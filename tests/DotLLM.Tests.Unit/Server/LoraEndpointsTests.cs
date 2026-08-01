@@ -102,11 +102,11 @@ public sealed class LoraEndpointsTests
 
         var state = NewState(registry);
         var ex = Assert.Throws<LoraAdapterNotFoundException>(
-            () => LoraEndpoints.Resolve("does-not-exist", state));
-        Assert.Contains("does-not-exist", ex.Message);
+            () => { LoraEndpoints.Resolve("does-not-exist", state); });
+        Assert.Contains("does-not-exist", ex.Message, StringComparison.Ordinal);
         // Available adapters are listed for diagnostic purposes
-        Assert.Contains("alpha", ex.Message);
-        Assert.Contains("beta", ex.Message);
+        Assert.Contains("alpha", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("beta", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -115,7 +115,7 @@ public sealed class LoraEndpointsTests
         using var registry = new LoraAdapterRegistry((n, p) => NewSyntheticAdapter(n));
         var state = NewState(registry);
         var ex = Assert.Throws<LoraAdapterNotFoundException>(
-            () => LoraEndpoints.Resolve("missing", state));
+            () => { LoraEndpoints.Resolve("missing", state); });
         Assert.Contains("none loaded", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -135,7 +135,7 @@ public sealed class LoraEndpointsTests
     {
         var state = NewState(registry: null);
         Assert.Throws<LoraAdapterNotFoundException>(
-            () => LoraEndpoints.Resolve("anything", state));
+            () => { LoraEndpoints.Resolve("anything", state); });
     }
 
     // ── Registry round-trip semantics ───────────────────────────────────

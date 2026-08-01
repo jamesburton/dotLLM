@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Engine.KvCache;
 using DotLLM.Models.Architectures;
@@ -44,7 +45,7 @@ public sealed unsafe class TurboQuantKvParityTests
         Skip.If(string.IsNullOrWhiteSpace(modelPath) || !File.Exists(modelPath),
             "Set DOTLLM_TURBOQUANT_PARITY_GGUF to a GGUF path to run the TurboQuant model-level parity benchmark.");
 
-        var gguf = GgufFile.Open(modelPath!);
+        using var gguf = GgufFile.Open(modelPath!);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
@@ -157,6 +158,7 @@ public sealed unsafe class TurboQuantKvParityTests
         return (row[idx] - max) - Math.Log(sum);
     }
 
+    [StructLayout(LayoutKind.Sequential)]
     private readonly record struct RefMetrics(double Top1Agreement, double MeanAbsLogitDelta, double MaxAbsLogitDelta, double MeanKl);
 
     private static RefMetrics CompareToReference(float[][] reference, float[][] candidate)

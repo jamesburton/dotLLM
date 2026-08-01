@@ -45,7 +45,8 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
     [Fact]
     public void Generate_RealSyntheticModel_RunsPrefillAndDenoiseAndReturnsTokens()
     {
-        using var model = LoadSyntheticModel(seed: 42);
+        using var loaded = LoadSyntheticModel(seed: 42);
+        var model = loaded.Model;
         var tok = new StubTokenizer();
         var diffusion = new DiffusionConfig
         {
@@ -73,7 +74,7 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
     {
         // Scripted model: every position confidently prefers token 7. The scheduler's proportional
         // budget unmasks a subset each step; the canvas-snapshot mask counts must never increase.
-        var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(7));
+        using var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(7));
         var tok = new StubTokenizer();
         var diffusion = new DiffusionConfig
         {
@@ -96,6 +97,29 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
                 $"mask count increased at step {i}: {masks[i - 1]} → {masks[i]}");
     }
 
+    // ───────────────────────── LoRA adapter wiring ─────────────────────────
+
+    [Fact]
+    public void Generate_WithAdapter_PassesAdapterToEveryForwardCall()
+    {
+        using var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(7));
+        var tok = new StubTokenizer();
+        var diffusion = new DiffusionConfig
+        {
+            CanvasLength = 4,
+            MaxDenoisingSteps = 4,
+            MaskTokenId = MaskTokenId,
+        };
+        var gen = new DiffusionTextGenerator(model, tok, new EntropyBoundSampler(), diffusion);
+        using var adapter = new FakeLoraAdapter();
+
+        gen.Generate([5, 5], adapter: adapter);
+
+        Assert.True(model.ForwardCount > 0);
+        Assert.True(model.AllForwardsSawAdapter);
+        Assert.Same(adapter, model.LastAdapter);
+    }
+
     // ───────────────────────── Confidence early stop ─────────────────────────
 
     [Fact]
@@ -103,7 +127,7 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
     {
         // A maximally-confident (near-zero entropy) canvas should trip the confidence early-stop
         // well before the max-step budget. Compare against an unbounded step budget.
-        var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(3));
+        using var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(3));
         var tok = new StubTokenizer();
         var diffusion = new DiffusionConfig
         {
@@ -129,7 +153,7 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
     [Fact]
     public void Generate_TargetLongerThanCanvas_ProducesMultipleCanvases()
     {
-        var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(4));
+        using var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(4));
         var tok = new StubTokenizer();
         var diffusion = new DiffusionConfig
         {
@@ -155,7 +179,7 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
     [Fact]
     public void Generate_StreamingCallback_ObservesDecreasingMaskCounts()
     {
-        var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(6));
+        using var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(6));
         var tok = new StubTokenizer();
         var diffusion = new DiffusionConfig
         {
@@ -188,7 +212,7 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
     [Fact]
     public void Generate_UsesCachelessHybridForward_NeverPassesKvCache()
     {
-        var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(1));
+        using var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(1));
         var tok = new StubTokenizer();
         var diffusion = new DiffusionConfig
         {
@@ -223,12 +247,30 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
         return row;
     }
 
-    private TransformerModel LoadSyntheticModel(int seed)
+    private LoadedModel LoadSyntheticModel(int seed)
     {
         string path = Path.Combine(_scratch, $"diff-{seed}.safetensors");
         WriteFixture(path, seed);
         var sf = SafetensorsFile.Open(path);
-        return TransformerModel.LoadFromSafetensors(sf, BuildSyntheticConfig());
+        var model = TransformerModel.LoadFromSafetensors(sf, BuildSyntheticConfig());
+        return new LoadedModel(model, sf);
+    }
+
+    /// <summary>
+    /// Bundles a loaded <see cref="TransformerModel"/> with the backing <see cref="SafetensorsFile"/> it
+    /// is anchored to. Per <see cref="TransformerModel.LoadFromSafetensors(ISafetensorsTensorSource, ModelConfig)"/>,
+    /// the source file must remain alive for the model's lifetime and the caller must dispose it after
+    /// disposing the model — this wrapper disposes both, in that order.
+    /// </summary>
+    private sealed class LoadedModel(TransformerModel model, SafetensorsFile file) : IDisposable
+    {
+        public TransformerModel Model => model;
+
+        public void Dispose()
+        {
+            model.Dispose();
+            file.Dispose();
+        }
     }
 
     private static ModelConfig BuildSyntheticConfig()
@@ -306,7 +348,7 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
 
         public ScriptedModel(int vocab, float[] rowLogits)
         {
-            if (rowLogits.Length != vocab) throw new ArgumentException("row length must equal vocab.");
+            if (rowLogits.Length != vocab) throw new ArgumentException("row length must equal vocab.", nameof(rowLogits));
             Config = new ModelConfig
             {
                 Architecture = Architecture.Llama,
@@ -335,6 +377,8 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
         public bool AllForwardsWereHybrid { get; private set; } = true;
         public int FirstHybridPrefixLen { get; private set; } = -1;
         public int FirstSeqLen { get; private set; } = -1;
+        public ILoraAdapter? LastAdapter { get; private set; }
+        public bool AllForwardsSawAdapter { get; private set; } = true;
 
         public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
             => Build(tokenIds.Length);
@@ -351,6 +395,8 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
         {
             if (kvCache is not null) AllForwardsWereCacheless = false;
             if (maskSpec.Mode != AttentionMaskMode.Hybrid) AllForwardsWereHybrid = false;
+            LastAdapter = adapter;
+            if (adapter is null) AllForwardsSawAdapter = false;
             if (ForwardCount == 0)
             {
                 FirstHybridPrefixLen = maskSpec.PrefixLength;
@@ -390,5 +436,17 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
         }
         public string DecodeToken(int tokenId) => $"t{tokenId}";
         public int CountTokens(string text) => Encode(text).Length;
+    }
+
+    /// <summary>Minimal no-op adapter used only to assert reference identity flows through to <c>Forward</c>.</summary>
+    private sealed class FakeLoraAdapter : ILoraAdapter
+    {
+        public string Name => "fake";
+        public int Rank => 4;
+        public float Alpha => 8f;
+        public IReadOnlyList<string> TargetModules => [];
+        public LoraLayerWeights? GetLayerWeights(int layerIndex, string projName, LoraRegion region = LoraRegion.Any) => null;
+        public bool IsCompatible(ModelConfig baseConfig) => true;
+        public void Dispose() { }
     }
 }

@@ -94,7 +94,7 @@ public class VulkanMatMulF32KernelTests
     internal static void SkipIfUnavailable(out string spvDir)
     {
         Skip.If(
-            Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1",
+            string.Equals(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN"), "1", StringComparison.Ordinal),
             "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(
             VulkanDevice.IsAvailable(),

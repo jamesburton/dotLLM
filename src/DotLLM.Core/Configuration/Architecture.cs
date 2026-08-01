@@ -119,6 +119,17 @@ public enum Architecture
     Qwen3MoeHybrid,
 
     /// <summary>
+    /// Dense Qwen3.5 hybrid — the same Gated DeltaNet (GDN) + full-attention layer
+    /// alternation as <see cref="Qwen3MoeHybrid"/> (identical GDN recurrence,
+    /// <c>qwen35.full_attention_interval</c> gating, RoPE section scheme), but with a
+    /// standard dense SwiGLU FFN (<c>ffn_gate/up/down.weight</c>) instead of a sparse MoE
+    /// sublayer. GGUF architecture string: <c>qwen35</c> (no <c>moe</c> suffix). First
+    /// observed in PrismML's Bonsai-27B ternary model (distilled from Qwen/Qwen3.6-27B).
+    /// See <see cref="DotLLM.Core.Models.GatedDeltaNetConfig"/> for GDN-specific parameters.
+    /// </summary>
+    Qwen3HybridDense,
+
+    /// <summary>
     /// HuggingFace SmolLM3 — Llama-shaped GQA transformer (3B SKU: 36 layers,
     /// 16 Q-heads, 4 KV-heads, head_dim=128, hidden=2048, intermediate=11008,
     /// vocab=128256, max_pos=65536). Distinguishing features vs Llama:
@@ -278,5 +289,19 @@ public enum Architecture
     DiffusionGemma,
 
     /// <summary>Microsoft BitNet b1.58 family (ternary-weight, I2_S quantization).</summary>
-    BitNet
+    BitNet,
+
+    /// <summary>
+    /// OpenAI gpt-oss family (gpt-oss-20b / gpt-oss-120b). GGUF architecture
+    /// string: <c>gpt-oss</c> (llama.cpp <c>LLM_ARCH_OPENAI_MOE</c>). GQA
+    /// attention with per-head <b>attention sinks</b> (a learned scalar logit
+    /// per head joining the softmax denominator), <b>alternating
+    /// sliding-window / dense attention</b> (window on even layers, dense on
+    /// odd — llama.cpp <c>set_swa_pattern(2, dense_first=false)</c>), NeoX
+    /// RoPE with YaRN scaling, and a routed-MoE FFN in every layer using the
+    /// clamped <c>swiglu_oai</c> activation (alpha=1.702, limit=7) with
+    /// per-expert biases and softmax-after-top-k router gating. Expert
+    /// weights ship in MXFP4.
+    /// </summary>
+    GptOss
 }

@@ -49,7 +49,7 @@ public class GgufReaderTests
         using var reader = new BinaryReader(stream);
 
         var ex = Assert.Throws<InvalidDataException>(() => GgufReader.ReadHeader(reader));
-        Assert.Contains("Invalid GGUF magic", ex.Message);
+        Assert.Contains("Invalid GGUF magic", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -65,7 +65,7 @@ public class GgufReaderTests
         using var reader = new BinaryReader(stream);
 
         var ex = Assert.Throws<InvalidDataException>(() => GgufReader.ReadHeader(reader));
-        Assert.Contains("Unsupported GGUF version: 99", ex.Message);
+        Assert.Contains("Unsupported GGUF version: 99", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -301,8 +301,8 @@ public class GgufReaderTests
         _ = GgufReader.ReadMetadata(reader, header);
 
         var ex = Assert.Throws<NotSupportedException>(() => GgufReader.ReadTensorInfos(reader, header));
-        Assert.Contains("bad_tensor", ex.Message);
-        Assert.Contains("999", ex.Message);
+        Assert.Contains("bad_tensor", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("999", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

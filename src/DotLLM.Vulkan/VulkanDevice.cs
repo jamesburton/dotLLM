@@ -179,10 +179,50 @@ public sealed class VulkanDevice : IDisposable
     /// </summary>
     public bool HasExternalSemaphoreWin32 { get; }
 
+    /// <summary>
+    /// True when the physical device advertises <c>VK_AMD_shader_info</c> AND
+    /// the device-create call enabled it. Prerequisite for
+    /// <see cref="GetShaderStatisticsAmd"/>, which queries the driver's actual
+    /// post-compile VGPR/SGPR/LDS allocation for a compiled pipeline — a
+    /// vendor-specific (AMD proprietary driver only) diagnostic extension, not
+    /// part of any codepath's correctness or performance.
+    /// </summary>
+    public bool HasShaderInfoAmd { get; }
+
+    /// <summary>
+    /// True when the physical device advertises
+    /// <c>VK_KHR_pipeline_executable_properties</c> AND the device-create call
+    /// enabled its <c>pipelineExecutableInfo</c> feature. Prerequisite for
+    /// <see cref="GetPipelineSubgroupSizes"/>, which reports the wave width the
+    /// driver actually compiled a pipeline stage for — a diagnostic-only query
+    /// (issue #241); no codepath's correctness or performance depends on it.
+    /// </summary>
+    public bool HasPipelineExecutableProperties { get; }
+
     internal nint Handle => _device;
     internal nint Queue => _queue;
     internal nint CommandPool => _commandPool;
     internal nint PhysicalDevice => _physicalDevice;
+
+    /// <summary>
+    /// Nanoseconds per timestamp tick (<c>VkPhysicalDeviceLimits.timestampPeriod</c>).
+    /// Read lazily for the env-gated decode profiler (issue #143). Returns 0 when
+    /// the reported value is implausible (&lt;=0 or &gt;10µs) — callers should then
+    /// skip GPU timestamping.
+    /// </summary>
+    internal unsafe float TimestampPeriodNs
+    {
+        get
+        {
+            VulkanApi.vkGetPhysicalDeviceProperties(_physicalDevice, out var props);
+            // The C# struct's byte tail starts at offset 292 (after the UUID),
+            // but VkPhysicalDeviceLimits is 8-byte aligned in the C layout, so
+            // it begins at 296 = tail+4. timestampPeriod is the float at limits
+            // offset 424 (right after timestampComputeAndGraphics) → tail+428.
+            float p = *(float*)(props.tail + 428);
+            return p >= 0.01f && p < 10_000f ? p : 0f;
+        }
+    }
 
     private VulkanDevice(
         nint instance, nint physical, nint device, nint queue,
@@ -193,7 +233,9 @@ public sealed class VulkanDevice : IDisposable
         bool hasIntegerDotProduct,
         bool hasSubgroupSizeControl, uint minSubgroupSize, uint maxSubgroupSize,
         uint requiredSubgroupSizeStages,
-        bool hasExternalSemaphoreWin32)
+        bool hasExternalSemaphoreWin32,
+        bool hasShaderInfoAmd,
+        bool hasPipelineExecutableProperties)
     {
         _instance = instance;
         _physicalDevice = physical;
@@ -216,6 +258,8 @@ public sealed class VulkanDevice : IDisposable
         MaxSubgroupSize = maxSubgroupSize;
         _requiredSubgroupSizeStages = requiredSubgroupSizeStages;
         HasExternalSemaphoreWin32 = hasExternalSemaphoreWin32;
+        HasShaderInfoAmd = hasShaderInfoAmd;
+        HasPipelineExecutableProperties = hasPipelineExecutableProperties;
     }
 
     /// <summary>
@@ -373,9 +417,22 @@ public sealed class VulkanDevice : IDisposable
             // Falls back silently when absent — caller checks HasExternalSemaphoreWin32.
             ProbeExternalSemaphoreWin32(physical, apiVersion, out bool hasExternalSemaphoreWin32);
 
+            // Probe VK_AMD_shader_info — vendor extension, no feature bits, no
+            // Vulkan-version gate. Just an extension-presence check; enabling
+            // it at device-create is what makes vkGetShaderInfoAMD resolvable.
+            bool hasShaderInfoAmd = HasDeviceExtension(physical, "VK_AMD_shader_info"u8);
+
+            // Probe VK_KHR_pipeline_executable_properties — diagnostic only
+            // (issue #241: read back the wave width the driver actually compiled
+            // a pipeline for). Extension presence + the pipelineExecutableInfo
+            // feature enable are both needed before the query is legal.
+            bool hasPipelineExecutableProperties =
+                HasDeviceExtension(physical, "VK_KHR_pipeline_executable_properties"u8);
+
             nint device = CreateLogicalDevice(
                 physical, queueFamily, hasCoopmat, hasExternalMemoryHost, hasIntegerDotProduct,
-                hasSubgroupSizeControl, hasExternalSemaphoreWin32);
+                hasSubgroupSizeControl, hasExternalSemaphoreWin32, hasShaderInfoAmd,
+                hasPipelineExecutableProperties);
 
             VulkanApi.vkGetDeviceQueue(device, queueFamily, 0, out nint queue);
 
@@ -395,7 +452,8 @@ public sealed class VulkanDevice : IDisposable
                 hasExternalMemoryHost, minImportedHostPointerAlignment,
                 hasIntegerDotProduct,
                 hasSubgroupSizeControl, minSubgroupSize, maxSubgroupSize,
-                requiredSubgroupSizeStages, hasExternalSemaphoreWin32);
+                requiredSubgroupSizeStages, hasExternalSemaphoreWin32, hasShaderInfoAmd,
+                hasPipelineExecutableProperties);
             instance = 0;
             return result;
         }
@@ -1077,7 +1135,8 @@ public sealed class VulkanDevice : IDisposable
     private static unsafe nint CreateLogicalDevice(
         nint physical, uint queueFamily,
         bool enableCoopmat, bool enableExternalMemoryHost, bool enableIntegerDotProduct,
-        bool enableSubgroupSizeControl, bool enableExternalSemaphoreWin32)
+        bool enableSubgroupSizeControl, bool enableExternalSemaphoreWin32, bool enableShaderInfoAmd,
+        bool enablePipelineExecutableProperties)
     {
         float priority = 1.0f;
 
@@ -1105,18 +1164,22 @@ public sealed class VulkanDevice : IDisposable
         ReadOnlySpan<byte> sscName = "VK_EXT_subgroup_size_control\0"u8;
         ReadOnlySpan<byte> extSemName = "VK_KHR_external_semaphore\0"u8;
         ReadOnlySpan<byte> extSemWin32Name = "VK_KHR_external_semaphore_win32\0"u8;
+        ReadOnlySpan<byte> shaderInfoAmdName = "VK_AMD_shader_info\0"u8;
+        ReadOnlySpan<byte> pipeExecName = "VK_KHR_pipeline_executable_properties\0"u8;
 
-        // Pack name bytes + pointer array onto the stack. Worst case all seven
+        // Pack name bytes + pointer array onto the stack. Worst case all eight
         // extension names are enabled at once (coopmat, external-memory ×2,
-        // integer-dot-product, subgroup-size-control, external-semaphore ×2). The
-        // integer-dot-product and subgroup-size-control strings are harmless to
-        // name even on a 1.3 driver where they are core — drivers ignore the
-        // duplicate, same as the external-memory/semaphore names below.
+        // integer-dot-product, subgroup-size-control, external-semaphore ×2,
+        // shader-info-amd). The integer-dot-product and subgroup-size-control
+        // strings are harmless to name even on a 1.3 driver where they are
+        // core — drivers ignore the duplicate, same as the external-memory/
+        // semaphore names below.
         byte* nameBytes = stackalloc byte[
             coopmatName.Length + extMemHostName.Length + extMemName.Length
             + intDotName.Length + sscName.Length
-            + extSemName.Length + extSemWin32Name.Length];
-        nint* namePtrs = stackalloc nint[7];
+            + extSemName.Length + extSemWin32Name.Length + shaderInfoAmdName.Length
+            + pipeExecName.Length];
+        nint* namePtrs = stackalloc nint[9];
         int nameOffset = 0;
         uint extCount = 0;
 
@@ -1172,6 +1235,20 @@ public sealed class VulkanDevice : IDisposable
             nameOffset += sscName.Length;
         }
 
+        if (enableShaderInfoAmd)
+        {
+            for (int i = 0; i < shaderInfoAmdName.Length; i++) nameBytes[nameOffset + i] = shaderInfoAmdName[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += shaderInfoAmdName.Length;
+        }
+
+        if (enablePipelineExecutableProperties)
+        {
+            for (int i = 0; i < pipeExecName.Length; i++) nameBytes[nameOffset + i] = pipeExecName[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += pipeExecName.Length;
+        }
+
         // Feature structs chained through pNext on top of the extension enables:
         //  - VK_KHR_cooperative_matrix requires `cooperativeMatrix=VK_TRUE`.
         //  - VK_KHR_shader_integer_dot_product requires
@@ -1221,6 +1298,18 @@ public sealed class VulkanDevice : IDisposable
             timelineFeatures.timelineSemaphore = 1; // VK_TRUE
             timelineFeatures.pNext = featureChain;
             featureChain = (nint)(&timelineFeatures);
+        }
+
+        // VK_KHR_pipeline_executable_properties requires `pipelineExecutableInfo`
+        // enabled before vkGetPipelineExecutablePropertiesKHR may be called.
+        // Diagnostic-only (issue #241) — enabling it does not change compilation.
+        VkPhysicalDevicePipelineExecutablePropertiesFeaturesKhr pipeExecFeatures = default;
+        if (enablePipelineExecutableProperties)
+        {
+            pipeExecFeatures.sType = VkStructureType.PhysicalDevicePipelineExecutablePropertiesFeaturesKhr;
+            pipeExecFeatures.pipelineExecutableInfo = 1; // VK_TRUE
+            pipeExecFeatures.pNext = featureChain;
+            featureChain = (nint)(&pipeExecFeatures);
         }
 
         ci.pNext = featureChain;
@@ -1355,6 +1444,18 @@ public sealed class VulkanDevice : IDisposable
     public Buffer Allocate(long bytes) => AllocateInternal(bytes, deviceLocal: false);
 
     /// <summary>
+    /// Allocates a host-visible storage buffer optimised for per-token CPU
+    /// readback (e.g. the logits buffer): prefers a memory type that is also
+    /// <c>HOST_CACHED</c> so host reads go through the CPU cache hierarchy.
+    /// The default host-visible type on AMD/Windows is write-combined
+    /// (uncached) — CPU reads from it run at &lt;1 GB/s, which cost ~0.4 ms
+    /// per decoded token on a 49k-vocab logits row (issue #143). Falls back
+    /// to the plain host-visible type when no cached type exists.
+    /// </summary>
+    public Buffer AllocateHostReadback(long bytes)
+        => AllocateInternal(bytes, deviceLocal: false, preferHostCached: true);
+
+    /// <summary>
     /// Allocates a storage buffer of <paramref name="bytes"/> bytes backed by
     /// device-local memory. The buffer is <b>not</b> host-mappable; use this
     /// for immutable weights and the KV cache, populating the contents via
@@ -1419,7 +1520,7 @@ public sealed class VulkanDevice : IDisposable
     /// </summary>
     public long DeviceLocalFallbackCount => Interlocked.Read(ref _deviceLocalFallbacks);
 
-    private Buffer AllocateInternal(long bytes, bool deviceLocal)
+    private Buffer AllocateInternal(long bytes, bool deviceLocal, bool preferHostCached = false)
     {
         if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
 
@@ -1458,51 +1559,78 @@ public sealed class VulkanDevice : IDisposable
                 typeIndex = FindMemoryType(req.memoryTypeBits, VkMemoryPropertyFlags.DeviceLocal);
             }
         }
+        else if (preferHostCached
+            && TryFindMemoryType(req.memoryTypeBits,
+                required: required | VkMemoryPropertyFlags.HostCached,
+                excluded: default,
+                out typeIndex))
+        {
+            // Cached host-visible type found — CPU readback at full speed.
+        }
         else
         {
             typeIndex = FindMemoryType(req.memoryTypeBits, required);
         }
 
+        uint preferredTypeIndex = typeIndex;
         var mai = new VkMemoryAllocateInfo
         {
             sType = VkStructureType.MemoryAllocateInfo,
             allocationSize = req.size,
             memoryTypeIndex = typeIndex,
         };
-        int allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out nint memory);
-
-        // The strict device-local heap (discrete VRAM, or the UMA carve-out — e.g. a
-        // 16 GB heap[0] on Strix Halo while heap[1] exposes 96 GB of DEVICE_LOCAL +
-        // HOST_VISIBLE GTT) can be far smaller than what the device can actually
-        // address. When it is exhausted, retry on the combined DEVICE_LOCAL +
-        // HOST_VISIBLE type, then plain host-visible — the llama.cpp
-        // GGML_VK_ALLOW_SYSMEM_FALLBACK equivalent. On UMA parts the fallback reads
-        // the same DRAM; on discrete GPUs it is slower than VRAM but beats an OOM
-        // crash. Opt out with DOTLLM_VULKAN_STRICT_DEVICE_LOCAL=1; occurrences are
-        // counted in DeviceLocalFallbackCount for harness reporting.
-        if (allocResult == VkErrorOutOfDeviceMemory && deviceLocal && !s_strictDeviceLocal)
+        int allocResult;
+        nint memory;
+        for (int attempt = 0; ; attempt++)
         {
-            // Heap-aware: on AMD APUs the FIRST type matching a fallback flag combo can
-            // sit on the same exhausted carve-out heap as the failed type, so ranking by
-            // flags alone re-fails. Try every eligible type, other heaps before the
-            // failed heap, larger heaps first, host-visible rungs after combined ones.
-            foreach (uint fbIndex in EnumerateDeviceLocalFallbackTypes(req.memoryTypeBits, typeIndex))
+            typeIndex = preferredTypeIndex;
+            mai.memoryTypeIndex = typeIndex;
+            allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out memory);
+
+            // The strict device-local heap (discrete VRAM, or the UMA carve-out — e.g. a
+            // 16 GB heap[0] on Strix Halo while heap[1] exposes 96 GB of DEVICE_LOCAL +
+            // HOST_VISIBLE GTT) can be far smaller than what the device can actually
+            // address. When it is exhausted, retry on the combined DEVICE_LOCAL +
+            // HOST_VISIBLE type, then plain host-visible — the llama.cpp
+            // GGML_VK_ALLOW_SYSMEM_FALLBACK equivalent. On UMA parts the fallback reads
+            // the same DRAM; on discrete GPUs it is slower than VRAM but beats an OOM
+            // crash. Opt out with DOTLLM_VULKAN_STRICT_DEVICE_LOCAL=1; occurrences are
+            // counted in DeviceLocalFallbackCount for harness reporting.
+            if (allocResult == VkErrorOutOfDeviceMemory && deviceLocal && !s_strictDeviceLocal)
             {
-                mai.memoryTypeIndex = fbIndex;
-                allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out memory);
-                if (allocResult >= 0)
+                // Heap-aware: on AMD APUs the FIRST type matching a fallback flag combo can
+                // sit on the same exhausted carve-out heap as the failed type, so ranking by
+                // flags alone re-fails. Try every eligible type, other heaps before the
+                // failed heap, larger heaps first, host-visible rungs after combined ones.
+                foreach (uint fbIndex in EnumerateDeviceLocalFallbackTypes(req.memoryTypeBits, typeIndex))
                 {
-                    typeIndex = fbIndex;
-                    Interlocked.Increment(ref _deviceLocalFallbacks);
-                    break;
+                    mai.memoryTypeIndex = fbIndex;
+                    allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out memory);
+                    if (allocResult >= 0)
+                    {
+                        typeIndex = fbIndex;
+                        Interlocked.Increment(ref _deviceLocalFallbacks);
+                        break;
+                    }
                 }
             }
+
+            // Transient memory pressure (issue #146): under back-to-back heavy runs the
+            // previous process's allocations may not be reclaimed yet, so a large staging
+            // or weight allocation fails once and succeeds moments later. Bounded
+            // retry-with-backoff before giving up — same policy as MapMemoryWithRetry.
+            if (allocResult >= 0 || !IsTransientMemoryResult(allocResult) || attempt >= s_memRetries)
+                break;
+            LogMemoryRetry("vkAllocateMemory",
+                $"AllocateInternal(deviceLocal={deviceLocal})", bytes, allocResult, attempt);
+            Thread.Sleep(RetryBackoffMs(attempt));
         }
 
         if (allocResult < 0)
         {
             VulkanApi.vkDestroyBuffer(_device, buffer, 0);
-            allocResult.ThrowOnError("vkAllocateMemory");
+            allocResult.ThrowOnError(
+                $"vkAllocateMemory ({bytes} bytes{(IsTransientMemoryResult(allocResult) ? $", {s_memRetries} retries exhausted" : "")})");
         }
 
         int bindResult = VulkanApi.vkBindBufferMemory(_device, buffer, memory, 0);
@@ -1526,6 +1654,100 @@ public sealed class VulkanDevice : IDisposable
         uint* types = (uint*)mem.memoryTypes; // 8-byte entries: u32 propertyFlags, u32 heapIndex
         var flags = (VkMemoryPropertyFlags)types[typeIndex * 2];
         return (flags & VkMemoryPropertyFlags.HostVisible) != 0;
+    }
+
+    /// <summary>VkResult VK_ERROR_OUT_OF_HOST_MEMORY.</summary>
+    private const int VkErrorOutOfHostMemory = -1;
+
+    /// <summary>VkResult VK_ERROR_MEMORY_MAP_FAILED.</summary>
+    private const int VkErrorMemoryMapFailed = -5;
+
+    /// <summary>
+    /// <c>DOTLLM_VULKAN_MEM_DIAG=1</c> dumps the physical-device heap/type table to stderr
+    /// when a map/alloc hits a transient memory failure — the issue #146 diagnosis aid.
+    /// </summary>
+    private static readonly bool s_memDiag =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_DIAG") == "1";
+
+    /// <summary>
+    /// Number of retries after a transient memory failure (<c>VK_ERROR_MEMORY_MAP_FAILED</c> /
+    /// host / device OOM) on <c>vkMapMemory</c> and <c>vkAllocateMemory</c>. Under memory
+    /// pressure on UMA boxes (issue #146: back-to-back heavy runs on Strix Halo, the previous
+    /// process's allocations not yet reclaimed) these calls fail transiently and succeed on
+    /// retry — observed ~2/15 model loads failing at the GB-scale weight-staging buffer.
+    /// Override with <c>DOTLLM_VULKAN_MEM_RETRIES</c> (0 disables, max 8). Default 4, with
+    /// exponential backoff 25/100/400/1600 ms.
+    /// </summary>
+    private static readonly int s_memRetries = ParseMemRetries();
+
+    private static int ParseMemRetries()
+    {
+        string? v = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_RETRIES");
+        return int.TryParse(v, out int n) && n >= 0 ? Math.Min(n, 8) : 4;
+    }
+
+    /// <summary>
+    /// True for VkResults that indicate memory pressure rather than API misuse —
+    /// the only failures worth retrying with backoff.
+    /// </summary>
+    internal static bool IsTransientMemoryResult(int result)
+        => result is VkErrorOutOfHostMemory or VkErrorOutOfDeviceMemory or VkErrorMemoryMapFailed;
+
+    /// <summary>Backoff before retry <paramref name="attempt"/> (0-based): 25, 100, 400, 1600, ... ms.</summary>
+    internal static int RetryBackoffMs(int attempt) => 25 << Math.Min(2 * attempt, 12);
+
+    /// <summary>
+    /// Maps <paramref name="memory"/> with bounded retry-with-backoff on transient memory
+    /// failures. All load-path (weight/KV staging) and host-copy maps go through this instead
+    /// of raw <c>vkMapMemory</c>: on Windows/WDDM the map must make the <em>entire</em>
+    /// allocation host-resident (residency is allocation-granular, not range-granular), so
+    /// mapping a GB-scale staging buffer transiently fails with
+    /// <c>VK_ERROR_MEMORY_MAP_FAILED</c> under system memory pressure even though the same
+    /// call succeeds moments later (issue #146). Throws with <paramref name="site"/> +
+    /// size context when all attempts fail.
+    /// </summary>
+    internal nint MapMemoryWithRetry(nint memory, ulong offset, ulong size, string site)
+    {
+        int r = VulkanApi.vkMapMemory(_device, memory, offset, size, 0, out nint mapped);
+        for (int attempt = 0; r < 0 && IsTransientMemoryResult(r) && attempt < s_memRetries; attempt++)
+        {
+            LogMemoryRetry("vkMapMemory", site, (long)size, r, attempt);
+            Thread.Sleep(RetryBackoffMs(attempt));
+            r = VulkanApi.vkMapMemory(_device, memory, offset, size, 0, out mapped);
+        }
+        if (r < 0)
+            r.ThrowOnError($"{site} ({size} bytes{(IsTransientMemoryResult(r) ? $", {s_memRetries} retries exhausted" : "")})");
+        return mapped;
+    }
+
+    private void LogMemoryRetry(string op, string site, long bytes, int result, int attempt)
+    {
+        Console.Error.WriteLine(
+            $"[vulkan-mem] transient {op} failure at '{site}' (VkResult {result}, {bytes} bytes); " +
+            $"retrying {attempt + 1}/{s_memRetries} after {RetryBackoffMs(attempt)} ms");
+        if (s_memDiag && attempt == 0)
+            DumpMemoryDiagnostics();
+    }
+
+    /// <summary>Dumps the heap/type table to stderr (DOTLLM_VULKAN_MEM_DIAG=1 only).</summary>
+    private unsafe void DumpMemoryDiagnostics()
+    {
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        uint* types = (uint*)mem.memoryTypes;   // 8-byte entries: u32 propertyFlags, u32 heapIndex
+        byte* heaps = (byte*)mem.memoryHeaps;   // 16-byte entries: u64 size, u32 flags, padding
+        for (uint i = 0; i < mem.memoryHeapCount; i++)
+        {
+            ulong size = *(ulong*)(heaps + i * 16);
+            uint flags = *(uint*)(heaps + i * 16 + 8);
+            Console.Error.WriteLine($"[vulkan-mem]   heap[{i}] size={size / (1024.0 * 1024 * 1024):F2} GiB flags=0x{flags:x}");
+        }
+        for (uint i = 0; i < mem.memoryTypeCount; i++)
+        {
+            Console.Error.WriteLine(
+                $"[vulkan-mem]   type[{i}] heap={types[i * 2 + 1]} props=0x{types[i * 2]:x} " +
+                $"({(VkMemoryPropertyFlags)types[i * 2]})");
+        }
+        Console.Error.WriteLine($"[vulkan-mem]   deviceLocalFallbacks={DeviceLocalFallbackCount}");
     }
 
     /// <summary>
@@ -1619,8 +1841,7 @@ public sealed class VulkanDevice : IDisposable
             throw new ArgumentException("Destination buffer too small.", nameof(dst));
 
         // 1. Copy host → staging.
-        VulkanApi.vkMapMemory(_device, staging.Memory, 0, (ulong)source.Length, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory staging");
+        nint mapped = MapMemoryWithRetry(staging.Memory, 0, (ulong)source.Length, "vkMapMemory staging");
         try
         {
             source.CopyTo(new Span<byte>((void*)mapped, source.Length));
@@ -1764,14 +1985,28 @@ public sealed class VulkanDevice : IDisposable
     }
 
     /// <summary>Copies <paramref name="source"/> from host memory into the start of <paramref name="dst"/>.</summary>
+    /// <remarks>
+    /// When <paramref name="dst"/> is device-local-only (a discrete GPU's VRAM, or —
+    /// as issue #370's CPU-MoE-offload host round-trip discovered — a scratch buffer
+    /// allocated strictly DEVICE_LOCAL even on a UMA part) the host cannot map it
+    /// directly, so the bytes are staged through a transient host-visible buffer and
+    /// <c>vkCmdCopyBuffer</c>'d across (mirrors <see cref="UploadToDeviceLocal"/> /
+    /// the <see cref="Download"/> readback-side fix, #364).
+    /// </remarks>
     public unsafe void Upload(ReadOnlySpan<float> source, Buffer dst)
     {
         long bytes = (long)source.Length * sizeof(float);
         if (bytes > dst.Size)
             throw new ArgumentException("Source larger than destination buffer.", nameof(source));
 
-        VulkanApi.vkMapMemory(_device, dst.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory");
+        if (!dst.IsHostVisible)
+        {
+            using Buffer staging = Allocate(bytes);
+            UploadToDeviceLocal(MemoryMarshal.AsBytes(source), staging, dst);
+            return;
+        }
+
+        nint mapped = MapMemoryWithRetry(dst.Memory, 0, (ulong)bytes, "vkMapMemory");
         try
         {
             var destSpan = new Span<float>((void*)mapped, source.Length);
@@ -1788,13 +2023,23 @@ public sealed class VulkanDevice : IDisposable
     /// Used for quantized weight blobs (Q8_0, Q4_K, etc.) where the GPU sees the
     /// data as <c>uint[]</c> and the shader extracts bytes.
     /// </summary>
+    /// <remarks>
+    /// Stages through a transient host-visible buffer when <paramref name="dst"/> is
+    /// device-local-only — see the <see cref="Upload(ReadOnlySpan{float}, Buffer)"/> remarks.
+    /// </remarks>
     public unsafe void Upload(ReadOnlySpan<byte> source, Buffer dst)
     {
         if (source.Length > dst.Size)
             throw new ArgumentException("Source larger than destination buffer.", nameof(source));
 
-        VulkanApi.vkMapMemory(_device, dst.Memory, 0, (ulong)source.Length, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory");
+        if (!dst.IsHostVisible)
+        {
+            using Buffer staging = Allocate(source.Length);
+            UploadToDeviceLocal(source, staging, dst);
+            return;
+        }
+
+        nint mapped = MapMemoryWithRetry(dst.Memory, 0, (ulong)source.Length, "vkMapMemory");
         try
         {
             var destSpan = new Span<byte>((void*)mapped, source.Length);
@@ -1836,8 +2081,7 @@ public sealed class VulkanDevice : IDisposable
 
     private unsafe void DownloadHostVisible(Buffer src, Span<float> destination, long bytes)
     {
-        VulkanApi.vkMapMemory(_device, src.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory");
+        nint mapped = MapMemoryWithRetry(src.Memory, 0, (ulong)bytes, "vkMapMemory");
         try
         {
             var srcSpan = new ReadOnlySpan<float>((void*)mapped, destination.Length);
@@ -1999,6 +2243,182 @@ public sealed class VulkanDevice : IDisposable
             VulkanApi.vkDestroySemaphore(_device, semaphore, 0);
     }
 
+    // Delegate matching vkGetShaderInfoAMD (VK_AMD_shader_info). Resolved
+    // lazily via vkGetDeviceProcAddr after device creation (the extension must
+    // have been enabled at vkCreateDevice) — same pattern as
+    // vkGetSemaphoreWin32HandleKHR above.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private unsafe delegate int VkGetShaderInfoAMD(
+        nint device, nint pipeline, uint shaderStage, int infoType,
+        ref nuint pInfoSize, void* pInfo);
+
+    /// <summary>
+    /// Queries the driver's actual post-compile shader statistics (physical/
+    /// used VGPR and SGPR counts, LDS usage, scratch memory usage) for a
+    /// compiled compute pipeline via <c>VK_AMD_shader_info</c>. Ground-truth
+    /// diagnostic — unlike SPIR-V-level IR inspection, this reflects what the
+    /// driver's own ISA backend actually allocated, including register spill
+    /// and LDS bank layout the SPIR-V disassembly cannot show.
+    /// </summary>
+    /// <param name="pipeline">The <c>VkPipeline</c> handle (e.g. <c>ComputePipeline.Pipeline</c>).</param>
+    /// <param name="shaderStage">Defaults to the compute stage — the only stage dotLLM's compute kernels use.</param>
+    /// <exception cref="InvalidOperationException">Thrown when the device did not enable <c>VK_AMD_shader_info</c> (see <see cref="HasShaderInfoAmd"/>).</exception>
+    /// <exception cref="VulkanException">Thrown when the driver rejects the query (non-AMD driver, wrong pipeline type).</exception>
+    internal unsafe VkShaderStatisticsInfoAmd GetShaderStatisticsAmd(
+        nint pipeline, uint shaderStage = VkShaderStageFlags.Compute)
+    {
+        if (!HasShaderInfoAmd)
+            throw new InvalidOperationException(
+                "Device does not support VK_AMD_shader_info — cannot query shader statistics.");
+
+        nint fn = VulkanApi.vkGetDeviceProcAddr(_device, "vkGetShaderInfoAMD");
+        if (fn == 0)
+            throw new VulkanException(-3,
+                "vkGetShaderInfoAMD not resolvable — extension not enabled at device create.");
+
+        var getShaderInfo = Marshal.GetDelegateForFunctionPointer<VkGetShaderInfoAMD>(fn);
+
+        VkShaderStatisticsInfoAmd stats = default;
+        nuint infoSize = (nuint)sizeof(VkShaderStatisticsInfoAmd);
+        int r = getShaderInfo(
+            _device, pipeline, shaderStage, VkShaderInfoTypeAmd.Statistics,
+            ref infoSize, &stats);
+        r.ThrowOnError("vkGetShaderInfoAMD");
+        return stats;
+    }
+
+    /// <summary>
+    /// DIAGNOSTIC ONLY (temporary, for the #390-followup investigation): calls
+    /// <c>vkGetShaderInfoAMD</c> with <c>pInfo=null</c> to fetch the driver's
+    /// self-reported required buffer size for <c>VkShaderStatisticsInfoAMD</c>,
+    /// to check it against our assumed C# struct layout (<c>sizeof</c> should
+    /// be 72 bytes per the Vulkan spec's C struct).
+    /// </summary>
+    internal unsafe int GetShaderInfoAmdReportedSize(nint pipeline, uint shaderStage = VkShaderStageFlags.Compute)
+    {
+        nint fn = VulkanApi.vkGetDeviceProcAddr(_device, "vkGetShaderInfoAMD");
+        if (fn == 0) throw new VulkanException(-3, "vkGetShaderInfoAMD not resolvable.");
+        var getShaderInfo = Marshal.GetDelegateForFunctionPointer<VkGetShaderInfoAMD>(fn);
+        nuint size = 0;
+        int r = getShaderInfo(_device, pipeline, shaderStage, VkShaderInfoTypeAmd.Statistics, ref size, null);
+        r.ThrowOnError("vkGetShaderInfoAMD (size query)");
+        return (int)size;
+    }
+
+    /// <summary>
+    /// DIAGNOSTIC ONLY (issue #241): returns the driver's ISA disassembly text for
+    /// a compiled compute pipeline via <c>VK_AMD_shader_info</c>. On the AMD
+    /// proprietary driver (LLPC) the blob carries PAL metadata that names the
+    /// wavefront size the stage was compiled for — the ground truth that
+    /// <c>VkPipelineExecutablePropertiesKHR.subgroupSize</c> does NOT give on this
+    /// driver (it reports the workgroup size there instead).
+    /// </summary>
+    internal unsafe string GetShaderDisassemblyAmd(nint pipeline, uint shaderStage = VkShaderStageFlags.Compute)
+    {
+        if (!HasShaderInfoAmd)
+            throw new InvalidOperationException(
+                "Device does not support VK_AMD_shader_info — cannot query shader disassembly.");
+
+        nint fn = VulkanApi.vkGetDeviceProcAddr(_device, "vkGetShaderInfoAMD");
+        if (fn == 0)
+            throw new VulkanException(-3, "vkGetShaderInfoAMD not resolvable.");
+        var getShaderInfo = Marshal.GetDelegateForFunctionPointer<VkGetShaderInfoAMD>(fn);
+
+        nuint size = 0;
+        getShaderInfo(_device, pipeline, shaderStage, VkShaderInfoTypeAmd.Disassembly, ref size, null)
+            .ThrowOnError("vkGetShaderInfoAMD (disassembly size)");
+        if (size == 0) return string.Empty;
+
+        byte[] buffer = new byte[(int)size];
+        fixed (byte* p = buffer)
+        {
+            nuint sz = size;
+            getShaderInfo(_device, pipeline, shaderStage, VkShaderInfoTypeAmd.Disassembly, ref sz, p)
+                .ThrowOnError("vkGetShaderInfoAMD (disassembly)");
+        }
+        int len = Array.IndexOf(buffer, (byte)0);
+        return System.Text.Encoding.UTF8.GetString(buffer, 0, len < 0 ? buffer.Length : len);
+    }
+
+    // Delegate matching vkGetPipelineExecutablePropertiesKHR
+    // (VK_KHR_pipeline_executable_properties). Resolved lazily via
+    // vkGetDeviceProcAddr — same pattern as vkGetShaderInfoAMD above.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private unsafe delegate int VkGetPipelineExecutablePropertiesKHR(
+        nint device, VkPipelineInfoKhr* pPipelineInfo,
+        uint* pExecutableCount, VkPipelineExecutablePropertiesKhr* pProperties);
+
+    /// <summary>
+    /// One compiled executable of a pipeline, as reported by
+    /// <c>vkGetPipelineExecutablePropertiesKHR</c>.
+    /// </summary>
+    /// <param name="Name">Driver's name for the executable (e.g. "compute").</param>
+    /// <param name="Description">Driver's free-text description.</param>
+    /// <param name="SubgroupSize">
+    /// The wave width the driver ACTUALLY compiled this executable for. This is
+    /// the only introspection API in the codebase that reports it — it is
+    /// invisible to timing A/Bs, to SPIR-V disassembly, and to
+    /// <c>VK_AMD_shader_info</c>'s statistics (issue #241).
+    /// </param>
+    public readonly record struct PipelineExecutableInfo(string Name, string Description, uint SubgroupSize);
+
+    /// <summary>
+    /// Reports the compiled executables of <paramref name="pipeline"/>, including
+    /// the driver's actual per-executable subgroup (wave) size, via
+    /// <c>VK_KHR_pipeline_executable_properties</c>. Diagnostic only.
+    /// </summary>
+    /// <param name="pipeline">The <c>VkPipeline</c> handle (e.g. <c>ComputePipeline.Pipeline</c>).</param>
+    /// <exception cref="InvalidOperationException">Thrown when the device did not enable the extension (see <see cref="HasPipelineExecutableProperties"/>).</exception>
+    public unsafe IReadOnlyList<PipelineExecutableInfo> GetPipelineSubgroupSizes(nint pipeline)
+    {
+        if (!HasPipelineExecutableProperties)
+            throw new InvalidOperationException(
+                "Device does not support VK_KHR_pipeline_executable_properties — cannot query the compiled subgroup size.");
+
+        nint fn = VulkanApi.vkGetDeviceProcAddr(_device, "vkGetPipelineExecutablePropertiesKHR");
+        if (fn == 0)
+            throw new VulkanException(-3,
+                "vkGetPipelineExecutablePropertiesKHR not resolvable — extension not enabled at device create.");
+
+        var query = Marshal.GetDelegateForFunctionPointer<VkGetPipelineExecutablePropertiesKHR>(fn);
+
+        var info = new VkPipelineInfoKhr
+        {
+            sType = VkStructureType.PipelineInfoKhr,
+            pipeline = pipeline,
+        };
+
+        uint count = 0;
+        query(_device, &info, &count, null).ThrowOnError("vkGetPipelineExecutablePropertiesKHR (count)");
+        if (count == 0)
+            return Array.Empty<PipelineExecutableInfo>();
+
+        var props = new VkPipelineExecutablePropertiesKhr[count];
+        for (int i = 0; i < props.Length; i++)
+            props[i].sType = VkStructureType.PipelineExecutablePropertiesKhr;
+
+        var results = new PipelineExecutableInfo[count];
+        fixed (VkPipelineExecutablePropertiesKhr* p = props)
+        {
+            query(_device, &info, &count, p).ThrowOnError("vkGetPipelineExecutablePropertiesKHR");
+            for (uint i = 0; i < count; i++)
+            {
+                results[i] = new PipelineExecutableInfo(
+                    ReadFixedUtf8(p[i].name, VkPipelineExecutablePropertiesKhr.MaxDescriptionSize),
+                    ReadFixedUtf8(p[i].description, VkPipelineExecutablePropertiesKhr.MaxDescriptionSize),
+                    p[i].subgroupSize);
+            }
+        }
+        return results;
+    }
+
+    private static unsafe string ReadFixedUtf8(byte* p, int max)
+    {
+        int len = 0;
+        while (len < max && p[len] != 0) len++;
+        return System.Text.Encoding.UTF8.GetString(p, len);
+    }
+
     // Maps the public handle-type enum to the internal interop flag bits.
     private static VkExternalSemaphoreHandleTypeFlags ToVkHandleType(ExternalSemaphoreHandleType t) => t switch
     {
@@ -2010,6 +2430,19 @@ public sealed class VulkanDevice : IDisposable
     // ────────────────────────────────────────────────────────────────
     // Forward-pass command submission
     // ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Hazard-scoped barrier tracker armed for the recording currently in
+    /// progress on this device (issue #144), or <c>null</c> when the legacy
+    /// blanket-barrier scheme is in effect. Armed by
+    /// <see cref="VulkanTransformerModel"/> right after
+    /// <see cref="SubmitContext.Begin"/> on its tracked forward path;
+    /// disarmed automatically by every <see cref="SubmitContext"/>
+    /// begin/submit so an aborted recording can never leak tracking into an
+    /// unrelated model's command buffer. Recording is single-threaded per
+    /// device, so a plain field suffices.
+    /// </summary>
+    internal VulkanHazardTracker? ActiveHazards;
 
     /// <summary>
     /// Reusable command-buffer + fence pair used by the fence-pipelined
@@ -2040,6 +2473,10 @@ public sealed class VulkanDevice : IDisposable
         /// </summary>
         public void Begin()
         {
+            // A fresh recording always starts untracked; the model re-arms
+            // the hazard tracker for its tracked path after Begin returns.
+            _device.ActiveHazards = null;
+            _splitThisForward = false;
             VulkanApi.vkResetCommandBuffer(_cmdBuf, 0).ThrowOnError("vkResetCommandBuffer");
             var begin = new VkCommandBufferBeginInfo
             {
@@ -2056,6 +2493,7 @@ public sealed class VulkanDevice : IDisposable
         /// </summary>
         public unsafe void SubmitAndWait()
         {
+            _device.ActiveHazards = null;
             VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer");
 
             nint cmdBufLocal = _cmdBuf;
@@ -2071,6 +2509,72 @@ public sealed class VulkanDevice : IDisposable
             VulkanApi.vkWaitForFences(_device._device, 1, fenceLocal, waitAll: 1, ulong.MaxValue)
                 .ThrowOnError("vkWaitForFences SubmitContext");
             VulkanApi.vkResetFences(_device._device, 1, fenceLocal).ThrowOnError("vkResetFences SubmitContext");
+        }
+
+        // Lazily-allocated second command buffer for SplitSubmit. At most ONE
+        // split per Begin/SubmitAndWait cycle: with two buffers, a second split
+        // would reset a buffer submitted earlier in the SAME forward (no fence
+        // yet) — guarded below.
+        private nint _cmdBufAlt;
+        private bool _splitThisForward;
+
+        /// <summary>
+        /// Mid-forward split: ends and submits everything recorded so far
+        /// WITHOUT a fence or host wait, then re-opens recording on a second
+        /// command buffer. The GPU starts executing the first chunk while the
+        /// host keeps recording — llama.cpp's chunked-submit overlap (issue
+        /// #143: hides most of the ~0.2-0.3 ms/token host recording cost on
+        /// small models). Queue-timeline pipeline barriers already recorded
+        /// (and recorded later) synchronize across the submit boundary, so the
+        /// dependency chain is unchanged — results are bit-identical.
+        /// At most one split per forward; the final <see cref="SubmitAndWait"/>
+        /// fence covers both submissions (same-queue ordering), so both
+        /// buffers are idle by the next <see cref="Begin"/>.
+        /// </summary>
+        public unsafe void SplitSubmit()
+        {
+            if (_splitThisForward)
+                throw new InvalidOperationException(
+                    "SplitSubmit may be called at most once per forward (two-buffer ring).");
+            _splitThisForward = true;
+
+            VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer SplitSubmit");
+            nint cmdBufLocal = _cmdBuf;
+            var submit = new VkSubmitInfo
+            {
+                sType = VkStructureType.SubmitInfo,
+                commandBufferCount = 1,
+                pCommandBuffers = (nint)(&cmdBufLocal),
+            };
+            VulkanApi.vkQueueSubmit(_device._queue, 1, submit, fence: 0)
+                .ThrowOnError("vkQueueSubmit SplitSubmit");
+
+            if (_cmdBufAlt == 0)
+            {
+                var cbai = new VkCommandBufferAllocateInfo
+                {
+                    sType = VkStructureType.CommandBufferAllocateInfo,
+                    commandPool = _device._commandPool,
+                    level = VkCommandBufferLevel.Primary,
+                    commandBufferCount = 1,
+                };
+                VulkanApi.vkAllocateCommandBuffers(_device._device, cbai, out _cmdBufAlt)
+                    .ThrowOnError("vkAllocateCommandBuffers SplitSubmit");
+            }
+
+            (_cmdBuf, _cmdBufAlt) = (_cmdBufAlt, _cmdBuf);
+            VulkanApi.vkResetCommandBuffer(_cmdBuf, 0).ThrowOnError("vkResetCommandBuffer SplitSubmit");
+            var begin = new VkCommandBufferBeginInfo
+            {
+                sType = VkStructureType.CommandBufferBeginInfo,
+                flags = VkCommandBufferUsageFlags.OneTimeSubmit,
+            };
+            VulkanApi.vkBeginCommandBuffer(_cmdBuf, begin).ThrowOnError("vkBeginCommandBuffer SplitSubmit");
+
+            // Keep the hazard tracker (issue #144) pointed at the live buffer.
+            // Epoch state carries across the chunk boundary: pipeline barriers
+            // synchronize prior command buffers in same-queue submission order.
+            _device.ActiveHazards?.OnCommandBufferSwitch(_cmdBuf);
         }
 
         /// <summary>
@@ -2093,6 +2597,7 @@ public sealed class VulkanDevice : IDisposable
         /// </remarks>
         public unsafe void SubmitAndSignal(nint signalSemaphore)
         {
+            _device.ActiveHazards = null;
             VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer SubmitAndSignal");
 
             nint cmdBufLocal = _cmdBuf;
@@ -2128,6 +2633,7 @@ public sealed class VulkanDevice : IDisposable
         /// </remarks>
         public unsafe void SubmitAndSignalTimeline(nint signalSemaphore, ulong signalValue)
         {
+            _device.ActiveHazards = null;
             VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer SubmitAndSignalTimeline");
 
             nint cmdBufLocal = _cmdBuf;
@@ -2184,6 +2690,12 @@ public sealed class VulkanDevice : IDisposable
                 nint local = _cmdBuf;
                 VulkanApi.vkFreeCommandBuffers(_device._device, _device._commandPool, 1, local);
                 _cmdBuf = 0;
+            }
+            if (_cmdBufAlt != 0)
+            {
+                nint local = _cmdBufAlt;
+                VulkanApi.vkFreeCommandBuffers(_device._device, _device._commandPool, 1, local);
+                _cmdBufAlt = 0;
             }
         }
     }

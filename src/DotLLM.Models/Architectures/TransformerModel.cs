@@ -101,6 +101,9 @@ public sealed unsafe class TransformerModel : IModel
     /// <summary>Total bytes allocated for inference scratch buffers.</summary>
     public long ComputeMemoryBytes => _state.AllocatedBytes;
 
+    /// <inheritdoc/>
+    public long RepackedWeightBytes => _weights.RepackedBytes;
+
     /// <summary>Debug: limit the number of transformer layers processed. 0 = all layers (default). -1 = skip all layers (embedding + LM head only).</summary>
     internal int DebugMaxLayers { get; set; }
 
@@ -180,11 +183,23 @@ public sealed unsafe class TransformerModel : IModel
     /// </summary>
     public static TransformerModel LoadFromSafetensors(
         ISafetensorsTensorSource file, ModelConfig config, ThreadingConfig threading)
+        => LoadFromSafetensors(file, config, threading, i2sCache: null);
+
+    /// <summary>
+    /// Loads a transformer model from an opened HuggingFace-convention safetensors source with
+    /// threading configuration and an optional BitNet I2_S weight cache. When
+    /// <paramref name="i2sCache"/> is supplied (BitNet checkpoints only), each linear
+    /// projection's ternary-packed bytes are served from / persisted to disk, avoiding the
+    /// dominant online bf16→I2_S quantization cost on repeated loads.
+    /// </summary>
+    internal static TransformerModel LoadFromSafetensors(
+        ISafetensorsTensorSource file, ModelConfig config, ThreadingConfig threading,
+        BitNetI2SCacheContext? i2sCache)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
 
-        var weights = TransformerWeightsSafetensorsLoader.Load(file, config);
+        var weights = TransformerWeightsSafetensorsLoader.Load(file, config, i2sCache);
         return BuildFromPrebuiltWeightsInternal(weights, config, threading, anchorSource: file);
     }
 
@@ -266,6 +281,24 @@ public sealed unsafe class TransformerModel : IModel
         int qBlockElems = config.NumAttentionHeads * Math.Max(slidingHeadDim, fullHeadDim);
         int kvBlockElems = Math.Max(slidingKvHeads * slidingHeadDim, fullKvHeads * fullHeadDim);
 
+        // MLA (DeepSeek-V2/V3) fuses o_proj INSIDE the attention kernel: unlike
+        // the GQA branch (which writes the pre-o_proj, numHeads*headDim-wide
+        // attention output into AttnOutput and applies o_proj afterward into a
+        // separate hiddenSize-wide buffer), the MLA branch writes its ALREADY
+        // o_proj-expanded, hiddenSize-wide result directly into the shared
+        // AttnOutput scratch. AttnOutput must therefore be sized to at least
+        // hiddenSize for MLA models — qBlockElems alone
+        // (numHeads*(qkNopeHeadDim+qkRopeHeadDim)) can be far smaller than
+        // hiddenSize on compact/synthetic configs (undersized allocation here
+        // is a native heap buffer overflow, not a catchable exception — #193).
+        // Real DeepSeek-V2-Lite-scale configs happen to satisfy qBlockElems >
+        // hiddenSize already (16 heads * 192 = 3072 > 2048), so this is a
+        // no-op there; Math.Max keeps every non-MLA architecture byte-for-byte
+        // unchanged.
+        int attnOutBlockElems = config.MlaConfig is not null
+            ? Math.Max(qBlockElems, config.HiddenSize)
+            : qBlockElems;
+
         var state = new TransformerForwardState(
             config.HiddenSize,
             config.NumAttentionHeads,
@@ -284,11 +317,17 @@ public sealed unsafe class TransformerModel : IModel
             globalRopeTheta,
             qBlockElems,
             kvBlockElems,
+            attnOutBlockElems: attnOutBlockElems,
             // Full global head dim — the partial-rotary frequency denominator
             // (Gemma 4 global layers: rotate globalRopeDim=128 dims but use freq
             // base over the full head dim 512). Equals globalRopeDim when there is
             // no partial rotary (Gemma 3), collapsing to the standard precompute.
-            globalFullHeadDim: config.GlobalHeadDim ?? config.HeadDim);
+            globalFullHeadDim: config.GlobalHeadDim ?? config.HeadDim,
+            // Proportional-rope factors (rope_freqs.weight — Gemma-4 E2B/E4B
+            // full-attention layers): folded into the global cos/sin table
+            // (angle = pos * θ^(-2i/dim) / factor[i], ggml theta/ff). Null for
+            // every model without the tensor.
+            globalFreqFactors: globalRopeDim > 0 ? weights.RopeFreqFactors : null);
 
         // For MLA + YaRN (DeepSeek-V2/V3 long-context), rebuild cos/sin tables
         // using per-dim ramped inverse frequencies. Plain precompute above is a
@@ -331,11 +370,19 @@ public sealed unsafe class TransformerModel : IModel
                  && rcfg.ScalingFactor > 1.0f
                  && rcfg.OrigMaxSeqLen > 0)
         {
+            // gpt-oss (llama.cpp ggml_rope_ext yarn, ext_factor=1) additionally
+            // applies the attention-magnitude concentration
+            // mscale = attn_factor * (1 + 0.1 * ln(factor)) to cos/sin. Other
+            // dense-YaRN archs (SmolLM3, Llama 3.1+) keep the plain AttnFactor
+            // convention established when they were wired.
+            float mscaleMultiplier = config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss
+                ? rcfg.AttnFactor * (1.0f + 0.1f * MathF.Log(rcfg.ScalingFactor))
+                : rcfg.AttnFactor;
             DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTableYarn(
                 config.MaxSequenceLength, ropeDim, ropeTheta,
                 rcfg.ScalingFactor, rcfg.OrigMaxSeqLen,
                 rcfg.BetaFast, rcfg.BetaSlow,
-                mscaleMultiplier: rcfg.AttnFactor,
+                mscaleMultiplier: mscaleMultiplier,
                 state.CosTable, state.SinTable);
         }
 
@@ -647,8 +694,13 @@ public sealed unsafe class TransformerModel : IModel
     /// Returns the effective sliding-window size for <paramref name="layer"/>.
     /// Honours <see cref="ModelConfig.PerLayerSlidingWindow"/> when set (each entry
     /// may be null for full attention or a positive int for sliding); otherwise
-    /// falls back to the model-wide <see cref="ModelConfig.SlidingWindowSize"/>.
-    /// Used for Gemma 3's interleaved local/global pattern.
+    /// falls back to the model-wide <see cref="ModelConfig.SlidingWindowSize"/>,
+    /// optionally modulated by <see cref="ModelConfig.SlidingWindowPattern"/> —
+    /// pattern N &gt; 0 applies the window only to layers where
+    /// <c>layer % N &lt; N - 1</c> (llama.cpp <c>set_swa_pattern(N,
+    /// dense_first=false)</c>; gpt-oss N=2: even layers windowed, odd dense).
+    /// Used for Gemma 3's interleaved local/global pattern and gpt-oss's
+    /// alternating sliding/dense attention.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int? GetLayerSlidingWindow(int layer)
@@ -656,7 +708,10 @@ public sealed unsafe class TransformerModel : IModel
         var perLayer = Config.PerLayerSlidingWindow;
         if (perLayer is not null && (uint)layer < (uint)perLayer.Count)
             return perLayer[layer];
-        return _slidingWindowSize;
+        if (_slidingWindowSize is null) return null;
+        int pattern = Config.SlidingWindowPattern;
+        if (pattern <= 0) return _slidingWindowSize;
+        return (layer % pattern) < pattern - 1 ? _slidingWindowSize : null;
     }
 
     /// <summary>
@@ -793,6 +848,59 @@ public sealed unsafe class TransformerModel : IModel
             }
         }
 
+        // 1c. Per-Layer Embeddings (PLE) — Gemma-4 dense text tower (E2B/E4B).
+        // Build the per-layer input tensor [seq, numLayers*pleDim] ONCE from the
+        // scaled main embedding (`hidden`) and the token-identity table, then inject
+        // a gated residual into every layer's output inside the loop. Null for every
+        // other architecture (buffers stay null, no work). Cross-backend: CUDA/Vulkan
+        // would compute/upload this same buffer and reuse the identical injection.
+        float* pleInputs = null, pleIdentity = null, pleGateScratch = null, pleProjScratch = null;
+        var pleWeights = _weights.PerLayerEmbedding;
+        int pleDim = pleWeights?.PerLayerDim ?? 0;
+        int pleLp = pleWeights is not null ? Config.NumLayers * pleDim : 0;
+        if (pleWeights is not null)
+        {
+            pleInputs = (float*)NativeMemory.AlignedAlloc((nuint)(sizeof(float) * seqLen * pleLp), 64);
+            pleIdentity = (float*)NativeMemory.AlignedAlloc((nuint)(sizeof(float) * seqLen * pleLp), 64);
+            pleGateScratch = (float*)NativeMemory.AlignedAlloc((nuint)(sizeof(float) * seqLen * pleDim), 64);
+            pleProjScratch = (float*)NativeMemory.AlignedAlloc((nuint)(sizeof(float) * seqLen * hiddenSize), 64);
+
+            // Token-identity gather: embed_tokens_per_layer[token] scaled by √pleDim.
+            GatherPerLayerIdentity(tokenIds, pleIdentity, pleLp, MathF.Sqrt(pleDim),
+                pleWeights.EmbedTokensPerLayer, pleWeights.EmbedTokensPerLayerQt);
+
+            // Combine with the context projection (output aliases projScratch = pleInputs).
+            PerLayerEmbeddings.ComputeInputs(
+                tokenIdentity: pleIdentity,
+                inputsEmbeds: hidden,
+                projWeight: (float*)pleWeights.ModelProjection,
+                projNormWeight: pleWeights.ProjectionNorm,
+                projScratch: pleInputs,
+                output: pleInputs,
+                seqLen: seqLen, hiddenSize: hiddenSize,
+                numLayers: Config.NumLayers, pleDim: pleDim, eps: eps);
+        }
+
+        // 1d. Shared-KV donor stash (Gemma-4 E2B/E4B, cacheless path only). The
+        // trailing NumSharedKvLayers layers attend over the KV of the LAST own-KV
+        // layer of their attention kind (llama.cpp reuse rule — see
+        // ModelConfig.SharedKvDonorLayer). On the cacheless full-sequence forward
+        // the donor layers stash their post-rope K / post-norm V here (slot 0 =
+        // sliding donor, slot 1 = full donor); with a KV-cache the shared layers
+        // read the donor's cache lines instead and the stash stays null.
+        float* sharedKvK = null, sharedKvV = null;
+        int sharedKvSlotStride = 0;
+        if (Config.NumSharedKvLayers > 0 && kvCache is null)
+        {
+            int maxKvStride = Math.Max(
+                Config.NumKvHeads * Config.HeadDim,
+                (Config.NumGlobalKvHeads ?? Config.NumKvHeads) * (Config.GlobalHeadDim ?? Config.HeadDim));
+            sharedKvSlotStride = seqLen * maxKvStride;
+            nuint stashBytes = (nuint)(sizeof(float) * 2L * sharedKvSlotStride);
+            sharedKvK = (float*)NativeMemory.AlignedAlloc(stashBytes, 64);
+            sharedKvV = (float*)NativeMemory.AlignedAlloc(stashBytes, 64);
+        }
+
         // 2. TRANSFORMER LAYERS
         var repackedLayers = _weights.RepackedLayers;
         int numLayers = DebugMaxLayers switch
@@ -893,7 +1001,9 @@ public sealed unsafe class TransformerModel : IModel
                         in lw, layer, seqLen,
                         hidden, residual, normOut, q, k, v, attnOut,
                         numKvHeadsLayer, headDimLayer, qStrideLayer, kvStrideLayer,
-                        positions, eps, kvCache);
+                        positions, eps, kvCache,
+                        pleInputs, pleGateScratch, pleProjScratch, pleDim,
+                        sharedKvK, sharedKvV, sharedKvSlotStride);
                 }
                 continue;
             }
@@ -972,7 +1082,9 @@ public sealed unsafe class TransformerModel : IModel
                             cachedLatent: _mlaLatentKvState.GetLatentPointer(layer),
                             cachedKPe: _mlaLatentKvState.GetKPePointer(layer),
                             cachedLength: _mlaLatentKvState.GetCurrentLength(layer),
-                            attnScaleMultiplier: mlaScaleMultiplier);
+                            attnScaleMultiplier: mlaScaleMultiplier,
+                            loraAdapter: _currentAdapter,
+                            loraLayer: layer);
                     }
                     else
                     {
@@ -1002,7 +1114,9 @@ public sealed unsafe class TransformerModel : IModel
                             cachedLatent: _mlaLatentKvState.GetLatentPointer(layer),
                             cachedKPe: _mlaLatentKvState.GetKPePointer(layer),
                             cachedLength: _mlaLatentKvState.GetCurrentLength(layer),
-                            attnScaleMultiplier: mlaScaleMultiplier);
+                            attnScaleMultiplier: mlaScaleMultiplier,
+                            loraAdapter: _currentAdapter,
+                            loraLayer: layer);
                     }
                     _mlaLatentKvState.Advance(layer, seqLen);
                 }
@@ -1072,9 +1186,11 @@ public sealed unsafe class TransformerModel : IModel
             // re-use the buffer for stage 1. Pre-LoRA-Q8_0 this was scoped
             // inside each sub-branch.
             byte* preQuantNormQkv = null;
-            // The fused decode kernels don't support I2_S; route ternary weights through the
-            // standard (unfused) projection path, which dispatches to the I2_S GEMV.
-            if (seqLen == 1 && _threadPool != null && !adapterActive && lw.QQuantType != QuantizationType.I2_S)
+            // The fused decode kernels don't support I2_S/PQ2_0 (both ternary, per-group or
+            // per-tensor scaled); route ternary weights through the standard (unfused)
+            // projection path, which dispatches to the dedicated ternary GEMV.
+            if (seqLen == 1 && _threadPool != null && !adapterActive
+                && lw.QQuantType != QuantizationType.I2_S && lw.QQuantType != QuantizationType.PQ2_0)
             {
                 // Decode path: try fused RmsNorm+Quantize (skips normOut intermediate)
                 byte* preQuantNorm = null;
@@ -1183,10 +1299,13 @@ public sealed unsafe class TransformerModel : IModel
             // e. Attention — with or without KV-cache
             // Gemma 3 family extras (no-op on every other architecture):
             //  - PerLayerSlidingWindow[layer]: per-layer sliding-window override
-            //    (Gemma 3 interleaves local/global attention).
+            //    (Gemma 3 interleaves local/global attention; gpt-oss alternates
+            //    windowed/dense via ModelConfig.SlidingWindowPattern).
             //  - QueryPreAttnScalar: override the default 1/sqrt(headDim) scale.
             //  - AttnLogitSoftcap: pre-softmax tanh soft-cap (Gemma 2 sets 50.0;
             //    Gemma 3 leaves null but the plumbing is wired).
+            // gpt-oss extras: lw.AttnSinks — per-head sink logits joining each
+            // head's softmax denominator (null for every other architecture).
             int? layerSlidingWindow = GetLayerSlidingWindow(layer);
             float attnScale = Config.QueryPreAttnScalar is float qpas && qpas > 0
                 ? 1.0f / MathF.Sqrt(qpas)
@@ -1211,7 +1330,7 @@ public sealed unsafe class TransformerModel : IModel
                     // Quantized path: dequantize KV tiles on-the-fly during attention
                     Attention.Execute(q, qkvCache, layer, attnOut,
                         seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], _threadPool,
-                        layerSlidingWindow, attnSoftCap);
+                        layerSlidingWindow, attnSoftCap, lw.AttnSinks);
                 }
                 else
                 {
@@ -1220,7 +1339,8 @@ public sealed unsafe class TransformerModel : IModel
 
                     Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
                         seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], attnScale,
-                        _threadPool, layerSlidingWindow, attnSoftCap);
+                        _threadPool, layerSlidingWindow, attnSoftCap,
+                        AttentionMaskMode.Causal, 0, lw.AttnSinks);
                 }
             }
             else
@@ -1232,7 +1352,7 @@ public sealed unsafe class TransformerModel : IModel
                 Attention.Execute(q, k, v, attnOut,
                     seqLen, seqLen, numHeads, numKvHeadsLayer, headDimLayer, 0, attnScale, _threadPool,
                     layerSlidingWindow, attnSoftCap,
-                    _currentMaskSpec.Mode, _currentMaskSpec.PrefixLength);
+                    _currentMaskSpec.Mode, _currentMaskSpec.PrefixLength, lw.AttnSinks);
             }
 
             // Optional attention sub-norm (BitNet Sub-LN): RMSNorm over the attention output
@@ -1306,11 +1426,63 @@ public sealed unsafe class TransformerModel : IModel
                 }
 
                 MoeLayerWeights moe = lw.Moe!;
+                // BitNet-ternary MoE (identity-MoTE): experts are I2_S with a relu² +
+                // per-expert ffn_sub_norm body, dispatched through the indexed I2_S kernel.
+                // The router (Gate + optional GateBias) stays F32.
+                // CROSS-BACKEND TODO (CPU-first landed here): mirror this in CudaMoeFfn
+                // (add an I2_S variant of native moe_grouped_gemv.cu — the quant path already
+                // uploads per-expert quant bytes) and VulkanTransformerModel (new
+                // moe_indexed_matmul_i2s_f32.comp; the q4_k/q8_0 indexed shaders are templates),
+                // plus the GateBias add in each backend's router. See
+                // .planning/2026-07-08-mote-dotllm-export-design.md §3.4.
+                if (moe.IsBitNetI2S)
+                {
+                    MoeSwiGluMlp.ExecuteBitNetMoe(
+                        hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
+                        gateWeights: moe.Gate,
+                        gateBias: moe.GateBias is not null ? moe.GateBias.AsSpan() : ReadOnlySpan<float>.Empty,
+                        gateBank: (byte*)moe.GateExpsI2SBase, gateRowBytes: moe.GateExpsI2SRowBytes, gateScales: moe.GateExpsI2SScales!,
+                        upBank: (byte*)moe.UpExpsI2SBase, upRowBytes: moe.UpExpsI2SRowBytes, upScales: moe.UpExpsI2SScales!,
+                        downBank: (byte*)moe.DownExpsI2SBase, downRowBytes: moe.DownExpsI2SRowBytes, downScales: moe.DownExpsI2SScales!,
+                        expertFfnSubNorm: moe.ExpertFfnSubNorm!,
+                        output: new Span<float>(normOut, seqLen * hiddenSize),
+                        numExperts: moe.NumExperts,
+                        numExpertsPerTok: moe.NumExpertsPerTok,
+                        hiddenSize: hiddenSize,
+                        intermediateSize: moe.IntermediateSize,
+                        seqLen: seqLen,
+                        normTopKProb: moe.NormTopKProb,
+                        rmsEps: eps,
+                        threadPool: _threadPool);
+                }
+                // Quantized-expert path (gpt-oss): consume the raw GGUF expert
+                // banks directly (MXFP4/Q8_0), with router/expert biases,
+                // softmax-after-top-k gating, and clamped swiglu_oai.
+                else if (moe.UseQuantExperts)
+                {
+                    MoeQuantSwiGluMlp.Execute(
+                        hidden: normOut, output: normOut, seqLen: seqLen,
+                        routerWeight: moe.Gate,
+                        routerBias: moe.RouterBias is null ? ReadOnlySpan<float>.Empty : moe.RouterBias,
+                        gateExpsBase: moe.GateExpsRaw, gateQt: moe.GateExpsRawQt,
+                        upExpsBase: moe.UpExpsRaw, upQt: moe.UpExpsRawQt,
+                        downExpsBase: moe.DownExpsRaw, downQt: moe.DownExpsRawQt,
+                        gateBias: moe.GateExpsBias is null ? ReadOnlySpan<float>.Empty : moe.GateExpsBias,
+                        upBias: moe.UpExpsBias is null ? ReadOnlySpan<float>.Empty : moe.UpExpsBias,
+                        downBias: moe.DownExpsBias is null ? ReadOnlySpan<float>.Empty : moe.DownExpsBias,
+                        numExperts: moe.NumExperts,
+                        numExpertsPerTok: moe.NumExpertsPerTok,
+                        hiddenSize: hiddenSize,
+                        intermediateSize: moe.IntermediateSize,
+                        softmaxAfterTopK: moe.SoftmaxAfterTopK,
+                        useSwiGluOai: moe.UseSwiGluOai,
+                        pool: _threadPool);
+                }
                 // Route through the shared-expert-aware overload iff we need
                 // shared-expert addition OR the raw-softmax (non-renormalised)
                 // Qwen1.5-MoE gating. The simple Mixtral path stays the call
                 // target for the common case.
-                if (moe.HasSharedExpert || !moe.NormTopKProb)
+                else if (moe.HasSharedExpert || !moe.NormTopKProb)
                 {
                     ReadOnlySpan<float> sharedGateSpan = moe.SharedExpertGate is not null
                         ? moe.SharedExpertGate.AsSpan()
@@ -1375,8 +1547,9 @@ public sealed unsafe class TransformerModel : IModel
             // so the LoRA delta call site can reuse the activation Q8_0
             // buffer for stage 1.
             byte* preQuantFfnHoisted = null;
-            // I2_S (BitNet) is unsupported by the fused decode kernels — use the unfused path.
-            if (seqLen == 1 && _threadPool != null && !ffnAdapterActive && lw.GateQuantType != QuantizationType.I2_S)
+            // I2_S/PQ2_0 (both ternary) are unsupported by the fused decode kernels — use the unfused path.
+            if (seqLen == 1 && _threadPool != null && !ffnAdapterActive
+                && lw.GateQuantType != QuantizationType.I2_S && lw.GateQuantType != QuantizationType.PQ2_0)
             {
                 // Decode path: try fused RmsNorm+Quantize (skips normOut intermediate)
                 byte* preQuantFfn = null;
@@ -1508,6 +1681,37 @@ public sealed unsafe class TransformerModel : IModel
                     new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
                     new Span<float>(hidden + t * hiddenSize, hiddenSize));
             }
+
+            // l. Per-Layer Embeddings (PLE) injection — Gemma-4 dense text tower.
+            // Gated residual added to the layer output using this layer's slice of the
+            // precomputed per-layer input tensor. No-op for every other architecture
+            // (pleInputs null). See docs verified against HF Gemma4TextDecoderLayer.
+            if (pleInputs is not null && lw.PleGateWeight != 0)
+            {
+                PerLayerEmbeddings.InjectLayer(
+                    hidden: hidden,
+                    perLayerInputs: pleInputs,
+                    layerIdx: layer, numLayers: Config.NumLayers,
+                    gateWeight: (float*)lw.PleGateWeight,
+                    projWeight: (float*)lw.PleProjWeight,
+                    postNormWeight: lw.PlePostNormWeight,
+                    gateScratch: pleGateScratch,
+                    projScratch: pleProjScratch,
+                    seqLen: seqLen, hiddenSize: hiddenSize, pleDim: pleDim, eps: eps);
+            }
+        }
+
+        if (pleInputs is not null)
+        {
+            NativeMemory.AlignedFree(pleInputs);
+            NativeMemory.AlignedFree(pleIdentity);
+            NativeMemory.AlignedFree(pleGateScratch);
+            NativeMemory.AlignedFree(pleProjScratch);
+        }
+        if (sharedKvK is not null)
+        {
+            NativeMemory.AlignedFree(sharedKvK);
+            NativeMemory.AlignedFree(sharedKvV);
         }
 
         // 3. FINAL NORM (in-place: hidden → hidden)
@@ -1549,11 +1753,24 @@ public sealed unsafe class TransformerModel : IModel
         float* hidden, float* residual, float* normOut,
         float* q, float* k, float* v, float* attnOut,
         int numKvHeadsLayer, int headDimLayer, int qStrideLayer, int kvStrideLayer,
-        ReadOnlySpan<int> positions, float eps, IKvCache? kvCache = null)
+        ReadOnlySpan<int> positions, float eps, IKvCache? kvCache = null,
+        float* pleInputs = null, float* pleGateScratch = null, float* pleProjScratch = null,
+        int pleDim = 0,
+        float* sharedKvK = null, float* sharedKvV = null, int sharedKvSlotStride = 0)
     {
         int hiddenSize = Config.HiddenSize;
         int numHeads = Config.NumAttentionHeads;
         var g4 = lw.Gemma4!;
+
+        // Shared-KV (Gemma-4 E2B/E4B): the trailing NumSharedKvLayers layers skip
+        // their own K/V entirely and attend over the donor layer's KV — donor =
+        // last own-KV layer of the same attention kind (ModelConfig.SharedKvDonorLayer,
+        // mirroring llama.cpp's reuse rule). Every other model has ownKv == true.
+        bool ownKv = Config.LayerHasOwnKv(layer);
+        // Stash slot: 0 = sliding donor, 1 = full donor (only used when sharing).
+        int sharedSlot = Config.IsFullAttentionLayer(layer) ? 1 : 0;
+        bool isSharedDonor = Config.NumSharedKvLayers > 0
+            && layer == Config.NumLayers - Config.NumSharedKvLayers - (Config.IsFullAttentionLayer(layer) ? 1 : 2);
 
         // DIFFUSION region per-layer scalar split. On diffusion-gemma the LAST
         // per-layer op uses enc_layer_output_scale for the PROMPT rows [0, P) and
@@ -1584,44 +1801,79 @@ public sealed unsafe class TransformerModel : IModel
 
         // Q = wq · normIn ; K = wk · normIn (raw projections, GEMM quantizes internally)
         Gemm(lw.QWeight, lw.QQuantType, normOut, q, lw.QOutputDim, lw.QInputDim, seqLen);
-        Gemm(lw.KWeight, lw.KQuantType, normOut, k, lw.KOutputDim, lw.KInputDim, seqLen);
+        if (ownKv)
+        {
+            Gemm(lw.KWeight, lw.KQuantType, normOut, k, lw.KOutputDim, lw.KInputDim, seqLen);
 
-        // V branch: off the RAW K projection when wv absent (global layers),
-        // else V = wv · normIn. K is captured BEFORE k-norm/rope, so when
-        // VFromK we copy k → v now (k still holds the raw projection).
-        if (g4.VFromK)
-            new Span<float>(k, seqLen * kvStrideLayer).CopyTo(new Span<float>(v, seqLen * kvStrideLayer));
-        else
-            Gemm(lw.VWeight, lw.VQuantType, normOut, v, lw.VOutputDim, lw.VInputDim, seqLen);
+            // V branch: off the RAW K projection when wv absent (global layers),
+            // else V = wv · normIn. K is captured BEFORE k-norm/rope, so when
+            // VFromK we copy k → v now (k still holds the raw projection).
+            if (g4.VFromK)
+                new Span<float>(k, seqLen * kvStrideLayer).CopyTo(new Span<float>(v, seqLen * kvStrideLayer));
+            else
+                Gemm(lw.VWeight, lw.VQuantType, normOut, v, lw.VOutputDim, lw.VInputDim, seqLen);
+        }
+
+        // LoRA delta (q/k/v): y += scale * (normIn · B) · A. No-op when no adapter is
+        // active. Applied AFTER the base projection and BEFORE QK-norm/RoPE, same
+        // ordering as the generic Llama-style layer path. No v_proj delta on VFromK
+        // layers — the base model has no v_proj weight there for an adapter to target.
+        // Shared-KV layers have no K/V projections at all, so no k/v deltas either.
+        if (_currentAdapter is not null)
+        {
+            ApplyLoraDelta(layer, "q_proj", normOut, q, seqLen, lw.QInputDim, lw.QOutputDim);
+            if (ownKv)
+            {
+                ApplyLoraDelta(layer, "k_proj", normOut, k, seqLen, lw.KInputDim, lw.KOutputDim);
+                if (!g4.VFromK)
+                    ApplyLoraDelta(layer, "v_proj", normOut, v, seqLen, lw.VInputDim, lw.VOutputDim);
+            }
+        }
 
         // Q-norm (rms * attn_q_norm per head), then K-norm (rms * attn_k_norm per
         // kv head). V-norm is WEIGHT-LESS rms per kv head (no scale), all layers.
         if (lw.QNormWeight is not null)
             ApplyPerHeadNorm(lw.QNormWeight, q, numHeads, headDimLayer, seqLen, eps);
-        if (lw.KNormWeight is not null)
-            ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeadsLayer, headDimLayer, seqLen, eps);
-        ApplyPerHeadNormWeightless(v, numKvHeadsLayer, headDimLayer, seqLen, eps);
+        if (ownKv)
+        {
+            if (lw.KNormWeight is not null)
+                ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeadsLayer, headDimLayer, seqLen, eps);
+            ApplyPerHeadNormWeightless(v, numKvHeadsLayer, headDimLayer, seqLen, eps);
+        }
 
         // RoPE on Q and K (V is NOT roped). Per-attention-type table/dim/pairing.
         // Global (full-attention) layers use PARTIAL NeoX rope: only the leading
         // GlobalRopeDim dims rotate, but the rotate_half pairing offset is the FULL
         // head's half-dim (dims [0,64) ↔ [256,320)). Sliding layers use full rope.
+        // Shared-KV layers rope Q only (their donor's K is already roped).
         var (ropeCos, ropeSin, ropeDimLayer, ropeTypeLayer) = GetLayerRope(layer);
         var qSpan = new Span<float>(q, seqLen * qStrideLayer);
-        var kSpan = new Span<float>(k, seqLen * kvStrideLayer);
+        var kSpan = ownKv ? new Span<float>(k, seqLen * kvStrideLayer) : Span<float>.Empty;
+        int ropeKvHeads = ownKv ? numKvHeadsLayer : 0;
         bool partialGlobal = Config.IsFullAttentionLayer(layer)
             && Config.PartialRotaryFactor is float prf && prf > 0f && prf < 1f
             && ropeDimLayer < headDimLayer;
         if (partialGlobal)
             RoPE.ExecutePartialNeoX(
                 qSpan, kSpan, positions,
-                numHeads, numKvHeadsLayer, headDimLayer, ropeDimLayer / 2,
+                numHeads, ropeKvHeads, headDimLayer, ropeDimLayer / 2,
                 ropeCos, ropeSin);
         else
             RoPE.Execute(
                 qSpan, kSpan, positions,
-                numHeads, numKvHeadsLayer, headDimLayer, ropeDimLayer,
+                numHeads, ropeKvHeads, headDimLayer, ropeDimLayer,
                 ropeCos, ropeSin, ropeTypeLayer);
+
+        // Shared-KV donor stash (cacheless): capture this donor layer's post-rope
+        // K / post-norm V for the trailing shared layers of the same kind.
+        if (isSharedDonor && sharedKvK is not null)
+        {
+            int kvElemsStash = seqLen * kvStrideLayer;
+            new ReadOnlySpan<float>(k, kvElemsStash)
+                .CopyTo(new Span<float>(sharedKvK + sharedSlot * sharedKvSlotStride, kvElemsStash));
+            new ReadOnlySpan<float>(v, kvElemsStash)
+                .CopyTo(new Span<float>(sharedKvV + sharedSlot * sharedKvSlotStride, kvElemsStash));
+        }
 
         // Attention: softmax(Qᵀ·K * 1.0 + causal mask) · V, GQA broadcast. Scale is
         // 1.0 (q_norm/k_norm make Q,K unit) — QueryPreAttnScalar=1.0 → 1/sqrt(1)=1.
@@ -1640,7 +1892,46 @@ public sealed unsafe class TransformerModel : IModel
         //   logical position P+i so the sliding-window lower bound matches the unified
         //   Hybrid path exactly.
         // None (default): the verbatim unified cacheless attention — byte-identical.
-        if (_pkvPhase == DiffusionKvPhase.Prefill)
+        if (!ownKv)
+        {
+            // ── Shared-KV layer: attend over the donor layer's KV ─────────────
+            // The donor (same attention kind) has already run this forward — its
+            // post-rope K / post-norm V sit in the KV-cache (cached path) or the
+            // per-forward stash (cacheless path). This layer neither projects nor
+            // stores KV (llama.cpp gemma4.cpp "reuse KV cache of earlier layers").
+            int donorLayer = Config.SharedKvDonorLayer(layer);
+            if (kvCache is not null)
+            {
+                int seqKv = kvCache.CurrentLength;
+                if (kvCache is IQuantizedKvCache qkvCacheShared)
+                {
+                    Attention.Execute(q, qkvCacheShared, donorLayer, attnOut,
+                        seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], _threadPool,
+                        layerSlidingWindow, softCap: 0f);
+                }
+                else
+                {
+                    var donorK = kvCache.GetKeysRef(donorLayer);
+                    var donorV = kvCache.GetValuesRef(donorLayer);
+                    Attention.Execute(q, (float*)donorK.DataPointer, (float*)donorV.DataPointer, attnOut,
+                        seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], attnScale,
+                        _threadPool, layerSlidingWindow, softCap: 0f);
+                }
+            }
+            else
+            {
+                if (sharedKvK is null)
+                    throw new InvalidOperationException(
+                        "Shared-KV layer reached without a donor stash — cacheless forward must allocate it.");
+                float* donorK = sharedKvK + sharedSlot * sharedKvSlotStride;
+                float* donorV = sharedKvV + sharedSlot * sharedKvSlotStride;
+                Attention.Execute(q, donorK, donorV, attnOut,
+                    seqLen, seqLen, numHeads, numKvHeadsLayer, headDimLayer, 0, attnScale, _threadPool,
+                    layerSlidingWindow, softCap: 0f,
+                    _currentMaskSpec.Mode, _currentMaskSpec.PrefixLength);
+            }
+        }
+        else if (_pkvPhase == DiffusionKvPhase.Prefill)
         {
             // K/V are row-major [seqLen × kvStrideLayer]; store them whole (seqLen == P).
             var store = _pkvStore!;
@@ -1735,6 +2026,8 @@ public sealed unsafe class TransformerModel : IModel
 
         // O projection: attnOut [seqLen × numHeads*headDim] → normOut [seqLen × hidden]
         Gemm(lw.OWeight, lw.OQuantType, attnOut, normOut, lw.OOutputDim, lw.OInputDim, seqLen);
+        if (_currentAdapter is not null)
+            ApplyLoraDelta(layer, "o_proj", attnOut, normOut, seqLen, lw.OInputDim, lw.OOutputDim);
 
         // post_attention_norm, then residual add: attn_out = rms(O)*post_attn + input.
         for (int t = 0; t < seqLen; t++)
@@ -1762,44 +2055,57 @@ public sealed unsafe class TransformerModel : IModel
                         new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
                         new Span<float>(attnOutP + t * hiddenSize, hiddenSize));
 
-                // ── Dense FFN branch (shared expert) ──────────────────────
+                // ── Dense FFN branch (shared expert / the ONLY FFN on E2B/E4B) ──
                 // cur_mlp = down( geglu(gate·n) * (up·n) ), n = rms(attn_out)*ffn_norm
-                Gemma4DenseFfn(in lw, attnOutP, denseP, tmpP, normOut, seqLen, eps);
-                // cur_mlp = rms(cur_mlp) * post_ffw_norm_1
-                for (int t = 0; t < seqLen; t++)
-                    RmsNorm.Execute(
-                        new ReadOnlySpan<float>(denseP + t * hiddenSize, hiddenSize),
-                        g4.PostFfwNorm1, eps,
-                        new Span<float>(denseP + t * hiddenSize, hiddenSize));
+                Gemma4DenseFfn(in lw, layer, attnOutP, denseP, tmpP, normOut, seqLen, eps);
 
-                // ── MoE branch ─────────────────────────────────────────────
-                Gemma4Moe(in lw, layer, attnOutP, moeP, tmpP, seqLen, eps);
-                // cur_moe = rms(cur_moe) * post_ffw_norm_2
-                for (int t = 0; t < seqLen; t++)
-                    RmsNorm.Execute(
-                        new ReadOnlySpan<float>(moeP + t * hiddenSize, hiddenSize),
-                        g4.PostFfwNorm2, eps,
-                        new Span<float>(moeP + t * hiddenSize, hiddenSize));
-
-                // ── Combine: cur = rms(cur_mlp + cur_moe)*post_ffw_norm + attn_out ──
-                for (int t = 0; t < seqLen; t++)
+                if (lw.Moe is not null)
                 {
-                    var dSpan = new ReadOnlySpan<float>(denseP + t * hiddenSize, hiddenSize);
-                    var mSpan = new ReadOnlySpan<float>(moeP + t * hiddenSize, hiddenSize);
-                    var sumSpan = new Span<float>(tmpP + t * hiddenSize, hiddenSize);
-                    TensorPrimitives.Add(dSpan, mSpan, sumSpan);
-                    RmsNorm.Execute(
-                        (ReadOnlySpan<float>)sumSpan, g4.PostFfwNorm, eps, sumSpan);
-                    // cur = cur + attn_out, then * layer_output_scale (LAST op).
-                    // Diffusion: prompt rows [0,P) use enc_layer_output_scale,
-                    // canvas rows [P,seqLen) use layer_output_scale. Non-diffusion
-                    // gemma4 keeps layer_output_scale for ALL rows (regionP == 0).
-                    float scale = t < regionP ? encScale : g4.LayerOutputScale;
-                    float* outT = hidden + t * hiddenSize;
-                    float* aoT = attnOutP + t * hiddenSize;
-                    float* sT = tmpP + t * hiddenSize;
-                    for (int j = 0; j < hiddenSize; j++)
-                        outT[j] = (sT[j] + aoT[j]) * scale;
+                    // ── MoE layer: dual parallel FFN (26B backbone) ────────
+                    // cur_mlp = rms(cur_mlp) * post_ffw_norm_1
+                    for (int t = 0; t < seqLen; t++)
+                        RmsNorm.Execute(
+                            new ReadOnlySpan<float>(denseP + t * hiddenSize, hiddenSize),
+                            g4.PostFfwNorm1!, eps,
+                            new Span<float>(denseP + t * hiddenSize, hiddenSize));
+
+                    Gemma4Moe(in lw, layer, attnOutP, moeP, tmpP, seqLen, eps);
+                    // cur_moe = rms(cur_moe) * post_ffw_norm_2
+                    for (int t = 0; t < seqLen; t++)
+                        RmsNorm.Execute(
+                            new ReadOnlySpan<float>(moeP + t * hiddenSize, hiddenSize),
+                            g4.PostFfwNorm2!, eps,
+                            new Span<float>(moeP + t * hiddenSize, hiddenSize));
+
+                    // ── Combine: cur = rms(cur_mlp + cur_moe)*post_ffw_norm + attn_out ──
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        var dSpan = new ReadOnlySpan<float>(denseP + t * hiddenSize, hiddenSize);
+                        var mSpan = new ReadOnlySpan<float>(moeP + t * hiddenSize, hiddenSize);
+                        var sumSpan = new Span<float>(tmpP + t * hiddenSize, hiddenSize);
+                        TensorPrimitives.Add(dSpan, mSpan, sumSpan);
+                        RmsNorm.Execute(
+                            (ReadOnlySpan<float>)sumSpan, g4.PostFfwNorm, eps, sumSpan);
+                        Add.Execute(
+                            (ReadOnlySpan<float>)sumSpan,
+                            new ReadOnlySpan<float>(attnOutP + t * hiddenSize, hiddenSize),
+                            new Span<float>(hidden + t * hiddenSize, hiddenSize));
+                    }
+                }
+                else
+                {
+                    // ── Dense-only layer (E2B/E4B): cur = rms(cur_mlp)*post_ffw_norm
+                    // + attn_out (llama.cpp gemma4.cpp non-MoE else branch) ──
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        var dSpan = new Span<float>(denseP + t * hiddenSize, hiddenSize);
+                        RmsNorm.Execute(
+                            (ReadOnlySpan<float>)dSpan, g4.PostFfwNorm, eps, dSpan);
+                        Add.Execute(
+                            (ReadOnlySpan<float>)dSpan,
+                            new ReadOnlySpan<float>(attnOutP + t * hiddenSize, hiddenSize),
+                            new Span<float>(hidden + t * hiddenSize, hiddenSize));
+                    }
                 }
             }
         }
@@ -1810,16 +2116,50 @@ public sealed unsafe class TransformerModel : IModel
             ArrayPool<float>.Shared.Return(moeBuf);
             ArrayPool<float>.Shared.Return(tmpNormBuf);
         }
+
+        // ── Per-Layer Embeddings injection (Gemma-4 dense E2B/E4B) ──────────
+        // Gated residual added to the layer output BEFORE layer_output_scale
+        // (llama.cpp gemma4.cpp: residual add → per-layer embedding → out_scale).
+        // No-op for the 26B backbone / diffusion (pleInputs null).
+        if (pleInputs is not null && lw.PleGateWeight != 0)
+        {
+            PerLayerEmbeddings.InjectLayer(
+                hidden: hidden,
+                perLayerInputs: pleInputs,
+                layerIdx: layer, numLayers: Config.NumLayers,
+                gateWeight: (float*)lw.PleGateWeight,
+                projWeight: (float*)lw.PleProjWeight,
+                postNormWeight: lw.PlePostNormWeight,
+                gateScratch: pleGateScratch,
+                projScratch: pleProjScratch,
+                seqLen: seqLen, hiddenSize: hiddenSize, pleDim: pleDim, eps: eps);
+        }
+
+        // ── layer_output_scale — the LAST per-layer op ───────────────────────
+        // Diffusion: prompt rows [0,P) use enc_layer_output_scale, canvas rows
+        // [P,seqLen) layer_output_scale. Non-diffusion gemma4 scales ALL rows
+        // (regionP == 0). Arithmetic is identical to the previous fused
+        // (sum + attn_out) * scale — the multiply just moved after the PLE hook.
+        for (int t = 0; t < seqLen; t++)
+        {
+            float scale = t < regionP ? encScale : g4.LayerOutputScale;
+            var row = new Span<float>(hidden + t * hiddenSize, hiddenSize);
+            TensorPrimitives.Multiply(row, scale, row);
+        }
     }
 
     /// <summary>
     /// Gemma-4 dense FFN branch: <c>down( geglu(gate·n) * (up·n) )</c> where
     /// <c>n = rms(attn_out) * ffn_norm</c>. Writes [seqLen × hidden] into
     /// <paramref name="dense"/>. Uses the layer's dense gate/up/down slots and the
-    /// model-wide dense intermediate width.
+    /// model-wide dense intermediate width. LoRA (when active) applies to this
+    /// dense/"shared expert" branch here; the routed MoE experts
+    /// (<see cref="Gemma4Moe"/>) get their own per-expert LoRA delta via the shared
+    /// <c>MoeSwiGluMlp.ExecuteRoutedFromAssignments</c> kernel's
+    /// <c>"mlp.experts.{j}.{proj}"</c> lookup.
     /// </summary>
     private unsafe void Gemma4DenseFfn(
-        in TransformerLayerWeights lw, float* attnOut, float* dense, float* normScratch,
+        in TransformerLayerWeights lw, int layer, float* attnOut, float* dense, float* normScratch,
         float* hiddenScratch, int seqLen, float eps)
     {
         int hiddenSize = Config.HiddenSize;
@@ -1837,6 +2177,11 @@ public sealed unsafe class TransformerModel : IModel
 
         Gemm(lw.GateWeight, lw.GateQuantType, hiddenScratch, ffnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
         Gemm(lw.UpWeight, lw.UpQuantType, hiddenScratch, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+        if (_currentAdapter is not null)
+        {
+            ApplyLoraDelta(layer, "gate_proj", hiddenScratch, ffnGate, seqLen, lw.GateInputDim, lw.GateOutputDim);
+            ApplyLoraDelta(layer, "up_proj", hiddenScratch, ffnUp, seqLen, lw.UpInputDim, lw.UpOutputDim);
+        }
 
         for (int t = 0; t < seqLen; t++)
         {
@@ -1847,6 +2192,8 @@ public sealed unsafe class TransformerModel : IModel
         }
 
         Gemm(lw.DownWeight, lw.DownQuantType, siluOut, dense, lw.DownOutputDim, lw.DownInputDim, seqLen);
+        if (_currentAdapter is not null)
+            ApplyLoraDelta(layer, "down_proj", siluOut, dense, seqLen, lw.DownInputDim, lw.DownOutputDim);
     }
 
     /// <summary>
@@ -1897,7 +2244,7 @@ public sealed unsafe class TransformerModel : IModel
                 // router input = rms * invSqrtH * router_scale
                 var rin = routerInBuf.AsSpan(t * hiddenSize, hiddenSize);
                 for (int j = 0; j < hiddenSize; j++)
-                    rin[j] = rms[j] * invSqrtH * g4.RouterScale[j];
+                    rin[j] = rms[j] * invSqrtH * g4.RouterScale![j];
             }
 
             // Custom routing: logits = ffn_gate_inp · routerInput, softmax over E,
@@ -1931,7 +2278,7 @@ public sealed unsafe class TransformerModel : IModel
                         // Fold the per-expert down scale into the routing weight: the
                         // final accumulation does sum_e w[e]*down_e, and the spec
                         // scales down_e by ffn_down_exps.scale[e] — equivalent.
-                        assignWeight[idx] = w * g4.DownExpertScale[e];
+                        assignWeight[idx] = w * g4.DownExpertScale![e];
                         bucketCursors[e]++;
                     }
                 }
@@ -1985,7 +2332,7 @@ public sealed unsafe class TransformerModel : IModel
                 numExperts, topK, hiddenSize, moeInterm, seqLen,
                 ReadOnlySpan<nint>.Empty, ReadOnlySpan<nint>.Empty, ReadOnlySpan<nint>.Empty,
                 0, ReadOnlySpan<float>.Empty,
-                loraAdapter: null, loraLayer: -1,
+                loraAdapter: _currentAdapter, loraLayer: layer,
                 threadPool: _threadPool,
                 useGeGLU: true);
         }
@@ -2620,13 +2967,25 @@ public sealed unsafe class TransformerModel : IModel
         // Phase 4d.2: MLA / MoE rejections are lifted. The standard
         // ApplyLoraDelta call sites are only reached on non-MLA / dense FFN
         // layers (the MLA branch in Forward routes through MlaAttention which
-        // has its own LoRA hooks; MoE routes through MoeSwiGluMlp). Adapters
-        // that target standard q/k/v/o or gate/up/down on MLA / MoE layers
-        // therefore pass through silently — applying the delta requires the
-        // MLA-specific (q_a_proj, q_b_proj, kv_a_proj_with_mqa, kv_b_proj)
-        // or per-expert (mlp.experts.{j}.{...}) projection names which the
-        // PEFT loader will eventually emit. Until those code paths are wired,
-        // a non-applicable target is a no-op rather than an error.
+        // has its own LoRA hooks; MoE routes through MoeSwiGluMlp, which now
+        // also resolves per-expert "mlp.experts.{j}.{proj}" entries — see
+        // Gemma4Moe / PeftAdapterLoader's MoeExpertPathRegex). Adapters that
+        // target standard q/k/v/o or gate/up/down on MLA layers still pass
+        // through silently — applying the delta there requires the
+        // MLA-specific (q_a_proj, q_b_proj, q_proj, kv_a_proj_with_mqa,
+        // kv_b_proj, o_proj) projection names, which are all wired: every one
+        // of the three MLA forward kernels — Execute (Phase A, expanded
+        // cache), ExecuteLatent (Phase B, absorbed decode), and
+        // ExecuteLatentHybrid (Phase C, hybrid expand-prefill / absorbed-
+        // decode) — now applies each of those deltas, including kv_b_proj,
+        // which is never expanded as a plain GEMV in the absorbed kernels:
+        // its delta is folded into the absorbed Q/K/V math via a low-rank
+        // "delta-expansion" over the cached latent (Phase B) or applied
+        // directly to the fully-expanded per-position scratch (Phase C's
+        // expand-prefill sub-path) — see
+        // MlaAttention.ApplyKvBProjLoraDeltaExpanded for the derivation. A
+        // target that isn't one of the above names (or the per-expert MoE
+        // names) is a no-op rather than an error.
     }
 
     /// <summary>
@@ -2655,9 +3014,57 @@ public sealed unsafe class TransformerModel : IModel
                                 QuantizationType preQuantXType = QuantizationType.F32)
     {
         if (_currentAdapter is null) return;
+
+        // DIFFUSION region split: real DiffusionGemma PEFT adapters train INDEPENDENT
+        // LoRA deltas for the prompt (encoder) and canvas (decoder) rows of the SAME
+        // unified [prompt|canvas] forward — mirroring the backbone's own region-aware
+        // per-layer scalar (see RunGemma4Layer's regionP / enc_layer_output_scale).
+        // preQuantX is never non-null on this path (only the generic non-Gemma4 layer
+        // path passes it, and that path never runs under DiffusionConfig), so a plain
+        // pointer-offset split is safe here.
+        bool diffusion = Config.DiffusionConfig is not null;
+        if (diffusion && _currentMaskSpec.Mode == AttentionMaskMode.Hybrid && preQuantX is null)
+        {
+            int p = Math.Clamp(_currentMaskSpec.PrefixLength, 0, seqLen);
+            if (p > 0)
+                LoraProjection.Apply(_currentAdapter, layer, projName, x, y,
+                                     p, inputDim, outputDim, _threadPool,
+                                     region: LoraRegion.Encoder);
+            if (p < seqLen)
+                LoraProjection.Apply(_currentAdapter, layer, projName,
+                                     x + (long)p * inputDim, y + (long)p * outputDim,
+                                     seqLen - p, inputDim, outputDim, _threadPool,
+                                     region: LoraRegion.Decoder);
+            return;
+        }
+
         LoraProjection.Apply(_currentAdapter, layer, projName, x, y,
                              seqLen, inputDim, outputDim, _threadPool,
                              preQuantX, preQuantXType);
+    }
+
+    /// <summary>
+    /// Applies the LoRA delta for DiffusionGemma's model-level self-conditioning module
+    /// (<see cref="ApplySelfConditioning"/>'s gate/up/down GeGLU MLP). Unlike
+    /// <see cref="ApplyLoraDelta"/>, this does NOT go through the diffusion
+    /// encoder/decoder region split: self-conditioning is a single computation that runs
+    /// once per forward and only ever touches canvas rows (there is no prompt/canvas row
+    /// split to make for it — the caller already restricts <paramref name="x"/> /
+    /// <paramref name="y"/> to the <c>canvasLen</c> rows). Looked up under
+    /// <see cref="LoraAdapter.SelfConditioningLayerIndex"/> with
+    /// <see cref="LoraRegion.Any"/>, using the same <c>gate_proj</c>/<c>up_proj</c>/
+    /// <c>down_proj</c> names the dense FFN uses (see
+    /// <see cref="PeftAdapterLoader"/>'s <c>SelfConditioningPathRegex</c>).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ApplySelfConditioningLoraDelta(string projName,
+                                                float* x, float* y, int canvasLen, int inputDim, int outputDim)
+    {
+        if (_currentAdapter is null) return;
+
+        LoraProjection.Apply(_currentAdapter, LoraAdapter.SelfConditioningLayerIndex, projName, x, y,
+                             canvasLen, inputDim, outputDim, _threadPool,
+                             region: LoraRegion.Any);
     }
 
     /// <summary>
@@ -2670,6 +3077,24 @@ public sealed unsafe class TransformerModel : IModel
         int numHeads, int headDim, int seqLen, float eps)
     {
         int stride = numHeads * headDim;
+
+        // OLMoE applies a SINGLE RMSNorm over the entire Q/K projection (weight
+        // length == num_heads*head_dim) before splitting into heads, whereas
+        // Qwen3/Gemma apply a PER-HEAD RMSNorm (weight length == head_dim) after
+        // the split. Distinguish by the resolved weight length. When numHeads==1
+        // the two are numerically identical, so the guard is harmless.
+        if (numHeads > 1 && normWeight.Length == stride)
+        {
+            for (int t = 0; t < seqLen; t++)
+            {
+                float* row = qk + t * stride;
+                RmsNorm.Execute(
+                    new ReadOnlySpan<float>(row, stride), normWeight, eps,
+                    new Span<float>(row, stride));
+            }
+            return;
+        }
+
         for (int t = 0; t < seqLen; t++)
         {
             for (int h = 0; h < numHeads; h++)
@@ -2714,12 +3139,16 @@ public sealed unsafe class TransformerModel : IModel
             MatMul.GemvQ5_K((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.Q6_K)
             MatMul.GemvQ6_K((byte*)weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.MXFP4)
+            MatMul.GemvMxfp4((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.F32)
             MatMul.GemvF32((float*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.F16)
             MatMul.GemvF16(weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.I2_S)
             MatMul.GemvI2_S((byte*)weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.PQ2_0)
+            MatMul.GemvPQ2_0((byte*)weights, x, y, m, k, _threadPool);
         else
             GemvDequantFallback(weights, qt, x, y, m, k);
     }
@@ -2767,12 +3196,16 @@ public sealed unsafe class TransformerModel : IModel
             MatMul.GemmQ5_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
         else if (qt == QuantizationType.Q6_K)
             MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+        else if (qt == QuantizationType.MXFP4)
+            MatMul.GemmMxfp4((byte*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.F32)
             MatMul.GemmF32((float*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.F16)
             MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.I2_S)
             MatMul.GemmI2_S((byte*)weights, b, c, m, k, n, _threadPool);
+        else if (qt == QuantizationType.PQ2_0)
+            MatMul.GemmPQ2_0((byte*)weights, b, c, m, k, n, _threadPool);
         else
             GemmDequantFallback(weights, qt, b, c, m, k, n);
     }
@@ -2860,9 +3293,25 @@ public sealed unsafe class TransformerModel : IModel
                                  int m, int k, int n, byte* preQuantizedInput,
                                  in WeightRepacking.RepackedWeight rw)
     {
-        if (rw.Ptr == 0 || n > 1 || rw.RowBytes < InterleavedMinRowBytes)
+        if (rw.Ptr == 0 || rw.RowBytes < InterleavedMinRowBytes)
         {
-            // Multi-token or small row stride: use original tiled GEMM path
+            // No repacked copy, or rows too short for interleaving to pay: original path.
+            Gemm(origWeights, qt, b, c, m, k, n, preQuantizedInput);
+            return;
+        }
+
+        if (n > 1)
+        {
+            // Multi-token: L2-tiled GEMM over the R4 layout. Same tiling shape as the row-major
+            // path, so it inherits the interleaved dot kernel's advantage instead of fighting
+            // register pressure the way the outer-product microkernels do (Step 26, #61).
+            if (qt == QuantizationType.Q8_0 && preQuantizedInput != null)
+            {
+                MatMul.GemmR4TiledQ8_0((byte*)rw.Ptr, preQuantizedInput, c,
+                    rw.FullGroupCount, rw.TailRows, k / 32, m, n, _threadPool);
+                return;
+            }
+
             Gemm(origWeights, qt, b, c, m, k, n, preQuantizedInput);
             return;
         }
@@ -3019,6 +3468,47 @@ public sealed unsafe class TransformerModel : IModel
     }
 
     /// <summary>
+    /// Gathers the Per-Layer Embeddings (PLE) token-identity rows into
+    /// <paramref name="dest"/> <c>[seq, rowWidth]</c> (rowWidth = numLayers*pleDim),
+    /// dequantizing per token and applying the ScaledWordEmbedding factor
+    /// <paramref name="scale"/> = √pleDim. Mirrors <see cref="EmbeddingLookup"/>'s
+    /// per-row dequant switch but for the wide per-layer table.
+    /// </summary>
+    private void GatherPerLayerIdentity(
+        ReadOnlySpan<int> tokenIds, float* dest, int rowWidth, float scale,
+        nint tablePtr, QuantizationType qt)
+    {
+        int pleVocab = _weights.PerLayerEmbedding!.VocabSize;
+        for (int t = 0; t < tokenIds.Length; t++)
+        {
+            int tokenId = tokenIds[t];
+            if ((uint)tokenId >= (uint)pleVocab)
+                throw new ArgumentOutOfRangeException(nameof(tokenIds),
+                    $"PLE token ID {tokenId} at position {t} is out of range [0, {pleVocab}).");
+
+            var destSpan = new Span<float>(dest + t * rowWidth, rowWidth);
+            if (qt == QuantizationType.F32)
+            {
+                float* src = (float*)tablePtr + (long)tokenId * rowWidth;
+                new ReadOnlySpan<float>(src, rowWidth).CopyTo(destSpan);
+            }
+            else if (qt == QuantizationType.F16)
+            {
+                Half* src = (Half*)tablePtr + (long)tokenId * rowWidth;
+                TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(src, rowWidth), destSpan);
+            }
+            else
+            {
+                long rowBytes = Dequantize.RowByteSize(rowWidth, qt);
+                nint rowPtr = tablePtr + (nint)((long)tokenId * rowBytes);
+                Dequantize.ToFloat32(rowPtr, rowWidth, qt, destSpan);
+            }
+
+            TensorPrimitives.Multiply(destSpan, scale, destSpan);
+        }
+    }
+
+    /// <summary>
     /// Dequantizes one token-embedding row (token id <paramref name="tokenId"/>) into
     /// <paramref name="dest"/> [hiddenSize], WITHOUT the Gemma embedding scale. Mirrors the
     /// per-row dequant in <see cref="EmbeddingLookup"/> but raw (the SC soft-embed folds
@@ -3130,6 +3620,11 @@ public sealed unsafe class TransformerModel : IModel
                 // g = gate·normed ; u = up·normed  (batched [canvasLen × ff]).
                 Gemm(sc.GatePtr, sc.GateQt, normedP, gateP, sc.GateOut, sc.GateIn, canvasLen);
                 Gemm(sc.UpPtr, sc.UpQt, normedP, upP, sc.UpOut, sc.UpIn, canvasLen);
+                if (_currentAdapter is not null)
+                {
+                    ApplySelfConditioningLoraDelta("gate_proj", normedP, gateP, canvasLen, sc.GateIn, sc.GateOut);
+                    ApplySelfConditioningLoraDelta("up_proj", normedP, upP, canvasLen, sc.UpIn, sc.UpOut);
+                }
 
                 // gelu_tanh(g) * u   (SAME GeGLU-tanh as the dense FFN).
                 for (int c = 0; c < canvasLen; c++)
@@ -3140,7 +3635,11 @@ public sealed unsafe class TransformerModel : IModel
 
                 // sc_sig = down·(gelu*u)   [canvasLen × hidden].
                 fixed (float* geluP = geluBuf)
+                {
                     Gemm(sc.DownPtr, sc.DownQt, geluP, sigP, sc.DownOut, sc.DownIn, canvasLen);
+                    if (_currentAdapter is not null)
+                        ApplySelfConditioningLoraDelta("down_proj", geluP, sigP, canvasLen, sc.DownIn, sc.DownOut);
+                }
 
                 // canvas += sc_sig (added to the scaled embeddings; caller rms_noscales after).
                 for (int c = 0; c < canvasLen; c++)

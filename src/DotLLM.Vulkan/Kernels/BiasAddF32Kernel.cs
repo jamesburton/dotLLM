@@ -27,7 +27,7 @@ public sealed class BiasAddF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 2);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 2);
     }
 
     /// <summary>Loads <c>bias_add_f32.spv</c> from <paramref name="spvDir"/>.</summary>

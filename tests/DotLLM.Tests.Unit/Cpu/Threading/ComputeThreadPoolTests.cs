@@ -234,6 +234,7 @@ public sealed unsafe class ComputeThreadPoolTests
         }
     }
 
+    [StructLayout(LayoutKind.Sequential)]
     private struct SumContext
     {
         public float* Data;

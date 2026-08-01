@@ -26,11 +26,11 @@ public sealed unsafe class KvBlockPoolTests
     [Fact]
     public void Constructor_RejectsInvalidDimensions()
     {
-        Assert.Throws<ArgumentOutOfRangeException>(() => new KvBlockPool(0, NumKvHeads, HeadDim, BlockSize, TotalBlocks));
-        Assert.Throws<ArgumentOutOfRangeException>(() => new KvBlockPool(NumLayers, 0, HeadDim, BlockSize, TotalBlocks));
-        Assert.Throws<ArgumentOutOfRangeException>(() => new KvBlockPool(NumLayers, NumKvHeads, 0, BlockSize, TotalBlocks));
-        Assert.Throws<ArgumentOutOfRangeException>(() => new KvBlockPool(NumLayers, NumKvHeads, HeadDim, 0, TotalBlocks));
-        Assert.Throws<ArgumentOutOfRangeException>(() => new KvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => { new KvBlockPool(0, NumKvHeads, HeadDim, BlockSize, TotalBlocks); });
+        Assert.Throws<ArgumentOutOfRangeException>(() => { new KvBlockPool(NumLayers, 0, HeadDim, BlockSize, TotalBlocks); });
+        Assert.Throws<ArgumentOutOfRangeException>(() => { new KvBlockPool(NumLayers, NumKvHeads, 0, BlockSize, TotalBlocks); });
+        Assert.Throws<ArgumentOutOfRangeException>(() => { new KvBlockPool(NumLayers, NumKvHeads, HeadDim, 0, TotalBlocks); });
+        Assert.Throws<ArgumentOutOfRangeException>(() => { new KvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, 0); });
     }
 
     [Fact]
@@ -245,8 +245,7 @@ public sealed unsafe class KvBlockPoolTests
     [Fact]
     public void Dispose_IsSafeToCallMultipleTimes()
     {
-        var pool = new KvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks);
-        pool.Dispose();
-        pool.Dispose(); // Should not throw
+        using var pool = new KvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks);
+        pool.Dispose(); // Explicit dispose; the `using` scope disposes again on exit — should not throw
     }
 }

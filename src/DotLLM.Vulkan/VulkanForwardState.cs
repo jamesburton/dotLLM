@@ -120,6 +120,17 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanDevice.Buffer? MoeGroupedGateInter { get; private set; } // [seqLen * topK, intermediate]
     public VulkanDevice.Buffer? MoeGroupedUpInter { get; private set; } // [seqLen * topK, intermediate]
 
+    // ── MoE dp4a activation scratch (issue #137) ──────────────────────
+    // Row-major Q8_1 quantization of the EXPANDED MoE activations
+    // ([seqLen*topK, K] — K = hidden for the gate/up banks, K = moe
+    // intermediate for the down bank; both fit the _q8_1MaxK stride).
+    // Feeds the indexed MMVQ expert kernels. Allocated only when both the
+    // dp4a path (mmvqEnabled) and a MoE layer are present. NOTE: rows use
+    // stride K (natural row-major from quantize_q8_1_rows), NOT _q8_1MaxK —
+    // the buffers are simply sized for the largest K.
+    public VulkanDevice.Buffer? MoeQ8_1Xq { get; private set; }   // [seqLen*topK * maxK/4] packed int8
+    public VulkanDevice.Buffer? MoeQ8_1Xds { get; private set; }  // [seqLen*topK * maxK/32] (d, s)
+
     // ── Gemma-4 dual-FFN scratch ──────────────────────────────────────
     // Allocated only for Gemma-4 (gemma4DualFfn). The dense ("shared") FFN
     // and the routed MoE both read attn_out (HiddenState) and produce a
@@ -254,7 +265,10 @@ internal sealed class VulkanForwardState : IDisposable
 
         // LM-head logits are always one token (last). Positions buffer sized for some reasonable
         // default; grows with EnsureCapacity.
-        Logits = device.Allocate((long)vocabSize * sizeof(float));
+        // Logits are read back by the host EVERY decoded token — prefer a
+        // HOST_CACHED memory type (the default write-combined host-visible type
+        // reads at <1 GB/s on the CPU: ~0.4 ms per 49k-vocab row — issue #143).
+        Logits = device.AllocateHostReadback((long)vocabSize * sizeof(float));
         PositionsBuffer = device.Allocate(Math.Max(1, initialSeqLen) * sizeof(int));
 
         // AllocateForCapacity allocates the per-seqLen prefill MMQ scratch
@@ -438,6 +452,19 @@ internal sealed class VulkanForwardState : IDisposable
                    + expertCountsBytes * 2 + expertOffsetsBytes + routedRowsBytes
                    + expandedBytes + interBytes * 2;
 
+        // Indexed-MMVQ expanded-activation Q8_1 scratch (issue #137): sized
+        // for seqLen*topK rows of the largest contraction dim (_q8_1MaxK
+        // covers hidden AND moeIntermediate). Shared by the gate/up (K =
+        // hidden) and down (K = moeIntermediate) quantizations within a layer
+        // — the second overwrites the first after the gate/up dispatches.
+        if (_mmvqEnabled && _q8_1MaxK > 0)
+        {
+            long moeRows = (long)seqLen * _moeTopK;
+            MoeQ8_1Xq = _device.AllocateDeviceLocal(moeRows * (_q8_1MaxK / 4) * sizeof(uint));
+            MoeQ8_1Xds = _device.AllocateDeviceLocal(moeRows * (_q8_1MaxK / 32) * 2 * sizeof(float));
+            total += MoeQ8_1Xq.Size + MoeQ8_1Xds.Size;
+        }
+
         if (_moeNumSharedExperts > 0)
         {
             long sharedInterBytes = (long)seqLen * _moeSharedIntermediateSize * sizeof(float);
@@ -538,6 +565,8 @@ internal sealed class VulkanForwardState : IDisposable
         MoeGroupedHidden?.Dispose(); MoeGroupedHidden = null;
         MoeGroupedGateInter?.Dispose(); MoeGroupedGateInter = null;
         MoeGroupedUpInter?.Dispose(); MoeGroupedUpInter = null;
+        MoeQ8_1Xq?.Dispose(); MoeQ8_1Xq = null;
+        MoeQ8_1Xds?.Dispose(); MoeQ8_1Xds = null;
 
         Gemma4DenseResult?.Dispose(); Gemma4DenseResult = null;
         Gemma4MoeResult?.Dispose(); Gemma4MoeResult = null;

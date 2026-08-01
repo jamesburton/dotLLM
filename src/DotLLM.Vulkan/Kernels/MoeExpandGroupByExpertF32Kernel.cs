@@ -24,7 +24,7 @@ public sealed class MoeExpandGroupByExpertF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 6);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 6);
     }
 
     /// <summary>Loads <c>moe_expand_group_by_expert_f32.spv</c> from <paramref name="spvDir"/>.</summary>

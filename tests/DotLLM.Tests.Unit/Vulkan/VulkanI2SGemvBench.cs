@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using DotLLM.Vulkan;
 using DotLLM.Vulkan.Kernels;
 using Xunit;
@@ -32,7 +33,16 @@ namespace DotLLM.Tests.Unit.Vulkan;
 [Collection("VulkanKernels")]
 public sealed class VulkanI2SGemvBench
 {
-    private const string VariantSpv = "matmul_i2_s_v0.spv";   // optional A/B comparand
+    /// <summary>
+    /// A/B comparand, overridable via <c>DOTLLM_I2S_GEMV_VARIANT_SPV</c>. Defaults to the
+    /// subgroup-reduction variant; the bench degrades to single-kernel timing when the named
+    /// SPIR-V is absent, so pointing it at a not-yet-built variant is not an error.
+    /// </summary>
+    private static string VariantSpv =>
+        Environment.GetEnvironmentVariable("DOTLLM_I2S_GEMV_VARIANT_SPV") is { Length: > 0 } v
+            ? v
+            : "matmul_i2_s_f32_gemv_sg.spv";
+
     private const int WarmupPasses = 2;
     private const int Passes = 9;
 
@@ -49,7 +59,7 @@ public sealed class VulkanI2SGemvBench
     [SkippableFact]
     public void Bench_I2SGemv()
     {
-        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_I2S_GEMV_BENCH") == "1",
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_I2S_GEMV_BENCH"), "1", StringComparison.Ordinal),
             "DOTLLM_I2S_GEMV_BENCH=1 to enable this benchmark.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -71,7 +81,7 @@ public sealed class VulkanI2SGemvBench
                 + $"batch={batch}  schedule: {WarmupPasses} warmup + {Passes} interleaved paired passes (median)");
             _output.WriteLine(variant is null
                 ? "| shape | µs/GEMV (current) | weight GB/s |"
-                : "| shape | current µs | variant(v0) µs | current/v0 | current GB/s |");
+                : $"| shape | current µs | {VariantSpv} µs | speedup | current GB/s |");
             _output.WriteLine("|---|---:|---:|---:|---:|");
 
             var rng = new Random(0x12_5C);
@@ -168,10 +178,13 @@ public sealed class VulkanI2SGemvBench
     }
 
     private static int EnvInt(string name, int fallback)
-        => int.TryParse(Environment.GetEnvironmentVariable(name), out int v) && v > 0 ? v : fallback;
+        => int.TryParse(Environment.GetEnvironmentVariable(name), NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) && v > 0 ? v : fallback;
 
     private static void PinToPCores()
     {
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux())
+            return; // ProcessorAffinity is only supported on Windows/Linux; affinity is best-effort.
+
         string mask = Environment.GetEnvironmentVariable("DOTLLM_BENCH_AFFINITY") ?? "3F";
         try
         {

@@ -11,7 +11,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </summary>
 [Trait("Category", "GPU")]
 [Collection(CudaCollection.Name)]
-public class CudaTensorTests : IDisposable
+public sealed class CudaTensorTests : IDisposable
 {
     private readonly CudaContext? _ctx;
 

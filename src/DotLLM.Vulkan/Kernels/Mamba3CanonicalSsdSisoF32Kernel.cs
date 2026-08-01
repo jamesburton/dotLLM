@@ -59,7 +59,7 @@ public sealed class Mamba3CanonicalSsdSisoF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: BufferCount);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: BufferCount);
     }
 
     /// <summary>Loads <c>mamba3_canonical_ssd_siso_f32.spv</c> from <paramref name="spvDir"/>.</summary>

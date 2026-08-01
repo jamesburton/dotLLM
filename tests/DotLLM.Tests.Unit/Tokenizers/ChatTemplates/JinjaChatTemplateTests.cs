@@ -84,10 +84,10 @@ public class JinjaChatTemplateTests
 
         var result = template.Apply(messages, new ChatTemplateOptions { AddGenerationPrompt = true });
 
-        Assert.Contains("<|im_start|>user\nHello!<|im_end|>", result);
-        Assert.Contains("<|im_start|>assistant\nHi there!<|im_end|>", result);
-        Assert.Contains("<|im_start|>user\nHow are you?<|im_end|>", result);
-        Assert.EndsWith("<|im_start|>assistant\n", result);
+        Assert.Contains("<|im_start|>user\nHello!<|im_end|>", result, StringComparison.Ordinal);
+        Assert.Contains("<|im_start|>assistant\nHi there!<|im_end|>", result, StringComparison.Ordinal);
+        Assert.Contains("<|im_start|>user\nHow are you?<|im_end|>", result, StringComparison.Ordinal);
+        Assert.EndsWith("<|im_start|>assistant\n", result, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -101,8 +101,8 @@ public class JinjaChatTemplateTests
 
         var result = template.Apply(messages, new ChatTemplateOptions { AddGenerationPrompt = false });
 
-        Assert.Contains("<|im_start|>user\nHello!<|im_end|>", result);
-        Assert.DoesNotContain("<|im_start|>assistant", result);
+        Assert.Contains("<|im_start|>user\nHello!<|im_end|>", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("<|im_start|>assistant", result, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -117,8 +117,8 @@ public class JinjaChatTemplateTests
 
         var result = template.Apply(messages, new ChatTemplateOptions { AddGenerationPrompt = true });
 
-        Assert.Contains("<|im_start|>system\nYou are helpful.<|im_end|>", result);
-        Assert.Contains("<|im_start|>user\nHello!<|im_end|>", result);
+        Assert.Contains("<|im_start|>system\nYou are helpful.<|im_end|>", result, StringComparison.Ordinal);
+        Assert.Contains("<|im_start|>user\nHello!<|im_end|>", result, StringComparison.Ordinal);
     }
 
     // ── Llama 3.1 tests ──
@@ -135,12 +135,12 @@ public class JinjaChatTemplateTests
 
         var result = template.Apply(messages, new ChatTemplateOptions { AddGenerationPrompt = true });
 
-        Assert.StartsWith("<|begin_of_text|>", result);
-        Assert.Contains("<|start_header_id|>system<|end_header_id|>", result);
-        Assert.Contains("You are helpful.", result);
-        Assert.Contains("<|start_header_id|>user<|end_header_id|>", result);
-        Assert.Contains("What is 2+2?", result);
-        Assert.Contains("<|start_header_id|>assistant<|end_header_id|>", result);
+        Assert.StartsWith("<|begin_of_text|>", result, StringComparison.Ordinal);
+        Assert.Contains("<|start_header_id|>system<|end_header_id|>", result, StringComparison.Ordinal);
+        Assert.Contains("You are helpful.", result, StringComparison.Ordinal);
+        Assert.Contains("<|start_header_id|>user<|end_header_id|>", result, StringComparison.Ordinal);
+        Assert.Contains("What is 2+2?", result, StringComparison.Ordinal);
+        Assert.Contains("<|start_header_id|>assistant<|end_header_id|>", result, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -156,7 +156,7 @@ public class JinjaChatTemplateTests
 
         var result = template.Apply(messages, new ChatTemplateOptions { AddGenerationPrompt = true });
 
-        Assert.StartsWith("<|begin_of_text|>", result);
+        Assert.StartsWith("<|begin_of_text|>", result, StringComparison.Ordinal);
         // All messages should appear in order
         int userHi = result.IndexOf("Hi", StringComparison.Ordinal);
         int assistantHello = result.IndexOf("Hello!", StringComparison.Ordinal);
@@ -180,10 +180,10 @@ public class JinjaChatTemplateTests
 
         var result = template.Apply(messages, new ChatTemplateOptions { AddGenerationPrompt = false });
 
-        Assert.StartsWith("<s>", result);
-        Assert.Contains("[INST] What is AI? [/INST]", result);
-        Assert.Contains("AI is artificial intelligence.</s>", result);
-        Assert.Contains("[INST] Tell me more. [/INST]", result);
+        Assert.StartsWith("<s>", result, StringComparison.Ordinal);
+        Assert.Contains("[INST] What is AI? [/INST]", result, StringComparison.Ordinal);
+        Assert.Contains("AI is artificial intelligence.</s>", result, StringComparison.Ordinal);
+        Assert.Contains("[INST] Tell me more. [/INST]", result, StringComparison.Ordinal);
     }
 
     // ── SmolLM tests ──
@@ -200,9 +200,9 @@ public class JinjaChatTemplateTests
         var result = template.Apply(messages, new ChatTemplateOptions { AddGenerationPrompt = true });
 
         // When no system message, SmolLM inserts a default system message
-        Assert.Contains("<|im_start|>system\nYou are a helpful AI assistant named SmolLM", result);
-        Assert.Contains("<|im_start|>user\nHello!", result);
-        Assert.Contains("<|im_start|>assistant\n", result);
+        Assert.Contains("<|im_start|>system\nYou are a helpful AI assistant named SmolLM", result, StringComparison.Ordinal);
+        Assert.Contains("<|im_start|>user\nHello!", result, StringComparison.Ordinal);
+        Assert.Contains("<|im_start|>assistant\n", result, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -218,8 +218,8 @@ public class JinjaChatTemplateTests
         var result = template.Apply(messages, new ChatTemplateOptions { AddGenerationPrompt = true });
 
         // Should NOT have the default system message
-        Assert.DoesNotContain("SmolLM", result);
-        Assert.Contains("<|im_start|>system\nYou are a poet.", result);
+        Assert.DoesNotContain("SmolLM", result, StringComparison.Ordinal);
+        Assert.Contains("<|im_start|>system\nYou are a poet.", result, StringComparison.Ordinal);
     }
 
     // ── Namespace pattern tests ──
@@ -237,10 +237,10 @@ public class JinjaChatTemplateTests
         var result = template.Apply(messages, new ChatTemplateOptions { AddGenerationPrompt = true });
 
         // Should NOT have default system because we provided one
-        Assert.DoesNotContain("You are a helpful assistant.", result);
-        Assert.Contains("<|system|>Custom system.<|end|>", result);
-        Assert.Contains("<|user|>Hello!<|end|>", result);
-        Assert.Contains("<|assistant|>", result);
+        Assert.DoesNotContain("You are a helpful assistant.", result, StringComparison.Ordinal);
+        Assert.Contains("<|system|>Custom system.<|end|>", result, StringComparison.Ordinal);
+        Assert.Contains("<|user|>Hello!<|end|>", result, StringComparison.Ordinal);
+        Assert.Contains("<|assistant|>", result, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -254,8 +254,8 @@ public class JinjaChatTemplateTests
 
         var result = template.Apply(messages, new ChatTemplateOptions { AddGenerationPrompt = true });
 
-        Assert.Contains("<|system|>You are a helpful assistant.<|end|>", result);
-        Assert.Contains("<|user|>Hello!<|end|>", result);
+        Assert.Contains("<|system|>You are a helpful assistant.<|end|>", result, StringComparison.Ordinal);
+        Assert.Contains("<|user|>Hello!<|end|>", result, StringComparison.Ordinal);
     }
 
     // ── Edge cases ──
@@ -360,7 +360,7 @@ public class JinjaChatTemplateTests
         var parser = new JinjaParser(tokens);
         var ast = parser.Parse();
 
-        var eval = new JinjaEvaluator(new Dictionary<string, object?>
+        var eval = new JinjaEvaluator(new Dictionary<string, object?>(StringComparer.Ordinal)
         {
             ["items"] = new List<object?> { "a", "b" },
             ["messages"] = new List<object?>(),
@@ -397,7 +397,7 @@ public class JinjaChatTemplateTests
 
         var result = tmpl.Apply(messages, new ChatTemplateOptions { AddGenerationPrompt = false });
 
-        Assert.Contains("[assistant]CALLS:get_weather", result);
+        Assert.Contains("[assistant]CALLS:get_weather", result, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -417,8 +417,8 @@ public class JinjaChatTemplateTests
 
         var result = tmpl.Apply(messages, new ChatTemplateOptions { AddGenerationPrompt = false });
 
-        Assert.Contains("[tool:call_0]", result);
-        Assert.Contains("""{"temp":22}""", result);
+        Assert.Contains("[tool:call_0]", result, StringComparison.Ordinal);
+        Assert.Contains("""{"temp":22}""", result, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -435,8 +435,8 @@ public class JinjaChatTemplateTests
             });
 
         // Should contain the tool definition as JSON
-        Assert.Contains("\"search\"", result);
-        Assert.Contains("\"function\"", result);
+        Assert.Contains("\"search\"", result, StringComparison.Ordinal);
+        Assert.Contains("\"function\"", result, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -466,9 +466,9 @@ public class JinjaChatTemplateTests
 
         var result = tmpl.Apply(messages, new ChatTemplateOptions { AddGenerationPrompt = false });
 
-        Assert.Contains("<|user|>Weather in Paris?", result);
-        Assert.Contains("[TC:get_weather]", result);
-        Assert.Contains("<|tool|>", result);
-        Assert.Contains("It's 22 degrees", result);
+        Assert.Contains("<|user|>Weather in Paris?", result, StringComparison.Ordinal);
+        Assert.Contains("[TC:get_weather]", result, StringComparison.Ordinal);
+        Assert.Contains("<|tool|>", result, StringComparison.Ordinal);
+        Assert.Contains("It's 22 degrees", result, StringComparison.Ordinal);
     }
 }

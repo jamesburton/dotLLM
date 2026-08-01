@@ -21,13 +21,24 @@ public sealed class VulkanModule : IDisposable
     private nint _shaderModule;
     private bool _disposed;
 
-    private VulkanModule(VulkanDevice device, nint shaderModule)
+    private VulkanModule(VulkanDevice device, nint shaderModule, uint storageWritesMask)
     {
         _device = device;
         _shaderModule = shaderModule;
+        StorageWritesMask = storageWritesMask;
     }
 
     internal nint Handle => _shaderModule;
+
+    /// <summary>
+    /// Per-binding writes mask reflected from the SPIR-V blob at load time:
+    /// bit <c>b</c> set means the shader may write storage-buffer binding
+    /// <c>b</c>; clear means the binding is declared <c>readonly</c>. Feeds
+    /// the hazard-scoped barrier tracker (issue #144) via
+    /// <see cref="ComputePipeline.StorageWritesMask"/>. Conservative
+    /// (<c>~0u</c>) when reflection fails.
+    /// </summary>
+    internal uint StorageWritesMask { get; }
 
     /// <summary>Loads a compiled SPIR-V shader from a file.</summary>
     public static VulkanModule LoadFromFile(VulkanDevice device, string spvPath)
@@ -55,7 +66,7 @@ public sealed class VulkanModule : IDisposable
             };
             VulkanApi.vkCreateShaderModule(device.Handle, ci, 0, out nint mod)
                 .ThrowOnError("vkCreateShaderModule");
-            return new VulkanModule(device, mod);
+            return new VulkanModule(device, mod, SpirvReflection.ComputeStorageWritesMask(spv));
         }
     }
 
@@ -173,7 +184,7 @@ public sealed class VulkanModule : IDisposable
                     .ThrowOnError("vkCreateComputePipelines");
             }
 
-            var result = new ComputePipeline(_device, setLayout, pipelineLayout, pipeline);
+            var result = new ComputePipeline(_device, setLayout, pipelineLayout, pipeline, StorageWritesMask);
             // Transfer ownership — clear locals so finally{} does not double-free.
             setLayout = 0; pipelineLayout = 0; pipeline = 0;
             return result;
@@ -218,13 +229,22 @@ public sealed class ComputePipeline : IDisposable
     private nint _pipelineLayout;
     private nint _pipeline;
 
-    internal ComputePipeline(VulkanDevice device, nint setLayout, nint pipelineLayout, nint pipeline)
+    internal ComputePipeline(VulkanDevice device, nint setLayout, nint pipelineLayout, nint pipeline,
+        uint storageWritesMask = ~0u)
     {
         _device = device;
         _setLayout = setLayout;
         _pipelineLayout = pipelineLayout;
         _pipeline = pipeline;
+        StorageWritesMask = storageWritesMask;
     }
+
+    /// <summary>
+    /// Shader storage-buffer writes mask (bit <c>b</c> = binding <c>b</c>
+    /// writable) reflected from the SPIR-V at module load — see
+    /// <see cref="VulkanModule.StorageWritesMask"/>.
+    /// </summary>
+    internal uint StorageWritesMask { get; }
 
     /// <summary>The <c>VkPipeline</c> handle.</summary>
     public nint Pipeline => _pipeline;

@@ -157,7 +157,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModelForwardBatchTests
         // The override rejects this with an ArgumentException naming the missing slot.
         var ex = Assert.Throws<ArgumentException>(() =>
             model.ForwardBatch(requests, deviceId: -1));
-        Assert.Contains("GdnState", ex.Message);
+        Assert.Contains("GdnState", ex.Message, StringComparison.Ordinal);
     }
 
     [SkippableFact]

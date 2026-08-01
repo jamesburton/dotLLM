@@ -378,11 +378,8 @@ public sealed unsafe class WeightRepackingTests
         byte* src = (byte*)NativeMemory.AlignedAlloc((nuint)totalBytes, 64);
         new Span<byte>(src, (int)totalBytes).Clear();
 
-        var rw = WeightRepacking.RepackR4((nint)src, QuantizationType.Q8_0, m, k);
+        using var rw = WeightRepacking.RepackR4((nint)src, QuantizationType.Q8_0, m, k);
         NativeMemory.AlignedFree(src);
-
-        // Dispose should not throw
-        rw.Dispose();
     }
 
     [Fact]

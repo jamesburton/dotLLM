@@ -28,7 +28,7 @@ public sealed class MoeIndexedLoraDeltaF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 5);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 5);
     }
 
     /// <summary>Loads <c>moe_indexed_lora_delta_f32.spv</c> from <paramref name="spvDir"/>.</summary>

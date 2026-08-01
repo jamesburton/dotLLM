@@ -234,7 +234,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         // on-device byte form — Q8_0 blocks for kept-Q8_0, F32 elsewhere).
         long stagingBytes = ComputeMaxStagingBytes(config, cpuLayers, outputNormWeight,
             outputOutputDim, outputInputDim, outputQuantType);
-        using var staging = device.Allocate(stagingBytes);
+        using var staging = VulkanStagingBuffer.Create(device, stagingBytes);
 
         // Token embedding [vocab, hidden] — always dequantised on upload (the embedding
         // gather uses byte-offset vkCmdCopyBuffer and needs a contiguous F32 layout).
@@ -509,7 +509,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     }
 
     private static SsmLayerBuffers UploadSsmLayer(
-        VulkanDevice device, VulkanDevice.Buffer staging,
+        VulkanDevice device, VulkanStagingBuffer staging,
         NemotronHSsmWeights ssmW, out long uploadedBytes)
     {
         uploadedBytes = 0;
@@ -547,7 +547,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     }
 
     private static AttentionLayerBuffers UploadAttentionLayer(
-        VulkanDevice device, VulkanDevice.Buffer staging,
+        VulkanDevice device, VulkanStagingBuffer staging,
         NemotronHAttentionWeights attnW, out long uploadedBytes)
     {
         uploadedBytes = 0;
@@ -574,7 +574,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     }
 
     private static FfnLayerBuffers UploadFfnLayer(
-        VulkanDevice device, VulkanDevice.Buffer staging,
+        VulkanDevice device, VulkanStagingBuffer staging,
         NemotronHFfnWeights ffnW, out long uploadedBytes)
     {
         var up = UploadProjectionMatrix(device, staging,
@@ -599,7 +599,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     /// <see cref="QuantizationType.F32"/>.
     /// </summary>
     private static unsafe VulkanDevice.Buffer UploadProjectionMatrix(
-        VulkanDevice device, VulkanDevice.Buffer staging,
+        VulkanDevice device, VulkanStagingBuffer staging,
         nint srcPtr, QuantizationType qt, int outputDim, int inputDim,
         bool forceF32,
         out QuantizationType deviceQuantType,
@@ -616,18 +616,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             long bytes = rowBytes * outputDim;
 
             var buf = device.AllocateDeviceLocal(bytes);
-            VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-                .ThrowOnError("vkMapMemory VulkanNemotronHWeights.UploadProjectionMatrix staging (raw quant)");
-            try
-            {
-                new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
-                    .CopyTo(new Span<byte>((void*)mapped, checked((int)bytes)));
-            }
-            finally
-            {
-                VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-            }
-            device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
+            staging.UploadBytes(srcPtr, bytes, buf);
 
             deviceQuantType = keepQt;
             uploadedBytes = bytes;
@@ -640,39 +629,37 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         long fpBytes = elems * sizeof(float);
         var fpBuf = device.AllocateDeviceLocal(fpBytes);
 
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)fpBytes, 0, out nint fpMapped)
-            .ThrowOnError("vkMapMemory VulkanNemotronHWeights.UploadProjectionMatrix staging");
-        try
+        if (qt == QuantizationType.F32)
         {
-            float* dst = (float*)fpMapped;
-            if (qt == QuantizationType.F32)
-            {
-                new ReadOnlySpan<float>((void*)srcPtr, checked((int)elems))
-                    .CopyTo(new Span<float>(dst, checked((int)elems)));
-            }
-            else if (qt == QuantizationType.F16)
-            {
-                System.Numerics.Tensors.TensorPrimitives.ConvertToSingle(
-                    new ReadOnlySpan<Half>((void*)srcPtr, checked((int)elems)),
-                    new Span<float>(dst, checked((int)elems)));
-            }
-            else
-            {
-                long rowBytes = Dequantize.RowByteSize(inputDim, qt);
-                for (int row = 0; row < outputDim; row++)
+            staging.UploadBytes(srcPtr, fpBytes, fpBuf);
+        }
+        else if (qt == QuantizationType.F16)
+        {
+            staging.UploadRows(outputDim, (long)inputDim * sizeof(float), fpBuf, 0,
+                (chunkPtr, firstRow, rowCount) =>
                 {
-                    nint rowSrc = srcPtr + (nint)((long)row * rowBytes);
-                    Dequantize.ToFloat32(rowSrc, inputDim, qt,
-                        new Span<float>(dst + (long)row * inputDim, inputDim));
-                }
-            }
+                    long elemOff = firstRow * inputDim;
+                    long n = (long)rowCount * inputDim;
+                    System.Numerics.Tensors.TensorPrimitives.ConvertToSingle(
+                        new ReadOnlySpan<Half>((void*)(srcPtr + (nint)(elemOff * 2)), checked((int)n)),
+                        new Span<float>((void*)chunkPtr, checked((int)n)));
+                });
         }
-        finally
+        else
         {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
+            long rowBytes = Dequantize.RowByteSize(inputDim, qt);
+            staging.UploadRows(outputDim, (long)inputDim * sizeof(float), fpBuf, 0,
+                (chunkPtr, firstRow, rowCount) =>
+                {
+                    float* dst = (float*)chunkPtr;
+                    for (int i = 0; i < rowCount; i++)
+                    {
+                        nint rowSrc = srcPtr + (nint)((firstRow + i) * rowBytes);
+                        Dequantize.ToFloat32(rowSrc, inputDim, qt,
+                            new Span<float>(dst + (long)i * inputDim, inputDim));
+                    }
+                });
         }
-
-        device.CopyBufferSynchronous(staging, fpBuf, (ulong)fpBytes);
 
         deviceQuantType = QuantizationType.F32;
         uploadedBytes = fpBytes;
@@ -680,22 +667,11 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     }
 
     private static unsafe VulkanDevice.Buffer UploadFloatArray(
-        VulkanDevice device, VulkanDevice.Buffer staging, float[] data)
+        VulkanDevice device, VulkanStagingBuffer staging, float[] data)
     {
         long bytes = (long)data.Length * sizeof(float);
         var buf = device.AllocateDeviceLocal(bytes);
-
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory VulkanNemotronHWeights.UploadFloatArray staging");
-        try
-        {
-            data.AsSpan().CopyTo(new Span<float>((void*)mapped, data.Length));
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-        }
-        device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
+        staging.UploadFloats(data, buf);
         return buf;
     }
 

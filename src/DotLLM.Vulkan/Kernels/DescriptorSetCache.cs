@@ -53,6 +53,7 @@ internal sealed class DescriptorSetCache
     private readonly nint _pool;
     private readonly nint _setLayout;
     private readonly int _buffersPerSet;
+    private readonly uint _writesMask;
 
     // Parallel arrays indexed by slot. _keys[i] holds MaxBuffersPerSet nints;
     // unused trailing slots are zero. _sets[i] is the descriptor set handle
@@ -61,13 +62,23 @@ internal sealed class DescriptorSetCache
     private readonly nint[] _sets;
     private int _count;
 
-    public DescriptorSetCache(VulkanDevice device, nint pool, nint setLayout, int buffersPerSet)
+    /// <summary>
+    /// Builds the cache against <paramref name="pipeline"/>'s descriptor-set
+    /// layout. The pipeline also supplies its SPIR-V-reflected storage-buffer
+    /// writes mask (<see cref="ComputePipeline.StorageWritesMask"/>) — this is
+    /// the single choke point every kernel dispatch passes through, so
+    /// <see cref="GetOrCreate"/> declares the dispatch's read/write buffer
+    /// set to the device's active <see cref="VulkanHazardTracker"/> (issue
+    /// #144) right before the caller records the dispatch.
+    /// </summary>
+    public DescriptorSetCache(VulkanDevice device, nint pool, ComputePipeline pipeline, int buffersPerSet)
     {
         if (buffersPerSet <= 0 || buffersPerSet > MaxBuffersPerSet)
             throw new ArgumentOutOfRangeException(nameof(buffersPerSet));
         _device = device;
         _pool = pool;
-        _setLayout = setLayout;
+        _setLayout = pipeline.DescriptorSetLayout;
+        _writesMask = pipeline.StorageWritesMask;
         _buffersPerSet = buffersPerSet;
         _keys = new nint[Capacity * MaxBuffersPerSet];
         _sets = new nint[Capacity];
@@ -84,6 +95,13 @@ internal sealed class DescriptorSetCache
         if (buffers.Length != _buffersPerSet)
             throw new ArgumentException(
                 $"Expected {_buffersPerSet} buffers, got {buffers.Length}.", nameof(buffers));
+
+        // Hazard-scoped barriers (issue #144): every kernel calls GetOrCreate
+        // with the exact buffer list of the dispatch it is about to record,
+        // so this is where the dispatch's access set is declared. Emits a
+        // batched barrier into the current command buffer only on a real
+        // RAW/WAR/WAW conflict. No-op (null) outside a tracked forward.
+        _device.ActiveHazards?.OnDispatch(buffers, _writesMask);
 
         // Linear scan — 256 entries × up-to-4 pointer comparisons is
         // ~a microsecond, well below vkAllocateDescriptorSets latency.

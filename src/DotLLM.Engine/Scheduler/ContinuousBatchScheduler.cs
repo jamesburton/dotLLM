@@ -208,7 +208,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         int maxTokens = Math.Max(1, options.MaxTokens);
 
         // Sampler pipeline (per-sequence — pipelines hold RNG state, so we can't share).
-        var pipeline = new SamplerPipeline(options);
+        var pipeline = new SamplerPipeline(options, _tokenizer);
 
         // Build stop conditions. Mirrors TextGenerator: explicit list if set, else EOS + MaxTokens + stop strings.
         IReadOnlyList<IStopCondition> stops;

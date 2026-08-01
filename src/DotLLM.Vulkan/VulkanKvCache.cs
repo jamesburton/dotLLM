@@ -203,6 +203,14 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         int maxPos = ValidateAndFindMaxPos(positions, seqLen);
         bool contiguous = IsContiguousAscending(positions);
 
+        // Hazard-scoped barriers (issue #144): declare the append's access set
+        // (reads the fresh K/V activations, writes the per-layer cache rows)
+        // so the tracker emits the RoPE→copy barrier and the later
+        // copy→attention barrier only when actually pending. One declaration
+        // per buffer pair covers both the contiguous and per-row forms.
+        _device.ActiveHazards?.OnTransfer(kDev.Handle, _keys[layerIndex].Handle);
+        _device.ActiveHazards?.OnTransfer(vDev.Handle, _values[layerIndex].Handle);
+
         if (contiguous)
         {
             int startPos = positions[0];
@@ -231,6 +239,24 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
             }
         }
 
+        int newLength = maxPos + 1;
+        if (newLength > _currentLength)
+            _currentLength = newLength;
+    }
+
+    /// <summary>
+    /// Validates <paramref name="positions"/> and advances <see cref="CurrentLength"/> as if
+    /// <see cref="RecordUpdate"/> had run, WITHOUT recording any copy commands. Used by the
+    /// fused RoPE+KV-write path (<c>RopeKvWriteF32Kernel</c>, issue #380), which writes cache
+    /// rows directly via its own compute dispatch instead of going through <see cref="RecordUpdate"/>'s
+    /// <c>vkCmdCopyBuffer</c> calls, but still needs the same length-tracking side effect.
+    /// </summary>
+    internal void AdvanceCurrentLength(ReadOnlySpan<int> positions, int seqLen)
+    {
+        if (positions.Length != seqLen)
+            throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
+
+        int maxPos = ValidateAndFindMaxPos(positions, seqLen);
         int newLength = maxPos + 1;
         if (newLength > _currentLength)
             _currentLength = newLength;
@@ -424,9 +450,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     private unsafe void MapAndCopy(VulkanDevice.Buffer staging, ReadOnlySpan<float> source)
     {
         int byteLen = source.Length * sizeof(float);
-        Interop.VulkanApi.vkMapMemory(
-                _device.Handle, staging.Memory, 0, (ulong)byteLen, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory IngestFromHost staging");
+        nint mapped = _device.MapMemoryWithRetry(staging.Memory, 0, (ulong)byteLen, "vkMapMemory IngestFromHost staging");
         try
         {
             fixed (float* src = source)

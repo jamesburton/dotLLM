@@ -50,9 +50,9 @@ public sealed class PromptCacheEndpointTests
 
         string json = JsonSerializer.Serialize(resp, ServerJsonContext.Default.PromptCacheResponse);
 
-        Assert.Contains("\"prefix_id\":\"sys-1\"", json);
-        Assert.Contains("\"tokens\":256", json);
-        Assert.Contains("\"blocks\":16", json);
+        Assert.Contains("\"prefix_id\":\"sys-1\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"tokens\":256", json, StringComparison.Ordinal);
+        Assert.Contains("\"blocks\":16", json, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -75,12 +75,12 @@ public sealed class PromptCacheEndpointTests
 
         string json = JsonSerializer.Serialize(resp, ServerJsonContext.Default.PromptCacheStatsResponse);
 
-        Assert.Contains("\"enabled\":true", json);
-        Assert.Contains("\"block_size\":16", json);
-        Assert.Contains("\"hit_tokens\":256", json);
-        Assert.Contains("\"miss_tokens\":32", json);
-        Assert.Contains("\"eviction_refusals\":1", json);
-        Assert.Contains("\"total_blocks\":64", json);
+        Assert.Contains("\"enabled\":true", json, StringComparison.Ordinal);
+        Assert.Contains("\"block_size\":16", json, StringComparison.Ordinal);
+        Assert.Contains("\"hit_tokens\":256", json, StringComparison.Ordinal);
+        Assert.Contains("\"miss_tokens\":32", json, StringComparison.Ordinal);
+        Assert.Contains("\"eviction_refusals\":1", json, StringComparison.Ordinal);
+        Assert.Contains("\"total_blocks\":64", json, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -112,7 +112,7 @@ public sealed class PromptCacheEndpointTests
         using var factory = new PagedKvCacheFactory(2, 2, 4, blockSize: 8, maxTotalTokens: 64);
         using var mgr = new PrefixTrieManager(factory);
 
-        var state = new ServerState
+        using var state = new ServerState
         {
             Options = new ServerOptions { Model = "test" },
             PrefixTrieManager = mgr,

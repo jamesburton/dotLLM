@@ -13,7 +13,13 @@ namespace DotLLM.Vulkan.Kernels;
 /// The seqLen&gt;1 analogue of <see cref="MatMulIq4NlMmvqKernel"/> (decode). Replaces the
 /// dequant→FP GEMM (<see cref="MatMulIq4NlGemmF32Kernel"/>) on the seqLen&gt;1 path; falls
 /// back to it when the device lacks integer-dot-product support. NOT bit-exact (activation
-/// int8-quant); validated against the CPU F32 oracle. Workgroup <c>(16,16,1)</c>.
+/// int8-quant); validated against the CPU F32 oracle.
+/// </remarks>
+/// <remarks>
+/// Dispatch: 2-D grid, workgroup <c>(16, 16, 1)</c> — one 64×64 output tile of <c>C</c>
+/// per workgroup (issue #367 register-tiled rewrite, direct port of #366's Q8_0 tiling —
+/// same single-32-block-per-row layout, only the weight decode differs). Each thread
+/// computes a 4×4 register tile (strided by 16).
 /// </remarks>
 public sealed class MatMulIq4NlMmqKernel : IDisposable
 {
@@ -23,8 +29,8 @@ public sealed class MatMulIq4NlMmqKernel : IDisposable
     /// <summary>Elements per IQ4_NL block.</summary>
     public const int Iq4NlGroupSize = 32;
 
-    private const int TileM = 16;
-    private const int TileN = 16;
+    private const int TileM = 64;
+    private const int TileN = 64;
     private const int PushConstantBytes = 5 * sizeof(uint);
 
     private readonly VulkanDevice _device;
@@ -40,7 +46,7 @@ public sealed class MatMulIq4NlMmqKernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 4);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
     }
 
     /// <summary>Loads <c>matmul_iq4_nl_mmq.spv</c>; null when missing or no integer-dot support.</summary>

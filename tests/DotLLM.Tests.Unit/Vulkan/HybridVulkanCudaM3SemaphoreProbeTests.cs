@@ -49,7 +49,7 @@ public sealed class HybridVulkanCudaM3SemaphoreProbeTests
 
     private static bool IsCudaDriverPresent()
     {
-        string lib = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+        string lib = OperatingSystem.IsWindows()
             ? "nvcuda.dll" : "libcuda.so.1";
         if (!NativeLibrary.TryLoad(lib, out nint h)) return false;
         NativeLibrary.Free(h);
@@ -120,7 +120,7 @@ public sealed class HybridVulkanCudaM3SemaphoreProbeTests
         // ── CUDA external semaphore API probe ──────────────────────────────
 
         bool cudaImportExtSemPresent = false;
-        string cudaLib = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+        string cudaLib = OperatingSystem.IsWindows()
             ? "nvcuda.dll" : "libcuda.so.1";
         if (NativeLibrary.TryLoad(cudaLib, out nint cudaHandle))
         {

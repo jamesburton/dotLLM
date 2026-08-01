@@ -22,7 +22,7 @@ public class VulkanAddKernelTests
     public void AddKernel_ProducesElementwiseSum()
     {
         Skip.If(
-            Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1",
+            string.Equals(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN"), "1", StringComparison.Ordinal),
             "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(
             VulkanDevice.IsAvailable(),
@@ -70,7 +70,7 @@ public class VulkanAddKernelTests
     public void Device_ReportsName()
     {
         Skip.If(
-            Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1",
+            string.Equals(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN"), "1", StringComparison.Ordinal),
             "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(
             VulkanDevice.IsAvailable(),

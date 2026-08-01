@@ -29,14 +29,18 @@ public sealed class LoraAdapterTests
     public void Constructor_RejectsInvalidRank()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            new LoraAdapter("test", rank: 0, alpha: 16f, targetModules: ["q_proj"]));
+        {
+            new LoraAdapter("test", rank: 0, alpha: 16f, targetModules: ["q_proj"]);
+        });
     }
 
     [Fact]
     public void Constructor_RejectsNullName()
     {
         Assert.Throws<ArgumentException>(() =>
-            new LoraAdapter("", rank: 8, alpha: 16f, targetModules: ["q_proj"]));
+        {
+            new LoraAdapter("", rank: 8, alpha: 16f, targetModules: ["q_proj"]);
+        });
     }
 
     [Fact]
@@ -160,9 +164,49 @@ public sealed class LoraAdapterTests
     }
 
     [Fact]
+    public void IsCompatible_UsesPerLayerHeadDim_ForGemma4DualHeadDimGlobalLayer()
+    {
+        // Gemma-4-family models (Gemma4, DiffusionGemma) use a DIFFERENT head dim / kv-head
+        // count on global (full-attention) layers than on sliding layers. A real adapter's
+        // q_proj entry at the global layer is correctly LARGER (GlobalHeadDim) than at a
+        // sliding layer -- IsCompatible must validate per-layer, not against one model-wide
+        // qOut, or it wrongly rejects (or wrongly accepts) shapes depending on which layer.
+        var cfg = BuildBaseConfig() with
+        {
+            NumLayers = 2,
+            NumAttentionHeads = 4,
+            HeadDim = 16,           // sliding head dim
+            GlobalHeadDim = 32,     // global (full-attention) head dim -- DIFFERENT
+            NumKvHeads = 4,
+            NumGlobalKvHeads = 2,   // global kv-heads -- DIFFERENT
+            SlidingWindowSize = 8,
+            PerLayerSlidingWindow = [8, null], // layer 0 sliding, layer 1 global (no window)
+        };
+        int rank = 8;
+
+        using var adapter = new LoraAdapter("a", rank, alpha: 16f, targetModules: ["q_proj"]);
+        int slidingQOut = cfg.NumAttentionHeads * cfg.HeadDim;      // 4*16=64
+        int globalQOut = cfg.NumAttentionHeads * cfg.GlobalHeadDim!.Value; // 4*32=128
+        Assert.NotEqual(slidingQOut, globalQOut);
+
+        adapter.AddLayerWeights(0, "q_proj", // sliding layer
+            new LoraLayerWeights(
+                LoraAdapter.AllocAligned((long)slidingQOut * rank),
+                LoraAdapter.AllocAligned((long)rank * cfg.HiddenSize),
+                cfg.HiddenSize, slidingQOut));
+        adapter.AddLayerWeights(1, "q_proj", // global layer -- LARGER output dim
+            new LoraLayerWeights(
+                LoraAdapter.AllocAligned((long)globalQOut * rank),
+                LoraAdapter.AllocAligned((long)rank * cfg.HiddenSize),
+                cfg.HiddenSize, globalQOut));
+
+        Assert.True(adapter.IsCompatible(cfg));
+    }
+
+    [Fact]
     public void Dispose_FreesNativeBuffers()
     {
-        var adapter = new LoraAdapter("a", rank: 8, alpha: 16f, targetModules: ["q_proj"]);
+        using var adapter = new LoraAdapter("a", rank: 8, alpha: 16f, targetModules: ["q_proj"]);
         int rank = 8;
         adapter.AddLayerWeights(0, "q_proj",
             new LoraLayerWeights(
@@ -171,7 +215,6 @@ public sealed class LoraAdapterTests
                 64, 64));
         adapter.Dispose();
 
-        // Idempotent: second dispose is a no-op.
-        adapter.Dispose();
+        // Idempotent: the enclosing `using` disposes again on scope exit — should be a no-op.
     }
 }

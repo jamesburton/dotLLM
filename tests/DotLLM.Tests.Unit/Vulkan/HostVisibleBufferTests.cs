@@ -22,7 +22,7 @@ public class HostVisibleBufferTests
     [SkippableFact]
     public void Probe_DoesNotCrash_WhenExtensionAbsent()
     {
-        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
+        Skip.If(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN"), "1", StringComparison.Ordinal), "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/device.");
 
         // The probe runs unconditionally in VulkanDevice.Create. Pass criterion
@@ -52,7 +52,7 @@ public class HostVisibleBufferTests
     [SkippableFact]
     public unsafe void TryCreate_ReturnsNull_WhenExtensionAbsent()
     {
-        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
+        Skip.If(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN"), "1", StringComparison.Ordinal), "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/device.");
 
         using var device = VulkanDevice.Create();
@@ -78,7 +78,7 @@ public class HostVisibleBufferTests
     [SkippableFact]
     public unsafe void TryCreate_ImportsAlignedPointer_WhenSupported()
     {
-        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
+        Skip.If(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN"), "1", StringComparison.Ordinal), "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/device.");
 
         using var device = VulkanDevice.Create();
@@ -117,7 +117,7 @@ public class HostVisibleBufferTests
     [SkippableFact]
     public unsafe void TryCreate_HandlesUnalignedPointer_ByPageRounding()
     {
-        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
+        Skip.If(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN"), "1", StringComparison.Ordinal), "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/device.");
 
         using var device = VulkanDevice.Create();
@@ -158,7 +158,7 @@ public class HostVisibleBufferTests
     [SkippableFact]
     public void Buffer_FromHostImport_FlagsAsHostImported()
     {
-        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
+        Skip.If(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN"), "1", StringComparison.Ordinal), "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/device.");
 
         using var device = VulkanDevice.Create();
@@ -187,7 +187,7 @@ public class HostVisibleBufferTests
     [SkippableFact]
     public void Buffer_FromDeviceLocal_NotHostImported()
     {
-        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
+        Skip.If(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN"), "1", StringComparison.Ordinal), "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/device.");
 
         using var device = VulkanDevice.Create();

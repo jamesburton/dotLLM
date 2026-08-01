@@ -100,6 +100,51 @@ public static class RoPE
         }
     }
 
+    /// <summary>
+    /// Pre-computes cos/sin tables with per-pair PROPORTIONAL frequency factors
+    /// (llama.cpp <c>rope_freqs.weight</c> / ggml <c>freq_factors</c>, used by the
+    /// Gemma-4 E2B/E4B full-attention layers and Llama-3.1-style long-rope). The
+    /// angle for pair <c>i</c> is <c>pos * θ^(-2i/headDim) / factors[i]</c> —
+    /// ggml's <c>ggml_rope_cache_init</c> divides the pair's theta by
+    /// <c>freq_factors[i0/2]</c> (<c>theta/ff</c>). Table layout is identical to
+    /// <see cref="PrecomputeFrequencyTable"/> (<c>table[pos * headDim/2 + i]</c>),
+    /// so the standard <c>Execute</c> overloads consume it unchanged.
+    /// </summary>
+    /// <param name="maxSeqLen">Maximum sequence length to pre-compute.</param>
+    /// <param name="headDim">Rotated dimension count (must be even).</param>
+    /// <param name="theta">Base frequency.</param>
+    /// <param name="factors">Per-pair divisors, length <c>headDim / 2</c>.</param>
+    /// <param name="cosTable">Destination cosine table; length ≥ maxSeqLen * headDim / 2.</param>
+    /// <param name="sinTable">Destination sine table; length ≥ maxSeqLen * headDim / 2.</param>
+    public static void PrecomputeFrequencyTableWithFactors(
+        int maxSeqLen, int headDim, float theta, ReadOnlySpan<float> factors,
+        Span<float> cosTable, Span<float> sinTable)
+    {
+        if (headDim <= 0 || headDim % 2 != 0)
+            throw new ArgumentException($"headDim must be a positive even number, got {headDim}", nameof(headDim));
+        int halfDim = headDim / 2;
+        if (factors.Length < halfDim)
+            throw new ArgumentException(
+                $"factors length {factors.Length} must be >= headDim/2 ({halfDim}).", nameof(factors));
+
+        float[] rented = ArrayPool<float>.Shared.Rent(halfDim);
+        Span<float> freqs = rented.AsSpan(0, halfDim);
+        for (int i = 0; i < halfDim; i++)
+            freqs[i] = 1.0f / (MathF.Pow(theta, 2.0f * i / headDim) * factors[i]);
+
+        for (int pos = 0; pos < maxSeqLen; pos++)
+        {
+            int tableBase = pos * halfDim;
+            for (int i = 0; i < halfDim; i++)
+            {
+                float angle = pos * freqs[i];
+                cosTable[tableBase + i] = MathF.Cos(angle);
+                sinTable[tableBase + i] = MathF.Sin(angle);
+            }
+        }
+        ArrayPool<float>.Shared.Return(rented);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void FillTables(int maxSeqLen, int headDim, float theta,
                                     Span<float> cosTable, Span<float> sinTable, Span<float> freqs)

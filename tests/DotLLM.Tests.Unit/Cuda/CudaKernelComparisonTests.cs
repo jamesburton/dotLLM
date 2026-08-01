@@ -14,7 +14,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </summary>
 [Trait("Category", "GPU")]
 [Collection(CudaCollection.Name)]
-public class CudaKernelComparisonTests : IDisposable
+public sealed class CudaKernelComparisonTests : IDisposable
 {
     private const int HiddenSize = 576;
     private const int NumHeads = 9;

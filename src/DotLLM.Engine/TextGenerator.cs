@@ -34,6 +34,7 @@ public sealed class TextGenerator
     private readonly Func<ModelConfig, int, Core.Attention.IKvCache>? _draftKvCacheFactory;
     private readonly int _speculativeCandidates;
     private readonly HybridPrefillDecodeStrategy? _hybridStrategy;
+    private readonly int _prefillChunkSize;
 
     /// <summary>
     /// Creates a new text generator.
@@ -55,6 +56,12 @@ public sealed class TextGenerator
     /// <param name="prefixTrieManager">Optional cross-request prefix trie manager (Step 37).
     /// Takes precedence over <paramref name="prefixCache"/> when supplied — multiple sessions
     /// share KV blocks via the trie.</param>
+    /// <param name="prefillChunkSize">Maximum prompt tokens per prefill forward pass (llama.cpp
+    /// <c>-ub</c> / micro-batch analog). When &gt; 0 the prompt is prefilled in chunks of at most
+    /// this many tokens (bounding peak activation memory per forward); 0 (default) runs the whole
+    /// uncached suffix in a single forward pass — behavior unchanged. Ignored on the hybrid
+    /// CPU-prefill/GPU-decode path, whose <see cref="HybridPrefillDecodeStrategy.RunPrefill"/>
+    /// processes the full prompt itself.</param>
     public TextGenerator(IModel model, ITokenizer tokenizer,
                           Func<ModelConfig, int, Core.Attention.IKvCache>? kvCacheFactory = null,
                           PrefixCache? prefixCache = null,
@@ -62,7 +69,8 @@ public sealed class TextGenerator
                           Func<ModelConfig, int, Core.Attention.IKvCache>? draftKvCacheFactory = null,
                           int speculativeCandidates = 5,
                           HybridPrefillDecodeStrategy? hybridStrategy = null,
-                          PrefixTrieManager? prefixTrieManager = null)
+                          PrefixTrieManager? prefixTrieManager = null,
+                          int prefillChunkSize = 0)
     {
         _model = model;
         _tokenizer = tokenizer;
@@ -73,6 +81,7 @@ public sealed class TextGenerator
         _draftKvCacheFactory = draftKvCacheFactory;
         _speculativeCandidates = speculativeCandidates;
         _hybridStrategy = hybridStrategy;
+        _prefillChunkSize = prefillChunkSize;
 
         if (hybridStrategy is not null
             && !ReferenceEquals(hybridStrategy.DecodeModel, model))
@@ -83,6 +92,11 @@ public sealed class TextGenerator
                 nameof(hybridStrategy));
         }
     }
+
+    /// <summary>
+    /// Configured prefill chunk size (llama.cpp <c>-ub</c> analog). 0 = single-pass prefill.
+    /// </summary>
+    public int PrefillChunkSize => _prefillChunkSize;
 
     /// <summary>
     /// Generates text from the given prompt using the specified options.
@@ -126,7 +140,7 @@ public sealed class TextGenerator
         var telemetry = new TelemetryRecorder(_model.Config, options);
 
         // Build sampling pipeline
-        var pipeline = new SamplerPipeline(options);
+        var pipeline = new SamplerPipeline(options, _tokenizer);
 
         // Logprobs capture setup
         bool captureLogprobs = options.Logprobs;
@@ -244,41 +258,29 @@ public sealed class TextGenerator
                 }
                 else if (prefillLen > 0)
                 {
-                    // Prefill suffix tokens — span slice avoids array allocation
-                    ReadOnlySpan<int> suffixTokens = promptIds.AsSpan(prefillStart);
-                    int[] positionsArray = ArrayPool<int>.Shared.Rent(prefillLen);
-                    try
+                    // Prefill suffix tokens — chunked when a prefill chunk size is configured
+                    // (llama.cpp -ub analog); otherwise a single forward pass, as before.
+                    using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter))
                     {
-                        Span<int> positions = positionsArray.AsSpan(0, prefillLen);
-                        for (int i = 0; i < prefillLen; i++)
-                            positions[i] = prefillStart + i;
+                        long ts1 = Stopwatch.GetTimestamp();
+                        prefillTicks = ts1 - ts0;
 
-                        using (ITensor prefillLogits = _model.Forward(suffixTokens, positions, deviceId: -1, kvCache, adapter))
+                        unsafe
                         {
-                            long ts1 = Stopwatch.GetTimestamp();
-                            prefillTicks = ts1 - ts0;
-
-                            unsafe
-                            {
-                                using var sampleSpan = telemetry.StartSample();
-                                long samplerStart = Stopwatch.GetTimestamp();
-                                // GPU/hybrid models return [1, vocabSize] (last token only);
-                                // CPU model returns [seqLen, vocabSize]. Use actual shape to index.
-                                float* logitPtr = (float*)prefillLogits.DataPointer;
-                                int logitRows = prefillLogits.Shape[0];
-                                var logitSpan = new Span<float>(logitPtr + (long)(logitRows - 1) * vocabSize, vocabSize);
-                                if (constraint != null)
-                                    TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
-                                var (tid, lp) = SampleWithLogprobs(logitSpan);
-                                firstTokenId = tid;
-                                if (lp.HasValue) logprobsList!.Add(lp.Value);
-                                samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
-                            }
+                            using var sampleSpan = telemetry.StartSample();
+                            long samplerStart = Stopwatch.GetTimestamp();
+                            // GPU/hybrid models return [1, vocabSize] (last token only);
+                            // CPU model returns [seqLen, vocabSize]. Use actual shape to index.
+                            float* logitPtr = (float*)prefillLogits.DataPointer;
+                            int logitRows = prefillLogits.Shape[0];
+                            var logitSpan = new Span<float>(logitPtr + (long)(logitRows - 1) * vocabSize, vocabSize);
+                            if (constraint != null)
+                                TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
+                            var (tid, lp) = SampleWithLogprobs(logitSpan);
+                            firstTokenId = tid;
+                            if (lp.HasValue) logprobsList!.Add(lp.Value);
+                            samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
                         }
-                    }
-                    finally
-                    {
-                        ArrayPool<int>.Shared.Return(positionsArray);
                     }
                 }
                 else if (promptLen > 0)
@@ -532,7 +534,7 @@ public sealed class TextGenerator
         var telemetry = new TelemetryRecorder(_model.Config, options);
 
         // Build sampling pipeline
-        var pipeline = new SamplerPipeline(options);
+        var pipeline = new SamplerPipeline(options, _tokenizer);
 
         // Logprobs capture setup
         bool captureLogprobs = options.Logprobs;
@@ -642,39 +644,27 @@ public sealed class TextGenerator
                 }
                 else if (prefillLen > 0)
                 {
-                    // Span slice avoids array allocation for suffix tokens
-                    ReadOnlySpan<int> suffixTokens = promptIds.AsSpan(prefillStart);
-                    int[] positionsArray = ArrayPool<int>.Shared.Rent(prefillLen);
-                    try
+                    // Prefill suffix tokens — chunked when a prefill chunk size is configured
+                    // (llama.cpp -ub analog); otherwise a single forward pass, as before.
+                    using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter))
                     {
-                        Span<int> positions = positionsArray.AsSpan(0, prefillLen);
-                        for (int i = 0; i < prefillLen; i++)
-                            positions[i] = prefillStart + i;
+                        long ts1 = Stopwatch.GetTimestamp();
+                        prefillTicks = ts1 - ts0;
 
-                        using (ITensor prefillLogits = _model.Forward(suffixTokens, positions, deviceId: -1, kvCache, adapter))
+                        unsafe
                         {
-                            long ts1 = Stopwatch.GetTimestamp();
-                            prefillTicks = ts1 - ts0;
-
-                            unsafe
-                            {
-                                using var sampleSpan = telemetry.StartSample();
-                                long samplerStart = Stopwatch.GetTimestamp();
-                                // GPU/hybrid models return [1, vocabSize] (last token only);
-                                // CPU model returns [seqLen, vocabSize]. Use actual shape to index.
-                                float* logitPtr = (float*)prefillLogits.DataPointer;
-                                int logitRows = prefillLogits.Shape[0];
-                                var logitSpan = new Span<float>(logitPtr + (long)(logitRows - 1) * vocabSize, vocabSize);
-                                if (constraint != null)
-                                    TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
-                                (firstTokenId, firstLogprobInfo) = SampleWithLogprobs(logitSpan);
-                                samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
-                            }
+                            using var sampleSpan = telemetry.StartSample();
+                            long samplerStart = Stopwatch.GetTimestamp();
+                            // GPU/hybrid models return [1, vocabSize] (last token only);
+                            // CPU model returns [seqLen, vocabSize]. Use actual shape to index.
+                            float* logitPtr = (float*)prefillLogits.DataPointer;
+                            int logitRows = prefillLogits.Shape[0];
+                            var logitSpan = new Span<float>(logitPtr + (long)(logitRows - 1) * vocabSize, vocabSize);
+                            if (constraint != null)
+                                TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
+                            (firstTokenId, firstLogprobInfo) = SampleWithLogprobs(logitSpan);
+                            samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
                         }
-                    }
-                    finally
-                    {
-                        ArrayPool<int>.Shared.Return(positionsArray);
                     }
                 }
                 else if (promptLen > 0)
@@ -1112,19 +1102,69 @@ public sealed class TextGenerator
         => options.Temperature <= 0f && options.RepetitionPenalty == 1.0f;
 
     /// <summary>
-    /// Prefills the draft model with the full prompt.
+    /// Runs the prompt-suffix prefill forward pass(es) against <paramref name="kvCache"/>.
+    /// When <see cref="_prefillChunkSize"/> is 0 the whole suffix runs in a single forward pass
+    /// (behavior unchanged); otherwise the suffix is split into chunks of at most that many tokens
+    /// (llama.cpp <c>-ub</c> analog — bounds peak activation memory per forward pass). Returns the
+    /// logits tensor of the <b>last</b> chunk only (the caller samples from its final row); earlier
+    /// chunks' logits are disposed here.
+    /// </summary>
+    private ITensor ForwardPrefill(int[] promptIds, int prefillStart, int prefillLen,
+        Core.Attention.IKvCache kvCache, ILoraAdapter? adapter)
+    {
+        int chunkSize = _prefillChunkSize > 0 ? Math.Min(_prefillChunkSize, prefillLen) : prefillLen;
+        int[] positionsArray = ArrayPool<int>.Shared.Rent(chunkSize);
+        ITensor? logits = null;
+        try
+        {
+            int offset = 0;
+            while (offset < prefillLen)
+            {
+                int len = Math.Min(chunkSize, prefillLen - offset);
+                Span<int> positions = positionsArray.AsSpan(0, len);
+                for (int i = 0; i < len; i++)
+                    positions[i] = prefillStart + offset + i;
+
+                logits?.Dispose();
+                logits = _model.Forward(promptIds.AsSpan(prefillStart + offset, len), positions,
+                    deviceId: -1, kvCache, adapter);
+                offset += len;
+            }
+            return logits!;
+        }
+        catch
+        {
+            logits?.Dispose();
+            throw;
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(positionsArray);
+        }
+    }
+
+    /// <summary>
+    /// Prefills the draft model with the full prompt. Honors <see cref="_prefillChunkSize"/>
+    /// the same way the target-model prefill does.
     /// </summary>
     private void PrefillDraftModel(int[] promptIds, Core.Attention.IKvCache draftKvCache)
     {
         int promptLen = promptIds.Length;
-        int[] positions = ArrayPool<int>.Shared.Rent(promptLen);
+        int chunkSize = _prefillChunkSize > 0 ? Math.Min(_prefillChunkSize, promptLen) : promptLen;
+        int[] positions = ArrayPool<int>.Shared.Rent(chunkSize);
         try
         {
-            for (int i = 0; i < promptLen; i++)
-                positions[i] = i;
+            int offset = 0;
+            while (offset < promptLen)
+            {
+                int len = Math.Min(chunkSize, promptLen - offset);
+                for (int i = 0; i < len; i++)
+                    positions[i] = offset + i;
 
-            using ITensor _ = _draftModel!.Forward(promptIds, positions.AsSpan(0, promptLen),
-                deviceId: -1, draftKvCache);
+                using ITensor _ = _draftModel!.Forward(promptIds.AsSpan(offset, len),
+                    positions.AsSpan(0, len), deviceId: -1, draftKvCache);
+                offset += len;
+            }
         }
         finally
         {

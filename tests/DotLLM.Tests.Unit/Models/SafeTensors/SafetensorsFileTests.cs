@@ -104,7 +104,9 @@ public sealed class SafetensorsFileTests : IDisposable
     public void Open_MissingFile_Throws()
     {
         Assert.Throws<FileNotFoundException>(() =>
-            SafetensorsFile.Open(Scratch("nope.safetensors")));
+        {
+            SafetensorsFile.Open(Scratch("nope.safetensors"));
+        });
     }
 
     [Fact]
@@ -112,7 +114,7 @@ public sealed class SafetensorsFileTests : IDisposable
     {
         string path = Scratch("tiny.safetensors");
         File.WriteAllBytes(path, [0x00, 0x01, 0x02]);
-        Assert.Throws<InvalidDataException>(() => SafetensorsFile.Open(path));
+        Assert.Throws<InvalidDataException>(() => { SafetensorsFile.Open(path); });
     }
 
     [Fact]
@@ -123,7 +125,7 @@ public sealed class SafetensorsFileTests : IDisposable
         Span<byte> buf = stackalloc byte[8];
         BinaryPrimitives.WriteUInt64LittleEndian(buf, 1UL << 30);
         using (var fs = File.Create(path)) { fs.Write(buf); }
-        Assert.Throws<InvalidDataException>(() => SafetensorsFile.Open(path));
+        Assert.Throws<InvalidDataException>(() => { SafetensorsFile.Open(path); });
     }
 
     [Fact]
@@ -141,7 +143,7 @@ public sealed class SafetensorsFileTests : IDisposable
             fs.Write(headerBytes);
             fs.Write(new byte[12]);
         }
-        Assert.Throws<InvalidDataException>(() => SafetensorsFile.Open(path));
+        Assert.Throws<InvalidDataException>(() => { SafetensorsFile.Open(path); });
     }
 
     [Fact]
@@ -172,8 +174,7 @@ public sealed class SafetensorsFileTests : IDisposable
         string path = Scratch("dispose.safetensors");
         new SafetensorsFixtureBuilder().AddFloat32("a", [1]).WriteTo(path);
 
-        var sf = SafetensorsFile.Open(path);
-        sf.Dispose();
-        sf.Dispose(); // must not throw
+        using var sf = SafetensorsFile.Open(path);
+        sf.Dispose(); // Explicit dispose; the `using` scope disposes again on exit — must not throw
     }
 }

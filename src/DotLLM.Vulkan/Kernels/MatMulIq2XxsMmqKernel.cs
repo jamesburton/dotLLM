@@ -42,7 +42,7 @@ public sealed class MatMulIq2XxsMmqKernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 6);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 6);
         _codebooks = codebooks;
     }
 

@@ -1,4 +1,6 @@
+using System.Runtime.InteropServices;
 using System.Text.Json;
+using Architecture = DotLLM.Core.Configuration.Architecture;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.PositionEncoding;
@@ -210,6 +212,7 @@ public sealed class DiffusionGemmaConfigExtractorTests : IDisposable
     private const int SynCanvas = 4;
     private const int SynMaskToken = 15; // within [0, SynVocab)
 
+    [StructLayout(LayoutKind.Sequential)]
     private readonly record struct SyntheticCheckpoint(int MaskTokenId, int CanvasLength);
 
     /// <summary>

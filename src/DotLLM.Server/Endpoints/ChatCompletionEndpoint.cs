@@ -24,6 +24,21 @@ public static class ChatCompletionEndpoint
         ServerState state,
         HttpContext httpContext)
     {
+        // (#369) Activate the requested model — a cheap field-swap if it's already resident, a
+        // lazy reload if it idled out, or a fresh load otherwise. No-op when request.Model is null
+        // or already active.
+        var activationError = await state.EnsureActiveAsync(request.Model, request.KeepAlive, httpContext.RequestAborted);
+        if (activationError is not null)
+        {
+            httpContext.Response.StatusCode = 400;
+            await httpContext.Response.WriteAsJsonAsync(
+                new ErrorResponse { Error = activationError },
+                ServerJsonContext.Default.ErrorResponse,
+                contentType: null,
+                httpContext.RequestAborted);
+            return;
+        }
+
         if (!state.IsReady || state.Generator is null || state.ChatTemplate is null)
         {
             httpContext.Response.StatusCode = 503;

@@ -1,9 +1,11 @@
+using System.Buffers;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using Architecture = DotLLM.Core.Configuration.Architecture;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
+using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Vulkan.Interop;
@@ -26,16 +28,19 @@ namespace DotLLM.Vulkan;
 /// sigmoid-inplace). MoE routed experts default to streaming (re-uploaded
 /// every forward — correctness-first, fits any model size); set
 /// <c>DOTLLM_VK_MOE_RESIDENT=1</c> to opt in to per-layer resident caching.
-/// Resident mode auto-detects uniformly Q6_K source banks at upload time
-/// and keeps them on device as raw Q6_K blocks (≈25 GB at qwen35moe-A3B
-/// scale on a 128 GB Strix Halo unified-memory host — fits) dispatching
-/// through <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ6_KF32Kernel"/>.
-/// Non-Q6_K source banks (or mixed-quant layers) fall back to F32 dequant +
-/// upload — fits when the model is small enough that ≈4× expansion stays
-/// under device-memory bounds; at Qwen3.6-35B-A3B scale (256 experts × 40
-/// layers × 3 matrices × ~1M elems) the fully-F32 resident layout would
-/// consume ~120 GB and would NOT fit, so the Q6_K-resident path is the
-/// only resident option for Qwen3.6-A3B-UD-Q6_K_XL.
+/// Resident mode auto-detects uniformly Q6_K or Q4_K source banks at upload
+/// time and keeps them on device as raw quant blocks (≈25 GB Q6_K, or
+/// smaller still for Q4_K, at qwen35moe-A3B scale on a 128 GB Strix Halo
+/// unified-memory host — fits) dispatching through
+/// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ6_KF32Kernel"/> or
+/// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ4_KF32Kernel"/>
+/// respectively. Other source quants (or mixed-quant layers) fall back to
+/// F32 dequant + upload — fits when the model is small enough that ≈4×
+/// expansion stays under device-memory bounds; at Qwen3.6-35B-A3B scale
+/// (256 experts × 40 layers × 3 matrices × ~1M elems) the fully-F32
+/// resident layout would consume ~120 GB and would NOT fit, so the
+/// Q6_K/Q4_K-resident paths are the only resident options at that scale
+/// (Q4_K is what the cached UD-Q4_K_XL checkpoint actually uses).
 /// </para>
 /// <para>
 /// <b>Submission boundaries.</b> Two submissions per layer × 40 layers + a
@@ -99,6 +104,49 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     private readonly VulkanQwen3MoeMoeUpload.LayerBundle?[] _residentMoeBundles;
     private readonly bool _residentMoeEnabled;
 
+    // #383: opt-in dp4a indexed-matmul MMQ for Q4_K-resident gate/up banks —
+    // see the constructor assignment for rollout rationale.
+    private readonly bool _moeIndexedMmqEnabled;
+
+    // CPU/GPU per-layer MoE expert placement (#370, llama.cpp `--n-cpu-moe`
+    // shorthand equivalent): _cpuMoeLayer[i] == true means layer i's routed
+    // expert compute runs entirely on the CPU (Cpu/Kernels/MoeSwiGluMlp.cs)
+    // against the raw GGUF quant view — no GPU bank is EVER uploaded for
+    // that layer, so device memory is actually reduced, not just deferred.
+    // Dense/attention weights stay GPU-resident regardless (repo-wide
+    // "device placement always explicit" rule — CLAUDE.md). Layer selection
+    // is uniform-per-layer (v1 simplification the issue accepts): the first
+    // <see cref="NCpuMoeLayers"/> layers by index, matching llama.cpp's
+    // "-ncmoe N: keep the MoE weights of the first N layers in the CPU".
+    private readonly bool[] _cpuMoeLayer;
+
+    /// <summary>Number of layers (from layer 0) whose routed MoE experts are CPU-placed.</summary>
+    public int NCpuMoeLayers { get; }
+
+    /// <summary>
+    /// Rough device-memory bytes NOT allocated because of CPU-placed layers —
+    /// each CPU-placed layer's three routed banks (W1/W2/W3) at the
+    /// streaming-F32 sizing (the default, non-resident upload cost every
+    /// forward would otherwise pay). Q6_K-resident mode would save
+    /// proportionally less (~25% of this estimate) per layer; this property
+    /// reports the F32-streaming baseline since that's the default policy
+    /// CPU-offload is most valuable against.
+    /// </summary>
+    public long EstimatedCpuOffloadVramSavedBytes { get; }
+
+    /// <summary>
+    /// Resolves the CPU-MoE-offload layer count: an explicit
+    /// <paramref name="nCpuMoeLayers"/> &gt;= 0 wins; otherwise falls back to
+    /// the <c>DOTLLM_N_CPU_MOE</c> environment variable (default 0 — no
+    /// offload, fully GPU-resident/streaming, matching pre-#370 behaviour).
+    /// </summary>
+    private static int ResolveNCpuMoeLayers(int nCpuMoeLayers)
+    {
+        if (nCpuMoeLayers >= 0) return nCpuMoeLayers;
+        string? raw = Environment.GetEnvironmentVariable("DOTLLM_N_CPU_MOE");
+        return int.TryParse(raw, out int n) && n > 0 ? n : 0;
+    }
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -136,7 +184,8 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         VulkanQwen3MoeHybridKernels kernels,
         int[] kvSlotForLayer, int attentionLayerCount,
         int[] gdnLayerOrdinal,
-        int ropeDim, float ropeTheta)
+        int ropeDim, float ropeTheta,
+        int nCpuMoeLayers)
     {
         _device = device;
         _ownsDevice = ownsDevice;
@@ -161,6 +210,28 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         _residentMoeEnabled =
             string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_RESIDENT"), "1", StringComparison.Ordinal);
         _residentMoeBundles = new VulkanQwen3MoeMoeUpload.LayerBundle?[cpuLayers.Length];
+        // #383: dp4a indexed-matmul MMQ for Q4_K-resident gate/up banks, opt-in
+        // pending real-model perf validation (same cautious rollout as prior new
+        // MMQ kernels, e.g. #344's gated IQ2_XXS path) -- flip the default once
+        // measured safe/fast on real hardware.
+        _moeIndexedMmqEnabled =
+            string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_INDEXED_MMQ"), "1", StringComparison.Ordinal);
+
+        int n = Math.Clamp(nCpuMoeLayers, 0, cpuLayers.Length);
+        NCpuMoeLayers = n;
+        _cpuMoeLayer = new bool[cpuLayers.Length];
+        long savedBytes = 0;
+        int hiddenSize = config.HiddenSize;
+        for (int i = 0; i < n; i++)
+        {
+            _cpuMoeLayer[i] = true;
+            var m = cpuLayers[i].Moe;
+            long w1Elems = (long)m.IntermediateSize * hiddenSize;
+            long w2Elems = (long)hiddenSize * m.IntermediateSize;
+            long perExpertBytes = (2 * w1Elems + w2Elems) * sizeof(float);
+            savedBytes += perExpertBytes * m.NumExperts;
+        }
+        EstimatedCpuOffloadVramSavedBytes = savedBytes;
     }
 
     /// <summary>
@@ -169,8 +240,23 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     /// the host (as raw quant views inside <see cref="Qwen3MoeLayerWeights.Moe"/>)
     /// and are streamed to the GPU on demand per layer.
     /// </summary>
+    /// <param name="device">Vulkan device.</param>
+    /// <param name="gguf">Source GGUF file.</param>
+    /// <param name="config">Model configuration.</param>
+    /// <param name="spvDir">Directory containing compiled SPIR-V shaders.</param>
+    /// <param name="nCpuMoeLayers">
+    /// CPU/GPU expert placement (#370, llama.cpp <c>--n-cpu-moe</c> shorthand
+    /// equivalent): the first <paramref name="nCpuMoeLayers"/> layers (by
+    /// index) run their routed MoE expert compute on the CPU instead of
+    /// uploading a GPU bank — trading decode/prefill throughput for reduced
+    /// device memory. Negative (default) falls back to the
+    /// <c>DOTLLM_N_CPU_MOE</c> environment variable (0 when unset — no
+    /// offload, identical to pre-#370 behaviour). Clamped to
+    /// <c>[0, config.NumLayers]</c>.
+    /// </param>
     public static VulkanQwen3MoeHybridTransformerModel BuildFromGguf(
-        VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir)
+        VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir,
+        int nCpuMoeLayers = -1)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(gguf);
@@ -245,7 +331,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             device, ownsDevice: false,
             config, gguf, cpuModel, cpuLayers, weights, state, gdnCache, kernels,
             kvSlotForLayer, attentionLayerCount, gdnLayerOrdinal,
-            ropeDim, ropeTheta);
+            ropeDim, ropeTheta, ResolveNCpuMoeLayers(nCpuMoeLayers));
     }
 
     /// <summary>
@@ -269,7 +355,8 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         float[] outputNormWeight,
         nint outputWeight, QuantizationType outputQt, int outputM, int outputK,
         nint tokenEmbedWeight, QuantizationType tokenEmbedQt,
-        string spvDir)
+        string spvDir,
+        int nCpuMoeLayers = -1)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(config);
@@ -340,7 +427,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             device, ownsDevice: false,
             config, gguf: null, cpuModel: null, cpuLayers, weights, state, gdnCache, kernels,
             kvSlotForLayer, attentionLayerCount, gdnLayerOrdinal,
-            ropeDim, ropeTheta);
+            ropeDim, ropeTheta, ResolveNCpuMoeLayers(nCpuMoeLayers));
     }
 
     // ── CPU-model accessors (we share the CPU loader; reach into its layers) ─
@@ -379,6 +466,25 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         var outDim = (int)t.GetField("_outputOutputDim", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(m)!;
         var inDim = (int)t.GetField("_outputInputDim", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(m)!;
         return (ptr, qt, outDim, inDim);
+    }
+
+    // Coarse env-gated prefill profiler (DOTLLM_VULKAN_MOE_PREFILL_PROFILE=1), mirroring
+    // VulkanTransformerModel's per-category profiler but at per-layer-submission
+    // granularity (2a token-mixing vs 2b MoE FFN) since this model already issues one
+    // SubmitAndWait per phase per layer -- no extra mid-command-buffer splits needed.
+    private static readonly bool MoePrefillProfileEnabled =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MOE_PREFILL_PROFILE") == "1";
+    private double _profAttnMs;
+    private double _profMoeMs;
+    private double _profEmbedMs;
+    private double _profHeadMs;
+
+    private static double ProfElapsedMs(ref long lastTicks)
+    {
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        double ms = (now - lastTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        lastTicks = now;
+        return ms;
     }
 
     /// <inheritdoc/>
@@ -457,6 +563,9 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         UploadPositions(positions);
 
         var kinds = _layout.LayerKind;
+        bool profActive = MoePrefillProfileEnabled && seqLen > 1;
+        if (profActive) { _profAttnMs = _profMoeMs = _profEmbedMs = _profHeadMs = 0; }
+        long profT0 = profActive ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         // ── 1. Token embedding (single submission) ────────────────────────────
         _submit.Begin();
@@ -465,6 +574,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         RecordEmbeddingGather(cmdBuf, tokenIds);
         KernelSupport.TransferToComputeBarrier(cmdBuf);
         _submit.SubmitAndWait();
+        if (profActive) { _profEmbedMs += ProfElapsedMs(ref profT0); }
 
         // ── 2. Per-layer body. Two submissions per layer: one for the
         //      token-mixing path, one for the MoE FFN (which needs a host
@@ -512,63 +622,23 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 0, 0, (ulong)((long)seqLen * hiddenSize * sizeof(float)));
             KernelSupport.ComputeToHostBarrier(cmdBuf);
             _submit.SubmitAndWait();
+            if (profActive) { _profAttnMs += ProfElapsedMs(ref profT0); }
 
-            // ── 2b. MoE submission. Resolve this layer's routed experts:
-            //        either fetch a resident bundle (opt-in) or upload fresh
-            //        and dispose after the layer (default — safe for any
-            //        model size). When resident-mode is on, the upload also
-            //        opts into a Q6_K-resident bank when the source allows
-            //        (~25 GB Q6_K vs ~120 GB F32 at qwen35moe-A3B scale —
-            //        the only way the resident layout fits on a 128 GB
-            //        Strix Halo unified-memory host). ──────────────────────
-            VulkanQwen3MoeMoeUpload.LayerBundle moeBuf;
-            bool disposeAfterLayer;
-            if (_residentMoeEnabled)
+            // ── 2b. MoE submission. Per-layer CPU/GPU expert placement (#370,
+            //        `DOTLLM_N_CPU_MOE` / explicit nCpuMoeLayers): layers
+            //        0..N-1 route their routed-expert compute entirely
+            //        through the CPU (never uploading a GPU bank for that
+            //        layer — VRAM saved, not just deferred); remaining
+            //        layers keep the existing resident/streaming GPU path.
+            if (_cpuMoeLayer[layer])
             {
-                // Lazily upload on first use; retained for the life of the
-                // model after that. See _residentMoeBundles field docstring
-                // for the device-memory caveat — DOTLLM_VK_MOE_RESIDENT=1
-                // is opt-in for models that fit.
-                moeBuf = _residentMoeBundles[layer]
-                    ?? (_residentMoeBundles[layer] = VulkanQwen3MoeMoeUpload.UploadLayer(
-                        _device, lw.Moe, hiddenSize, residentQuant: true));
-                disposeAfterLayer = false;
+                RunCpuPlacedMoeLayer(layer, layerBuf, seqLen, hiddenSize, eps);
             }
             else
             {
-                moeBuf = VulkanQwen3MoeMoeUpload.UploadLayer(_device, lw.Moe, hiddenSize);
-                disposeAfterLayer = true;
+                RunGpuPlacedMoeLayer(layer, lw, layerBuf, seqLen, hiddenSize, eps);
             }
-
-            _submit.Begin();
-            cmdBuf = _submit.CommandBuffer;
-            KernelSupport.HostToComputeBarrier(cmdBuf);
-
-            // Second residual snapshot (HiddenState now holds the updated activations).
-            RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.Residual,
-                0, 0, (ulong)((long)seqLen * hiddenSize * sizeof(float)));
-            KernelSupport.TransferToComputeBarrier(cmdBuf);
-
-            _kernels.RmsNorm.Record(cmdBuf, _state.HiddenState, layerBuf.PostAttnNormWeight, _state.NormOutput,
-                rowCount: seqLen, n: hiddenSize, eps: eps);
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
-
-            RecordMoeLayer(cmdBuf, moeBuf, layerBuf.PostAttnNormWeight, seqLen, hiddenSize, eps);
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
-
-            // Second residual add.
-            _kernels.Add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch,
-                seqLen * hiddenSize);
-            KernelSupport.ComputeToTransferBarrier(cmdBuf);
-            RecordCopyBufferRange(cmdBuf, _state.AddScratch, _state.HiddenState,
-                0, 0, (ulong)((long)seqLen * hiddenSize * sizeof(float)));
-            KernelSupport.ComputeToHostBarrier(cmdBuf);
-            _submit.SubmitAndWait();
-
-            // In streaming mode, free this layer's transient banks before
-            // moving to the next layer. In resident mode the bundle is kept
-            // alive on _residentMoeBundles and only disposed at model Dispose.
-            if (disposeAfterLayer) moeBuf.Dispose();
+            if (profActive) { _profMoeMs += ProfElapsedMs(ref profT0); }
         }
 
         // ── 3. Final norm + LM head (single submission, last token only) ──────
@@ -591,6 +661,17 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: 1);
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         _submit.SubmitAndWait();
+        if (profActive)
+        {
+            _profHeadMs += ProfElapsedMs(ref profT0);
+            double total = _profEmbedMs + _profAttnMs + _profMoeMs + _profHeadMs;
+            Console.Error.WriteLine(
+                $"[moe-prefill-profile] seqLen={seqLen} layers={_cpuLayers.Length} total_ms={total:F1}  " +
+                $"embed={_profEmbedMs:F1}ms({_profEmbedMs / total * 100:F1}%)  " +
+                $"attn(2a)={_profAttnMs:F1}ms({_profAttnMs / total * 100:F1}%)  " +
+                $"moe(2b)={_profMoeMs:F1}ms({_profMoeMs / total * 100:F1}%)  " +
+                $"head={_profHeadMs:F1}ms({_profHeadMs / total * 100:F1}%)");
+        }
 
         // ── 4. Download logits ─────────────────────────────────────────────────
         var shape = new TensorShape(1, vocabSize);
@@ -963,6 +1044,248 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     // ── MoE FFN ──────────────────────────────────────────────────────────────
 
     /// <summary>
+    /// Runs one GPU-placed layer's MoE FFN: the existing resident/streaming
+    /// indexed-matmul path, unchanged from pre-#370 behaviour.
+    /// </summary>
+    private void RunGpuPlacedMoeLayer(
+        int layer, Qwen3MoeLayerWeights lw,
+        in VulkanQwen3MoeHybridWeights.LayerBuffers layerBuf,
+        int seqLen, int hiddenSize, float eps)
+    {
+        // Resolve this layer's routed experts: either fetch a resident bundle
+        // (opt-in) or upload fresh and dispose after the layer (default —
+        // safe for any model size). When resident-mode is on, the upload
+        // also opts into a resident-quant bank (Q6_K or Q4_K) when the
+        // source allows (~25 GB Q6_K, or smaller for Q4_K, vs ~120 GB F32 at
+        // qwen35moe-A3B scale — the only way the resident layout fits on a
+        // 128 GB Strix Halo unified-memory host).
+        VulkanQwen3MoeMoeUpload.LayerBundle moeBuf;
+        bool disposeAfterLayer;
+        if (_residentMoeEnabled)
+        {
+            // Lazily upload on first use; retained for the life of the
+            // model after that. See _residentMoeBundles field docstring
+            // for the device-memory caveat — DOTLLM_VK_MOE_RESIDENT=1
+            // is opt-in for models that fit.
+            bool firstUpload = _residentMoeBundles[layer] is null;
+            moeBuf = _residentMoeBundles[layer]
+                ?? (_residentMoeBundles[layer] = VulkanQwen3MoeMoeUpload.UploadLayer(
+                    _device, lw.Moe, hiddenSize, residentQuant: true));
+            if (firstUpload && layer == 0)
+            {
+                // One-line diagnostic so DOTLLM_VK_MOE_RESIDENT=1 runs make
+                // the chosen bank storage type observable (#371) — this is
+                // the only place that knows whether the resident-quant
+                // overlay engaged or silently fell back to F32.
+                Console.Error.WriteLine(
+                    $"[dotLLM] Vulkan resident-MoE bank quant types: gate={moeBuf.W1QuantType} " +
+                    $"up={moeBuf.W3QuantType} down={moeBuf.W2QuantType} " +
+                    $"(source: gate={lw.Moe.GateExpsRawQt}, up={lw.Moe.UpExpsRawQt}, down={lw.Moe.DownExpsRawQt})");
+            }
+            disposeAfterLayer = false;
+        }
+        else
+        {
+            moeBuf = VulkanQwen3MoeMoeUpload.UploadLayer(_device, lw.Moe, hiddenSize);
+            disposeAfterLayer = true;
+        }
+
+        _submit.Begin();
+        nint cmdBuf = _submit.CommandBuffer;
+        KernelSupport.HostToComputeBarrier(cmdBuf);
+
+        // Second residual snapshot (HiddenState now holds the updated activations).
+        RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.Residual,
+            0, 0, (ulong)((long)seqLen * hiddenSize * sizeof(float)));
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+        _kernels.RmsNorm.Record(cmdBuf, _state.HiddenState, layerBuf.PostAttnNormWeight, _state.NormOutput,
+            rowCount: seqLen, n: hiddenSize, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        RecordMoeLayer(cmdBuf, moeBuf, layerBuf.PostAttnNormWeight, seqLen, hiddenSize, eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // Second residual add.
+        _kernels.Add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch,
+            seqLen * hiddenSize);
+        KernelSupport.ComputeToTransferBarrier(cmdBuf);
+        RecordCopyBufferRange(cmdBuf, _state.AddScratch, _state.HiddenState,
+            0, 0, (ulong)((long)seqLen * hiddenSize * sizeof(float)));
+        KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _submit.SubmitAndWait();
+
+        // In streaming mode, free this layer's transient banks before
+        // moving to the next layer. In resident mode the bundle is kept
+        // alive on _residentMoeBundles and only disposed at model Dispose.
+        if (disposeAfterLayer) moeBuf.Dispose();
+    }
+
+    /// <summary>
+    /// Runs one CPU-placed layer's MoE FFN (#370): the post-attn-normed
+    /// hidden state is computed on the GPU as usual, then downloaded, run
+    /// through <see cref="MoeSwiGluMlp"/> on the CPU against the layer's raw
+    /// GGUF quant-view weight pointers (identical routing/GEMM path the
+    /// pure-CPU <c>Qwen3MoeHybridTransformerModel</c> uses), and re-uploaded
+    /// in place — no GPU expert bank is EVER allocated for this layer.
+    /// Dense/attention compute for the layer (already recorded in the 2a
+    /// submission before this is called) stays fully on GPU, matching the
+    /// repo's "device placement always explicit" rule.
+    /// </summary>
+    private void RunCpuPlacedMoeLayer(
+        int layer, in VulkanQwen3MoeHybridWeights.LayerBuffers layerBuf,
+        int seqLen, int hiddenSize, float eps)
+    {
+        // ── GPU half: residual snapshot + post-attn RMSNorm → NormOutput. ──
+        _submit.Begin();
+        nint cmdBuf = _submit.CommandBuffer;
+        KernelSupport.HostToComputeBarrier(cmdBuf);
+
+        RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.Residual,
+            0, 0, (ulong)((long)seqLen * hiddenSize * sizeof(float)));
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+        _kernels.RmsNorm.Record(cmdBuf, _state.HiddenState, layerBuf.PostAttnNormWeight, _state.NormOutput,
+            rowCount: seqLen, n: hiddenSize, eps: eps);
+        KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _submit.SubmitAndWait();
+
+        // ── Host round trip: download, run the CPU MoE kernel in place, upload. ──
+        int elemCount = seqLen * hiddenSize;
+        float[] hostBuf = ArrayPool<float>.Shared.Rent(elemCount);
+        try
+        {
+            var hostSpan = hostBuf.AsSpan(0, elemCount);
+            _device.Download(_state.NormOutput, hostSpan);
+            RunMoeLayerOnCpu(_cpuLayers[layer].Moe, seqLen, hiddenSize, hostSpan);
+            _device.Upload(hostSpan, _state.NormOutput);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(hostBuf);
+        }
+
+        // ── GPU half: residual add + copy back into HiddenState. ──
+        _submit.Begin();
+        cmdBuf = _submit.CommandBuffer;
+        KernelSupport.HostToComputeBarrier(cmdBuf);
+
+        _kernels.Add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch,
+            seqLen * hiddenSize);
+        KernelSupport.ComputeToTransferBarrier(cmdBuf);
+        RecordCopyBufferRange(cmdBuf, _state.AddScratch, _state.HiddenState,
+            0, 0, (ulong)((long)seqLen * hiddenSize * sizeof(float)));
+        KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _submit.SubmitAndWait();
+    }
+
+    /// <summary>
+    /// Runs one layer's MoE SwiGLU FFN entirely on the CPU, in place over
+    /// <paramref name="normOut"/>. Calls the exact same
+    /// <see cref="MoeSwiGluMlp.Route"/> / <see cref="MoeSwiGluMlp.ExecuteRoutedFromAssignments"/>
+    /// pair — against the same raw-quant-view weight pointers — that the
+    /// pure-CPU <c>Qwen3MoeHybridTransformerModel.ForwardMoeBody</c> uses, so
+    /// output is bit-identical to running the whole model on CPU for this
+    /// layer. LoRA is not threaded through here — Vulkan-side LoRA is a
+    /// separate delta system; CPU-placed layers under an active LoRA
+    /// adapter are a known v1 gap (#370 ledger).
+    /// </summary>
+    private static unsafe void RunMoeLayerOnCpu(MoeLayerWeights moe, int seqLen, int hiddenSize, Span<float> normOut)
+    {
+        int numExperts = moe.NumExperts;
+        int numExpertsPerTok = moe.NumExpertsPerTok;
+        int intermediate = moe.IntermediateSize;
+        int totalAssignments = seqLen * numExpertsPerTok;
+
+        int[] assignExpert = ArrayPool<int>.Shared.Rent(totalAssignments);
+        float[] assignWeight = ArrayPool<float>.Shared.Rent(totalAssignments);
+        int[] bucketCursors = ArrayPool<int>.Shared.Rent(numExperts + 1);
+        int[] bucketTokens = ArrayPool<int>.Shared.Rent(totalAssignments);
+        int[] bucketSlots = ArrayPool<int>.Shared.Rent(totalAssignments);
+        int[] uniqueExperts = ArrayPool<int>.Shared.Rent(numExperts);
+        try
+        {
+            int uniqueCount = MoeSwiGluMlp.Route(
+                hidden: normOut,
+                gateWeights: moe.Gate,
+                assignExpert: assignExpert.AsSpan(0, totalAssignments),
+                assignWeight: assignWeight.AsSpan(0, totalAssignments),
+                bucketCursors: bucketCursors.AsSpan(0, numExperts + 1),
+                bucketTokens: bucketTokens.AsSpan(0, totalAssignments),
+                bucketSlots: bucketSlots.AsSpan(0, totalAssignments),
+                uniqueExperts: uniqueExperts.AsSpan(0, numExperts),
+                numExperts: numExperts,
+                numExpertsPerTok: numExpertsPerTok,
+                hiddenSize: hiddenSize,
+                seqLen: seqLen,
+                normTopKProb: moe.NormTopKProb);
+
+            ReadOnlySpan<float> sharedGateSpan = moe.SharedExpertGate is not null
+                ? moe.SharedExpertGate.AsSpan()
+                : ReadOnlySpan<float>.Empty;
+
+            bool useRawQuantView = moe.HasRawQuantView;
+            nint gateBase = useRawQuantView ? moe.GateExpsRaw : 0;
+            nint upBase = useRawQuantView ? moe.UpExpsRaw : 0;
+            nint downBase = useRawQuantView ? moe.DownExpsRaw : 0;
+            QuantizationType gateQt = useRawQuantView ? moe.GateExpsRawQt : QuantizationType.F32;
+            QuantizationType upQt = useRawQuantView ? moe.UpExpsRawQt : QuantizationType.F32;
+            QuantizationType downQt = useRawQuantView ? moe.DownExpsRawQt : QuantizationType.F32;
+
+            // Per-expert byte stride into the fused gate/up/down tensors — the
+            // slice for expert e is at base + e * RowByteSize(M*K, qt), i.e.
+            // M * RowByteSize(K, qt) for valid quant data. Mirrors
+            // Qwen3MoeHybridTransformerModel.ForwardMoeBody exactly.
+            long gateRowBytes = useRawQuantView
+                ? Dequantize.RowByteSize((long)intermediate * hiddenSize, gateQt) : 0;
+            long upRowBytes = useRawQuantView
+                ? Dequantize.RowByteSize((long)intermediate * hiddenSize, upQt) : 0;
+            long downRowBytes = useRawQuantView
+                ? Dequantize.RowByteSize((long)hiddenSize * intermediate, downQt) : 0;
+
+            ReadOnlySpan<nint> gateF32Ptrs = useRawQuantView ? ReadOnlySpan<nint>.Empty : moe.W1;
+            ReadOnlySpan<nint> upF32Ptrs = useRawQuantView ? ReadOnlySpan<nint>.Empty : moe.W3;
+            ReadOnlySpan<nint> downF32Ptrs = useRawQuantView ? ReadOnlySpan<nint>.Empty : moe.W2;
+
+            MoeSwiGluMlp.ExecuteRoutedFromAssignments(
+                hidden: normOut,
+                gateExpsRawBase: gateBase, gateExpsQt: gateQt, gateExpsRowBytes: gateRowBytes, gateExpsF32Ptrs: gateF32Ptrs,
+                upExpsRawBase: upBase, upExpsQt: upQt, upExpsRowBytes: upRowBytes, upExpsF32Ptrs: upF32Ptrs,
+                downExpsRawBase: downBase, downExpsQt: downQt, downExpsRowBytes: downRowBytes, downExpsF32Ptrs: downF32Ptrs,
+                assignExpert: assignExpert.AsSpan(0, totalAssignments),
+                assignWeight: assignWeight.AsSpan(0, totalAssignments),
+                bucketCursors: bucketCursors.AsSpan(0, numExperts + 1),
+                bucketTokens: bucketTokens.AsSpan(0, totalAssignments),
+                bucketSlots: bucketSlots.AsSpan(0, totalAssignments),
+                uniqueExperts: uniqueExperts.AsSpan(0, numExperts),
+                uniqueExpertCount: uniqueCount,
+                output: normOut,
+                numExperts: numExperts,
+                numExpertsPerTok: numExpertsPerTok,
+                hiddenSize: hiddenSize,
+                intermediateSize: intermediate,
+                seqLen: seqLen,
+                sharedGateProj: moe.SharedGateProj,
+                sharedUpProj: moe.SharedUpProj,
+                sharedDownProj: moe.SharedDownProj,
+                sharedIntermediateSize: moe.SharedIntermediateSize,
+                sharedExpertGate: sharedGateSpan,
+                loraAdapter: null,
+                loraLayer: -1,
+                threadPool: null);
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(assignExpert);
+            ArrayPool<float>.Shared.Return(assignWeight);
+            ArrayPool<int>.Shared.Return(bucketCursors);
+            ArrayPool<int>.Shared.Return(bucketTokens);
+            ArrayPool<int>.Shared.Return(bucketSlots);
+            ArrayPool<int>.Shared.Return(uniqueExperts);
+        }
+    }
+
+    /// <summary>
     /// Records the routed-MoE SwiGLU FFN dispatch using the per-layer banks
     /// uploaded by <see cref="VulkanQwen3MoeMoeUpload.UploadLayer"/>. Mirrors
     /// the routed path of <see cref="VulkanTransformerModel"/>'s
@@ -996,19 +1319,50 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             seqLen: seqLen, topK: topK, hidden: hidden);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        // 4. Indexed expert matmuls. Two paths share the same buffer
-        //    contract (bank/x/indices/y) and the same shape (m, k, n,
-        //    numExperts) — only the dequant differs:
+        // 4. Indexed expert matmuls. All paths share the same buffer contract
+        //    (bank/x/indices/y) and the same shape (m, k, n, numExperts) —
+        //    only the dequant differs, and each bank picks its OWN kernel
+        //    independently via its own resolved quant type (#372):
         //       F32 banks  → MoeIndexedMatmul (plain F32 dot)
-        //       Q6_K banks → MoeIndexedMatmulQ6K (per-row Q6_K dequant in
-        //                    the inner loop)
+        //       Q6_K/Q4_K/Q5_K banks → the matching per-row-dequant kernel
         //    See VulkanQwen3MoeMoeUpload remarks for the residency caveat.
-        RecordIndexedMoeMatmul(cmdBuf, moeW,
-            moeW.W1Bank, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeGateInter,
-            m: interm, k: hidden, n: expandedRows, numExperts: numE);
-        RecordIndexedMoeMatmul(cmdBuf, moeW,
-            moeW.W3Bank, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeUpInter,
-            m: interm, k: hidden, n: expandedRows, numExperts: numE);
+        //
+        // #383: when both gate/up banks are Q4_K-resident and the dp4a MMQ kernel
+        // is available, quantize MoeExpandedInput to Q8_1 ONCE (gate and up share
+        // the same activation row + K=hidden) and route both through the dp4a
+        // indexed matmul instead of the scalar per-element kernel. Down (K=
+        // intermediate, a different activation buffer) isn't covered by this pass
+        // — it stays on its own resolved-bank kernel (Q5_K for the cached
+        // UD-Q4_K_XL checkpoint, no MMQ variant wired for that bank yet).
+        bool useGateUpMmq = _moeIndexedMmqEnabled
+            && _kernels.MoeIndexedMatmulQ4KMmq is not null
+            && moeW.W1QuantType == QuantizationType.Q4_K
+            && moeW.W3QuantType == QuantizationType.Q4_K
+            && (hidden % MoeIndexedMatmulQ4KMmqKernel.Q4_KGroupSize) == 0;
+        if (useGateUpMmq)
+        {
+            _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf,
+                _state.MoeExpandedInput, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                n: expandedRows, k: hidden);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _kernels.MoeIndexedMatmulQ4KMmq!.Record(cmdBuf,
+                moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                _state.MoeTopkIndices, _state.MoeGateInter,
+                m: interm, k: hidden, n: expandedRows, numExperts: numE);
+            _kernels.MoeIndexedMatmulQ4KMmq!.Record(cmdBuf,
+                moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                _state.MoeTopkIndices, _state.MoeUpInter,
+                m: interm, k: hidden, n: expandedRows, numExperts: numE);
+        }
+        else
+        {
+            RecordIndexedMoeMatmul(cmdBuf, moeW.W1QuantType,
+                moeW.W1Bank, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeGateInter,
+                m: interm, k: hidden, n: expandedRows, numExperts: numE);
+            RecordIndexedMoeMatmul(cmdBuf, moeW.W3QuantType,
+                moeW.W3Bank, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeUpInter,
+                m: interm, k: hidden, n: expandedRows, numExperts: numE);
+        }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 5. SwiGLU: silu(gate) * up
@@ -1016,10 +1370,30 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             n: expandedRows * interm);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        // 6. Indexed down matmul.
-        RecordIndexedMoeMatmul(cmdBuf, moeW,
-            moeW.W2Bank, _state.MoeSiluInter, _state.MoeTopkIndices, _state.MoeDownRows,
-            m: hidden, k: interm, n: expandedRows, numExperts: numE);
+        // 6. Indexed down matmul. #383 follow-up: same dp4a swap as gate/up, for the
+        // Q5_K-resident down bank (K=intermediate, MoeSiluInter as input — a
+        // different activation buffer than gate/up's, so its own quantize pass).
+        bool useDownMmq = _moeIndexedMmqEnabled
+            && _kernels.MoeIndexedMatmulQ5KMmq is not null
+            && moeW.W2QuantType == QuantizationType.Q5_K
+            && (interm % MoeIndexedMatmulQ5KMmqKernel.Q5_KGroupSize) == 0;
+        if (useDownMmq)
+        {
+            _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf,
+                _state.MoeSiluInter, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
+                n: expandedRows, k: interm);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _kernels.MoeIndexedMatmulQ5KMmq!.Record(cmdBuf,
+                moeW.W2Bank, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
+                _state.MoeTopkIndices, _state.MoeDownRows,
+                m: hidden, k: interm, n: expandedRows, numExperts: numE);
+        }
+        else
+        {
+            RecordIndexedMoeMatmul(cmdBuf, moeW.W2QuantType,
+                moeW.W2Bank, _state.MoeSiluInter, _state.MoeTopkIndices, _state.MoeDownRows,
+                m: hidden, k: interm, n: expandedRows, numExperts: numE);
+        }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 7. Weighted scatter into NormOutput.
@@ -1036,22 +1410,32 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     }
 
     /// <summary>
-    /// Per-bank-quant-type dispatcher for a routed-expert indexed matmul. Bank
-    /// storage type is recorded once at upload time on
-    /// <see cref="VulkanQwen3MoeMoeUpload.LayerBundle.BankQuantType"/>; this
-    /// helper picks the matching kernel so the caller stays oblivious to
-    /// whether the layer is F32-streaming or Q6_K-resident.
+    /// Per-bank-quant-type dispatcher for a routed-expert indexed matmul. Each
+    /// bank's storage type is resolved independently at upload time (#372,
+    /// see <see cref="VulkanQwen3MoeMoeUpload.LayerBundle.W1QuantType"/> /
+    /// <c>W2QuantType</c> / <c>W3QuantType</c>); the caller passes the
+    /// specific bank's own quant type here so this helper stays oblivious to
+    /// whether the layer is F32-streaming or resident, and whether sibling
+    /// banks share its quant type or not.
     /// </summary>
     private void RecordIndexedMoeMatmul(
-        nint cmdBuf, VulkanQwen3MoeMoeUpload.LayerBundle moeW,
+        nint cmdBuf, QuantizationType bankQuantType,
         VulkanDevice.Buffer bank, VulkanDevice.Buffer x,
         VulkanDevice.Buffer indices, VulkanDevice.Buffer y,
         int m, int k, int n, int numExperts)
     {
-        switch (moeW.BankQuantType)
+        switch (bankQuantType)
         {
             case QuantizationType.Q6_K:
                 _kernels.MoeIndexedMatmulQ6K.Record(cmdBuf, bank, x, indices, y,
+                    m: m, k: k, n: n, numExperts: numExperts);
+                break;
+            case QuantizationType.Q4_K:
+                _kernels.MoeIndexedMatmulQ4K.Record(cmdBuf, bank, x, indices, y,
+                    m: m, k: k, n: n, numExperts: numExperts);
+                break;
+            case QuantizationType.Q5_K:
+                _kernels.MoeIndexedMatmulQ5K.Record(cmdBuf, bank, x, indices, y,
                     m: m, k: k, n: n, numExperts: numExperts);
                 break;
             case QuantizationType.F32:
@@ -1065,7 +1449,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 // future upload-side regression that introduces a new bank
                 // quant type without updating this dispatch site.
                 throw new InvalidOperationException(
-                    $"Unsupported MoE bank quant type: {moeW.BankQuantType}. " +
+                    $"Unsupported MoE bank quant type: {bankQuantType}. " +
                     "Add a kernel dispatch arm and an upload-side branch in " +
                     "VulkanQwen3MoeMoeUpload.UploadLayer.");
         }

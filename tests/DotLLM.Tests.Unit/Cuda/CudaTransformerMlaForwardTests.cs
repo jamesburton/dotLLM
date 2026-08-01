@@ -1,3 +1,4 @@
+using System.Globalization;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.PositionEncoding;
@@ -178,8 +179,8 @@ public sealed class CudaTransformerMlaForwardTests : IDisposable
             $"{label}: CPU produced {cpu.Length - cpuFinite}/{cpu.Length} non-finite logits — fixture bug.");
         Assert.True(gpuFinite == gpu.Length,
             $"{label}: GPU produced {gpu.Length - gpuFinite}/{gpu.Length} non-finite logits. " +
-            $"cpu=[{string.Join(", ", cpu.Select(v => v.ToString("F3")))}], " +
-            $"gpu=[{string.Join(", ", gpu.Select(v => v.ToString("F3")))}]");
+            $"cpu=[{string.Join(", ", cpu.Select(v => v.ToString("F3", CultureInfo.InvariantCulture)))}], " +
+            $"gpu=[{string.Join(", ", gpu.Select(v => v.ToString("F3", CultureInfo.InvariantCulture)))}]");
 
         float maxDiff = 0f;
         int worstCol = 0;
@@ -191,8 +192,8 @@ public sealed class CudaTransformerMlaForwardTests : IDisposable
         Assert.True(maxDiff <= Tolerance,
             $"{label}: max |Δlogit| = {maxDiff:E3} at col {worstCol} " +
             $"(cpu={cpu[worstCol]:F4}, gpu={gpu[worstCol]:F4}) > {Tolerance:E3}; " +
-            $"cpu=[{string.Join(", ", cpu.Select(v => v.ToString("F3")))}], " +
-            $"gpu=[{string.Join(", ", gpu.Select(v => v.ToString("F3")))}]");
+            $"cpu=[{string.Join(", ", cpu.Select(v => v.ToString("F3", CultureInfo.InvariantCulture)))}], " +
+            $"gpu=[{string.Join(", ", gpu.Select(v => v.ToString("F3", CultureInfo.InvariantCulture)))}]");
     }
 
     private static ModelConfig BuildConfig(int qLoraRank, bool includeMoe)

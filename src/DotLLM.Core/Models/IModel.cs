@@ -16,6 +16,13 @@ public interface IModel : IDisposable
     long ComputeMemoryBytes { get; }
 
     /// <summary>
+    /// Total bytes of committed memory holding repacked (layout-transformed) copies of the model
+    /// weights, or 0 when the backend does not repack. This is memory in addition to the
+    /// memory-mapped weight file, not a subset of it.
+    /// </summary>
+    long RepackedWeightBytes => 0;
+
+    /// <summary>
     /// Runs a forward pass through the model.
     /// </summary>
     /// <param name="tokenIds">Input token IDs for this batch.</param>
@@ -33,6 +40,45 @@ public interface IModel : IDisposable
     /// <param name="kvCache">Optional KV-cache. When null, behaves identically to the uncached forward pass.</param>
     /// <returns>Logits tensor of shape [1, vocab_size] for the last token.</returns>
     ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache);
+
+    /// <summary>
+    /// Runs a forward pass with optional KV-cache, with an explicit hint about whether the caller
+    /// only needs the last input position's logits.
+    /// </summary>
+    /// <remarks>
+    /// <para>Some callers (e.g. <c>BenchRunner</c>'s untimed prefill / <c>--depth</c> context
+    /// extension) submit many tokens in one call purely to advance the KV-cache/hidden state, and
+    /// only ever read the LAST position's logits (via argmax) — never the intermediate positions'.
+    /// Others (e.g. speculative-decoding verification, which submits the last-accepted token plus
+    /// K draft tokens in one call and inspects EVERY position's logits to accept/reject each draft)
+    /// genuinely need every position. The model cannot tell these two cases apart from
+    /// <paramref name="tokenIds"/>/<paramref name="kvCache"/> alone, so callers that only want the
+    /// last row must say so explicitly via <paramref name="lastTokenLogitsOnly"/>.</para>
+    /// <para>The default implementation ignores the hint and forwards to
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>, so every
+    /// existing implementor keeps its current behavior unless it explicitly overrides this
+    /// overload to act on the hint (currently the CUDA <c>Qwen3HybridDense</c> / <c>Qwen3MoeHybrid</c>
+    /// models, whose LM-head Logits scratch buffer scales with <c>seqLen × vocab_size</c> and can be
+    /// large enough at high <c>seqLen</c> to matter for VRAM headroom — see issue #185).</para>
+    /// </remarks>
+    /// <param name="tokenIds">Input token IDs for this step.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    /// <param name="kvCache">Optional KV-cache. When null, behaves identically to the uncached forward pass.</param>
+    /// <param name="lastTokenLogitsOnly">
+    /// When true AND <paramref name="tokenIds"/> has more than one token, implementations MAY
+    /// return logits for only the last position (shape [1, vocab_size]) instead of every position.
+    /// Ignored (always full per-position logits) when false — the safe default for any caller that
+    /// hasn't been audited to only ever read the last row. Has no effect when
+    /// <paramref name="tokenIds"/>.Length is already 1.
+    /// </param>
+    /// <returns>
+    /// Logits tensor of shape [1, vocab_size] when <paramref name="lastTokenLogitsOnly"/> is honored,
+    /// otherwise [seq, vocab_size] for all input positions (same as the non-hinted overload).
+    /// </returns>
+    ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                    IKvCache? kvCache, bool lastTokenLogitsOnly)
+        => Forward(tokenIds, positions, deviceId, kvCache);
 
     /// <summary>
     /// Runs a forward pass with optional KV-cache and an optional LoRA adapter.

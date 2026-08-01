@@ -213,7 +213,7 @@ internal sealed class VulkanMamba3Weights : IDisposable
         // staging buffer once and reuse it across every device-local copy.
         long maxBytes = ComputeMaxStagingBytes(
             numLayers, hidden, vocab, dInner, dState, nHead, dInProj, bcBiasElems, mimoElems);
-        using var staging = device.Allocate(maxBytes);
+        using var staging = VulkanStagingBuffer.Create(device, maxBytes);
 
         long totalBytes = 0;
 
@@ -473,23 +473,10 @@ internal sealed class VulkanMamba3Weights : IDisposable
     /// through <paramref name="staging"/> into the device-local <paramref name="dst"/>.
     /// Same on-device byte layout as <see cref="VulkanWeights"/> so the existing
     /// <c>matmul_q8_0</c> / <c>matmul_q8_0_gemm</c> kernels can read it directly.</summary>
-    private static unsafe void UploadRawBytes(
-        VulkanDevice device, VulkanDevice.Buffer staging,
+    private static void UploadRawBytes(
+        VulkanDevice device, VulkanStagingBuffer staging,
         nint srcPtr, long bytes, VulkanDevice.Buffer dst)
-    {
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory VulkanMamba3Weights raw");
-        try
-        {
-            new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
-                .CopyTo(new Span<byte>((void*)mapped, checked((int)bytes)));
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-        }
-        device.CopyBufferSynchronous(staging, dst, (ulong)bytes);
-    }
+        => staging.UploadBytes(srcPtr, bytes, dst);
 
     private static long ComputeMaxStagingBytes(
         int numLayers, int hidden, int vocab, int dInner, int dState, int nHead, int dInProj,
@@ -525,7 +512,7 @@ internal sealed class VulkanMamba3Weights : IDisposable
     }
 
     private static unsafe VulkanDevice.Buffer UploadTensor(
-        VulkanDevice device, VulkanDevice.Buffer staging,
+        VulkanDevice device, VulkanStagingBuffer staging,
         Mamba3TensorHandle handle, long expectedElements, out long uploadedBytes)
     {
         if (!handle.IsPopulated)
@@ -537,20 +524,7 @@ internal sealed class VulkanMamba3Weights : IDisposable
 
         long bytes = expectedElements * sizeof(float);
         var buf = device.AllocateDeviceLocal(bytes);
-
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory VulkanMamba3Weights.UploadTensor staging");
-        try
-        {
-            new ReadOnlySpan<float>((void*)handle.Pointer, checked((int)expectedElements))
-                .CopyTo(new Span<float>((void*)mapped, checked((int)expectedElements)));
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-        }
-
-        device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
+        staging.UploadBytes(handle.Pointer, bytes, buf);
         uploadedBytes = bytes;
         return buf;
     }

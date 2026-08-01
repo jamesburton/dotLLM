@@ -106,7 +106,9 @@ public sealed unsafe class LoraComposerTests
         using var a = MakeAdapter("a", 200, 200f, 16, 16, 1);
         using var b = MakeAdapter("b", 200, 200f, 16, 16, 2);
         Assert.Throws<NotSupportedException>(() =>
-            LoraComposer.Compose(new (ILoraAdapter, float)[] { (a, 1f), (b, 1f) }, cfg, maxRank: 256));
+        {
+            LoraComposer.Compose(new (ILoraAdapter, float)[] { (a, 1f), (b, 1f) }, cfg, maxRank: 256);
+        });
     }
 
     [Fact]
@@ -119,7 +121,9 @@ public sealed unsafe class LoraComposerTests
             LoraAdapter.AllocAligned(4 * 16), LoraAdapter.AllocAligned(16 * 4), 16, 16));
         using var _ = b;
         Assert.Throws<InvalidOperationException>(() =>
-            LoraComposer.Compose(new (ILoraAdapter, float)[] { (a, 1f), (b, 1f) }, cfg));
+        {
+            LoraComposer.Compose(new (ILoraAdapter, float)[] { (a, 1f), (b, 1f) }, cfg);
+        });
     }
 
     [Fact]

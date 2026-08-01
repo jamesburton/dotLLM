@@ -3,7 +3,7 @@ using Xunit;
 
 namespace DotLLM.Tests.Unit.Models.Gguf;
 
-public class GgufFileTests : IDisposable
+public sealed class GgufFileTests : IDisposable
 {
     private readonly List<string> _tempFiles = [];
 
@@ -131,7 +131,7 @@ public class GgufFileTests : IDisposable
     [Fact]
     public void Open_FileNotFound_Throws()
     {
-        Assert.Throws<FileNotFoundException>(() => GgufFile.Open("/nonexistent/path.gguf"));
+        Assert.Throws<FileNotFoundException>(() => { GgufFile.Open("/nonexistent/path.gguf"); });
     }
 
     [Fact]
@@ -141,9 +141,8 @@ public class GgufFileTests : IDisposable
             .AddTensor("w", [4], 0, new byte[16]);
         string path = WriteTempGguf(data);
 
-        var file = GgufFile.Open(path);
-        file.Dispose();
-        file.Dispose(); // Should not throw.
+        using var file = GgufFile.Open(path);
+        file.Dispose(); // Explicit dispose; the `using` scope disposes again on exit — should not throw.
     }
 
     [Fact]
@@ -190,8 +189,8 @@ public class GgufFileTests : IDisposable
         byte[] bytes = File.ReadAllBytes(path);
         File.WriteAllBytes(path, bytes[..(bytes.Length - 4)]);
 
-        var ex = Assert.Throws<InvalidDataException>(() => GgufFile.Open(path));
-        Assert.Contains("second", ex.Message);
+        var ex = Assert.Throws<InvalidDataException>(() => { GgufFile.Open(path); });
+        Assert.Contains("second", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -206,9 +205,9 @@ public class GgufFileTests : IDisposable
         byte[] bytes = File.ReadAllBytes(path);
         File.WriteAllBytes(path, bytes[..(bytes.Length - 4)]);
 
-        var ex = Assert.Throws<InvalidDataException>(() => GgufFile.Open(path));
-        Assert.Contains("partial", ex.Message);
-        Assert.Contains("extends beyond", ex.Message);
+        var ex = Assert.Throws<InvalidDataException>(() => { GgufFile.Open(path); });
+        Assert.Contains("partial", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("extends beyond", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -219,8 +218,8 @@ public class GgufFileTests : IDisposable
             .AddTensor("w", [4], 0, new byte[16]);
         string path = WriteTempGguf(data);
 
-        var ex = Assert.Throws<InvalidDataException>(() => GgufFile.Open(path));
-        Assert.Contains("power of 2", ex.Message);
+        var ex = Assert.Throws<InvalidDataException>(() => { GgufFile.Open(path); });
+        Assert.Contains("power of 2", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -231,7 +230,7 @@ public class GgufFileTests : IDisposable
             .AddTensor("w", [4], 0, new byte[16]);
         string path = WriteTempGguf(data);
 
-        var ex = Assert.Throws<InvalidDataException>(() => GgufFile.Open(path));
-        Assert.Contains("power of 2", ex.Message);
+        var ex = Assert.Throws<InvalidDataException>(() => { GgufFile.Open(path); });
+        Assert.Contains("power of 2", ex.Message, StringComparison.Ordinal);
     }
 }

@@ -1,3 +1,4 @@
+using System.Globalization;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
@@ -76,6 +77,122 @@ public sealed class DeepSeekV2GgufLoadTests
         {
             File.Delete(ggufPath);
         }
+    }
+
+    // ── Minimal MLA Forward() repro (#193) ──────────────────────────────
+    // A synthetic, plain-F32, 1-layer, dense-only (no MoE) MLA fixture at
+    // HiddenSize=256 — about as small as the architecture allows. Root cause
+    // (see Forward_MinimalMlaFixture_DoesNotCrash_ProducesFiniteLogits):
+    // TransformerForwardState sizes the shared Q/AttnOutput scratch buffer
+    // to `numHeads * headDim` (the GQA per-token attention-output width).
+    // The MLA branch of TransformerModel's forward loop writes its ALREADY
+    // o_proj-expanded, hiddenSize-wide output directly into that same
+    // AttnOutput buffer (MLA fuses o_proj inside the kernel, unlike GQA which
+    // writes pre-projection numHeads*headDim-wide output and applies o_proj
+    // afterward into a separate hiddenSize-wide buffer). Whenever
+    // numHeads*(qkNopeHeadDim+qkRopeHeadDim) < hiddenSize, the MLA kernel
+    // overruns the AttnOutput allocation and corrupts the native heap —
+    // fatal, not a catchable .NET exception. Real DeepSeek-V2-Lite
+    // (hidden=2048, 16 heads, headDim=192 ⇒ 3072 > 2048) never triggers this
+    // by coincidence; a minimal fixture with small head dims (this one:
+    // 2 heads * (4+4) = 16 ≪ 256) reliably does.
+    private const int MiniHiddenSize = 256;
+    private const int MiniNumHeads = 2;
+    private const int MiniVocabSize = 8;
+    private const int MiniQkNope = 4;
+    private const int MiniQkRope = 4;
+    private const int MiniVHead = 4;
+    private const int MiniKvLoraRank = 8;
+    private const int MiniIntermediateSize = 32;
+
+    [Fact]
+    public void Forward_MinimalMlaFixture_DoesNotCrash_ProducesFiniteLogits()
+    {
+        string ggufPath = WriteMinimalMlaFixture();
+        try
+        {
+            using var gguf = GgufFile.Open(ggufPath);
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+
+            Assert.Equal(AttentionType.MLA, config.AttentionType);
+            Assert.NotNull(config.MlaConfig);
+            Assert.Null(config.Moe);
+
+            using var model = TransformerModel.LoadFromGguf(gguf, config);
+
+            int[] tokenIds = [0, 1, 2, 3];
+            int[] positions = [0, 1, 2, 3];
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: 0);
+
+            unsafe
+            {
+                int total = logits.Shape.Rank == 1 ? logits.Shape[0] : logits.Shape[1];
+                var span = new ReadOnlySpan<float>((void*)logits.DataPointer, total);
+                int finite = 0;
+                foreach (float v in span)
+                    if (float.IsFinite(v)) finite++;
+                Assert.True(finite == total,
+                    $"Expected all {total} logits finite; got {finite}. " +
+                    $"First 8: [{string.Join(", ", span.Slice(0, Math.Min(8, total)).ToArray().Select(v => v.ToString("F3")))}]");
+            }
+        }
+        finally
+        {
+            File.Delete(ggufPath);
+        }
+    }
+
+    /// <summary>
+    /// Writes a minimal 1-layer, dense-only (no MoE), plain-F32 DeepSeek-V2-style
+    /// GGUF — see the remarks above <see cref="Forward_MinimalMlaFixture_DoesNotCrash_ProducesFiniteLogits"/>.
+    /// </summary>
+    private static string WriteMinimalMlaFixture()
+    {
+        var b = new GgufTestData(version: 3);
+        var rng = new Random(1234);
+
+        int qkHead = MiniQkNope + MiniQkRope;
+        int qTotal = MiniNumHeads * qkHead;
+        int kvAOut = MiniKvLoraRank + MiniQkRope;
+        int kvBOut = MiniNumHeads * (MiniQkNope + MiniVHead);
+        int oInput = MiniNumHeads * MiniVHead;
+
+        b.AddString("general.architecture", "deepseek2");
+        b.AddUInt32("deepseek2.embedding_length", (uint)MiniHiddenSize);
+        b.AddUInt32("deepseek2.block_count", 1);
+        b.AddUInt32("deepseek2.feed_forward_length", (uint)MiniIntermediateSize);
+        b.AddUInt32("deepseek2.attention.head_count", (uint)MiniNumHeads);
+        b.AddUInt32("deepseek2.attention.head_count_kv", (uint)MiniNumHeads);
+        b.AddUInt32("deepseek2.context_length", 16);
+        b.AddFloat32("deepseek2.attention.layer_norm_rms_epsilon", 1e-6f);
+        b.AddUInt32("deepseek2.vocab_size", (uint)MiniVocabSize);
+        b.AddFloat32("deepseek2.rope.freq_base", 10000.0f);
+        b.AddUInt32("deepseek2.rope.dimension_count", (uint)MiniQkRope);
+
+        b.AddUInt32("deepseek2.attention.q_lora_rank", 0);
+        b.AddUInt32("deepseek2.attention.kv_lora_rank", (uint)MiniKvLoraRank);
+        b.AddUInt32("deepseek2.attention.key_length", (uint)qkHead);
+        b.AddUInt32("deepseek2.attention.value_length", (uint)MiniVHead);
+
+        AddF32Tensor(b, "token_embd.weight", [MiniHiddenSize, MiniVocabSize], rng.Next());
+        AddF32Tensor(b, "output_norm.weight", [MiniHiddenSize], rng.Next(), center: 1.0f, jitter: 0.05f);
+        AddF32Tensor(b, "output.weight", [MiniHiddenSize, MiniVocabSize], rng.Next());
+
+        const string p = "blk.0";
+        AddF32Tensor(b, $"{p}.attn_norm.weight", [MiniHiddenSize], rng.Next(), center: 1.0f, jitter: 0.05f);
+        AddF32Tensor(b, $"{p}.ffn_norm.weight", [MiniHiddenSize], rng.Next(), center: 1.0f, jitter: 0.05f);
+
+        AddF32Tensor(b, $"{p}.attn_q.weight", [MiniHiddenSize, qTotal], rng.Next());
+        AddF32Tensor(b, $"{p}.attn_kv_a_mqa.weight", [MiniHiddenSize, kvAOut], rng.Next());
+        AddF32Tensor(b, $"{p}.attn_kv_a_norm.weight", [MiniKvLoraRank], rng.Next(), center: 1.0f, jitter: 0.05f);
+        AddF32Tensor(b, $"{p}.attn_kv_b.weight", [MiniKvLoraRank, kvBOut], rng.Next());
+        AddF32Tensor(b, $"{p}.attn_output.weight", [oInput, MiniHiddenSize], rng.Next());
+
+        AddF32Tensor(b, $"{p}.ffn_gate.weight", [MiniHiddenSize, MiniIntermediateSize], rng.Next());
+        AddF32Tensor(b, $"{p}.ffn_up.weight", [MiniHiddenSize, MiniIntermediateSize], rng.Next());
+        AddF32Tensor(b, $"{p}.ffn_down.weight", [MiniIntermediateSize, MiniHiddenSize], rng.Next());
+
+        return b.WriteToTempFile();
     }
 
     /// <summary>
@@ -191,7 +308,7 @@ public sealed class DeepSeekV2GgufLoadTests
                 if (float.IsFinite(v)) finite++;
             Assert.True(finite == total,
                 $"Expected all {total} logits finite; got {finite} finite. " +
-                $"First 10: [{string.Join(", ", span.Slice(0, Math.Min(10, total)).ToArray().Select(v => v.ToString("F3")))}]");
+                $"First 10: [{string.Join(", ", span.Slice(0, Math.Min(10, total)).ToArray().Select(v => v.ToString("F3", CultureInfo.InvariantCulture)))}]");
         }
     }
 
@@ -236,7 +353,7 @@ public sealed class DeepSeekV2GgufLoadTests
                 if (float.IsFinite(v)) finite++;
             Assert.True(finite == total,
                 $"Expected all {total} logits finite; got {finite} finite. " +
-                $"First 10: [{string.Join(", ", span.Slice(0, Math.Min(10, total)).ToArray().Select(v => v.ToString("F3")))}]");
+                $"First 10: [{string.Join(", ", span.Slice(0, Math.Min(10, total)).ToArray().Select(v => v.ToString("F3", CultureInfo.InvariantCulture)))}]");
         }
     }
 
@@ -315,7 +432,7 @@ public sealed class DeepSeekV2GgufLoadTests
         // Until then, gracefully skip when we hit an unrecognised quant type.
         GgufFile gguf;
         try { gguf = GgufFile.Open(path); }
-        catch (NotSupportedException ex) when (ex.Message.Contains("quantization type"))
+        catch (NotSupportedException ex) when (ex.Message.Contains("quantization type", StringComparison.Ordinal))
         {
             Skip.If(true, $"Q3_K_M loader-side gap: {ex.Message} (Q3_K dequant not yet implemented).");
             return;
@@ -382,7 +499,7 @@ public sealed class DeepSeekV2GgufLoadTests
         // unsupported quant type rather than failing the test.
         GgufFile gguf;
         try { gguf = GgufFile.Open(path); }
-        catch (NotSupportedException ex) when (ex.Message.Contains("quantization type"))
+        catch (NotSupportedException ex) when (ex.Message.Contains("quantization type", StringComparison.Ordinal))
         {
             Skip.If(true, $"Q2_K loader-side gap: {ex.Message}");
             return;
@@ -433,7 +550,7 @@ public sealed class DeepSeekV2GgufLoadTests
             if (float.IsFinite(v)) finite++;
         Assert.True(finite == total,
             $"{label}: expected all {total} logits finite; got {finite} finite. " +
-            $"First 8: [{string.Join(", ", span.Slice(0, Math.Min(8, total)).ToArray().Select(v => v.ToString("F3")))}]");
+            $"First 8: [{string.Join(", ", span.Slice(0, Math.Min(8, total)).ToArray().Select(v => v.ToString("F3", CultureInfo.InvariantCulture)))}]");
     }
 
     private static unsafe int ArgmaxLogits(ITensor logits)

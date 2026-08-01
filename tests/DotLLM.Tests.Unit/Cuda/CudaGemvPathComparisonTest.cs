@@ -31,7 +31,7 @@ public class CudaGemvPathComparisonTest
 
     private static bool IsCudaDriverPresent()
     {
-        string lib = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "nvcuda.dll" : "libcuda.so.1";
+        string lib = OperatingSystem.IsWindows() ? "nvcuda.dll" : "libcuda.so.1";
         if (!NativeLibrary.TryLoad(lib, out nint h)) return false;
         NativeLibrary.Free(h);
         return CudaAvailableProbe();
@@ -55,7 +55,7 @@ public class CudaGemvPathComparisonTest
             ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
         Skip.If(!File.Exists(modelPath), "SmolLM-135M Q8_0 GGUF not found");
 
-        var gguf = GgufFile.Open(modelPath);
+        using var gguf = GgufFile.Open(modelPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config);
 
@@ -137,7 +137,7 @@ public class CudaGemvPathComparisonTest
             ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
         Skip.If(!File.Exists(modelPath), "SmolLM-135M Q8_0 GGUF not found");
 
-        var gguf = GgufFile.Open(modelPath);
+        using var gguf = GgufFile.Open(modelPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config);
 

@@ -38,8 +38,10 @@ public sealed class MatMulQ4KMmqKernel : IDisposable
     /// <summary>Elements per Q4_K super-block.</summary>
     public const int Q4KGroupSize = 256;
 
-    private const int TileM = 16;
-    private const int TileN = 16;
+    // issue #139: 64×64 output tile per workgroup (16×16 threads × 4×4 register
+    // tile each) — must match TILE_M/TILE_N in the shader.
+    private const int TileM = 64;
+    private const int TileN = 64;
     private const int PushConstantBytes = 5 * sizeof(uint); // M, K, N, blocksPerRow, rowUints
 
     private readonly VulkanDevice _device;
@@ -55,7 +57,7 @@ public sealed class MatMulQ4KMmqKernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 4);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
     }
 
     /// <summary>

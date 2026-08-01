@@ -13,8 +13,12 @@ namespace DotLLM.Vulkan.Kernels;
 /// NOT bit-exact vs the F32-in GEMM (the activation is int8-quantized first). Validated
 /// against the CPU F32 oracle (argmax + tolerance). Replaces the dequant→FP GEMM
 /// (<see cref="MatMulQ5KGemmF32Kernel"/>) on the seqLen&gt;1 path; falls back to it when
-/// the device lacks integer-dot-product support. Workgroup <c>(16,16,1)</c>, one 16×16
-/// output cell per workgroup.
+/// the device lacks integer-dot-product support.
+/// </remarks>
+/// <remarks>
+/// Dispatch: 2-D grid, workgroup <c>(16, 16, 1)</c> — one 64×64 output tile of <c>C</c>
+/// per workgroup (issue #367 register-tiled rewrite, direct port of #139's Q4_K tiling).
+/// Each thread computes a 4×4 register tile (strided by 16).
 /// </remarks>
 public sealed class MatMulQ5KMmqKernel : IDisposable
 {
@@ -24,8 +28,8 @@ public sealed class MatMulQ5KMmqKernel : IDisposable
     /// <summary>Elements per Q5_K super-block.</summary>
     public const int Q5KGroupSize = 256;
 
-    private const int TileM = 16;
-    private const int TileN = 16;
+    private const int TileM = 64;
+    private const int TileN = 64;
     private const int PushConstantBytes = 5 * sizeof(uint);
 
     private readonly VulkanDevice _device;
@@ -41,7 +45,7 @@ public sealed class MatMulQ5KMmqKernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 4);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
     }
 
     /// <summary>

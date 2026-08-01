@@ -24,6 +24,14 @@ internal sealed unsafe class TransformerForwardState : IDisposable
     // per-layer block so a single allocation covers both layer types.
     private readonly int _qBlockElems;   // max over layer types of numHeads   * layerHeadDim
     private readonly int _kvBlockElems;  // max over layer types of kvHeads(L) * layerHeadDim
+    // AttnOutput block size. Equals _qBlockElems for GQA/MHA/MQA models (the
+    // attention kernel writes the pre-o_proj, numHeads*headDim-wide output
+    // here; o_proj is applied afterward into a separate buffer). MLA models
+    // fuse o_proj INSIDE the kernel and write the already-projected,
+    // hiddenSize-wide result directly into AttnOutput instead — callers pass
+    // an explicit (possibly larger) size for that case. See TransformerModel
+    // .BuildFromPrebuiltWeightsInternal and #193.
+    private readonly int _attnOutBlockElems;
 
     private int _currentSeqLen;
 
@@ -37,7 +45,7 @@ internal sealed unsafe class TransformerForwardState : IDisposable
 
             long bytes = 0;
             bytes += s * _hiddenSize * 3;                    // HiddenState + Residual + NormOutput
-            bytes += s * _qBlockElems * 2;                   // Q + AttnOutput
+            bytes += s * (_qBlockElems + _attnOutBlockElems); // Q + AttnOutput
             bytes += s * _kvBlockElems * 2;                  // K + V
             bytes += s * _intermediateSize * 3;              // FfnGate + FfnUp + SiluOutput
             bytes += s * _vocabSize;                          // Logits (all positions for speculative verify)
@@ -113,7 +121,9 @@ internal sealed unsafe class TransformerForwardState : IDisposable
         float ropeTheta,
         int globalRopeDim = 0, float globalRopeTheta = 0f,
         int qBlockElems = 0, int kvBlockElems = 0,
-        int globalFullHeadDim = 0)
+        int attnOutBlockElems = 0,
+        int globalFullHeadDim = 0,
+        float[]? globalFreqFactors = null)
     {
         _hiddenSize = hiddenSize;
         _numHeads = numHeads;
@@ -126,6 +136,9 @@ internal sealed unsafe class TransformerForwardState : IDisposable
         // every existing caller byte-identical.
         _qBlockElems = qBlockElems > 0 ? qBlockElems : numHeads * headDim;
         _kvBlockElems = kvBlockElems > 0 ? kvBlockElems : numKvHeads * headDim;
+        // Defaults to _qBlockElems when the caller doesn't pass an explicit
+        // size — keeps every existing (non-MLA) caller byte-identical.
+        _attnOutBlockElems = attnOutBlockElems > 0 ? attnOutBlockElems : _qBlockElems;
 
         // Pre-compute RoPE frequency tables
         int halfDim = ropeDim / 2;
@@ -147,7 +160,14 @@ internal sealed unsafe class TransformerForwardState : IDisposable
             // (globalFullHeadDim, e.g. 512) — NOT the rotated count. When
             // globalFullHeadDim <= globalRopeDim (Gemma 3 / full rotation) the two
             // coincide and the standard precompute is used.
-            if (globalFullHeadDim > globalRopeDim)
+            // Proportional-rope frequency factors (Gemma-4 E2B/E4B rope_freqs
+            // tensor): the full-attention layers rotate the FULL head dim with the
+            // per-pair theta divided by the factor (ggml theta/ff). Mutually
+            // exclusive with the 26B partial-rotary path in practice.
+            if (globalFreqFactors is not null)
+                DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTableWithFactors(
+                    maxSeqLen, globalRopeDim, globalRopeTheta, globalFreqFactors, GlobalCosTable, GlobalSinTable);
+            else if (globalFullHeadDim > globalRopeDim)
                 DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTablePartial(
                     maxSeqLen, globalRopeDim, globalFullHeadDim, globalRopeTheta, GlobalCosTable, GlobalSinTable);
             else
@@ -178,7 +198,7 @@ internal sealed unsafe class TransformerForwardState : IDisposable
         Q = AllocFloats((long)newCapacity * _qBlockElems);
         K = AllocFloats((long)newCapacity * _kvBlockElems);
         V = AllocFloats((long)newCapacity * _kvBlockElems);
-        AttnOutput = AllocFloats((long)newCapacity * _qBlockElems);
+        AttnOutput = AllocFloats((long)newCapacity * _attnOutBlockElems);
         FfnGate = AllocFloats(newCapacity * _intermediateSize);
         FfnUp = AllocFloats(newCapacity * _intermediateSize);
         SiluOutput = AllocFloats(newCapacity * _intermediateSize);

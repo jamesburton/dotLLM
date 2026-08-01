@@ -450,3 +450,4 @@ moe_debug.txt
 parity_dotllm/
 parity_dotllm_multi/
 .claude/worktrees/
+.claude/strix/

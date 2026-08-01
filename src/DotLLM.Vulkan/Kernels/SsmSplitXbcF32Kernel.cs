@@ -39,7 +39,7 @@ public sealed class SsmSplitXbcF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: BufferCount);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: BufferCount);
     }
 
     /// <summary>Loads <c>ssm_split_xbc_f32.spv</c> from <paramref name="spvDir"/>.</summary>

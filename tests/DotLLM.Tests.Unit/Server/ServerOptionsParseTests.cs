@@ -25,4 +25,80 @@ public class ServerOptionsParseTests
         Assert.NotNull(opts.Scheduler);
         Assert.True(opts.Scheduler!.EnableFairness);
     }
+
+    [Fact]
+    public void Default_NoSpeculativeAndNoPrefillChunk()
+    {
+        // Zero behavior change when unset: no draft model, K default, chunking off.
+        var opts = ServerOptions.Parse(new[] { "--model", "m.gguf" });
+        Assert.Null(opts.SpeculativeModel);
+        Assert.Equal(5, opts.SpeculativeCandidates);
+        Assert.Equal(0, opts.PrefillChunkSize);
+    }
+
+    [Theory]
+    [InlineData("--speculative-model")]
+    [InlineData("--draft-model")]
+    public void SpeculativeModelFlag_SetsDraftModel(string flag)
+    {
+        var opts = ServerOptions.Parse(new[] { "--model", "m.gguf", flag, "draft.gguf" });
+        Assert.Equal("draft.gguf", opts.SpeculativeModel);
+    }
+
+    [Theory]
+    [InlineData("--speculative-k")]
+    [InlineData("--draft-tokens")]
+    public void SpeculativeKFlag_SetsCandidates(string flag)
+    {
+        var opts = ServerOptions.Parse(new[] { "--model", "m.gguf", flag, "3" });
+        Assert.Equal(3, opts.SpeculativeCandidates);
+    }
+
+    [Theory]
+    [InlineData("--prefill-chunk-size")]
+    [InlineData("--ubatch-size")]
+    public void PrefillChunkSizeFlag_SetsChunkSize(string flag)
+    {
+        var opts = ServerOptions.Parse(new[] { "--model", "m.gguf", flag, "256" });
+        Assert.Equal(256, opts.PrefillChunkSize);
+    }
+
+    [Fact]
+    public void ResolveSchedulerOptions_PrefillChunkSize_MapsToPerStepCap()
+    {
+        var opts = ServerOptions.Parse(new[] { "--model", "m.gguf", "--prefill-chunk-size", "128" });
+        var scheduler = ServerStartup.ResolveSchedulerOptions(opts);
+        Assert.NotNull(scheduler);
+        Assert.Equal(128, scheduler!.MaxPrefillTokensPerStep);
+    }
+
+    [Fact]
+    public void ResolveSchedulerOptions_ExplicitSchedulerCap_Wins()
+    {
+        // An explicit Scheduler.MaxPrefillTokensPerStep (e.g. bound from appsettings) is not
+        // overridden by the CLI-level prefill chunk size.
+        var opts = ServerOptions.Parse(new[] { "--model", "m.gguf", "--prefill-chunk-size", "128" }) with
+        {
+            Scheduler = new DotLLM.Engine.Scheduler.ContinuousBatchSchedulerOptions { MaxPrefillTokensPerStep = 512 },
+        };
+        var scheduler = ServerStartup.ResolveSchedulerOptions(opts);
+        Assert.Equal(512, scheduler!.MaxPrefillTokensPerStep);
+    }
+
+    [Fact]
+    public void ResolveSchedulerOptions_Unset_ReturnsNull()
+    {
+        var opts = ServerOptions.Parse(new[] { "--model", "m.gguf" });
+        Assert.Null(ServerStartup.ResolveSchedulerOptions(opts));
+    }
+
+    [Fact]
+    public void ResolveSchedulerOptions_FairnessPreserved_WithChunkSize()
+    {
+        var opts = ServerOptions.Parse(new[]
+            { "--model", "m.gguf", "--scheduler-fairness", "--prefill-chunk-size", "64" });
+        var scheduler = ServerStartup.ResolveSchedulerOptions(opts);
+        Assert.True(scheduler!.EnableFairness);
+        Assert.Equal(64, scheduler.MaxPrefillTokensPerStep);
+    }
 }

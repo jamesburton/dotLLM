@@ -11,7 +11,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </summary>
 [Trait("Category", "GPU")]
 [Collection(CudaCollection.Name)]
-public class CudaGemmTest : IDisposable
+public sealed class CudaGemmTest : IDisposable
 {
     private readonly ITestOutputHelper _out;
     private readonly CudaContext? _ctx;

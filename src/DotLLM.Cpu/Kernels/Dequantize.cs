@@ -38,6 +38,30 @@ public static unsafe partial class Dequantize
     /// <summary>Number of elements per I2_S block (x86 packing). 128 codes → 32 bytes.</summary>
     internal const int I2SBlockSize = 128;
 
+    /// <summary>Number of elements per PQ2_0 group. Same 128-code packing as I2_S.</summary>
+    internal const int PQ2_0GroupSize = 128;
+
+    /// <summary>
+    /// PQ2_0 group size in bytes: 2 (Half scale) + 32 (packed 2-bit codes, 4/byte) = 34.
+    /// Unlike I2_S, the scale is PER GROUP (not per tensor) and comes BEFORE the codes
+    /// (verified empirically against real Bonsai GGUF tensor bytes — see
+    /// <see cref="QuantizationType.PQ2_0"/>'s doc comment for how this was confirmed).
+    /// </summary>
+    internal const int PQ2_0GroupBytes = 34;
+
+    /// <summary>MXFP4 block size in bytes: 1 (E8M0 scale) + 16 (packed nibble bytes) = 17.</summary>
+    internal const int Mxfp4BlockBytes = 17;
+
+    /// <summary>Number of elements per MXFP4 block.</summary>
+    internal const int Mxfp4GroupSize = 32;
+
+    /// <summary>
+    /// MXFP4 E2M1 value table, doubled (matches llama.cpp <c>kvalues_mxfp4</c>).
+    /// Index = 4-bit code; values are 2× the nominal e2m1 value, compensated by
+    /// halving the E8M0 block scale (<see cref="E8M0ToFloatHalf"/>).
+    /// </summary>
+    internal static ReadOnlySpan<sbyte> Mxfp4Values => [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
     /// <summary>
     /// Returns the byte size of one row of <paramref name="elementCount"/> elements in the given quantization format.
     /// Useful for computing row strides when iterating weight matrices.
@@ -67,6 +91,9 @@ public static unsafe partial class Dequantize
         QuantizationType.IQ3_S => elementCount / KQuantGroupSize * IQ3_S_BlockBytes,
         // I2_S: packed 2-bit row stride only (k/4). The per-tensor scale lives at the tensor tail.
         QuantizationType.I2_S => elementCount / 4,
+        QuantizationType.MXFP4 => elementCount / Mxfp4GroupSize * Mxfp4BlockBytes,
+        // PQ2_0: scale is per-group (interleaved), so row stride includes it — contrast I2_S.
+        QuantizationType.PQ2_0 => elementCount / PQ2_0GroupSize * PQ2_0GroupBytes,
         _ => throw new ArgumentOutOfRangeException(nameof(quantType), quantType,
             $"Unknown quantization type: {quantType}")
     };
@@ -151,6 +178,12 @@ public static unsafe partial class Dequantize
             case QuantizationType.I2_S:
                 DequantizeI2_S(src, elementCount, dest);
                 break;
+            case QuantizationType.MXFP4:
+                DequantizeMxfp4Scalar(src, elementCount, dest);
+                break;
+            case QuantizationType.PQ2_0:
+                DequantizePQ2_0(src, elementCount, dest);
+                break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(quantType), quantType,
                     $"Unsupported quantization type: {quantType}");
@@ -230,6 +263,60 @@ public static unsafe partial class Dequantize
             }
 
             blockBase += Q8_0BlockBytes;
+        }
+    }
+
+    // ──────────────────── MXFP4 ────────────────────
+
+    /// <summary>
+    /// Converts an E8M0 exponent byte to <c>2^(e-127) / 2</c> as float —
+    /// i.e. the halved power-of-two block scale used with the doubled
+    /// <see cref="Mxfp4Values"/> table. Mirrors llama.cpp's
+    /// <c>ggml_e8m0_to_fp32_half</c>: <c>e &lt; 2</c> maps to the denormals
+    /// 2^-128 / 2^-127; otherwise the bit pattern is <c>(e-1) &lt;&lt; 23</c>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static float E8M0ToFloatHalf(byte e)
+    {
+        uint bits = e < 2
+            ? 0x00200000u << e          // 2^-128, 2^-127 (denormal patterns)
+            : (uint)(e - 1) << 23;      // 0.5 * 2^(e-127) = 2^(e-128)
+        return BitConverter.UInt32BitsToSingle(bits);
+    }
+
+    /// <summary>
+    /// Scalar MXFP4 dequantization — port of llama.cpp's
+    /// <c>dequantize_row_mxfp4</c>. Block layout (17 bytes, 32 elements):
+    /// <c>e (E8M0 scale byte @0), qs[16] @1</c>. Low nibbles → elements 0..15,
+    /// high nibbles → elements 16..31. Formula:
+    /// <c>value = kvalues[nibble] * e8m0_to_fp32_half(e)</c>.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void DequantizeMxfp4Scalar(nint src, long elementCount, Span<float> dest)
+    {
+        if (elementCount % Mxfp4GroupSize != 0)
+            throw new ArgumentException(
+                $"MXFP4 element count must be a multiple of {Mxfp4GroupSize}, got {elementCount}",
+                nameof(elementCount));
+
+        long blockCount = elementCount / Mxfp4GroupSize;
+        byte* blockBase = (byte*)src;
+        int outIdx = 0;
+        ReadOnlySpan<sbyte> kvalues = Mxfp4Values;
+
+        for (long b = 0; b < blockCount; b++)
+        {
+            float d = E8M0ToFloatHalf(blockBase[0]);
+            byte* qs = blockBase + 1;
+
+            for (int j = 0; j < 16; j++)
+            {
+                dest[outIdx + j] = kvalues[qs[j] & 0x0F] * d;
+                dest[outIdx + j + 16] = kvalues[qs[j] >> 4] * d;
+            }
+
+            outIdx += Mxfp4GroupSize;
+            blockBase += Mxfp4BlockBytes;
         }
     }
 
@@ -387,6 +474,47 @@ public static unsafe partial class Dequantize
             for (int gp = 0; gp < 32; gp++)
             {
                 byte packed = blockBase[gp];
+                dest[outBase + gp] = (((packed >> 6) & 0x3) - 1) * scale;
+                dest[outBase + gp + 32] = (((packed >> 4) & 0x3) - 1) * scale;
+                dest[outBase + gp + 64] = (((packed >> 2) & 0x3) - 1) * scale;
+                dest[outBase + gp + 96] = ((packed & 0x3) - 1) * scale;
+            }
+        }
+    }
+
+    // ──────────────────── PQ2_0 (PrismML Bonsai ternary) ────────────────────
+
+    /// <summary>
+    /// Scalar PQ2_0 dequantization (PrismML Bonsai ternary). Group layout: 128 elements per
+    /// 34-byte group, laid out as <c>scale(Half, 2 bytes) + codes[32](uint8, 4 codes/byte)</c>
+    /// — note the scale comes BEFORE the codes (opposite of where a reader familiar with
+    /// <see cref="DequantizeI2_S"/>'s tensor-TAIL scale might expect it — this is a genuinely
+    /// different, per-GROUP scale, empirically confirmed, not to be assumed from I2_S's shape).
+    /// Within a group, byte at <c>group_pos</c> (0..31) holds the codes for elements
+    /// {group_pos, +32, +64, +96} at bit offsets {6,4,2,0} — same bit convention as I2_S.
+    /// Codes map 0→-1, 1→0, 2→+1. Formula: <c>value = (code - 1) * group_scale</c>.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void DequantizePQ2_0(nint src, long elementCount, Span<float> dest)
+    {
+        if (elementCount % PQ2_0GroupSize != 0)
+            throw new ArgumentException(
+                $"PQ2_0 element count must be a multiple of {PQ2_0GroupSize}, got {elementCount}",
+                nameof(elementCount));
+
+        byte* data = (byte*)src;
+        long groupCount = elementCount / PQ2_0GroupSize;
+
+        for (long g = 0; g < groupCount; g++)
+        {
+            byte* groupBase = data + g * PQ2_0GroupBytes;
+            float scale = (float)Unsafe.ReadUnaligned<Half>(groupBase);
+            byte* codes = groupBase + 2;
+            int outBase = (int)(g * PQ2_0GroupSize);
+
+            for (int gp = 0; gp < 32; gp++)
+            {
+                byte packed = codes[gp];
                 dest[outBase + gp] = (((packed >> 6) & 0x3) - 1) * scale;
                 dest[outBase + gp + 32] = (((packed >> 4) & 0x3) - 1) * scale;
                 dest[outBase + gp + 64] = (((packed >> 2) & 0x3) - 1) * scale;

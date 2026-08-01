@@ -100,8 +100,21 @@ public static unsafe partial class MatMul
     /// The biased activation and its <c>vpdpbusd</c> are reused; only the weight load and the
     /// two dot products differ per row.
     /// </summary>
+    /// <remarks>
+    /// Not the same kernel as upstream's <see cref="VecDotQ8_0Vnni_4Rows"/> (the sign-trick,
+    /// native-512-bit-emulated-via-256-bit-insert implementation from #399, kept under its
+    /// original name for compatibility with upstream's own <c>RowMajorVnniBenchmarks</c> and
+    /// this project's own 2026-07-30 Zen5 measurements against it, both posted to
+    /// kkokosa/dotLLM#415). This is the zero-point (+128 bias) implementation from the
+    /// <c>issue/322-q8-avx512-vnni-net11</c> investigation's "the regression was an
+    /// implementation artifact" finding — native 256-bit throughout (no Vector512 packing
+    /// overhead), <see cref="ComputeRowsVnni"/> dispatches here, not to the original. Suffixed
+    /// "Zp" to disambiguate; not yet A/B'd against the sign-trick version on this exact
+    /// row-major shape (only against AVX2/AVX-512-maddubs) — worth doing if #415 gets picked
+    /// back up, since this may already be the fix that thread is looking for.
+    /// </remarks>
     [SkipLocalsInit]
-    internal static void VecDotQ8_0Vnni_4Rows(
+    internal static void VecDotQ8_0VnniZp_4Rows(
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* x, int blockCount, float* results)
     {
@@ -162,7 +175,7 @@ public static unsafe partial class MatMul
         int row = 0;
         for (; row + 3 < m; row += 4)
         {
-            VecDotQ8_0Vnni_4Rows(
+            VecDotQ8_0VnniZp_4Rows(
                 weightsQ8 + row * rowBytes,
                 weightsQ8 + (row + 1) * rowBytes,
                 weightsQ8 + (row + 2) * rowBytes,

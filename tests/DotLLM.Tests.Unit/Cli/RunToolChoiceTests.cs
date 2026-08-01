@@ -29,25 +29,25 @@ public sealed class RunToolChoiceTests
     {
         string schema = ToolCallSchemaBuilder.BuildForRequired(SingleTools, "arguments");
         Assert.NotEmpty(schema);
-        Assert.Contains("get_weather", schema);
-        Assert.Contains("arguments", schema);
+        Assert.Contains("get_weather", schema, StringComparison.Ordinal);
+        Assert.Contains("arguments", schema, StringComparison.Ordinal);
     }
 
     [Fact]
     public void BuildForRequired_MultiTool_ContainsAllNames()
     {
         string schema = ToolCallSchemaBuilder.BuildForRequired(MultiTools, "arguments");
-        Assert.Contains("get_weather", schema);
-        Assert.Contains("search_web", schema);
+        Assert.Contains("get_weather", schema, StringComparison.Ordinal);
+        Assert.Contains("search_web", schema, StringComparison.Ordinal);
     }
 
     [Fact]
     public void BuildForFunction_ProducesConstSchema()
     {
         string schema = ToolCallSchemaBuilder.BuildForFunction(WeatherTool, "arguments");
-        Assert.Contains("get_weather", schema);
+        Assert.Contains("get_weather", schema, StringComparison.Ordinal);
         // Single-function schema uses const for name
-        Assert.Contains("const", schema);
+        Assert.Contains("const", schema, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -61,7 +61,7 @@ public sealed class RunToolChoiceTests
         Assert.NotNull(calls);
         Assert.Single(calls);
         Assert.Equal("get_weather", calls![0].FunctionName);
-        Assert.Contains("Tokyo", calls[0].Arguments);
+        Assert.Contains("Tokyo", calls[0].Arguments, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -75,6 +75,6 @@ public sealed class RunToolChoiceTests
         Assert.NotNull(calls);
         Assert.Single(calls);
         Assert.Equal("search_web", calls![0].FunctionName);
-        Assert.Contains("dotnet", calls[0].Arguments);
+        Assert.Contains("dotnet", calls[0].Arguments, StringComparison.Ordinal);
     }
 }

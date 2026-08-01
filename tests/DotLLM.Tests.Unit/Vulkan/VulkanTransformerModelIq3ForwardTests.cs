@@ -111,6 +111,11 @@ public sealed class VulkanTransformerModelIq3ForwardTests : IDisposable
         // ── CPU oracle ────────────────────────────────────────────────
         float[] cpuLogits;
         {
+            // Not disposed here by design: BuildFromPrebuiltWeights hands
+            // `cpuWeights` to `model`, whose Dispose() disposes _weights
+            // internally — see TransformerModel.Dispose(). `model` is
+            // disposed below via `using`, so wrapping `cpuWeights` too
+            // would double-free.
             TransformerWeights cpuWeights = MaterialiseWeights(blob, config, iq3Type);
             using var model = TransformerModel.BuildFromPrebuiltWeights(cpuWeights, config);
             using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
@@ -120,7 +125,11 @@ public sealed class VulkanTransformerModelIq3ForwardTests : IDisposable
         // ── Vulkan under test ─────────────────────────────────────────
         float[] vkLogits;
         {
-            TransformerWeights vkWeights = MaterialiseWeights(blob, config, iq3Type);
+            // VulkanTransformerModel.BuildFromPrebuiltWeights uploads from
+            // `vkWeights` into device buffers but does not take ownership of
+            // it (VulkanTransformerModel.Dispose never touches cpuWeights) —
+            // the caller must dispose it.
+            using TransformerWeights vkWeights = MaterialiseWeights(blob, config, iq3Type);
             using var device = VulkanDevice.Create();
             using var model = VulkanTransformerModel.BuildFromPrebuiltWeights(device, config, vkWeights, spvDir);
             using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);

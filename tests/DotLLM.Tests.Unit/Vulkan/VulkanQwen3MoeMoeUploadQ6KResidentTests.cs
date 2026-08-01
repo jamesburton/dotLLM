@@ -26,8 +26,8 @@ namespace DotLLM.Tests.Unit.Vulkan;
 ///   <item>Upload the layer twice — once with <c>residentQuant: false</c>
 ///         (existing F32 dequant + streaming) and once with
 ///         <c>residentQuant: true</c> (Q6_K-resident raw-block copy). Verify
-///         <see cref="VulkanQwen3MoeMoeUpload.LayerBundle.BankQuantType"/>
-///         reflects the chosen path.</item>
+///         <see cref="VulkanQwen3MoeMoeUpload.LayerBundle.W1QuantType"/> (and
+///         its W2/W3 siblings) reflects the chosen path.</item>
 ///   <item>Run the indexed matmul over each bundle (F32 path uses
 ///         <see cref="MoeIndexedMatmulF32Kernel"/>, Q6_K path uses
 ///         <see cref="MoeIndexedMatmulQ6_KF32Kernel"/>) on the same expert
@@ -162,12 +162,16 @@ public sealed unsafe class VulkanQwen3MoeMoeUploadQ6KResidentTests : IDisposable
         // ── Streaming F32 upload (current default). ──
         using var streamingBundle = VulkanQwen3MoeMoeUpload.UploadLayer(
             device, moe, hiddenSize: hidden, residentQuant: false);
-        Assert.Equal(QuantizationType.F32, streamingBundle.BankQuantType);
+        Assert.Equal(QuantizationType.F32, streamingBundle.W1QuantType);
+        Assert.Equal(QuantizationType.F32, streamingBundle.W2QuantType);
+        Assert.Equal(QuantizationType.F32, streamingBundle.W3QuantType);
 
         // ── Resident Q6_K upload. ──
         using var residentBundle = VulkanQwen3MoeMoeUpload.UploadLayer(
             device, moe, hiddenSize: hidden, residentQuant: true);
-        Assert.Equal(QuantizationType.Q6_K, residentBundle.BankQuantType);
+        Assert.Equal(QuantizationType.Q6_K, residentBundle.W1QuantType);
+        Assert.Equal(QuantizationType.Q6_K, residentBundle.W2QuantType);
+        Assert.Equal(QuantizationType.Q6_K, residentBundle.W3QuantType);
 
         // ── Compare W1 dispatch outputs. ──
         AssertBankParity(device, f32Kernel, q6kKernel,
@@ -221,7 +225,9 @@ public sealed unsafe class VulkanQwen3MoeMoeUploadQ6KResidentTests : IDisposable
         using var bundle = VulkanQwen3MoeMoeUpload.UploadLayer(
             device, moe, hiddenSize: hidden, residentQuant: true);
 
-        Assert.Equal(QuantizationType.F32, bundle.BankQuantType);
+        Assert.Equal(QuantizationType.F32, bundle.W1QuantType);
+        Assert.Equal(QuantizationType.F32, bundle.W2QuantType);
+        Assert.Equal(QuantizationType.F32, bundle.W3QuantType);
     }
 
     private static void AssertBankParity(

@@ -67,6 +67,16 @@ internal static class VkStructureType
     internal const int PhysicalDeviceSubgroupSizeControlProperties = 1000225000;
     internal const int PhysicalDeviceSubgroupSizeControlFeatures = 1000225001;
     internal const int PipelineShaderStageRequiredSubgroupSizeCreateInfo = 1000225002;
+    // VK_KHR_pipeline_executable_properties. The Features struct (chained off
+    // VkPhysicalDeviceFeatures2 at device create) carries `pipelineExecutableInfo`;
+    // VkPipelineInfoKHR names the pipeline to introspect; VkPipelineExecutablePropertiesKHR
+    // is the per-executable result and — uniquely among the introspection APIs we
+    // already have — reports the `subgroupSize` the driver ACTUALLY compiled the
+    // stage for. VK_AMD_shader_info's statistics do not expose the wave width, and
+    // it is invisible to timing A/Bs and to SPIR-V disassembly (issue #241).
+    internal const int PhysicalDevicePipelineExecutablePropertiesFeaturesKhr = 1000269000;
+    internal const int PipelineInfoKhr = 1000269001;
+    internal const int PipelineExecutablePropertiesKhr = 1000269002;
     // VK_KHR_external_semaphore (core 1.1) — VkExportSemaphoreCreateInfo chains
     // off VkSemaphoreCreateInfo.pNext to declare which handle type(s) the
     // semaphore may be exported as. Drives the M3 Vulkan→CUDA async handoff.
@@ -629,6 +639,20 @@ internal struct VkPhysicalDeviceTimelineSemaphoreFeatures
     internal uint timelineSemaphore; // VkBool32
 }
 
+// VkQueryPoolCreateInfo — timestamp query pool for the env-gated decode
+// profiler (issue #143). sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO (11),
+// queryType = VK_QUERY_TYPE_TIMESTAMP (2).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkQueryPoolCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal int queryType;
+    internal uint queryCount;
+    internal uint pipelineStatistics;
+}
+
 // VkPipelineStageFlagBits — stage masks for vkCmdPipelineBarrier. Only the few
 // we need in the compute-only hot loop are listed.
 internal static class VkPipelineStageFlags
@@ -776,6 +800,44 @@ internal struct VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
     internal uint requiredSubgroupSize;
 }
 
+// VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR — chained off
+// VkPhysicalDeviceFeatures2.pNext at device create. `pipelineExecutableInfo` must
+// be VK_TRUE before vkGetPipelineExecutablePropertiesKHR may be called.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDevicePipelineExecutablePropertiesFeaturesKhr
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint pipelineExecutableInfo; // VkBool32
+}
+
+// VkPipelineInfoKHR — argument to vkGetPipelineExecutablePropertiesKHR naming the
+// pipeline whose compiled executables are to be enumerated.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPipelineInfoKhr
+{
+    internal int sType;
+    internal nint pNext;
+    internal nint pipeline; // VkPipeline
+}
+
+// VkPipelineExecutablePropertiesKHR — one entry per compiled executable in a
+// pipeline. `subgroupSize` is the wave width the driver actually compiled the
+// stage for — the only API in this codebase that reports it (issue #241).
+// `name`/`description` are fixed VK_MAX_DESCRIPTION_SIZE (256) char arrays.
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkPipelineExecutablePropertiesKhr
+{
+    internal const int MaxDescriptionSize = 256;
+
+    internal int sType;
+    internal nint pNext;
+    internal uint stages; // VkShaderStageFlags
+    internal fixed byte name[MaxDescriptionSize];
+    internal fixed byte description[MaxDescriptionSize];
+    internal uint subgroupSize;
+}
+
 // VkCooperativeMatrixPropertiesKHR — one entry per driver-supported tile shape
 // returned by vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR. Values are
 // used to pick the (MSize, NSize, KSize) baked into the compiled coopmat shader.
@@ -857,4 +919,46 @@ internal struct VkExternalMemoryBufferCreateInfo
     internal int sType;
     internal nint pNext;
     internal uint handleTypes;
+}
+
+// VK_AMD_shader_info — vkGetShaderInfoAMD's VkShaderInfoTypeAMD parameter.
+// Only Statistics is used (post-compile VGPR/SGPR/LDS usage); Binary and
+// Disassembly return driver-internal blobs we have no use for here.
+internal static class VkShaderInfoTypeAmd
+{
+    internal const int Statistics = 0;
+    internal const int Binary = 1;
+    internal const int Disassembly = 2;
+}
+
+// VkShaderResourceUsageAMD — nested inside VkShaderStatisticsInfoAMD. `size_t`
+// fields map to `nuint` (this project only targets 64-bit Windows/Linux, where
+// nuint is 8 bytes, matching the native ABI).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkShaderResourceUsageAmd
+{
+    internal uint numUsedVgprs;
+    internal uint numUsedSgprs;
+    internal uint ldsSizePerLocalWorkGroup;
+    internal nuint ldsUsageSizeInBytes;
+    internal nuint scratchMemUsageInBytes;
+}
+
+// VkShaderStatisticsInfoAMD — returned by vkGetShaderInfoAMD with infoType =
+// VK_SHADER_INFO_TYPE_STATISTICS_AMD. Reports the driver's actual post-compile
+// register/LDS allocation for a given pipeline stage — ground truth for the
+// "is the MMQ kernel register-spilling / LDS-limited on occupancy" question
+// that black-box timing (#384-#390) could not answer.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkShaderStatisticsInfoAmd
+{
+    internal uint shaderStageMask; // VkShaderStageFlags bitmask
+    internal VkShaderResourceUsageAmd resourceUsage;
+    internal uint numPhysicalVgprs;
+    internal uint numPhysicalSgprs;
+    internal uint numAvailableVgprs;
+    internal uint numAvailableSgprs;
+    internal uint computeWorkGroupSizeX;
+    internal uint computeWorkGroupSizeY;
+    internal uint computeWorkGroupSizeZ;
 }

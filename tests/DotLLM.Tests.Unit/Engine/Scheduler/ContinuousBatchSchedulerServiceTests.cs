@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
@@ -125,7 +126,7 @@ public sealed class ContinuousBatchSchedulerServiceTests
         private readonly int _emitToken;
         private readonly int _afterNTokens;
         private readonly Dictionary<IKvCache, int> _steps = new(ReferenceEqualityComparer.Instance);
-        private readonly object _stepLock = new();
+        private readonly Lock _stepLock = new();
 
         public MockModel(int emitToken, int afterNTokens)
         {
@@ -218,7 +219,7 @@ public sealed class ContinuousBatchSchedulerServiceTests
         public int[] Encode(string text) => Array.Empty<int>();
         public string Decode(ReadOnlySpan<int> tokenIds) => string.Join(",", tokenIds.ToArray());
         public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => Decode(tokenIds);
-        public string DecodeToken(int tokenId) => tokenId.ToString();
+        public string DecodeToken(int tokenId) => tokenId.ToString(CultureInfo.InvariantCulture);
         public int CountTokens(string text) => 0;
     }
 }

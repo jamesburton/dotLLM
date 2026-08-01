@@ -1,4 +1,5 @@
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Models;
 using DotLLM.Core.PositionEncoding;
 using DotLLM.Models.Gguf;
 using Xunit;
@@ -144,7 +145,7 @@ public class GgufModelConfigExtractorTests
 
         var config = GgufModelConfigExtractor.Extract(metadata);
         Assert.NotNull(config.ChatTemplate);
-        Assert.Contains("messages", config.ChatTemplate);
+        Assert.Contains("messages", config.ChatTemplate, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -223,6 +224,74 @@ public class GgufModelConfigExtractorTests
     }
 
     [Fact]
+    public void Extract_Qwen35Dense_PopulatesGdnAndHybridLayoutNoMoe()
+    {
+        // Real metadata values from PrismML's Ternary-Bonsai-27B-Q2_0.gguf (confirmed by direct
+        // inspection this session — general.architecture="qwen35", no "moe" suffix, no expert_*
+        // keys at all). Distinguishes this dense hybrid from qwen35moe (Extract_ArchitectureParsing
+        // covers the moe variant's bare architecture mapping; this test covers the GDN/hybrid-layout
+        // extraction path end-to-end, which qwen35 and qwen35moe both funnel through).
+        var metadata = BuildMetadata(d =>
+        {
+            d.AddString("general.architecture", "qwen35");
+            d.AddUInt32("qwen35.embedding_length", 5120);
+            d.AddUInt32("qwen35.block_count", 64);
+            d.AddUInt32("qwen35.feed_forward_length", 17408);
+            d.AddUInt32("qwen35.attention.head_count", 24);
+            d.AddUInt32("qwen35.attention.head_count_kv", 4);
+            d.AddUInt32("qwen35.attention.key_length", 256);
+            d.AddUInt32("qwen35.context_length", 262144);
+            d.AddUInt32("qwen35.vocab_size", 248320);
+            d.AddFloat32("qwen35.attention.layer_norm_rms_epsilon", 1e-6f);
+            d.AddFloat32("qwen35.rope.freq_base", 10000000.0f);
+            d.AddUInt32("qwen35.rope.dimension_count", 64);
+            // GDN config (qwen35.ssm.* — same key names as Mamba-2 but different semantics).
+            d.AddUInt32("qwen35.ssm.conv_kernel", 4);
+            d.AddUInt32("qwen35.ssm.state_size", 128);
+            d.AddUInt32("qwen35.ssm.group_count", 16);
+            d.AddUInt32("qwen35.ssm.time_step_rank", 48);
+            d.AddUInt32("qwen35.ssm.inner_size", 6144);
+            d.AddUInt32("qwen35.full_attention_interval", 4);
+            // Deliberately NO expert_count/expert_used_count/etc. — dense, not MoE.
+        });
+
+        var config = GgufModelConfigExtractor.Extract(metadata);
+
+        Assert.Equal(Architecture.Qwen3HybridDense, config.Architecture);
+        Assert.Equal(5120, config.HiddenSize);
+        Assert.Equal(64, config.NumLayers);
+        Assert.Equal(17408, config.IntermediateSize);
+        Assert.Equal(24, config.NumAttentionHeads);
+        Assert.Equal(4, config.NumKvHeads);
+        Assert.Equal(256, config.HeadDim);
+        Assert.Equal(262144, config.MaxSequenceLength);
+
+        // GDN config populated, Mamba-2 SsmConfig NOT (qwen35.ssm.* keys are GDN-flavoured, not
+        // Mamba-2 — extracting them as MambaSsmConfig would be silently wrong).
+        Assert.True(config.GdnConfig.HasValue);
+        var gdn = config.GdnConfig!.Value;
+        Assert.Equal(4, gdn.FullAttnInterval);
+        Assert.Equal(48, gdn.NVHead);
+        Assert.Equal(16, gdn.NKHead);
+        Assert.Equal(128, gdn.DState);
+        Assert.Equal(6144, gdn.DInner);
+        Assert.Equal(4, gdn.DConv);
+        Assert.Null(config.SsmConfig);
+
+        // Hybrid layer layout: 3 GDN layers then 1 full-attention layer, repeating
+        // (full_attention_interval=4, 1-based: layer index i is full-attn when (i+1)%4==0).
+        Assert.NotNull(config.HybridLayout);
+        Assert.Equal(HybridLayerKind.GatedDeltaNet, config.HybridLayout.LayerKind[0]);
+        Assert.Equal(HybridLayerKind.GatedDeltaNet, config.HybridLayout.LayerKind[1]);
+        Assert.Equal(HybridLayerKind.GatedDeltaNet, config.HybridLayout.LayerKind[2]);
+        Assert.Equal(HybridLayerKind.Attention, config.HybridLayout.LayerKind[3]);
+        Assert.Equal(HybridLayerKind.GatedDeltaNet, config.HybridLayout.LayerKind[4]);
+
+        // Dense — no MoE sublayer at all, unlike qwen35moe.
+        Assert.Null(config.Moe);
+    }
+
+    [Fact]
     public void Extract_DeepSeekV2_LoraQ_PopulatesQLoraRank()
     {
         // V2-full / V3 ship with q_lora_rank > 0 (Q-side factorisation).
@@ -295,7 +364,7 @@ public class GgufModelConfigExtractorTests
         var metadata = BuildMetadata(d => d.AddString("general.architecture", "unknown_arch"));
 
         var ex = Assert.Throws<InvalidDataException>(() => GgufModelConfigExtractor.Extract(metadata));
-        Assert.Contains("unknown_arch", ex.Message);
+        Assert.Contains("unknown_arch", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -342,7 +411,9 @@ public class GgufModelConfigExtractorTests
     [InlineData("qwen", Architecture.Qwen)]
     [InlineData("qwen2", Architecture.Qwen)]
     [InlineData("qwen3", Architecture.Qwen)]
+#pragma warning disable CS0618 // Intentional: pins legacy "deepseek" GGUF metadata compat.
     [InlineData("deepseek", Architecture.DeepSeek)]
+#pragma warning restore CS0618
     // Note: deepseek2 / deepseek3 require additional MLA + MoE metadata that
     // this minimal-keys parameterised test doesn't supply — they're covered by
     // the dedicated Extract_DeepSeekV2Lite_PopulatesMlaAndMoe and

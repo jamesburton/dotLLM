@@ -1,3 +1,4 @@
+using System.Globalization;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
@@ -723,8 +724,8 @@ public sealed class TransformerModelForwardBatchTests : IDisposable
         Assert.True(mismatches == 0,
             $"[{label}] {mismatches}/{expected.Length} logits diverged from per-seq Forward; "
             + $"maxAbs={maxAbs:G9}, first divergent index={firstBad} "
-            + $"(expected={(firstBad >= 0 ? expected[firstBad].ToString("R") : "n/a")}, "
-            + $"actual={(firstBad >= 0 ? actual[firstBad].ToString("R") : "n/a")})");
+            + $"(expected={(firstBad >= 0 ? expected[firstBad].ToString("R", CultureInfo.InvariantCulture) : "n/a")}, "
+            + $"actual={(firstBad >= 0 ? actual[firstBad].ToString("R", CultureInfo.InvariantCulture) : "n/a")})");
     }
 
     /// <summary>
@@ -769,8 +770,8 @@ public sealed class TransformerModelForwardBatchTests : IDisposable
         Assert.True(mismatches == 0,
             $"[{label}] {mismatches}/{expected.Length} logits exceeded absTol={absTol:G3}, relTol={relTol:G3}; "
             + $"maxAbs={maxAbs:G6}, maxRel={maxRel:G6}, first bad idx={firstBad} "
-            + $"(expected={(firstBad >= 0 ? expected[firstBad].ToString("R") : "n/a")}, "
-            + $"actual={(firstBad >= 0 ? actual[firstBad].ToString("R") : "n/a")})");
+            + $"(expected={(firstBad >= 0 ? expected[firstBad].ToString("R", CultureInfo.InvariantCulture) : "n/a")}, "
+            + $"actual={(firstBad >= 0 ? actual[firstBad].ToString("R", CultureInfo.InvariantCulture) : "n/a")})");
     }
 
     // ─────────────────────────────────────────────────────────────────────────

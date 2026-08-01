@@ -217,8 +217,10 @@ public sealed class TransformerModelBidirectionalForwardTests : IDisposable
             cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, cfg.MaxSequenceLength);
 
         Assert.Throws<NotSupportedException>(() =>
+        {
             model.Forward(tokenIds, positions, deviceId: -1, kv, adapter: null,
-                          AttentionMaskSpec.Bidirectional));
+                          AttentionMaskSpec.Bidirectional);
+        });
     }
 
     // ───────────────────────── helpers ─────────────────────────

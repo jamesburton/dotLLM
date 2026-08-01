@@ -106,6 +106,16 @@ public record ModelConfig
     /// </summary>
     public float? QueryPreAttnScalar { get; init; }
 
+    /// <summary>
+    /// Interleaved sliding-window pattern period. 0 (default) = the sliding
+    /// window (when set) applies to every layer (Mistral convention). N &gt; 0 =
+    /// layer <c>il</c> uses the sliding window iff <c>il % N &lt; N - 1</c>
+    /// (llama.cpp <c>set_swa_pattern(N, dense_first=false)</c>); the remaining
+    /// layers use dense full-context attention. gpt-oss uses N=2 (even layers
+    /// windowed, odd layers dense).
+    /// </summary>
+    public int SlidingWindowPattern { get; init; }
+
     /// <summary>MLA configuration. Only set for DeepSeek-style MLA attention.</summary>
     public MlaConfig? MlaConfig { get; init; }
 
@@ -155,6 +165,17 @@ public record ModelConfig
     /// schedule, and the tokenizer-resolved mask token id.
     /// </summary>
     public DiffusionConfig? DiffusionConfig { get; init; }
+
+    /// <summary>
+    /// Per-Layer Embeddings (PLE) configuration for the Gemma-4 dense text tower
+    /// (<c>gemma4_text</c>, e.g. E2B/E4B). Non-null only when the checkpoint ships the
+    /// PLE tables (<c>embed_tokens_per_layer</c> + <c>per_layer_model_projection</c> +
+    /// the per-layer gate/projection/norm). When set, the forward pass computes the
+    /// per-layer input tensor once after the embedding lookup and injects a gated
+    /// residual into every decoder layer's output. Null for every other architecture
+    /// (including the Gemma-4 MoE backbone and Gemma 3) — those paths are unaffected.
+    /// </summary>
+    public PerLayerEmbeddingConfig? PerLayerEmbedding { get; init; }
 
     /// <summary>Jinja2 chat template from model metadata. Null if not present.</summary>
     public string? ChatTemplate { get; init; }
@@ -298,6 +319,46 @@ public record ModelConfig
         if (perLayer is null || (uint)layerIdx >= (uint)perLayer.Count)
             return true;
         return perLayer[layerIdx] is null;
+    }
+
+    /// <summary>
+    /// Number of trailing layers that REUSE an earlier layer's KV instead of
+    /// projecting/caching their own (Gemma-4 E2B/E4B
+    /// <c>attention.shared_kv_layers</c>; llama.cpp <c>n_layer_kv_from_start =
+    /// n_layer - shared_kv_layers</c>). Zero (the default) means every layer has
+    /// its own KV — all non-Gemma-4-PLE architectures are unaffected. When
+    /// positive, layers <c>[NumLayers - NumSharedKvLayers, NumLayers)</c> skip
+    /// their K/V projections entirely and attend over the KV of
+    /// <see cref="SharedKvDonorLayer(int)"/> (the last own-KV layer of the same
+    /// attention type: sliding layers borrow the last own-KV sliding layer,
+    /// full-attention layers the last own-KV full layer).
+    /// </summary>
+    public int NumSharedKvLayers { get; init; }
+
+    /// <summary>
+    /// Returns true when <paramref name="layerIdx"/> projects and stores its own
+    /// K/V. False only for the trailing <see cref="NumSharedKvLayers"/> shared-KV
+    /// layers (Gemma-4 E2B/E4B); always true when sharing is off.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public bool LayerHasOwnKv(int layerIdx)
+        => NumSharedKvLayers <= 0 || layerIdx < NumLayers - NumSharedKvLayers;
+
+    /// <summary>
+    /// Returns the donor layer whose KV a shared-KV layer reuses. Mirrors
+    /// llama.cpp's gemma3n/gemma4 reuse rule
+    /// (<c>n_layer_kv_from_start - (is_swa(il) ? 2 : 1)</c>): with
+    /// <c>kvFromStart = NumLayers - NumSharedKvLayers</c>, a sliding-window shared
+    /// layer borrows layer <c>kvFromStart - 2</c> (the last own-KV sliding layer)
+    /// and a full-attention shared layer borrows <c>kvFromStart - 1</c> (the last
+    /// own-KV full layer). Only meaningful when <see cref="LayerHasOwnKv(int)"/>
+    /// is false for <paramref name="layerIdx"/>.
+    /// </summary>
+    public int SharedKvDonorLayer(int layerIdx)
+    {
+        int kvFromStart = NumLayers - NumSharedKvLayers;
+        return kvFromStart - (IsFullAttentionLayer(layerIdx) ? 1 : 2);
     }
 
     /// <summary>

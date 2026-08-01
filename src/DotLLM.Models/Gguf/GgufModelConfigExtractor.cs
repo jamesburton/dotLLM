@@ -77,6 +77,14 @@ public static class GgufModelConfigExtractor
         if (swValue > 0)
             slidingWindowSize = (int)swValue;
 
+        // Interleaved SWA pattern (gpt-oss: window on even layers, dense on odd —
+        // llama.cpp set_swa_pattern(2, dense_first=false); the metadata key is
+        // optional and defaults to 2 for gpt-oss).
+        int slidingWindowPattern = 0;
+        if (architecture == Architecture.GptOss && slidingWindowSize is not null)
+            slidingWindowPattern = (int)metadata.GetUInt32OrDefault(
+                $"{arch}.attention.sliding_window_pattern", 2);
+
         int vocabSize = ResolveVocabSize(metadata, arch);
 
         string? chatTemplate = metadata.GetStringOrDefault("tokenizer.chat_template", null!);
@@ -87,7 +95,7 @@ public static class GgufModelConfigExtractor
 
         // GDN models reuse the same {arch}.ssm.* key names as Mamba-2 but with
         // different semantics — skip Mamba-2 SSM config extraction for them.
-        MambaSsmConfig? ssmConfig = architecture is Architecture.Qwen3MoeHybrid
+        MambaSsmConfig? ssmConfig = architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense
             ? null
             : TryExtractSsmConfig(metadata, arch);
 
@@ -112,14 +120,23 @@ public static class GgufModelConfigExtractor
             // value.
             headDim = mlaConfig.QkNopeHeadDim + mlaConfig.QkRopeHeadDim;
         }
-        else if (architecture is Architecture.Qwen3MoeHybrid)
+        else if (architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense)
         {
             gdnConfig = TryExtractGdnConfig(metadata, arch);
-            moeConfig = TryExtractQwenMoeConfig(metadata, arch, numLayers);
+            // Dense hybrid (Qwen3HybridDense, e.g. Bonsai) has no MoE sublayer at all —
+            // don't call TryExtractQwenMoeConfig for it. It would return null anyway
+            // (no {arch}.expert_count key), but calling it only for the MoE variant
+            // keeps the intent explicit rather than relying on that null-return.
+            if (architecture is Architecture.Qwen3MoeHybrid)
+                moeConfig = TryExtractQwenMoeConfig(metadata, arch, numLayers);
             // Build per-layer layout from full_attention_interval (not stored as
             // per-layer arrays like Nemotron-H, so TryExtractHybridLayout returned null).
             if (gdnConfig is { } gdn)
                 hybridLayout = BuildQwen3MoeHybridLayout(numLayers, gdn.FullAttnInterval, numKvHeads);
+        }
+        else if (architecture == Architecture.GptOss)
+        {
+            moeConfig = ExtractGptOssMoeConfig(metadata, arch, intermediateSize);
         }
 
         return new ModelConfig
@@ -141,6 +158,7 @@ public static class GgufModelConfigExtractor
             RoPEConfig = ropeConfig,
             PositionEncodingType = ropeConfig.HasValue ? PositionEncodingType.RoPE : PositionEncodingType.None,
             SlidingWindowSize = slidingWindowSize,
+            SlidingWindowPattern = slidingWindowPattern,
             HybridLayout = hybridLayout,
             SsmConfig = ssmConfig,
             MlaConfig = mlaConfig,
@@ -149,6 +167,39 @@ public static class GgufModelConfigExtractor
             ChatTemplate = chatTemplate,
         };
     }
+
+    /// <summary>
+    /// Applies user-supplied RoPE overrides (CLI <c>--rope-scaling</c>/<c>--rope-freq-base</c>/etc.,
+    /// or server <c>ModelLoadRequest</c> equivalents) on top of the GGUF-derived <see cref="ModelConfig.RoPEConfig"/>
+    /// (and <see cref="ModelConfig.GlobalRoPEConfig"/> for dual-RoPE architectures like Gemma 4).
+    /// No new scaling math — every override field is a straight replacement of the corresponding
+    /// <see cref="RoPEConfig"/> field, everything else derived from GGUF metadata is left as-is.
+    /// A no-op (returns <paramref name="config"/> unchanged) when <paramref name="overrides"/> is
+    /// null, has no fields set, or the model has no RoPE config to override (non-RoPE architectures).
+    /// </summary>
+    public static ModelConfig ApplyRoPEOverride(ModelConfig config, RoPEOverrideOptions? overrides)
+    {
+        if (overrides is null || !overrides.HasAnyOverride)
+            return config;
+
+        ModelConfig result = config;
+        if (config.RoPEConfig is { } rope)
+            result = result with { RoPEConfig = ApplyOverride(rope, overrides) };
+        if (config.GlobalRoPEConfig is { } globalRope)
+            result = result with { GlobalRoPEConfig = ApplyOverride(globalRope, overrides) };
+        return result;
+    }
+
+    private static RoPEConfig ApplyOverride(RoPEConfig rope, RoPEOverrideOptions overrides) => rope with
+    {
+        Theta = overrides.FreqBase ?? rope.Theta,
+        ScalingType = overrides.ScalingType ?? rope.ScalingType,
+        ScalingFactor = overrides.ScalingFactor ?? rope.ScalingFactor,
+        OrigMaxSeqLen = overrides.OrigMaxSeqLen ?? rope.OrigMaxSeqLen,
+        AttnFactor = overrides.AttnFactor ?? rope.AttnFactor,
+        BetaFast = overrides.BetaFast ?? rope.BetaFast,
+        BetaSlow = overrides.BetaSlow ?? rope.BetaSlow,
+    };
 
     /// <summary>
     /// Extracts an <see cref="MlaConfig"/> from DeepSeek-V2/V3 GGUF metadata.
@@ -348,6 +399,33 @@ public static class GgufModelConfigExtractor
         };
     }
 
+    /// <summary>
+    /// Extracts the gpt-oss MoE configuration. Every layer is a routed-MoE
+    /// layer (no dense lead, no shared experts). Router gating is
+    /// softmax-after-top-k over raw (bias-added) logits; experts use the
+    /// clamped <c>swiglu_oai</c> activation; router and expert projections all
+    /// carry biases. Per llama.cpp's <c>LLM_ARCH_OPENAI_MOE</c>.
+    /// </summary>
+    private static MoeConfig ExtractGptOssMoeConfig(GgufMetadata metadata, string arch,
+                                                     int denseIntermediate)
+    {
+        int expertCount = (int)metadata.GetUInt32($"{arch}.expert_count");
+        int expertUsed = (int)metadata.GetUInt32($"{arch}.expert_used_count");
+        int moeIntermediate = (int)metadata.GetUInt32OrDefault(
+            $"{arch}.expert_feed_forward_length", (uint)denseIntermediate);
+
+        return new MoeConfig
+        {
+            NumExperts = expertCount,
+            NumExpertsPerTok = expertUsed,
+            MoeIntermediateSize = moeIntermediate,
+            SoftmaxAfterTopK = true,
+            UseSwiGluOai = true,
+            HasExpertBiases = true,
+            DecoderSparseStep = 1,
+        };
+    }
+
     private static HybridLayerLayout? TryExtractHybridLayout(GgufMetadata metadata, string arch, int numLayers)
     {
         string kvKey = $"{arch}.attention.head_count_kv";
@@ -506,6 +584,10 @@ public static class GgufModelConfigExtractor
             "qwen2moe" or "qwen3moe" or "qwenmoe" => Architecture.QwenMoe,
             // Qwen3.6-35B-A3B: Gated DeltaNet hybrid — NOT a plain Qwen-MoE transformer.
             "qwen35moe" => Architecture.Qwen3MoeHybrid,
+            // Dense Qwen3.5 hybrid (no MoE suffix) — same GDN/attention alternation as
+            // qwen35moe, dense SwiGLU FFN instead of sparse MoE. First seen in PrismML's
+            // Bonsai-27B (distilled from Qwen/Qwen3.6-27B).
+            "qwen35" => Architecture.Qwen3HybridDense,
             "mixtral" => Architecture.Mixtral,
 #pragma warning disable CS0618 // Preserve legacy GGUF metadata mapping for compatibility diagnostics.
             // Pre-V2 DeepSeek (legacy placeholder — never actually loaded by us).
@@ -527,6 +609,8 @@ public static class GgufModelConfigExtractor
             // BuildGemma4Config turns into a non-null DiffusionConfig.
             "diffusion-gemma" or "diffusion_gemma" => Architecture.DiffusionGemma,
             "bitnet" or "bitnet-b1.58" or "bitnet-25" => Architecture.BitNet,
+            // OpenAI gpt-oss (llama.cpp LLM_ARCH_OPENAI_MOE).
+            "gpt-oss" => Architecture.GptOss,
             _ => throw new InvalidDataException($"Unsupported GGUF architecture: '{archString}'.")
         };
     }
@@ -558,12 +642,17 @@ public static class GgufModelConfigExtractor
     /// those keys and leave <see cref="ModelConfig.PartialRotaryFactor"/> null — the
     /// forward path uses <c>DimensionCount</c> as the rotated span when the factor
     /// is null, which is exactly the GGUF representation.</para>
-    /// <para><b>PLE / AltUp / Laurel.</b> The released
-    /// <c>unsloth/gemma-4-26B-A4B</c> and <c>diffusiongemma-26B</c> GGUFs report
-    /// <c>embedding_length_per_layer_input = 0</c> and carry no
-    /// <c>per_layer_*</c>/<c>altup</c>/<c>laurel</c> tensors — this conversion does
-    /// NOT use Gemma-3n-style per-layer embeddings / alternating updates / learned
-    /// augmented residuals, so none are wired here.</para>
+    /// <para><b>PLE / shared KV (dense E2B/E4B).</b> The dense text-tower GGUFs
+    /// (<c>unsloth/gemma-4-E4B-it</c>) report
+    /// <c>embedding_length_per_layer_input &gt; 0</c> and ship the Gemma-3n-style
+    /// <c>per_layer_*</c> PLE tensors, plus <c>attention.shared_kv_layers</c>
+    /// (trailing layers reuse an earlier layer's KV) and a <c>rope_freqs</c>
+    /// proportional-rope factor tensor for the full-attention layers — all wired
+    /// below. The MoE 26B GGUFs report 0 / omit these and are unaffected.</para>
+    /// <para><b>AltUp / Laurel / activation sparsity.</b> Gemma-3n-only components
+    /// that Gemma 4 dropped: no released <c>gemma4</c> GGUF carries
+    /// <c>altup_*</c>/<c>laurel_*</c> tensors and llama.cpp's <c>gemma4.cpp</c>
+    /// graph has no gaussian-topk sparsity, so none are wired here.</para>
     /// </remarks>
     private static ModelConfig BuildGemma4Config(GgufMetadata metadata, string arch, Architecture architecture)
     {
@@ -642,6 +731,45 @@ public static class GgufModelConfigExtractor
             };
         }
 
+        // ── Per-Layer Embeddings (PLE) — the dense Gemma-4 text tower (E2B/E4B). ──
+        // embedding_length_per_layer_input > 0 marks the PLE variant: an auxiliary
+        // per-layer token-embedding table (per_layer_token_embd, width
+        // pleDim*numLayers) plus a context projection (per_layer_model_proj) feed a
+        // gated residual into every layer (llama.cpp gemma4.cpp build_inp_per_layer /
+        // project_per_layer_inputs). The released MoE 26B GGUFs report 0 here and
+        // carry no per_layer_* tensors, so this stays null for them.
+        PerLayerEmbeddingConfig? perLayerEmbedding = null;
+        uint pleDim = metadata.GetUInt32OrDefault($"{arch}.embedding_length_per_layer_input", 0);
+        if (pleDim > 0)
+        {
+            perLayerEmbedding = new PerLayerEmbeddingConfig
+            {
+                PerLayerDim = (int)pleDim,
+                // The gemma4 GGUF has a single vocabulary — per_layer_token_embd
+                // has the same row count as token_embd.
+                VocabSize = vocabSize,
+            };
+        }
+
+        // ── Shared trailing KV layers (Gemma-4 E2B/E4B). ──
+        // attention.shared_kv_layers = number of TRAILING layers that reuse an
+        // earlier layer's KV (llama.cpp: n_layer_kv_from_start = n_layer - shared).
+        // The reuse rule itself lives on ModelConfig.SharedKvDonorLayer.
+        int sharedKvLayers = (int)metadata.GetUInt32OrDefault($"{arch}.attention.shared_kv_layers", 0);
+        if (sharedKvLayers < 0 || sharedKvLayers >= numLayers)
+            throw new InvalidDataException(
+                $"gemma4 GGUF '{arch}.attention.shared_kv_layers' = {sharedKvLayers} must be in [0, {numLayers}).");
+
+        // Partial rotary: the MoE 26B rotates only the leading 0.25 fraction of the
+        // 512-dim global head (validated end-to-end). The dense-PLE E2B/E4B variant
+        // instead rotates the FULL head dim on both layer kinds
+        // (rope.dimension_count == key_length, rope.dimension_count_swa ==
+        // key_length_swa; llama.cpp n_rot(il) comes straight from those keys) and
+        // modulates the global-layer frequencies via the rope_freqs.weight
+        // proportional-rope factor tensor (loaded by TransformerWeights). Gate on
+        // the PLE marker, which cleanly separates the two released families.
+        float? partialRotaryFactor = perLayerEmbedding is null ? 0.25f : null;
+
         float? finalLogitSoftcap = null;
         float fls = metadata.GetFloat32OrDefault($"{arch}.final_logit_softcapping", 0f);
         if (fls > 0f) finalLogitSoftcap = fls;
@@ -696,7 +824,9 @@ public static class GgufModelConfigExtractor
             // rotated span — partial_rotary_factor 0.25 selects the rotated dims).
             // The forward path multiplies this factor by the global head dim and
             // rounds down to even. Sliding layers keep full rotation (factor n/a).
-            PartialRotaryFactor = 0.25f,
+            // Null on the dense-PLE E2B/E4B variant (full-dim rotation + rope_freqs
+            // proportional factors — see above).
+            PartialRotaryFactor = partialRotaryFactor,
             NumGlobalKvHeads = numGlobalKvHeads,
             GlobalHeadDim = globalHeadDimNullable,
             // Gemma 4 q_norm/k_norm make Q,K unit so the attention softmax scale
@@ -717,6 +847,8 @@ public static class GgufModelConfigExtractor
             FinalLogitSoftcap = finalLogitSoftcap,
             EmbeddingScale = MathF.Sqrt(hiddenSize),
             Moe = moe,
+            PerLayerEmbedding = perLayerEmbedding,
+            NumSharedKvLayers = sharedKvLayers,
             ChatTemplate = chatTemplate,
             DiffusionConfig = diffusion,
         };
@@ -788,7 +920,8 @@ public static class GgufModelConfigExtractor
         RoPEType ropeType = architecture switch
         {
             Architecture.Qwen or Architecture.QwenMoe
-                or Architecture.Qwen3MoeHybrid or Architecture.Phi => RoPEType.NeoX,
+                or Architecture.Qwen3MoeHybrid or Architecture.Phi
+                or Architecture.GptOss => RoPEType.NeoX,
             _ => RoPEType.Norm,
         };
 

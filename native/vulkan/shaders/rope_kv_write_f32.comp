@@ -1,0 +1,166 @@
+#version 450
+// Fused RoPE + KV-cache write, FP32.
+//
+// Vulkan port of native/kernels/fused_rope_kv_write.cu. Collapses the
+// current two-dispatch sequence (rope_f32.comp COMPUTE dispatch, then
+// VulkanKvCache.RecordUpdate's 2x vkCmdCopyBuffer TRANSFER copies) into one
+// COMPUTE dispatch:
+//   - Q is rotated IN PLACE in the Q scratch buffer (unchanged from
+//     rope_f32.comp — attention always reads Q from scratch, never from a
+//     cache).
+//   - K is rotated and the ROTATED result is written DIRECTLY into the
+//     K-cache row for this token (instead of into K scratch, which then
+//     gets vkCmdCopyBuffer'd into the cache).
+//   - V receives no rotation; it is copied verbatim from V scratch into the
+//     V-cache row for this token (replacing the second vkCmdCopyBuffer).
+//
+// CONTIGUOUS-POSITIONS ONLY: cache row for source token t is
+// (startPos + t) * kvStride — a single push-constant base plus a per-thread
+// stride multiply, mirroring VulkanKvCache.RecordUpdate's contiguous fast
+// path (one vkCmdCopyBuffer region covering the whole seqLen). Non-
+// contiguous / gapped positions (VulkanKvCache's per-row-copy fallback) are
+// NOT supported by this shader — the host falls back to the unfused
+// rope_f32.comp + RecordUpdate path for that case.
+//
+// Region layout in the flat thread grid (mirrors fused_rope_kv_write.cu's
+// region scheme, generalised over seqLen since Vulkan dispatches the whole
+// prefill chunk in one call rather than being decode-only like the CUDA
+// kernel):
+//   [0,  r0) r0 = seqLen * numHeads   * halfRope        -> Q rotation (in place on q)
+//   [r0, r1) r1 = r0 + seqLen * numKvHeads * halfRope    -> K rotation (write to k-cache row)
+//   [r1, r2) r2 = r1 + seqLen * numKvHeads * tail        -> K tail copy, only if ropeDim < headDim
+//   [r2, r3) r3 = r2 + seqLen * numKvHeads * headDim     -> V full copy (write to v-cache row)
+//
+// Layout: Q scratch is [seqLen, numHeads * headDim]; K/V scratch are
+// [seqLen, numKvHeads * headDim]; K/V cache rows are [maxSeqLen, kvStride]
+// with kvStride == numKvHeads * headDim for the layer (VulkanKvCache.cs).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)         buffer BufQ      { float q[]; };        // [seqLen, numHeads   * headDim] in/out
+layout(set = 0, binding = 1, std430) readonly buffer BufK      { float k[]; };        // [seqLen, numKvHeads * headDim] in
+layout(set = 0, binding = 2, std430) readonly buffer BufV      { float v[]; };        // [seqLen, numKvHeads * headDim] in
+layout(set = 0, binding = 3, std430) readonly buffer BufPos    { int positions[]; };  // [seqLen] RoPE angle source
+layout(set = 0, binding = 4, std430)         buffer BufKCache { float kCache[]; };    // [maxSeqLen, kvStride] out
+layout(set = 0, binding = 5, std430)         buffer BufVCache { float vCache[]; };    // [maxSeqLen, kvStride] out
+
+layout(push_constant) uniform PushConstants {
+    uint  seqLen;
+    uint  numHeads;
+    uint  numKvHeads;
+    uint  headDim;
+    uint  ropeDim;        // number of dims to rotate (<= headDim, even)
+    uint  ropeType;       // 0 = Norm (interleaved), 1 = NeoX (rotate-half)
+    float theta;
+    uint  freqDim;        // frequency-denominator dim for the exponent 2*pair/freqDim
+    uint  neoxPairOffset; // NeoX rotate-half pairing offset: i1 = i0 + neoxPairOffset
+    uint  startPos;       // cache row index of source token 0 (contiguous positions only)
+    uint  kvStride;       // elements per cache row (== numKvHeads * headDim for this layer)
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    uint halfRope = pc.ropeDim >> 1u;
+    uint tail = pc.headDim - pc.ropeDim;
+
+    uint r0 = pc.seqLen * pc.numHeads   * halfRope;
+    uint r1 = r0 + pc.seqLen * pc.numKvHeads * halfRope;
+    uint r2 = r1 + pc.seqLen * pc.numKvHeads * tail;
+    uint r3 = r2 + pc.seqLen * pc.numKvHeads * pc.headDim;
+
+    if (idx >= r3) return;
+
+    // ── Region 0: Q rotation pairs (in-place on q) ──
+    if (idx < r0) {
+        if (halfRope == 0u) return;
+        uint pair = idx % halfRope;
+        uint rem  = idx / halfRope;
+        uint head = rem % pc.numHeads;
+        uint t    = rem / pc.numHeads;
+
+        float expn  = float(2u * pair) / float(pc.freqDim);
+        float freq  = 1.0 / pow(pc.theta, expn);
+        float angle = float(positions[t]) * freq;
+        float c     = cos(angle);
+        float s     = sin(angle);
+
+        uint baseIdx = t * pc.numHeads * pc.headDim + head * pc.headDim;
+        uint i0, i1;
+        if (pc.ropeType == 1u) {
+            i0 = baseIdx + pair;
+            i1 = baseIdx + pair + pc.neoxPairOffset;
+        } else {
+            i0 = baseIdx + 2u * pair;
+            i1 = baseIdx + 2u * pair + 1u;
+        }
+
+        float v0 = q[i0];
+        float v1 = q[i1];
+        q[i0] = v0 * c - v1 * s;
+        q[i1] = v0 * s + v1 * c;
+        return;
+    }
+
+    // ── Region 1: K rotation pairs (read k scratch, write rotated to k-cache row) ──
+    if (idx < r1) {
+        uint local = idx - r0;
+        uint pair  = local % halfRope;
+        uint rem   = local / halfRope;
+        uint head  = rem % pc.numKvHeads;
+        uint t     = rem / pc.numKvHeads;
+
+        float expn  = float(2u * pair) / float(pc.freqDim);
+        float freq  = 1.0 / pow(pc.theta, expn);
+        float angle = float(positions[t]) * freq;
+        float c     = cos(angle);
+        float s     = sin(angle);
+
+        uint srcBase = t * pc.numKvHeads * pc.headDim + head * pc.headDim;
+        uint i0, i1;
+        if (pc.ropeType == 1u) {
+            i0 = srcBase + pair;
+            i1 = srcBase + pair + pc.neoxPairOffset;
+        } else {
+            i0 = srcBase + 2u * pair;
+            i1 = srcBase + 2u * pair + 1u;
+        }
+
+        float v0 = k[i0];
+        float v1 = k[i1];
+
+        uint cacheRow = (pc.startPos + t) * pc.kvStride + head * pc.headDim;
+        uint dstOff0 = i0 - srcBase; // offset within head
+        uint dstOff1 = i1 - srcBase;
+        kCache[cacheRow + dstOff0] = v0 * c - v1 * s;
+        kCache[cacheRow + dstOff1] = v0 * s + v1 * c;
+        return;
+    }
+
+    // ── Region 2: K tail copy (rope_dim < head_dim, no rotation) ──
+    if (idx < r2) {
+        uint local = idx - r1;
+        uint off   = local % tail;   // tail offset within head
+        uint rem   = local / tail;
+        uint head  = rem % pc.numKvHeads;
+        uint t     = rem / pc.numKvHeads;
+
+        uint srcIdx = t * pc.numKvHeads * pc.headDim + head * pc.headDim + pc.ropeDim + off;
+        uint cacheRow = (pc.startPos + t) * pc.kvStride + head * pc.headDim + pc.ropeDim + off;
+        kCache[cacheRow] = k[srcIdx];
+        return;
+    }
+
+    // ── Region 3: V full copy (no rotation) ──
+    {
+        uint local = idx - r2;
+        uint off   = local % pc.headDim;
+        uint rem   = local / pc.headDim;
+        uint head  = rem % pc.numKvHeads;
+        uint t     = rem / pc.numKvHeads;
+
+        uint srcIdx = t * pc.numKvHeads * pc.headDim + head * pc.headDim + off;
+        uint cacheRow = (pc.startPos + t) * pc.kvStride + head * pc.headDim + off;
+        vCache[cacheRow] = v[srcIdx];
+    }
+}

@@ -1,4 +1,7 @@
+using System.Runtime.InteropServices;
+using Architecture = DotLLM.Core.Configuration.Architecture;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Core.PositionEncoding;
 using DotLLM.Core.Tensors;
@@ -113,6 +116,250 @@ public sealed class TransformerModelMlaForwardTests : IDisposable
     public void Forward_PhaseC_HybridCache_MatchesPhaseASingleCall_MonolithicQ()
     {
         AssertPhaseCSplitCallMatchesPhaseASingle(qLoraRank: 0, seed: 616);
+    }
+
+    // ───────────────────────── LoRA (ILoraAdapter) coverage ─────────────────────────
+    //
+    // These tests exercise the *PEFT-style* ILoraAdapter feature (distinct
+    // from DeepSeek's own q_lora_rank built-in low-rank Q compression, which
+    // the "_LoRAQ" test-name suffix above refers to). They prove:
+    //   1. An active adapter targeting q_a_proj/q_b_proj/q_proj/
+    //      kv_a_proj_with_mqa/kv_b_proj actually changes Phase B and Phase C
+    //      output (the hooks are wired, not silently no-op).
+    //   2. With that same adapter active, Phase B / Phase C still match the
+    //      Phase A oracle within the existing 1e-3 tolerance — this is the
+    //      decisive proof that the kv_b_proj absorbed-math LoRA delta
+    //      (MlaAttention.ApplyKvBProjLoraDeltaExpanded) is numerically
+    //      correct, not just "doesn't crash".
+
+    [Fact]
+    public void Forward_PhaseB_LoraAdapter_ChangesLogits_LoRAQ()
+    {
+        AssertLoraAdapterChangesLogits(qLoraRank: 8, useHybrid: false, seed: 711);
+    }
+
+    [Fact]
+    public void Forward_PhaseB_LoraAdapter_ChangesLogits_MonolithicQ()
+    {
+        AssertLoraAdapterChangesLogits(qLoraRank: 0, useHybrid: false, seed: 712);
+    }
+
+    [Fact]
+    public void Forward_PhaseC_LoraAdapter_ChangesLogits_LoRAQ()
+    {
+        AssertLoraAdapterChangesLogits(qLoraRank: 8, useHybrid: true, seed: 713);
+    }
+
+    [Fact]
+    public void Forward_PhaseC_LoraAdapter_ChangesLogits_MonolithicQ()
+    {
+        AssertLoraAdapterChangesLogits(qLoraRank: 0, useHybrid: true, seed: 714);
+    }
+
+    [Fact]
+    public void Forward_PhaseB_LoraAdapter_MatchesPhaseASingleCall_LoRAQ()
+    {
+        // Decisive correctness check for the kv_b_proj absorbed-math LoRA
+        // delta fix: with an adapter active on q_a_proj/q_b_proj/
+        // kv_a_proj_with_mqa/kv_b_proj, Phase B's split prefill+decode
+        // sequence must still reproduce the Phase A single-call oracle
+        // (also run WITH the same adapter) within 1e-3.
+        AssertLoraAdapterMatchesPhaseA(qLoraRank: 8, useHybrid: false, seed: 821);
+    }
+
+    [Fact]
+    public void Forward_PhaseB_LoraAdapter_MatchesPhaseASingleCall_MonolithicQ()
+    {
+        AssertLoraAdapterMatchesPhaseA(qLoraRank: 0, useHybrid: false, seed: 822);
+    }
+
+    [Fact]
+    public void Forward_PhaseC_LoraAdapter_MatchesPhaseASingleCall_LoRAQ()
+    {
+        // Same decisive check for Phase C: the expand-prefill sub-path
+        // applies the kv_b_proj delta directly to the expanded scratch,
+        // while the absorbed-decode sub-path reuses ExecuteLatent's fix.
+        AssertLoraAdapterMatchesPhaseA(qLoraRank: 8, useHybrid: true, seed: 823);
+    }
+
+    [Fact]
+    public void Forward_PhaseC_LoraAdapter_MatchesPhaseASingleCall_MonolithicQ()
+    {
+        AssertLoraAdapterMatchesPhaseA(qLoraRank: 0, useHybrid: true, seed: 824);
+    }
+
+    /// <summary>
+    /// Proves the LoRA hooks are actually wired (not silently no-op) for
+    /// the absorbed-cache MLA kernels: running the same prefill through a
+    /// model with vs. without an active adapter must produce different
+    /// logits.
+    /// </summary>
+    private void AssertLoraAdapterChangesLogits(int qLoraRank, bool useHybrid, int seed)
+    {
+        string path = Path.Combine(_scratch, $"mla-lora-changes-h{useHybrid}-q{qLoraRank}.safetensors");
+        WriteFixture(path, qLoraRank, seed);
+
+        ModelConfig baseConfig = BuildConfig(qLoraRank);
+        ModelConfig config = useHybrid
+            ? baseConfig with { MlaConfig = baseConfig.MlaConfig! with { UseHybridMlaCache = true } }
+            : baseConfig with { MlaConfig = baseConfig.MlaConfig! with { UseLatentCache = true } };
+
+        int[] tokenIds = [0, 1, 2];
+        int[] positions = [0, 1, 2];
+
+        float[] plainLogits;
+        using (var sf1 = SafetensorsFile.Open(path))
+        using (var model1 = TransformerModel.LoadFromSafetensors(sf1, config))
+        using (ITensor logits = model1.Forward(tokenIds, positions, deviceId: -1, kvCache: null, adapter: null))
+        {
+            plainLogits = CopyLogits(logits);
+        }
+
+        using var adapter = BuildLoraAdapter(qLoraRank, seed: seed + 1000);
+        float[] adaptedLogits;
+        using (var sf2 = SafetensorsFile.Open(path))
+        using (var model2 = TransformerModel.LoadFromSafetensors(sf2, config))
+        using (ITensor logits = model2.Forward(tokenIds, positions, deviceId: -1, kvCache: null, adapter: adapter))
+        {
+            adaptedLogits = CopyLogits(logits);
+        }
+
+        Assert.Equal(plainLogits.Length, adaptedLogits.Length);
+        bool anyDifferent = false;
+        for (int i = 0; i < plainLogits.Length; i++)
+        {
+            if (MathF.Abs(plainLogits[i] - adaptedLogits[i]) > 1e-5f)
+            {
+                anyDifferent = true;
+                break;
+            }
+        }
+        Assert.True(anyDifferent,
+            $"Active LoRA adapter did not change {(useHybrid ? "Phase C" : "Phase B")} MLA logits "
+            + $"(qLoraRank={qLoraRank}) — the projection hooks may be no-ops.");
+    }
+
+    /// <summary>
+    /// Decisive correctness check: with an ILoraAdapter active on
+    /// q_a_proj/q_b_proj (or q_proj)/kv_a_proj_with_mqa/kv_b_proj, a split
+    /// prefill+decode sequence through the absorbed-cache kernel
+    /// (Phase B or Phase C) must reproduce a Phase A single-call oracle run
+    /// with the SAME adapter, within 1e-3 — proving the kv_b_proj
+    /// absorbed-math delta application is numerically equivalent to
+    /// Execute's plain per-token GEMV-plus-delta.
+    /// </summary>
+    private void AssertLoraAdapterMatchesPhaseA(int qLoraRank, bool useHybrid, int seed)
+    {
+        string path = Path.Combine(_scratch, $"mla-lora-parity-h{useHybrid}-q{qLoraRank}.safetensors");
+        WriteFixture(path, qLoraRank, seed);
+        using var adapter = BuildLoraAdapter(qLoraRank, seed: seed + 2000);
+
+        int[] tokenIds = [0, 1, 2, 3, 4];
+        int fullLen = tokenIds.Length;
+        int prefillLen = 3;
+
+        // ── Pass A (Phase A, single call, WITH adapter) — oracle ────────
+        float[] fullLogits;
+        {
+            ModelConfig configA = BuildConfig(qLoraRank);
+            using var sfA = SafetensorsFile.Open(path);
+            using var modelA = TransformerModel.LoadFromSafetensors(sfA, configA);
+            int[] positions = [0, 1, 2, 3, 4];
+            using ITensor logits = modelA.Forward(tokenIds, positions, deviceId: -1, kvCache: null, adapter: adapter);
+            Assert.Equal(fullLen, logits.Shape[0]);
+            fullLogits = CopyLogits(logits);
+        }
+
+        // ── Pass B/C (split call, WITH the same adapter) — under test ───
+        ModelConfig baseConfig = BuildConfig(qLoraRank);
+        ModelConfig config = useHybrid
+            ? baseConfig with { MlaConfig = baseConfig.MlaConfig! with { UseHybridMlaCache = true } }
+            : baseConfig with { MlaConfig = baseConfig.MlaConfig! with { UseLatentCache = true } };
+        string phaseLabel = useHybrid ? "Phase C" : "Phase B";
+
+        using (var sf = SafetensorsFile.Open(path))
+        using (var model = TransformerModel.LoadFromSafetensors(sf, config))
+        {
+            float[] prefillLastRow;
+            {
+                int[] ptids = tokenIds.AsSpan(0, prefillLen).ToArray();
+                int[] ppos = Enumerable.Range(0, prefillLen).ToArray();
+                using ITensor logits = model.Forward(ptids, ppos, deviceId: -1, kvCache: null, adapter: adapter);
+                prefillLastRow = CopyRow(logits, prefillLen - 1);
+            }
+            AssertRowClose(fullLogits, rowIndex: prefillLen - 1, expected: prefillLastRow,
+                           tolerance: 1e-3f, label: $"[{phaseLabel}+LoRA] prefill last row (qLoraRank={qLoraRank})");
+
+            for (int t = prefillLen; t < fullLen; t++)
+            {
+                int[] dtids = [tokenIds[t]];
+                int[] dpos = [t];
+                using ITensor logits = model.Forward(dtids, dpos, deviceId: -1, kvCache: null, adapter: adapter);
+                Assert.Equal(1, logits.Shape[0]);
+                float[] decodeRow = CopyRow(logits, 0);
+                AssertRowClose(fullLogits, rowIndex: t, expected: decodeRow,
+                               tolerance: 1e-3f, label: $"[{phaseLabel}+LoRA] decode t={t} (qLoraRank={qLoraRank})");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds an ILoraAdapter targeting the MLA-specific projection names
+    /// (q_a_proj/q_b_proj or q_proj, kv_a_proj_with_mqa, kv_b_proj) for
+    /// every layer of the fixture, with small deterministic weights.
+    /// </summary>
+    private static LoraAdapter BuildLoraAdapter(int qLoraRank, int seed)
+    {
+        const int rank = 4;
+        const float alpha = 64f;
+        string[] targets = qLoraRank > 0
+            ? ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"]
+            : ["q_proj", "kv_a_proj_with_mqa", "kv_b_proj"];
+
+        var adapter = new LoraAdapter("mla-test-adapter", rank, alpha, targets);
+
+        int qkHead = QkNope + QkRope;
+        int qTotal = NumHeads * qkHead;
+        int kvADim = KvLoraRank + QkRope;
+        int kvBOut = NumHeads * (QkNope + VHead);
+
+        for (int layer = 0; layer < NumLayers; layer++)
+        {
+            int s = seed + 100 * (layer + 1);
+            if (qLoraRank > 0)
+            {
+                AddLoraWeights(adapter, layer, "q_a_proj", inputDim: HiddenSize, outputDim: qLoraRank, rank, s + 1);
+                AddLoraWeights(adapter, layer, "q_b_proj", inputDim: qLoraRank, outputDim: qTotal, rank, s + 2);
+            }
+            else
+            {
+                AddLoraWeights(adapter, layer, "q_proj", inputDim: HiddenSize, outputDim: qTotal, rank, s + 3);
+            }
+            AddLoraWeights(adapter, layer, "kv_a_proj_with_mqa", inputDim: HiddenSize, outputDim: kvADim, rank, s + 4);
+            AddLoraWeights(adapter, layer, "kv_b_proj", inputDim: KvLoraRank, outputDim: kvBOut, rank, s + 5);
+        }
+
+        return adapter;
+    }
+
+    private static unsafe void AddLoraWeights(
+        LoraAdapter adapter, int layer, string proj, int inputDim, int outputDim, int rank, int seed)
+    {
+        nint a = LoraAdapter.AllocAligned((long)outputDim * rank);
+        nint b = LoraAdapter.AllocAligned((long)rank * inputDim);
+        FillAligned(a, outputDim * rank, amplitude: 0.3f, seed: seed);
+        FillAligned(b, rank * inputDim, amplitude: 0.3f, seed: seed + 5000);
+        adapter.AddLayerWeights(layer, proj, new LoraLayerWeights(a, b, inputDim, outputDim));
+    }
+
+    private static unsafe void FillAligned(nint ptr, int count, float amplitude, int seed)
+    {
+        var span = new Span<float>((void*)ptr, count);
+        for (int i = 0; i < count; i++)
+        {
+            float phi = 0.61803398875f * (i + 1) + seed * 0.37f;
+            span[i] = amplitude * MathF.Cos(phi);
+        }
     }
 
     /// <summary>
@@ -504,6 +751,7 @@ public sealed class TransformerModelMlaForwardTests : IDisposable
         return new LogitStats(total, finite, (float)mean, (float)stddev, min, max);
     }
 
+    [StructLayout(LayoutKind.Sequential)]
     private readonly record struct LogitStats(
         int TotalCount, int FiniteCount, float Mean, float StdDev, float Min, float Max);
 }

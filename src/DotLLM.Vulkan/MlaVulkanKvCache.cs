@@ -170,6 +170,15 @@ public sealed class MlaVulkanKvCache : IKvCache, IDisposable
             throw new ArgumentOutOfRangeException(nameof(positions),
                 $"Position {maxPos} exceeds max cache length {_maxSeqLen}.");
 
+        // Hazard-scoped barriers (issue #144): declare each append copy's
+        // access set to the active tracker (no-op when untracked).
+        if (_device.ActiveHazards is { } hazards)
+        {
+            hazards.OnTransfer(kNopeDev.Handle, _kNopeBuffers[layerIndex].Handle);
+            hazards.OnTransfer(vDev.Handle, _vBuffers[layerIndex].Handle);
+            hazards.OnTransfer(kPeDev.Handle, _kPeBuffers[layerIndex].Handle);
+        }
+
         // K_nope copy
         var kRegion = new VkBufferCopy
         {

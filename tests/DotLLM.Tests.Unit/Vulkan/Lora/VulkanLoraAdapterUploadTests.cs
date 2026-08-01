@@ -90,6 +90,10 @@ public sealed class VulkanLoraAdapterUploadTests
         using var device = VulkanDevice.Create();
         using var cache = new VulkanLoraAdapterCache(device);
 
+        // Not disposed here by design: VulkanLoraAdapterCache owns disposal of
+        // every entry it caches (see VulkanLoraAdapterCache.Dispose), and
+        // `cache` is disposed above via `using`. Wrapping these borrowed
+        // references in `using` would double-dispose the same instance.
         var first = cache.GetOrAdd(adapter);
         var second = cache.GetOrAdd(adapter);
 

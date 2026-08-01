@@ -338,6 +338,42 @@ public class BpeTokenizerTests
             bosId: 0, eosId: 0, addBosSpace: false);
     }
 
+    /// <summary>
+    /// Long text whose characters fall back to bytes must not overflow the symbol buffer.
+    /// </summary>
+    /// <remarks>
+    /// <para>Regression for an <see cref="IndexOutOfRangeException"/> in
+    /// <c>SentencePieceEncoding.BuildInitialSymbols</c>. The symbol array was sized by CHARACTER
+    /// count, but byte fallback emits one symbol per UTF-8 BYTE — up to 3 per char — so any text
+    /// containing characters outside the vocab could write past the end.</para>
+    /// <para>The length is the load-bearing part of this test. <c>ArrayPool.Rent</c> hands back
+    /// power-of-two buckets, so most sizes come with slack that silently absorbs the overflow;
+    /// the bug only surfaces when the requested length sits just under a bucket boundary.
+    /// 65,536 is exactly such a size — and it is the chunk size the perplexity corpus reader uses,
+    /// which is how this shipped undetected. A shorter or rounder string does NOT reproduce it.</para>
+    /// </remarks>
+    [Theory]
+    [InlineData(65536)]   // exact ArrayPool bucket — zero slack, the pathological case
+    [InlineData(65500)]   // just under the bucket
+    [InlineData(32768)]
+    public void ByteFallback_LongText_DoesNotOverflowSymbolBuffer(int length)
+    {
+        var tok = BuildChatMlVocab();
+
+        // 'h' and 'i' are in the vocab; every other char must go through byte fallback. Mixing
+        // them means the symbol count exceeds the char count without being a trivial 3x.
+        var sb = new System.Text.StringBuilder(length);
+        for (int i = 0; i < length; i++)
+            sb.Append((i % 4) switch { 0 => 'h', 1 => 'i', 2 => 'z', _ => 'ä' });
+
+        int[] ids = tok.Encode(sb.ToString());
+
+        Assert.NotEmpty(ids);
+        // Fallback expands, so there must be at least as many ids as characters.
+        Assert.True(ids.Length >= length,
+            $"expected >= {length} ids from {length} chars with byte fallback, got {ids.Length}");
+    }
+
     [Fact]
     public void SpecialToken_EmittedAsSingleId_NotBpeEncoded()
     {
@@ -412,29 +448,50 @@ public class BpeTokenizerTests
     // -------------------------------------------------------------------------
 
     [Fact]
-    public void TiktokenPreTokenizer_ReturnsRegexForKnownTypes()
+    public void TiktokenPreTokenizer_ReturnsPipelineForKnownTypes()
     {
-        Assert.NotNull(TiktokenPreTokenizer.GetRegex("gpt2"));
-        Assert.NotNull(TiktokenPreTokenizer.GetRegex("default"));
-        Assert.NotNull(TiktokenPreTokenizer.GetRegex("llama3"));
-        Assert.NotNull(TiktokenPreTokenizer.GetRegex("llama-bpe"));
-        Assert.NotNull(TiktokenPreTokenizer.GetRegex("deepseek-llm"));
-        Assert.NotNull(TiktokenPreTokenizer.GetRegex("deepseek-coder"));
-        Assert.NotNull(TiktokenPreTokenizer.GetRegex("command-r"));
+        Assert.NotNull(TiktokenPreTokenizer.GetRegexes("gpt2"));
+        Assert.NotNull(TiktokenPreTokenizer.GetRegexes("default"));
+        Assert.NotNull(TiktokenPreTokenizer.GetRegexes("llama3"));
+        Assert.NotNull(TiktokenPreTokenizer.GetRegexes("llama-bpe"));
+        Assert.NotNull(TiktokenPreTokenizer.GetRegexes("deepseek-llm"));
+        Assert.NotNull(TiktokenPreTokenizer.GetRegexes("deepseek-coder"));
+        Assert.NotNull(TiktokenPreTokenizer.GetRegexes("command-r"));
+    }
+
+    [Theory]
+    [InlineData("starcoder")]
+    [InlineData("refact")]
+    [InlineData("command-r")]
+    [InlineData("smollm")]
+    [InlineData("codeshell")]
+    [InlineData("exaone")]
+    [InlineData("minerva")]
+    [InlineData("mellum2")]
+    public void StarCoderFamily_IsATwoStagePipeline(string preType)
+    {
+        // llama.cpp falls these eight pre-types through one case block whose regex_exprs has two
+        // entries: \p{N} to isolate every digit, then the main pattern. A single-expression
+        // mapping cannot represent it, and `smollm` being absent entirely is what made SmolLM
+        // silently run with no pre-tokenization at all (issue #237).
+        var pipeline = TiktokenPreTokenizer.GetRegexes(preType);
+        Assert.NotNull(pipeline);
+        Assert.Equal(2, pipeline!.Length);
+        Assert.Equal(@"\p{N}", pipeline[0].ToString());
     }
 
     [Fact]
     public void TiktokenPreTokenizer_ReturnsNullForUnknownType()
     {
-        Assert.Null(TiktokenPreTokenizer.GetRegex(null));
-        Assert.Null(TiktokenPreTokenizer.GetRegex(""));
-        Assert.Null(TiktokenPreTokenizer.GetRegex("unknown-model"));
+        Assert.Null(TiktokenPreTokenizer.GetRegexes(null));
+        Assert.Null(TiktokenPreTokenizer.GetRegexes(""));
+        Assert.Null(TiktokenPreTokenizer.GetRegexes("unknown-model"));
     }
 
     [Fact]
     public void Gpt2Regex_SplitsWordsAndSpaces()
     {
-        var regex = TiktokenPreTokenizer.GetRegex("gpt2")!;
+        var regex = TiktokenPreTokenizer.GetRegexes("gpt2")![0];
         var matches = regex.Matches("hello world");
         // "hello" and " world"
         Assert.Equal(2, matches.Count);
@@ -445,7 +502,7 @@ public class BpeTokenizerTests
     [Fact]
     public void Llama3Regex_SplitsContractions()
     {
-        var regex = TiktokenPreTokenizer.GetRegex("llama3")!;
+        var regex = TiktokenPreTokenizer.GetRegexes("llama3")![0];
         var matches = regex.Matches("I'm happy");
         // "I", "'m", " happy"
         Assert.True(matches.Count >= 3);
@@ -454,9 +511,121 @@ public class BpeTokenizerTests
     }
 
     [Fact]
+    public void PreTokenizationRegexes_MatchWhitespaceOnRawText()
+    {
+        // Guards the ordering bug behind #237: pre-tokenization must run on RAW text, before the
+        // GPT-2 byte-level mapping. That mapping sends 0x20 to U+0120, so a regex applied after it
+        // can never match \s, a leading ' ?', or \s+(?!\S) -- every whitespace-dependent
+        // alternative dies silently, and the tokenizer degrades into near-correct output.
+        // If this fails, the space is no longer reaching the pattern as a space.
+        var gpt2 = TiktokenPreTokenizer.GetRegexes("gpt2")![0];
+        Assert.Equal(" world", gpt2.Matches("hello world")[1].Value);
+
+        var starcoder = TiktokenPreTokenizer.GetRegexes("smollm")![1];
+        Assert.Equal(" world", starcoder.Matches("hello world")[1].Value);
+    }
+
+    [Theory]
+    [InlineData("'s", "s")]
+    [InlineData("'t", "t")]
+    [InlineData("'re", "re")]
+    [InlineData("'ve", "ve")]
+    [InlineData("'m", "m")]
+    [InlineData("'ll", "ll")]
+    [InlineData("'d", "d")]
+    public void Gpt2Regex_SpacedContraction_SplitsAsPunctuationRunThenLetters(
+        string contraction, string suffixAfterApostrophe)
+    {
+        // Issue #237: the contraction alternatives ('s|'t|'re|...) carry no leading ` ?`, unlike
+        // every other "content" alternative, so they only win when immediately preceded by a
+        // letter. A lone apostrophe after a space -- as in wikitext-2's spaced "Teddy 's Story"
+        // -- has no letter to attach to, so it must fall to the punctuation-run alternative
+        // instead (" '", then the remaining letters separately), matching llama.cpp / GPT-2 / HF.
+        // Mis-splitting this as [" ", "'s"] was issue #237's exact symptom.
+        var regex = TiktokenPreTokenizer.GetRegexes("gpt2")![0];
+        var matches = regex.Matches(" " + contraction);
+        Assert.Equal(2, matches.Count);
+        Assert.Equal(" '", matches[0].Value);
+        Assert.Equal(suffixAfterApostrophe, matches[1].Value);
+    }
+
+    [Theory]
+    [InlineData("'s")]
+    [InlineData("'t")]
+    [InlineData("'re")]
+    [InlineData("'ve")]
+    [InlineData("'m")]
+    [InlineData("'ll")]
+    [InlineData("'d")]
+    public void Gpt2Regex_AttachedContraction_SplitsAsLetterRunThenContraction(string contraction)
+    {
+        // Mirror case: immediately after a letter (no intervening space), the contraction
+        // alternative wins, e.g. "Teddy's" -> ["Teddy", "'s"].
+        var regex = TiktokenPreTokenizer.GetRegexes("gpt2")![0];
+        var matches = regex.Matches("Teddy" + contraction);
+        Assert.Equal(2, matches.Count);
+        Assert.Equal("Teddy", matches[0].Value);
+        Assert.Equal(contraction, matches[1].Value);
+    }
+
+    [Fact]
+    public void Gpt2Regex_ReproducesIssue237ExactRepro()
+    {
+        // The exact repro from issue #237: llama.cpp / GPT-2 / HF split "Teddy 's Story" as
+        // ["Teddy", " '", "s", " Story"]. dotLLM previously mis-split it as
+        // ["Teddy", " ", "'s", " Story"] -- 30/3904 tokens differed from llama.cpp on wikitext-2
+        // despite matching token *counts*, which is why a count-only check missed it.
+        var regex = TiktokenPreTokenizer.GetRegexes("gpt2")![0];
+        var matches = regex.Matches("Teddy 's Story");
+        Assert.Equal(4, matches.Count);
+        Assert.Equal("Teddy", matches[0].Value);
+        Assert.Equal(" '", matches[1].Value);
+        Assert.Equal("s", matches[2].Value);
+        Assert.Equal(" Story", matches[3].Value);
+    }
+
+    [Theory]
+    [InlineData("'s", "s")]
+    [InlineData("'t", "t")]
+    [InlineData("'re", "re")]
+    [InlineData("'ve", "ve")]
+    [InlineData("'m", "m")]
+    [InlineData("'ll", "ll")]
+    [InlineData("'d", "d")]
+    public void StarCoderRegex_SpacedContraction_SplitsAsPunctuationRunThenLetters(
+        string contraction, string suffixAfterApostrophe)
+    {
+        // Same property must hold for the StarCoder/SmolLM pipeline's second stage (index 1 --
+        // index 0 is the digit-isolation stage) since it shares the GPT-2 contraction group.
+        var regex = TiktokenPreTokenizer.GetRegexes("smollm")![1];
+        var matches = regex.Matches(" " + contraction);
+        Assert.Equal(2, matches.Count);
+        Assert.Equal(" '", matches[0].Value);
+        Assert.Equal(suffixAfterApostrophe, matches[1].Value);
+    }
+
+    [Fact]
+    public void Gpt2Regex_LetterAndDigitAlternatives_AreNotAffectedByTheOrderingQuirk()
+    {
+        // Issue #237 acceptance criterion: check whether the same ordering error affects the
+        // numeric and letter alternatives. It does not: unlike the contraction group, both
+        // ` ?\p{L}+` and ` ?\p{N}+` already carry their own leading optional space, so a space
+        // immediately before a letter or digit is claimed by that alternative directly -- there
+        // is no "space with nothing to attach to" case for them to lose the way contractions did.
+        var regex = TiktokenPreTokenizer.GetRegexes("gpt2")![0];
+        var letterMatches = regex.Matches(" a");
+        Assert.Single(letterMatches);
+        Assert.Equal(" a", letterMatches[0].Value);
+
+        var digitMatches = regex.Matches(" 5");
+        Assert.Single(digitMatches);
+        Assert.Equal(" 5", digitMatches[0].Value);
+    }
+
+    [Fact]
     public void Llama3Regex_GroupsDigitsInThrees()
     {
-        var regex = TiktokenPreTokenizer.GetRegex("llama3")!;
+        var regex = TiktokenPreTokenizer.GetRegexes("llama3")![0];
         var matches = regex.Matches("12345");
         // "123", "45"
         Assert.Equal(2, matches.Count);
@@ -589,5 +758,32 @@ public class BpeTokenizerTests
             tokens[i] = byteToUnicode[i].ToString();
 
         return (tokens, []);
+    }
+
+    // No allocation-threshold test here on purpose. The cost this change removes is the merge
+    // queue's GROWTH while merging, so it only exists for a vocabulary with a real merge table;
+    // the synthetic 256-byte vocab these tests use has none, and measures identically before and
+    // after (655,512 bytes either way). A threshold assertion built on it would pass regardless of
+    // whether the fix were present. TokenizerAllocationBenchmarks, which loads a real vocabulary,
+    // is where this is measured.
+
+    [Fact]
+    public void PreTokenizedEncode_IsUnchangedByQueueReuse()
+    {
+        // The merge queue is now reused across segments, so a segment's leftovers could in
+        // principle leak into the next. Encoding the same text as one call and as its pre-token
+        // pieces concatenated must agree, and repeat calls on one instance must be stable.
+        BpeTokenizer tokenizer = BuildMinimalTiktokenVocab("gpt2");
+        const string Text = "the quick brown fox, 12345 times over! and again: the quick brown fox";
+
+        int[] first = tokenizer.Encode(Text);
+        int[] second = tokenizer.Encode(Text);
+        Assert.Equal(first, second);
+
+        // A fresh instance has a fresh queue; a reused one must not differ from it.
+        Assert.Equal(BuildMinimalTiktokenVocab("gpt2").Encode(Text), second);
+
+        // Round-trip: whatever the segmentation, the text must come back intact.
+        Assert.Equal(Text, tokenizer.Decode(first));
     }
 }

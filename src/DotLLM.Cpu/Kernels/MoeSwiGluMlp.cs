@@ -56,7 +56,7 @@ namespace DotLLM.Cpu.Kernels;
 /// <c>[numExperts, hiddenSize]</c>.
 /// </para>
 /// </remarks>
-public static unsafe class MoeSwiGluMlp
+public static unsafe partial class MoeSwiGluMlp
 {
     /// <summary>
     /// Executes the MoE SwiGLU FFN for a batch of <paramref name="seqLen"/>
@@ -219,6 +219,11 @@ public static unsafe class MoeSwiGluMlp
     /// <param name="hiddenSize">Hidden / residual dimension (H).</param>
     /// <param name="seqLen">Number of tokens in this batch (T).</param>
     /// <param name="normTopKProb">When true, renormalise the selected top-k probabilities to sum to 1.0.</param>
+    /// <param name="gateBias">
+    /// Optional additive router bias [numExperts] applied to the gate logits before softmax/top-k
+    /// (identity-MoTE / Qwen3 aux-loss-free routing). Empty span ⇒ no bias. Shifts the top-k
+    /// selection; cannot be folded into <paramref name="gateWeights"/>.
+    /// </param>
     /// <returns>Number of unique experts actually used (the valid prefix length of <paramref name="uniqueExperts"/>).</returns>
     public static int Route(
         ReadOnlySpan<float> hidden,
@@ -231,11 +236,14 @@ public static unsafe class MoeSwiGluMlp
         Span<int> uniqueExperts,
         int numExperts, int numExpertsPerTok,
         int hiddenSize, int seqLen,
-        bool normTopKProb)
+        bool normTopKProb,
+        ReadOnlySpan<float> gateBias = default)
     {
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (numExpertsPerTok <= 0 || numExpertsPerTok > numExperts)
             throw new ArgumentOutOfRangeException(nameof(numExpertsPerTok));
+        if (!gateBias.IsEmpty && gateBias.Length < numExperts)
+            throw new ArgumentException("gateBias too small", nameof(gateBias));
 
         int totalAssignments = seqLen * numExpertsPerTok;
         if (assignExpert.Length < totalAssignments) throw new ArgumentException("assignExpert too small", nameof(assignExpert));
@@ -275,6 +283,17 @@ public static unsafe class MoeSwiGluMlp
             {
                 var logitsSpan = gateLogitsBuf.AsSpan(t * numExperts, numExperts);
                 var routingSpan = routingBuf.AsSpan(t * numExperts, numExperts);
+
+                // Additive router bias (identity-MoTE / Qwen3 aux-free routing). Applied to
+                // the logits before softmax/top-k so it shifts the top-k SELECTION. With
+                // top-1 + normTopKProb the selected gate weight is renormalised to 1.0, so
+                // the bias only moves the argmax — it cannot be folded into gateWeights.
+                if (!gateBias.IsEmpty)
+                {
+                    for (int e = 0; e < numExperts; e++)
+                        logitsSpan[e] += gateBias[e];
+                }
+
                 Softmax.Execute(logitsSpan, routingSpan);
 
                 SelectTopK(routingSpan, topkIdx, topkProb);

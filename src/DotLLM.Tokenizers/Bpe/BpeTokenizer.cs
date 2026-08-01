@@ -89,9 +89,29 @@ public sealed class BpeTokenizer : ITokenizer
         int bosId, int eosId, string? preTokenizerType = null)
     {
         var specialTokens = BuildSpecialTokenTable(tokens, tokenTypes);
-        var preRegex = TiktokenPreTokenizer.GetRegex(preTokenizerType);
+        var preRegexes = TiktokenPreTokenizer.GetRegexes(preTokenizerType);
         return new BpeTokenizer(
-            new Gpt2TiktokenEncoding(tokens, merges, tokenTypes, preRegex),
+            new Gpt2TiktokenEncoding(tokens, merges, tokenTypes, preRegexes),
+            specialTokens, bosId, eosId, tokens.Length);
+    }
+
+    /// <summary>
+    /// Creates a Gemma-4 SPM-style merge-ranked BPE tokenizer
+    /// (GGUF <c>tokenizer.ggml.model = "gemma4"</c>).
+    /// Spaces are escaped to <c>▁</c> before merge-ranked BPE runs over raw UTF-8 text;
+    /// pre-tokenization only splits newline runs (llama.cpp <c>LLAMA_VOCAB_PRE_TYPE_GEMMA4</c>).
+    /// </summary>
+    /// <param name="tokens">Vocabulary strings indexed by token ID.</param>
+    /// <param name="merges">Merge table entries in "A B" format; index = rank (lower = applied first).</param>
+    /// <param name="tokenTypes">Per-token type flags. Null = all normal.</param>
+    /// <param name="bosId">Beginning-of-sequence token ID.</param>
+    /// <param name="eosId">End-of-sequence token ID.</param>
+    public static BpeTokenizer CreateGemma4(
+        string[] tokens, string[] merges, int[]? tokenTypes, int bosId, int eosId)
+    {
+        var specialTokens = BuildSpecialTokenTable(tokens, tokenTypes);
+        return new BpeTokenizer(
+            new Gemma4SpmBpeEncoding(tokens, merges, tokenTypes),
             specialTokens, bosId, eosId, tokens.Length);
     }
 
@@ -116,8 +136,10 @@ public sealed class BpeTokenizer : ITokenizer
         int bosId, int eosId, System.Text.RegularExpressions.Regex? preRegex)
     {
         var specialTokens = BuildSpecialTokenTable(tokens, tokenTypes);
+        // A single expression is a one-stage pipeline. Pre-types whose reference definition has
+        // several stages (the StarCoder/SmolLM family) must go through CreateTiktoken instead.
         return new BpeTokenizer(
-            new Gpt2TiktokenEncoding(tokens, merges, tokenTypes, preRegex),
+            new Gpt2TiktokenEncoding(tokens, merges, tokenTypes, preRegex is null ? null : [preRegex]),
             specialTokens, bosId, eosId, tokens.Length);
     }
 
