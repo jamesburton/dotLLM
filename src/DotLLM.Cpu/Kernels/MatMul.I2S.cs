@@ -128,8 +128,27 @@ public static unsafe partial class MatMul
         public bool Tiled;  // issue #232: use the 4x4 register-blocked inner kernel
     }
 
-    /// <summary>True when a SIMD W2A8 (int8-activation) path is available.</summary>
-    private static bool I2SUseW2A8 => Avx2.IsSupported;
+    /// <summary>
+    /// True when the SIMD W2A8 (int8-activation) path is available and enabled. Gates every I2_S
+    /// GEMV/GEMM core, so it also governs the indexed-MoE path.
+    ///
+    /// <para>Overridable via <c>DOTLLM_I2S_W2A8=0</c> to force the float (W2A16) tier on hardware
+    /// that would otherwise take W2A8. This exists as an <b>experimental control</b>: it isolates
+    /// the activation-quantization variable without disturbing any other kernel. The blunt
+    /// alternative, <c>DOTNET_EnableAVX2=0</c>, also de-vectorizes RMSNorm, softmax, RoPE and every
+    /// TensorPrimitives reduction, so a result obtained that way cannot attribute a change to the
+    /// activation path (and runs an order of magnitude slower). Investigating issue #247.</para>
+    /// </summary>
+    private static readonly bool I2SUseW2A8Enabled = ResolveI2SUseW2A8();
+
+    private static bool I2SUseW2A8 => I2SUseW2A8Enabled;
+
+    private static bool ResolveI2SUseW2A8()
+    {
+        string? env = Environment.GetEnvironmentVariable("DOTLLM_I2S_W2A8");
+        if (env is "0" or "false" or "off") return false;
+        return Avx2.IsSupported;
+    }
 
     // ─────────────────────────── 4x4 register-blocked GEMM tile (issue #232) ───────────────────────────
 

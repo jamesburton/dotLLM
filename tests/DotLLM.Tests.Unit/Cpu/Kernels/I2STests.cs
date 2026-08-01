@@ -172,7 +172,9 @@ public sealed unsafe class I2STests
     /// <para>This test <b>discriminates</b>: swapping either call back to the other entry makes it
     /// fail. On a pre-AVX2 host both entries take the float tier and the difference vanishes
     /// legitimately — which is exactly why the defect was invisible on the T5500 — so the
-    /// divergence assertion is gated on <see cref="Avx2.IsSupported"/>.</para>
+    /// divergence assertion is gated on whether W2A8 is actually active, which is AVX2 support
+    /// <i>and</i> the <c>DOTLLM_I2S_W2A8</c> override (mirroring the kernel's own gate, so an
+    /// experimental run with the override set does not report a spurious failure).</para>
     /// </summary>
     [Fact]
     public void GemvI2S_DispatchingEntry_IsNotTheFloatTier_OnAvx2()
@@ -207,17 +209,21 @@ public sealed unsafe class I2STests
             // 5e-7·√k ≈ 2.5e-5). Anything above this is a different algorithm, not rounding.
             const float floatTierEnvelope = 1e-4f;
 
-            if (Avx2.IsSupported)
+            // Mirror MatMul's own gate: AVX2 support AND the DOTLLM_I2S_W2A8 override.
+            bool w2a8Active = Avx2.IsSupported
+                && Environment.GetEnvironmentVariable("DOTLLM_I2S_W2A8") is not ("0" or "false" or "off");
+
+            if (w2a8Active)
             {
                 Assert.True(maxDiff > floatTierEnvelope,
-                    $"expected the dispatching entry to take the W2A8 tier on AVX2 and diverge from " +
-                    $"the float tier by more than {floatTierEnvelope}, but max |Δ| was {maxDiff}. " +
+                    $"expected the dispatching entry to take the W2A8 tier and diverge from the float " +
+                    $"tier by more than {floatTierEnvelope}, but max |Δ| was {maxDiff}. " +
                     $"If the W2A8 gate moved, the GPU parity tests' reference choice needs revisiting.");
             }
             else
             {
                 Assert.True(maxDiff <= floatTierEnvelope,
-                    $"without AVX2 both entries take the float tier, so they should agree; max |Δ| {maxDiff}");
+                    $"with W2A8 inactive both entries take the float tier, so they should agree; max |Δ| {maxDiff}");
             }
         }
         finally { NativeMemory.Free(w); }
