@@ -29,8 +29,8 @@ public sealed class CudaAttentionF16PagedTests : IDisposable
 {
     private const int NumLayers = 1;
     private const int BlockSize = 4;
-    private const int TotalBlocks = 64;
-    private const int MaxSeqLen = 256;
+    private const int TotalBlocks = 80;
+    private const int MaxSeqLen = 320;
 
     private readonly CudaContext? _ctx;
     private readonly CudaStream? _stream;
