@@ -56,6 +56,19 @@ public sealed unsafe class MatMulVnniTests
         }
     }
 
+    /// <summary>
+    /// The 4-row zero-point kernel must agree with the single-row one it is derived from.
+    /// </summary>
+    /// <remarks>
+    /// Targets <c>VecDotQ8_0VnniZp_4Rows</c> — the kernel <see cref="MatMul.ComputeRowsVnni"/>
+    /// actually dispatches to, and the 256-bit sibling of <see cref="MatMul.VecDotQ8_0Vnni"/>.
+    /// It is deliberately <em>not</em> <c>VecDotQ8_0Vnni_4Rows</c>: despite the name, that is
+    /// upstream's unrelated sign-trick kernel, which accumulates in <c>Vector512</c> via
+    /// <c>Avx512F</c> and therefore additionally requires AVX-512F. Calling it from behind an
+    /// AVX-VNNI-only guard throws <c>PlatformNotSupportedException</c> on AVX-VNNI-without-AVX-512
+    /// hardware (Meteor Lake, Alder/Raptor Lake); <c>MatMulTests</c> covers that kernel behind the
+    /// correct <c>Avx512BW &amp;&amp; AvxVnni</c> guard.
+    /// </remarks>
     [Theory]
     [InlineData(1)]
     [InlineData(7)]
@@ -85,7 +98,7 @@ public sealed unsafe class MatMulVnniTests
             float r3 = MatMul.VecDotQ8_0Vnni((byte*)w3, (byte*)x, blockCount);
 
             float* results = stackalloc float[4];
-            MatMul.VecDotQ8_0Vnni_4Rows((byte*)w0, (byte*)w1, (byte*)w2, (byte*)w3,
+            MatMul.VecDotQ8_0VnniZp_4Rows((byte*)w0, (byte*)w1, (byte*)w2, (byte*)w3,
                 (byte*)x, blockCount, results);
 
             Assert.Equal(r0, results[0], MathF.Abs(r0) * 1e-5f + 1e-4f);
@@ -149,6 +162,60 @@ public sealed unsafe class MatMulVnniTests
         {
             NativeMemory.AlignedFree((void*)weights);
             NativeMemory.AlignedFree((void*)xQ8);
+        }
+    }
+
+    /// <summary>
+    /// Pins the ISA contract of the dispatched VNNI row loop: everything
+    /// <see cref="MatMul.ComputeRowsVnni"/> reaches must be executable on
+    /// AVX-VNNI-<em>only</em> hardware, and must agree per row with the single-row kernel.
+    /// </summary>
+    /// <remarks>
+    /// This is the guard that the original defect slipped past. <c>ComputeRowsVnni</c> is entered
+    /// from <c>ComputeRows</c> under <c>IsQ8_0VnniSupported</c> (<c>AvxVnni.IsSupported</c>) alone,
+    /// so any kernel it calls that also needs AVX-512F throws
+    /// <c>PlatformNotSupportedException</c> on Meteor/Alder/Raptor Lake — a live crash, not a
+    /// tolerance miss. Row counts straddle the 4-row group boundary so both the grouped kernel and
+    /// the single-row tail are executed: 4 and 8 are whole groups, 1/2/3 are tail-only, 7 and 18
+    /// mix both.
+    /// </remarks>
+    [Theory]
+    [InlineData(1, 7)]
+    [InlineData(2, 18)]
+    [InlineData(3, 1)]
+    [InlineData(4, 18)]
+    [InlineData(7, 7)]
+    [InlineData(8, 128)]
+    [InlineData(18, 18)]
+    public void ComputeRowsVnni_RunsOnVnniOnlyHardware_AndMatchesSingleRow(int m, int blockCount)
+    {
+        if (!MatMul.IsQ8_0VnniSupported) return;
+
+        var rng = new Random(2026);
+        int rowBytes = blockCount * Q8_0BlockBytes;
+        nint weights = (nint)NativeMemory.AlignedAlloc((nuint)((long)m * rowBytes), 64);
+        nint x = (nint)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+        float[] rows = new float[m];
+        try
+        {
+            for (int row = 0; row < m; row++)
+                FillRandomQ8_0Blocks((byte*)weights + (long)row * rowBytes, blockCount, rng);
+            FillRandomQ8_0Blocks((byte*)x, blockCount, rng);
+
+            fixed (float* outPtr = rows)
+                MatMul.ComputeRowsVnni((byte*)weights, (byte*)x, outPtr, m, blockCount);
+
+            for (int row = 0; row < m; row++)
+            {
+                float single = MatMul.VecDotQ8_0Vnni(
+                    (byte*)weights + (long)row * rowBytes, (byte*)x, blockCount);
+                Assert.Equal(single, rows[row], MathF.Abs(single) * 1e-5f + 1e-4f);
+            }
+        }
+        finally
+        {
+            NativeMemory.AlignedFree((void*)weights);
+            NativeMemory.AlignedFree((void*)x);
         }
     }
 

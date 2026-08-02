@@ -960,6 +960,19 @@ public static unsafe partial class MatMul
     /// (<c>vpmaddubsw</c> + <c>vpmaddwd</c>) is replaced by a single <c>vpdpbusd</c>.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// <b>Requires AVX-512F in addition to AVX-VNNI.</b> Despite the name, the block-pair
+    /// accumulator is a <see cref="Vector512{T}"/> fed by <c>Avx512F.ConvertToVector512Single</c>
+    /// and <c>Avx512F.FusedMultiplyAdd</c> (see <c>ProcessVnniDualBlock</c>), so an
+    /// <c>AvxVnni.IsSupported</c>-only guard is <em>not</em> sufficient: on AVX-VNNI-without-AVX-512
+    /// hardware (Meteor Lake, Alder/Raptor Lake) this throws
+    /// <c>PlatformNotSupportedException</c> as soon as <paramref name="blockCount"/> reaches 2 —
+    /// at <c>blockCount == 1</c> the paired loop never runs and the fault is not reached, which is
+    /// exactly what made a mis-guarded call site look like a partial failure. Guard on
+    /// <c>Avx512BW.IsSupported &amp;&amp; AvxVnni.IsSupported</c>. For the AVX-VNNI-only 4-row path
+    /// use <see cref="VecDotQ8_0VnniZp_4Rows"/>, which is what <see cref="ComputeRowsVnni"/>
+    /// dispatches to.
+    /// </para>
     /// Both forms group 4 consecutive byte products into one int32 lane, so results match
     /// bit-for-bit over the Q8_0 value range: the i16 intermediate in the non-VNNI path
     /// saturates only above 32767, and |x|,|w| &lt;= 127 bounds each lane at 2*127*127 = 32258.
