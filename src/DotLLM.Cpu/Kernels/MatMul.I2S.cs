@@ -128,8 +128,27 @@ public static unsafe partial class MatMul
         public bool Tiled;  // issue #232: use the 4x4 register-blocked inner kernel
     }
 
-    /// <summary>True when a SIMD W2A8 (int8-activation) path is available.</summary>
-    private static bool I2SUseW2A8 => Avx2.IsSupported;
+    /// <summary>
+    /// True when the SIMD W2A8 (int8-activation) path is available and enabled. Gates every I2_S
+    /// GEMV/GEMM core, so it also governs the indexed-MoE path.
+    ///
+    /// <para>Overridable via <c>DOTLLM_I2S_W2A8=0</c> to force the float (W2A16) tier on hardware
+    /// that would otherwise take W2A8. This exists as an <b>experimental control</b>: it isolates
+    /// the activation-quantization variable without disturbing any other kernel. The blunt
+    /// alternative, <c>DOTNET_EnableAVX2=0</c>, also de-vectorizes RMSNorm, softmax, RoPE and every
+    /// TensorPrimitives reduction, so a result obtained that way cannot attribute a change to the
+    /// activation path (and runs an order of magnitude slower). Investigating issue #247.</para>
+    /// </summary>
+    private static readonly bool I2SUseW2A8Enabled = ResolveI2SUseW2A8();
+
+    private static bool I2SUseW2A8 => I2SUseW2A8Enabled;
+
+    private static bool ResolveI2SUseW2A8()
+    {
+        string? env = Environment.GetEnvironmentVariable("DOTLLM_I2S_W2A8");
+        if (env is "0" or "false" or "off") return false;
+        return Avx2.IsSupported;
+    }
 
     // ─────────────────────────── 4x4 register-blocked GEMM tile (issue #232) ───────────────────────────
 
@@ -205,6 +224,32 @@ public static unsafe partial class MatMul
             return;
         }
         GemvI2_SCore(weights, x, result, m, k, scale, threadPool);
+    }
+
+    /// <summary>
+    /// Benchmark/test-only entry point that always takes the float reference tier (unpack row to
+    /// f32 + <see cref="TensorPrimitives.Dot"/>), bypassing the <see cref="I2SUseW2A8"/> SIMD
+    /// dispatch that <see cref="GemvI2_S(byte*, float*, float*, int, int, ComputeThreadPool?)"/>
+    /// otherwise always takes on AVX2 hardware. The per-tensor scale is read from the weight-tensor
+    /// tail, exactly as the dispatching entry does.
+    ///
+    /// <para>Exists because the GPU I2_S GEMV kernels are <b>F32-in</b>: comparing them against the
+    /// dispatching CPU entry compares float32-activation GPU against int8-activation CPU — an
+    /// algorithm mismatch, not a reduction-order difference, and the activation-quant error swamps
+    /// the fp32 divergence being asserted on. Mirrors <c>GemvPQ2_0Scalar</c>.</para>
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void GemvI2_SScalar(byte* weights, float* x, float* result, int m, int k)
+    {
+        float scale = Unsafe.ReadUnaligned<float>(weights + (long)m * k / 4);
+
+        if (k % I2SBlockSize != 0)
+        {
+            GemvI2_SRaggedRows(weights, x, result, 0, m, k, scale);
+            return;
+        }
+
+        GemvI2_SRows(weights, x, result, 0, m, k, scale);
     }
 
     [SkipLocalsInit]
@@ -318,6 +363,45 @@ public static unsafe partial class MatMul
         }
 
         GemmI2_SCore(weights, b, c, m, k, n, scale, threadPool);
+    }
+
+    /// <summary>
+    /// Benchmark/test-only twin of the scale-explicit
+    /// <see cref="GemmI2_S(byte*, float*, float*, int, int, int, float, ComputeThreadPool?)"/> that
+    /// always takes the float (W2A16) tier, bypassing the <see cref="I2SUseW2A8"/> dispatch.
+    /// Mirrors <see cref="GemvI2_SScalar"/> and <c>GemmPQ2_0Scalar</c>.
+    ///
+    /// <para>Exists so a GPU parity oracle can be F32 end-to-end (issue #229): the GPU I2_S kernels
+    /// are F32-in, so an oracle that routes through the dispatching entry measures per-token
+    /// activation-quantization error rather than the kernel divergence under test.</para>
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void GemmI2_SScalar(byte* weights, float* b, float* c, int m, int k, int n,
+                                        float scale, ComputeThreadPool? threadPool)
+    {
+        if (n == 1)
+        {
+            // GEMV shapes: go straight to the float rows (the ragged twin is already float-only).
+            if (k % I2SBlockSize != 0) GemvI2_SRaggedRows(weights, b, c, 0, m, k, scale);
+            else GemvI2_SRows(weights, b, c, 0, m, k, scale);
+            return;
+        }
+
+        if (k % I2SBlockSize != 0)
+        {
+            // The ragged core has no W2A8 tier, so it is already the float path.
+            GemmI2_SRaggedCore(weights, b, c, m, k, n, scale, threadPool);
+            return;
+        }
+
+        if (threadPool is null || m < ParallelMinRows)
+        {
+            GemmI2_SRows(weights, b, c, m, 0, m, k, n, scale);
+            return;
+        }
+
+        var ctx = new GemmI2SCtx { Weights = weights, B = b, C = c, M = m, K = k, N = n, Scale = scale };
+        threadPool.Dispatch((nint)(&ctx), &GemmI2_SWorker);
     }
 
     [SkipLocalsInit]
@@ -1120,6 +1204,13 @@ public static unsafe partial class MatMul
     /// <param name="n">Number of input rows (token·slot assignments).</param>
     /// <param name="rowExpertIds">Length-<paramref name="n"/> expert id assigned to each input row.</param>
     /// <param name="threadPool">Optional thread pool — forwarded to the per-expert GEMM.</param>
+    /// <param name="useFloatTier">
+    /// Test/benchmark control. When <see langword="true"/>, the per-expert GEMM takes the float
+    /// (W2A16) tier via <see cref="GemmI2_SScalar"/> instead of the <see cref="I2SUseW2A8"/>
+    /// dispatch. Default <see langword="false"/> keeps production behaviour byte-identical.
+    /// Exists so a GPU parity oracle can be F32 end-to-end — the GPU MoE kernels are F32-in, so an
+    /// oracle on the W2A8 tier compares two different algorithms (issue #229).
+    /// </param>
     /// <remarks>
     /// <paramref name="k"/> need not be a multiple of 128 (issue #206) — the per-expert batched
     /// GEMM below (<see cref="GemmI2_S(byte*, float*, float*, int, int, int, float, ComputeThreadPool?)"/>)
@@ -1129,7 +1220,8 @@ public static unsafe partial class MatMul
     public static void MoeIndexedMatmulI2_S(
         byte* expertWeights, long expertRowBytes, ReadOnlySpan<float> expertScales,
         float* b, float* c, int m, int k, int n,
-        ReadOnlySpan<int> rowExpertIds, ComputeThreadPool? threadPool)
+        ReadOnlySpan<int> rowExpertIds, ComputeThreadPool? threadPool,
+        bool useFloatTier = false)
     {
         if (rowExpertIds.Length < n)
             throw new ArgumentException("rowExpertIds too small", nameof(rowExpertIds));
@@ -1214,7 +1306,10 @@ public static unsafe partial class MatMul
 
                     // One batched ternary GEMM with this expert's bank + α.
                     byte* bank = expertWeights + (nint)(e * expertRowBytes);
-                    GemmI2_S(bank, batchInPtr, batchOutPtr, m, k, batch, expertScales[e], threadPool);
+                    if (useFloatTier)
+                        GemmI2_SScalar(bank, batchInPtr, batchOutPtr, m, k, batch, expertScales[e], threadPool);
+                    else
+                        GemmI2_S(bank, batchInPtr, batchOutPtr, m, k, batch, expertScales[e], threadPool);
 
                     // Scatter output rows back to original positions [n × m].
                     for (int bi = 0; bi < batch; bi++)

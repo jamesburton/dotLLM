@@ -8,9 +8,19 @@ using Xunit.Abstractions;
 namespace DotLLM.Tests.Unit.Cuda;
 
 /// <summary>
-/// Validates the CUDA I2_S (BitNet ternary) GEMV against the CPU float reference (MatMul.GemvI2_S).
-/// Variant A (W2A16, here the FP32-in twin) is an exact analog of the CPU path, so it must match to
-/// fp32 reduction-order error. Uses synthetic packed tensors at real BitNet 2B4T dims — no model file.
+/// Validates the CUDA I2_S (BitNet ternary) GEMV against the CPU float reference
+/// (<c>MatMul.GemvI2_SScalar</c>). Variant A (W2A16, here the FP32-in twin) is an exact analog of
+/// that CPU path, so it must match to fp32 reduction-order error. Uses synthetic packed tensors at
+/// real BitNet 2B4T dims — no model file.
+///
+/// <para><b>Reference tier matters (issue #229).</b> The comparison MUST use
+/// <c>MatMul.GemvI2_SScalar</c>, not the dispatching <c>MatMul.GemvI2_S</c>. The latter takes the
+/// <b>W2A8 int8-activation</b> tier on any AVX2 host (<c>MatMul.I2S.cs</c>: <c>I2SUseW2A8</c> gates
+/// <c>GemvI2_SCore</c>), while the kernels under test are <b>F32-in</b>. Comparing them measures
+/// per-token activation-quantization error — a different algorithm — not the fp32 divergence the
+/// assertions are about, and it silently changes with the host's ISA (a pre-AVX2 box takes the float
+/// tier and sees none of it). The W2A8 kernel has its own dedicated int8-reference test
+/// (<see cref="RunA8"/>).</para>
 /// </summary>
 [Trait("Category", "GPU")]
 [Collection(CudaCollection.Name)]
@@ -79,11 +89,13 @@ public class CudaI2SGemvTest
         float[] x = new float[k];
         for (int i = 0; i < k; i++) x[i] = (float)(rng.NextDouble() * 2 - 1) * 0.5f;
 
-        // CPU reference.
+        // CPU reference — the FLOAT tier explicitly (see the class remarks). MatMul.GemvI2_S is the
+        // *dispatching* entry and takes the W2A8 int8-activation path on any AVX2 host, which is a
+        // different algorithm from the F32-in kernel under test.
         float[] cpu = new float[n];
         fixed (byte* w = packed)
         fixed (float* px = x, py = cpu)
-            MatMul.GemvI2_S(w, px, py, n, k, null);
+            MatMul.GemvI2_SScalar(w, px, py, n, k);
 
         // GPU.
         float[] gpu;
@@ -130,25 +142,28 @@ public class CudaI2SGemvTest
         float meanDiff = sumDiff / n;
         _out.WriteLine($"I2_S GEMV {n}×{k}: max abs diff={maxDiff:E4}, mean={meanDiff:E4}");
 
-        // Tolerance scales with sqrt(k), because BOTH sides accumulate in float32 in DIFFERENT
-        // orders and the error that produces is proportional to the result magnitude, which itself
-        // grows as sqrt(k) for a k-term dot product of zero-mean values. A fixed absolute bound
-        // therefore cannot hold across k: it silently tightens as k grows.
+        // Tolerance scales with sqrt(k): both sides accumulate in float32 in DIFFERENT orders, and
+        // that error is proportional to the result magnitude, which itself grows as sqrt(k) for a
+        // k-term dot product of zero-mean values. A fixed absolute bound cannot hold across k — it
+        // silently tightens as k grows (the original 1e-3 was set when k <= 6912 and was not
+        // revisited when #207/#211 added the 9216 and 13312 shapes).
         //
-        // This is not GPU-vs-CPU imprecision in the usual sense. The reference is MatMul.GemvI2_S,
-        // the production SIMD kernel, so its summation order depends on the host's vector width —
-        // the same test can pass on one machine and fail on another purely from AVX2-vs-AVX-512
-        // lane counts, against an unchanged GPU. The old fixed 1e-3 was set when k <= 6912 and was
-        // not revisited when #207/#211 added the 9216 and 13312 shapes.
+        // Issue #229: this bound was previously 4e-4·√k, which was ~13000x looser than the true
+        // fp32 divergence. That slack existed because the reference was the *dispatching*
+        // MatMul.GemvI2_S, i.e. the W2A8 int8-activation kernel on this AVX2 host — so the test was
+        // measuring per-token activation-quantization error, not reduction order. Against the float
+        // tier (GemvI2_SScalar) the measured max|diff|/√k across the four shapes is 9.1e-9 .. 3.0e-8;
+        // the ragged twin lands in the same band (4.2e-9 .. 1.4e-8). 5e-7 leaves ~17x headroom.
         //
-        // Measured max|diff| / sqrt(k) across the four shapes is 7.6e-5 .. 1.5e-4, so 4e-4 leaves
-        // ~2.7x headroom on the worst case. That still discriminates hard: a real defect (bad block
-        // indexing, shared-memory overflow — the #207 bug) perturbs results by O(|y|), which is
-        // thousands of times above this bound, not a few times.
-        float maxTol = 4e-4f * MathF.Sqrt(k);
-        float meanTol = 1e-4f * MathF.Sqrt(k);
-        Assert.True(maxDiff <= maxTol, $"max abs diff {maxDiff} exceeds {maxTol} (4e-4·√k, k={k})");
-        Assert.True(meanDiff <= meanTol, $"mean abs diff {meanDiff} exceeds {meanTol} (1e-4·√k, k={k})");
+        // Residual host-dependence: GemvI2_SRows reduces via TensorPrimitives.Dot, whose accumulator
+        // count still follows the host vector width. That now perturbs results at the 1e-8 level
+        // rather than 1e-4, which the headroom above absorbs. A real defect (bad block indexing,
+        // shared-memory overflow — the #207 bug) perturbs by O(|y|) ~ 1, five orders of magnitude
+        // above this bound.
+        float maxTol = 5e-7f * MathF.Sqrt(k);
+        float meanTol = 1e-7f * MathF.Sqrt(k);
+        Assert.True(maxDiff <= maxTol, $"max abs diff {maxDiff} exceeds {maxTol} (5e-7·√k, k={k})");
+        Assert.True(meanDiff <= meanTol, $"mean abs diff {meanDiff} exceeds {meanTol} (1e-7·√k, k={k})");
     }
 
     /// <summary>
@@ -175,11 +190,12 @@ public class CudaI2SGemvTest
         for (int i = 0; i < k; i++) x[i] = (Half)xf[i];
 
         // CPU reference (full float precision — the FP16 GPU result is compared against this
-        // with a widened tolerance for the F16 input/output rounding).
+        // with a widened tolerance for the F16 input/output rounding). GemvI2_SScalar, not the
+        // dispatching GemvI2_S, so the reference really is float-activation (see class remarks).
         float[] cpu = new float[n];
         fixed (byte* w = packed)
         fixed (float* px = xf, py = cpu)
-            MatMul.GemvI2_S(w, px, py, n, k, null);
+            MatMul.GemvI2_SScalar(w, px, py, n, k);
 
         Half[] gpu;
         {
@@ -438,9 +454,11 @@ public class CudaI2SGemvTest
     /// integer-math precision (the only float work is the final scale·invActScale multiply + the fp32
     /// reduction, hence ≤ 1e-4, not bit-exact).
     ///
-    /// NOTE: the dp4a result vs the *float* CPU reference (MatMul.GemvI2_S over full-precision x) will
-    /// differ — that gap is the expected per-token activation-quant error, NOT a kernel bug. We therefore
-    /// assert against the int8 reference here, exactly as the spec (§2a, §7 row B0) prescribes.
+    /// NOTE: the dp4a result vs the *float* CPU reference (MatMul.GemvI2_SScalar over full-precision x)
+    /// will differ — that gap is the expected per-token activation-quant error, NOT a kernel bug. We
+    /// therefore assert against the int8 reference here, exactly as the spec (§2a, §7 row B0) prescribes.
+    /// (The dispatching <c>MatMul.GemvI2_S</c> is not the float reference on an AVX2 host: it takes the
+    /// W2A8 tier itself. Issue #229.)
     /// </summary>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private unsafe void RunA8(int n, int k)
@@ -569,11 +587,14 @@ public class CudaI2SGemvTest
         float[] x = new float[k];
         for (int i = 0; i < k; i++) x[i] = (float)(rng.NextDouble() * 2 - 1) * 0.5f;
 
-        // CPU reference (now ragged-safe — MatMul.GemvI2_S dispatches to the ragged path itself).
+        // CPU reference (GemvI2_SScalar is ragged-safe — it dispatches to the ragged float rows
+        // itself). The ragged CPU path has no W2A8 tier, so this is the same arithmetic the
+        // dispatching entry would have produced; the explicit shim keeps that true by construction
+        // rather than by coincidence.
         float[] cpu = new float[n];
         fixed (byte* w = packed)
         fixed (float* px = x, py = cpu)
-            MatMul.GemvI2_S(w, px, py, n, k, null);
+            MatMul.GemvI2_SScalar(w, px, py, n, k);
 
         // GPU (ragged kernel).
         float[] gpu;
@@ -620,13 +641,14 @@ public class CudaI2SGemvTest
         float meanDiff = sumDiff / n;
         _out.WriteLine($"I2_S GEMV ragged {n}×{k}: max abs diff={maxDiff:E4}, mean={meanDiff:E4}");
 
-        // Same sqrt(k) scaling as Run() — see the rationale there. The ragged shapes are small
-        // enough that the old fixed bound still held, but the tolerance must track k for the same
-        // reason, otherwise adding a larger ragged case later silently re-introduces the failure.
-        float maxTol = 4e-4f * MathF.Sqrt(k);
-        float meanTol = 1e-4f * MathF.Sqrt(k);
-        Assert.True(maxDiff <= maxTol, $"max abs diff {maxDiff} exceeds {maxTol} (4e-4·√k, k={k})");
-        Assert.True(meanDiff <= meanTol, $"mean abs diff {meanDiff} exceeds {meanTol} (1e-4·√k, k={k})");
+        // Same sqrt(k) scaling and same constants as Run() — see the rationale there. The ragged
+        // shapes are small enough that the old fixed bound still held, but the tolerance must track
+        // k for the same reason, otherwise adding a larger ragged case later silently re-introduces
+        // the failure. Measured max|diff|/√k here: 4.2e-9 (16x200) .. 1.4e-8 (32x5460).
+        float maxTol = 5e-7f * MathF.Sqrt(k);
+        float meanTol = 1e-7f * MathF.Sqrt(k);
+        Assert.True(maxDiff <= maxTol, $"max abs diff {maxDiff} exceeds {maxTol} (5e-7·√k, k={k})");
+        Assert.True(meanDiff <= meanTol, $"mean abs diff {meanDiff} exceeds {meanTol} (1e-7·√k, k={k})");
     }
 
     [SkippableTheory]

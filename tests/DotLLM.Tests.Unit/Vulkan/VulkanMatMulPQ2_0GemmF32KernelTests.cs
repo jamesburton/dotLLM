@@ -203,10 +203,16 @@ public class VulkanMatMulPQ2_0GemmF32KernelTests
     }
 
     /// <summary>
-    /// Full-GEMM parity against the CPU reference <c>MatMul.GemmPQ2_0</c> on real Bonsai-27B
+    /// Full-GEMM parity against the CPU reference <c>MatMul.GemmPQ2_0Scalar</c> on real Bonsai-27B
     /// packed weights with a random activation batch. Complements the bit-exactness gate: that
     /// one pins the decode, this one pins the tiling and accumulation over a real weight
     /// distribution (real per-group fp16 scales, real ternary sparsity) at fp32 rounding scale.
+    ///
+    /// <para><b>Reference tier matters (issue #229).</b> Uses <c>GemmPQ2_0Scalar</c>, the float
+    /// tier, NOT the dispatching <c>MatMul.GemmPQ2_0</c> — that one takes the W2A8 int8-activation
+    /// path on any AVX2 host, while this Vulkan kernel is F32-in. Comparing them would measure
+    /// per-token activation-quantization error rather than fp32 rounding, and would silently change
+    /// with the host's ISA. Same defect as the CUDA parity tests fixed under #229.</para>
     /// </summary>
     [SkippableFact]
     public unsafe void RealBonsaiTensor_MatchesCpuGemmReference()
@@ -227,7 +233,7 @@ public class VulkanMatMulPQ2_0GemmF32KernelTests
         fixed (byte* wPtr = weights)
         fixed (float* bPtr = inputB)
         fixed (float* cPtr = expected)
-            MatMul.GemmPQ2_0(wPtr, bPtr, cPtr, m, k, n, threadPool: null);
+            MatMul.GemmPQ2_0Scalar(wPtr, bPtr, cPtr, m, k, n);
 
         foreach (var (variant, actual) in RunAllVariants(spvDir, weights, inputB, m, k, n))
         {
