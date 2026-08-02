@@ -811,6 +811,13 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
     other prerequisite named in `docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md` (a CUDA multi-sequence
     batched-decode call shape, i.e. `CudaTransformerModel.ForwardBatch`) is not, so #200 stays
     blocked on that one alone now.
+    **Update (issue #251, landed):** that remaining prerequisite now exists too —
+    `CudaTransformerModel.ForwardBatch` is a per-sequence-loop dispatch (not a fused multi-sequence
+    kernel launch; see `docs/SCHEDULING.md`'s `ForwardBatch` status table for the full design
+    reasoning), reusing the same eager per-layer body that already handles `CudaPagedKvCache`. #200
+    is now unblocked at the call-shape level: a future direct block-table-read kernel targets the
+    single-sequence-per-launch grid (`docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md` §6's proposed
+    signature already assumed this), not the fused batch-dimensioned variant.
   - **#219: found and fixed a real kv_split grid-sizing bug in #197/#198's own heuristic.**
     `ComputeAttentionKvSplit`'s `AttnSplitMinKvPerSplit` term (default 128) was the binding clamp
     at Bonsai's actual decode depth (seqKv~258-270), forcing `kv_split=3` (grid=12 — *half* the

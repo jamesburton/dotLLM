@@ -27,6 +27,28 @@ idea with a missing engine-side producer), same conclusion structure.
 > re-derive the block-table shape; it only needs to decide the launch granularity itself and, if
 > batched, write the small concatenation step.
 
+> **Update (issue #251, landed):** Prerequisite chain item 1 below (§5) — `CudaTransformerModel.ForwardBatch`
+> — is done. The launch-granularity question this note raised in §4 point 1 is resolved as
+> **per-sequence-loop, NOT a fused single-launch-across-the-batch kernel** — the "safer, pragmatic
+> first step" the issue itself invited, chosen because it is mechanically verifiable by inspection
+> (same kernels, same order, same shared scratch — only the host-side synchronization points move)
+> without needing GPU access to validate a riskier concurrent-scratch or batch-dimension kernel
+> rewrite. Concretely: every request in a `ForwardBatch` call still runs the identical per-layer
+> kernel sequence a standalone `Forward` call would run for it, sequentially reusing the model's one
+> scratch buffer and one CUDA stream; what's eliminated is the interface-default fallback's N
+> blocking `cuStreamSynchronize` + synchronous-D2H round trips (one per sequence, GPU idle during
+> each host-side dispatch gap) in favor of enqueuing every sequence's kernels back-to-back and
+> synchronizing once, using a pinned host-buffer pool (`cuMemHostAlloc`) so the per-request D2H
+> copy is genuinely asynchronous. **This confirms and locks in this note's own §4 point 1
+> answer for a future #200 implementer**: since #251 chose per-sequence-loop, a future direct
+> block-table-read kernel only needs the trivial single-sequence-per-launch extension of the
+> existing grid (`docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md` §6's proposed signature already assumed
+> this branch) — the fused multi-sequence-launch branch (batch-dimensioned block table, different
+> KV-split partition/reduce strategy) remains a separate, undecided, larger design surface that
+> would only become relevant if a future issue revisits #251's decision. See
+> `docs/SCHEDULING.md`'s `ForwardBatch` status table and `CudaTransformerModel.cs`'s
+> `ForwardInternal`/`ForwardBatch` doc comments for the full implementation reasoning.
+
 ## TL;DR
 
 Re-verified as of 2026-08-01: **the prerequisite chain #200's own comments identified on

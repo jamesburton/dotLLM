@@ -324,6 +324,12 @@ public sealed unsafe class CudaTransformerModel : IModel
     private nint _gemma4ActScratchF32;
     private int _gemma4ActScratchElems;
 
+    // #251: grow-only pool of pinned ("page-locked") host buffers for ForwardBatch's
+    // per-request async D2H logits copy, one per batch lane, each sized for vocabSize
+    // floats. See EnsureBatchPinnedHostBuffers / ForwardInternal's deferredHostDest param.
+    private nint[]? _batchPinnedHostBuffers;
+    private int _batchPinnedHostVocabSize;
+
     // ── per-category profiling state (only allocated when ProfilingEnabled is set) ──
     internal const int ProfileCategoryCount = 12;
     private nint[]? _profEvents;        // event pool, allocated lazily
@@ -780,6 +786,41 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache)
+        => ForwardInternal(tokenIds, positions, deviceId, kvCache,
+            suppressGraphCapture: false, deferredHostDest: 0)!;
+
+    /// <summary>
+    /// Core forward body shared by the single-sequence <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
+    /// entrypoint and <see cref="ForwardBatch"/> (issue #251).
+    /// </summary>
+    /// <param name="tokenIds">Input token IDs for this step.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    /// <param name="kvCache">Optional KV-cache. When null, behaves identically to the uncached forward pass.</param>
+    /// <param name="suppressGraphCapture">
+    /// When <see langword="true"/>, always takes the eager per-layer body even when
+    /// <see cref="UseGraphCapture"/> would otherwise engage. <see cref="ForwardBatch"/> sets this
+    /// because CUDA-graph <em>capture</em> (first decode step for a given KV-cache) puts the whole
+    /// stream into a capturing state — any other sequence's kernels enqueued on the same stream
+    /// while a different sequence's graph is being recorded would be silently swept into that
+    /// graph. Graph <em>replay</em> (`cuGraphLaunch`, all subsequent steps) is ordinary
+    /// stream-ordered work and would be safe to interleave, but the capture path only knows "first
+    /// time this KV-cache is seen", so the simplest correct rule is to disable capture for the
+    /// whole batched call rather than special-case the first-vs-later step per request.
+    /// </param>
+    /// <param name="deferredHostDest">
+    /// 0 (default): unchanged behaviour — synchronize the stream, allocate a fresh
+    /// <see cref="UnmanagedTensor"/>, D2H-copy the logits into it, and return it.
+    /// Non-zero: a pinned host pointer (<see cref="CudaDriverApi.cuMemHostAlloc"/>) sized for
+    /// <c>vocabSize</c> floats. The logits are D2H-copied there via
+    /// <see cref="CudaDriverApi.cuMemcpyDtoHAsync_v2"/> on this model's stream (genuinely
+    /// non-blocking because the destination is pinned) and the method returns
+    /// <see langword="null"/> without synchronizing — the caller (<see cref="ForwardBatch"/>)
+    /// is responsible for synchronizing once after every sequence in the batch has been
+    /// dispatched, then copying each pinned buffer into its own result tensor.
+    /// </param>
+    private ITensor? ForwardInternal(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, bool suppressGraphCapture, nint deferredHostDest)
     {
         bool isMla = _weights.MlaLayers is not null;
         bool isMoe = _weights.MoeLayers is not null;
@@ -809,6 +850,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         // MLA / MoE are not graph-capable today (MoE has host-side bucketing; MLA's
         // absorbed kernel uses dynamic shmem) — they fall through to eager.
         if (UseGraphCapture
+            && !suppressGraphCapture        // #251: batched calls force the eager body — see doc comment above
             && tokenIds.Length == 1
             && _kernels.HasKvWriteKernel
             && !ProfilingEnabled            // event injection between launches breaks capture
@@ -1441,6 +1483,29 @@ public sealed unsafe class CudaTransformerModel : IModel
         // Capture dispatch-only time (all launches queued, before GPU wait).
         long dispatchEndTs = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
+        // #251 batched-decode path: enqueue a genuinely async D2H copy into caller-owned
+        // PINNED host memory and return without synchronizing. Async D2H into pageable
+        // memory would still block the calling thread (CUDA driver requirement), which is
+        // why ForwardBatch pre-allocates pinned buffers instead of reusing UnmanagedTensor's
+        // normal (pageable) NativeMemory allocation. Single-stream ordering guarantees this
+        // copy drains _state.LogitsF32 before the NEXT batched request's kernels (enqueued
+        // immediately after this call returns, on the same stream) overwrite it — see
+        // ForwardBatch's doc comment for the full correctness argument. The caller
+        // synchronizes ONCE after the whole batch has been dispatched.
+        if (deferredHostDest != 0)
+        {
+            CudaDriverApi.cuMemcpyDtoHAsync_v2(deferredHostDest, _state.LogitsF32,
+                (nuint)(vocabSize * sizeof(float)), s).ThrowOnError();
+            // Per-category profiling event timing is not meaningful without the sync point above
+            // (the events recorded this call haven't completed yet), so reset the cursor here
+            // rather than leaving it to grow unboundedly across every request in every batched
+            // call — ProfilingEnabled + ForwardBatch is an unsupported diagnostic combination
+            // (LastGpuLaunchMs / LastCategoryMs simply won't reflect batched requests).
+            if (ProfilingEnabled)
+                _profEventCursor = 0;
+            return null;
+        }
+
         // 7. Stream sync (single sync point for entire forward pass)
         _stream.Synchronize();
 
@@ -1483,6 +1548,156 @@ public sealed unsafe class CudaTransformerModel : IModel
             (nuint)(vocabSize * sizeof(float))).ThrowOnError();
 
         return result;
+    }
+
+    /// <summary>
+    /// Grow-only pool of pinned ("page-locked") host buffers backing <see cref="ForwardBatch"/>'s
+    /// per-request async D2H logits copy — one buffer per batch lane, each sized for
+    /// <c>vocabSize</c> floats. Pinned (vs. the ordinary pageable <see cref="UnmanagedTensor"/>
+    /// allocation the single-sequence path uses) is required for a genuinely non-blocking
+    /// <c>cuMemcpyDtoHAsync_v2</c> — see <see cref="ForwardInternal"/>'s <c>deferredHostDest</c>
+    /// doc comment. Buffers are reused (never freed) across calls; only grown when a larger
+    /// batch is seen. Freed in <see cref="Dispose"/>.
+    /// </summary>
+    private void EnsureBatchPinnedHostBuffers(int count, int vocabSize)
+    {
+        if (_batchPinnedHostBuffers is not null && _batchPinnedHostVocabSize != vocabSize)
+        {
+            // Config.VocabSize is fixed for the lifetime of a model instance, so this only
+            // guards a theoretical future reuse; free and reallocate from scratch rather than
+            // risk copying stale-sized buffers forward.
+            foreach (var p in _batchPinnedHostBuffers)
+                if (p != 0) CudaDriverApi.cuMemFreeHost(p);
+            _batchPinnedHostBuffers = null;
+        }
+
+        int have = _batchPinnedHostBuffers?.Length ?? 0;
+        if (have >= count)
+        {
+            _batchPinnedHostVocabSize = vocabSize;
+            return;
+        }
+
+        var grown = new nint[count];
+        if (_batchPinnedHostBuffers is not null)
+            Array.Copy(_batchPinnedHostBuffers, grown, have);
+
+        nuint bytes = (nuint)((long)vocabSize * sizeof(float));
+        for (int i = have; i < count; i++)
+            CudaDriverApi.cuMemHostAlloc(out grown[i], bytes, flags: 0).ThrowOnError();
+
+        _batchPinnedHostBuffers = grown;
+        _batchPinnedHostVocabSize = vocabSize;
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// <para><b>Issue #251 design decision.</b> This is a per-sequence-loop implementation, NOT a
+    /// fused single-launch-across-the-batch kernel. Every request still runs the exact same
+    /// per-layer kernel sequence <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
+    /// would run for it alone (same GPU-side computation, byte-identical output), reusing this
+    /// model's single <see cref="_state"/> scratch and single <see cref="_stream"/> — sequentially,
+    /// never concurrently. A genuinely fused kernel (one launch, grid indexed over sequences) was
+    /// considered and rejected for this issue: the model's per-layer forward body is ~700 lines of
+    /// architecture-specific dispatch (MLA, MoE, BitNet I2_S fused GEMV, LoRA, quantized-KV, plus
+    /// three live decode-attention kernel variants — see
+    /// <c>docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md</c> §4.2) all built around ONE sequence's worth
+    /// of shared scratch; batching it for real would mean either (a) replicating
+    /// <see cref="_state"/>/<see cref="_cublas"/> per concurrent stream — a substantial VRAM and
+    /// correctness-surface increase for an unverified win on shared hardware, or (b) rewriting
+    /// every kernel to take a batch dimension — the "different kernel, not the same kernel with a
+    /// loop" rewrite <c>docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md</c> §4.2 already flagged as a
+    /// separate, much larger design surface. Neither is verifiable in this issue's time budget
+    /// without GPU access to validate correctness under real concurrency.
+    /// </para>
+    /// <para>What IS real here: the interface's default <c>ForwardBatch</c> loops calling
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/> per request, and
+    /// EVERY one of those calls ends with a blocking <c>_stream.Synchronize()</c> followed by a
+    /// synchronous D2H copy — i.e. the host is forced to fully drain the GPU and wait N times
+    /// before N sequences' kernels are all even dispatched, with the GPU sitting idle during each
+    /// host-side dispatch gap in between. This override removes ALL of that per-sequence
+    /// serialization: every request's kernels are enqueued back-to-back on the same stream (via
+    /// <see cref="ForwardInternal"/> with <c>deferredHostDest</c> set to a pinned per-lane host
+    /// buffer, which makes the tail D2H copy genuinely asynchronous instead of the blocking
+    /// pageable-memory copy the single-sequence path uses), and the host only synchronizes ONCE
+    /// after the whole batch is dispatched. CUDA-graph capture is force-disabled for the whole call
+    /// (<c>suppressGraphCapture: true</c>) — interleaving a different sequence's kernels into an
+    /// in-progress graph *capture* (not replay) on the shared single stream would silently corrupt
+    /// that graph; see <see cref="ForwardInternal"/>'s doc comment for the full argument. This is
+    /// exactly the "batch the host-side kernel-launch/memory-management bookkeeping while still
+    /// issuing N kernel launches" pragmatic option the issue named as the safer first step, chosen
+    /// over the fused-kernel rewrite because it is mechanically verifiable by inspection (same
+    /// kernels, same order, same scratch, only the host-side synchronization points move) and
+    /// requires no new PTX.</para>
+    /// <para>Gemma-4 (<c>_isGemma4</c>) is excluded: its CUDA forward is cacheless (no KV-cache
+    /// support yet), and every <see cref="SequenceForwardRequest.KvCache"/> is a required non-null
+    /// field, so routing it through the batched core below would throw for every request. It falls
+    /// back to the interface-default per-sequence loop instead, so behaviour (including the
+    /// exception) is unchanged from calling <c>Forward</c> directly per request.</para>
+    /// </remarks>
+    public IReadOnlyList<ITensor> ForwardBatch(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+        if (requests.Count == 1)
+        {
+            var r0 = requests[0];
+            return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span, deviceId, r0.KvCache, r0.Adapter) };
+        }
+
+        if (_isGemma4)
+        {
+            var fallback = new ITensor[requests.Count];
+            for (int i = 0; i < requests.Count; i++)
+            {
+                var r = requests[i];
+                fallback[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.Adapter);
+            }
+            return fallback;
+        }
+
+        int vocabSize = Config.VocabSize;
+        EnsureBatchPinnedHostBuffers(requests.Count, vocabSize);
+        nint[] pinned = _batchPinnedHostBuffers!;
+
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var r = requests[i];
+            bool hasAdapter = r.Adapter is not null;
+            if (hasAdapter)
+            {
+                if (!ReferenceEquals(_cudaLora?.Source, r.Adapter))
+                {
+                    _cudaLora?.Dispose();
+                    _cudaLora = CudaLoraWeights.Stage(r.Adapter!, Config, _kernels, _stream.Handle);
+                }
+                _currentAdapter = r.Adapter;
+            }
+            try
+            {
+                ForwardInternal(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache,
+                    suppressGraphCapture: true, deferredHostDest: pinned[i]);
+            }
+            finally
+            {
+                if (hasAdapter) _currentAdapter = null;
+            }
+        }
+
+        // The ONE synchronize for the entire batch — see the doc comment above for why removing
+        // the other (requests.Count - 1) host-blocking syncs is this override's whole point.
+        _stream.Synchronize();
+
+        var results = new ITensor[requests.Count];
+        long bytes = (long)vocabSize * sizeof(float);
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var shape = new TensorShape(1, vocabSize);
+            var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+            Buffer.MemoryCopy((void*)pinned[i], (void*)result.DataPointer, bytes, bytes);
+            results[i] = result;
+        }
+        return results;
     }
 
     /// <inheritdoc/>
@@ -3177,6 +3392,12 @@ public sealed unsafe class CudaTransformerModel : IModel
         if (_gemma4MoeF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4MoeF32); _gemma4MoeF32 = 0; }
         if (_gemma4RouterInF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4RouterInF32); _gemma4RouterInF32 = 0; }
         if (_gemma4ActScratchF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4ActScratchF32); _gemma4ActScratchF32 = 0; }
+        if (_batchPinnedHostBuffers != null)
+        {
+            foreach (var p in _batchPinnedHostBuffers)
+                if (p != 0) CudaDriverApi.cuMemFreeHost(p);
+            _batchPinnedHostBuffers = null;
+        }
         _mlaScratchF16?.Dispose();
         _mlaKvCache?.Dispose();
         _moeScratch?.Dispose();
