@@ -38,6 +38,18 @@ public sealed class CudaPagedKvCache : IKvCache, IPerLayerKvCache
     private nint _kScratch;
     private nint _vScratch;
 
+    // Issue #200: block-pointer arrays for the direct block-table-read attention kernel
+    // (attention_f16_paged / LaunchAttentionPaged), an alternative to the gather above.
+    // Host side is pinned memory (cuMemHostAlloc) so the small per-decode-step H2D refresh
+    // in PrepareNativeBlockPtrs is genuinely async (same reasoning as issue #251's pinned
+    // D2H pool) rather than blocking on pageable memory. Sized once for the worst case
+    // (ceil(maxSeqLen / blockSize) blocks); reused every call, never reallocated.
+    private readonly int _maxBlocksPerSeq;
+    private nint _kBlockPtrsHost;
+    private nint _vBlockPtrsHost;
+    private nint _kBlockPtrsDevice;
+    private nint _vBlockPtrsDevice;
+
     private bool _disposed;
 
     /// <inheritdoc/>
@@ -101,6 +113,17 @@ public sealed class CudaPagedKvCache : IKvCache, IPerLayerKvCache
         long scratchBytes = (long)maxSeqLen * maxStride * sizeof(ushort);
         CudaDriverApi.cuMemAlloc_v2(out _kScratch, (nuint)scratchBytes).ThrowOnError();
         CudaDriverApi.cuMemAlloc_v2(out _vScratch, (nuint)scratchBytes).ThrowOnError();
+
+        // Issue #200: block-pointer arrays sized once for the worst case, lazily populated
+        // by PrepareNativeBlockPtrs. Allocated unconditionally (tiny — pointer-sized entries,
+        // not KV content) so the opt-in native path never needs a first-call allocation on
+        // the decode hot path; unused entirely when DOTLLM_ATTN_PAGED_NATIVE is off.
+        _maxBlocksPerSeq = (maxSeqLen + pool.BlockSize - 1) / pool.BlockSize;
+        nuint ptrArrayBytes = (nuint)((long)_maxBlocksPerSeq * IntPtr.Size);
+        CudaDriverApi.cuMemHostAlloc(out _kBlockPtrsHost, ptrArrayBytes, 0).ThrowOnError();
+        CudaDriverApi.cuMemHostAlloc(out _vBlockPtrsHost, ptrArrayBytes, 0).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out _kBlockPtrsDevice, ptrArrayBytes).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out _vBlockPtrsDevice, ptrArrayBytes).ThrowOnError();
     }
 
     /// <summary>
@@ -223,6 +246,63 @@ public sealed class CudaPagedKvCache : IKvCache, IPerLayerKvCache
     }
 
     /// <summary>
+    /// Issue #200: builds this layer's block-pointer arrays for the direct block-table-read
+    /// attention kernel (<c>attention_f16_paged</c> / <c>CudaKernels.LaunchAttentionPaged</c>),
+    /// eliminating <see cref="PrepareAttentionScratch"/>'s D2D gather of KV content. Resolves
+    /// each logical block's device pointer for this layer host-side (cheap pointer
+    /// arithmetic, no device round-trip — mirrors <see cref="CudaKvBlockPool.GetKeyPtr"/>'s
+    /// own cost), then refreshes only the small pointer array on the device
+    /// (<c>blockCount * sizeof(nint)</c> bytes — a handful of blocks in the common case, e.g.
+    /// 17 blocks × 8 bytes × 2 arrays ≈ 272 bytes, vs. the full KV byte gather
+    /// <see cref="PrepareAttentionScratch"/> performs every call).
+    /// </summary>
+    /// <remarks>
+    /// Uses a <b>synchronous</b> <c>cuMemcpyHtoD_v2</c>, not the async entry point, even though
+    /// the host staging buffer is pinned. The pinned buffer is reused across every layer of a
+    /// decode step (never reallocated); an async H2D copy only enqueues the transfer, so the
+    /// very next call (next layer) could overwrite the host buffer before the GPU actually
+    /// reads it — a real host/device race, not a hypothetical one, since this method is called
+    /// once per layer in a tight loop with no synchronization between calls. A synchronous copy
+    /// costs a small fixed PCIe-latency stall (~1-5 µs, dominated by latency not the ~272-byte
+    /// payload) but guarantees the buffer is safe to overwrite the moment this call returns.
+    /// Double-buffering the host array (ping-pong between two pinned buffers) would let this
+    /// go async again; not done here since this path is opt-in/unvalidated and correctness
+    /// takes priority over an unmeasured latency win (see docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md).
+    /// </remarks>
+    /// <returns>
+    /// Device pointers to the K and V block-pointer arrays, plus the block count (the
+    /// attention kernel derives <c>logical_block = tkv / blockSize</c> itself, so the caller
+    /// does not need to pass the count separately — it's returned only for callers that want
+    /// to reason about it, e.g. tests).
+    /// </returns>
+    internal unsafe (nint kBlockPtrs, nint vBlockPtrs, int blockCount) PrepareNativeBlockPtrs(int layerIndex, nint stream)
+    {
+        int currentLength = _blockTable.CurrentLength;
+        int blockSize = _pool.BlockSize;
+        int blockCount = (currentLength + blockSize - 1) / blockSize;
+        if (blockCount == 0) return (_kBlockPtrsDevice, _vBlockPtrsDevice, 0);
+        if (blockCount > _maxBlocksPerSeq)
+            throw new InvalidOperationException(
+                $"CudaPagedKvCache: sequence needs {blockCount} blocks but the block-pointer " +
+                $"arrays were only sized for {_maxBlocksPerSeq} (maxSeqLen at construction).");
+
+        var kHost = (nint*)_kBlockPtrsHost;
+        var vHost = (nint*)_vBlockPtrsHost;
+        for (int b = 0; b < blockCount; b++)
+        {
+            int blockId = _blockTable.BlockIdAt(b);
+            kHost[b] = _pool.GetKeyPtr(blockId, layerIndex);
+            vHost[b] = _pool.GetValuePtr(blockId, layerIndex);
+        }
+
+        nuint bytes = (nuint)((long)blockCount * sizeof(nint));
+        CudaDriverApi.cuMemcpyHtoD_v2(_kBlockPtrsDevice, _kBlockPtrsHost, bytes).ThrowOnError();
+        CudaDriverApi.cuMemcpyHtoD_v2(_vBlockPtrsDevice, _vBlockPtrsHost, bytes).ThrowOnError();
+
+        return (_kBlockPtrsDevice, _vBlockPtrsDevice, blockCount);
+    }
+
+    /// <summary>
     /// Resets the visible length of the cache to the given position.
     /// Used by prompt caching to truncate to the matched prefix length.
     /// </summary>
@@ -281,5 +361,10 @@ public sealed class CudaPagedKvCache : IKvCache, IPerLayerKvCache
 
         if (_kScratch != 0) { CudaDriverApi.cuMemFree_v2(_kScratch); _kScratch = 0; }
         if (_vScratch != 0) { CudaDriverApi.cuMemFree_v2(_vScratch); _vScratch = 0; }
+
+        if (_kBlockPtrsDevice != 0) { CudaDriverApi.cuMemFree_v2(_kBlockPtrsDevice); _kBlockPtrsDevice = 0; }
+        if (_vBlockPtrsDevice != 0) { CudaDriverApi.cuMemFree_v2(_vBlockPtrsDevice); _vBlockPtrsDevice = 0; }
+        if (_kBlockPtrsHost != 0) { CudaDriverApi.cuMemFreeHost(_kBlockPtrsHost); _kBlockPtrsHost = 0; }
+        if (_vBlockPtrsHost != 0) { CudaDriverApi.cuMemFreeHost(_vBlockPtrsHost); _vBlockPtrsHost = 0; }
     }
 }

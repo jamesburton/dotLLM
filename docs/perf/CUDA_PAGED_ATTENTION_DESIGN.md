@@ -2,8 +2,10 @@
 
 **Issue:** #200
 **Author:** dotnet-perf-expert agent, 2026-08-01
-**Status:** Design only — no kernel code in this commit. Confirms and extends the two prior
-comments on #200 (2026-07-27); nothing material has changed since.
+**Status:** Implemented (2026-08-02, opt-in via `DOTLLM_ATTN_PAGED_NATIVE=1`, default OFF pending
+real-hardware measurement) — see the "Update (issue #200, implemented 2026-08-02)" note directly
+below for what shipped. Originally design-only, confirming and extending the two prior comments on
+#200 (2026-07-27); superseded once both prerequisite issues (#252, #251) landed in this session.
 **Predecessor pattern:** `docs/perf/MMA_BATCHED_MMQ.md` — same shape of problem (a real kernel
 idea with a missing engine-side producer), same conclusion structure.
 
@@ -48,6 +50,95 @@ idea with a missing engine-side producer), same conclusion structure.
 > would only become relevant if a future issue revisits #251's decision. See
 > `docs/SCHEDULING.md`'s `ForwardBatch` status table and `CudaTransformerModel.cs`'s
 > `ForwardInternal`/`ForwardBatch` doc comments for the full implementation reasoning.
+
+> **Update (issue #200, implemented 2026-08-02):** Both prerequisites in the chain below are now
+> resolved (see the two updates immediately above this one — #252 landed the block pool/table,
+> #251 landed `ForwardBatch` and settled the launch-granularity question as per-sequence-loop).
+> With both blockers gone, this session implemented the kernel this note's §6 designed:
+> `attention_f16_paged` in `native/kernels/attention.cu` — a full, deliberately-separate copy of
+> `attention_f16_body` (same choice already made for `attention_pos_f16` in the same file) with
+> ONLY the K/V row address resolution changed from a flat `k + tkv * kv_stride` offset to a
+> two-step `block_ptrs[tkv / block_size] + (tkv % block_size) * kv_stride` lookup. Composed
+> against the plain `attention_f16` kernel (the kernel `CudaTransformerModel`'s eager-fallback
+> `DispatchAttention` actually calls for a typical dense-model decode step — re-verified by reading
+> the dispatch code directly, not assumed; see the "which kernel is the real default" correction
+> below), not the GQA-split-KV kernel §4.2 speculated about — `attention_f32_gqa_split_kv` turns
+> out to only be wired into `CudaQwen3HybridDenseTransformerModel`, a narrower path, not
+> `CudaTransformerModel`'s general dispatch.
+>
+> **Correction to this note's own §4.2**: re-reading `CudaTransformerModel.cs`'s actual
+> `DispatchAttention` local function (not just recalling kernel names) shows the decode-time
+> fallback order is G-flash → G3 → `LaunchAttention` (`attention_f16`), not
+> `attention_f32_gqa_split_kv` — that kernel is real but scoped to a different, narrower dense-hybrid
+> model class. This matters because it changes which kernel a paged-native variant needed to
+> extend to be representative of the actual default decode hot path; `attention_f16` was the right
+> choice once re-verified, not `attention_f32_gqa_split_kv` as this note originally guessed.
+>
+> **C# side**: `CudaKvBlockPool`/`CudaKvBlockTable` gained no new device-visible plumbing (the
+> block IDs and per-layer device pointers they already exposed, `GetKeyPtr`/`GetValuePtr`/
+> `BlockIdAt`, were sufficient); `CudaPagedKvCache.PrepareNativeBlockPtrs(layerIndex, stream)` is
+> the new entry point, building a small per-layer array of block base device pointers (host-side
+> pointer arithmetic, then a **synchronous** `cuMemcpyHtoD_v2` H2D refresh — deliberately not async,
+> since the pinned host staging buffer is reused every layer in a tight per-layer loop with no
+> synchronization in between; an async copy would race the next layer's overwrite against the
+> current layer's still-pending device read). `CudaKernels.LaunchAttentionPaged` wraps the new
+> kernel with the same launch geometry (`numBlocks = seqQ * numHeads`, identical shared-memory
+> size formula) as `LaunchAttention`.
+>
+> **Wiring**: opt-in via `DOTLLM_ATTN_PAGED_NATIVE=1` (`CudaKernels.EnableNativePagedAttention`,
+> default OFF — this kernel is unmeasured on real hardware as of this writing), gated additionally
+> on `seqLen == 1` (decode only, matching the issue's own scope — "paged **decode** attention
+> kernel") and `HasAttentionF16Paged` (stale-PTX-safe capability check). `CudaTransformerModel`'s
+> `ForwardInternal` (called by both single-sequence `Forward` and, per #251, every request inside
+> `ForwardBatch`) branches to the new path when the paged cache is in use, decode is happening, and
+> the flag is on; otherwise it falls back to the pre-existing `PrepareAttentionScratch` gather —
+> unchanged and still the default.
+>
+> **Correctness**: `tests/DotLLM.Tests.Unit/Cuda/CudaAttentionF16PagedTests.cs` compares the new
+> kernel's output against the existing gather-based dispatch for the SAME scattered-block KV
+> content (exact block boundary, partial tail block, single-block sequence, GQA group broadcast,
+> sliding window, and the real Bonsai-27B decode shape numHeads=24/numKvHeads=4/headDim=256 at
+> seqKv=258 this investigation's own profiling used) — asserting **bit-exact** FP16 equality, not
+> a tolerance, since both paths run the identical online-softmax body with no reassociation
+> (unlike the split-KV kernels' partial-combine reduction, which genuinely does need a tolerance).
+> A separate allocator-logic test (`PrepareNativeBlockPtrs_ResolvesSamePointersAsPoolAccessors`)
+> checks the uploaded pointer array matches `CudaKvBlockPool.GetKeyPtr`/`GetValuePtr` directly.
+> None of these were run this session (shared-GPU constraint) — confirmed to build only; see the
+> coordinator hand-off note at the end of this update for the exact command to run.
+>
+> **Performance — honestly unverified**: `tests/DotLLM.Tests.Unit/Cuda/CudaAttentionF16PagedPerfHarness.cs`
+> (opt-in, `DOTLLM_CUDA_PERF=1`, no asserted threshold, matching `CudaBatchedDecodePerfHarness`'s
+> issue-#251 pattern) times the gather-based vs. paged-native dispatch at the real Bonsai-27B decode
+> shape/depth, but **has not been run on real hardware this session**. The theoretical case for a
+> win is real (the gather path D2D-copies every block's KV bytes — for this shape, roughly
+> `2 * ceil(258/16) * 16 * (4*256) * 2 bytes` ≈ 8.5 MB of D2D traffic *per layer, per decode step*;
+> the paged-native path instead H2D-copies just `2 * 17 * 8 bytes` ≈ 272 bytes of pointers), but a
+> synchronous per-layer H2D copy (chosen for correctness — see the C# section above) has its own
+> fixed latency cost that could offset some or all of that win, and this has not been measured.
+> This is exactly the kind of claim `docs/perf/MMA_BATCHED_MMQ.md`-style investigations in this repo
+> insist on verifying rather than assuming — flagged honestly rather than claimed as a proven win.
+>
+> **Scoping check (per the issue's own request)**: the staging-buffer-gather pattern this kernel
+> targets exists in exactly two places — `DotLLM.Engine/KvCache/PagedKvCache.cs` (CPU, wired only to
+> `NaiveAttentionStrategy`) and `CudaPagedKvCache.PrepareAttentionScratch` (CUDA, from #252). Grepped
+> `src/DotLLM.Vulkan/` for `PagedKvCache`/`BlockPool`/`BlockTable` — zero matches; Vulkan has no
+> paged KV-cache at all yet, so there is nothing to eliminate a gather from there. This is a
+> CUDA-specific performance optimization, not a cross-backend correctness bug — the
+> CLAUDE.md "Cross-Backend Critical Bugs" propagation rule does not apply here.
+>
+> **What's still NOT done**: prefill (`seqLen > 1`) still always uses the gather path — the design
+> doc's own reasoning (G3/flash prefill kernels need a contiguous buffer regardless, and this
+> issue's title is specifically "decode") was kept as-is rather than re-litigated. Composing
+> block-table indirection with the GQA-split kernel or the tensor-core decode kernel (§4.2's other
+> two candidates) remains unattempted — this implementation targeted the one kernel confirmed to be
+> the actual default decode path, not all three. `ContinuousBatchScheduler`'s CPU-`KvBlockPool`-typed
+> paged-pool integration is unchanged (still doesn't drive `CudaPagedKvCache`, per #252's own note).
+>
+> **Hand-off for GPU verification** (shared-GPU constraint — not run this session):
+> ```
+> dotnet test tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj -c Release --filter "FullyQualifiedName~Cuda.CudaAttentionF16PagedTests"
+> DOTLLM_CUDA_PERF=1 dotnet test tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj -c Release --filter "FullyQualifiedName~Cuda.CudaAttentionF16PagedPerfHarness" --logger "console;verbosity=detailed"
+> ```
 
 ## TL;DR
 

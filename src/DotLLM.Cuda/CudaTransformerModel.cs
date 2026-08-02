@@ -1211,15 +1211,35 @@ public sealed unsafe class CudaTransformerModel : IModel
                 else if (kvCache is CudaPagedKvCache cudaPagedKvCache)
                 {
                     // Issue #252: block-scattered storage. Write into the (possibly newly
-                    // allocated / CoW'd) block(s), then gather into the contiguous scratch
-                    // buffer the existing attention kernels expect — same staging-buffer shape
-                    // as the CPU PagedKvCache; the direct block-table-read kernel that would
-                    // eliminate this gather is issue #200's separate, still-blocked scope.
+                    // allocated / CoW'd) block(s).
                     cudaPagedKvCache.UpdateDevice(kPtr, vPtr, positions, seqLen, layer, s);
                     int seqKv = cudaPagedKvCache.CurrentLength;
-                    var (kCachePtr, vCachePtr) = cudaPagedKvCache.PrepareAttentionScratch(layer, s);
-                    MarkProfile(ProfileCategory.KvUpdate);
-                    DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0]);
+
+                    // Issue #200 (opt-in, DOTLLM_ATTN_PAGED_NATIVE=1): decode-only (seqLen==1)
+                    // direct block-table-read attention, skipping the gather below entirely.
+                    // Restricted to decode because that's this issue's scope (title: "paged
+                    // decode attention kernel") and because prefill already prefers G3/flash,
+                    // which need a contiguous buffer regardless — extending the paged-native
+                    // path to prefill is a separate, later decision (see
+                    // docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md).
+                    if (seqLen == 1 && CudaKernels.EnableNativePagedAttention && _kernels.HasAttentionF16Paged)
+                    {
+                        var (kBlockPtrs, vBlockPtrs, _) = cudaPagedKvCache.PrepareNativeBlockPtrs(layer, s);
+                        MarkProfile(ProfileCategory.KvUpdate);
+                        _kernels.LaunchAttentionPaged(qPtr, kBlockPtrs, vBlockPtrs, _state.AttnOutput,
+                            seqLen, seqKv, cudaPagedKvCache.Pool.BlockSize,
+                            numHeads, numKvHeads, headDim,
+                            positions[0], slidingWindow, s);
+                    }
+                    else
+                    {
+                        // Default: gather into the contiguous scratch buffer the existing
+                        // attention kernels expect — same staging-buffer shape as the CPU
+                        // PagedKvCache.
+                        var (kCachePtr, vCachePtr) = cudaPagedKvCache.PrepareAttentionScratch(layer, s);
+                        MarkProfile(ProfileCategory.KvUpdate);
+                        DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0]);
+                    }
                 }
                 else
                 {

@@ -66,6 +66,13 @@ public sealed class CudaKvBlockTable
     }
 
     /// <summary>
+    /// Physical block ID for a given logical block index (issue #200: used to build the
+    /// direct block-table-read attention kernel's per-layer block-pointer array without a
+    /// staging-buffer gather — see <see cref="CudaPagedKvCache.PrepareNativeBlockPtrs"/>).
+    /// </summary>
+    internal int BlockIdAt(int logicalBlock) => _blockIds[logicalBlock];
+
+    /// <summary>
     /// Shares all current blocks with <paramref name="target"/> by incrementing ref counts.
     /// Used for beam search branching or prefix sharing.
     /// </summary>
