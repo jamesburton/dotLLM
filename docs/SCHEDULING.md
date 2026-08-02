@@ -70,6 +70,16 @@ while (!cancelled):
 
 The trade-off: a very small chunk size raises per-step overhead (lots of small kernel dispatches); a very large chunk size lets one long prompt dominate the GPU for several steps before decode catches up. Production setups tune chunk size against expected prompt-length distribution and decode-batch size.
 
+**CLI/server knob (#141).** `MaxPrefillTokensPerStep` is user-facing via `--prefill-chunk-size`
+(alias `--ubatch-size`, llama.cpp `-ub` analog) on `run`, `chat`, and `serve`, and via
+`ServerOptions.PrefillChunkSize` (bindable from `appsettings.json`). `ServerStartup.ResolveSchedulerOptions`
+maps the flag onto this scheduler's `MaxPrefillTokensPerStep` when the continuous-batch scheduler is
+active and no `Scheduler` section already sets an explicit cap — see [docs/SERVER.md](SERVER.md) for
+the exact precedence rule and [docs/SPECULATIVE.md](SPECULATIVE.md#cli--server-usage) for the sibling
+`--speculative-model`/`--speculative-k` (`--draft-model`/`--draft-tokens`) flags. On the single-request
+`TextGenerator` path (no scheduler) the same flag drives true intra-prompt chunking instead of an
+admission-level cap — see the honest per-path semantics note in `docs/SERVER.md`.
+
 ## Kernel-Batched Forward (`IModel.ForwardBatch`)
 
 `IModel.ForwardBatch(IReadOnlyList<SequenceForwardRequest>, int deviceId)` is the seam for true batched compute across sequences:
