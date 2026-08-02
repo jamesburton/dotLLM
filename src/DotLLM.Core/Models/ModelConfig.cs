@@ -202,7 +202,17 @@ public record ModelConfig
     public bool IsGemmaArchitecture =>
         Architecture is DotLLM.Core.Configuration.Architecture.Gemma3
                      or DotLLM.Core.Configuration.Architecture.Gemma4
-                     or DotLLM.Core.Configuration.Architecture.DiffusionGemma;
+                     or DotLLM.Core.Configuration.Architecture.DiffusionGemma
+                     or DotLLM.Core.Configuration.Architecture.Gemma3n;
+
+    /// <summary>
+    /// Gemma-3n AltUp / Laurel / activation-sparsity configuration. Non-null iff
+    /// <see cref="Architecture"/> is <see cref="DotLLM.Core.Configuration.Architecture.Gemma3n"/>;
+    /// null for every other architecture (including <see cref="DotLLM.Core.Configuration.Architecture.Gemma4"/>,
+    /// which reuses the same PLE / shared-KV / dual-RoPE plumbing but has no
+    /// AltUp or Laurel blocks). See <see cref="Gemma3nConfig"/>.
+    /// </summary>
+    public Gemma3nConfig? Gemma3n { get; init; }
 
     /// <summary>
     /// Optional per-attention-type RoPE override for the FULL-attention layers

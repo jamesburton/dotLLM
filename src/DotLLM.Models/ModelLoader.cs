@@ -151,6 +151,7 @@ public static class ModelLoader
                     or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
                     or Architecture.SmolLM3
                     or Architecture.Gemma3 or Architecture.Gemma4
+                    or Architecture.Gemma3n
                     or Architecture.DiffusionGemma
                     // BitNet b1.58 reuses the standard TransformerModel tower: the
                     // safetensors loader quantizes each linear projection to ternary
@@ -170,7 +171,7 @@ public static class ModelLoader
                     => Mamba3TransformerModel.LoadFromSafetensors(source, config),
                 _ => throw new NotSupportedException(
                     $"Safetensors loader does not yet dispatch architecture {config.Architecture}. "
-                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, DeepSeekV2, DeepSeekV3, SmolLM3, Gemma3, Gemma4, DiffusionGemma, BitNet, Mamba3."),
+                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, DeepSeekV2, DeepSeekV3, SmolLM3, Gemma3, Gemma4, Gemma3n, DiffusionGemma, BitNet, Mamba3."),
             };
 
             return (model, source, config);
@@ -231,6 +232,19 @@ public static class ModelLoader
                 ModelConfig diffusionConfig =
                     DiffusionGemmaConfigExtractor.ExtractFromDirectory(doc.RootElement, weightsDir);
                 return (source, diffusionConfig);
+            }
+
+            // Gemma-3n wrapper: model_type=gemma3n / gemma3n_text houses the text
+            // tower under `text_config` (audio_config / vision_config skipped —
+            // text-only) plus the Gemma-3n-only AltUp/Laurel/activation-sparsity
+            // fields Gemma3nConfigExtractor understands. Checked BEFORE
+            // ResolveArchitecture for the same reason as the diffusion_gemma probe
+            // above (issue #136).
+            if (string.Equals(topModelType, "gemma3n", StringComparison.Ordinal)
+                || string.Equals(topModelType, "gemma3n_text", StringComparison.Ordinal))
+            {
+                ModelConfig gemma3nConfig = Gemma3nConfigExtractor.Extract(doc.RootElement);
+                return (source, gemma3nConfig);
             }
 
             Architecture arch;

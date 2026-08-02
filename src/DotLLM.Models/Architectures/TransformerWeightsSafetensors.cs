@@ -123,6 +123,32 @@ internal static class TransformerWeightsSafetensorsLoader
                 };
             }
 
+            // Model-level Gemma-3n AltUp stream projections (numInputs-1 pairs,
+            // used once per forward — building the initial stream stack from the
+            // embedding, and collapsing the final stack after the last layer).
+            Gemma3nAltUpWeights? gemma3nAltUp = null;
+            if (config.Gemma3n is { } g3n)
+            {
+                int nProj = g3n.NumInputs - 1;
+                var altupProj = new nint[nProj];
+                var altupUnembed = new nint[nProj];
+                for (int i = 0; i < nProj; i++)
+                {
+                    var (pPtr, _, pM, pK) = ResolveLinearAsF32(file, $"model.altup_projections.{i}.weight", owned);
+                    ValidateProjectionShape(pM, pK, config.HiddenSize, config.HiddenSize, $"model.altup_projections.{i}.weight");
+                    altupProj[i] = pPtr;
+
+                    var (uPtr, _, uM, uK) = ResolveLinearAsF32(file, $"model.altup_unembed_projections.{i}.weight", owned);
+                    ValidateProjectionShape(uM, uK, config.HiddenSize, config.HiddenSize, $"model.altup_unembed_projections.{i}.weight");
+                    altupUnembed[i] = uPtr;
+                }
+                gemma3nAltUp = new Gemma3nAltUpWeights
+                {
+                    AltUpProjections = altupProj,
+                    AltUpUnembedProjections = altupUnembed,
+                };
+            }
+
             return TransformerWeights.CreateFromSafetensors(
                 tokenEmbedWeight: embPtr, tokenEmbedQt: embQt,
                 vocabSize: config.VocabSize, hiddenSize: config.HiddenSize,
@@ -130,7 +156,8 @@ internal static class TransformerWeightsSafetensorsLoader
                 outputNormWeight: outputNorm,
                 outputWeight: outPtr, outputQt: outQt, outputM: outM, outputK: outK,
                 ownedAllocations: owned,
-                perLayerEmbedding: pleWeights);
+                perLayerEmbedding: pleWeights,
+                gemma3nAltUp: gemma3nAltUp);
         }
         catch
         {
@@ -202,6 +229,43 @@ internal static class TransformerWeightsSafetensorsLoader
             ValidateProjectionShape(ppM, ppK, hiddenSize, pleDim, $"{prefix}.per_layer_projection.weight");
             plePostNorm = ResolveNorm(file, $"{prefix}.post_per_layer_input_norm.weight", hiddenSize);
             GemmaAbsorbOnePlusWeight(plePostNorm);
+        }
+
+        // Gemma-3n per-layer AltUp + Laurel weights. All F32 (small matrices —
+        // numInputs is 4, laurelRank 64 on every released SKU). correct_output_scale
+        // is a raw learned vector (NOT a norm weight — no (1+w) offset).
+        Gemma3nLayerWeights? gemma3n = null;
+        if (config.Gemma3n is { } g3nCfg)
+        {
+            int n = g3nCfg.NumInputs;
+            (nint correctionCoefs, _, int ccM, int ccK) = ResolveLinearAsF32(file, $"{prefix}.altup.correction_coefs.weight", owned);
+            ValidateProjectionShape(ccM, ccK, n, n, $"{prefix}.altup.correction_coefs.weight");
+            (nint predictionCoefs, _, int pcM, int pcK) = ResolveLinearAsF32(file, $"{prefix}.altup.prediction_coefs.weight", owned);
+            ValidateProjectionShape(pcM, pcK, n * n, n, $"{prefix}.altup.prediction_coefs.weight");
+            (nint modalityRouter, _, int mrM, int mrK) = ResolveLinearAsF32(file, $"{prefix}.altup.modality_router.weight", owned);
+            ValidateProjectionShape(mrM, mrK, n, hiddenSize, $"{prefix}.altup.modality_router.weight");
+            float[] routerNorm = ResolveNorm(file, $"{prefix}.altup.router_norm.weight", hiddenSize);
+            GemmaAbsorbOnePlusWeight(routerNorm);
+            float[] correctOutputScale = ResolveNorm(file, $"{prefix}.altup.correct_output_scale", hiddenSize);
+
+            (nint laurelLeft, _, int llM, int llK) = ResolveLinearAsF32(file, $"{prefix}.laurel.linear_left.weight", owned);
+            ValidateProjectionShape(llM, llK, g3nCfg.LaurelRank, hiddenSize, $"{prefix}.laurel.linear_left.weight");
+            (nint laurelRight, _, int lrM, int lrK) = ResolveLinearAsF32(file, $"{prefix}.laurel.linear_right.weight", owned);
+            ValidateProjectionShape(lrM, lrK, hiddenSize, g3nCfg.LaurelRank, $"{prefix}.laurel.linear_right.weight");
+            float[] postLaurelNorm = ResolveNorm(file, $"{prefix}.laurel.post_laurel_norm.weight", hiddenSize);
+            GemmaAbsorbOnePlusWeight(postLaurelNorm);
+
+            gemma3n = new Gemma3nLayerWeights
+            {
+                CorrectionCoefs = correctionCoefs,
+                PredictionCoefs = predictionCoefs,
+                ModalityRouter = modalityRouter,
+                RouterNorm = routerNorm,
+                CorrectOutputScale = correctOutputScale,
+                LaurelLinearLeft = laurelLeft,
+                LaurelLinearRight = laurelRight,
+                PostLaurelNorm = postLaurelNorm,
+            };
         }
 
         // FFN — dense (Llama/Mistral/Qwen), Mixtral-convention MoE, or
@@ -308,7 +372,8 @@ internal static class TransformerWeightsSafetensorsLoader
             moe: null,
             mla: null,
             postAttnNormWeight: postAttnNorm, postFfnNormWeight: postFfnNorm,
-            pleGateWeight: pleGate, pleProjWeight: pleProj, plePostNormWeight: plePostNorm);
+            pleGateWeight: pleGate, pleProjWeight: pleProj, plePostNormWeight: plePostNorm,
+            gemma3n: gemma3n);
     }
 
     /// <summary>
