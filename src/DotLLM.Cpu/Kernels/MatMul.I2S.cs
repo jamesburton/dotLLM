@@ -365,6 +365,45 @@ public static unsafe partial class MatMul
         GemmI2_SCore(weights, b, c, m, k, n, scale, threadPool);
     }
 
+    /// <summary>
+    /// Benchmark/test-only twin of the scale-explicit
+    /// <see cref="GemmI2_S(byte*, float*, float*, int, int, int, float, ComputeThreadPool?)"/> that
+    /// always takes the float (W2A16) tier, bypassing the <see cref="I2SUseW2A8"/> dispatch.
+    /// Mirrors <see cref="GemvI2_SScalar"/> and <c>GemmPQ2_0Scalar</c>.
+    ///
+    /// <para>Exists so a GPU parity oracle can be F32 end-to-end (issue #229): the GPU I2_S kernels
+    /// are F32-in, so an oracle that routes through the dispatching entry measures per-token
+    /// activation-quantization error rather than the kernel divergence under test.</para>
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void GemmI2_SScalar(byte* weights, float* b, float* c, int m, int k, int n,
+                                        float scale, ComputeThreadPool? threadPool)
+    {
+        if (n == 1)
+        {
+            // GEMV shapes: go straight to the float rows (the ragged twin is already float-only).
+            if (k % I2SBlockSize != 0) GemvI2_SRaggedRows(weights, b, c, 0, m, k, scale);
+            else GemvI2_SRows(weights, b, c, 0, m, k, scale);
+            return;
+        }
+
+        if (k % I2SBlockSize != 0)
+        {
+            // The ragged core has no W2A8 tier, so it is already the float path.
+            GemmI2_SRaggedCore(weights, b, c, m, k, n, scale, threadPool);
+            return;
+        }
+
+        if (threadPool is null || m < ParallelMinRows)
+        {
+            GemmI2_SRows(weights, b, c, m, 0, m, k, n, scale);
+            return;
+        }
+
+        var ctx = new GemmI2SCtx { Weights = weights, B = b, C = c, M = m, K = k, N = n, Scale = scale };
+        threadPool.Dispatch((nint)(&ctx), &GemmI2_SWorker);
+    }
+
     [SkipLocalsInit]
     private static void GemmI2_SCore(byte* weights, float* b, float* c, int m, int k, int n,
                                      float scale, ComputeThreadPool? threadPool)
@@ -1165,6 +1204,13 @@ public static unsafe partial class MatMul
     /// <param name="n">Number of input rows (token·slot assignments).</param>
     /// <param name="rowExpertIds">Length-<paramref name="n"/> expert id assigned to each input row.</param>
     /// <param name="threadPool">Optional thread pool — forwarded to the per-expert GEMM.</param>
+    /// <param name="useFloatTier">
+    /// Test/benchmark control. When <see langword="true"/>, the per-expert GEMM takes the float
+    /// (W2A16) tier via <see cref="GemmI2_SScalar"/> instead of the <see cref="I2SUseW2A8"/>
+    /// dispatch. Default <see langword="false"/> keeps production behaviour byte-identical.
+    /// Exists so a GPU parity oracle can be F32 end-to-end — the GPU MoE kernels are F32-in, so an
+    /// oracle on the W2A8 tier compares two different algorithms (issue #229).
+    /// </param>
     /// <remarks>
     /// <paramref name="k"/> need not be a multiple of 128 (issue #206) — the per-expert batched
     /// GEMM below (<see cref="GemmI2_S(byte*, float*, float*, int, int, int, float, ComputeThreadPool?)"/>)
@@ -1174,7 +1220,8 @@ public static unsafe partial class MatMul
     public static void MoeIndexedMatmulI2_S(
         byte* expertWeights, long expertRowBytes, ReadOnlySpan<float> expertScales,
         float* b, float* c, int m, int k, int n,
-        ReadOnlySpan<int> rowExpertIds, ComputeThreadPool? threadPool)
+        ReadOnlySpan<int> rowExpertIds, ComputeThreadPool? threadPool,
+        bool useFloatTier = false)
     {
         if (rowExpertIds.Length < n)
             throw new ArgumentException("rowExpertIds too small", nameof(rowExpertIds));
@@ -1259,7 +1306,10 @@ public static unsafe partial class MatMul
 
                     // One batched ternary GEMM with this expert's bank + α.
                     byte* bank = expertWeights + (nint)(e * expertRowBytes);
-                    GemmI2_S(bank, batchInPtr, batchOutPtr, m, k, batch, expertScales[e], threadPool);
+                    if (useFloatTier)
+                        GemmI2_SScalar(bank, batchInPtr, batchOutPtr, m, k, batch, expertScales[e], threadPool);
+                    else
+                        GemmI2_S(bank, batchInPtr, batchOutPtr, m, k, batch, expertScales[e], threadPool);
 
                     // Scatter output rows back to original positions [n × m].
                     for (int bi = 0; bi < batch; bi++)

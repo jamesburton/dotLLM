@@ -181,7 +181,13 @@ public sealed class CudaMoeFfnBitNetI2STests : IDisposable
                     ffnSubNorm,
                     output: new Span<float>(outPtr, seqLen * hidden),
                     numExperts, topK, hidden, intermediate, seqLen,
-                    normTopKProb, rmsEps: Eps, threadPool: null);
+                    normTopKProb, rmsEps: Eps, threadPool: null,
+                    // Issue #229: the CUDA BitNet-MoE kernels are F32-in, but this oracle's indexed
+                    // GEMMs otherwise take the W2A8 int8-activation tier on any AVX2 host. That made
+                    // the comparison an algorithm mismatch, not a kernel check — it failed 4/4 here
+                    // while passing under DOTNET_EnableAVX2=0 and on the pre-AVX2 T5500, against an
+                    // unchanged kernel. Force the float tier so the oracle matches the kernel.
+                    useFloatTier: true);
             }
 
             // ── GPU forward: upload per-expert payload+tail-scale buffers, router, bias, sub-norm. ──
