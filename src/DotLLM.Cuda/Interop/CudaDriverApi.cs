@@ -179,6 +179,18 @@ internal static partial class CudaDriverApi
     [LibraryImport(LibName)]
     internal static partial int cuMemsetD8_v2(nint dstDevice, byte value, nuint n);
 
+    /// <summary>
+    /// Allocates page-locked ("pinned") host memory. Required for a genuinely
+    /// asynchronous <see cref="cuMemcpyDtoHAsync_v2"/> — a D2H copy into pageable
+    /// host memory blocks the calling thread regardless of the Async entry point
+    /// (see issue #251's batched-decode design note in CudaTransformerModel.cs).
+    /// </summary>
+    [LibraryImport(LibName)]
+    internal static partial int cuMemHostAlloc(out nint pp, nuint bytesize, uint flags);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuMemFreeHost(nint p);
+
     // ── Streams ─────────────────────────────────────────────────────
 
     [LibraryImport(LibName)]

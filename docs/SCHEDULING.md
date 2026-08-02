@@ -99,7 +99,37 @@ The default interface implementation loops over `Forward` per request — backen
 - **CPU (`TransformerModel.ForwardBatch`)**: shipped. Phase 5a fuses the lm_head GEMM at `seqLen = Σ N_i` (commit `479c23f`); Phase 5b fuses the intra-block matmuls (Q/K/V/O/gate/up/down) across the simple subgroup — GQA non-MLA non-MoE non-LoRA-active (commit `92c1345`, ~2.09× speedup at 4× decode batch on Strix Halo / SmolLM-135M Q8_0). Attention stays per-sequence; complex requests fall through to the per-seq loop.
 - **Vulkan dense host (`VulkanTransformerModel.ForwardBatch`)**: shipped. Phase 5f path-1 — same intra-block matmul fusion pattern; attention dispatches per-seq via slice copy into shared scratch (commit `1c04887`). Phase 5e (lm_head-only fusion) was skipped on Vulkan because Vulkan's lm_head runs only on the last token (seqLen=1, returns `[1, vocab]`), making the saving ~150-350 µs per step — noise-floor.
 - **Vulkan other hosts (Qwen3MoeHybrid / NemotronH / Mamba3)**: per-seq dispatch. Per-sequence recurrent-state isolation is shipped for all three — `Qwen3MoeHybrid` via `IGdnState` + `SequenceForwardRequest.GdnState` (commits `03f7ab9`/`a3ad719`/`0f3e4ce`), `Mamba3` via `IMambaState` + `SequenceForwardRequest.MambaState` (session 7), `NemotronH` via `ISsmState` + `SequenceForwardRequest.SsmState` (CPU #355 / Vulkan #356); each host's `ForwardBatch` threads the per-seq state through and rejects null-state multi-seq dispatch with a clear diagnostic. Intra-block matmul fusion to mirror Phase 5f's dense-host pattern was evaluated (issue #359) and deliberately **not** adopted; the fusion target stays lm_head fan-out only. Note the rationale is *not* "every layer is recurrent" — that is inaccurate for the hybrids: Nemotron-H interleaves a minority of GQA-attention + FFN layers among its Mamba2 SSM stack, and Qwen3-MoE-Hybrid has full GQA-attention layers, and those non-recurrent layers' projection GEMMs (Q/K/V/O, up/down) **are** batchable across the sub-batch in isolation. The win is nonetheless noise-floor and not worth the rewrite, because: (1) the residual stream is shared across the interleaved recurrent + non-recurrent layers, so batching the non-recurrent minority while the dominant SSM/GDN layers stay per-seq forces a per-seq slice/write-back of the stacked hidden buffer at every recurrent layer — i.e. a full restructure of each host's per-seq `RunForwardCore` into a dense-style batched-layer loop with N-way SSM/KV state threading; (2) cost is dominated by the per-token recurrent scan, which is the large majority of layers (~90%+ for Nemotron-H), is unfusable, and is memory-bandwidth-bound on gfx1151; (3) at decode each sequence contributes `seqLen = 1`, so the batchable projection GEMMs are tiny GEMV-batch dispatches (`N = batch`) whose saved dispatch/barrier overhead is a few percent of total dispatches confined to the non-dominant layer minority. The dense host's full layer-loop fusion transfers there only because *every* dense layer is batchable; in the hybrids it is not. See the `ForwardBatch` doc-comment in `VulkanNemotronHTransformerModel` for the same conclusion at the code level.
-- **CUDA**: per-seq fallback. Same mirror needed when a CUDA host is available.
+- **CUDA (`CudaTransformerModel.ForwardBatch`)**: shipped (issue #251), but as a **per-sequence-loop**
+  dispatch, not a fused multi-sequence kernel launch — a deliberate scope decision, not a stopgap.
+  Every request still runs the exact same per-layer kernel sequence the single-sequence `Forward`
+  would run for it alone (same GPU-side computation, byte-identical output), reusing the model's
+  single scratch buffer and single CUDA stream sequentially. What changes: the interface's default
+  `ForwardBatch` fallback loops calling `Forward` per request, and *every* `Forward` call ends with a
+  blocking `cuStreamSynchronize` + a synchronous D2H logits copy — the host fully drains the GPU and
+  waits **N times** before N sequences' kernels are even all dispatched, with the GPU idle during each
+  host-side dispatch gap in between. The override instead enqueues every request's kernels
+  back-to-back on the same stream (via a private `deferredHostDest`-parameterized core that D2H-copies
+  each request's logits *asynchronously* into a pinned per-lane host buffer,
+  `cuMemHostAlloc`/`cuMemcpyDtoHAsync_v2` — genuine host-side asynchrony requires page-locked
+  destination memory, unlike the pageable `UnmanagedTensor` allocation the single-sequence path
+  uses) and synchronizes **once** after the whole batch is dispatched. CUDA-graph *capture* (not
+  replay) is force-disabled for the duration of a batched call, since interleaving a different
+  sequence's kernels into an in-progress graph capture on the shared single stream would silently
+  corrupt that graph — see the `ForwardInternal`/`ForwardBatch` doc comments in
+  `CudaTransformerModel.cs` for the full argument. Gemma-4 (cacheless CUDA forward, no KV-cache
+  support yet) falls back to the interface-default per-sequence loop unchanged. A genuinely fused
+  single-launch-across-the-batch kernel was considered and explicitly deferred — see
+  `docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md` §4.2 and the `ForwardBatch` doc comment for why: the
+  per-layer forward body is architecture-dispatch-heavy (MLA, MoE, BitNet I2_S fused GEMV, LoRA,
+  quantized-KV, three live decode-attention kernel variants) built around one sequence's worth of
+  shared scratch, and batching it for real means either replicating scratch/cuBLAS-handle state per
+  concurrent stream or rewriting every kernel to take a batch dimension — a materially larger,
+  separately-scoped rewrite, not this issue's pragmatic first step. Tests: `CudaBatchedDecodeTests`
+  (`ForwardBatch_MultipleSequences_MatchesPerSequenceBaseline` — argmax + logit parity vs. the
+  per-sequence baseline across 3 concurrent decoding sequences; `ForwardBatch_SingleRequest_MatchesDirectForward`;
+  `ForwardBatch_EmptyRequests_ReturnsEmpty`), plus an opt-in `CudaBatchedDecodePerfHarness`
+  (`DOTLLM_CUDA_PERF=1`) reporting wall-clock throughput vs. the per-sequence loop for the same
+  workload.
 - **Vulkan block-table attention (Phase 5g)**: deferred — vLLM-style single attention kernel reading per-seq block tables.
 
 The acceptance test (`FourConcurrentSchedulerTests`) drives 4 distinct prompts concurrently through the scheduler and verifies each gets its own per-request response — the API contract is in place across all backends.
