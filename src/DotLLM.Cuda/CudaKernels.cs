@@ -267,6 +267,12 @@ public sealed unsafe class CudaKernels : IDisposable
     // 4-byte device buffers. Pointers stay stable across cuGraphLaunch replays;
     // host bumps the underlying ints via cuMemcpyHtoD between launches (~1 µs).
     private readonly nint _attentionDynFunc;
+    // Issue #200: direct block-table-read paged decode attention -- reads K/V through a
+    // small per-layer array of block base device pointers instead of a contiguous buffer,
+    // eliminating CudaPagedKvCache.PrepareAttentionScratch's D2D gather. TryGetFunction so a
+    // stale PTX without this symbol still loads gracefully (HasAttentionF16Paged reports
+    // false and callers keep using the gather-based path).
+    private readonly nint _attentionPagedFunc;
     // Decode-step KV-cache write: dst row is dst_base + posPtr[0] * kv_stride.
     // Replaces a host-side cuMemcpyDtoDAsync where the dst address would be
     // baked into the graph at instantiate time.
@@ -638,6 +644,8 @@ public sealed unsafe class CudaKernels : IDisposable
         _attentionFunc = _attentionModule.GetFunction("attention_f16");
         _attentionDynFunc = _attentionModule.GetFunction("attention_f16_dyn");
         _attentionPosFunc = _attentionModule.GetFunction("attention_pos_f16");
+        // Issue #200 -- optional, see field comment above.
+        _attentionPagedFunc = _attentionModule.TryGetFunction("attention_f16_paged");
         _kvCacheUpdatePosFunc = _kvCacheUpdateModule.GetFunction("kv_cache_update_pos_f16");
         _biasAddFunc = _biasAddModule.GetFunction("bias_add_f16");
         _perHeadRmsNormFunc = _perHeadRmsNormModule.GetFunction("per_head_rmsnorm_f16");
@@ -3601,6 +3609,68 @@ public sealed unsafe class CudaKernels : IDisposable
         uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
 
         CudaDriverApi.cuLaunchKernel(_attentionDynFunc,
+                (uint)numBlocks, 1, 1, BlockSize, 1, 1,
+                sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+    #pragma warning restore CS1573
+
+    /// <summary>
+    /// Whether the opt-in direct block-table-read paged decode attention kernel (issue #200,
+    /// <c>attention_f16_paged</c>) is available in the loaded PTX. False on a stale build --
+    /// callers must keep using <see cref="CudaPagedKvCache"/>'s gather-based
+    /// <c>PrepareAttentionScratch</c> + <see cref="LaunchAttention"/> path unconditionally.
+    /// </summary>
+    public bool HasAttentionF16Paged => _attentionPagedFunc != 0;
+
+    /// <summary>
+    /// Enables <see cref="LaunchAttentionPaged"/> in <c>CudaTransformerModel</c>'s paged-cache
+    /// decode dispatch, in place of the default gather-into-scratch path. Default OFF (this
+    /// kernel has not been measured against the gather path yet -- see issue #200's own
+    /// "wire in behind an opt-in flag" requirement and <c>docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md</c>).
+    /// Set <c>DOTLLM_ATTN_PAGED_NATIVE=1</c> to opt in.
+    /// </summary>
+    public static bool EnableNativePagedAttention { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_ATTN_PAGED_NATIVE") == "1";
+
+    /// <summary>
+    /// Issue #200: direct block-table-read paged decode attention. Same online-softmax math
+    /// and launch geometry as <see cref="LaunchAttention"/> (one block per (query_token,
+    /// query_head), same tiled shared-memory layout) -- the only difference is that K/V rows
+    /// are resolved through <paramref name="kBlockPtrs"/>/<paramref name="vBlockPtrs"/> (a
+    /// small per-layer device array of block base pointers, see
+    /// <see cref="CudaPagedKvCache.PrepareNativeBlockPtrs"/>) instead of a flat contiguous
+    /// buffer, eliminating the D2D gather <see cref="CudaPagedKvCache.PrepareAttentionScratch"/>
+    /// would otherwise need to run before this launch.
+    /// </summary>
+    /// <param name="kBlockPtrs">Device pointer to an array of <c>ceil(seqKv/blockSize)</c> device pointers (K blocks, this layer).</param>
+    /// <param name="vBlockPtrs">Device pointer to an array of <c>ceil(seqKv/blockSize)</c> device pointers (V blocks, this layer).</param>
+    /// <param name="blockSize">Tokens per block (<see cref="CudaKvBlockPool.BlockSize"/>).</param>
+    #pragma warning disable CS1573 // match LaunchAttention; remaining params are self-documenting
+    public void LaunchAttentionPaged(nint q, nint kBlockPtrs, nint vBlockPtrs, nint output,
+                                      int seqQ, int seqKv, int blockSize,
+                                      int numHeads, int numKvHeads, int headDim,
+                                      int positionOffset, int slidingWindow, nint stream)
+    {
+        if (_attentionPagedFunc == 0)
+            throw new InvalidOperationException(
+                "attention_f16_paged is not available in the loaded PTX (stale build). " +
+                "Check HasAttentionF16Paged before calling LaunchAttentionPaged.");
+
+        nint qArg = q, kbpArg = kBlockPtrs, vbpArg = vBlockPtrs, outArg = output;
+        int sqArg = seqQ, skvArg = seqKv, bsArg = blockSize;
+        int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
+        int poArg = positionOffset, swArg = slidingWindow;
+
+        void** args = stackalloc void*[] {&qArg, &kbpArg, &vbpArg, &outArg,
+                        &sqArg, &skvArg, &bsArg, &nhArg, &nkvArg, &hdArg,
+                        &poArg, &swArg};
+
+        int numBlocks = seqQ * numHeads;
+        // Same shared-memory layout/size as LaunchAttention (q_shared+score_tile+out_accum+warp_scratch).
+        const int TileKv = 256;
+        uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
+
+        CudaDriverApi.cuLaunchKernel(_attentionPagedFunc,
                 (uint)numBlocks, 1, 1, BlockSize, 1, 1,
                 sharedBytes, stream, (nint)args, 0).ThrowOnError();
     }

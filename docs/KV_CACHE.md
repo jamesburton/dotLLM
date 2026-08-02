@@ -24,7 +24,7 @@ Simple indexing: `K_cache[layer][head][pos] = new_K`. Wastes memory for short se
 
 ## Paged KV-Cache
 
-Inspired by OS virtual memory paging. This is the **memory management** half of PagedAttention (vLLM): block-based allocation, ref counting, CoW. The **kernel** half (attention reading non-contiguous blocks directly) is a future step — current kernels see contiguous buffers via staging-buffer gather.
+Inspired by OS virtual memory paging. This is the **memory management** half of PagedAttention (vLLM): block-based allocation, ref counting, CoW. The **kernel** half (attention reading non-contiguous blocks directly) is opt-in on CUDA as of issue #200 (`DOTLLM_ATTN_PAGED_NATIVE=1`, decode only — see the CUDA section below); it remains a future step for CPU and any future Vulkan paged cache, where current kernels still see contiguous buffers via staging-buffer gather.
 
 ### Why
 
@@ -88,12 +88,26 @@ GPU-resident mirror of the above, in `DotLLM.Cuda`:
   `CudaKvBlockPool`, mirroring `PagedKvCacheFactory`.
 - Wired into `CudaTransformerModel` via `CreateKvBlockPool`/`CreatePagedKvCache`, and into `--paged`
   for the `run`/`chat`/`serve` CLI commands.
+- `CudaTransformerModel.ForwardBatch` (issue #251) is a real, fused-launch-sequence override — no
+  longer the `IModel` per-sequence-loop default — so `ContinuousBatchScheduler`-driven multi-sequence
+  decode on CUDA runs through this cache's dispatch too, not just single-sequence `run`/`chat`.
 
-**Not yet wired**: the direct block-table-read attention kernel that would eliminate the
-gather-into-scratch step (issue #200, `docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md`) and
-`ContinuousBatchScheduler` integration (the scheduler dispatches through `IModel.ForwardBatch`,
-which `CudaTransformerModel` does not yet override — a CUDA model with paged KV-cache still serves
-each request through the per-request `TextGenerator` path, same as before this cache existed).
+**Issue #200 (opt-in, default OFF)**: a direct block-table-read decode attention kernel,
+`attention_f16_paged`, now exists alongside the default gather-into-scratch path — see
+`docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md` for the full design/implementation note. Set
+`DOTLLM_ATTN_PAGED_NATIVE=1` to enable it. It reads K/V rows through a small per-layer array of
+block base device pointers (`CudaPagedKvCache.PrepareNativeBlockPtrs`) instead of gathering KV
+bytes into a contiguous scratch buffer first (`PrepareAttentionScratch`), eliminating that D2D copy
+on the decode hot path. Restricted to decode (`seqLen == 1`); prefill still uses the gather-based
+path (G3/flash prefill kernels need a contiguous buffer regardless). Default remains the
+gather-based dispatch — this kernel is unmeasured on real hardware as of this writing (see the
+design doc's "What's still unverified" section) and is deliberately opt-in per this project's
+"don't ship an unvalidated kernel as the default" convention.
+
+**Still not wired**: `ContinuousBatchScheduler`'s own paged-pool-aware preemption/prefix-trie logic
+(`pagedPool:` parameter) is CPU-`KvBlockPool`-typed and does not drive `CudaPagedKvCache` — CUDA
+requests still get scheduled without paged-cache-aware preemption, even though the cache itself is
+now paged. This is a separate scheduler-integration gap, not part of #200's scope.
 
 ### CLI
 
@@ -120,10 +134,14 @@ dotllm serve model.gguf --no-ui
   (shared buffer). CUDA's `CudaPagedKvCache` doesn't implement `GetKeysRef`/`GetValuesRef` at all —
   there's no single contiguous device pointer to hand back without a gather — callers must use
   `PrepareAttentionScratch(layerIndex, stream)` instead.
-- CUDA paged KV-cache is not wired into `ContinuousBatchScheduler` — see the CUDA section above.
-- The direct block-table-read attention kernel (eliminating the staging/scratch gather on either
-  backend) is a separate future step — see `docs/ROADMAP.md`'s "Paged attention kernels" row and
-  issue #200 (CUDA design in `docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md`).
+- CUDA paged KV-cache is not wired into `ContinuousBatchScheduler`'s paged-pool-aware preemption —
+  see the CUDA section above.
+- CUDA has an opt-in direct block-table-read decode attention kernel now (issue #200,
+  `DOTLLM_ATTN_PAGED_NATIVE=1`, see the CUDA section above and
+  `docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md`), but it defaults OFF pending real-hardware
+  measurement, and it only covers CUDA decode — CPU's `PagedKvCache` and any future Vulkan paged
+  cache still only have the staging-buffer-gather shape (see `docs/ROADMAP.md`'s "Paged attention
+  kernels" row for the remaining backends/prefill scope).
 
 ## KV-Cache Quantization
 
