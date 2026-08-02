@@ -118,6 +118,58 @@ public sealed class VulkanMoeGroupByExpertF32KernelTests
         F16Bf16Fixture.AssertClose(expected, actual, outputDim, hidden, absTol: 5e-3f, relTol: 1e-3f);
     }
 
+    /// <summary>
+    /// Issue #240: same parity gate against the explicit
+    /// <see cref="MoeGroupedCoopmatVariant.Coopmat32"/> variant (wave32-pinned 32-thread
+    /// workgroup). Skips when either the device cannot pin <c>requiredSubgroupSize=32</c> or
+    /// (expected on this machine — the shader was authored without a Vulkan SDK/<c>glslc</c> to
+    /// compile it) <c>moe_grouped_matmul_f16_coopmat32.spv</c> is not yet present. Once compiled
+    /// via <c>native/vulkan/build.ps1</c>/<c>build.sh</c>, this test starts exercising it.
+    /// </summary>
+    [SkippableFact]
+    public void GroupedF16Coopmat32Matmul_MatchesCpuReference()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        const int rows = 11;
+        const int hidden = 32;
+        const int outputDim = 19;
+        const int numExperts = 4;
+
+        int[] indices = [2, 0, 2, 1, 3, 1, 0, 3, 1, 2, 0];
+        uint[] offsets = ComputeOffsets(indices, numExperts);
+
+        var rng = new Random(0x5EED);
+        float[] x = F16Bf16Fixture.RandomFloats(rng, rows * hidden, range: 0.5f);
+        float[] weightsF32 = F16Bf16Fixture.RandomFloats(rng, numExperts * outputDim * hidden, range: 0.1f);
+        byte[] weightsF16 = F16Bf16Fixture.QuantizeRowsF16(weightsF32, numExperts * outputDim, hidden);
+        float[] expected = CpuGroupedMatmulF16(weightsF16, x, offsets, outputDim, hidden, rows, numExperts);
+
+        using var device = VulkanDevice.Create();
+        var variant = MoeGroupedCoopmatVariant.Coopmat32;
+        Skip.IfNot(variant.IsSupportedOn(device, spvDir),
+            $"{variant.SpvFileName} not available (device cannot pin requiredSubgroupSize=32, " +
+            "or the shader has not been compiled yet via native/vulkan/build.ps1/build.sh).");
+        using var kernel = MoeGroupedMatmulF16CoopmatKernel.Create(device, spvDir, variant);
+
+        using var weightsBuf = device.Allocate((long)weightsF16.Length);
+        using var xBuf = device.Allocate((long)x.Length * sizeof(float));
+        using var offsetsBuf = device.Allocate((long)offsets.Length * sizeof(uint));
+        using var yBuf = device.Allocate((long)expected.Length * sizeof(float));
+
+        device.Upload(weightsF16, weightsBuf);
+        device.Upload(x, xBuf);
+        device.Upload(MemoryMarshal.AsBytes<uint>(offsets), offsetsBuf);
+
+        kernel.Launch(weightsBuf, xBuf, offsetsBuf, yBuf,
+            outputDim, hidden, rows, numExperts);
+
+        float[] actual = new float[expected.Length];
+        device.Download(yBuf, actual);
+
+        F16Bf16Fixture.AssertClose(expected, actual, outputDim, hidden, absTol: 5e-3f, relTol: 1e-3f);
+    }
+
     private static uint[] ComputeOffsets(int[] indices, int numExperts)
     {
         var counts = new uint[numExperts];

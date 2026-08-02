@@ -1,0 +1,207 @@
+#version 450
+// ONE-SUBGROUP-PER-WORKGROUP VARIANT of matmul_q8_0_gemm_coopmat.comp, paired
+// with requiredSubgroupSize = 32 on the pipeline (see MatMulQ8_0GemmCoopmatKernel /
+// Q8_0GemmCoopmatVariant.Coopmat32 in the C# host).
+//
+// Issue #240 audit: #236/PR#238 found that pinning the PQ2_0 coopmat kernel to a
+// 32-thread workgroup + VkPipelineShaderStageRequiredSubgroupSizeCreateInfo(32) is
+// worth a further 1.29-1.79x on gfx1151 on top of the coopmat tile itself, because
+// RDNA3.5's WMMA is a wave32 instruction while the driver defaults compute dispatch
+// to wave64 (VulkanDevice.SubgroupSize reports 64 there). Every coopmat pipeline in
+// the repo that has not been audited for this is plausibly paying the same tax.
+// This file is that fix for the Q8_0 GEMM coopmat kernel specifically.
+//
+// This is NOT simply matmul_q8_0_gemm_coopmat.comp with local_size_x changed: that
+// shader hardcodes per-thread work counts (8 elements/thread staging sharedB, 4
+// lanes/row + 8 cols/thread dequantizing sharedA, 4 cells/thread on the store
+// scatter) that assume exactly 64 invocations. Halving the workgroup to 32 threads
+// without doubling each of those per-thread work counts would silently leave half
+// of sharedB/sharedA unstaged (zeroed by nothing — undefined/stale shared memory)
+// and half the store-scatter cells unwritten. (Contrast matmul_pq2_0_f32_gemm_coopmat.comp,
+// which issue #236 already wrote WG_SIZE-generically via `gl_WorkGroupSize.x`-derived
+// per-thread constants — that file's coopmat32 sibling really is just the layout line.
+// This file hand-derives the equivalent 32-thread constants instead of refactoring
+// the shipping 64-thread original in place, so this new, unvalidated variant cannot
+// regress the proven 64-thread kernel every model on `dev` already depends on.)
+//
+// Derivation of the 32-thread constants (mechanically identical to the 64-thread
+// file with WG_SIZE=32 substituted through the same per-thread-work formulas):
+//   sharedB staging : B_ELEMS = TN*BK = 16*32 = 512;  B_PER_THR = 512/32 = 16
+//   sharedA dequant : LANES_PER_ROW = WG_SIZE/TM = 32/16 = 2;  A_COLS_PER_THR = BK/LANES_PER_ROW = 32/2 = 16
+//   store scatter   : STORE_ITERS = (TM*TN)/WG_SIZE = 256/32 = 8
+//
+// Numerically identical to the 64-thread kernel (same K-reduction order per weight
+// row/token pair, same F16 staging, same coopMatMulAdd tiling) — only the mapping
+// of GPU threads to staging work changes. Held to the same coopmat parity tolerance
+// (abs 5e-3 / rel 5e-3) as matmul_q8_0_gemm_coopmat.comp in
+// VulkanMatMulQ8_0GemmCoopmatKernelTests.
+//
+// STATUS: written and reviewed by hand; NOT YET COMPILED (no Vulkan SDK / glslc
+// available in the session that authored this) and NOT wired into
+// MatMulQ8_0GemmCoopmatKernel.Create's default selection until it is. See
+// Q8_0GemmCoopmatVariant.SelectFor's file-existence + device-capability gate.
+
+#extension GL_KHR_cooperative_matrix      : require
+#extension GL_KHR_memory_scope_semantics  : require
+#extension GL_KHR_shader_subgroup_basic   : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage    : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; }; // Q8_0 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; };      // [N*K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };      // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim (number of weight rows)
+    uint K;             // contraction dim (must be a multiple of 32)
+    uint N;             // batch size (number of input rows)
+    uint blocksPerRow;  // = K / 32
+    uint rowUints;      // per-row uint stride = ceil(blocksPerRow * 34 / 4)
+} pc;
+
+const uint TM    = 16u;  // coopmat M — output-row tile
+const uint TN    = 16u;  // coopmat N — output-col tile
+const uint TK    = 16u;  // coopmat K per coopMatMulAdd
+const uint BK    = 32u;  // K elements staged into shared mem per outer iter (one Q8_0 block)
+const uint BLOCK = 32u;  // Q8_0 group size (must equal BK)
+const uint BLOCK_BYTES = 34u;
+const uint WG_SIZE = 32u;
+
+// Per-thread work counts for WG_SIZE=32 (see header derivation).
+const uint B_ELEMS = TN * BK;                    // 512
+const uint B_PER_THR = B_ELEMS / WG_SIZE;        // 16
+const uint LANES_PER_ROW = WG_SIZE / TM;         // 2
+const uint A_COLS_PER_THR = BK / LANES_PER_ROW;  // 16
+const uint STORE_ITERS = (TM * TN) / WG_SIZE;    // 8
+
+// Shared weight tile: [TM rows][BK cols] as F16. Row-major flattened.
+// Stores d × q (dequantised int8 scaled by the block's fp16 scale).
+shared float16_t sharedA[TM * BK];
+
+// Shared input tile: [TN rows][BK cols] as F16. Row-major flattened.
+shared float16_t sharedB[TN * BK];
+
+// Staging for bounds-guarded store path (TM × TN cells, stored from
+// coopmat accumulator then scattered to C with per-lane checks).
+shared float storeStage[TM * TN];
+
+// Q8_0 helpers — identical to matmul_q8_0_gemm_coopmat.comp / matmul_q8_0_gemm.comp.
+int readQsByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    int bv = int((u >> shift) & 0xFFu);
+    return (bv ^ 0x80) - 0x80;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+void main() {
+    uint mBase = gl_WorkGroupID.x * TM; // weight rows (C columns)
+    uint tBase = gl_WorkGroupID.y * TN; // input rows (C rows)
+
+    uint tid = gl_LocalInvocationID.x;  // 0..WG_SIZE-1
+    uint rowByteStride = pc.blocksPerRow * BLOCK_BYTES;
+
+    // Single coopmat F32 accumulator for the whole K contraction — the
+    // master result tile. Updated in place by each coopMatMulAdd.
+    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums =
+        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint kBlock = 0u; kBlock < pc.blocksPerRow; kBlock++) {
+        uint kBase = kBlock * BLOCK;
+
+        // ---- 1. Stage sharedB[TN, BK] as F16. TN*BK=512, WG=32, B_PER_THR=16 per thread. ----
+        for (uint i = 0u; i < B_PER_THR; i++) {
+            uint idx = tid * B_PER_THR + i;
+            uint row = idx / BK;             // 0..15
+            uint col = idx - row * BK;       // 0..31
+            uint tGlobal = tBase + row;
+            float v = 0.0;
+            if (tGlobal < pc.N) {
+                v = b[tGlobal * pc.K + kBase + col];
+            }
+            sharedB[row * BK + col] = float16_t(v);
+        }
+
+        // ---- 2. Dequantise + pre-scale sharedA[TM, BK] as d × q in F16. ----
+        // 32 threads, LANES_PER_ROW=2 per row, A_COLS_PER_THR=16 cols per thread.
+        // The fp16 scale d for this block is read once per row (lane 0 of the
+        // 2-thread row pair) and applied inline to each int8 q.
+        uint mLocal = tid / LANES_PER_ROW;              // 0..15
+        uint laneOfRow = tid - mLocal * LANES_PER_ROW;  // 0..1
+        uint mGlobal = mBase + mLocal;
+
+        bool rowValid = mGlobal < pc.M;
+        float d = 0.0;
+        uint blockBase = 0u;
+        if (rowValid) {
+            blockBase = mGlobal * rowByteStride + kBlock * BLOCK_BYTES;
+            d = readHalf(blockBase);
+        }
+
+        uint col0 = laneOfRow * A_COLS_PER_THR;
+        for (uint j = 0u; j < A_COLS_PER_THR; j++) {
+            uint col = col0 + j;
+            float q = 0.0;
+            if (rowValid) {
+                q = d * float(readQsByte(blockBase + 2u + col));
+            }
+            sharedA[mLocal * BK + col] = float16_t(q);
+        }
+
+        // Shared-mem fences: ensure every thread's writes are visible to
+        // the coopmat load below, which reads subgroup-wide.
+        barrier();
+        memoryBarrierShared();
+
+        // ---- 3. Two coopMatMulAdd — K slices [0,16) and [16,32). ----
+        for (uint kSlice = 0u; kSlice < BK; kSlice += TK) {
+            coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> aTile;
+            coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> bTile;
+
+            coopMatLoad(aTile, sharedA, kSlice, BK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(bTile, sharedB, kSlice, BK, gl_CooperativeMatrixLayoutColumnMajor);
+
+            sums = coopMatMulAdd(aTile, bTile, sums);
+        }
+
+        barrier();
+    }
+
+    // ---- 4. Store output. ----
+    bool tileAllIn = (mBase + TM) <= pc.M && (tBase + TN) <= pc.N;
+
+    if (tileAllIn) {
+        coopMatStore(sums, c, tBase * pc.M + mBase, pc.M, gl_CooperativeMatrixLayoutColumnMajor);
+    } else {
+        coopMatStore(sums, storeStage, 0, TM, gl_CooperativeMatrixLayoutColumnMajor);
+        barrier();
+
+        // WG_SIZE=32 threads, TM*TN=256 cells -> STORE_ITERS=8 cells per thread.
+        for (uint i = 0u; i < STORE_ITERS; i++) {
+            uint idx = tid + i * WG_SIZE;    // 0..255
+            if (idx >= TM * TN) break;
+            uint t = idx / TM;                // 0..15
+            uint m = idx - t * TM;             // 0..15
+            uint mGlobal = mBase + m;
+            uint tGlobal = tBase + t;
+            if (mGlobal < pc.M && tGlobal < pc.N) {
+                c[tGlobal * pc.M + mGlobal] = storeStage[t * TM + m];
+            }
+        }
+    }
+}
