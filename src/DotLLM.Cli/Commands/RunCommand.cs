@@ -518,6 +518,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         }
 
         DotLLM.Engine.KvCache.PagedKvCacheFactory? pagedFactory = null;
+        DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
         try
         {
             // Add stop sequences for tool calling end-of-turn tokens
@@ -544,11 +545,26 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? kvFactory = null;
             if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
             {
-                if (settings.Paged)
-                    Console.Error.WriteLine("WARNING: Paged KV-cache not supported with CUDA, using GPU cache.");
-                kvFactory = kvConfig.IsQuantized
-                    ? (cfg, size) => cudaModel.CreateKvCache(size, kvConfig)
-                    : (cfg, size) => cudaModel.CreateKvCache(size);
+                if (settings.Paged && kvConfig.IsQuantized)
+                {
+                    Console.Error.WriteLine("WARNING: Paged KV-cache does not support quantization yet, using quantized GPU cache.");
+                    kvFactory = (cfg, size) => cudaModel.CreateKvCache(size, kvConfig);
+                }
+                else if (settings.Paged)
+                {
+                    // Issue #252: block-scattered device storage + gather-into-scratch attention
+                    // dispatch. Mirrors the CPU `--paged` branch below.
+                    cudaPagedFactory = new DotLLM.Cuda.CudaPagedKvCacheFactory(
+                        DotLLM.Core.Attention.KvGeometry.FromConfig(config));
+                    var factory = cudaPagedFactory;
+                    kvFactory = (cfg, size) => cudaModel.CreatePagedKvCache(factory.Pool, size);
+                }
+                else
+                {
+                    kvFactory = kvConfig.IsQuantized
+                        ? (cfg, size) => cudaModel.CreateKvCache(size, kvConfig)
+                        : (cfg, size) => cudaModel.CreateKvCache(size);
+                }
             }
             else if (model is DotLLM.Cuda.HybridTransformerModel hybridModel)
             {
@@ -839,6 +855,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             foreach (var inner in innerAdapters)
                 inner.Dispose();
             pagedFactory?.Dispose();
+            cudaPagedFactory?.Dispose();
             model.Dispose();
             gguf?.Dispose();
             safetensorsSource?.Dispose();

@@ -7,6 +7,26 @@ comments on #200 (2026-07-27); nothing material has changed since.
 **Predecessor pattern:** `docs/perf/MMA_BATCHED_MMQ.md` — same shape of problem (a real kernel
 idea with a missing engine-side producer), same conclusion structure.
 
+> **Update (issue #252, landed):** Prerequisite chain item 2 below (§5) — "CUDA paged KV-cache
+> infrastructure" — is done: `CudaKvBlockPool` + `CudaKvBlockTable` + `CudaPagedKvCache` now exist
+> in `src/DotLLM.Cuda/` (see `docs/KV_CACHE.md`'s "CUDA Paged KV-Cache" section), wired into
+> `CudaTransformerModel` and `--paged` on `run`/`chat`/`serve` via a gather-into-scratch dispatch
+> (mirrors the CPU `PagedKvCache`'s staging-buffer approach — the existing attention kernels are
+> unmodified). This issue (#200 — the *direct* block-table-read kernel eliminating that gather) is
+> still not attempted; the remaining blocker is chain item 1 (CUDA multi-sequence batched decode /
+> `CudaTransformerModel.ForwardBatch`), which #252 deliberately did not attempt (§4 below explains
+> why the block-table ABI depended on it) — **that dependency is now the sole reason left, not
+> "both are undesigned."** #252's answer to the launch-granularity question this note raises in §4
+> point 1: the block table it shipped is **per-sequence, one array per active sequence** — s
+> `CudaKvBlockTable` maps one sequence's logical blocks to physical block IDs, with no batch
+> dimension baked in anywhere (not in `CudaKvBlockPool`, which is shared and layer-indexed only, and
+> not in the per-sequence table). This is deliberately agnostic to whether #251 ends up dispatching
+> one kernel launch per sequence (trivial: this block table needs nothing added) or a fused
+> multi-sequence launch (needs a `[batch, maxBlocksPerSeq]` array built by concatenating N of these
+> per-sequence tables' `_blockIds` — straightforward, not a redesign). #251 does not need to
+> re-derive the block-table shape; it only needs to decide the launch granularity itself and, if
+> batched, write the small concatenation step.
+
 ## TL;DR
 
 Re-verified as of 2026-08-01: **the prerequisite chain #200's own comments identified on

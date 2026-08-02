@@ -1166,6 +1166,19 @@ public sealed unsafe class CudaTransformerModel : IModel
                     DispatchAttention(cudaKvCache.GetKeysPtr(layer), cudaKvCache.GetValuesPtr(layer),
                         seqKv, positions[0]);
                 }
+                else if (kvCache is CudaPagedKvCache cudaPagedKvCache)
+                {
+                    // Issue #252: block-scattered storage. Write into the (possibly newly
+                    // allocated / CoW'd) block(s), then gather into the contiguous scratch
+                    // buffer the existing attention kernels expect — same staging-buffer shape
+                    // as the CPU PagedKvCache; the direct block-table-read kernel that would
+                    // eliminate this gather is issue #200's separate, still-blocked scope.
+                    cudaPagedKvCache.UpdateDevice(kPtr, vPtr, positions, seqLen, layer, s);
+                    int seqKv = cudaPagedKvCache.CurrentLength;
+                    var (kCachePtr, vCachePtr) = cudaPagedKvCache.PrepareAttentionScratch(layer, s);
+                    MarkProfile(ProfileCategory.KvUpdate);
+                    DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0]);
+                }
                 else
                 {
                     MarkProfile(ProfileCategory.KvUpdate);
@@ -3074,6 +3087,37 @@ public sealed unsafe class CudaTransformerModel : IModel
         if (!config.IsQuantized)
             return new CudaKvCache(geom, maxSeqLen);
         return new CudaQuantizedKvCache(geom, maxSeqLen, config);
+    }
+
+    /// <summary>
+    /// Creates a shared GPU-resident paged block pool (issue #252) sized for this model's layer
+    /// geometry. Pass the returned pool to <see cref="CreatePagedKvCache"/> for each sequence, or
+    /// use <see cref="CudaPagedKvCacheFactory"/> directly when a single owner should manage the
+    /// pool's lifetime across many per-sequence caches (server / continuous-batching pattern,
+    /// mirrors <c>PagedKvCacheFactory</c> on the CPU side).
+    /// </summary>
+    /// <param name="blockSize">Number of tokens per block (default: 16, matches the CPU pool).</param>
+    /// <param name="maxTotalTokens">Maximum total tokens across all sequences sharing this pool.</param>
+    public CudaKvBlockPool CreateKvBlockPool(int blockSize = 16, int maxTotalTokens = 65536)
+    {
+        _context.MakeCurrent();
+        return new CudaKvBlockPool(Core.Attention.KvGeometry.FromConfig(Config), blockSize, maxTotalTokens, _context);
+    }
+
+    /// <summary>
+    /// Creates a paged KV-cache (issue #252) for a single sequence, backed by
+    /// <paramref name="pool"/>. The pool is typically shared across every sequence a
+    /// server/scheduler admits, so caller owns disposing it once (via <see cref="CudaKvBlockPool"/>
+    /// or a wrapping <see cref="CudaPagedKvCacheFactory"/>) — disposing the per-sequence
+    /// <see cref="CudaPagedKvCache"/> only frees that sequence's block-table entries back to the
+    /// shared pool plus its own scratch buffers, not the pool itself.
+    /// </summary>
+    /// <param name="pool">Shared block pool, e.g. from <see cref="CreateKvBlockPool"/>.</param>
+    /// <param name="maxSeqLen">Maximum sequence length for this cache.</param>
+    public CudaPagedKvCache CreatePagedKvCache(CudaKvBlockPool pool, int maxSeqLen)
+    {
+        _context.MakeCurrent();
+        return new CudaPagedKvCache(pool, maxSeqLen);
     }
 
     /// <summary>

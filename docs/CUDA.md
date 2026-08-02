@@ -803,6 +803,14 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
     a "read paged blocks directly" kernel to attach to. Real prerequisite: a CUDA paged KV-cache
     implementation, worth building once continuous batching (already tracked) makes multi-sequence
     paged decode the common case.
+    **Update (issue #252, landed):** the prerequisite named above now exists —
+    `CudaKvBlockPool`/`CudaKvBlockTable`/`CudaPagedKvCache` (see `docs/KV_CACHE.md`'s "CUDA Paged
+    KV-Cache" section), wired into `CudaTransformerModel` and `--paged` on `run`/`chat`/`serve`.
+    #200 itself (the direct block-table-read kernel eliminating the gather-into-scratch step) is
+    still not attempted — the block pool this note called "the real prerequisite" is done, but the
+    other prerequisite named in `docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md` (a CUDA multi-sequence
+    batched-decode call shape, i.e. `CudaTransformerModel.ForwardBatch`) is not, so #200 stays
+    blocked on that one alone now.
   - **#219: found and fixed a real kv_split grid-sizing bug in #197/#198's own heuristic.**
     `ComputeAttentionKvSplit`'s `AttnSplitMinKvPerSplit` term (default 128) was the binding clamp
     at Bonsai's actual decode depth (seqKv~258-270), forcing `kv_split=3` (grid=12 — *half* the
