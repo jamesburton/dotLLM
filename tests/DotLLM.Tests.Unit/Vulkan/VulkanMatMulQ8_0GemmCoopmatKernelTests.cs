@@ -83,6 +83,37 @@ public class VulkanMatMulQ8_0GemmCoopmatKernelTests
             device.HasCooperativeMatrix,
             $"VK_KHR_cooperative_matrix not supported on {device.DeviceName}.");
 
+        RunAndAssert(device, spvDir, Q8_0GemmCoopmatVariant.SelectFor(device, spvDir), m, k, n);
+    }
+
+    /// <summary>
+    /// Issue #240: same parity gate against the explicit
+    /// <see cref="Q8_0GemmCoopmatVariant.Coopmat32"/> variant (wave32-pinned 32-thread
+    /// workgroup). Skips separately from <see cref="Launch_MatchesCpuReference"/> when either
+    /// the device cannot pin <c>requiredSubgroupSize=32</c> or (expected on this machine —
+    /// the shader was authored without a Vulkan SDK/<c>glslc</c> to compile it)
+    /// <c>matmul_q8_0_gemm_coopmat32.spv</c> is not yet present in <paramref name="spvDir"/>'s
+    /// directory. Once compiled via <c>native/vulkan/build.ps1</c>/<c>build.sh</c>, this test
+    /// starts exercising it on any host that supports the pin.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(2, 4, 32)]
+    [InlineData(64, 576, 576)]
+    [InlineData(64, 4096, 4096)]
+    public void Launch_Coopmat32MatchesCpuReference(int n, int m, int k)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        var variant = Q8_0GemmCoopmatVariant.Coopmat32;
+        Skip.IfNot(variant.IsSupportedOn(device, spvDir),
+            $"{variant.SpvFileName} not available (device cannot pin requiredSubgroupSize=32, " +
+            "or the shader has not been compiled yet via native/vulkan/build.ps1/build.sh).");
+
+        RunAndAssert(device, spvDir, variant, m, k, n);
+    }
+
+    private void RunAndAssert(VulkanDevice device, string spvDir, Q8_0GemmCoopmatVariant variant, int m, int k, int n)
+    {
         var rng = new Random(0xBEEF + n * 31 + m * 17 + k * 3);
         float[] weightsF32 = RandomFloats(rng, m * k, range: 0.1f);
         float[] inputB = RandomFloats(rng, n * k, range: 1.0f);
@@ -96,7 +127,7 @@ public class VulkanMatMulQ8_0GemmCoopmatKernelTests
         // CPU reference over the exact Q8_0 bytes the GPU sees.
         float[] expected = CpuGemmQ8_0(weightsQ8, inputB, m, k, n);
 
-        using var kernel = MatMulQ8_0GemmCoopmatKernel.Create(device, spvDir);
+        using var kernel = MatMulQ8_0GemmCoopmatKernel.Create(device, spvDir, variant);
 
         long weightsBufBytes = ((long)totalBytes + 3) & ~3L;
         using var bufW = device.Allocate(weightsBufBytes);

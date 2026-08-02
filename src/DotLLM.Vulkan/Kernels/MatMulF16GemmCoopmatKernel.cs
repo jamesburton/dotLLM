@@ -3,6 +3,40 @@ using DotLLM.Vulkan.Interop;
 namespace DotLLM.Vulkan.Kernels;
 
 /// <summary>
+/// Identifies an F16 coopmat GEMM shader variant — see
+/// <see cref="Kernels.Q8_0GemmCoopmatVariant"/> (issue #240) for the rationale; this is the
+/// same wave-width-pin fix applied to <see cref="MatMulF16GemmCoopmatKernel"/>.
+/// </summary>
+/// <param name="SpvFileName">File name of the SPIR-V module within the <c>spv</c> directory.</param>
+/// <param name="RequiredSubgroupSize">Non-zero pins the pipeline to this wave width.</param>
+public readonly record struct F16GemmCoopmatVariant(string SpvFileName, int RequiredSubgroupSize)
+{
+    /// <summary>Baseline 64-thread coopmat kernel.</summary>
+    public static F16GemmCoopmatVariant Coopmat64 => new("matmul_f16_gemm_coopmat.spv", 0);
+
+    /// <summary>32-thread workgroup pinned to wave32.</summary>
+    public static F16GemmCoopmatVariant Coopmat32 => new("matmul_f16_gemm_coopmat32.spv", 32);
+
+    /// <summary>
+    /// Whether <paramref name="device"/> can create a pipeline for this variant right now: the
+    /// pinnable subgroup size (when declared) AND the compiled SPIR-V present in
+    /// <paramref name="spvDir"/> — see <see cref="Q8_0GemmCoopmatVariant.IsSupportedOn"/>'s
+    /// remarks for why the file-existence check matters.
+    /// </summary>
+    public bool IsSupportedOn(VulkanDevice device, string spvDir)
+    {
+        if (RequiredSubgroupSize != 0
+            && !device.SupportsRequiredSubgroupSize((uint)RequiredSubgroupSize, VkShaderStageFlags.Compute))
+            return false;
+        return File.Exists(Path.Combine(spvDir, SpvFileName));
+    }
+
+    /// <summary>Picks the fastest variant this device can actually run right now.</summary>
+    public static F16GemmCoopmatVariant SelectFor(VulkanDevice device, string spvDir)
+        => Coopmat32.IsSupportedOn(device, spvDir) ? Coopmat32 : Coopmat64;
+}
+
+/// <summary>
 /// F16 native batched GEMM via <c>VK_KHR_cooperative_matrix</c>:
 /// <c>C[N, M] = B[N, K] @ W_f16[M, K]^T</c>.
 /// </summary>
@@ -19,7 +53,7 @@ namespace DotLLM.Vulkan.Kernels;
 /// Availability: this kernel requires the physical device to advertise
 /// <c>VK_KHR_cooperative_matrix</c> with a 16x16x16 F16xF16->F32 subgroup
 /// tile. Callers must check <see cref="VulkanDevice.HasCooperativeMatrix"/>
-/// before calling <see cref="Create"/> — otherwise an exception is thrown.
+/// before calling <see cref="Create(VulkanDevice, string)"/> — otherwise an exception is thrown.
 /// The orchestrator wires runtime dispatch selection (coopmat vs scalar) in
 /// <c>RecordMatmul</c>.
 /// </para>
@@ -58,13 +92,22 @@ public sealed class MatMulF16GemmCoopmatKernel : IDisposable
     }
 
     /// <summary>
-    /// Loads <c>matmul_f16_gemm_coopmat.spv</c> from the given directory and
-    /// creates the pipeline. Requires
+    /// Loads the fastest coopmat variant <paramref name="device"/> can run right now
+    /// (<see cref="F16GemmCoopmatVariant.SelectFor"/>) and creates the pipeline. Requires
     /// <see cref="VulkanDevice.HasCooperativeMatrix"/> to be <c>true</c> —
     /// throws <see cref="InvalidOperationException"/> otherwise so the caller
     /// can fall back to <see cref="MatMulF16GemmF32Kernel"/>.
     /// </summary>
     public static MatMulF16GemmCoopmatKernel Create(VulkanDevice device, string spvDir)
+        => Create(device, spvDir, F16GemmCoopmatVariant.SelectFor(device, spvDir));
+
+    /// <summary>
+    /// Loads the SPIR-V for <paramref name="variant"/> and creates the pipeline. The explicit
+    /// overload exists so a benchmark can A/B <see cref="F16GemmCoopmatVariant.Coopmat64"/> vs
+    /// <see cref="F16GemmCoopmatVariant.Coopmat32"/> side by side in one process.
+    /// </summary>
+    /// <exception cref="FileNotFoundException">The variant's SPIR-V is missing from <paramref name="spvDir"/>.</exception>
+    public static MatMulF16GemmCoopmatKernel Create(VulkanDevice device, string spvDir, F16GemmCoopmatVariant variant)
     {
         if (!device.HasCooperativeMatrix)
             throw new InvalidOperationException(
@@ -72,7 +115,7 @@ public sealed class MatMulF16GemmCoopmatKernel : IDisposable
                 "Check VulkanDevice.HasCooperativeMatrix before calling Create() and fall " +
                 "back to MatMulF16GemmF32Kernel when it is false.");
 
-        string path = Path.Combine(spvDir, "matmul_f16_gemm_coopmat.spv");
+        string path = Path.Combine(spvDir, variant.SpvFileName);
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
@@ -88,7 +131,8 @@ public sealed class MatMulF16GemmCoopmatKernel : IDisposable
             pipeline = module.CreateComputePipeline(
                 entryPoint: "main",
                 bindings: bindings,
-                pushConstantBytes: PushConstantBytes);
+                pushConstantBytes: PushConstantBytes,
+                requiredSubgroupSize: (uint)variant.RequiredSubgroupSize);
         }
         catch
         {

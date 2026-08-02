@@ -49,6 +49,38 @@ public class VulkanMatMulF16GemmCoopmatKernelTests
         Skip.IfNot(device.HasCooperativeMatrix,
             "Device does not advertise VK_KHR_cooperative_matrix.");
 
+        RunAndAssert(device, spvDir, F16GemmCoopmatVariant.SelectFor(device, spvDir), m, k, n);
+    }
+
+    /// <summary>
+    /// Issue #240: same parity gate against the explicit
+    /// <see cref="F16GemmCoopmatVariant.Coopmat32"/> variant (wave32-pinned 32-thread
+    /// workgroup). Skips separately from <see cref="Launch_MatchesCpuReference"/> when either
+    /// the device cannot pin <c>requiredSubgroupSize=32</c> or (expected on this machine —
+    /// the shader was authored without a Vulkan SDK/<c>glslc</c> to compile it)
+    /// <c>matmul_f16_gemm_coopmat32.spv</c> is not yet present in <paramref name="spvDir"/>'s
+    /// directory. Once compiled via <c>native/vulkan/build.ps1</c>/<c>build.sh</c>, this test
+    /// starts exercising it on any host that supports the pin.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(16, 32, 16)]
+    [InlineData(64, 128, 16)]
+    [InlineData(256, 512, 16)]
+    public void Launch_Coopmat32MatchesCpuReference(int m, int k, int n)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        using var device = VulkanDevice.Create();
+        var variant = F16GemmCoopmatVariant.Coopmat32;
+        Skip.IfNot(variant.IsSupportedOn(device, spvDir),
+            $"{variant.SpvFileName} not available (device cannot pin requiredSubgroupSize=32, " +
+            "or the shader has not been compiled yet via native/vulkan/build.ps1/build.sh).");
+
+        RunAndAssert(device, spvDir, variant, m, k, n);
+    }
+
+    private static void RunAndAssert(VulkanDevice device, string spvDir, F16GemmCoopmatVariant variant, int m, int k, int n)
+    {
         var rng = new Random(0xF16C + m * 7 + k * 11 + n * 13);
         float[] weightsF32 = F16Bf16Fixture.RandomFloats(rng, m * k, range: 0.1f);
         float[] inputB = F16Bf16Fixture.RandomFloats(rng, n * k, range: 1.0f);
@@ -57,7 +89,7 @@ public class VulkanMatMulF16GemmCoopmatKernelTests
 
         float[] expected = F16Bf16Fixture.CpuGemmF16(weightsF16, inputB, m, k, n);
 
-        using var kernel = MatMulF16GemmCoopmatKernel.Create(device, spvDir);
+        using var kernel = MatMulF16GemmCoopmatKernel.Create(device, spvDir, variant);
 
         long weightsBufBytes = ((long)weightsF16.Length + 3) & ~3L;
         using var bufW = device.Allocate(weightsBufBytes);
