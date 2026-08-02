@@ -62,6 +62,39 @@ Future optimization: specialized paged attention kernels that read blocks direct
 - `PagedKvCache : IKvCache` — Paged cache with staging-buffer gather. Drop-in replacement for `SimpleKvCache`.
 - `PagedKvCacheFactory` — Creates `PagedKvCache` instances backed by a shared `KvBlockPool`.
 
+### CUDA Paged KV-Cache (issue #252)
+
+GPU-resident mirror of the above, in `DotLLM.Cuda`:
+
+- `CudaKvBlockPool` — Same `[totalBlocks, blockSize, kvStride]` shape as `KvBlockPool`, but block
+  storage lives in device memory (FP16, matching `CudaKvCache`'s on-device element type) instead of
+  host `NativeMemory`. Allocation/free-list/refcount bookkeeping stays host-side (a C# `lock` +
+  `Interlocked`, identical to the CPU pool) — only block storage and copy-on-write duplication
+  (`CopyBlock`) touch the device. Built around `KvGeometry` (per-layer stride) rather than a single
+  scalar stride, matching `CudaKvCache`/`CudaQuantizedKvCache`'s existing generalization for
+  Gemma-4's non-uniform layer shapes.
+- `CudaKvBlockTable` — Per-sequence block table, same semantics as `KvBlockTable` (`Fork`,
+  `EnsureWritable`/CoW, `SeedSharedBlocks`, `SnapshotFullBlocks`), except `EnsureWritable` drives a
+  device-to-device async copy on a caller-supplied CUDA stream instead of `Buffer.MemoryCopy`.
+- `CudaPagedKvCache : IKvCache, IPerLayerKvCache` — Device-pointer-only cache (mirrors
+  `CudaKvCache`/`CudaQuantizedKvCache`'s convention: `Update(ITensor/TensorRef)`,
+  `GetKeys`/`GetValues`, and `GetKeysRef`/`GetValuesRef` all throw `NotSupportedException`). Driven
+  via `UpdateDevice` (block-boundary-batched D2D writes, allocating/CoW'ing blocks as needed) and
+  `PrepareAttentionScratch` (gathers this layer's blocks into a contiguous FP16 scratch buffer via
+  D2D copies — the GPU-side equivalent of `PagedKvCache`'s staging-buffer gather). The existing
+  CUDA attention kernels are unmodified; they read the gathered scratch exactly like a plain
+  `CudaKvCache`'s buffer.
+- `CudaPagedKvCacheFactory` — Creates `CudaPagedKvCache` instances backed by a shared
+  `CudaKvBlockPool`, mirroring `PagedKvCacheFactory`.
+- Wired into `CudaTransformerModel` via `CreateKvBlockPool`/`CreatePagedKvCache`, and into `--paged`
+  for the `run`/`chat`/`serve` CLI commands.
+
+**Not yet wired**: the direct block-table-read attention kernel that would eliminate the
+gather-into-scratch step (issue #200, `docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md`) and
+`ContinuousBatchScheduler` integration (the scheduler dispatches through `IModel.ForwardBatch`,
+which `CudaTransformerModel` does not yet override — a CUDA model with paged KV-cache still serves
+each request through the per-request `TextGenerator` path, same as before this cache existed).
+
 ### CLI
 
 ```
@@ -78,9 +111,19 @@ dotllm serve model.gguf --no-ui
 
 ### Limitations (v1)
 
-- CPU `PagedKvCache` only. CUDA and hybrid models fall back to their native KV-cache.
-- Not compatible with quantized KV-cache (`--cache-type-k`/`--cache-type-v`). Falls back to `QuantizedKvCache` with a warning.
-- Staging buffer means `GetKeysRef`/`GetValuesRef` results are only valid until the next call (shared buffer).
+- CUDA now has a paged KV-cache (issue #252, see above) via `CudaPagedKvCache`. Hybrid (CPU+GPU
+  split-layer) models still fall back to their native KV-cache — `CudaKvBlockPool`'s per-layer
+  shape assumes every layer's storage lives on one device, which doesn't fit the hybrid split.
+- Not compatible with quantized KV-cache (`--cache-type-k`/`--cache-type-v`) on either backend.
+  Falls back to `QuantizedKvCache`/`CudaQuantizedKvCache` with a warning.
+- Staging buffer means `GetKeysRef`/`GetValuesRef` (CPU) results are only valid until the next call
+  (shared buffer). CUDA's `CudaPagedKvCache` doesn't implement `GetKeysRef`/`GetValuesRef` at all —
+  there's no single contiguous device pointer to hand back without a gather — callers must use
+  `PrepareAttentionScratch(layerIndex, stream)` instead.
+- CUDA paged KV-cache is not wired into `ContinuousBatchScheduler` — see the CUDA section above.
+- The direct block-table-read attention kernel (eliminating the staging/scratch gather on either
+  backend) is a separate future step — see `docs/ROADMAP.md`'s "Paged attention kernels" row and
+  issue #200 (CUDA design in `docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md`).
 
 ## KV-Cache Quantization
 
