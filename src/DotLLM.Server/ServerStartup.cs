@@ -145,14 +145,35 @@ public static class ServerStartup
 
         Func<ModelConfig, int, IKvCache>? kvFactory = null;
         PagedKvCacheFactory? pagedFactory = null;
+        DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
         PrefixTrieManager? prefixTrieManager = null;
         if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
         {
-            if (options.UsePaged)
-                Console.WriteLine("[dotllm] Paged KV-cache not supported with CUDA, using GPU cache.");
-            kvFactory = kvConfig.IsQuantized
-                ? (cfg, size) => cudaModel.CreateKvCache(size, kvConfig)
-                : (cfg, size) => cudaModel.CreateKvCache(size);
+            if (options.UsePaged && kvConfig.IsQuantized)
+            {
+                Console.WriteLine("[dotllm] Paged KV-cache does not support quantization yet, using quantized GPU cache.");
+                kvFactory = (cfg, size) => cudaModel.CreateKvCache(size, kvConfig);
+            }
+            else if (options.UsePaged)
+            {
+                // Issue #252: GPU-resident block pool + gather-into-scratch attention dispatch.
+                // NOT wired into ContinuousBatchScheduler (pagedFactory stays null below) — the
+                // scheduler runs through IModel.ForwardBatch, which CudaTransformerModel doesn't
+                // yet override, so CUDA requests continue to serve one at a time through the
+                // per-request TextGenerator path exactly as before this cache existed. Only the
+                // per-request KV-cache backing changes (block-based instead of one flat buffer).
+                cudaPagedFactory = new DotLLM.Cuda.CudaPagedKvCacheFactory(
+                    DotLLM.Core.Attention.KvGeometry.FromConfig(config));
+                var factory = cudaPagedFactory;
+                kvFactory = (cfg, size) => cudaModel.CreatePagedKvCache(factory.Pool, size);
+                Console.WriteLine("[dotllm] Using GPU paged KV-cache (block-based allocation, single-request dispatch)");
+            }
+            else
+            {
+                kvFactory = kvConfig.IsQuantized
+                    ? (cfg, size) => cudaModel.CreateKvCache(size, kvConfig)
+                    : (cfg, size) => cudaModel.CreateKvCache(size);
+            }
         }
         else if (model is DotLLM.Cuda.HybridTransformerModel hybridModel)
         {
@@ -276,6 +297,7 @@ public static class ServerStartup
             KvCacheConfig = kvConfig,
             KvCacheFactory = kvFactory,
             PagedFactory = pagedFactory,
+            CudaPagedFactory = cudaPagedFactory,
             PrefixCache = prefixCache,
             PrefixTrieManager = prefixTrieManager,
             IsReady = true,

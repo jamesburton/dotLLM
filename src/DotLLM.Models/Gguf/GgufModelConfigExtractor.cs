@@ -914,14 +914,29 @@ public static class GgufModelConfigExtractor
         int dimCount = (int)metadata.GetUInt32OrDefault(dimCountKey, (uint)headDim);
 
         // Determine RoPE element-pairing convention. Must match the GGUF Q/K weight layout:
-        // - Llama/Mistral: converter permutes Q/K weights → interleaved (Norm)
+        // - Llama/Mistral: mainline llama.cpp's converter permutes Q/K weights → interleaved (Norm)
         // - Qwen/Phi: weights kept in HuggingFace order → non-interleaved (NeoX)
         // Qwen family (dense + MoE + GDN hybrid) and Phi keep HF weight order → NeoX pairing.
+        //
+        // BitNet (issue #247): despite being "Llama-shaped" architecturally, BitNet GGUFs are
+        // written by Microsoft's own bitnet.cpp fork of llama.cpp, whose `BitnetModel.modify_tensors`
+        // does NOT call the `permute()` step that `LlamaModel.modify_tensors` applies to attn_q/attn_k
+        // (verified against bitnet.cpp's `convert-hf-to-gguf-bitnet.py`: `BitnetModel` overrides
+        // `modify_tensors` to quantize weights but never invokes `permute`). So BitNet's Q/K weights
+        // stay in the original HuggingFace (`rotate_half`) layout, same as Qwen/Phi — NeoX pairing is
+        // required, not Norm. Applying Norm (interleaved) pairing to HF-layout weights doesn't corrupt
+        // short-range attention (rotation angles are near-identity for small positions/relative
+        // distances) but increasingly scrambles the learned phase structure as position grows, which
+        // is exactly the "quality degrades with sequence length" symptom this fixes. This is
+        // BitNet-specific: other I2_S-quantized GGUFs built on a plain Llama-arch body (e.g.
+        // Falcon-E-3B, Falcon3-3B) go through the normal llama.cpp Llama conversion path (with the
+        // permute) and correctly resolve to Architecture.Llama, not Architecture.BitNet, so they are
+        // unaffected by this case.
         RoPEType ropeType = architecture switch
         {
             Architecture.Qwen or Architecture.QwenMoe
                 or Architecture.Qwen3MoeHybrid or Architecture.Phi
-                or Architecture.GptOss => RoPEType.NeoX,
+                or Architecture.GptOss or Architecture.BitNet => RoPEType.NeoX,
             _ => RoPEType.Norm,
         };
 

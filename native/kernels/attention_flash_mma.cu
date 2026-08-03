@@ -50,6 +50,30 @@
 #define Q_TILE 16
 #define KV_TILE 16
 
+// Shared-memory row-stride padding (bank-conflict fix, 2026-08-01). HEAD_DIM (64 halves =
+// 128 bytes = exactly 32 banks) and KV_TILE (16 halves = 32 bytes = 8 banks) both divide the
+// 32-bank cycle evenly, so every row of sK/sQ/sVt/sP lands in the same bank phase as the row
+// before it -- the classic power-of-two-stride conflict. `ncu --set full` on this kernel
+// (s=1024, .perf-runs/flash_mma_s1024_details.txt) measured this directly: 9.7-way shared-load
+// bank conflicts (84% of load wavefronts, Est. Speedup 77.4%) and 4.0-way shared-store
+// conflicts (72% of store wavefronts, Est. Speedup 66.4%) -- while DRAM throughput was only
+// 2%, ruling out actual bandwidth as the bottleneck.
+//
+// Padding every row stride breaks the alignment -- the exact technique already proven in this
+// codebase's I2_S GEMM kernel (MatMul.I2S.cs: 128-word stride -> 129) -- BUT sK/sQ/sVt/sP are
+// read via `ldmatrix`, which requires each per-thread row address to be 16-byte aligned (CUDA
+// error 716 "misaligned address" if violated -- confirmed the hard way: a naive +1-halfword
+// pad breaks this, since `(lane & 15) * stride` must stay a multiple of 8 halfwords for every
+// lane value, which only holds if the stride itself is a multiple of 8). So these four pad by
+// +8 elements (stays a multiple of 8 halfwords => 16-byte-aligned rows; new stride not a
+// multiple of the 128-byte/32-bank cycle either). sScore is float and read only via plain
+// per-lane scalar loads (no ldmatrix), so it only needs its usual 4-byte alignment -- pads by
+// +1 like the I2_S precedent. Combined cost across all five arrays at MAX_GROUP_WARPS=4 is a
+// few hundred bytes -- negligible next to the 5-blocks/SM shared-mem occupancy ceiling.
+#define HEAD_DIM_PAD (HEAD_DIM + 8)   // sK / sQ row stride (72 halves, ldmatrix-safe)
+#define KV_TILE_PAD (KV_TILE + 8)     // sVt / sP row stride (24 halves, ldmatrix-safe)
+#define KV_TILE_PAD_SCORE (KV_TILE + 1) // sScore row stride (17 floats, plain scalar access)
+
 // ldmatrix.x4: load four 8x8 FP16 matrices from shared into a warp's fragment.
 __device__ __forceinline__ void ldmatrix_x4(unsigned (&r)[4], const void* smem_ptr)
 {
@@ -102,6 +126,114 @@ __device__ __forceinline__ void mma_m16n8k16(
 //   K/V load → compute barrier is __syncthreads() (cross-warp); QK / softmax / PV stay
 //   per-warp under __syncwarp(). Per-warp state (sQ/sScore/sP/sM/sL/sCorr/O_frag) is
 //   warp-indexed; sK/sVt are block-shared.
+//
+// 2026-08-01 — SHARED-MEMORY BANK-CONFLICT FIX, real measured win, supersedes the "double-
+// buffered K/V loads" headroom guess above. `ncu --set full` at s=1024 (real Llama-3.2-1B
+// shape, .perf-runs/flash_mma_s1024_details.txt) found the actual bottleneck was NOT latency/
+// occupancy: DRAM throughput was only 2% (ruling out bandwidth) while shared LOADS showed a
+// 9.7-way bank conflict (84% of load wavefronts, Est. Speedup 77.4%) and shared STORES a
+// 4.0-way conflict (72% of store wavefronts, Est. Speedup 66.4%). Root cause: HEAD_DIM (64
+// halves = 128 bytes = exactly 32 banks) and KV_TILE (16 halves/floats = 8/16 banks) both
+// divide the 32-bank cycle evenly, so sK/sQ/sVt/sP/sScore's row strides put every row in the
+// same bank phase. Fixed by padding every row stride (HEAD_DIM_PAD/KV_TILE_PAD/
+// KV_TILE_PAD_SCORE below) — same technique as this codebase's I2_S GEMM kernel (128-word
+// stride -> 129). One real subtlety: `ldmatrix` requires 16-byte-aligned per-thread row
+// addresses, so sK/sQ/sVt/sP (all ldmatrix-accessed) pad by +8 elements (stays a multiple of
+// 8 halfwords), not the naive +1 that immediately hit CUDA error 716 "misaligned address" on
+// real hardware. sScore is float and only ever read via plain per-lane scalar loads (no
+// ldmatrix), so it safely pads by +1 like the I2_S precedent.
+//
+// Measured (real interleaved A/B via CudaTensorCoreAttentionParityTests.
+// CompletePathTimingVsAttentionF16, DOTLLM_CUDA_ATTN_BENCH=1, RTX 3060, Llama-3.2-1B shape):
+// G3/flash speedup roughly DOUBLED to TRIPLED — 1.3-1.69x pre-fix -> 3.65x @ s=1024, 3.61x @
+// s=2048, 2.96x @ s=4096 post-fix. Also closed most of the gap to the GEMM-only floor (the
+// "~3x worse than cuBLAS per-FLOP" claim above): floor/flash is now ~1.4-1.7x (was implied
+// ~3x), i.e. this kernel moved from ~33% to ~58-70% of cuBLAS's raw per-FLOP efficiency at
+// this shape, purely from fixing shared-memory access pattern, no algorithmic change.
+// Correctness: FlashMmaPath_MatchesAttentionF16 passes bit/tolerance-clean at s=512/1024/2048
+// (5e-3 abs-or-rel), full CUDA suite (401+ tests) green, zero regressions.
+//
+// Build-system gotcha found along the way, fixed separately in DotLLM.Cuda.csproj: this file
+// (and its decode sibling attention_flash_mma_decode_gqa_split.cu) needs compute_86 for its
+// mma.sync instructions, but the MSBuild CompileCudaPtx target had no per-file arch override
+// (unlike native/build_ptx.bat's ARCH_86 list) — a plain `dotnet build` after any edit to this
+// file silently regenerated wrong-arch (compute_75) PTX. That doesn't fail the build; it fails
+// SILENTLY at runtime (CudaKernels.cs's best-effort module load catches the JIT error and just
+// leaves HasAttentionFlashMma false, falling back to G3 with no visible symptom). Added the
+// same per-file %(CudaKernel.Arch) override to the csproj so plain `dotnet build` now matches
+// build_ptx.bat's output.
+//
+// Post-fix `ncu` confirmation (same day): a second elevated `ncu --set full` capture on this
+// exact kernel/shape directly confirms the mechanism, not just the wall-clock effect. Shared
+// LOAD bank conflicts (9.7-way, 84% of wavefronts pre-fix) are now fully gone -- `ncu` no
+// longer flags them at all. Shared STORE conflicts improved but did not fully clear: 4.0-way
+// (72% of wavefronts) -> 2.5-way (60%), Est. Speedup dropped 66.4% -> 29.3%. Duration this
+// launch: 1.55ms -> 0.959ms (-38%). Checked whether a different pad size closes the remaining
+// store gap: it can't -- `ldmatrix`'s 16-byte alignment forces the stride to stay a multiple
+// of 8 halfwords, which forces the bank-stride to a multiple of 4 banks, capping the
+// achievable distribution period at 32/4=8 rows. +8 already hits that ceiling (verified +16
+// and +32 are WORSE -- period 4 and 2 respectively -- and +24/+40 only tie it). The residual
+// store conflict most likely comes from sScore/sP's per-LANE sequential write in the online-
+// softmax loop (`wP[lane * KV_TILE_PAD + j]` inside a `for j` loop) -- a different access
+// shape than the row-parallel ldmatrix reads this padding targeted. A real further lever, but
+// needs a softmax-write restructure, not a stride tweak -- not attempted this pass. See
+// docs/perf/CUDA_OPTIMIZATION_SWEEP_2026-08.md for the full writeup.
+//
+// 2026-08-01 -- #249 follow-up investigation of the residual 2.5-way store conflict above.
+// No elevated `ncu` access in this session (background agent, can't satisfy the UAC prompt),
+// so root-caused by hand-deriving the actual per-instruction bank-conflict multiplicity for
+// every shared STORE in the kernel body (bank(lane) = (word-offset(lane)) mod 32, then
+// checking which lane pairs collide). Two distinct store patterns contribute, and the dominant
+// one turned out to be DIFFERENT from the wP hypothesis recorded above:
+//
+//   1. The QK-spill scale-write into sScore (`wScore[r0*KV_TILE_PAD_SCORE+kcol] = ...`, 8 store
+//      statements/KV-tile, ALL 32 lanes active, r0=lane>>2, kcol=(lane&3)*2+{0,1}+ns*8). With
+//      KV_TILE_PAD_SCORE=17 (chosen for the read pattern below), hand-deriving bank(lane) for
+//      all 32 lanes shows up to a 4-WAY conflict (e.g. lanes {3,10,17,24} all map to bank 6) --
+//      worse than the 2-way this file's own +8-padding ceiling reasoning was built around.
+//   2. wP's per-lane sequential write (`wP[lane*KV_TILE_PAD+j]`, 16 store statements/KV-tile,
+//      only lanes<Q_TILE active) -- the pattern this file already flagged above. Uniform 2-way
+//      (lanes 8 apart collide), forced by ldmatrix's 8-halfword-multiple alignment requirement.
+//
+// Checked whether a bigger/different KV_TILE_PAD_SCORE could kill #1 too: sScore has NO
+// ldmatrix alignment constraint (plain scalar float access only), so its stride is fully free
+// unlike sK/sQ/sVt/sP. Reformulating the QK-spill's address as e(m,sub)=m*S+sub mod16 (m=r0/2,
+// sub=lane%4) shows odd S in {3,5,7,9,11,13} mod 16 caps the QK-spill conflict at 2-way (down
+// from 4-way) -- S=19 (KV_TILE+3) is such a value, and PROVABLY no odd S can do better than
+// 2-way here (a perfect bijection needs {0,S,2S,3S} mod 16 = {0,4,8,12}, which forces S even --
+// incompatible with S odd, which the read pattern below needs). So S=17 (this file's actual
+// choice, ≡1 mod16) is provably the WORST odd choice for the QK-spill pattern specifically --
+// but it was chosen correctly for a different, more-frequent pattern: the online-softmax loop
+// reads wScore[lane*S+j] for the SAME 16 active lanes twice per KV-tile (m_cur loop + p loop,
+// 32 read instructions vs the QK-spill's 8 writes) and needs gcd(S,32)<=2 to stay conflict-free
+// across lanes 0..15 -- true for ANY odd S, so switching to S=19 would have fixed the write
+// side without breaking the read side. Implemented and tested (S=19, correctness-clean,
+// FlashMmaPath_MatchesAttentionF16 still 5e-3 tolerance-clean at s=512/1024/2048).
+//
+// Real A/B (CompletePathTimingVsAttentionF16, DOTLLM_CUDA_ATTN_BENCH=1, RTX 3060, interleaved
+// same-session runs, 4 samples per config to bound this box's clock-drift noise): flashMMA
+// absolute ms, S=17 baseline vs S=19 candidate --
+//   s=1024: baseline {0.657,0.681,0.666,0.664} mean 0.667 | S=19 {0.665,0.666,0.667,0.647}
+//     mean 0.661 (~1% better, inside per-config spread)
+//   s=2048: baseline {2.435,2.418,2.347,2.419} mean 2.405 | S=19 {2.352,2.351,2.343,2.372}
+//     mean 2.355 (~2% better)
+//   s=4096: baseline {10.994,10.402,10.195,10.455} mean 10.512 | S=19 {10.210,10.564,9.898,
+//     11.013} mean 10.421 (~1% better, but S=19's own run-to-run spread here is 9.898-11.013,
+//     i.e. 11% -- LARGER than the ~1-2% mean delta being measured)
+// Verdict: NOT a clear win. The ~1-2% mean deltas are smaller than this box's own measured
+// run-to-run noise band (4-11% peak-to-trough per config, consistent with the documented GPU
+// clock drift under repeated heavy kernel launches). A mathematically real, provable reduction
+// in worst-case per-instruction bank-conflict multiplicity (4-way -> 2-way) for a genuine,
+// previously mis-attributed conflict source did NOT translate into a measurable real speedup.
+// Cross-checked against the post-#248 `ncu` capture's Scheduler Statistics
+// (flash_mma_s1024_postfix_details.txt): only 0.58 of 12 warps/scheduler were eligible per
+// cycle (Est. Local Speedup 55.21% from occupancy/latency-hiding alone) -- i.e. this kernel is
+// now bottlenecked on warp-issue eligibility (latency hiding), not on shared-store throughput,
+// so further reducing store bank conflicts has little room left to matter at the wall-clock
+// level. REVERTED (KV_TILE_PAD_SCORE stayed at KV_TILE+1); no code change shipped from this
+// investigation. The bigger, still-open lever for this kernel is the occupancy/latency-hiding
+// gap (see docs/perf/CUDA_OPTIMIZATION_SWEEP_2026-08.md section 6b item 1's own "small
+// fraction of kernel work" caveat) -- out of scope for #249, tracked separately.
 extern "C" __global__ void __launch_bounds__(MAX_GROUP_WARPS * 32) attention_flash_mma_f16(
     const half* __restrict__ q,   // [seq, numHeads,   headDim] row-major
     const half* __restrict__ k,   // [seq, numKvHeads, headDim] row-major
@@ -126,12 +258,12 @@ extern "C" __global__ void __launch_bounds__(MAX_GROUP_WARPS * 32) attention_fla
     const int kv_stride = num_kv_heads * HEAD_DIM;
 
     // Block-shared K/V tiles (loaded once, reused by all `group` warps).
-    __shared__ half sK[KV_TILE * HEAD_DIM];        // [key][d]
-    __shared__ half sVt[HEAD_DIM * KV_TILE];       // V transposed: [d][key]
+    __shared__ half sK[KV_TILE * HEAD_DIM_PAD];        // [key][d], row stride HEAD_DIM_PAD
+    __shared__ half sVt[HEAD_DIM * KV_TILE_PAD];       // V transposed: [d][key], row stride KV_TILE_PAD
     // Per-warp state (warp-indexed slices).
-    __shared__ half sQ[MAX_GROUP_WARPS][Q_TILE * HEAD_DIM];     // [warp][q][d]
-    __shared__ half sP[MAX_GROUP_WARPS][Q_TILE * KV_TILE];      // [warp] normalised P: [q][key]
-    __shared__ float sScore[MAX_GROUP_WARPS][Q_TILE * KV_TILE]; // [warp] raw S spilled
+    __shared__ half sQ[MAX_GROUP_WARPS][Q_TILE * HEAD_DIM_PAD];     // [warp][q][d], row stride HEAD_DIM_PAD
+    __shared__ half sP[MAX_GROUP_WARPS][Q_TILE * KV_TILE_PAD];      // [warp] normalised P: [q][key], row stride KV_TILE_PAD
+    __shared__ float sScore[MAX_GROUP_WARPS][Q_TILE * KV_TILE_PAD_SCORE]; // [warp] raw S spilled, row stride KV_TILE_PAD_SCORE
     __shared__ float sM[MAX_GROUP_WARPS][Q_TILE];              // [warp] running row max
     __shared__ float sL[MAX_GROUP_WARPS][Q_TILE];              // [warp] running row denom
     __shared__ float sCorr[MAX_GROUP_WARPS][Q_TILE];          // [warp] per-row O rescale
@@ -148,7 +280,7 @@ extern "C" __global__ void __launch_bounds__(MAX_GROUP_WARPS * 32) attention_fla
     {
         int qr = i / HEAD_DIM, d = i % HEAD_DIM;
         int gq = q0 + qr;
-        wQ[i] = (gq < seq) ? q[(size_t)gq * q_stride + hq * HEAD_DIM + d] : __float2half(0.0f);
+        wQ[qr * HEAD_DIM_PAD + d] = (gq < seq) ? q[(size_t)gq * q_stride + hq * HEAD_DIM + d] : __float2half(0.0f);
     }
 
     // O accumulator: 16 queries x 64 headDim = 8 n-subtiles, each a {f32 x4} frag.
@@ -180,9 +312,9 @@ extern "C" __global__ void __launch_bounds__(MAX_GROUP_WARPS * 32) attention_fla
             int kr = i / HEAD_DIM, d = i % HEAD_DIM;
             int gk = k0 + kr;
             half kv = (gk < seq) ? k[(size_t)gk * kv_stride + hk * HEAD_DIM + d] : __float2half(0.0f);
-            sK[i] = kv;
+            sK[kr * HEAD_DIM_PAD + d] = kv;
             half vv = (gk < seq) ? v[(size_t)gk * kv_stride + hk * HEAD_DIM + d] : __float2half(0.0f);
-            sVt[(size_t)d * KV_TILE + kr] = vv;   // transpose into [d][key]
+            sVt[(size_t)d * KV_TILE_PAD + kr] = vv;   // transpose into [d][key]
         }
         __syncthreads();   // block-wide: K/V visible to every warp before any warp reads
 
@@ -199,7 +331,7 @@ extern "C" __global__ void __launch_bounds__(MAX_GROUP_WARPS * 32) attention_fla
             unsigned a[4];
             // Each lane points at row (lane%16), the half-tile selected by lane/16
             // gives the 8-col offset; ldmatrix gathers the full 16x16.
-            const half* aptr = &wQ[(lane & 15) * HEAD_DIM + ks * 16 + (lane >> 4) * 8];
+            const half* aptr = &wQ[(lane & 15) * HEAD_DIM_PAD + ks * 16 + (lane >> 4) * 8];
             ldmatrix_x4(a, aptr);
 
             #pragma unroll
@@ -207,7 +339,7 @@ extern "C" __global__ void __launch_bounds__(MAX_GROUP_WARPS * 32) attention_fla
             {
                 // B = K[8 x 16] for keys [ns*8, ns*8+8): ldmatrix.x2 over [key][d].
                 unsigned b[2];
-                const half* bptr = &sK[(ns * 8 + (lane & 7)) * HEAD_DIM + ks * 16 + ((lane >> 3) & 1) * 8];
+                const half* bptr = &sK[(ns * 8 + (lane & 7)) * HEAD_DIM_PAD + ks * 16 + ((lane >> 3) & 1) * 8];
                 ldmatrix_x2(b, bptr);
                 mma_m16n8k16(S_frag[ns], a, b);
             }
@@ -218,10 +350,10 @@ extern "C" __global__ void __launch_bounds__(MAX_GROUP_WARPS * 32) attention_fla
         for (int ns = 0; ns < 2; ns++)
         {
             int kcol = ns * 8 + col_lo;
-            wScore[r0 * KV_TILE + kcol]       = S_frag[ns][0] * scale;
-            wScore[r0 * KV_TILE + ns * 8 + col_hi] = S_frag[ns][1] * scale;
-            wScore[(r0 + 8) * KV_TILE + kcol] = S_frag[ns][2] * scale;
-            wScore[(r0 + 8) * KV_TILE + ns * 8 + col_hi] = S_frag[ns][3] * scale;
+            wScore[r0 * KV_TILE_PAD_SCORE + kcol]       = S_frag[ns][0] * scale;
+            wScore[r0 * KV_TILE_PAD_SCORE + ns * 8 + col_hi] = S_frag[ns][1] * scale;
+            wScore[(r0 + 8) * KV_TILE_PAD_SCORE + kcol] = S_frag[ns][2] * scale;
+            wScore[(r0 + 8) * KV_TILE_PAD_SCORE + ns * 8 + col_hi] = S_frag[ns][3] * scale;
         }
         __syncwarp();
 
@@ -240,7 +372,7 @@ extern "C" __global__ void __launch_bounds__(MAX_GROUP_WARPS * 32) attention_fla
                 int gk = k0 + j;
                 if (gk < seq && gk <= causal_last)
                 {
-                    float s = wScore[lane * KV_TILE + j];
+                    float s = wScore[lane * KV_TILE_PAD_SCORE + j];
                     if (s > m_cur) m_cur = s;
                 }
             }
@@ -257,10 +389,10 @@ extern "C" __global__ void __launch_bounds__(MAX_GROUP_WARPS * 32) attention_fla
                 float p = 0.0f;
                 if (gk < seq && gk <= causal_last)
                 {
-                    p = __expf(wScore[lane * KV_TILE + j] - m_cur);
+                    p = __expf(wScore[lane * KV_TILE_PAD_SCORE + j] - m_cur);
                     l_cur += p;
                 }
-                wP[lane * KV_TILE + j] = __float2half(p);
+                wP[lane * KV_TILE_PAD + j] = __float2half(p);
             }
 
             wM[lane] = m_cur;
@@ -283,7 +415,7 @@ extern "C" __global__ void __launch_bounds__(MAX_GROUP_WARPS * 32) attention_fla
         // ---- PV: O[16 x 64] += P[16 x 16] . V[16 x 64], 8 n-subtiles, 1 k-step ----
         // A = P[16x16] from this warp's sP via ldmatrix.x4.
         unsigned pa[4];
-        const half* pptr = &wP[(lane & 15) * KV_TILE + (lane >> 4) * 8];
+        const half* pptr = &wP[(lane & 15) * KV_TILE_PAD + (lane >> 4) * 8];
         ldmatrix_x4(pa, pptr);
 
         #pragma unroll
@@ -291,7 +423,7 @@ extern "C" __global__ void __launch_bounds__(MAX_GROUP_WARPS * 32) attention_fla
         {
             // B = V^T[8 x 16] = sVt[d in n*8..n*8+8][key 0..15]. mma B is [n=8 x k=16].
             unsigned vb[2];
-            const half* vptr = &sVt[(n * 8 + (lane & 7)) * KV_TILE + ((lane >> 3) & 1) * 8];
+            const half* vptr = &sVt[(n * 8 + (lane & 7)) * KV_TILE_PAD + ((lane >> 3) & 1) * 8];
             ldmatrix_x2(vb, vptr);
             mma_m16n8k16(O_frag[n], pa, vb);
         }

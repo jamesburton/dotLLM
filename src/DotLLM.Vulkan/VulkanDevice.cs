@@ -189,6 +189,16 @@ public sealed class VulkanDevice : IDisposable
     /// </summary>
     public bool HasShaderInfoAmd { get; }
 
+    /// <summary>
+    /// True when the physical device advertises
+    /// <c>VK_KHR_pipeline_executable_properties</c> AND the device-create call
+    /// enabled its <c>pipelineExecutableInfo</c> feature. Prerequisite for
+    /// <see cref="GetPipelineSubgroupSizes"/>, which reports the wave width the
+    /// driver actually compiled a pipeline stage for — a diagnostic-only query
+    /// (issue #241); no codepath's correctness or performance depends on it.
+    /// </summary>
+    public bool HasPipelineExecutableProperties { get; }
+
     internal nint Handle => _device;
     internal nint Queue => _queue;
     internal nint CommandPool => _commandPool;
@@ -224,7 +234,8 @@ public sealed class VulkanDevice : IDisposable
         bool hasSubgroupSizeControl, uint minSubgroupSize, uint maxSubgroupSize,
         uint requiredSubgroupSizeStages,
         bool hasExternalSemaphoreWin32,
-        bool hasShaderInfoAmd)
+        bool hasShaderInfoAmd,
+        bool hasPipelineExecutableProperties)
     {
         _instance = instance;
         _physicalDevice = physical;
@@ -248,6 +259,7 @@ public sealed class VulkanDevice : IDisposable
         _requiredSubgroupSizeStages = requiredSubgroupSizeStages;
         HasExternalSemaphoreWin32 = hasExternalSemaphoreWin32;
         HasShaderInfoAmd = hasShaderInfoAmd;
+        HasPipelineExecutableProperties = hasPipelineExecutableProperties;
     }
 
     /// <summary>
@@ -410,9 +422,17 @@ public sealed class VulkanDevice : IDisposable
             // it at device-create is what makes vkGetShaderInfoAMD resolvable.
             bool hasShaderInfoAmd = HasDeviceExtension(physical, "VK_AMD_shader_info"u8);
 
+            // Probe VK_KHR_pipeline_executable_properties — diagnostic only
+            // (issue #241: read back the wave width the driver actually compiled
+            // a pipeline for). Extension presence + the pipelineExecutableInfo
+            // feature enable are both needed before the query is legal.
+            bool hasPipelineExecutableProperties =
+                HasDeviceExtension(physical, "VK_KHR_pipeline_executable_properties"u8);
+
             nint device = CreateLogicalDevice(
                 physical, queueFamily, hasCoopmat, hasExternalMemoryHost, hasIntegerDotProduct,
-                hasSubgroupSizeControl, hasExternalSemaphoreWin32, hasShaderInfoAmd);
+                hasSubgroupSizeControl, hasExternalSemaphoreWin32, hasShaderInfoAmd,
+                hasPipelineExecutableProperties);
 
             VulkanApi.vkGetDeviceQueue(device, queueFamily, 0, out nint queue);
 
@@ -432,7 +452,8 @@ public sealed class VulkanDevice : IDisposable
                 hasExternalMemoryHost, minImportedHostPointerAlignment,
                 hasIntegerDotProduct,
                 hasSubgroupSizeControl, minSubgroupSize, maxSubgroupSize,
-                requiredSubgroupSizeStages, hasExternalSemaphoreWin32, hasShaderInfoAmd);
+                requiredSubgroupSizeStages, hasExternalSemaphoreWin32, hasShaderInfoAmd,
+                hasPipelineExecutableProperties);
             instance = 0;
             return result;
         }
@@ -1114,7 +1135,8 @@ public sealed class VulkanDevice : IDisposable
     private static unsafe nint CreateLogicalDevice(
         nint physical, uint queueFamily,
         bool enableCoopmat, bool enableExternalMemoryHost, bool enableIntegerDotProduct,
-        bool enableSubgroupSizeControl, bool enableExternalSemaphoreWin32, bool enableShaderInfoAmd)
+        bool enableSubgroupSizeControl, bool enableExternalSemaphoreWin32, bool enableShaderInfoAmd,
+        bool enablePipelineExecutableProperties)
     {
         float priority = 1.0f;
 
@@ -1143,6 +1165,7 @@ public sealed class VulkanDevice : IDisposable
         ReadOnlySpan<byte> extSemName = "VK_KHR_external_semaphore\0"u8;
         ReadOnlySpan<byte> extSemWin32Name = "VK_KHR_external_semaphore_win32\0"u8;
         ReadOnlySpan<byte> shaderInfoAmdName = "VK_AMD_shader_info\0"u8;
+        ReadOnlySpan<byte> pipeExecName = "VK_KHR_pipeline_executable_properties\0"u8;
 
         // Pack name bytes + pointer array onto the stack. Worst case all eight
         // extension names are enabled at once (coopmat, external-memory ×2,
@@ -1154,8 +1177,9 @@ public sealed class VulkanDevice : IDisposable
         byte* nameBytes = stackalloc byte[
             coopmatName.Length + extMemHostName.Length + extMemName.Length
             + intDotName.Length + sscName.Length
-            + extSemName.Length + extSemWin32Name.Length + shaderInfoAmdName.Length];
-        nint* namePtrs = stackalloc nint[8];
+            + extSemName.Length + extSemWin32Name.Length + shaderInfoAmdName.Length
+            + pipeExecName.Length];
+        nint* namePtrs = stackalloc nint[9];
         int nameOffset = 0;
         uint extCount = 0;
 
@@ -1218,6 +1242,13 @@ public sealed class VulkanDevice : IDisposable
             nameOffset += shaderInfoAmdName.Length;
         }
 
+        if (enablePipelineExecutableProperties)
+        {
+            for (int i = 0; i < pipeExecName.Length; i++) nameBytes[nameOffset + i] = pipeExecName[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += pipeExecName.Length;
+        }
+
         // Feature structs chained through pNext on top of the extension enables:
         //  - VK_KHR_cooperative_matrix requires `cooperativeMatrix=VK_TRUE`.
         //  - VK_KHR_shader_integer_dot_product requires
@@ -1267,6 +1298,18 @@ public sealed class VulkanDevice : IDisposable
             timelineFeatures.timelineSemaphore = 1; // VK_TRUE
             timelineFeatures.pNext = featureChain;
             featureChain = (nint)(&timelineFeatures);
+        }
+
+        // VK_KHR_pipeline_executable_properties requires `pipelineExecutableInfo`
+        // enabled before vkGetPipelineExecutablePropertiesKHR may be called.
+        // Diagnostic-only (issue #241) — enabling it does not change compilation.
+        VkPhysicalDevicePipelineExecutablePropertiesFeaturesKhr pipeExecFeatures = default;
+        if (enablePipelineExecutableProperties)
+        {
+            pipeExecFeatures.sType = VkStructureType.PhysicalDevicePipelineExecutablePropertiesFeaturesKhr;
+            pipeExecFeatures.pipelineExecutableInfo = 1; // VK_TRUE
+            pipeExecFeatures.pNext = featureChain;
+            featureChain = (nint)(&pipeExecFeatures);
         }
 
         ci.pNext = featureChain;
@@ -2260,6 +2303,120 @@ public sealed class VulkanDevice : IDisposable
         int r = getShaderInfo(_device, pipeline, shaderStage, VkShaderInfoTypeAmd.Statistics, ref size, null);
         r.ThrowOnError("vkGetShaderInfoAMD (size query)");
         return (int)size;
+    }
+
+    /// <summary>
+    /// DIAGNOSTIC ONLY (issue #241): returns the driver's ISA disassembly text for
+    /// a compiled compute pipeline via <c>VK_AMD_shader_info</c>. On the AMD
+    /// proprietary driver (LLPC) the blob carries PAL metadata that names the
+    /// wavefront size the stage was compiled for — the ground truth that
+    /// <c>VkPipelineExecutablePropertiesKHR.subgroupSize</c> does NOT give on this
+    /// driver (it reports the workgroup size there instead).
+    /// </summary>
+    internal unsafe string GetShaderDisassemblyAmd(nint pipeline, uint shaderStage = VkShaderStageFlags.Compute)
+    {
+        if (!HasShaderInfoAmd)
+            throw new InvalidOperationException(
+                "Device does not support VK_AMD_shader_info — cannot query shader disassembly.");
+
+        nint fn = VulkanApi.vkGetDeviceProcAddr(_device, "vkGetShaderInfoAMD");
+        if (fn == 0)
+            throw new VulkanException(-3, "vkGetShaderInfoAMD not resolvable.");
+        var getShaderInfo = Marshal.GetDelegateForFunctionPointer<VkGetShaderInfoAMD>(fn);
+
+        nuint size = 0;
+        getShaderInfo(_device, pipeline, shaderStage, VkShaderInfoTypeAmd.Disassembly, ref size, null)
+            .ThrowOnError("vkGetShaderInfoAMD (disassembly size)");
+        if (size == 0) return string.Empty;
+
+        byte[] buffer = new byte[(int)size];
+        fixed (byte* p = buffer)
+        {
+            nuint sz = size;
+            getShaderInfo(_device, pipeline, shaderStage, VkShaderInfoTypeAmd.Disassembly, ref sz, p)
+                .ThrowOnError("vkGetShaderInfoAMD (disassembly)");
+        }
+        int len = Array.IndexOf(buffer, (byte)0);
+        return System.Text.Encoding.UTF8.GetString(buffer, 0, len < 0 ? buffer.Length : len);
+    }
+
+    // Delegate matching vkGetPipelineExecutablePropertiesKHR
+    // (VK_KHR_pipeline_executable_properties). Resolved lazily via
+    // vkGetDeviceProcAddr — same pattern as vkGetShaderInfoAMD above.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private unsafe delegate int VkGetPipelineExecutablePropertiesKHR(
+        nint device, VkPipelineInfoKhr* pPipelineInfo,
+        uint* pExecutableCount, VkPipelineExecutablePropertiesKhr* pProperties);
+
+    /// <summary>
+    /// One compiled executable of a pipeline, as reported by
+    /// <c>vkGetPipelineExecutablePropertiesKHR</c>.
+    /// </summary>
+    /// <param name="Name">Driver's name for the executable (e.g. "compute").</param>
+    /// <param name="Description">Driver's free-text description.</param>
+    /// <param name="SubgroupSize">
+    /// The wave width the driver ACTUALLY compiled this executable for. This is
+    /// the only introspection API in the codebase that reports it — it is
+    /// invisible to timing A/Bs, to SPIR-V disassembly, and to
+    /// <c>VK_AMD_shader_info</c>'s statistics (issue #241).
+    /// </param>
+    public readonly record struct PipelineExecutableInfo(string Name, string Description, uint SubgroupSize);
+
+    /// <summary>
+    /// Reports the compiled executables of <paramref name="pipeline"/>, including
+    /// the driver's actual per-executable subgroup (wave) size, via
+    /// <c>VK_KHR_pipeline_executable_properties</c>. Diagnostic only.
+    /// </summary>
+    /// <param name="pipeline">The <c>VkPipeline</c> handle (e.g. <c>ComputePipeline.Pipeline</c>).</param>
+    /// <exception cref="InvalidOperationException">Thrown when the device did not enable the extension (see <see cref="HasPipelineExecutableProperties"/>).</exception>
+    public unsafe IReadOnlyList<PipelineExecutableInfo> GetPipelineSubgroupSizes(nint pipeline)
+    {
+        if (!HasPipelineExecutableProperties)
+            throw new InvalidOperationException(
+                "Device does not support VK_KHR_pipeline_executable_properties — cannot query the compiled subgroup size.");
+
+        nint fn = VulkanApi.vkGetDeviceProcAddr(_device, "vkGetPipelineExecutablePropertiesKHR");
+        if (fn == 0)
+            throw new VulkanException(-3,
+                "vkGetPipelineExecutablePropertiesKHR not resolvable — extension not enabled at device create.");
+
+        var query = Marshal.GetDelegateForFunctionPointer<VkGetPipelineExecutablePropertiesKHR>(fn);
+
+        var info = new VkPipelineInfoKhr
+        {
+            sType = VkStructureType.PipelineInfoKhr,
+            pipeline = pipeline,
+        };
+
+        uint count = 0;
+        query(_device, &info, &count, null).ThrowOnError("vkGetPipelineExecutablePropertiesKHR (count)");
+        if (count == 0)
+            return Array.Empty<PipelineExecutableInfo>();
+
+        var props = new VkPipelineExecutablePropertiesKhr[count];
+        for (int i = 0; i < props.Length; i++)
+            props[i].sType = VkStructureType.PipelineExecutablePropertiesKhr;
+
+        var results = new PipelineExecutableInfo[count];
+        fixed (VkPipelineExecutablePropertiesKhr* p = props)
+        {
+            query(_device, &info, &count, p).ThrowOnError("vkGetPipelineExecutablePropertiesKHR");
+            for (uint i = 0; i < count; i++)
+            {
+                results[i] = new PipelineExecutableInfo(
+                    ReadFixedUtf8(p[i].name, VkPipelineExecutablePropertiesKhr.MaxDescriptionSize),
+                    ReadFixedUtf8(p[i].description, VkPipelineExecutablePropertiesKhr.MaxDescriptionSize),
+                    p[i].subgroupSize);
+            }
+        }
+        return results;
+    }
+
+    private static unsafe string ReadFixedUtf8(byte* p, int max)
+    {
+        int len = 0;
+        while (len < max && p[len] != 0) len++;
+        return System.Text.Encoding.UTF8.GetString(p, len);
     }
 
     // Maps the public handle-type enum to the internal interop flag bits.

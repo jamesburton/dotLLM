@@ -33,8 +33,13 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         public string Model { get; set; } = string.Empty;
 
         [CommandOption("--prompt|-p")]
-        [Description("Input prompt for generation (required).")]
+        [Description("Input prompt for generation. Required unless --prompt-file is given.")]
         public string? Prompt { get; set; }
+
+        [CommandOption("--prompt-file")]
+        [Description("Read the prompt from a file instead of --prompt. " +
+                     "A single trailing newline is stripped. Mutually exclusive with --prompt.")]
+        public string? PromptFile { get; set; }
 
         [CommandOption("--max-tokens|-n")]
         [Description("Maximum number of tokens to generate.")]
@@ -266,14 +271,18 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
-        if (string.IsNullOrEmpty(settings.Prompt))
+        if (!TextArgument.TryResolve(settings.Prompt, settings.PromptFile,
+                "--prompt|-p", "--prompt-file", required: true,
+                out string? resolvedPrompt, out string? promptError))
         {
             if (settings.Json)
-                Console.Error.WriteLine("Error: --prompt|-p is required.");
+                Console.Error.WriteLine($"Error: {promptError}");
             else
-                AnsiConsole.MarkupLine("[red]--prompt|-p is required.[/]");
+                AnsiConsole.MarkupLine($"[red]{Markup.Escape(promptError!)}[/]");
             return 1;
         }
+
+        string prompt = resolvedPrompt!;
 
         // HuggingFace safetensors directory? (config.json + *.safetensors /
         // model.safetensors.index.json). Auto-detected; loads via the
@@ -410,7 +419,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         // Parse tool definitions and format prompt via chat template when tools are provided
         ToolDefinition[]? tools = ChatCommand.ParseToolDefinitions(settings.Tools);
         IToolCallParser? toolCallParser = null;
-        string effectivePrompt = settings.Prompt;
+        string effectivePrompt = prompt;
         if (tools is { Length: > 0 } && gguf is null)
         {
             // Tool calling relies on the GGUF-embedded chat template; the HF
@@ -431,7 +440,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
             var messages = new List<ChatMessage>
             {
-                new() { Role = "user", Content = settings.Prompt }
+                new() { Role = "user", Content = prompt }
             };
             effectivePrompt = chatTemplate.Apply(messages, new ChatTemplateOptions
             {
@@ -509,6 +518,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         }
 
         DotLLM.Engine.KvCache.PagedKvCacheFactory? pagedFactory = null;
+        DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
         try
         {
             // Add stop sequences for tool calling end-of-turn tokens
@@ -525,7 +535,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             }
 
             if (!settings.Json)
-                Console.Write(tools is { Length: > 0 } ? "" : settings.Prompt);
+                Console.Write(tools is { Length: > 0 } ? "" : prompt);
 
             var kvConfig = new KvCacheConfig(
                 KvCacheConfig.ParseDType(settings.CacheTypeK),
@@ -535,11 +545,26 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? kvFactory = null;
             if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
             {
-                if (settings.Paged)
-                    Console.Error.WriteLine("WARNING: Paged KV-cache not supported with CUDA, using GPU cache.");
-                kvFactory = kvConfig.IsQuantized
-                    ? (cfg, size) => cudaModel.CreateKvCache(size, kvConfig)
-                    : (cfg, size) => cudaModel.CreateKvCache(size);
+                if (settings.Paged && kvConfig.IsQuantized)
+                {
+                    Console.Error.WriteLine("WARNING: Paged KV-cache does not support quantization yet, using quantized GPU cache.");
+                    kvFactory = (cfg, size) => cudaModel.CreateKvCache(size, kvConfig);
+                }
+                else if (settings.Paged)
+                {
+                    // Issue #252: block-scattered device storage + gather-into-scratch attention
+                    // dispatch. Mirrors the CPU `--paged` branch below.
+                    cudaPagedFactory = new DotLLM.Cuda.CudaPagedKvCacheFactory(
+                        DotLLM.Core.Attention.KvGeometry.FromConfig(config));
+                    var factory = cudaPagedFactory;
+                    kvFactory = (cfg, size) => cudaModel.CreatePagedKvCache(factory.Pool, size);
+                }
+                else
+                {
+                    kvFactory = kvConfig.IsQuantized
+                        ? (cfg, size) => cudaModel.CreateKvCache(size, kvConfig)
+                        : (cfg, size) => cudaModel.CreateKvCache(size);
+                }
             }
             else if (model is DotLLM.Cuda.HybridTransformerModel hybridModel)
             {
@@ -676,7 +701,10 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 kvCacheBytes = (long)config.NumLayers * 2 * cacheSize
                     * config.NumKvHeads * config.HeadDim
                     * (model is DotLLM.Cuda.CudaTransformerModel ? sizeof(ushort) : sizeof(float));
-            long totalMemory = modelWeightsBytes + computeBytes + kvCacheBytes;
+            // R4-interleaved buffers are a second, committed copy of the weights held alongside
+            // the mapped file — counting only the mapping understates the footprint by ~2x.
+            long repackedBytes = model.RepackedWeightBytes;
+            long totalMemory = modelWeightsBytes + repackedBytes + computeBytes + kvCacheBytes;
 
             // Backend/decode-path diagnostics
             string samplerPath = BuildSamplerPath(settings);
@@ -715,7 +743,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 var result = new RunJsonResult
                 {
                     Text = outputText,
-                    Prompt = settings.Prompt,
+                    Prompt = prompt,
                     Model = Path.GetFileName(resolvedPath),
                     Architecture = config.Architecture.ToString(),
                     FinishReason = finishReason.ToString().ToLowerInvariant(),
@@ -747,6 +775,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                     Memory = new RunMemoryDto
                     {
                         WeightsBytes = modelWeightsBytes,
+                        RepackedBytes = repackedBytes,
                         ComputeBytes = computeBytes,
                         KvCacheBytes = kvCacheBytes,
                         TotalBytes = totalMemory,
@@ -783,7 +812,10 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 bodyLines.Add(new Markup(PerfLine("Load", loadMs, null, null)));
                 bodyLines.Add(new Text(""));
                 bodyLines.Add(new Markup("  [bold]Memory[/]"));
-                bodyLines.Add(new Markup(MemLine("Weights", modelWeightsBytes, "(memory-mapped)")));
+                bodyLines.Add(new Markup(MemLine("Weights", modelWeightsBytes,
+                    repackedBytes > 0 ? "(memory-mapped, +repacked below)" : "(memory-mapped)")));
+                if (repackedBytes > 0)
+                    bodyLines.Add(new Markup(MemLine("Repacked (R4)", repackedBytes, "(committed)")));
                 bodyLines.Add(new Markup(MemLine("Compute", computeBytes, null)));
                 string kvLabel = kvConfig.IsQuantized
                     ? $"({cacheSize} slots, K:{settings.CacheTypeK} V:{settings.CacheTypeV})"
@@ -823,6 +855,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             foreach (var inner in innerAdapters)
                 inner.Dispose();
             pagedFactory?.Dispose();
+            cudaPagedFactory?.Dispose();
             model.Dispose();
             gguf?.Dispose();
             safetensorsSource?.Dispose();

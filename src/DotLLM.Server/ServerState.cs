@@ -51,6 +51,14 @@ public sealed class ServerState : IDisposable
     /// <summary>Paged KV-cache factory (non-null when paged mode is active). Owns the shared block pool.</summary>
     public PagedKvCacheFactory? PagedFactory { get; set; }
 
+    /// <summary>GPU-resident paged KV block-pool factory (issue #252), non-null only for a CUDA
+    /// model loaded with <c>--paged</c>. Not consulted by <see cref="RebuildSchedulerLocked"/> —
+    /// the continuous-batch scheduler runs through <c>IModel.ForwardBatch</c>, which CUDA does not
+    /// yet override (see <c>docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md</c>), so a CUDA model with
+    /// paged KV-cache still serves each request through the per-request <see cref="TextGenerator"/>
+    /// path, same as before this field existed.</summary>
+    public DotLLM.Cuda.CudaPagedKvCacheFactory? CudaPagedFactory { get; set; }
+
     /// <summary>Prefix cache for prompt caching (null when disabled).</summary>
     public PrefixCache? PrefixCache { get; set; }
 
@@ -408,6 +416,7 @@ public sealed class ServerState : IDisposable
             KvCacheConfig = KvCacheConfig,
             KvCacheFactory = KvCacheFactory,
             PagedFactory = PagedFactory,
+            CudaPagedFactory = CudaPagedFactory,
             PrefixCache = PrefixCache,
             PrefixTrieManager = PrefixTrieManager,
             Model = Model,
@@ -431,6 +440,7 @@ public sealed class ServerState : IDisposable
         ToolCallParser = null;
         KvCacheFactory = null;
         PagedFactory = null;
+        CudaPagedFactory = null;
         PrefixCache = null;
         PrefixTrieManager = null;
         Model = null;
@@ -454,6 +464,7 @@ public sealed class ServerState : IDisposable
         KvCacheConfig = snapshot.KvCacheConfig;
         KvCacheFactory = snapshot.KvCacheFactory;
         PagedFactory = snapshot.PagedFactory;
+        CudaPagedFactory = snapshot.CudaPagedFactory;
         PrefixCache = snapshot.PrefixCache;
         PrefixTrieManager = snapshot.PrefixTrieManager;
         Model = snapshot.Model;
@@ -484,6 +495,7 @@ public sealed class ServerState : IDisposable
         KvCacheConfig = loaded.KvCacheConfig;
         KvCacheFactory = loaded.KvCacheFactory;
         PagedFactory = loaded.PagedFactory;
+        CudaPagedFactory = loaded.CudaPagedFactory;
         PrefixCache = loaded.PrefixCache;
         PrefixTrieManager = loaded.PrefixTrieManager;
         Model = loaded.Model;
@@ -555,6 +567,7 @@ public sealed class ServerState : IDisposable
         PrefixCache?.Dispose();
         PrefixTrieManager?.Dispose();
         PagedFactory?.Dispose();
+        CudaPagedFactory?.Dispose();
         DraftModel?.Dispose();
         DraftGguf?.Dispose();
         Model?.Dispose();
@@ -564,6 +577,7 @@ public sealed class ServerState : IDisposable
         ToolCallParser = null;
         KvCacheFactory = null;
         PagedFactory = null;
+        CudaPagedFactory = null;
         PrefixCache = null;
         PrefixTrieManager = null;
         Model = null;
@@ -585,6 +599,7 @@ public sealed class ServerState : IDisposable
         PrefixCache?.Dispose();
         PrefixTrieManager?.Dispose();
         PagedFactory?.Dispose();
+        CudaPagedFactory?.Dispose();
         DraftModel?.Dispose();
         DraftGguf?.Dispose();
         Model?.Dispose();

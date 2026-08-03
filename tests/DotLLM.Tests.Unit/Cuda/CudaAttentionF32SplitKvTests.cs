@@ -201,6 +201,133 @@ public class CudaAttentionF32SplitKvTests
     }
 
     /// <summary>
+    /// Issue #226 spike: does accumulating the cross-split COMBINE (partial_max/partial_sum/
+    /// partial_out merge) in double precision instead of float measurably tighten the reassociation
+    /// tolerance vs the CPU oracle and vs the exact (non-split) GPU kernel, relative to the plain
+    /// float-combine <c>attention_f32_split_kv</c>? <c>fast_exp_neg</c> is untouched in both split
+    /// kernels -- this isolates the combine-step precision hypothesis specifically.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(24, 4, 256, 256)]
+    [InlineData(24, 4, 256, 1024)]
+    [InlineData(24, 4, 256, 1300)]
+    public void AttentionF32SplitKvHp_TightensReassociationToleranceVsPlainSplitKv(
+        int numHeads, int numKvHeads, int headDim, int seqKv)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir!);
+
+        Skip.IfNot(kernels.HasAttentionF32SplitKv, "attention_f32_split_kv not present in PTX (stale build)");
+        Skip.IfNot(kernels.HasAttentionF32SplitKvHp, "attention_f32_split_kv_hp not present in PTX (stale build)");
+        Skip.IfNot(kernels.IsAttentionSplitKvSafe(numHeads, headDim),
+            $"split-KV cooperative launch not safe for numHeads={numHeads}, headDim={headDim} on this GPU");
+        Skip.IfNot(kernels.IsAttentionSplitKvHpSafe(numHeads, headDim),
+            $"split-KV-hp cooperative launch not safe for numHeads={numHeads}, headDim={headDim} on this GPU");
+
+        var rng = new Random(0xA77E17 ^ numHeads ^ numKvHeads ^ (headDim << 8) ^ (seqKv << 16));
+
+        int qElems = numHeads * headDim;
+        int kvElems = numKvHeads * headDim;
+        int positionOffset = seqKv - 1;
+
+        float[] q = RandomVec(rng, qElems);
+        float[] k = RandomVec(rng, seqKv * kvElems);
+        float[] v = RandomVec(rng, seqKv * kvElems);
+
+        float[] cpuOut = new float[qElems];
+        unsafe
+        {
+            fixed (float* pq = q, pk = k, pv = v, pOut = cpuOut)
+                Attention.Execute(pq, pk, pv, pOut, seqQ: 1, seqKv, numHeads, numKvHeads, headDim,
+                    positionOffset, pool: null, slidingWindowSize: null);
+        }
+
+        nint dQ = 0, dK = 0, dV = 0, dOutExact = 0, dOutSplit = 0, dOutSplitHp = 0;
+        nint dPartialMax = 0, dPartialSum = 0, dPartialOut = 0;
+        try
+        {
+            long qBytes = (long)qElems * sizeof(float);
+            long kvBytes = (long)seqKv * kvElems * sizeof(float);
+            CudaDriverApi.cuMemAlloc_v2(out dQ, (nuint)qBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dK, (nuint)kvBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dV, (nuint)kvBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dOutExact, (nuint)qBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dOutSplit, (nuint)qBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dOutSplitHp, (nuint)qBytes).ThrowOnError();
+
+            long scalarBytes = (long)numHeads * CudaKernels.AttentionKvSplit * sizeof(float);
+            long outPartialBytes = scalarBytes * headDim;
+            CudaDriverApi.cuMemAlloc_v2(out dPartialMax, (nuint)scalarBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dPartialSum, (nuint)scalarBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dPartialOut, (nuint)outPartialBytes).ThrowOnError();
+
+            unsafe
+            {
+                fixed (float* p = q) CudaDriverApi.cuMemcpyHtoD_v2(dQ, (nint)p, (nuint)qBytes).ThrowOnError();
+                fixed (float* p = k) CudaDriverApi.cuMemcpyHtoD_v2(dK, (nint)p, (nuint)kvBytes).ThrowOnError();
+                fixed (float* p = v) CudaDriverApi.cuMemcpyHtoD_v2(dV, (nint)p, (nuint)kvBytes).ThrowOnError();
+            }
+
+            nint s = stream.Handle;
+            kernels.LaunchAttentionF32(dQ, dK, dV, dOutExact, seqQ: 1, seqKv, numHeads, numKvHeads, headDim,
+                positionOffset, slidingWindow: 0, s);
+            kernels.LaunchAttentionF32SplitKv(dQ, dK, dV, dOutSplit, seqKv, numHeads, numKvHeads, headDim,
+                positionOffset, slidingWindow: 0, dPartialMax, dPartialSum, dPartialOut, s);
+            stream.Synchronize();
+            kernels.LaunchAttentionF32SplitKvHp(dQ, dK, dV, dOutSplitHp, seqKv, numHeads, numKvHeads, headDim,
+                positionOffset, slidingWindow: 0, dPartialMax, dPartialSum, dPartialOut, s);
+            stream.Synchronize();
+
+            float[] gpuExact = new float[qElems];
+            float[] gpuSplit = new float[qElems];
+            float[] gpuSplitHp = new float[qElems];
+            unsafe
+            {
+                fixed (float* p = gpuExact) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dOutExact, (nuint)qBytes).ThrowOnError();
+                fixed (float* p = gpuSplit) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dOutSplit, (nuint)qBytes).ThrowOnError();
+                fixed (float* p = gpuSplitHp) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dOutSplitHp, (nuint)qBytes).ThrowOnError();
+            }
+
+            double maxAbsSplitVsCpu = 0, maxAbsSplitHpVsCpu = 0;
+            double maxAbsSplitVsExact = 0, maxAbsSplitHpVsExact = 0;
+            for (int i = 0; i < qElems; i++)
+            {
+                Assert.False(float.IsNaN(gpuSplitHp[i]) || float.IsInfinity(gpuSplitHp[i]),
+                    $"NaN/Inf in split-KV-hp GPU output at index {i}");
+                maxAbsSplitVsCpu = Math.Max(maxAbsSplitVsCpu, Math.Abs((double)gpuSplit[i] - cpuOut[i]));
+                maxAbsSplitHpVsCpu = Math.Max(maxAbsSplitHpVsCpu, Math.Abs((double)gpuSplitHp[i] - cpuOut[i]));
+                maxAbsSplitVsExact = Math.Max(maxAbsSplitVsExact, Math.Abs((double)gpuSplit[i] - gpuExact[i]));
+                maxAbsSplitHpVsExact = Math.Max(maxAbsSplitHpVsExact, Math.Abs((double)gpuSplitHp[i] - gpuExact[i]));
+            }
+
+            _out.WriteLine($"numHeads={numHeads} numKvHeads={numKvHeads} headDim={headDim} seqKv={seqKv}: " +
+                $"maxAbs(split-CPU)={maxAbsSplitVsCpu:e3} maxAbs(splitHp-CPU)={maxAbsSplitHpVsCpu:e3} | " +
+                $"maxAbs(split-exact)={maxAbsSplitVsExact:e3} maxAbs(splitHp-exact)={maxAbsSplitHpVsExact:e3} | " +
+                $"vsExact ratio(hp/plain)={(maxAbsSplitVsExact > 0 ? maxAbsSplitHpVsExact / maxAbsSplitVsExact : 0):F4}");
+
+            Assert.True(maxAbsSplitHpVsCpu < 5e-2,
+                $"split-KV-hp GPU kernel vs CPU oracle exceeded tolerance: {maxAbsSplitHpVsCpu:e3}");
+        }
+        finally
+        {
+            if (dQ != 0) CudaDriverApi.cuMemFree_v2(dQ);
+            if (dK != 0) CudaDriverApi.cuMemFree_v2(dK);
+            if (dV != 0) CudaDriverApi.cuMemFree_v2(dV);
+            if (dOutExact != 0) CudaDriverApi.cuMemFree_v2(dOutExact);
+            if (dOutSplit != 0) CudaDriverApi.cuMemFree_v2(dOutSplit);
+            if (dOutSplitHp != 0) CudaDriverApi.cuMemFree_v2(dOutSplitHp);
+            if (dPartialMax != 0) CudaDriverApi.cuMemFree_v2(dPartialMax);
+            if (dPartialSum != 0) CudaDriverApi.cuMemFree_v2(dPartialSum);
+            if (dPartialOut != 0) CudaDriverApi.cuMemFree_v2(dPartialOut);
+        }
+    }
+
+    /// <summary>
     /// Runs many consecutive decode steps (growing seqKv by one appended KV row per step, matching
     /// real generation) through both the split-KV GPU kernel and the CPU reference, tracking how
     /// max diff evolves. UNLIKE GDN's coop-split4 characterization (which found drift compounding

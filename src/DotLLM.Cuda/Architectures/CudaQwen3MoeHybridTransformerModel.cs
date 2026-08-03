@@ -2073,6 +2073,12 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             _kernels.LaunchConvertF16ToF32(_f16KCache![slot], _f32KvReadStagingK, kvLiveElems, streamH);
             _kernels.LaunchConvertF16ToF32(_f16VCache![slot], _f32KvReadStagingV, kvLiveElems, streamH);
 
+            // Scope note (issues #197 + #198): this MoE-hybrid architecture's decode attention
+            // has never had the #183 split-KV tier wired in (unlike CudaQwen3HybridDenseTransformerModel),
+            // so the new opt-in combined GQA-group + split-KV kernel (CudaKernels.LaunchAttentionF32GqaSplit)
+            // is intentionally NOT wired here either -- this is a scope decision to keep the #197/#198
+            // PR focused, not a regression (nothing here regresses; there was no split-KV path to lose).
+            // Wiring it here is a reasonable, non-blocking follow-up.
             _kernels.LaunchAttentionF32(q, _f32KvReadStagingK, _f32KvReadStagingV, attnOut,
                 seqLen, seqKv, numHeads, numKvHeads, headDim,
                 positionOffset: positionOffset, slidingWindow: 0, streamH);

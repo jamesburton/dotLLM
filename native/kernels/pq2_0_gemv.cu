@@ -910,6 +910,149 @@
 // fix here has a small absolute ceiling — worth a look only as a low-effort, low-risk follow-up
 // (e.g. batching multiple small per-layer projections into fewer, larger launches), not worth
 // reopening the broader kernel-level investigation over.
+//
+// ───────────────────────── #244: re-investigated, found ALREADY IMPLEMENTED — no code change ─────────────────────────
+// Issue #244 (filed 2026-07-31, seeded by a fresh re-profile at
+// `.perf-runs/ncu-2026-07-30-ffn-gemv-post161/README.md`) proposed the identity
+// `acc = Sum(raw_code * x) - Sum(x)` for the ternary unpack/accumulate loop, citing the
+// 2026-07-22 advisor review's "algebraic ALU reduction" candidate as still untried post-#161.
+// That premise was WRONG: this is the exact same candidate as the "Algebraic ALU reduction
+// (#161 continued, advisor candidate #4/5)" section above, same identity, same file — and it was
+// already implemented and shipped on 2026-07-22, commit 7c7101c ("perf(cuda): algebraic ALU
+// reduction in PQ2_0 GEMV decode loop (#161)"), nine days before #244 was filed. Every production
+// kernel in this file (`pq2_0_gemv_f16in`/`_small`, `pq2_0_gemv2_f16in`/`_small`,
+// `pq2_0_gemv_f32io`/`_small`, `pq2_0_gemv2_f32io`/`_small` — 8 entry points, confirmed by
+// grepping for `pq2_0_code_dot(p, gx)`) already calls `pq2_0_load_group_x`/`pq2_0_code_dot`
+// exactly as described above; only `pq2_0_gemv_f32in` (the deliberately-untouched CPU-vs-GPU
+// exact-reference kernel, see the file's v1/v2 note near the top) still uses the older per-code
+// `code - 1` decode. The `.perf-runs` README that seeded #244 re-ran `ncu` against these ALREADY-
+// REDUCED kernels and correctly measured 75.10% compute-bound headroom on the dominant FFN
+// kernel — but that number describes headroom REMAINING AFTER this identity, not evidence the
+// identity itself was still unapplied; nobody checked the kernel source before writing the issue.
+//
+// No functional change was made for #244 — instead, the already-shipped implementation was
+// independently re-verified fresh:
+//   * Correctness: full `CudaPQ2_0GemvTest` suite, 21/21 passed on real hardware (RTX 3060, driver
+//     present, nothing skipped), including `PQ2_0GemvF32Native_MatchesCpuFloatReference` and
+//     `PQ2_0GemvFusedDecodeF32Native_MatchesSeparateLaunches` at real Bonsai-27B dims (n=512/37/3,
+//     k=5120/17408/5248) — max abs diff stays within the existing 5e-2/1e-2 tolerance bar. That
+//     bar is NOT new and is NOT specific to the algebraic identity: it was set by `xs[]` staying
+//     `half`-precision internally (unchanged either way), the same bar `PQ2_0GemvF16In_...`
+//     already used before commit 7c7101c existed. This session did not need to characterize a new
+//     tolerance because none was introduced.
+//   * Benchmark: fresh `bench --device cuda -p 64 -n 16 -r 3` against the real
+//     `Ternary-Bonsai-27B-Q2_0.gguf`, RTX 3060, GPU otherwise idle (~800 MiB baseline VRAM) ->
+//     18.30-18.40 tok/s decode (median 18.37, best 18.40; prefill 101-102 tok/s). Consistent with,
+//     and modestly ahead of, the ~17.2-18.4 tok/s range this file's history has held at since the
+//     algebraic reduction landed (commit 7c7101c's own recorded +1.9% mean win, 16.98 -> 17.30
+//     tok/s, persisted through every subsequent negative-result round in this file without
+//     regressing) — no throughput regression, nothing to revert.
+//
+// Recommendation for whoever triages #244: close as a duplicate of the work already merged under
+// #161 (commit 7c7101c), referencing this note. The only remaining untried candidate in this
+// specific vein is candidate (B) from the "Algebraic ALU reduction" section's own "Scope decision"
+// paragraph above (a broader LUT/wider-bit-trick ternary decode) — deliberately not attempted
+// here either, for the same reasons already given there (advisor-flagged per-lane divergent
+// constant-memory risk, not modeled/measured, and identity (A)'s real win already came in under
+// the advisor's original estimate). Also worth doing: updating the `prismml-bonsai-model` project
+// memory to record this candidate as DONE rather than pending, so a third session doesn't
+// rediscover the same "untried candidate" framing a second time.
+//
+// ───────────────────────── #245: Candidate B (LUT/wider-bit-trick decode) MODELED, NOT ATTEMPTED — divergent-access risk CONFIRMED real ─────────────────────────
+// Issue #245 exists to do, for candidate (B), the modeling this file's own standing rule requires
+// BEFORE writing any code — exactly the treatment the #164 entry gave shared-memory bank conflicts
+// (real address arithmetic first, hardware-behavior facts second, implementation only if that
+// clears). The precondition #245 itself names (confirm real ALU headroom remains after (A)) is
+// already satisfied: `.perf-runs/ncu-2026-07-30-ffn-gemv-post161/README.md` measured the dominant
+// FFN kernel (`pq2_0_gemv_f32io`, grid=320) at 75.10% compute/memory throughput post-(A) — real,
+// comfortable, non-desperate headroom. That headroom being real does NOT make the LUT trade good;
+// it only means there is ALU room to spend IF the trade is favorable. It isn't, per the modeling
+// below.
+//
+// Step 1 — what a LUT would replace, and its ACTUAL per-lane address pattern (not intuition).
+// `pq2_0_code_dot` (defined below) decodes byte `p`'s four 2-bit codes via three `SHF`/`LOP3.LUT`
+// pairs plus a bare `LOP3.LUT` for the low code, confirmed directly via `cuobjdump --dump-sass` on
+// a fresh `nvcc -cubin -arch=sm_86 --use_fast_math -Xptxas -v` compile of this exact file
+// (`pq2_0_gemv_f32io_small`, register/smem footprint 40 registers / 10304 bytes smem / 384 bytes
+// cmem[0], zero spill — bit-identical to every prior entry's recorded baseline, confirming nothing
+// else drifted): `SHF.R.U32.HI` (extract) -> `LOP3.LUT ...,0x3,...` (mask) -> `I2FP.F32.U32`
+// (convert), x3 for the shifted codes plus one bare `LOP3.LUT`+`I2FP.F32.U32` for the unshifted low
+// code — 11 total instructions to decode one byte's 4 codes. Every one of these is a
+// register-to-register ALU op with NO memory access and therefore NO possibility of per-lane
+// serialization: it costs exactly 1 instruction-issue-slot per warp regardless of how much the 32
+// lanes' `p` values diverge. This is the baseline a LUT-based decode has to beat.
+//
+// The `p` value itself: `p = codesBase[(size_t)gFlat * 32 + lane]` (see `pq2_0_gemv_f16in` and
+// every sibling kernel below) — lane `i` reads codes-region byte `i` of the group, BY
+// CONSTRUCTION, because that's what makes the load coalesced (32 lanes, 32 consecutive bytes, one
+// 32B sector). This is not an incidental detail that a smarter LUT layout could route around: the
+// coalesced weight-byte load and the "each lane owns a different weight byte" property are the
+// SAME fact. Any LUT keyed on `p` therefore has an address that is, by the kernel's own design,
+// potentially different in every one of the 32 lanes on every group iteration.
+//
+// Step 2 — is it ACTUALLY divergent on real weights, or could real ternary weight statistics keep
+// it warp-uniform in practice? Measured directly (not assumed): a standalone script
+// (`gguf`-format manual parse, no on-GPU execution needed) read real 32-byte code windows straight
+// out of the actual `Ternary-Bonsai-27B-Q2_0.gguf` (HF cache,
+// `models--prism-ml--Ternary-Bonsai-27B-gguf`), sampling 2560-7680 real groups apiece from three
+// different PQ2_0 tensors — `output.weight`, `blk.0.ffn_gate.weight` (k=5120), and
+// `blk.0.ffn_down.weight` (k=17408, the literal tensor backing the dominant `pq2_0_gemv_f32io`
+// grid=320 kernel the `.perf-runs` README profiled) — and counted the number of DISTINCT code
+// bytes among each group's 32 lanes:
+//   * `output.weight`:        mean 26.53 / median 27 unique bytes per 32-lane group (min 21, max 32)
+//   * `blk.0.ffn_gate.weight`: mean 26.42 / median 26 unique bytes per 32-lane group (min 20, max 32)
+//   * `blk.0.ffn_down.weight`: mean ~26.6 / median 26-27 unique bytes per 32-lane group (same shape)
+// Only 81 of 256 possible byte values are ever valid (2-bit fields restricted to {0,1,2}, never 3),
+// yet the mean unique-address count across three independent real weight tensors clusters tightly
+// at ~26-27 out of 32 lanes — essentially indistinguishable from the uniform-iid-draw estimate
+// (81*(1-(1-1/81)^32) ≈ 26.5, a birthday-paradox calculation), meaning real trained ternary weights
+// show NO exploitable clustering at this granularity: this is the ORDINARY case on real data, not a
+// rare worst-case tail. (Also confirms candidate A's own algebra: all 81 combinations were observed
+// in every sample, so the decode genuinely needs to handle the full ternary alphabet per lane, not
+// a narrow common-case subset a smaller/skewed LUT could special-case around.)
+//
+// Step 3 — what that means for constant memory. Per the CUDA C++ Programming Guide's documented
+// constant-cache behavior (the same class of "known hardware mechanism, not a per-kernel surprise"
+// fact the #164 entry leaned on for shared-memory banking): a constant-memory read is a single
+// broadcast ONLY when every thread in the warp requests the SAME address; when a warp's addresses
+// span N distinct values, the request is split into N SEQUENTIAL broadcasts, i.e. throughput drops
+// by a factor of N for that instruction. With a measured real-data mean of ~26.5 distinct addresses
+// per 32-lane group, a `__constant__`-memory LUT keyed on `p` would serialize to ~26.5x its nominal
+// latency ON AVERAGE, every single group, for every kernel in this file. Replacing an 11-instruction
+// sequence that costs exactly 1 warp-cycle-equivalent regardless of data with a single memory
+// instruction that costs ~26.5x its nominal latency on typical real data is a clear, quantified
+// LOSS — not a marginal or uncertain one. This is a stronger and more directly provable case than
+// several of this file's prior negative results (which needed a live `ncu` session or a SASS
+// surprise to reveal the flaw); here the flaw follows directly from the kernel's own indexing
+// expression plus one real-weight measurement, no GPU execution of a candidate kernel required.
+//
+// Step 4 — does routing the LUT through `__shared__` memory instead of `__constant__` (the "or
+// otherwise avoids the divergent-access penalty" alternative #245's scope explicitly asks to
+// consider) rescue the idea? No, for two independent reasons. (a) Divergence-sensitivity doesn't
+// disappear, it just changes shape: a shared-memory LUT's per-lane addresses collide by BANK
+// (`bank(p) = p mod 32` for a 4-byte entry), and the same real-data address distribution that
+// spreads ~26.5 distinct VALUES across 32 lanes has no reason to avoid spreading across most of the
+// 32 banks too — this trades one divergence-sensitive access pattern for another, not for a safe
+// one. (b) Even in the hypothetical zero-conflict best case, a LUT lookup (address computation +
+// `LDS` + result unpack) is not obviously cheaper than the current 11-instruction pure-ALU
+// sequence the compiler already keeps branch-free and spill-free (confirmed register/smem-neutral
+// above) — there is no version of this idea that both dodges the divergent-access penalty AND
+// beats a baseline that costs a fixed, data-independent 11 instructions. The per-lane divergence is
+// not an implementation detail to route around; it IS the workload distribution that makes this
+// kernel's weight loads coalesced in the first place. Any LUT structure keyed on the per-lane code
+// value inherits it.
+//
+// **Verdict: the advisor's flagged risk is CONFIRMED real and costly, matching (and — via the
+// direct real-weight measurement above — exceeding in confidence) the shape of this file's five
+// prior negative results.** Per the issue's own explicit framing ("a well-reasoned 'not worth the
+// risk, here's why' is the complete, valuable, expected outcome"), candidate (B) is NOT implemented.
+// No kernel code was changed for #245. Left as a documented, modeled, closed line of investigation:
+// a future session should not re-attempt a `__constant__`- or `__shared__`-memory LUT keyed on the
+// per-lane ternary code byte without first finding a way to make that byte warp-uniform — which
+// would require restructuring which lane owns which weight byte, i.e. giving up the coalesced
+// global-memory load this kernel family's entire v2+ design has been built around since the
+// original I2_S-derived rewrite. That is a different, much larger redesign than "add a LUT," and is
+// not what candidate (B) as scoped ever proposed.
 
 #include <cuda_fp16.h>
 #include <stdint.h>

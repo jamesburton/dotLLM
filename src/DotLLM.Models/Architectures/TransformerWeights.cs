@@ -451,6 +451,48 @@ internal sealed class Gemma4LayerWeights
 }
 
 /// <summary>
+/// Per-layer Gemma-3n AltUp (Alternating Updates) + Laurel (Learned Augmented
+/// Residual Layer) weight bundle. Non-null iff
+/// <see cref="DotLLM.Core.Models.ModelConfig.Gemma3n"/> is set. Everything here
+/// is loaded as F32 (small matrices — <c>numInputs</c> is 4 on every released
+/// SKU, <c>laurelRank</c> is 64) regardless of the surrounding model's
+/// quantization, matching how PLE's per-layer gate/projection are loaded.
+/// </summary>
+/// <remarks>
+/// The four-norm-layout attention/FFN norms, Q/K/V/O projections, dense GeGLU
+/// FFN, and the PLE per-layer gate/projection/post-norm all live in the
+/// standard <see cref="TransformerLayerWeights"/> slots (reused verbatim from
+/// the dense Gemma-4 text tower); this bundle carries only the genuinely new
+/// Gemma-3n pieces. See <c>Gemma3nTextAltUp</c> / <c>Gemma3nTextLaurelBlock</c>
+/// in HF <c>modeling_gemma3n.py</c>.
+/// </remarks>
+internal sealed class Gemma3nLayerWeights
+{
+    /// <summary><c>altup.correction_coefs.weight</c> [numInputs, numInputs] row-major F32 (no bias).</summary>
+    public required nint CorrectionCoefs { get; init; }
+    /// <summary><c>altup.prediction_coefs.weight</c> [numInputs*numInputs, numInputs] row-major F32 (no bias).</summary>
+    public required nint PredictionCoefs { get; init; }
+    /// <summary><c>altup.modality_router.weight</c> [numInputs, hiddenSize] row-major F32 (no bias).</summary>
+    public required nint ModalityRouter { get; init; }
+    /// <summary><c>altup.router_norm.weight</c> [hiddenSize] ((1+w) absorbed).</summary>
+    public required float[] RouterNorm { get; init; }
+    /// <summary>
+    /// <c>altup.correct_output_scale</c> [hiddenSize] — a raw learned vector (NOT
+    /// a norm weight; no (1+w) offset), multiplied into the corrected active
+    /// stream before it feeds the Per-Layer-Embeddings gate, when
+    /// <see cref="DotLLM.Core.Models.Gemma3nConfig.CorrectOutputScale"/> is true.
+    /// </summary>
+    public required float[] CorrectOutputScale { get; init; }
+
+    /// <summary><c>laurel.linear_left.weight</c> [laurelRank, hiddenSize] row-major F32 (no bias).</summary>
+    public required nint LaurelLinearLeft { get; init; }
+    /// <summary><c>laurel.linear_right.weight</c> [hiddenSize, laurelRank] row-major F32 (no bias).</summary>
+    public required nint LaurelLinearRight { get; init; }
+    /// <summary><c>laurel.post_laurel_norm.weight</c> [hiddenSize] ((1+w) absorbed).</summary>
+    public required float[] PostLaurelNorm { get; init; }
+}
+
+/// <summary>
 /// Model-level DiffusionGemma self-conditioning (SC) weights. Present ONLY on the
 /// diffusion-gemma GGUF (absent on autoregressive gemma4, where SC is meaningless).
 /// SC feeds the PREVIOUS denoise step's canvas logits back into the canvas region
@@ -627,6 +669,14 @@ internal readonly struct TransformerLayerWeights
     /// </summary>
     public readonly Gemma4LayerWeights? Gemma4;
 
+    /// <summary>
+    /// Non-null on a Gemma-3n layer — the per-layer AltUp (correction/prediction
+    /// coefficients, modality router, correct-output-scale) and Laurel-block
+    /// weights. Null on every other architecture (including <see cref="Gemma4"/>,
+    /// which has no AltUp or Laurel). See <see cref="Gemma3nLayerWeights"/>.
+    /// </summary>
+    public readonly Gemma3nLayerWeights? Gemma3n;
+
     // ──────────────────── Per-Layer Embeddings (PLE) ────────────────────
     // Gemma-4 dense text tower (E2B/E4B) only. Non-zero/non-null iff the model
     // config carries PerLayerEmbedding. The forward pass, after the MLP residual
@@ -659,7 +709,8 @@ internal readonly struct TransformerLayerWeights
         Gemma4LayerWeights? gemma4 = null,
         float[]? attnSubNormWeight = null, float[]? ffnSubNormWeight = null,
         nint pleGateWeight = 0, nint pleProjWeight = 0, float[]? plePostNormWeight = null,
-        float[]? attnSinks = null)
+        float[]? attnSinks = null,
+        Gemma3nLayerWeights? gemma3n = null)
     {
         AttnNormWeight = attnNormWeight;
         QNormWeight = qNormWeight;
@@ -683,6 +734,7 @@ internal readonly struct TransformerLayerWeights
         PleProjWeight = pleProjWeight;
         PlePostNormWeight = plePostNormWeight;
         AttnSinks = attnSinks;
+        Gemma3n = gemma3n;
     }
 }
 
@@ -714,6 +766,25 @@ internal sealed class PerLayerEmbeddingWeights
     public required int VocabSize { get; init; }
     /// <summary>Number of decoder layers (row width of the PLE table = NumLayers*PerLayerDim).</summary>
     public required int NumLayers { get; init; }
+}
+
+/// <summary>
+/// Model-level Gemma-3n AltUp weight bundle: the <c>numInputs - 1</c> input-side
+/// and output-side stream projections used once per forward (building the
+/// initial stream stack from the embedding, and collapsing the final stream
+/// stack to a single hidden vector after the last layer). The per-layer
+/// AltUp/Laurel weights live on <see cref="Gemma3nLayerWeights"/>; this holds
+/// only the two model-level projection sets. Non-null iff
+/// <see cref="DotLLM.Core.Models.ModelConfig.Gemma3n"/> is set.
+/// </summary>
+internal sealed class Gemma3nAltUpWeights
+{
+    /// <summary><c>altup_projections.{i}.weight</c>, i=0..numInputs-2, each
+    /// [hiddenSize, hiddenSize] row-major F32 (no bias).</summary>
+    public required nint[] AltUpProjections { get; init; }
+    /// <summary><c>altup_unembed_projections.{i}.weight</c>, i=0..numInputs-2, each
+    /// [hiddenSize, hiddenSize] row-major F32 (no bias).</summary>
+    public required nint[] AltUpUnembedProjections { get; init; }
 }
 
 /// <summary>
@@ -848,6 +919,11 @@ internal sealed class RepackedLayerWeights : IDisposable
 {
     public WeightRepacking.RepackedWeight Q, K, V, O, Gate, Up, Down;
 
+    /// <summary>Total unmanaged bytes held by this layer's R4 buffers. Unrepacked projections contribute 0.</summary>
+    public long AllocatedBytes =>
+        Q.AllocatedBytes + K.AllocatedBytes + V.AllocatedBytes + O.AllocatedBytes
+        + Gate.AllocatedBytes + Up.AllocatedBytes + Down.AllocatedBytes;
+
     public void Dispose()
     {
         Q.Dispose(); K.Dispose(); V.Dispose(); O.Dispose();
@@ -898,6 +974,13 @@ internal sealed class TransformerWeights : IDisposable
     public PerLayerEmbeddingWeights? PerLayerEmbedding { get; }
 
     /// <summary>
+    /// Model-level Gemma-3n AltUp stream-projection weights. Non-null only when
+    /// <see cref="DotLLM.Core.Models.ModelConfig.Gemma3n"/> is set; null for every
+    /// other architecture.
+    /// </summary>
+    public Gemma3nAltUpWeights? Gemma3nAltUp { get; }
+
+    /// <summary>
     /// Optional proportional-rope per-pair frequency factors (<c>rope_freqs.weight</c>,
     /// length = global rotated dim / 2). Gemma-4 E2B/E4B applies them on the
     /// full-attention layers (ggml <c>theta / freq_factors[i]</c>); the sliding
@@ -931,6 +1014,17 @@ internal sealed class TransformerWeights : IDisposable
     /// </summary>
     private readonly HashSet<nint>? _liveOwnedAllocations;
 
+    /// <summary>
+    /// Total unmanaged bytes held by R4-interleaved buffers. Zero until <see cref="RepackWeights"/> runs,
+    /// and zero for models whose weights are not repackable (F32/F16).
+    /// </summary>
+    /// <remarks>
+    /// These buffers are a second copy of the weights, held in committed memory alongside the
+    /// memory-mapped originals — reporting that counts only the mapped file understates the
+    /// process footprint by roughly 2x.
+    /// </remarks>
+    public long RepackedBytes { get; private set; }
+
     private TransformerWeights(
         nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType, int vocabSize, int hiddenSize,
         TransformerLayerWeights[] layers,
@@ -938,7 +1032,8 @@ internal sealed class TransformerWeights : IDisposable
         nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim,
         List<nint>? ownedAllocations = null,
         Gemma4SelfCondWeights? selfCond = null,
-        PerLayerEmbeddingWeights? perLayerEmbedding = null)
+        PerLayerEmbeddingWeights? perLayerEmbedding = null,
+        Gemma3nAltUpWeights? gemma3nAltUp = null)
     {
         TokenEmbedWeight = tokenEmbedWeight;
         TokenEmbedQuantType = tokenEmbedQuantType;
@@ -956,6 +1051,7 @@ internal sealed class TransformerWeights : IDisposable
             : null;
         SelfCond = selfCond;
         PerLayerEmbedding = perLayerEmbedding;
+        Gemma3nAltUp = gemma3nAltUp;
     }
 
     /// <summary>
@@ -1012,7 +1108,8 @@ internal sealed class TransformerWeights : IDisposable
         float[] outputNormWeight,
         nint outputWeight, QuantizationType outputQt, int outputM, int outputK,
         List<nint> ownedAllocations,
-        PerLayerEmbeddingWeights? perLayerEmbedding = null)
+        PerLayerEmbeddingWeights? perLayerEmbedding = null,
+        Gemma3nAltUpWeights? gemma3nAltUp = null)
     {
         return new TransformerWeights(
             tokenEmbedWeight, tokenEmbedQt, vocabSize, hiddenSize,
@@ -1021,7 +1118,8 @@ internal sealed class TransformerWeights : IDisposable
             outputWeight, outputQt, outputM, outputK,
             ownedAllocations,
             selfCond: null,
-            perLayerEmbedding: perLayerEmbedding);
+            perLayerEmbedding: perLayerEmbedding,
+            gemma3nAltUp: gemma3nAltUp);
     }
 
     /// <summary>
@@ -1215,6 +1313,12 @@ internal sealed class TransformerWeights : IDisposable
 
         if (WeightRepacking.IsRepackable(OutputQuantType))
             RepackedOutput = WeightRepacking.RepackR4(OutputWeight, OutputQuantType, OutputOutputDim, OutputInputDim);
+
+        long total = 0;
+        foreach (var rl in repacked)
+            total += rl.AllocatedBytes;
+        total += RepackedOutput?.AllocatedBytes ?? 0;
+        RepackedBytes = total;
     }
 
     private static WeightRepacking.RepackedWeight TryRepack(nint ptr, QuantizationType qt, int m, int k)

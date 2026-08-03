@@ -86,6 +86,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ2_KMmvqLargeFunc;
     private readonly nint _quantizedGemvQ4_KMmvqLargeFunc;
     private readonly nint _quantizedGemvQ4_KMmvqCoalescedFunc;
+    private readonly nint _quantizedGemvQ4_KMmvqLlamaCppFunc;
     private readonly nint _quantizedGemvQ5_KMmvqLargeFunc;
     private readonly nint _quantizedGemvQ6_KMmvqLargeFunc;
     private readonly nint _quantizedGemvIQ4_NLMmvqLargeFunc;
@@ -150,7 +151,17 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _attentionF32SplitKvFunc;
     private int _attnSplitKvMaxCoResidentGrid = -1; // -1 = not yet queried
     private int _attnSplitKvCachedHeadDim = -1;      // headDim the cached query above is valid for
+    // Issue #226 spike: fp64-combine variant of attention_f32_split_kv.
+    private readonly nint _attentionF32SplitKvHpFunc;
+    private int _attnSplitKvHpMaxCoResidentGrid = -1;
+    private int _attnSplitKvHpCachedHeadDim = -1;
+    // Combined GQA-group + split-KV kernel (issues #197 + #198): grid = (numKvHeads, kv_split).
+    private readonly nint _attentionF32GqaSplitKvFunc;
+    private int _attnGqaSplitMaxCoResidentGrid = -1; // -1 = not yet queried
+    private int _attnGqaSplitCachedHeadDim = -1;      // headDim the cached query above is valid for
+    private int _attnGqaSplitCachedGroup = -1;        // group (numHeads/numKvHeads) the cache is valid for
     private readonly nint _swigluF32Func;
+    private readonly nint _relu2GluF32Func;
     private readonly nint _biasAddF32Func;
     private readonly nint _perHeadRmsNormF32Func;
     private readonly nint _ropeFunc;
@@ -183,10 +194,19 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _i2sGemv3F16InFunc;
     private readonly nint _i2sGemvNormF16InFunc;
     private readonly nint _i2sGemvF32InFunc;
+    // Batched GEMM (issue #250): decode-row-once-reuse-across-tokens twin of i2_s_gemv_f32in,
+    // used by CudaMoeFfn.ForwardBitNetI2S's prefill path (seqLen>1 routes multiple tokens to the
+    // same expert). TryGetFunction'd so a stale PTX (not yet recompiled) still loads gracefully —
+    // gate any use on HasI2SBatchedGemm.
+    private readonly nint _i2sGemmF32InFunc;
     private readonly nint _i2sGemvA8Func;
     private readonly nint _i2sGemvA8DeviceScaleFunc;
     private readonly nint _quantizeF16ToI8AbsMaxFunc;
     private readonly nint _dequantI2sF16Func;
+    // Ragged K (k % 128 != 0) — issue #206.
+    private readonly nint _i2sGemvF16InRaggedFunc;
+    private readonly nint _i2sGemvF32InRaggedFunc;
+    private readonly nint _dequantI2sF16RaggedFunc;
     private readonly nint _pq2_0GemvF32InFunc;
     private readonly nint _pq2_0GemvF16InFunc;
     private readonly nint _pq2_0Gemv2F16InFunc;
@@ -247,6 +267,12 @@ public sealed unsafe class CudaKernels : IDisposable
     // 4-byte device buffers. Pointers stay stable across cuGraphLaunch replays;
     // host bumps the underlying ints via cuMemcpyHtoD between launches (~1 µs).
     private readonly nint _attentionDynFunc;
+    // Issue #200: direct block-table-read paged decode attention -- reads K/V through a
+    // small per-layer array of block base device pointers instead of a contiguous buffer,
+    // eliminating CudaPagedKvCache.PrepareAttentionScratch's D2D gather. TryGetFunction so a
+    // stale PTX without this symbol still loads gracefully (HasAttentionF16Paged reports
+    // false and callers keep using the gather-based path).
+    private readonly nint _attentionPagedFunc;
     // Decode-step KV-cache write: dst row is dst_base + posPtr[0] * kv_stride.
     // Replaces a host-side cuMemcpyDtoDAsync where the dst address would be
     // baked into the graph at instantiate time.
@@ -320,6 +346,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _moeAxpyScaledPerTokenF32Func;
     private readonly nint _moeSigmoidLogitF32Func;
     private readonly nint _moeGatherTokenRowsF32Func;
+    // Issue #246 (BitNet-ternary MoE): additive router bias, applied before softmax/top-k.
+    private readonly nint _moeGateBiasAddF32Func;
 
     // ── MoE grouped-GEMV kernels (Phase B — single launch across K_active experts) ──
     // One kernel computes (K_active × M) F16 outputs by walking K_active raw-quant
@@ -416,6 +444,18 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule? _attentionFlashMmaModule;
     private readonly nint _attentionFlashMmaFunc;
 
+    // Tensor-core (mma.sync) FP16 DECODE attention composed with the #197/#198 GQA-group +
+    // split-KV grid design (issue #199 v2 — see native/kernels/attention_flash_mma_decode_gqa_split.cu).
+    // v1 (single warp/block, grid=numHeads) was 4-5x slower than the F32 baseline at every
+    // realistic depth due to ~4% occupancy; this kernel packs the GQA group into the mma
+    // tile's M dimension (free — same instruction count as v1, up to 8x more useful
+    // throughput) and grids (numKvHeads, kvSplit) like attention_f32_gqa_split_kv. Optional
+    // PTX, Ampere-only (mma.sync is sm_80+).
+    private readonly CudaModule? _attentionMmaDecodeGqaSplitModule;
+    private readonly nint _attentionMmaDecodeGqaSplitFunc;
+    private int _attnMmaDecodeGqaSplitMaxCoResidentGrid = -1; // -1 = not yet queried
+    private int _attnMmaDecodeGqaSplitCachedGroup = -1;        // group the cached query above is valid for
+
 
     /// <summary>
     /// Loads all PTX modules from the specified directory.
@@ -466,6 +506,21 @@ public sealed unsafe class CudaKernels : IDisposable
         _relu2GluRmsNormModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2_glu_rmsnorm.ptx"));
         _fusedAddRmsNormF32ResModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "fused_add_rmsnorm_f32res.ptx"));
 
+        // Query the device's opt-in dynamic shared-memory cap ONCE, unconditionally (not gated
+        // on the optional MMQ PTX below) — the always-loaded I2_S GEMV kernels need it too (see
+        // issue #207: their x-staging shared buffer used to be a BitNet-2B-4T-sized static array;
+        // it is now dynamic and must be opted into >48 KB for large-intermediate non-BitNet models).
+        {
+            int devForOptIn;
+            if (CudaDriverApi.cuCtxGetDevice(out devForOptIn) == 0
+                && CudaDriverApi.cuDeviceGetAttribute(out int optIn0,
+                    CudaDriverApi.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, devForOptIn) == 0
+                && optIn0 > 0)
+            {
+                _maxDynamicSharedBytesOptIn = optIn0;
+            }
+        }
+
         // MMQ-style fused dequant+matmul GEMV (optional — PTX may not be compiled yet).
         // Provides a faster Q4_K decode path via dp4a-packed INT8 multiply-add.
         string mmqPath = Path.Combine(ptxDir, "quantized_gemv_mmq.ptx");
@@ -484,6 +539,7 @@ public sealed unsafe class CudaKernels : IDisposable
             _quantizedGemvQ2_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q2_k_mmvq_large");
             _quantizedGemvQ4_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmvq_large");
             _quantizedGemvQ4_KMmvqCoalescedFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmvq_coalesced");
+            _quantizedGemvQ4_KMmvqLlamaCppFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmvq_llamacpp");
             _quantizedGemvQ5_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmvq_large");
             _quantizedGemvQ6_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmvq_large");
             _quantizedGemvIQ4_NLMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_nl_mmvq_large");
@@ -509,13 +565,9 @@ public sealed unsafe class CudaKernels : IDisposable
             // ~15.7 KB and Llama-405B-class intermediate=53248 lands at ~58 KB — past 48 KB. Opt
             // each on-the-fly variant into the device's full optin cap (typically 100+ KB on
             // Ampere/Ada/Hopper) so any in-budget k launches without recompiling.
-            int devForOptIn;
-            if (CudaDriverApi.cuCtxGetDevice(out devForOptIn) == 0
-                && CudaDriverApi.cuDeviceGetAttribute(out int optIn,
-                    CudaDriverApi.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, devForOptIn) == 0
-                && optIn > 0)
+            if (_maxDynamicSharedBytesOptIn > 0)
             {
-                _maxDynamicSharedBytesOptIn = optIn;
+                int optIn = _maxDynamicSharedBytesOptIn;
                 SetMaxDynamicSharedBytes(_quantizedGemvQ4_KMmqFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ2_KMmqFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ5_KMmqFunc, optIn);
@@ -524,6 +576,7 @@ public sealed unsafe class CudaKernels : IDisposable
                 SetMaxDynamicSharedBytes(_quantizedGemvIQ4_XSMmqFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ2_KMmvqLargeFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ4_KMmvqLargeFunc, optIn);
+                SetMaxDynamicSharedBytes(_quantizedGemvQ4_KMmvqLlamaCppFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ5_KMmvqLargeFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ6_KMmvqLargeFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvIQ4_NLMmvqLargeFunc, optIn);
@@ -565,7 +618,15 @@ public sealed unsafe class CudaKernels : IDisposable
         // still loads gracefully; HasAttentionF32SplitKv reports false and callers fall back to
         // the exact LaunchAttentionF32 path unconditionally.
         _attentionF32SplitKvFunc = _attentionF32Module.TryGetFunction("attention_f32_split_kv");
+        // Optional (issue #226 spike) -- fp64-combine variant of attention_f32_split_kv, see that
+        // kernel's header for scope. TryGetFunction: stale PTX without it just disables the gate.
+        _attentionF32SplitKvHpFunc = _attentionF32Module.TryGetFunction("attention_f32_split_kv_hp");
+        // Optional (issues #197+#198) -- TryGetFunction so a stale PTX without the combined
+        // GQA-group + split-KV kernel still loads gracefully; HasAttentionF32GqaSplitKv reports
+        // false and callers fall back to attention_f32_split_kv / LaunchAttentionF32.
+        _attentionF32GqaSplitKvFunc = _attentionF32Module.TryGetFunction("attention_f32_gqa_split_kv");
         _swigluF32Func = _swigluF32Module.GetFunction("swiglu_f32");
+        _relu2GluF32Func = _swigluF32Module.GetFunction("relu2glu_f32");
         _biasAddF32Func = _biasAddF32Module.GetFunction("bias_add_f32");
         _perHeadRmsNormF32Func = _perHeadRmsNormF32Module.GetFunction("per_head_rmsnorm_f32");
         _ropeFunc = _ropeModule.GetFunction("rope_f16");
@@ -583,6 +644,8 @@ public sealed unsafe class CudaKernels : IDisposable
         _attentionFunc = _attentionModule.GetFunction("attention_f16");
         _attentionDynFunc = _attentionModule.GetFunction("attention_f16_dyn");
         _attentionPosFunc = _attentionModule.GetFunction("attention_pos_f16");
+        // Issue #200 -- optional, see field comment above.
+        _attentionPagedFunc = _attentionModule.TryGetFunction("attention_f16_paged");
         _kvCacheUpdatePosFunc = _kvCacheUpdateModule.GetFunction("kv_cache_update_pos_f16");
         _biasAddFunc = _biasAddModule.GetFunction("bias_add_f16");
         _perHeadRmsNormFunc = _perHeadRmsNormModule.GetFunction("per_head_rmsnorm_f16");
@@ -601,10 +664,34 @@ public sealed unsafe class CudaKernels : IDisposable
         _i2sGemv3F16InFunc = _i2sGemvModule.GetFunction("i2_s_gemv3_f16in");
         _i2sGemvNormF16InFunc = _i2sGemvModule.GetFunction("i2_s_gemv_norm_f16in");
         _i2sGemvF32InFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f32in");
+        _i2sGemmF32InFunc = _i2sGemvModule.TryGetFunction("i2_s_gemm_f32in");
         _i2sGemvA8Func = _i2sGemvModule.GetFunction("i2_s_gemv_a8");
         _i2sGemvA8DeviceScaleFunc = _i2sGemvModule.GetFunction("i2_s_gemv_a8_device_scale");
         _quantizeF16ToI8AbsMaxFunc = _i2sGemvModule.GetFunction("quantize_f16_to_i8_absmax");
         _dequantI2sF16Func = _dequantI2sModule.GetFunction("dequant_i2_s_f16");
+        // Ragged K (k % 128 != 0) — issue #206.
+        _i2sGemvF16InRaggedFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f16in_ragged");
+        _i2sGemvF32InRaggedFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f32in_ragged");
+        _dequantI2sF16RaggedFunc = _dequantI2sModule.GetFunction("dequant_i2_s_f16_ragged");
+        // Opt the x-staging I2_S GEMV kernels (dynamic shared memory, see i2_s_gemv.cu / issue #207)
+        // into the device's full dynamic-shared cap, same as the on-the-fly MMQ kernels above.
+        // Covers both the aligned fast-path kernels and the ragged (#206) fallback kernels — both
+        // families stage x[k] into the same `extern __shared__ float xs[]` pattern now.
+        // i2_s_gemv_a8[_device_scale] read activations from global (no xs[] staging) — no opt-in needed.
+        if (_maxDynamicSharedBytesOptIn > 0)
+        {
+            SetMaxDynamicSharedBytes(_i2sGemvF16InFunc, _maxDynamicSharedBytesOptIn);
+            SetMaxDynamicSharedBytes(_i2sGemv2F16InFunc, _maxDynamicSharedBytesOptIn);
+            SetMaxDynamicSharedBytes(_i2sGemv3F16InFunc, _maxDynamicSharedBytesOptIn);
+            SetMaxDynamicSharedBytes(_i2sGemvNormF16InFunc, _maxDynamicSharedBytesOptIn);
+            SetMaxDynamicSharedBytes(_i2sGemvF32InFunc, _maxDynamicSharedBytesOptIn);
+            SetMaxDynamicSharedBytes(_i2sGemvF16InRaggedFunc, _maxDynamicSharedBytesOptIn);
+            SetMaxDynamicSharedBytes(_i2sGemvF32InRaggedFunc, _maxDynamicSharedBytesOptIn);
+            // i2_s_gemm_f32in's shared cache is int8 (rowsPerBlock * k bytes) — strictly smaller
+            // than the GEMV kernels' k*sizeof(float) staging buffer for the same k at
+            // rowsPerBlock<=4, so this opt-in is a safety margin rather than a hard requirement.
+            SetMaxDynamicSharedBytes(_i2sGemmF32InFunc, _maxDynamicSharedBytesOptIn);
+        }
         _pq2_0GemvF32InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f32in");
         _pq2_0GemvF16InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f16in");
         _pq2_0Gemv2F16InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv2_f16in");
@@ -755,6 +842,7 @@ public sealed unsafe class CudaKernels : IDisposable
             _moeAxpyScaledPerTokenF32Func = _moeFfnModule.TryGetFunction("moe_axpy_scaled_per_token_f32");
             _moeSigmoidLogitF32Func = _moeFfnModule.TryGetFunction("moe_sigmoid_logit_f32");
             _moeGatherTokenRowsF32Func = _moeFfnModule.TryGetFunction("moe_gather_token_rows_f32");
+            _moeGateBiasAddF32Func = _moeFfnModule.TryGetFunction("moe_gate_bias_add_f32");
         }
 
         // MoE grouped-GEMV (Phase B). One kernel walks K_active raw-quant per-expert
@@ -872,6 +960,27 @@ public sealed unsafe class CudaKernels : IDisposable
                 _attentionFlashMmaFunc = 0;
             }
         }
+
+        // Tensor-core FP16 decode attention composed with the GQA-group + split-KV grid
+        // (issue #199 v2). Same best-effort load pattern as attention_flash_mma above and for
+        // the same reason (mma.sync PTX is sm_80+; cuModuleLoadData JITs eagerly and would
+        // throw on Turing) — a failure leaves HasAttentionMmaDecodeGqaSplit false and the
+        // gate/dispatch wrapper (CudaAttentionMmaDecodeGqaSplit) never selects it.
+        string attentionMmaDecodeGqaSplitPath = Path.Combine(ptxDir, "attention_flash_mma_decode_gqa_split.ptx");
+        if (File.Exists(attentionMmaDecodeGqaSplitPath))
+        {
+            try
+            {
+                var mmaDecodeGqaSplitModule = CudaModule.LoadFromFile(attentionMmaDecodeGqaSplitPath);
+                _attentionMmaDecodeGqaSplitFunc = mmaDecodeGqaSplitModule.TryGetFunction("attention_flash_mma_decode_gqa_split_f16");
+                _attentionMmaDecodeGqaSplitModule = mmaDecodeGqaSplitModule;
+            }
+            catch (CudaException)
+            {
+                _attentionMmaDecodeGqaSplitModule = null;
+                _attentionMmaDecodeGqaSplitFunc = 0;
+            }
+        }
     }
 
     /// <summary>
@@ -947,6 +1056,37 @@ public sealed unsafe class CudaKernels : IDisposable
         && _moeZeroF32Func != 0 && _moeAxpyScaledRowF32Func != 0
         && _moeAxpyUnweightedF32Func != 0 && _moeAxpyScaledPerTokenF32Func != 0
         && _moeSigmoidLogitF32Func != 0 && _moeGatherTokenRowsF32Func != 0;
+
+    /// <summary>
+    /// True when the additive router-bias kernel (<see cref="LaunchMoeGateBiasAddF32"/>,
+    /// issue #246) is available. Required only when the MoE layer's router carries a
+    /// non-null <c>gate.bias</c> (identity-MoTE / Qwen3 aux-loss-free routing); harmless
+    /// (unused) otherwise.
+    /// </summary>
+    public bool HasMoeGateBiasAdd => _moeGateBiasAddF32Func != 0;
+
+    /// <summary>
+    /// True when all kernels needed by <see cref="CudaMoeFfn"/>'s BitNet-ternary (I2_S)
+    /// MoE forward path (issue #246) are available: the shared MoE orchestration kernels
+    /// (<see cref="HasMoeKernels"/>), the F32 I2_S GEMV, the relu²·GLU activation, and F32
+    /// RMSNorm (per-expert FFN Sub-LN). The additive router-bias kernel is checked
+    /// separately via <see cref="HasMoeGateBiasAdd"/> — only required when the layer's
+    /// router actually carries a bias.
+    /// </summary>
+    public bool HasBitNetMoeKernels =>
+        HasMoeKernels && _i2sGemvF32InFunc != 0 && _relu2GluF32Func != 0 && _rmsnormF32Func != 0;
+
+    /// <summary>
+    /// True when the batched I2_S GEMM kernel (<see cref="LaunchI2_SGemmF32In"/>, issue #250) is
+    /// available. Lets <see cref="CudaMoeFfn.ForwardBitNetI2S"/>'s prefill path (seqLen&gt;1, multiple
+    /// tokens routed to the same expert) decode each expert's gate/up/down weight row ONCE and reuse
+    /// it across all routed tokens, instead of the original per-row-GEMV-call loop (issue #246 scope
+    /// note) that re-decoded the weight matrix once per token. Independent of
+    /// <see cref="HasBitNetMoeKernels"/> so a stale PTX (not yet recompiled) still runs correctly via
+    /// the per-row-loop fallback — this is a pure prefill-throughput optimization, never a correctness
+    /// requirement.
+    /// </summary>
+    public bool HasI2SBatchedGemm => _i2sGemmF32InFunc != 0;
 
     /// <summary>
     /// True when all Qwen3MoeHybrid recurrence-path FP32 kernels (causal conv1d,
@@ -1045,6 +1185,16 @@ public sealed unsafe class CudaKernels : IDisposable
     /// the default MMVQ-large. On-the-fly only (ignores preq scratch). Set <c>DOTLLM_CUDA_MMVQ_COALESCED=1</c>.</summary>
     public static bool MmvqCoalesced { get; set; } =
         Environment.GetEnvironmentVariable("DOTLLM_CUDA_MMVQ_COALESCED") == "1";
+
+    /// <summary>Opt-in: route Q4_K decode GEMV (k ≥ <see cref="MmvqLargeKThreshold"/>) through the
+    /// llama.cpp-faithful coalesced+accumulate-once MMVQ kernel (<c>quantized_gemv_q4_k_mmvq_llamacpp</c>)
+    /// instead of the default MMVQ-large. Unlike <see cref="MmvqCoalesced"/> (#363, warp-per-superblock
+    /// with a per-iteration 8-wide reduction — bit-exact but 3x SLOWER on Kaggle T4), this kernel keeps
+    /// the coalesced 128-byte qs read per super-block but defers ALL cross-lane combination to a single
+    /// end-of-row reduction, matching MMVQ-large's accumulate-once property. On-the-fly only (ignores
+    /// preq scratch). Set <c>DOTLLM_CUDA_MMVQ_LLAMACPP=1</c>.</summary>
+    public static bool MmvqLlamaCpp { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_CUDA_MMVQ_LLAMACPP") == "1";
 
     /// <summary>Disable decode-time packed QKV upload/dispatch for diagnostics.</summary>
     public static bool DisablePackedQkv { get; set; } =
@@ -1183,10 +1333,15 @@ public sealed unsafe class CudaKernels : IDisposable
         nint wArg = quantWeight, xArg = xF16, yArg = yF16;
         int nArg = n, kArg = k;
         void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
+        // Dynamic shared memory: x[k] staged as FP32 (see i2_s_gemv.cu). Sized per-call since k
+        // varies by projection (e.g. FFN-down's k = intermediateSize, which can exceed the old
+        // BitNet-2B-4T-specific static bound — see issue #207).
+        uint dynShmem = (uint)k * sizeof(float);
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV k={k}");
         // v2 warp-per-row: I2sRowsPerBlock output rows per 256-thread block → ceil(n / rows) blocks.
         CudaDriverApi.cuLaunchKernel(_i2sGemvF16InFunc,
                 (uint)((n + I2sRowsPerBlock - 1) / I2sRowsPerBlock), 1, 1, BlockSize, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>Fused I2_S ternary GEMV for two projections sharing one FP16 input vector.</summary>
@@ -1204,9 +1359,11 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             &w0Arg, &w1Arg, &xArg, &y0Arg, &y1Arg, &n0Arg, &n1Arg, &kArg
         };
+        uint dynShmem = (uint)k * sizeof(float);
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV2 k={k}");
         CudaDriverApi.cuLaunchKernel(_i2sGemv2F16InFunc,
                 grid, 1, 1, BlockSize, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>Fused I2_S ternary GEMV for three projections sharing one FP16 input vector.</summary>
@@ -1225,9 +1382,11 @@ public sealed unsafe class CudaKernels : IDisposable
             &w0Arg, &w1Arg, &w2Arg, &xArg, &y0Arg, &y1Arg, &y2Arg,
             &n0Arg, &n1Arg, &n2Arg, &kArg
         };
+        uint dynShmem = (uint)k * sizeof(float);
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV3 k={k}");
         CudaDriverApi.cuLaunchKernel(_i2sGemv3F16InFunc,
                 grid, 1, 1, BlockSize, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>I2_S ternary GEMV whose FP16 input is RMS-normalized in-kernel before projection.</summary>
@@ -1244,9 +1403,12 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             &wArg, &xArg, &normArg, &yArg, &nArg, &kArg, &epsArg
         };
+        // Shared layout (i2_s_gemv.cu): xs[k] (even-aligned) + warp_sums[32] + rms_inv[1].
+        uint dynShmem = (uint)(((k + 1) & ~1) + 33) * sizeof(float);
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV-norm k={k}");
         CudaDriverApi.cuLaunchKernel(_i2sGemvNormF16InFunc,
                 grid, 1, 1, BlockSize, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>I2_S ternary GEMV with FP32 activations/output. Exact-match twin for CPU-vs-GPU tests.</summary>
@@ -1255,9 +1417,99 @@ public sealed unsafe class CudaKernels : IDisposable
         nint wArg = quantWeight, xArg = xF32, yArg = yF32;
         int nArg = n, kArg = k;
         void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
+        uint dynShmem = (uint)k * sizeof(float);
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV-f32 k={k}");
         CudaDriverApi.cuLaunchKernel(_i2sGemvF32InFunc,
                 (uint)((n + I2sRowsPerBlock - 1) / I2sRowsPerBlock), 1, 1, BlockSize, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Weight rows decoded per block for <see cref="LaunchI2_SGemmF32In"/> (issue #250), before
+    /// any shared-memory-budget shrink. One warp owns exactly one row (no ROWS_PER_WARP multiplier —
+    /// see i2_s_gemv.cu's Variant C remarks for why).</summary>
+    private const int I2sGemmMaxRowsPerBlock = 8;
+
+    /// <summary>
+    /// Batched I2_S ternary GEMM (issue #250): <c>C[t,row] = scale · dot(ternary(W[row,:]), B[t,:])</c>
+    /// for <c>row in [0,n)</c>, <c>t in [0,numTokens)</c>. <paramref name="bF32"/> is <c>[numTokens,k]</c>
+    /// row-major; <paramref name="cF32"/> is <c>[numTokens,n]</c> row-major (token-major — matches
+    /// <c>CudaMoeScratch.GateBatch</c>/<c>UpBatch</c>/<c>DownBatch</c>'s layout). Decodes each weight row
+    /// ONCE (into a per-warp shared int8 cache) and reuses it across every token, instead of the
+    /// per-row-GEMV-call loop <see cref="CudaMoeFfn"/> used before this issue — see
+    /// <c>i2_s_gemm_f32in</c> in i2_s_gemv.cu for the full rationale.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="numTokens"/> == 1 degrades to a plain <see cref="LaunchI2_SGemvF32In"/> call: decoding
+    /// a row to shared just to dot it once is strictly extra work versus the single-pass GEMV kernel.
+    /// Caller must check <see cref="HasI2SBatchedGemm"/> first (this method assumes the kernel is loaded).
+    /// </remarks>
+    public void LaunchI2_SGemmF32In(nint quantWeight, nint bF32, nint cF32, int n, int k, int numTokens, nint stream)
+    {
+        if (numTokens <= 0) return;
+        if (numTokens == 1)
+        {
+            LaunchI2_SGemvF32In(quantWeight, bF32, cF32, n, k, stream);
+            return;
+        }
+
+        // The shared row cache costs rowsPerBlock * k BYTES (int8) — shrink rowsPerBlock so this
+        // fits the device's dynamic-shared opt-in cap for large k (e.g. big FFN intermediate sizes)
+        // instead of failing the launch. Skipped (keeps the max) if the cap couldn't be queried,
+        // matching CheckDynamicSharedBudget's own "unknown cap → don't block" convention below.
+        int rowsPerBlock = I2sGemmMaxRowsPerBlock;
+        if (_maxDynamicSharedBytesOptIn > 0)
+        {
+            int maxRowsForBudget = _maxDynamicSharedBytesOptIn / k;
+            if (maxRowsForBudget < 1) maxRowsForBudget = 1;
+            if (maxRowsForBudget < rowsPerBlock) rowsPerBlock = maxRowsForBudget;
+        }
+
+        nint wArg = quantWeight, bArg = bF32, cArg = cF32;
+        int nArg = n, kArg = k, tArg = numTokens, rpbArg = rowsPerBlock;
+        void** args = stackalloc void*[] {&wArg, &bArg, &cArg, &nArg, &kArg, &tArg, &rpbArg};
+        uint dynShmem = (uint)(rowsPerBlock * k); // int8 ternary cache, 1 byte/element
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMM-f32 k={k} rowsPerBlock={rowsPerBlock}");
+        CudaDriverApi.cuLaunchKernel(_i2sGemmF32InFunc,
+                (uint)((n + rowsPerBlock - 1) / rowsPerBlock), 1, 1, BlockSize, 1, 1,
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    // Ragged K (k % 128 != 0) — issue #206. i2_s_gemv_{f16,f32}in_ragged use ONE warp per row
+    // (8 rows/block, fixed — not I2sRowsPerBlock, which encodes the aligned kernel's
+    // ROWS_PER_WARP=2 tuning) since they don't share the aligned kernels' uint4/shared-block
+    // launch contract. See i2_s_gemv.cu's issue #206 comment for why a ragged row cannot reuse the
+    // aligned addressing even for a "tail cleanup".
+    private const int I2sRaggedRowsPerBlock = 8;
+
+    /// <summary>
+    /// Ragged-K (<c>k % 128 != 0</c>) twin of <see cref="LaunchI2_SGemvF16In"/>. Scalar
+    /// correctness-first fallback — see <c>i2_s_gemv_f16in_ragged</c> in i2_s_gemv.cu.
+    /// </summary>
+    public void LaunchI2_SGemvF16InRagged(nint quantWeight, nint xF16, nint yF16, int n, int k, nint stream)
+    {
+        nint wArg = quantWeight, xArg = xF16, yArg = yF16;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
+        // Dynamic shared memory (issue #207 fix applied here too — the ragged kernel's x-staging
+        // buffer used the same fixed BitNet-2B-4T-sized static array as the aligned kernels).
+        uint dynShmem = (uint)k * sizeof(float);
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV ragged k={k}");
+        CudaDriverApi.cuLaunchKernel(_i2sGemvF16InRaggedFunc,
+                (uint)((n + I2sRaggedRowsPerBlock - 1) / I2sRaggedRowsPerBlock), 1, 1, BlockSize, 1, 1,
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Ragged-K (<c>k % 128 != 0</c>) twin of <see cref="LaunchI2_SGemvF32In"/>.</summary>
+    public void LaunchI2_SGemvF32InRagged(nint quantWeight, nint xF32, nint yF32, int n, int k, nint stream)
+    {
+        nint wArg = quantWeight, xArg = xF32, yArg = yF32;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
+        uint dynShmem = (uint)k * sizeof(float);
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV ragged-f32 k={k}");
+        CudaDriverApi.cuLaunchKernel(_i2sGemvF32InRaggedFunc,
+                (uint)((n + I2sRaggedRowsPerBlock - 1) / I2sRaggedRowsPerBlock), 1, 1, BlockSize, 1, 1,
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>
@@ -1324,6 +1576,28 @@ public sealed unsafe class CudaKernels : IDisposable
         if (gridDim == 0) gridDim = 1;
 
         CudaDriverApi.cuLaunchKernel(_dequantI2sF16Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Ragged-K (<c>k % 128 != 0</c>) twin of <see cref="LaunchDequantI2_SToF16"/>. The aligned
+    /// kernel's <c>blocks_per_row = k/128</c> integer division silently drops each row's tail
+    /// elements for a ragged k, so this dispatches a one-thread-per-output-element grid-stride
+    /// kernel (<c>dequant_i2_s_f16_ragged</c>) that derives each element's block/bit address
+    /// directly from its flattened index instead. See issue #206.
+    /// </summary>
+    public void LaunchDequantI2_SToF16Ragged(nint src, nint dst, int n, int k, nint stream)
+    {
+        nint srcArg = src, dstArg = dst;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] {&srcArg, &dstArg, &nArg, &kArg};
+
+        long totalElems = (long)n * k;
+        uint gridDim = (uint)Math.Min((totalElems + BlockSize - 1) / BlockSize, MaxDequantGridSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_dequantI2sF16RaggedFunc,
                 gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
@@ -1893,6 +2167,442 @@ public sealed unsafe class CudaKernels : IDisposable
                 sharedBytes, stream, (nint)args).ThrowOnError();
     }
 
+    // ─── Issue #226 spike: fp64-combine variant of attention_f32_split_kv ──────────────────────
+    //
+    // Same grid/block/shared-memory shape as LaunchAttentionF32SplitKv; the ONLY kernel-side
+    // difference is the cross-split combine step accumulates in double instead of float (see
+    // attention_f32_split_kv_hp's header in attention_f32.cu). Separate function pointer, separate
+    // opt-in gate (DOTLLM_ATTN_SPLIT_KV_HP=1) so it can be A/B'd against the plain split-KV kernel
+    // without a rebuild. Whether this actually reduces the #222-documented divergence, and at what
+    // perf cost, is exactly what issue #226 measures -- no verdict assumed here.
+
+    /// <summary>Whether the opt-in fp64-combine <c>attention_f32_split_kv_hp</c> kernel (issue
+    /// #226) is present in the loaded PTX.</summary>
+    public bool HasAttentionF32SplitKvHp => _attentionF32SplitKvHpFunc != 0;
+
+    /// <summary>
+    /// Opt-in (default OFF) env-var gate for <see cref="LaunchAttentionF32SplitKvHp"/>. Issue #226
+    /// spike: does accumulating the cross-split combine (partial_max/partial_sum/partial_out
+    /// merge) in double precision reduce the real-generation argmax divergence #222 found in the
+    /// float-combine <see cref="LaunchAttentionF32SplitKv"/>? <c>fast_exp_neg</c> itself is
+    /// untouched (still float, still the same approximation) -- only the summation of its already-
+    /// computed outputs across the (up to) <see cref="AttentionKvSplit"/> terms changes precision.
+    /// </summary>
+    public static bool EnableAttentionSplitKvHp { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_ATTN_SPLIT_KV_HP") == "1";
+
+    /// <summary>Same co-residency safety check as <see cref="IsAttentionSplitKvSafe"/>, queried
+    /// independently against <c>attention_f32_split_kv_hp</c>'s own function pointer (its register
+    /// footprint may differ slightly from the plain kernel's due to the double-precision locals in
+    /// the combine block).</summary>
+    public bool IsAttentionSplitKvHpSafe(int numHeads, int headDim)
+    {
+        if (_attentionF32SplitKvHpFunc == 0) return false;
+
+        if (_attnSplitKvHpMaxCoResidentGrid < 0 || _attnSplitKvHpCachedHeadDim != headDim)
+        {
+            CudaDriverApi.cuCtxGetDevice(out int device);
+            int coopSupported = 0;
+            CudaDriverApi.cuDeviceGetAttribute(out coopSupported,
+                CudaDriverApi.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device);
+            if (coopSupported == 0)
+            {
+                _attnSplitKvHpMaxCoResidentGrid = 0;
+            }
+            else
+            {
+                CudaDriverApi.cuDeviceGetAttribute(out int numSms,
+                    CudaDriverApi.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+                const int TileKv = 256;
+                uint sharedBytesForQuery = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
+                int rc = CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    out int maxBlocksPerSm, _attentionF32SplitKvHpFunc, BlockSize, sharedBytesForQuery);
+                _attnSplitKvHpMaxCoResidentGrid = rc == 0 ? numSms * maxBlocksPerSm : 0;
+            }
+            _attnSplitKvHpCachedHeadDim = headDim;
+        }
+
+        return _attnSplitKvHpMaxCoResidentGrid > 0 && numHeads * AttentionKvSplit <= _attnSplitKvHpMaxCoResidentGrid;
+    }
+
+    /// <summary>fp64-combine variant of <see cref="LaunchAttentionF32SplitKv"/> (issue #226) --
+    /// identical signature/scratch-buffer layout, callers can share the same scratch allocation
+    /// and safety-check call site pattern.</summary>
+    public void LaunchAttentionF32SplitKvHp(nint q, nint k, nint v, nint output,
+                                     int seqKv, int numHeads, int numKvHeads, int headDim,
+                                     int positionOffset, int slidingWindow,
+                                     nint partialMax, nint partialSum, nint partialOut, nint stream)
+    {
+        nint qArg = q, kArg = k, vArg = v, outArg = output;
+        int skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
+        int poArg = positionOffset, swArg = slidingWindow;
+        nint pmArg = partialMax, psArg = partialSum, poutArg = partialOut;
+
+        void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
+                        &skvArg, &nhArg, &nkvArg, &hdArg,
+                        &poArg, &swArg, &pmArg, &psArg, &poutArg};
+
+        const int TileKv = 256;
+        uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
+
+        CudaDriverApi.cuLaunchCooperativeKernel(_attentionF32SplitKvHpFunc,
+                (uint)numHeads, AttentionKvSplit, 1, BlockSize, 1, 1,
+                sharedBytes, stream, (nint)args).ThrowOnError();
+    }
+
+    // ─── OPT-IN combined GQA-group + split-KV kernel (issues #197 + #198) ─────────────────────
+    //
+    // attention_f32_split_kv (above) grids one block per QUERY head. attention_f32_gqa_split_kv
+    // grids one block per KV HEAD instead, register-blocking the QK/PV loops across the GQA
+    // group of query heads sharing that KV head, AND composes that with a runtime (not
+    // hardcoded) KV-split factor -- see native/kernels/attention_f32.cu's header on the combined
+    // kernel for the full design and the two source issues' brainstorm comments for why the two
+    // ideas MUST compose (grid=numKvHeads alone would make occupancy ~6x worse for Bonsai-27B's
+    // real shape, numKvHeads=4 < numHeads=24).
+
+    /// <summary>Max GQA group (query heads per KV head) the combined kernel supports -- MUST
+    /// equal <c>MAX_GQA_GROUP</c> in <c>attention_f32.cu</c> (a compile-time cap on a
+    /// runtime-loop-bounded register array; exceeding it is a correctness hazard, not just a
+    /// perf one, so callers must gate on this before launch).</summary>
+    public const int MaxGqaGroup = 8;
+
+    /// <summary>
+    /// Whether the opt-in combined GQA-group + split-KV <c>attention_f32_gqa_split_kv</c> kernel
+    /// (issues #197 + #198) is present in the loaded PTX. Presence alone does not mean it's safe
+    /// to launch for a given shape -- call <see cref="MaxSafeAttentionGqaSplit"/> first.
+    /// </summary>
+    public bool HasAttentionF32GqaSplitKv => _attentionF32GqaSplitKvFunc != 0;
+
+    /// <summary>
+    /// Opt-in (default OFF) env-var gate for <see cref="LaunchAttentionF32GqaSplit"/>. Same
+    /// tradeoff shape as <see cref="EnableAttentionSplitKv"/> (issue #183) for the split-KV
+    /// combine's reassociation, PLUS the (bit-exact, validated) GQA-group regrid on top -- see
+    /// attention_f32.cu's combined-kernel header for the full correctness story. Off by default
+    /// per this project's Correctness-then-Performance priority order.
+    /// </summary>
+    public static bool EnableAttentionGqaSplit { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_ATTN_GQA_SPLIT") == "1";
+
+    /// <summary>
+    /// Minimum <c>seqKv</c> before the combined kernel is worth its grid.sync + combine overhead
+    /// -- same rationale as <see cref="AttentionSplitKvMinSeqKv"/>. Tunable; not read from an env
+    /// var (only the on/off gate is).
+    /// </summary>
+    public static int AttentionGqaSplitMinSeqKv { get; set; } = 256;
+
+    private static int EnvIntOrDefault(string envVar, int fallback)
+    {
+        var raw = Environment.GetEnvironmentVariable(envVar);
+        return int.TryParse(raw, out int v) && v > 0 ? v : fallback;
+    }
+
+    /// <summary>
+    /// Target total co-resident blocks for <see cref="ComputeAttentionKvSplit"/>'s occupancy
+    /// term (<c>baseBlocks</c> is <c>numKvHeads</c> for the combined kernel). Default derived
+    /// from an RTX-3060 sweep against the real Bonsai-27B shape (numKvHeads=4, headDim=256) --
+    /// see the issue #197/#198 PR description for the sweep table. Override via
+    /// <c>DOTLLM_CUDA_SPLIT_TARGET_BLOCKS</c> (kept permanently, like Vulkan kept its equivalent
+    /// post-#347, so a different CUDA arch/GPU tier can be re-tuned without a native rebuild).
+    /// </summary>
+    private static readonly int AttnSplitTargetBlocks =
+        EnvIntOrDefault("DOTLLM_CUDA_SPLIT_TARGET_BLOCKS", 32);
+
+    /// <summary>
+    /// Minimum KV rows per split before further splitting stops paying for its own grid.sync +
+    /// combine overhead. Override via <c>DOTLLM_CUDA_SPLIT_MIN_KV</c>.
+    /// </summary>
+    /// <remarks>
+    /// <b>Issue #219 fix (was 128):</b> at 128, this term was the BINDING clamp in
+    /// <see cref="ComputeAttentionKvSplit"/> at real Bonsai-27B decode depths (seqKv~258-270),
+    /// overriding <see cref="AttnSplitTargetBlocks"/>'s occupancy target entirely -- it forced
+    /// <c>kv_split=3</c> (grid=12 blocks) when the occupancy term (<c>byOccupancy=8</c> for
+    /// numKvHeads=4) and the co-residency ceiling (<c>maxSafeSplit=35</c>) both allowed far more.
+    /// grid=12 is HALF the pre-split baseline's grid=24, i.e. the "fix" made grid fill worse, not
+    /// better -- confirmed via <c>ncu --set full</c> (issue #199's finding, root-caused in #219):
+    /// duration 174-176us, Achieved Occupancy 16.5-16.7% (statistically identical to the unsplit
+    /// baseline's 16.6-16.8%), Waves/SM 0.09 (worse than baseline's 0.14).
+    /// <para/>
+    /// Lowering to 32 lets <c>byOccupancy</c> become the binding term at this shape/depth as the
+    /// heuristic's own doc comment always intended (<c>S = clamp(TargetBlocks/baseBlocks, 1,
+    /// ceil(seqKv/MinKvPerSplit))</c>, hard-clamped to <c>maxSafeSplit</c>) -- re-profiled
+    /// (<c>ncu --set full</c>, same shape/depth): kv_split=8 (grid=32, now above the unsplit
+    /// baseline's grid=24 as designed), duration 144-146us (~17% faster than the pre-fix 174-176us
+    /// launches), Achieved Occupancy 18.7-19.2% (up from 16.5-16.7%), Waves/SM 0.23 (up from
+    /// 0.09), Compute Throughput 15.7-15.8% (up from 9.3-9.4%).
+    /// <para/>
+    /// <b>This does NOT make the split kernel beat the plain unsplit path</b> at this shape/depth
+    /// -- the fixed 144-146us launches are still ~37% slower than <c>attention_f32</c>'s
+    /// 105-106us at the same seqKv (memory throughput only reaches 16.8-20.6% vs baseline's
+    /// 44.6-45.0%; the cooperative-launch grid.sync()+combine overhead appears to dominate, not
+    /// the intended K/V-read amortization). Pushing further (kv_split=16, grid=64, via
+    /// <c>DOTLLM_CUDA_SPLIT_TARGET_BLOCKS=64</c> + this var at 16) raises Achieved Occupancy
+    /// further (32-45%, avg ~38%) but duration is FLAT-TO-WORSE (148-150us) and Warp
+    /// Cycles/Instruction regresses (28.5 vs 18.6-18.8 at kv_split=8) -- confirms occupancy is no
+    /// longer the binding constraint past ~8 splits for this shape, so 32 (giving kv_split=8 at
+    /// numKvHeads=4) is kept as the default rather than pushed further. Net: this fixes the
+    /// heuristic to behave as documented (a real, ncu-validated improvement whenever
+    /// <c>DOTLLM_ATTN_GQA_SPLIT=1</c> IS enabled), but the feature stays opt-in/default-OFF --
+    /// even fixed, it does not beat the default path at this depth. Full data: issue #219.
+    /// </remarks>
+    private static readonly int AttnSplitMinKvPerSplit =
+        EnvIntOrDefault("DOTLLM_CUDA_SPLIT_MIN_KV", 32);
+
+    /// <summary>
+    /// Occupancy-target split-count heuristic (issue #197), form ported from Vulkan's
+    /// <c>VulkanSplitKvAttentionKernel.ComputeSplits</c> (issue #347's sweep) -- but the
+    /// CONSTANTS are re-derived for CUDA, not copied: Vulkan's <c>TargetWorkgroups</c>/
+    /// <c>MinKvPerSplit</c> were swept entirely on gfx1151 (Strix Halo) against a two-dispatch
+    /// execution model with no co-residency constraint. CUDA's combined kernel is a single
+    /// cooperative launch where ALL requested blocks must be co-resident simultaneously (a hard
+    /// <c>cuLaunchCooperativeKernel</c> requirement), which the Vulkan formula has no equivalent
+    /// clamp for -- that's exactly what <paramref name="maxSafeSplit"/> supplies here.
+    /// <c>S = clamp(TargetBlocks/baseBlocks, 1, ceil(seqKv/MinKvPerSplit))</c>, then hard-clamped
+    /// to <paramref name="maxSafeSplit"/>.
+    /// </summary>
+    /// <param name="seqKv">Cached KV length for this decode step.</param>
+    /// <param name="baseBlocks">Grid.x base block count before splitting -- <c>numKvHeads</c> for
+    /// the combined kernel.</param>
+    /// <param name="maxSafeSplit">The real, GPU/shape-specific co-residency ceiling from
+    /// <see cref="MaxSafeAttentionGqaSplit"/>. Hard clamp -- exceeding it is a CUDA launch error,
+    /// not a soft perf regression.</param>
+    public static int ComputeAttentionKvSplit(int seqKv, int baseBlocks, int maxSafeSplit)
+    {
+        if (seqKv <= 0 || baseBlocks <= 0 || maxSafeSplit <= 0) return 1;
+        int byKv = (seqKv + AttnSplitMinKvPerSplit - 1) / AttnSplitMinKvPerSplit;
+        int byOccupancy = Math.Max(1, AttnSplitTargetBlocks / baseBlocks);
+        int s = Math.Min(byOccupancy, byKv);
+        s = Math.Min(s, maxSafeSplit);
+        return Math.Max(1, s);
+    }
+
+    /// <summary>
+    /// True when <paramref name="numHeads"/>/<paramref name="numKvHeads"/> is a shape the
+    /// combined kernel can handle at all: divides evenly (same convention
+    /// <see cref="DotLLM.Cuda.CudaFlashAttention"/>'s <c>CanUse</c> gate already enforces -- no
+    /// silent truncating-division mis-index) and the resulting group does not exceed
+    /// <see cref="MaxGqaGroup"/>.
+    /// </summary>
+    public static bool IsGqaGroupShapeSupported(int numHeads, int numKvHeads)
+    {
+        if (numHeads <= 0 || numKvHeads <= 0 || numHeads % numKvHeads != 0) return false;
+        int group = numHeads / numKvHeads;
+        return group >= 1 && group <= MaxGqaGroup;
+    }
+
+    /// <summary>
+    /// Queries (once per distinct (<paramref name="headDim"/>, group) pair, cached) the maximum
+    /// safe <c>kv_split</c> for <see cref="LaunchAttentionF32GqaSplit"/> at this
+    /// (numKvHeads, headDim) shape on THIS GPU -- i.e. the largest S such that
+    /// <c>numKvHeads*S</c> blocks can be co-resident simultaneously (the same hard
+    /// <c>cuLaunchCooperativeKernel</c> requirement <see cref="IsAttentionSplitKvSafe"/> already
+    /// guards for the fixed-split kernel, generalized: this returns the ceiling itself, not a
+    /// bool, so callers can feed it into <see cref="ComputeAttentionKvSplit"/>). Returns 0 if the
+    /// kernel isn't loaded, cooperative launch isn't supported, or the shape doesn't fit even at
+    /// split=1 -- callers must fall back to <see cref="LaunchAttentionF32SplitKv"/> or
+    /// <see cref="LaunchAttentionF32"/> in that case.
+    /// </summary>
+    public int MaxSafeAttentionGqaSplit(int numKvHeads, int headDim, int group)
+    {
+        if (_attentionF32GqaSplitKvFunc == 0 || numKvHeads <= 0 || group <= 0) return 0;
+
+        if (_attnGqaSplitMaxCoResidentGrid < 0
+            || _attnGqaSplitCachedHeadDim != headDim
+            || _attnGqaSplitCachedGroup != group)
+        {
+            CudaDriverApi.cuCtxGetDevice(out int device);
+            int coopSupported = 0;
+            CudaDriverApi.cuDeviceGetAttribute(out coopSupported,
+                CudaDriverApi.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device);
+            if (coopSupported == 0)
+            {
+                _attnGqaSplitMaxCoResidentGrid = 0;
+            }
+            else
+            {
+                CudaDriverApi.cuDeviceGetAttribute(out int numSms,
+                    CudaDriverApi.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+                const int TileKv = 256;
+                uint sharedBytesForQuery =
+                    (uint)((group * headDim * 2 + group * TileKv + 32 + group * 2) * sizeof(float));
+                int rc = CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    out int maxBlocksPerSm, _attentionF32GqaSplitKvFunc, BlockSize, sharedBytesForQuery);
+                _attnGqaSplitMaxCoResidentGrid = rc == 0 ? numSms * maxBlocksPerSm : 0;
+            }
+            _attnGqaSplitCachedHeadDim = headDim;
+            _attnGqaSplitCachedGroup = group;
+        }
+
+        if (_attnGqaSplitMaxCoResidentGrid <= 0) return 0;
+        return _attnGqaSplitMaxCoResidentGrid / numKvHeads; // integer floor; 0 = unsafe at any split
+    }
+
+    /// <summary>
+    /// OPT-IN, default-OFF combined GQA-group + split-KV kernel (issues #197 + #198),
+    /// decode-only (<c>seqQ==1</c> implicit -- no seqQ parameter). Grid = <c>(numKvHeads,
+    /// kvSplit)</c> using CUDA Cooperative Groups <c>grid.sync()</c> -- still exactly ONE kernel
+    /// launch. Each block register-blocks the QK/PV loops across the GQA group of query heads
+    /// sharing its KV head (see attention_f32.cu's header). Bit-exact per head vs
+    /// <see cref="LaunchAttentionF32"/> at <c>kvSplit==1</c> (validated, not just asserted --
+    /// see <c>CudaAttentionF32GqaSplitTests.cs</c>); inherits <see cref="LaunchAttentionF32SplitKv"/>'s
+    /// existing reassociation tolerance at <c>kvSplit&gt;1</c>. Callers MUST have confirmed
+    /// <see cref="IsGqaGroupShapeSupported"/> and clamped <paramref name="kvSplit"/> to
+    /// <see cref="MaxSafeAttentionGqaSplit"/>'s result before calling (exceeding the
+    /// cooperative-launch co-residency ceiling is a hard CUDA error).
+    /// </summary>
+    /// <param name="q">Device pointer to this step's query, <c>[numHeads, headDim]</c> (seqQ=1).</param>
+    /// <param name="k">Device pointer to the cached keys, <c>[seqKv, numKvHeads, headDim]</c>.</param>
+    /// <param name="v">Device pointer to the cached values, <c>[seqKv, numKvHeads, headDim]</c>.</param>
+    /// <param name="output">Device pointer to the output, <c>[numHeads, headDim]</c>. Overwritten.</param>
+    /// <param name="seqKv">Cached KV length (causal upper bound is <paramref name="positionOffset"/>).</param>
+    /// <param name="numHeads">Number of query attention heads.</param>
+    /// <param name="numKvHeads">Number of KV heads (GQA group = numHeads/numKvHeads).</param>
+    /// <param name="headDim">Per-head dimension.</param>
+    /// <param name="positionOffset">This step's query position (causal mask upper bound).</param>
+    /// <param name="slidingWindow">Sliding window size, or 0 for full causal attention.</param>
+    /// <param name="kvSplit">KV-dimension split factor -- see <see cref="ComputeAttentionKvSplit"/>.</param>
+    /// <param name="partialMax">Scratch, <c>[numHeads, kvSplit]</c> floats.</param>
+    /// <param name="partialSum">Scratch, <c>[numHeads, kvSplit]</c> floats.</param>
+    /// <param name="partialOut">Scratch, <c>[numHeads, kvSplit, headDim]</c> floats.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchAttentionF32GqaSplit(nint q, nint k, nint v, nint output,
+                                     int seqKv, int numHeads, int numKvHeads, int headDim,
+                                     int positionOffset, int slidingWindow, int kvSplit,
+                                     nint partialMax, nint partialSum, nint partialOut, nint stream)
+    {
+        nint qArg = q, kArg = k, vArg = v, outArg = output;
+        int skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
+        int poArg = positionOffset, swArg = slidingWindow, ksArg = kvSplit;
+        nint pmArg = partialMax, psArg = partialSum, poutArg = partialOut;
+
+        void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
+                        &skvArg, &nhArg, &nkvArg, &hdArg,
+                        &poArg, &swArg, &ksArg, &pmArg, &psArg, &poutArg};
+
+        int group = numHeads / numKvHeads;
+        const int TileKv = 256;
+        uint sharedBytes =
+            (uint)((group * headDim * 2 + group * TileKv + 32 + group * 2) * sizeof(float));
+
+        CudaDriverApi.cuLaunchCooperativeKernel(_attentionF32GqaSplitKvFunc,
+                (uint)numKvHeads, (uint)kvSplit, 1, BlockSize, 1, 1,
+                sharedBytes, stream, (nint)args).ThrowOnError();
+    }
+
+    // ─── OPT-IN tensor-core (mma.sync) FP16 decode attention, composed with the GQA-group +
+    // split-KV grid (issue #199 v2) ─────────────────────────────────────────────────────────
+    //
+    // Same grid shape as attention_f32_gqa_split_kv above -- (numKvHeads, kvSplit) via
+    // cuLaunchCooperativeKernel -- but each block packs the `group` query heads sharing its
+    // KV head into ONE mma.sync.m16n8k16 tile's M dimension instead of register-blocking them
+    // (see attention_flash_mma_decode_gqa_split.cu's header for the full design and why this
+    // keeps the kernel's STATIC shared-memory footprint group-independent, unlike the sibling
+    // kernel's dynamic per-group shared arrays). Reads Q/K/V as FP16 (K/V straight from the
+    // FP16 KV cache) and writes F32 output directly, same convention as v1
+    // (attention_flash_mma_decode.cu, issue #199 v1, not merged).
+
+    /// <summary>Block size (NUM_WARPS*32) the composed tensor-core decode kernel is compiled
+    /// with -- MUST match <c>NUM_WARPS</c> in <c>attention_flash_mma_decode_gqa_split.cu</c>.</summary>
+    public const int AttentionMmaDecodeGqaSplitBlockSize = 256;
+
+    /// <summary>Head dimension the composed tensor-core decode kernel is compiled for
+    /// (Bonsai-27B's qwen35moe shape) -- MUST match <c>HEAD_DIM</c> in
+    /// <c>attention_flash_mma_decode_gqa_split.cu</c>.</summary>
+    public const int AttentionMmaDecodeGqaSplitHeadDim = 256;
+
+    /// <summary>
+    /// True when the composed tensor-core decode kernel (issue #199 v2) is loaded
+    /// (<c>attention_flash_mma_decode_gqa_split.ptx</c> present and the sm_86 module loaded
+    /// successfully on this device). Presence alone does not mean it's safe to launch for a
+    /// given shape -- call <see cref="MaxSafeAttentionMmaDecodeGqaSplit"/> first. See
+    /// <see cref="DotLLM.Cuda.CudaAttentionMmaDecodeGqaSplit"/> for the gating/dispatch wrapper.
+    /// </summary>
+    public bool HasAttentionMmaDecodeGqaSplit => _attentionMmaDecodeGqaSplitFunc != 0;
+
+    /// <summary>
+    /// Queries (once per distinct <paramref name="group"/>, cached) the maximum safe
+    /// <c>kvSplit</c> for <see cref="LaunchAttentionMmaDecodeGqaSplit"/> at this
+    /// (numKvHeads, group) shape on THIS GPU -- i.e. the largest S such that
+    /// <c>numKvHeads*S</c> blocks can be co-resident simultaneously (the same hard
+    /// <c>cuLaunchCooperativeKernel</c> requirement <see cref="MaxSafeAttentionGqaSplit"/>
+    /// already guards for the sibling FP32 kernel). Unlike that kernel, this one's shared
+    /// memory is STATIC and group-independent (see the .cu file's header), so the occupancy
+    /// query passes <c>dynamicSMemSize=0</c> -- the driver already knows the static footprint
+    /// from the compiled module. <paramref name="headDim"/> is accepted for API symmetry with
+    /// <see cref="MaxSafeAttentionGqaSplit"/> but is not used in the query (the kernel is
+    /// compiled for a single fixed <see cref="AttentionMmaDecodeGqaSplitHeadDim"/>). Returns 0
+    /// if the kernel isn't loaded, cooperative launch isn't supported, or the shape doesn't
+    /// fit even at split=1.
+    /// </summary>
+    public int MaxSafeAttentionMmaDecodeGqaSplit(int numKvHeads, int headDim, int group)
+    {
+        if (_attentionMmaDecodeGqaSplitFunc == 0 || numKvHeads <= 0 || group <= 0) return 0;
+
+        if (_attnMmaDecodeGqaSplitMaxCoResidentGrid < 0 || _attnMmaDecodeGqaSplitCachedGroup != group)
+        {
+            CudaDriverApi.cuCtxGetDevice(out int device);
+            int coopSupported = 0;
+            CudaDriverApi.cuDeviceGetAttribute(out coopSupported,
+                CudaDriverApi.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device);
+            if (coopSupported == 0)
+            {
+                _attnMmaDecodeGqaSplitMaxCoResidentGrid = 0;
+            }
+            else
+            {
+                CudaDriverApi.cuDeviceGetAttribute(out int numSms,
+                    CudaDriverApi.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+                int rc = CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    out int maxBlocksPerSm, _attentionMmaDecodeGqaSplitFunc,
+                    AttentionMmaDecodeGqaSplitBlockSize, dynamicSMemSize: 0);
+                _attnMmaDecodeGqaSplitMaxCoResidentGrid = rc == 0 ? numSms * maxBlocksPerSm : 0;
+            }
+            _attnMmaDecodeGqaSplitCachedGroup = group;
+        }
+
+        if (_attnMmaDecodeGqaSplitMaxCoResidentGrid <= 0) return 0;
+        return _attnMmaDecodeGqaSplitMaxCoResidentGrid / numKvHeads; // integer floor; 0 = unsafe at any split
+    }
+
+    /// <summary>
+    /// OPT-IN, default-OFF composed tensor-core decode kernel (issue #199 v2), decode-only
+    /// (<c>seqQ==1</c> implicit). Grid = <c>(numKvHeads, kvSplit)</c> using CUDA Cooperative
+    /// Groups <c>grid.sync()</c> -- still exactly ONE kernel launch, same shape and combine
+    /// algebra as <see cref="LaunchAttentionF32GqaSplit"/> (ported verbatim -- see the .cu
+    /// file's header). Callers MUST have confirmed <see cref="CudaKernels.IsGqaGroupShapeSupported"/>
+    /// and clamped <paramref name="kvSplit"/> to <see cref="MaxSafeAttentionMmaDecodeGqaSplit"/>'s
+    /// result before calling (exceeding the cooperative-launch co-residency ceiling is a hard
+    /// CUDA error).
+    /// </summary>
+    /// <param name="q">Device pointer to this step's query, FP16, <c>[numHeads, headDim]</c> (seqQ=1).</param>
+    /// <param name="k">Device pointer to the FP16 KV cache's keys, <c>[seqKv, numKvHeads, headDim]</c>.</param>
+    /// <param name="v">Device pointer to the FP16 KV cache's values, <c>[seqKv, numKvHeads, headDim]</c>.</param>
+    /// <param name="output">Device pointer to the F32 output, <c>[numHeads, headDim]</c>. Overwritten.</param>
+    /// <param name="seqKv">Cached KV length.</param>
+    /// <param name="numHeads">Number of query attention heads.</param>
+    /// <param name="numKvHeads">Number of KV heads (GQA group = numHeads/numKvHeads).</param>
+    /// <param name="kvSplit">KV-dimension split factor -- see <see cref="ComputeAttentionKvSplit"/>.</param>
+    /// <param name="partialMax">Scratch, <c>[numHeads, kvSplit]</c> floats.</param>
+    /// <param name="partialSum">Scratch, <c>[numHeads, kvSplit]</c> floats.</param>
+    /// <param name="partialOut">Scratch, <c>[numHeads, kvSplit, headDim]</c> floats.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchAttentionMmaDecodeGqaSplit(nint q, nint k, nint v, nint output,
+        int seqKv, int numHeads, int numKvHeads, int kvSplit,
+        nint partialMax, nint partialSum, nint partialOut, nint stream)
+    {
+        nint qArg = q, kArg = k, vArg = v, outArg = output;
+        int skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, ksArg = kvSplit;
+        float scArg = 1.0f / MathF.Sqrt(AttentionMmaDecodeGqaSplitHeadDim);
+        nint pmArg = partialMax, psArg = partialSum, poutArg = partialOut;
+
+        void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
+                        &skvArg, &nhArg, &nkvArg, &scArg, &ksArg, &pmArg, &psArg, &poutArg};
+
+        CudaDriverApi.cuLaunchCooperativeKernel(_attentionMmaDecodeGqaSplitFunc,
+                (uint)numKvHeads, (uint)kvSplit, 1, AttentionMmaDecodeGqaSplitBlockSize, 1, 1,
+                0, stream, (nint)args).ThrowOnError();
+    }
+
+
     /// <summary>FP32 SwiGLU: out = SiLU(gate) * up, all FP32.</summary>
     public void LaunchSwiGLUF32(nint gate, nint up, nint output,
                                   int n, int seqLen, nint stream)
@@ -1904,6 +2614,25 @@ public sealed unsafe class CudaKernels : IDisposable
         uint gridDim = (uint)((n * seqLen + BlockSize - 1) / BlockSize);
 
         CudaDriverApi.cuLaunchKernel(_swigluF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// FP32 BitNet-MoE gate activation: <c>out = relu(gate)^2 * up</c> (issue #246). Replaces
+    /// <see cref="LaunchSwiGLUF32"/> for ternary I2_S expert bodies — same launch shape (one
+    /// thread per element, grid-strided over <c>n * seqLen</c>).
+    /// </summary>
+    public void LaunchReLU2GLUF32(nint gate, nint up, nint output,
+                                    int n, int seqLen, nint stream)
+    {
+        nint gateArg = gate, upArg = up, outArg = output;
+        int nArg = n, slArg = seqLen;
+
+        void** args = stackalloc void*[] {&gateArg, &upArg, &outArg, &nArg, &slArg};
+        uint gridDim = (uint)((n * seqLen + BlockSize - 1) / BlockSize);
+
+        CudaDriverApi.cuLaunchKernel(_relu2GluF32Func,
                 gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
@@ -2885,6 +3614,87 @@ public sealed unsafe class CudaKernels : IDisposable
     }
     #pragma warning restore CS1573
 
+    /// <summary>
+    /// Whether the opt-in direct block-table-read paged decode attention kernel (issue #200,
+    /// <c>attention_f16_paged</c>) is available in the loaded PTX. False on a stale build --
+    /// callers must keep using <see cref="CudaPagedKvCache"/>'s gather-based
+    /// <c>PrepareAttentionScratch</c> + <see cref="LaunchAttention"/> path unconditionally.
+    /// </summary>
+    public bool HasAttentionF16Paged => _attentionPagedFunc != 0;
+
+    /// <summary>
+    /// Enables <see cref="LaunchAttentionPaged"/> in <c>CudaTransformerModel</c>'s paged-cache
+    /// decode dispatch, in place of the default gather-into-scratch path. Default OFF (this
+    /// kernel has not been measured against the gather path yet -- see issue #200's own
+    /// "wire in behind an opt-in flag" requirement and <c>docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md</c>).
+    /// Set <c>DOTLLM_ATTN_PAGED_NATIVE=1</c> to opt in.
+    /// </summary>
+    public static bool EnableNativePagedAttention { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_ATTN_PAGED_NATIVE") == "1";
+
+    /// <summary>
+    /// Issue #200: direct block-table-read paged decode attention. Same online-softmax math
+    /// and launch geometry as <see cref="LaunchAttention"/> (one block per (query_token,
+    /// query_head), same tiled shared-memory layout) -- the only difference is that K/V rows
+    /// are resolved through <paramref name="kBlockPtrs"/>/<paramref name="vBlockPtrs"/> (a
+    /// small per-layer device array of block base pointers, see
+    /// <see cref="CudaPagedKvCache.PrepareNativeBlockPtrs"/>) instead of a flat contiguous
+    /// buffer, eliminating the D2D gather <see cref="CudaPagedKvCache.PrepareAttentionScratch"/>
+    /// would otherwise need to run before this launch.
+    /// </summary>
+    /// <param name="kBlockPtrs">Device pointer to an array of <c>ceil(seqKv/blockSize)</c> device pointers (K blocks, this layer).</param>
+    /// <param name="vBlockPtrs">Device pointer to an array of <c>ceil(seqKv/blockSize)</c> device pointers (V blocks, this layer).</param>
+    /// <param name="blockSize">Tokens per block (<see cref="CudaKvBlockPool.BlockSize"/>).</param>
+    #pragma warning disable CS1573 // match LaunchAttention; remaining params are self-documenting
+    public void LaunchAttentionPaged(nint q, nint kBlockPtrs, nint vBlockPtrs, nint output,
+                                      int seqQ, int seqKv, int blockSize,
+                                      int numHeads, int numKvHeads, int headDim,
+                                      int positionOffset, int slidingWindow, nint stream)
+    {
+        if (_attentionPagedFunc == 0)
+            throw new InvalidOperationException(
+                "attention_f16_paged is not available in the loaded PTX (stale build). " +
+                "Check HasAttentionF16Paged before calling LaunchAttentionPaged.");
+
+        nint qArg = q, kbpArg = kBlockPtrs, vbpArg = vBlockPtrs, outArg = output;
+        int sqArg = seqQ, skvArg = seqKv, bsArg = blockSize;
+        int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
+        int poArg = positionOffset, swArg = slidingWindow;
+
+        void** args = stackalloc void*[] {&qArg, &kbpArg, &vbpArg, &outArg,
+                        &sqArg, &skvArg, &bsArg, &nhArg, &nkvArg, &hdArg,
+                        &poArg, &swArg};
+
+        int numBlocks = seqQ * numHeads;
+        // Same shared-memory layout/size as LaunchAttention (q_shared+score_tile+out_accum+warp_scratch).
+        const int TileKv = 256;
+        uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
+
+        CudaDriverApi.cuLaunchKernel(_attentionPagedFunc,
+                (uint)numBlocks, 1, 1, BlockSize, 1, 1,
+                sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+    #pragma warning restore CS1573
+
+    /// <summary>
+    /// Diagnostic-only (issue #213): reports register/local-memory usage for the
+    /// <c>attention_f16</c> vs <c>attention_f16_dyn</c> compiled functions, to check for an
+    /// occupancy-affecting compiled-code difference between the two entry points without
+    /// needing Nsight Compute. Returns (numRegsScalar, numRegsDyn, localBytesScalar, localBytesDyn).
+    /// </summary>
+    internal (int regsScalar, int regsDyn, int localScalar, int localDyn) DebugGetAttentionFuncStats()
+    {
+        CudaDriverApi.cuFuncGetAttribute(out int regsScalar,
+            CudaDriverApi.CU_FUNC_ATTRIBUTE_NUM_REGS, _attentionFunc).ThrowOnError();
+        CudaDriverApi.cuFuncGetAttribute(out int regsDyn,
+            CudaDriverApi.CU_FUNC_ATTRIBUTE_NUM_REGS, _attentionDynFunc).ThrowOnError();
+        CudaDriverApi.cuFuncGetAttribute(out int localScalar,
+            CudaDriverApi.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, _attentionFunc).ThrowOnError();
+        CudaDriverApi.cuFuncGetAttribute(out int localDyn,
+            CudaDriverApi.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, _attentionDynFunc).ThrowOnError();
+        return (regsScalar, regsDyn, localScalar, localDyn);
+    }
+
     /// <summary>Attention variant that reads the query position from device memory.</summary>
     public void LaunchAttentionPos(nint q, nint k, nint v, nint output, nint positions,
                                    int seqQ, int seqKv,
@@ -3377,6 +4187,11 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <c>DOTLLM_DISABLE_MMVQ_LARGE_Q4K=1</c>.</summary>
     public bool HasMmvqLargeQ4K => _quantizedGemvQ4_KMmvqLargeFunc != 0 && !DisableMmvqLargeQ4K;
 
+    /// <summary>True when the llama.cpp-faithful coalesced+accumulate-once Q4_K MMVQ kernel
+    /// (<c>quantized_gemv_q4_k_mmvq_llamacpp</c>) is loaded (PTX present). Independent of
+    /// <see cref="MmvqLlamaCpp"/>, which additionally gates whether the dispatcher routes to it.</summary>
+    public bool HasMmvqLlamaCppQ4K => _quantizedGemvQ4_KMmvqLlamaCppFunc != 0;
+
     /// <summary>True when the MMVQ-large Q5_K GEMV kernel is loaded and not disabled.</summary>
     public bool HasMmvqLargeQ5K => _quantizedGemvQ5_KMmvqLargeFunc != 0 && !DisableMmvqLargeQ5K;
 
@@ -3569,6 +4384,24 @@ public sealed unsafe class CudaKernels : IDisposable
 
         bool usePreq = preqScratch != 0 && HasPreQ8_1;
 
+        // llama.cpp-faithful coalesced+accumulate-once Q4_K MMVQ (opt-in, DOTLLM_CUDA_MMVQ_LLAMACPP=1):
+        // same warp-per-superblock coalesced 128-byte qs load as MmvqCoalesced below, but defers ALL
+        // cross-lane reduction to a single end-of-row reduce (MMVQ-large's accumulate-once property).
+        // Checked ahead of MmvqCoalesced so it takes priority if both toggles are set. On-the-fly only.
+        if (MmvqLlamaCpp && qt == QuantizationType.Q4_K && k >= MmvqLargeKThreshold
+            && _quantizedGemvQ4_KMmvqLlamaCppFunc != 0)
+        {
+            nint wLc = quantWeight, xLc = x, yLc = y;
+            int nLc = n, kLc = k;
+            void** argsLc = stackalloc void*[] { &wLc, &xLc, &yLc, &nLc, &kLc };
+            uint dynShmemLc = (uint)ComputeMmqDynamicSharedBytes(qt, k);
+            CheckDynamicSharedBudget(dynShmemLc, qt, k);
+            CudaDriverApi.cuLaunchKernel(_quantizedGemvQ4_KMmvqLlamaCppFunc,
+                    (uint)n, 1, 1, MmvqLargeThreads, 1, 1,
+                    dynShmemLc, stream, (nint)argsLc, 0).ThrowOnError();
+            return;
+        }
+
         // Experimental coalesced Q4_K MMVQ (opt-in, DOTLLM_CUDA_MMVQ_COALESCED=1): warp-per-superblock
         // with coalesced 128-byte qs loads. On-the-fly only (does its own Stage-1 from x, ignores preq).
         // Same 1-row-per-block launch as MMVQ-large; gated to Q4_K + k ≥ threshold.
@@ -3712,17 +4545,23 @@ public sealed unsafe class CudaKernels : IDisposable
         }
     }
 
+    /// <summary>MMQ-GEMV-specific overload of <see cref="CheckDynamicSharedBudget(uint, string)"/>.</summary>
+    private void CheckDynamicSharedBudget(uint dynShmem, QuantizationType qt, int k)
+        => CheckDynamicSharedBudget(dynShmem, $"MMQ GEMV {qt} k={k}");
+
     /// <summary>
     /// Pre-launch check that the requested dynamic shmem fits the device budget. Failing
     /// fast here gives a much clearer error than CUDA's generic CUDA_ERROR_INVALID_VALUE
-    /// when sharedMemBytes exceeds the opt-in cap. Skipped if we couldn't query the cap.
+    /// (or, worse, a downstream "illegal memory access" from an out-of-bounds shared-memory
+    /// write inside the kernel) when sharedMemBytes exceeds the opt-in cap. Skipped if we
+    /// couldn't query the cap.
     /// </summary>
-    private void CheckDynamicSharedBudget(uint dynShmem, QuantizationType qt, int k)
+    private void CheckDynamicSharedBudget(uint dynShmem, string label)
     {
         if (_maxDynamicSharedBytesOptIn <= 0) return;
         if (dynShmem <= (uint)_maxDynamicSharedBytesOptIn) return;
         throw new InvalidOperationException(
-            $"MMQ GEMV {qt} k={k} requires {dynShmem} bytes of dynamic shared memory, " +
+            $"{label} requires {dynShmem} bytes of dynamic shared memory, " +
             $"exceeding the device cap of {_maxDynamicSharedBytesOptIn} bytes. " +
             "Either route through the dequantize-then-cuBLAS-FP16 fallback or fan the matmul " +
             "across multiple kernel launches.");
@@ -4388,6 +5227,26 @@ public sealed unsafe class CudaKernels : IDisposable
     }
 
     // ── MoE launchers ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Additive router-bias add (issue #246): <c>logits[t, e] += bias[e]</c> for every
+    /// token. Must be called BEFORE <see cref="LaunchMoeSoftmaxTopk"/> — mirrors
+    /// <c>MoeSwiGluMlp.Route</c>'s CPU ordering (bias added to raw logits, then
+    /// softmax, then top-k). Used by identity-MoTE / Qwen3 aux-loss-free routing.
+    /// </summary>
+    public void LaunchMoeGateBiasAddF32(nint logits, nint bias, int seqLen, int numExperts, nint stream)
+    {
+        if (_moeGateBiasAddF32Func == 0)
+            throw new InvalidOperationException("MoE gate-bias-add kernel not available.");
+
+        nint logitsArg = logits, biasArg = bias;
+        int slArg = seqLen, neArg = numExperts;
+        void** args = stackalloc void*[] {&logitsArg, &biasArg, &slArg, &neArg};
+        uint gridDim = (uint)((seqLen * numExperts + BlockSize - 1) / BlockSize);
+        CudaDriverApi.cuLaunchKernel(_moeGateBiasAddF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
 
     /// <summary>
     /// Per-token softmax + top-k selection for MoE routing. Reads

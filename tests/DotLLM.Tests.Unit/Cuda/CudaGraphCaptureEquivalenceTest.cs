@@ -267,6 +267,215 @@ public class CudaGraphCaptureEquivalenceTest
             $"First-step logit divergence too large: max abs diff = {maxDiff}");
     }
 
+    /// <summary>
+    /// BitNet (I2_S ternary) variant of <see cref="EagerVsGraphDecode_Match"/>: the eager
+    /// path's FP32-residual / Sub-LN / ReLU² branches must be exactly mirrored by
+    /// <c>CaptureDecodeGraph</c> — issue #212. BitNet is a strong discriminator (unlike
+    /// the dense SmolLM path above, a wrong captured body here can silently overflow FP16
+    /// or skip the Sub-LN normalization entirely, producing high-confidence-but-wrong
+    /// logits rather than a crash) so this locks in both the real BitNet-2B-4T model
+    /// (hidden=2560, 128-aligned) and the ragged bitnet_b1_58-xl model (hidden=2048,
+    /// intermediate=5460, not a multiple of 128 — exercises the ragged I2_S GEMV path
+    /// inside the graph too, see issue #206).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(
+        "E:/.cache/huggingface/hub/models--microsoft--bitnet-b1.58-2B-4T-gguf/snapshots/a1f2f1c765812aa8af3f6eda4a313707064bba15/ggml-model-i2_s.gguf",
+        "BitNet-2B-4T")]
+    [InlineData(
+        "E:/Development/bitnet-tests/models/bitnet_b1_58-xl/ggml-model-i2_s.gguf",
+        "bitnet_b1_58-xl")]
+    public unsafe void EagerVsGraphDecode_BitNet_Match(string modelPath, string label)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(!File.Exists(modelPath), $"{label} GGUF not found at {modelPath}");
+
+        using var gguf = GgufFile.Open(modelPath);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        Assert.Equal(DotLLM.Core.Configuration.Architecture.BitNet, config.Architecture);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        int[] prompt = tokenizer.Encode("The capital of France is Paris. The capital of Germany is");
+        _out.WriteLine($"[{label}] Prompt tokens: {prompt.Length}");
+
+        const int decodeSteps = 16;
+        int kvCap = prompt.Length + decodeSteps + 8;
+
+        // === Run 1: Eager ===
+        int[] eagerTokens = new int[decodeSteps];
+        float[] eagerFirstLogits = new float[config.VocabSize];
+        using (var modelEager = CudaTransformerModel.LoadFromGguf(gguf, config))
+        using (var kvEager = modelEager.CreateKvCache(kvCap))
+        {
+            modelEager.UseGraphCapture = false;
+            int[] positions = new int[prompt.Length];
+            for (int i = 0; i < prompt.Length; i++) positions[i] = i;
+            using (var _ = modelEager.Forward(prompt, positions, 0, kvEager)) { }
+
+            int curTok = prompt[^1];
+            int[] tokBuf = new int[1];
+            int[] posBuf = new int[1];
+            for (int i = 0; i < decodeSteps; i++)
+            {
+                tokBuf[0] = curTok;
+                posBuf[0] = prompt.Length + i;
+                using var t = modelEager.Forward(tokBuf, posBuf, 0, kvEager);
+                int argmax = ArgMax((float*)t.DataPointer, config.VocabSize);
+                if (i == 0)
+                {
+                    var span = new ReadOnlySpan<float>((void*)t.DataPointer, config.VocabSize);
+                    span.CopyTo(eagerFirstLogits);
+                }
+                eagerTokens[i] = argmax;
+                curTok = argmax;
+            }
+        }
+
+        // === Run 2: Graph capture ===
+        int[] graphTokens = new int[decodeSteps];
+        float[] graphFirstLogits = new float[config.VocabSize];
+        using (var modelGraph = CudaTransformerModel.LoadFromGguf(gguf, config))
+        using (var kvGraph = modelGraph.CreateKvCache(kvCap))
+        {
+            modelGraph.UseGraphCapture = true;
+            int[] positions = new int[prompt.Length];
+            for (int i = 0; i < prompt.Length; i++) positions[i] = i;
+            // Prefill stays eager (multi-token).
+            using (var _ = modelGraph.Forward(prompt, positions, 0, kvGraph)) { }
+
+            int curTok = prompt[^1];
+            int[] tokBuf = new int[1];
+            int[] posBuf = new int[1];
+            for (int i = 0; i < decodeSteps; i++)
+            {
+                tokBuf[0] = curTok;
+                posBuf[0] = prompt.Length + i;
+                using var t = modelGraph.Forward(tokBuf, posBuf, 0, kvGraph);
+                int argmax = ArgMax((float*)t.DataPointer, config.VocabSize);
+                if (i == 0)
+                {
+                    var span = new ReadOnlySpan<float>((void*)t.DataPointer, config.VocabSize);
+                    span.CopyTo(graphFirstLogits);
+                }
+                graphTokens[i] = argmax;
+                curTok = argmax;
+            }
+        }
+
+        // === Compare ===
+        _out.WriteLine($"[{label}] Eager tokens: [{string.Join(", ", eagerTokens)}]");
+        _out.WriteLine($"[{label}] Graph tokens: [{string.Join(", ", graphTokens)}]");
+
+        float maxDiff = 0;
+        float sumDiff = 0;
+        for (int i = 0; i < config.VocabSize; i++)
+        {
+            float d = MathF.Abs(eagerFirstLogits[i] - graphFirstLogits[i]);
+            sumDiff += d;
+            if (d > maxDiff) maxDiff = d;
+        }
+        _out.WriteLine($"[{label}] Step 0 logit max abs diff: {maxDiff:F6}, mean diff: {sumDiff / config.VocabSize:F6}");
+
+        // Same gate as EagerVsGraphDecode_Match above: argmax MUST match at every step,
+        // logit values tolerate the same generous 5.0f bound (PTX-JIT SASS-scheduling
+        // drift from other tests sharing the process, not a real eager/graph divergence).
+        for (int i = 0; i < decodeSteps; i++)
+        {
+            Assert.True(eagerTokens[i] == graphTokens[i],
+                $"[{label}] Argmax divergence at step {i}: eager={eagerTokens[i]}, graph={graphTokens[i]}");
+        }
+
+        Assert.True(maxDiff < 5.0f,
+            $"[{label}] First-step logit divergence too large: max abs diff = {maxDiff}");
+    }
+
+    /// <summary>
+    /// Issue #213: BitNet's graph-capture eligibility now falls back to eager once the
+    /// running KV length reaches <see cref="CudaTransformerModel.BitNetGraphCaptureMaxDepth"/>
+    /// (default 384) — the deep-context regression's mitigation. This test decodes PAST that
+    /// threshold (prompt + decode steps &gt; 384) so the "graph" run actually exercises BOTH
+    /// halves: graph replay while shallow, then a mid-generation transition to eager once the
+    /// threshold is crossed, all within a single <see cref="CudaKvCache"/> / model instance
+    /// (unlike <see cref="EagerVsGraphDecode_BitNet_Match"/>, which never decodes deep enough
+    /// to reach the threshold). Must still match the eager oracle bit-exactly — the transition
+    /// itself must not corrupt any state (KV-cache length bookkeeping, the graph's cached
+    /// `_decodeGraphExec` sitting unused post-transition, etc.).
+    /// </summary>
+    [SkippableFact]
+    public unsafe void EagerVsGraphDecode_BitNet_CrossesGraphDepthThreshold_Match()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        const string modelPath =
+            "E:/.cache/huggingface/hub/models--microsoft--bitnet-b1.58-2B-4T-gguf/snapshots/a1f2f1c765812aa8af3f6eda4a313707064bba15/ggml-model-i2_s.gguf";
+        Skip.If(!File.Exists(modelPath), $"BitNet-2B-4T GGUF not found at {modelPath}");
+
+        using var gguf = GgufFile.Open(modelPath);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        int[] prompt = tokenizer.Encode("The capital of France is Paris. The capital of Germany is");
+        _out.WriteLine($"Prompt tokens: {prompt.Length}");
+
+        // BitNetGraphCaptureMaxDepth defaults to 384; decode well past it so the graph run
+        // spends part of the sequence on graph replay and part on the post-threshold eager
+        // fallback within the SAME kvCache/model instance.
+        int decodeSteps = Math.Max(32, (CudaTransformerModel.BitNetGraphCaptureMaxDepth - prompt.Length) + 64);
+        int kvCap = prompt.Length + decodeSteps + 8;
+        _out.WriteLine($"decodeSteps={decodeSteps} (threshold={CudaTransformerModel.BitNetGraphCaptureMaxDepth})");
+
+        int[] eagerTokens = new int[decodeSteps];
+        using (var modelEager = CudaTransformerModel.LoadFromGguf(gguf, config))
+        using (var kvEager = modelEager.CreateKvCache(kvCap))
+        {
+            modelEager.UseGraphCapture = false;
+            int[] positions = new int[prompt.Length];
+            for (int i = 0; i < prompt.Length; i++) positions[i] = i;
+            using (var _ = modelEager.Forward(prompt, positions, 0, kvEager)) { }
+
+            int curTok = prompt[^1];
+            int[] tokBuf = new int[1];
+            int[] posBuf = new int[1];
+            for (int i = 0; i < decodeSteps; i++)
+            {
+                tokBuf[0] = curTok;
+                posBuf[0] = prompt.Length + i;
+                using var t = modelEager.Forward(tokBuf, posBuf, 0, kvEager);
+                eagerTokens[i] = ArgMax((float*)t.DataPointer, config.VocabSize);
+                curTok = eagerTokens[i];
+            }
+        }
+
+        int[] graphTokens = new int[decodeSteps];
+        using (var modelGraph = CudaTransformerModel.LoadFromGguf(gguf, config))
+        using (var kvGraph = modelGraph.CreateKvCache(kvCap))
+        {
+            modelGraph.UseGraphCapture = true;
+            int[] positions = new int[prompt.Length];
+            for (int i = 0; i < prompt.Length; i++) positions[i] = i;
+            using (var _ = modelGraph.Forward(prompt, positions, 0, kvGraph)) { }
+
+            int curTok = prompt[^1];
+            int[] tokBuf = new int[1];
+            int[] posBuf = new int[1];
+            for (int i = 0; i < decodeSteps; i++)
+            {
+                tokBuf[0] = curTok;
+                posBuf[0] = prompt.Length + i;
+                using var t = modelGraph.Forward(tokBuf, posBuf, 0, kvGraph);
+                graphTokens[i] = ArgMax((float*)t.DataPointer, config.VocabSize);
+                curTok = graphTokens[i];
+            }
+        }
+
+        _out.WriteLine($"Eager tokens: [{string.Join(", ", eagerTokens)}]");
+        _out.WriteLine($"Graph(+fallback) tokens: [{string.Join(", ", graphTokens)}]");
+
+        for (int i = 0; i < decodeSteps; i++)
+        {
+            Assert.True(eagerTokens[i] == graphTokens[i],
+                $"Argmax divergence at step {i} (depth {prompt.Length + i}): " +
+                $"eager={eagerTokens[i]}, graph={graphTokens[i]}");
+        }
+    }
+
     private static unsafe int ArgMax(float* data, int n)
     {
         int best = 0;

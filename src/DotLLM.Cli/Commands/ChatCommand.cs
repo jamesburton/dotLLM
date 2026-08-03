@@ -38,6 +38,12 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         [Description("System prompt for the conversation.")]
         public string? SystemPrompt { get; set; }
 
+        /// <summary>Path to a file containing the system prompt.</summary>
+        [CommandOption("--system-file")]
+        [Description("Read the system prompt from a file instead of --system. " +
+                     "A single trailing newline is stripped. Mutually exclusive with --system.")]
+        public string? SystemPromptFile { get; set; }
+
         /// <summary>Maximum tokens per response.</summary>
         [CommandOption("--max-tokens|-n")]
         [Description("Maximum number of tokens to generate per response.")]
@@ -222,6 +228,15 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
     /// <inheritdoc/>
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
+        // Resolve before loading the model so a bad path fails fast.
+        if (!TextArgument.TryResolve(settings.SystemPrompt, settings.SystemPromptFile,
+                "--system|-s", "--system-file", required: false,
+                out string? systemPrompt, out string? systemError))
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(systemError!)}[/]");
+            return 1;
+        }
+
         // HuggingFace safetensors directory (config.json + *.safetensors /
         // index.json)? Auto-detected; loads via the safetensors path. The GGUF
         // path is unchanged.
@@ -407,8 +422,8 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         // Initialize conversation
         var history = new List<ChatMessage>();
-        if (!string.IsNullOrEmpty(settings.SystemPrompt))
-            history.Add(new ChatMessage { Role = "system", Content = settings.SystemPrompt });
+        if (!string.IsNullOrEmpty(systemPrompt))
+            history.Add(new ChatMessage { Role = "system", Content = systemPrompt });
 
         var kvConfig = new KvCacheConfig(
             KvCacheConfig.ParseDType(settings.CacheTypeK),
@@ -417,13 +432,29 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? kvFactory = null;
         DotLLM.Engine.KvCache.PagedKvCacheFactory? pagedFactory = null;
+        DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
         if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
         {
-            if (settings.Paged)
-                AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache not supported with CUDA, using GPU cache.[/]");
-            kvFactory = kvConfig.IsQuantized
-                ? (cfg, size) => cudaModel.CreateKvCache(size, kvConfig)
-                : (cfg, size) => cudaModel.CreateKvCache(size);
+            if (settings.Paged && kvConfig.IsQuantized)
+            {
+                AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache does not support quantization yet, using quantized GPU cache.[/]");
+                kvFactory = (cfg, size) => cudaModel.CreateKvCache(size, kvConfig);
+            }
+            else if (settings.Paged)
+            {
+                // Issue #252: block-scattered device storage + gather-into-scratch attention
+                // dispatch. Mirrors the CPU `--paged` branch below.
+                cudaPagedFactory = new DotLLM.Cuda.CudaPagedKvCacheFactory(
+                    DotLLM.Core.Attention.KvGeometry.FromConfig(config!));
+                var factory = cudaPagedFactory;
+                kvFactory = (cfg, size) => cudaModel.CreatePagedKvCache(factory.Pool, size);
+            }
+            else
+            {
+                kvFactory = kvConfig.IsQuantized
+                    ? (cfg, size) => cudaModel.CreateKvCache(size, kvConfig)
+                    : (cfg, size) => cudaModel.CreateKvCache(size);
+            }
         }
         else if (model is DotLLM.Cuda.HybridTransformerModel hybridModel)
         {
@@ -501,6 +532,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         finally
         {
             pagedFactory?.Dispose();
+            cudaPagedFactory?.Dispose();
             draftModel?.Dispose();
             draftGguf?.Dispose();
             model?.Dispose();

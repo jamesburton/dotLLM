@@ -89,9 +89,9 @@ public sealed class BpeTokenizer : ITokenizer
         int bosId, int eosId, string? preTokenizerType = null)
     {
         var specialTokens = BuildSpecialTokenTable(tokens, tokenTypes);
-        var preRegex = TiktokenPreTokenizer.GetRegex(preTokenizerType);
+        var preRegexes = TiktokenPreTokenizer.GetRegexes(preTokenizerType);
         return new BpeTokenizer(
-            new Gpt2TiktokenEncoding(tokens, merges, tokenTypes, preRegex),
+            new Gpt2TiktokenEncoding(tokens, merges, tokenTypes, preRegexes),
             specialTokens, bosId, eosId, tokens.Length);
     }
 
@@ -136,8 +136,10 @@ public sealed class BpeTokenizer : ITokenizer
         int bosId, int eosId, System.Text.RegularExpressions.Regex? preRegex)
     {
         var specialTokens = BuildSpecialTokenTable(tokens, tokenTypes);
+        // A single expression is a one-stage pipeline. Pre-types whose reference definition has
+        // several stages (the StarCoder/SmolLM family) must go through CreateTiktoken instead.
         return new BpeTokenizer(
-            new Gpt2TiktokenEncoding(tokens, merges, tokenTypes, preRegex),
+            new Gpt2TiktokenEncoding(tokens, merges, tokenTypes, preRegex is null ? null : [preRegex]),
             specialTokens, bosId, eosId, tokens.Length);
     }
 

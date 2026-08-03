@@ -181,6 +181,9 @@ dotllm run QuantFactory/SmolLM-135M-GGUF -p "Once upon a time" -n 128 -t 0.7 --t
 # JSON output (for scripting / piping)
 dotllm run QuantFactory/SmolLM-135M-GGUF -p "Hello" --json
 
+# Long prompts: read from a file instead of the command line
+dotllm run QuantFactory/SmolLM-135M-GGUF --prompt-file prompt.txt -n 256
+
 # Select a specific quantization when a repo has multiple .gguf files
 dotllm run QuantFactory/SmolLM-135M-GGUF -p "Test" -q Q8_0
 
@@ -347,12 +350,14 @@ To embed the same endpoints inside your own ASP.NET Core app, see [Host the Open
 
 **`run`-only:**
 
-- `--prompt` / `-p` — input prompt (**required**)
+- `--prompt` / `-p` — input prompt (**required** unless `--prompt-file` is given)
+- `--prompt-file` — read the prompt from a file instead of `--prompt`. A single trailing newline is stripped. Mutually exclusive with `--prompt`
 - `--json` — emit a single JSON result object (suppresses formatted output)
 
 **`chat`-only:**
 
 - `--system` / `-s` — system prompt
+- `--system-file` — read the system prompt from a file instead of `--system`. A single trailing newline is stripped. Mutually exclusive with `--system`
 - `--tool-choice` — `auto` (default), `none`, `required`, or a function name
 - `--no-prompt-cache` — disable KV-cache reuse across turns
 - `--prompt-cache-size` — max cached sessions (default: `1`)
@@ -421,6 +426,25 @@ dotnet test
 ```
 
 > Integration tests automatically download several GGUF models (~4.5 GB total) from HuggingFace to `~/.dotllm/test-cache/` on first run. The first `dotnet test` will take a while; subsequent runs use the cache. To run only unit tests (no downloads): `dotnet test tests/DotLLM.Tests.Unit`.
+
+Set `DOTLLM_TEST_CACHE_DIR` to relocate that cache — useful for pointing CI at a mounted cache volume so models aren't re-downloaded every job, or for moving it off a small system drive:
+
+```bash
+# Linux/macOS
+export DOTLLM_TEST_CACHE_DIR=/mnt/ci-cache/dotllm-models
+```
+```powershell
+# Windows
+$env:DOTLLM_TEST_CACHE_DIR = "D:\dotllm-test-cache"
+```
+
+The cache uses the same `{owner}/{repo}/{file}.gguf` layout as `~/.dotllm/models/`, so you can point it at your CLI model directory to reuse models you already pulled:
+
+```powershell
+$env:DOTLLM_TEST_CACHE_DIR = "$HOME\.dotllm\models"
+```
+
+> Doing so means test models are downloaded into your `dotllm model pull` inventory and will appear in `dotllm model list`. That is intentional but opt-in — leave the variable unset to keep auto-downloaded test models separate from models you pulled explicitly. The value must be an absolute path (or a relative one, resolved against the working directory); `~` is not expanded.
 
 > **GPU tests** (tagged `Category=GPU`) require an NVIDIA GPU and run full model inference — they can take 20-30 minutes. They are skipped automatically on machines without CUDA. To exclude them explicitly: `dotnet test tests/DotLLM.Tests.Unit/ --filter "Category!=GPU"`
 
@@ -562,13 +586,36 @@ To run comparison benchmarks against [llama.cpp](https://github.com/ggerganov/ll
    ```
 
 2. **Point bench_compare to the binary** -- either:
-   - Set `LLAMACPP_BIN` environment variable to the path of `llama-cli`
-   - Or pass `--llamacpp-bin /path/to/llama-cli` on each invocation
+   - Set `LLAMACPP_BIN` environment variable to the path of `llama-completion` (older builds name it `llama-cli`)
+   - Or pass `--llamacpp-bin /path/to/llama-completion` on each invocation
 
-3. **Run comparison:**
+   Without either, bench_compare looks for `llama-completion` on `PATH`.
+
+3. **Run comparison -- match the thread count:**
    ```bash
-   python scripts/bench_compare.py --model QuantFactory/SmolLM-135M-GGUF --dotllm --llamacpp
+   python scripts/bench_compare.py --model QuantFactory/SmolLM-135M-GGUF --dotllm --llamacpp --threads 16
    ```
+
+> **Always pass `--threads` when comparing engines.** Their defaults are different: dotLLM auto-selects *all logical cores*, llama.cpp auto-selects *physical cores*. On a 32-logical/16-physical machine that is 32 vs 16, which makes the comparison meaningless. bench_compare warns when you omit it.
+
+### Comparing .NET runtimes
+
+`--runtimes` runs dotLLM on several target frameworks in one comparison, each as a separate BenchmarkDotNet job with its own result row:
+
+```bash
+python scripts/bench_compare.py --model QuantFactory/SmolLM-135M-GGUF \
+  --dotllm --llamacpp --threads 16 --runtimes net10.0,net11.0
+```
+
+```
+Decode Throughput (tok/s)                               * = fastest (highest)
+Model                Quant      llama.cpp  dotLLM (net10.0)  dotLLM (net11.0)
+SmolLM-135M          Q8_0          304.6     360.3    417.0*
+```
+
+Each requested framework needs an SDK able to target it -- benchmarking `net11.0` requires the .NET 11 SDK installed, otherwise the job fails with `NETSDK1045`. `global.json` uses `rollForward: latestMajor` with `allowPrerelease`, so machines with only the .NET 10 SDK keep resolving to it and the default (host runtime only) is unaffected.
+
+> Do **not** set `DOTNET_ROLL_FORWARD` to benchmark a newer runtime. BenchmarkDotNet generates its toolchain project to match the *host* runtime, so rolling the host forward makes it emit a project the pinned SDK cannot build. `--runtimes` is the supported mechanism.
 
 > [llama.cpp](https://github.com/ggerganov/llama.cpp) is optional. All dotLLM benchmarks work without it. The `--llamacpp` flag simply adds a side-by-side comparison column.
 

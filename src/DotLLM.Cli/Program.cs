@@ -10,6 +10,13 @@ var app = new CommandApp();
 app.Configure(config =>
 {
     config.SetApplicationName("dotllm");
+
+    // Spectre's default handler prints only the exception MESSAGE. For a fault like
+    // "Index was outside the bounds of the array" that is close to useless — the message names no
+    // type, file or frame, so diagnosing it means guessing at call sites. Opt in to the full
+    // exception (type, message, stack) with DOTLLM_DEBUG_ERRORS=1.
+    if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_DEBUG_ERRORS"), "1", StringComparison.Ordinal))
+        config.PropagateExceptions();
     config.SetApplicationVersion("0.1.0");
     // Spectre.Console.Cli's example validation uses reflection that doesn't work under Native AOT
     if (RuntimeFeature.IsDynamicCodeSupported)
@@ -52,6 +59,10 @@ app.Configure(config =>
         .WithDescription("Interactive multi-turn chat with a GGUF model.")
         .WithExample("chat", "QuantFactory/SmolLM-135M-GGUF", "--system", "You are a helpful assistant.");
 
+    config.AddCommand<PerplexityCommand>("perplexity")
+        .WithDescription("Compute perplexity over a text corpus.")
+        .WithExample("perplexity", "QuantFactory/SmolLM-135M-GGUF", "--corpus", "wiki.test.raw", "--context", "512", "--stride", "256");
+
     config.AddCommand<ServeCommand>("serve")
         .WithDescription("Launch API server with built-in web chat UI.")
         .WithExample("serve", "Qwen/Qwen3-0.6B-GGUF", "--port", "8080");
@@ -92,4 +103,13 @@ app.Configure(config =>
 #endif
 });
 
-return app.Run(args);
+try
+{
+    return app.Run(args);
+}
+catch (Exception ex) when (string.Equals(
+    Environment.GetEnvironmentVariable("DOTLLM_DEBUG_ERRORS"), "1", StringComparison.Ordinal))
+{
+    Console.Error.WriteLine(ex.ToString());
+    return 1;
+}

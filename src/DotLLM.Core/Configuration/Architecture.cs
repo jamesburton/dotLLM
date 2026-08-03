@@ -303,5 +303,82 @@ public enum Architecture
     /// per-expert biases and softmax-after-top-k router gating. Expert
     /// weights ship in MXFP4.
     /// </summary>
-    GptOss
+    GptOss,
+
+    /// <summary>
+    /// Google Gemma-3n family (e.g. <c>google/gemma-3n-E2B-it</c>,
+    /// <c>google/gemma-3n-E4B-it</c>). HF discriminators:
+    /// <c>architectures[0]=Gemma3nForConditionalGeneration</c>,
+    /// <c>model_type=gemma3n</c> at the top level (multimodal wrapper — text +
+    /// vision + audio); the text tower lives under <c>text_config</c>
+    /// (<c>model_type=gemma3n_text</c>). Only the text tower is supported here.
+    /// <para>
+    /// Shares the Gemma 3/4 backbone shape (four RMSNorms per layer, the
+    /// <c>(1 + weight)</c> RMSNorm convention, GeGLU-tanh FFN,
+    /// <c>sqrt(hidden)</c> embedding scaling, per-head Q/K RMSNorms,
+    /// interleaved local/global attention with per-attention-type RoPE base
+    /// — <c>rope_theta</c> for full-attention layers,
+    /// <c>rope_local_base_freq</c> for sliding layers — and trailing
+    /// KV-shared layers via <see cref="DotLLM.Core.Models.ModelConfig.NumSharedKvLayers"/>)
+    /// and reuses the same Per-Layer Embeddings (PLE) tables as the dense
+    /// Gemma-4 text tower (<see cref="DotLLM.Core.Models.ModelConfig.PerLayerEmbedding"/>
+    /// — PLE originated in Gemma 3n). Unlike Gemma 4, Gemma-3n's real config
+    /// does not ship a distinct global head-dim / global KV-head count or a
+    /// partial-rotary factor — every layer uses the same <c>head_dim</c> /
+    /// <c>num_key_value_heads</c>, and both RoPE schedules rotate the full head
+    /// (<see cref="DotLLM.Core.Models.ModelConfig.NumGlobalKvHeads"/> /
+    /// <see cref="DotLLM.Core.Models.ModelConfig.GlobalHeadDim"/> /
+    /// <see cref="DotLLM.Core.Models.ModelConfig.PartialRotaryFactor"/> stay null).
+    /// </para>
+    /// <para>
+    /// <b>Deltas vs <see cref="Gemma4"/> — the genuinely new Gemma-3n-only pieces
+    /// (see <see cref="DotLLM.Core.Models.Gemma3nConfig"/>):</b>
+    /// <list type="bullet">
+    ///   <item><b>AltUp (Alternating Updates)</b> — every decoder layer operates
+    ///     on <c>altup_num_inputs</c> (4) parallel hidden-state streams instead of
+    ///     one. A per-layer <c>predict</c> step derives a per-token prediction for
+    ///     every stream from a router over the active stream (index
+    ///     <c>altup_active_idx</c>, default 0); after attention + Laurel + MLP
+    ///     produce the "activated" value for the active stream, a per-layer
+    ///     <c>correct</c> step propagates that update back across all streams. A
+    ///     final unembed-projection + magnitude-matched mean collapses the
+    ///     streams to a single hidden vector after the last layer. See
+    ///     <c>Gemma3nTextAltUp.predict</c> / <c>.correct</c> in HF
+    ///     <c>modeling_gemma3n.py</c>.</item>
+    ///   <item><b>Laurel blocks (Learned Augmented Residual Layer)</b> — a
+    ///     per-layer low-rank bottleneck (<c>laurel_rank</c>, 64) applied to the
+    ///     post-<c>input_layernorm</c> hidden state in parallel with attention;
+    ///     its RMSNorm'd output is averaged with the attention residual via
+    ///     <c>(attn_gated + laurel_output) / sqrt(2)</c>.</item>
+    ///   <item><b>Weight-less V RMSNorm</b> — <c>v_norm</c> has no learned scale
+    ///     (<c>with_scale=False</c>), unlike <c>q_norm</c>/<c>k_norm</c>.</item>
+    ///   <item><b>Per-layer activation sparsity</b> — a Gaussian top-k gate
+    ///     (<c>_gaussian_topk</c>: <c>relu(gate_proj - (mean + std·Φ⁻¹(sparsity)))</c>)
+    ///     applied to the FFN gate before the activation function, when
+    ///     <c>activation_sparsity_pattern[layer] &gt; 0</c> (the real E4B ships 0.95
+    ///     on the first 10 layers, 0.0 thereafter).</item>
+    ///   <item><b>PLE injection point differs from Gemma 4</b> — instead of a
+    ///     gated residual added directly to the single hidden stream, Gemma-3n's
+    ///     PLE gate/act/project/post-norm delta is computed from the
+    ///     AltUp-corrected active stream and added only to the NON-active streams
+    ///     (<c>corrected_predictions[1:] += first_prediction</c>).</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// <b>Scope of this pass (issue #136).</b> CPU-only, a dedicated per-layer
+    /// method (<c>RunGemma3nLayer</c>) mirroring <c>RunGemma4Layer</c>'s
+    /// self-contained style: config detection, weight loading from HF
+    /// safetensors, and AltUp/Laurel/PLE/activation-sparsity/shared-KV wired end
+    /// to end (including incremental KV-cache decode, reusing the same
+    /// <see cref="DotLLM.Core.Attention.IKvCache"/> path as every other
+    /// architecture), verified against a synthetic fixture. Every Q/K/V/O/FFN
+    /// projection still goes through the quantization-aware GEMM dispatcher, so
+    /// quantized checkpoints load and run; the AltUp/Laurel/PLE/activation-
+    /// sparsity orchestration itself is F32 scratch (matching the scope PLE's
+    /// initial pass set). LoRA is not threaded through this path, and GGUF
+    /// loading + the CUDA/Vulkan backends are follow-up work — see the PR
+    /// description for the exact boundary.
+    /// </para>
+    /// </summary>
+    Gemma3n
 }

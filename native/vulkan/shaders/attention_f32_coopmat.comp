@@ -13,7 +13,22 @@
 // useful work.
 //
 // groupCount.x = ceil(seqQ / Br) * numHeads
-// local_size_x = 32 (one subgroup, matching AMD RDNA3/3.5 WMMA + NVIDIA)
+// local_size_x = WG_SIZE = 64 (see the #define below for why — NOT 32 despite
+// this comment previously claiming so; issue #240's audit caught the mismatch.
+// On a wave32 device (NVIDIA, RDNA3.5) the driver either idles the extra 32
+// lanes or runs a second subgroup over the identical tile, so this kernel is
+// plausibly paying the same "wrong wave width" tax #236 fixed for the PQ2_0
+// GEMM coopmat kernel via a dedicated 32-thread-workgroup + requiredSubgroupSize
+// pin — NOT fixed here: this shader's per-thread staging math (unlike the
+// already-generalized matmul_pq2_0_f32_gemm_coopmat.comp) is hardcoded to
+// WG_SIZE=64 in several places, and the fix needs the same care given to
+// matmul_q8_0_gemm_coopmat32.comp/matmul_f16_gemm_coopmat32.comp (issue #240).
+// Deferred: this kernel is already opt-in/off-by-default (measured 1.27-1.56x
+// SLOWER than the shared-mem reduce on the gfx1151 reference even at the
+// current wave width — see AttentionF32Kernel's remarks), and reworking a
+// flash-attention-style online-softmax kernel's threading with no hardware
+// available to validate the result is a correctness risk not worth taking
+// blind. Tracked as follow-up work in issue #240.
 //
 // Tile shape: 16 × 16 × 16 with f16 A / f16 B / f32 C — the portable KHR
 // shape supported by AMD RDNA3+ (gfx11+), NVIDIA Ampere+, and Intel Arc.

@@ -709,10 +709,314 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
 
 ## Future Work
 
-- **CUDA MoE FFN port**: top-k routing + per-expert grouped-GEMM on GPU. CPU has `MoeSwiGluMlp`; CUDA equivalent doesn't exist yet. **Concrete blocker for end-to-end DeepSeek-V2/V3 on CUDA** (MLA attention Phase 1 primitives landed; they need a matching MoE FFN to complete the layer forward).
+- **CUDA MoE FFN — DONE for standard SwiGLU MoE, stale note corrected 2026-07-31.** `CudaMoeFfn.cs` implements the full forward (device-side softmax+top-k routing, Phase A direct-quantized-GEMV, Phase B grouped-GEMV batching K_active experts' gate/up into 2 launches, shared-expert path) and is wired into `CudaTransformerModel`'s per-layer loop alongside `CudaMlaAttention` — the DeepSeek-V2/V3 MLA+MoE pair this bullet used to call a blocker is already assembled and tested at 4 tiers (synthetic parity, quantized parity, real-GGUF layer parity, real-checkpoint smoke test — see `docs/perf/DEEPSEEK_QUANTIZED_GPU_PATH.md`). Quant coverage: Q2_K/Q4_K/Q5_K/Q6_K/Q8_0/IQ4_NL/IQ4_XS have direct GPU GEMV kernels; other types fall back to dequant+cuBLAS (correct, slower). Known limit: ~8 MoE layers fit in 12GB VRAM (a real model has 26-27) — a memory-capacity/expert-offloading problem, not a missing-kernel one.
+  **BitNet-ternary (I2_S) MoE experts — DONE (issue #246, 2026-07-31).** `CudaMoeFfn.ForwardBitNetI2S` ports `MoeSwiGluMlp.BitNet.cs`'s CPU forward shape (relu² gate, per-expert FFN Sub-LN before down_proj, ternary I2_S experts) to GPU. Confirmed lower-risk than a from-scratch port: composes the already-optimized `LaunchI2_SGemvF32In` GEMV kernel (one launch per assigned row — no batched I2_S GEMM yet, fine since decode is batch=1 per expert regardless) with the existing MoE routing/bucketing dispatch, plus one new `relu2glu_f32` kernel and reuse of the existing `rmsnorm_f32` kernel (unmodified) for the per-expert Sub-LN. The per-expert-scale mismatch this was expected to need a `pq2_0_repack.cu`-style device kernel for turned out not to: a load-time two-copy upload (payload + that expert's own trailing F32 scale into one pre-sized buffer) suffices, since it's attaching a scalar to an already-contiguous slice, not reordering interleaved bytes. CPU-reference parity verified at 1e-3 tolerance across decode/prefill/router-bias/skip-expert cases; full CUDA suite 398-400 passed, 0 failed. **Remaining**: no real BitNet-MoE checkpoint exists locally to validate end-to-end (identity-MoTE, see issue #117, is this project's own experimental architecture, not a public checkpoint family) — synthetic parity is the ceiling until one surfaces. No batched/grouped I2_S GEMM for prefill — a real perf concern only if BitNet-MoE prefill becomes a hot path.
 - **MLA Phase B + C** (CUDA decode efficiency): latent KV cache + W_UK absorption (`MlaAttention.ExecuteLatent`/`ExecuteLatentHybrid` CPU equivalents). Phase A naive expanded forward is already in tree (`CudaMlaAttention.Forward`).
 - **MLA FP16/quantized weight paths**: current Phase A is F32 throughout. FP16 follow-up; quantized extends `Project` patterns from the GQA path.
 - **Flash Attention**: replace naive attention kernel with tiled flash attention (shared memory, online softmax). Full Tensor Core access via `wmma` intrinsics in PTX. **Elevated `ncu --set full` data (2026-07-27, RTX 3060, `attention_f32` decode launches, Bonsai-27B, grid=(24,1,1)/block=(256,1,1))**: Compute (SM) Throughput ~4.2-4.3%, Memory Throughput ~8.6-8.7%, Achieved Occupancy 16.5-16.8% vs. 100% Theoretical (ncu's own analysis flags ~83% Est. Speedup from occupancy alone), Waves Per SM only 0.14 (grid=24=`numHeads` badly underfills the 3060's 28 SMs), Warp Cycles Per Issued Instruction ~42.3-42.8 — i.e. the kernel is genuinely **latency-bound**, not compute- or memory-bandwidth-bound; both throughput metrics sit near-idle simultaneously. This is the same root cause #180/#182's "grid too small" fixes addressed elsewhere in the decode path (see the `prismml-bonsai-model` project memory), now confirmed quantitatively for attention specifically rather than inferred from category-level `DOTLLM_HYBRID_PROFILE` percentages. **This also explains, not just motivates, issue #183's inconclusive real-world result**: #183 shipped an opt-in split-KV ("Flash-Decoding") kernel that splits the KV-tile loop across more cooperating blocks specifically to raise occupancy — the real A/B (depth 256-1024) came back within noise (+0.5% to +2% best-of, not a clean win). Given this ncu data, that outcome makes sense: splitting into more blocks helps an occupancy-bound kernel, but a kernel this deep into the latency-bound regime (42 cycles stalled per issued instruction, both compute AND memory sitting under 9%) needs fewer, larger, better-pipelined memory transactions — i.e. an actual flash-attention rewrite (tiled shared-memory staging, online softmax, deeper software pipelining to hide the per-access latency) — not just more parallel blocks replaying the same latency-bound access pattern. Treat #183's split-KV kernel as a proven-safe but low-value stepping stone, not a substitute for this item.
+
+  **2026-07-30 re-profile, post-#197/#198 (PR #201), at realistic depth — corrects the picture above.**
+  The 2026-07-27 numbers were measured at shallow depth (`-p 8 -n 12`, no `--depth`, so `seq_kv` was
+  effectively ~8-20) with no launch-skip verification of which kernel/phase was actually captured —
+  worth flagging since a first re-profile attempt this session initially mis-captured **prefill**
+  `attention_f32` launches (`seq_q=8`, grid=192) while believing it had captured decode (a live
+  instance of exactly the "verify a flag/kernel is actually wired into the code path you're testing"
+  lesson from the BitNet session's GQA-split false-correlation — see `[[bitnet-support]]`). Corrected
+  methodology: `--kernel-name` filtering (not `--launch-skip` guessing) plus `--depth 512` (clears
+  `AttentionGqaSplitMinSeqKv=256`, the opt-in gate `DOTLLM_ATTN_GQA_SPLIT=1` needs to even dispatch
+  `attention_f32_gqa_split_kv` instead of falling through to the plain kernel) confirmed by grid-shape
+  before trusting any number.
+
+  | Metric | Baseline `attention_f32` (grid=24) | `attention_f32_gqa_split_kv` (grid=4×8, `DOTLLM_ATTN_GQA_SPLIT=1`) |
+  |---|---:|---:|
+  | Duration | 191.97 us | 180.48 us (**-6.0%**) |
+  | Compute (SM) Throughput | 9.74% | 20.61% (**+112%**) |
+  | Memory Throughput | 48.93% | 25.15% (**-48.6%**, i.e. real reduction in redundant KV traffic) |
+  | Achieved Occupancy | 16.65% | 19.00% |
+  | Theoretical Occupancy | 100% | 83.33% (grouped-warp kernel needs more registers/shared mem per block) |
+  | Waves Per SM | 0.14 | 0.23 |
+  | Warp Cycles Per Issued Instruction | 24.60 | 15.24 (**-38%**) |
+  | Dominant stall reason | 75.7% L1TEX/global-memory scoreboard wait | 44.2% CTA-barrier wait (6.7 of 15.24 cycles) |
+
+  Reading: #197/#198 (the GQA-group + tuned split-KV kernel) is real and working as designed — it
+  substantially cuts redundant KV reads (compute throughput +112%, memory traffic -49%, per-instruction
+  stall -38%) — but the wall-clock win per launch is modest (~6%) because occupancy barely moves
+  (16.65%→19.00%) and the theoretical ceiling actually drops (100%→83.33%) from the grouped kernel's
+  higher per-block resource cost. Critically, **the dominant stall reason changed category**: the
+  plain kernel is bottlenecked on raw memory-load latency (waiting for K/V reads to land), the
+  GQA-split kernel is now bottlenecked on **CTA-barrier synchronization** (warps waiting for siblings
+  in the same block, "commonly caused by diverging code paths before a barrier" per `ncu`'s own
+  analysis) — a different, more specific, more actionable diagnosis than the original "generically
+  latency-bound" read. This means #199's own stated precondition ("implement after #198 lands and
+  the kernel is out of the latency-bound regime") is only **partially** satisfied: #198 helped, but
+  the kernel is still deep in an underutilized regime, just via a different mechanism. Worth
+  considering a smaller, lower-risk fix first — reducing warp divergence/barrier count in
+  `attention_f32_gqa_split_kv`'s grouped-warp code specifically — before committing to #199's full
+  FP16 tensor-core rewrite (HIGH risk, precision-sensitive, per that issue's own scoping). Not yet
+  investigated at the SASS/source level; the barrier-stall *hypothesis* itself should get the same
+  "verify before trusting" treatment #218 gave a superficially similar `ncu` hypothesis (which turned
+  out wrong) before either path is chosen. Raw `.ncu-rep` reports and this session's methodology notes
+  are in `.perf-runs/ncu-2026-07-30-post197198/` (not committed — binary, ~250 MB combined).
+
+  **Follow-up (issues #197+#198, same session): GQA-group register-blocking + tuned split-KV,
+  composed into one kernel.** `attention_f32_gqa_split_kv` grids `(numKvHeads, kv_split)` instead
+  of `(numHeads, ATTN_KV_SPLIT=4)` -- each block owns one KV head and register-blocks the QK/PV
+  loops across the `group=numHeads/numKvHeads` query heads sharing it (Bonsai-27B: group=6), so
+  each K/V element is read from global memory once per tile and reused `group` times, instead of
+  `group` independent blocks each re-reading the same rows. `kv_split` is now a runtime parameter
+  (an occupancy-target heuristic, `CudaKernels.ComputeAttentionKvSplit`, form ported from Vulkan's
+  `ComputeSplits`/#347 but re-derived for CUDA's cooperative-launch co-residency ceiling), not
+  #183's hardcoded 4. Correctness: bit-exact (0 ULP) per query head vs `attention_f32` at
+  `kv_split==1` across 5 shapes including the real Bonsai-27B shape, validated directly (not
+  assumed) -- see `CudaAttentionF32GqaSplitTests.cs`. Real occupancy query on this RTX 3060 for
+  Bonsai-27B's shape: `MaxSafeAttentionGqaSplit(numKvHeads=4, headDim=256, group=6) = 35` (up to
+  140 co-resident blocks vs today's grid=24). **Real A/B (dotnet bench, same host, 2 rounds/depth,
+  MEDIAN not best-of): depth 256 -2.1%, depth 512 +0.9%, depth 768 +2.1% (consistent both rounds),
+  depth 1024 +0.8%, depth 2048 +0.9%** -- directionally flat-to-positive at every depth except the
+  shallowest (256, where per-split KV rows are too few to amortize the grid.sync+combine overhead,
+  same shape as #183's own depth-256 result), but no depth clears this project's documented 2-8%
+  run-to-run noise floor as a decisive win. An honest inconclusive result, matching #183's own
+  precedent exactly -- shipped opt-in (`DOTLLM_ATTN_GQA_SPLIT=1`, default OFF), not because it's
+  unsafe (correctness-validated, zero-risk to any default path) but because the real-world gain
+  is not yet demonstrated beyond noise. `ncu` re-profiling to confirm the occupancy/waves-per-SM
+  metrics actually moved could not be completed this session (`ERR_NVGPUCTRPERM` -- this host
+  requires elevated/UAC PowerShell for `ncu`, unavailable to this non-interactive session); the
+  register-level evidence available instead (`ptxas -v`: 40 registers, 0 spill loads/stores, same
+  register count as the baseline `attention_f32` kernel) is consistent with the kernel being a
+  clean regrid rather than something register-pressure-bound, but does not substitute for a real
+  `ncu` capture. A future session with UAC access should re-run `ncu --set full` on this kernel
+  before considering the occupancy claim independently confirmed.
+  **Follow-up investigation (issues #199/#200/#219/#220/#222/#226/#227, 2026-07-27→28): tensor
+  cores parked, a real kv_split bug found + fixed, and #183's precision disqualified it from
+  default-on despite being the strongest performer found.**
+  - **#199 (tensor-core decode kernel): not attempted, correctly blocked at the design stage.** A
+    literal port of Vulkan's coopmat decode kernel would have regressed #197/#198's KV-head-grid
+    design (Vulkan grids per query-head with padding; #197/#198 deliberately grids per KV-head to
+    amortize reads across Bonsai's group=6 sibling heads — porting Vulkan's scheme would throw that
+    away). Bonsai's `headDim=256` also doesn't fit the existing prefill mma kernel's `headDim=64`
+    hardcoding, so this would be from-scratch design work, not a port. Correctly deferred pending
+    confirmation that the kernel is still latency-bound after #197/#198 (see #219 below — it
+    isn't, in the way assumed).
+  - **#200 (native paged-KV decode kernel): not attempted, no producer exists.** CUDA has no paged
+    KV-cache implementation at all — `PagedKvCache` is CPU-only; every CUDA path (`run`/`chat`/
+    `serve`) that requests paging silently falls back to the native non-paged cache. Nothing for
+    a "read paged blocks directly" kernel to attach to. Real prerequisite: a CUDA paged KV-cache
+    implementation, worth building once continuous batching (already tracked) makes multi-sequence
+    paged decode the common case.
+    **Update (issue #252, landed):** the prerequisite named above now exists —
+    `CudaKvBlockPool`/`CudaKvBlockTable`/`CudaPagedKvCache` (see `docs/KV_CACHE.md`'s "CUDA Paged
+    KV-Cache" section), wired into `CudaTransformerModel` and `--paged` on `run`/`chat`/`serve`.
+    #200 itself (the direct block-table-read kernel eliminating the gather-into-scratch step) is
+    still not attempted — the block pool this note called "the real prerequisite" is done, but the
+    other prerequisite named in `docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md` (a CUDA multi-sequence
+    batched-decode call shape, i.e. `CudaTransformerModel.ForwardBatch`) is not, so #200 stays
+    blocked on that one alone now.
+    **Update (issue #251, landed):** that remaining prerequisite now exists too —
+    `CudaTransformerModel.ForwardBatch` is a per-sequence-loop dispatch (not a fused multi-sequence
+    kernel launch; see `docs/SCHEDULING.md`'s `ForwardBatch` status table for the full design
+    reasoning), reusing the same eager per-layer body that already handles `CudaPagedKvCache`. #200
+    is now unblocked at the call-shape level: a future direct block-table-read kernel targets the
+    single-sequence-per-launch grid (`docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md` §6's proposed
+    signature already assumed this), not the fused batch-dimensioned variant.
+  - **#219: found and fixed a real kv_split grid-sizing bug in #197/#198's own heuristic.**
+    `ComputeAttentionKvSplit`'s `AttnSplitMinKvPerSplit` term (default 128) was the binding clamp
+    at Bonsai's actual decode depth (seqKv~258-270), forcing `kv_split=3` (grid=12 — *half* the
+    unsplit baseline's grid=24) instead of the intended `byOccupancy=8`. Fixed via #220 (merged):
+    lowered to 32. `ncu`-confirmed: grid 12→32, duration 174-176us→144-146us (~17% faster),
+    occupancy 16.5%→18.8%. Still ~37% slower than the unsplit baseline at this depth even fixed —
+    stays opt-in/default-OFF. The "32" target is depth-specific, not universal (item 4 of #219: at
+    depth 768, target=96 helps further, but even matched-grid the GQA-split design still trails
+    #183's simpler kernel by ~20% — its register-blocking approach carries overhead grid size alone
+    doesn't close).
+  - **#219 also re-tested #183 (`DOTLLM_ATTN_SPLIT_KV`) at the depth range its original A/B never
+    reached** (the depth>=768 hang above is gone on current `dev`). Result: the cleanest win in
+    this whole investigation family — 194us vs 274-276us (~29% faster), occupancy 16.6%→57%
+    (3.4x), Waves/SM 0.14→0.69. Structurally simpler (fixed `SPLIT=4`, no GQA register-blocking)
+    than #197/#198/#220's design, and beats it even after that design is grid-size-tuned.
+  - **#222: that win is precision-unsafe — #183 changes generated output for any context beyond
+    256 tokens, not a rare edge case.** Real end-to-end generation-parity test (Bonsai-27B,
+    deterministic sampling) found the first divergence at generated-step 225 (decode depth 257 —
+    the earliest point the kernel can engage): a genuine argmax flip (baseline margin 0.076 vs
+    split-KV margin 0.011) that fully compounds via the sampled-token feedback loop — 774/775
+    subsequent tokens differ. Perplexity confirms independently: flat pre-gate (-0.02%, as expected
+    since the kernel can't engage there), +0.30% post-gate. **Recommendation: #183 stays opt-in/
+    default-OFF** — the fastest kernel found here is not a safe default despite the win being real.
+  - **#226/#227: tried fp64 accumulation in the cross-split combine step to reduce the
+    reassociation error — no improvement, clean negative result.** Root cause is *not* `fast_exp_neg`
+    (this file's header already documents why precise `expf` was rejected — CPU/GPU parity, both
+    the baseline and split-KV kernels already use the same approximation identically) and *not* the
+    final 4-way merge arithmetic: the double-precision combine variant (`attention_f32_split_kv_hp`,
+    opt-in `DOTLLM_ATTN_SPLIT_KV_HP=1`, PR #227 open/not merged) diverges at the *identical* step
+    225 with an essentially identical margin and perplexity delta. The reassociation error is
+    already baked into each split's own independent partial accumulation (computed in float, over a
+    different KV sub-range/order than the baseline's single pass) *before* the combine runs — fixing
+    that would need higher precision in the per-split accumulation itself, a materially bigger
+    change than scoped, and an open question rather than a next task.
+  - **Net for this line of work**: three kernel variants now exist for decode attention
+    (`attention_f32` baseline, `attention_f32_split_kv` #183, `attention_f32_gqa_split_kv` #197/
+    #198/#220), all correctness-validated and zero-default-risk, but only the baseline is safe as
+    default — #183 is faster but changes output; the GQA-split design is neither faster nor safer.
+    A tensor-core rewrite (#199) remains the only lever not yet tried that could plausibly beat
+    #183's raw speed *and* stay numerically closer to baseline (different algorithm shape, not a
+    reassociated split of the same one) — worth reconsidering once continuous batching or another
+    driver makes the investment timing right.
+
+  **#230: checked whether the GQA-split kernel's CTA-barrier stall (44.2% of 15.24 cycles, per the
+  2026-07-30 re-profile above) has a cheaper fix than #199's rewrite — SASS-verified per-barrier
+  diagnosis, one genuine barrier removed, honest negative result on wall-clock impact.**
+  Per this project's #218 precedent (an `ncu` barrier-stall hypothesis that direct SASS inspection
+  proved wrong), the stall label was not trusted at face value. Compiled with
+  `nvcc -lineinfo` + `ptxas -lineinfo -arch=sm_86` + `nvdisasm -g` (no elevation needed) to get an
+  exact PC→source-line map for every `BAR.SYNC` in `attention_f32_gqa_split_kv`: 16 static sites
+  across 13 source-level `__syncthreads()` call sites, of which 6 belong to the per-head max/sum
+  reduction loop (attention_f32.cu lines 827-878) that the kernel's own header already flags as
+  "the one place this design does not parallelize across the group" — run sequentially `group`=6
+  times per KV tile for Bonsai-27B, i.e. this one loop accounts for the large majority of the
+  kernel's *dynamic* barrier count. Dependency analysis of what each of those 6 barriers actually
+  protects found one (the loop-tail sync, guarding `warp_scratch` reuse across the next head's
+  max-phase write) to be fully redundant: the WAR hazard it exists for is already closed
+  transitively by the loop's own real cross-warp barriers (the ones a few lines into the next
+  iteration, which every thread must reach — and reaching them requires every thread to have
+  already finished the current iteration, scratch-buffer read included). Removed it with a
+  same-file comment documenting the argument. SASS confirms a clean, minimal, single-barrier
+  removal (`BAR.SYNC` count 16→15; PTX diff is exactly one deleted `bar.sync` instruction) at
+  **zero register/shared-memory cost** (`ptxas`: `REG:40` unchanged, so the 83.33% theoretical
+  occupancy ceiling is untouched) — the lowest-risk category of change this investigation could
+  make. The other 4 of the 6 per-head barriers are real cross-warp producer/consumer dependencies
+  (broadcasting a warp-0-computed cross-warp max/sum to the rest of the block) inherent to the
+  shuffle-tree reduction algorithm shared verbatim with `attention_f32`/`attention_f32_split_kv`,
+  and removing them would mean changing that reduction's structure — which would break the
+  kv_split==1 bit-exactness contract this kernel is tested against, a materially bigger and riskier
+  change than scoped here.
+  **Correctness**: all 21 `CudaAttentionF32GqaSplitTests` pass post-fix, including bit-exact
+  (0 ULP) at every tested group size (1, 4, 6, 8, including the MAX_GQA_GROUP boundary) and the
+  300-consecutive-decode-step drift characterization; both `CudaAttentionSplitKvGenerationParityTests`
+  (real Bonsai-27B generation + perplexity, exercising the same compiled PTX module) pass unchanged.
+  Ran the GQA-split unit-test suite 3x (once concurrently with itself) with no flakiness, the kind
+  of check a subtle removed-barrier race would likely surface.
+  **Wall-clock**: real `dotnet bench` A/B on this RTX 3060, interleaved pre-fix/post-fix rounds (not
+  blocked sequentially, after an initial blocked run showed a same-direction decline in BOTH
+  configurations — a session-level thermal/clock effect, not a kernel difference; interleaving and
+  shortening `-n` from 48→24 per rep controls for it), `DOTLLM_ATTN_GQA_SPLIT=1`, real Bonsai-27B:
+  at **depth 512** (matching the re-profile's own depth), 3 interleaved rounds, median decode tok/s
+  pre-fix {17.48, 17.30, 17.36} vs post-fix {17.47, 17.37, 17.30} — mean 17.38 vs 17.38, a dead
+  tie. At **depth 1024**, 2 interleaved rounds, pre-fix {16.80, 16.37} vs post-fix {15.73, 16.05} —
+  post-fix trends ~2-4% lower by median (though best-of-rep is within ~1%), still inside this
+  project's documented 2-8% run-to-run noise floor and with isolated outlier reps (a single rep
+  dropping to ~14-15 tok/s with no GPU contention visible in `nvidia-smi`) present at both configs.
+  **Reading**: the fix is real (verified at the SASS/instruction level, not just asserted) and free
+  (no register/occupancy cost, no precision cost), but its wall-clock effect is not distinguishable
+  from noise at either depth tested. This is consistent, not surprising, given `attention_f32*`'s
+  own scoping note elsewhere in this file that attention is only ~3-10% of total decode-step time
+  even at depth 256-1024 — removing 1 of 6 barriers in one loop of one kernel that is itself a
+  small slice of the token budget was never likely to clear this host's noise floor, and the other
+  5 barriers are not cheaply removable without a materially bigger, riskier change. **Recommendation
+  for #199**: this specific "cheap fix" avenue is exhausted — kept as a real, zero-risk,
+  correctness-preserving cleanup (worth keeping in the opt-in kernel regardless), but it does not
+  answer #199's precondition question in the affirmative. #199's tensor-core rewrite (or accepting
+  the GQA-split kernel's current form as a non-default, marginal-value opt-in alongside #183)
+  remain the only levers left that could plausibly move the needle further on this kernel.
+
+  **#199 v2 (branch `issue/199-tensor-core-decode-attention-v2`, not merged): the tensor-core
+  rewrite, composed with #197/#198's grid — a real, reproducible WIN.** v1 (branch
+  `issue/199-tensor-core-decode-attention`, not merged) built a decode-only tensor-core kernel
+  with genuine HMMA/LDSM SASS but scoped to one warp/block, grid=numHeads=24 — deliberately not
+  composed with #197/#198's grid per the original issue's own design comment, to keep the new
+  FP16/tensor-core precision axis separable while bringing the kernel up. Real A/B found it
+  **4-5x SLOWER** than `attention_f32` at every realistic depth (~4% theoretical occupancy,
+  worse than the baseline's own ~16.5% achieved). v2 (clean-room, based on `dev`, not a port of
+  v1's branch) composes the tensor-core math with the GQA-group + split-KV grid design, the
+  follow-up v1's own writeup named and declined to attempt: grid = `(numKvHeads, kvSplit)`,
+  identical shape to `attention_f32_gqa_split_kv`, with the `group` query heads sharing a KV
+  head packed into the mma.sync instruction's M=16 dimension itself (free — same instruction
+  count as v1's single-head version, up to `MAX_GQA_GROUP`=8x more useful throughput) and PV
+  work split 8-way across warps within each block (real intra-block parallelism v1's single
+  warp and the sibling kernel's sequential per-head reduction loop both lack). `ptxas -v`: 55
+  registers/thread, 0 spill, 42696B static shared (group-independent, unlike a naive
+  per-warp-per-head duplication). `cuobjdump --dump-sass`: 20 static HMMA + 37 static LDSM,
+  matching the hand-computed expectation exactly. Correctness: 5e-3 abs-OR-rel vs both the CPU
+  oracle and the F32 GPU baseline at seqKv in {1,256,512,1024,2048} using the real occupancy-
+  tuned `kvSplit` (not just the trivial split=1 case), plus a new three-way agreement check vs
+  `attention_f32_gqa_split_kv` itself and a 300-step non-compounding-drift check — all pass (see
+  `tests/DotLLM.Tests.Unit/Cuda/CudaAttentionMmaDecodeGqaSplitTests.cs`,
+  `.perf-runs/issue199-v2-mma-decode-gqa-split/README.md`). **Real interleaved wall-clock, 5
+  independent runs, real Bonsai-27B shape**: at depth >= 512 this kernel is a clean **2-2.6x win
+  over `attention_f32`** and a **2-2.5x win over `attention_f32_gqa_split_kv`**, reproduced
+  every run with no overlap between win/loss ranges; depth 256 is noisier (4/5 runs win
+  1.2-2.1x, 1/5 runs showed a 0.80x loss at that shallowest depth specifically while 512-2048
+  stayed positive in the same run) — consistent with #219/#230's own prior finding that the
+  shallowest depth is where fixed per-launch/grid.sync overhead is least amortized. Kept
+  opt-in/default-OFF (`DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=1`) per the standing #180/#183
+  precedent — this session validated synthetic-fixture parity and wall-clock, not real
+  end-to-end generation parity (the #222-style test that caught #183's real-world precision
+  problem despite it passing synthetic parity), so a default-on flip should wait on that. Not
+  wired into any model's forward pass this session (kernel-level validation was the scope,
+  matching the precedent that `attention_f32_gqa_split_kv` itself also isn't wired into
+  `CudaQwen3MoeHybridTransformerModel`). **This is the first positive wall-clock result in the
+  #197/#198/#199 investigation family** — worth prioritizing model integration + a real
+  generation-parity pass as the next step, ahead of any of the other still-opt-in kernels this
+  investigation produced.
+
+  **Model integration + real generation-parity (2026-07-30, same day, branch
+  `issue/199-tensor-core-decode-attention-v2`): wired into `CudaQwen3HybridDenseTransformerModel`
+  and validated at real generation scale — PASSES, with two real debugging-methodology lessons
+  worth recording.** Wired as a new top-priority dispatch tier (above `attention_f32_gqa_split_kv`,
+  below the #226 fp64-combine research toggle) — requires `numKvHeads < numHeads` in addition to
+  `CudaAttentionMmaDecodeGqaSplit.CanUse`'s own shape checks (at group=1 there's no query-head
+  group to pack into the mma tile's M dimension, degenerating to v1's exact failure mode), converts
+  Q to FP16 into a new dedicated scratch buffer, and reads K/V straight from the FP16 KV cache
+  (skips the F32 staging conversion this call doesn't need, though that conversion still runs
+  unconditionally for the fallback tiers below it).
+
+  A dedicated generation-parity test
+  (`tests/DotLLM.Tests.Integration/Cuda/CudaAttentionMmaDecodeGqaSplitGenerationParityTests.cs`,
+  same harness shape as #222's `CudaAttentionSplitKvGenerationParityTests`) found real bugs twice
+  before landing a trustworthy result:
+  1. **First wiring attempt dispatched the kernel via `_kernels.LaunchAttentionMmaDecodeGqaSplit`
+     directly** (matching this file's existing style for the other opt-in tiers, which don't use
+     `CudaAttentionMmaDecodeGqaSplit`'s wrapper class at all) — but the test's own correctness
+     check (`DispatchCount` increasing, added specifically to prove the branch fires rather than
+     silently falling through — this project's standing lesson from the BitNet-session GQA-split
+     false-correlation, see `[[bitnet-support]]`) failed: `DispatchCount` only increments inside the
+     wrapper class's own `Run()` method, which the direct-call wiring never touched. Root cause was
+     in the *test's* assumption, not the dispatch logic itself (confirmed by a real CLI diagnostic:
+     the gating math was correct and dispatching real kernel launches all along) — fixed by routing
+     the model's dispatch through `CudaAttentionMmaDecodeGqaSplit.Run()` instead of calling
+     `CudaKernels` directly, which both fixes the counter and removes a small amount of duplicated
+     eligibility logic.
+  2. **The pre-gate bit-exactness assertion then failed for real**: `Assert.Equal(0.0,
+     maxPreGateStepDiff)` — a stricter check than #222's own test has (that one only prints the
+     value, never asserts on it) — found a nonzero diff at the exact gate boundary. Isolated via a
+     throwaway diagnostic test (two fresh model loads compared pairwise: false-vs-false,
+     true-vs-true, and false-vs-true, at a token count safely below vs. exactly spanning the gate)
+     that the underlying dispatch was bit-identical in all cases through step index `gate-2`,
+     first differing at step index `gate-1`. Root cause: the test's `depth = t` step-index proxy
+     (copied verbatim from #222's test, which carries the same approximation in a comment: "seqKv
+     at the step scoring token t+1 is t+1; use t as a depth proxy") undercounts by exactly one —
+     the KV write for position `t` lands before that step's attention read, so the real `seqKv` at
+     step `t` is `t+1`, not `t`. Fixed to `depth = t + 1`; pre-gate diff is now exactly `0.0`.
+     #222's own test likely carries the identical off-by-one at its own gate boundary, silently
+     tolerated because it was never asserted on — not fixed here (out of scope), flagged for
+     whoever next touches that file.
+
+  **Result, corrected methodology, real Bonsai-27B, 1040-token corpus, fresh model loads per
+  pass**: pre-gate (depth<256, 255 steps) bit-identical (`0.0` exactly) — confirms the gate is
+  airtight, no accidental engagement below threshold. Post-gate (depth>=256, 784 steps) perplexity
+  **improves** slightly (ratio 0.998270, -0.173%) rather than regressing. Overall -0.1305%. Greedy
+  generation first diverges at generated-step 225 (decode depth 257) — the SAME step/depth #222's
+  original split-KV investigation documented for `attention_f32_gqa_split_kv`'s own sibling kernel,
+  and a small, borderline-margin flip (baseline margin 7.59e-2 vs variant 7.94e-2, both far from a
+  confident decision) consistent with that already-characterized, already-accepted reassociation
+  sensitivity rather than a new correctness problem this kernel introduces. Full CUDA unit suite
+  (423 tests, 380 real + 43 env-gated skips) passes with zero regressions from the model-file
+  changes. **Still opt-in/default-OFF** (`DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=1`) pending a maintainer
+  decision on default-on, but the precondition that gap existed for (#222-style real generation
+  validation) is now satisfied.
+- **BitNet decode CUDA-graph capture, and the generic `attention_f16_dyn` slowdown behind it** (issues #212/#213/#218/#221, PRs #214/#217/#223/#224, 2026-07-28): BitNet was the only supported architecture excluded from the project's default-on decode CUDA-graph capture (the generic captured body omitted BitNet's FP32-residual/Sub-LN/ReLU² ops). #214 ported those ops in and removed the exclusion — bit-exact vs eager, +9-11% decode at shallow depth on both real BitNet models (2B-4T, `bitnet_b1_58-xl`). This surfaced a real depth-dependent regression, fixed for BitNet specifically via #217's depth ceiling (`BitNetGraphCaptureMaxDepth`, default 384).
+
+  **#218 then found and fixed the underlying kernel-level cause, and generalized the mitigation to every architecture.** An elevated `ncu --set full` capture (`.perf-runs/ncu-2026-07-28/README.md`) first suggested a CTA-barrier-stall hypothesis (the `seq_kv`/`position_offset` device-pointer reads landing too close to a sync point) — **this was refuted** by direct SASS inspection (`ptxas -arch=sm_86` + `cuobjdump --dump-sass`, no elevation needed): `ptxas` already schedules both loads as the first two real instructions, with 50-90 independent instructions before first use. The actual cause: all 256 threads in `attention_f16_dyn` each independently re-read the same block-uniform pointer values — 8x the redundant memory-latency exposure `attention_f16` doesn't pay (it reads from the near-free constant/parameter bank instead). Fixed by templating the shared kernel body on a `DeviceIndirect` compile-time bool; the `_dyn` instantiation has only thread 0 dereference the pointers once, broadcasting via the dead tail of the existing `warp_scratch[32]` shared buffer — no new shared memory, no new barrier, and `attention_f16`'s SASS is byte-for-byte unaffected (verified via SASS diff). This closed roughly a third of the regression on its own; the rest was closed by generalizing #217's pattern into a new `GraphCaptureMaxDepth` (default 512, `DOTLLM_GRAPH_MAX_DEPTH` override) covering every graph-capable architecture, with BitNet keeping its own tighter, separately-validated ceiling. Falcon-E-3B/Falcon3-3B regression fully closed at every depth ≥512 tested; shallow-depth graph win preserved (+2.8% to +7.9%).
+
+  **#221 separately confirmed** (via a real regression test plus `nsys --cuda-graph-trace=node` kernel-launch traces, not just code reading) that the I2_S QKV/GateUp fused-GEMV decode dispatch (`CanFuseI2SDecode`) already engages identically for Llama-arch I2_S models (Falcon-E-3B, Falcon3-3B) and BitNet-arch — confirmed working as designed, no fix needed there. (A separate, orthogonal, non-performance-relevant finding from the same investigation: the load-time QKV VRAM buffer-packing, `TryUploadPackedThree`, never engages for any I2_S model since I2_S has its own dedicated kernel family rather than the generic quantized-GEMV path that buffer feeds — documented so it isn't mistaken for a regression later.)
 - **Fused quantized GEMM for prefill**: Marlin-style dequant-in-register. Decode is now MMQ + MMVQ-large + pre-Q8_1 (Qwen3-8B Q4_K_M decode hits 33 tok/s eager on RTX 3060 — inside llama.cpp's reported range); prefill still uses dequant→cuBLAS HGEMM.
 - **Continuous batching scheduler** (engine-layer prerequisite for tensor-core mma kernel value — see `docs/perf/MMA_BATCHED_MMQ.md` for the design analysis).
 - **Tensor-core (mma) batched MMQ**: only valuable once batched decode is the call shape. See `docs/perf/MMA_BATCHED_MMQ.md` for thresholds.

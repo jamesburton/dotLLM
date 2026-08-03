@@ -31,6 +31,11 @@ public sealed class ResidentModelSnapshot : IDisposable
     public KvCacheConfig KvCacheConfig { get; init; }
     public Func<ModelConfig, int, IKvCache>? KvCacheFactory { get; init; }
     public PagedKvCacheFactory? PagedFactory { get; init; }
+
+    /// <summary>GPU-resident paged KV block-pool factory (issue #252), non-null only for a CUDA
+    /// model loaded with <c>--paged</c>. Independent of <see cref="PagedFactory"/> (the CPU pool) —
+    /// a given resident model uses at most one of the two, never both.</summary>
+    public DotLLM.Cuda.CudaPagedKvCacheFactory? CudaPagedFactory { get; init; }
     public PrefixCache? PrefixCache { get; init; }
     public PrefixTrieManager? PrefixTrieManager { get; init; }
     public IModel? Model { get; init; }
@@ -60,6 +65,7 @@ public sealed class ResidentModelSnapshot : IDisposable
         PrefixCache?.Dispose();
         PrefixTrieManager?.Dispose();
         PagedFactory?.Dispose();
+        CudaPagedFactory?.Dispose();
         DraftModel?.Dispose();
         DraftGguf?.Dispose();
         Model?.Dispose();

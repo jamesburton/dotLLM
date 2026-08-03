@@ -23,3 +23,20 @@ extern "C" __global__ void __launch_bounds__(256) swiglu_f32(
         output[idx] = (g / (1.0f + expf(-g))) * u;
     }
 }
+
+// BitNet-MoE gate activation (issue #246): relu(gate)^2 * up, replacing SiLU-gated GLU for
+// ternary I2_S expert bodies. Matches DotLLM.Cpu.Kernels.FusedOps.ReLU2GLU exactly (max(0,g),
+// square, multiply by up — no fast-math transcendental involved, so this kernel's numerics are
+// as exact as the source floats allow, unlike swiglu_f32's --use_fast_math sigmoid above).
+extern "C" __global__ void __launch_bounds__(256) relu2glu_f32(
+    const float* __restrict__ gate, const float* __restrict__ up,
+    float* __restrict__ output, const int n, const int seq_len)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n * seq_len)
+    {
+        float g = gate[idx], u = up[idx];
+        float r = fmaxf(g, 0.0f);
+        output[idx] = r * r * u;
+    }
+}

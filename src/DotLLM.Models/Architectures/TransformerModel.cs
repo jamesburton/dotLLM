@@ -101,6 +101,9 @@ public sealed unsafe class TransformerModel : IModel
     /// <summary>Total bytes allocated for inference scratch buffers.</summary>
     public long ComputeMemoryBytes => _state.AllocatedBytes;
 
+    /// <inheritdoc/>
+    public long RepackedWeightBytes => _weights.RepackedBytes;
+
     /// <summary>Debug: limit the number of transformer layers processed. 0 = all layers (default). -1 = skip all layers (embedding + LM head only).</summary>
     internal int DebugMaxLayers { get; set; }
 
@@ -898,6 +901,36 @@ public sealed unsafe class TransformerModel : IModel
             sharedKvV = (float*)NativeMemory.AlignedAlloc(stashBytes, 64);
         }
 
+        // 1e. Gemma-3n AltUp stream stack. Every decoder layer operates on
+        // Config.Gemma3n!.NumInputs parallel hidden-state streams instead of one —
+        // built once here from the (scaled, PLE-input-precomputed but not yet
+        // injected) embedding via the model-level altup_projections, threaded
+        // through the layer loop by RunGemma3nLayer (predict → attend/Laurel/MLP
+        // the active stream → correct all streams), and collapsed back to a
+        // single hidden vector below, after the last layer. Null for every other
+        // architecture (buffers stay null, no work).
+        // Pointer-array (not tensor-data) allocations use plain NativeMemory.Alloc —
+        // stackalloc cannot target a pointer-to-pointer element type (CS0306).
+        float** g3nStreams = null;
+        float* g3nStreamsBacking = null;
+        int g3nNumInputs = 0;
+        if (Config.Gemma3n is { } g3nCfgOuter)
+        {
+            g3nNumInputs = g3nCfgOuter.NumInputs;
+            g3nStreamsBacking = (float*)NativeMemory.AlignedAlloc(
+                (nuint)(sizeof(float) * (long)g3nNumInputs * seqLen * hiddenSize), 64);
+            g3nStreams = (float**)NativeMemory.Alloc((nuint)(sizeof(float*) * g3nNumInputs));
+            for (int i = 0; i < g3nNumInputs; i++)
+                g3nStreams[i] = g3nStreamsBacking + (long)i * seqLen * hiddenSize;
+
+            float** altupProjPtrs = (float**)NativeMemory.Alloc((nuint)(sizeof(float*) * (g3nNumInputs - 1)));
+            for (int i = 0; i < g3nNumInputs - 1; i++)
+                altupProjPtrs[i] = (float*)_weights.Gemma3nAltUp!.AltUpProjections[i];
+
+            Gemma3nAltUp.BuildInputStreams(hidden, g3nStreams, altupProjPtrs, seqLen, hiddenSize, g3nNumInputs);
+            NativeMemory.Free(altupProjPtrs);
+        }
+
         // 2. TRANSFORMER LAYERS
         var repackedLayers = _weights.RepackedLayers;
         int numLayers = DebugMaxLayers switch
@@ -1002,6 +1035,25 @@ public sealed unsafe class TransformerModel : IModel
                         pleInputs, pleGateScratch, pleProjScratch, pleDim,
                         sharedKvK, sharedKvV, sharedKvSlotStride);
                 }
+                continue;
+            }
+
+            // ── Gemma-3n branch ───────────────────────────────────────────
+            // AltUp (multi-stream predict/correct) + Laurel + per-layer
+            // activation sparsity are sufficiently distinct from the shared
+            // GQA/dense blocks that this runs as a self-contained per-layer
+            // method, mirroring RunGemma4Layer's style. g3nStreams is non-null
+            // iff Config.Gemma3n is set.
+            if (lw.Gemma3n is not null)
+            {
+                RunGemma3nLayer(
+                    in lw, layer, seqLen,
+                    g3nStreams!, g3nNumInputs,
+                    hidden, residual, normOut, q, k, v, attnOut,
+                    numKvHeadsLayer, headDimLayer, qStrideLayer, kvStrideLayer,
+                    positions, eps, kvCache,
+                    pleInputs, pleGateScratch, pleProjScratch, pleDim,
+                    sharedKvK, sharedKvV, sharedKvSlotStride);
                 continue;
             }
 
@@ -1711,6 +1763,33 @@ public sealed unsafe class TransformerModel : IModel
             NativeMemory.AlignedFree(sharedKvV);
         }
 
+        // 2b. Gemma-3n AltUp stream reduction. Collapses the final numInputs-
+        // stream stack to a single hidden vector: streams 1..N-1 are unembed-
+        // projected + magnitude-matched to stream 0, then all N streams
+        // (including the untouched stream 0) are averaged into `hidden`. No-op
+        // for every other architecture (g3nStreams null).
+        if (g3nStreams is not null)
+        {
+            float** altupUnembedPtrs = (float**)NativeMemory.Alloc((nuint)(sizeof(float*) * (g3nNumInputs - 1)));
+            for (int i = 0; i < g3nNumInputs - 1; i++)
+                altupUnembedPtrs[i] = (float*)_weights.Gemma3nAltUp!.AltUpUnembedProjections[i];
+
+            float* reduceScratchBacking = (float*)NativeMemory.AlignedAlloc(
+                (nuint)(sizeof(float) * (long)(g3nNumInputs - 1) * seqLen * hiddenSize), 64);
+            float** reduceScratch = (float**)NativeMemory.Alloc((nuint)(sizeof(float*) * (g3nNumInputs - 1)));
+            for (int i = 0; i < g3nNumInputs - 1; i++)
+                reduceScratch[i] = reduceScratchBacking + (long)i * seqLen * hiddenSize;
+
+            Gemma3nAltUp.ReduceOutputStreams(
+                g3nStreams, altupUnembedPtrs, hidden, reduceScratch, seqLen, hiddenSize, g3nNumInputs);
+
+            NativeMemory.Free(altupUnembedPtrs);
+            NativeMemory.Free(reduceScratch);
+            NativeMemory.AlignedFree(reduceScratchBacking);
+            NativeMemory.AlignedFree(g3nStreamsBacking);
+            NativeMemory.Free(g3nStreams);
+        }
+
         // 3. FINAL NORM (in-place: hidden → hidden)
         for (int t = 0; t < seqLen; t++)
         {
@@ -2142,6 +2221,328 @@ public sealed unsafe class TransformerModel : IModel
             float scale = t < regionP ? encScale : g4.LayerOutputScale;
             var row = new Span<float>(hidden + t * hiddenSize, hiddenSize);
             TensorPrimitives.Multiply(row, scale, row);
+        }
+    }
+
+    /// <summary>
+    /// Runs one Gemma-3n transformer layer. Operates on <paramref name="streams"/>,
+    /// the AltUp multi-stream stack maintained by the caller across the whole
+    /// layer loop: <see cref="Gemma3nAltUp.Predict"/> derives a per-stream
+    /// prediction, the active stream's prediction is copied into
+    /// <paramref name="hidden"/> and run through the standard Gemma four-norm
+    /// attention (own-KV or shared-KV donor reuse, per-attention-type RoPE,
+    /// weight-less V-norm) with a parallel Laurel block, then the dense GeGLU FFN
+    /// (with per-layer activation sparsity), and finally
+    /// <see cref="Gemma3nAltUp.Correct"/> propagates the result back across every
+    /// stream. The Per-Layer-Embeddings gate is computed from the (optionally
+    /// <c>correct_output_scale</c>-scaled) corrected active stream and added onto
+    /// the NON-active streams only — the one point where Gemma-3n's PLE injection
+    /// differs from Gemma-4's (see <see cref="RunGemma4Layer"/> /
+    /// <see cref="PerLayerEmbeddings.InjectLayer"/>). Verified against HF
+    /// <c>transformers</c> <c>modeling_gemma3n.py</c>
+    /// <c>Gemma3nTextDecoderLayer.forward</c>.
+    /// </summary>
+    /// <remarks>
+    /// F32 reference path (issue #136 scope): every projection still goes through
+    /// the quantization-aware <see cref="Gemm"/> dispatcher so quantized
+    /// checkpoints load and run, but LoRA deltas are not threaded through this
+    /// method (Gemma-3n + LoRA is follow-up work), and attention biases are not
+    /// applied (no released Gemma-3n checkpoint carries them —
+    /// <c>attention_bias=false</c>).
+    /// </remarks>
+    private unsafe void RunGemma3nLayer(
+        in TransformerLayerWeights lw, int layer, int seqLen,
+        float** streams, int numInputs,
+        float* hidden, float* residual, float* normOut,
+        float* q, float* k, float* v, float* attnOut,
+        int numKvHeadsLayer, int headDimLayer, int qStrideLayer, int kvStrideLayer,
+        ReadOnlySpan<int> positions, float eps, IKvCache? kvCache,
+        float* pleInputs, float* pleGateScratch, float* pleProjScratch, int pleDim,
+        float* sharedKvK, float* sharedKvV, int sharedKvSlotStride)
+    {
+        var g3n = lw.Gemma3n!;
+        var g3nCfg = Config.Gemma3n!;
+        int hiddenSize = Config.HiddenSize;
+        int numHeads = Config.NumAttentionHeads;
+        int activeIdx = g3nCfg.ActiveIdx;
+        long hElems = (long)seqLen * hiddenSize;
+
+        // Shared-KV (mirrors RunGemma4Layer — same generic ModelConfig donor rule).
+        bool ownKv = Config.LayerHasOwnKv(layer);
+        int sharedSlot = Config.IsFullAttentionLayer(layer) ? 1 : 0;
+        bool isSharedDonor = Config.NumSharedKvLayers > 0
+            && layer == Config.NumLayers - Config.NumSharedKvLayers - (Config.IsFullAttentionLayer(layer) ? 1 : 2);
+
+        float[] predictionsBuf = ArrayPool<float>.Shared.Rent((int)(hElems * numInputs));
+        float[] modalityBuf = ArrayPool<float>.Shared.Rent(seqLen * numInputs);
+        float[] coefBuf = ArrayPool<float>.Shared.Rent(numInputs * numInputs);
+        float[] altupNormScratchBuf = ArrayPool<float>.Shared.Rent(hiddenSize);
+        float[] innovationBuf = ArrayPool<float>.Shared.Rent(hiddenSize);
+        float[] laurelDeltaBuf = ArrayPool<float>.Shared.Rent((int)hElems);
+        float[] laurelRankBuf = ArrayPool<float>.Shared.Rent(seqLen * g3nCfg.LaurelRank);
+        float[] activatedBuf = ArrayPool<float>.Shared.Rent((int)hElems);
+        float[] firstPredBuf = ArrayPool<float>.Shared.Rent((int)hElems);
+        // Pointer array (not tensor data) — stackalloc cannot target a
+        // pointer-to-pointer element type (CS0306), so this uses plain
+        // NativeMemory.Alloc, freed in the `finally` below.
+        float** predictions = (float**)NativeMemory.Alloc((nuint)(sizeof(float*) * numInputs));
+
+        try
+        {
+            fixed (float* predictionsFlat = predictionsBuf)
+            fixed (float* modalityP = modalityBuf)
+            fixed (float* coefP = coefBuf)
+            fixed (float* altupNormScratchP = altupNormScratchBuf)
+            fixed (float* innovationP = innovationBuf)
+            fixed (float* laurelDeltaP = laurelDeltaBuf)
+            fixed (float* laurelRankP = laurelRankBuf)
+            fixed (float* activatedP = activatedBuf)
+            fixed (float* firstPredP = firstPredBuf)
+            {
+                for (int i = 0; i < numInputs; i++)
+                    predictions[i] = predictionsFlat + (long)i * hElems;
+
+                // ── AltUp predict ────────────────────────────────────────────
+                Gemma3nAltUp.Predict(
+                    streams, (float*)g3n.PredictionCoefs, g3n.RouterNorm, (float*)g3n.ModalityRouter,
+                    predictions, seqLen, hiddenSize, numInputs, activeIdx, eps,
+                    modalityP, coefP, altupNormScratchP);
+
+                // active_prediction := predictions[activeIdx]. `hidden` becomes the
+                // scratch buffer the rest of this method's attention/FFN math reads
+                // and writes, exactly like the standard GQA/RunGemma4Layer branches.
+                new ReadOnlySpan<float>(predictions[activeIdx], (int)hElems)
+                    .CopyTo(new Span<float>(hidden, (int)hElems));
+                new ReadOnlySpan<float>(hidden, (int)hElems).CopyTo(new Span<float>(residual, (int)hElems));
+
+                // ── input_layernorm (shared by attention AND Laurel) ──────────
+                for (int t = 0; t < seqLen; t++)
+                    RmsNorm.Execute(
+                        new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
+                        lw.AttnNormWeight, eps,
+                        new Span<float>(normOut + t * hiddenSize, hiddenSize));
+
+                // ── Laurel (parallel to attention, same normed input) ─────────
+                Gemma3nLaurel.ComputeDelta(
+                    normOut, (float*)g3n.LaurelLinearLeft, (float*)g3n.LaurelLinearRight,
+                    g3n.PostLaurelNorm, laurelRankP, laurelDeltaP,
+                    seqLen, hiddenSize, g3nCfg.LaurelRank, eps);
+
+                // ── Attention: Q/K/V/O (own-KV or shared-KV donor reuse) ──────
+                Gemm(lw.QWeight, lw.QQuantType, normOut, q, lw.QOutputDim, lw.QInputDim, seqLen);
+                if (ownKv)
+                {
+                    Gemm(lw.KWeight, lw.KQuantType, normOut, k, lw.KOutputDim, lw.KInputDim, seqLen);
+                    Gemm(lw.VWeight, lw.VQuantType, normOut, v, lw.VOutputDim, lw.VInputDim, seqLen);
+                }
+
+                if (lw.QNormWeight is not null)
+                    ApplyPerHeadNorm(lw.QNormWeight, q, numHeads, headDimLayer, seqLen, eps);
+                if (ownKv)
+                {
+                    if (lw.KNormWeight is not null)
+                        ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeadsLayer, headDimLayer, seqLen, eps);
+                    // Gemma-3n v_norm is weight-less (with_scale=False in HF).
+                    ApplyPerHeadNormWeightless(v, numKvHeadsLayer, headDimLayer, seqLen, eps);
+                }
+
+                var (ropeCos, ropeSin, ropeDimLayer, ropeTypeLayer) = GetLayerRope(layer);
+                var qSpan = new Span<float>(q, seqLen * qStrideLayer);
+                var kSpan = ownKv ? new Span<float>(k, seqLen * kvStrideLayer) : Span<float>.Empty;
+                int ropeKvHeads = ownKv ? numKvHeadsLayer : 0;
+                RoPE.Execute(qSpan, kSpan, positions, numHeads, ropeKvHeads, headDimLayer, ropeDimLayer,
+                    ropeCos, ropeSin, ropeTypeLayer);
+
+                if (isSharedDonor && sharedKvK is not null)
+                {
+                    int kvElemsStash = seqLen * kvStrideLayer;
+                    new ReadOnlySpan<float>(k, kvElemsStash)
+                        .CopyTo(new Span<float>(sharedKvK + sharedSlot * sharedKvSlotStride, kvElemsStash));
+                    new ReadOnlySpan<float>(v, kvElemsStash)
+                        .CopyTo(new Span<float>(sharedKvV + sharedSlot * sharedKvSlotStride, kvElemsStash));
+                }
+
+                float attnScale = Config.QueryPreAttnScalar is float qpas && qpas > 0
+                    ? 1.0f / MathF.Sqrt(qpas)
+                    : 1.0f / MathF.Sqrt(headDimLayer);
+                int? layerSlidingWindow = GetLayerSlidingWindow(layer);
+                float attnSoftcap = Config.AttnLogitSoftcap ?? 0f;
+
+                if (!ownKv)
+                {
+                    int donorLayer = Config.SharedKvDonorLayer(layer);
+                    if (kvCache is not null)
+                    {
+                        var donorK = kvCache.GetKeysRef(donorLayer);
+                        var donorV = kvCache.GetValuesRef(donorLayer);
+                        int seqKv = kvCache.CurrentLength;
+                        Attention.Execute(q, (float*)donorK.DataPointer, (float*)donorV.DataPointer, attnOut,
+                            seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], attnScale,
+                            _threadPool, layerSlidingWindow, softCap: attnSoftcap);
+                    }
+                    else
+                    {
+                        if (sharedKvK is null)
+                            throw new InvalidOperationException(
+                                "Gemma-3n shared-KV layer reached without a donor stash — cacheless forward must allocate it.");
+                        float* donorK = sharedKvK + sharedSlot * sharedKvSlotStride;
+                        float* donorV = sharedKvV + sharedSlot * sharedKvSlotStride;
+                        Attention.Execute(q, donorK, donorV, attnOut,
+                            seqLen, seqLen, numHeads, numKvHeadsLayer, headDimLayer, 0, attnScale, _threadPool,
+                            layerSlidingWindow, softCap: attnSoftcap,
+                            _currentMaskSpec.Mode, _currentMaskSpec.PrefixLength);
+                    }
+                }
+                else if (kvCache is not null)
+                {
+                    var kRef = new TensorRef(seqLen, kvStrideLayer, DType.Float32, -1, (nint)k);
+                    var vRef = new TensorRef(seqLen, kvStrideLayer, DType.Float32, -1, (nint)v);
+                    kvCache.Update(kRef, vRef, positions, layer);
+                    int seqKv = kvCache.CurrentLength;
+                    var cachedK = kvCache.GetKeysRef(layer);
+                    var cachedV = kvCache.GetValuesRef(layer);
+                    Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
+                        seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], attnScale,
+                        _threadPool, layerSlidingWindow, softCap: attnSoftcap);
+                }
+                else
+                {
+                    Attention.Execute(q, k, v, attnOut,
+                        seqLen, seqLen, numHeads, numKvHeadsLayer, headDimLayer, 0, attnScale, _threadPool,
+                        layerSlidingWindow, softCap: attnSoftcap,
+                        _currentMaskSpec.Mode, _currentMaskSpec.PrefixLength);
+                }
+
+                // O projection → normOut, then post_attention_layernorm.
+                Gemm(lw.OWeight, lw.OQuantType, attnOut, normOut, lw.OOutputDim, lw.OInputDim, seqLen);
+                for (int t = 0; t < seqLen; t++)
+                    RmsNorm.Execute(
+                        new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
+                        lw.PostAttnNormWeight!, eps,
+                        new Span<float>(normOut + t * hiddenSize, hiddenSize));
+
+                // attn_gated = active_prediction + attn; attn_laurel = (attn_gated + laurel) / sqrt(2).
+                const float invSqrt2 = 0.70710678118654752f;
+                for (int t = 0; t < seqLen; t++)
+                {
+                    float* h = hidden + t * hiddenSize;   // active_prediction (residual copy still intact)
+                    float* a = normOut + t * hiddenSize;  // post_attention_layernorm(O)
+                    float* l = laurelDeltaP + t * hiddenSize;
+                    for (int i = 0; i < hiddenSize; i++)
+                        h[i] = (h[i] + a[i] + l[i]) * invSqrt2;
+                }
+                // hidden now holds attn_laurel; refresh residual for the FFN sublayer.
+                new ReadOnlySpan<float>(hidden, (int)hElems).CopyTo(new Span<float>(residual, (int)hElems));
+
+                // ── pre_feedforward_layernorm → dense GeGLU MLP (with per-layer
+                // activation sparsity applied to the gate before the activation) ──
+                for (int t = 0; t < seqLen; t++)
+                    RmsNorm.Execute(
+                        new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
+                        lw.FfnNormWeight, eps,
+                        new Span<float>(normOut + t * hiddenSize, hiddenSize));
+
+                float* ffnGate = (float*)_state.FfnGate;
+                float* ffnUp = (float*)_state.FfnUp;
+                float* siluOut = (float*)_state.SiluOutput;
+                Gemm(lw.GateWeight, lw.GateQuantType, normOut, ffnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
+                Gemm(lw.UpWeight, lw.UpQuantType, normOut, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+
+                float sparsity = layer < g3nCfg.ActivationSparsityPattern.Count
+                    ? g3nCfg.ActivationSparsityPattern[layer] : 0f;
+                if (sparsity > 0f)
+                    GaussianTopK.Apply(ffnGate, seqLen, lw.GateOutputDim, sparsity);
+
+                for (int t = 0; t < seqLen; t++)
+                {
+                    var gSpan = new ReadOnlySpan<float>(ffnGate + t * lw.GateOutputDim, lw.GateOutputDim);
+                    var uSpan = new ReadOnlySpan<float>(ffnUp + t * lw.UpOutputDim, lw.UpOutputDim);
+                    var oSpan = new Span<float>(siluOut + t * lw.GateOutputDim, lw.GateOutputDim);
+                    FusedOps.GeGLUTanh(gSpan, uSpan, oSpan);
+                }
+                Gemm(lw.DownWeight, lw.DownQuantType, siluOut, normOut, lw.DownOutputDim, lw.DownInputDim, seqLen);
+
+                // post_feedforward_layernorm, then activated = attn_laurel + ffn_out.
+                for (int t = 0; t < seqLen; t++)
+                    RmsNorm.Execute(
+                        new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
+                        lw.PostFfnNormWeight!, eps,
+                        new Span<float>(normOut + t * hiddenSize, hiddenSize));
+                for (int t = 0; t < seqLen; t++)
+                    Add.Execute(
+                        new ReadOnlySpan<float>(residual + t * hiddenSize, hiddenSize),
+                        new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
+                        new Span<float>(activatedP + t * hiddenSize, hiddenSize));
+
+                // ── AltUp correct — writes the corrected stack back into `streams` ──
+                Gemma3nAltUp.Correct(
+                    predictions, activatedP, (float*)g3n.CorrectionCoefs, g3n.RouterNorm, (float*)g3n.ModalityRouter,
+                    streams, seqLen, hiddenSize, numInputs, activeIdx, eps,
+                    modalityP, innovationP, altupNormScratchP);
+
+                // ── Per-Layer Embeddings gate, computed from the (optionally
+                // correct_output_scale-scaled) corrected active stream, injected
+                // onto the NON-active streams only (HF:
+                // `corrected_predictions[1:] += first_prediction`). No-op for a
+                // Gemma-3n checkpoint without PLE tables (pleInputs null). ─────
+                if (pleInputs is not null && lw.PleGateWeight != 0)
+                {
+                    new ReadOnlySpan<float>(streams[activeIdx], (int)hElems)
+                        .CopyTo(new Span<float>(firstPredP, (int)hElems));
+                    if (g3nCfg.CorrectOutputScale)
+                    {
+                        fixed (float* scaleP = g3n.CorrectOutputScale)
+                            for (int t = 0; t < seqLen; t++)
+                            {
+                                float* row = firstPredP + t * hiddenSize;
+                                for (int h = 0; h < hiddenSize; h++)
+                                    row[h] *= scaleP[h];
+                            }
+                    }
+
+                    // InjectLayer computes gate→act→(×per-layer input)→proj→post-norm
+                    // and ADDS it into its `hidden` arg in place; we pass a throwaway
+                    // copy (firstPredP) as that "hidden" so the real streams are
+                    // untouched by this call, then read the delta back out of
+                    // pleProjScratch (still holding the post-norm value) and add
+                    // it onto every non-active stream ourselves.
+                    PerLayerEmbeddings.InjectLayer(
+                        hidden: firstPredP,
+                        perLayerInputs: pleInputs,
+                        layerIdx: layer, numLayers: Config.NumLayers,
+                        gateWeight: (float*)lw.PleGateWeight,
+                        projWeight: (float*)lw.PleProjWeight,
+                        postNormWeight: lw.PlePostNormWeight!,
+                        gateScratch: pleGateScratch,
+                        projScratch: pleProjScratch,
+                        seqLen: seqLen, hiddenSize: hiddenSize, pleDim: pleDim, eps: eps);
+
+                    for (int i = 0; i < numInputs; i++)
+                    {
+                        if (i == activeIdx) continue;
+                        for (int t = 0; t < seqLen; t++)
+                        {
+                            float* s = streams[i] + t * hiddenSize;
+                            float* d = pleProjScratch + t * hiddenSize;
+                            for (int h = 0; h < hiddenSize; h++)
+                                s[h] += d[h];
+                        }
+                    }
+                }
+            }
+        }
+        finally
+        {
+            NativeMemory.Free(predictions);
+            ArrayPool<float>.Shared.Return(predictionsBuf);
+            ArrayPool<float>.Shared.Return(modalityBuf);
+            ArrayPool<float>.Shared.Return(coefBuf);
+            ArrayPool<float>.Shared.Return(altupNormScratchBuf);
+            ArrayPool<float>.Shared.Return(innovationBuf);
+            ArrayPool<float>.Shared.Return(laurelDeltaBuf);
+            ArrayPool<float>.Shared.Return(laurelRankBuf);
+            ArrayPool<float>.Shared.Return(activatedBuf);
+            ArrayPool<float>.Shared.Return(firstPredBuf);
         }
     }
 
@@ -3290,9 +3691,25 @@ public sealed unsafe class TransformerModel : IModel
                                  int m, int k, int n, byte* preQuantizedInput,
                                  in WeightRepacking.RepackedWeight rw)
     {
-        if (rw.Ptr == 0 || n > 1 || rw.RowBytes < InterleavedMinRowBytes)
+        if (rw.Ptr == 0 || rw.RowBytes < InterleavedMinRowBytes)
         {
-            // Multi-token or small row stride: use original tiled GEMM path
+            // No repacked copy, or rows too short for interleaving to pay: original path.
+            Gemm(origWeights, qt, b, c, m, k, n, preQuantizedInput);
+            return;
+        }
+
+        if (n > 1)
+        {
+            // Multi-token: L2-tiled GEMM over the R4 layout. Same tiling shape as the row-major
+            // path, so it inherits the interleaved dot kernel's advantage instead of fighting
+            // register pressure the way the outer-product microkernels do (Step 26, #61).
+            if (qt == QuantizationType.Q8_0 && preQuantizedInput != null)
+            {
+                MatMul.GemmR4TiledQ8_0((byte*)rw.Ptr, preQuantizedInput, c,
+                    rw.FullGroupCount, rw.TailRows, k / 32, m, n, _threadPool);
+                return;
+            }
+
             Gemm(origWeights, qt, b, c, m, k, n, preQuantizedInput);
             return;
         }

@@ -106,6 +106,13 @@ public sealed class VulkanTransformerModel : IModel
     // per-tensor float32 scale. Decode via GEMV, prefill via 16x16-tiled GEMM.
     private readonly MatMulI2SGemvF32Kernel _matmulI2S;
     private readonly MatMulI2SGemmF32Kernel _matmulI2SGemm;
+    // PQ2_0 matmul kernel — PrismML Bonsai ternary (~2.1 bpw incl. per-group fp16
+    // scale). 128-element group alignment; raw on-device layout is (K/128)·34
+    // packed-group bytes per row (2-byte fp16 scale + 32-byte codes per group,
+    // no per-tensor tail scale, unlike I2_S). Decode via GEMV, prefill via the
+    // 32x32 register-blocked GEMM ported from the I2_S design (#233).
+    private readonly MatMulPQ2_0GemvF32Kernel _matmulPQ2_0;
+    private readonly MatMulPQ2_0GemmF32Kernel _matmulPQ2_0Gemm;
     // Q6_K_M matmul kernels — Phase 1 sibling of Q4_K / Q5_K, completing the
     // K-quant matmul kernel coverage. Q6_K is structurally simpler on the
     // metadata side (no dmin / 6-bit-packed scales) but has a more intricate
@@ -881,6 +888,7 @@ public sealed class VulkanTransformerModel : IModel
         MatMulIq3SGemvF32Kernel matmulIq3S, MatMulIq3SGemmF32Kernel matmulIq3SGemm,
         MatMulIq1SGemvF32Kernel matmulIq1S, MatMulIq1SGemmF32Kernel matmulIq1SGemm,
         MatMulI2SGemvF32Kernel matmulI2S, MatMulI2SGemmF32Kernel matmulI2SGemm,
+        MatMulPQ2_0GemvF32Kernel matmulPQ2_0, MatMulPQ2_0GemmF32Kernel matmulPQ2_0Gemm,
         MatMulF16GemvF32Kernel matmulF16, MatMulF16GemmF32Kernel matmulF16Gemm,
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
@@ -983,6 +991,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq1SGemm = matmulIq1SGemm;
         _matmulI2S = matmulI2S;
         _matmulI2SGemm = matmulI2SGemm;
+        _matmulPQ2_0 = matmulPQ2_0;
+        _matmulPQ2_0Gemm = matmulPQ2_0Gemm;
         _matmulF16 = matmulF16;
         _matmulF16Gemm = matmulF16Gemm;
         _matmulF16GemmCoopmat = matmulF16GemmCoopmat;
@@ -1469,6 +1479,15 @@ public sealed class VulkanTransformerModel : IModel
         // routes per device-side QuantizationType.
         var matmulI2S = MatMulI2SGemvF32Kernel.Create(device, spvDir);
         var matmulI2SGemm = MatMulI2SGemmF32Kernel.Create(device, spvDir);
+        // PQ2_0 GEMV + GEMM — PrismML Bonsai ternary. Always created; the
+        // dispatcher routes per device-side QuantizationType. The GEMM variant is
+        // chosen per device by PQ2_0GemmVariant.SelectFor: the wave32-pinned coopmat
+        // kernel where VK_KHR_cooperative_matrix and a pinnable compute subgroup size
+        // are both available (1.81-2.15x over register-blocked on gfx1151, #236),
+        // the 64-thread coopmat kernel where the pin is not available, and #233's
+        // register-blocked F32 kernel everywhere else.
+        var matmulPQ2_0 = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
+        var matmulPQ2_0Gemm = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir);
         // F16 / BF16 native matmul kernels — Phase 8. Always created; the
         // dispatcher routes per device-side QuantizationType. The F16 GEMM
         // coopmat path is opportunistic (null on devices without coopmat).
@@ -1679,6 +1698,7 @@ public sealed class VulkanTransformerModel : IModel
             matmulIq3S, matmulIq3SGemm,
             matmulIq1S, matmulIq1SGemm,
             matmulI2S, matmulI2SGemm,
+            matmulPQ2_0, matmulPQ2_0Gemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
             rmsnormMatmulQ8Fused,
@@ -3715,6 +3735,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq1SGemm.InvalidateDescriptorCache();
         _matmulI2S.InvalidateDescriptorCache();
         _matmulI2SGemm.InvalidateDescriptorCache();
+        _matmulPQ2_0.InvalidateDescriptorCache();
+        _matmulPQ2_0Gemm.InvalidateDescriptorCache();
         _matmulF16.InvalidateDescriptorCache();
         _matmulF16Gemm.InvalidateDescriptorCache();
         _matmulF16GemmCoopmat?.InvalidateDescriptorCache();
@@ -6191,6 +6213,25 @@ public sealed class VulkanTransformerModel : IModel
                     m: outputDim, k: inputDim, n: seqLen);
             }
         }
+        else if (weightQt == QuantType.PQ2_0)
+        {
+            // PQ2_0 (PrismML Bonsai ternary): 128-element group alignment (enforced by
+            // KeepPQ2_0OnDevice). Each group carries its own fp16 scale (read + applied
+            // in-shader per group), unlike I2_S's single per-tensor tail scale. Decode via
+            // GEMV, prefill via the 32x32 register-blocked GEMM (#233) — the port of the
+            // shipped I2_S prefill kernel, which folds each group's scale into the staged
+            // weight tile rather than applying one tensor scale to the finished accumulator.
+            if (seqLen == 1)
+            {
+                _matmulPQ2_0.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulPQ2_0Gemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
         else if (weightQt == QuantType.IQ1_S)
         {
             // IQ1_S: 256-element super-block alignment, ~1.5-1.7 bpw smallest GGUF quant.
@@ -6423,6 +6464,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq1S.Dispose();
         _matmulI2SGemm.Dispose();
         _matmulI2S.Dispose();
+        _matmulPQ2_0.Dispose();
+        _matmulPQ2_0Gemm.Dispose();
         _matmulIq4XsGemm.Dispose();
         _matmulIq4Xs.Dispose();
         _matmulIq4NlGemm.Dispose();

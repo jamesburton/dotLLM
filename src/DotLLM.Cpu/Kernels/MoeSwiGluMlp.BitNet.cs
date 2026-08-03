@@ -58,6 +58,17 @@ public static unsafe partial class MoeSwiGluMlp
     /// <param name="normTopKProb">Renormalise the selected top-k probabilities to sum to 1.0.</param>
     /// <param name="rmsEps">RMSNorm epsilon for the per-expert FFN Sub-LN.</param>
     /// <param name="threadPool">Optional thread pool — forwarded to the indexed GEMMs.</param>
+    /// <param name="useFloatTier">
+    /// Test/benchmark control forwarded to <see cref="MatMul.MoeIndexedMatmulI2_S"/>. When
+    /// <see langword="true"/>, the three indexed GEMMs take the float (W2A16) tier instead of the
+    /// W2A8 int8-activation tier that AVX2 hosts otherwise select. Default
+    /// <see langword="false"/> keeps production behaviour byte-identical.
+    ///
+    /// <para>Exists so a GPU parity oracle can be F32 end-to-end: the CUDA/Vulkan BitNet-MoE
+    /// kernels are F32-in, so an oracle on the W2A8 tier compares two different algorithms and its
+    /// tolerance measures activation-quantization error rather than kernel divergence — and does so
+    /// ISA-dependently, passing on a pre-AVX2 host. Issue #229.</para>
+    /// </param>
     [SkipLocalsInit]
     public static void ExecuteBitNetMoe(
         ReadOnlySpan<float> hidden,
@@ -71,7 +82,8 @@ public static unsafe partial class MoeSwiGluMlp
         int numExperts, int numExpertsPerTok,
         int hiddenSize, int intermediateSize, int seqLen,
         bool normTopKProb, float rmsEps,
-        ComputeThreadPool? threadPool = null)
+        ComputeThreadPool? threadPool = null,
+        bool useFloatTier = false)
     {
         if (hidden.Length < (long)seqLen * hiddenSize)
             throw new ArgumentException("hidden too small", nameof(hidden));
@@ -142,13 +154,13 @@ public static unsafe partial class MoeSwiGluMlp
                 MatMul.MoeIndexedMatmulI2_S(
                     gateBank, gateRowBytes, gateScales,
                     batchInPtr, gateOutPtr, intermediateSize, hiddenSize, n,
-                    rowExpertIds, threadPool);
+                    rowExpertIds, threadPool, useFloatTier);
 
                 // up = x · W_up^T       [n × I]
                 MatMul.MoeIndexedMatmulI2_S(
                     upBank, upRowBytes, upScales,
                     batchInPtr, upOutPtr, intermediateSize, hiddenSize, n,
-                    rowExpertIds, threadPool);
+                    rowExpertIds, threadPool, useFloatTier);
 
                 // inter = ffn_sub_norm_e( relu²(gate) * up )   per-expert Sub-LN
                 for (int a = 0; a < n; a++)
@@ -164,7 +176,7 @@ public static unsafe partial class MoeSwiGluMlp
                 MatMul.MoeIndexedMatmulI2_S(
                     downBank, downRowBytes, downScales,
                     interPtr, downOutPtr, hiddenSize, intermediateSize, n,
-                    rowExpertIds, threadPool);
+                    rowExpertIds, threadPool, useFloatTier);
 
                 // Weighted top-k accumulation → output[t] = Σ_slot w * down_out[t*k+slot].
                 fixed (float* outPtr = output)

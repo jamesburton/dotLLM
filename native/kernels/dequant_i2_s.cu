@@ -62,3 +62,39 @@ extern "C" __global__ void __launch_bounds__(256) dequant_i2_s_f16(
         out_base[lane + 96] = __float2half((float)c3 * scale);
     }
 }
+
+// ───────────────────────── Ragged K (k % 128 != 0) — issue #206 ─────────────────────────
+//
+// `blocks_per_row = k/128` above is an integer division: for a ragged k it silently floors,
+// dropping each row's tail elements (dst would keep whatever garbage was already in the scratch
+// buffer for those columns — not just a crash, a silent correctness bug). The block-128 interleave
+// for a ragged tensor is also NOT reset per row (see i2_s_gemv.cu's issue #206 comment / the
+// bitnet.cpp reference `quantize_i2_s`): it is computed over the flattened n*k element stream, so
+// `dst[flat]` (== `dst[row*k+col]`, since flat is already exactly that) can be derived directly
+// from the flattened index without ever separating row/col. One thread per output element,
+// grid-stride over the whole tensor — simple and correct; this is an edge-case fallback for the
+// (rare) ragged prefill path, not the tuned hot loop.
+extern "C" __global__ void __launch_bounds__(256) dequant_i2_s_f16_ragged(
+    const uint8_t* __restrict__ weight,   // packed codes [n * k/4 bytes] + trailing f32 scale
+    half*          __restrict__ dst,      // [n * k] dense FP16, row-major
+    const int n,
+    const int k)
+{
+    const float scale = *reinterpret_cast<const float*>(weight + (size_t)n * (k / 4));
+    const long long total = (long long)n * (long long)k;
+
+    const long long idx0   = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long stride = (long long)gridDim.x * blockDim.x;
+
+    for (long long flat = idx0; flat < total; flat += stride)
+    {
+        long long block = flat >> 7;              // flat / 128
+        int inBlock = (int)(flat & 127);          // flat % 128
+        int groupPos = inBlock & 31;
+        int groupIdx = inBlock >> 5;
+        uint8_t packed = weight[block * 32 + groupPos];
+        int shift = 6 - 2 * groupIdx;
+        int code = (packed >> shift) & 0x3;
+        dst[flat] = __float2half(((float)code - 1.0f) * scale);
+    }
+}
