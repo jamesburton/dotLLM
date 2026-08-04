@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Cpu.Threading;
@@ -47,6 +49,25 @@ public static unsafe partial class MatMul
         QuantizationType.Q6_K => &ComputeRowsQ6_K,
         _ => null,
     };
+
+    /// <summary>
+    /// Reports whether the fused decode path can compute a projection for <paramref name="qt"/>.
+    /// </summary>
+    /// <remarks>
+    /// The answer is derived from the dispatch tables the fused kernels actually use
+    /// (<see cref="GetComputeRowsFn"/> plus the two float formats handled directly by
+    /// <c>DispatchSingle</c>), so adding a new <c>ComputeRows</c> entry automatically makes the
+    /// type eligible — there is no separate list to keep in sync. Callers that own a
+    /// general-purpose GEMM should consult this before invoking
+    /// <see cref="FusedDecodeGemv3"/>/<see cref="FusedDecodeGemv2"/> and route unsupported types
+    /// through that GEMM instead, which is both faster and format-complete compared with the
+    /// dequantize-per-row fallback the fused path uses as a last resort.
+    /// </remarks>
+    /// <param name="qt">Weight quantization type of the projection.</param>
+    /// <returns><see langword="true"/> when a dedicated fused decode kernel exists.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool SupportsFusedDecode(QuantizationType qt) =>
+        qt is QuantizationType.F32 or QuantizationType.F16 || GetComputeRowsFn(qt) != null;
 
     /// <summary>Returns per-row weight block bytes for the given quant type.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -399,12 +420,9 @@ public static unsafe partial class MatMul
             return;
         }
 
-        if (preQuantInput != null)
+        if (preQuantInput != null && GetComputeRowsFn(qt) != null)
         {
             // Pre-quantized input available and format-compatible → dispatch via ComputeRows
-            var fn = GetComputeRowsFn(qt);
-            if (fn == null) return;
-
             int blockCount = GetBlockCount(k, qt);
             var ctx = new FusedDecode2Ctx
             {
@@ -426,10 +444,48 @@ public static unsafe partial class MatMul
                 case QuantizationType.Q4_K: GemvQ4_K(weights, input, result, m, k, pool); break;
                 case QuantizationType.Q5_K: GemvQ5_K(weights, input, result, m, k, pool); break;
                 case QuantizationType.Q6_K: GemvQ6_K(weights, input, result, m, k, pool); break;
+                case QuantizationType.I2_S: GemvI2_S(weights, input, result, m, k, pool); break;
+                case QuantizationType.PQ2_0: GemvPQ2_0(weights, input, result, m, k, pool); break;
+                case QuantizationType.MXFP4: GemvMxfp4(weights, input, result, m, k, pool); break;
                 default:
-                    throw new NotSupportedException(
-                        $"Fused decode does not support {qt}. Use standard Gemm path.");
+                    // No dedicated GEMV for this format. Rather than fail the whole decode step,
+                    // dequantize row-by-row and dot — the same last-resort path the MoE MLP uses.
+                    // Callers with a full GEMM should have gated on SupportsFusedDecode and never
+                    // reach here; this exists so the kernel API is total instead of throwing.
+                    GemvDequantRows(weights, qt, input, result, m, k);
+                    break;
             }
+        }
+    }
+
+    /// <summary>
+    /// Last-resort GEMV for weight formats without a dedicated vec_dot kernel: dequantize each
+    /// weight row to F32 and take a dot product against the input.
+    /// </summary>
+    /// <param name="weights">Quantized weight matrix, row-major, <paramref name="m"/> rows of <paramref name="k"/> elements.</param>
+    /// <param name="qt">Weight quantization type.</param>
+    /// <param name="x">Input vector of length <paramref name="k"/>.</param>
+    /// <param name="y">Output vector of length <paramref name="m"/>.</param>
+    /// <param name="m">Number of output rows.</param>
+    /// <param name="k">Number of input elements per row.</param>
+    internal static void GemvDequantRows(byte* weights, QuantizationType qt, float* x, float* y,
+                                         int m, int k)
+    {
+        long rowBytes = Dequantize.RowByteSize(k, qt);
+        float[] rowBuf = ArrayPool<float>.Shared.Rent(k);
+        try
+        {
+            var rowSpan = rowBuf.AsSpan(0, k);
+            var xSpan = new ReadOnlySpan<float>(x, k);
+            for (int i = 0; i < m; i++)
+            {
+                Dequantize.ToFloat32((nint)weights + (nint)(i * rowBytes), k, qt, rowSpan);
+                y[i] = TensorPrimitives.Dot((ReadOnlySpan<float>)rowSpan, xSpan);
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(rowBuf);
         }
     }
 }

@@ -1235,11 +1235,16 @@ public sealed unsafe class TransformerModel : IModel
             // re-use the buffer for stage 1. Pre-LoRA-Q8_0 this was scoped
             // inside each sub-branch.
             byte* preQuantNormQkv = null;
-            // The fused decode kernels don't support I2_S/PQ2_0 (both ternary, per-group or
-            // per-tensor scaled); route ternary weights through the standard (unfused)
-            // projection path, which dispatches to the dedicated ternary GEMV.
+            // The fused decode kernels only cover the formats with a dedicated ComputeRows
+            // implementation. Everything else (ternary, K-quants without a fused kernel, all the
+            // IQ formats, BF16, MXFP4, …) routes through the standard unfused projection path
+            // below, which has a complete dispatch table plus a dequantize fallback. Asking the
+            // kernel via SupportsFusedDecode keeps this in step with the kernel's own tables
+            // rather than duplicating a type list that goes stale.
             if (seqLen == 1 && _threadPool != null && !adapterActive
-                && lw.QQuantType != QuantizationType.I2_S && lw.QQuantType != QuantizationType.PQ2_0)
+                && MatMul.SupportsFusedDecode(lw.QQuantType)
+                && MatMul.SupportsFusedDecode(lw.KQuantType)
+                && MatMul.SupportsFusedDecode(lw.VQuantType))
             {
                 // Decode path: try fused RmsNorm+Quantize (skips normOut intermediate)
                 byte* preQuantNorm = null;
@@ -1596,9 +1601,11 @@ public sealed unsafe class TransformerModel : IModel
             // so the LoRA delta call site can reuse the activation Q8_0
             // buffer for stage 1.
             byte* preQuantFfnHoisted = null;
-            // I2_S/PQ2_0 (both ternary) are unsupported by the fused decode kernels — use the unfused path.
+            // Same capability gate as Q/K/V: formats without a fused decode kernel take the
+            // standard unfused projection path instead of failing.
             if (seqLen == 1 && _threadPool != null && !ffnAdapterActive
-                && lw.GateQuantType != QuantizationType.I2_S && lw.GateQuantType != QuantizationType.PQ2_0)
+                && MatMul.SupportsFusedDecode(lw.GateQuantType)
+                && MatMul.SupportsFusedDecode(lw.UpQuantType))
             {
                 // Decode path: try fused RmsNorm+Quantize (skips normOut intermediate)
                 byte* preQuantFfn = null;
