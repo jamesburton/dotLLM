@@ -1,3 +1,4 @@
+using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Models;
@@ -26,6 +27,58 @@ public static class CudaModelLoader
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var model = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId, ptxDir);
         return (model, gguf, config);
+    }
+
+    /// <summary>
+    /// Creates the architecture-appropriate CUDA <see cref="IModel"/> for an already-opened
+    /// GGUF file. This is THE per-architecture CUDA dispatch point — the mirror of
+    /// <see cref="ModelLoader.CreateCpuModelFromGguf"/>, and CLI commands plus the server call
+    /// it so hybrid architectures (Qwen3MoeHybrid / Qwen3HybridDense Gated-DeltaNet layers)
+    /// route to their dedicated loaders instead of the plain
+    /// <see cref="CudaTransformerModel"/>, whose tensor naming they do not follow (e.g. a GDN
+    /// layer has no <c>attn_output.weight</c>, so the plain loader fails with
+    /// "blk.0.attn_output.weight not present" — issue #259).
+    /// </summary>
+    /// <param name="gguf">An opened GGUF file. Must remain alive for the lifetime of the model.</param>
+    /// <param name="config">Model configuration extracted from <paramref name="gguf"/>.</param>
+    /// <param name="deviceId">GPU device ordinal (0-based).</param>
+    /// <param name="ptxDir">Directory containing compiled PTX files. Null for auto-detect.
+    /// Honoured only by the plain <see cref="CudaTransformerModel"/> path; the hybrid loaders
+    /// auto-detect.</param>
+    /// <returns>
+    /// The loaded CUDA model together with a factory for the KV-cache it expects. The factory is
+    /// returned rather than left to the caller because each architecture needs its own concrete
+    /// cache type and there is no common <c>CreateKvCache</c> interface — capturing it here keeps
+    /// the pairing in one place instead of forcing every call site to re-switch on the type.
+    /// </returns>
+    public static (IModel Model, Func<int, IKvCache> KvCacheFactory) CreateFromGguf(
+        GgufFile gguf, ModelConfig config, int deviceId = 0, string? ptxDir = null)
+    {
+        ArgumentNullException.ThrowIfNull(gguf);
+        ArgumentNullException.ThrowIfNull(config);
+
+        switch (config.Architecture)
+        {
+            case Architecture.Qwen3HybridDense:
+            {
+                var dense = Architectures.CudaQwen3HybridDenseTransformerModel
+                    .LoadFromGguf(gguf, config, deviceId);
+                return (dense, size => dense.CreateKvCache(size));
+            }
+
+            case Architecture.Qwen3MoeHybrid:
+            {
+                var moe = Architectures.CudaQwen3MoeHybridTransformerModel
+                    .LoadFromGguf(gguf, config, deviceId);
+                return (moe, size => moe.CreateKvCache(size));
+            }
+
+            default:
+            {
+                var model = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId, ptxDir);
+                return (model, size => model.CreateKvCache(size));
+            }
+        }
     }
 
     /// <summary>

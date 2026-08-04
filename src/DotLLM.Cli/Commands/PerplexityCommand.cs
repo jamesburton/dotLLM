@@ -5,7 +5,7 @@ using DotLLM.Core.Evaluation;
 using DotLLM.Core.Models;
 using DotLLM.Engine;
 using DotLLM.Engine.Evaluation;
-using DotLLM.Models.Architectures;
+using DotLLM.Models;
 using DotLLM.Models.Evaluation;
 using DotLLM.Models.Gguf;
 using Spectre.Console;
@@ -155,8 +155,11 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         {
             case "cuda":
             {
-                var cudaModel = DotLLM.Cuda.CudaTransformerModel.LoadFromGguf(gguf, config, gpuId);
-                model = cudaModel;
+                // Shared per-architecture CUDA dispatch — routes hybrid architectures
+                // (Qwen3MoeHybrid, Qwen3HybridDense) to their dedicated loaders. The plain
+                // CudaTransformerModel loader fails on them with
+                // "blk.0.attn_output.weight not present" (issue #259).
+                (model, _) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId);
                 forwardDeviceId = gpuId;
                 deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
                 break;
@@ -166,7 +169,8 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             {
                 var vkDevice = DotLLM.Vulkan.VulkanDevice.Create();
                 ownedDevice = vkDevice;
-                model = DotLLM.Vulkan.VulkanTransformerModel.LoadFromGguf(
+                // Shared per-architecture Vulkan dispatch — see the CPU/CUDA branches (#259).
+                (model, _) = DotLLM.Vulkan.VulkanModelLoader.CreateFromGguf(
                     vkDevice, gguf, config, ResolveSpvDir());
                 forwardDeviceId = 0;
                 deviceLabel = vkDevice.DeviceName;
@@ -175,7 +179,12 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
 
             default:
             {
-                model = TransformerModel.LoadFromGguf(gguf, config, new ThreadingConfig(settings.Threads));
+                // Shared per-architecture CPU dispatch — routes hybrid architectures
+                // (Nemotron-H, Qwen3MoeHybrid, Qwen3HybridDense) to their dedicated loaders
+                // rather than the plain TransformerModel, whose tensor naming they do not
+                // follow (a GDN layer has no attn_output.weight — issue #259).
+                model = ModelLoader.CreateCpuModelFromGguf(
+                    gguf, config, new ThreadingConfig(settings.Threads));
                 forwardDeviceId = -1;
                 deviceLabel = $"cpu-{new ThreadingConfig(settings.Threads).EffectiveThreadCount}t";
                 break;
