@@ -127,6 +127,9 @@ public static unsafe partial class Dequantize
             case QuantizationType.Q8_0:
                 DequantizeQ8_0(src, elementCount, dest);
                 break;
+            case QuantizationType.Q4_0:
+                DequantizeQ4_0Scalar(src, elementCount, dest);
+                break;
             case QuantizationType.Q5_0:
                 DequantizeQ5_0(src, elementCount, dest);
                 break;
@@ -317,6 +320,42 @@ public static unsafe partial class Dequantize
 
             outIdx += Mxfp4GroupSize;
             blockBase += Mxfp4BlockBytes;
+        }
+    }
+
+    // ──────────────────── Q4_0 ────────────────────
+    /// <summary>
+    /// Q4_0 scalar dequant. Block layout (18 bytes, 32 elements):
+    /// <c>d(Half@0), qs[16]@2</c>. Formula: <c>value = d * (nibble - 8)</c>.
+    /// </summary>
+    /// <remarks>
+    /// Nibble ordering follows llama.cpp <c>dequantize_row_q4_0</c>: within byte <c>j</c> the low
+    /// nibble is element <c>j</c> and the high nibble is element <c>j + 16</c> — the two halves of
+    /// the block are interleaved by nibble, not by adjacent pairs.
+    /// </remarks>
+    [SkipLocalsInit]
+    internal static void DequantizeQ4_0Scalar(nint src, long elementCount, Span<float> dest)
+    {
+        if (elementCount % Q8_0GroupSize != 0)
+            throw new ArgumentException(
+                $"Q4_0 element count must be a multiple of {Q8_0GroupSize}, got {elementCount}",
+                nameof(elementCount));
+        long blockCount = elementCount / Q8_0GroupSize;
+        byte* blockBase = (byte*)src;
+        int outIdx = 0;
+        for (long b = 0; b < blockCount; b++)
+        {
+            float d = (float)Unsafe.ReadUnaligned<Half>(blockBase);
+            byte* qs = blockBase + 2;
+            for (int j = 0; j < 16; j++)
+            {
+                int lo = qs[j] & 0xF;
+                int hi = (qs[j] >> 4) & 0xF;
+                dest[outIdx + j]      = d * (lo - 8);
+                dest[outIdx + j + 16] = d * (hi - 8);
+            }
+            outIdx += Q8_0GroupSize;
+            blockBase += Q4_0BlockBytes;
         }
     }
 
