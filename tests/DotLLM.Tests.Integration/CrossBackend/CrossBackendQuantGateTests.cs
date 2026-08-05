@@ -273,10 +273,16 @@ public sealed class CrossBackendQuantGateTests
     /// "ok" at 1e11 perplexity).
     /// </summary>
     /// <remarks>
-    /// Expected to be RED on today's <c>dev</c> for the 14 types #257 lists (fused decode throws
-    /// "does not support &lt;TYPE&gt;. Use standard Gemm path" with no automatic GEMM fallback).
-    /// That is the gate working as intended - #257 explicitly asks for a test that fails without
-    /// its fix, "the reason this reached dev is that no test loads a Q4_0 model end-to-end."
+    /// #257 describes 14 types (including <c>Q4_1</c>/<c>Q5_1</c>/<c>Q2_K</c>/<c>Q3_K</c> and every
+    /// IQ2_*/IQ3_* type) failing CPU decode with "does not support &lt;TYPE&gt;. Use standard Gemm
+    /// path" and no automatic GEMM fallback, and #255 describes CPU Q4_0 throwing "Unsupported
+    /// quantization type" on load. Neither reproduced when this gate was run against the
+    /// <c>origin/dev</c> commit this branch forked from (2026-08) - every one of the 21 types with
+    /// a fixture completed CPU decode and produced a finite continuation NLL. Either both issues
+    /// were already fixed upstream of this fork, or the affected path differs from what those
+    /// issues describe; either way, this test is the gate that would go RED again if either
+    /// regressed, which is the point - #257 explicitly asks for a test that fails without its fix,
+    /// "the reason this reached dev is that no test loads a Q4_0 model end-to-end."
     /// </remarks>
     [Theory]
     [MemberData(nameof(AllGateTypeCases))]
