@@ -86,17 +86,21 @@ void main() {
         float scale = readGroupScale(groupByteBase);
         uint codeByteOff = groupByteBase + 2u + gp;
 
+        // Ascending bit offsets {0,2,4,6} -> consecutive elements {4*gp,+1,+2,+3} — verified
+        // against PrismML's reference dequantize_row_q2_0 (issue #269 follow-up, 2026-08-05).
+        // NOT the strided {gp,+32,+64,+96} layout this shader previously assumed — see
+        // DotLLM.Cpu/Kernels/Dequantize.cs's DequantizePQ2_0 doc comment for the full writeup.
         uint pk = readByte(codeByteOff);
-        float c0 = float(int((pk >> 6u) & 3u) - 1);
-        float c1 = float(int((pk >> 4u) & 3u) - 1);
-        float c2 = float(int((pk >> 2u) & 3u) - 1);
-        float c3 = float(int( pk        & 3u) - 1);
+        float c0 = float(int( pk        & 3u) - 1);
+        float c1 = float(int((pk >> 2u) & 3u) - 1);
+        float c2 = float(int((pk >> 4u) & 3u) - 1);
+        float c3 = float(int((pk >> 6u) & 3u) - 1);
 
-        uint xBase = g * PQ2_GROUP_SIZE + gp;
+        uint xBase = g * PQ2_GROUP_SIZE + 4u * gp;
         acc += scale * (c0 * x[xBase]
-                       + c1 * x[xBase + 32u]
-                       + c2 * x[xBase + 64u]
-                       + c3 * x[xBase + 96u]);
+                       + c1 * x[xBase + 1u]
+                       + c2 * x[xBase + 2u]
+                       + c3 * x[xBase + 3u]);
     }
 
     partials[tid] = acc;
