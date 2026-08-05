@@ -3555,32 +3555,7 @@ public sealed unsafe class TransformerModel : IModel
         else if (qt == QuantizationType.PQ2_0)
             MatMul.GemvPQ2_0((byte*)weights, x, y, m, k, _threadPool);
         else
-            GemvDequantFallback(weights, qt, x, y, m, k);
-    }
-
-    /// <summary>
-    /// Fallback GEMV for quant types without dedicated vec_dot kernels.
-    /// Dequantizes one weight row at a time and computes float dot product.
-    /// Correct but slower than fused kernels.
-    /// </summary>
-    private static void GemvDequantFallback(nint weights, QuantizationType qt, float* x, float* y, int m, int k)
-    {
-        long rowBytes = Dequantize.RowByteSize(k, qt);
-        float[] rowBuf = ArrayPool<float>.Shared.Rent(k);
-        try
-        {
-            var rowSpan = rowBuf.AsSpan(0, k);
-            var xSpan = new ReadOnlySpan<float>(x, k);
-            for (int i = 0; i < m; i++)
-            {
-                Dequantize.ToFloat32(weights + i * (nint)rowBytes, k, qt, rowSpan);
-                y[i] = TensorPrimitives.Dot(new ReadOnlySpan<float>(rowBuf, 0, k), xSpan);
-            }
-        }
-        finally
-        {
-            ArrayPool<float>.Shared.Return(rowBuf);
-        }
+            MatMul.GemvDequantRows((byte*)weights, qt, x, y, m, k, _threadPool);
     }
 
     /// <summary>
@@ -3612,20 +3587,11 @@ public sealed unsafe class TransformerModel : IModel
         else if (qt == QuantizationType.PQ2_0)
             MatMul.GemmPQ2_0((byte*)weights, b, c, m, k, n, _threadPool);
         else
-            GemmDequantFallback(weights, qt, b, c, m, k, n);
-    }
-
-    /// <summary>
-    /// Fallback GEMM for quant types without dedicated vec_dot kernels.
-    /// Iterates per input row, calling <see cref="GemvDequantFallback"/> for each.
-    /// </summary>
-    private static void GemmDequantFallback(nint weights, QuantizationType qt, float* b, float* c,
-                                            int m, int k, int n)
-    {
-        for (int t = 0; t < n; t++)
-        {
-            GemvDequantFallback(weights, qt, b + t * k, c + t * m, m, k);
-        }
+            // Formats with no dedicated vec_dot kernel (BF16, Q4_0/Q4_1/Q5_1, Q2_K/Q3_K, the IQ
+            // family). MatMul.GemmDequantRows decodes each weight row once and reuses it across
+            // all n columns, row-parallel over the pool — bit-identical to the serial per-token
+            // fallback it replaces, just not single-threaded any more (#263).
+            MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, _threadPool);
     }
 
     /// <summary>

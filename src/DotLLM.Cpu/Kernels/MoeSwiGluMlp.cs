@@ -978,36 +978,11 @@ public static unsafe partial class MoeSwiGluMlp
                 return;
             default:
                 // Fallback for quant types without a direct kernel (Q4_0, Q4_1, Q5_1, IQ*, BF16).
-                // Dequant per row then F32 dot. Matches GemmDequantFallback in the model.
-                GemmDequantFallback(weights, qt, b, c, m, k, n);
+                // Dequant per row then F32 dot, row-parallel and dequantizing each row once for
+                // all n columns (#263). Shares MatMul.GemmDequantRows with the model's own
+                // fallback so both stay bit-identical.
+                MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, pool);
                 return;
-        }
-    }
-
-    /// <summary>
-    /// Per-row dequant + F32 dot fallback for quant types without a direct GEMM kernel.
-    /// </summary>
-    private static void GemmDequantFallback(
-        nint weights, QuantizationType qt, float* b, float* c, int m, int k, int n)
-    {
-        long rowBytes = Dequantize.RowByteSize(k, qt);
-        float[] rowBuf = ArrayPool<float>.Shared.Rent(k);
-        try
-        {
-            var rowSpan = rowBuf.AsSpan(0, k);
-            for (int t = 0; t < n; t++)
-            {
-                var xSpan = new ReadOnlySpan<float>(b + t * k, k);
-                for (int i = 0; i < m; i++)
-                {
-                    Dequantize.ToFloat32(weights + i * (nint)rowBytes, k, qt, rowSpan);
-                    c[t * m + i] = TensorPrimitives.Dot(new ReadOnlySpan<float>(rowBuf, 0, k), xSpan);
-                }
-            }
-        }
-        finally
-        {
-            ArrayPool<float>.Shared.Return(rowBuf);
         }
     }
 
