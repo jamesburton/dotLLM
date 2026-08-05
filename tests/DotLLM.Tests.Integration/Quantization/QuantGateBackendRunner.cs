@@ -41,10 +41,12 @@ public static class QuantGateCorpus
             ".docs", "corpora", "wikitext2-test.raw"));
 }
 
-/// <summary>Both legs of one (fixture, backend) cell.</summary>
-/// <param name="Perplexity">Teacher-forced result — the prefill/GEMM leg.</param>
-/// <param name="DecodeTokens">Greedy token ids emitted, in order — the decode/GEMV leg.</param>
-/// <param name="DecodeLogits">Full logit vector at each decode step.</param>
+/// <summary>All three legs of one (fixture, backend) cell.</summary>
+/// <param name="Perplexity">Teacher-forced result over the corpus — the bulk prefill/GEMM leg.</param>
+/// <param name="DecodeTokens">Argmax id from each prompt's uncached forward — the short-context leg.</param>
+/// <param name="DecodeLogits">Full logit vector behind each <see cref="DecodeTokens"/> entry.</param>
+/// <param name="KvDecodeTokens">Argmax id from each prompt's single cached <c>seqLen == 1</c> step — the decode/GEMV leg.</param>
+/// <param name="KvDecodeLogits">Full logit vector behind each <see cref="KvDecodeTokens"/> entry.</param>
 /// <remarks>
 /// <para>
 /// <b>Do not compare two runs by record equality, and never compare
@@ -60,26 +62,50 @@ public static class QuantGateCorpus
 /// <b>Comparable across backends:</b> <see cref="PerplexityResult.MeanNegativeLogLikelihood"/>,
 /// <see cref="PerplexityResult.Perplexity"/> and <see cref="PerplexityResult.ScoredTokens"/> (the
 /// last of which must <i>match</i> for the others to mean anything), plus
-/// <see cref="DecodeTokens"/> and <see cref="DecodeLogits"/>.
+/// <see cref="DecodeTokens"/>, <see cref="DecodeLogits"/>, <see cref="KvDecodeTokens"/> and
+/// <see cref="KvDecodeLogits"/>.
+/// </para>
+/// <para>
+/// <b>Why three legs and not two.</b> The gate was specified with a prefill leg and a decode leg
+/// because the original matrix caught a BF16 defect that passed perplexity and failed generation.
+/// But both of the first two legs are GEMM-shaped: the CPU fused-decode/GEMV path is gated on
+/// <c>seqLen == 1</c> (<c>TransformerModel.cs:1244</c> and <c>:1606</c>), and neither a corpus
+/// window nor a whole-prompt forward ever has a sequence length of one. Without
+/// <see cref="KvDecodeTokens"/> the gate would claim two legs and deliver one of them twice,
+/// leaving the GEMV path exactly as unexercised as it was before #256.
 /// </para>
 /// </remarks>
-public sealed record QuantGateRun(PerplexityResult Perplexity, int[] DecodeTokens, float[][] DecodeLogits)
+public sealed record QuantGateRun(
+    PerplexityResult Perplexity,
+    int[] DecodeTokens, float[][] DecodeLogits,
+    int[] KvDecodeTokens, float[][] KvDecodeLogits)
 {
     /// <summary>
-    /// Whether the decode leg emitted more than one distinct token, and so actually discriminates.
+    /// Whether the short-context leg produced more than one distinct token, and so actually
+    /// discriminates at the token level.
     /// </summary>
     /// <remarks>
-    /// Decoding is greedy with no repetition penalty (it must stay deterministic to be comparable),
-    /// so a small model can emit EOS immediately or lock into a repeat. Every step then carries the
-    /// same id, and a token-level cross-backend comparison becomes vacuously equal — passing the
-    /// decode/GEMV leg without exercising it, which is the exact failure the two-leg design exists to
-    /// prevent. Callers should assert on this rather than assume the leg was informative; a false
-    /// value means "choose a different decode prompt", not "the backends agree".
-    /// <para>Note that <see cref="DecodeLogits"/> stays discriminating either way — identical tokens
-    /// can still sit on materially different logit vectors. This flag is about the token-level
-    /// comparison only.</para>
+    /// <para>
+    /// A token-level comparison across backends is vacuous when every entry carries the same id:
+    /// the two sides compare equal for free, and the leg passes without exercising anything.
+    /// </para>
+    /// <para>
+    /// <b>This is why the legs score one step each from several prompts rather than several
+    /// autoregressive steps from one prompt.</b> Measured: on the <c>--pure</c> Q2_K and Q3_K 1B
+    /// fixtures, greedy self-feedback is a fixed point — feeding the model's own argmax back makes
+    /// it re-emit that id forever. A search over ten candidate prompts found the degeneracy on
+    /// both fixtures for all ten, so no prompt fixes it. But the <i>first</i> token varies richly
+    /// with the prompt (Q2_K produced 67585, 55934, 127327, 37424, … across the candidates), so
+    /// independent single steps from distinct prompts discriminate where an autoregressive chain
+    /// cannot. The chosen quad yields four distinct ids on all 21 fixtures.
+    /// </para>
+    /// <para>Note that the logit vectors stay discriminating either way — identical tokens can sit
+    /// on materially different logit vectors. This flag is about the token-level comparison only.</para>
     /// </remarks>
     public bool DecodeIsInformative => DecodeTokens.Distinct().Count() > 1;
+
+    /// <summary>Whether the cached <c>seqLen == 1</c> leg produced more than one distinct token.</summary>
+    public bool KvDecodeIsInformative => KvDecodeTokens.Distinct().Count() > 1;
 }
 
 /// <summary>
@@ -151,11 +177,12 @@ public static class QuantGateBackendRunner
     /// <exception cref="ArgumentNullException"><paramref name="entry"/> is <see langword="null"/>.</exception>
     public static QuantGateRun Run(
         QuantLadderEntry entry, QuantGateBackend backend, string corpusPath,
-        int corpusTokens, string decodePrompt, int decodeSteps)
+        int corpusTokens, IReadOnlyList<string> decodePrompts)
     {
         ArgumentNullException.ThrowIfNull(entry);
         ArgumentException.ThrowIfNullOrEmpty(corpusPath);
-        ArgumentOutOfRangeException.ThrowIfLessThan(decodeSteps, 1);
+        ArgumentNullException.ThrowIfNull(decodePrompts);
+        ArgumentOutOfRangeException.ThrowIfLessThan(decodePrompts.Count, 1);
 
         using GgufFile gguf = GgufFile.Open(entry.FilePath);
         ModelConfig config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -165,21 +192,31 @@ public static class QuantGateBackendRunner
         IDisposable? ownedDevice = null;
         int deviceId;
 
+        // Captured rather than discarded: each architecture needs its own concrete cache type and
+        // there is no common CreateKvCache interface, so the loaders hand the pairing back here.
+        // The cached seqLen == 1 leg cannot be run without it.
+        Func<int, DotLLM.Core.Attention.IKvCache> kvCacheFactory;
+
         switch (backend)
         {
             case QuantGateBackend.Cuda:
-                (model, _) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, 0);
+                (model, kvCacheFactory) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, 0);
                 deviceId = 0;
                 break;
 
             case QuantGateBackend.Vulkan:
-                (model, ownedDevice) = LoadVulkan(gguf, config);
+                (model, ownedDevice, kvCacheFactory) = LoadVulkan(gguf, config);
                 deviceId = 0;
                 break;
 
             default:
                 model = ModelLoader.CreateCpuModelFromGguf(gguf, config, new ThreadingConfig(0));
                 deviceId = -1;
+
+                // The CPU transformer has no CreateKvCache of its own; SimpleKvCache is the dense
+                // cache its Forward overload consumes, sized from the same config the model loaded.
+                kvCacheFactory = maxSeqLen => new DotLLM.Engine.KvCache.SimpleKvCache(
+                    DotLLM.Core.Attention.KvGeometry.FromConfig(config), maxSeqLen);
                 break;
         }
 
@@ -213,8 +250,10 @@ public static class QuantGateBackendRunner
                 pplModel.ResetState();
 
                 var (decodeTokens, decodeLogits) = RunDecode(
-                    model, tokenizer, deviceId, decodePrompt, decodeSteps);
-                return new QuantGateRun(ppl, decodeTokens, decodeLogits);
+                    model, tokenizer, deviceId, decodePrompts);
+                var (kvTokens, kvLogits) = RunKvDecode(
+                    model, tokenizer, deviceId, kvCacheFactory, decodePrompts);
+                return new QuantGateRun(ppl, decodeTokens, decodeLogits, kvTokens, kvLogits);
             }
             finally
             {
@@ -246,14 +285,15 @@ public static class QuantGateBackendRunner
     /// <i>returned</i>, which makes the ownership transfer visible to the caller and to the
     /// IDisposable analyzers.</para>
     /// </remarks>
-    private static (IModel Model, IDisposable Device) LoadVulkan(GgufFile gguf, ModelConfig config)
+    private static (IModel Model, IDisposable Device, Func<int, DotLLM.Core.Attention.IKvCache> KvCacheFactory)
+        LoadVulkan(GgufFile gguf, ModelConfig config)
     {
         var device = DotLLM.Vulkan.VulkanDevice.Create();
         try
         {
-            (IModel model, _) = DotLLM.Vulkan.VulkanModelLoader.CreateFromGguf(
-                device, gguf, config, ResolveSpvDir());
-            return (model, device);
+            (IModel model, Func<int, DotLLM.Core.Attention.IKvCache> kvCacheFactory) =
+                DotLLM.Vulkan.VulkanModelLoader.CreateFromGguf(device, gguf, config, ResolveSpvDir());
+            return (model, device, kvCacheFactory);
         }
         catch (Exception)
         {
@@ -262,52 +302,200 @@ public static class QuantGateBackendRunner
         }
     }
 
-    /// <summary>Greedy-decodes <paramref name="steps"/> tokens, capturing each step's logits.</summary>
+    /// <summary>
+    /// Greedy-decodes several candidate prompts against one fixture on the CPU reference path,
+    /// loading the model once.
+    /// </summary>
+    /// <param name="entry">Fixture to load.</param>
+    /// <param name="prompts">Candidate decode prompts to try.</param>
+    /// <returns>The argmax id each prompt produced, in the order given.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="entry"/> or <paramref name="prompts"/> is <see langword="null"/>.</exception>
+    /// <remarks>
+    /// <para>
+    /// Exists to choose <c>CrossBackendQuantGateTests.DecodePrompts</c> by measurement. The gate
+    /// requires the CPU reference to produce more than one distinct id across its steps: when every
+    /// step carries the same id, the top-1 arm compares equal for free and "the backends agree"
+    /// becomes a statement about the prompts rather than about the kernels.
+    /// </para>
+    /// <para>
+    /// <b>CPU only, deliberately.</b> The reference leg is the one that decides whether a prompt
+    /// set discriminates, so a GPU arm here would add load cost and device-lifetime handling
+    /// without changing the answer. It also means this probe runs under <c>Category=Fixtures</c>,
+    /// on a machine with the ladder but no GPU.
+    /// </para>
+    /// <para>
+    /// The model is loaded once and every prompt scored against it, because loading dominates: a 1B
+    /// fixture's cold load runs to minutes while a handful of short forwards take seconds.
+    /// </para>
+    /// </remarks>
+    public static IReadOnlyList<int> ProbeDecodePrompts(
+        QuantLadderEntry entry, IReadOnlyList<string> prompts)
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(prompts);
+        ArgumentOutOfRangeException.ThrowIfLessThan(prompts.Count, 1);
+
+        using GgufFile gguf = GgufFile.Open(entry.FilePath);
+        ModelConfig config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        ITokenizer tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+
+        IModel model = ModelLoader.CreateCpuModelFromGguf(gguf, config, new ThreadingConfig(0));
+        try
+        {
+            (int[] tokens, _) = RunDecode(model, tokenizer, -1, prompts);
+            return tokens;
+        }
+        finally
+        {
+            model.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Scores one uncached forward per prompt and returns each one's argmax and full logit row.
+    /// </summary>
     /// <param name="model">Loaded model; not owned here.</param>
     /// <param name="tokenizer">Tokenizer belonging to the same GGUF.</param>
     /// <param name="deviceId">Forward-pass device; <c>-1</c> is CPU.</param>
-    /// <param name="prompt">Prompt to seed the context with.</param>
-    /// <param name="steps">Number of greedy steps.</param>
-    /// <returns>Emitted ids and the full logit vector behind each.</returns>
+    /// <param name="prompts">Prompts to score, one forward each.</param>
+    /// <returns>The argmax id per prompt and the full logit vector behind each.</returns>
+    /// <remarks>
+    /// <para>
+    /// <b>One step per prompt, not several steps per prompt.</b> Autoregressive greedy decode is a
+    /// fixed point on a near-destroyed <c>--pure</c> fixture: feeding the model's own argmax back
+    /// makes it re-emit that id forever. Measured over ten candidate prompts, Q2_K and Q3_K on
+    /// Llama-3.2-1B were degenerate for every one of them, so no choice of prompt avoids it. The
+    /// first id, however, varies richly with the prompt, so independent forwards from distinct
+    /// prompts discriminate where a chain cannot.
+    /// </para>
+    /// <para>
+    /// No KV-cache here on purpose — this leg is identical across all three backends, so a
+    /// cache-management difference cannot be scored as a kernel difference.
+    /// <see cref="RunKvDecode"/> is the leg that deliberately does use one.
+    /// </para>
+    /// </remarks>
     private static (int[] Tokens, float[][] Logits) RunDecode(
-        IModel model, ITokenizer tokenizer, int deviceId, string prompt, int steps)
+        IModel model, ITokenizer tokenizer, int deviceId, IReadOnlyList<string> prompts)
     {
-        int[] promptTokens = tokenizer.Encode(prompt);
-        var context = new List<int>(promptTokens);
-        var emitted = new int[steps];
-        var logits = new float[steps][];
+        var emitted = new int[prompts.Count];
+        var logits = new float[prompts.Count][];
         int vocab = model.Config.VocabSize;
 
-        for (int step = 0; step < steps; step++)
+        for (int i = 0; i < prompts.Count; i++)
         {
-            var positions = new int[context.Count];
-            for (int i = 0; i < positions.Length; i++)
-                positions[i] = i;
+            int[] tokens = tokenizer.Encode(prompts[i]);
+            var positions = new int[tokens.Length];
+            for (int p = 0; p < positions.Length; p++)
+                positions[p] = p;
 
-            // Each step is scored as an independent sequence from position 0, so any recurrent state
-            // the previous step left behind must go first — see #261.
+            // Each prompt is an independent sequence from position 0, so any recurrent state the
+            // previous one left behind must go first — see #261.
             model.ResetSequenceState();
 
-            // Full re-prefill each step rather than an incremental KV step: it is slower, but it
-            // is identical across all three backends, and a KV-cache difference would otherwise be
-            // scored as a kernel difference.
-            using ITensor output = model.Forward(
-                System.Runtime.InteropServices.CollectionsMarshal.AsSpan(context), positions, deviceId);
+            using ITensor output = model.Forward(tokens, positions, deviceId);
             float[] row = LastRowOf(output, vocab);
 
-            int best = 0;
-            for (int v = 1; v < row.Length; v++)
-            {
-                if (row[v] > row[best])
-                    best = v;
-            }
-
-            logits[step] = row;
-            emitted[step] = best;
-            context.Add(best);
+            logits[i] = row;
+            emitted[i] = ArgMax(row);
         }
 
         return (emitted, logits);
+    }
+
+    /// <summary>
+    /// Scores one cached single-token step per prompt — the only leg that reaches the decode/GEMV
+    /// path.
+    /// </summary>
+    /// <param name="model">Loaded model; not owned here.</param>
+    /// <param name="tokenizer">Tokenizer belonging to the same GGUF.</param>
+    /// <param name="deviceId">Forward-pass device; <c>-1</c> is CPU.</param>
+    /// <param name="kvCacheFactory">Backend-appropriate cache factory, from the model's loader.</param>
+    /// <param name="prompts">Prompts to seed each cache with, one cached step each.</param>
+    /// <returns>The argmax id from each cached step and the full logit vector behind it.</returns>
+    /// <remarks>
+    /// <para>
+    /// <b>Why this leg exists.</b> The CPU fused-decode/GEMV kernels are gated on
+    /// <c>seqLen == 1</c> (<c>TransformerModel.cs:1244</c> and <c>:1606</c>). Neither a corpus
+    /// window nor a whole-prompt forward ever has a sequence length of one, so without this leg the
+    /// gate would test GEMM twice and leave GEMV exactly as uncovered as it was before #256 — while
+    /// reporting that it had covered both.
+    /// </para>
+    /// <para>
+    /// <b>The cost, stated plainly.</b> Each backend brings its own concrete cache type, so this
+    /// leg mixes cache-management behaviour into the comparison in a way the other two legs
+    /// deliberately avoid. A disagreement here is therefore weaker evidence about a quantization
+    /// kernel than a disagreement on the other legs: it narrows to "the GEMV path or the cache",
+    /// not to "the GEMV path". That is still strictly better than not exercising the path at all,
+    /// and the prompt-shaped prefill immediately before each step is shared, so a cache that
+    /// disagreed about the <i>prompt</i> would show up on the other legs first.
+    /// </para>
+    /// <para>
+    /// One cached step per prompt rather than several, for the same fixed-point reason as
+    /// <see cref="RunDecode"/>: distinct prompts give distinct contexts, and a chain does not.
+    /// </para>
+    /// </remarks>
+    private static (int[] Tokens, float[][] Logits) RunKvDecode(
+        IModel model, ITokenizer tokenizer, int deviceId,
+        Func<int, DotLLM.Core.Attention.IKvCache> kvCacheFactory, IReadOnlyList<string> prompts)
+    {
+        var emitted = new int[prompts.Count];
+        var logits = new float[prompts.Count][];
+        int vocab = model.Config.VocabSize;
+
+        for (int i = 0; i < prompts.Count; i++)
+        {
+            int[] tokens = tokenizer.Encode(prompts[i]);
+            var positions = new int[tokens.Length];
+            for (int p = 0; p < positions.Length; p++)
+                positions[p] = p;
+
+            model.ResetSequenceState();
+
+            // A fresh cache per prompt: reusing one would carry the previous prompt's keys and
+            // values into this prompt's attention, which is a different measurement entirely.
+            DotLLM.Core.Attention.IKvCache cache = kvCacheFactory(tokens.Length + 1);
+            try
+            {
+                int seed;
+                using (ITensor prefill = model.Forward(tokens, positions, deviceId, cache))
+                    seed = ArgMax(LastRowOf(prefill, vocab));
+
+                // The one call in the whole gate with seqLen == 1. Everything above this line is
+                // setup; this is the measurement.
+                //
+                // Verified to be load-bearing by sabotage: returning the prefill row here instead
+                // of taking this step turns Run_CachedLegIsNotARepeatOfTheUncachedOne red, while
+                // every other assertion in the class stays green. That is the failure mode — GEMV
+                // coverage reported but not performed — and it is caught.
+                using ITensor step = model.Forward(
+                    [seed], [tokens.Length], deviceId, cache);
+                float[] row = LastRowOf(step, vocab);
+
+                logits[i] = row;
+                emitted[i] = ArgMax(row);
+            }
+            finally
+            {
+                (cache as IDisposable)?.Dispose();
+            }
+        }
+
+        return (emitted, logits);
+    }
+
+    /// <summary>Index of the largest element.</summary>
+    /// <param name="row">Logit row to scan.</param>
+    /// <returns>The argmax index.</returns>
+    private static int ArgMax(float[] row)
+    {
+        int best = 0;
+        for (int v = 1; v < row.Length; v++)
+        {
+            if (row[v] > row[best])
+                best = v;
+        }
+
+        return best;
     }
 
     /// <summary>

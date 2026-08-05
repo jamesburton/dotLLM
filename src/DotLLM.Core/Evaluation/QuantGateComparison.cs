@@ -57,14 +57,23 @@ public static class QuantGateComparison
     /// <summary>Environment variable selecting the comparison metric.</summary>
     public const string ModeEnvVar = "DOTLLM_QUANT_GATE_MODE";
 
-    /// <summary>Parses a metric name. <see langword="null"/> or empty selects <see cref="QuantGateMetric.Both"/>.</summary>
+    /// <summary>Parses a metric name. <see langword="null"/> or empty selects <see cref="QuantGateMetric.Nats"/>.</summary>
     /// <param name="raw">Mode name, case-insensitive: <c>perplexity</c>, <c>nats</c> or <c>both</c>.</param>
     /// <returns>The parsed metric.</returns>
     /// <exception cref="ArgumentException">The value is not a recognised mode.</exception>
+    /// <remarks>
+    /// The default is <see cref="QuantGateMetric.Nats"/>, not <see cref="QuantGateMetric.Both"/>, on
+    /// measured evidence from the first full 40-cell sweep: the healthy Q2_K/Vulkan cell sat at
+    /// 0.0192 nats (38% of its bound) while simultaneously reaching 1.935% relative perplexity —
+    /// 97% of the 2% bound. Both numbers describe the same agreement; only the perplexity one was
+    /// nearly tripped, because <c>exp</c> amplifies at the magnitudes a <c>--pure</c> low-bit
+    /// fixture produces. Asserting the amplified arm by default would have made a non-defect the
+    /// first thing to fail. The perplexity spread is still measured and reported on every cell.
+    /// </remarks>
     public static QuantGateMetric ResolveMode(string? raw)
     {
         if (string.IsNullOrWhiteSpace(raw))
-            return QuantGateMetric.Both;
+            return QuantGateMetric.Nats;
 
         // Deliberately throws rather than defaulting: a toggle that silently ignores a typo
         // reports a metric nobody selected, and the run looks like it passed.

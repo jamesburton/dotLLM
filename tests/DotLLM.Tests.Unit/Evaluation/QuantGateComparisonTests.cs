@@ -21,9 +21,15 @@ public sealed class QuantGateComparisonTests
     private static readonly PerplexityResult Q2KCpu = new(7137435.5839, 15.780, 1000, 1);
     private static readonly PerplexityResult Q2KVulkan = new(7001965.5753, 15.761701, 1000, 1);
 
+    /// <summary>
+    /// The unset default is <see cref="QuantGateMetric.Nats"/>. Pinned by a test rather than left
+    /// implicit, because it is the arm the gate asserts when nobody sets the toggle, and the reason
+    /// it is not <c>Both</c> came out of measurement (see <c>ResolveMode</c>'s remarks) rather than
+    /// taste — a silent flip back to <c>Both</c> would re-introduce the amplified perplexity arm.
+    /// </summary>
     [Theory]
-    [InlineData(null, QuantGateMetric.Both)]
-    [InlineData("", QuantGateMetric.Both)]
+    [InlineData(null, QuantGateMetric.Nats)]
+    [InlineData("", QuantGateMetric.Nats)]
     [InlineData("both", QuantGateMetric.Both)]
     [InlineData("BOTH", QuantGateMetric.Both)]
     [InlineData("nats", QuantGateMetric.Nats)]

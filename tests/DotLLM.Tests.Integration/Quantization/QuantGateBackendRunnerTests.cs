@@ -15,9 +15,12 @@ namespace DotLLM.Tests.Integration.Quantization;
 [Collection("QuantLadder")]
 public sealed class QuantGateBackendRunnerTests
 {
-    private const string DecodePrompt = "The capital of France is";
     private const int CorpusTokens = 512;
-    private const int DecodeSteps = 4;
+
+    // The gate's own set, not a restatement: these tests exist to say the runner is trustworthy on
+    // the inputs the gate actually uses, and a private copy would drift silently.
+    private static readonly string[] DecodePrompts = CrossBackendQuantGateTests.DecodePrompts;
+    private static int DecodeSteps => DecodePrompts.Length;
 
     private readonly QuantLadderFixture _ladder;
 
@@ -35,65 +38,120 @@ public sealed class QuantGateBackendRunnerTests
         QuantLadderEntry? entry = RequireQ8Fixture();
 
         QuantGateRun a = QuantGateBackendRunner.Run(
-            entry!, QuantGateBackend.Cpu, QuantGateCorpus.Path,
-            CorpusTokens, DecodePrompt, DecodeSteps);
+            entry!, QuantGateBackend.Cpu, QuantGateCorpus.Path, CorpusTokens, DecodePrompts);
         QuantGateRun b = QuantGateBackendRunner.Run(
-            entry!, QuantGateBackend.Cpu, QuantGateCorpus.Path,
-            CorpusTokens, DecodePrompt, DecodeSteps);
+            entry!, QuantGateBackend.Cpu, QuantGateCorpus.Path, CorpusTokens, DecodePrompts);
 
         Assert.Equal(a.Perplexity.MeanNegativeLogLikelihood, b.Perplexity.MeanNegativeLogLikelihood, 12);
         Assert.Equal(a.DecodeTokens, b.DecodeTokens);
+        Assert.Equal(a.KvDecodeTokens, b.KvDecodeTokens);
 
-        // Tokens alone do not test the decode kernel. Argmax is invariant to any perturbation
-        // smaller than the top-2 logit gap, so a nondeterministic decode GEMV — the exact kernel
-        // this leg exists to cover — would emit identical tokens and pass. Compare the vectors.
-        Assert.Equal(a.DecodeLogits.Length, b.DecodeLogits.Length);
-        for (int step = 0; step < a.DecodeLogits.Length; step++)
+        // Tokens alone do not test the kernels. Argmax is invariant to any perturbation smaller than
+        // the top-2 logit gap, so a nondeterministic GEMV — the exact kernel the cached leg exists
+        // to cover — would emit identical tokens and pass. Compare the vectors, on both legs.
+        AssertBitIdentical("uncached", a.DecodeLogits, b.DecodeLogits);
+        AssertBitIdentical("cached", a.KvDecodeLogits, b.KvDecodeLogits);
+    }
+
+    /// <summary>Asserts two runs' logit rows are bit-identical.</summary>
+    /// <param name="leg">Leg name for failure text.</param>
+    /// <param name="left">First run's rows.</param>
+    /// <param name="right">Second run's rows.</param>
+    private static void AssertBitIdentical(string leg, float[][] left, float[][] right)
+    {
+        Assert.Equal(left.Length, right.Length);
+        for (int step = 0; step < left.Length; step++)
         {
-            float[] left = a.DecodeLogits[step];
-            float[] right = b.DecodeLogits[step];
-            Assert.Equal(left.Length, right.Length);
-            for (int v = 0; v < left.Length; v++)
+            float[] l = left[step];
+            float[] r = right[step];
+            Assert.Equal(l.Length, r.Length);
+            for (int v = 0; v < l.Length; v++)
             {
                 Assert.True(
-                    left[v].Equals(right[v]),
-                    $"decode step {step}, logit {v}: {left[v]:R} != {right[v]:R} across two identical runs.");
+                    l[v].Equals(r[v]),
+                    $"{leg} step {step}, logit {v}: {l[v]:R} != {r[v]:R} across two identical runs.");
             }
         }
     }
 
-    /// <summary>Both legs must actually produce data; an empty decode leg would assert nothing.</summary>
+    /// <summary>All three legs must actually produce data; an empty leg would assert nothing.</summary>
     [SkippableFact]
-    public void Run_ProducesBothLegs()
+    public void Run_ProducesAllThreeLegs()
     {
         QuantLadderEntry? entry = RequireQ8Fixture();
 
         QuantGateRun run = QuantGateBackendRunner.Run(
-            entry!, QuantGateBackend.Cpu, QuantGateCorpus.Path,
-            CorpusTokens, DecodePrompt, DecodeSteps);
+            entry!, QuantGateBackend.Cpu, QuantGateCorpus.Path, CorpusTokens, DecodePrompts);
 
         Assert.True(run.Perplexity.ScoredTokens > 0);
         Assert.True(double.IsFinite(run.Perplexity.MeanNegativeLogLikelihood));
-        Assert.Equal(DecodeSteps, run.DecodeTokens.Length);
-        Assert.Equal(DecodeSteps, run.DecodeLogits.Length);
-        Assert.All(run.DecodeLogits, l => Assert.True(l.Length > 0));
 
-        // A zero-filled or otherwise degenerate row satisfies every length assertion above, so the
-        // content is checked too: real logits are finite and are not all the same value.
-        for (int step = 0; step < run.DecodeLogits.Length; step++)
-        {
-            float[] row = run.DecodeLogits[step];
-            Assert.All(row, v => Assert.True(float.IsFinite(v), $"decode step {step} contains {v}."));
-            Assert.True(
-                row.Distinct().Count() > 1,
-                $"decode step {step}: all {row.Length} logits are {row[0]:R} — the row was never populated.");
-        }
+        AssertLegIsPopulated("uncached", run.DecodeTokens, run.DecodeLogits);
+        AssertLegIsPopulated("cached", run.KvDecodeTokens, run.KvDecodeLogits);
 
-        // Greedy decode on a small model can emit EOS or lock into a repeat, which would make a
-        // later cross-backend token comparison vacuously equal. Surfaced, not assumed.
+        // The prompt set was chosen so this holds on every fixture; surfaced here rather than
+        // assumed, because a vacuous leg passes a cross-backend token comparison for free.
         Assert.True(
             run.DecodeIsInformative,
-            $"decode leg emitted only [{string.Join(", ", run.DecodeTokens)}] — pick a different prompt.");
+            $"uncached leg produced only [{string.Join(", ", run.DecodeTokens)}] — re-run the prompt search.");
+    }
+
+    /// <summary>
+    /// The cached leg must differ from the uncached one, proving it is a distinct measurement.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The cached leg exists to reach the <c>seqLen == 1</c> GEMV path. If it silently degraded
+    /// into repeating the uncached forward — a cache that was never populated, or a step that
+    /// re-submitted the whole prompt — it would return the same logits and every other assertion in
+    /// this class would still pass, while the gate reported GEMV coverage it did not have.
+    /// </para>
+    /// <para>
+    /// The two legs score genuinely different things: the uncached leg reads the logits <i>at</i>
+    /// the prompt's last position, the cached leg reads them one position later, after the prompt's
+    /// own argmax has been appended. So their rows must differ, and identical rows mean the cached
+    /// step did not happen.
+    /// </para>
+    /// </remarks>
+    [SkippableFact]
+    public void Run_CachedLegIsNotARepeatOfTheUncachedOne()
+    {
+        QuantLadderEntry? entry = RequireQ8Fixture();
+
+        QuantGateRun run = QuantGateBackendRunner.Run(
+            entry!, QuantGateBackend.Cpu, QuantGateCorpus.Path, CorpusTokens, DecodePrompts);
+
+        for (int step = 0; step < run.DecodeLogits.Length; step++)
+        {
+            float[] uncached = run.DecodeLogits[step];
+            float[] cached = run.KvDecodeLogits[step];
+            Assert.Equal(uncached.Length, cached.Length);
+            Assert.Contains(
+                Enumerable.Range(0, uncached.Length),
+                i => !uncached[i].Equals(cached[i]));
+        }
+    }
+
+    /// <summary>Asserts one leg returned the expected number of populated, finite logit rows.</summary>
+    /// <param name="leg">Leg name for failure text.</param>
+    /// <param name="tokens">Emitted ids.</param>
+    /// <param name="logits">Logit rows behind them.</param>
+    private static void AssertLegIsPopulated(string leg, int[] tokens, float[][] logits)
+    {
+        Assert.Equal(DecodeSteps, tokens.Length);
+        Assert.Equal(DecodeSteps, logits.Length);
+
+        // A zero-filled or otherwise degenerate row satisfies every length assertion, so the content
+        // is checked too: real logits are finite and are not all the same value.
+        for (int step = 0; step < logits.Length; step++)
+        {
+            float[] row = logits[step];
+            Assert.True(row.Length > 0, $"{leg} step {step}: empty row.");
+            Assert.All(row, v => Assert.True(float.IsFinite(v), $"{leg} step {step} contains {v}."));
+            Assert.True(
+                row.Distinct().Count() > 1,
+                $"{leg} step {step}: all {row.Length} logits are {row[0]:R} — the row was never populated.");
+        }
     }
 
     /// <summary>
@@ -113,10 +171,10 @@ public sealed class QuantGateBackendRunnerTests
         // Two prompts sharing a first token but ending at different positions.
         QuantGateRun longer = QuantGateBackendRunner.Run(
             entry!, QuantGateBackend.Cpu, QuantGateCorpus.Path,
-            CorpusTokens, DecodePrompt, DecodeSteps);
+            CorpusTokens, ["The capital of France is"]);
         QuantGateRun shorter = QuantGateBackendRunner.Run(
             entry!, QuantGateBackend.Cpu, QuantGateCorpus.Path,
-            CorpusTokens, "The capital of", DecodeSteps);
+            CorpusTokens, ["The capital of"]);
 
         float[] a = longer.DecodeLogits[0];
         float[] b = shorter.DecodeLogits[0];
