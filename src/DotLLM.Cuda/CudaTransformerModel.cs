@@ -1,4 +1,4 @@
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
 using System.Buffers;
 using System.Numerics.Tensors;
 using DotLLM.Core.Attention;
@@ -2543,7 +2543,8 @@ public sealed unsafe class CudaTransformerModel : IModel
 
         static bool IsIQuant(QuantizationType qt) =>
             qt is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
-                or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S;
+                or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S
+                or QuantizationType.IQ3_XXS or QuantizationType.IQ3_S or QuantizationType.IQ1_S;
     }
 
     private static bool ShouldUseHighPrecisionForward(CudaWeights weights)
@@ -2571,7 +2572,8 @@ public sealed unsafe class CudaTransformerModel : IModel
         // Higher precision-loss formats benefit from the dequant→F32→dot fallback.
         static bool IsIQuant(QuantizationType qt) =>
             qt is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
-                or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S;
+                or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S
+                or QuantizationType.IQ3_XXS or QuantizationType.IQ3_S or QuantizationType.IQ1_S;
     }
 
     private ITensor ForwardHighPrecision(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
@@ -3094,7 +3096,8 @@ public sealed unsafe class CudaTransformerModel : IModel
         if (quantWeight != 0)
         {
             if (qt is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS or QuantizationType.Q5_K
-                    or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S)
+                    or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S
+                    or QuantizationType.IQ3_XXS or QuantizationType.IQ3_S or QuantizationType.IQ1_S)
             {
                 _kernels.LaunchDequantToF32(quantWeight, qt, weightF32,
                     outputDim * inputDim, s);

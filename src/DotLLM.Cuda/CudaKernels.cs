@@ -255,6 +255,28 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvIQ2_XXSFunc;
     private readonly nint _quantizedGemvIQ2_XSFunc;
     private readonly nint _quantizedGemvIQ2_SFunc;
+
+    // IQ3 family (dequant_iq3.ptx) and IQ1_S (dequant_iq1.ptx) — issue #258.
+    // Dequant-only: prefill and decode both go through dequant + cuBLAS/dot,
+    // matching how the IQ2 family shipped before its GEMVs were added.
+    private readonly CudaModule? _dequantIQ3Module;
+    private readonly nint _dequantIQ3_XXSFunc;
+    private readonly nint _dequantIQ3_SFunc;
+    private readonly nint _dequantIQ3_XXSF32Func;
+    private readonly nint _dequantIQ3_SF32Func;
+    private readonly CudaModule? _dequantIQ1Module;
+    private readonly nint _dequantIQ1_SFunc;
+    private readonly nint _dequantIQ1_SF32Func;
+
+    // BF16 expansion and MXFP4 dequant (dequant_bf16_mxfp4.ptx) — issue #258.
+    // BF16 is a pure bit-shift widening, not a quantization; MXFP4 is the
+    // format gpt-oss models ship in exclusively.
+    private readonly CudaModule? _dequantBf16Mxfp4Module;
+    private readonly nint _dequantBF16Func;
+    private readonly nint _dequantBF16F32Func;
+    private readonly nint _dequantMXFP4Func;
+    private readonly nint _dequantMXFP4F32Func;
+
     private readonly CudaModule? _quantKvModule;
     private readonly nint _quantKvQ8_0Func;
     private readonly nint _quantKvQ4_0Func;
@@ -753,6 +775,37 @@ public sealed unsafe class CudaKernels : IDisposable
             _quantizedGemvIQ2_XXSFunc = _iq2Module.TryGetFunction("quantized_gemv_iq2_xxs");
             _quantizedGemvIQ2_XSFunc = _iq2Module.TryGetFunction("quantized_gemv_iq2_xs");
             _quantizedGemvIQ2_SFunc = _iq2Module.TryGetFunction("quantized_gemv_iq2_s");
+        }
+
+        // IQ3 dequant (iq3_xxs / iq3_s) — issue #258. Optional, like the IQ2 module.
+        string iq3Path = Path.Combine(ptxDir, "dequant_iq3.ptx");
+        if (File.Exists(iq3Path))
+        {
+            _dequantIQ3Module = CudaModule.LoadFromFile(iq3Path);
+            _dequantIQ3_XXSFunc = _dequantIQ3Module.TryGetFunction("dequant_iq3_xxs_f16");
+            _dequantIQ3_SFunc = _dequantIQ3Module.TryGetFunction("dequant_iq3_s_f16");
+            _dequantIQ3_XXSF32Func = _dequantIQ3Module.TryGetFunction("dequant_iq3_xxs_f32");
+            _dequantIQ3_SF32Func = _dequantIQ3Module.TryGetFunction("dequant_iq3_s_f32");
+        }
+
+        // IQ1_S dequant — issue #258.
+        string iq1Path = Path.Combine(ptxDir, "dequant_iq1.ptx");
+        if (File.Exists(iq1Path))
+        {
+            _dequantIQ1Module = CudaModule.LoadFromFile(iq1Path);
+            _dequantIQ1_SFunc = _dequantIQ1Module.TryGetFunction("dequant_iq1_s_f16");
+            _dequantIQ1_SF32Func = _dequantIQ1Module.TryGetFunction("dequant_iq1_s_f32");
+        }
+
+        // BF16 widening + MXFP4 dequant — issue #258.
+        string bf16Mxfp4Path = Path.Combine(ptxDir, "dequant_bf16_mxfp4.ptx");
+        if (File.Exists(bf16Mxfp4Path))
+        {
+            _dequantBf16Mxfp4Module = CudaModule.LoadFromFile(bf16Mxfp4Path);
+            _dequantBF16Func = _dequantBf16Mxfp4Module.TryGetFunction("dequant_bf16_f16");
+            _dequantBF16F32Func = _dequantBf16Mxfp4Module.TryGetFunction("dequant_bf16_f32");
+            _dequantMXFP4Func = _dequantBf16Mxfp4Module.TryGetFunction("dequant_mxfp4_f16");
+            _dequantMXFP4F32Func = _dequantBf16Mxfp4Module.TryGetFunction("dequant_mxfp4_f32");
         }
 
         // KV-cache quantization (optional — PTX may not be compiled yet)
@@ -4682,6 +4735,56 @@ public sealed unsafe class CudaKernels : IDisposable
                 LaunchConvertF16ToF32(src, dst, totalElements, stream);
                 return;
 
+            case QuantizationType.BF16:
+            {
+                if (_dequantBF16F32Func == 0)
+                    break;
+                int teArg = totalElements;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &teArg};
+                uint gridDim = (uint)Math.Min((totalElements + (int)BlockSize - 1) / (int)BlockSize,
+                    MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantBF16F32Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.MXFP4:
+            {
+                if (_dequantMXFP4F32Func == 0)
+                    break;
+                int totalBlocks = totalElements / 32;
+                int tbArg = totalBlocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tbArg};
+                uint gridDim = (uint)Math.Min((totalBlocks + 7) / 8, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantMXFP4F32Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.IQ3_XXS:
+            case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_S:
+            {
+                nint f32Func = srcDtype switch
+                {
+                    QuantizationType.IQ3_XXS => _dequantIQ3_XXSF32Func,
+                    QuantizationType.IQ3_S => _dequantIQ3_SF32Func,
+                    _ => _dequantIQ1_SF32Func
+                };
+                if (f32Func == 0)
+                    break;
+                int totalSuperblocks = totalElements / 256;
+                int tsbArg = totalSuperblocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
+                uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(f32Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
             case QuantizationType.IQ4_NL:
             {
                 if (_dequantIQ4_NLF32Func == 0)
@@ -4926,6 +5029,68 @@ public sealed unsafe class CudaKernels : IDisposable
                     throw new InvalidOperationException(
                         $"{srcDtype} dequant kernel not present in iq2.ptx — rebuild PTX from " +
                         "native/kernels/iq2.cu.");
+                int totalSuperblocks = totalElements / 256;
+                int tsbArg = totalSuperblocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
+                uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.BF16:
+            {
+                // BF16 is the high 16 bits of an F32; widening is a bit-shift,
+                // so this is elementwise rather than block-structured.
+                if (_dequantBF16Func == 0)
+                    throw new InvalidOperationException(
+                        "BF16 dequant kernel not present in dequant_bf16_mxfp4.ptx — rebuild PTX from " +
+                        "native/kernels/dequant_bf16_mxfp4.cu.");
+                int teArg = totalElements;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &teArg};
+                uint gridDim = (uint)Math.Min((totalElements + (int)BlockSize - 1) / (int)BlockSize,
+                    MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantBF16Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.MXFP4:
+            {
+                if (_dequantMXFP4Func == 0)
+                    throw new InvalidOperationException(
+                        "MXFP4 dequant kernel not present in dequant_bf16_mxfp4.ptx — rebuild PTX from " +
+                        "native/kernels/dequant_bf16_mxfp4.cu.");
+                int totalBlocks = totalElements / 32;
+                int tbArg = totalBlocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tbArg};
+                // Each 256-thread CUDA block covers 8 MXFP4 blocks (32 elements each).
+                uint gridDim = (uint)Math.Min((totalBlocks + 7) / 8, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantMXFP4Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.IQ3_XXS:
+            case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_S:
+            {
+                // Super-block shaped like the IQ2/IQ4_XS kernels: one thread per
+                // element within a 256-element super-block, one CUDA block per
+                // super-block, grid-strided.
+                (nint func, string ptx) = srcDtype switch
+                {
+                    QuantizationType.IQ3_XXS => (_dequantIQ3_XXSFunc, "dequant_iq3"),
+                    QuantizationType.IQ3_S => (_dequantIQ3_SFunc, "dequant_iq3"),
+                    _ => (_dequantIQ1_SFunc, "dequant_iq1")
+                };
+                if (func == 0)
+                    throw new InvalidOperationException(
+                        $"{srcDtype} dequant kernel not present in {ptx}.ptx — rebuild PTX from " +
+                        $"native/kernels/{ptx}.cu.");
                 int totalSuperblocks = totalElements / 256;
                 int tsbArg = totalSuperblocks;
                 void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
@@ -5697,6 +5862,9 @@ public sealed unsafe class CudaKernels : IDisposable
         _dequantModule.Dispose();
         _dequantIQuantsModule?.Dispose();
         _iq2Module?.Dispose();
+        _dequantIQ3Module?.Dispose();
+        _dequantIQ1Module?.Dispose();
+        _dequantBf16Mxfp4Module?.Dispose();
         _quantizedGemvModule.Dispose();
         _fusedAddRmsNormModule.Dispose();
         _rmsnormF32InModule.Dispose();
