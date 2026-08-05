@@ -53,4 +53,22 @@ public interface IPerplexityModel
     /// Logits, owned by the caller. Row layout is governed by <see cref="ReturnsAllRows"/>.
     /// </returns>
     ITensor Forward(ReadOnlySpan<int> tokens, ReadOnlySpan<int> positions);
+
+    /// <summary>
+    /// Discards any state the previous <see cref="Forward"/> left behind, so the next one starts a
+    /// genuinely fresh sequence. Called by the evaluator before every scored window.
+    /// </summary>
+    /// <remarks>
+    /// <para>Perplexity treats each window as an independent sequence — that is the whole premise of
+    /// windowed scoring, and it is why positions restart at 0 for every window. For a dense
+    /// transformer scored with no KV-cache that is automatic: nothing survives a forward. For a
+    /// recurrent architecture (Mamba/SSM, Gated-DeltaNet) it is not: the uncached forward falls back
+    /// to a model-owned recurrent state that persists, so window <c>n</c> inherits window
+    /// <c>n-1</c>'s state and the reported perplexity is wrong with no error raised (issue #261).</para>
+    /// <para>The default implementation is a no-op, which is correct for any stateless model and for
+    /// test doubles. <c>BackendPerplexityModel</c> forwards it to
+    /// <c>IModel.ResetSequenceState()</c>, where the recurrent architectures are obliged to
+    /// implement it.</para>
+    /// </remarks>
+    void ResetState() { }
 }
