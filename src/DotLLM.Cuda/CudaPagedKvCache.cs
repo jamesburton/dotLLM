@@ -110,6 +110,16 @@ public sealed class CudaPagedKvCache : IKvCache, IPerLayerKvCache
             maxStride = Math.Max(maxStride, pool.KvStrideOf(i));
         _maxStride = maxStride;
 
+        // Issue #268: without this, a CudaPagedKvCache constructed after an idle-eviction ->
+        // lazy-reload cycle (a fresh CudaContext, per docs/SERVER.md's Keep-Alive/Idle-Unload
+        // feature) can allocate against whatever context happens to still be current on this
+        // thread -- possibly the destroyed pre-reload context -- throwing "CUDA error 201:
+        // invalid device context". Mirrors CudaKvBlockPool's own constructor, which already does
+        // this via its own _context field; reuse the SAME pool's context here rather than adding
+        // a redundant constructor parameter, since every CudaPagedKvCache is always backed by a
+        // pool that already carries the right context.
+        pool.Context?.MakeCurrent();
+
         long scratchBytes = (long)maxSeqLen * maxStride * sizeof(ushort);
         CudaDriverApi.cuMemAlloc_v2(out _kScratch, (nuint)scratchBytes).ThrowOnError();
         CudaDriverApi.cuMemAlloc_v2(out _vScratch, (nuint)scratchBytes).ThrowOnError();
@@ -358,6 +368,9 @@ public sealed class CudaPagedKvCache : IKvCache, IPerLayerKvCache
         _disposed = true;
 
         _blockTable.Free();
+
+        // Issue #268: same MakeCurrent rationale as the constructor -- mirrors CudaKvBlockPool.Dispose.
+        _pool.Context?.MakeCurrent();
 
         if (_kScratch != 0) { CudaDriverApi.cuMemFree_v2(_kScratch); _kScratch = 0; }
         if (_vScratch != 0) { CudaDriverApi.cuMemFree_v2(_vScratch); _vScratch = 0; }

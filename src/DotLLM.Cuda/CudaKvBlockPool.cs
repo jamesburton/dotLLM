@@ -55,6 +55,14 @@ public sealed class CudaKvBlockPool : IDisposable
     private readonly CudaContext? _context;
     private bool _disposed;
 
+    /// <summary>
+    /// The CUDA context this pool's device memory was allocated under (issue #268) — exposed so
+    /// dependent objects allocated later against the same device (e.g. <see cref="CudaPagedKvCache"/>)
+    /// can call <see cref="CudaContext.MakeCurrent"/> before their own allocation calls, rather than
+    /// silently relying on whatever context happens to already be current on the calling thread.
+    /// </summary>
+    internal CudaContext? Context => _context;
+
     /// <summary>Number of tokens per block.</summary>
     public int BlockSize => _blockSize;
 
