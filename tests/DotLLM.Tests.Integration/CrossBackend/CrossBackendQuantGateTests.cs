@@ -20,7 +20,7 @@ namespace DotLLM.Tests.Integration.CrossBackend;
 /// <para><b>Why this exists.</b> #254 (CUDA Q4_0/Q4_1 returning ~1e11 perplexity while exiting
 /// 0) and #255 (CPU Q4_0 throwing "Unsupported quantization type" on every load) both shipped
 /// to <c>dev</c> green, because every existing test scored a per-kernel synthetic tensor
-/// against a CPU reference — never a real quantized model loaded end-to-end and compared
+/// against a CPU reference - never a real quantized model loaded end-to-end and compared
 /// against a second backend on real tokens. This class is that missing gate.</para>
 ///
 /// <para><b>In-process, not subprocess.</b> The issue describes the gate in terms of the
@@ -29,12 +29,12 @@ namespace DotLLM.Tests.Integration.CrossBackend;
 /// <see cref="PerplexityEvaluator"/>, <see cref="TextGenerator"/>) directly in-process, exactly
 /// like <c>RealGgufVulkanParityTests</c> and <c>CudaGemm16FPerplexityTests</c> already do. This
 /// is a deliberate difference from a literal CLI-subprocess reproduction: two of the issue's own
-/// named traps — "a generation leg must not treat non-empty stdout as success" and "the CLI can
-/// print an error message to stdout and still exit 0" — are traps of shelling out and parsing
+/// named traps - "a generation leg must not treat non-empty stdout as success" and "the CLI can
+/// print an error message to stdout and still exit 0" - are traps of shelling out and parsing
 /// text. Calling the API directly means a broken decode path throws a real .NET exception or
 /// returns a real (possibly astronomical) number, either of which xunit sees plainly; there is no
-/// stdout to misparse. The third trap — coverage read from observed tensor block types, not
-/// filenames — still applies and is enforced explicitly by
+/// stdout to misparse. The third trap - coverage read from observed tensor block types, not
+/// filenames - still applies and is enforced explicitly by
 /// <see cref="Cpu_ObservedBlockType_MatchesFixtureTarget"/> below, reading
 /// <see cref="GgufFile.Tensors"/> directly (the same data <c>dotllm debug gguf-tensors</c>
 /// prints) rather than assuming the fixture's file name or the llama-quantize argument used to
@@ -42,14 +42,14 @@ namespace DotLLM.Tests.Integration.CrossBackend;
 ///
 /// <para><b>Fixtures.</b> One <c>--pure</c> single-block-type GGUF per <see cref="QuantizationType"/>,
 /// generated from one shared Llama-3.2-1B-Instruct F16 source (hidden_size 2048, so
-/// <c>ne[0] % 256 == 0</c> for every 256-superblock K-quant/IQ type — a 135M-class model's
+/// <c>ne[0] % 256 == 0</c> for every 256-superblock K-quant/IQ type - a 135M-class model's
 /// hidden_size of 576 fails that constraint). Generation recipe, the llama-quantize argument used
 /// for each dotLLM <see cref="QuantizationType"/> (including the <c>IQ2_S</c>/<c>IQ2_M</c>
 /// ftype-vs-block-type mismatch the issue calls out by name), and current disk-budget gaps are
 /// documented in <c>.docs/corpora/QUANT_FIXTURES.md</c>. Every test below resolves its fixture via
 /// <see cref="ResolveFixturePath"/> (env var override, else the conventional
-/// <c>~/.dotllm/test-cache/quant-fixtures/Llama-3.2-1B-pure/</c> path) and self-skips — not
-/// fails — when the fixture is absent, matching the existing <c>DOTLLM_*_GGUF</c> convention
+/// <c>~/.dotllm/quant-ladder/Llama-3.2-1B-pure/</c> path) and self-skips - not
+/// fails - when the fixture is absent, matching the existing <c>DOTLLM_*_GGUF</c> convention
 /// used by <c>RealGgufVulkanParityTests</c> et al.</para>
 ///
 /// <para><b>Two legs, because they cover different kernels.</b>
@@ -59,7 +59,7 @@ namespace DotLLM.Tests.Integration.CrossBackend;
 /// <see cref="Backend_AgreesWithCpu"/> exercise the decode/GEMV path (single-token forward,
 /// repeated). The issue found several types pass the first and fail the second (a fused-decode
 /// kernel that throws "does not support &lt;TYPE&gt;. Use standard Gemm path" with no automatic
-/// fallback — #257) — scoring only one leg would miss that class of defect entirely.</para>
+/// fallback - #257) - scoring only one leg would miss that class of defect entirely.</para>
 ///
 /// <para><b>Assert on cross-backend spread, not absolute perplexity.</b>
 /// <see cref="Backend_AgreesWithCpu"/> compares <see cref="PerplexityResult.MeanNegativeLogLikelihood"/>
@@ -68,7 +68,7 @@ namespace DotLLM.Tests.Integration.CrossBackend;
 /// actually caught, post-#256) used to catch a CPU-vs-GPU IQ1_S divergence of 0.24 nats (27%
 /// relative) on a fixture legitimately destroyed by 1-bit quantization, where CUDA and Vulkan
 /// agreed with each other to 0.0033 nats. A magnitude-only threshold (perplexity not
-/// "astronomical") would have missed it — both large numbers looked equally destroyed until
+/// "astronomical") would have missed it - both large numbers looked equally destroyed until
 /// diffed against a third backend on identical tokens.</para>
 /// </remarks>
 public sealed class CrossBackendQuantGateTests
@@ -77,15 +77,15 @@ public sealed class CrossBackendQuantGateTests
 
     public CrossBackendQuantGateTests(ITestOutputHelper output) => _output = output;
 
-    // ════════════════════════════════════════════════════════════════════
+    // ========================================================================
     // Fixture ladder
-    // ════════════════════════════════════════════════════════════════════
+    // ========================================================================
 
     /// <summary>
     /// Every <see cref="QuantizationType"/> the gate covers. Deliberately excludes:
-    /// <see cref="QuantizationType.F32"/> (pass-through, not a quantized kernel — no fixture
+    /// <see cref="QuantizationType.F32"/> (pass-through, not a quantized kernel - no fixture
     /// needed), <see cref="QuantizationType.I2_S"/> and <see cref="QuantizationType.PQ2_0"/>
-    /// (BitNet / PrismML block layouts with no mainline llama.cpp <c>--pure</c> equivalent —
+    /// (BitNet / PrismML block layouts with no mainline llama.cpp <c>--pure</c> equivalent -
     /// see BitNet/PrismML-specific fixture notes in QUANT_FIXTURES.md instead).
     /// </summary>
     public static readonly QuantizationType[] AllGateTypes =
@@ -131,13 +131,13 @@ public sealed class CrossBackendQuantGateTests
         }
     }
 
-    // ════════════════════════════════════════════════════════════════════
+    // ========================================================================
     // Shared corpus / prompt
-    // ════════════════════════════════════════════════════════════════════
+    // ========================================================================
 
     // Ordinary English, long enough for a stable teacher-forced NLL estimate on a --pure
     // (frequently near-destroyed) fixture without being so long that the O(n^2) growing-prefix
-    // path (required whenever a backend returns only the last logits row — every GPU backend
+    // path (required whenever a backend returns only the last logits row - every GPU backend
     // here) gets slow. Absolute perplexity on these fixtures is not meaningful (see class
     // remarks); only the cross-backend NLL delta on identical tokens is.
     private const string Corpus =
@@ -164,7 +164,7 @@ public sealed class CrossBackendQuantGateTests
     /// Bound (nats) on <c>|cpu.MeanNegativeLogLikelihood - backend.MeanNegativeLogLikelihood|</c>
     /// for the teacher-forced leg. Sourced from #276: CUDA and Vulkan agreed with each other to
     /// 0.0033 nats on a fixture where CPU diverged from both by 0.24 nats (27% relative
-    /// perplexity) — a genuine CPU IQ1_S defect that a magnitude-only ("perplexity isn't
+    /// perplexity) - a genuine CPU IQ1_S defect that a magnitude-only ("perplexity isn't
     /// astronomical") check would have missed, since a --pure 1-bit fixture is *supposed* to
     /// have a huge absolute perplexity.
     /// </summary>
@@ -174,7 +174,7 @@ public sealed class CrossBackendQuantGateTests
     /// Bound on mean <c>(1 - cosine_similarity)</c> between per-step decode logits, CPU vs
     /// backend, over <see cref="DecodeSteps"/> greedy steps. #276 measured 1-cos of 2.8e-3
     /// (CUDA) / 3.0e-3 (Vulkan) against CPU on IQ1_S as "inside the healthy continuum" even
-    /// while the *prefill* NLL for the same fixture was 13x outside its own bound — decode and
+    /// while the *prefill* NLL for the same fixture was 13x outside its own bound - decode and
     /// prefill are different kernels and can fail independently (#257). This bound is set well
     /// above that healthy band (so ordinary FP-order noise never trips it) but far below what a
     /// genuinely broken decode kernel produces: #254's CUDA Q4_0/Q4_1 decode returned ~1e10-1e11
@@ -183,20 +183,20 @@ public sealed class CrossBackendQuantGateTests
     /// </summary>
     private const double OneMinusCosineTolerance = 0.05;
 
-    // ════════════════════════════════════════════════════════════════════
-    // CPU-only tests — run in every `dotnet test`, no GPU required.
-    // ════════════════════════════════════════════════════════════════════
+    // ========================================================================
+    // CPU-only tests - run in every `dotnet test`, no GPU required.
+    // ========================================================================
 
     /// <summary>
     /// Trap #1 from the issue: "coverage must be read from observed tensor block types, never
-    /// filenames" — llama.cpp ftypes do not map 1:1 to ggml block types (ftype <c>IQ2_S</c>
+    /// filenames" - llama.cpp ftypes do not map 1:1 to ggml block types (ftype <c>IQ2_S</c>
     /// actually yields <c>IQ2_XS</c> blocks; ftype <c>IQ2_M</c> is what yields <c>IQ2_S</c>).
-    /// This reads <see cref="GgufFile.Tensors"/> directly — the same data
-    /// <c>dotllm debug gguf-tensors</c> prints — and asserts every transformer-block weight
+    /// This reads <see cref="GgufFile.Tensors"/> directly - the same data
+    /// <c>dotllm debug gguf-tensors</c> prints - and asserts every transformer-block weight
     /// tensor (attn_q/k/v/o, ffn_gate/up/down) is the EXPECTED block type, regardless of what
     /// llama-quantize argument or file name produced the fixture. <c>token_embd</c>/<c>output</c>
     /// are pinned to Q8_0 at generation time (some low-bit ftypes need imatrix coverage the
-    /// embedding tensor lacks) and are deliberately excluded from this check — see
+    /// embedding tensor lacks) and are deliberately excluded from this check - see
     /// QUANT_FIXTURES.md.
     /// </summary>
     [Theory]
@@ -218,18 +218,22 @@ public sealed class CrossBackendQuantGateTests
         foreach (var t in wrongType)
             _output.WriteLine($"[{quantType}] unexpected block type on '{t.Name}': observed {t.QuantizationType}");
 
-        Assert.True(wrongType.Count == 0,
-            $"[{quantType}] {wrongType.Count}/{blockTensors.Count} transformer-block tensors were NOT "
-            + $"observed as {quantType} (e.g. '{wrongType.FirstOrDefault().Name}' -> {wrongType.FirstOrDefault().QuantizationType}). "
-            + "Fixture generation likely used the wrong llama-quantize argument for this dotLLM type "
-            + "— see the ftype-vs-block-type mapping notes in QUANT_FIXTURES.md.");
+        if (wrongType.Count > 0)
+        {
+            var first = wrongType[0];
+            Assert.Fail(
+                $"[{quantType}] {wrongType.Count}/{blockTensors.Count} transformer-block tensors were NOT "
+                + $"observed as {quantType} (e.g. '{first.Name}' -> {first.QuantizationType}). "
+                + "Fixture generation likely used the wrong llama-quantize argument for this dotLLM type "
+                + "- see the ftype-vs-block-type mapping notes in QUANT_FIXTURES.md.");
+        }
 
         _output.WriteLine($"[{quantType}] {blockTensors.Count} transformer-block tensors, all observed as {quantType}.");
     }
 
     /// <summary>
     /// CPU prefill/GEMM smoke: teacher-forced perplexity must be a finite, positive number.
-    /// Also the source of the CPU-only baseline numbers reported alongside this PR — absolute
+    /// Also the source of the CPU-only baseline numbers reported alongside this PR - absolute
     /// values are expected to be enormous for the most aggressively quantized fixtures (that is
     /// the model being destroyed by design, not a bug; see class remarks).
     /// </summary>
@@ -247,7 +251,7 @@ public sealed class CrossBackendQuantGateTests
         using var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
-        using var model = ModelLoader.CreateCpuModelFromGguf(gguf, config, ThreadingConfig.SingleThreaded);
+        using var model = ModelLoader.CreateCpuModelFromGguf(gguf, config, ThreadingConfig.Auto);
 
         var result = ScoreTeacherForced(model, deviceId: -1, tokenizer);
 
@@ -262,16 +266,16 @@ public sealed class CrossBackendQuantGateTests
 
     /// <summary>
     /// CPU decode/GEMV smoke. Traps #2/#3 from the issue: an actual generated-token count is
-    /// asserted (not "stdout was non-empty" — there is no stdout here, only the real
+    /// asserted (not "stdout was non-empty" - there is no stdout here, only the real
     /// <see cref="GenerationToken"/> stream or a real exception), and the resulting continuation
-    /// is scored for perplexity rather than merely checked for a clean completion — "gen=ok"
+    /// is scored for perplexity rather than merely checked for a clean completion - "gen=ok"
     /// alone proved decode executed, not that the output was sensible (#254's CUDA Q4_0 scored
     /// "ok" at 1e11 perplexity).
     /// </summary>
     /// <remarks>
     /// Expected to be RED on today's <c>dev</c> for the 14 types #257 lists (fused decode throws
     /// "does not support &lt;TYPE&gt;. Use standard Gemm path" with no automatic GEMM fallback).
-    /// That is the gate working as intended — #257 explicitly asks for a test that fails without
+    /// That is the gate working as intended - #257 explicitly asks for a test that fails without
     /// its fix, "the reason this reached dev is that no test loads a Q4_0 model end-to-end."
     /// </remarks>
     [Theory]
@@ -288,7 +292,7 @@ public sealed class CrossBackendQuantGateTests
         using var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
-        using var model = ModelLoader.CreateCpuModelFromGguf(gguf, config, ThreadingConfig.SingleThreaded);
+        using var model = ModelLoader.CreateCpuModelFromGguf(gguf, config, ThreadingConfig.Auto);
 
         var (text, generatedTokenCount, finishReason) = await GenerateGreedyAsync(model, tokenizer, DecodeSteps);
 
@@ -309,15 +313,15 @@ public sealed class CrossBackendQuantGateTests
 
         _output.WriteLine($"[{quantType}] CPU continuation NLL={result.MeanNegativeLogLikelihood:F6} nats");
         Assert.True(double.IsFinite(result.MeanNegativeLogLikelihood),
-            $"[{quantType}] CPU continuation NLL was not finite — decode produced tokens the model itself "
+            $"[{quantType}] CPU continuation NLL was not finite - decode produced tokens the model itself "
             + "assigns zero/undefined probability, i.e. self-inconsistent output.");
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    // Cross-backend gate — GPU. NOT run by default `dotnet test`; filter
+    // ========================================================================
+    // Cross-backend gate - GPU. NOT run by default `dotnet test`; filter
     // Category=GPU in. Each case independently skips when its fixture is
     // absent or the backend is unavailable on this host.
-    // ════════════════════════════════════════════════════════════════════
+    // ========================================================================
 
     /// <summary>
     /// The gate itself: CPU vs one GPU backend, on the identical fixture and corpus, both legs.
@@ -336,7 +340,7 @@ public sealed class CrossBackendQuantGateTests
         using var cpuGguf = GgufFile.Open(path!);
         var cpuConfig = GgufModelConfigExtractor.Extract(cpuGguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(cpuGguf.Metadata);
-        using var cpuModel = ModelLoader.CreateCpuModelFromGguf(cpuGguf, cpuConfig, ThreadingConfig.SingleThreaded);
+        using var cpuModel = ModelLoader.CreateCpuModelFromGguf(cpuGguf, cpuConfig, ThreadingConfig.Auto);
 
         using var gpuGguf = GgufFile.Open(path!);
         var gpuConfig = GgufModelConfigExtractor.Extract(gpuGguf.Metadata);
@@ -359,7 +363,7 @@ public sealed class CrossBackendQuantGateTests
 
         try
         {
-            // ── Leg 1: teacher-forced perplexity (prefill/GEMM) ──
+            // Leg 1: teacher-forced perplexity (prefill/GEMM).
             var cpuPpl = ScoreTeacherForced(cpuModel, deviceId: -1, tokenizer);
             var gpuPpl = ScoreTeacherForced(gpuModel, gpuDeviceId, tokenizer);
 
@@ -375,7 +379,7 @@ public sealed class CrossBackendQuantGateTests
                 $"[{quantType}/{backend}] prefill NLL delta {natsDelta:F6} nats exceeds bound {NatsTolerance} "
                 + $"(cpu={cpuPpl.MeanNegativeLogLikelihood:F6}, {backend}={gpuPpl.MeanNegativeLogLikelihood:F6}).");
 
-            // ── Leg 2: greedy decode (decode/GEMV), per-step logit agreement ──
+            // Leg 2: greedy decode (decode/GEMV), per-step logit agreement.
             double meanOneMinusCos = await ScoreDecodeAgreementAsync(
                 cpuModel, gpuModel, gpuDeviceId, tokenizer, DecodeSteps);
 
@@ -385,7 +389,7 @@ public sealed class CrossBackendQuantGateTests
 
             Assert.True(meanOneMinusCos <= OneMinusCosineTolerance,
                 $"[{quantType}/{backend}] decode-step logits diverged: mean(1-cos)={meanOneMinusCos:E4} "
-                + $"exceeds bound {OneMinusCosineTolerance}. This is the decode/GEMV path specifically — "
+                + $"exceeds bound {OneMinusCosineTolerance}. This is the decode/GEMV path specifically - "
                 + "prefill agreeing does not imply decode agrees (#257).");
         }
         finally
@@ -395,16 +399,17 @@ public sealed class CrossBackendQuantGateTests
         }
     }
 
-    // ════════════════════════════════════════════════════════════════════
+    // ========================================================================
     // Fixture resolution
-    // ════════════════════════════════════════════════════════════════════
+    // ========================================================================
 
     /// <summary>
     /// Resolves a fixture path for <paramref name="quantType"/>: env var override
     /// (<c>DOTLLM_QUANT_FIXTURE_&lt;TYPE&gt;</c>) takes precedence, else the conventional
-    /// <c>~/.dotllm/test-cache/quant-fixtures/Llama-3.2-1B-pure/Llama-3.2-1B-pure-&lt;TYPE&gt;.gguf</c>
-    /// path documented in QUANT_FIXTURES.md. Returns null (never throws) when neither exists —
-    /// callers self-skip.
+    /// <c>~/.dotllm/quant-ladder/Llama-3.2-1B-pure/Llama-3.2-1B-pure-&lt;TYPE&gt;.gguf</c>
+    /// path documented in QUANT_FIXTURES.md (dotLLM's canonical location for "generated
+    /// per-quantization coverage fixtures" per this project's CLAUDE.md fixture-storage rules).
+    /// Returns null (never throws) when neither exists - callers self-skip.
     /// </summary>
     internal static string? ResolveFixturePath(QuantizationType quantType)
     {
@@ -414,7 +419,7 @@ public sealed class CrossBackendQuantGateTests
 
         string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         string conventional = Path.Combine(
-            home, ".dotllm", "test-cache", "quant-fixtures", "Llama-3.2-1B-pure",
+            home, ".dotllm", "quant-ladder", "Llama-3.2-1B-pure",
             $"Llama-3.2-1B-pure-{quantType}.gguf");
         return File.Exists(conventional) ? conventional : null;
     }
@@ -422,7 +427,7 @@ public sealed class CrossBackendQuantGateTests
     private static string FixtureHint(QuantizationType quantType) =>
         $"Set DOTLLM_QUANT_FIXTURE_{quantType} or generate via the recipe in "
         + ".docs/corpora/QUANT_FIXTURES.md into "
-        + "~/.dotllm/test-cache/quant-fixtures/Llama-3.2-1B-pure/.";
+        + "~/.dotllm/quant-ladder/Llama-3.2-1B-pure/.";
 
     private static bool IsTransformerBlockWeight(GgufTensorDescriptor tensor)
     {
@@ -437,9 +442,9 @@ public sealed class CrossBackendQuantGateTests
             || tensor.Name.EndsWith(".ffn_down.weight", StringComparison.Ordinal);
     }
 
-    // ════════════════════════════════════════════════════════════════════
+    // ========================================================================
     // Backend loading
-    // ════════════════════════════════════════════════════════════════════
+    // ========================================================================
 
     private static void SkipUnlessBackendAvailable(GateBackend backend, out string? auxDir)
     {
@@ -520,9 +525,9 @@ public sealed class CrossBackendQuantGateTests
         return null;
     }
 
-    // ════════════════════════════════════════════════════════════════════
+    // ========================================================================
     // Scoring helpers
-    // ════════════════════════════════════════════════════════════════════
+    // ========================================================================
 
     private static PerplexityResult ScoreTeacherForced(
         IModel model, int deviceId, DotLLM.Tokenizers.ITokenizer tokenizer)
@@ -558,7 +563,7 @@ public sealed class CrossBackendQuantGateTests
     /// two sequences to fork and start comparing unrelated positions), and returns the mean
     /// <c>1 - cosine_similarity</c> between their last-row logits at each step. No KV cache: each
     /// step is a fresh growing-prefix forward via the 3-arg <c>IModel.Forward</c>, which every
-    /// backend implements uniformly — mirrors the pattern in
+    /// backend implements uniformly - mirrors the pattern in
     /// <c>RealGgufVulkanParityTests.RunGgufParityTest</c>.
     /// </summary>
     private static async Task<double> ScoreDecodeAgreementAsync(
