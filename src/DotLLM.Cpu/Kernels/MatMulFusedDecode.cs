@@ -1,5 +1,3 @@
-using System.Buffers;
-using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Cpu.Threading;
@@ -452,40 +450,11 @@ public static unsafe partial class MatMul
                     // dequantize row-by-row and dot — the same last-resort path the MoE MLP uses.
                     // Callers with a full GEMM should have gated on SupportsFusedDecode and never
                     // reach here; this exists so the kernel API is total instead of throwing.
-                    GemvDequantRows(weights, qt, input, result, m, k);
+                    // Row-parallel via the pool: the fallback being format-complete is no reason
+                    // for it to also be single-threaded (#263).
+                    GemvDequantRows(weights, qt, input, result, m, k, pool);
                     break;
             }
-        }
-    }
-
-    /// <summary>
-    /// Last-resort GEMV for weight formats without a dedicated vec_dot kernel: dequantize each
-    /// weight row to F32 and take a dot product against the input.
-    /// </summary>
-    /// <param name="weights">Quantized weight matrix, row-major, <paramref name="m"/> rows of <paramref name="k"/> elements.</param>
-    /// <param name="qt">Weight quantization type.</param>
-    /// <param name="x">Input vector of length <paramref name="k"/>.</param>
-    /// <param name="y">Output vector of length <paramref name="m"/>.</param>
-    /// <param name="m">Number of output rows.</param>
-    /// <param name="k">Number of input elements per row.</param>
-    internal static void GemvDequantRows(byte* weights, QuantizationType qt, float* x, float* y,
-                                         int m, int k)
-    {
-        long rowBytes = Dequantize.RowByteSize(k, qt);
-        float[] rowBuf = ArrayPool<float>.Shared.Rent(k);
-        try
-        {
-            var rowSpan = rowBuf.AsSpan(0, k);
-            var xSpan = new ReadOnlySpan<float>(x, k);
-            for (int i = 0; i < m; i++)
-            {
-                Dequantize.ToFloat32((nint)weights + (nint)(i * rowBytes), k, qt, rowSpan);
-                y[i] = TensorPrimitives.Dot((ReadOnlySpan<float>)rowSpan, xSpan);
-            }
-        }
-        finally
-        {
-            ArrayPool<float>.Shared.Return(rowBuf);
         }
     }
 }

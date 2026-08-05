@@ -976,32 +976,12 @@ public sealed unsafe class NemotronHTransformerModel : IModel
                 MatMul.GemmF16(weights, b, c, m, k, n);
                 return;
             default:
-                GemmDequantFallback(weights, qt, b, c, m, k, n);
+                // Shared dequantize-and-dot fallback (#263): decodes each weight row once and
+                // reuses it across all n columns instead of re-decoding the matrix per token.
+                // This Gemm has no thread pool in scope, so it runs serially — bit-identical to
+                // the private copy it replaces.
+                MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, pool: null);
                 return;
-        }
-    }
-
-    private static void GemmDequantFallback(nint weights, QuantizationType qt, float* b, float* c,
-                                            int m, int k, int n)
-    {
-        long rowBytes = Dequantize.RowByteSize(k, qt);
-        float[] rowBuf = ArrayPool<float>.Shared.Rent(k);
-        try
-        {
-            var rowSpan = rowBuf.AsSpan(0, k);
-            for (int t = 0; t < n; t++)
-            {
-                var xSpan = new ReadOnlySpan<float>(b + t * k, k);
-                for (int i = 0; i < m; i++)
-                {
-                    Dequantize.ToFloat32(weights + i * (nint)rowBytes, k, qt, rowSpan);
-                    c[t * m + i] = TensorPrimitives.Dot(new ReadOnlySpan<float>(rowBuf, 0, k), xSpan);
-                }
-            }
-        }
-        finally
-        {
-            ArrayPool<float>.Shared.Return(rowBuf);
         }
     }
 
