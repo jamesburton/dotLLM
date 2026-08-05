@@ -263,6 +263,17 @@ public sealed unsafe class Mamba3TransformerModel : IModel
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Deliberately a no-op: unlike the GDN / Nemotron-H hosts, this model owns no persistent
+    /// recurrent state. Every forward that is not given a caller-supplied <see cref="Mamba3State"/>
+    /// allocates and disposes a fresh scratch state for that call, so consecutive uncached forwards
+    /// are already independent sequences. Overridden explicitly rather than inherited because the
+    /// <see cref="IModel.ResetSequenceState"/> default throws for recurrent models — a new recurrent
+    /// architecture must state which of the two cases it is in, not inherit the wrong one (#261).
+    /// </remarks>
+    public void ResetSequenceState() { }
+
+    /// <inheritdoc/>
     public bool RequiresPerSequenceState => true;
 
     /// <inheritdoc/>

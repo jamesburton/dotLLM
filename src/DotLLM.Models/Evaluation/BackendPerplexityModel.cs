@@ -50,6 +50,9 @@ public sealed class BackendPerplexityModel : IPerplexityModel
     public ITensor Forward(ReadOnlySpan<int> tokens, ReadOnlySpan<int> positions)
         => _model.Forward(tokens, positions, _deviceId);
 
+    /// <inheritdoc/>
+    public void ResetState() => _model.ResetSequenceState();
+
     /// <summary>
     /// Determines empirically whether <paramref name="model"/> returns logits for every position, by
     /// running a two-token forward and measuring the returned element count.
@@ -63,14 +66,26 @@ public sealed class BackendPerplexityModel : IPerplexityModel
     /// adapter noticing, and the failure mode is a silently wrong perplexity rather than an
     /// exception. A two-token probe costs one trivial forward and cannot be wrong about the backend
     /// it just ran.
+    /// <para><b>The probe leaves no trace.</b> On a recurrent architecture the probe's forward
+    /// advances model-owned recurrent state, so without the reset below the two throwaway tokens
+    /// would have been prepended to the very first scored window (issue #261). The reset runs in a
+    /// <c>finally</c>: a probe that throws part-way through a forward has still dirtied the state,
+    /// and leaving it dirty would corrupt whatever the caller does next.</para>
     /// </remarks>
     public static bool Probe(IModel model, int deviceId)
     {
         ArgumentNullException.ThrowIfNull(model);
 
-        ReadOnlySpan<int> tokens = stackalloc int[2] { 0, 0 };
-        ReadOnlySpan<int> positions = stackalloc int[2] { 0, 1 };
-        using ITensor logits = model.Forward(tokens, positions, deviceId);
-        return logits.ElementCount >= 2L * model.Config.VocabSize;
+        try
+        {
+            ReadOnlySpan<int> tokens = stackalloc int[2] { 0, 0 };
+            ReadOnlySpan<int> positions = stackalloc int[2] { 0, 1 };
+            using ITensor logits = model.Forward(tokens, positions, deviceId);
+            return logits.ElementCount >= 2L * model.Config.VocabSize;
+        }
+        finally
+        {
+            model.ResetSequenceState();
+        }
     }
 }

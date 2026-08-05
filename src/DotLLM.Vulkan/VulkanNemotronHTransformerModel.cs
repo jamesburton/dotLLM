@@ -674,6 +674,14 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Re-zeroes the model-owned SSM state cache (conv history + hidden state) used by every forward that does not carry a caller-supplied
+    /// per-sequence state container. Callers that treat each forward as an independent sequence
+    /// (perplexity windows) must call this between sequences — see issue #261.
+    /// </remarks>
+    public void ResetSequenceState() => _ssmCache.Reset();
+
+    /// <inheritdoc/>
     public bool RequiresPerSequenceState => true;
 
     /// <summary>
