@@ -31,6 +31,9 @@ dotnet test tests/DotLLM.Tests.Unit/ -c Release --filter "Category!=GPU"
 # Run integration tests (downloads small test models on first run)
 dotnet test tests/DotLLM.Tests.Integration/ -c Release
 
+# Run integration tests without the quantization-ladder fixtures (Category=Fixtures)
+dotnet test tests/DotLLM.Tests.Integration/ -c Release --filter "Category!=Fixtures"
+
 # Run the CLI without installing
 dotnet run --project src/DotLLM.Cli -c Release -- run QuantFactory/SmolLM-135M-GGUF -p "hello" -n 32
 ```

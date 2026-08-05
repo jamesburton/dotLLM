@@ -448,6 +448,8 @@ $env:DOTLLM_TEST_CACHE_DIR = "$HOME\.dotllm\models"
 
 > **GPU tests** (tagged `Category=GPU`) require an NVIDIA GPU and run full model inference — they can take 20-30 minutes. They are skipped automatically on machines without CUDA. To exclude them explicitly: `dotnet test tests/DotLLM.Tests.Unit/ --filter "Category!=GPU"`
 
+> **Fixture tests** (tagged `Category=Fixtures`) require the local quantization-ladder fixtures under `~/.dotllm/quant-ladder/`; no GPU required. To exclude them explicitly: `dotnet test tests/DotLLM.Tests.Integration/ --filter "Category!=Fixtures"`
+
 **Model correctness smoke tests** (`scripts/test_models.py`) run dotLLM CLI with greedy decoding across architectures (Llama, Mistral, Phi, Qwen) and verify expected output:
 
 ```bash

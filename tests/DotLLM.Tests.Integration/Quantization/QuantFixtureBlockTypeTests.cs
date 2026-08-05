@@ -15,7 +15,11 @@ namespace DotLLM.Tests.Integration.Quantization;
 /// stock <c>Q4_K_M</c> mixes Q4_K with Q6_K — which is why the ladder is <c>--pure</c>. Until this
 /// passes, no cell may be counted as coverage for its type.
 /// </remarks>
-[Trait("Category", "GPU")]
+// Category=Fixtures: needs the local ~/.dotllm/quant-ladder/ fixtures but no GPU — this test
+// only mmaps a GGUF and counts tensor descriptors. Do not tag it GPU: that category means
+// "requires an NVIDIA GPU, 20-30 min" (README.md / CONTRIBUTING.md), and a contributor
+// filtering "Category!=GPU" on a CPU box would silently lose this gate.
+[Trait("Category", "Fixtures")]
 [Collection("QuantLadder")]
 public sealed class QuantFixtureBlockTypeTests
 {
@@ -28,6 +32,11 @@ public sealed class QuantFixtureBlockTypeTests
         _output = output;
     }
 
+    /// <summary>
+    /// Theory data of every type the ladder is expected to cover — one case per row of
+    /// <see cref="QuantLadderFixture.Expected"/>, so a new ladder entry is verified automatically
+    /// without touching this class.
+    /// </summary>
     public static TheoryData<QuantizationType> ExpectedTypes()
     {
         var data = new TheoryData<QuantizationType>();
@@ -36,6 +45,13 @@ public sealed class QuantFixtureBlockTypeTests
         return data;
     }
 
+    /// <summary>
+    /// Proves the fixture indexed under <paramref name="type"/> actually contains that ggml block
+    /// type on real weight matrices — not merely that a file with a matching ftype exists. This is
+    /// the check that turns "we cover N quantization types" from a filename convention into a
+    /// measured claim; see the class remarks for why filenames cannot be trusted.
+    /// </summary>
+    /// <param name="type">Block type the ladder claims this fixture exercises.</param>
     [SkippableTheory]
     [MemberData(nameof(ExpectedTypes))]
     public void Fixture_ContainsTheBlockTypeItClaims(QuantizationType type)
