@@ -34,6 +34,14 @@ public sealed class QuantLadderFixture
     /// <summary>Environment variable overriding the ladder root directory.</summary>
     public const string DirEnvVar = "DOTLLM_QUANT_LADDER";
 
+    /// <summary>
+    /// Minimum byte size for a fixture to be classified as <see cref="Available"/> rather than
+    /// <see cref="Missing"/>. Existence alone does not prove a fixture is usable: a crashed
+    /// <c>llama-quantize</c> leaves a truncated stub behind, and a first sweep once reported
+    /// "21/21 produced" where 12 were 1.7 MB stubs.
+    /// </summary>
+    public const long MinFixtureBytes = 1_000_000;
+
     private const int Ctx135M = 512;
     private const int Ctx1B = 128;
 
@@ -87,9 +95,8 @@ public sealed class QuantLadderFixture
         {
             string full = Path.GetFullPath(Path.Combine(RootDirectory, relativePath));
 
-            // Size is checked, not just existence: a crashed llama-quantize leaves a truncated
-            // file, and a first sweep once reported "21/21 produced" where 12 were 1.7 MB stubs.
-            if (File.Exists(full) && new FileInfo(full).Length > 1_000_000)
+            // Size is checked, not just existence — see MinFixtureBytes for why.
+            if (File.Exists(full) && new FileInfo(full).Length > MinFixtureBytes)
                 available.Add(new QuantLadderEntry(type, full, ctx));
             else
                 missing.Add(type);

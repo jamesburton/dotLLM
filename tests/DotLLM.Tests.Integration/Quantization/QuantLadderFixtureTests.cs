@@ -37,7 +37,7 @@ public sealed class QuantLadderFixtureTests
         foreach (var entry in _ladder.Available)
         {
             Assert.True(File.Exists(entry.FilePath), $"{entry.Type}: {entry.FilePath}");
-            Assert.True(new FileInfo(entry.FilePath).Length > 1_000_000,
+            Assert.True(new FileInfo(entry.FilePath).Length > QuantLadderFixture.MinFixtureBytes,
                 $"{entry.Type} is {new FileInfo(entry.FilePath).Length} bytes — a truncated quantize leaves a stub");
         }
     }
@@ -63,5 +63,71 @@ public sealed class QuantLadderFixtureTests
     {
         var types = QuantLadderFixture.Expected.Select(e => e.Type).ToList();
         Assert.Equal(types.Count, types.Distinct().Count());
+    }
+
+    /// <summary>
+    /// Against an empty ladder root, classification must actually reach <c>Missing</c> for every
+    /// expected type — not just leave <c>Available</c> vacuously empty. This is the failure mode
+    /// #256 exists to catch: an empty directory previously still made every test in this class
+    /// pass. The fixture is constructed directly here (not via the shared collection fixture) and
+    /// the environment mutation is scoped to this test with save/restore in <c>finally</c>, since
+    /// xunit can run other collections concurrently and must not observe this override.
+    /// </summary>
+    [Fact]
+    public void EmptyLadderRoot_ClassifiesEveryExpectedTypeAsMissing()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), $"quant-ladder-empty-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempRoot);
+        string? previous = Environment.GetEnvironmentVariable(QuantLadderFixture.DirEnvVar);
+
+        try
+        {
+            Environment.SetEnvironmentVariable(QuantLadderFixture.DirEnvVar, tempRoot);
+            var fixture = new QuantLadderFixture();
+
+            Assert.Empty(fixture.Available);
+            Assert.Equal(
+                QuantLadderFixture.Expected.Select(e => e.Type).ToHashSet(),
+                fixture.Missing.ToHashSet());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(QuantLadderFixture.DirEnvVar, previous);
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// A stub file — present at the expected relative path but far short of
+    /// <see cref="QuantLadderFixture.MinFixtureBytes"/> — must classify as <c>Missing</c>, not
+    /// <c>Available</c>. This proves the size check is load-bearing: a crashed
+    /// <c>llama-quantize</c> leaves exactly this kind of truncated file behind, and existence
+    /// alone would wrongly call it usable. No real fixture is touched — the stub is a few KB of
+    /// zeros written under a fresh temp directory.
+    /// </summary>
+    [Fact]
+    public void TruncatedStubFile_ClassifiesAsMissing_NotAvailable()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), $"quant-ladder-stub-{Guid.NewGuid():N}");
+        string? previous = Environment.GetEnvironmentVariable(QuantLadderFixture.DirEnvVar);
+
+        try
+        {
+            var (stubType, relativePath, _) = QuantLadderFixture.Expected[0];
+            string stubFullPath = Path.Combine(tempRoot, relativePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(stubFullPath)!);
+            File.WriteAllBytes(stubFullPath, new byte[4096]);
+
+            Environment.SetEnvironmentVariable(QuantLadderFixture.DirEnvVar, tempRoot);
+            var fixture = new QuantLadderFixture();
+
+            Assert.Contains(stubType, fixture.Missing);
+            Assert.DoesNotContain(fixture.Available, e => e.Type == stubType);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(QuantLadderFixture.DirEnvVar, previous);
+            Directory.Delete(tempRoot, recursive: true);
+        }
     }
 }
