@@ -529,9 +529,18 @@ public static unsafe partial class Dequantize
     /// — note the scale comes BEFORE the codes (opposite of where a reader familiar with
     /// <see cref="DequantizeI2_S"/>'s tensor-TAIL scale might expect it — this is a genuinely
     /// different, per-GROUP scale, empirically confirmed, not to be assumed from I2_S's shape).
-    /// Within a group, byte at <c>group_pos</c> (0..31) holds the codes for elements
-    /// {group_pos, +32, +64, +96} at bit offsets {6,4,2,0} — same bit convention as I2_S.
-    /// Codes map 0→-1, 1→0, 2→+1. Formula: <c>value = (code - 1) * group_scale</c>.
+    /// Within a group, byte at index <c>b</c> (0..31) holds the codes for the 4 CONSECUTIVE
+    /// elements {4b, 4b+1, 4b+2, 4b+3} at ASCENDING bit offsets {0,2,4,6} (element <c>4b+k</c> at
+    /// bit offset <c>2k</c>) — verified byte-for-byte against PrismML's own reference
+    /// <c>dequantize_row_q2_0</c> in their <c>PrismML-Eng/llama.cpp</c> fork (<c>ggml-quants.c</c>,
+    /// <c>byte_index = j/4; bit_offset = (j%4)*2</c>). This is NOT the same convention as
+    /// <see cref="DequantizeI2_S"/>'s strided {gp,+32,+64,+96}/descending-bits scheme — an earlier
+    /// version of this function wrongly assumed PQ2_0 shared I2_S's exact bit-interleave (issue
+    /// #269 follow-up investigation, 2026-08-05), which silently scrambled every weight's position
+    /// within its 128-element group while leaving per-tensor statistics looking numerically
+    /// unremarkable (same value set, wrong positions) — the root cause of Bonsai-27B's garbled
+    /// generation and nightmarish (610,988) real-corpus perplexity. Codes map 0→-1, 1→0, 2→+1,
+    /// 3→+2. Formula: <c>value = (code - 1) * group_scale</c>.
     /// </summary>
     [SkipLocalsInit]
     internal static void DequantizePQ2_0(nint src, long elementCount, Span<float> dest)
@@ -551,13 +560,14 @@ public static unsafe partial class Dequantize
             byte* codes = groupBase + 2;
             int outBase = (int)(g * PQ2_0GroupSize);
 
-            for (int gp = 0; gp < 32; gp++)
+            for (int b = 0; b < 32; b++)
             {
-                byte packed = codes[gp];
-                dest[outBase + gp] = (((packed >> 6) & 0x3) - 1) * scale;
-                dest[outBase + gp + 32] = (((packed >> 4) & 0x3) - 1) * scale;
-                dest[outBase + gp + 64] = (((packed >> 2) & 0x3) - 1) * scale;
-                dest[outBase + gp + 96] = ((packed & 0x3) - 1) * scale;
+                byte packed = codes[b];
+                int outIdx = outBase + 4 * b;
+                dest[outIdx] = ((packed & 0x3) - 1) * scale;
+                dest[outIdx + 1] = (((packed >> 2) & 0x3) - 1) * scale;
+                dest[outIdx + 2] = (((packed >> 4) & 0x3) - 1) * scale;
+                dest[outIdx + 3] = (((packed >> 6) & 0x3) - 1) * scale;
             }
         }
     }

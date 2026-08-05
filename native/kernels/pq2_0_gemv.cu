@@ -1133,23 +1133,32 @@ struct Pq2_0GroupX
     float x0, x1, x2, x3, sum;
 };
 
+// NOTE (issue #269 follow-up, 2026-08-05): `xb` is now the index of the FIRST of 4 CONSECUTIVE
+// activation elements {xb, xb+1, xb+2, xb+3} — verified byte-for-byte against PrismML's own
+// reference `dequantize_row_q2_0` (PrismML-Eng/llama.cpp, ggml-quants.c: byte_index = j/4;
+// bit_offset = (j%4)*2). This is NOT I2_S's strided {xb,+32,+64,+96} layout, which an earlier
+// version of this pair wrongly assumed PQ2_0 shared — see
+// DotLLM.Cpu/Kernels/Dequantize.cs's DequantizePQ2_0 doc comment for the full root-cause
+// writeup. Call sites must pass `out_base + 4*lane`, not `out_base + lane`.
 __device__ __forceinline__ Pq2_0GroupX pq2_0_load_group_x(const half* xs, int xb)
 {
     Pq2_0GroupX gx;
     gx.x0 = __half2float(xs[xb]);
-    gx.x1 = __half2float(xs[xb + 32]);
-    gx.x2 = __half2float(xs[xb + 64]);
-    gx.x3 = __half2float(xs[xb + 96]);
+    gx.x1 = __half2float(xs[xb + 1]);
+    gx.x2 = __half2float(xs[xb + 2]);
+    gx.x3 = __half2float(xs[xb + 3]);
     gx.sum = gx.x0 + gx.x1 + gx.x2 + gx.x3;
     return gx;
 }
 
+// Ascending bit offsets {0,2,4,6} → consecutive elements {xb,xb+1,xb+2,xb+3} (see
+// pq2_0_load_group_x's note above).
 __device__ __forceinline__ float pq2_0_code_dot(unsigned int p, const Pq2_0GroupX& gx)
 {
-    unsigned int c0 = (p >> 6) & 0x3;
-    unsigned int c1 = (p >> 4) & 0x3;
-    unsigned int c2 = (p >> 2) & 0x3;
-    unsigned int c3 =  p       & 0x3;
+    unsigned int c0 =  p       & 0x3;
+    unsigned int c1 = (p >> 2) & 0x3;
+    unsigned int c2 = (p >> 4) & 0x3;
+    unsigned int c3 = (p >> 6) & 0x3;
     return (float)c0 * gx.x0 + (float)c1 * gx.x1 + (float)c2 * gx.x2 + (float)c3 * gx.x3;
 }
 
@@ -1184,15 +1193,18 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f32in(
             #pragma unroll
             for (int gp = 0; gp < 32; gp++)
             {
+                // Ascending bit offsets {0,2,4,6} -> consecutive elements {4*gp,+1,+2,+3} — see
+                // pq2_0_load_group_x's note above (issue #269 follow-up, 2026-08-05).
                 uint8_t p = codes[gp];
-                int c0 = ((p >> 6) & 0x3) - 1;
-                int c1 = ((p >> 4) & 0x3) - 1;
-                int c2 = ((p >> 2) & 0x3) - 1;
-                int c3 = ( p       & 0x3) - 1;
-                group_acc += (float)c0 * x[out_base + gp]
-                           + (float)c1 * x[out_base + gp + 32]
-                           + (float)c2 * x[out_base + gp + 64]
-                           + (float)c3 * x[out_base + gp + 96];
+                int c0 = ( p       & 0x3) - 1;
+                int c1 = ((p >> 2) & 0x3) - 1;
+                int c2 = ((p >> 4) & 0x3) - 1;
+                int c3 = ((p >> 6) & 0x3) - 1;
+                int elemBase = out_base + 4 * gp;
+                group_acc += (float)c0 * x[elemBase]
+                           + (float)c1 * x[elemBase + 1]
+                           + (float)c2 * x[elemBase + 2]
+                           + (float)c3 * x[elemBase + 3];
             }
             acc += group_acc * scale;
         }
@@ -1320,7 +1332,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
 
                 // Loaded/summed ONCE per (warp, group), reused across both rows below — see the
                 // "Algebraic ALU reduction" note above pq2_0_load_group_x's definition.
-                const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + lane);
+                const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + 4 * lane);
 
                 #pragma unroll
                 for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
@@ -1454,7 +1466,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in(
 
                 // Loaded/summed ONCE per (warp, group), reused across both rows below — see the
                 // "Algebraic ALU reduction" note above pq2_0_load_group_x's definition.
-                const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + lane);
+                const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + 4 * lane);
 
                 #pragma unroll
                 for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
@@ -1561,7 +1573,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in_small(
 
             // Loaded/summed ONCE per (warp, group), reused across both rows below - see the
             // "Algebraic ALU reduction" note above pq2_0_load_group_x's definition.
-            const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + lane);
+            const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + 4 * lane);
 
             #pragma unroll
             for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
@@ -1655,7 +1667,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in_small(
 
             // Loaded/summed ONCE per (warp, group), reused across both rows below - see the
             // "Algebraic ALU reduction" note above pq2_0_load_group_x's definition.
-            const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + lane);
+            const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + 4 * lane);
 
             #pragma unroll
             for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
@@ -1763,7 +1775,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f32io(
 
                 // Loaded/summed ONCE per (warp, group), reused across both rows below - see the
                 // "Algebraic ALU reduction" note above pq2_0_load_group_x's definition.
-                const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + lane);
+                const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + 4 * lane);
 
                 #pragma unroll
                 for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
@@ -1877,7 +1889,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f32io(
 
                 // Loaded/summed ONCE per (warp, group), reused across both rows below - see the
                 // "Algebraic ALU reduction" note above pq2_0_load_group_x's definition.
-                const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + lane);
+                const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + 4 * lane);
 
                 #pragma unroll
                 for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
@@ -1978,7 +1990,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f32io_small(
 
             // Loaded/summed ONCE per (warp, group), reused across both rows below - see the
             // "Algebraic ALU reduction" note above pq2_0_load_group_x's definition.
-            const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + lane);
+            const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + 4 * lane);
 
             #pragma unroll
             for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
@@ -2078,7 +2090,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f32io_small(
 
             // Loaded/summed ONCE per (warp, group), reused across both rows below - see the
             // "Algebraic ALU reduction" note above pq2_0_load_group_x's definition.
-            const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + lane);
+            const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + 4 * lane);
 
             #pragma unroll
             for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)

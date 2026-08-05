@@ -6,9 +6,17 @@
 //   * 128-element GROUP = 34 bytes: scale(Half, 2 bytes) THEN codes[32] (4 codes/byte, 2 bits
 //     each). Unlike I2_S (one per-tensor tail scale), PQ2_0's scale is PER-GROUP and comes
 //     BEFORE its codes — empirically verified against real Ternary-Bonsai-27B-Q2_0.gguf bytes.
-//   * Byte gp in [0,31] within a group's codes holds elements {gp, gp+32, gp+64, gp+96} at bit
-//     offsets {6,4,2,0}.
-//   * Code mapping value = code - 1 (0->-1, 1->0, 2->+1).
+//   * Byte b in [0,31] within a group's codes holds the 4 CONSECUTIVE elements
+//     {4b, 4b+1, 4b+2, 4b+3} at ASCENDING bit offsets {0,2,4,6} — verified byte-for-byte against
+//     PrismML's own reference `dequantize_row_q2_0` in their PrismML-Eng/llama.cpp fork
+//     (ggml-quants.c: byte_index = j/4; bit_offset = (j%4)*2). This is NOT I2_S's strided
+//     {gp,+32,+64,+96}/descending-bits layout — an earlier version of this kernel wrongly copied
+//     that convention (issue #269 follow-up, 2026-08-05), which silently scrambled every weight's
+//     position within its 128-element group (same value SET, wrong positions) while leaving
+//     per-tensor activation statistics looking numerically unremarkable throughout the whole
+//     forward pass — the root cause of Bonsai-27B's garbled generation. See
+//     DotLLM.Cpu/Kernels/Dequantize.cs's DequantizePQ2_0 doc comment for the full writeup.
+//   * Code mapping value = code - 1 (0->-1, 1->0, 2->+1, 3->+2).
 //
 // Output is dense row-major FP16 [n, k] for a cuBLAS HGEMM prefill, mirroring dequant_i2_s.cu.
 //
@@ -76,15 +84,17 @@ extern "C" __global__ void __launch_bounds__(256) dequant_pq2_0_f16(
         float scale = __half2float(scales[g]);
         uint8_t p = codesBase[(size_t)g * 32 + lane];   // unconditionally aligned+coalesced — see file header
 
-        int c0 = ((p >> 6) & 0x3) - 1;
-        int c1 = ((p >> 4) & 0x3) - 1;
-        int c2 = ((p >> 2) & 0x3) - 1;
-        int c3 = ( p       & 0x3) - 1;
+        // Ascending bit offsets {0,2,4,6} → consecutive elements {4*lane, 4*lane+1, 4*lane+2, 4*lane+3}.
+        int c0 = ( p       & 0x3) - 1;
+        int c1 = ((p >> 2) & 0x3) - 1;
+        int c2 = ((p >> 4) & 0x3) - 1;
+        int c3 = ((p >> 6) & 0x3) - 1;
 
         half* out_base = dst + (size_t)row * k + (size_t)gi * PQ2_0_GROUP_SIZE;
-        out_base[lane]      = __float2half((float)c0 * scale);
-        out_base[lane + 32] = __float2half((float)c1 * scale);
-        out_base[lane + 64] = __float2half((float)c2 * scale);
-        out_base[lane + 96] = __float2half((float)c3 * scale);
+        int outIdx = 4 * lane;
+        out_base[outIdx]     = __float2half((float)c0 * scale);
+        out_base[outIdx + 1] = __float2half((float)c1 * scale);
+        out_base[outIdx + 2] = __float2half((float)c2 * scale);
+        out_base[outIdx + 3] = __float2half((float)c3 * scale);
     }
 }
