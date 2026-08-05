@@ -45,7 +45,42 @@ public static class QuantGateCorpus
 /// <param name="Perplexity">Teacher-forced result — the prefill/GEMM leg.</param>
 /// <param name="DecodeTokens">Greedy token ids emitted, in order — the decode/GEMV leg.</param>
 /// <param name="DecodeLogits">Full logit vector at each decode step.</param>
-public sealed record QuantGateRun(PerplexityResult Perplexity, int[] DecodeTokens, float[][] DecodeLogits);
+/// <remarks>
+/// <para>
+/// <b>Do not compare two runs by record equality, and never compare
+/// <see cref="PerplexityResult.WindowCount"/> across backends.</b> The window count is an artefact of
+/// which evaluator path the backend's logits shape selected, not of the kernels being measured: a
+/// backend returning all rows (the CPU transformer) takes
+/// <c>PerplexityEvaluator.TeacherForcedSinglePass</c> and reports <c>WindowCount == 1</c>, while a
+/// last-row-only backend (CUDA and Vulkan dense) takes <c>TeacherForcedGrowingPrefix</c> and reports
+/// <c>WindowCount == ctx - 1</c>. Comparing it would fail every cell for a reason that has nothing to
+/// do with quantization.
+/// </para>
+/// <para>
+/// <b>Comparable across backends:</b> <see cref="PerplexityResult.MeanNegativeLogLikelihood"/>,
+/// <see cref="PerplexityResult.Perplexity"/> and <see cref="PerplexityResult.ScoredTokens"/> (the
+/// last of which must <i>match</i> for the others to mean anything), plus
+/// <see cref="DecodeTokens"/> and <see cref="DecodeLogits"/>.
+/// </para>
+/// </remarks>
+public sealed record QuantGateRun(PerplexityResult Perplexity, int[] DecodeTokens, float[][] DecodeLogits)
+{
+    /// <summary>
+    /// Whether the decode leg emitted more than one distinct token, and so actually discriminates.
+    /// </summary>
+    /// <remarks>
+    /// Decoding is greedy with no repetition penalty (it must stay deterministic to be comparable),
+    /// so a small model can emit EOS immediately or lock into a repeat. Every step then carries the
+    /// same id, and a token-level cross-backend comparison becomes vacuously equal — passing the
+    /// decode/GEMV leg without exercising it, which is the exact failure the two-leg design exists to
+    /// prevent. Callers should assert on this rather than assume the leg was informative; a false
+    /// value means "choose a different decode prompt", not "the backends agree".
+    /// <para>Note that <see cref="DecodeLogits"/> stays discriminating either way — identical tokens
+    /// can still sit on materially different logit vectors. This flag is about the token-level
+    /// comparison only.</para>
+    /// </remarks>
+    public bool DecodeIsInformative => DecodeTokens.Distinct().Count() > 1;
+}
 
 /// <summary>
 /// Loads a ladder fixture on one backend and scores both legs (#256).
@@ -138,13 +173,9 @@ public static class QuantGateBackendRunner
                 break;
 
             case QuantGateBackend.Vulkan:
-            {
-                var vk = DotLLM.Vulkan.VulkanDevice.Create();
-                ownedDevice = vk;
-                (model, _) = DotLLM.Vulkan.VulkanModelLoader.CreateFromGguf(vk, gguf, config, ResolveSpvDir());
+                (model, ownedDevice) = LoadVulkan(gguf, config);
                 deviceId = 0;
                 break;
-            }
 
             default:
                 model = ModelLoader.CreateCpuModelFromGguf(gguf, config, new ThreadingConfig(0));
@@ -152,38 +183,82 @@ public static class QuantGateBackendRunner
                 break;
         }
 
+        // Nested rather than a single finally with two disposals: if model.Dispose() throws, a flat
+        // finally would skip the device disposal and leak the same handles the catch above exists to
+        // protect.
         try
         {
-            var tokens = new List<int>();
-            using (var reader = new StreamReader(corpusPath))
+            try
             {
-                foreach (int id in CorpusReader.StreamTokens(reader, tokenizer, corpusTokens))
-                    tokens.Add(id);
+                var tokens = new List<int>();
+                using (var reader = new StreamReader(corpusPath))
+                {
+                    foreach (int id in CorpusReader.StreamTokens(reader, tokenizer, corpusTokens))
+                        tokens.Add(id);
+                }
+
+                // Probed, not assumed: CUDA returns last-row-only, and so does Vulkan — a type-based
+                // assumption here would silently produce a wrong perplexity.
+                bool returnsAllRows = BackendPerplexityModel.Probe(model, deviceId);
+                var pplModel = new BackendPerplexityModel(model, deviceId, returnsAllRows);
+
+                // Teacher-forced: the only mode comparable across backends, since sliding-window
+                // requires all-row logits which the GPU paths do not return.
+                int ctx = Math.Min(entry.ContextLength, config.MaxSequenceLength);
+                var options = new PerplexityOptions(PerplexityMode.TeacherForced, ctx, ctx);
+                PerplexityResult ppl = PerplexityEvaluator.Evaluate(
+                    pplModel, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(tokens), options);
+
+                // The recurrent state left by the perplexity run must not leak into decode (#261).
+                pplModel.ResetState();
+
+                var (decodeTokens, decodeLogits) = RunDecode(
+                    model, tokenizer, deviceId, decodePrompt, decodeSteps);
+                return new QuantGateRun(ppl, decodeTokens, decodeLogits);
             }
-
-            // Probed, not assumed: CUDA returns last-row-only, and so does Vulkan — a type-based
-            // assumption here would silently produce a wrong perplexity.
-            bool returnsAllRows = BackendPerplexityModel.Probe(model, deviceId);
-            var pplModel = new BackendPerplexityModel(model, deviceId, returnsAllRows);
-
-            // Teacher-forced: the only mode comparable across backends, since sliding-window
-            // requires all-row logits which the GPU paths do not return.
-            int ctx = Math.Min(entry.ContextLength, config.MaxSequenceLength);
-            var options = new PerplexityOptions(PerplexityMode.TeacherForced, ctx, ctx);
-            PerplexityResult ppl = PerplexityEvaluator.Evaluate(
-                pplModel, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(tokens), options);
-
-            // The recurrent state left by the perplexity run must not leak into decode (#261).
-            pplModel.ResetState();
-
-            var (decodeTokens, decodeLogits) = RunDecode(
-                model, tokenizer, deviceId, decodePrompt, decodeSteps);
-            return new QuantGateRun(ppl, decodeTokens, decodeLogits);
+            finally
+            {
+                model.Dispose();
+            }
         }
         finally
         {
-            model.Dispose();
             ownedDevice?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Creates a Vulkan device and loads the model onto it, releasing the device if the load fails.
+    /// </summary>
+    /// <param name="gguf">Open fixture.</param>
+    /// <param name="config">Config extracted from <paramref name="gguf"/>.</param>
+    /// <returns>The model and the device it owns; the caller disposes both.</returns>
+    /// <remarks>
+    /// <para><b>The device outlives its own constructor call and must not leak on a failed load.</b>
+    /// Load failure is not the exceptional case for a coverage gate — it is the expected outcome for
+    /// exactly the cells the gate exists to find: <c>VulkanModelLoader.CreateFromGguf</c> throws
+    /// <see cref="NotSupportedException"/> for architectures with no Vulkan loader, plus
+    /// missing-tensor and out-of-memory paths, and <c>ResolveSpvDir</c> throws when the SPIR-V has
+    /// not been built. Without the catch below, sweeping 21 fixtures leaks a <c>VkDevice</c> and
+    /// <c>VkInstance</c> per failing cell until a later cell dies of handle exhaustion and the
+    /// failure gets attributed to a kernel.</para>
+    /// <para>Extracted into its own method rather than inlined in the switch so the device is
+    /// <i>returned</i>, which makes the ownership transfer visible to the caller and to the
+    /// IDisposable analyzers.</para>
+    /// </remarks>
+    private static (IModel Model, IDisposable Device) LoadVulkan(GgufFile gguf, ModelConfig config)
+    {
+        var device = DotLLM.Vulkan.VulkanDevice.Create();
+        try
+        {
+            (IModel model, _) = DotLLM.Vulkan.VulkanModelLoader.CreateFromGguf(
+                device, gguf, config, ResolveSpvDir());
+            return (model, device);
+        }
+        catch (Exception)
+        {
+            device.Dispose();
+            throw;
         }
     }
 
@@ -259,6 +334,15 @@ public static class QuantGateBackendRunner
         if (total < vocab)
             throw new InvalidOperationException(
                 $"Logits tensor holds {total} elements, fewer than one row of {vocab}.");
+
+        // A padded or otherwise non-vocab row length would make `total - vocab` land mid-row and the
+        // read straddle two positions — a wrong measurement that produces no error. Not reachable
+        // with today's backends; asserted anyway, because the whole point of this file is never to
+        // silently measure the wrong thing.
+        if (total % vocab != 0)
+            throw new InvalidOperationException(
+                $"Logits tensor holds {total} elements, not a whole multiple of the vocabulary ({vocab}); " +
+                "the row stride is not the vocabulary size and the last row cannot be located by offset.");
 
         var row = new float[vocab];
         var source = new ReadOnlySpan<float>((void*)(output.DataPointer + (nint)(total - vocab) * sizeof(float)), vocab);
