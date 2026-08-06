@@ -147,6 +147,64 @@ public sealed class VulkanKvCacheLifetimeTests
             "If it stays low while churned-vs-retained is high, a second and larger defect remains.");
     }
 
+    /// <summary>
+    /// Separates "the GEMV kernel is wrong" from "the cached-attention path is wrong" for a cell
+    /// that fails only the cached <c>seqLen == 1</c> leg.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The gate leaves an ambiguity for #278 (Vulkan IQ2_XS, cosine −0.49) and #279 (CUDA IQ3_S).
+    /// Both fail the cached leg while passing the GEMM-shaped legs, and that leg changes two things
+    /// at once: it runs at <c>seqLen == 1</c> (so the fused GEMV kernels are selected) *and* it
+    /// attends over a populated KV cache. Either could be at fault.
+    /// </para>
+    /// <para>
+    /// A one-token prompt separates them. It takes the <b>GEMV</b> path — <c>seqLen == 1</c> — with
+    /// <b>no cache</b>. So:
+    /// </para>
+    /// <list type="bullet">
+    /// <item>diverges here ⇒ the GEMV kernel, independent of any cache;</item>
+    /// <item>agrees here but the cached leg diverges ⇒ the cache/attention interaction, and the
+    /// GEMV kernels are exonerated.</item>
+    /// </list>
+    /// <para>
+    /// Diagnostic, not a gate: it reports and always passes. Its job is to point the next person at
+    /// one of two files rather than both, which is worth more than another red cell.
+    /// </para>
+    /// </remarks>
+    [SkippableTheory]
+    [InlineData(QuantizationType.IQ2_XS, QuantGateBackend.Vulkan)]
+    [InlineData(QuantizationType.IQ3_S, QuantGateBackend.Cuda)]
+    [InlineData(QuantizationType.F16, QuantGateBackend.Vulkan)]
+    public void SingleTokenPrompt_SeparatesGemvFromCache(QuantizationType type, QuantGateBackend backend)
+    {
+        QuantLadderEntry? entry = _ladder.Available.FirstOrDefault(e => e.Type == type);
+        Skip.If(entry is null, $"{type} fixture not present under {_ladder.RootDirectory}");
+        Skip.IfNot(QuantGateBackendRunner.IsAvailable(backend), $"{backend} not available");
+
+        // Single-token prompts: the encoder may still emit a BOS, so these are "as short as the
+        // tokenizer allows" rather than guaranteed length 1 — what matters is that they are far
+        // shorter than the gate's prompts, which drives seqLen for the uncached leg towards 1.
+        string[] tiny = ["A", "1", "the", "{"];
+
+        QuantGateRun cpu = QuantGateBackendRunner.Run(
+            entry!, QuantGateBackend.Cpu, QuantGateCorpus.Path, 256, tiny);
+        QuantGateRun gpu = QuantGateBackendRunner.Run(
+            entry!, backend, QuantGateCorpus.Path, 256, tiny);
+
+        for (int i = 0; i < tiny.Length; i++)
+        {
+            _output.WriteLine(
+                $"  SEPARATE\t{type}/{backend}\tprompt={tiny[i]}\t" +
+                $"uncached={Cosine(cpu.DecodeLogits[i], gpu.DecodeLogits[i]):F6}\t" +
+                $"cached={Cosine(cpu.KvDecodeLogits[i], gpu.KvDecodeLogits[i]):F6}");
+        }
+
+        _output.WriteLine(
+            "  uncached low  => the GEMV kernel itself (short prompt, no cache involved). " +
+            "uncached high + cached low => the cache/attention interaction, GEMV exonerated.");
+    }
+
     /// <summary>Runs the prompt set on Vulkan under one cache-lifetime policy.</summary>
     /// <param name="entry">Fixture to load.</param>
     /// <param name="disposeBetweenPrompts">
