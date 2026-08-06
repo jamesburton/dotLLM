@@ -149,12 +149,19 @@ public sealed class CrossBackendQuantGateTests
             return;
         }
 
-        QuantGateRun cpu;
+        // The CPU reference runs OUTSIDE the environmental catch, deliberately. CPU is the tier
+        // every other measurement is defined against: if it cannot score a fixture, the cell has no
+        // reference and there is nothing to be tolerant about. Sharing the catch below would let a
+        // CPU failure be filed as a declared skip — and `Dequantize` throws NotSupportedException
+        // for a type it does not handle, which that catch classifies as environmental. #255 was
+        // exactly that defect (CPU Q4_0 threw "Unsupported quantization type"), so a gate built to
+        // catch #255 would have recorded it as "unsupported on backend" and stayed green.
+        QuantGateRun cpu = QuantGateBackendRunner.Run(
+            entry, QuantGateBackend.Cpu, QuantGateCorpus.Path, CorpusTokens, DecodePrompts);
+
         QuantGateRun gpu;
         try
         {
-            cpu = QuantGateBackendRunner.Run(
-                entry, QuantGateBackend.Cpu, QuantGateCorpus.Path, CorpusTokens, DecodePrompts);
             gpu = QuantGateBackendRunner.Run(
                 entry, backend, QuantGateCorpus.Path, CorpusTokens, DecodePrompts);
         }
