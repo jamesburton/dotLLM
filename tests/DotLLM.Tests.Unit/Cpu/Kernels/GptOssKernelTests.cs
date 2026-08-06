@@ -280,28 +280,16 @@ public sealed unsafe class GptOssKernelTests
                 $"dim {d}: expected {expected[d]}, got {output[d]}");
     }
 
-    /// <summary>Round-trips a vector through Q8_0 quantization.</summary>
-    private static float[] RoundTripQ8(float[] v)
-    {
-        int k = v.Length;
-        float[] result = new float[k];
-        byte[] q8 = new byte[k / 32 * 34];
-        fixed (float* vp = v)
-        fixed (byte* qp = q8)
-        {
-            MatMul.QuantizeF32ToQ8_0(vp, qp, k);
-            Dequantize.ToFloat32((nint)qp, k, QuantizationType.Q8_0, result);
-        }
-        return result;
-    }
-
     [Fact]
-    public void MoeQuant_Mxfp4Experts_MatchesDequantReferenceWithQ8Activations()
+    public void MoeQuant_Mxfp4Experts_MatchesDequantReference()
     {
-        // Exact oracle: the MXFP4 GEMVs compute dot(dequantized MXFP4 row,
-        // Q8_0-round-tripped activations). Rebuild that pipeline in double
-        // precision (round-tripping the activations at each GEMV boundary) —
-        // only float summation-order noise remains.
+        // Exact oracle (issue #275): the MXFP4 GEMVs compute
+        // dot(dequantized MXFP4 row, f32 activations) directly — no Q8_0
+        // round-trip of the activations (that step was removed by #275: it
+        // added noise dotLLM's CUDA/Vulkan MXFP4 path does not have, since
+        // both dequantize to F16 and run a full-precision GEMM/GEMV with no
+        // activation quantization at all). Rebuild that pipeline in double
+        // precision — only float summation-order noise remains.
         const int E = 4, topK = 2, H = 64, I = 64;
         var rng = new Random(314);
 
@@ -361,7 +349,6 @@ public sealed unsafe class GptOssKernelTests
         double m = order.Max(e => logits[e]);
         double sum = order.Sum(e => Math.Exp(logits[e] - m));
 
-        float[] xq = RoundTripQ8(x);
         var expected = new double[H];
         var magnitude = new double[H];
         foreach (int e in order)
@@ -373,20 +360,19 @@ public sealed unsafe class GptOssKernelTests
                 double g = 0, u = 0;
                 for (int j = 0; j < H; j++)
                 {
-                    g += (double)gateF[(e * I + i) * H + j] * xq[j];
-                    u += (double)upF[(e * I + i) * H + j] * xq[j];
+                    g += (double)gateF[(e * I + i) * H + j] * x[j];
+                    u += (double)upF[(e * I + i) * H + j] * x[j];
                 }
                 double xg = Math.Min(g, 7.0);
                 double yu = Math.Clamp(u, -7.0, 7.0);
                 act[i] = (float)(xg / (1.0 + Math.Exp(1.702 * -xg)) * (yu + 1.0));
             }
-            float[] actQ = RoundTripQ8(act);
             for (int d = 0; d < H; d++)
             {
                 double o = 0, mag = 0;
                 for (int i = 0; i < I; i++)
                 {
-                    double term = (double)downF[(e * H + d) * I + i] * actQ[i];
+                    double term = (double)downF[(e * H + d) * I + i] * act[i];
                     o += term;
                     mag += Math.Abs(term);
                 }
@@ -397,10 +383,8 @@ public sealed unsafe class GptOssKernelTests
 
         for (int d = 0; d < H; d++)
         {
-            // Tolerance scales with the cancellation-free magnitude: float
-            // summation-order noise plus the tiny Q8 scale-rounding drift
-            // between the integer-dot and float-dot formulations.
-            double tol = magnitude[d] * 2e-3 + 1e-3;
+            // Ordinary float summation-order tolerance only — no quantization noise remains.
+            double tol = magnitude[d] * 1e-5 + 1e-4;
             Assert.True(Math.Abs(expected[d] - outQ[d]) <= tol,
                 $"dim {d}: expected {expected[d]}, got {outQ[d]} (tol {tol})");
         }
