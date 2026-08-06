@@ -75,6 +75,10 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     private readonly VulkanGdnStateCache _gdnCache;
     private readonly VulkanQwen3MoeHybridKernels _kernels;
 
+    // Last KV cache seen by the forward core, for reference-identity comparison only — a change
+    // means the cached descriptor sets may be bound to VkBuffers that no longer exist.
+    private IKvCache? _lastKvCache;
+
     // Hybrid layout: kind per layer + sparse KV-slot mapping for attention layers only.
     private readonly HybridLayerLayout _layout;
     private readonly GatedDeltaNetConfig _gdn;
@@ -558,7 +562,17 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         }
 
         bool resized = _state.EnsureCapacity(seqLen);
-        if (resized) _kernels.InvalidateAll();
+
+        // A KV-cache identity change invalidates cached descriptor sets for the same reason a
+        // scratch reallocation does: they are keyed on raw VkBuffer handles, and after
+        // vkDestroyBuffer the driver may reissue the same handle for the next allocation — so a
+        // descriptor-cache hit can bind a set written against a destroyed buffer and read freed
+        // memory, silently and intermittently. This model binds cached K/V into attention via
+        // GetKeysBuffer/GetValuesBuffer exactly as VulkanTransformerModel does; see the fuller
+        // note there. Third instance of the same pattern, fixed in the same change.
+        if (resized || !ReferenceEquals(_lastKvCache, kvCache)) _kernels.InvalidateAll();
+
+        _lastKvCache = kvCache;
 
         UploadPositions(positions);
 

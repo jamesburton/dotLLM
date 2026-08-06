@@ -40,6 +40,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private readonly VulkanDevice _device;
     private readonly VulkanNemotronHWeights _weights;
     private readonly VulkanNemotronHForwardState _state;
+
+    // Last KV cache seen by Forward, for reference-identity comparison only — a change means the
+    // cached descriptor sets may be bound to VkBuffers that no longer exist. Holding the reference
+    // keeps the managed wrapper alive, not the device memory; the caller still owns disposal.
+    private IKvCache? _lastKvCache;
     private readonly VulkanSsmStateCache _ssmCache;
 
     // Caller-supplied per-sequence SSM state for the in-flight forward, set by the
@@ -700,8 +705,22 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         float eps = Config.NormEpsilon;
 
         bool scratchResized = _state.EnsureCapacity(seqLen);
-        if (scratchResized)
+
+        // A KV-cache identity change invalidates the cached descriptor sets for the same reason a
+        // scratch reallocation does: DescriptorSetCache matches on raw VkBuffer handle values, and
+        // a handle is only unique while its buffer lives. Dispose one cache, allocate another, and
+        // the driver may reissue the identical handle — scoring a descriptor-cache "hit" on a set
+        // bound to the destroyed buffer. It reads freed memory with no Vulkan error, and shows up
+        // only as intermittently wrong numbers.
+        //
+        // Same defect and same fix as VulkanTransformerModel; see the fuller note there. This model
+        // binds cached K/V into attention through GetKeysBuffer/GetValuesBuffer exactly as that one
+        // does, and InvalidateKernelCaches already covers _attention, so it has always had the same
+        // exposure. Fixed here in the same change rather than left for whoever hits it next.
+        if (scratchResized || !ReferenceEquals(_lastKvCache, kvCache))
             InvalidateKernelCaches();
+
+        _lastKvCache = kvCache;
 
         ValidateTokenIds(tokenIds);
         UploadPositions(positions);

@@ -844,6 +844,11 @@ public sealed class VulkanTransformerModel : IModel
     private readonly bool _ownsDevice;
 
     // LoRA (Phase 4b) — device-side cache of uploaded adapters keyed by
+    // Last KV cache seen by Forward, for reference-identity comparison only. A change means every
+    // cached descriptor set may be bound to a VkBuffer that no longer exists — see the invalidation
+    // site in Forward for why a recycled handle makes this silently wrong rather than an error.
+    private IKvCache? _lastKvCache;
+
     // ILoraAdapter reference identity. Lazy: zero VRAM when no LoRA Forward
     // is ever invoked. _currentLora is set/cleared in the try/finally
     // surrounding the inner Forward and is checked at every projection
@@ -3052,8 +3057,30 @@ public sealed class VulkanTransformerModel : IModel
         // next dispatch binds a dangling VkBuffer. In steady-state decode
         // (seqLen = 1 after the initial prefill) scratch never grows, so the
         // cache stays warm across forwards.
-        if (scratchResized)
+        //
+        // The same reasoning applies to the KV cache, which was previously missed. A VkBuffer
+        // handle is only unique while the buffer lives: after vkDestroyBuffer the driver is free
+        // to hand the identical numeric handle back for the next allocation. Because
+        // DescriptorSetCache.GetOrCreate matches purely on those handle values, a caller that
+        // disposes one KV cache and creates another — one cache per sequence, which is exactly
+        // what a server does across requests — can score a "hit" on a descriptor set written
+        // against the destroyed buffer and read freed memory. There is no Vulkan error for this;
+        // it surfaces only as wrong numbers, intermittently, depending on how the driver recycles.
+        //
+        // Found by the #256 gate: every Vulkan cell of the cached seqLen == 1 leg diverged from
+        // CPU, F16 and BF16 included (so not a quantization kernel), and scoring the same prompts
+        // twice under different cache lifetimes gave different logits on the same device — see
+        // VulkanKvCacheLifetimeTests. With the caches retained, Vulkan matches CPU to ~1e-5.
+        //
+        // Mirrors CudaTransformerModel, which has always re-captured its decode graph on a
+        // kvCache identity change (CudaTransformerModel.cs:1794) — that is why CUDA was clean.
+        if (scratchResized || !ReferenceEquals(_lastKvCache, kvCache))
             InvalidateKernelCaches();
+
+        // Held by reference for identity only. This keeps the managed wrapper alive, not the
+        // device memory: the caller still owns disposal, and Dispose destroys the VkBuffers
+        // whether or not this field points at it.
+        _lastKvCache = kvCache;
 
         // Pipeline stage resume (layer-spanning): seed HiddenState from the handed-off hidden rows of a
         // previous stage instead of gathering token embeddings. Synchronous host→device upload into the
