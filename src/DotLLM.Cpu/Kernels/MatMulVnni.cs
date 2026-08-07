@@ -177,9 +177,9 @@ public static unsafe partial class MatMul
         {
             VecDotQ8_0VnniZp_4Rows(
                 weightsQ8 + (long)row * rowBytes,
-                weightsQ8 + (row + 1) * rowBytes,
-                weightsQ8 + (row + 2) * rowBytes,
-                weightsQ8 + (row + 3) * rowBytes,
+                weightsQ8 + (long)(row + 1) * rowBytes,
+                weightsQ8 + (long)(row + 2) * rowBytes,
+                weightsQ8 + (long)(row + 3) * rowBytes,
                 xQ8, blockCount, result + row);
         }
         for (; row < m; row++)
