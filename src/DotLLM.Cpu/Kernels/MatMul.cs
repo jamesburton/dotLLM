@@ -58,7 +58,7 @@ public static unsafe partial class MatMul
 
         for (int row = 0; row < m; row++)
         {
-            var rowSpan = new ReadOnlySpan<float>(a + row * k, k);
+            var rowSpan = new ReadOnlySpan<float>(a + (long)row * k, k);
             result[row] = TensorPrimitives.Dot(rowSpan, xSpan);
         }
     }
@@ -72,7 +72,7 @@ public static unsafe partial class MatMul
         for (int row = 0; row < m; row++)
         {
             float sum = 0;
-            float* rowPtr = a + row * k;
+            float* rowPtr = a + (long)row * k;
             for (int j = 0; j < k; j++)
                 sum += rowPtr[j] * x[j];
             result[row] = sum;
@@ -145,9 +145,9 @@ public static unsafe partial class MatMul
             {
                 VecDotQ8_0Avx512_4Rows(
                     weightsQ8 + (long)row * rowBytes,
-                    weightsQ8 + (row + 1) * rowBytes,
-                    weightsQ8 + (row + 2) * rowBytes,
-                    weightsQ8 + (row + 3) * rowBytes,
+                    weightsQ8 + (long)(row + 1) * rowBytes,
+                    weightsQ8 + (long)(row + 2) * rowBytes,
+                    weightsQ8 + (long)(row + 3) * rowBytes,
                     xQ8, blockCount, result + row);
             }
             for (; row < m; row++)
@@ -163,9 +163,9 @@ public static unsafe partial class MatMul
             {
                 VecDotQ8_0Avx2_4Rows(
                     weightsQ8 + (long)row * rowBytes,
-                    weightsQ8 + (row + 1) * rowBytes,
-                    weightsQ8 + (row + 2) * rowBytes,
-                    weightsQ8 + (row + 3) * rowBytes,
+                    weightsQ8 + (long)(row + 1) * rowBytes,
+                    weightsQ8 + (long)(row + 2) * rowBytes,
+                    weightsQ8 + (long)(row + 3) * rowBytes,
                     xQ8, blockCount, result + row);
             }
             for (; row < m; row++)
