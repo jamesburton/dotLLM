@@ -137,6 +137,64 @@ public class JinjaParserTests
         Assert.Equal("found", setAttr.AttributeName);
     }
 
+    // ── Macro statements (#273) ──
+
+    [Fact]
+    public void MacroStatement_NoParams()
+    {
+        var ast = Parse("{% macro greet() %}hi{% endmacro %}");
+        var macro = Assert.IsType<MacroNode>(ast.Nodes[0]);
+        Assert.Equal("greet", macro.Name);
+        Assert.Empty(macro.Parameters);
+        Assert.Single(macro.Body);
+        Assert.IsType<TextNode>(macro.Body[0]);
+    }
+
+    [Fact]
+    public void MacroStatement_ParamsWithAndWithoutDefaults()
+    {
+        var ast = Parse("{% macro render_content(content, do_vision_count, is_system_content=false) %}x{% endmacro %}");
+        var macro = Assert.IsType<MacroNode>(ast.Nodes[0]);
+        Assert.Equal("render_content", macro.Name);
+        Assert.Equal(3, macro.Parameters.Count);
+
+        Assert.Equal("content", macro.Parameters[0].Name);
+        Assert.Null(macro.Parameters[0].Default);
+
+        Assert.Equal("do_vision_count", macro.Parameters[1].Name);
+        Assert.Null(macro.Parameters[1].Default);
+
+        Assert.Equal("is_system_content", macro.Parameters[2].Name);
+        Assert.NotNull(macro.Parameters[2].Default);
+        Assert.IsType<LiteralExpr>(macro.Parameters[2].Default);
+        Assert.Equal(false, ((LiteralExpr)macro.Parameters[2].Default!).Value);
+    }
+
+    [Fact]
+    public void MacroStatement_BodyCapturesStatementsAndExpressions()
+    {
+        var ast = Parse("{% macro wrap(x) %}[{% if x %}{{ x }}{% endif %}]{% endmacro %}");
+        var macro = Assert.IsType<MacroNode>(ast.Nodes[0]);
+        Assert.Equal(3, macro.Body.Count); // "[" text, if-node, "]" text
+        Assert.IsType<TextNode>(macro.Body[0]);
+        Assert.IsType<IfNode>(macro.Body[1]);
+        Assert.IsType<TextNode>(macro.Body[2]);
+    }
+
+    [Fact]
+    public void MacroCall_ParsesAsFunctionCallExpr()
+    {
+        // Call sites use the same FunctionCallExpr as any other function — the parser doesn't
+        // need to know "render_content" is a macro vs. a builtin at parse time.
+        var ast = Parse("{% macro render_content(content) %}{{ content }}{% endmacro %}{{ render_content(message.content) }}");
+        Assert.Equal(2, ast.Nodes.Count);
+        Assert.IsType<MacroNode>(ast.Nodes[0]);
+        var output = Assert.IsType<ExpressionOutputNode>(ast.Nodes[1]);
+        var call = Assert.IsType<FunctionCallExpr>(output.Expression);
+        Assert.Equal("render_content", call.Name);
+        Assert.Single(call.Args);
+    }
+
     [Fact]
     public void FilterChain()
     {
