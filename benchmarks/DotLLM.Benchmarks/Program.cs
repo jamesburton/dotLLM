@@ -22,6 +22,10 @@ if (args.Length > 0 && args[0] == "span-vulkan")
 {
     return VulkanPipelineSpanProfile.Run(args[1..]);
 }
+if (args.Length > 0 && args[0] == "mtp-bench")
+{
+    return MtpBenchProfile.Run(args[1..]);
+}
 
 // Mutator job: run benchmarks in-process so BDN skips the separate subprocess
 // build step entirely. This avoids the 2-minute build timeout that DotLLM.Cuda's
