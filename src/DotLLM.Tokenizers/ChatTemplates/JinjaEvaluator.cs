@@ -4,6 +4,16 @@ using System.Text;
 namespace DotLLM.Tokenizers.ChatTemplates;
 
 /// <summary>
+/// Runtime value produced by evaluating a <see cref="MacroNode"/> and stored as a regular
+/// scope variable under the macro's name — so a later <c>{{ name(args) }}</c> resolves through
+/// the same identifier lookup as any other variable, and macros defined inside a loop or
+/// conditional are only callable once that branch actually executes (matches Jinja2).
+/// </summary>
+internal sealed record JinjaMacroValue(
+    IReadOnlyList<(string Name, IExpression? Default)> Parameters,
+    IReadOnlyList<ITemplateNode> Body);
+
+/// <summary>
 /// Tree-walking evaluator: executes a JinjaTemplate AST against a variable context
 /// and produces the rendered output string.
 /// </summary>
@@ -82,6 +92,12 @@ internal sealed class JinjaEvaluator
 
             case SetAttributeNode setAttr:
                 EvaluateSetAttribute(setAttr);
+                break;
+
+            case MacroNode macroNode:
+                // Registered as a plain scope variable (see JinjaMacroValue) so calls resolve
+                // through the same LookupVariable path as any other identifier.
+                SetVariable(macroNode.Name, new JinjaMacroValue(macroNode.Parameters, macroNode.Body));
                 break;
         }
     }
@@ -403,6 +419,8 @@ internal sealed class JinjaEvaluator
             {
                 // Check if it's a variable that's callable (e.g., user-provided function)
                 var func = LookupVariable(expr.Name);
+                if (func is JinjaMacroValue macro)
+                    return CallMacro(macro, expr.Args);
                 if (func is Func<object?[], object?> callable)
                 {
                     var args = expr.Args.Select(a => EvalExpr(a.Value)).ToArray();
@@ -411,6 +429,70 @@ internal sealed class JinjaEvaluator
                 throw new JinjaException($"Unknown function: {expr.Name}");
             }
         }
+    }
+
+    /// <summary>
+    /// Invokes a macro call site: binds positional/keyword arguments to the macro's declared
+    /// parameters (falling back to each parameter's default expression, then
+    /// <see cref="Undefined"/>), then renders the macro body in its own pushed scope. Named args
+    /// take priority over positional position — mirrors Jinja2/Python keyword-argument binding.
+    /// </summary>
+    private object? CallMacro(JinjaMacroValue macro, IReadOnlyList<(string? Name, IExpression Value)> callArgs)
+    {
+        PushScope();
+        try
+        {
+            var positional = new List<object?>();
+            var named = new Dictionary<string, object?>();
+            foreach (var (name, valueExpr) in callArgs)
+            {
+                var value = EvalExpr(valueExpr);
+                if (name is not null)
+                    named[name] = value;
+                else
+                    positional.Add(value);
+            }
+
+            for (int i = 0; i < macro.Parameters.Count; i++)
+            {
+                var (paramName, defaultExpr) = macro.Parameters[i];
+                object? value;
+                if (named.TryGetValue(paramName, out var namedVal))
+                    value = namedVal;
+                else if (i < positional.Count)
+                    value = positional[i];
+                else if (defaultExpr is not null)
+                    value = EvalExpr(defaultExpr);
+                else
+                    value = Undefined;
+                SetVariable(paramName, value);
+            }
+
+            return RenderNodes(macro.Body);
+        }
+        finally
+        {
+            PopScope();
+        }
+    }
+
+    /// <summary>
+    /// Renders a node list into its own returned string by temporarily redirecting
+    /// <see cref="_output"/> — used for macro bodies, whose rendered text is captured as the
+    /// expression's return value at the call site rather than appended straight to the
+    /// top-level template output. Restores the caller's in-progress output afterward, so nested
+    /// macro calls (a macro invoking another macro) compose correctly via normal recursion.
+    /// </summary>
+    private string RenderNodes(IReadOnlyList<ITemplateNode> nodes)
+    {
+        var saved = _output.ToString();
+        _output.Clear();
+        foreach (var node in nodes)
+            EvaluateNode(node);
+        var rendered = _output.ToString();
+        _output.Clear();
+        _output.Append(saved);
+        return rendered;
     }
 
     private object? EvalMethodCall(MethodCallExpr expr)
