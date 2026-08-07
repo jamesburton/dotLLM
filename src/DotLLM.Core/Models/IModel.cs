@@ -327,4 +327,76 @@ public interface IModel : IDisposable
         }
         return results;
     }
+
+    /// <summary>
+    /// True when this model's checkpoint carries a Multi-Token Prediction (MTP / "NextN") head
+    /// (<see cref="ModelConfig.NextnPredictLayers"/> &gt; 0 <em>and</em> the loader found the
+    /// <c>nextn.*</c> tensors) — see issue #253. Default <see langword="false"/>: every model
+    /// that doesn't override this is completely unaffected by the MTP members below, which all
+    /// either no-op or throw.
+    /// </summary>
+    bool SupportsMtp => false;
+
+    /// <summary>
+    /// Allocates a fresh <see cref="IMtpState"/> — the MTP head's own tiny KV-cache plus pending
+    /// hidden-state handoff — or <see langword="null"/> when <see cref="SupportsMtp"/> is
+    /// <see langword="false"/>. The caller owns the returned state's lifetime (one per in-flight
+    /// sequence using MTP self-speculative decoding).
+    /// </summary>
+    IMtpState? CreateMtpState() => null;
+
+    /// <summary>
+    /// Runs a forward pass that additionally captures the trunk's pre-final-norm hidden state
+    /// (one row per input position, in <paramref name="tokenIds"/> order) into
+    /// <paramref name="mtpState"/> when non-null, so a subsequent <see cref="ForwardMtp"/> call
+    /// can seed the MTP head's next autoregressive draft step from it.
+    /// </summary>
+    /// <remarks>
+    /// <para>The default implementation ignores <paramref name="mtpState"/> and forwards to
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, ILoraAdapter?)"/> —
+    /// exactly the "capability off" behavior every model already has today, so passing a non-null
+    /// state to a model with <see cref="SupportsMtp"/> false is a silent no-op rather than an
+    /// error (callers are expected to check <see cref="SupportsMtp"/> before ever constructing an
+    /// <see cref="IMtpState"/> in the first place). Models that override
+    /// <see cref="SupportsMtp"/> to <see langword="true"/> must override this overload too, and
+    /// populate <paramref name="mtpState"/> byte-identically to how they'd behave with
+    /// <paramref name="mtpState"/> null otherwise — capturing the hidden state is a pure side
+    /// effect that never changes the returned logits.</para>
+    /// </remarks>
+    /// <param name="tokenIds">Input token IDs for this step.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    /// <param name="kvCache">Optional KV-cache. When null, behaves identically to the uncached forward pass.</param>
+    /// <param name="adapter">Optional LoRA adapter. When null, behaves like the adapter-less overload.</param>
+    /// <param name="mtpState">
+    /// When non-null on an MTP-supporting model, receives the captured pre-final-norm hidden state
+    /// rows for every position in <paramref name="tokenIds"/>. Ignored otherwise.
+    /// </param>
+    /// <returns>Logits tensor of shape [seq, vocab_size] for all input positions — identical to the non-MTP overload.</returns>
+    ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                    IKvCache? kvCache, ILoraAdapter? adapter, IMtpState? mtpState)
+        => Forward(tokenIds, positions, deviceId, kvCache, adapter);
+
+    /// <summary>
+    /// Runs one MTP head autoregressive draft step: embeds <paramref name="tokenId"/>, combines it
+    /// with <paramref name="state"/>'s current pending hidden vector through the MTP block's own
+    /// <c>enorm</c>/<c>hnorm</c>/<c>eh_proj</c> plus a single decoder block and shared LM head, and
+    /// returns logits over the full vocabulary. Advances <paramref name="state"/>'s own KV-cache by
+    /// one step and updates its pending hidden vector with the MTP block's own output hidden state,
+    /// ready for the <em>next</em> <see cref="ForwardMtp"/> call — the MTP head drafts K tokens by
+    /// calling this K times in a row without re-invoking the trunk (matching llama.cpp's MTP draft
+    /// loop in <c>common_speculative_state_draft_mtp::draft()</c>).
+    /// </summary>
+    /// <param name="state">
+    /// The sequence's <see cref="IMtpState"/>, previously seeded via a <c>Forward</c> call
+    /// with a non-null <c>mtpState</c> and <see cref="IMtpState.SeedFromCapturedRow"/>.
+    /// </param>
+    /// <param name="tokenId">The token whose embedding feeds this MTP step (the previous step's accepted/drafted token).</param>
+    /// <param name="position">Sequence position this MTP step's RoPE angle and KV-cache slot correspond to.</param>
+    /// <returns>Logits tensor of shape [1, vocab_size] for the drafted position.</returns>
+    /// <exception cref="NotSupportedException"><see cref="SupportsMtp"/> is <see langword="false"/>.</exception>
+    ITensor ForwardMtp(IMtpState state, int tokenId, int position)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not support MTP self-speculative decoding (SupportsMtp=false). " +
+            "Check SupportsMtp before creating an IMtpState or calling ForwardMtp. See issue #253.");
 }
