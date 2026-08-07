@@ -354,10 +354,36 @@ public sealed class VulkanTransformerModel : IModel
     // independent ops (Q/K/V, gate/up, per-expert matmuls) overlap — the
     // llama.cpp ggml-vulkan model. Kill-switch restores blanket barriers.
     // DEFAULT = legacy (blanket) barriers. Hazard tracking measured perf-NEUTRAL on
-    // gfx1151 (#144 ledger) and the #144+#145 combination intermittently DEVICE_LOSTs
-    // (under-sync interaction, issue #148) — so hazard mode is opt-IN via
-    // DOTLLM_VULKAN_HAZARD_BARRIERS=1 until root-caused. DOTLLM_VULKAN_LEGACY_BARRIERS=1
-    // still forces legacy explicitly (wins over both).
+    // gfx1151 (#144 ledger) and hazard mode intermittently DEVICE_LOSTs — so hazard
+    // mode is opt-IN via DOTLLM_VULKAN_HAZARD_BARRIERS=1 until root-caused.
+    // DOTLLM_VULKAN_LEGACY_BARRIERS=1 still forces legacy explicitly (wins over both).
+    //
+    // Issue #148 status (2026-08-07 re-investigation): the DEVICE_LOST is REAL and
+    // reproduces on a second, unrelated GPU/driver (NVIDIA RTX 3060, not just the
+    // original gfx1151 report) — `dotllm bench <SmolLM Q8_0 gguf> -d vulkan -p 512
+    // -n 128 -r 3` with DOTLLM_VULKAN_HAZARD_BARRIERS=1, ~25-35% of runs, 0/10+ under
+    // legacy barriers in the same session. NOT purely environmental/driver flake.
+    // BUT the issue's original hypothesis (a #144 x #145 RmsNormQuantizeQ8_1Fused
+    // interaction) did NOT hold up: disabling DOTLLM_VULKAN_DISABLE_FUSED_RMSNORM_QUANT=1
+    // alone, or DOTLLM_VULKAN_MMVQ_NO_SHARE=1 alone (which also disables #145's fused
+    // path), or DOTLLM_VULKAN_DISABLE_FUSED_RMSNORM_MATMUL=1 alone (the older,
+    // pre-#145 RmsNormMatmulQ8_0Fused kernel), or forcing split-KV attention off
+    // (DOTLLM_VULKAN_SPLIT_TARGET_WG=1) alone, each STILL reproduced the crash at
+    // least once. DOTLLM_VULKAN_HAZARD_VALIDATE=1 (forces a barrier at every tracked
+    // guard) ALSO still crashed — ruling out "the elision heuristic fires too late"
+    // as the mechanism; something writes a buffer without ever routing through
+    // DescriptorSetCache.GetOrCreate/OnTransfer, so no amount of forced barriering at
+    // the *tracked* guards helps. Manual review of RmsNormQuantizeQ8_1FusedKernel,
+    // RecordNormedSharedInputMmvqGroup (whose two KernelSupport.ComputeToComputeBarrier
+    // calls are unconditional, NOT gated on ActiveHazards — real but redundant/
+    // over-sync, not a candidate for the under-sync bug), RopeKvWriteF32Kernel, and
+    // VulkanSplitKvAttentionKernel's split/merge passes found their SPIR-V-reflected
+    // read/write declarations correctly wired. Combining ALL four opt-outs above got
+    // 5/5 clean runs (vs the ~25-35% baseline), suggesting the true defect lives in
+    // MMVQ group-sharing (#46/#139/#150) and/or RmsNormMatmulQ8_0Fused and/or
+    // split-KV attention rather than #145 specifically — NOT confirmed to a specific
+    // line. Root cause still open; do not flip the default without re-running this
+    // matrix and narrowing further.
     private static readonly bool LegacyBarriersEnabled =
         Environment.GetEnvironmentVariable("DOTLLM_VULKAN_LEGACY_BARRIERS") == "1" ||
         Environment.GetEnvironmentVariable("DOTLLM_VULKAN_HAZARD_BARRIERS") != "1";
