@@ -156,6 +156,10 @@ public static unsafe partial class MatMul
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     internal static void ComputeRowsMxfp4(byte* weights, float* x, float* result, int m, int blockCount)
     {
+        // rowBytes is deliberately `long`: that alone makes every `row * rowBytes` below a
+        // 64-bit multiply (int `row` is promoted), so the issue-#429 wrap class cannot occur
+        // here. Do not "fix" the call sites by adding a (long) cast to `row` — and do not
+        // narrow this local to int.
         long rowBytes = (long)blockCount * Mxfp4BlockBytes;
 
         if (Avx2.IsSupported && Ssse3.IsSupported)
