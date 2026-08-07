@@ -173,6 +173,17 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     public long ComputeMemoryBytes => _state.AllocatedBytes + _gdnCache.AllocatedBytes;
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Re-zeroes the model-owned Gated-DeltaNet cache used by every forward that does not carry a
+    /// caller-supplied <see cref="IGdnState"/>. This model does not report
+    /// <see cref="IModel.RequiresPerSequenceState"/>, so it would inherit the no-op default — but its
+    /// GDN cache does persist across uncached forwards, so callers that score independent sequences
+    /// (perplexity windows) would leak state exactly as the CPU host did. Overridden for parity with
+    /// the CPU / Vulkan hosts — see issue #261.
+    /// </remarks>
+    public void ResetSequenceState() => _gdnCache.Reset();
+
     /// <summary>Number of full-attention layers — matches the sparse KV-cache slot count.</summary>
     public int AttentionLayerCount => _attentionLayerCount;
 

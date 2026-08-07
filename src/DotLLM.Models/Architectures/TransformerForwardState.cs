@@ -35,6 +35,39 @@ internal sealed unsafe class TransformerForwardState : IDisposable
 
     private int _currentSeqLen;
 
+    /// <summary>
+    /// Per-token byte size of <see cref="InputQ8Scratch"/>: the largest quantized-input
+    /// row across every GEMM whose activation is pre-quantized through that buffer —
+    /// Q/K/V and gate/up (hidden-wide), down (intermediate-wide), and the attention
+    /// output projection, whose input is the attention block stride
+    /// (<c>numHeads × headDim</c>), NOT the hidden size. Those coincide for almost every
+    /// architecture, but gpt-oss projects a wider attention block than its residual
+    /// stream (64 heads × 64 dim = 4096 vs hidden 2880), so omitting the Q/attn-output
+    /// block widths under-allocates the buffer and the o_proj pre-quantization runs off
+    /// the end of it (issue #260).
+    /// Sized for the largest of Q8_0 (34B/32 elements), Q8_1 (36B/32), and Q8_K (292B/256).
+    /// </summary>
+    private int InputScratchRowBytes
+    {
+        get
+        {
+            int maxInputDim = Math.Max(
+                Math.Max(_hiddenSize, _intermediateSize),
+                Math.Max(_qBlockElems, _attnOutBlockElems));
+            int q8_0RowBytes = (maxInputDim / 32) * 34;
+            int q8_1RowBytes = (maxInputDim / 32) * 36;
+            int q8_kRowBytes = (maxInputDim / 256) * 292;
+            return Math.Max(Math.Max(q8_0RowBytes, q8_1RowBytes), q8_kRowBytes);
+        }
+    }
+
+    /// <summary>
+    /// Total bytes currently allocated for <see cref="InputQ8Scratch"/>
+    /// (<c>capacity × per-token row bytes</c>). Exposed for regression coverage of the
+    /// under-allocation fixed in issue #260.
+    /// </summary>
+    internal long InputQ8ScratchBytes => (long)_currentSeqLen * InputScratchRowBytes;
+
     /// <summary>Total bytes currently allocated for inference scratch buffers.</summary>
     public long AllocatedBytes
     {
@@ -50,12 +83,7 @@ internal sealed unsafe class TransformerForwardState : IDisposable
             bytes += s * _intermediateSize * 3;              // FfnGate + FfnUp + SiluOutput
             bytes += s * _vocabSize;                          // Logits (all positions for speculative verify)
             bytes *= sizeof(float);
-            // InputQ8Scratch: seqLen × max(Q8_0, Q8_1, Q8_K) row bytes
-            int maxInputDim = Math.Max(_hiddenSize, _intermediateSize);
-            int q8_0Bytes = (maxInputDim / 32) * 34;
-            int q8_1Bytes = (maxInputDim / 32) * 36;
-            int q8_kBytes = (maxInputDim / 256) * 292;
-            bytes += s * Math.Max(Math.Max(q8_0Bytes, q8_1Bytes), q8_kBytes);
+            bytes += s * InputScratchRowBytes;
             // RoPE tables (managed, but still part of compute memory)
             bytes += (CosTable.Length + SinTable.Length) * sizeof(float);
             if (GlobalCosTable is not null && GlobalSinTable is not null)
@@ -204,22 +232,12 @@ internal sealed unsafe class TransformerForwardState : IDisposable
         SiluOutput = AllocFloats(newCapacity * _intermediateSize);
         Logits = AllocFloats((long)newCapacity * _vocabSize); // All positions' logits for speculative verify
 
-        // InputQ8Scratch: seqLen × max(q8_0RowBytes, q8_1RowBytes, q8_kRowBytes) for pre-quantized GEMM input reuse.
-        // Q8_0: 34 bytes per 32-element block. Q8_1: 36 bytes per 32-element block. Q8_K: 292 bytes per 256-element block.
-        int maxInputDim = Math.Max(_hiddenSize, _intermediateSize);
-        int q8_0RowBytes = (maxInputDim / 32) * 34;
-        int q8_1RowBytes = (maxInputDim / 32) * 36;
-        int q8_kRowBytes = (maxInputDim / 256) * 292;
-        int scratchRowBytes = Math.Max(Math.Max(q8_0RowBytes, q8_1RowBytes), q8_kRowBytes);
-        InputQ8Scratch = AllocBytes(newCapacity * scratchRowBytes);
+        InputQ8Scratch = AllocBytes((long)newCapacity * InputScratchRowBytes);
 
         _currentSeqLen = newCapacity;
     }
 
-    private static nint AllocFloats(long count)
-    {
-        return (nint)NativeMemory.AlignedAlloc((nuint)(count * sizeof(float)), 64);
-    }
+    private static nint AllocFloats(long count) => AllocBytes(count * sizeof(float));
 
     private static nint AllocBytes(long count)
     {

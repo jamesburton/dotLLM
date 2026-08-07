@@ -846,6 +846,14 @@ public sealed class VulkanMamba3TransformerModel : IModel
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Re-zeroes the model-owned Mamba-3 recurrent state used by every forward that does not carry a caller-supplied
+    /// per-sequence state container. Callers that treat each forward as an independent sequence
+    /// (perplexity windows) must call this between sequences — see issue #261.
+    /// </remarks>
+    public void ResetSequenceState() => _recurrent.Reset();
+
+    /// <inheritdoc/>
     public bool RequiresPerSequenceState => true;
 
     /// <inheritdoc/>

@@ -8,14 +8,22 @@ namespace DotLLM.Tests.Unit.Cpu.Kernels;
 /// <summary>
 /// Tests for the PrismML Bonsai ternary quantization format (GGUF type 42, "PQ2_0").
 /// Layout: 128-element groups, each 34 bytes = scale(Half, 2 bytes) + codes[32](uint8,
-/// 4 codes/byte, 2 bits each). Codes map 0→-1, 1→0, 2→+1. Unlike I2_S (a single per-tensor
-/// scale trailing the whole packed payload), PQ2_0's scale is per-GROUP and comes BEFORE the
-/// group's codes — both facts verified empirically against real
+/// 4 codes/byte, 2 bits each). Codes map 0→-1, 1→0, 2→+1, 3→+2. Unlike I2_S (a single
+/// per-tensor scale trailing the whole packed payload), PQ2_0's scale is per-GROUP and comes
+/// BEFORE the group's codes — both facts verified empirically against real
 /// <c>Ternary-Bonsai-27B-Q2_0.gguf</c> tensor bytes (2026-07-20): decoding with
 /// scale-then-codes gives 0% invalid ternary codes and a tight, plausible per-group scale
 /// distribution across 200 sampled groups of a real attention-output weight matrix; every
 /// other byte-ordering hypothesis (codes-then-scale, or separate contiguous code/scale
 /// regions, mirroring I2_S's shape) produces invalid codes and/or wildly inconsistent scales.
+/// Within the codes, byte at index <c>b</c> holds the 4 CONSECUTIVE elements
+/// {4b,4b+1,4b+2,4b+3} at ASCENDING bit offsets {0,2,4,6} — verified byte-for-byte against
+/// PrismML's own reference <c>dequantize_row_q2_0</c> (PrismML-Eng/llama.cpp, ggml-quants.c).
+/// This is NOT I2_S's strided {gp,+32,+64,+96}/descending-bits layout — every test in this
+/// file assumed that wrong convention until issue #269's follow-up investigation
+/// (2026-08-05) found it was the root cause of Bonsai-27B's garbled generation (real-corpus
+/// perplexity 610,988, fixed to 12.44 — see DotLLM.Cpu/Kernels/Dequantize.cs's
+/// DequantizePQ2_0 doc comment for the full writeup).
 /// </summary>
 public sealed unsafe class PQ2_0Tests
 {
@@ -47,9 +55,15 @@ public sealed unsafe class PQ2_0Tests
 
     /// <summary>
     /// Pins the exact byte layout independent of any packing helper: scale(Half) at offset 0,
-    /// codes[32] starting at offset 2. Within the codes, byte at group_pos holds elements
-    /// {gp, gp+32, gp+64, gp+96} at bit offsets {6,4,2,0} -- same bit convention as I2_S.
-    /// Byte 0x92 = 0b10_01_00_10 -> codes {2,1,0,2} -> ternary {+1,0,-1,+1}.
+    /// codes[32] starting at offset 2. Within the codes, byte at index <c>b</c> holds the 4
+    /// CONSECUTIVE elements {4b,4b+1,4b+2,4b+3} at ASCENDING bit offsets {0,2,4,6} — verified
+    /// against PrismML's own reference <c>dequantize_row_q2_0</c> (PrismML-Eng/llama.cpp,
+    /// ggml-quants.c: byte_index = j/4; bit_offset = (j%4)*2). NOT the same bit convention as
+    /// I2_S — an earlier version of this test encoded the wrong (strided/descending-bits)
+    /// convention as its expected values (issue #269 follow-up, 2026-08-05); see
+    /// DotLLM.Cpu/Kernels/Dequantize.cs's DequantizePQ2_0 doc comment for the full writeup.
+    /// Byte 0x92 = 0b10_01_00_10 -> bit offsets {0,2,4,6} give codes {2,0,1,2} -> ternary
+    /// {+1,-1,0,+1} for elements {0,1,2,3}.
     /// </summary>
     [Fact]
     public void DequantizePQ2_0_HandPackedGroup_DecodesTernaryTimesGroupScale()
@@ -60,16 +74,16 @@ public sealed unsafe class PQ2_0Tests
         try
         {
             *(Half*)buf = (Half)scale;  // scale FIRST
-            buf[2] = 0x92;               // then codes; elements 0,32,64,96
+            buf[2] = 0x92;               // then codes; elements 0,1,2,3
 
             float[] dest = new float[n];
             Dequantize.ToFloat32((nint)buf, n, QuantizationType.PQ2_0, dest);
 
-            Assert.Equal(+scale, dest[0], 1e-3f);  // code 2 -> +1
-            Assert.Equal(0f, dest[32], 1e-3f);      // code 1 ->  0
-            Assert.Equal(-scale, dest[64], 1e-3f); // code 0 -> -1
-            Assert.Equal(+scale, dest[96], 1e-3f); // code 2 -> +1
-            Assert.Equal(-scale, dest[1], 1e-3f);  // unset byte -> code 0 -> -1
+            Assert.Equal(+scale, dest[0], 1e-3f);  // bits[1:0]=10=2 -> +1
+            Assert.Equal(-scale, dest[1], 1e-3f);  // bits[3:2]=00=0 -> -1
+            Assert.Equal(0f, dest[2], 1e-3f);       // bits[5:4]=01=1 ->  0
+            Assert.Equal(+scale, dest[3], 1e-3f);  // bits[7:6]=10=2 -> +1
+            Assert.Equal(-scale, dest[4], 1e-3f);  // unset byte 1 -> code 0 -> -1
         }
         finally { NativeMemory.Free(buf); }
     }
@@ -347,13 +361,13 @@ public sealed unsafe class PQ2_0Tests
                 *(Half*)groupBase = (Half)groupScales[r * groupsPerRow + g];
                 byte* codes = groupBase + 2;
                 int baseIdx = r * k + g * 128;
-                for (int gp = 0; gp < 32; gp++)
+                for (int b = 0; b < 32; b++)
                 {
-                    byte c0 = (byte)(ternary[baseIdx + gp] + 1);
-                    byte c1 = (byte)(ternary[baseIdx + gp + 32] + 1);
-                    byte c2 = (byte)(ternary[baseIdx + gp + 64] + 1);
-                    byte c3 = (byte)(ternary[baseIdx + gp + 96] + 1);
-                    codes[gp] = (byte)((c0 << 6) | (c1 << 4) | (c2 << 2) | c3);
+                    byte c0 = (byte)(ternary[baseIdx + 4 * b] + 1);
+                    byte c1 = (byte)(ternary[baseIdx + 4 * b + 1] + 1);
+                    byte c2 = (byte)(ternary[baseIdx + 4 * b + 2] + 1);
+                    byte c3 = (byte)(ternary[baseIdx + 4 * b + 3] + 1);
+                    codes[b] = (byte)(c0 | (c1 << 2) | (c2 << 4) | (c3 << 6));
                 }
             }
         }
@@ -361,7 +375,10 @@ public sealed unsafe class PQ2_0Tests
     }
 
     /// <summary>Packs ternary {-1,0,1} values + one scale per 128-element group into PQ2_0's
-    /// scale-then-codes group layout. Test-only helper (mirrors I2STests' PackI2S).</summary>
+    /// scale-then-codes group layout. Test-only helper (mirrors I2STests' PackI2S). Byte b holds
+    /// the 4 CONSECUTIVE elements {4b,4b+1,4b+2,4b+3} at ASCENDING bit offsets {0,2,4,6} —
+    /// verified against PrismML's reference dequantize_row_q2_0 (issue #269 follow-up,
+    /// 2026-08-05), NOT I2_S's strided {gp,+32,+64,+96}/descending-bits layout.</summary>
     private static byte* PackPQ2_0(sbyte[] ternary, float[] groupScales)
     {
         int n = ternary.Length;
@@ -375,13 +392,13 @@ public sealed unsafe class PQ2_0Tests
             *(Half*)groupBase = (Half)groupScales[g];
             byte* codes = groupBase + 2;
             int baseIdx = g * 128;
-            for (int gp = 0; gp < 32; gp++)
+            for (int b = 0; b < 32; b++)
             {
-                byte c0 = (byte)(ternary[baseIdx + gp] + 1);
-                byte c1 = (byte)(ternary[baseIdx + gp + 32] + 1);
-                byte c2 = (byte)(ternary[baseIdx + gp + 64] + 1);
-                byte c3 = (byte)(ternary[baseIdx + gp + 96] + 1);
-                codes[gp] = (byte)((c0 << 6) | (c1 << 4) | (c2 << 2) | c3);
+                byte c0 = (byte)(ternary[baseIdx + 4 * b] + 1);
+                byte c1 = (byte)(ternary[baseIdx + 4 * b + 1] + 1);
+                byte c2 = (byte)(ternary[baseIdx + 4 * b + 2] + 1);
+                byte c3 = (byte)(ternary[baseIdx + 4 * b + 3] + 1);
+                codes[b] = (byte)(c0 | (c1 << 2) | (c2 << 4) | (c3 << 6));
             }
         }
         return buf;

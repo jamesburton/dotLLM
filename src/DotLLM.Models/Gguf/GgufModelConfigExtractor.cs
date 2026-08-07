@@ -935,7 +935,7 @@ public static class GgufModelConfigExtractor
         RoPEType ropeType = architecture switch
         {
             Architecture.Qwen or Architecture.QwenMoe
-                or Architecture.Qwen3MoeHybrid or Architecture.Phi
+                or Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense or Architecture.Phi
                 or Architecture.GptOss or Architecture.BitNet => RoPEType.NeoX,
             _ => RoPEType.Norm,
         };

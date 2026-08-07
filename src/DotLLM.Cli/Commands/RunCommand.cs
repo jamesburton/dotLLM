@@ -343,7 +343,9 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             else if (gpuLayers >= config.NumLayers)
             {
                 int gpuId = ParseGpuId(settings.Device);
-                model = DotLLM.Cuda.CudaTransformerModel.LoadFromGguf(gguf, config, gpuId);
+                // Shared per-architecture CUDA dispatch — routes hybrid architectures
+                // (Qwen3MoeHybrid, Qwen3HybridDense) to their dedicated loaders (#259).
+                (model, _) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId);
             }
             else
             {

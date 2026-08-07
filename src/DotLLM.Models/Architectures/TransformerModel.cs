@@ -1235,11 +1235,16 @@ public sealed unsafe class TransformerModel : IModel
             // re-use the buffer for stage 1. Pre-LoRA-Q8_0 this was scoped
             // inside each sub-branch.
             byte* preQuantNormQkv = null;
-            // The fused decode kernels don't support I2_S/PQ2_0 (both ternary, per-group or
-            // per-tensor scaled); route ternary weights through the standard (unfused)
-            // projection path, which dispatches to the dedicated ternary GEMV.
+            // The fused decode kernels only cover the formats with a dedicated ComputeRows
+            // implementation. Everything else (ternary, K-quants without a fused kernel, all the
+            // IQ formats, BF16, MXFP4, …) routes through the standard unfused projection path
+            // below, which has a complete dispatch table plus a dequantize fallback. Asking the
+            // kernel via SupportsFusedDecode keeps this in step with the kernel's own tables
+            // rather than duplicating a type list that goes stale.
             if (seqLen == 1 && _threadPool != null && !adapterActive
-                && lw.QQuantType != QuantizationType.I2_S && lw.QQuantType != QuantizationType.PQ2_0)
+                && MatMul.SupportsFusedDecode(lw.QQuantType)
+                && MatMul.SupportsFusedDecode(lw.KQuantType)
+                && MatMul.SupportsFusedDecode(lw.VQuantType))
             {
                 // Decode path: try fused RmsNorm+Quantize (skips normOut intermediate)
                 byte* preQuantNorm = null;
@@ -1596,9 +1601,11 @@ public sealed unsafe class TransformerModel : IModel
             // so the LoRA delta call site can reuse the activation Q8_0
             // buffer for stage 1.
             byte* preQuantFfnHoisted = null;
-            // I2_S/PQ2_0 (both ternary) are unsupported by the fused decode kernels — use the unfused path.
+            // Same capability gate as Q/K/V: formats without a fused decode kernel take the
+            // standard unfused projection path instead of failing.
             if (seqLen == 1 && _threadPool != null && !ffnAdapterActive
-                && lw.GateQuantType != QuantizationType.I2_S && lw.GateQuantType != QuantizationType.PQ2_0)
+                && MatMul.SupportsFusedDecode(lw.GateQuantType)
+                && MatMul.SupportsFusedDecode(lw.UpQuantType))
             {
                 // Decode path: try fused RmsNorm+Quantize (skips normOut intermediate)
                 byte* preQuantFfn = null;
@@ -3548,32 +3555,7 @@ public sealed unsafe class TransformerModel : IModel
         else if (qt == QuantizationType.PQ2_0)
             MatMul.GemvPQ2_0((byte*)weights, x, y, m, k, _threadPool);
         else
-            GemvDequantFallback(weights, qt, x, y, m, k);
-    }
-
-    /// <summary>
-    /// Fallback GEMV for quant types without dedicated vec_dot kernels.
-    /// Dequantizes one weight row at a time and computes float dot product.
-    /// Correct but slower than fused kernels.
-    /// </summary>
-    private static void GemvDequantFallback(nint weights, QuantizationType qt, float* x, float* y, int m, int k)
-    {
-        long rowBytes = Dequantize.RowByteSize(k, qt);
-        float[] rowBuf = ArrayPool<float>.Shared.Rent(k);
-        try
-        {
-            var rowSpan = rowBuf.AsSpan(0, k);
-            var xSpan = new ReadOnlySpan<float>(x, k);
-            for (int i = 0; i < m; i++)
-            {
-                Dequantize.ToFloat32(weights + i * (nint)rowBytes, k, qt, rowSpan);
-                y[i] = TensorPrimitives.Dot(new ReadOnlySpan<float>(rowBuf, 0, k), xSpan);
-            }
-        }
-        finally
-        {
-            ArrayPool<float>.Shared.Return(rowBuf);
-        }
+            MatMul.GemvDequantRows((byte*)weights, qt, x, y, m, k, _threadPool);
     }
 
     /// <summary>
@@ -3605,20 +3587,11 @@ public sealed unsafe class TransformerModel : IModel
         else if (qt == QuantizationType.PQ2_0)
             MatMul.GemmPQ2_0((byte*)weights, b, c, m, k, n, _threadPool);
         else
-            GemmDequantFallback(weights, qt, b, c, m, k, n);
-    }
-
-    /// <summary>
-    /// Fallback GEMM for quant types without dedicated vec_dot kernels.
-    /// Iterates per input row, calling <see cref="GemvDequantFallback"/> for each.
-    /// </summary>
-    private static void GemmDequantFallback(nint weights, QuantizationType qt, float* b, float* c,
-                                            int m, int k, int n)
-    {
-        for (int t = 0; t < n; t++)
-        {
-            GemvDequantFallback(weights, qt, b + t * k, c + t * m, m, k);
-        }
+            // Formats with no dedicated vec_dot kernel (BF16, Q4_0/Q4_1/Q5_1, Q2_K/Q3_K, the IQ
+            // family). MatMul.GemmDequantRows decodes each weight row once and reuses it across
+            // all n columns, row-parallel over the pool — bit-identical to the serial per-token
+            // fallback it replaces, just not single-threaded any more (#263).
+            MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, _threadPool);
     }
 
     /// <summary>

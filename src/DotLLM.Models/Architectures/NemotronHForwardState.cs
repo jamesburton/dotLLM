@@ -99,7 +99,11 @@ internal sealed unsafe class NemotronHForwardState : IDisposable
         _nHead = nHead;
         _bcDim = nGroup * dState;
 
-        int scratchBase = Math.Max(Math.Max(hiddenSize, maxIntermediateSize), dInner);
+        // Include qElems (the attention output projection's input width, numHeads × headDim)
+        // — it exceeds the hidden size whenever a model projects a wider attention block
+        // than its residual stream, and omitting it under-allocates the scratch (issue #260).
+        int scratchBase = Math.Max(
+            Math.Max(Math.Max(hiddenSize, maxIntermediateSize), dInner), qElems);
         int q8_0RowBytes = (scratchBase / 32) * 34;
         int q8_1RowBytes = (scratchBase / 32) * 36;
         int q8_kRowBytes = (scratchBase / 256) * 292;

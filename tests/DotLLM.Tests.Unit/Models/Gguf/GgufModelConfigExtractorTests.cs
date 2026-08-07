@@ -266,6 +266,18 @@ public class GgufModelConfigExtractorTests
         Assert.Equal(256, config.HeadDim);
         Assert.Equal(262144, config.MaxSequenceLength);
 
+        // Regression guard (found 2026-08-05 while investigating garbled Bonsai-27B
+        // generation): Qwen3HybridDense weights are HF-order (never permuted by any
+        // llama.cpp Llama-style converter, same as plain Qwen/Qwen3MoeHybrid), so RoPE
+        // pairing MUST be NeoX. The extractor's switch previously listed
+        // Architecture.Qwen3MoeHybrid but omitted Qwen3HybridDense, silently falling
+        // through to RoPEType.Norm (interleaved) — wrong pairing that scrambles the
+        // learned phase structure layer over layer, producing incoherent generation
+        // despite every kernel-level correctness gate (CPU/GPU logit parity, finite
+        // logits) passing, since both backends share this same wrong config.
+        Assert.NotNull(config.RoPEConfig);
+        Assert.Equal(DotLLM.Core.Configuration.RoPEType.NeoX, config.RoPEConfig!.Value.Type);
+
         // GDN config populated, Mamba-2 SsmConfig NOT (qwen35.ssm.* keys are GDN-flavoured, not
         // Mamba-2 — extracting them as MambaSsmConfig would be silently wrong).
         Assert.True(config.GdnConfig.HasValue);

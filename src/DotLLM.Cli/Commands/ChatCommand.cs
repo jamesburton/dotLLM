@@ -305,7 +305,9 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                         ? int.Parse(settings.Device.AsSpan(ci + 1))
                         : 0;
                     ctx.Status($"Loading {config.Architecture} model on GPU {gpuId}...");
-                    model = DotLLM.Cuda.CudaTransformerModel.LoadFromGguf(gguf, config, gpuId);
+                    // Shared per-architecture CUDA dispatch — routes hybrid architectures
+                    // (Qwen3MoeHybrid, Qwen3HybridDense) to their dedicated loaders (#259).
+                    (model, _) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId);
                 }
                 else
                 {

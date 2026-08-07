@@ -224,6 +224,45 @@ public interface IModel : IDisposable
     bool RequiresPerSequenceState => false;
 
     /// <summary>
+    /// Re-zeroes any <em>model-owned</em> recurrent state, so the next <c>Forward</c> that does not
+    /// carry a caller-threaded state container starts a genuinely fresh sequence.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Why this exists.</b> The uncached
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int)"/> overload takes no state
+    /// container, so a recurrent architecture falls back to a model-owned default state (the
+    /// <c>_gdnCache</c> / <c>_ssmCache</c> instance). That state persists across calls, which is
+    /// correct for prefill-then-decode of one sequence and <b>silently wrong</b> for a caller that
+    /// treats each forward as an independent sequence. Perplexity scoring is exactly such a caller —
+    /// every window is an independent sequence, and it cannot use <see cref="ForwardBatch"/> (whose
+    /// <see cref="SequenceForwardRequest.KvCache"/> is required and non-nullable) to thread state
+    /// itself. Without this hook the throwaway probe forward and every preceding window leaked into
+    /// the scored window's state and corrupted the reported number with no error (issue #261).</para>
+    /// <para><b>Why the default throws for recurrent models.</b> A silent no-op default would let a
+    /// future recurrent architecture inherit exactly the bug this method fixes, and the failure mode
+    /// is a plausible-looking wrong number rather than an exception. So the default is a no-op only
+    /// for stateless architectures; a model that declares <see cref="RequiresPerSequenceState"/>
+    /// must override this method — even if only to document that its uncached forward allocates a
+    /// scratch state per call and therefore has nothing to reset.</para>
+    /// <para>Idempotent, and safe to call on a stateless model (does nothing). Does not touch
+    /// caller-threaded state containers — those are reset via
+    /// <see cref="IRecurrentSequenceState.Reset"/> by whoever owns them.</para>
+    /// </remarks>
+    /// <exception cref="NotSupportedException">
+    /// The model declares <see cref="RequiresPerSequenceState"/> but has not overridden this method.
+    /// </exception>
+    void ResetSequenceState()
+    {
+        if (RequiresPerSequenceState)
+            throw new NotSupportedException(
+                $"{GetType().Name} declares {nameof(RequiresPerSequenceState)} but does not implement " +
+                $"{nameof(ResetSequenceState)}(). A recurrent model must re-zero its model-owned " +
+                "recurrent state (or explicitly document that it owns none), otherwise callers that " +
+                "score independent sequences through the uncached Forward — e.g. perplexity — silently " +
+                "leak state across sequences. See issue #261.");
+    }
+
+    /// <summary>
     /// True when this model can have its per-sequence recurrent state <em>threaded by the caller</em>:
     /// the caller allocates one container per sequence via <see cref="CreateSequenceState"/> and supplies
     /// it on every <see cref="ForwardBatch"/> request (via <see cref="SequenceForwardRequest.MambaState"/> /

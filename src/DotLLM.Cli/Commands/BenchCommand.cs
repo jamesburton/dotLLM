@@ -168,70 +168,30 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
                     break;
 
                 case "cuda":
-                    switch (config.Architecture)
-                    {
-                        case Architecture.Qwen3HybridDense:
-                        {
-                            var cudaDense = DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel
-                                .LoadFromGguf(gguf, config, gpuId);
-                            model = cudaDense;
-                            kvFactory = size => cudaDense.CreateKvCache(size);
-                            deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
-                            break;
-                        }
-                        case Architecture.Qwen3MoeHybrid:
-                        {
-                            var cudaMoe = DotLLM.Cuda.Architectures.CudaQwen3MoeHybridTransformerModel
-                                .LoadFromGguf(gguf, config, gpuId);
-                            model = cudaMoe;
-                            kvFactory = size => cudaMoe.CreateKvCache(size);
-                            deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
-                            break;
-                        }
-                        default:
-                        {
-                            var cudaModel = DotLLM.Cuda.CudaTransformerModel.LoadFromGguf(gguf, config, gpuId);
-                            model = cudaModel;
-                            kvFactory = size => cudaModel.CreateKvCache(size);
-                            deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
-                            break;
-                        }
-                    }
+                    // THE shared per-architecture CUDA dispatch (#259) — routes hybrid
+                    // architectures (Qwen3MoeHybrid, Qwen3HybridDense) to their dedicated
+                    // loaders; their GDN layers have no attn_output.weight.
+                    (model, kvFactory) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId);
+                    deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
                     break;
 
                 case "vulkan":
-                    switch (config.Architecture)
+                {
+                    vulkanDevice = DotLLM.Vulkan.VulkanDevice.Create();
+                    // THE shared per-architecture Vulkan dispatch (#259).
+                    (model, kvFactory) = DotLLM.Vulkan.VulkanModelLoader.CreateFromGguf(
+                        vulkanDevice, gguf, config, ResolveSpvDir(), settings.NCpuMoeLayers);
+                    deviceLabel = vulkanDevice.DeviceName;
+                    if (model is DotLLM.Vulkan.VulkanQwen3MoeHybridTransformerModel vkMoe
+                        && vkMoe.NCpuMoeLayers > 0 && !settings.Json)
                     {
-                        case Architecture.Qwen3MoeHybrid:
-                        {
-                            vulkanDevice = DotLLM.Vulkan.VulkanDevice.Create();
-                            var vkMoe = DotLLM.Vulkan.VulkanQwen3MoeHybridTransformerModel.BuildFromGguf(
-                                vulkanDevice, gguf, config, ResolveSpvDir(), settings.NCpuMoeLayers);
-                            model = vkMoe;
-                            kvFactory = size => vkMoe.CreateKvCache(size);
-                            deviceLabel = vulkanDevice.DeviceName;
-                            if (vkMoe.NCpuMoeLayers > 0 && !settings.Json)
-                                AnsiConsole.MarkupLine(
-                                    $"[grey]MoE CPU offload: {vkMoe.NCpuMoeLayers} layer(s), " +
-                                    $"~{vkMoe.EstimatedCpuOffloadVramSavedBytes / (1024.0 * 1024.0):F0} MiB " +
-                                    "GPU expert-bank upload avoided.[/]");
-                            break;
-                        }
-                        case Architecture.NemotronH:
-                            throw new NotSupportedException(
-                                "Nemotron-H has no Vulkan GGUF loader yet — bench it with --device cpu.");
-                        default:
-                        {
-                            vulkanDevice = DotLLM.Vulkan.VulkanDevice.Create();
-                            var vkModel = DotLLM.Vulkan.VulkanTransformerModel.LoadFromGguf(
-                                vulkanDevice, gguf, config, ResolveSpvDir());
-                            model = vkModel;
-                            kvFactory = size => vkModel.CreateKvCache(size);
-                            deviceLabel = vulkanDevice.DeviceName;
-                            break;
-                        }
+                        AnsiConsole.MarkupLine(
+                            $"[grey]MoE CPU offload: {vkMoe.NCpuMoeLayers} layer(s), " +
+                            $"~{vkMoe.EstimatedCpuOffloadVramSavedBytes / (1024.0 * 1024.0):F0} MiB " +
+                            "GPU expert-bank upload avoided.[/]");
                     }
                     break;
+                }
 
                 default:
                     throw new InvalidOperationException($"Unhandled backend '{backend}'.");

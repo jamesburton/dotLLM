@@ -182,21 +182,27 @@ void main() {
             float scale = readGroupScale(groupByteBase);
             uint codeBase = groupByteBase + 2u;
 
+            // Ascending bit offsets {0,2,4,6} -> consecutive elements {4*gp,+1,+2,+3} — verified
+            // against PrismML's reference dequantize_row_q2_0 (issue #269 follow-up, 2026-08-05).
+            // NOT the strided {gp,+32,+64,+96} layout an earlier version of this shader assumed —
+            // see DotLLM.Cpu/Kernels/Dequantize.cs's DequantizePQ2_0 doc comment for the writeup.
             for (uint i = 0u; i < A_PER_THR; i++) {
                 uint gp = gp0 + i;           // 0..31 within the group's code bytes
                 uint pk = readByte(codeBase + gp);
-                sharedA[sBase + gp]       = float16_t(float(int((pk >> 6u) & 3u) - 1) * scale);
-                sharedA[sBase + gp + 32u] = float16_t(float(int((pk >> 4u) & 3u) - 1) * scale);
-                sharedA[sBase + gp + 64u] = float16_t(float(int((pk >> 2u) & 3u) - 1) * scale);
-                sharedA[sBase + gp + 96u] = float16_t(float(int( pk        & 3u) - 1) * scale);
+                uint outIdx = sBase + 4u * gp;
+                sharedA[outIdx]      = float16_t(float(int( pk        & 3u) - 1) * scale);
+                sharedA[outIdx + 1u] = float16_t(float(int((pk >> 2u) & 3u) - 1) * scale);
+                sharedA[outIdx + 2u] = float16_t(float(int((pk >> 4u) & 3u) - 1) * scale);
+                sharedA[outIdx + 3u] = float16_t(float(int((pk >> 6u) & 3u) - 1) * scale);
             }
         } else {
             for (uint i = 0u; i < A_PER_THR; i++) {
                 uint gp = gp0 + i;
-                sharedA[sBase + gp]       = float16_t(0.0);
-                sharedA[sBase + gp + 32u] = float16_t(0.0);
-                sharedA[sBase + gp + 64u] = float16_t(0.0);
-                sharedA[sBase + gp + 96u] = float16_t(0.0);
+                uint outIdx = sBase + 4u * gp;
+                sharedA[outIdx]      = float16_t(0.0);
+                sharedA[outIdx + 1u] = float16_t(0.0);
+                sharedA[outIdx + 2u] = float16_t(0.0);
+                sharedA[outIdx + 3u] = float16_t(0.0);
             }
         }
 

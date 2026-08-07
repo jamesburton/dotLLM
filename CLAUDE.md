@@ -86,6 +86,34 @@ dotLLM/
 - Tensor metadata (shape, stride, pointer): structs, not classes.
 - GC: Server GC, `SustainedLowLatency` mode during inference.
 
+## Model & Fixture Storage Rules
+
+**Model weights NEVER live in the repository, and are never committed.** They belong in the
+shared on-disk cache:
+
+| location | holds |
+|---|---|
+| `~/.dotllm/models/` | models fetched for normal use (`dotllm model pull`) |
+| `~/.dotllm/test-cache/{org}/{repo}/` | fixtures the test suite resolves, incl. `DOTLLM_*_GGUF` overrides |
+| `~/.dotllm/quant-ladder/` | generated per-quantization coverage fixtures |
+
+- **If a path inside the tree needs a model, symlink to the cache — never copy it in.**
+- Reference fixtures from tests via the existing `DOTLLM_*_GGUF` environment overrides
+  (see `.docs/corpora/QUANT_FIXTURES.md`), not by relative path into the working tree.
+- **Why this matters, beyond tidiness:** a single GGUF is 0.1–50 GB; git keeps a committed
+  blob forever *even after deletion*, so one mistake permanently bloats every clone. The
+  cache also lets the OS page cache share **one** on-disk copy across every process and
+  worktree — the same property the mmap loading strategy above depends on.
+- `.gitignore` carries an extension-level backstop (`*.gguf`, `*.safetensors`, `*.ckpt`,
+  `*.pt`, `*.pth`, `*.onnx`, …) because the directory rules only cover the paths people
+  remembered to use. **Do not add broad binary globs**: `*.spv` and `*.ptx` are tracked on
+  purpose (216 compiled Vulkan/CUDA shaders are legitimate build artifacts).
+- Activation/tensor dumps are scratch — write them under the session scratch dir or
+  `.docs/`, never the repo root and never a drive root (a debug run once left four
+  `C:\dotllm_qwen35_*` dump folders behind).
+- Large *generated* corpora and results also stay out: `.docs/` is git-ignored and is where
+  the wikitext corpus, sweep drivers and results tables live.
+
 ## SIMD & Vectorization Rules
 
 - Foundation: `System.Numerics.Tensors.TensorPrimitives` for standard ops.

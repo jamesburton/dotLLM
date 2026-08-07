@@ -66,6 +66,66 @@ public sealed class CudaPagedKvCacheTests : IDisposable
         Assert.Throws<ArgumentOutOfRangeException>(() => new CudaPagedKvCache(pool, 0));
     }
 
+    /// <summary>
+    /// Issue #268 regression. CUDA's "current context" is per-OS-thread. In the real server, the
+    /// thread that lazily reloads a model after idle-eviction (and thus constructs a fresh
+    /// <see cref="CudaContext"/> + <see cref="CudaKvBlockPool"/>) is not necessarily the same
+    /// thread that later constructs the <see cref="CudaPagedKvCache"/> for a request -- a brand
+    /// new OS thread (e.g. a thread-pool worker that has never touched CUDA before) has NO current
+    /// context at all. Reproduces that exactly: builds the pool on the test thread, then
+    /// constructs <see cref="CudaPagedKvCache"/> on a genuinely fresh background thread that never
+    /// calls <see cref="CudaContext.MakeCurrent"/> itself. Confirmed this discriminates before
+    /// trusting it: reverting the fix (removing <c>pool.Context?.MakeCurrent()</c> from
+    /// <see cref="CudaPagedKvCache"/>'s constructor/Dispose) makes this test fail with
+    /// <c>CUDA_ERROR_INVALID_CONTEXT</c> on the background thread's first allocation call, exactly
+    /// the issue's reported failure; an earlier version of this test that merely made a SECOND
+    /// context current on the SAME thread did NOT discriminate (UVA lets same-thread cross-context
+    /// allocation silently succeed) -- this thread-based version is the real repro shape.
+    /// </summary>
+    [SkippableFact]
+    public unsafe void Constructor_OnFreshThreadWithNoCurrentContext_MatchesCudaKvBlockPoolPattern()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+
+        using var contextA = CudaContext.Create(0);
+        using var pool = new CudaKvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks, contextA);
+
+        CudaPagedKvCache? cache = null;
+        Exception? threadEx = null;
+
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                // Deliberately no MakeCurrent() call here -- this thread has never touched CUDA,
+                // matching a fresh thread-pool worker handling a post-reload request.
+                cache = new CudaPagedKvCache(pool, MaxSeqLen);
+            }
+            catch (Exception ex)
+            {
+                threadEx = ex;
+            }
+        });
+        thread.Start();
+        thread.Join();
+
+        Assert.Null(threadEx);
+        Assert.NotNull(cache);
+
+        try
+        {
+            // Real use, not just "didn't throw at construction": a genuine D2D write + gather
+            // round-trip through the cache's own device buffers, run back on the test thread
+            // (which already has contextA current from the pool's own construction above).
+            contextA.MakeCurrent();
+            WriteAndGatherAndVerify(cache!, seqLen: BlockSize, startPos: 0);
+        }
+        finally
+        {
+            cache!.Dispose();
+        }
+    }
+
     [SkippableFact]
     public unsafe void UpdateDevice_ThenGather_RoundTripsExactBlockBoundary()
     {

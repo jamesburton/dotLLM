@@ -265,3 +265,25 @@ The Vulkan IQ2 family kernels store the codebook tables as readonly SSBOs upload
 **IQ1_S, IQ3_XXS, and IQ3_S** are supported on CPU and Vulkan (dequant + GEMV + GEMM); the CUDA backend treats them as CPU-only fallbacks. **IQ1_M** remains out of scope. MMQ-preq / MMVQ-large / MoE-grouped variants for the IQ2 / IQ3 families are deferred; CUDA prefill falls back to dequant→cuBLAS via the `dequant_iq2_*_f32` kernels.
 
 The Vulkan IQ3 family kernels store the two codebook tables as readonly SSBOs uploaded once per model load (1 KB `Iq3XxsGrid` + 2 KB `Iq3SGrid` + the 128-byte `ksigns_iq2xs` table shared with the IQ2 family ≈ 3 KB on device, shared by all 6 IQ3 matmul/dequant kernels via `Iq3Codebooks`). Per-element decode is `db * grid[gridIdx*4 + j] * sign_j` with two grid rows per 8-element pair (g1 for elements 0..3, g2 for 4..7). The IQ3_XXS shaders bind the shared `ksigns_iq2xs` SSBO at binding 4 (matching the IQ2_XXS layout); IQ3_S omits this binding since the 8-bit sign mask is stored inline per pair.
+
+## Mach-1 Additive Codec (issue #266, Phase A)
+
+`SyzygyResearch/Mach-1-Additive-35B` (a Qwen3.6-35B-A3B checkpoint, `Architecture.Qwen3MoeHybrid`) ships a bespoke ~1.7 bpw "additive" trellis codec — a tail-biting-trellis + randomized-Hadamard-transform (QTIP/QuIP#-family) format, not a GGUF quant type. It has no GGUF representation (no container for trellis + RHT + per-tile gamma) and is decoded via a ported, standalone C# codec rather than the GGUF dequant pipeline described above.
+
+**Phase A (this section) is decoder-only**: `src/DotLLM.Models/Quantization/Mach1/` reproduces the vendor's own `decode.py` (Apache-2.0, ported with attribution) primitive-for-primitive:
+
+| Primitive | Type | Notes |
+|---|---|---|
+| Tail-biting trellis bit-unpack | `Mach1TrellisCodec.UnpackTileStates`/`UnpackAllTiles` | `L`-bit shift register, `K·V` fresh bits/step, MSB-first big-endian-word packing, final `L-K·V` bits wrap from the stream start. |
+| `quantlut_sym` LUT expansion | `Mach1QuantLutSym` / `Mach1LutCache` | Hashes a persisted `[2^tlutBits, V]` table up to the full `[2^L, V]` table via `p=s*(s+1)`; cached by `(L, tlutBits, content hash)`. |
+| Orthonormal Walsh-Hadamard transform | `Mach1WalshHadamard` | Sylvester order, single fp32 **division** by `sqrt(dim)` (not a reciprocal multiply) after the butterfly passes — bit-exactness depends on this. |
+| Wavefront tile gamma | `Mach1WaveGamma` | 16×16-tile granularity; the wavefront schedule deliberately double-writes the top-right corner tile, later wave wins. |
+| int5-g64 (LM head) | `Mach1Int5G64Codec` | 8 signed 5-bit codes packed into 5 little-endian bytes; per-64 fp16 scale; optional exact protected-row overrides. |
+| Affine int-bits (embeddings) | `Mach1AffineEmbedCodec` | Asymmetric per-64-group int4 (or int3), MSB-first bit-packed; optional exact bf16-bit-pattern exceptions. |
+| Trellis weight reconstruction | `Mach1TrellisWeightDecoder` | Full op order: `unpack → recons → fp16 round-trip → [wave_gamma] → [×wscale] → H_n → ×su → transpose → H_m → ×sv → transpose → crop`. No FMA fusion anywhere in this path — the reference multiplies/adds/divides as separate fp32 ops, and the port matches that exactly. |
+
+Two expert-tier containers exist and are dispatched on the layer file's own metadata, never assumed (`Mach1ExpertContainerKind`/`Mach1ExpertContainer.Detect`): the chunked `trained_susv_wave_gamma_chunked_v1` container (`Mach1ExpertLayerDecoderV3T`, the one shipped in the current repo) and the older per-expert manifest-driven container (`Mach1ExpertLayerDecoderV2`, structurally ported but unverified — no sample of this container currently exists to check against). The NE ("spine": attention / linear-attn / shared-expert) tier uses the same trellis workhorse with int8-sign SU/SV + a scalar Wscale instead of continuous su/sv (`Mach1NeSpineDecoder`).
+
+**Bit-exactness is validated**, not just approximated: `tests/DotLLM.Tests.Integration/Models/Quantization/Mach1/Mach1GoldenBitExactTests.cs` decodes layer 0 / expert 0's gate/up/down projections and compares every element's raw bit pattern against the vendor's own `goldens/L0_e0_fp32.safetensors` — zero mismatches. The fixture resolves via `DOTLLM_MACH1_35B_DIR`, falling back to `~/.dotllm/test-cache/SyzygyResearch/Mach-1-Additive-35B/`, and the test skips (does not fail) when absent. Per-primitive unit tests in `tests/DotLLM.Tests.Unit/Models/Quantization/Mach1/` use discriminating shapes (non-power-of-two dims that force real padding, `Mb != Nb` grids) and, for the trellis/quantlut_sym/expert-pipeline primitives, cross-check against vectors captured by running the vendor's own `decode.py` — not a re-derivation of this port.
+
+**Not yet done** (tracked by issue #266's later phases, out of scope for Phase A): the `packed/` safetensors loader, `HfConfigExtractor`/`ModelLoader` wiring, and the fused additive-domain GEMV (`y = diag(sv)·H_m·[wave_gamma⊙Wunit]·H_n·diag(su)·x`) on CPU/CUDA/Vulkan. Today the decoder only reconstructs dense fp32 tensors for offline validation; it is not wired into any model's forward pass.

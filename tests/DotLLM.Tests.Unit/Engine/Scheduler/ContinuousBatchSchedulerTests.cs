@@ -1175,6 +1175,12 @@ public sealed class ContinuousBatchSchedulerTests
 
         public bool RequiresPerSequenceState => _requiresPerSeqState;
 
+        // The mock owns no recurrent state; required because IModel's default throws when
+        // RequiresPerSequenceState is true, so a recurrent model cannot silently inherit a no-op.
+        public void ResetSequenceState() => ResetSequenceStateCount++;
+
+        public int ResetSequenceStateCount { get; private set; }
+
         // Mirror IModel's default loop ForwardBatch, but count invocations so tests can assert the
         // scheduler actually fused the decode (vs the per-sequence Forward path).
         public IReadOnlyList<ITensor> ForwardBatch(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
@@ -1350,6 +1356,11 @@ public sealed class ContinuousBatchSchedulerTests
 
         public bool RequiresPerSequenceState => true;
         public bool SupportsThreadedSequenceState => true;
+
+        // No model-owned state — every sequence's state is caller-threaded. Explicit because
+        // IModel's default throws for models declaring RequiresPerSequenceState.
+        public void ResetSequenceState() { }
+
         public IRecurrentSequenceState? CreateSequenceState()
         {
             StateCreateCount++;
