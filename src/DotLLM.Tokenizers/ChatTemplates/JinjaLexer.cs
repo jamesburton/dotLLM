@@ -300,6 +300,8 @@ internal sealed class JinjaLexer
             "in" => JinjaTokenType.In,
             "endfor" => JinjaTokenType.Endfor,
             "set" => JinjaTokenType.Set,
+            "macro" => JinjaTokenType.Macro,
+            "endmacro" => JinjaTokenType.EndMacro,
             "not" => JinjaTokenType.Not,
             "and" => JinjaTokenType.And,
             "or" => JinjaTokenType.Or,

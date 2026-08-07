@@ -127,10 +127,27 @@ public static class ServerStartup
             model = DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(gguf, config, gpuLayers, gpuId, threading);
         }
 
-        // Create chat template
-        var declaredChatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer, config.Architecture);
+        // Create chat template. The declared template is untrusted input from the GGUF's
+        // tokenizer.chat_template metadata — a parse failure (unsupported Jinja construct,
+        // malformed template, etc.) must not take down the whole server process (#273). Fall
+        // back to the plain completion-style transcript and keep loading; chat formatting will
+        // look wrong for this model, but the model still loads and serves.
+        JinjaChatTemplate? declaredChatTemplate;
+        try
+        {
+            declaredChatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer, config.Architecture);
+        }
+        catch (JinjaException ex)
+        {
+            Console.WriteLine(
+                $"[dotllm] WARNING: model's declared chat_template failed to parse ({ex.Message}); " +
+                "falling back to a plain completion-style transcript. Chat formatting will not match " +
+                "this model's expected format until the template issue is fixed.");
+            declaredChatTemplate = null;
+        }
+
         if (declaredChatTemplate is null)
-            Console.WriteLine("[dotllm] Model has no GGUF chat template; using a plain completion-style transcript.");
+            Console.WriteLine("[dotllm] Model has no usable GGUF chat template; using a plain completion-style transcript.");
         IChatTemplate chatTemplate = declaredChatTemplate ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer);
 
         // Tool call parser
