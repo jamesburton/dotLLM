@@ -47,4 +47,41 @@ public class VulkanMatMulIq2XsGemvF32KernelTests
 
         Iq2Fixture.AssertClose(expected, actual, $"iq2_xs GEMV m={m} k={k}", AbsTol, RelTol);
     }
+
+    /// <summary>
+    /// Production-scale coverage (issue #278), F32-in fallback path. See
+    /// <see cref="VulkanMatMulIq2XsMmvqKernelTests.Mmvq_MatchesF32Oracle_AtProductionScale"/>
+    /// for why <see cref="Iq2Fixture.QuantizeRowsIq2XsFast"/> is needed here instead of
+    /// <see cref="Iq2Fixture.QuantizeRowsIq2Xs"/>.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(4096, 2048)]
+    [InlineData(128256, 2048)]
+    public void Launch_MatchesCpuReference_AtProductionScale(int m, int k)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        var rng = new Random(0x278 + m * 7 + k * 11);
+        byte[] weightsIq2 = Iq2Fixture.QuantizeRowsIq2XsFast(rng, m, k);
+        float[] x = Iq2Fixture.RandomFloats(rng, k, range: 1.0f);
+        float[] expected = Iq2Fixture.CpuGemvIq2Xs(weightsIq2, x, m, k);
+
+        using var device = VulkanDevice.Create();
+        using var kernel = MatMulIq2XsGemvF32Kernel.Create(device, spvDir);
+
+        long weightsBufBytes = ((long)weightsIq2.Length + 3) & ~3L;
+        using var bufW = device.Allocate(weightsBufBytes);
+        using var bufX = device.Allocate((long)k * sizeof(float));
+        using var bufY = device.Allocate((long)m * sizeof(float));
+
+        device.Upload(new ReadOnlySpan<byte>(weightsIq2), bufW);
+        device.Upload(x, bufX);
+
+        kernel.Launch(bufW, bufX, bufY, m, k);
+
+        float[] actual = new float[m];
+        device.Download(bufY, actual);
+
+        Iq2Fixture.AssertClose(expected, actual, $"iq2_xs GEMV production-scale m={m} k={k}", AbsTol, RelTol);
+    }
 }
