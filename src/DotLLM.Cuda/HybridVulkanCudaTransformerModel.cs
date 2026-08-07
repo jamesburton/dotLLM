@@ -508,7 +508,7 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         }
 
         // ── Final RMSNorm + LM Head (last token only) ──
-        nint lastHidden = _cudaState.HiddenState + (nint)((seqLen - 1) * hiddenSize * h);
+        nint lastHidden = _cudaState.HiddenState + (nint)((long)(seqLen - 1) * hiddenSize * h);
         _kernels.LaunchRmsNorm(lastHidden, _cudaWeights.OutputNormWeight, _cudaState.NormOutput,
             hiddenSize, eps, 1, s);
 
