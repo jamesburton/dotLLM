@@ -154,6 +154,88 @@ public sealed class Mach1PackedCheckpointLoaderTests
     }
 
     [SkippableFact]
+    public void DecodeEmbedding_RealFixture_FiniteDeterministic_AndAppliesExceptionOverrides()
+    {
+        string? root = ResolveFixtureRoot();
+        Skip.If(root is null, SkipReason);
+        string embedPath = Path.Combine(root!, "packed", "ne", "embed_int4.safetensors");
+        Skip.If(!File.Exists(embedPath), "packed/ne/embed_int4.safetensors not staged.");
+
+        using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(root!, "config.json")));
+        ModelConfig config = Qwen35MoeConfigExtractor.Extract(doc.RootElement);
+
+        using var checkpoint = Mach1PackedCheckpoint.Open(root!);
+        var embed = new float[(long)config.VocabSize * config.HiddenSize];
+        checkpoint.DecodeEmbedding(embed);
+
+        Assert.All(embed, v => Assert.True(float.IsFinite(v)));
+        Assert.Contains(embed, v => v != 0f);
+
+        // Determinism: re-decode into a fresh buffer and compare.
+        var embed2 = new float[embed.Length];
+        checkpoint.DecodeEmbedding(embed2);
+        Assert.Equal(embed, embed2);
+
+        // Exact-overwrite exceptions: cross-check a sample of overridden elements against the raw
+        // exc_idx/exc_bits tensors, applying the same bf16-bit-pattern formula decode.py/Mach1AffineEmbedCodec
+        // use (bits << 16, reinterpreted as fp32) — proves DecodeEmbedding actually threads the 246,714-entry
+        // exception list through, not just the affine int4 group-quant path.
+        using var embedFile = SafetensorsFile.Open(embedPath);
+        var excIdx = MemoryMarshal.Cast<byte, int>(embedFile.GetTensorSpan("exc_idx"));
+        var excBits = MemoryMarshal.Cast<byte, ushort>(embedFile.GetTensorSpan("exc_bits"));
+        Assert.True(excIdx.Length > 0);
+
+        int sampled = 0;
+        int stride = Math.Max(1, excIdx.Length / 25);
+        for (int i = 0; i < excIdx.Length && sampled < 25; i += stride)
+        {
+            long flatIdx = excIdx[i];
+            float expected = BitConverter.Int32BitsToSingle((int)((uint)excBits[i] << 16));
+            Assert.Equal(expected, embed[flatIdx]);
+            sampled++;
+        }
+        Assert.True(sampled > 0, "no exception entries were sampled.");
+    }
+
+    [SkippableFact]
+    public void DecodeHead_RealFixture_FiniteDeterministic_NoChunkBoundaryGaps()
+    {
+        string? root = ResolveFixtureRoot();
+        Skip.If(root is null, SkipReason);
+        Skip.If(!Directory.Exists(Path.Combine(root!, "packed", "head")), "packed/head/ not staged.");
+
+        using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(root!, "config.json")));
+        ModelConfig config = Qwen35MoeConfigExtractor.Extract(doc.RootElement);
+
+        using var checkpoint = Mach1PackedCheckpoint.Open(root!);
+        var head = new float[(long)config.VocabSize * config.HiddenSize];
+        checkpoint.DecodeHead(head, config.HiddenSize);
+
+        Assert.All(head, v => Assert.True(float.IsFinite(v)));
+        Assert.Contains(head, v => v != 0f);
+
+        // Spot-check row diversity right at each of the 8 chunk boundaries (248320/8=31040 rows
+        // each, matching head_c{0..7}of8.safetensors' own dims metadata) — a chunk-assembly bug
+        // (wrong r0 offset, dropped/duplicated/misordered chunk) shows up as an all-zero or
+        // stale-repeated region starting exactly at a chunk boundary.
+        int rowsPerChunk = config.VocabSize / 8;
+        Assert.Equal(31040, rowsPerChunk);
+        for (int c = 0; c < 8; c++)
+        {
+            int row = c * rowsPerChunk;
+            var rowSpan = head.AsSpan(row * config.HiddenSize, config.HiddenSize);
+            bool anyNonZero = false;
+            foreach (float v in rowSpan) { if (v != 0f) { anyNonZero = true; break; } }
+            Assert.True(anyNonZero, $"chunk {c} (row {row}) decoded to an all-zero row.");
+        }
+
+        // Determinism: re-decode into a fresh buffer and compare.
+        var head2 = new float[head.Length];
+        checkpoint.DecodeHead(head2, config.HiddenSize);
+        Assert.Equal(head, head2);
+    }
+
+    [SkippableFact]
     public void DecodeExpertProjection_Layer0Expert0_MatchesVendorGolden_ThroughOrchestrationLayer()
     {
         // Redundant with Mach1GoldenBitExactTests (which exercises the Phase A decoder
