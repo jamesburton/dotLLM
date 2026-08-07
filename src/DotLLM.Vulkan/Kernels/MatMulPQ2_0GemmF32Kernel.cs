@@ -152,8 +152,9 @@ public readonly record struct PQ2_0GemmVariant(
 /// <para>
 /// Weight layout matches the CPU oracle <c>DotLLM.Cpu.Kernels.MatMul.UnpackPQ2_0Row</c>: each
 /// 128 contiguous columns of a row form a 34-byte group — 2 bytes little-endian fp16 group scale
-/// then 32 packed code bytes (byte <c>gp</c> holds group-relative positions
-/// <c>{gp, gp+32, gp+64, gp+96}</c> at bit offsets <c>{6,4,2,0}</c>, value = code − 1). Row
+/// then 32 packed code bytes (byte <c>b</c> holds 4 CONSECUTIVE group-relative positions
+/// <c>{4b, 4b+1, 4b+2, 4b+3}</c> at ASCENDING bit offsets <c>{0,2,4,6}</c>, value = code − 1 —
+/// PrismML's real format, see #271). Row
 /// stride is <c>(K/128)·34</c> bytes and there is <b>no</b> per-tensor tail scale (contrast I2_S,
 /// whose single float32 scale sits at byte offset <c>M·(K/4)</c> and is applied once to the
 /// finished accumulator). Because each group owns its scale, the scale is folded into the shared

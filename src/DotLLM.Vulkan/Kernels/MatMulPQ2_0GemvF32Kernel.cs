@@ -9,8 +9,9 @@ namespace DotLLM.Vulkan.Kernels;
 /// Weight layout mirrors the CPU oracle <c>DotLLM.Cpu.Kernels.MatMul.UnpackPQ2_0Row</c> /
 /// <c>Dequantize.DequantizePQ2_0</c>: each 128 contiguous columns of a row form one 34-byte
 /// group — 2 bytes little-endian fp16 group scale followed by 32 bytes of packed 2-bit ternary
-/// codes (byte <c>gp</c>, 0..31, packs 4 codes for group-relative positions
-/// <c>{gp, gp+32, gp+64, gp+96}</c> at bit offsets <c>{6,4,2,0}</c>; value = code − 1).
+/// codes (byte <c>b</c>, 0..31, packs 4 CONSECUTIVE codes for group-relative positions
+/// <c>{4b, 4b+1, 4b+2, 4b+3}</c> at ASCENDING bit offsets <c>{0,2,4,6}</c>; value = code − 1 —
+/// PrismML's real format, verified against their reference dequantize_row_q2_0, see #271).
 /// Unlike I2_S (a single per-tensor tail scale applied once after the full row-dot), PQ2_0
 /// applies each group's own scale to that group's partial dot product — the group scale is
 /// read in-shader per 128-element span, not once at the end.
