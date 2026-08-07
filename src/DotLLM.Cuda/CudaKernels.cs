@@ -4792,6 +4792,8 @@ public sealed unsafe class CudaKernels : IDisposable
                 int totalBlocks = totalElements / 32;
                 int tbArg = totalBlocks;
                 void** args = stackalloc void*[] {&srcArg, &dstArg, &tbArg};
+                // 8 IQ4_NL blocks (256 elements) per CTA — matches the kernel's
+                // thread grouping fixed in issue #265.
                 uint gridDim = (uint)Math.Min((totalBlocks + 7) / 8, MaxDequantGridSize);
                 CudaDriverApi.cuLaunchKernel(_dequantIQ4_NLF32Func,
                         gridDim, 1, 1, BlockSize, 1, 1,
@@ -4988,7 +4990,11 @@ public sealed unsafe class CudaKernels : IDisposable
                 int totalBlocks = totalElements / 32;
                 int tbArg = totalBlocks;
                 void** args = stackalloc void*[] {&srcArg, &dstArg, &tbArg};
-                uint gridDim = (uint)Math.Min(totalBlocks, MaxDequantGridSize);
+                // Issue #265: kernel now groups 8 IQ4_NL blocks (256 elements) per
+                // CTA so all 256 threads participate (was 32/256, 1/8 occupancy).
+                // Grid dim must match that grouping, same formula already used by
+                // LaunchDequantToF32's IQ4_NL case below.
+                uint gridDim = (uint)Math.Min((totalBlocks + 7) / 8, MaxDequantGridSize);
                 CudaDriverApi.cuLaunchKernel(_dequantIQ4_NLFunc,
                         gridDim, 1, 1, BlockSize, 1, 1,
                         0, stream, (nint)args, 0).ThrowOnError();

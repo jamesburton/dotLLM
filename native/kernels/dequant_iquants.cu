@@ -12,25 +12,42 @@ __device__ __constant__ int8_t kvalues_iq4nl_device[16] = {
 #define IQ4_NL_BLOCK_SIZE 32
 #define IQ4_NL_BLOCK_BYTES 18
 
+// IQ4_NL blocks are independent 32-element/18-byte units — unlike IQ4_XS/IQ3_S
+// there is no 256-element super-block grouping them on disk. A launch_bounds(256)
+// CTA mapping 1 thread per element of ONE block therefore only keeps 32 of 256
+// threads active (1/8 occupancy, issue #265). To match the IQ4_XS/IQ3_S pattern
+// of "one thread per element across a 256-wide unit of work", each CTA instead
+// covers a virtual group of 8 consecutive IQ4_NL blocks (8 * 32 = 256 elements):
+// thread t handles local block (t >> 5) within the group, element (t & 31)
+// within that block. This changes only the thread-to-work mapping and grid-loop
+// granularity — the on-disk block layout and per-element math are unchanged.
+#define IQ4_NL_BLOCKS_PER_GROUP 8
+
 extern "C" __global__ void __launch_bounds__(256) dequant_iq4_nl_f16(
     const uint8_t* __restrict__ src,
     half* __restrict__ dst,
     const int total_blocks)
 {
-    int t = threadIdx.x;
-    if (t >= IQ4_NL_BLOCK_SIZE) {
-        return;
-    }
+    int t = threadIdx.x; // 0..255
+    int local_block = t >> 5;   // 0..7
+    int elem = t & 31;          // 0..31
 
-    for (int block_idx = blockIdx.x; block_idx < total_blocks; block_idx += gridDim.x) {
+    int total_groups = (total_blocks + IQ4_NL_BLOCKS_PER_GROUP - 1) / IQ4_NL_BLOCKS_PER_GROUP;
+
+    for (int group = blockIdx.x; group < total_groups; group += gridDim.x) {
+        int block_idx = group * IQ4_NL_BLOCKS_PER_GROUP + local_block;
+        if (block_idx >= total_blocks) {
+            continue;
+        }
+
         const uint8_t* block = src + (size_t)block_idx * IQ4_NL_BLOCK_BYTES;
         const uint8_t* qs = block + 2;
         float d = __half2float(*reinterpret_cast<const half*>(block));
 
-        int j = t & 15;
+        int j = elem & 15;
         uint8_t packed = qs[j];
-        int q = t < 16 ? (packed & 0x0F) : (packed >> 4);
-        dst[(size_t)block_idx * IQ4_NL_BLOCK_SIZE + t] =
+        int q = elem < 16 ? (packed & 0x0F) : (packed >> 4);
+        dst[(size_t)block_idx * IQ4_NL_BLOCK_SIZE + elem] =
             __float2half(d * (float)kvalues_iq4nl_device[q]);
     }
 }
@@ -40,20 +57,26 @@ extern "C" __global__ void __launch_bounds__(256) dequant_iq4_nl_f32(
     float* __restrict__ dst,
     const int total_blocks)
 {
-    int t = threadIdx.x;
-    if (t >= IQ4_NL_BLOCK_SIZE) {
-        return;
-    }
+    int t = threadIdx.x; // 0..255
+    int local_block = t >> 5;   // 0..7
+    int elem = t & 31;          // 0..31
 
-    for (int block_idx = blockIdx.x; block_idx < total_blocks; block_idx += gridDim.x) {
+    int total_groups = (total_blocks + IQ4_NL_BLOCKS_PER_GROUP - 1) / IQ4_NL_BLOCKS_PER_GROUP;
+
+    for (int group = blockIdx.x; group < total_groups; group += gridDim.x) {
+        int block_idx = group * IQ4_NL_BLOCKS_PER_GROUP + local_block;
+        if (block_idx >= total_blocks) {
+            continue;
+        }
+
         const uint8_t* block = src + (size_t)block_idx * IQ4_NL_BLOCK_BYTES;
         const uint8_t* qs = block + 2;
         float d = __half2float(*reinterpret_cast<const half*>(block));
 
-        int j = t & 15;
+        int j = elem & 15;
         uint8_t packed = qs[j];
-        int q = t < 16 ? (packed & 0x0F) : (packed >> 4);
-        dst[(size_t)block_idx * IQ4_NL_BLOCK_SIZE + t] =
+        int q = elem < 16 ? (packed & 0x0F) : (packed >> 4);
+        dst[(size_t)block_idx * IQ4_NL_BLOCK_SIZE + elem] =
             d * (float)kvalues_iq4nl_device[q];
     }
 }
