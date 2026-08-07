@@ -89,21 +89,71 @@ public sealed class VulkanMmvqSharedQuantParityTests
         }
     }
 
-    // Builds a fresh Vulkan model under the requested NO_SHARE setting and runs
-    // prefill + DecodeStepsToCheck single-token decodes, returning the last-row
-    // logits per step. The decode trajectory is driven by the SHARED run's
-    // argmax for both runs would require coupling; instead each run advances by
-    // its OWN argmax — which is fine because (a) both runs are deterministic and
-    // (b) if they ever diverge, the bit-identical assert fires at that step
-    // before the trajectories can drift apart.
-    private float[][] RunDecode(string spvDir, int[] prompt, bool noShare)
+    /// <summary>
+    /// Companion to <see cref="SharedQuant_BitIdenticalToPerProjection_OnSmolLmDecode"/>
+    /// for the fused dual-output dispatch (issue #71): the FFN gate_proj/up_proj
+    /// pair collapses into one <c>MatMulQ8_0MmvqDualKernel</c> dispatch by default;
+    /// <c>DOTLLM_VULKAN_MMVQ_NO_DUAL=1</c> forces the pre-#71 two-dispatch form
+    /// (sharing still on). Both must produce bit-identical logits — the dual
+    /// kernel changes dispatch shape only, not arithmetic.
+    /// </summary>
+    [SkippableFact]
+    public void Dual_BitIdenticalToSeparateDispatches_OnSmolLmDecode()
     {
-        string? original = Environment.GetEnvironmentVariable(
+        SkipVulkanOrMmvqUnavailable(out string spvDir);
+
+        int[] prompt;
+        using (var gguf = GgufFile.Open(_fixture.FilePath))
+        {
+            var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+            prompt = tokenizer.Encode("The capital of France is").ToArray();
+        }
+        Assert.NotEmpty(prompt);
+
+        // Dual is opt-in (off by default — see VulkanTransformerModel.IsMmvqDualEnabled,
+        // a measured non-win on this hardware). Force it on for one run to verify the
+        // fused dispatch is still bit-identical to the default two-dispatch form.
+        float[][] dual = RunDecode(spvDir, prompt, noShare: false, dualOn: true);
+        float[][] separate = RunDecode(spvDir, prompt, noShare: false, dualOn: false);
+
+        Assert.Equal(dual.Length, separate.Length);
+        for (int step = 0; step < dual.Length; step++)
+        {
+            float[] a = dual[step];
+            float[] b = separate[step];
+            Assert.Equal(a.Length, b.Length);
+            int mismatch = -1;
+            for (int i = 0; i < a.Length; i++)
+            {
+                if (!a[i].Equals(b[i])) { mismatch = i; break; }
+            }
+            Assert.True(mismatch < 0,
+                $"step {step}: dual vs separate-dispatch logits differ at index {mismatch} " +
+                $"(dual={(mismatch >= 0 ? a[mismatch] : 0):G9}, " +
+                $"separate={(mismatch >= 0 ? b[mismatch] : 0):G9}). " +
+                "The fused dual MMVQ dispatch is not bit-identical to the two-dispatch form.");
+            _output.WriteLine($"step {step}: bit-identical ({a.Length} logits)");
+        }
+    }
+
+    // Builds a fresh Vulkan model under the requested NO_SHARE/DUAL setting and
+    // runs prefill + DecodeStepsToCheck single-token decodes, returning the
+    // last-row logits per step. The decode trajectory is driven by EACH run's OWN
+    // argmax — which is fine because (a) both runs are deterministic and (b) if
+    // they ever diverge, the bit-identical assert fires at that step before the
+    // trajectories can drift apart.
+    private float[][] RunDecode(string spvDir, int[] prompt, bool noShare, bool dualOn = false)
+    {
+        string? originalShare = Environment.GetEnvironmentVariable(
             VulkanTransformerModel.MmvqNoShareEnvVar);
+        string? originalDual = Environment.GetEnvironmentVariable(
+            VulkanTransformerModel.MmvqDualEnvVar);
         try
         {
             Environment.SetEnvironmentVariable(
                 VulkanTransformerModel.MmvqNoShareEnvVar, noShare ? "1" : null);
+            Environment.SetEnvironmentVariable(
+                VulkanTransformerModel.MmvqDualEnvVar, dualOn ? "1" : null);
 
             using var gguf = GgufFile.Open(_fixture.FilePath);
             var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -129,7 +179,8 @@ public sealed class VulkanMmvqSharedQuantParityTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable(VulkanTransformerModel.MmvqNoShareEnvVar, original);
+            Environment.SetEnvironmentVariable(VulkanTransformerModel.MmvqNoShareEnvVar, originalShare);
+            Environment.SetEnvironmentVariable(VulkanTransformerModel.MmvqDualEnvVar, originalDual);
         }
     }
 
