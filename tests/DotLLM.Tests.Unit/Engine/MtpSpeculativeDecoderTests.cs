@@ -155,13 +155,18 @@ public sealed class MtpSpeculativeDecoderTests
         using var kvCache = new SimpleKvCache(1, NumKvHeads, HeadDim, MaxSeqLen);
         using var mtpState = new CpuMtpState(HiddenSize, MtpNumKvHeads, MtpHeadDim, maxSteps: Math.Max(k, 1) + 4);
 
-        // Prefill: seed the target KV-cache with the start token at position 0, matching the
-        // "position = prompt length + decoded so far" contract DraftAndVerify documents.
+        // Prefill: seed the target KV-cache with the start token at position 0. `position` must
+        // equal lastToken's OWN KV-cache slot (see DraftAndVerify's remarks: "lastToken already
+        // occupies position in kvCacheTarget"), matching SpeculativeDecoder's identical
+        // convention -- so it starts at 0 here, not 1. This mock model ignores position entirely
+        // for logit computation, so this correction has no effect on this test's assertions (both
+        // values pass); fixed for realism after a real (position-sensitive) CUDA model test caught
+        // an off-by-one derived from copying this exact pattern -- see issue #253's CUDA follow-up.
         using (ITensor _ = model.Forward([startToken], [0], deviceId: -1, kvCache))
         {
         }
 
-        int position = 1;
+        int position = 0;
         Span<int> outputBuffer = stackalloc int[k + 1];
         int guard = 0;
         while (generatedIds.Count - 1 < totalNewTokens && guard++ < totalNewTokens * 4)
