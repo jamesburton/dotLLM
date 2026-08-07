@@ -1477,7 +1477,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         }
         else
         {
-            nint lastHidden = _state.HiddenState + (nint)((seqLen - 1) * hiddenSize * h);
+            nint lastHidden = _state.HiddenState + (nint)((long)(seqLen - 1) * hiddenSize * h);
             _kernels.LaunchRmsNorm(lastHidden, _weights.OutputNormWeight, _state.NormOutput,
                 hiddenSize, eps, 1, s);
         }
@@ -2684,7 +2684,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             }
         }
 
-        nint lastHidden = _state.ResidualF32 + (nint)((seqLen - 1) * hiddenSize * sizeof(float));
+        nint lastHidden = _state.ResidualF32 + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
         RmsNormF32WithWeight(lastHidden, _weights.OutputNormWeight, _cpuWeights?.OutputNormWeight, _state.NormOutputF32,
             hiddenSize, eps, 1, s);
 

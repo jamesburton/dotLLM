@@ -4728,7 +4728,10 @@ public sealed unsafe class CudaKernels : IDisposable
         switch (srcDtype)
         {
             case QuantizationType.F32:
-                CudaDriverApi.cuMemcpyDtoD_v2(dst, src, (nuint)(totalElements * sizeof(float))).ThrowOnError();
+                // (long) widening is load-bearing: `totalElements * 4` overflows int at
+                // totalElements > 2^29 (a 2 GiB F32 tensor — reachable for a large
+                // embedding / LM head inside a 12–16 GB budget).
+                CudaDriverApi.cuMemcpyDtoD_v2(dst, src, (nuint)((long)totalElements * sizeof(float))).ThrowOnError();
                 return;
 
             case QuantizationType.F16:
@@ -4888,8 +4891,10 @@ public sealed unsafe class CudaKernels : IDisposable
         switch (srcDtype)
         {
             case QuantizationType.F16:
-                // Already FP16, just copy
-                CudaDriverApi.cuMemcpyDtoD_v2(dst, src, (nuint)(totalElements * 2)).ThrowOnError();
+                // Already FP16, just copy.
+                // (long) widening is load-bearing: `totalElements * 2` overflows int at
+                // totalElements > 2^30 (a 2 GiB F16 tensor).
+                CudaDriverApi.cuMemcpyDtoD_v2(dst, src, (nuint)((long)totalElements * 2)).ThrowOnError();
                 return;
 
             case QuantizationType.F32:
