@@ -184,6 +184,55 @@ public static class ModelLoader
     }
 
     /// <summary>
+    /// Loads a Qwen3.6-35B-A3B model from a Mach-1 additive-codec HF repo's
+    /// <c>packed/</c> directory tree (issue #266 Phase B) — e.g.
+    /// <c>SyzygyResearch/Mach-1-Additive-35B</c>. Unlike <see cref="LoadFromSafetensors"/>,
+    /// this layout has no <c>model.safetensors.index.json</c> and its tensors
+    /// are not directly readable weight bytes (trellis + randomized-Hadamard
+    /// + wave-gamma codec) — every tensor is decoded via
+    /// <see cref="DotLLM.Models.Quantization.Mach1.Mach1PackedCheckpoint"/> and
+    /// Phase A's codec decoders, then wired into the exact same weight
+    /// structures <see cref="Qwen3MoeHybridTransformerModel.LoadFromGguf(GgufFile, ModelConfig)"/>
+    /// produces — the forward pass is unmodified.
+    /// </summary>
+    /// <param name="checkpointRoot">
+    /// The checkpoint root directory (containing <c>packed/</c>,
+    /// <c>extras.safetensors</c>, <c>config.json</c>).
+    /// </param>
+    /// <param name="threading">Threading configuration. Null defaults to single-threaded.</param>
+    /// <returns>The loaded model and its configuration. There is no file handle to
+    /// return (unlike GGUF/safetensors) — every tensor is decoded into
+    /// NativeMemory the model owns and frees on <c>Dispose</c>.</returns>
+    /// <exception cref="FileNotFoundException"><c>config.json</c> or <c>packed/experts/codec.json</c> is missing.</exception>
+    /// <exception cref="InvalidDataException"><c>config.json</c> is not a <c>qwen3_5_moe</c> checkpoint.</exception>
+    public static (IModel Model, ModelConfig Config) LoadFromMach1Packed(
+        string checkpointRoot, ThreadingConfig? threading = null)
+    {
+        ArgumentNullException.ThrowIfNull(checkpointRoot);
+
+        string configPath = Path.Combine(checkpointRoot, "config.json");
+        if (!File.Exists(configPath))
+            throw new FileNotFoundException(
+                $"Expected HuggingFace config.json at '{configPath}'.", configPath);
+
+        using var doc = JsonDocument.Parse(File.ReadAllText(configPath));
+        string? modelType = doc.RootElement.TryGetProperty("model_type", out var mt) && mt.ValueKind == JsonValueKind.String
+            ? mt.GetString()
+            : null;
+        if (!string.Equals(modelType, "qwen3_5_moe", StringComparison.Ordinal)
+            && !string.Equals(modelType, "qwen3_5_moe_text", StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                $"LoadFromMach1Packed requires config.json model_type='qwen3_5_moe' (Mach-1 additive-codec " +
+                $"Qwen3.6-35B-A3B checkpoints), got '{modelType}'.");
+        }
+
+        ModelConfig config = Qwen35MoeConfigExtractor.Extract(doc.RootElement);
+        IModel model = Qwen3MoeHybridTransformerModel.LoadFromMach1Packed(checkpointRoot, config, threading);
+        return (model, config);
+    }
+
+    /// <summary>
     /// Opens an HF safetensors checkpoint and parses its <c>config.json</c>
     /// into a <see cref="ModelConfig"/>, without creating any model instance.
     /// Used by alternative loaders (e.g. CUDA) that need the source + config
@@ -245,6 +294,25 @@ public static class ModelLoader
             {
                 ModelConfig gemma3nConfig = Gemma3nConfigExtractor.Extract(doc.RootElement);
                 return (source, gemma3nConfig);
+            }
+
+            // Qwen3.6-35B-A3B (qwen35moe / Architecture.Qwen3MoeHybrid) wrapper:
+            // model_type=qwen3_5_moe / qwen3_5_moe_text houses the text tower under
+            // `text_config` (vision_config skipped — text-only) plus the Gated
+            // DeltaNet hybrid config Qwen35MoeConfigExtractor understands. Checked
+            // BEFORE ResolveArchitecture for the same reason as the gemma3n probe
+            // above (issue #266 Phase B). Note: this hoist covers *config
+            // extraction* for any qwen3_5_moe checkpoint (e.g. a hypothetical plain
+            // bf16 HF safetensors dump); the Mach-1 additive-codec `packed/` layout
+            // this checkpoint family ships today has no `model.safetensors.index.json`
+            // / single-shard file this generic OpenSafetensorsSource probe can open —
+            // that layout is loaded via the dedicated
+            // <see cref="LoadFromMach1Packed"/> entry point instead.
+            if (string.Equals(topModelType, "qwen3_5_moe", StringComparison.Ordinal)
+                || string.Equals(topModelType, "qwen3_5_moe_text", StringComparison.Ordinal))
+            {
+                ModelConfig qwen35MoeConfig = Qwen35MoeConfigExtractor.Extract(doc.RootElement);
+                return (source, qwen35MoeConfig);
             }
 
             Architecture arch;
