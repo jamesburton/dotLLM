@@ -158,6 +158,21 @@ public record ModelConfig
     public GatedDeltaNetConfig? GdnConfig { get; init; }
 
     /// <summary>
+    /// Number of trailing Multi-Token Prediction (MTP / "NextN") head layers present in the
+    /// checkpoint, beyond <see cref="NumLayers"/> trunk layers. 0 (default) means the GGUF has
+    /// no MTP head — self-speculative decoding is unavailable and every other code path is
+    /// byte-for-byte unaffected. Mirrors llama.cpp's <c>{arch}.nextn_predict_layers</c> GGUF key
+    /// (PR ggml-org/llama.cpp#22673) and the DeepSeek-V3 "NextN" naming it reuses. Qwen3.6's MTP
+    /// GGUFs set this to 1: the checkpoint's raw <c>block_count</c> is trunk+MTP combined, and
+    /// the GGUF config extractor subtracts this value back out so
+    /// <see cref="NumLayers"/> always denotes trunk-only layers — every existing consumer of
+    /// <see cref="NumLayers"/> (KV-cache sizing, per-layer arrays, hybrid layout) keeps seeing
+    /// exactly the trunk stack it already expects, with the MTP head loaded and driven
+    /// separately (see <c>IModel.SupportsMtp</c>).
+    /// </summary>
+    public int NextnPredictLayers { get; init; }
+
+    /// <summary>
     /// Diffusion-decoding configuration for masked-canvas text-diffusion models
     /// (DiffusionGemma). Non-null only for a diffusion checkpoint; null for every
     /// autoregressive architecture — those models are unaffected by this slot.
