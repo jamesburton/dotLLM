@@ -192,12 +192,12 @@ public static unsafe partial class MatMul
         if (Avx2.IsSupported && Ssse3.IsSupported)
         {
             for (int row = 0; row < m; row++)
-                result[row] = VecDotMxfp4Q8_0Avx2(weights + row * rowBytes, xQ8, blockCount);
+                result[row] = VecDotMxfp4Q8_0Avx2(weights + (long)row * rowBytes, xQ8, blockCount);
         }
         else
         {
             for (int row = 0; row < m; row++)
-                result[row] = VecDotMxfp4Q8_0Scalar(weights + row * rowBytes, xQ8, blockCount);
+                result[row] = VecDotMxfp4Q8_0Scalar(weights + (long)row * rowBytes, xQ8, blockCount);
         }
     }
 
