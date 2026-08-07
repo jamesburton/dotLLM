@@ -34,6 +34,16 @@ public static class GgufModelConfigExtractor
         int numLayers = (int)metadata.GetUInt32($"{arch}.block_count");
         int numAttentionHeads = (int)metadata.GetUInt32($"{arch}.attention.head_count");
 
+        // Multi-Token Prediction (MTP / "NextN") head: llama.cpp PR #22673 stores the trailing
+        // MTP block(s) as extra entries appended to block_count (confirmed against the merged
+        // convert_hf_to_gguf.py: `block_count = num_hidden_layers + mtp_num_hidden_layers`).
+        // Only Qwen3.5/3.6 (Qwen3HybridDense / Qwen3MoeHybrid) ship this key today — every other
+        // architecture defaults to 0 and numTrunkLayers == numLayers, so nothing changes for them.
+        int nextnPredictLayers = architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense
+            ? (int)metadata.GetUInt32OrDefault($"{arch}.nextn_predict_layers", 0)
+            : 0;
+        int numTrunkLayers = numLayers - nextnPredictLayers;
+
         // Hybrid models (Nemotron-H) store head_count_kv and feed_forward_length as
         // per-layer Int32 arrays whose entries are zero for layers of the wrong kind.
         // Build a HybridLayerLayout in that case; for pure-Transformer architectures
@@ -131,8 +141,11 @@ public static class GgufModelConfigExtractor
                 moeConfig = TryExtractQwenMoeConfig(metadata, arch, numLayers);
             // Build per-layer layout from full_attention_interval (not stored as
             // per-layer arrays like Nemotron-H, so TryExtractHybridLayout returned null).
+            // Use numTrunkLayers, not raw numLayers: an MTP checkpoint's block_count
+            // includes the trailing nextn_predict_layers MTP block(s), which are always
+            // full-attention and must not be interleaved into the GDN/full-attn pattern.
             if (gdnConfig is { } gdn)
-                hybridLayout = BuildQwen3MoeHybridLayout(numLayers, gdn.FullAttnInterval, numKvHeads);
+                hybridLayout = BuildQwen3MoeHybridLayout(numTrunkLayers, gdn.FullAttnInterval, numKvHeads);
         }
         else if (architecture == Architecture.GptOss)
         {
@@ -145,7 +158,8 @@ public static class GgufModelConfigExtractor
             VocabSize = vocabSize,
             HiddenSize = hiddenSize,
             IntermediateSize = intermediateSize,
-            NumLayers = numLayers,
+            NumLayers = numTrunkLayers,
+            NextnPredictLayers = nextnPredictLayers,
             NumAttentionHeads = numAttentionHeads,
             NumKvHeads = numKvHeads,
             HeadDim = headDim,

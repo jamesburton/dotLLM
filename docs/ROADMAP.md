@@ -203,6 +203,8 @@ a llama.cpp reference run (`llama-bench`) on the same hardware to establish pari
 - CUDA benchmark produces non-NA results for both quantizations.
 - Decode throughput within 2× of llama.cpp (same model, same GPU, same quantization).
 
+**Follow-up — Mach-1 additive-codec checkpoint (issue #266):** `SyzygyResearch/Mach-1-Additive-35B` ships the same Qwen3.6-35B-A3B / `Architecture.Qwen3MoeHybrid` model compressed to ~1.7 bpw with a bespoke trellis + randomized-Hadamard codec, with no GGUF representation. **Phase A** (codec decoder, `src/DotLLM.Models/Quantization/Mach1/`) :white_check_mark: — bit-exact vs. the vendor's own golden tensor. **Phase B** (load path — packed-layout reader, `qwen3_5_moe` config extractor, HF→dotLLM tensor mapping into the existing unmodified forward pass) :white_check_mark: — every tier (routed experts, NE spine/GDN, NE spine/full-attention, LM head, embeddings) and both layer kinds independently validated against the real fixture, several bit-exact against the vendor golden; see `docs/QUANTIZATION.md`'s "Mach-1 Additive Codec" section for the full per-tier validation table. Full 40-layer end-to-end generation / top-1 agreement is gated on ~70-128 GB RAM for dense-decode (a known hardware limitation, documented in `docs/QUANTIZATION.md` — not attempted in-repo; needs a bigger-RAM machine). **Phase C** (fused additive-domain GEMV on CPU/CUDA/Vulkan — the actual ~7.5 GB-resident deliverable) is pending; the issue is not closed until Phase C lands on all three backends.
+
 ## Future Considerations
 
 Not in the current roadmap, but the architecture should not preclude these:
