@@ -127,10 +127,27 @@ public static class ServerStartup
             model = DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(gguf, config, gpuLayers, gpuId, threading);
         }
 
-        // Create chat template
-        var declaredChatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer, config.Architecture);
+        // Create chat template. The declared template is untrusted input from the GGUF's
+        // tokenizer.chat_template metadata — a parse failure (unsupported Jinja construct,
+        // malformed template, etc.) must not take down the whole server process (#273). Fall
+        // back to the plain completion-style transcript and keep loading; chat formatting will
+        // look wrong for this model, but the model still loads and serves.
+        JinjaChatTemplate? declaredChatTemplate;
+        try
+        {
+            declaredChatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer, config.Architecture);
+        }
+        catch (JinjaException ex)
+        {
+            Console.WriteLine(
+                $"[dotllm] WARNING: model's declared chat_template failed to parse ({ex.Message}); " +
+                "falling back to a plain completion-style transcript. Chat formatting will not match " +
+                "this model's expected format until the template issue is fixed.");
+            declaredChatTemplate = null;
+        }
+
         if (declaredChatTemplate is null)
-            Console.WriteLine("[dotllm] Model has no GGUF chat template; using a plain completion-style transcript.");
+            Console.WriteLine("[dotllm] Model has no usable GGUF chat template; using a plain completion-style transcript.");
         IChatTemplate chatTemplate = declaredChatTemplate ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer);
 
         // Tool call parser
@@ -182,6 +199,37 @@ public static class ServerStartup
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported with hybrid GPU, using hybrid cache.");
             kvFactory = (cfg, size) => hybridModel.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel qwen3HybridDenseModel)
+        {
+            // Issue #274: this architecture (e.g. Bonsai-27B) owns its K/V storage internally
+            // (a per-attention-layer F16 device cache sized to AttentionLayerCount, not
+            // NumLayers — see CreateKvCache's doc). Without this branch the model matched
+            // neither CudaTransformerModel nor HybridTransformerModel above and fell through to
+            // the generic PagedKvCacheFactory/SimpleKvCache paths, both of which assume a model
+            // that does NOT own its KV storage and size a host-RAM pool/buffer against the
+            // model's full NumLayers and MaxSequenceLength — tens of GB for a 27B hybrid model,
+            // causing an unhandled startup OOM (paged) or per-request OOM under load (simple).
+            // The returned handle is length-only (a single int) — no host or device allocation
+            // happens here; the real per-layer GPU buffers are sized correctly inside
+            // EnsureF16KvCache using AttentionLayerCount.
+            if (options.UsePaged)
+                Console.WriteLine("[dotllm] Paged KV-cache not supported for Qwen3HybridDense hybrid GPU model (#274); using the model's own internal KV-cache.");
+            else if (kvConfig.IsQuantized)
+                Console.WriteLine("[dotllm] KV-cache quantization not supported for Qwen3HybridDense hybrid GPU model (#274); using the model's own internal KV-cache.");
+            kvFactory = (cfg, size) => qwen3HybridDenseModel.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.CudaQwen3MoeHybridTransformerModel qwen3MoeHybridModel)
+        {
+            // Issue #274: same rationale as the Qwen3HybridDense branch above — this
+            // architecture also owns its K/V storage internally (identical
+            // EnsureF16KvCache/AttentionLayerCount pattern) and must not be routed through the
+            // generic paged/simple KV-cache paths.
+            if (options.UsePaged)
+                Console.WriteLine("[dotllm] Paged KV-cache not supported for Qwen3MoeHybrid hybrid GPU model (#274); using the model's own internal KV-cache.");
+            else if (kvConfig.IsQuantized)
+                Console.WriteLine("[dotllm] KV-cache quantization not supported for Qwen3MoeHybrid hybrid GPU model (#274); using the model's own internal KV-cache.");
+            kvFactory = (cfg, size) => qwen3MoeHybridModel.CreateKvCache(size);
         }
         else if (options.UsePaged && !kvConfig.IsQuantized)
         {
