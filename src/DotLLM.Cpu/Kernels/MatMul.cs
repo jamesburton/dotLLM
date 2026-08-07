@@ -144,7 +144,7 @@ public static unsafe partial class MatMul
             for (; row + 3 < m; row += 4)
             {
                 VecDotQ8_0Avx512_4Rows(
-                    weightsQ8 + row * rowBytes,
+                    weightsQ8 + (long)row * rowBytes,
                     weightsQ8 + (row + 1) * rowBytes,
                     weightsQ8 + (row + 2) * rowBytes,
                     weightsQ8 + (row + 3) * rowBytes,
@@ -152,7 +152,7 @@ public static unsafe partial class MatMul
             }
             for (; row < m; row++)
             {
-                result[row] = VecDotQ8_0Avx512(weightsQ8 + row * rowBytes, xQ8, blockCount);
+                result[row] = VecDotQ8_0Avx512(weightsQ8 + (long)row * rowBytes, xQ8, blockCount);
             }
         }
         else if (Avx2.IsSupported)
@@ -162,7 +162,7 @@ public static unsafe partial class MatMul
             for (; row + 3 < m; row += 4)
             {
                 VecDotQ8_0Avx2_4Rows(
-                    weightsQ8 + row * rowBytes,
+                    weightsQ8 + (long)row * rowBytes,
                     weightsQ8 + (row + 1) * rowBytes,
                     weightsQ8 + (row + 2) * rowBytes,
                     weightsQ8 + (row + 3) * rowBytes,
@@ -170,14 +170,14 @@ public static unsafe partial class MatMul
             }
             for (; row < m; row++)
             {
-                result[row] = VecDotQ8_0Avx2(weightsQ8 + row * rowBytes, xQ8, blockCount);
+                result[row] = VecDotQ8_0Avx2(weightsQ8 + (long)row * rowBytes, xQ8, blockCount);
             }
         }
         else
         {
             for (int row = 0; row < m; row++)
             {
-                result[row] = VecDotQ8_0Scalar(weightsQ8 + row * rowBytes, xQ8, blockCount);
+                result[row] = VecDotQ8_0Scalar(weightsQ8 + (long)row * rowBytes, xQ8, blockCount);
             }
         }
     }
@@ -1563,7 +1563,7 @@ public static unsafe partial class MatMul
             float* rowBuf = stackalloc float[k];
             for (int row = 0; row < m; row++)
             {
-                var srcRow = new ReadOnlySpan<Half>(weightsHalf + row * k, k);
+                var srcRow = new ReadOnlySpan<Half>(weightsHalf + (long)row * k, k);
                 var destRow = new Span<float>(rowBuf, k);
                 TensorPrimitives.ConvertToSingle(srcRow, destRow);
                 y[row] = TensorPrimitives.Dot(destRow, new ReadOnlySpan<float>(x, k));
@@ -1576,7 +1576,7 @@ public static unsafe partial class MatMul
             {
                 for (int row = 0; row < m; row++)
                 {
-                    var srcRow = new ReadOnlySpan<Half>(weightsHalf + row * k, k);
+                    var srcRow = new ReadOnlySpan<Half>(weightsHalf + (long)row * k, k);
                     var destRow = rented.AsSpan(0, k);
                     TensorPrimitives.ConvertToSingle(srcRow, destRow);
                     y[row] = TensorPrimitives.Dot(destRow, new ReadOnlySpan<float>(x, k));

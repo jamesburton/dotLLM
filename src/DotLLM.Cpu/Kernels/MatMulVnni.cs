@@ -176,13 +176,13 @@ public static unsafe partial class MatMul
         for (; row + 3 < m; row += 4)
         {
             VecDotQ8_0VnniZp_4Rows(
-                weightsQ8 + row * rowBytes,
+                weightsQ8 + (long)row * rowBytes,
                 weightsQ8 + (row + 1) * rowBytes,
                 weightsQ8 + (row + 2) * rowBytes,
                 weightsQ8 + (row + 3) * rowBytes,
                 xQ8, blockCount, result + row);
         }
         for (; row < m; row++)
-            result[row] = VecDotQ8_0Vnni(weightsQ8 + row * rowBytes, xQ8, blockCount);
+            result[row] = VecDotQ8_0Vnni(weightsQ8 + (long)row * rowBytes, xQ8, blockCount);
     }
 }
