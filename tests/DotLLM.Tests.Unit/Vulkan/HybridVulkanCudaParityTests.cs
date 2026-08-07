@@ -55,9 +55,12 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// read slot 1 from a 3-slot CUDA cache, while split=3 gives only 1 slot.
 /// </para>
 /// <para>
-/// <b>Skip behaviour.</b> Skips cleanly when either Vulkan or CUDA is
-/// unavailable, when PTX files cannot be located, or when the
-/// DOTLLM_VULKAN_DEVICE_VENDOR env-var is not set to the Intel Arc vendor.
+/// <b>Skip behaviour.</b> Skips cleanly when either a Vulkan or a CUDA
+/// device is unavailable (<see cref="IsBothAvailable"/> — no vendor
+/// requirement; a single physical GPU exposing both a Vulkan ICD and the
+/// CUDA driver, e.g. an NVIDIA card, satisfies this and runs the real
+/// split forward pass on both backends), or when the PTX/SPIR-V kernel
+/// directories cannot be located.
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
