@@ -64,7 +64,14 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     /// "fall back to the trunk's token_embd/output/output_norm" path. Ignored when
     /// <paramref name="withMtp"/> is <see langword="false"/>.
     /// </param>
-    public static byte[] Build(uint seed = 0xC0FFEEu, bool withMtp = true, bool mtpHasOwnHeadTensors = true)
+    /// <param name="fullAttnInterval">
+    /// Overrides <see cref="FullAttnInterval"/>'s default mixed GDN+attention layout. Pass 1 for an
+    /// all-full-attention trunk (no GDN layer at all) — useful for isolating a test from the
+    /// separate, pre-existing "speculative decoding has no rollback for recurrent trunk state"
+    /// limitation (see <c>MtpSpeculativeDecoder</c>'s remarks).
+    /// </param>
+    public static byte[] Build(uint seed = 0xC0FFEEu, bool withMtp = true, bool mtpHasOwnHeadTensors = true,
+        int fullAttnInterval = FullAttnInterval)
     {
         var w = new GgufWriter();
         var rng = new SyntheticGemma4Gguf.Xorshift(seed);
@@ -89,7 +96,11 @@ public static class SyntheticQwen35HybridDenseMtpGguf
         w.AddUInt32($"{arch}.rope.dimension_count", RopeDim);
 
         // Hybrid layout: trunk layer i is full attention when (i+1) % full_attention_interval == 0.
-        w.AddUInt32($"{arch}.full_attention_interval", FullAttnInterval);
+        // fullAttnInterval defaults to the standard fixture shape (mixed GDN+attention); callers that
+        // need an all-full-attention trunk (e.g. to isolate a test from the separate, pre-existing
+        // "speculative decoding + recurrent trunk state has no rollback" limitation — see
+        // MtpSpeculativeDecoder's remarks / issue #253's CUDA follow-up notes) pass 1.
+        w.AddUInt32($"{arch}.full_attention_interval", (uint)fullAttnInterval);
 
         if (withMtp)
             w.AddUInt32($"{arch}.nextn_predict_layers", 1);
@@ -112,7 +123,7 @@ public static class SyntheticQwen35HybridDenseMtpGguf
 
         for (int i = 0; i < BlockCount; i++)
         {
-            bool fullAttn = (i + 1) % FullAttnInterval == 0;
+            bool fullAttn = (i + 1) % fullAttnInterval == 0;
             string p = $"blk.{i}";
 
             AddNorm(w, rng, $"{p}.attn_norm.weight", HiddenSize);
@@ -150,9 +161,10 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     }
 
     /// <summary>Writes the synthetic fixture to <paramref name="path"/>.</summary>
-    public static string Write(string path, uint seed = 0xC0FFEEu, bool withMtp = true, bool mtpHasOwnHeadTensors = true)
+    public static string Write(string path, uint seed = 0xC0FFEEu, bool withMtp = true, bool mtpHasOwnHeadTensors = true,
+        int fullAttnInterval = FullAttnInterval)
     {
-        File.WriteAllBytes(path, Build(seed, withMtp, mtpHasOwnHeadTensors));
+        File.WriteAllBytes(path, Build(seed, withMtp, mtpHasOwnHeadTensors, fullAttnInterval));
         return path;
     }
 
