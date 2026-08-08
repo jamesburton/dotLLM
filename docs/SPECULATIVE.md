@@ -78,6 +78,52 @@ Speculated tokens that are rejected need their KV-cache entries invalidated:
 - Target model KV-cache: only keep entries for accepted tokens.
 - With PagedAttention: simply update the sequence length counter in the block table (blocks are reused, data overwritten on next append).
 
+## Recurrent (GDN) Trunk State Rollback
+
+Position-indexed attention KV-cache is not the only per-sequence state a verify round can touch.
+Hybrid architectures with Gated DeltaNet layers (`Qwen3HybridDense` and siblings) carry a
+**recurrent trunk state** (`IGdnState`) that has no position addressing — every token forwarded
+through the trunk mutates it in place, in call order, regardless of the position label attached to
+that call. A batched verify forward issues ALL K drafted tokens before any accept/reject decision
+is made, so a rejected token's contribution to that recurrent state has already happened by the
+time the KV-cache is rolled back — and unlike the KV-cache, there was historically no way to
+address it away (issue [#287](https://github.com/kkokosa/dotLLM/issues/287)).
+
+**Fix**: `IModel` exposes an opt-in checkpoint/restore pair —
+`SupportsRecurrentStateCheckpoint` / `CheckpointRecurrentState()` / `RestoreRecurrentState(checkpoint)`.
+Both `SpeculativeDecoder` and `MtpSpeculativeDecoder` checkpoint the target model's recurrent state
+immediately before a batched verify forward that might get partially rejected. On rejection, they
+restore the checkpoint and replay exactly the draft tokens that turned out to be genuinely
+accepted (`acceptedCount - 1` of them — the trailing output token is always a corrected/bonus
+substitute that was never itself fed through the trunk), bringing the recurrent state to precisely
+what it would be had the rejected tokens never been drafted. On full acceptance, no restore is
+needed — the state already reflects exactly the accepted history.
+
+Implemented for `Qwen3HybridDenseTransformerModel` (CPU, deep-copies `GdnStateCache` via
+`Buffer.MemoryCopy`) and `CudaQwen3HybridDenseTransformerModel` (CUDA, device-to-device via
+`cuMemcpyDtoD_v2`) — the two models with a real speculative-decoding call path today (MTP
+self-speculation requires `SupportsMtp`, currently only true for this family). Other
+`RequiresPerSequenceState` architectures (`Qwen3MoeHybridTransformerModel`, `Mamba3TransformerModel`)
+have not implemented the checkpoint pair yet — `SupportsRecurrentStateCheckpoint` defaults to
+`false` for them, so they keep prior (uncorrected) behavior rather than silently corrupting an
+un-audited model; extending this fix to them is follow-up work if/when they gain a real
+speculative-decoding caller.
+
+**An asymmetry between the two decoders, worth knowing before touching either rollback path
+again.** `MtpSpeculativeDecoder` forwards `lastToken` via a separate, always-legitimate "catchup"
+call BEFORE taking its checkpoint, so on rollback only the accepted draft-token prefix needs
+replaying. `SpeculativeDecoder`'s verify batch instead forwards `lastToken` itself as row 0
+(`verifyTokens[0]`) — the checkpoint taken immediately before that SAME batched call therefore
+predates `lastToken`'s own trunk processing too, so its replay must re-forward `lastToken` FIRST,
+then the accepted draft-token prefix. Getting this wrong (replaying only the draft tokens, mirroring
+`MtpSpeculativeDecoder`) was caught during development by
+`SpeculativeDecoderGdnStateTests` — the resulting state omitted `lastToken`'s contribution entirely
+and produced ~1% relative logit error. That test's regression assertion uses a 1e-4 relative
+tolerance rather than `MtpSpeculativeDecoderGdnStateTests`' byte-exact one: composing three
+checkpoint/restore/re-batch cycles back-to-back leaves a benign float32-ULP-scale residual (IEEE 754
+addition is not associative across differently-shaped batched re-computation), four orders of
+magnitude below what either real bug produced.
+
 ## Constraint Interaction
 
 When constrained decoding is active:

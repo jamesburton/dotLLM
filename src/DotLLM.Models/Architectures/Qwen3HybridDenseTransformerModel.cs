@@ -1152,6 +1152,30 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
     /// <inheritdoc/>
     /// <remarks>
+    /// Issue #287: this is the model that motivated <see cref="IModel.SupportsRecurrentStateCheckpoint"/> —
+    /// speculative decoding's batched verify forward mutates <see cref="_gdnCache"/> for every
+    /// drafted token before accept/reject is known, and <see cref="GdnStateCache"/> has no
+    /// position addressing to undo a rejected token's contribution the way <see cref="IKvCache"/>
+    /// rollback does.
+    /// </remarks>
+    public bool SupportsRecurrentStateCheckpoint => true;
+
+    /// <inheritdoc/>
+    public object? CheckpointRecurrentState() => _gdnCache.Clone();
+
+    /// <inheritdoc/>
+    public void RestoreRecurrentState(object? checkpoint)
+    {
+        if (checkpoint is null) return;
+        if (checkpoint is not GdnStateCache snapshot)
+            throw new ArgumentException(
+                $"{GetType().Name}.RestoreRecurrentState expects a GdnStateCache checkpoint; got {checkpoint.GetType().Name}.",
+                nameof(checkpoint));
+        snapshot.CopyTo(_gdnCache);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
     /// Sized for the MTP head's own attention (<see cref="Config"/>'s standard head count/dim —
     /// the MTP block is a normal full-attention layer, see <see cref="MtpHeadWeights"/>), with a
     /// KV-cache deep enough for <see cref="MtpDefaultMaxDraftSteps"/> autoregressive draft steps.

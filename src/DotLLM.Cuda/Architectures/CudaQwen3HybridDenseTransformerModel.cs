@@ -203,6 +203,34 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// </remarks>
     public void ResetSequenceState() => _gdnCache.Reset();
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Issue #287 CUDA parity with the CPU host (<c>Qwen3HybridDenseTransformerModel</c>):
+    /// speculative decoding's batched verify forward mutates <see cref="_gdnCache"/> for every
+    /// drafted token before accept/reject is known, and <see cref="CudaGdnStateCache"/> has no
+    /// position addressing to undo a rejected token's contribution the way the KV-cache rollback
+    /// does. Independent of <see cref="IModel.RequiresPerSequenceState"/> (which this model does
+    /// not report — see <see cref="ResetSequenceState"/>'s remarks): <see cref="_gdnCache"/> is
+    /// still the model-owned default state every explicit-state-less <c>Forward</c> call threads,
+    /// and that is exactly the state <c>MtpSpeculativeDecoder</c> / <c>SpeculativeDecoder</c>
+    /// operate against today.
+    /// </remarks>
+    public bool SupportsRecurrentStateCheckpoint => true;
+
+    /// <inheritdoc/>
+    public object? CheckpointRecurrentState() => _gdnCache.Clone();
+
+    /// <inheritdoc/>
+    public void RestoreRecurrentState(object? checkpoint)
+    {
+        if (checkpoint is null) return;
+        if (checkpoint is not CudaGdnStateCache snapshot)
+            throw new ArgumentException(
+                $"{GetType().Name}.RestoreRecurrentState expects a CudaGdnStateCache checkpoint; got {checkpoint.GetType().Name}.",
+                nameof(checkpoint));
+        snapshot.CopyTo(_gdnCache);
+    }
+
     /// <summary>Number of full-attention layers — matches the sparse KV-cache slot count.</summary>
     public int AttentionLayerCount => _attentionLayerCount;
 

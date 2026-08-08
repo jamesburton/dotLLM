@@ -37,6 +37,7 @@ namespace DotLLM.Cuda.Architectures;
 /// </remarks>
 internal sealed unsafe class CudaGdnStateCache : IGdnState
 {
+    private readonly GatedDeltaNetConfig _gdn;
     private readonly int _numGdnLayers;
     private readonly int _convStateElements;
     private readonly int _gdnStateElements;
@@ -63,6 +64,47 @@ internal sealed unsafe class CudaGdnStateCache : IGdnState
         (long)_numGdnLayers * (_convStateElements + _gdnStateElements) * sizeof(float);
 
     /// <summary>
+    /// Device-to-device deep-copies this cache's current contents into a freshly-allocated
+    /// <see cref="CudaGdnStateCache"/> of the same shape — the CUDA-backend checkpoint primitive
+    /// for issue #287's speculative-decoding GDN-state rollback fix. Mirrors
+    /// <see cref="DotLLM.Models.Architectures.GdnStateCache.Clone"/>.
+    /// </summary>
+    public CudaGdnStateCache Clone()
+    {
+        ThrowIfDisposed();
+        var clone = new CudaGdnStateCache(_gdn, _numGdnLayers);
+        CopyTo(clone);
+        return clone;
+    }
+
+    /// <summary>
+    /// Device-to-device overwrites <paramref name="destination"/>'s buffers with this cache's
+    /// current contents via <c>cuMemcpyDtoD_v2</c>. Both caches must share the same shape.
+    /// </summary>
+    public void CopyTo(CudaGdnStateCache destination)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(destination);
+        destination.ThrowIfDisposed();
+        if (destination._numGdnLayers != _numGdnLayers
+            || destination._convStateElements != _convStateElements
+            || destination._gdnStateElements != _gdnStateElements)
+        {
+            throw new ArgumentException(
+                "Destination CudaGdnStateCache shape does not match this cache's shape.", nameof(destination));
+        }
+
+        if (_numGdnLayers == 0) return;
+
+        long convBytes = (long)_numGdnLayers * _convStateElements * sizeof(float);
+        long stateBytes = (long)_numGdnLayers * _gdnStateElements * sizeof(float);
+        if (convBytes > 0)
+            CudaDriverApi.cuMemcpyDtoD_v2(destination._convState, _convState, (nuint)convBytes).ThrowOnError();
+        if (stateBytes > 0)
+            CudaDriverApi.cuMemcpyDtoD_v2(destination._gdnState, _gdnState, (nuint)stateBytes).ThrowOnError();
+    }
+
+    /// <summary>
     /// Creates a new GDN state cache for the given config and layer count. All buffers
     /// are zero-initialised (zero state = no prior history) using <c>cuMemsetD8_v2</c>.
     /// </summary>
@@ -70,6 +112,7 @@ internal sealed unsafe class CudaGdnStateCache : IGdnState
     {
         if (numGdnLayers < 0) throw new ArgumentOutOfRangeException(nameof(numGdnLayers));
 
+        _gdn = gdn;
         _numGdnLayers = numGdnLayers;
         _convStateElements = gdn.ConvStateElements; // (DConv-1) * convDim
         _gdnStateElements = gdn.StateElements;      // NVHead * DState * DState
