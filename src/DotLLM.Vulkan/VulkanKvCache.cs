@@ -449,7 +449,11 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
 
     private unsafe void MapAndCopy(VulkanDevice.Buffer staging, ReadOnlySpan<float> source)
     {
-        int byteLen = source.Length * sizeof(float);
+        // 64-bit: source.Length is an element count, so `length * 4` wraps int at
+        // 512 M floats (2 GiB) — the same element-count × element-size overflow
+        // fixed on the CPU side in #429. A per-layer KV slab of that size is only
+        // out of reach on drivers that cap maxMemoryAllocationSize at 2 GiB.
+        long byteLen = (long)source.Length * sizeof(float);
         nint mapped = _device.MapMemoryWithRetry(staging.Memory, 0, (ulong)byteLen, "vkMapMemory IngestFromHost staging");
         try
         {

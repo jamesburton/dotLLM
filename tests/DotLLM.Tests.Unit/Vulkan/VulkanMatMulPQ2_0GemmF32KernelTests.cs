@@ -356,10 +356,13 @@ public class VulkanMatMulPQ2_0GemmF32KernelTests
     /// <summary>
     /// Packs a row-major <c>[m, k]</c> ternary matrix + per-(row,group) fp16 scales into the
     /// PQ2_0 byte layout the kernel decodes: each 128-element group is 34 bytes — a leading
-    /// little-endian fp16 scale, then 32 bytes where byte <c>gp</c> holds group-relative
-    /// positions {gp, gp+32, gp+64, gp+96} at bit offsets {6, 4, 2, 0} (stored code = value + 1
-    /// ∈ {0,1,2}). Row stride = (k/128)·34 bytes. Mirrors
-    /// <see cref="VulkanMatMulPQ2_0GemvF32KernelTests"/>'s packer.
+    /// little-endian fp16 scale, then 32 bytes where byte <c>b</c> holds 4 CONSECUTIVE
+    /// group-relative positions {4b, 4b+1, 4b+2, 4b+3} at ASCENDING bit offsets {0, 2, 4, 6}
+    /// (stored code = value + 1 ∈ {0,1,2}). Row stride = (k/128)·34 bytes. See issue #271 —
+    /// this is PrismML's real format, verified byte-for-byte against their reference
+    /// dequantize_row_q2_0, not I2_S's strided {gp,gp+32,gp+64,gp+96} interleave this helper
+    /// used to (wrongly) assume. Mirrors <see cref="VulkanMatMulPQ2_0GemvF32KernelTests"/>'s
+    /// packer.
     /// </summary>
     private static byte[] PackPQ2_0(sbyte[] ternary, Half[] scales, int m, int k)
     {
@@ -379,8 +382,8 @@ public class VulkanMatMulPQ2_0GemmF32KernelTests
                 for (int p = 0; p < GroupSize; p++)
                 {
                     int code = ternary[rowBase + groupElemBase + p] + 1;   // {-1,0,1} -> {0,1,2}
-                    int byteInGroup = p % 32;
-                    int shift = 6 - 2 * (p / 32);                          // sub-group 0->6,1->4,2->2,3->0
+                    int byteInGroup = p / 4;
+                    int shift = 2 * (p % 4);                               // 4b+0->0, 4b+1->2, 4b+2->4, 4b+3->6
                     buf[codeBase + byteInGroup] |= (byte)(code << shift);
                 }
             }

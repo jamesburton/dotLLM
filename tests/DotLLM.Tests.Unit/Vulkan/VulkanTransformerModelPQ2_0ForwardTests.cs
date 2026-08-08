@@ -192,10 +192,13 @@ public sealed class VulkanTransformerModelPQ2_0ForwardTests : IDisposable
     /// Generates a row-major <c>[outputDim, inputDim]</c> matrix directly in the PQ2_0 byte
     /// layout: random ternary codes {-1,0,+1} with a random fp16 scale per (row, 128-element
     /// group), packed exactly as <see cref="MatMulPQ2_0GemvF32Kernel"/> decodes (2-byte
-    /// little-endian fp16 scale + 32 packed code bytes per 34-byte group; byte <c>gp</c>
-    /// packs group-relative positions {gp, gp+32, gp+64, gp+96} at bit offsets {6,4,2,0}).
-    /// No separate F32 source is needed — CPU and Vulkan both derive their view directly from
-    /// these bytes.
+    /// little-endian fp16 scale + 32 packed code bytes per 34-byte group; byte <c>b</c> packs
+    /// 4 CONSECUTIVE group-relative positions {4b, 4b+1, 4b+2, 4b+3} at ASCENDING bit offsets
+    /// {0,2,4,6} — PrismML's real format, see issue #271). No separate F32 source is needed —
+    /// CPU and Vulkan both derive their view directly from these bytes, so this test's own
+    /// pass/fail doesn't actually depend on matching the real format (both sides decode
+    /// whatever convention this packer uses), but the doc/code should still describe the real
+    /// layout rather than the pre-#271 I2_S-style guess to avoid misleading future readers.
     /// </summary>
     private static byte[] QuantiseToPQ2_0Bytes(int outputDim, int inputDim, Random rng)
     {
@@ -219,8 +222,8 @@ public sealed class VulkanTransformerModelPQ2_0ForwardTests : IDisposable
                 for (int p = 0; p < GroupSize; p++)
                 {
                     int code = rng.Next(3);                 // {0,1,2} -> {-1,0,+1}
-                    int byteInGroup = p % 32;
-                    int shift = 6 - 2 * (p / 32);
+                    int byteInGroup = p / 4;
+                    int shift = 2 * (p % 4);                // 4b+0->0, 4b+1->2, 4b+2->4, 4b+3->6
                     buf[codeBase + byteInGroup] |= (byte)(code << shift);
                 }
             }

@@ -620,7 +620,10 @@ internal sealed class CudaWeights : IDisposable
                                            int outputDim, int inputDim,
                                            List<nint> allocs, CudaKernels kernels, nint stream)
     {
-        int totalElements = outputDim * inputDim;
+        // 64-bit: `outputDim * inputDim` overflows int for a tensor of >2^31 elements
+        // (e.g. a 256k-vocab x 16384-hidden LM head = 4.2e9). Every byte-size below already
+        // widens to long; the element COUNT itself was the remaining 32-bit product.
+        long totalElements = (long)outputDim * inputDim;
 
         if (qt == QuantizationType.F16)
         {
@@ -637,7 +640,9 @@ internal sealed class CudaWeights : IDisposable
             long f16Bytes = (long)totalElements * sizeof(ushort);
             CudaDriverApi.cuMemAlloc_v2(out nint devF16, (nuint)f16Bytes).ThrowOnError();
             allocs.Add(devF16);
-            kernels.LaunchConvertF32ToF16(devF32, devF16, totalElements, stream);
+            // The kernel API takes an int element count; fail loudly rather than
+            // silently truncating a >2^31-element tensor.
+            kernels.LaunchConvertF32ToF16(devF32, devF16, checked((int)totalElements), stream);
             CudaDriverApi.cuStreamSynchronize(stream).ThrowOnError();
             allocs.Remove(devF32);
             CudaDriverApi.cuMemFree_v2(devF32);
@@ -669,7 +674,7 @@ internal sealed class CudaWeights : IDisposable
         CudaDriverApi.cuMemAlloc_v2(out nint devFp16, (nuint)fp16Bytes).ThrowOnError();
         allocs.Add(devFp16);
 
-        kernels.LaunchDequantToF16(devQuant, qt, devFp16, totalElements, stream);
+        kernels.LaunchDequantToF16(devQuant, qt, devFp16, checked((int)totalElements), stream);
         return devFp16;
     }
 
