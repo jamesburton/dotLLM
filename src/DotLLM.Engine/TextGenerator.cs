@@ -33,6 +33,7 @@ public sealed class TextGenerator
     private readonly IModel? _draftModel;
     private readonly Func<ModelConfig, int, Core.Attention.IKvCache>? _draftKvCacheFactory;
     private readonly int _speculativeCandidates;
+    private readonly bool _mtpEnabled;
     private readonly HybridPrefillDecodeStrategy? _hybridStrategy;
     private readonly int _prefillChunkSize;
 
@@ -47,7 +48,21 @@ public sealed class TextGenerator
     /// When provided, the KV-cache is kept alive between calls and only new suffix tokens are prefilled.</param>
     /// <param name="draftModel">Optional draft model for speculative decoding.</param>
     /// <param name="draftKvCacheFactory">Optional factory for creating the draft model's KV-cache.</param>
-    /// <param name="speculativeCandidates">Number of draft tokens per speculative step (K). Default 5.</param>
+    /// <param name="speculativeCandidates">Number of draft tokens per speculative step (K). Default 5.
+    /// Shared with MTP self-speculative decoding's own K (<paramref name="mtpEnabled"/>) — both are the
+    /// same "candidates per round" concept, just drafted by a second model vs. the target's own head.</param>
+    /// <param name="mtpEnabled">
+    /// Enables Multi-Token Prediction (MTP) self-speculative decoding (issue #253) when
+    /// <paramref name="model"/> reports <see cref="IModel.SupportsMtp"/> — the model's own
+    /// lightweight extra head drafts candidates from its own hidden state, no second model needed.
+    /// Defaults to <see langword="true"/>: MTP is auto-detected purely from the loaded checkpoint
+    /// (mirrors this project's other GGUF-content-driven auto-behavior, e.g. hybrid-architecture
+    /// dispatch) and is a no-op for every model that doesn't carry an MTP head, so the default is
+    /// safe for all existing callers. Ignored (falls through to the standard or two-model
+    /// speculative loop) whenever <paramref name="draftModel"/> is also supplied — the two are
+    /// mutually exclusive per sequence; an explicit draft model takes priority. Only engages when
+    /// decoding is effectively greedy and logprobs aren't requested, same gate as the two-model
+    /// path (see <see cref="IsEffectivelyGreedy"/>).</param>
     /// <param name="hybridStrategy">Optional CPU-prefill / GPU-decode hybrid strategy. When set
     /// and the prompt length is below the strategy's crossover threshold, prefill runs on the
     /// strategy's CPU model and the KV state is handed off to <paramref name="model"/> (the
@@ -68,6 +83,7 @@ public sealed class TextGenerator
                           IModel? draftModel = null,
                           Func<ModelConfig, int, Core.Attention.IKvCache>? draftKvCacheFactory = null,
                           int speculativeCandidates = 5,
+                          bool mtpEnabled = true,
                           HybridPrefillDecodeStrategy? hybridStrategy = null,
                           PrefixTrieManager? prefixTrieManager = null,
                           int prefillChunkSize = 0)
@@ -80,6 +96,7 @@ public sealed class TextGenerator
         _draftModel = draftModel;
         _draftKvCacheFactory = draftKvCacheFactory;
         _speculativeCandidates = speculativeCandidates;
+        _mtpEnabled = mtpEnabled;
         _hybridStrategy = hybridStrategy;
         _prefillChunkSize = prefillChunkSize;
 
@@ -181,11 +198,13 @@ public sealed class TextGenerator
         var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens);
 
         // Hybrid mode is enabled when a strategy is wired up, the prompt is short enough,
-        // and we have a clean cache (no prefix-cache reuse, no speculative draft model).
+        // and we have a clean cache (no prefix-cache reuse, no speculative draft model, no MTP).
+        bool useMtp = ShouldUseMtp(captureLogprobs, options);
         bool useHybrid = _hybridStrategy is not null
             && _hybridStrategy.ShouldRunHybrid(promptLen)
             && cachedTokenCount == 0
-            && _draftModel is null;
+            && _draftModel is null
+            && !useMtp;
 
         // Stop-check scratch buffer: rented up-front and returned in the outer finally to preserve
         // the zero-GC-pressure guarantee on the inference hot path.
@@ -423,6 +442,75 @@ public sealed class TextGenerator
                     ArrayPool<int>.Shared.Return(specBuffer);
                 }
             }
+            else if (useMtp)
+            {
+                // ── MTP self-speculative decode loop (issue #253): the target model's own
+                //    lightweight head drafts candidates from its own hidden state — no second
+                //    model, no second full-model KV-cache, just the model's own IMtpState. ──
+                var mtpDecoder = new MtpSpeculativeDecoder(greedy: true);
+                using DotLLM.Core.Models.IMtpState mtpState = _model.CreateMtpState()
+                    ?? throw new InvalidOperationException(
+                        $"{_model.GetType().Name}.SupportsMtp is true but CreateMtpState() returned null.");
+                int[] specBuffer = ArrayPool<int>.Shared.Rent(_speculativeCandidates + 1);
+                try
+                {
+                    int step = 1;
+                    while (step < maxTokens)
+                    {
+                        int pos = promptLen + step - 1;
+                        if (pos >= cacheSize) break;
+
+                        int remaining = maxTokens - step;
+                        int k = Math.Min(_speculativeCandidates, remaining);
+
+                        var result = mtpDecoder.DraftAndVerify(
+                            _model, kvCache, mtpState,
+                            pipeline, generatedIds, constraint,
+                            pos, vocabSize, k, specBuffer);
+
+                        if (result.AcceptedCount == 0) break;
+
+                        decodeTicks += result.DraftTicks + result.VerifyTicks;
+                        specDrafted += result.DraftedCount;
+
+                        // Constraint is already advanced inside DraftAndVerify — do NOT advance again here.
+                        bool shouldBreak = false;
+                        for (int i = 0; i < result.AcceptedCount; i++)
+                        {
+                            int tokenId = specBuffer[i];
+                            generatedIds.Add(tokenId);
+                            detok.Append(tokenId);
+
+                            stopResult = CheckStopConditions(stopConditions, tokenId, generatedIds,
+                                detok.GetTailView(stopTailSize, stopScratch));
+                            if (stopResult != StopResult.Continue)
+                            {
+                                if (stopResult == StopResult.Stop)
+                                    generatedIds.RemoveAt(generatedIds.Count - 1);
+                                else
+                                {
+                                    specAccepted++;
+                                    onTokenGenerated?.Invoke(tokenId);
+                                }
+
+                                finishReason = stopResult == StopResult.StopInclude ? FinishReason.Length : FinishReason.Stop;
+                                shouldBreak = true;
+                                break;
+                            }
+
+                            specAccepted++;
+                            onTokenGenerated?.Invoke(tokenId);
+                            step++;
+                        }
+
+                        if (shouldBreak) break;
+                    }
+                }
+                finally
+                {
+                    ArrayPool<int>.Shared.Return(specBuffer);
+                }
+            }
             else
             {
                 // ── Standard decode loop: one token at a time ──
@@ -572,10 +660,12 @@ public sealed class TextGenerator
         long kvBytes = GetKvCacheBytes(kvCache);
 
         // Hybrid mode: same gating as the non-streaming path.
+        bool useMtp = ShouldUseMtp(captureLogprobs, options);
         bool useHybrid = _hybridStrategy is not null
             && _hybridStrategy.ShouldRunHybrid(promptLen)
             && cachedTokenCount == 0
-            && _draftModel is null;
+            && _draftModel is null
+            && !useMtp;
 
         // Stop-check scratch buffer: rented up-front and returned in the outer finally. try/finally
         // is preserved across yield points by the async-iterator state machine, so Return runs on
@@ -842,6 +932,97 @@ public sealed class TextGenerator
                     ArrayPool<int>.Shared.Return(specBuffer);
                 }
             }
+            else if (useMtp)
+            {
+                // ── MTP self-speculative decode loop (issue #253) — streaming variant. ──
+                var mtpDecoder = new MtpSpeculativeDecoder(greedy: true);
+                using DotLLM.Core.Models.IMtpState mtpState = _model.CreateMtpState()
+                    ?? throw new InvalidOperationException(
+                        $"{_model.GetType().Name}.SupportsMtp is true but CreateMtpState() returned null.");
+                int[] specBuffer = ArrayPool<int>.Shared.Rent(_speculativeCandidates + 1);
+                try
+                {
+                    int step = 1;
+                    while (step < maxTokens)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        int pos = promptLen + step - 1;
+                        if (pos >= cacheSize) break;
+
+                        int remaining = maxTokens - step;
+                        int kk = Math.Min(_speculativeCandidates, remaining);
+
+                        var result = mtpDecoder.DraftAndVerify(
+                            _model, kvCache, mtpState,
+                            pipeline, generatedIds, constraint,
+                            pos, vocabSize, kk, specBuffer);
+
+                        if (result.AcceptedCount == 0) break;
+
+                        decodeTicks += result.DraftTicks + result.VerifyTicks;
+                        specDrafted += result.DraftedCount;
+
+                        // Constraint is already advanced inside DraftAndVerify — do NOT advance again here.
+                        bool shouldBreak = false;
+                        for (int i = 0; i < result.AcceptedCount; i++)
+                        {
+                            int tokenId = specBuffer[i];
+                            generatedIds.Add(tokenId);
+                            detok.Append(tokenId);
+
+                            stopResult = CheckStopConditions(stopConditions, tokenId, generatedIds,
+                                detok.GetTailView(stopTailSize, stopScratch));
+                            if (stopResult != StopResult.Continue)
+                            {
+                                var fr = stopResult == StopResult.StopInclude ? FinishReason.Length : FinishReason.Stop;
+                                if (stopResult == StopResult.Stop)
+                                {
+                                    generatedIds.RemoveAt(generatedIds.Count - 1);
+                                    StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
+                                    var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
+                                    yield return new GenerationToken(tokenId, string.Empty, fr, timings);
+                                }
+                                else
+                                {
+                                    specAccepted++;
+                                    StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
+                                    var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
+                                    string text = detok.TakeDelta();
+                                    yield return new GenerationToken(tokenId, text, fr, timings);
+                                }
+                                shouldBreak = true;
+                                yield break;
+                            }
+
+                            specAccepted++;
+
+                            // Yield each accepted token
+                            {
+                                bool isLastStep = (step + 1 >= maxTokens) || (promptLen + step >= cacheSize);
+                                string text = detok.TakeDelta();
+                                if (isLastStep && i == result.AcceptedCount - 1)
+                                {
+                                    StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
+                                    var timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvBytes, cachedTokenCount, specDrafted, specAccepted);
+                                    yield return new GenerationToken(tokenId, text, FinishReason.Length, timings);
+                                    shouldBreak = true;
+                                    break;
+                                }
+                                yield return new GenerationToken(tokenId, text, null);
+                            }
+
+                            step++;
+                        }
+
+                        if (shouldBreak) yield break;
+                    }
+                }
+                finally
+                {
+                    ArrayPool<int>.Shared.Return(specBuffer);
+                }
+            }
             else
             {
                 // ── Standard decode loop: one token at a time ──
@@ -1100,6 +1281,18 @@ public sealed class TextGenerator
     // this restriction by making q/p pipeline-aware.
     private static bool IsEffectivelyGreedy(DotLLM.Core.Configuration.InferenceOptions options)
         => options.Temperature <= 0f && options.RepetitionPenalty == 1.0f;
+
+    /// <summary>
+    /// Gates MTP self-speculative decoding (issue #253) for one <c>Generate</c>/
+    /// <c>GenerateStreamingTokensAsync</c> call: enabled, the model actually carries an MTP head,
+    /// no explicit two-model draft is configured (mutually exclusive — an explicit draft model
+    /// always wins), no logprobs requested (no per-position logit access in the draft loop), and
+    /// decoding is effectively greedy (same distributional-correctness gate as the two-model path,
+    /// see <see cref="IsEffectivelyGreedy"/>).
+    /// </summary>
+    private bool ShouldUseMtp(bool captureLogprobs, DotLLM.Core.Configuration.InferenceOptions options)
+        => _mtpEnabled && _draftModel is null && _model.SupportsMtp
+           && !captureLogprobs && IsEffectivelyGreedy(options);
 
     /// <summary>
     /// Runs the prompt-suffix prefill forward pass(es) against <paramref name="kvCache"/>.

@@ -119,6 +119,15 @@ dotllm chat model.gguf --speculative-model draft.gguf --speculative-k 5
 dotllm serve model.gguf --speculative-model draft.gguf --speculative-k 5
 
 # Serve: select draft model from the web UI's Load Model modal
+
+# CLI: MTP self-speculative decoding — auto-detected from the GGUF, no flag needed
+dotllm run qwen3.6-27b-mtp.gguf -p "Hello"
+
+# CLI: opt out of auto-detected MTP (e.g. for exact-timing comparisons or debugging)
+dotllm run qwen3.6-27b-mtp.gguf --no-mtp -p "Hello"
+
+# Serve: MTP is opt-in (default off) — takes the continuous-batch scheduler offline when enabled
+dotllm serve qwen3.6-27b-mtp.gguf --mtp --speculative-k 5
 ```
 
 `--draft-model` and `--draft-tokens` are accepted as aliases of `--speculative-model` and
@@ -277,16 +286,63 @@ zero-behavior-change guarantee for non-MTP checkpoints, hidden-state-capture-is-
 (byte-identical logits with/without `mtpState`), determinism, and the trunk-fallback path when a
 checkpoint omits the optional head-local `nextn.*` tensors.
 
+### CLI & server wiring (issue #253, CLI/server pass)
+
+`TextGenerator` gained an `mtpEnabled` constructor parameter (default `true`) dispatching to
+`MtpSpeculativeDecoder` in both `Generate` and `GenerateStreamingTokensAsync` — a third decode-loop
+branch alongside the existing standard and two-model-speculative loops, gated by
+`_mtpEnabled && _draftModel is null && _model.SupportsMtp && !captureLogprobs &&
+IsEffectivelyGreedy(options)` (mutually exclusive with an explicit two-model draft, which always
+takes priority; same greedy/no-logprobs gate the two-model path already uses). MTP's K reuses
+`speculativeCandidates` — the same "candidates per round" knob, just drafted by the model's own head
+instead of a second model. Metrics flow through the existing generic `SpeculativeDraftTokens` /
+`SpeculativeAcceptedTokens` / `SpeculativeAcceptanceRate` fields on `InferenceTimings` — no new
+fields needed, since those were never two-model-specific in the first place.
+
+**`dotllm run`/`dotllm chat` (`RunCommand.cs`): auto-detect, opt-out via `--no-mtp`.** MTP engages
+automatically whenever the loaded GGUF carries an MTP head and decoding is effectively greedy — no
+flag needed to get the speedup. This mirrors the project's existing precedent for "safe machinery
+on by default with an escape hatch" (`--no-prompt-cache`, `--no-warmup` on `serve`) rather than
+requiring an opt-in flag like the two-model `--speculative-model` (which is inherently opt-in
+because a second model path must be supplied). Two considerations specifically favor auto-detect
+here over opt-in: (1) the correctness guarantee is already demonstrated (`MtpSpeculativeDecoderTests`)
+so auto-enabling can't silently change output, matching the same "provably behavior-preserving, so
+default on" reasoning as prompt-cache/warm-up; (2) the population that could be surprised is
+inherently self-selected — only users who deliberately downloaded an MTP-branded GGUF variant are
+affected at all, and they almost certainly picked that file *for* the MTP speedup. `RunCommand`
+prints a one-line status note (`MTP self-speculative decoding: K=...`) when it engages, same as the
+two-model path's own status line.
+
+**`dotllm serve` (`ServeCommand.cs`/`ServerOptions.cs`/`ServerStartup.cs`): opt-in via `--mtp`,
+default off** — the opposite default from `run`/`chat`, deliberately. Enabling MTP also takes the
+continuous-batch scheduler offline for that model (same restriction the two-model
+`--speculative-model` flag already has — MTP's single-sequence self-speculative loop doesn't support
+multi-request batching in this iteration; see `ServerStartup.LoadModel`'s `mtpActive` gate next to
+the existing `draftModel is null` scheduler condition). Silently trading concurrent-request
+throughput for single-request MTP speedup purely because a particular GGUF happened to load would be
+a surprising regression for shared server traffic — unlike `run`'s single-shot case, there's a real
+downside to weigh, so `serve` requires the explicit flag. `GET /props` reports whether MTP is
+actually active for the loaded model (`mtp_active`) — `true` only when both `--mtp` was passed *and*
+the checkpoint carries an MTP head.
+
+**Chat completions.** `speculative_draft_tokens` / `speculative_accepted_tokens` /
+`speculative_acceptance_rate` on the streaming chunk's timing block (already present for the
+two-model path) report MTP's numbers identically when MTP is the mode that ran — no new
+wire-format fields needed.
+
 ### Status / what's left
 
-- **CPU only.** CUDA is explicit future follow-up per the issue's own scope, not this pass.
-- **Not wired into `TextGenerator`/CLI/server yet.** `IMtpSpeculativeDecoder` /
-  `MtpSpeculativeDecoder` exist and are tested in isolation; threading MTP through the same
-  `--speculative-*` opt-in surface `SpeculativeDecoder` uses (or an equivalent auto-detect from
-  `ModelConfig.NextnPredictLayers`) is follow-up work.
-- **No real-model validation yet.** No `Qwen3.6-27B-MTP-GGUF` fixture is available locally
-  (checked `~/.dotllm/test-cache/` and the HF cache) — end-to-end correctness and the real
-  measured speedup against Qwen3.6-27B (or Bonsai-27B once/if a ternary MTP variant exists) are
-  blocked on fixture availability.
+- **CPU and CUDA implemented** (`Qwen3HybridDenseTransformerModel`/`CudaQwen3HybridDenseTransformerModel`);
+  the partial-offload hybrid split path (`HybridQwen3HybridDenseTransformerModel`) does not support
+  MTP (`SupportsMtp` is always `false` there) and falls through to the standard decode loop.
+- **Wired into `TextGenerator`/CLI/server** — see above. Not wired into `ChatCommand.cs` with its
+  own `--no-mtp` flag (only `RunCommand.cs` per the issue's CLI scope); `ChatCommand` still gets MTP
+  automatically via `TextGenerator`'s `mtpEnabled: true` default (no escape hatch there yet — a
+  small documented follow-up, not a functional gap).
+- **Real-model validation**: `froggeric/Qwen3.6-27B-MTP-GGUF` (Q4_K_M) fetched to
+  `~/.dotllm/test-cache` this session — real end-to-end CLI run confirmed via `dotllm run` with the
+  new `--no-mtp`-gated auto-detect path (see the issue #253 CLI-wiring session notes for the actual
+  generation output and acceptance rate). Full interleaved A/B throughput benchmarking is still
+  `MtpBenchProfile`-only.
 - **Only `nextn_predict_layers == 1`** is supported, matching llama.cpp's own current QWEN35
   assertion — multi-block MTP is out of scope until a real checkpoint needs it.

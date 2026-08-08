@@ -295,8 +295,19 @@ public static class ServerStartup
             Console.WriteLine($"[dotllm] Speculative decoding: draft={Path.GetFileName(draftPath)}, K={options.SpeculativeCandidates}");
         }
 
+        // MTP self-speculative decoding (issue #253) — opt-in for serve (unlike run/chat's
+        // auto-detect default), since engaging it also takes the continuous-batch scheduler
+        // offline for this model (see below). Only actually engages requests when the loaded
+        // checkpoint carries an MTP head; otherwise this is a no-op even with --mtp set.
+        bool mtpActive = options.MtpEnabled && draftModel is null && model.SupportsMtp;
+        if (options.MtpEnabled && draftModel is null && model.SupportsMtp)
+            Console.WriteLine($"[dotllm] MTP self-speculative decoding: K={options.SpeculativeCandidates} (model carries an MTP head)");
+        else if (options.MtpEnabled && draftModel is null && !model.SupportsMtp)
+            Console.WriteLine("[dotllm] --mtp was set but this checkpoint has no MTP head (nextn.* tensors) — ignoring.");
+
         var generator = new TextGenerator(model, tokenizer, kvFactory, prefixCache,
             draftModel: draftModel, speculativeCandidates: options.SpeculativeCandidates,
+            mtpEnabled: options.MtpEnabled,
             prefixTrieManager: prefixTrieManager,
             prefillChunkSize: options.PrefillChunkSize);
         if (options.PrefillChunkSize > 0)
@@ -318,11 +329,11 @@ public static class ServerStartup
         prefixCache?.Clear(); // Discard warm-up KV-cache entries
 
         // Continuous-batch scheduler. Enabled when a paged factory is available and speculative
-        // decoding is off — the scheduler doesn't support draft models in this iteration, and
-        // GPU/hybrid models keep their existing single-request path until the IModel.ForwardBatch
-        // override lands in those backends.
+        // decoding is off — the scheduler doesn't support draft models (or MTP self-speculative
+        // decoding, same restriction) in this iteration, and GPU/hybrid models keep their existing
+        // single-request path until the IModel.ForwardBatch override lands in those backends.
         ContinuousBatchSchedulerService? scheduler = null;
-        if (pagedFactory is not null && kvFactory is not null && draftModel is null)
+        if (pagedFactory is not null && kvFactory is not null && draftModel is null && !mtpActive)
         {
             var schedulerOptions = ResolveSchedulerOptions(options);
 
