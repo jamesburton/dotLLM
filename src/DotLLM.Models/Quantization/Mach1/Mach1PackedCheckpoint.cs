@@ -153,6 +153,29 @@ public sealed class Mach1PackedCheckpoint : IDisposable
         }
     }
 
+    /// <summary>
+    /// Computes <c>y[m0] = W[m0, n0] * x[n0]</c> for one expert's one
+    /// projection at the given layer directly from the packed trellis stream
+    /// (issue #266 Phase C's fused additive GEMV) — never materializes the
+    /// dense weight matrix that <see cref="DecodeExpertProjection"/> does.
+    /// Only implemented for the chunked v3t container; the older v2/manifest
+    /// container (not observed in the real fixture) throws
+    /// <see cref="NotSupportedException"/>.
+    /// </summary>
+    public void GemvExpertProjection(int layer, int expertIndex, string proj, int m0, int n0, ReadOnlySpan<float> x, Span<float> y)
+    {
+        EnsureExpertsLayerOpen(layer);
+        if (_expertsDecoderV3T is { } v3t)
+        {
+            v3t.GemvExpertProjection(expertIndex, proj, m0, n0, x, y);
+        }
+        else
+        {
+            throw new NotSupportedException(
+                "Fused GEMV (issue #266 Phase C) is only implemented for the chunked v3t expert container.");
+        }
+    }
+
     private void EnsureExpertsLayerOpen(int layer)
     {
         if (_openExpertsLayerIdx == layer)
