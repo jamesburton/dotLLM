@@ -160,6 +160,11 @@ public sealed class VulkanTransformerModel : IModel
     // router falls back to the standalone (rmsnorm + matmul_q8_0) pair.
     private readonly RmsNormMatmulQ8_0FusedKernel? _rmsnormMatmulQ8Fused;
     private readonly RmsNormQuantizeQ8_1FusedKernel? _rmsnormQuantQ8Fused;
+    // Fused SwiGLU + Q8_1 quantize for the down_proj decode GEMV (issue #71,
+    // sibling of _rmsnormQuantQ8Fused / issue #145). Null when the SPV is
+    // missing; TryRecordFusedSwiGluQuantizeDown then falls back to the
+    // standalone SwiGLU -> barrier -> quantize -> barrier -> MMVQ chain.
+    private readonly SwiGluQuantizeQ8_1FusedKernel? _swigluQuantQ8Fused;
     // dp4a MMVQ decode path (issue #46) — both null when the device lacks
     // integer-dot-product support, the SPVs are missing, or the env-var
     // opt-out is set; RecordMatmul then falls back to the F32-in Q8_0 GEMV.
@@ -171,6 +176,16 @@ public sealed class VulkanTransformerModel : IModel
     // sites. Null under the same conditions as _matmulQ8Mmvq (plus a missing
     // fused SPV); the router then falls back to _matmulQ8Mmvq + AddKernel.
     private readonly MatMulQ8_0MmvqResidualKernel? _matmulQ8MmvqResidual;
+    // Fused dual-output Q8_0 MMVQ decode GEMV (issue #71) — collapses a
+    // same-K, same-quant-type PAIR of MMVQ GEMVs sharing one quantized
+    // activation (the FFN gate_proj/up_proj group; both K = hidden_size)
+    // into ONE dispatch instead of two barrier-free-but-separate ones.
+    // OFF BY DEFAULT (opt-in via DOTLLM_VULKAN_MMVQ_DUAL=1) — measured
+    // GPU-time regression on RTX 3060, see IsMmvqDualEnabled's doc comment.
+    // Null unless explicitly enabled AND _matmulQ8Mmvq is live AND the fused
+    // SPV is present; RecordMmvqGroupGemvs then falls back to the
+    // per-projection loop (unchanged pre-#71 behaviour).
+    private readonly MatMulQ8_0MmvqDualKernel? _matmulQ8MmvqDual;
     // dp4a MMVQ decode path for Q4_K (issue #52) — null under the same
     // conditions as _matmulQ8Mmvq; reuses _quantizeQ8_1 + the Q8_1Xq/Xds
     // activation scratch. RecordMatmul falls back to the F32-in Q4_K GEMV.
@@ -920,8 +935,10 @@ public sealed class VulkanTransformerModel : IModel
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
         RmsNormMatmulQ8_0FusedKernel? rmsnormMatmulQ8Fused,
         RmsNormQuantizeQ8_1FusedKernel? rmsnormQuantQ8Fused,
+        SwiGluQuantizeQ8_1FusedKernel? swigluQuantQ8Fused,
         QuantizeQ8_1Kernel? quantizeQ8_1, MatMulQ8_0MmvqKernel? matmulQ8Mmvq,
         MatMulQ8_0MmvqResidualKernel? matmulQ8MmvqResidual,
+        MatMulQ8_0MmvqDualKernel? matmulQ8MmvqDual,
         MatMulQ4KMmvqKernel? matmulQ4KMmvq,
         MatMulQ6KMmvqKernel? matmulQ6KMmvq,
         MatMulQ5KMmvqKernel? matmulQ5KMmvq,
@@ -1026,9 +1043,11 @@ public sealed class VulkanTransformerModel : IModel
         _matmulBf16Gemm = matmulBf16Gemm;
         _rmsnormMatmulQ8Fused = rmsnormMatmulQ8Fused;
         _rmsnormQuantQ8Fused = rmsnormQuantQ8Fused;
+        _swigluQuantQ8Fused = swigluQuantQ8Fused;
         _quantizeQ8_1 = quantizeQ8_1;
         _matmulQ8Mmvq = matmulQ8Mmvq;
         _matmulQ8MmvqResidual = matmulQ8MmvqResidual;
+        _matmulQ8MmvqDual = matmulQ8MmvqDual;
         _matmulQ4KMmvq = matmulQ4KMmvq;
         _matmulQ6KMmvq = matmulQ6KMmvq;
         _matmulQ5KMmvq = matmulQ5KMmvq;
@@ -1291,6 +1310,7 @@ public sealed class VulkanTransformerModel : IModel
         QuantizeQ8_1Kernel? quantizeQ8_1 = null;
         MatMulQ8_0MmvqKernel? matmulQ8Mmvq = null;
         MatMulQ8_0MmvqResidualKernel? matmulQ8MmvqResidual = null;
+        MatMulQ8_0MmvqDualKernel? matmulQ8MmvqDual = null;
         MatMulQ4KMmvqKernel? matmulQ4KMmvq = null;
         MatMulQ6KMmvqKernel? matmulQ6KMmvq = null;
         MatMulQ5KMmvqKernel? matmulQ5KMmvq = null;
@@ -1306,6 +1326,16 @@ public sealed class VulkanTransformerModel : IModel
             // missing it just disables the fusion, not the base MMVQ path.
             matmulQ8MmvqResidual = matmulQ8Mmvq is not null
                 ? MatMulQ8_0MmvqResidualKernel.TryCreate(device, spvDir)
+                : null;
+            // Fused dual-output Q8_0 MMVQ (issue #71) — OFF BY DEFAULT. Measured
+            // regression (see IsMmvqDualEnabled doc): the gate/up pair already
+            // dispatches barrier-free, so collapsing it into one dispatch trades
+            // a microsecond-scale CPU launch cost for real GPU-side branch/
+            // descriptor overhead — a net loss on RTX 3060. Kept as a tested,
+            // documented, opt-in artifact (DOTLLM_VULKAN_MMVQ_DUAL=1) rather than
+            // removed, in case it pays off on other hardware.
+            matmulQ8MmvqDual = matmulQ8Mmvq is not null && IsMmvqDualEnabled()
+                ? MatMulQ8_0MmvqDualKernel.TryCreate(device, spvDir)
                 : null;
             // Q4_K MMVQ (issue #52) reuses quantizeQ8_1; it is an independent
             // weight-format path, so a missing Q4_K SPV must not disable Q8_0
@@ -1332,6 +1362,7 @@ public sealed class VulkanTransformerModel : IModel
                 quantizeQ8_1?.Dispose();
                 matmulQ8Mmvq?.Dispose();
                 matmulQ8MmvqResidual?.Dispose();
+                matmulQ8MmvqDual?.Dispose();
                 matmulQ4KMmvq?.Dispose();
                 matmulQ6KMmvq?.Dispose();
                 matmulQ5KMmvq?.Dispose();
@@ -1342,6 +1373,7 @@ public sealed class VulkanTransformerModel : IModel
                 quantizeQ8_1 = null;
                 matmulQ8Mmvq = null;
                 matmulQ8MmvqResidual = null;
+                matmulQ8MmvqDual = null;
                 matmulQ4KMmvq = null;
                 matmulQ6KMmvq = null;
                 matmulQ5KMmvq = null;
@@ -1559,6 +1591,19 @@ public sealed class VulkanTransformerModel : IModel
             rmsnormQuantQ8Fused = RmsNormQuantizeQ8_1FusedKernel.TryCreate(device, spvDir);
         }
 
+        // Fused SwiGLU + Q8_1 activation quantize for the down_proj decode MMVQ
+        // GEMV (issue #71): removes one dispatch + one barrier per dense-FFN
+        // decode layer (SwiGLU -> quantize collapses into one dispatch; the
+        // barrier before the MMVQ GEMV itself still stands). No subgroup
+        // reduction needed (SwiGLU is pointwise), so no HasSubgroupArithmetic
+        // gate. Opt-out: DOTLLM_VULKAN_DISABLE_FUSED_SWIGLU_QUANT=1.
+        SwiGluQuantizeQ8_1FusedKernel? swigluQuantQ8Fused = null;
+        if (quantizeQ8_1 is not null && matmulQ8Mmvq is not null
+            && Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_FUSED_SWIGLU_QUANT") != "1")
+        {
+            swigluQuantQ8Fused = SwiGluQuantizeQ8_1FusedKernel.TryCreate(device, spvDir);
+        }
+
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var rope = RopeF32Kernel.Create(device, spvDir);
         // Optional fused RoPE + KV-cache-write (issue #380). Null on SPV dirs predating
@@ -1729,8 +1774,10 @@ public sealed class VulkanTransformerModel : IModel
             matmulBf16, matmulBf16Gemm,
             rmsnormMatmulQ8Fused,
             rmsnormQuantQ8Fused,
+            swigluQuantQ8Fused,
             quantizeQ8_1, matmulQ8Mmvq,
             matmulQ8MmvqResidual,
+            matmulQ8MmvqDual,
             matmulQ4KMmvq,
             matmulQ6KMmvq,
             matmulQ5KMmvq,
@@ -1845,6 +1892,29 @@ public sealed class VulkanTransformerModel : IModel
 
     internal static bool IsMmvqShareDisabled() =>
         Environment.GetEnvironmentVariable(MmvqNoShareEnvVar) == "1";
+
+    /// <summary>
+    /// Env-var OPT-IN for the fused dual-output MMVQ dispatch (issue #71).
+    /// Default is OFF — this is a measured, documented NON-win, kept opt-in
+    /// rather than removed. Profiling on RTX 3060 (SmolLM-135M Q8_0 decode,
+    /// <c>DOTLLM_VULKAN_DECODE_PROFILE_GPU=1</c>, 3 independent runs, &lt;1%
+    /// intra-run variance) showed the fused gate/up dispatch is reproducibly
+    /// SLOWER in GPU execution time than the pre-#71 two-dispatch form it
+    /// replaces (~13.0-13.2 ms/tok fused vs ~9.2-9.3 ms/tok separate — a
+    /// ~40% regression in that category), despite issuing one fewer
+    /// dispatch. Root cause (not fully isolated): the gate/up pair already
+    /// runs with NO inter-GEMV barrier (issue #150's shared-quant sharing),
+    /// so there was no barrier-drain cost left to remove — only the
+    /// microsecond-scale CPU-side vkCmdDispatch/bind call — while the fused
+    /// shader's <c>if (useA) … else …</c> row-routing branch and doubled
+    /// descriptor-set size add real per-invocation GPU cost that outweighs
+    /// it. Set <c>DOTLLM_VULKAN_MMVQ_DUAL=1</c> to opt in for A/B
+    /// re-measurement (e.g. on hardware where the tradeoff may differ).
+    /// </summary>
+    internal const string MmvqDualEnvVar = "DOTLLM_VULKAN_MMVQ_DUAL";
+
+    internal static bool IsMmvqDualEnabled() =>
+        Environment.GetEnvironmentVariable(MmvqDualEnvVar) == "1";
 
     /// <summary>
     /// Env-var opt-out for the dp4a MMQ prefill path (issue #50). Set
@@ -3374,48 +3444,60 @@ public sealed class VulkanTransformerModel : IModel
             ProfSample("ffn_gate_up");
             DpStamp(cmdBuf, DpCatGateUp);
 
-            // FFN gate activation: GeGLU-tanh (Gemma) when _geglu is non-null,
-            // gated squared-ReLU (BitNet) when _relu2glu is non-null, otherwise
-            // the standard SwiGLU. All fuse gate*act + up into SiluOutput; only
-            // the gate non-linearity differs.
-            if (_geglu is not null)
-                _geglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
-            else if (_relu2glu is not null)
-                _relu2glu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
-            else
-                _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
-            BarrierComputeToCompute(cmdBuf);
-            ProfSample("ffn_act");
-            DpStamp(cmdBuf, DpCatAct);
-
-            // BitNet Sub-LN: in-place RMSNorm over the gated FFN intermediate before
-            // the down projection. No-op for non-BitNet (FfnSubNormWeight null).
-            if (lw.FfnSubNormWeight is { } ffnSubNorm)
-            {
-                _rmsnorm.Record(cmdBuf, _state.SiluOutput, ffnSubNorm, _state.SiluOutput,
-                    rowCount: seqLen, n: lw.DownInputDim, eps: eps);
-                BarrierComputeToCompute(cmdBuf);
-            }
-
-            // Down projection. Issue #379: fuse the residual add directly
-            // into this matmul's final store under the same qualification
-            // rules as the o_proj site above (Q8_0, no bias / LoRA / Gemma
-            // post-ffn-norm in between).
-            downProjFused = lw.DownBias is null && _currentLora is null && lw.PostFfnNormWeight is null
-                && TryRecordMatmulWithResidualQ8_0(cmdBuf, lw.Down, lw.DownDeviceQuantType,
-                    _state.SiluOutput, _state.Residual, _state.AddScratch,
-                    lw.DownOutputDim, lw.DownInputDim, seqLen);
+            // FFN gate activation + down projection. Issue #71: on the
+            // qualifying decode path (plain SwiGLU, Q8_0 down_proj, no bias /
+            // LoRA / BitNet sub-norm / Gemma post-ffn-norm in the way) the
+            // activation, its Q8_1 quantize, AND the down_proj MMVQ GEMV +
+            // residual add collapse from 3 dispatches / 2 barriers into 2
+            // dispatches / 1 barrier (activation+quantize fused; the GEMV
+            // still needs its own barrier to see the just-quantized scratch).
+            downProjFused = TryRecordFusedSwiGluQuantizeDownResidual(cmdBuf, lw, seqLen, intermediateSize);
 
             if (!downProjFused)
             {
-                RecordMatmul(cmdBuf, lw.Down, lw.DownDeviceQuantType, _state.SiluOutput, _state.NormOutput,
-                    lw.DownOutputDim, lw.DownInputDim, seqLen);
-
+                // FFN gate activation: GeGLU-tanh (Gemma) when _geglu is non-null,
+                // gated squared-ReLU (BitNet) when _relu2glu is non-null, otherwise
+                // the standard SwiGLU. All fuse gate*act + up into SiluOutput; only
+                // the gate non-linearity differs.
+                if (_geglu is not null)
+                    _geglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
+                else if (_relu2glu is not null)
+                    _relu2glu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
+                else
+                    _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
                 BarrierComputeToCompute(cmdBuf);
-                if (lw.DownBias is not null)
+                ProfSample("ffn_act");
+                DpStamp(cmdBuf, DpCatAct);
+
+                // BitNet Sub-LN: in-place RMSNorm over the gated FFN intermediate before
+                // the down projection. No-op for non-BitNet (FfnSubNormWeight null).
+                if (lw.FfnSubNormWeight is { } ffnSubNorm)
                 {
-                    _biasAdd.Record(cmdBuf, _state.NormOutput, lw.DownBias, seqLen, lw.DownOutputDim);
+                    _rmsnorm.Record(cmdBuf, _state.SiluOutput, ffnSubNorm, _state.SiluOutput,
+                        rowCount: seqLen, n: lw.DownInputDim, eps: eps);
                     BarrierComputeToCompute(cmdBuf);
+                }
+
+                // Down projection. Issue #379: fuse the residual add directly
+                // into this matmul's final store under the same qualification
+                // rules as the o_proj site above (Q8_0, no bias / LoRA / Gemma
+                // post-ffn-norm in between).
+                downProjFused = lw.DownBias is null && _currentLora is null && lw.PostFfnNormWeight is null
+                    && TryRecordMatmulWithResidualQ8_0(cmdBuf, lw.Down, lw.DownDeviceQuantType,
+                        _state.SiluOutput, _state.Residual, _state.AddScratch,
+                        lw.DownOutputDim, lw.DownInputDim, seqLen);
+
+                if (!downProjFused)
+                {
+                    RecordMatmul(cmdBuf, lw.Down, lw.DownDeviceQuantType, _state.SiluOutput, _state.NormOutput,
+                        lw.DownOutputDim, lw.DownInputDim, seqLen);
+
+                    BarrierComputeToCompute(cmdBuf);
+                    if (lw.DownBias is not null)
+                    {
+                        _biasAdd.Record(cmdBuf, _state.NormOutput, lw.DownBias, seqLen, lw.DownOutputDim);
+                        BarrierComputeToCompute(cmdBuf);
+                    }
                 }
             }
 
@@ -3774,9 +3856,11 @@ public sealed class VulkanTransformerModel : IModel
         _matmulBf16Gemm.InvalidateDescriptorCache();
         _rmsnormMatmulQ8Fused?.InvalidateDescriptorCache();
         _rmsnormQuantQ8Fused?.InvalidateDescriptorCache();
+        _swigluQuantQ8Fused?.InvalidateDescriptorCache();
         _quantizeQ8_1?.InvalidateDescriptorCache();
         _matmulQ8Mmvq?.InvalidateDescriptorCache();
         _matmulQ8MmvqResidual?.InvalidateDescriptorCache();
+        _matmulQ8MmvqDual?.InvalidateDescriptorCache();
         _matmulQ4KMmvq?.InvalidateDescriptorCache();
         _matmulQ6KMmvq?.InvalidateDescriptorCache();
         _matmulQ5KMmvq?.InvalidateDescriptorCache();
@@ -5362,14 +5446,7 @@ public sealed class VulkanTransformerModel : IModel
             _rmsnormQuantQ8Fused.Record(cmdBuf, input, normWeight, normOut,
                 _state.Q8_1Xq!, _state.Q8_1Xds!, inputDim, eps);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            foreach (var p in projections)
-            {
-                // No inter-GEMV barrier — same reasoning as the unfused shared
-                // group: the GEMVs only read the shared scratch and write
-                // disjoint outputs.
-                RecordMmvqGemvPreQuantized(cmdBuf, p.Weights, p.WeightQt, p.Output,
-                    p.OutputDim, inputDim);
-            }
+            RecordMmvqGroupGemvs(cmdBuf, inputDim, projections);
             return;
         }
 
@@ -5391,14 +5468,10 @@ public sealed class VulkanTransformerModel : IModel
             // mixed-quant groups (e.g. Q4_K q/k + Q6_K v) share the one quant.
             _quantizeQ8_1!.Record(cmdBuf, input, _state.Q8_1Xq!, _state.Q8_1Xds!, inputDim);
             BarrierComputeToCompute(cmdBuf);
-            foreach (var p in projections)
-            {
-                // No inter-GEMV barrier: all GEMVs only read the shared scratch
-                // and write disjoint outputs (read-after-write on the scratch is
-                // ordered by the single barrier above).
-                RecordMmvqGemvPreQuantized(cmdBuf, p.Weights, p.WeightQt, p.Output,
-                    p.OutputDim, inputDim);
-            }
+            // No inter-GEMV barrier: all GEMVs only read the shared scratch
+            // and write disjoint outputs (read-after-write on the scratch is
+            // ordered by the single barrier above).
+            RecordMmvqGroupGemvs(cmdBuf, inputDim, projections);
             return;
         }
 
@@ -5488,6 +5561,35 @@ public sealed class VulkanTransformerModel : IModel
         QuantType.IQ1_S => _matmulIq1SMmvq is not null && (inputDim % MatMulIq1SMmvqKernel.Iq1SGroupSize) == 0,
         _ => false,
     };
+
+    /// <summary>
+    /// Records the GEMVs for a shared-activation MMVQ group (issue #71). A
+    /// same-<c>K</c> PAIR that are both Q8_0 collapses into one
+    /// <see cref="MatMulQ8_0MmvqDualKernel"/> dispatch instead of two
+    /// separate <see cref="MatMulQ8_0MmvqKernel"/> dispatches — every member
+    /// of a shared-quant group already reads the same <c>inputDim</c> (that
+    /// is the sharing precondition), so any Q8_0 pair automatically has
+    /// matching K. Covers the FFN gate_proj/up_proj group (both K =
+    /// hidden_size). Groups of any other size/quant mix, or when the dual
+    /// kernel isn't wired, fall back to the per-projection loop (unchanged
+    /// pre-#71 behaviour; still barrier-free between GEMVs).
+    /// </summary>
+    private void RecordMmvqGroupGemvs(nint cmdBuf, int inputDim, ReadOnlySpan<MmvqGroupProjection> projections)
+    {
+        if (_matmulQ8MmvqDual is not null && projections.Length == 2
+            && projections[0].WeightQt == QuantType.Q8_0 && projections[1].WeightQt == QuantType.Q8_0)
+        {
+            _matmulQ8MmvqDual.Record(cmdBuf,
+                projections[0].Weights, projections[1].Weights,
+                _state.Q8_1Xq!, _state.Q8_1Xds!,
+                projections[0].Output, projections[1].Output,
+                mA: projections[0].OutputDim, mB: projections[1].OutputDim, k: inputDim);
+            return;
+        }
+
+        foreach (var p in projections)
+            RecordMmvqGemvPreQuantized(cmdBuf, p.Weights, p.WeightQt, p.Output, p.OutputDim, inputDim);
+    }
 
     /// <summary>
     /// Dispatches the decode MMVQ GEMV for <paramref name="qt"/> against the
@@ -5640,6 +5742,51 @@ public sealed class VulkanTransformerModel : IModel
             default:
                 throw new InvalidOperationException($"No prefill MMQ kernel for {qt}.");
         }
+    }
+
+    /// <summary>
+    /// Issue #71: attempts the fused decode-path chain for a dense-FFN's
+    /// gate activation through the down_proj residual store — SwiGLU
+    /// activation + Q8_1 quantize collapse into ONE dispatch
+    /// (<see cref="SwiGluQuantizeQ8_1FusedKernel"/>), followed by the
+    /// existing residual-fused MMVQ GEMV (issue #379). Replaces the
+    /// (SwiGLU → barrier → quantize → barrier → MMVQ+residual) chain with
+    /// (fused-act-quantize → barrier → MMVQ+residual) — one fewer dispatch
+    /// and one fewer barrier per qualifying layer.
+    /// </summary>
+    /// <remarks>
+    /// Only fires for plain SwiGLU (not GeGLU/relu²GLU), Q8_0 down_proj,
+    /// decode (<c>seqLen==1</c>), and the same "nothing sits between the raw
+    /// result and the residual add" qualification as
+    /// <see cref="TryRecordMatmulWithResidualQ8_0"/> (no bias, no LoRA, no
+    /// Gemma post-ffn-norm, no BitNet sub-norm — the sub-norm case needs
+    /// <c>SiluOutput</c> materialized as an intermediate step the fused
+    /// kernel doesn't expose, so it is excluded here and falls back to the
+    /// standalone chain, matching BitNet's relu²-GLU gate anyway).
+    /// </remarks>
+    private bool TryRecordFusedSwiGluQuantizeDownResidual(
+        nint cmdBuf, in VulkanWeights.LayerBuffers lw, int seqLen, int intermediateSize)
+    {
+        if (_swigluQuantQ8Fused is null) return false;
+        if (seqLen != 1) return false;
+        if (_geglu is not null || _relu2glu is not null) return false;
+        if (lw.FfnSubNormWeight is not null) return false;
+        if (lw.DownDeviceQuantType != QuantType.Q8_0) return false;
+        if (lw.DownBias is not null || _currentLora is not null || lw.PostFfnNormWeight is not null) return false;
+        if (_matmulQ8MmvqResidual is null || _state.Q8_1Xq is null || _state.Q8_1Xds is null) return false;
+        if ((intermediateSize % SwiGluQuantizeQ8_1FusedKernel.GroupSize) != 0) return false;
+        if (QuantizeQ8_1Kernel.PackedBytes(intermediateSize) > _state.Q8_1Xq.Size) return false;
+        if (QuantizeQ8_1Kernel.ScaleBytes(intermediateSize) > _state.Q8_1Xds.Size) return false;
+
+        _swigluQuantQ8Fused.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput,
+            _state.Q8_1Xq, _state.Q8_1Xds, intermediateSize);
+        BarrierComputeToCompute(cmdBuf);
+        ProfSample("ffn_act");
+        DpStamp(cmdBuf, DpCatAct);
+
+        _matmulQ8MmvqResidual.Record(cmdBuf, lw.Down, _state.Q8_1Xq, _state.Q8_1Xds,
+            _state.Residual, _state.AddScratch, m: lw.DownOutputDim, k: lw.DownInputDim);
+        return true;
     }
 
     /// <summary>
@@ -6485,6 +6632,7 @@ public sealed class VulkanTransformerModel : IModel
         _rmsnorm.Dispose();
         _rmsnormMatmulQ8Fused?.Dispose();
         _rmsnormQuantQ8Fused?.Dispose();
+        _swigluQuantQ8Fused?.Dispose();
         _matmulBf16Gemm.Dispose();
         _matmulBf16.Dispose();
         _matmulF16GemmCoopmat?.Dispose();
@@ -6548,6 +6696,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq1SMmvq?.Dispose();
         _matmulQ8Mmvq?.Dispose();
         _matmulQ8MmvqResidual?.Dispose();
+        _matmulQ8MmvqDual?.Dispose();
         _quantizeQ8_1?.Dispose();
         _matmulQ8GemmCoopmat?.Dispose();
         _matmulQ8Gemm.Dispose();
