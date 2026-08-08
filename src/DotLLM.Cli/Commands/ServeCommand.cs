@@ -120,9 +120,19 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>Number of draft candidates per speculative step.</summary>
         [CommandOption("--speculative-k|--draft-tokens")]
-        [Description("Number of draft tokens per speculative step (K). Default 5.")]
+        [Description("Number of draft tokens per speculative step (K). Default 5. Also used as K for --mtp.")]
         [DefaultValue(5)]
         public int SpeculativeK { get; set; } = 5;
+
+        /// <summary>Opt-in to MTP self-speculative decoding when the loaded GGUF carries an MTP head.</summary>
+        [CommandOption("--mtp")]
+        [Description("Enable Multi-Token Prediction (MTP) self-speculative decoding when the loaded GGUF carries " +
+                     "an MTP head (nextn.* tensors); no-op otherwise. Off by default for serve (unlike run/chat, " +
+                     "which auto-detect): enabling it disables the continuous-batch scheduler for this model, " +
+                     "same restriction as --speculative-model, which would be a surprising throughput trade for " +
+                     "concurrent server traffic to make silently.")]
+        [DefaultValue(false)]
+        public bool Mtp { get; set; }
 
         /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
         [CommandOption("--prefill-chunk-size|--ubatch-size")]
@@ -202,6 +212,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             UsePaged = !settings.NoPaged,
             SpeculativeModel = settings.SpeculativeModel,
             SpeculativeCandidates = settings.SpeculativeK,
+            MtpEnabled = settings.Mtp,
             PrefillChunkSize = settings.PrefillChunkSize,
             KeepAliveSeconds = settings.KeepAlive,
             MaxResidentModels = settings.MaxResidentModels,

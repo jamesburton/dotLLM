@@ -55,8 +55,23 @@ public sealed record ServerOptions
     /// <summary>Draft model for speculative decoding. Null = disabled.</summary>
     public string? SpeculativeModel { get; init; }
 
-    /// <summary>Number of draft candidates per speculative step (K).</summary>
+    /// <summary>Number of draft candidates per speculative step (K). Also used as K for MTP
+    /// self-speculative decoding (<see cref="MtpEnabled"/>) — both are the same "candidates per
+    /// round" concept.</summary>
     public int SpeculativeCandidates { get; init; } = 5;
+
+    /// <summary>
+    /// Enables Multi-Token Prediction (MTP) self-speculative decoding (issue #253) when the loaded
+    /// checkpoint carries an MTP head. Unlike <see cref="SpeculativeModel"/> this needs no second
+    /// model — it's a no-op for any GGUF without an MTP head. Defaults to <c>false</c> (opt-in via
+    /// <c>--mtp</c>) for <c>serve</c>, unlike the CLI's <c>run</c>/<c>chat</c> commands where MTP
+    /// auto-detects and defaults on: enabling it here also disables the continuous-batch scheduler
+    /// for this model (mirrors the existing <see cref="SpeculativeModel"/> restriction — MTP's
+    /// single-sequence self-speculative loop doesn't support multi-request batching in this
+    /// iteration), which would be a surprising throughput regression for concurrent server traffic
+    /// to trigger purely from which GGUF happened to load.
+    /// </summary>
+    public bool MtpEnabled { get; init; }
 
     /// <summary>
     /// Maximum prompt tokens per prefill forward pass (llama.cpp <c>-ub</c> / micro-batch analog).
@@ -157,6 +172,7 @@ public sealed record ServerOptions
         bool schedulerFairness = false;
         string? speculativeModel = null;
         int speculativeCandidates = 5;
+        bool mtpEnabled = false;
         int prefillChunkSize = 0;
         string? ropeScaling = null;
         float? ropeFreqBase = null;
@@ -214,6 +230,8 @@ public sealed record ServerOptions
                     speculativeModel = next; i++; break;
                 case "--speculative-k" or "--draft-tokens":
                     speculativeCandidates = int.Parse(next!); i++; break;
+                case "--mtp":
+                    mtpEnabled = true; break;
                 case "--prefill-chunk-size" or "--ubatch-size":
                     prefillChunkSize = int.Parse(next!); i++; break;
                 case "--rope-scaling":
@@ -279,6 +297,7 @@ public sealed record ServerOptions
                 : null,
             SpeculativeModel = speculativeModel,
             SpeculativeCandidates = speculativeCandidates,
+            MtpEnabled = mtpEnabled,
             PrefillChunkSize = prefillChunkSize,
             KeepAliveSeconds = keepAliveSeconds,
             MaxResidentModels = maxResidentModels,

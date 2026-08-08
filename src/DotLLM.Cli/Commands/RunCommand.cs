@@ -249,9 +249,18 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
         /// <summary>Number of draft candidates per speculative step.</summary>
         [CommandOption("--speculative-k|--draft-tokens")]
-        [Description("Number of draft tokens per speculative step (K). Default 5.")]
+        [Description("Number of draft tokens per speculative step (K). Default 5. Also used as K for --no-mtp/MTP self-speculative decoding.")]
         [DefaultValue(5)]
         public int SpeculativeK { get; set; } = 5;
+
+        /// <summary>Opt-out of MTP self-speculative decoding when the loaded GGUF carries an MTP head.</summary>
+        [CommandOption("--no-mtp")]
+        [Description("Disable Multi-Token Prediction (MTP) self-speculative decoding. When enabled (default), " +
+                     "MTP auto-engages whenever the loaded GGUF carries an MTP head (nextn.* tensors) and decoding " +
+                     "is effectively greedy — same output as plain decode, just faster. No effect on GGUFs without an MTP head. " +
+                     "Mutually exclusive with --speculative-model (an explicit draft model takes priority).")]
+        [DefaultValue(false)]
+        public bool NoMtp { get; set; }
 
         /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
         [CommandOption("--prefill-chunk-size|--ubatch-size")]
@@ -654,8 +663,12 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 }
             }
 
+            if (!settings.Json && draftModel is null && !settings.NoMtp && model.SupportsMtp)
+                AnsiConsole.MarkupLine($"[dim]MTP self-speculative decoding: K={settings.SpeculativeK} (model carries an MTP head; disable with --no-mtp)[/]");
+
             var generator = new TextGenerator(model, tokenizer, kvFactory,
                 draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
+                mtpEnabled: !settings.NoMtp,
                 prefillChunkSize: settings.PrefillChunkSize);
             var totalSw = Stopwatch.StartNew();
             int generated = 0;

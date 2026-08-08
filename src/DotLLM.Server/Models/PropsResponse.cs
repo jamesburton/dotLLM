@@ -48,6 +48,15 @@ public sealed record PropsResponse
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? DraftModelPath { get; init; }
 
+    /// <summary>
+    /// True when MTP (Multi-Token Prediction) self-speculative decoding (issue #253) is actually
+    /// engaging requests: <c>--mtp</c> was passed at startup <em>and</em> the loaded checkpoint
+    /// carries an MTP head. False when either condition doesn't hold — including the common case
+    /// of a normal (non-MTP) GGUF, where this is always false regardless of the <c>--mtp</c> flag.
+    /// </summary>
+    [JsonPropertyName("mtp_active")]
+    public bool MtpActive { get; init; }
+
     [JsonPropertyName("is_ready")]
     public bool IsReady { get; init; }
 }
