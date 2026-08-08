@@ -2235,7 +2235,11 @@ public sealed class VulkanTransformerModel : IModel
     {
         if (scUse > 0f && !prevCanvasLogits.IsEmpty && canvasLen > 0)
         {
-            int need = canvasLen * Config.VocabSize;
+            // checked: canvasLen × vocab wraps int at ~16.6 k canvas tokens for a
+            // 129 k vocab, and a wrapped-positive `need` would silently under-copy
+            // (and under-validate) the self-conditioning logits. Matches the
+            // `checked(simpleCount * vocabSize)` guards on the batched-logits paths.
+            int need = checked(canvasLen * Config.VocabSize);
             if (prevCanvasLogits.Length < need)
                 throw new ArgumentException(
                     $"prevCanvasLogits length {prevCanvasLogits.Length} < canvasLen*vocab {need}.",

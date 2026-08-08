@@ -38,7 +38,8 @@ namespace DotLLM.Engine;
 /// against plain greedy decode of the same (synthetic) model.
 /// </para>
 /// <para>
-/// <b>The "catchup" forward — why every round starts by re-processing <c>lastToken</c>.</b>
+/// <b>The "catchup" forward — why every round starts by re-processing <c>lastToken</c>, and why
+/// the verify batch does NOT re-submit it (issue #253 CUDA follow-up, fixed 2026-08-07).</b>
 /// The MTP head's first draft step needs <c>mtpState</c> seeded with the trunk's own
 /// hidden state <em>after</em> processing <c>lastToken</c> (the pairing invariant, confirmed
 /// against llama.cpp's <c>graph_mtp</c>: <c>h_input</c> and <c>tok_embd</c> in the same MTP call
@@ -49,17 +50,26 @@ namespace DotLLM.Engine;
 /// construction, <em>never been forwarded through the trunk as an input</em>: there is no row in
 /// the previous round's verify batch whose hidden state reflects it. So every round begins with a
 /// single-token trunk forward of <c>lastToken</c> (with <c>mtpState</c> capture) purely
-/// to obtain that hidden state before the MTP draft loop can start. This re-forward is safe and
-/// idempotent — <c>lastToken</c> already occupies <c>position</c> in
-/// <c>kvCacheTarget</c> from the prior round (or the initial prefill); <see cref="IKvCache"/>
-/// is position-indexed (<c>Rollback</c>'s doc: "Allocated memory is retained and overwritten on
-/// subsequent Update calls"), so writing the same token at the same position again is a no-op on
-/// the cache contents. The verify batch afterward still includes <c>lastToken</c> as its own row 0
-/// (matching <see cref="SpeculativeDecoder"/>'s shape) for the comparison-basis logits it needs —
-/// a second harmless re-forward of the same token. This doubles the trunk's per-round
-/// single-token-equivalent cost relative to a maximally-optimized implementation that reuses the
-/// catchup call's own logits as the row-0 comparison basis; documented here as a known,
-/// correctness-first simplification rather than silently traded away.
+/// to obtain that hidden state before the MTP draft loop can start.
+/// </para>
+/// <para>
+/// The catchup call's own logits are ALSO this round's "position 0" comparison basis for
+/// <c>draftTokens[0]</c> — reused directly (<c>catchupArgmax</c>), rather than re-submitting
+/// <c>lastToken</c> as row 0 of the verify batch the way <see cref="SpeculativeDecoder"/>'s
+/// two-model verify phase does. An earlier version of this method DID re-submit it, reasoning
+/// (correctly, but incompletely) that <see cref="IKvCache"/> is position-indexed so re-writing the
+/// same token at the same position is a no-op on cache contents. <b>That reasoning does not extend
+/// to recurrent trunk layers</b> (Gated DeltaNet / Mamba, exactly the token-mixing kind
+/// <see cref="ModelConfig.HybridLayout"/> hybrid architectures use — the real MTP target,
+/// Qwen3.6-27B/Bonsai-27B, IS one): their state is a pure sequential recurrence, not
+/// position-indexed, so forwarding the same token through it a second time double-advances that
+/// state and corrupts every subsequent decode step. This was caught empirically by a CUDA
+/// integration test driving the real (GDN-containing) <c>Qwen3HybridDense</c> model through this
+/// decoder and comparing against plain greedy decode of the same model — a comparison the original
+/// mock-model unit tests could not catch because their mock used a non-recurrent architecture.
+/// Skipping the redundant row also removes the "doubles the trunk's per-round single-token
+/// cost" overhead the original version explicitly traded away as a documented simplification —
+/// fixing the bug turned out to be strictly cheaper, not a tradeoff.
 /// </para>
 /// </remarks>
 public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
@@ -116,13 +126,23 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
         // Fresh MTP head KV-cache for this round — see the type remarks on why this is safe.
         mtpState.Rollback(0);
 
-        // ── Catchup (see type remarks): seed mtpState with h-after-lastToken before drafting. ──
+        // ── Catchup (see type remarks): seed mtpState with h-after-lastToken before drafting.
+        //    ALSO capture this call's own logits' argmax — this IS position 0's verify comparison
+        //    basis (see the "no redundant re-forward" remarks below), so the verify batch never
+        //    resubmits lastToken. ──
         long catchupStart = Stopwatch.GetTimestamp();
+        int catchupArgmax;
         using (ITensor catchupLogits = targetModel.Forward(
                    [lastToken], [position], deviceId: -1, kvCacheTarget, adapter: null, mtpState))
         {
             mtpState.SeedFromCapturedRow(0);
-            _ = catchupLogits; // logits themselves unused here — only the hidden-state side effect matters
+            unsafe
+            {
+                var span = new Span<float>((void*)catchupLogits.DataPointer, vocabSize);
+                if (constraint != null)
+                    TokenMaskApplier.Apply(span, constraint.GetAllowedTokens());
+                catchupArgmax = TensorPrimitives.IndexOfMax((ReadOnlySpan<float>)span);
+            }
         }
         verifyTicks += Stopwatch.GetTimestamp() - catchupStart;
 
@@ -166,42 +186,67 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
                     generatedIds.RemoveRange(originalGenCount, generatedIds.Count - originalGenCount);
             }
 
-            // ── Verify Phase (single batched forward pass over the target model — identical
-            //    shape to SpeculativeDecoder's verify phase; row 0 redundantly re-forwards
-            //    lastToken, matching the catchup step above — see type remarks). ──
-            int verifyLen = k + 1;
-            Span<int> verifyTokens = verifyLen <= 16 ? stackalloc int[verifyLen] : new int[verifyLen];
-            Span<int> verifyPositions = verifyLen <= 16 ? stackalloc int[verifyLen] : new int[verifyLen];
-
-            verifyTokens[0] = lastToken;
-            verifyPositions[0] = position;
-            for (int i = 0; i < k; i++)
+            // ── Accept/reject position 0 against the catchup call's own argmax — NOT a fresh
+            //    verify-batch row. Re-submitting lastToken as a verify-batch row (the original
+            //    design) would be byte-redundant for attention/KV-cache math (causally
+            //    independent of later batch rows) but subtly WRONG for recurrent (GDN/Mamba)
+            //    trunk layers: their state is a pure sequential recurrence, not position-indexed,
+            //    so forwarding the same token through it twice per round double-advances that
+            //    state and corrupts every subsequent decode step. catchupArgmax IS the same
+            //    computation a fresh "row 0" would have produced (identical input token, position,
+            //    and preceding KV-cache/recurrent state) — reusing it is both correct and, as a
+            //    side effect, removes the redundant single-token forward the original design paid
+            //    every round. ──
+            int acceptedCount = 0;
+            if (draftTokens[0] == catchupArgmax)
             {
-                verifyTokens[i + 1] = draftTokens[i];
-                verifyPositions[i + 1] = position + i + 1;
+                outputBuffer[acceptedCount++] = draftTokens[0];
+                constraint?.Advance(draftTokens[0]);
+            }
+            else
+            {
+                outputBuffer[acceptedCount++] = catchupArgmax;
+                constraint?.Advance(catchupArgmax);
+                RollbackKvCache(kvCacheTarget, position, acceptedCount);
+                return new SpeculativeResult(acceptedCount, draftTicks, verifyTicks, k);
             }
 
-            int actualVerifyLen = Math.Min(verifyLen, maxPos - position);
-            if (actualVerifyLen < 1)
-                return default;
+            // ── Verify Phase (single batched forward pass over ALL of draftTokens[0..k-1] at
+            //    position+1..position+k — this is the pre-fix verify batch with ONLY the leading
+            //    lastToken row dropped; draftTokens[0] itself still needs to appear as an INPUT
+            //    token here even though its own value was already resolved via catchupArgmax
+            //    above, because it is what row m needs to predict draftTokens[m+1]. Row m (0-based)
+            //    predicts the token after position+m+1, i.e. it is the comparison basis for
+            //    draftTokens[m+1] (m=0..k-2); the LAST row (m=k-1, input=draftTokens[k-1]) doubles
+            //    as the bonus-token source when every draft token is accepted, mirroring
+            //    SpeculativeDecoder's verify shape. ──
+            int verifyLen = k;
+            Span<int> verifyTokens = verifyLen <= 16 ? stackalloc int[verifyLen] : new int[verifyLen];
+            Span<int> verifyPositions = verifyLen <= 16 ? stackalloc int[verifyLen] : new int[verifyLen];
+            for (int i = 0; i < verifyLen; i++)
+            {
+                verifyTokens[i] = draftTokens[i];
+                verifyPositions[i] = position + i + 1;
+            }
 
+            // k is already clamped to maxPos - position - 1 above, so position + k <= maxPos - 1
+            // and every verify position here (<= position + k) is guaranteed in-range — no
+            // additional clamp needed (unlike the pre-fix code, which clamped defensively against
+            // an off-by-one that can no longer occur with this narrower verify range).
             long verifyStart = Stopwatch.GetTimestamp();
             using ITensor targetLogits = targetModel.Forward(
-                verifyTokens.Slice(0, actualVerifyLen),
-                verifyPositions.Slice(0, actualVerifyLen),
-                deviceId: -1, kvCacheTarget, adapter: null);
+                verifyTokens, verifyPositions, deviceId: -1, kvCacheTarget, adapter: null);
             verifyTicks += Stopwatch.GetTimestamp() - verifyStart;
-
-            // ── Accept/Reject Phase (greedy argmax — see type remarks for the correctness argument) ──
-            int acceptedCount = 0;
 
             unsafe
             {
                 nint basePtr = targetLogits.DataPointer;
 
-                for (int i = 0; i < Math.Min(k, actualVerifyLen); i++)
+                // Rows 0..k-2 verify draftTokens[1..k-1]; row k-1 is reserved for the bonus token
+                // below and is never itself an accept/reject comparison target.
+                for (int i = 0; i < verifyLen - 1; i++)
                 {
-                    int draftTok = draftTokens[i];
+                    int draftTok = draftTokens[i + 1];
                     var targetLogitSpan = new Span<float>(
                         (void*)(basePtr + (long)i * vocabSize * sizeof(float)), vocabSize);
 
@@ -223,18 +268,16 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
                     }
                 }
 
-                // All K accepted — sample bonus token from the target's own argmax.
-                if (actualVerifyLen > k)
-                {
-                    var bonusLogitSpan = new Span<float>(
-                        (void*)(basePtr + (long)k * vocabSize * sizeof(float)), vocabSize);
+                // All K accepted — sample bonus token from the LAST verify row's own argmax
+                // (predicts position+k+1, exactly matching the pre-fix design's bonus semantics).
+                var bonusLogitSpan = new Span<float>(
+                    (void*)(basePtr + (long)(verifyLen - 1) * vocabSize * sizeof(float)), vocabSize);
 
-                    if (constraint != null)
-                        TokenMaskApplier.Apply(bonusLogitSpan, constraint.GetAllowedTokens());
+                if (constraint != null)
+                    TokenMaskApplier.Apply(bonusLogitSpan, constraint.GetAllowedTokens());
 
-                    int bonusToken = TensorPrimitives.IndexOfMax((ReadOnlySpan<float>)bonusLogitSpan);
-                    outputBuffer[acceptedCount++] = bonusToken;
-                }
+                int bonusToken = TensorPrimitives.IndexOfMax((ReadOnlySpan<float>)bonusLogitSpan);
+                outputBuffer[acceptedCount++] = bonusToken;
             }
 
             RollbackKvCache(kvCacheTarget, position, acceptedCount);

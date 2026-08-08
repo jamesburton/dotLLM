@@ -224,6 +224,53 @@ public sealed class VulkanDevice : IDisposable
         }
     }
 
+    /// <summary>
+    /// <c>VkPhysicalDeviceLimits.maxStorageBufferRange</c> — the largest byte range a
+    /// single <c>VkDescriptorBufferInfo</c> may expose to a shader. This is the hard
+    /// ceiling that keeps every GLSL byte-offset computation in
+    /// <c>native/vulkan/shaders/*.comp</c> sound: those offsets are 32-bit
+    /// <c>uint</c> (GLSL has no 64-bit integers without
+    /// <c>GL_EXT_shader_explicit_arithmetic_types_int64</c>, which our kernels do not
+    /// enable), so an offset can only overflow if a buffer larger than 4 GiB−1 is bound
+    /// whole. Vulkan's own floor for this limit is 2²⁷ (128 MiB); every desktop driver
+    /// we target reports <c>0xFFFFFFFF</c>. Read lazily — this is not a hot path.
+    /// </summary>
+    /// <remarks>
+    /// Byte offset: <c>VkPhysicalDeviceLimits</c> begins at <c>tail + 4</c> (see
+    /// <see cref="TimestampPeriodNs"/>); <c>maxStorageBufferRange</c> is the 8th
+    /// <c>uint32_t</c> field (after maxImageDimension1D/2D/3D/Cube,
+    /// maxImageArrayLayers, maxTexelBufferElements, maxUniformBufferRange), i.e.
+    /// limits offset 28 → <c>tail + 32</c>.
+    /// </remarks>
+    internal unsafe ulong MaxStorageBufferRange
+    {
+        get
+        {
+            VulkanApi.vkGetPhysicalDeviceProperties(_physicalDevice, out var props);
+            return *(uint*)(props.tail + 32);
+        }
+    }
+
+    /// <summary>
+    /// Rejects a buffer allocation whose size exceeds the device's
+    /// <c>maxStorageBufferRange</c>. Such a buffer cannot be bound with
+    /// <c>VK_WHOLE_SIZE</c> (which is how every kernel in this backend binds its
+    /// storage buffers — see <c>KernelSupport.WriteBufferBindings</c>), and past 4 GiB
+    /// the shaders' 32-bit <c>uint</c> byte-offset arithmetic would silently wrap with
+    /// no diagnostic. Failing loudly here converts undefined behaviour into a clear
+    /// error naming the real constraint.
+    /// </summary>
+    internal static void ThrowIfExceedsStorageBufferRange(long bytes, ulong maxStorageBufferRange)
+    {
+        if (maxStorageBufferRange == 0) return;   // limit unreadable — don't block the caller
+        if ((ulong)bytes <= maxStorageBufferRange) return;
+        throw new InvalidOperationException(
+            $"Requested buffer of {bytes} bytes exceeds the device's maxStorageBufferRange "
+            + $"({maxStorageBufferRange} bytes). A larger buffer cannot be bound whole to a "
+            + "compute shader, and the shaders' 32-bit uint byte offsets would wrap. Split the "
+            + "tensor across multiple buffers (e.g. per-expert or per-row-block banks).");
+    }
+
     private VulkanDevice(
         nint instance, nint physical, nint device, nint queue,
         nint commandPool, string name, uint vendor, int type, uint queueFamily,
@@ -1495,6 +1542,9 @@ public sealed class VulkanDevice : IDisposable
     /// </remarks>
     public Buffer? TryWrapHostVisible(nint hostPointer, long size)
     {
+        // Same 32-bit shader-offset ceiling as AllocateInternal: a zero-copy import is
+        // still bound with VK_WHOLE_SIZE, so it must fit maxStorageBufferRange.
+        ThrowIfExceedsStorageBufferRange(size, MaxStorageBufferRange);
         var import = HostVisibleBuffer.TryCreate(this, hostPointer, size);
         return import is null ? null : new Buffer(this, import);
     }
@@ -1523,6 +1573,7 @@ public sealed class VulkanDevice : IDisposable
     private Buffer AllocateInternal(long bytes, bool deviceLocal, bool preferHostCached = false)
     {
         if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
+        ThrowIfExceedsStorageBufferRange(bytes, MaxStorageBufferRange);
 
         var bci = new VkBufferCreateInfo
         {
