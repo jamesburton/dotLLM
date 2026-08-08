@@ -294,6 +294,64 @@ public interface IModel : IDisposable
     IRecurrentSequenceState? CreateSequenceState() => null;
 
     /// <summary>
+    /// True when this model's MODEL-OWNED recurrent state (the state an explicit-state-less
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/> call implicitly
+    /// threads and advances — see <see cref="ResetSequenceState"/>) can be checkpointed and
+    /// restored via <see cref="CheckpointRecurrentState"/> / <see cref="RestoreRecurrentState"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Why this exists (issue #287).</b> Speculative decoding (<c>SpeculativeDecoder</c> /
+    /// <c>MtpSpeculativeDecoder</c>) verifies K drafted tokens via a single batched
+    /// <c>Forward</c> call BEFORE knowing which of them will be accepted. For position-indexed
+    /// attention KV-cache, a rejected token's cache entries are simply unreachable once
+    /// <see cref="IKvCache"/> is rolled back to the accepted boundary. But a recurrent trunk layer
+    /// (Gated DeltaNet, Mamba) has no position addressing — every input token mutates the running
+    /// state in place, in call order, regardless of the position label attached to it. Once the
+    /// batched verify <c>Forward</c> has run, a rejected token's contribution to that state has
+    /// already happened and cannot be addressed away the way stale KV-cache entries can.</para>
+    /// <para>A model that reports <see langword="true"/> here lets the speculative decoders
+    /// checkpoint state immediately before a batched verify call and, if any drafted token in that
+    /// batch is rejected, restore the checkpoint and re-forward only the tokens that turned out to
+    /// be genuinely accepted — bringing the recurrent state to exactly the state it would be in had
+    /// the rejected tokens never been drafted.</para>
+    /// <para>Default <see langword="false"/>: models that declare <see cref="RequiresPerSequenceState"/>
+    /// but have not implemented this pair (e.g. <c>Qwen3MoeHybridTransformerModel</c>,
+    /// <c>Mamba3TransformerModel</c> as of this writing — neither currently has a real speculative-
+    /// decoding call path, since MTP self-speculation requires <see cref="SupportsMtp"/> and today
+    /// only the GDN-bearing <c>Qwen3HybridDenseTransformerModel</c> family implements that) keep
+    /// today's documented behavior unchanged rather than silently corrupting an un-audited model or
+    /// throwing where nothing previously threw. Implementing this pair for those architectures if
+    /// they ever gain a speculative-decoding call path is a follow-up, not a blocker.</para>
+    /// </remarks>
+    bool SupportsRecurrentStateCheckpoint => false;
+
+    /// <summary>
+    /// Captures an opaque snapshot of this model's current model-owned recurrent state (see
+    /// <see cref="SupportsRecurrentStateCheckpoint"/>). Returns <see langword="null"/> when
+    /// <see cref="SupportsRecurrentStateCheckpoint"/> is <see langword="false"/>.
+    /// </summary>
+    /// <remarks>
+    /// The returned object is owned by the caller until passed to
+    /// <see cref="RestoreRecurrentState"/> (or discarded, when the round it was captured for turns
+    /// out not to need a rollback). Implementations that allocate for the snapshot (e.g. cloning a
+    /// GDN state buffer) do so fresh per call.
+    /// </remarks>
+    object? CheckpointRecurrentState() => null;
+
+    /// <summary>
+    /// Restores model-owned recurrent state from a snapshot previously returned by
+    /// <see cref="CheckpointRecurrentState"/>, undoing every <c>Forward</c> call issued against
+    /// this model's model-owned state since that snapshot was captured.
+    /// </summary>
+    /// <remarks>
+    /// No-op when <see cref="SupportsRecurrentStateCheckpoint"/> is <see langword="false"/> or
+    /// <paramref name="checkpoint"/> is <see langword="null"/>. Implementations should throw
+    /// <see cref="ArgumentException"/> if <paramref name="checkpoint"/> is non-null but not the
+    /// concrete snapshot type this model itself produces.
+    /// </remarks>
+    void RestoreRecurrentState(object? checkpoint) { }
+
+    /// <summary>
     /// Runs a fused forward pass across multiple in-flight sequences.
     /// </summary>
     /// <remarks>
