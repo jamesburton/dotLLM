@@ -26,6 +26,7 @@ public static class PropsEndpoint
                 Threads = threading.EffectiveThreadCount,
                 SamplingDefaults = ToDto(state.SamplingDefaults),
                 DraftModelPath = string.IsNullOrEmpty(state.DraftModelPath) ? null : state.DraftModelPath,
+                MtpActive = state.Options.MtpEnabled && (state.Model?.SupportsMtp ?? false),
                 IsReady = state.IsReady,
             };
         });

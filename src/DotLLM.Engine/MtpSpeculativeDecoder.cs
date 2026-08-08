@@ -207,7 +207,10 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
             {
                 outputBuffer[acceptedCount++] = catchupArgmax;
                 constraint?.Advance(catchupArgmax);
-                RollbackKvCache(kvCacheTarget, position, acceptedCount);
+                // Rejected before the verify batch ever ran (only the always-legitimate catchup
+                // forward has touched the trunk so far this round) — nothing to restore.
+                RollbackState(targetModel, kvCacheTarget, position, acceptedCount,
+                    outputBuffer, gdnCheckpoint: null, rejected: false);
                 return new SpeculativeResult(acceptedCount, draftTicks, verifyTicks, k);
             }
 
@@ -233,6 +236,20 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
             // and every verify position here (<= position + k) is guaranteed in-range — no
             // additional clamp needed (unlike the pre-fix code, which clamped defensively against
             // an off-by-one that can no longer occur with this narrower verify range).
+            //
+            // Issue #287: this batched forward advances the target model's recurrent (GDN) trunk
+            // state — if it has one — for every one of draftTokens[0..k-1], before we know which
+            // will end up accepted (rows past the eventual rejection point get rolled back on the
+            // KV-cache side below, but a pure sequential recurrence has no position addressing to
+            // undo that the same way). Checkpoint immediately before this call so a partial
+            // rejection can restore + replay exactly the genuinely-accepted prefix. (The position-0
+            // catchup-vs-draftTokens[0] comparison above never reaches this point on rejection, so
+            // it needs no checkpoint of its own — nothing has touched the trunk beyond the always-
+            // legitimate catchup forward yet.)
+            object? gdnCheckpoint = targetModel.SupportsRecurrentStateCheckpoint
+                ? targetModel.CheckpointRecurrentState()
+                : null;
+
             long verifyStart = Stopwatch.GetTimestamp();
             using ITensor targetLogits = targetModel.Forward(
                 verifyTokens, verifyPositions, deviceId: -1, kvCacheTarget, adapter: null);
@@ -263,7 +280,8 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
                     {
                         outputBuffer[acceptedCount++] = targetArgmax;
                         constraint?.Advance(targetArgmax);
-                        RollbackKvCache(kvCacheTarget, position, acceptedCount);
+                        RollbackState(targetModel, kvCacheTarget, position, acceptedCount,
+                            outputBuffer, gdnCheckpoint, rejected: true);
                         return new SpeculativeResult(acceptedCount, draftTicks, verifyTicks, k);
                     }
                 }
@@ -280,7 +298,11 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
                 outputBuffer[acceptedCount++] = bonusToken;
             }
 
-            RollbackKvCache(kvCacheTarget, position, acceptedCount);
+            // All K drafted tokens were accepted (the bonus token was sampled-only, never forwarded
+            // through the trunk) — the target's recurrent state already reflects exactly the
+            // accepted history, so no GDN restore is needed here.
+            RollbackState(targetModel, kvCacheTarget, position, acceptedCount,
+                outputBuffer, gdnCheckpoint, rejected: false);
             return new SpeculativeResult(acceptedCount, draftTicks, verifyTicks, k);
         }
         finally
@@ -289,10 +311,50 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
         }
     }
 
-    private static void RollbackKvCache(IKvCache kvCacheTarget, int position, int acceptedCount)
+    /// <summary>
+    /// Rolls the (position-indexed) target KV-cache back to the accepted boundary, and — issue
+    /// #287 — restores the target model's recurrent (GDN) trunk state from
+    /// <paramref name="gdnCheckpoint"/> and replays exactly the genuinely-accepted draft-token
+    /// prefix when <paramref name="rejected"/> is <see langword="true"/>. No-op for models that
+    /// don't report <see cref="IModel.SupportsRecurrentStateCheckpoint"/> (<paramref name="gdnCheckpoint"/>
+    /// is null for them) and for the all-accepted round (nothing to undo).
+    /// </summary>
+    /// <param name="targetModel">The target model.</param>
+    /// <param name="kvCacheTarget">Target model's KV-cache.</param>
+    /// <param name="position">Sequence position this round started drafting from.</param>
+    /// <param name="acceptedCount">
+    /// Tokens written to <paramref name="outputBuffer"/> this round. When <paramref name="rejected"/>
+    /// is true, the LAST of these is always a corrected substitute that was never itself fed
+    /// through the trunk as an input — so exactly <c>acceptedCount - 1</c> of the leading entries
+    /// are the draft tokens genuinely forwarded AND accepted, which is what gets replayed.
+    /// </param>
+    /// <param name="outputBuffer">This round's accepted/corrected output tokens, in order.</param>
+    /// <param name="gdnCheckpoint">
+    /// Recurrent-state snapshot captured before the verify forward, or null when the target model
+    /// doesn't support checkpointing.
+    /// </param>
+    /// <param name="rejected">True when this round ended in a rejection (vs. all K accepted).</param>
+    private static void RollbackState(
+        IModel targetModel, IKvCache kvCacheTarget, int position, int acceptedCount,
+        ReadOnlySpan<int> outputBuffer, object? gdnCheckpoint, bool rejected)
     {
         int acceptedEnd = position + acceptedCount;
         if (acceptedEnd <= kvCacheTarget.CurrentLength)
             kvCacheTarget.Rollback(acceptedEnd);
+
+        if (!rejected || gdnCheckpoint is null)
+            return;
+
+        targetModel.RestoreRecurrentState(gdnCheckpoint);
+
+        int replayCount = acceptedCount - 1;
+        if (replayCount <= 0)
+            return;
+
+        Span<int> replayPositions = replayCount <= 16 ? stackalloc int[replayCount] : new int[replayCount];
+        for (int i = 0; i < replayCount; i++)
+            replayPositions[i] = position + i + 1;
+
+        using ITensor _ = targetModel.Forward(outputBuffer.Slice(0, replayCount), replayPositions, deviceId: -1, kvCacheTarget);
     }
 }

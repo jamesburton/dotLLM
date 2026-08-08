@@ -296,6 +296,132 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
         Assert.Equal(plain, speculative);
     }
 
+    /// <summary>
+    /// CUDA counterpart of the CPU regression test for issue #287's fix
+    /// (<c>MtpSpeculativeDecoderGdnStateTests.DraftAndVerify_AfterRejection_NextTokenLogitsMatchCleanReplay_RawFloats</c>).
+    /// Unlike <see cref="DraftAndVerify_MatchesPlainGreedyDecode_OnRealCudaModel"/> above (which
+    /// deliberately uses <c>fullAttnInterval: 1</c> to dodge the GDN-rollback gap that test's own
+    /// remarks describe), this test uses the fixture's DEFAULT mixed GDN+attention layout and
+    /// targets that gap directly: after running <see cref="MtpSpeculativeDecoder"/> through several
+    /// rounds against the real <see cref="CudaQwen3HybridDenseTransformerModel"/> (hitting at least
+    /// one genuine rejection), forwarding the still-pending last accepted/corrected token against
+    /// the model's own internal, decoder-managed <see cref="CudaGdnStateCache"/> must produce
+    /// BYTE-IDENTICAL logits to forwarding the exact same accepted-token history, one token at a
+    /// time, through a fresh CUDA model instance. Before <see cref="CudaQwen3HybridDenseTransformerModel.CheckpointRecurrentState"/> /
+    /// <see cref="CudaQwen3HybridDenseTransformerModel.RestoreRecurrentState"/> existed, this would
+    /// diverge (rejected draft tokens' recurrent-state contribution leaked into the device-resident
+    /// GDN state with no way to undo it); the CUDA <c>cuMemcpyDtoD_v2</c>-based checkpoint/restore
+    /// fixes it identically to the CPU host.
+    /// </summary>
+    [SkippableFact]
+    public void DraftAndVerify_AfterRejection_NextTokenLogitsMatchCleanReplay_OnRealCudaModel()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir is null, "PTX files not found");
+
+        string path = SyntheticQwen35HybridDenseMtpGguf.Write(
+            Path.Combine(_scratch, "qwen35-mtp-gdn-cuda-logits.gguf"), withMtp: true);
+
+        const int startToken = 3;
+        const int k = 3;
+        const int rounds = 3;
+
+        List<int> acceptedHistory;
+        int lastTokenPosition;
+        float[] nextLogitsFromDecoder;
+        bool anyRejection;
+
+        // ── Run the (fixed) decoder through several rounds, then forward the still-pending last
+        //    token against the SAME CUDA model instance's internal, decoder-managed GDN state. ──
+        {
+            using var gguf = GgufFile.Open(path);
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            using var model = CudaQwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir!);
+            Assert.True(model.SupportsMtp);
+            Assert.True(model.SupportsRecurrentStateCheckpoint);
+
+            var decoder = new MtpSpeculativeDecoder(greedy: true);
+            var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
+
+            var generatedIds = new List<int> { startToken };
+            using var kvCache = model.CreateKvCache(maxSeqLen: 64);
+            using var mtpState = (CudaMtpState)model.CreateMtpState()!;
+
+            // NOTE: deliberately NO manual prefill forward here — DraftAndVerify's own "catchup"
+            // forward already seeds the KV-cache and trunk hidden state for `lastToken` at
+            // `position` on round 1. A real recurrent (GDN) model must not be forwarded through the
+            // same token/position twice (see MtpSpeculativeDecoderGdnStateTests' identical note).
+            int position = 0;
+            anyRejection = false;
+            Span<int> outputBuffer = stackalloc int[k + 1];
+            for (int r = 0; r < rounds; r++)
+            {
+                int kThisRound = Math.Min(k, 64 - position - 2);
+                if (kThisRound <= 0) break;
+
+                var result = decoder.DraftAndVerify(
+                    model, kvCache, mtpState, pipeline, generatedIds,
+                    constraint: null, position, vocabSize: config.VocabSize, numCandidates: kThisRound, outputBuffer);
+
+                if (result.AcceptedCount <= result.DraftedCount)
+                    anyRejection = true;
+
+                _out.WriteLine(
+                    $"[cuda-logits] round {r} @ position={position} k={kThisRound} accepted={result.AcceptedCount} " +
+                    $"drafted={result.DraftedCount} out=[{string.Join(",", outputBuffer.Slice(0, result.AcceptedCount).ToArray())}]");
+
+                for (int i = 0; i < result.AcceptedCount; i++)
+                    generatedIds.Add(outputBuffer[i]);
+
+                position += result.AcceptedCount;
+            }
+
+            Assert.True(anyRejection,
+                "Test setup failure: no rejection occurred across the rounds run, so this comparison " +
+                "cannot discriminate between correct and GDN-state-corrupted behavior.");
+
+            acceptedHistory = generatedIds;
+            lastTokenPosition = position;
+            _out.WriteLine($"[cuda-logits] acceptedHistory=[{string.Join(",", acceptedHistory)}] lastTokenPosition={lastTokenPosition}");
+
+            using ITensor nextLogits = model.Forward([acceptedHistory[^1]], [lastTokenPosition], deviceId: -1, kvCache);
+            unsafe
+            {
+                var span = new ReadOnlySpan<float>((void*)nextLogits.DataPointer, config.VocabSize);
+                nextLogitsFromDecoder = span.ToArray();
+            }
+        }
+
+        // ── Clean reference: fresh CUDA model instance, forward EXACTLY the same accepted-token
+        //    history, one token at a time — no decoder involved at all. ──
+        float[] nextLogitsClean;
+        {
+            using var gguf = GgufFile.Open(path);
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            using var model = CudaQwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir!);
+            using var kvCache = model.CreateKvCache(maxSeqLen: 64);
+
+            ITensor? last = null;
+            for (int pos = 0; pos < acceptedHistory.Count; pos++)
+            {
+                last?.Dispose();
+                last = model.Forward([acceptedHistory[pos]], [pos], deviceId: -1, kvCache);
+            }
+
+            using ITensor probeLogits = last!;
+            unsafe
+            {
+                var span = new ReadOnlySpan<float>((void*)probeLogits.DataPointer, config.VocabSize);
+                nextLogitsClean = span.ToArray();
+            }
+        }
+
+        Assert.Equal(nextLogitsClean.Length, nextLogitsFromDecoder.Length);
+        for (int i = 0; i < nextLogitsClean.Length; i++)
+            Assert.Equal(nextLogitsClean[i], nextLogitsFromDecoder[i]); // byte-identical float compare
+    }
+
     private static float[] RunSingleMtpStep(string path, string ptxDir)
     {
         using var gguf = GgufFile.Open(path);
