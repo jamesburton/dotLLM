@@ -70,8 +70,15 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     /// separate, pre-existing "speculative decoding has no rollback for recurrent trunk state"
     /// limitation (see <c>MtpSpeculativeDecoder</c>'s remarks).
     /// </param>
+    /// <param name="blockCount">
+    /// Overrides <see cref="BlockCount"/>'s default trunk depth (2). Issue #291's CPU/GPU
+    /// partial-offload split regression coverage needs a trunk deep enough that a split boundary
+    /// can land with BOTH a GDN and a full-attention layer on EACH side of the boundary (a 2-layer
+    /// trunk can only ever put one layer on each side) — every other existing caller keeps the
+    /// default 2-layer trunk unchanged.
+    /// </param>
     public static byte[] Build(uint seed = 0xC0FFEEu, bool withMtp = true, bool mtpHasOwnHeadTensors = true,
-        int fullAttnInterval = FullAttnInterval)
+        int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount)
     {
         var w = new GgufWriter();
         var rng = new SyntheticGemma4Gguf.Xorshift(seed);
@@ -82,7 +89,7 @@ public static class SyntheticQwen35HybridDenseMtpGguf
         w.AddString("general.name", "synthetic-qwen35-hybriddense-mtp-tiny");
         w.AddUInt32("general.alignment", 32);
 
-        int rawBlockCount = withMtp ? BlockCount + 1 : BlockCount;
+        int rawBlockCount = withMtp ? blockCount + 1 : blockCount;
         w.AddUInt32($"{arch}.context_length", ContextLength);
         w.AddUInt32($"{arch}.embedding_length", HiddenSize);
         w.AddUInt32($"{arch}.block_count", (uint)rawBlockCount);
@@ -121,7 +128,7 @@ public static class SyntheticQwen35HybridDenseMtpGguf
         AddMatrixF32(w, rng, "output.weight", inK: HiddenSize, outM: VocabSize, 0.05f);
         AddNorm(w, rng, "output_norm.weight", HiddenSize);
 
-        for (int i = 0; i < BlockCount; i++)
+        for (int i = 0; i < blockCount; i++)
         {
             bool fullAttn = (i + 1) % fullAttnInterval == 0;
             string p = $"blk.{i}";
@@ -139,7 +146,7 @@ public static class SyntheticQwen35HybridDenseMtpGguf
 
         if (withMtp)
         {
-            string mp = $"blk.{BlockCount}";
+            string mp = $"blk.{blockCount}";
             AddNorm(w, rng, $"{mp}.attn_norm.weight", HiddenSize);
             AddNorm(w, rng, $"{mp}.post_attention_norm.weight", HiddenSize);
             AddFullAttnLayer(w, rng, mp); // MTP block is always full-attention
@@ -162,9 +169,9 @@ public static class SyntheticQwen35HybridDenseMtpGguf
 
     /// <summary>Writes the synthetic fixture to <paramref name="path"/>.</summary>
     public static string Write(string path, uint seed = 0xC0FFEEu, bool withMtp = true, bool mtpHasOwnHeadTensors = true,
-        int fullAttnInterval = FullAttnInterval)
+        int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount)
     {
-        File.WriteAllBytes(path, Build(seed, withMtp, mtpHasOwnHeadTensors, fullAttnInterval));
+        File.WriteAllBytes(path, Build(seed, withMtp, mtpHasOwnHeadTensors, fullAttnInterval, blockCount));
         return path;
     }
 

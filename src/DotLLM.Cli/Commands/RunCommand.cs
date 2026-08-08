@@ -350,8 +350,19 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             else
             {
                 int gpuId = ParseGpuId(settings.Device);
-                model = DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(gguf, config, gpuLayers, gpuId,
-                    new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly));
+                var hybridThreading = new ThreadingConfig(
+                    settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
+                // Issue #291: the generic (Llama-style) HybridTransformerModel partial-offload
+                // splitter assumes every layer shares one uniform tensor-name set, which throws
+                // KeyNotFoundException on Qwen3HybridDense's interleaved GDN/full-attention
+                // layers (a GDN layer has no attn_output.weight at all). Route this architecture
+                // to its own architecture-aware GPU-head/CPU-tail split instead — mirrors the
+                // CPU-only and full-GPU-offload dispatch's existing per-architecture routing
+                // above (see the "#259" comments on this same method).
+                model = config.Architecture == DotLLM.Core.Configuration.Architecture.Qwen3HybridDense
+                    ? DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel.LoadFromGguf(
+                        gguf, config, gpuLayers, gpuId, hybridThreading)
+                    : DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(gguf, config, gpuLayers, gpuId, hybridThreading);
             }
         }
 
@@ -371,7 +382,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         // Display VRAM warning after spinner completes (so it stays visible).
         // In JSON mode, write to stderr so it doesn't corrupt the JSON output.
         string? vramWarning = (model as DotLLM.Cuda.CudaTransformerModel)?.VramWarning
-                           ?? (model as DotLLM.Cuda.HybridTransformerModel)?.VramWarning;
+                           ?? (model as DotLLM.Cuda.HybridTransformerModel)?.VramWarning
+                           ?? (model as DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel)?.VramWarning;
         if (vramWarning is not null)
         {
             if (settings.Json)
@@ -512,6 +524,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             {
                 DotLLM.Cuda.CudaTransformerModel => DotLLM.Cuda.CudaDevice.GetDevice(ParseGpuId(settings.Device)).ToString(),
                 DotLLM.Cuda.HybridTransformerModel h => $"hybrid {h.NumGpuLayers}gpu/{config.NumLayers - h.NumGpuLayers}cpu",
+                DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel h => $"hybrid {h.NumGpuLayers}gpu/{config.NumLayers - h.NumGpuLayers}cpu",
                 _ => $"{threadingInfo.EffectiveThreadCount} threads"
             };
             var segments = $"{config.Architecture} {config.NumLayers}L/{config.HiddenSize}H | {quantLabel} | {deviceLabel} | {samplingLabel}";
@@ -573,6 +586,12 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 if (settings.Paged)
                     Console.Error.WriteLine("WARNING: Paged KV-cache not supported with hybrid GPU, using hybrid cache.");
                 kvFactory = (cfg, size) => hybridModel.CreateKvCache(size);
+            }
+            else if (model is DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel qwen35HybridModel)
+            {
+                if (settings.Paged)
+                    Console.Error.WriteLine("WARNING: Paged KV-cache not supported with hybrid GPU, using hybrid cache.");
+                kvFactory = (cfg, size) => qwen35HybridModel.CreateKvCache(size);
             }
             else if (settings.Paged && !kvConfig.IsQuantized)
             {
