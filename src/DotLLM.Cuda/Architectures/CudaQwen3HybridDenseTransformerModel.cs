@@ -174,6 +174,15 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
     private bool _disposed;
 
+    // Issue #291: true for an instance built via LoadHeadFromGguf (the GPU half of a CPU/GPU
+    // partial-offload split) — such an instance only owns a layer PREFIX and has no lm_head/
+    // output-norm/embedding-table device weights loaded (_outputDevice/_outputNormDevice/
+    // _tokenEmbedDevice are all 0 sentinels; the CPU tail owns the final norm + lm_head). Guards
+    // the normal Forward()/ForwardCore() entry points, which assume a full model, so a
+    // misuse (calling the full Forward on a head-only instance) fails fast instead of silently
+    // reading garbage/null device pointers.
+    private readonly bool _isHeadOnly;
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -247,9 +256,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         CudaStream stream, CudaCublasHandle cublas, CudaContext context, CudaKernels kernels,
         int deviceId,
         nint dequantScratchDevice,
-        CudaMtpHeadWeights? mtpHead = null)
+        CudaMtpHeadWeights? mtpHead = null,
+        bool isHeadOnly = false)
     {
         Config = config;
+        _isHeadOnly = isHeadOnly;
         _gguf = gguf;
         _layers = layers;
         _mtpHead = mtpHead;
@@ -469,6 +480,238 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             ropeTheta, ropeDim,
             state, gdnCache, stream, cublas, context, kernels, deviceId,
             dequantScratchDevice, mtpHead);
+    }
+
+    /// <summary>
+    /// Loads ONLY the GPU-resident layer prefix <c>[0, numGpuLayers)</c> of a Qwen3HybridDense
+    /// model — the GPU half of a CPU/GPU partial-offload split (issue #291). Pairs with a
+    /// CPU-side tail instance (<c>DotLLM.Models.Architectures.Qwen3HybridDenseTransformerModel.LoadTailFromGguf</c>)
+    /// covering the remaining layers; the composition model D2H-transfers this instance's boundary
+    /// hidden state (via <see cref="ForwardHead"/>) into the tail.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Deliberately skips uploading the full embedding table, lm_head, output-norm and MTP head to
+    /// device — the CPU tail owns the final norm + lm_head, so none of those are needed by a
+    /// head-only instance. Skipping them is the actual VRAM saving partial offload exists to
+    /// deliver for a large-vocabulary model like Bonsai-27B (a 248,320-token vocab lm_head can be
+    /// hundreds of MB even quantized) — loading them here anyway would silently defeat the whole
+    /// point of a smaller <c>--gpu-layers</c> count.
+    /// </para>
+    /// <para>
+    /// Reuses <see cref="LoadLayerDevice"/> unchanged — the SAME per-layer tensor-name resolution
+    /// the full <see cref="LoadFromGguf"/> path already gets right for this architecture's
+    /// GDN-vs-full-attention naming split (issue #291's root cause: the generic, architecture-
+    /// unaware <c>DotLLM.Cuda.HybridTransformerModel</c> partial-offload splitter never consulted
+    /// per-layer-kind naming at all).
+    /// </para>
+    /// </remarks>
+    /// <param name="gguf">Opened GGUF file (must remain alive for the model's lifetime).</param>
+    /// <param name="fullConfig">
+    /// The FULL model's configuration (<c>NumLayers</c> = the whole trunk). Since the GPU head
+    /// always owns the layer PREFIX <c>[0, numGpuLayers)</c>, global and local layer indices
+    /// coincide here — unlike the CPU tail, no index offset is needed when calling
+    /// <see cref="LoadLayerDevice"/>.
+    /// </param>
+    /// <param name="numGpuLayers">Number of layers this head owns. Must be in <c>(0, fullConfig.NumLayers)</c>.</param>
+    /// <param name="deviceId">GPU device ordinal (0-based).</param>
+    /// <param name="ptxDir">Directory containing compiled PTX. Null auto-detects.</param>
+    internal static CudaQwen3HybridDenseTransformerModel LoadHeadFromGguf(
+        GgufFile gguf, ModelConfig fullConfig, int numGpuLayers, int deviceId = 0, string? ptxDir = null)
+    {
+        ArgumentNullException.ThrowIfNull(gguf);
+        ArgumentNullException.ThrowIfNull(fullConfig);
+        if (fullConfig.Architecture != Architecture.Qwen3HybridDense)
+            throw new ArgumentException(
+                $"CudaQwen3HybridDenseTransformerModel requires Architecture.Qwen3HybridDense, got {fullConfig.Architecture}.",
+                nameof(fullConfig));
+        if (fullConfig.HybridLayout is null)
+            throw new ArgumentException("Qwen3HybridDense config must have HybridLayout populated.", nameof(fullConfig));
+        if (fullConfig.GdnConfig is null)
+            throw new ArgumentException("Qwen3HybridDense config must have GdnConfig populated.", nameof(fullConfig));
+        if (numGpuLayers <= 0 || numGpuLayers >= fullConfig.NumLayers)
+            throw new ArgumentOutOfRangeException(nameof(numGpuLayers),
+                $"numGpuLayers must be between 1 and {fullConfig.NumLayers - 1} for a GPU/CPU split.");
+
+        var context = CudaContext.Create(deviceId);
+        var stream = CudaStream.Create();
+        var cublas = CudaCublasHandle.Create();
+        cublas.SetStream(stream);
+
+        // See LoadFromGguf's identical reset — guards against the same ABA context-handle hazard
+        // (issue #162 follow-up) when many CUDA tests load/dispose Qwen3HybridDense models
+        // (head-only or full) across one process.
+        s_pq2_0RepackModule = null;
+        s_pq2_0RepackFunc = 0;
+        s_pq2_0RepackContext = 0;
+
+        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
+        var kernels = new CudaKernels(ptxDir);
+
+        nint dataBase = gguf.DataBasePointer;
+        var tensors = gguf.TensorsByName;
+        var fullLayout = fullConfig.HybridLayout!;
+        int hiddenSize = fullConfig.HiddenSize;
+
+        // Embedding: host-side lookup metadata only — deliberately NOT uploaded to device (see
+        // remarks above). tokenEmbedDevice stays 0; ForwardHead's per-token dequant reads
+        // straight from the mmap'd GGUF via dataBase/embDesc.DataOffset, exactly like the full
+        // model's own host-side embedding lookup already does.
+        var embDesc = tensors["token_embd.weight"];
+        long embRowBytes = Dequantize.RowByteSize(hiddenSize, embDesc.QuantizationType);
+
+        int ropeDim = fullConfig.RoPEConfig?.DimensionCount ?? fullConfig.HeadDim;
+        if ((ropeDim & 1) != 0)
+            throw new InvalidDataException(
+                $"Qwen3HybridDense rope_dim={ropeDim} must be even for pair-wise rotation.");
+        if (ropeDim > fullConfig.HeadDim)
+            throw new InvalidDataException(
+                $"Qwen3HybridDense rope_dim={ropeDim} exceeds head_dim={fullConfig.HeadDim}.");
+        float ropeTheta = fullConfig.RoPEConfig?.Theta ?? 10000.0f;
+
+        var layers = new DeviceLayer[numGpuLayers];
+        var kvSlotForLayer = new int[numGpuLayers];
+        int attentionLayerCount = 0;
+        long maxTileFloats = 0;
+
+        for (int i = 0; i < numGpuLayers; i++)
+        {
+            // i IS the global raw GGUF block index here — the GPU head always owns the layer
+            // PREFIX [0, numGpuLayers), so local and global indices coincide (unlike the CPU
+            // tail's LoadTailFromGguf, which must offset by startLayer).
+            layers[i] = LoadLayerDevice(i, dataBase, tensors, fullConfig, ref maxTileFloats);
+            kvSlotForLayer[i] = fullLayout.LayerKind[i] == HybridLayerKind.Attention
+                ? attentionLayerCount++
+                : -1;
+        }
+
+        var gdn = fullConfig.GdnConfig!.Value;
+        var state = new CudaQwen3HybridDenseForwardState(
+            hiddenSize: hiddenSize,
+            vocabSize: fullConfig.VocabSize,
+            qElems: fullConfig.NumAttentionHeads * fullConfig.HeadDim,
+            kvElems: fullConfig.NumKvHeads * fullConfig.HeadDim,
+            convDim: (2 * gdn.NKHead + gdn.NVHead) * gdn.DState,
+            dConv: gdn.DConv,
+            nVHead: gdn.NVHead,
+            nKHead: gdn.NKHead,
+            dState: gdn.DState,
+            intermediateSize: fullConfig.IntermediateSize);
+
+        int gdnLayerCount = 0;
+        for (int i = 0; i < numGpuLayers; i++)
+            if (fullLayout.LayerKind[i] == HybridLayerKind.GatedDeltaNet) gdnLayerCount++;
+        var gdnCache = new CudaGdnStateCache(gdn, gdnLayerCount);
+
+        // Sliced config: NumLayers=numGpuLayers so this instance's own Config correctly reports
+        // its (partial) layer count / hybrid layout. Since the head owns the PREFIX, slicing
+        // [0, numGpuLayers) is an identity slice for every layer this instance actually touches.
+        var headLayout = new HybridLayerLayout
+        {
+            LayerKind = fullLayout.LayerKind[..numGpuLayers],
+            HeadCountKv = fullLayout.HeadCountKv[..numGpuLayers],
+            FeedForwardLength = fullLayout.FeedForwardLength[..numGpuLayers],
+        };
+        var headConfig = fullConfig with { NumLayers = numGpuLayers, HybridLayout = headLayout, NextnPredictLayers = 0 };
+
+        // maxTileFloats only reflects the GDN/attention/FFN tiles actually processed on this GPU
+        // head (no lm_head tile folded in, unlike LoadFromGguf) — correct, since this instance
+        // never runs the lm_head projection at all.
+        nint dequantScratchDevice = AllocDevice(Math.Max(maxTileFloats, 1) * sizeof(ushort));
+
+        return new CudaQwen3HybridDenseTransformerModel(
+            headConfig, gguf, layers,
+            tokenEmbedDevice: 0, embDesc.QuantizationType,
+            dataBase, embDesc.DataOffset, embRowBytes,
+            outputNormDevice: 0,
+            outputDevice: 0, outputQt: default, outputOutputDim: 0, outputInputDim: 0,
+            ownsOutputDevice: false,
+            kvSlotForLayer, attentionLayerCount,
+            ropeTheta, ropeDim,
+            state, gdnCache, stream, cublas, context, kernels, deviceId,
+            dequantScratchDevice, mtpHead: null, isHeadOnly: true);
+    }
+
+    /// <summary>
+    /// Runs embedding + the GPU-resident layer prefix ONLY (no final RMSNorm / lm_head / MTP),
+    /// returning the raw pre-final-norm hidden state as a <c>[seqLen, hiddenSize]</c> F32 HOST
+    /// tensor. Only valid on an instance built via <see cref="LoadHeadFromGguf"/> — the GPU half
+    /// of a CPU/GPU partial-offload split (issue #291).
+    /// </summary>
+    /// <remarks>
+    /// SYNC WARNING: mirrors <see cref="ForwardCore"/>'s setup block (H2D token/position upload,
+    /// host-side per-token embedding dequant + H2D copy, per-layer dispatch via
+    /// <see cref="RunSingleLayerBody"/>) — any future fix to that setup or to the GDN/attention
+    /// per-layer dispatch must be mirrored here. Unlike <see cref="ForwardCore"/> this method never
+    /// runs the final RMSNorm/lm_head/MTP-capture tail — a head-only instance has none of those
+    /// weights loaded (see <see cref="LoadHeadFromGguf"/>'s remarks).
+    /// </remarks>
+    internal ITensor ForwardHead(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, IKvCache? kvCache)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!_isHeadOnly)
+            throw new InvalidOperationException(
+                $"{nameof(ForwardHead)} is only valid on a head-only instance built via {nameof(LoadHeadFromGguf)}.");
+
+        int seqLen = tokenIds.Length;
+        if (seqLen == 0 || seqLen != positions.Length)
+            throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
+
+        int hiddenSize = Config.HiddenSize;
+        int numHeads = Config.NumAttentionHeads;
+        int numKvHeads = Config.NumKvHeads;
+        int headDim = Config.HeadDim;
+        float eps = Config.NormEpsilon;
+        int maxSeq = Config.MaxSequenceLength;
+
+        for (int i = 0; i < positions.Length; i++)
+        {
+            if ((uint)positions[i] >= (uint)maxSeq)
+                throw new ArgumentOutOfRangeException(nameof(positions),
+                    $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
+        }
+
+        _context.MakeCurrent();
+        _state.EnsureCapacity(seqLen);
+
+        nint streamH = _stream.Handle;
+
+        fixed (int* tokenPtr = tokenIds)
+        {
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.TokenIdsDevice, (nint)tokenPtr,
+                (nuint)(seqLen * sizeof(int)), streamH).ThrowOnError();
+        }
+        fixed (int* posPtr = positions)
+        {
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.PositionsDevice, (nint)posPtr,
+                (nuint)(seqLen * sizeof(int)), streamH).ThrowOnError();
+        }
+
+        float[] embedHost = new float[(long)seqLen * hiddenSize];
+        for (int t = 0; t < seqLen; t++)
+        {
+            nint rowSrc = _embedDataBase + (nint)(_embedDataOffset + (ulong)tokenIds[t] * (ulong)_embedRowBytes);
+            Dequantize.ToFloat32(rowSrc, hiddenSize, _tokenEmbedQt,
+                embedHost.AsSpan(t * hiddenSize, hiddenSize));
+        }
+        fixed (float* pEmbedHost = embedHost)
+        {
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.HiddenState, (nint)pEmbedHost,
+                (nuint)((long)seqLen * hiddenSize * sizeof(float)), streamH).ThrowOnError();
+        }
+
+        for (int layer = 0; layer < _layers.Length; layer++)
+        {
+            RunSingleLayerBody(layer, seqLen, positions, hiddenSize,
+                numHeads, numKvHeads, headDim, eps, kvCache);
+        }
+
+        _stream.Synchronize();
+        var shape = new TensorShape(seqLen, hiddenSize);
+        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+        CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.HiddenState,
+            (nuint)((long)seqLen * hiddenSize * sizeof(float))).ThrowOnError();
+        return result;
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -839,6 +1082,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                            CudaMtpState? mtpCapture)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_isHeadOnly)
+            throw new InvalidOperationException(
+                $"This instance was built via {nameof(LoadHeadFromGguf)} (issue #291 partial-offload " +
+                $"GPU head) and has no lm_head/output-norm loaded. Use {nameof(ForwardHead)} instead.");
 
         int seqLen = tokenIds.Length;
         if (seqLen == 0 || seqLen != positions.Length)
