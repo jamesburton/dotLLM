@@ -312,4 +312,43 @@ Two expert-tier containers exist and are dispatched on the layer file's own meta
 | Full per-layer weight mapping (full-attn) | `LoadLayerFromMach1_FullAttnLayer3_BuildsCorrectlyShapedWeights` | Same, for a full-attention layer — confirms `LoadFullAttnLayerFromMach1`'s shape wiring. |
 | Chat template | `Mach1ChatTemplateTests` (3 tests) | The real `chat_template.jinja`'s `{% macro render_content %}` (macro support landed separately, issue #273) renders correctly: simple turns, system+history ordering, tool-call round-trip. |
 
-**Not yet run: the full public `LoadFromMach1Packed` entry point end-to-end** (all 40 layers + embed + head in one call) and consequently **full-model generation / top-1 token agreement vs. `DOTLLM_QWEN36_A3B_Q6_K_XL_GGUF` / perplexity delta**. Every tier and both layer kinds are independently validated above (including bit-exactness against the vendor golden where a golden exists); what remains untested is purely the "all 40 layers simultaneously resident" scale, which is gated on the ~70-128 GB RAM this section describes, not on any known defect. **Not yet done** (tracked by issue #266's Phase C): the fused additive-domain GEMV (`y = diag(sv)·H_m·[wave_gamma⊙Wunit]·H_n·diag(su)·x`) on CPU/CUDA/Vulkan — the actual point of the codec, letting the routed-expert weights stay resident in ~6.2 GB of packed bytes instead of ~128 GB of dense fp32.
+**Not yet run: the full public `LoadFromMach1Packed` entry point end-to-end** (all 40 layers + embed + head in one call) and consequently **full-model generation / top-1 token agreement vs. `DOTLLM_QWEN36_A3B_Q6_K_XL_GGUF` / perplexity delta**. Every tier and both layer kinds are independently validated above (including bit-exactness against the vendor golden where a golden exists); what remains untested is purely the "all 40 layers simultaneously resident" scale, which is gated on the ~70-128 GB RAM this section describes, not on any known defect.
+
+### Mach-1 fused additive expert GEMV (issue #266, Phase C — CPU, partial)
+
+**Status: CPU-only, correctness-validated on real weights, not yet wired into the forward pass; CUDA/Vulkan not started.** This is the actual point of the codec: computing `y = W·x` directly from the packed trellis stream so the routed-expert weights (6.21 of 7.53 GB) never leave their packed-byte form, instead of decoding to dense fp32 first (which is what Phase A/B's `DecodeExpertProjection` does, and what makes full-model dense-decode need ~70-128 GB — see above).
+
+**Derivation.** `Mach1TrellisWeightDecoder.Decode` builds the dense weight as `W = diag(sv) · H_m · [wave_gamma ⊙ Wunit] · H_n · diag(su)` (crop omitted). For a GEMV `y = W·x`, both orthonormal (hence symmetric) Hadamard transforms and `diag(su)` move onto the activation side by associativity instead of being baked into a materialized weight matrix:
+
+```
+y = diag(sv) · H_m · [wave_gamma ⊙ Wunit] · x'      where x' = H_n(su ⊙ x)
+```
+
+`Mach1FusedExpertGemv.Compute` (`src/DotLLM.Models/Quantization/Mach1/Mach1FusedExpertGemv.cs`) implements exactly this: (1) pad + scale the activation by `su` and Hadamard-transform it — `O(n log n)`, once per call; (2) unpack each 16×16 tile's trellis states and immediately multiply-accumulate its lattice values against `x'` — the trellis is never written to a dense `[m,n]` buffer, matching `codec.json`'s own documented `kernel_contract` (per-weight ops are add/subtract-dominated on the exact integer lattice, `wave_gamma` applied at tile granularity); (3) Hadamard-transform the accumulated `[m]`-length result and scale by `sv`, crop to `m0`. `Mach1ExpertLayerDecoderV3T.GemvExpertProjection` / `Mach1PackedCheckpoint.GemvExpertProjection` expose it with the identical key-lookup/su/sv/gamma extraction as `DecodeExpertProjection`, so the two paths are directly A/B-comparable.
+
+**Correctness**, both synthetic (fixture-free, `Mach1FusedExpertGemvTests`, non-power-of-two/non-square/`Mb != Nb` shapes with production `cb_params`) and against real fixture weights (`Mach1FusedExpertGemvRealFixtureTests.GemvExpertProjection_Expert0AllProjections_MatchesDenseDecodeThenMatVec`, layer 0 / expert 0, all three projections), comparing the fused path against dense-decode-then-matvec (`DecodeExpertProjection` + a plain row-dot-product loop) as reference:
+
+| Case | max abs error | max rel error |
+|---|---|---|
+| Synthetic, m0=16 n0=16 (single tile) | 3.6e-6 | 5.1e-5 |
+| Synthetic, m0=48 n0=20 | 3.8e-6 | 6.1e-6 |
+| Synthetic, m0=20 n0=48, with gamma | 8.1e-6 | 2.2e-6 |
+| Synthetic, m0=20 n0=48, no gamma | 5.7e-6 | 1.5e-5 |
+| Real fixture, expert 0 gate [512×2048] | 1.1e-6 | 2.3e-3 |
+| Real fixture, expert 0 up [512×2048] | 7.0e-7 | 4.0e-4 |
+| Real fixture, expert 0 down [2048×512] | 2.8e-7 | 1.5e-4 |
+
+All errors are consistent with ordinary fp32 reassociation noise (the two paths sum the same terms in different orders — direct row-dot-product vs. Hadamard-butterfly reformulation), not a structural bug; a real transpose/index/gamma error produces errors many orders of magnitude larger, which is what these tests are actually built to catch (see the test docstrings for why the shapes are chosen).
+
+**Performance** (`Mach1FusedExpertGemvRealFixtureTests.Perf_InterleavedAB_DenseDecodeVsFusedGemv_Expert0Gate`, interleaved A/B, 10 trials, real layer-0/expert-0 gate weights, this project's `MtpBenchProfile`-style methodology): dense-decode-then-matvec median **107.3 ms/call**, fused GEMV median **35.2 ms/call** — **~3.0x faster**, single-threaded, scalar (no SIMD in either path). This is not primarily a memory-vs-compute tradeoff: the fused path is asymptotically cheaper because it Hadamard-transforms one `n`-length vector and one `m`-length vector (`O(n log n + m log m)`) instead of Hadamard-transforming *every row* of the dense `[m,n]` matrix twice, once per axis (`O(m·n·log n + n·m·log m)`), plus it skips the dense path's two full-matrix transpose passes.
+
+**Resident memory** (`Mach1FusedExpertGemvRealFixtureTests.Memory_DenseDecodeRetained_vs_FusedDiscarded_NExperts`, real layer-0 weights, 32 experts' gate projection = one full chunk, managed-heap growth via `GC.GetTotalMemory` bracketing each phase): decoding and retaining 32 dense `[512,2048]` fp32 arrays grew the heap by **138.9 MB** (theoretical 128.0 MB, difference is array-object/GC overhead); computing the fused GEMV for the same 32 experts and discarding each result grew it by **1.0 MB**. This is a micro-scale, single-projection/single-layer measurement (RAM-budget-appropriate for this session, not a full-model run); the model-wide claim — 256 experts × 3 projections × 40 layers dense fp32 (~64 GB) vs. 6.21 GB packed-resident — is issue #266's own figure, not independently re-measured here, but this test's per-expert delta (≈4.3 MB retained per dense `[512,2048]` projection vs. ≈0 retained for fused) is directly consistent with it by simple multiplication.
+
+**What Phase C still needs to close issue #266:**
+
+- **CUDA and Vulkan implementations**, each validated against this same dense-decode reference (issue #266 explicitly requires all three backends; this session is CPU-only per its own scope, gated on the CPU measurement above per the issue's phasing).
+- **SIMD vectorization of the CPU inner loop.** `Mach1FusedExpertGemv.Compute` is scalar; the accumulate loop (`temp[row] += w * xPrime[col]`) and the trellis bit-unpack are both unvectorized. The ~3x win above is from the algorithmic reformulation alone.
+- **The `kernel_contract`'s documented perf reordering**: accumulate each tile's raw lattice-value·`x'` partial sum first (add/subtract-dominated, since `Wunit` is an exact integer lattice), then apply the tile's single `wave_gamma` multiply to the partial sum ("~1 multiply per 16 weights") instead of per-element — algebraically identical, not yet implemented.
+- **Wiring into the actual MoE forward pass** (`Qwen3MoeHybridTransformerModel`'s FFN dispatch) — this pass validates the kernel in isolation against real weights, not end-to-end token generation through the fused path. The forward pass currently uses `LoadFromMach1Packed`'s dense-decode-then-cache route only.
+- **The other three tiers' stepping-stone completion** (NE spine 0.70 GB, LM head 0.33 GB, embeddings 0.29 GB) — issue #266's permitted stepping-stone decodes these to dense/Q8_0 at load while only the routed-expert GEMV fuses; that decode-at-load path already exists from Phase B, it just hasn't been threaded into a real "packed-resident" load mode (currently everything, including these three tiers, decodes to dense fp32 the same way, so the ~7.5 GB headline number is not yet achievable end-to-end).
+- **Model-scale (not per-expert) resident-memory and perplexity/top-1 measurement**, gated on the ~70-128 GB RAM issue #266 already documents as needed for a full dense-decode baseline run, or on the forward-pass wiring above making a dense baseline unnecessary.
