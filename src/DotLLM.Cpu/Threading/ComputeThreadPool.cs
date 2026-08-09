@@ -61,6 +61,7 @@ public sealed unsafe class ComputeThreadPool : IDisposable
     private readonly Thread[] _workers;
     private readonly ManualResetEventSlim[] _workReady;
     private readonly CountdownEvent _completion;
+    private readonly ManualResetEventSlim? _debugWorkerStartGate;
     private readonly int _threadCount;
     private readonly int _decodeThreadCount;
     private readonly int[] _workerCoreAssignment; // maps worker index → logical processor ID (or -1)
@@ -102,7 +103,7 @@ public sealed unsafe class ComputeThreadPool : IDisposable
     /// </summary>
     /// <param name="threadCount">Total threads including caller. Must be >= 2.</param>
     public ComputeThreadPool(int threadCount)
-        : this(threadCount, topology: null, config: default)
+        : this(threadCount, topology: null, config: default, debugWorkerStartGate: null)
     {
     }
 
@@ -113,10 +114,29 @@ public sealed unsafe class ComputeThreadPool : IDisposable
     /// <param name="topology">Optional NUMA topology for CPU pinning. Null = no pinning.</param>
     /// <param name="config">Threading configuration for decode thread count and pinning options.</param>
     public ComputeThreadPool(int threadCount, NumaTopology? topology, ThreadingConfig config)
+        : this(threadCount, topology, config, debugWorkerStartGate: null)
+    {
+    }
+
+    /// <summary>
+    /// Test-only overload (issue #129 regression coverage): every worker thread blocks on
+    /// <paramref name="debugWorkerStartGate"/> as the very first action in <see cref="WorkerLoop"/>,
+    /// before it reads any dispatch state. Lets a test hold workers at the "OS thread requested via
+    /// <see cref="Thread.Start()"/> but not yet actually scheduled" point deterministically, instead
+    /// of relying on real scheduler contention to hit that window.
+    /// </summary>
+    internal ComputeThreadPool(int threadCount, ManualResetEventSlim debugWorkerStartGate)
+        : this(threadCount, topology: null, config: default, debugWorkerStartGate)
+    {
+    }
+
+    private ComputeThreadPool(
+        int threadCount, NumaTopology? topology, ThreadingConfig config, ManualResetEventSlim? debugWorkerStartGate)
     {
         if (threadCount < 2)
             throw new ArgumentOutOfRangeException(nameof(threadCount), "Thread pool requires at least 2 threads.");
 
+        _debugWorkerStartGate = debugWorkerStartGate;
         _threadCount = threadCount;
         int workerCount = threadCount - 1;
         _activeWorkerCount = workerCount;
@@ -254,6 +274,10 @@ public sealed unsafe class ComputeThreadPool : IDisposable
 
     private void WorkerLoop(object? state)
     {
+        // Test-only seam (issue #129): let a test hold this thread here — before it touches any
+        // dispatch state — to deterministically simulate an OS-scheduling-delayed worker startup.
+        _debugWorkerStartGate?.Wait();
+
         int arrayIdx = (int)state!;
         int threadIdx = arrayIdx + 1;
 
@@ -261,7 +285,27 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         if (_workerCoreAssignment[arrayIdx] >= 0)
             CpuAffinity.PinCurrentThread(_workerCoreAssignment[arrayIdx]);
 
-        int lastGeneration = Volatile.Read(ref _dispatchGeneration);
+        // Baseline for "has a new dispatch happened since I last checked". This MUST be the
+        // constant 0, not a live Volatile.Read of the mutable _dispatchGeneration field.
+        //
+        // Root cause of issue #129 (dotnet test hangs on the Strix Halo box, 32 logical
+        // processors): Thread.Start() only *requests* OS scheduling — it does not guarantee this
+        // thread runs before the constructor returns to its caller. If the caller immediately
+        // calls Dispatch() and this worker's first read of _dispatchGeneration happens to land
+        // *after* that Dispatch() already incremented it (and Set() this worker's ready-event),
+        // the worker treats the dispatch it was woken for as "nothing new", Reset()s the very
+        // event that woke it, and loops back to waiting for a dispatch that will never come —
+        // while the caller's Dispatch() blocks forever in CountdownEvent.Wait() for a Signal()
+        // this worker will now never issue. Reproduces far more reliably on machines with many
+        // logical processors (more concurrently-scheduled test collections/pools competing for
+        // CPU time widens the window for a freshly-started worker thread to lose the race), which
+        // is why this was effectively unreproducible on the lower-core-count primary workstation.
+        //
+        // 0 is always the correct baseline: _dispatchGeneration is only ever mutated by Dispatch()
+        // and Dispose(), and neither can run before this constructor — which starts every worker
+        // thread — has returned to its own caller, so _dispatchGeneration is guaranteed to still
+        // be its field-initializer value (0) at the moment each worker thread is created.
+        int lastGeneration = 0;
 
         while (true)
         {
