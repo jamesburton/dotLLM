@@ -155,7 +155,8 @@ public sealed class TextGenerator
     /// <returns>The inference response with generated text, metadata, and timings.</returns>
     public InferenceResponse Generate(string prompt, InferenceOptions? options = null,
         Action<int>? onTokenGenerated = null,
-        ILoraAdapter? adapter = null)
+        ILoraAdapter? adapter = null,
+        Action<ReadOnlySpan<char>>? onTextGenerated = null)
     {
         options ??= new InferenceOptions();
 
@@ -253,6 +254,48 @@ public sealed class TextGenerator
             // Incremental detokenizer keeps stop-check cost O(1) amortized per token
             // instead of decoding the entire generated sequence each step (O(n²)).
             var detok = new IncrementalDetokenizer(_tokenizer, initialCapacity: Math.Max(64, maxTokens * 4));
+
+            // Text-level streaming (issue #424). Inert unless onTextGenerated is supplied, so the
+            // id-only path keeps its allocation profile. Sits alongside the id callback rather than
+            // replacing it: only this one can express a final token whose stop-string suffix was
+            // trimmed at a character boundary.
+            var textEmitter = new StopAwareTextEmitter(onTextGenerated, stopConditions);
+
+            // Emits the freshly decoded text of a token that stays in the output.
+            void EmitText()
+            {
+                if (textEmitter.IsActive)
+                    textEmitter.Append(detok.TakeDelta());
+            }
+
+            // Terminal emission. The three endings differ in what the last token contributes:
+            //  • Stop + stop-string match — the token stays in the id list but only its prefix is
+            //    output, so append its text and trim the matched suffix off. This is precisely the
+            //    case the id-level callback cannot express (issue #424).
+            //  • Stop without a stop-string match (EOS and friends) — the token is dropped from the
+            //    id list, so its text is never emitted; only previously withheld text is released.
+            //  • StopInclude — the token is part of the output in full.
+            void EmitTextForStop(StopResult result, bool isStopStringMatch)
+            {
+                if (!textEmitter.IsActive)
+                    return;
+
+                if (result == StopResult.Stop && !isStopStringMatch)
+                {
+                    textEmitter.Flush();
+                    return;
+                }
+
+                if (result == StopResult.Stop)
+                {
+                    textEmitter.FlushTrimmingStopSuffix(detok.TakeDelta());
+                }
+                else
+                {
+                    textEmitter.Append(detok.TakeDelta());
+                    textEmitter.Flush();
+                }
+            }
 
             // Local helper: snapshot log-softmax before sampling (which modifies logits in-place),
             // sample a token, then build logprob info.
@@ -389,6 +432,8 @@ public sealed class TextGenerator
                 else
                     onTokenGenerated?.Invoke(firstTokenId);
 
+                EmitTextForStop(stopResult, isStopStringMatch);
+
                 finishReason = stopResult == StopResult.StopInclude ? FinishReason.Length : FinishReason.Stop;
                 StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                 telemetry.Complete(promptLen, cachedTokenCount, generatedIds.Count,
@@ -402,6 +447,7 @@ public sealed class TextGenerator
             }
 
             onTokenGenerated?.Invoke(firstTokenId);
+            EmitText();
 
             int specDrafted = 0, specAccepted = 0;
 
@@ -465,6 +511,8 @@ public sealed class TextGenerator
                                     onTokenGenerated?.Invoke(tokenId);
                                 }
 
+                                EmitTextForStop(stopResult, isStopStringMatch);
+
                                 finishReason = stopResult == StopResult.StopInclude ? FinishReason.Length : FinishReason.Stop;
                                 shouldBreak = true;
                                 break;
@@ -472,6 +520,7 @@ public sealed class TextGenerator
 
                             specAccepted++;
                             onTokenGenerated?.Invoke(tokenId);
+                            EmitText();
                             step++;
                         }
 
@@ -523,17 +572,27 @@ public sealed class TextGenerator
                             generatedIds.Add(tokenId);
                             detok.Append(tokenId);
 
-                            stopResult = CheckStopConditions(stopConditions, tokenId, generatedIds,
-                                detok.GetTailView(stopTailSize, stopScratch));
+                            // The MTP loop postdates #296, so it never received that PR's
+                            // keep-the-token treatment; apply it here too, otherwise this path
+                            // alone still drops the whole partially-output final token.
+                            ReadOnlySpan<char> mtpTail = detok.GetTailView(stopTailSize, stopScratch);
+                            stopResult = CheckStopConditions(stopConditions, tokenId, generatedIds, mtpTail);
                             if (stopResult != StopResult.Continue)
                             {
+                                bool isStopStringMatch = HasStopStringSuffix(mtpTail, stopConditions);
                                 if (stopResult == StopResult.Stop)
-                                    generatedIds.RemoveAt(generatedIds.Count - 1);
+                                {
+                                    if (!isStopStringMatch)
+                                        generatedIds.RemoveAt(generatedIds.Count - 1);
+                                    // Stop-string match: keep the last token; trim suffix in BuildResponse.
+                                }
                                 else
                                 {
                                     specAccepted++;
                                     onTokenGenerated?.Invoke(tokenId);
                                 }
+
+                                EmitTextForStop(stopResult, isStopStringMatch);
 
                                 finishReason = stopResult == StopResult.StopInclude ? FinishReason.Length : FinishReason.Stop;
                                 shouldBreak = true;
@@ -542,6 +601,7 @@ public sealed class TextGenerator
 
                             specAccepted++;
                             onTokenGenerated?.Invoke(tokenId);
+                            EmitText();
                             step++;
                         }
 
@@ -605,13 +665,21 @@ public sealed class TextGenerator
                         else
                             onTokenGenerated?.Invoke(nextTokenId);
 
+                        EmitTextForStop(stopResult, isStopStringMatch);
+
                         finishReason = stopResult == StopResult.StopInclude ? FinishReason.Length : FinishReason.Stop;
                         break;
                     }
 
                     onTokenGenerated?.Invoke(nextTokenId);
+                    EmitText();
                 }
             }
+
+            // Releases text still withheld because it could have begun a stop string, for every
+            // ending that did not go through EmitTextForStop (length limit, KV-cache exhaustion,
+            // a speculative round accepting nothing). Idempotent once the buffer is empty.
+            textEmitter.Flush();
 
             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
             telemetry.Complete(promptLen, cachedTokenCount, generatedIds.Count,
