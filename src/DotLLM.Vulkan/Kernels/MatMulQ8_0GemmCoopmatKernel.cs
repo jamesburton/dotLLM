@@ -58,9 +58,24 @@ public readonly record struct Q8_0GemmCoopmatVariant(string SpvFileName, int Req
         return File.Exists(Path.Combine(spvDir, SpvFileName));
     }
 
-    /// <summary>Picks the fastest variant this device can actually run right now.</summary>
+    /// <summary>
+    /// Picks the default variant for this device. Defaults to <see cref="Coopmat64"/>.
+    /// </summary>
+    /// <remarks>
+    /// Issue #298: this used to unconditionally prefer <see cref="Coopmat32"/> whenever
+    /// <see cref="IsSupportedOn"/> allowed it, on the assumption that pinning the true wave
+    /// width is always a win (per #236/PQ2_0's 1.29-1.79x). Real same-session A/B measurement
+    /// (<c>VulkanCoopmat32SubgroupPinBench</c>) on BOTH measured hardware families falsified
+    /// that assumption for this kernel: RTX 3060 (576/1536/4096 shapes) 1.31x/1.43x/1.00x, but
+    /// gfx1151 (Strix Halo, dotLLM's primary non-CUDA target) 1.17x/0.74x/0.65x — a real 27-35%
+    /// REGRESSION at medium/large shapes, the ones closest to real inference workload. No
+    /// shape/vendor pattern was consistent enough to justify a default-ON heuristic, so this now
+    /// defaults to the always-safe baseline. <see cref="Coopmat32"/> remains available via the
+    /// explicit-selection overload for A/B benchmarking; do not flip this default back without
+    /// new measured evidence superseding the above.
+    /// </remarks>
     public static Q8_0GemmCoopmatVariant SelectFor(VulkanDevice device, string spvDir)
-        => Coopmat32.IsSupportedOn(device, spvDir) ? Coopmat32 : Coopmat64;
+        => Coopmat64;
 }
 
 /// <summary>
