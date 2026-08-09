@@ -1619,6 +1619,10 @@ public static unsafe partial class MatMul
                         var xSpan = new ReadOnlySpan<float>(xPtr, k);
                         var destRow = new Span<float>(rowBuf, k);
 
+                        // `row * k` stays in int on purpose (#429 audit): the whole-tensor offset
+                        // is already carried in 64-bit by `tileWeightsHalf`, and
+                        // row < tileRows <= tileM <= 256 (ComputeTileM clamps), so the residual
+                        // product tops out at 255 * k — 4.2M for a 16384-wide 405B tensor.
                         for (int row = 0; row < tileRows; row++)
                         {
                             var srcRow = new ReadOnlySpan<Half>(tileWeightsHalf + row * k, k);
@@ -2512,6 +2516,8 @@ public static unsafe partial class MatMul
                 var xSpan = new ReadOnlySpan<float>(xPtr, ctx.K);
                 for (int row = 0; row < tileRows; row++)
                 {
+                    // See GemmF16: `row * ctx.K` is deliberately int — the tensor-scale offset
+                    // lives in `tileWeightsHalf` (64-bit) and row < tileRows <= ctx.TileM <= 256.
                     var srcRow = new ReadOnlySpan<Half>(tileWeightsHalf + row * ctx.K, ctx.K);
                     TensorPrimitives.ConvertToSingle(srcRow, destRow);
                     outPtr[row] = TensorPrimitives.Dot(destRow, xSpan);
