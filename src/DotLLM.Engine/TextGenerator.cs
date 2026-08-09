@@ -120,8 +120,38 @@ public sealed class TextGenerator
     /// </summary>
     /// <param name="prompt">Input text prompt.</param>
     /// <param name="options">Inference options controlling sampling and stopping. Null uses defaults.</param>
-    /// <param name="onTokenGenerated">Optional callback invoked after each token is generated, receiving the token ID.</param>
+    /// <param name="onTokenGenerated">
+    /// Optional callback invoked after each token is generated, receiving the token ID.
+    /// <para>
+    /// <b>This is the pre-trim, token-level stream.</b> It is a progress hook, not an output
+    /// stream: the token that triggers a stop condition is never passed to it, and a token
+    /// whose text is only <em>partly</em> emitted (e.g. it decodes to
+    /// <c>"ld&lt;|im_end|&gt;"</c> for stop string <c>"&lt;|im_end|&gt;"</c>) cannot be
+    /// expressed by an <see cref="Action{T}"/> over token IDs at all. Handing the ID over
+    /// would leak the stop string into the consumer's text, which
+    /// <see cref="StopStringCondition"/> exists to prevent.
+    /// </para>
+    /// <para>
+    /// Consequence: re-rendering these IDs can produce a strict prefix of
+    /// <see cref="InferenceResponse.Text"/>. Keep using this callback for things that are
+    /// genuinely about token identity (logprob correlation, speculative-decoding
+    /// instrumentation). For driving output text, use <paramref name="onTextGenerated"/>,
+    /// which reproduces <see cref="InferenceResponse.Text"/> exactly.
+    /// </para>
+    /// </param>
     /// <param name="adapter">Optional LoRA adapter to apply during the forward passes (Phase 4c).</param>
+    /// <param name="onTextGenerated">
+    /// Optional <b>text-level</b> streaming callback (issue #424). Receives the decoded text
+    /// fragments of the output, in order; concatenating every fragment reproduces
+    /// <see cref="InferenceResponse.Text"/> exactly, including a final token whose
+    /// stop-string suffix was trimmed at a character boundary, and never including a stop
+    /// string. Fragments do not correspond one-to-one with tokens: text that could still turn
+    /// out to be the start of a stop string is withheld until it is known to be output, so a
+    /// single call may carry several tokens' worth of characters, or none.
+    /// <para>
+    /// The span is only valid for the duration of the call — copy it if you need to retain it.
+    /// </para>
+    /// </param>
     /// <returns>The inference response with generated text, metadata, and timings.</returns>
     public InferenceResponse Generate(string prompt, InferenceOptions? options = null,
         Action<int>? onTokenGenerated = null,
@@ -344,12 +374,18 @@ public sealed class TextGenerator
             generatedIds.Add(firstTokenId);
             detok.Append(firstTokenId);
 
-            var stopResult = CheckStopConditions(stopConditions, firstTokenId, generatedIds,
-                detok.GetTailView(stopTailSize, stopScratch));
+            ReadOnlySpan<char> firstTail = detok.GetTailView(stopTailSize, stopScratch);
+            var stopResult = CheckStopConditions(stopConditions, firstTokenId, generatedIds, firstTail);
             if (stopResult != StopResult.Continue)
             {
+                bool isStopStringMatch = HasStopStringSuffix(firstTail, stopConditions);
                 if (stopResult == StopResult.Stop)
-                    generatedIds.RemoveAt(generatedIds.Count - 1);
+                {
+                    if (!isStopStringMatch)
+                        generatedIds.RemoveAt(generatedIds.Count - 1);
+                    // Stop-string match: keep the last token in the id list; BuildResponse
+                    // will trim the matched stop-string suffix at the character boundary.
+                }
                 else
                     onTokenGenerated?.Invoke(firstTokenId);
 
@@ -361,7 +397,8 @@ public sealed class TextGenerator
                     finishReason);
                 return BuildResponse(promptLen, generatedIds, finishReason,
                     prefillTicks, decodeTicks, samplerTicks, GetKvCacheBytes(kvCache), cachedTokenCount,
-                    logprobs: logprobsList?.ToArray());
+                    logprobs: logprobsList?.ToArray(),
+                    stopConditionsForSuffixTrim: stopConditions);
             }
 
             onTokenGenerated?.Invoke(firstTokenId);
@@ -411,12 +448,17 @@ public sealed class TextGenerator
                             generatedIds.Add(tokenId);
                             detok.Append(tokenId);
 
-                            stopResult = CheckStopConditions(stopConditions, tokenId, generatedIds,
-                                detok.GetTailView(stopTailSize, stopScratch));
+                            ReadOnlySpan<char> specTail = detok.GetTailView(stopTailSize, stopScratch);
+                            stopResult = CheckStopConditions(stopConditions, tokenId, generatedIds, specTail);
                             if (stopResult != StopResult.Continue)
                             {
+                                bool isStopStringMatch = HasStopStringSuffix(specTail, stopConditions);
                                 if (stopResult == StopResult.Stop)
-                                    generatedIds.RemoveAt(generatedIds.Count - 1);
+                                {
+                                    if (!isStopStringMatch)
+                                        generatedIds.RemoveAt(generatedIds.Count - 1);
+                                    // Stop-string match: keep the last token; trim suffix in BuildResponse.
+                                }
                                 else
                                 {
                                     specAccepted++;
@@ -549,12 +591,17 @@ public sealed class TextGenerator
                     generatedIds.Add(nextTokenId);
                     detok.Append(nextTokenId);
 
-                    stopResult = CheckStopConditions(stopConditions, nextTokenId, generatedIds,
-                        detok.GetTailView(stopTailSize, stopScratch));
+                    ReadOnlySpan<char> decTail = detok.GetTailView(stopTailSize, stopScratch);
+                    stopResult = CheckStopConditions(stopConditions, nextTokenId, generatedIds, decTail);
                     if (stopResult != StopResult.Continue)
                     {
+                        bool isStopStringMatch = HasStopStringSuffix(decTail, stopConditions);
                         if (stopResult == StopResult.Stop)
-                            generatedIds.RemoveAt(generatedIds.Count - 1);
+                        {
+                            if (!isStopStringMatch)
+                                generatedIds.RemoveAt(generatedIds.Count - 1);
+                            // Stop-string match: keep the last token; trim suffix in BuildResponse.
+                        }
                         else
                             onTokenGenerated?.Invoke(nextTokenId);
 
@@ -573,7 +620,8 @@ public sealed class TextGenerator
                 finishReason);
             return BuildResponse(promptLen, generatedIds, finishReason,
                 prefillTicks, decodeTicks, samplerTicks, GetKvCacheBytes(kvCache), cachedTokenCount,
-                specDrafted, specAccepted, logprobsList?.ToArray());
+                specDrafted, specAccepted, logprobsList?.ToArray(),
+                stopConditionsForSuffixTrim: stopConditions);
         }
         finally
         {
@@ -1261,6 +1309,25 @@ public sealed class TextGenerator
         return StopResult.Continue;
     }
 
+    /// <summary>
+    /// True when some registered <see cref="StopStringCondition"/>'s stop string is a
+    /// suffix of <paramref name="decodedTail"/>. Determines whether the last token is
+    /// kept in <c>generatedIds</c> (true — its text carries a partial overlap with the
+    /// stop string and must be character-trimmed in <c>BuildResponse</c>) or removed
+    /// (false — EOS / similar single-token termination where the token's text is
+    /// conceptually the terminator itself).
+    /// </summary>
+    /// <remarks>
+    /// Deliberately independent of <em>which</em> condition <see cref="CheckStopConditions"/>
+    /// matched first: that would make the outcome depend on the order conditions were
+    /// registered, so an EOS condition placed ahead of a stop-string condition matching
+    /// the same tail would drop the whole last token and resurrect the over-trim bug.
+    /// The suffix test here uses exactly the predicate <see cref="StopStringCondition"/>
+    /// itself uses (ordinal <c>EndsWith</c> on the same tail window).
+    /// </remarks>
+    private static bool HasStopStringSuffix(ReadOnlySpan<char> decodedTail, List<IStopCondition> conditions)
+        => StopSuffixTrimmer.MatchedSuffixLength(decodedTail, conditions) > 0;
+
     // Tail window passed to stop conditions. Must cover the longest stop string currently
     // registered; a safety cushion absorbs future stop strings added via custom conditions.
     private static int ComputeStopTailSize(List<IStopCondition> conditions)
@@ -1382,11 +1449,23 @@ public sealed class TextGenerator
         FinishReason finishReason, long prefillTicks, long decodeTicks, long samplerTicks,
         long kvCacheBytes = 0, int cachedTokenCount = 0,
         int specDrafted = 0, int specAccepted = 0,
-        TokenLogprobInfo[]? logprobs = null)
+        TokenLogprobInfo[]? logprobs = null,
+        List<IStopCondition>? stopConditionsForSuffixTrim = null)
     {
         string text = generatedIds.Count > 0
             ? _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds), stripBosSpace: false)
             : string.Empty;
+
+        // Character-level stop-string suffix trim. When generation stopped because a
+        // StopStringCondition matched, the last token is kept in `generatedIds` so the
+        // user can see how many tokens were actually emitted, but its decoded text may
+        // contain a partial overlap with the stop string (e.g. last token decodes to
+        // "ld<|im_end|>", stop string "<|im_end|>"). Trim at the char boundary so the
+        // returned text preserves the "ld" prefix and excludes the matched suffix.
+        if (stopConditionsForSuffixTrim is not null && finishReason == FinishReason.Stop)
+        {
+            text = StopSuffixTrimmer.TrimMatchedSuffix(text, stopConditionsForSuffixTrim);
+        }
 
         return new InferenceResponse
         {
