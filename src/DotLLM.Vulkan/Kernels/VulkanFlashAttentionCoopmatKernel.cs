@@ -4,16 +4,84 @@ using DotLLM.Vulkan.Interop;
 namespace DotLLM.Vulkan.Kernels;
 
 /// <summary>
+/// Identifies the subgroup-pin variant used to create the coopmat Flash-Attention
+/// pipelines (base + hd64 share the same pin: both use <c>WG_SIZE=256</c> with
+/// <c>NUM_SLICES=4</c> KV-column slices owned by <c>gl_SubgroupID % 4</c> �?" the
+/// SAME SPIR-V, just a different <c>VkPipelineShaderStageRequiredSubgroupSizeCreateInfo</c>
+/// at pipeline-creation time).
+/// </summary>
+/// <remarks>
+/// <para>
+/// Issue #240 audit, attention half: unlike the coopmat GEMM kernels (#236/#297/#298),
+/// this shader's own header already documents its intended wave width as 64 �?" the
+/// 4-slice design (<c>NUM_SLICES = BC/16 = 4</c>) is built to have exactly 4 subgroups
+/// per 256-thread workgroup, one subgroup per KV-column slice, which only happens when
+/// the driver compiles the stage at subgroup size 64. <see cref="VulkanDevice.SubgroupSize"/>
+/// / <c>VulkanDevice.HasSubgroupSizeControl</c>'s own doc comment records that gfx1151's
+/// confirmed unpinned compute default IS wave64 (the K-quant decode GEMV kernels pin
+/// DOWN to 32 specifically to escape that default) �?" so this kernel's workgroup size
+/// already matches its intended wave width without any pin, on the one hardware family
+/// this codebase has measured. At subgroup size 32 (a driver that defaults differently,
+/// or hypothetically forcing 32 here) the shader's own comment states each slice would be
+/// computed redundantly by 2 subgroups instead of 1 �?" wasteful but explicitly documented
+/// as still correct.
+/// </para>
+/// <para>
+/// <see cref="Pinned64"/> exists to make that "already matches" conclusion an explicit,
+/// measured guarantee rather than an implicit driver default that could silently change:
+/// pinning costs nothing to build (same .spv, see remarks on <see cref="VulkanFlashAttentionCoopmatKernel.Create(VulkanDevice, string, FlashAttentionCoopmatVariant)"/>)
+/// and is measured against <see cref="Default"/> before any default-selection change, per
+/// #299's precedent of not shipping a pin based on assumption alone.
+/// </para>
+/// </remarks>
+public readonly record struct FlashAttentionCoopmatVariant(int RequiredSubgroupSize)
+{
+    /// <summary>Unpinned �?" current production behaviour, driver picks the subgroup size (confirmed wave64 default on gfx1151).</summary>
+    public static FlashAttentionCoopmatVariant Default => new(0);
+
+    /// <summary>Pinned to <c>requiredSubgroupSize=64</c> via <c>VkPipelineShaderStageRequiredSubgroupSizeCreateInfo</c> on both the base and hd64 pipelines.</summary>
+    public static FlashAttentionCoopmatVariant Pinned64 => new(64);
+
+    /// <summary>Whether <paramref name="device"/> can create a pipeline pinned to this variant's wave width right now.</summary>
+    public bool IsSupportedOn(VulkanDevice device)
+        => RequiredSubgroupSize == 0
+            || device.SupportsRequiredSubgroupSize((uint)RequiredSubgroupSize, VkShaderStageFlags.Compute);
+
+    /// <summary>
+    /// Picks the default variant for this device. Defaults to <see cref="Default"/> (unpinned).
+    /// </summary>
+    /// <remarks>
+    /// Per #298/#299's precedent: do not default a pin ON without real, same-session
+    /// A/B measurement superseding this comment. The structural analysis above predicted
+    /// <see cref="Pinned64"/> would be a no-op on gfx1151 specifically (its confirmed
+    /// unpinned default already IS 64) �?" <c>VulkanFlashAttentionCoopmatSubgroupPinBench</c>
+    /// (Strix Halo, gfx1151, driver reporting <c>SubgroupSize=64</c> unpinned) confirmed the
+    /// prediction directly instead of shipping it on theory alone:
+    /// <code>
+    /// smollm_p128    (base, hd=64,  seqKv=128,  9/3 heads):  0.96x
+    /// llama3_p512    (base, hd=64,  seqKv=512, 32/4 heads):  0.99x
+    /// longctx_p2048  (hd64 path,    hd=64, seqKv=2048, 8/2): 0.99x
+    /// mha_p512_hd128 (base, hd=128, seqKv=512, 8/8 heads):   1.00x
+    /// </code>
+    /// All four shapes land within measurement noise of 1.00x �?" a confirmed no-op, not a
+    /// win, exactly as the "already matches" structural read predicted. No shape/vendor
+    /// evidence currently justifies flipping this default; keep it unpinned unless new
+    /// evidence supersedes this comment.
+    /// </remarks>
+    public static FlashAttentionCoopmatVariant SelectFor(VulkanDevice device) => Default;
+}
+
+/// <summary>
 /// KHR cooperative-matrix Flash-Attention kernel for the GQA prefill path
 /// (issue #149). Same tiling, dispatch geometry, bindings and push constants
-/// as <see cref="VulkanFlashAttentionF32Kernel"/>, but QK^T and P·V run on
-/// the matrix cores via 16x16x16 f16xf16-&gt;f32 cooperative-matrix tiles —
+/// as <see cref="VulkanFlashAttentionF32Kernel"/>, but QK^T and PA�V run on
+/// the matrix cores via 16x16x16 f16xf16-&gt;f32 cooperative-matrix tiles �?"
 /// llama.cpp's FA_COOPMAT1 shape (Br=16, Bc=4x16 subgroup slices).
 /// </summary>
 /// <remarks>
 /// <para>
 /// Parity target: <c>DotLLM.Cpu.Kernels.Attention.ExecuteScalar</c> (same as
-/// the scalar FA kernel) — but at f16-input tolerance, NOT the all-F32
+/// the scalar FA kernel) �?" but at f16-input tolerance, NOT the all-F32
 /// tolerance: Q/K/V are rounded to f16 for the matrix multiplies, exactly the
 /// rounding class llama.cpp ships (its KV cache is f16). Softmax state and
 /// both matmul accumulators stay F32. See
@@ -25,19 +93,28 @@ namespace DotLLM.Vulkan.Kernels;
 /// <see cref="SupportsDevice"/>). Callers route to the scalar FA kernel when
 /// unavailable, when the env kill-switch
 /// <c>DOTLLM_VULKAN_DISABLE_COOPMAT_ATTENTION=1</c> is set, or when
-/// <c>headDim &gt; MaxHeadDim</c>. Decode (seqQ == 1) must never route here —
+/// <c>headDim &gt; MaxHeadDim</c>. Decode (seqQ == 1) must never route here �?"
 /// llama.cpp itself prefers FA_SCALAR at n_rows==1, matching the 2026-04
 /// finding that coopmat attention loses at decode shapes on gfx1151.
 /// </para>
 /// <para>
 /// Issue #378: a second SPV (<c>attention_flash_f32_coopmat_hd64.spv</c>,
 /// <c>MAX_HEAD_DIM=64</c> instead of 128) is loaded when present and used
-/// whenever the model's <c>headDim &lt;= HeadDim64Threshold</c> — halves the
+/// whenever the model's <c>headDim &lt;= HeadDim64Threshold</c> �?" halves the
 /// qTile/kvTile shared-memory footprint and the live O-accumulator register
 /// count for small-headDim models (SmolLM and other 64-headDim configs),
 /// which the base shader's own comment attributes its occupancy ceiling to.
 /// Falls back to the 128-dim shader unconditionally if the hd64 SPV is
 /// missing (older SPV cache) or <c>DOTLLM_VULKAN_FA_COOPMAT_HD64=0</c>.
+/// </para>
+/// <para>
+/// Issue #240: both the base and hd64 pipelines can additionally be created
+/// with an explicit <see cref="FlashAttentionCoopmatVariant"/> subgroup pin
+/// via the 3-arg <see cref="Create(VulkanDevice, string, FlashAttentionCoopmatVariant)"/>
+/// overload, for A/B measurement against the unpinned default. Production
+/// callers use the unchanged 2-arg <see cref="Create(VulkanDevice, string)"/>,
+/// which always selects <see cref="FlashAttentionCoopmatVariant.SelectFor"/>
+/// (currently <see cref="FlashAttentionCoopmatVariant.Default"/> �?" unpinned).
 /// </para>
 /// </remarks>
 public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
@@ -57,7 +134,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     /// this. Same-session order-reversed A/B on SmolLM-135M found a clear,
     /// consistent +10-17% prefill win at seqKv 640-2048, but a noise-level
     /// (sometimes slightly negative) effect exactly at the canonical p=512
-    /// benchmark point — LDS occupancy gains need enough KV-tile-loop
+    /// benchmark point �?" LDS occupancy gains need enough KV-tile-loop
     /// iterations to amortize whatever regresses at very short context.
     /// Threshold picked at the first cleanly-positive measured point (640)
     /// rather than the ambiguous 512 one, so the standard SmolLM-135M
@@ -110,7 +187,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
 
     /// <summary>
     /// Returns <c>true</c> when the device advertises a subgroup-scope
-    /// 16x16x16 F16 x F16 -&gt; F32 cooperative-matrix tile — the exact shape
+    /// 16x16x16 F16 x F16 -&gt; F32 cooperative-matrix tile �?" the exact shape
     /// the shader's <c>coopMatMulAdd</c> calls require.
     /// </summary>
     public static bool SupportsDevice(VulkanDevice device)
@@ -131,21 +208,44 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
 
     /// <summary>
     /// Loads <c>attention_flash_f32_coopmat.spv</c> and creates the compute
-    /// pipeline. Throws when the device lacks the required coopmat tile or
-    /// the SPV is missing — use <see cref="TryCreate"/> for graceful fallback.
+    /// pipeline using <see cref="FlashAttentionCoopmatVariant.SelectFor"/>
+    /// (currently the unpinned <see cref="FlashAttentionCoopmatVariant.Default"/>).
+    /// Throws when the device lacks the required coopmat tile or the SPV is
+    /// missing �?" use <see cref="TryCreate"/> for graceful fallback.
     /// </summary>
     public static VulkanFlashAttentionCoopmatKernel Create(VulkanDevice device, string spvDir)
+        => Create(device, spvDir, FlashAttentionCoopmatVariant.SelectFor(device));
+
+    /// <summary>
+    /// Loads <c>attention_flash_f32_coopmat.spv</c> (and, when present,
+    /// <c>attention_flash_f32_coopmat_hd64.spv</c>) and creates both compute
+    /// pipelines pinned to <paramref name="variant"/>'s subgroup size. The
+    /// explicit overload exists so a benchmark can A/B
+    /// <see cref="FlashAttentionCoopmatVariant.Default"/> vs
+    /// <see cref="FlashAttentionCoopmatVariant.Pinned64"/> side by side in one
+    /// process �?" both variants load the SAME SPIR-V module; only the
+    /// <c>VkPipelineShaderStageRequiredSubgroupSizeCreateInfo</c> passed at
+    /// pipeline-creation time differs, so there is no new shader to compile
+    /// or validate independently of the existing correctness tests.
+    /// </summary>
+    public static VulkanFlashAttentionCoopmatKernel Create(VulkanDevice device, string spvDir, FlashAttentionCoopmatVariant variant)
     {
         if (!SupportsDevice(device))
             throw new InvalidOperationException(
                 "VulkanFlashAttentionCoopmatKernel requires a subgroup-scope 16x16x16 " +
                 "F16xF16->F32 VK_KHR_cooperative_matrix tile. Check SupportsDevice() first " +
                 "and fall back to VulkanFlashAttentionF32Kernel.");
+        if (variant.RequiredSubgroupSize != 0 && !variant.IsSupportedOn(device))
+            throw new InvalidOperationException(
+                $"Device cannot pin the compute stage to requiredSubgroupSize={variant.RequiredSubgroupSize}. " +
+                "Check FlashAttentionCoopmatVariant.IsSupportedOn(device) before calling Create() with an explicit variant.");
 
         string path = Path.Combine(spvDir, "attention_flash_f32_coopmat.spv");
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
+
+        uint requiredSubgroupSize = (uint)variant.RequiredSubgroupSize;
 
         VulkanModule module = VulkanModule.LoadFromFile(device, path);
         ComputePipeline pipeline;
@@ -159,7 +259,8 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
             pipeline = module.CreateComputePipeline(
                 entryPoint: "main",
                 bindings: bindings,
-                pushConstantBytes: PushConstantBytes);
+                pushConstantBytes: PushConstantBytes,
+                requiredSubgroupSize: requiredSubgroupSize);
         }
         catch
         {
@@ -184,7 +285,8 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
                 hd64Pipeline = hd64Module.CreateComputePipeline(
                     entryPoint: "main",
                     bindings: bindings,
-                    pushConstantBytes: PushConstantBytes);
+                    pushConstantBytes: PushConstantBytes,
+                    requiredSubgroupSize: requiredSubgroupSize);
                 // Separate pool per pipeline: DescriptorSetCache.Reset() calls
                 // vkResetDescriptorPool on its whole pool, which would silently
                 // invalidate the OTHER pipeline's still-referenced sets
@@ -206,7 +308,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
 
     /// <summary>
     /// Returns <c>null</c> when the device lacks coopmat support, the SPV is
-    /// missing, or pipeline creation fails — callers fall back to the scalar
+    /// missing, or pipeline creation fails �?" callers fall back to the scalar
     /// FA kernel.
     /// </summary>
     public static VulkanFlashAttentionCoopmatKernel? TryCreate(VulkanDevice device, string spvDir)
@@ -253,7 +355,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
 
     /// <summary>
     /// Records the coopmat FA dispatch. Contract is identical to
-    /// <see cref="VulkanFlashAttentionF32Kernel.Record"/> — same buffer
+    /// <see cref="VulkanFlashAttentionF32Kernel.Record"/> �?" same buffer
     /// shapes, same parameters, same dispatch geometry.
     /// </summary>
     public unsafe void Record(
