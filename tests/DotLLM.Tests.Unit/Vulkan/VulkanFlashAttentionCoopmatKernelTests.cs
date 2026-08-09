@@ -18,9 +18,9 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// Tolerance: the kernel rounds Q/K/V to f16 for the two matrix multiplies
 /// (F32 accumulators, F32 softmax state) — the same input-rounding class
 /// llama.cpp's flash-attention ships (its KV cache is f16, and its FA_COOPMAT1
-/// default even uses an f16 P·V accumulator, which we do NOT). Parity vs an
+/// default even uses an f16 P×V accumulator, which we do NOT). Parity vs an
 /// all-F32 oracle is therefore epsilon-level, not bit-exact: abs 1e-3 /
-/// rel 1e-2 (≈2x the historical coopmat-vs-F32-GPU envelope of 5e-4 / 5e-3,
+/// rel 1e-2 (~2x the historical coopmat-vs-F32-GPU envelope of 5e-4 / 5e-3,
 /// headroom for the CPU-reduction-order delta the F32 kernels also carry).
 /// End-to-end greedy-token stability is gated separately via
 /// DOTLLM_BENCH_DUMP_TOKENS A/B (see the issue #149 ledger).
@@ -30,6 +30,22 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// <c>hq/groupSize != hq%groupSize</c>, head_dim that is NOT a multiple of the
 /// 16-wide coopmat chunk (80), partial Q/KV tiles, non-zero positionOffset
 /// (chunked prefill), and every mask mode the dispatcher can route here.
+/// </para>
+/// <para>
+/// Issue #240: the <c>Launch_Pinned64_*</c> tests below cover the SAME kernel
+/// created via <see cref="VulkanFlashAttentionCoopmatKernel.Create(VulkanDevice, string, FlashAttentionCoopmatVariant)"/>
+/// with <see cref="FlashAttentionCoopmatVariant.Pinned64"/> — an explicit
+/// <c>requiredSubgroupSize=64</c> pin on the SAME SPIR-V the unpinned tests
+/// above already validate (see that overload's remarks: no new shader, only
+/// a different pipeline-creation-time subgroup constraint). This is a
+/// representative discriminating subset of the shapes above (short/partial
+/// tiles, asymmetric GQA, full head_dim 128, padded-tail head_dim 72, the
+/// hd64 dispatch path, a large multi-tile GQA8 512 shape, sliding-window
+/// cross-tile, and bidirectional multi-tile masking) chosen to cover both
+/// the base and hd64 pipelines and every masking mode without doubling the
+/// full suite — sufficient to catch a subgroup-pin-induced correctness
+/// regression (e.g. a full-subgroups assumption the shader's redundant-slice
+/// design silently violates) without exhaustively re-running every shape.
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
@@ -52,13 +68,13 @@ public class VulkanFlashAttentionCoopmatKernelTests
 
     [SkippableFact]
     public void Launch_Mha_HeadDim128()
-        // Full MAX_HEAD_DIM: exercises both P·V rounds.
+        // Full MAX_HEAD_DIM: exercises both P×V rounds.
         => RunOne(seqQ: 32, seqKv: 32, numHeads: 8, numKvHeads: 8, headDim: 128, positionOffset: 0);
 
     [SkippableFact]
     public void Launch_HeadDim80_NonChunkMultiple()
         // head_dim 80 = 5 x 16 chunks, hdCeil == 80 < 128: exercises the
-        // padded-chunk loads, the skipped slices in P·V round 1
+        // padded-chunk loads, the skipped slices in P×V round 1
         // (dBlock 80/96/112 >= hdCeil) and the d0 >= headDim write guard.
         => RunOne(seqQ: 48, seqKv: 48, numHeads: 4, numKvHeads: 2, headDim: 80, positionOffset: 0);
 
@@ -192,12 +208,59 @@ public class VulkanFlashAttentionCoopmatKernelTests
         => RunOne(seqQ: 48, seqKv: 48, numHeads: 4, numKvHeads: 2, headDim: 64,
             positionOffset: 0, maskMode: AttentionMaskMode.Hybrid, prefixLen: 20);
 
-    // ─────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #240: requiredSubgroupSize=64 pin, same SPIR-V, representative
+    // discriminating subset (see class remarks).
+    // ─────────────────────────────────────────────────────────────────────
+
+    [SkippableFact]
+    public void Launch_Pinned64_Mha_ShortPrefill()
+        => RunOne(seqQ: 4, seqKv: 4, numHeads: 1, numKvHeads: 1, headDim: 64, positionOffset: 0,
+            variant: FlashAttentionCoopmatVariant.Pinned64);
+
+    [SkippableFact]
+    public void Launch_Pinned64_Gqa3_SmolLm_Prefill64()
+        => RunOne(seqQ: 64, seqKv: 64, numHeads: 9, numKvHeads: 3, headDim: 64, positionOffset: 0,
+            variant: FlashAttentionCoopmatVariant.Pinned64);
+
+    [SkippableFact]
+    public void Launch_Pinned64_Mha_HeadDim128()
+        => RunOne(seqQ: 32, seqKv: 32, numHeads: 8, numKvHeads: 8, headDim: 128, positionOffset: 0,
+            variant: FlashAttentionCoopmatVariant.Pinned64);
+
+    [SkippableFact]
+    public void Launch_Pinned64_HeadDim72_PaddedTailChunk()
+        => RunOne(seqQ: 33, seqKv: 40, numHeads: 4, numKvHeads: 2, headDim: 72, positionOffset: 0,
+            variant: FlashAttentionCoopmatVariant.Pinned64);
+
+    [SkippableFact]
+    public void Launch_Pinned64_Hd64_Gqa3_SmolLm_LongPrefill()
+        => RunOne(seqQ: 640, seqKv: 640, numHeads: 9, numKvHeads: 3, headDim: 64, positionOffset: 0,
+            variant: FlashAttentionCoopmatVariant.Pinned64);
+
+    [SkippableFact]
+    public void Launch_Pinned64_Gqa8_Prefill_512()
+        => RunOne(seqQ: 512, seqKv: 512, numHeads: 32, numKvHeads: 4, headDim: 64, positionOffset: 0,
+            variant: FlashAttentionCoopmatVariant.Pinned64);
+
+    [SkippableFact]
+    public void Launch_Pinned64_SlidingWindow_CrossTile()
+        => RunOne(seqQ: 128, seqKv: 256, numHeads: 4, numKvHeads: 2, headDim: 128,
+            positionOffset: 128, slidingWindow: 100, variant: FlashAttentionCoopmatVariant.Pinned64);
+
+    [SkippableFact]
+    public void Launch_Pinned64_Bidirectional_MultiTile()
+        => RunOne(seqQ: 40, seqKv: 96, numHeads: 4, numKvHeads: 2, headDim: 64,
+            positionOffset: 0, maskMode: AttentionMaskMode.Bidirectional,
+            variant: FlashAttentionCoopmatVariant.Pinned64);
+
+    // ─────────────────────────────────────────────────────────────────────
 
     private static void RunOne(int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset, int slidingWindow = 0, float softCap = 0.0f, bool useAlibi = false,
         float scaleOverride = 0.0f,
-        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0,
+        FlashAttentionCoopmatVariant variant = default)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -205,6 +268,8 @@ public class VulkanFlashAttentionCoopmatKernelTests
         Skip.IfNot(
             VulkanFlashAttentionCoopmatKernel.SupportsDevice(device),
             "Device does not expose a subgroup-scope 16x16x16 F16xF16->F32 cooperative-matrix tile.");
+        Skip.IfNot(variant.IsSupportedOn(device),
+            $"Device cannot pin the compute stage to requiredSubgroupSize={variant.RequiredSubgroupSize}.");
 
         var rng = new Random(0xC0091 + seqQ * 41 + seqKv * 17 + numHeads * 7 + headDim);
         float[] qh = RandomFloats(rng, seqQ * numHeads * headDim);
@@ -216,7 +281,7 @@ public class VulkanFlashAttentionCoopmatKernelTests
             seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
             slidingWindow, softCap, useAlibi, scaleOverride, maskMode, prefixLen);
 
-        using var kernel = VulkanFlashAttentionCoopmatKernel.Create(device, spvDir);
+        using var kernel = VulkanFlashAttentionCoopmatKernel.Create(device, spvDir, variant);
 
         using var bufQ   = device.Allocate((long)qh.Length * sizeof(float));
         using var bufK   = device.Allocate((long)kh.Length * sizeof(float));
