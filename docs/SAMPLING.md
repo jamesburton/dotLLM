@@ -55,6 +55,34 @@ Keep only K highest-probability tokens. Set rest to `-∞`.
 ### 6. Top-P / Nucleus (`TopPStep`)
 Sort by probability descending. Keep smallest set where cumulative probability ≥ P.
 
+**Tie-breaking is deterministic by token id.** At 32K+ vocabularies with near-uniform logits,
+distinct logits routinely round to the *same* `float` probability after softmax, so the cutoff can
+fall inside a group of equal-probability tokens. `TopPSampler` orders candidates by **descending
+probability, then ascending token id**, so the surviving member of a tie is always the lowest id.
+The set of tokens above the top-p mass is correct either way — this only fixes *which* tie member
+is kept.
+
+Why it is specified rather than left to the sort: `Array.Sort` is an unstable IntroSort that
+switches strategy by array size, so without a secondary key the selection would be an artefact of
+sort internals. Two consequences follow. (1) A **seeded** run would not be reproducible across
+environments or runtime versions, which is a guarantee users reasonably assume of a seeded sampler.
+(2) Any parity test comparing selected token *indices* under a near-uniform distribution would be
+asserting on sort internals rather than sampler semantics.
+
+The alternative — leave tie order unspecified and merely document that determinism holds
+per-environment, not across them — was considered. It is defensible: any tie member is an equally
+valid sample, so nothing is *wrong* under the weaker guarantee. It was not chosen because the
+stronger guarantee turned out to be free. Ordering is realised by sorting one packed `ulong` per
+token (probability bits in the high half, `~tokenId` in the low half; softmax outputs are
+non-negative, and non-negative IEEE-754 floats are monotonic read as `uint`) instead of the
+key/item array pair it replaces — a single primitive sort, no comparer delegate, one fewer array to
+permute.
+
+Other steps were audited for the same defect and are already deterministic: `TopKSampler`,
+`MinPSampler` and `TopNSigmaSampler` are threshold scans in ascending index order,
+`CategoricalSampler` sorts its candidates by token id, and `EntropyBoundSampler` already breaks
+entropy ties by position index.
+
 ### 7. Min-P (`MinPStep`)
 Keep tokens with `probability ≥ min_p × max_probability`. More stable than top-p across distributions.
 
