@@ -3,11 +3,12 @@ using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Tokenizers.Bpe;
 using DotLLM.Vulkan;
 using System.Numerics.Tensors;
-using Xunit;
 using Xunit.Abstractions;
+using Xunit;
 
 namespace DotLLM.Tests.Integration.Backends;
 
@@ -32,15 +33,20 @@ public sealed class BitNetVulkanAccuracyTests
 
     public BitNetVulkanAccuracyTests(ITestOutputHelper output) => _output = output;
 
-    private static string? ModelPath =>
-        Environment.GetEnvironmentVariable("DOTLLM_BITNET_GGUF");
+    /// <summary>
+    /// BitNet I2_S fixture, resolved via <see cref="KnownTestFixtures.BitNetI2S"/>:
+    /// <c>$DOTLLM_BITNET_GGUF</c>, then the dotLLM test cache, then the HF hub cache (#308).
+    /// </summary>
+    private static FixtureLocation BitNetFixture => KnownTestFixtures.BitNetI2S;
+
+    private static string? ModelPath => BitNetFixture.Path;
 
     private const string ParityPrompt = "The capital of France is";
 
     [SkippableFact]
     public unsafe void CpuVsVulkan_Prefill_LastTokenLogits_Match()
     {
-        Skip.If(ModelPath is null || !File.Exists(ModelPath), "BitNet GGUF not available (set DOTLLM_BITNET_GGUF).");
+        Skip.If(!BitNetFixture.Found, BitNetFixture.SkipMessage(KnownTestFixtures.BitNetI2SDescription));
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader or physical device available on this host.");
 
         using var gguf = GgufFile.Open(ModelPath!);
@@ -78,7 +84,7 @@ public sealed class BitNetVulkanAccuracyTests
     [SkippableFact]
     public unsafe void CpuVsVulkan_SingleToken_Logits_Match()
     {
-        Skip.If(ModelPath is null || !File.Exists(ModelPath), "BitNet GGUF not available (set DOTLLM_BITNET_GGUF).");
+        Skip.If(!BitNetFixture.Found, BitNetFixture.SkipMessage(KnownTestFixtures.BitNetI2SDescription));
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader or physical device available on this host.");
 
         using var gguf = GgufFile.Open(ModelPath!);
@@ -112,7 +118,7 @@ public sealed class BitNetVulkanAccuracyTests
     [SkippableFact]
     public unsafe void CpuVsVulkan_BatchedPrefill_LastTokenLogits_Match()
     {
-        Skip.If(ModelPath is null || !File.Exists(ModelPath), "BitNet GGUF not available (set DOTLLM_BITNET_GGUF).");
+        Skip.If(!BitNetFixture.Found, BitNetFixture.SkipMessage(KnownTestFixtures.BitNetI2SDescription));
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader or physical device available on this host.");
 
         using var gguf = GgufFile.Open(ModelPath!);

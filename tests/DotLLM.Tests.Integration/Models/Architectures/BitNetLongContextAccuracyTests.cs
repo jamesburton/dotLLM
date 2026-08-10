@@ -3,9 +3,10 @@ using DotLLM.Engine.Evaluation;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Evaluation;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Tokenizers.Bpe;
-using Xunit;
 using Xunit.Abstractions;
+using Xunit;
 
 namespace DotLLM.Tests.Integration.Models.Architectures;
 
@@ -41,8 +42,13 @@ public sealed class BitNetLongContextAccuracyTests
     private readonly ITestOutputHelper _output;
     public BitNetLongContextAccuracyTests(ITestOutputHelper output) => _output = output;
 
-    private static string? ModelPath =>
-        Environment.GetEnvironmentVariable("DOTLLM_BITNET_GGUF");
+    /// <summary>
+    /// BitNet I2_S fixture, resolved via <see cref="KnownTestFixtures.BitNetI2S"/>:
+    /// <c>$DOTLLM_BITNET_GGUF</c>, then the dotLLM test cache, then the HF hub cache (#308).
+    /// </summary>
+    private static FixtureLocation BitNetFixture => KnownTestFixtures.BitNetI2S;
+
+    private static string? ModelPath => BitNetFixture.Path;
 
     // ~700 words of varied, non-repetitive factual prose spanning several unrelated topics
     // (deliberately encyclopedic/wikitext-like, not a single easy narrative) — real wikitext-2
@@ -95,14 +101,10 @@ public sealed class BitNetLongContextAccuracyTests
         + "directly to the first deliberate vaccination and, eventually, to the global eradication "
         + "of smallpox two centuries later.";
 
-    [Fact]
+    [SkippableFact]
     public void Cpu_Perplexity_AtLongContext_StaysWithinBoundAndDoesNotDegradeWithLength()
     {
-        if (ModelPath is null || !File.Exists(ModelPath))
-        {
-            _output.WriteLine("SKIP: BitNet GGUF not available (set DOTLLM_BITNET_GGUF).");
-            return;
-        }
+        Skip.If(!BitNetFixture.Found, BitNetFixture.SkipMessage(KnownTestFixtures.BitNetI2SDescription));
 
         using var gguf = GgufFile.Open(ModelPath!);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);

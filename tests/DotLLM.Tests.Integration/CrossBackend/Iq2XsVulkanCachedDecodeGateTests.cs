@@ -71,7 +71,7 @@ public sealed class Iq2XsVulkanCachedDecodeGateTests
     public void CachedSeqLen1Decode_Iq2Xs_Vulkan_AgreesWithCpu()
     {
         string? path = CrossBackendQuantGateTests.ResolveFixturePath(QuantizationType.IQ2_XS);
-        Skip.If(path is null, $"IQ2_XS: fixture not found (see .docs/corpora/QUANT_FIXTURES.md).");
+        Skip.If(path is null, $"IQ2_XS: fixture not found (see docs/QUANT_FIXTURES.md).");
 
         bool vulkanOk;
         try { using var probe = VulkanDevice.Create(); vulkanOk = true; }

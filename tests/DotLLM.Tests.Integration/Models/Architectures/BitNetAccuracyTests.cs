@@ -2,10 +2,11 @@ using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Tokenizers.Bpe;
 using System.Numerics.Tensors;
-using Xunit;
 using Xunit.Abstractions;
+using Xunit;
 
 namespace DotLLM.Tests.Integration.Models.Architectures;
 
@@ -38,8 +39,13 @@ public sealed class BitNetAccuracyTests
 
     public BitNetAccuracyTests(ITestOutputHelper output) => _output = output;
 
-    private static string? ModelPath =>
-        Environment.GetEnvironmentVariable("DOTLLM_BITNET_GGUF");
+    /// <summary>
+    /// BitNet I2_S fixture, resolved via <see cref="KnownTestFixtures.BitNetI2S"/>:
+    /// <c>$DOTLLM_BITNET_GGUF</c>, then the dotLLM test cache, then the HF hub cache (#308).
+    /// </summary>
+    private static FixtureLocation BitNetFixture => KnownTestFixtures.BitNetI2S;
+
+    private static string? ModelPath => BitNetFixture.Path;
 
     // ~120 tokens of ordinary English. Absolute perplexity here is the quantitative
     // accuracy signal for the CPU I2_S forward; the same prompt's last-token logits
@@ -54,14 +60,10 @@ public sealed class BitNetAccuracyTests
 
     private const string ParityPrompt = "The capital of France is";
 
-    [Fact]
+    [SkippableFact]
     public unsafe void Cpu_Perplexity_OnFixedPassage_IsSane()
     {
-        if (ModelPath is null || !File.Exists(ModelPath))
-        {
-            _output.WriteLine("SKIP: BitNet GGUF not available (set DOTLLM_BITNET_GGUF).");
-            return;
-        }
+        Skip.If(!BitNetFixture.Found, BitNetFixture.SkipMessage(KnownTestFixtures.BitNetI2SDescription));
 
         using var gguf = GgufFile.Open(ModelPath!);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -101,19 +103,12 @@ public sealed class BitNetAccuracyTests
         Assert.InRange(perplexity, 1.0, 30.0);
     }
 
-    [Fact]
+    [SkippableFact]
     public unsafe void CpuVsCuda_LastTokenLogits_Match()
     {
-        if (ModelPath is null || !File.Exists(ModelPath))
-        {
-            _output.WriteLine("SKIP: BitNet GGUF not available (set DOTLLM_BITNET_GGUF).");
-            return;
-        }
-        if (!CudaDevice.IsAvailable())
-        {
-            _output.WriteLine("SKIP: No CUDA device available.");
-            return;
-        }
+        Skip.If(!BitNetFixture.Found, BitNetFixture.SkipMessage(KnownTestFixtures.BitNetI2SDescription));
+        Skip.If(!CudaDevice.IsAvailable(),
+            "No CUDA device available.");
 
         using var gguf = GgufFile.Open(ModelPath!);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);

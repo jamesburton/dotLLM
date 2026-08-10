@@ -1,14 +1,15 @@
-using System.Diagnostics;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
-using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.SafeTensors;
+using DotLLM.Models;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Tokenizers;
 using DotLLM.Vulkan;
-using Xunit;
+using System.Diagnostics;
 using Xunit.Abstractions;
+using Xunit;
 
 namespace DotLLM.Tests.Integration.Vulkan;
 
@@ -101,13 +102,9 @@ public sealed class RealHfSafetensorsEndToEndVulkanTests
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_TINYLLAMA_CHECKPOINT_PATH",
             conventional: "C:/temp/dotllm-tinyllama");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] TinyLlama-1.1B checkpoint not found. Set DOTLLM_TINYLLAMA_CHECKPOINT_PATH "
-                + "or place the snapshot at C:/temp/dotllm-tinyllama/");
-            return;
-        }
+        Skip.If(root is null,
+            "TinyLlama-1.1B checkpoint not found. Set DOTLLM_TINYLLAMA_CHECKPOINT_PATH "
+            + "or place the snapshot at C:/temp/dotllm-tinyllama/");
         RunParityTest(root, expectedArch: Architecture.Llama, label: "TinyLlama-1.1B",
             logitsAbsTol: LogitsAbsTol, softPerStep: false);
     }
@@ -122,13 +119,9 @@ public sealed class RealHfSafetensorsEndToEndVulkanTests
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_QWEN25_CHECKPOINT_PATH",
             conventional: "C:/Users/james/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Qwen2.5-0.5B checkpoint not found. Set DOTLLM_QWEN25_CHECKPOINT_PATH "
-                + "or ensure the HF snapshot is present at the conventional path.");
-            return;
-        }
+        Skip.If(root is null,
+            "Qwen2.5-0.5B checkpoint not found. Set DOTLLM_QWEN25_CHECKPOINT_PATH "
+            + "or ensure the HF snapshot is present at the conventional path.");
         RunParityTest(root, expectedArch: Architecture.Qwen, label: "Qwen2.5-0.5B",
             logitsAbsTol: LogitsAbsTol, softPerStep: false);
     }
@@ -143,13 +136,9 @@ public sealed class RealHfSafetensorsEndToEndVulkanTests
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_PHI35_CHECKPOINT_PATH",
             conventional: "C:/temp/dotllm-phi35-mini");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Phi-3.5-mini checkpoint not found. Set DOTLLM_PHI35_CHECKPOINT_PATH "
-                + "or place the snapshot at C:/temp/dotllm-phi35-mini/");
-            return;
-        }
+        Skip.If(root is null,
+            "Phi-3.5-mini checkpoint not found. Set DOTLLM_PHI35_CHECKPOINT_PATH "
+            + "or place the snapshot at C:/temp/dotllm-phi35-mini/");
         RunParityTest(root, expectedArch: Architecture.Phi, label: "Phi-3.5-mini",
             logitsAbsTol: LogitsAbsTol, softPerStep: false);
     }
@@ -169,13 +158,9 @@ public sealed class RealHfSafetensorsEndToEndVulkanTests
             ?? ResolveCheckpointRoot(
                 envVar: null,
                 conventional: "C:/temp/dotllm-granite3-moe");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Granite-3 MoE checkpoint not found. Set DOTLLM_GRANITE3_CHECKPOINT_PATH "
-                + "or place the snapshot at C:/temp/dotllm-granite31-moe/ or C:/temp/dotllm-granite3-moe/");
-            return;
-        }
+        Skip.If(root is null,
+            "Granite-3 MoE checkpoint not found. Set DOTLLM_GRANITE3_CHECKPOINT_PATH "
+            + "or place the snapshot at C:/temp/dotllm-granite31-moe/ or C:/temp/dotllm-granite3-moe/");
         RunParityTest(root, expectedArch: Architecture.GraniteMoe, label: "Granite-3-MoE",
             logitsAbsTol: LogitsAbsTolGraniteMoe, softPerStep: SoftPerStepGraniteMoe);
     }
@@ -187,17 +172,10 @@ public sealed class RealHfSafetensorsEndToEndVulkanTests
     [SkippableFact]
     public void DeepSeekV2Lite_VulkanForward_MatchesCpuReference_OnEightDecodeSteps()
     {
-        string? root = ResolveCheckpointRoot(
-            envVar: "DOTLLM_DEEPSEEK_V2_LITE_CHECKPOINT_PATH",
-            conventional: "C:/temp/dotllm-deepseek-v2-lite");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] DeepSeek-V2-Lite checkpoint not found. Set "
-                + "DOTLLM_DEEPSEEK_V2_LITE_CHECKPOINT_PATH or place the snapshot "
-                + "at C:/temp/dotllm-deepseek-v2-lite/");
-            return;
-        }
+        FixtureLocation deepSeekFixture = KnownTestFixtures.DeepSeekV2LiteCheckpoint;
+        Skip.If(!deepSeekFixture.Found,
+            deepSeekFixture.SkipMessage(KnownTestFixtures.DeepSeekV2LiteDescription));
+        string root = deepSeekFixture.Path!;
         RunParityTest(root, expectedArch: Architecture.DeepSeekV2, label: "DeepSeek-V2-Lite",
             logitsAbsTol: LogitsAbsTol, softPerStep: false);
     }

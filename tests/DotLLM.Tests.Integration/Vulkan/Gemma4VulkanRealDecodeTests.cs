@@ -1,10 +1,11 @@
-using System.Diagnostics;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Tensors;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Vulkan;
-using Xunit;
+using System.Diagnostics;
 using Xunit.Abstractions;
+using Xunit;
 
 namespace DotLLM.Tests.Integration.Vulkan;
 
@@ -28,7 +29,11 @@ namespace DotLLM.Tests.Integration.Vulkan;
 [Trait("Category", "GPU")]
 public sealed class Gemma4VulkanRealDecodeTests
 {
-    private const string ModelPathEnvVar = "DOTLLM_GEMMA4_GGUF";
+    /// <summary>
+    /// Gemma-4-26B fixture, resolved via <see cref="KnownTestFixtures.Gemma4_26B_A4B_Q4KM"/>:
+    /// <c>$DOTLLM_GEMMA4_GGUF</c>, then the dotLLM test cache, then the HF hub cache (#308).
+    /// </summary>
+    private static FixtureLocation Gemma4Fixture => KnownTestFixtures.Gemma4_26B_A4B_Q4KM;
 
     private readonly ITestOutputHelper _output;
 
@@ -37,9 +42,9 @@ public sealed class Gemma4VulkanRealDecodeTests
     [SkippableFact]
     public unsafe void Gemma4_26B_Vulkan_KvCachedDecode_GeneratesCoherentText()
     {
-        string? path = Environment.GetEnvironmentVariable(ModelPathEnvVar);
-        Skip.If(string.IsNullOrWhiteSpace(path) || !File.Exists(path),
-            $"Set {ModelPathEnvVar} to the gemma-4-26B GGUF to run this decode validation.");
+        FixtureLocation fixture = Gemma4Fixture;
+        Skip.If(!fixture.Found, fixture.SkipMessage(KnownTestFixtures.Gemma4_26BDescription));
+        string path = fixture.Path!;
         Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader or physical device available on this host.");
 

@@ -91,13 +91,9 @@ public sealed class IbSsmMamba3VulkanGenerationTests
     public void Mamba3_VulkanForward_MatchesCpuReference_OnPromptPrefill()
     {
         string? dir = ResolveCheckpointDir();
-        if (dir is null)
-        {
-            _output.WriteLine(
-                $"[SKIP] ib-ssm/mamba3-370M-10BT checkpoint not found. Set {CheckpointPathEnvVar} "
-                + $"to the safetensors file or its directory, or place it at {ConventionalDir}/{SafetensorsName}.");
-            return;
-        }
+        Skip.If(dir is null,
+            $"ib-ssm/mamba3-370M-10BT checkpoint not found. Set {CheckpointPathEnvVar} "
+            + $"to the safetensors file or its directory, or place it at {ConventionalDir}/{SafetensorsName}.");
 
         SkipIfVulkanUnavailable(out string spvDir);
 

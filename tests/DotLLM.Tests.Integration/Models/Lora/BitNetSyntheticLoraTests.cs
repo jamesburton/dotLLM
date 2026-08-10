@@ -1,8 +1,9 @@
 using DotLLM.Core.Configuration;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
-using Xunit;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit.Abstractions;
+using Xunit;
 
 namespace DotLLM.Tests.Integration.Models.Lora;
 
@@ -11,18 +12,19 @@ public class BitNetSyntheticLoraTests
     private readonly ITestOutputHelper _output;
     public BitNetSyntheticLoraTests(ITestOutputHelper output) => _output = output;
 
-    private static string? ModelPath =>
-        Environment.GetEnvironmentVariable("DOTLLM_BITNET_GGUF"); // set to the cached i2_s path
+    /// <summary>
+    /// BitNet I2_S fixture, resolved via <see cref="KnownTestFixtures.BitNetI2S"/>:
+    /// <c>$DOTLLM_BITNET_GGUF</c>, then the dotLLM test cache, then the HF hub cache (#308).
+    /// </summary>
+    private static FixtureLocation BitNetFixture => KnownTestFixtures.BitNetI2S;
 
-    [Fact]
+    private static string? ModelPath => BitNetFixture.Path;
+
+    [SkippableFact]
     public void SyntheticAdapter_ChangesLogits_ButBaseUnchanged()
     {
         // Plain Fact + early-return (no SkippableFact dependency): no-op pass when the model is absent.
-        if (ModelPath is null || !File.Exists(ModelPath))
-        {
-            _output.WriteLine("SKIP: BitNet GGUF not available (set DOTLLM_BITNET_GGUF).");
-            return;
-        }
+        Skip.If(!BitNetFixture.Found, BitNetFixture.SkipMessage(KnownTestFixtures.BitNetI2SDescription));
 
         using var gguf = GgufFile.Open(ModelPath!);
         var cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);

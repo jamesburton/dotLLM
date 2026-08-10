@@ -46,7 +46,7 @@ namespace DotLLM.Tests.Integration.CrossBackend;
 /// hidden_size of 576 fails that constraint). Generation recipe, the llama-quantize argument used
 /// for each dotLLM <see cref="QuantizationType"/> (including the <c>IQ2_S</c>/<c>IQ2_M</c>
 /// ftype-vs-block-type mismatch the issue calls out by name), and current disk-budget gaps are
-/// documented in <c>.docs/corpora/QUANT_FIXTURES.md</c>. Every test below resolves its fixture via
+/// documented in <c>docs/QUANT_FIXTURES.md</c>. Every test below resolves its fixture via
 /// <see cref="ResolveFixturePath"/> (env var override, else the conventional
 /// <c>~/.dotllm/quant-ladder/Llama-3.2-1B-pure/</c> path) and self-skips - not
 /// fails - when the fixture is absent, matching the existing <c>DOTLLM_*_GGUF</c> convention
@@ -199,18 +199,14 @@ public sealed class CrossBackendQuantGateTests
     /// embedding tensor lacks) and are deliberately excluded from this check - see
     /// QUANT_FIXTURES.md.
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(AllGateTypeCases))]
     public void Cpu_ObservedBlockType_MatchesFixtureTarget(QuantizationType quantType)
     {
         string? path = ResolveFixturePath(quantType);
-        if (path is null)
-        {
-            _output.WriteLine($"[SKIP] {quantType}: fixture not found. {FixtureHint(quantType)}");
-            return;
-        }
+        Skip.If(path is null, $"{quantType}: fixture not found. {FixtureHint(quantType)}");
 
-        using var gguf = GgufFile.Open(path);
+        using var gguf = GgufFile.Open(path!);
         var blockTensors = gguf.Tensors.Where(IsTransformerBlockWeight).ToList();
         Assert.NotEmpty(blockTensors);
 
@@ -237,18 +233,14 @@ public sealed class CrossBackendQuantGateTests
     /// values are expected to be enormous for the most aggressively quantized fixtures (that is
     /// the model being destroyed by design, not a bug; see class remarks).
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(AllGateTypeCases))]
     public void Cpu_TeacherForcedPerplexity_IsFinite(QuantizationType quantType)
     {
         string? path = ResolveFixturePath(quantType);
-        if (path is null)
-        {
-            _output.WriteLine($"[SKIP] {quantType}: fixture not found. {FixtureHint(quantType)}");
-            return;
-        }
+        Skip.If(path is null, $"{quantType}: fixture not found. {FixtureHint(quantType)}");
 
-        using var gguf = GgufFile.Open(path);
+        using var gguf = GgufFile.Open(path!);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
         using var model = ModelLoader.CreateCpuModelFromGguf(gguf, config, ThreadingConfig.Auto);
@@ -284,18 +276,14 @@ public sealed class CrossBackendQuantGateTests
     /// regressed, which is the point - #257 explicitly asks for a test that fails without its fix,
     /// "the reason this reached dev is that no test loads a Q4_0 model end-to-end."
     /// </remarks>
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(AllGateTypeCases))]
     public async Task Cpu_GreedyGeneration_CompletesWithTokens(QuantizationType quantType)
     {
         string? path = ResolveFixturePath(quantType);
-        if (path is null)
-        {
-            _output.WriteLine($"[SKIP] {quantType}: fixture not found. {FixtureHint(quantType)}");
-            return;
-        }
+        Skip.If(path is null, $"{quantType}: fixture not found. {FixtureHint(quantType)}");
 
-        using var gguf = GgufFile.Open(path);
+        using var gguf = GgufFile.Open(path!);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
         using var model = ModelLoader.CreateCpuModelFromGguf(gguf, config, ThreadingConfig.Auto);
@@ -432,7 +420,7 @@ public sealed class CrossBackendQuantGateTests
 
     private static string FixtureHint(QuantizationType quantType) =>
         $"Set DOTLLM_QUANT_FIXTURE_{quantType} or generate via the recipe in "
-        + ".docs/corpora/QUANT_FIXTURES.md into "
+        + "docs/QUANT_FIXTURES.md into "
         + "~/.dotllm/quant-ladder/Llama-3.2-1B-pure/.";
 
     private static bool IsTransformerBlockWeight(GgufTensorDescriptor tensor)

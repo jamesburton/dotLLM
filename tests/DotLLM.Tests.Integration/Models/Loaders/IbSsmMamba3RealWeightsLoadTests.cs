@@ -107,18 +107,14 @@ public sealed class IbSsmMamba3RealWeightsLoadTests
     /// dimensions. No forward pass — the 48-layer CPU prefill is exercised by
     /// <see cref="ForwardProducesFiniteVocabLogits"/>.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void LoadConfig_ReturnsExpectedDimensions()
     {
         string? checkpointPath = ResolveCheckpointPath();
-        if (checkpointPath is null)
-        {
-            _output.WriteLine(
-                $"[SKIP] ib-ssm/mamba3-370M-10BT checkpoint not found. Set {CheckpointPathEnvVar} "
-                + $"to the safetensors file or its directory, or place it at {ConventionalDir}/model.safetensors "
-                + "or %USERPROFILE%/dotllm-ibssm-370m/model.safetensors.");
-            return;
-        }
+        Skip.If(checkpointPath is null,
+            $"ib-ssm/mamba3-370M-10BT checkpoint not found. Set {CheckpointPathEnvVar} "
+            + $"to the safetensors file or its directory, or place it at {ConventionalDir}/model.safetensors "
+            + "or %USERPROFILE%/dotllm-ibssm-370m/model.safetensors.");
 
         long fileBytes = new FileInfo(checkpointPath).Length;
         _output.WriteLine($"Checkpoint: {checkpointPath}  ({fileBytes:N0} bytes)");
@@ -171,17 +167,13 @@ public sealed class IbSsmMamba3RealWeightsLoadTests
     /// time, so regressions (NaN emergence, degeneracy, slowdowns) are visible
     /// in the test output.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void ForwardProducesFiniteVocabLogits()
     {
         string? checkpointPath = ResolveCheckpointPath();
-        if (checkpointPath is null)
-        {
-            _output.WriteLine(
-                $"[SKIP] ib-ssm/mamba3-370M-10BT checkpoint not found. Set {CheckpointPathEnvVar} "
-                + "to enable this test.");
-            return;
-        }
+        Skip.If(checkpointPath is null,
+            $"ib-ssm/mamba3-370M-10BT checkpoint not found. Set {CheckpointPathEnvVar} "
+            + "to enable this test.");
 
         long fileBytes = new FileInfo(checkpointPath).Length;
         _output.WriteLine($"Checkpoint: {checkpointPath}  ({fileBytes:N0} bytes)");
@@ -257,30 +249,22 @@ public sealed class IbSsmMamba3RealWeightsLoadTests
     /// algorithm-level tolerances used by the small-scale comparators.
     /// </para>
     /// </remarks>
-    [Fact]
+    [SkippableFact]
     public void ForwardMatchesCanonicalReference()
     {
         string? enable = Environment.GetEnvironmentVariable(RefCompareEnvVar);
-        if (!string.Equals(enable, "1", StringComparison.Ordinal))
-        {
-            _output.WriteLine(
-                $"[SKIP] Canonical reference comparison disabled. To enable, set "
-                + $"{RefCompareEnvVar}=1 plus {CheckpointPathEnvVar}. Note: the canonical "
-                + "state-spaces/mamba path requires Triton+CUDA (not viable on Windows+CPU "
-                + "at 370M dims); the pure-Python fallback from capture_fixtures_canonical.py "
-                + "takes tens of minutes to run 48 layers × 1024 hidden × 5 tokens. "
-                + "Algorithm-level drift at block scale is covered by "
-                + "Mamba3CanonicalReferenceCompareTests.");
-            return;
-        }
+        Skip.If(!string.Equals(enable, "1", StringComparison.Ordinal),
+            $"Canonical reference comparison disabled. To enable, set "
+            + $"{RefCompareEnvVar}=1 plus {CheckpointPathEnvVar}. Note: the canonical "
+            + "state-spaces/mamba path requires Triton+CUDA (not viable on Windows+CPU "
+            + "at 370M dims); the pure-Python fallback from capture_fixtures_canonical.py "
+            + "takes tens of minutes to run 48 layers × 1024 hidden × 5 tokens. "
+            + "Algorithm-level drift at block scale is covered by "
+            + "Mamba3CanonicalReferenceCompareTests.");
 
         string? checkpointPath = ResolveCheckpointPath();
-        if (checkpointPath is null)
-        {
-            _output.WriteLine(
-                $"[SKIP] ib-ssm/mamba3-370M-10BT checkpoint not found. Set {CheckpointPathEnvVar}.");
-            return;
-        }
+        Skip.If(checkpointPath is null,
+            $"ib-ssm/mamba3-370M-10BT checkpoint not found. Set {CheckpointPathEnvVar}.");
 
         // Full-scale reference import is not wired here — the test remains a
         // documented opt-in until a Triton+CUDA CI path exists.
@@ -324,17 +308,13 @@ public sealed class IbSsmMamba3RealWeightsLoadTests
     /// win of this stage.
     /// </para>
     /// </remarks>
-    [Fact]
+    [SkippableFact]
     public void DecodeMatchesPrefillOnRealCheckpoint()
     {
         string? checkpointPath = ResolveCheckpointPath();
-        if (checkpointPath is null)
-        {
-            _output.WriteLine(
-                $"[SKIP] ib-ssm/mamba3-370M-10BT checkpoint not found. Set {CheckpointPathEnvVar} "
-                + "to enable this test.");
-            return;
-        }
+        Skip.If(checkpointPath is null,
+            $"ib-ssm/mamba3-370M-10BT checkpoint not found. Set {CheckpointPathEnvVar} "
+            + "to enable this test.");
 
         long fileBytes = new FileInfo(checkpointPath).Length;
         _output.WriteLine($"Checkpoint: {checkpointPath}  ({fileBytes:N0} bytes)");

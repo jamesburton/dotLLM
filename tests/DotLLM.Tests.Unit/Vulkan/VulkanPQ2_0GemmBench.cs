@@ -122,11 +122,7 @@ public sealed class VulkanPQ2_0GemmBench
             comparisons.Add(("register-blocked -> coopmat32",
                 PQ2_0GemmVariant.RegisterBlocked, PQ2_0GemmVariant.Coopmat32));
         }
-        if (comparisons.Count == 0)
-        {
-            _output.WriteLine("NOTE: VK_KHR_cooperative_matrix absent — nothing to compare.");
-            return;
-        }
+        Skip.If(comparisons.Count == 0, "VK_KHR_cooperative_matrix absent — nothing to compare.");
 
         foreach (var (label, refVariant, challVariant) in comparisons)
         {

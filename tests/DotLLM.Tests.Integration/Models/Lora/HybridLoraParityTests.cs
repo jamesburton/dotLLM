@@ -33,22 +33,16 @@ public sealed class HybridLoraParityTests
     private static string ModelPath =>
         @"C:/Users/james/.dotllm/models/QuantFactory/SmolLM-135M-GGUF/SmolLM-135M.Q8_0.gguf";
 
-    [Fact]
+    [SkippableFact]
     public unsafe void HybridAndCpu_LoraLogits_AreNumericallyConsistent()
     {
         // ── Guard 1: model file must be present ──────────────────────────────────
-        if (!File.Exists(ModelPath))
-        {
-            _output.WriteLine("SKIP: SmolLM-135M Q8_0 GGUF not found.");
-            return;
-        }
+        Skip.If(!File.Exists(ModelPath),
+            "SmolLM-135M Q8_0 GGUF not found.");
 
         // ── Guard 2: CUDA device must be available ────────────────────────────────
-        if (!CudaDevice.IsAvailable())
-        {
-            _output.WriteLine("SKIP: No CUDA device available.");
-            return;
-        }
+        Skip.If(!CudaDevice.IsAvailable(),
+            "No CUDA device available.");
 
         // ── Setup ─────────────────────────────────────────────────────────────────
         using var gguf = GgufFile.Open(ModelPath);
