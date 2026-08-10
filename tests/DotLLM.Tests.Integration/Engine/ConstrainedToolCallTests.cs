@@ -3,6 +3,7 @@ using DotLLM.Engine;
 using DotLLM.Engine.Constraints;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ToolCallParsers;
 using Xunit;
@@ -36,15 +37,16 @@ public sealed class ConstrainedToolCallTests
     /// engine's real guarantee unconditionally, and only asserts the full parsed tool call when the
     /// model actually terminated.
     /// </para>
-    /// When <c>DOTLLM_BITNET_GGUF</c> is unset or points to a missing file the test exits
-    /// immediately and is counted as a pass (CI no-op).
+    /// When the BitNet fixture cannot be resolved the test reports <b>skipped</b> naming every
+    /// path probed — it used to <c>return;</c> and be counted as a pass (#307).
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void BitNet_ToolChoiceRequired_ProducesValidSelfTerminatingCall()
     {
-        // ── env gate ──────────────────────────────────────────────────────────
-        string? ggufPath = Environment.GetEnvironmentVariable("DOTLLM_BITNET_GGUF");
-        if (string.IsNullOrEmpty(ggufPath) || !File.Exists(ggufPath)) return;
+        // ── fixture gate ──────────────────────────────────────────────────────
+        FixtureLocation fixture = KnownTestFixtures.BitNetI2S;
+        Skip.If(!fixture.Found, fixture.SkipMessage(KnownTestFixtures.BitNetI2SDescription));
+        string ggufPath = fixture.Path!;
 
         // ── load model (same path as CLI ChatCommand, no Cli dependency needed) ──
         using var gguf = GgufFile.Open(ggufPath);

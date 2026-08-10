@@ -27,6 +27,13 @@ namespace DotLLM.Tests.Unit.Conventions;
 /// <c>Skip.If</c>/<c>Skip.IfNot</c> instead, which reports
 /// <b>skipped</b>. A deliberate exception can be annotated with a
 /// <c>// silent-skip-ok: &lt;reason&gt;</c> comment on the <c>return;</c> line or the line above it.</para>
+/// <para><b>Known gap.</b> This rule requires a log line, so it does not catch the *unlogged*
+/// variant — <c>if (!Avx2.IsSupported) return;</c> and friends, which bail before asserting
+/// anything and say nothing at all. A survey while fixing #307 counted ~46 of those, nearly all
+/// hardware-capability gates under <c>tests/DotLLM.Tests.Unit/Cpu/Kernels/</c>. They are silent
+/// only on hardware lacking the ISA, which is a different (and much larger) mechanical change
+/// than the fixture gates #307 is about, so they are left for a follow-up rather than widened
+/// into here — a rule that fails on 46 pre-existing sites could not be landed.</para>
 /// </remarks>
 public sealed class SilentSkipConventionTests
 {
