@@ -1,0 +1,31 @@
+<Project>
+
+  <!-- Preview track only (dev-dotnet11). `Avx512Bf16` (VDPBF16PS) is not in any shipping or
+       nightly .NET SDK — it exists only in our dotnet/runtime fork. Compiling against it means
+       taking the targeting pack from that local build instead of the SDK's bundled one, so
+       `Microsoft.NETCore.App.Ref` / `.Runtime.*` 11.0.0-dev are restored from the
+       `local-dotnet-runtime` source declared in NuGet.config. Produce them with:
+
+           cd C:\dotnet-runtime
+           build.cmd -c Release -s clr+libs+packs+host -clrinterpreter
+
+       This lives in Directory.Build.targets rather than Directory.Build.props on purpose: the
+       props file is evaluated before the SDK creates the implicit Microsoft.NETCore.App
+       FrameworkReference, so an `Update` there matches nothing and breaks TargetFramework
+       inference (NETSDK1241).
+
+       RuntimeFrameworkVersion is pinned to the same build deliberately. Compiling against a ref
+       assembly that the running shared framework lacks would fail at runtime with a
+       TypeLoadException the moment an Avx512Bf16 path is reached, which is much harder to
+       diagnose than a restore error. Running/testing therefore needs the matching runtime: either
+       a self-contained `dotnet publish`, or install
+       artifacts\packages\Release\Shipping\dotnet-runtime-11.0.0-dev-win-x64.exe.
+
+       Do NOT port this file to dev/main. -->
+  <ItemGroup>
+    <FrameworkReference Update="Microsoft.NETCore.App"
+                        TargetingPackVersion="11.0.0-dev"
+                        RuntimeFrameworkVersion="11.0.0-dev" />
+  </ItemGroup>
+
+</Project>
