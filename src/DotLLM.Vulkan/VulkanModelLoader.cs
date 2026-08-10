@@ -36,8 +36,7 @@ public static class VulkanModelLoader
     /// cache type and there is no common <c>CreateKvCache</c> interface.
     /// </returns>
     /// <exception cref="NotSupportedException">
-    /// The architecture has no Vulkan GGUF loader yet (e.g. Qwen3HybridDense), or has no GGUF
-    /// representation at all (Mamba-3).
+    /// The architecture has no GGUF representation at all (Mamba-3).
     /// </exception>
     public static (IModel Model, Func<int, IKvCache> KvCacheFactory) CreateFromGguf(
         VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir,
@@ -64,23 +63,24 @@ public static class VulkanModelLoader
                 return (nemotron, size => nemotron.CreateKvCache(size));
             }
 
+            case Architecture.Qwen3HybridDense:
+            {
+                var dense = VulkanQwen3HybridDenseTransformerModel.BuildFromGguf(
+                    device, gguf, config, spvDir);
+                return (dense, size => dense.CreateKvCache(size));
+            }
+
             // Explicit rejections. Without these these architectures fall into `default`,
             // where VulkanTransformerModel fails on dense-attention tensor naming — the
             // caller then sees "blk.0.attn_output.weight not present" (or a bare
             // "Hybrid SSM / Mamba architectures are not supported") instead of the actual
-            // reason, which is different for each of them.
+            // reason.
             case Architecture.Mamba3:
                 throw new NotSupportedException(
                     "Mamba-3 has no GGUF representation: no upstream 'mamba3' value for " +
                     "general.architecture and no GGUF tensor-naming convention, so GgufModelConfigExtractor " +
                     "cannot produce Architecture.Mamba3 in the first place. Mamba-3 is safetensors-first on " +
                     "every backend — load it via VulkanMamba3TransformerModel.LoadFromSafetensors.");
-
-            case Architecture.Qwen3HybridDense:
-                throw new NotSupportedException(
-                    "Qwen3HybridDense (qwen35) has no Vulkan GGUF loader yet — its Gated-DeltaNet layers " +
-                    "have no attn_output.weight, so the dense VulkanTransformerModel path cannot load it. " +
-                    "Use --device cpu or --device cuda (CudaModelLoader has a dedicated loader).");
 
             default:
             {
