@@ -1,12 +1,13 @@
-using System.Diagnostics;
-using System.Text.Json;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Models;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Tokenizers;
-using Xunit;
+using System.Diagnostics;
+using System.Text.Json;
 using Xunit.Abstractions;
+using Xunit;
 
 namespace DotLLM.Tests.Integration.Models.Loaders;
 
@@ -60,19 +61,15 @@ public sealed class RealHfSafetensorsEndToEndTests
     // Phi-3.5-mini-instruct
     // ────────────────────────────────────────────────────────────────────
 
-    [Fact]
+    [SkippableFact]
     public void Phi35Mini_LoadsAndForwardsEndToEnd()
     {
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_PHI35_CHECKPOINT_PATH",
             conventional: "C:/temp/dotllm-phi35-mini");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Phi-3.5-mini checkpoint not found. Set DOTLLM_PHI35_CHECKPOINT_PATH "
-                + "or place the snapshot at C:/temp/dotllm-phi35-mini/");
-            return;
-        }
+        Skip.If(root is null,
+            "Phi-3.5-mini checkpoint not found. Set DOTLLM_PHI35_CHECKPOINT_PATH "
+            + "or place the snapshot at C:/temp/dotllm-phi35-mini/");
 
         _output.WriteLine($"Root: {root}");
 
@@ -119,19 +116,15 @@ public sealed class RealHfSafetensorsEndToEndTests
     // Granite-3.0-3B-A800M-instruct
     // ────────────────────────────────────────────────────────────────────
 
-    [Fact]
+    [SkippableFact]
     public void Granite3Moe_LoadsAndForwardsEndToEnd()
     {
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_GRANITE3_CHECKPOINT_PATH",
             conventional: "C:/temp/dotllm-granite31-moe");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Granite-3 MoE checkpoint not found. Set DOTLLM_GRANITE3_CHECKPOINT_PATH "
-                + "or place the snapshot at C:/temp/dotllm-granite31-moe/");
-            return;
-        }
+        Skip.If(root is null,
+            "Granite-3 MoE checkpoint not found. Set DOTLLM_GRANITE3_CHECKPOINT_PATH "
+            + "or place the snapshot at C:/temp/dotllm-granite31-moe/");
 
         _output.WriteLine($"Root: {root}");
 
@@ -189,19 +182,15 @@ public sealed class RealHfSafetensorsEndToEndTests
     // Qwen2.5-0.5B (dense, byte-level BPE tokenizer, heavy GQA)
     // ────────────────────────────────────────────────────────────────────
 
-    [Fact]
+    [SkippableFact]
     public void Qwen25_0_5B_LoadsAndForwardsEndToEnd()
     {
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_QWEN25_CHECKPOINT_PATH",
             conventional: "C:/Users/james/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Qwen2.5-0.5B checkpoint not found. Set DOTLLM_QWEN25_CHECKPOINT_PATH "
-                + "or ensure the HF snapshot is present at the conventional path.");
-            return;
-        }
+        Skip.If(root is null,
+            "Qwen2.5-0.5B checkpoint not found. Set DOTLLM_QWEN25_CHECKPOINT_PATH "
+            + "or ensure the HF snapshot is present at the conventional path.");
 
         _output.WriteLine($"Root: {root}");
 
@@ -300,19 +289,15 @@ public sealed class RealHfSafetensorsEndToEndTests
     // TinyLlama-1.1B-Chat-v1.0 (small real Llama, cheap validation)
     // ────────────────────────────────────────────────────────────────────
 
-    [Fact]
+    [SkippableFact]
     public void TinyLlama_11B_LoadsAndForwardsEndToEnd()
     {
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_TINYLLAMA_CHECKPOINT_PATH",
             conventional: "C:/temp/dotllm-tinyllama");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] TinyLlama-1.1B checkpoint not found. Set DOTLLM_TINYLLAMA_CHECKPOINT_PATH "
-                + "or place the snapshot at C:/temp/dotllm-tinyllama/");
-            return;
-        }
+        Skip.If(root is null,
+            "TinyLlama-1.1B checkpoint not found. Set DOTLLM_TINYLLAMA_CHECKPOINT_PATH "
+            + "or place the snapshot at C:/temp/dotllm-tinyllama/");
 
         _output.WriteLine($"Root: {root}");
 
@@ -356,20 +341,13 @@ public sealed class RealHfSafetensorsEndToEndTests
     // DeepSeek-V2-Lite (MLA + MoE, monolithic Q, KV-LoRA, YaRN, 2 shared experts)
     // ────────────────────────────────────────────────────────────────────
 
-    [Fact]
+    [SkippableFact]
     public void DeepSeekV2Lite_LoadsAndForwardsEndToEnd()
     {
-        string? root = ResolveCheckpointRoot(
-            envVar: "DOTLLM_DEEPSEEK_V2_LITE_CHECKPOINT_PATH",
-            conventional: "C:/temp/dotllm-deepseek-v2-lite");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] DeepSeek-V2-Lite checkpoint not found. Set "
-                + "DOTLLM_DEEPSEEK_V2_LITE_CHECKPOINT_PATH or place the snapshot "
-                + "at C:/temp/dotllm-deepseek-v2-lite/");
-            return;
-        }
+        FixtureLocation deepSeekFixture = KnownTestFixtures.DeepSeekV2LiteCheckpoint;
+        Skip.If(!deepSeekFixture.Found,
+            deepSeekFixture.SkipMessage(KnownTestFixtures.DeepSeekV2LiteDescription));
+        string root = deepSeekFixture.Path!;
 
         _output.WriteLine($"Root: {root}");
 
@@ -451,19 +429,15 @@ public sealed class RealHfSafetensorsEndToEndTests
     // API contract is exercised end-to-end without KV-cache plumbing.
     // ════════════════════════════════════════════════════════════════════
 
-    [Fact]
+    [SkippableFact]
     public void TinyLlama_11B_GeneratesText_FromTokenizedPrompt()
     {
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_TINYLLAMA_CHECKPOINT_PATH",
             conventional: "C:/temp/dotllm-tinyllama");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] TinyLlama-1.1B checkpoint not found. Set DOTLLM_TINYLLAMA_CHECKPOINT_PATH "
-                + "or place the snapshot at C:/temp/dotllm-tinyllama/");
-            return;
-        }
+        Skip.If(root is null,
+            "TinyLlama-1.1B checkpoint not found. Set DOTLLM_TINYLLAMA_CHECKPOINT_PATH "
+            + "or place the snapshot at C:/temp/dotllm-tinyllama/");
 
         RunGenerationLoop(
             root,
@@ -473,19 +447,15 @@ public sealed class RealHfSafetensorsEndToEndTests
             timeoutSeconds: 180);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Qwen25_0_5B_GeneratesText_FromTokenizedPrompt()
     {
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_QWEN25_CHECKPOINT_PATH",
             conventional: "C:/Users/james/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Qwen2.5-0.5B checkpoint not found. Set DOTLLM_QWEN25_CHECKPOINT_PATH "
-                + "or ensure the HF snapshot is present at the conventional path.");
-            return;
-        }
+        Skip.If(root is null,
+            "Qwen2.5-0.5B checkpoint not found. Set DOTLLM_QWEN25_CHECKPOINT_PATH "
+            + "or ensure the HF snapshot is present at the conventional path.");
 
         RunGenerationLoop(
             root,
@@ -495,19 +465,15 @@ public sealed class RealHfSafetensorsEndToEndTests
             timeoutSeconds: 180);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Phi35Mini_GeneratesText_FromTokenizedPrompt()
     {
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_PHI35_CHECKPOINT_PATH",
             conventional: "C:/temp/dotllm-phi35-mini");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Phi-3.5-mini checkpoint not found. Set DOTLLM_PHI35_CHECKPOINT_PATH "
-                + "or place the snapshot at C:/temp/dotllm-phi35-mini/");
-            return;
-        }
+        Skip.If(root is null,
+            "Phi-3.5-mini checkpoint not found. Set DOTLLM_PHI35_CHECKPOINT_PATH "
+            + "or place the snapshot at C:/temp/dotllm-phi35-mini/");
 
         RunGenerationLoop(
             root,
@@ -517,19 +483,15 @@ public sealed class RealHfSafetensorsEndToEndTests
             timeoutSeconds: 180);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Granite3Moe_GeneratesText_FromTokenizedPrompt()
     {
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_GRANITE3_CHECKPOINT_PATH",
             conventional: "C:/temp/dotllm-granite31-moe");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Granite-3 MoE checkpoint not found. Set DOTLLM_GRANITE3_CHECKPOINT_PATH "
-                + "or place the snapshot at C:/temp/dotllm-granite31-moe/");
-            return;
-        }
+        Skip.If(root is null,
+            "Granite-3 MoE checkpoint not found. Set DOTLLM_GRANITE3_CHECKPOINT_PATH "
+            + "or place the snapshot at C:/temp/dotllm-granite31-moe/");
 
         RunGenerationLoop(
             root,
@@ -560,14 +522,10 @@ public sealed class RealHfSafetensorsEndToEndTests
 
         // Load tokenizer first — if missing, skip before spending ~seconds on weights.
         ITokenizer? tok = ModelLoader.LoadTokenizerFromHfDirectory(root);
-        if (tok is null)
-        {
-            _output.WriteLine(
-                $"[SKIP] No tokenizer.json found under {root}. "
-                + "This repo ships vocab.json + merges.txt but no tokenizer.json — "
-                + "the HF ByteLevel factory path (P0.1) requires tokenizer.json.");
-            return;
-        }
+        Skip.If(tok is null,
+            $"No tokenizer.json found under {root}. "
+            + "This repo ships vocab.json + merges.txt but no tokenizer.json — "
+            + "the HF ByteLevel factory path (P0.1) requires tokenizer.json.");
 
         var loadWatch = Stopwatch.StartNew();
         var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
@@ -748,30 +706,22 @@ public sealed class RealHfSafetensorsEndToEndTests
     // correctness bug, not numerical noise — investigate immediately.
     // ════════════════════════════════════════════════════════════════════
 
-    [Fact]
+    [SkippableFact]
     public void Qwen25_0_5B_LogitsMatchPyTorchReference()
     {
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_QWEN25_CHECKPOINT_PATH",
             conventional: "C:/Users/james/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Qwen2.5-0.5B checkpoint not found. Set DOTLLM_QWEN25_CHECKPOINT_PATH "
-                + "or ensure the HF snapshot is present at the conventional path.");
-            return;
-        }
+        Skip.If(root is null,
+            "Qwen2.5-0.5B checkpoint not found. Set DOTLLM_QWEN25_CHECKPOINT_PATH "
+            + "or ensure the HF snapshot is present at the conventional path.");
 
         string? referencePath = ResolveReferenceJsonPath("qwen2.5-0.5b-reference.json");
-        if (referencePath is null || !File.Exists(referencePath))
-        {
-            _output.WriteLine(
-                "[SKIP] PyTorch reference JSON not found. To generate it, run: "
-                + "python tests/scripts/compare_logits_py_reference.py "
-                + "--model-path \"<qwen snapshot>\" --prompt \"The capital of France is\" "
-                + "--output-path tests/DotLLM.Tests.Integration/Models/Loaders/references/qwen2.5-0.5b-reference.json");
-            return;
-        }
+        Skip.If(referencePath is null || !File.Exists(referencePath),
+            "PyTorch reference JSON not found. To generate it, run: "
+            + "python tests/scripts/compare_logits_py_reference.py "
+            + "--model-path \"<qwen snapshot>\" --prompt \"The capital of France is\" "
+            + "--output-path tests/DotLLM.Tests.Integration/Models/Loaders/references/qwen2.5-0.5b-reference.json");
 
         _output.WriteLine($"Root: {root}");
         _output.WriteLine($"Reference: {referencePath}");
@@ -818,30 +768,22 @@ public sealed class RealHfSafetensorsEndToEndTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void TinyLlama_11B_LogitsMatchPyTorchReference()
     {
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_TINYLLAMA_CHECKPOINT_PATH",
             conventional: "C:/temp/dotllm-tinyllama");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] TinyLlama-1.1B checkpoint not found. Set DOTLLM_TINYLLAMA_CHECKPOINT_PATH "
-                + "or place the snapshot at C:/temp/dotllm-tinyllama/");
-            return;
-        }
+        Skip.If(root is null,
+            "TinyLlama-1.1B checkpoint not found. Set DOTLLM_TINYLLAMA_CHECKPOINT_PATH "
+            + "or place the snapshot at C:/temp/dotllm-tinyllama/");
 
         string? referencePath = ResolveReferenceJsonPath("tinyllama-1.1b-reference.json");
-        if (referencePath is null || !File.Exists(referencePath))
-        {
-            _output.WriteLine(
-                "[SKIP] PyTorch reference JSON not found. Generate via: "
-                + "python tests/scripts/compare_logits_py_reference.py "
-                + "--model-path \"C:/temp/dotllm-tinyllama\" --prompt \"The capital of France is\" "
-                + "--output-path tests/DotLLM.Tests.Integration/Models/Loaders/references/tinyllama-1.1b-reference.json");
-            return;
-        }
+        Skip.If(referencePath is null || !File.Exists(referencePath),
+            "PyTorch reference JSON not found. Generate via: "
+            + "python tests/scripts/compare_logits_py_reference.py "
+            + "--model-path \"C:/temp/dotllm-tinyllama\" --prompt \"The capital of France is\" "
+            + "--output-path tests/DotLLM.Tests.Integration/Models/Loaders/references/tinyllama-1.1b-reference.json");
 
         // After the HfConfigExtractor RoPE fix (HF Llama is rotate_half = NeoX,
         // not adjacent-pairs Norm) the F32+eager reference matches 5/5 argmax
@@ -851,30 +793,22 @@ public sealed class RealHfSafetensorsEndToEndTests
             tolerances: DriftTolerances.Tight);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Phi35Mini_LogitsMatchPyTorchReference()
     {
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_PHI35_CHECKPOINT_PATH",
             conventional: "C:/temp/dotllm-phi35-mini");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Phi-3.5-mini checkpoint not found. Set DOTLLM_PHI35_CHECKPOINT_PATH "
-                + "or place the snapshot at C:/temp/dotllm-phi35-mini/");
-            return;
-        }
+        Skip.If(root is null,
+            "Phi-3.5-mini checkpoint not found. Set DOTLLM_PHI35_CHECKPOINT_PATH "
+            + "or place the snapshot at C:/temp/dotllm-phi35-mini/");
 
         string? referencePath = ResolveReferenceJsonPath("phi-3.5-mini-reference.json");
-        if (referencePath is null || !File.Exists(referencePath))
-        {
-            _output.WriteLine(
-                "[SKIP] PyTorch reference JSON not found. Generate via: "
-                + "python tests/scripts/compare_logits_py_reference.py "
-                + "--model-path \"C:/temp/dotllm-phi35-mini\" --prompt \"The capital of France is\" "
-                + "--output-path tests/DotLLM.Tests.Integration/Models/Loaders/references/phi-3.5-mini-reference.json");
-            return;
-        }
+        Skip.If(referencePath is null || !File.Exists(referencePath),
+            "PyTorch reference JSON not found. Generate via: "
+            + "python tests/scripts/compare_logits_py_reference.py "
+            + "--model-path \"C:/temp/dotllm-phi35-mini\" --prompt \"The capital of France is\" "
+            + "--output-path tests/DotLLM.Tests.Integration/Models/Loaders/references/phi-3.5-mini-reference.json");
 
         // Phi-3.5 matches HF 5/5 argmax with F32+eager reference. Compound
         // F32-vs-bf16 drift over 32 transformer blocks lands max_abs_diff at
@@ -924,32 +858,21 @@ public sealed class RealHfSafetensorsEndToEndTests
     /// argmax=5/5=1.0</c> — comfortably inside <see cref="DriftTolerances.Tight"/>.
     /// </para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void DeepSeekV2Lite_LogitsMatchPyTorchReference()
     {
-        string? root = ResolveCheckpointRoot(
-            envVar: "DOTLLM_DEEPSEEK_V2_LITE_CHECKPOINT_PATH",
-            conventional: "C:/temp/dotllm-deepseek-v2-lite");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] DeepSeek-V2-Lite checkpoint not found. Set "
-                + "DOTLLM_DEEPSEEK_V2_LITE_CHECKPOINT_PATH or place the snapshot at "
-                + "C:/temp/dotllm-deepseek-v2-lite/");
-            return;
-        }
+        FixtureLocation deepSeekFixture = KnownTestFixtures.DeepSeekV2LiteCheckpoint;
+        Skip.If(!deepSeekFixture.Found,
+            deepSeekFixture.SkipMessage(KnownTestFixtures.DeepSeekV2LiteDescription));
+        string root = deepSeekFixture.Path!;
 
         string? referencePath = ResolveReferenceJsonPath("deepseek-v2-lite-reference.json");
-        if (referencePath is null || !File.Exists(referencePath))
-        {
-            _output.WriteLine(
-                "[SKIP] PyTorch reference JSON not found. Generate via: "
-                + "python tests/scripts/compare_logits_py_reference.py "
-                + "--model-path \"C:/temp/dotllm-deepseek-v2-lite\" --prompt \"The capital of France is\" "
-                + "--output-path tests/DotLLM.Tests.Integration/Models/Loaders/references/deepseek-v2-lite-reference.json "
-                + "--dtype bfloat16  (Warning: 30 GB model, peak RSS ~32 GiB in bf16)");
-            return;
-        }
+        Skip.If(referencePath is null || !File.Exists(referencePath),
+            "PyTorch reference JSON not found. Generate via: "
+            + "python tests/scripts/compare_logits_py_reference.py "
+            + "--model-path \"C:/temp/dotllm-deepseek-v2-lite\" --prompt \"The capital of France is\" "
+            + "--output-path tests/DotLLM.Tests.Integration/Models/Loaders/references/deepseek-v2-lite-reference.json "
+            + "--dtype bfloat16  (Warning: 30 GB model, peak RSS ~32 GiB in bf16)");
 
         // DeepSeek-V2-Lite uses MLA — verifies Phase A (or Phase B/C if
         // Config.MlaConfig.UseLatentCache is toggled at load time) against
@@ -990,31 +913,20 @@ public sealed class RealHfSafetensorsEndToEndTests
     /// rather than silently relaxing, and flag as follow-up.
     /// </para>
     /// </remarks>
-    [Fact]
+    [SkippableFact]
     public void DeepSeekV2Lite_LongContext_LogitsMatchPyTorchReference()
     {
-        string? root = ResolveCheckpointRoot(
-            envVar: "DOTLLM_DEEPSEEK_V2_LITE_CHECKPOINT_PATH",
-            conventional: "C:/temp/dotllm-deepseek-v2-lite");
-        if (root is null)
-        {
-            _output.WriteLine(
-                "[SKIP] DeepSeek-V2-Lite checkpoint not found. Set "
-                + "DOTLLM_DEEPSEEK_V2_LITE_CHECKPOINT_PATH or place the snapshot at "
-                + "C:/temp/dotllm-deepseek-v2-lite/");
-            return;
-        }
+        FixtureLocation deepSeekFixture = KnownTestFixtures.DeepSeekV2LiteCheckpoint;
+        Skip.If(!deepSeekFixture.Found,
+            deepSeekFixture.SkipMessage(KnownTestFixtures.DeepSeekV2LiteDescription));
+        string root = deepSeekFixture.Path!;
 
         string? referencePath = ResolveReferenceJsonPath("deepseek-v2-lite-longctx-reference.json");
-        if (referencePath is null || !File.Exists(referencePath))
-        {
-            _output.WriteLine(
-                "[SKIP] Long-context PyTorch reference JSON not found "
-                + "(expected deepseek-v2-lite-longctx-reference.json). "
-                + "Generate a >=4500-token reference via compare_logits_py_reference.py "
-                + "with --trust-remote-code to activate YaRN ramped freqs.");
-            return;
-        }
+        Skip.If(referencePath is null || !File.Exists(referencePath),
+            "Long-context PyTorch reference JSON not found "
+            + "(expected deepseek-v2-lite-longctx-reference.json). "
+            + "Generate a >=4500-token reference via compare_logits_py_reference.py "
+            + "with --trust-remote-code to activate YaRN ramped freqs.");
 
         // Expect positions >4096 to exercise ramped inv_freq. If drift blows
         // up (argmax_match_rate < 0.8), treat as a secondary follow-up — do
@@ -1353,12 +1265,8 @@ public sealed class RealHfSafetensorsEndToEndTests
         Action<ModelConfig> assertConfig)
     {
         string? root = ResolveCheckpointRoot(envVar, conventional);
-        if (root is null)
-        {
-            _output.WriteLine(
-                $"[SKIP] {label} checkpoint not found. Set {envVar} or place the snapshot at {conventional}/");
-            return;
-        }
+        Skip.If(root is null,
+            $"{label} checkpoint not found. Set {envVar} or place the snapshot at {conventional}/");
 
         _output.WriteLine($"Root: {root}");
 

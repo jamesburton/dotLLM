@@ -99,7 +99,7 @@ shared on-disk cache:
 
 - **If a path inside the tree needs a model, symlink to the cache — never copy it in.**
 - Reference fixtures from tests via the existing `DOTLLM_*_GGUF` environment overrides
-  (see `.docs/corpora/QUANT_FIXTURES.md`), not by relative path into the working tree.
+  (see `docs/QUANT_FIXTURES.md`), not by relative path into the working tree.
 - **Why this matters, beyond tidiness:** a single GGUF is 0.1–50 GB; git keeps a committed
   blob forever *even after deletion*, so one mistake permanently bloats every clone. The
   cache also lets the OS page cache share **one** on-disk copy across every process and

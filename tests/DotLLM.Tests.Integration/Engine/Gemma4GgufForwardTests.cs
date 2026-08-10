@@ -1,14 +1,15 @@
-using System.Diagnostics;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
-using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Models;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Vulkan;
-using Xunit;
+using System.Diagnostics;
 using Xunit.Abstractions;
+using Xunit;
 
 namespace DotLLM.Tests.Integration.Engine;
 
@@ -32,19 +33,18 @@ namespace DotLLM.Tests.Integration.Engine;
 /// </remarks>
 public sealed class Gemma4GgufForwardTests
 {
-    private const string ModelPathEnvVar = "DOTLLM_GEMMA4_GGUF";
 
     private readonly ITestOutputHelper _output;
 
     public Gemma4GgufForwardTests(ITestOutputHelper output) => _output = output;
 
-    private static string? TryResolveModelPath()
-    {
-        string? path = Environment.GetEnvironmentVariable(ModelPathEnvVar);
-        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
-            return null;
-        return path;
-    }
+    /// <summary>
+    /// Gemma-4-26B fixture, resolved via <see cref="KnownTestFixtures.Gemma4_26B_A4B_Q4KM"/>:
+    /// <c>$DOTLLM_GEMMA4_GGUF</c>, then the dotLLM test cache, then the HF hub cache (#308).
+    /// </summary>
+    private static FixtureLocation Gemma4Fixture => KnownTestFixtures.Gemma4_26B_A4B_Q4KM;
+
+    private static string? TryResolveModelPath() => Gemma4Fixture.Path;
 
     /// <summary>
     /// Load the real Gemma-4-26B-A4B GGUF and run a SINGLE cacheless causal forward over
@@ -55,7 +55,7 @@ public sealed class Gemma4GgufForwardTests
     public unsafe void Gemma4_26B_SingleForward_PredictsSensibleNextToken()
     {
         string? path = TryResolveModelPath();
-        Skip.If(path is null, $"Set {ModelPathEnvVar} to a gemma4 GGUF (e.g. gemma-4-26B-A4B-it-UD-Q4_K_M.gguf) to run this validation.");
+        Skip.If(path is null, Gemma4Fixture.SkipMessage(KnownTestFixtures.Gemma4_26BDescription));
 
         var loadSw = Stopwatch.StartNew();
         var (model, gguf, config) = ModelLoader.LoadFromGguf(path!);
@@ -150,7 +150,7 @@ public sealed class Gemma4GgufForwardTests
     public unsafe void Gemma4_26B_Vulkan_QuantizedExperts_LoadsAndForwards()
     {
         string? path = TryResolveModelPath();
-        Skip.If(path is null, $"Set {ModelPathEnvVar} to a gemma4 GGUF to run this Vulkan validation.");
+        Skip.If(path is null, Gemma4Fixture.SkipMessage(KnownTestFixtures.Gemma4_26BDescription));
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader or physical device available on this host.");
         string spvDir = ResolveSpvDir();
 
@@ -210,7 +210,7 @@ public sealed class Gemma4GgufForwardTests
     public unsafe void Gemma4_26B_HybridLayerSwap_Bisect()
     {
         string? path = TryResolveModelPath();
-        Skip.If(path is null, $"Set {ModelPathEnvVar} to a gemma4 GGUF to run this validation.");
+        Skip.If(path is null, Gemma4Fixture.SkipMessage(KnownTestFixtures.Gemma4_26BDescription));
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader or physical device available on this host.");
         string spec = (Environment.GetEnvironmentVariable("DOTLLM_HYBRID_VK_LAYERS") ?? "none").Trim();
         string spvDir = ResolveSpvDir();

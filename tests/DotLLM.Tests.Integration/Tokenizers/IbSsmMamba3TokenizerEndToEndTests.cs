@@ -71,24 +71,17 @@ public sealed class IbSsmMamba3TokenizerEndToEndTests
         return null;
     }
 
-    [Fact]
+    [SkippableFact]
     public void Tokenizer_EncodesAsciiPrompt()
     {
         string? dir = ResolveCheckpointDir();
-        if (dir is null)
-        {
-            _output.WriteLine(
-                $"[SKIP] ib-ssm/mamba3-370M-10BT checkpoint not found. Set {CheckpointPathEnvVar} "
-                + $"to the safetensors file or its directory, or place it at {ConventionalDir}/{SafetensorsName}.");
-            return;
-        }
+        Skip.If(dir is null,
+            $"ib-ssm/mamba3-370M-10BT checkpoint not found. Set {CheckpointPathEnvVar} "
+            + $"to the safetensors file or its directory, or place it at {ConventionalDir}/{SafetensorsName}.");
 
         string tokenizerPath = Path.Combine(dir, TokenizerName);
-        if (!File.Exists(tokenizerPath))
-        {
-            _output.WriteLine($"[SKIP] {tokenizerPath} not present next to weights.");
-            return;
-        }
+        Skip.If(!File.Exists(tokenizerPath),
+            $"{tokenizerPath} not present next to weights.");
 
         _output.WriteLine($"Tokenizer: {tokenizerPath}  ({new FileInfo(tokenizerPath).Length:N0} bytes)");
 
@@ -121,24 +114,17 @@ public sealed class IbSsmMamba3TokenizerEndToEndTests
         Assert.Equal(nonAscii, naDecoded);
     }
 
-    [Fact]
+    [SkippableFact]
     public void MambaForward_OnTokenizedPrompt_ProducesValidArgmaxToken()
     {
         string? dir = ResolveCheckpointDir();
-        if (dir is null)
-        {
-            _output.WriteLine(
-                $"[SKIP] ib-ssm/mamba3-370M-10BT checkpoint not found. Set {CheckpointPathEnvVar} to enable.");
-            return;
-        }
+        Skip.If(dir is null,
+            $"ib-ssm/mamba3-370M-10BT checkpoint not found. Set {CheckpointPathEnvVar} to enable.");
 
         string tokenizerPath = Path.Combine(dir, TokenizerName);
         string weightsPath = Path.Combine(dir, SafetensorsName);
-        if (!File.Exists(tokenizerPath) || !File.Exists(weightsPath))
-        {
-            _output.WriteLine($"[SKIP] Required files missing under {dir}.");
-            return;
-        }
+        Skip.If(!File.Exists(tokenizerPath) || !File.Exists(weightsPath),
+            $"Required files missing under {dir}.");
 
         // 1. Tokenizer.
         var loadTokenizerWatch = Stopwatch.StartNew();
@@ -204,15 +190,12 @@ public sealed class IbSsmMamba3TokenizerEndToEndTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void LoadTokenizerFromHfDirectory_SucceedsAlongsideWeights()
     {
         string? dir = ResolveCheckpointDir();
-        if (dir is null)
-        {
-            _output.WriteLine($"[SKIP] {CheckpointPathEnvVar} not set / default path missing.");
-            return;
-        }
+        Skip.If(dir is null,
+            $"{CheckpointPathEnvVar} not set / default path missing.");
 
         ITokenizer? tok = ModelLoader.LoadTokenizerFromHfDirectory(dir);
         Assert.NotNull(tok);

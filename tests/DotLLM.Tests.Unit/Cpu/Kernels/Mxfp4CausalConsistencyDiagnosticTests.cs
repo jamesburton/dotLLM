@@ -44,15 +44,12 @@ public sealed class Mxfp4CausalConsistencyDiagnosticTests
         return File.Exists(path) ? path : null;
     }
 
-    [Fact]
+    [SkippableFact]
     public unsafe void Mxfp4Gemm_LogitsAtSharedPrefix_AreBatchSizeInvariant()
     {
         string? path = ResolveFixture();
-        if (path is null)
-        {
-            _output.WriteLine("[SKIP] Llama-3.2-1B-pure-MXFP4.gguf not found.");
-            return;
-        }
+        Skip.If(path is null,
+            "Llama-3.2-1B-pure-MXFP4.gguf not found.");
 
         using var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);

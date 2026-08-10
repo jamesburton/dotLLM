@@ -3,9 +3,10 @@ using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using System.Numerics.Tensors;
-using Xunit;
 using Xunit.Abstractions;
+using Xunit;
 
 namespace DotLLM.Tests.Integration.Models.Lora;
 
@@ -30,25 +31,23 @@ public sealed class HybridBitNetParityTests
 
     public HybridBitNetParityTests(ITestOutputHelper output) => _output = output;
 
-    private static string? ModelPath =>
-        Environment.GetEnvironmentVariable("DOTLLM_BITNET_GGUF");
+    /// <summary>
+    /// BitNet I2_S fixture, resolved via <see cref="KnownTestFixtures.BitNetI2S"/>:
+    /// <c>$DOTLLM_BITNET_GGUF</c>, then the dotLLM test cache, then the HF hub cache (#308).
+    /// </summary>
+    private static FixtureLocation BitNetFixture => KnownTestFixtures.BitNetI2S;
 
-    [Fact]
+    private static string? ModelPath => BitNetFixture.Path;
+
+    [SkippableFact]
     public unsafe void HybridAndCpu_BitNetBaseLogits_AreNumericallyConsistent()
     {
         // ── Guard 1: model file must be present ──────────────────────────────────
-        if (ModelPath is null || !File.Exists(ModelPath))
-        {
-            _output.WriteLine("SKIP: BitNet GGUF not available (set DOTLLM_BITNET_GGUF).");
-            return;
-        }
+        Skip.If(!BitNetFixture.Found, BitNetFixture.SkipMessage(KnownTestFixtures.BitNetI2SDescription));
 
         // ── Guard 2: CUDA device must be available ────────────────────────────────
-        if (!CudaDevice.IsAvailable())
-        {
-            _output.WriteLine("SKIP: No CUDA device available.");
-            return;
-        }
+        Skip.If(!CudaDevice.IsAvailable(),
+            "No CUDA device available.");
 
         // ── Setup ─────────────────────────────────────────────────────────────────
         using var gguf = GgufFile.Open(ModelPath!);
