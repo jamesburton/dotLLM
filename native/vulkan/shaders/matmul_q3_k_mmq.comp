@@ -90,19 +90,25 @@ int unpackQ3Scale(uint scalesBase, uint sub) {
     } else {
         lowNibble = (readByte(scalesBase + (sub - 8u)) >> 4u) & 0xFu;
     }
-    uint hiByte  = 8u + (sub >> 2u);
-    uint hiShift = (sub & 3u) << 1u;
+    uint hiByte  = 8u + (sub & 3u);
+    uint hiShift = (sub >> 2u) << 1u;
     uint hiBits  = (readByte(scalesBase + hiByte) >> hiShift) & 0x3u;
     uint scale6  = lowNibble | (hiBits << 4u);
     return int(scale6) - 32;
 }
 
 // 4 signed (signed3 = ((hBit<<2)|q2) − 4) bytes for dp4a.
-uint packQ3(uint qsw, uint hm16, uint qBit0, uint hBit0) {
+//
+// llama.cpp Q3_K element ordering: a 16-element sub-block occupies 16
+// CONSECUTIVE qs bytes (base 32*(sub/8) + 16*(sub%2)) at the FIXED bit-pair
+// `qShift = ((sub/2)%4)*2`, and 16 consecutive hmask bytes (base 16*(sub%2)) at
+// the FIXED bit `hBitIdx = sub/2`. 4 consecutive elements = one funnelled word
+// from each plane, one field per byte lane.
+uint packQ3(uint qsw, uint hmw, uint qShift, uint hBitIdx) {
     uint res = 0u;
     for (uint e = 0u; e < 4u; e++) {
-        uint q2 = (qsw  >> (qBit0 + e * 2u)) & 3u;
-        uint hb = (hm16 >> (hBit0 + e))      & 1u;
+        uint q2 = (qsw >> (e * 8u + qShift))  & 3u;
+        uint hb = (hmw >> (e * 8u + hBitIdx)) & 1u;
         int s3 = int((hb << 2u) | q2) - 4;
         res |= (uint(s3) & 0xFFu) << (e * 8u);
     }
@@ -138,9 +144,11 @@ void main() {
                 uint packed = 0u;
                 if (mGlobal < pc.M) {
                     uint blockByteBase = mGlobal * rowByteStride + kSB * SB_BYTES;
-                    uint qsw  = read4Bytes(blockByteBase + 32u + sub * 4u);
-                    uint hm16 = read4Bytes(blockByteBase + sub * 2u) & 0xFFFFu;
-                    packed = packQ3(qsw, hm16, p * 8u, p * 4u);
+                    uint qsSubBase = blockByteBase + 32u + 32u * (sub >> 3u) + 16u * (sub & 1u);
+                    uint hmSubBase = blockByteBase +       16u * (sub & 1u);
+                    packed = packQ3(read4Bytes(qsSubBase + p * 4u),
+                                    read4Bytes(hmSubBase + p * 4u),
+                                    ((sub >> 1u) & 3u) << 1u, sub >> 1u);
                 }
                 sharedWq[rLocal * CHUNK_STRIDE + uL] = packed;
             }
