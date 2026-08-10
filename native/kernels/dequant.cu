@@ -62,10 +62,14 @@ extern "C" __global__ void __launch_bounds__(256) dequant_q4_0_f16(
         float d = __half2float(*reinterpret_cast<const half*>(block));
         const uint8_t* qs = block + 2;
 
-        // Elements interleave: out[2j]=lo(qs[j]), out[2j+1]=hi(qs[j])
-        int byte_idx = lane / 2;
-        uint8_t packed = qs[byte_idx];
-        int val = (lane & 1) ? ((int)(packed >> 4) - 8) : ((int)(packed & 0x0F) - 8);
+        // GGUF Q4_0 packs the block as two halves, NOT interleaved pairs:
+        //   element j       = low  nibble of qs[j]   (j = 0..15)
+        //   element j + 16  = high nibble of qs[j]
+        // (Matches ggml's dequantize_row_q4_0 and the Q5_0/Q5_1 kernels below.)
+        int j = lane < 16 ? lane : lane - 16;
+        uint8_t packed = qs[j];
+        int nibble = (lane < 16) ? (packed & 0x0F) : (packed >> 4);
+        int val = nibble - 8;
 
         dst[(size_t)block_idx * Q4_0_BLOCK_SIZE + lane] = __float2half(d * (float)val);
     }
@@ -130,9 +134,11 @@ extern "C" __global__ void __launch_bounds__(256) dequant_q4_1_f16(
         float m = __half2float(*reinterpret_cast<const half*>(block + 2));
         const uint8_t* qs = block + 4;
 
-        int byte_idx = lane / 2;
-        uint8_t packed = qs[byte_idx];
-        int val = (lane & 1) ? (int)(packed >> 4) : (int)(packed & 0x0F);
+        // Same two-halves nibble order as Q4_0: element j = low nibble of qs[j],
+        // element j + 16 = high nibble of qs[j].
+        int j = lane < 16 ? lane : lane - 16;
+        uint8_t packed = qs[j];
+        int val = (lane < 16) ? (int)(packed & 0x0F) : (int)(packed >> 4);
 
         dst[(size_t)block_idx * Q4_1_BLOCK_SIZE + lane] = __float2half(d * (float)val + m);
     }

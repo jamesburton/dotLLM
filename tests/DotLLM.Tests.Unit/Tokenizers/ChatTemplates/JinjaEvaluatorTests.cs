@@ -557,4 +557,115 @@ public class JinjaEvaluatorTests
         var result = Eval("before{# ignored #}after");
         Assert.Equal("beforeafter", result);
     }
+
+    // ── Macros (#273) ──
+    // JinjaParser previously threw an unhandled exception on any {% macro %} block (real-world
+    // Qwen3-family templates define one, e.g. render_content) which crashed ServerStartup.LoadModel
+    // before the model finished loading. These verify actual macro *execution* — parameter binding,
+    // defaults, call-site expansion, and closures over outer scope — not just "doesn't throw".
+
+    [Fact]
+    public void Macro_DefineAndCall_NoParams()
+    {
+        Assert.Equal("hello", Eval("{% macro greet() %}hello{% endmacro %}{{ greet() }}"));
+    }
+
+    [Fact]
+    public void Macro_PositionalParam_BindsAtCallSite()
+    {
+        Assert.Equal("[Hi]", Eval("{% macro wrap(x) %}[{{ x }}]{% endmacro %}{{ wrap('Hi') }}"));
+    }
+
+    [Fact]
+    public void Macro_CalledMultipleTimes_EachCallIndependent()
+    {
+        var result = Eval("{% macro wrap(x) %}<{{ x }}>{% endmacro %}{{ wrap('a') }}{{ wrap('b') }}{{ wrap('c') }}");
+        Assert.Equal("<a><b><c>", result);
+    }
+
+    [Fact]
+    public void Macro_MissingArg_WithDefault_UsesDefault()
+    {
+        var result = Eval(
+            "{% macro render(content, is_system=false) %}{{ is_system }}:{{ content }}{% endmacro %}{{ render('hi') }}");
+        Assert.Equal("False:hi", result);
+    }
+
+    [Fact]
+    public void Macro_ExplicitArg_OverridesDefault()
+    {
+        var result = Eval(
+            "{% macro render(content, is_system=false) %}{{ is_system }}:{{ content }}{% endmacro %}{{ render('hi', true) }}");
+        Assert.Equal("True:hi", result);
+    }
+
+    [Fact]
+    public void Macro_KeywordArg_BindsByName()
+    {
+        var result = Eval(
+            "{% macro render(content, is_system=false) %}{{ is_system }}:{{ content }}{% endmacro %}" +
+            "{{ render(content='hi', is_system=true) }}");
+        Assert.Equal("True:hi", result);
+    }
+
+    [Fact]
+    public void Macro_MissingArg_NoDefault_IsUndefined()
+    {
+        // Undefined stringifies to "" exactly like an unset top-level variable (VariableLookup_Undefined_EmptyString).
+        Assert.Equal("[]", Eval("{% macro wrap(x) %}[{{ x }}]{% endmacro %}{{ wrap() }}"));
+    }
+
+    [Fact]
+    public void Macro_BodyWithControlFlow()
+    {
+        // Mirrors the shape of Qwen3-family render_content: dispatches on the type of its argument.
+        var result = Eval(
+            "{% macro render(content) %}" +
+            "{%- if content is string %}{{ content }}" +
+            "{%- elif content is iterable and content is not mapping %}{% for item in content %}{{ item }}{% endfor %}" +
+            "{%- else %}?{%- endif %}" +
+            "{% endmacro %}" +
+            "[{{ render('plain') }}][{{ render(parts) }}]",
+            new Dictionary<string, object?>(StringComparer.Ordinal)
+            {
+                ["parts"] = new List<object?> { "a", "b", "c" },
+            });
+        Assert.Equal("[plain][abc]", result);
+    }
+
+    [Fact]
+    public void Macro_ClosesOverOuterNamespace_MutationPersistsAcrossCalls()
+    {
+        // Real pattern from Qwen3-family templates: a namespace() counter declared at template
+        // top level, incremented from inside a macro body on every call — the mutation must be
+        // visible to the caller after the macro returns (namespace is a shared mutable object,
+        // not copied into the macro's local scope).
+        var result = Eval(
+            "{%- set counter = namespace(value=0) %}" +
+            "{%- macro bump() %}{%- set counter.value = counter.value + 1 %}{{ counter.value }}{%- endmacro %}" +
+            "{{ bump() }}-{{ bump() }}-{{ bump() }}-{{ counter.value }}");
+        Assert.Equal("1-2-3-3", result);
+    }
+
+    [Fact]
+    public void Macro_CallsAnotherMacro_NestedRendering()
+    {
+        var result = Eval(
+            "{% macro inner(x) %}({{ x }}){% endmacro %}" +
+            "{% macro outer(x) %}[{{ inner(x) }}]{% endmacro %}" +
+            "{{ outer('z') }}");
+        Assert.Equal("[(z)]", result);
+    }
+
+    [Fact]
+    public void Macro_UsedInsideForLoop()
+    {
+        var result = Eval(
+            "{% macro tag(x) %}<{{ x }}>{% endmacro %}{% for item in items %}{{ tag(item) }}{% endfor %}",
+            new Dictionary<string, object?>(StringComparer.Ordinal)
+            {
+                ["items"] = new List<object?> { "a", "b" },
+            });
+        Assert.Equal("<a><b>", result);
+    }
 }

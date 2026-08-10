@@ -63,6 +63,11 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     private readonly ComputeThreadPool? _threadPool;
     private readonly bool _ownsThreadPool;
 
+    // Multi-Token Prediction (MTP / "NextN") head — issue #253. Null for every GGUF without a
+    // nextn.* tensor group, which is the overwhelming majority: every other field and code path
+    // in this class is completely unaffected by MTP being absent.
+    private readonly MtpHeadWeights? _mtpHead;
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -71,6 +76,9 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
     /// <summary>Number of full-attention layers — the matching sparse KV-cache slot count.</summary>
     public int AttentionLayerCount => _attentionLayerCount;
+
+    /// <inheritdoc/>
+    public bool SupportsMtp => _mtpHead is not null;
 
     private Qwen3HybridDenseTransformerModel(
         ModelConfig config,
@@ -81,12 +89,14 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim,
         int[] kvSlotForLayer, int attentionLayerCount,
         float[] ropeCosTable, float[] ropeSinTable, int ropeDim,
-        ComputeThreadPool? threadPool, bool ownsPool)
+        ComputeThreadPool? threadPool, bool ownsPool,
+        MtpHeadWeights? mtpHead = null)
     {
         Config = config;
         _gguf = gguf;
         _layers = layers;
         _outputNormWeight = outputNormWeight;
+        _mtpHead = mtpHead;
         _tokenEmbedWeight = tokenEmbedWeight;
         _tokenEmbedQuantType = tokenEmbedQuantType;
         _outputWeight = outputWeight;
@@ -213,13 +223,19 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
         ComputeThreadPool? pool = CreatePool(threading);
 
+        // MTP (issue #253): load the trailing NextN head when the GGUF carries one. Zero behavior
+        // change for every other checkpoint — LoadMtpHeadIfPresent returns null unless
+        // config.NextnPredictLayers > 0 AND the nextn.* tensors are actually present.
+        MtpHeadWeights? mtpHead = LoadMtpHeadIfPresent(dataBase, tensors, config);
+
         return new Qwen3HybridDenseTransformerModel(
             config, gguf, layers, outputNormWeight,
             embPtr, embDesc.QuantizationType,
             outputPtr, outputQt, outputM, outputK,
             kvSlotForLayer, attentionLayerCount,
             ropeCos, ropeSin, ropeDim,
-            pool, ownsPool: pool is not null);
+            pool, ownsPool: pool is not null,
+            mtpHead);
     }
 
     private static ComputeThreadPool? CreatePool(ThreadingConfig threading)
@@ -237,6 +253,299 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         }
 
         return new ComputeThreadPool(effectiveThreads, topology: null, threading);
+    }
+
+    /// <summary>
+    /// Loads ONLY the CPU-resident tail <c>[startLayer, fullConfig.NumLayers)</c> of a
+    /// Qwen3HybridDense model — the CPU half of a CPU/GPU partial-offload split (issue #291).
+    /// Pairs with a GPU-side head instance
+    /// (<c>DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel.LoadHeadFromGguf</c>)
+    /// covering layers <c>[0, startLayer)</c>; the composition model D2H-transfers the GPU head's
+    /// boundary hidden state and feeds it into this tail via <see cref="ForwardFromHiddenState"/>.
+    /// </summary>
+    /// <remarks>
+    /// Reuses <see cref="LoadLayer"/> — the SAME per-layer tensor-name resolution the full
+    /// CPU-only <see cref="LoadFromGguf(GgufFile, ModelConfig, ThreadingConfig)"/> path already
+    /// gets right for this architecture's GDN-vs-full-attention naming split. Before this method
+    /// existed, the generic (architecture-unaware) <c>DotLLM.Cuda.HybridTransformerModel</c>
+    /// partial-offload splitter was the only CPU/GPU-split path, and it always called the
+    /// Llama-style <c>TransformerWeights.LoadFromGguf</c> — which assumes every layer has a
+    /// uniform <c>attn_output.weight</c>, throwing <c>KeyNotFoundException</c> the moment it hit a
+    /// GDN layer (no attention output projection at all). This is issue #291's actual root cause:
+    /// the splitter was never taught this architecture's per-layer-kind naming, not a subtly wrong
+    /// boundary calculation.
+    /// </remarks>
+    /// <param name="gguf">Opened GGUF file (must remain alive for the model's lifetime).</param>
+    /// <param name="fullConfig">
+    /// The FULL model's configuration (<c>NumLayers</c> = the whole trunk, <c>HybridLayout</c>
+    /// covering every layer). <see cref="LoadLayer"/> needs the untouched global layout to resolve
+    /// <c>blk.{startLayer + i}</c>'s tensor names/kind correctly — this tail's OWN
+    /// <see cref="Config"/> is a re-sliced view scoped to just <c>[startLayer, NumLayers)</c>.
+    /// </param>
+    /// <param name="startLayer">
+    /// First GLOBAL layer index this tail owns (the GPU head owns <c>[0, startLayer)</c>). Must be
+    /// in <c>(0, fullConfig.NumLayers)</c>.
+    /// </param>
+    /// <param name="threading">CPU threading configuration for this tail's layers.</param>
+    internal static Qwen3HybridDenseTransformerModel LoadTailFromGguf(
+        GgufFile gguf, ModelConfig fullConfig, int startLayer, ThreadingConfig threading)
+    {
+        ArgumentNullException.ThrowIfNull(gguf);
+        ArgumentNullException.ThrowIfNull(fullConfig);
+        if (fullConfig.Architecture != Architecture.Qwen3HybridDense)
+            throw new ArgumentException(
+                $"Qwen3HybridDenseTransformerModel requires Architecture.Qwen3HybridDense, got {fullConfig.Architecture}.",
+                nameof(fullConfig));
+        if (fullConfig.HybridLayout is null)
+            throw new ArgumentException("Qwen3HybridDense config must have HybridLayout populated.", nameof(fullConfig));
+        if (fullConfig.GdnConfig is null)
+            throw new ArgumentException("Qwen3HybridDense config must have GdnConfig populated.", nameof(fullConfig));
+        if (startLayer <= 0 || startLayer >= fullConfig.NumLayers)
+            throw new ArgumentOutOfRangeException(nameof(startLayer),
+                $"startLayer must be between 1 and {fullConfig.NumLayers - 1} for a GPU/CPU split.");
+
+        nint dataBase = gguf.DataBasePointer;
+        var tensors = gguf.TensorsByName;
+        int tailCount = fullConfig.NumLayers - startLayer;
+
+        // Sliced layout/config: LOCAL layer index i (0..tailCount-1) here corresponds to GLOBAL
+        // layer (startLayer + i). Weight loading below still passes the UNSLICED fullConfig plus
+        // the GLOBAL index to LoadLayer (tensor-name/kind resolution needs the real blk.N index
+        // against the full layout); this sliced config only drives the tail's own local
+        // bookkeeping (KV slots, GDN ordinals, Config.NumLayers, RoPE/GDN-cache sizing).
+        var tailLayout = new HybridLayerLayout
+        {
+            LayerKind = fullConfig.HybridLayout.LayerKind[startLayer..],
+            HeadCountKv = fullConfig.HybridLayout.HeadCountKv[startLayer..],
+            FeedForwardLength = fullConfig.HybridLayout.FeedForwardLength[startLayer..],
+        };
+        // MTP is not yet supported through the partial-offload split (out of scope for #291) —
+        // force NextnPredictLayers=0 so this slice never tries (and fails) to resolve an MTP
+        // block at the wrong raw index.
+        var tailConfig = fullConfig with { NumLayers = tailCount, HybridLayout = tailLayout, NextnPredictLayers = 0 };
+
+        var embDesc = tensors["token_embd.weight"];
+        nint embPtr = dataBase + (nint)embDesc.DataOffset;
+
+        var outNormDesc = tensors["output_norm.weight"];
+        float[] outputNormWeight = DequantizeF32(dataBase, outNormDesc, fullConfig.HiddenSize);
+
+        nint outputPtr;
+        QuantizationType outputQt;
+        int outputM, outputK;
+        if (tensors.TryGetValue("output.weight", out var outDesc))
+        {
+            outputPtr = dataBase + (nint)outDesc.DataOffset;
+            outputQt = outDesc.QuantizationType;
+            outputK = outDesc.Shape[0];
+            outputM = outDesc.Shape[1];
+        }
+        else
+        {
+            outputPtr = embPtr;
+            outputQt = embDesc.QuantizationType;
+            outputK = embDesc.Shape[0];
+            outputM = embDesc.Shape[1];
+        }
+
+        int ropeDim = fullConfig.RoPEConfig?.DimensionCount ?? fullConfig.HeadDim;
+        if ((ropeDim & 1) != 0)
+            throw new InvalidDataException(
+                $"Qwen3HybridDense rope_dim={ropeDim} must be even for pair-wise rotation.");
+        if (ropeDim > fullConfig.HeadDim)
+            throw new InvalidDataException(
+                $"Qwen3HybridDense rope_dim={ropeDim} exceeds head_dim={fullConfig.HeadDim}.");
+
+        var layers = new Qwen3HybridDenseLayerWeights[tailCount];
+        var kvSlotForLayer = new int[tailCount];
+        int attentionLayerCount = 0;
+        for (int i = 0; i < tailCount; i++)
+        {
+            // Global raw GGUF block index (startLayer + i) against the UNSLICED fullConfig —
+            // LoadLayer indexes fullConfig.HybridLayout.LayerKind[layerIdx] directly, which only
+            // lines up with the real blk.N tensor names when layerIdx is the global index.
+            layers[i] = LoadLayer(startLayer + i, dataBase, tensors, fullConfig);
+            kvSlotForLayer[i] = tailLayout.LayerKind[i] == HybridLayerKind.Attention
+                ? attentionLayerCount++
+                : -1;
+        }
+
+        float ropeTheta = fullConfig.RoPEConfig?.Theta ?? 10000.0f;
+        int halfRope = ropeDim / 2;
+        var ropeCos = new float[fullConfig.MaxSequenceLength * halfRope];
+        var ropeSin = new float[fullConfig.MaxSequenceLength * halfRope];
+        RoPE.PrecomputeFrequencyTable(fullConfig.MaxSequenceLength, ropeDim, ropeTheta, ropeCos, ropeSin);
+
+        ComputeThreadPool? pool = CreatePool(threading);
+
+        return new Qwen3HybridDenseTransformerModel(
+            tailConfig, gguf, layers, outputNormWeight,
+            embPtr, embDesc.QuantizationType,
+            outputPtr, outputQt, outputM, outputK,
+            kvSlotForLayer, attentionLayerCount,
+            ropeCos, ropeSin, ropeDim,
+            pool, ownsPool: pool is not null,
+            mtpHead: null);
+    }
+
+    /// <summary>
+    /// Runs this model's layer loop + final norm + lm_head starting from a CALLER-SUPPLIED
+    /// initial hidden state instead of an embedding lookup — the CPU-tail half of a CPU/GPU
+    /// partial-offload split (issue #291): <paramref name="initialHidden"/> is the GPU head's
+    /// boundary hidden state (D2H-transferred by the composition model), continuing exactly where
+    /// the GPU's layer prefix left off.
+    /// </summary>
+    /// <remarks>
+    /// SYNC WARNING: mirrors <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?, IMtpState?)"/>
+    /// byte-for-byte except for the embedding step (no <c>EmbedTokens</c> call — the caller
+    /// supplies the starting hidden state directly) and the omitted MTP-capture hook (MTP is not
+    /// yet supported through the partial-offload split). Any future fix to the layer loop /
+    /// GDN-vs-attention dispatch / final norm / lm-head in that method must be mirrored here.
+    /// </remarks>
+    /// <param name="initialHidden">
+    /// Row-major <c>[seqLen, hiddenSize]</c> F32 hidden state to resume from, in place of
+    /// embedding <paramref name="positions"/>.Length tokens. <c>seqLen</c> is inferred from
+    /// <c>initialHidden.Length / Config.HiddenSize</c> and must exactly match
+    /// <paramref name="positions"/>.Length.
+    /// </param>
+    /// <param name="positions">Position indices for each row of <paramref name="initialHidden"/>.</param>
+    /// <param name="deviceId">Target device for the returned logits tensor (CPU: -1).</param>
+    /// <param name="kvCache">Optional KV-cache for this tail's attention layers. Null runs uncached.</param>
+    /// <param name="gdnState">
+    /// Optional caller-supplied GDN state container. Null falls back to this model's own
+    /// model-owned default state (see <see cref="ResetSequenceState"/>).
+    /// </param>
+    internal ITensor ForwardFromHiddenState(ReadOnlySpan<float> initialHidden, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, IGdnState? gdnState)
+    {
+        int hiddenSize = Config.HiddenSize;
+        int seqLen = positions.Length;
+        if (seqLen == 0)
+            throw new ArgumentException("positions must be non-empty.", nameof(positions));
+        if (initialHidden.Length != seqLen * hiddenSize)
+            throw new ArgumentException(
+                $"initialHidden.Length ({initialHidden.Length}) must equal positions.Length * Config.HiddenSize " +
+                $"({seqLen} * {hiddenSize} = {seqLen * hiddenSize}).", nameof(initialHidden));
+
+        GdnStateCache gdnCache;
+        if (gdnState is null)
+        {
+            gdnCache = _gdnCache;
+        }
+        else if (gdnState is GdnStateCache typed)
+        {
+            if (typed.NumGdnLayers != _gdnCache.NumGdnLayers)
+                throw new ArgumentException(
+                    $"GdnState NumGdnLayers ({typed.NumGdnLayers}) does not match model GDN-layer count ({_gdnCache.NumGdnLayers}).",
+                    nameof(gdnState));
+            gdnCache = typed;
+        }
+        else
+        {
+            throw new ArgumentException(
+                $"Qwen3HybridDenseTransformerModel requires a CPU GdnStateCache; got {gdnState.GetType().Name}.",
+                nameof(gdnState));
+        }
+
+        int vocabSize = Config.VocabSize;
+        int intermediateSize = Config.IntermediateSize;
+        int numHeads = Config.NumAttentionHeads;
+        int numKvHeads = Config.NumKvHeads;
+        int headDim = Config.HeadDim;
+        float eps = Config.NormEpsilon;
+        int maxSeq = Config.MaxSequenceLength;
+
+        for (int i = 0; i < positions.Length; i++)
+        {
+            if ((uint)positions[i] >= (uint)maxSeq)
+                throw new ArgumentOutOfRangeException(nameof(positions),
+                    $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
+        }
+
+        _state.EnsureCapacity(seqLen);
+        _threadPool?.SetDispatchMode(seqLen == 1 ? DispatchMode.SpinWait : DispatchMode.EventBased);
+
+        float* hidden = (float*)_state.HiddenState;
+        float* residual = (float*)_state.Residual;
+        float* normOut = (float*)_state.NormOutput;
+        float* logits = (float*)_state.Logits;
+        float* qAttn = (float*)_state.QScratch;
+        float* kAttn = (float*)_state.KScratch;
+        float* vAttn = (float*)_state.VScratch;
+        float* attnOut = (float*)_state.AttnOutput;
+
+        initialHidden.CopyTo(new Span<float>(hidden, seqLen * hiddenSize));
+
+        var kinds = _layout.LayerKind;
+        for (int layer = 0; layer < _layers.Length; layer++)
+        {
+            var lw = _layers[layer];
+            // ── Token-mixing sub-layer ─────────────────────────────────────────
+            new Span<float>(hidden, seqLen * hiddenSize)
+                .CopyTo(new Span<float>(residual, seqLen * hiddenSize));
+            for (int t = 0; t < seqLen; t++)
+            {
+                RmsNorm.Execute(
+                    new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
+                    lw.AttnNormWeight, eps,
+                    new Span<float>(normOut + t * hiddenSize, hiddenSize));
+            }
+
+            if (kinds[layer] == HybridLayerKind.GatedDeltaNet)
+                ForwardGdnBody(lw.Gdn!, layer, seqLen, hiddenSize, normOut, eps, gdnCache);
+            else
+                ForwardFullAttnBody(lw.FullAttn!, layer, seqLen, positions,
+                    normOut, qAttn, kAttn, vAttn, attnOut,
+                    numHeads, numKvHeads, headDim, kvCache);
+            // First residual add: hidden = residual + normOut (token-mixing output).
+            for (int t = 0; t < seqLen; t++)
+            {
+                Add.Execute(
+                    new ReadOnlySpan<float>(residual + t * hiddenSize, hiddenSize),
+                    new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
+                    new Span<float>(hidden + t * hiddenSize, hiddenSize));
+            }
+            // ── Dense SwiGLU FFN sub-layer ──────────────────────────────────────
+            new Span<float>(hidden, seqLen * hiddenSize)
+                .CopyTo(new Span<float>(residual, seqLen * hiddenSize));
+            for (int t = 0; t < seqLen; t++)
+            {
+                RmsNorm.Execute(
+                    new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
+                    lw.PostAttnNormWeight, eps,
+                    new Span<float>(normOut + t * hiddenSize, hiddenSize));
+            }
+
+            ForwardDenseFfnBody(lw, seqLen, hiddenSize, intermediateSize, normOut);
+
+            // Second residual add.
+            for (int t = 0; t < seqLen; t++)
+            {
+                Add.Execute(
+                    new ReadOnlySpan<float>(residual + t * hiddenSize, hiddenSize),
+                    new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
+                    new Span<float>(hidden + t * hiddenSize, hiddenSize));
+            }
+        }
+
+        // Final output norm + logit projection.
+        for (int t = 0; t < seqLen; t++)
+        {
+            RmsNorm.Execute(
+                new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
+                _outputNormWeight, eps,
+                new Span<float>(hidden + t * hiddenSize, hiddenSize));
+        }
+
+        Gemm(_outputWeight, _outputQuantType, hidden, logits,
+             _outputOutputDim, _outputInputDim, seqLen);
+
+        var shape = new TensorShape(seqLen, vocabSize);
+        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
+        new Span<float>(logits, seqLen * vocabSize).CopyTo(
+            new Span<float>((void*)result.DataPointer, seqLen * vocabSize));
+
+        return result;
     }
 
     /// <summary>
@@ -487,6 +796,126 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         };
     }
 
+    /// <summary>
+    /// Loads the trailing Multi-Token Prediction (MTP / "NextN") head when the GGUF has one
+    /// (issue #253), or returns <see langword="null"/> for a checkpoint without MTP — the
+    /// overwhelming majority of GGUFs, completely unaffected by this method.
+    /// </summary>
+    /// <remarks>
+    /// Tensor naming and layout confirmed against llama.cpp PR ggml-org/llama.cpp#22673
+    /// (<c>src/models/qwen35.cpp</c>'s <c>load_block_mtp</c>): the MTP block sits at raw GGUF
+    /// block index <c>config.NumLayers</c> (trunk layers occupy <c>[0, NumLayers)</c>, since
+    /// <c>GgufModelConfigExtractor</c> already subtracted <c>nextn_predict_layers</c>
+    /// back out of the raw <c>block_count</c> — see <see cref="ModelConfig.NextnPredictLayers"/>).
+    /// It is structurally a full-attention decoder layer (same tensors <see cref="LoadLayer"/>
+    /// would load for an <see cref="HybridLayerKind.Attention"/> block), plus four "nextn.*"
+    /// tensors. Only <c>nextn_predict_layers == 1</c> is supported, matching llama.cpp's own
+    /// <c>GGML_ASSERT(hparams.nextn_predict_layers == 1)</c> for the QWEN35 family today.
+    /// </remarks>
+    private static MtpHeadWeights? LoadMtpHeadIfPresent(
+        nint dataBase,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
+        ModelConfig config)
+    {
+        if (config.NextnPredictLayers <= 0)
+            return null;
+
+        if (config.NextnPredictLayers != 1)
+            throw new NotSupportedException(
+                $"Qwen3HybridDense MTP only supports a single trailing MTP block " +
+                $"(nextn_predict_layers=1); got {config.NextnPredictLayers}. Matches llama.cpp's own " +
+                "current QWEN35 MTP assertion (issue #253 scope: Qwen3.6, not a future multi-head variant).");
+
+        int mtpBlk = config.NumLayers; // trunk occupies [0, NumLayers); MTP is appended right after
+        string prefix = $"blk.{mtpBlk}";
+
+        // The hparam can be set without the tensors actually being present (e.g. a trunk-only
+        // GGUF someone hand-edited the metadata on) — treat that as "no MTP head", not an error,
+        // to keep the zero-behavior-change guarantee unconditional.
+        if (!tensors.ContainsKey($"{prefix}.nextn.eh_proj.weight"))
+            return null;
+
+        int hiddenSize = config.HiddenSize;
+
+        // The MTP block's own attn+ffn tensors use the exact same naming/shapes as any other
+        // full-attention Qwen3HybridDense layer — reuse the trunk loaders directly.
+        var attn = LoadFullAttnLayer(prefix, dataBase, tensors, config, config.NumKvHeads);
+        var attnNorm = DequantizeF32(dataBase, tensors[$"{prefix}.attn_norm.weight"], hiddenSize);
+        var postAttnNorm = DequantizeF32(dataBase, tensors[$"{prefix}.post_attention_norm.weight"], hiddenSize);
+
+        var gateDesc = tensors[$"{prefix}.ffn_gate.weight"];
+        var upDesc = tensors[$"{prefix}.ffn_up.weight"];
+        var downDesc = tensors[$"{prefix}.ffn_down.weight"];
+
+        var layer = new Qwen3HybridDenseLayerWeights
+        {
+            AttnNormWeight = attnNorm,
+            PostAttnNormWeight = postAttnNorm,
+            FullAttn = attn,
+            Gdn = null,
+
+            GateWeight = dataBase + (nint)gateDesc.DataOffset,
+            GateQuantType = gateDesc.QuantizationType,
+            GateInputDim = gateDesc.Shape[0],
+            GateOutputDim = gateDesc.Shape[1],
+
+            UpWeight = dataBase + (nint)upDesc.DataOffset,
+            UpQuantType = upDesc.QuantizationType,
+            UpInputDim = upDesc.Shape[0],
+            UpOutputDim = upDesc.Shape[1],
+
+            DownWeight = dataBase + (nint)downDesc.DataOffset,
+            DownQuantType = downDesc.QuantizationType,
+            DownInputDim = downDesc.Shape[0],
+            DownOutputDim = downDesc.Shape[1],
+        };
+
+        var ehProjDesc = tensors[$"{prefix}.nextn.eh_proj.weight"];
+        float[] enorm = DequantizeF32(dataBase, tensors[$"{prefix}.nextn.enorm.weight"], hiddenSize);
+        float[] hnorm = DequantizeF32(dataBase, tensors[$"{prefix}.nextn.hnorm.weight"], hiddenSize);
+
+        nint? embedTokensPtr = null;
+        QuantizationType embedTokensQt = default;
+        if (tensors.TryGetValue($"{prefix}.nextn.embed_tokens.weight", out var embedDesc))
+        {
+            embedTokensPtr = dataBase + (nint)embedDesc.DataOffset;
+            embedTokensQt = embedDesc.QuantizationType;
+        }
+
+        nint? sharedHeadPtr = null;
+        QuantizationType sharedHeadQt = default;
+        if (tensors.TryGetValue($"{prefix}.nextn.shared_head_head.weight", out var sharedHeadDesc))
+        {
+            sharedHeadPtr = dataBase + (nint)sharedHeadDesc.DataOffset;
+            sharedHeadQt = sharedHeadDesc.QuantizationType;
+        }
+
+        float[]? sharedHeadNorm = tensors.TryGetValue($"{prefix}.nextn.shared_head_norm.weight", out var shnDesc)
+            ? DequantizeF32(dataBase, shnDesc, hiddenSize)
+            : null;
+
+        return new MtpHeadWeights
+        {
+            Layer = layer,
+
+            EhProjWeight = dataBase + (nint)ehProjDesc.DataOffset,
+            EhProjQuantType = ehProjDesc.QuantizationType,
+            EhProjInputDim = ehProjDesc.Shape[0],
+            EhProjOutputDim = ehProjDesc.Shape[1],
+
+            EnormWeight = enorm,
+            HnormWeight = hnorm,
+
+            EmbedTokensWeight = embedTokensPtr,
+            EmbedTokensQuantType = embedTokensQt,
+
+            SharedHeadHeadWeight = sharedHeadPtr,
+            SharedHeadHeadQuantType = sharedHeadQt,
+
+            SharedHeadNormWeight = sharedHeadNorm,
+        };
+    }
+
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
         => Forward(tokenIds, positions, deviceId, kvCache: null, gdnState: null);
@@ -507,6 +936,18 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                            int deviceId, IKvCache? kvCache, ILoraAdapter? adapter)
         => Forward(tokenIds, positions, deviceId, kvCache, gdnState: null);
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// MTP (issue #253): when <paramref name="mtpState"/> is a <see cref="CpuMtpState"/>, this
+    /// call additionally captures the pre-final-norm hidden state for every position in
+    /// <paramref name="tokenIds"/> into it — see the capture point inside the core
+    /// <c>Forward(..., IGdnState?, IMtpState?)</c> overload. The returned logits are byte-identical
+    /// to calling without <paramref name="mtpState"/>.
+    /// </remarks>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ILoraAdapter? adapter, IMtpState? mtpState)
+        => Forward(tokenIds, positions, deviceId, kvCache, gdnState: null, mtpState);
+
     /// <summary>
     /// Runs a forward pass with optional KV-cache (for the GQA layers) and optional
     /// per-sequence GDN recurrent state (for the GDN layers). When
@@ -524,8 +965,14 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     /// Optional per-seq GDN recurrent state container. Must be a
     /// <see cref="GdnStateCache"/> sized for this model's GDN-layer count.
     /// </param>
+    /// <param name="mtpState">
+    /// Optional MTP state (issue #253). When a <see cref="CpuMtpState"/>, this call additionally
+    /// captures the pre-final-norm hidden state for every position into it as a side effect — see
+    /// the capture point right before the final RMSNorm below. Ignored (and safe to pass null) for
+    /// callers that don't use MTP self-speculative decoding.
+    /// </param>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
-                           int deviceId, IKvCache? kvCache, IGdnState? gdnState)
+                           int deviceId, IKvCache? kvCache, IGdnState? gdnState, IMtpState? mtpState = null)
     {
         // Resolve the GDN state: caller-supplied container preferred, model-owned
         // fallback for the single-seq Forward callers that pre-date the per-seq API.
@@ -654,6 +1101,13 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 TensorDump.Dump2D($"blk.{layer}.l_out", hidden, seqLen, hiddenSize);
         }
 
+        // MTP (issue #253): capture the pre-final-norm hidden state for every position, one row
+        // per input token, BEFORE the final RMSNorm below overwrites `hidden` in place. This is
+        // the exact quantity llama.cpp's MTP head consumes (`h_pre_norm` / `llama_get_embeddings_pre_norm`)
+        // — a pure side effect that never changes the logits this call returns.
+        if (mtpState is CpuMtpState mtpCapture)
+            mtpCapture.SetCapturedRows(new ReadOnlySpan<float>(hidden, seqLen * hiddenSize), seqLen);
+
         // Final output norm + logit projection.
         for (int t = 0; t < seqLen; t++)
         {
@@ -680,6 +1134,14 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Re-zeroes the model-owned Gated-DeltaNet cache used by every forward that does not carry a
+    /// caller-supplied <see cref="IGdnState"/>. Callers that treat each forward as an independent
+    /// sequence (perplexity windows) must call this between sequences — see issue #261.
+    /// </remarks>
+    public void ResetSequenceState() => _gdnCache.Reset();
+
+    /// <inheritdoc/>
     public bool RequiresPerSequenceState => true;
 
     /// <inheritdoc/>
@@ -688,8 +1150,74 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     public IRecurrentSequenceState? CreateSequenceState() => new GdnStateCache(_gdn, _gdnCache.NumGdnLayers);
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Issue #287: this is the model that motivated <see cref="IModel.SupportsRecurrentStateCheckpoint"/> —
+    /// speculative decoding's batched verify forward mutates <see cref="_gdnCache"/> for every
+    /// drafted token before accept/reject is known, and <see cref="GdnStateCache"/> has no
+    /// position addressing to undo a rejected token's contribution the way <see cref="IKvCache"/>
+    /// rollback does.
+    /// </remarks>
+    public bool SupportsRecurrentStateCheckpoint => true;
+
+    /// <inheritdoc/>
+    public object? CheckpointRecurrentState() => _gdnCache.Clone();
+
+    /// <inheritdoc/>
+    public void RestoreRecurrentState(object? checkpoint)
+    {
+        if (checkpoint is null) return;
+        if (checkpoint is not GdnStateCache snapshot)
+            throw new ArgumentException(
+                $"{GetType().Name}.RestoreRecurrentState expects a GdnStateCache checkpoint; got {checkpoint.GetType().Name}.",
+                nameof(checkpoint));
+        snapshot.CopyTo(_gdnCache);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Sized for the MTP head's own attention (<see cref="Config"/>'s standard head count/dim —
+    /// the MTP block is a normal full-attention layer, see <see cref="MtpHeadWeights"/>), with a
+    /// KV-cache deep enough for <see cref="MtpDefaultMaxDraftSteps"/> autoregressive draft steps.
+    /// </remarks>
+    public IMtpState? CreateMtpState()
+    {
+        if (_mtpHead is null)
+            return null;
+
+        return new CpuMtpState(
+            hiddenSize: Config.HiddenSize,
+            numKvHeads: _mtpHead.Layer.FullAttn!.NumKvHeads,
+            headDim: Config.HeadDim,
+            maxSteps: MtpDefaultMaxDraftSteps);
+    }
+
     /// <summary>
-    /// Per-sequence loop over <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?)"/>
+    /// Default MTP KV-cache depth when a caller doesn't need a specific candidate count K up
+    /// front. Callers that know K in advance (e.g. an MTP self-speculative decoder, see issue
+    /// #253) can size their own <see cref="CpuMtpState"/> directly instead of going through
+    /// <see cref="CreateMtpState"/>.
+    /// </summary>
+    public const int MtpDefaultMaxDraftSteps = 16;
+
+    /// <inheritdoc/>
+    public ITensor ForwardMtp(IMtpState state, int tokenId, int position)
+    {
+        if (_mtpHead is null)
+            throw new NotSupportedException(
+                $"{nameof(Qwen3HybridDenseTransformerModel)} has no MTP head loaded (SupportsMtp=false).");
+        if (state is not CpuMtpState mtp)
+            throw new ArgumentException(
+                $"Qwen3HybridDenseTransformerModel requires a CPU CpuMtpState; got {state.GetType().Name}.",
+                nameof(state));
+        if ((uint)tokenId >= (uint)Config.VocabSize)
+            throw new ArgumentOutOfRangeException(nameof(tokenId));
+
+        return ForwardMtpCore(_mtpHead, mtp, tokenId, position);
+    }
+
+    /// <summary>
+    /// Per-sequence loop over <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?, IMtpState?)"/>
     /// — threads each request's GDN state through to the GDN scan, so multi-seq batched
     /// dispatch is safe as long as every request supplies a fresh <see cref="GdnStateCache"/>.
     /// </summary>
@@ -1120,6 +1648,249 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         }
     }
 
+    /// <summary>Single-token embedding lookup against an arbitrary embedding table — used by
+    /// <see cref="ForwardMtpCore"/> to embed from either <c>nextn.embed_tokens</c> (when present)
+    /// or the trunk's own <c>token_embd.weight</c> (fallback), mirroring <see cref="EmbedTokens"/>'s
+    /// per-quant-type dispatch for a single row.</summary>
+    private static void EmbedOneToken(int tokenId, nint embPtr, QuantizationType qt, Span<float> dest, int hiddenSize)
+    {
+        if (qt == QuantizationType.F32)
+        {
+            new ReadOnlySpan<float>((float*)embPtr + (long)tokenId * hiddenSize, hiddenSize).CopyTo(dest);
+        }
+        else if (qt == QuantizationType.F16)
+        {
+            TensorPrimitives.ConvertToSingle(
+                new ReadOnlySpan<Half>((Half*)embPtr + (long)tokenId * hiddenSize, hiddenSize), dest);
+        }
+        else
+        {
+            long rowBytes = Dequantize.RowByteSize(hiddenSize, qt);
+            Dequantize.ToFloat32(embPtr + (nint)((long)tokenId * rowBytes), hiddenSize, qt, dest);
+        }
+    }
+
+    /// <summary>
+    /// Runs one MTP head autoregressive draft step (issue #253) — see <see cref="ForwardMtp"/>.
+    /// Off the trunk's hot forward path (single token, called K≤~16 times per speculation round),
+    /// so this uses <see cref="ArrayPool{T}"/> scratch rather than the trunk's dedicated
+    /// <see cref="Qwen3HybridDenseForwardState"/> scratch arena — simplicity over micro-optimising
+    /// a call that runs orders of magnitude less often than the main per-layer forward loop.
+    /// </summary>
+    /// <remarks>
+    /// Operation order confirmed against llama.cpp PR ggml-org/llama.cpp#22673
+    /// (<c>src/models/qwen35.cpp</c>'s <c>graph_mtp</c> constructor):
+    /// <list type="number">
+    ///   <item><c>h_norm = RMSNorm(pendingHidden, nextn.hnorm)</c>; <c>e_norm = RMSNorm(embed(tokenId), nextn.enorm)</c>.</item>
+    ///   <item><c>cur = eh_proj @ concat(e_norm, h_norm)</c> — this becomes the attention sub-block's residual (<c>inpSA</c>).</item>
+    ///   <item>Gated full attention over the MTP head's own KV-cache (identical math to
+    ///         <see cref="ForwardFullAttnBody"/>, but seqQ=1 against the head's private cache rather
+    ///         than the trunk's), residual-added back onto <c>inpSA</c>.</item>
+    ///   <item>Dense SwiGLU FFN, residual-added — the result is the MTP block's own output hidden
+    ///         state ("h_pre_norm"), which seeds <em>this state's next</em> <see cref="ForwardMtp"/> call.</item>
+    ///   <item><c>shared_head_norm</c> (or the trunk's <c>output_norm</c> fallback) then
+    ///         <c>shared_head_head</c> (or the trunk's own LM head fallback) → logits.</item>
+    /// </list>
+    /// </remarks>
+    private ITensor ForwardMtpCore(MtpHeadWeights mtpHead, CpuMtpState state, int tokenId, int position)
+    {
+        int hiddenSize = Config.HiddenSize;
+        int vocabSize = Config.VocabSize;
+        var attn = mtpHead.Layer.FullAttn!;
+        int numHeads = Config.NumAttentionHeads;
+        int numKvHeads = attn.NumKvHeads;
+        int headDim = Config.HeadDim;
+        int qElems = numHeads * headDim;
+        int kvStride = numKvHeads * headDim;
+        int intermediateSize = mtpHead.Layer.GateOutputDim;
+        float eps = Config.NormEpsilon;
+
+        int step = state.CurrentLength;
+        if (step >= state.MaxSteps)
+            throw new InvalidOperationException(
+                $"CpuMtpState KV-cache exhausted ({state.MaxSteps} steps advanced). Size the state for " +
+                "at least numCandidates MTP draft steps per speculation round.");
+
+        var pool = ArrayPool<float>.Shared;
+        float[] tokEmbedArr = pool.Rent(hiddenSize);
+        float[] eNormArr = pool.Rent(hiddenSize);
+        float[] hNormArr = pool.Rent(hiddenSize);
+        float[] concatArr = pool.Rent(2 * hiddenSize);
+        float[] curArr = pool.Rent(hiddenSize);
+        float[] residualArr = pool.Rent(hiddenSize);
+        float[] normedArr = pool.Rent(hiddenSize);
+        float[] qgArr = pool.Rent(2 * qElems);
+        float[] qArr = pool.Rent(qElems);
+        float[] gateArr = pool.Rent(qElems);
+        float[] kArr = pool.Rent(kvStride);
+        float[] vArr = pool.Rent(kvStride);
+        float[] attnOutArr = pool.Rent(qElems);
+        float[] ffnGateArr = pool.Rent(intermediateSize);
+        float[] ffnUpArr = pool.Rent(intermediateSize);
+        float[] siluArr = pool.Rent(intermediateSize);
+        float[] normedHeadArr = pool.Rent(hiddenSize);
+        float[] logitsArr = pool.Rent(vocabSize);
+
+        try
+        {
+            var tokEmbed = tokEmbedArr.AsSpan(0, hiddenSize);
+            var eNorm = eNormArr.AsSpan(0, hiddenSize);
+            var hNorm = hNormArr.AsSpan(0, hiddenSize);
+            var concat = concatArr.AsSpan(0, 2 * hiddenSize);
+            var cur = curArr.AsSpan(0, hiddenSize);
+            var residual = residualArr.AsSpan(0, hiddenSize);
+            var normed = normedArr.AsSpan(0, hiddenSize);
+            var qg = qgArr.AsSpan(0, 2 * qElems);
+            var q = qArr.AsSpan(0, qElems);
+            var gate = gateArr.AsSpan(0, qElems);
+            var k = kArr.AsSpan(0, kvStride);
+            var v = vArr.AsSpan(0, kvStride);
+            var attnOut = attnOutArr.AsSpan(0, qElems);
+            var ffnGate = ffnGateArr.AsSpan(0, intermediateSize);
+            var ffnUp = ffnUpArr.AsSpan(0, intermediateSize);
+            var silu = siluArr.AsSpan(0, intermediateSize);
+            var normedHead = normedHeadArr.AsSpan(0, hiddenSize);
+            var logits = logitsArr.AsSpan(0, vocabSize);
+
+            // ── Embed predicted-from token, combine with pending trunk/MTP hidden state ──
+            EmbedOneToken(tokenId,
+                mtpHead.EmbedTokensWeight ?? _tokenEmbedWeight,
+                mtpHead.EmbedTokensWeight is not null ? mtpHead.EmbedTokensQuantType : _tokenEmbedQuantType,
+                tokEmbed, hiddenSize);
+
+            RmsNorm.Execute(tokEmbed, mtpHead.EnormWeight, eps, eNorm);
+            RmsNorm.Execute(state.PendingHidden, mtpHead.HnormWeight, eps, hNorm);
+
+            eNorm.CopyTo(concat);
+            hNorm.CopyTo(concat.Slice(hiddenSize));
+
+            fixed (float* concatPtr = concat, curPtr = cur)
+                Gemm(mtpHead.EhProjWeight, mtpHead.EhProjQuantType, concatPtr, curPtr,
+                     mtpHead.EhProjOutputDim, mtpHead.EhProjInputDim, 1);
+
+            // inpSA: the attention sub-block's residual is the eh_proj output, not the raw input.
+            cur.CopyTo(residual);
+
+            // ── Attention sub-block — same gated-QKV math as ForwardFullAttnBody, seqQ=1 ──
+            RmsNorm.Execute(cur, mtpHead.Layer.AttnNormWeight, eps, normed);
+
+            fixed (float* normedPtr = normed, qgPtr = qg)
+                Gemm(attn.QWeight, attn.QQuantType, normedPtr, qgPtr, attn.QOutputDim, attn.QInputDim, 1);
+
+            for (int h = 0; h < numHeads; h++)
+            {
+                int qgOff = h * 2 * headDim;
+                int hOff = h * headDim;
+                qg.Slice(qgOff, headDim).CopyTo(q.Slice(hOff));
+                qg.Slice(qgOff + headDim, headDim).CopyTo(gate.Slice(hOff));
+            }
+
+            fixed (float* normedPtr = normed, kPtr = k, vPtr = v)
+            {
+                Gemm(attn.KWeight, attn.KQuantType, normedPtr, kPtr, attn.KOutputDim, attn.KInputDim, 1);
+                Gemm(attn.VWeight, attn.VQuantType, normedPtr, vPtr, attn.VOutputDim, attn.VInputDim, 1);
+            }
+
+            Mamba3QkNorm.Execute(q, attn.QNormWeight, eps, 1, numHeads, headDim);
+            Mamba3QkNorm.Execute(k, attn.KNormWeight, eps, 1, numKvHeads, headDim);
+
+            Span<int> posSpan = stackalloc int[1];
+            posSpan[0] = position;
+            RoPE.Execute(q, k, posSpan, numHeads, numKvHeads, headDim, _ropeDim,
+                _ropeCosTable, _ropeSinTable, RoPEType.NeoX);
+
+            // Append this step's K/V into the MTP head's own tiny cache and attend causally over
+            // everything drafted so far in this round (NOT the trunk's KV-cache).
+            k.CopyTo(state.GetKeyRow(step));
+            v.CopyTo(state.GetValueRow(step));
+
+            int seqKv = step + 1;
+            Attention.Execute(
+                q,
+                new ReadOnlySpan<float>(state.KeyCachePtr, seqKv * kvStride),
+                new ReadOnlySpan<float>(state.ValueCachePtr, seqKv * kvStride),
+                attnOut,
+                /* seqQ */ 1, seqKv, numHeads, numKvHeads, headDim,
+                /* positionOffset */ step,
+                /* slidingWindowSize */ (int?)null);
+
+            // sigmoid(gate) applied to attention output before O-proj (Qwen3.5/3.6 gated attention).
+            for (int i = 0; i < qElems; i++)
+                attnOut[i] *= 1f / (1f + MathF.Exp(-gate[i]));
+
+            fixed (float* attnOutPtr = attnOut, curPtr = cur)
+                Gemm(attn.OWeight, attn.OQuantType, attnOutPtr, curPtr, attn.OOutputDim, attn.OInputDim, 1);
+
+            Add.Execute(residual, cur, cur); // cur = inpSA + attn_out_projected
+
+            // ── Dense SwiGLU FFN sub-layer ──
+            cur.CopyTo(residual); // ffn_residual
+            RmsNorm.Execute(cur, mtpHead.Layer.PostAttnNormWeight, eps, normed);
+
+            fixed (float* normedPtr = normed, ffnGatePtr = ffnGate, ffnUpPtr = ffnUp)
+            {
+                Gemm(mtpHead.Layer.GateWeight, mtpHead.Layer.GateQuantType, normedPtr, ffnGatePtr,
+                     mtpHead.Layer.GateOutputDim, mtpHead.Layer.GateInputDim, 1);
+                Gemm(mtpHead.Layer.UpWeight, mtpHead.Layer.UpQuantType, normedPtr, ffnUpPtr,
+                     mtpHead.Layer.UpOutputDim, mtpHead.Layer.UpInputDim, 1);
+            }
+
+            FusedOps.SwiGLU(ffnGate, ffnUp, silu);
+
+            fixed (float* siluPtr = silu, curPtr = cur)
+                Gemm(mtpHead.Layer.DownWeight, mtpHead.Layer.DownQuantType, siluPtr, curPtr,
+                     mtpHead.Layer.DownOutputDim, mtpHead.Layer.DownInputDim, 1);
+
+            Add.Execute(residual, cur, cur); // cur = ffn_residual + ffn_out
+
+            // `cur` is now the MTP block's own output hidden state ("h_pre_norm" in llama.cpp) —
+            // seed the NEXT ForwardMtp call's pending hidden with it before the head-norm below
+            // consumes it, then advance the MTP KV-cache length.
+            cur.CopyTo(state.PendingHiddenMutable);
+            state.Advance();
+
+            // ── Shared LM head (falls back to the trunk's output_norm/output.weight when the
+            //    GGUF didn't ship head-local nextn.shared_head_* tensors) ──
+            float[] headNormWeight = mtpHead.SharedHeadNormWeight ?? _outputNormWeight;
+            RmsNorm.Execute(cur, headNormWeight, eps, normedHead);
+
+            nint headWeight = mtpHead.SharedHeadHeadWeight ?? _outputWeight;
+            QuantizationType headQt = mtpHead.SharedHeadHeadWeight is not null
+                ? mtpHead.SharedHeadHeadQuantType : _outputQuantType;
+            int headOutputDim = mtpHead.SharedHeadHeadWeight is not null ? vocabSize : _outputOutputDim;
+            int headInputDim = mtpHead.SharedHeadHeadWeight is not null ? hiddenSize : _outputInputDim;
+
+            fixed (float* normedHeadPtr = normedHead, logitsPtr = logits)
+                Gemm(headWeight, headQt, normedHeadPtr, logitsPtr, headOutputDim, headInputDim, 1);
+
+            var shape = new TensorShape(1, vocabSize);
+            var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+            logits.CopyTo(new Span<float>((void*)result.DataPointer, vocabSize));
+            return result;
+        }
+        finally
+        {
+            pool.Return(tokEmbedArr);
+            pool.Return(eNormArr);
+            pool.Return(hNormArr);
+            pool.Return(concatArr);
+            pool.Return(curArr);
+            pool.Return(residualArr);
+            pool.Return(normedArr);
+            pool.Return(qgArr);
+            pool.Return(qArr);
+            pool.Return(gateArr);
+            pool.Return(kArr);
+            pool.Return(vArr);
+            pool.Return(attnOutArr);
+            pool.Return(ffnGateArr);
+            pool.Return(ffnUpArr);
+            pool.Return(siluArr);
+            pool.Return(normedHeadArr);
+            pool.Return(logitsArr);
+        }
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void Gemm(nint weights, QuantizationType qt, float* b, float* c, int m, int k, int n,
                       byte* preQuantizedInput = null)
@@ -1159,32 +1930,10 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);
                 return;
             default:
-                GemmDequantFallback(weights, qt, b, c, m, k, n);
+                // Shared dequantize-and-dot fallback (#263): decodes each weight row once and
+                // reuses it across all n columns instead of re-decoding the matrix per token.
+                MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, pool: null);
                 return;
-        }
-    }
-
-    private static void GemmDequantFallback(nint weights, QuantizationType qt, float* b, float* c,
-                                            int m, int k, int n)
-    {
-        long rowBytes = Dequantize.RowByteSize(k, qt);
-        float[] rowBuf = ArrayPool<float>.Shared.Rent(k);
-        try
-        {
-            var rowSpan = rowBuf.AsSpan(0, k);
-            for (int t = 0; t < n; t++)
-            {
-                var xSpan = new ReadOnlySpan<float>(b + t * k, k);
-                for (int i = 0; i < m; i++)
-                {
-                    Dequantize.ToFloat32(weights + i * (nint)rowBytes, k, qt, rowSpan);
-                    c[t * m + i] = TensorPrimitives.Dot(new ReadOnlySpan<float>(rowBuf, 0, k), xSpan);
-                }
-            }
-        }
-        finally
-        {
-            ArrayPool<float>.Shared.Return(rowBuf);
         }
     }
 

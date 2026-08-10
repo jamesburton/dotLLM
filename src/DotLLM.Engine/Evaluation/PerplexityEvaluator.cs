@@ -120,6 +120,9 @@ public static class PerplexityEvaluator
         var accumulator = new NllAccumulator();
         for (int prefix = 1; prefix < length; prefix++)
         {
+            // Each prefix is scored as its own sequence from position 0, so any recurrent state the
+            // previous prefix left in the model must go — see IPerplexityModel.ResetState (#261).
+            model.ResetState();
             using ITensor logits = model.Forward(tokens[..prefix], positions.AsSpan(0, prefix));
             var row = new ReadOnlySpan<float>((void*)logits.DataPointer, vocab);
             accumulator.Add(-LogProb.OfTarget(row, tokens[prefix]));
@@ -189,6 +192,9 @@ public static class PerplexityEvaluator
                 window = windowBuffer;
             }
 
+            // Every window is an independent sequence (positions restart at 0), so the previous
+            // window's recurrent state must not carry into this one — see #261.
+            model.ResetState();
             using ITensor logits = model.Forward(window, positions);
             windows++;
 
@@ -227,6 +233,9 @@ public static class PerplexityEvaluator
 
         var accumulator = new NllAccumulator();
 
+        // One window, but the model may still be carrying recurrent state from an earlier caller
+        // (notably BackendPerplexityModel.Probe's throwaway forward) — see #261.
+        model.ResetState();
         using ITensor logits = model.Forward(tokens[..length], positions);
         int vocab = model.VocabSize;
         // Row i predicts token i+1, so the final row has no target within the window.

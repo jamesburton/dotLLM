@@ -35,6 +35,7 @@ namespace DotLLM.Models.Architectures;
 /// </remarks>
 public sealed unsafe class GdnStateCache : IGdnState
 {
+    private readonly GatedDeltaNetConfig _gdn;
     private readonly int _numGdnLayers;
     private readonly int _convStateElements;
     private readonly int _gdnStateElements;
@@ -75,6 +76,7 @@ public sealed unsafe class GdnStateCache : IGdnState
     {
         if (numGdnLayers < 0) throw new ArgumentOutOfRangeException(nameof(numGdnLayers));
 
+        _gdn = gdn;
         _numGdnLayers = numGdnLayers;
         _convStateElements = gdn.ConvStateElements; // (DConv-1) * NKHead * DState
         _gdnStateElements = gdn.StateElements;      // NVHead * DState * DState
@@ -141,6 +143,49 @@ public sealed unsafe class GdnStateCache : IGdnState
     /// <summary>Total bytes allocated across both state buffers.</summary>
     public long AllocatedBytes =>
         (long)_numGdnLayers * (_convStateElements + _gdnStateElements) * sizeof(float);
+
+    /// <summary>
+    /// Deep-copies this cache's current contents into a freshly-allocated
+    /// <see cref="GdnStateCache"/> of the same shape — a checkpoint speculative decoding can
+    /// later restore via <see cref="CopyTo"/> (issue #287: rejected draft tokens' recurrent-state
+    /// contribution has no rollback today; this is the primitive the fix is built on).
+    /// </summary>
+    public GdnStateCache Clone()
+    {
+        ThrowIfDisposed();
+        var clone = new GdnStateCache(_gdn, _numGdnLayers);
+        CopyTo(clone);
+        return clone;
+    }
+
+    /// <summary>
+    /// Overwrites <paramref name="destination"/>'s buffers with this cache's current contents.
+    /// Both caches must share the same layer count / per-layer element counts (true for any pair
+    /// obtained from the same model instance's <see cref="Qwen3HybridDenseTransformerModel.CreateSequenceState"/>
+    /// or <see cref="Clone"/>).
+    /// </summary>
+    public void CopyTo(GdnStateCache destination)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(destination);
+        destination.ThrowIfDisposed();
+        if (destination._numGdnLayers != _numGdnLayers
+            || destination._convStateElements != _convStateElements
+            || destination._gdnStateElements != _gdnStateElements)
+        {
+            throw new ArgumentException(
+                "Destination GdnStateCache shape does not match this cache's shape.", nameof(destination));
+        }
+
+        if (_numGdnLayers == 0) return;
+
+        long convBytes = (long)_numGdnLayers * _convStateElements * sizeof(float);
+        long stateBytes = (long)_numGdnLayers * _gdnStateElements * sizeof(float);
+        if (convBytes > 0)
+            Buffer.MemoryCopy((void*)_convState, (void*)destination._convState, convBytes, convBytes);
+        if (stateBytes > 0)
+            Buffer.MemoryCopy((void*)_gdnState, (void*)destination._gdnState, stateBytes, stateBytes);
+    }
 
     /// <inheritdoc/>
     public void Dispose()

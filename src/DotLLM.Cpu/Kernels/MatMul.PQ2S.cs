@@ -263,9 +263,14 @@ public static unsafe partial class MatMul
 
     /// <summary>
     /// Unpacks one PQ2_0-packed weight row (K codes, K a multiple of 128) into float
-    /// {-scale,0,+scale}, per-group. Same bit convention as I2_S's <c>UnpackRow</c> (byte at
-    /// <c>gp</c> holds elements {gp, +32, +64, +96} at bit offsets {6,4,2,0}), but each 34-byte
-    /// group carries its own leading Half scale rather than sharing one per-tensor tail scale.
+    /// {-scale,0,+scale,+2*scale}, per-group. NOT the same bit convention as I2_S's
+    /// <c>UnpackRow</c> — verified against PrismML's own reference <c>dequantize_row_q2_0</c>
+    /// (<c>PrismML-Eng/llama.cpp</c>, <c>ggml-quants.c</c>): byte at index <c>b</c> holds the 4
+    /// CONSECUTIVE elements {4b, 4b+1, 4b+2, 4b+3} at ASCENDING bit offsets {0,2,4,6}. An earlier
+    /// version of this function wrongly copied I2_S's strided {gp,+32,+64,+96}/descending-bits
+    /// scheme (issue #269 follow-up, 2026-08-05) — see <see cref="Dequantize.DequantizePQ2_0"/>
+    /// for the full root-cause writeup. Each 34-byte group carries its own leading Half scale
+    /// rather than sharing one per-tensor tail scale.
     /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -279,13 +284,14 @@ public static unsafe partial class MatMul
             byte* codes = groupBase + 2;
             int outBase = g * PQ2_0GroupSize;
 
-            for (int gp = 0; gp < 32; gp++)
+            for (int b = 0; b < 32; b++)
             {
-                byte packed = codes[gp];
-                dest[outBase + gp] = (((packed >> 6) & 0x3) - 1) * scale;
-                dest[outBase + gp + 32] = (((packed >> 4) & 0x3) - 1) * scale;
-                dest[outBase + gp + 64] = (((packed >> 2) & 0x3) - 1) * scale;
-                dest[outBase + gp + 96] = ((packed & 0x3) - 1) * scale;
+                byte packed = codes[b];
+                int outIdx = outBase + 4 * b;
+                dest[outIdx] = ((packed & 0x3) - 1) * scale;
+                dest[outIdx + 1] = (((packed >> 2) & 0x3) - 1) * scale;
+                dest[outIdx + 2] = (((packed >> 4) & 0x3) - 1) * scale;
+                dest[outIdx + 3] = (((packed >> 6) & 0x3) - 1) * scale;
             }
         }
     }
@@ -544,14 +550,18 @@ public static unsafe partial class MatMul
 
     /// <summary>
     /// Unpacks one PQ2_0-packed weight row (K codes, K a multiple of 128) into int8 ternary
-    /// {-1,0,+1} laid out contiguously (each 32-element slice aligns with a Q8_0 block), plus
-    /// the row's per-128-element group scales into <paramref name="groupScales"/> (length
-    /// <c>k/128</c>). Same bit layout as I2_S's <c>UnpackRowI8</c> (byte at <c>gp</c> holds
-    /// elements {gp, +32, +64, +96} at bit offsets {6,4,2,0}), reusing its AVX2 field-extraction
-    /// helpers (<c>UnpackI2SField6/4/2/0</c>) — PQ2_0's 128-element group and I2_S's 128-element
-    /// block are byte-for-byte identical in the codes region (<see cref="PQ2_0GroupSize"/> ==
-    /// I2_S's block size), the only difference being the leading 2-byte Half scale read here per
-    /// group instead of once per tensor tail.
+    /// {-1,0,+1,+2} in true logical element order, plus the row's per-128-element group scales
+    /// into <paramref name="groupScales"/> (length <c>k/128</c>). NOT the same bit layout as
+    /// I2_S's <c>UnpackRowI8</c> — verified against PrismML's own reference
+    /// <c>dequantize_row_q2_0</c> (<c>PrismML-Eng/llama.cpp</c>, <c>ggml-quants.c</c>): byte at
+    /// index <c>b</c> holds the 4 CONSECUTIVE elements {4b,4b+1,4b+2,4b+3} at ASCENDING bit
+    /// offsets {0,2,4,6}. An earlier version of this function wrongly assumed I2_S's strided
+    /// {gp,+32,+64,+96}/descending-bits layout (issue #269 follow-up, 2026-08-05) — see
+    /// <see cref="Dequantize.DequantizePQ2_0"/> for the full root-cause writeup. Still reuses
+    /// I2_S's AVX2 per-bit-field extraction helpers (each gives 32 contiguous byte-order-aligned
+    /// values for one bit position across the group) but interleaves their four outputs back into
+    /// true consecutive element order afterward, since the fields no longer land on contiguous
+    /// output slices the way I2_S's own strided convention does.
     /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -561,6 +571,11 @@ public static unsafe partial class MatMul
 
         if (Avx2.IsSupported)
         {
+            sbyte* field0 = stackalloc sbyte[32]; // element 4b   (bit offset 0)
+            sbyte* field2 = stackalloc sbyte[32]; // element 4b+1 (bit offset 2)
+            sbyte* field4 = stackalloc sbyte[32]; // element 4b+2 (bit offset 4)
+            sbyte* field6 = stackalloc sbyte[32]; // element 4b+3 (bit offset 6)
+
             for (int g = 0; g < groups; g++)
             {
                 byte* groupBase = rowPtr + g * PQ2_0GroupBytes;
@@ -575,12 +590,19 @@ public static unsafe partial class MatMul
                 Vector256<short> w0 = Avx2.ConvertToVector256Int16(packed.GetLower());
                 Vector256<short> w1 = Avx2.ConvertToVector256Int16(packed.GetUpper());
 
-                // gp, gp+32, gp+64, gp+96 ← bit offsets 6, 4, 2, 0 (see I2_S's UnpackRowI8 doc
-                // comment for why the shift counts are literal per-callsite constants).
-                UnpackI2SField6(w0, w1, outp);
-                UnpackI2SField4(w0, w1, outp + 32);
-                UnpackI2SField2(w0, w1, outp + 64);
-                UnpackI2SField0(w0, w1, outp + 96);
+                UnpackI2SField0(w0, w1, field0);
+                UnpackI2SField2(w0, w1, field2);
+                UnpackI2SField4(w0, w1, field4);
+                UnpackI2SField6(w0, w1, field6);
+
+                for (int b = 0; b < 32; b++)
+                {
+                    int outIdx = 4 * b;
+                    outp[outIdx] = field0[b];
+                    outp[outIdx + 1] = field2[b];
+                    outp[outIdx + 2] = field4[b];
+                    outp[outIdx + 3] = field6[b];
+                }
             }
             return;
         }
@@ -591,13 +613,14 @@ public static unsafe partial class MatMul
             groupScales[g] = (float)Unsafe.ReadUnaligned<Half>(groupBase);
             byte* bp = groupBase + 2;
             int outBase = g * PQ2_0GroupSize;
-            for (int gp = 0; gp < 32; gp++)
+            for (int b = 0; b < 32; b++)
             {
-                byte packed = bp[gp];
-                dest[outBase + gp] = (sbyte)(((packed >> 6) & 0x3) - 1);
-                dest[outBase + gp + 32] = (sbyte)(((packed >> 4) & 0x3) - 1);
-                dest[outBase + gp + 64] = (sbyte)(((packed >> 2) & 0x3) - 1);
-                dest[outBase + gp + 96] = (sbyte)((packed & 0x3) - 1);
+                byte packed = bp[b];
+                int outIdx = outBase + 4 * b;
+                dest[outIdx] = (sbyte)((packed & 0x3) - 1);
+                dest[outIdx + 1] = (sbyte)(((packed >> 2) & 0x3) - 1);
+                dest[outIdx + 2] = (sbyte)(((packed >> 4) & 0x3) - 1);
+                dest[outIdx + 3] = (sbyte)(((packed >> 6) & 0x3) - 1);
             }
         }
     }

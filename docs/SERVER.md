@@ -34,14 +34,21 @@ Primary chat endpoint. Accepts OpenAI-compatible request format.
   "dry_allowed_length": 2,
   "dry_penalty_last_n": 0,
   "dry_sequence_breakers": ["\n", ":", "\"", "*"],
-  "n": 1,
-  "lora_adapter": "customer-support"
+  "n": 1
 }
 ```
 
 Also accepted (not shown above): `top_k`, `min_p`, `repetition_penalty` — see [SAMPLING.md](SAMPLING.md)
 for the full parameter reference, including the DRY/top-nσ/logit-bias/frequency/presence-penalty
 processors these fields drive. `POST /v1/completions` accepts the same sampling parameter set.
+
+> **Adapter selection**: there is no `lora_adapter` request field (it is not part of the OpenAI
+> surface either, and the server ignores unknown fields silently). LoRA serving is roadmap step 47
+> and is not implemented: the engine has the `IAdapterManager` abstraction and
+> `InferenceRequest.AdapterId`, but there is no implementation, no adapter admin endpoint, and no
+> way to select an adapter per request. Until then, serve an adapted model by merging the adapter
+> into the weights offline and loading the merged model — via `--model` at startup or
+> `POST /v1/models/load`. See [LORA.md](LORA.md) for the planned design.
 
 **Response** (non-streaming):
 ```json

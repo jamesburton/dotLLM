@@ -31,9 +31,15 @@ public readonly record struct F16GemmCoopmatVariant(string SpvFileName, int Requ
         return File.Exists(Path.Combine(spvDir, SpvFileName));
     }
 
-    /// <summary>Picks the fastest variant this device can actually run right now.</summary>
+    /// <summary>
+    /// Picks the default variant for this device. Defaults to <see cref="Coopmat64"/> —
+    /// see <see cref="Q8_0GemmCoopmatVariant.SelectFor"/>'s remarks (issue #298): real
+    /// cross-vendor A/B measurement showed <see cref="Coopmat32"/> regresses 0.73x-0.91x at
+    /// medium/large shapes on gfx1151. <see cref="Coopmat32"/> remains available via the
+    /// explicit-selection overload.
+    /// </summary>
     public static F16GemmCoopmatVariant SelectFor(VulkanDevice device, string spvDir)
-        => Coopmat32.IsSupportedOn(device, spvDir) ? Coopmat32 : Coopmat64;
+        => Coopmat64;
 }
 
 /// <summary>

@@ -256,28 +256,17 @@ public static unsafe class MoeQuantSwiGluMlp
                 MatMul.GemvF16(weights, x, y, m, k, pool);
                 break;
             default:
-                GemvDequantRows(weights, qt, x, y, m, k);
+                GemvDequantRows(weights, qt, x, y, m, k, pool);
                 break;
         }
     }
 
-    private static void GemvDequantRows(nint weights, QuantizationType qt, float* x, float* y, int m, int k)
-    {
-        long rowBytes = Dequantize.RowByteSize(k, qt);
-        float[] rowBuf = ArrayPool<float>.Shared.Rent(k);
-        try
-        {
-            var rowSpan = rowBuf.AsSpan(0, k);
-            var xSpan = new ReadOnlySpan<float>(x, k);
-            for (int i = 0; i < m; i++)
-            {
-                Dequantize.ToFloat32(weights + (nint)(i * rowBytes), k, qt, rowSpan);
-                y[i] = TensorPrimitives.Dot((ReadOnlySpan<float>)rowSpan, xSpan);
-            }
-        }
-        finally
-        {
-            ArrayPool<float>.Shared.Return(rowBuf);
-        }
-    }
+    /// <summary>
+    /// Dequantize-per-row GEMV fallback. Shared with the fused decode dispatcher so both
+    /// last-resort paths behave identically — including the row-parallel dispatch (#263).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void GemvDequantRows(nint weights, QuantizationType qt, float* x, float* y, int m, int k,
+                                        ComputeThreadPool? pool)
+        => MatMul.GemvDequantRows((byte*)weights, qt, x, y, m, k, pool);
 }

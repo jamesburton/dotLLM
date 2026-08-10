@@ -9,6 +9,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cpu.Threading;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.Quantization.Mach1;
 
 namespace DotLLM.Models.Architectures;
 
@@ -57,6 +58,13 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
     private readonly ComputeThreadPool? _threadPool;
     private readonly bool _ownsThreadPool;
 
+    // NativeMemory.AlignedAlloc allocations this model owns and must free on Dispose.
+    // Null for the GGUF path (weights are zero-copy mmap views owned by _gguf) and for
+    // BuildFromPrebuiltWeights (caller owns every pointer). Populated by
+    // LoadFromMach1Packed, whose weights are all decoded (not mmap-backed) and therefore
+    // genuinely owned by this instance.
+    private readonly IReadOnlyList<nint>? _ownedMemory;
+
     // Set for the duration of one Forward(..., ILoraAdapter?) call; consulted only by
     // ForwardMoeBody's MoeSwiGluMlp.ExecuteRoutedFromAssignments call site (per-expert
     // "mlp.experts.{j}.{proj}" hook). Same single-threaded-per-instance lifecycle as
@@ -82,7 +90,8 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
         nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim,
         int[] kvSlotForLayer, int attentionLayerCount,
         float[] ropeCosTable, float[] ropeSinTable, int ropeDim,
-        ComputeThreadPool? threadPool, bool ownsPool)
+        ComputeThreadPool? threadPool, bool ownsPool,
+        IReadOnlyList<nint>? ownedMemory = null)
     {
         Config = config;
         _gguf = gguf;
@@ -103,6 +112,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
         _ropeDim = ropeDim;
         _threadPool = threadPool;
         _ownsThreadPool = ownsPool;
+        _ownedMemory = ownedMemory;
 
         _gdnLayerOrdinal = new int[config.NumLayers];
         int gdnOrdinal = 0;
@@ -322,6 +332,423 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
             kvSlotForLayer, attentionLayerCount,
             ropeCos, ropeSin, ropeDim,
             threadPool: null, ownsPool: false);
+    }
+
+    /// <summary>
+    /// Loads a Qwen3MoeHybrid model from a Mach-1 additive-codec HF checkpoint's
+    /// <c>packed/</c> directory tree (issue #266 Phase B). Decodes every tensor
+    /// to dense fp32 via <see cref="Mach1PackedCheckpoint"/> / Phase A's codec
+    /// decoders and wires them into the SAME <see cref="Qwen3MoeLayerWeights"/> /
+    /// <see cref="GdnTokenMixingWeights"/> / <see cref="Qwen3FullAttnWeights"/> /
+    /// <see cref="MoeLayerWeights"/> shapes <see cref="LoadFromGguf(GgufFile, ModelConfig)"/>
+    /// populates — the forward pass (<see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?)"/>)
+    /// is completely unmodified; this method is a loader-only addition.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Memory.</b> Unlike the GGUF path (zero-copy mmap views), every
+    /// tensor here is decoded into a fresh <c>NativeMemory.AlignedAlloc</c>
+    /// buffer this instance owns and frees on <see cref="Dispose"/> — there is
+    /// no on-disk representation to memory-map (the trellis/RHT codec is not a
+    /// simple byte layout). At full 40-layer / 256-expert scale the routed
+    /// experts alone are <c>256 * 40 * 3 * 512 * 2048 * 4 bytes ≈ 128 GB</c> —
+    /// far beyond a typical workstation's RAM. Per issue #266's "Practical
+    /// constraints" section, this method decodes and materializes layers
+    /// SEQUENTIALLY (one <see cref="Mach1PackedCheckpoint"/> layer-file open at
+    /// a time) but still ends up holding ALL decoded layers resident
+    /// simultaneously once the loop completes, because the unmodified forward
+    /// pass requires every layer's weights present as plain pointers. Callers
+    /// on memory-constrained hardware should load a config with a reduced
+    /// <see cref="ModelConfig.NumLayers"/> (see <c>Mach1PackedCheckpointTests</c>
+    /// for a truncated-layer-count smoke test) rather than attempt the full
+    /// 40-layer checkpoint; full-scale resident-memory avoidance is Phase C's
+    /// fused-kernel path, not this one.
+    /// </para>
+    /// </remarks>
+    /// <param name="checkpointRoot">
+    /// The checkpoint root directory (containing <c>packed/</c>,
+    /// <c>extras.safetensors</c>, <c>config.json</c>).
+    /// </param>
+    /// <param name="config">
+    /// Model configuration extracted via <see cref="DotLLM.Models.SafeTensors.Qwen35MoeConfigExtractor"/>.
+    /// </param>
+    /// <param name="threading">Threading configuration. Defaults to single-threaded.</param>
+    public static Qwen3MoeHybridTransformerModel LoadFromMach1Packed(
+        string checkpointRoot, ModelConfig config, ThreadingConfig? threading = null)
+    {
+        ArgumentNullException.ThrowIfNull(checkpointRoot);
+        if (config.Architecture != Architecture.Qwen3MoeHybrid)
+            throw new ArgumentException(
+                $"Qwen3MoeHybridTransformerModel requires Architecture.Qwen3MoeHybrid, got {config.Architecture}.",
+                nameof(config));
+        if (config.HybridLayout is null)
+            throw new ArgumentException("Qwen3MoeHybrid config must have HybridLayout populated.", nameof(config));
+        if (config.GdnConfig is null)
+            throw new ArgumentException("Qwen3MoeHybrid config must have GdnConfig populated.", nameof(config));
+        if (config.Moe is null)
+            throw new ArgumentException("Qwen3MoeHybrid config must have Moe populated.", nameof(config));
+
+        var layout = config.HybridLayout;
+        var owned = new List<nint>();
+
+        // Decoding at this scale allocates many GB of NativeMemory across dozens of calls
+        // (see the "Memory" remarks above) — an exception partway through (e.g. a shape
+        // mismatch on a later layer) must not leak everything decoded so far.
+        try
+        {
+            using var checkpoint = Mach1PackedCheckpoint.Open(checkpointRoot);
+            using var extras = Mach1ExtrasReader.Open(checkpointRoot);
+
+            int vh = config.VocabSize, hs = config.HiddenSize;
+
+            nint tokenEmbedWeight = AllocAndDecode(vh * hs, owned, dest => checkpoint.DecodeEmbedding(dest));
+            float[] outputNormWeight = extras.ReadF32("model.language_model.norm.weight", hs);
+            nint outputWeight = AllocAndDecode(vh * hs, owned, dest => checkpoint.DecodeHead(dest, hs));
+
+            int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
+            if ((ropeDim & 1) != 0)
+                throw new InvalidDataException(
+                    $"Qwen3MoeHybrid rope_dim={ropeDim} must be even for pair-wise rotation.");
+            if (ropeDim > config.HeadDim)
+                throw new InvalidDataException(
+                    $"Qwen3MoeHybrid rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.");
+
+            var layers = new Qwen3MoeLayerWeights[config.NumLayers];
+            var kvSlotForLayer = new int[config.NumLayers];
+            int attentionLayerCount = 0;
+            for (int i = 0; i < config.NumLayers; i++)
+            {
+                layers[i] = LoadLayerFromMach1(i, checkpoint, extras, config, owned);
+                kvSlotForLayer[i] = layout.LayerKind[i] == HybridLayerKind.Attention
+                    ? attentionLayerCount++
+                    : -1;
+            }
+
+            float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+            int halfRope = ropeDim / 2;
+            float[] ropeCos, ropeSin;
+            if (attentionLayerCount > 0)
+            {
+                ropeCos = new float[config.MaxSequenceLength * halfRope];
+                ropeSin = new float[config.MaxSequenceLength * halfRope];
+                RoPE.PrecomputeFrequencyTable(config.MaxSequenceLength, ropeDim, ropeTheta, ropeCos, ropeSin);
+            }
+            else
+            {
+                ropeCos = Array.Empty<float>();
+                ropeSin = Array.Empty<float>();
+            }
+
+            ComputeThreadPool? pool = CreatePool(threading ?? ThreadingConfig.SingleThreaded);
+
+            return new Qwen3MoeHybridTransformerModel(
+                config, gguf: null, layers, outputNormWeight,
+                tokenEmbedWeight, QuantizationType.F32,
+                outputWeight, QuantizationType.F32, outputOutputDim: vh, outputInputDim: hs,
+                kvSlotForLayer, attentionLayerCount,
+                ropeCos, ropeSin, ropeDim,
+                pool, ownsPool: pool is not null,
+                ownedMemory: owned);
+        }
+        catch
+        {
+            foreach (nint ptr in owned)
+            {
+                if (ptr != 0)
+                    System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)ptr);
+            }
+            throw;
+        }
+    }
+
+    internal static Qwen3MoeLayerWeights LoadLayerFromMach1(
+        int layerIdx,
+        Mach1PackedCheckpoint checkpoint,
+        Mach1ExtrasReader extras,
+        ModelConfig config,
+        List<nint> owned)
+    {
+        string prefix = $"model.language_model.layers.{layerIdx}";
+        int hiddenSize = config.HiddenSize;
+        var layout = config.HybridLayout!;
+
+        float[] attnNormWeight = extras.ReadF32($"{prefix}.input_layernorm.weight", hiddenSize);
+        float[] postAttnNormWeight = extras.ReadF32($"{prefix}.post_attention_layernorm.weight", hiddenSize);
+
+        var tokenMixing = layout.LayerKind[layerIdx] switch
+        {
+            HybridLayerKind.GatedDeltaNet =>
+                (gdn: LoadGdnLayerFromMach1(layerIdx, prefix, checkpoint, extras, config, owned), attn: (Qwen3FullAttnWeights?)null),
+            HybridLayerKind.Attention =>
+                (gdn: (GdnTokenMixingWeights?)null, attn: LoadFullAttnLayerFromMach1(layerIdx, prefix, checkpoint, extras, config, layout.HeadCountKv[layerIdx], owned)),
+            _ => throw new InvalidOperationException(
+                $"Unexpected HybridLayerKind {layout.LayerKind[layerIdx]} at layer {layerIdx} in Qwen3MoeHybrid."),
+        };
+
+        MoeLayerWeights moe = LoadMoeLayerFromMach1(layerIdx, prefix, checkpoint, extras, config, owned);
+
+        return new Qwen3MoeLayerWeights
+        {
+            AttnNormWeight = attnNormWeight,
+            PostAttnNormWeight = postAttnNormWeight,
+            Gdn = tokenMixing.gdn,
+            FullAttn = tokenMixing.attn,
+            Moe = moe,
+        };
+    }
+
+    /// <summary>
+    /// Loads one GDN layer's token-mixing weights from Mach-1-decoded NE-tier
+    /// tensors + <c>extras.safetensors</c> scalars. HF tensor names verified
+    /// against the real <c>SyzygyResearch/Mach-1-Additive-35B</c> fixture:
+    /// <c>linear_attn.in_proj_qkv.weight</c> [2*NKHead*DState+NVHead*DState, hidden],
+    /// <c>linear_attn.in_proj_z.weight</c> [NVHead*DState, hidden],
+    /// <c>linear_attn.out_proj.weight</c> [hidden, NVHead*DState],
+    /// <c>linear_attn.A_log</c>/<c>dt_bias</c>/<c>norm.weight</c> (extras),
+    /// <c>linear_attn.conv1d.weight</c> [convDim, 1, dConv] (extras — PyTorch
+    /// Conv1d depthwise layout; flattened row-major this is BYTE-IDENTICAL to
+    /// <see cref="DotLLM.Cpu.Kernels.Conv1dCausal.Execute"/>'s expected
+    /// channel-major <c>[dConv, convDim]</c> layout — element (k,c) at flat
+    /// index c*dConv+k either way — so no transpose is needed),
+    /// <c>linear_attn.in_proj_a.weight</c>/<c>in_proj_b.weight</c> [NVHead, hidden]
+    /// (alpha/beta decay + write-gate projections, extras).
+    /// </summary>
+    internal static GdnTokenMixingWeights LoadGdnLayerFromMach1(
+        int layerIdx,
+        string prefix,
+        Mach1PackedCheckpoint checkpoint,
+        Mach1ExtrasReader extras,
+        ModelConfig config,
+        List<nint> owned)
+    {
+        var gdn = config.GdnConfig!.Value;
+        int hiddenSize = config.HiddenSize;
+        int qkvOut = 2 * gdn.NKHead * gdn.DState + gdn.NVHead * gdn.DState;
+        int zOut = gdn.NVHead * gdn.DState;
+        int convDim = (2 * gdn.NKHead + gdn.NVHead) * gdn.DState;
+
+        nint qkvWeight = AllocAndDecode(qkvOut * hiddenSize, owned,
+            dest => checkpoint.DecodeNeTensor(layerIdx, $"{prefix}.linear_attn.in_proj_qkv.weight", dest));
+        nint gateWeight = AllocAndDecode(zOut * hiddenSize, owned,
+            dest => checkpoint.DecodeNeTensor(layerIdx, $"{prefix}.linear_attn.in_proj_z.weight", dest));
+        nint outWeight = AllocAndDecode(hiddenSize * zOut, owned,
+            dest => checkpoint.DecodeNeTensor(layerIdx, $"{prefix}.linear_attn.out_proj.weight", dest));
+
+        float[] a = extras.ReadF32($"{prefix}.linear_attn.A_log", gdn.NVHead);
+        float[] dtBias = extras.ReadF32($"{prefix}.linear_attn.dt_bias", gdn.NVHead);
+        float[] ssmNormWeight = extras.ReadF32($"{prefix}.linear_attn.norm.weight", gdn.DState);
+        // PyTorch depthwise Conv1d weight [convDim, 1, dConv] flattens row-major to the
+        // same c*dConv+k layout Conv1dCausal.Execute expects — direct reinterpretation,
+        // no transpose (see method doc).
+        float[] conv1dWeight = extras.ReadF32($"{prefix}.linear_attn.conv1d.weight", gdn.DConv * convDim);
+        float[] conv1dBias = new float[convDim]; // GDN has no conv bias — zeros satisfy Conv1dCausal precondition
+
+        nint alphaWeight = AllocAndDecodeFromExtras(extras, $"{prefix}.linear_attn.in_proj_a.weight", gdn.NVHead * hiddenSize, owned);
+        nint betaWeight = AllocAndDecodeFromExtras(extras, $"{prefix}.linear_attn.in_proj_b.weight", gdn.NVHead * hiddenSize, owned);
+
+        return new GdnTokenMixingWeights
+        {
+            QkvWeight = qkvWeight,
+            QkvQuantType = QuantizationType.F32,
+            QkvInputDim = hiddenSize,
+            QkvOutputDim = qkvOut,
+
+            GateWeight = gateWeight,
+            GateQuantType = QuantizationType.F32,
+            GateInputDim = hiddenSize,
+            GateOutputDim = zOut,
+
+            A = a,
+
+            AlphaWeight = alphaWeight,
+            AlphaQuantType = QuantizationType.F32,
+            AlphaInputDim = hiddenSize,
+            AlphaOutputDim = gdn.NVHead,
+
+            BetaWeight = betaWeight,
+            BetaQuantType = QuantizationType.F32,
+            BetaInputDim = hiddenSize,
+            BetaOutputDim = gdn.NVHead,
+
+            Conv1dWeight = conv1dWeight,
+            Conv1dBias = conv1dBias,
+            DtBias = dtBias,
+            SsmNormWeight = ssmNormWeight,
+
+            OutWeight = outWeight,
+            OutQuantType = QuantizationType.F32,
+            OutInputDim = zOut,
+            OutOutputDim = hiddenSize,
+        };
+    }
+
+    /// <summary>
+    /// Loads one full-attention layer's weights from Mach-1-decoded NE-tier
+    /// tensors + <c>extras.safetensors</c> QK-norm. HF tensor names verified
+    /// against the real fixture's <c>packed/ne/L03.safetensors</c> (the first
+    /// full-attention layer): <c>self_attn.q_proj.weight</c>
+    /// [2*numAttentionHeads*headDim, hidden] (Q+Gate fused per head — same
+    /// convention llama.cpp's qwen35moe GGUF conversion preserves verbatim),
+    /// <c>self_attn.k_proj.weight</c>/<c>v_proj.weight</c> [numKvHeads*headDim, hidden],
+    /// <c>self_attn.o_proj.weight</c> [hidden, numAttentionHeads*headDim].
+    /// </summary>
+    internal static Qwen3FullAttnWeights LoadFullAttnLayerFromMach1(
+        int layerIdx,
+        string prefix,
+        Mach1PackedCheckpoint checkpoint,
+        Mach1ExtrasReader extras,
+        ModelConfig config,
+        int numKvHeads,
+        List<nint> owned)
+    {
+        int hiddenSize = config.HiddenSize;
+        int qGateOut = 2 * config.NumAttentionHeads * config.HeadDim;
+        int kvOut = numKvHeads * config.HeadDim;
+        int oIn = config.NumAttentionHeads * config.HeadDim;
+
+        nint qWeight = AllocAndDecode(qGateOut * hiddenSize, owned,
+            dest => checkpoint.DecodeNeTensor(layerIdx, $"{prefix}.self_attn.q_proj.weight", dest));
+        nint kWeight = AllocAndDecode(kvOut * hiddenSize, owned,
+            dest => checkpoint.DecodeNeTensor(layerIdx, $"{prefix}.self_attn.k_proj.weight", dest));
+        nint vWeight = AllocAndDecode(kvOut * hiddenSize, owned,
+            dest => checkpoint.DecodeNeTensor(layerIdx, $"{prefix}.self_attn.v_proj.weight", dest));
+        nint oWeight = AllocAndDecode(hiddenSize * oIn, owned,
+            dest => checkpoint.DecodeNeTensor(layerIdx, $"{prefix}.self_attn.o_proj.weight", dest));
+
+        float[] qNorm = extras.ReadF32($"{prefix}.self_attn.q_norm.weight", config.HeadDim);
+        float[] kNorm = extras.ReadF32($"{prefix}.self_attn.k_norm.weight", config.HeadDim);
+
+        return new Qwen3FullAttnWeights
+        {
+            QWeight = qWeight,
+            QQuantType = QuantizationType.F32,
+            QInputDim = hiddenSize,
+            QOutputDim = qGateOut,
+
+            KWeight = kWeight,
+            KQuantType = QuantizationType.F32,
+            KInputDim = hiddenSize,
+            KOutputDim = kvOut,
+
+            VWeight = vWeight,
+            VQuantType = QuantizationType.F32,
+            VInputDim = hiddenSize,
+            VOutputDim = kvOut,
+
+            OWeight = oWeight,
+            OQuantType = QuantizationType.F32,
+            OInputDim = oIn,
+            OOutputDim = hiddenSize,
+
+            NumKvHeads = numKvHeads,
+            QNormWeight = qNorm,
+            KNormWeight = kNorm,
+        };
+    }
+
+    /// <summary>
+    /// Loads one layer's sparse MoE FFN from Mach-1-decoded tensors: 256 routed
+    /// experts (chunked v3t expert-tier decode, per-expert gate/up/down),
+    /// router gate + shared-expert branch (extras/NE tier). Populates the SAME
+    /// F32 <see cref="MoeLayerWeights.W1"/>/<see cref="MoeLayerWeights.W2"/>/<see cref="MoeLayerWeights.W3"/>
+    /// per-expert pointer banks the CPU <c>MoeSwiGluMlp</c> kernel already
+    /// consumes for the GGUF path's non-quantized MoE experts — no forward-pass
+    /// changes. See the "Memory" remarks on <see cref="LoadFromMach1Packed"/>:
+    /// this is ~3 GB of NativeMemory PER LAYER (256 experts x 3 projections x
+    /// 512x2048 fp32), the dominant cost of this loader.
+    /// </summary>
+    internal static MoeLayerWeights LoadMoeLayerFromMach1(
+        int layerIdx,
+        string prefix,
+        Mach1PackedCheckpoint checkpoint,
+        Mach1ExtrasReader extras,
+        ModelConfig config,
+        List<nint> owned)
+    {
+        var moe = config.Moe!;
+        int hiddenSize = config.HiddenSize;
+        int numExperts = moe.NumExperts;
+        int moeIntermediate = moe.MoeIntermediateSize;
+
+        float[] router = extras.ReadF32($"{prefix}.mlp.gate.weight", numExperts * hiddenSize);
+
+        var w1 = new nint[numExperts]; // gate_proj [Ie, H]
+        var w3 = new nint[numExperts]; // up_proj   [Ie, H]
+        var w2 = new nint[numExperts]; // down_proj [H, Ie]
+        for (int e = 0; e < numExperts; e++)
+        {
+            w1[e] = AllocAndDecode(moeIntermediate * hiddenSize, owned,
+                dest => checkpoint.DecodeExpertProjection(layerIdx, e, "gate", moeIntermediate, hiddenSize, dest));
+            w3[e] = AllocAndDecode(moeIntermediate * hiddenSize, owned,
+                dest => checkpoint.DecodeExpertProjection(layerIdx, e, "up", moeIntermediate, hiddenSize, dest));
+            w2[e] = AllocAndDecode(hiddenSize * moeIntermediate, owned,
+                dest => checkpoint.DecodeExpertProjection(layerIdx, e, "down", hiddenSize, moeIntermediate, dest));
+        }
+
+        nint[] sharedGate = Array.Empty<nint>();
+        nint[] sharedUp = Array.Empty<nint>();
+        nint[] sharedDown = Array.Empty<nint>();
+        int sharedIntermediate = 0;
+        float[]? sharedExpertGate = null;
+        if (moe.SharedExpertIntermediateSize is int sharedI && sharedI > 0)
+        {
+            sharedIntermediate = sharedI;
+            sharedGate = [AllocAndDecode(sharedI * hiddenSize, owned,
+                dest => checkpoint.DecodeNeTensor(layerIdx, $"{prefix}.mlp.shared_expert.gate_proj.weight", dest))];
+            sharedUp = [AllocAndDecode(sharedI * hiddenSize, owned,
+                dest => checkpoint.DecodeNeTensor(layerIdx, $"{prefix}.mlp.shared_expert.up_proj.weight", dest))];
+            sharedDown = [AllocAndDecode(hiddenSize * sharedI, owned,
+                dest => checkpoint.DecodeNeTensor(layerIdx, $"{prefix}.mlp.shared_expert.down_proj.weight", dest))];
+
+            if (moe.HasSharedExpertGate)
+                sharedExpertGate = extras.ReadF32($"{prefix}.mlp.shared_expert_gate.weight", hiddenSize);
+        }
+
+        return new MoeLayerWeights(
+            gate: router,
+            w1: w1, w2: w2, w3: w3,
+            numExperts: numExperts,
+            numExpertsPerTok: moe.NumExpertsPerTok,
+            hiddenSize: hiddenSize,
+            intermediateSize: moeIntermediate,
+            normTopKProb: moe.NormTopKProb,
+            sharedGateProj: sharedGate,
+            sharedUpProj: sharedUp,
+            sharedDownProj: sharedDown,
+            sharedIntermediateSize: sharedIntermediate,
+            sharedExpertGate: sharedExpertGate);
+    }
+
+    /// <summary>
+    /// Allocates a 64-byte-aligned NativeMemory F32 buffer, invokes
+    /// <paramref name="decode"/> to fill it, registers it in
+    /// <paramref name="owned"/> for the model's <see cref="Dispose"/> to free,
+    /// and returns the pointer.
+    /// </summary>
+    private static unsafe nint AllocAndDecode(int elementCount, List<nint> owned, Action<Span<float>> decode)
+    {
+        nuint bytes = (nuint)((long)elementCount * sizeof(float));
+        nint dst = (nint)System.Runtime.InteropServices.NativeMemory.AlignedAlloc(bytes, 64);
+        owned.Add(dst);
+        decode(new Span<float>((void*)dst, elementCount));
+        return dst;
+    }
+
+    /// <summary>
+    /// Allocates a 64-byte-aligned NativeMemory F32 buffer and copies an
+    /// <c>extras.safetensors</c>-resolved tensor into it (small GDN alpha/beta
+    /// projections — kept off the managed heap only for uniformity with the
+    /// other GDN projection pointers, which all flow through the same
+    /// <c>nint</c> + <see cref="QuantizationType.F32"/> slots).
+    /// </summary>
+    private static unsafe nint AllocAndDecodeFromExtras(Mach1ExtrasReader extras, string name, int elementCount, List<nint> owned)
+    {
+        float[] values = extras.ReadF32(name, elementCount);
+        nuint bytes = (nuint)((long)elementCount * sizeof(float));
+        nint dst = (nint)System.Runtime.InteropServices.NativeMemory.AlignedAlloc(bytes, 64);
+        owned.Add(dst);
+        values.AsSpan().CopyTo(new Span<float>((void*)dst, elementCount));
+        return dst;
     }
 
     private static Qwen3MoeLayerWeights LoadLayer(
@@ -716,6 +1143,14 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
 
         return result;
     }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Re-zeroes the model-owned Gated-DeltaNet cache used by every forward that does not carry a
+    /// caller-supplied <see cref="IGdnState"/>. Callers that treat each forward as an independent
+    /// sequence (perplexity windows) must call this between sequences — see issue #261.
+    /// </remarks>
+    public void ResetSequenceState() => _gdnCache.Reset();
 
     /// <inheritdoc/>
     public bool RequiresPerSequenceState => true;
@@ -1285,32 +1720,10 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
                 MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);
                 return;
             default:
-                GemmDequantFallback(weights, qt, b, c, m, k, n);
+                // Shared dequantize-and-dot fallback (#263): decodes each weight row once and
+                // reuses it across all n columns instead of re-decoding the matrix per token.
+                MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, pool: null);
                 return;
-        }
-    }
-
-    private static void GemmDequantFallback(nint weights, QuantizationType qt, float* b, float* c,
-                                            int m, int k, int n)
-    {
-        long rowBytes = Dequantize.RowByteSize(k, qt);
-        float[] rowBuf = ArrayPool<float>.Shared.Rent(k);
-        try
-        {
-            var rowSpan = rowBuf.AsSpan(0, k);
-            for (int t = 0; t < n; t++)
-            {
-                var xSpan = new ReadOnlySpan<float>(b + t * k, k);
-                for (int i = 0; i < m; i++)
-                {
-                    Dequantize.ToFloat32(weights + i * (nint)rowBytes, k, qt, rowSpan);
-                    c[t * m + i] = TensorPrimitives.Dot(new ReadOnlySpan<float>(rowBuf, 0, k), xSpan);
-                }
-            }
-        }
-        finally
-        {
-            ArrayPool<float>.Shared.Return(rowBuf);
         }
     }
 
@@ -1321,6 +1734,14 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
             _threadPool?.Dispose();
         _state.Dispose();
         _gdnCache.Dispose();
+        if (_ownedMemory is { } owned)
+        {
+            foreach (nint ptr in owned)
+            {
+                if (ptr != 0)
+                    System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)ptr);
+            }
+        }
         GC.SuppressFinalize(this);
     }
 

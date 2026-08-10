@@ -275,9 +275,8 @@ public static class ChatCompletionEndpoint
         DotLLM.Core.Lora.ILoraAdapter? adapter,
         CancellationToken ct)
     {
-        httpContext.Response.ContentType = "text/event-stream";
-        httpContext.Response.Headers.CacheControl = "no-cache";
-        httpContext.Response.Headers.Connection = "keep-alive";
+        // No Connection header: it is connection-specific and illegal over HTTP/2+. See SseResponse.
+        SseResponse.ApplyHeaders(httpContext);
 
         // First chunk: role
         var roleChunk = new ChatCompletionChunk

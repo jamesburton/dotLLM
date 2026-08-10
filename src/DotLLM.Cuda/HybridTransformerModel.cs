@@ -703,11 +703,14 @@ public sealed unsafe class HybridTransformerModel : IModel
                 // b. RMSNorm + Pre-quantize + Q/K/V projections
                 byte* inputQ8Scratch = (byte*)_cpuState.InputQ8Scratch;
 
-                // The fused decode kernels don't support I2_S; route ternary weights through the
-                // standard (unfused) projection path, which dispatches to the I2_S GEMV. Mirrors
-                // TransformerModel.cs:1077 — without this guard I2_S decode throws in FusedQkvDecode.
+                // Only formats with a dedicated fused decode kernel take the fused path; the rest
+                // (ternary, IQ formats, BF16, MXFP4, …) route through the standard unfused
+                // projection path below. Capability-driven via MatMul.SupportsFusedDecode so this
+                // tracks the kernel's own dispatch tables. Mirrors TransformerModel's Q/K/V gate.
                 if (seqLen == 1 && _threadPool != null && !adapterActive
-                    && lw.QQuantType != QuantizationType.I2_S)
+                    && MatMul.SupportsFusedDecode(lw.QQuantType)
+                    && MatMul.SupportsFusedDecode(lw.KQuantType)
+                    && MatMul.SupportsFusedDecode(lw.VQuantType))
                 {
                     // Decode path: try fused RmsNorm+Quantize
                     byte* preQuantNorm = null;
@@ -845,10 +848,11 @@ public sealed unsafe class HybridTransformerModel : IModel
                 // FFN: RMSNorm + Pre-quantize + Gate/Up projections.
                 // Force the unfused path when an adapter is active so normOut (F32)
                 // is materialised for the gate/up LoRA delta — same trap as Q/K/V.
-                // I2_S (BitNet) is unsupported by the fused decode kernels — use the unfused
-                // path (which dispatches the I2_S GEMV). Mirrors TransformerModel.cs:1379.
+                // Same capability gate as Q/K/V: formats without a fused decode kernel take the
+                // standard unfused projection path instead of failing.
                 if (seqLen == 1 && _threadPool != null && !adapterActive
-                    && lw.GateQuantType != QuantizationType.I2_S)
+                    && MatMul.SupportsFusedDecode(lw.GateQuantType)
+                    && MatMul.SupportsFusedDecode(lw.UpQuantType))
                 {
                     byte* preQuantFfn = null;
                     if (IsCompatiblePreQuant(lw.GateQuantType, lw.UpQuantType))

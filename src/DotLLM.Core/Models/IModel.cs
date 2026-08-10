@@ -224,6 +224,45 @@ public interface IModel : IDisposable
     bool RequiresPerSequenceState => false;
 
     /// <summary>
+    /// Re-zeroes any <em>model-owned</em> recurrent state, so the next <c>Forward</c> that does not
+    /// carry a caller-threaded state container starts a genuinely fresh sequence.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Why this exists.</b> The uncached
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int)"/> overload takes no state
+    /// container, so a recurrent architecture falls back to a model-owned default state (the
+    /// <c>_gdnCache</c> / <c>_ssmCache</c> instance). That state persists across calls, which is
+    /// correct for prefill-then-decode of one sequence and <b>silently wrong</b> for a caller that
+    /// treats each forward as an independent sequence. Perplexity scoring is exactly such a caller —
+    /// every window is an independent sequence, and it cannot use <see cref="ForwardBatch"/> (whose
+    /// <see cref="SequenceForwardRequest.KvCache"/> is required and non-nullable) to thread state
+    /// itself. Without this hook the throwaway probe forward and every preceding window leaked into
+    /// the scored window's state and corrupted the reported number with no error (issue #261).</para>
+    /// <para><b>Why the default throws for recurrent models.</b> A silent no-op default would let a
+    /// future recurrent architecture inherit exactly the bug this method fixes, and the failure mode
+    /// is a plausible-looking wrong number rather than an exception. So the default is a no-op only
+    /// for stateless architectures; a model that declares <see cref="RequiresPerSequenceState"/>
+    /// must override this method — even if only to document that its uncached forward allocates a
+    /// scratch state per call and therefore has nothing to reset.</para>
+    /// <para>Idempotent, and safe to call on a stateless model (does nothing). Does not touch
+    /// caller-threaded state containers — those are reset via
+    /// <see cref="IRecurrentSequenceState.Reset"/> by whoever owns them.</para>
+    /// </remarks>
+    /// <exception cref="NotSupportedException">
+    /// The model declares <see cref="RequiresPerSequenceState"/> but has not overridden this method.
+    /// </exception>
+    void ResetSequenceState()
+    {
+        if (RequiresPerSequenceState)
+            throw new NotSupportedException(
+                $"{GetType().Name} declares {nameof(RequiresPerSequenceState)} but does not implement " +
+                $"{nameof(ResetSequenceState)}(). A recurrent model must re-zero its model-owned " +
+                "recurrent state (or explicitly document that it owns none), otherwise callers that " +
+                "score independent sequences through the uncached Forward — e.g. perplexity — silently " +
+                "leak state across sequences. See issue #261.");
+    }
+
+    /// <summary>
     /// True when this model can have its per-sequence recurrent state <em>threaded by the caller</em>:
     /// the caller allocates one container per sequence via <see cref="CreateSequenceState"/> and supplies
     /// it on every <see cref="ForwardBatch"/> request (via <see cref="SequenceForwardRequest.MambaState"/> /
@@ -253,6 +292,64 @@ public interface IModel : IDisposable
     /// default implementation returns <see langword="null"/>.
     /// </remarks>
     IRecurrentSequenceState? CreateSequenceState() => null;
+
+    /// <summary>
+    /// True when this model's MODEL-OWNED recurrent state (the state an explicit-state-less
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/> call implicitly
+    /// threads and advances — see <see cref="ResetSequenceState"/>) can be checkpointed and
+    /// restored via <see cref="CheckpointRecurrentState"/> / <see cref="RestoreRecurrentState"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Why this exists (issue #287).</b> Speculative decoding (<c>SpeculativeDecoder</c> /
+    /// <c>MtpSpeculativeDecoder</c>) verifies K drafted tokens via a single batched
+    /// <c>Forward</c> call BEFORE knowing which of them will be accepted. For position-indexed
+    /// attention KV-cache, a rejected token's cache entries are simply unreachable once
+    /// <see cref="IKvCache"/> is rolled back to the accepted boundary. But a recurrent trunk layer
+    /// (Gated DeltaNet, Mamba) has no position addressing — every input token mutates the running
+    /// state in place, in call order, regardless of the position label attached to it. Once the
+    /// batched verify <c>Forward</c> has run, a rejected token's contribution to that state has
+    /// already happened and cannot be addressed away the way stale KV-cache entries can.</para>
+    /// <para>A model that reports <see langword="true"/> here lets the speculative decoders
+    /// checkpoint state immediately before a batched verify call and, if any drafted token in that
+    /// batch is rejected, restore the checkpoint and re-forward only the tokens that turned out to
+    /// be genuinely accepted — bringing the recurrent state to exactly the state it would be in had
+    /// the rejected tokens never been drafted.</para>
+    /// <para>Default <see langword="false"/>: models that declare <see cref="RequiresPerSequenceState"/>
+    /// but have not implemented this pair (e.g. <c>Qwen3MoeHybridTransformerModel</c>,
+    /// <c>Mamba3TransformerModel</c> as of this writing — neither currently has a real speculative-
+    /// decoding call path, since MTP self-speculation requires <see cref="SupportsMtp"/> and today
+    /// only the GDN-bearing <c>Qwen3HybridDenseTransformerModel</c> family implements that) keep
+    /// today's documented behavior unchanged rather than silently corrupting an un-audited model or
+    /// throwing where nothing previously threw. Implementing this pair for those architectures if
+    /// they ever gain a speculative-decoding call path is a follow-up, not a blocker.</para>
+    /// </remarks>
+    bool SupportsRecurrentStateCheckpoint => false;
+
+    /// <summary>
+    /// Captures an opaque snapshot of this model's current model-owned recurrent state (see
+    /// <see cref="SupportsRecurrentStateCheckpoint"/>). Returns <see langword="null"/> when
+    /// <see cref="SupportsRecurrentStateCheckpoint"/> is <see langword="false"/>.
+    /// </summary>
+    /// <remarks>
+    /// The returned object is owned by the caller until passed to
+    /// <see cref="RestoreRecurrentState"/> (or discarded, when the round it was captured for turns
+    /// out not to need a rollback). Implementations that allocate for the snapshot (e.g. cloning a
+    /// GDN state buffer) do so fresh per call.
+    /// </remarks>
+    object? CheckpointRecurrentState() => null;
+
+    /// <summary>
+    /// Restores model-owned recurrent state from a snapshot previously returned by
+    /// <see cref="CheckpointRecurrentState"/>, undoing every <c>Forward</c> call issued against
+    /// this model's model-owned state since that snapshot was captured.
+    /// </summary>
+    /// <remarks>
+    /// No-op when <see cref="SupportsRecurrentStateCheckpoint"/> is <see langword="false"/> or
+    /// <paramref name="checkpoint"/> is <see langword="null"/>. Implementations should throw
+    /// <see cref="ArgumentException"/> if <paramref name="checkpoint"/> is non-null but not the
+    /// concrete snapshot type this model itself produces.
+    /// </remarks>
+    void RestoreRecurrentState(object? checkpoint) { }
 
     /// <summary>
     /// Runs a fused forward pass across multiple in-flight sequences.
@@ -288,4 +385,76 @@ public interface IModel : IDisposable
         }
         return results;
     }
+
+    /// <summary>
+    /// True when this model's checkpoint carries a Multi-Token Prediction (MTP / "NextN") head
+    /// (<see cref="ModelConfig.NextnPredictLayers"/> &gt; 0 <em>and</em> the loader found the
+    /// <c>nextn.*</c> tensors) — see issue #253. Default <see langword="false"/>: every model
+    /// that doesn't override this is completely unaffected by the MTP members below, which all
+    /// either no-op or throw.
+    /// </summary>
+    bool SupportsMtp => false;
+
+    /// <summary>
+    /// Allocates a fresh <see cref="IMtpState"/> — the MTP head's own tiny KV-cache plus pending
+    /// hidden-state handoff — or <see langword="null"/> when <see cref="SupportsMtp"/> is
+    /// <see langword="false"/>. The caller owns the returned state's lifetime (one per in-flight
+    /// sequence using MTP self-speculative decoding).
+    /// </summary>
+    IMtpState? CreateMtpState() => null;
+
+    /// <summary>
+    /// Runs a forward pass that additionally captures the trunk's pre-final-norm hidden state
+    /// (one row per input position, in <paramref name="tokenIds"/> order) into
+    /// <paramref name="mtpState"/> when non-null, so a subsequent <see cref="ForwardMtp"/> call
+    /// can seed the MTP head's next autoregressive draft step from it.
+    /// </summary>
+    /// <remarks>
+    /// <para>The default implementation ignores <paramref name="mtpState"/> and forwards to
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, ILoraAdapter?)"/> —
+    /// exactly the "capability off" behavior every model already has today, so passing a non-null
+    /// state to a model with <see cref="SupportsMtp"/> false is a silent no-op rather than an
+    /// error (callers are expected to check <see cref="SupportsMtp"/> before ever constructing an
+    /// <see cref="IMtpState"/> in the first place). Models that override
+    /// <see cref="SupportsMtp"/> to <see langword="true"/> must override this overload too, and
+    /// populate <paramref name="mtpState"/> byte-identically to how they'd behave with
+    /// <paramref name="mtpState"/> null otherwise — capturing the hidden state is a pure side
+    /// effect that never changes the returned logits.</para>
+    /// </remarks>
+    /// <param name="tokenIds">Input token IDs for this step.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    /// <param name="kvCache">Optional KV-cache. When null, behaves identically to the uncached forward pass.</param>
+    /// <param name="adapter">Optional LoRA adapter. When null, behaves like the adapter-less overload.</param>
+    /// <param name="mtpState">
+    /// When non-null on an MTP-supporting model, receives the captured pre-final-norm hidden state
+    /// rows for every position in <paramref name="tokenIds"/>. Ignored otherwise.
+    /// </param>
+    /// <returns>Logits tensor of shape [seq, vocab_size] for all input positions — identical to the non-MTP overload.</returns>
+    ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                    IKvCache? kvCache, ILoraAdapter? adapter, IMtpState? mtpState)
+        => Forward(tokenIds, positions, deviceId, kvCache, adapter);
+
+    /// <summary>
+    /// Runs one MTP head autoregressive draft step: embeds <paramref name="tokenId"/>, combines it
+    /// with <paramref name="state"/>'s current pending hidden vector through the MTP block's own
+    /// <c>enorm</c>/<c>hnorm</c>/<c>eh_proj</c> plus a single decoder block and shared LM head, and
+    /// returns logits over the full vocabulary. Advances <paramref name="state"/>'s own KV-cache by
+    /// one step and updates its pending hidden vector with the MTP block's own output hidden state,
+    /// ready for the <em>next</em> <see cref="ForwardMtp"/> call — the MTP head drafts K tokens by
+    /// calling this K times in a row without re-invoking the trunk (matching llama.cpp's MTP draft
+    /// loop in <c>common_speculative_state_draft_mtp::draft()</c>).
+    /// </summary>
+    /// <param name="state">
+    /// The sequence's <see cref="IMtpState"/>, previously seeded via a <c>Forward</c> call
+    /// with a non-null <c>mtpState</c> and <see cref="IMtpState.SeedFromCapturedRow"/>.
+    /// </param>
+    /// <param name="tokenId">The token whose embedding feeds this MTP step (the previous step's accepted/drafted token).</param>
+    /// <param name="position">Sequence position this MTP step's RoPE angle and KV-cache slot correspond to.</param>
+    /// <returns>Logits tensor of shape [1, vocab_size] for the drafted position.</returns>
+    /// <exception cref="NotSupportedException"><see cref="SupportsMtp"/> is <see langword="false"/>.</exception>
+    ITensor ForwardMtp(IMtpState state, int tokenId, int position)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not support MTP self-speculative decoding (SupportsMtp=false). " +
+            "Check SupportsMtp before creating an IMtpState or calling ForwardMtp. See issue #253.");
 }

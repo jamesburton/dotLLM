@@ -340,6 +340,63 @@ internal static unsafe class Iq2Fixture
         }
     }
 
+    /// <summary>
+    /// Directly packs random-but-VALID IQ2_XS block bytes (grid index in
+    /// [0,511], sign index in [0,127], scale nibbles in [0,15]) without the
+    /// O(gridSize * 128 sign patterns) nearest-pair search <see cref="QuantizeBlockIq2Xs"/>
+    /// does. That search makes <see cref="QuantizeRowsIq2Xs"/> unusable at
+    /// production shapes (issue #278's own follow-up measured ~4m49s of CPU
+    /// time at m=512,k=1024 alone; the real model runs k=2048 with m up to
+    /// 128256). This generator is O(m*k) — same cost as the CPU dequant
+    /// reference it will be checked against via <see cref="CpuGemvIq2Xs"/> /
+    /// <see cref="CpuGemmIq2Xs"/> (which read production
+    /// <c>Dequantize.DequantizeIQ2_XS</c>, not a search) — so both fixture and
+    /// oracle stay cheap enough to exercise the shapes production actually
+    /// dispatches, closing the coverage gap the issue's own comment names.
+    /// </summary>
+    public static byte[] QuantizeRowsIq2XsFast(Random rng, int m, int k)
+    {
+        if ((k % Iq2GroupSize) != 0)
+            throw new ArgumentException($"k must be a multiple of {Iq2GroupSize}, got {k}", nameof(k));
+
+        int blocksPerRow = k / Iq2GroupSize;
+        int rowBytes = blocksPerRow * Iq2XsBlockBytes;
+        var dst = new byte[m * rowBytes];
+
+        for (int row = 0; row < m; row++)
+        {
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                int off = row * rowBytes + b * Iq2XsBlockBytes;
+
+                // d: small positive fp16 scale, representative of real weight magnitudes.
+                float d = 0.001f + (float)rng.NextDouble() * 0.05f;
+                Half hd = (Half)d;
+                Unsafe.WriteUnaligned(ref dst[off], hd);
+
+                // qs[32] uint16 LE: bits 0..8 = grid index (0..511), bits 9..15 = sign index (0..127).
+                for (int p = 0; p < 32; p++)
+                {
+                    int gridIdx = rng.Next(0, Iq2XsGridSize);
+                    int signIdx = rng.Next(0, 128);
+                    ushort q = (ushort)((gridIdx & 0x1FF) | ((signIdx & 0x7F) << 9));
+                    int qOff = off + 2 + p * 2;
+                    dst[qOff + 0] = (byte)(q & 0xff);
+                    dst[qOff + 1] = (byte)((q >> 8) & 0xff);
+                }
+
+                // scales[8]: two random 4-bit sub-scales per byte.
+                for (int ib32 = 0; ib32 < Iq2NumSubBlocks; ib32++)
+                {
+                    byte lo = (byte)rng.Next(0, 16);
+                    byte hi = (byte)rng.Next(0, 16);
+                    dst[off + 66 + ib32] = (byte)((lo & 0xF) | ((hi & 0xF) << 4));
+                }
+            }
+        }
+        return dst;
+    }
+
     public static void AssertFixtureRoundtripIq2Xs(float[] srcF32, byte[] q2Bytes, int m, int k)
         => AssertRoundtrip(srcF32, q2Bytes, m, k, QuantizationType.IQ2_XS, "IQ2_XS");
 
