@@ -4,10 +4,11 @@ using DotLLM.Core.Tensors;
 using DotLLM.Engine.KvCache;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Tokenizers.Bpe;
 using DotLLM.Vulkan;
-using Xunit;
 using Xunit.Abstractions;
+using Xunit;
 
 namespace DotLLM.Tests.Integration.Vulkan;
 
@@ -63,14 +64,11 @@ public sealed class RealGgufVulkanParityTests
     [SkippableFact]
     public void Llama32_1B_Q8_0_VulkanForward_MatchesCpuReference()
     {
-        string? path = ResolveGgufPath(
-            envVar: "DOTLLM_LLAMA32_1B_Q8_0_GGUF",
-            conventional: "C:/Users/james/.dotllm/test-cache/bartowski/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q8_0.gguf");
-        if (path is null)
-        {
-            _output.WriteLine("[SKIP] Llama-3.2-1B Q8_0 GGUF not found.");
-            return;
-        }
+        FixtureLocation fixture = TestFixtureResolver.ResolveFile(
+            "DOTLLM_LLAMA32_1B_Q8_0_GGUF", "bartowski", "Llama-3.2-1B-Instruct-GGUF",
+            "Llama-3.2-1B-Instruct-Q8_0.gguf");
+        Skip.If(!fixture.Found, fixture.SkipMessage("Llama-3.2-1B Q8_0 GGUF"));
+        string path = fixture.Path!;
         RunGgufParityTest(path, expectedArch: Architecture.Llama, label: "Llama-3.2-1B-Q8_0",
             prompt: "The capital of France is");
     }
@@ -82,14 +80,11 @@ public sealed class RealGgufVulkanParityTests
     [SkippableFact]
     public void Bielik15B_Q4_K_M_VulkanForward_MatchesCpuReference()
     {
-        string? path = ResolveGgufPath(
-            envVar: "DOTLLM_BIELIK_15B_Q4_K_M_GGUF",
-            conventional: "C:/Users/james/.dotllm/test-cache/second-state/Bielik-1.5B-v3.0-Instruct-GGUF/Bielik-1.5B-v3.0-Instruct-Q4_K_M.gguf");
-        if (path is null)
-        {
-            _output.WriteLine("[SKIP] Bielik-1.5B Q4_K_M GGUF not found.");
-            return;
-        }
+        FixtureLocation fixture = TestFixtureResolver.ResolveFile(
+            "DOTLLM_BIELIK_15B_Q4_K_M_GGUF", "second-state", "Bielik-1.5B-v3.0-Instruct-GGUF",
+            "Bielik-1.5B-v3.0-Instruct-Q4_K_M.gguf");
+        Skip.If(!fixture.Found, fixture.SkipMessage("Bielik-1.5B Q4_K_M GGUF"));
+        string path = fixture.Path!;
         RunGgufParityTest(path, expectedArch: Architecture.Llama, label: "Bielik-1.5B-Q4_K_M",
             prompt: "The capital of France is");
     }
@@ -105,18 +100,11 @@ public sealed class RealGgufVulkanParityTests
     [SkippableFact]
     public void Mistral7B_Q4_K_M_VulkanForward_MatchesCpuReference()
     {
-        string? path = ResolveGgufPath(
-            envVar: "DOTLLM_MISTRAL_7B_Q4_K_M_GGUF",
-            conventional: "C:/Users/james/.dotllm/models/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/mistral-7b-instruct-v0.2.Q4_K_M.gguf");
-        if (path is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Mistral-7B Q4_K_M GGUF not found. Set "
-                + "DOTLLM_MISTRAL_7B_Q4_K_M_GGUF or download "
-                + "TheBloke/Mistral-7B-Instruct-v0.2-GGUF/mistral-7b-instruct-v0.2.Q4_K_M.gguf "
-                + "to ~/.dotllm/models/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/.");
-            return;
-        }
+        FixtureLocation fixture = TestFixtureResolver.ResolveFile(
+            "DOTLLM_MISTRAL_7B_Q4_K_M_GGUF", "TheBloke", "Mistral-7B-Instruct-v0.2-GGUF",
+            "mistral-7b-instruct-v0.2.Q4_K_M.gguf");
+        Skip.If(!fixture.Found, fixture.SkipMessage("Mistral-7B Q4_K_M GGUF"));
+        string path = fixture.Path!;
         RunGgufParityTest(path, expectedArch: Architecture.Llama, label: "Mistral-7B-Q4_K_M",
             prompt: "The capital of France is");
     }
@@ -139,18 +127,11 @@ public sealed class RealGgufVulkanParityTests
     [SkippableFact]
     public void Llama31_8B_IQ4_XS_VulkanForward_MatchesCpuReference()
     {
-        string? path = ResolveGgufPath(
-            envVar: "DOTLLM_LLAMA31_8B_IQ4_XS_GGUF",
-            conventional: "C:/Users/james/.dotllm/test-cache/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf");
-        if (path is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Llama-3.1-8B IQ4_XS GGUF not found. Set "
-                + "DOTLLM_LLAMA31_8B_IQ4_XS_GGUF or download to "
-                + "~/.dotllm/test-cache/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf "
-                + "(~4.5 GB) from huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF.");
-            return;
-        }
+        FixtureLocation fixture = TestFixtureResolver.ResolveFile(
+            "DOTLLM_LLAMA31_8B_IQ4_XS_GGUF", "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF",
+            "Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf");
+        Skip.If(!fixture.Found, fixture.SkipMessage("Llama-3.1-8B IQ4_XS GGUF (~4.5 GB)"));
+        string path = fixture.Path!;
         RunGgufParityTest(path, expectedArch: Architecture.Llama, label: "Llama-3.1-8B-IQ4_XS",
             prompt: "The capital of France is");
     }
@@ -165,19 +146,11 @@ public sealed class RealGgufVulkanParityTests
     [SkippableFact]
     public void Llama31_8B_IQ1_S_VulkanForward_MatchesCpuReference()
     {
-        string? path = ResolveGgufPath(
-            envVar: "DOTLLM_LLAMA31_8B_IQ1_S_GGUF",
-            conventional: "C:/Users/james/.dotllm/test-cache/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-IQ1_S.gguf");
-        if (path is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Llama-3.1-8B IQ1_S GGUF not found. Set "
-                + "DOTLLM_LLAMA31_8B_IQ1_S_GGUF or download to "
-                + "~/.dotllm/test-cache/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-IQ1_S.gguf "
-                + "(~2.0 GB) — IQ1_S Llama-3.1-8B GGUFs are not always published; "
-                + "any IQ1_S GGUF can be substituted via the env var.");
-            return;
-        }
+        FixtureLocation fixture = TestFixtureResolver.ResolveFile(
+            "DOTLLM_LLAMA31_8B_IQ1_S_GGUF", "bartowski", "Meta-Llama-3.1-8B-Instruct-GGUF",
+            "Meta-Llama-3.1-8B-Instruct-IQ1_S.gguf");
+        Skip.If(!fixture.Found, fixture.SkipMessage("Llama-3.1-8B IQ1_S GGUF (~2.0 GB; any IQ1_S GGUF may be substituted via the env var)"));
+        string path = fixture.Path!;
         RunGgufParityTest(path, expectedArch: Architecture.Llama, label: "Llama-3.1-8B-IQ1_S",
             prompt: "The capital of France is");
     }
@@ -185,18 +158,11 @@ public sealed class RealGgufVulkanParityTests
     [SkippableFact]
     public void DeepSeekV2Lite_Q4_K_M_VulkanForward_MatchesCpuReference()
     {
-        string? path = ResolveGgufPath(
-            envVar: "DOTLLM_DEEPSEEK_V2_LITE_Q4_K_M_GGUF",
-            conventional: "C:/Users/james/.dotllm/test-cache/mradermacher/DeepSeek-V2-Lite-GGUF/DeepSeek-V2-Lite.Q4_K_M.gguf");
-        if (path is null)
-        {
-            _output.WriteLine(
-                "[SKIP] DeepSeek-V2-Lite Q4_K_M GGUF not found. Set "
-                + "DOTLLM_DEEPSEEK_V2_LITE_Q4_K_M_GGUF or download to "
-                + "~/.dotllm/test-cache/mradermacher/DeepSeek-V2-Lite-GGUF/DeepSeek-V2-Lite.Q4_K_M.gguf "
-                + "(~10.4 GB) from huggingface.co/mradermacher/DeepSeek-V2-Lite-GGUF.");
-            return;
-        }
+        FixtureLocation fixture = TestFixtureResolver.ResolveFile(
+            "DOTLLM_DEEPSEEK_V2_LITE_Q4_K_M_GGUF", "mradermacher", "DeepSeek-V2-Lite-GGUF",
+            "DeepSeek-V2-Lite.Q4_K_M.gguf");
+        Skip.If(!fixture.Found, fixture.SkipMessage("DeepSeek-V2-Lite Q4_K_M GGUF (~10.4 GB)"));
+        string path = fixture.Path!;
         RunGgufParityTest(path, expectedArch: Architecture.DeepSeekV2, label: "DeepSeek-V2-Lite-Q4_K_M",
             prompt: "The capital of France is");
     }
@@ -210,18 +176,11 @@ public sealed class RealGgufVulkanParityTests
     [SkippableFact]
     public void DeepSeekCoderV2Lite_Q2_K_VulkanForward_MatchesCpuReference()
     {
-        string? path = ResolveGgufPath(
-            envVar: "DOTLLM_DEEPSEEK_CODER_V2_LITE_Q2_K_GGUF",
-            conventional: "C:/Users/james/.dotllm/test-cache/bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF/DeepSeek-Coder-V2-Lite-Instruct-Q2_K.gguf");
-        if (path is null)
-        {
-            _output.WriteLine(
-                "[SKIP] DeepSeek-Coder-V2-Lite Q2_K GGUF not found. Set "
-                + "DOTLLM_DEEPSEEK_CODER_V2_LITE_Q2_K_GGUF or download to "
-                + "~/.dotllm/test-cache/bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF/DeepSeek-Coder-V2-Lite-Instruct-Q2_K.gguf "
-                + "from huggingface.co/bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF.");
-            return;
-        }
+        FixtureLocation fixture = TestFixtureResolver.ResolveFile(
+            "DOTLLM_DEEPSEEK_CODER_V2_LITE_Q2_K_GGUF", "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF",
+            "DeepSeek-Coder-V2-Lite-Instruct-Q2_K.gguf");
+        Skip.If(!fixture.Found, fixture.SkipMessage("DeepSeek-Coder-V2-Lite Q2_K GGUF"));
+        string path = fixture.Path!;
         RunGgufParityTest(path, expectedArch: Architecture.DeepSeekV2, label: "DeepSeek-Coder-V2-Lite-Q2_K",
             prompt: "def fibonacci(n):");
     }
@@ -229,29 +188,27 @@ public sealed class RealGgufVulkanParityTests
     // ────────────────────────────────────────────────────────────────────
     // Bielik-1.5B Q3_K_M (~660 MB GGUF) — exercises Q3_K Vulkan kernels.
     //
-    // Q3_K caveat: the dotLLM CPU oracle has a pre-existing layout bug for
-    // sub-blocks 12..15 of every Q3_K super-block (see
-    // docs/QUANTIZATION.md). The Vulkan kernel matches the CPU oracle
-    // bit-for-bit, so the parity assertion below holds — but this test does
-    // NOT validate Q3_K against llama.cpp / canonical GGUF semantics on
-    // those four sub-blocks.
+    // This test is what surfaced #311: Q3_K's bit layout was transposed in
+    // BOTH the scale high-bits and the element ordering, in every backend and
+    // in the kernel-test fixture, so the decoded weights were noise (corr
+    // 0.006 vs the Q8_0 build of the same model). Cross-backend parity still
+    // "held" at the kernel level because every side shared the bug; only a
+    // real 32-layer GGUF forward amplified the resulting garbage far enough
+    // (L∞ 5.09, top-10 Jaccard 0.40) to break the end-to-end bound.
+    //
+    // Canonical-semantics coverage now lives in
+    // DequantizeKQuantTests.Q3_K_DenseRandomBlocks_MatchLlamaCppReference;
+    // this test remains the cross-backend check. See docs/QUANTIZATION.md.
     // ────────────────────────────────────────────────────────────────────
 
     [SkippableFact]
     public void Bielik15B_Q3_K_M_VulkanForward_MatchesCpuReference()
     {
-        string? path = ResolveGgufPath(
-            envVar: "DOTLLM_BIELIK_15B_Q3_K_M_GGUF",
-            conventional: "C:/Users/james/.dotllm/test-cache/second-state/Bielik-1.5B-v3.0-Instruct-GGUF/Bielik-1.5B-v3.0-Instruct-Q3_K_M.gguf");
-        if (path is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Bielik-1.5B Q3_K_M GGUF not found. Set "
-                + "DOTLLM_BIELIK_15B_Q3_K_M_GGUF or download to "
-                + "~/.dotllm/test-cache/second-state/Bielik-1.5B-v3.0-Instruct-GGUF/Bielik-1.5B-v3.0-Instruct-Q3_K_M.gguf "
-                + "from huggingface.co/second-state/Bielik-1.5B-v3.0-Instruct-GGUF.");
-            return;
-        }
+        FixtureLocation fixture = TestFixtureResolver.ResolveFile(
+            "DOTLLM_BIELIK_15B_Q3_K_M_GGUF", "second-state", "Bielik-1.5B-v3.0-Instruct-GGUF",
+            "Bielik-1.5B-v3.0-Instruct-Q3_K_M.gguf");
+        Skip.If(!fixture.Found, fixture.SkipMessage("Bielik-1.5B Q3_K_M GGUF"));
+        string path = fixture.Path!;
         RunGgufParityTest(path, expectedArch: Architecture.Llama, label: "Bielik-1.5B-Q3_K_M",
             prompt: "The capital of France is");
     }
@@ -266,17 +223,11 @@ public sealed class RealGgufVulkanParityTests
     [SkippableFact]
     public void Qwen36A3B_IQ2_M_VulkanForward_MatchesCpuReference()
     {
-        string? path = ResolveGgufPath(
-            envVar: "DOTLLM_QWEN36_A3B_IQ2_M_GGUF",
-            conventional: "C:/Users/james/.dotllm/test-cache/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-IQ2_M.gguf");
-        if (path is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Qwen3.6-A3B-IQ2_M GGUF not found. Set DOTLLM_QWEN36_A3B_IQ2_M_GGUF or "
-                + "download to ~/.dotllm/test-cache/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-IQ2_M.gguf "
-                + "(~11.5 GB).");
-            return;
-        }
+        FixtureLocation fixture = TestFixtureResolver.ResolveFile(
+            "DOTLLM_QWEN36_A3B_IQ2_M_GGUF", "unsloth", "Qwen3.6-35B-A3B-GGUF",
+            "Qwen3.6-35B-A3B-IQ2_M.gguf");
+        Skip.If(!fixture.Found, fixture.SkipMessage("Qwen3.6-A3B IQ2_M GGUF (~11.5 GB)"));
+        string path = fixture.Path!;
         RunGgufParityTest(path, expectedArch: Architecture.Qwen3MoeHybrid, label: "Qwen3.6-A3B-IQ2_M",
             prompt: "The capital of France is");
     }
@@ -284,17 +235,11 @@ public sealed class RealGgufVulkanParityTests
     [SkippableFact]
     public void Qwen36A3B_IQ2_XXS_VulkanForward_MatchesCpuReference()
     {
-        string? path = ResolveGgufPath(
-            envVar: "DOTLLM_QWEN36_A3B_IQ2_XXS_GGUF",
-            conventional: "C:/Users/james/.dotllm/test-cache/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-IQ2_XXS.gguf");
-        if (path is null)
-        {
-            _output.WriteLine(
-                "[SKIP] Qwen3.6-A3B-IQ2_XXS GGUF not found. Set DOTLLM_QWEN36_A3B_IQ2_XXS_GGUF or "
-                + "download to ~/.dotllm/test-cache/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-IQ2_XXS.gguf "
-                + "(~10.8 GB).");
-            return;
-        }
+        FixtureLocation fixture = TestFixtureResolver.ResolveFile(
+            "DOTLLM_QWEN36_A3B_IQ2_XXS_GGUF", "unsloth", "Qwen3.6-35B-A3B-GGUF",
+            "Qwen3.6-35B-A3B-IQ2_XXS.gguf");
+        Skip.If(!fixture.Found, fixture.SkipMessage("Qwen3.6-A3B IQ2_XXS GGUF (~10.8 GB)"));
+        string path = fixture.Path!;
         RunGgufParityTest(path, expectedArch: Architecture.Qwen3MoeHybrid, label: "Qwen3.6-A3B-IQ2_XXS",
             prompt: "The capital of France is");
     }
@@ -416,14 +361,6 @@ public sealed class RealGgufVulkanParityTests
             UseHybridMlaCache = false,
         };
         return cpuConfig with { MlaConfig = mla };
-    }
-
-    private static string? ResolveGgufPath(string envVar, string conventional)
-    {
-        string? env = Environment.GetEnvironmentVariable(envVar);
-        if (!string.IsNullOrWhiteSpace(env) && File.Exists(env)) return env;
-        if (File.Exists(conventional)) return conventional;
-        return null;
     }
 
     private static void SkipIfVulkanUnavailable(out string spvDir)

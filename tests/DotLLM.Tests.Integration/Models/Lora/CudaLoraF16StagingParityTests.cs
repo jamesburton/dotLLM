@@ -29,20 +29,14 @@ public sealed class CudaLoraF16StagingParityTests
     private const string ModelPath =
         @"C:\Users\james\.dotllm\models\QuantFactory\SmolLM-135M-GGUF\SmolLM-135M.Q8_0.gguf";
 
-    [Fact]
+    [SkippableFact]
     public unsafe void F16Adapter_StagesOnGpu_AndMatchesCpu()
     {
-        if (!File.Exists(ModelPath))
-        {
-            _output.WriteLine($"SKIP: SmolLM-135M GGUF not found at {ModelPath}.");
-            return;
-        }
+        Skip.If(!File.Exists(ModelPath),
+            $"SmolLM-135M GGUF not found at {ModelPath}.");
 
-        if (!CudaDevice.IsAvailable())
-        {
-            _output.WriteLine("SKIP: No CUDA device available.");
-            return;
-        }
+        Skip.If(!CudaDevice.IsAvailable(),
+            "No CUDA device available.");
 
         using var gguf = GgufFile.Open(ModelPath);
         var cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);

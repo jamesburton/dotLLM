@@ -16,15 +16,15 @@
 //   lowSrcByte = sub < 8 ? sub : sub - 8         // sub 8..15 use bytes 0..7 high nibble
 //   lowNibble  = sub < 8 ? scales[lowSrcByte] & 0xF
 //                        : (scales[lowSrcByte] >> 4) & 0xF
-//   hiByte     = 8 + (sub / 4)                    // 8..11 each hold high 2 bits for 4 subs
-//   hiShift    = (sub % 4) * 2
+//   hiByte     = 8 + (sub % 4)                    // NOTE: byte/shift are transposed
+//   hiShift    = (sub / 4) * 2                    // vs the obvious 8+sub/4 @ (sub%4)*2
 //   hiBits     = (scales[hiByte] >> hiShift) & 0x3
 //   scale6     = lowNibble | (hiBits << 4)        // 0..63
 //
 // Per-element decode (sub = t / 16):
-//   signedScale = scale6[sub] - 32                // -32..31
-//   qBits = (qs[t/4] >> ((t%4)*2)) & 0x3          // 0..3
-//   hBit  = (hmask[t/8] >> (t%8)) & 0x1           // 0..1
+//   signedScale = scale6[sub] - 32                            // -32..31
+//   qBits = (qs[(t%32) + 32*(t/128)] >> (((t/32)%4)*2)) & 0x3  // 0..3
+//   hBit  = (hmask[t%32] >> (t/32)) & 0x1                      // 0..1
 //   signed3 = ((hBit << 2) | qBits) - 4           // -4..3
 //   value   = d * signedScale * signed3
 //
@@ -72,8 +72,8 @@ int unpackQ3Scale(uint scalesBase, uint sub) {
     } else {
         lowNibble = (readByte(scalesBase + (sub - 8u)) >> 4u) & 0xFu;
     }
-    uint hiByte  = 8u + (sub >> 2u);
-    uint hiShift = (sub & 3u) << 1u;
+    uint hiByte  = 8u + (sub & 3u);
+    uint hiShift = (sub >> 2u) << 1u;
     uint hiBits  = (readByte(scalesBase + hiByte) >> hiShift) & 0x3u;
     uint scale6  = lowNibble | (hiBits << 4u);
     return int(scale6) - 32;
@@ -93,11 +93,15 @@ void main() {
     uint sub = t >> 4u;                     // 0..15
     int signedScale = unpackQ3Scale(scalesBase, sub);
 
-    uint qByte  = readByte(qsBase + (t >> 2u));
-    uint bitOff = (t & 3u) << 1u;
+    // Element ordering per llama.cpp dequantize_row_q3_K: each 128-element half
+    // uses 32 qs bytes, each byte supplying FOUR elements 32 apart. Element t
+    // reads bit-pair (t/32)%4 of qs byte (t%32) + 32*(t/128); hmask bit t/32 of
+    // byte t%32.
+    uint qByte  = readByte(qsBase + (t & 31u) + 32u * (t >> 7u));
+    uint bitOff = ((t >> 5u) & 3u) << 1u;
     uint qBits  = (qByte >> bitOff) & 0x3u;
-    uint hByte  = readByte(hmaskBase + (t >> 3u));
-    uint hBit   = (hByte >> (t & 7u)) & 0x1u;
+    uint hByte  = readByte(hmaskBase + (t & 31u));
+    uint hBit   = (hByte >> (t >> 5u)) & 0x1u;
     int signed3 = int((hBit << 2u) | qBits) - 4;
 
     dst[block * Q3K_GROUP_SIZE + t] = d * float(signedScale) * float(signed3);

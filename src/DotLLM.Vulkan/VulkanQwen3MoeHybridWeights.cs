@@ -259,7 +259,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
             outputW, outputDeviceQt, outputOutputDim, outputInputDim, totalBytes);
     }
 
-    private static GdnLayerBuffers UploadGdnLayer(
+    internal static GdnLayerBuffers UploadGdnLayer(
         VulkanDevice device, VulkanStagingBuffer staging,
         GdnTokenMixingWeights gdnW, out long uploadedBytes)
     {
@@ -305,7 +305,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
             dtBiasHost: gdnW.DtBias);
     }
 
-    private static FullAttnLayerBuffers UploadFullAttnLayer(
+    internal static FullAttnLayerBuffers UploadFullAttnLayer(
         VulkanDevice device, VulkanStagingBuffer staging,
         Qwen3FullAttnWeights attnW, out long uploadedBytes)
     {
@@ -370,7 +370,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         return QuantizationType.F32;
     }
 
-    private static long ProjectionUploadBytes(int outputDim, int inputDim, QuantizationType qt)
+    internal static long ProjectionUploadBytes(int outputDim, int inputDim, QuantizationType qt)
     {
         if (KeepNative(qt, inputDim))
         {
@@ -426,7 +426,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
     /// alignment permits, otherwise dequantises to F32 on the host before
     /// upload.
     /// </summary>
-    private static unsafe VulkanDevice.Buffer UploadProjectionMatrix(
+    internal static unsafe VulkanDevice.Buffer UploadProjectionMatrix(
         VulkanDevice device, VulkanStagingBuffer staging,
         nint srcPtr, QuantizationType qt, int outputDim, int inputDim,
         bool forceF32,
@@ -489,7 +489,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         return fpBuf;
     }
 
-    private static unsafe VulkanDevice.Buffer UploadFloatArray(
+    internal static unsafe VulkanDevice.Buffer UploadFloatArray(
         VulkanDevice device, VulkanStagingBuffer staging, float[] data)
     {
         long bytes = (long)data.Length * sizeof(float);

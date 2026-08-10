@@ -30,9 +30,29 @@
 
 set -u
 
-# Default: <repo-root>/.gpu-lock (script lives in <repo-root>/scripts). Override with
-# DOTLLM_GPU_LOCK_DIR — worktrees/other checkouts MUST point at ONE shared dir per box.
-LOCK_DIR="${DOTLLM_GPU_LOCK_DIR:-$(cd "$(dirname "$0")/.." && pwd)/.gpu-lock}"
+# Default: <PRIMARY worktree>/.gpu-lock. Resolving to the *primary* worktree rather than
+# "the checkout this script lives in" is load-bearing: the lock exists to serialise access to
+# ONE physical GPU, so every worktree on the box must converge on the SAME directory.
+#
+# The old default (`dirname $0/..`) gave each worktree a PRIVATE lock, so parallel agents each
+# acquired "the" lock and ran on the GPU simultaneously — every acquire succeeded and the
+# contention was invisible. Any measurement taken from a worktree while another agent was
+# running is therefore suspect.
+#
+# `git rev-parse --git-common-dir` yields the primary checkout's .git even from a linked
+# worktree (where --git-dir points at .git/worktrees/<name>), so its parent is the primary
+# worktree. Falls back to the old behaviour outside a git repo. Override with
+# DOTLLM_GPU_LOCK_DIR to share a lock across unrelated clones on the same box.
+_gpu_lock_default_dir() {
+    local common
+    if common=$(git -C "$(dirname "$0")" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+       && [ -n "$common" ]; then
+        (cd "$common/.." && pwd)
+    else
+        (cd "$(dirname "$0")/.." && pwd)
+    fi
+}
+LOCK_DIR="${DOTLLM_GPU_LOCK_DIR:-$(_gpu_lock_default_dir)/.gpu-lock}"
 HOLDER_FILE="$LOCK_DIR/holder"
 
 cmd="${1:-}"

@@ -234,15 +234,15 @@ public sealed class SmolLM3SafetensorsLoadTests : IDisposable
     /// drops the safetensors / config.json into the cache; this test does
     /// not initiate the download.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void RealWeights_Loads_And_ForwardsFiniteLogits_WhenAvailable()
     {
         string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         string checkpointDir = Path.Combine(
             userProfile, ".dotllm", "test-cache", "HuggingFaceTB", "SmolLM3-3B");
         string configPath = Path.Combine(checkpointDir, "config.json");
-        if (!File.Exists(configPath))
-            return; // gated — not part of CI
+        // Used to `return;` here, which xunit reports as PASSED (#307).
+        Skip.IfNot(File.Exists(configPath), $"SmolLM3-3B checkpoint not found at {checkpointDir}.");
 
         var (model, source, config) = DotLLM.Models.ModelLoader.LoadFromSafetensors(checkpointDir);
         try
