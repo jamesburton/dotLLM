@@ -395,15 +395,23 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             _kernels.Add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch,
                 seqLen * hiddenSize);
             KernelSupport.ComputeToTransferBarrier(cmdBuf);
-            RecordCopyBufferRange(cmdBuf, _state.AddScratch, _state.HiddenState,
-                0, 0, (ulong)((long)seqLen * hiddenRowBytes));
-            KernelSupport.TransferToComputeBarrier(cmdBuf);
 
             // ── 2b. Dense SwiGLU FFN ────────────────────────────────────────
-            // Snapshot the post-token-mixing hidden state as the FFN residual,
-            // then post-norm → gate/up → SwiGLU → down → residual add. Mirrors
+            // Post-norm → gate/up → SwiGLU → down → residual add. Mirrors
             // Qwen3HybridDenseTransformerModel.ForwardDenseFfnBody.
-            RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.Residual,
+            //
+            // Both HiddenState and the FFN's residual snapshot are fanned out
+            // from AddScratch rather than chaining HiddenState → Residual.
+            // Chaining would be a transfer-write followed by a transfer-read of
+            // the same buffer inside one command buffer, and the barrier
+            // vocabulary here has no TRANSFER→TRANSFER edge (only
+            // TransferToCompute, which does not order a later transfer read).
+            // The MoE hybrid sibling never hits this because its two sublayers
+            // are separated by a submit; a dense FFN needs no host round-trip,
+            // so this host records the whole layer into one command buffer.
+            RecordCopyBufferRange(cmdBuf, _state.AddScratch, _state.HiddenState,
+                0, 0, (ulong)((long)seqLen * hiddenRowBytes));
+            RecordCopyBufferRange(cmdBuf, _state.AddScratch, _state.Residual,
                 0, 0, (ulong)((long)seqLen * hiddenRowBytes));
             KernelSupport.TransferToComputeBarrier(cmdBuf);
 
