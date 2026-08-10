@@ -5,6 +5,7 @@ using Architecture = DotLLM.Core.Configuration.Architecture;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Models.Architectures;
+using DotLLM.Models.Gguf;
 using DotLLM.Vulkan.Interop;
 using DotLLM.Vulkan.Kernels;
 
@@ -153,6 +154,15 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     // and ForwardBatch for the data flow.
     private VulkanNemotronHForwardBatchScratch? _batchScratch;
 
+    /// <summary>
+    /// The CPU model that produced <see cref="NemotronHLayerWeights"/> from a GGUF, when this
+    /// instance came from <see cref="BuildFromGguf"/>. Disposed with this model so its
+    /// dequantised norm arrays are released; the <c>GgufFile</c> itself stays caller-owned.
+    /// Null on the <see cref="BuildFromPrebuiltWeights"/> (synthetic-fixture) path. Assigned
+    /// once immediately after construction — see <see cref="BuildFromGguf"/>.
+    /// </summary>
+    private NemotronHTransformerModel? _cpuModel;
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -275,6 +285,90 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _ropeDim = ropeDim;
         _ropeTheta = ropeTheta;
     }
+
+    /// <summary>
+    /// Builds a Vulkan NemotronH model directly from an opened GGUF file — the entry point
+    /// <see cref="VulkanModelLoader.CreateFromGguf"/> dispatches <see cref="Architecture.NemotronH"/> to.
+    /// </summary>
+    /// <remarks>
+    /// Mirrors <see cref="VulkanQwen3MoeHybridTransformerModel.BuildFromGguf"/>: the CPU loader
+    /// (<see cref="NemotronHTransformerModel.LoadFromGguf"/>) does all GGUF tensor-name mapping and
+    /// per-layer validation, producing <see cref="NemotronHLayerWeights"/> that point into the
+    /// GGUF mmap; those are then uploaded to the device by
+    /// <see cref="VulkanNemotronHWeights.Upload"/>. Duplicating the tensor-name mapping here would
+    /// be a second place for the Nemotron-H naming conventions (<c>blk.N.ssm_*</c>, the
+    /// <c>attn_norm</c>-on-every-layer quirk, the non-gated FFN rejection) to drift.
+    /// <para>
+    /// Unlike the Qwen3-MoE hybrid, every Nemotron-H weight is uploaded to the device, so the CPU
+    /// model is retained only so its dequantised F32 norm arrays are disposed deterministically.
+    /// </para>
+    /// </remarks>
+    /// <param name="device">An initialized Vulkan device. Not owned; the caller disposes it.</param>
+    /// <param name="gguf">An opened GGUF file. Must outlive the returned model.</param>
+    /// <param name="config">Model configuration extracted from <paramref name="gguf"/>.</param>
+    /// <param name="spvDir">Directory containing compiled SPIR-V blobs.</param>
+    public static VulkanNemotronHTransformerModel BuildFromGguf(
+        VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir)
+    {
+        ArgumentNullException.ThrowIfNull(device);
+        ArgumentNullException.ThrowIfNull(gguf);
+        ArgumentNullException.ThrowIfNull(config);
+        ArgumentNullException.ThrowIfNull(spvDir);
+
+        if (config.Architecture != Architecture.NemotronH)
+            throw new ArgumentException(
+                $"VulkanNemotronHTransformerModel requires Architecture.NemotronH, got {config.Architecture}.",
+                nameof(config));
+
+        var cpuModel = NemotronHTransformerModel.LoadFromGguf(gguf, config);
+        try
+        {
+            var cpuLayers = ExtractCpuLayers(cpuModel);
+            var outputNormWeight = ExtractOutputNormWeight(cpuModel);
+            var (tokenEmbedPtr, tokenEmbedQt) = ExtractTokenEmbed(cpuModel);
+            var (outputPtr, outputQt, outputM, outputK) = ExtractOutput(cpuModel);
+
+            var model = BuildFromPrebuiltWeights(
+                device, config, cpuLayers, outputNormWeight,
+                outputPtr, outputQt, outputM, outputK,
+                tokenEmbedPtr, tokenEmbedQt, spvDir);
+            model._cpuModel = cpuModel;
+            return model;
+        }
+        catch
+        {
+            cpuModel.Dispose();
+            throw;
+        }
+    }
+
+    // ── CPU-model accessors (we share the CPU GGUF loader; reach into its weights) ─
+    // The CPU model holds these privately. Surfacing them via reflection mirrors
+    // VulkanQwen3MoeHybridTransformerModel; the alternative is widening the public
+    // DotLLM.Models API for a single internal consumer.
+
+    private static NemotronHLayerWeights[] ExtractCpuLayers(NemotronHTransformerModel m)
+        => (NemotronHLayerWeights[])Field("_layers").GetValue(m)!;
+
+    private static float[] ExtractOutputNormWeight(NemotronHTransformerModel m)
+        => (float[])Field("_outputNormWeight").GetValue(m)!;
+
+    private static (nint ptr, QuantizationType qt) ExtractTokenEmbed(NemotronHTransformerModel m)
+        => ((nint)Field("_tokenEmbedWeight").GetValue(m)!,
+            (QuantizationType)Field("_tokenEmbedQuantType").GetValue(m)!);
+
+    private static (nint ptr, QuantizationType qt, int outputDim, int inputDim) ExtractOutput(
+        NemotronHTransformerModel m)
+        => ((nint)Field("_outputWeight").GetValue(m)!,
+            (QuantizationType)Field("_outputQuantType").GetValue(m)!,
+            (int)Field("_outputOutputDim").GetValue(m)!,
+            (int)Field("_outputInputDim").GetValue(m)!);
+
+    private static System.Reflection.FieldInfo Field(string name)
+        => typeof(NemotronHTransformerModel).GetField(
+               name,
+               System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+           ?? throw new InvalidOperationException($"NemotronHTransformerModel.{name} field missing.");
 
     /// <summary>
     /// Builds a Vulkan NemotronH model from caller-owned, pre-built <see cref="NemotronHLayerWeights"/> —
@@ -1429,6 +1523,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _state.Dispose();
         _weights.Dispose();
         _ssmCache.Dispose();
+        // Frees the CPU loader's dequantised norm arrays and detaches it from the GgufFile.
+        // The GgufFile is owned by the BuildFromGguf caller, so it is not disposed here.
+        _cpuModel?.Dispose();
 
         _ssmSplitXbc.Dispose();
         _reluSquared.Dispose();
