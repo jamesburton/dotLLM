@@ -855,11 +855,12 @@ internal sealed class VulkanWeights : IDisposable
     /// </summary>
     /// <remarks>
     /// <para>
-    /// GPU-side dequant path (issue #147): when the source table is Q4_K / Q6_K
-    /// (the llama.cpp <c>*_K_M</c> / IQ4 file-type embeds), the RAW quantized
-    /// bytes go to the device (zero-copy imported when the driver allows,
-    /// otherwise streamed through the bounded staging buffer at their quantized
-    /// size — 3.5-6.6 bpw instead of 32) and a one-time <c>q4_k/q6_k_dequant_f32</c>
+    /// GPU-side dequant path (issue #147): when the source table is
+    /// Q4_K / Q5_K / Q6_K (the llama.cpp <c>*_K_M</c> / IQ4 file-type embeds),
+    /// the RAW quantized bytes go to the device (zero-copy imported when the
+    /// driver allows, otherwise streamed through the bounded staging buffer at
+    /// their quantized size — 3.5-6.6 bpw instead of 32) and a one-time
+    /// <c>q4_k/q5_k/q6_k_dequant_f32</c>
     /// compute dispatch expands them into the device-local F32 gather table.
     /// The host never materialises the vocab×hidden×4 F32 image, and the shader
     /// is bit-identical to the CPU oracle (<c>precise</c> math, same op order).
@@ -883,10 +884,14 @@ internal sealed class VulkanWeights : IDisposable
 
         bool gpuEligible = spvDir is not null
             && !IsEmbedGpuDequantDisabled()
-            && qt is QuantizationType.Q4_K or QuantizationType.Q6_K
+            && qt is QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K
             && (hidden % 256) == 0
-            && File.Exists(Path.Combine(spvDir,
-                qt == QuantizationType.Q4_K ? "q4_k_dequant_f32.spv" : "q6_k_dequant_f32.spv"));
+            && File.Exists(Path.Combine(spvDir, qt switch
+            {
+                QuantizationType.Q4_K => "q4_k_dequant_f32.spv",
+                QuantizationType.Q5_K => "q5_k_dequant_f32.spv",
+                _ => "q6_k_dequant_f32.spv",
+            }));
 
         if (!gpuEligible)
         {
@@ -915,6 +920,12 @@ internal sealed class VulkanWeights : IDisposable
                 using var kernel = Q4KDequantF32Kernel.Create(device, spvDir!);
                 kernel.Launch(srcBuf!, dst, totalBlocks);
                 LastTokenEmbedDequantPath = imported ? "gpu-q4_k-imported" : "gpu-q4_k";
+            }
+            else if (qt == QuantizationType.Q5_K)
+            {
+                using var kernel = Q5KDequantF32Kernel.Create(device, spvDir!);
+                kernel.Launch(srcBuf!, dst, totalBlocks);
+                LastTokenEmbedDequantPath = imported ? "gpu-q5_k-imported" : "gpu-q5_k";
             }
             else
             {
