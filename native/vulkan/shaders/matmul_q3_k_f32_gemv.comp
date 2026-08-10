@@ -23,8 +23,8 @@
 // Reconstruction (mirrors DequantizeQ3_KScalar). For element t in [0, 256):
 //   sub        = t / 16                                     // 0..15
 //   signedSc   = unpackQ3Scale(sub) - 32                     // -32..31
-//   qBits      = (qs[t/4] >> ((t%4)*2)) & 0x3                // 0..3
-//   hBit       = (hmask[t/8] >> (t%8)) & 0x1                 // 0..1
+//   qBits      = (qs[(t%32) + 32*(t/128)] >> (((t/32)%4)*2)) & 0x3   // 0..3
+//   hBit       = (hmask[t%32] >> (t/32)) & 0x1               // 0..1
 //   signed3    = ((hBit << 2) | qBits) - 4                   // -4..3
 //   value      = d * signedSc * signed3
 //
@@ -88,8 +88,8 @@ int unpackQ3Scale(uint scalesBase, uint sub) {
     } else {
         lowNibble = (readByte(scalesBase + (sub - 8u)) >> 4u) & 0xFu;
     }
-    uint hiByte  = 8u + (sub >> 2u);
-    uint hiShift = (sub & 3u) << 1u;
+    uint hiByte  = 8u + (sub & 3u);
+    uint hiShift = (sub >> 2u) << 1u;
     uint hiBits  = (readByte(scalesBase + hiByte) >> hiShift) & 0x3u;
     uint scale6  = lowNibble | (hiBits << 4u);
     return int(scale6) - 32;
@@ -122,22 +122,26 @@ void main() {
             int signedSc = unpackQ3Scale(scalesBase, sub);
             float scF = d * float(signedSc);
 
-            // The sub-block's 16 two-bit qs values pack into one funnelled word
-            // (value l at bit l*2); its 16 hmask high bits are the low 16 bits of
-            // the funnelled hmask word (byte t/8, bit t%8 ⇒ bit l). Fetch each
-            // ONCE and bitfield-extract into vec4 lanes — the old path issued a
-            // scalar word load per qs byte AND per hmask byte, 4× redundant.
-            uint qsw  = read4Bytes(qsBase + sub * 4u);
-            uint hm16 = read4Bytes(hmaskBase + sub * 2u) & 0xFFFFu;
+            // llama.cpp element ordering: the sub-block's 16 elements live in 16
+            // CONSECUTIVE qs bytes at 32*(sub/8) + 16*(sub%2) — one 2-bit field
+            // per byte at the FIXED bit-pair ((sub/2)%4) — and 16 consecutive
+            // hmask bytes at 16*(sub%2), one bit each at index (sub/2). So each
+            // group of 4 elements is one funnelled word from each plane; the
+            // shift is uniform across the sub-block.
+            uint qsSubBase = qsBase    + 32u * (sub >> 3u) + 16u * (sub & 1u);
+            uint hmSubBase = hmaskBase + 16u * (sub & 1u);
+            uint qShift = ((sub >> 1u) & 3u) << 1u;
+            uint hBitIdx = sub >> 1u;
             uint outBase = xBase + sub * 16u;
             float subSum = 0.0;
             for (uint g = 0u; g < 4u; g++) {
-                uint s2 = g * 8u;            // q2 bit base (l*2 for l=g*4)
-                uvec4 q2 = uvec4((qsw >> s2) & 3u, (qsw >> (s2 + 2u)) & 3u,
-                                 (qsw >> (s2 + 4u)) & 3u, (qsw >> (s2 + 6u)) & 3u);
-                uint lb = g * 4u;            // hmask bit base (l for l=g*4)
-                uvec4 hb = uvec4((hm16 >> lb) & 1u, (hm16 >> (lb + 1u)) & 1u,
-                                 (hm16 >> (lb + 2u)) & 1u, (hm16 >> (lb + 3u)) & 1u);
+                uint lb  = g * 4u;
+                uint qsw = read4Bytes(qsSubBase + lb);
+                uint hmw = read4Bytes(hmSubBase + lb);
+                uvec4 q2 = uvec4((qsw >> qShift) & 3u, (qsw >> (8u + qShift)) & 3u,
+                                 (qsw >> (16u + qShift)) & 3u, (qsw >> (24u + qShift)) & 3u);
+                uvec4 hb = uvec4((hmw >> hBitIdx) & 1u, (hmw >> (8u + hBitIdx)) & 1u,
+                                 (hmw >> (16u + hBitIdx)) & 1u, (hmw >> (24u + hBitIdx)) & 1u);
                 vec4 s3 = vec4((hb << 2u) | q2) - vec4(4.0);
                 uint xb = outBase + lb;
                 vec4 xv = vec4(x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]);

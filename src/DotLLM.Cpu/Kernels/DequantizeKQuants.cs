@@ -297,41 +297,52 @@ public static unsafe partial class Dequantize
             float d = (float)BitConverter.UInt16BitsToHalf(dHalf);
 
             // Unpack 12 bytes → 16 unsigned 6-bit scales (then biased by -32).
-            // Per llama.cpp ggml-quants.c dequantize_row_q3_K, the low 4 bits of
-            // each scale live in scales12[0..7]:
-            //   sub 0..3  low nibble = scales12[0..3] low nibble
-            //   sub 4..7  low nibble = scales12[4..7] low nibble
-            //   sub 8..11 low nibble = scales12[0..3] high nibble
-            //   sub 12..15 low nibble = scales12[4..7] high nibble
-            // Bytes 8..11 hold the high 2 bits packed 4 scales per byte:
-            //   byte 8: subs 0..3,  byte 9: subs 4..7,
-            //   byte 10: subs 8..11, byte 11: subs 12..15.
-            // Earlier dotLLM code read sub 12..15 from bytes 8..11 high nibble,
-            // which collided with the high-2-bits packing — silently corrupting
-            // sub-blocks 12..15 of every Q3_K super-block. Now matches llama.cpp.
+            // Per llama.cpp ggml-quants.c dequantize_row_q3_K (the `aux` shuffle):
+            //   scales[ 0+b] = (s[  b] & 0xF) | (((s[8+b] >> 0) & 3) << 4)
+            //   scales[ 4+b] = (s[4+b] & 0xF) | (((s[8+b] >> 2) & 3) << 4)
+            //   scales[ 8+b] = (s[  b] >> 4)  | (((s[8+b] >> 4) & 3) << 4)
+            //   scales[12+b] = (s[4+b] >> 4)  | (((s[8+b] >> 6) & 3) << 4)   for b in 0..3
+            // i.e. the low nibble comes from bytes 0..7 (low nibble for sub 0..7,
+            // high nibble for sub 8..15) and the high 2 bits come from
+            // byte 8 + (sub % 4) at shift 2 * (sub / 4). The byte/shift pair is
+            // TRANSPOSED relative to the obvious-looking 8 + sub/4 @ (sub%4)*2 —
+            // getting it the wrong way round scrambles 12 of the 16 sub-blocks.
             for (int sub = 0; sub < 16; sub++)
             {
                 int lowSrcByte = sub < 8 ? sub : sub - 8;  // sub 8..15 → bytes 0..7 high nibble
                 int lowNibble = sub < 8 ? scales12[lowSrcByte] & 0x0F : (scales12[lowSrcByte] >> 4) & 0x0F;
-                int hiByte = 8 + (sub / 4);
-                int hiShift = (sub % 4) * 2;
+                int hiByte = 8 + (sub % 4);
+                int hiShift = (sub / 4) * 2;
                 int hiBits = (scales12[hiByte] >> hiShift) & 0x03;
                 scales[sub] = (byte)(lowNibble | (hiBits << 4));
             }
 
             // 16 sub-blocks × 16 elements = 256 elements per super-block.
+            //
+            // Element ordering (llama.cpp dequantize_row_q3_K): the 2-bit quants
+            // are NOT stored 4-consecutive-elements-per-byte. Each 128-element
+            // half of the super-block uses 32 qs bytes, and each byte supplies
+            // FOUR elements 32 apart — element e reads bit-pair (e/32)%4 of
+            // byte (e%32) + 32*(e/128). The hmask is likewise transposed: element
+            // e reads bit e/32 of byte e%32. Reading them as e/4 @ (e%4)*2 and
+            // e/8 @ e%8 (the old dotLLM layout) permutes every element of every
+            // super-block into the wrong sub-block scale — decoded weights
+            // correlate ~0.01 with the true values.
             for (int sub = 0; sub < 16; sub++)
             {
                 int signedScale = scales[sub] - 32;  // [-32, 31]
                 float scaleD = d * signedScale;
                 int eBase = sub * 16;
+                int qsSubBase = 32 * (sub >> 3) + 16 * (sub & 1);
+                int qShift = ((sub >> 1) & 3) * 2;
+                int hmSubBase = 16 * (sub & 1);
+                int hBitIdx = sub >> 1;
                 for (int l = 0; l < 16; l++)
                 {
-                    int e = eBase + l;
-                    int qBits = (qs[e / 4] >> ((e % 4) * 2)) & 0x03;
-                    int hBit = (hmask[e / 8] >> (e % 8)) & 0x01;
+                    int qBits = (qs[qsSubBase + l] >> qShift) & 0x03;
+                    int hBit = (hmask[hmSubBase + l] >> hBitIdx) & 0x01;
                     int signed3 = ((hBit << 2) | qBits) - 4;  // [-4, 3]
-                    dest[(int)(destOffset + e)] = scaleD * signed3;
+                    dest[(int)(destOffset + eBase + l)] = scaleD * signed3;
                 }
             }
 

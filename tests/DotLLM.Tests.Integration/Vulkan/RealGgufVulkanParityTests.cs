@@ -229,12 +229,17 @@ public sealed class RealGgufVulkanParityTests
     // ────────────────────────────────────────────────────────────────────
     // Bielik-1.5B Q3_K_M (~660 MB GGUF) — exercises Q3_K Vulkan kernels.
     //
-    // Q3_K caveat: the dotLLM CPU oracle has a pre-existing layout bug for
-    // sub-blocks 12..15 of every Q3_K super-block (see
-    // docs/QUANTIZATION.md). The Vulkan kernel matches the CPU oracle
-    // bit-for-bit, so the parity assertion below holds — but this test does
-    // NOT validate Q3_K against llama.cpp / canonical GGUF semantics on
-    // those four sub-blocks.
+    // This test is what surfaced #311: Q3_K's bit layout was transposed in
+    // BOTH the scale high-bits and the element ordering, in every backend and
+    // in the kernel-test fixture, so the decoded weights were noise (corr
+    // 0.006 vs the Q8_0 build of the same model). Cross-backend parity still
+    // "held" at the kernel level because every side shared the bug; only a
+    // real 32-layer GGUF forward amplified the resulting garbage far enough
+    // (L∞ 5.09, top-10 Jaccard 0.40) to break the end-to-end bound.
+    //
+    // Canonical-semantics coverage now lives in
+    // DequantizeKQuantTests.Q3_K_DenseRandomBlocks_MatchLlamaCppReference;
+    // this test remains the cross-backend check. See docs/QUANTIZATION.md.
     // ────────────────────────────────────────────────────────────────────
 
     [SkippableFact]

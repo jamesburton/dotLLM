@@ -74,8 +74,8 @@ int unpackQ3Scale(uint scalesBase, uint sub) {
     } else {
         lowNibble = (readByte(scalesBase + (sub - 8u)) >> 4u) & 0xFu;
     }
-    uint hiByte  = 8u + (sub >> 2u);
-    uint hiShift = (sub & 3u) << 1u;
+    uint hiByte  = 8u + (sub & 3u);
+    uint hiShift = (sub >> 2u) << 1u;
     uint hiBits  = (readByte(scalesBase + hiByte) >> hiShift) & 0x3u;
     uint scale6  = lowNibble | (hiBits << 4u);
     return int(scale6) - 32;
@@ -127,12 +127,17 @@ void main() {
                 int signedSc = unpackQ3Scale(scalesBase, subIdx);
                 float scF = d * float(signedSc);
 
-                uint elem   = subIdx * SUBBLOCK + col;
-                uint qByte  = readByte(qsBase + (elem >> 2u));
-                uint bitOff = (elem & 3u) << 1u;
+                // llama.cpp element ordering: the 16 elements of sub-block
+                // `subIdx` are 16 CONSECUTIVE qs bytes at
+                // 32*(sub/8) + 16*(sub%2), read at bit-pair ((sub/2)%4), and 16
+                // consecutive hmask bytes at 16*(sub%2), bit (sub/2).
+                uint qsSubBase  = 32u * (subIdx >> 3u) + 16u * (subIdx & 1u);
+                uint hmSubBase  = 16u * (subIdx & 1u);
+                uint qByte  = readByte(qsBase + qsSubBase + col);
+                uint bitOff = ((subIdx >> 1u) & 3u) << 1u;
                 uint qBits  = (qByte >> bitOff) & 0x3u;
-                uint hByte  = readByte(hmaskBase + (elem >> 3u));
-                uint hBit   = (hByte >> (elem & 7u)) & 0x1u;
+                uint hByte  = readByte(hmaskBase + hmSubBase + col);
+                uint hBit   = (hByte >> (subIdx >> 1u)) & 0x1u;
                 int signed3 = int((hBit << 2u) | qBits) - 4;
 
                 w = scF * float(signed3);

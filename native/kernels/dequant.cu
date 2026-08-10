@@ -251,17 +251,22 @@ extern "C" __global__ void __launch_bounds__(256) dequant_q3_k_f16(
         //   sub 0..7  low nibble = scales12[sub] low nibble
         //   sub 8..15 low nibble = scales12[sub-8] high nibble (NOT sub-4 — that
         //   collides with the high-2-bits packing in scales12[8..11]).
-        //   scales12[8 + sub/4]  → high 2 bits at offset (sub%4)*2
+        //   high 2 bits = scales12[8 + (sub % 4)] >> ((sub / 4) * 2)
+        // The byte/shift pair is TRANSPOSED relative to the obvious-looking
+        // 8 + sub/4 @ (sub%4)*2 — the wrong way round scrambles 12 of 16 scales.
         int lowSrcByte = sub < 8 ? sub : sub - 8;
         int lowNibble = sub < 8
             ? (scales12[lowSrcByte] & 0x0F)
             : ((scales12[lowSrcByte] >> 4) & 0x0F);
-        int hiBits = (scales12[8 + (sub >> 2)] >> ((sub & 3) * 2)) & 0x03;
+        int hiBits = (scales12[8 + (sub & 3)] >> ((sub >> 2) * 2)) & 0x03;
         int signedScale = (lowNibble | (hiBits << 4)) - 32;  // [-32, 31]
 
-        // Per-element 3-bit unpacking.
-        int qBits = (qs[t >> 2] >> ((t & 3) * 2)) & 0x03;
-        int hBit = (hmask[t >> 3] >> (t & 7)) & 0x01;
+        // Per-element 3-bit unpacking. The 2-bit quants are NOT stored four
+        // consecutive elements per byte: element t reads bit-pair (t/32)%4 of
+        // qs byte (t%32) + 32*(t/128), and hmask bit t/32 of byte t%32
+        // (llama.cpp's shift/m loop over 128-element halves).
+        int qBits = (qs[(t & 31) + 32 * (t >> 7)] >> (((t >> 5) & 3) * 2)) & 0x03;
+        int hBit = (hmask[t & 31] >> (t >> 5)) & 0x01;
         int signed3 = ((hBit << 2) | qBits) - 4;  // [-4, 3]
 
         dst[(size_t)sb_idx * Q3_K_SUPER_BLOCK_SIZE + t] =

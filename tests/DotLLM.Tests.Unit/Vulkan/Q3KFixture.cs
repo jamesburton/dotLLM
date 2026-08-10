@@ -15,7 +15,7 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// Q3_K block layout (matches <c>DequantizeQ3_KScalar</c> / llama.cpp):
 /// <c>hmask[32] (1 bit/elem) + qs[64] (2 bits/elem) + scales[12] (16 × 6-bit unsigned, biased -32) + d (fp16) = 110 bytes / 256 elements</c>.
 /// Decoded value per element <c>t</c> with <c>sub = t / 16</c>:
-/// <c>q3 = ((hmask[t/8] &gt;&gt; (t%8)) &amp; 1) &lt;&lt; 2 | ((qs[t/4] &gt;&gt; ((t%4)*2)) &amp; 3) - 4</c>
+/// <c>q3 = ((hmask[t%32] &gt;&gt; (t/32)) &amp; 1) &lt;&lt; 2 | ((qs[(t%32)+32*(t/128)] &gt;&gt; (((t/32)%4)*2)) &amp; 3) - 4</c>
 /// gives a signed 3-bit value in <c>-4..3</c>;
 /// <c>signedScale = scales[sub] - 32</c> in <c>-32..31</c>;
 /// <c>value = d * signedScale * q3</c>.
@@ -39,10 +39,16 @@ internal static unsafe class Q3KFixture
 
     /// <summary>
     /// Generate a uniform-random FP32 array in [-range, range). All 16
-    /// sub-blocks per super-block carry random data — the CPU-oracle bug
-    /// flagged by Agent 4 (sub_12..15 read from bytes 8..11 high nibble
-    /// instead of bytes 4..7) has been fixed in <c>DequantizeQ3_KScalar</c>
-    /// and the matching CUDA + Vulkan kernels.
+    /// sub-blocks per super-block carry random data.
+    /// <para>
+    /// NOTE (#311): this fixture used to pack with the same transposed Q3_K
+    /// layout the kernels decoded with, so every Q3_K kernel test was a closed
+    /// wrong-encoder/wrong-decoder loop that passed while real GGUF weights
+    /// decoded to noise. The packing here is now canonical llama.cpp; keep it
+    /// that way, and keep
+    /// <c>DequantizeKQuantTests.Q3_K_DenseRandomBlocks_MatchLlamaCppReference</c>
+    /// as the independent anchor so the loop cannot silently close again.
+    /// </para>
     /// </summary>
     public static float[] RandomFloats(Random rng, int count, float range)
     {
@@ -157,14 +163,18 @@ internal static unsafe class Q3KFixture
         for (int i = 0; i < 64; i++) qsPtr[i]    = 0;
         for (int i = 0; i < 12; i++) scalesPtr[i] = 0;
 
+        // Canonical llama.cpp element ordering (quantize_row_q3_K_ref): each
+        // 128-element half uses 32 qs bytes, and each byte carries FOUR elements
+        // 32 apart — element t lands in bit-pair (t/32)%4 of byte
+        // (t%32) + 32*(t/128); its high bit lands in bit t/32 of hmask[t%32].
         for (int t = 0; t < Q3KGroupSize; t++)
         {
             int q3plus4 = q3vals[t] + 4; // 0..7 (3-bit unsigned)
             int low2 = q3plus4 & 0x3;
             int hi1  = (q3plus4 >> 2) & 0x1;
 
-            qsPtr[t >> 2] |= (byte)(low2 << ((t & 3) * 2));
-            hmaskPtr[t >> 3] |= (byte)(hi1 << (t & 7));
+            qsPtr[(t % 32) + 32 * (t / 128)] |= (byte)(low2 << (((t / 32) % 4) * 2));
+            hmaskPtr[t % 32] |= (byte)(hi1 << (t / 32));
         }
 
         // Pack scales[12]: 6-bit unsigned per sub-block (subScalesI[j] + 32, range 0..63).
@@ -172,7 +182,8 @@ internal static unsafe class Q3KFixture
         //   sub  0..7  low nibble = scales12[sub] low nibble
         //   sub  8..15 low nibble = scales12[sub-8] high nibble (NOT sub-4 — that
         //   collides with the high-2-bits packing). Bytes 0..7 carry both halves.
-        //   sub  0..15 high 2 bits = scales12[8 + sub/4], shifted by (sub%4)*2.
+        //   sub  0..15 high 2 bits = scales12[8 + sub%4], shifted by (sub/4)*2
+        //   (byte and shift are TRANSPOSED vs the obvious-looking 8+sub/4 @ (sub%4)*2).
         for (int sub = 0; sub < 16; sub++)
         {
             int scale6 = (subScalesI[sub] + 32) & 0x3F;
@@ -191,8 +202,8 @@ internal static unsafe class Q3KFixture
         {
             int scale6 = (subScalesI[sub] + 32) & 0x3F;
             int hi2  = (scale6 >> 4) & 0x3;
-            int hiByte = 8 + (sub / 4);
-            int hiShift = (sub % 4) * 2;
+            int hiByte = 8 + (sub % 4);
+            int hiShift = (sub / 4) * 2;
             byte mask = (byte)(0x3 << hiShift);
             scalesPtr[hiByte] = (byte)((scalesPtr[hiByte] & ~mask) | (hi2 << hiShift));
         }
@@ -214,10 +225,10 @@ internal static unsafe class Q3KFixture
     }
 
     /// <summary>
-    /// Smoke check on the fixture round-trip. The Q3_K dequant bug
-    /// (sub_12..15 reading from bytes 8..11 high nibble) has been fixed in
-    /// <c>DequantizeQ3_KScalar</c>, so round-trip drift on Q3_K now matches
-    /// the K-quant family at large (~few percent depending on data distribution).
+    /// Smoke check on the fixture round-trip. With the #311 layout fix in both
+    /// the fixture packer and <c>DequantizeQ3_KScalar</c>, round-trip drift on
+    /// Q3_K matches the K-quant family at large (~few percent depending on data
+    /// distribution).
     /// </summary>
     public static void AssertFixtureRoundtrip(float[] srcF32, byte[] q3kBytes, int m, int k)
     {
@@ -283,8 +294,8 @@ internal static unsafe class Q3KFixture
                         for (int l = 0; l < 16; l++)
                         {
                             int t = sub * 16 + l;
-                            int qBits = (qs[t >> 2] >> ((t & 3) * 2)) & 0x3;
-                            int hBit  = (hmask[t >> 3] >> (t & 7)) & 0x1;
+                            int qBits = (qs[(t % 32) + 32 * (t / 128)] >> (((t / 32) % 4) * 2)) & 0x3;
+                            int hBit  = (hmask[t % 32] >> (t / 32)) & 0x1;
                             int signed3 = ((hBit << 2) | qBits) - 4;
                             float w = scF * signed3;
                             sum += w * x[outBase + l];
@@ -337,8 +348,8 @@ internal static unsafe class Q3KFixture
                             for (int l = 0; l < 16; l++)
                             {
                                 int tIdx = sub * 16 + l;
-                                int qBits = (qs[tIdx >> 2] >> ((tIdx & 3) * 2)) & 0x3;
-                                int hBit  = (hmask[tIdx >> 3] >> (tIdx & 7)) & 0x1;
+                                int qBits = (qs[(tIdx % 32) + 32 * (tIdx / 128)] >> (((tIdx / 32) % 4) * 2)) & 0x3;
+                                int hBit  = (hmask[tIdx % 32] >> (tIdx / 32)) & 0x1;
                                 int signed3 = ((hBit << 2) | qBits) - 4;
                                 float w = scF * signed3;
                                 sum += w * inputB[bRowBase + outBase + l];
@@ -359,8 +370,8 @@ internal static unsafe class Q3KFixture
             lowNibble = scales12[sub] & 0xF;
         else
             lowNibble = (scales12[sub - 8] >> 4) & 0xF;
-        int hiByte  = 8 + (sub / 4);
-        int hiShift = (sub % 4) * 2;
+        int hiByte  = 8 + (sub % 4);
+        int hiShift = (sub / 4) * 2;
         int hiBits  = (scales12[hiByte] >> hiShift) & 0x3;
         return lowNibble | (hiBits << 4);
     }
