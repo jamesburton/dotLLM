@@ -256,6 +256,115 @@ public sealed unsafe class DequantizeKQuantTests
         }
     }
 
+    /// <summary>
+    /// Discriminating Q3_K oracle test (#311). <see cref="Q3_K_SingleBlock_HandCalculated"/>
+    /// only touches element 0/1 of sub-block 0 and an all-zero sub-block 1 — a degenerate
+    /// case where the correct and the incorrect bit layouts coincide, which is exactly why
+    /// a total scramble of Q3_K could sit in this PR undetected.
+    ///
+    /// This test drives DENSE pseudorandom super-block bytes through
+    /// <see cref="Dequantize.ToFloat32"/> and compares against a LITERAL transcription of
+    /// llama.cpp's <c>ggml-quants.c dequantize_row_q3_K</c> — including the 32-bit
+    /// <c>aux</c>/<c>kmask</c> scale shuffle and the <c>shift</c>/<c>m</c> loop over
+    /// 128-element halves. The reference is written in llama.cpp's own control-flow shape,
+    /// structurally unlike the production kernel's closed-form indexing, so agreement is
+    /// evidence rather than a shared-mistake tautology.
+    ///
+    /// Discrimination proof: reverting either half of the fix makes this red —
+    /// the scale hi-bits byte/shift transposition (<c>8 + sub%4 @ (sub/4)*2</c> →
+    /// <c>8 + sub/4 @ (sub%4)*2</c>) or the element ordering
+    /// (<c>qs[(t%32)+32*(t/128)] @ ((t/32)%4)*2</c> → <c>qs[t/4] @ (t%4)*2</c>).
+    /// </summary>
+    [Fact]
+    public void Q3_K_DenseRandomBlocks_MatchLlamaCppReference()
+    {
+        const int blocks = 5;
+        const int elements = blocks * KQuantGroupSize;
+        nuint totalBytes = (nuint)(blocks * Q3_K_BlockBytes);
+        nint ptr = (nint)NativeMemory.AlignedAlloc(totalBytes, 64);
+        try
+        {
+            var rng = new Random(20260810);
+            byte* raw = (byte*)ptr;
+            for (int i = 0; i < (int)totalBytes; i++) raw[i] = (byte)rng.Next(256);
+            // Keep the fp16 super-block deltas finite and O(1) so the comparison is
+            // about bit layout, not about NaN/Inf plumbing.
+            for (int b = 0; b < blocks; b++)
+                Unsafe.WriteUnaligned(raw + b * Q3_K_BlockBytes + 108, (Half)(0.25f + 0.125f * b));
+
+            float[] actual = new float[elements];
+            Dequantize.ToFloat32(ptr, elements, QuantizationType.Q3_K, actual);
+
+            float[] expected = LlamaCppDequantizeRowQ3K(raw, blocks);
+
+            // Both sides compute the identical product in float — require exact equality.
+            for (int i = 0; i < elements; i++)
+            {
+                Assert.True(expected[i] == actual[i],
+                    $"Q3_K element {i} (block {i / KQuantGroupSize}, sub {(i % KQuantGroupSize) / 16}, "
+                    + $"lane {i % 16}): llama.cpp reference {expected[i]} != dotLLM {actual[i]}");
+            }
+        }
+        finally
+        {
+            NativeMemory.AlignedFree((void*)ptr);
+        }
+    }
+
+    /// <summary>
+    /// Literal transcription of llama.cpp <c>ggml-quants.c dequantize_row_q3_K</c>
+    /// (the authoritative GGUF Q3_K semantics), kept in its original control-flow shape
+    /// on purpose — see <see cref="Q3_K_DenseRandomBlocks_MatchLlamaCppReference"/>.
+    /// </summary>
+    private static float[] LlamaCppDequantizeRowQ3K(byte* src, int nb)
+    {
+        const uint kmask1 = 0x03030303u;
+        const uint kmask2 = 0x0f0f0f0fu;
+
+        var y = new float[nb * KQuantGroupSize];
+        int outIdx = 0;
+        uint* aux = stackalloc uint[4];
+        sbyte* scales = (sbyte*)aux;
+
+        for (int i = 0; i < nb; i++)
+        {
+            byte* block = src + i * Q3_K_BlockBytes;
+            byte* hm = block;               // hmask[32]
+            byte* q = block + 32;           // qs[64]
+            float dAll = (float)Unsafe.ReadUnaligned<Half>(block + 108);
+
+            for (int w = 0; w < 3; w++) aux[w] = Unsafe.ReadUnaligned<uint>(block + 96 + w * 4);
+            uint tmp = aux[2];
+            aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+            aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+            aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+            aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+            byte m = 1;
+            int qOff = 0;
+            int isIdx = 0;
+            for (int n = 0; n < KQuantGroupSize; n += 128)
+            {
+                int shift = 0;
+                for (int j = 0; j < 4; ++j)
+                {
+                    float dl = dAll * (scales[isIdx++] - 32);
+                    for (int l = 0; l < 16; ++l)
+                        y[outIdx++] = dl * (((q[qOff + l] >> shift) & 3) - (((hm[l] & m) != 0) ? 0 : 4));
+
+                    dl = dAll * (scales[isIdx++] - 32);
+                    for (int l = 0; l < 16; ++l)
+                        y[outIdx++] = dl * (((q[qOff + l + 16] >> shift) & 3) - (((hm[l + 16] & m) != 0) ? 0 : 4));
+
+                    shift += 2;
+                    m <<= 1;
+                }
+                qOff += 32;
+            }
+        }
+        return y;
+    }
+
     [Fact]
     public void Q3_K_RowByteSize_Matches()
     {
