@@ -15,6 +15,29 @@ if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir | Out
 
 $arch = "compute_75"
 
+# The PTX ISA version every committed artifact must declare (CUDA 12.8 emits 8.7).
+# PTX whose .version exceeds the driver's is rejected outright with
+# CUDA_ERROR_UNSUPPORTED_PTX_VERSION — CUDA 13.1 emits 9.1, unloadable on any
+# pre-13.1 driver. This has regressed twice from a newer toolkit being picked up
+# silently (#124, #318), so every generated file is checked below rather than
+# discovered later by a user on an older driver. Override only when deliberately
+# moving the whole tree to a new toolkit baseline.
+$expectPtxVersion = if ($env:DOTLLM_PTX_EXPECT_VERSION) { $env:DOTLLM_PTX_EXPECT_VERSION } else { "8.7" }
+
+function Assert-PtxVersion {
+    param([string]$Path)
+
+    $line = Select-String -Path $Path -Pattern '^\.version\s+(\S+)' | Select-Object -First 1
+    $actual = if ($line) { $line.Matches[0].Groups[1].Value } else { "(none)" }
+    if ($actual -ne $expectPtxVersion) {
+        $nvccPath = (Get-Command nvcc -ErrorAction SilentlyContinue).Source
+        throw "$([System.IO.Path]::GetFileName($Path)) declares .version $actual, expected $expectPtxVersion. " +
+              "nvcc in use: $nvccPath. A committed PTX file at the wrong ISA version fails to load with " +
+              "CUDA_ERROR_UNSUPPORTED_PTX_VERSION on older drivers (see #124, #318). Point nvcc at the " +
+              "CUDA 12.8 toolkit, or set DOTLLM_PTX_EXPECT_VERSION if you are deliberately re-baselining the tree."
+    }
+}
+
 # Kernels requiring --fmad=false for bit-perfect parity with the CPU scalar
 # reference. .NET RyuJIT does not emit FMA from a*b+c without an explicit
 # MathF.FusedMultiplyAdd, so without this flag the GPU result drifts by ~1 ULP
@@ -44,6 +67,8 @@ foreach ($cuFile in Get-ChildItem "$kernelDir\*.cu") {
     if ($LASTEXITCODE -ne 0) {
         throw "nvcc failed for $($cuFile.Name)"
     }
+
+    Assert-PtxVersion "$outDir\$base.ptx"
 
     Write-Host "  $($cuFile.Name) -> $base.ptx"
 }
