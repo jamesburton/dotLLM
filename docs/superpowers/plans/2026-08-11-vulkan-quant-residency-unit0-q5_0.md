@@ -691,3 +691,79 @@ PR body must record: the residency report before/after (bytes packed vs uploaded
 MMVQ, MMQ and `moe_indexed_matmul_q5_0_*` are deliberately excluded. MMVQ and the MoE-indexed path get their own plan once Task 1's report can quantify what they buy; MMQ is measurement-gated per the spec, because #384–#391 refuted four MMQ tiling variants on this hardware. DeepSeek-V2-Lite's OOM is only fully resolved once the MoE-indexed path lands — Task 2 reduces it, and the acceptance criterion for it belongs to that later plan.
 
 Types Q4_0, Q4_1, Q5_1 and MXFP4 follow this same task shape and are separate units per the spec.
+
+---
+
+### Task 8: `VulkanComputeKernelBase` — de-duplicate the kernel wrappers
+
+**Ruling (human, pre-flight):** the review rubric governs over the plan's copy-the-sibling
+instruction in Tasks 4-6. Execute this task **after** Tasks 4-7, so it migrates all six wrappers
+(the five existing siblings plus Q5_0) in one uniform, reviewable diff rather than leaving the
+codebase with two coexisting patterns mid-plan.
+
+**Files:**
+- Create: `src/DotLLM.Vulkan/Kernels/VulkanComputeKernelBase.cs`
+- Modify: `src/DotLLM.Vulkan/Kernels/Q2KDequantF32Kernel.cs`, `Q3KDequantF32Kernel.cs`,
+  `Q4KDequantF32Kernel.cs`, `Q5KDequantF32Kernel.cs`, `Q6KDequantF32Kernel.cs`,
+  `Q5_0DequantF32Kernel.cs`
+- Test: existing Vulkan kernel suites are the regression net; no new behaviour is added.
+
+**Interfaces:**
+- Produces: `abstract class VulkanComputeKernelBase : IDisposable` with
+  `protected VulkanComputeKernelBase(VulkanDevice device, string spvDir, string shaderFileName, int buffersPerSet, int pushConstantBytes)`,
+  `protected void BindAndPush(nint cmdBuf, ReadOnlySpan<nint> buffers, ReadOnlySpan<uint> pushConstants)`,
+  `internal void InvalidateDescriptorCache()`, `public void Dispose()`, and
+  `internal nint PipelineHandle { get; }` (preserved — `MatMulQ8_0MmqKernel` exposes it for the
+  `VK_AMD_shader_info` diagnostic).
+- Consumes: the Q5_0 kernels from Tasks 4-6.
+
+**Why:** `_device`, `_module`, `_pipeline`, `_descriptorPool`, `_descriptorCache`, the `Create`
+flow and `Dispose` are byte-identical across every wrapper. The `DescriptorSetCache`
+handle-aliasing hazard lives in exactly that duplicated region, so today a fix to it needs applying
+in six places — the duplicated-logic failure mode CLAUDE.md warns about, here within one backend.
+
+**Performance constraint (analysed, not assumed):** `buffersPerSet` and `pushConstantBytes` are
+resolved once at construction, so **no virtual dispatch may appear on the per-dispatch path** —
+`Record` stays concrete in each derived class. `BindAndPush` must take `ReadOnlySpan<uint>`, never
+`uint[]`, so the derived `stackalloc` push-constant buffer causes no managed allocation. A virtual
+call would in any case be ~0.05% of this backend's measured ~2.9us dispatch overhead (#390), but
+the zero-allocation rule is not negotiable.
+
+- [ ] **Step 1: Capture the pre-refactor baseline**
+
+```bash
+bash scripts/gpu-lock.sh acquire kernelbase "pre-refactor Vulkan baseline" 3600
+dotnet build tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj -c Release
+dotnet test tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj -c Release --filter "Category=GPU" --nologo
+bash scripts/gpu-lock.sh release kernelbase
+```
+Record the exact passed/failed/skipped counts. This is the number the refactor must reproduce.
+
+- [ ] **Step 2: Write `VulkanComputeKernelBase`**
+
+It owns: loading the `.spv`, `CreateComputePipeline` with `buffersPerSet` bindings and
+`pushConstantBytes` push constants, `KernelSupport.CreateDescriptorPool`, the `DescriptorSetCache`,
+`InvalidateDescriptorCache`, `PipelineHandle`, and a `Dispose` that destroys the pool then disposes
+pipeline and module in the existing order. `BindAndPush` performs `vkCmdBindPipeline`,
+`vkCmdBindDescriptorSets` against the cached set for `buffers`, and `vkCmdPushConstants` — it does
+**not** dispatch.
+
+- [ ] **Step 3: Migrate the six wrappers**
+
+Each derived class keeps its own `Create` factory, its buffer-size guards, its push-constant
+`stackalloc`, and its `vkCmdDispatch` geometry. Everything else is deleted in favour of the base.
+Public and internal signatures must not change — these types are used across
+`VulkanTransformerModel` and the test suites.
+
+- [ ] **Step 4: Verify against the baseline**
+
+Re-run the exact command from Step 1. Expected: **identical** passed/failed/skipped counts. This
+refactor changes no numerics; any count change is a regression and must be investigated, not
+explained away.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/DotLLM.Vulkan/Kernels/
+git commit -m "refactor(vulkan): extract VulkanComputeKernelBase from six kernel wrappers (#344)"
+```
