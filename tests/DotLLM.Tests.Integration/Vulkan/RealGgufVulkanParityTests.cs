@@ -44,6 +44,13 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+// Serializes this class against RealGgufQ5_0ParityTests: both read the mutable
+// static VulkanWeights.LastResidencyReport after loading a model, and running them
+// concurrently would let one load overwrite the other's report. Critically the
+// failure mode here is a FALSE PASS — the Q5_0 fixture also reports exactly 1
+// expanded tensor, so Assert.Equal(1, residency.ExpandedTensorCount) below could be
+// satisfied while reading the wrong model's report. See task-7-report.md §Fix round 1.
+[Collection("VulkanResidencyReport")]
 public sealed class RealGgufVulkanParityTests
 {
     private const float LogitsAbsTol = 3.0f;

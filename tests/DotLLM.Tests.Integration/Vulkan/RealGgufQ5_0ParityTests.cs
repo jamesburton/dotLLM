@@ -26,6 +26,15 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// element, no reduction, so any difference is a real divergence).
 /// </summary>
 [Trait("Category", "GPU")]
+// VulkanWeights.LastResidencyReport is a mutable static published at the end of
+// VulkanWeights.Upload, so two classes that load a model and then read it MUST NOT
+// run concurrently — xUnit would otherwise let one load overwrite the other's
+// report, and the failure mode is a FALSE PASS (after #344 both this fixture and
+// RealGgufVulkanParityTests' Q8_0 fixture report exactly 1 expanded tensor, so a
+// swapped report still satisfies that class's Assert.Equal(1, ExpandedTensorCount)).
+// Sharing a collection name is what serializes them; verified empirically, see
+// task-7-report.md §Fix round 1.
+[Collection("VulkanResidencyReport")]
 public sealed class RealGgufQ5_0ParityTests
 {
     private readonly ITestOutputHelper _output;
