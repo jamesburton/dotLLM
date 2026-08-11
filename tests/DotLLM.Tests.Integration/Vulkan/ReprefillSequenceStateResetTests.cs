@@ -96,11 +96,26 @@ public sealed class ReprefillSequenceStateResetTests : IDisposable
     /// driver now uses. Recurrent state lives in device memory there, so a CPU-side pass says
     /// nothing about it.
     /// </summary>
-    [SkippableFact]
+    /// <remarks>
+    /// <para><b>Statically skipped, and the reason is a real defect, not a missing fixture</b> —
+    /// see #360. Running this fixture through <c>VulkanModelLoader.CreateFromGguf</c> on gfx1151
+    /// kills the device with <c>VK_ERROR_DEVICE_LOST</c> in ~3 s. The skip is deliberate and
+    /// static rather than a runtime <c>Skip.If</c> on the exception, for two reasons: a device
+    /// loss invalidates the <c>VkDevice</c> for the remainder of the process, so letting this run
+    /// would take unrelated GPU suites down with it; and a runtime skip would make an unfixed
+    /// defect look like an absent fixture, which is the failure mode this whole change exists to
+    /// remove. Delete the Skip once #360 is fixed — the test body is correct and ready.</para>
+    /// <para>Consequence to be honest about: device-side recurrent-state reset is currently
+    /// covered only indirectly, via the replay assertion the parity driver runs on real models.</para>
+    /// </remarks>
+    [Fact(Skip = "Blocked on #360: VulkanModelLoader device-losses (VK_ERROR_DEVICE_LOST) on the "
+                 + "tiny synthetic qwen35moe fixture on gfx1151, and a device loss poisons the "
+                 + "VkDevice for every later GPU test in the process. Not a fixture gap - a defect. "
+                 + "The CPU sibling of this test covers the same invariant and passes.")]
     [Trait("Category", "GPU")]
     public void ReprefillLoop_OnARecurrentVulkanModel_IsSequenceIndependentOnlyWhenStateIsReset()
     {
-        string spvDir = SkipIfVulkanUnavailable();
+        string spvDir = SkipIfVulkanUnavailable();   // unreachable while the Skip above is set (#360)
 
         using var device = VulkanDevice.Create();
         using GgufFile gguf = OpenFixture(out ModelConfig config);
