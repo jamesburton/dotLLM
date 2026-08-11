@@ -2192,54 +2192,61 @@ internal sealed class VulkanWeights : IDisposable
 
     /// <summary>
     /// Throws when the routed-MoE host F32 dequant this <paramref name="plan"/> describes cannot
-    /// plausibly fit in <paramref name="availableBytes"/>, with a message itemising the footprint
-    /// and the banks responsible.
+    /// fit in <paramref name="physicalMemoryBytes"/> — i.e. it does not fit in the machine's RAM
+    /// at all — with a message itemising the footprint and the banks responsible.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// <b>The bound is total physical memory, deliberately, not free memory.</b> Two reasons.
+    /// First, <see cref="GCMemoryInfo.MemoryLoadBytes"/> is a snapshot from the last GC and reads
+    /// 0 in a process that has not collected yet, so a free-memory rule is only as good as the
+    /// caller's GC history. Second, and more important: Windows backs commit with the pagefile,
+    /// so a load whose footprint exceeds *free* RAM can still complete — slowly. Refusing it
+    /// would turn a working (if miserable) load into a hard failure. Exceeding *total* RAM is a
+    /// different claim: no amount of freeing, scheduling or waiting makes it fit, so refusing is
+    /// safe and the diagnosis is unambiguous.
+    /// </para>
+    /// <para>
+    /// Consequence: a footprint that fits in RAM but not alongside whatever else is resident is
+    /// still attempted, exactly as before. This check narrows the unactionable
+    /// <see cref="OutOfMemoryException"/> case; it does not claim to predict every OOM.
+    /// </para>
+    /// <para>
     /// Separated from the memory probe so it is unit-testable with a supplied budget and no GPU.
-    /// A non-positive <paramref name="availableBytes"/> means "unknown" and never blocks — this
-    /// check exists to replace an unactionable <see cref="OutOfMemoryException"/> with an
-    /// explanation, and must never turn a load that would have worked into a failure.
+    /// A non-positive <paramref name="physicalMemoryBytes"/> means "unknown" and never blocks.
+    /// </para>
     /// </remarks>
     internal static void ThrowIfMoeF32HostDequantUnaffordable(
-        MoeF32HostDequantPlan plan, long availableBytes)
+        MoeF32HostDequantPlan plan, long physicalMemoryBytes)
     {
         ArgumentNullException.ThrowIfNull(plan);
 
-        if (plan.CanSkip || plan.HostF32Bytes <= 0 || availableBytes <= 0)
+        if (plan.CanSkip || plan.HostF32Bytes <= 0 || physicalMemoryBytes <= 0)
             return;
-        if (plan.HostF32Bytes <= availableBytes)
+        if (plan.HostF32Bytes <= physicalMemoryBytes)
             return;
 
         throw new InsufficientMemoryException(
-            $"Loading this MoE model on the Vulkan backend needs {plan.Describe()}, but only "
-            + $"{availableBytes / (1024.0 * 1024.0 * 1024.0):F1} GiB of host memory is available. "
-            + "The routed expert banks are dequantised to F32 on the host because at least one of "
-            + "them uses a quantization the Vulkan backend cannot keep device-resident, and the "
-            + "skip is all-or-nothing (see issue #327 for the coverage work that removes this "
-            + "fallback). Load this model on the CPU or CUDA backend, use a build whose routed "
-            + "expert banks are Q4_K/Q5_K/Q6_K/Q8_0, or run on a host with more RAM.");
+            $"Loading this MoE model on the Vulkan backend needs {plan.Describe()}, which exceeds "
+            + $"this host's total physical memory of "
+            + $"{physicalMemoryBytes / (1024.0 * 1024.0 * 1024.0):F1} GiB — it cannot fit, "
+            + "regardless of what else is running. The routed expert banks are dequantised to F32 "
+            + "on the host because at least one of them uses a quantization the Vulkan backend "
+            + "cannot keep device-resident, and the skip is all-or-nothing (see issue #327 for "
+            + "the coverage work that removes this fallback). Load this model on the CPU or CUDA "
+            + "backend, use a build whose routed expert banks are Q4_K/Q5_K/Q6_K/Q8_0, or run on "
+            + "a host with more RAM.");
     }
 
     /// <summary>
-    /// Free host memory to compare the F32 fallback footprint against: total physical (or
-    /// container limit) minus what the machine is already using. Returns 0 ("unknown") when the
-    /// runtime cannot report it, which callers treat as "do not block".
+    /// The machine's total physical memory (or container memory limit), to compare the F32
+    /// fallback footprint against. Returns 0 ("unknown") when the runtime cannot report it,
+    /// which callers treat as "do not block".
     /// </summary>
-    /// <remarks>
-    /// Machine-wide, not process-wide, on purpose. The case that motivated #326 is the parity
-    /// test, where a CPU reference model has *already* taken ~57 GiB before the Vulkan load
-    /// starts asking for its own copy; a process-local figure would have called that affordable.
-    /// </remarks>
-    internal static long AvailableHostMemoryBytes()
+    internal static long HostPhysicalMemoryBytes()
     {
-        var info = GC.GetGCMemoryInfo();
-        long total = info.TotalAvailableMemoryBytes;
-        long inUse = info.MemoryLoadBytes;
-        if (total <= 0)
-            return 0;
-        long free = total - inUse;
-        return free > 0 ? free : 0;
+        long total = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+        return total > 0 ? total : 0;
     }
 
     /// <summary>True iff a Q4_K MoE overlay can be kept on device as raw Q4_K super-blocks

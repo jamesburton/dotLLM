@@ -46,11 +46,12 @@ public sealed class MoeF32HostDequantPreflightTests
     {
         var plan = DeepSeekV2LiteQ4KMPlan();
 
-        // 128 GiB box with a ~57 GiB CPU reference model already resident: ~64 GiB free is
-        // enough for the second copy on paper but not once the model itself is mapped — the
-        // case here is the harsher one where the budget is clearly short.
+        // 31.6 GiB is what GC.GetGCMemoryInfo().TotalAvailableMemoryBytes actually reports on
+        // the Strix Halo box this was triaged on — the ~53.6 GiB fallback cannot fit in RAM at
+        // all there, which is why the load reached OutOfMemoryException rather than merely
+        // paging.
         var ex = Assert.Throws<InsufficientMemoryException>(
-            () => VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(plan, 20L * 1024 * 1024 * 1024));
+            () => VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(plan, 33_900_000_000L));
 
         Assert.Contains("53.6 GiB of host F32", ex.Message, StringComparison.Ordinal);
         Assert.Contains("14 of 78 routed expert banks", ex.Message, StringComparison.Ordinal);
@@ -72,11 +73,15 @@ public sealed class MoeF32HostDequantPreflightTests
     }
 
     [Fact]
-    public void AffordableFallback_DoesNotThrow()
+    public void FallbackThatFitsInPhysicalMemory_DoesNotThrow()
     {
-        // A small MoE model whose fallback genuinely fits must keep loading exactly as before —
-        // the preflight replaces an OOM, it must not manufacture one.
+        // A model whose fallback fits in RAM must keep loading exactly as before — the preflight
+        // replaces an OOM, it must not manufacture one. This includes the case where the machine
+        // is currently busy: the bound is TOTAL physical memory, not free memory, because
+        // Windows backs commit with the pagefile and a load over the free-memory line can still
+        // complete. See ThrowIfMoeF32HostDequantUnaffordable's remarks.
         var plan = DeepSeekV2LiteQ4KMPlan();
+        VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(plan, DeepSeekV2LiteF32Bytes);
         VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(plan, DeepSeekV2LiteF32Bytes + 1);
     }
 
@@ -85,26 +90,27 @@ public sealed class MoeF32HostDequantPreflightTests
     {
         var plan = new VulkanWeights.MoeF32HostDequantPlan(
             CanSkip: true, HostF32Bytes: 0, [], TotalBanks: 78);
-        VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(plan, availableBytes: 1);
+        VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(plan, physicalMemoryBytes: 1);
     }
 
     [Fact]
     public void UnknownMemoryBudget_NeverThrows()
     {
-        // AvailableHostMemoryBytes returns 0 when the runtime cannot report the machine's
-        // memory. That must degrade to the old behaviour (attempt the load), never to a
-        // refusal on a host that would have coped.
+        // HostPhysicalMemoryBytes returns 0 when the runtime cannot report the machine's memory.
+        // That must degrade to the old behaviour (attempt the load), never to a refusal on a
+        // host that would have coped.
         var plan = DeepSeekV2LiteQ4KMPlan();
-        VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(plan, availableBytes: 0);
-        VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(plan, availableBytes: -1);
+        VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(plan, physicalMemoryBytes: 0);
+        VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(plan, physicalMemoryBytes: -1);
     }
 
     [Fact]
-    public void AvailableHostMemoryBytes_IsNonNegativeAndBelowTotal()
+    public void HostPhysicalMemoryBytes_ReportsAPlausibleAmount()
     {
-        long available = VulkanWeights.AvailableHostMemoryBytes();
-        Assert.True(available >= 0, $"negative available memory: {available}");
-        Assert.True(available <= GC.GetGCMemoryInfo().TotalAvailableMemoryBytes,
-            "free memory must not exceed the machine's total");
+        // If this ever returned 0 on a normal host the preflight would be silently inert, which
+        // is exactly the failure mode #326 is about — assert it reports something real.
+        long physical = VulkanWeights.HostPhysicalMemoryBytes();
+        Assert.True(physical >= 1L << 30, $"implausible physical memory report: {physical} bytes");
+        Assert.Equal(GC.GetGCMemoryInfo().TotalAvailableMemoryBytes, physical);
     }
 }

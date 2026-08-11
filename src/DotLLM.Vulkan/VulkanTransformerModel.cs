@@ -1157,7 +1157,7 @@ public sealed class VulkanTransformerModel : IModel
             // OutOfMemoryException inside SliceExpertsToF32.
             var moePlan = VulkanWeights.PlanMoeF32HostDequant(device, gguf, config);
             VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(
-                moePlan, VulkanWeights.AvailableHostMemoryBytes());
+                moePlan, VulkanWeights.HostPhysicalMemoryBytes());
             var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config, moePlan.CanSkip);
             return BuildModel(device, ownsDevice: true, config, cpuWeights, spvDir, gguf);
         }
@@ -1189,7 +1189,7 @@ public sealed class VulkanTransformerModel : IModel
         // #326: see the other overload — preflight the F32 fallback footprint before allocating.
         var moePlan = VulkanWeights.PlanMoeF32HostDequant(device, gguf, config);
         VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(
-            moePlan, VulkanWeights.AvailableHostMemoryBytes());
+            moePlan, VulkanWeights.HostPhysicalMemoryBytes());
         var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config, moePlan.CanSkip);
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf);
     }
