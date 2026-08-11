@@ -70,7 +70,7 @@ public sealed class RealGgufVulkanParityTests
         Skip.If(!fixture.Found, fixture.SkipMessage("Llama-3.2-1B Q8_0 GGUF"));
         string path = fixture.Path!;
         RunGgufParityTest(path, expectedArch: Architecture.Llama, label: "Llama-3.2-1B-Q8_0",
-            prompt: "The capital of France is");
+            prompt: "The capital of France is", assertNoResidencyExpansion: true);
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -248,7 +248,8 @@ public sealed class RealGgufVulkanParityTests
     // Driver
     // ════════════════════════════════════════════════════════════════════
 
-    private void RunGgufParityTest(string path, Architecture expectedArch, string label, string prompt)
+    private void RunGgufParityTest(string path, Architecture expectedArch, string label, string prompt,
+        bool assertNoResidencyExpansion = false)
     {
         SkipIfVulkanUnavailable(out string spvDir);
 
@@ -294,6 +295,26 @@ public sealed class RealGgufVulkanParityTests
         }
         vkLoadWatch.Stop();
         _output.WriteLine($"[{label}] Vulkan load ({vkLoadWatch.Elapsed.TotalSeconds:F1} s)");
+
+        if (assertNoResidencyExpansion)
+        {
+            var residency = VulkanWeights.LastResidencyReport;
+            Assert.NotNull(residency);
+            _output.WriteLine($"[{label}] {residency.Describe()}");
+            // token_embd.weight is unconditionally dequantised to F32 for any source type
+            // other than Q4_K/Q5_K/Q6_K (no GPU gather+dequant kernel for Q8_0/F16 embed
+            // tables — see VulkanWeights.UploadTokenEmbedding) — an intentional, orthogonal
+            // design choice, not a DeviceQuantTypeFor missing-kernel gap. Every other tensor
+            // in an all-Q8_0 model must stay packed. Pin the count to 1 too, so the
+            // assertion still fails if the embed entry ever silently vanishes.
+            Assert.Equal(1, residency.ExpandedTensorCount);
+            var unexpected = residency.Entries
+                .Where(e => e.Expanded && e.Name != "token_embd.weight")
+                .ToList();
+            Assert.True(unexpected.Count == 0,
+                $"[{label}] unexpected residency expansion: "
+                + string.Join(", ", unexpected.Select(e => $"{e.Name} ({e.Source}->{e.Device})")));
+        }
 
         try
         {

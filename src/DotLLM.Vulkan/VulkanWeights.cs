@@ -542,6 +542,7 @@ internal sealed class VulkanWeights : IDisposable
 
         long totalBytes = 0;
         ResetUploadCounters();
+        _residencyReport = new VulkanResidencyReport();
 
         // Bounded persistently-mapped staging (issue #147): sized to the largest single
         // upload but capped at VulkanStagingBuffer.MaxChunkBytes — larger tensors stream
@@ -631,9 +632,9 @@ internal sealed class VulkanWeights : IDisposable
             else
             {
                 q = UploadMatrix(device, staging, lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim,
-                    dequantToFp32, out qDeviceQt, out qBytes);
+                    dequantToFp32, $"blk.{firstLayer + i}.attn_q.weight", out qDeviceQt, out qBytes);
                 k = UploadMatrix(device, staging, lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim,
-                    dequantToFp32, out kDeviceQt, out kBytes);
+                    dequantToFp32, $"blk.{firstLayer + i}.attn_k.weight", out kDeviceQt, out kBytes);
                 if (vFromK)
                 {
                     // V-less global layer: no attn_v weight; the forward copies
@@ -645,14 +646,14 @@ internal sealed class VulkanWeights : IDisposable
                 else
                 {
                     v = UploadMatrix(device, staging, lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
-                        dequantToFp32, out vDeviceQt, out vBytes);
+                        dequantToFp32, $"blk.{firstLayer + i}.attn_v.weight", out vDeviceQt, out vBytes);
                 }
                 qBias = UploadOptionalVec(device, vecStaging, lw.QBias);
                 kBias = UploadOptionalVec(device, vecStaging, lw.KBias);
                 vBias = UploadOptionalVec(device, vecStaging, lw.VBias);
             }
             var o = UploadMatrix(device, staging, lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim,
-                dequantToFp32, out var oDeviceQt, out long oBytes);
+                dequantToFp32, $"blk.{firstLayer + i}.attn_output.weight", out var oDeviceQt, out long oBytes);
             var oBias = UploadOptionalVec(device, vecStaging, lw.OBias);
 
             MlaLayerBuffers? mla = null;
@@ -704,11 +705,11 @@ internal sealed class VulkanWeights : IDisposable
             else
             {
                 gate = UploadMatrix(device, staging, lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim,
-                    dequantToFp32, out gateDeviceQt, out gateBytes);
+                    dequantToFp32, $"blk.{firstLayer + i}.ffn_gate.weight", out gateDeviceQt, out gateBytes);
                 up = UploadMatrix(device, staging, lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim,
-                    dequantToFp32, out upDeviceQt, out upBytes);
+                    dequantToFp32, $"blk.{firstLayer + i}.ffn_up.weight", out upDeviceQt, out upBytes);
                 down = UploadMatrix(device, staging, lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim,
-                    dequantToFp32, out downDeviceQt, out downBytes);
+                    dequantToFp32, $"blk.{firstLayer + i}.ffn_down.weight", out downDeviceQt, out downBytes);
                 gateBias = UploadOptionalVec(device, vecStaging, lw.GateBias);
                 upBias = UploadOptionalVec(device, vecStaging, lw.UpBias);
                 downBias = UploadOptionalVec(device, vecStaging, lw.DownBias);
@@ -820,9 +821,12 @@ internal sealed class VulkanWeights : IDisposable
                 weights.OutputWeight, weights.OutputQuantType,
                 weights.OutputOutputDim, weights.OutputInputDim,
                 dequantToFp32,
+                "output.weight",
                 out outputDeviceQt, out long outputBytes);
             totalBytes += outputBytes;
         }
+
+        LastResidencyReport = _residencyReport;
 
         return new VulkanWeights(
             device, tokenEmbed, weights.VocabSize, weights.HiddenSize,
@@ -831,6 +835,20 @@ internal sealed class VulkanWeights : IDisposable
             weights.OutputOutputDim, weights.OutputInputDim,
             totalBytes);
     }
+
+    /// <summary>
+    /// Accumulates during the current <see cref="Upload"/> call; snapshotted into
+    /// <see cref="LastResidencyReport"/> just before <c>Upload</c> returns.
+    /// </summary>
+    private static VulkanResidencyReport _residencyReport = new();
+
+    /// <summary>
+    /// Residency accounting for the most recent <see cref="Upload"/> call: which tensors
+    /// were kept in their packed source quantization on device versus widened to F32
+    /// because <see cref="DeviceQuantTypeFor"/> had no matching Vulkan kernel. See
+    /// <see cref="VulkanResidencyReport"/>.
+    /// </summary>
+    public static VulkanResidencyReport? LastResidencyReport { get; private set; }
 
     /// <summary>
     /// Set <c>DOTLLM_VULKAN_DISABLE_EMBED_GPU_DEQUANT=1</c> to force the legacy
@@ -898,7 +916,7 @@ internal sealed class VulkanWeights : IDisposable
             LastTokenEmbedDequantPath = "cpu";
             return UploadMatrix(device, staging,
                 weights.TokenEmbedWeight, qt, vocab, hidden,
-                dequantToFp32: true, out _, out uploadedBytes);
+                dequantToFp32: true, "token_embd.weight", out _, out uploadedBytes);
         }
 
         long qBytes = Dequantize.RowByteSize(hidden, qt) * vocab;
@@ -1313,10 +1331,12 @@ internal sealed class VulkanWeights : IDisposable
         VulkanDevice device, VulkanStagingBuffer staging,
         nint srcPtr, QuantizationType qt, int outputDim, int inputDim,
         bool dequantToFp32,
+        string name,
         out QuantizationType deviceQuantType,
         out long uploadedBytes)
     {
         long elems = (long)outputDim * inputDim;
+        long packedBytes = Dequantize.RowByteSize(inputDim, qt) * outputDim;
 
         // Raw quant-block upload — keeps the GGUF on-disk byte layout intact on device so
         // the matmul_q8_0 / matmul_q2_k / matmul_q3_k / matmul_q4_k / matmul_q5_k / matmul_q6_k kernels can read it
@@ -1337,6 +1357,7 @@ internal sealed class VulkanWeights : IDisposable
             {
                 deviceQuantType = keepQt;
                 uploadedBytes = bytes;
+                _residencyReport.Add(name, qt, deviceQuantType, packedBytes, uploadedBytes);
                 return importedBuf!;
             }
 
@@ -1346,6 +1367,7 @@ internal sealed class VulkanWeights : IDisposable
             LastUploadStagingMatrices++;
             deviceQuantType = keepQt;
             uploadedBytes = bytes;
+            _residencyReport.Add(name, qt, deviceQuantType, packedBytes, uploadedBytes);
             return buf;
         }
 
@@ -1408,6 +1430,7 @@ internal sealed class VulkanWeights : IDisposable
 
         deviceQuantType = QuantizationType.F32;
         uploadedBytes = fpBytes;
+        _residencyReport.Add(name, qt, deviceQuantType, packedBytes, uploadedBytes);
         return fpBuf;
     }
 
