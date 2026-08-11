@@ -292,6 +292,26 @@ public sealed unsafe class CudaTransformerModel : IModel
     private object? _decodeGraphKvCache;
     private int _decodeGraphLayerCount;       // DebugMaxLayers snapshot at capture time
 
+    // ── graph-engagement observables (#338) ─────────────────────────────────────────────
+    // Setting UseGraphCapture is NOT evidence that capture engaged: the constructor clears the
+    // flag when the kv-write kernel is missing, and the dispatch gate above re-checks six more
+    // conditions (batched call, multi-token, profiling, MLA/MoE, active LoRA adapter, depth
+    // ceiling) — each of which silently routes to the eager body with at most a one-line
+    // warning. An equivalence test that compares "eager" against a run that silently fell back
+    // to eager passes green while proving nothing, which is exactly what the graph-capture
+    // suite was doing. These counters are the observable that lets a test assert engagement
+    // instead of assuming it. Internal (InternalsVisibleTo DotLLM.Tests.Unit/Integration);
+    // plain int fields on a non-thread-safe model, no interlocking, no hot-path cost.
+
+    /// <summary>Number of <c>cuGraphLaunch</c> replays performed by the decode fast path.</summary>
+    internal int GraphReplayCount { get; private set; }
+
+    /// <summary>Number of times a decode graph was captured and instantiated.</summary>
+    internal int GraphCaptureCount { get; private set; }
+
+    /// <summary>Number of single-token decodes that fell through to the eager body.</summary>
+    internal int EagerDecodeCount { get; private set; }
+
     // ── MLA / MoE per-model state (lazy-allocated, populated only when the
     //    model declares the matching config) ──
     // RoPE cos/sin tables for MLA's decoupled rope sub-dimension. Shape:
@@ -886,6 +906,11 @@ public sealed unsafe class CudaTransformerModel : IModel
             if (kvCache is CudaQuantizedKvCache qKv && qKv.WindowCapacity > 0)
                 return ForwardDecodeGraphQuantized(tokenIds, positions, deviceId, qKv);
         }
+
+        // #338: a single-token decode reaching here did NOT use graph replay, whatever
+        // UseGraphCapture says. Counted so a test can tell "capture engaged" from "capture
+        // was requested and silently declined".
+        if (tokenIds.Length == 1) EagerDecodeCount++;
 
         _context.MakeCurrent();
         int seqLen = tokenIds.Length;
@@ -1806,12 +1831,14 @@ public sealed unsafe class CudaTransformerModel : IModel
         {
             DisposeDecodeGraph();
             CaptureDecodeGraph(kvCache, effectiveLayers);
+            GraphCaptureCount++;   // #338: engagement observable
             _decodeGraphKvCache = kvCache;
             _decodeGraphLayerCount = effectiveLayers;
         }
 
         // Replay: single packet submission.
         CudaDriverApi.cuGraphLaunch(_decodeGraphExec, s).ThrowOnError();
+        GraphReplayCount++;   // #338: engagement observable
         _stream.Synchronize();
 
         // Update host-side KV length so the next eager call (or sampler stop check) sees
@@ -1870,11 +1897,13 @@ public sealed unsafe class CudaTransformerModel : IModel
         {
             DisposeDecodeGraph();
             CaptureDecodeGraphQuantized(kvCache, effectiveLayers);
+            GraphCaptureCount++;   // #338: engagement observable
             _decodeGraphKvCache = kvCache;
             _decodeGraphLayerCount = effectiveLayers;
         }
 
         CudaDriverApi.cuGraphLaunch(_decodeGraphExec, s).ThrowOnError();
+        GraphReplayCount++;   // #338: engagement observable
         _stream.Synchronize();
 
         kvCache.AdvanceLengthForGraphDecode(seqKv);

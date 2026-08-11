@@ -29,6 +29,22 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- #338: the CUDA suites hard-coded absolute fixture paths (`E:/.cache/huggingface/...`),
+         duplicated across files so the literals drifted, and green-by-skip on every machine but
+         one. They now use the same resolver the integration suite standardised in #308. Linked
+         rather than copied so the two projects cannot diverge; both files are `internal`, so each
+         assembly gets its own copy and neither leaks API. -->
+    <Compile Include="..\DotLLM.Tests.Integration\Fixtures\TestFixtureResolver.cs"
+             Link="Fixtures\TestFixtureResolver.cs" />
+    <Compile Include="..\DotLLM.Tests.Integration\Fixtures\KnownTestFixtures.cs"
+             Link="Fixtures\KnownTestFixtures.cs" />
+    <!-- TestFixtureResolver probes TestModelDownloader.CacheDirectory (the $DOTLLM_TEST_CACHE_DIR
+         / ~/.dotllm/test-cache root), so it comes along. -->
+    <Compile Include="..\DotLLM.Tests.Integration\Fixtures\TestModelDownloader.cs"
+             Link="Fixtures\TestModelDownloader.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="xunit" />
     <PackageReference Include="xunit.runner.visualstudio" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
