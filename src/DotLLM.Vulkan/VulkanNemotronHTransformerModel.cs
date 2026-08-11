@@ -130,13 +130,14 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// threshold derivation and the ON-by-default evidence.
     /// <para>
     /// <b>Known coverage gap (issue #331):</b> that evidence was gathered on
-    /// Llama-3.2-3B (<c>VulkanSplitDecodeParityTests</c>) and confirmed on a real
-    /// Qwen3MoeHybrid GGUF (<c>VulkanSplitDecodeMoeParityTests</c>). Nemotron-H has
+    /// Llama-3.2-3B only (<c>VulkanSplitDecodeParityTests</c>). Nemotron-H has
     /// <i>no</i> real-GGUF end-to-end split-KV validation — no Nemotron-H GGUF is
-    /// staged on the development box. It ships on the same default as the other
-    /// architectures, resting on the shared kernel's CPU-oracle parity plus
-    /// synthetic-weight forward tests. Stage a Nemotron-H GGUF and add an arm to
-    /// <c>VulkanSplitDecodeMoeParityTests</c>'s pattern to close this.
+    /// staged on the development box. (Qwen3MoeHybrid has the test written —
+    /// <c>VulkanSplitDecodeMoeParityTests</c> — but it is blocked by issue #356.)
+    /// Both ship on the same default as Llama, resting on the shared kernel's
+    /// CPU-oracle parity plus synthetic-weight forward tests. Stage a Nemotron-H
+    /// GGUF and follow <c>VulkanSplitDecodeMoeParityTests</c>'s pattern to close
+    /// this one.
     /// </para>
     /// </summary>
     private readonly VulkanSplitKvAttentionKernel? _splitKvAttention;

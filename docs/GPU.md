@@ -1,4 +1,4 @@
-# GPU Inference — dotLLM
+﻿# GPU Inference — dotLLM
 
 ## Overview
 
@@ -316,10 +316,21 @@ default at **−0.173%**. Vulkan split-KV moves perplexity by 0.005–0.012% in 
 the rejected one — so the CUDA "keep it off" conclusion does **not** transfer as a
 quality prediction, only as the (correct) warning that token-level equality will not hold.
 
-Real-GGUF end-to-end coverage: Llama (`VulkanSplitDecodeParityTests`) and
-Qwen3-MoE-Hybrid (`VulkanSplitDecodeMoeParityTests`). **Nemotron-H remains unvalidated
-end-to-end** — no Nemotron-H GGUF is staged on the development box; it rests on the
-shared kernel's CPU-oracle parity plus synthetic-weight forward tests.
+Real-GGUF end-to-end coverage: **Llama only** (`VulkanSplitDecodeParityTests`).
+Two gaps remain, both recorded rather than implied:
+
+- **Qwen3-MoE-Hybrid** — the test exists (`VulkanSplitDecodeMoeParityTests`, written
+  against the 35B-A3B GGUF) but is blocked by
+  [#356](https://github.com/jamesburton/dotLLM/issues/356): Vulkan's Qwen3MoeHybrid
+  decode overflows `MatMulF32Kernel`'s `DescriptorSetCache` in the streaming-F32
+  shared-expert matmul before the assertions are reached. Pre-existing and unrelated
+  to split-KV — it reproduces with the split path forced OFF — so the test converts
+  that one failure into a Skip. It starts proving something as soon as #356 lands.
+- **Nemotron-H** — no Nemotron-H GGUF is staged on the development box at all.
+
+Both therefore ship on the shared kernel's CPU-oracle parity plus synthetic-weight
+forward tests, and on the kernel being proven end-to-end on a *different*
+architecture.
 
 ## CLI Usage
 

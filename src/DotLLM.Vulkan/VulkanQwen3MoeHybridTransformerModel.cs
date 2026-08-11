@@ -1017,9 +1017,13 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         {
             // Decode: split the KV range across many workgroups (Flash-Decoding).
             // Engages from seqKv >= 17 with the shipping heuristic (issue #331);
-            // only seqKv <= 16 falls through to the per-token kernel. Validated
-            // end-to-end on a real Qwen3MoeHybrid GGUF by
-            // VulkanSplitDecodeMoeParityTests (issue #331).
+            // only seqKv <= 16 falls through to the per-token kernel.
+            // Real-GGUF e2e split-KV coverage exists as a test
+            // (VulkanSplitDecodeMoeParityTests, issue #331) but is BLOCKED on this
+            // box by issue #356 (descriptor-cache overflow in the streaming-F32
+            // shared-expert matmul, unrelated to split-KV). Until #356 lands this
+            // architecture ships on the shared kernel's CPU-oracle parity plus
+            // synthetic-weight forward tests, like Nemotron-H.
             _kernels.SplitKvAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
