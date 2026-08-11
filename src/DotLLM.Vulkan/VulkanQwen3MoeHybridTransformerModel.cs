@@ -1,4 +1,4 @@
-using System.Buffers;
+﻿using System.Buffers;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
@@ -1015,8 +1015,11 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
             && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads))
         {
-            // Long-context decode: split the KV range across many workgroups
-            // (Flash-Decoding). Short context falls through to the per-token kernel.
+            // Decode: split the KV range across many workgroups (Flash-Decoding).
+            // Engages from seqKv >= 17 with the shipping heuristic (issue #331);
+            // only seqKv <= 16 falls through to the per-token kernel. Validated
+            // end-to-end on a real Qwen3MoeHybrid GGUF by
+            // VulkanSplitDecodeMoeParityTests (issue #331).
             _kernels.SplitKvAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
