@@ -1070,6 +1070,16 @@ internal sealed class VulkanWeights : IDisposable
     private static bool KeepQ8OnDevice(QuantizationType qt, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.Q8_0;
 
+    /// <summary>Returns true when the matrix will be kept on device as Q5_0 blocks
+    /// (22 bytes per 32 elements: fp16 scale + 4-byte qh bitfield + 16 packed nibble
+    /// bytes). Gated on the contraction axis being a multiple of the Q5_0 block size
+    /// (32) — unlike the K-quants this needs no 256-alignment gate. Consumed by
+    /// <c>MatMulQ5_0GemvF32Kernel</c> (decode) and <c>MatMulQ5_0GemmF32Kernel</c>
+    /// (prefill); both are unconditionally created, so no capability gate applies
+    /// (#344).</summary>
+    private static bool KeepQ5_0OnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.Q5_0 && (inputDim % 32) == 0;
+
     /// <summary>Returns true when the matrix will be kept on device as native F16
     /// (2 bytes per element). Gated on the contraction axis being a multiple of 2
     /// (each storage uint holds two F16 elements via <c>unpackHalf2x16</c>).
@@ -1191,6 +1201,7 @@ internal sealed class VulkanWeights : IDisposable
         QuantizationType srcQt, int inputDim, bool dequantToFp32)
     {
         if (KeepQ8OnDevice(srcQt, dequantToFp32)) return QuantizationType.Q8_0;
+        if (KeepQ5_0OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q5_0;
         if (KeepQ2KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q2_K;
         if (KeepQ3KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q3_K;
         if (KeepQ4KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q4_K;
@@ -1283,6 +1294,8 @@ internal sealed class VulkanWeights : IDisposable
         long elems = (long)outputDim * inputDim;
         if (KeepQ8OnDevice(qt, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0) * outputDim;
+        if (KeepQ5_0OnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.Q5_0) * outputDim;
         if (KeepQ2KOnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q2_K) * outputDim;
         if (KeepQ3KOnDevice(qt, inputDim, dequantToFp32))

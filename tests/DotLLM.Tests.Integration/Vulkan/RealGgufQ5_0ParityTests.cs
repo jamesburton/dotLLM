@@ -1,7 +1,11 @@
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Models;
+using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
+using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tests.Integration.Fixtures;
+using DotLLM.Tokenizers.Bpe;
 using DotLLM.Vulkan;
 using DotLLM.Vulkan.Kernels;
 using Xunit;
@@ -425,6 +429,207 @@ public sealed class RealGgufQ5_0ParityTests
 
         _output.WriteLine($"Checked {tensorsChecked} Q5_0 GEMM tensors at n={n}.");
         Assert.True(tensorsChecked > 0);
+    }
+
+    /// <summary>
+    /// Loads a real Q5_0 GGUF through the full Vulkan upload path and asserts that
+    /// NO tensor whose source format is Q5_0 was widened to F32 on upload (#344).
+    /// <para>
+    /// This is the reachability gate for the Task 4/5/6 Q5_0 kernels: they can be
+    /// bit-exact against real GGUF bytes and still never run, because
+    /// <c>VulkanWeights.DeviceQuantTypeFor</c> ends in an unconditional
+    /// <c>return QuantizationType.F32</c>. Only the load-time residency report can
+    /// tell "a kernel exists" apart from "a kernel is routed to".
+    /// </para>
+    /// <para>
+    /// <b>Scoped to <c>Source == Q5_0</c> on purpose.</b> Two other expansions are
+    /// legitimate and out of scope here: (a) <c>token_embd.weight</c>, which
+    /// <c>VulkanWeights.UploadTokenEmbedding</c> uploads with
+    /// <c>dequantToFp32: true</c> for every source type except Q4_K/Q5_K/Q6_K
+    /// (there is no GPU gather+dequant kernel for the rest) — an orthogonal design
+    /// choice, not a missing matmul kernel; and (b) any non-Q5_0 tensor the file
+    /// happens to carry (llama.cpp's Q5_0 recipe commonly emits a Q6_K or Q8_0
+    /// <c>output.weight</c>), whose residency belongs to its own unit. Pinning
+    /// <c>ExpandedTensorCount</c> here would couple this test to both.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public void SmolLM135M_Q5_0_KeepsWeightsPacked_NoF32Expansion()
+    {
+        FixtureLocation fixture = TestFixtureResolver.ResolveFile(
+            "DOTLLM_SMOLLM135M_Q5_0_GGUF", "QuantFactory", "SmolLM-135M-GGUF",
+            "SmolLM-135M.Q5_0.gguf");
+        Skip.If(!fixture.Found, fixture.SkipMessage("SmolLM-135M Q5_0 GGUF"));
+        SkipIfVulkanUnavailable(out string spvDir);
+
+        _output.WriteLine($"gguf: {fixture.Path!}");
+
+        using var gguf = GgufFile.Open(fixture.Path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var vkModel = VulkanTransformerModel.LoadFromGguf(gguf, config, spvDir);
+
+        // Static side-channel — read it immediately after the load returns.
+        VulkanResidencyReport? report = VulkanWeights.LastResidencyReport;
+        Assert.NotNull(report);
+        _output.WriteLine(report!.Describe());
+
+        foreach (var group in report.Entries.GroupBy(e => (e.Source, e.Device)))
+        {
+            _output.WriteLine(
+                $"  {group.Key.Source} -> {group.Key.Device}: {group.Count()} tensor(s), "
+                + $"{group.Sum(e => e.PackedBytes):N0} packed -> {group.Sum(e => e.UploadedBytes):N0} uploaded.");
+        }
+
+        var q5Expanded = report.Entries
+            .Where(e => e.Source == QuantizationType.Q5_0 && e.Expanded
+                        && e.Name != "token_embd.weight")
+            .ToArray();
+
+        Assert.True(q5Expanded.Length == 0,
+            $"Q5_0 tensors still widened on upload ({q5Expanded.Length} of "
+            + $"{report.Entries.Count(e => e.Source == QuantizationType.Q5_0)} Q5_0 tensors):\n"
+            + string.Join("\n", q5Expanded.Take(10).Select(
+                e => $"  {e.Name}: {e.Source}->{e.Device} {e.PackedBytes:N0}->{e.UploadedBytes:N0} bytes"))
+            + $"\n{report.Describe()}");
+
+        // A model with no Q5_0 tensors at all would satisfy the assertion above
+        // vacuously — pin that the fixture actually exercised the path.
+        int q5Resident = report.Entries.Count(
+            e => e.Source == QuantizationType.Q5_0 && e.Device == QuantizationType.Q5_0);
+        Assert.True(q5Resident > 0,
+            $"No Q5_0 tensor was kept device-resident — the fixture may not be Q5_0.\n{report.Describe()}");
+        _output.WriteLine($"Q5_0 tensors kept device-resident: {q5Resident}.");
+    }
+
+    /// <summary>
+    /// End-to-end CPU-vs-Vulkan argmax parity on the same Q5_0 fixture (#344).
+    /// <para>
+    /// The residency test above proves the packed bytes reach the device; this one
+    /// proves the CONSUMERS can read them. Prefill (seqLen&gt;1, step 0) exercises
+    /// <see cref="MatMulQ5_0GemmF32Kernel"/> and every decode step exercises
+    /// <see cref="MatMulQ5_0GemvF32Kernel"/>. Before the residency wiring it passes
+    /// via the F32-widened path; after it, a dispatch gap (packed Q5_0 bytes
+    /// reinterpreted as floats by the generic F32 matmul) turns the logits into
+    /// noise and this test goes red — which is the whole point.
+    /// </para>
+    /// Tolerances mirror the Q8_0 SmolLM-135M parity precedent in
+    /// <c>RealGgufVulkanParityTests</c>: the CPU path runs Q-format arithmetic
+    /// against Q8_1-quantised activations while Vulkan runs F32 activations
+    /// against packed weights, so per-projection arithmetic differs slightly and
+    /// the argmax floor is the load-bearing assertion.
+    /// </summary>
+    [SkippableFact]
+    public void SmolLM135M_Q5_0_VulkanForward_MatchesCpuArgmax()
+    {
+        FixtureLocation fixture = TestFixtureResolver.ResolveFile(
+            "DOTLLM_SMOLLM135M_Q5_0_GGUF", "QuantFactory", "SmolLM-135M-GGUF",
+            "SmolLM-135M.Q5_0.gguf");
+        Skip.If(!fixture.Found, fixture.SkipMessage("SmolLM-135M Q5_0 GGUF"));
+        SkipIfVulkanUnavailable(out string spvDir);
+
+        const int decodeSteps = 4;
+        const int argmaxFloor = 3; // out of prefill + 4 decode = 5 steps
+
+        using var cpuGguf = GgufFile.Open(fixture.Path!);
+        var config = GgufModelConfigExtractor.Extract(cpuGguf.Metadata);
+        using var cpuModel = TransformerModel.LoadFromGguf(cpuGguf, config);
+        var tokenizer = GgufBpeTokenizerFactory.Load(cpuGguf.Metadata);
+
+        using var vkGguf = GgufFile.Open(fixture.Path!);
+        using var vkModel = VulkanTransformerModel.LoadFromGguf(vkGguf, config, spvDir);
+
+        int vocab = config.VocabSize;
+        var tokens = new List<int>(tokenizer.Encode("The capital of France is").ToArray());
+        Assert.NotEmpty(tokens);
+
+        int matches = 0;
+        for (int step = 0; step <= decodeSteps; step++)
+        {
+            int[] tokenIds = tokens.ToArray();
+            int[] positions = new int[tokenIds.Length];
+            for (int i = 0; i < positions.Length; i++) positions[i] = i;
+
+            float[] cpuLogits = LastRowLogits(cpuModel, tokenIds, positions, vocab);
+            float[] vkLogits = LastRowLogits(vkModel, tokenIds, positions, vocab);
+
+            int cpuArgmax = ArgmaxOf(cpuLogits);
+            int vkArgmax = ArgmaxOf(vkLogits);
+            if (cpuArgmax == vkArgmax) matches++;
+
+            double corr = Correlation(cpuLogits, vkLogits);
+            _output.WriteLine(
+                $"step {step} (seqLen={tokenIds.Length}): cpu_argmax={cpuArgmax} vk_argmax={vkArgmax} "
+                + $"corr={corr:F5}{(cpuArgmax == vkArgmax ? " [match]" : " [diff]")}");
+            Assert.True(corr > 0.99,
+                $"step {step}: logit correlation {corr:F5} — Vulkan Q5_0 path is not "
+                + "reading the same weights as the CPU reference.");
+
+            tokens.Add(cpuArgmax);
+        }
+
+        Assert.True(matches >= argmaxFloor,
+            $"strict argmax matches {matches}/{decodeSteps + 1} below floor {argmaxFloor}.");
+        _output.WriteLine($"strict argmax matches: {matches}/{decodeSteps + 1}");
+
+        // The growing-context reprefill loop above is seqLen > 1 at every step, so
+        // it only ever exercises MatMulQ5_0GemmF32Kernel. Run one explicit
+        // single-token forward to route the seqLen == 1 branch through
+        // MatMulQ5_0GemvF32Kernel — otherwise the decode kernel would be as
+        // unreachable-but-untested after this change as it was before it.
+        int[] one = [tokens[0]];
+        int[] onePos = [0];
+        float[] cpuOne = LastRowLogits(cpuModel, one, onePos, vocab);
+        float[] vkOne = LastRowLogits(vkModel, one, onePos, vocab);
+        double oneCorr = Correlation(cpuOne, vkOne);
+        int cpuOneArg = ArgmaxOf(cpuOne);
+        int vkOneArg = ArgmaxOf(vkOne);
+        _output.WriteLine(
+            $"decode shape (seqLen=1): cpu_argmax={cpuOneArg} vk_argmax={vkOneArg} corr={oneCorr:F5}");
+        Assert.True(oneCorr > 0.99,
+            $"seqLen=1 (GEMV) logit correlation {oneCorr:F5} — the Q5_0 decode kernel "
+            + "is not reading the packed weights correctly.");
+        Assert.Equal(cpuOneArg, vkOneArg);
+    }
+
+    private static unsafe float[] LastRowLogits(IModel model, int[] tokenIds, int[] positions, int vocab)
+    {
+        using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+        Assert.Equal(2, logits.Shape.Rank);
+        int seqLen = logits.Shape[0];
+        Assert.Equal(vocab, logits.Shape[1]);
+        var span = new ReadOnlySpan<float>((void*)logits.DataPointer, seqLen * vocab);
+        var result = new float[vocab];
+        span.Slice((seqLen - 1) * vocab, vocab).CopyTo(result);
+        return result;
+    }
+
+    private static int ArgmaxOf(float[] xs)
+    {
+        int best = 0;
+        float bestV = xs[0];
+        for (int i = 1; i < xs.Length; i++) if (xs[i] > bestV) { bestV = xs[i]; best = i; }
+        return best;
+    }
+
+    /// <summary>
+    /// Pearson correlation between two logit vectors. A dispatch gap that feeds
+    /// packed quant bytes to an F32 kernel produces near-zero correlation (the
+    /// Q3_K #311 diagnosis measured 0.006), which no per-element tolerance on
+    /// wildly-scaled logits would reliably catch.
+    /// </summary>
+    private static double Correlation(float[] a, float[] b)
+    {
+        int n = a.Length;
+        double ma = 0, mb = 0;
+        for (int i = 0; i < n; i++) { ma += a[i]; mb += b[i]; }
+        ma /= n; mb /= n;
+        double sab = 0, saa = 0, sbb = 0;
+        for (int i = 0; i < n; i++)
+        {
+            double da = a[i] - ma, db = b[i] - mb;
+            sab += da * db; saa += da * da; sbb += db * db;
+        }
+        return sab / Math.Sqrt(Math.Max(saa * sbb, 1e-30));
     }
 
     private static void SkipIfVulkanUnavailable(out string spvDir)
