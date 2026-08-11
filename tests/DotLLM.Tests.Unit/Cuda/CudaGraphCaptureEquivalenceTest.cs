@@ -60,13 +60,12 @@ public class CudaGraphCaptureEquivalenceTest
     private sealed record DecodeRun(int[] Tokens, float[][] Logits, int Replays, int Captures, int EagerDecodes);
 
     [SkippableTheory]
-    [InlineData("SmolLM-135M.Q4_K_M.gguf")]
-    [InlineData("SmolLM-135M.Q8_0.gguf")]
-    public void EagerVsGraphDecode_Match(string modelFile)
+    [InlineData("SmolLM-135M.Q4_K_M.gguf", "DOTLLM_SMOLLM_135M_Q4_K_M_GGUF")]
+    [InlineData("SmolLM-135M.Q8_0.gguf", "DOTLLM_SMOLLM_Q8_GGUF")]
+    public void EagerVsGraphDecode_Match(string modelFile, string envVar)
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
-        FixtureLocation fixture = TestFixtureResolver.ResolveFile(
-            "DOTLLM_SMOLLM_135M_GGUF", "QuantFactory", "SmolLM-135M-GGUF", modelFile);
+        FixtureLocation fixture = ResolveSmolLM(modelFile, envVar);
         Skip.If(!fixture.Found, fixture.SkipMessage($"SmolLM-135M {modelFile}"));
 
         using var gguf = GgufFile.Open(fixture.Path!);
@@ -95,8 +94,7 @@ public class CudaGraphCaptureEquivalenceTest
     public void EagerVsGraphDecode_QuantizedKv_Match()
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
-        FixtureLocation fixture = TestFixtureResolver.ResolveFile(
-            "DOTLLM_SMOLLM_135M_GGUF", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q4_K_M.gguf");
+        FixtureLocation fixture = ResolveSmolLM("SmolLM-135M.Q4_K_M.gguf", "DOTLLM_SMOLLM_135M_Q4_K_M_GGUF");
         Skip.If(!fixture.Found, fixture.SkipMessage("SmolLM-135M Q4_K_M GGUF"));
 
         using var gguf = GgufFile.Open(fixture.Path!);
@@ -203,6 +201,20 @@ public class CudaGraphCaptureEquivalenceTest
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
         return tokenizer.Encode("The capital of France is Paris. The capital of Germany is");
     }
+
+    /// <summary>
+    /// Resolves one SmolLM-135M quant.
+    /// </summary>
+    /// <remarks>
+    /// The override variable is PER-QUANT deliberately. `TestFixtureResolver` accepts a
+    /// file-valued override and returns it as-is without checking it is the file that was asked
+    /// for, so a single shared `DOTLLM_SMOLLM_135M_GGUF` pointing at the Q8_0 blob would make the
+    /// Q4_K_M case silently test Q8_0 — a fixture quietly not being what the test says it is, which
+    /// is the class of defect this change exists to remove. `DOTLLM_SMOLLM_Q8_GGUF` matches the
+    /// name already used by CudaTurboQuantKvEndToEndTests.
+    /// </remarks>
+    private static FixtureLocation ResolveSmolLM(string modelFile, string envVar)
+        => TestFixtureResolver.ResolveFile(envVar, "QuantFactory", "SmolLM-135M-GGUF", modelFile);
 
     private static FixtureLocation ResolveBitNet(string label, out string description)
     {
