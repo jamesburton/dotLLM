@@ -2175,6 +2175,14 @@ internal sealed class TransformerWeights : IDisposable
         // ~10 MB per layer). The caller dequantizes the routed experts on-demand per layer using
         // the raw-quant view.
         bool skipRoutedDequant = skipF32Dequant || skipRoutedF32Only;
+        // KNOWN REGRESSION (#327 fix-round-1 disclosure, not fixed this round): Vulkan's
+        // LoadMlaLayer call site now always passes explicit skipGateDequant/skipUpDequant/
+        // skipDownDequant and never skipF32Dequant, so skipSharedDequant below is always
+        // false for the Vulkan MLA+MoE path — a fully-resident model now pays for a
+        // shared-expert F32 host array (~10 MB/layer) it previously avoided when
+        // CanSkipMoeF32HostDequant was true. No numeric impact; whether to restore that
+        // skip (e.g. thread a shared-expert bool through moeBankSkipSelector too) is a
+        // separate decision, deliberately out of scope here.
         bool skipSharedDequant = skipF32Dequant; // shared stays unless caller asks for full skip
 
         // Per-bank overrides (#327) default to the combined decision above — this keeps
