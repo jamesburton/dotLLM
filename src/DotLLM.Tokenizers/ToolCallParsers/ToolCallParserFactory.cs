@@ -55,4 +55,32 @@ public static class ToolCallParserFactory
             _ => new GenericToolCallParser()
         };
     }
+
+    /// <summary>
+    /// Selects the parser to use for *output* given the effective <see cref="ToolChoice"/>.
+    /// </summary>
+    /// <param name="toolChoice">The request's tool choice.</param>
+    /// <param name="modelParser">The model-family parser produced by <see cref="Create"/>.</param>
+    /// <returns>
+    /// A <see cref="GenericToolCallParser"/> for <see cref="ToolChoice.Required"/> and
+    /// <see cref="ToolChoice.Function"/>; otherwise <paramref name="modelParser"/> unchanged.
+    /// </returns>
+    /// <remarks>
+    /// When <c>tool_choice</c> is <c>required</c> or a specific function, the output is produced by
+    /// <c>ToolCallSchemaBuilder</c> + <c>JsonSchemaConstraint</c>, which emit a <b>bare JSON object</b>
+    /// (<c>{"name":…,"arguments":…}</c>) — the JSON-schema constraint machinery cannot emit a model's
+    /// literal envelope tokens (<c>&lt;tool_call&gt;</c>, <c>&lt;|python_tag|&gt;</c>, <c>[TOOL_CALLS]</c>).
+    /// Parsing constrained output with a marker-based parser therefore always yields <c>null</c>, and
+    /// the tool call is silently lost. Every constrained call site must route through this method so the
+    /// rule cannot fork again (see issue #325).
+    /// <para>
+    /// Note this is about *parsing*; the <c>argumentsKey</c> passed to <c>ToolCallSchemaBuilder</c> must
+    /// still be derived from the <i>model</i> parser (Llama uses <c>"parameters"</c>), so callers should
+    /// compute it before swapping.
+    /// </para>
+    /// </remarks>
+    public static IToolCallParser ForToolChoice(ToolChoice toolChoice, IToolCallParser modelParser)
+        => toolChoice is ToolChoice.Required or ToolChoice.Function
+            ? new GenericToolCallParser()
+            : modelParser;
 }

@@ -61,11 +61,17 @@ public sealed class ConstrainedToolCallTests
             """{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}""");
 
         // Mirror ChatCommand: select parser + arguments key the same way production does.
+        // The MODEL parser decides the arguments key only:
         // For BitNet (Architecture.BitNet) → HermesToolCallParser → "arguments" key.
         // For Llama 3.1+ → LlamaToolCallParser → "parameters" key.
-        var toolCallParser = GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config.Architecture);
-        string argumentsKey = toolCallParser is LlamaToolCallParser ? "parameters" : "arguments";
+        var modelParser = GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config.Architecture);
+        string argumentsKey = modelParser is LlamaToolCallParser ? "parameters" : "arguments";
         string schema = ToolCallSchemaBuilder.BuildForRequired([tool], argumentsKey);
+
+        // The constraint emits a BARE JSON object (no <tool_call>/<|python_tag|>/[TOOL_CALLS]
+        // envelope — the JSON-schema constraint cannot emit literal marker tokens), so the
+        // markerless parser is the one production uses under tool_choice=required (#325).
+        var toolCallParser = ToolCallParserFactory.ForToolChoice(new ToolChoice.Required(), modelParser);
 
         // ── inference options — greedy + repeat-penalty 1.3, JSON schema constraint ──
         var options = new InferenceOptions

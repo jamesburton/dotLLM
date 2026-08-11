@@ -496,8 +496,9 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                     { Schema = ToolCallSchemaBuilder.BuildForFunction(tools.First(t => t.Name == fn.Name), argumentsKey), Name = "tool_call" },
                 _ => responseFormat
             };
-            // Constrained output is bare JSON → parse with the generic (markerless) parser.
-            toolCallParser = new GenericToolCallParser();
+            // Constrained output is bare JSON → parse with the generic (markerless) parser (#325).
+            toolCallParser = ToolCallParserFactory.ForToolChoice(
+                toolChoice, toolCallParser ?? new GenericToolCallParser());
         }
         var inferenceOptions = new InferenceOptions
         {
