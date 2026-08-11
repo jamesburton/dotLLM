@@ -19,6 +19,10 @@ public class VulkanQ3KDequantF32KernelTests
     [InlineData(8)]
     [InlineData(64)]
     [InlineData(1024)]
+    // >1536 blocks: real Q3_K weight matrices are far larger than the cases above, and a
+    // truncation that only bites past a few thousand blocks is invisible below it.
+    [InlineData(2048)]
+    [InlineData(4096)]
     public void Launch_MatchesCpuOracle(int totalBlocks)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
