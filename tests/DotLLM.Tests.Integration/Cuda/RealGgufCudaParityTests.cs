@@ -215,6 +215,27 @@ public sealed class RealGgufCudaParityTests
     private void RunGgufParityTest(string path, Architecture expectedArch, string label, string prompt)
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+
+        // This suite verifies CPU/CUDA NUMERICAL agreement for a real checkpoint regardless of
+        // which internal path CUDA takes to get there — including quant types with no native
+        // CUDA kernel (e.g. Q3_K, IQ1_S), which legitimately fall back to a dequant-and-expand
+        // path (CudaKernels.EnsureQuantExpansionAllowed). That fallback is exactly what this
+        // suite is exercising and verifying is numerically correct, so opt in for the duration
+        // of this test rather than tripping the production-facing safety gate.
+        bool prevAllowExpansion = CudaKernels.AllowQuantExpansion;
+        CudaKernels.AllowQuantExpansion = true;
+        try
+        {
+            RunGgufParityTestCore(path, expectedArch, label, prompt);
+        }
+        finally
+        {
+            CudaKernels.AllowQuantExpansion = prevAllowExpansion;
+        }
+    }
+
+    private void RunGgufParityTestCore(string path, Architecture expectedArch, string label, string prompt)
+    {
         string ptxDir = ResolvePtxDir();
         Skip.If(!Directory.Exists(ptxDir), $"CUDA PTX directory not found (resolved: {ptxDir}).");
 

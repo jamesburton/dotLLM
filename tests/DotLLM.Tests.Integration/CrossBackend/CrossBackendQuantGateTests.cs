@@ -331,6 +331,27 @@ public sealed class CrossBackendQuantGateTests
 
         SkipUnlessBackendAvailable(backend, out string? auxDir);
 
+        // This gate verifies CPU/GPU NUMERICAL agreement per quant type regardless of which
+        // internal path CUDA takes to get there — including types with no native CUDA kernel
+        // (e.g. Q3_K, Q4_0), which legitimately fall back to a dequant-and-expand path
+        // (CudaKernels.EnsureQuantExpansionAllowed). That fallback's correctness is exactly
+        // what this gate exercises, so opt in for the duration of this case rather than
+        // tripping the production-facing safety gate added alongside it.
+        bool prevAllowExpansion = DotLLM.Cuda.CudaKernels.AllowQuantExpansion;
+        DotLLM.Cuda.CudaKernels.AllowQuantExpansion = true;
+        try
+        {
+            await Backend_AgreesWithCpuCore(quantType, backend, path!, auxDir);
+        }
+        finally
+        {
+            DotLLM.Cuda.CudaKernels.AllowQuantExpansion = prevAllowExpansion;
+        }
+    }
+
+    private async Task Backend_AgreesWithCpuCore(
+        QuantizationType quantType, GateBackend backend, string path, string? auxDir)
+    {
         using var cpuGguf = GgufFile.Open(path!);
         var cpuConfig = GgufModelConfigExtractor.Extract(cpuGguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(cpuGguf.Metadata);
