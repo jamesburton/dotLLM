@@ -88,6 +88,7 @@ public class ToolCallParserFactoryTests
         data.Add(new HermesToolCallParser());
         data.Add(new XmlToolCallParser());
         data.Add(new MistralToolCallParser());
+        data.Add(new PythonicToolCallParser());
         return data;
     }
 
