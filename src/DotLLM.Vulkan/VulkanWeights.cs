@@ -974,6 +974,7 @@ internal sealed class VulkanWeights : IDisposable
             }
             LastTokenEmbedDequantPath = importedQ8 ? "resident-q8_0-imported" : "resident-q8_0";
             uploadedBytes = q8Bytes;
+            _residencyReport.Add("token_embd.weight", qt, QuantizationType.Q8_0, q8Bytes, q8Bytes);
             return q8Buf!;
         }
 
