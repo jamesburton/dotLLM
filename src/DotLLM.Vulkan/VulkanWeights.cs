@@ -450,6 +450,16 @@ internal sealed class VulkanWeights : IDisposable
 
     public LayerBuffers[] Layers => _layers;
     public VulkanDevice.Buffer TokenEmbedding { get; }
+
+    /// <summary>
+    /// Byte layout the token-embedding table actually holds on the device:
+    /// <see cref="QuantizationType.F32"/> for the widened gather table (the
+    /// historic behaviour — <c>vkCmdCopyBuffer</c> row gather), or
+    /// <see cref="QuantizationType.Q8_0"/> when the raw quantized table stayed
+    /// resident and the gather is a dequantizing compute dispatch (issue #352).
+    /// </summary>
+    public QuantizationType TokenEmbedDeviceQuantType { get; }
+
     public int VocabSize { get; }
     public int HiddenSize { get; }
 
@@ -463,7 +473,8 @@ internal sealed class VulkanWeights : IDisposable
 
     private VulkanWeights(
         VulkanDevice device,
-        VulkanDevice.Buffer tokenEmbed, int vocabSize, int hiddenSize,
+        VulkanDevice.Buffer tokenEmbed, QuantizationType tokenEmbedDeviceQt,
+        int vocabSize, int hiddenSize,
         LayerBuffers[] layers,
         VulkanDevice.Buffer outputNormWeight,
         VulkanDevice.Buffer outputWeight, QuantizationType outputDeviceQt, int outputM, int outputK,
@@ -471,6 +482,7 @@ internal sealed class VulkanWeights : IDisposable
     {
         _device = device;
         TokenEmbedding = tokenEmbed;
+        TokenEmbedDeviceQuantType = tokenEmbedDeviceQt;
         VocabSize = vocabSize;
         HiddenSize = hiddenSize;
         _layers = layers;
@@ -548,7 +560,7 @@ internal sealed class VulkanWeights : IDisposable
         // through it in chunks. Mapped ONCE for the whole load, so no per-upload
         // vkMapMemory re-charges the allocation's host commit (the #146 flake trigger).
         long stagingBytes = ComputeMaxUploadBytes(weights, numLayers, dequantToFp32, firstLayer,
-            skipTokenEmbed, skipOutputHead);
+            skipTokenEmbed, skipOutputHead, spvDir);
         using var staging = VulkanStagingBuffer.Create(device, stagingBytes);
 
         // Small dedicated staging for norm-vec / bias / scale uploads (issue #147):
@@ -566,6 +578,7 @@ internal sealed class VulkanWeights : IDisposable
         // A non-first pipeline stage never gathers (seeded from hidden state),
         // so it stubs the slot — same contract as the MoE/MLA stub buffers.
         VulkanDevice.Buffer tokenEmbed;
+        QuantizationType tokenEmbedDeviceQt = QuantizationType.F32;
         if (skipTokenEmbed)
         {
             LastTokenEmbedDequantPath = "skipped";
@@ -574,7 +587,7 @@ internal sealed class VulkanWeights : IDisposable
         else
         {
             tokenEmbed = UploadTokenEmbedding(device, staging, weights, spvDir,
-                out long tokenEmbedBytes);
+                out long tokenEmbedBytes, out tokenEmbedDeviceQt);
             totalBytes += tokenEmbedBytes;
         }
 
@@ -825,7 +838,7 @@ internal sealed class VulkanWeights : IDisposable
         }
 
         return new VulkanWeights(
-            device, tokenEmbed, weights.VocabSize, weights.HiddenSize,
+            device, tokenEmbed, tokenEmbedDeviceQt, weights.VocabSize, weights.HiddenSize,
             layerBuffers,
             outputNorm, outputWeight, outputDeviceQt,
             weights.OutputOutputDim, weights.OutputInputDim,
@@ -840,6 +853,34 @@ internal sealed class VulkanWeights : IDisposable
     /// </summary>
     private static bool IsEmbedGpuDequantDisabled() =>
         Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_EMBED_GPU_DEQUANT") == "1";
+
+    /// <summary>
+    /// Set <c>DOTLLM_VULKAN_DISABLE_EMBED_RESIDENT=1</c> to force the token-embed
+    /// table to be widened to F32 on upload even when a device-resident gather
+    /// exists for its type. The discriminating baseline for the #352 parity test
+    /// (resident gather vs widened copy must agree bit-for-bit) and an
+    /// operational escape hatch.
+    /// </summary>
+    private static bool IsEmbedResidencyDisabled() =>
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_EMBED_RESIDENT") == "1";
+
+    /// <summary>
+    /// Whether a Q8_0 token-embedding table can stay resident in its quantized
+    /// byte layout (issue #352).
+    /// </summary>
+    /// <remarks>
+    /// Deliberately separate from the matmul-side <c>Keep*OnDevice</c> predicates:
+    /// residency for the embedding table is gated on the existence of an
+    /// <em>embedding gather</em> shader for the type, which is a strictly
+    /// different capability from having a dense matmul kernel for it. Adding a
+    /// type here without its gather shader silently corrupts every embedding row.
+    /// </remarks>
+    internal static bool KeepEmbedQ8_0OnDevice(QuantizationType qt, int hiddenSize, string? spvDir)
+        => qt == QuantizationType.Q8_0
+           && (hiddenSize % 32) == 0
+           && !IsEmbedResidencyDisabled()
+           && spvDir is not null
+           && File.Exists(Path.Combine(spvDir, "q8_0_embed_gather_f32.spv"));
 
     /// <summary>
     /// Diagnostic — how the token-embed table was materialised on the most recent
@@ -866,21 +907,59 @@ internal sealed class VulkanWeights : IDisposable
     /// is bit-identical to the CPU oracle (<c>precise</c> math, same op order).
     /// </para>
     /// <para>
+    /// DEVICE-RESIDENT path (issue #352): when the source table is Q8_0 and the
+    /// <c>q8_0_embed_gather_f32</c> shader is available, the raw Q8_0 bytes are
+    /// the device image — nothing is widened. The per-forward gather becomes a
+    /// dequantizing compute dispatch instead of a row <c>vkCmdCopyBuffer</c>,
+    /// and the table costs 34 bytes per 32 weights instead of 128 (a 3.76x
+    /// saving; ~772 MB on Llama-3.2-1B-Instruct-Q8_0). Note this is strictly
+    /// stronger than the #147 GPU-dequant path above, which still materialises
+    /// the vocab×hidden F32 table on the device — it only moves the *dequant*
+    /// off the host.
+    /// </para>
+    /// <para>
     /// Every other source type falls back to the CPU dequant streamed through
-    /// staging (host commit still bounded by the staging cap). Follow-up quant
-    /// types (Q8_0, F16 — SmolLM/TinyLlama-class embeds) are ledgered in the
-    /// #147 audit; their tables are ≤8× smaller than the K-quant gate models'.
+    /// staging (host commit still bounded by the staging cap). Extending
+    /// residency to a further type means writing that type's gather shader —
+    /// a dense matmul kernel for the type is NOT sufficient, because the
+    /// embedding lookup dispatches on this table alone.
     /// </para>
     /// </remarks>
     private static VulkanDevice.Buffer UploadTokenEmbedding(
         VulkanDevice device, VulkanStagingBuffer staging, TransformerWeights weights,
-        string? spvDir, out long uploadedBytes)
+        string? spvDir, out long uploadedBytes, out QuantizationType deviceQt)
     {
         int vocab = weights.VocabSize;
         int hidden = weights.HiddenSize;
         QuantizationType qt = weights.TokenEmbedQuantType;
         long elems = (long)vocab * hidden;
         long fpBytes = elems * sizeof(float);
+
+        // Device-resident Q8_0 table (issue #352) — no widening at all.
+        if (KeepEmbedQ8_0OnDevice(qt, hidden, spvDir))
+        {
+            deviceQt = QuantizationType.Q8_0;
+            long q8Bytes = Dequantize.RowByteSize(hidden, qt) * vocab;
+            bool importedQ8 = TryZeroCopyImport(device, weights.TokenEmbedWeight, q8Bytes, out var q8Buf);
+            if (!importedQ8)
+            {
+                q8Buf = device.AllocateDeviceLocal(q8Bytes);
+                try
+                {
+                    staging.UploadBytes(weights.TokenEmbedWeight, q8Bytes, q8Buf);
+                }
+                catch
+                {
+                    q8Buf.Dispose();
+                    throw;
+                }
+            }
+            LastTokenEmbedDequantPath = importedQ8 ? "resident-q8_0-imported" : "resident-q8_0";
+            uploadedBytes = q8Bytes;
+            return q8Buf!;
+        }
+
+        deviceQt = QuantizationType.F32;
 
         bool gpuEligible = spvDir is not null
             && !IsEmbedGpuDequantDisabled()
@@ -1195,13 +1274,19 @@ internal sealed class VulkanWeights : IDisposable
 
     private static long ComputeMaxUploadBytes(
         TransformerWeights weights, int numLayers, bool dequantToFp32, int firstLayer = 0,
-        bool skipTokenEmbed = false, bool skipOutputHead = false)
+        bool skipTokenEmbed = false, bool skipOutputHead = false, string? spvDir = null)
     {
         long max = 0;
         // Skipped (stubbed) tensors never pass through staging — excluding them matters because the
         // F32 embed table is frequently the single largest staging allocation (vocab × hidden × 4).
+        // A device-resident embed table (issue #352) stages only its quantized bytes.
         if (!skipTokenEmbed)
-            max = Math.Max(max, UploadBytes(weights.VocabSize, weights.HiddenSize, weights.TokenEmbedQuantType, dequantToFp32: true));
+        {
+            bool embedResident = KeepEmbedQ8_0OnDevice(weights.TokenEmbedQuantType, weights.HiddenSize, spvDir);
+            max = Math.Max(max, UploadBytes(
+                weights.VocabSize, weights.HiddenSize, weights.TokenEmbedQuantType,
+                dequantToFp32: !embedResident));
+        }
         if (!skipOutputHead)
             max = Math.Max(max, UploadBytes(weights.OutputOutputDim, weights.OutputInputDim, weights.OutputQuantType, dequantToFp32));
         for (int i = 0; i < numLayers; i++)

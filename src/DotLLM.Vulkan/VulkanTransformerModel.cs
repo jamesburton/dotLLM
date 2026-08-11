@@ -683,6 +683,10 @@ public sealed class VulkanTransformerModel : IModel
     // created only when Config.EmbeddingScale is set. Null otherwise. Also
     // reused for the Gemma-4 per-layer output scale (layer_output_scale).
     private readonly ScaleInplaceF32Kernel? _embedScale;
+    // Device-resident Q8_0 token-embedding gather (issue #352). Non-null only when
+    // VulkanWeights kept the embedding table in its raw Q8_0 layout instead of
+    // widening it to F32; null => the legacy vkCmdCopyBuffer F32 row gather.
+    private readonly Q8_0EmbedGatherF32Kernel? _embedGatherQ8;
     // Unit-gamma (all-ones) [maxHeadDim] vector for Gemma-4's weight-less V-norm
     // (per-kv-head RMSNorm with no scale). Lazily allocated on first use.
     private VulkanDevice.Buffer? _gemma4OnesVec;
@@ -967,7 +971,9 @@ public sealed class VulkanTransformerModel : IModel
         VulkanFlashAttentionCoopmatKernel? flashAttentionCoopmat,
         VulkanSplitKvAttentionKernel? splitKvAttention,
         SwiGluF32Kernel swiglu, GeGluTanhF32Kernel? geglu, ReLU2GluF32Kernel? relu2glu,
-        ScaleInplaceF32Kernel? embedScale, AddKernel add,
+        ScaleInplaceF32Kernel? embedScale,
+        Q8_0EmbedGatherF32Kernel? embedGatherQ8,
+        AddKernel add,
         BiasAddF32Kernel biasAdd,
         AttentionMlaF32Kernel? mlaAttention, RopeMlaF32Kernel? mlaRope, MlaKvSplitF32Kernel? mlaKvSplit,
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax, MoeIndexedMatmulF32Kernel? moeIndexedMatmul,
@@ -1083,6 +1089,7 @@ public sealed class VulkanTransformerModel : IModel
         _geglu = geglu;
         _relu2glu = relu2glu;
         _embedScale = embedScale;
+        _embedGatherQ8 = embedGatherQ8;
         _add = add;
         _biasAdd = biasAdd;
         _mlaAttention = mlaAttention;
@@ -1654,6 +1661,13 @@ public sealed class VulkanTransformerModel : IModel
             config.EmbeddingScale is float es && es != 1.0f
                 ? ScaleInplaceF32Kernel.Create(device, spvDir)
                 : null;
+        // Device-resident Q8_0 embedding gather (issue #352) — created only when
+        // the upload actually kept the table quantized, so a model whose embed
+        // was widened (or stubbed for a pipeline stage) keeps the F32 copy path.
+        Q8_0EmbedGatherF32Kernel? embedGatherQ8 =
+            weights.TokenEmbedDeviceQuantType == QuantizationType.Q8_0
+                ? Q8_0EmbedGatherF32Kernel.Create(device, spvDir)
+                : null;
         var add = AddKernel.Create(device, spvDir);
         var biasAdd = BiasAddF32Kernel.Create(device, spvDir);
 
@@ -1801,7 +1815,9 @@ public sealed class VulkanTransformerModel : IModel
             matmulQ2KMmq,
             matmulQ3KMmq,
             matmulIq2XxsMmq,
-            rmsnorm, rope, ropeKvWrite, attention, flashAttention, flashAttentionCoopmat, splitKvAttention, swiglu, geglu, relu2glu, embedScale, add,
+            rmsnorm, rope, ropeKvWrite, attention, flashAttention, flashAttentionCoopmat, splitKvAttention, swiglu, geglu, relu2glu, embedScale,
+            embedGatherQ8,
+            add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
             moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulQ8,
@@ -2593,7 +2609,7 @@ public sealed class VulkanTransformerModel : IModel
         // HiddenState[t, :] for t in [0, totalTokens). Order matches packedTokens
         // (= per-seq concatenation in simpleIdx order).
         RecordEmbeddingGather(cmdBuf, packedTokens.AsSpan(0, totalTokens));
-        BarrierTransferToCompute(cmdBuf);
+        BarrierAfterEmbeddingGather(cmdBuf);
 
         // Per-seq token offset into the batched buffer. Used inside the layer loop
         // to slice Q/K/V/AttnOutput per sequence (computed once, reused per layer).
@@ -3020,7 +3036,7 @@ public sealed class VulkanTransformerModel : IModel
         if (!seedFromHidden)
         {
             RecordEmbeddingGather(cmdBuf, tokenIds);
-            BarrierTransferToCompute(cmdBuf);
+            BarrierAfterEmbeddingGather(cmdBuf);
         }
 
         // Gemma sqrt(hidden) embedding scaling — multiply the gathered
@@ -3896,6 +3912,7 @@ public sealed class VulkanTransformerModel : IModel
         _geglu?.InvalidateDescriptorCache();
         _relu2glu?.InvalidateDescriptorCache();
         _embedScale?.InvalidateDescriptorCache();
+        _embedGatherQ8?.InvalidateDescriptorCache();
         _add.InvalidateDescriptorCache();
         _biasAdd.InvalidateDescriptorCache();
         _mlaAttention?.InvalidateDescriptorCache();
@@ -4246,7 +4263,7 @@ public sealed class VulkanTransformerModel : IModel
         KernelSupport.HostToComputeBarrier(cmdBuf);
         _state.ResetHiddenSlot();
         RecordEmbeddingGather(cmdBuf, tokenIds);
-        BarrierTransferToCompute(cmdBuf);
+        BarrierAfterEmbeddingGather(cmdBuf);
         if (_embedScale is not null)
         {
             _embedScale.Record(cmdBuf, _state.HiddenState, seqLen * hiddenSize, Config.EmbeddingScale!.Value);
@@ -6540,9 +6557,36 @@ public sealed class VulkanTransformerModel : IModel
     /// For <c>seqLen=1</c> decode this is one call; for prefill it's
     /// <c>promptLen</c> calls, still dwarfed by the per-layer matmul cost.
     /// </remarks>
+    /// <summary>
+    /// Barrier between the embedding gather and its first consumer (the first
+    /// RMSNorm's COMPUTE read of HiddenState). The F32 gather is a TRANSFER
+    /// (<c>vkCmdCopyBuffer</c>); the device-resident quantized gather (issue
+    /// #352) is a COMPUTE dispatch — so the source stage differs.
+    /// </summary>
+    private void BarrierAfterEmbeddingGather(nint cmdBuf)
+    {
+        if (_embedGatherQ8 is not null) BarrierComputeToCompute(cmdBuf);
+        else BarrierTransferToCompute(cmdBuf);
+    }
+
     private void RecordEmbeddingGather(nint cmdBuf, ReadOnlySpan<int> tokenIds)
     {
         int hiddenSize = Config.HiddenSize;
+
+        // Device-resident quantized table (issue #352): the table never got
+        // widened to F32, so the gather is a dequantizing compute dispatch that
+        // reads the token ids from a device buffer instead of N row copies with
+        // host-resolved offsets. Bit-identical to the F32 copy path — the shader
+        // reproduces the CPU scalar dequant exactly.
+        if (_embedGatherQ8 is not null)
+        {
+            _device.Upload(MemoryMarshal.AsBytes(tokenIds), _state.TokenIdsBuffer);
+            _embedGatherQ8.Record(
+                cmdBuf, _weights.TokenEmbedding, _state.TokenIdsBuffer, _state.HiddenState,
+                tokenIds.Length, hiddenSize, Config.VocabSize);
+            return;
+        }
+
         long rowBytes = (long)hiddenSize * sizeof(float);
         var srcBuf = _weights.TokenEmbedding.Handle;
         var dstBuf = _state.HiddenState.Handle;
@@ -6622,6 +6666,7 @@ public sealed class VulkanTransformerModel : IModel
         _geglu?.Dispose();
         _relu2glu?.Dispose();
         _embedScale?.Dispose();
+        _embedGatherQ8?.Dispose();
         _gemma4OnesVec?.Dispose();
         _splitKvAttention?.Dispose();
         _flashAttention?.Dispose();
