@@ -1152,8 +1152,13 @@ public sealed class VulkanTransformerModel : IModel
             // what CudaTransformerModel/CudaPipelineTransformerModel already do
             // unconditionally, but gated here since Vulkan didn't have full K-quant
             // routed-bank coverage until this issue.
-            bool skipF32MoeDequant = VulkanWeights.CanSkipMoeF32HostDequant(device, gguf, config);
-            var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config, skipF32MoeDequant);
+            // #326: when the skip is refused, say what the fallback will cost and why BEFORE
+            // allocating it — otherwise the load exhausts host RAM and reports a bare
+            // OutOfMemoryException inside SliceExpertsToF32.
+            var moePlan = VulkanWeights.PlanMoeF32HostDequant(device, gguf, config);
+            VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(
+                moePlan, VulkanWeights.AvailableHostMemoryBytes());
+            var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config, moePlan.CanSkip);
             return BuildModel(device, ownsDevice: true, config, cpuWeights, spvDir, gguf);
         }
         catch
@@ -1181,8 +1186,11 @@ public sealed class VulkanTransformerModel : IModel
 
         spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
         // #191: see the other LoadFromGguf overload's comment.
-        bool skipF32MoeDequant = VulkanWeights.CanSkipMoeF32HostDequant(device, gguf, config);
-        var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config, skipF32MoeDequant);
+        // #326: see the other overload — preflight the F32 fallback footprint before allocating.
+        var moePlan = VulkanWeights.PlanMoeF32HostDequant(device, gguf, config);
+        VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(
+            moePlan, VulkanWeights.AvailableHostMemoryBytes());
+        var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config, moePlan.CanSkip);
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf);
     }
 
