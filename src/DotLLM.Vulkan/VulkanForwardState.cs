@@ -197,6 +197,14 @@ internal sealed class VulkanForwardState : IDisposable
     // ── Host → device transfer scratch (tokens + positions) ──────────
     public VulkanDevice.Buffer PositionsBuffer { get; private set; }
 
+    /// <summary>
+    /// Per-forward token ids, host-written before recording. Only consumed by
+    /// the device-resident (quantized) embedding gather (issue #352); the F32
+    /// gather path resolves rows host-side into <c>vkCmdCopyBuffer</c> offsets
+    /// and never reads this buffer.
+    /// </summary>
+    public VulkanDevice.Buffer TokenIdsBuffer { get; private set; }
+
     // ── LoRA delta scratch (Phase 4b) ─────────────────────────────────
     // Allocated lazily on first LoRA-aware forward via EnsureLoraScratch
     // (otherwise null — forward pass with no adapter pays no extra VRAM).
@@ -270,6 +278,7 @@ internal sealed class VulkanForwardState : IDisposable
         // reads at <1 GB/s on the CPU: ~0.4 ms per 49k-vocab row — issue #143).
         Logits = device.AllocateHostReadback((long)vocabSize * sizeof(float));
         PositionsBuffer = device.Allocate(Math.Max(1, initialSeqLen) * sizeof(int));
+        TokenIdsBuffer = device.Allocate(Math.Max(1, initialSeqLen) * sizeof(int));
 
         // AllocateForCapacity allocates the per-seqLen prefill MMQ scratch
         // (Q8_1XqRows / Q8_1XdsRows) sized by _q8_1MaxK, so it must run after
@@ -396,6 +405,8 @@ internal sealed class VulkanForwardState : IDisposable
         // Resize positions buffer — host writes positions per forward.
         PositionsBuffer.Dispose();
         PositionsBuffer = _device.Allocate((long)seqLen * sizeof(int));
+        TokenIdsBuffer.Dispose();
+        TokenIdsBuffer = _device.Allocate((long)seqLen * sizeof(int));
 
         // Prefill MMQ activation scratch — [seqLen, maxK] packed int8 + scales.
         // Only when the dp4a path is wired (mmvqEnabled). Released alongside the
@@ -606,6 +617,7 @@ internal sealed class VulkanForwardState : IDisposable
         ReleaseLayerScratch();
         Logits?.Dispose();
         PositionsBuffer?.Dispose();
+        TokenIdsBuffer?.Dispose();
         Q8_1Xq?.Dispose();
         Q8_1Xds?.Dispose();
     }
