@@ -1219,6 +1219,52 @@ public sealed unsafe class CudaKernels : IDisposable
     public static bool DisableQuantizedGemv { get; set; } =
         Environment.GetEnvironmentVariable("DOTLLM_DISABLE_QUANTIZED_GEMV") == "1";
 
+    /// <summary>
+    /// Opt-in gate for persistently expanding a quant type CUDA has no native kernel for into
+    /// a larger resident format (FP16/F32) kept for the model's entire lifetime. Default
+    /// disabled: a checkpoint that can't actually be run in its compact form on this backend
+    /// fails loudly at load time (see <see cref="EnsureQuantExpansionAllowed"/>) instead of
+    /// silently ballooning VRAM and running a de-facto bigger, slower model than the one that
+    /// was loaded. Set <c>DOTLLM_CUDA_ALLOW_QUANT_EXPANSION=1</c> to restore the old
+    /// silent-fallback behavior.
+    /// </summary>
+    public static bool AllowQuantExpansion { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_CUDA_ALLOW_QUANT_EXPANSION") == "1";
+
+    /// <summary>
+    /// Call at every site that is about to fall back to a full, model-lifetime-resident
+    /// dequant of <paramref name="qt"/> for <paramref name="tensorLabel"/> because no native
+    /// CUDA kernel exists for it. Throws unless <see cref="AllowQuantExpansion"/> is set — see
+    /// its remarks for why this defaults to a hard failure rather than a silent fallback.
+    /// Not for the transient per-call scratch-buffer dequant used during prefill by types that
+    /// DO have a native decode kernel — that path doesn't change the model's resident memory
+    /// footprint and is not gated.
+    /// </summary>
+    /// <param name="qt">The quantization type with no native CUDA kernel.</param>
+    /// <param name="tensorLabel">Human-readable tensor/layer identity for the error message.</param>
+    /// <param name="compactBytes">Size of the tensor in its native on-disk quant format.</param>
+    /// <param name="expandedBytes">Size of the tensor once expanded to the resident fallback format.</param>
+    public static void EnsureQuantExpansionAllowed(
+        QuantizationType qt, string tensorLabel, long compactBytes, long expandedBytes)
+    {
+        if (AllowQuantExpansion) return;
+        throw new InvalidOperationException(
+            $"CUDA has no native kernel for quantization type {qt} on '{tensorLabel}'. Running "
+            + $"this model on CUDA as-is would silently expand this tensor from "
+            + $"{FormatBytes(compactBytes)} (native quant, what you loaded) to "
+            + $"{FormatBytes(expandedBytes)} (dequantized, resident for the model's whole "
+            + "lifetime) — you would not be running the model you loaded, but a de-facto "
+            + "larger, slower version of it, and every other tensor of this type in the model "
+            + "would silently expand the same way. Set DOTLLM_CUDA_ALLOW_QUANT_EXPANSION=1 if "
+            + "you explicitly want this fallback, or use a checkpoint requantized to a "
+            + "CUDA-native type (F16, F32, BF16, Q8_0, Q2_K, Q4_K, Q5_0, Q5_K, Q6_K, IQ4_NL, "
+            + "IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, I2_S, or PQ2_0).");
+    }
+
+    private static string FormatBytes(long bytes) => bytes >= (1L << 30)
+        ? $"{bytes / (double)(1L << 30):F2} GiB"
+        : $"{bytes / (double)(1L << 20):F1} MiB";
+
     /// <summary>MMVQ-large block size (threads). MUST equal the compiled <c>MMVQ_LARGE_THREADS</c> in
     /// quantized_gemv_mmq.cu. Tunable via <c>DOTLLM_CUDA_MMVQ_THREADS</c> (32–256, multiple of 32; default
     /// 128) to sweep occupancy for the decode GEMV — for small-k models (k≤~3072) the default leaves most
