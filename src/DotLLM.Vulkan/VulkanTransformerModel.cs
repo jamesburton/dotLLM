@@ -1146,14 +1146,19 @@ public sealed class VulkanTransformerModel : IModel
         try
         {
             spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
-            // #191: skip the per-expert F32 host dequant of routed MoE banks when
-            // every routed bank across every MoE layer would resolve to a supported
-            // raw-quant device view anyway (see CanSkipMoeF32HostDequant) — mirrors
-            // what CudaTransformerModel/CudaPipelineTransformerModel already do
-            // unconditionally, but gated here since Vulkan didn't have full K-quant
-            // routed-bank coverage until this issue.
-            bool skipF32MoeDequant = VulkanWeights.CanSkipMoeF32HostDequant(device, gguf, config);
-            var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config, skipF32MoeDequant);
+            // #191/#327: skip the per-expert F32 host dequant of a routed MoE bank when
+            // THAT bank would resolve to a supported raw-quant device view anyway (see
+            // VulkanWeights.ResolveMoeBankResidency) — mirrors what
+            // CudaTransformerModel/CudaPipelineTransformerModel already do unconditionally,
+            // but gated here since Vulkan didn't have full K-quant routed-bank coverage
+            // until #191. Resolved PER BANK (#327): one unsupported sibling (e.g. a Q5_0
+            // down bank) no longer forces every other bank in the model to pay for a host
+            // F32 array it will never read.
+            var moeBankResidency = VulkanWeights.ResolveMoeBankResidency(device, gguf, config);
+            var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config,
+                moeBankSkipSelector: layerIdx => moeBankResidency.TryGetValue(layerIdx, out var r)
+                    ? (r.Gate, r.Up, r.Down)
+                    : (false, false, false));
             return BuildModel(device, ownsDevice: true, config, cpuWeights, spvDir, gguf);
         }
         catch
@@ -1180,9 +1185,12 @@ public sealed class VulkanTransformerModel : IModel
         RejectUnsupportedArchitecture(config);
 
         spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
-        // #191: see the other LoadFromGguf overload's comment.
-        bool skipF32MoeDequant = VulkanWeights.CanSkipMoeF32HostDequant(device, gguf, config);
-        var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config, skipF32MoeDequant);
+        // #191/#327: see the other LoadFromGguf overload's comment.
+        var moeBankResidency = VulkanWeights.ResolveMoeBankResidency(device, gguf, config);
+        var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config,
+            moeBankSkipSelector: layerIdx => moeBankResidency.TryGetValue(layerIdx, out var r)
+                ? (r.Gate, r.Up, r.Down)
+                : (false, false, false));
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf);
     }
 

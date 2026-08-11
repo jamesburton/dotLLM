@@ -1,3 +1,4 @@
+using System.Linq;
 using DotLLM.Core.Configuration;
 using DotLLM.Vulkan;
 using Xunit;
@@ -39,5 +40,43 @@ public class VulkanResidencyReportTests
 
         Assert.Equal(0, report.ExpandedTensorCount);
         Assert.Equal(report.PackedBytes, report.UploadedBytes);
+    }
+
+    /// <summary>
+    /// #327: a routed-MoE layer's three banks must be resolved independently, not
+    /// ANDed model-globally. Uses the SAME per-bank contraction dims the real loader
+    /// does (<c>VulkanWeights.CanSkipMoeF32HostDequant</c>'s DeepSeek-V2 loop): gate/up
+    /// contract along <c>hiddenSize</c>, down contracts along the MoE intermediate size.
+    /// </summary>
+    /// <remarks>
+    /// The brief's original 3-bank example passed a single <c>inputDim: 1408</c> to
+    /// every bank, including the two Q4_K gate/up banks — but Q4_K requires 256-alignment
+    /// and 1408 % 256 != 0, so that literal example can never pass against
+    /// <c>CanKeepBankResident</c>'s real (K-quant super-block-aligned) implementation.
+    /// This version keeps the scenario (2 resident-capable siblings + 1 not, #327) but
+    /// gives gate/up their production dimension (hiddenSize, 256-aligned) instead.
+    /// </remarks>
+    [Fact]
+    public void MoeSkip_IsPerBank_NotModelGlobal()
+    {
+        const int hiddenSize = 2048;       // gate/up contraction axis — 256-aligned.
+        const int moeIntermediate = 1408;  // down contraction axis — 32- but not 256-aligned.
+
+        // 3 banks: two Q4_K (resident-capable), one Q5_0 (not — no Vulkan Q5_0 kernel
+        // in this worktree; #344 Unit 1 adds it).
+        var banks = new[]
+        {
+            (Name: "blk.0.ffn_gate_exps.weight", Qt: QuantizationType.Q4_K, InputDim: hiddenSize),
+            (Name: "blk.0.ffn_up_exps.weight",   Qt: QuantizationType.Q4_K, InputDim: hiddenSize),
+            (Name: "blk.0.ffn_down_exps.weight", Qt: QuantizationType.Q5_0, InputDim: moeIntermediate),
+        };
+
+        var resident = banks
+            .Where(b => VulkanWeights.CanKeepBankResident(b.Qt, b.InputDim))
+            .Select(b => b.Name)
+            .ToArray();
+
+        Assert.Equal(2, resident.Length);
+        Assert.DoesNotContain("blk.0.ffn_down_exps.weight", resident);
     }
 }

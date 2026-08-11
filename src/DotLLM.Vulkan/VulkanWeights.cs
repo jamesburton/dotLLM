@@ -775,7 +775,7 @@ internal sealed class VulkanWeights : IDisposable
                 }
                 else
                 {
-                    moe = UploadMoeLayer(device, staging, vecStaging, lw.Moe, out long moeBytes);
+                    moe = UploadMoeLayer(device, staging, vecStaging, lw.Moe, $"blk.{firstLayer + i}", out long moeBytes);
                     totalBytes += moeBytes;
                 }
             }
@@ -1211,6 +1211,28 @@ internal sealed class VulkanWeights : IDisposable
         return QuantizationType.F32;
     }
 
+    /// <summary>
+    /// True when a single projection of format <paramref name="qt"/> and contraction
+    /// dimension <paramref name="inputDim"/> can be held on device in its own packed
+    /// form (any of the general-purpose <see cref="DeviceQuantTypeFor"/> formats),
+    /// rather than being widened to F32 on upload.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the GENERAL per-projection predicate (same one <see cref="UploadMatrix"/>
+    /// uses for attention/FFN weights) — it recognizes strictly more formats than the
+    /// routed-MoE-specific <see cref="MoeRoutedRawDeviceQuantType"/> (e.g. Q2_K, Q3_K, the
+    /// IQ family, I2_S, PQ2_0), because those extra formats have no MoE-indexed matmul
+    /// kernel yet. <b>Do not use this to decide routed-expert-bank residency</b> — that
+    /// decision belongs to <see cref="MoeRoutedRawDeviceQuantType"/> /
+    /// <see cref="ResolveMoeBankResidency"/>, which mirror exactly what
+    /// <see cref="UploadMoeLayer"/> dispatches to. This predicate is for ordinary
+    /// (non-routed) weight matrices.
+    /// </para>
+    /// </remarks>
+    public static bool CanKeepBankResident(QuantizationType qt, int inputDim)
+        => DeviceQuantTypeFor(qt, inputDim, dequantToFp32: false) == qt;
+
     private static long ComputeMaxUploadBytes(
         TransformerWeights weights, int numLayers, bool dequantToFp32, int firstLayer = 0,
         bool skipTokenEmbed = false, bool skipOutputHead = false)
@@ -1529,7 +1551,7 @@ internal sealed class VulkanWeights : IDisposable
     /// </remarks>
     private static MoeLayerBuffers UploadMoeLayer(
         VulkanDevice device, VulkanStagingBuffer stage, VulkanStagingBuffer vecStage,
-        MoeLayerWeights moe, out long uploadedBytes)
+        MoeLayerWeights moe, string namePrefix, out long uploadedBytes)
     {
         uploadedBytes = 0;
         int hidden = moe.HiddenSize;
@@ -1601,6 +1623,19 @@ internal sealed class VulkanWeights : IDisposable
         var w2Bank = UploadRoutedBankWhole(device, stage, routedW2Qt, moe.DownExpsRaw, moe.W2, perExpertW2Bytes, numE);
         var w3Bank = UploadRoutedBankWhole(device, stage, routedW3Qt, moe.UpExpsRaw, moe.W3, perExpertW3Bytes, numE);
         uploadedBytes += (perExpertW1Bytes + perExpertW2Bytes + perExpertW3Bytes) * numE;
+
+        // #327: routed-expert banks bypass UploadMatrix (the only path that otherwise
+        // records into the residency report), so they were previously invisible to it —
+        // record them here so per-bank residency (this task's whole point) is observable.
+        long packedW1Bytes = Dequantize.RowByteSize(hidden, moe.GateExpsRawQt) * interm * numE;
+        long packedW2Bytes = Dequantize.RowByteSize(interm, moe.DownExpsRawQt) * hidden * numE;
+        long packedW3Bytes = Dequantize.RowByteSize(hidden, moe.UpExpsRawQt) * interm * numE;
+        _residencyReport.Add($"{namePrefix}.ffn_gate_exps.weight", moe.GateExpsRawQt, routedW1Qt,
+            packedW1Bytes, perExpertW1Bytes * numE);
+        _residencyReport.Add($"{namePrefix}.ffn_down_exps.weight", moe.DownExpsRawQt, routedW2Qt,
+            packedW2Bytes, perExpertW2Bytes * numE);
+        _residencyReport.Add($"{namePrefix}.ffn_up_exps.weight", moe.UpExpsRawQt, routedW3Qt,
+            packedW3Bytes, perExpertW3Bytes * numE);
 
         // ── Shared-expert per-expert buffers (separate buffers, NOT a packed bank — the
         //    matmul kernel reads its weight buffer from offset 0). Each shared expert
@@ -2065,8 +2100,54 @@ internal sealed class VulkanWeights : IDisposable
     /// </remarks>
     internal static bool CanSkipMoeF32HostDequant(VulkanDevice device, GgufFile gguf, ModelConfig config)
     {
-        if (config.MlaConfig is null || config.Moe is null)
+        var residency = ResolveMoeBankResidency(device, gguf, config);
+        if (residency.Count == 0 && (config.MlaConfig is null || config.Moe is null))
             return false;
+
+        foreach (var bank in residency.Values)
+        {
+            if (!bank.AllResident)
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>One MoE layer's per-bank routed-expert residency outcome.</summary>
+    /// <remarks>
+    /// <c>Resolved</c> is false for a layer whose GGUF tensor descriptors could not be
+    /// read (missing/unexpected tensor) — the caller must treat every bank on that layer
+    /// as needing the F32 host fallback, mirroring <see cref="CanSkipMoeF32HostDequant"/>'s
+    /// prior all-or-nothing behavior for that failure case.
+    /// </remarks>
+    internal readonly record struct MoeBankResidency(bool Resolved, bool Gate, bool Up, bool Down)
+    {
+        public bool AllResident => Resolved && Gate && Up && Down;
+    }
+
+    /// <summary>
+    /// Per-bank sibling of <see cref="CanSkipMoeF32HostDequant"/>: resolves, for EVERY MoE
+    /// layer, whether EACH of the three routed banks (gate/up/down) independently would be
+    /// kept device-resident by <see cref="UploadMoeLayer"/> — instead of ANDing the decision
+    /// across the whole model. One unsupported sibling (e.g. a Q5_0 down bank, #327) no
+    /// longer has to force every other bank in the model to pay for a host F32 array it will
+    /// never read.
+    /// </summary>
+    /// <remarks>
+    /// Uses the exact same predicate (<see cref="MoeRoutedRawDeviceQuantType"/>) with the
+    /// exact same per-bank (M, K) mapping <see cref="UploadMoeLayer"/> uses (gate/up contract
+    /// along hidden, down along the MoE intermediate size) — the two must never diverge, or a
+    /// bank this preflight calls "resident" could resolve to F32 at upload time and read a
+    /// null per-expert host pointer (see <see cref="CanSkipMoeF32HostDequant"/>'s remarks for
+    /// why that is silent corruption, not a crash). This preflight inspects the GGUF tensor
+    /// descriptors directly (no CPU weights loaded yet).
+    /// </remarks>
+    internal static Dictionary<int, MoeBankResidency> ResolveMoeBankResidency(
+        VulkanDevice device, GgufFile gguf, ModelConfig config)
+    {
+        var result = new Dictionary<int, MoeBankResidency>();
+        if (config.MlaConfig is null || config.Moe is null)
+            return result;
 
         var moe = config.Moe;
         var tensors = gguf.TensorsByName;
@@ -2083,7 +2164,10 @@ internal sealed class VulkanWeights : IDisposable
             if (!tensors.TryGetValue($"{prefix}.ffn_gate_exps.weight", out var gateDesc)
                 || !tensors.TryGetValue($"{prefix}.ffn_up_exps.weight", out var upDesc)
                 || !tensors.TryGetValue($"{prefix}.ffn_down_exps.weight", out var downDesc))
-                return false; // Unexpected/missing tensor — fall back to the safe F32 path.
+            {
+                result[i] = new MoeBankResidency(Resolved: false, Gate: false, Up: false, Down: false);
+                continue; // Unexpected/missing tensor — caller must fall back to F32 for this layer.
+            }
 
             nint gateRaw = dataBase + (nint)gateDesc.DataOffset;
             nint upRaw = dataBase + (nint)upDesc.DataOffset;
@@ -2096,11 +2180,14 @@ internal sealed class VulkanWeights : IDisposable
             var w2Qt = MoeRoutedRawDeviceQuantType(
                 device, downRaw, downDesc.QuantizationType, hiddenSize, moeIntermediate, hiddenSize, moeIntermediate);
 
-            if (w1Qt == QuantizationType.F32 || w2Qt == QuantizationType.F32 || w3Qt == QuantizationType.F32)
-                return false;
+            result[i] = new MoeBankResidency(
+                Resolved: true,
+                Gate: w1Qt != QuantizationType.F32,
+                Up: w3Qt != QuantizationType.F32,
+                Down: w2Qt != QuantizationType.F32);
         }
 
-        return true;
+        return result;
     }
 
     /// <summary>True iff a Q4_K MoE overlay can be kept on device as raw Q4_K super-blocks
