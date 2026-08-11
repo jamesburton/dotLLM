@@ -1,0 +1,148 @@
+#version 450
+// Q5_0 matrix-vector multiplication (decode-path GEMV).
+//
+//   y[m] = sum_k  W_q5_0[m, k] * x[k]      with W_q5_0 dequantized on the fly.
+//
+// Weight layout mirrors llama.cpp's block_q5_0 and
+// DotLLM.Cpu.Kernels.Dequantize.DequantizeQ5_0Scalar (also proven against
+// real GGUF bytes on the GPU in q5_0_dequant_f32.comp, Task 4):
+//   Each 32 contiguous elements of a row form one Q5_0 block of 22 bytes:
+//       bytes [0,1]   = fp16 scale d
+//       bytes [2..5]  = qh (uint32) — the 5th bit of every element
+//       bytes [6..21] = qs[16]      — two 4-bit nibbles per byte
+//   Row stride = (K / 32) * 22 bytes.
+//
+// Per-element decode, j in [0,16):
+//   lo = qs[j] & 0xF          high bit = (qh >> j)        & 1  -> element j
+//   hi = (qs[j] >> 4) & 0xF   high bit = (qh >> (j + 16)) & 1  -> element j + 16
+//   value = d * ((bit << 4 | nibble) - 16)
+// This is the EXACT expression from q5_0_dequant_f32.comp (Task 4) — Q5_0
+// hides the 5th bit in a separate word, the same class of indexing that
+// shipped transposed in Q3_K, so it is not re-derived here.
+//
+// x[] is FP32 (not pre-quantized). Output y[] is also FP32.
+//
+// Dispatch: one workgroup per output row (blockIdx.x = m). local_size_x =
+// 128 threads, each strides across blocks (block b handled by thread b %
+// 128), accumulates a partial sum, then the workgroup reduces in shared
+// memory. Adjacent threads (tid, tid+1) own adjacent 22-byte blocks, so
+// their loads land in adjacent memory — the coalescing pattern used by
+// matmul_q8_0.comp / the other decode GEMVs (#338/#339: the largest
+// measured decode win in this backend). Within a block, the 16 qs bytes are
+// read 4-at-a-time as funnelled uint words (one storage load covers 8
+// elements) instead of byte-by-byte.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;                // number of output rows
+    uint K;                // columns (must be a multiple of 32)
+    uint blocksPerRow;     // = K / 32
+    uint rowUints;         // reserved (row stride recomputed from blocksPerRow, see matmul_q8_0.comp)
+} pc;
+
+const uint Q5_0_BLOCK_BYTES = 22u;
+const uint Q5_0_GROUP_SIZE  = 32u;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+uint readUint(uint absByteOff) {
+    return readByte(absByteOff)
+         | (readByte(absByteOff + 1u) << 8)
+         | (readByte(absByteOff + 2u) << 16)
+         | (readByte(absByteOff + 3u) << 24);
+}
+
+// Read 4 consecutive bytes starting at `absByteOff` as a little-endian
+// packed uint, funnelling across the word boundary when the offset is not
+// 4-aligned (the 22-byte Q5_0 block makes the qs base's alignment mod 4
+// alternate across blocks: 6 mod 4 == 2, and each successive block adds 22
+// which is 2 mod 4, so the phase alternates 2,0,2,0,...). One storage load
+// replaces four byte-wise readByte calls. Mirrors matmul_q3_k_f32_gemv.comp.
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowByteStride = pc.blocksPerRow * Q5_0_BLOCK_BYTES;
+    uint rowByteBase = m * rowByteStride;
+
+    float acc = 0.0;
+
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * Q5_0_BLOCK_BYTES;
+        float d = readHalf(blockByteBase);
+        uint qh = readUint(blockByteBase + 2u);
+        uint qsBase = blockByteBase + 6u;
+        uint xBase = b * Q5_0_GROUP_SIZE;
+
+        float blockSum = 0.0;
+        for (uint g = 0u; g < 4u; g++) {
+            uint jBase = g * 4u;
+            uint word = read4Bytes(qsBase + jBase);
+
+            uvec4 lo = uvec4(word & 0xFu, (word >> 8) & 0xFu, (word >> 16) & 0xFu, (word >> 24) & 0xFu);
+            uvec4 hi = uvec4((word >> 4) & 0xFu, (word >> 12) & 0xFu, (word >> 20) & 0xFu, (word >> 28) & 0xFu);
+
+            uvec4 bitLo = uvec4((qh >> jBase) & 1u, (qh >> (jBase + 1u)) & 1u,
+                                 (qh >> (jBase + 2u)) & 1u, (qh >> (jBase + 3u)) & 1u);
+            uvec4 bitHi = uvec4((qh >> (jBase + 16u)) & 1u, (qh >> (jBase + 17u)) & 1u,
+                                 (qh >> (jBase + 18u)) & 1u, (qh >> (jBase + 19u)) & 1u);
+
+            vec4 qLo = vec4(lo | (bitLo << 4u)) - vec4(16.0);
+            vec4 qHi = vec4(hi | (bitHi << 4u)) - vec4(16.0);
+
+            uint xbLo = xBase + jBase;
+            uint xbHi = xBase + 16u + jBase;
+            vec4 xvLo = vec4(x[xbLo], x[xbLo + 1u], x[xbLo + 2u], x[xbLo + 3u]);
+            vec4 xvHi = vec4(x[xbHi], x[xbHi + 1u], x[xbHi + 2u], x[xbHi + 3u]);
+
+            blockSum += dot(qLo, xvLo) + dot(qHi, xvHi);
+        }
+        acc += d * blockSum;
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}
