@@ -13,12 +13,13 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <remarks>
 /// <para>
 /// Why this exists. Q3_K shipped with a transposed bit layout in every backend (#311).
-/// On Vulkan the defect outlived the dequant fix because the <i>packed matmul</i>
-/// shaders decode weight bytes inline and had to be rewritten separately — "a sub-block
-/// is now 16 consecutive bytes at a fixed bit-pair, not one funnelled word". Whether
-/// CUDA carries the same exposure is not something a reader can tell by inspection, and
-/// getting it wrong in either direction is expensive: assume a kernel exists and you
-/// hunt a phantom, assume it does not and a real one ships untested.
+/// Fixing it needed more than the dequant path: on Vulkan the <i>packed matmul</i> shaders
+/// decode weight bytes inline and had to be rewritten separately — "a sub-block is now 16
+/// consecutive bytes at a fixed bit-pair, not one funnelled word". Whether CUDA carries the
+/// same class of surface is not something a reader can tell by inspection, and getting it
+/// wrong in either direction is expensive: assume a kernel exists and you hunt a phantom
+/// (a Q3_K matmul hunt was opened on exactly that assumption and found nothing to fix in
+/// any backend); assume it does not and a real one ships untested.
 /// </para>
 /// <para>
 /// It does not exist today. CUDA never grew a packed Q3_K matmul: the whole committed

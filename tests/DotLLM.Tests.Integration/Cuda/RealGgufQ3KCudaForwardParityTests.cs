@@ -17,10 +17,12 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// <remarks>
 /// <para>
 /// Kernel-level parity does not establish that the right kernel is wired into the forward
-/// pass. On Vulkan the Q3_K dequant shader was fixed by #311 and still the end-to-end
-/// parity failed (L∞ 14.586, top-10 Jaccard 0.00) because the packed matmul shaders decode
-/// weight bytes inline and bypass the dequant path entirely — a gap invisible to every
-/// kernel test. This is the CUDA equivalent check, on the whole path rather than one kernel.
+/// pass, and a kernel-level suite cannot see a stale build at all. Both failure modes have
+/// bitten this project: Q3_K shipped scrambled for months behind green kernel tests (#311),
+/// and a Q3_K parity sweep was then read as a live 14.586 L∞ regression when it was a
+/// half-updated Release build — fixed shaders scored against a stale transposed CPU oracle,
+/// because `.spv` files load from the repo tree while CPU kernels live in a compiled DLL
+/// (#341). An end-to-end test on real bytes is what actually exercises the shipping path.
 /// </para>
 /// <para>
 /// CUDA has no packed Q3_K matmul (pinned by <c>CudaQ3KKernelSurfaceTests</c>): the entire
