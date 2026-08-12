@@ -1,4 +1,4 @@
-# GPU Inference — dotLLM
+﻿# GPU Inference — dotLLM
 
 ## Overview
 
@@ -270,6 +270,67 @@ The current GPU attention kernel is **naive** (not flash attention):
 - Shared memory for scores + output accumulator
 
 See [ATTENTION.md](ATTENTION.md) for mechanism details. **Flash attention** (tiled, O(N) memory) is a planned future optimization.
+
+### Vulkan split-KV (Flash-Decoding) decode attention — default ON
+
+The Vulkan backend routes **decode** attention (`seqQ == 1`) through
+`VulkanSplitKvAttentionKernel` (`attention_f32_splitkv{,_merge}.comp`, issues #345/#346):
+one workgroup per (head, KV split) computes a partial online-softmax state
+(`m`, `l`, un-normalised `acc`), a second dispatch merges the partials per head.
+This is the long-context decode win — **2.1x at ctx 2048, 2.8x at ctx 4096** on gfx1151.
+It is wired into `VulkanTransformerModel`, `VulkanNemotronHTransformerModel`,
+`VulkanQwen3MoeHybridTransformerModel` and `VulkanQwen3HybridDenseTransformerModel`.
+
+**Engagement threshold is `seqKv >= 17`, not 256.** `ComputeSplits` is
+`S = min(TargetWorkgroups / numHeads, ceil(seqKv / MinKvPerSplit))` and the router
+takes the split kernel at `S >= 2`. With the shipping defaults (`TargetWorkgroups = 256`;
+`MinKvPerSplit = 16` since issue #143 lowered it from 256) the KV term hits 2 at
+`seqKv = 17`, and the occupancy term is `>= 2` for any `numHeads <= 128`. So the split
+path is live on essentially **every decode step of every real model**, not only past 256.
+The pre-#143 "short context is bit-identical, so exposure starts beyond 256" claim was
+stale by an order of magnitude and is corrected here (issue #331). Only `seqKv <= 16`
+(or `numHeads > 128`) falls through to the per-token kernel bit-identically.
+Opt out with `DOTLLM_VULKAN_DISABLE_SPLIT_DECODE=1`; retune with
+`DOTLLM_VULKAN_SPLIT_TARGET_WG` / `DOTLLM_VULKAN_SPLIT_MIN_KV`.
+
+**Why ON is nevertheless the right default (issue #331 evidence).** The split kernel
+differs from the per-token kernel by cross-split online-softmax reassociation (plus a
+coalesced subgroup Q·K reduction and shifted KV tile alignment), so it is
+divergence-*capable* in the same class CUDA's #183/#222 characterised — exact-token
+equality over a long generation is not a sustainable invariant for any reassociated
+attention kernel. The decision metric is therefore the paired perplexity delta.
+Measured on Llama-3.2-3B-Instruct IQ4_XS / gfx1151, split ON vs forced OFF, fresh model
+instance per arm (`VulkanSplitDecodeParityTests`):
+
+| check | result |
+|---|---|
+| per-step NLL below engagement (`seqKv < 17`) | **bit-identical** (max abs Δ exactly 0) |
+| teacher-forced decode PPL, 1007 steps at depth 17–1024 | 2.61653 → 2.61640 (**−0.005%**) |
+| same at depth 3840–4096 (S = 10, where the win lives) | 1.06913 → 1.06900 (**−0.012%**) |
+| 512-step greedy generation | first argmax flip at step 93 (depth 101) at a near-tie (top1−top2 margin 0.036), compounding after — the expected signature |
+
+For scale, this project **rejected** CUDA's `DOTLLM_ATTN_SPLIT_KV` as a default at
+**+0.30%** perplexity (#222) and **accepted** the CUDA MMA-decode GQA-split kernel as a
+default at **−0.173%**. Vulkan split-KV moves perplexity by 0.005–0.012% in the
+*favourable* direction — ~25x smaller than the accepted CUDA change, ~60x smaller than
+the rejected one — so the CUDA "keep it off" conclusion does **not** transfer as a
+quality prediction, only as the (correct) warning that token-level equality will not hold.
+
+Real-GGUF end-to-end coverage: **Llama only** (`VulkanSplitDecodeParityTests`).
+Two gaps remain, both recorded rather than implied:
+
+- **Qwen3-MoE-Hybrid** — the test exists (`VulkanSplitDecodeMoeParityTests`, written
+  against the 35B-A3B GGUF) but is blocked by
+  [#356](https://github.com/jamesburton/dotLLM/issues/356): Vulkan's Qwen3MoeHybrid
+  decode overflows `MatMulF32Kernel`'s `DescriptorSetCache` in the streaming-F32
+  shared-expert matmul before the assertions are reached. Pre-existing and unrelated
+  to split-KV — it reproduces with the split path forced OFF — so the test converts
+  that one failure into a Skip. It starts proving something as soon as #356 lands.
+- **Nemotron-H** — no Nemotron-H GGUF is staged on the development box at all.
+
+Both therefore ship on the shared kernel's CPU-oracle parity plus synthetic-weight
+forward tests, and on the kernel being proven end-to-end on a *different*
+architecture.
 
 ## CLI Usage
 

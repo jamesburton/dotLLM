@@ -2,6 +2,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Engine.KvCache;
+using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tests.Integration.Fixtures;
@@ -44,6 +45,15 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+// Serializes this class against RealGgufQ5_0ParityTests: both read the mutable
+// static VulkanWeights.LastResidencyReport after loading a model, and running them
+// concurrently would let one load overwrite the other's report. Critically the
+// failure mode is a FALSE PASS, not a crash — the expanded-tensor count is a small
+// integer that another model's report can coincidentally satisfy, so the assertion
+// below can be met while reading the wrong model's report. Verified empirically
+// (#344), and the risk did not go away when #352 took the expected count to 0 —
+// a report from a fully-packed model reads 0 just as readily.
+[Collection("VulkanResidencyReport")]
 public sealed class RealGgufVulkanParityTests
 {
     private const float LogitsAbsTol = 3.0f;
@@ -70,7 +80,7 @@ public sealed class RealGgufVulkanParityTests
         Skip.If(!fixture.Found, fixture.SkipMessage("Llama-3.2-1B Q8_0 GGUF"));
         string path = fixture.Path!;
         RunGgufParityTest(path, expectedArch: Architecture.Llama, label: "Llama-3.2-1B-Q8_0",
-            prompt: "The capital of France is");
+            prompt: "The capital of France is", assertNoResidencyExpansion: true);
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -248,7 +258,8 @@ public sealed class RealGgufVulkanParityTests
     // Driver
     // ════════════════════════════════════════════════════════════════════
 
-    private void RunGgufParityTest(string path, Architecture expectedArch, string label, string prompt)
+    private void RunGgufParityTest(string path, Architecture expectedArch, string label, string prompt,
+        bool assertNoResidencyExpansion = false)
     {
         SkipIfVulkanUnavailable(out string spvDir);
 
@@ -268,8 +279,14 @@ public sealed class RealGgufVulkanParityTests
         // the Vulkan-side config.
         ModelConfig vkConfig = NormalizeForVulkan(cpuConfig);
 
+        // #328: go through the per-architecture DISPATCHERS, not the dense loaders.
+        // `TransformerModel.LoadFromGguf` / `VulkanTransformerModel.LoadFromGguf` are the
+        // dense-attention implementations; calling them directly meant this suite never
+        // exercised the dispatch point #259 added, and a hybrid checkpoint (Qwen3.6-A3B)
+        // died inside the dense weight loader with `blk.0.attn_output.weight not present`
+        // instead of either running or reporting a real reason.
         var cpuLoadWatch = System.Diagnostics.Stopwatch.StartNew();
-        using var cpuModel = TransformerModel.LoadFromGguf(cpuGguf, cpuConfig);
+        using IModel cpuModel = ModelLoader.CreateCpuModelFromGguf(cpuGguf, cpuConfig);
         cpuLoadWatch.Stop();
         _output.WriteLine(
             $"[{label}] CPU load ({cpuLoadWatch.Elapsed.TotalSeconds:F1} s): "
@@ -279,10 +296,13 @@ public sealed class RealGgufVulkanParityTests
 
         using var vkGguf = GgufFile.Open(path);
         var vkLoadWatch = System.Diagnostics.Stopwatch.StartNew();
-        VulkanTransformerModel? vkModel = null;
+        // The dispatcher takes an existing device and does NOT take ownership of it, so the
+        // test owns it and must outlive the model (disposed in the outer finally).
+        using var vkDevice = VulkanDevice.Create();
+        IModel? vkModel = null;
         try
         {
-            vkModel = VulkanTransformerModel.LoadFromGguf(vkGguf, vkConfig, spvDir);
+            (vkModel, _) = VulkanModelLoader.CreateFromGguf(vkDevice, vkGguf, vkConfig, spvDir);
         }
         catch (DotLLM.Vulkan.Interop.VulkanException ex) when (
             ex.ErrorCode == -1 || ex.ErrorCode == -2 || ex.ErrorCode == -5)
@@ -292,8 +312,46 @@ public sealed class RealGgufVulkanParityTests
                 + "weights still exceeded available device-local memory on this "
                 + "host. Re-run on a host with more VRAM.");
         }
+        catch (InsufficientMemoryException ex)
+        {
+            // #326. The routed MoE expert banks would be host-dequantised to F32 because at
+            // least one uses a quantization Vulkan cannot keep device-resident (#327). That is
+            // a host-capacity limit, not a CPU↔Vulkan divergence — reporting it as a parity
+            // FAIL misrepresents the sweep. The preflight message itemises the offending banks.
+            Skip.If(true, $"[{label}] {ex.Message}");
+        }
         vkLoadWatch.Stop();
         _output.WriteLine($"[{label}] Vulkan load ({vkLoadWatch.Elapsed.TotalSeconds:F1} s)");
+
+        if (assertNoResidencyExpansion)
+        {
+            var residency = VulkanWeights.LastResidencyReport;
+            Assert.NotNull(residency);
+            _output.WriteLine($"[{label}] {residency.Describe()}");
+            // #352 removed the last widening on this model: token_embd.weight used to be
+            // dequantised to F32 unconditionally (no GPU gather+dequant kernel for a Q8_0
+            // embed table), and now stays packed via q8_0_embed_gather_f32. So an all-Q8_0
+            // model must keep EVERY tensor packed — no carve-out. Pinning the count at 0
+            // rather than only listing offenders keeps the assertion able to fail if an
+            // entry silently vanishes from the report instead of being kept resident.
+            Assert.Equal(0, residency.ExpandedTensorCount);
+
+            // ExpandedTensorCount == 0 is satisfied just as well by an entry that VANISHED
+            // from the report as by one kept packed, so the count alone cannot verify the
+            // thing #352 actually changed. Name the tensor and assert it is present and
+            // unexpanded — this is what fails if the resident branch stops reporting.
+            var embed = Assert.Single(
+                residency.Entries, e => e.Name == "token_embd.weight");
+            Assert.False(embed.Expanded,
+                $"[{label}] token_embd.weight widened {embed.Source}->{embed.Device}");
+
+            var unexpected = residency.Entries
+                .Where(e => e.Expanded)
+                .ToList();
+            Assert.True(unexpected.Count == 0,
+                $"[{label}] unexpected residency expansion: "
+                + string.Join(", ", unexpected.Select(e => $"{e.Name} ({e.Source}->{e.Device})")));
+        }
 
         try
         {
@@ -309,8 +367,27 @@ public sealed class RealGgufVulkanParityTests
             // the SafeTensors sibling tests. Sidesteps any cache-mode
             // divergence between CPU (Phase C latent default for DeepSeek-V2)
             // and Vulkan (Phase A expanded only).
+            //
+            // #328 — RECURRENT STATE. Every iteration re-forwards the WHOLE prefix, so each
+            // iteration is an independent sequence. The uncached `Forward(tokens, positions,
+            // deviceId)` overload carries no state container and falls back to the model-owned
+            // recurrent state (`_gdnCache` / `_ssmCache`), which persists across calls — correct
+            // for prefill-then-decode of one sequence, silently wrong here. On a recurrent
+            // architecture (Qwen3MoeHybrid GDN, Nemotron-H SSM) step n would otherwise inherit
+            // steps 0..n-1's recurrence *on top of* re-reading the same tokens, and the two
+            // backends could then drift for reasons unrelated to kernel parity. This is the same
+            // hazard perplexity scoring hit in #261; the fix is the same hook.
+            //
+            // Called unconditionally: it is a documented no-op on stateless (dense) models, and
+            // for a recurrent model that forgot to implement it the IModel default THROWS — so a
+            // future architecture cannot inherit a silent no-op here.
             var tokens = new List<int>(promptIds.Length + DecodeStepsToCheck);
             tokens.AddRange(promptIds);
+
+            float[]? firstStepCpuLogits = null;
+            float[]? firstStepVkLogits = null;
+            int[]? firstStepTokenIds = null;
+            int[]? firstStepPositions = null;
 
             for (int step = 0; step <= DecodeStepsToCheck; step++)
             {
@@ -318,8 +395,19 @@ public sealed class RealGgufVulkanParityTests
                 int[] positions = new int[tokenIds.Length];
                 for (int i = 0; i < positions.Length; i++) positions[i] = i;
 
+                cpuModel.ResetSequenceState();
+                vkModel!.ResetSequenceState();
+
                 float[] cpuLogits = RunForwardCpuLastRow(cpuModel, tokenIds, positions, vocab);
                 float[] vkLogits = RunForwardVulkanLastRow(vkModel!, tokenIds, positions, vocab);
+
+                if (step == 0)
+                {
+                    firstStepCpuLogits = (float[])cpuLogits.Clone();
+                    firstStepVkLogits = (float[])vkLogits.Clone();
+                    firstStepTokenIds = tokenIds;
+                    firstStepPositions = positions;
+                }
 
                 AssertLogitsMatch(cpuLogits, vkLogits, step, label);
                 int cpuArgmax = Argmax(cpuLogits);
@@ -333,6 +421,27 @@ public sealed class RealGgufVulkanParityTests
 
                 tokens.Add(cpuArgmax);
             }
+
+            // #328 — the state-independence check that makes the reset above load-bearing.
+            //
+            // Re-running step 0's exact inputs after the whole loop must reproduce step 0's
+            // exact outputs, BIT-FOR-BIT, on both backends: nothing about the inputs changed,
+            // and a correctly reset model is a pure function of (weights, tokens, positions).
+            // Without the reset a recurrent model returns different logits here, because nine
+            // forwards' worth of GDN/SSM recurrence has accumulated. This is what turns "we
+            // called ResetSequenceState" into "the reset actually restores the initial state on
+            // this architecture, on this backend" — and it discriminates: it is false before the
+            // fix and true after, on any recurrent model, without needing a known-good reference.
+            // On a dense model it is trivially true and costs one extra prefill per backend.
+            cpuModel.ResetSequenceState();
+            vkModel!.ResetSequenceState();
+            float[] cpuReplay = RunForwardCpuLastRow(cpuModel, firstStepTokenIds!, firstStepPositions!, vocab);
+            float[] vkReplay = RunForwardVulkanLastRow(vkModel!, firstStepTokenIds!, firstStepPositions!, vocab);
+            AssertBitIdentical(firstStepCpuLogits!, cpuReplay, label, "CPU");
+            AssertBitIdentical(firstStepVkLogits!, vkReplay, label, "Vulkan");
+            _output.WriteLine(
+                $"[{label}] sequence-state reset verified on both backends "
+                + $"(recurrent={cpuModel.RequiresPerSequenceState})");
 
             Assert.True(strictArgmaxMatches >= StrictArgmaxFloor,
                 $"[{label}] strict argmax match floor {StrictArgmaxFloor}/{stepsChecked} not met: "
@@ -414,7 +523,29 @@ public sealed class RealGgufVulkanParityTests
         return result;
     }
 
-    private static unsafe float[] RunForwardVulkanLastRow(VulkanTransformerModel model, int[] tokenIds, int[] positions, int vocab)
+    /// <summary>
+    /// Asserts two logit vectors are bit-identical. Deliberately exact (#328): this compares a
+    /// forward against a REPLAY of itself on the same backend with the same inputs, so any
+    /// difference at all means the model was not in the same state — there is no legitimate
+    /// numerical slack to allow for, and a tolerance here would hide exactly what it checks.
+    /// </summary>
+    private static void AssertBitIdentical(float[] first, float[] replay, string label, string backend)
+    {
+        Assert.Equal(first.Length, replay.Length);
+        for (int i = 0; i < first.Length; i++)
+        {
+            if (BitConverter.SingleToInt32Bits(first[i]) == BitConverter.SingleToInt32Bits(replay[i]))
+                continue;
+            Assert.Fail(
+                $"[{label}] {backend}: re-running step 0's inputs after the decode loop did not "
+                + $"reproduce step 0's logits (index {i}: {first[i]:R} -> {replay[i]:R}). The model "
+                + "did not return to its initial state, so every parity number above was measured "
+                + "against accumulated recurrent state rather than the sequence under test. See "
+                + "IModel.ResetSequenceState and issues #328 / #261.");
+        }
+    }
+
+    private static unsafe float[] RunForwardVulkanLastRow(IModel model, int[] tokenIds, int[] positions, int vocab)
     {
         using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
         Assert.Equal(2, logits.Shape.Rank);

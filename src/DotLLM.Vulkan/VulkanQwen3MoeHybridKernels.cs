@@ -1,4 +1,4 @@
-using DotLLM.Vulkan.Kernels;
+﻿using DotLLM.Vulkan.Kernels;
 
 namespace DotLLM.Vulkan;
 
@@ -74,10 +74,13 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     /// </summary>
     public VulkanFlashAttentionF32Kernel? FlashAttention { get; }
     /// <summary>
-    /// Optional split-KV (Flash-Decoding) kernel for the long-context decode
-    /// path (seqQ == 1). Null when the SPVs are missing or the env-var opt-out
-    /// is set; only used for shapes that actually split (short context falls
-    /// back to <see cref="Attention"/>).
+    /// Optional split-KV (Flash-Decoding) kernel for the decode path
+    /// (seqQ == 1). Null when the SPVs are missing or the env-var opt-out
+    /// is set; only used for shapes that actually split — which with the shipping
+    /// defaults means every seqKv &gt;= 17 on a model with &lt;= 128 heads (issue
+    /// #331), so only seqKv &lt;= 16 falls back to <see cref="Attention"/>. See
+    /// <see cref="VulkanTransformerModel.DisableSplitDecodeEnvVar"/> for the
+    /// threshold derivation and the ON-by-default evidence.
     /// </summary>
     public VulkanSplitKvAttentionKernel? SplitKvAttention { get; }
     public SwiGluF32Kernel SwiGlu { get; }

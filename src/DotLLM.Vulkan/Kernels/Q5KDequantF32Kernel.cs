@@ -19,7 +19,7 @@ namespace DotLLM.Vulkan.Kernels;
 /// dispatched in bounded chunks via the <c>firstBlock</c> push constant so no
 /// single <c>vkCmdDispatch</c> exceeds the portable group-count limit.
 /// </remarks>
-public sealed class Q5KDequantF32Kernel : IDisposable
+public sealed class Q5KDequantF32Kernel : VulkanComputeKernelBase
 {
     /// <summary>Q5_K super-block: 2 + 2 + 12 + 32 + 128 = 176 bytes.</summary>
     public const int Q5_KBlockBytes = 176;
@@ -32,59 +32,18 @@ public sealed class Q5KDequantF32Kernel : IDisposable
 
     private const int PushConstantBytes = 3 * sizeof(uint); // totalBlocks, srcUints, firstBlock
 
-    private readonly VulkanDevice _device;
-    private readonly VulkanModule _module;
-    private readonly ComputePipeline _pipeline;
-    private readonly nint _descriptorPool;
-    private readonly DescriptorSetCache _descriptorCache;
-    private bool _disposed;
-
-    private Q5KDequantF32Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
+    private Q5KDequantF32Kernel(VulkanDevice device, string spvDir)
+        : base(device, spvDir, "q5_k_dequant_f32.spv", buffersPerSet: 2, pushConstantBytes: PushConstantBytes)
     {
-        _device = device;
-        _module = module;
-        _pipeline = pipeline;
-        _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 2);
     }
 
     /// <summary>Loads <c>q5_k_dequant_f32.spv</c> from the given directory and creates the pipeline.</summary>
-    public static Q5KDequantF32Kernel Create(VulkanDevice device, string spvDir)
-    {
-        string path = Path.Combine(spvDir, "q5_k_dequant_f32.spv");
-        if (!File.Exists(path))
-            throw new FileNotFoundException(
-                $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
-
-        var module = VulkanModule.LoadFromFile(device, path);
-        ComputePipeline pipeline;
-        try
-        {
-            Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[2];
-            bindings[0] = new VkDescriptorBinding(0);
-            bindings[1] = new VkDescriptorBinding(1);
-            pipeline = module.CreateComputePipeline(
-                entryPoint: "main",
-                bindings: bindings,
-                pushConstantBytes: PushConstantBytes);
-        }
-        catch
-        {
-            module.Dispose();
-            throw;
-        }
-
-        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 2);
-        return new Q5KDequantF32Kernel(device, module, pipeline, pool);
-    }
-
-    /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
-    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
+    public static Q5KDequantF32Kernel Create(VulkanDevice device, string spvDir) => new(device, spvDir);
 
     /// <summary>Dispatches the dequant synchronously (all chunks in one submit).</summary>
     public void Launch(VulkanDevice.Buffer src, VulkanDevice.Buffer dst, long totalBlocks)
     {
-        using var ctx = _device.CreateSubmitContext();
+        using var ctx = Device.CreateSubmitContext();
         ctx.Begin();
         Record(ctx.CommandBuffer, src, dst, totalBlocks);
         ctx.SubmitAndWait();
@@ -94,7 +53,7 @@ public sealed class Q5KDequantF32Kernel : IDisposable
     /// Chunks the dispatch so no single <c>vkCmdDispatch</c> exceeds
     /// <see cref="MaxBlocksPerDispatch"/> workgroups (chunks write disjoint output —
     /// no inter-chunk barrier needed).</summary>
-    public unsafe void Record(
+    public void Record(
         nint cmdBuf, VulkanDevice.Buffer src, VulkanDevice.Buffer dst, long totalBlocks)
     {
         if (totalBlocks <= 0) throw new ArgumentOutOfRangeException(nameof(totalBlocks));
@@ -110,37 +69,15 @@ public sealed class Q5KDequantF32Kernel : IDisposable
         uint srcUints = (uint)((srcMin + 3) / 4);
 
         Span<nint> buffers = stackalloc nint[2] { src.Handle, dst.Handle };
-        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
-
-        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
-        VulkanApi.vkCmdBindDescriptorSets(
-            cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
-            0, 1, descriptorSet, 0, 0);
+        BindOnly(cmdBuf, buffers);
 
         Span<uint> pc = stackalloc uint[3] { (uint)totalBlocks, srcUints, 0 };
         for (long first = 0; first < totalBlocks; first += MaxBlocksPerDispatch)
         {
             uint count = (uint)Math.Min(MaxBlocksPerDispatch, totalBlocks - first);
             pc[2] = (uint)first;
-            fixed (uint* pcPtr = pc)
-            {
-                VulkanApi.vkCmdPushConstants(
-                    cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute,
-                    0, PushConstantBytes, (nint)pcPtr);
-            }
+            PushConstantsOnly(cmdBuf, pc);
             VulkanApi.vkCmdDispatch(cmdBuf, count, 1, 1);
         }
-    }
-
-    /// <inheritdoc/>
-    public void Dispose()
-    {
-        if (_disposed) return;
-        _disposed = true;
-
-        if (_descriptorPool != 0)
-            VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);
-        _pipeline.Dispose();
-        _module.Dispose();
     }
 }

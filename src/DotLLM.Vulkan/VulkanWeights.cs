@@ -450,6 +450,16 @@ internal sealed class VulkanWeights : IDisposable
 
     public LayerBuffers[] Layers => _layers;
     public VulkanDevice.Buffer TokenEmbedding { get; }
+
+    /// <summary>
+    /// Byte layout the token-embedding table actually holds on the device:
+    /// <see cref="QuantizationType.F32"/> for the widened gather table (the
+    /// historic behaviour — <c>vkCmdCopyBuffer</c> row gather), or
+    /// <see cref="QuantizationType.Q8_0"/> when the raw quantized table stayed
+    /// resident and the gather is a dequantizing compute dispatch (issue #352).
+    /// </summary>
+    public QuantizationType TokenEmbedDeviceQuantType { get; }
+
     public int VocabSize { get; }
     public int HiddenSize { get; }
 
@@ -463,7 +473,8 @@ internal sealed class VulkanWeights : IDisposable
 
     private VulkanWeights(
         VulkanDevice device,
-        VulkanDevice.Buffer tokenEmbed, int vocabSize, int hiddenSize,
+        VulkanDevice.Buffer tokenEmbed, QuantizationType tokenEmbedDeviceQt,
+        int vocabSize, int hiddenSize,
         LayerBuffers[] layers,
         VulkanDevice.Buffer outputNormWeight,
         VulkanDevice.Buffer outputWeight, QuantizationType outputDeviceQt, int outputM, int outputK,
@@ -471,6 +482,7 @@ internal sealed class VulkanWeights : IDisposable
     {
         _device = device;
         TokenEmbedding = tokenEmbed;
+        TokenEmbedDeviceQuantType = tokenEmbedDeviceQt;
         VocabSize = vocabSize;
         HiddenSize = hiddenSize;
         _layers = layers;
@@ -542,13 +554,14 @@ internal sealed class VulkanWeights : IDisposable
 
         long totalBytes = 0;
         ResetUploadCounters();
+        _residencyReport = new VulkanResidencyReport();
 
         // Bounded persistently-mapped staging (issue #147): sized to the largest single
         // upload but capped at VulkanStagingBuffer.MaxChunkBytes — larger tensors stream
         // through it in chunks. Mapped ONCE for the whole load, so no per-upload
         // vkMapMemory re-charges the allocation's host commit (the #146 flake trigger).
         long stagingBytes = ComputeMaxUploadBytes(weights, numLayers, dequantToFp32, firstLayer,
-            skipTokenEmbed, skipOutputHead);
+            skipTokenEmbed, skipOutputHead, spvDir);
         using var staging = VulkanStagingBuffer.Create(device, stagingBytes);
 
         // Small dedicated staging for norm-vec / bias / scale uploads (issue #147):
@@ -566,6 +579,7 @@ internal sealed class VulkanWeights : IDisposable
         // A non-first pipeline stage never gathers (seeded from hidden state),
         // so it stubs the slot — same contract as the MoE/MLA stub buffers.
         VulkanDevice.Buffer tokenEmbed;
+        QuantizationType tokenEmbedDeviceQt = QuantizationType.F32;
         if (skipTokenEmbed)
         {
             LastTokenEmbedDequantPath = "skipped";
@@ -574,7 +588,7 @@ internal sealed class VulkanWeights : IDisposable
         else
         {
             tokenEmbed = UploadTokenEmbedding(device, staging, weights, spvDir,
-                out long tokenEmbedBytes);
+                out long tokenEmbedBytes, out tokenEmbedDeviceQt);
             totalBytes += tokenEmbedBytes;
         }
 
@@ -631,9 +645,9 @@ internal sealed class VulkanWeights : IDisposable
             else
             {
                 q = UploadMatrix(device, staging, lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim,
-                    dequantToFp32, out qDeviceQt, out qBytes);
+                    dequantToFp32, $"blk.{firstLayer + i}.attn_q.weight", out qDeviceQt, out qBytes);
                 k = UploadMatrix(device, staging, lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim,
-                    dequantToFp32, out kDeviceQt, out kBytes);
+                    dequantToFp32, $"blk.{firstLayer + i}.attn_k.weight", out kDeviceQt, out kBytes);
                 if (vFromK)
                 {
                     // V-less global layer: no attn_v weight; the forward copies
@@ -645,14 +659,14 @@ internal sealed class VulkanWeights : IDisposable
                 else
                 {
                     v = UploadMatrix(device, staging, lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
-                        dequantToFp32, out vDeviceQt, out vBytes);
+                        dequantToFp32, $"blk.{firstLayer + i}.attn_v.weight", out vDeviceQt, out vBytes);
                 }
                 qBias = UploadOptionalVec(device, vecStaging, lw.QBias);
                 kBias = UploadOptionalVec(device, vecStaging, lw.KBias);
                 vBias = UploadOptionalVec(device, vecStaging, lw.VBias);
             }
             var o = UploadMatrix(device, staging, lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim,
-                dequantToFp32, out var oDeviceQt, out long oBytes);
+                dequantToFp32, $"blk.{firstLayer + i}.attn_output.weight", out var oDeviceQt, out long oBytes);
             var oBias = UploadOptionalVec(device, vecStaging, lw.OBias);
 
             MlaLayerBuffers? mla = null;
@@ -704,11 +718,11 @@ internal sealed class VulkanWeights : IDisposable
             else
             {
                 gate = UploadMatrix(device, staging, lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim,
-                    dequantToFp32, out gateDeviceQt, out gateBytes);
+                    dequantToFp32, $"blk.{firstLayer + i}.ffn_gate.weight", out gateDeviceQt, out gateBytes);
                 up = UploadMatrix(device, staging, lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim,
-                    dequantToFp32, out upDeviceQt, out upBytes);
+                    dequantToFp32, $"blk.{firstLayer + i}.ffn_up.weight", out upDeviceQt, out upBytes);
                 down = UploadMatrix(device, staging, lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim,
-                    dequantToFp32, out downDeviceQt, out downBytes);
+                    dequantToFp32, $"blk.{firstLayer + i}.ffn_down.weight", out downDeviceQt, out downBytes);
                 gateBias = UploadOptionalVec(device, vecStaging, lw.GateBias);
                 upBias = UploadOptionalVec(device, vecStaging, lw.UpBias);
                 downBias = UploadOptionalVec(device, vecStaging, lw.DownBias);
@@ -774,7 +788,7 @@ internal sealed class VulkanWeights : IDisposable
                 }
                 else
                 {
-                    moe = UploadMoeLayer(device, staging, vecStaging, lw.Moe, out long moeBytes);
+                    moe = UploadMoeLayer(device, staging, vecStaging, lw.Moe, $"blk.{firstLayer + i}", out long moeBytes);
                     totalBytes += moeBytes;
                 }
             }
@@ -820,17 +834,34 @@ internal sealed class VulkanWeights : IDisposable
                 weights.OutputWeight, weights.OutputQuantType,
                 weights.OutputOutputDim, weights.OutputInputDim,
                 dequantToFp32,
+                "output.weight",
                 out outputDeviceQt, out long outputBytes);
             totalBytes += outputBytes;
         }
 
+        LastResidencyReport = _residencyReport;
+
         return new VulkanWeights(
-            device, tokenEmbed, weights.VocabSize, weights.HiddenSize,
+            device, tokenEmbed, tokenEmbedDeviceQt, weights.VocabSize, weights.HiddenSize,
             layerBuffers,
             outputNorm, outputWeight, outputDeviceQt,
             weights.OutputOutputDim, weights.OutputInputDim,
             totalBytes);
     }
+
+    /// <summary>
+    /// Accumulates during the current <see cref="Upload"/> call; snapshotted into
+    /// <see cref="LastResidencyReport"/> just before <c>Upload</c> returns.
+    /// </summary>
+    private static VulkanResidencyReport _residencyReport = new();
+
+    /// <summary>
+    /// Residency accounting for the most recent <see cref="Upload"/> call: which tensors
+    /// were kept in their packed source quantization on device versus widened to F32
+    /// because <see cref="DeviceQuantTypeFor"/> had no matching Vulkan kernel. See
+    /// <see cref="VulkanResidencyReport"/>.
+    /// </summary>
+    public static VulkanResidencyReport? LastResidencyReport { get; private set; }
 
     /// <summary>
     /// Set <c>DOTLLM_VULKAN_DISABLE_EMBED_GPU_DEQUANT=1</c> to force the legacy
@@ -840,6 +871,34 @@ internal sealed class VulkanWeights : IDisposable
     /// </summary>
     private static bool IsEmbedGpuDequantDisabled() =>
         Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_EMBED_GPU_DEQUANT") == "1";
+
+    /// <summary>
+    /// Set <c>DOTLLM_VULKAN_DISABLE_EMBED_RESIDENT=1</c> to force the token-embed
+    /// table to be widened to F32 on upload even when a device-resident gather
+    /// exists for its type. The discriminating baseline for the #352 parity test
+    /// (resident gather vs widened copy must agree bit-for-bit) and an
+    /// operational escape hatch.
+    /// </summary>
+    private static bool IsEmbedResidencyDisabled() =>
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_EMBED_RESIDENT") == "1";
+
+    /// <summary>
+    /// Whether a Q8_0 token-embedding table can stay resident in its quantized
+    /// byte layout (issue #352).
+    /// </summary>
+    /// <remarks>
+    /// Deliberately separate from the matmul-side <c>Keep*OnDevice</c> predicates:
+    /// residency for the embedding table is gated on the existence of an
+    /// <em>embedding gather</em> shader for the type, which is a strictly
+    /// different capability from having a dense matmul kernel for it. Adding a
+    /// type here without its gather shader silently corrupts every embedding row.
+    /// </remarks>
+    internal static bool KeepEmbedQ8_0OnDevice(QuantizationType qt, int hiddenSize, string? spvDir)
+        => qt == QuantizationType.Q8_0
+           && (hiddenSize % 32) == 0
+           && !IsEmbedResidencyDisabled()
+           && spvDir is not null
+           && File.Exists(Path.Combine(spvDir, "q8_0_embed_gather_f32.spv"));
 
     /// <summary>
     /// Diagnostic — how the token-embed table was materialised on the most recent
@@ -866,21 +925,64 @@ internal sealed class VulkanWeights : IDisposable
     /// is bit-identical to the CPU oracle (<c>precise</c> math, same op order).
     /// </para>
     /// <para>
+    /// DEVICE-RESIDENT path (issue #352): when the source table is Q8_0 and the
+    /// <c>q8_0_embed_gather_f32</c> shader is available, the raw Q8_0 bytes are
+    /// the device image — nothing is widened. The per-forward gather becomes a
+    /// dequantizing compute dispatch instead of a row <c>vkCmdCopyBuffer</c>,
+    /// and the table costs 34 bytes per 32 weights instead of 128 (a 3.76x
+    /// saving; ~772 MB on Llama-3.2-1B-Instruct-Q8_0). Note this is strictly
+    /// stronger than the #147 GPU-dequant path above, which still materialises
+    /// the vocab×hidden F32 table on the device — it only moves the *dequant*
+    /// off the host.
+    /// </para>
+    /// <para>
     /// Every other source type falls back to the CPU dequant streamed through
-    /// staging (host commit still bounded by the staging cap). Follow-up quant
-    /// types (Q8_0, F16 — SmolLM/TinyLlama-class embeds) are ledgered in the
-    /// #147 audit; their tables are ≤8× smaller than the K-quant gate models'.
+    /// staging (host commit still bounded by the staging cap). Extending
+    /// residency to a further type means writing that type's gather shader —
+    /// a dense matmul kernel for the type is NOT sufficient, because the
+    /// embedding lookup dispatches on this table alone.
     /// </para>
     /// </remarks>
     private static VulkanDevice.Buffer UploadTokenEmbedding(
         VulkanDevice device, VulkanStagingBuffer staging, TransformerWeights weights,
-        string? spvDir, out long uploadedBytes)
+        string? spvDir, out long uploadedBytes, out QuantizationType deviceQt)
     {
         int vocab = weights.VocabSize;
         int hidden = weights.HiddenSize;
         QuantizationType qt = weights.TokenEmbedQuantType;
         long elems = (long)vocab * hidden;
         long fpBytes = elems * sizeof(float);
+
+        // Device-resident Q8_0 table (issue #352) — no widening at all.
+        if (KeepEmbedQ8_0OnDevice(qt, hidden, spvDir))
+        {
+            deviceQt = QuantizationType.Q8_0;
+            long q8Bytes = Dequantize.RowByteSize(hidden, qt) * vocab;
+            bool importedQ8 = TryZeroCopyImport(device, weights.TokenEmbedWeight, q8Bytes, out var q8Buf);
+            if (!importedQ8)
+            {
+                q8Buf = device.AllocateDeviceLocal(q8Bytes);
+                try
+                {
+                    staging.UploadBytes(weights.TokenEmbedWeight, q8Bytes, q8Buf);
+                }
+                catch
+                {
+                    q8Buf.Dispose();
+                    throw;
+                }
+            }
+            LastTokenEmbedDequantPath = importedQ8 ? "resident-q8_0-imported" : "resident-q8_0";
+            uploadedBytes = q8Bytes;
+            // #352 hand-off to #344: the widening paths below report via UploadMatrix, so
+            // without this the one tensor the residency report exists to track would vanish
+            // from it exactly when it stopped widening — reading as "not uploaded" rather
+            // than "kept packed". Packed == uploaded here, which is the whole point.
+            _residencyReport.Add("token_embd.weight", qt, QuantizationType.Q8_0, q8Bytes, q8Bytes);
+            return q8Buf!;
+        }
+
+        deviceQt = QuantizationType.F32;
 
         bool gpuEligible = spvDir is not null
             && !IsEmbedGpuDequantDisabled()
@@ -898,7 +1000,7 @@ internal sealed class VulkanWeights : IDisposable
             LastTokenEmbedDequantPath = "cpu";
             return UploadMatrix(device, staging,
                 weights.TokenEmbedWeight, qt, vocab, hidden,
-                dequantToFp32: true, out _, out uploadedBytes);
+                dequantToFp32: true, "token_embd.weight", out _, out uploadedBytes);
         }
 
         long qBytes = Dequantize.RowByteSize(hidden, qt) * vocab;
@@ -1052,6 +1154,16 @@ internal sealed class VulkanWeights : IDisposable
     private static bool KeepQ8OnDevice(QuantizationType qt, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.Q8_0;
 
+    /// <summary>Returns true when the matrix will be kept on device as Q5_0 blocks
+    /// (22 bytes per 32 elements: fp16 scale + 4-byte qh bitfield + 16 packed nibble
+    /// bytes). Gated on the contraction axis being a multiple of the Q5_0 block size
+    /// (32) — unlike the K-quants this needs no 256-alignment gate. Consumed by
+    /// <c>MatMulQ5_0GemvF32Kernel</c> (decode) and <c>MatMulQ5_0GemmF32Kernel</c>
+    /// (prefill); both are unconditionally created, so no capability gate applies
+    /// (#344).</summary>
+    private static bool KeepQ5_0OnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.Q5_0 && (inputDim % 32) == 0;
+
     /// <summary>Returns true when the matrix will be kept on device as native F16
     /// (2 bytes per element). Gated on the contraction axis being a multiple of 2
     /// (each storage uint holds two F16 elements via <c>unpackHalf2x16</c>).
@@ -1173,6 +1285,7 @@ internal sealed class VulkanWeights : IDisposable
         QuantizationType srcQt, int inputDim, bool dequantToFp32)
     {
         if (KeepQ8OnDevice(srcQt, dequantToFp32)) return QuantizationType.Q8_0;
+        if (KeepQ5_0OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q5_0;
         if (KeepQ2KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q2_K;
         if (KeepQ3KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q3_K;
         if (KeepQ4KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q4_K;
@@ -1193,15 +1306,43 @@ internal sealed class VulkanWeights : IDisposable
         return QuantizationType.F32;
     }
 
+    /// <summary>
+    /// True when a single projection of format <paramref name="qt"/> and contraction
+    /// dimension <paramref name="inputDim"/> can be held on device in its own packed
+    /// form (any of the general-purpose <see cref="DeviceQuantTypeFor"/> formats),
+    /// rather than being widened to F32 on upload.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the GENERAL per-projection predicate (same one <see cref="UploadMatrix"/>
+    /// uses for attention/FFN weights) — it recognizes strictly more formats than the
+    /// routed-MoE-specific <see cref="MoeRoutedRawDeviceQuantType"/> (e.g. Q2_K, Q3_K, the
+    /// IQ family, I2_S, PQ2_0), because those extra formats have no MoE-indexed matmul
+    /// kernel yet. <b>Do not use this to decide routed-expert-bank residency</b> — that
+    /// decision belongs to <see cref="MoeRoutedRawDeviceQuantType"/> /
+    /// <see cref="ResolveMoeBankResidency"/>, which mirror exactly what
+    /// <see cref="UploadMoeLayer"/> dispatches to. This predicate is for ordinary
+    /// (non-routed) weight matrices.
+    /// </para>
+    /// </remarks>
+    public static bool CanKeepBankResident(QuantizationType qt, int inputDim)
+        => DeviceQuantTypeFor(qt, inputDim, dequantToFp32: false) == qt;
+
     private static long ComputeMaxUploadBytes(
         TransformerWeights weights, int numLayers, bool dequantToFp32, int firstLayer = 0,
-        bool skipTokenEmbed = false, bool skipOutputHead = false)
+        bool skipTokenEmbed = false, bool skipOutputHead = false, string? spvDir = null)
     {
         long max = 0;
         // Skipped (stubbed) tensors never pass through staging — excluding them matters because the
         // F32 embed table is frequently the single largest staging allocation (vocab × hidden × 4).
+        // A device-resident embed table (issue #352) stages only its quantized bytes.
         if (!skipTokenEmbed)
-            max = Math.Max(max, UploadBytes(weights.VocabSize, weights.HiddenSize, weights.TokenEmbedQuantType, dequantToFp32: true));
+        {
+            bool embedResident = KeepEmbedQ8_0OnDevice(weights.TokenEmbedQuantType, weights.HiddenSize, spvDir);
+            max = Math.Max(max, UploadBytes(
+                weights.VocabSize, weights.HiddenSize, weights.TokenEmbedQuantType,
+                dequantToFp32: !embedResident));
+        }
         if (!skipOutputHead)
             max = Math.Max(max, UploadBytes(weights.OutputOutputDim, weights.OutputInputDim, weights.OutputQuantType, dequantToFp32));
         for (int i = 0; i < numLayers; i++)
@@ -1243,6 +1384,8 @@ internal sealed class VulkanWeights : IDisposable
         long elems = (long)outputDim * inputDim;
         if (KeepQ8OnDevice(qt, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0) * outputDim;
+        if (KeepQ5_0OnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.Q5_0) * outputDim;
         if (KeepQ2KOnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q2_K) * outputDim;
         if (KeepQ3KOnDevice(qt, inputDim, dequantToFp32))
@@ -1284,7 +1427,8 @@ internal sealed class VulkanWeights : IDisposable
 
     /// <summary>
     /// Uploads a single weight matrix. When <paramref name="dequantToFp32"/> is false and
-    /// the source is a quantised format with a matching Vulkan kernel (Q8_0 / Q4_K / Q5_K)
+    /// the source is a quantised format with a matching Vulkan kernel (Q8_0 / Q5_0 / Q2_K /
+    /// Q3_K / Q4_K / Q5_K / Q6_K / the IQ family / I2_S / PQ2_0)
     /// and the contraction axis satisfies the kernel's group-size constraint, the raw
     /// block bytes are copied to device memory verbatim and the returned
     /// <paramref name="deviceQuantType"/> reflects the source format. Otherwise the source
@@ -1313,10 +1457,12 @@ internal sealed class VulkanWeights : IDisposable
         VulkanDevice device, VulkanStagingBuffer staging,
         nint srcPtr, QuantizationType qt, int outputDim, int inputDim,
         bool dequantToFp32,
+        string name,
         out QuantizationType deviceQuantType,
         out long uploadedBytes)
     {
         long elems = (long)outputDim * inputDim;
+        long packedBytes = Dequantize.RowByteSize(inputDim, qt) * outputDim;
 
         // Raw quant-block upload — keeps the GGUF on-disk byte layout intact on device so
         // the matmul_q8_0 / matmul_q2_k / matmul_q3_k / matmul_q4_k / matmul_q5_k / matmul_q6_k kernels can read it
@@ -1337,6 +1483,7 @@ internal sealed class VulkanWeights : IDisposable
             {
                 deviceQuantType = keepQt;
                 uploadedBytes = bytes;
+                _residencyReport.Add(name, qt, deviceQuantType, packedBytes, uploadedBytes);
                 return importedBuf!;
             }
 
@@ -1346,6 +1493,7 @@ internal sealed class VulkanWeights : IDisposable
             LastUploadStagingMatrices++;
             deviceQuantType = keepQt;
             uploadedBytes = bytes;
+            _residencyReport.Add(name, qt, deviceQuantType, packedBytes, uploadedBytes);
             return buf;
         }
 
@@ -1408,6 +1556,7 @@ internal sealed class VulkanWeights : IDisposable
 
         deviceQuantType = QuantizationType.F32;
         uploadedBytes = fpBytes;
+        _residencyReport.Add(name, qt, deviceQuantType, packedBytes, uploadedBytes);
         return fpBuf;
     }
 
@@ -1506,7 +1655,7 @@ internal sealed class VulkanWeights : IDisposable
     /// </remarks>
     private static MoeLayerBuffers UploadMoeLayer(
         VulkanDevice device, VulkanStagingBuffer stage, VulkanStagingBuffer vecStage,
-        MoeLayerWeights moe, out long uploadedBytes)
+        MoeLayerWeights moe, string namePrefix, out long uploadedBytes)
     {
         uploadedBytes = 0;
         int hidden = moe.HiddenSize;
@@ -1578,6 +1727,19 @@ internal sealed class VulkanWeights : IDisposable
         var w2Bank = UploadRoutedBankWhole(device, stage, routedW2Qt, moe.DownExpsRaw, moe.W2, perExpertW2Bytes, numE);
         var w3Bank = UploadRoutedBankWhole(device, stage, routedW3Qt, moe.UpExpsRaw, moe.W3, perExpertW3Bytes, numE);
         uploadedBytes += (perExpertW1Bytes + perExpertW2Bytes + perExpertW3Bytes) * numE;
+
+        // #327: routed-expert banks bypass UploadMatrix (the only path that otherwise
+        // records into the residency report), so they were previously invisible to it —
+        // record them here so per-bank residency (this task's whole point) is observable.
+        long packedW1Bytes = Dequantize.RowByteSize(hidden, moe.GateExpsRawQt) * interm * numE;
+        long packedW2Bytes = Dequantize.RowByteSize(interm, moe.DownExpsRawQt) * hidden * numE;
+        long packedW3Bytes = Dequantize.RowByteSize(hidden, moe.UpExpsRawQt) * interm * numE;
+        _residencyReport.Add($"{namePrefix}.ffn_gate_exps.weight", moe.GateExpsRawQt, routedW1Qt,
+            packedW1Bytes, perExpertW1Bytes * numE);
+        _residencyReport.Add($"{namePrefix}.ffn_down_exps.weight", moe.DownExpsRawQt, routedW2Qt,
+            packedW2Bytes, perExpertW2Bytes * numE);
+        _residencyReport.Add($"{namePrefix}.ffn_up_exps.weight", moe.UpExpsRawQt, routedW3Qt,
+            packedW3Bytes, perExpertW3Bytes * numE);
 
         // ── Shared-expert per-expert buffers (separate buffers, NOT a packed bank — the
         //    matmul kernel reads its weight buffer from offset 0). Each shared expert
@@ -2041,9 +2203,206 @@ internal sealed class VulkanWeights : IDisposable
     /// </para>
     /// </remarks>
     internal static bool CanSkipMoeF32HostDequant(VulkanDevice device, GgufFile gguf, ModelConfig config)
+        => PlanMoeF32HostDequant(device, gguf, config).CanSkip;
+
+    /// <summary>
+    /// One routed MoE expert bank that <see cref="MoeRoutedRawDeviceQuantType"/> could NOT keep
+    /// device-resident, and therefore forces the host F32 dequant fallback.
+    /// </summary>
+    /// <param name="Layer">Layer index (<c>blk.{Layer}</c>).</param>
+    /// <param name="Bank">Tensor short name, e.g. <c>ffn_down_exps.weight</c>.</param>
+    /// <param name="Quant">The bank's on-disk GGUF quantization type — the reason it fell back.</param>
+    /// <param name="ContractionDim">
+    /// The contraction-axis extent (K). Reported because it is usually the *cause*: llama.cpp
+    /// is forced off the K-quant formats whenever K is not a multiple of <c>QK_K = 256</c>.
+    /// </param>
+    internal readonly record struct MoeRoutedBankFallback(
+        int Layer, string Bank, QuantizationType Quant, int ContractionDim);
+
+    /// <summary>
+    /// The outcome of the <see cref="PlanMoeF32HostDequant"/> preflight: whether the host F32
+    /// dequant of routed MoE banks can be skipped, and — when it cannot — exactly which banks
+    /// blocked it and how much host RAM the fallback will consume.
+    /// </summary>
+    /// <param name="CanSkip">
+    /// True iff EVERY routed bank on EVERY MoE layer resolves to a supported device-resident
+    /// quant type, i.e. <c>skipF32MoeDequant: true</c> is safe to pass.
+    /// </param>
+    /// <param name="HostF32Bytes">
+    /// Host RAM the F32 fallback will allocate: the full per-expert F32 dequant of exactly the
+    /// banks listed in <paramref name="Fallbacks"/> — NOT every routed bank on every MoE layer.
+    /// Since #327 the skip is resolved per bank, so a device-resident sibling of an offending
+    /// bank costs nothing. Zero when <paramref name="CanSkip"/> is true.
+    /// </param>
+    /// <param name="Fallbacks">The banks that blocked the skip, in layer order.</param>
+    /// <param name="TotalBanks">How many routed banks were inspected, for a "N of M" summary.</param>
+    internal sealed record MoeF32HostDequantPlan(
+        bool CanSkip,
+        long HostF32Bytes,
+        IReadOnlyList<MoeRoutedBankFallback> Fallbacks,
+        int TotalBanks)
+    {
+        /// <summary>
+        /// Human-readable itemisation for the preflight exception: the footprint, how many banks
+        /// of how many blocked it, and the distinct (bank, quant, K) combinations responsible.
+        /// Distinct combinations rather than every offending tensor — a 60-layer model would
+        /// otherwise produce a 180-line message that says the same three things.
+        /// </summary>
+        public string Describe()
+        {
+            var groups = Fallbacks
+                .GroupBy(f => (f.Bank, f.Quant, f.ContractionDim))
+                .OrderBy(g => g.Key.Bank, StringComparer.Ordinal)
+                .Select(g =>
+                    $"{g.Count()}x {g.Key.Bank} stored as {g.Key.Quant} (K={g.Key.ContractionDim})");
+
+            return $"{HostF32Bytes / (1024.0 * 1024.0 * 1024.0):F1} GiB of host F32, because "
+                 + $"{Fallbacks.Count} of {TotalBanks} routed expert banks cannot be kept "
+                 + $"device-resident: {string.Join("; ", groups)}";
+        }
+    }
+
+    /// <summary>
+    /// Preflight for the routed-MoE host F32 dequant: reports whether it can be skipped (the
+    /// <see cref="CanSkipMoeF32HostDequant"/> answer) and, when it cannot, what it will cost
+    /// and which banks are responsible.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>#326.</b> Before this existed the only signal was the bool, so a model whose routed
+    /// banks are not device-resident-capable simply proceeded to allocate — for DeepSeek-V2-Lite
+    /// ~57 GiB of host F32 — and died with a bare <see cref="OutOfMemoryException"/> pointing at
+    /// <c>SliceExpertsToF32</c>. Every input to that number is in the GGUF tensor descriptors and
+    /// is knowable before the first allocation.
+    /// </para>
+    /// <para>
+    /// <b>#327 made the skip per-bank</b>, so this plan's footprint is the sum over the offending
+    /// banks only. <see cref="ResolveMoeBankResidency"/> is what actually drives the load (via
+    /// <c>TransformerWeights.LoadFromGguf</c>'s <c>moeBankSkipSelector</c>); this method must
+    /// agree with it bank for bank, or the affordability check is bounding the wrong number.
+    /// Both walk the same tensors with the same <see cref="MoeRoutedRawDeviceQuantType"/>
+    /// predicate — they must never diverge.
+    /// </para>
+    /// </remarks>
+    internal static MoeF32HostDequantPlan PlanMoeF32HostDequant(
+        VulkanDevice device, GgufFile gguf, ModelConfig config)
     {
         if (config.MlaConfig is null || config.Moe is null)
-            return false;
+            return new MoeF32HostDequantPlan(CanSkip: false, HostF32Bytes: 0, [], TotalBanks: 0);
+
+        var moe = config.Moe;
+        var tensors = gguf.TensorsByName;
+        nint dataBase = gguf.DataBasePointer;
+        int hiddenSize = config.HiddenSize;
+        int moeIntermediate = moe.MoeIntermediateSize;
+        int numExperts = moe.NumExperts;
+
+        // Every routed bank has the same element count (gate/up are [moeIntermediate, hiddenSize],
+        // down is the transpose), so one F32 bank costs the same regardless of which it is.
+        long bankF32Bytes = (long)numExperts * sizeof(float) * moeIntermediate * hiddenSize;
+
+        var fallbacks = new List<MoeRoutedBankFallback>();
+        int totalBanks = 0;
+        long hostF32Bytes = 0;
+
+        for (int i = 0; i < config.NumLayers; i++)
+        {
+            if (!moe.IsMoeLayer(i))
+                continue;
+
+            string prefix = $"blk.{i}";
+            if (!tensors.TryGetValue($"{prefix}.ffn_gate_exps.weight", out var gateDesc)
+                || !tensors.TryGetValue($"{prefix}.ffn_up_exps.weight", out var upDesc)
+                || !tensors.TryGetValue($"{prefix}.ffn_down_exps.weight", out var downDesc))
+            {
+                // Unexpected/missing tensor — fall back to the safe F32 path, as before. No
+                // itemisation is possible (there is no descriptor to name). The footprint is a
+                // LOWER BOUND here: it counts only the layers inspected so far, and this layer
+                // (which ResolveMoeBankResidency reports as Resolved: false, so all three of its
+                // banks WILL be dequantised) is not counted at all.
+                return new MoeF32HostDequantPlan(
+                    CanSkip: false, hostF32Bytes, fallbacks, totalBanks);
+            }
+
+            totalBanks += 3;
+
+            nint gateRaw = dataBase + (nint)gateDesc.DataOffset;
+            nint upRaw = dataBase + (nint)upDesc.DataOffset;
+            nint downRaw = dataBase + (nint)downDesc.DataOffset;
+
+            var w1Qt = MoeRoutedRawDeviceQuantType(
+                device, gateRaw, gateDesc.QuantizationType, moeIntermediate, hiddenSize, moeIntermediate, hiddenSize);
+            var w3Qt = MoeRoutedRawDeviceQuantType(
+                device, upRaw, upDesc.QuantizationType, moeIntermediate, hiddenSize, moeIntermediate, hiddenSize);
+            var w2Qt = MoeRoutedRawDeviceQuantType(
+                device, downRaw, downDesc.QuantizationType, hiddenSize, moeIntermediate, hiddenSize, moeIntermediate);
+
+            // #327: the fallback is now resolved PER BANK (ResolveMoeBankResidency feeds
+            // TransformerWeights.LoadFromGguf's moeBankSkipSelector), so only the banks that
+            // actually fall back allocate a host F32 array. The footprint must mirror that
+            // exactly — charging every bank of every MoE layer, as this did while the skip was
+            // model-global and all-or-nothing, would over-report and let the affordability
+            // check refuse a load that the per-bank path made fit.
+            if (w1Qt == QuantizationType.F32)
+            {
+                fallbacks.Add(new MoeRoutedBankFallback(
+                    i, "ffn_gate_exps.weight", gateDesc.QuantizationType, hiddenSize));
+                hostF32Bytes += bankF32Bytes;
+            }
+            if (w3Qt == QuantizationType.F32)
+            {
+                fallbacks.Add(new MoeRoutedBankFallback(
+                    i, "ffn_up_exps.weight", upDesc.QuantizationType, hiddenSize));
+                hostF32Bytes += bankF32Bytes;
+            }
+            if (w2Qt == QuantizationType.F32)
+            {
+                fallbacks.Add(new MoeRoutedBankFallback(
+                    i, "ffn_down_exps.weight", downDesc.QuantizationType, moeIntermediate));
+                hostF32Bytes += bankF32Bytes;
+            }
+        }
+
+        // hostF32Bytes is already 0 when nothing fell back, so no CanSkip-conditional needed.
+        return new MoeF32HostDequantPlan(
+            CanSkip: fallbacks.Count == 0, hostF32Bytes, fallbacks, totalBanks);
+    }
+
+    /// <summary>One MoE layer's per-bank routed-expert residency outcome.</summary>
+    /// <remarks>
+    /// <c>Resolved</c> is false for a layer whose GGUF tensor descriptors could not be
+    /// read (missing/unexpected tensor) — the caller must treat every bank on that layer
+    /// as needing the F32 host fallback, mirroring <see cref="CanSkipMoeF32HostDequant"/>'s
+    /// prior all-or-nothing behavior for that failure case.
+    /// </remarks>
+    internal readonly record struct MoeBankResidency(bool Resolved, bool Gate, bool Up, bool Down)
+    {
+        public bool AllResident => Resolved && Gate && Up && Down;
+    }
+
+    /// <summary>
+    /// Per-bank sibling of <see cref="CanSkipMoeF32HostDequant"/>: resolves, for EVERY MoE
+    /// layer, whether EACH of the three routed banks (gate/up/down) independently would be
+    /// kept device-resident by <see cref="UploadMoeLayer"/> — instead of ANDing the decision
+    /// across the whole model. One unsupported sibling (e.g. a Q5_0 down bank, #327) no
+    /// longer has to force every other bank in the model to pay for a host F32 array it will
+    /// never read.
+    /// </summary>
+    /// <remarks>
+    /// Uses the exact same predicate (<see cref="MoeRoutedRawDeviceQuantType"/>) with the
+    /// exact same per-bank (M, K) mapping <see cref="UploadMoeLayer"/> uses (gate/up contract
+    /// along hidden, down along the MoE intermediate size) — the two must never diverge, or a
+    /// bank this preflight calls "resident" could resolve to F32 at upload time and read a
+    /// null per-expert host pointer (see <see cref="CanSkipMoeF32HostDequant"/>'s remarks for
+    /// why that is silent corruption, not a crash). This preflight inspects the GGUF tensor
+    /// descriptors directly (no CPU weights loaded yet).
+    /// </remarks>
+    internal static Dictionary<int, MoeBankResidency> ResolveMoeBankResidency(
+        VulkanDevice device, GgufFile gguf, ModelConfig config)
+    {
+        var result = new Dictionary<int, MoeBankResidency>();
+        if (config.MlaConfig is null || config.Moe is null)
+            return result;
 
         var moe = config.Moe;
         var tensors = gguf.TensorsByName;
@@ -2060,7 +2419,10 @@ internal sealed class VulkanWeights : IDisposable
             if (!tensors.TryGetValue($"{prefix}.ffn_gate_exps.weight", out var gateDesc)
                 || !tensors.TryGetValue($"{prefix}.ffn_up_exps.weight", out var upDesc)
                 || !tensors.TryGetValue($"{prefix}.ffn_down_exps.weight", out var downDesc))
-                return false; // Unexpected/missing tensor — fall back to the safe F32 path.
+            {
+                result[i] = new MoeBankResidency(Resolved: false, Gate: false, Up: false, Down: false);
+                continue; // Unexpected/missing tensor — caller must fall back to F32 for this layer.
+            }
 
             nint gateRaw = dataBase + (nint)gateDesc.DataOffset;
             nint upRaw = dataBase + (nint)upDesc.DataOffset;
@@ -2073,11 +2435,74 @@ internal sealed class VulkanWeights : IDisposable
             var w2Qt = MoeRoutedRawDeviceQuantType(
                 device, downRaw, downDesc.QuantizationType, hiddenSize, moeIntermediate, hiddenSize, moeIntermediate);
 
-            if (w1Qt == QuantizationType.F32 || w2Qt == QuantizationType.F32 || w3Qt == QuantizationType.F32)
-                return false;
+            result[i] = new MoeBankResidency(
+                Resolved: true,
+                Gate: w1Qt != QuantizationType.F32,
+                Up: w3Qt != QuantizationType.F32,
+                Down: w2Qt != QuantizationType.F32);
         }
 
-        return true;
+        return result;
+    }
+
+    /// <summary>
+    /// Throws when the routed-MoE host F32 dequant this <paramref name="plan"/> describes cannot
+    /// fit in <paramref name="physicalMemoryBytes"/> — i.e. it does not fit in the machine's RAM
+    /// at all — with a message itemising the footprint and the banks responsible.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>The bound is total physical memory, deliberately, not free memory.</b> Two reasons.
+    /// First, <see cref="GCMemoryInfo.MemoryLoadBytes"/> is a snapshot from the last GC and reads
+    /// 0 in a process that has not collected yet, so a free-memory rule is only as good as the
+    /// caller's GC history. Second, and more important: Windows backs commit with the pagefile,
+    /// so a load whose footprint exceeds *free* RAM can still complete — slowly. Refusing it
+    /// would turn a working (if miserable) load into a hard failure. Exceeding *total* RAM is a
+    /// different claim: no amount of freeing, scheduling or waiting makes it fit, so refusing is
+    /// safe and the diagnosis is unambiguous.
+    /// </para>
+    /// <para>
+    /// Consequence: a footprint that fits in RAM but not alongside whatever else is resident is
+    /// still attempted, exactly as before. This check narrows the unactionable
+    /// <see cref="OutOfMemoryException"/> case; it does not claim to predict every OOM.
+    /// </para>
+    /// <para>
+    /// Separated from the memory probe so it is unit-testable with a supplied budget and no GPU.
+    /// A non-positive <paramref name="physicalMemoryBytes"/> means "unknown" and never blocks.
+    /// </para>
+    /// </remarks>
+    internal static void ThrowIfMoeF32HostDequantUnaffordable(
+        MoeF32HostDequantPlan plan, long physicalMemoryBytes)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+
+        if (plan.CanSkip || plan.HostF32Bytes <= 0 || physicalMemoryBytes <= 0)
+            return;
+        if (plan.HostF32Bytes <= physicalMemoryBytes)
+            return;
+
+        throw new InsufficientMemoryException(
+            $"Loading this MoE model on the Vulkan backend needs {plan.Describe()}, which exceeds "
+            + $"this host's total physical memory of "
+            + $"{physicalMemoryBytes / (1024.0 * 1024.0 * 1024.0):F1} GiB — it cannot fit, "
+            + "regardless of what else is running. The routed expert banks are dequantised to F32 "
+            + "on the host because they use a quantization the Vulkan backend cannot keep "
+            + "device-resident. Since #327 this is resolved per bank, so the figure above counts "
+            + "only the banks that actually fall back — their device-resident siblings cost "
+            + "nothing. Load this model on the CPU or CUDA "
+            + "backend, use a build whose routed expert banks are Q4_K/Q5_K/Q6_K/Q8_0, or run on "
+            + "a host with more RAM.");
+    }
+
+    /// <summary>
+    /// The machine's total physical memory (or container memory limit), to compare the F32
+    /// fallback footprint against. Returns 0 ("unknown") when the runtime cannot report it,
+    /// which callers treat as "do not block".
+    /// </summary>
+    internal static long HostPhysicalMemoryBytes()
+    {
+        long total = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+        return total > 0 ? total : 0;
     }
 
     /// <summary>True iff a Q4_K MoE overlay can be kept on device as raw Q4_K super-blocks

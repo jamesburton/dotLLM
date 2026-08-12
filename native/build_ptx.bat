@@ -23,6 +23,21 @@ setlocal EnableDelayedExpansion
 set ARCH=%1
 if "%ARCH%"=="" set ARCH=compute_75
 
+REM ── PTX ISA version contract ────────────────────────────────────────────
+REM Every committed .ptx must declare .version 8.7 (what CUDA 12.8 emits).
+REM PTX whose ISA version exceeds the driver's is rejected outright with
+REM CUDA_ERROR_UNSUPPORTED_PTX_VERSION: CUDA 13.1 emits .version 9.1, which no
+REM pre-13.1 driver will load.
+REM
+REM This has now regressed TWICE (#124, #318) by the same mechanism — %CUDA_PATH%
+REM silently pointing at a newer toolkit than intended, on a box where several are
+REM installed side by side. Nothing downstream notices, because the wrong PTX
+REM compiles, commits and reviews exactly like the right PTX; it only fails on
+REM someone else's older driver. So the version is asserted per file, here, at the
+REM moment of generation. Override only when deliberately re-baselining the whole
+REM tree onto a new toolkit.
+if not defined DOTLLM_PTX_EXPECT_VERSION set "DOTLLM_PTX_EXPECT_VERSION=8.7"
+
 if not defined CUDA_PATH (
     echo CUDA_PATH is not set. Install a CUDA toolkit and ensure CUDA_PATH points at it.
     exit /b 1
@@ -105,23 +120,54 @@ for %%F in ("%KERNEL_DIR%\*.cu") do (
         echo FAILED: %%~nxF
         set FAIL=1
     ) else (
+        call :assert_ptx_version "%OUT_DIR%\!BASE!.ptx"
         set "ARCH_NOTE="
         if /I not "!KARCH!"=="%ARCH%" set "ARCH_NOTE= [!KARCH!]"
-        if defined FAST_FLAG (
-            echo   %%~nxF -^> !BASE!.ptx ^(fast_math^)!ARCH_NOTE!
-        ) else (
-            if defined FMAD_FLAG (
-                echo   %%~nxF -^> !BASE!.ptx ^(precise, no FMA — bit-perfect with CPU^)!ARCH_NOTE!
+        if not "!PTX_VERSION_BAD!"=="1" (
+            if defined FAST_FLAG (
+                echo   %%~nxF -^> !BASE!.ptx ^(fast_math^)!ARCH_NOTE!
             ) else (
-                echo   %%~nxF -^> !BASE!.ptx ^(precise^)!ARCH_NOTE!
+                if defined FMAD_FLAG (
+                    echo   %%~nxF -^> !BASE!.ptx ^(precise, no FMA — bit-perfect with CPU^)!ARCH_NOTE!
+                ) else (
+                    echo   %%~nxF -^> !BASE!.ptx ^(precise^)!ARCH_NOTE!
+                )
             )
         )
     )
 )
 
 if "%FAIL%"=="1" exit /b 1
+echo All PTX at .version %DOTLLM_PTX_EXPECT_VERSION%.
 echo Done. PTX files in %OUT_DIR%
 exit /b 0
+
+REM ===================================================================
+REM :assert_ptx_version <ptx file>
+REM Fails (exit /b 1) if the generated file's .version directive is not the
+REM expected baseline, naming the nvcc that produced it. See the PTX ISA
+REM version contract note near the top of this file.
+REM ===================================================================
+:assert_ptx_version
+REM Deliberately NO setlocal: the failure flag must reach the caller's FAIL, and
+REM cmd's errorlevel does not survive `endlocal` reliably from inside a FOR body.
+set "PTX_FILE=%~1"
+set "PTX_ACTUAL="
+set "PTX_VERSION_BAD="
+for /f "tokens=2" %%V in ('findstr /R /C:"^\.version" "%PTX_FILE%"') do (
+    if not defined PTX_ACTUAL set "PTX_ACTUAL=%%V"
+)
+if "%PTX_ACTUAL%"=="%DOTLLM_PTX_EXPECT_VERSION%" exit /b 0
+echo.
+echo ERROR: %~nx1 declares .version %PTX_ACTUAL%, expected %DOTLLM_PTX_EXPECT_VERSION%.
+echo        nvcc used: %NVCC%
+echo        A committed PTX file at the wrong ISA version fails to load with
+echo        CUDA_ERROR_UNSUPPORTED_PTX_VERSION on older drivers ^(see #124, #318^).
+echo        Point CUDA_PATH at the CUDA 12.8 toolkit and rerun, or set
+echo        DOTLLM_PTX_EXPECT_VERSION if you are deliberately re-baselining the tree.
+set "PTX_VERSION_BAD=1"
+set FAIL=1
+exit /b 1
 
 REM ===================================================================
 REM :find_msvc — locate a CUDA-compatible host MSVC toolchain.
