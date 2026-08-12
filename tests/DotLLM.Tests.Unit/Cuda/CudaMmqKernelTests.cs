@@ -633,6 +633,130 @@ public class CudaMmqKernelTests
             block[i] = (byte)rng.Next(0, 256);
     }
 
+    // ── Batched-M prefill equivalence tests (issue #349) ─────────────────────
+    // Oracle: loop of M=1 launches via the already-validated single-row preq path
+    // (quantize_x_to_q8_1 + quantized_gemv_q4_k_mmq_preq), one token at a time.
+    // Under test: ONE quantize_x_to_q8_1_batched launch + ONE
+    // quantized_gemv_q4_k_mmq_batched launch covering all m tokens. Reusing the
+    // preq kernel as ground truth (rather than re-deriving Q4_K math a third
+    // time) mirrors RunPreqEquivalence's structure.
+
+    [SkippableTheory]
+    [InlineData(2, 4, 256)]      // MMQ_BATCH_M_TILE boundary: m=2 exactly fills one M-tile
+    [InlineData(3, 8, 512)]      // odd m: second M-tile is partially out of range
+    [InlineData(8, 64, 1024)]    // larger batch, moderate n/k
+    [InlineData(32, 4096, 4096)] // Qwen3-8B-class shape at a real prefill-length batch
+    public void MmqBatchedQ4K_MatchesLoopOfM1_WithinTolerance(int m, int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunMmqBatchedEquivalence(m, n, k);
+    }
+
+    private unsafe void RunMmqBatchedEquivalence(int m, int n, int k, float peakRelativeTolerance = 0.01f)
+    {
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        using var kernels = new CudaKernels(ptxDir!);
+        Skip.IfNot(kernels.HasMmq(QuantizationType.Q4_K), "MMQ kernel for Q4_K not loaded (PTX may be stale)");
+        Skip.IfNot(kernels.HasMmqBatchedQ4K, "Batched-MMQ Q4_K kernel not loaded (PTX may be stale)");
+
+        var rng = new Random(9012 ^ m ^ n ^ k);
+        int superblocksPerRow = k / 256;
+        int rowBytes = superblocksPerRow * 144;
+        long weightBytes = (long)n * rowBytes;
+
+        byte[] hostWeight = new byte[weightBytes];
+        var weightSpan = hostWeight.AsSpan();
+        for (int row = 0; row < n; row++)
+        for (int sb = 0; sb < superblocksPerRow; sb++)
+            SynthesiseQ4KBlock(rng, weightSpan.Slice(row * rowBytes + sb * 144, 144));
+
+        Half[] hostX = new Half[m * k];
+        for (int i = 0; i < hostX.Length; i++)
+        {
+            double u1 = 1.0 - rng.NextDouble();
+            double u2 = 1.0 - rng.NextDouble();
+            double g = Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2);
+            hostX[i] = (Half)(g * 0.4);
+        }
+
+        long xBytes = (long)m * k * sizeof(ushort);
+        long yBytes = (long)m * n * sizeof(ushort);
+        long batchedScratchBytes = (long)m * CudaForwardState.PreQ8_1ScratchBytes(k);
+        long singleScratchBytes = CudaForwardState.PreQ8_1ScratchBytes(k);
+
+        nint devW = 0, devX = 0, devYLoop = 0, devYBatched = 0, devScratchBatched = 0, devScratchSingle = 0;
+        Half[] yLoop = new Half[m * n];
+        Half[] yBatched = new Half[m * n];
+
+        try
+        {
+            CudaDriverApi.cuMemAlloc_v2(out devW, (nuint)weightBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out devX, (nuint)xBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out devYLoop, (nuint)yBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out devYBatched, (nuint)yBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out devScratchBatched, (nuint)batchedScratchBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out devScratchSingle, (nuint)singleScratchBytes).ThrowOnError();
+
+            fixed (byte* pW = hostWeight)
+                CudaDriverApi.cuMemcpyHtoD_v2(devW, (nint)pW, (nuint)weightBytes).ThrowOnError();
+            fixed (Half* pX = hostX)
+                CudaDriverApi.cuMemcpyHtoD_v2(devX, (nint)pX, (nuint)xBytes).ThrowOnError();
+
+            // Oracle: one M=1 launch pair per token, via the already-validated preq path.
+            for (int token = 0; token < m; token++)
+            {
+                nint xRow = devX + (nint)((long)token * k * sizeof(ushort));
+                nint yRow = devYLoop + (nint)((long)token * n * sizeof(ushort));
+                kernels.LaunchQuantizeXToQ8_1(xRow, devScratchSingle, k, stream.Handle);
+                kernels.LaunchQuantizedGemvMmq(devW, QuantizationType.Q4_K, xRow, yRow, n, k, devScratchSingle, stream.Handle);
+            }
+
+            // Under test: one batched-quantize + one batched-MMQ launch for all m tokens.
+            kernels.LaunchQuantizeXToQ8_1Batched(devX, devScratchBatched, k, m, stream.Handle);
+            kernels.LaunchQuantizedGemvMmqBatchedQ4K(devW, devScratchBatched, devYBatched, n, k, m, stream.Handle);
+
+            stream.Synchronize();
+
+            fixed (Half* pY = yLoop)
+                CudaDriverApi.cuMemcpyDtoH_v2((nint)pY, devYLoop, (nuint)yBytes).ThrowOnError();
+            fixed (Half* pY = yBatched)
+                CudaDriverApi.cuMemcpyDtoH_v2((nint)pY, devYBatched, (nuint)yBytes).ThrowOnError();
+        }
+        finally
+        {
+            if (devW != 0) CudaDriverApi.cuMemFree_v2(devW);
+            if (devX != 0) CudaDriverApi.cuMemFree_v2(devX);
+            if (devYLoop != 0) CudaDriverApi.cuMemFree_v2(devYLoop);
+            if (devYBatched != 0) CudaDriverApi.cuMemFree_v2(devYBatched);
+            if (devScratchBatched != 0) CudaDriverApi.cuMemFree_v2(devScratchBatched);
+            if (devScratchSingle != 0) CudaDriverApi.cuMemFree_v2(devScratchSingle);
+        }
+
+        float maxAbs = 0f, refMax = 0f;
+        double sumAbs = 0.0;
+        int total = m * n;
+        for (int i = 0; i < total; i++)
+        {
+            float a = (float)yLoop[i];
+            float b = (float)yBatched[i];
+            float diff = MathF.Abs(a - b);
+            sumAbs += diff;
+            if (diff > maxAbs) maxAbs = diff;
+            if (MathF.Abs(a) > refMax) refMax = MathF.Abs(a);
+        }
+        float meanAbs = (float)(sumAbs / total);
+        float peakRelMax = refMax > 0 ? maxAbs / refMax : 0f;
+        float peakRelMean = refMax > 0 ? meanAbs / refMax : 0f;
+
+        _out.WriteLine($"BATCHED Q4_K m={m} n={n} k={k}: ref|max|={refMax:F3} |batched-loop| max={maxAbs:F4} mean={meanAbs:F4} peak-rel max={peakRelMax:P3} mean={peakRelMean:P3}");
+
+        Assert.True(peakRelMax < peakRelativeTolerance,
+            $"Peak-relative max diff {peakRelMax:P3} exceeds {peakRelativeTolerance:P1} (max={maxAbs}, refMax={refMax})");
+    }
+
     private static string? FindPtxDir()
     {
         var candidates = new[]
