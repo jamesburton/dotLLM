@@ -12,8 +12,8 @@
 
 - .NET 10, `<Nullable>enable</Nullable>` project-wide, file-scoped namespaces, XML doc comments on all public APIs (per CLAUDE.md Code Style).
 - GPU memory handles use `nint` (device pointer) per existing `CudaKernels.cs` / `CudaForwardState.cs` convention — this codebase's actual GPU interop pattern is the CUDA **Driver API** (`cuLaunchKernel` via a `CudaDriverApi` P/Invoke wrapper, PTX modules loaded at runtime with `CudaModule.LoadFromFile`/`TryGetFunction`), not a bespoke native shared library — follow that established pattern exactly, do not introduce a new native library entry point.
-- No CMake / no C/C++ build system: `.cu` kernels compile via a single `nvcc -ptx` invocation through `native/build.ps1` (Windows) / `native/build.sh`, output to `native/ptx/*.ptx`, one `.ptx` file per `.cu` file. **Extend the two existing files** (`quantized_gemv_mmq.cu`, `quantize_x.cu`) — do not create new `.cu` files, so no changes to the build script or to `CudaKernels.cs`'s per-module `File.Exists`/`LoadFromFile` wiring are needed, only new `TryGetFunction` calls inside the already-existing `if (File.Exists(...))` blocks.
-- PTX target is `compute_75` with `--use_fast_math` (neither new kernel is in `build.ps1`'s `$bitPerfect` list, so this is the default path — matches every other kernel in these two files).
+- No CMake / no C/C++ build system: `.cu` kernels compile via a single `nvcc -ptx` invocation through **`native/build_ptx.bat`** (Windows) / `native/build.sh` (Linux — kept in sync with the `.bat`, same `FAST_MATH`/`FAST_MATH_KERNELS` allow-list), output to `native/ptx/*.ptx`, one `.ptx` file per `.cu` file. **Do NOT use `native/build.ps1`** — despite the similar name, it is a separate, legacy script (its own comment self-describes as "the legacy fast-math path"): it defaults to `--use_fast_math` for every kernel except a small opt-out list, the opposite convention from `build_ptx.bat`'s small opt-**in** `FAST_MATH` list that the rest of this file's kernels (and every recently-added kernel elsewhere in the tree) actually build under, and it hardcodes an expected PTX ISA version (8.7 / CUDA 12.8) that does not match this environment's toolkit (13.1 emits 9.1) — running it would either throw on the version assert or silently rewrite every other committed `.ptx` file's fast-math flag. **Extend the two existing files** (`quantized_gemv_mmq.cu`, `quantize_x.cu`) — do not create new `.cu` files, so no changes to the build script or to `CudaKernels.cs`'s per-module `File.Exists`/`LoadFromFile` wiring are needed, only new `TryGetFunction` calls inside the already-existing `if (File.Exists(...))` blocks.
+- PTX target is `compute_75`, **without** `--use_fast_math`: neither new kernel's base filename (`quantized_gemv_mmq`, `quantize_x`) appears in `build_ptx.bat`'s `FAST_MATH` allow-list (`add add_f32 swiglu swiglu_f32 convert bias_add bias_add_f32 embedding embedding_f32out dequant quant_kv`), so both files already compile with precise math today — matching the existing `_preq`/legacy MMQ kernels in the same two files, which are also not fast-math. This has effectively no numerical impact on the new kernels regardless (neither uses any transcendental function — pure `__dp4a`/multiply-add/warp-shuffle arithmetic), but the build-script correction above matters for the REST of the PTX tree.
 - `*.ptx` files ARE tracked in git on purpose (216 compiled shaders/kernels are legitimate build artifacts per CLAUDE.md) — after regenerating PTX, `git add` the updated `native/ptx/quantized_gemv_mmq.ptx` and `native/ptx/quantize_x.ptx` alongside the `.cu` source changes.
 - Model weights NEVER live in or get copied into the repository. The benchmark task (Task 6) must resolve a model via the existing GGUF path / HuggingFace repo-ID resolution built into the `bench` CLI command, never via a fixture copied into the working tree.
 - Priority order per CLAUDE.md: Correctness then Performance then Extensibility — the discriminating parity test (Task 4) must pass before the dispatcher gate (Task 5) routes real forward-pass traffic through the new kernel.
@@ -191,14 +191,13 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q4_k_mmq_bat
 
 - [ ] **Step 2: Regenerate PTX and verify the new symbol compiles**
 
-Run (Windows):
+Run (Windows — from the repo root, NOT `native/build.ps1`, see Global Constraints for why):
 
-```powershell
-cd native
-./build.ps1
+```
+native\build_ptx.bat
 ```
 
-Expected output includes `quantized_gemv_mmq.cu -> quantized_gemv_mmq.ptx` with no `nvcc` errors (the script throws on nonzero exit code).
+Expected output includes a line for `quantized_gemv_mmq.cu -> quantized_gemv_mmq.ptx` (or the script's equivalent per-file success line) with no `FAIL` marker (the script sets an error flag and reports failures at the end rather than throwing immediately).
 
 - [ ] **Step 3: Verify the new kernel symbol is present in the regenerated PTX**
 
@@ -295,12 +294,13 @@ extern "C" __global__ void __launch_bounds__(QX_THREADS) quantize_x_to_q8_1_batc
 
 - [ ] **Step 2: Regenerate PTX**
 
-```powershell
-cd native
-./build.ps1
+Run (Windows — from the repo root, NOT `native/build.ps1`, see Global Constraints for why):
+
+```
+native\build_ptx.bat
 ```
 
-Expected: `quantize_x.cu -> quantize_x.ptx` with no errors.
+Expected: a success line for `quantize_x.cu -> quantize_x.ptx` with no `FAIL` marker.
 
 - [ ] **Step 3: Verify the new symbol is present**
 
@@ -689,7 +689,7 @@ Insert a new region into `tests/DotLLM.Tests.Unit/Cuda/CudaMmqKernelTests.cs` ri
 dotnet test tests/DotLLM.Tests.Unit/ --filter "FullyQualifiedName~MmqBatchedQ4K_MatchesLoopOfM1_WithinTolerance"
 ```
 
-Expected on a machine WITHOUT a CUDA GPU: all 4 cases report `Skipped` with reason `"No CUDA GPU available"` (proves the test compiles and the skip path works). Expected on a machine WITH a CUDA GPU (e.g. the RTX 3060 T1 tier): all 4 cases `Passed`, with `_out.WriteLine` peak-relative drift under 1% printed for each case. If any case reports `Skipped: "Batched-MMQ Q4_K kernel not loaded (PTX may be stale)"` on a GPU machine, re-run Task 1/2 Step 2 (`native/build.ps1`) — the PTX in `native/ptx/` is stale relative to the `.cu` source.
+Expected on a machine WITHOUT a CUDA GPU: all 4 cases report `Skipped` with reason `"No CUDA GPU available"` (proves the test compiles and the skip path works). Expected on a machine WITH a CUDA GPU (e.g. the RTX 3060 T1 tier): all 4 cases `Passed`, with `_out.WriteLine` peak-relative drift under 1% printed for each case. If any case reports `Skipped: "Batched-MMQ Q4_K kernel not loaded (PTX may be stale)"` on a GPU machine, re-run Task 1/2 Step 2 (`native\build_ptx.bat`) — the PTX in `native/ptx/` is stale relative to the `.cu` source.
 
 - [ ] **Step 3: Commit**
 
