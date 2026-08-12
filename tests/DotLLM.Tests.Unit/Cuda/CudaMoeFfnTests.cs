@@ -183,6 +183,180 @@ public sealed class CudaMoeFfnTests : IDisposable
     }
 
     /// <summary>
+    /// gpt-oss-shaped fixture (issue #348): router + per-expert bias, softmax-after-top-k
+    /// gating, OAI-clamped SwiGLU activation. Oracle is
+    /// <see cref="MoeQuantSwiGluMlp.Execute"/> (the same kernel gpt-oss uses on CPU) with F32
+    /// experts — isolating bias/gating/activation correctness from MXFP4 dequant correctness
+    /// (covered separately by Mxfp4Tests.cs). No shared experts (gpt-oss has none).
+    /// </summary>
+    [SkippableFact]
+    public unsafe void MoeFfn_GptOssShape_MatchesQuantSwiGluOracle()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null, "PTX files not found");
+        Skip.IfNot(_kernels!.HasMoeKernels, "MoE PTX kernels not available");
+        Skip.IfNot(_kernels!.HasSwiGluOai, "swiglu_oai_f32 kernel not available (stale PTX)");
+
+        const int seqLen = 3, numExperts = 8, topK = 2, hidden = 32, intermediate = 48;
+        var rng = new Random(348);
+
+        float[] hiddenIn = RandomArr(rng, seqLen * hidden, 0.3f);
+        float[] router = RandomArr(rng, numExperts * hidden, 0.05f);
+        float[] routerBias = RandomArr(rng, numExperts, 0.05f);
+        float[] gateBias = RandomArr(rng, numExperts * intermediate, 0.05f);
+        float[] upBias = RandomArr(rng, numExperts * intermediate, 0.05f);
+        float[] downBias = RandomArr(rng, numExperts * hidden, 0.05f);
+
+        float[][] w1 = new float[numExperts][];
+        float[][] w2 = new float[numExperts][];
+        float[][] w3 = new float[numExperts][];
+        for (int e = 0; e < numExperts; e++)
+        {
+            w1[e] = RandomArr(rng, intermediate * hidden, 0.05f);
+            w3[e] = RandomArr(rng, intermediate * hidden, 0.05f);
+            w2[e] = RandomArr(rng, hidden * intermediate, 0.05f);
+        }
+
+        // ── CPU oracle: MoeQuantSwiGluMlp.Execute, F32 experts, one token at a time
+        // (Execute's seqLen loop already handles multi-token, but flattening per-expert
+        // pointer arrays for the fixed-block-based CPU API is simplest done once). ──
+        float[] cpuOut = new float[seqLen * hidden];
+        var pins = new List<System.Runtime.InteropServices.GCHandle>();
+        try
+        {
+            var w1Handles = new System.Runtime.InteropServices.GCHandle[numExperts];
+            var w2Handles = new System.Runtime.InteropServices.GCHandle[numExperts];
+            var w3Handles = new System.Runtime.InteropServices.GCHandle[numExperts];
+            for (int e = 0; e < numExperts; e++)
+            {
+                w1Handles[e] = System.Runtime.InteropServices.GCHandle.Alloc(w1[e], System.Runtime.InteropServices.GCHandleType.Pinned);
+                w2Handles[e] = System.Runtime.InteropServices.GCHandle.Alloc(w2[e], System.Runtime.InteropServices.GCHandleType.Pinned);
+                w3Handles[e] = System.Runtime.InteropServices.GCHandle.Alloc(w3[e], System.Runtime.InteropServices.GCHandleType.Pinned);
+                pins.Add(w1Handles[e]); pins.Add(w2Handles[e]); pins.Add(w3Handles[e]);
+            }
+
+            // MoeQuantSwiGluMlp.Execute expects one contiguous 3D-stacked bank per projection
+            // (expert e at byte offset e * expertBytes), matching the GGUF on-disk layout. Build
+            // that layout on the host by concatenating the per-expert F32 arrays.
+            float[] gateExpsFlat = new float[numExperts * intermediate * hidden];
+            float[] upExpsFlat = new float[numExperts * intermediate * hidden];
+            float[] downExpsFlat = new float[numExperts * hidden * intermediate];
+            for (int e = 0; e < numExperts; e++)
+            {
+                w1[e].CopyTo(gateExpsFlat, e * intermediate * hidden);
+                w3[e].CopyTo(upExpsFlat, e * intermediate * hidden);
+                w2[e].CopyTo(downExpsFlat, e * hidden * intermediate);
+            }
+
+            fixed (float* hp = hiddenIn)
+            fixed (float* op = cpuOut)
+            fixed (float* gp = gateExpsFlat)
+            fixed (float* up = upExpsFlat)
+            fixed (float* dp = downExpsFlat)
+            {
+                MoeQuantSwiGluMlp.Execute(
+                    hidden: hp, output: op, seqLen: seqLen,
+                    routerWeight: router, routerBias: routerBias,
+                    gateExpsBase: (nint)gp, gateQt: DotLLM.Core.Configuration.QuantizationType.F32,
+                    upExpsBase: (nint)up, upQt: DotLLM.Core.Configuration.QuantizationType.F32,
+                    downExpsBase: (nint)dp, downQt: DotLLM.Core.Configuration.QuantizationType.F32,
+                    gateBias: gateBias, upBias: upBias, downBias: downBias,
+                    numExperts: numExperts, numExpertsPerTok: topK,
+                    hiddenSize: hidden, intermediateSize: intermediate,
+                    softmaxAfterTopK: true, useSwiGluOai: true,
+                    pool: null);
+            }
+        }
+        finally
+        {
+            foreach (var h in pins) h.Free();
+        }
+
+        // ── GPU forward ──
+        var allocs = new List<nint>();
+        try
+        {
+            nint dHidden = AllocAndUploadF32(hiddenIn, allocs);
+            nint dRouter = AllocAndUploadF32(router, allocs);
+            nint dRouterBias = AllocAndUploadF32(routerBias, allocs);
+            nint dGateBias = AllocAndUploadF32(gateBias, allocs);
+            nint dUpBias = AllocAndUploadF32(upBias, allocs);
+            nint dDownBias = AllocAndUploadF32(downBias, allocs);
+
+            nint[] dW1 = new nint[numExperts];
+            nint[] dW2 = new nint[numExperts];
+            nint[] dW3 = new nint[numExperts];
+            for (int e = 0; e < numExperts; e++)
+            {
+                dW1[e] = AllocAndUploadF32(w1[e], allocs);
+                dW2[e] = AllocAndUploadF32(w2[e], allocs);
+                dW3[e] = AllocAndUploadF32(w3[e], allocs);
+            }
+            nint dOut = AllocF32(seqLen * hidden, allocs);
+
+            var weights = new CudaMoeLayerWeights(
+                numExperts: numExperts, numExpertsPerTok: topK, hiddenSize: hidden,
+                moeIntermediateSize: intermediate,
+                normTopKProb: true,
+                router: dRouter,
+                gateProj: dW1, upProj: dW3, downProj: dW2,
+                numSharedExperts: 0, sharedIntermediateSize: 0,
+                sharedGateProj: null, sharedUpProj: null, sharedDownProj: null,
+                sharedExpertGate: 0,
+                precision: MoePrecision.F32,
+                gateProjQuantType: DotLLM.Core.Configuration.QuantizationType.F32,
+                upProjQuantType: DotLLM.Core.Configuration.QuantizationType.F32,
+                downProjQuantType: DotLLM.Core.Configuration.QuantizationType.F32,
+                sharedGateProjQuantType: DotLLM.Core.Configuration.QuantizationType.F32,
+                sharedUpProjQuantType: DotLLM.Core.Configuration.QuantizationType.F32,
+                sharedDownProjQuantType: DotLLM.Core.Configuration.QuantizationType.F32,
+                routerBiasF32: dRouterBias,
+                gateExpsBiasF32: dGateBias,
+                upExpsBiasF32: dUpBias,
+                downExpsBiasF32: dDownBias,
+                useSwiGluOai: true);
+
+            using var scratch = new CudaMoeScratch();
+
+            CudaMoeFfn.Forward(
+                hiddenF32: dHidden, outputF32: dOut,
+                seqLen: seqLen,
+                weights: weights,
+                scratch: scratch, cublasHandle: _cublas!.Handle,
+                kernels: _kernels!, stream: _stream!.Handle);
+            _stream.Synchronize();
+
+            float[] gpuOut = new float[seqLen * hidden];
+            fixed (float* p = gpuOut)
+                CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dOut,
+                    (nuint)(gpuOut.Length * sizeof(float))).ThrowOnError();
+
+            int mismatches = 0;
+            float maxDiff = 0f;
+            int maxDiffIdx = -1;
+            for (int i = 0; i < cpuOut.Length; i++)
+            {
+                float diff = MathF.Abs(cpuOut[i] - gpuOut[i]);
+                if (diff > DefaultTolerance)
+                {
+                    mismatches++;
+                    if (diff > maxDiff) { maxDiff = diff; maxDiffIdx = i; }
+                }
+            }
+            Assert.True(mismatches == 0,
+                $"gpt-oss MoE forward: {mismatches}/{cpuOut.Length} elements outside tolerance "
+              + $"{DefaultTolerance} (max diff {maxDiff} at idx {maxDiffIdx}: "
+              + $"cpu={(maxDiffIdx >= 0 ? cpuOut[maxDiffIdx] : 0)} "
+              + $"gpu={(maxDiffIdx >= 0 ? gpuOut[maxDiffIdx] : 0)}).");
+        }
+        finally
+        {
+            foreach (var p in allocs)
+                CudaDriverApi.cuMemFree_v2(p);
+        }
+    }
+
+    /// <summary>
     /// Builds a synthetic MoE fixture, runs the GPU forward through
     /// <see cref="CudaMoeFfn.Forward"/>, and compares against
     /// <see cref="MoeSwiGluMlp.ExecuteWithSharedExpert"/>.
