@@ -126,13 +126,17 @@ public static unsafe class CudaMoeFfn
         // ── Step 2b: additive router bias (gpt-oss, issue #348) ──
         // MUST run before softmax/top-k — same ordering as ForwardBitNetI2S's identity-MoTE
         // router bias (bias shifts both the top-k argmax AND the softmax probabilities).
-        if (weights.RouterBiasF32 != 0)
+        // RouterBiasF32 (gpt-oss, #348) and GateBiasF32 (identity-MoTE/BitNet, #246) are both
+        // additive router biases; Forward (unlike ForwardBitNetI2S) may see either depending on
+        // which loader populated this layer, so check both.
+        nint effectiveRouterBias = weights.RouterBiasF32 != 0 ? weights.RouterBiasF32 : weights.GateBiasF32;
+        if (effectiveRouterBias != 0)
         {
             if (!kernels.HasMoeGateBiasAdd)
                 throw new InvalidOperationException(
                     "MoE layer has a router bias but moe_gate_bias_add_f32 is not available. " +
                     "Recompile native/kernels/moe_ffn.cu to PTX.");
-            kernels.LaunchMoeGateBiasAddF32(scratch.Logits, weights.RouterBiasF32, seqLen, E, stream);
+            kernels.LaunchMoeGateBiasAddF32(scratch.Logits, effectiveRouterBias, seqLen, E, stream);
         }
 
         // ── Step 3: per-token softmax + top-k selection → device buffers ──
