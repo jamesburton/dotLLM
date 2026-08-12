@@ -120,6 +120,39 @@ public sealed class CudaMoeLayerWeights
     public nint GateBiasF32 { get; }
 
     /// <summary>
+    /// Optional F32 router-bias device pointer <c>[numExperts]</c> for the quantized-expert
+    /// gating path (gpt-oss <c>ffn_gate_inp.bias</c>, issue #348). 0 when absent. Distinct
+    /// from <see cref="GateBiasF32"/> (the identity-MoTE / <see cref="MoePrecision.BitNetI2S"/>
+    /// router bias) so the two features can evolve independently even though both add to the
+    /// same router logits before softmax/top-k.
+    /// </summary>
+    public nint RouterBiasF32 { get; }
+
+    /// <summary>
+    /// Optional per-expert gate-projection bias, flat F32 device pointer
+    /// <c>[numExperts × moeIntermediateSize]</c> (gpt-oss <c>ffn_gate_exps.bias</c>). 0 when
+    /// absent. Expert <c>e</c>'s slice starts at byte offset
+    /// <c>e * moeIntermediateSize * sizeof(float)</c>.
+    /// </summary>
+    public nint GateExpsBiasF32 { get; }
+
+    /// <summary>Optional per-expert up-projection bias. Same layout as <see cref="GateExpsBiasF32"/>.</summary>
+    public nint UpExpsBiasF32 { get; }
+
+    /// <summary>
+    /// Optional per-expert down-projection bias, flat F32 device pointer
+    /// <c>[numExperts × hiddenSize]</c>. 0 when absent. Expert <c>e</c>'s slice starts at byte
+    /// offset <c>e * hiddenSize * sizeof(float)</c>.
+    /// </summary>
+    public nint DownExpsBiasF32 { get; }
+
+    /// <summary>
+    /// True = gpt-oss clamped swiglu_oai activation (<see cref="CudaKernels.LaunchSwiGLUOaiF32"/>);
+    /// false = plain SwiGLU (<see cref="CudaKernels.LaunchSwiGLUF32"/>). Default false.
+    /// </summary>
+    public bool UseSwiGluOai { get; }
+
+    /// <summary>
     /// RMSNorm epsilon for the per-expert FFN Sub-LN. Only meaningful when
     /// <see cref="Precision"/> == <see cref="MoePrecision.BitNetI2S"/>.
     /// </summary>
@@ -208,7 +241,12 @@ public sealed class CudaMoeLayerWeights
         QuantizationType sharedDownProjQuantType,
         nint[]? expertFfnSubNormF32 = null,
         nint gateBiasF32 = 0,
-        float rmsEps = 0f)
+        float rmsEps = 0f,
+        nint routerBiasF32 = 0,
+        nint gateExpsBiasF32 = 0,
+        nint upExpsBiasF32 = 0,
+        nint downExpsBiasF32 = 0,
+        bool useSwiGluOai = false)
     {
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (numExpertsPerTok <= 0 || numExpertsPerTok > numExperts)
@@ -254,5 +292,10 @@ public sealed class CudaMoeLayerWeights
         ExpertFfnSubNormF32 = expertFfnSubNormF32 ?? Array.Empty<nint>();
         GateBiasF32 = gateBiasF32;
         RmsEps = rmsEps;
+        RouterBiasF32 = routerBiasF32;
+        GateExpsBiasF32 = gateExpsBiasF32;
+        UpExpsBiasF32 = upExpsBiasF32;
+        DownExpsBiasF32 = downExpsBiasF32;
+        UseSwiGluOai = useSwiGluOai;
     }
 }
