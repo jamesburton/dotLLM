@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using Architecture = DotLLM.Core.Configuration.Architecture;
@@ -121,10 +121,24 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// </summary>
     private readonly VulkanFlashAttentionF32Kernel? _flashAttention;
     /// <summary>
-    /// Split-KV (Flash-Decoding) kernel for the long-context decode path
-    /// (seqLen == 1). Null when the SPVs are missing or the env-var opt-out is
-    /// set; used only for shapes that actually split (short context falls back
-    /// to <see cref="_attention"/>, keeping that path unchanged).
+    /// Split-KV (Flash-Decoding) kernel for the decode path (seqLen == 1).
+    /// Null when the SPVs are missing or the env-var opt-out is set; used only
+    /// for shapes that actually split. With the shipping defaults that is every
+    /// seqKv &gt;= 17 on a model with &lt;= 128 heads (issue #331 — NOT "past 256"),
+    /// so only seqKv &lt;= 16 falls back to <see cref="_attention"/>. See
+    /// <see cref="VulkanTransformerModel.DisableSplitDecodeEnvVar"/> for the
+    /// threshold derivation and the ON-by-default evidence.
+    /// <para>
+    /// <b>Known coverage gap (issue #331):</b> that evidence was gathered on
+    /// Llama-3.2-3B only (<c>VulkanSplitDecodeParityTests</c>). Nemotron-H has
+    /// <i>no</i> real-GGUF end-to-end split-KV validation — no Nemotron-H GGUF is
+    /// staged on the development box. (Qwen3MoeHybrid has the test written —
+    /// <c>VulkanSplitDecodeMoeParityTests</c> — but it is blocked by issue #356.)
+    /// Both ship on the same default as Llama, resting on the shared kernel's
+    /// CPU-oracle parity plus synthetic-weight forward tests. Stage a Nemotron-H
+    /// GGUF and follow <c>VulkanSplitDecodeMoeParityTests</c>'s pattern to close
+    /// this one.
+    /// </para>
     /// </summary>
     private readonly VulkanSplitKvAttentionKernel? _splitKvAttention;
     private readonly SwiGluF32Kernel _swiglu;
@@ -1146,8 +1160,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
             && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads))
         {
-            // Long-context decode: split the KV range across many workgroups
-            // (Flash-Decoding). Short context falls through to the per-token kernel.
+            // Decode: split the KV range across many workgroups (Flash-Decoding).
+            // Engages from seqKv >= 17 with the shipping heuristic (issue #331);
+            // only seqKv <= 16 falls through to the per-token kernel.
             _splitKvAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,

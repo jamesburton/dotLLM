@@ -662,12 +662,16 @@ public sealed class VulkanTransformerModel : IModel
     private readonly VulkanFlashAttentionF32Kernel? _flashAttention;
     private readonly VulkanFlashAttentionCoopmatKernel? _flashAttentionCoopmat;
     /// <summary>
-    /// Split-KV (Flash-Decoding) attention kernel for the long-context decode
-    /// path (seqQ == 1). Null when the SPVs are missing (older builds) or the
+    /// Split-KV (Flash-Decoding) attention kernel for the decode path
+    /// (seqQ == 1). Null when the SPVs are missing (older builds) or the
     /// env-var opt-out is set. Even when present it is used only for shapes that
-    /// actually split (<see cref="VulkanSplitKvAttentionKernel.WouldSplit"/>);
-    /// short context falls through to <see cref="_attention"/>, keeping that path
-    /// bit-identical to before.
+    /// actually split (<see cref="VulkanSplitKvAttentionKernel.WouldSplit"/>).
+    /// <b>That is not a "long context only" condition</b>: with the shipping
+    /// defaults it is true from <c>seqKv &gt;= 17</c> for any model with
+    /// <c>numHeads &lt;= 128</c> — see <see cref="DisableSplitDecodeEnvVar"/> for
+    /// the threshold derivation and the evidence behind shipping it on by default.
+    /// Only <c>seqKv &lt;= 16</c> (and <c>numHeads &gt; 128</c>) falls through to
+    /// <see cref="_attention"/> bit-identically.
     /// </summary>
     private readonly VulkanSplitKvAttentionKernel? _splitKvAttention;
     private readonly SwiGluF32Kernel _swiglu;
@@ -1637,9 +1641,10 @@ public sealed class VulkanTransformerModel : IModel
                 || config.HeadDim > VulkanFlashAttentionCoopmatKernel.MaxHeadDim
                 ? null
                 : VulkanFlashAttentionCoopmatKernel.TryCreate(device, spvDir);
-        // Optional split-KV (Flash-Decoding) kernel for the long-context decode
-        // path (seqQ == 1). Disabled by env-var opt-out or missing SPV (older
-        // builds); short-context decode still routes to the per-token kernel.
+        // Optional split-KV (Flash-Decoding) kernel for the decode path
+        // (seqQ == 1). Disabled by env-var opt-out or missing SPV (older
+        // builds); only seqKv <= 16 decode still routes to the per-token kernel
+        // (issue #331 — NOT "everything below 256", see DisableSplitDecodeEnvVar).
         VulkanSplitKvAttentionKernel? splitKvAttention =
             IsSplitDecodeDisabled() || config.HeadDim > VulkanSplitKvAttentionKernel.MaxHeadDim
                 ? null
@@ -1854,11 +1859,61 @@ public sealed class VulkanTransformerModel : IModel
         Environment.GetEnvironmentVariable(DisableCoopmatAttentionEnvVar) == "1";
 
     /// <summary>
-    /// Env-var opt-out for the split-KV (Flash-Decoding) decode path. Set
-    /// <c>DOTLLM_VULKAN_DISABLE_SPLIT_DECODE=1</c> to force every decode dispatch
-    /// onto the legacy per-token <see cref="AttentionF32Kernel"/> — used for
-    /// same-session A/B benchmarking of the split-KV win.
+    /// Env-var opt-<b>out</b> for the split-KV (Flash-Decoding) decode path
+    /// (issues #345/#346). Set <c>DOTLLM_VULKAN_DISABLE_SPLIT_DECODE=1</c> to force
+    /// every decode dispatch onto the legacy per-token
+    /// <see cref="AttentionF32Kernel"/> — used for same-session A/B benchmarking of
+    /// the split-KV win, and as the escape hatch if a driver miscompiles the split
+    /// shaders. <b>Unset means ON</b>; the ON-by-default decision is recorded below.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Engagement threshold: seqKv &gt;= 17, not 256 (issue #331).</b>
+    /// <see cref="VulkanSplitKvAttentionKernel.ComputeSplits"/> is
+    /// <c>S = min(TargetWorkgroups / numHeads, ceil(seqKv / MinKvPerSplit))</c> and
+    /// the router takes the split kernel at <c>S &gt;= 2</c>. With the shipping
+    /// defaults (<c>TargetWorkgroups = 256</c>; <c>MinKvPerSplit = 16</c> since
+    /// issue #143 lowered it from 256) the KV term reaches 2 at <c>seqKv = 17</c>
+    /// and the occupancy term is &gt;= 2 for every <c>numHeads &lt;= 128</c>. #345's
+    /// original "short context is bit-identical, so exposure starts past 256"
+    /// argument rested on the old 256 floor and has been stale since #143 — the
+    /// split path is live on essentially every decode step of every real model.
+    /// </para>
+    /// <para>
+    /// <b>Why it nevertheless ships ON — the evidence (issue #331).</b> The split
+    /// kernel differs from the per-token kernel by cross-split online-softmax
+    /// reassociation (plus a coalesced subgroup Q·K reduction and shifted KV tile
+    /// alignment), so it is divergence-<i>capable</i> in the same class CUDA's
+    /// #183/#222 characterised, and exact-token equality over a long generation is
+    /// not a sustainable invariant for it. What matters is whether output
+    /// <i>quality</i> moves. Measured on Llama-3.2-3B-Instruct IQ4_XS / gfx1151,
+    /// ON vs forced-OFF, fresh model per arm
+    /// (<c>VulkanSplitDecodeParityTests</c>):
+    /// </para>
+    /// <list type="bullet">
+    ///   <item>Pre-engagement (<c>seqKv &lt; 17</c>) per-step NLL: <b>bit-identical</b>
+    ///         (max |Δ| exactly 0) — the gate itself is correct.</item>
+    ///   <item>Teacher-forced decode perplexity over 1007 post-engagement steps
+    ///         (depth 17-1024): 2.61653 → 2.61640, <b>−0.005%</b>.</item>
+    ///   <item>Same at the depth the win was measured at (3840-4096, S = 10):
+    ///         1.06913 → 1.06900, <b>−0.012%</b>.</item>
+    ///   <item>512-step greedy generation: first argmax flip at step 93 (depth 101)
+    ///         at a near-tie (top1−top2 margin 0.036), compounding thereafter —
+    ///         the expected signature, not a quality regression.</item>
+    /// </list>
+    /// <para>
+    /// For scale, this project rejected CUDA's #183 as a default at <b>+0.30%</b>
+    /// perplexity and accepted the CUDA MMA-decode GQA-split kernel as a default at
+    /// <b>−0.173%</b>. Vulkan split-KV moves perplexity by ~0.005-0.012% in the
+    /// <i>favourable</i> direction — 25x smaller than the accepted CUDA change and
+    /// ~60x smaller than the rejected one. Combined with the shipped win it buys
+    /// (2.1x decode at ctx 2048, 2.8x at ctx 4096), ON is the right default. The
+    /// regression guard is <c>VulkanSplitDecodeParityTests</c>, which asserts the
+    /// bit-exact pre-engagement segment and bounds the post-engagement perplexity
+    /// ratio; do not weaken it to an exact-token assertion over a long generation,
+    /// which would be permanently red for benign reasons.
+    /// </para>
+    /// </remarks>
     internal const string DisableSplitDecodeEnvVar = "DOTLLM_VULKAN_DISABLE_SPLIT_DECODE";
 
     internal static bool IsSplitDecodeDisabled() =>
@@ -1971,9 +2026,11 @@ public sealed class VulkanTransformerModel : IModel
         float softCap = 0.0f, float scaleOverride = 0.0f,
         AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
-        // Long-context decode (seqQ == 1): split the KV range across many
-        // workgroups (Flash-Decoding) when the shape is worth splitting. Short
-        // context falls through to the per-token kernel (bit-identical to before).
+        // Decode (seqQ == 1): split the KV range across many workgroups
+        // (Flash-Decoding) when the shape is worth splitting — which, with the
+        // shipping heuristic, means seqKv >= 17 on any model with <= 128 heads,
+        // i.e. nearly every decode step (issue #331). Only seqKv <= 16 falls
+        // through to the per-token kernel (bit-identical to before).
         if (_splitKvAttention is not null && seqQ == 1
             && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
             && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads))
