@@ -2402,6 +2402,141 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q4_k_mmq_pre
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Q4_K batched-M dp4a MMQ — prefill kernel (issue #349).
+//
+// Extends quantized_gemv_q4_k_mmq_preq to a BATCH of M activation rows (prefill
+// tokens) processed in one launch, instead of one M=1 GEMV per token. The grid
+// tiles BOTH output rows (N, MMQ_ROWS_PER_BLOCK=4, same tile as every other MMQ
+// kernel in this file) and activation rows (M, MMQ_BATCH_M_TILE=2), so each
+// block owns MMQ_ROWS_PER_BLOCK * MMQ_BATCH_M_TILE = 8 warps — one warp per
+// (output row, token) pair. Each warp independently walks the full
+// superblocks_per_row loop for its pair (lanes split the loop via a stride-32
+// loop) and warp-shfl-reduces to one scalar — no shared memory at all.
+//
+// The amortization mechanism: all MMQ_BATCH_M_TILE warps assigned the SAME
+// output row (different tokens) read the SAME 144-byte weight superblocks
+// within a few cycles of each other on the same SM, so L1/L2 cache serves the
+// repeat reads. This is what lets the batched path avoid re-dequantizing the
+// whole [n,k] weight matrix to FP16 on every prefill call (the dequant->cuBLAS
+// baseline pays that O(n*k) cost regardless of seqLen); see
+// docs/perf/MMA_BATCHED_MMQ.md §3a step 2 for the design rationale.
+//
+// Consumes pre-quantized activations from quantize_x_to_q8_1_batched (int8 xq /
+// half dx / half sx2, laid out as [m,k] / [m,k/32] / [m,k/16] row-major
+// sections concatenated by section, NOT interleaved per token).
+#define MMQ_BATCH_M_TILE 2
+
+extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q4_k_mmq_batched(
+    const uint8_t* __restrict__ weight,
+    const int8_t*  __restrict__ xq_in,   // [m, k] int8, row stride k
+    const half*    __restrict__ dx_in,   // [m, k/32] half, row stride k/32
+    const half*    __restrict__ sx2_in,  // [m, k/16] half (2 per chunk), row stride k/16
+    half* __restrict__ y,                // [m, n] half, row stride n
+    const int n,
+    const int k,
+    const int m)
+{
+    const int row_base = blockIdx.x * MMQ_ROWS_PER_BLOCK;
+    const int m_base = blockIdx.y * MMQ_BATCH_M_TILE;
+    if (row_base >= n || m_base >= m) return;
+
+    const int superblocks_per_row = k / 256;
+    const int num_chunks = k >> 5;   // k/32 chunks per activation row
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;                            // 0..7
+    const int lane = tid & 31;
+    const int row_in_tile = warp_id % MMQ_ROWS_PER_BLOCK;     // 0..3
+    const int m_in_tile   = warp_id / MMQ_ROWS_PER_BLOCK;     // 0..1
+
+    const int row = row_base + row_in_tile;
+    const int token = m_base + m_in_tile;
+    if (row >= n || token >= m) return;
+
+    const int8_t* xq_row  = xq_in  + (size_t)token * k;
+    const half*   dx_row  = dx_in  + (size_t)token * num_chunks;
+    const half*   sx2_row = sx2_in + (size_t)token * num_chunks * 2;
+    const uint8_t* w_row = weight + (size_t)row * superblocks_per_row * 144;
+
+    float row_acc = 0.0f;
+
+    // Each lane handles a stride-32 subset of this (row, token) pair's
+    // superblocks — identical per-superblock math to quantized_gemv_q4_k_mmq_preq,
+    // just executed by one lane per superblock instead of scattered across
+    // 256 threads with a shared-memory reduction.
+    for (int sb = lane; sb < superblocks_per_row; sb += 32)
+    {
+        const uint8_t* block = w_row + sb * 144;
+        float d    = __half2float(*reinterpret_cast<const half*>(block));
+        float dmin = __half2float(*reinterpret_cast<const half*>(block + 2));
+        const uint8_t* scales_raw = block + 4;
+        const uint8_t* qs = block + 16;
+
+        #pragma unroll
+        for (int pair = 0; pair < 4; pair++)
+        {
+            int sb_even = pair * 2;
+            int sb_odd  = pair * 2 + 1;
+
+            int sc0, m0, sc1, m1;
+            if (sb_even < 4)
+            {
+                sc0 = scales_raw[sb_even]     & 0x3F;
+                m0  = scales_raw[sb_even + 4] & 0x3F;
+                sc1 = scales_raw[sb_odd]      & 0x3F;
+                m1  = scales_raw[sb_odd + 4]  & 0x3F;
+            }
+            else
+            {
+                sc0 = (scales_raw[sb_even + 4] & 0x0F) | ((scales_raw[sb_even - 4] >> 6) << 4);
+                m0  = (scales_raw[sb_even + 4] >> 4)   | ((scales_raw[sb_even]     >> 6) << 4);
+                sc1 = (scales_raw[sb_odd + 4]  & 0x0F) | ((scales_raw[sb_odd - 4]  >> 6) << 4);
+                m1  = (scales_raw[sb_odd + 4]  >> 4)   | ((scales_raw[sb_odd]      >> 6) << 4);
+            }
+
+            const uint8_t* pair_qs = qs + pair * 32;
+            int chunk_even = sb * 8 + sb_even;
+            int chunk_odd  = sb * 8 + sb_odd;
+
+            const int8_t* xq_even = xq_row + chunk_even * 32;
+            const int8_t* xq_odd  = xq_row + chunk_odd  * 32;
+
+            int dot0 = 0;
+            int dot1 = 0;
+
+            #pragma unroll
+            for (int g = 0; g < 8; g++)
+            {
+                uint32_t qpacked = *reinterpret_cast<const uint32_t*>(pair_qs + g * 4);
+                int lo = (int)(qpacked & 0x0F0F0F0F);
+                int hi = (int)((qpacked >> 4) & 0x0F0F0F0F);
+
+                int xq_e_packed = *reinterpret_cast<const int*>(xq_even + g * 4);
+                int xq_o_packed = *reinterpret_cast<const int*>(xq_odd  + g * 4);
+
+                dot0 = __dp4a(lo, xq_e_packed, dot0);
+                dot1 = __dp4a(hi, xq_o_packed, dot1);
+            }
+
+            float dx_e = __half2float(dx_row[chunk_even]);
+            float dx_o = __half2float(dx_row[chunk_odd]);
+            float sx_e = __half2float(sx2_row[chunk_even * 2 + 0]) + __half2float(sx2_row[chunk_even * 2 + 1]);
+            float sx_o = __half2float(sx2_row[chunk_odd  * 2 + 0]) + __half2float(sx2_row[chunk_odd  * 2 + 1]);
+
+            row_acc += dx_e * (d * (float)sc0 * (float)dot0 - dmin * (float)m0 * sx_e);
+            row_acc += dx_o * (d * (float)sc1 * (float)dot1 - dmin * (float)m1 * sx_o);
+        }
+    }
+
+    // Warp-shfl reduction across the 32 lanes.
+    for (int offset = 16; offset > 0; offset >>= 1)
+        row_acc += __shfl_xor_sync(0xFFFFFFFF, row_acc, offset);
+
+    if (lane == 0)
+        y[(size_t)token * n + row] = __float2half(row_acc);
+}
+
 extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q5_k_mmq_preq(
     const uint8_t* __restrict__ weight,
     const int8_t*  __restrict__ xq_in,
