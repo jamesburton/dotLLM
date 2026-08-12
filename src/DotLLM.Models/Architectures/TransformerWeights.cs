@@ -1123,6 +1123,66 @@ internal sealed class TransformerWeights : IDisposable
     }
 
     /// <summary>
+    /// Throws when <paramref name="config"/> names an architecture that does NOT follow the
+    /// dense Llama-style GGUF tensor naming this loader assumes, and therefore has a dedicated
+    /// model class reached through the per-architecture dispatchers.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Issue #324. Without this guard the load proceeds and dies on
+    /// <c>tensors["blk.0.attn_output.weight"]</c> with a bare
+    /// <see cref="KeyNotFoundException"/> — an error that describes a symptom of a hybrid
+    /// layer (a Gated-DeltaNet or Mamba layer has no attention output projection) rather than
+    /// the actual cause (the caller used the dense loader instead of the dispatcher). That
+    /// misleading message has already cost debugging time twice; the "Explicit rejections"
+    /// block in <c>VulkanModelLoader</c> exists to pre-empt exactly this for the architectures
+    /// it happens to enumerate.
+    /// </para>
+    /// <para>
+    /// This is the single shared choke point for the dense GGUF weight load on <b>every</b>
+    /// backend — <c>TransformerModel</c> (CPU), <c>VulkanTransformerModel</c>,
+    /// <c>CudaTransformerModel</c>, <c>CudaPipelineTransformerModel</c> and
+    /// <c>HybridTransformerModel</c> all funnel through it — so one guard here covers all of
+    /// them. The dedicated model classes have their own weight loaders and never call this
+    /// method, so the check cannot break a legitimate path.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="NotSupportedException">
+    /// The architecture requires a dedicated loader. The message names both the architecture
+    /// and the entry point to use.
+    /// </exception>
+    internal static void ThrowIfArchitectureNeedsDedicatedLoader(ModelConfig config)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+
+        string? why = config.Architecture switch
+        {
+            DotLLM.Core.Configuration.Architecture.NemotronH =>
+                "its Mamba-2 layers carry ssm_in/ssm_out/ssm_conv1d tensors and no attention "
+                + "projections at all",
+            DotLLM.Core.Configuration.Architecture.Qwen3MoeHybrid or DotLLM.Core.Configuration.Architecture.Qwen3HybridDense =>
+                "its Gated-DeltaNet layers carry ssm_in/ssm_out/ssm_conv1d tensors instead of "
+                + "attn_q/attn_k/attn_v/attn_output",
+            DotLLM.Core.Configuration.Architecture.Mamba3 =>
+                "Mamba-3 has no GGUF representation at all (no upstream 'mamba3' value for "
+                + "general.architecture and no GGUF tensor-naming convention) — it is "
+                + "safetensors-first on every backend",
+            _ => null,
+        };
+
+        if (why is null)
+            return;
+
+        throw new NotSupportedException(
+            $"Architecture {config.Architecture} does not use the dense Llama-style GGUF tensor "
+            + $"naming that TransformerWeights.LoadFromGguf assumes, because {why}. Loading it "
+            + "here would fail later with a misleading \"blk.0.attn_output.weight not present\". "
+            + "Load it through the per-architecture dispatcher for your backend instead: "
+            + "ModelLoader.CreateCpuModelFromGguf (CPU), VulkanModelLoader.CreateFromGguf "
+            + "(Vulkan), or CudaModelLoader.CreateFromGguf (CUDA).");
+    }
+
+    /// <summary>
     /// Loads all weight references from an opened GGUF file.
     /// Norm weights are dequantized to <c>float[]</c>. Linear projections stay as mmap pointers.
     /// </summary>
@@ -1138,6 +1198,8 @@ internal sealed class TransformerWeights : IDisposable
     public static TransformerWeights LoadFromGguf(GgufFile gguf, ModelConfig config,
                                                     bool skipF32MoeDequant = false)
     {
+        ThrowIfArchitectureNeedsDedicatedLoader(config);
+
         nint dataBase = gguf.DataBasePointer;
         var tensors = gguf.TensorsByName;
 

@@ -2113,6 +2113,15 @@ public sealed class VulkanTransformerModel : IModel
 
     private static void RejectUnsupportedArchitecture(ModelConfig config)
     {
+        // Architectures with a dedicated Vulkan model class must say so BEFORE the generic
+        // "hybrid unsupported" message below — Qwen3MoeHybrid / Qwen3HybridDense / NemotronH
+        // all carry a HybridLayout, but VulkanQwen3MoeHybridTransformerModel,
+        // VulkanQwen3HybridDenseTransformerModel and VulkanNemotronHTransformerModel exist and
+        // are reached via VulkanModelLoader.CreateFromGguf. Reporting them as "not supported
+        // on the Vulkan backend yet" is simply untrue and sends the caller down a dead end
+        // (issue #324).
+        TransformerWeights.ThrowIfArchitectureNeedsDedicatedLoader(config);
+
         if (config.HybridLayout is not null || config.SsmConfig is not null || config.Mamba3Config is not null)
             throw new NotSupportedException("Hybrid SSM / Mamba architectures are not supported on the Vulkan backend yet.");
         // MLA: latent / hybrid cache modes are CPU-only for now; the Vulkan
