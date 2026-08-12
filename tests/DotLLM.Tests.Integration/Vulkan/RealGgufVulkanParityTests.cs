@@ -292,6 +292,14 @@ public sealed class RealGgufVulkanParityTests
                 + "weights still exceeded available device-local memory on this "
                 + "host. Re-run on a host with more VRAM.");
         }
+        catch (InsufficientMemoryException ex)
+        {
+            // #326. The routed MoE expert banks would be host-dequantised to F32 because at
+            // least one uses a quantization Vulkan cannot keep device-resident (#327). That is
+            // a host-capacity limit, not a CPU↔Vulkan divergence — reporting it as a parity
+            // FAIL misrepresents the sweep. The preflight message itemises the offending banks.
+            Skip.If(true, $"[{label}] {ex.Message}");
+        }
         vkLoadWatch.Stop();
         _output.WriteLine($"[{label}] Vulkan load ({vkLoadWatch.Elapsed.TotalSeconds:F1} s)");
 
