@@ -4390,13 +4390,35 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <summary>
     /// Minimum prefill seqLen (inclusive) at which the batched-MMQ Q4_K kernel is preferred over
     /// the dequant→cuBLAS HGEMM fallback — mirrors llama.cpp's MMVQ_MAX_BATCH_SIZE /
-    /// MMQ_DP4A_MAX_BATCH_SIZE crossover gating (docs/perf/MMA_BATCHED_MMQ.md §1d). Default set
-    /// from the Task 6 benchmark sweep in
-    /// docs/superpowers/plans/2026-08-12-cuda-prefill-batched-mmq.md; override with
-    /// <c>DOTLLM_MMQ_BATCHED_MIN_SEQLEN</c> for A/B comparison.
+    /// MMQ_DP4A_MAX_BATCH_SIZE crossover gating (docs/perf/MMA_BATCHED_MMQ.md §1d).
     /// </summary>
+    /// <remarks>
+    /// <b>KNOWN LIMITATION (Task 6 benchmark sweep, RTX 3060, 2026-08-12) — set to
+    /// <see cref="int.MaxValue"/>, effectively disabled for all realistic prefill lengths.</b>
+    /// Measured on Qwen3-4B-Q4_K_M and the pure Q4_K
+    /// <c>Llama-3.2-1B-pure-Q4_K.gguf</c> ladder fixture (no Q6_K-mixture dilution) across
+    /// <c>-p</c> ∈ {4, 8, 16, 32, 64, 128, 256, 512}: the batched-MMQ path was slower than the
+    /// dequant→cuBLAS fallback at <b>every</b> seqLen ≥ 8 tested, by a margin that *grows* with
+    /// seqLen instead of shrinking (Qwen3-4B: ~2× slower at p=8, ~13x at p=64, ~39x at p=256,
+    /// ~51× at p=512; the dilution-free Llama-3.2-1B pure-Q4_K fixture showed ~22× at p=128,
+    /// i.e. the regression is not a Q4_K_M-mixture artifact). Reproduced with interleaved
+    /// baseline/new-path pairs (ruling out ordering/thermal noise) and confirmed the dispatcher
+    /// gate genuinely fires (prefill tok/s differs sharply at p≥8 vs the p=4 control pair, where
+    /// both paths are identical because the gate is off in both). Root cause (not fixed here —
+    /// out of this task's file scope): <see cref="LaunchQuantizedGemvMmqBatchedQ4K"/> launches
+    /// <c>gridY = ceil(m / MmqBatchMTile)</c> with <c>MmqBatchMTile = 2</c>, so each pair of
+    /// prefill rows re-reads the entire Q4_K weight matrix from global memory independently —
+    /// weight-read volume (and thus wall time) scales ~linearly with seqLen instead of being
+    /// amortized the way cuBLAS's HGEMM tiling amortizes it, which is why per-token prefill cost
+    /// stays roughly flat at decode-GEMV levels (~19–23 ms/token on the 3060) instead of dropping
+    /// as seqLen grows. A real fix needs a larger per-block M-tile (with correspondingly larger
+    /// register/shared-memory reuse across the batch) before this default can be safely lowered;
+    /// track as a follow-up issue. Until then, prefer <c>DOTLLM_DISABLE_MMQ_BATCHED_Q4K=1</c>'s
+    /// effective state (dequant→cuBLAS) for all prefill. Override with
+    /// <c>DOTLLM_MMQ_BATCHED_MIN_SEQLEN</c> for A/B comparison once a fix lands.
+    /// </remarks>
     public static int MmqBatchedMinSeqLen { get; set; } =
-        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_MMQ_BATCHED_MIN_SEQLEN"), out int v) ? v : 8;
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_MMQ_BATCHED_MIN_SEQLEN"), out int v) ? v : int.MaxValue;
 
     /// <summary>True when this MMQ GEMV variant is available for the given quantization type.</summary>
     public bool HasMmq(QuantizationType qt) => qt switch
