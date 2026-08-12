@@ -11,7 +11,7 @@ namespace DotLLM.Vulkan.Kernels;
 /// each (fp16 d, 32-bit qh holding the 5th bit of every element, 16 bytes of
 /// 4-bit qs). Output tile 16×16, K-chunk = 32 elements (one Q5_0 block) —
 /// tile shape and shared-memory staging pattern copied verbatim from
-/// <see cref="MatMulQ3KGemmF32Kernel"/> (the Q8_0 GEMM kernel's 32-element
+/// <see cref="MatMulQ8_0GemmKernel"/> (the Q8_0 GEMM kernel's 32-element
 /// direct-block staging pattern, not a new tile shape). No coopmat path —
 /// follow-up ticket.
 /// </remarks>

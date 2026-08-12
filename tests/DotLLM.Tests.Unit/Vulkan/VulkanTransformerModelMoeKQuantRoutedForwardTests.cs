@@ -256,11 +256,17 @@ public sealed class VulkanTransformerModelMoeKQuantRoutedForwardTests : IDisposa
     /// (<see cref="VulkanWeights.ResolveMoeBankResidency"/>) from the OLD model-global
     /// behavior (<c>if (w1Qt==F32 || w2Qt==F32 || w3Qt==F32) return false</c> collapsed
     /// onto every bank). This fixture mixes quant types on ONE layer — gate/up Q4_K
-    /// (resident-capable), down Q5_0 (no Vulkan kernel in this worktree yet) — so gate/up
+    /// (resident-capable), down Q5_0 (no MoE-indexed Vulkan kernel in this worktree yet) — so gate/up
     /// staying independently resident is only observable if the per-bank aggregation is
     /// real. Reverting <c>ResolveMoeBankResidency</c> to AND across all three banks makes
     /// this test FAIL (verified manually — see task-2-report.md fix-round-1 section).
     /// </summary>
+    /// <remarks>
+    /// "No Vulkan kernel" below means no MoE-INDEXED Q5_0 kernel. #344 added a dense
+    /// (non-routed) Vulkan Q5_0 GEMM/GEMV kernel — <see cref="MoeRoutedRawDeviceQuantType"/>
+    /// deliberately does not extend to it, since MoE-indexed dispatch is a distinct kernel
+    /// family from dense matmul (see <see cref="VulkanWeights.CanKeepBankResident"/>'s XML).
+    /// </remarks>
     [SkippableFact]
     public void ResolveMoeBankResidency_IsPerBank_PartiallyResidentLayerKeepsGateUpResident()
     {
@@ -277,7 +283,7 @@ public sealed class VulkanTransformerModelMoeKQuantRoutedForwardTests : IDisposa
         Assert.True(residency.TryGetValue(DsLeadingDenseBlocks, out var bank));
         Assert.True(bank.Gate, "ffn_gate_exps (Q4_K, 256-aligned) must resolve resident.");
         Assert.True(bank.Up, "ffn_up_exps (Q4_K, 256-aligned) must resolve resident.");
-        Assert.False(bank.Down, "ffn_down_exps (Q5_0) has no Vulkan kernel yet — must NOT resolve resident.");
+        Assert.False(bank.Down, "ffn_down_exps (Q5_0) has no MoE-indexed Vulkan kernel yet — must NOT resolve resident.");
 
         // The model-wide preflight still correctly reports false overall (down blocks the
         // full-skip decision) — the per-bank signal above is what #327 adds beyond this.
@@ -455,7 +461,7 @@ public sealed class VulkanTransformerModelMoeKQuantRoutedForwardTests : IDisposa
     /// Sibling of <see cref="WriteDeepSeekV2Fixture"/> that mixes routed-bank quant types on
     /// the ONE MoE layer instead of using the same type for all three: gate/up are Q4_K
     /// (resident-capable — 256-aligned on <see cref="DsHiddenSize"/>), down is Q5_0 (no
-    /// Vulkan kernel exists in this worktree yet, so it must NOT resolve resident). This is
+    /// MoE-indexed Vulkan kernel exists in this worktree yet, so it must NOT resolve resident). This is
     /// the #327 motivating shape (DeepSeek-V2-Lite Q4_K_M ships mixed-quant routed banks) and
     /// is what distinguishes true per-bank resolution from the old model-global AND — a test
     /// built only on <see cref="WriteDeepSeekV2Fixture"/>'s uniform-type fixtures cannot tell

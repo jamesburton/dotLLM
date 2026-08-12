@@ -32,8 +32,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 // report, and the failure mode is a FALSE PASS (after #344 both this fixture and
 // RealGgufVulkanParityTests' Q8_0 fixture report exactly 1 expanded tensor, so a
 // swapped report still satisfies that class's Assert.Equal(1, ExpandedTensorCount)).
-// Sharing a collection name is what serializes them; verified empirically, see
-// task-7-report.md §Fix round 1.
+// Sharing a collection name is what serializes them; verified empirically (#344).
 [Collection("VulkanResidencyReport")]
 public sealed class RealGgufQ5_0ParityTests
 {
@@ -133,7 +132,6 @@ public sealed class RealGgufQ5_0ParityTests
             Assert.Fail(
                 $"Fixture at {path} contains no Q5_0 tensors. Types present: "
                 + string.Join(", ", typesPresent));
-            return;
         }
 
         // Allocate device buffers ONCE at the maximum tensor size and reuse
@@ -237,7 +235,6 @@ public sealed class RealGgufQ5_0ParityTests
             Assert.Fail(
                 $"Fixture at {path} contains no 2D Q5_0 matmul tensors. Types present: "
                 + string.Join(", ", typesPresent));
-            return;
         }
 
         // Allocate device buffers ONCE at the maximum tensor size and reuse
@@ -366,7 +363,6 @@ public sealed class RealGgufQ5_0ParityTests
             Assert.Fail(
                 $"Fixture at {path} contains no 2D Q5_0 matmul tensors. Types present: "
                 + string.Join(", ", typesPresent));
-            return;
         }
 
         // Allocate device buffers ONCE at the maximum size and reuse them
@@ -645,9 +641,9 @@ public sealed class RealGgufQ5_0ParityTests
     {
         Skip.IfNot(IsVulkanRuntimeAvailable(),
             "Vulkan runtime not available on this host (vulkan-1.dll missing or no compatible device).");
-        spvDir = ResolveSpvDir();
-        Skip.If(spvDir is null || !Directory.Exists(spvDir),
-            $"Vulkan SPV directory not found (resolved: {spvDir ?? "null"}).");
+        spvDir = ResolveSpvDir() ?? string.Empty;
+        Skip.If(spvDir.Length == 0 || !Directory.Exists(spvDir),
+            $"Vulkan SPV directory not found (resolved: {(spvDir.Length == 0 ? "null" : spvDir)}).");
     }
 
     private static bool IsVulkanRuntimeAvailable()
@@ -663,7 +659,7 @@ public sealed class RealGgufQ5_0ParityTests
         }
     }
 
-    private static string ResolveSpvDir()
+    private static string? ResolveSpvDir()
     {
         // The repo ships SPV blobs at native/vulkan/spv/ relative to the
         // repo root. Tests run from bin/Debug/net10.0/, so walk up to the
@@ -675,6 +671,6 @@ public sealed class RealGgufQ5_0ParityTests
             if (Directory.Exists(candidate)) return candidate;
             probe = Path.GetDirectoryName(probe);
         }
-        return null!;
+        return null;
     }
 }

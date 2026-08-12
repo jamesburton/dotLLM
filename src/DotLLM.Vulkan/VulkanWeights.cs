@@ -1337,7 +1337,8 @@ internal sealed class VulkanWeights : IDisposable
 
     /// <summary>
     /// Uploads a single weight matrix. When <paramref name="dequantToFp32"/> is false and
-    /// the source is a quantised format with a matching Vulkan kernel (Q8_0 / Q4_K / Q5_K)
+    /// the source is a quantised format with a matching Vulkan kernel (Q8_0 / Q5_0 / Q2_K /
+    /// Q3_K / Q4_K / Q5_K / Q6_K / the IQ family / I2_S / PQ2_0)
     /// and the contraction axis satisfies the kernel's group-size constraint, the raw
     /// block bytes are copied to device memory verbatim and the returned
     /// <paramref name="deviceQuantType"/> reflects the source format. Otherwise the source

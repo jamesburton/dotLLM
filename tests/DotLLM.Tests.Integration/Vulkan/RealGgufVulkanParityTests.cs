@@ -49,7 +49,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 // concurrently would let one load overwrite the other's report. Critically the
 // failure mode here is a FALSE PASS — the Q5_0 fixture also reports exactly 1
 // expanded tensor, so Assert.Equal(1, residency.ExpandedTensorCount) below could be
-// satisfied while reading the wrong model's report. See task-7-report.md §Fix round 1.
+// satisfied while reading the wrong model's report. Verified empirically (#344).
 [Collection("VulkanResidencyReport")]
 public sealed class RealGgufVulkanParityTests
 {
