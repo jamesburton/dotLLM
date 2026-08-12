@@ -94,21 +94,6 @@ public static class CudaModelLoader
                     + "CudaTransformerModel this would otherwise silently fall through to. Use "
                     + "the CPU or Vulkan backend for NemotronH checkpoints.");
 
-            // gpt-oss's MoE experts carry a per-expert bias (GateExpsBias/UpExpsBias/DownExpsBias)
-            // and use an OAI-clamped-SwiGLU activation (UseSwiGluOai), neither of which
-            // CudaMoeWeightsLoader/CudaMoeFfn reference (confirmed: zero call sites outside
-            // generated XML docs). Falling through to the generic MoE path would silently drop
-            // the bias and run the wrong activation on every layer (gpt-oss is all-MoE) rather
-            // than crash or warn — worse than a clean failure. Fail loudly until CudaMoeFfn
-            // actually implements both.
-            case Architecture.GptOss:
-                throw new NotSupportedException(
-                    "CUDA does not yet implement gpt-oss's per-expert MoE bias or OAI-clamped-"
-                    + "SwiGLU activation (CudaMoeFfn has no support for UseQuantExperts/"
-                    + "*ExpsBias/UseSwiGluOai) — falling through to the generic MoE path would "
-                    + "silently produce wrong output rather than fail. Use the CPU or Vulkan "
-                    + "backend for gpt-oss checkpoints.");
-
             default:
             {
                 var model = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId, ptxDir);

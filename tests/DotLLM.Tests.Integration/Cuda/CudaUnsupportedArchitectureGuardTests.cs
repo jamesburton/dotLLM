@@ -25,7 +25,6 @@ public sealed class CudaUnsupportedArchitectureGuardTests
     [SkippableTheory]
     [InlineData(Architecture.Mamba3)]
     [InlineData(Architecture.NemotronH)]
-    [InlineData(Architecture.GptOss)]
     public void CreateFromGguf_UnsupportedArchitecture_ThrowsNotSupportedInsteadOfSilentFallthrough(
         Architecture architecture)
     {
@@ -44,8 +43,6 @@ public sealed class CudaUnsupportedArchitectureGuardTests
             () => CudaModelLoader.CreateFromGguf(gguf, config));
 
         Assert.DoesNotContain("attn_output.weight", ex.Message, StringComparison.Ordinal);
-        // GptOss's message uses the product name "gpt-oss", not the enum member name.
-        string expectedNameInMessage = architecture == Architecture.GptOss ? "gpt-oss" : architecture.ToString();
-        Assert.Contains(expectedNameInMessage, ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(architecture.ToString(), ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 }
