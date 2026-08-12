@@ -3150,35 +3150,53 @@ public sealed unsafe class CudaTransformerModel : IModel
     }
 
     /// <summary>
-    /// Dispatches projection as cuBLAS HGEMM (prefill) or quantized/cuBLAS GEMV (decode).
-    /// For quantized weights with no persistent FP16 copy (<paramref name="fp16Weight"/> == 0),
-    /// dequantizes on-the-fly into <see cref="CudaForwardState.DequantScratch"/> before calling cuBLAS.
+    /// Dispatches projection as batched-MMQ / cuBLAS HGEMM (prefill) or quantized/cuBLAS GEMV
+    /// (decode). Prefill (seqLen &gt; 1) uses the dp4a-batched-MMQ kernel for Q4_K weights once
+    /// seqLen clears <see cref="CudaKernels.MmqBatchedMinSeqLen"/> (issue #349); otherwise — and
+    /// for every other quant type — falls back to dequant→cuBLAS HGEMM. For quantized weights with
+    /// no persistent FP16 copy (<paramref name="fp16Weight"/> == 0), the fallback dequantizes
+    /// on-the-fly into <see cref="CudaForwardState.DequantScratch"/> before calling cuBLAS.
     /// </summary>
     private void Project(nint quantWeight, QuantizationType qt, nint fp16Weight,
                           nint input, nint output, int outputDim, int inputDim, int seqLen)
     {
         nint s = _stream.Handle;
 
-        if (seqLen > 1) // Prefill: cuBLAS HGEMM
+        if (seqLen > 1) // Prefill
         {
-            nint w = fp16Weight;
-            if (w == 0)
+            // dp4a-batched-MMQ prefill (issue #349 PoC): skip dequant+cuBLAS entirely for Q4_K
+            // once seqLen clears the crossover gate (mirrors llama.cpp's MMVQ_MAX_BATCH_SIZE /
+            // MMQ_DP4A_MAX_BATCH_SIZE-style batch-size dispatch — docs/perf/MMA_BATCHED_MMQ.md §1d).
+            if (quantWeight != 0 && qt == QuantizationType.Q4_K
+                && seqLen >= CudaKernels.MmqBatchedMinSeqLen
+                && (inputDim & 31) == 0 && inputDim <= _state.PreQ8_1ScratchK
+                && _kernels.HasMmqBatchedQ4K)
             {
-                // Quantized: dequant into scratch, then GEMM
-                if (qt == QuantizationType.I2_S && inputDim % I2SBlockSize128 != 0)
-                    // Ragged K (issue #206): the aligned dequant kernel's blocks_per_row=k/128
-                    // integer division would silently drop each row's tail elements.
-                    _kernels.LaunchDequantI2_SToF16Ragged(quantWeight, _state.DequantScratch, outputDim, inputDim, s);
-                else if (qt == QuantizationType.I2_S)
-                    _kernels.LaunchDequantI2_SToF16(quantWeight, _state.DequantScratch, outputDim, inputDim, s);
-                else if (qt == QuantizationType.PQ2_0)
-                    _kernels.LaunchDequantPQ2_0ToF16(quantWeight, _state.DequantScratch, outputDim, inputDim, s);
-                else
-                    _kernels.LaunchDequantToF16(quantWeight, qt, _state.DequantScratch,
-                        outputDim * inputDim, s);
-                w = _state.DequantScratch;
+                _kernels.LaunchQuantizeXToQ8_1Batched(input, _state.PreQ8_1BatchedScratch, inputDim, seqLen, s);
+                _kernels.LaunchQuantizedGemvMmqBatchedQ4K(quantWeight, _state.PreQ8_1BatchedScratch,
+                    output, outputDim, inputDim, seqLen, s);
             }
-            CudaGemm.LinearF16(_cublas.Handle, input, w, output, seqLen, inputDim, outputDim, s);
+            else // Fallback: dequant into scratch, then cuBLAS HGEMM
+            {
+                nint w = fp16Weight;
+                if (w == 0)
+                {
+                    // Quantized: dequant into scratch, then GEMM
+                    if (qt == QuantizationType.I2_S && inputDim % I2SBlockSize128 != 0)
+                        // Ragged K (issue #206): the aligned dequant kernel's blocks_per_row=k/128
+                        // integer division would silently drop each row's tail elements.
+                        _kernels.LaunchDequantI2_SToF16Ragged(quantWeight, _state.DequantScratch, outputDim, inputDim, s);
+                    else if (qt == QuantizationType.I2_S)
+                        _kernels.LaunchDequantI2_SToF16(quantWeight, _state.DequantScratch, outputDim, inputDim, s);
+                    else if (qt == QuantizationType.PQ2_0)
+                        _kernels.LaunchDequantPQ2_0ToF16(quantWeight, _state.DequantScratch, outputDim, inputDim, s);
+                    else
+                        _kernels.LaunchDequantToF16(quantWeight, qt, _state.DequantScratch,
+                            outputDim * inputDim, s);
+                    w = _state.DequantScratch;
+                }
+                CudaGemm.LinearF16(_cublas.Handle, input, w, output, seqLen, inputDim, outputDim, s);
+            }
         }
         else if (CanUseI2SA8Project(qt, seqLen, outputDim, inputDim)) // Decode: I2_S W2A8 GEMV
         {
