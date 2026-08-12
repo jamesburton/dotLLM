@@ -11,7 +11,8 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// architectures it has no dedicated CUDA loader for, instead of silently falling through to the
 /// generic <see cref="CudaTransformerModel"/> — which would either throw a confusing
 /// tensor-not-found error deep inside the generic loader (the #259 failure mode), or worse,
-/// silently produce wrong output on whichever tensors happen to coincide (the gpt-oss MoE case).
+/// silently produce wrong output on whichever tensors happen to coincide (the gpt-oss
+/// attention-sinks/SWA case).
 /// </summary>
 /// <remarks>
 /// The guard fires purely on <c>config.Architecture</c>, before any GGUF tensor is read, so any
@@ -44,8 +45,6 @@ public sealed class CudaUnsupportedArchitectureGuardTests
             () => CudaModelLoader.CreateFromGguf(gguf, config));
 
         Assert.DoesNotContain("attn_output.weight", ex.Message, StringComparison.Ordinal);
-        // GptOss's message uses the product name "gpt-oss", not the enum member name.
-        string expectedNameInMessage = architecture == Architecture.GptOss ? "gpt-oss" : architecture.ToString();
-        Assert.Contains(expectedNameInMessage, ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(architecture.ToString(), ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 }

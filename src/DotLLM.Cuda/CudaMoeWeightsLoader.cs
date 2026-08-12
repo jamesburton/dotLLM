@@ -129,6 +129,14 @@ internal static unsafe class CudaMoeWeightsLoader
                 "CudaMoeWeightsLoader.LoadLayerQuant requires the source MoeLayerWeights to carry " +
                 "raw GGUF quant views (the GGUF MoE loader populates these alongside the F32 dequants).");
 
+        if (moe.SoftmaxAfterTopK && !moe.NormTopKProb)
+            throw new NotSupportedException(
+                "CudaMoeWeightsLoader.LoadLayerQuant: SoftmaxAfterTopK gating requires " +
+                "NormTopKProb=true on CUDA — the GPU forward path implements softmax-after-top-k " +
+                "as softmax-over-all-experts + top-k + renormalize (mathematically equivalent only " +
+                "when the top-k weights are renormalized to sum to 1). A model with " +
+                "SoftmaxAfterTopK=true and NormTopKProb=false is not supported on CUDA.");
+
         int numExperts = moe.NumExperts;
         int hidden = moe.HiddenSize;
         int moeIntermediate = moe.IntermediateSize;
@@ -188,6 +196,11 @@ internal static unsafe class CudaMoeWeightsLoader
             ? UploadF32Array(gateArr, allocs)
             : (nint)0;
 
+        nint routerBiasF32 = moe.RouterBias is float[] rb ? UploadF32Array(rb, allocs) : (nint)0;
+        nint gateExpsBiasF32 = moe.GateExpsBias is float[] gb ? UploadF32Array(gb, allocs) : (nint)0;
+        nint upExpsBiasF32 = moe.UpExpsBias is float[] ub ? UploadF32Array(ub, allocs) : (nint)0;
+        nint downExpsBiasF32 = moe.DownExpsBias is float[] db ? UploadF32Array(db, allocs) : (nint)0;
+
         return new CudaMoeLayerWeights(
             numExperts, moe.NumExpertsPerTok, hidden, moeIntermediate,
             moe.NormTopKProb,
@@ -202,7 +215,12 @@ internal static unsafe class CudaMoeWeightsLoader
             downProjQuantType: moe.DownExpsRawQt,
             sharedGateProjQuantType: sgQt,
             sharedUpProjQuantType: suQt,
-            sharedDownProjQuantType: sdQt);
+            sharedDownProjQuantType: sdQt,
+            routerBiasF32: routerBiasF32,
+            gateExpsBiasF32: gateExpsBiasF32,
+            upExpsBiasF32: upExpsBiasF32,
+            downExpsBiasF32: downExpsBiasF32,
+            useSwiGluOai: moe.UseSwiGluOai);
     }
 
     /// <summary>

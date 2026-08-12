@@ -123,6 +123,22 @@ public static unsafe class CudaMoeFfn
             cublasHandle, hiddenF32, weights.Router, scratch.Logits,
             seqLen, hidden, E, stream);
 
+        // ── Step 2b: additive router bias (gpt-oss, issue #348) ──
+        // MUST run before softmax/top-k — same ordering as ForwardBitNetI2S's identity-MoTE
+        // router bias (bias shifts both the top-k argmax AND the softmax probabilities).
+        // RouterBiasF32 (gpt-oss, #348) and GateBiasF32 (identity-MoTE/BitNet, #246) are both
+        // additive router biases; Forward (unlike ForwardBitNetI2S) may see either depending on
+        // which loader populated this layer, so check both.
+        nint effectiveRouterBias = weights.RouterBiasF32 != 0 ? weights.RouterBiasF32 : weights.GateBiasF32;
+        if (effectiveRouterBias != 0)
+        {
+            if (!kernels.HasMoeGateBiasAdd)
+                throw new InvalidOperationException(
+                    "MoE layer has a router bias but moe_gate_bias_add_f32 is not available. " +
+                    "Recompile native/kernels/moe_ffn.cu to PTX.");
+            kernels.LaunchMoeGateBiasAddF32(scratch.Logits, effectiveRouterBias, seqLen, E, stream);
+        }
+
         // ── Step 3: per-token softmax + top-k selection → device buffers ──
         kernels.LaunchMoeSoftmaxTopk(
             scratch.Logits, scratch.TopkIdx, scratch.TopkWeight,
@@ -224,6 +240,7 @@ public static unsafe class CudaMoeFfn
             && kernels.HasMoeGroupedGemv(weights.GateProjQuantType)
             && kernels.HasMoeGroupedGemv(weights.UpProjQuantType)
             && weights.GateProjQuantType == weights.UpProjQuantType
+            && weights.GateExpsBiasF32 == 0 && weights.UpExpsBiasF32 == 0
             && activeExperts > 0;
 
         // Map global expert id e → local index in the [0, K_active) compacted array.
@@ -295,6 +312,10 @@ public static unsafe class CudaMoeFfn
                     dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
                     gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
                     outputF32: scratch.GateBatch);
+                if (weights.GateExpsBiasF32 != 0)
+                    kernels.LaunchMoeGateBiasAddF32(
+                        scratch.GateBatch, weights.GateExpsBiasF32 + (nint)((long)e * I * sizeof(float)),
+                        seqLen: batch, numExperts: I, stream);
                 ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream,
                     scratch.GatheredInput, batch, K: hidden, M: I,
                     weightF32: weights.UpProj[e],
@@ -302,6 +323,10 @@ public static unsafe class CudaMoeFfn
                     dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
                     gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
                     outputF32: scratch.UpBatch);
+                if (weights.UpExpsBiasF32 != 0)
+                    kernels.LaunchMoeGateBiasAddF32(
+                        scratch.UpBatch, weights.UpExpsBiasF32 + (nint)((long)e * I * sizeof(float)),
+                        seqLen: batch, numExperts: I, stream);
             }
             else
             {
@@ -321,11 +346,29 @@ public static unsafe class CudaMoeFfn
             // 4. SwiGLU element-wise.
             //    Sources rebase into the K_active-laid-out gate/up buffers when
             //    grouped is active; otherwise they read the per-expert buffer at offset 0.
-            kernels.LaunchSwiGLUF32(
-                scratch.GateBatch + (nint)gateOff,
-                scratch.UpBatch + (nint)upOff,
-                scratch.SiluBatch,
-                I, batch, stream);
+            if (weights.UseSwiGluOai)
+            {
+                if (!kernels.HasSwiGluOai)
+                    throw new InvalidOperationException(
+                        "MoE layer requires the gpt-oss clamped SwiGLU activation but " +
+                        "swiglu_oai_f32 is not available. Recompile native/kernels/moe_ffn.cu to PTX.");
+                kernels.LaunchSwiGLUOaiF32(
+                    scratch.GateBatch + (nint)gateOff,
+                    scratch.UpBatch + (nint)upOff,
+                    scratch.SiluBatch,
+                    I, batch,
+                    DotLLM.Cpu.Kernels.MoeQuantSwiGluMlp.SwiGluOaiAlpha,
+                    DotLLM.Cpu.Kernels.MoeQuantSwiGluMlp.SwiGluOaiLimit,
+                    stream);
+            }
+            else
+            {
+                kernels.LaunchSwiGLUF32(
+                    scratch.GateBatch + (nint)gateOff,
+                    scratch.UpBatch + (nint)upOff,
+                    scratch.SiluBatch,
+                    I, batch, stream);
+            }
 
             // 5. GEMM down.
             //    down[batch, hidden] = silu[batch, I] × W2[hidden, I]^T
@@ -338,6 +381,10 @@ public static unsafe class CudaMoeFfn
                 dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
                 gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
                 outputF32: scratch.DownBatch);
+            if (weights.DownExpsBiasF32 != 0)
+                kernels.LaunchMoeGateBiasAddF32(
+                    scratch.DownBatch, weights.DownExpsBiasF32 + (nint)((long)e * hidden * sizeof(float)),
+                    seqLen: batch, numExperts: hidden, stream);
 
             // 6. Per-slot axpy (group by slot to amortise weight lookups). See
             //    DispatchExpertAxpySlots for the slot-grouping strategy.

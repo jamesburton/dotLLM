@@ -94,20 +94,20 @@ public static class CudaModelLoader
                     + "CudaTransformerModel this would otherwise silently fall through to. Use "
                     + "the CPU or Vulkan backend for NemotronH checkpoints.");
 
-            // gpt-oss's MoE experts carry a per-expert bias (GateExpsBias/UpExpsBias/DownExpsBias)
-            // and use an OAI-clamped-SwiGLU activation (UseSwiGluOai), neither of which
-            // CudaMoeWeightsLoader/CudaMoeFfn reference (confirmed: zero call sites outside
-            // generated XML docs). Falling through to the generic MoE path would silently drop
-            // the bias and run the wrong activation on every layer (gpt-oss is all-MoE) rather
-            // than crash or warn — worse than a clean failure. Fail loudly until CudaMoeFfn
-            // actually implements both.
+            // gpt-oss's MoE per-expert bias and OAI-clamped-SwiGLU activation are now
+            // implemented (issue #348) and CudaMoeFfn/CudaMoeWeightsLoader handle them
+            // correctly. However, gpt-oss ALSO requires per-head attention sinks (a learned
+            // scalar per head joining the softmax denominator) and an alternating
+            // sliding-window/dense attention pattern (window on even layers, dense on odd) —
+            // neither exists anywhere in src/DotLLM.Cuda/ or native/kernels/. CUDA attention
+            // would silently run standard GQA with a uniform window, producing wrong output
+            // rather than failing. Fail loudly until both are implemented.
             case Architecture.GptOss:
                 throw new NotSupportedException(
-                    "CUDA does not yet implement gpt-oss's per-expert MoE bias or OAI-clamped-"
-                    + "SwiGLU activation (CudaMoeFfn has no support for UseQuantExperts/"
-                    + "*ExpsBias/UseSwiGluOai) — falling through to the generic MoE path would "
-                    + "silently produce wrong output rather than fail. Use the CPU or Vulkan "
-                    + "backend for gpt-oss checkpoints.");
+                    "CUDA implements GptOss's MoE bias/activation (#348) but not its per-head "
+                    + "attention sinks or its alternating sliding-window/dense attention "
+                    + "pattern — loading would silently produce wrong output rather than fail. "
+                    + "Use the CPU backend for gpt-oss checkpoints.");
 
             default:
             {
