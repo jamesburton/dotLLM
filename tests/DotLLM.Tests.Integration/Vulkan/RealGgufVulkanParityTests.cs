@@ -48,9 +48,11 @@ namespace DotLLM.Tests.Integration.Vulkan;
 // Serializes this class against RealGgufQ5_0ParityTests: both read the mutable
 // static VulkanWeights.LastResidencyReport after loading a model, and running them
 // concurrently would let one load overwrite the other's report. Critically the
-// failure mode here is a FALSE PASS — the Q5_0 fixture also reports exactly 1
-// expanded tensor, so Assert.Equal(1, residency.ExpandedTensorCount) below could be
-// satisfied while reading the wrong model's report. Verified empirically (#344).
+// failure mode is a FALSE PASS, not a crash — the expanded-tensor count is a small
+// integer that another model's report can coincidentally satisfy, so the assertion
+// below can be met while reading the wrong model's report. Verified empirically
+// (#344), and the risk did not go away when #352 took the expected count to 0 —
+// a report from a fully-packed model reads 0 just as readily.
 [Collection("VulkanResidencyReport")]
 public sealed class RealGgufVulkanParityTests
 {
@@ -326,15 +328,25 @@ public sealed class RealGgufVulkanParityTests
             var residency = VulkanWeights.LastResidencyReport;
             Assert.NotNull(residency);
             _output.WriteLine($"[{label}] {residency.Describe()}");
-            // token_embd.weight is unconditionally dequantised to F32 for any source type
-            // other than Q4_K/Q5_K/Q6_K (no GPU gather+dequant kernel for Q8_0/F16 embed
-            // tables — see VulkanWeights.UploadTokenEmbedding) — an intentional, orthogonal
-            // design choice, not a DeviceQuantTypeFor missing-kernel gap. Every other tensor
-            // in an all-Q8_0 model must stay packed. Pin the count to 1 too, so the
-            // assertion still fails if the embed entry ever silently vanishes.
-            Assert.Equal(1, residency.ExpandedTensorCount);
+            // #352 removed the last widening on this model: token_embd.weight used to be
+            // dequantised to F32 unconditionally (no GPU gather+dequant kernel for a Q8_0
+            // embed table), and now stays packed via q8_0_embed_gather_f32. So an all-Q8_0
+            // model must keep EVERY tensor packed — no carve-out. Pinning the count at 0
+            // rather than only listing offenders keeps the assertion able to fail if an
+            // entry silently vanishes from the report instead of being kept resident.
+            Assert.Equal(0, residency.ExpandedTensorCount);
+
+            // ExpandedTensorCount == 0 is satisfied just as well by an entry that VANISHED
+            // from the report as by one kept packed, so the count alone cannot verify the
+            // thing #352 actually changed. Name the tensor and assert it is present and
+            // unexpanded — this is what fails if the resident branch stops reporting.
+            var embed = Assert.Single(
+                residency.Entries, e => e.Name == "token_embd.weight");
+            Assert.False(embed.Expanded,
+                $"[{label}] token_embd.weight widened {embed.Source}->{embed.Device}");
+
             var unexpected = residency.Entries
-                .Where(e => e.Expanded && e.Name != "token_embd.weight")
+                .Where(e => e.Expanded)
                 .ToList();
             Assert.True(unexpected.Count == 0,
                 $"[{label}] unexpected residency expansion: "

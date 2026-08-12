@@ -974,6 +974,11 @@ internal sealed class VulkanWeights : IDisposable
             }
             LastTokenEmbedDequantPath = importedQ8 ? "resident-q8_0-imported" : "resident-q8_0";
             uploadedBytes = q8Bytes;
+            // #352 hand-off to #344: the widening paths below report via UploadMatrix, so
+            // without this the one tensor the residency report exists to track would vanish
+            // from it exactly when it stopped widening — reading as "not uploaded" rather
+            // than "kept packed". Packed == uploaded here, which is the whole point.
+            _residencyReport.Add("token_embd.weight", qt, QuantizationType.Q8_0, q8Bytes, q8Bytes);
             return q8Buf!;
         }
 
