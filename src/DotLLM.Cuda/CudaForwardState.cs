@@ -84,6 +84,14 @@ internal sealed class CudaForwardState : IDisposable
     public nint PreQ8_1Scratch;
     public int  PreQ8_1ScratchK;        // capacity in elements (must be a multiple of 32)
 
+    // Batched pre-Q8_1 input-quantization scratch for prefill (issue #349): holds ALL
+    // seqLen activation rows quantized in one shot, feeding the batched-MMQ prefill
+    // kernel. Grows with EnsureCapacity like the other per-token buffers below (unlike
+    // PreQ8_1Scratch, which is a fixed one-row buffer sized once in the constructor).
+    // Per-row byte count uses the same PreQ8_1ScratchBytes(k) formula as the decode
+    // scratch, with k = PreQ8_1ScratchK (the largest GEMV input dim across call sites).
+    public nint PreQ8_1BatchedScratch;
+
     // Small device buffers for H2D copy of token IDs and positions
     public nint TokenIdsDevice; // [maxSeqLen] int32
     public nint PositionsDevice;// [maxSeqLen] int32
@@ -186,6 +194,7 @@ internal sealed class CudaForwardState : IDisposable
         TokenIdsDevice = AllocDevice((long)newCapacity * sizeof(int));
         PositionsDevice = AllocDevice((long)newCapacity * sizeof(int));
         LoraTmp = AllocDevice((long)newCapacity * MaxLoraRank * half);
+        PreQ8_1BatchedScratch = AllocDevice((long)newCapacity * PreQ8_1ScratchBytes(PreQ8_1ScratchK));
 
         _currentSeqLen = newCapacity;
     }
@@ -232,6 +241,7 @@ internal sealed class CudaForwardState : IDisposable
         FreeIfNonZero(ref TokenIdsDevice);
         FreeIfNonZero(ref PositionsDevice);
         FreeIfNonZero(ref LoraTmp);
+        FreeIfNonZero(ref PreQ8_1BatchedScratch);
     }
 
     public void Dispose()

@@ -97,6 +97,7 @@ public sealed unsafe class CudaKernels : IDisposable
     // Stage 1 work that scales with output dim n (n× for MMVQ-large, n/4× for MMQ-4-rows).
     private readonly CudaModule? _quantizeXModule;
     private readonly nint _quantizeXToQ8_1Func;
+    private readonly nint _quantizeXToQ8_1BatchedFunc;
 
     // TurboQuant (MSE-stage) KV codec — optional module (turboquant.ptx). The CUDA port of the
     // Vulkan turboquant_{dequant,encode}_f32 shaders. 0 funcs when the PTX is absent/stale.
@@ -117,6 +118,10 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ6_KMmvqLargePreqFunc;
     private readonly nint _quantizedGemvIQ4_NLMmvqLargePreqFunc;
     private readonly nint _quantizedGemvIQ4_XSMmvqLargePreqFunc;
+    // Batched-M dp4a MMQ prefill kernel (issue #349) — amortizes weight reads across
+    // MmqBatchedMinSeqLen prefill tokens per block via L1/L2 cache reuse (see
+    // native/kernels/quantized_gemv_mmq.cu for the kernel body). Q4_K only for this PoC.
+    private readonly nint _quantizedGemvQ4_KMmqBatchedFunc;
     /// <summary>
     /// Device's maximum opt-in dynamic shared-memory bytes per block (queried once at
     /// kernel-load via CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN). The
@@ -582,6 +587,9 @@ public sealed unsafe class CudaKernels : IDisposable
             _quantizedGemvQ6_KMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmvq_large_preq");
             _quantizedGemvIQ4_NLMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_nl_mmvq_large_preq");
             _quantizedGemvIQ4_XSMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_xs_mmvq_large_preq");
+            // Batched-M prefill kernel (issue #349) — TryGetFunction so a stale PTX
+            // without the new symbol still loads; HasMmqBatchedQ4K reports false.
+            _quantizedGemvQ4_KMmqBatchedFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmq_batched");
 
             // The on-the-fly MMQ kernels size their per-chunk Stage 1 scratch (s_xq/s_dx/s_sx[2])
             // dynamically from `k`. For k up to ~12 KiB-shmem-worth (Qwen3-8B intermediate=12288)
@@ -614,6 +622,7 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             _quantizeXModule = CudaModule.LoadFromFile(quantizeXPath);
             _quantizeXToQ8_1Func = _quantizeXModule.GetFunction("quantize_x_to_q8_1");
+            _quantizeXToQ8_1BatchedFunc = _quantizeXModule.TryGetFunction("quantize_x_to_q8_1_batched");
         }
 
         string turboquantPath = Path.Combine(ptxDir, "turboquant.ptx");
@@ -4322,6 +4331,15 @@ public sealed unsafe class CudaKernels : IDisposable
     /// Override: <c>DOTLLM_DISABLE_PREQ8_1=1</c>.</summary>
     public bool HasPreQ8_1 => _quantizeXToQ8_1Func != 0 && !DisablePreQ8_1;
 
+    /// <summary>
+    /// True when the batched-M dp4a MMQ Q4_K prefill kernel AND its batched input-quantization
+    /// companion are both loaded (issue #349 proof of concept — Q4_K only). Gates the prefill
+    /// dispatcher in <c>CudaTransformerModel.Project</c>: when true (and <see cref="MmqBatchedMinSeqLen"/>
+    /// is met), prefill skips dequant→cuBLAS HGEMM entirely for Q4_K weights.
+    /// </summary>
+    public bool HasMmqBatchedQ4K => _quantizedGemvQ4_KMmqBatchedFunc != 0 && _quantizeXToQ8_1BatchedFunc != 0
+        && !DisableQuantizedGemv && !DisableMmqBatchedQ4K;
+
     /// <summary>Test/benchmark hook to force the legacy Q2_K GEMV kernel even when MMQ is loaded.</summary>
     public static bool DisableMmqQ2K { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_Q2K") == "1";
 
@@ -4363,6 +4381,22 @@ public sealed unsafe class CudaKernels : IDisposable
     /// buffer awkward to size. Default off — pre-Q8_1 is the recommended path.</remarks>
     public static bool DisablePreQ8_1 { get; set; } =
         Environment.GetEnvironmentVariable("DOTLLM_DISABLE_PREQ8_1") == "1";
+
+    /// <summary>Test/benchmark hook to force the dequant→cuBLAS prefill fallback even when the
+    /// batched-MMQ Q4_K kernel is loaded. Override: <c>DOTLLM_DISABLE_MMQ_BATCHED_Q4K=1</c>.</summary>
+    public static bool DisableMmqBatchedQ4K { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_BATCHED_Q4K") == "1";
+
+    /// <summary>
+    /// Minimum prefill seqLen (inclusive) at which the batched-MMQ Q4_K kernel is preferred over
+    /// the dequant→cuBLAS HGEMM fallback — mirrors llama.cpp's MMVQ_MAX_BATCH_SIZE /
+    /// MMQ_DP4A_MAX_BATCH_SIZE crossover gating (docs/perf/MMA_BATCHED_MMQ.md §1d). Default set
+    /// from the Task 6 benchmark sweep in
+    /// docs/superpowers/plans/2026-08-12-cuda-prefill-batched-mmq.md; override with
+    /// <c>DOTLLM_MMQ_BATCHED_MIN_SEQLEN</c> for A/B comparison.
+    /// </summary>
+    public static int MmqBatchedMinSeqLen { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_MMQ_BATCHED_MIN_SEQLEN"), out int v) ? v : 8;
 
     /// <summary>True when this MMQ GEMV variant is available for the given quantization type.</summary>
     public bool HasMmq(QuantizationType qt) => qt switch
@@ -4654,6 +4688,77 @@ public sealed unsafe class CudaKernels : IDisposable
                     gridDim, 1, 1, BlockSize, 1, 1,
                     dynShmem, stream, (nint)args, 0).ThrowOnError();
         }
+    }
+
+    /// <summary>
+    /// Batched pre-Q8_1 input quantization for prefill (issue #349). Quantizes
+    /// <paramref name="x"/>[m, k] (row-major, row stride k) to INT8 in ONE launch covering all
+    /// m activation rows, instead of m separate <see cref="LaunchQuantizeXToQ8_1"/> calls.
+    /// Scratch layout is the single-row layout's sections concatenated by row (NOT interleaved
+    /// per-row blocks): <c>int8_t xq[m,k] | half dx[m,k/32] | half sx2[m,k/16]</c>, each section
+    /// itself row-major with row stride k, k/32, k/16 respectively. Size the scratch as
+    /// <c>m * CudaForwardState.PreQ8_1ScratchBytes(k)</c> bytes. Consumed by
+    /// <see cref="LaunchQuantizedGemvMmqBatchedQ4K"/>.
+    /// </summary>
+    public void LaunchQuantizeXToQ8_1Batched(nint x, nint scratch, int k, int m, nint stream)
+    {
+        if (_quantizeXToQ8_1BatchedFunc == 0)
+            throw new InvalidOperationException(
+                "Batched pre-Q8_1 quantization kernel not available. Compile native/kernels/quantize_x.cu to PTX.");
+        if ((k & 31) != 0)
+            throw new ArgumentException($"k must be a multiple of 32 (got {k}).", nameof(k));
+
+        int numChunks = k >> 5;
+        nint xqPtr  = scratch;
+        nint dxPtr  = scratch + (nint)((long)m * k);
+        nint sx2Ptr = dxPtr + (nint)((long)m * numChunks * 2);
+
+        nint xArg = x, xqArg = xqPtr, dxArg = dxPtr, sx2Arg = sx2Ptr;
+        int kArg = k;
+        void** args = stackalloc void*[] { &xArg, &xqArg, &dxArg, &sx2Arg, &kArg };
+
+        // Must mirror QX_THREADS_X / QX_WARPS_PER_BLOCK in quantize_x.cu (32 × 8 = 256).
+        const uint QxThreadsX = 32;
+        const uint QxWarpsPerBlock = 8;
+        uint gridX = (uint)((numChunks + QxWarpsPerBlock - 1) / QxWarpsPerBlock);
+        CudaDriverApi.cuLaunchKernel(_quantizeXToQ8_1BatchedFunc,
+                gridX, (uint)m, 1, QxThreadsX, QxWarpsPerBlock, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Batched-M dp4a MMQ prefill GEMV for Q4_K (issue #349 proof of concept). Computes
+    /// <c>Y[m, n] = X[m, k] × W[n, k]^T</c> for Q4_K-quantized W in a single launch — replacing
+    /// the dequant→cuBLAS HGEMM prefill fallback. Requires <paramref name="preqScratch"/> to
+    /// already hold the output of <see cref="LaunchQuantizeXToQ8_1Batched"/> for the same x/k/m.
+    /// Gate calls with <see cref="HasMmqBatchedQ4K"/>.
+    /// </summary>
+    public void LaunchQuantizedGemvMmqBatchedQ4K(nint quantWeight, nint preqScratch,
+                                                   nint y, int n, int k, int m, nint stream)
+    {
+        if (_quantizedGemvQ4_KMmqBatchedFunc == 0)
+            throw new InvalidOperationException(
+                "Batched MMQ GEMV kernel not available. Compile native/kernels/quantized_gemv_mmq.cu to PTX.");
+
+        int numChunks = k >> 5;
+        nint xqPtr  = preqScratch;
+        nint dxPtr  = preqScratch + (nint)((long)m * k);
+        nint sx2Ptr = dxPtr + (nint)((long)m * numChunks * 2);
+
+        nint wArg = quantWeight, xqArg = xqPtr, dxArg = dxPtr, sx2Arg = sx2Ptr, yArg = y;
+        int nArg = n, kArg = k, mArg = m;
+        void** args = stackalloc void*[] { &wArg, &xqArg, &dxArg, &sx2Arg, &yArg, &nArg, &kArg, &mArg };
+
+        // Must mirror MMQ_ROWS_PER_BLOCK / MMQ_BATCH_M_TILE in quantized_gemv_mmq.cu.
+        const int MmqRowsPerBlock = 4;
+        const int MmqBatchMTile = 2;
+        uint gridX = (uint)((n + MmqRowsPerBlock - 1) / MmqRowsPerBlock);
+        uint gridY = (uint)((m + MmqBatchMTile - 1) / MmqBatchMTile);
+
+        // No dynamic shmem — pure register + warp-shfl accumulation, no budget check needed.
+        CudaDriverApi.cuLaunchKernel(_quantizedGemvQ4_KMmqBatchedFunc,
+                gridX, gridY, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>MMQ-GEMV-specific overload of <see cref="CheckDynamicSharedBudget(uint, string)"/>.</summary>
