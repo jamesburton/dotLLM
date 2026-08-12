@@ -173,6 +173,255 @@ public sealed class RealGgufQ3KDequantParityTests
             + "decode diverges from real llama.cpp-quantised bytes.");
     }
 
+    /// <summary>
+    /// F32-in prefill GEMM (<c>matmul_q3_k_f32_gemm</c>) on real GGUF bytes. Same weight
+    /// decode as the GEMV but a different traversal (16×16 output tile, one thread per
+    /// output cell, K-chunk = one 16-element sub-block), so a layout error can live in one
+    /// and not the other.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(6)]   // the shape RealGgufVulkanParityTests actually prefills
+    [InlineData(68)]  // > one TILE_N, so the tile loop is exercised rather than masked away
+    public void Bielik15B_Q3_K_RealGgufBytes_VulkanGemm_MatchesCpuReference(int n)
+    {
+        RunRealGgufMatMulParity(n, MatMulFlavour.GemmF32);
+    }
+
+    /// <summary>
+    /// dp4a prefill GEMM (<c>matmul_q3_k_mmq</c>) on real GGUF bytes. This is the kernel the
+    /// failing end-to-end Bielik parity test actually dispatches for its 6-token prefill
+    /// (MMQ is enabled by default wherever the device advertises integer dot product).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(6)]
+    [InlineData(68)]
+    public void Bielik15B_Q3_K_RealGgufBytes_VulkanMmq_MatchesCpuReference(int n)
+    {
+        RunRealGgufMatMulParity(n, MatMulFlavour.Mmq);
+    }
+
+    /// <summary>
+    /// dp4a decode GEMV (<c>matmul_q3_k_mmvq</c>) on real GGUF bytes — the kernel that
+    /// actually serves decode when integer dot product is available (the F32
+    /// <c>matmul_q3_k_f32_gemv</c> already covered above is only the fallback).
+    /// </summary>
+    [SkippableFact]
+    public void Bielik15B_Q3_K_RealGgufBytes_VulkanMmvq_MatchesCpuReference()
+    {
+        RunRealGgufMatMulParity(1, MatMulFlavour.Mmvq);
+    }
+
+    private enum MatMulFlavour { GemmF32, Mmq, Mmvq }
+
+    /// <summary>Rows per tensor. Keeps the O(n·m·k) double-precision CPU reference bounded.</summary>
+    private const int MatMulMaxRows = 64;
+
+    /// <summary>Tensors per run. 129 × the reference cost would dominate the suite.</summary>
+    private const int MaxTensors = 24;
+
+    /// <summary>
+    /// Int8-activation drift bound, matching the fixture-based MMQ/MMVQ tests
+    /// (<c>VulkanMatMulQ3KMmqKernelTests.RelTol</c> = 3e-2,
+    /// <c>VulkanMatMulQ3KMmvqKernelTests.RelTol</c> = 6e-2). A layout disagreement moves
+    /// outputs by O(1) relative, orders of magnitude above this.
+    /// </summary>
+    private static float RelTolFor(MatMulFlavour flavour) => flavour switch
+    {
+        MatMulFlavour.GemmF32 => 2e-2f, // F32 activations: only reduction-order drift
+        MatMulFlavour.Mmq     => 3e-2f,
+        _                     => 6e-2f,
+    };
+
+    private void RunRealGgufMatMulParity(int n, MatMulFlavour flavour)
+    {
+        FixtureLocation fixture = TestFixtureResolver.ResolveFile(
+            "DOTLLM_BIELIK_15B_Q3_K_M_GGUF", "second-state", "Bielik-1.5B-v3.0-Instruct-GGUF",
+            "Bielik-1.5B-v3.0-Instruct-Q3_K_M.gguf");
+        Skip.If(!fixture.Found, fixture.SkipMessage("Bielik-1.5B Q3_K_M GGUF"));
+
+        string? spvDir = ResolveSpvDir();
+        Skip.If(spvDir is null || !Directory.Exists(spvDir),
+            $"Vulkan SPV directory not found (resolved: {spvDir ?? "null"}).");
+
+        using GgufFile gguf = GgufFile.Open(fixture.Path!);
+        using var device = VulkanDevice.Create();
+
+        bool needsDp4a = flavour != MatMulFlavour.GemmF32;
+        Skip.If(needsDp4a && !device.HasIntegerDotProduct,
+            "Device does not advertise VK_KHR_shader_integer_dot_product — MMQ/MMVQ unavailable.");
+
+        // Enumerate the tensors first so every buffer can be sized to the largest case and
+        // then REUSED. Allocating per tensor would recycle Vulkan buffer handles into each
+        // kernel's handle-keyed DescriptorSetCache and silently bind a dead, smaller buffer.
+        var tensors = new List<(string Name, int K, int M, long DataOffset)>();
+        foreach (GgufTensorDescriptor t in gguf.Tensors)
+        {
+            if (t.QuantizationType != QuantizationType.Q3_K || t.Shape.Rank != 2) continue;
+            int tk = t.Shape[0];
+            if (tk % Q3KGroupSize != 0 || t.Shape[1] <= 0) continue;
+            tensors.Add((t.Name, tk, Math.Min(t.Shape[1], MatMulMaxRows), (long)t.DataOffset));
+            if (tensors.Count >= MaxTensors) break;
+        }
+        Assert.True(tensors.Count > 0,
+            "No 2-D Q3_K tensor found to exercise the matmul path. Types present: "
+            + string.Join(", ", gguf.Tensors.GroupBy(t => t.QuantizationType)
+                .OrderByDescending(g => g.Count()).Select(g => $"{g.Key}×{g.Count()}")));
+
+        int maxK = tensors.Max(t => t.K);
+        int maxRows = tensors.Max(t => t.M);
+        long maxWeightBytes = tensors.Max(t => (long)t.M * (t.K / Q3KGroupSize) * Q3KBlockBytes);
+
+        using var bufW = device.Allocate((maxWeightBytes + 3) & ~3L);
+        using var bufB = device.Allocate((long)n * maxK * sizeof(float));
+        using var bufC = device.Allocate((long)n * maxRows * sizeof(float));
+
+        MatMulQ3KGemmF32Kernel? gemm = null;
+        MatMulQ3KMmqKernel? mmq = null;
+        MatMulQ3KMmvqKernel? mmvq = null;
+        QuantizeQ8_1RowsKernel? quantRows = null;
+        QuantizeQ8_1Kernel? quantOne = null;
+        VulkanDevice.Buffer? bufXq = null, bufXds = null;
+
+        try
+        {
+            switch (flavour)
+            {
+                case MatMulFlavour.GemmF32:
+                    gemm = MatMulQ3KGemmF32Kernel.Create(device, spvDir!);
+                    break;
+                case MatMulFlavour.Mmq:
+                    quantRows = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir!)
+                        ?? throw new Xunit.Sdk.XunitException("quantize_q8_1_rows.spv missing.");
+                    mmq = MatMulQ3KMmqKernel.TryCreate(device, spvDir!)
+                        ?? throw new Xunit.Sdk.XunitException("matmul_q3_k_mmq.spv missing.");
+                    bufXq = device.Allocate(QuantizeQ8_1RowsKernel.PackedBytes(n, maxK));
+                    bufXds = device.Allocate(QuantizeQ8_1RowsKernel.ScaleBytes(n, maxK));
+                    break;
+                default:
+                    quantOne = QuantizeQ8_1Kernel.TryCreate(device, spvDir!)
+                        ?? throw new Xunit.Sdk.XunitException("quantize_q8_1.spv missing.");
+                    mmvq = MatMulQ3KMmvqKernel.TryCreate(device, spvDir!)
+                        ?? throw new Xunit.Sdk.XunitException("matmul_q3_k_mmvq.spv missing.");
+                    bufXq = device.Allocate(QuantizeQ8_1Kernel.PackedBytes(maxK));
+                    bufXds = device.Allocate(QuantizeQ8_1Kernel.ScaleBytes(maxK));
+                    break;
+            }
+
+            float relTol = RelTolFor(flavour);
+            int tensorsChecked = 0, worstErrors = 0;
+            double worstRel = 0;
+            string worstWhere = "(none)";
+
+            for (int ti = 0; ti < tensors.Count; ti++)
+            {
+                (string name, int k, int m, long dataOffset) = tensors[ti];
+                int blocksPerRow = k / Q3KGroupSize;
+                int byteCount = m * blocksPerRow * Q3KBlockBytes;
+
+                var raw = new byte[byteCount];
+                unsafe
+                {
+                    new ReadOnlySpan<byte>((void*)(gguf.DataBasePointer + (nint)dataOffset), byteCount)
+                        .CopyTo(raw);
+                }
+
+                var rng = new Random(0x3CAFE1 ^ (ti * 7919) ^ (n * 31));
+                var b = new float[(long)n * k];
+                for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+
+                // Reference: dequantise with the llama.cpp-anchored CPU oracle, then a plain
+                // F32 matmul. Independent of the packed weight decode under test.
+                var w = new float[(long)m * k];
+                unsafe
+                {
+                    fixed (byte* rawPtr = raw) Dequantize.DequantizeQ3_K((nint)rawPtr, (long)m * k, w);
+                }
+                var expected = new float[(long)n * m];
+                for (int t = 0; t < n; t++)
+                {
+                    long bBase = (long)t * k;
+                    for (int row = 0; row < m; row++)
+                    {
+                        double acc = 0;
+                        long wBase = (long)row * k;
+                        for (int i = 0; i < k; i++) acc += (double)w[wBase + i] * b[bBase + i];
+                        expected[(long)t * m + row] = (float)acc;
+                    }
+                }
+
+                device.Upload(new ReadOnlySpan<byte>(raw), bufW);
+                device.Upload(b, bufB);
+
+                var actual = new float[(long)n * m];
+                if (flavour == MatMulFlavour.GemmF32)
+                {
+                    gemm!.Launch(bufW, bufB, bufC, m, k, n);
+                }
+                else
+                {
+                    using var ctx = device.CreateSubmitContext();
+                    ctx.Begin();
+                    if (flavour == MatMulFlavour.Mmq)
+                    {
+                        quantRows!.Record(ctx.CommandBuffer, bufB, bufXq!, bufXds!, n, k);
+                        KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+                        mmq!.Record(ctx.CommandBuffer, bufW, bufXq!, bufXds!, bufC, m, k, n);
+                    }
+                    else
+                    {
+                        quantOne!.Record(ctx.CommandBuffer, bufB, bufXq!, bufXds!, k);
+                        KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+                        mmvq!.Record(ctx.CommandBuffer, bufW, bufXq!, bufXds!, bufC, m, k);
+                    }
+                    ctx.SubmitAndWait();
+                }
+                device.Download(bufC, actual);
+
+                // rms-relative bound, same shape as the fixture-based MMQ/MMVQ assertions.
+                double ss = 0;
+                for (int i = 0; i < expected.Length; i++) ss += (double)expected[i] * expected[i];
+                float absTol = MathF.Max((float)Math.Sqrt(ss / expected.Length), 1e-6f) * relTol;
+
+                for (int i = 0; i < expected.Length; i++)
+                {
+                    float e = expected[i], a = actual[i];
+                    float diff = MathF.Abs(e - a);
+                    float rel = diff / MathF.Max(MathF.Abs(e), 1e-7f);
+                    // Track the worst observed relative error unconditionally — a green run
+                    // that reports "0" says nothing about how much headroom the bound has.
+                    if (rel > worstRel && MathF.Abs(e) > absTol)
+                    {
+                        worstRel = rel;
+                        worstWhere = $"{name} [n={n},m={m},k={k}] token {i / m} row {i % m} "
+                            + $"(cpu={e:R} vulkan={a:R}, absTol={absTol:G6})";
+                    }
+                    if (diff > absTol && rel > relTol) worstErrors++;
+                }
+
+                tensorsChecked++;
+            }
+
+            _output.WriteLine(
+                $"[Q3_K real-bytes {flavour} n={n}] tensors={tensorsChecked} "
+                + $"out-of-tolerance cells={worstErrors} worst rel={worstRel:E3} at {worstWhere}");
+            Assert.True(worstErrors == 0,
+                $"Vulkan Q3_K {flavour} disagrees with the CPU oracle on real GGUF bytes: "
+                + $"{worstErrors} out-of-tolerance cells, worst relative error {worstRel:E3} at {worstWhere}. "
+                + "The fixture-based test for this kernel passes, so the packed weight decode "
+                + "diverges on real llama.cpp-quantised bytes.");
+        }
+        finally
+        {
+            bufXq?.Dispose();
+            bufXds?.Dispose();
+            gemm?.Dispose();
+            mmq?.Dispose();
+            mmvq?.Dispose();
+            quantRows?.Dispose();
+            quantOne?.Dispose();
+        }
+    }
+
     private void AssertRealGgufQ3KDequantParity(string ggufPath)
     {
         string? spvDir = ResolveSpvDir();
