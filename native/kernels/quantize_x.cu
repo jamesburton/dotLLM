@@ -77,3 +77,63 @@ extern "C" __global__ void __launch_bounds__(QX_THREADS) quantize_x_to_q8_1(
         sx2[chunk * 2 + 1] = __float2half((float)s);
     }
 }
+
+// Batched variant of quantize_x_to_q8_1 (issue #349): quantizes ALL m activation
+// rows (prefill tokens) of x[m, k] in ONE launch instead of m separate launches.
+// Adds a second grid dimension (blockIdx.y = token) on top of the identical
+// per-chunk math; output layout is the single-row layout's THREE SECTIONS
+// concatenated by row (int8_t xq[m,k] | half dx[m,k/32] | half sx2[m,k/16]),
+// each section itself row-major — NOT interleaved per-token blocks. This
+// mirrors quantize_x_to_q8_1's own single-row layout, scaled by m; see
+// CudaForwardState.PreQ8_1ScratchBytes(k) for the per-row byte count (the
+// batched scratch is m * PreQ8_1ScratchBytes(k) bytes total).
+extern "C" __global__ void __launch_bounds__(QX_THREADS) quantize_x_to_q8_1_batched(
+    const half* __restrict__ x,     // [m, k] half, row stride k
+    int8_t* __restrict__ xq,        // [m, k] int8, row stride k
+    half*   __restrict__ dx,        // [m, k/32] half, row stride k/32
+    half*   __restrict__ sx2,       // [m, k/16] half, row stride k/16
+    const int k)
+{
+    const int num_chunks = k >> 5;          // k / 32
+    const int warp_id = threadIdx.y;        // 0..QX_WARPS_PER_BLOCK-1
+    const int lane    = threadIdx.x;        // 0..31
+    const int chunk   = blockIdx.x * QX_WARPS_PER_BLOCK + warp_id;
+    const int token   = blockIdx.y;
+    if (chunk >= num_chunks) return;
+
+    const half* x_row     = x   + (size_t)token * k;
+    int8_t* xq_row         = xq  + (size_t)token * k;
+    half*   dx_row          = dx  + (size_t)token * num_chunks;
+    half*   sx2_row         = sx2 + (size_t)token * num_chunks * 2;
+
+    const int idx = chunk * 32 + lane;
+    float v = __half2float(x_row[idx]);
+    float a = fabsf(v);
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        float other = __shfl_xor_sync(0xFFFFFFFF, a, offset);
+        a = fmaxf(a, other);
+    }
+
+    float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
+    int qi = __float2int_rn(v * inv_scale);
+    qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
+    xq_row[idx] = (int8_t)qi;
+
+    int s = qi;
+    #pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1)
+        s += __shfl_xor_sync(0xFFFFFFFF, s, offset);
+
+    if (lane == 0)
+    {
+        dx_row[chunk] = __float2half(a / 127.0f);
+        sx2_row[chunk * 2 + 0] = __float2half((float)s);
+    }
+    if (lane == 16)
+    {
+        sx2_row[chunk * 2 + 1] = __float2half((float)s);
+    }
+}
