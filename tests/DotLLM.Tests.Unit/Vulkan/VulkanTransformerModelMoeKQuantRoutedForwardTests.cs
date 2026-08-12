@@ -250,6 +250,86 @@ public sealed class VulkanTransformerModelMoeKQuantRoutedForwardTests : IDisposa
         => VulkanWeights.CanSkipMoeF32HostDequant(device, gguf, config);
 
     /// <summary>
+    /// #327's actual scenario, and the gap a prior review found: the OTHER preflight tests
+    /// in this file only exercise fully-K-quant-resident fixtures (all three banks resolve
+    /// the same way), so they never distinguish per-bank resolution
+    /// (<see cref="VulkanWeights.ResolveMoeBankResidency"/>) from the OLD model-global
+    /// behavior (<c>if (w1Qt==F32 || w2Qt==F32 || w3Qt==F32) return false</c> collapsed
+    /// onto every bank). This fixture mixes quant types on ONE layer — gate/up Q4_K
+    /// (resident-capable), down Q5_0 (no MoE-indexed Vulkan kernel in this worktree yet) — so gate/up
+    /// staying independently resident is only observable if the per-bank aggregation is
+    /// real. Reverting <c>ResolveMoeBankResidency</c> to AND across all three banks makes
+    /// this test FAIL (verified manually — see task-2-report.md fix-round-1 section).
+    /// </summary>
+    /// <remarks>
+    /// "No Vulkan kernel" below means no MoE-INDEXED Q5_0 kernel. #344 added a dense
+    /// (non-routed) Vulkan Q5_0 GEMM/GEMV kernel — <see cref="MoeRoutedRawDeviceQuantType"/>
+    /// deliberately does not extend to it, since MoE-indexed dispatch is a distinct kernel
+    /// family from dense matmul (see <see cref="VulkanWeights.CanKeepBankResident"/>'s XML).
+    /// </remarks>
+    [SkippableFact]
+    public void ResolveMoeBankResidency_IsPerBank_PartiallyResidentLayerKeepsGateUpResident()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+
+        string path = WriteDeepSeekV2MixedResidencyFixture();
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+
+        var residency = VulkanWeights.ResolveMoeBankResidency(device, gguf, config);
+
+        // Layer DsLeadingDenseBlocks (index 1) is the fixture's single MoE layer.
+        Assert.True(residency.TryGetValue(DsLeadingDenseBlocks, out var bank));
+        Assert.True(bank.Gate, "ffn_gate_exps (Q4_K, 256-aligned) must resolve resident.");
+        Assert.True(bank.Up, "ffn_up_exps (Q4_K, 256-aligned) must resolve resident.");
+        Assert.False(bank.Down, "ffn_down_exps (Q5_0) has no MoE-indexed Vulkan kernel yet — must NOT resolve resident.");
+
+        // The model-wide preflight still correctly reports false overall (down blocks the
+        // full-skip decision) — the per-bank signal above is what #327 adds beyond this.
+        Assert.False(VulkanWeights.CanSkipMoeF32HostDequant(device, gguf, config));
+    }
+
+    /// <summary>
+    /// The #326 preflight's footprint must equal what the #327 per-bank load will ACTUALLY
+    /// allocate. These two landed on separate branches — #326 wrote its accounting while the
+    /// skip was still model-global ("all 78 banks get F32'd"), and #327 then made the skip
+    /// per-bank without the accounting following it. Charging every bank of every MoE layer
+    /// over-reports the footprint, which matters because
+    /// <see cref="VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable"/> turns that number into
+    /// a hard refusal — an over-report can refuse a load the per-bank path just made fit.
+    /// </summary>
+    /// <remarks>
+    /// Discriminating by construction: this fixture's single MoE layer has gate/up resident
+    /// (Q4_K) and only down falling back (Q5_0), so the correct answer is ONE bank's worth of
+    /// F32 and the old all-or-nothing answer is THREE — a 3x margin, not a tolerance question.
+    /// </remarks>
+    [SkippableFact]
+    public void PlanMoeF32HostDequant_ChargesOnlyTheBanksThatActuallyFallBack()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+
+        string path = WriteDeepSeekV2MixedResidencyFixture();
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+
+        var plan = VulkanWeights.PlanMoeF32HostDequant(device, gguf, config);
+
+        // One expert bank, F32: numExperts * sizeof(float) * moeIntermediate * hiddenSize.
+        const long OneBankF32Bytes = (long)DsNumExperts * sizeof(float) * DsMoeIntermediate * DsHiddenSize;
+
+        Assert.False(plan.CanSkip);
+        Assert.Equal(3, plan.TotalBanks);
+        var fallback = Assert.Single(plan.Fallbacks);
+        Assert.Equal("ffn_down_exps.weight", fallback.Bank);
+        Assert.Equal(QuantizationType.Q5_0, fallback.Quant);
+
+        Assert.Equal(OneBankF32Bytes, plan.HostF32Bytes);
+        Assert.NotEqual(3 * OneBankF32Bytes, plan.HostF32Bytes); // the pre-#327 all-or-nothing answer
+    }
+
+    /// <summary>
     /// Reflects into the Vulkan model's PRIVATE <c>_weights</c> field (the only part not
     /// reachable via InternalsVisibleTo) to read the on-device quant type each routed
     /// bank (gate/down/up) actually resolved to for the given layer — the same fields
@@ -414,6 +494,112 @@ public sealed class VulkanTransformerModelMoeKQuantRoutedForwardTests : IDisposa
         string path = b.WriteToTempFile();
         _tempFiles.Add(path);
         return path;
+    }
+
+    /// <summary>
+    /// Sibling of <see cref="WriteDeepSeekV2Fixture"/> that mixes routed-bank quant types on
+    /// the ONE MoE layer instead of using the same type for all three: gate/up are Q4_K
+    /// (resident-capable — 256-aligned on <see cref="DsHiddenSize"/>), down is Q5_0 (no
+    /// MoE-indexed Vulkan kernel exists in this worktree yet, so it must NOT resolve resident). This is
+    /// the #327 motivating shape (DeepSeek-V2-Lite Q4_K_M ships mixed-quant routed banks) and
+    /// is what distinguishes true per-bank resolution from the old model-global AND — a test
+    /// built only on <see cref="WriteDeepSeekV2Fixture"/>'s uniform-type fixtures cannot tell
+    /// the two apart. Down's bytes are never dequantized by the tests that consume this
+    /// fixture (preflight-only, no <c>.Forward()</c>), so they are random-but-correctly-sized
+    /// rather than a faithful Q5_0 quantization.
+    /// </summary>
+    private string WriteDeepSeekV2MixedResidencyFixture()
+    {
+        var b = new GgufTestData(version: 3);
+        var rng = new Random(0x327);
+
+        int qkHead = DsQkNope + DsQkRope;
+        int qTotal = DsNumHeads * qkHead;
+        int kvAOut = DsKvLoraRank + DsQkRope;
+        int kvBOut = DsNumHeads * (DsQkNope + DsVHead);
+        int oInput = DsNumHeads * DsVHead;
+
+        b.AddString("general.architecture", "deepseek2");
+        b.AddUInt32("deepseek2.embedding_length", (uint)DsHiddenSize);
+        b.AddUInt32("deepseek2.block_count", (uint)DsNumLayers);
+        b.AddUInt32("deepseek2.feed_forward_length", (uint)DsIntermediateSize);
+        b.AddUInt32("deepseek2.attention.head_count", (uint)DsNumHeads);
+        b.AddUInt32("deepseek2.attention.head_count_kv", (uint)DsNumHeads);
+        b.AddUInt32("deepseek2.context_length", 16);
+        b.AddFloat32("deepseek2.attention.layer_norm_rms_epsilon", 1e-6f);
+        b.AddUInt32("deepseek2.vocab_size", (uint)DsVocabSize);
+        b.AddFloat32("deepseek2.rope.freq_base", 10000.0f);
+        b.AddUInt32("deepseek2.rope.dimension_count", (uint)DsQkRope);
+
+        b.AddUInt32("deepseek2.attention.q_lora_rank", 0);
+        b.AddUInt32("deepseek2.attention.kv_lora_rank", (uint)DsKvLoraRank);
+        b.AddUInt32("deepseek2.attention.key_length", (uint)(DsQkNope + DsQkRope));
+        b.AddUInt32("deepseek2.attention.value_length", (uint)DsVHead);
+
+        b.AddUInt32("deepseek2.expert_count", (uint)DsNumExperts);
+        b.AddUInt32("deepseek2.expert_used_count", (uint)DsNumExpertsPerTok);
+        b.AddUInt32("deepseek2.expert_shared_count", 0);
+        b.AddUInt32("deepseek2.expert_feed_forward_length", (uint)DsMoeIntermediate);
+        b.AddUInt32("deepseek2.leading_dense_block_count", (uint)DsLeadingDenseBlocks);
+
+        AddF32Tensor(b, "token_embd.weight", [DsHiddenSize, DsVocabSize], rng);
+        AddF32Tensor(b, "output_norm.weight", [DsHiddenSize], rng, center: 1.0f, jitter: 0.05f);
+        AddF32Tensor(b, "output.weight", [DsHiddenSize, DsVocabSize], rng);
+
+        for (int i = 0; i < DsNumLayers; i++)
+        {
+            string p = $"blk.{i}";
+
+            AddF32Tensor(b, $"{p}.attn_norm.weight", [DsHiddenSize], rng, center: 1.0f, jitter: 0.05f);
+            AddF32Tensor(b, $"{p}.ffn_norm.weight", [DsHiddenSize], rng, center: 1.0f, jitter: 0.05f);
+
+            AddF32Tensor(b, $"{p}.attn_q.weight", [DsHiddenSize, qTotal], rng);
+            AddF32Tensor(b, $"{p}.attn_kv_a_mqa.weight", [DsHiddenSize, kvAOut], rng);
+            AddF32Tensor(b, $"{p}.attn_kv_a_norm.weight", [DsKvLoraRank], rng, center: 1.0f, jitter: 0.05f);
+            AddF32Tensor(b, $"{p}.attn_kv_b.weight", [DsKvLoraRank, kvBOut], rng);
+            AddF32Tensor(b, $"{p}.attn_output.weight", [oInput, DsHiddenSize], rng);
+
+            if (i < DsLeadingDenseBlocks)
+            {
+                AddF32Tensor(b, $"{p}.ffn_gate.weight", [DsHiddenSize, DsIntermediateSize], rng);
+                AddF32Tensor(b, $"{p}.ffn_up.weight", [DsHiddenSize, DsIntermediateSize], rng);
+                AddF32Tensor(b, $"{p}.ffn_down.weight", [DsIntermediateSize, DsHiddenSize], rng);
+            }
+            else
+            {
+                AddF32Tensor(b, $"{p}.ffn_gate_inp.weight", [DsHiddenSize, DsNumExperts], rng);
+                AddExpertBankQuant(b, $"{p}.ffn_gate_exps.weight",
+                    k: DsHiddenSize, m: DsMoeIntermediate, numExperts: DsNumExperts, QuantizationType.Q4_K, rng);
+                AddExpertBankQuant(b, $"{p}.ffn_up_exps.weight",
+                    k: DsHiddenSize, m: DsMoeIntermediate, numExperts: DsNumExperts, QuantizationType.Q4_K, rng);
+                AddExpertBankRawQ5_0(b, $"{p}.ffn_down_exps.weight",
+                    k: DsMoeIntermediate, m: DsHiddenSize, numExperts: DsNumExperts, rng);
+            }
+        }
+
+        string path = b.WriteToTempFile();
+        _tempFiles.Add(path);
+        return path;
+    }
+
+    /// <summary>
+    /// Writes one fused-experts tensor as Q5_0-tagged bytes of the CORRECT size (22 bytes
+    /// per 32-element block) but random content — sufficient for
+    /// <see cref="VulkanWeights.ResolveMoeBankResidency"/>/<c>MoeRoutedRawDeviceQuantType</c>,
+    /// which only inspect the descriptor's quant type and shape, never dereference the raw
+    /// bytes. Not a faithful Q5_0 quantization — do not use with a <c>.Forward()</c> test.
+    /// </summary>
+    private static void AddExpertBankRawQ5_0(GgufTestData b, string name, int k, int m, int numExperts, Random rng)
+    {
+        const int q5_0GroupSize = 32;
+        const int q5_0BlockBytes = 22;
+        if (k % q5_0GroupSize != 0)
+            throw new ArgumentException($"k={k} must be a multiple of {q5_0GroupSize} for Q5_0.", nameof(k));
+
+        int rowBytes = (k / q5_0GroupSize) * q5_0BlockBytes;
+        var all = new byte[(long)numExperts * m * rowBytes];
+        rng.NextBytes(all);
+        b.AddTensor(name, [k, m, numExperts], (uint)QuantizationType.Q5_0, all);
     }
 
     /// <summary>

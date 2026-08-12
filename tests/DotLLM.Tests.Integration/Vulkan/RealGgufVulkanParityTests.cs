@@ -45,6 +45,15 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+// Serializes this class against RealGgufQ5_0ParityTests: both read the mutable
+// static VulkanWeights.LastResidencyReport after loading a model, and running them
+// concurrently would let one load overwrite the other's report. Critically the
+// failure mode is a FALSE PASS, not a crash — the expanded-tensor count is a small
+// integer that another model's report can coincidentally satisfy, so the assertion
+// below can be met while reading the wrong model's report. Verified empirically
+// (#344), and the risk did not go away when #352 took the expected count to 0 —
+// a report from a fully-packed model reads 0 just as readily.
+[Collection("VulkanResidencyReport")]
 public sealed class RealGgufVulkanParityTests
 {
     private const float LogitsAbsTol = 3.0f;
@@ -71,7 +80,7 @@ public sealed class RealGgufVulkanParityTests
         Skip.If(!fixture.Found, fixture.SkipMessage("Llama-3.2-1B Q8_0 GGUF"));
         string path = fixture.Path!;
         RunGgufParityTest(path, expectedArch: Architecture.Llama, label: "Llama-3.2-1B-Q8_0",
-            prompt: "The capital of France is");
+            prompt: "The capital of France is", assertNoResidencyExpansion: true);
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -249,7 +258,8 @@ public sealed class RealGgufVulkanParityTests
     // Driver
     // ════════════════════════════════════════════════════════════════════
 
-    private void RunGgufParityTest(string path, Architecture expectedArch, string label, string prompt)
+    private void RunGgufParityTest(string path, Architecture expectedArch, string label, string prompt,
+        bool assertNoResidencyExpansion = false)
     {
         SkipIfVulkanUnavailable(out string spvDir);
 
@@ -312,6 +322,36 @@ public sealed class RealGgufVulkanParityTests
         }
         vkLoadWatch.Stop();
         _output.WriteLine($"[{label}] Vulkan load ({vkLoadWatch.Elapsed.TotalSeconds:F1} s)");
+
+        if (assertNoResidencyExpansion)
+        {
+            var residency = VulkanWeights.LastResidencyReport;
+            Assert.NotNull(residency);
+            _output.WriteLine($"[{label}] {residency.Describe()}");
+            // #352 removed the last widening on this model: token_embd.weight used to be
+            // dequantised to F32 unconditionally (no GPU gather+dequant kernel for a Q8_0
+            // embed table), and now stays packed via q8_0_embed_gather_f32. So an all-Q8_0
+            // model must keep EVERY tensor packed — no carve-out. Pinning the count at 0
+            // rather than only listing offenders keeps the assertion able to fail if an
+            // entry silently vanishes from the report instead of being kept resident.
+            Assert.Equal(0, residency.ExpandedTensorCount);
+
+            // ExpandedTensorCount == 0 is satisfied just as well by an entry that VANISHED
+            // from the report as by one kept packed, so the count alone cannot verify the
+            // thing #352 actually changed. Name the tensor and assert it is present and
+            // unexpanded — this is what fails if the resident branch stops reporting.
+            var embed = Assert.Single(
+                residency.Entries, e => e.Name == "token_embd.weight");
+            Assert.False(embed.Expanded,
+                $"[{label}] token_embd.weight widened {embed.Source}->{embed.Device}");
+
+            var unexpected = residency.Entries
+                .Where(e => e.Expanded)
+                .ToList();
+            Assert.True(unexpected.Count == 0,
+                $"[{label}] unexpected residency expansion: "
+                + string.Join(", ", unexpected.Select(e => $"{e.Name} ({e.Source}->{e.Device})")));
+        }
 
         try
         {

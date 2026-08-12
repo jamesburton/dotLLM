@@ -71,6 +71,12 @@ public sealed class VulkanTransformerModel : IModel
     // RDNA3.5 iGPU at Llama-3 4096² N=64 (790 vs 209 GFLOPS). Null on devices
     // without coopmat — the router falls back to _matmulQ8Gemm then.
     private readonly MatMulQ8_0GemmCoopmatKernel? _matmulQ8GemmCoopmat;
+    // Q5_0 matmul kernels (#344) — the legacy 32-element-block 5-bit format.
+    // Always created; the dispatcher in RecordMatmul branches on the device-side
+    // QuantizationType per call. No MMVQ/MMQ integer-dot variants yet (out of
+    // scope per the unit-0 plan), so these are the only Q5_0 consumers.
+    private readonly MatMulQ5_0GemvF32Kernel _matmulQ5_0;
+    private readonly MatMulQ5_0GemmF32Kernel _matmulQ5_0Gemm;
     // Q2_K + Q3_K matmul kernels — completes the K-quant family on Vulkan.
     // Always created; the dispatcher in RecordMatmul branches on the
     // device-side QuantizationType per call. No coopmat variants — follow-up
@@ -921,6 +927,7 @@ public sealed class VulkanTransformerModel : IModel
         VulkanForwardState state,
         MatMulF32Kernel matmul, MatMulQ8_0Kernel matmulQ8, MatMulQ8_0GemmKernel matmulQ8Gemm,
         MatMulQ8_0GemmCoopmatKernel? matmulQ8GemmCoopmat,
+        MatMulQ5_0GemvF32Kernel matmulQ5_0, MatMulQ5_0GemmF32Kernel matmulQ5_0Gemm,
         MatMulQ2KGemvF32Kernel matmulQ2K, MatMulQ2KGemmF32Kernel matmulQ2KGemm,
         MatMulQ3KGemvF32Kernel matmulQ3K, MatMulQ3KGemmF32Kernel matmulQ3KGemm,
         MatMulQ4KGemvF32Kernel matmulQ4K, MatMulQ4KGemmF32Kernel matmulQ4KGemm,
@@ -1014,6 +1021,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8 = matmulQ8;
         _matmulQ8Gemm = matmulQ8Gemm;
         _matmulQ8GemmCoopmat = matmulQ8GemmCoopmat;
+        _matmulQ5_0 = matmulQ5_0;
+        _matmulQ5_0Gemm = matmulQ5_0Gemm;
         _matmulQ2K = matmulQ2K;
         _matmulQ2KGemm = matmulQ2KGemm;
         _matmulQ3K = matmulQ3K;
@@ -1157,19 +1166,26 @@ public sealed class VulkanTransformerModel : IModel
         try
         {
             spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
-            // #191: skip the per-expert F32 host dequant of routed MoE banks when
-            // every routed bank across every MoE layer would resolve to a supported
-            // raw-quant device view anyway (see CanSkipMoeF32HostDequant) — mirrors
-            // what CudaTransformerModel/CudaPipelineTransformerModel already do
-            // unconditionally, but gated here since Vulkan didn't have full K-quant
-            // routed-bank coverage until this issue.
-            // #326: when the skip is refused, say what the fallback will cost and why BEFORE
+            // #191/#327: skip the per-expert F32 host dequant of a routed MoE bank when
+            // THAT bank would resolve to a supported raw-quant device view anyway (see
+            // VulkanWeights.ResolveMoeBankResidency) — mirrors what
+            // CudaTransformerModel/CudaPipelineTransformerModel already do unconditionally,
+            // but gated here since Vulkan didn't have full K-quant routed-bank coverage
+            // until #191. Resolved PER BANK (#327): one unsupported sibling (e.g. a Q5_0
+            // down bank) no longer forces every other bank in the model to pay for a host
+            // F32 array it will never read.
+            // #326: when banks do fall back, say what that will cost and why BEFORE
             // allocating it — otherwise the load exhausts host RAM and reports a bare
-            // OutOfMemoryException inside SliceExpertsToF32.
+            // OutOfMemoryException inside SliceExpertsToF32. The plan accounts for exactly
+            // the banks the selector below will NOT skip, so the two agree by construction.
             var moePlan = VulkanWeights.PlanMoeF32HostDequant(device, gguf, config);
             VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(
                 moePlan, VulkanWeights.HostPhysicalMemoryBytes());
-            var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config, moePlan.CanSkip);
+            var moeBankResidency = VulkanWeights.ResolveMoeBankResidency(device, gguf, config);
+            var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config,
+                moeBankSkipSelector: layerIdx => moeBankResidency.TryGetValue(layerIdx, out var r)
+                    ? (r.Gate, r.Up, r.Down)
+                    : (false, false, false));
             return BuildModel(device, ownsDevice: true, config, cpuWeights, spvDir, gguf);
         }
         catch
@@ -1196,12 +1212,15 @@ public sealed class VulkanTransformerModel : IModel
         RejectUnsupportedArchitecture(config);
 
         spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
-        // #191: see the other LoadFromGguf overload's comment.
-        // #326: see the other overload — preflight the F32 fallback footprint before allocating.
+        // #191/#327/#326: see the other LoadFromGguf overload's comment.
         var moePlan = VulkanWeights.PlanMoeF32HostDequant(device, gguf, config);
         VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(
             moePlan, VulkanWeights.HostPhysicalMemoryBytes());
-        var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config, moePlan.CanSkip);
+        var moeBankResidency = VulkanWeights.ResolveMoeBankResidency(device, gguf, config);
+        var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config,
+            moeBankSkipSelector: layerIdx => moeBankResidency.TryGetValue(layerIdx, out var r)
+                ? (r.Gate, r.Up, r.Down)
+                : (false, false, false));
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf);
     }
 
@@ -1497,6 +1516,11 @@ public sealed class VulkanTransformerModel : IModel
         var matmul = MatMulF32Kernel.Create(device, spvDir);
         var matmulQ8 = MatMulQ8_0Kernel.Create(device, spvDir);
         var matmulQ8Gemm = MatMulQ8_0GemmKernel.Create(device, spvDir);
+        // Q5_0 GEMV + GEMM (#344) — makes the Q5_0 device-resident upload path
+        // reachable. Always created; the dispatcher routes per device-side
+        // QuantizationType.
+        var matmulQ5_0 = MatMulQ5_0GemvF32Kernel.Create(device, spvDir);
+        var matmulQ5_0Gemm = MatMulQ5_0GemmF32Kernel.Create(device, spvDir);
         // Q2_K + Q3_K GEMV + GEMM — completes the K-quant family on Vulkan.
         // Always created; the dispatcher routes per device-side QuantizationType.
         var matmulQ2K = MatMulQ2KGemvF32Kernel.Create(device, spvDir);
@@ -1780,6 +1804,7 @@ public sealed class VulkanTransformerModel : IModel
             device, ownsDevice,
             config, weights, cpuWeights, state,
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
+            matmulQ5_0, matmulQ5_0Gemm,
             matmulQ2K, matmulQ2KGemm,
             matmulQ3K, matmulQ3KGemm,
             matmulQ4K, matmulQ4KGemm,
@@ -3909,6 +3934,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8.InvalidateDescriptorCache();
         _matmulQ8Gemm.InvalidateDescriptorCache();
         _matmulQ8GemmCoopmat?.InvalidateDescriptorCache();
+        _matmulQ5_0.InvalidateDescriptorCache();
+        _matmulQ5_0Gemm.InvalidateDescriptorCache();
         _matmulQ2K.InvalidateDescriptorCache();
         _matmulQ2KGemm.InvalidateDescriptorCache();
         _matmulQ3K.InvalidateDescriptorCache();
@@ -6004,6 +6031,29 @@ public sealed class VulkanTransformerModel : IModel
                 ProfNote("q8_0_f32gemm", outputDim, inputDim, seqLen);
             }
         }
+        else if (weightQt == QuantType.Q5_0)
+        {
+            // Q5_0 (#344): 32-element blocks, 22 bytes each (fp16 scale + 4-byte qh
+            // bitfield + 16 packed nibble bytes). Alignment (inputDim % 32 == 0) is
+            // enforced upstream by VulkanWeights.KeepQ5_0OnDevice. No MMVQ/MMQ
+            // integer-dot variants yet — decode goes through the F32-in GEMV,
+            // prefill through the 16x16-tiled F32-in GEMM. Reaching the trailing
+            // generic-F32 `else` instead would reinterpret packed Q5_0 blocks as
+            // floats: no crash, silently wrong logits — hence this branch is the
+            // load-bearing half of making Q5_0 device-resident.
+            if (seqLen == 1)
+            {
+                _matmulQ5_0.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+                ProfNote("q5_0_f32gemv", outputDim, inputDim, seqLen);
+            }
+            else
+            {
+                _matmulQ5_0Gemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q5_0_f32gemm", outputDim, inputDim, seqLen);
+            }
+        }
         else if (weightQt == QuantType.Q2_K)
         {
             if (seqLen == 1)
@@ -6789,6 +6839,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ3K.Dispose();
         _matmulQ2KGemm.Dispose();
         _matmulQ2K.Dispose();
+        _matmulQ5_0Gemm.Dispose();
+        _matmulQ5_0.Dispose();
         _matmulQ8Mmq?.Dispose();
         _matmulQ8MmqResidual?.Dispose();
         _matmulQ4KMmq?.Dispose();

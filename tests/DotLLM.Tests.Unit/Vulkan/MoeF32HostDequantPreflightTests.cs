@@ -23,13 +23,19 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// </remarks>
 public sealed class MoeF32HostDequantPreflightTests
 {
-    private const long DeepSeekV2LiteF32Bytes = 26L * 64 * 4 * 3 * 1408 * 2048; // ~57 GiB
+    // One routed expert bank, F32: numExperts * sizeof(float) * moeIntermediate * hidden.
+    private const long OneBankF32Bytes = 64L * 4 * 1408 * 2048;
+
+    // #327 made the skip PER BANK, so only the 14 offending ffn_down_exps banks are dequantised
+    // — their Q4_K gate/up siblings stay device-resident and cost nothing. Before #327 this was
+    // all 78 banks (~57 GiB); charging that now would over-report by 5.6x and let
+    // ThrowIfMoeF32HostDequantUnaffordable refuse a load the per-bank path made fit.
+    private const long DeepSeekV2LiteF32Bytes = 14 * OneBankF32Bytes; // ~9.6 GiB
 
     private static VulkanWeights.MoeF32HostDequantPlan DeepSeekV2LiteQ4KMPlan()
     {
         // The Q4_K_M build's actual census: gate/up are Q4_K everywhere (device-resident-capable),
-        // but 14 of the 26 ffn_down_exps banks are Q5_0, which is not covered — and one uncovered
-        // bank refuses the skip for the whole model, so all 78 banks get F32'd.
+        // but 14 of the 26 ffn_down_exps banks are Q5_0. Those 14 are what falls back.
         var fallbacks = new List<VulkanWeights.MoeRoutedBankFallback>();
         foreach (int layer in new[] { 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 19, 21, 22 })
         {
@@ -46,14 +52,12 @@ public sealed class MoeF32HostDequantPreflightTests
     {
         var plan = DeepSeekV2LiteQ4KMPlan();
 
-        // 31.6 GiB is what GC.GetGCMemoryInfo().TotalAvailableMemoryBytes actually reports on
-        // the Strix Halo box this was triaged on — the ~53.6 GiB fallback cannot fit in RAM at
-        // all there, which is why the load reached OutOfMemoryException rather than merely
-        // paging.
+        // An 8 GiB box: the ~9.6 GiB per-bank fallback cannot fit in RAM there at all, so the
+        // preflight must refuse rather than let the load reach OutOfMemoryException.
         var ex = Assert.Throws<InsufficientMemoryException>(
-            () => VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(plan, 33_900_000_000L));
+            () => VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(plan, 8L * 1024 * 1024 * 1024));
 
-        Assert.Contains("53.6 GiB of host F32", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("9.6 GiB of host F32", ex.Message, StringComparison.Ordinal);
         Assert.Contains("14 of 78 routed expert banks", ex.Message, StringComparison.Ordinal);
         Assert.Contains("ffn_down_exps.weight", ex.Message, StringComparison.Ordinal);
         Assert.Contains("Q5_0", ex.Message, StringComparison.Ordinal);
@@ -83,6 +87,30 @@ public sealed class MoeF32HostDequantPreflightTests
         var plan = DeepSeekV2LiteQ4KMPlan();
         VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(plan, DeepSeekV2LiteF32Bytes);
         VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(plan, DeepSeekV2LiteF32Bytes + 1);
+    }
+
+    /// <summary>
+    /// The concrete consequence of #327's per-bank accounting, and the regression this guards:
+    /// on the 31.6 GiB Strix Halo box that triaged #326, DeepSeek-V2-Lite Q4_K_M's fallback now
+    /// FITS (~9.6 GiB for the 14 offending down banks). Under the pre-#327 all-or-nothing
+    /// figure (~57 GiB for all 78 banks) this same call threw, refusing a load that is in fact
+    /// affordable. If the planner ever reverts to charging resident siblings, this fails.
+    /// </summary>
+    [Fact]
+    public void PerBankFootprint_FitsOnTheBoxWhereTheAllOrNothingFigureDidNot()
+    {
+        var plan = DeepSeekV2LiteQ4KMPlan();
+
+        // 33.9e9 bytes is what GC.GetGCMemoryInfo().TotalAvailableMemoryBytes actually reports
+        // on that box (~31.6 GiB — the rest is the BIOS UMA carve-out).
+        VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(plan, 33_900_000_000L);
+
+        // ...and the pre-#327 figure genuinely did not fit, so the two answers really do differ
+        // in outcome, not merely in magnitude.
+        var allOrNothing = new VulkanWeights.MoeF32HostDequantPlan(
+            CanSkip: false, 78 * OneBankF32Bytes, plan.Fallbacks, TotalBanks: 78);
+        Assert.Throws<InsufficientMemoryException>(
+            () => VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(allOrNothing, 33_900_000_000L));
     }
 
     [Fact]

@@ -1195,8 +1195,16 @@ internal sealed class TransformerWeights : IDisposable
     /// isn't called, and they blow ~2.2 GB host RAM per V2-Lite Q4_K_M layer.
     /// CPU-only callers leave this false to keep <see cref="DotLLM.Cpu.Kernels.MoeSwiGluMlp.Execute"/>
     /// callable.</param>
+    /// <param name="moeBankSkipSelector">Optional per-layer, per-bank override (#327) for the
+    /// routed-expert F32 host dequant: given a layer index, returns whether the gate/up/down
+    /// banks on THAT layer independently may skip the host dequant. When supplied, this takes
+    /// priority over <paramref name="skipF32MoeDequant"/> for every MLA+MoE layer — one
+    /// unsupported bank no longer forces the F32 host dequant for its resident-capable
+    /// siblings. <see langword="null"/> (the default) preserves the prior model-wide
+    /// behavior driven solely by <paramref name="skipF32MoeDequant"/>.</param>
     public static TransformerWeights LoadFromGguf(GgufFile gguf, ModelConfig config,
-                                                    bool skipF32MoeDequant = false)
+                                                    bool skipF32MoeDequant = false,
+                                                    Func<int, (bool SkipGate, bool SkipUp, bool SkipDown)>? moeBankSkipSelector = null)
     {
         ThrowIfArchitectureNeedsDedicatedLoader(config);
 
@@ -1224,7 +1232,7 @@ internal sealed class TransformerWeights : IDisposable
         for (int i = 0; i < config.NumLayers; i++)
         {
             layers[i] = config.MlaConfig is not null
-                ? LoadMlaLayer(i, dataBase, tensors, config, owned!, skipF32MoeDequant)
+                ? LoadMlaLayer(i, dataBase, tensors, config, owned!, skipF32MoeDequant, moeBankSkipSelector)
                 : config.Gemma4DualFfn
                     ? LoadGemma4Layer(i, dataBase, tensors, config, owned)
                     : LoadLayer(i, dataBase, tensors, config);
@@ -1988,7 +1996,8 @@ internal sealed class TransformerWeights : IDisposable
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config,
         List<nint> owned,
-        bool skipF32MoeDequant = false)
+        bool skipF32MoeDequant = false,
+        Func<int, (bool SkipGate, bool SkipUp, bool SkipDown)>? moeBankSkipSelector = null)
     {
         var mla = config.MlaConfig
             ?? throw new InvalidOperationException("LoadMlaLayer called without MlaConfig.");
@@ -2097,7 +2106,17 @@ internal sealed class TransformerWeights : IDisposable
 
         if (layerIsMoe)
         {
-            moeBundle = LoadDeepSeekMoeLayer(layerIdx, dataBase, tensors, config, owned, skipF32MoeDequant);
+            // #327: when the caller supplied a per-bank residency selector (Vulkan's
+            // preflight), thread its per-layer per-bank decision through instead of the
+            // single model-wide skipF32MoeDequant flag — one unsupported sibling bank no
+            // longer forces every other bank in the model to pay for an F32 host array it
+            // will never read. Falls back to the old combined flag when no selector is given
+            // (CUDA callers, and any Vulkan caller before this preflight ran).
+            (bool skipGate, bool skipUp, bool skipDown) = moeBankSkipSelector is not null
+                ? moeBankSkipSelector(layerIdx)
+                : (skipF32MoeDequant, skipF32MoeDequant, skipF32MoeDequant);
+            moeBundle = LoadDeepSeekMoeLayer(layerIdx, dataBase, tensors, config, owned,
+                skipGateDequant: skipGate, skipUpDequant: skipUp, skipDownDequant: skipDown);
         }
         else if (tensors.TryGetValue($"{prefix}.ffn_gate.weight", out var gateDesc))
         {
@@ -2155,6 +2174,25 @@ internal sealed class TransformerWeights : IDisposable
     /// (on-device dequant) replace.
     /// </para>
     /// </remarks>
+    /// <param name="layerIdx">Zero-based layer index within the model.</param>
+    /// <param name="dataBase">Base pointer of the mmap'd GGUF tensor-data region.</param>
+    /// <param name="tensors">Tensor descriptors by name, from the opened GGUF file.</param>
+    /// <param name="config">Model configuration (supplies <c>config.Moe</c>).</param>
+    /// <param name="owned">Accumulates unmanaged allocations for later disposal.</param>
+    /// <param name="skipF32Dequant">When true, skip the F32 host dequant of both the routed
+    /// and shared expert banks (unless overridden per bank below).</param>
+    /// <param name="skipRoutedF32Only">When true, skip the F32 host dequant of the routed
+    /// expert banks only — the shared-expert branch (small) still gets an F32 host array.</param>
+    /// <param name="skipGateDequant">Per-bank override for the routed <c>ffn_gate_exps</c>
+    /// F32 host dequant. <see langword="null"/> (the default) falls back to the combined
+    /// <paramref name="skipF32Dequant"/>/<paramref name="skipRoutedF32Only"/> decision, which
+    /// applies uniformly to gate/up/down. Non-null lets a caller (Vulkan's per-bank residency
+    /// preflight, #327) skip the host dequant ONLY for banks it will actually keep device-
+    /// resident, while still populating the F32 host array for a sibling bank that needs it.</param>
+    /// <param name="skipUpDequant">Per-bank override, sibling of <paramref name="skipGateDequant"/>
+    /// for <c>ffn_up_exps</c>.</param>
+    /// <param name="skipDownDequant">Per-bank override, sibling of <paramref name="skipGateDequant"/>
+    /// for <c>ffn_down_exps</c>.</param>
     internal static unsafe MoeLayerWeights LoadDeepSeekMoeLayer(
         int layerIdx,
         nint dataBase,
@@ -2162,7 +2200,10 @@ internal sealed class TransformerWeights : IDisposable
         ModelConfig config,
         List<nint> owned,
         bool skipF32Dequant = false,
-        bool skipRoutedF32Only = false)
+        bool skipRoutedF32Only = false,
+        bool? skipGateDequant = null,
+        bool? skipUpDequant = null,
+        bool? skipDownDequant = null)
     {
         var moe = config.Moe
             ?? throw new InvalidOperationException("LoadDeepSeekMoeLayer called without Moe config.");
@@ -2196,33 +2237,38 @@ internal sealed class TransformerWeights : IDisposable
         // ~10 MB per layer). The caller dequantizes the routed experts on-demand per layer using
         // the raw-quant view.
         bool skipRoutedDequant = skipF32Dequant || skipRoutedF32Only;
+        // KNOWN REGRESSION (#327 fix-round-1 disclosure, not fixed this round): Vulkan's
+        // LoadMlaLayer call site now always passes explicit skipGateDequant/skipUpDequant/
+        // skipDownDequant and never skipF32Dequant, so skipSharedDequant below is always
+        // false for the Vulkan MLA+MoE path — a fully-resident model now pays for a
+        // shared-expert F32 host array (~10 MB/layer) it previously avoided when
+        // CanSkipMoeF32HostDequant was true. No numeric impact; whether to restore that
+        // skip (e.g. thread a shared-expert bool through moeBankSkipSelector too) is a
+        // separate decision, deliberately out of scope here.
         bool skipSharedDequant = skipF32Dequant; // shared stays unless caller asks for full skip
 
-        nint[] w1, w3, w2;
-        if (skipRoutedDequant)
-        {
-            // GPU-only callers skip the F32 host dequant of the per-expert
-            // 3D tensors — saves ~2.2 GB host RAM per V2-Lite Q4_K_M MoE
-            // layer. Zero-filled arrays of size numExperts (to satisfy the
-            // MoeLayerWeights ctor's length validation); the GPU loader uses
-            // the raw views (gateRaw/upRaw/downRaw below). The CPU
-            // MoeSwiGluMlp oracle is not callable on this layer in this mode.
-            w1 = new nint[numExperts];
-            w3 = new nint[numExperts];
-            w2 = new nint[numExperts];
-        }
-        else
-        {
-            w1 = SliceExpertsToF32(
-                dataBase, gateDesc,
-                numExperts, M: moeIntermediate, K: hiddenSize, owned);
-            w3 = SliceExpertsToF32(
-                dataBase, upDesc,
-                numExperts, M: moeIntermediate, K: hiddenSize, owned);
-            w2 = SliceExpertsToF32(
-                dataBase, downDesc,
-                numExperts, M: hiddenSize, K: moeIntermediate, owned);
-        }
+        // Per-bank overrides (#327) default to the combined decision above — this keeps
+        // every existing caller's behavior byte-identical (all three still move together)
+        // unless a caller passes an explicit per-bank skip.
+        bool skipGate = skipGateDequant ?? skipRoutedDequant;
+        bool skipUp = skipUpDequant ?? skipRoutedDequant;
+        bool skipDown = skipDownDequant ?? skipRoutedDequant;
+
+        // GPU-only callers skip the F32 host dequant of the per-expert 3D tensors for a
+        // bank that will stay device-resident — saves up to ~2.2 GB host RAM per V2-Lite
+        // Q4_K_M MoE layer. Zero-filled arrays of size numExperts (to satisfy the
+        // MoeLayerWeights ctor's length validation) stand in for a skipped bank; the GPU
+        // loader uses the raw views (gateRaw/upRaw/downRaw below) for it instead. The CPU
+        // MoeSwiGluMlp oracle is not callable against a skipped bank.
+        nint[] w1 = skipGate
+            ? new nint[numExperts]
+            : SliceExpertsToF32(dataBase, gateDesc, numExperts, M: moeIntermediate, K: hiddenSize, owned);
+        nint[] w3 = skipUp
+            ? new nint[numExperts]
+            : SliceExpertsToF32(dataBase, upDesc, numExperts, M: moeIntermediate, K: hiddenSize, owned);
+        nint[] w2 = skipDown
+            ? new nint[numExperts]
+            : SliceExpertsToF32(dataBase, downDesc, numExperts, M: hiddenSize, K: moeIntermediate, owned);
 
         nint gateRaw = dataBase + (nint)gateDesc.DataOffset;
         nint upRaw = dataBase + (nint)upDesc.DataOffset;
