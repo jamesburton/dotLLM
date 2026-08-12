@@ -70,10 +70,12 @@ ToolChoice:
 
 | `tool_choice` | Constrained decoding | Parser runs | Use case |
 |---------------|---------------------|-------------|----------|
-| `Auto` | No | Yes | Model freely decides; detect tool calls post-hoc |
+| `Auto` | No | Yes — **model-family** parser | Model freely decides; detect tool calls post-hoc |
 | `None` | No | No | Tools in context for reference only |
-| `Required` | Yes — `anyOf` schema | Yes | Force a tool call; guaranteed valid JSON |
-| `Function(name)` | Yes — single-tool schema | Yes | Force a specific function |
+| `Required` | Yes — `anyOf` schema | Yes — **generic (markerless)** parser | Force a tool call; guaranteed valid JSON |
+| `Function(name)` | Yes — single-tool schema | Yes — **generic (markerless)** parser | Force a specific function |
+
+**Which parser parses constrained output** — see [Parsing Constrained Output](#parsing-constrained-output) below. Constrained output is *bare JSON*, never the model's envelope, so the marker-based parsers must not be used on it.
 
 ### ChatMessage (tool-related fields)
 
@@ -101,8 +103,10 @@ Models signal tool calls in different formats. Each parser handles one conventio
 |--------|--------|----------|--------|----------------|
 | `LlamaToolCallParser` | `<\|python_tag\|>` | `name` + `parameters` | Llama 3.1+ Instruct | `<\|python_tag\|>{"name":"f","parameters":{...}}` |
 | `HermesToolCallParser` | `<tool_call>`...`</tool_call>` | `name` + `arguments` | Hermes, Qwen tool-calling | `<tool_call>{"name":"f","arguments":{...}}</tool_call>` |
+| `XmlToolCallParser` | `<tool_call>`...`</tool_call>` (delegates to Hermes) | `name` + `arguments` | SmolLM3 `xml_tools` branch, Qwen3/Hermes | `<tool_call>{"name":"f","arguments":{...}}</tool_call>` |
 | `MistralToolCallParser` | `[TOOL_CALLS]` | `name` + `arguments` | Mistral Instruct | `[TOOL_CALLS][{"name":"f","arguments":{...}}]` |
-| `GenericToolCallParser` | None (bare JSON) | `name` + `arguments`/`parameters` | Fallback | `{"name":"f","arguments":{...}}` |
+| `PythonicToolCallParser` | Python call syntax | positional/kwargs → `arguments` | SmolLM3 (`python_tools` branch) | `[f(city="Tokyo")]` |
+| `GenericToolCallParser` | None (bare JSON) | `name` + `arguments`/`parameters` | Fallback **and all constrained output** | `{"name":"f","arguments":{...}}` |
 
 ### Key Normalization: `parameters` vs `arguments`
 
@@ -132,17 +136,20 @@ All parsers return `null` on malformed input — they never throw. This is criti
 
 **Tier 1 — Template content (highest priority):**
 ```
-Template contains "<tool_call>"       → HermesToolCallParser
+"python_tools" without "xml_tools"    → PythonicToolCallParser
+Template contains "<tool_call>"       → XmlToolCallParser
 Template contains "python_tag"        → LlamaToolCallParser
 Template contains "[TOOL_CALLS]"      → MistralToolCallParser
 ```
 
 **Tier 2 — Architecture fallback:**
 ```
-Architecture.Llama    → LlamaToolCallParser
-Architecture.Mistral  → MistralToolCallParser
-Architecture.Qwen     → HermesToolCallParser
-*                     → GenericToolCallParser
+Architecture.Llama            → LlamaToolCallParser
+Architecture.Mistral          → MistralToolCallParser
+Architecture.Qwen / QwenMoe   → HermesToolCallParser
+Architecture.SmolLM3          → XmlToolCallParser
+Architecture.BitNet           → HermesToolCallParser
+*                             → GenericToolCallParser
 ```
 
 Template content takes priority because the template is the source of truth for the model's tool calling convention — the same architecture may have different fine-tunes with different conventions.
@@ -206,6 +213,29 @@ ToolDefinition[] → ToolCallSchemaBuilder.BuildForRequired()
 ```
 
 `SchemaCompiler` supports `anyOf`, `const`, nested objects, and `enum`; `SchemaTracker` adds the bounded parallel `anyOf` branch-narrowing (#104) that enforces the *correct* per-tool branch. This means a constrained tool call is **structurally guaranteed** to be a valid JSON object conforming to exactly one tool's parameter schema (no leaked/duplicate keys, self-terminating). Note: structural validity is guaranteed regardless of model, but full *termination* (the model emitting the closing braces + EOS) still depends on model capability — a weak base can run to `MaxTokens` on an unbounded string value.
+
+### Parsing Constrained Output
+
+**Constrained output is bare JSON. It is parsed by `GenericToolCallParser`, regardless of model family.**
+
+`ToolCallSchemaBuilder` + `JsonSchemaConstraint` emit a *JSON object* — `{"name": …, "arguments": …}` — and nothing else. The constraint machinery is a JSON-schema tracker; it has no way to force the model's envelope tokens (`<tool_call>`, `<|python_tag|>`, `[TOOL_CALLS]`) around that object, and the schema deliberately contains no such literals. Feeding constrained output to a marker-based parser therefore *always* yields `null` and the tool call is silently lost (issue #325).
+
+So the wrapper format is owned by the **constraint layer** for `Required`/`Function` (it is: no wrapper), and every consumer must respect that:
+
+```csharp
+// argumentsKey comes from the MODEL parser (Llama → "parameters"), computed BEFORE the swap
+string argumentsKey = modelParser is LlamaToolCallParser ? "parameters" : "arguments";
+responseFormat = new ResponseFormat.JsonSchema { Schema = ToolCallSchemaBuilder.BuildForRequired(tools, argumentsKey) };
+
+// then swap the parser used for OUTPUT
+parser = ToolCallParserFactory.ForToolChoice(toolChoice, modelParser);
+```
+
+`ForToolChoice` returns `GenericToolCallParser` for `Required`/`Function` and the model parser unchanged for `Auto`/`None`. It is the single place this rule lives — `dotllm run`, `dotllm chat`, the integration tests, and (once server-side `tool_choice` enforcement lands) the server all route through it.
+
+The swap also matters for **streaming**: `StreamingToolCallAccumulator` uses `IsToolCallStart`, so with a marker parser on constrained output the suppression never triggers and the raw tool-call JSON leaks to the user's console.
+
+The marker parsers deliberately do **not** fall back to bare JSON. Under `tool_choice=auto` the absence of a marker is the signal "this is not a tool call"; a fallback would misparse prose that happens to contain `{"name": …}`.
 
 ### `tool_choice=auto` — No Constraint
 
@@ -426,7 +456,9 @@ The weather in Paris is 22°C and sunny.
 | `Tokenizers/ToolCallParsers/MistralToolCallParser.cs` | Mistral parser |
 | `Tokenizers/ToolCallParsers/GenericToolCallParser.cs` | Fallback parser |
 | `Tokenizers/ToolCallParsers/ToolCallJsonHelper.cs` | Shared JSON extraction + normalization |
-| `Tokenizers/ToolCallParsers/ToolCallParserFactory.cs` | Auto-detection factory |
+| `Tokenizers/ToolCallParsers/XmlToolCallParser.cs` | SmolLM3 / Hermes XML envelope |
+| `Tokenizers/ToolCallParsers/PythonicToolCallParser.cs` | SmolLM3 Pythonic call syntax |
+| `Tokenizers/ToolCallParsers/ToolCallParserFactory.cs` | Auto-detection factory + `ForToolChoice` (constrained-output rule) |
 | `Engine/Constraints/ToolCallSchemaBuilder.cs` | Schema generation from tool definitions |
 | `Engine/ToolCallDetector.cs` | Post-generation detection |
 | `Engine/StreamingToolCallAccumulator.cs` | Streaming boundary detection |
@@ -440,6 +472,7 @@ The weather in Paris is 22°C and sunny.
 | Parser per model family | 4 implementations + factory | Models use fundamentally different formats — no single parser handles all |
 | Template heuristic over config | Scan template for markers | Template is source of truth; same architecture can have different tool conventions |
 | Schema constraint only for required/function | No constraint for auto | Model must be free to produce text instead of tool calls with `auto` |
+| Wrapper format under constraint | None — bare JSON, parsed by `GenericToolCallParser` via `ToolCallParserFactory.ForToolChoice` | A JSON-schema constraint cannot emit envelope tokens; centralising the rule stops call sites forking (#325) |
 | Post-generation detection (not in TextGenerator) | `ToolCallDetector` is caller responsibility | Keeps engine minimal; CLI and Server both use it differently |
 | `arguments` normalization | `ToolCallJsonHelper` handles both keys | Llama uses `parameters`, everyone else uses `arguments` — normalize once |
 | Sequential call IDs | `call_0`, `call_1`, ... | Simple, deterministic; models rarely provide their own IDs |

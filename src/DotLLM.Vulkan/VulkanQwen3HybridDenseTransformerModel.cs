@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using Architecture = DotLLM.Core.Configuration.Architecture;
@@ -774,6 +774,9 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
             && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads))
         {
+            // Decode: split the KV range across many workgroups (Flash-Decoding).
+            // Engages from seqKv >= 17 with the shipping heuristic (issue #331);
+            // only seqKv <= 16 falls through to the per-token kernel.
             _kernels.SplitKvAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,

@@ -59,6 +59,27 @@ STORAGE RULES (firm)
 * A model that was ALREADY on disk before the sweep started is never deleted; the
   state file records `preexisting: true` so that is auditable.
 
+BUILD FRESHNESS (fork issue #341)
+---------------------------------
+The sweep ALWAYS builds. It runs `dotnet build -c Release` on the test project once, up
+front — before any GPU lock is taken — and aborts the whole run if that build fails; the
+per-model `dotnet test` then runs without `--no-build` (a near-no-op incremental build).
+`--no-build` is refused outright.
+
+This is not tidiness. dotLLM is only half-compiled: Vulkan `.spv` shaders are loaded from
+the repo tree at runtime, while the CPU kernels are baked into `DotLLM.Cpu.dll`. Stale
+binaries therefore give a LIVE GPU path against a STALE CPU oracle, and a cross-backend
+parity test reports a large, specific and completely fictitious divergence. That happened:
+`bielik-1.5b-q3_k_m` was recorded as failing at L-inf 14.586 / Jaccard 0.00 against binaries
+predating the #311 Q3_K fix; on a fresh build the same test passes at L-inf 1.4818. Note
+that checking the committed `.spv` against their `.comp` sources does NOT detect this — it
+says nothing about the DLLs. Worktree merges make it easy to hit, because they never touch
+the main checkout's `bin/Release`.
+
+Every result also records the commit (+ dirty flag) it was produced against, in the log and
+in `state.json` under `build`. `--report` shows it as a column; entries with `?` predate this
+and should be re-run with `--force` before being believed.
+
 GPU LOCK
 --------
 Three other agents share this box's GPU. The lock is acquired per model, held only
@@ -141,6 +162,35 @@ def main_checkout_root() -> Path:
 
 def expand(p: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(p)))
+
+
+def build_stamp() -> dict:
+    """
+    Provenance for every result this run records (#341).
+
+    A parity number is only interpretable against the code that produced it. Recording the
+    commit + dirty flag next to each result makes a result from an unexpected tree
+    self-evident *afterwards*, instead of indistinguishable from a real failure — which is
+    exactly how the stale-binary Q3_K "regression" survived scrutiny for a session.
+    """
+    def git(*args: str) -> str:
+        try:
+            p = subprocess.run(["git", *args], cwd=repo_root(), capture_output=True,
+                               text=True, errors="replace", timeout=30)
+            return p.stdout.strip() if p.returncode == 0 else ""
+        except Exception:
+            return ""
+
+    commit = git("rev-parse", "HEAD")
+    return {
+        "commit": commit or "unknown",
+        "commit_short": (commit or "unknown")[:12],
+        "branch": git("rev-parse", "--abbrev-ref", "HEAD") or "unknown",
+        # Uncommitted edits mean `commit` alone does not identify the code under test.
+        "dirty": bool(git("status", "--porcelain")),
+        "worktree": str(repo_root()),
+        "built_at": now(),
+    }
 
 
 def hub_cache() -> Path:
@@ -468,13 +518,51 @@ _SUMMARY = re.compile(
     r"(?:Passed|Failed)!\s*-\s*Failed:\s*(\d+),\s*Passed:\s*(\d+),\s*Skipped:\s*(\d+)")
 
 
+def build_tests(project: Path, configuration: str, log: Log, timeout: int = 3600) -> None:
+    """
+    Build the test project ONCE, up front, before the GPU lock is ever taken.
+
+    #341: this sweep used to run `dotnet test --no-build`, which silently tested whatever
+    binaries happened to be lying in `bin/<config>` from some earlier session. That is far
+    worse here than an ordinary stale-build failure, because dotLLM is only *half* compiled:
+    the Vulkan `.spv` shaders are loaded from the repo tree at runtime while the CPU kernels
+    are baked into `DotLLM.Cpu.dll`. Stale binaries therefore give a live GPU path against a
+    stale CPU oracle, and the cross-backend parity test reports a large, specific, entirely
+    fictitious divergence. It cost a session once (bielik-1.5b-q3_k_m, L-inf 14.586 vs 1.4818
+    on a fresh build).
+
+    Raises on failure: a sweep that cannot build must abort loudly, never produce numbers.
+    """
+    cmd = ["dotnet", "build", str(project), "-c", configuration, "--nologo", "-v", "minimal"]
+    log(f"[build] {' '.join(cmd)}")
+    started = time.time()
+    try:
+        p = subprocess.run(cmd, cwd=repo_root(), capture_output=True, text=True,
+                           errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"dotnet build exceeded {timeout}s - refusing to test stale binaries")
+    out = (p.stdout or "") + "\n" + (p.stderr or "")
+    log.detail(out)
+    if p.returncode != 0:
+        tail = [l for l in out.splitlines() if l.strip()][-6:]
+        raise RuntimeError("dotnet build FAILED (exit "
+                           f"{p.returncode}) - refusing to test stale binaries:\n  "
+                           + "\n  ".join(tail))
+    log(f"[build] ok in {int(time.time() - started)}s")
+
+
 def run_test(project: Path, filt: str, extra_env: dict, timeout: int, log: Log,
-             configuration: str, no_build: bool) -> tuple[str, str]:
-    """Returns (status, detail). status in passed/failed/skipped/timeout/error."""
+             configuration: str) -> tuple[str, str]:
+    """
+    Returns (status, detail). status in passed/failed/skipped/timeout/error.
+
+    #341: deliberately NO `--no-build`. `build_tests` already did the expensive compile before
+    the GPU lock was taken, so this incremental build is a near-no-op — but it is the thing
+    that guarantees the assemblies under test match the working tree, including any file that
+    changed mid-sweep.
+    """
     cmd = ["dotnet", "test", str(project), "-c", configuration, "--filter", filt,
            "--nologo", "-v", "minimal"]
-    if no_build:
-        cmd.append("--no-build")
     env = dict(os.environ)
     env.update(extra_env)
     env["DOTLLM_PARITY_SWEEP"] = "1"
@@ -519,11 +607,24 @@ GLYPH = {"passed": "PASS", "failed": "FAIL", "skipped": "SKIP", "timeout": "TIME
          "fetching": "fetc", "testing": "test"}
 
 
+def build_tag(entry: dict) -> str:
+    """
+    The commit a recorded result was produced against (#341). `?` means the entry predates
+    provenance recording — i.e. it may have come from binaries of unknown vintage and should
+    be re-run before it is believed.
+    """
+    b = entry.get("build")
+    if not isinstance(b, dict) or not b.get("commit_short"):
+        return "?"
+    return b["commit_short"][:8] + ("+d" if b.get("dirty") else "")
+
+
 def report(models: list[dict], state: State) -> None:
     print()
-    print("  status  size    cached  model                          detail")
-    print("  ------  ------  ------  -----------------------------  " + "-" * 44)
+    print("  status  size    cached  built-at   model                          detail")
+    print("  ------  ------  ------  ---------  -----------------------------  " + "-" * 40)
     tally: dict[str, int] = {}
+    unprovenanced = 0
     for m in models:
         e = state.get(m["id"])
         st = e.get("status", "pending")
@@ -534,10 +635,17 @@ def report(models: list[dict], state: State) -> None:
             pre = "held" if st not in TERMINAL else "del"   # ours: on disk / cleaned up
         else:
             pre = "-"
+        tag = build_tag(e)
+        if tag == "?" and st in TERMINAL:
+            unprovenanced += 1
         print(f"  {GLYPH.get(st, st):6} {gb(e.get('size_bytes') or m.get('size_bytes')):>6}"
-              f"  {pre:>6}  {m['id']:<29}  {str(e.get('detail', ''))[:44]}")
-    print("  " + "-" * 92)
+              f"  {pre:>6}  {tag:<9}  {m['id']:<29}  {str(e.get('detail', ''))[:40]}")
+    print("  " + "-" * 100)
     print("  " + "  ".join(f"{k}={v}" for k, v in sorted(tally.items())))
+    if unprovenanced:
+        print(f"  NOTE: {unprovenanced} terminal result(s) carry no build stamp - they were "
+              f"recorded before #341 and the binaries they used are unknown. Re-run with "
+              f"--force before trusting them.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -563,12 +671,19 @@ def main() -> int:
     ap.add_argument("--fetch-timeout", type=int, default=DEFAULT_FETCH_TIMEOUT)
     ap.add_argument("--test-timeout", type=int, default=None, help="override per-model timeout")
     ap.add_argument("--configuration", default="Release")
-    ap.add_argument("--no-build", action="store_true", default=True,
-                    help="pass --no-build to dotnet test (default; build once up front)")
-    ap.add_argument("--build", dest="no_build", action="store_false",
-                    help="let each dotnet test invocation build")
+    # #341: `--no-build` is gone, not merely defaulted off. It is kept only as a rejected
+    # flag so that a stale script/runbook/muscle-memory invocation fails loudly with the
+    # reason, rather than argparse's generic "unrecognized arguments".
+    ap.add_argument("--no-build", action="store_true",
+                    help=argparse.SUPPRESS)
     ap.add_argument("--keep", action="store_true", help="do not delete fetched models")
     args = ap.parse_args()
+
+    if args.no_build:
+        print("--no-build is refused: this sweep tested stale binaries once and reported a "
+              "fictitious Q3_K parity regression (fork issue #341). The build is incremental "
+              "and runs before the GPU lock is taken.", file=sys.stderr)
+        return 2
 
     cfg = json.loads(Path(args.models).read_text(encoding="utf-8"))
     project = repo_root() / cfg.get("test_project",
@@ -656,6 +771,20 @@ def main() -> int:
         report(cfg["models"], state)
         return 0
 
+    # ── build ONCE, before any GPU lock is taken, and abort loudly on failure (#341) ──
+    stamp = build_stamp()
+    log(f"[sweep] code under test: {stamp['commit_short']} ({stamp['branch']})"
+        f"{'  *** DIRTY WORKING TREE ***' if stamp['dirty'] else ''}  in {stamp['worktree']}")
+    try:
+        build_tests(project, args.configuration, log)
+    except Exception as ex:                                   # noqa: BLE001
+        log(f"[sweep] ABORT: {ex}")
+        log("[sweep] no models were tested - a sweep must never report parity numbers "
+            "produced by binaries it did not just build.")
+        log.close()
+        return 1
+    stamp["built_at"] = now()
+
     signal.signal(signal.SIGINT, _on_sigint)
     done = 0
 
@@ -736,17 +865,19 @@ def main() -> int:
                 env = {m["env"]: str(fetched_path)} if m.get("env") else {}
                 timeout = args.test_timeout or m.get("timeout_sec", DEFAULT_TEST_TIMEOUT)
                 status, detail = run_test(project, m["filter"], env, timeout, log,
-                                          args.configuration, args.no_build)
+                                          args.configuration)
             finally:
                 lock_release(log)
 
             state.set(mid, status=status, detail=detail, size_bytes=size,
-                      preexisting=preexisting, owned=owned, repo=m["repo"], file=m["file"])
-            log(f"    {status.upper()}: {detail}")
+                      preexisting=preexisting, owned=owned, repo=m["repo"], file=m["file"],
+                      build=stamp)
+            log(f"    {status.upper()}: {detail}  [{stamp['commit_short']}"
+                f"{'+dirty' if stamp['dirty'] else ''}]")
 
         except subprocess.TimeoutExpired:
             state.set(mid, status="timeout", detail=f"fetch exceeded {args.fetch_timeout}s",
-                      size_bytes=size, preexisting=preexisting, owned=owned)
+                      size_bytes=size, preexisting=preexisting, owned=owned, build=stamp)
             log(f"    TIMEOUT during fetch")
         except KeyboardInterrupt:
             deferred = True   # keep the bytes; the next run resumes from here
@@ -756,7 +887,7 @@ def main() -> int:
             raise
         except Exception as ex:                      # noqa: BLE001 — one bad model must not end the run
             state.set(mid, status="error", detail=f"{type(ex).__name__}: {ex}"[:400],
-                      size_bytes=size, preexisting=preexisting, owned=owned)
+                      size_bytes=size, preexisting=preexisting, owned=owned, build=stamp)
             log(f"    ERROR: {type(ex).__name__}: {ex}")
         finally:
             # ── self-clean: only what WE brought in, and only once we are done ──

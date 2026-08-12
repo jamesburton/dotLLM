@@ -298,7 +298,16 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         if (needsEmbedF32)
         {
             long totalElems = (long)config.VocabSize * hiddenSize;
-            embedF32Device = AllocDevice(totalElems * sizeof(float));
+            long embedF32Bytes = totalElems * sizeof(float);
+            // No native F32-hidden-state embedding-lookup kernel for this quant type
+            // (LaunchEmbeddingLookupF32 only covers F32/F16/Q8_0) — about to keep BOTH the
+            // raw quant bytes (tokenEmbedDevice, retained for the tied LM head's native GEMV)
+            // and a full F32 expansion of the whole vocab table resident for the model's
+            // lifetime. Gated: see CudaKernels.EnsureQuantExpansionAllowed.
+            CudaKernels.EnsureQuantExpansionAllowed(
+                embDesc.QuantizationType, "token embedding table", embTotalBytes, embedF32Bytes);
+
+            embedF32Device = AllocDevice(embedF32Bytes);
             ownsEmbedF32 = true;
             // Host-side full-table dequant then H2D — once per load.
             float[] embedF32Host = new float[totalElems];
@@ -506,7 +515,13 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         if (needsEmbedF32)
         {
             long totalElems = (long)config.VocabSize * hiddenSize;
-            embedF32Device = AllocDevice(totalElems * sizeof(float));
+            long embedF32Bytes = totalElems * sizeof(float);
+            // Same gate as LoadFromGguf's identical fallback — see
+            // CudaKernels.EnsureQuantExpansionAllowed.
+            CudaKernels.EnsureQuantExpansionAllowed(
+                embDesc.QuantizationType, "token embedding table", embTotalBytes, embedF32Bytes);
+
+            embedF32Device = AllocDevice(embedF32Bytes);
             ownsEmbedF32 = true;
             float[] embedF32Host = new float[totalElems];
             Dequantize.ToFloat32(dataBase + (nint)embDesc.DataOffset, totalElems,

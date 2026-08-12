@@ -391,6 +391,13 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 },
                 _ => null // auto/none — no constraint
             };
+
+            // The constraint emits a BARE JSON object — it cannot produce the model's envelope
+            // (<tool_call>, <|python_tag|>, [TOOL_CALLS]). Parse constrained output with the
+            // markerless parser, or the tool call is silently lost (#325). argumentsKey above is
+            // deliberately computed from the model parser first.
+            if (responseFormat is not null && toolCallParser is not null)
+                toolCallParser = ToolCallParserFactory.ForToolChoice(toolChoice, toolCallParser);
         }
 
         var inferenceOptions = new InferenceOptions

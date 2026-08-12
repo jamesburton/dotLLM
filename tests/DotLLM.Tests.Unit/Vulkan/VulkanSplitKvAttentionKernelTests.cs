@@ -1,4 +1,4 @@
-using DotLLM.Core.Attention;
+﻿using DotLLM.Core.Attention;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Core.PositionEncoding;
 using DotLLM.Vulkan;
@@ -37,22 +37,27 @@ public class VulkanSplitKvAttentionKernelTests
     [SkippableFact]
     public void Decode_Gqa_TwoSplits_Even()
     {
-        // seqKv=400 -> S=2 (ceil(400/256)), splitLen=200 (even). GQA 4/2.
+        // seqKv=400, numHeads=4 -> byOccupancy=64, byKv=ceil(400/16)=25 -> S=25,
+        // splitLen=16 (even, no ragged tail). GQA 4/2. (The old comment here said
+        // S=2 from a MinKvPerSplit of 256; issue #143 lowered that floor to 16 —
+        // see issue #331.)
         RunOne(seqKv: 400, numHeads: 4, numKvHeads: 2, headDim: 64, positionOffset: 399);
     }
 
     [SkippableFact]
     public void Decode_Gqa_UnevenLastSplit()
     {
-        // seqKv=777 -> S=4, splitLen=195 -> splits [0,195)[195,390)[390,585)[585,777):
-        // last split is 192 wide (uneven). Discriminates a split-boundary bug.
+        // seqKv=777, numHeads=4 -> S=min(64, ceil(777/16)=49)=49, splitLen=16:
+        // 48 full splits of 16 plus a ragged last split of 9. Discriminates a
+        // split-boundary bug.
         RunOne(seqKv: 777, numHeads: 4, numKvHeads: 2, headDim: 64, positionOffset: 776);
     }
 
     [SkippableFact]
     public void Decode_SmolLm_Gqa8_LongContext()
     {
-        // SmolLM head config (9/3) at 1024 context -> S=4.
+        // SmolLM head config (9/3) at 1024 context -> byOccupancy=256/9=28,
+        // byKv=64 -> S=28, splitLen=37 (ragged last split of 25).
         RunOne(seqKv: 1024, numHeads: 9, numKvHeads: 3, headDim: 64, positionOffset: 1023);
     }
 
@@ -60,6 +65,7 @@ public class VulkanSplitKvAttentionKernelTests
     public void Decode_HeadDim128()
     {
         // Llama-style head_dim 128 (one lane handles 2 dims at sgSize=64).
+        // numHeads=8 -> byOccupancy=32, byKv=ceil(600/16)=38 -> S=32.
         RunOne(seqKv: 600, numHeads: 8, numKvHeads: 8, headDim: 128, positionOffset: 599);
     }
 

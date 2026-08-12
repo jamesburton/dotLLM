@@ -244,7 +244,7 @@ internal sealed class CudaWeights : IDisposable
             // No per-row kernel (e.g. Q4_0, or K-quant with hidden not a multiple
             // of 256) — dequant the entire table to FP16 once at load.
             tokenEmbed = UploadAndDequant(cpuWeights.TokenEmbedWeight, tokenEmbedQt,
-                config.VocabSize, config.HiddenSize, allocs, kernels, stream);
+                config.VocabSize, config.HiddenSize, allocs, kernels, stream, "token embedding table");
             tokenEmbedQt = QuantizationType.F16;
         }
 
@@ -264,7 +264,7 @@ internal sealed class CudaWeights : IDisposable
             bool lmHeadHasGemv = kernels.HasLoadedQuantizedGemv(cpuWeights.OutputQuantType);
             outputWeight = (!IsQuantized(cpuWeights.OutputQuantType) || !lmHeadHasGemv)
                 ? UploadAndDequant(cpuWeights.OutputWeight, cpuWeights.OutputQuantType,
-                    cpuWeights.OutputOutputDim, cpuWeights.OutputInputDim, allocs, kernels, stream)
+                    cpuWeights.OutputOutputDim, cpuWeights.OutputInputDim, allocs, kernels, stream, "LM head")
                 : 0;
         }
 
@@ -292,7 +292,8 @@ internal sealed class CudaWeights : IDisposable
         for (int i = 0; i < layerCount; i++)
         {
             // cpuWeights.Layers is indexed globally; layers array is 0-based (local to this CUDA slice).
-            ref readonly var lw = ref cpuWeights.Layers[firstLayer + i];
+            int globalLayer = firstLayer + i;
+            ref readonly var lw = ref cpuWeights.Layers[globalLayer];
 
             // MLA layers do NOT carry GQA Q/K/V tensors — those slots are zero on
             // the CPU side. Skip the GQA upload path entirely; CudaMlaWeightsLoader
@@ -318,12 +319,12 @@ internal sealed class CudaWeights : IDisposable
             nint qNorm = 0, kNorm = 0;
             if (!isMlaLayer)
             {
-                q = SkipFp16(lw.QQuantType, kernels) ? 0 : UploadAndDequant(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim, allocs, kernels, stream);
-                k = SkipFp16(lw.KQuantType, kernels) ? 0 : UploadAndDequant(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs, kernels, stream);
+                q = SkipFp16(lw.QQuantType, kernels) ? 0 : UploadAndDequant(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim, allocs, kernels, stream, $"layer {globalLayer} Q projection");
+                k = SkipFp16(lw.KQuantType, kernels) ? 0 : UploadAndDequant(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs, kernels, stream, $"layer {globalLayer} K projection");
                 // V-from-K (gemma4 global layers): no attn_v.weight — leave V slots 0;
                 // the gemma4 forward copies the raw K projection into V.
-                v = (vFromK || SkipFp16(lw.VQuantType, kernels)) ? 0 : UploadAndDequant(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs, kernels, stream);
-                o = SkipFp16(lw.OQuantType, kernels) ? 0 : UploadAndDequant(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim, allocs, kernels, stream);
+                v = (vFromK || SkipFp16(lw.VQuantType, kernels)) ? 0 : UploadAndDequant(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs, kernels, stream, $"layer {globalLayer} V projection");
+                o = SkipFp16(lw.OQuantType, kernels) ? 0 : UploadAndDequant(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim, allocs, kernels, stream, $"layer {globalLayer} O projection");
 
                 // ── Upload raw quantized Q/K/V weights ──
                 // When fusion is possible (shared quant type + input dim, GEMV kernel exists),
@@ -389,9 +390,9 @@ internal sealed class CudaWeights : IDisposable
             // dense upload for non-MoE layers AND for gemma4 layers.
             if (!isMoeLayer || isGemma4Layer)
             {
-                gate = SkipFp16(lw.GateQuantType, kernels) ? 0 : UploadAndDequant(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim, allocs, kernels, stream);
-                up = SkipFp16(lw.UpQuantType, kernels) ? 0 : UploadAndDequant(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim, allocs, kernels, stream);
-                down = SkipFp16(lw.DownQuantType, kernels) ? 0 : UploadAndDequant(lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim, allocs, kernels, stream);
+                gate = SkipFp16(lw.GateQuantType, kernels) ? 0 : UploadAndDequant(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim, allocs, kernels, stream, $"layer {globalLayer} Gate projection");
+                up = SkipFp16(lw.UpQuantType, kernels) ? 0 : UploadAndDequant(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim, allocs, kernels, stream, $"layer {globalLayer} Up projection");
+                down = SkipFp16(lw.DownQuantType, kernels) ? 0 : UploadAndDequant(lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim, allocs, kernels, stream, $"layer {globalLayer} Down projection");
 
                 // ── Upload raw quantized Gate/Up weights (same packing strategy as Q/K/V) ──
                 if (!CudaKernels.DisablePackedGateUp)
@@ -618,7 +619,8 @@ internal sealed class CudaWeights : IDisposable
     /// <summary>Upload quantized weight to GPU, then dequantize to FP16 on device.</summary>
     private static nint UploadAndDequant(nint hostPtr, QuantizationType qt,
                                            int outputDim, int inputDim,
-                                           List<nint> allocs, CudaKernels kernels, nint stream)
+                                           List<nint> allocs, CudaKernels kernels, nint stream,
+                                           string tensorLabel)
     {
         // 64-bit: `outputDim * inputDim` overflows int for a tensor of >2^31 elements
         // (e.g. a 256k-vocab x 16384-hidden LM head = 4.2e9). Every byte-size below already
@@ -666,15 +668,26 @@ internal sealed class CudaWeights : IDisposable
             return devI2sFp16;
         }
 
-        // Quantized: upload raw bytes, dequant to FP16 on device
+        // No dedicated handling above (no native GEMV/MMQ kernel for this type) — about to
+        // fall back to a full, model-lifetime-resident dequant. Gated: see
+        // CudaKernels.EnsureQuantExpansionAllowed for why this defaults to a hard failure.
         long quantBytes = Dequantize.RowByteSize(inputDim, qt) * outputDim;
+        long fp16Bytes = (long)totalElements * sizeof(ushort);
+        CudaKernels.EnsureQuantExpansionAllowed(qt, tensorLabel, quantBytes, fp16Bytes);
+
+        // Quantized: upload raw bytes, dequant to FP16 on device
         nint devQuant = AllocAndUpload(hostPtr, quantBytes, allocs);
 
-        long fp16Bytes = (long)totalElements * sizeof(ushort);
         CudaDriverApi.cuMemAlloc_v2(out nint devFp16, (nuint)fp16Bytes).ThrowOnError();
         allocs.Add(devFp16);
 
         kernels.LaunchDequantToF16(devQuant, qt, devFp16, checked((int)totalElements), stream);
+        // Free the transient raw-quant upload once the dequant kernel has consumed it — it is
+        // never read again (mirrors the F32 branch above, which already frees its own
+        // transient upload the same way).
+        CudaDriverApi.cuStreamSynchronize(stream).ThrowOnError();
+        allocs.Remove(devQuant);
+        CudaDriverApi.cuMemFree_v2(devQuant);
         return devFp16;
     }
 

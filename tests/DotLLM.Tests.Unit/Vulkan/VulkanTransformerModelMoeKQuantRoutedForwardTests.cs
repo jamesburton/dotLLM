@@ -291,6 +291,45 @@ public sealed class VulkanTransformerModelMoeKQuantRoutedForwardTests : IDisposa
     }
 
     /// <summary>
+    /// The #326 preflight's footprint must equal what the #327 per-bank load will ACTUALLY
+    /// allocate. These two landed on separate branches — #326 wrote its accounting while the
+    /// skip was still model-global ("all 78 banks get F32'd"), and #327 then made the skip
+    /// per-bank without the accounting following it. Charging every bank of every MoE layer
+    /// over-reports the footprint, which matters because
+    /// <see cref="VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable"/> turns that number into
+    /// a hard refusal — an over-report can refuse a load the per-bank path just made fit.
+    /// </summary>
+    /// <remarks>
+    /// Discriminating by construction: this fixture's single MoE layer has gate/up resident
+    /// (Q4_K) and only down falling back (Q5_0), so the correct answer is ONE bank's worth of
+    /// F32 and the old all-or-nothing answer is THREE — a 3x margin, not a tolerance question.
+    /// </remarks>
+    [SkippableFact]
+    public void PlanMoeF32HostDequant_ChargesOnlyTheBanksThatActuallyFallBack()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+
+        string path = WriteDeepSeekV2MixedResidencyFixture();
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+
+        var plan = VulkanWeights.PlanMoeF32HostDequant(device, gguf, config);
+
+        // One expert bank, F32: numExperts * sizeof(float) * moeIntermediate * hiddenSize.
+        const long OneBankF32Bytes = (long)DsNumExperts * sizeof(float) * DsMoeIntermediate * DsHiddenSize;
+
+        Assert.False(plan.CanSkip);
+        Assert.Equal(3, plan.TotalBanks);
+        var fallback = Assert.Single(plan.Fallbacks);
+        Assert.Equal("ffn_down_exps.weight", fallback.Bank);
+        Assert.Equal(QuantizationType.Q5_0, fallback.Quant);
+
+        Assert.Equal(OneBankF32Bytes, plan.HostF32Bytes);
+        Assert.NotEqual(3 * OneBankF32Bytes, plan.HostF32Bytes); // the pre-#327 all-or-nothing answer
+    }
+
+    /// <summary>
     /// Reflects into the Vulkan model's PRIVATE <c>_weights</c> field (the only part not
     /// reachable via InternalsVisibleTo) to read the on-device quant type each routed
     /// bank (gate/down/up) actually resolved to for the given layer — the same fields

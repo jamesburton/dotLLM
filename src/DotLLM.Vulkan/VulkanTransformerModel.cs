@@ -668,12 +668,16 @@ public sealed class VulkanTransformerModel : IModel
     private readonly VulkanFlashAttentionF32Kernel? _flashAttention;
     private readonly VulkanFlashAttentionCoopmatKernel? _flashAttentionCoopmat;
     /// <summary>
-    /// Split-KV (Flash-Decoding) attention kernel for the long-context decode
-    /// path (seqQ == 1). Null when the SPVs are missing (older builds) or the
+    /// Split-KV (Flash-Decoding) attention kernel for the decode path
+    /// (seqQ == 1). Null when the SPVs are missing (older builds) or the
     /// env-var opt-out is set. Even when present it is used only for shapes that
-    /// actually split (<see cref="VulkanSplitKvAttentionKernel.WouldSplit"/>);
-    /// short context falls through to <see cref="_attention"/>, keeping that path
-    /// bit-identical to before.
+    /// actually split (<see cref="VulkanSplitKvAttentionKernel.WouldSplit"/>).
+    /// <b>That is not a "long context only" condition</b>: with the shipping
+    /// defaults it is true from <c>seqKv &gt;= 17</c> for any model with
+    /// <c>numHeads &lt;= 128</c> — see <see cref="DisableSplitDecodeEnvVar"/> for
+    /// the threshold derivation and the evidence behind shipping it on by default.
+    /// Only <c>seqKv &lt;= 16</c> (and <c>numHeads &gt; 128</c>) falls through to
+    /// <see cref="_attention"/> bit-identically.
     /// </summary>
     private readonly VulkanSplitKvAttentionKernel? _splitKvAttention;
     private readonly SwiGluF32Kernel _swiglu;
@@ -689,6 +693,10 @@ public sealed class VulkanTransformerModel : IModel
     // created only when Config.EmbeddingScale is set. Null otherwise. Also
     // reused for the Gemma-4 per-layer output scale (layer_output_scale).
     private readonly ScaleInplaceF32Kernel? _embedScale;
+    // Device-resident Q8_0 token-embedding gather (issue #352). Non-null only when
+    // VulkanWeights kept the embedding table in its raw Q8_0 layout instead of
+    // widening it to F32; null => the legacy vkCmdCopyBuffer F32 row gather.
+    private readonly Q8_0EmbedGatherF32Kernel? _embedGatherQ8;
     // Unit-gamma (all-ones) [maxHeadDim] vector for Gemma-4's weight-less V-norm
     // (per-kv-head RMSNorm with no scale). Lazily allocated on first use.
     private VulkanDevice.Buffer? _gemma4OnesVec;
@@ -974,7 +982,9 @@ public sealed class VulkanTransformerModel : IModel
         VulkanFlashAttentionCoopmatKernel? flashAttentionCoopmat,
         VulkanSplitKvAttentionKernel? splitKvAttention,
         SwiGluF32Kernel swiglu, GeGluTanhF32Kernel? geglu, ReLU2GluF32Kernel? relu2glu,
-        ScaleInplaceF32Kernel? embedScale, AddKernel add,
+        ScaleInplaceF32Kernel? embedScale,
+        Q8_0EmbedGatherF32Kernel? embedGatherQ8,
+        AddKernel add,
         BiasAddF32Kernel biasAdd,
         AttentionMlaF32Kernel? mlaAttention, RopeMlaF32Kernel? mlaRope, MlaKvSplitF32Kernel? mlaKvSplit,
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax, MoeIndexedMatmulF32Kernel? moeIndexedMatmul,
@@ -1092,6 +1102,7 @@ public sealed class VulkanTransformerModel : IModel
         _geglu = geglu;
         _relu2glu = relu2glu;
         _embedScale = embedScale;
+        _embedGatherQ8 = embedGatherQ8;
         _add = add;
         _biasAdd = biasAdd;
         _mlaAttention = mlaAttention;
@@ -1163,6 +1174,13 @@ public sealed class VulkanTransformerModel : IModel
             // until #191. Resolved PER BANK (#327): one unsupported sibling (e.g. a Q5_0
             // down bank) no longer forces every other bank in the model to pay for a host
             // F32 array it will never read.
+            // #326: when banks do fall back, say what that will cost and why BEFORE
+            // allocating it — otherwise the load exhausts host RAM and reports a bare
+            // OutOfMemoryException inside SliceExpertsToF32. The plan accounts for exactly
+            // the banks the selector below will NOT skip, so the two agree by construction.
+            var moePlan = VulkanWeights.PlanMoeF32HostDequant(device, gguf, config);
+            VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(
+                moePlan, VulkanWeights.HostPhysicalMemoryBytes());
             var moeBankResidency = VulkanWeights.ResolveMoeBankResidency(device, gguf, config);
             var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config,
                 moeBankSkipSelector: layerIdx => moeBankResidency.TryGetValue(layerIdx, out var r)
@@ -1194,7 +1212,10 @@ public sealed class VulkanTransformerModel : IModel
         RejectUnsupportedArchitecture(config);
 
         spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
-        // #191/#327: see the other LoadFromGguf overload's comment.
+        // #191/#327/#326: see the other LoadFromGguf overload's comment.
+        var moePlan = VulkanWeights.PlanMoeF32HostDequant(device, gguf, config);
+        VulkanWeights.ThrowIfMoeF32HostDequantUnaffordable(
+            moePlan, VulkanWeights.HostPhysicalMemoryBytes());
         var moeBankResidency = VulkanWeights.ResolveMoeBankResidency(device, gguf, config);
         var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config,
             moeBankSkipSelector: layerIdx => moeBankResidency.TryGetValue(layerIdx, out var r)
@@ -1651,9 +1672,10 @@ public sealed class VulkanTransformerModel : IModel
                 || config.HeadDim > VulkanFlashAttentionCoopmatKernel.MaxHeadDim
                 ? null
                 : VulkanFlashAttentionCoopmatKernel.TryCreate(device, spvDir);
-        // Optional split-KV (Flash-Decoding) kernel for the long-context decode
-        // path (seqQ == 1). Disabled by env-var opt-out or missing SPV (older
-        // builds); short-context decode still routes to the per-token kernel.
+        // Optional split-KV (Flash-Decoding) kernel for the decode path
+        // (seqQ == 1). Disabled by env-var opt-out or missing SPV (older
+        // builds); only seqKv <= 16 decode still routes to the per-token kernel
+        // (issue #331 — NOT "everything below 256", see DisableSplitDecodeEnvVar).
         VulkanSplitKvAttentionKernel? splitKvAttention =
             IsSplitDecodeDisabled() || config.HeadDim > VulkanSplitKvAttentionKernel.MaxHeadDim
                 ? null
@@ -1675,6 +1697,13 @@ public sealed class VulkanTransformerModel : IModel
         ScaleInplaceF32Kernel? embedScale =
             config.EmbeddingScale is float es && es != 1.0f
                 ? ScaleInplaceF32Kernel.Create(device, spvDir)
+                : null;
+        // Device-resident Q8_0 embedding gather (issue #352) — created only when
+        // the upload actually kept the table quantized, so a model whose embed
+        // was widened (or stubbed for a pipeline stage) keeps the F32 copy path.
+        Q8_0EmbedGatherF32Kernel? embedGatherQ8 =
+            weights.TokenEmbedDeviceQuantType == QuantizationType.Q8_0
+                ? Q8_0EmbedGatherF32Kernel.Create(device, spvDir)
                 : null;
         var add = AddKernel.Create(device, spvDir);
         var biasAdd = BiasAddF32Kernel.Create(device, spvDir);
@@ -1824,7 +1853,9 @@ public sealed class VulkanTransformerModel : IModel
             matmulQ2KMmq,
             matmulQ3KMmq,
             matmulIq2XxsMmq,
-            rmsnorm, rope, ropeKvWrite, attention, flashAttention, flashAttentionCoopmat, splitKvAttention, swiglu, geglu, relu2glu, embedScale, add,
+            rmsnorm, rope, ropeKvWrite, attention, flashAttention, flashAttentionCoopmat, splitKvAttention, swiglu, geglu, relu2glu, embedScale,
+            embedGatherQ8,
+            add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
             moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulQ8,
@@ -1869,11 +1900,61 @@ public sealed class VulkanTransformerModel : IModel
         Environment.GetEnvironmentVariable(DisableCoopmatAttentionEnvVar) == "1";
 
     /// <summary>
-    /// Env-var opt-out for the split-KV (Flash-Decoding) decode path. Set
-    /// <c>DOTLLM_VULKAN_DISABLE_SPLIT_DECODE=1</c> to force every decode dispatch
-    /// onto the legacy per-token <see cref="AttentionF32Kernel"/> — used for
-    /// same-session A/B benchmarking of the split-KV win.
+    /// Env-var opt-<b>out</b> for the split-KV (Flash-Decoding) decode path
+    /// (issues #345/#346). Set <c>DOTLLM_VULKAN_DISABLE_SPLIT_DECODE=1</c> to force
+    /// every decode dispatch onto the legacy per-token
+    /// <see cref="AttentionF32Kernel"/> — used for same-session A/B benchmarking of
+    /// the split-KV win, and as the escape hatch if a driver miscompiles the split
+    /// shaders. <b>Unset means ON</b>; the ON-by-default decision is recorded below.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Engagement threshold: seqKv &gt;= 17, not 256 (issue #331).</b>
+    /// <see cref="VulkanSplitKvAttentionKernel.ComputeSplits"/> is
+    /// <c>S = min(TargetWorkgroups / numHeads, ceil(seqKv / MinKvPerSplit))</c> and
+    /// the router takes the split kernel at <c>S &gt;= 2</c>. With the shipping
+    /// defaults (<c>TargetWorkgroups = 256</c>; <c>MinKvPerSplit = 16</c> since
+    /// issue #143 lowered it from 256) the KV term reaches 2 at <c>seqKv = 17</c>
+    /// and the occupancy term is &gt;= 2 for every <c>numHeads &lt;= 128</c>. #345's
+    /// original "short context is bit-identical, so exposure starts past 256"
+    /// argument rested on the old 256 floor and has been stale since #143 — the
+    /// split path is live on essentially every decode step of every real model.
+    /// </para>
+    /// <para>
+    /// <b>Why it nevertheless ships ON — the evidence (issue #331).</b> The split
+    /// kernel differs from the per-token kernel by cross-split online-softmax
+    /// reassociation (plus a coalesced subgroup Q·K reduction and shifted KV tile
+    /// alignment), so it is divergence-<i>capable</i> in the same class CUDA's
+    /// #183/#222 characterised, and exact-token equality over a long generation is
+    /// not a sustainable invariant for it. What matters is whether output
+    /// <i>quality</i> moves. Measured on Llama-3.2-3B-Instruct IQ4_XS / gfx1151,
+    /// ON vs forced-OFF, fresh model per arm
+    /// (<c>VulkanSplitDecodeParityTests</c>):
+    /// </para>
+    /// <list type="bullet">
+    ///   <item>Pre-engagement (<c>seqKv &lt; 17</c>) per-step NLL: <b>bit-identical</b>
+    ///         (max |Δ| exactly 0) — the gate itself is correct.</item>
+    ///   <item>Teacher-forced decode perplexity over 1007 post-engagement steps
+    ///         (depth 17-1024): 2.61653 → 2.61640, <b>−0.005%</b>.</item>
+    ///   <item>Same at the depth the win was measured at (3840-4096, S = 10):
+    ///         1.06913 → 1.06900, <b>−0.012%</b>.</item>
+    ///   <item>512-step greedy generation: first argmax flip at step 93 (depth 101)
+    ///         at a near-tie (top1−top2 margin 0.036), compounding thereafter —
+    ///         the expected signature, not a quality regression.</item>
+    /// </list>
+    /// <para>
+    /// For scale, this project rejected CUDA's #183 as a default at <b>+0.30%</b>
+    /// perplexity and accepted the CUDA MMA-decode GQA-split kernel as a default at
+    /// <b>−0.173%</b>. Vulkan split-KV moves perplexity by ~0.005-0.012% in the
+    /// <i>favourable</i> direction — 25x smaller than the accepted CUDA change and
+    /// ~60x smaller than the rejected one. Combined with the shipped win it buys
+    /// (2.1x decode at ctx 2048, 2.8x at ctx 4096), ON is the right default. The
+    /// regression guard is <c>VulkanSplitDecodeParityTests</c>, which asserts the
+    /// bit-exact pre-engagement segment and bounds the post-engagement perplexity
+    /// ratio; do not weaken it to an exact-token assertion over a long generation,
+    /// which would be permanently red for benign reasons.
+    /// </para>
+    /// </remarks>
     internal const string DisableSplitDecodeEnvVar = "DOTLLM_VULKAN_DISABLE_SPLIT_DECODE";
 
     internal static bool IsSplitDecodeDisabled() =>
@@ -1986,9 +2067,11 @@ public sealed class VulkanTransformerModel : IModel
         float softCap = 0.0f, float scaleOverride = 0.0f,
         AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
-        // Long-context decode (seqQ == 1): split the KV range across many
-        // workgroups (Flash-Decoding) when the shape is worth splitting. Short
-        // context falls through to the per-token kernel (bit-identical to before).
+        // Decode (seqQ == 1): split the KV range across many workgroups
+        // (Flash-Decoding) when the shape is worth splitting — which, with the
+        // shipping heuristic, means seqKv >= 17 on any model with <= 128 heads,
+        // i.e. nearly every decode step (issue #331). Only seqKv <= 16 falls
+        // through to the per-token kernel (bit-identical to before).
         if (_splitKvAttention is not null && seqQ == 1
             && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
             && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads))
@@ -2136,6 +2219,15 @@ public sealed class VulkanTransformerModel : IModel
 
     private static void RejectUnsupportedArchitecture(ModelConfig config)
     {
+        // Architectures with a dedicated Vulkan model class must say so BEFORE the generic
+        // "hybrid unsupported" message below — Qwen3MoeHybrid / Qwen3HybridDense / NemotronH
+        // all carry a HybridLayout, but VulkanQwen3MoeHybridTransformerModel,
+        // VulkanQwen3HybridDenseTransformerModel and VulkanNemotronHTransformerModel exist and
+        // are reached via VulkanModelLoader.CreateFromGguf. Reporting them as "not supported
+        // on the Vulkan backend yet" is simply untrue and sends the caller down a dead end
+        // (issue #324).
+        TransformerWeights.ThrowIfArchitectureNeedsDedicatedLoader(config);
+
         if (config.HybridLayout is not null || config.SsmConfig is not null || config.Mamba3Config is not null)
             throw new NotSupportedException("Hybrid SSM / Mamba architectures are not supported on the Vulkan backend yet.");
         // MLA: latent / hybrid cache modes are CPU-only for now; the Vulkan
@@ -2616,7 +2708,7 @@ public sealed class VulkanTransformerModel : IModel
         // HiddenState[t, :] for t in [0, totalTokens). Order matches packedTokens
         // (= per-seq concatenation in simpleIdx order).
         RecordEmbeddingGather(cmdBuf, packedTokens.AsSpan(0, totalTokens));
-        BarrierTransferToCompute(cmdBuf);
+        BarrierAfterEmbeddingGather(cmdBuf);
 
         // Per-seq token offset into the batched buffer. Used inside the layer loop
         // to slice Q/K/V/AttnOutput per sequence (computed once, reused per layer).
@@ -3043,7 +3135,7 @@ public sealed class VulkanTransformerModel : IModel
         if (!seedFromHidden)
         {
             RecordEmbeddingGather(cmdBuf, tokenIds);
-            BarrierTransferToCompute(cmdBuf);
+            BarrierAfterEmbeddingGather(cmdBuf);
         }
 
         // Gemma sqrt(hidden) embedding scaling — multiply the gathered
@@ -3921,6 +4013,7 @@ public sealed class VulkanTransformerModel : IModel
         _geglu?.InvalidateDescriptorCache();
         _relu2glu?.InvalidateDescriptorCache();
         _embedScale?.InvalidateDescriptorCache();
+        _embedGatherQ8?.InvalidateDescriptorCache();
         _add.InvalidateDescriptorCache();
         _biasAdd.InvalidateDescriptorCache();
         _mlaAttention?.InvalidateDescriptorCache();
@@ -4271,7 +4364,7 @@ public sealed class VulkanTransformerModel : IModel
         KernelSupport.HostToComputeBarrier(cmdBuf);
         _state.ResetHiddenSlot();
         RecordEmbeddingGather(cmdBuf, tokenIds);
-        BarrierTransferToCompute(cmdBuf);
+        BarrierAfterEmbeddingGather(cmdBuf);
         if (_embedScale is not null)
         {
             _embedScale.Record(cmdBuf, _state.HiddenState, seqLen * hiddenSize, Config.EmbeddingScale!.Value);
@@ -6588,9 +6681,36 @@ public sealed class VulkanTransformerModel : IModel
     /// For <c>seqLen=1</c> decode this is one call; for prefill it's
     /// <c>promptLen</c> calls, still dwarfed by the per-layer matmul cost.
     /// </remarks>
+    /// <summary>
+    /// Barrier between the embedding gather and its first consumer (the first
+    /// RMSNorm's COMPUTE read of HiddenState). The F32 gather is a TRANSFER
+    /// (<c>vkCmdCopyBuffer</c>); the device-resident quantized gather (issue
+    /// #352) is a COMPUTE dispatch — so the source stage differs.
+    /// </summary>
+    private void BarrierAfterEmbeddingGather(nint cmdBuf)
+    {
+        if (_embedGatherQ8 is not null) BarrierComputeToCompute(cmdBuf);
+        else BarrierTransferToCompute(cmdBuf);
+    }
+
     private void RecordEmbeddingGather(nint cmdBuf, ReadOnlySpan<int> tokenIds)
     {
         int hiddenSize = Config.HiddenSize;
+
+        // Device-resident quantized table (issue #352): the table never got
+        // widened to F32, so the gather is a dequantizing compute dispatch that
+        // reads the token ids from a device buffer instead of N row copies with
+        // host-resolved offsets. Bit-identical to the F32 copy path — the shader
+        // reproduces the CPU scalar dequant exactly.
+        if (_embedGatherQ8 is not null)
+        {
+            _device.Upload(MemoryMarshal.AsBytes(tokenIds), _state.TokenIdsBuffer);
+            _embedGatherQ8.Record(
+                cmdBuf, _weights.TokenEmbedding, _state.TokenIdsBuffer, _state.HiddenState,
+                tokenIds.Length, hiddenSize, Config.VocabSize);
+            return;
+        }
+
         long rowBytes = (long)hiddenSize * sizeof(float);
         var srcBuf = _weights.TokenEmbedding.Handle;
         var dstBuf = _state.HiddenState.Handle;
@@ -6670,6 +6790,7 @@ public sealed class VulkanTransformerModel : IModel
         _geglu?.Dispose();
         _relu2glu?.Dispose();
         _embedScale?.Dispose();
+        _embedGatherQ8?.Dispose();
         _gemma4OnesVec?.Dispose();
         _splitKvAttention?.Dispose();
         _flashAttention?.Dispose();
