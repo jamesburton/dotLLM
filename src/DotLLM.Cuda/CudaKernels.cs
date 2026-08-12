@@ -370,6 +370,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _moeGatherTokenRowsF32Func;
     // Issue #246 (BitNet-ternary MoE): additive router bias, applied before softmax/top-k.
     private readonly nint _moeGateBiasAddF32Func;
+    // Issue #348 (gpt-oss MoE): OAI-clamped SwiGLU activation.
+    private readonly nint _swigluOaiF32Func;
 
     // ── MoE grouped-GEMV kernels (Phase B — single launch across K_active experts) ──
     // One kernel computes (K_active × M) F16 outputs by walking K_active raw-quant
@@ -896,6 +898,7 @@ public sealed unsafe class CudaKernels : IDisposable
             _moeSigmoidLogitF32Func = _moeFfnModule.TryGetFunction("moe_sigmoid_logit_f32");
             _moeGatherTokenRowsF32Func = _moeFfnModule.TryGetFunction("moe_gather_token_rows_f32");
             _moeGateBiasAddF32Func = _moeFfnModule.TryGetFunction("moe_gate_bias_add_f32");
+            _swigluOaiF32Func = _moeFfnModule.TryGetFunction("swiglu_oai_f32");
         }
 
         // MoE grouped-GEMV (Phase B). One kernel walks K_active raw-quant per-expert
@@ -1117,6 +1120,15 @@ public sealed unsafe class CudaKernels : IDisposable
     /// (unused) otherwise.
     /// </summary>
     public bool HasMoeGateBiasAdd => _moeGateBiasAddF32Func != 0;
+
+    /// <summary>
+    /// True when the gpt-oss OAI-clamped-SwiGLU activation kernel (issue #348,
+    /// <see cref="LaunchSwiGLUOaiF32"/>) is loaded. Optional — a stale PTX build
+    /// without this symbol still loads; <see cref="CudaMoeFfn.Forward"/> throws
+    /// a descriptive error only if a model actually needs it
+    /// (<c>CudaMoeLayerWeights.UseSwiGluOai == true</c>).
+    /// </summary>
+    public bool HasSwiGluOai => _swigluOaiF32Func != 0;
 
     /// <summary>
     /// True when all kernels needed by <see cref="CudaMoeFfn"/>'s BitNet-ternary (I2_S)
@@ -5466,6 +5478,29 @@ public sealed unsafe class CudaKernels : IDisposable
         void** args = stackalloc void*[] {&logitsArg, &biasArg, &slArg, &neArg};
         uint gridDim = (uint)((seqLen * numExperts + BlockSize - 1) / BlockSize);
         CudaDriverApi.cuLaunchKernel(_moeGateBiasAddF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// gpt-oss clamped SwiGLU activation (issue #348): <c>out = x/(1+exp(-alpha*x)) * (y+1)</c>
+    /// where <c>x=min(gate,limit)</c>, <c>y=clamp(up,-limit,limit)</c>. Safe to call with
+    /// <paramref name="output"/> aliasing <paramref name="gate"/>.
+    /// </summary>
+    public void LaunchSwiGLUOaiF32(nint gate, nint up, nint output, int n, int seqLen,
+        float alpha, float limit, nint stream)
+    {
+        if (_swigluOaiF32Func == 0)
+            throw new InvalidOperationException(
+                "swiglu_oai_f32 kernel not available. Recompile native/kernels/moe_ffn.cu to PTX.");
+
+        nint gateArg = gate, upArg = up, outArg = output;
+        int nArg = n, slArg = seqLen;
+        float alphaArg = alpha, limitArg = limit;
+        void** args = stackalloc void*[] {&gateArg, &upArg, &outArg, &nArg, &slArg, &alphaArg, &limitArg};
+        uint total = (uint)(n * seqLen);
+        uint gridDim = (total + BlockSize - 1) / BlockSize;
+        CudaDriverApi.cuLaunchKernel(_swigluOaiF32Func,
                 gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
