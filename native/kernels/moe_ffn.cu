@@ -24,6 +24,9 @@
 //                                    moe_softmax_topk_f32 so it shifts both the top-k argmax
 //                                    AND the softmax probabilities — matches MoeSwiGluMlp.Route's
 //                                    CPU ordering exactly).
+//   swiglu_oai_f32                — gpt-oss clamped SwiGLU activation (issue #348):
+//                                    x=min(gate,limit); y=clamp(up,-limit,limit);
+//                                    out = x/(1+exp(-alpha*x)) * (y+1).
 
 #include <math.h>
 
@@ -96,6 +99,32 @@ extern "C" __global__ void __launch_bounds__(256) moe_gate_bias_add_f32(
     int stride = gridDim.x * blockDim.x;
     for (int i = idx; i < total; i += stride)
         logits[i] += bias[i % num_experts];
+}
+
+// ── swiglu_oai_f32 ───────────────────────────────────────────────────────
+//
+// gpt-oss clamped SwiGLU activation (issue #348, llama.cpp ggml_swiglu_oai):
+//   x = min(gate, limit)
+//   y = clamp(up, -limit, limit)
+//   out = x / (1 + exp(-alpha * x)) * (y + 1)
+// Matches DotLLM.Cpu.Kernels.MoeQuantSwiGluMlp.SwiGluOai exactly (alpha=1.702f,
+// limit=7.0f). This file is not in build_ptx.bat's FAST_MATH list, so expf()
+// here is precise — matching the CPU oracle's MathF.Exp, unlike swiglu_f32.cu's
+// fast-math sigmoid (see that file's header comment).
+extern "C" __global__ void __launch_bounds__(256) swiglu_oai_f32(
+    const float* __restrict__ gate, const float* __restrict__ up,
+    float* __restrict__ output, const int n, const int seq_len,
+    const float alpha, const float limit)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n * seq_len)
+    {
+        float g = gate[idx], u = up[idx];
+        float x = fminf(g, limit);
+        float y = fmaxf(fminf(u, limit), -limit);
+        float glu = x / (1.0f + expf(-alpha * x));
+        output[idx] = glu * (y + 1.0f);
+    }
 }
 
 // ── moe_softmax_topk_f32 ─────────────────────────────────────────────────
