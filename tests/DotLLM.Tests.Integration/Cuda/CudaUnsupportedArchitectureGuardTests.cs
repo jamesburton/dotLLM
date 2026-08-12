@@ -11,7 +11,8 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// architectures it has no dedicated CUDA loader for, instead of silently falling through to the
 /// generic <see cref="CudaTransformerModel"/> — which would either throw a confusing
 /// tensor-not-found error deep inside the generic loader (the #259 failure mode), or worse,
-/// silently produce wrong output on whichever tensors happen to coincide (the gpt-oss MoE case).
+/// silently produce wrong output on whichever tensors happen to coincide (the gpt-oss
+/// attention-sinks/SWA case).
 /// </summary>
 /// <remarks>
 /// The guard fires purely on <c>config.Architecture</c>, before any GGUF tensor is read, so any
@@ -25,6 +26,7 @@ public sealed class CudaUnsupportedArchitectureGuardTests
     [SkippableTheory]
     [InlineData(Architecture.Mamba3)]
     [InlineData(Architecture.NemotronH)]
+    [InlineData(Architecture.GptOss)]
     public void CreateFromGguf_UnsupportedArchitecture_ThrowsNotSupportedInsteadOfSilentFallthrough(
         Architecture architecture)
     {
