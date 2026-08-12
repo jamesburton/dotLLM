@@ -30,12 +30,9 @@ public sealed class Q4KDequantF32Kernel : VulkanComputeKernelBase
 
     private const int PushConstantBytes = 3 * sizeof(uint); // totalBlocks, srcUints, firstBlock
 
-    private readonly VulkanDevice _device;
-
     private Q4KDequantF32Kernel(VulkanDevice device, string spvDir)
         : base(device, spvDir, "q4_k_dequant_f32.spv", buffersPerSet: 2, pushConstantBytes: PushConstantBytes)
     {
-        _device = device;
     }
 
     /// <summary>Loads <c>q4_k_dequant_f32.spv</c> from the given directory and creates the pipeline.</summary>
@@ -44,7 +41,7 @@ public sealed class Q4KDequantF32Kernel : VulkanComputeKernelBase
     /// <summary>Dispatches the dequant synchronously (all chunks in one submit).</summary>
     public void Launch(VulkanDevice.Buffer src, VulkanDevice.Buffer dst, long totalBlocks)
     {
-        using var ctx = _device.CreateSubmitContext();
+        using var ctx = Device.CreateSubmitContext();
         ctx.Begin();
         Record(ctx.CommandBuffer, src, dst, totalBlocks);
         ctx.SubmitAndWait();
@@ -70,12 +67,14 @@ public sealed class Q4KDequantF32Kernel : VulkanComputeKernelBase
         uint srcUints = (uint)((srcMin + 3) / 4);
 
         Span<nint> buffers = stackalloc nint[2] { src.Handle, dst.Handle };
+        BindOnly(cmdBuf, buffers);
+
         Span<uint> pc = stackalloc uint[3] { (uint)totalBlocks, srcUints, 0 };
         for (long first = 0; first < totalBlocks; first += MaxBlocksPerDispatch)
         {
             uint count = (uint)Math.Min(MaxBlocksPerDispatch, totalBlocks - first);
             pc[2] = (uint)first;
-            BindAndPush(cmdBuf, buffers, pc);
+            PushConstantsOnly(cmdBuf, pc);
             VulkanApi.vkCmdDispatch(cmdBuf, count, 1, 1);
         }
     }

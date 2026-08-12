@@ -27,6 +27,23 @@ namespace DotLLM.Vulkan.Kernels;
 /// <c>Record</c> methods stay concrete — <c>buffersPerSet</c> and
 /// <c>pushConstantBytes</c> are resolved once, at construction).
 /// </para>
+/// <para>
+/// <b>Important:</b> <see cref="DescriptorSetCache.GetOrCreate"/> (called from
+/// <see cref="BindOnly"/>, and hence from <see cref="BindAndPush"/>) declares
+/// the dispatch's buffer-access set to the device's active hazard tracker
+/// every time it runs — not only on a cache miss. For a single-dispatch
+/// <c>Record</c>, call <see cref="BindAndPush"/> once. For a chunked dispatch
+/// (multiple <c>vkCmdDispatch</c> calls against the *same* buffers, differing
+/// only in push constants — e.g. the K-quant dequant kernels'
+/// <c>firstBlock</c>-chunked loop), call <see cref="BindOnly"/> exactly once
+/// before the loop and <see cref="PushConstantsOnly"/> per chunk inside it:
+/// calling <see cref="BindAndPush"/> (or <see cref="BindOnly"/>) once per
+/// chunk would re-arm hazard tracking on each iteration and — if a tracked
+/// forward is ever active — spuriously treat each chunk's write as a hazard
+/// against the previous chunk's write to the same destination buffer,
+/// emitting a redundant <c>vkCmdPipelineBarrier</c> per chunk even though the
+/// chunks write disjoint output and no inter-chunk barrier is needed.
+/// </para>
 /// </remarks>
 public abstract class VulkanComputeKernelBase : IDisposable
 {
@@ -36,6 +53,9 @@ public abstract class VulkanComputeKernelBase : IDisposable
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
+
+    /// <summary>The device this kernel was created against.</summary>
+    protected VulkanDevice Device => _device;
 
     /// <summary>
     /// Loads <paramref name="shaderFileName"/> from <paramref name="spvDir"/> and
@@ -86,14 +106,16 @@ public abstract class VulkanComputeKernelBase : IDisposable
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
     /// <summary>
-    /// Binds the pipeline, binds the (allocated-or-cached) descriptor set for
-    /// <paramref name="buffers"/>, and pushes <paramref name="pushConstants"/> into
-    /// <paramref name="cmdBuf"/>. Does not dispatch — the caller records
-    /// <c>vkCmdDispatch</c> itself, since dispatch geometry (and, for chunked
-    /// dispatches, repeated calls to this method with a per-chunk push-constant
-    /// block) is kernel-specific.
+    /// Binds the pipeline and binds the (allocated-or-cached) descriptor set for
+    /// <paramref name="buffers"/> into <paramref name="cmdBuf"/>. Does not push
+    /// constants or dispatch. This is the call that declares the dispatch's
+    /// buffer-access set to the device's active hazard tracker (via
+    /// <see cref="DescriptorSetCache.GetOrCreate"/>) — for a chunked dispatch that
+    /// reuses the same buffers across multiple <c>vkCmdDispatch</c> calls, call this
+    /// once before the loop, not once per chunk (see the hazard-tracking note on
+    /// this class).
     /// </summary>
-    protected unsafe void BindAndPush(nint cmdBuf, ReadOnlySpan<nint> buffers, ReadOnlySpan<uint> pushConstants)
+    protected void BindOnly(nint cmdBuf, ReadOnlySpan<nint> buffers)
     {
         nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
 
@@ -101,16 +123,37 @@ public abstract class VulkanComputeKernelBase : IDisposable
         VulkanApi.vkCmdBindDescriptorSets(
             cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
             0, 1, descriptorSet, 0, 0);
+    }
 
-        if (pushConstants.Length > 0)
+    /// <summary>
+    /// Pushes <paramref name="pushConstants"/> into <paramref name="cmdBuf"/> without
+    /// touching the pipeline/descriptor-set bind or the descriptor-set cache. Combine
+    /// with <see cref="BindOnly"/> for a chunked dispatch: bind once before the loop,
+    /// then call this once per chunk.
+    /// </summary>
+    protected unsafe void PushConstantsOnly(nint cmdBuf, ReadOnlySpan<uint> pushConstants)
+    {
+        fixed (uint* pcPtr = pushConstants)
         {
-            fixed (uint* pcPtr = pushConstants)
-            {
-                VulkanApi.vkCmdPushConstants(
-                    cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute,
-                    0, (uint)(pushConstants.Length * sizeof(uint)), (nint)pcPtr);
-            }
+            VulkanApi.vkCmdPushConstants(
+                cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute,
+                0, (uint)(pushConstants.Length * sizeof(uint)), (nint)pcPtr);
         }
+    }
+
+    /// <summary>
+    /// Binds the pipeline, binds the (allocated-or-cached) descriptor set for
+    /// <paramref name="buffers"/>, and pushes <paramref name="pushConstants"/> into
+    /// <paramref name="cmdBuf"/>. Does not dispatch — the caller records
+    /// <c>vkCmdDispatch</c> itself. Convenience wrapper of <see cref="BindOnly"/> +
+    /// <see cref="PushConstantsOnly"/> for the (common) single-dispatch case; do
+    /// <b>not</b> call this per chunk in a chunked dispatch — see the hazard-tracking
+    /// note on this class.
+    /// </summary>
+    protected void BindAndPush(nint cmdBuf, ReadOnlySpan<nint> buffers, ReadOnlySpan<uint> pushConstants)
+    {
+        BindOnly(cmdBuf, buffers);
+        PushConstantsOnly(cmdBuf, pushConstants);
     }
 
     /// <inheritdoc/>

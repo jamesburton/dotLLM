@@ -26,12 +26,9 @@ public sealed class Q5_0DequantF32Kernel : VulkanComputeKernelBase
 
     private const int PushConstantBytes = 2 * sizeof(uint);
 
-    private readonly VulkanDevice _device;
-
     private Q5_0DequantF32Kernel(VulkanDevice device, string spvDir)
         : base(device, spvDir, "q5_0_dequant_f32.spv", buffersPerSet: 2, pushConstantBytes: PushConstantBytes)
     {
-        _device = device;
     }
 
     /// <summary>Loads <c>q5_0_dequant_f32.spv</c> from the given directory and creates the pipeline.</summary>
@@ -40,7 +37,7 @@ public sealed class Q5_0DequantF32Kernel : VulkanComputeKernelBase
     /// <summary>Dispatches the dequant synchronously.</summary>
     public void Launch(VulkanDevice.Buffer src, VulkanDevice.Buffer dst, int totalBlocks)
     {
-        using var ctx = _device.CreateSubmitContext();
+        using var ctx = Device.CreateSubmitContext();
         ctx.Begin();
         Record(ctx.CommandBuffer, src, dst, totalBlocks);
         ctx.SubmitAndWait();

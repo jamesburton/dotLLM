@@ -23,12 +23,9 @@ public sealed class Q2KDequantF32Kernel : VulkanComputeKernelBase
 
     private const int PushConstantBytes = 2 * sizeof(uint);
 
-    private readonly VulkanDevice _device;
-
     private Q2KDequantF32Kernel(VulkanDevice device, string spvDir)
         : base(device, spvDir, "q2_k_dequant_f32.spv", buffersPerSet: 2, pushConstantBytes: PushConstantBytes)
     {
-        _device = device;
     }
 
     /// <summary>Loads <c>q2_k_dequant_f32.spv</c> from the given directory and creates the pipeline.</summary>
@@ -37,7 +34,7 @@ public sealed class Q2KDequantF32Kernel : VulkanComputeKernelBase
     /// <summary>Dispatches the dequant synchronously.</summary>
     public void Launch(VulkanDevice.Buffer src, VulkanDevice.Buffer dst, int totalBlocks)
     {
-        using var ctx = _device.CreateSubmitContext();
+        using var ctx = Device.CreateSubmitContext();
         ctx.Begin();
         Record(ctx.CommandBuffer, src, dst, totalBlocks);
         ctx.SubmitAndWait();
