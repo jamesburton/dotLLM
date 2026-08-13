@@ -1,4 +1,5 @@
 using DotLLM.Vulkan.Interop;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -14,9 +15,9 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class MatMulIq2XxsGemmF32Kernel : IDisposable
 {
     /// <summary>IQ2 super-block size in bytes.</summary>
-    public const int IQ2_XXSBlockBytes = 66;
+    public const int IQ2_XXSBlockBytes = QuantFormat.IQ2_XXSBlockBytes;
     /// <summary>Elements per IQ2 super-block.</summary>
-    public const int IQ2_XXSGroupSize = 256;
+    public const int IQ2_XXSGroupSize = QuantFormat.KQuantGroupSize;
 
     private const int TileM = 16;
     private const int TileN = 16;

@@ -1,4 +1,5 @@
 using DotLLM.Vulkan.Interop;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -24,10 +25,10 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class MatMulIq4NlMmqKernel : IDisposable
 {
     /// <summary>IQ4_NL block: fp16 d + qs[16].</summary>
-    public const int Iq4NlBlockBytes = 18;
+    public const int Iq4NlBlockBytes = QuantFormat.IQ4_NLBlockBytes;
 
     /// <summary>Elements per IQ4_NL block.</summary>
-    public const int Iq4NlGroupSize = 32;
+    public const int Iq4NlGroupSize = QuantFormat.LegacyGroupSize;
 
     private const int TileM = 64;
     private const int TileN = 64;

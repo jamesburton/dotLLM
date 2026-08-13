@@ -15,31 +15,31 @@ namespace DotLLM.Cpu.Kernels;
 public static unsafe partial class Dequantize
 {
     /// <summary>Q4_0 block size in bytes: 2 (Half scale) + 16 (packed nibble bytes).</summary>
-    private const int Q4_0BlockBytes = 18;
+    private const int Q4_0BlockBytes = QuantFormat.Q4_0BlockBytes;
 
     /// <summary>Q8_0 block size in bytes: 2 (Half scale) + 32 (sbyte quantized values).</summary>
-    private const int Q8_0BlockBytes = 34;
+    private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
 
     /// <summary>Number of elements per Q8_0 block.</summary>
-    private const int Q8_0GroupSize = 32;
+    private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
 
     /// <summary>Q5_0 block size in bytes: 2 (Half d) + 4 (qh) + 16 (qs) = 22.</summary>
-    private const int Q5_0BlockBytes = 22;
+    private const int Q5_0BlockBytes = QuantFormat.Q5_0BlockBytes;
 
     /// <summary>Number of elements per Q5_0 block.</summary>
-    private const int Q5_0GroupSize = 32;
+    private const int Q5_0GroupSize = QuantFormat.LegacyGroupSize;
 
     /// <summary>Q4_1 block size in bytes: 2 (Half d) + 2 (Half m) + 16 (qs) = 20.</summary>
-    private const int Q4_1BlockBytes = 20;
+    private const int Q4_1BlockBytes = QuantFormat.Q4_1BlockBytes;
 
     /// <summary>Q5_1 block size in bytes: 2 (Half d) + 2 (Half m) + 4 (qh) + 16 (qs) = 24.</summary>
-    private const int Q5_1BlockBytes = 24;
+    private const int Q5_1BlockBytes = QuantFormat.Q5_1BlockBytes;
 
     /// <summary>Number of elements per I2_S block (x86 packing). 128 codes → 32 bytes.</summary>
     internal const int I2SBlockSize = 128;
 
     /// <summary>Number of elements per PQ2_0 group. Same 128-code packing as I2_S.</summary>
-    internal const int PQ2_0GroupSize = 128;
+    internal const int PQ2_0GroupSize = QuantFormat.TernaryGroupSize;
 
     /// <summary>
     /// PQ2_0 group size in bytes: 2 (Half scale) + 32 (packed 2-bit codes, 4/byte) = 34.
@@ -47,13 +47,13 @@ public static unsafe partial class Dequantize
     /// (verified empirically against real Bonsai GGUF tensor bytes — see
     /// <see cref="QuantizationType.PQ2_0"/>'s doc comment for how this was confirmed).
     /// </summary>
-    internal const int PQ2_0GroupBytes = 34;
+    internal const int PQ2_0GroupBytes = QuantFormat.PQ2_0BlockBytes;
 
     /// <summary>MXFP4 block size in bytes: 1 (E8M0 scale) + 16 (packed nibble bytes) = 17.</summary>
-    internal const int Mxfp4BlockBytes = 17;
+    internal const int Mxfp4BlockBytes = QuantFormat.Mxfp4BlockBytes;
 
     /// <summary>Number of elements per MXFP4 block.</summary>
-    internal const int Mxfp4GroupSize = 32;
+    internal const int Mxfp4GroupSize = QuantFormat.LegacyGroupSize;
 
     /// <summary>
     /// MXFP4 E2M1 value table, doubled (matches llama.cpp <c>kvalues_mxfp4</c>).

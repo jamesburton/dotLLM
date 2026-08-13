@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -24,14 +25,14 @@ namespace DotLLM.Cpu.Kernels;
 public static unsafe partial class Dequantize
 {
     /// <summary>IQ2_XXS block size in bytes: 2(d) + 64(qs[32] uint16) = 66.</summary>
-    internal const int IQ2_XXS_BlockBytes = 66;
+    internal const int IQ2_XXS_BlockBytes = QuantFormat.IQ2_XXSBlockBytes;
 
     /// <summary>IQ2_XS block size in bytes: 2(d) + 64(qs[32] uint16) + 8(scales) = 74.</summary>
-    internal const int IQ2_XS_BlockBytes = 74;
+    internal const int IQ2_XS_BlockBytes = QuantFormat.IQ2_XSBlockBytes;
 
     /// <summary>IQ2_S block size in bytes: 2(d) + 64(qs[64]) + 8(qh) + 8(scales) = 82.
     /// Also used by the <c>MOSTLY_IQ2_M</c> file-type recipe.</summary>
-    internal const int IQ2_S_BlockBytes = 82;
+    internal const int IQ2_S_BlockBytes = QuantFormat.IQ2_SBlockBytes;
 
     /// <summary>Iq2XxsGrid (256 entries x 8 grid bytes). Mirrors ggml-common.h Iq2XxsGrid.</summary>
     internal static ReadOnlySpan<byte> Iq2XxsGrid =>

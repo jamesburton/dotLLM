@@ -1,4 +1,5 @@
 using DotLLM.Vulkan.Interop;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -23,10 +24,10 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
 {
     /// <summary>PQ2_0 group: 2 bytes fp16 scale + 32 bytes packed ternary codes.</summary>
-    public const int PQ2_0GroupBytes = 34;
+    public const int PQ2_0GroupBytes = QuantFormat.PQ2_0BlockBytes;
 
     /// <summary>Elements per PQ2_0 group.</summary>
-    public const int PQ2_0GroupSize = 128;
+    public const int PQ2_0GroupSize = QuantFormat.TernaryGroupSize;
 
     private const int PushConstantBytes = 4 * sizeof(uint);
 

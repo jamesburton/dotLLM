@@ -17,8 +17,8 @@ namespace DotLLM.Cuda;
 public sealed class CudaQuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache
 {
     private const int BlockSize = 32;
-    private const int Q8_0BlockBytes = 34;
-    private const int Q4_0BlockBytes = 18;
+    private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
+    private const int Q4_0BlockBytes = QuantFormat.Q4_0BlockBytes;
 
     private readonly nint[] _keysQuant;     // device ptrs: quantized K
     private readonly nint[] _valuesQuant;   // device ptrs: quantized V

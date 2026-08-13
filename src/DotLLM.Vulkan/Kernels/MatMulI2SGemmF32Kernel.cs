@@ -1,4 +1,5 @@
 using DotLLM.Vulkan.Interop;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -325,10 +326,10 @@ public readonly record struct I2SGemmVariant(
 public sealed class MatMulI2SGemmF32Kernel : IDisposable
 {
     /// <summary>I2_S block: 128 ternary codes packed into 32 bytes.</summary>
-    public const int I2SBlockBytes = 32;
+    public const int I2SBlockBytes = QuantFormat.I2_SBlockBytes;
 
     /// <summary>Elements per I2_S block.</summary>
-    public const int I2SGroupSize = 128;
+    public const int I2SGroupSize = QuantFormat.TernaryGroupSize;
 
     private const int PushConstantBytes = 5 * sizeof(uint); // M, K, N, blocksPerRow, rowUints
 

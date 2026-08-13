@@ -276,12 +276,12 @@ public static unsafe class FusedOps
     // Fuses RmsNorm(hidden → normOut) + Quantize(normOut → Q8 scratch) into one kernel
     // that reads hidden once and writes quantized output directly — skipping normOut.
 
-    private const int Q8_0GroupSize = 32;
-    private const int Q8_0BlockBytes = 34;
-    private const int Q8_1GroupSize = 32;
-    private const int Q8_1BlockBytes = 36;
-    private const int Q8_K_GroupSize = 256;
-    private const int Q8_K_BlockBytes = 292;
+    private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
+    private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
+    private const int Q8_1GroupSize = QuantFormat.LegacyGroupSize;
+    private const int Q8_1BlockBytes = QuantFormat.Q8_1BlockBytes;
+    private const int Q8_K_GroupSize = QuantFormat.KQuantGroupSize;
+    private const int Q8_K_BlockBytes = QuantFormat.Q8_KBlockBytes;
 
     /// <summary>
     /// Dispatches fused RmsNorm+Quantize based on quant type.

@@ -1,4 +1,5 @@
 using DotLLM.Vulkan.Interop;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -29,10 +30,10 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class MatMulQ6KGemmF32Kernel : IDisposable
 {
     /// <summary>Q6_K super-block: 128 + 64 + 16 + 2 = 210 bytes.</summary>
-    public const int Q6_KBlockBytes = 210;
+    public const int Q6_KBlockBytes = QuantFormat.Q6_KBlockBytes;
 
     /// <summary>Elements per Q6_K super-block.</summary>
-    public const int Q6_KGroupSize = 256;
+    public const int Q6_KGroupSize = QuantFormat.KQuantGroupSize;
 
     private const int TileM = 16;
     private const int TileN = 16;

@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using DotLLM.Cpu.Threading;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -16,10 +17,10 @@ namespace DotLLM.Cpu.Kernels;
 public static unsafe partial class MatMul
 {
     /// <summary>Q5_0 block size in bytes: 2 (Half d) + 4 (uint32 qh) + 16 (byte[16] qs).</summary>
-    private const int Q5_0BlockBytes = 22;
+    private const int Q5_0BlockBytes = QuantFormat.Q5_0BlockBytes;
 
     /// <summary>Number of elements per Q5_0 block.</summary>
-    private const int Q5_0GroupSize = 32;
+    private const int Q5_0GroupSize = QuantFormat.LegacyGroupSize;
 
     // ──────────────────── Q5_0 × Q8_1 Scalar ────────────────────
 

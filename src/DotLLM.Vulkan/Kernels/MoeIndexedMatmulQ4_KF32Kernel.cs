@@ -1,4 +1,5 @@
 using DotLLM.Vulkan.Interop;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -25,10 +26,10 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class MoeIndexedMatmulQ4_KF32Kernel : IDisposable
 {
     /// <summary>Q4_K super-block: 2(d) + 2(dmin) + 12(scales) + 128(qs) = 144 bytes.</summary>
-    public const int Q4_KBlockBytes = 144;
+    public const int Q4_KBlockBytes = QuantFormat.Q4_KBlockBytes;
 
     /// <summary>Elements per Q4_K super-block.</summary>
-    public const int Q4_KGroupSize = 256;
+    public const int Q4_KGroupSize = QuantFormat.KQuantGroupSize;
 
     private const int WorkgroupX = 16;
     private const int WorkgroupY = 16;

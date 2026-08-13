@@ -16,10 +16,10 @@ namespace DotLLM.Cli.Commands.Debug;
 internal sealed class DebugEmbedLookupCommand : Command<DebugEmbedLookupCommand.Settings>
 {
     /// <summary>Q8_0 block: 2 bytes (Half scale) + 32 bytes (sbyte values).</summary>
-    private const int Q8_0BlockBytes = 34;
+    private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
 
     /// <summary>Elements per Q8_0 block.</summary>
-    private const int Q8_0GroupSize = 32;
+    private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
 
     public sealed class Settings : CommandSettings
     {

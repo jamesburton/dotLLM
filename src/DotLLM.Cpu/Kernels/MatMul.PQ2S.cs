@@ -4,6 +4,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using DotLLM.Cpu.Threading;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -40,8 +41,8 @@ namespace DotLLM.Cpu.Kernels;
 /// </summary>
 public static unsafe partial class MatMul
 {
-    private const int PQ2_0GroupSize = 128;
-    private const int PQ2_0GroupBytes = 34;
+    private const int PQ2_0GroupSize = QuantFormat.TernaryGroupSize;
+    private const int PQ2_0GroupBytes = QuantFormat.PQ2_0BlockBytes;
 
     private struct GemvPQ2SCtx
     {

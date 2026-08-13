@@ -1,5 +1,6 @@
 using System;
 using DotLLM.Vulkan.Interop;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -32,10 +33,10 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class MatMulQ5KMmvqKernel : IDisposable
 {
     /// <summary>Q5_K super-block: 176 bytes for 256 elements.</summary>
-    public const int Q5KBlockBytes = 176;
+    public const int Q5KBlockBytes = QuantFormat.Q5_KBlockBytes;
 
     /// <summary>Elements per Q5_K super-block.</summary>
-    public const int Q5KGroupSize = 256;
+    public const int Q5KGroupSize = QuantFormat.KQuantGroupSize;
 
     /// <summary>Workgroup width — must match the shader's <c>local_size_x</c>. One
     /// wave32 subgroup per output row (issue #338 coalesced lane=K-position GEMV).</summary>

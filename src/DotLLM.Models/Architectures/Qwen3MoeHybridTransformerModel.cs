@@ -24,8 +24,8 @@ namespace DotLLM.Models.Architectures;
 /// </summary>
 public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
 {
-    private const int Q8_0BlockBytes = 34;
-    private const int Q8_0GroupSize = 32;
+    private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
+    private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
 
     private readonly GgufFile? _gguf; // kept alive; null when built from prebuilt weights
     private readonly Qwen3MoeLayerWeights[] _layers;

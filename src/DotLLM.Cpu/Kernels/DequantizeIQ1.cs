@@ -1,11 +1,12 @@
 using System.Runtime.CompilerServices;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Cpu.Kernels;
 
 public static unsafe partial class Dequantize
 {
     /// <summary>IQ1_S super-block size in bytes: 2(d) + 32(qs) + 16(qh, 8 x uint16) = 50.</summary>
-    internal const int IQ1_S_BlockBytes = 50;
+    internal const int IQ1_S_BlockBytes = QuantFormat.IQ1_SBlockBytes;
 
     /// <summary>IQ1_S delta constant from ggml-common.h (IQ1S_DELTA).</summary>
     internal const float Iq1SDelta = 0.125f;

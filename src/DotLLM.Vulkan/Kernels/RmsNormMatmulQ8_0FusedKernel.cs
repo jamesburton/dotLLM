@@ -1,4 +1,5 @@
 using DotLLM.Vulkan.Interop;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -30,10 +31,10 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class RmsNormMatmulQ8_0FusedKernel : IDisposable
 {
     /// <summary>Q8_0 block: 2 bytes fp16 scale + 32 signed int8 values.</summary>
-    public const int Q8_0BlockBytes = 34;
+    public const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
 
     /// <summary>Elements per Q8_0 block.</summary>
-    public const int Q8_0GroupSize = 32;
+    public const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
 
     /// <summary>
     /// Maximum hidden size supported by the shader's on-chip scratch buffer.

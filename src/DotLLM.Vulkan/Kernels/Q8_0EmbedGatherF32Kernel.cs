@@ -1,4 +1,5 @@
 using DotLLM.Vulkan.Interop;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -25,10 +26,10 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class Q8_0EmbedGatherF32Kernel : IDisposable
 {
     /// <summary>Q8_0 block: 2-byte fp16 scale + 32 int8 = 34 bytes.</summary>
-    public const int Q8_0BlockBytes = 34;
+    public const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
 
     /// <summary>Elements per Q8_0 block.</summary>
-    public const int Q8_0GroupSize = 32;
+    public const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
 
     private const int WorkgroupSize = 256;
     private const int PushConstantBytes = 4 * sizeof(uint); // nTokens, hidden, blocksPerRow, vocabSize
