@@ -29,6 +29,12 @@ internal sealed class CudaNemotronHForwardState : IDisposable
     private int _currentSeqLen;
     private readonly int _maxSeqLen; // cap for TokenIdsDevice/PositionsDevice (int32, not resized per-call)
 
+    /// <summary>Fixed allocated capacity (in elements) of <see cref="TokenIdsDevice"/> and
+    /// <see cref="PositionsDevice"/> — unlike every other buffer here, these are sized once at
+    /// construction and never grown by <see cref="EnsureCapacity"/>. Callers writing into either
+    /// buffer must bound their write length against this value themselves.</summary>
+    public int MaxSeqLen => _maxSeqLen;
+
     public nint HiddenState;
     public nint Residual;
     public nint NormOutput;

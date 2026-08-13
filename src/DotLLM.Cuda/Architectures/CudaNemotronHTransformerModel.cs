@@ -900,8 +900,21 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
     /// <summary>Uploads the current call's host position span to <c>_state.PositionsDevice</c>
     /// (RoPE reads positions from device memory; <c>Embed</c> reads token ids from the host span
     /// directly, no upload needed there).</summary>
+    /// <remarks>Unlike every other per-call buffer in <see cref="CudaNemotronHForwardState"/>,
+    /// <c>PositionsDevice</c> is fixed-size (allocated once at <c>maxSeqLen</c> ints, never grown
+    /// by <see cref="CudaNemotronHForwardState.EnsureCapacity"/>) — so a caller passing
+    /// <c>positions.Length</c> greater than that fixed capacity would otherwise write past the
+    /// buffer with no diagnostic. The per-element range check in <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
+    /// only catches monotonically-increasing overruns (a position value &gt;= maxSeq), not this
+    /// case (e.g. duplicate/non-monotonic positions with <c>seqLen &gt; maxSeqLen</c>), so this
+    /// guard checks the buffer's real allocated capacity directly instead.</remarks>
     private void UploadPositions(ReadOnlySpan<int> positions)
     {
+        if (positions.Length > _state.MaxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(positions),
+                $"positions.Length {positions.Length} exceeds the fixed PositionsDevice capacity " +
+                $"{_state.MaxSeqLen}.");
+
         fixed (int* p = positions)
         {
             CudaDriverApi.cuMemcpyHtoD_v2(_state.PositionsDevice, (nint)p,
@@ -942,7 +955,6 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         UploadPositions(positions);
         Embed(tokenIds, _state.HiddenState, hiddenSize);
 
-        var kinds = _layout.LayerKind;
         for (int layer = 0; layer < _layers.Length; layer++)
         {
             var lw = _layers[layer];
