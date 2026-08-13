@@ -48,10 +48,6 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     private readonly int[] _ssmLayerOrdinal;
     private readonly int _numSsmLayers;
 
-    private readonly float[] _ropeCosTable;
-    private readonly float[] _ropeSinTable;
-    private readonly int _ropeDim;
-
     private readonly NemotronHForwardState _state;
     private readonly SsmStateCache _ssmCache;
 
@@ -76,8 +72,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         float[] outputNormWeight,
         nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType,
         nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim,
-        int[] kvSlotForLayer, int attentionLayerCount,
-        float[] ropeCosTable, float[] ropeSinTable, int ropeDim)
+        int[] kvSlotForLayer, int attentionLayerCount)
     {
         Config = config;
         _gguf = gguf;
@@ -93,9 +88,6 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         _ssm = config.SsmConfig!.Value;
         _kvSlotForLayer = kvSlotForLayer;
         _attentionLayerCount = attentionLayerCount;
-        _ropeCosTable = ropeCosTable;
-        _ropeSinTable = ropeSinTable;
-        _ropeDim = ropeDim;
 
         _ssmLayerOrdinal = new int[config.NumLayers];
         int ssmOrdinal = 0;
@@ -177,10 +169,11 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             outputM = embDesc.Shape[1];
         }
 
-        int ropeDim = config.RoPEConfig?.DimensionCount ?? 0;
-        if (ropeDim <= 0)
-            throw new InvalidDataException(
-                "NemotronH requires rope.dimension_count in GGUF metadata (expected 78 for Nemotron-3).");
+        // NO RoPE for nemotron_h (issue #372): llama.cpp's nemotron-h.cpp and HF's
+        // NemotronHAttention apply no position encoding on the attention layers —
+        // position information comes entirely from the Mamba2 layers. The GGUF
+        // rope.* keys (rope.dimension_count = head_dim) are converter artifacts
+        // llama.cpp never consumes, so they are neither required nor validated here.
 
         var layers = new NemotronHLayerWeights[config.NumLayers];
         var kvSlotForLayer = new int[config.NumLayers];
@@ -188,39 +181,16 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         for (int i = 0; i < config.NumLayers; i++)
         {
             layers[i] = LoadLayer(i, dataBase, tensors, config, layout, ssm);
-
-            if (layout.LayerKind[i] == HybridLayerKind.Attention)
-            {
-                // RoPE preconditions: even, ≤ head_dim. A strict rope_dim == 78 check was the
-                // Nemotron-3 4B Q4_K_M case from DESIGN.md §2, but other nemotron_h variants
-                // (e.g., the Ollama nemotron-3-nano 4B) use full-head RoPE with rope_dim == head_dim.
-                if ((ropeDim & 1) != 0)
-                    throw new InvalidDataException(
-                        $"NemotronH rope_dim={ropeDim} must be even for pair-wise rotation.");
-                if (ropeDim > config.HeadDim)
-                    throw new InvalidDataException(
-                        $"NemotronH attention layer {i}: rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.");
-
-                kvSlotForLayer[i] = attentionLayerCount++;
-            }
-            else
-            {
-                kvSlotForLayer[i] = -1;
-            }
+            kvSlotForLayer[i] = layout.LayerKind[i] == HybridLayerKind.Attention
+                ? attentionLayerCount++
+                : -1;
         }
-
-        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        int halfRope = ropeDim / 2;
-        var ropeCos = new float[config.MaxSequenceLength * halfRope];
-        var ropeSin = new float[config.MaxSequenceLength * halfRope];
-        RoPE.PrecomputeFrequencyTable(config.MaxSequenceLength, ropeDim, ropeTheta, ropeCos, ropeSin);
 
         return new NemotronHTransformerModel(
             config, gguf, layers, outputNormWeight,
             embPtr, embDesc.QuantizationType,
             outputPtr, outputQt, outputM, outputK,
-            kvSlotForLayer, attentionLayerCount,
-            ropeCos, ropeSin, ropeDim);
+            kvSlotForLayer, attentionLayerCount);
     }
 
     /// <summary>
@@ -265,36 +235,13 @@ public sealed unsafe class NemotronHTransformerModel : IModel
                 : -1;
         }
 
-        int ropeDim = config.RoPEConfig?.DimensionCount ?? 0;
-        // Allow ropeDim==0 when there are no attention layers.
-        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        int halfRope = ropeDim / 2;
-        float[] ropeCos, ropeSin;
-        if (attentionLayerCount > 0)
-        {
-            if (ropeDim <= 0 || (ropeDim & 1) != 0)
-                throw new ArgumentException(
-                    $"NemotronH attention layers require an even rope_dim > 0 (got {ropeDim}).", nameof(config));
-            if (ropeDim > config.HeadDim)
-                throw new ArgumentException(
-                    $"rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.", nameof(config));
-
-            ropeCos = new float[config.MaxSequenceLength * halfRope];
-            ropeSin = new float[config.MaxSequenceLength * halfRope];
-            RoPE.PrecomputeFrequencyTable(config.MaxSequenceLength, ropeDim, ropeTheta, ropeCos, ropeSin);
-        }
-        else
-        {
-            ropeCos = Array.Empty<float>();
-            ropeSin = Array.Empty<float>();
-        }
-
+        // Any RoPEConfig on the ModelConfig is ignored — nemotron_h applies no
+        // position encoding on attention (issue #372; see ForwardAttentionBody).
         return new NemotronHTransformerModel(
             config, gguf: null, layers, outputNormWeight,
             tokenEmbedWeight, tokenEmbedQuantType,
             outputWeight, outputQuantType, outputOutputDim, outputInputDim,
-            kvSlotForLayer, attentionLayerCount,
-            ropeCos, ropeSin, ropeDim);
+            kvSlotForLayer, attentionLayerCount);
     }
 
     private static NemotronHLayerWeights LoadLayer(
@@ -686,13 +633,12 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         Gemm(attn.KWeight, attn.KQuantType, normOut, k, attn.KOutputDim, attn.KInputDim, seqLen, preQuantizedInput: null);
         Gemm(attn.VWeight, attn.VQuantType, normOut, v, attn.VOutputDim, attn.VInputDim, seqLen, preQuantizedInput: null);
 
-        // Partial RoPE: rotates the first _ropeDim=78 dims of each head, leaves the remainder untouched.
-        RoPE.Execute(
-            new Span<float>(q, seqLen * numHeads * headDim),
-            new Span<float>(k, seqLen * kvStride),
-            positions,
-            numHeads, numKvHeads, headDim, _ropeDim,
-            _ropeCosTable, _ropeSinTable, RoPEType.Norm);
+        // NO position encoding (issue #372). Both references apply nothing here:
+        // llama.cpp src/models/nemotron-h.cpp goes straight from build_qkv to
+        // build_attn (no rope token in the file), and HF transformers'
+        // NemotronHAttention.forward never calls apply_rotary_pos_emb. Position
+        // information comes entirely from the Mamba2 layers. The GGUF
+        // rope.dimension_count key is a converter artifact and is ignored.
 
         if (kvCache is not null)
         {
