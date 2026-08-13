@@ -81,7 +81,7 @@
          so the kernels backing it must be compiled with FMA fusion disabled.
          elementwise_f32.cu hosts sigmoid/silu/sigmoid_mul (host fallbacks the agent
          is replacing) and is here for the same reason. -->
-    <CudaKernel Update="$(CudaKernelDir)\conv1d_causal.cu;$(CudaKernelDir)\gated_delta_net_scan.cu;$(CudaKernelDir)\elementwise_f32.cu;$(CudaKernelDir)\mamba2_selective_scan.cu;$(CudaKernelDir)\mamba3_data_rope_f32.cu;$(CudaKernelDir)\mamba3_chunk_boundary_f32.cu">
+    <CudaKernel Update="$(CudaKernelDir)\conv1d_causal.cu;$(CudaKernelDir)\gated_delta_net_scan.cu;$(CudaKernelDir)\elementwise_f32.cu;$(CudaKernelDir)\mamba2_selective_scan.cu;$(CudaKernelDir)\mamba3_data_rope_f32.cu;$(CudaKernelDir)\mamba3_chunk_boundary_f32.cu;$(CudaKernelDir)\mamba3_ssd_scan_siso_f32.cu">
       <FmadFlag>-fmad=false</FmadFlag>
     </CudaKernel>
   </ItemGroup>
