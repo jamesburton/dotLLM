@@ -24,6 +24,10 @@ public class VulkanMatMulQ3KGemvF32KernelTests
     [InlineData(2048, 768)]
     [InlineData(576, 1024)]
     [InlineData(1024, 1024)]
+    // Issue #361 — odd total block count: Q3_K blocks are 110 bytes ≡ 2 (mod 4), so
+    // m*blocksPerRow odd puts the buffer end 2 bytes into the funnel's last uint.
+    [InlineData(7, 256)]  // 7 blocks, 770 bytes ≡ 2 (mod 4)
+    [InlineData(3, 768)]  // 9 blocks, 990 bytes ≡ 2 (mod 4)
     public void Launch_MatchesCpuReference(int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

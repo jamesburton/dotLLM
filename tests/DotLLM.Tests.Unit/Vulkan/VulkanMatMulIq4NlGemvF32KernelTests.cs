@@ -30,6 +30,10 @@ public class VulkanMatMulIq4NlGemvF32KernelTests
     [InlineData(2048, 96)]               // large M (workgroup-per-row dispatch)
     [InlineData(576, 256)]               // 8 blocks per row, SmolLM-like shape
     [InlineData(1024, 1024)]             // square, 32 blocks per row
+    // Issue #361 — odd total block count: IQ4_NL blocks are 18 bytes ≡ 2 (mod 4), so
+    // m*blocksPerRow odd puts the buffer end 2 bytes into the funnel's last uint.
+    [InlineData(7, 96)]                  // 21 blocks, 378 bytes ≡ 2 (mod 4)
+    [InlineData(3, 32)]                  // 3 blocks, 54 bytes ≡ 2 (mod 4)
     public void Launch_MatchesCpuReference(int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

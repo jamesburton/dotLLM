@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
@@ -961,16 +962,9 @@ internal sealed class VulkanWeights : IDisposable
             bool importedQ8 = TryZeroCopyImport(device, weights.TokenEmbedWeight, q8Bytes, out var q8Buf);
             if (!importedQ8)
             {
-                q8Buf = device.AllocateDeviceLocal(q8Bytes);
-                try
-                {
-                    staging.UploadBytes(weights.TokenEmbedWeight, q8Bytes, q8Buf);
-                }
-                catch
-                {
-                    q8Buf.Dispose();
-                    throw;
-                }
+                // Q8_0 rows are 34 bytes/block, so odd vocab·blocksPerRow sizes are
+                // ≡ 2 (mod 4) — round up like every packed staging upload (#361).
+                q8Buf = AllocateAndUploadPacked(device, staging, weights.TokenEmbedWeight, q8Bytes);
             }
             LastTokenEmbedDequantPath = importedQ8 ? "resident-q8_0-imported" : "resident-q8_0";
             uploadedBytes = q8Bytes;
@@ -1013,8 +1007,9 @@ internal sealed class VulkanWeights : IDisposable
             bool imported = TryZeroCopyImport(device, weights.TokenEmbedWeight, qBytes, out srcBuf);
             if (!imported)
             {
-                srcBuf = device.AllocateDeviceLocal(qBytes);
-                staging.UploadBytes(weights.TokenEmbedWeight, qBytes, srcBuf);
+                // Q6_K rows are 210 bytes/block, so odd vocab·blocksPerRow sizes are
+                // ≡ 2 (mod 4) — round up like every packed staging upload (#361).
+                srcBuf = AllocateAndUploadPacked(device, staging, weights.TokenEmbedWeight, qBytes);
             }
 
             if (qt == QuantizationType.Q4_K)
@@ -1083,6 +1078,51 @@ internal sealed class VulkanWeights : IDisposable
     /// </summary>
     private static bool IsHostImportDisabled() =>
         Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_HOST_IMPORT") == "1";
+
+    /// <summary>
+    /// Rounds a packed-weight byte size up to a 4-byte multiple (issue #361).
+    /// The packed-matmul shaders read their weight SSBO through a <c>uint</c>-addressed
+    /// funnel, so when the packed size is ≡ 2 (mod 4) — ten formats have a block size
+    /// ≡ 2 (mod 4), e.g. Q8_0's 34-byte and Q6_K's 210-byte blocks — the final read
+    /// covers 2 bytes past the logical end. With <c>robustBufferAccess</c> off and
+    /// bindings at <c>VK_WHOLE_SIZE</c>, an exact-sized allocation makes that read
+    /// out-of-bounds. The fix is allocation-side, not shader-side: those trailing
+    /// bytes are real weight data, merely not <c>uint</c>-addressable, so the shader
+    /// must keep reading them; the buffer just has to extend to the <c>uint</c>
+    /// boundary. The zero-copy import path needs no round-up — its VkBuffer is
+    /// created at the page-rounded import size already.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long RoundUpToUintBoundary(long bytes) => (bytes + 3) & ~3L;
+
+    /// <summary>
+    /// Allocates a device-local buffer for <paramref name="bytes"/> of packed weight
+    /// data, rounded up per <see cref="RoundUpToUintBoundary"/>, uploads the packed
+    /// bytes, and zero-fills the 0–3 padding bytes so the buffer has no uninitialized
+    /// tail (deterministic under validation layers; the shaders never *use* the pad —
+    /// the funnel's final <c>uint</c> merely touches it).
+    /// </summary>
+    internal static unsafe VulkanDevice.Buffer AllocateAndUploadPacked(
+        VulkanDevice device, VulkanStagingBuffer staging, nint srcPtr, long bytes)
+    {
+        long padded = RoundUpToUintBoundary(bytes);
+        var buf = device.AllocateDeviceLocal(padded);
+        try
+        {
+            staging.UploadBytes(srcPtr, bytes, buf);
+            if (padded != bytes)
+            {
+                uint zero = 0;
+                staging.UploadBytes((nint)(&zero), padded - bytes, buf, bytes);
+            }
+        }
+        catch
+        {
+            buf.Dispose();
+            throw;
+        }
+        return buf;
+    }
 
     /// <summary>
     /// Attempts to wrap <paramref name="srcPtr"/> + <paramref name="bytes"/>
@@ -1487,8 +1527,7 @@ internal sealed class VulkanWeights : IDisposable
                 return importedBuf!;
             }
 
-            var buf = device.AllocateDeviceLocal(bytes);
-            staging.UploadBytes(srcPtr, bytes, buf);
+            var buf = AllocateAndUploadPacked(device, staging, srcPtr, bytes);
 
             LastUploadStagingMatrices++;
             deviceQuantType = keepQt;
@@ -2081,8 +2120,9 @@ internal sealed class VulkanWeights : IDisposable
         {
             if (TryZeroCopyImport(device, raw, bankBytes, out var imported))
                 return imported!;
-            var rawBank = device.AllocateDeviceLocal(bankBytes);
-            stage.UploadBytes(raw, bankBytes, rawBank);
+            // Q8_0 banks (34 bytes/block) can be ≡ 2 (mod 4) — round up like every
+            // packed staging upload (#361).
+            var rawBank = AllocateAndUploadPacked(device, stage, raw, bankBytes);
             LastUploadStagingMatrices++;
             return rawBank;
         }
