@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
@@ -41,10 +42,11 @@ namespace DotLLM.Cuda.Architectures;
 /// uses.
 /// </para>
 /// <para>
-/// <b>Not yet a complete <see cref="IModel"/>.</b> This task (Task 8 of issue #346)
-/// delivers only the skeleton, weight upload, and <see cref="LoadFromSafetensors"/> —
-/// the <c>Forward</c> overloads throw <see cref="NotImplementedException"/> until
-/// Task 9 adds the real forward pass and <c>EnsureScratchCapacity</c>.
+/// <b>SISO-complete <see cref="IModel"/>.</b> Task 8 delivered the skeleton, weight
+/// upload, and <see cref="LoadFromSafetensors"/>; Task 9 added the real forward pass
+/// (<c>EnsureScratchCapacity</c>, per-layer dispatch, host-side per-token prep) for
+/// SISO checkpoints. MIMO checkpoints (<see cref="Mamba3Config.IsMimo"/>) are rejected
+/// with <see cref="NotSupportedException"/> — see <c>ForwardMimo</c> (issue #346 Task 14).
 /// </para>
 /// </remarks>
 public sealed unsafe class CudaMamba3TransformerModel : IModel
@@ -109,25 +111,6 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
     /// uncached forwards are already independent sequences.
     /// </remarks>
     public void ResetSequenceState() { }
-
-    /// <inheritdoc/>
-    /// <remarks>
-    /// Stub — implemented in Task 9 alongside <c>ForwardBatch</c> and
-    /// <c>EnsureScratchCapacity</c>. Declared now so this class satisfies
-    /// <see cref="IModel"/> and the rest of the codebase can reference
-    /// <see cref="CudaMamba3TransformerModel"/> (e.g. Task 10's
-    /// <c>CudaModelLoader.LoadMamba3FromSafetensors</c>) ahead of the forward pass
-    /// landing.
-    /// </remarks>
-    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
-        => throw new NotImplementedException(
-            $"{nameof(CudaMamba3TransformerModel)}.Forward is implemented in Task 9 (issue #346).");
-
-    /// <inheritdoc/>
-    /// <remarks>See remarks on the 3-argument <c>Forward</c> overload.</remarks>
-    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
-        => throw new NotImplementedException(
-            $"{nameof(CudaMamba3TransformerModel)}.Forward is implemented in Task 9 (issue #346).");
 
     private readonly record struct DeviceLayer(
         nint Norm, nint InProj, nint OutProj, nint BNorm, nint CNorm,
@@ -271,9 +254,484 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
         return devPtr;
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Forward
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
+        => Forward(tokenIds, positions, deviceId, kvCache: null);
+
+    /// <inheritdoc/>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
+    {
+        // #347 lesson: MakeCurrent must be the first CUDA-touching statement in every
+        // public entry point — the ephemeral CudaMamba3StateCache constructed below
+        // allocates device memory before ForwardCore would otherwise set the context.
+        _context.MakeCurrent();
+        _ = kvCache; // Mamba-3 uses SSM state, not KV-cache — matches CPU's Forward(..., IKvCache?) contract.
+        using var ephemeral = new CudaMamba3StateCache(_m3, _numLayers);
+        return ForwardCore(tokenIds, positions, deviceId, ephemeral, runChunkBoundary: false);
+    }
+
+    /// <summary>
+    /// Runs a forward pass that reads and writes a persistent
+    /// <see cref="CudaMamba3StateCache"/>, enabling prefill-then-decode sequences.
+    /// Mirrors CPU <c>Mamba3TransformerModel.Forward(..., Mamba3State)</c>.
+    /// </summary>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+        CudaMamba3StateCache state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        if (state.NumLayers != _numLayers)
+            throw new ArgumentException(
+                $"CudaMamba3StateCache has {state.NumLayers} layers but model has {_numLayers}.", nameof(state));
+        _context.MakeCurrent();
+        return ForwardCore(tokenIds, positions, deviceId, state, runChunkBoundary: true);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Mirrors CPU <c>Mamba3TransformerModel.ForwardBatch</c>: rejects LoRA adapters
+    /// (no Mamba-3 LoRA path), requires every request to carry a per-seq
+    /// <see cref="CudaMamba3StateCache"/> (via <see cref="SequenceForwardRequest.MambaState"/>)
+    /// once 2+ requests are batched together, and otherwise loops per request — no
+    /// fused-GEMM batching in this v1 (see this plan's biggest-risk note for why).
+    /// </remarks>
+    public IReadOnlyList<ITensor> ForwardBatch(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+
+        _context.MakeCurrent();
+
+        for (int i = 0; i < requests.Count; i++)
+        {
+            if (requests[i].Adapter is not null)
+                throw new NotSupportedException(
+                    "CudaMamba3TransformerModel.ForwardBatch does not support LoRA adapters "
+                    + "(no Mamba-3 LoRA path today, matching the CPU host).");
+        }
+
+        if (requests.Count >= 2)
+        {
+            for (int i = 0; i < requests.Count; i++)
+            {
+                if (requests[i].MambaState is null)
+                    throw new ArgumentException(
+                        $"CudaMamba3TransformerModel.ForwardBatch with {requests.Count} requests requires "
+                        + $"every request to supply a per-seq MambaState; request[{i}] has none.",
+                        nameof(requests));
+            }
+        }
+
+        var results = new ITensor[requests.Count];
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var r = requests[i];
+            if (r.MambaState is null)
+            {
+                results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache);
+            }
+            else if (r.MambaState is CudaMamba3StateCache cudaState)
+            {
+                results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, cudaState);
+            }
+            else
+            {
+                throw new ArgumentException(
+                    $"CudaMamba3TransformerModel requires a CudaMamba3StateCache; got {r.MambaState.GetType().Name}.",
+                    nameof(requests));
+            }
+        }
+        return results;
+    }
+
+    /// <summary>
+    /// Grows every device scratch buffer so at least <paramref name="seqLen"/> tokens
+    /// can be served without further allocation. Power-of-two growth, mirroring
+    /// <c>Mamba3ForwardScratch.EnsureCapacity</c> (CPU) /
+    /// <c>VulkanMamba3ForwardScratch.EnsureCapacity</c> (Vulkan).
+    /// </summary>
+    private void EnsureScratchCapacity(int seqLen)
+    {
+        if (seqLen <= _scratchCapacity) return;
+
+        int cap = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)seqLen);
+        FreeScratch();
+        _scratchCapacity = 0; // FreeScratch already resets this; explicit for clarity before re-set below.
+
+        int hidden = Config.HiddenSize;
+        int dInProj = _m3.InputProjectionDim;
+        int dInner = _m3.DInner;
+        int nHead = _m3.NumHeads;
+        int dState = _m3.StateSize;
+        int numRopeAngles = _m3.NumRopeAngles;
+        int effRank = _m3.IsMimo ? _m3.MimoRank : 1;
+
+        _hidden = AllocF32((long)cap * hidden);
+        _residual = AllocF32((long)cap * hidden);
+        _normOut = AllocF32((long)cap * hidden);
+        _blockOut = AllocF32((long)cap * hidden);
+        _projDevice = AllocF32((long)cap * dInProj);
+        _xDevice = AllocF32((long)cap * dInner);
+        _zDevice = AllocF32((long)cap * dInner);
+        _yScanDevice = AllocF32((long)cap * dInner);
+        _dtDevice = AllocF32((long)cap * nHead);
+        _adtDevice = AllocF32((long)cap * nHead);
+        _trapDevice = AllocF32((long)cap * nHead);
+        _gammaDevice = AllocF32((long)cap * nHead);
+        _scaleDevice = AllocF32((long)cap * nHead);
+        _qkPreDotDevice = AllocF32((long)cap * nHead);
+        _anglesRawDevice = AllocF32((long)cap * numRopeAngles);
+        _bDevice = AllocF32((long)cap * effRank * nHead * dState);
+        _cDevice = AllocF32((long)cap * effRank * nHead * dState);
+        _coefDevice = AllocF32(nHead);
+
+        _scratchCapacity = cap;
+    }
+
+    private static nint AllocF32(long elementCount)
+    {
+        CudaDriverApi.cuMemAlloc_v2(out nint ptr, (nuint)(elementCount * sizeof(float))).ThrowOnError();
+        return ptr;
+    }
+
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+        CudaMamba3StateCache state, bool runChunkBoundary)
+    {
+        int seqLen = tokenIds.Length;
+        if (seqLen == 0 || seqLen != positions.Length)
+            throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
+        // Positions are not consumed by the block forward on any backend (Mamba-3 encodes
+        // position implicitly through cum_angle accumulation — see CPU's
+        // Mamba3TransformerModel.Forward(..., IKvCache?) doc), but CPU's ForwardCore still
+        // validates them against MaxSequenceLength for API-parity error behaviour — mirror
+        // that here rather than silently accepting an out-of-range position that CPU would
+        // reject.
+        int maxSeq = Config.MaxSequenceLength;
+        for (int i = 0; i < positions.Length; i++)
+        {
+            if ((uint)positions[i] >= (uint)maxSeq)
+                throw new ArgumentOutOfRangeException(nameof(positions),
+                    $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
+        }
+        // deviceId controls the RETURNED tensor's placement, not where compute runs (compute
+        // always runs on the GPU this model was loaded onto via LoadFromSafetensors' own
+        // deviceId). This v1 only implements host-resident output (mirrors every CPU/Vulkan
+        // Forward call site, which always passes -1) — matches CPU's
+        // Mamba3TransformerModel.ForwardCore threading `deviceId` into UnmanagedTensor.Allocate,
+        // but a device-resident (deviceId >= 0) result would need a D2D copy instead of the D2H
+        // copy below, which is out of scope here.
+        if (deviceId >= 0)
+            throw new NotSupportedException(
+                "CudaMamba3TransformerModel.Forward only supports deviceId=-1 (host-resident output "
+                + "tensor) today. Device-resident output tensors are a future optimization.");
+        if (_m3.IsMimo)
+            throw new NotSupportedException(
+                "CudaMamba3TransformerModel.Forward (SISO path) does not support IsMimo=true "
+                + "checkpoints yet — see ForwardMimo (issue #346 Task 14).");
+        if (_m3.NumGroups != 1)
+            throw new NotSupportedException(
+                $"CudaMamba3TransformerModel.Forward assumes NumGroups (n_groups) == 1 for its B/C "
+                + $"split-offset math; got {_m3.NumGroups}. HostPrepareSiso's ofsC = ofsB + dState "
+                + "hardcodes bcPerToken == dState, which is only correct for G=1 — every known real "
+                + "checkpoint has n_groups=1 (matches CPU/Vulkan's own documented assumption), but a "
+                + "G>1 checkpoint would silently corrupt every offset from ofsC onward instead of "
+                + "failing loudly, so this guard rejects it explicitly rather than the alternative.");
+
+        int hiddenSize = Config.HiddenSize;
+        int vocabSize = Config.VocabSize;
+        int nHead = _m3.NumHeads;
+        int headDim = _m3.HeadDim;
+        int dState = _m3.StateSize;
+        int dInner = _m3.DInner;
+        int dInProj = _m3.InputProjectionDim;
+        int numRopeAngles = _m3.NumRopeAngles;
+        float aFloor = _m3.AFloor;
+        float eps = Config.NormEpsilon;
+        nint s = _stream.Handle;
+
+        EnsureScratchCapacity(seqLen);
+
+        // 1. Token upload + embedding lookup (device).
+        int[] tokenIdsArr = tokenIds.ToArray();
+        // #347 lesson: explicit bounds guard before the H2D upload feeds these IDs into a
+        // fixed-size [vocab, hidden] embedding table lookup — an out-of-range token id would
+        // otherwise read out of bounds on the device with no indirect per-element check to
+        // catch it. Mirrors VulkanMamba3TransformerModel.ValidateTokenIds.
+        for (int i = 0; i < tokenIdsArr.Length; i++)
+        {
+            if ((uint)tokenIdsArr[i] >= (uint)vocabSize)
+                throw new ArgumentOutOfRangeException(nameof(tokenIds),
+                    $"Token ID {tokenIdsArr[i]} at index {i} is out of range [0, {vocabSize}).");
+        }
+        nint tokenIdsDevice = 0;
+        try
+        {
+            long tokenBytes = (long)seqLen * sizeof(int);
+            CudaDriverApi.cuMemAlloc_v2(out tokenIdsDevice, (nuint)tokenBytes).ThrowOnError();
+            fixed (int* p = tokenIdsArr)
+                CudaDriverApi.cuMemcpyHtoD_v2(tokenIdsDevice, (nint)p, (nuint)tokenBytes).ThrowOnError();
+
+            _kernels.LaunchEmbeddingLookupF32(_tokenEmbedDevice, QuantizationType.F32,
+                tokenIdsDevice, _hidden, seqLen, hiddenSize, s);
+
+            // 2. Layers.
+            for (int layer = 0; layer < _numLayers; layer++)
+            {
+                var lw = _layers[layer];
+
+                // Snapshot residual (D2D) + pre-norm (device).
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(_residual, _hidden, (nuint)((long)seqLen * hiddenSize * sizeof(float)), s).ThrowOnError();
+                _kernels.LaunchRmsNormF32(_hidden, lw.Norm, _normOut, hiddenSize, eps, seqLen, s);
+
+                // in_proj GEMM (device): proj[seqLen, dInProj] = normOut[seqLen, hidden] @ inProj[dInProj, hidden]^T.
+                CudaGemm.LinearF32(_cublas.Handle, _normOut, lw.InProj, _projDevice, seqLen, hiddenSize, dInProj, s);
+                _stream.Synchronize();
+
+                // 3. Host prep — D2H the in_proj output, run the per-token
+                // softplus/sigmoid/RMSNorm+bias/qk_pre_dot/scale math on CPU (mirrors
+                // Mamba3Block.Forward Steps 2-4 exactly), H2D the results back.
+                HostPrepareSiso(seqLen, dInProj, dInner, nHead, dState, numRopeAngles, aFloor, eps,
+                    lw.DtBias, lw.BNorm, lw.CNorm, lw.BBias, lw.CBias, s);
+
+                // 4. Data-RoPE (device) — mutates _bDevice/_cDevice in place, threads cum_angle.
+                _kernels.LaunchMamba3DataRopeF32(_bDevice, _cDevice, _anglesRawDevice, _dtDevice,
+                    state.GetCumAnglePtr(layer), state.GetCumAnglePtr(layer),
+                    seqLen, nRank: 1, nHead, dState, numRopeAngles, mode: 0,
+                    hasCumPrev: true, writeCumOut: true, s);
+
+                // 5. Chunk-boundary correction (device) — BEFORE the scan, only for the
+                // state-threaded overload (see this task's design note above).
+                if (runChunkBoundary)
+                {
+                    _kernels.LaunchMamba3ChunkBoundaryF32(
+                        state.GetSsmStatePtr(layer), state.GetVStatePtr(layer), state.GetKStatePtr(layer),
+                        _coefDevice, nHead, headDim, dState, nRank: 1, s);
+                }
+
+                // 6. SISO SSD scan (device) — mutates ssm_state in place, writes _yScanDevice.
+                _kernels.LaunchMamba3SsdScanSisoF32(
+                    state.GetSsmStatePtr(layer), _xDevice, _cDevice, _bDevice,
+                    _qkPreDotDevice, _scaleDevice, _gammaDevice, _adtDevice, lw.D, _zDevice, _yScanDevice,
+                    seqLen, nHead, headDim, dState, hasZ: true, s);
+
+                // 6.5. Persist this chunk's last-token post-RoPE K / raw V for the NEXT
+                // call's chunk-boundary correction (D2D — matches CPU's bHRN/xBuf slice
+                // copy at Mamba3Block.cs Step 6.5). kState stores bHRN (the "kRoped"
+                // argument to the SSD scan, i.e. _bDevice/B) not cHRN — confirmed against
+                // both Mamba3Block.cs:401 (bHRN -> kState) and
+                // VulkanMamba3TransformerModel.cs's matching RecordCopyBufferRange(_state.B -> kState)
+                // (CPU's C-tensor equivalent is _cDevice/"qRoped", which is never copied here).
+                if (runChunkBoundary)
+                {
+                    long kBytes = (long)nHead * dState * sizeof(float);
+                    long vBytes = (long)nHead * headDim * sizeof(float);
+                    nint lastKSrc = _bDevice + (nint)((long)(seqLen - 1) * nHead * dState * sizeof(float));
+                    nint lastVSrc = _xDevice + (nint)((long)(seqLen - 1) * nHead * headDim * sizeof(float));
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(state.GetKStatePtr(layer), lastKSrc, (nuint)kBytes, s).ThrowOnError();
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(state.GetVStatePtr(layer), lastVSrc, (nuint)vBytes, s).ThrowOnError();
+                }
+
+                // 7. out_proj GEMM (device): blockOut[seqLen, hidden] = yScan[seqLen, dInner] @ outProj[hidden, dInner]^T.
+                CudaGemm.LinearF32(_cublas.Handle, _yScanDevice, lw.OutProj, _blockOut, seqLen, dInner, hiddenSize, s);
+
+                // Residual add (device): hidden = residual + blockOut.
+                _kernels.LaunchAddF32(_residual, _blockOut, _hidden, seqLen * hiddenSize, s);
+            }
+
+            // 8. Final RMSNorm (device, in place) + lm_head GEMM (device, last token only).
+            _kernels.LaunchRmsNormF32(_hidden, _finalNormDevice, _hidden, hiddenSize, eps, seqLen, s);
+
+            nint lastHidden = _hidden + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
+            CudaGemm.GemvF32(_cublas.Handle, _lmHeadDevice, lastHidden, _logitsDevice, vocabSize, hiddenSize, s);
+
+            var shape = new TensorShape(1, vocabSize);
+            var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
+            _stream.Synchronize();
+            CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _logitsDevice, (nuint)((long)vocabSize * sizeof(float))).ThrowOnError();
+            return result;
+        }
+        finally
+        {
+            if (tokenIdsDevice != 0) CudaDriverApi.cuMemFree_v2(tokenIdsDevice);
+        }
+    }
+
+    /// <summary>
+    /// Host-side per-token preprocessing for one SISO layer: downloads the in_proj GEMM
+    /// output, replicates <c>Mamba3Block.Forward</c>'s Steps 2-4 (split, softplus/sigmoid
+    /// DT/A/trap/gamma, B/C RMSNorm+bias, qk_pre_dot, shifted-gamma/scale) on the CPU
+    /// exactly as written there, then uploads the per-token tables the device kernels
+    /// need. Mirrors Vulkan's <c>ComputeHostTables</c> design decision (see this class's
+    /// doc comment) — a fused on-device version is a documented future optimization, not
+    /// attempted in this plan (see the biggest-risk note).
+    /// </summary>
+    private void HostPrepareSiso(int seqLen, int dInProj, int dInner, int nHead, int dState,
+        int numRopeAngles, float aFloor, float normEps,
+        nint dtBiasDevice, nint bNormDevice, nint cNormDevice, nint bBiasDevice, nint cBiasDevice,
+        nint stream)
+    {
+        float[] proj = new float[seqLen * dInProj];
+        fixed (float* p = proj)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, _projDevice, (nuint)(proj.Length * sizeof(float))).ThrowOnError();
+
+        float[] dtBias = DownloadF32(dtBiasDevice, nHead);
+        float[] bNormW = DownloadF32(bNormDevice, dState);
+        float[] cNormW = DownloadF32(cNormDevice, dState);
+        float[] bBias = DownloadF32(bBiasDevice, nHead * dState);   // numBcHeads=1 SISO, so [nHead, dState]
+        float[] cBias = DownloadF32(cBiasDevice, nHead * dState);
+
+        int ofsZ = 0, ofsX = dInner, ofsB = 2 * dInner, ofsC = ofsB + dState;
+        int ofsDdDt = ofsC + dState, ofsDdA = ofsDdDt + nHead, ofsTrap = ofsDdA + nHead, ofsAngles = ofsTrap + nHead;
+
+        var x = new float[seqLen * dInner];
+        var z = new float[seqLen * dInner];
+        var dt = new float[seqLen * nHead];
+        var adt = new float[seqLen * nHead];
+        var trap = new float[seqLen * nHead];
+        var gamma = new float[seqLen * nHead];
+        var scale = new float[seqLen * nHead];
+        var anglesRaw = new float[seqLen * numRopeAngles];
+        var bHRN = new float[seqLen * nHead * dState];
+        var cHRN = new float[seqLen * nHead * dState];
+        var qkPreDot = new float[seqLen * nHead];
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            int src = t * dInProj;
+            Array.Copy(proj, src + ofsZ, z, t * dInner, dInner);
+            Array.Copy(proj, src + ofsX, x, t * dInner, dInner);
+
+            for (int h = 0; h < nHead; h++)
+            {
+                float ddDt = proj[src + ofsDdDt + h];
+                float ddA = proj[src + ofsDdA + h];
+                float trp = proj[src + ofsTrap + h];
+
+                float dtv = SoftPlus(ddDt + dtBias[h]);
+                float aVal = -SoftPlus(ddA);
+                if (aVal > -aFloor) aVal = -aFloor;
+
+                dt[t * nHead + h] = dtv;
+                adt[t * nHead + h] = aVal * dtv;
+                float tv = Sigmoid(trp);
+                trap[t * nHead + h] = tv;
+                gamma[t * nHead + h] = dtv * tv;
+            }
+
+            Array.Copy(proj, src + ofsAngles, anglesRaw, t * numRopeAngles, numRopeAngles);
+
+            // B/C RMSNorm + bias (numBcHeads=1 broadcasts to every head — matches every
+            // real checkpoint's n_groups=1; multi-group is a Mamba3Block-documented
+            // future extension, not implemented on any backend today).
+            int bSrcBase = src + ofsB, cSrcBase = src + ofsC;
+            RmsNormFactor(proj, bSrcBase, dState, normEps, out float bInvRms);
+            RmsNormFactor(proj, cSrcBase, dState, normEps, out float cInvRms);
+            for (int h = 0; h < nHead; h++)
+            {
+                int biasBase = h * dState;
+                int dstBase = (t * nHead + h) * dState;
+                for (int n = 0; n < dState; n++)
+                {
+                    bHRN[dstBase + n] = proj[bSrcBase + n] * bInvRms * bNormW[n] + bBias[biasBase + n];
+                    cHRN[dstBase + n] = proj[cSrcBase + n] * cInvRms * cNormW[n] + cBias[biasBase + n];
+                }
+            }
+        }
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            int baseT = t * nHead * dState;
+            for (int h = 0; h < nHead; h++)
+            {
+                float dot = 0f;
+                int off = baseT + h * dState;
+                for (int n = 0; n < dState; n++) dot += cHRN[off + n] * bHRN[off + n];
+                qkPreDot[t * nHead + h] = dot;
+            }
+        }
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            for (int h = 0; h < nHead; h++)
+            {
+                float sh = 0f;
+                if (t + 1 < seqLen)
+                {
+                    int next = (t + 1) * nHead + h;
+                    sh = dt[next] * (1f - trap[next]);
+                }
+                scale[t * nHead + h] = gamma[t * nHead + h] + sh;
+            }
+        }
+
+        // Chunk-boundary coefficient: coef[h] = dt[0,h] * (1 - trap[0,h]) — only the
+        // FIRST token's dt/trap matter (Mamba3Block.ApplyChunkBoundaryAdjustment reads
+        // dt[0,:]/trap[0,:] only).
+        var coef = new float[nHead];
+        for (int h = 0; h < nHead; h++) coef[h] = dt[h] * (1f - trap[h]);
+
+        UploadF32Array(x, _xDevice, stream);
+        UploadF32Array(z, _zDevice, stream);
+        UploadF32Array(dt, _dtDevice, stream);
+        UploadF32Array(adt, _adtDevice, stream);
+        UploadF32Array(trap, _trapDevice, stream);
+        UploadF32Array(gamma, _gammaDevice, stream);
+        UploadF32Array(scale, _scaleDevice, stream);
+        UploadF32Array(anglesRaw, _anglesRawDevice, stream);
+        UploadF32Array(bHRN, _bDevice, stream);
+        UploadF32Array(cHRN, _cDevice, stream);
+        UploadF32Array(qkPreDot, _qkPreDotDevice, stream);
+        UploadF32Array(coef, _coefDevice, stream);
+        _stream.Synchronize();
+    }
+
+    private static float[] DownloadF32(nint devicePtr, int elementCount)
+    {
+        var host = new float[elementCount];
+        if (devicePtr == 0) return host;
+        fixed (float* p = host)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, devicePtr, (nuint)(elementCount * sizeof(float))).ThrowOnError();
+        return host;
+    }
+
+    private static void UploadF32Array(float[] host, nint devicePtr, nint stream)
+    {
+        fixed (float* p = host)
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(devicePtr, (nint)p, (nuint)(host.Length * sizeof(float)), stream).ThrowOnError();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void RmsNormFactor(float[] proj, int offset, int n, float normEps, out float invRms)
+    {
+        // F32 accumulator upcast to double — matches Mamba3Block.RmsNormInto's accumulator
+        // precision exactly (bit-parity requirement, not just "close enough").
+        double acc = 0.0;
+        for (int i = 0; i < n; i++) { double v = proj[offset + i]; acc += v * v; }
+        float mean = (float)(acc / n);
+        invRms = 1f / MathF.Sqrt(mean + normEps);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float SoftPlus(float x)
+    {
+        if (x > 20f) return x;
+        if (x < -20f) return MathF.Exp(x);
+        return MathF.Log(1f + MathF.Exp(x));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float Sigmoid(float x) => 1f / (1f + MathF.Exp(-x));
+
     private long ScratchAllocatedBytes()
     {
-        if (_scratchCapacity == 0) return 0;
+        // _logitsDevice is allocated once in the constructor, independent of
+        // _scratchCapacity — always counted.
+        long logitsBytes = (long)Config.VocabSize * sizeof(float);
+        if (_scratchCapacity == 0) return logitsBytes;
         long cap = _scratchCapacity;
         int hidden = Config.HiddenSize, dInner = _m3.DInner, nHead = _m3.NumHeads;
         int dState = _m3.StateSize, numRopeAngles = _m3.NumRopeAngles;
@@ -283,8 +741,9 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
                     + cap * dInner * 3L                        // x/z/yScan
                     + cap * nHead * 6L                         // dt/adt/trap/gamma/scale/qkPreDot
                     + cap * numRopeAngles                      // anglesRaw
-                    + cap * effRank * nHead * dState * 2L;     // b/c
-        return floats * sizeof(float);
+                    + cap * effRank * nHead * dState * 2L      // b/c
+                    + nHead;                                   // _coefDevice — [nHead], not cap-scaled
+        return floats * sizeof(float) + logitsBytes;
     }
 
     /// <inheritdoc/>
