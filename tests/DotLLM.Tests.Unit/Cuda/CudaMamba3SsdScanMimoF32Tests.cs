@@ -23,12 +23,12 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// kernel block. Because this kernel folds the ENTIRE sequence into one launch with a
 /// sequential per-token state update, any sub-ULP drift introduced at t=0 compounds through
 /// every later token's state and y. Measured on this box (RTX 3060): worst observed
-/// maxAbsDiff across both shape/gate combinations was 2.38e-7 y / 1.19e-7 state (the
-/// nRank=2/hasZ=false case) — over 400x smaller than the 1e-4 tolerance below, and still
-/// several orders of magnitude tighter than a real transcription bug (wrong
-/// stride/index/broadcast/accumulator-order/rank-sum-omission) would produce, which shows
-/// up as O(0.1+). Per-case values are also reported live via <see cref="ITestOutputHelper"/>
-/// in the test output.
+/// maxAbsDiff across all three shape/gate combinations was 4.77e-7 y / 1.19e-7 state (the
+/// nRank=2/nHead=8/headDim=64/dState=128/hasZ=true realistic-shape case) — over 200x smaller
+/// than the 1e-4 tolerance below, and still several orders of magnitude tighter than a real
+/// transcription bug (wrong stride/index/broadcast/accumulator-order/rank-sum-omission) would
+/// produce, which shows up as O(0.1+). Per-case values are also reported live via
+/// <see cref="ITestOutputHelper"/> in the test output.
 /// </remarks>
 [Trait("Category", "GPU")]
 public class CudaMamba3SsdScanMimoF32Tests
@@ -63,8 +63,17 @@ public class CudaMamba3SsdScanMimoF32Tests
     }
 
     [SkippableTheory]
-    [InlineData(3, 4, 4, 8, 5, true)]   // tiny MIMO shape, rank=3, with gate
-    [InlineData(2, 4, 4, 8, 5, false)]  // tiny MIMO shape, rank=2, no gate
+    [InlineData(3, 4, 4, 8, 5, true)]     // tiny MIMO shape, rank=3, with gate
+    [InlineData(2, 4, 4, 8, 5, false)]    // tiny MIMO shape, rank=2, no gate
+    [InlineData(2, 8, 64, 128, 4, true)]  // realistic non-degenerate shape (nHead != headDim != dState),
+                                           // borrowed from VulkanMamba3CanonicalSsdMimoF32KernelTests's
+                                           // "Mamba-3 realistic decode"-scale case. The two shapes above
+                                           // both collide nHead == headDim == 4, which makes a rank/head
+                                           // stride computed from the wrong dimension undetectable (e.g.
+                                           // bcRankStride = nHead*dState vs headDim*dState — both 32 when
+                                           // nHead==headDim). This is the ONLY correctness gate this
+                                           // kernel has (no real MIMO checkpoint exists), so it must be
+                                           // able to catch that bug class on its own.
     public void Mamba3SsdScanMimoF32_MatchesCpuReference(
         int nRank, int nHead, int headDim, int dState, int seqLen, bool hasZ)
     {
