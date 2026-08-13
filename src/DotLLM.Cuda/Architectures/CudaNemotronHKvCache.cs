@@ -19,7 +19,7 @@ namespace DotLLM.Cuda.Architectures;
 /// <c>positions[0]</c> — the only write pattern NemotronH's CPU/Vulkan hosts ever produce
 /// (prefill writes <c>[0, seqLen)</c>; decode writes one position). A non-contiguous call throws.
 /// </remarks>
-internal sealed class CudaNemotronHKvCache : IKvCache
+public sealed class CudaNemotronHKvCache : IKvCache
 {
     private readonly nint[] _keys;   // per-slot device buffers, [maxSeqLen, kvStride] F32
     private readonly nint[] _values;
