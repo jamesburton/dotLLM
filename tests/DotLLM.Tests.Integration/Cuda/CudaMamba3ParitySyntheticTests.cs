@@ -60,9 +60,20 @@ public sealed class CudaMamba3ParitySyntheticTests : IDisposable
     private const int NumRopeAngles = 2;
     private const int DInProj = 2 * DInner + 2 * BcDim + 3 * NumHeads + NumRopeAngles;
 
-    // Absolute logit tolerance, matching IbSsmMamba3VulkanGenerationTests' calibration
-    // for an F32-on-both-sides forward (pure reduction-order noise, no quantization).
-    private const float LogitsAbsTol = 1e-2f;
+    // Absolute logit tolerance for the single-shot comparison. NOT transplanted from
+    // IbSsmMamba3VulkanGenerationTests' LogitsAbsTol=3.0f — that value is calibrated for
+    // the REAL 370M checkpoint's O(10)-magnitude logits (paired with a top-K Jaccard
+    // check, not used standalone), a ~300x different logit scale than this tiny
+    // synthetic fixture's ~0.04-magnitude logits; an absolute tolerance does not survive
+    // that scale change; 1e-2 would be ~25% of this fixture's own logit magnitude.
+    // Calibrated instead from what this fixture actually produces: observed max_abs
+    // 7.45E-9 pure F32 reduction-order noise (both backends run F32, no quantization),
+    // tightened to 1e-6 (~130x margin). The mutation experiment for the two-chunk test
+    // below (see TwoChunkLogitsAbsTol) showed the same drift order applies to the
+    // single-shot path too, and that a loose absolute tolerance (the original 1e-2)
+    // would silently pass a real regression of this fixture's own bug class — no reason
+    // to leave this constant looser than the tightened one.
+    private const float LogitsAbsTol = 1e-6f;
 
     // Floor for the two-chunk ablation delta (real state vs. k_state/v_state zeroed).
     // Both sides of this comparison are two deterministic CUDA runs on the same GPU —
