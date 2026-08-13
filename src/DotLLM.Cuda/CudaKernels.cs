@@ -446,6 +446,10 @@ public sealed unsafe class CudaKernels : IDisposable
     private CudaModule? _mamba3SsdScanSisoF32Module;
     private nint _mamba3SsdScanSisoF32Func;
 
+    // Issue #346 (Mamba3 CUDA host): canonical MIMO SSD scan.
+    private CudaModule? _mamba3SsdScanMimoF32Module;
+    private nint _mamba3SsdScanMimoF32Func;
+
     private readonly CudaModule? _mamba2ScanF32Module;
     private readonly nint _mamba2ScanF32Func;
     private CudaModule? _groupRmsNormF32Module;
@@ -1005,6 +1009,13 @@ public sealed unsafe class CudaKernels : IDisposable
             _mamba3SsdScanSisoF32Func = _mamba3SsdScanSisoF32Module.TryGetFunction("mamba3_ssd_scan_siso_f32");
         }
 
+        string mamba3SsdScanMimoF32Path = Path.Combine(ptxDir, "mamba3_ssd_scan_mimo_f32.ptx");
+        if (File.Exists(mamba3SsdScanMimoF32Path))
+        {
+            _mamba3SsdScanMimoF32Module = CudaModule.LoadFromFile(mamba3SsdScanMimoF32Path);
+            _mamba3SsdScanMimoF32Func = _mamba3SsdScanMimoF32Module.TryGetFunction("mamba3_ssd_scan_mimo_f32");
+        }
+
         string mamba2ScanF32Path = Path.Combine(ptxDir, "mamba2_selective_scan.ptx");
         if (File.Exists(mamba2ScanF32Path))
         {
@@ -1259,6 +1270,12 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <see cref="LaunchMamba3SsdScanSisoF32"/>) is loaded.
     /// </summary>
     public bool HasMamba3SsdScanSiso => _mamba3SsdScanSisoF32Func != 0;
+
+    /// <summary>
+    /// True when the Mamba-3 canonical MIMO SSD scan kernel (issue #346,
+    /// <see cref="LaunchMamba3SsdScanMimoF32"/>) is loaded.
+    /// </summary>
+    public bool HasMamba3SsdScanMimo => _mamba3SsdScanMimoF32Func != 0;
 
     /// <summary>
     /// True when the fused GDN decay kernel (softplus + exp) is available on the
@@ -3354,6 +3371,46 @@ public sealed unsafe class CudaKernels : IDisposable
             &seqArg, &headArg, &hdArg, &dsArg, &hasZArg };
 
         CudaDriverApi.cuLaunchKernel(_mamba3SsdScanSisoF32Func,
+                (uint)nHead, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Mamba-3 canonical MIMO SSD scan (issue #346). Same one-block-per-head,
+    /// covers-all-seqLen-in-one-launch structure as
+    /// <see cref="LaunchMamba3SsdScanSisoF32"/>, extended with a rank axis
+    /// <paramref name="nRank"/> (state stays rank-free: K is rank-summed inside the
+    /// state update, matching <c>Mamba3CanonicalSsd.ExecuteMimo</c>).
+    /// </summary>
+    /// <remarks>
+    /// <b>No-aliasing contract.</b> The kernel declares <c>v</c>, <c>qRoped</c>,
+    /// <c>kRoped</c>, <c>z</c>, <c>mimoZ</c>, and <c>mimoO</c> <c>__restrict__</c>
+    /// (native/kernels/mamba3_ssd_scan_mimo_f32.cu), which nvcc compiles to read-only
+    /// <c>ld.global.nc</c> loads for those buffers. Callers MUST NOT pass
+    /// <paramref name="y"/> or <paramref name="state"/> aliasing any of
+    /// <paramref name="v"/>, <paramref name="qRoped"/>, <paramref name="kRoped"/>,
+    /// <paramref name="z"/>, <paramref name="mimoZ"/>, or <paramref name="mimoO"/> — e.g. an
+    /// in-place <c>y == v</c> would read stale (pre-write) data through the read-only cache
+    /// instead of the just-written value, since the compiler has been told those pointers are
+    /// never written through any alias.
+    /// </remarks>
+    public void LaunchMamba3SsdScanMimoF32(nint state, nint v, nint qRoped, nint kRoped,
+        nint qkPreDotSum, nint scale, nint gamma, nint adt, nint d, nint z, nint mimoZ, nint mimoO, nint y,
+        int seqLen, int nRank, int nHead, int headDim, int dState, bool hasZ, nint stream)
+    {
+        if (_mamba3SsdScanMimoF32Func == 0)
+            throw new InvalidOperationException(
+                "mamba3_ssd_scan_mimo_f32 kernel not available. Recompile native/kernels/mamba3_ssd_scan_mimo_f32.cu to PTX.");
+
+        nint stateArg = state, vArg = v, qArg = qRoped, kArg = kRoped, qkpArg = qkPreDotSum;
+        nint sclArg = scale, gmArg = gamma, adtArg = adt, dArg = d, zArg = z, mzArg = mimoZ, moArg = mimoO, yArg = y;
+        int seqArg = seqLen, rankArg = nRank, headArg = nHead, hdArg = headDim, dsArg = dState, hasZArg = hasZ ? 1 : 0;
+
+        void** args = stackalloc void*[] {
+            &stateArg, &vArg, &qArg, &kArg, &qkpArg, &sclArg, &gmArg, &adtArg, &dArg, &zArg, &mzArg, &moArg, &yArg,
+            &seqArg, &rankArg, &headArg, &hdArg, &dsArg, &hasZArg };
+
+        CudaDriverApi.cuLaunchKernel(_mamba3SsdScanMimoF32Func,
                 (uint)nHead, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
@@ -6452,6 +6509,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _mamba3DataRopeF32Module?.Dispose();
         _mamba3ChunkBoundaryF32Module?.Dispose();
         _mamba3SsdScanSisoF32Module?.Dispose();
+        _mamba3SsdScanMimoF32Module?.Dispose();
         _mamba2ScanF32Module?.Dispose();
         _groupRmsNormF32Module?.Dispose();
         _reluSquaredInplaceF32Module?.Dispose();
