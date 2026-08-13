@@ -10,6 +10,14 @@
 
 Implementation: Trie for prefix matching, compiled regex. Vocabulary loaded from GGUF `tokenizer.ggml.tokens` + `tokenizer.ggml.merges`.
 
+> ⚠️ **Known pitfall (issue #373):** the model-specific regex is selected from GGUF
+> `tokenizer.ggml.pre` in `TiktokenPreTokenizer.GetRegexes`, which returns **null for unknown
+> values**, and `BpeTokenizer` treats null as "no pre-tokenization" — so a GGUF with an
+> unimplemented `pre` (e.g. `pixtral`) currently tokenizes with **no splitting regex at all**,
+> silently diverging from llama.cpp. Until #373 lands (loud failure + more `pre` values), check
+> that a new model's `tokenizer.ggml.pre` has a case in `GetRegexes` before trusting any output
+> or quality measurement.
+
 ### SentencePiece BPE (Llama 2)
 
 - Unicode code-point level (not byte-level).
