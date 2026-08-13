@@ -433,6 +433,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _gdnDeinterleaveL2NormDecodeF32Func;
     private readonly nint _gdnDecayF32Func;
     private readonly nint _gdnDecaySigmoidF32Func;
+    private readonly CudaModule? _mamba2ScanF32Module;
+    private readonly nint _mamba2ScanF32Func;
     private readonly CudaModule? _elementwiseF32Module;
     private readonly nint _sigmoidF32Func;
     private readonly nint _siluF32Func;
@@ -963,6 +965,13 @@ public sealed unsafe class CudaKernels : IDisposable
                 _gdnScanF32Module.TryGetFunction("gdn_deinterleave_l2norm_decode_f32");
             _gdnDecayF32Func = _gdnScanF32Module.TryGetFunction("gdn_decay_f32");
             _gdnDecaySigmoidF32Func = _gdnScanF32Module.TryGetFunction("gdn_decay_sigmoid_f32");
+        }
+
+        string mamba2ScanF32Path = Path.Combine(ptxDir, "mamba2_selective_scan.ptx");
+        if (File.Exists(mamba2ScanF32Path))
+        {
+            _mamba2ScanF32Module = CudaModule.LoadFromFile(mamba2ScanF32Path);
+            _mamba2ScanF32Func = _mamba2ScanF32Module.TryGetFunction("mamba2_selective_scan_f32");
         }
 
         // Pointwise FP32 helpers (sigmoid / silu / sigmoid_mul) for the post-
@@ -3064,6 +3073,55 @@ public sealed unsafe class CudaKernels : IDisposable
 
         CudaDriverApi.cuLaunchKernel(_gdnScanStepF32Func,
                 (uint)nVHead, 1, 1, (uint)dState, 1, 1,
+                sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Mamba2 selective-scan (NVIDIA Nemotron-H), one launch per SSM-layer forward call —
+    /// bit-order-faithful port of <see cref="DotLLM.Cpu.Kernels.Mamba2SelectiveScan.Execute"/>,
+    /// fused with the raw-dt + dtBias guarded-softplus decay and the D-skip term. See
+    /// native/kernels/mamba2_selective_scan.cu for the full layout and fusion documentation.
+    /// </summary>
+    /// <param name="state">Device pointer, <c>[nHead, headDim, dState]</c> F32, updated in place.</param>
+    /// <param name="x">Device pointer, <c>[seqLen, dInner]</c> F32 (dInner = nHead*headDim).</param>
+    /// <param name="dtRaw">Device pointer, <c>[seqLen, nHead]</c> F32, NOT yet bias-added.</param>
+    /// <param name="dtBias">Device pointer, <c>[nHead]</c> F32.</param>
+    /// <param name="a">Device pointer, <c>[nHead]</c> F32 (stored negative by the GGUF converter).</param>
+    /// <param name="d">Device pointer, <c>[nHead]</c> F32 (D skip parameter).</param>
+    /// <param name="b">Device pointer, <c>[seqLen, nGroup, dState]</c> F32.</param>
+    /// <param name="c">Device pointer, <c>[seqLen, nGroup, dState]</c> F32.</param>
+    /// <param name="y">Device pointer, <c>[seqLen, dInner]</c> F32, overwritten (includes D-skip).</param>
+    /// <param name="nHead">Number of Mamba2 heads.</param>
+    /// <param name="headDim">Channels per head (dInner / nHead). Must be in (0, 256] — the kernel
+    /// is compiled with <c>__launch_bounds__(256)</c> and launches with blockDim.x == headDim.</param>
+    /// <param name="dState">SSM state width.</param>
+    /// <param name="nGroup">Number of B/C groups (must divide nHead evenly).</param>
+    /// <param name="seqLen">Number of tokens in this call.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    /// <exception cref="ArgumentOutOfRangeException">headDim outside (0, 256].</exception>
+    public void LaunchMamba2SelectiveScanF32(nint state, nint x, nint dtRaw, nint dtBias,
+                                               nint a, nint d, nint b, nint c, nint y,
+                                               int nHead, int headDim, int dState, int nGroup,
+                                               int seqLen, nint stream)
+    {
+        if (headDim <= 0 || headDim > 256)
+            throw new ArgumentOutOfRangeException(nameof(headDim),
+                $"headDim={headDim}; mamba2_selective_scan_f32 is compiled with __launch_bounds__(256) " +
+                "and launches with blockDim.x == headDim.");
+
+        nint sArg = state, xArg = x, dtArg = dtRaw, dtbArg = dtBias;
+        nint aArg = a, dArg = d, bArg = b, cArg = c, yArg = y;
+        int nhArg = nHead, hdArg = headDim, dsArg = dState, ngArg = nGroup, slArg = seqLen;
+
+        void** args = stackalloc void*[] {&sArg, &xArg, &dtArg, &dtbArg,
+                        &aArg, &dArg, &bArg, &cArg, &yArg,
+                        &nhArg, &hdArg, &dsArg, &ngArg, &slArg};
+
+        // Shared memory: b_shared[dState] + c_shared[dState]
+        uint sharedBytes = (uint)(2 * dState * sizeof(float));
+
+        CudaDriverApi.cuLaunchKernel(_mamba2ScanF32Func,
+                (uint)nHead, 1, 1, (uint)headDim, 1, 1,
                 sharedBytes, stream, (nint)args, 0).ThrowOnError();
     }
 
@@ -6143,6 +6201,7 @@ public sealed unsafe class CudaKernels : IDisposable
         // would double-free the underlying CUmodule handle.
         _conv1dCausalF32Module?.Dispose();
         _gdnScanF32Module?.Dispose();
+        _mamba2ScanF32Module?.Dispose();
         _elementwiseF32Module?.Dispose();
         _gemma4F32Module?.Dispose();
     }

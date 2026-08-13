@@ -73,7 +73,7 @@ REM produces ~1 ULP precision drift per accumulation versus the CPU's separate
 REM mul+add. The Qwen3MoeHybrid recurrence (GDN) compounds those tiny errors
 REM over time steps, so the two kernels backing it must be compiled with FMA
 REM fusion disabled. Costs minor perf; matches the CPU bit-for-bit.
-set "NO_FMA=conv1d_causal gated_delta_net_scan elementwise_f32 turboquant"
+set "NO_FMA=conv1d_causal gated_delta_net_scan elementwise_f32 turboquant mamba2_selective_scan"
 
 REM Kernels that emit Ampere-only PTX (mma.sync / cp.async) and so MUST be built
 REM at compute_86 instead of the global default. These are dispatch-gated to
