@@ -481,11 +481,15 @@ public class BpeTokenizerTests
     }
 
     [Fact]
-    public void TiktokenPreTokenizer_ReturnsNullForUnknownType()
+    public void TiktokenPreTokenizer_AbsentDefaultsUnknownThrows()
     {
-        Assert.Null(TiktokenPreTokenizer.GetRegexes(null));
-        Assert.Null(TiktokenPreTokenizer.GetRegexes(""));
-        Assert.Null(TiktokenPreTokenizer.GetRegexes("unknown-model"));
+        // #373: this replaces TiktokenPreTokenizer_ReturnsNullForUnknownType, which
+        // pinned the defective contract (null → silent no-pre-tokenization). The
+        // policy now mirrors llama.cpp: absent → GPT-2 default, unknown → throw.
+        // Full policy coverage lives in PreTokenizerPolicyTests.
+        Assert.Equal(TiktokenPreTokenizer.GetRegexes("gpt2"), TiktokenPreTokenizer.GetRegexes(null));
+        Assert.Equal(TiktokenPreTokenizer.GetRegexes("gpt2"), TiktokenPreTokenizer.GetRegexes(""));
+        Assert.Throws<InvalidDataException>(() => TiktokenPreTokenizer.GetRegexes("unknown-model"));
     }
 
     [Fact]
@@ -692,7 +696,8 @@ public class BpeTokenizerTests
     [Fact]
     public void GgufFactory_LoadsTiktokenWithoutPreType()
     {
-        // No tokenizer.ggml.pre key → no pre-tokenization (backwards compat)
+        // No tokenizer.ggml.pre key → GPT-2 default pipeline (llama.cpp's
+        // "missing pre-tokenizer type, using: 'default'" fallback; #373)
         var (tokens, merges) = BuildTiktokenGgufData();
         var entries = new Dictionary<string, GgufMetadataValue>
         {
