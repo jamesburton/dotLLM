@@ -1,4 +1,5 @@
 using DotLLM.Vulkan.Interop;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -20,10 +21,10 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class Q6KDequantF32Kernel : VulkanComputeKernelBase
 {
     /// <summary>Q6_K super-block: 128 + 64 + 16 + 2 = 210 bytes.</summary>
-    public const int Q6_KBlockBytes = 210;
+    public const int Q6_KBlockBytes = QuantFormat.Q6_KBlockBytes;
 
     /// <summary>Elements per Q6_K super-block.</summary>
-    public const int Q6_KGroupSize = 256;
+    public const int Q6_KGroupSize = QuantFormat.KQuantGroupSize;
 
     /// <summary>Workgroups per dispatch chunk — comfortably under the 65535 portable x-limit.</summary>
     private const int MaxBlocksPerDispatch = 32768;

@@ -1,3 +1,4 @@
+using DotLLM.Core.Configuration;
 using DotLLM.Vulkan.Interop;
 
 namespace DotLLM.Vulkan.Kernels;
@@ -27,7 +28,7 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class QuantizeQ8_1RowsKernel : IDisposable
 {
     /// <summary>Elements per Q8_1 block.</summary>
-    public const int GroupSize = 32;
+    public const int GroupSize = QuantFormat.LegacyGroupSize;
 
     private const int PushConstantBytes = 3 * sizeof(uint); // K, blocksPerRow, N
 

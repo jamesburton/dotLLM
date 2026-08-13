@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -12,22 +13,22 @@ namespace DotLLM.Cpu.Kernels;
 public static unsafe partial class Dequantize
 {
     /// <summary>Q2_K block size in bytes: 16(scales) + 64(qs) + 2(d) + 2(dmin) = 84.</summary>
-    internal const int Q2_K_BlockBytes = 84;
+    internal const int Q2_K_BlockBytes = QuantFormat.Q2_KBlockBytes;
 
     /// <summary>Q3_K block size in bytes: 32(hmask) + 64(qs) + 12(scales) + 2(d) = 110.</summary>
-    internal const int Q3_K_BlockBytes = 110;
+    internal const int Q3_K_BlockBytes = QuantFormat.Q3_KBlockBytes;
 
     /// <summary>Q4_K block size in bytes: 2(d) + 2(dmin) + 12(scales) + 128(qs) = 144.</summary>
-    internal const int Q4_K_BlockBytes = 144;
+    internal const int Q4_K_BlockBytes = QuantFormat.Q4_KBlockBytes;
 
     /// <summary>Q5_K block size in bytes: 2(d) + 2(dmin) + 12(scales) + 32(qh) + 128(qs) = 176.</summary>
-    internal const int Q5_K_BlockBytes = 176;
+    internal const int Q5_K_BlockBytes = QuantFormat.Q5_KBlockBytes;
 
     /// <summary>Q6_K block size in bytes: 128(ql) + 64(qh) + 16(scales) + 2(d) = 210.</summary>
-    internal const int Q6_K_BlockBytes = 210;
+    internal const int Q6_K_BlockBytes = QuantFormat.Q6_KBlockBytes;
 
     /// <summary>Number of elements per K-quant super-block.</summary>
-    internal const int KQuantGroupSize = 256;
+    internal const int KQuantGroupSize = QuantFormat.KQuantGroupSize;
 
     // ──────────────────── Scale unpacking ────────────────────
 

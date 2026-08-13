@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using DotLLM.Cpu.Threading;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -15,16 +16,16 @@ namespace DotLLM.Cpu.Kernels;
 public static unsafe partial class MatMul
 {
     /// <summary>Q8_0 block size in bytes: 2 (Half scale) + 32 (sbyte quantized values).</summary>
-    private const int Q8_0BlockBytes = 34;
+    private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
 
     /// <summary>Number of elements per Q8_0 block.</summary>
-    private const int Q8_0GroupSize = 32;
+    private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
 
     /// <summary>Q8_1 block size in bytes: 2 (Half d) + 2 (Half s) + 32 (sbyte quantized values).</summary>
-    public const int Q8_1BlockBytes = 36;
+    public const int Q8_1BlockBytes = QuantFormat.Q8_1BlockBytes;
 
     /// <summary>Number of elements per Q8_1 block.</summary>
-    private const int Q8_1GroupSize = 32;
+    private const int Q8_1GroupSize = QuantFormat.LegacyGroupSize;
 
     /// <summary>Stackalloc threshold in bytes. Above this, use ArrayPool.</summary>
     private const int StackAllocThreshold = 8192;

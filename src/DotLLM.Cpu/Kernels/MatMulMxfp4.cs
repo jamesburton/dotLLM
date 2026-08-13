@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using DotLLM.Cpu.Threading;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -40,10 +41,10 @@ namespace DotLLM.Cpu.Kernels;
 public static unsafe partial class MatMul
 {
     /// <summary>MXFP4 block size in bytes: 1 (E8M0 scale) + 16 (nibbles).</summary>
-    private const int Mxfp4BlockBytes = 17;
+    private const int Mxfp4BlockBytes = QuantFormat.Mxfp4BlockBytes;
 
     /// <summary>Elements per MXFP4 block.</summary>
-    private const int Mxfp4GroupSize = 32;
+    private const int Mxfp4GroupSize = QuantFormat.LegacyGroupSize;
 
     /// <summary>
     /// MXFP4 GEMV: A is MXFP4 [M,K], x is f32 [K]. Dots each row directly against the f32

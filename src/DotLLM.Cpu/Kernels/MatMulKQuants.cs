@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using DotLLM.Cpu.Threading;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -14,16 +15,16 @@ namespace DotLLM.Cpu.Kernels;
 /// </summary>
 public static unsafe partial class MatMul
 {
-    private const int Q4_K_BlockBytes = 144;
-    private const int Q5_K_BlockBytes = 176;
-    private const int Q6_K_BlockBytes = 210;
-    private const int KQuantGroupSize = 256;
+    private const int Q4_K_BlockBytes = QuantFormat.Q4_KBlockBytes;
+    private const int Q5_K_BlockBytes = QuantFormat.Q5_KBlockBytes;
+    private const int Q6_K_BlockBytes = QuantFormat.Q6_KBlockBytes;
+    private const int KQuantGroupSize = QuantFormat.KQuantGroupSize;
 
     /// <summary>Q8_K block: float d(4) + sbyte qs[256](256) + short bsums[16](32) = 292 bytes.</summary>
-    public const int Q8_K_BlockBytes = 292;
+    public const int Q8_K_BlockBytes = QuantFormat.Q8_KBlockBytes;
 
     /// <summary>Elements per Q8_K block.</summary>
-    private const int Q8_K_GroupSize = 256;
+    private const int Q8_K_GroupSize = QuantFormat.KQuantGroupSize;
 
     // ──────────────────── Q8_K quantization ────────────────────
 

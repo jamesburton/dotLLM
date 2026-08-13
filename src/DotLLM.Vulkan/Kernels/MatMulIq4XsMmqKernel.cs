@@ -1,4 +1,5 @@
 using DotLLM.Vulkan.Interop;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -21,10 +22,10 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class MatMulIq4XsMmqKernel : IDisposable
 {
     /// <summary>IQ4_XS super-block: d + scales_h + scales_l[4] + qs[128].</summary>
-    public const int Iq4XsBlockBytes = 136;
+    public const int Iq4XsBlockBytes = QuantFormat.IQ4_XSBlockBytes;
 
     /// <summary>Elements per IQ4_XS super-block.</summary>
-    public const int Iq4XsGroupSize = 256;
+    public const int Iq4XsGroupSize = QuantFormat.KQuantGroupSize;
 
     // issue #139: 64×64 output tile per workgroup (16×16 threads × 4×4 register
     // tile each) — must match TILE_M/TILE_N in matmul_iq4_xs_mmq.comp.

@@ -18,8 +18,8 @@ namespace DotLLM.Engine.KvCache;
 public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache
 {
     private const int BlockSize = 32;
-    private const int Q8_0BlockBytes = 34;
-    private const int Q4_0BlockBytes = 18;
+    private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
+    private const int Q4_0BlockBytes = QuantFormat.Q4_0BlockBytes;
 
     private readonly nint[] _keysQuant;     // [numLayers] quantized K buffers
     private readonly nint[] _valuesQuant;   // [numLayers] quantized V buffers
