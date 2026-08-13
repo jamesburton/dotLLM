@@ -433,6 +433,11 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _gdnDeinterleaveL2NormDecodeF32Func;
     private readonly nint _gdnDecayF32Func;
     private readonly nint _gdnDecaySigmoidF32Func;
+
+    // Issue #346 (Mamba3 CUDA host): canonical data-dependent RoPE on B/C.
+    private CudaModule? _mamba3DataRopeF32Module;
+    private nint _mamba3DataRopeF32Func;
+
     private readonly CudaModule? _mamba2ScanF32Module;
     private readonly nint _mamba2ScanF32Func;
     private CudaModule? _groupRmsNormF32Module;
@@ -971,6 +976,13 @@ public sealed unsafe class CudaKernels : IDisposable
             _gdnDecaySigmoidF32Func = _gdnScanF32Module.TryGetFunction("gdn_decay_sigmoid_f32");
         }
 
+        string mamba3DataRopeF32Path = Path.Combine(ptxDir, "mamba3_data_rope_f32.ptx");
+        if (File.Exists(mamba3DataRopeF32Path))
+        {
+            _mamba3DataRopeF32Module = CudaModule.LoadFromFile(mamba3DataRopeF32Path);
+            _mamba3DataRopeF32Func = _mamba3DataRopeF32Module.TryGetFunction("mamba3_data_rope_f32");
+        }
+
         string mamba2ScanF32Path = Path.Combine(ptxDir, "mamba2_selective_scan.ptx");
         if (File.Exists(mamba2ScanF32Path))
         {
@@ -1204,6 +1216,15 @@ public sealed unsafe class CudaKernels : IDisposable
     /// </summary>
     public bool HasGdnKernels =>
         _conv1dCausalF32Func != 0 && _gdnScanStepF32Func != 0 && _l2NormHeadsF32Func != 0;
+
+    /// <summary>
+    /// True when the Mamba-3 canonical data-RoPE kernel (issue #346,
+    /// <see cref="LaunchMamba3DataRopeF32"/>) is loaded. Optional — a stale PTX build
+    /// without this symbol still loads; the Mamba-3 model forward path (not yet wired,
+    /// issue #346 follow-up task) throws a descriptive error only when it actually
+    /// needs this kernel.
+    /// </summary>
+    public bool HasMamba3DataRope => _mamba3DataRopeF32Func != 0;
 
     /// <summary>
     /// True when the fused GDN decay kernel (softplus + exp) is available on the
@@ -3167,6 +3188,56 @@ public sealed unsafe class CudaKernels : IDisposable
         CudaDriverApi.cuLaunchKernel(_mamba2ScanF32Func,
                 (uint)nHead, 1, 1, (uint)headDim, 1, 1,
                 sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Mamba-3 canonical data-dependent RoPE on B/C (issue #346). One CUDA block per
+    /// head; sequential loop over t inside the kernel (mirrors
+    /// native/vulkan/shaders/mamba3_data_rope_f32.comp's one-workgroup-per-head design,
+    /// itself validated against <c>DotLLM.Cpu.Kernels.Mamba3DataRoPE.ExecuteCanonical</c>).
+    /// <paramref name="b"/>/<paramref name="c"/> are mutated in place, shape
+    /// <c>[seqLen, nRank, nHead, dState]</c>. <paramref name="mode"/>: 0=Pairwise (SISO),
+    /// 1=Halved (MIMO). Pass <paramref name="hasCumPrev"/>=false to start the cumulative
+    /// angle from zero (fresh sequence); pass <paramref name="writeCumOut"/>=false if the
+    /// caller does not need the final angle (rare — decode continuity needs it every call).
+    /// </summary>
+    /// <remarks>
+    /// <b>numRopeAngles is capped at 64, not the kernel's MAX_ROPE_ANGLES=256 shared-memory
+    /// bound.</b> The shared-memory fill (<c>sharedCum</c>) and the <c>cumOut</c> writeback both
+    /// stride by the 64-thread block (<c>for (k = tid; k &lt; nra; k += WG_SIZE)</c>), so they
+    /// scale correctly to nra up to 256. The rotation block, however, is a plain
+    /// <c>if (tid &lt; nra)</c> with no stride loop — pairs at k &gt;= 64 are silently never
+    /// rotated. Confirmed present in both this kernel and the pre-existing
+    /// native/vulkan/shaders/mamba3_data_rope_f32.comp it was ported from (issue #346 Task 2
+    /// finding; not fixed here — fixing needs a kernel-source recompile, out of scope for a
+    /// C#-only task). All known real Mamba-3 checkpoints use numRopeAngles ∈ {32, 64}, so this
+    /// does not block current usage, but the guard rejects anything that would silently
+    /// corrupt lanes instead of quietly under-rotating them.
+    /// </remarks>
+    public void LaunchMamba3DataRopeF32(nint b, nint c, nint anglesRaw, nint dt,
+        nint cumPrev, nint cumOut, int seqLen, int nRank, int nHead, int dState,
+        int numRopeAngles, int mode, bool hasCumPrev, bool writeCumOut, nint stream)
+    {
+        if (_mamba3DataRopeF32Func == 0)
+            throw new InvalidOperationException(
+                "mamba3_data_rope_f32 kernel not available. Recompile native/kernels/mamba3_data_rope_f32.cu to PTX.");
+        if (numRopeAngles > 64)
+            throw new ArgumentOutOfRangeException(nameof(numRopeAngles),
+                $"numRopeAngles={numRopeAngles}; mamba3_data_rope_f32's rotation loop is 'if (tid < nra)' " +
+                "over a 64-thread block with no stride, so lanes at k>=64 would silently never rotate " +
+                "(issue #346 finding; kernel needs a stride loop there to lift this cap).");
+
+        nint bArg = b, cArg = c, anglesArg = anglesRaw, dtArg = dt, cumPrevArg = cumPrev, cumOutArg = cumOut;
+        int seqArg = seqLen, rankArg = nRank, headArg = nHead, stateArg = dState, nraArg = numRopeAngles, modeArg = mode;
+        int hasCumArg = hasCumPrev ? 1 : 0, writeCumArg = writeCumOut ? 1 : 0;
+
+        void** args = stackalloc void*[] {
+            &bArg, &cArg, &anglesArg, &dtArg, &cumPrevArg, &cumOutArg,
+            &seqArg, &rankArg, &headArg, &stateArg, &nraArg, &modeArg, &hasCumArg, &writeCumArg };
+
+        CudaDriverApi.cuLaunchKernel(_mamba3DataRopeF32Func,
+                (uint)nHead, 1, 1, 64, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>
@@ -6260,6 +6331,7 @@ public sealed unsafe class CudaKernels : IDisposable
         // would double-free the underlying CUmodule handle.
         _conv1dCausalF32Module?.Dispose();
         _gdnScanF32Module?.Dispose();
+        _mamba3DataRopeF32Module?.Dispose();
         _mamba2ScanF32Module?.Dispose();
         _groupRmsNormF32Module?.Dispose();
         _reluSquaredInplaceF32Module?.Dispose();
