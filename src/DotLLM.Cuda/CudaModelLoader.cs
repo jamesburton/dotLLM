@@ -82,10 +82,11 @@ public static class CudaModelLoader
             // partial/wrong load on whichever tensors happen to coincide.
             case Architecture.Mamba3:
                 throw new NotSupportedException(
-                    "CUDA has no dedicated loader for Mamba3 yet (tracked separately from the "
-                    + "Mamba3 guard on CudaModelLoader.LoadFromSafetensors — that one covers the "
-                    + "safetensors path only, this is the GGUF path). Use the CPU or Vulkan "
-                    + "backend for Mamba3 checkpoints.");
+                    "Mamba3 has no GGUF tensor-naming convention on ANY dotLLM backend (CPU, Vulkan, "
+                    + "or CUDA) — see docs/SUPPORTED_MODELS.md's 'No upstream GGUF mapping' note. "
+                    + "Load Mamba3 checkpoints via CudaModelLoader.LoadMamba3FromSafetensors (CUDA), "
+                    + "ModelLoader.LoadFromSafetensors (CPU), or VulkanMamba3TransformerModel.LoadFromSafetensors "
+                    + "(Vulkan) instead.");
 
             case Architecture.NemotronH:
             {
@@ -138,11 +139,49 @@ public static class CudaModelLoader
         {
             if (config.Architecture == Architecture.Mamba3)
                 throw new NotSupportedException(
-                    "CUDA loader does not yet support Mamba3. Use the CPU safetensors loader "
-                    + "(ModelLoader.LoadFromSafetensors) or the GGUF path.");
+                    "Mamba3 is not loadable via CudaModelLoader.LoadFromSafetensors — its layer "
+                    + "shape (no attention, no standard FFN) is not CudaTransformerModel-compatible. "
+                    + "Use CudaModelLoader.LoadMamba3FromSafetensors(path, deviceId, ptxDir) instead.");
 
             var i2sCache = ModelLoader.TryCreateBitNetI2SCache(path, config);
             var model = CudaTransformerModel.LoadFromSafetensors(source, config, deviceId, ptxDir, i2sCache);
+            return (model, source, config);
+        }
+        catch
+        {
+            source.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Loads a Mamba-3 model from an HF safetensors checkpoint onto the specified GPU.
+    /// This is the CUDA safetensors entry point for <see cref="Architecture.Mamba3"/> —
+    /// a dedicated method rather than a branch inside <see cref="LoadFromSafetensors"/>
+    /// because that method's return type is pinned to the concrete
+    /// <see cref="CudaTransformerModel"/>, which <see cref="Architectures.CudaMamba3TransformerModel"/>
+    /// is not (Mamba-3's layer shape — no attention, no standard FFN — is not
+    /// <see cref="CudaTransformerModel"/>-compatible). Mirrors
+    /// <see cref="ModelLoader.LoadFromSafetensors(string, ThreadingConfig?)"/> (CPU) and
+    /// <c>VulkanMamba3TransformerModel.LoadFromSafetensors</c>'s dedicated-entry-point
+    /// pattern.
+    /// </summary>
+    /// <param name="path">A <c>*.safetensors</c> file or a directory containing one, plus a sibling <c>config.json</c>.</param>
+    /// <param name="deviceId">GPU device ordinal (0-based).</param>
+    /// <param name="ptxDir">Directory containing compiled PTX files. Null for auto-detect.</param>
+    public static (Architectures.CudaMamba3TransformerModel Model, ISafetensorsTensorSource Source, ModelConfig Config)
+        LoadMamba3FromSafetensors(string path, int deviceId = 0, string? ptxDir = null)
+    {
+        var (source, config) = ModelLoader.OpenSafetensorsAndConfig(path);
+        try
+        {
+            if (config.Architecture != Architecture.Mamba3)
+                throw new ArgumentException(
+                    $"CudaModelLoader.LoadMamba3FromSafetensors requires a Mamba3 checkpoint, "
+                    + $"got Architecture.{config.Architecture}. Use CudaModelLoader.LoadFromSafetensors instead.",
+                    nameof(path));
+
+            var model = Architectures.CudaMamba3TransformerModel.LoadFromSafetensors(source, config, deviceId, ptxDir);
             return (model, source, config);
         }
         catch
