@@ -435,6 +435,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _gdnDecaySigmoidF32Func;
     private readonly CudaModule? _mamba2ScanF32Module;
     private readonly nint _mamba2ScanF32Func;
+    private CudaModule? _groupRmsNormF32Module;
+    private nint _groupRmsNormF32Func;
     private readonly CudaModule? _elementwiseF32Module;
     private readonly nint _sigmoidF32Func;
     private readonly nint _siluF32Func;
@@ -972,6 +974,13 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             _mamba2ScanF32Module = CudaModule.LoadFromFile(mamba2ScanF32Path);
             _mamba2ScanF32Func = _mamba2ScanF32Module.TryGetFunction("mamba2_selective_scan_f32");
+        }
+
+        string groupRmsNormF32Path = Path.Combine(ptxDir, "group_rmsnorm.ptx");
+        if (File.Exists(groupRmsNormF32Path))
+        {
+            _groupRmsNormF32Module = CudaModule.LoadFromFile(groupRmsNormF32Path);
+            _groupRmsNormF32Func = _groupRmsNormF32Module.TryGetFunction("group_rmsnorm_f32");
         }
 
         // Pointwise FP32 helpers (sigmoid / silu / sigmoid_mul) for the post-
@@ -2798,6 +2807,30 @@ public sealed unsafe class CudaKernels : IDisposable
 
         CudaDriverApi.cuLaunchKernel(_perHeadRmsNormF32Func,
                 (uint)(seqLen * numHeads), 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Per-group F32 RmsNorm (NVIDIA Nemotron-H Mamba2 SSM output norm). Each group has
+    /// its own weight slice — unlike <see cref="LaunchPerHeadRmsNormF32"/>'s single shared weight
+    /// array. See native/kernels/group_rmsnorm.cu.</summary>
+    /// <param name="x">Device pointer, <c>[seqLen, nGroup, groupDim]</c> F32, normalized in place.</param>
+    /// <param name="weight">Device pointer, <c>[nGroup, groupDim]</c> F32 (== ssm_norm.weight).</param>
+    /// <param name="eps">Variance epsilon added before the reciprocal square root.</param>
+    /// <param name="seqLen">Number of tokens (rows) in <paramref name="x"/>.</param>
+    /// <param name="nGroup">Number of SSM groups (grid.x == seqLen * nGroup).</param>
+    /// <param name="groupDim">Elements per group (== d_inner / nGroup).</param>
+    /// <param name="stream">CUDA stream to launch on.</param>
+    public void LaunchGroupRmsNormF32(nint x, nint weight, float eps,
+                                        int seqLen, int nGroup, int groupDim, nint stream)
+    {
+        nint xArg = x, wArg = weight;
+        float epsArg = eps;
+        int slArg = seqLen, ngArg = nGroup, gdArg = groupDim;
+
+        void** args = stackalloc void*[] {&xArg, &wArg, &epsArg, &slArg, &ngArg, &gdArg};
+
+        CudaDriverApi.cuLaunchKernel(_groupRmsNormF32Func,
+                (uint)(seqLen * nGroup), 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
@@ -6202,6 +6235,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _conv1dCausalF32Module?.Dispose();
         _gdnScanF32Module?.Dispose();
         _mamba2ScanF32Module?.Dispose();
+        _groupRmsNormF32Module?.Dispose();
         _elementwiseF32Module?.Dispose();
         _gemma4F32Module?.Dispose();
     }
