@@ -11,6 +11,7 @@ using DotLLM.Cuda.Architectures;
 using DotLLM.Engine.KvCache;
 using DotLLM.Models.Architectures;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace DotLLM.Tests.Unit.Cuda;
 
@@ -25,6 +26,13 @@ namespace DotLLM.Tests.Unit.Cuda;
 [Trait("Category", "GPU")]
 public sealed class CudaNemotronHTransformerModelForwardTests
 {
+    private readonly ITestOutputHelper _output;
+
+    public CudaNemotronHTransformerModelForwardTests(ITestOutputHelper output)
+    {
+        _output = output;
+    }
+
     private const int HiddenSize = 16;
     private const int VocabSize = 8;
     private const int HeadDim = 8;
@@ -157,6 +165,22 @@ public sealed class CudaNemotronHTransformerModelForwardTests
         }
 
         int lastRow = seqLen - 1;
+        float maxAbsDiff = 0f;
+        float maxRelDiff = 0f;
+        for (int c = 0; c < vocabSize; c++)
+        {
+            float cpu = cpuLogits[lastRow * vocabSize + c];
+            float cuda = cudaLogits[lastRow * vocabSize + c];
+            float diff = MathF.Abs(cpu - cuda);
+            if (diff > maxAbsDiff) maxAbsDiff = diff;
+            float rel = diff / (MathF.Abs(cpu) + 1e-12f);
+            if (rel > maxRelDiff) maxRelDiff = rel;
+        }
+        _output.WriteLine(
+            $"layers={string.Join(',', layerKinds)}, seqLen={seqLen}, quant={quantize}: " +
+            $"max|diff|={maxAbsDiff:E3}, max relative={maxRelDiff:E3} " +
+            $"(AbsTol={AbsTol:E3}, RelTol={RelTol:E3})");
+
         for (int c = 0; c < vocabSize; c++)
         {
             float cpu = cpuLogits[lastRow * vocabSize + c];
@@ -250,6 +274,23 @@ public sealed class CudaNemotronHTransformerModelForwardTests
         {
             int rows = step == 0 ? promptIds.Length : 1;
             int lastRow = rows - 1;
+
+            float maxAbsDiff = 0f;
+            float maxRelDiff = 0f;
+            for (int c = 0; c < vocabSize; c++)
+            {
+                float cpu = cpuSteps[step][lastRow * vocabSize + c];
+                float cuda = cudaSteps[step][lastRow * vocabSize + c];
+                float diff = MathF.Abs(cpu - cuda);
+                if (diff > maxAbsDiff) maxAbsDiff = diff;
+                float rel = diff / (MathF.Abs(cpu) + 1e-12f);
+                if (rel > maxRelDiff) maxRelDiff = rel;
+            }
+            string stepKind = step == 0 ? "prefill" : "decode";
+            _output.WriteLine(
+                $"step={step} ({stepKind}): max|diff|={maxAbsDiff:E3}, max relative={maxRelDiff:E3} " +
+                $"(AbsTol={AbsTol:E3}, RelTol={RelTol:E3})");
+
             for (int c = 0; c < vocabSize; c++)
             {
                 float cpu = cpuSteps[step][lastRow * vocabSize + c];
