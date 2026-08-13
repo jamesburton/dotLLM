@@ -53,6 +53,12 @@ public class VulkanMatMulQ8_0KernelTests
     [InlineData(8, 32)]                   // K=32, M>1 — historical bug
     [InlineData(4, 96)]                   // K=96, blocksPerRow=3 (odd) — same family
     [InlineData(2, 160)]                  // K=160, blocksPerRow=5 (odd) — same family
+    // Issue #361 — m AND blocksPerRow both odd, so m*blocksPerRow*34 ≡ 2 (mod 4):
+    // the uint funnel's final read covers the last 2 real bytes plus 2 pad bytes.
+    // Production now allocates rounded-up (VulkanWeights.AllocateAndUploadPacked);
+    // these shapes prove the last row still decodes from a padded buffer.
+    [InlineData(7, 96)]                   // 21 blocks, 714 bytes ≡ 2 (mod 4)
+    [InlineData(3, 32)]                   // 3 blocks, 102 bytes ≡ 2 (mod 4)
     public void Launch_MatchesCpuReference(int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
