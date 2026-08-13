@@ -2,6 +2,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
+using DotLLM.Cuda.Architectures;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tests.Integration.Fixtures;
@@ -206,6 +207,136 @@ public sealed class RealGgufCudaParityTests
         Skip.If(!fixture.Found, fixture.SkipMessage("Qwen3.6-35B-A3B IQ2_XXS GGUF"));
         RunGgufParityTest(fixture.Path!, expectedArch: Architecture.Qwen3MoeHybrid, label: "Qwen36A3B-IQ2_XXS",
             prompt: "The capital of France is");
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // NemotronH (NVIDIA Nemotron-3-Nano-4B or similar) — hybrid Mamba2-SSM +
+    // GQA-attention coverage. Uses DOTLLM_NEMOTRON_H_GGUF (NOT
+    // TestFixtureResolver — no known HF org/repo/filename triple is
+    // registered for this model; mirrors NemotronHTextGeneratorTests'
+    // simple env-var + File.Exists pattern). Real cached prefill + decode
+    // (not the shared driver's KV-cache-less growing-context reprefill) —
+    // see this task's design note for why.
+    // ────────────────────────────────────────────────────────────────────
+
+    private const string NemotronHModelPathEnvVar = "DOTLLM_NEMOTRON_H_GGUF";
+
+    [SkippableFact]
+    public void NemotronH_CudaForward_MatchesCpuReference_PrefillAndDecode()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+
+        string? path = Environment.GetEnvironmentVariable(NemotronHModelPathEnvVar);
+        Skip.If(string.IsNullOrWhiteSpace(path) || !File.Exists(path),
+            $"Set {NemotronHModelPathEnvVar} to a Nemotron-H GGUF to run this test.");
+
+        string ptxDir = ResolvePtxDir();
+        Skip.If(!Directory.Exists(ptxDir), $"CUDA PTX directory not found (resolved: {ptxDir}).");
+
+        bool prevAllowExpansion = CudaKernels.AllowQuantExpansion;
+        CudaKernels.AllowQuantExpansion = true;
+        try
+        {
+            RunNemotronHParityTest(path!, ptxDir);
+        }
+        finally
+        {
+            CudaKernels.AllowQuantExpansion = prevAllowExpansion;
+        }
+    }
+
+    private void RunNemotronHParityTest(string path, string ptxDir)
+    {
+        _output.WriteLine($"[NemotronH] gguf: {path}");
+
+        using var cpuGguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(cpuGguf.Metadata);
+        Assert.Equal(Architecture.NemotronH, config.Architecture);
+        Assert.NotNull(config.HybridLayout);
+        Assert.NotNull(config.SsmConfig);
+
+        using var cpuModel = NemotronHTransformerModel.LoadFromGguf(cpuGguf, config);
+        var tokenizer = GgufBpeTokenizerFactory.Load(cpuGguf.Metadata);
+
+        using var cudaGguf = GgufFile.Open(path);
+        IModel? cudaModel = null;
+        try
+        {
+            var (model, kvCacheFactory) = CudaModelLoader.CreateFromGguf(cudaGguf, config, deviceId: 0, ptxDir);
+            cudaModel = model;
+
+            int attentionLayerCount = ((CudaNemotronHTransformerModel)model).AttentionLayerCount;
+
+            int[] promptIds = tokenizer.Encode("The capital of France is").ToArray();
+            Assert.NotEmpty(promptIds);
+            _output.WriteLine($"[NemotronH] prompt tokens: [{string.Join(',', promptIds)}]");
+
+            int[] promptPositions = new int[promptIds.Length];
+            for (int i = 0; i < promptPositions.Length; i++) promptPositions[i] = i;
+
+            cpuModel.ResetSequenceState();
+            cudaModel.ResetSequenceState();
+
+            using var cpuKv = new DotLLM.Engine.KvCache.SimpleKvCache(
+                attentionLayerCount, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength);
+            using var cudaKv = kvCacheFactory(config.MaxSequenceLength);
+
+            int vocab = config.VocabSize;
+            int strictArgmaxMatches = 0;
+            int stepsChecked = 0;
+            const int DecodeSteps = 8;
+            // Reuses the class-level StrictArgmaxFloor field (also 5, out of prefill + 8
+            // decode = 9 steps) rather than redeclaring a same-named local const, which
+            // MA0084 (Meziantou.Analyzer) flags as hiding the field.
+
+            float[] cpuLogits = RunForwardLastRow(cpuModel, promptIds, promptPositions, vocab, deviceId: -1, cpuKv);
+            float[] cudaLogits = RunForwardLastRow(cudaModel, promptIds, promptPositions, vocab, deviceId: -1, cudaKv);
+            AssertLogitsMatch(cpuLogits, cudaLogits, step: 0, "NemotronH");
+            int cpuArgmax0 = Argmax(cpuLogits), cudaArgmax0 = Argmax(cudaLogits);
+            if (cpuArgmax0 == cudaArgmax0) strictArgmaxMatches++;
+            stepsChecked++;
+            _output.WriteLine($"[NemotronH] step 0 (prefill): cpu_argmax={cpuArgmax0} cuda_argmax={cudaArgmax0}" +
+                (cpuArgmax0 == cudaArgmax0 ? " [match]" : " [diff]"));
+
+            int pos = promptIds.Length;
+            int nextCpuTok = cpuArgmax0, nextCudaTok = cudaArgmax0;
+            for (int step = 1; step <= DecodeSteps; step++)
+            {
+                float[] cpuStep = RunForwardLastRow(cpuModel, new[] { nextCpuTok }, new[] { pos }, vocab, deviceId: -1, cpuKv);
+                float[] cudaStep = RunForwardLastRow(cudaModel, new[] { nextCudaTok }, new[] { pos }, vocab, deviceId: -1, cudaKv);
+                AssertLogitsMatch(cpuStep, cudaStep, step, "NemotronH");
+                int cpuArgmax = Argmax(cpuStep), cudaArgmax = Argmax(cudaStep);
+                if (cpuArgmax == cudaArgmax) strictArgmaxMatches++;
+                stepsChecked++;
+                _output.WriteLine($"[NemotronH] step {step}: cpu_argmax={cpuArgmax} cuda_argmax={cudaArgmax}" +
+                    (cpuArgmax == cudaArgmax ? " [match]" : " [diff]"));
+                nextCpuTok = cpuArgmax;
+                nextCudaTok = cudaArgmax;
+                pos++;
+            }
+
+            Assert.True(strictArgmaxMatches >= StrictArgmaxFloor,
+                $"[NemotronH] strict argmax match floor {StrictArgmaxFloor}/{stepsChecked} not met: got {strictArgmaxMatches}/{stepsChecked}.");
+            _output.WriteLine($"[NemotronH] strict argmax matches: {strictArgmaxMatches}/{stepsChecked}");
+        }
+        finally
+        {
+            cudaModel?.Dispose();
+            cudaGguf.Dispose();
+        }
+    }
+
+    private static unsafe float[] RunForwardLastRow(
+        IModel model, int[] tokenIds, int[] positions, int vocab, int deviceId, DotLLM.Core.Attention.IKvCache kvCache)
+    {
+        using ITensor logits = model.Forward(tokenIds, positions, deviceId, kvCache);
+        Assert.Equal(2, logits.Shape.Rank);
+        int seqLen = logits.Shape[0];
+        Assert.Equal(vocab, logits.Shape[1]);
+        var span = new ReadOnlySpan<float>((void*)logits.DataPointer, seqLen * vocab);
+        var result = new float[vocab];
+        span.Slice((seqLen - 1) * vocab, vocab).CopyTo(result);
+        return result;
     }
 
     // ════════════════════════════════════════════════════════════════════
