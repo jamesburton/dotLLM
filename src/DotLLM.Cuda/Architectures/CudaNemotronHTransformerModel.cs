@@ -833,7 +833,8 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
     /// GQA attention sub-layer forward — reads pre-normed activations from
     /// <c>_state.NormOutput</c> and writes the o_proj result back into the same buffer.
     /// <paramref name="positions"/> is the HOST-side position span (needed by
-    /// <see cref="IKvCache.Update"/>'s signature); <c>_state.PositionsDevice</c> (uploaded once
+    /// <see cref="IKvCache.Update(DotLLM.Core.Tensors.TensorRef, DotLLM.Core.Tensors.TensorRef, ReadOnlySpan{int}, int)"/>'s
+    /// signature); <c>_state.PositionsDevice</c> (uploaded once
     /// per <c>Forward</c> call by Task 11) is the device-side copy RoPE reads from.
     /// </summary>
     private void ForwardAttentionBody(
@@ -894,5 +895,198 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         Gemm(ffn.UpWeight, ffn.UpQt, _state.NormOutput, _state.FfnIntermediate, ffn.UpOutputDim, ffn.UpInputDim, seqLen);
         _kernels.LaunchReluSquaredInplaceF32(_state.FfnIntermediate, seqLen * intermediateSize, streamH);
         Gemm(ffn.DownWeight, ffn.DownQt, _state.FfnIntermediate, _state.NormOutput, ffn.DownOutputDim, ffn.DownInputDim, seqLen);
+    }
+
+    /// <summary>Uploads the current call's host position span to <c>_state.PositionsDevice</c>
+    /// (RoPE reads positions from device memory; <c>Embed</c> reads token ids from the host span
+    /// directly, no upload needed there).</summary>
+    private void UploadPositions(ReadOnlySpan<int> positions)
+    {
+        fixed (int* p = positions)
+        {
+            CudaDriverApi.cuMemcpyHtoD_v2(_state.PositionsDevice, (nint)p,
+                (nuint)(positions.Length * sizeof(int))).ThrowOnError();
+        }
+    }
+
+    /// <inheritdoc/>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
+        => Forward(tokenIds, positions, deviceId, kvCache: null);
+
+    /// <inheritdoc/>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache)
+    {
+        int seqLen = tokenIds.Length;
+        if (seqLen == 0 || seqLen != positions.Length)
+            throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
+
+        int hiddenSize = Config.HiddenSize;
+        int vocabSize = Config.VocabSize;
+        int numHeads = Config.NumAttentionHeads;
+        int numKvHeads = Config.NumKvHeads;
+        int headDim = Config.HeadDim;
+        float eps = Config.NormEpsilon;
+        int maxSeq = Config.MaxSequenceLength;
+
+        for (int i = 0; i < positions.Length; i++)
+        {
+            if ((uint)positions[i] >= (uint)maxSeq)
+                throw new ArgumentOutOfRangeException(nameof(positions),
+                    $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
+        }
+
+        _state.EnsureCapacity(seqLen);
+        nint streamH = _stream.Handle;
+
+        UploadPositions(positions);
+        Embed(tokenIds, _state.HiddenState, hiddenSize);
+
+        var kinds = _layout.LayerKind;
+        for (int layer = 0; layer < _layers.Length; layer++)
+        {
+            var lw = _layers[layer];
+
+            // Save residual snapshot, then pre-sublayer RMSNorm into NormOutput — shared by all
+            // three sub-layer kinds.
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState,
+                (nuint)((long)seqLen * hiddenSize * sizeof(float)), streamH).ThrowOnError();
+            _kernels.LaunchRmsNormF32(_state.HiddenState, lw.AttnNormWeightDevice, _state.NormOutput,
+                hiddenSize, eps, seqLen, streamH);
+
+            switch (lw.Kind)
+            {
+                case HybridLayerKind.Ffn:
+                    ForwardFfnBody(lw.Ffn!.Value, seqLen, hiddenSize);
+                    break;
+                case HybridLayerKind.Attention:
+                    ForwardAttentionBody(lw.Attention!.Value, layer, seqLen, positions,
+                        numHeads, numKvHeads, headDim, kvCache);
+                    break;
+                case HybridLayerKind.Ssm:
+                    ForwardSsmBody(lw.Ssm!.Value, layer, seqLen, hiddenSize, eps);
+                    break;
+                default:
+                    throw new InvalidOperationException(
+                        $"Unknown HybridLayerKind {lw.Kind} at layer {layer}.");
+            }
+
+            // Residual add: HiddenState = Residual + NormOutput (NormOutput holds this
+            // sub-layer's output — every ForwardXBody writes back into NormOutput).
+            _kernels.LaunchAddF32(_state.Residual, _state.NormOutput, _state.HiddenState,
+                seqLen * hiddenSize, streamH);
+        }
+
+        // Final RMSNorm over every row (matches the CPU host, which normalizes all seqLen rows
+        // before the lm_head GEMM — unlike Qwen3HybridDense's optional lastTokenLogitsOnly this
+        // model does not need since NemotronH's realistic vocab sizes don't hit the VRAM ceiling
+        // that optimization exists for).
+        _kernels.LaunchRmsNormF32(_state.HiddenState, _outputNormDevice, _state.HiddenState,
+            hiddenSize, eps, seqLen, streamH);
+
+        Gemm(_outputDevice, _outputQt, _state.HiddenState, _state.Logits,
+             _outputOutputDim, _outputInputDim, seqLen);
+
+        // cuMemcpyDtoH_v2 does not implicitly wait for this model's non-default _stream —
+        // synchronize first (mirrors CudaQwen3HybridDenseTransformerModel's identical D2H tail).
+        _stream.Synchronize();
+
+        var shape = new TensorShape(seqLen, vocabSize);
+        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
+        CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.Logits,
+            (nuint)((long)seqLen * vocabSize * sizeof(float))).ThrowOnError();
+
+        return result;
+    }
+
+    /// <summary>
+    /// Forward with a caller-supplied per-sequence SSM state (the per-token recurrent state the
+    /// continuous-batch scheduler threads so concurrent sequences don't share the model-owned
+    /// default). Null falls back to the model-owned <c>_ssmCache</c> (single-sequence behaviour).
+    /// Attention layers use <paramref name="kvCache"/> as usual. Mirrors
+    /// <c>NemotronHTransformerModel.Forward(..., ISsmState?)</c> exactly.
+    /// </summary>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ISsmState? ssmState)
+    {
+        CudaNemotronHSsmStateCache? prev = _activeSsm;
+        _activeSsm = ResolveSsm(ssmState);
+        try { return Forward(tokenIds, positions, deviceId, kvCache); }
+        finally { _activeSsm = prev; }
+    }
+
+    private CudaNemotronHSsmStateCache? ResolveSsm(ISsmState? ssmState)
+    {
+        if (ssmState is null) return null; // use _ssmCache
+        if (ssmState is CudaNemotronHSsmStateCache cache)
+        {
+            if (cache.NumSsmLayers != _numSsmLayers)
+                throw new ArgumentException(
+                    $"SsmState covers {cache.NumSsmLayers} SSM layers but this model has {_numSsmLayers}.",
+                    nameof(ssmState));
+            return cache;
+        }
+        throw new ArgumentException(
+            $"CudaNemotronHTransformerModel requires a {nameof(CudaNemotronHSsmStateCache)} for its " +
+            $"SSM state; got {ssmState.GetType().Name}.",
+            nameof(ssmState));
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>Re-zeroes the model-owned SSM cache (conv history + hidden state) used by every
+    /// forward that does not carry a caller-supplied <see cref="ISsmState"/>. Callers that treat
+    /// each forward as an independent sequence (perplexity windows, growing-context reprefill
+    /// parity tests — see Task 14) must call this between sequences.</remarks>
+    public void ResetSequenceState() => _ssmCache.Reset();
+
+    /// <inheritdoc/>
+    public bool RequiresPerSequenceState => true;
+
+    /// <inheritdoc/>
+    public bool SupportsThreadedSequenceState => true;
+
+    /// <inheritdoc/>
+    public IRecurrentSequenceState? CreateSequenceState() => new CudaNemotronHSsmStateCache(_ssm, _numSsmLayers);
+
+    /// <summary>
+    /// Batched forward across sequences. NemotronH SSM state is per-token recurrent, so this
+    /// threads each request's per-seq <see cref="SequenceForwardRequest.SsmState"/> through a
+    /// per-sequence <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, ISsmState?)"/>
+    /// call (no cross-sequence fusion). For 2+ requests every entry must supply a per-seq
+    /// <c>SsmState</c> (a null would silently share the model-owned default and corrupt
+    /// concurrent decode). LoRA adapters are not supported. Mirrors
+    /// <c>NemotronHTransformerModel.ForwardBatch</c> exactly.
+    /// </summary>
+    public IReadOnlyList<ITensor> ForwardBatch(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+
+        for (int i = 0; i < requests.Count; i++)
+        {
+            if (requests[i].Adapter is not null)
+                throw new NotSupportedException(
+                    "CudaNemotronHTransformerModel.ForwardBatch does not support LoRA adapters.");
+        }
+
+        if (requests.Count >= 2)
+        {
+            for (int i = 0; i < requests.Count; i++)
+            {
+                if (requests[i].SsmState is null)
+                    throw new ArgumentException(
+                        $"CudaNemotronHTransformerModel.ForwardBatch with {requests.Count} requests requires " +
+                        $"every request to supply a per-seq SsmState; request[{i}] has none.",
+                        nameof(requests));
+            }
+        }
+
+        var results = new ITensor[requests.Count];
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var r = requests[i];
+            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.SsmState);
+        }
+        return results;
     }
 }

@@ -42,6 +42,8 @@ public sealed class CudaNemotronHKvCache : IKvCache
     public long AllocatedBytes =>
         2L * _keys.Length * _maxSeqLen * _kvStride * sizeof(float);
 
+    /// <summary>Allocates device key/value buffers for <paramref name="attentionLayerCount"/> attention
+    /// layer slots, each sized <c>[maxSeqLen, numKvHeads * headDim]</c> F32.</summary>
     public CudaNemotronHKvCache(int attentionLayerCount, int numKvHeads, int headDim, int maxSeqLen, int deviceId)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(attentionLayerCount);
