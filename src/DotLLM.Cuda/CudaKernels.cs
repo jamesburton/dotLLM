@@ -442,6 +442,10 @@ public sealed unsafe class CudaKernels : IDisposable
     private CudaModule? _mamba3ChunkBoundaryF32Module;
     private nint _mamba3ChunkBoundaryF32Func;
 
+    // Issue #346 (Mamba3 CUDA host): canonical SISO SSD scan.
+    private CudaModule? _mamba3SsdScanSisoF32Module;
+    private nint _mamba3SsdScanSisoF32Func;
+
     private readonly CudaModule? _mamba2ScanF32Module;
     private readonly nint _mamba2ScanF32Func;
     private CudaModule? _groupRmsNormF32Module;
@@ -994,6 +998,13 @@ public sealed unsafe class CudaKernels : IDisposable
             _mamba3ChunkBoundaryF32Func = _mamba3ChunkBoundaryF32Module.TryGetFunction("mamba3_chunk_boundary_f32");
         }
 
+        string mamba3SsdScanSisoF32Path = Path.Combine(ptxDir, "mamba3_ssd_scan_siso_f32.ptx");
+        if (File.Exists(mamba3SsdScanSisoF32Path))
+        {
+            _mamba3SsdScanSisoF32Module = CudaModule.LoadFromFile(mamba3SsdScanSisoF32Path);
+            _mamba3SsdScanSisoF32Func = _mamba3SsdScanSisoF32Module.TryGetFunction("mamba3_ssd_scan_siso_f32");
+        }
+
         string mamba2ScanF32Path = Path.Combine(ptxDir, "mamba2_selective_scan.ptx");
         if (File.Exists(mamba2ScanF32Path))
         {
@@ -1242,6 +1253,12 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <see cref="LaunchMamba3ChunkBoundaryF32"/>) is loaded.
     /// </summary>
     public bool HasMamba3ChunkBoundary => _mamba3ChunkBoundaryF32Func != 0;
+
+    /// <summary>
+    /// True when the Mamba-3 canonical SISO SSD scan kernel (issue #346,
+    /// <see cref="LaunchMamba3SsdScanSisoF32"/>) is loaded.
+    /// </summary>
+    public bool HasMamba3SsdScanSiso => _mamba3SsdScanSisoF32Func != 0;
 
     /// <summary>
     /// True when the fused GDN decay kernel (softplus + exp) is available on the
@@ -3294,6 +3311,50 @@ public sealed unsafe class CudaKernels : IDisposable
 
         CudaDriverApi.cuLaunchKernel(_mamba3ChunkBoundaryF32Func,
                 gridX, gridY, gridZ, 16, 16, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Mamba-3 canonical SISO SSD scan (issue #346). One CUDA block per head, block
+    /// size 256 (matches <see cref="BlockSize"/> and Vulkan's WG_SIZE); covers ALL
+    /// <paramref name="seqLen"/> tokens in a single kernel launch (unlike the GDN scan
+    /// kernel's per-token host loop) via a sequential internal loop with
+    /// <c>__syncthreads()</c> barriers. <paramref name="state"/> is mutated in place —
+    /// pass the persistent <c>[nHead, headDim, dState]</c> SSM state buffer from
+    /// the Mamba-3 CUDA state cache (not yet wired, issue #346 follow-up task).
+    /// Pass <paramref name="z"/>=0
+    /// and <paramref name="hasZ"/>=false to skip the silu(z) gate (never done in
+    /// practice — every known checkpoint has a gate — but the CPU/Vulkan kernels both
+    /// support it, so this launcher mirrors that for interface parity).
+    /// </summary>
+    /// <remarks>
+    /// <b>No-aliasing contract.</b> The kernel declares <c>v</c>, <c>qRoped</c>,
+    /// <c>kRoped</c>, and <c>z</c> <c>__restrict__</c> (native/kernels/mamba3_ssd_scan_siso_f32.cu),
+    /// which nvcc compiles to read-only <c>ld.global.nc</c> loads for those buffers. Callers MUST
+    /// NOT pass <paramref name="y"/> or <paramref name="state"/> aliasing any of
+    /// <paramref name="v"/>, <paramref name="qRoped"/>, <paramref name="kRoped"/>, or
+    /// <paramref name="z"/> — e.g. an in-place <c>y == v</c> would read stale (pre-write) data
+    /// through the read-only cache instead of the just-written value, since the compiler has
+    /// been told those pointers are never written through any alias.
+    /// </remarks>
+    public void LaunchMamba3SsdScanSisoF32(nint state, nint v, nint qRoped, nint kRoped,
+        nint qkPreDot, nint scale, nint gamma, nint adt, nint d, nint z, nint y,
+        int seqLen, int nHead, int headDim, int dState, bool hasZ, nint stream)
+    {
+        if (_mamba3SsdScanSisoF32Func == 0)
+            throw new InvalidOperationException(
+                "mamba3_ssd_scan_siso_f32 kernel not available. Recompile native/kernels/mamba3_ssd_scan_siso_f32.cu to PTX.");
+
+        nint stateArg = state, vArg = v, qArg = qRoped, kArg = kRoped;
+        nint qkpArg = qkPreDot, sclArg = scale, gmArg = gamma, adtArg = adt, dArg = d, zArg = z, yArg = y;
+        int seqArg = seqLen, headArg = nHead, hdArg = headDim, dsArg = dState, hasZArg = hasZ ? 1 : 0;
+
+        void** args = stackalloc void*[] {
+            &stateArg, &vArg, &qArg, &kArg, &qkpArg, &sclArg, &gmArg, &adtArg, &dArg, &zArg, &yArg,
+            &seqArg, &headArg, &hdArg, &dsArg, &hasZArg };
+
+        CudaDriverApi.cuLaunchKernel(_mamba3SsdScanSisoF32Func,
+                (uint)nHead, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
@@ -6390,6 +6451,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _gdnScanF32Module?.Dispose();
         _mamba3DataRopeF32Module?.Dispose();
         _mamba3ChunkBoundaryF32Module?.Dispose();
+        _mamba3SsdScanSisoF32Module?.Dispose();
         _mamba2ScanF32Module?.Dispose();
         _groupRmsNormF32Module?.Dispose();
         _reluSquaredInplaceF32Module?.Dispose();
