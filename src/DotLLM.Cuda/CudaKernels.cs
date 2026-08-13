@@ -438,6 +438,10 @@ public sealed unsafe class CudaKernels : IDisposable
     private CudaModule? _mamba3DataRopeF32Module;
     private nint _mamba3DataRopeF32Func;
 
+    // Issue #346 (Mamba3 CUDA host): streaming-decode chunk-boundary state correction.
+    private CudaModule? _mamba3ChunkBoundaryF32Module;
+    private nint _mamba3ChunkBoundaryF32Func;
+
     private readonly CudaModule? _mamba2ScanF32Module;
     private readonly nint _mamba2ScanF32Func;
     private CudaModule? _groupRmsNormF32Module;
@@ -983,6 +987,13 @@ public sealed unsafe class CudaKernels : IDisposable
             _mamba3DataRopeF32Func = _mamba3DataRopeF32Module.TryGetFunction("mamba3_data_rope_f32");
         }
 
+        string mamba3ChunkBoundaryF32Path = Path.Combine(ptxDir, "mamba3_chunk_boundary_f32.ptx");
+        if (File.Exists(mamba3ChunkBoundaryF32Path))
+        {
+            _mamba3ChunkBoundaryF32Module = CudaModule.LoadFromFile(mamba3ChunkBoundaryF32Path);
+            _mamba3ChunkBoundaryF32Func = _mamba3ChunkBoundaryF32Module.TryGetFunction("mamba3_chunk_boundary_f32");
+        }
+
         string mamba2ScanF32Path = Path.Combine(ptxDir, "mamba2_selective_scan.ptx");
         if (File.Exists(mamba2ScanF32Path))
         {
@@ -1225,6 +1236,12 @@ public sealed unsafe class CudaKernels : IDisposable
     /// needs this kernel.
     /// </summary>
     public bool HasMamba3DataRope => _mamba3DataRopeF32Func != 0;
+
+    /// <summary>
+    /// True when the Mamba-3 streaming-decode chunk-boundary kernel (issue #346,
+    /// <see cref="LaunchMamba3ChunkBoundaryF32"/>) is loaded.
+    /// </summary>
+    public bool HasMamba3ChunkBoundary => _mamba3ChunkBoundaryF32Func != 0;
 
     /// <summary>
     /// True when the fused GDN decay kernel (softplus + exp) is available on the
@@ -3237,6 +3254,46 @@ public sealed unsafe class CudaKernels : IDisposable
 
         CudaDriverApi.cuLaunchKernel(_mamba3DataRopeF32Func,
                 (uint)nHead, 1, 1, 64, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Mamba-3 streaming-decode chunk-boundary state correction (issue #346):
+    /// <c>state[h,p,n] += vState[h,p] * (sum_r kState[r,h,n]) * coef[h]</c>. Fully
+    /// parallel 3D dispatch over (dState, headDim, nHead) — no time recurrence. Call
+    /// BEFORE the SSD scan kernel for a chunk that carries a non-empty prior
+    /// (kState, vState) pair (see Mamba3Block.Forward's Step 5.5 doc comment for why
+    /// this must run before, not after, the scan).
+    /// </summary>
+    /// <remarks>
+    /// The kernel's final combine multiplies <c>(v*kSum)*coef</c>
+    /// (native/kernels/mamba3_chunk_boundary_f32.cu), while the CPU references
+    /// (<c>Mamba3Block.ApplyChunkBoundaryAdjustment</c>,
+    /// <c>Mamba3CanonicalSsd.ExecuteMimoStreaming</c>) compute <c>(v*coef)*kSum</c> — an
+    /// inherited, documented O(ulp) difference from the Vulkan original (see
+    /// src/DotLLM.Vulkan/Kernels/Mamba3ChunkBoundaryF32Kernel.cs). The rank-sum reduction
+    /// itself is bit-exact (identical accumulation order on both sides); only the final
+    /// multiply order differs, so callers comparing against the CPU oracle should use a
+    /// small tolerance, not bit-exact equality.
+    /// </remarks>
+    public void LaunchMamba3ChunkBoundaryF32(nint state, nint vState, nint kState, nint coef,
+        int nHead, int headDim, int dState, int nRank, nint stream)
+    {
+        if (_mamba3ChunkBoundaryF32Func == 0)
+            throw new InvalidOperationException(
+                "mamba3_chunk_boundary_f32 kernel not available. Recompile native/kernels/mamba3_chunk_boundary_f32.cu to PTX.");
+
+        nint stateArg = state, vArg = vState, kArg = kState, coefArg = coef;
+        int hArg = nHead, pArg = headDim, nArg = dState, rArg = nRank;
+
+        void** args = stackalloc void*[] { &stateArg, &vArg, &kArg, &coefArg, &hArg, &pArg, &nArg, &rArg };
+
+        uint gridX = (uint)((dState + 15) / 16);
+        uint gridY = (uint)((headDim + 15) / 16);
+        uint gridZ = (uint)nHead;
+
+        CudaDriverApi.cuLaunchKernel(_mamba3ChunkBoundaryF32Func,
+                gridX, gridY, gridZ, 16, 16, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
@@ -6332,6 +6389,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _conv1dCausalF32Module?.Dispose();
         _gdnScanF32Module?.Dispose();
         _mamba3DataRopeF32Module?.Dispose();
+        _mamba3ChunkBoundaryF32Module?.Dispose();
         _mamba2ScanF32Module?.Dispose();
         _groupRmsNormF32Module?.Dispose();
         _reluSquaredInplaceF32Module?.Dispose();
