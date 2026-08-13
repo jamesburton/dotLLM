@@ -212,7 +212,23 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeSigmoidGatedAdd = moeSigmoidGatedAdd;
     }
 
-    public static VulkanQwen3MoeHybridKernels Create(VulkanDevice device, string spvDir)
+    /// <param name="device">Device the pipelines are created on.</param>
+    /// <param name="spvDir">Directory the compiled <c>.spv</c> shader modules are loaded from.</param>
+    /// <param name="headDim">
+    /// Attention head dimension, used for the same compile-time capability gate
+    /// <see cref="VulkanTransformerModel"/> and <c>VulkanNemotronHTransformerModel</c> apply
+    /// at construction: the flash and split-KV shaders bake in a maximum head_dim, so a model
+    /// above that bound can never dispatch them and creating them only wastes pipelines,
+    /// descriptor pools and device memory.
+    /// <para>
+    /// This is an alignment/resource fix, <b>not</b> a correctness fix — both models backed by
+    /// these kernels already re-check <c>headDim &lt;= MaxHeadDim</c> at every dispatch site and
+    /// fall back to the per-token attention kernel, so an over-bound head was never dispatched
+    /// to a shader that could not represent it. The parameter is required (not defaulted) so a
+    /// new call site cannot silently reintroduce the ungated construction.
+    /// </para>
+    /// </param>
+    public static VulkanQwen3MoeHybridKernels Create(VulkanDevice device, string spvDir, int headDim)
     {
         var matmul = MatMulF32Kernel.Create(device, spvDir);
         var matmulQ8 = MatMulQ8_0Kernel.Create(device, spvDir);
@@ -265,12 +281,21 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var rope = RopeF32Kernel.Create(device, spvDir);
         var attention = AttentionF32Kernel.Create(device, spvDir);
-        VulkanFlashAttentionF32Kernel? flashAttention = VulkanTransformerModel.IsFlashAttentionDisabled()
-            ? null
-            : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
-        VulkanSplitKvAttentionKernel? splitKvAttention = VulkanTransformerModel.IsSplitDecodeDisabled()
-            ? null
-            : VulkanSplitKvAttentionKernel.TryCreate(device, spvDir);
+        // Same two-part gate as VulkanTransformerModel / VulkanNemotronHTransformerModel:
+        // global env-var opt-out, plus the shaders' compile-time head_dim bound. Both models
+        // backed by these kernels (Qwen3-MoE-Hybrid and Qwen3-Hybrid-Dense) were missing the
+        // capability half here, so an over-bound model still paid to build pipelines it could
+        // never dispatch. Their dispatch sites already re-check the same bound and fall back to
+        // the per-token attention kernel, so no output was ever wrong — this is resource and
+        // consistency alignment, not a correctness fix.
+        VulkanFlashAttentionF32Kernel? flashAttention =
+            VulkanTransformerModel.IsFlashAttentionDisabled() || headDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
+                ? null
+                : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
+        VulkanSplitKvAttentionKernel? splitKvAttention =
+            VulkanTransformerModel.IsSplitDecodeDisabled() || headDim > VulkanSplitKvAttentionKernel.MaxHeadDim
+                ? null
+                : VulkanSplitKvAttentionKernel.TryCreate(device, spvDir);
         var swiglu = SwiGluF32Kernel.Create(device, spvDir);
         var add = AddKernel.Create(device, spvDir);
         var silu = SiluInplaceF32Kernel.Create(device, spvDir);

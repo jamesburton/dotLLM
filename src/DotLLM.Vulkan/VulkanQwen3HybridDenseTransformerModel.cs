@@ -248,7 +248,7 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
 
         var state = new VulkanQwen3HybridDenseForwardState(device, config, gdn, initialSeqLen: 1);
         var gdnCache = new VulkanGdnStateCache(device, gdn, gdnOrdinal);
-        var kernels = VulkanQwen3MoeHybridKernels.Create(device, spvDir);
+        var kernels = VulkanQwen3MoeHybridKernels.Create(device, spvDir, config.HeadDim);
 
         return new VulkanQwen3HybridDenseTransformerModel(
             device, ownsDevice,
