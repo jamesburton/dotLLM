@@ -39,7 +39,11 @@ public static class GgufModelConfigExtractor
         // convert_hf_to_gguf.py: `block_count = num_hidden_layers + mtp_num_hidden_layers`).
         // Only Qwen3.5/3.6 (Qwen3HybridDense / Qwen3MoeHybrid) ship this key today — every other
         // architecture defaults to 0 and numTrunkLayers == numLayers, so nothing changes for them.
+        // nemotron_h_moe ships the same key (Nemotron 3.5 Lightning: 1 MTP layer
+        // appended as the final block, carrying BOTH head_count_kv and
+        // feed_forward_length — the trunk-exclusive kinds rule does not apply to it).
         int nextnPredictLayers = architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense
+                or Architecture.NemotronHMoe
             ? (int)metadata.GetUInt32OrDefault($"{arch}.nextn_predict_layers", 0)
             : 0;
         int numTrunkLayers = numLayers - nextnPredictLayers;
@@ -48,7 +52,7 @@ public static class GgufModelConfigExtractor
         // per-layer Int32 arrays whose entries are zero for layers of the wrong kind.
         // Build a HybridLayerLayout in that case; for pure-Transformer architectures
         // both keys are scalar UInt32.
-        HybridLayerLayout? hybridLayout = TryExtractHybridLayout(metadata, arch, numLayers);
+        HybridLayerLayout? hybridLayout = TryExtractHybridLayout(metadata, arch, numTrunkLayers, nextnPredictLayers);
 
         int intermediateSize;
         int numKvHeads;
@@ -166,7 +170,7 @@ public static class GgufModelConfigExtractor
             MaxSequenceLength = maxSeqLen,
             NormEpsilon = normEps,
             AttentionType = attentionType,
-            ActivationFunction = architecture is Architecture.NemotronH or Architecture.BitNet
+            ActivationFunction = architecture is Architecture.NemotronH or Architecture.NemotronHMoe or Architecture.BitNet
                 ? ActivationFunction.ReluSquared
                 : ActivationFunction.SiLU,
             RoPEConfig = ropeConfig,
@@ -440,7 +444,8 @@ public static class GgufModelConfigExtractor
         };
     }
 
-    private static HybridLayerLayout? TryExtractHybridLayout(GgufMetadata metadata, string arch, int numLayers)
+    private static HybridLayerLayout? TryExtractHybridLayout(
+        GgufMetadata metadata, string arch, int numLayers, int trailingMtpLayers)
     {
         string kvKey = $"{arch}.attention.head_count_kv";
         string ffKey = $"{arch}.feed_forward_length";
@@ -452,12 +457,23 @@ public static class GgufModelConfigExtractor
         int[] headCountKv = metadata.GetInt32Array(kvKey);
         int[] feedForwardLength = metadata.GetInt32Array(ffKey);
 
-        if (headCountKv.Length != numLayers)
+        // The GGUF per-layer arrays cover block_count = trunk + MTP layers. MTP head
+        // layers (nemotron_h_moe.nextn_predict_layers, appended last) carry BOTH a KV
+        // head count and a feed-forward length, so they must be trimmed BEFORE the
+        // exclusive-kind classification below — llama.cpp does not run them in
+        // standard decode, and dotLLM's trunk NumLayers already excludes them.
+        int expectedLength = numLayers + trailingMtpLayers;
+        if (headCountKv.Length != expectedLength)
             throw new InvalidDataException(
-                $"'{kvKey}' array length {headCountKv.Length} does not match block_count {numLayers}.");
-        if (feedForwardLength.Length != numLayers)
+                $"'{kvKey}' array length {headCountKv.Length} does not match block_count {expectedLength}.");
+        if (feedForwardLength.Length != expectedLength)
             throw new InvalidDataException(
-                $"'{ffKey}' array length {feedForwardLength.Length} does not match block_count {numLayers}.");
+                $"'{ffKey}' array length {feedForwardLength.Length} does not match block_count {expectedLength}.");
+        if (trailingMtpLayers > 0)
+        {
+            headCountKv = headCountKv[..numLayers];
+            feedForwardLength = feedForwardLength[..numLayers];
+        }
 
         var kinds = new HybridLayerKind[numLayers];
         for (int i = 0; i < numLayers; i++)
@@ -613,6 +629,9 @@ public static class GgufModelConfigExtractor
             // V3 / V3-MoE — MLA + sigmoid-gated routing + group-norm experts.
             "deepseek3" => Architecture.DeepSeekV3,
             "nemotron_h" => Architecture.NemotronH,
+            // Nemotron-H hybrid stack + DeepSeek-V3-style MoE + optional MTP head
+            // (Nemotron 3.5 Lightning). Distinct llama.cpp arch from nemotron_h.
+            "nemotron_h_moe" => Architecture.NemotronHMoe,
             // Gemma 4 MoE text tower (llama.cpp `gemma4` arch). Dual head-dim /
             // dual KV-head / dual-RoPE-per-attention-type + MoE experts. See
             // BuildGemma4Config for the full GGUF → ModelConfig mapping.

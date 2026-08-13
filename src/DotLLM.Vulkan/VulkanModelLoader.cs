@@ -75,6 +75,13 @@ public static class VulkanModelLoader
             // caller then sees "blk.0.attn_output.weight not present" (or a bare
             // "Hybrid SSM / Mamba architectures are not supported") instead of the actual
             // reason.
+            case Architecture.NemotronHMoe:
+                throw new NotSupportedException(
+                    "nemotron_h_moe (Nemotron 3.5 Lightning) is recognized but not yet runnable on " +
+                    "Vulkan: the DeepSeek-V3-style MoE forward is not implemented, and its expert " +
+                    "tensors ship in quantizations (Q5_0/IQ4_NL/Q4_0) the expert-indexed MoE kernel " +
+                    "family does not cover yet. Tracked in issue #375.");
+
             case Architecture.Mamba3:
                 throw new NotSupportedException(
                     "Mamba-3 has no GGUF representation: no upstream 'mamba3' value for " +

@@ -52,6 +52,17 @@ public enum Architecture
     NemotronH,
 
     /// <summary>
+    /// NVIDIA Nemotron-H-MoE — the Nemotron-H hybrid Mamba2/attention stack with the
+    /// dense MLP replaced by a DeepSeek-V3-style MoE (sigmoid router with per-expert
+    /// bias, expert-weight norm + scale, ungated squared-ReLU experts, one shared
+    /// expert) plus an optional MTP head layer. Used by Nemotron 3.5 Lightning
+    /// (30B-A3B). GGUF architecture string: <c>nemotron_h_moe</c> — a separate
+    /// llama.cpp arch from <c>nemotron_h</c>. Recognition and layout parsing are
+    /// implemented; the MoE forward is not yet (issue #375).
+    /// </summary>
+    NemotronHMoe,
+
+    /// <summary>
     /// Mamba-3 (Lahoti et al., ICLR 2026, arXiv 2603.15569) — pure SSM with
     /// trapezoidal discretization, data-dependent RoPE on B/C, and optional
     /// MIMO. No convolution, no attention. HF <c>model_type</c>: <c>mamba3</c>.

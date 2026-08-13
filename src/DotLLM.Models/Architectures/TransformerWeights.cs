@@ -1157,7 +1157,7 @@ internal sealed class TransformerWeights : IDisposable
 
         string? why = config.Architecture switch
         {
-            DotLLM.Core.Configuration.Architecture.NemotronH =>
+            DotLLM.Core.Configuration.Architecture.NemotronH or DotLLM.Core.Configuration.Architecture.NemotronHMoe =>
                 "its Mamba-2 layers carry ssm_in/ssm_out/ssm_conv1d tensors and no attention "
                 + "projections at all",
             DotLLM.Core.Configuration.Architecture.Qwen3MoeHybrid or DotLLM.Core.Configuration.Architecture.Qwen3HybridDense =>
