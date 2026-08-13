@@ -437,6 +437,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _mamba2ScanF32Func;
     private CudaModule? _groupRmsNormF32Module;
     private nint _groupRmsNormF32Func;
+    private CudaModule? _reluSquaredInplaceF32Module;
+    private nint _reluSquaredInplaceF32Func;
     private readonly CudaModule? _elementwiseF32Module;
     private readonly nint _sigmoidF32Func;
     private readonly nint _siluF32Func;
@@ -981,6 +983,15 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             _groupRmsNormF32Module = CudaModule.LoadFromFile(groupRmsNormF32Path);
             _groupRmsNormF32Func = _groupRmsNormF32Module.TryGetFunction("group_rmsnorm_f32");
+        }
+
+        // Plain elementwise squared-ReLU for NemotronH's non-gated FFN activation.
+        // Optional — TryGetFunction so a stale PTX still loads gracefully.
+        string reluSquaredInplaceF32Path = Path.Combine(ptxDir, "relu_squared_inplace.ptx");
+        if (File.Exists(reluSquaredInplaceF32Path))
+        {
+            _reluSquaredInplaceF32Module = CudaModule.LoadFromFile(reluSquaredInplaceF32Path);
+            _reluSquaredInplaceF32Func = _reluSquaredInplaceF32Module.TryGetFunction("relu_squared_inplace_f32");
         }
 
         // Pointwise FP32 helpers (sigmoid / silu / sigmoid_mul) for the post-
@@ -3473,6 +3484,21 @@ public sealed unsafe class CudaKernels : IDisposable
         if (gridDim == 0) gridDim = 1;
 
         CudaDriverApi.cuLaunchKernel(_siluF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Plain elementwise squared-ReLU in place: x = max(0,x)^2. NVIDIA Nemotron-H's
+    /// non-gated FFN activation — distinct from <see cref="LaunchReLU2F32"/>'s GLU-fused form.
+    /// See native/kernels/relu_squared_inplace.cu.</summary>
+    public void LaunchReluSquaredInplaceF32(nint x, int n, nint stream)
+    {
+        if (n <= 0) return;
+        nint xArg = x;
+        int nArg = n;
+        void** args = stackalloc void*[] {&xArg, &nArg};
+        uint gridDim = (uint)((n + BlockSize - 1) / BlockSize);
+        CudaDriverApi.cuLaunchKernel(_reluSquaredInplaceF32Func,
                 gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
