@@ -64,7 +64,27 @@ public sealed class CudaNemotronHKvCache : IKvCache
     }
 
     /// <inheritdoc/>
+    /// <remarks>Synchronous null-stream copy (<c>cuMemcpyDtoD_v2</c>) — implicitly full-device-blocking.
+    /// Kept for <see cref="IKvCache"/> callers with no stream to offer. The model's own hot forward path
+    /// uses <see cref="UpdateDevice"/> instead, which is stream-ordered against the caller's own
+    /// <c>CudaStream</c> and does not block the host.</remarks>
     public void Update(TensorRef keys, TensorRef values, ReadOnlySpan<int> positions, int layerIndex)
+        => UpdateCore(keys, values, positions, layerIndex, stream: 0, isAsync: false);
+
+    /// <summary>
+    /// Stream-ordered variant of <see cref="Update(TensorRef, TensorRef, ReadOnlySpan{int}, int)"/> —
+    /// uses <c>cuMemcpyDtoDAsync_v2</c> against <paramref name="stream"/> instead of the synchronous
+    /// null-stream copy the interface method issues. Mirrors
+    /// <see cref="DotLLM.Cuda.CudaKvCache.UpdateDevice(nint, nint, ReadOnlySpan{int}, int, int, nint)"/>'s
+    /// stream-ordered pattern. This is the call path <c>CudaNemotronHTransformerModel.ForwardAttentionBody</c>
+    /// uses — it already owns the model's <c>CudaStream</c> and must not force a full-device sync on
+    /// every attention-layer KV write.
+    /// </summary>
+    internal void UpdateDevice(TensorRef keys, TensorRef values, ReadOnlySpan<int> positions, int layerIndex, nint stream)
+        => UpdateCore(keys, values, positions, layerIndex, stream, isAsync: true);
+
+    private void UpdateCore(TensorRef keys, TensorRef values, ReadOnlySpan<int> positions, int layerIndex,
+        nint stream, bool isAsync)
     {
         ThrowIfDisposed();
         if (positions.IsEmpty)
@@ -88,8 +108,16 @@ public sealed class CudaNemotronHKvCache : IKvCache
         nint dstK = _keys[layerIndex] + (nint)((long)startPos * rowBytes);
         nint dstV = _values[layerIndex] + (nint)((long)startPos * rowBytes);
 
-        CudaDriverApi.cuMemcpyDtoD_v2(dstK, keys.DataPointer, (nuint)bytesToCopy).ThrowOnError();
-        CudaDriverApi.cuMemcpyDtoD_v2(dstV, values.DataPointer, (nuint)bytesToCopy).ThrowOnError();
+        if (isAsync)
+        {
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(dstK, keys.DataPointer, (nuint)bytesToCopy, stream).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(dstV, values.DataPointer, (nuint)bytesToCopy, stream).ThrowOnError();
+        }
+        else
+        {
+            CudaDriverApi.cuMemcpyDtoD_v2(dstK, keys.DataPointer, (nuint)bytesToCopy).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoD_v2(dstV, values.DataPointer, (nuint)bytesToCopy).ThrowOnError();
+        }
 
         int newLength = startPos + seqLen;
         if (newLength > _currentLength) _currentLength = newLength;

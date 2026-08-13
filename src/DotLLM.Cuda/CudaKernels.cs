@@ -6262,6 +6262,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _gdnScanF32Module?.Dispose();
         _mamba2ScanF32Module?.Dispose();
         _groupRmsNormF32Module?.Dispose();
+        _reluSquaredInplaceF32Module?.Dispose();
         _elementwiseF32Module?.Dispose();
         _gemma4F32Module?.Dispose();
     }

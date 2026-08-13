@@ -95,7 +95,10 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
 
     /// <summary>Creates a <see cref="CudaNemotronHKvCache"/> sized for this model.</summary>
     public CudaNemotronHKvCache CreateKvCache(int maxSeqLen)
-        => new(_attentionLayerCount, Config.NumKvHeads, Config.HeadDim, maxSeqLen, _deviceId);
+    {
+        _context.MakeCurrent();
+        return new(_attentionLayerCount, Config.NumKvHeads, Config.HeadDim, maxSeqLen, _deviceId);
+    }
 
     // ── Device-side per-layer weight structs ────────────────────────────────
 
@@ -302,6 +305,7 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
             FreeIfNonZero(ref outputDevice);
         }
 
+        _kernels.Dispose();
         _cublas.Dispose();
         _stream.Dispose();
         _context.Dispose();
@@ -865,7 +869,10 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
 
             var kRef = new TensorRef(seqLen, kvStride, DType.Float32, _deviceId, _state.KScratch);
             var vRef = new TensorRef(seqLen, kvStride, DType.Float32, _deviceId, _state.VScratch);
-            kvCache.Update(kRef, vRef, positions, kvSlot);
+            if (kvCache is CudaNemotronHKvCache cudaKvCache)
+                cudaKvCache.UpdateDevice(kRef, vRef, positions, kvSlot, streamH);
+            else
+                kvCache.Update(kRef, vRef, positions, kvSlot);
 
             int seqKv = kvCache.CurrentLength;
             TensorRef cachedK = kvCache.GetKeysRef(kvSlot);
@@ -949,6 +956,7 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
                     $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
         }
 
+        _context.MakeCurrent();
         _state.EnsureCapacity(seqLen);
         nint streamH = _stream.Handle;
 
@@ -1021,6 +1029,7 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, ISsmState? ssmState)
     {
+        _context.MakeCurrent();
         CudaNemotronHSsmStateCache? prev = _activeSsm;
         _activeSsm = ResolveSsm(ssmState);
         try { return Forward(tokenIds, positions, deviceId, kvCache); }
@@ -1058,7 +1067,11 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
     public bool SupportsThreadedSequenceState => true;
 
     /// <inheritdoc/>
-    public IRecurrentSequenceState? CreateSequenceState() => new CudaNemotronHSsmStateCache(_ssm, _numSsmLayers);
+    public IRecurrentSequenceState? CreateSequenceState()
+    {
+        _context.MakeCurrent();
+        return new CudaNemotronHSsmStateCache(_ssm, _numSsmLayers);
+    }
 
     /// <summary>
     /// Batched forward across sequences. NemotronH SSM state is per-token recurrent, so this
@@ -1073,6 +1086,8 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
     {
         ArgumentNullException.ThrowIfNull(requests);
         if (requests.Count == 0) return Array.Empty<ITensor>();
+
+        _context.MakeCurrent();
 
         for (int i = 0; i < requests.Count; i++)
         {

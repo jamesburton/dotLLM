@@ -277,9 +277,15 @@ public sealed class RealGgufCudaParityTests
             cpuModel.ResetSequenceState();
             cudaModel.ResetSequenceState();
 
+            // Cap KV-cache capacity well below the model's full context. This test only ever
+            // writes promptIds.Length (a handful of tokens for "The capital of France is") +
+            // DecodeSteps (8) = ~13-16 positions — sizing both caches at config.MaxSequenceLength
+            // (a real Nemotron-H GGUF's full context) risked allocating several GB of VRAM+RAM
+            // scratch just for cache backing on every run of this test.
+            int kvCacheCapacity = Math.Min(config.MaxSequenceLength, 64);
             using var cpuKv = new DotLLM.Engine.KvCache.SimpleKvCache(
-                attentionLayerCount, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength);
-            using var cudaKv = kvCacheFactory(config.MaxSequenceLength);
+                attentionLayerCount, config.NumKvHeads, config.HeadDim, kvCacheCapacity);
+            using var cudaKv = kvCacheFactory(kvCacheCapacity);
 
             int vocab = config.VocabSize;
             int strictArgmaxMatches = 0;
