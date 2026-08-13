@@ -4413,9 +4413,20 @@ public sealed unsafe class CudaKernels : IDisposable
     /// stays roughly flat at decode-GEMV levels (~19–23 ms/token on the 3060) instead of dropping
     /// as seqLen grows. A real fix needs a larger per-block M-tile (with correspondingly larger
     /// register/shared-memory reuse across the batch) before this default can be safely lowered;
-    /// track as a follow-up issue. Until then, prefer <c>DOTLLM_DISABLE_MMQ_BATCHED_Q4K=1</c>'s
+    /// track as a follow-up issue: #367. Until then, prefer <c>DOTLLM_DISABLE_MMQ_BATCHED_Q4K=1</c>'s
     /// effective state (dequant→cuBLAS) for all prefill. Override with
     /// <c>DOTLLM_MMQ_BATCHED_MIN_SEQLEN</c> for A/B comparison once a fix lands.
+    /// <para>
+    /// <b>Lowering this at runtime is not fully retroactive.</b> <see cref="CudaForwardState.EnsureCapacity"/>
+    /// only allocates <c>PreQ8_1BatchedScratch</c> when the capacity it is growing to already
+    /// clears whatever this threshold was <i>at that call</i>; lowering the property afterward does
+    /// not go back and allocate the buffer for already-grown state (<see cref="CudaTransformerModel.Project"/>
+    /// guards against dispatching into the kernel with a null scratch pointer in that case and falls
+    /// back to dequant→cuBLAS, but that means the lowered threshold silently has no effect until the
+    /// next capacity growth or a freshly constructed forward state). Setting this via the env var
+    /// override before process start is therefore the most reliable way to get the lowered threshold
+    /// to actually take effect.
+    /// </para>
     /// </remarks>
     public static int MmqBatchedMinSeqLen { get; set; } =
         int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_MMQ_BATCHED_MIN_SEQLEN"), out int v) ? v : int.MaxValue;

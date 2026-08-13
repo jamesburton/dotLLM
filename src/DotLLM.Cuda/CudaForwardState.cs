@@ -194,7 +194,18 @@ internal sealed class CudaForwardState : IDisposable
         TokenIdsDevice = AllocDevice((long)newCapacity * sizeof(int));
         PositionsDevice = AllocDevice((long)newCapacity * sizeof(int));
         LoraTmp = AllocDevice((long)newCapacity * MaxLoraRank * half);
-        PreQ8_1BatchedScratch = AllocDevice((long)newCapacity * PreQ8_1ScratchBytes(PreQ8_1ScratchK));
+        // Only allocate the batched-MMQ prefill scratch when the dispatcher gate can actually
+        // fire (issue #349/#367): at the shipped default (MmqBatchedMinSeqLen=int.MaxValue) the
+        // buffer would otherwise sit allocated-but-unreadable for every model, CPU or GPU-bound,
+        // costing real VRAM (~30-478 MB depending on context/model size) for zero benefit — the
+        // exact unconditional-EnsureCapacity failure mode documented in issue #188. newCapacity is
+        // always >= seqLen (power-of-2 rounded), so this guard can only under-allocate relative to
+        // MmqBatchedMinSeqLen, never leave a live dispatch path pointing at a smaller-than-needed
+        // buffer; see CudaTransformerModel.Project's PreQ8_1BatchedScratch != 0 check for the
+        // complementary guard covering the case where MmqBatchedMinSeqLen is lowered after this
+        // allocation decision was made.
+        if (newCapacity >= CudaKernels.MmqBatchedMinSeqLen)
+            PreQ8_1BatchedScratch = AllocDevice((long)newCapacity * PreQ8_1ScratchBytes(PreQ8_1ScratchK));
 
         _currentSeqLen = newCapacity;
     }

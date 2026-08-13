@@ -3170,7 +3170,14 @@ public sealed unsafe class CudaTransformerModel : IModel
             if (quantWeight != 0 && qt == QuantizationType.Q4_K
                 && seqLen >= CudaKernels.MmqBatchedMinSeqLen
                 && (inputDim & 31) == 0 && inputDim <= _state.PreQ8_1ScratchK
-                && _kernels.HasMmqBatchedQ4K)
+                && _kernels.HasMmqBatchedQ4K
+                // MmqBatchedMinSeqLen is a settable static — a test/A-B harness could lower it
+                // after this CudaForwardState was constructed (or after an EnsureCapacity growth
+                // that ran under a higher threshold), in which case PreQ8_1BatchedScratch was never
+                // allocated (see CudaForwardState.EnsureCapacity's gate, issue #349/#367). Without
+                // this check we'd dispatch into LaunchQuantizedGemvMmqBatchedQ4K with a null/zero
+                // scratch pointer instead of cleanly falling back to dequant->cuBLAS.
+                && _state.PreQ8_1BatchedScratch != 0)
             {
                 _kernels.LaunchQuantizeXToQ8_1Batched(input, _state.PreQ8_1BatchedScratch, inputDim, seqLen, s);
                 _kernels.LaunchQuantizedGemvMmqBatchedQ4K(quantWeight, _state.PreQ8_1BatchedScratch,
