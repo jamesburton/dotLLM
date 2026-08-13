@@ -718,4 +718,114 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
             CopyHtoD(hiddenDevice, (nint)p, (long)hostRows.Length * sizeof(float));
         }
     }
+
+    /// <summary>
+    /// Mamba2 SSM sub-layer forward — reads pre-normed activations from
+    /// <c>_state.NormOutput</c> and writes the ssm_out projection back into the same buffer.
+    /// Advances the per-layer conv/SSM recurrent state in place. See this task's reference note
+    /// for how this 11-operation CUDA sequence maps onto the CPU/Vulkan 12-step numbering (two
+    /// steps are fused into the Task 1 scan kernel).
+    /// </summary>
+    private void ForwardSsmBody(in DeviceSsm ssmW, int absoluteLayerIndex, int seqLen, int hiddenSize, float eps)
+    {
+        int dInner = _ssm.DInner;
+        int dConv = _ssm.DConv;
+        int nHead = _ssm.NHead;
+        int headDim = _ssm.HeadDim;
+        int dState = _ssm.DState;
+        int nGroup = _ssm.NGroup;
+        int convDim = _ssm.ConvDim;
+        int groupDim = dInner / nGroup;
+        int inProjDim = _ssm.InputProjectionDim;
+        int bcDim = nGroup * dState;
+        int dtOffset = 2 * dInner + 2 * nGroup * dState;
+        nint streamH = _stream.Handle;
+
+        int ssmOrdinal = _ssmLayerOrdinal[absoluteLayerIndex];
+        var activeSsm = _activeSsm ?? _ssmCache;
+        nint convStatePtr = activeSsm.GetConvStatePtr(ssmOrdinal);
+        nint ssmStatePtr = activeSsm.GetSsmStatePtr(ssmOrdinal);
+
+        // 1. ssm_in GEMM: NormOutput[seqLen, hiddenSize] -> Zxbcdt[seqLen, inProjDim].
+        Gemm(ssmW.InWeight, ssmW.InQt, _state.NormOutput, _state.Zxbcdt, inProjDim, hiddenSize, seqLen);
+
+        // 2. ConvInput = concat(conv_state, xBC rows sliced out of Zxbcdt).
+        long convDimBytes = (long)convDim * sizeof(float);
+        long inProjRowBytes = (long)inProjDim * sizeof(float);
+        if (dConv > 1)
+        {
+            long convStateBytes = (long)(dConv - 1) * convDim * sizeof(float);
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.ConvInput, convStatePtr, (nuint)convStateBytes, streamH).ThrowOnError();
+        }
+        for (int t = 0; t < seqLen; t++)
+        {
+            nint src = _state.Zxbcdt + (nint)((long)t * inProjRowBytes + (long)dInner * sizeof(float));
+            nint dst = _state.ConvInput + (nint)((long)(dConv - 1 + t) * convDimBytes);
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(dst, src, (nuint)convDimBytes, streamH).ThrowOnError();
+        }
+
+        // 3. Conv1d causal -> XBC. Reuses the existing generic conv1d_causal_f32 kernel as-is.
+        _kernels.LaunchConv1dCausalF32(_state.ConvInput, ssmW.Conv1dWeightDevice, ssmW.Conv1dBiasDevice, _state.XBC,
+            dConv, convDim, seqLen, streamH);
+
+        // 4. SiLU on XBC in place.
+        _kernels.LaunchSiluF32(_state.XBC, (long)seqLen * convDim, streamH);
+
+        // 5. Save the trailing (dConv-1) rows of ConvInput (pre-SiLU) back into conv_state.
+        if (dConv > 1)
+        {
+            long convStateBytes = (long)(dConv - 1) * convDim * sizeof(float);
+            nint src = _state.ConvInput + (nint)((long)seqLen * convDimBytes);
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(convStatePtr, src, (nuint)convStateBytes, streamH).ThrowOnError();
+        }
+
+        // 6. Extract the RAW dt slice (bias-add + guarded softplus are fused into the scan
+        // kernel launched in step 8 — see Task 1).
+        long dtRowBytes = (long)nHead * sizeof(float);
+        for (int t = 0; t < seqLen; t++)
+        {
+            nint src = _state.Zxbcdt + (nint)((long)t * inProjRowBytes + (long)dtOffset * sizeof(float));
+            nint dst = _state.DtBuffer + (nint)((long)t * dtRowBytes);
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(dst, src, (nuint)dtRowBytes, streamH).ThrowOnError();
+        }
+
+        // 7. Split XBC[t,:] = [x | B | C] into SsmX / SsmB / SsmC.
+        long xRowBytes = (long)dInner * sizeof(float);
+        long bcRowBytes = (long)bcDim * sizeof(float);
+        for (int t = 0; t < seqLen; t++)
+        {
+            nint rowBase = _state.XBC + (nint)((long)t * convDimBytes);
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.SsmX + (nint)((long)t * xRowBytes), rowBase,
+                (nuint)xRowBytes, streamH).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.SsmB + (nint)((long)t * bcRowBytes), rowBase + (nint)xRowBytes,
+                (nuint)bcRowBytes, streamH).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.SsmC + (nint)((long)t * bcRowBytes),
+                rowBase + (nint)(xRowBytes + bcRowBytes), (nuint)bcRowBytes, streamH).ThrowOnError();
+        }
+
+        // 8. Mamba2 selective scan — dt bias-add, guarded softplus, decay, and the D-skip term
+        // are ALL fused into this one launch (see Task 1's kernel documentation).
+        _kernels.LaunchMamba2SelectiveScanF32(
+            ssmStatePtr, _state.SsmX, _state.DtBuffer, ssmW.DtBiasDevice, ssmW.ADevice, ssmW.DDevice,
+            _state.SsmB, _state.SsmC, _state.SsmY,
+            nHead, headDim, dState, nGroup, seqLen, streamH);
+
+        // 9. Extract z = Zxbcdt[t, 0..dInner) into SsmZ (strided source row, contiguous dest).
+        for (int t = 0; t < seqLen; t++)
+        {
+            nint src = _state.Zxbcdt + (nint)((long)t * inProjRowBytes);
+            nint dst = _state.SsmZ + (nint)((long)t * xRowBytes);
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(dst, src, (nuint)xRowBytes, streamH).ThrowOnError();
+        }
+
+        // 10. SwiGLU gating in place: SsmY = SiLU(SsmZ) * SsmY. Safe to alias up==output — see
+        // this task's reference note.
+        _kernels.LaunchSwiGLUF32(_state.SsmZ, _state.SsmY, _state.SsmY, dInner, seqLen, streamH);
+
+        // 11. Group RMSNorm on SsmY in place.
+        _kernels.LaunchGroupRmsNormF32(_state.SsmY, ssmW.NormWeightDevice, eps, seqLen, nGroup, groupDim, streamH);
+
+        // 12. ssm_out projection into NormOutput.
+        Gemm(ssmW.OutWeight, ssmW.OutQt, _state.SsmY, _state.NormOutput, hiddenSize, dInner, seqLen);
+    }
 }
