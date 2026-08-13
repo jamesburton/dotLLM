@@ -2414,13 +2414,24 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q4_k_mmq_pre
 // superblocks_per_row loop for its pair (lanes split the loop via a stride-32
 // loop) and warp-shfl-reduces to one scalar — no shared memory at all.
 //
-// The amortization mechanism: all MMQ_BATCH_M_TILE warps assigned the SAME
-// output row (different tokens) read the SAME 144-byte weight superblocks
+// The DESIGN INTENT (amortization mechanism): all MMQ_BATCH_M_TILE warps assigned
+// the SAME output row (different tokens) read the SAME 144-byte weight superblocks
 // within a few cycles of each other on the same SM, so L1/L2 cache serves the
-// repeat reads. This is what lets the batched path avoid re-dequantizing the
+// repeat reads. This was intended to let the batched path avoid re-dequantizing the
 // whole [n,k] weight matrix to FP16 on every prefill call (the dequant->cuBLAS
 // baseline pays that O(n*k) cost regardless of seqLen); see
-// docs/perf/MMA_BATCHED_MMQ.md §3a step 2 for the design rationale.
+// docs/perf/MMA_BATCHED_MMQ.md §3a step 2 for the original design rationale.
+//
+// MEASURED REALITY (Task 6 benchmark sweep, RTX 3060, 2026-08-12): this kernel is
+// 2x-51x SLOWER than the dequant->cuBLAS baseline at every tested prefill length
+// (-p in {4,8,...,512}), and the gap grows with seqLen instead of shrinking. The
+// MMQ_BATCH_M_TILE=2 tile is too narrow for the above L1/L2 reuse to pay off in
+// practice — see issue #367 for the root-cause writeup and the wider-tile redesign
+// needed before this path can be usefully re-enabled (dispatch is currently gated
+// off by default via CudaKernels.MmqBatchedMinSeqLen=int.MaxValue). This does NOT
+// mean the kernel is wrong: it is numerically correct (verified by the Task 4
+// batched-vs-loop-of-M=1 parity test) — only the performance assumption above was
+// wrong, not the math.
 //
 // Consumes pre-quantized activations from quantize_x_to_q8_1_batched (int8 xq /
 // half dx / half sx2, laid out as [m,k] / [m,k/32] / [m,k/16] row-major

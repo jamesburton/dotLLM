@@ -118,9 +118,15 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ6_KMmvqLargePreqFunc;
     private readonly nint _quantizedGemvIQ4_NLMmvqLargePreqFunc;
     private readonly nint _quantizedGemvIQ4_XSMmvqLargePreqFunc;
-    // Batched-M dp4a MMQ prefill kernel (issue #349) — amortizes weight reads across
-    // MmqBatchedMinSeqLen prefill tokens per block via L1/L2 cache reuse (see
-    // native/kernels/quantized_gemv_mmq.cu for the kernel body). Q4_K only for this PoC.
+    // Batched-M dp4a MMQ prefill kernel (issue #349) — DESIGNED to amortize weight reads
+    // across MMQ_BATCH_M_TILE(2) prefill tokens per block via L1/L2 cache reuse (see
+    // native/kernels/quantized_gemv_mmq.cu for the kernel body), but measured 2x-51x
+    // slower than the dequant->cuBLAS baseline in practice (Task 6 benchmark sweep,
+    // RTX 3060) — the 2-token tile is too narrow for real amortization; see issue #367
+    // for the redesign. Note MMQ_BATCH_M_TILE (the kernel's per-block tile width) is a
+    // different number from MmqBatchedMinSeqLen (the dispatch threshold below, now
+    // int.MaxValue) — don't conflate them. Disabled by default via that threshold.
+    // Q4_K only for this PoC.
     private readonly nint _quantizedGemvQ4_KMmqBatchedFunc;
     /// <summary>
     /// Device's maximum opt-in dynamic shared-memory bytes per block (queried once at
@@ -4336,6 +4342,11 @@ public sealed unsafe class CudaKernels : IDisposable
     /// companion are both loaded (issue #349 proof of concept — Q4_K only). Gates the prefill
     /// dispatcher in <c>CudaTransformerModel.Project</c>: when true (and <see cref="MmqBatchedMinSeqLen"/>
     /// is met), prefill skips dequant→cuBLAS HGEMM entirely for Q4_K weights.
+    /// <b>In practice this path is dormant by default</b>: <see cref="MmqBatchedMinSeqLen"/>'s default
+    /// is <see cref="int.MaxValue"/> (Task 6 benchmark sweep measured the batched-MMQ kernel 2x-51x
+    /// slower than the dequant→cuBLAS fallback at every tested prefill length), so
+    /// <c>HasMmqBatchedQ4K</c> being true does NOT mean the batched-MMQ path is actually taken —
+    /// see issue #367 for the wider-tile redesign needed before the threshold can be safely lowered.
     /// </summary>
     public bool HasMmqBatchedQ4K => _quantizedGemvQ4_KMmqBatchedFunc != 0 && _quantizeXToQ8_1BatchedFunc != 0
         && !DisableQuantizedGemv && !DisableMmqBatchedQ4K;
