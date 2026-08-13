@@ -1,3 +1,4 @@
+using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
@@ -286,6 +287,33 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
         if (state.NumLayers != _numLayers)
             throw new ArgumentException(
                 $"CudaMamba3StateCache has {state.NumLayers} layers but model has {_numLayers}.", nameof(state));
+        // Mirrors Mamba3TransformerModel.Forward(..., Mamba3State)'s element-count guards
+        // (Mamba3TransformerModel.cs:217-226) — NumLayers alone does not catch a cache built
+        // from a different Mamba3Config with the same layer count, which would otherwise hand
+        // the kernels undersized buffers and produce out-of-bounds device writes with no
+        // diagnostic. CudaMamba3StateCache additionally exposes KState/VState element counts
+        // (Mamba3State does not), so those are checked too.
+        int expectedSsm = _m3.NumHeads * _m3.HeadDim * _m3.StateSize;
+        int expectedCum = _m3.NumHeads * _m3.NumRopeAngles;
+        int expectedKRank = _m3.IsMimo ? _m3.MimoRank : 1;
+        int expectedK = expectedKRank * _m3.NumHeads * _m3.StateSize;
+        int expectedV = _m3.NumHeads * _m3.HeadDim;
+        if (state.SsmStateElementsPerLayer != expectedSsm)
+            throw new ArgumentException(
+                $"CudaMamba3StateCache SSM layout mismatch: state has {state.SsmStateElementsPerLayer} "
+                + $"elements/layer, model expects {expectedSsm}.", nameof(state));
+        if (state.CumAngleElementsPerLayer != expectedCum)
+            throw new ArgumentException(
+                $"CudaMamba3StateCache cum_angle layout mismatch: state has {state.CumAngleElementsPerLayer} "
+                + $"elements/layer, model expects {expectedCum}.", nameof(state));
+        if (state.KStateElementsPerLayer != expectedK)
+            throw new ArgumentException(
+                $"CudaMamba3StateCache k_state layout mismatch: state has {state.KStateElementsPerLayer} "
+                + $"elements/layer, model expects {expectedK}.", nameof(state));
+        if (state.VStateElementsPerLayer != expectedV)
+            throw new ArgumentException(
+                $"CudaMamba3StateCache v_state layout mismatch: state has {state.VStateElementsPerLayer} "
+                + $"elements/layer, model expects {expectedV}.", nameof(state));
         _context.MakeCurrent();
         return ForwardCore(tokenIds, positions, deviceId, state, runChunkBoundary: true);
     }
@@ -647,10 +675,12 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
             int baseT = t * nHead * dState;
             for (int h = 0; h < nHead; h++)
             {
-                float dot = 0f;
                 int off = baseT + h * dState;
-                for (int n = 0; n < dState; n++) dot += cHRN[off + n] * bHRN[off + n];
-                qkPreDot[t * nHead + h] = dot;
+                // TensorPrimitives.Dot, not a naive scalar accumulation loop — matches CPU's
+                // Mamba3Block.cs:339 and Vulkan's identical choice exactly, avoiding a gratuitous
+                // F32 reassociation against the oracle Task 11's parity tests will diff against.
+                qkPreDot[t * nHead + h] = TensorPrimitives.Dot(
+                    cHRN.AsSpan(off, dState), bHRN.AsSpan(off, dState));
             }
         }
 
