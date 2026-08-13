@@ -828,4 +828,71 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         // 12. ssm_out projection into NormOutput.
         Gemm(ssmW.OutWeight, ssmW.OutQt, _state.SsmY, _state.NormOutput, hiddenSize, dInner, seqLen);
     }
+
+    /// <summary>
+    /// GQA attention sub-layer forward — reads pre-normed activations from
+    /// <c>_state.NormOutput</c> and writes the o_proj result back into the same buffer.
+    /// <paramref name="positions"/> is the HOST-side position span (needed by
+    /// <see cref="IKvCache.Update"/>'s signature); <c>_state.PositionsDevice</c> (uploaded once
+    /// per <c>Forward</c> call by Task 11) is the device-side copy RoPE reads from.
+    /// </summary>
+    private void ForwardAttentionBody(
+        in DeviceAttn attn, int absoluteLayerIndex, int seqLen, ReadOnlySpan<int> positions,
+        int numHeads, int numKvHeads, int headDim, IKvCache? kvCache)
+    {
+        int kvStride = numKvHeads * headDim;
+        nint streamH = _stream.Handle;
+
+        Gemm(attn.QWeight, attn.QQt, _state.NormOutput, _state.QScratch, attn.QOutputDim, attn.QInputDim, seqLen);
+        Gemm(attn.KWeight, attn.KQt, _state.NormOutput, _state.KScratch, attn.KOutputDim, attn.KInputDim, seqLen);
+        Gemm(attn.VWeight, attn.VQt, _state.NormOutput, _state.VScratch, attn.VOutputDim, attn.VInputDim, seqLen);
+
+        // Partial RoPE: RoPEType.Norm (GPT-J interleaved pairing) over the first _ropeDim dims
+        // of each head — matches NemotronHTransformerModel.ForwardAttentionBody's
+        // RoPE.Execute(..., RoPEType.Norm) call. LaunchRoPEF32's own doc comment already
+        // documents ropeType=0/freqDim=0/neoxPairOffset=0 as the correct shape for NemotronH.
+        _kernels.LaunchRoPEF32(_state.QScratch, _state.KScratch, _state.PositionsDevice,
+            seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta,
+            CudaKernels.ToCudaRopeType(RoPEType.Norm), streamH);
+
+        if (kvCache is not null)
+        {
+            int kvSlot = _kvSlotForLayer[absoluteLayerIndex];
+            if (kvSlot < 0)
+                throw new InvalidOperationException(
+                    $"Layer {absoluteLayerIndex} has no KV-cache slot (not an attention layer).");
+
+            var kRef = new TensorRef(seqLen, kvStride, DType.Float32, _deviceId, _state.KScratch);
+            var vRef = new TensorRef(seqLen, kvStride, DType.Float32, _deviceId, _state.VScratch);
+            kvCache.Update(kRef, vRef, positions, kvSlot);
+
+            int seqKv = kvCache.CurrentLength;
+            TensorRef cachedK = kvCache.GetKeysRef(kvSlot);
+            TensorRef cachedV = kvCache.GetValuesRef(kvSlot);
+
+            _kernels.LaunchAttentionF32(_state.QScratch, cachedK.DataPointer, cachedV.DataPointer, _state.AttnOutput,
+                seqQ: seqLen, seqKv: seqKv, numHeads, numKvHeads, headDim,
+                positionOffset: positions[0], slidingWindow: 0, streamH);
+        }
+        else
+        {
+            _kernels.LaunchAttentionF32(_state.QScratch, _state.KScratch, _state.VScratch, _state.AttnOutput,
+                seqQ: seqLen, seqKv: seqLen, numHeads, numKvHeads, headDim,
+                positionOffset: 0, slidingWindow: 0, streamH);
+        }
+
+        Gemm(attn.OWeight, attn.OQt, _state.AttnOutput, _state.NormOutput, attn.OOutputDim, attn.OInputDim, seqLen);
+    }
+
+    /// <summary>Squared-ReLU FFN sub-layer forward (no gate) — up -> relu² -> down, reads/writes
+    /// <c>_state.NormOutput</c>. Matches <c>NemotronHTransformerModel.ForwardFfnBody</c> exactly.</summary>
+    private void ForwardFfnBody(in DeviceFfn ffn, int seqLen, int hiddenSize)
+    {
+        int intermediateSize = ffn.UpOutputDim;
+        nint streamH = _stream.Handle;
+
+        Gemm(ffn.UpWeight, ffn.UpQt, _state.NormOutput, _state.FfnIntermediate, ffn.UpOutputDim, ffn.UpInputDim, seqLen);
+        _kernels.LaunchReluSquaredInplaceF32(_state.FfnIntermediate, seqLen * intermediateSize, streamH);
+        Gemm(ffn.DownWeight, ffn.DownQt, _state.FfnIntermediate, _state.NormOutput, ffn.DownOutputDim, ffn.DownInputDim, seqLen);
+    }
 }
