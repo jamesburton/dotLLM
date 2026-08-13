@@ -325,7 +325,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         var state = new VulkanQwen3MoeHybridForwardState(device, config, gdn, initialSeqLen: 1);
         var gdnCache = new VulkanGdnStateCache(device, gdn, gdnOrdinal);
 
-        var kernels = VulkanQwen3MoeHybridKernels.Create(device, spvDir);
+        var kernels = VulkanQwen3MoeHybridKernels.Create(device, spvDir, config.HeadDim);
 
         return new VulkanQwen3MoeHybridTransformerModel(
             device, ownsDevice: false,
@@ -421,7 +421,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         var state = new VulkanQwen3MoeHybridForwardState(device, config, gdn, initialSeqLen: 1);
         var gdnCache = new VulkanGdnStateCache(device, gdn, gdnOrdinal);
 
-        var kernels = VulkanQwen3MoeHybridKernels.Create(device, spvDir);
+        var kernels = VulkanQwen3MoeHybridKernels.Create(device, spvDir, config.HeadDim);
 
         return new VulkanQwen3MoeHybridTransformerModel(
             device, ownsDevice: false,
