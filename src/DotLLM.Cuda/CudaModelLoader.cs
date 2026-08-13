@@ -88,11 +88,11 @@ public static class CudaModelLoader
                     + "backend for Mamba3 checkpoints.");
 
             case Architecture.NemotronH:
-                throw new NotSupportedException(
-                    "CUDA has no dedicated loader for NemotronH yet — its Mamba2 SSM layers "
-                    + "(A, dt_bias, conv1d, etc.) are not tensor-compatible with the generic "
-                    + "CudaTransformerModel this would otherwise silently fall through to. Use "
-                    + "the CPU or Vulkan backend for NemotronH checkpoints.");
+            {
+                var nemotronH = Architectures.CudaNemotronHTransformerModel
+                    .LoadFromGguf(gguf, config, deviceId, ptxDir);
+                return (nemotronH, size => nemotronH.CreateKvCache(size));
+            }
 
             // gpt-oss's MoE per-expert bias and OAI-clamped-SwiGLU activation are now
             // implemented (issue #348) and CudaMoeFfn/CudaMoeWeightsLoader handle them

@@ -25,7 +25,6 @@ public sealed class CudaUnsupportedArchitectureGuardTests
 {
     [SkippableTheory]
     [InlineData(Architecture.Mamba3)]
-    [InlineData(Architecture.NemotronH)]
     [InlineData(Architecture.GptOss)]
     public void CreateFromGguf_UnsupportedArchitecture_ThrowsNotSupportedInsteadOfSilentFallthrough(
         Architecture architecture)
