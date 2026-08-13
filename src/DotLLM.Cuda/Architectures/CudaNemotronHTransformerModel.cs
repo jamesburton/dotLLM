@@ -382,4 +382,340 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         }
         return device;
     }
+
+    /// <summary>
+    /// Builds a NemotronH CUDA model from caller-owned, pre-built <see cref="NemotronHLayerWeights"/> —
+    /// the shared entry point for <see cref="LoadFromGguf"/> (Task 7) and the synthetic-fixture
+    /// parity test (Task 13). Caller retains ownership of every host <see cref="nint"/> pointer
+    /// (token embed, output, plus every projection inside <paramref name="cpuLayers"/>) — this
+    /// method only reads from them to build fresh device buffers plus the retained
+    /// <c>_tokenEmbedHostPtr</c> for per-call embedding dequant.
+    /// </summary>
+    internal static CudaNemotronHTransformerModel BuildFromPrebuiltWeights(
+        ModelConfig config,
+        NemotronHLayerWeights[] cpuLayers,
+        float[] outputNormWeight,
+        nint outputWeight, QuantizationType outputQt, int outputOutputDim, int outputInputDim,
+        nint tokenEmbedWeight, QuantizationType tokenEmbedQt,
+        int deviceId = 0, string? ptxDir = null)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        ArgumentNullException.ThrowIfNull(cpuLayers);
+        ArgumentNullException.ThrowIfNull(outputNormWeight);
+        if (config.Architecture != Architecture.NemotronH)
+            throw new ArgumentException(
+                $"CudaNemotronHTransformerModel requires Architecture.NemotronH, got {config.Architecture}.",
+                nameof(config));
+        if (config.HybridLayout is null)
+            throw new ArgumentException("NemotronH config must have HybridLayout populated.", nameof(config));
+        if (config.SsmConfig is null)
+            throw new ArgumentException("NemotronH config must have SsmConfig populated.", nameof(config));
+        if (cpuLayers.Length != config.NumLayers)
+            throw new ArgumentException(
+                $"cpuLayers length {cpuLayers.Length} != config.NumLayers {config.NumLayers}.", nameof(cpuLayers));
+
+        var layout = config.HybridLayout!;
+        var ssm = config.SsmConfig!.Value;
+        int hiddenSize = config.HiddenSize;
+
+        var context = CudaContext.Create(deviceId);
+        var stream = CudaStream.Create();
+        var cublas = CudaCublasHandle.Create();
+        cublas.SetStream(stream);
+
+        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
+        var kernels = new CudaKernels(ptxDir);
+
+        long maxTileFloats = 0;
+
+        // Output norm — always F32 [hiddenSize].
+        nint outputNormDevice = UploadF32ArrayFrom(outputNormWeight);
+
+        // lm_head — always uploaded as its own fresh device buffer (no tied-embedding aliasing
+        // optimization; NemotronH's CPU loader already resolves the tied case at the host-pointer
+        // level, so outputWeight here is already the correct source regardless).
+        nint outputDevice = UploadRawTensorFromHost(outputWeight, outputQt, outputOutputDim, outputInputDim);
+        UpdateMaxTile(ref maxTileFloats, (long)outputOutputDim * outputInputDim);
+
+        long tokenEmbedRowBytes = Dequantize.RowByteSize(hiddenSize, tokenEmbedQt);
+
+        // Per-layer upload.
+        var layers = new DeviceLayer[config.NumLayers];
+        var kvSlotForLayer = new int[config.NumLayers];
+        int attentionLayerCount = 0;
+        int numSsmLayers = 0;
+        int maxIntermediate = 0;
+        for (int i = 0; i < config.NumLayers; i++)
+        {
+            var cpuLayer = cpuLayers[i];
+            nint attnNormDevice = UploadF32ArrayFrom(cpuLayer.AttnNormWeight);
+
+            DeviceSsm? ssmDev = null;
+            DeviceAttn? attnDev = null;
+            DeviceFfn? ffnDev = null;
+
+            switch (layout.LayerKind[i])
+            {
+                case HybridLayerKind.Ssm:
+                    ssmDev = UploadDeviceSsmLayer(cpuLayer.Ssm!, ref maxTileFloats);
+                    numSsmLayers++;
+                    break;
+                case HybridLayerKind.Attention:
+                    attnDev = UploadDeviceAttentionLayer(cpuLayer.Attention!, ref maxTileFloats);
+                    kvSlotForLayer[i] = attentionLayerCount++;
+                    break;
+                case HybridLayerKind.Ffn:
+                    ffnDev = UploadDeviceFfnLayer(cpuLayer.Ffn!, ref maxTileFloats);
+                    if (cpuLayer.Ffn!.UpOutputDim > maxIntermediate) maxIntermediate = cpuLayer.Ffn.UpOutputDim;
+                    break;
+                default:
+                    throw new InvalidOperationException(
+                        $"Unknown HybridLayerKind {layout.LayerKind[i]} at layer {i}.");
+            }
+            if (layout.LayerKind[i] != HybridLayerKind.Attention) kvSlotForLayer[i] = -1;
+
+            layers[i] = new DeviceLayer
+            {
+                AttnNormWeightDevice = attnNormDevice,
+                Kind = layout.LayerKind[i],
+                Ssm = ssmDev,
+                Attention = attnDev,
+                Ffn = ffnDev,
+            };
+        }
+        if (maxIntermediate == 0) maxIntermediate = hiddenSize;
+
+        // RoPE config — allow ropeDim==0 only when there are no attention layers (mirrors
+        // NemotronHTransformerModel.BuildFromPrebuiltWeights exactly).
+        int ropeDim = config.RoPEConfig?.DimensionCount ?? 0;
+        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+        if (attentionLayerCount > 0)
+        {
+            if (ropeDim <= 0 || (ropeDim & 1) != 0)
+                throw new ArgumentException(
+                    $"NemotronH attention layers require an even rope_dim > 0 (got {ropeDim}).", nameof(config));
+            if (ropeDim > config.HeadDim)
+                throw new ArgumentException(
+                    $"rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.", nameof(config));
+        }
+
+        var state = new CudaNemotronHForwardState(
+            hiddenSize: hiddenSize,
+            maxIntermediateSize: maxIntermediate,
+            vocabSize: config.VocabSize,
+            qElems: config.NumAttentionHeads * config.HeadDim,
+            kvElems: config.NumKvHeads * config.HeadDim,
+            inputProjectionDim: ssm.InputProjectionDim,
+            convDim: ssm.ConvDim,
+            dConv: ssm.DConv,
+            dInner: ssm.DInner,
+            nHead: ssm.NHead,
+            nGroup: ssm.NGroup,
+            dState: ssm.DState,
+            maxSeqLen: config.MaxSequenceLength);
+
+        var ssmCache = new CudaNemotronHSsmStateCache(ssm, numSsmLayers);
+
+        UpdateMaxTile(ref maxTileFloats, maxIntermediate); // dequant scratch floor for tiny models
+        nint dequantScratchDevice = AllocDevice(maxTileFloats * sizeof(ushort));
+
+        return new CudaNemotronHTransformerModel(
+            config, layers,
+            tokenEmbedWeight, tokenEmbedQt, tokenEmbedRowBytes,
+            outputNormDevice,
+            outputDevice, outputQt, outputOutputDim, outputInputDim, ownsOutputDevice: true,
+            kvSlotForLayer, attentionLayerCount,
+            ropeTheta, ropeDim,
+            state, ssmCache, stream, cublas, context, kernels, deviceId, dequantScratchDevice);
+    }
+
+    private static void UpdateMaxTile(ref long max, long candidate)
+    {
+        if (candidate > max) max = candidate;
+    }
+
+    private static DeviceSsm UploadDeviceSsmLayer(NemotronHSsmWeights w, ref long maxTileFloats)
+    {
+        nint inDevice = UploadRawTensorFromHost(w.InWeight, w.InQuantType, w.InOutputDim, w.InInputDim);
+        nint outDevice = UploadRawTensorFromHost(w.OutWeight, w.OutQuantType, w.OutOutputDim, w.OutInputDim);
+        UpdateMaxTile(ref maxTileFloats, (long)w.InOutputDim * w.InInputDim);
+        UpdateMaxTile(ref maxTileFloats, (long)w.OutOutputDim * w.OutInputDim);
+
+        return new DeviceSsm
+        {
+            InWeight = inDevice, InQt = w.InQuantType, InInputDim = w.InInputDim, InOutputDim = w.InOutputDim,
+            Conv1dWeightDevice = UploadF32ArrayFrom(w.Conv1dWeight),
+            Conv1dBiasDevice = UploadF32ArrayFrom(w.Conv1dBias),
+            ADevice = UploadF32ArrayFrom(w.A),
+            DDevice = UploadF32ArrayFrom(w.D),
+            DtBiasDevice = UploadF32ArrayFrom(w.DtBias),
+            NormWeightDevice = UploadF32ArrayFrom(w.NormWeight),
+            OutWeight = outDevice, OutQt = w.OutQuantType, OutInputDim = w.OutInputDim, OutOutputDim = w.OutOutputDim,
+        };
+    }
+
+    private static DeviceAttn UploadDeviceAttentionLayer(NemotronHAttentionWeights w, ref long maxTileFloats)
+    {
+        nint qDevice = UploadRawTensorFromHost(w.QWeight, w.QQuantType, w.QOutputDim, w.QInputDim);
+        nint kDevice = UploadRawTensorFromHost(w.KWeight, w.KQuantType, w.KOutputDim, w.KInputDim);
+        nint vDevice = UploadRawTensorFromHost(w.VWeight, w.VQuantType, w.VOutputDim, w.VInputDim);
+        nint oDevice = UploadRawTensorFromHost(w.OWeight, w.OQuantType, w.OOutputDim, w.OInputDim);
+        UpdateMaxTile(ref maxTileFloats, (long)w.QOutputDim * w.QInputDim);
+        UpdateMaxTile(ref maxTileFloats, (long)w.KOutputDim * w.KInputDim);
+        UpdateMaxTile(ref maxTileFloats, (long)w.VOutputDim * w.VInputDim);
+        UpdateMaxTile(ref maxTileFloats, (long)w.OOutputDim * w.OInputDim);
+
+        return new DeviceAttn
+        {
+            QWeight = qDevice, QQt = w.QQuantType, QInputDim = w.QInputDim, QOutputDim = w.QOutputDim,
+            KWeight = kDevice, KQt = w.KQuantType, KInputDim = w.KInputDim, KOutputDim = w.KOutputDim,
+            VWeight = vDevice, VQt = w.VQuantType, VInputDim = w.VInputDim, VOutputDim = w.VOutputDim,
+            OWeight = oDevice, OQt = w.OQuantType, OInputDim = w.OInputDim, OOutputDim = w.OOutputDim,
+            NumKvHeads = w.NumKvHeads,
+        };
+    }
+
+    private static DeviceFfn UploadDeviceFfnLayer(NemotronHFfnWeights w, ref long maxTileFloats)
+    {
+        nint upDevice = UploadRawTensorFromHost(w.UpWeight, w.UpQuantType, w.UpOutputDim, w.UpInputDim);
+        nint downDevice = UploadRawTensorFromHost(w.DownWeight, w.DownQuantType, w.DownOutputDim, w.DownInputDim);
+        UpdateMaxTile(ref maxTileFloats, (long)w.UpOutputDim * w.UpInputDim);
+        UpdateMaxTile(ref maxTileFloats, (long)w.DownOutputDim * w.DownInputDim);
+
+        return new DeviceFfn
+        {
+            UpWeight = upDevice, UpQt = w.UpQuantType, UpInputDim = w.UpInputDim, UpOutputDim = w.UpOutputDim,
+            DownWeight = downDevice, DownQt = w.DownQuantType, DownInputDim = w.DownInputDim, DownOutputDim = w.DownOutputDim,
+        };
+    }
+
+    /// <summary>
+    /// Dispatches one linear projection <c>Y[seqLen,m] = X[seqLen,k] @ W[m,k]^T</c> by quant
+    /// type. F32 weights go straight through cuBLAS. Q8_0 decode (seqLen==1) uses the direct
+    /// F32-in/F32-out quantized GEMV kernel. Every other quant format (F16, K-quants, IQ-quants)
+    /// funnels through an F16 dequant-then-cuBLAS-HGEMM round trip. Verbatim copy of
+    /// <c>CudaQwen3HybridDenseTransformerModel.Gemm</c> minus its I2_S/PQ2_0 branches (NemotronH
+    /// GGUFs never carry ternary/PQ2_0 tensors).
+    /// </summary>
+    private void Gemm(nint weight, QuantizationType qt, nint x, nint y, int m, int k, int seqLen)
+    {
+        nint streamH = _stream.Handle;
+
+        if (qt == QuantizationType.F32)
+        {
+            CudaGemm.LinearF32(_cublas.Handle, x, weight, y, seqLen, k, m, streamH);
+            return;
+        }
+
+        if (seqLen == 1)
+        {
+            if (qt == QuantizationType.Q8_0)
+            {
+                _kernels.LaunchQuantizedGemvF32In(weight, x, y, m, k, streamH);
+                return;
+            }
+
+            if (qt == QuantizationType.F16
+                || _kernels.HasMmq(qt)
+                || _kernels.HasQuantizedGemvKernel(qt))
+            {
+                EnsureActivF16InScratch(k);
+                EnsureActivF16OutScratch(m);
+                _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, k, streamH);
+
+                if (qt == QuantizationType.F16)
+                {
+                    CudaGemm.GemvF16(_cublas.Handle, weight, _activF16InScratch,
+                        _activF16OutScratch, m, k, streamH);
+                }
+                else if (_kernels.HasMmq(qt) && !CudaKernels.ForceDirectGemv)
+                {
+                    _kernels.LaunchQuantizedGemvMmq(weight, qt,
+                        _activF16InScratch, _activF16OutScratch, m, k, preqScratch: 0, streamH);
+                }
+                else
+                {
+                    _kernels.LaunchQuantizedGemv(weight, qt,
+                        _activF16InScratch, _activF16OutScratch, m, k, streamH);
+                }
+
+                _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y, m, streamH);
+                return;
+            }
+        }
+
+        // Prefill (seqLen > 1) and decode fallback for any quant format without a direct path.
+        long totalElems = (long)m * k;
+        int totalElemsI = checked((int)totalElems);
+        int activInElems = checked((int)((long)seqLen * k));
+        int activOutElems = checked((int)((long)seqLen * m));
+        EnsureActivF16InScratch(activInElems);
+        EnsureActivF16OutScratch(activOutElems);
+
+        _kernels.LaunchDequantToF16(weight, qt, _dequantScratchF16Weight, totalElemsI, streamH);
+        _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, activInElems, streamH);
+        CudaGemm.LinearF16(_cublas.Handle, _activF16InScratch, _dequantScratchF16Weight,
+            _activF16OutScratch, seqLen, k, m, streamH);
+        _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y, activOutElems, streamH);
+    }
+
+    private void EnsureActivF16InScratch(long halfs)
+    {
+        if (halfs <= _activF16InScratchElems) return;
+        FreeIfNonZero(ref _activF16InScratch);
+        CudaDriverApi.cuMemAlloc_v2(out _activF16InScratch, (nuint)(halfs * sizeof(ushort))).ThrowOnError();
+        _activF16InScratchElems = halfs;
+    }
+
+    private void EnsureActivF16OutScratch(long halfs)
+    {
+        if (halfs <= _activF16OutScratchElems) return;
+        FreeIfNonZero(ref _activF16OutScratch);
+        CudaDriverApi.cuMemAlloc_v2(out _activF16OutScratch, (nuint)(halfs * sizeof(ushort))).ThrowOnError();
+        _activF16OutScratchElems = halfs;
+    }
+
+    /// <summary>
+    /// Embedding lookup via per-call host-side row dequant (see this task's design note) —
+    /// writes <paramref name="tokenIds"/>.Length rows of <paramref name="hiddenSize"/> floats
+    /// each into the device buffer <paramref name="hiddenDevice"/>. Mirrors
+    /// <c>NemotronHTransformerModel.EmbedTokens</c> (CPU) exactly: F32 straight copy, F16
+    /// widened via <c>TensorPrimitives.ConvertToSingle</c>, everything else via
+    /// <c>Dequantize.ToFloat32</c>.
+    /// </summary>
+    private void Embed(ReadOnlySpan<int> tokenIds, nint hiddenDevice, int hiddenSize)
+    {
+        int seqLen = tokenIds.Length;
+        float[] hostRows = new float[seqLen * hiddenSize];
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            int tokenId = tokenIds[t];
+            if ((uint)tokenId >= (uint)Config.VocabSize)
+                throw new ArgumentOutOfRangeException(nameof(tokenIds),
+                    $"Token ID {tokenId} at position {t} is out of range [0, {Config.VocabSize}).");
+
+            Span<float> dst = hostRows.AsSpan(t * hiddenSize, hiddenSize);
+            nint rowPtr = _tokenEmbedHostPtr + (nint)((long)tokenId * _tokenEmbedRowBytes);
+
+            if (_tokenEmbedQt == QuantizationType.F32)
+            {
+                new ReadOnlySpan<float>((float*)rowPtr, hiddenSize).CopyTo(dst);
+            }
+            else if (_tokenEmbedQt == QuantizationType.F16)
+            {
+                var src = new ReadOnlySpan<Half>((Half*)rowPtr, hiddenSize);
+                System.Numerics.Tensors.TensorPrimitives.ConvertToSingle(src, dst);
+            }
+            else
+            {
+                Dequantize.ToFloat32(rowPtr, hiddenSize, _tokenEmbedQt, dst);
+            }
+        }
+
+        fixed (float* p = hostRows)
+        {
+            CopyHtoD(hiddenDevice, (nint)p, (long)hostRows.Length * sizeof(float));
+        }
+    }
 }
