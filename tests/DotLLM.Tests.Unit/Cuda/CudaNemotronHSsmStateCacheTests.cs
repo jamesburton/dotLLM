@@ -61,9 +61,21 @@ public class CudaNemotronHSsmStateCacheTests
                     (nuint)(ones.Length * sizeof(float))).ThrowOnError();
         }
 
+        float[] twos = new float[cache.ConvStateElements];
+        Array.Fill(twos, 2.0f);
+        unsafe
+        {
+            fixed (float* p = twos)
+                CudaDriverApi.cuMemcpyHtoD_v2(cache.GetConvStatePtr(0), (nint)p,
+                    (nuint)(twos.Length * sizeof(float))).ThrowOnError();
+        }
+
         cache.Reset();
         float[] afterReset = Download(cache.GetSsmStatePtr(0), cache.SsmStateElements);
         Assert.All(afterReset, v => Assert.Equal(0f, v));
+
+        float[] convAfterReset = Download(cache.GetConvStatePtr(0), cache.ConvStateElements);
+        Assert.All(convAfterReset, v => Assert.Equal(0f, v));
     }
 
     private static unsafe float[] Download(nint devicePtr, int count)
