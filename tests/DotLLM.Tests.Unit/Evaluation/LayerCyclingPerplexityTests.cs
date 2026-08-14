@@ -166,6 +166,51 @@ public sealed class LayerCyclingPerplexityTests : IDisposable
         Assert.Equal(correct, leaked, 12);
     }
 
+    /// <summary>
+    /// The per-corpus-window diagnostic callback (<c>--per-window</c>) must still fire in cycling
+    /// mode, once per window and with the same figures a whole-model run reports.
+    /// </summary>
+    /// <remarks>
+    /// Cycling delegates its final scoring pass to <see cref="PerplexityEvaluator"/> precisely so
+    /// that the diagnostics keep working; this pins that, because "the number is right but
+    /// <c>--per-window</c> silently stopped reporting" is a plausible way to lose the one tool that
+    /// localises a disagreement to specific corpus content.
+    /// </remarks>
+    [Fact]
+    public void CycledScoring_StillReportsPerWindowDiagnostics()
+    {
+        var cycledWindows = new List<(int Index, double Perplexity, int Scored)>();
+        var wholeWindows = new List<(int Index, double Perplexity, int Scored)>();
+
+        (IModel wholeModel, _) = LoadPristineModel();
+        using (wholeModel)
+        {
+            var adapter = new BackendPerplexityModel(
+                wholeModel, deviceId: -1, BackendPerplexityModel.Probe(wholeModel, deviceId: -1));
+            PerplexityEvaluator.Evaluate(adapter, Corpus, SlidingOptions,
+                (i, ppl, n) => wholeWindows.Add((i, ppl, n)));
+        }
+
+        (IModel model, ModelConfig config) = LoadPristineModel();
+        using (model)
+        {
+            using ILayerWindowModel windows = new CpuLayerWindowModel(model, config);
+            CyclingPerplexityEvaluator.Evaluate(
+                windows, Corpus, SlidingOptions,
+                CyclingPerplexityEvaluator.PartitionLayers(config.NumLayers, BlockCount / 2),
+                (i, ppl, n) => cycledWindows.Add((i, ppl, n)));
+        }
+
+        Assert.True(wholeWindows.Count > 1, "geometry must span a window boundary");
+        Assert.Equal(wholeWindows.Count, cycledWindows.Count);
+        for (int i = 0; i < wholeWindows.Count; i++)
+        {
+            Assert.Equal(wholeWindows[i].Index, cycledWindows[i].Index);
+            Assert.Equal(wholeWindows[i].Scored, cycledWindows[i].Scored);
+            Assert.Equal(wholeWindows[i].Perplexity, cycledWindows[i].Perplexity, 10);
+        }
+    }
+
     /// <summary>A cycling partition that does not cover every layer must be rejected, not scored.</summary>
     [Fact]
     public void Cycling_RejectsAPartitionThatDoesNotCoverTheTrunk()
