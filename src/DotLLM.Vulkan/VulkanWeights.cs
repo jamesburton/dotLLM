@@ -1714,15 +1714,9 @@ internal sealed class VulkanWeights : IDisposable
         QuantizationType routedW1Qt = MoeRoutedRawDeviceQuantType(device, moe.GateExpsRaw, moe.GateExpsRawQt, moe.GateExpsMDim, moe.GateExpsKDim, interm, hidden);
         QuantizationType routedW2Qt = MoeRoutedRawDeviceQuantType(device, moe.DownExpsRaw, moe.DownExpsRawQt, moe.DownExpsMDim, moe.DownExpsKDim, hidden, interm);
         QuantizationType routedW3Qt = MoeRoutedRawDeviceQuantType(device, moe.UpExpsRaw, moe.UpExpsRawQt, moe.UpExpsMDim, moe.UpExpsKDim, interm, hidden);
-        long perExpertW1Bytes = routedW1Qt != QuantizationType.F32
-            ? MoeOverlayUploadBytes(routedW1Qt, interm, hidden)
-            : (long)interm * hidden * sizeof(float);
-        long perExpertW2Bytes = routedW2Qt != QuantizationType.F32
-            ? MoeOverlayUploadBytes(routedW2Qt, hidden, interm)
-            : (long)hidden * interm * sizeof(float);
-        long perExpertW3Bytes = routedW3Qt != QuantizationType.F32
-            ? MoeOverlayUploadBytes(routedW3Qt, interm, hidden)
-            : (long)interm * hidden * sizeof(float);
+        long perExpertW1Bytes = RoutedBankUploadBytes(routedW1Qt, interm, hidden);
+        long perExpertW2Bytes = RoutedBankUploadBytes(routedW2Qt, hidden, interm);
+        long perExpertW3Bytes = RoutedBankUploadBytes(routedW3Qt, interm, hidden);
 
         bool sharedW1KeepQuant = hasShared && MoeOverlayKeepsQuantized(moe.SharedExpertProjQuantTypeOverlay, hidden);
         bool sharedW2KeepQuant = hasShared && MoeOverlayKeepsQuantized(moe.SharedExpertProjQuantTypeOverlay, sharedI);
@@ -2192,6 +2186,14 @@ internal sealed class VulkanWeights : IDisposable
             if (MoeOverlayKeepsQ4K(qt, expectedK)) return QuantizationType.Q4_K;
             if (MoeOverlayKeepsQ5K(qt, expectedK)) return QuantizationType.Q5_K;
             if (MoeOverlayKeepsQ6K(qt, expectedK)) return QuantizationType.Q6_K;
+
+            // #407: the legacy/i-quant routed pairs. Both had complete-or-partial
+            // DENSE Vulkan paths already; without these two lines their expert banks
+            // still fell through to the F32 host dequant below (5.8x for Q5_0,
+            // 7.1x for IQ4_NL) — the exact "kernel exists but is unreachable"
+            // failure #344 calls out.
+            if (MoeOverlayKeepsQ5_0(qt, expectedK)) return QuantizationType.Q5_0;
+            if (MoeOverlayKeepsIq4Nl(qt, expectedK)) return QuantizationType.IQ4_NL;
         }
 
         // Strategy C path: keep routed F16 expert banks raw only when the
@@ -2564,6 +2566,29 @@ internal sealed class VulkanWeights : IDisposable
     private static bool MoeOverlayKeepsQ6K(QuantizationType qt, int contractionDim)
         => qt == QuantizationType.Q6_K && (contractionDim % 256) == 0;
 
+    /// <summary>
+    /// True iff a Q5_0 routed expert bank can be kept on device as raw 22-byte Q5_0
+    /// blocks — gated on the contraction-axis dim being a multiple of the Q5_0 group
+    /// size (32). Consumed by <see cref="MoeRoutedRawDeviceQuantType"/> and dispatched
+    /// through <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ5_0F32Kernel"/> (#407).
+    /// </summary>
+    /// <remarks>
+    /// Deliberately NOT part of <see cref="MoeOverlayKeepsQuantized"/>: that predicate
+    /// governs the router-gate / shared-expert quant overlay, which has no Q5_0 matmul
+    /// kernel of its own. Only the routed-bank path is wired here.
+    /// </remarks>
+    private static bool MoeOverlayKeepsQ5_0(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.Q5_0 && (contractionDim % 32) == 0;
+
+    /// <summary>
+    /// True iff an IQ4_NL routed expert bank can be kept on device as raw 18-byte
+    /// IQ4_NL blocks — gated on the contraction-axis dim being a multiple of the
+    /// IQ4_NL group size (32). Sibling of <see cref="MoeOverlayKeepsQ5_0"/>, dispatched
+    /// through <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulIq4NlF32Kernel"/> (#407).
+    /// </summary>
+    private static bool MoeOverlayKeepsIq4Nl(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.IQ4_NL && (contractionDim % 32) == 0;
+
     /// <summary>True iff an F16 MoE overlay can be kept on device as raw 2-byte F16
     /// elements — gated on the contraction-axis dim being a multiple of 2. Phase 8
     /// sibling of <see cref="MoeOverlayKeepsQ4K"/>.</summary>
@@ -2588,6 +2613,23 @@ internal sealed class VulkanWeights : IDisposable
         || MoeOverlayKeepsF16(qt, contractionDim)
         || MoeOverlayKeepsBf16(qt, contractionDim);
 
+    /// <summary>
+    /// Per-expert on-device byte size for ONE routed expert bank, given the storage type
+    /// <see cref="MoeRoutedRawDeviceQuantType"/> already resolved for it: the packed
+    /// row-stride bytes for any non-F32 type, or the dequantised F32 size otherwise.
+    /// </summary>
+    /// <remarks>
+    /// Split out from <see cref="MoeOverlayUploadBytes"/> (#407) because that helper is
+    /// shared with the router-gate / shared-expert overlay path, which recognises a
+    /// deliberately narrower type set. Driving both from one list coupled two unrelated
+    /// decisions; driving the routed size from the ALREADY-RESOLVED type cannot disagree
+    /// with the resolver by construction.
+    /// </remarks>
+    private static long RoutedBankUploadBytes(QuantizationType routedQt, int outputDim, int contractionDim)
+        => routedQt == QuantizationType.F32
+            ? (long)outputDim * contractionDim * sizeof(float)
+            : Dequantize.RowByteSize(contractionDim, routedQt) * outputDim;
+
     /// <summary>Returns the on-device byte size for an MoE projection in its chosen
     /// storage form — raw Q-format / F16 / BF16 row-stride bytes when the overlay
     /// says so, otherwise F32.</summary>
@@ -2602,6 +2644,12 @@ internal sealed class VulkanWeights : IDisposable
             return Dequantize.RowByteSize(contractionDim, QuantizationType.Q5_K) * outputDim;
         if (MoeOverlayKeepsQ6K(qt, contractionDim))
             return Dequantize.RowByteSize(contractionDim, QuantizationType.Q6_K) * outputDim;
+        // NOTE (#407): Q5_0 / IQ4_NL are deliberately NOT listed here. This helper is
+        // shared with the router-gate and shared-expert overlay path, whose "is it kept
+        // packed?" decision is MoeOverlayKeepsQuantized — which those two types are also
+        // deliberately absent from (no overlay matmul kernel). Adding them here alone
+        // would size a buffer for packed bytes that the caller then fills with F32.
+        // The routed-bank byte size goes through RoutedBankUploadBytes instead.
         if (MoeOverlayKeepsF16(qt, contractionDim))
             return Dequantize.RowByteSize(contractionDim, QuantizationType.F16) * outputDim;
         if (MoeOverlayKeepsBf16(qt, contractionDim))
