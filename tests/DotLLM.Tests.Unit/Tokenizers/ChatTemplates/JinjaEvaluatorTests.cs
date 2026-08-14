@@ -238,6 +238,76 @@ public class JinjaEvaluatorTests
         Assert.Equal("", result);
     }
 
+    // ── loop.previtem / loop.nextitem (#399) ──
+
+    [Fact]
+    public void ForLoop_PrevItem_ReflectsActualNeighbour()
+    {
+        // Discriminates against a broken implementation that always echoes the current item
+        // (would render "abc") or always renders undefined (would render "").
+        var result = Eval(
+            "{% for x in items %}{{ loop.previtem }}{% endfor %}",
+            new Dictionary<string, object?>(StringComparer.Ordinal) { ["items"] = new List<object?> { "a", "b", "c" } });
+        Assert.Equal("ab", result);
+    }
+
+    [Fact]
+    public void ForLoop_NextItem_ReflectsActualNeighbour()
+    {
+        // Discriminates the same way as ForLoop_PrevItem_ReflectsActualNeighbour, from the other end.
+        var result = Eval(
+            "{% for x in items %}{{ loop.nextitem }}{% endfor %}",
+            new Dictionary<string, object?>(StringComparer.Ordinal) { ["items"] = new List<object?> { "a", "b", "c" } });
+        Assert.Equal("bc", result);
+    }
+
+    [Fact]
+    public void ForLoop_PrevItem_UndefinedOnFirstIteration_IsFalsyAndRendersEmpty()
+    {
+        // Jinja2: loop.previtem on the first iteration is Undefined — falsy, prints as "", never throws.
+        var result = Eval(
+            "{% for x in items %}{% if not loop.previtem %}U{% endif %}[{{ loop.previtem }}]{% endfor %}",
+            new Dictionary<string, object?>(StringComparer.Ordinal) { ["items"] = new List<object?> { "a", "b" } });
+        Assert.Equal("U[][a]", result);
+    }
+
+    [Fact]
+    public void ForLoop_NextItem_UndefinedOnLastIteration_IsFalsyAndRendersEmpty()
+    {
+        // Jinja2: loop.nextitem on the last iteration is Undefined — falsy, prints as "", never throws.
+        var result = Eval(
+            "{% for x in items %}[{{ loop.nextitem }}]{% if not loop.nextitem %}U{% endif %}{% endfor %}",
+            new Dictionary<string, object?>(StringComparer.Ordinal) { ["items"] = new List<object?> { "a", "b" } });
+        Assert.Equal("[b][]U", result);
+    }
+
+    [Fact]
+    public void ForLoop_PrevItem_IsDefinedTest_TracksBoundary()
+    {
+        var result = Eval(
+            "{% for x in items %}{{ loop.previtem is defined }}{% endfor %}",
+            new Dictionary<string, object?>(StringComparer.Ordinal) { ["items"] = new List<object?> { "a", "b", "c" } });
+        Assert.Equal("FalseTrueTrue", result);
+    }
+
+    [Fact]
+    public void ForLoop_NextItem_IsDefinedTest_TracksBoundary()
+    {
+        var result = Eval(
+            "{% for x in items %}{{ loop.nextitem is defined }}{% endfor %}",
+            new Dictionary<string, object?>(StringComparer.Ordinal) { ["items"] = new List<object?> { "a", "b", "c" } });
+        Assert.Equal("TrueTrueFalse", result);
+    }
+
+    [Fact]
+    public void ForLoop_SingleItem_BothPrevAndNextAreUndefined()
+    {
+        var result = Eval(
+            "{% for x in items %}[{{ loop.previtem }}|{{ loop.nextitem }}]{% endfor %}",
+            new Dictionary<string, object?>(StringComparer.Ordinal) { ["items"] = new List<object?> { "only" } });
+        Assert.Equal("[|]", result);
+    }
+
     // ── Scoping ──
 
     [Fact]
@@ -355,6 +425,33 @@ public class JinjaEvaluatorTests
     public void IsNotDefined_False()
     {
         Assert.Equal("False", Eval("{{ x is not defined }}", new Dictionary<string, object?>(StringComparer.Ordinal) { ["x"] = "val" }));
+    }
+
+    // ── Is undefined / is not undefined (#399: required by Qwen3.8-27B's
+    // "preserve_thinking is undefined" check on the path to every tool message) ──
+
+    [Fact]
+    public void IsUndefined_True_WhenVariableAbsent()
+    {
+        Assert.Equal("True", Eval("{{ x is undefined }}"));
+    }
+
+    [Fact]
+    public void IsUndefined_False_WhenVariableDefined()
+    {
+        Assert.Equal("False", Eval("{{ x is undefined }}", new Dictionary<string, object?>(StringComparer.Ordinal) { ["x"] = "val" }));
+    }
+
+    [Fact]
+    public void IsNotUndefined_True_WhenVariableDefined()
+    {
+        Assert.Equal("True", Eval("{{ x is not undefined }}", new Dictionary<string, object?>(StringComparer.Ordinal) { ["x"] = "val" }));
+    }
+
+    [Fact]
+    public void IsNotUndefined_False_WhenVariableAbsent()
+    {
+        Assert.Equal("False", Eval("{{ x is not undefined }}"));
     }
 
     // ── raise_exception ──
