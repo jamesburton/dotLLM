@@ -514,8 +514,9 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             PerplexityEvaluator.WindowObserver? observer = settings.PerWindow
                 ? (i, ppl, n) => Console.WriteLine($"window {i}: ppl={ppl:F6} scored={n}")
                 : null;
+            // Escaped: a LayerWindow renders as "[0..8)" and Spectre would read the '[' as a tag.
             CyclingPerplexityEvaluator.PhaseObserver onPhase = (i, count, w) =>
-                AnsiConsole.MarkupLine($"[grey]  layer window {i + 1}/{count}: {w}[/]");
+                AnsiConsole.MarkupLine($"[grey]  layer window {i + 1}/{count}: {Markup.Escape(w.ToString())}[/]");
 
             result = CyclingPerplexityEvaluator.Evaluate(
                 composite,
@@ -568,7 +569,10 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         table.AddRow("Scored tokens", $"{result.ScoredTokens:N0}");
         table.AddRow("Windows", $"{result.WindowCount:N0}");
         table.AddRow("Mode", mode == PerplexityMode.SlidingWindow ? "sliding-window" : "teacher-forced");
-        table.AddRow("Layer placement", placement);
+        // Escaped, not raw: the placement renders layer ranges as "[0..8)", and Spectre reads a
+        // leading '[' as the start of a markup tag — an unescaped row aborts the whole run with
+        // "malformed markup tag" instead of printing the result.
+        table.AddRow("Layer placement", Markup.Escape(placement));
         table.AddRow("Context", $"{context:N0}");
         table.AddRow("Stride", $"{stride:N0}");
         table.AddRow("Unscored prefix", $"{unscoredPrefix:N0}");
