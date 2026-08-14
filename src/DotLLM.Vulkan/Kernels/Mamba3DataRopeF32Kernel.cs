@@ -64,10 +64,9 @@ public sealed class Mamba3DataRopeF32Kernel : IDisposable
     /// The CUDA sibling kernel (native/kernels/mamba3_data_rope_f32.cu, driven by
     /// DotLLM.Cuda.CudaKernels.LaunchMamba3DataRopeF32) had the identical gap and was fixed
     /// in the same change.
-    /// <b>NOTE: this constant assumes the compiled mamba3_data_rope_f32.spv reflects the
-    /// fixed .comp source. If the .spv has not yet been rebuilt with glslc (see the #376 PR
-    /// description), raising this cap re-exposes the under-rotation bug at runtime for
-    /// numRopeAngles &gt; 64 — do not merge until the .spv is confirmed rebuilt.</b>
+    /// The compiled mamba3_data_rope_f32.spv was rebuilt from the fixed .comp source with
+    /// glslc (Strix Halo, Vulkan SDK) and verified 8/8 on Radeon 8060S plus 8/8 on the
+    /// NVIDIA Vulkan driver, including the numRopeAngles=128 discriminating cases.
     /// </summary>
     private const int MaxRopeAngles = 256;
 
