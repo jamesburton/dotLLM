@@ -35,7 +35,7 @@ public class NemotronHMoeConfigTests
     /// (2×SSM, 1×Attention, 3×MoE-FFN) + 1 trailing MTP layer (attention+MoE).</summary>
     private static GgufMetadata BuildNemotronHMoeMetadata(
         int[]? headCountKv = null, int[]? feedForwardLength = null, uint nextn = 1,
-        uint? blockCount = null)
+        uint? blockCount = null, Action<GgufTestData>? extra = null)
     {
         const string arch = "nemotron_h_moe";
         // layer:            0    1     2    3     4    5    | 6 (MTP)
@@ -68,6 +68,17 @@ public class NemotronHMoeConfigTests
             // they must at minimum not break this one).
             d.AddUInt32($"{arch}.expert_count", 128);
             d.AddUInt32($"{arch}.expert_used_count", 6);
+            d.AddUInt32($"{arch}.expert_feed_forward_length", 64);
+            d.AddUInt32($"{arch}.expert_shared_feed_forward_length", 96);
+            d.AddUInt32($"{arch}.expert_gating_func", 2); // sigmoid
+            d.AddBool($"{arch}.expert_weights_norm", true);
+            d.AddFloat32($"{arch}.expert_weights_scale", 2.5f);
+            if (extra is null)
+            {
+                d.AddUInt32($"{arch}.expert_group_count", 1);
+                d.AddUInt32($"{arch}.expert_group_used_count", 1);
+            }
+            extra?.Invoke(d);
         });
     }
 
@@ -94,6 +105,43 @@ public class NemotronHMoeConfigTests
             },
             config.HybridLayout.LayerKind);
     }
+
+    /// <summary>#375 slice 2 — the MoE config carries llama.cpp build_moe_ffn's exact
+    /// semantics: sigmoid gating, selection-only bias, weight renorm, scale 2.5,
+    /// ungated relu² experts, one shared expert of width 96.</summary>
+    [Fact]
+    public void Extract_NemotronHMoe_PopulatesSigmoidMoeConfig()
+    {
+        var config = GgufModelConfigExtractor.Extract(BuildNemotronHMoeMetadata());
+
+        Assert.NotNull(config.Moe);
+        var moe = config.Moe!;
+        Assert.Equal(128, moe.NumExperts);
+        Assert.Equal(6, moe.NumExpertsPerTok);
+        Assert.Equal(64, moe.MoeIntermediateSize);
+        Assert.Equal(96, moe.SharedExpertIntermediateSize);
+        Assert.Equal(1, moe.NumSharedExperts);
+        Assert.True(moe.SigmoidGating);
+        Assert.True(moe.HasSelectionBias);
+        Assert.True(moe.NormalizeExpertWeights);
+        Assert.Equal(2.5f, moe.ExpertWeightsScale);
+        Assert.True(moe.UngatedReluSquaredExperts);
+        Assert.False(moe.NormTopKProb);
+    }
+
+    /// <summary>Group-limited routing is unimplemented; a non-degenerate group config
+    /// must refuse loudly, not route wrong.</summary>
+    [Fact]
+    public void Extract_GroupedRouting_Throws()
+    {
+        var metadata = BuildNemotronHMoeMetadata(extra: d =>
+        {
+            d.AddUInt32("nemotron_h_moe.expert_group_count", 8);
+            d.AddUInt32("nemotron_h_moe.expert_group_used_count", 4);
+        });
+        Assert.Throws<InvalidDataException>(() => GgufModelConfigExtractor.Extract(metadata));
+    }
+
 
     /// <summary>
     /// The exclusive-kinds rule still holds for TRUNK layers: a non-trailing layer

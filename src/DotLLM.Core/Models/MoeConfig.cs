@@ -154,6 +154,47 @@ public sealed record MoeConfig
     public bool HasExpertBiases { get; init; }
 
     /// <summary>
+    /// When <c>true</c> the router scores experts with <b>sigmoid</b> instead
+    /// of softmax (llama.cpp <c>LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID</c>;
+    /// DeepSeek-V3 family, Nemotron-H-MoE). Gating weights are the sigmoid
+    /// probabilities of the selected experts.
+    /// </summary>
+    public bool SigmoidGating { get; init; }
+
+    /// <summary>
+    /// When <c>true</c> the model carries a per-expert selection bias tensor
+    /// (<c>blk.N.exp_probs_b.bias</c>, DeepSeek-V3's <c>e_score_correction_bias</c>).
+    /// Per llama.cpp <c>build_moe_ffn</c>: the bias is added to the
+    /// probabilities <b>for top-k selection only</b> — the gating weights are
+    /// gathered from the UNBIASED probabilities. Conflating the two changes
+    /// every routed output.
+    /// </summary>
+    public bool HasSelectionBias { get; init; }
+
+    /// <summary>
+    /// When <c>true</c> the gathered top-k gating weights are re-normalised by
+    /// their own sum (llama.cpp <c>expert_weights_norm</c>). Same operation as
+    /// <see cref="NormTopKProb"/> but keyed from GGUF metadata for
+    /// sigmoid-gated models, where it is NOT the default.
+    /// </summary>
+    public bool NormalizeExpertWeights { get; init; }
+
+    /// <summary>
+    /// Scale applied to the gating weights after normalisation (llama.cpp
+    /// <c>expert_weights_scale</c>; 2.5 for Nemotron-H-MoE, 1.0 = no-op).
+    /// </summary>
+    public float ExpertWeightsScale { get; init; } = 1.0f;
+
+    /// <summary>
+    /// When <c>true</c> each expert is an UNGATED squared-ReLU MLP —
+    /// <c>down(relu(up(x))²)</c> with no gate projection at all (llama.cpp
+    /// passes <c>nullptr</c> for <c>ffn_gate_exps</c> and
+    /// <c>LLM_FFN_RELU_SQR</c>; Nemotron-H-MoE). The shared expert, when
+    /// present, uses the same activation.
+    /// </summary>
+    public bool UngatedReluSquaredExperts { get; init; }
+
+    /// <summary>
     /// Returns true if layer <paramref name="layerIdx"/> is a routed-MoE
     /// layer under the current configuration. Checks the
     /// <see cref="MlpOnlyLayers"/> override first (forced dense), then the
