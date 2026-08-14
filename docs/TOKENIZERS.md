@@ -10,6 +10,20 @@
 
 Implementation: Trie for prefix matching, compiled regex. Vocabulary loaded from GGUF `tokenizer.ggml.tokens` + `tokenizer.ggml.merges`.
 
+**`tokenizer.ggml.pre` policy (issue #373, mirrors llama.cpp `llama_vocab`):** the model-specific
+pipeline is selected in `TiktokenPreTokenizer.GetRegexes`.
+
+- **Absent/empty** → GPT-2 default pipeline (llama.cpp's "missing pre-tokenizer type, using:
+  'default'").
+- **Unknown value** → `InvalidDataException` at load (llama.cpp throws here too). Escape hatch:
+  `DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER=1` proceeds with the GPT-2 default pipeline — never with
+  "no pre-tokenization", which silently mis-tokenizes.
+- Supported `pre` values: `default`/`gpt2`; `llama3`/`llama-v3`/`llama-bpe`/`falcon3`/`falcon-h1`/
+  `pixtral`/`midm-2.0`/`lfm2`/`jina-v5-nano` (one shared Llama-3 pipeline, as in llama.cpp);
+  `starcoder`/`refact`/`command-r`/`smollm`/`codeshell`/`exaone`/`minerva`/`mellum2`;
+  `deepseek-llm`; `deepseek-coder`; `gpt-4o`/`llama4`. New values are sourced from llama.cpp
+  `llama-vocab.cpp` (authoritative), never invented.
+
 ### SentencePiece BPE (Llama 2)
 
 - Unicode code-point level (not byte-level).

@@ -39,7 +39,11 @@ public static class GgufModelConfigExtractor
         // convert_hf_to_gguf.py: `block_count = num_hidden_layers + mtp_num_hidden_layers`).
         // Only Qwen3.5/3.6 (Qwen3HybridDense / Qwen3MoeHybrid) ship this key today — every other
         // architecture defaults to 0 and numTrunkLayers == numLayers, so nothing changes for them.
+        // nemotron_h_moe ships the same key (Nemotron 3.5 Lightning: 1 MTP layer
+        // appended as the final block, carrying BOTH head_count_kv and
+        // feed_forward_length — the trunk-exclusive kinds rule does not apply to it).
         int nextnPredictLayers = architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense
+                or Architecture.NemotronHMoe
             ? (int)metadata.GetUInt32OrDefault($"{arch}.nextn_predict_layers", 0)
             : 0;
         int numTrunkLayers = numLayers - nextnPredictLayers;
@@ -48,7 +52,7 @@ public static class GgufModelConfigExtractor
         // per-layer Int32 arrays whose entries are zero for layers of the wrong kind.
         // Build a HybridLayerLayout in that case; for pure-Transformer architectures
         // both keys are scalar UInt32.
-        HybridLayerLayout? hybridLayout = TryExtractHybridLayout(metadata, arch, numLayers);
+        HybridLayerLayout? hybridLayout = TryExtractHybridLayout(metadata, arch, numTrunkLayers, nextnPredictLayers);
 
         int intermediateSize;
         int numKvHeads;
@@ -151,6 +155,10 @@ public static class GgufModelConfigExtractor
         {
             moeConfig = ExtractGptOssMoeConfig(metadata, arch, intermediateSize);
         }
+        else if (architecture == Architecture.NemotronHMoe)
+        {
+            moeConfig = ExtractNemotronHMoeConfig(metadata, arch, intermediateSize);
+        }
 
         return new ModelConfig
         {
@@ -166,7 +174,7 @@ public static class GgufModelConfigExtractor
             MaxSequenceLength = maxSeqLen,
             NormEpsilon = normEps,
             AttentionType = attentionType,
-            ActivationFunction = architecture is Architecture.NemotronH or Architecture.BitNet
+            ActivationFunction = architecture is Architecture.NemotronH or Architecture.NemotronHMoe or Architecture.BitNet
                 ? ActivationFunction.ReluSquared
                 : ActivationFunction.SiLU,
             RoPEConfig = ropeConfig,
@@ -303,6 +311,61 @@ public static class GgufModelConfigExtractor
     /// = moe_intermediate_size per expert; <c>{arch}.leading_dense_block_count</c>
     /// = first_k_dense_replace (number of leading layers that stay dense FFN).
     /// </remarks>
+    /// <summary>
+    /// Extracts the <see cref="MoeConfig"/> for <c>nemotron_h_moe</c> (Nemotron 3.5
+    /// Lightning, issue #375). Anchored to llama.cpp's <c>build_moe_ffn</c> call in
+    /// <c>src/models/nemotron-h.cpp</c> (<c>build_ffn_layer</c>'s MoE branch — note the
+    /// separate nemotron-h-moe.cpp is a subclass shim): <b>sigmoid</b> gating with a
+    /// per-expert selection bias (<c>exp_probs_b</c>, applied to selection ONLY),
+    /// expert-weight renormalisation, weight scale (2.5 in the shipping checkpoint),
+    /// UNGATED squared-ReLU experts, and one shared relu² expert whose output is added
+    /// to the routed sum. Grouped routing keys ship as 1/1 (degenerate) and are
+    /// validated as such — group-limited routing is NOT implemented.
+    /// </summary>
+    private static MoeConfig ExtractNemotronHMoeConfig(GgufMetadata metadata, string arch, int denseIntermediate)
+    {
+        int expertCount = (int)metadata.GetUInt32($"{arch}.expert_count");
+        int expertUsed = (int)metadata.GetUInt32($"{arch}.expert_used_count");
+        int moeIntermediate = (int)metadata.GetUInt32OrDefault(
+            $"{arch}.expert_feed_forward_length", (uint)denseIntermediate);
+        int sharedFf = (int)metadata.GetUInt32OrDefault($"{arch}.expert_shared_feed_forward_length", 0);
+        int sharedCount = (int)metadata.GetUInt32OrDefault($"{arch}.expert_shared_count", (uint)(sharedFf > 0 ? 1 : 0));
+
+        // llama.cpp llama_expert_gating_func_type: 1 = softmax, 2 = sigmoid.
+        uint gatingFunc = metadata.GetUInt32OrDefault($"{arch}.expert_gating_func", 2);
+        if (gatingFunc != 2)
+            throw new InvalidDataException(
+                $"nemotron_h_moe expert_gating_func={gatingFunc} is not supported — only sigmoid (2) "
+                + "is implemented (issue #375), and every published checkpoint ships sigmoid.");
+
+        // Group-limited routing (DeepSeek-V3 node-limited top-k) is not implemented;
+        // the shipping checkpoint is degenerate (1 group, 1 used). Refuse loudly if a
+        // future file actually needs it rather than silently routing wrong.
+        uint groupCount = metadata.GetUInt32OrDefault($"{arch}.expert_group_count", 1);
+        uint groupUsed = metadata.GetUInt32OrDefault($"{arch}.expert_group_used_count", 1);
+        if (groupCount > 1 || groupUsed > 1)
+            throw new InvalidDataException(
+                $"nemotron_h_moe grouped expert routing (expert_group_count={groupCount}, "
+                + $"expert_group_used_count={groupUsed}) is not implemented (issue #375).");
+
+        return new MoeConfig
+        {
+            NumExperts = expertCount,
+            NumExpertsPerTok = expertUsed,
+            MoeIntermediateSize = moeIntermediate,
+            NormTopKProb = false, // sigmoid path uses NormalizeExpertWeights below instead
+            SharedExpertIntermediateSize = sharedFf > 0 ? sharedFf : null,
+            NumSharedExperts = sharedCount,
+            HasSharedExpertGate = false,
+            DecoderSparseStep = 1,
+            SigmoidGating = true,
+            HasSelectionBias = true, // blk.N.exp_probs_b.bias — verified present in the GGUF
+            NormalizeExpertWeights = metadata.GetBoolOrDefault($"{arch}.expert_weights_norm", false),
+            ExpertWeightsScale = metadata.GetFloat32OrDefault($"{arch}.expert_weights_scale", 1.0f),
+            UngatedReluSquaredExperts = true,
+        };
+    }
+
     private static MoeConfig? TryExtractDeepseekMoeConfig(GgufMetadata metadata, string arch,
                                                            int denseIntermediate, int numLayers)
     {
@@ -440,7 +503,8 @@ public static class GgufModelConfigExtractor
         };
     }
 
-    private static HybridLayerLayout? TryExtractHybridLayout(GgufMetadata metadata, string arch, int numLayers)
+    private static HybridLayerLayout? TryExtractHybridLayout(
+        GgufMetadata metadata, string arch, int numLayers, int trailingMtpLayers)
     {
         string kvKey = $"{arch}.attention.head_count_kv";
         string ffKey = $"{arch}.feed_forward_length";
@@ -452,12 +516,23 @@ public static class GgufModelConfigExtractor
         int[] headCountKv = metadata.GetInt32Array(kvKey);
         int[] feedForwardLength = metadata.GetInt32Array(ffKey);
 
-        if (headCountKv.Length != numLayers)
+        // The GGUF per-layer arrays cover block_count = trunk + MTP layers. MTP head
+        // layers (nemotron_h_moe.nextn_predict_layers, appended last) carry BOTH a KV
+        // head count and a feed-forward length, so they must be trimmed BEFORE the
+        // exclusive-kind classification below — llama.cpp does not run them in
+        // standard decode, and dotLLM's trunk NumLayers already excludes them.
+        int expectedLength = numLayers + trailingMtpLayers;
+        if (headCountKv.Length != expectedLength)
             throw new InvalidDataException(
-                $"'{kvKey}' array length {headCountKv.Length} does not match block_count {numLayers}.");
-        if (feedForwardLength.Length != numLayers)
+                $"'{kvKey}' array length {headCountKv.Length} does not match block_count {expectedLength}.");
+        if (feedForwardLength.Length != expectedLength)
             throw new InvalidDataException(
-                $"'{ffKey}' array length {feedForwardLength.Length} does not match block_count {numLayers}.");
+                $"'{ffKey}' array length {feedForwardLength.Length} does not match block_count {expectedLength}.");
+        if (trailingMtpLayers > 0)
+        {
+            headCountKv = headCountKv[..numLayers];
+            feedForwardLength = feedForwardLength[..numLayers];
+        }
 
         var kinds = new HybridLayerKind[numLayers];
         for (int i = 0; i < numLayers; i++)
@@ -613,6 +688,9 @@ public static class GgufModelConfigExtractor
             // V3 / V3-MoE — MLA + sigmoid-gated routing + group-norm experts.
             "deepseek3" => Architecture.DeepSeekV3,
             "nemotron_h" => Architecture.NemotronH,
+            // Nemotron-H hybrid stack + DeepSeek-V3-style MoE + optional MTP head
+            // (Nemotron 3.5 Lightning). Distinct llama.cpp arch from nemotron_h.
+            "nemotron_h_moe" => Architecture.NemotronHMoe,
             // Gemma 4 MoE text tower (llama.cpp `gemma4` arch). Dual head-dim /
             // dual KV-head / dual-RoPE-per-attention-type + MoE experts. See
             // BuildGemma4Config for the full GGUF → ModelConfig mapping.

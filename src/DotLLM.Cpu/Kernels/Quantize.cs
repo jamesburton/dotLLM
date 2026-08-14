@@ -18,19 +18,19 @@ public static unsafe partial class Quantize
     private const int GroupSize32 = 32;
 
     /// <summary>Q8_0 block size in bytes: 2 (Half d) + 32 (sbyte qs).</summary>
-    private const int Q8_0BlockBytes = 34;
+    private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
 
     /// <summary>Q5_0 block size in bytes: 2 (Half d) + 4 (qh) + 16 (qs).</summary>
-    private const int Q5_0BlockBytes = 22;
+    private const int Q5_0BlockBytes = QuantFormat.Q5_0BlockBytes;
 
     /// <summary>Q5_1 block size in bytes: 2 (Half d) + 2 (Half m) + 4 (qh) + 16 (qs).</summary>
-    private const int Q5_1BlockBytes = 24;
+    private const int Q5_1BlockBytes = QuantFormat.Q5_1BlockBytes;
 
     /// <summary>Q4_K super-block size in bytes: 2(d)+2(dmin)+12(scales)+128(qs).</summary>
-    private const int Q4_K_BlockBytes = 144;
+    private const int Q4_K_BlockBytes = QuantFormat.Q4_KBlockBytes;
 
     /// <summary>Q4_K super-block element count.</summary>
-    private const int KQuantGroupSize = 256;
+    private const int KQuantGroupSize = QuantFormat.KQuantGroupSize;
 
     /// <summary>
     /// Returns the number of bytes one quantized row of <paramref name="elementCount"/>

@@ -88,6 +88,13 @@ public static class CudaModelLoader
                     + "ModelLoader.LoadFromSafetensors (CPU), or VulkanMamba3TransformerModel.LoadFromSafetensors "
                     + "(Vulkan) instead.");
 
+            case Architecture.NemotronHMoe:
+                throw new NotSupportedException(
+                    "nemotron_h_moe (Nemotron 3.5 Lightning) is recognized but not yet runnable on "
+                    + "CUDA: the DeepSeek-V3-style MoE forward is not implemented. Note the smallest "
+                    + "published GGUF is ~17.6 GiB — larger than most single consumer GPUs. Tracked "
+                    + "in issue #375.");
+
             case Architecture.NemotronH:
             {
                 var nemotronH = Architectures.CudaNemotronHTransformerModel

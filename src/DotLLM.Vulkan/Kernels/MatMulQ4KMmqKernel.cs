@@ -1,4 +1,5 @@
 using DotLLM.Vulkan.Interop;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -33,10 +34,10 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class MatMulQ4KMmqKernel : IDisposable
 {
     /// <summary>Q4_K super-block: fp16 d + fp16 dmin + 12 scale bytes + 128 qs bytes.</summary>
-    public const int Q4KBlockBytes = 144;
+    public const int Q4KBlockBytes = QuantFormat.Q4_KBlockBytes;
 
     /// <summary>Elements per Q4_K super-block.</summary>
-    public const int Q4KGroupSize = 256;
+    public const int Q4KGroupSize = QuantFormat.KQuantGroupSize;
 
     // issue #139: 64×64 output tile per workgroup (16×16 threads × 4×4 register
     // tile each) — must match TILE_M/TILE_N in the shader.

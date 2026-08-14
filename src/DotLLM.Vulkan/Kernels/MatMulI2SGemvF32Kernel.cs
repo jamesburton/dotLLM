@@ -1,4 +1,5 @@
 using DotLLM.Vulkan.Interop;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -20,10 +21,10 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class MatMulI2SGemvF32Kernel : IDisposable
 {
     /// <summary>I2_S block: 128 ternary codes packed into 32 bytes.</summary>
-    public const int I2SBlockBytes = 32;
+    public const int I2SBlockBytes = QuantFormat.I2_SBlockBytes;
 
     /// <summary>Elements per I2_S block.</summary>
-    public const int I2SGroupSize = 128;
+    public const int I2SGroupSize = QuantFormat.TernaryGroupSize;
 
     private const int PushConstantBytes = 4 * sizeof(uint);
 

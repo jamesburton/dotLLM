@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 
 namespace DotLLM.Core.Lora;
@@ -298,10 +299,10 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
     /// GGUF on-disk Q8_0 layout and the
     /// <c>DotLLM.Cpu.Kernels.MatMul</c> kernel format.
     /// </summary>
-    public const int Q8_0BlockBytes = 34;
+    public const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
 
     /// <summary>Number of F32 elements per Q8_0 block.</summary>
-    public const int Q8_0GroupSize = 32;
+    public const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
 
     /// <summary>
     /// Returns the Q8_0 byte size for a row of <paramref name="elements"/>

@@ -1199,6 +1199,16 @@ public sealed class VulkanDevice : IDisposable
         ci.sType = VkStructureType.DeviceCreateInfo;
         ci.queueCreateInfoCount = 1;
         ci.pQueueCreateInfos = (nint)(&qci);
+        // pEnabledFeatures is deliberately left null — in particular
+        // `robustBufferAccess` stays OFF (issue #361 considered enabling it as
+        // defence in depth and decided against): (a) it taxes every SSBO access
+        // on some drivers, on the hot inference path; (b) it turns genuine
+        // sizing bugs into silent clamps instead of loud faults, the exact
+        // failure mode this project's verification history argues against.
+        // In-range access is instead guaranteed allocation-side: every packed
+        // upload is rounded up to a 4-byte multiple
+        // (VulkanWeights.AllocateAndUploadPacked) so the uint-funnel shaders'
+        // final read is always inside the buffer.
 
         // Stack-buffer for the (small) extension-name table. VK_KHR_external_memory
         // is a hard dependency of VK_EXT_external_memory_host and is core in 1.1,

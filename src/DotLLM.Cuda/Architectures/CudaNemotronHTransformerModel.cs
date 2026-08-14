@@ -61,8 +61,6 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
     private readonly int[] _ssmLayerOrdinal;
     private readonly int _numSsmLayers;
 
-    private readonly float _ropeTheta;
-    private readonly int _ropeDim;
 
     // Prefill dequant-to-F16 + cuBLAS-HGEMM scratch, shared by every projection whose weight
     // has no native F32 CUDA kernel — see Task 8's Gemm dispatcher.
@@ -170,7 +168,6 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         nint outputDevice, QuantizationType outputQt, int outputOutputDim, int outputInputDim,
         bool ownsOutputDevice,
         int[] kvSlotForLayer, int attentionLayerCount,
-        float ropeTheta, int ropeDim,
         CudaNemotronHForwardState state, CudaNemotronHSsmStateCache ssmCache,
         CudaStream stream, CudaCublasHandle cublas, CudaContext context, CudaKernels kernels,
         int deviceId, nint dequantScratchDevice)
@@ -190,8 +187,6 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         _ssm = config.SsmConfig!.Value;
         _kvSlotForLayer = kvSlotForLayer;
         _attentionLayerCount = attentionLayerCount;
-        _ropeTheta = ropeTheta;
-        _ropeDim = ropeDim;
         _state = state;
         _ssmCache = ssmCache;
         _stream = stream;
@@ -489,19 +484,8 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         }
         if (maxIntermediate == 0) maxIntermediate = hiddenSize;
 
-        // RoPE config — allow ropeDim==0 only when there are no attention layers (mirrors
-        // NemotronHTransformerModel.BuildFromPrebuiltWeights exactly).
-        int ropeDim = config.RoPEConfig?.DimensionCount ?? 0;
-        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        if (attentionLayerCount > 0)
-        {
-            if (ropeDim <= 0 || (ropeDim & 1) != 0)
-                throw new ArgumentException(
-                    $"NemotronH attention layers require an even rope_dim > 0 (got {ropeDim}).", nameof(config));
-            if (ropeDim > config.HeadDim)
-                throw new ArgumentException(
-                    $"rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.", nameof(config));
-        }
+        // Any RoPEConfig is ignored — nemotron_h applies no position encoding on
+        // attention (issue #372); mirrors the CPU model.
 
         var state = new CudaNemotronHForwardState(
             hiddenSize: hiddenSize,
@@ -529,7 +513,6 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
             outputNormDevice,
             outputDevice, outputQt, outputOutputDim, outputInputDim, ownsOutputDevice: true,
             kvSlotForLayer, attentionLayerCount,
-            ropeTheta, ropeDim,
             state, ssmCache, stream, cublas, context, kernels, deviceId, dequantScratchDevice);
     }
 
@@ -852,13 +835,9 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         Gemm(attn.KWeight, attn.KQt, _state.NormOutput, _state.KScratch, attn.KOutputDim, attn.KInputDim, seqLen);
         Gemm(attn.VWeight, attn.VQt, _state.NormOutput, _state.VScratch, attn.VOutputDim, attn.VInputDim, seqLen);
 
-        // Partial RoPE: RoPEType.Norm (GPT-J interleaved pairing) over the first _ropeDim dims
-        // of each head — matches NemotronHTransformerModel.ForwardAttentionBody's
-        // RoPE.Execute(..., RoPEType.Norm) call. LaunchRoPEF32's own doc comment already
-        // documents ropeType=0/freqDim=0/neoxPairOffset=0 as the correct shape for NemotronH.
-        _kernels.LaunchRoPEF32(_state.QScratch, _state.KScratch, _state.PositionsDevice,
-            seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta,
-            CudaKernels.ToCudaRopeType(RoPEType.Norm), streamH);
+        // NO position encoding here (issue #372): llama.cpp's nemotron-h.cpp and HF's
+        // NemotronHAttention rotate nothing — position information comes entirely
+        // from the Mamba2 layers. Mirrors the CPU model's ForwardAttentionBody.
 
         if (kvCache is not null)
         {

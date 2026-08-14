@@ -1,4 +1,5 @@
 using DotLLM.Vulkan.Interop;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -15,10 +16,10 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class Iq3XxsDequantF32Kernel : IDisposable
 {
     /// <summary>IQ3_XXS super-block: 2 + 64 + 32 = 98 bytes.</summary>
-    public const int IQ3_XXSBlockBytes = 98;
+    public const int IQ3_XXSBlockBytes = QuantFormat.IQ3_XXSBlockBytes;
 
     /// <summary>Elements per IQ3_XXS super-block.</summary>
-    public const int IQ3_XXSGroupSize = 256;
+    public const int IQ3_XXSGroupSize = QuantFormat.KQuantGroupSize;
 
     private const int PushConstantBytes = 2 * sizeof(uint);
 

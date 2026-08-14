@@ -1,3 +1,4 @@
+using System.IO;
 using System.Text.RegularExpressions;
 
 namespace DotLLM.Tokenizers.Bpe;
@@ -70,26 +71,60 @@ internal static class TiktokenPreTokenizer
         RegexOptions.Compiled),
     ];
 
+    // ── Tekken (Mistral NeMo / Pixtral-12B tokenizer family; also NVIDIA
+    // Nemotron-Nano-9B-v2). llama.cpp LLAMA_VOCAB_PRE_TYPE_TEKKEN. This is the
+    // ORIGINAL tokenizer.json pattern (quoted verbatim in llama-vocab.cpp:408);
+    // llama.cpp itself ships a lookahead-based rewrite only because std::regex
+    // lacks \p{Lu}-style classes — .NET supports them natively, so the faithful
+    // original is used here.
+    private static readonly Regex[] TekkenPipeline =
+    [
+        new(@"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+            RegexOptions.Compiled),
+    ];
+
     /// <summary>
     /// Returns the ordered pre-tokenization regex pipeline for the given GGUF
-    /// <c>tokenizer.ggml.pre</c> type, or <c>null</c> if the type is unknown or absent.
+    /// <c>tokenizer.ggml.pre</c> type. Mirrors llama.cpp's <c>llama_vocab</c> policy
+    /// (issue #373): an <b>absent</b> type falls back to the GPT-2 default pipeline
+    /// (llama.cpp logs "missing pre-tokenizer type, using: 'default'"), and an
+    /// <b>unknown</b> type throws — llama.cpp's exact behavior
+    /// (<c>throw std::runtime_error("unknown pre-tokenizer type: ...")</c>).
     /// </summary>
     /// <remarks>
-    /// A <c>null</c> result means the caller performs <b>no</b> pre-tokenization and BPE merges
-    /// run across the whole input. That is rarely what an unrecognized name should mean: merges
-    /// then cross boundaries the model was trained to respect, producing a token stream that
-    /// mostly matches the reference and diverges at a small number of sites — the failure mode
-    /// that motivated this table (see issue #237).
+    /// <para>Before #373 an unknown type returned <c>null</c>, which the caller treated as
+    /// "no pre-tokenization at all": BPE merges then cross boundaries the model was trained
+    /// to respect, producing a token stream that mostly matches the reference and silently
+    /// diverges at a small number of sites — the failure mode that motivated this table
+    /// (see issue #237). Loud failure is deliberate; do not soften it back to a fallback.</para>
+    /// <para>Escape hatch: set <c>DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER=1</c> to accept an
+    /// unknown type and use the GPT-2 default pipeline (NOT the old "none") — output quality
+    /// is then explicitly at the user's own risk.</para>
     /// </remarks>
-    internal static Regex[]? GetRegexes(string? preType) => preType switch
+    /// <exception cref="InvalidDataException">
+    /// The type is non-empty and not in the table, and the escape hatch is unset.
+    /// </exception>
+    internal static Regex[] GetRegexes(string? preType) => preType switch
     {
-        "default" or "gpt2" => Gpt2Pipeline,
-        "llama3" or "llama-bpe" => Llama3Pipeline,
+        null or "" or "default" or "gpt2" => Gpt2Pipeline,
+        // llama.cpp routes all of these through LLAMA_VOCAB_PRE_TYPE_LLAMA3
+        // (llama-vocab.cpp, the "llama3" case block).
+        "llama3" or "llama-v3" or "llama-bpe" or "falcon3" or "falcon-h1"
+            or "pixtral" or "midm-2.0" or "lfm2" or "jina-v5-nano" => Llama3Pipeline,
         "starcoder" or "refact" or "command-r" or "smollm"
             or "codeshell" or "exaone" or "minerva" or "mellum2" => StarCoderPipeline,
         "deepseek-llm" => DeepSeekLlmPipeline,
         "deepseek-coder" => DeepSeekCoderPipeline,
         "gpt-4o" or "llama4" => Gpt4oPipeline,
-        _ => null,
+        "tekken" => TekkenPipeline,
+        _ => Environment.GetEnvironmentVariable("DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER") == "1"
+            ? Gpt2Pipeline
+            : throw new InvalidDataException(
+                $"Unknown tokenizer.ggml.pre type: '{preType}'. dotLLM has no pre-tokenization " +
+                "regex pipeline for it, and running without one silently mis-tokenizes (issue #373; " +
+                "llama.cpp throws on this too). Either add the pipeline to TiktokenPreTokenizer " +
+                "(source it from llama.cpp llama-vocab.cpp), or set " +
+                "DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER=1 to proceed with the GPT-2 default pipeline " +
+                "at your own risk."),
     };
 }

@@ -1,3 +1,4 @@
+using DotLLM.Core.Configuration;
 using DotLLM.Vulkan.Interop;
 
 namespace DotLLM.Vulkan.Kernels;
@@ -32,7 +33,7 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class RmsNormQuantizeQ8_1FusedKernel : IDisposable
 {
     /// <summary>Elements per Q8_1 block (must match <see cref="QuantizeQ8_1Kernel.GroupSize"/>).</summary>
-    public const int GroupSize = 32;
+    public const int GroupSize = QuantFormat.LegacyGroupSize;
 
     private const int PushConstantBytes = 3 * sizeof(uint); // n, eps, blocksPerRow
 

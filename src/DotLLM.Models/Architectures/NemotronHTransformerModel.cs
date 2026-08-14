@@ -21,9 +21,9 @@ namespace DotLLM.Models.Architectures;
 /// </summary>
 public sealed unsafe class NemotronHTransformerModel : IModel
 {
-    private const int Q8_0BlockBytes = 34;
-    private const int Q8_0GroupSize = 32;
-    private const int Q8_1GroupSize = 32;
+    private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
+    private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
+    private const int Q8_1GroupSize = QuantFormat.LegacyGroupSize;
 
     private readonly GgufFile? _gguf; // keep alive (null when constructed from prebuilt weights)
     private readonly NemotronHLayerWeights[] _layers;
@@ -47,10 +47,6 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     // Ordinal mapping: physical layer index -> index into _ssmCache for SSM layers; -1 otherwise.
     private readonly int[] _ssmLayerOrdinal;
     private readonly int _numSsmLayers;
-
-    private readonly float[] _ropeCosTable;
-    private readonly float[] _ropeSinTable;
-    private readonly int _ropeDim;
 
     private readonly NemotronHForwardState _state;
     private readonly SsmStateCache _ssmCache;
@@ -76,8 +72,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         float[] outputNormWeight,
         nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType,
         nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim,
-        int[] kvSlotForLayer, int attentionLayerCount,
-        float[] ropeCosTable, float[] ropeSinTable, int ropeDim)
+        int[] kvSlotForLayer, int attentionLayerCount)
     {
         Config = config;
         _gguf = gguf;
@@ -93,9 +88,6 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         _ssm = config.SsmConfig!.Value;
         _kvSlotForLayer = kvSlotForLayer;
         _attentionLayerCount = attentionLayerCount;
-        _ropeCosTable = ropeCosTable;
-        _ropeSinTable = ropeSinTable;
-        _ropeDim = ropeDim;
 
         _ssmLayerOrdinal = new int[config.NumLayers];
         int ssmOrdinal = 0;
@@ -139,9 +131,9 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     /// </summary>
     public static NemotronHTransformerModel LoadFromGguf(GgufFile gguf, ModelConfig config)
     {
-        if (config.Architecture != Architecture.NemotronH)
+        if (config.Architecture is not (Architecture.NemotronH or Architecture.NemotronHMoe))
             throw new ArgumentException(
-                $"NemotronHTransformerModel requires Architecture.NemotronH, got {config.Architecture}.",
+                $"NemotronHTransformerModel requires Architecture.NemotronH/NemotronHMoe, got {config.Architecture}.",
                 nameof(config));
         if (config.HybridLayout is null)
             throw new ArgumentException("NemotronH config must have HybridLayout populated.", nameof(config));
@@ -177,10 +169,11 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             outputM = embDesc.Shape[1];
         }
 
-        int ropeDim = config.RoPEConfig?.DimensionCount ?? 0;
-        if (ropeDim <= 0)
-            throw new InvalidDataException(
-                "NemotronH requires rope.dimension_count in GGUF metadata (expected 78 for Nemotron-3).");
+        // NO RoPE for nemotron_h (issue #372): llama.cpp's nemotron-h.cpp and HF's
+        // NemotronHAttention apply no position encoding on the attention layers —
+        // position information comes entirely from the Mamba2 layers. The GGUF
+        // rope.* keys (rope.dimension_count = head_dim) are converter artifacts
+        // llama.cpp never consumes, so they are neither required nor validated here.
 
         var layers = new NemotronHLayerWeights[config.NumLayers];
         var kvSlotForLayer = new int[config.NumLayers];
@@ -188,39 +181,16 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         for (int i = 0; i < config.NumLayers; i++)
         {
             layers[i] = LoadLayer(i, dataBase, tensors, config, layout, ssm);
-
-            if (layout.LayerKind[i] == HybridLayerKind.Attention)
-            {
-                // RoPE preconditions: even, ≤ head_dim. A strict rope_dim == 78 check was the
-                // Nemotron-3 4B Q4_K_M case from DESIGN.md §2, but other nemotron_h variants
-                // (e.g., the Ollama nemotron-3-nano 4B) use full-head RoPE with rope_dim == head_dim.
-                if ((ropeDim & 1) != 0)
-                    throw new InvalidDataException(
-                        $"NemotronH rope_dim={ropeDim} must be even for pair-wise rotation.");
-                if (ropeDim > config.HeadDim)
-                    throw new InvalidDataException(
-                        $"NemotronH attention layer {i}: rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.");
-
-                kvSlotForLayer[i] = attentionLayerCount++;
-            }
-            else
-            {
-                kvSlotForLayer[i] = -1;
-            }
+            kvSlotForLayer[i] = layout.LayerKind[i] == HybridLayerKind.Attention
+                ? attentionLayerCount++
+                : -1;
         }
-
-        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        int halfRope = ropeDim / 2;
-        var ropeCos = new float[config.MaxSequenceLength * halfRope];
-        var ropeSin = new float[config.MaxSequenceLength * halfRope];
-        RoPE.PrecomputeFrequencyTable(config.MaxSequenceLength, ropeDim, ropeTheta, ropeCos, ropeSin);
 
         return new NemotronHTransformerModel(
             config, gguf, layers, outputNormWeight,
             embPtr, embDesc.QuantizationType,
             outputPtr, outputQt, outputM, outputK,
-            kvSlotForLayer, attentionLayerCount,
-            ropeCos, ropeSin, ropeDim);
+            kvSlotForLayer, attentionLayerCount);
     }
 
     /// <summary>
@@ -241,9 +211,9 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType,
         nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim)
     {
-        if (config.Architecture != Architecture.NemotronH)
+        if (config.Architecture is not (Architecture.NemotronH or Architecture.NemotronHMoe))
             throw new ArgumentException(
-                $"NemotronHTransformerModel requires Architecture.NemotronH, got {config.Architecture}.",
+                $"NemotronHTransformerModel requires Architecture.NemotronH/NemotronHMoe, got {config.Architecture}.",
                 nameof(config));
         if (config.HybridLayout is null)
             throw new ArgumentException("NemotronH config must have HybridLayout populated.", nameof(config));
@@ -265,36 +235,13 @@ public sealed unsafe class NemotronHTransformerModel : IModel
                 : -1;
         }
 
-        int ropeDim = config.RoPEConfig?.DimensionCount ?? 0;
-        // Allow ropeDim==0 when there are no attention layers.
-        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        int halfRope = ropeDim / 2;
-        float[] ropeCos, ropeSin;
-        if (attentionLayerCount > 0)
-        {
-            if (ropeDim <= 0 || (ropeDim & 1) != 0)
-                throw new ArgumentException(
-                    $"NemotronH attention layers require an even rope_dim > 0 (got {ropeDim}).", nameof(config));
-            if (ropeDim > config.HeadDim)
-                throw new ArgumentException(
-                    $"rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.", nameof(config));
-
-            ropeCos = new float[config.MaxSequenceLength * halfRope];
-            ropeSin = new float[config.MaxSequenceLength * halfRope];
-            RoPE.PrecomputeFrequencyTable(config.MaxSequenceLength, ropeDim, ropeTheta, ropeCos, ropeSin);
-        }
-        else
-        {
-            ropeCos = Array.Empty<float>();
-            ropeSin = Array.Empty<float>();
-        }
-
+        // Any RoPEConfig on the ModelConfig is ignored — nemotron_h applies no
+        // position encoding on attention (issue #372; see ForwardAttentionBody).
         return new NemotronHTransformerModel(
             config, gguf: null, layers, outputNormWeight,
             tokenEmbedWeight, tokenEmbedQuantType,
             outputWeight, outputQuantType, outputOutputDim, outputInputDim,
-            kvSlotForLayer, attentionLayerCount,
-            ropeCos, ropeSin, ropeDim);
+            kvSlotForLayer, attentionLayerCount);
     }
 
     private static NemotronHLayerWeights LoadLayer(
@@ -324,6 +271,13 @@ public sealed unsafe class NemotronHTransformerModel : IModel
                 AttnNormWeight = attnNormWeight,
                 Attention = LoadAttentionLayer(prefix, dataBase, tensors, config, layout.HeadCountKv[layerIdx]),
             },
+            // An FFN-classified layer is MoE iff the router tensor exists (nemotron_h_moe).
+            HybridLayerKind.Ffn when tensors.ContainsKey($"{prefix}.ffn_gate_inp.weight") =>
+                new NemotronHLayerWeights
+                {
+                    AttnNormWeight = attnNormWeight,
+                    Moe = LoadMoeLayer(prefix, dataBase, tensors, config),
+                },
             HybridLayerKind.Ffn => new NemotronHLayerWeights
             {
                 AttnNormWeight = attnNormWeight,
@@ -429,8 +383,8 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     {
         if (tensors.ContainsKey($"{prefix}.ffn_gate.weight"))
             throw new InvalidDataException(
-                $"{prefix}.ffn_gate.weight present — Nemotron-H FFN is non-gated (squared-ReLU). " +
-                "This GGUF may be mislabelled or a MoE variant (nemotron_h_moe), which is unsupported.");
+                $"{prefix}.ffn_gate.weight present — Nemotron-H FFN is non-gated (squared-ReLU); " +
+                "this GGUF does not match the architecture's tensor convention.");
 
         var up = tensors[$"{prefix}.ffn_up.weight"];
         var down = tensors[$"{prefix}.ffn_down.weight"];
@@ -448,6 +402,68 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             DownOutputDim = down.Shape[1],
 
             IntermediateSize = intermediateSize,
+        };
+    }
+
+    /// <summary>
+    /// Loads a nemotron_h_moe routed-MoE FFN layer (issue #375). Requires
+    /// <see cref="ModelConfig.Moe"/> (populated by the GGUF extractor) and the six
+    /// MoE tensors llama.cpp's nemotron-h graph consumes: router, selection bias, fused
+    /// up/down expert banks, and the shared expert's up/down.
+    /// </summary>
+    private static NemotronHMoeWeights LoadMoeLayer(
+        string prefix, nint dataBase,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
+        ModelConfig config)
+    {
+        var moeCfg = config.Moe ?? throw new InvalidDataException(
+            $"{prefix}: ffn_gate_inp.weight present but ModelConfig.MoeConfig is null — " +
+            "the GGUF is missing the expert_* metadata keys.");
+
+        var gateInp = tensors[$"{prefix}.ffn_gate_inp.weight"];
+        var probsB = tensors[$"{prefix}.exp_probs_b.bias"];
+        var upExps = tensors[$"{prefix}.ffn_up_exps.weight"];
+        var downExps = tensors[$"{prefix}.ffn_down_exps.weight"];
+        var upShexp = tensors[$"{prefix}.ffn_up_shexp.weight"];
+        var downShexp = tensors[$"{prefix}.ffn_down_shexp.weight"];
+
+        int hidden = config.HiddenSize;
+        int moeInter = moeCfg.MoeIntermediateSize;
+        int nExpert = moeCfg.NumExperts;
+
+        if (upExps.Shape.Rank != 3 || upExps.Shape[0] != hidden || upExps.Shape[1] != moeInter || upExps.Shape[2] != nExpert)
+            throw new InvalidDataException(
+                $"{prefix}.ffn_up_exps.weight has unexpected shape; expected [{hidden},{moeInter},{nExpert}].");
+        if (downExps.Shape.Rank != 3 || downExps.Shape[0] != moeInter || downExps.Shape[1] != hidden || downExps.Shape[2] != nExpert)
+            throw new InvalidDataException(
+                $"{prefix}.ffn_down_exps.weight has unexpected shape; expected [{moeInter},{hidden},{nExpert}].");
+        if (probsB.Shape.ElementCount != nExpert)
+            throw new InvalidDataException(
+                $"{prefix}.exp_probs_b.bias length {probsB.Shape.ElementCount}, expected {nExpert}.");
+
+        int sharedInter = upShexp.Shape[1];
+
+        return new NemotronHMoeWeights
+        {
+            GateInpWeight = dataBase + (nint)gateInp.DataOffset,
+            GateInpQuantType = gateInp.QuantizationType,
+            SelectionBias = DequantizeF32(dataBase, probsB, nExpert),
+            UpExpsWeight = dataBase + (nint)upExps.DataOffset,
+            UpExpsQuantType = upExps.QuantizationType,
+            UpPerExpertBytes = Dequantize.RowByteSize(hidden, upExps.QuantizationType) * moeInter,
+            DownExpsWeight = dataBase + (nint)downExps.DataOffset,
+            DownExpsQuantType = downExps.QuantizationType,
+            DownPerExpertBytes = Dequantize.RowByteSize(moeInter, downExps.QuantizationType) * hidden,
+            UpShexpWeight = dataBase + (nint)upShexp.DataOffset,
+            UpShexpQuantType = upShexp.QuantizationType,
+            DownShexpWeight = dataBase + (nint)downShexp.DataOffset,
+            DownShexpQuantType = downShexp.QuantizationType,
+            NumExperts = nExpert,
+            NumExpertsPerTok = moeCfg.NumExpertsPerTok,
+            MoeIntermediateSize = moeInter,
+            SharedIntermediateSize = sharedInter,
+            NormalizeWeights = moeCfg.NormalizeExpertWeights,
+            WeightsScale = moeCfg.ExpertWeightsScale,
         };
     }
 
@@ -515,6 +531,10 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             char kindTag;
             switch (kinds[layer])
             {
+                case HybridLayerKind.Ffn when lw.Moe is not null:
+                    ForwardMoeFfnBody(lw.Moe, seqLen, hiddenSize, normOut);
+                    kindTag = 'M';
+                    break;
                 case HybridLayerKind.Ffn:
                     ForwardFfnBody(lw.Ffn!, seqLen, hiddenSize, normOut, ffnMid, inputQ8Scratch);
                     kindTag = 'F';
@@ -675,6 +695,114 @@ public sealed unsafe class NemotronHTransformerModel : IModel
              ffn.DownOutputDim, ffn.DownInputDim, seqLen, preQuantDown);
     }
 
+    /// <summary>
+    /// nemotron_h_moe routed-MoE FFN body (issue #375), anchored to llama.cpp's
+    /// <c>build_moe_ffn</c> as called from <c>nemotron-h.cpp</c>'s <c>build_ffn_layer</c>:
+    /// router on the FULL hidden input, sigmoid, plus selection bias (SELECTION ONLY),
+    /// top-k, weights = UNBIASED probabilities of the selected experts, optional
+    /// renorm by their sum (denominator clamped like llama.cpp's F16-min clamp),
+    /// times weights scale, weighted sum of ungated relu-squared experts, plus shared
+    /// relu-squared expert. Reads pre-normed activations from <paramref name="normOut"/>
+    /// and writes the result back to the same buffer (same contract as the other
+    /// sub-layer bodies). Correctness-first: per-token GEMVs into pooled scratch.
+    /// </summary>
+    private static void ForwardMoeFfnBody(NemotronHMoeWeights moe, int seqLen, int hiddenSize, float* normOut)
+    {
+        int nExpert = moe.NumExperts;
+        int topK = moe.NumExpertsPerTok;
+        int moeInter = moe.MoeIntermediateSize;
+        int sharedInter = moe.SharedIntermediateSize;
+
+        var pool = System.Buffers.ArrayPool<float>.Shared;
+        float[] hBuf = pool.Rent(hiddenSize);
+        float[] logitsBuf = pool.Rent(nExpert);
+        float[] selBuf = pool.Rent(nExpert);
+        float[] midBuf = pool.Rent(Math.Max(moeInter, sharedInter));
+        float[] outBuf = pool.Rent(hiddenSize);
+        float[] accBuf = pool.Rent(hiddenSize);
+        int[] topIdx = new int[topK];
+        try
+        {
+            fixed (float* h = hBuf, logits = logitsBuf, mid = midBuf, expOut = outBuf)
+            {
+                Span<float> w = stackalloc float[topK];
+                for (int t = 0; t < seqLen; t++)
+                {
+                    // normOut doubles as the output buffer, so snapshot the token's input.
+                    new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize)
+                        .CopyTo(hBuf.AsSpan(0, hiddenSize));
+
+                    // Router logits on the FULL hidden input, then sigmoid probabilities.
+                    Gemm(moe.GateInpWeight, moe.GateInpQuantType, h, logits, nExpert, hiddenSize, 1, null);
+                    System.Numerics.Tensors.TensorPrimitives.Sigmoid(
+                        logitsBuf.AsSpan(0, nExpert), logitsBuf.AsSpan(0, nExpert));
+
+                    // Selection scores = probs + bias. The bias biases SELECTION ONLY —
+                    // gating weights below read the unbiased probabilities.
+                    for (int e = 0; e < nExpert; e++)
+                        selBuf[e] = logitsBuf[e] + moe.SelectionBias[e];
+
+                    // Top-k selection (k = 6 over 128; simple selection is fine here).
+                    for (int k2 = 0; k2 < topK; k2++)
+                    {
+                        int best = -1;
+                        float bestV = float.NegativeInfinity;
+                        for (int e = 0; e < nExpert; e++)
+                        {
+                            if (selBuf[e] > bestV) { bestV = selBuf[e]; best = e; }
+                        }
+                        topIdx[k2] = best;
+                        selBuf[best] = float.NegativeInfinity;
+                    }
+
+                    // Gating weights from the UNBIASED probabilities; optional renorm
+                    // (llama.cpp clamps the denominator to the smallest normal F16), then scale.
+                    float sum = 0f;
+                    for (int k2 = 0; k2 < topK; k2++) { w[k2] = logitsBuf[topIdx[k2]]; sum += w[k2]; }
+                    if (moe.NormalizeWeights)
+                    {
+                        float denom = MathF.Max(sum, 6.103515625e-5f);
+                        for (int k2 = 0; k2 < topK; k2++) w[k2] /= denom;
+                    }
+                    if (moe.WeightsScale != 0f && moe.WeightsScale != 1f)
+                    {
+                        for (int k2 = 0; k2 < topK; k2++) w[k2] *= moe.WeightsScale;
+                    }
+
+                    accBuf.AsSpan(0, hiddenSize).Clear();
+
+                    // Routed experts: ungated relu-squared MLP per selected expert, weighted sum.
+                    for (int k2 = 0; k2 < topK; k2++)
+                    {
+                        int e = topIdx[k2];
+                        nint upPtr = moe.UpExpsWeight + (nint)(e * moe.UpPerExpertBytes);
+                        nint downPtr = moe.DownExpsWeight + (nint)(e * moe.DownPerExpertBytes);
+
+                        Gemm(upPtr, moe.UpExpsQuantType, h, mid, moeInter, hiddenSize, 1, null);
+                        ReluSquared.Execute(midBuf.AsSpan(0, moeInter), midBuf.AsSpan(0, moeInter));
+                        Gemm(downPtr, moe.DownExpsQuantType, mid, expOut, hiddenSize, moeInter, 1, null);
+
+                        float wk = w[k2];
+                        for (int i = 0; i < hiddenSize; i++) accBuf[i] += wk * expOut[i];
+                    }
+
+                    // Shared expert (same ungated relu-squared, on the full input), added unweighted.
+                    Gemm(moe.UpShexpWeight, moe.UpShexpQuantType, h, mid, sharedInter, hiddenSize, 1, null);
+                    ReluSquared.Execute(midBuf.AsSpan(0, sharedInter), midBuf.AsSpan(0, sharedInter));
+                    Gemm(moe.DownShexpWeight, moe.DownShexpQuantType, mid, expOut, hiddenSize, sharedInter, 1, null);
+                    for (int i = 0; i < hiddenSize; i++) accBuf[i] += expOut[i];
+
+                    accBuf.AsSpan(0, hiddenSize).CopyTo(new Span<float>(normOut + t * hiddenSize, hiddenSize));
+                }
+            }
+        }
+        finally
+        {
+            pool.Return(hBuf); pool.Return(logitsBuf); pool.Return(selBuf);
+            pool.Return(midBuf); pool.Return(outBuf); pool.Return(accBuf);
+        }
+    }
+
     private void ForwardAttentionBody(
         NemotronHAttentionWeights attn, int layer, int seqLen, ReadOnlySpan<int> positions,
         float* normOut, float* q, float* k, float* v, float* attnOut,
@@ -686,13 +814,12 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         Gemm(attn.KWeight, attn.KQuantType, normOut, k, attn.KOutputDim, attn.KInputDim, seqLen, preQuantizedInput: null);
         Gemm(attn.VWeight, attn.VQuantType, normOut, v, attn.VOutputDim, attn.VInputDim, seqLen, preQuantizedInput: null);
 
-        // Partial RoPE: rotates the first _ropeDim=78 dims of each head, leaves the remainder untouched.
-        RoPE.Execute(
-            new Span<float>(q, seqLen * numHeads * headDim),
-            new Span<float>(k, seqLen * kvStride),
-            positions,
-            numHeads, numKvHeads, headDim, _ropeDim,
-            _ropeCosTable, _ropeSinTable, RoPEType.Norm);
+        // NO position encoding (issue #372). Both references apply nothing here:
+        // llama.cpp src/models/nemotron-h.cpp goes straight from build_qkv to
+        // build_attn (no rope token in the file), and HF transformers'
+        // NemotronHAttention.forward never calls apply_rotary_pos_emb. Position
+        // information comes entirely from the Mamba2 layers. The GGUF
+        // rope.dimension_count key is a converter artifact and is ignored.
 
         if (kvCache is not null)
         {

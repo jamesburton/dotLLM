@@ -83,7 +83,10 @@ public sealed class BpeTokenizer : ITokenizer
     /// <param name="tokenTypes">Per-token type flags. Null = all normal.</param>
     /// <param name="bosId">Beginning-of-sequence token ID.</param>
     /// <param name="eosId">End-of-sequence token ID.</param>
-    /// <param name="preTokenizerType">GGUF <c>tokenizer.ggml.pre</c> value (e.g., "llama3", "gpt2"). Null = no pre-tokenization.</param>
+    /// <param name="preTokenizerType">GGUF <c>tokenizer.ggml.pre</c> value (e.g., "llama3", "gpt2").
+    /// Null/absent = the GPT-2 default pipeline (llama.cpp's "missing pre-tokenizer type" fallback);
+    /// an unknown value throws <see cref="System.IO.InvalidDataException"/> unless
+    /// <c>DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER=1</c> (issue #373).</param>
     public static BpeTokenizer CreateTiktoken(
         string[] tokens, string[] merges, int[]? tokenTypes,
         int bosId, int eosId, string? preTokenizerType = null)

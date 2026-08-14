@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -27,12 +28,12 @@ namespace DotLLM.Cpu.Kernels;
 public static unsafe partial class Dequantize
 {
     /// <summary>IQ3_XXS block size in bytes: 2(d) + 3*(QK_K/8) = 2 + 96 = 98 / 256 elements (3.0625 bpw).</summary>
-    internal const int IQ3_XXS_BlockBytes = 98;
+    internal const int IQ3_XXS_BlockBytes = QuantFormat.IQ3_XXSBlockBytes;
 
     /// <summary>IQ3_S block size in bytes:
     /// 2(d) + QK_K/4 (qs=64) + QK_K/32 (qh=8) + QK_K/8 (signs=32) + QK_K/64 (scales=4)
     /// = 2 + 64 + 8 + 32 + 4 = 110 / 256 elements (3.4375 bpw).</summary>
-    internal const int IQ3_S_BlockBytes = 110;
+    internal const int IQ3_S_BlockBytes = QuantFormat.IQ3_SBlockBytes;
 
     /// <summary>
     /// <c>iq3xxs_grid</c> from ggml-common.h — 256 entries × 4 unsigned bytes.

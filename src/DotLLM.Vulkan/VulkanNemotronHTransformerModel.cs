@@ -111,7 +111,6 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private readonly MatMulBf16GemvF32Kernel _matmulBf16;
     private readonly MatMulBf16GemmF32Kernel _matmulBf16Gemm;
     private readonly RmsNormF32Kernel _rmsnorm;
-    private readonly RopeF32Kernel _rope;
     private readonly AttentionF32Kernel _attention;
     /// <summary>
     /// Flash-Attention F32 kernel for the GQA prefill path (seqQ &gt; 1). Null
@@ -155,8 +154,6 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private readonly VulkanDevice.SubmitContext _submit;
     private readonly bool _ownsDevice;
 
-    private readonly int _ropeDim;
-    private readonly float _ropeTheta;
 
     // Phase 5f mirror — ForwardBatch lm_head-only fusion scratch. Lazy-allocated on
     // first batched call (zero VRAM cost when only Forward is used). Holds a stacked
@@ -219,7 +216,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         MatMulF16GemvF32Kernel matmulF16, MatMulF16GemmF32Kernel matmulF16Gemm,
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
-        RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
+        RmsNormF32Kernel rmsnorm,
         AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
         VulkanSplitKvAttentionKernel? splitKvAttention,
         SwiGluF32Kernel swiglu, AddKernel add, BiasAddF32Kernel biasAdd,
@@ -227,8 +224,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         Mamba2SelectiveScanF32Kernel mamba2Scan, SsmDSkipF32Kernel ssmDSkip,
         GroupRmsNormF32Kernel groupRmsNorm, ReluSquaredInplaceF32Kernel reluSquared,
         SsmSplitXbcF32Kernel ssmSplitXbc,
-        VulkanDevice.SubmitContext submit,
-        int ropeDim, float ropeTheta)
+        VulkanDevice.SubmitContext submit)
     {
         _device = device;
         _ownsDevice = ownsDevice;
@@ -280,7 +276,6 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulBf16 = matmulBf16;
         _matmulBf16Gemm = matmulBf16Gemm;
         _rmsnorm = rmsnorm;
-        _rope = rope;
         _attention = attention;
         _flashAttention = flashAttention;
         _splitKvAttention = splitKvAttention;
@@ -296,8 +291,6 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _ssmSplitXbc = ssmSplitXbc;
 
         _submit = submit;
-        _ropeDim = ropeDim;
-        _ropeTheta = ropeTheta;
     }
 
     /// <summary>
@@ -436,18 +429,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         }
         if (maxIntermediate == 0) maxIntermediate = config.HiddenSize;
 
-        // Validate RoPE config when there are attention layers.
-        int ropeDim = config.RoPEConfig?.DimensionCount ?? 0;
-        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        if (attentionLayerCount > 0)
-        {
-            if (ropeDim <= 0 || (ropeDim & 1) != 0)
-                throw new ArgumentException(
-                    $"NemotronH attention layers require an even rope_dim > 0 (got {ropeDim}).", nameof(config));
-            if (ropeDim > config.HeadDim)
-                throw new ArgumentException(
-                    $"rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.", nameof(config));
-        }
+        // Any RoPEConfig is ignored — nemotron_h applies no position encoding on
+        // attention (issue #372); mirrors the CPU model.
 
         // Upload weights and allocate scratch.
         var weights = VulkanNemotronHWeights.Upload(device, config, cpuLayers, outputNormWeight,
@@ -528,7 +511,6 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         var matmulBf16 = MatMulBf16GemvF32Kernel.Create(device, spvDir);
         var matmulBf16Gemm = MatMulBf16GemmF32Kernel.Create(device, spvDir);
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
-        var rope = RopeF32Kernel.Create(device, spvDir);
         var attention = AttentionF32Kernel.Create(device, spvDir);
         VulkanFlashAttentionF32Kernel? flashAttention =
             VulkanTransformerModel.IsFlashAttentionDisabled() || config.HeadDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
@@ -573,11 +555,10 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             matmulIq1S, matmulIq1SGemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
-            rmsnorm, rope, attention, flashAttention, splitKvAttention, swiglu, add, biasAdd,
+            rmsnorm, attention, flashAttention, splitKvAttention, swiglu, add, biasAdd,
             conv1dCausal, siluInplace, mamba2Scan, ssmDSkip, groupRmsNorm, reluSquared,
             ssmSplitXbc,
-            submit,
-            ropeDim, ropeTheta);
+            submit);
     }
 
     /// <inheritdoc/>
@@ -1128,11 +1109,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             outputDim: attnW.VOutputDim, inputDim: attnW.VInputDim, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        // Partial RoPE on Q/K (only the first _ropeDim dims of each head).
-        _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
-            seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
-            headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
-            variant: RopeF32Kernel.Variant.Norm);
+        // NO position encoding here (issue #372): llama.cpp's nemotron-h.cpp and HF's
+        // NemotronHAttention rotate nothing — position information comes entirely
+        // from the Mamba2 layers. Mirrors the CPU model's ForwardAttentionBody.
 
         VulkanDevice.Buffer kSrc, vSrc;
         int seqKv;
@@ -1247,7 +1226,6 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulBf16.InvalidateDescriptorCache();
         _matmulBf16Gemm.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
-        _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
         _flashAttention?.InvalidateDescriptorCache();
         _splitKvAttention?.InvalidateDescriptorCache();
@@ -1555,7 +1533,6 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _splitKvAttention?.Dispose();
         _flashAttention?.Dispose();
         _attention.Dispose();
-        _rope.Dispose();
         _rmsnorm.Dispose();
         _matmulBf16Gemm.Dispose();
         _matmulBf16.Dispose();

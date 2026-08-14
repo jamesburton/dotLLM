@@ -1,5 +1,6 @@
 using System;
 using DotLLM.Vulkan.Interop;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -15,9 +16,9 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class MatMulIq3XxsMmvqKernel : IDisposable
 {
     /// <summary>IQ3_XXS super-block bytes.</summary>
-    public const int Iq3XxsBlockBytes = 98;
+    public const int Iq3XxsBlockBytes = QuantFormat.IQ3_XXSBlockBytes;
     /// <summary>Elements per IQ3_XXS super-block.</summary>
-    public const int Iq3XxsGroupSize = 256;
+    public const int Iq3XxsGroupSize = QuantFormat.KQuantGroupSize;
 
     private const int PushConstantBytes = 4 * sizeof(uint);
 

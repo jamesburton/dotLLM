@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -9,13 +10,13 @@ namespace DotLLM.Cpu.Kernels;
 public static unsafe partial class Dequantize
 {
     /// <summary>IQ4_NL block size in bytes: 2(d) + 16(qs) = 18.</summary>
-    internal const int IQ4_NL_BlockBytes = 18;
+    internal const int IQ4_NL_BlockBytes = QuantFormat.IQ4_NLBlockBytes;
 
     /// <summary>IQ4_XS block size in bytes: 2(d) + 2(scales_h) + 4(scales_l) + 128(qs) = 136.</summary>
-    internal const int IQ4_XS_BlockBytes = 136;
+    internal const int IQ4_XS_BlockBytes = QuantFormat.IQ4_XSBlockBytes;
 
     /// <summary>Number of elements per IQ4_NL block.</summary>
-    internal const int IQ4_NL_GroupSize = 32;
+    internal const int IQ4_NL_GroupSize = QuantFormat.LegacyGroupSize;
 
     /// <summary>
     /// Non-linear signed lookup shared by IQ4_NL and IQ4_XS. Values match
