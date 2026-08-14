@@ -1,10 +1,13 @@
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Evaluation;
 using DotLLM.Core.Models;
+using DotLLM.Core.PositionEncoding;
 using DotLLM.Core.Tensors;
-using DotLLM.Models;
+using DotLLM.Models.Architectures;
 using DotLLM.Models.Evaluation;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
+using DotLLM.Tests.Unit.Models.SafeTensors;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -28,14 +31,14 @@ public sealed class TempWindowParityScratchTests(ITestOutputHelper output) : IDi
     }
 
     [Fact]
-    public void SplitWindows_MatchWholeModel()
+    public void HybridSplitWindows_MatchWholeModel()
     {
         string path = SyntheticQwen35MoeGguf.Write(
             Path.Combine(_scratch, "qwen35moe-4layer.gguf"), blockCount: 4);
 
         using GgufFile gguf = GgufFile.Open(path);
         ModelConfig config = GgufModelConfigExtractor.Extract(gguf.Metadata);
-        using IModel model = ModelLoader.CreateCpuModelFromGguf(gguf, config);
+        using IModel model = DotLLM.Models.ModelLoader.CreateCpuModelFromGguf(gguf, config);
 
         Assert.Equal(4, config.NumLayers);
         Assert.True(model.RequiresPerSequenceState);
@@ -46,115 +49,113 @@ public sealed class TempWindowParityScratchTests(ITestOutputHelper output) : IDi
         int hidden = config.HiddenSize;
         int vocab = config.VocabSize;
 
-        // Whole-model reference.
         model.ResetSequenceState();
         using ITensor reference = model.Forward(tokens, positions, -1);
         var refLogits = new float[seqLen * vocab];
-        unsafe
-        {
-            new ReadOnlySpan<float>((void*)reference.DataPointer, refLogits.Length).CopyTo(refLogits);
-        }
+        unsafe { new ReadOnlySpan<float>((void*)reference.DataPointer, refLogits.Length).CopyTo(refLogits); }
 
-        // Cycled: [0..2) then [2..4). Layer 0 and layer 2 are both GDN (full_attention_interval=2),
-        // so a cut at 2 puts GDN ordinal 0 on one side and ordinal 1 on the other.
-        using var windowModel = new CpuLayerWindowModel(model, config);
+        using var wm = new CpuLayerWindowModel(model, config);
         var h1 = new float[seqLen * hidden];
         var h2 = new float[seqLen * hidden];
-
-        using (ILayerWindowExecutor a = windowModel.CreateWindow(0, 2))
+        using (ILayerWindowExecutor a = wm.CreateWindow(0, 2))
         {
             a.ResetState();
             a.Run(tokens, ReadOnlySpan<float>.Empty, positions, h1);
         }
 
-        using (ILayerWindowExecutor b = windowModel.CreateWindow(2, 2))
+        using (ILayerWindowExecutor b = wm.CreateWindow(2, 2))
         {
             b.ResetState();
             b.Run(ReadOnlySpan<int>.Empty, h1, positions, h2);
         }
 
-        using ITensor cycled = windowModel.ApplyOutputHead(h2, seqLen);
-        var cycLogits = new float[seqLen * vocab];
-        unsafe
-        {
-            new ReadOnlySpan<float>((void*)cycled.DataPointer, cycLogits.Length).CopyTo(cycLogits);
-        }
-
-        double maxAbs = 0, maxRel = 0;
-        for (int i = 0; i < refLogits.Length; i++)
-        {
-            double abs = Math.Abs(refLogits[i] - cycLogits[i]);
-            double rel = abs / Math.Max(1e-9, Math.Abs(refLogits[i]));
-            if (abs > maxAbs) maxAbs = abs;
-            if (rel > maxRel) maxRel = rel;
-        }
-
-        output.WriteLine($"layers={config.NumLayers} seqLen={seqLen} vocab={vocab} " +
-                         $"maxAbs={maxAbs:E6} maxRel={maxRel:E6}");
-        Assert.True(maxRel < 1e-4, $"maxAbs={maxAbs:E6} maxRel={maxRel:E6}");
+        using ITensor cycled = wm.ApplyOutputHead(h2, seqLen);
+        Report("hybrid cut@2", refLogits, cycled);
     }
 
     [Fact]
-    public void WrongGdnOrdinal_WouldChangeTheAnswer()
+    public void DenseSplitWindows_MatchWholeModel()
     {
-        // Discriminating control: if the second window's GDN layer read state slot 0 instead of its
-        // own slot 1, the result would differ. Prove the two slots are actually distinguishable by
-        // checking that a 3-layer-ish alternative cut (1..4) — which routes layer 2's GDN through a
-        // window whose start is an attention layer — still reproduces the whole-model logits.
-        string path = SyntheticQwen35MoeGguf.Write(
-            Path.Combine(_scratch, "qwen35moe-4layer-b.gguf"), blockCount: 4);
+        const int hidden = 64, numHeads = 4, headDim = 16, intermediate = 128, vocab = 32, layers = 4;
+        var rng = new Random(42);
+        var bld = new SafetensorsFixtureBuilder();
+        bld.AddFloat32("model.embed_tokens.weight", [vocab, hidden], Rand(rng, vocab * hidden));
+        bld.AddFloat32("model.norm.weight", [hidden], Rand(rng, hidden));
+        for (int i = 0; i < layers; i++)
+        {
+            string p = $"model.layers.{i}";
+            bld.AddFloat32($"{p}.input_layernorm.weight", [hidden], Rand(rng, hidden));
+            bld.AddFloat32($"{p}.post_attention_layernorm.weight", [hidden], Rand(rng, hidden));
+            bld.AddFloat32($"{p}.self_attn.q_proj.weight", [numHeads * headDim, hidden], Rand(rng, numHeads * headDim * hidden));
+            bld.AddFloat32($"{p}.self_attn.k_proj.weight", [numHeads * headDim, hidden], Rand(rng, numHeads * headDim * hidden));
+            bld.AddFloat32($"{p}.self_attn.v_proj.weight", [numHeads * headDim, hidden], Rand(rng, numHeads * headDim * hidden));
+            bld.AddFloat32($"{p}.self_attn.o_proj.weight", [hidden, numHeads * headDim], Rand(rng, hidden * numHeads * headDim));
+            bld.AddFloat32($"{p}.mlp.gate_proj.weight", [intermediate, hidden], Rand(rng, intermediate * hidden));
+            bld.AddFloat32($"{p}.mlp.up_proj.weight", [intermediate, hidden], Rand(rng, intermediate * hidden));
+            bld.AddFloat32($"{p}.mlp.down_proj.weight", [hidden, intermediate], Rand(rng, hidden * intermediate));
+        }
+        bld.AddFloat32("lm_head.weight", [vocab, hidden], Rand(rng, vocab * hidden));
 
-        using GgufFile gguf = GgufFile.Open(path);
-        ModelConfig config = GgufModelConfigExtractor.Extract(gguf.Metadata);
-        using IModel model = ModelLoader.CreateCpuModelFromGguf(gguf, config);
+        string path = Path.Combine(_scratch, "dense.safetensors");
+        bld.WriteTo(path);
 
-        int[] tokens = [2, 5, 1, 3];
-        int[] positions = [0, 1, 2, 3];
+        var cfg = new ModelConfig
+        {
+            Architecture = Architecture.Llama,
+            VocabSize = vocab,
+            HiddenSize = hidden,
+            IntermediateSize = intermediate,
+            NumLayers = layers,
+            NumAttentionHeads = numHeads,
+            NumKvHeads = numHeads,
+            HeadDim = headDim,
+            MaxSequenceLength = 128,
+            NormEpsilon = 1e-5f,
+            RoPEConfig = new RoPEConfig(Theta: 10000f, DimensionCount: headDim, Type: RoPEType.Norm),
+        };
+
+        using var file = SafetensorsFile.Open(path);
+        using var model = TransformerModel.LoadFromSafetensors(file, cfg);
+
+        int[] tokens = [1, 5, 9, 3, 7];
+        int[] positions = [0, 1, 2, 3, 4];
         int seqLen = tokens.Length;
-        int hidden = config.HiddenSize;
-        int vocab = config.VocabSize;
 
-        model.ResetSequenceState();
         using ITensor reference = model.Forward(tokens, positions, -1);
         var refLogits = new float[seqLen * vocab];
-        unsafe
-        {
-            new ReadOnlySpan<float>((void*)reference.DataPointer, refLogits.Length).CopyTo(refLogits);
-        }
+        unsafe { new ReadOnlySpan<float>((void*)reference.DataPointer, refLogits.Length).CopyTo(refLogits); }
 
-        using var windowModel = new CpuLayerWindowModel(model, config);
-        var buf = new float[seqLen * hidden];
-        var buf2 = new float[seqLen * hidden];
+        using var wm = new CpuLayerWindowModel(model, cfg);
+        var h1 = new float[seqLen * hidden];
+        var h2 = new float[seqLen * hidden];
+        using (ILayerWindowExecutor a = wm.CreateWindow(0, 1)) a.Run(tokens, ReadOnlySpan<float>.Empty, positions, h1);
+        using (ILayerWindowExecutor b = wm.CreateWindow(1, 3)) b.Run(ReadOnlySpan<int>.Empty, h1, positions, h2);
+        using ITensor cycled = wm.ApplyOutputHead(h2, seqLen);
+        Report("dense cut@1", refLogits, cycled);
+    }
 
-        using (ILayerWindowExecutor a = windowModel.CreateWindow(0, 1))
-        {
-            a.ResetState();
-            a.Run(tokens, ReadOnlySpan<float>.Empty, positions, buf);
-        }
-
-        using (ILayerWindowExecutor b = windowModel.CreateWindow(1, 3))
-        {
-            b.ResetState();
-            b.Run(ReadOnlySpan<int>.Empty, buf, positions, buf2);
-        }
-
-        using ITensor cycled = windowModel.ApplyOutputHead(buf2, seqLen);
-        var cycLogits = new float[seqLen * vocab];
-        unsafe
-        {
-            new ReadOnlySpan<float>((void*)cycled.DataPointer, cycLogits.Length).CopyTo(cycLogits);
-        }
+    private void Report(string label, float[] refLogits, ITensor cycled)
+    {
+        var cyc = new float[refLogits.Length];
+        unsafe { new ReadOnlySpan<float>((void*)cycled.DataPointer, cyc.Length).CopyTo(cyc); }
 
         double maxAbs = 0, maxRel = 0;
         for (int i = 0; i < refLogits.Length; i++)
         {
-            double abs = Math.Abs(refLogits[i] - cycLogits[i]);
+            double abs = Math.Abs(refLogits[i] - cyc[i]);
             double rel = abs / Math.Max(1e-9, Math.Abs(refLogits[i]));
             if (abs > maxAbs) maxAbs = abs;
             if (rel > maxRel) maxRel = rel;
         }
 
-        output.WriteLine($"cut@1 maxAbs={maxAbs:E6} maxRel={maxRel:E6}");
-        Assert.True(maxRel < 1e-4, $"maxAbs={maxAbs:E6} maxRel={maxRel:E6}");
+        output.WriteLine($"{label}: maxAbs={maxAbs:E6} maxRel={maxRel:E6}");
+        Assert.True(maxRel < 1e-4, $"{label}: maxAbs={maxAbs:E6} maxRel={maxRel:E6}");
+    }
+
+    private static float[] Rand(Random rng, int n)
+    {
+        var a = new float[n];
+        for (int i = 0; i < n; i++) a[i] = (float)((rng.NextDouble() - 0.5) * 0.1);
+        return a;
     }
 }

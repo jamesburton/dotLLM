@@ -154,7 +154,11 @@ public sealed class LayerCyclingPerplexityTests : IDisposable
     public void CycledScoring_WithoutPerWindowReset_IsIndistinguishableOnASingleWindow()
     {
         int[] oneWindow = Corpus[..8];
-        var options = new PerplexityOptions(PerplexityMode.SlidingWindow, ContextLength: 8, Stride: 8);
+        // Same window shape as SlidingOptions (context 8, unscored prefix 4) so that only the
+        // number of windows differs from the discriminating test; the stride is irrelevant with a
+        // corpus exactly one window long.
+        var options = new PerplexityOptions(
+            PerplexityMode.SlidingWindow, ContextLength: 8, Stride: 8, UnscoredPrefix: 4);
 
         double correct = ScoreCycled(BlockCount / 2, sabotageReset: false, oneWindow, options);
         double leaked = ScoreCycled(BlockCount / 2, sabotageReset: true, oneWindow, options);
