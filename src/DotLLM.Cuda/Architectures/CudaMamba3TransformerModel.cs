@@ -346,12 +346,21 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
     /// when the async H2D copy above it actually completes. Returns a zero-filled array (not
     /// <see cref="Array.Empty{T}"/>) for an unpopulated handle, matching the zero-bias
     /// semantics the removed <c>DownloadF32</c> helper had for a null device pointer — callers
-    /// index these arrays unconditionally.
+    /// index these arrays unconditionally. Carries its own <see cref="Mamba3TensorHandle.SourceDType"/>
+    /// guard (matching <see cref="UploadF32"/>'s) rather than relying on the <c>DeviceLayer(...)</c>
+    /// call site's argument evaluation order to have already thrown via a same-handle
+    /// <see cref="UploadF32"/> call — a BF16 handle must never reach the
+    /// <c>Buffer.MemoryCopy</c> below, which would otherwise read <paramref name="expectedElements"/>
+    /// * 4 bytes from a half-sized mmap region regardless of call-site ordering.
     /// </summary>
     private static unsafe float[] CopyHostF32(Mamba3TensorHandle handle, long expectedElements)
     {
         var host = new float[expectedElements];
         if (!handle.IsPopulated) return host;
+        if (handle.SourceDType != SafetensorsDType.F32)
+            throw new NotSupportedException(
+                $"CudaMamba3TransformerModel requires F32 tensors; got {handle.SourceDType}. "
+                + "Quantized/F16 Mamba-3 weights are not yet supported on CUDA (CPU-parity scope, issue #346).");
         fixed (float* p = host)
             Buffer.MemoryCopy((void*)handle.Pointer, p, host.Length * sizeof(float), expectedElements * sizeof(float));
         return host;
