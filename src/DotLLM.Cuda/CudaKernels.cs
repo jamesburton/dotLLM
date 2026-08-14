@@ -3277,6 +3277,16 @@ public sealed unsafe class CudaKernels : IDisposable
                 $"numRopeAngles={numRopeAngles}; mamba3_data_rope_f32's rotation loop is 'if (tid < nra)' " +
                 "over a 64-thread block with no stride, so lanes at k>=64 would silently never rotate " +
                 "(issue #346 finding; kernel needs a stride loop there to lift this cap).");
+        // Mirrors the Vulkan sibling's second guard (Mamba3DataRopeF32Kernel.cs:178-180).
+        // Without it, numRopeAngles > dState/2 writes OOB on device: the kernel indexes
+        // bcBase + 2*tid + 1 / bcBase + halfDState + tid, both of which assume
+        // 2*numRopeAngles <= dState. Unreachable today (rope_fraction <= 1.0 in practice)
+        // but cross-backend guard symmetry on this exact kernel is a principle here
+        // (commit 417d4950), not an optimization to skip.
+        int rotaryDim = 2 * numRopeAngles;
+        if (rotaryDim > dState)
+            throw new ArgumentException(
+                $"2*numRopeAngles ({rotaryDim}) > dState ({dState}).", nameof(numRopeAngles));
 
         nint bArg = b, cArg = c, anglesArg = anglesRaw, dtArg = dt, cumPrevArg = cumPrev, cumOutArg = cumOut;
         int seqArg = seqLen, rankArg = nRank, headArg = nHead, stateArg = dState, nraArg = numRopeAngles, modeArg = mode;

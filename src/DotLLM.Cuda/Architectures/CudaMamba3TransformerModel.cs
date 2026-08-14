@@ -296,8 +296,9 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
         // (Mamba3TransformerModel.cs:217-226) — NumLayers alone does not catch a cache built
         // from a different Mamba3Config with the same layer count, which would otherwise hand
         // the kernels undersized buffers and produce out-of-bounds device writes with no
-        // diagnostic. CudaMamba3StateCache additionally exposes KState/VState element counts
-        // (Mamba3State does not), so those are checked too.
+        // diagnostic. Mamba3State also exposes KState/VState element counts
+        // (Mamba3State.cs:105,108) but CPU's own guard doesn't check them — CUDA validates
+        // stronger and checks all four buffers here.
         int expectedSsm = _m3.NumHeads * _m3.HeadDim * _m3.StateSize;
         int expectedCum = _m3.NumHeads * _m3.NumRopeAngles;
         int expectedKRank = _m3.IsMimo ? _m3.MimoRank : 1;
@@ -1001,13 +1002,29 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
         if (ptr != 0) CudaDriverApi.cuMemFree_v2(ptr);
     }
 
+    /// <summary>
+    /// Frees a scratch pointer (if allocated) and zeroes the field in place. Used instead of
+    /// <see cref="FreeIfNonZero"/> for every field in <see cref="FreeScratch"/> so that if
+    /// <see cref="EnsureScratchCapacity"/>'s realloc sequence throws mid-way (e.g. device OOM
+    /// on a later buffer), the fields already freed here are left as 0 rather than dangling —
+    /// a subsequent re-entry (with <c>_scratchCapacity == 0</c>) that calls <c>FreeScratch</c>
+    /// again would otherwise re-free stale pointers that may by then alias live driver
+    /// re-handed allocations (free-of-live-buffer). Calling this twice on the same field is a
+    /// safe no-op (second call sees <c>p == 0</c>).
+    /// </summary>
+    private static void FreeAndClear(ref nint p)
+    {
+        FreeIfNonZero(p);
+        p = 0;
+    }
+
     private void FreeScratch()
     {
-        FreeIfNonZero(_hidden); FreeIfNonZero(_residual); FreeIfNonZero(_normOut); FreeIfNonZero(_blockOut);
-        FreeIfNonZero(_projDevice); FreeIfNonZero(_xDevice); FreeIfNonZero(_zDevice); FreeIfNonZero(_yScanDevice);
-        FreeIfNonZero(_dtDevice); FreeIfNonZero(_adtDevice); FreeIfNonZero(_trapDevice);
-        FreeIfNonZero(_gammaDevice); FreeIfNonZero(_scaleDevice); FreeIfNonZero(_qkPreDotDevice);
-        FreeIfNonZero(_anglesRawDevice); FreeIfNonZero(_bDevice); FreeIfNonZero(_cDevice); FreeIfNonZero(_coefDevice);
+        FreeAndClear(ref _hidden); FreeAndClear(ref _residual); FreeAndClear(ref _normOut); FreeAndClear(ref _blockOut);
+        FreeAndClear(ref _projDevice); FreeAndClear(ref _xDevice); FreeAndClear(ref _zDevice); FreeAndClear(ref _yScanDevice);
+        FreeAndClear(ref _dtDevice); FreeAndClear(ref _adtDevice); FreeAndClear(ref _trapDevice);
+        FreeAndClear(ref _gammaDevice); FreeAndClear(ref _scaleDevice); FreeAndClear(ref _qkPreDotDevice);
+        FreeAndClear(ref _anglesRawDevice); FreeAndClear(ref _bDevice); FreeAndClear(ref _cDevice); FreeAndClear(ref _coefDevice);
         _scratchCapacity = 0;
     }
 }
