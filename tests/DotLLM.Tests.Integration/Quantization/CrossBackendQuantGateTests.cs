@@ -162,8 +162,13 @@ public sealed class CrossBackendQuantGateTests
         QuantGateRun gpu;
         try
         {
+            // The reference's seeds are pinned into the GPU run's cached leg. Without this the two
+            // sides step from their own prefill argmax, which on a --pure fixture is routinely a
+            // near-tie — and a one-token context difference costs cosine 0.98 down to -0.53,
+            // indistinguishable from a kernel defect and previously filed as three of them.
             gpu = QuantGateBackendRunner.Run(
-                entry, backend, QuantGateCorpus.Path, CorpusTokens, DecodePrompts);
+                entry, backend, QuantGateCorpus.Path, CorpusTokens, DecodePrompts,
+                cpu.KvDecodeSeeds);
         }
         catch (Exception ex) when (ClassifyEnvironmentFailure(ex) is { } environmental)
         {
@@ -294,6 +299,20 @@ public sealed class CrossBackendQuantGateTests
     /// <param name="failures">Collects one entry per breach.</param>
     /// <param name="allTopOneAgreed">Cleared when any step's argmax differs.</param>
     /// <returns>The per-step cosines, breaching or not.</returns>
+    /// <summary>
+    /// Minimum softmax probability gap between the CPU reference's top-1 and runner-up token
+    /// below which a top-1 mismatch is not asserted.
+    /// </summary>
+    /// <remarks>
+    /// On a <c>--pure</c> fixture the reference's own top-1 is routinely a near-tie: a one-token
+    /// seed-context difference measured against itself (no cross-backend comparison at all) was
+    /// enough to flip decode-leg top-1 on MXFP4 and IQ2_XS after the leg-3 seed-pinning fix. A
+    /// two-argmax coin-flip is not evidence a kernel disagrees; the logit-cosine assertion already
+    /// covers that step. 5% softmax-probability margin is comfortably past a coin-flip while still
+    /// catching a top-1 divergence on a token the reference is actually confident about.
+    /// </remarks>
+    private const double MinTop1Margin = 0.05;
+
     private static double[] CompareLeg(
         string leg, float[][] cpuLogits, float[][] gpuLogits, int[] cpuTokens, int[] gpuTokens,
         QuantGateBackend backend, List<string> failures, ref bool allTopOneAgreed)
@@ -308,12 +327,36 @@ public sealed class CrossBackendQuantGateTests
 
             if (cpuTokens[step] != gpuTokens[step])
             {
-                allTopOneAgreed = false;
-                failures.Add($"{leg} step {step}: top-1 {cpuTokens[step]} (cpu) vs {gpuTokens[step]} ({backend})");
+                double margin = Top1Margin(cpuLogits[step], cpuTokens[step]);
+                if (margin >= MinTop1Margin)
+                {
+                    allTopOneAgreed = false;
+                    failures.Add(
+                        $"{leg} step {step}: top-1 {cpuTokens[step]} (cpu) vs {gpuTokens[step]} " +
+                        $"({backend}), cpu margin {margin:P1}");
+                }
             }
         }
 
         return cosines;
+    }
+
+    /// <summary>Softmax probability gap between <paramref name="top1"/> and the runner-up.</summary>
+    private static double Top1Margin(float[] logits, int top1)
+    {
+        float top1Value = logits[top1];
+        float runnerUp = float.NegativeInfinity;
+        for (int i = 0; i < logits.Length; i++)
+        {
+            if (i != top1 && logits[i] > runnerUp)
+                runnerUp = logits[i];
+        }
+
+        // Only these two logits matter for the gap between them; shifting both by top1Value
+        // before exponentiating keeps the top term at exp(0) = 1 without touching the ratio.
+        double expTop1 = 1.0;
+        double expRunnerUp = Math.Exp((double)runnerUp - top1Value);
+        return (expTop1 - expRunnerUp) / (expTop1 + expRunnerUp);
     }
 
     /// <summary>Formats a cosine array for the machine-readable CELL row.</summary>

@@ -47,6 +47,8 @@ public static class QuantGateCorpus
 /// <param name="DecodeLogits">Full logit vector behind each <see cref="DecodeTokens"/> entry.</param>
 /// <param name="KvDecodeTokens">Argmax id from each prompt's single cached <c>seqLen == 1</c> step — the decode/GEMV leg.</param>
 /// <param name="KvDecodeLogits">Full logit vector behind each <see cref="KvDecodeTokens"/> entry.</param>
+/// <param name="KvDecodeSeeds">Token fed to each cached step. Pinned to the reference's choice on
+/// every non-reference backend so the leg compares kernels rather than contexts.</param>
 /// <remarks>
 /// <para>
 /// <b>Do not compare two runs by record equality, and never compare
@@ -78,7 +80,8 @@ public static class QuantGateCorpus
 public sealed record QuantGateRun(
     PerplexityResult Perplexity,
     int[] DecodeTokens, float[][] DecodeLogits,
-    int[] KvDecodeTokens, float[][] KvDecodeLogits)
+    int[] KvDecodeTokens, float[][] KvDecodeLogits,
+    int[] KvDecodeSeeds)
 {
     /// <summary>
     /// Whether the short-context leg produced more than one distinct token, and so actually
@@ -177,7 +180,8 @@ public static class QuantGateBackendRunner
     /// <exception cref="ArgumentNullException"><paramref name="entry"/> is <see langword="null"/>.</exception>
     public static QuantGateRun Run(
         QuantLadderEntry entry, QuantGateBackend backend, string corpusPath,
-        int corpusTokens, IReadOnlyList<string> decodePrompts)
+        int corpusTokens, IReadOnlyList<string> decodePrompts,
+        IReadOnlyList<int>? pinnedKvSeeds = null)
     {
         ArgumentNullException.ThrowIfNull(entry);
         ArgumentException.ThrowIfNullOrEmpty(corpusPath);
@@ -251,9 +255,10 @@ public static class QuantGateBackendRunner
 
                 var (decodeTokens, decodeLogits) = RunDecode(
                     model, tokenizer, deviceId, decodePrompts);
-                var (kvTokens, kvLogits) = RunKvDecode(
-                    model, tokenizer, deviceId, kvCacheFactory, decodePrompts);
-                return new QuantGateRun(ppl, decodeTokens, decodeLogits, kvTokens, kvLogits);
+                var (kvTokens, kvLogits, kvSeeds) = RunKvDecode(
+                    model, tokenizer, deviceId, kvCacheFactory, decodePrompts, pinnedKvSeeds);
+                return new QuantGateRun(
+                    ppl, decodeTokens, decodeLogits, kvTokens, kvLogits, kvSeeds);
             }
             finally
             {
@@ -434,12 +439,14 @@ public static class QuantGateBackendRunner
     /// <see cref="RunDecode"/>: distinct prompts give distinct contexts, and a chain does not.
     /// </para>
     /// </remarks>
-    private static (int[] Tokens, float[][] Logits) RunKvDecode(
+    private static (int[] Tokens, float[][] Logits, int[] Seeds) RunKvDecode(
         IModel model, ITokenizer tokenizer, int deviceId,
-        Func<int, DotLLM.Core.Attention.IKvCache> kvCacheFactory, IReadOnlyList<string> prompts)
+        Func<int, DotLLM.Core.Attention.IKvCache> kvCacheFactory, IReadOnlyList<string> prompts,
+        IReadOnlyList<int>? pinnedSeeds)
     {
         var emitted = new int[prompts.Count];
         var logits = new float[prompts.Count][];
+        var seeds = new int[prompts.Count];
         int vocab = model.Config.VocabSize;
 
         for (int i = 0; i < prompts.Count; i++)
@@ -456,9 +463,24 @@ public static class QuantGateBackendRunner
             DotLLM.Core.Attention.IKvCache cache = kvCacheFactory(tokens.Length + 1);
             try
             {
+                // The prefill still runs on every backend — it is what fills the cache this step
+                // reads. Only the *token* fed to the step is pinned.
                 int seed;
                 using (ITensor prefill = model.Forward(tokens, positions, deviceId, cache))
                     seed = ArgMax(LastRowOf(prefill, vocab));
+
+                // On a --pure fixture the prefill argmax is routinely a near-tie, so two correct
+                // backends legitimately pick different seeds. Stepping each backend from its own
+                // argmax then compares logits from DIFFERENT contexts and reports the difference as
+                // a kernel disagreement. Measured on CPU against itself, a single-token seed flip
+                // costs cosine 0.98 down to -0.53 depending on fixture — the same magnitudes, and
+                // the same negative sign, that were filed as Vulkan IQ2_XS (-0.49) and CUDA IQ3_S
+                // kernel defects. Pinning the reference's seed is what makes this leg a comparison
+                // of kernels rather than of contexts.
+                if (pinnedSeeds is not null)
+                    seed = pinnedSeeds[i];
+
+                seeds[i] = seed;
 
                 // The one call in the whole gate with seqLen == 1. Everything above this line is
                 // setup; this is the measurement.
@@ -480,7 +502,7 @@ public static class QuantGateBackendRunner
             }
         }
 
-        return (emitted, logits);
+        return (emitted, logits, seeds);
     }
 
     /// <summary>Index of the largest element.</summary>
