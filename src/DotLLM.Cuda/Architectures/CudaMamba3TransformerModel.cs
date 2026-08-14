@@ -770,12 +770,18 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
                 _kernels.LaunchAddF32(_residual, _blockOut, _hidden, seqLen * hiddenSize, s);
             }
 
-            // 8. Final RMSNorm (device, in place) + lm_head GEMM (device, last token only).
-            // TEMP-REVERTED-FOR-MEASUREMENT (#382 item 4 not yet applied in this commit).
-            _kernels.LaunchRmsNormF32(_hidden, _finalNormDevice, _hidden, hiddenSize, eps, seqLen, s);
+            // 8. Final RMSNorm + lm_head GEMM (device, last token only).
+            // #382 item 4: only the last row feeds the lm_head GEMV — normalizing all seqLen
+            // rows (as the previous version did) is wasted prefill work RMSNorm being
+            // row-independent makes provably unnecessary. Mirrors
+            // VulkanMamba3TransformerModel.RunFinalNormAndLmHead: D2D-copy the last row into the
+            // fixed-size _lastHiddenDevice scratch, then norm with rowCount:1.
+            long hiddenRowBytes = (long)hiddenSize * sizeof(float);
+            nint lastHiddenSrc = _hidden + (nint)((long)(seqLen - 1) * hiddenRowBytes);
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_lastHiddenDevice, lastHiddenSrc, (nuint)hiddenRowBytes, s).ThrowOnError();
+            _kernels.LaunchRmsNormF32(_lastHiddenDevice, _finalNormDevice, _lastHiddenDevice, hiddenSize, eps, rows: 1, s);
 
-            nint lastHidden = _hidden + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
-            CudaGemm.GemvF32(_cublas.Handle, _lmHeadDevice, lastHidden, _logitsDevice, vocabSize, hiddenSize, s);
+            CudaGemm.GemvF32(_cublas.Handle, _lmHeadDevice, _lastHiddenDevice, _logitsDevice, vocabSize, hiddenSize, s);
 
             var shape = new TensorShape(1, vocabSize);
             var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
