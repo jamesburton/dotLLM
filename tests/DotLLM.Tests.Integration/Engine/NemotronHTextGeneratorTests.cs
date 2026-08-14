@@ -3,6 +3,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.Tensors;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -36,7 +37,7 @@ public class NemotronHTextGeneratorTests
         string? path = TryResolveModelPath();
         Skip.If(path is null, $"Set {ModelPathEnvVar} to a Nemotron-H GGUF to run this test.");
 
-        using var gguf = GgufFile.Open(path!);
+        using var gguf = CheckpointGuard.LoadOrSkip(path!, "Nemotron-H GGUF", () => GgufFile.Open(path!));
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
 
         Assert.Equal(Architecture.NemotronH, config.Architecture);
@@ -50,7 +51,7 @@ public class NemotronHTextGeneratorTests
         string? path = TryResolveModelPath();
         Skip.If(path is null, $"Set {ModelPathEnvVar} to a Nemotron-H GGUF to run this test.");
 
-        using var gguf = GgufFile.Open(path!);
+        using var gguf = CheckpointGuard.LoadOrSkip(path!, "Nemotron-H GGUF", () => GgufFile.Open(path!));
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         using var model = NemotronHTransformerModel.LoadFromGguf(gguf, config);
 
@@ -106,7 +107,7 @@ public class NemotronHTextGeneratorTests
         string? path = TryResolveModelPath();
         Skip.If(path is null, $"Set {ModelPathEnvVar} to a Nemotron-H GGUF to run this test.");
 
-        using var gguf = GgufFile.Open(path!);
+        using var gguf = CheckpointGuard.LoadOrSkip(path!, "Nemotron-H GGUF", () => GgufFile.Open(path!));
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         using var model = NemotronHTransformerModel.LoadFromGguf(gguf, config);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
@@ -128,7 +129,7 @@ public class NemotronHTextGeneratorTests
         string? path = TryResolveModelPath();
         Skip.If(path is null, $"Set {ModelPathEnvVar} to a Nemotron-H GGUF to run this test.");
 
-        using var gguf = GgufFile.Open(path!);
+        using var gguf = CheckpointGuard.LoadOrSkip(path!, "Nemotron-H GGUF", () => GgufFile.Open(path!));
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         using var model = NemotronHTransformerModel.LoadFromGguf(gguf, config);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);

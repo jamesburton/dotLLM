@@ -2,6 +2,7 @@ using System.Diagnostics;
 using DotLLM.Core.Tensors;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.Hf;
 using Xunit;
@@ -133,7 +134,9 @@ public sealed class IbSsmMamba3TokenizerEndToEndTests
 
         // 2. Model.
         var loadModelWatch = Stopwatch.StartNew();
-        var (model, file, config) = ModelLoader.LoadFromSafetensors(weightsPath);
+        var (model, file, config) = CheckpointGuard.LoadOrSkip(
+            weightsPath, "ib-ssm/mamba3-370M-10BT checkpoint",
+            () => ModelLoader.LoadFromSafetensors(weightsPath));
         loadModelWatch.Stop();
 
         try
