@@ -36,27 +36,36 @@ namespace DotLLM.Tests.Unit.Vulkan;
 [Collection("VulkanKernels")]
 public sealed class VulkanMamba3TransformerModelForwardTests : IDisposable
 {
-    internal const int HiddenSize = 8;
+    // Issue #385: widened from a degenerate tuple (NumHeads==HeadDim==4,
+    // HiddenSize==StateSize==8) so NumHeads/HeadDim/StateSize/HiddenSize/MimoRank
+    // are all pairwise distinct — same reasoning as CudaMamba3MimoParitySyntheticTests'
+    // widening (same numeric choice, for cross-backend consistency). SISO and MIMO
+    // deliberately keep sharing HiddenSize/NumHeads/HeadDim/StateSize/Expand (see the
+    // MIMO-dims comment below) — only MimoRank is MIMO-only — so this bump widens
+    // both the SISO and MIMO fixtures in this file at once; SISO's AbsTol/RelTol
+    // (5e-3/1e-3) have ample headroom and are unaffected by the dim change itself.
+    internal const int HiddenSize = 12;
     internal const int VocabSize = 16;
     private const int NumLayers = 2;
-    private const int NumHeads = 4;
-    private const int HeadDim = 4;              // d_inner = 16
-    private const int Expand = 2;
-    private const int StateSize = 8;
+    private const int NumHeads = 2;
+    private const int HeadDim = 6;               // d_inner = 12
+    private const int Expand = 1;                // expand*hidden(12) == d_inner(12)
+    private const int StateSize = 16;
     private const int DInner = NumHeads * HeadDim;
     private const int NumBcHeads = 1;            // SISO; G = 1
     private const int BcDim = StateSize * NumBcHeads;
-    // num_rope_angles = (state_size * rope_fraction) / 2 with rope_fraction=0.5 → 2.
-    private const int NumRopeAngles = 2;
-    private const int DInProj = 2 * DInner + 2 * BcDim + 3 * NumHeads + NumRopeAngles; // 62
+    // num_rope_angles = int(state_size * rope_fraction) / 2 with rope_fraction=0.5,
+    // state_size=16 → int(8)/2 = 4. Guard: 2*4=8 <= StateSize=16.
+    private const int NumRopeAngles = 4;
+    private const int DInProj = 2 * DInner + 2 * BcDim + 3 * NumHeads + NumRopeAngles; // 66
 
     // MIMO fixture dimensions — same model dims as SISO but with a rank > 1 B/C
     // expansion. Shares DInner / HeadDim / NumHeads / StateSize with SISO so the
     // recurrent state and out-projection paths exercise identical code with only
     // the rank axis changed.
-    private const int MimoRank = 2;
+    private const int MimoRank = 3;
     private const int MimoBcDim = StateSize * NumBcHeads * MimoRank;
-    private const int MimoDInProj = 2 * DInner + 2 * MimoBcDim + 3 * NumHeads + NumRopeAngles;
+    private const int MimoDInProj = 2 * DInner + 2 * MimoBcDim + 3 * NumHeads + NumRopeAngles; // 130
 
     private const float AbsTol = 5e-3f;
     private const float RelTol = 1e-3f;
