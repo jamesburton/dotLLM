@@ -592,6 +592,7 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
     /// <summary>Releases all Vulkan, CUDA, and host resources owned by this model.</summary>
     public void Dispose()
     {
+        _context.MakeCurrent();
         if (_tempF32Device != 0)
         {
             CudaDriverApi.cuMemFree_v2(_tempF32Device);

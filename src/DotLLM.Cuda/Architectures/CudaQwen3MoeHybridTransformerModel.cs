@@ -172,7 +172,11 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// (perplexity windows) would leak state exactly as the CPU host did. Overridden for parity with
     /// the CPU / Vulkan hosts — see issue #261.
     /// </remarks>
-    public void ResetSequenceState() => _gdnCache.Reset();
+    public void ResetSequenceState()
+    {
+        _context.MakeCurrent();
+        _gdnCache.Reset();
+    }
 
     /// <summary>Number of full-attention layers — matches the sparse KV-cache slot count.</summary>
     public int AttentionLayerCount => _attentionLayerCount;
@@ -2848,6 +2852,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     {
         if (_disposed) return;
         _disposed = true;
+        _context.MakeCurrent();
 
         // Per-layer weight free.
         for (int i = 0; i < _layers.Length; i++)

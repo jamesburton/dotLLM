@@ -977,6 +977,7 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
     {
         if (_disposed) return;
         _disposed = true;
+        _context.MakeCurrent();
 
         foreach (var l in _layers)
         {

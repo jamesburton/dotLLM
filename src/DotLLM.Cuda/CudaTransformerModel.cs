@@ -1684,6 +1684,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     {
         ArgumentNullException.ThrowIfNull(requests);
         if (requests.Count == 0) return Array.Empty<ITensor>();
+        _context.MakeCurrent();
         if (requests.Count == 1)
         {
             var r0 = requests[0];
@@ -1752,6 +1753,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         if (adapter is null)
             return Forward(tokenIds, positions, deviceId, kvCache);
 
+        _context.MakeCurrent();
         if (!ReferenceEquals(_cudaLora?.Source, adapter))
         {
             _cudaLora?.Dispose();
@@ -3449,6 +3451,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        _context.MakeCurrent();
         ReportLaunchProfile();
         _cudaLora?.Dispose();
         DisposeDecodeGraph();
