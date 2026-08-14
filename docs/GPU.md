@@ -502,9 +502,17 @@ order of what they buy and cost:
 
 | Flags | Placement | Use when |
 |---|---|---|
-| `--device cuda --gpu-layers N` | GPU `[0..N)`, CPU `[N..L)` | The usual partial offload. Fastest; only exercises a *prefix* of the trunk on the GPU. |
+| `--device cuda --gpu-layers N` | GPU `[0..N)`, CPU `[N..L)` | The usual partial offload. Only exercises a *prefix* of the trunk on the GPU, and see the sliding-window caveat below. |
 | `--device cuda --gpu-layers N --first-layer K` | CPU `[0..K)`, GPU `[K..K+N)`, CPU `[K+N..L)` | You need a *specific* slice of the trunk on the GPU — e.g. verifying the deep layers of a model whose prefix already passed. |
 | `--device cuda --gpu-layers N --cycle` | GPU window of `N` layers slid across the whole trunk | Full-coverage GPU verification of a model too large for the device. |
+
+### Prefix offload scores teacher-forced only
+
+`HybridTransformerModel` returns logits for the **last row only**, so `--gpu-layers` without
+`--cycle` cannot run sliding-window mode and falls to the O(n²) growing-prefix teacher-forced path.
+That is expensive: on Llama-3.2-1B, 64 tokens took 235 s that way, against 19.8 s for 400 tokens
+cycled. Cycling is unaffected — its host-side output head produces every row — which is a second
+reason to prefer it whenever the model is dense enough to use it.
 
 ### Why cycling exists
 
