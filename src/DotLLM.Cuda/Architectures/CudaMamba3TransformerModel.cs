@@ -81,11 +81,40 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
     private nint _hidden = 0, _residual = 0, _normOut = 0, _blockOut = 0;      // [cap, hidden]
     private nint _projDevice = 0;                                   // [cap, dInProj] (in_proj GEMM output)
     private nint _xDevice = 0, _zDevice = 0, _yScanDevice = 0;               // [cap, dInner]
-    private nint _dtDevice = 0, _adtDevice = 0, _trapDevice = 0, _gammaDevice = 0, _scaleDevice = 0, _qkPreDotDevice = 0; // [cap, nHead]
+    private nint _dtDevice = 0, _adtDevice = 0, _gammaDevice = 0, _scaleDevice = 0, _qkPreDotDevice = 0; // [cap, nHead]
     private nint _anglesRawDevice = 0;                               // [cap, numRopeAngles]
     private nint _bDevice = 0, _cDevice = 0;                             // [cap, effRank, nHead, dState]
     private nint _coefDevice = 0;                                    // [nHead] — chunk-boundary coefficients
     private nint _logitsDevice;                                  // [vocab] — last-token logits (allocated once)
+    // #382 item 4: the final RMSNorm only needs to touch the last token — this is a fixed
+    // [hidden]-sized device scratch for that single row (allocated once, like _logitsDevice,
+    // since hiddenSize never changes for a loaded model), NOT part of the seqLen-scaled
+    // scratch capacity growth path below.
+    private readonly nint _lastHiddenDevice;
+
+    // #382 item 1: reusable host-side per-forward scratch for HostPrepareSiso/HostPrepareMimo
+    // — grown alongside the device scratch in EnsureScratchCapacity instead of `new float[...]`
+    // per layer per forward (the previous version allocated ~12 arrays per layer per forward;
+    // `proj` alone is seqLen*dInProj floats, LOH-sized on the real 370M checkpoint at any
+    // realistic prefill length). Each array's *capacity* is cap-scaled; callers must still slice
+    // to the current seqLen-scaled length before use (see HostPrepareSiso/Mimo) — using the full
+    // array length after a capacity grow would upload/read stale or out-of-range data on a
+    // smaller subsequent forward.
+    private float[] _hostProj = [];
+    private float[] _hostX = [];
+    private float[] _hostZ = [];
+    private float[] _hostDt = [];
+    private float[] _hostAdt = [];
+    private float[] _hostTrap = [];   // host-only — never uploaded to device (#382 item 3).
+    private float[] _hostGamma = [];
+    private float[] _hostScale = [];
+    private float[] _hostAnglesRaw = [];
+    private float[] _hostB = [];
+    private float[] _hostC = [];
+    private float[] _hostQkPreDot = [];
+    // Chunk-boundary coefficient — [nHead], fixed size (no seqLen dependence), allocated once
+    // in the constructor like _coefDevice rather than grown in EnsureScratchCapacity.
+    private readonly float[] _hostCoef;
 
     private bool _disposed;
 
@@ -118,10 +147,25 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
     /// </remarks>
     public void ResetSequenceState() { }
 
+    /// <remarks>
+    /// The <c>*Host</c> fields (<c>DtBiasHost</c>/<c>BNormHost</c>/<c>CNormHost</c>/
+    /// <c>BBiasHost</c>/<c>CBiasHost</c>) are #382 item 2's fix: host-side copies of the small
+    /// per-layer bias/norm-weight tensors that <see cref="HostPrepareSiso"/>/
+    /// <see cref="HostPrepareMimo"/> need on the CPU for the softplus/sigmoid/RMSNorm+bias math.
+    /// Populated once in <see cref="LoadFromSafetensors"/> (mirrors
+    /// <c>VulkanMamba3Weights.LayerBuffers</c>'s <c>*Host</c> fields) so the per-forward path no
+    /// longer re-downloads them from the matching device fields via <c>cuMemcpyDtoH_v2</c> on
+    /// every layer of every call. The device-side <c>DtBias</c>/<c>BNorm</c>/<c>CNorm</c>/
+    /// <c>BBias</c>/<c>CBias</c> buffers are still uploaded and kept (VRAM cost is trivial —
+    /// these are nHead/dState-sized) for the documented future fused device-kernel host-prep
+    /// replacement (see this class's doc remarks); only <c>D</c> is actually read as a device
+    /// pointer by a kernel today (the SSD scan).
+    /// </remarks>
     private readonly record struct DeviceLayer(
         nint Norm, nint InProj, nint OutProj, nint BNorm, nint CNorm,
         nint BBias, nint CBias, nint D, nint DtBias,
-        nint MimoZ, nint MimoO);
+        nint MimoZ, nint MimoO,
+        float[] DtBiasHost, float[] BNormHost, float[] CNormHost, float[] BBiasHost, float[] CBiasHost);
 
     private CudaMamba3TransformerModel(
         ModelConfig config, CudaContext context, CudaStream stream, CudaCublasHandle cublas,
@@ -145,6 +189,12 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
 
         long vocabBytes = (long)config.VocabSize * sizeof(float);
         CudaDriverApi.cuMemAlloc_v2(out _logitsDevice, (nuint)vocabBytes).ThrowOnError();
+        // #382 item 4: fixed [hidden]-sized scratch for the final RMSNorm's last-row-only input
+        // (see ForwardCore's tail). Allocated once here, not cap-scaled — hiddenSize is constant
+        // for the lifetime of a loaded model.
+        long lastHiddenBytes = (long)config.HiddenSize * sizeof(float);
+        CudaDriverApi.cuMemAlloc_v2(out _lastHiddenDevice, (nuint)lastHiddenBytes).ThrowOnError();
+        _hostCoef = new float[_m3.NumHeads];
     }
 
     /// <summary>
@@ -237,7 +287,16 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
                         D: UploadF32(lw.D, nHead, stream.Handle, allocs),
                         DtBias: UploadF32(lw.DtBias, nHead, stream.Handle, allocs),
                         MimoZ: m3.IsMimo ? UploadF32(lw.MimoZ, mimoElems, stream.Handle, allocs) : 0,
-                        MimoO: m3.IsMimo ? UploadF32(lw.MimoO, mimoElems, stream.Handle, allocs) : 0);
+                        MimoO: m3.IsMimo ? UploadF32(lw.MimoO, mimoElems, stream.Handle, allocs) : 0,
+                        // #382 item 2: host-side copies of the same handles, taken while the
+                        // mmap-backed CPU pointers are still valid (before `weights.Dispose()`
+                        // in the outer finally / before the caller's `file` may be closed) — see
+                        // DeviceLayer's doc comment for why HostPrepareSiso/Mimo need these.
+                        DtBiasHost: CopyHostF32(lw.DtBias, nHead),
+                        BNormHost: CopyHostF32(lw.BNorm, dState),
+                        CNormHost: CopyHostF32(lw.CNorm, dState),
+                        BBiasHost: CopyHostF32(lw.BBias, bcBiasElems),
+                        CBiasHost: CopyHostF32(lw.CBias, bcBiasElems));
                 }
 
                 // All H2D copies above were issued async on `stream` — synchronize before
@@ -275,6 +334,36 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
             // not retain a reference to it after the H2D copies above complete.
             weights.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Copies a populated F32 <see cref="Mamba3TensorHandle"/> straight into a managed
+    /// <c>float[]</c> — the host-side companion to <see cref="UploadF32"/> for the small
+    /// per-layer tensors <see cref="HostPrepareSiso"/>/<see cref="HostPrepareMimo"/> need
+    /// on the CPU (#382 item 2). Runs synchronously (unlike <see cref="UploadF32"/>'s async
+    /// H2D copy) so it is safe to call from within the same load-time loop that also stages
+    /// the device upload — the source pointer is guaranteed valid at this point regardless of
+    /// when the async H2D copy above it actually completes. Returns a zero-filled array (not
+    /// <see cref="Array.Empty{T}"/>) for an unpopulated handle, matching the zero-bias
+    /// semantics the removed <c>DownloadF32</c> helper had for a null device pointer — callers
+    /// index these arrays unconditionally. Carries its own <see cref="Mamba3TensorHandle.SourceDType"/>
+    /// guard (matching <see cref="UploadF32"/>'s) rather than relying on the <c>DeviceLayer(...)</c>
+    /// call site's argument evaluation order to have already thrown via a same-handle
+    /// <see cref="UploadF32"/> call — a BF16 handle must never reach the
+    /// <c>Buffer.MemoryCopy</c> below, which would otherwise read <paramref name="expectedElements"/>
+    /// * 4 bytes from a half-sized mmap region regardless of call-site ordering.
+    /// </summary>
+    private static unsafe float[] CopyHostF32(Mamba3TensorHandle handle, long expectedElements)
+    {
+        var host = new float[expectedElements];
+        if (!handle.IsPopulated) return host;
+        if (handle.SourceDType != SafetensorsDType.F32)
+            throw new NotSupportedException(
+                $"CudaMamba3TransformerModel requires F32 tensors; got {handle.SourceDType}. "
+                + "Quantized/F16 Mamba-3 weights are not yet supported on CUDA (CPU-parity scope, issue #346).");
+        fixed (float* p = host)
+            Buffer.MemoryCopy((void*)handle.Pointer, p, host.Length * sizeof(float), expectedElements * sizeof(float));
+        return host;
     }
 
     /// <summary>
@@ -453,7 +542,6 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
         _yScanDevice = AllocF32((long)cap * dInner);
         _dtDevice = AllocF32((long)cap * nHead);
         _adtDevice = AllocF32((long)cap * nHead);
-        _trapDevice = AllocF32((long)cap * nHead);
         _gammaDevice = AllocF32((long)cap * nHead);
         _scaleDevice = AllocF32((long)cap * nHead);
         _qkPreDotDevice = AllocF32((long)cap * nHead);
@@ -461,6 +549,24 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
         _bDevice = AllocF32((long)cap * effRank * nHead * dState);
         _cDevice = AllocF32((long)cap * effRank * nHead * dState);
         _coefDevice = AllocF32(nHead);
+
+        // #382 item 1: reusable host-side per-forward scratch, grown alongside the device
+        // buffers above instead of `new float[...]` per layer per forward in
+        // HostPrepareSiso/HostPrepareMimo. Sized identically to their device counterparts
+        // (bcWidth = effRank * nHead * dState covers both the SISO [T, H, N] and MIMO
+        // [T, R, H, N] layouts, matching _bDevice/_cDevice's own sizing).
+        _hostProj = new float[(long)cap * dInProj];
+        _hostX = new float[(long)cap * dInner];
+        _hostZ = new float[(long)cap * dInner];
+        _hostDt = new float[(long)cap * nHead];
+        _hostAdt = new float[(long)cap * nHead];
+        _hostTrap = new float[(long)cap * nHead];
+        _hostGamma = new float[(long)cap * nHead];
+        _hostScale = new float[(long)cap * nHead];
+        _hostAnglesRaw = new float[(long)cap * numRopeAngles];
+        _hostB = new float[(long)cap * effRank * nHead * dState];
+        _hostC = new float[(long)cap * effRank * nHead * dState];
+        _hostQkPreDot = new float[(long)cap * nHead];
 
         _scratchCapacity = cap;
     }
@@ -571,7 +677,7 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
                 if (_m3.IsMimo)
                 {
                     HostPrepareMimo(seqLen, dInProj, dInner, nHead, dState, numRopeAngles, effRank, aFloor, eps,
-                        lw.DtBias, lw.BNorm, lw.CNorm, lw.BBias, lw.CBias, s);
+                        lw, s);
 
                     // Data-RoPE (device) — mutates _bDevice/_cDevice in place, threads cum_angle.
                     // Halved mode for MIMO (Mamba3Block.ForwardMimo Step 5), nRank=effRank.
@@ -625,7 +731,7 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
                     // softplus/sigmoid/RMSNorm+bias/qk_pre_dot/scale math on CPU (mirrors
                     // Mamba3Block.Forward Steps 2-4 exactly), H2D the results back.
                     HostPrepareSiso(seqLen, dInProj, dInner, nHead, dState, numRopeAngles, aFloor, eps,
-                        lw.DtBias, lw.BNorm, lw.CNorm, lw.BBias, lw.CBias, s);
+                        lw, s);
 
                     // Data-RoPE (device) — mutates _bDevice/_cDevice in place, threads cum_angle.
                     _kernels.LaunchMamba3DataRopeF32(_bDevice, _cDevice, _anglesRawDevice, _dtDevice,
@@ -673,11 +779,18 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
                 _kernels.LaunchAddF32(_residual, _blockOut, _hidden, seqLen * hiddenSize, s);
             }
 
-            // 8. Final RMSNorm (device, in place) + lm_head GEMM (device, last token only).
-            _kernels.LaunchRmsNormF32(_hidden, _finalNormDevice, _hidden, hiddenSize, eps, seqLen, s);
+            // 8. Final RMSNorm + lm_head GEMM (device, last token only).
+            // #382 item 4: only the last row feeds the lm_head GEMV — normalizing all seqLen
+            // rows (as the previous version did) is wasted prefill work RMSNorm being
+            // row-independent makes provably unnecessary. Mirrors
+            // VulkanMamba3TransformerModel.RunFinalNormAndLmHead: D2D-copy the last row into the
+            // fixed-size _lastHiddenDevice scratch, then norm with rowCount:1.
+            long hiddenRowBytes = (long)hiddenSize * sizeof(float);
+            nint lastHiddenSrc = _hidden + (nint)((long)(seqLen - 1) * hiddenRowBytes);
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_lastHiddenDevice, lastHiddenSrc, (nuint)hiddenRowBytes, s).ThrowOnError();
+            _kernels.LaunchRmsNormF32(_lastHiddenDevice, _finalNormDevice, _lastHiddenDevice, hiddenSize, eps, rows: 1, s);
 
-            nint lastHidden = _hidden + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
-            CudaGemm.GemvF32(_cublas.Handle, _lmHeadDevice, lastHidden, _logitsDevice, vocabSize, hiddenSize, s);
+            CudaGemm.GemvF32(_cublas.Handle, _lmHeadDevice, _lastHiddenDevice, _logitsDevice, vocabSize, hiddenSize, s);
 
             var shape = new TensorShape(1, vocabSize);
             var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
@@ -701,34 +814,31 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
     /// attempted in this plan (see the biggest-risk note).
     /// </summary>
     private void HostPrepareSiso(int seqLen, int dInProj, int dInner, int nHead, int dState,
-        int numRopeAngles, float aFloor, float normEps,
-        nint dtBiasDevice, nint bNormDevice, nint cNormDevice, nint bBiasDevice, nint cBiasDevice,
-        nint stream)
+        int numRopeAngles, float aFloor, float normEps, DeviceLayer lw, nint stream)
     {
-        float[] proj = new float[seqLen * dInProj];
+        // #382 item 1: reuse the cap-sized host scratch fields instead of `new float[...]` —
+        // only the first seqLen-scaled prefix of each is valid/written this call; the D2H copy
+        // below and every UploadF32Array call at the bottom are careful to size themselves off
+        // `seqLen`, not the (possibly larger) field's own Length, matching the analogous care
+        // EnsureScratchCapacity's device buffers already require.
+        float[] proj = _hostProj;
         fixed (float* p = proj)
-            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, _projDevice, (nuint)(proj.Length * sizeof(float))).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, _projDevice, (nuint)((long)seqLen * dInProj * sizeof(float))).ThrowOnError();
 
-        float[] dtBias = DownloadF32(dtBiasDevice, nHead);
-        float[] bNormW = DownloadF32(bNormDevice, dState);
-        float[] cNormW = DownloadF32(cNormDevice, dState);
-        float[] bBias = DownloadF32(bBiasDevice, nHead * dState);   // numBcHeads=1 SISO, so [nHead, dState]
-        float[] cBias = DownloadF32(cBiasDevice, nHead * dState);
+        // #382 item 2: cached once at load (DeviceLayer.*Host) — no more per-forward
+        // cuMemcpyDtoH_v2 re-download of these static per-layer tensors.
+        float[] dtBias = lw.DtBiasHost;
+        float[] bNormW = lw.BNormHost;
+        float[] cNormW = lw.CNormHost;
+        float[] bBias = lw.BBiasHost;   // numBcHeads=1 SISO, so [nHead, dState]
+        float[] cBias = lw.CBiasHost;
 
         int ofsZ = 0, ofsX = dInner, ofsB = 2 * dInner, ofsC = ofsB + dState;
         int ofsDdDt = ofsC + dState, ofsDdA = ofsDdDt + nHead, ofsTrap = ofsDdA + nHead, ofsAngles = ofsTrap + nHead;
 
-        var x = new float[seqLen * dInner];
-        var z = new float[seqLen * dInner];
-        var dt = new float[seqLen * nHead];
-        var adt = new float[seqLen * nHead];
-        var trap = new float[seqLen * nHead];
-        var gamma = new float[seqLen * nHead];
-        var scale = new float[seqLen * nHead];
-        var anglesRaw = new float[seqLen * numRopeAngles];
-        var bHRN = new float[seqLen * nHead * dState];
-        var cHRN = new float[seqLen * nHead * dState];
-        var qkPreDot = new float[seqLen * nHead];
+        float[] x = _hostX, z = _hostZ, dt = _hostDt, adt = _hostAdt, trap = _hostTrap,
+            gamma = _hostGamma, scale = _hostScale, anglesRaw = _hostAnglesRaw,
+            bHRN = _hostB, cHRN = _hostC, qkPreDot = _hostQkPreDot;
 
         for (int t = 0; t < seqLen; t++)
         {
@@ -804,20 +914,21 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
         // Chunk-boundary coefficient: coef[h] = dt[0,h] * (1 - trap[0,h]) — only the
         // FIRST token's dt/trap matter (Mamba3Block.ApplyChunkBoundaryAdjustment reads
         // dt[0,:]/trap[0,:] only).
-        var coef = new float[nHead];
+        float[] coef = _hostCoef;
         for (int h = 0; h < nHead; h++) coef[h] = dt[h] * (1f - trap[h]);
 
-        UploadF32Array(x, _xDevice, stream);
-        UploadF32Array(z, _zDevice, stream);
-        UploadF32Array(dt, _dtDevice, stream);
-        UploadF32Array(adt, _adtDevice, stream);
-        UploadF32Array(trap, _trapDevice, stream);
-        UploadF32Array(gamma, _gammaDevice, stream);
-        UploadF32Array(scale, _scaleDevice, stream);
-        UploadF32Array(anglesRaw, _anglesRawDevice, stream);
-        UploadF32Array(bHRN, _bDevice, stream);
-        UploadF32Array(cHRN, _cDevice, stream);
-        UploadF32Array(qkPreDot, _qkPreDotDevice, stream);
+        UploadF32Array(x.AsSpan(0, seqLen * dInner), _xDevice, stream);
+        UploadF32Array(z.AsSpan(0, seqLen * dInner), _zDevice, stream);
+        UploadF32Array(dt.AsSpan(0, seqLen * nHead), _dtDevice, stream);
+        UploadF32Array(adt.AsSpan(0, seqLen * nHead), _adtDevice, stream);
+        // trap is never uploaded — #382 item 3: no kernel consumes a device trap buffer
+        // (the removed _trapDevice was allocated + uploaded every layer for nothing).
+        UploadF32Array(gamma.AsSpan(0, seqLen * nHead), _gammaDevice, stream);
+        UploadF32Array(scale.AsSpan(0, seqLen * nHead), _scaleDevice, stream);
+        UploadF32Array(anglesRaw.AsSpan(0, seqLen * numRopeAngles), _anglesRawDevice, stream);
+        UploadF32Array(bHRN.AsSpan(0, seqLen * nHead * dState), _bDevice, stream);
+        UploadF32Array(cHRN.AsSpan(0, seqLen * nHead * dState), _cDevice, stream);
+        UploadF32Array(qkPreDot.AsSpan(0, seqLen * nHead), _qkPreDotDevice, stream);
         UploadF32Array(coef, _coefDevice, stream);
         _stream.Synchronize();
     }
@@ -830,37 +941,28 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
     /// the pre-rotation dot over rank (<c>qkPreDotSum</c>).
     /// </summary>
     private void HostPrepareMimo(int seqLen, int dInProj, int dInner, int nHead, int dState,
-        int numRopeAngles, int mimoRank, float aFloor, float normEps,
-        nint dtBiasDevice, nint bNormDevice, nint cNormDevice, nint bBiasDevice, nint cBiasDevice,
-        nint stream)
+        int numRopeAngles, int mimoRank, float aFloor, float normEps, DeviceLayer lw, nint stream)
     {
         int r_ = mimoRank;
         int bcPerToken = dState * r_; // numBcHeads=1 on every known checkpoint
 
-        float[] proj = new float[seqLen * dInProj];
+        // #382 items 1+2 — see HostPrepareSiso's matching comments; identical rationale.
+        float[] proj = _hostProj;
         fixed (float* p = proj)
-            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, _projDevice, (nuint)(proj.Length * sizeof(float))).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, _projDevice, (nuint)((long)seqLen * dInProj * sizeof(float))).ThrowOnError();
 
-        float[] dtBias = DownloadF32(dtBiasDevice, nHead);
-        float[] bNormW = DownloadF32(bNormDevice, dState);
-        float[] cNormW = DownloadF32(cNormDevice, dState);
-        float[] bBias = DownloadF32(bBiasDevice, nHead * r_ * dState);   // [H, R, N]
-        float[] cBias = DownloadF32(cBiasDevice, nHead * r_ * dState);
+        float[] dtBias = lw.DtBiasHost;
+        float[] bNormW = lw.BNormHost;
+        float[] cNormW = lw.CNormHost;
+        float[] bBias = lw.BBiasHost;   // [H, R, N]
+        float[] cBias = lw.CBiasHost;
 
         int ofsZ = 0, ofsX = dInner, ofsB = 2 * dInner, ofsC = ofsB + bcPerToken;
         int ofsDdDt = ofsC + bcPerToken, ofsDdA = ofsDdDt + nHead, ofsTrap = ofsDdA + nHead, ofsAngles = ofsTrap + nHead;
 
-        var x = new float[seqLen * dInner];
-        var z = new float[seqLen * dInner];
-        var dt = new float[seqLen * nHead];
-        var adt = new float[seqLen * nHead];
-        var trap = new float[seqLen * nHead];
-        var gamma = new float[seqLen * nHead];
-        var scale = new float[seqLen * nHead];
-        var anglesRaw = new float[seqLen * numRopeAngles];
-        var bRHN = new float[seqLen * r_ * nHead * dState];
-        var cRHN = new float[seqLen * r_ * nHead * dState];
-        var qkPreDotSum = new float[seqLen * nHead];
+        float[] x = _hostX, z = _hostZ, dt = _hostDt, adt = _hostAdt, trap = _hostTrap,
+            gamma = _hostGamma, scale = _hostScale, anglesRaw = _hostAnglesRaw,
+            bRHN = _hostB, cRHN = _hostC, qkPreDotSum = _hostQkPreDot;
 
         for (int t = 0; t < seqLen; t++)
         {
@@ -937,34 +1039,25 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
             }
         }
 
-        var coef = new float[nHead];
+        float[] coef = _hostCoef;
         for (int h = 0; h < nHead; h++) coef[h] = dt[h] * (1f - trap[h]);
 
-        UploadF32Array(x, _xDevice, stream);
-        UploadF32Array(z, _zDevice, stream);
-        UploadF32Array(dt, _dtDevice, stream);
-        UploadF32Array(adt, _adtDevice, stream);
-        UploadF32Array(trap, _trapDevice, stream);
-        UploadF32Array(gamma, _gammaDevice, stream);
-        UploadF32Array(scale, _scaleDevice, stream);
-        UploadF32Array(anglesRaw, _anglesRawDevice, stream);
-        UploadF32Array(bRHN, _bDevice, stream);
-        UploadF32Array(cRHN, _cDevice, stream);
-        UploadF32Array(qkPreDotSum, _qkPreDotDevice, stream);
+        UploadF32Array(x.AsSpan(0, seqLen * dInner), _xDevice, stream);
+        UploadF32Array(z.AsSpan(0, seqLen * dInner), _zDevice, stream);
+        UploadF32Array(dt.AsSpan(0, seqLen * nHead), _dtDevice, stream);
+        UploadF32Array(adt.AsSpan(0, seqLen * nHead), _adtDevice, stream);
+        // trap is never uploaded — see HostPrepareSiso's matching comment (#382 item 3).
+        UploadF32Array(gamma.AsSpan(0, seqLen * nHead), _gammaDevice, stream);
+        UploadF32Array(scale.AsSpan(0, seqLen * nHead), _scaleDevice, stream);
+        UploadF32Array(anglesRaw.AsSpan(0, seqLen * numRopeAngles), _anglesRawDevice, stream);
+        UploadF32Array(bRHN.AsSpan(0, seqLen * r_ * nHead * dState), _bDevice, stream);
+        UploadF32Array(cRHN.AsSpan(0, seqLen * r_ * nHead * dState), _cDevice, stream);
+        UploadF32Array(qkPreDotSum.AsSpan(0, seqLen * nHead), _qkPreDotDevice, stream);
         UploadF32Array(coef, _coefDevice, stream);
         _stream.Synchronize();
     }
 
-    private static float[] DownloadF32(nint devicePtr, int elementCount)
-    {
-        var host = new float[elementCount];
-        if (devicePtr == 0) return host;
-        fixed (float* p = host)
-            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, devicePtr, (nuint)(elementCount * sizeof(float))).ThrowOnError();
-        return host;
-    }
-
-    private static void UploadF32Array(float[] host, nint devicePtr, nint stream)
+    private static void UploadF32Array(ReadOnlySpan<float> host, nint devicePtr, nint stream)
     {
         fixed (float* p = host)
             CudaDriverApi.cuMemcpyHtoDAsync_v2(devicePtr, (nint)p, (nuint)(host.Length * sizeof(float)), stream).ThrowOnError();
@@ -994,10 +1087,12 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
 
     private long ScratchAllocatedBytes()
     {
-        // _logitsDevice is allocated once in the constructor, independent of
-        // _scratchCapacity — always counted.
+        // _logitsDevice and _lastHiddenDevice are allocated once in the constructor,
+        // independent of _scratchCapacity — always counted.
         long logitsBytes = (long)Config.VocabSize * sizeof(float);
-        if (_scratchCapacity == 0) return logitsBytes;
+        long lastHiddenBytes = (long)Config.HiddenSize * sizeof(float);
+        long fixedBytes = logitsBytes + lastHiddenBytes;
+        if (_scratchCapacity == 0) return fixedBytes;
         long cap = _scratchCapacity;
         int hidden = Config.HiddenSize, dInner = _m3.DInner, nHead = _m3.NumHeads;
         int dState = _m3.StateSize, numRopeAngles = _m3.NumRopeAngles;
@@ -1005,11 +1100,11 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
         long floats = cap * hidden * 4L                       // hidden/residual/normOut/blockOut
                     + cap * _m3.InputProjectionDim             // proj
                     + cap * dInner * 3L                        // x/z/yScan
-                    + cap * nHead * 6L                         // dt/adt/trap/gamma/scale/qkPreDot
+                    + cap * nHead * 5L                         // dt/adt/gamma/scale/qkPreDot (#382 item 3: trap removed)
                     + cap * numRopeAngles                      // anglesRaw
                     + cap * effRank * nHead * dState * 2L      // b/c
                     + nHead;                                   // _coefDevice — [nHead], not cap-scaled
-        return floats * sizeof(float) + logitsBytes;
+        return floats * sizeof(float) + fixedBytes;
     }
 
     /// <inheritdoc/>
@@ -1029,6 +1124,7 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
         FreeIfNonZero(_finalNormDevice);
         if (_lmHeadOwnsDevice) FreeIfNonZero(_lmHeadDevice);
         FreeIfNonZero(_logitsDevice);
+        FreeIfNonZero(_lastHiddenDevice);
         FreeScratch();
 
         _kernels.Dispose();
@@ -1063,7 +1159,7 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
     {
         FreeAndClear(ref _hidden); FreeAndClear(ref _residual); FreeAndClear(ref _normOut); FreeAndClear(ref _blockOut);
         FreeAndClear(ref _projDevice); FreeAndClear(ref _xDevice); FreeAndClear(ref _zDevice); FreeAndClear(ref _yScanDevice);
-        FreeAndClear(ref _dtDevice); FreeAndClear(ref _adtDevice); FreeAndClear(ref _trapDevice);
+        FreeAndClear(ref _dtDevice); FreeAndClear(ref _adtDevice);
         FreeAndClear(ref _gammaDevice); FreeAndClear(ref _scaleDevice); FreeAndClear(ref _qkPreDotDevice);
         FreeAndClear(ref _anglesRawDevice); FreeAndClear(ref _bDevice); FreeAndClear(ref _cDevice); FreeAndClear(ref _coefDevice);
         _scratchCapacity = 0;
