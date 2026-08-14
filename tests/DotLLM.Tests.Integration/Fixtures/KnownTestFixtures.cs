@@ -40,6 +40,32 @@ internal static class KnownTestFixtures
     public const string Gemma4_26BDescription = "Gemma-4-26B-A4B-it Q4_K_M GGUF (~15.7 GB)";
 
     /// <summary>
+    /// Qwen2.5-0.5B-Instruct, Q8_0 (~0.5 GB) — <c>Qwen/Qwen2.5-0.5B-Instruct-GGUF</c>.
+    /// Carries <c>tokenizer.ggml.pre = qwen2</c>, the value on every Qwen2/Qwen3 GGUF (#397).
+    /// </summary>
+    public static FixtureLocation Qwen2_5_0_5B_Q8_0 => TestFixtureResolver.ResolveFile(
+        "DOTLLM_QWEN25_0_5B_Q8_0_GGUF",
+        "Qwen",
+        "Qwen2.5-0.5B-Instruct-GGUF",
+        "qwen2.5-0.5b-instruct-q8_0.gguf");
+
+    /// <summary>Human-readable name for <see cref="Qwen2_5_0_5B_Q8_0"/> skip messages.</summary>
+    public const string Qwen2_5_0_5BDescription = "Qwen2.5-0.5B-Instruct Q8_0 GGUF (tokenizer.ggml.pre = qwen2)";
+
+    /// <summary>
+    /// Ternary-Bonsai-27B, Q2_0 (~7.2 GB) — <c>prism-ml/Ternary-Bonsai-27B-gguf</c>.
+    /// Carries <c>tokenizer.ggml.pre = qwen35</c> (#397).
+    /// </summary>
+    public static FixtureLocation TernaryBonsai27B_Q2_0 => TestFixtureResolver.ResolveFile(
+        "DOTLLM_BONSAI_PQ2_0_GGUF",
+        "prism-ml",
+        "Ternary-Bonsai-27B-gguf",
+        "Ternary-Bonsai-27B-Q2_0.gguf");
+
+    /// <summary>Human-readable name for <see cref="TernaryBonsai27B_Q2_0"/> skip messages.</summary>
+    public const string TernaryBonsai27BDescription = "Ternary-Bonsai-27B Q2_0 GGUF (tokenizer.ggml.pre = qwen35)";
+
+    /// <summary>
     /// DeepSeek-V2-Lite HF safetensors snapshot directory —
     /// <c>deepseek-ai/DeepSeek-V2-Lite</c>.
     /// </summary>

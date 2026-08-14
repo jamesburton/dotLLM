@@ -24,22 +24,43 @@ public class PreTokenizerPolicyTests
     /// with NO pre-tokenization (the old unknown-pre behavior) "1234" is one
     /// segment and 3+4 merges. Token count 4 vs 3 discriminates the two.
     /// </summary>
-    private static BpeTokenizer Build(string? preType)
+    private static BpeTokenizer Build(string? preType) => Build(preType, "34", "3 4");
+
+    /// <summary>
+    /// Builds the same 256-byte GPT-2 vocabulary with one extra merged token, so a
+    /// single merge either fires or is blocked purely by where the pre-tokenizer put
+    /// its segment boundary.
+    /// </summary>
+    /// <param name="preType">GGUF <c>tokenizer.ggml.pre</c> value under test.</param>
+    /// <param name="mergedToken">The extra vocabulary entry, in byte-level (GPT-2
+    /// <c>bytes_to_unicode</c>) spelling.</param>
+    /// <param name="merge">The single merge rule producing <paramref name="mergedToken"/>.</param>
+    private static BpeTokenizer Build(string? preType, string mergedToken, string merge)
+        => BpeTokenizer.CreateTiktoken(Vocab(mergedToken), merges: [merge], tokenTypes: null,
+            bosId: 0, eosId: 0, preTokenizerType: preType);
+
+    /// <summary>The 256 byte tokens plus one merged entry.</summary>
+    private static string[] Vocab(string mergedToken)
     {
-        char[] byteToUnicode = new char[256];
-        for (int b = 33; b <= 126; b++) byteToUnicode[b] = (char)b;
-        for (int b = 161; b <= 172; b++) byteToUnicode[b] = (char)b;
-        for (int b = 174; b <= 255; b++) byteToUnicode[b] = (char)b;
+        string[] tokens = new string[257];
+        for (int i = 0; i < 256; i++) tokens[i] = ByteToUnicode[i].ToString();
+        tokens[256] = mergedToken;
+        return tokens;
+    }
+
+    /// <summary>GPT-2 <c>bytes_to_unicode</c> table — printable bytes map to themselves.</summary>
+    private static readonly char[] ByteToUnicode = BuildByteToUnicode();
+
+    private static char[] BuildByteToUnicode()
+    {
+        char[] map = new char[256];
+        for (int b = 33; b <= 126; b++) map[b] = (char)b;
+        for (int b = 161; b <= 172; b++) map[b] = (char)b;
+        for (int b = 174; b <= 255; b++) map[b] = (char)b;
         int n = 0;
         for (int b = 0; b < 256; b++)
-            if (byteToUnicode[b] == 0) byteToUnicode[b] = (char)(0x100 + n++);
-
-        string[] tokens = new string[257];
-        for (int i = 0; i < 256; i++) tokens[i] = byteToUnicode[i].ToString();
-        tokens[256] = "34";
-
-        return BpeTokenizer.CreateTiktoken(tokens, merges: ["3 4"], tokenTypes: null,
-            bosId: 0, eosId: 0, preTokenizerType: preType);
+            if (map[b] == 0) map[b] = (char)(0x100 + n++);
+        return map;
     }
 
     [Theory]
@@ -75,12 +96,80 @@ public class PreTokenizerPolicyTests
         Assert.Single(Build("llama3").Encode("34")); // {1,3} group → "34" merges
     }
 
+    /// <summary>
+    /// Issue #397 — <c>qwen2</c> is the value on <b>every</b> Qwen2/Qwen3 GGUF, and it
+    /// differs from llama3 in exactly one place: the digit alternative is a bare
+    /// <c>\p{N}</c>, not <c>\p{N}{1,3}</c>. With a "3 4" merge in the vocab, "34"
+    /// therefore stays two tokens under qwen2 and collapses to one under both gpt2
+    /// (<c> ?\p{N}+</c>) and llama3 — so this fails if qwen2 is routed to either.
+    /// </summary>
+    [Theory]
+    [InlineData("qwen2")]
+    [InlineData("qwen35")]
+    [InlineData("deepseek-r1-qwen")] // llama.cpp: -> LLAMA_VOCAB_PRE_TYPE_QWEN2
+    [InlineData("kormo")]
+    [InlineData("f2llmv2")]
+    [InlineData("megrez")]
+    public void QwenPipelines_SplitEveryDigit_UnlikeGpt2AndLlama3(string preType)
+    {
+        Assert.Equal(2, Build(preType).Encode("34").Length);
+        Assert.Single(Build("gpt2").Encode("34"));
+        Assert.Single(Build("llama3").Encode("34"));
+    }
+
+    /// <summary>
+    /// The discriminator between <c>qwen35</c> and <c>qwen2</c> (they share the bare
+    /// <c>\p{N}</c>, so the digit test above cannot tell them apart): qwen35's letter
+    /// run is <c>[\p{L}\p{M}]+</c>, so a decomposed "e" + U+0301 COMBINING ACUTE stays
+    /// one segment, while qwen2/llama3/gpt2 all use <c>\p{L}+</c> and split the mark
+    /// off into the punctuation alternative. The vocab carries the byte-level merge
+    /// "e" + 0xCC (the first UTF-8 byte of U+0301), which can only fire inside a single
+    /// segment — 2 tokens under qwen35, 3 under everything else.
+    /// </summary>
+    [Fact]
+    public void Qwen35_KeepsCombiningMarksInTheLetterRun_UnlikeQwen2Gpt2AndLlama3()
+    {
+        // Built from code points rather than source literals so the test cannot be
+        // defeated by an editor silently NFC-composing the file.
+        string input = "e" + (char)0x0301;   // e + COMBINING ACUTE ACCENT (UTF-8: 65 CC 81)
+        string merged = "e" + (char)0x00CC;   // bytes_to_unicode spelling of the bytes 65 CC
+        string merge = "e " + (char)0x00CC;
+
+        Assert.Equal(2, Build("qwen35", merged, merge).Encode(input).Length);
+        Assert.Equal(3, Build("qwen2", merged, merge).Encode(input).Length);
+        Assert.Equal(3, Build("llama3", merged, merge).Encode(input).Length);
+        Assert.Equal(3, Build("gpt2", merged, merge).Encode(input).Length);
+    }
+
     [Fact]
     public void UnknownPreType_Throws_NamingTheValue()
     {
         var ex = Assert.Throws<InvalidDataException>(() => Build("no-such-pre-tokenizer"));
         Assert.Contains("no-such-pre-tokenizer", ex.Message, StringComparison.Ordinal);
         Assert.Contains(OptOutVar, ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Negative control for <see cref="UnknownPreType_Throws_NamingTheValue"/>, required by
+    /// #373. The pre-fix behaviour — unknown <c>pre</c> resolved to a <c>null</c> regex, i.e.
+    /// NO pre-tokenization — is reconstructed explicitly here via
+    /// <see cref="BpeTokenizer.CreateTiktokenWithRegex"/> and shown to (a) load without
+    /// complaint and (b) produce a materially different token stream. That is exactly what the
+    /// old silent path did on an unknown value: it "passed", and mis-tokenized.
+    /// </summary>
+    [Fact]
+    public void NegativeControl_TheOldSilentNoPreTokenizationPath_LoadsQuietlyAndMisTokenizes()
+    {
+        var silent = BpeTokenizer.CreateTiktokenWithRegex(
+            Vocab("34"), merges: ["3 4"], tokenTypes: null, bosId: 0, eosId: 0, preRegex: null);
+
+        // (a) No throw, no diagnostic — the failure mode #373 removed.
+        // (b) One segment for the whole input, so the "3 4" merge fires where every
+        //     real pipeline forbids it: 1 token vs 2 under qwen2, 3 vs 4 under llama3.
+        Assert.Single(silent.Encode("34"));
+        Assert.Equal(2, Build("qwen2").Encode("34").Length);
+        Assert.Equal(3, silent.Encode("1234").Length);
+        Assert.Equal(4, Build("llama3").Encode("1234").Length);
     }
 
     [Fact]

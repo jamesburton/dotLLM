@@ -71,6 +71,34 @@ internal static class TiktokenPreTokenizer
         RegexOptions.Compiled),
     ];
 
+    // ── Qwen 2 / Qwen 3 (llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN2) ──────
+    // Identical to the Llama-3 expression EXCEPT the digit alternative is a bare
+    // `\p{N}` (one digit per segment) instead of `\p{N}{1,3}`, so BPE never merges
+    // across digits. This is the ORIGINAL tokenizer.json pattern that llama.cpp
+    // quotes verbatim in the comment above its own copy (llama-vocab.cpp, the
+    // QWEN2 case); llama.cpp spells the contractions out as `'[sS]|'[tT]|…` only
+    // because std::regex has no `(?i:…)` group — the two are equivalent and .NET
+    // supports the original form directly.
+    private static readonly Regex[] Qwen2Pipeline =
+    [
+        new(@"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+            RegexOptions.Compiled),
+    ];
+
+    // ── Qwen 3.5 (llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN35) ────────────
+    // Qwen2's expression with combining marks folded into the letter run:
+    // `[\p{L}\p{M}]+` instead of `\p{L}+`, and `\p{M}` excluded from the
+    // punctuation class (`[^\s\p{L}\p{M}\p{N}]+`). A decomposed "e" + U+0301
+    // therefore stays ONE segment here but splits into letter + mark under
+    // qwen2/llama3/gpt2 — the property the discriminating test exercises.
+    // Original tokenizer.json pattern, quoted verbatim by llama.cpp above its
+    // QWEN35 case.
+    private static readonly Regex[] Qwen35Pipeline =
+    [
+        new(@"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+            RegexOptions.Compiled),
+    ];
+
     // ── Tekken (Mistral NeMo / Pixtral-12B tokenizer family; also NVIDIA
     // Nemotron-Nano-9B-v2). llama.cpp LLAMA_VOCAB_PRE_TYPE_TEKKEN. This is the
     // ORIGINAL tokenizer.json pattern (quoted verbatim in llama-vocab.cpp:408);
@@ -111,10 +139,18 @@ internal static class TiktokenPreTokenizer
         // (llama-vocab.cpp, the "llama3" case block).
         "llama3" or "llama-v3" or "llama-bpe" or "falcon3" or "falcon-h1"
             or "pixtral" or "midm-2.0" or "lfm2" or "jina-v5-nano" => Llama3Pipeline,
+        // "minerva-7b" is llama.cpp's actual spelling; "minerva" is kept because
+        // earlier dotLLM releases accepted it and no GGUF is known to carry it.
         "starcoder" or "refact" or "command-r" or "smollm"
-            or "codeshell" or "exaone" or "minerva" or "mellum2" => StarCoderPipeline,
+            or "codeshell" or "exaone" or "minerva" or "minerva-7b"
+            or "mellum2" => StarCoderPipeline,
         "deepseek-llm" => DeepSeekLlmPipeline,
         "deepseek-coder" => DeepSeekCoderPipeline,
+        // llama.cpp routes all of these to LLAMA_VOCAB_PRE_TYPE_QWEN2, and gives
+        // STABLELM2 / HUNYUAN / SOLAR_OPEN the same regex block by case fall-through.
+        "qwen2" or "deepseek-r1-qwen" or "kormo" or "f2llmv2" or "megrez"
+            or "stablelm2" or "hunyuan" or "solar-open" => Qwen2Pipeline,
+        "qwen35" => Qwen35Pipeline,
         "gpt-4o" or "llama4" => Gpt4oPipeline,
         "tekken" => TekkenPipeline,
         _ => Environment.GetEnvironmentVariable("DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER") == "1"
