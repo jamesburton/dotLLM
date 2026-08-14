@@ -43,53 +43,72 @@ namespace DotLLM.Tests.Integration.Cuda;
 [Trait("Category", "GPU")]
 public sealed class CudaMamba3MimoParitySyntheticTests : IDisposable
 {
-    private const int HiddenSize = 8;
+    // Issue #385: widened from the degenerate SISO-inherited tuple
+    // (NumHeads==HeadDim==4, HiddenSize==StateSize==8) so ALL of
+    // NumHeads/HeadDim/StateSize/HiddenSize/MimoRank are pairwise distinct —
+    // an H<->P (head/headDim) or a hidden<->state axis transposition now
+    // produces an out-of-bounds index or a wrong-shape read instead of
+    // silently staying in bounds. Expand dropped 2->1 to keep the loader's
+    // hard invariant `num_heads*head_dim == expand*hidden_size` satisfied
+    // (Mamba3ConfigExtractor.cs:97-100): NumHeads*HeadDim=12, Expand*HiddenSize=1*12=12.
+    // HeadDim kept even (kernel-level MIMO SSD scan test uses headDim=64;
+    // no known odd-headDim vectorization path is exercised anywhere else).
+    private const int HiddenSize = 12;
     private const int VocabSize = 16;
     private const int NumLayers = 2;
-    private const int NumHeads = 4;
-    private const int HeadDim = 4;
-    private const int Expand = 2;
-    private const int StateSize = 8;
+    private const int NumHeads = 2;
+    private const int HeadDim = 6;
+    private const int Expand = 1;
+    private const int StateSize = 16;
     private const int MimoRank = 3;
     private const int DInner = NumHeads * HeadDim;
     private const int BcDim = StateSize * MimoRank;
-    private const int NumRopeAngles = 2;
+    // int(state_size * rope_fraction=0.5) / 2 = int(16*0.5)/2 = 4 (Mamba3Config.NumRopeAngles).
+    // Guard: 2*NumRopeAngles=8 <= StateSize=16 (LaunchMamba3DataRopeF32's second guard).
+    private const int NumRopeAngles = 4;
     private const int DInProj = 2 * DInner + 2 * BcDim + 3 * NumHeads + NumRopeAngles;
 
-    // Absolute logit tolerance for the single-shot comparison. Calibrated from what this
-    // fixture actually produces on real hardware (NOT the brief's transplanted 1e-2 —
-    // see Task 11's REVIEW fix round for why a transplanted/uncalibrated constant is
-    // exactly the failure mode this project has already shipped once): observed max_abs
-    // = 7.451E-9 (RTX 3060, this fixture/tokens/positions). Both backends run F32 (no
-    // quantization), so the residual drift is pure reduction-order noise through the
-    // MIMO rank-sum path — identical order of magnitude to CudaMamba3ParitySyntheticTests'
-    // SISO LogitsAbsTol=1e-6, same reasoning applied here (~134x margin over observed).
+    // Absolute logit tolerance for the single-shot comparison. Recalibrated for issue
+    // #385's widened fixture (NumHeads=2/HeadDim=6/StateSize=16/HiddenSize=12/MimoRank=3,
+    // all pairwise distinct — see field comments above) — NOT transplanted from the
+    // pre-#385 degenerate-dims value (see Task 11's REVIEW fix round for why a
+    // transplanted/uncalibrated constant is exactly the failure mode this project has
+    // already shipped once). Observed max_abs = 5.588E-9 (RTX 3060, this fixture/tokens/
+    // positions, 2026-08-14). Both backends run F32 (no quantization), so the residual
+    // drift is pure reduction-order noise through the MIMO rank-sum path — same order of
+    // magnitude as before widening (7.451E-9) and as CudaMamba3ParitySyntheticTests' SISO
+    // LogitsAbsTol=1e-6. Kept at 1e-6 (~179x margin over observed).
     private const float LogitsAbsTol = 1e-6f;
 
     // Floor for the two-chunk ablation delta (real state vs. k_state/v_state zeroed).
     // Both sides of this comparison are two deterministic CUDA runs on the same GPU — no
     // cross-backend/cross-run noise to hide behind, so any nonzero delta is a genuine
-    // effect of the ablation. Observed max_abs = 4.470E-8 (RTX 3060) — set ~4.5x below
-    // that, matching CudaMamba3ParitySyntheticTests.BoundaryContributionFloor's ~5x-below
-    // calibration approach.
-    private const float BoundaryContributionFloor = 1e-8f;
+    // effect of the ablation. Recalibrated for issue #385's widened fixture: observed
+    // max_abs = 5.141E-7 (RTX 3060, 2026-08-14; was 4.470E-8 pre-widening — the larger
+    // dims/rank give the rank-summed coef*kSum*v term more terms to sum, so a larger
+    // boundary contribution is expected). Set ~5x below that (1e-7), matching
+    // CudaMamba3ParitySyntheticTests.BoundaryContributionFloor's ~5x-below calibration
+    // approach — still >13,000,000x above the ~1e-13 no-op-boundary float-non-associativity
+    // floor the SISO comment cites, so this remains a real, non-noise gate.
+    private const float BoundaryContributionFloor = 1e-7f;
 
     // Tighter, separate tolerance for the two-chunk CPU-vs-CUDA comparison — the MIMO
     // analog of CudaMamba3ParitySyntheticTests.TwoChunkLogitsAbsTol. The plain
     // LogitsAbsTol above never exercises the chunk-boundary correction (single-shot has
     // no persisted state) so is far too loose to be a real gate for the coef*kSum*v
-    // (rank-summed) term this test exists to guard. Observed max_abs = 7.451E-9 (same
-    // order as the single-shot path — the MIMO chunk-boundary term reproduces CPU exactly
-    // here). Set to 1e-7 (~13x margin over observed 7.451E-9), matching Task 11's SISO
-    // TwoChunkLogitsAbsTol exactly. NOTE (found during this task's own mutation testing):
-    // unlike the SISO case, this logit-level comparison does NOT reliably discriminate a
-    // B-vs-C chunk-boundary persist bug for THIS fixture — the boundary term's own
-    // contribution to final logits is only ~4e-8 (see BoundaryContributionFloor), so a
-    // wrong-tensor swap perturbs an already-tiny term by an amount that stays within the
-    // same order as this fixture's own F32 noise floor after attenuation through
-    // out_proj/residual/final-norm/lm_head. KStateAbsTol below is the assertion that
-    // actually catches that bug class (mutation-verified) — this constant is kept at the
-    // SISO-precedented value for logit-scale regressions unrelated to the boundary term.
+    // (rank-summed) term this test exists to guard. Recalibrated for issue #385's widened
+    // fixture: observed max_abs = 5.588E-9 (RTX 3060, 2026-08-14 — same order as the
+    // single-shot path; the MIMO chunk-boundary term reproduces CPU exactly here). Kept at
+    // 1e-7 (~18x margin over observed), matching Task 11's SISO TwoChunkLogitsAbsTol.
+    // Re-verified by mutation (2026-08-14, reintroducing the B-vs-C chunk-boundary persist
+    // swap at CudaMamba3TransformerModel.cs's MIMO branch, temporarily then reverted):
+    // like the pre-widening fixture, this logit-level comparison does NOT reliably
+    // discriminate the swap even at the new (wider, non-degenerate) dims — the boundary
+    // term's own contribution to final logits is only ~5e-7 (see BoundaryContributionFloor)
+    // and gets attenuated through out_proj/residual/final-norm/lm_head. KStateAbsTol below
+    // is the assertion that actually catches that bug class (mutation-verified below) —
+    // this constant is kept at the SISO-precedented value for logit-scale regressions
+    // unrelated to the boundary term.
     private const float TwoChunkLogitsAbsTol = 1e-7f;
 
     // Tolerance for the direct raw k_state comparison (see class remarks). This buffer
@@ -98,14 +117,20 @@ public sealed class CudaMamba3MimoParitySyntheticTests : IDisposable
     // Mamba3DataRoPE.ExecuteCanonical) and CUDA (HostPrepareMimo host math +
     // mamba3_data_rope_f32.cu, an independent expf/cosf/sinf-based kernel) — a looser
     // tolerance than the logit-scale ones above because this is comparing raw
-    // pre-out_proj/pre-norm values, not attenuated logits. Observed max_abs on the
-    // correct implementation (RTX 3060, this fixture): 1.192E-7 (layer 0) / 8.941E-8
-    // (layer 1) — pure F32 reduction-order noise, ~840x margin below this tolerance.
-    // MUTATION-VERIFIED: reintroducing the B-vs-C swap (this task's own brief had it
-    // wrong — see class remarks) changes this to 4.615E-1 (layer 0), ~4600x over this
-    // tolerance and ~3.9M x above the correct-code noise floor — this assertion, NOT the
-    // logit-level ones above, is what actually catches that bug class for this fixture.
-    private const float KStateAbsTol = 1e-4f;
+    // pre-out_proj/pre-norm values, not attenuated logits. Recalibrated for issue #385's
+    // widened fixture: observed max_abs on the correct implementation (RTX 3060,
+    // 2026-08-14) = 2.235E-7 (layer 0) / 3.278E-7 (layer 1) — pure F32 reduction-order
+    // noise (was 1.192E-7 / 8.941E-8 pre-widening; larger StateSize/MimoRank sum more
+    // terms so a modest increase is expected). Set to 3e-4 (~915x margin over the worst
+    // observed 3.278E-7), matching the pre-widening ~840x-margin calibration approach.
+    // MUTATION-VERIFIED (2026-08-14): reintroducing the B-vs-C swap at
+    // CudaMamba3TransformerModel.cs's MIMO chunk-boundary persist (`_bDevice` ->
+    // `_cDevice` at the `lastKSrc` assignment, temporarily then reverted — see class
+    // remarks / Mamba3Block.cs:680's kRoped=bRHN binding) changes this to 7.347E-1
+    // (layer 0), ~2450x over this tolerance and ~3.3M x above the correct-code noise
+    // floor — this assertion, NOT the logit-level ones above, is what actually catches
+    // that bug class for this fixture.
+    private const float KStateAbsTol = 3e-4f;
 
     private readonly ITestOutputHelper _output;
     private readonly string _scratch;
@@ -137,6 +162,7 @@ public sealed class CudaMamba3MimoParitySyntheticTests : IDisposable
         try
         {
             Assert.True(config.Mamba3Config!.IsMimo);
+            AssertDerivedDims(config.Mamba3Config);
 
             int[] tokenIds = [0, 1, 2, 3, 5];
             int[] positions = [0, 1, 2, 3, 4];
@@ -205,6 +231,7 @@ public sealed class CudaMamba3MimoParitySyntheticTests : IDisposable
         var cpuModel = (Mamba3TransformerModel)cpuModelBase;
         Mamba3Config m3 = config.Mamba3Config!;
         Assert.True(m3.IsMimo);
+        AssertDerivedDims(m3);
 
         try
         {
@@ -330,6 +357,21 @@ public sealed class CudaMamba3MimoParitySyntheticTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Issue #385 self-check: asserts this fixture's local constants match what
+    /// <see cref="Mamba3Config"/>'s own formulas derive from the same primitive
+    /// inputs (StateSize/NumHeads/HeadDim/NumGroups/RopeFraction/MimoRank) —
+    /// catches the fixture's own arithmetic drifting from the production
+    /// derivation it exists to exercise, before any forward pass runs.
+    /// </summary>
+    private static void AssertDerivedDims(Mamba3Config m3)
+    {
+        Assert.Equal(DInner, m3.DInner);
+        Assert.Equal(BcDim, m3.BcDim);
+        Assert.Equal(NumRopeAngles, m3.NumRopeAngles);
+        Assert.Equal(DInProj, m3.InputProjectionDim);
+    }
+
     /// <summary>Downloads a device buffer into a managed array via a D2H copy (test-only helper).</summary>
     private static unsafe float[] DownloadF32(nint devicePtr, int elementCount)
     {
@@ -406,10 +448,18 @@ public sealed class CudaMamba3MimoParitySyntheticTests : IDisposable
             AddSmall(tensors, Mamba3TensorMapping.CBias(i), [NumHeads, MimoRank, StateSize], 0.02f, sBase + 6);
             AddSmall(tensors, Mamba3TensorMapping.D(i), [NumHeads], 0.1f, sBase + 7);
             AddSmall(tensors, Mamba3TensorMapping.DtBias(i), [NumHeads], 0.02f, sBase + 8);
-            // Canonical init values: mimo_x ~ 1/R, mimo_z ~ 1, mimo_o ~ 1/R (Mamba3TensorMapping doc comments).
-            AddConstant(tensors, Mamba3TensorMapping.MimoX(i), [NumHeads, MimoRank, HeadDim], 1f / MimoRank);
-            AddConstant(tensors, Mamba3TensorMapping.MimoZ(i), [NumHeads, MimoRank, HeadDim], 1f);
-            AddConstant(tensors, Mamba3TensorMapping.MimoO(i), [NumHeads, MimoRank, HeadDim], 1f / MimoRank);
+            // Issue #385: canonical init values are mimo_x ~ 1/R, mimo_z ~ 1, mimo_o ~ 1/R
+            // (Mamba3TensorMapping doc comments), but a PURE constant fill is invariant
+            // under index permutation — a [H,R,P] stride/transposition bug on the
+            // consumption side (e.g. swapping the R and P axes, or a per-rank offset
+            // error) reads a different element that holds the exact same value and is
+            // therefore undetectable end-to-end. Perturb each with a small distinct
+            // seeded-cosine ramp around its canonical center (mirrors the CPU MIMO
+            // fixture's AddSeededCosinesAround / SafetensorsFixtureBuilder.cs) so a
+            // wrong-index read is very likely to land on a numerically different value.
+            AddSmallAround(tensors, Mamba3TensorMapping.MimoX(i), [NumHeads, MimoRank, HeadDim], 1f / MimoRank, 0.05f, sBase + 9);
+            AddSmallAround(tensors, Mamba3TensorMapping.MimoZ(i), [NumHeads, MimoRank, HeadDim], 1f, 0.05f, sBase + 10);
+            AddSmallAround(tensors, Mamba3TensorMapping.MimoO(i), [NumHeads, MimoRank, HeadDim], 1f / MimoRank, 0.05f, sBase + 11);
         }
 
         WriteSafetensorsFile(safetensorsPath, tensors);
@@ -428,12 +478,22 @@ public sealed class CudaMamba3MimoParitySyntheticTests : IDisposable
         sink.Add((name, shape, values));
     }
 
-    private static void AddConstant(List<(string, int[], float[])> sink, string name, int[] shape, float value)
+    /// <summary>
+    /// Issue #385: like <see cref="AddSmall"/> but centered on <paramref name="center"/>
+    /// instead of zero — used for MimoX/MimoZ/MimoO, whose canonical inits are non-zero
+    /// constants (1/R, 1, 1/R). Distinct <paramref name="seed"/> per tensor keeps the
+    /// three perturbation patterns from coinciding.
+    /// </summary>
+    private static void AddSmallAround(List<(string, int[], float[])> sink, string name, int[] shape, float center, float amplitude, int seed)
     {
         long n = 1;
         for (int i = 0; i < shape.Length; i++) n *= shape[i];
         var values = new float[n];
-        Array.Fill(values, value);
+        for (long i = 0; i < n; i++)
+        {
+            float phi = 0.61803398875f * (i + 1) + seed * 0.37f;
+            values[i] = center + amplitude * MathF.Cos(phi);
+        }
         sink.Add((name, shape, values));
     }
 
