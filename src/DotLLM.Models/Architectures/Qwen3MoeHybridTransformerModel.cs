@@ -988,9 +988,120 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
     /// Optional per-seq GDN recurrent state container. Must be a
     /// <see cref="GdnStateCache"/> sized for this model's GDN-layer count.
     /// </param>
-    [SkipLocalsInit]
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, IGdnState? gdnState)
+        => ForwardCore(tokenIds, ReadOnlySpan<float>.Empty, positions, deviceId, kvCache, gdnState,
+                       firstLayer: 0, layerCount: _layers.Length, hiddenOut: Span<float>.Empty)!;
+
+    /// <summary>
+    /// Runs a contiguous window of this model's layers standalone, entering from token ids
+    /// (<paramref name="firstLayer"/> is 0) or from a boundary hidden state, and leaving the
+    /// residual stream at the window's far edge.
+    /// </summary>
+    /// <remarks>
+    /// <para>This is the layer-cycling entry point (issue #395): the same trunk loop the whole-model
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?)"/> runs,
+    /// restricted to <c>[firstLayer, firstLayer + layerCount)</c>, with no output norm and no LM
+    /// head. Apply those separately with <see cref="ApplyOutputHead"/>.</para>
+    /// <para><b>GDN state stays globally indexed.</b> Each Gated-DeltaNet layer addresses its
+    /// recurrent slot through the constructor-built <c>_gdnLayerOrdinal</c> table, which is keyed by
+    /// <em>absolute</em> layer index. A window therefore reads and writes exactly the slots that
+    /// layer would touch in a whole-model run — re-deriving the ordinal by counting from the window
+    /// start would silently shift every GDN layer onto the wrong slot and produce a plausible wrong
+    /// number rather than an exception.</para>
+    /// </remarks>
+    /// <param name="tokenIds">Token ids; required when <paramref name="firstLayer"/> is 0, else ignored.</param>
+    /// <param name="hiddenIn">
+    /// Row-major <c>[seqLen, HiddenSize]</c> boundary hidden state to resume from. Required when
+    /// <paramref name="firstLayer"/> is greater than 0; empty for the first window.
+    /// </param>
+    /// <param name="positions">Absolute position id per row; its length defines <c>seqLen</c>.</param>
+    /// <param name="firstLayer">First global layer index to execute.</param>
+    /// <param name="layerCount">Number of layers to execute; at least one.</param>
+    /// <param name="hiddenOut">Destination for the <c>[seqLen, HiddenSize]</c> residual stream leaving the window.</param>
+    /// <exception cref="ArgumentOutOfRangeException">The window falls outside the layer range.</exception>
+    /// <exception cref="ArgumentException">A required span is empty or wrongly sized.</exception>
+    internal void ForwardLayerWindow(
+        ReadOnlySpan<int> tokenIds, ReadOnlySpan<float> hiddenIn, ReadOnlySpan<int> positions,
+        int firstLayer, int layerCount, Span<float> hiddenOut)
+    {
+        if (hiddenOut.IsEmpty)
+            throw new ArgumentException("hiddenOut must be sized [seqLen, HiddenSize].", nameof(hiddenOut));
+
+        ForwardCore(tokenIds, hiddenIn, positions, deviceId: -1, kvCache: null, gdnState: null,
+                    firstLayer, layerCount, hiddenOut);
+    }
+
+    /// <summary>Applies the final output norm + LM head to a post-trunk hidden state, all rows.</summary>
+    /// <param name="hidden">Row-major <c>[seqLen, HiddenSize]</c> hidden state leaving the last layer.</param>
+    /// <param name="seqLen">Number of rows in <paramref name="hidden"/>.</param>
+    /// <param name="deviceId">Target device for the returned tensor.</param>
+    /// <returns>A caller-owned <c>[seqLen, VocabSize]</c> FP32 logits tensor.</returns>
+    /// <remarks>
+    /// Shares <c>RunOutputHead</c> with the whole-model forward, so a cycled result is numerically
+    /// identical to the un-cycled one rather than merely close.
+    /// </remarks>
+    internal ITensor ApplyOutputHead(ReadOnlySpan<float> hidden, int seqLen, int deviceId)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(seqLen);
+        int hiddenSize = Config.HiddenSize;
+        if (hidden.Length < (long)seqLen * hiddenSize)
+            throw new ArgumentException(
+                $"hidden must hold {seqLen}x{hiddenSize} floats; got {hidden.Length}.", nameof(hidden));
+
+        _state.EnsureCapacity(seqLen);
+        hidden[..(seqLen * hiddenSize)].CopyTo(new Span<float>((float*)_state.HiddenState, seqLen * hiddenSize));
+        return RunOutputHead(seqLen, deviceId);
+    }
+
+    /// <summary>
+    /// Final output norm (in place over <c>_state.HiddenState</c>) + LM-head GEMM, materialised into
+    /// a freshly-allocated caller-owned logits tensor.
+    /// </summary>
+    private ITensor RunOutputHead(int seqLen, int deviceId)
+    {
+        int hiddenSize = Config.HiddenSize;
+        int vocabSize = Config.VocabSize;
+        float eps = Config.NormEpsilon;
+        float* hidden = (float*)_state.HiddenState;
+        float* logits = (float*)_state.Logits;
+
+        // Final output norm + logit projection.
+        for (int t = 0; t < seqLen; t++)
+        {
+            RmsNorm.Execute(
+                new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
+                _outputNormWeight, eps,
+                new Span<float>(hidden + t * hiddenSize, hiddenSize));
+        }
+        if (TensorDump.Enabled)
+            TensorDump.Dump2D("result_norm", hidden, seqLen, hiddenSize);
+
+        Gemm(_outputWeight, _outputQuantType, hidden, logits,
+             _outputOutputDim, _outputInputDim, seqLen, preQuantizedInput: null);
+
+        if (TensorDump.Enabled)
+            TensorDump.Dump2D("result_output", logits, seqLen, vocabSize);
+
+        var shape = new TensorShape(seqLen, vocabSize);
+        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
+        new Span<float>(logits, seqLen * vocabSize).CopyTo(
+            new Span<float>((void*)result.DataPointer, seqLen * vocabSize));
+
+        return result;
+    }
+
+    /// <summary>
+    /// The single trunk implementation behind every forward on this class: embed (or resume from a
+    /// boundary hidden state), run layers <c>[firstLayer, firstLayer + layerCount)</c>, then either
+    /// export the residual stream (<paramref name="hiddenOut"/> non-empty, returns
+    /// <see langword="null"/>) or run the output head.
+    /// </summary>
+    [SkipLocalsInit]
+    private ITensor? ForwardCore(
+        ReadOnlySpan<int> tokenIds, ReadOnlySpan<float> hiddenIn, ReadOnlySpan<int> positions,
+        int deviceId, IKvCache? kvCache, IGdnState? gdnState,
+        int firstLayer, int layerCount, Span<float> hiddenOut)
     {
         // Resolve the GDN state: caller-supplied container preferred, model-owned
         // fallback for the single-seq Forward callers that pre-date the per-seq API.
@@ -1016,12 +1127,15 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
                 nameof(gdnState));
         }
 
-        int seqLen = tokenIds.Length;
-        if (seqLen == 0 || seqLen != positions.Length)
+        // A window that starts above layer 0 carries no token ids at all, so the row count is
+        // defined by `positions` — the one input every entry mode supplies.
+        int seqLen = positions.Length;
+        if (seqLen == 0)
+            throw new ArgumentException("positions must be non-empty.", nameof(positions));
+        if (hiddenIn.IsEmpty && seqLen != tokenIds.Length)
             throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
 
         int hiddenSize = Config.HiddenSize;
-        int vocabSize = Config.VocabSize;
         int numHeads = Config.NumAttentionHeads;
         int numKvHeads = Config.NumKvHeads;
         int headDim = Config.HeadDim;
@@ -1035,6 +1149,21 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
                     $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
         }
 
+        ArgumentOutOfRangeException.ThrowIfNegative(firstLayer);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(layerCount);
+        if (firstLayer + layerCount > _layers.Length)
+            throw new ArgumentOutOfRangeException(nameof(layerCount),
+                $"Layer window [{firstLayer}..{firstLayer + layerCount}) falls outside the " +
+                $"{_layers.Length}-layer trunk.");
+
+        long stateElems = (long)seqLen * hiddenSize;
+        if (!hiddenIn.IsEmpty && hiddenIn.Length < stateElems)
+            throw new ArgumentException(
+                $"hiddenIn must hold {seqLen}x{hiddenSize} floats; got {hiddenIn.Length}.", nameof(hiddenIn));
+        if (!hiddenOut.IsEmpty && hiddenOut.Length < stateElems)
+            throw new ArgumentException(
+                $"hiddenOut must hold {seqLen}x{hiddenSize} floats; got {hiddenOut.Length}.", nameof(hiddenOut));
+
         _state.EnsureCapacity(seqLen);
 
         // Adaptive dispatch mode: spin-wait for decode (short, frequent dispatches),
@@ -1044,20 +1173,29 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
         float* hidden = (float*)_state.HiddenState;
         float* residual = (float*)_state.Residual;
         float* normOut = (float*)_state.NormOutput;
-        float* logits = (float*)_state.Logits;
         byte* inputQ8Scratch = (byte*)_state.InputQ8Scratch;
         float* qAttn = (float*)_state.QScratch;
         float* kAttn = (float*)_state.KScratch;
         float* vAttn = (float*)_state.VScratch;
         float* attnOut = (float*)_state.AttnOutput;
 
-        EmbedTokens(tokenIds, hidden, hiddenSize);
+        // Entry: either the embedding table (window starts at layer 0) or a caller-supplied
+        // boundary residual stream saved by the preceding layer window.
+        if (hiddenIn.IsEmpty)
+        {
+            EmbedTokens(tokenIds, hidden, hiddenSize);
 
-        if (TensorDump.Enabled)
-            TensorDump.Dump2D("token_embd", hidden, seqLen, hiddenSize);
+            if (TensorDump.Enabled)
+                TensorDump.Dump2D("token_embd", hidden, seqLen, hiddenSize);
+        }
+        else
+        {
+            hiddenIn[..(int)stateElems].CopyTo(new Span<float>(hidden, (int)stateElems));
+        }
 
         var kinds = _layout.LayerKind;
-        for (int layer = 0; layer < _layers.Length; layer++)
+        int endLayer = firstLayer + layerCount;
+        for (int layer = firstLayer; layer < endLayer; layer++)
         {
             var lw = _layers[layer];
             // ── Token-mixing sub-layer ─────────────────────────────────────────
@@ -1119,29 +1257,16 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
                 TensorDump.Dump2D($"blk.{layer}.l_out", hidden, seqLen, hiddenSize);
         }
 
-        // Final output norm + logit projection.
-        for (int t = 0; t < seqLen; t++)
+        // Window mode: hand back the residual stream leaving the last executed layer and stop
+        // short of the head — the caller either feeds it to the next window or, after the last
+        // window, to ApplyOutputHead.
+        if (!hiddenOut.IsEmpty)
         {
-            RmsNorm.Execute(
-                new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
-                _outputNormWeight, eps,
-                new Span<float>(hidden + t * hiddenSize, hiddenSize));
+            new ReadOnlySpan<float>(hidden, (int)stateElems).CopyTo(hiddenOut[..(int)stateElems]);
+            return null;
         }
-        if (TensorDump.Enabled)
-            TensorDump.Dump2D("result_norm", hidden, seqLen, hiddenSize);
 
-        Gemm(_outputWeight, _outputQuantType, hidden, logits,
-             _outputOutputDim, _outputInputDim, seqLen, preQuantizedInput: null);
-
-        if (TensorDump.Enabled)
-            TensorDump.Dump2D("result_output", logits, seqLen, vocabSize);
-
-        var shape = new TensorShape(seqLen, vocabSize);
-        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
-        new Span<float>(logits, seqLen * vocabSize).CopyTo(
-            new Span<float>((void*)result.DataPointer, seqLen * vocabSize));
-
-        return result;
+        return RunOutputHead(seqLen, deviceId);
     }
 
     /// <inheritdoc/>

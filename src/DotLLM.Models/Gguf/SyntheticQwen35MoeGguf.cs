@@ -36,7 +36,13 @@ public static class SyntheticQwen35MoeGguf
     private const int SharedIntermediate = 16;
     private const int NumExperts = 4;
     private const int NumExpertsPerTok = 2;
-    private const int BlockCount = 2;          // layer 0 GDN, layer 1 full-attn
+    /// <summary>
+    /// Default trunk depth: layer 0 Gated-DeltaNet, layer 1 full attention. Callers that need
+    /// recurrent layers on <em>both</em> sides of a layer cut (layer-window / cycling coverage,
+    /// issue #395) pass a larger even <c>blockCount</c> to <see cref="Build"/>; the
+    /// <c>full_attention_interval</c> of 2 then alternates GDN / attention the whole way down.
+    /// </summary>
+    private const int DefaultBlockCount = 2;
     private const int FullAttnInterval = 2;    // (i+1) % 2 == 0 → layer 1 is attention
 
     // GDN config ({arch}.ssm.* keys, qwen35moe semantics).
@@ -47,8 +53,21 @@ public static class SyntheticQwen35MoeGguf
     private const int DInner = NVHead * DState; // ssm.inner_size
 
     /// <summary>Builds the synthetic <c>qwen35moe</c> fixture to a byte array.</summary>
-    public static byte[] Build(uint seed = 0xC0FFEEu)
+    /// <param name="seed">PRNG seed; the fixture is fully deterministic in it.</param>
+    /// <param name="blockCount">
+    /// Trunk depth. Must be positive and even, so that <c>full_attention_interval = 2</c> yields
+    /// an alternating GDN / attention layout ending on an attention layer. Values above the
+    /// default exist for layer-window coverage, where a cut must have recurrent layers on both
+    /// sides to prove anything (issue #395).
+    /// </param>
+    /// <returns>The GGUF bytes.</returns>
+    public static byte[] Build(uint seed = 0xC0FFEEu, int blockCount = DefaultBlockCount)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blockCount);
+        if (blockCount % FullAttnInterval != 0)
+            throw new ArgumentOutOfRangeException(nameof(blockCount),
+                $"blockCount must be a multiple of {FullAttnInterval} to keep the GDN / attention alternation intact.");
+
         var w = new GgufWriter();
         var rng = new SyntheticGemma4Gguf.Xorshift(seed);
         const string arch = "qwen35moe";
@@ -60,7 +79,7 @@ public static class SyntheticQwen35MoeGguf
 
         w.AddUInt32($"{arch}.context_length", ContextLength);
         w.AddUInt32($"{arch}.embedding_length", HiddenSize);
-        w.AddUInt32($"{arch}.block_count", BlockCount);
+        w.AddUInt32($"{arch}.block_count", (uint)blockCount);
         w.AddUInt32($"{arch}.attention.head_count", NumAttentionHeads);
         w.AddUInt32($"{arch}.attention.head_count_kv", NumKvHeads);
         w.AddUInt32($"{arch}.attention.key_length", HeadDim);
@@ -93,7 +112,7 @@ public static class SyntheticQwen35MoeGguf
         AddMatrixF32(w, rng, "token_embd.weight", inK: HiddenSize, outM: VocabSize, 0.05f);
         AddNorm(w, rng, "output_norm.weight", HiddenSize);
 
-        for (int i = 0; i < BlockCount; i++)
+        for (int i = 0; i < blockCount; i++)
         {
             bool fullAttn = (i + 1) % FullAttnInterval == 0;
             string p = $"blk.{i}";
@@ -113,9 +132,13 @@ public static class SyntheticQwen35MoeGguf
     }
 
     /// <summary>Writes the synthetic <c>qwen35moe</c> fixture to <paramref name="path"/>.</summary>
-    public static string Write(string path, uint seed = 0xC0FFEEu)
+    /// <param name="path">Destination file path.</param>
+    /// <param name="seed">PRNG seed; the fixture is fully deterministic in it.</param>
+    /// <param name="blockCount">Trunk depth; see <see cref="Build"/>.</param>
+    /// <returns><paramref name="path"/>, for call chaining.</returns>
+    public static string Write(string path, uint seed = 0xC0FFEEu, int blockCount = DefaultBlockCount)
     {
-        File.WriteAllBytes(path, Build(seed));
+        File.WriteAllBytes(path, Build(seed, blockCount));
         return path;
     }
 

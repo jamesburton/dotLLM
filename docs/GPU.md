@@ -495,6 +495,82 @@ GPU layers compute in FP16 (Half precision). At the boundary, the hidden state i
 - `CudaQuantizedKvCache` — Q8_0/Q4_0 GPU KV-cache with FP16 scratch-buffer attention (see [KV_CACHE.md](KV_CACHE.md))
 - `CudaWeights.LoadFromGguf(numGpuLayers)` — Partial weight upload to VRAM
 
+## Measuring a model larger than the device: windowed offload and layer cycling
+
+`dotllm perplexity` can score a model that does not fit on the GPU. Three placements, in increasing
+order of what they buy and cost:
+
+| Flags | Placement | Use when |
+|---|---|---|
+| `--device cuda --gpu-layers N` | GPU `[0..N)`, CPU `[N..L)` | The usual partial offload. Fastest; only exercises a *prefix* of the trunk on the GPU. |
+| `--device cuda --gpu-layers N --first-layer K` | CPU `[0..K)`, GPU `[K..K+N)`, CPU `[K+N..L)` | You need a *specific* slice of the trunk on the GPU — e.g. verifying the deep layers of a model whose prefix already passed. |
+| `--device cuda --gpu-layers N --cycle` | GPU window of `N` layers slid across the whole trunk | Full-coverage GPU verification of a model too large for the device. |
+
+### Why cycling exists
+
+Naive full coverage means re-running the whole corpus once per window: `ceil(L/N)` passes, each
+bottlenecked by the CPU half. Cycling instead makes one logical pass:
+
+1. Load layers `[0..N)`. Run the corpus. Save the hidden state at the cut for every scored window.
+2. Load `[N..2N)`. Replay from the **saved boundary activations** rather than from token embeddings.
+   Save the next boundary.
+3. Repeat to the final window; then apply the output head and score.
+
+Every layer is GPU-executed exactly once and no layer is ever executed on CPU, so the cost is roughly
+one GPU-speed pass plus checkpoint traffic instead of `N x` a CPU-dominated pass.
+
+Checkpoint volume is `windows x context x hidden x 4 B`, held in host RAM, with two boundaries alive
+at a time (the one being read and the one being written). A full wikitext-2 sweep
+(655 windows x 512 tokens) at `hidden = 2688` is ~3.6 GB per boundary. Spilling boundaries to disk is
+not implemented.
+
+### What cycling does and does not tell you
+
+- The output head (final norm + LM head) runs on the **host**, not on the device. Device layer
+  windows return only a hidden state, and sliding-window scoring needs logits for every row rather
+  than the last row the device forward paths are optimised for. Every transformer *layer* still runs
+  on the GPU; the head is one GEMM against a weight that is negligible next to a layer window.
+- **End-perplexity is a weak backend discriminator.** Each window blends host and device arithmetic,
+  and a bias affecting all layers uniformly can partially cancel. If you are hunting a device
+  numerics defect rather than measuring model quality, diff the saved boundary activations against a
+  CPU reference at the cut — those tensors are exactly what cycling already computes.
+- The result table always prints a `Layer placement` row, on whole-device runs too, so a scraped
+  table cannot report a split or cycled run as a single-device one.
+- `--per-window`, `--tokens-file`, `--bos`, `--stride` and `--unscored-prefix` behave identically in
+  cycling mode: the final scoring pass is the ordinary `PerplexityEvaluator` running against the
+  saved boundaries, and both the cycling passes and the scoring pass walk the same
+  `PerplexityWindowPlan`.
+
+### Recurrent architectures
+
+Recurrent state (Mamba/SSM conv + state, Gated DeltaNet) is **not** carried across a layer cut, and
+deliberately so. State is per layer, and each layer belongs to exactly one layer window that replays
+the whole corpus in window order — so the state a layer must start corpus window `w` with is zero, in
+a cycled run and a whole-device run alike. What the checkpoint has to carry across the cut is the
+hidden state only.
+
+What *does* break hybrids is a layer-window pass that forgets to reset recurrent state between corpus
+windows — issue #261's failure, multiplied, because each pass replays the whole corpus.
+`ILayerWindowExecutor.ResetState()` is called before every corpus window in every pass for that
+reason, and `LayerCyclingPerplexityTests` asserts both that a cycled run equals a whole-model run on
+a recurrent fixture and that dropping the reset changes the number.
+
+### Scope
+
+The CUDA layer-window executor is built on `CudaPipelineStage`, whose layer loop is standard dense /
+GQA causal only — no MLA, no MoE, no gemma4, no recurrent layers. Unsupported architectures are
+rejected at load rather than scored. Hybrid/MoE architectures can still be scored with `--gpu-layers`
+prefix offload, and are covered on CPU by the layer-window engine.
+
+### Implementation
+
+- `ILayerWindowModel` / `ILayerWindowExecutor` (`DotLLM.Core.Evaluation`) — the hidden-in/hidden-out
+  layer-window contract shared by every backend
+- `CyclingPerplexityEvaluator` (`DotLLM.Engine.Evaluation`) — pass driver + boundary checkpoints
+- `PerplexityWindowPlan` — the single corpus-window enumeration shared with `PerplexityEvaluator`
+- `CompositeLayerWindowModel` — per-window device assignment for an arbitrary contiguous GPU window
+- `CpuLayerWindowModel` / `CudaLayerWindowModel` — the backend implementations
+
 ## Unified-Memory Zero-Copy Weight Upload (Vulkan, UMA APUs)
 
 On unified-memory APUs (AMD Strix Halo / Ryzen AI Max+ 395, Intel iGPUs, Apple Silicon via MoltenVK) the CPU and GPU share the same DDR. The default upload path still pays a host→device copy because the driver allocates a new `VkDeviceMemory` region and the kernel reads from there. On a UMA part that copy is pure waste — the source and destination are the same physical DRAM.

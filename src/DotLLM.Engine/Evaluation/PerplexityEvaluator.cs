@@ -146,16 +146,14 @@ public static class PerplexityEvaluator
         IPerplexityModel model, ReadOnlySpan<int> tokens, int context, int stride, int unscoredPrefix,
         int bosTokenId, WindowObserver? onWindow)
     {
-        if (stride < 1 || stride > context)
-            throw new ArgumentException(
-                $"Stride must be in [1, {context}] for a context of {context}.", nameof(stride));
-
-        int prefix = unscoredPrefix >= 0 ? unscoredPrefix : context - stride;
-        if (prefix < 1 || prefix >= context)
-            throw new ArgumentException(
-                $"Unscored prefix must be in [1, {context - 1}] for a context of {context}; " +
-                "each scored token needs at least one token of context, and at least one token must be scored.",
-                nameof(unscoredPrefix));
+        // Geometry is validated and enumerated by the shared plan, not by a loop local to this
+        // method: layer-cycling replays the identical corpus enumeration per GPU layer window and
+        // indexes its boundary activations by window position, so a second copy of the loop is the
+        // one thing that could silently desynchronise the two (see PerplexityWindowPlan).
+        var plan = PerplexityWindowPlan.Create(
+            new PerplexityOptions(PerplexityMode.SlidingWindow, context, stride, 0, unscoredPrefix, bosTokenId),
+            tokens.Length, context);
+        int prefix = plan.UnscoredPrefix;
 
         if (!model.ReturnsAllRows)
             throw new NotSupportedException(
@@ -176,21 +174,14 @@ public static class PerplexityEvaluator
         // When a BOS id is supplied, each window's first token is replaced by it, mirroring
         // llama.cpp's perplexity: every chunk is a fresh sequence and is given a sequence start.
         // The substituted slot sits inside the unscored prefix, so no scored target is altered.
-        int[]? windowBuffer = bosTokenId >= 0 ? new int[context] : null;
+        // The plan applies the substitution so that the cycling driver cannot disagree about it.
+        var windowBuffer = new int[context];
 
-        for (int start = 0; start + context <= tokens.Length; start += stride)
+        for (int w = 0; w < plan.WindowCount; w++)
         {
-            ReadOnlySpan<int> window;
-            if (windowBuffer is null)
-            {
-                window = tokens.Slice(start, context);
-            }
-            else
-            {
-                tokens.Slice(start, context).CopyTo(windowBuffer);
-                windowBuffer[0] = bosTokenId;
-                window = windowBuffer;
-            }
+            int start = plan.StartOf(w);
+            plan.CopyWindow(tokens, w, windowBuffer);
+            ReadOnlySpan<int> window = windowBuffer;
 
             // Every window is an independent sequence (positions restart at 0), so the previous
             // window's recurrent state must not carry into this one — see #261.

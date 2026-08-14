@@ -691,6 +691,114 @@ public sealed unsafe class TransformerModel : IModel
     }
 
     /// <summary>
+    /// Runs a contiguous window of this model's layers standalone, entering from token ids
+    /// (<paramref name="firstLayer"/> is 0) or from a boundary hidden state, and leaving the
+    /// residual stream at the window's far edge.
+    /// </summary>
+    /// <remarks>
+    /// <para>This is the layer-cycling entry point (issue #395). It runs the same trunk loop the
+    /// whole-model forward runs, restricted to <c>[firstLayer, firstLayer + layerCount)</c>, with no
+    /// final norm and no LM head — apply those with <see cref="ApplyOutputHead"/>.</para>
+    /// <para><b>Scope.</b> Only the plain dense / GQA-and-MoE trunk is windowable. Every architecture
+    /// whose forward carries cross-layer state or a whole-trunk pre/post pass is rejected up front by
+    /// <see cref="GuardLayerWindowSupported"/> rather than silently producing a plausible wrong
+    /// number: Gemma-4 (per-layer embeddings, shared-KV donor stash), Gemma-3n (AltUp streams built
+    /// before the first layer and collapsed after the last), MLA (persistent per-layer latent/expanded
+    /// KV state), and diffusion-gemma (region embedding + self-conditioning). Layer-local features —
+    /// per-layer sliding windows, per-layer RoPE tables, per-layer head dims, MoE FFNs — all resolve
+    /// from the absolute layer index and are window-safe.</para>
+    /// </remarks>
+    /// <param name="tokenIds">Token ids; required when <paramref name="firstLayer"/> is 0, else ignored.</param>
+    /// <param name="hiddenIn">
+    /// Row-major <c>[seqLen, HiddenSize]</c> boundary hidden state to resume from. Required when
+    /// <paramref name="firstLayer"/> is greater than 0; empty for the first window.
+    /// </param>
+    /// <param name="positions">Absolute position id per row; its length defines <c>seqLen</c>.</param>
+    /// <param name="firstLayer">First global layer index to execute.</param>
+    /// <param name="layerCount">Number of layers to execute; at least one.</param>
+    /// <param name="hiddenOut">Destination for the <c>[seqLen, HiddenSize]</c> residual stream leaving the window.</param>
+    /// <exception cref="NotSupportedException">This model's architecture cannot be windowed.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">The window falls outside the layer range.</exception>
+    /// <exception cref="ArgumentException">A required span is empty or wrongly sized.</exception>
+    internal void ForwardLayerWindow(
+        ReadOnlySpan<int> tokenIds, ReadOnlySpan<float> hiddenIn, ReadOnlySpan<int> positions,
+        int firstLayer, int layerCount, Span<float> hiddenOut)
+    {
+        GuardLayerWindowSupported();
+
+        ArgumentOutOfRangeException.ThrowIfNegative(firstLayer);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(layerCount);
+        if (firstLayer + layerCount > Config.NumLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerCount),
+                $"Layer window [{firstLayer}..{firstLayer + layerCount}) falls outside the " +
+                $"{Config.NumLayers}-layer trunk.");
+
+        int seqLen = positions.Length;
+        if (seqLen == 0)
+            throw new ArgumentException("positions must be non-empty.", nameof(positions));
+        if (hiddenIn.IsEmpty && tokenIds.Length != seqLen)
+            throw new ArgumentException("tokenIds and positions must have equal length.", nameof(tokenIds));
+
+        long need = (long)seqLen * Config.HiddenSize;
+        if (!hiddenIn.IsEmpty && hiddenIn.Length < need)
+            throw new ArgumentException(
+                $"hiddenIn must hold {seqLen}x{Config.HiddenSize} floats; got {hiddenIn.Length}.", nameof(hiddenIn));
+        if (hiddenOut.Length < need)
+            throw new ArgumentException(
+                $"hiddenOut must hold {seqLen}x{Config.HiddenSize} floats; got {hiddenOut.Length}.", nameof(hiddenOut));
+
+        RunLayerRangeCore(tokenIds, hiddenIn, positions, kvCache: null,
+                          firstLayer, layerCount, hiddenOut);
+    }
+
+    /// <summary>Applies the final output norm + LM head to a post-trunk hidden state, all rows.</summary>
+    /// <param name="hidden">Row-major <c>[seqLen, HiddenSize]</c> hidden state leaving the last layer.</param>
+    /// <param name="seqLen">Number of rows in <paramref name="hidden"/>.</param>
+    /// <param name="deviceId">Target device for the returned tensor.</param>
+    /// <returns>A caller-owned <c>[seqLen, VocabSize]</c> FP32 logits tensor.</returns>
+    /// <remarks>
+    /// Reuses the same <see cref="ApplyFinalNorm"/> + <c>RunLmHead</c> pair the whole-model forward
+    /// ends with — including the optional Gemma final-logit soft-cap — so a cycled result is
+    /// numerically identical to the un-cycled one rather than merely close.
+    /// </remarks>
+    internal unsafe ITensor ApplyOutputHead(ReadOnlySpan<float> hidden, int seqLen, int deviceId)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(seqLen);
+        int hiddenSize = Config.HiddenSize;
+        if (hidden.Length < (long)seqLen * hiddenSize)
+            throw new ArgumentException(
+                $"hidden must hold {seqLen}x{hiddenSize} floats; got {hidden.Length}.", nameof(hidden));
+
+        _state.EnsureCapacity(seqLen);
+        hidden[..(seqLen * hiddenSize)].CopyTo(new Span<float>((float*)_state.HiddenState, seqLen * hiddenSize));
+        ApplyFinalNorm(seqLen);
+        return RunLmHead(seqLen, deviceId);
+    }
+
+    /// <summary>
+    /// Rejects the architectures whose forward pass is not expressible as an independent slice of the
+    /// layer loop. See <see cref="ForwardLayerWindow"/> remarks for why each one is excluded.
+    /// </summary>
+    private void GuardLayerWindowSupported()
+    {
+        static NotSupportedException Reject(string what) => new(
+            $"TransformerModel.ForwardLayerWindow does not support {what}: its forward pass carries "
+            + "state across the whole trunk, so an isolated layer window would silently compute a "
+            + "different result. Layer cycling (issue #395) is limited to the plain dense / GQA path.");
+
+        if (Config.DiffusionConfig is not null) throw Reject("diffusion (diffusion-gemma) models");
+        if (Config.MlaConfig is not null) throw Reject("MLA (DeepSeek-V2/V3) models");
+        if (Config.Gemma3n is not null) throw Reject("Gemma-3n (AltUp multi-stream) models");
+        if (Config.NumSharedKvLayers > 0) throw Reject("shared-KV (Gemma-4 E2B/E4B) models");
+        if (_weights.PerLayerEmbedding is not null) throw Reject("per-layer-embedding (Gemma-4 dense tower) models");
+        if (_weights.Layers.Length > 0 && _weights.Layers[0].Gemma4 is not null) throw Reject("Gemma-4 models");
+        if (DebugMaxLayers != 0)
+            throw new NotSupportedException(
+                "TransformerModel.ForwardLayerWindow cannot be combined with DebugMaxLayers, which "
+                + "truncates the trunk and would make the window range mean something else.");
+    }
+
+    /// <summary>
     /// Returns the effective sliding-window size for <paramref name="layer"/>.
     /// Honours <see cref="ModelConfig.PerLayerSlidingWindow"/> when set (each entry
     /// may be null for full attention or a positive int for sliding); otherwise
@@ -758,6 +866,31 @@ public sealed unsafe class TransformerModel : IModel
     /// </summary>
     private unsafe void RunLayersAndFinalNormCore(
         ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, IKvCache? kvCache)
+        => RunLayerRangeCore(tokenIds, ReadOnlySpan<float>.Empty, positions, kvCache,
+                             firstLayer: 0, layerCount: -1, hiddenOut: Span<float>.Empty);
+
+    /// <summary>
+    /// The single trunk implementation: embed (or resume from a boundary hidden state), run layers
+    /// <c>[firstLayer, firstLayer + layerCount)</c>, then either export the residual stream
+    /// (<paramref name="hiddenOut"/> non-empty — no final norm) or apply the final RMSNorm in place
+    /// over <c>_state.HiddenState</c> for the caller's lm_head.
+    /// </summary>
+    /// <param name="tokenIds">Token ids; ignored when <paramref name="hiddenIn"/> is supplied.</param>
+    /// <param name="hiddenIn">
+    /// Row-major <c>[seqLen, hiddenSize]</c> boundary hidden state replacing the embedding lookup.
+    /// Empty on the whole-model path.
+    /// </param>
+    /// <param name="positions">Absolute position id per row; its length defines <c>seqLen</c>.</param>
+    /// <param name="kvCache">Optional KV-cache.</param>
+    /// <param name="layerCount">Layers to execute, or <c>-1</c> for "the whole trunk".</param>
+    /// <param name="firstLayer">First global layer index to execute.</param>
+    /// <param name="hiddenOut">
+    /// When non-empty, receives the residual stream leaving the last executed layer and the final
+    /// norm is skipped.
+    /// </param>
+    private unsafe void RunLayerRangeCore(
+        ReadOnlySpan<int> tokenIds, ReadOnlySpan<float> hiddenIn, ReadOnlySpan<int> positions,
+        IKvCache? kvCache, int firstLayer, int layerCount, Span<float> hiddenOut)
     {
         // A distinct per-layer head dim (Gemma 4 global_head_dim) is supported on
         // the cacheless path only — reject a KV-cache up front with a clear message.
@@ -771,7 +904,9 @@ public sealed unsafe class TransformerModel : IModel
                     $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
         }
 
-        int seqLen = tokenIds.Length;
+        // A window that starts above layer 0 carries no token ids, so `positions` — the one input
+        // every entry mode supplies — defines the row count.
+        int seqLen = hiddenIn.IsEmpty ? tokenIds.Length : positions.Length;
         int hiddenSize = Config.HiddenSize;
         int numHeads = Config.NumAttentionHeads;
         // Note: the per-head dimension is resolved PER LAYER inside the loop
@@ -800,8 +935,12 @@ public sealed unsafe class TransformerModel : IModel
         float* siluOut = (float*)_state.SiluOutput;
         float* logits = (float*)_state.Logits;
 
-        // 1. EMBEDDING LOOKUP
-        EmbeddingLookup(tokenIds, hidden, hiddenSize);
+        // 1. EMBEDDING LOOKUP — or, for a layer window that does not own the embedding, the
+        // boundary residual stream saved by the preceding window.
+        if (hiddenIn.IsEmpty)
+            EmbeddingLookup(tokenIds, hidden, hiddenSize);
+        else
+            hiddenIn[..(seqLen * hiddenSize)].CopyTo(new Span<float>(hidden, seqLen * hiddenSize));
 
         // Diagnostic embedding hook (bug-#2 bisection): capture or replace the
         // scaled embedding before the layers. No-op on the normal path (null).
@@ -985,7 +1124,9 @@ public sealed unsafe class TransformerModel : IModel
             }
         }
 
-        for (int layer = 0; layer < numLayers; layer++)
+        // Layer-window bound: layerCount < 0 means "the whole trunk" (every pre-existing caller).
+        int endLayer = layerCount < 0 ? numLayers : Math.Min(firstLayer + layerCount, numLayers);
+        for (int layer = firstLayer; layer < endLayer; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
             var rl = repackedLayers?[layer];
@@ -1797,7 +1938,31 @@ public sealed unsafe class TransformerModel : IModel
             NativeMemory.Free(g3nStreams);
         }
 
+        // Window mode: hand back the residual stream leaving the last executed layer and stop short
+        // of the final norm — the caller either feeds it to the next window or, after the last
+        // window, to ApplyOutputHead.
+        if (!hiddenOut.IsEmpty)
+        {
+            new ReadOnlySpan<float>(hidden, seqLen * hiddenSize).CopyTo(hiddenOut[..(seqLen * hiddenSize)]);
+            return;
+        }
+
         // 3. FINAL NORM (in-place: hidden → hidden)
+        ApplyFinalNorm(seqLen);
+    }
+
+    /// <summary>
+    /// Applies the model's final RMSNorm in place over <c>_state.HiddenState[0..seqLen*hiddenSize]</c>,
+    /// using <c>_state.NormOutput</c> as the per-row temporary.
+    /// </summary>
+    /// <param name="seqLen">Row count to normalise.</param>
+    private unsafe void ApplyFinalNorm(int seqLen)
+    {
+        int hiddenSize = Config.HiddenSize;
+        float eps = Config.NormEpsilon;
+        float* hidden = (float*)_state.HiddenState;
+        float* normOut = (float*)_state.NormOutput;
+
         for (int t = 0; t < seqLen; t++)
         {
             float* hiddenT = hidden + t * hiddenSize;
