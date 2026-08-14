@@ -1,3 +1,5 @@
+using System.Threading;
+
 namespace DotLLM.Tests.Integration.Fixtures;
 
 /// <summary>
@@ -18,41 +20,49 @@ namespace DotLLM.Tests.Integration.Fixtures;
 ///   <item><description>Any <see cref="IOException"/> — sharing violations (file locked
 ///     by a concurrent downloader), <see cref="EndOfStreamException"/> from a
 ///     <c>BinaryReader</c> hitting EOF mid-header, or the file vanishing between the
-///     probe and the open.</description></item>
+///     probe and the open. Unconditional: always a skip.</description></item>
 ///   <item><description>An <see cref="InvalidDataException"/> whose message matches one
-///     of <see cref="TruncationSignatures"/> — the small, closed set of messages
-///     <c>GgufFile.Open</c> / <c>SafetensorsFile.Open</c> throw <b>only</b> when a
-///     declared offset (tensor data, header length) runs past the file's actual length.
-///     That is a deterministic truncation signature: a genuinely truncated file's header
-///     still claims the size it was supposed to be, so the length checks in those loaders
-///     fail in exactly this shape. A COMPLETE-but-corrupt file (bad JSON, wrong dtype,
-///     mismatched shape) does not produce these specific messages and is intentionally
-///     left uncaught below, per issue #384 task item 3: a parse error on a complete file
-///     must still be a real failure, not a silent skip.</description></item>
+///     of <see cref="TruncationSignatures"/> (declared-offset-vs-file-length overshoot)
+///     <b>AND</b> <see cref="IsPlausiblyInFlight"/> finds independent evidence the file is
+///     still being written (locked, or its size changes across a short recheck window).
+///     Only then is it a skip — see the correctness note below for why the signature
+///     alone is not sufficient.</description></item>
 /// </list>
 /// <para>
-/// <b>Documented compromise (issue #384 task item 3).</b> The issue also floats a
-/// "file size changed during the test run" signal as an alternative truncation
-/// detector. This helper does not implement it: a snapshot-then-recheck race adds
-/// complexity without covering any failure this exception-signature approach misses —
-/// any truncation that would move the file's size mid-load necessarily also violates
-/// one of the bounds checks the signature list matches (the checked-in loaders validate
-/// every tensor/header offset against the file length before returning). The remaining
-/// gap is a genuinely <i>stalled</i> partial download (stable size, syntactically valid
-/// but incomplete header/tensor table) that happens to parse as self-consistent — that
-/// case is indistinguishable from real corruption without a known-good-size table per
-/// fixture, and is intentionally left to fail loudly rather than risk masking a real
-/// loader bug.
+/// <b>Correctness note — the bounds-overshoot signature is NOT proof of truncation.</b>
+/// An earlier version of this guard treated <see cref="TruncationSignatures"/> matches as
+/// an unconditional skip, on the theory that "a declared offset running past the file's
+/// actual length" only happens to genuinely truncated downloads. That is false: a
+/// COMPLETE file whose header is self-consistent (valid JSON, correct length prefix) but
+/// whose <c>data_offsets</c>/tensor-size field was corrupted independently (bit flip,
+/// disk corruption, a loader bug writing a bad offset) produces the exact same message —
+/// <c>GgufFile.Open</c>/<c>SafetensorsFile.Open</c> only compare declared offsets against
+/// the file's actual length; they cannot tell "download died partway" apart from "offsets
+/// corrupted in a complete file" from the exception alone. Masking the latter as a skip
+/// would hide a real loader/data bug, which is worse than the noisy failure issue #384 set
+/// out to fix. <see cref="IsPlausiblyInFlight"/> adds the missing signal: a checkpoint
+/// still being downloaded is either still locked by the writer, or its size is still
+/// changing a few hundred milliseconds later; a complete-but-corrupt file is neither.
+/// </para>
+/// <para>
+/// <b>Why the recheck is safe to run after the failure.</b> Both loaders close their file
+/// handle (and, for the bounds-overshoot case specifically, never open a memory-mapped
+/// view at all — the check runs before that step) before the offset comparison that
+/// throws, so by the time <see cref="LoadOrSkip{T}"/> catches the exception, nothing this
+/// guard opens can conflict with a concurrent writer.
 /// </para>
 /// </remarks>
 internal static class CheckpointGuard
 {
+    /// <summary>How long to wait between the two size samples in <see cref="IsPlausiblyInFlight"/>.</summary>
+    private static readonly TimeSpan InFlightRecheckDelay = TimeSpan.FromMilliseconds(250);
+
     /// <summary>
     /// Message fragments that <c>DotLLM.Models.Gguf.GgufFile.Open</c> and
     /// <c>DotLLM.Models.SafeTensors.SafetensorsFile.Open</c> throw <see cref="InvalidDataException"/>
-    /// with <b>only</b> when a declared data/header range extends past the file's actual
-    /// length — i.e. truncation, never corruption of an otherwise-complete file. Keep in
-    /// sync with those two loaders if their messages change.
+    /// with when a declared data/header range extends past the file's actual length. This is
+    /// necessary but NOT sufficient evidence of truncation — see the correctness note on the
+    /// type doc comment. Keep in sync with those two loaders if their messages change.
     /// </summary>
     private static readonly string[] TruncationSignatures =
     [
@@ -68,7 +78,8 @@ internal static class CheckpointGuard
     /// whole test) and converts a "present but unreadable" failure into a
     /// <see cref="Xunit.SkipException"/> instead of letting it fail the test.
     /// </summary>
-    /// <param name="path">Path passed to the load call, for the skip message.</param>
+    /// <param name="path">Path passed to the load call, for the skip message and the
+    /// in-flight recheck.</param>
     /// <param name="description">Short human-readable fixture name, for the skip message.</param>
     /// <param name="load">The load call to guard.</param>
     /// <exception cref="Xunit.SkipException">
@@ -84,7 +95,7 @@ internal static class CheckpointGuard
         {
             throw new Xunit.SkipException(SkipMessage(path, description, ex));
         }
-        catch (InvalidDataException ex) when (IsTruncationSignature(ex.Message))
+        catch (InvalidDataException ex) when (IsTruncationSignature(ex.Message) && IsPlausiblyInFlight(path))
         {
             throw new Xunit.SkipException(SkipMessage(path, description, ex));
         }
@@ -98,6 +109,62 @@ internal static class CheckpointGuard
                 return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// Independent evidence that <paramref name="path"/> is still being written by another
+    /// process, rather than sitting complete-but-corrupt: either something else currently
+    /// holds it open (denies an exclusive read), or its length changes across a short
+    /// recheck window. A stable, unlocked file is treated as NOT in-flight — a genuinely
+    /// dead/stalled partial download will fail loudly here, which is the honest outcome:
+    /// this guard cannot distinguish a dead partial download from real corruption without a
+    /// known-good-size table, and failing loud is safer than silently skipping either one.
+    /// </summary>
+    private static bool IsPlausiblyInFlight(string path)
+    {
+        if (IsLocked(path))
+            return true;
+
+        long? sizeBefore = TryGetLength(path);
+        if (sizeBefore is null)
+            return true; // vanished between the failed load and this check — in-flight-ish.
+
+        Thread.Sleep(InFlightRecheckDelay);
+
+        long? sizeAfter = TryGetLength(path);
+        if (sizeAfter is null)
+            return true;
+
+        return sizeBefore != sizeAfter;
+    }
+
+    private static bool IsLocked(string path)
+    {
+        try
+        {
+            using var probe = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None);
+            return false;
+        }
+        catch (IOException)
+        {
+            // Covers both a genuine sharing violation and FileNotFoundException (a subtype of
+            // IOException) if the file vanished between the failed load and this probe —
+            // either way, treat it as in-flight.
+            return true;
+        }
+    }
+
+    private static long? TryGetLength(string path)
+    {
+        try
+        {
+            var info = new FileInfo(path);
+            return info.Exists ? info.Length : null;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
     }
 
     private static string SkipMessage(string path, string description, Exception ex)
