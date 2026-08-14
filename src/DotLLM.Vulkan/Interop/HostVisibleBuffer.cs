@@ -208,6 +208,14 @@ public sealed class HostVisibleBuffer : IDisposable
         // on gfx1151 in particular returns VK_ERROR_INVALID_EXTERNAL_HANDLE for
         // HOST_ALLOCATION on read-only MemoryMappedFile views but accepts
         // HOST_MAPPED_FOREIGN_MEMORY for the same pointer.
+        //
+        // #369: shared READ lock around the whole loop — see
+        // VulkanDevice.s_lifecycleLock's doc comment. This loop's
+        // vkCreateBuffer/vkAllocateMemory/vkBindBufferMemory are the same
+        // create-vs-device-create hazard class as VulkanDevice.AllocateInternal.
+        VulkanDevice.s_lifecycleLock.EnterReadLock();
+        try
+        {
         for (int attempt = 0; attempt < usableCount; attempt++)
         {
             uint handleType = usable[attempt];
@@ -332,6 +340,11 @@ public sealed class HostVisibleBuffer : IDisposable
         // All candidate handle types rejected — LastImportFailureCode/Stage
         // reflect the most recent attempt.
         return null;
+        }
+        finally
+        {
+            VulkanDevice.s_lifecycleLock.ExitReadLock();
+        }
     }
 
     /// <inheritdoc/>
@@ -340,18 +353,29 @@ public sealed class HostVisibleBuffer : IDisposable
         if (_disposed) return;
         _disposed = true;
 
-        if (_buffer != 0)
+        // #369: shared READ lock — see VulkanDevice.s_lifecycleLock's doc
+        // comment. Same hazard class as VulkanDevice.Buffer.Dispose's
+        // vkDestroyBuffer/vkFreeMemory.
+        VulkanDevice.s_lifecycleLock.EnterReadLock();
+        try
         {
-            VulkanApi.vkDestroyBuffer(_device.Handle, _buffer, 0);
-            _buffer = 0;
+            if (_buffer != 0)
+            {
+                VulkanApi.vkDestroyBuffer(_device.Handle, _buffer, 0);
+                _buffer = 0;
+            }
+            // The imported VkDeviceMemory must be freed BUT it does NOT release
+            // the underlying host mmap — that's the caller's lifecycle. The
+            // mmap'd pages live in the GgufFile owning MemoryMappedFile.
+            if (_memory != 0)
+            {
+                VulkanApi.vkFreeMemory(_device.Handle, _memory, 0);
+                _memory = 0;
+            }
         }
-        // The imported VkDeviceMemory must be freed BUT it does NOT release
-        // the underlying host mmap — that's the caller's lifecycle. The
-        // mmap'd pages live in the GgufFile owning MemoryMappedFile.
-        if (_memory != 0)
+        finally
         {
-            VulkanApi.vkFreeMemory(_device.Handle, _memory, 0);
-            _memory = 0;
+            VulkanDevice.s_lifecycleLock.ExitReadLock();
         }
     }
 }

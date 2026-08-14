@@ -144,8 +144,20 @@ internal sealed class DescriptorSetCache
     /// </summary>
     public void Reset()
     {
-        VulkanApi.vkResetDescriptorPool(_device.Handle, _pool, 0)
-            .ThrowOnError("vkResetDescriptorPool DescriptorSetCache");
+        // #369: shared READ lock — see VulkanDevice.s_lifecycleLock's doc
+        // comment. vkResetDescriptorPool bulk-frees every descriptor set in
+        // the pool, the same "device frees an object" hazard class as
+        // AllocateDescriptorSet's vkAllocateDescriptorSets.
+        VulkanDevice.s_lifecycleLock.EnterReadLock();
+        try
+        {
+            VulkanApi.vkResetDescriptorPool(_device.Handle, _pool, 0)
+                .ThrowOnError("vkResetDescriptorPool DescriptorSetCache");
+        }
+        finally
+        {
+            VulkanDevice.s_lifecycleLock.ExitReadLock();
+        }
         Array.Clear(_keys);
         Array.Clear(_sets);
         _count = 0;
