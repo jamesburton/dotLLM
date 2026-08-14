@@ -71,6 +71,18 @@ internal static class TiktokenPreTokenizer
         RegexOptions.Compiled),
     ];
 
+    // ── Tekken (Mistral NeMo / Pixtral-12B tokenizer family; also NVIDIA
+    // Nemotron-Nano-9B-v2). llama.cpp LLAMA_VOCAB_PRE_TYPE_TEKKEN. This is the
+    // ORIGINAL tokenizer.json pattern (quoted verbatim in llama-vocab.cpp:408);
+    // llama.cpp itself ships a lookahead-based rewrite only because std::regex
+    // lacks \p{Lu}-style classes — .NET supports them natively, so the faithful
+    // original is used here.
+    private static readonly Regex[] TekkenPipeline =
+    [
+        new(@"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+            RegexOptions.Compiled),
+    ];
+
     /// <summary>
     /// Returns the ordered pre-tokenization regex pipeline for the given GGUF
     /// <c>tokenizer.ggml.pre</c> type. Mirrors llama.cpp's <c>llama_vocab</c> policy
@@ -104,6 +116,7 @@ internal static class TiktokenPreTokenizer
         "deepseek-llm" => DeepSeekLlmPipeline,
         "deepseek-coder" => DeepSeekCoderPipeline,
         "gpt-4o" or "llama4" => Gpt4oPipeline,
+        "tekken" => TekkenPipeline,
         _ => Environment.GetEnvironmentVariable("DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER") == "1"
             ? Gpt2Pipeline
             : throw new InvalidDataException(
