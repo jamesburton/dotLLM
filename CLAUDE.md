@@ -253,6 +253,23 @@ If a PR to upstream sits without maintainer activity for **two weeks**, post a p
 - If a parallel agent is working on a backend listed in a task's "do not touch" surface, document the cross-backend fix you applied so they can pick it up; do NOT defer the fix.
 - Reference llama.cpp's CPU implementation (`ggml/src/ggml-cpu/ops.cpp`) as the authoritative source for any GGUF-format model op semantics — including head-broadcast conventions, sign conventions, and accumulator placement.
 
+## Prove the Test Can Fail
+
+**For any test guarding a correctness invariant, DEMONSTRATE that it fails against a wrong implementation, and record how in the PR body.** Claiming a test discriminates is not evidence that it does — three times this rule was asserted and wrong, twice caught only by an explicit check, once not caught for months.
+
+Two accepted methods:
+
+- **Mutation** — apply a deliberate wrong implementation, re-run, confirm the test fails. Best for logic. List which mutants were applied and which died.
+- **Substitution** — swap the component for a plausible wrong alternative *on real data* and confirm the output actually differs. Best for data-dependent paths.
+
+**Substitution is not optional for data-dependent tests: a strong assertion over weak fixture data still cannot fail.** A real-GGUF pre-tokenizer parity test passed CI, its author's testing and a review — then was shown to produce byte-identical token ids when the pipeline was forcibly swapped, because neither vocabulary contained a single multi-digit token, so the very construct under test was unobservable. The assertion was fine; the *fixture* could not distinguish right from wrong.
+
+A surviving mutant is a finding, not a failure — it usually converts into a one-line test guarding real behaviour.
+
+**Scope:** correctness gates only — tests whose name or issue claims a guarantee. A smoke test is allowed to be a smoke test. This generalizes the per-type negative-control standard already mandated for quantization (issue #344, "the test must be shown to fail against a deliberately broken implementation"); keep the two consistent.
+
+**Weak assertions to distrust on sight:** `IsFinite`, non-empty, non-constant, `> 0`, and fixed tolerances where the bound should scale with the reduction length (√K). A months-old attention bug survived behind "logits are finite and non-constant".
+
 ## What Claude Should Know
 
 - **Author**: Konrad — expert .NET dev, "Pro .NET Memory Management" (2nd ed.), MVP, 20+ yrs perf. AI/agents at Nethermind. Do NOT over-explain .NET basics.
