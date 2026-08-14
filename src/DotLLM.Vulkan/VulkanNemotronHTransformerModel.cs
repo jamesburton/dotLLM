@@ -299,7 +299,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// </summary>
     /// <remarks>
     /// Mirrors <see cref="VulkanQwen3MoeHybridTransformerModel.BuildFromGguf"/>: the CPU loader
-    /// (<see cref="NemotronHTransformerModel.LoadFromGguf"/>) does all GGUF tensor-name mapping and
+    /// (<c>NemotronHTransformerModel.LoadFromGguf</c>) does all GGUF tensor-name mapping and
     /// per-layer validation, producing <see cref="NemotronHLayerWeights"/> that point into the
     /// GGUF mmap; those are then uploaded to the device by
     /// <see cref="VulkanNemotronHWeights.Upload"/>. Duplicating the tensor-name mapping here would
