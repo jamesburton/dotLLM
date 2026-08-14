@@ -6,6 +6,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
+using DotLLM.Cpu.Threading;
 using DotLLM.Models.Gguf;
 
 namespace DotLLM.Models.Architectures;
@@ -48,6 +49,11 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     private readonly int[] _ssmLayerOrdinal;
     private readonly int _numSsmLayers;
 
+    // #386: compute pool for the Gemm hot path. Null = single-threaded (tests,
+    // prebuilt-weights path). Owned iff created by LoadFromGguf.
+    private readonly ComputeThreadPool? _threadPool;
+    private readonly bool _ownsThreadPool;
+
     private readonly NemotronHForwardState _state;
     private readonly SsmStateCache _ssmCache;
 
@@ -72,7 +78,8 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         float[] outputNormWeight,
         nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType,
         nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim,
-        int[] kvSlotForLayer, int attentionLayerCount)
+        int[] kvSlotForLayer, int attentionLayerCount,
+        ComputeThreadPool? threadPool = null, bool ownsThreadPool = false)
     {
         Config = config;
         _gguf = gguf;
@@ -88,6 +95,8 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         _ssm = config.SsmConfig!.Value;
         _kvSlotForLayer = kvSlotForLayer;
         _attentionLayerCount = attentionLayerCount;
+        _threadPool = threadPool;
+        _ownsThreadPool = ownsThreadPool;
 
         _ssmLayerOrdinal = new int[config.NumLayers];
         int ssmOrdinal = 0;
@@ -130,6 +139,15 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     /// remain alive for the lifetime of the returned model.
     /// </summary>
     public static NemotronHTransformerModel LoadFromGguf(GgufFile gguf, ModelConfig config)
+        => LoadFromGguf(gguf, config, ThreadingConfig.SingleThreaded);
+
+    /// <summary>
+    /// Loads a Nemotron-H / Nemotron-H-MoE model with threading configuration (#386).
+    /// Mirrors the Qwen hybrid loaders: a parallel config creates a ComputeThreadPool
+    /// that every projection GEMM dispatches through (row-partitioned, so results are
+    /// bit-identical to the single-threaded path).
+    /// </summary>
+    public static NemotronHTransformerModel LoadFromGguf(GgufFile gguf, ModelConfig config, ThreadingConfig threading)
     {
         if (config.Architecture is not (Architecture.NemotronH or Architecture.NemotronHMoe))
             throw new ArgumentException(
@@ -186,11 +204,31 @@ public sealed unsafe class NemotronHTransformerModel : IModel
                 : -1;
         }
 
+        ComputeThreadPool? pool = CreatePool(threading);
+
         return new NemotronHTransformerModel(
             config, gguf, layers, outputNormWeight,
             embPtr, embDesc.QuantizationType,
             outputPtr, outputQt, outputM, outputK,
-            kvSlotForLayer, attentionLayerCount);
+            kvSlotForLayer, attentionLayerCount,
+            pool, ownsThreadPool: pool is not null);
+    }
+
+    private static ComputeThreadPool? CreatePool(ThreadingConfig threading)
+    {
+        if (!threading.IsParallel)
+            return null;
+
+        int effectiveThreads = threading.EffectiveThreadCount;
+        if (threading.EnableNumaPinning || threading.EnablePCorePinning)
+        {
+            var topology = NumaTopology.Detect();
+            if (threading.EnablePCorePinning && topology.IsHybrid)
+                effectiveThreads = Math.Min(effectiveThreads, topology.PerformanceCoreIds.Count);
+            return new ComputeThreadPool(effectiveThreads, topology, threading);
+        }
+
+        return new ComputeThreadPool(effectiveThreads, topology: null, threading);
     }
 
     /// <summary>
@@ -200,7 +238,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     /// pointer (token embed, output, plus every projection inside <paramref name="layers"/>).
     /// </summary>
     /// <remarks>
-    /// Unlike <see cref="LoadFromGguf"/> there is no <see cref="GgufFile"/> to keep alive — the
+    /// Unlike <c>LoadFromGguf</c> there is no <see cref="GgufFile"/> to keep alive — the
     /// model holds <c>null</c> for the gguf reference. Disposing this model frees only the forward
     /// scratch and the SSM cache; weight memory belongs to the caller.
     /// </remarks>
@@ -674,7 +712,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void ForwardFfnBody(NemotronHFfnWeights ffn, int seqLen, int hiddenSize,
+    private void ForwardFfnBody(NemotronHFfnWeights ffn, int seqLen, int hiddenSize,
                                        float* normOut, float* ffnMid, byte* inputQ8Scratch)
     {
         int intermediateSize = ffn.UpOutputDim;
@@ -706,7 +744,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     /// and writes the result back to the same buffer (same contract as the other
     /// sub-layer bodies). Correctness-first: per-token GEMVs into pooled scratch.
     /// </summary>
-    private static void ForwardMoeFfnBody(NemotronHMoeWeights moe, int seqLen, int hiddenSize, float* normOut)
+    private void ForwardMoeFfnBody(NemotronHMoeWeights moe, int seqLen, int hiddenSize, float* normOut)
     {
         int nExpert = moe.NumExperts;
         int topK = moe.NumExpertsPerTok;
@@ -1076,31 +1114,33 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void Gemm(nint weights, QuantizationType qt, float* b, float* c,
-                              int m, int k, int n, byte* preQuantizedInput)
+    private void Gemm(nint weights, QuantizationType qt, float* b, float* c,
+                      int m, int k, int n, byte* preQuantizedInput)
     {
+        // #386: pool-aware GEMM dispatch — mirrors Qwen3HybridDenseTransformerModel.Gemm.
+        // Row-partitioned across the pool, so results are bit-identical to serial.
         switch (qt)
         {
             case QuantizationType.Q8_0:
-                MatMul.GemmQ8_0((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                MatMul.GemmQ8_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
                 return;
             case QuantizationType.Q5_0:
-                MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
                 return;
             case QuantizationType.Q4_K:
-                MatMul.GemmQ4_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                MatMul.GemmQ4_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
                 return;
             case QuantizationType.Q5_K:
-                MatMul.GemmQ5_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                MatMul.GemmQ5_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
                 return;
             case QuantizationType.Q6_K:
-                MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
                 return;
             case QuantizationType.F32:
-                MatMul.GemmF32((float*)weights, b, c, m, k, n);
+                MatMul.GemmF32((float*)weights, b, c, m, k, n, _threadPool);
                 return;
             case QuantizationType.F16:
-                MatMul.GemmF16(weights, b, c, m, k, n);
+                MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);
                 return;
             default:
                 // Shared dequantize-and-dot fallback (#263): decodes each weight row once and
@@ -1148,6 +1188,8 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        if (_ownsThreadPool)
+            _threadPool?.Dispose();
         _state.Dispose();
         _ssmCache.Dispose();
         GC.SuppressFinalize(this);

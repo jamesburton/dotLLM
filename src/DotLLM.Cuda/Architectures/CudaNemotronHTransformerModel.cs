@@ -209,7 +209,7 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
 
     /// <summary>
     /// Loads a NemotronH model from an opened GGUF file onto the given CUDA device. Reuses
-    /// <see cref="NemotronHTransformerModel.LoadFromGguf"/> (CPU) for all GGUF tensor-name
+    /// <c>NemotronHTransformerModel.LoadFromGguf</c> (CPU) for all GGUF tensor-name
     /// resolution and shape validation, then uploads the resulting weights to device memory —
     /// see this task's "Design decision" note for why.
     /// </summary>
