@@ -183,53 +183,90 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
                     $"Mamba-3 weights are incomplete ({weights.Report.MissingRequiredCount} required tensors "
                     + "missing). Inspect Mamba3Weights.Report.Problems before attempting a CUDA load.");
 
+            // #383: context creation is the one call in this sequence that cannot leak on its
+            // own throw (nothing has been allocated yet), so it stays outside the try/catch
+            // below — everything created from here on (stream/cublas/kernels/device buffers)
+            // is disposed on any failure before rethrowing.
             var context = CudaContext.Create(deviceId);
-            var stream = CudaStream.Create();
-            var cublas = CudaCublasHandle.Create();
-            ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
-            var kernels = new CudaKernels(ptxDir);
-
-            var m3 = config.Mamba3Config;
-            int hidden = config.HiddenSize;
-            int vocab = config.VocabSize;
-            int dInner = m3.DInner;
-            int nHead = m3.NumHeads;
-            int dState = m3.StateSize;
-            int effRank = m3.IsMimo ? m3.MimoRank : 1;
-            int bcBiasElems = nHead * effRank * dState;
-            int mimoElems = m3.IsMimo ? nHead * m3.MimoRank * m3.HeadDim : 0;
-
-            nint tokenEmbedDevice = UploadF32(weights.TokenEmbedding, (long)vocab * hidden, stream.Handle);
-            nint finalNormDevice = UploadF32(weights.FinalNorm, hidden, stream.Handle);
-
-            bool tied = weights.LmHead.Pointer == weights.TokenEmbedding.Pointer;
-            nint lmHeadDevice = tied ? tokenEmbedDevice : UploadF32(weights.LmHead, (long)vocab * hidden, stream.Handle);
-
-            var layers = new DeviceLayer[config.NumLayers];
-            for (int i = 0; i < config.NumLayers; i++)
+            CudaStream? stream = null;
+            CudaCublasHandle? cublas = null;
+            CudaKernels? kernels = null;
+            // Ledger of every device buffer allocated below. UploadF32 appends to this the
+            // instant cuMemAlloc succeeds (before the H2D copy), so a throw mid-upload — e.g.
+            // a BF16 tensor tripping the F32-only guard, or a later buffer hitting device OOM —
+            // still leaves every earlier buffer (including the ones inside a partially-built
+            // DeviceLayer that was never assigned into `layers`) recoverable. UploadF32 is
+            // skipped entirely for the tied lm_head case (see below), so the alias is never
+            // double-added/double-freed.
+            var allocs = new List<nint>();
+            try
             {
-                ref readonly var lw = ref weights.Layers[i];
-                layers[i] = new DeviceLayer(
-                    Norm: UploadF32(lw.Norm, hidden, stream.Handle),
-                    InProj: UploadF32(lw.InProj, (long)m3.InputProjectionDim * hidden, stream.Handle),
-                    OutProj: UploadF32(lw.OutProj, (long)hidden * dInner, stream.Handle),
-                    BNorm: UploadF32(lw.BNorm, dState, stream.Handle),
-                    CNorm: UploadF32(lw.CNorm, dState, stream.Handle),
-                    BBias: UploadF32(lw.BBias, bcBiasElems, stream.Handle),
-                    CBias: UploadF32(lw.CBias, bcBiasElems, stream.Handle),
-                    D: UploadF32(lw.D, nHead, stream.Handle),
-                    DtBias: UploadF32(lw.DtBias, nHead, stream.Handle),
-                    MimoZ: m3.IsMimo ? UploadF32(lw.MimoZ, mimoElems, stream.Handle) : 0,
-                    MimoO: m3.IsMimo ? UploadF32(lw.MimoO, mimoElems, stream.Handle) : 0);
+                stream = CudaStream.Create();
+                cublas = CudaCublasHandle.Create();
+                ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
+                kernels = new CudaKernels(ptxDir);
+
+                var m3 = config.Mamba3Config;
+                int hidden = config.HiddenSize;
+                int vocab = config.VocabSize;
+                int dInner = m3.DInner;
+                int nHead = m3.NumHeads;
+                int dState = m3.StateSize;
+                int effRank = m3.IsMimo ? m3.MimoRank : 1;
+                int bcBiasElems = nHead * effRank * dState;
+                int mimoElems = m3.IsMimo ? nHead * m3.MimoRank * m3.HeadDim : 0;
+
+                nint tokenEmbedDevice = UploadF32(weights.TokenEmbedding, (long)vocab * hidden, stream.Handle, allocs);
+                nint finalNormDevice = UploadF32(weights.FinalNorm, hidden, stream.Handle, allocs);
+
+                bool tied = weights.LmHead.Pointer == weights.TokenEmbedding.Pointer;
+                nint lmHeadDevice = tied ? tokenEmbedDevice : UploadF32(weights.LmHead, (long)vocab * hidden, stream.Handle, allocs);
+
+                var layers = new DeviceLayer[config.NumLayers];
+                for (int i = 0; i < config.NumLayers; i++)
+                {
+                    ref readonly var lw = ref weights.Layers[i];
+                    layers[i] = new DeviceLayer(
+                        Norm: UploadF32(lw.Norm, hidden, stream.Handle, allocs),
+                        InProj: UploadF32(lw.InProj, (long)m3.InputProjectionDim * hidden, stream.Handle, allocs),
+                        OutProj: UploadF32(lw.OutProj, (long)hidden * dInner, stream.Handle, allocs),
+                        BNorm: UploadF32(lw.BNorm, dState, stream.Handle, allocs),
+                        CNorm: UploadF32(lw.CNorm, dState, stream.Handle, allocs),
+                        BBias: UploadF32(lw.BBias, bcBiasElems, stream.Handle, allocs),
+                        CBias: UploadF32(lw.CBias, bcBiasElems, stream.Handle, allocs),
+                        D: UploadF32(lw.D, nHead, stream.Handle, allocs),
+                        DtBias: UploadF32(lw.DtBias, nHead, stream.Handle, allocs),
+                        MimoZ: m3.IsMimo ? UploadF32(lw.MimoZ, mimoElems, stream.Handle, allocs) : 0,
+                        MimoO: m3.IsMimo ? UploadF32(lw.MimoO, mimoElems, stream.Handle, allocs) : 0);
+                }
+
+                // All H2D copies above were issued async on `stream` — synchronize before
+                // releasing the CPU-side (mmap-backed) weight handles.
+                stream.Synchronize();
+
+                return new CudaMamba3TransformerModel(
+                    config, context, stream, cublas, kernels, layers,
+                    tokenEmbedDevice, finalNormDevice, lmHeadDevice, lmHeadOwnsDevice: !tied);
             }
+            catch
+            {
+                // Best-effort drain of any pending async H2D copies before freeing the buffers
+                // they target — cheap, and removes any question of a copy racing the frees below.
+                try { stream?.Synchronize(); } catch { /* already failing; nothing more to report */ }
 
-            // All H2D copies above were issued async on `stream` — synchronize before
-            // releasing the CPU-side (mmap-backed) weight handles.
-            stream.Synchronize();
+                for (int i = allocs.Count - 1; i >= 0; i--)
+                    FreeIfNonZero(allocs[i]);
 
-            return new CudaMamba3TransformerModel(
-                config, context, stream, cublas, kernels, layers,
-                tokenEmbedDevice, finalNormDevice, lmHeadDevice, lmHeadOwnsDevice: !tied);
+                kernels?.Dispose();
+                cublas?.Dispose();
+                stream?.Dispose();
+                // CudaContext.Create (above) makes the context current on THIS thread, and this
+                // catch runs synchronously on the same thread — no MakeCurrent() call is needed
+                // here (matches #368's convention: only cross-thread entry points need an
+                // explicit rebind before touching CUDA state).
+                context.Dispose();
+                throw;
+            }
         }
         finally
         {
@@ -244,9 +281,11 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
     /// Uploads a populated F32 <see cref="Mamba3TensorHandle"/> to a freshly-allocated
     /// device buffer via an async H2D copy on <paramref name="stream"/>. Returns 0 (no
     /// allocation) for an unpopulated handle — e.g. <c>MimoZ</c>/<c>MimoO</c> on a SISO
-    /// checkpoint.
+    /// checkpoint. The allocated pointer is appended to <paramref name="allocs"/> immediately
+    /// after <c>cuMemAlloc</c> succeeds (before the H2D copy), so callers can free everything
+    /// allocated so far from that ledger if a later call in the same sequence throws (#383).
     /// </summary>
-    private static nint UploadF32(Mamba3TensorHandle handle, long expectedElements, nint stream)
+    private static nint UploadF32(Mamba3TensorHandle handle, long expectedElements, nint stream, List<nint> allocs)
     {
         if (!handle.IsPopulated) return 0;
         if (handle.SourceDType != SafetensorsDType.F32)
@@ -256,6 +295,7 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
 
         long bytes = expectedElements * sizeof(float);
         CudaDriverApi.cuMemAlloc_v2(out nint devPtr, (nuint)bytes).ThrowOnError();
+        allocs.Add(devPtr);
         CudaDriverApi.cuMemcpyHtoDAsync_v2(devPtr, handle.Pointer, (nuint)bytes, stream).ThrowOnError();
         return devPtr;
     }

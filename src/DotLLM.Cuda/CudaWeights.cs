@@ -215,6 +215,14 @@ internal sealed class CudaWeights : IDisposable
         bool isHybrid = (firstLayer + layerCount) < config.NumLayers;
 
         var allocs = new List<nint>();
+        // #383: `allocs` already tracked every device buffer this method (and the MLA/MoE/
+        // Gemma4 per-layer loaders below, which share this same list by reference) allocates —
+        // it just was never used to clean up on a mid-load throw (device OOM, a corrupt tensor).
+        // This method does not own `kernels`/`stream` (caller-supplied via LoadFromGguf's
+        // parameters) — only the device buffers it allocates are its responsibility here; the
+        // caller's own factory method is responsible for context/stream/cublas/kernels cleanup.
+        try
+        {
 
         // Token embeddings — upload in original format if a per-row embedding lookup
         // kernel exists for it (saves the FP16 expansion of a vocab×hidden table).
@@ -510,6 +518,22 @@ internal sealed class CudaWeights : IDisposable
             outputNorm, outputWeight, cpuWeights.OutputOutputDim, cpuWeights.OutputInputDim,
             outputWeightQuant, cpuWeights.OutputQuantType, allocs,
             mlaLayers, moeLayers, gemma4Layers);
+        }
+        catch
+        {
+            // Best-effort drain of any pending async H2D copies (several upload helpers above
+            // use cuMemcpyHtoDAsync_v2 on `stream`) before freeing the buffers they target.
+            try { CudaDriverApi.cuStreamSynchronize(stream); } catch { /* already failing */ }
+
+            for (int i = allocs.Count - 1; i >= 0; i--)
+                FreeDeviceIfNonZero(allocs[i]);
+            throw;
+        }
+    }
+
+    private static void FreeDeviceIfNonZero(nint ptr)
+    {
+        if (ptr != 0) CudaDriverApi.cuMemFree_v2(ptr);
     }
 
     /// <summary>Upload raw quantized weight bytes to GPU (no dequant). For decode quantized GEMV.</summary>

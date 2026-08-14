@@ -126,14 +126,37 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
 
         // 1. Load Vulkan model for the first N layers only.
         //    config with { NumLayers = N } restricts weight upload to N layers.
+        // #383: `vulkanModel` and `cpuWeights` are each created before CreateFromWeights'
+        // (CUDA-side) resources exist, so CreateFromWeights' own try/catch can't reach them —
+        // if it throws, this method must dispose whichever of these it already created.
         var vulkanConfig = config with { NumLayers = numVulkanLayers };
         var vulkanModel = VulkanTransformerModel.LoadFromGguf(gguf, vulkanConfig, spvDir);
-
-        // 2. Load CPU weights for CUDA upload (full model).
-        var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config);
-
-        return CreateFromWeights(config, vulkanModel, numVulkanLayers,
-            cpuWeights, cudaDeviceId, ptxDir);
+        try
+        {
+            // 2. Load CPU weights for CUDA upload (full model).
+            var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config);
+            try
+            {
+                return CreateFromWeights(config, vulkanModel, numVulkanLayers,
+                    cpuWeights, cudaDeviceId, ptxDir);
+            }
+            catch
+            {
+                // #383 review follow-up: TransformerWeights.Dispose() releases host allocations
+                // and can itself throw — that would replace the original exception (the reason
+                // we're in this catch at all) with an unrelated teardown failure. Swallow it, same
+                // as the stream-drain guard idiom used elsewhere for this class of hazard.
+                try { cpuWeights.Dispose(); } catch { /* don't mask the original exception */ }
+                throw;
+            }
+        }
+        catch
+        {
+            // #383 review follow-up: VulkanTransformerModel.Dispose() tears down real GPU
+            // resources and can itself throw — see the cpuWeights.Dispose() note above.
+            try { vulkanModel.Dispose(); } catch { /* don't mask the original exception */ }
+            throw;
+        }
     }
 
     /// <summary>
@@ -169,54 +192,92 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
 
         // Load Vulkan model for N layers (device not owned — caller retains it).
+        // #383: `vulkanModel` is created before CreateFromWeights' (CUDA-side) resources exist,
+        // so CreateFromWeights' own try/catch can't reach it — if it throws, this method must
+        // dispose the vulkanModel it already created. `cpuWeights` stays caller-owned (per this
+        // method's doc) — never disposed here, on success or failure.
         var vulkanConfig = config with { NumLayers = numVulkanLayers };
         var vulkanModel = VulkanTransformerModel.BuildFromPrebuiltWeights(
             vulkanDevice, vulkanConfig, cpuWeights, spvDir);
+        try
+        {
+            // Repack CPU weights for CUDA upload (idempotent).
+            cpuWeights.RepackWeights();
 
-        // Repack CPU weights for CUDA upload (idempotent).
-        cpuWeights.RepackWeights();
-
-        return CreateFromWeights(config, vulkanModel, numVulkanLayers,
-            cpuWeights, cudaDeviceId, ptxDir);
+            return CreateFromWeights(config, vulkanModel, numVulkanLayers,
+                cpuWeights, cudaDeviceId, ptxDir);
+        }
+        catch
+        {
+            // #383 review follow-up: see LoadFromGguf's identical guard above — Dispose() can
+            // itself throw and must not replace the original exception.
+            try { vulkanModel.Dispose(); } catch { /* don't mask the original exception */ }
+            throw;
+        }
     }
 
     private static HybridVulkanCudaTransformerModel CreateFromWeights(
         ModelConfig config, VulkanTransformerModel vulkanModel, int numVulkanLayers,
         TransformerWeights cpuWeights, int cudaDeviceId, string? ptxDir)
     {
-        // Initialize CUDA.
+        // Initialize CUDA. #383: context creation cannot leak on its own throw (nothing
+        // allocated yet), so it stays outside the try/catch — everything created from here on
+        // is disposed on any failure before rethrowing. This method does NOT own
+        // `vulkanModel`/`cpuWeights` — both callers (LoadFromGguf, BuildFromPrebuiltWeights) are
+        // responsible for those.
         var context = CudaContext.Create(cudaDeviceId);
-        var stream = CudaStream.Create();
-        var cublas = CudaCublasHandle.Create();
-        cublas.SetStream(stream);
+        CudaStream? stream = null;
+        CudaCublasHandle? cublas = null;
+        CudaKernels? kernels = null;
+        CudaWeights? cudaWeights = null;
+        CudaForwardState? cudaState = null;
+        try
+        {
+            stream = CudaStream.Create();
+            cublas = CudaCublasHandle.Create();
+            cublas.SetStream(stream);
 
-        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
-        var kernels = new CudaKernels(ptxDir);
+            ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
+            kernels = new CudaKernels(ptxDir);
 
-        // Upload only the CUDA-resident layers to CUDA VRAM. Layers 0..numVulkanLayers-1
-        // are handled by Vulkan; no need to pay for them in CUDA VRAM.
-        // firstLayer skips the Vulkan slice; numGpuLayers = L-V covers the rest + output norm/LM head.
-        // skipTokenEmbed: the embedding gather happens on the Vulkan side, so the CUDA phase never
-        // reads the table — don't pay vocab × hidden of CUDA VRAM for it (#123).
-        int numCudaOnlyLayers = config.NumLayers - numVulkanLayers;
-        var cudaWeights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
-            numGpuLayers: numCudaOnlyLayers, firstLayer: numVulkanLayers, skipTokenEmbed: true);
+            // Upload only the CUDA-resident layers to CUDA VRAM. Layers 0..numVulkanLayers-1
+            // are handled by Vulkan; no need to pay for them in CUDA VRAM.
+            // firstLayer skips the Vulkan slice; numGpuLayers = L-V covers the rest + output norm/LM head.
+            // skipTokenEmbed: the embedding gather happens on the Vulkan side, so the CUDA phase never
+            // reads the table — don't pay vocab × hidden of CUDA VRAM for it (#123).
+            int numCudaOnlyLayers = config.NumLayers - numVulkanLayers;
+            cudaWeights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
+                numGpuLayers: numCudaOnlyLayers, firstLayer: numVulkanLayers, skipTokenEmbed: true);
 
-        // CUDA scratch activations (same sizing as CudaTransformerModel).
-        var cudaState = new CudaForwardState(
-            config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
-            config.HeadDim, config.IntermediateSize, config.VocabSize);
+            // CUDA scratch activations (same sizing as CudaTransformerModel).
+            cudaState = new CudaForwardState(
+                config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
+                config.HeadDim, config.IntermediateSize, config.VocabSize);
 
-        // RoPE config (same translation as CudaTransformerModel and HybridTransformerModel).
-        int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
-        if (ropeDim == 0) ropeDim = config.HeadDim;
-        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        int ropeType = CudaKernels.ToCudaRopeType(config.RoPEConfig?.Type ?? RoPEType.Norm);
+            // RoPE config (same translation as CudaTransformerModel and HybridTransformerModel).
+            int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
+            if (ropeDim == 0) ropeDim = config.HeadDim;
+            float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+            int ropeType = CudaKernels.ToCudaRopeType(config.RoPEConfig?.Type ?? RoPEType.Norm);
 
-        return new HybridVulkanCudaTransformerModel(
-            config, vulkanModel, numVulkanLayers,
-            cudaWeights, cudaState, stream, cublas, context, kernels,
-            cudaDeviceId, ropeTheta, ropeDim, ropeType);
+            return new HybridVulkanCudaTransformerModel(
+                config, vulkanModel, numVulkanLayers,
+                cudaWeights, cudaState, stream, cublas, context, kernels,
+                cudaDeviceId, ropeTheta, ropeDim, ropeType);
+        }
+        catch
+        {
+            cudaState?.Dispose();
+            cudaWeights?.Dispose();
+            kernels?.Dispose();
+            cublas?.Dispose();
+            stream?.Dispose();
+            // CudaContext.Create (above) makes the context current on THIS thread, and this
+            // catch runs synchronously on the same thread — no MakeCurrent() call is needed
+            // here (matches #368's convention).
+            context.Dispose();
+            throw;
+        }
     }
 
     /// <summary>

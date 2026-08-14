@@ -562,13 +562,23 @@ public sealed unsafe class CudaTransformerModel : IModel
         TransformerWeights cpuWeights, ModelConfig config, GgufFile? gguf,
         int deviceId, string? ptxDir, long estimatedWeightBytes)
     {
+        // #383: context creation cannot leak on its own throw (nothing allocated yet), so it
+        // stays outside the try/catch — everything created from here on (stream/cublas/kernels/
+        // weights/state) is disposed on any failure before rethrowing.
         var context = CudaContext.Create(deviceId);
-        var stream = CudaStream.Create();
-        var cublas = CudaCublasHandle.Create();
+        CudaStream? stream = null;
+        CudaCublasHandle? cublas = null;
+        CudaKernels? kernels = null;
+        CudaWeights? weights = null;
+        CudaForwardState? state = null;
+        try
+        {
+        stream = CudaStream.Create();
+        cublas = CudaCublasHandle.Create();
         cublas.SetStream(stream);
 
         ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
-        var kernels = new CudaKernels(ptxDir);
+        kernels = new CudaKernels(ptxDir);
 
         string? vramWarning = null;
         if (estimatedWeightBytes > 0
@@ -606,7 +616,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             };
         }
 
-        var weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
+        weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
             onHostTensorUploaded: onHostTensorUploaded);
         LastLoadStreamedHostFreeCount = streamedFreeCount;
 
@@ -656,7 +666,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         // DOTLLM_CUDA_FLASH_ATTN_MINSEQ. Per-call gating in CudaFlashAttention.CanUse.
         CudaFlashAttention.ConfigureDefault(geForceAmpere);
 
-        var state = new CudaForwardState(
+        state = new CudaForwardState(
             config.HiddenSize, config.NumAttentionHeads, stateKvHeads,
             stateHeadDim, config.IntermediateSize, config.VocabSize, useFp32Residual);
 
@@ -671,6 +681,21 @@ public sealed unsafe class CudaTransformerModel : IModel
 
         return new CudaTransformerModel(config, weights, state, stream, cublas, context,
             kernels, gguf, cpuWeights, deviceId, ropeTheta, ropeDim, ropeType, vramWarning);
+        }
+        catch
+        {
+            state?.Dispose();
+            weights?.Dispose();
+            kernels?.Dispose();
+            cublas?.Dispose();
+            stream?.Dispose();
+            // CudaContext.Create (above) makes the context current on THIS thread, and this
+            // catch runs synchronously on the same thread — no MakeCurrent() call is needed
+            // here (matches #368's convention: only cross-thread entry points need an explicit
+            // rebind before touching CUDA state).
+            context.Dispose();
+            throw;
+        }
     }
 
     /// <inheritdoc/>
