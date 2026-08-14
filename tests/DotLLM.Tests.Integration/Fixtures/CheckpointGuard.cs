@@ -23,10 +23,10 @@ namespace DotLLM.Tests.Integration.Fixtures;
 ///     probe and the open. Unconditional: always a skip.</description></item>
 ///   <item><description>An <see cref="InvalidDataException"/> whose message matches one
 ///     of <see cref="TruncationSignatures"/> (declared-offset-vs-file-length overshoot)
-///     <b>AND</b> <see cref="IsPlausiblyInFlight"/> finds independent evidence the file is
-///     still being written (locked, or its size changes across a short recheck window).
-///     Only then is it a skip — see the correctness note below for why the signature
-///     alone is not sufficient.</description></item>
+///     <b>AND</b> <see cref="IsPlausiblyInFlight"/> — run from the <c>catch</c> body, see
+///     below — finds independent evidence the file is still being written (locked, or its
+///     size changes across a short recheck window). Only then is it a skip — see the
+///     correctness note below for why the signature alone is not sufficient.</description></item>
 /// </list>
 /// <para>
 /// <b>Correctness note — the bounds-overshoot signature is NOT proof of truncation.</b>
@@ -45,11 +45,27 @@ namespace DotLLM.Tests.Integration.Fixtures;
 /// changing a few hundred milliseconds later; a complete-but-corrupt file is neither.
 /// </para>
 /// <para>
-/// <b>Why the recheck is safe to run after the failure.</b> Both loaders close their file
-/// handle (and, for the bounds-overshoot case specifically, never open a memory-mapped
-/// view at all — the check runs before that step) before the offset comparison that
-/// throws, so by the time <see cref="LoadOrSkip{T}"/> catches the exception, nothing this
-/// guard opens can conflict with a concurrent writer.
+/// <b>Why <see cref="IsPlausiblyInFlight"/> runs in the <c>catch</c> BODY, not the
+/// exception filter.</b> A first attempt put the check in the <c>when</c> clause
+/// alongside <see cref="IsTruncationSignature"/>. That is wrong and was proven wrong by
+/// review: C# exception filters execute during the CLR's <i>first pass</i>, before the
+/// stack unwinds — i.e. before any <c>using</c>/<c>finally</c> block between the throw
+/// site and this handler has run. <c>SafetensorsFile.Open</c> throws its "would read past
+/// EOF" / "unexpected EOF" / 8-byte-length-prefix errors from <b>inside</b> its own
+/// <c>using (var fs = new FileStream(..., FileShare.Read))</c> block, so at filter-evaluation
+/// time <c>fs</c> is still open. A lock probe run there always collides with the loader's
+/// own handle and reports "locked" regardless of whether anything else is touching the
+/// file — silently skipping real corruption for exactly those three signatures (the other
+/// two, "extends beyond file boundary" and "exceed data section length", are thrown after
+/// their loader's file handle already closed, so they were not affected — but the fix
+/// applies uniformly rather than special-casing which loader threw). Moving the check into
+/// the <c>catch</c> body defers it to the CLR's <i>second pass</i>, which runs only after
+/// the stack has unwound and every intervening <c>using</c>/<c>finally</c> — including the
+/// throwing loader's own — has disposed. By the time <see cref="IsPlausiblyInFlight"/>
+/// runs, nothing this guard opens can collide with the load call's own (by-then-closed)
+/// handles; only a genuinely external writer can trip the lock or size-change checks.
+/// <see cref="IsTruncationSignature"/> stays in the filter because it only inspects the
+/// exception's <c>Message</c> — pure, no I/O, nothing to race.
 /// </para>
 /// </remarks>
 internal static class CheckpointGuard
@@ -95,9 +111,19 @@ internal static class CheckpointGuard
         {
             throw new Xunit.SkipException(SkipMessage(path, description, ex));
         }
-        catch (InvalidDataException ex) when (IsTruncationSignature(ex.Message) && IsPlausiblyInFlight(path))
+        catch (InvalidDataException ex) when (IsTruncationSignature(ex.Message))
         {
-            throw new Xunit.SkipException(SkipMessage(path, description, ex));
+            // IsPlausiblyInFlight deliberately lives in the CATCH BODY, not the exception
+            // filter above — see the "why the recheck runs in the catch body" doc-comment
+            // paragraph. Filters run in the CLR's first pass, before the stack unwinds, so a
+            // check here would race the throwing loader's own not-yet-disposed FileStream for
+            // three of the five TruncationSignatures ("would read past EOF", "unexpected EOF",
+            // the 8-byte-length-prefix case) and always see "locked" — defeating the
+            // discriminator for exactly those cases. `IsTruncationSignature` stays in the
+            // filter because it only inspects `ex.Message`, no I/O, so it has nothing to race.
+            if (IsPlausiblyInFlight(path))
+                throw new Xunit.SkipException(SkipMessage(path, description, ex));
+            throw; // preserves the original stack trace — do not `throw ex`.
         }
     }
 

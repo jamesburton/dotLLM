@@ -15,22 +15,84 @@ namespace DotLLM.Tests.Integration.Fixtures;
 public sealed class CheckpointGuardTests
 {
     [Fact]
-    public void LoadOrSkip_TruncatedHeaderLengthPrefix_SkipsInsteadOfFailing()
+    public void LoadOrSkip_TruncatedHeaderLengthPrefixOnStableUnlockedFile_PropagatesOriginalFailure()
     {
         // An 8-byte header-length prefix (declaring a 50-byte JSON header) with NO header
-        // bytes following it — exactly the shape of a download interrupted right after the
-        // first 8 bytes landed on disk. SafetensorsFile.Open throws InvalidDataException
-        // with the "would read past EOF" truncation signature.
-        string path = TempPath("truncated");
+        // bytes following it. SafetensorsFile.Open throws the "would read past EOF"
+        // InvalidDataException from INSIDE its own `using (var fs = ...)` block — one of the
+        // three TruncationSignatures a first (buggy) version of the in-flight discriminator
+        // got wrong: putting the lock/size probe in the exception FILTER ran it while that
+        // FileStream was still open (filters run in the CLR's first pass, before the stack
+        // unwinds), so the probe always collided with the loader's OWN handle and reported
+        // "locked" — this test passed "by accident" under that version regardless of whether
+        // the file was actually still being written. With the probe correctly moved into the
+        // catch BODY (after the stack has unwound and the loader's FileStream is disposed),
+        // a stable, unlocked file like this one must FAIL loudly, not skip — this is the
+        // reviewer's decisive repro that this test now asserts correctly.
+        string path = TempPath("truncated-stable");
         try
         {
             File.WriteAllBytes(path, BitConverter.GetBytes(50UL));
 
-            var ex = Assert.Throws<Xunit.SkipException>(() =>
+            var ex = Assert.Throws<InvalidDataException>(() =>
                 CheckpointGuard.LoadOrSkip(path, "regression fixture", () => SafetensorsFile.Open(path)));
-            Assert.Contains(
-                "checkpoint present but unreadable (partial download or locked)",
-                ex.Message, StringComparison.Ordinal);
+            Assert.Contains("would read past EOF", ex.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain("checkpoint present but unreadable", ex.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task LoadOrSkip_TruncatedHeaderLengthPrefixWhileFileStillGrowing_SkipsInsteadOfFailing()
+    {
+        // Same "would read past EOF" signature as the stable case above — one of the three
+        // signatures thrown from inside SafetensorsFile.Open's own `using` block, so the
+        // in-flight probe MUST run after that block has disposed (catch body, not filter) to
+        // see anything other than its own collision. Here a background writer keeps
+        // appending to the file for the test's duration (far too slowly to ever reach the
+        // declared 50-byte header within the test, so the same exception fires every retry),
+        // simulating an active downloader. The discriminator should observe the size
+        // changing across its recheck window and skip.
+        string path = TempPath("truncated-growing");
+        try
+        {
+            File.WriteAllBytes(path, BitConverter.GetBytes(50UL));
+
+            using var stop = new CancellationTokenSource();
+            Task writer = Task.Run(() =>
+            {
+                while (!stop.IsCancellationRequested)
+                {
+                    try
+                    {
+                        using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                        fs.WriteByte(0);
+                    }
+                    catch (IOException)
+                    {
+                        // Transient sharing conflict with CheckpointGuard's own lock probe —
+                        // retry on the next iteration.
+                    }
+                    Thread.Sleep(20);
+                }
+            });
+
+            try
+            {
+                var ex = Assert.Throws<Xunit.SkipException>(() =>
+                    CheckpointGuard.LoadOrSkip(path, "regression fixture", () => SafetensorsFile.Open(path)));
+                Assert.Contains(
+                    "checkpoint present but unreadable (partial download or locked)",
+                    ex.Message, StringComparison.Ordinal);
+            }
+            finally
+            {
+                stop.Cancel();
+                await writer.WaitAsync(TimeSpan.FromSeconds(5));
+            }
         }
         finally
         {
