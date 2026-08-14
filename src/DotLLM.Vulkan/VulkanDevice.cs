@@ -22,6 +22,28 @@ namespace DotLLM.Vulkan;
 /// </remarks>
 public sealed class VulkanDevice : IDisposable
 {
+    /// <summary>
+    /// Process-wide gate around Vulkan instance/device create-and-destroy
+    /// (<c>vkCreateInstance</c>, <c>vkCreateDevice</c>, <c>vkDestroyDevice</c>,
+    /// <c>vkDestroyInstance</c>). Fixes #369: xUnit runs test collections in
+    /// parallel by default, and multiple collections calling
+    /// <see cref="Create()"/> concurrently could drive the Vulkan loader/ICD
+    /// into <c>vkCreateDevice</c> at the same time, which crashed the
+    /// testhost natively (0xC0000005) instead of returning a
+    /// <c>VkResult</c> error — observed alongside transient
+    /// <c>VK_ERROR_OUT_OF_DEVICE_MEMORY</c> retries, consistent with the
+    /// loader/driver not being safe under concurrent instance+device
+    /// lifecycle calls. Destruction is included too: a create racing a
+    /// destroy on another thread is the same class of loader-level race as
+    /// two concurrent creates. Scoped tightly to the create/destroy calls
+    /// themselves (see <see cref="CreateCore"/> and <see cref="Dispose"/>) —
+    /// never held while a device is in use, so it does not serialize test
+    /// bodies, only their (rare, already-expensive) setup/teardown. In
+    /// production, a process creates at most a handful of devices total, so
+    /// the added contention is negligible.
+    /// </summary>
+    private static readonly Lock s_lifecycleLock = new();
+
     private nint _instance;
     private nint _physicalDevice;
     private nint _device;
@@ -339,17 +361,20 @@ public sealed class VulkanDevice : IDisposable
     private static bool ProbeInstance()
     {
         VulkanLibraryResolver.Register();
-        nint inst = CreateInstance();
-        if (inst == 0) return false;
-        try
+        lock (s_lifecycleLock)
         {
-            uint count = 0;
-            int r = VulkanApi.vkEnumeratePhysicalDevices(inst, ref count, null);
-            return r >= 0 && count > 0;
-        }
-        finally
-        {
-            VulkanApi.vkDestroyInstance(inst, 0);
+            nint inst = CreateInstance();
+            if (inst == 0) return false;
+            try
+            {
+                uint count = 0;
+                int r = VulkanApi.vkEnumeratePhysicalDevices(inst, ref count, null);
+                return r >= 0 && count > 0;
+            }
+            finally
+            {
+                VulkanApi.vkDestroyInstance(inst, 0);
+            }
         }
     }
 
@@ -370,17 +395,20 @@ public sealed class VulkanDevice : IDisposable
     private static int ProbePhysicalDeviceCount()
     {
         VulkanLibraryResolver.Register();
-        nint inst = CreateInstance();
-        if (inst == 0) return 0;
-        try
+        lock (s_lifecycleLock)
         {
-            uint count = 0;
-            int r = VulkanApi.vkEnumeratePhysicalDevices(inst, ref count, null);
-            return r >= 0 ? (int)count : 0;
-        }
-        finally
-        {
-            VulkanApi.vkDestroyInstance(inst, 0);
+            nint inst = CreateInstance();
+            if (inst == 0) return 0;
+            try
+            {
+                uint count = 0;
+                int r = VulkanApi.vkEnumeratePhysicalDevices(inst, ref count, null);
+                return r >= 0 ? (int)count : 0;
+            }
+            finally
+            {
+                VulkanApi.vkDestroyInstance(inst, 0);
+            }
         }
     }
 
@@ -408,106 +436,122 @@ public sealed class VulkanDevice : IDisposable
     private static VulkanDevice CreateCore(int? forcedIndex)
     {
         VulkanLibraryResolver.Register();
-        nint instance = CreateInstance();
-        if (instance == 0)
-            throw new VulkanException(-3, "vkCreateInstance failed — no Vulkan loader or driver available.");
 
-        try
+        // #369: the whole instance→device sequence runs under s_lifecycleLock.
+        // Concurrent xUnit collections each calling Create() drove the
+        // loader/ICD into vkCreateDevice at the same time and crashed the
+        // testhost natively rather than returning an error — see the lock
+        // field's doc comment for the full rationale. The intermediate
+        // physical-device probes (subgroup, coopmat, extension checks) are
+        // included too since they run against the `instance`/`physical`
+        // handles created in this same call and some (coopmat, integer dot
+        // product, subgroup-size-control) gate what gets enabled at
+        // vkCreateDevice time — they are not independent of the create
+        // sequence. The lock is released as soon as this method returns; it
+        // is never held while a device is in use.
+        lock (s_lifecycleLock)
         {
-            nint physical = SelectPhysicalDevice(instance, forcedIndex, out string name, out uint vendor, out int type, out uint apiVersion);
-            uint queueFamily = SelectComputeQueueFamily(physical);
+            nint instance = CreateInstance();
+            if (instance == 0)
+                throw new VulkanException(-3, "vkCreateInstance failed — no Vulkan loader or driver available.");
 
-            // Probe Vulkan 1.1 subgroup properties. Skipped gracefully on
-            // Vulkan 1.0 drivers — SubgroupSize=0, HasSubgroupArithmetic=false.
-            ProbeSubgroup(physical, apiVersion, out uint subgroupSize, out bool hasArithmetic);
-
-            // Probe VK_KHR_cooperative_matrix. Requires the device extension
-            // to be enabled at vkCreateDevice time for the shader to use it,
-            // so we must decide support *before* creating the logical device.
-            // Skipped gracefully on Vulkan 1.0 — returns empty shape list.
-            ProbeCooperativeMatrix(
-                instance, physical, apiVersion,
-                out bool hasCoopmat, out var coopmatShapes);
-
-            // Probe VK_EXT_external_memory_host. Same gating as coopmat — the
-            // extension must be enabled at vkCreateDevice time before
-            // vkAllocateMemory will accept VkImportMemoryHostPointerInfoEXT.
-            // VK_KHR_external_memory is the dependency (core in 1.1) and is
-            // always available on a 1.1+ driver. Falls back silently when
-            // absent — caller checks HasExternalMemoryHost.
-            ProbeExternalMemoryHost(
-                physical, apiVersion,
-                out bool hasExternalMemoryHost, out ulong minImportedHostPointerAlignment);
-
-            // Probe VK_KHR_shader_integer_dot_product (Vulkan 1.3 core). Like
-            // coopmat, the extension + feature must be enabled at
-            // vkCreateDevice time before the dp4a MMVQ shader can run, so we
-            // decide support before creating the logical device. Skipped
-            // gracefully on Vulkan 1.0 — returns false.
-            ProbeIntegerDotProduct(
-                physical, apiVersion,
-                out bool hasIntegerDotProduct);
-
-            // Probe VK_EXT_subgroup_size_control (Vulkan 1.3 core). Like the
-            // others, the feature must be enabled at vkCreateDevice time before
-            // a pipeline may pin its subgroup size, so we decide support before
-            // creating the logical device. Skipped gracefully on < 1.3 / missing
-            // extension — returns false + zero sizes.
-            ProbeSubgroupSizeControl(
-                physical, apiVersion,
-                out bool hasSubgroupSizeControl, out uint minSubgroupSize,
-                out uint maxSubgroupSize, out uint requiredSubgroupSizeStages);
-
-            // Probe VK_KHR_external_semaphore + VK_KHR_external_semaphore_win32
-            // (Win32 only). Required for the M3 cross-API handoff: the Vulkan
-            // forward submit signals an exported semaphore that CUDA waits on.
-            // Falls back silently when absent — caller checks HasExternalSemaphoreWin32.
-            ProbeExternalSemaphoreWin32(physical, apiVersion, out bool hasExternalSemaphoreWin32);
-
-            // Probe VK_AMD_shader_info — vendor extension, no feature bits, no
-            // Vulkan-version gate. Just an extension-presence check; enabling
-            // it at device-create is what makes vkGetShaderInfoAMD resolvable.
-            bool hasShaderInfoAmd = HasDeviceExtension(physical, "VK_AMD_shader_info"u8);
-
-            // Probe VK_KHR_pipeline_executable_properties — diagnostic only
-            // (issue #241: read back the wave width the driver actually compiled
-            // a pipeline for). Extension presence + the pipelineExecutableInfo
-            // feature enable are both needed before the query is legal.
-            bool hasPipelineExecutableProperties =
-                HasDeviceExtension(physical, "VK_KHR_pipeline_executable_properties"u8);
-
-            nint device = CreateLogicalDevice(
-                physical, queueFamily, hasCoopmat, hasExternalMemoryHost, hasIntegerDotProduct,
-                hasSubgroupSizeControl, hasExternalSemaphoreWin32, hasShaderInfoAmd,
-                hasPipelineExecutableProperties);
-
-            VulkanApi.vkGetDeviceQueue(device, queueFamily, 0, out nint queue);
-
-            var cpInfo = new VkCommandPoolCreateInfo
+            try
             {
-                sType = VkStructureType.CommandPoolCreateInfo,
-                flags = VkCommandPoolCreateFlags.ResetCommandBuffer,
-                queueFamilyIndex = queueFamily,
-            };
-            VulkanApi.vkCreateCommandPool(device, cpInfo, 0, out nint pool)
-                .ThrowOnError("vkCreateCommandPool");
+                nint physical = SelectPhysicalDevice(instance, forcedIndex, out string name, out uint vendor, out int type, out uint apiVersion);
+                uint queueFamily = SelectComputeQueueFamily(physical);
 
-            // Transfer ownership of instance to the device on success.
-            var result = new VulkanDevice(
-                instance, physical, device, queue, pool, name, vendor, type, queueFamily,
-                subgroupSize, hasArithmetic, hasCoopmat, coopmatShapes,
-                hasExternalMemoryHost, minImportedHostPointerAlignment,
-                hasIntegerDotProduct,
-                hasSubgroupSizeControl, minSubgroupSize, maxSubgroupSize,
-                requiredSubgroupSizeStages, hasExternalSemaphoreWin32, hasShaderInfoAmd,
-                hasPipelineExecutableProperties);
-            instance = 0;
-            return result;
-        }
-        finally
-        {
-            if (instance != 0)
-                VulkanApi.vkDestroyInstance(instance, 0);
+                // Probe Vulkan 1.1 subgroup properties. Skipped gracefully on
+                // Vulkan 1.0 drivers — SubgroupSize=0, HasSubgroupArithmetic=false.
+                ProbeSubgroup(physical, apiVersion, out uint subgroupSize, out bool hasArithmetic);
+
+                // Probe VK_KHR_cooperative_matrix. Requires the device extension
+                // to be enabled at vkCreateDevice time for the shader to use it,
+                // so we must decide support *before* creating the logical device.
+                // Skipped gracefully on Vulkan 1.0 — returns empty shape list.
+                ProbeCooperativeMatrix(
+                    instance, physical, apiVersion,
+                    out bool hasCoopmat, out var coopmatShapes);
+
+                // Probe VK_EXT_external_memory_host. Same gating as coopmat — the
+                // extension must be enabled at vkCreateDevice time before
+                // vkAllocateMemory will accept VkImportMemoryHostPointerInfoEXT.
+                // VK_KHR_external_memory is the dependency (core in 1.1) and is
+                // always available on a 1.1+ driver. Falls back silently when
+                // absent — caller checks HasExternalMemoryHost.
+                ProbeExternalMemoryHost(
+                    physical, apiVersion,
+                    out bool hasExternalMemoryHost, out ulong minImportedHostPointerAlignment);
+
+                // Probe VK_KHR_shader_integer_dot_product (Vulkan 1.3 core). Like
+                // coopmat, the extension + feature must be enabled at
+                // vkCreateDevice time before the dp4a MMVQ shader can run, so we
+                // decide support before creating the logical device. Skipped
+                // gracefully on Vulkan 1.0 — returns false.
+                ProbeIntegerDotProduct(
+                    physical, apiVersion,
+                    out bool hasIntegerDotProduct);
+
+                // Probe VK_EXT_subgroup_size_control (Vulkan 1.3 core). Like the
+                // others, the feature must be enabled at vkCreateDevice time before
+                // a pipeline may pin its subgroup size, so we decide support before
+                // creating the logical device. Skipped gracefully on < 1.3 / missing
+                // extension — returns false + zero sizes.
+                ProbeSubgroupSizeControl(
+                    physical, apiVersion,
+                    out bool hasSubgroupSizeControl, out uint minSubgroupSize,
+                    out uint maxSubgroupSize, out uint requiredSubgroupSizeStages);
+
+                // Probe VK_KHR_external_semaphore + VK_KHR_external_semaphore_win32
+                // (Win32 only). Required for the M3 cross-API handoff: the Vulkan
+                // forward submit signals an exported semaphore that CUDA waits on.
+                // Falls back silently when absent — caller checks HasExternalSemaphoreWin32.
+                ProbeExternalSemaphoreWin32(physical, apiVersion, out bool hasExternalSemaphoreWin32);
+
+                // Probe VK_AMD_shader_info — vendor extension, no feature bits, no
+                // Vulkan-version gate. Just an extension-presence check; enabling
+                // it at device-create is what makes vkGetShaderInfoAMD resolvable.
+                bool hasShaderInfoAmd = HasDeviceExtension(physical, "VK_AMD_shader_info"u8);
+
+                // Probe VK_KHR_pipeline_executable_properties — diagnostic only
+                // (issue #241: read back the wave width the driver actually compiled
+                // a pipeline for). Extension presence + the pipelineExecutableInfo
+                // feature enable are both needed before the query is legal.
+                bool hasPipelineExecutableProperties =
+                    HasDeviceExtension(physical, "VK_KHR_pipeline_executable_properties"u8);
+
+                nint device = CreateLogicalDevice(
+                    physical, queueFamily, hasCoopmat, hasExternalMemoryHost, hasIntegerDotProduct,
+                    hasSubgroupSizeControl, hasExternalSemaphoreWin32, hasShaderInfoAmd,
+                    hasPipelineExecutableProperties);
+
+                VulkanApi.vkGetDeviceQueue(device, queueFamily, 0, out nint queue);
+
+                var cpInfo = new VkCommandPoolCreateInfo
+                {
+                    sType = VkStructureType.CommandPoolCreateInfo,
+                    flags = VkCommandPoolCreateFlags.ResetCommandBuffer,
+                    queueFamilyIndex = queueFamily,
+                };
+                VulkanApi.vkCreateCommandPool(device, cpInfo, 0, out nint pool)
+                    .ThrowOnError("vkCreateCommandPool");
+
+                // Transfer ownership of instance to the device on success.
+                var result = new VulkanDevice(
+                    instance, physical, device, queue, pool, name, vendor, type, queueFamily,
+                    subgroupSize, hasArithmetic, hasCoopmat, coopmatShapes,
+                    hasExternalMemoryHost, minImportedHostPointerAlignment,
+                    hasIntegerDotProduct,
+                    hasSubgroupSizeControl, minSubgroupSize, maxSubgroupSize,
+                    requiredSubgroupSizeStages, hasExternalSemaphoreWin32, hasShaderInfoAmd,
+                    hasPipelineExecutableProperties);
+                instance = 0;
+                return result;
+            }
+            finally
+            {
+                if (instance != 0)
+                    VulkanApi.vkDestroyInstance(instance, 0);
+            }
         }
     }
 
@@ -2162,22 +2206,37 @@ public sealed class VulkanDevice : IDisposable
 
         if (_device != 0)
         {
+            // Not under s_lifecycleLock: this only waits on work already
+            // submitted to *this* device's queue, it does not touch the
+            // loader's instance/device create-destroy tables, so it cannot
+            // race another thread's Create()/Dispose() the way the calls
+            // below can.
             VulkanApi.vkDeviceWaitIdle(_device);
         }
-        if (_commandPool != 0)
+
+        // #369: vkDestroyDevice/vkDestroyInstance are the teardown half of
+        // the same loader-level create/destroy race that crashed
+        // vkCreateDevice (see s_lifecycleLock's doc comment) — a destroy on
+        // one thread racing a create on another is the same hazard class,
+        // so both sides share the gate. vkDestroyCommandPool is included
+        // since it runs against the device inside the same window.
+        lock (s_lifecycleLock)
         {
-            VulkanApi.vkDestroyCommandPool(_device, _commandPool, 0);
-            _commandPool = 0;
-        }
-        if (_device != 0)
-        {
-            VulkanApi.vkDestroyDevice(_device, 0);
-            _device = 0;
-        }
-        if (_instance != 0)
-        {
-            VulkanApi.vkDestroyInstance(_instance, 0);
-            _instance = 0;
+            if (_commandPool != 0)
+            {
+                VulkanApi.vkDestroyCommandPool(_device, _commandPool, 0);
+                _commandPool = 0;
+            }
+            if (_device != 0)
+            {
+                VulkanApi.vkDestroyDevice(_device, 0);
+                _device = 0;
+            }
+            if (_instance != 0)
+            {
+                VulkanApi.vkDestroyInstance(_instance, 0);
+                _instance = 0;
+            }
         }
     }
 
