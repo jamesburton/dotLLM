@@ -360,6 +360,7 @@ public sealed unsafe class HybridTransformerModel : IModel
         if (adapter is null)
             return Forward(tokenIds, positions, deviceId, kvCache); // byte-equivalent
 
+        _context.MakeCurrent();
         if (!ReferenceEquals(_cudaLora?.Source, adapter))
         {
             _cudaLora?.Dispose();
@@ -1427,6 +1428,7 @@ public sealed unsafe class HybridTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        _context.MakeCurrent();
         _cudaLora?.Dispose();
         _gpuState.Dispose();
         _gpuWeights.Dispose();

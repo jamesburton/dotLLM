@@ -201,7 +201,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// (perplexity windows) would leak state exactly as the CPU host did. Overridden for parity with
     /// the CPU / Vulkan hosts — see issue #261.
     /// </remarks>
-    public void ResetSequenceState() => _gdnCache.Reset();
+    public void ResetSequenceState()
+    {
+        _context.MakeCurrent();
+        _gdnCache.Reset();
+    }
 
     /// <inheritdoc/>
     /// <remarks>
@@ -218,7 +222,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     public bool SupportsRecurrentStateCheckpoint => true;
 
     /// <inheritdoc/>
-    public object? CheckpointRecurrentState() => _gdnCache.Clone();
+    public object? CheckpointRecurrentState()
+    {
+        _context.MakeCurrent();
+        return _gdnCache.Clone();
+    }
 
     /// <inheritdoc/>
     public void RestoreRecurrentState(object? checkpoint)
@@ -228,6 +236,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             throw new ArgumentException(
                 $"{GetType().Name}.RestoreRecurrentState expects a CudaGdnStateCache checkpoint; got {checkpoint.GetType().Name}.",
                 nameof(checkpoint));
+        _context.MakeCurrent();
         snapshot.CopyTo(_gdnCache);
     }
 
@@ -254,6 +263,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         if (_mtpHead is null)
             return null;
 
+        _context.MakeCurrent();
         return new CudaMtpState(
             hiddenSize: Config.HiddenSize,
             numKvHeads: _mtpHead.Value.Layer.FullAttn!.Value.NumKvHeads,
@@ -2723,6 +2733,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     {
         if (_disposed) return;
         _disposed = true;
+        _context.MakeCurrent();
 
         for (int i = 0; i < _layers.Length; i++)
         {

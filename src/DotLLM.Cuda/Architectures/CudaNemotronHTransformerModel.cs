@@ -281,6 +281,7 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
     public void Dispose()
     {
         if (_disposed) return;
+        _context.MakeCurrent();
         _state.Dispose();
         _ssmCache.Dispose();
         FreeIfNonZero(ref _dequantScratchF16Weight);
@@ -1037,7 +1038,11 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
     /// forward that does not carry a caller-supplied <see cref="ISsmState"/>. Callers that treat
     /// each forward as an independent sequence (perplexity windows, growing-context reprefill
     /// parity tests — see Task 14) must call this between sequences.</remarks>
-    public void ResetSequenceState() => _ssmCache.Reset();
+    public void ResetSequenceState()
+    {
+        _context.MakeCurrent();
+        _ssmCache.Reset();
+    }
 
     /// <inheritdoc/>
     public bool RequiresPerSequenceState => true;
