@@ -8,6 +8,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cuda;
 using DotLLM.Cuda.Architectures;
+using DotLLM.Cuda.Interop;
 using DotLLM.Engine.KvCache;
 using DotLLM.Models.Architectures;
 using Xunit;
@@ -301,6 +302,76 @@ public sealed class CudaNemotronHTransformerModelForwardTests
                     $"step={step} col={c}: cpu={cpu:F6} vs cuda={cuda:F6} (|diff|={diff:E3} > {bar:E3})");
             }
         }
+    }
+
+    /// <summary>
+    /// Regression coverage for issue #383: <see cref="CudaNemotronHTransformerModel.BuildFromPrebuiltWeights"/>
+    /// used to create <c>CudaContext</c>/<c>CudaStream</c>/<c>CudaCublasHandle</c>/<c>CudaKernels</c>
+    /// and upload every layer's device buffers with no try/catch — any exception partway through
+    /// (device OOM, a missing PTX module) leaked everything already created, including buffers
+    /// allocated inside a per-layer helper (<c>UploadDeviceSsmLayer</c> etc.) that never made it
+    /// into a stored <c>DeviceLayer</c> record.
+    /// </summary>
+    /// <remarks>
+    /// Uses a bogus <c>ptxDir</c> — the same reliable, deterministic, hardware-independent trigger
+    /// as <c>CudaMamba3FactoryLeakTests</c> (see that class's remarks for why a dtype/shape defect
+    /// isn't usable here either: <c>BuildFromPrebuiltWeights</c> takes already-resolved CPU
+    /// buffers with no equivalent pre-resource-creation validation gate, so this is simply the
+    /// most direct, safe way to reach a throw after <c>CudaContext</c>/<c>CudaStream</c>/
+    /// <c>CudaCublasHandle</c> already exist without depending on real GPU memory pressure).
+    /// </remarks>
+    [SkippableFact]
+    public void BuildFromPrebuiltWeights_BadPtxDir_ThrowsAndLeaksNoDeviceMemory()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+
+        var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Ffn };
+        using var fixture = NemotronHFixtureBuilder.Build(kinds, seed: 383);
+        var config = fixture.Config;
+        int hiddenSize = config.HiddenSize;
+        int vocabSize = config.VocabSize;
+
+        string badPtxDir = Path.Combine(Path.GetTempPath(), $"dotllm-cuda-nemotronh-no-such-ptx-{Guid.NewGuid():N}");
+
+        const int Iterations = 5;
+        nuint baselineFree = 0;
+
+        // See CudaMamba3FactoryLeakTests for why a dedicated probe context is needed:
+        // cuMemGetInfo operates on whatever context is current, and each failed
+        // BuildFromPrebuiltWeights call below both creates and (once the #383 fix disposes it in
+        // the catch path) destroys its own CudaContext, leaving no current context afterwards.
+        using var probeContext = CudaContext.Create(deviceId: 0);
+
+        for (int i = 0; i < Iterations; i++)
+        {
+            Assert.Throws<DirectoryNotFoundException>(() =>
+                CudaNemotronHTransformerModel.BuildFromPrebuiltWeights(
+                    config, fixture.Layers, fixture.OutputNormWeight,
+                    fixture.OutputWeightPtr, fixture.OutputQuantType, vocabSize, hiddenSize,
+                    fixture.TokenEmbedPtr, QuantizationType.F32,
+                    deviceId: 0, ptxDir: badPtxDir));
+
+            if (i == 0)
+            {
+                probeContext.MakeCurrent();
+                CudaDriverApi.cuMemGetInfo_v2(out baselineFree, out _).ThrowOnError();
+                _output.WriteLine($"Baseline free VRAM after 1st failed load: {baselineFree / (1024 * 1024)} MB");
+            }
+        }
+
+        probeContext.MakeCurrent();
+        CudaDriverApi.cuMemGetInfo_v2(out nuint freeAfter, out _).ThrowOnError();
+        _output.WriteLine($"Free VRAM after {Iterations} failed loads: {freeAfter / (1024 * 1024)} MB");
+
+        // Same noise floor and rationale as CudaMamba3FactoryLeakTests: pre-#383 each failed load
+        // leaked a live CudaContext (tens of MB alone) plus a CudaStream/CudaCublasHandle and any
+        // per-layer device buffers already uploaded — a real regression shows up as tens of MB
+        // per iteration, far past this floor.
+        const long NoiseFloorBytes = 16L * 1024 * 1024;
+        long drop = (long)baselineFree - (long)freeAfter;
+        Assert.True(drop < NoiseFloorBytes,
+            $"Free VRAM dropped by {drop / (1024.0 * 1024):F1} MB across {Iterations - 1} further failed loads " +
+            $"(baseline {baselineFree / (1024 * 1024)} MB -> {freeAfter / (1024 * 1024)} MB) — likely a leak.");
     }
 
     /// <summary>Owns a randomly-generated NemotronH "model" in unmanaged memory. Verbatim port of
