@@ -43,11 +43,16 @@ namespace DotLLM.Cuda.Architectures;
 /// uses.
 /// </para>
 /// <para>
-/// <b>SISO-complete <see cref="IModel"/>.</b> Task 8 delivered the skeleton, weight
-/// upload, and <see cref="LoadFromSafetensors"/>; Task 9 added the real forward pass
-/// (<c>EnsureScratchCapacity</c>, per-layer dispatch, host-side per-token prep) for
-/// SISO checkpoints. MIMO checkpoints (<see cref="Mamba3Config.IsMimo"/>) are rejected
-/// with <see cref="NotSupportedException"/> — see <c>ForwardMimo</c> (issue #346 Task 14).
+/// <b>SISO + MIMO complete <see cref="IModel"/>.</b> Task 8 delivered the skeleton,
+/// weight upload, and <see cref="LoadFromSafetensors"/>; Task 9 added the real forward
+/// pass (<c>EnsureScratchCapacity</c>, per-layer dispatch, host-side per-token prep) for
+/// SISO checkpoints; Task 14 wired MIMO checkpoints (<see cref="Mamba3Config.IsMimo"/>)
+/// into the same <c>ForwardCore</c> via a per-layer branch (<see cref="HostPrepareMimo"/>,
+/// halved-RoPE, rank-parameterized chunk-boundary correction,
+/// <c>LaunchMamba3SsdScanMimoF32</c>). No public MIMO checkpoint exists — MIMO
+/// correctness evidence is the Task 13 kernel-level unit test plus this task's synthetic
+/// end-to-end fixture test (mirrors CPU/Vulkan's own MIMO coverage; see
+/// <c>docs/ROADMAP.md</c> step 60f).
 /// </para>
 /// </remarks>
 public sealed unsafe class CudaMamba3TransformerModel : IModel
@@ -456,10 +461,6 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
             throw new NotSupportedException(
                 "CudaMamba3TransformerModel.Forward only supports deviceId=-1 (host-resident output "
                 + "tensor) today. Device-resident output tensors are a future optimization.");
-        if (_m3.IsMimo)
-            throw new NotSupportedException(
-                "CudaMamba3TransformerModel.Forward (SISO path) does not support IsMimo=true "
-                + "checkpoints yet — see ForwardMimo (issue #346 Task 14).");
         if (_m3.NumGroups != 1)
             throw new NotSupportedException(
                 $"CudaMamba3TransformerModel.Forward assumes NumGroups (n_groups) == 1 for its B/C "
@@ -480,6 +481,7 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
         float aFloor = _m3.AFloor;
         float eps = Config.NormEpsilon;
         nint s = _stream.Handle;
+        int effRank = _m3.IsMimo ? _m3.MimoRank : 1;
 
         EnsureScratchCapacity(seqLen);
 
@@ -519,48 +521,108 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
                 CudaGemm.LinearF32(_cublas.Handle, _normOut, lw.InProj, _projDevice, seqLen, hiddenSize, dInProj, s);
                 _stream.Synchronize();
 
-                // 3. Host prep — D2H the in_proj output, run the per-token
-                // softplus/sigmoid/RMSNorm+bias/qk_pre_dot/scale math on CPU (mirrors
-                // Mamba3Block.Forward Steps 2-4 exactly), H2D the results back.
-                HostPrepareSiso(seqLen, dInProj, dInner, nHead, dState, numRopeAngles, aFloor, eps,
-                    lw.DtBias, lw.BNorm, lw.CNorm, lw.BBias, lw.CBias, s);
-
-                // 4. Data-RoPE (device) — mutates _bDevice/_cDevice in place, threads cum_angle.
-                _kernels.LaunchMamba3DataRopeF32(_bDevice, _cDevice, _anglesRawDevice, _dtDevice,
-                    state.GetCumAnglePtr(layer), state.GetCumAnglePtr(layer),
-                    seqLen, nRank: 1, nHead, dState, numRopeAngles, mode: 0,
-                    hasCumPrev: true, writeCumOut: true, s);
-
-                // 5. Chunk-boundary correction (device) — BEFORE the scan, only for the
-                // state-threaded overload (see this task's design note above).
-                if (runChunkBoundary)
+                // 3-6.5. Host prep + data-RoPE + chunk-boundary correction + SSD scan +
+                // K/V-state persist — branches on IsMimo, mirroring CPU
+                // Mamba3TransformerModel.ForwardCore's if(isMimo){...}else{...} structure
+                // (Mamba3TransformerModel.cs:414-488). effRank threads through both branches
+                // so EnsureScratchCapacity's already-effRank-aware _bDevice/_cDevice sizing
+                // needs no change.
+                if (_m3.IsMimo)
                 {
-                    _kernels.LaunchMamba3ChunkBoundaryF32(
-                        state.GetSsmStatePtr(layer), state.GetVStatePtr(layer), state.GetKStatePtr(layer),
-                        _coefDevice, nHead, headDim, dState, nRank: 1, s);
+                    HostPrepareMimo(seqLen, dInProj, dInner, nHead, dState, numRopeAngles, effRank, aFloor, eps,
+                        lw.DtBias, lw.BNorm, lw.CNorm, lw.BBias, lw.CBias, s);
+
+                    // Data-RoPE (device) — mutates _bDevice/_cDevice in place, threads cum_angle.
+                    // Halved mode for MIMO (Mamba3Block.ForwardMimo Step 5), nRank=effRank.
+                    _kernels.LaunchMamba3DataRopeF32(_bDevice, _cDevice, _anglesRawDevice, _dtDevice,
+                        state.GetCumAnglePtr(layer), state.GetCumAnglePtr(layer),
+                        seqLen, effRank, nHead, dState, numRopeAngles, mode: 1 /* Halved */,
+                        hasCumPrev: true, writeCumOut: true, s);
+
+                    // Chunk-boundary correction (device) — BEFORE the scan, only for the
+                    // state-threaded overload. nRank=effRank sums k_state over rank
+                    // (Mamba3CanonicalSsd.ExecuteMimoStreaming's rank-summed boundary term).
+                    if (runChunkBoundary)
+                    {
+                        _kernels.LaunchMamba3ChunkBoundaryF32(
+                            state.GetSsmStatePtr(layer), state.GetVStatePtr(layer), state.GetKStatePtr(layer),
+                            _coefDevice, nHead, headDim, dState, effRank, s);
+                    }
+
+                    // MIMO SSD scan (device) — mutates ssm_state in place, writes _yScanDevice.
+                    // qRoped=_cDevice (C), kRoped=_bDevice (B) — matches
+                    // Mamba3CanonicalSsd.ExecuteMimoStreaming(state, v, qRoped: cRHN, kRoped: bRHN, ...).
+                    _kernels.LaunchMamba3SsdScanMimoF32(
+                        state.GetSsmStatePtr(layer), _xDevice, _cDevice, _bDevice,
+                        _qkPreDotDevice, _scaleDevice, _gammaDevice, _adtDevice, lw.D, _zDevice,
+                        lw.MimoZ, lw.MimoO, _yScanDevice,
+                        seqLen, effRank, nHead, headDim, dState, hasZ: true, s);
+
+                    // Persist this chunk's last-token post-RoPE K (per rank) / raw V for
+                    // the NEXT call's chunk-boundary correction. kState stores the SSD
+                    // scan's "kRoped" argument — _bDevice/B, NOT _cDevice/C — confirmed
+                    // against Mamba3CanonicalSsd.ExecuteMimoStreaming's persist step
+                    // (kRoped param bound to bRHN at the ForwardMimo call site,
+                    // Mamba3Block.cs:680) and against this file's own SISO branch below,
+                    // which persists _bDevice for the identical reason (Task 9's original
+                    // C-vs-B transcription bug — see progress.md — reproduced here in this
+                    // task's brief and corrected before commit). kRoped layout [T, R, H, N]
+                    // — the whole last-token [R, H, N] slice (all ranks) is contiguous.
+                    if (runChunkBoundary)
+                    {
+                        long kBytes = (long)effRank * nHead * dState * sizeof(float);
+                        long vBytes = (long)nHead * headDim * sizeof(float);
+                        nint lastKSrc = _bDevice + (nint)((long)(seqLen - 1) * effRank * nHead * dState * sizeof(float));
+                        nint lastVSrc = _xDevice + (nint)((long)(seqLen - 1) * nHead * headDim * sizeof(float));
+                        CudaDriverApi.cuMemcpyDtoDAsync_v2(state.GetKStatePtr(layer), lastKSrc, (nuint)kBytes, s).ThrowOnError();
+                        CudaDriverApi.cuMemcpyDtoDAsync_v2(state.GetVStatePtr(layer), lastVSrc, (nuint)vBytes, s).ThrowOnError();
+                    }
                 }
-
-                // 6. SISO SSD scan (device) — mutates ssm_state in place, writes _yScanDevice.
-                _kernels.LaunchMamba3SsdScanSisoF32(
-                    state.GetSsmStatePtr(layer), _xDevice, _cDevice, _bDevice,
-                    _qkPreDotDevice, _scaleDevice, _gammaDevice, _adtDevice, lw.D, _zDevice, _yScanDevice,
-                    seqLen, nHead, headDim, dState, hasZ: true, s);
-
-                // 6.5. Persist this chunk's last-token post-RoPE K / raw V for the NEXT
-                // call's chunk-boundary correction (D2D — matches CPU's bHRN/xBuf slice
-                // copy at Mamba3Block.cs Step 6.5). kState stores bHRN (the "kRoped"
-                // argument to the SSD scan, i.e. _bDevice/B) not cHRN — confirmed against
-                // both Mamba3Block.cs:401 (bHRN -> kState) and
-                // VulkanMamba3TransformerModel.cs's matching RecordCopyBufferRange(_state.B -> kState)
-                // (CPU's C-tensor equivalent is _cDevice/"qRoped", which is never copied here).
-                if (runChunkBoundary)
+                else
                 {
-                    long kBytes = (long)nHead * dState * sizeof(float);
-                    long vBytes = (long)nHead * headDim * sizeof(float);
-                    nint lastKSrc = _bDevice + (nint)((long)(seqLen - 1) * nHead * dState * sizeof(float));
-                    nint lastVSrc = _xDevice + (nint)((long)(seqLen - 1) * nHead * headDim * sizeof(float));
-                    CudaDriverApi.cuMemcpyDtoDAsync_v2(state.GetKStatePtr(layer), lastKSrc, (nuint)kBytes, s).ThrowOnError();
-                    CudaDriverApi.cuMemcpyDtoDAsync_v2(state.GetVStatePtr(layer), lastVSrc, (nuint)vBytes, s).ThrowOnError();
+                    // Host prep — D2H the in_proj output, run the per-token
+                    // softplus/sigmoid/RMSNorm+bias/qk_pre_dot/scale math on CPU (mirrors
+                    // Mamba3Block.Forward Steps 2-4 exactly), H2D the results back.
+                    HostPrepareSiso(seqLen, dInProj, dInner, nHead, dState, numRopeAngles, aFloor, eps,
+                        lw.DtBias, lw.BNorm, lw.CNorm, lw.BBias, lw.CBias, s);
+
+                    // Data-RoPE (device) — mutates _bDevice/_cDevice in place, threads cum_angle.
+                    _kernels.LaunchMamba3DataRopeF32(_bDevice, _cDevice, _anglesRawDevice, _dtDevice,
+                        state.GetCumAnglePtr(layer), state.GetCumAnglePtr(layer),
+                        seqLen, nRank: 1, nHead, dState, numRopeAngles, mode: 0,
+                        hasCumPrev: true, writeCumOut: true, s);
+
+                    // Chunk-boundary correction (device) — BEFORE the scan, only for the
+                    // state-threaded overload (see this task's design note above).
+                    if (runChunkBoundary)
+                    {
+                        _kernels.LaunchMamba3ChunkBoundaryF32(
+                            state.GetSsmStatePtr(layer), state.GetVStatePtr(layer), state.GetKStatePtr(layer),
+                            _coefDevice, nHead, headDim, dState, nRank: 1, s);
+                    }
+
+                    // SISO SSD scan (device) — mutates ssm_state in place, writes _yScanDevice.
+                    _kernels.LaunchMamba3SsdScanSisoF32(
+                        state.GetSsmStatePtr(layer), _xDevice, _cDevice, _bDevice,
+                        _qkPreDotDevice, _scaleDevice, _gammaDevice, _adtDevice, lw.D, _zDevice, _yScanDevice,
+                        seqLen, nHead, headDim, dState, hasZ: true, s);
+
+                    // Persist this chunk's last-token post-RoPE K / raw V for the NEXT
+                    // call's chunk-boundary correction (D2D — matches CPU's bHRN/xBuf slice
+                    // copy at Mamba3Block.cs Step 6.5). kState stores bHRN (the "kRoped"
+                    // argument to the SSD scan, i.e. _bDevice/B) not cHRN — confirmed against
+                    // both Mamba3Block.cs:401 (bHRN -> kState) and
+                    // VulkanMamba3TransformerModel.cs's matching RecordCopyBufferRange(_state.B -> kState)
+                    // (CPU's C-tensor equivalent is _cDevice/"qRoped", which is never copied here).
+                    if (runChunkBoundary)
+                    {
+                        long kBytes = (long)nHead * dState * sizeof(float);
+                        long vBytes = (long)nHead * headDim * sizeof(float);
+                        nint lastKSrc = _bDevice + (nint)((long)(seqLen - 1) * nHead * dState * sizeof(float));
+                        nint lastVSrc = _xDevice + (nint)((long)(seqLen - 1) * nHead * headDim * sizeof(float));
+                        CudaDriverApi.cuMemcpyDtoDAsync_v2(state.GetKStatePtr(layer), lastKSrc, (nuint)kBytes, s).ThrowOnError();
+                        CudaDriverApi.cuMemcpyDtoDAsync_v2(state.GetVStatePtr(layer), lastVSrc, (nuint)vBytes, s).ThrowOnError();
+                    }
                 }
 
                 // 7. out_proj GEMM (device): blockOut[seqLen, hidden] = yScan[seqLen, dInner] @ outProj[hidden, dInner]^T.
@@ -715,6 +777,139 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
         UploadF32Array(bHRN, _bDevice, stream);
         UploadF32Array(cHRN, _cDevice, stream);
         UploadF32Array(qkPreDot, _qkPreDotDevice, stream);
+        UploadF32Array(coef, _coefDevice, stream);
+        _stream.Synchronize();
+    }
+
+    /// <summary>
+    /// MIMO analog of <see cref="HostPrepareSiso"/> — line-for-line port of
+    /// <c>Mamba3Block.ForwardMimo</c>'s Steps 2-4. Differs from SISO in: <c>bcPerToken</c>
+    /// includes the rank factor, B/C are laid out <c>[T, R, H, N]</c> (RmsNorm+bias applied
+    /// per <c>(r, g)</c> slice with bias shape <c>[H, R, N]</c>), and <c>qkPreDot</c> sums
+    /// the pre-rotation dot over rank (<c>qkPreDotSum</c>).
+    /// </summary>
+    private void HostPrepareMimo(int seqLen, int dInProj, int dInner, int nHead, int dState,
+        int numRopeAngles, int mimoRank, float aFloor, float normEps,
+        nint dtBiasDevice, nint bNormDevice, nint cNormDevice, nint bBiasDevice, nint cBiasDevice,
+        nint stream)
+    {
+        int r_ = mimoRank;
+        int bcPerToken = dState * r_; // numBcHeads=1 on every known checkpoint
+
+        float[] proj = new float[seqLen * dInProj];
+        fixed (float* p = proj)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, _projDevice, (nuint)(proj.Length * sizeof(float))).ThrowOnError();
+
+        float[] dtBias = DownloadF32(dtBiasDevice, nHead);
+        float[] bNormW = DownloadF32(bNormDevice, dState);
+        float[] cNormW = DownloadF32(cNormDevice, dState);
+        float[] bBias = DownloadF32(bBiasDevice, nHead * r_ * dState);   // [H, R, N]
+        float[] cBias = DownloadF32(cBiasDevice, nHead * r_ * dState);
+
+        int ofsZ = 0, ofsX = dInner, ofsB = 2 * dInner, ofsC = ofsB + bcPerToken;
+        int ofsDdDt = ofsC + bcPerToken, ofsDdA = ofsDdDt + nHead, ofsTrap = ofsDdA + nHead, ofsAngles = ofsTrap + nHead;
+
+        var x = new float[seqLen * dInner];
+        var z = new float[seqLen * dInner];
+        var dt = new float[seqLen * nHead];
+        var adt = new float[seqLen * nHead];
+        var trap = new float[seqLen * nHead];
+        var gamma = new float[seqLen * nHead];
+        var scale = new float[seqLen * nHead];
+        var anglesRaw = new float[seqLen * numRopeAngles];
+        var bRHN = new float[seqLen * r_ * nHead * dState];
+        var cRHN = new float[seqLen * r_ * nHead * dState];
+        var qkPreDotSum = new float[seqLen * nHead];
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            int src = t * dInProj;
+            Array.Copy(proj, src + ofsZ, z, t * dInner, dInner);
+            Array.Copy(proj, src + ofsX, x, t * dInner, dInner);
+
+            for (int h = 0; h < nHead; h++)
+            {
+                float ddDt = proj[src + ofsDdDt + h];
+                float ddA = proj[src + ofsDdA + h];
+                float trp = proj[src + ofsTrap + h];
+                float dtv = SoftPlus(ddDt + dtBias[h]);
+                float aVal = -SoftPlus(ddA);
+                if (aVal > -aFloor) aVal = -aFloor;
+                dt[t * nHead + h] = dtv;
+                adt[t * nHead + h] = aVal * dtv;
+                float tv = Sigmoid(trp);
+                trap[t * nHead + h] = tv;
+                gamma[t * nHead + h] = dtv * tv;
+            }
+
+            Array.Copy(proj, src + ofsAngles, anglesRaw, t * numRopeAngles, numRopeAngles);
+
+            for (int rr = 0; rr < r_; rr++)
+            {
+                int bSrcBase = src + ofsB + rr * dState;
+                int cSrcBase = src + ofsC + rr * dState;
+                RmsNormFactor(proj, bSrcBase, dState, normEps, out float bInvRms);
+                RmsNormFactor(proj, cSrcBase, dState, normEps, out float cInvRms);
+                for (int h = 0; h < nHead; h++)
+                {
+                    int biasBase = (h * r_ + rr) * dState;
+                    int dstBase = ((t * r_ + rr) * nHead + h) * dState;
+                    for (int n = 0; n < dState; n++)
+                    {
+                        bRHN[dstBase + n] = proj[bSrcBase + n] * bInvRms * bNormW[n] + bBias[biasBase + n];
+                        cRHN[dstBase + n] = proj[cSrcBase + n] * cInvRms * cNormW[n] + cBias[biasBase + n];
+                    }
+                }
+            }
+        }
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            for (int h = 0; h < nHead; h++)
+            {
+                float sum = 0f;
+                for (int rr = 0; rr < r_; rr++)
+                {
+                    int baseIdx = ((t * r_ + rr) * nHead + h) * dState;
+                    // TensorPrimitives.Dot, not a naive scalar accumulation loop — matches
+                    // CPU's Mamba3Block.cs:646 and the SISO branch above (HostPrepareSiso)
+                    // exactly, avoiding a gratuitous F32 reassociation against the oracle
+                    // this task's parity tests diff against (same rationale as Task 9's
+                    // fix-round change to HostPrepareSiso).
+                    sum += TensorPrimitives.Dot(cRHN.AsSpan(baseIdx, dState), bRHN.AsSpan(baseIdx, dState));
+                }
+                qkPreDotSum[t * nHead + h] = sum;
+            }
+        }
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            for (int h = 0; h < nHead; h++)
+            {
+                float sh = 0f;
+                if (t + 1 < seqLen)
+                {
+                    int next = (t + 1) * nHead + h;
+                    sh = dt[next] * (1f - trap[next]);
+                }
+                scale[t * nHead + h] = gamma[t * nHead + h] + sh;
+            }
+        }
+
+        var coef = new float[nHead];
+        for (int h = 0; h < nHead; h++) coef[h] = dt[h] * (1f - trap[h]);
+
+        UploadF32Array(x, _xDevice, stream);
+        UploadF32Array(z, _zDevice, stream);
+        UploadF32Array(dt, _dtDevice, stream);
+        UploadF32Array(adt, _adtDevice, stream);
+        UploadF32Array(trap, _trapDevice, stream);
+        UploadF32Array(gamma, _gammaDevice, stream);
+        UploadF32Array(scale, _scaleDevice, stream);
+        UploadF32Array(anglesRaw, _anglesRawDevice, stream);
+        UploadF32Array(bRHN, _bDevice, stream);
+        UploadF32Array(cRHN, _cDevice, stream);
+        UploadF32Array(qkPreDotSum, _qkPreDotDevice, stream);
         UploadF32Array(coef, _coefDevice, stream);
         _stream.Synchronize();
     }
