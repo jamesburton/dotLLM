@@ -67,14 +67,9 @@ public static class ModelLoader
         return config.Architecture switch
         {
             Architecture.NemotronH => NemotronHTransformerModel.LoadFromGguf(gguf, config),
-            // Recognized (arch parse + hybrid/MTP layout land in #375 slice 1) but the
-            // MoE forward is not implemented yet — reject accurately, do not fall through
-            // to the dense loader's misleading tensor-naming failure.
-            Architecture.NemotronHMoe => throw new NotSupportedException(
-                "nemotron_h_moe (Nemotron 3.5 Lightning) is recognized but not yet runnable: "
-                + "the DeepSeek-V3-style MoE forward (sigmoid router with per-expert bias, "
-                + "expert-weight norm + scale, ungated squared-ReLU experts, shared expert) "
-                + "is not implemented on any backend. Tracked in issue #375."),
+            // #375 slice 2: nemotron_h_moe shares the NemotronH model class — the MoE
+            // FFN layers are detected per-layer by the ffn_gate_inp router tensor.
+            Architecture.NemotronHMoe => NemotronHTransformerModel.LoadFromGguf(gguf, config),
             Architecture.Qwen3MoeHybrid => Qwen3MoeHybridTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             Architecture.Qwen3HybridDense => Qwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             _ => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
