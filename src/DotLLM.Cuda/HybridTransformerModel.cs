@@ -231,7 +231,11 @@ public sealed unsafe class HybridTransformerModel : IModel
             }
             catch
             {
-                pool?.Dispose();
+                // #383 review follow-up: ComputeThreadPool.Dispose() joins worker threads and can
+                // itself throw — that would replace the original exception (the reason we're in
+                // this catch at all) with an unrelated teardown failure, losing the real
+                // diagnostic. Swallow it, same as the stream-drain guard elsewhere in this file.
+                try { pool?.Dispose(); } catch { /* don't mask the original exception */ }
                 cpuState?.Dispose();
                 gpuState?.Dispose();
                 gpuWeights?.Dispose();
@@ -247,7 +251,10 @@ public sealed unsafe class HybridTransformerModel : IModel
         }
         catch
         {
-            cpuWeights.Dispose();
+            // #383 review follow-up: TransformerWeights.Dispose() releases host allocations and
+            // can itself throw — see the ComputeThreadPool.Dispose() note above for why this must
+            // not be allowed to replace the original exception.
+            try { cpuWeights.Dispose(); } catch { /* don't mask the original exception */ }
             throw;
         }
     }
@@ -378,7 +385,9 @@ public sealed unsafe class HybridTransformerModel : IModel
         }
         catch
         {
-            pool?.Dispose();
+            // #383 review follow-up: see LoadFromGguf's identical guard above — Dispose() joining
+            // worker threads can itself throw, which must not replace the original exception.
+            try { pool?.Dispose(); } catch { /* don't mask the original exception */ }
             cpuState?.Dispose();
             gpuState?.Dispose();
             gpuWeights?.Dispose();

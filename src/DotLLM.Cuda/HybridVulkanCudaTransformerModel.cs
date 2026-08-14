@@ -142,13 +142,19 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
             }
             catch
             {
-                cpuWeights.Dispose();
+                // #383 review follow-up: TransformerWeights.Dispose() releases host allocations
+                // and can itself throw — that would replace the original exception (the reason
+                // we're in this catch at all) with an unrelated teardown failure. Swallow it, same
+                // as the stream-drain guard idiom used elsewhere for this class of hazard.
+                try { cpuWeights.Dispose(); } catch { /* don't mask the original exception */ }
                 throw;
             }
         }
         catch
         {
-            vulkanModel.Dispose();
+            // #383 review follow-up: VulkanTransformerModel.Dispose() tears down real GPU
+            // resources and can itself throw — see the cpuWeights.Dispose() note above.
+            try { vulkanModel.Dispose(); } catch { /* don't mask the original exception */ }
             throw;
         }
     }
@@ -203,7 +209,9 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         }
         catch
         {
-            vulkanModel.Dispose();
+            // #383 review follow-up: see LoadFromGguf's identical guard above — Dispose() can
+            // itself throw and must not replace the original exception.
+            try { vulkanModel.Dispose(); } catch { /* don't mask the original exception */ }
             throw;
         }
     }
