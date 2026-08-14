@@ -125,7 +125,10 @@ public static class CudaModelLoader
     /// resolution, then uploads through
     /// <c>CudaTransformerModel.LoadFromSafetensors</c>. Covers the same
     /// Transformer-family architectures as the CPU safetensors loader; Mamba3
-    /// is not supported on CUDA and throws <see cref="NotSupportedException"/>.
+    /// is not loadable via this method (its layer shape is not
+    /// <see cref="CudaTransformerModel"/>-compatible) and throws
+    /// <see cref="NotSupportedException"/> pointing at the dedicated
+    /// <see cref="LoadMamba3FromSafetensors"/> entry point instead.
     /// </summary>
     /// <param name="path">A <c>*.safetensors</c> file, a
     /// <c>model.safetensors.index.json</c>, or a directory containing one.</param>

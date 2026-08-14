@@ -46,4 +46,32 @@ public sealed class CudaUnsupportedArchitectureGuardTests
         Assert.DoesNotContain("attn_output.weight", ex.Message, StringComparison.Ordinal);
         Assert.Contains(architecture.ToString(), ex.Message, StringComparison.OrdinalIgnoreCase);
     }
+
+    [SkippableFact]
+    public void LoadFromSafetensors_Mamba3Checkpoint_ThrowsNotSupportedPointingAtDedicatedLoader()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+
+        string scratch = Path.Combine(Path.GetTempPath(), $"dotllm-mamba3-guard-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(scratch);
+        try
+        {
+            string modelPath = Path.Combine(scratch, "model.safetensors");
+            string configPath = Path.Combine(scratch, "config.json");
+            // Reuses the exact synthetic-checkpoint writer introduced in
+            // CudaMamba3ParitySyntheticTests (Task 11) — smallest fixture that
+            // resolves to Architecture.Mamba3 via Mamba3ConfigExtractor.
+            DotLLM.Tests.Integration.Cuda.CudaMamba3ParitySyntheticTests.WriteMinimalMamba3CheckpointForGuardTest(
+                modelPath, configPath);
+
+            var ex = Assert.Throws<NotSupportedException>(
+                () => CudaModelLoader.LoadFromSafetensors(modelPath));
+
+            Assert.Contains("LoadMamba3FromSafetensors", ex.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            try { Directory.Delete(scratch, recursive: true); } catch { /* best-effort */ }
+        }
+    }
 }

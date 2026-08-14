@@ -333,6 +333,16 @@ public sealed class CudaMamba3ParitySyntheticTests : IDisposable
         WriteSafetensorsFixture(safetensorsPath);
     }
 
+    /// <summary>
+    /// Reusable entry point for other test classes (see
+    /// <see cref="CudaUnsupportedArchitectureGuardTests.LoadFromSafetensors_Mamba3Checkpoint_ThrowsNotSupportedPointingAtDedicatedLoader"/>)
+    /// that need the smallest fixture resolving to <c>Architecture.Mamba3</c>, without
+    /// duplicating the synthetic-checkpoint writer a third time. No behavior change from
+    /// <see cref="WriteSyntheticMamba3Checkpoint"/> — thin wrapper for call-site clarity.
+    /// </summary>
+    internal static void WriteMinimalMamba3CheckpointForGuardTest(string safetensorsPath, string configPath)
+        => WriteSyntheticMamba3Checkpoint(safetensorsPath, configPath);
+
     private static void WriteConfigJson(string path)
     {
         using var fs = File.Create(path);
