@@ -58,6 +58,23 @@ public class PreTokenizerPolicyTests
         Assert.Equal(4, viaAlias.Length);
     }
 
+    /// <summary>
+    /// Tekken (Mistral NeMo family; NVIDIA Nemotron-Nano-9B-v2 ships it) splits
+    /// EVERY digit into its own segment (bare <c>\p{N}</c>), unlike gpt2
+    /// (<c> ?\p{N}+</c> groups runs) and llama3 (<c>\p{N}{1,3}</c> groups up to
+    /// three). With a "3 4" merge in the vocab, "34" therefore stays two tokens
+    /// under tekken but merges to one under gpt2 — discriminating tekken both
+    /// from "missing" and from either wrong-pipeline routing.
+    /// </summary>
+    [Fact]
+    public void Tekken_SplitsEveryDigit_UnlikeGpt2AndLlama3()
+    {
+        int[] tekken = Build("tekken").Encode("34");
+        Assert.Equal(2, tekken.Length);      // "3","4" — merge blocked by per-digit split
+        Assert.Single(Build("gpt2").Encode("34"));   // digit run grouped → "34" merges
+        Assert.Single(Build("llama3").Encode("34")); // {1,3} group → "34" merges
+    }
+
     [Fact]
     public void UnknownPreType_Throws_NamingTheValue()
     {
