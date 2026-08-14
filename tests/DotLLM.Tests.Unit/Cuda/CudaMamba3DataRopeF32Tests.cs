@@ -72,6 +72,13 @@ public class CudaMamba3DataRopeF32Tests
     [InlineData(2, 4, 8, 2, 3, false)]     // nRank=2 (MIMO rank slices), mode=Pairwise
     [InlineData(1, 4, 16, 4, 3, true)]     // mode=Halved, nRank=1
     [InlineData(2, 4, 16, 4, 3, true)]     // mode=Halved AND nRank=2 combined
+    // numRopeAngles=128 > WG_SIZE=64: discriminates issue #376. On the pre-fix kernel
+    // (rotation loop = 'if (tid < nra)' over a 64-thread block, no stride) lanes 64..127
+    // are silently never rotated — this shape catches that with an O(1) B/C mismatch,
+    // not O(1e-7) noise. dState=256 satisfies the 2*numRopeAngles<=dState launcher guard
+    // exactly (rotaryDim=256=dState) and MAX_ROPE_ANGLES=256 shared-memory bound.
+    [InlineData(1, 2, 256, 128, 2, false)] // mode=Pairwise, numRopeAngles=128 > 64
+    [InlineData(1, 2, 256, 128, 2, true)]  // mode=Halved, numRopeAngles=128 > 64
     public void Mamba3DataRopeF32_MatchesCpuReference(
         int nRank, int nHead, int dState, int numRopeAngles, int seqLen, bool halved)
     {

@@ -37,6 +37,15 @@ public class VulkanMamba3DataRopeF32KernelTests
     [InlineData(4, 1, 4,  32,  8, /*halved*/ false)]   // SISO Pairwise — multi-token prefill
     [InlineData(1, 2, 2,  16,  4, /*halved*/ true)]    // MIMO Halved   — single token, tiny
     [InlineData(4, 2, 4,  32,  8, /*halved*/ true)]    // MIMO Halved   — multi-token prefill
+    // numRopeAngles=128 > WG_SIZE=64: discriminates issue #376. On the pre-fix shader
+    // (rotation loop = 'if (tid < nra)' over a 64-thread workgroup, no stride) lanes
+    // 64..127 are silently never rotated — an O(1) B/C mismatch, not F32 noise.
+    // dState=256 satisfies 2*numRopeAngles<=dState exactly and the MAX_RA=256 shared-mem
+    // bound. Requires the mamba3_data_rope_f32.spv to have been rebuilt from the fixed
+    // .comp source (see Mamba3DataRopeF32Kernel.MaxRopeAngles remarks) — this test will
+    // FAIL, not skip, against a stale pre-#376 .spv.
+    [InlineData(2, 1, 2, 256, 128, /*halved*/ false)]  // SISO Pairwise — numRopeAngles=128 > 64
+    [InlineData(2, 1, 2, 256, 128, /*halved*/ true)]   // MIMO Halved   — numRopeAngles=128 > 64
     public void Launch_MatchesCpuReference(
         int seqLen, int nRank, int nHead, int dState, int numRopeAngles, bool halved)
     {

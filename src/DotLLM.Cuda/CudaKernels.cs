@@ -3253,17 +3253,16 @@ public sealed unsafe class CudaKernels : IDisposable
     /// caller does not need the final angle (rare — decode continuity needs it every call).
     /// </summary>
     /// <remarks>
-    /// <b>numRopeAngles is capped at 64, not the kernel's MAX_ROPE_ANGLES=256 shared-memory
-    /// bound.</b> The shared-memory fill (<c>sharedCum</c>) and the <c>cumOut</c> writeback both
-    /// stride by the 64-thread block (<c>for (k = tid; k &lt; nra; k += WG_SIZE)</c>), so they
-    /// scale correctly to nra up to 256. The rotation block, however, is a plain
-    /// <c>if (tid &lt; nra)</c> with no stride loop — pairs at k &gt;= 64 are silently never
-    /// rotated. Confirmed present in both this kernel and the pre-existing
-    /// native/vulkan/shaders/mamba3_data_rope_f32.comp it was ported from (issue #346 Task 2
-    /// finding; not fixed here — fixing needs a kernel-source recompile, out of scope for a
-    /// C#-only task). All known real Mamba-3 checkpoints use numRopeAngles ∈ {32, 64}, so this
-    /// does not block current usage, but the guard rejects anything that would silently
-    /// corrupt lanes instead of quietly under-rotating them.
+    /// <b>numRopeAngles is capped at 256 (MAX_ROPE_ANGLES), the kernel's shared-memory bound</b>
+    /// (<c>sharedCum</c>/<c>sharedCos</c>/<c>sharedSin</c> are each sized <c>[256]</c>). The
+    /// shared-memory fill, rotation, and <c>cumOut</c> writeback loops are all strided by the
+    /// 64-thread block (<c>for (k = tid; k &lt; nra; k += WG_SIZE)</c>), so all three scale
+    /// correctly to nra up to 256 (issue #376: the rotation loop was previously a one-shot
+    /// <c>if (tid &lt; nra)</c> with no stride, silently leaving lanes k &gt;= 64 unrotated
+    /// whenever nra &gt; 64 — this guard was temporarily tightened to 64 as a stopgap on
+    /// <c>issue/346-mamba3-cuda-host</c> until the kernel itself was fixed; the fix landed here
+    /// and the same construct was corrected in the Vulkan sibling
+    /// native/vulkan/shaders/mamba3_data_rope_f32.comp).
     /// </remarks>
     public void LaunchMamba3DataRopeF32(nint b, nint c, nint anglesRaw, nint dt,
         nint cumPrev, nint cumOut, int seqLen, int nRank, int nHead, int dState,
@@ -3272,11 +3271,10 @@ public sealed unsafe class CudaKernels : IDisposable
         if (_mamba3DataRopeF32Func == 0)
             throw new InvalidOperationException(
                 "mamba3_data_rope_f32 kernel not available. Recompile native/kernels/mamba3_data_rope_f32.cu to PTX.");
-        if (numRopeAngles > 64)
+        if (numRopeAngles > 256)
             throw new ArgumentOutOfRangeException(nameof(numRopeAngles),
-                $"numRopeAngles={numRopeAngles}; mamba3_data_rope_f32's rotation loop is 'if (tid < nra)' " +
-                "over a 64-thread block with no stride, so lanes at k>=64 would silently never rotate " +
-                "(issue #346 finding; kernel needs a stride loop there to lift this cap).");
+                $"numRopeAngles={numRopeAngles}; mamba3_data_rope_f32's shared-memory tables " +
+                "(sharedCum/sharedCos/sharedSin) are sized MAX_ROPE_ANGLES=256.");
         // Mirrors the Vulkan sibling's second guard (Mamba3DataRopeF32Kernel.cs:178-180).
         // Without it, numRopeAngles > dState/2 writes OOB on device: the kernel indexes
         // bcBase + 2*tid + 1 / bcBase + halfDState + tid, both of which assume

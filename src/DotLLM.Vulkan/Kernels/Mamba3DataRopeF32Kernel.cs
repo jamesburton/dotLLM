@@ -54,20 +54,22 @@ public sealed class Mamba3DataRopeF32Kernel : IDisposable
     private const int PushConstantBytes = 8 * sizeof(uint);
     private const int BufferCount = 6;
     /// <summary>
-    /// Safe upper bound on numRopeAngles for this kernel. NOT the shader's shared-memory
-    /// array bound (which is 256, sized by MAX_RA in mamba3_data_rope_f32.comp) — the
-    /// rotation block in that shader is a plain <c>if (tid &lt; nra)</c> gate over the
-    /// 64-thread workgroup with no stride loop, unlike the shared-mem seed/writeback
-    /// loops which correctly stride by WG_SIZE. For numRopeAngles &gt; 64, lane-pairs at
-    /// k &gt;= 64 would silently never rotate — no error, just wrong (partially-rotated)
-    /// output. The CUDA sibling kernel (native/kernels/mamba3_data_rope_f32.cu, driven by
-    /// DotLLM.Cuda.CudaKernels.LaunchMamba3DataRopeF32) is a direct port of this shader and
-    /// has the identical gap; its C# launcher applies the same 64 cap (issue #346). All
-    /// known Mamba-3 checkpoints use numRopeAngles in {32, 64}, so this doesn't block
-    /// current usage. Raise this back to 256 only after the shader's rotation loop gains a
-    /// stride loop (tracked separately — do not fix by editing the .comp/.cu here).
+    /// Safe upper bound on numRopeAngles for this kernel — the shader's shared-memory
+    /// array bound (<c>sharedCum</c>/<c>sharedCos</c>/<c>sharedSin</c>, each sized
+    /// <c>MAX_RA=256</c> in mamba3_data_rope_f32.comp). The rotation block previously used
+    /// a one-shot <c>if (tid &lt; nra)</c> gate with no stride loop, unlike the shared-mem
+    /// seed/writeback loops which already strided by WG_SIZE — for numRopeAngles &gt; 64
+    /// lane-pairs at k &gt;= 64 silently never rotated. Fixed (issue #376) to stride the
+    /// rotation loop the same way, so this cap is restored to the real shared-memory bound.
+    /// The CUDA sibling kernel (native/kernels/mamba3_data_rope_f32.cu, driven by
+    /// DotLLM.Cuda.CudaKernels.LaunchMamba3DataRopeF32) had the identical gap and was fixed
+    /// in the same change.
+    /// <b>NOTE: this constant assumes the compiled mamba3_data_rope_f32.spv reflects the
+    /// fixed .comp source. If the .spv has not yet been rebuilt with glslc (see the #376 PR
+    /// description), raising this cap re-exposes the under-rotation bug at runtime for
+    /// numRopeAngles &gt; 64 — do not merge until the .spv is confirmed rebuilt.</b>
     /// </summary>
-    private const int MaxRopeAngles = 64;
+    private const int MaxRopeAngles = 256;
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
@@ -171,10 +173,8 @@ public sealed class Mamba3DataRopeF32Kernel : IDisposable
         if (numRopeAngles > MaxRopeAngles)
             throw new ArgumentException(
                 $"numRopeAngles ({numRopeAngles}) exceeds {MaxRopeAngles}; " +
-                "mamba3_data_rope_f32.comp's rotation loop is 'if (tid < nra)' over a " +
-                "64-thread workgroup with no stride, so lanes at k>=64 would silently " +
-                "never rotate (issue #346 finding; the shader needs a stride loop there " +
-                "to lift this cap).",
+                "mamba3_data_rope_f32.comp's shared-memory tables " +
+                "(sharedCum/sharedCos/sharedSin) are sized MAX_RA=256.",
                 nameof(numRopeAngles));
         int rotaryDim = 2 * numRopeAngles;
         if (rotaryDim > dState)
