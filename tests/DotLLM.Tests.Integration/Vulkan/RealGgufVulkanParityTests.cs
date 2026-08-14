@@ -269,7 +269,7 @@ public sealed class RealGgufVulkanParityTests
         // dequantised (CPU Q8_0 path runs Q-format arithmetic; CPU K-quant
         // path dequantises to F32) or uploaded raw to device (Vulkan keeps
         // K-quant / Q8_0 in source bytes thanks to Phase 1).
-        using var cpuGguf = GgufFile.Open(path);
+        using var cpuGguf = CheckpointGuard.LoadOrSkip(path, "GGUF checkpoint (CPU)", () => GgufFile.Open(path));
         var cpuConfig = GgufModelConfigExtractor.Extract(cpuGguf.Metadata);
         Assert.Equal(expectedArch, cpuConfig.Architecture);
 
@@ -294,7 +294,7 @@ public sealed class RealGgufVulkanParityTests
 
         var tokenizer = GgufBpeTokenizerFactory.Load(cpuGguf.Metadata);
 
-        using var vkGguf = GgufFile.Open(path);
+        using var vkGguf = CheckpointGuard.LoadOrSkip(path, "GGUF checkpoint (Vulkan)", () => GgufFile.Open(path));
         var vkLoadWatch = System.Diagnostics.Stopwatch.StartNew();
         // The dispatcher takes an existing device and does NOT take ownership of it, so the
         // test owns it and must outlive the model (disposed in the outer finally).

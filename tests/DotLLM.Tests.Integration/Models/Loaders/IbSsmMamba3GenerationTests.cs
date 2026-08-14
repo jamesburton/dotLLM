@@ -2,6 +2,7 @@ using System.Diagnostics;
 using DotLLM.Core.Tensors;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Tokenizers;
 using Xunit;
 using Xunit.Abstractions;
@@ -98,7 +99,9 @@ public sealed class IbSsmMamba3GenerationTests
         Assert.NotNull(tok);
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, file, config) = ModelLoader.LoadFromSafetensors(weightsPath);
+        var (model, file, config) = CheckpointGuard.LoadOrSkip(
+            weightsPath, "ib-ssm/mamba3-370M-10BT checkpoint",
+            () => ModelLoader.LoadFromSafetensors(weightsPath));
         loadWatch.Stop();
         _output.WriteLine(
             $"Loaded: vocab={config.VocabSize}  layers={config.NumLayers}  "

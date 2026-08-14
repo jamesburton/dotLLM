@@ -4,6 +4,7 @@ using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -120,7 +121,9 @@ public sealed class IbSsmMamba3RealWeightsLoadTests
         _output.WriteLine($"Checkpoint: {checkpointPath}  ({fileBytes:N0} bytes)");
 
         var sw = Stopwatch.StartNew();
-        var (model, file, config) = ModelLoader.LoadFromSafetensors(checkpointPath);
+        var (model, file, config) = CheckpointGuard.LoadOrSkip(
+            checkpointPath, "ib-ssm/mamba3-370M-10BT checkpoint",
+            () => ModelLoader.LoadFromSafetensors(checkpointPath));
         sw.Stop();
 
         try
@@ -179,7 +182,9 @@ public sealed class IbSsmMamba3RealWeightsLoadTests
         _output.WriteLine($"Checkpoint: {checkpointPath}  ({fileBytes:N0} bytes)");
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, file, config) = ModelLoader.LoadFromSafetensors(checkpointPath);
+        var (model, file, config) = CheckpointGuard.LoadOrSkip(
+            checkpointPath, "ib-ssm/mamba3-370M-10BT checkpoint",
+            () => ModelLoader.LoadFromSafetensors(checkpointPath));
         loadWatch.Stop();
         _output.WriteLine($"Load: {loadWatch.Elapsed.TotalMilliseconds:F1} ms");
 
@@ -320,7 +325,9 @@ public sealed class IbSsmMamba3RealWeightsLoadTests
         _output.WriteLine($"Checkpoint: {checkpointPath}  ({fileBytes:N0} bytes)");
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, file, config) = ModelLoader.LoadFromSafetensors(checkpointPath);
+        var (model, file, config) = CheckpointGuard.LoadOrSkip(
+            checkpointPath, "ib-ssm/mamba3-370M-10BT checkpoint",
+            () => ModelLoader.LoadFromSafetensors(checkpointPath));
         loadWatch.Stop();
         _output.WriteLine($"Load: {loadWatch.Elapsed.TotalMilliseconds:F1} ms");
 

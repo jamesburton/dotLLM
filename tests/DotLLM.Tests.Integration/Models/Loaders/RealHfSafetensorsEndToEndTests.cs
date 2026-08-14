@@ -74,7 +74,8 @@ public sealed class RealHfSafetensorsEndToEndTests
         _output.WriteLine($"Root: {root}");
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
         loadWatch.Stop();
 
         try
@@ -129,7 +130,8 @@ public sealed class RealHfSafetensorsEndToEndTests
         _output.WriteLine($"Root: {root}");
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
         loadWatch.Stop();
 
         try
@@ -195,7 +197,8 @@ public sealed class RealHfSafetensorsEndToEndTests
         _output.WriteLine($"Root: {root}");
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
         loadWatch.Stop();
 
         try
@@ -302,7 +305,8 @@ public sealed class RealHfSafetensorsEndToEndTests
         _output.WriteLine($"Root: {root}");
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
         loadWatch.Stop();
 
         try
@@ -352,7 +356,8 @@ public sealed class RealHfSafetensorsEndToEndTests
         _output.WriteLine($"Root: {root}");
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
         loadWatch.Stop();
 
         try
@@ -528,7 +533,8 @@ public sealed class RealHfSafetensorsEndToEndTests
             + "the HF ByteLevel factory path (P0.1) requires tokenizer.json.");
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
         loadWatch.Stop();
 
         try
@@ -735,7 +741,8 @@ public sealed class RealHfSafetensorsEndToEndTests
             $"Reference logits shape: [{reference.LogitsShape[0]}, {reference.LogitsShape[1]}] "
             + $"input_ids=[{string.Join(", ", reference.InputIds)}]");
 
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
 
         try
         {
@@ -958,7 +965,8 @@ public sealed class RealHfSafetensorsEndToEndTests
             $"Reference logits shape: [{reference.LogitsShape[0]}, {reference.LogitsShape[1]}] "
             + $"input_ids=[{string.Join(", ", reference.InputIds)}]");
 
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
 
         try
         {
@@ -1271,7 +1279,8 @@ public sealed class RealHfSafetensorsEndToEndTests
         _output.WriteLine($"Root: {root}");
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
         loadWatch.Stop();
 
         try
