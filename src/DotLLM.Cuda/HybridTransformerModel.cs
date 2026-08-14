@@ -135,85 +135,121 @@ public sealed unsafe class HybridTransformerModel : IModel
                 $"numGpuLayers must be between 1 and {config.NumLayers - 1} for hybrid mode. " +
                 $"Use TransformerModel for pure CPU or CudaTransformerModel for pure GPU.");
 
-        // 1. Load CPU weights (mmap references only)
+        // 1. Load CPU weights (mmap references only). #383: this is created before any GPU
+        // resource, so a failure below must dispose it explicitly — it isn't reachable from
+        // any partially-built model instance.
         var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config);
-        cpuWeights.RepackWeights();
-
-        // 2. Initialize CUDA
-        var context = CudaContext.Create(deviceId);
-        var stream = CudaStream.Create();
-        var cublas = CudaCublasHandle.Create();
-        cublas.SetStream(stream);
-
-        string? ptxDir = Path.Combine(AppContext.BaseDirectory, "ptx");
-        var kernels = new CudaKernels(ptxDir);
-
-        // 3. Upload only GPU layers to VRAM
-        var gpuWeights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle, numGpuLayers);
-
-        // 4. VRAM estimation and warning
-        string? vramWarning = null;
-        if (CudaDriverApi.cuMemGetInfo_v2(out nuint freeAfter, out nuint totalVram) == 0
-            && totalVram > 0)
+        try
         {
-            // Rough check: if less than 10% free after loading, warn
-            double freePercent = (double)freeAfter / totalVram;
-            if (freePercent < 0.10)
+            cpuWeights.RepackWeights();
+
+            // 2. Initialize CUDA. Context creation cannot leak on its own throw (nothing
+            // allocated yet), so it stays outside the inner try/catch — everything created
+            // from here on is disposed on any failure before rethrowing.
+            var context = CudaContext.Create(deviceId);
+            CudaStream? stream = null;
+            CudaCublasHandle? cublas = null;
+            CudaKernels? kernels = null;
+            CudaWeights? gpuWeights = null;
+            CudaForwardState? gpuState = null;
+            TransformerForwardState? cpuState = null;
+            ComputeThreadPool? pool = null;
+            try
             {
-                long freeMb = (long)freeAfter / (1024 * 1024);
-                long totalMb = (long)totalVram / (1024 * 1024);
-                vramWarning = $"VRAM nearly full after loading {numGpuLayers}/{config.NumLayers} layers " +
-                              $"({freeMb}/{totalMb} MB free). Consider reducing --gpu-layers.";
+                stream = CudaStream.Create();
+                cublas = CudaCublasHandle.Create();
+                cublas.SetStream(stream);
+
+                string? ptxDir = Path.Combine(AppContext.BaseDirectory, "ptx");
+                kernels = new CudaKernels(ptxDir);
+
+                // 3. Upload only GPU layers to VRAM
+                gpuWeights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle, numGpuLayers);
+
+                // 4. VRAM estimation and warning
+                string? vramWarning = null;
+                if (CudaDriverApi.cuMemGetInfo_v2(out nuint freeAfter, out nuint totalVram) == 0
+                    && totalVram > 0)
+                {
+                    // Rough check: if less than 10% free after loading, warn
+                    double freePercent = (double)freeAfter / totalVram;
+                    if (freePercent < 0.10)
+                    {
+                        long freeMb = (long)freeAfter / (1024 * 1024);
+                        long totalMb = (long)totalVram / (1024 * 1024);
+                        vramWarning = $"VRAM nearly full after loading {numGpuLayers}/{config.NumLayers} layers " +
+                                      $"({freeMb}/{totalMb} MB free). Consider reducing --gpu-layers.";
+                    }
+                }
+
+                // 5. GPU scratch buffers. BitNet's residual stream exceeds FP16 range in deep
+                //    layers, so it carries the residual in FP32 (overflow→NaN otherwise). Mirrors
+                //    CudaTransformerModel.LoadFromGguf.
+                gpuState = new CudaForwardState(
+                    config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
+                    config.HeadDim, config.IntermediateSize, config.VocabSize,
+                    useFp32Residual: config.Architecture == DotLLM.Core.Configuration.Architecture.BitNet);
+
+                // 6. CPU scratch buffers (with RoPE tables)
+                int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
+                if (ropeDim == 0) ropeDim = config.HeadDim;
+                float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+                RoPEType cpuRopeType = config.RoPEConfig?.Type ?? RoPEType.Norm;
+                // Translate the public RoPEType enum (Norm=0, NeoX=2) to the CUDA
+                // kernel's encoding (Norm=0, NeoX=1). The CPU half of this hybrid
+                // model still consumes the enum directly via cpuRopeType; only the
+                // GPU dispatch needs the kernel-side integer encoding.
+                int gpuRopeType = CudaKernels.ToCudaRopeType(cpuRopeType);
+
+                cpuState = new TransformerForwardState(
+                    config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
+                    config.HeadDim, config.IntermediateSize, config.VocabSize,
+                    config.MaxSequenceLength, ropeDim, ropeTheta);
+
+                // 7. ComputeThreadPool for CPU layers
+                if (threading.IsParallel)
+                {
+                    int effectiveThreads = threading.EffectiveThreadCount;
+                    if (threading.EnableNumaPinning || threading.EnablePCorePinning)
+                    {
+                        var topology = NumaTopology.Detect();
+                        if (threading.EnablePCorePinning && topology.IsHybrid)
+                            effectiveThreads = Math.Min(effectiveThreads, topology.PerformanceCoreIds.Count);
+                        pool = new ComputeThreadPool(effectiveThreads, topology, threading);
+                    }
+                    else
+                    {
+                        pool = new ComputeThreadPool(effectiveThreads, topology: null, threading);
+                    }
+                }
+
+                return new HybridTransformerModel(
+                    config, gpuWeights, gpuState, stream, cublas, context, kernels,
+                    cpuWeights, cpuState, pool, ownsPool: pool is not null, gguf,
+                    numGpuLayers, deviceId, ropeTheta, ropeDim, gpuRopeType, cpuRopeType,
+                    config.SlidingWindowSize, vramWarning);
+            }
+            catch
+            {
+                pool?.Dispose();
+                cpuState?.Dispose();
+                gpuState?.Dispose();
+                gpuWeights?.Dispose();
+                kernels?.Dispose();
+                cublas?.Dispose();
+                stream?.Dispose();
+                // CudaContext.Create (above) makes the context current on THIS thread, and this
+                // catch runs synchronously on the same thread — no MakeCurrent() call is needed
+                // here (matches #368's convention).
+                context.Dispose();
+                throw;
             }
         }
-
-        // 5. GPU scratch buffers. BitNet's residual stream exceeds FP16 range in deep
-        //    layers, so it carries the residual in FP32 (overflow→NaN otherwise). Mirrors
-        //    CudaTransformerModel.LoadFromGguf.
-        var gpuState = new CudaForwardState(
-            config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
-            config.HeadDim, config.IntermediateSize, config.VocabSize,
-            useFp32Residual: config.Architecture == DotLLM.Core.Configuration.Architecture.BitNet);
-
-        // 6. CPU scratch buffers (with RoPE tables)
-        int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
-        if (ropeDim == 0) ropeDim = config.HeadDim;
-        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        RoPEType cpuRopeType = config.RoPEConfig?.Type ?? RoPEType.Norm;
-        // Translate the public RoPEType enum (Norm=0, NeoX=2) to the CUDA
-        // kernel's encoding (Norm=0, NeoX=1). The CPU half of this hybrid
-        // model still consumes the enum directly via cpuRopeType; only the
-        // GPU dispatch needs the kernel-side integer encoding.
-        int gpuRopeType = CudaKernels.ToCudaRopeType(cpuRopeType);
-
-        var cpuState = new TransformerForwardState(
-            config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
-            config.HeadDim, config.IntermediateSize, config.VocabSize,
-            config.MaxSequenceLength, ropeDim, ropeTheta);
-
-        // 7. ComputeThreadPool for CPU layers
-        ComputeThreadPool? pool = null;
-        if (threading.IsParallel)
+        catch
         {
-            int effectiveThreads = threading.EffectiveThreadCount;
-            if (threading.EnableNumaPinning || threading.EnablePCorePinning)
-            {
-                var topology = NumaTopology.Detect();
-                if (threading.EnablePCorePinning && topology.IsHybrid)
-                    effectiveThreads = Math.Min(effectiveThreads, topology.PerformanceCoreIds.Count);
-                pool = new ComputeThreadPool(effectiveThreads, topology, threading);
-            }
-            else
-            {
-                pool = new ComputeThreadPool(effectiveThreads, topology: null, threading);
-            }
+            cpuWeights.Dispose();
+            throw;
         }
-
-        return new HybridTransformerModel(
-            config, gpuWeights, gpuState, stream, cublas, context, kernels,
-            cpuWeights, cpuState, pool, ownsPool: pool is not null, gguf,
-            numGpuLayers, deviceId, ropeTheta, ropeDim, gpuRopeType, cpuRopeType,
-            config.SlidingWindowSize, vramWarning);
     }
 
     /// <summary>
@@ -265,68 +301,96 @@ public sealed unsafe class HybridTransformerModel : IModel
 
         // 2. Initialize CUDA — mirror LoadFromGguf in every step except the
         //    PTX dir defaulting (caller-supplied for parity tests so the test
-        //    can locate native/ptx/ from its output directory).
+        //    can locate native/ptx/ from its output directory). #383: context creation
+        //    cannot leak on its own throw (nothing allocated yet), so it stays outside the
+        //    try/catch — everything created from here on is disposed on any failure before
+        //    rethrowing. `cpuWeights` is caller-owned (see this method's doc) — never disposed
+        //    here.
         var context = CudaContext.Create(deviceId);
-        var stream = CudaStream.Create();
-        var cublas = CudaCublasHandle.Create();
-        cublas.SetStream(stream);
-
-        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
-        var kernels = new CudaKernels(ptxDir);
-
-        // 3. Upload only GPU layers to VRAM
-        var gpuWeights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle, numGpuLayers);
-
-        // 4. Skip the VRAM-pressure warning — synthetic fixtures are tiny and
-        //    the cuMemGetInfo probe would just clutter the test output.
-
-        // 5. GPU scratch buffers. BitNet's residual stream exceeds FP16 range in deep
-        //    layers, so it carries the residual in FP32 (overflow→NaN otherwise). Mirrors
-        //    CudaTransformerModel.LoadFromGguf / the production LoadFromGguf above.
-        var gpuState = new CudaForwardState(
-            config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
-            config.HeadDim, config.IntermediateSize, config.VocabSize,
-            useFp32Residual: config.Architecture == DotLLM.Core.Configuration.Architecture.BitNet);
-
-        // 6. CPU scratch buffers (with RoPE tables)
-        int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
-        if (ropeDim == 0) ropeDim = config.HeadDim;
-        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        RoPEType cpuRopeType = config.RoPEConfig?.Type ?? RoPEType.Norm;
-        // Translate the public RoPEType enum (Norm=0, NeoX=2) to the CUDA
-        // kernel's encoding (Norm=0, NeoX=1). Same translation site as
-        // LoadFromGguf — fixed in #36; the parity test built on top of this
-        // factory pins that fix for the hybrid split.
-        int gpuRopeType = CudaKernels.ToCudaRopeType(cpuRopeType);
-
-        var cpuState = new TransformerForwardState(
-            config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
-            config.HeadDim, config.IntermediateSize, config.VocabSize,
-            config.MaxSequenceLength, ropeDim, ropeTheta);
-
-        // 7. ComputeThreadPool for CPU layers — mirror the LoadFromGguf branch
+        CudaStream? stream = null;
+        CudaCublasHandle? cublas = null;
+        CudaKernels? kernels = null;
+        CudaWeights? gpuWeights = null;
+        CudaForwardState? gpuState = null;
+        TransformerForwardState? cpuState = null;
         ComputeThreadPool? pool = null;
-        if (effectiveThreading.IsParallel)
+        try
         {
-            int effectiveThreads = effectiveThreading.EffectiveThreadCount;
-            if (effectiveThreading.EnableNumaPinning || effectiveThreading.EnablePCorePinning)
-            {
-                var topology = NumaTopology.Detect();
-                if (effectiveThreading.EnablePCorePinning && topology.IsHybrid)
-                    effectiveThreads = Math.Min(effectiveThreads, topology.PerformanceCoreIds.Count);
-                pool = new ComputeThreadPool(effectiveThreads, topology, effectiveThreading);
-            }
-            else
-            {
-                pool = new ComputeThreadPool(effectiveThreads, topology: null, effectiveThreading);
-            }
-        }
+            stream = CudaStream.Create();
+            cublas = CudaCublasHandle.Create();
+            cublas.SetStream(stream);
 
-        return new HybridTransformerModel(
-            config, gpuWeights, gpuState, stream, cublas, context, kernels,
-            cpuWeights, cpuState, pool, ownsPool: pool is not null, gguf: null,
-            numGpuLayers, deviceId, ropeTheta, ropeDim, gpuRopeType, cpuRopeType,
-            config.SlidingWindowSize, vramWarning: null);
+            ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
+            kernels = new CudaKernels(ptxDir);
+
+            // 3. Upload only GPU layers to VRAM
+            gpuWeights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle, numGpuLayers);
+
+            // 4. Skip the VRAM-pressure warning — synthetic fixtures are tiny and
+            //    the cuMemGetInfo probe would just clutter the test output.
+
+            // 5. GPU scratch buffers. BitNet's residual stream exceeds FP16 range in deep
+            //    layers, so it carries the residual in FP32 (overflow→NaN otherwise). Mirrors
+            //    CudaTransformerModel.LoadFromGguf / the production LoadFromGguf above.
+            gpuState = new CudaForwardState(
+                config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
+                config.HeadDim, config.IntermediateSize, config.VocabSize,
+                useFp32Residual: config.Architecture == DotLLM.Core.Configuration.Architecture.BitNet);
+
+            // 6. CPU scratch buffers (with RoPE tables)
+            int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
+            if (ropeDim == 0) ropeDim = config.HeadDim;
+            float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+            RoPEType cpuRopeType = config.RoPEConfig?.Type ?? RoPEType.Norm;
+            // Translate the public RoPEType enum (Norm=0, NeoX=2) to the CUDA
+            // kernel's encoding (Norm=0, NeoX=1). Same translation site as
+            // LoadFromGguf — fixed in #36; the parity test built on top of this
+            // factory pins that fix for the hybrid split.
+            int gpuRopeType = CudaKernels.ToCudaRopeType(cpuRopeType);
+
+            cpuState = new TransformerForwardState(
+                config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
+                config.HeadDim, config.IntermediateSize, config.VocabSize,
+                config.MaxSequenceLength, ropeDim, ropeTheta);
+
+            // 7. ComputeThreadPool for CPU layers — mirror the LoadFromGguf branch
+            if (effectiveThreading.IsParallel)
+            {
+                int effectiveThreads = effectiveThreading.EffectiveThreadCount;
+                if (effectiveThreading.EnableNumaPinning || effectiveThreading.EnablePCorePinning)
+                {
+                    var topology = NumaTopology.Detect();
+                    if (effectiveThreading.EnablePCorePinning && topology.IsHybrid)
+                        effectiveThreads = Math.Min(effectiveThreads, topology.PerformanceCoreIds.Count);
+                    pool = new ComputeThreadPool(effectiveThreads, topology, effectiveThreading);
+                }
+                else
+                {
+                    pool = new ComputeThreadPool(effectiveThreads, topology: null, effectiveThreading);
+                }
+            }
+
+            return new HybridTransformerModel(
+                config, gpuWeights, gpuState, stream, cublas, context, kernels,
+                cpuWeights, cpuState, pool, ownsPool: pool is not null, gguf: null,
+                numGpuLayers, deviceId, ropeTheta, ropeDim, gpuRopeType, cpuRopeType,
+                config.SlidingWindowSize, vramWarning: null);
+        }
+        catch
+        {
+            pool?.Dispose();
+            cpuState?.Dispose();
+            gpuState?.Dispose();
+            gpuWeights?.Dispose();
+            kernels?.Dispose();
+            cublas?.Dispose();
+            stream?.Dispose();
+            // CudaContext.Create (above) makes the context current on THIS thread, and this
+            // catch runs synchronously on the same thread — no MakeCurrent() call is needed
+            // here (matches #368's convention).
+            context.Dispose();
+            throw;
+        }
     }
 
     /// <summary>Creates a <see cref="HybridKvCache"/> for this model.</summary>
