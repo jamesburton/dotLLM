@@ -308,6 +308,24 @@ public class JinjaEvaluatorTests
         Assert.Equal("[|]", result);
     }
 
+    [Fact]
+    public void ForLoop_NestedLoop_DoesNotLeakIntoOuterLoopPrevNextItem()
+    {
+        // The inner for-loop's own "loop" variable (with its own previtem/nextitem) must not
+        // clobber the outer loop's "loop" variable once the inner loop finishes and control
+        // returns to the outer iteration body. Each outer iteration renders the inner loop's
+        // output, then reads the OUTER loop's previtem/nextitem afterward.
+        var vars = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["outer"] = new List<object?> { "o1", "o2", "o3" },
+            ["inner"] = new List<object?> { "i1", "i2" },
+        };
+        var result = Eval(
+            "{% for o in outer %}{{ o }}:{% for x in inner %}{{ x }}{% endfor %}:prev={{ loop.previtem }}:next={{ loop.nextitem }};{% endfor %}",
+            vars);
+        Assert.Equal("o1:i1i2:prev=:next=o2;o2:i1i2:prev=o1:next=o3;o3:i1i2:prev=o2:next=;", result);
+    }
+
     // ── Scoping ──
 
     [Fact]
@@ -434,6 +452,16 @@ public class JinjaEvaluatorTests
     public void IsUndefined_True_WhenVariableAbsent()
     {
         Assert.Equal("True", Eval("{{ x is undefined }}"));
+    }
+
+    [Fact]
+    public void IsUndefined_False_WhenVariableIsNull()
+    {
+        // A key present with value null is DEFINED (Jinja2: is defined == True, is undefined ==
+        // False), distinct from an absent key. This is what keeps a legitimately-null
+        // loop.previtem/nextitem distinguishable from an omitted (undefined) one — the whole
+        // basis of the omission-instead-of-sentinel design for those two fields.
+        Assert.Equal("False", Eval("{{ x is undefined }}", new Dictionary<string, object?>(StringComparer.Ordinal) { ["x"] = null }));
     }
 
     [Fact]
