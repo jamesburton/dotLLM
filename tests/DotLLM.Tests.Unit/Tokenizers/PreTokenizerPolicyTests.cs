@@ -150,6 +150,26 @@ public class PreTokenizerPolicyTests
     }
 
     /// <summary>
+    /// Separates <c>qwen35</c> from <c>tekken</c> — the one pairing the real-GGUF parity suite
+    /// cannot cover. Both split every digit and both fold combining marks into the letter run,
+    /// so they differ only at a case boundary: qwen35's <c>[\p{L}\p{M}]+</c> runs straight through
+    /// it, while tekken's <c>[\p{Lu}…]*[\p{Ll}…]+</c> / <c>[\p{Lu}…]+[\p{Ll}…]*</c> pair must end
+    /// the segment before an upper-case letter that follows a lower-case one. With an "a B" merge
+    /// in the vocab, "aB" is therefore 1 token under qwen35 and 2 under tekken.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately unit-level: neither Qwen vocabulary contains a merge that crosses a case
+    /// boundary, so at integration level both routings emit identical ids and the assertion would
+    /// be vacuous.
+    /// </remarks>
+    [Fact]
+    public void Qwen35_KeepsCaseBoundariesInsideTheLetterRun_UnlikeTekken()
+    {
+        Assert.Single(Build("qwen35", "aB", "a B").Encode("aB"));
+        Assert.Equal(2, Build("tekken", "aB", "a B").Encode("aB").Length);
+    }
+
+    /// <summary>
     /// Negative control for <see cref="UnknownPreType_Throws_NamingTheValue"/>, required by
     /// #373. The pre-fix behaviour — unknown <c>pre</c> resolved to a <c>null</c> regex, i.e.
     /// NO pre-tokenization — is reconstructed explicitly here via
