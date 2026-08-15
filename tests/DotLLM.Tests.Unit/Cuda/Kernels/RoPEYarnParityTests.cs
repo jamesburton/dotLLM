@@ -271,6 +271,60 @@ public sealed class RoPEYarnParityTests : IDisposable
     }
 
     /// <summary>
+    /// The graph-replay decode path. <c>fused_rope_kv_write_f16_dyn</c> is what
+    /// <c>CudaTransformerModel</c>'s CUDA-graph branch launches, and it reads the cache row
+    /// from a device pointer instead of a kernel argument. Its body is otherwise identical
+    /// to the non-dyn kernel, but "identical body" is exactly the assumption that silently
+    /// rots, so the YaRN arguments are exercised through the dyn launcher too — a wrong
+    /// parameter-slot order here would be baked into every captured graph.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(0)]
+    [InlineData(5)]
+    public void FusedRopeKvWriteDyn_Yarn_MatchesCpuYarnReference(int position)
+    {
+        _harness.SkipIfUnavailable();
+        Skip.IfNot(_harness.Kernels.HasFusedRopeKvWriteKernel,
+                   "fused_rope_kv_write.ptx not loaded.");
+
+        const int maxSeq = 16;
+        int kvStride = NumKvHeads * HeadDim;
+        var rng = new Random(380 + position);
+
+        Half[] qh = ToHalf(CudaKernelTestHarness.RandomF32(rng, NumHeads * HeadDim));
+        Half[] kh = ToHalf(CudaKernelTestHarness.RandomF32(rng, kvStride));
+        Half[] vh = ToHalf(CudaKernelTestHarness.RandomF32(rng, kvStride));
+
+        (float[] cpuQ, float[] cpuK) = CpuYarnReference(
+            ToFloat(qh), ToFloat(kh), [position], seqLen: 1);
+
+        nint devQ = _harness.Upload(qh);
+        nint devK = _harness.Upload(kh);
+        nint devV = _harness.Upload(vh);
+        nint devPos = _harness.Upload(new[] { position });
+        // The dyn variant's distinguishing feature: the cache row lives in device memory.
+        nint devCachePos = _harness.Upload(new[] { position });
+        nint devInvFreq = _harness.Upload(YarnInvFreq());
+        nint kCache = _harness.Allocate((long)maxSeq * kvStride * sizeof(ushort));
+        nint vCache = _harness.Allocate((long)maxSeq * kvStride * sizeof(ushort));
+        float mscale = GptOssRope().ComputeYarnMscaleMultiplier(Architecture.GptOss);
+
+        _harness.Kernels.LaunchFusedRopeKvWriteF16Dyn(
+            devQ, devK, devV, kCache, vCache, devPos, devCachePos,
+            NumHeads, NumKvHeads, HeadDim, RopeDim, kvStride, Theta,
+            CudaKernels.ToCudaRopeType(RoPEType.NeoX),
+            _harness.StreamHandle, devInvFreq, mscale);
+        _harness.Synchronize();
+
+        float[] gpuQ = ToFloat(_harness.DownloadHalves(devQ, qh.Length));
+        float[] gpuKRow = ToFloat(_harness.DownloadHalves(
+            kCache + (nint)((long)position * kvStride * sizeof(ushort)), kvStride));
+
+        CudaKernelTestHarness.AssertClose($"FusedRopeKvDyn-YaRN Q@{position}", cpuQ, gpuQ, 2e-3f, 5e-3f);
+        CudaKernelTestHarness.AssertClose($"FusedRopeKvDyn-YaRN K@{position}", cpuK, gpuKRow, 2e-3f, 5e-3f);
+    }
+
+    /// <summary>
     /// Discriminating counterpart for the decode path, at position 0.
     /// </summary>
     [SkippableFact]
