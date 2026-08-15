@@ -567,8 +567,35 @@ a recurrent fixture and that dropping the reset changes the number.
 
 The CUDA layer-window executor is built on `CudaPipelineStage`, whose layer loop is standard dense /
 GQA causal only — no MLA, no MoE, no gemma4, no recurrent layers. Unsupported architectures are
-rejected at load rather than scored. Hybrid/MoE architectures can still be scored with `--gpu-layers`
-prefix offload, and are covered on CPU by the layer-window engine.
+rejected at load with a named error rather than scored. Hybrid/MoE architectures can still be scored
+with `--gpu-layers` prefix offload, and are covered on CPU by the layer-window engine.
+
+**Scaled RoPE is rejected too, and for a less obvious reason.** Every other rejection covers a feature
+that changes the layer graph. Scaled RoPE (YaRN / linear / NTK / LongRoPE) does not — it changes the
+*frequency table* — so it would clear every structural check and then be scored with the **unscaled**
+table, because `CudaPipelineStage` passes only theta / dim / type to `LaunchRoPE` while the CPU
+reference applies the full correction. Note this is a **pre-existing, backend-wide** gap: whole-device
+`--device cuda` is equally unscaled today. The rejection keeps the layer-window guard's promise; it
+does not fix CUDA RoPE scaling. Llama-3's `llama3` scaling maps to `RoPEScalingType.None`, so the
+Llama-3.x family is unaffected.
+
+### How sensitive the CUDA equivalence tests actually are
+
+Measured on Llama-3.2-1B-Q8_0, mean NLL ~3.0 on real English:
+
+| Change | Effect on mean NLL |
+|---|---|
+| FP16 boundary rounding alone (16 cuts vs 1) | 0.054% |
+| Cycled vs whole-device CUDA | 0.036% |
+| Boundary corrupted by 1% element-wise | 0.123% |
+| Boundary corrupted by 5% element-wise | 0.632% |
+| Boundary scaled uniformly by 1% | 0.043% — **invisible** |
+
+Two things follow. The 0.2% bound resolves a boundary corruption of roughly 2% or more and **does not**
+resolve a 1% one, so a sub-percent defect would hide inside FP16 rounding; the bit-identical CPU tests
+carry the logic load. And a *uniform* scale of the residual stream is undetectable by construction,
+because the next layer begins with RMSNorm, which is scale-invariant — worth knowing before designing
+any activation-level check at a layer boundary.
 
 ### Implementation
 
