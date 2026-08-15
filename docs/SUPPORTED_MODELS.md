@@ -46,7 +46,9 @@ for system context.
 
 **Row count: 15 / 21 `Architecture` enum variants covered.** (Not yet rowed:
 `NemotronHMoe`, `Qwen3HybridDense`, `Gemma3`, `Gemma4`, `DiffusionGemma`,
-`BitNet` — pre-existing gaps, out of scope for this update.)
+`BitNet` — pre-existing gaps, out of scope for this update. The matrix also
+has 16 physical rows because of a pre-existing duplicate `Meta Llama` row —
+unrelated to this change, not touched here.)
 
 ## Per-architecture notes
 
@@ -287,18 +289,25 @@ SWA, and MXFP4 MoE together; no real `gpt-oss-20b-mxfp4.gguf` checkpoint is
 available locally for a real-weight run.
 
 **CUDA**: `CudaMoeFfn` already implements gpt-oss's MoE per-expert bias and
-clamped-SwiGLU activation (issue #348). Issue #366 closed the two remaining
-attention-path gaps, both kernel-level parity-verified against the CPU oracle
-on a real RTX 3060:
+clamped-SwiGLU activation (issue #348). gpt-oss's CUDA attention path has
+three known gaps; issue #366 closed two of them, both kernel-level
+parity-verified against the CPU oracle on a real RTX 3060:
 - **Alternating sliding-window attention** — per-layer window resolution now
   matches CPU semantics across every CUDA attention dispatch site.
 - **Dense YaRN RoPE scaling** — CUDA RoPE previously ignored `rope_scaling`
-  entirely, a ~34.7% Q/K divergence at position 0 for *any* dense-YaRN model
-  (not gpt-oss-specific — this also makes CUDA output for SmolLM3-128k and
-  Llama 3.1+ extended-context checkpoints correctly match CPU for the first
-  time; see those rows above, neither previously claimed CUDA parity so
-  nothing there was stale). Fixed via a host-precomputed inverse-frequency +
-  mscale upload sharing the CPU math as the single source of truth.
+  entirely. For gpt-oss's shipped config (`factor=32`, `attn_factor` absent
+  → 1.0) this was a ~34.7% Q/K divergence at position 0, because gpt-oss's
+  mscale formula (`AttnFactor * (1 + 0.1*ln(factor))`) is architecture-gated
+  and applies even at `pos=0`; other dense-YaRN checkpoints without that
+  gate see a smaller, ramp-only divergence at `pos > 0`. Not gpt-oss-specific
+  — the same fix corrects CUDA's dense RoPE for any checkpoint that reaches
+  the shared YaRN path (confirmed: SmolLM3's 128k SKU; unconfirmed for
+  official Meta Llama 3.1, whose native `rope_type=llama3` NTK scaling is a
+  distinct scheme dotLLM does not implement — only Llama-family checkpoints
+  that ship `rope_type=yarn` instead take this path). Fixed via a
+  host-precomputed inverse-frequency + mscale upload sharing the CPU math as
+  the single source of truth.
+- **Per-head attention sinks** — NOT addressed by #366; see below.
 
 `CudaModelLoader.CreateFromGguf`'s `Architecture.GptOss` case still throws
 `NotSupportedException` — per-head attention sinks are not yet implemented on
