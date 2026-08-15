@@ -472,10 +472,13 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         int effectiveContext, int effectiveStride, int effectivePrefix, PerplexityMode mode)
     {
         int numLayers = config.NumLayers;
-        string deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
-
         var sw = Stopwatch.StartNew();
         PerplexityResult result;
+        // Filled inside the try: enumerating the device is itself a CUDA call that throws when no
+        // usable device is present, and doing it above the handler reproduced — in a different
+        // failure mode — the same unhandled-stack-trace problem the model construction below was
+        // moved in here to fix.
+        string deviceLabel = $"cuda:{gpuId}";
 
         // Model construction is INSIDE the try, not above it. CudaLayerWindowModel's whole contract
         // is that an architecture its window loop cannot execute is rejected at load time rather
@@ -484,6 +487,8 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         // exactly this path.
         try
         {
+            deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
+
             // The CPU model is the head provider and, for a non-cycled window, also executes the
             // layers outside the GPU window. Its weights are mmap-backed, so holding it resident
             // alongside the device window costs page cache rather than committed memory.
@@ -533,8 +538,12 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
                 observer,
                 onPhase);
         }
-        catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException
+                                     or InvalidOperationException or DotLLM.Cuda.Interop.CudaException)
         {
+            // CudaException / InvalidOperationException cover the device itself being absent or
+            // unusable, which is a user-facing configuration problem like the others here, not a
+            // defect worth a stack trace.
             AnsiConsole.MarkupLine($"[red]{Markup.Escape(ex.Message)}[/]");
             return 1;
         }

@@ -86,8 +86,9 @@ public sealed class CudaLayerCyclingPerplexityTests(ITestOutputHelper output)
         output.WriteLine($"relative difference   = {relative:P4}");
 
         // 0.3% of the mean NLL. The two paths differ by an FP16 boundary round trip per layer cut
-        // and by an FP32-host versus FP16-device output head; measured, that is 0.036%, so this is
-        // ~8x headroom rather than the order of magnitude the first draft of this test allowed. The
+        // and by an FP32-host versus FP16-device output head; measured, that is ~0.04% — but see the
+        // type remarks: figures this small are sequence-dependent rather than constants (#429), so
+        // the headroom here is roughly an order of magnitude, not a precise ratio. The
         // looser bound was a hangover from scoring random token ids, where the figure sat near the
         // uniform floor and could not move far no matter what broke.
         Assert.True(relative < 0.003,
@@ -125,7 +126,9 @@ public sealed class CudaLayerCyclingPerplexityTests(ITestOutputHelper output)
         double relative = Math.Abs(perLayer - oneWindow) / Math.Abs(oneWindow);
         output.WriteLine($"relative difference                      = {relative:P4}");
 
-        // 0.2%; measured 0.054%. See the tightening note on the equivalence test above.
+        // 0.2%. Rounding alone measures ~0.01-0.05% here depending on the harness — see the type
+        // remarks on why a figure this small is not a constant (#429). Do not tighten further on the
+        // strength of one run.
         Assert.True(relative < 0.002,
             $"cutting the trunk into {config.NumLayers} windows moved the mean NLL from {oneWindow:F6} " +
             $"to {perLayer:F6} ({relative:P4}); only FP16 boundary rounding should differ.");
@@ -140,16 +143,22 @@ public sealed class CudaLayerCyclingPerplexityTests(ITestOutputHelper output)
     /// be looser than any defect the test can produce. Required by <c>CLAUDE.md</c>'s "demonstrate the
     /// test can fail" rule (issue #418).</para>
     /// <para><b>The calibration, stated plainly, because it bounds what these tests can claim.</b>
-    /// Measured on Llama-3.2-1B-Q8_0: FP16 rounding alone moves the mean NLL 0.054%; a 1%
-    /// element-wise boundary perturbation moves it 0.123%; a 5% one moves it 0.632%. So the 0.2%
-    /// bound resolves a boundary corruption of roughly 2% or more and does <em>not</em> resolve a 1%
-    /// one — a sub-percent boundary defect would hide inside FP16 rounding and these tests would pass.
-    /// That is a real limit, not a reason to loosen the assertion: the logic load is carried by the
-    /// CPU tests, which are bit-identical and therefore catch a corruption of any size, and by
-    /// <see cref="CycledScoring_IsInsensitiveToTheNumberOfLayerCuts"/>, which multiplies whatever
-    /// error a single cut introduces by the number of cuts.</para>
+    /// Measured on Llama-3.2-1B-Q8_0 across two independent harnesses: FP16 rounding alone moves the
+    /// mean NLL by ~0.01–0.05%; an element-wise boundary corruption of 0.5% moves it 0.138%, 1%
+    /// moves it 0.123–0.131%, 2% moves it 0.165%, and 5% moves it 0.585–0.632%. So the
+    /// <b>demonstrated-reliable detection level is 5%</b>: a 2% corruption lands at 0.165%, below the
+    /// 0.2% bound, and therefore <em>cannot be relied on</em> to be caught. That is a real limit, not
+    /// a reason to loosen the assertion — the logic load is carried by the CPU tests, which are
+    /// bit-identical and therefore catch a corruption of any size.</para>
+    /// <para><b>Two traps for anyone re-deriving these numbers.</b> The response is
+    /// <em>non-monotonic</em> below ~2% — 0.5% moves the figure more than 1% does — because at that
+    /// scale the effect is dominated by which tokens flip rather than by the perturbation's
+    /// magnitude, so dose-response reasoning does not apply. And figures below ~0.1% are not
+    /// reproducible constants: two individually byte-reproducible harnesses disagree 5.7x on the
+    /// 16-cuts-vs-1 figure with identical inputs, with the disagreement scaling with boundary count
+    /// (issue #429). Do not tighten a bound on the strength of one run of a figure that small.</para>
     /// <para>The earlier 1% magnitude is kept in the record deliberately: it is what showed that a
-    /// <em>uniform</em> scale is invisible here (0.043%, less than plain rounding) because the next
+    /// <em>uniform</em> scale is invisible here (~0.02-0.04%, no more than plain rounding) because the next
     /// layer's RMSNorm is scale-invariant — see <see cref="PerturbedBoundaryModel"/>.</para>
     /// </remarks>
     [SkippableFact]

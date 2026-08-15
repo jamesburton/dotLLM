@@ -201,16 +201,15 @@ public sealed class CudaLayerWindowModel : ILayerWindowModel
     /// fused-add-RMSNorm → SwiGLU FFN. Anything outside that would run to completion and produce a
     /// plausible-looking but wrong perplexity, which is the one failure mode this whole feature must
     /// not have — hence a hard throw at load time rather than a warning.
+    /// <para><b>Internal rather than private so it can be tested without a GPU or a GGUF.</b> The
+    /// guard's whole value is that it fires; a rejection that silently stopped firing would restore
+    /// exactly the silent-wrong-number failure it exists to prevent, and would look identical to a
+    /// passing build. Reaching it through the public factories would need a real unsupported
+    /// checkpoint on disk for every rejected feature, which is not something the test suite can
+    /// carry.</para>
     /// </remarks>
     /// <param name="config">Configuration to check.</param>
     /// <exception cref="NotSupportedException">The configuration is outside the supported scope.</exception>
-    /// <remarks>
-    /// <b>Internal rather than private so it can be tested without a GPU or a GGUF.</b> The guard's
-    /// whole value is that it fires; a rejection that silently stopped firing would restore exactly
-    /// the silent-wrong-number failure it exists to prevent, and would look identical to a passing
-    /// build. Reaching it through the public factories would need a real unsupported checkpoint on
-    /// disk for every rejected feature, which is not something the test suite can carry.
-    /// </remarks>
     internal static void ValidateSupported(ModelConfig config)
     {
         Reject(config.MlaConfig is not null, config, "multi-head latent attention (MLA)");

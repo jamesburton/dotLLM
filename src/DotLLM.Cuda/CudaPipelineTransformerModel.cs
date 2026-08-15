@@ -331,8 +331,8 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
             // skipOutputHead is driven by isFinalStage, not by the layer range. A stage that owns
             // the last layer but is NOT the final stage (the layer-cycling perplexity windows, which
             // always apply the head on the host — issue #395) would otherwise upload an output norm
-            // + LM head + quantized decode copy it never launches: ~0.5 GB on a 1B model and ~1.5 GB
-            // on a 27-30B one, which is enough to OOM the last window of a cycle whose earlier
+            // + LM head it never launches: 268 MiB measured on Llama-3.2-1B-Q8_0, scaling with
+            // vocab x hidden, which is enough to OOM the last window of a cycle whose earlier
             // windows all fit.
             weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
                 numGpuLayers: layerCount, firstLayer: firstLayer, skipTokenEmbed: skipTokenEmbed,

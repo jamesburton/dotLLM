@@ -581,21 +581,40 @@ Llama-3.x family is unaffected.
 
 ### How sensitive the CUDA equivalence tests actually are
 
-Measured on Llama-3.2-1B-Q8_0, mean NLL ~3.0 on real English:
+Measured on Llama-3.2-1B-Q8_0, mean NLL ~3.0 on real English. **Read the sub-0.1% rows as
+order-of-magnitude, not as constants** — see the warning below.
 
 | Change | Effect on mean NLL |
 |---|---|
-| FP16 boundary rounding alone (16 cuts vs 1) | 0.054% |
-| Cycled vs whole-device CUDA | 0.036% |
-| Boundary corrupted by 1% element-wise | 0.123% |
-| Boundary corrupted by 5% element-wise | 0.632% |
-| Boundary scaled uniformly by 1% | 0.043% — **invisible** |
+| FP16 boundary rounding alone (16 cuts vs 1) | ~0.01–0.05% *(sequence-dependent)* |
+| Cycled vs whole-device CUDA | ~0.04% *(sequence-dependent)* |
+| Boundary scaled **uniformly** by 1% | ~0.02–0.04% — **invisible** |
+| Boundary corrupted by 0.5% element-wise | 0.138% |
+| Boundary corrupted by 1% element-wise | 0.123–0.131% |
+| Boundary corrupted by 2% element-wise | 0.165% |
+| Boundary corrupted by 5% element-wise | 0.585–0.632% |
 
-Two things follow. The 0.2% bound resolves a boundary corruption of roughly 2% or more and **does not**
-resolve a 1% one, so a sub-percent defect would hide inside FP16 rounding; the bit-identical CPU tests
-carry the logic load. And a *uniform* scale of the residual stream is undetectable by construction,
-because the next layer begins with RMSNorm, which is scale-invariant — worth knowing before designing
-any activation-level check at a layer boundary.
+Four things follow.
+
+**1. The demonstrated-reliable detection level is 5%, not 2%.** A 2% element-wise corruption measures
+0.165%, which is *below* the 0.2% bound — so a 2% corruption **cannot be relied on to be resolved**.
+The bit-identical CPU tests carry the logic load; these bounds are a coarse backstop.
+
+**2. Sub-0.1% figures are not reproducible constants.** Two independently written, individually
+byte-reproducible harnesses disagree by **5.7x** on the 16-cuts-vs-1 figure (0.0540% vs 0.0094%) with
+identical corpus, options and partition. The disagreement scales with the number of boundary crossings
+(~4e-6 at one window, ~6e-4 at one-layer windows), so it is not measurement noise but something
+sequence- or allocation-dependent — cuBLAS algorithm selection driven by allocation history is the
+working hypothesis. **Do not derive a threshold from a single run of a figure this small.** Tracked as
+issue #429, which affects how thresholds are derived repo-wide.
+
+**3. The response is non-monotonic below ~2%.** A 0.5% corruption moved the figure *more* (0.138%) than
+a 1% one (0.123–0.131%). Below roughly 2% the effect is dominated by *which* tokens flip rather than by
+the magnitude of the perturbation, so dose-response reasoning does not apply there.
+
+**4. A uniform scale of the residual stream is undetectable by construction**, because the next layer
+begins with RMSNorm, which is scale-invariant. Worth knowing before designing any activation-level
+check at a layer boundary.
 
 ### Implementation
 
