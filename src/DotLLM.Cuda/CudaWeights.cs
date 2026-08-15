@@ -550,7 +550,7 @@ internal sealed class CudaWeights : IDisposable
         // mscale multiplies cos AND sin at every position. Mirrors the CPU gate in
         // TransformerModel.BuildFromPrebuiltWeightsInternal: dense path only (MLA models
         // carry their own YaRN cos/sin tables through CudaTransformerModel's MLA state).
-        var (ropeYarnInvFreq, ropeYarnMscale) = UploadDenseYarnInvFreq(config, allocs, stream);
+        var (ropeYarnInvFreq, ropeYarnMscale) = UploadDenseYarnInvFreq(config, allocs);
 
         return new CudaWeights(layers, tokenEmbed, tokenEmbedQt,
             outputNorm, outputWeight, cpuWeights.OutputOutputDim, cpuWeights.OutputInputDim,
@@ -592,7 +592,7 @@ internal sealed class CudaWeights : IDisposable
     /// released both by the mid-load failure unwind and by <see cref="Dispose"/>.
     /// </remarks>
     private static unsafe (nint InvFreqDevice, float Mscale) UploadDenseYarnInvFreq(
-        ModelConfig config, List<nint> allocs, nint stream)
+        ModelConfig config, List<nint> allocs)
     {
         // MLA models rebuild their own YaRN cos/sin tables (CudaTransformerModel's MLA
         // state); this dense path must not double-apply on top of them.
@@ -613,14 +613,13 @@ internal sealed class CudaWeights : IDisposable
             ropeDim, rope.Theta, rope.ScalingFactor, rope.OrigMaxSeqLen,
             rope.BetaFast, rope.BetaSlow, invFreq);
 
+        // AllocAndUpload goes through cuMemcpyHtoD_v2 — the SYNCHRONOUS copy — so the
+        // `fixed` pin covers the whole transfer and the managed array is free to move
+        // again once the block exits. (An async copy here would be a use-after-unpin.)
         long bytes = (long)halfDim * sizeof(float);
         nint devPtr;
         fixed (float* p = invFreq)
             devPtr = AllocAndUpload((nint)p, bytes, allocs);
-
-        // AllocAndUpload issues a synchronous HtoD copy, but sync alongside the surrounding
-        // uploads so the buffer is guaranteed visible before the first forward.
-        CudaDriverApi.cuStreamSynchronize(stream).ThrowOnError();
 
         return (devPtr, rope.ComputeYarnMscaleMultiplier(config.Architecture));
     }
