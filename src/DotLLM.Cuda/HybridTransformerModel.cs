@@ -479,7 +479,6 @@ public sealed unsafe class HybridTransformerModel : IModel
         int vocabSize = Config.VocabSize;
         int kvStride = numKvHeads * headDim;
         float eps = Config.NormEpsilon;
-        int slidingWindow = Config.SlidingWindowSize ?? 0;
         int h = sizeof(ushort); // FP16 element size
 
         int totalLayers = Config.NumLayers;
@@ -543,6 +542,14 @@ public sealed unsafe class HybridTransformerModel : IModel
         for (int layer = 0; layer < gpuLayers; layer++)
         {
             ref readonly var lw = ref _gpuWeights.Layers[layer];
+
+            // Per-layer window: gpt-oss alternates window/dense (pattern=2), Gemma-3 uses
+            // pattern=6; uniform-window and no-window models resolve identically to the old
+            // hoisted value. 0 = dense (kernel convention). Mirrors CPU GetLayerSlidingWindow.
+            // `layer` is the absolute (global) index (GPU phase = global layers 0..gpuLayers-1).
+            int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                Config.SlidingWindowSize, Config.SlidingWindowPattern,
+                Config.PerLayerSlidingWindow, layer);
 
             // ── ATTENTION BLOCK ──
             ProjectGpu(lw.QQuant, lw.QQuantType, lw.Q, _gpuState.NormOutput, _gpuState.Q,

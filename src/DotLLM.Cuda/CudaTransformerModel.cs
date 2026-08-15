@@ -946,7 +946,6 @@ public sealed unsafe class CudaTransformerModel : IModel
         int intermediateSize = Config.IntermediateSize;
         int vocabSize = Config.VocabSize;
         float eps = Config.NormEpsilon;
-        int slidingWindow = Config.SlidingWindowSize ?? 0;
         int h = sizeof(ushort); // FP16 element size
 
         nint s = _stream.Handle;
@@ -1035,6 +1034,13 @@ public sealed unsafe class CudaTransformerModel : IModel
         for (int layer = 0; layer < numLayers; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
+
+            // Per-layer window: gpt-oss alternates window/dense (pattern=2), Gemma-3 uses
+            // pattern=6; uniform-window and no-window models resolve identically to the old
+            // hoisted value. 0 = dense (kernel convention). Mirrors CPU GetLayerSlidingWindow.
+            int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                Config.SlidingWindowSize, Config.SlidingWindowPattern,
+                Config.PerLayerSlidingWindow, layer);
 
             // When a LoRA adapter is active, every fused decode kernel below is bypassed.
             // Declared at the top of the loop (before the MLA `goto FfnBlock`) so it is
@@ -1959,7 +1965,6 @@ public sealed unsafe class CudaTransformerModel : IModel
         int intermediateSize = Config.IntermediateSize;
         int vocabSize = Config.VocabSize;
         float eps = Config.NormEpsilon;
-        int slidingWindow = Config.SlidingWindowSize ?? 0;
         const int seqLen = 1;
         const int h = sizeof(ushort);
 
@@ -1998,6 +2003,14 @@ public sealed unsafe class CudaTransformerModel : IModel
             for (int layer = 0; layer < numLayers; layer++)
             {
                 ref readonly var lw = ref _weights.Layers[layer];
+
+                // Per-layer window: see the comment on the eager Forward() body's identical
+                // computation. Baking the resolved per-layer value into the captured graph is
+                // correct because the window is a static per-layer architectural property that
+                // never changes across replays of this graph.
+                int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                    Config.SlidingWindowSize, Config.SlidingWindowPattern,
+                    Config.PerLayerSlidingWindow, layer);
 
                 // BitNet (I2_S) decode: fuse the Q/K/V projections into ONE GEMV launch
                 // when eligible (same condition as the eager path — no adapter is ever
@@ -2264,7 +2277,6 @@ public sealed unsafe class CudaTransformerModel : IModel
         int intermediateSize = Config.IntermediateSize;
         int vocabSize = Config.VocabSize;
         float eps = Config.NormEpsilon;
-        int slidingWindow = Config.SlidingWindowSize ?? 0;
         const int seqLen = 1;
         const int h = sizeof(ushort);
 
@@ -2298,6 +2310,14 @@ public sealed unsafe class CudaTransformerModel : IModel
             for (int layer = 0; layer < numLayers; layer++)
             {
                 ref readonly var lw = ref _weights.Layers[layer];
+
+                // Per-layer window: see the comment on the eager Forward() body's identical
+                // computation. Baking the resolved per-layer value into the captured graph is
+                // correct because the window is a static per-layer architectural property that
+                // never changes across replays of this graph.
+                int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                    Config.SlidingWindowSize, Config.SlidingWindowPattern,
+                    Config.PerLayerSlidingWindow, layer);
 
                 // BitNet (I2_S) decode: fuse the Q/K/V projections into ONE GEMV launch
                 // when eligible — mirrors the eager path's fusedI2SQkv branch (#212).
@@ -2643,7 +2663,6 @@ public sealed unsafe class CudaTransformerModel : IModel
         int intermediateSize = Config.IntermediateSize;
         int vocabSize = Config.VocabSize;
         float eps = Config.NormEpsilon;
-        int slidingWindow = Config.SlidingWindowSize ?? 0;
         nint s = _stream.Handle;
 
         _state.EnsureCapacity(seqLen);
@@ -2679,6 +2698,12 @@ public sealed unsafe class CudaTransformerModel : IModel
         for (int layer = 0; layer < numLayers; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
+
+            // Per-layer window: see the comment on the eager Forward() body's identical
+            // computation. Mirrors CPU GetLayerSlidingWindow.
+            int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                Config.SlidingWindowSize, Config.SlidingWindowPattern,
+                Config.PerLayerSlidingWindow, layer);
 
             ProjectF32(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutputF32, _state.QF32,
                 lw.QOutputDim, lw.QInputDim, seqLen);
