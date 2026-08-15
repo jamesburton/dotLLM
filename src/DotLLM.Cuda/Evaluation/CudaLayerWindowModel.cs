@@ -1,3 +1,4 @@
+using DotLLM.Core.Configuration;
 using DotLLM.Core.Evaluation;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
@@ -203,7 +204,14 @@ public sealed class CudaLayerWindowModel : ILayerWindowModel
     /// </remarks>
     /// <param name="config">Configuration to check.</param>
     /// <exception cref="NotSupportedException">The configuration is outside the supported scope.</exception>
-    private static void ValidateSupported(ModelConfig config)
+    /// <remarks>
+    /// <b>Internal rather than private so it can be tested without a GPU or a GGUF.</b> The guard's
+    /// whole value is that it fires; a rejection that silently stopped firing would restore exactly
+    /// the silent-wrong-number failure it exists to prevent, and would look identical to a passing
+    /// build. Reaching it through the public factories would need a real unsupported checkpoint on
+    /// disk for every rejected feature, which is not something the test suite can carry.
+    /// </remarks>
+    internal static void ValidateSupported(ModelConfig config)
     {
         Reject(config.MlaConfig is not null, config, "multi-head latent attention (MLA)");
         Reject(config.Moe is not null, config, "mixture-of-experts FFN routing");
@@ -223,6 +231,20 @@ public sealed class CudaLayerWindowModel : ILayerWindowModel
             "interleaved sliding-window patterns (the window loop uses one uniform window size)");
         Reject(config.GlobalRoPEConfig is not null, config,
             "a separate RoPE configuration for full-attention layers");
+
+        // The window loop hands LaunchRoPE nothing but theta / dim / type (CudaPipelineStage's
+        // RunLayers), and no CUDA LaunchRoPE overload accepts YaRN's scaling factor, original
+        // context length, attn factor or beta fast/slow. The CPU reference DOES apply them
+        // (TransformerModel's PrecomputeFrequencyTableYarn), so a scaled-RoPE GGUF would clear every
+        // other rejection here and then be scored with the UNSCALED frequency table — a plausible,
+        // authoritative, wrong perplexity, which is the single failure mode this guard exists to
+        // prevent. The gap is pre-existing and backend-wide (whole-device `--device cuda` is equally
+        // unscaled); this rejection does not fix that, it only keeps the new guard's promise honest.
+        // Note Llama-3's `llama3` scaling type maps to RoPEScalingType.None in
+        // GgufModelConfigExtractor, so the Llama-3.x family is unaffected.
+        Reject(config.RoPEConfig is { ScalingType: not RoPEScalingType.None }, config,
+            "scaled RoPE (YaRN / linear / NTK / LongRoPE) — the window loop applies the unscaled "
+            + "frequency table");
         Reject(config.PartialRotaryFactor is not null, config, "partial rotary embeddings");
         Reject(config.NumGlobalKvHeads is not null, config,
             "a distinct KV-head count for full-attention layers");
