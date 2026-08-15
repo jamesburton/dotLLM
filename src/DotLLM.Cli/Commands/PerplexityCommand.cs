@@ -474,43 +474,50 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         int numLayers = config.NumLayers;
         string deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
 
-        // The CPU model is the head provider and, for a non-cycled window, also executes the layers
-        // outside the GPU window. Its weights are mmap-backed, so holding it resident alongside the
-        // device window costs page cache rather than committed memory.
-        using IModel cpuModel = ModelLoader.CreateCpuModelFromGguf(
-            gguf, config, new ThreadingConfig(settings.Threads));
-        using var cpuWindows = new CpuLayerWindowModel(cpuModel, config);
-        using var cudaWindows = DotLLM.Cuda.Evaluation.CudaLayerWindowModel.LoadFromGguf(
-            gguf, config, gpuId, cpuWindows);
-
-        var assignments = new List<CompositeLayerWindowModel.LayerAssignment>();
-        if (placement.Cycle)
-        {
-            foreach (LayerWindow w in CyclingPerplexityEvaluator.PartitionLayers(numLayers, placement.GpuLayers))
-                assignments.Add(new CompositeLayerWindowModel.LayerAssignment(w, cudaWindows));
-        }
-        else
-        {
-            int first = placement.FirstLayer;
-            int end = first + placement.GpuLayers;
-            if (first > 0)
-                assignments.Add(new CompositeLayerWindowModel.LayerAssignment(new LayerWindow(0, first), cpuWindows));
-            assignments.Add(new CompositeLayerWindowModel.LayerAssignment(
-                new LayerWindow(first, placement.GpuLayers), cudaWindows));
-            if (end < numLayers)
-                assignments.Add(new CompositeLayerWindowModel.LayerAssignment(
-                    new LayerWindow(end, numLayers - end), cpuWindows));
-        }
-
-        using var composite = new CompositeLayerWindowModel(assignments, cpuWindows);
-
-        AnsiConsole.MarkupLine(
-            $"[grey]placement: {Markup.Escape(placement.Describe(deviceLabel, numLayers))}[/]");
-
         var sw = Stopwatch.StartNew();
         PerplexityResult result;
+
+        // Model construction is INSIDE the try, not above it. CudaLayerWindowModel's whole contract
+        // is that an architecture its window loop cannot execute is rejected at load time rather
+        // than silently mis-scored — and a rejection that reaches the user as an unhandled stack
+        // trace is not the clean refusal that contract advertises. Every hybrid / MoE model takes
+        // exactly this path.
         try
         {
+            // The CPU model is the head provider and, for a non-cycled window, also executes the
+            // layers outside the GPU window. Its weights are mmap-backed, so holding it resident
+            // alongside the device window costs page cache rather than committed memory.
+            using IModel cpuModel = ModelLoader.CreateCpuModelFromGguf(
+                gguf, config, new ThreadingConfig(settings.Threads));
+            using var cpuWindows = new CpuLayerWindowModel(cpuModel, config);
+            using var cudaWindows = DotLLM.Cuda.Evaluation.CudaLayerWindowModel.LoadFromGguf(
+                gguf, config, gpuId, cpuWindows);
+
+            var assignments = new List<CompositeLayerWindowModel.LayerAssignment>();
+            if (placement.Cycle)
+            {
+                foreach (LayerWindow w in CyclingPerplexityEvaluator.PartitionLayers(numLayers, placement.GpuLayers))
+                    assignments.Add(new CompositeLayerWindowModel.LayerAssignment(w, cudaWindows));
+            }
+            else
+            {
+                int first = placement.FirstLayer;
+                int end = first + placement.GpuLayers;
+                if (first > 0)
+                    assignments.Add(new CompositeLayerWindowModel.LayerAssignment(
+                        new LayerWindow(0, first), cpuWindows));
+                assignments.Add(new CompositeLayerWindowModel.LayerAssignment(
+                    new LayerWindow(first, placement.GpuLayers), cudaWindows));
+                if (end < numLayers)
+                    assignments.Add(new CompositeLayerWindowModel.LayerAssignment(
+                        new LayerWindow(end, numLayers - end), cpuWindows));
+            }
+
+            using var composite = new CompositeLayerWindowModel(assignments, cpuWindows);
+
+            AnsiConsole.MarkupLine(
+                $"[grey]placement: {Markup.Escape(placement.Describe(deviceLabel, numLayers))}[/]");
+
             PerplexityEvaluator.WindowObserver? observer = settings.PerWindow
                 ? (i, ppl, n) => Console.WriteLine($"window {i}: ppl={ppl:F6} scored={n}")
                 : null;

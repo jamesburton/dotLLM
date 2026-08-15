@@ -200,19 +200,31 @@ internal sealed class CudaWeights : IDisposable
     /// disposes <paramref name="cpuWeights"/>. The caller MUST pass null whenever it retains
     /// <paramref name="cpuWeights"/> for a CPU-side forward.
     /// </param>
+    /// <param name="skipOutputHead">
+    /// When <c>true</c>, the output norm + LM head (and the head's quantized decode copy) are not
+    /// uploaded even though this window reaches the last layer, exactly as if the window stopped
+    /// short of it. For a caller that applies the head elsewhere — the layer-cycling perplexity
+    /// windows, which always run the head on the host so that logits are produced for every row
+    /// (issue #395) — the head is otherwise pure dead VRAM on the one window that happens to contain
+    /// the final layer: roughly 0.5 GB on a 1B model and ~1.5 GB on a 27-30B one, enough to OOM the
+    /// last window of a cycle whose earlier windows fit. Default <c>false</c> preserves the existing
+    /// "final window owns the head" behavior.
+    /// </param>
     public static CudaWeights LoadFromGguf(TransformerWeights cpuWeights, ModelConfig config,
                                               CudaKernels kernels, nint stream,
                                               int numGpuLayers = -1, int firstLayer = 0,
                                               bool skipTokenEmbed = false,
-                                              Action<nint>? onHostTensorUploaded = null)
+                                              Action<nint>? onHostTensorUploaded = null,
+                                              bool skipOutputHead = false)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(firstLayer);
         int layerCount = numGpuLayers < 0
             ? config.NumLayers - firstLayer
             : Math.Min(numGpuLayers, config.NumLayers - firstLayer);
-        // isHybrid: the CUDA upload covers only a contiguous slice of the full model,
-        // so it does NOT own the output norm + LM head (caller owns them separately).
-        bool isHybrid = (firstLayer + layerCount) < config.NumLayers;
+        // isHybrid: this upload does NOT own the output norm + LM head, because either it covers
+        // only a contiguous slice of the full model (the caller owns the tail), or the caller has
+        // said outright that it applies the head itself (skipOutputHead).
+        bool isHybrid = (firstLayer + layerCount) < config.NumLayers || skipOutputHead;
 
         var allocs = new List<nint>();
 
