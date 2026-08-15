@@ -142,7 +142,7 @@ internal sealed class CudaWeights : IDisposable
     /// with the PLAIN <c>RoPE.PrecomputeFrequencyTable</c>, whereas the CPU MLA path uses
     /// <c>RoPE.PrecomputeFrequencyTableYarn</c> — so CUDA MLA carries the same class of
     /// CPU/CUDA divergence for DeepSeek-V2/V3 long context. Do not read the exclusion below
-    /// as "already handled". See <c>.docs/366-rope-scaling-findings.md</c>.
+    /// as "already handled". Tracked in issue #430.
     /// </para>
     /// </summary>
     /// <remarks>
@@ -609,8 +609,8 @@ internal sealed class CudaWeights : IDisposable
         // while the CPU MLA path calls RoPE.PrecomputeFrequencyTableYarn
         // (TransformerModel.cs, the MlaConfig.RopeScalingFactor branch). CUDA MLA therefore
         // has the SAME class of CPU/CUDA divergence #366 closes for the dense path, and it
-        // remains OPEN — tracked in .docs/366-rope-scaling-findings.md. Wiring it here would
-        // be wrong (different kernels); it needs the MLA table build to switch routines.
+        // remains OPEN — tracked in issue #430. Wiring it here would be wrong (different
+        // kernels); it needs the MLA table build to switch routines.
         if (config.MlaConfig is not null) return (0, 1.0f);
         if (config.RoPEConfig is not DotLLM.Core.PositionEncoding.RoPEConfig rope) return (0, 1.0f);
         if (!rope.IsDenseYarnActive) return (0, 1.0f);
