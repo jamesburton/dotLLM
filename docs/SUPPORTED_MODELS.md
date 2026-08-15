@@ -42,8 +42,11 @@ for system context.
 | IBM Granite-3.x MoE | `Architecture.GraniteMoe` | HF tokenizer.json (BPE + ByteLevel) | RoPE Norm | GQA | yes: fused per-layer `block_sparse_moe.{router.layer, input_linear, output_linear}` | Llama set plus `num_local_experts`, `num_experts_per_tok`, `moe_intermediate_size`. `architectures[0] = GraniteMoeForCausalLM` or `model_type = granitemoe`. | `verified: real weights` (CPU + Vulkan) — `ibm-granite/granite-3.0-3b-a800m-instruct` (6.3 GB, CPU `Granite3Moe_LoadsAndForwardsEndToEnd`; Vulkan `Granite3Moe_VulkanForward_MatchesCpuReference_OnEightDecodeSteps` 3m 56s) | Fused per-expert layout: `input_linear [E, 2*I, H]` packs w1 (rows `[0..I)`) + w3 (rows `[I..2*I)`), `output_linear [E, H, I]` packs w2. Each expert is upcast into its own F32 slab via `AllocPartAsF32`. No shared expert; typical top-k is unusually high (8 of 40). |
 | Alibaba Qwen3MoeHybrid | `Architecture.Qwen3MoeHybrid` | GGUF BPE (via `GgufBpeTokenizerFactory`) | RoPE NeoX (full-attn only) + MultiRope (`ggml_rope_multi`) | Hybrid: Gated DeltaNet (GDN) linear-attention recurrence on 38 of 40 layers + full GQA every 4th layer (`qwen35moe.full_attention_interval`); per-layer GDN state cache `[NVHead, DState, DState]` | yes: 256 routed experts top-8 + a sigmoid-gated shared expert on every layer; expert tensors stored as fused-per-projection (`ffn_{gate,up,down}_exps`) with per-expert byte stride | GGUF `general.architecture = qwen35moe` with `qwen35moe.full_attention_interval`, GDN config (`d_inner`, `n_v_head`, `n_k_head`, `d_state`, `d_conv`), MoE config (`n_routed_experts`, `n_shared_experts`, `n_experts_per_tok`, `expert_feed_forward_length`, `norm_topk_prob`) | **CPU bit-exact vs llama.cpp** — `Qwen3MoeHybridTransformerModelTests` (5/5 synthetic F32: GDN-only / mixed / shared-expert / GDN+full-attn / determinism); real Qwen3.6-35B-A3B-UD-Q6_K_XL GGUF top-1 token ("Ta") matches the `gguf-py` Python reference. **CUDA**: implementation landed (CudaQwen3MoeHybridTransformerModel, CudaGdnStateCache, on-device MoE dispatcher via CudaMoeFfn, F32 KV cache for full-attn layers) — real-GGUF GPU parity test pending hardware (29.6 GiB exceeds local 12 GiB). **Vulkan**: implementation landed (VulkanQwen3MoeHybridTransformerModel + 7 GDN compute shaders, multi-token scan, opt-in resident routed banks via `DOTLLM_VK_MOE_RESIDENT=1`) — real-GGUF parity test pending Strix Halo + glslc. | No plain-HF-safetensors path, but `Qwen3MoeHybridTransformerModel.LoadFromMach1Packed` (issue #266 Phase B) loads `SyzygyResearch/Mach-1-Additive-35B`'s non-GGUF additive-codec `packed/` layout, decoding to the same weight shapes with zero forward-pass changes — see the "No plain-HF-safetensors path" note below the quant matrix. CPU `Qwen3MoeHybridTransformerModel`'s GGUF path consumes the GGUF raw quant view directly (Q4_K / Q5_K / Q6_K / Q8_0 / Q5_0 / F32 / F16), eliminating the previous ~30 GiB per-forward dequant scratch (commit landed as Step 26). Each layer carries either a `GdnTokenMixingWeights` or a `Qwen3FullAttnWeights` plus a shared `Qwen3MoeLayerWeights`. Refer to `docs/ROADMAP.md` Phase 10 and `.planning/notes/qwen35moe-gdeltanet-architecture.md` for the full architecture map. |
 | HuggingFace SmolLM3 | `Architecture.SmolLM3` | HF tokenizer.json (BPE + ByteLevel) | RoPE NeoX (rotate_half) with optional dense-path YaRN (long-context SKUs) | GQA-4; per-layer `NoPE` gating via `ModelConfig.NoRopeLayers` | no | Llama set plus `no_rope_layers` mask (HF: 1=apply RoPE, 0=skip; surfaced as a SKIP-index list), optional `rope_scaling`. `architectures[0] = SmolLM3ForCausalLM` or `model_type = smollm3`. | `verified: tiny-random (synthetic)` — `SmolLM3SafetensorsLoadTests` synthesises a 4-layer Llama-shaped fixture and exercises three correctness invariants: AllNoPe-bit-identical-across-positions, NoNoPe-positions-affect-logits, and YaRN-at-position-beyond-origMax-diverges-from-baseline. Real-weight HuggingFaceTB/SmolLM3-3B test is gated (`~/.dotllm/test-cache/HuggingFaceTB/SmolLM3-3B/`) and returns early in CI. | Llama-shaped attention + SwiGLU FFN — the new code is the per-layer RoPE skip, the `RoPE.PrecomputeFrequencyTableYarn` wiring for the dense path (`TransformerModel.BuildFromPrebuiltWeightsInternal`), and the SmolLM3-style tool-call parsers (`XmlToolCallParser` + `PythonicToolCallParser`). |
+| OpenAI gpt-oss | `Architecture.GptOss` | gpt2-model BPE (`gpt-4o` o200k pre-tokenizer) | RoPE NeoX, theta 150000, dense YaRN (factor 32, original context 4096) | GQA (20b: 64Q/8KV, head_dim 64) with alternating sliding-window/dense pattern (window 128 on even layers, dense on odd — `SlidingWindowPattern=2`) plus per-head attention sinks | yes: routed MoE in **every** layer — 32 experts, top-4, router bias, softmax-after-top-k, clamped `swiglu_oai` activation, per-expert MXFP4 gate/up/down weights + bias | Llama set plus `attn_sinks.weight` per layer, `sliding_window`, MoE block, `rope_scaling` (`type=yarn`, `factor=32`, `original_context_length=4096`) | `verified: tiny-random (synthetic)` (CPU) — `TransformerModelGptOssForwardTests` exercises attention sinks, alternating SWA, and MXFP4 MoE together through a synthetic GGUF fixture; no real `gpt-oss-20b-mxfp4.gguf` checkpoint available locally for a real-weight run. **CUDA**: `planned` — alternating sliding-window attention and dense YaRN RoPE scaling are now implemented and kernel-level parity-verified against the CPU oracle on a real RTX 3060 (issue #366), but `CudaModelLoader.CreateFromGguf`'s `Architecture.GptOss` case still throws `NotSupportedException` pending per-head attention sinks (issue #365) — gpt-oss does not load end-to-end on CUDA yet. **Vulkan**: not implemented — no `GptOss` dispatch arm. | See the per-architecture note below and [docs/MODEL_CONFIG.md](MODEL_CONFIG.md) for the full tensor/field map. |
 
-**Row count: 14 / 14 `Architecture` enum variants covered.**
+**Row count: 15 / 21 `Architecture` enum variants covered.** (Not yet rowed:
+`NemotronHMoe`, `Qwen3HybridDense`, `Gemma3`, `Gemma4`, `DiffusionGemma`,
+`BitNet` — pre-existing gaps, out of scope for this update.)
 
 ## Per-architecture notes
 
@@ -267,6 +270,43 @@ reference (16 parity tests). Upload-path predicates land in
 (dense), `48d65fe` (Qwen3MoeHybrid), `146d747` (NemotronH), `ad6b853`
 (Mamba3) — IQ3 now usable end-to-end across all 4 Vulkan transformer
 hosts.
+
+### gpt-oss (`Architecture.GptOss`)
+OpenAI's gpt-oss-20b/120b GGUF architecture (`general.architecture = gpt-oss`,
+llama.cpp `LLM_ARCH_OPENAI_MOE`). Every layer combines GQA attention with a
+learned per-head attention-sink logit joining the softmax denominator and an
+alternating sliding-window/dense pattern (window 128 on even layers, dense on
+odd — `SlidingWindowPattern=2`); the FFN is a routed MoE in every layer (32
+experts, top-4, softmax-after-top-k, clamped `swiglu_oai` activation, MXFP4
+expert weights). See [docs/MODEL_CONFIG.md](MODEL_CONFIG.md) (gpt-oss
+section) for the full tensor/field map.
+
+**CPU**: fully implemented and exercised by a synthetic GGUF fixture
+(`TransformerModelGptOssForwardTests`) covering attention sinks, alternating
+SWA, and MXFP4 MoE together; no real `gpt-oss-20b-mxfp4.gguf` checkpoint is
+available locally for a real-weight run.
+
+**CUDA**: `CudaMoeFfn` already implements gpt-oss's MoE per-expert bias and
+clamped-SwiGLU activation (issue #348). Issue #366 closed the two remaining
+attention-path gaps, both kernel-level parity-verified against the CPU oracle
+on a real RTX 3060:
+- **Alternating sliding-window attention** — per-layer window resolution now
+  matches CPU semantics across every CUDA attention dispatch site.
+- **Dense YaRN RoPE scaling** — CUDA RoPE previously ignored `rope_scaling`
+  entirely, a ~34.7% Q/K divergence at position 0 for *any* dense-YaRN model
+  (not gpt-oss-specific — this also makes CUDA output for SmolLM3-128k and
+  Llama 3.1+ extended-context checkpoints correctly match CPU for the first
+  time; see those rows above, neither previously claimed CUDA parity so
+  nothing there was stale). Fixed via a host-precomputed inverse-frequency +
+  mscale upload sharing the CPU math as the single source of truth.
+
+`CudaModelLoader.CreateFromGguf`'s `Architecture.GptOss` case still throws
+`NotSupportedException` — per-head attention sinks are not yet implemented on
+CUDA (tracked in issue #365). **gpt-oss does not load on the CUDA backend
+yet**; lifting that guard is #365's deliverable, not this change's.
+
+**Vulkan**: no `GptOss` dispatch arm exists — not implemented on this
+backend.
 
 ## Legend
 
