@@ -131,11 +131,19 @@ internal sealed class CudaWeights : IDisposable
     /// Device buffer holding the dense-YaRN ramped inverse frequencies — <c>ropeDim / 2</c>
     /// F32 values produced by <see cref="RoPE.ComputeYarnInverseFrequencies"/>, the same
     /// routine the CPU reference uses inside <c>RoPE.PrecomputeFrequencyTableYarn</c>.
-    /// <c>0</c> when the model has no dense YaRN scaling
-    /// (<see cref="DotLLM.Core.PositionEncoding.RoPEConfig.IsDenseYarnActive"/> false, or an
-    /// MLA model, which carries its own YaRN cos/sin tables). The RoPE kernels treat 0 as
-    /// "compute frequencies from theta in-kernel", which is bit-identical to pre-#366
-    /// behaviour.
+    /// <c>0</c> when <see cref="DotLLM.Core.PositionEncoding.RoPEConfig.IsDenseYarnActive"/>
+    /// is false, and also for MLA models — which are excluded because they never reach the
+    /// kernels this buffer feeds: MLA runs a separate, table-driven RoPE path
+    /// (<c>CudaTransformerModel.EnsureMlaState</c> uploads its own cos/sin tables).
+    /// The RoPE kernels treat 0 as "compute frequencies from theta in-kernel", which is
+    /// bit-identical to pre-#366 behaviour.
+    /// <para>
+    /// <b>MLA's own dense-YaRN gap is NOT addressed by #366.</b> That path builds its tables
+    /// with the PLAIN <c>RoPE.PrecomputeFrequencyTable</c>, whereas the CPU MLA path uses
+    /// <c>RoPE.PrecomputeFrequencyTableYarn</c> — so CUDA MLA carries the same class of
+    /// CPU/CUDA divergence for DeepSeek-V2/V3 long context. Do not read the exclusion below
+    /// as "already handled". See <c>.docs/366-rope-scaling-findings.md</c>.
+    /// </para>
     /// </summary>
     /// <remarks>
     /// An inverse-frequency vector rather than a position-indexed cos/sin table: it is
@@ -594,8 +602,15 @@ internal sealed class CudaWeights : IDisposable
     private static unsafe (nint InvFreqDevice, float Mscale) UploadDenseYarnInvFreq(
         ModelConfig config, List<nint> allocs)
     {
-        // MLA models rebuild their own YaRN cos/sin tables (CudaTransformerModel's MLA
-        // state); this dense path must not double-apply on top of them.
+        // MLA is excluded because it never consumes the kernels this buffer feeds — it runs
+        // a separate, table-driven RoPE path whose cos/sin tables CudaTransformerModel
+        // uploads itself. NOT because MLA's YaRN is already handled: that path calls the
+        // PLAIN RoPE.PrecomputeFrequencyTable (CudaTransformerModel.cs, EnsureMlaState),
+        // while the CPU MLA path calls RoPE.PrecomputeFrequencyTableYarn
+        // (TransformerModel.cs, the MlaConfig.RopeScalingFactor branch). CUDA MLA therefore
+        // has the SAME class of CPU/CUDA divergence #366 closes for the dense path, and it
+        // remains OPEN — tracked in .docs/366-rope-scaling-findings.md. Wiring it here would
+        // be wrong (different kernels); it needs the MLA table build to switch routines.
         if (config.MlaConfig is not null) return (0, 1.0f);
         if (config.RoPEConfig is not DotLLM.Core.PositionEncoding.RoPEConfig rope) return (0, 1.0f);
         if (!rope.IsDenseYarnActive) return (0, 1.0f);
