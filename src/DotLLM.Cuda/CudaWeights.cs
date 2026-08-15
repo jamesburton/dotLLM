@@ -127,6 +127,33 @@ internal sealed class CudaWeights : IDisposable
     /// </summary>
     public CudaGemma4LayerWeights?[]? Gemma4Layers { get; }
 
+    /// <summary>
+    /// Device buffer holding the dense-YaRN ramped inverse frequencies — <c>ropeDim / 2</c>
+    /// F32 values produced by <see cref="RoPE.ComputeYarnInverseFrequencies"/>, the same
+    /// routine the CPU reference uses inside <c>RoPE.PrecomputeFrequencyTableYarn</c>.
+    /// <c>0</c> when the model has no dense YaRN scaling
+    /// (<see cref="DotLLM.Core.PositionEncoding.RoPEConfig.IsDenseYarnActive"/> false, or an
+    /// MLA model, which carries its own YaRN cos/sin tables). The RoPE kernels treat 0 as
+    /// "compute frequencies from theta in-kernel", which is bit-identical to pre-#366
+    /// behaviour.
+    /// </summary>
+    /// <remarks>
+    /// An inverse-frequency vector rather than a position-indexed cos/sin table: it is
+    /// <c>ropeDim/2</c> floats regardless of context length (no max-sequence-length sizing
+    /// and no chance of an out-of-range row read), and the kernels already index by
+    /// <c>positions[t]</c>. The kernel then evaluates the identical expression the CPU
+    /// table stores, <c>cos/sin(pos * invFreq[i]) * mscale</c>.
+    /// </remarks>
+    public nint RopeYarnInvFreqDevice { get; }
+
+    /// <summary>
+    /// Dense-YaRN cos/sin multiplier (mscale) matching
+    /// <see cref="DotLLM.Core.PositionEncoding.RoPEConfig.ComputeYarnMscaleMultiplier"/>.
+    /// <c>1.0f</c> when YaRN is inactive — an exact IEEE identity multiply, so the
+    /// non-YaRN path is unchanged bit-for-bit.
+    /// </summary>
+    public float RopeYarnMscale { get; }
+
     public nint TokenEmbedDevice { get; }
     public QuantizationType TokenEmbedQuantType { get; }
     public nint OutputNormWeight { get; }
@@ -144,8 +171,11 @@ internal sealed class CudaWeights : IDisposable
                           List<nint> allocs,
                           CudaMlaLayerWeights[]? mlaLayers,
                           CudaMoeLayerWeights?[]? moeLayers,
-                          CudaGemma4LayerWeights?[]? gemma4Layers)
+                          CudaGemma4LayerWeights?[]? gemma4Layers,
+                          nint ropeYarnInvFreq, float ropeYarnMscale)
     {
+        RopeYarnInvFreqDevice = ropeYarnInvFreq;
+        RopeYarnMscale = ropeYarnMscale;
         Layers = layers;
         TokenEmbedDevice = tokenEmbed;
         TokenEmbedQuantType = tokenEmbedQt;
@@ -514,10 +544,19 @@ internal sealed class CudaWeights : IDisposable
                 cpuWeights.OutputOutputDim, cpuWeights.OutputInputDim, allocs);
         }
 
+        // Dense-YaRN inverse frequencies (#366). The CUDA RoPE kernels previously derived
+        // every frequency from theta alone, silently dropping rope.scaling.* — for gpt-oss
+        // (yarn, factor=32, orig_ctx=4096) that is wrong from position 0, because YaRN's
+        // mscale multiplies cos AND sin at every position. Mirrors the CPU gate in
+        // TransformerModel.BuildFromPrebuiltWeightsInternal: dense path only (MLA models
+        // carry their own YaRN cos/sin tables through CudaTransformerModel's MLA state).
+        var (ropeYarnInvFreq, ropeYarnMscale) = UploadDenseYarnInvFreq(config, allocs, stream);
+
         return new CudaWeights(layers, tokenEmbed, tokenEmbedQt,
             outputNorm, outputWeight, cpuWeights.OutputOutputDim, cpuWeights.OutputInputDim,
             outputWeightQuant, cpuWeights.OutputQuantType, allocs,
-            mlaLayers, moeLayers, gemma4Layers);
+            mlaLayers, moeLayers, gemma4Layers,
+            ropeYarnInvFreq, ropeYarnMscale);
         }
         catch
         {
@@ -534,6 +573,56 @@ internal sealed class CudaWeights : IDisposable
     private static void FreeDeviceIfNonZero(nint ptr)
     {
         if (ptr != 0) CudaDriverApi.cuMemFree_v2(ptr);
+    }
+
+    /// <summary>
+    /// Computes and uploads the dense-YaRN ramped inverse frequencies for
+    /// <paramref name="config"/>, returning the device pointer and the companion mscale
+    /// multiplier. Returns <c>(0, 1.0f)</c> — the "no scaling" sentinel the RoPE kernels
+    /// treat as bit-identical to their pre-#366 behaviour — when the model has no dense
+    /// YaRN scaling.
+    /// </summary>
+    /// <remarks>
+    /// The ramp math is NOT reimplemented here: it comes from
+    /// <see cref="RoPE.ComputeYarnInverseFrequencies"/>, the same routine the CPU reference
+    /// path uses inside <c>RoPE.PrecomputeFrequencyTableYarn</c>, and the mscale convention
+    /// comes from <see cref="DotLLM.Core.PositionEncoding.RoPEConfig.ComputeYarnMscaleMultiplier"/>.
+    /// Both are shared with the CPU so the two backends cannot drift.
+    /// The allocation is appended to <paramref name="allocs"/> (the #383 ledger), so it is
+    /// released both by the mid-load failure unwind and by <see cref="Dispose"/>.
+    /// </remarks>
+    private static unsafe (nint InvFreqDevice, float Mscale) UploadDenseYarnInvFreq(
+        ModelConfig config, List<nint> allocs, nint stream)
+    {
+        // MLA models rebuild their own YaRN cos/sin tables (CudaTransformerModel's MLA
+        // state); this dense path must not double-apply on top of them.
+        if (config.MlaConfig is not null) return (0, 1.0f);
+        if (config.RoPEConfig is not DotLLM.Core.PositionEncoding.RoPEConfig rope) return (0, 1.0f);
+        if (!rope.IsDenseYarnActive) return (0, 1.0f);
+
+        // Same rope-width derivation as the CPU (TransformerModel, non-MLA branch) and as
+        // CudaTransformerModel's _ropeDim — these must agree or the kernel would index a
+        // differently-sized inverse-frequency vector.
+        int ropeDim = rope.DimensionCount != 0 ? rope.DimensionCount : config.HeadDim;
+        if (ropeDim == 0) ropeDim = config.HeadDim;
+        if (ropeDim <= 0 || ropeDim % 2 != 0) return (0, 1.0f);
+
+        int halfDim = ropeDim / 2;
+        float[] invFreq = new float[halfDim];
+        RoPE.ComputeYarnInverseFrequencies(
+            ropeDim, rope.Theta, rope.ScalingFactor, rope.OrigMaxSeqLen,
+            rope.BetaFast, rope.BetaSlow, invFreq);
+
+        long bytes = (long)halfDim * sizeof(float);
+        nint devPtr;
+        fixed (float* p = invFreq)
+            devPtr = AllocAndUpload((nint)p, bytes, allocs);
+
+        // AllocAndUpload issues a synchronous HtoD copy, but sync alongside the surrounding
+        // uploads so the buffer is guaranteed visible before the first forward.
+        CudaDriverApi.cuStreamSynchronize(stream).ThrowOnError();
+
+        return (devPtr, rope.ComputeYarnMscaleMultiplier(config.Architecture));
     }
 
     /// <summary>Upload raw quantized weight bytes to GPU (no dequant). For decode quantized GEMV.</summary>

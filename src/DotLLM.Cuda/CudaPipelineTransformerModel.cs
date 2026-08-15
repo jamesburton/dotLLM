@@ -485,8 +485,10 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
             if (lw.KNormWeight != 0)
                 _kernels.LaunchPerHeadRmsNorm(_state.K, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
 
+            // Dense-YaRN scaling (#366) rides on the weights bundle; (0, 1.0f) when inactive.
             _kernels.LaunchRoPE(_state.Q, _state.K, _state.PositionsDevice,
-                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _ropeType, s);
+                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _ropeType, s,
+                _weights.RopeYarnInvFreqDevice, _weights.RopeYarnMscale);
 
             if (kvCache is not null)
             {

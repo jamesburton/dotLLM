@@ -2226,11 +2226,21 @@ public sealed unsafe class CudaKernels : IDisposable
     /// for the standard <c>ropeDim/2</c> (Qwen3 / NemotronH / Llama — matches CPU
     /// <c>RoPE.Execute</c>); pass <c>headDim/2</c> for Gemma-4 partial global layers (matches CPU
     /// <c>RoPE.ApplyRotationNeoXPartial</c>).
+    /// <para>
+    /// <paramref name="ropeInvFreq"/> / <paramref name="ropeMscale"/> carry the dense-YaRN
+    /// scaling (#366): a device buffer of <c>ropeDim/2</c> floats holding the ramped
+    /// inverse frequencies produced by <c>RoPE.ComputeYarnInverseFrequencies</c>, plus the
+    /// cos/sin multiplier from <c>RoPEConfig.ComputeYarnMscaleMultiplier</c>. The defaults
+    /// (<c>0</c> / <c>1.0f</c>) select the kernel's original in-kernel
+    /// <c>powf(theta, ...)</c> and are bit-identical to the pre-#366 behaviour. When
+    /// <paramref name="ropeInvFreq"/> is non-zero it supersedes <paramref name="freqDim"/>.
+    /// </para>
     /// </summary>
     public void LaunchRoPEF32(nint q, nint k, nint positions,
                                 int seqLen, int numHeads, int numKvHeads, int headDim,
                                 int ropeDim, float theta, int ropeType, nint stream,
-                                int freqDim = 0, int neoxPairOffset = 0)
+                                int freqDim = 0, int neoxPairOffset = 0,
+                                nint ropeInvFreq = 0, float ropeMscale = 1.0f)
     {
         nint qArg = q, kArg = k, posArg = positions;
         int slArg = seqLen, nhArg = numHeads, nkvArg = numKvHeads;
@@ -2238,9 +2248,12 @@ public sealed unsafe class CudaKernels : IDisposable
         int fdArg = freqDim; // 0 ⇒ kernel falls back to rope_dim
         int npoArg = neoxPairOffset; // 0 ⇒ kernel falls back to rope_dim/2 (standard)
         float thetaArg = theta;
+        nint invFreqArg = ropeInvFreq; // 0 ⇒ nullptr ⇒ in-kernel powf(theta, ...)
+        float mscaleArg = ropeMscale;
 
         void** args = stackalloc void*[] {&qArg, &kArg, &posArg, &slArg, &nhArg, &nkvArg,
-                        &hdArg, &rdArg, &thetaArg, &rtArg, &fdArg, &npoArg};
+                        &hdArg, &rdArg, &thetaArg, &rtArg, &fdArg, &npoArg,
+                        &invFreqArg, &mscaleArg};
 
         int halfRope = ropeDim / 2;
         int totalPairs = seqLen * Math.Max(numHeads, numKvHeads) * halfRope;
@@ -3827,18 +3840,26 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
-    /// <summary>Rotary position embedding. In-place on Q and K.</summary>
+    /// <summary>
+    /// Rotary position embedding. In-place on Q and K.
+    /// <paramref name="ropeInvFreq"/> / <paramref name="ropeMscale"/> carry the dense-YaRN
+    /// scaling (#366) — see <see cref="LaunchRoPEF32"/> for the contract. The defaults
+    /// (<c>0</c> / <c>1.0f</c>) are bit-identical to the pre-#366 behaviour.
+    /// </summary>
     public void LaunchRoPE(nint q, nint k, nint positions,
                             int seqLen, int numHeads, int numKvHeads, int headDim,
-                            int ropeDim, float theta, int ropeType, nint stream)
+                            int ropeDim, float theta, int ropeType, nint stream,
+                            nint ropeInvFreq = 0, float ropeMscale = 1.0f)
     {
         nint qArg = q, kArg = k, posArg = positions;
         int slArg = seqLen, nhArg = numHeads, nkvArg = numKvHeads;
         int hdArg = headDim, rdArg = ropeDim, rtArg = ropeType;
         float thetaArg = theta;
+        nint invFreqArg = ropeInvFreq;
+        float mscaleArg = ropeMscale;
 
         void** args = stackalloc void*[] {&qArg, &kArg, &posArg, &slArg, &nhArg, &nkvArg,
-                        &hdArg, &rdArg, &thetaArg, &rtArg};
+                        &hdArg, &rdArg, &thetaArg, &rtArg, &invFreqArg, &mscaleArg};
 
         int halfRope = ropeDim / 2;
         int totalPairs = seqLen * Math.Max(numHeads, numKvHeads) * halfRope;
@@ -4337,6 +4358,14 @@ public sealed unsafe class CudaKernels : IDisposable
     /// Q is rotated in place on <paramref name="qSrc"/>; K is rotated and the rotated row
     /// is written to <paramref name="kCacheBase"/><c> + cachePos * kvStride</c>; V is plain-copied
     /// to <paramref name="vCacheBase"/><c> + cachePos * kvStride</c>.
+    /// <para>
+    /// <paramref name="ropeInvFreq"/> / <paramref name="ropeMscale"/> carry the dense-YaRN
+    /// scaling (#366) — see <see cref="LaunchRoPEF32"/> for the contract. This launcher is
+    /// the one that matters most for YaRN: decode takes it by default, so leaving it
+    /// unscaled would mis-rotate every generated token. Both values are model constants,
+    /// so baking them into a captured CUDA graph is safe (the per-step values — positions
+    /// and cache row — are already read from device memory by the Dyn variant).
+    /// </para>
     /// </summary>
     public void LaunchFusedRopeKvWriteF16(
         nint qSrc, nint kSrc, nint vSrc,
@@ -4344,7 +4373,7 @@ public sealed unsafe class CudaKernels : IDisposable
         nint positionsDevice, int cachePos,
         int numHeads, int numKvHeads, int headDim,
         int ropeDim, int kvStride, float theta, int ropeType,
-        nint stream)
+        nint stream, nint ropeInvFreq = 0, float ropeMscale = 1.0f)
     {
         if (_fusedRopeKvWriteModule == null)
             throw new InvalidOperationException(
@@ -4358,13 +4387,16 @@ public sealed unsafe class CudaKernels : IDisposable
         int rdArg = ropeDim, kvStrideArg = kvStride;
         float thetaArg = theta;
         int rtArg = ropeType;
+        nint invFreqArg = ropeInvFreq;
+        float mscaleArg = ropeMscale;
 
         void** args = stackalloc void*[] {
             &qArg, &kArg, &vArg, &kCacheArg, &vCacheArg,
             &posArg, &cachePosArg,
             &nhArg, &nkvArg, &hdArg,
             &rdArg, &kvStrideArg,
-            &thetaArg, &rtArg
+            &thetaArg, &rtArg,
+            &invFreqArg, &mscaleArg
         };
 
         int halfRope = ropeDim / 2;
@@ -4391,7 +4423,7 @@ public sealed unsafe class CudaKernels : IDisposable
         nint positionsDevice, nint cachePosPtr,
         int numHeads, int numKvHeads, int headDim,
         int ropeDim, int kvStride, float theta, int ropeType,
-        nint stream)
+        nint stream, nint ropeInvFreq = 0, float ropeMscale = 1.0f)
     {
         if (_fusedRopeKvWriteModule == null)
             throw new InvalidOperationException(
@@ -4405,13 +4437,16 @@ public sealed unsafe class CudaKernels : IDisposable
         int rdArg = ropeDim, kvStrideArg = kvStride;
         float thetaArg = theta;
         int rtArg = ropeType;
+        nint invFreqArg = ropeInvFreq;
+        float mscaleArg = ropeMscale;
 
         void** args = stackalloc void*[] {
             &qArg, &kArg, &vArg, &kCacheArg, &vCacheArg,
             &posArg, &cachePosPtrArg,
             &nhArg, &nkvArg, &hdArg,
             &rdArg, &kvStrideArg,
-            &thetaArg, &rtArg
+            &thetaArg, &rtArg,
+            &invFreqArg, &mscaleArg
         };
 
         int halfRope = ropeDim / 2;

@@ -33,6 +33,13 @@ public sealed unsafe class CudaTransformerModel : IModel
     private readonly float _ropeTheta;
     private readonly int _ropeDim;
     private readonly int _ropeType;
+    // Dense-YaRN scaling (#366). _ropeYarnInvFreq is CudaWeights' [_ropeDim/2] device
+    // buffer of ramped inverse frequencies (0 when the model has no dense YaRN), and
+    // _ropeYarnMscale the companion cos/sin multiplier (1.0f when inactive). Every RoPE
+    // launch on this model's paths threads both through; the (0, 1.0f) pair is the
+    // kernels' bit-identical no-scaling sentinel. Owned by CudaWeights — do NOT free here.
+    private readonly nint _ropeYarnInvFreq;
+    private readonly float _ropeYarnMscale;
     private readonly bool _useHighPrecisionForward;
 
     /// <summary>
@@ -391,6 +398,8 @@ public sealed unsafe class CudaTransformerModel : IModel
         _deviceId = deviceId;
         _ropeTheta = ropeTheta;
         _ropeDim = ropeDim;
+        _ropeYarnInvFreq = weights.RopeYarnInvFreqDevice;
+        _ropeYarnMscale = weights.RopeYarnMscale;
         VramWarning = vramWarning;
         _ropeType = ropeType;
 
@@ -1192,7 +1201,7 @@ public sealed unsafe class CudaTransformerModel : IModel
                     layer,
                     numHeads, numKvHeads, headDim,
                     _ropeDim, _ropeTheta, effectiveRopeType,
-                    s, _kernels);
+                    s, _kernels, _ropeYarnInvFreq, _ropeYarnMscale);
                 MarkProfile(ProfileCategory.RopeAndExtras);
                 int seqKv = cudaKvCache.CurrentLength;
                 MarkProfile(ProfileCategory.KvUpdate);
@@ -1207,7 +1216,8 @@ public sealed unsafe class CudaTransformerModel : IModel
                 // Eager fallback path (prefill seqLen>1, quantized KV, or no fused kernel).
                 _kernels.LaunchRoPE(qPtr, kPtr, _state.PositionsDevice,
                     seqLen, numHeads, numKvHeads, headDim,
-                    _ropeDim, _ropeTheta, effectiveRopeType, s);
+                    _ropeDim, _ropeTheta, effectiveRopeType, s,
+                    _ropeYarnInvFreq, _ropeYarnMscale);
                 MarkProfile(ProfileCategory.RopeAndExtras);
 
                 // Dispatch G3 (cuBLAS tensor-core prefill attention) when the call is a
@@ -2089,13 +2099,15 @@ public sealed unsafe class CudaTransformerModel : IModel
                         kvCache.GetKeysPtr(layer), kvCache.GetValuesPtr(layer),
                         _state.PositionsDevice, _decodePosDevice,
                         numHeads, numKvHeads, headDim,
-                        _ropeDim, kvCache.KvStrideOf(layer), _ropeTheta, effectiveRopeType, s);
+                        _ropeDim, kvCache.KvStrideOf(layer), _ropeTheta, effectiveRopeType, s,
+                        _ropeYarnInvFreq, _ropeYarnMscale);
                 }
                 else
                 {
                     _kernels.LaunchRoPE(qPtr, kPtr, _state.PositionsDevice,
                         seqLen, numHeads, numKvHeads, headDim,
-                        _ropeDim, _ropeTheta, effectiveRopeType, s);
+                        _ropeDim, _ropeTheta, effectiveRopeType, s,
+                        _ropeYarnInvFreq, _ropeYarnMscale);
 
                     // KV-cache update via device-resident position; replaces the eager
                     // path's cuMemcpyDtoDAsync (which would bake the dst address).
@@ -2377,7 +2389,8 @@ public sealed unsafe class CudaTransformerModel : IModel
                 int effectiveRopeType = DebugRopeTypeOverride >= 0 ? DebugRopeTypeOverride : _ropeType;
                 _kernels.LaunchRoPE(qPtr, kPtr, _state.PositionsDevice,
                     seqLen, numHeads, numKvHeads, headDim,
-                    _ropeDim, _ropeTheta, effectiveRopeType, s);
+                    _ropeDim, _ropeTheta, effectiveRopeType, s,
+                    _ropeYarnInvFreq, _ropeYarnMscale);
 
                 // KV-cache update (FP16 ring write + predicated quantize-on-evict),
                 // device-side eviction state.
@@ -2723,7 +2736,8 @@ public sealed unsafe class CudaTransformerModel : IModel
 
             int effectiveRopeType = DebugRopeTypeOverride >= 0 ? DebugRopeTypeOverride : _ropeType;
             _kernels.LaunchRoPEF32(_state.QF32, _state.KF32, _state.PositionsDevice,
-                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, effectiveRopeType, s);
+                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, effectiveRopeType, s,
+                ropeInvFreq: _ropeYarnInvFreq, ropeMscale: _ropeYarnMscale);
 
             _kernels.LaunchAttentionF32(_state.QF32, _state.KF32, _state.VF32, _state.AttnOutputF32,
                 seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s);
