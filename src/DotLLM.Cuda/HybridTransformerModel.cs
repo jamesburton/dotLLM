@@ -479,7 +479,6 @@ public sealed unsafe class HybridTransformerModel : IModel
         int vocabSize = Config.VocabSize;
         int kvStride = numKvHeads * headDim;
         float eps = Config.NormEpsilon;
-        int slidingWindow = Config.SlidingWindowSize ?? 0;
         int h = sizeof(ushort); // FP16 element size
 
         int totalLayers = Config.NumLayers;
@@ -544,6 +543,14 @@ public sealed unsafe class HybridTransformerModel : IModel
         {
             ref readonly var lw = ref _gpuWeights.Layers[layer];
 
+            // Per-layer window: gpt-oss alternates window/dense (pattern=2), Gemma-3 uses
+            // pattern=6; uniform-window and no-window models resolve identically to the old
+            // hoisted value. 0 = dense (kernel convention). Mirrors CPU GetLayerSlidingWindow.
+            // `layer` is the absolute (global) index (GPU phase = global layers 0..gpuLayers-1).
+            int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                Config.SlidingWindowSize, Config.SlidingWindowPattern,
+                Config.PerLayerSlidingWindow, layer);
+
             // ── ATTENTION BLOCK ──
             ProjectGpu(lw.QQuant, lw.QQuantType, lw.Q, _gpuState.NormOutput, _gpuState.Q,
                 lw.QOutputDim, lw.QInputDim, seqLen);
@@ -573,8 +580,10 @@ public sealed unsafe class HybridTransformerModel : IModel
             if (lw.KNormWeight != 0)
                 _kernels.LaunchPerHeadRmsNorm(_gpuState.K, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
 
+            // Dense-YaRN scaling (#366) rides on the weights bundle; (0, 1.0f) when inactive.
             _kernels.LaunchRoPE(_gpuState.Q, _gpuState.K, _gpuState.PositionsDevice,
-                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _gpuRopeType, s);
+                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _gpuRopeType, s,
+                _gpuWeights.RopeYarnInvFreqDevice, _gpuWeights.RopeYarnMscale);
 
             // KV-cache update + Attention
             var gpuKvCache = hybridKvCache?.GpuCache;

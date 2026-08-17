@@ -457,7 +457,6 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         int intermediateSize = Config.IntermediateSize;
         int vocabSize = Config.VocabSize;
         float eps = Config.NormEpsilon;
-        int slidingWindow = Config.SlidingWindowSize ?? 0;
         int h = sizeof(ushort); // FP16 element size
 
         _context.MakeCurrent();
@@ -498,6 +497,15 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
             ref readonly var lw = ref _cudaWeights.Layers[localLayer];
             int cacheLayer = localLayer;
 
+            // Per-layer window: gpt-oss alternates window/dense (pattern=2), Gemma-3 uses
+            // pattern=6; uniform-window and no-window models resolve identically to the old
+            // hoisted value. 0 = dense (kernel convention). Mirrors CPU GetLayerSlidingWindow.
+            // `layer` is the absolute (global) index (CUDA phase = global layers
+            // _numVulkanLayers..totalLayers-1).
+            int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                Config.SlidingWindowSize, Config.SlidingWindowPattern,
+                Config.PerLayerSlidingWindow, layer);
+
             // ── ATTENTION BLOCK ──
             Project(lw.QQuant, lw.QQuantType, lw.Q, _cudaState.NormOutput, _cudaState.Q,
                 lw.QOutputDim, lw.QInputDim, seqLen, s, cublasH);
@@ -515,8 +523,10 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
             if (lw.KNormWeight != 0)
                 _kernels.LaunchPerHeadRmsNorm(_cudaState.K, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
 
+            // Dense-YaRN scaling (#366) rides on the weights bundle; (0, 1.0f) when inactive.
             _kernels.LaunchRoPE(_cudaState.Q, _cudaState.K, _cudaState.PositionsDevice,
-                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _ropeType, s);
+                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _ropeType, s,
+                _cudaWeights.RopeYarnInvFreqDevice, _cudaWeights.RopeYarnMscale);
 
             if (cudaKvCache is not null)
             {
