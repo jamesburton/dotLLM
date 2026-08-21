@@ -200,19 +200,34 @@ internal sealed class CudaWeights : IDisposable
     /// disposes <paramref name="cpuWeights"/>. The caller MUST pass null whenever it retains
     /// <paramref name="cpuWeights"/> for a CPU-side forward.
     /// </param>
+    /// <param name="skipOutputHead">
+    /// When <c>true</c>, the output norm + LM head (and the head's quantized decode copy) are not
+    /// uploaded even though this window reaches the last layer, exactly as if the window stopped
+    /// short of it. For a caller that applies the head elsewhere — the layer-cycling perplexity
+    /// windows, which always run the head on the host so that logits are produced for every row
+    /// (issue #395) — the head is otherwise pure dead VRAM on the one window that happens to contain
+    /// the final layer, enough to OOM the last window of a cycle whose earlier windows all fit.
+    /// Measured per-window on Llama-3.2-1B-Q8_0 via <c>cuMemGetInfo_v2</c> around the same window
+    /// built both ways: <b>268 MiB</b>, matching the <c>vocab x hidden</c> arithmetic for the raw
+    /// quantized copy (no FP16 copy is made when a GEMV kernel is loaded for the head's quant type).
+    /// It scales with <c>vocab x hidden</c>, so it is materially larger on a 27-30B model. Default
+    /// <c>false</c> preserves the existing "final window owns the head" behavior.
+    /// </param>
     public static CudaWeights LoadFromGguf(TransformerWeights cpuWeights, ModelConfig config,
                                               CudaKernels kernels, nint stream,
                                               int numGpuLayers = -1, int firstLayer = 0,
                                               bool skipTokenEmbed = false,
-                                              Action<nint>? onHostTensorUploaded = null)
+                                              Action<nint>? onHostTensorUploaded = null,
+                                              bool skipOutputHead = false)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(firstLayer);
         int layerCount = numGpuLayers < 0
             ? config.NumLayers - firstLayer
             : Math.Min(numGpuLayers, config.NumLayers - firstLayer);
-        // isHybrid: the CUDA upload covers only a contiguous slice of the full model,
-        // so it does NOT own the output norm + LM head (caller owns them separately).
-        bool isHybrid = (firstLayer + layerCount) < config.NumLayers;
+        // isHybrid: this upload does NOT own the output norm + LM head, because either it covers
+        // only a contiguous slice of the full model (the caller owns the tail), or the caller has
+        // said outright that it applies the head itself (skipOutputHead).
+        bool isHybrid = (firstLayer + layerCount) < config.NumLayers || skipOutputHead;
 
         var allocs = new List<nint>();
         // #383: `allocs` already tracked every device buffer this method (and the MLA/MoE/

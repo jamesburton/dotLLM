@@ -301,7 +301,9 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
     /// <summary>
     /// Builds a stage on CUDA device <paramref name="deviceId"/> from shared host weights, uploading only
     /// the window <c>[firstLayer .. firstLayer+layerCount)</c>. The output norm + LM head are uploaded iff
-    /// the window reaches the last layer (see <see cref="CudaWeights.LoadFromGguf"/>). Pass
+    /// the window reaches the last layer <em>and</em> <paramref name="isFinalStage"/> is set — a stage that
+    /// owns the last layer but does not apply the head (the layer-cycling perplexity windows, which run the
+    /// head on the host) does not pay VRAM for it. Pass
     /// <paramref name="skipTokenEmbed"/> for a non-first stage: the embedding table is not uploaded and
     /// <see cref="EnqueueFromEmbedding"/> throws — the stage must be entered via
     /// <see cref="EnqueueFromHidden"/>.
@@ -327,8 +329,15 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
             cublas.SetStream(stream);
             kernels = new CudaKernels(ptxDir);
 
+            // skipOutputHead is driven by isFinalStage, not by the layer range. A stage that owns
+            // the last layer but is NOT the final stage (the layer-cycling perplexity windows, which
+            // always apply the head on the host — issue #395) would otherwise upload an output norm
+            // + LM head it never launches: 268 MiB measured on Llama-3.2-1B-Q8_0, scaling with
+            // vocab x hidden, which is enough to OOM the last window of a cycle whose earlier
+            // windows all fit.
             weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
-                numGpuLayers: layerCount, firstLayer: firstLayer, skipTokenEmbed: skipTokenEmbed);
+                numGpuLayers: layerCount, firstLayer: firstLayer, skipTokenEmbed: skipTokenEmbed,
+                skipOutputHead: !isFinalStage);
 
             state = new CudaForwardState(
                 config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,

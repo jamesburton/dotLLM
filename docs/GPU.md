@@ -495,6 +495,136 @@ GPU layers compute in FP16 (Half precision). At the boundary, the hidden state i
 - `CudaQuantizedKvCache` — Q8_0/Q4_0 GPU KV-cache with FP16 scratch-buffer attention (see [KV_CACHE.md](KV_CACHE.md))
 - `CudaWeights.LoadFromGguf(numGpuLayers)` — Partial weight upload to VRAM
 
+## Measuring a model larger than the device: windowed offload and layer cycling
+
+`dotllm perplexity` can score a model that does not fit on the GPU. Three placements, in increasing
+order of what they buy and cost:
+
+| Flags | Placement | Use when |
+|---|---|---|
+| `--device cuda --gpu-layers N` | GPU `[0..N)`, CPU `[N..L)` | The usual partial offload. Only exercises a *prefix* of the trunk on the GPU, and see the sliding-window caveat below. |
+| `--device cuda --gpu-layers N --first-layer K` | CPU `[0..K)`, GPU `[K..K+N)`, CPU `[K+N..L)` | You need a *specific* slice of the trunk on the GPU — e.g. verifying the deep layers of a model whose prefix already passed. |
+| `--device cuda --gpu-layers N --cycle` | GPU window of `N` layers slid across the whole trunk | Full-coverage GPU verification of a model too large for the device. |
+
+### Prefix offload scores teacher-forced only
+
+`HybridTransformerModel` returns logits for the **last row only**, so `--gpu-layers` without
+`--cycle` cannot run sliding-window mode and falls to the O(n²) growing-prefix teacher-forced path.
+That is expensive: on Llama-3.2-1B, 64 tokens took 235 s that way, against 19.8 s for 400 tokens
+cycled. Cycling is unaffected — its host-side output head produces every row — which is a second
+reason to prefer it whenever the model is dense enough to use it.
+
+### Why cycling exists
+
+Naive full coverage means re-running the whole corpus once per window: `ceil(L/N)` passes, each
+bottlenecked by the CPU half. Cycling instead makes one logical pass:
+
+1. Load layers `[0..N)`. Run the corpus. Save the hidden state at the cut for every scored window.
+2. Load `[N..2N)`. Replay from the **saved boundary activations** rather than from token embeddings.
+   Save the next boundary.
+3. Repeat to the final window; then apply the output head and score.
+
+Every layer is GPU-executed exactly once and no layer is ever executed on CPU, so the cost is roughly
+one GPU-speed pass plus checkpoint traffic instead of `N x` a CPU-dominated pass.
+
+Checkpoint volume is `windows x context x hidden x 4 B`, held in host RAM, with two boundaries alive
+at a time (the one being read and the one being written). A full wikitext-2 sweep
+(655 windows x 512 tokens) at `hidden = 2688` is ~3.6 GB per boundary. Spilling boundaries to disk is
+not implemented.
+
+### What cycling does and does not tell you
+
+- The output head (final norm + LM head) runs on the **host**, not on the device. Device layer
+  windows return only a hidden state, and sliding-window scoring needs logits for every row rather
+  than the last row the device forward paths are optimised for. Every transformer *layer* still runs
+  on the GPU; the head is one GEMM against a weight that is negligible next to a layer window.
+- **End-perplexity is a weak backend discriminator.** Each window blends host and device arithmetic,
+  and a bias affecting all layers uniformly can partially cancel. If you are hunting a device
+  numerics defect rather than measuring model quality, diff the saved boundary activations against a
+  CPU reference at the cut — those tensors are exactly what cycling already computes.
+- The result table always prints a `Layer placement` row, on whole-device runs too, so a scraped
+  table cannot report a split or cycled run as a single-device one.
+- `--per-window`, `--tokens-file`, `--bos`, `--stride` and `--unscored-prefix` behave identically in
+  cycling mode: the final scoring pass is the ordinary `PerplexityEvaluator` running against the
+  saved boundaries, and both the cycling passes and the scoring pass walk the same
+  `PerplexityWindowPlan`.
+
+### Recurrent architectures
+
+Recurrent state (Mamba/SSM conv + state, Gated DeltaNet) is **not** carried across a layer cut, and
+deliberately so. State is per layer, and each layer belongs to exactly one layer window that replays
+the whole corpus in window order — so the state a layer must start corpus window `w` with is zero, in
+a cycled run and a whole-device run alike. What the checkpoint has to carry across the cut is the
+hidden state only.
+
+What *does* break hybrids is a layer-window pass that forgets to reset recurrent state between corpus
+windows — issue #261's failure, multiplied, because each pass replays the whole corpus.
+`ILayerWindowExecutor.ResetState()` is called before every corpus window in every pass for that
+reason, and `LayerCyclingPerplexityTests` asserts both that a cycled run equals a whole-model run on
+a recurrent fixture and that dropping the reset changes the number.
+
+### Scope
+
+The CUDA layer-window executor is built on `CudaPipelineStage`, whose layer loop is standard dense /
+GQA causal only — no MLA, no MoE, no gemma4, no recurrent layers. Unsupported architectures are
+rejected at load with a named error rather than scored. Hybrid/MoE architectures can still be scored
+with `--gpu-layers` prefix offload, and are covered on CPU by the layer-window engine.
+
+**Scaled RoPE is rejected too, and for a less obvious reason.** Every other rejection covers a feature
+that changes the layer graph. Scaled RoPE (YaRN / linear / NTK / LongRoPE) does not — it changes the
+*frequency table* — so it would clear every structural check and then be scored with the **unscaled**
+table, because `CudaPipelineStage` passes only theta / dim / type to `LaunchRoPE` while the CPU
+reference applies the full correction. Note this is a **pre-existing, backend-wide** gap: whole-device
+`--device cuda` is equally unscaled today. The rejection keeps the layer-window guard's promise; it
+does not fix CUDA RoPE scaling. Llama-3's `llama3` scaling maps to `RoPEScalingType.None`, so the
+Llama-3.x family is unaffected.
+
+### How sensitive the CUDA equivalence tests actually are
+
+Measured on Llama-3.2-1B-Q8_0, mean NLL ~3.0 on real English. **Read the sub-0.1% rows as
+order-of-magnitude, not as constants** — see the warning below.
+
+| Change | Effect on mean NLL |
+|---|---|
+| FP16 boundary rounding alone (16 cuts vs 1) | ~0.01–0.05% *(sequence-dependent)* |
+| Cycled vs whole-device CUDA | ~0.04% *(sequence-dependent)* |
+| Boundary scaled **uniformly** by 1% | ~0.02–0.04% — **invisible** |
+| Boundary corrupted by 0.5% element-wise | 0.138% |
+| Boundary corrupted by 1% element-wise | 0.123–0.131% |
+| Boundary corrupted by 2% element-wise | 0.165% |
+| Boundary corrupted by 5% element-wise | 0.585–0.632% |
+
+Four things follow.
+
+**1. The demonstrated-reliable detection level is 5%, not 2%.** A 2% element-wise corruption measures
+0.165%, which is *below* the 0.2% bound — so a 2% corruption **cannot be relied on to be resolved**.
+The bit-identical CPU tests carry the logic load; these bounds are a coarse backstop.
+
+**2. Sub-0.1% figures are not reproducible constants.** Two independently written, individually
+byte-reproducible harnesses disagree by **5.7x** on the 16-cuts-vs-1 figure (0.0540% vs 0.0094%) with
+identical corpus, options and partition. The disagreement scales with the number of boundary crossings
+(~4e-6 at one window, ~6e-4 at one-layer windows), so it is not measurement noise but something
+sequence- or allocation-dependent — cuBLAS algorithm selection driven by allocation history is the
+working hypothesis. **Do not derive a threshold from a single run of a figure this small.** Tracked as
+issue #429, which affects how thresholds are derived repo-wide.
+
+**3. The response is non-monotonic below ~2%.** A 0.5% corruption moved the figure *more* (0.138%) than
+a 1% one (0.123–0.131%). Below roughly 2% the effect is dominated by *which* tokens flip rather than by
+the magnitude of the perturbation, so dose-response reasoning does not apply there.
+
+**4. A uniform scale of the residual stream is undetectable by construction**, because the next layer
+begins with RMSNorm, which is scale-invariant. Worth knowing before designing any activation-level
+check at a layer boundary.
+
+### Implementation
+
+- `ILayerWindowModel` / `ILayerWindowExecutor` (`DotLLM.Core.Evaluation`) — the hidden-in/hidden-out
+  layer-window contract shared by every backend
+- `CyclingPerplexityEvaluator` (`DotLLM.Engine.Evaluation`) — pass driver + boundary checkpoints
+- `PerplexityWindowPlan` — the single corpus-window enumeration shared with `PerplexityEvaluator`
+- `CompositeLayerWindowModel` — per-window device assignment for an arbitrary contiguous GPU window
+- `CpuLayerWindowModel` / `CudaLayerWindowModel` — the backend implementations
+
 ## Unified-Memory Zero-Copy Weight Upload (Vulkan, UMA APUs)
 
 On unified-memory APUs (AMD Strix Halo / Ryzen AI Max+ 395, Intel iGPUs, Apple Silicon via MoltenVK) the CPU and GPU share the same DDR. The default upload path still pays a host→device copy because the driver allocates a new `VkDeviceMemory` region and the kernel reads from there. On a UMA part that copy is pure waste — the source and destination are the same physical DRAM.
