@@ -301,9 +301,14 @@ composition of all three is gated by
 under GQA 4Q/2KV), alternating SWA (window 8, `SlidingWindowPattern=2`, seqLen
 24 = 3x the window so dense layers have a genuinely wider receptive field),
 dense YaRN RoPE (factor 32 over an original context of 8 — gpt-oss's own 32x
-ratio, with the original context below the sequence length so the
-inverse-frequency ramp engages), and biased MXFP4 MoE experts all
-simultaneously active, compared against the CPU oracle through
+ratio; the factor increase from 2→32 raises the mscale multiplier from
+≈1.0693 to ≈1.3466, scaling cos/sin — and therefore Q, K and every attention
+score, including at position 0 — and also divides the interpolated ramp
+dimensions' frequencies by 32 instead of 2, 16x more compression on those
+dimensions; the original-context change to 8 preserves gpt-oss's real shipped
+ratio but is numerically inert at this fixture's small head dimension, see
+the effect-size test's remarks for the derivation), and biased MXFP4 MoE
+experts all simultaneously active, compared against the CPU oracle through
 `CudaModelLoader.CreateFromGguf` itself. Observed max |diff| on last-token
 logits: 1.022E-003 against a tolerance of 8.0E-003, on a real RTX 3060
 (2026-09-02). A companion CPU-only test measures each of the five feature
@@ -321,21 +326,21 @@ The three contributing issues:
   attention are gated away from sink-bearing layers.
 - **#366** — the two attention gaps below, both kernel-level parity-verified
   against the CPU oracle on a real RTX 3060:
-- **Alternating sliding-window attention** — per-layer window resolution now
-  matches CPU semantics across every CUDA attention dispatch site.
-- **Dense YaRN RoPE scaling** — CUDA RoPE previously ignored `rope_scaling`
-  entirely. For gpt-oss's shipped config (`factor=32`, `attn_factor` absent
-  → 1.0) this was a ~34.7% Q/K divergence at position 0, because gpt-oss's
-  mscale formula (`AttnFactor * (1 + 0.1*ln(factor))`) is architecture-gated
-  and applies even at `pos=0`; other dense-YaRN checkpoints without that
-  gate see a smaller, ramp-only divergence at `pos > 0`. Not gpt-oss-specific
-  — the same fix corrects CUDA's dense RoPE for any checkpoint that reaches
-  the shared YaRN path (confirmed: SmolLM3's 128k SKU; unconfirmed for
-  official Meta Llama 3.1, whose native `rope_type=llama3` NTK scaling is a
-  distinct scheme dotLLM does not implement — only Llama-family checkpoints
-  that ship `rope_type=yarn` instead take this path). Fixed via a
-  host-precomputed inverse-frequency + mscale upload sharing the CPU math as
-  the single source of truth.
+  - **Alternating sliding-window attention** — per-layer window resolution now
+    matches CPU semantics across every CUDA attention dispatch site.
+  - **Dense YaRN RoPE scaling** — CUDA RoPE previously ignored `rope_scaling`
+    entirely. For gpt-oss's shipped config (`factor=32`, `attn_factor` absent
+    → 1.0) this was a ~34.7% Q/K divergence at position 0, because gpt-oss's
+    mscale formula (`AttnFactor * (1 + 0.1*ln(factor))`) is architecture-gated
+    and applies even at `pos=0`; other dense-YaRN checkpoints without that
+    gate see a smaller, ramp-only divergence at `pos > 0`. Not gpt-oss-specific
+    — the same fix corrects CUDA's dense RoPE for any checkpoint that reaches
+    the shared YaRN path (confirmed: SmolLM3's 128k SKU; unconfirmed for
+    official Meta Llama 3.1, whose native `rope_type=llama3` NTK scaling is a
+    distinct scheme dotLLM does not implement — only Llama-family checkpoints
+    that ship `rope_type=yarn` instead take this path). Fixed via a
+    host-precomputed inverse-frequency + mscale upload sharing the CPU math as
+    the single source of truth.
 
 **No real-weight CUDA run yet.** All CUDA verification above is against
 synthetic fixtures. No `gpt-oss-20b-mxfp4.gguf` is present in

@@ -46,10 +46,20 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// would pass by accident). Exercises <c>CudaSlidingWindowResolver</c>.</description></item>
 /// <item><description><b>#366 — dense YaRN RoPE mscale.</b> The fixture declares
 /// <c>rope.scaling.type = yarn</c> with factor 32 over an original context of 8
-/// — the same 32x ratio gpt-oss ships (131072/4096), scaled down, with the
-/// original context deliberately below <see cref="SeqLen"/> so the
-/// inverse-frequency ramp genuinely engages. Before #366 CUDA RoPE silently
-/// dropped YaRN's mscale term.</description></item>
+/// — the same 32x ratio gpt-oss ships (131072/4096), scaled down. The entire
+/// measured effect comes from <c>factor</c> (2→32): it raises the mscale
+/// multiplier from ≈1.0693 to ≈1.3466 (scaling cos/sin, and therefore Q, K and
+/// every attention score, at every position including position 0), and it
+/// divides the interpolated ramp dimensions' frequencies by 32 instead of 2 —
+/// 16x more frequency compression on those dimensions. <c>original_context_length</c>
+/// (32→8) is kept in step to preserve gpt-oss's real shipped ratio
+/// (<c>8 × 32 = 256</c>, mirroring gpt-oss's real <c>4096 × 32 = 131072</c>) but is
+/// numerically inert at this fixture's headDim=8 geometry — the YaRN correction
+/// range (<c>low</c>/<c>high</c> in
+/// <see cref="DotLLM.Cpu.Kernels.RoPE.ComputeYarnInverseFrequencies"/>)
+/// clamps to the identical <c>[0, 1]</c> at both settings, so it contributes
+/// nothing to the measured effect size; it is a no-op here, not the mechanism.
+/// Before #366 CUDA RoPE silently dropped YaRN's mscale term.</description></item>
 /// <item><description><b>#365 — per-head attention sinks.</b> Every layer carries
 /// <c>attn_sinks.weight</c> with a DISTINCT value per head (1.0, 1.5, 2.0, 2.5
 /// across the 4 query heads) under GQA (4 Q heads over 2 KV heads), so a kernel
@@ -111,14 +121,27 @@ public sealed class CudaGptOssParitySyntheticTests : IDisposable
 
     // Dense-YaRN shape. gpt-oss ships factor=32 over an original context of 4096
     // (131072 / 4096 = 32x); this fixture keeps that exact 32x ratio at fixture
-    // scale — original context 8, full context 256. Both parts matter:
-    //   • factor 32 sets the mscale term to 1 + 0.1*ln(32) = 1.3466 (vs 1.0693 at
-    //     factor 2), which multiplies cos AND sin, so Q and K are each scaled and
-    //     the attention scores by ~1.81.
-    //   • an original context of 8 (< SeqLen) is what makes the inverse-frequency
-    //     ramp actually engage: positions 8..23 sit beyond it. With the earlier
-    //     orig-context of 32 the whole 24-token sequence was inside the original
-    //     context and the ramp was a near-no-op.
+    // scale — original context 8, full context 256.
+    //
+    // The entire measured effect-size increase comes from `factor` (2 -> 32):
+    //   • it sets the mscale term to 1 + 0.1*ln(32) = 1.3466 (vs 1.0693 at
+    //     factor 2), which multiplies cos AND sin, so Q and K are each scaled
+    //     by mscale and the attention scores (Q.K) by ~mscale^2 ~= 1.81 — at
+    //     EVERY position, including position 0.
+    //   • it also divides the interpolated ramp dimensions' frequencies by 32
+    //     instead of 2 (freqInter = 1/(scalingFactor * theta^exponent)) — 16x
+    //     more frequency compression on those dimensions.
+    // `original_context_length` (32 -> 8) was ALSO changed, to preserve
+    // gpt-oss's real shipped ratio (8*32=256, mirroring gpt-oss's real
+    // 4096*32=131072) — but at this fixture's small geometry (headDim=8,
+    // theta=10000, betaFast=32, betaSlow=1) it is numerically INERT: the YaRN
+    // correction range in RoPE.ComputeYarnInverseFrequencies
+    // (src/DotLLM.Cpu/Kernels/RoPE.cs) clamps to low=0, high=1 at BOTH
+    // original-context settings, so the inverse-frequency table is
+    // bit-identical whether original_context_length is 8 or 32. It is kept for
+    // shape-fidelity / documentation-of-intent, not because it does anything
+    // at this scale — the ramp is a function of DIMENSION index, not of
+    // whether a token position exceeds the original context length.
     // Measured consequence: the YaRN effect on the logits rose from 5.515E-003
     // (below AbsTol — the parity gate could not have seen CUDA drop YaRN) to the
     // value pinned in the AbsTol comment below. See task-5-report.md.

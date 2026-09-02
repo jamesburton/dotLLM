@@ -110,8 +110,9 @@ public sealed class CudaAttentionSinksKernelTests : IDisposable
     /// <list type="bullet">
     /// <item>head 3: sink = +5.0 — a DETERMINISTIC upper bound on any attainable raw score. With
     /// headDim=16 and Q/K sampled uniformly in [-1, 1], the maximum possible pre-softmax score is
-    /// <c>headDim * scale^2 / sqrt(headDim) = sqrt(headDim) = 4.0</c> (every per-dim product at its
-    /// extreme, same sign) — sink=5.0 exceeds that unconditionally, forcing <c>m = sink</c> for
+    /// <c>headDim * scale = headDim / sqrt(headDim) = sqrt(headDim) = 4.0</c> (every per-dim product at its
+    /// extreme, same sign, summed over headDim dims, then scaled by <c>scale = 1/sqrt(headDim)</c>)
+    /// — sink=5.0 exceeds that unconditionally, forcing <c>m = sink</c> for
     /// every row of this head regardless of what the random data happens to produce.</item>
     /// <item>head 0: sink = -20.0 — well below the symmetric -4.0 floor, so the sink is provably
     /// negligible (its <c>exp(sink - m)</c> term is astronomically small relative to the row's
