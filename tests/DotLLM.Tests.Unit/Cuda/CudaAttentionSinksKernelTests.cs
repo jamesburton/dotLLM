@@ -156,6 +156,164 @@ public sealed class CudaAttentionSinksKernelTests : IDisposable
                                           absoluteTolerance: 1.5e-2f, relativeTolerance: 1.5e-2f);
     }
 
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // attention_f16 (native/kernels/attention.cu) — Task 4.
+    //
+    // WHY these exist in addition to the attention_f32 pair above: the F32 kernel is NOT on
+    // gpt-oss's forward path. CudaTransformerModel's eager attention dispatch is FP16 end to end
+    // (FP16 Q/K/V projections, FP16 KV cache), and its `else` branch calls LaunchAttention →
+    // attention_f16; LaunchAttentionF32 is reached only from ForwardHighPrecision (gated on
+    // IQ-family quantization — gpt-oss ships MXFP4, not IQ) and a Gemma-4-specific body. So the
+    // sink epilogue had to be ported into attention_f16 as well, and that port needs its own
+    // discriminating coverage.
+    //
+    // The two tests below mirror the F32 pair exactly (same shapes, same GQA repeat-2 collision
+    // fixture, same per-head sink regimes) so a divergence between the two kernels shows up as one
+    // failing and the other passing.
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// F16 counterpart of <see cref="NullSinks_BitIdenticalToBaseline"/>: <c>sinks=0</c> (nullptr)
+    /// must reproduce the CPU reference computed WITHOUT sinks. The no-regression gate for adding
+    /// the epilogue to <c>attention_f16</c>.
+    /// <para>
+    /// <b>Why this tolerance (2e-2) is LOOSER than the sink-bearing test's (5e-3) — the inverse of
+    /// the F32 pair above, and not a mistake.</b> The gap being measured here is
+    /// <c>attention.cu</c>'s precise <c>expf</c> against the CPU's <i>non-sink</i> tiled softmax,
+    /// which uses the Schraudolph approximation (<c>FastMath.FastExp</c> /
+    /// <c>FastMath.ExpSumAndStore</c>, <c>Attention.cs:591,599</c>). That is the ~1%-scale
+    /// backend disagreement <c>attention_f32.cu</c>'s file header documents — and it is entirely
+    /// PRE-EXISTING, nothing to do with #365. The sink-bearing test is tighter precisely because
+    /// the CPU sink path switches to exact <c>TensorPrimitives.Exp</c>/<c>MathF.Exp</c>
+    /// (<c>Attention.cs:216-217</c>), which <i>matches</i> the kernel's <c>expf</c>.
+    /// </para>
+    /// <para>
+    /// <b>Verified, not assumed.</b> This exact assertion was run against the PRE-#365
+    /// <c>attention.ptx</c> (restored via <c>git checkout HEAD -- native/ptx/attention.ptx</c>,
+    /// confirmed 11 params on the <c>attention_f16</c> entry vs 12 after, with a full
+    /// <c>dotnet build</c> in between so the test binary's <c>bin/.../ptx/</c> copy actually
+    /// refreshed — see this file's Task 3 stale-PTX note). It produced numerically IDENTICAL
+    /// output: <c>92/320 elements, maxAbs=1.4376E-002 @idx=218 (expected=-0.045225,
+    /// actual=-0.059601)</c>, the same figures to the last digit as the post-change run. That is a
+    /// stronger no-regression result than the tolerance assertion itself: with <c>sinks=nullptr</c>
+    /// the epilogue is skipped entirely and the kernel is bit-identical to its pre-#365 form.
+    /// Tolerance set to 2e-2 (~39% headroom over the observed 1.4376e-2).
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public void F16_NullSinks_MatchesCpuBaseline()
+    {
+        _harness.SkipIfUnavailable();
+
+        const int numHeads = 4, numKvHeads = 2, headDim = 16;
+        int seqQ = 5, seqKv = 9;
+        int positionOffset = seqKv - seqQ;
+        var rng = new Random(365_3);
+
+        var (q, k, v) = RandomF16RoundTripped(rng, seqQ, seqKv, numHeads, numKvHeads, headDim);
+
+        float[] cpuOutput = new float[seqQ * numHeads * headDim];
+        Attention.Execute(q, k, v, cpuOutput, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset);
+
+        float[] gpuOutput = RunGpuAttentionF16(q, k, v, seqQ, seqKv, numHeads, numKvHeads, headDim,
+                                                positionOffset, sinksDevPtr: 0);
+
+        // 2e-2, not 5e-3: pre-existing CPU-fast-exp vs GPU-expf gap, observed maxAbs=1.4376e-2 both
+        // before and after this change. See remarks for the pre-change-PTX control run.
+        CudaKernelTestHarness.AssertClose("AttentionSinksF16-null", cpuOutput, gpuOutput,
+                                          absoluteTolerance: 2e-2f, relativeTolerance: 2e-2f);
+    }
+
+    /// <summary>
+    /// F16 counterpart of <see cref="WithSinks_MatchesCpuSoftmaxRowWithSink"/> — identical GQA
+    /// repeat-2 fixture (heads=4, kvHeads=2, so <c>hkv = hq / 2</c> collides heads 0/1 and 2/3) and
+    /// identical distinct per-head sink regimes (-20 negligible, -1 / 0.4 mid-band, +5 provably
+    /// dominant given the ±4.0 attainable score bound at headDim=16) — so a <c>sinks[hkv]</c>
+    /// mis-indexing in <c>attention.cu</c> is caught the same way Task 3's mutation check proved
+    /// for <c>attention_f32.cu</c>.
+    /// <para>
+    /// Tolerance is the same 5e-3 as the null-sink gate above, i.e. TIGHTER than the F32 sink
+    /// test's 1.5e-2. That is not an oversight: the F32 test's loose bound exists purely because
+    /// <c>attention_f32.cu</c> uses the Schraudolph <c>fast_exp_neg</c> bit-trick while the CPU
+    /// sink path uses exact <c>MathF.Exp</c>. <c>attention.cu</c> has no fast-exp helper and its
+    /// epilogue uses precise <c>expf</c>, matching the CPU's exact exp — so that particular
+    /// approximation mismatch simply is not present here, and only FP16 storage rounding remains.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public void F16_WithSinks_MatchesCpuSoftmaxRowWithSink()
+    {
+        _harness.SkipIfUnavailable();
+
+        const int numHeads = 4, numKvHeads = 2, headDim = 16;
+        int seqQ = 5, seqKv = 9;
+        int positionOffset = seqKv - seqQ;
+        var rng = new Random(365_4);
+
+        var (q, k, v) = RandomF16RoundTripped(rng, seqQ, seqKv, numHeads, numKvHeads, headDim);
+
+        // Same values, same per-head regimes, as the F32 sink test — see its remarks.
+        float[] sinks = [-20.0f, -1.0f, 0.4f, 5.0f];
+
+        float[] cpuOutput = new float[seqQ * numHeads * headDim];
+        Attention.Execute(q, k, v, cpuOutput, seqQ, seqKv, numHeads, numKvHeads, headDim,
+                           positionOffset, sinks: sinks);
+
+        nint devSinks = _harness.Upload(sinks);
+        float[] gpuOutput = RunGpuAttentionF16(q, k, v, seqQ, seqKv, numHeads, numKvHeads, headDim,
+                                                positionOffset, sinksDevPtr: devSinks);
+
+        CudaKernelTestHarness.AssertClose("AttentionSinksF16-gqa", cpuOutput, gpuOutput,
+                                          absoluteTolerance: 5e-3f, relativeTolerance: 5e-3f);
+    }
+
+    /// <summary>
+    /// Random Q/K/V already round-tripped through <see cref="Half"/>, so the CPU reference consumes
+    /// EXACTLY the values the FP16 kernel will read. Without this the comparison would also be
+    /// measuring input quantization error, which has nothing to do with the sink epilogue under test.
+    /// </summary>
+    private static (float[] Q, float[] K, float[] V) RandomF16RoundTripped(
+        Random rng, int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim)
+    {
+        static float[] Gen(Random rng, int count)
+        {
+            float[] f = CudaKernelTestHarness.RandomF32(rng, count, scale: 1.0f);
+            for (int i = 0; i < f.Length; i++) f[i] = (float)(Half)f[i];
+            return f;
+        }
+
+        return (Gen(rng, seqQ * numHeads * headDim),
+                Gen(rng, seqKv * numKvHeads * headDim),
+                Gen(rng, seqKv * numKvHeads * headDim));
+    }
+
+    private float[] RunGpuAttentionF16(float[] q, float[] k, float[] v,
+                                        int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
+                                        int positionOffset, nint sinksDevPtr)
+    {
+        static Half[] ToHalf(float[] src)
+        {
+            var h = new Half[src.Length];
+            for (int i = 0; i < src.Length; i++) h[i] = (Half)src[i];
+            return h;
+        }
+
+        nint devQ = _harness.Upload(ToHalf(q));
+        nint devK = _harness.Upload(ToHalf(k));
+        nint devV = _harness.Upload(ToHalf(v));
+        nint devOut = _harness.Allocate((long)q.Length * sizeof(ushort));
+
+        _harness.Kernels.LaunchAttention(devQ, devK, devV, devOut,
+            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow: 0,
+            _harness.StreamHandle, sinks: sinksDevPtr);
+        _harness.Synchronize();
+
+        Half[] outHalf = _harness.DownloadHalves(devOut, q.Length);
+        float[] outF = new float[outHalf.Length];
+        for (int i = 0; i < outHalf.Length; i++) outF[i] = (float)outHalf[i];
+        return outF;
+    }
+
     private float[] RunGpuAttention(float[] q, float[] k, float[] v,
                                      int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
                                      int positionOffset, nint sinksDevPtr)
