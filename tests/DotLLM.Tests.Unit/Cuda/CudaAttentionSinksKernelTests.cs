@@ -18,8 +18,9 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// pre-#365 CPU reference exactly at the SAME tolerance already established by
 /// <c>AttentionF32ParityTests</c> (<c>abs=5e-3, rel=5e-3</c> — both sides use the Schraudolph
 /// fast-exp approximation, so only matched-approximation / reduction-order drift is expected).
-/// Observed on the last local GPU run: maxAbs ≈ 2.4E-04, maxRel ≈ 1.9E-04 — comfortably inside
-/// tolerance, confirming <c>sinks=0</c> is a true no-op.
+/// Observed on the last local GPU run: maxAbs=9.8068E-07, maxRel=1.2621E-04 (idx 103, expected
+/// 0.007770, actual 0.007769) — effectively bit-identical, as expected since <c>sinks=0</c>
+/// introduces no new approximation and both sides still use the fast-exp path identically.
 /// </para>
 /// <para>
 /// <b>Test 2 tolerance (sink-bearing parity):</b> the CPU sink path
