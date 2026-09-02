@@ -40,7 +40,8 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32(
     const float* __restrict__ v, float* __restrict__ output,
     const int seq_q, const int seq_kv,
     const int num_heads, const int num_kv_heads, const int head_dim,
-    const int position_offset, const int sliding_window)
+    const int position_offset, const int sliding_window,
+    const float* __restrict__ sinks)   // gpt-oss per-head sink logits [num_heads]; nullptr = disabled
 {
     int block_id = blockIdx.x;
     if (block_id >= seq_q * num_heads) return;
@@ -156,6 +157,41 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32(
             out_accum[d] += v_acc;
         }
         __syncthreads();
+    }
+
+    // gpt-oss attention sinks (#365): the per-head sink logit joins the softmax
+    // denominator as a final "virtual tile" with no V contribution. Matches CPU
+    // Attention.SoftmaxRowWithSink / llama.cpp ggml_soft_max_add_sinks:
+    //   m' = max(running_max, sink)
+    //   running_sum = running_sum * exp(running_max - m') + exp(sink - m')
+    //   out_accum  *= exp(running_max - m')
+    // i.e. exactly the same online-softmax rescale the tile loop above performs per
+    // tile, run once more against a tile whose only "score" is the sink and whose V
+    // row is zero — so the sink absorbs probability mass but moves no value vector.
+    // nullptr => bit-identical to the pre-#365 kernel (no rescale, no added term).
+    if (sinks != nullptr)
+    {
+        float sink = sinks[hq];
+        float new_max = fmaxf(running_max, sink);
+        float correction = (running_max > -FLT_MAX + 1.0f)
+                           ? fast_exp_neg(running_max - new_max) : 0.0f;
+        running_sum = running_sum * correction + fast_exp_neg(sink - new_max);
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+            out_accum[d] *= correction;
+        running_max = new_max;
+        // No __syncthreads() needed: each thread rescales and later reads only its
+        // own strided d-elements of out_accum; running_sum/running_max are
+        // per-thread registers already uniform across the block at this point.
+        // VERIFIED against the tile loop above, not assumed: both start from uniform
+        // initializers, and every update is a function of block-uniform values only —
+        // `running_max` from `tile_max = warp_scratch[0]` read after the barrier that
+        // follows thread 0's write, and `running_sum` from `*= correction` (uniform
+        // inputs) plus `+= warp_scratch[0]` read after its own barrier. The
+        // `running_max == -FLT_MAX` case (seq_kv == 0, or every score masked by the
+        // causal/sliding-window predicate) is handled by the same `correction = 0`
+        // guard the tile loop uses: out_accum is zeroed, the denominator becomes the
+        // sink term alone, and the row writes out exactly 0 — the correct limit of a
+        // row whose entire probability mass sits on the sink.
     }
 
     // Normalize and write
@@ -303,7 +339,8 @@ extern "C" __global__ void attention_f32_split_kv(
     const int position_offset, const int sliding_window,
     float* __restrict__ partial_max,   // [num_heads, ATTN_KV_SPLIT]
     float* __restrict__ partial_sum,   // [num_heads, ATTN_KV_SPLIT]
-    float* __restrict__ partial_out)   // [num_heads, ATTN_KV_SPLIT, head_dim]
+    float* __restrict__ partial_out,   // [num_heads, ATTN_KV_SPLIT, head_dim]
+    const float* __restrict__ sinks)   // gpt-oss per-head sink logits [num_heads]; nullptr = disabled
 {
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
@@ -342,6 +379,10 @@ extern "C" __global__ void attention_f32_split_kv(
     float running_max = -FLT_MAX;
     float running_sum = 0.0f;
 
+    // NOTE (#365): NO sink epilogue in this per-split body. Each block here owns only a
+    // KV SUB-RANGE, so applying the sink once per split would count it ATTN_KV_SPLIT
+    // times in the row's denominator. The sink is injected exactly once, in the
+    // cross-split combine below — see the comment there.
     for (int t_start = kv_lo; t_start < kv_hi; t_start += TILE_KV)
     {
         int t_end = t_start + TILE_KV;
@@ -442,7 +483,31 @@ extern "C" __global__ void attention_f32_split_kv(
         for (int i = 0; i < ATTN_KV_SPLIT; i++)
             m = fmaxf(m, partial_max[(size_t)hq * ATTN_KV_SPLIT + i]);
 
-        float l = 0.0f;
+        // gpt-oss attention sinks (#365) — THE single injection point for this kernel.
+        // The row's softmax denominator is assembled exactly once here (the per-split
+        // bodies above publish UNNORMALIZED partials), so this is the only place the
+        // sink can join it without being counted once per split.
+        //
+        // Algebraically the sink is a virtual (ATTN_KV_SPLIT+1)-th partial with
+        // (m_sink = sink, l_sink = 1, o_sink = 0). Folding it into the cross-split max
+        // makes m' = max(max_i m_i, sink); every existing exp(m_i - m') weight — in
+        // BOTH the `l` sum below and the `o` sum in the per-d loop — then rescales
+        // correctly with no other change, while the sink itself adds exp(sink - m') to
+        // `l` and contributes nothing to `o` (its "value vector" is zero). That is
+        // identical to attention_f32's post-loop epilogue, and to the CPU reference
+        // Attention.SoftmaxRowWithSink / llama.cpp ggml_soft_max_add_sinks.
+        //
+        // `sink_term` stays 0 when sinks == nullptr, and seeding `l` with an exact
+        // +0.0f leaves the pre-#365 accumulation bit-identical.
+        float sink_term = 0.0f;
+        if (sinks != nullptr)
+        {
+            float sink = sinks[hq];
+            m = fmaxf(m, sink);                 // m is now m' = max(max_i m_i, sink)
+            sink_term = fast_exp_neg(sink - m); // argument <= 0 by construction
+        }
+
+        float l = sink_term;
         for (int i = 0; i < ATTN_KV_SPLIT; i++)
         {
             float mi = partial_max[(size_t)hq * ATTN_KV_SPLIT + i];
@@ -496,6 +561,18 @@ extern "C" __global__ void attention_f32_split_kv(
 // both can be A/B'd directly without a rebuild-swap dance -- opt-in via DOTLLM_ATTN_SPLIT_KV_HP=1,
 // mutually exclusive with (and takes priority over, when both would apply) plain split-KV. See
 // issue #226 for the correctness/precision/perf verdict once measured.
+//
+// ─── #365 NOTE: NO attention-sink support here (deliberate) ────────────────────────────────
+// The "byte-for-byte copy of attention_f32_split_kv except the combine block" claim above is now
+// true only of the ORIGINAL kernel body: attention_f32_split_kv gained a trailing
+// `const float* __restrict__ sinks` parameter and a sink term in its combine (issue #365,
+// gpt-oss); this spike kernel deliberately did NOT, because nothing in this plan dispatches
+// gpt-oss to it (it is env-var opt-in, default OFF, and reachable only from the Qwen3-hybrid
+// decode path) and adding it would silently change this spike's isolated-variable A/B.
+// CONSEQUENCE: a sink-bearing layer routed here would silently drop its sinks -- wrong numerics,
+// no error. Any future dispatch change MUST keep sink-bearing layers off this kernel (and off
+// attention_f32_gqa_split_kv below, same reasoning), or add the sink term to its combine first
+// using attention_f32_split_kv's injection as the template.
 extern "C" __global__ void attention_f32_split_kv_hp(
     const float* __restrict__ q, const float* __restrict__ k,
     const float* __restrict__ v, float* __restrict__ output,
@@ -732,6 +809,15 @@ extern "C" __global__ void attention_f32_split_kv_hp(
 // `MaxSafeAttentionGqaSplit`'s result (queried via `cuOccupancyMaxActiveBlocksPerMultiprocessor`,
 // same mechanism `IsAttentionSplitKvSafe` already uses) before launch -- exceeding the
 // cooperative-launch co-residency ceiling is a hard CUDA error, not a soft perf regression.
+//
+// ─── #365 NOTE: NO attention-sink support here (deliberate) ────────────────────────────────
+// Like attention_f32_split_kv_hp above, this kernel did NOT gain issue #365's per-head sink
+// parameter: it is env-var opt-in, default OFF, and reached only from the Qwen3-hybrid decode
+// path, which has no sink weights. Its combine block (after grid.sync()) has the same clean
+// single-injection shape as attention_f32_split_kv's, so adding sinks later is mechanical --
+// fold `sink` into the per-head `m` scan and seed `l` with `fast_exp_neg(sink - m)` -- with the
+// one extra wrinkle that the `kv_split == 1` bit-exact fast path would need the same epilogue
+// attention_f32 uses. UNTIL THEN: a sink-bearing layer routed here silently drops its sinks.
 #define MAX_GQA_GROUP 8
 
 extern "C" __global__ void __launch_bounds__(256) attention_f32_gqa_split_kv(
