@@ -268,6 +268,96 @@ public sealed class CudaAttentionSinksKernelTests : IDisposable
     }
 
     /// <summary>
+    /// <c>attention_f16_dyn</c> (via <see cref="CudaKernels.LaunchAttentionDyn"/>) must produce the
+    /// same sink-bearing output as <c>attention_f16</c> on identical inputs.
+    /// <para>
+    /// <b>Why this test is not redundant with <see cref="F16_WithSinks_MatchesCpuSoftmaxRowWithSink"/>.</b>
+    /// The two entry points share <c>attention_f16_body</c>, but they are separate
+    /// <c>__global__</c> instantiations with separate PTX entries (both went 11 → 12 params in #365)
+    /// and separate C# launchers marshalling the new trailing argument. The mutation check in this
+    /// file's remarks exercised only the SCALAR instantiation. `_dyn` is the one graph-captured
+    /// decode replays — i.e. the entry point gpt-oss actually hits at decode time — so an argument
+    /// order slip or a missed plumb there would silently drop sinks on the default decode path while
+    /// every other test in this file stayed green.
+    /// </para>
+    /// <para>
+    /// Decode-shaped (<c>seqQ=1</c>, <c>seqKv=9</c>, <c>positionOffset=8</c>) because that is the only
+    /// shape <c>_dyn</c> is ever launched with, and its <c>seq_kv</c> / <c>position_offset</c> come
+    /// from device ints. Asserted <b>bit-exact</b> on the raw FP16 bits — same-body instantiations,
+    /// so anything less would be a weaker claim than the data supports (precedent:
+    /// <c>CudaAttentionF16PagedTests</c> asserts bit-exactness between two genuinely different
+    /// kernels).
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public void F16Dyn_WithSinks_MatchesScalarEntryPoint()
+    {
+        _harness.SkipIfUnavailable();
+
+        const int numHeads = 4, numKvHeads = 2, headDim = 16;
+        const int seqQ = 1, seqKv = 9;
+        const int positionOffset = seqKv - seqQ;
+        var rng = new Random(365_5);
+
+        var (q, k, v) = RandomF16RoundTripped(rng, seqQ, seqKv, numHeads, numKvHeads, headDim);
+        float[] sinks = [-20.0f, -1.0f, 0.4f, 5.0f];
+        nint devSinks = _harness.Upload(sinks);
+
+        nint devQ = _harness.Upload(ToHalf(q));
+        nint devK = _harness.Upload(ToHalf(k));
+        nint devV = _harness.Upload(ToHalf(v));
+
+        int outElems = seqQ * numHeads * headDim;
+        nint devOutScalar = _harness.Allocate((long)outElems * sizeof(ushort));
+        nint devOutDyn = _harness.Allocate((long)outElems * sizeof(ushort));
+
+        // Scalar entry point: seq_kv / position_offset passed by value.
+        _harness.Kernels.LaunchAttention(devQ, devK, devV, devOutScalar,
+            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow: 0,
+            _harness.StreamHandle, sinks: devSinks);
+
+        // Dyn entry point: the same two scalars read from device memory instead.
+        nint devSeqKv = _harness.Upload(new[] { seqKv });
+        nint devPosOffset = _harness.Upload(new[] { positionOffset });
+        _harness.Kernels.LaunchAttentionDyn(devQ, devK, devV, devOutDyn,
+            seqQ, devSeqKv, numHeads, numKvHeads, headDim, devPosOffset, slidingWindow: 0,
+            _harness.StreamHandle, sinks: devSinks);
+
+        _harness.Synchronize();
+
+        Half[] scalar = _harness.DownloadHalves(devOutScalar, outElems);
+        Half[] dyn = _harness.DownloadHalves(devOutDyn, outElems);
+
+        for (int i = 0; i < outElems; i++)
+        {
+            Assert.False(float.IsNaN((float)dyn[i]) || float.IsInfinity((float)dyn[i]),
+                $"NaN/Inf in attention_f16_dyn sink output at index {i}");
+            Assert.Equal(scalar[i], dyn[i]); // bit-exact: same body, same inputs
+        }
+
+        // Guard against a vacuous pass: the sinks must actually have moved the output. Head 3's
+        // sink (+5.0) provably dominates every attainable score at headDim=16 (see the F32 sink
+        // test's remarks for that bound), so a nullptr run must differ somewhere.
+        nint devOutNoSink = _harness.Allocate((long)outElems * sizeof(ushort));
+        _harness.Kernels.LaunchAttentionDyn(devQ, devK, devV, devOutNoSink,
+            seqQ, devSeqKv, numHeads, numKvHeads, headDim, devPosOffset, slidingWindow: 0,
+            _harness.StreamHandle, sinks: 0);
+        _harness.Synchronize();
+
+        Half[] noSink = _harness.DownloadHalves(devOutNoSink, outElems);
+        Assert.True(noSink.AsSpan().SequenceCompareTo(dyn.AsSpan()) != 0,
+            "attention_f16_dyn produced identical output with and without sinks — the sinks "
+            + "argument is not reaching the kernel.");
+    }
+
+    private static Half[] ToHalf(float[] src)
+    {
+        var h = new Half[src.Length];
+        for (int i = 0; i < src.Length; i++) h[i] = (Half)src[i];
+        return h;
+    }
+
+    /// <summary>
     /// Random Q/K/V already round-tripped through <see cref="Half"/>, so the CPU reference consumes
     /// EXACTLY the values the FP16 kernel will read. Without this the comparison would also be
     /// measuring input quantization error, which has nothing to do with the sink epilogue under test.
@@ -291,13 +381,6 @@ public sealed class CudaAttentionSinksKernelTests : IDisposable
                                         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
                                         int positionOffset, nint sinksDevPtr)
     {
-        static Half[] ToHalf(float[] src)
-        {
-            var h = new Half[src.Length];
-            for (int i = 0; i < src.Length; i++) h[i] = (Half)src[i];
-            return h;
-        }
-
         nint devQ = _harness.Upload(ToHalf(q));
         nint devK = _harness.Upload(ToHalf(k));
         nint devV = _harness.Upload(ToHalf(v));
