@@ -24,8 +24,10 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// <para>
 /// <b>Why this test exists.</b> gpt-oss CUDA support was delivered across three
 /// separate issues, each verified only in isolation. This is the first thing
-/// that proves they compose. All four features are simultaneously live in the
-/// single fixture below:
+/// that proves they compose. Every gpt-oss feature that differs from a plain
+/// Llama-family model is simultaneously live in the single fixture below —
+/// four feature groups, five independently measurable behaviours (group 1
+/// contributes both the expert biases and the clamped activation):
 /// </para>
 /// <list type="number">
 /// <item><description><b>#348 — MoE per-expert bias + clamped <c>swiglu_oai</c>.</b>
@@ -43,9 +45,11 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// window makes windowed and dense attention numerically identical, so it
 /// would pass by accident). Exercises <c>CudaSlidingWindowResolver</c>.</description></item>
 /// <item><description><b>#366 — dense YaRN RoPE mscale.</b> The fixture declares
-/// <c>rope.scaling.type = yarn</c> with factor 2.0 and original context 32,
-/// matching gpt-oss's shipped dense-YaRN config shape. Before #366 CUDA RoPE
-/// silently dropped YaRN's mscale term.</description></item>
+/// <c>rope.scaling.type = yarn</c> with factor 32 over an original context of 8
+/// — the same 32x ratio gpt-oss ships (131072/4096), scaled down, with the
+/// original context deliberately below <see cref="SeqLen"/> so the
+/// inverse-frequency ramp genuinely engages. Before #366 CUDA RoPE silently
+/// dropped YaRN's mscale term.</description></item>
 /// <item><description><b>#365 — per-head attention sinks.</b> Every layer carries
 /// <c>attn_sinks.weight</c> with a DISTINCT value per head (1.0, 1.5, 2.0, 2.5
 /// across the 4 query heads) under GQA (4 Q heads over 2 KV heads), so a kernel
@@ -104,7 +108,23 @@ public sealed class CudaGptOssParitySyntheticTests : IDisposable
     private const int MoeIntermediateSize = 32;
     private const int SlidingWindow = 8;
     private const int SeqLen = 24;        // 3x the window: dense layers see 24, windowed layers 8.
-    private const int ContextLength = 64;
+
+    // Dense-YaRN shape. gpt-oss ships factor=32 over an original context of 4096
+    // (131072 / 4096 = 32x); this fixture keeps that exact 32x ratio at fixture
+    // scale — original context 8, full context 256. Both parts matter:
+    //   • factor 32 sets the mscale term to 1 + 0.1*ln(32) = 1.3466 (vs 1.0693 at
+    //     factor 2), which multiplies cos AND sin, so Q and K are each scaled and
+    //     the attention scores by ~1.81.
+    //   • an original context of 8 (< SeqLen) is what makes the inverse-frequency
+    //     ramp actually engage: positions 8..23 sit beyond it. With the earlier
+    //     orig-context of 32 the whole 24-token sequence was inside the original
+    //     context and the ramp was a near-no-op.
+    // Measured consequence: the YaRN effect on the logits rose from 5.515E-003
+    // (below AbsTol — the parity gate could not have seen CUDA drop YaRN) to the
+    // value pinned in the AbsTol comment below. See task-5-report.md.
+    private const int ContextLength = 256;
+    private const int YarnOrigContextLength = 8;
+    private const float YarnScalingFactor = 32.0f;
 
     // Parity tolerance: F32 CPU oracle vs the FP16-internal CUDA dense forward
     // (weights upload as F16, cuBLAS HGEMM, attention_f16), so the noise floor is
@@ -117,33 +137,36 @@ public sealed class CudaGptOssParitySyntheticTests : IDisposable
     // was measured, and it is bounded on BOTH sides:
     //
     //   lower bound (noise): observed max |diff| on the as-committed fixture =
-    //     1.550E-003. Diffuse across all 12 logits (1.3E-004 .. 1.6E-003) with
-    //     the worst column being the one whose CPU logit is nearest zero, i.e.
-    //     absolute rounding noise, not a systematic feature error. Note this is
-    //     ~10x the 1.533E-004 CudaAlternatingSwaParityTests sees on a dense-F32
-    //     fixture of similar depth — the extra comes from MXFP4 expert dequant
-    //     and the MoE router's top-k softmax, neither of which that test has.
+    //     1.022E-003. Diffuse across all 12 logits with the worst column being
+    //     the one whose CPU logit is nearest zero, i.e. absolute rounding noise,
+    //     not a systematic feature error. Note this is ~7x the 1.533E-004
+    //     CudaAlternatingSwaParityTests sees on a dense-F32 fixture of similar
+    //     depth — the extra comes from MXFP4 expert dequant and the MoE router's
+    //     top-k softmax, neither of which that test has.
     //
     //   upper bound (discrimination): the per-feature effect sizes measured by
     //     GptOssFixture_EveryFeatureMovesLogitsFarAboveParityTolerance are
-    //     4.252E-001 (sinks), 2.306E-001 (SWA), 5.621E-001 (swiglu_oai) and
-    //     7.173E-002 (expert biases — the binding one). A tolerance above that
-    //     smallest effect would let CUDA drop expert biases entirely and still
-    //     pass, which is exactly the failure mode CudaAlternatingSwaParityTests
-    //     documents hitting when it followed a "~100x margin" rule of thumb.
+    //     5.856E-001 (swiglu_oai), 4.130E-001 (SWA), 3.164E-001 (sinks),
+    //     1.078E-001 (expert biases) and 1.020E-001 (dense YaRN — the binding
+    //     one). A tolerance above that smallest effect would let CUDA drop YaRN
+    //     entirely and still pass, which is exactly the failure mode
+    //     CudaAlternatingSwaParityTests documents hitting when it followed a
+    //     "~100x margin" rule of thumb.
     //
-    // 8.0E-003 sits near the geometric centre of [1.550E-003, 7.173E-002]:
-    // ~5.2x above the noise floor, ~9.0x below the smallest feature effect.
+    // 8.0E-003 sits near the geometric centre of [1.022E-003, 1.020E-001]
+    // (centre 1.02E-002): ~7.8x above the noise floor, ~12.7x below the smallest
+    // feature effect.
     private const float AbsTol = 8.0e-3f;
     private const float RelTol = 2.0e-3f;
 
     /// <summary>
     /// Minimum multiple of <see cref="AbsTol"/> that each individual feature's
     /// effect on the logits must clear for the parity assertion to be able to
-    /// detect that feature going missing on the GPU. Set to 5 because the
-    /// binding feature (#348 expert biases, effect 7.173E-002) clears
-    /// <see cref="AbsTol"/> by 9.0x — a 10x bar would sit above it and fail on
-    /// the as-committed fixture.
+    /// detect that feature going missing on the GPU. Set to 5, not 10: the
+    /// binding feature (#366 dense YaRN, effect 1.020E-001) clears
+    /// <see cref="AbsTol"/> by 12.7x, so a 10x bar would leave only 1.27x
+    /// headroom and turn any minor fixture tweak into a spurious failure. At 5x
+    /// the bar is 4.0E-002 and the binding feature clears it by 2.55x.
     /// </summary>
     private const float MinEffectSizeMultiple = 5.0f;
 
@@ -187,8 +210,12 @@ public sealed class CudaGptOssParitySyntheticTests : IDisposable
         using var gguf = GgufFile.Open(path);
         ModelConfig config = GgufModelConfigExtractor.Extract(gguf.Metadata);
 
-        // Assert the fixture really does carry all four features before trusting
-        // a parity match: a fixture that quietly lost one would match trivially.
+        // Assert the fixture really does carry every feature before trusting a
+        // parity match: a fixture that quietly lost one would match trivially.
+        // Presence only — the EFFECT of each is measured by the sibling test,
+        // because presence alone is too weak a check (IsDenseYarnActive is
+        // satisfied by any factor > 1.0, including a factor whose effect on the
+        // logits is far below AbsTol).
         Assert.Equal(Architecture.GptOss, config.Architecture);
         Assert.Equal(SlidingWindow, config.SlidingWindowSize);
         Assert.Equal(2, config.SlidingWindowPattern);
@@ -212,8 +239,10 @@ public sealed class CudaGptOssParitySyntheticTests : IDisposable
     /// <summary>
     /// Guards the gate above from silently degenerating. A CPU-vs-CUDA parity
     /// assertion can only catch a feature the GPU dropped if dropping that
-    /// feature moves the logits by more than the tolerance. This measures each
-    /// of the four features' effect on the CPU side alone (no GPU needed) and
+    /// feature moves the logits by more than the tolerance. This measures the
+    /// effect of every gpt-oss feature the fixture activates — sinks, MoE
+    /// expert biases, alternating SWA, dense YaRN RoPE, clamped
+    /// <c>swiglu_oai</c> — on the CPU side alone (no GPU needed) and
     /// asserts every one clears <see cref="AbsTol"/> by
     /// <see cref="MinEffectSizeMultiple"/>x. If a future fixture tweak shrinks
     /// an effect below that bar, this fails loudly instead of leaving the parity
@@ -232,22 +261,41 @@ public sealed class CudaGptOssParitySyntheticTests : IDisposable
         float[] biasOn = RunCpuLastRow(WriteFixture("eff-bias-on", seed: 11, biasMode: BiasMode.Normal));
         float[] biasOff = RunCpuLastRow(WriteFixture("eff-bias-off", seed: 11, biasMode: BiasMode.Zeroed));
 
-        // #366 alternating SWA and #348 clamped swiglu_oai are config-driven, so
-        // one fixture serves for both: re-run it with the feature switched off.
+        // #366 alternating SWA, #366 dense YaRN RoPE and #348 clamped swiglu_oai
+        // are all config-driven, so one fixture serves for all three: re-run it
+        // with each feature switched off in the ModelConfig.
         string tweakPath = WriteFixture("eff-config", seed: 13);
         using var tweakGguf = GgufFile.Open(tweakPath);
         ModelConfig windowed = GgufModelConfigExtractor.Extract(tweakGguf.Metadata);
-        float[] swaOn = RunCpuLastRow(tweakGguf, windowed);
+        float[] baseline = RunCpuLastRow(tweakGguf, windowed);
+
         float[] swaOff = RunCpuLastRow(tweakGguf, windowed with { SlidingWindowSize = null });
-        float[] oaiOn = swaOn;
         float[] oaiOff = RunCpuLastRow(
             tweakGguf, windowed with { Moe = windowed.Moe! with { UseSwiGluOai = false } });
+
+        // #366 dense YaRN RoPE. The parity gate asserts RoPEConfig.IsDenseYarnActive,
+        // but that predicate is satisfied by ANY factor > 1.0 — a fixture edited to
+        // e.g. factor=1.01 would keep the assert green while the actual effect on
+        // the logits collapsed toward zero, leaving the gate unable to see CUDA
+        // ignoring YaRN. That is not hypothetical: silently dropping YaRN's mscale
+        // is precisely the pre-existing CUDA bug #366 found and fixed. So measure
+        // the effect, don't just assert presence. Turning ScalingType off disables
+        // the whole dense-YaRN path (both the inverse-frequency ramp and the mscale
+        // term folded into cos/sin), so this bounds the full YaRN contribution, of
+        // which the mscale term #366 restored is a part.
+        float[] yarnOff = RunCpuLastRow(
+            tweakGguf,
+            windowed with
+            {
+                RoPEConfig = windowed.RoPEConfig!.Value with { ScalingType = RoPEScalingType.None },
+            });
 
         float bar = AbsTol * MinEffectSizeMultiple;
         AssertEffectSize("#365 per-head attention sinks", sinksOn, sinksOff, bar);
         AssertEffectSize("#348 MoE per-expert biases", biasOn, biasOff, bar);
-        AssertEffectSize("#366 alternating sliding-window attention", swaOn, swaOff, bar);
-        AssertEffectSize("#348 clamped swiglu_oai activation", oaiOn, oaiOff, bar);
+        AssertEffectSize("#366 alternating sliding-window attention", baseline, swaOff, bar);
+        AssertEffectSize("#366 dense YaRN RoPE scaling", baseline, yarnOff, bar);
+        AssertEffectSize("#348 clamped swiglu_oai activation", baseline, oaiOff, bar);
     }
 
     private void AssertEffectSize(string feature, float[] on, float[] off, float bar)
@@ -387,11 +435,12 @@ public sealed class CudaGptOssParitySyntheticTests : IDisposable
         w.AddUInt32($"{arch}.expert_used_count", TopK);
         w.AddUInt32($"{arch}.expert_feed_forward_length", MoeIntermediateSize);
         w.AddFloat32($"{arch}.rope.freq_base", 10000.0f);
-        // Dense YaRN scaling — the shape of gpt-oss's shipped rope_scaling, and
-        // the path #366 fixed (CUDA RoPE previously dropped YaRN's mscale term).
+        // Dense YaRN scaling — the shape of gpt-oss's shipped rope_scaling (same
+        // 32x factor), and the path #366 fixed (CUDA RoPE previously dropped
+        // YaRN's mscale term entirely).
         w.AddString($"{arch}.rope.scaling.type", "yarn");
-        w.AddFloat32($"{arch}.rope.scaling.factor", 2.0f);
-        w.AddUInt32($"{arch}.rope.scaling.original_context_length", 32);
+        w.AddFloat32($"{arch}.rope.scaling.factor", YarnScalingFactor);
+        w.AddUInt32($"{arch}.rope.scaling.original_context_length", YarnOrigContextLength);
         w.AddUInt32($"{arch}.vocab_size", VocabSize);
 
         AddMatrixF32(w, rng, "token_embd.weight", inK: HiddenSize, outM: VocabSize, 0.05f);
@@ -453,14 +502,16 @@ public sealed class CudaGptOssParitySyntheticTests : IDisposable
         // BiasMode.Zeroed scales AFTER the draw so the RNG stream is unchanged.
         //
         // Amplitude 0.2 rather than the 0.05 used for every other bias in this
-        // fixture: at 0.05 the measured CPU-side effect of zeroing these biases
-        // was only 2.460E-002, just 7.6x this test's FP16+MXFP4 parity noise
-        // floor (3.233E-003) -- too narrow a band to set a tolerance in that
-        // both clears the noise and stays below the effect. Raising the
-        // amplitude widens the smallest of the four feature effects instead of
-        // widening the tolerance, which is the direction that preserves
-        // discrimination. Still small in absolute terms (the residual stream is
-        // O(0.1-1) here), so nothing saturates the swiglu_oai clamp.
+        // fixture: on an earlier revision of this fixture, 0.05 produced a
+        // measured CPU-side effect of only 2.460E-002 against a parity noise
+        // floor of 3.233E-003 -- just 7.6x -- too narrow a band to place a
+        // tolerance that both clears the noise and stays below the effect.
+        // Raising the amplitude widens the feature effect instead of widening
+        // the tolerance, which is the direction that preserves discrimination.
+        // (The same reasoning later drove the dense-YaRN strengthening at
+        // YarnScalingFactor above; both are recorded in task-5-report.md.)
+        // Still small in absolute terms (the residual stream is O(0.1-1) here),
+        // so nothing saturates the swiglu_oai clamp.
         const float ExpertBiasAmplitude = 0.2f;
         float biasScale = biasMode == BiasMode.Normal ? 1.0f : 0.0f;
         AddVectorF32(w, rng, $"{p}.ffn_gate_exps.bias", NumExperts * MoeIntermediateSize, ExpertBiasAmplitude, biasScale);
