@@ -20,6 +20,14 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// llama.cpp is forced to store every <c>ffn_down_exps</c> as Q5_0 or IQ4_NL rather than a
 /// K-quant).
 /// </para>
+/// <para>
+/// <b>Historical note (#407).</b> Those Q5_0 down banks no longer fall back at all: Q5_0 and
+/// IQ4_NL gained routed (<c>moe_indexed</c>) Vulkan kernels and resolver wiring, and 1408 is
+/// 32-aligned, so the real DeepSeek-V2-Lite Q4_K_M plan is now fully resident. The plans below
+/// are constructed by hand rather than resolved from a GGUF precisely so this file keeps
+/// testing the accounting / refusal MESSAGE independently of which types happen to have kernels
+/// on any given day — the scenario is still reachable for any type without one (#344 Units 2-4).
+/// </para>
 /// </remarks>
 public sealed class MoeF32HostDequantPreflightTests
 {

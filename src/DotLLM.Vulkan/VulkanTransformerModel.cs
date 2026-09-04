@@ -738,6 +738,13 @@ public sealed class VulkanTransformerModel : IModel
     private readonly MoeIndexedMatmulQ5_KF32Kernel? _moeIndexedMatmulQ5K;
     private readonly MoeIndexedMatmulQ6_KF32Kernel? _moeIndexedMatmulQ6K;
     private readonly MoeIndexedMatmulQ5_1F32Kernel? _moeIndexedMatmulQ5_1;
+    // Legacy/i-quant routed-bank pair (#407). Nemotron-3.5-Lightning's published
+    // GGUFs are ~76% Q5_0 / ~91% IQ4_NL by tensor count and ~93% of its parameters
+    // sit in routed experts, so without these two the whole model's expert banks
+    // expand to F32 on upload. Created unconditionally alongside the K-quant
+    // siblings whenever the model has MoE layers.
+    private readonly MoeIndexedMatmulQ5_0F32Kernel? _moeIndexedMatmulQ5_0;
+    private readonly MoeIndexedMatmulIq4NlF32Kernel? _moeIndexedMatmulIq4Nl;
     // Indexed MMVQ (dp4a) decode variants of the quantized expert matmuls
     // (issue #137). Used on the S==1 decode path when the expanded MoE
     // activations have been Q8_1-quantized (quantize_q8_1_rows into the
@@ -993,6 +1000,8 @@ public sealed class VulkanTransformerModel : IModel
         MoeIndexedMatmulQ5_KF32Kernel? moeIndexedMatmulQ5K,
         MoeIndexedMatmulQ6_KF32Kernel? moeIndexedMatmulQ6K,
         MoeIndexedMatmulQ5_1F32Kernel? moeIndexedMatmulQ5_1,
+        MoeIndexedMatmulQ5_0F32Kernel? moeIndexedMatmulQ5_0,
+        MoeIndexedMatmulIq4NlF32Kernel? moeIndexedMatmulIq4Nl,
         MoeIndexedMatmulQ4KMmvqKernel? moeIndexedMatmulQ4KMmvq,
         MoeIndexedMatmulQ5_1MmvqKernel? moeIndexedMatmulQ5_1Mmvq,
         MoeIndexedMatmulQ8_0MmvqKernel? moeIndexedMatmulQ8Mmvq,
@@ -1115,6 +1124,8 @@ public sealed class VulkanTransformerModel : IModel
         _moeIndexedMatmulQ5K = moeIndexedMatmulQ5K;
         _moeIndexedMatmulQ6K = moeIndexedMatmulQ6K;
         _moeIndexedMatmulQ5_1 = moeIndexedMatmulQ5_1;
+        _moeIndexedMatmulQ5_0 = moeIndexedMatmulQ5_0;
+        _moeIndexedMatmulIq4Nl = moeIndexedMatmulIq4Nl;
         _moeIndexedMatmulQ4KMmvq = moeIndexedMatmulQ4KMmvq;
         _moeIndexedMatmulQ5_1Mmvq = moeIndexedMatmulQ5_1Mmvq;
         _moeIndexedMatmulQ8Mmvq = moeIndexedMatmulQ8Mmvq;
@@ -1725,6 +1736,8 @@ public sealed class VulkanTransformerModel : IModel
         MoeIndexedMatmulQ5_KF32Kernel? moeIndexedMatmulQ5K = null;
         MoeIndexedMatmulQ6_KF32Kernel? moeIndexedMatmulQ6K = null;
         MoeIndexedMatmulQ5_1F32Kernel? moeIndexedMatmulQ5_1 = null;
+        MoeIndexedMatmulQ5_0F32Kernel? moeIndexedMatmulQ5_0 = null;
+        MoeIndexedMatmulIq4NlF32Kernel? moeIndexedMatmulIq4Nl = null;
         MoeIndexedMatmulQ4KMmvqKernel? moeIndexedMatmulQ4KMmvq = null;
         MoeIndexedMatmulQ5_1MmvqKernel? moeIndexedMatmulQ5_1Mmvq = null;
         MoeIndexedMatmulQ8_0MmvqKernel? moeIndexedMatmulQ8Mmvq = null;
@@ -1752,6 +1765,12 @@ public sealed class VulkanTransformerModel : IModel
             moeIndexedMatmulQ4K = MoeIndexedMatmulQ4_KF32Kernel.Create(device, spvDir);
             moeIndexedMatmulQ5K = MoeIndexedMatmulQ5_KF32Kernel.Create(device, spvDir);
             moeIndexedMatmulQ6K = MoeIndexedMatmulQ6_KF32Kernel.Create(device, spvDir);
+            // #407: legacy Q5_0 / non-linear IQ4_NL routed banks. Same
+            // unconditional creation as the K-quant siblings above — the
+            // resolver (VulkanWeights.MoeRoutedRawDeviceQuantType) can pick
+            // either type for any MoE architecture, not just Gemma-4.
+            moeIndexedMatmulQ5_0 = MoeIndexedMatmulQ5_0F32Kernel.Create(device, spvDir);
+            moeIndexedMatmulIq4Nl = MoeIndexedMatmulIq4NlF32Kernel.Create(device, spvDir);
             if (config.Gemma4DualFfn)
             {
                 // Gemma-4's quantized down-projection bank is Q5_1 (a legacy quant,
@@ -1860,6 +1879,7 @@ public sealed class VulkanTransformerModel : IModel
             mlaAttention, mlaRope, mlaKvSplit,
             moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulQ8,
             moeIndexedMatmulQ4K, moeIndexedMatmulQ5K, moeIndexedMatmulQ6K, moeIndexedMatmulQ5_1,
+            moeIndexedMatmulQ5_0, moeIndexedMatmulIq4Nl,
             moeIndexedMatmulQ4KMmvq, moeIndexedMatmulQ5_1Mmvq, moeIndexedMatmulQ8Mmvq,
             moeIndexedMatmulTiled, moeIndexedLoraDelta,
             moeExpertOffsets, moeExpandGroupByExpert, moeGroupedMatmulF16Coopmat, moeUngroupScatter,
@@ -4025,6 +4045,8 @@ public sealed class VulkanTransformerModel : IModel
         _moeIndexedMatmulQ4K?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ5K?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ6K?.InvalidateDescriptorCache();
+        _moeIndexedMatmulQ5_0?.InvalidateDescriptorCache();
+        _moeIndexedMatmulIq4Nl?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ5_1?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ4KMmvq?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ5_1Mmvq?.InvalidateDescriptorCache();
@@ -5361,6 +5383,26 @@ public sealed class VulkanTransformerModel : IModel
             if (_moeIndexedMatmulQ6K is null)
                 throw new InvalidOperationException("Q6_K MoE indexed matmul kernel was not created.");
             _moeIndexedMatmulQ6K.Record(cmdBuf,
+                bank, x, indices, y,
+                m: m, k: k, n: n, numExperts: numExperts);
+            return;
+        }
+
+        if (weightQt == QuantizationType.Q5_0)
+        {
+            if (_moeIndexedMatmulQ5_0 is null)
+                throw new InvalidOperationException("Q5_0 MoE indexed matmul kernel was not created.");
+            _moeIndexedMatmulQ5_0.Record(cmdBuf,
+                bank, x, indices, y,
+                m: m, k: k, n: n, numExperts: numExperts);
+            return;
+        }
+
+        if (weightQt == QuantizationType.IQ4_NL)
+        {
+            if (_moeIndexedMatmulIq4Nl is null)
+                throw new InvalidOperationException("IQ4_NL MoE indexed matmul kernel was not created.");
+            _moeIndexedMatmulIq4Nl.Record(cmdBuf,
                 bank, x, indices, y,
                 m: m, k: k, n: n, numExperts: numExperts);
             return;
@@ -6775,6 +6817,8 @@ public sealed class VulkanTransformerModel : IModel
         _moeIndexedMatmulQ4KMmvq?.Dispose();
         _moeIndexedMatmulQ8Mmvq?.Dispose();
         _moeIndexedMatmulQ5_1?.Dispose();
+        _moeIndexedMatmulIq4Nl?.Dispose();
+        _moeIndexedMatmulQ5_0?.Dispose();
         _moeIndexedMatmulQ6K?.Dispose();
         _moeIndexedMatmulQ5K?.Dispose();
         _moeIndexedMatmulQ4K?.Dispose();

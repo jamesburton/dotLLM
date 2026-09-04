@@ -1,0 +1,120 @@
+#version 450
+// MoE indexed expert matmul over a packed Q5_0 expert bank (issue #407).
+//
+//   y[n, m] = sum_k dequant_q5_0(bank[indices[n], m, k]) * x[n, k]
+//
+// Layout of `bank` is [numExperts, M, K] row-major. Each row holds (K / 32)
+// Q5_0 blocks of 22 bytes (32 elements each):
+//     bytes [0,1]   = fp16 d   (delta)
+//     bytes [2..5]  = qh[4]    (one 5th bit per element, 32 bits little-endian)
+//     bytes [6..21] = qs[16]   (two 4-bit values per byte)
+// Row stride = (K / 32) * 22 bytes. 22 is NOT a multiple of 4, so a block base
+// can land at any byte phase within the uint-indexed buffer — every read goes
+// through the straddle-safe helpers below.
+//
+// Element reconstruction (mirrors DotLLM.Cpu.Kernels.Dequantize
+// .DequantizeQ5_0Scalar byte-for-byte): for j in [0,16):
+//     lo  = qs[j] & 0xF ;  hi  = qs[j] >> 4
+//     b5lo = (qh >> j) & 1 ;  b5hi = (qh >> (j+16)) & 1
+//     out[j]      = d * ((lo | (b5lo << 4)) - 16)
+//     out[j + 16] = d * ((hi | (b5hi << 4)) - 16)
+// So output element index e in [0,32): if e < 16 -> low nibble of qs[e], qh bit e;
+// else -> high nibble of qs[e-16], qh bit (e-16+16) = e.
+//
+// The element -> (nibble, qh bit) mapping above is the #311 hazard class called
+// out by #344: it is verified against REAL llama.cpp-quantised GGUF bytes via
+// the CPU scalar oracle, not against a self-authored encoder.
+//
+// Sibling of moe_indexed_matmul_q8_0_f32.comp / moe_indexed_matmul_q5_1_f32.comp;
+// Q5_0 is SYMMETRIC (d*(q-16)), so unlike the Q5_1 sibling there is no per-block
+// min term and no per-expert output-scale binding.
+//
+// Dispatch: 2D grid, one thread per output cell (n, m). Workgroup (16, 16).
+//   groupCount = (ceil(M/16), ceil(N/16)).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  bank[]; };   // Q5_0 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufX    { float x[]; };      // [N * K]
+layout(set = 0, binding = 2, std430) readonly  buffer BufIdx  { int   indices[]; };// [N]
+layout(set = 0, binding = 3, std430) writeonly buffer BufY    { float y[]; };      // [N * M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim   (per-expert weight row count)
+    uint K;             // input dim    (per-expert weight col count, multiple of 32)
+    uint N;             // total rows   (typically seqLen * topK)
+    uint numExperts;    // bank's first axis size — bounds-check
+    uint blocksPerRow;  // = K / 32
+} pc;
+
+const uint Q5_0_BLOCK_BYTES = 22u;
+const uint Q5_0_GROUP_SIZE  = 32u;
+
+uint readByte(uint absByteOff) {
+    uint u = bank[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = bank[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = bank[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+uint readWord(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    if (byteInWord == 0u) return bank[alignedIdx];
+    uint lo = bank[alignedIdx];
+    uint hi = bank[alignedIdx + 1u];
+    uint sh = byteInWord * 8u;
+    return (lo >> sh) | (hi << (32u - sh));
+}
+
+void main() {
+    uint m = gl_GlobalInvocationID.x; // 0..M
+    uint n = gl_GlobalInvocationID.y; // 0..N
+    if (m >= pc.M || n >= pc.N) return;
+
+    int rawIdx = indices[n];
+    uint expertIdx = uint(clamp(rawIdx, 0, int(pc.numExperts) - 1));
+
+    uint rowByteStride    = pc.blocksPerRow * Q5_0_BLOCK_BYTES;
+    uint matrixByteStride = pc.M * rowByteStride;
+    uint rowByteBase      = expertIdx * matrixByteStride + m * rowByteStride;
+    uint xRowBase         = n * pc.K;
+
+    float acc = 0.0;
+
+    for (uint b = 0u; b < pc.blocksPerRow; b++) {
+        uint blockByteBase = rowByteBase + b * Q5_0_BLOCK_BYTES;
+        float d = readHalf(blockByteBase);
+        uint qh = readWord(blockByteBase + 2u);
+        uint qsBase = blockByteBase + 6u;
+
+        uint xBase = xRowBase + b * Q5_0_GROUP_SIZE;
+
+        float blockSum = 0.0;
+        for (uint j = 0u; j < 16u; j++) {
+            uint byteVal = readByte(qsBase + j);
+            uint lo = byteVal & 0xFu;
+            uint hi = (byteVal >> 4u) & 0xFu;
+            uint b5lo = (qh >> j) & 1u;
+            uint b5hi = (qh >> (j + 16u)) & 1u;
+            blockSum += x[xBase + j]        * (float(lo | (b5lo << 4u)) - 16.0);
+            blockSum += x[xBase + j + 16u]  * (float(hi | (b5hi << 4u)) - 16.0);
+        }
+        acc += d * blockSum;
+    }
+
+    y[n * pc.M + m] = acc;
+}
