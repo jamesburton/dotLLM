@@ -29,6 +29,15 @@ internal readonly struct CudaLayerWeights
     // BitNet Sub-LN weights on device (FP16). 0 when absent (non-BitNet models).
     public readonly nint AttnSubNormWeight, FfnSubNormWeight;
 
+    /// <summary>
+    /// gpt-oss per-head attention sink logits on device (issue #365) — <b>F32</b>, one element
+    /// per QUERY head, uploaded verbatim (NOT converted to FP16 like the norm weights above):
+    /// every sink-aware attention kernel takes <c>const float*</c>. 0 when the layer has no
+    /// <c>attn_sinks.weight</c> tensor, which is every non-gpt-oss model — and 0 makes the
+    /// kernels bit-identical to their pre-#365 form.
+    /// </summary>
+    public readonly nint AttnSinksDevice;
+
     // Bias on device (FP16, 0 when absent)
     public readonly nint QBias, KBias, VBias, OBias;
     public readonly nint GateBias, UpBias, DownBias;
@@ -64,7 +73,8 @@ internal readonly struct CudaLayerWeights
         nint gateQuant, QuantizationType gateQt, nint upQuant, QuantizationType upQt,
         nint downQuant, QuantizationType downQt,
         nint qkvPacked, QuantizationType qkvPackedQt, int qkvPackedOut,
-        nint gateUpPacked, QuantizationType gateUpPackedQt, int gateUpPackedOut)
+        nint gateUpPacked, QuantizationType gateUpPackedQt, int gateUpPackedOut,
+        nint attnSinks)
     {
         Q = q; QOutputDim = qOut; QInputDim = qIn;
         K = k; KOutputDim = kOut; KInputDim = kIn;
@@ -76,6 +86,7 @@ internal readonly struct CudaLayerWeights
         AttnNormWeight = attnNorm; FfnNormWeight = ffnNorm;
         QNormWeight = qNorm; KNormWeight = kNorm;
         AttnSubNormWeight = attnSubNorm; FfnSubNormWeight = ffnSubNorm;
+        AttnSinksDevice = attnSinks;
         QBias = qBias; KBias = kBias; VBias = vBias; OBias = oBias;
         GateBias = gateBias; UpBias = upBias; DownBias = downBias;
         QQuant = qQuant; QQuantType = qQt; KQuant = kQuant; KQuantType = kQt;
@@ -482,6 +493,15 @@ internal sealed class CudaWeights : IDisposable
             nint attnSubNorm = lw.AttnSubNormWeight is not null ? UploadNormWeight(lw.AttnSubNormWeight, allocs, kernels, stream) : 0;
             nint ffnSubNorm = lw.FfnSubNormWeight is not null ? UploadNormWeight(lw.FfnSubNormWeight, allocs, kernels, stream) : 0;
 
+            // gpt-oss per-head attention sinks (issue #365), from the layer's
+            // `attn_sinks.weight` GGUF tensor (bound CPU-side to TransformerLayerWeights.AttnSinks).
+            // Uploaded as RAW F32 — the sink-aware attention kernels take `const float*`, so this
+            // deliberately does NOT go through UploadNormWeight (which converts to FP16).
+            // Placed here, outside the MLA/MoE conditionals above, so it is reached for every
+            // layer shape — gpt-oss has a MoE FFN but standard GQA attention.
+            // 0 for every model without the tensor, which keeps the kernels bit-identical.
+            nint attnSinks = lw.AttnSinks is not null ? UploadF32Vector(lw.AttnSinks, allocs) : 0;
+
             layers[i] = new CudaLayerWeights(
                 q, lw.QOutputDim, lw.QInputDim, k, lw.KOutputDim, lw.KInputDim,
                 v, lw.VOutputDim, lw.VInputDim, o, lw.OOutputDim, lw.OInputDim,
@@ -495,7 +515,8 @@ internal sealed class CudaWeights : IDisposable
                 gateQuant, lw.GateQuantType, upQuant, lw.UpQuantType,
                 downQuant, lw.DownQuantType,
                 qkvPacked, qkvPackedQt, qkvPackedOut,
-                gateUpPacked, gateUpPackedQt, gateUpPackedOut);
+                gateUpPacked, gateUpPackedQt, gateUpPackedOut,
+                attnSinks);
 
             if (isMlaLayer)
             {
@@ -837,6 +858,22 @@ internal sealed class CudaWeights : IDisposable
         kernels.LaunchConvertF32ToF16(devF32, devF16, n, stream);
 
         return devF16;
+    }
+
+    /// <summary>
+    /// Upload a float[] to device as RAW F32 (no FP16 conversion) — for kernel parameters typed
+    /// <c>const float*</c>, e.g. the gpt-oss attention sinks (#365). The allocation is appended to
+    /// <paramref name="allocs"/> immediately after <c>cuMemAlloc_v2</c> (issue #383 ledger pattern)
+    /// so a failure of the copy, or of any later step in the load, still unwinds this buffer.
+    /// </summary>
+    private static unsafe nint UploadF32Vector(float[] values, List<nint> allocs)
+    {
+        long bytes = (long)values.Length * sizeof(float);
+        AllocOrThrowWithContext(bytes, "attention sinks upload", out nint devPtr);
+        allocs.Add(devPtr);
+        fixed (float* ptr = values)
+            MemcpyHtoDOrThrowWithContext(devPtr, (nint)ptr, bytes, "attention sinks upload");
+        return devPtr;
     }
 
     /// <summary>Upload optional float[] bias → FP16 on device. Returns 0 if bias is null.</summary>

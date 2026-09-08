@@ -2264,20 +2264,44 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
-    /// <summary>FP32 attention: Q/K/V/output all FP32.</summary>
+    /// <summary>
+    /// FP32 attention: Q/K/V/output all FP32.
+    /// </summary>
+    /// <param name="q">Device pointer to the query tensor, <c>[seqQ, numHeads, headDim]</c>.</param>
+    /// <param name="k">Device pointer to the cached keys, <c>[seqKv, numKvHeads, headDim]</c>.</param>
+    /// <param name="v">Device pointer to the cached values, <c>[seqKv, numKvHeads, headDim]</c>.</param>
+    /// <param name="output">Device pointer to the output, <c>[seqQ, numHeads, headDim]</c>. Overwritten.</param>
+    /// <param name="seqQ">Number of query positions in this launch.</param>
+    /// <param name="seqKv">Cached KV length (causal upper bound is <paramref name="positionOffset"/>).</param>
+    /// <param name="numHeads">Number of query attention heads.</param>
+    /// <param name="numKvHeads">Number of KV heads (GQA broadcast group = numHeads/numKvHeads).</param>
+    /// <param name="headDim">Per-head dimension.</param>
+    /// <param name="positionOffset">Position of the first query row (causal mask upper bound).</param>
+    /// <param name="slidingWindow">Sliding window size, or 0 for full causal attention.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    /// <param name="sinks">
+    /// Optional device pointer to <c>numHeads</c> per-head gpt-oss sink logits (issue #365).
+    /// <c>0</c> (default) selects nullptr, disabling the sink — bit-identical to pre-#365
+    /// behaviour. When non-zero, the kernel folds each head's sink logit into that row's
+    /// softmax denominator (extra "no-op" attention slot that absorbs probability mass but
+    /// contributes no value vector), matching the CPU reference's
+    /// <see cref="DotLLM.Cpu.Kernels.Attention.SoftmaxRowWithSink"/> convention.
+    /// </param>
     public void LaunchAttentionF32(nint q, nint k, nint v, nint output,
                                      int seqQ, int seqKv,
                                      int numHeads, int numKvHeads, int headDim,
-                                     int positionOffset, int slidingWindow, nint stream)
+                                     int positionOffset, int slidingWindow, nint stream,
+                                     nint sinks = 0)
     {
         nint qArg = q, kArg = k, vArg = v, outArg = output;
         int sqArg = seqQ, skvArg = seqKv;
         int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
         int poArg = positionOffset, swArg = slidingWindow;
+        nint sinksArg = sinks; // 0 ⇒ nullptr ⇒ sink disabled (pre-#365 behaviour)
 
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &sqArg, &skvArg, &nhArg, &nkvArg, &hdArg,
-                        &poArg, &swArg};
+                        &poArg, &swArg, &sinksArg};
 
         int numBlocks = seqQ * numHeads;
         // Tiled online softmax: q_shared[headDim] + score_tile[256] + out_accum[headDim] + warp_scratch[32]
@@ -2385,19 +2409,29 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <param name="partialSum">Scratch, <c>[numHeads, AttentionKvSplit]</c> floats.</param>
     /// <param name="partialOut">Scratch, <c>[numHeads, AttentionKvSplit, headDim]</c> floats.</param>
     /// <param name="stream">CUDA stream handle.</param>
+    /// <param name="sinks">
+    /// Optional device pointer to <c>numHeads</c> per-head gpt-oss sink logits (issue #365).
+    /// <c>0</c> (default) selects nullptr, disabling the sink — bit-identical to pre-#365
+    /// behaviour. When non-zero, the kernel folds each head's sink logit into that row's
+    /// softmax denominator (extra "no-op" attention slot that absorbs probability mass but
+    /// contributes no value vector), matching the CPU reference's
+    /// <see cref="DotLLM.Cpu.Kernels.Attention.SoftmaxRowWithSink"/> convention.
+    /// </param>
     public void LaunchAttentionF32SplitKv(nint q, nint k, nint v, nint output,
                                      int seqKv, int numHeads, int numKvHeads, int headDim,
                                      int positionOffset, int slidingWindow,
-                                     nint partialMax, nint partialSum, nint partialOut, nint stream)
+                                     nint partialMax, nint partialSum, nint partialOut, nint stream,
+                                     nint sinks = 0)
     {
         nint qArg = q, kArg = k, vArg = v, outArg = output;
         int skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
         int poArg = positionOffset, swArg = slidingWindow;
         nint pmArg = partialMax, psArg = partialSum, poutArg = partialOut;
+        nint sinksArg = sinks; // 0 ⇒ nullptr ⇒ sink disabled (pre-#365 behaviour)
 
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &skvArg, &nhArg, &nkvArg, &hdArg,
-                        &poArg, &swArg, &pmArg, &psArg, &poutArg};
+                        &poArg, &swArg, &pmArg, &psArg, &poutArg, &sinksArg};
 
         const int TileKv = 256;
         uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
@@ -4072,20 +4106,29 @@ public sealed unsafe class CudaKernels : IDisposable
         _ => false,
     };
 
-    /// <summary>Naive scaled dot-product attention with causal mask and GQA.</summary>
+    /// <summary>
+    /// Naive scaled dot-product attention with causal mask and GQA.
+    /// <para>
+    /// <c>sinks</c> (issue #365): optional device pointer to gpt-oss per-head sink logits —
+    /// <b>F32</b>, <c>numHeads</c> elements, indexed by QUERY head. 0 ⇒ nullptr ⇒ sink disabled,
+    /// which is bit-identical to the pre-#365 kernel.
+    /// </para>
+    /// </summary>
     public void LaunchAttention(nint q, nint k, nint v, nint output,
                                  int seqQ, int seqKv,
                                  int numHeads, int numKvHeads, int headDim,
-                                 int positionOffset, int slidingWindow, nint stream)
+                                 int positionOffset, int slidingWindow, nint stream,
+                                 nint sinks = 0)
     {
         nint qArg = q, kArg = k, vArg = v, outArg = output;
         int sqArg = seqQ, skvArg = seqKv;
         int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
         int poArg = positionOffset, swArg = slidingWindow;
+        nint sinksArg = sinks; // 0 ⇒ nullptr ⇒ sink disabled (pre-#365 behaviour)
 
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &sqArg, &skvArg, &nhArg, &nkvArg, &hdArg,
-                        &poArg, &swArg};
+                        &poArg, &swArg, &sinksArg};
 
         int numBlocks = seqQ * numHeads;
         // Tiled online softmax: q_shared[headDim] + score_tile[256] + out_accum[headDim] + warp_scratch[32]
@@ -4109,7 +4152,8 @@ public sealed unsafe class CudaKernels : IDisposable
     public void LaunchAttentionDyn(nint q, nint k, nint v, nint output,
                                     int seqQ, nint seqKvPtr,
                                     int numHeads, int numKvHeads, int headDim,
-                                    nint positionOffsetPtr, int slidingWindow, nint stream)
+                                    nint positionOffsetPtr, int slidingWindow, nint stream,
+                                    nint sinks = 0)
     {
         nint qArg = q, kArg = k, vArg = v, outArg = output;
         int sqArg = seqQ;
@@ -4117,10 +4161,15 @@ public sealed unsafe class CudaKernels : IDisposable
         int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
         nint poPtrArg = positionOffsetPtr;
         int swArg = slidingWindow;
+        // 0 ⇒ nullptr ⇒ sink disabled. Graph-safe: the sink buffer is a fixed per-layer
+        // allocation whose CONTENTS never change between decode steps, so baking this
+        // pointer into the captured graph is valid across every replay (unlike seqKv /
+        // positionOffset, which is exactly why those two are passed indirectly).
+        nint sinksArg = sinks;
 
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &sqArg, &skvPtrArg, &nhArg, &nkvArg, &hdArg,
-                        &poPtrArg, &swArg};
+                        &poPtrArg, &swArg, &sinksArg};
 
         int numBlocks = seqQ * numHeads;
         const int TileKv = 256;

@@ -532,14 +532,21 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
             {
                 cudaKvCache.UpdateDevice(_cudaState.K, _cudaState.V, positions, seqLen, cacheLayer, s);
                 int seqKv = cudaKvCache.CurrentLength;
+                // lw.AttnSinksDevice (#365): 0 unless the GGUF carried `attn_sinks.weight`, so this
+                // is bit-identical for every model that has no sinks. Plumbed for the same reason
+                // as HybridTransformerModel's pair — sink loading is tensor-driven, not
+                // architecture-gated, so a future dense sinks model reaching this split path must
+                // not drop them silently.
                 _kernels.LaunchAttention(_cudaState.Q, cudaKvCache.GetKeysPtr(cacheLayer),
                     cudaKvCache.GetValuesPtr(cacheLayer), _cudaState.AttnOutput,
-                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], slidingWindow, s);
+                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], slidingWindow, s,
+                    lw.AttnSinksDevice);
             }
             else
             {
                 _kernels.LaunchAttention(_cudaState.Q, _cudaState.K, _cudaState.V, _cudaState.AttnOutput,
-                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s);
+                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s,
+                    lw.AttnSinksDevice);
             }
 
             Project(lw.OQuant, lw.OQuantType, lw.O, _cudaState.AttnOutput, _cudaState.NormOutput,

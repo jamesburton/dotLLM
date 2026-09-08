@@ -494,14 +494,21 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
             {
                 kvCache.UpdateDevice(_state.K, _state.V, positions, seqLen, cacheLayer, s);
                 int seqKv = kvCache.CurrentLength;
+                // lw.AttnSinksDevice (#365): 0 unless the GGUF carried `attn_sinks.weight`, so this
+                // is bit-identical for every model that has no sinks. Plumbed for the same reason
+                // as HybridTransformerModel's pair — sink loading is tensor-driven, not
+                // architecture-gated, so a future dense sinks model split across pipeline stages
+                // must not drop them silently.
                 _kernels.LaunchAttention(_state.Q, kvCache.GetKeysPtr(cacheLayer),
                     kvCache.GetValuesPtr(cacheLayer), _state.AttnOutput,
-                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], slidingWindow, s);
+                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], slidingWindow, s,
+                    lw.AttnSinksDevice);
             }
             else
             {
                 _kernels.LaunchAttention(_state.Q, _state.K, _state.V, _state.AttnOutput,
-                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s);
+                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s,
+                    lw.AttnSinksDevice);
             }
 
             Project(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutput, _state.NormOutput,

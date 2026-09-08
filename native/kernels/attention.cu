@@ -61,7 +61,8 @@ __device__ __forceinline__ void attention_f16_body(
     int position_offset,
     int sliding_window,
     const int* __restrict__ seq_kv_ptr,
-    const int* __restrict__ position_offset_ptr);
+    const int* __restrict__ position_offset_ptr,
+    const float* __restrict__ sinks);
 
 extern "C" __global__ void __launch_bounds__(256) attention_f16(
     const half* __restrict__ q,
@@ -74,10 +75,11 @@ extern "C" __global__ void __launch_bounds__(256) attention_f16(
     const int num_kv_heads,
     const int head_dim,
     const int position_offset,
-    const int sliding_window)
+    const int sliding_window,
+    const float* __restrict__ sinks)   // gpt-oss per-head sink logits [num_heads]; nullptr = disabled
 {
     attention_f16_body<false>(q, k, v, output, seq_q, seq_kv, num_heads, num_kv_heads,
-                       head_dim, position_offset, sliding_window, nullptr, nullptr);
+                       head_dim, position_offset, sliding_window, nullptr, nullptr, sinks);
 }
 
 // Graph-friendly entry point: seq_kv and position_offset are dereferenced from
@@ -96,12 +98,13 @@ extern "C" __global__ void __launch_bounds__(256) attention_f16_dyn(
     const int num_kv_heads,
     const int head_dim,
     const int* __restrict__ position_offset_ptr,
-    const int sliding_window)
+    const int sliding_window,
+    const float* __restrict__ sinks)   // gpt-oss per-head sink logits [num_heads]; nullptr = disabled
 {
     attention_f16_body<true>(q, k, v, output, seq_q, /*seq_kv resolved post-barrier*/ 0,
                        num_heads, num_kv_heads, head_dim,
                        /*position_offset resolved post-barrier*/ 0, sliding_window,
-                       seq_kv_ptr, position_offset_ptr);
+                       seq_kv_ptr, position_offset_ptr, sinks);
 }
 
 template <bool DeviceIndirect>
@@ -118,7 +121,8 @@ __device__ __forceinline__ void attention_f16_body(
     int position_offset,
     int sliding_window,
     const int* __restrict__ seq_kv_ptr,
-    const int* __restrict__ position_offset_ptr)
+    const int* __restrict__ position_offset_ptr,
+    const float* __restrict__ sinks)
 {
     int block_id = blockIdx.x;
     int total_blocks = seq_q * num_heads;
@@ -298,6 +302,51 @@ __device__ __forceinline__ void attention_f16_body(
             out_accum[d] += v_acc;
         }
         __syncthreads();
+    }
+
+    // gpt-oss attention sinks (#365): the per-head sink logit joins the softmax
+    // denominator as a final "virtual tile" with no V contribution. Matches CPU
+    // Attention.SoftmaxRowWithSink / llama.cpp ggml_soft_max_add_sinks:
+    //   m' = max(running_max, sink)
+    //   running_sum = running_sum * exp(running_max - m') + exp(sink - m')
+    //   out_accum  *= exp(running_max - m')
+    // i.e. exactly the same online-softmax rescale step 2c performs per tile, run
+    // once more against a tile whose only "score" is the sink and whose V row is
+    // zero — so the sink absorbs probability mass but moves no value vector.
+    // Indexed by the QUERY head `hq`, not the KV head `hkv`: gpt-oss stores one
+    // sink logit per query head (mirrors the CPU reference and attention_f32.cu).
+    // nullptr => bit-identical to the pre-#365 kernel (no rescale, no added term).
+    //
+    // Uses expf, matching every other exp in this kernel. (attention_f32.cu's twin
+    // epilogue uses its file-local Schraudolph fast_exp_neg because that file's
+    // tile loop does too — mixing exp flavours within one softmax would make the
+    // sink term inconsistent with the tile terms it is normalised against.)
+    if (sinks != nullptr)
+    {
+        float sink = sinks[hq];
+        float new_max = fmaxf(running_max, sink);
+        float correction = (running_max > -FLT_MAX + 1.0f)
+                           ? expf(running_max - new_max) : 0.0f;
+
+        running_sum = running_sum * correction + expf(sink - new_max);
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+            out_accum[d] *= correction;
+
+        running_max = new_max;
+        // No __syncthreads() needed: each thread rescales and later reads only its
+        // own strided d-elements of out_accum; running_sum/running_max are
+        // per-thread registers already uniform across the block at this point.
+        // VERIFIED against this file's tile loop, not assumed: both start from
+        // uniform initializers, and every update is a function of block-uniform
+        // values only — `running_max` from `tile_max = warp_scratch[0]` read after
+        // the barrier that follows thread 0's write (step 2b), and `running_sum`
+        // from `*= correction` (uniform inputs) plus `+= warp_scratch[0]` read
+        // after its own barrier (step 2d). The `running_max == -FLT_MAX` case
+        // (seq_kv == 0, or every score masked by the causal/sliding-window
+        // predicate) is handled by the same `correction = 0` guard the tile loop
+        // uses: out_accum is zeroed, the denominator becomes the sink term alone,
+        // and the row writes out exactly 0 — the correct limit of a row whose
+        // entire probability mass sits on the sink.
     }
 
     // Step 3: Final normalize and write output
