@@ -37,6 +37,18 @@ internal static class TiktokenPreTokenizer
             RegexOptions.Compiled),
     ];
 
+    // ── Qwen3.5 / qwen35 (PrismML Bonsai, Qwen3.6+/3.8 hybrids) ─────
+    // llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN35 (llama-vocab.cpp). Differs from the Llama-3 pattern in
+    // two ways that matter: the letter classes include combining marks (\p{M}), and digits are NOT
+    // grouped in runs of up to three — \p{N} matches one digit at a time. Case-insensitive
+    // contractions are spelled out per-character rather than via (?i:), matching llama.cpp exactly.
+    // clean_spaces = false for this type, which is the default for this pipeline.
+    private static readonly Regex[] Qwen35Pipeline =
+    [
+        new(@"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+            RegexOptions.Compiled),
+    ];
+
     // ── StarCoder / SmolLM family ───────────────────────────────────
     // Two stages, in order: isolate every digit, then the GPT-2 pattern WITHOUT its
     // trailing `|\s+` alternative. Shared by StarCoder, Refact, Command-R, SmolLM,
@@ -117,6 +129,7 @@ internal static class TiktokenPreTokenizer
         "deepseek-coder" => DeepSeekCoderPipeline,
         "gpt-4o" or "llama4" => Gpt4oPipeline,
         "tekken" => TekkenPipeline,
+        "qwen35" => Qwen35Pipeline,
         _ => Environment.GetEnvironmentVariable("DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER") == "1"
             ? Gpt2Pipeline
             : throw new InvalidDataException(

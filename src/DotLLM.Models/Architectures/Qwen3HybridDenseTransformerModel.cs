@@ -58,6 +58,10 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     private readonly int _ropeDim;
 
     private readonly Qwen3HybridDenseForwardState _state;
+
+    // PrismML Hadamard fold (prism.hadamard.*) — null for every checkpoint outside the Bonsai 2
+    // family, and every rotation site below is a no-op when it is null.
+    private readonly HadamardActivationRotator? _hadamard;
     private readonly GdnStateCache _gdnCache;
 
     private readonly ComputeThreadPool? _threadPool;
@@ -134,7 +138,17 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             nVHead: _gdn.NVHead,
             nKHead: _gdn.NKHead,
             dState: _gdn.DState,
-            intermediateSize: config.IntermediateSize);
+            intermediateSize: config.IntermediateSize,
+            hasHadamardFold: config.HadamardFold is not null);
+
+        if (config.HadamardFold is { } fold)
+        {
+            _hadamard = new HadamardActivationRotator(fold, _gdn);
+            // Cheap insurance for the fixed-site rotation strategy: if a checkpoint ever folds a
+            // different set of weights than the sites below cover, fail here rather than generate
+            // fluent text in the wrong basis.
+            _hadamard.ValidateQwen35FoldSet(config.NumLayers, _gdn.FullAttnInterval);
+        }
     }
 
     /// <summary>
@@ -537,7 +551,15 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 new Span<float>(hidden + t * hiddenSize, hiddenSize));
         }
 
-        Gemm(_outputWeight, _outputQuantType, hidden, logits,
+        // output.weight is folded too — the final-norm output needs rotating before the lm_head.
+        float* headIn = hidden;
+        if (_hadamard is { } headRot)
+        {
+            headIn = (float*)_state.HadamardScratch;
+            headRot.RotateForward(hidden, headIn, seqLen, _outputInputDim);
+        }
+
+        Gemm(_outputWeight, _outputQuantType, headIn, logits,
              _outputOutputDim, _outputInputDim, seqLen);
 
         var shape = new TensorShape(seqLen, vocabSize);
@@ -1119,7 +1141,15 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         if (TensorDump.Enabled)
             TensorDump.Dump2D("result_norm", hidden, seqLen, hiddenSize);
 
-        Gemm(_outputWeight, _outputQuantType, hidden, logits,
+        // output.weight is folded too — the final-norm output needs rotating before the lm_head.
+        float* headIn = hidden;
+        if (_hadamard is { } headRot)
+        {
+            headIn = (float*)_state.HadamardScratch;
+            headRot.RotateForward(hidden, headIn, seqLen, _outputInputDim);
+        }
+
+        Gemm(_outputWeight, _outputQuantType, headIn, logits,
              _outputOutputDim, _outputInputDim, seqLen);
 
         if (TensorDump.Enabled)
@@ -1288,10 +1318,19 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         int gdnOrdinal = _gdnLayerOrdinal[absoluteLayerIdx];
 
         // ── 1. Projections from normed input ──────────────────────────────────
-        // All four projections read from normOut (the attn_norm output).
-        Gemm(gdnW.QkvWeight, gdnW.QkvQuantType, normOut, qkvBuf,
+        // All four projections read from normOut (the attn_norm output), but on a
+        // Hadamard-folded checkpoint only qkv and gate are folded: alpha and beta are NOT, so they
+        // must keep reading the unrotated activation. Hence the rotation goes to scratch.
+        float* foldedIn = normOut;
+        if (_hadamard is { } rot)
+        {
+            foldedIn = (float*)_state.HadamardScratch;
+            rot.RotateForward(normOut, foldedIn, seqLen, gdnW.QkvInputDim);
+        }
+
+        Gemm(gdnW.QkvWeight, gdnW.QkvQuantType, foldedIn, qkvBuf,
              gdnW.QkvOutputDim, gdnW.QkvInputDim, seqLen);
-        Gemm(gdnW.GateWeight, gdnW.GateQuantType, normOut, zBuf,
+        Gemm(gdnW.GateWeight, gdnW.GateQuantType, foldedIn, zBuf,
              gdnW.GateOutputDim, gdnW.GateInputDim, seqLen);
         Gemm(gdnW.AlphaWeight, gdnW.AlphaQuantType, normOut, alphaBuf,
              gdnW.AlphaOutputDim, gdnW.AlphaInputDim, seqLen);
@@ -1430,7 +1469,17 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             TensorDump.Dump3D($"blk.{absoluteLayerIdx}.final_output", gdnOut, seqLen, nVHead, dState);
 
         // ── 7. ssm_out projection into normOut ────────────────────────────────
-        Gemm(gdnW.OutWeight, gdnW.OutQuantType, gdnOut, normOut,
+        // ssm_out is the one folded weight that also needs the value-head permutation: the fold was
+        // computed in grouped [dState, rep, nKHead] order while the recurrence emits tiled order.
+        float* outIn = gdnOut;
+        if (_hadamard is { } outRot)
+        {
+            outIn = (float*)_state.HadamardScratch;
+            outRot.RotateForward(gdnOut, outIn, seqLen, gdnW.OutInputDim,
+                                 permuteGdnValueHeads: true);
+        }
+
+        Gemm(gdnW.OutWeight, gdnW.OutQuantType, outIn, normOut,
              gdnW.OutOutputDim, gdnW.OutInputDim, seqLen);
 
         if (TensorDump.Enabled)
@@ -1470,7 +1519,16 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         float* gate = (float*)_state.GateScratch;
 
         // 1. Fused Q+Gate projection.
-        Gemm(attn.QWeight, attn.QQuantType, normOut, qgBuf, attn.QOutputDim, attn.QInputDim, seqLen);
+        // attn_q/attn_k/attn_v are all folded and all read the same attn_norm output, so one
+        // rotation serves the three (the fork memoizes the identical way).
+        float* projIn = normOut;
+        if (_hadamard is { } qkvRot)
+        {
+            projIn = (float*)_state.HadamardScratch;
+            qkvRot.RotateForward(normOut, projIn, seqLen, attn.QInputDim);
+        }
+
+        Gemm(attn.QWeight, attn.QQuantType, projIn, qgBuf, attn.QOutputDim, attn.QInputDim, seqLen);
         if (TensorDump.Enabled)
             TensorDump.Dump2D($"blk.{layer}.fa_qg", qgBuf, seqLen, qgElems);
 
@@ -1499,8 +1557,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         }
 
         // 3. K and V projections.
-        Gemm(attn.KWeight, attn.KQuantType, normOut, k, attn.KOutputDim, attn.KInputDim, seqLen);
-        Gemm(attn.VWeight, attn.VQuantType, normOut, v, attn.VOutputDim, attn.VInputDim, seqLen);
+        Gemm(attn.KWeight, attn.KQuantType, projIn, k, attn.KOutputDim, attn.KInputDim, seqLen);
+        Gemm(attn.VWeight, attn.VQuantType, projIn, v, attn.VOutputDim, attn.VInputDim, seqLen);
         if (TensorDump.Enabled)
         {
             TensorDump.Dump2D($"blk.{layer}.fa_k", k, seqLen, numKvHeads * headDim);
@@ -1584,7 +1642,16 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             TensorDump.Dump2D($"blk.{layer}.fa_attnout_postgate", attnOut, seqLen, qElems);
 
         // 8. Output projection.
-        Gemm(attn.OWeight, attn.OQuantType, attnOut, normOut, attn.OOutputDim, attn.OInputDim, seqLen);
+        // attn_output shares the 6144-wide sign vector with ssm_out but takes NO value-head
+        // permutation — the permutation is per-weight state, not a property of the width.
+        float* oIn = attnOut;
+        if (_hadamard is { } oRot)
+        {
+            oIn = (float*)_state.HadamardScratch;
+            oRot.RotateForward(attnOut, oIn, seqLen, attn.OInputDim);
+        }
+
+        Gemm(attn.OWeight, attn.OQuantType, oIn, normOut, attn.OOutputDim, attn.OInputDim, seqLen);
     }
 
     /// <summary>
@@ -1600,8 +1667,16 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         float* ffnUp = (float*)_state.FfnUp;
         float* siluOut = (float*)_state.SiluOutput;
 
-        Gemm(lw.GateWeight, lw.GateQuantType, normOut, ffnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
-        Gemm(lw.UpWeight, lw.UpQuantType, normOut, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+        // ffn_gate and ffn_up are both folded and share the same input — one rotation.
+        float* ffnIn = normOut;
+        if (_hadamard is { } ffnRot)
+        {
+            ffnIn = (float*)_state.HadamardScratch;
+            ffnRot.RotateForward(normOut, ffnIn, seqLen, lw.GateInputDim);
+        }
+
+        Gemm(lw.GateWeight, lw.GateQuantType, ffnIn, ffnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
+        Gemm(lw.UpWeight, lw.UpQuantType, ffnIn, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
 
         for (int t = 0; t < seqLen; t++)
         {
@@ -1611,7 +1686,16 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             FusedOps.SwiGLU(gateSpan, upSpan, outSpan);
         }
 
-        Gemm(lw.DownWeight, lw.DownQuantType, siluOut, normOut, lw.DownOutputDim, lw.DownInputDim, seqLen);
+        // ffn_down's input is the 17408-wide SwiGLU result. Reusing the scratch is safe: the
+        // gate/up rotation above has already been consumed by both GEMMs.
+        float* downIn = siluOut;
+        if (_hadamard is { } downRot)
+        {
+            downIn = (float*)_state.HadamardScratch;
+            downRot.RotateForward(siluOut, downIn, seqLen, lw.DownInputDim);
+        }
+
+        Gemm(lw.DownWeight, lw.DownQuantType, downIn, normOut, lw.DownOutputDim, lw.DownInputDim, seqLen);
     }
 
     private void EmbedTokens(ReadOnlySpan<int> tokenIds, float* hidden, int hiddenSize)
@@ -1646,6 +1730,12 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 Dequantize.ToFloat32(embPtr + (nint)((long)tokenId * rowBytes), hiddenSize, qt, destSpan);
             }
         }
+
+        // A Hadamard-latent embedding table stores rotated rows: restore the primal basis right
+        // after the lookup. Note the INVERSE order — rotation first, then signs (h = s * (H z)) —
+        // which is the opposite of every folded-weight site above.
+        if (_hadamard is { } embRot)
+            embRot.RotateInverseInPlace(hidden, tokenIds.Length, hiddenSize);
     }
 
     /// <summary>Single-token embedding lookup against an arbitrary embedding table — used by

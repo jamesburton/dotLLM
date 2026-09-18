@@ -72,23 +72,25 @@ public sealed class HadamardActivationRotator
     /// Rotates every row of a <c>[seqLen, width]</c> activation into <paramref name="dst"/>, ready
     /// to be multiplied by the named folded weight.
     /// </summary>
-    /// <param name="tensorName">
-    /// The folded weight's GGUF name. Only used to decide whether the GDN value-head permutation
-    /// applies (<c>*.ssm_out.weight</c>); the rotation itself depends only on the width.
-    /// </param>
     /// <param name="src">Source activation, <c>seqLen · width</c> floats.</param>
     /// <param name="dst">Destination, same length. Must not alias <paramref name="src"/>.</param>
     /// <param name="seqLen">Number of token rows.</param>
     /// <param name="width">Activation width (the folded weight's input dimension).</param>
-    public unsafe void RotateForward(string tensorName, float* src, float* dst, int seqLen, int width)
+    /// <param name="permuteGdnValueHeads">
+    /// True only for <c>*.ssm_out.weight</c>, whose fold was computed in grouped value-head order.
+    /// Passed as a flag rather than derived from a tensor name so the hot path allocates nothing.
+    /// Ignored when the checkpoint does not set <c>prism.hadamard.gdn_v_grouped</c>.
+    /// </param>
+    public unsafe void RotateForward(
+        float* src, float* dst, int seqLen, int width, bool permuteGdnValueHeads = false)
     {
         var signs = _fold.SignsFor(width);
         var signSpan = signs is null ? ReadOnlySpan<sbyte>.Empty : signs.AsSpan();
-        bool permute = _fold.GdnVGrouped && IsSsmOut(tensorName);
+        bool permute = _fold.GdnVGrouped && permuteGdnValueHeads;
 
         if (permute && width != _dState * _nKHead * _rep)
             throw new InvalidOperationException(
-                $"'{tensorName}' input width {width} does not match GDN geometry " +
+                $"ssm_out input width {width} does not match GDN geometry " +
                 $"{_dState}x{_nKHead}x{_rep} = {_dState * _nKHead * _rep}.");
 
         for (int t = 0; t < seqLen; t++)
