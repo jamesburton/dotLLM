@@ -57,6 +57,10 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
 
     private readonly VulkanQwen3HybridDenseWeights _weights;
     private readonly VulkanQwen3HybridDenseForwardState _state;
+
+    // PrismML Hadamard fold (prism.hadamard.*) — null outside the Bonsai 2 family; every rotation
+    // site below is a no-op when it is null.
+    private readonly VulkanHadamardRotation? _hadamard;
     private readonly VulkanGdnStateCache _gdnCache;
     private readonly VulkanQwen3MoeHybridKernels _kernels;
 
@@ -106,7 +110,8 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         VulkanQwen3MoeHybridKernels kernels,
         int[] kvSlotForLayer, int attentionLayerCount,
         int[] gdnLayerOrdinal,
-        int ropeDim, float ropeTheta)
+        int ropeDim, float ropeTheta,
+        VulkanHadamardRotation? hadamard)
     {
         _device = device;
         _ownsDevice = ownsDevice;
@@ -124,6 +129,7 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         _gdnLayerOrdinal = gdnLayerOrdinal;
         _ropeDim = ropeDim;
         _ropeTheta = ropeTheta;
+        _hadamard = hadamard;
 
         _submit = device.CreateSubmitContext();
     }
@@ -250,11 +256,15 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         var gdnCache = new VulkanGdnStateCache(device, gdn, gdnOrdinal);
         var kernels = VulkanQwen3MoeHybridKernels.Create(device, spvDir, config.HeadDim);
 
+        var hadamard = config.HadamardFold is { } fold
+            ? VulkanHadamardRotation.Create(device, spvDir, fold, gdn)
+            : null;
+
         return new VulkanQwen3HybridDenseTransformerModel(
             device, ownsDevice,
             config, gguf, cpuModel, weights, state, gdnCache, kernels,
             kvSlotForLayer, attentionLayerCount, gdnLayerOrdinal,
-            ropeDim, ropeTheta);
+            ropeDim, ropeTheta, hadamard);
     }
 
     // ── CPU-model accessors (we share the CPU loader; reach into its layers) ─
@@ -345,7 +355,13 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         }
 
         bool resized = _state.EnsureCapacity(seqLen);
-        if (resized) _kernels.InvalidateAll();
+        if (resized)
+        {
+            _kernels.InvalidateAll();
+            // The FWHT kernel keeps its own handle-keyed descriptor cache, and a freed buffer handle
+            // can be recycled into the new scratch allocation — which would bind the stale set.
+            _hadamard?.InvalidateDescriptorCache();
+        }
 
         UploadPositions(positions);
 
@@ -445,8 +461,16 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             rowCount: 1, n: hiddenSize, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
+        var headIn = _state.NormOutput;
+        if (_hadamard is { } headRot)
+        {
+            headIn = _state.HadamardScratch!;
+            headRot.RecordForward(cmdBuf, _state.NormOutput, headIn, 1, _weights.OutputInputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+
         RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
-            _state.NormOutput, _state.Logits,
+            headIn, _state.Logits,
             outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: 1);
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         _submit.SubmitAndWait();
@@ -541,11 +565,20 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         nint cmdBuf, in VulkanQwen3HybridDenseWeights.DenseFfnLayerBuffers ffn,
         int seqLen, int intermediateSize)
     {
+        // ffn_gate and ffn_up are both folded and share this input — one rotation serves both.
+        var ffnIn = _state.NormOutput;
+        if (_hadamard is { } ffnRot)
+        {
+            ffnIn = _state.HadamardScratch!;
+            ffnRot.RecordForward(cmdBuf, _state.NormOutput, ffnIn, seqLen, ffn.GateInputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+
         RecordMatmul(cmdBuf, ffn.GateWeight, ffn.GateDeviceQuantType,
-            _state.NormOutput, _state.FfnGate,
+            ffnIn, _state.FfnGate,
             outputDim: ffn.GateOutputDim, inputDim: ffn.GateInputDim, seqLen: seqLen);
         RecordMatmul(cmdBuf, ffn.UpWeight, ffn.UpDeviceQuantType,
-            _state.NormOutput, _state.FfnUp,
+            ffnIn, _state.FfnUp,
             outputDim: ffn.UpOutputDim, inputDim: ffn.UpInputDim, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
@@ -553,8 +586,17 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             n: checked(seqLen * intermediateSize));
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
+        // Reusing the scratch is safe: the gate/up rotation above has been consumed by both GEMMs.
+        var downIn = _state.FfnSilu;
+        if (_hadamard is { } downRot)
+        {
+            downIn = _state.HadamardScratch!;
+            downRot.RecordForward(cmdBuf, _state.FfnSilu, downIn, seqLen, ffn.DownInputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+
         RecordMatmul(cmdBuf, ffn.DownWeight, ffn.DownDeviceQuantType,
-            _state.FfnSilu, _state.NormOutput,
+            downIn, _state.NormOutput,
             outputDim: ffn.DownOutputDim, inputDim: ffn.DownInputDim, seqLen: seqLen);
     }
 
@@ -583,11 +625,21 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         var gdnStateBuf = gdnCache.GetGdnStateBuffer(gdnOrdinal);
 
         // ── 1. Projections ───────────────────────────────────────────────────
+        // Only attn_qkv and attn_gate are folded; ssm_alpha and ssm_beta below deliberately keep
+        // reading the UNROTATED NormOutput, which is why the rotation goes to a separate buffer.
+        var gdnProjIn = _state.NormOutput;
+        if (_hadamard is { } gdnRot)
+        {
+            gdnProjIn = _state.HadamardScratch!;
+            gdnRot.RecordForward(cmdBuf, _state.NormOutput, gdnProjIn, seqLen, gdnW.QkvInputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+
         RecordMatmul(cmdBuf, gdnW.QkvWeight, gdnW.QkvDeviceQuantType,
-            _state.NormOutput, _state.GdnQkvBuf,
+            gdnProjIn, _state.GdnQkvBuf,
             outputDim: gdnW.QkvOutputDim, inputDim: gdnW.QkvInputDim, seqLen: seqLen);
         RecordMatmul(cmdBuf, gdnW.GateWeight, gdnW.GateDeviceQuantType,
-            _state.NormOutput, _state.GdnZBuf,
+            gdnProjIn, _state.GdnZBuf,
             outputDim: gdnW.GateOutputDim, inputDim: gdnW.GateInputDim, seqLen: seqLen);
         RecordMatmul(cmdBuf, gdnW.AlphaWeight, gdnW.AlphaDeviceQuantType,
             _state.NormOutput, _state.GdnAlphaBuf,
@@ -677,8 +729,19 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // ── 7. ssm_out projection back into NormOutput ───────────────────────
+        // The one site taking the value-head permutation: the fold was computed in grouped
+        // [dState, rep, nKHead] order while the scan emits tiled order.
+        var ssmOutIn = _state.GdnOut;
+        if (_hadamard is { } outRot)
+        {
+            ssmOutIn = _state.HadamardScratch!;
+            outRot.RecordForward(cmdBuf, _state.GdnOut, ssmOutIn, seqLen, gdnW.OutInputDim,
+                permuteGdnValueHeads: true);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+
         RecordMatmul(cmdBuf, gdnW.OutWeight, gdnW.OutDeviceQuantType,
-            _state.GdnOut, _state.NormOutput,
+            ssmOutIn, _state.NormOutput,
             outputDim: gdnW.OutOutputDim, inputDim: gdnW.OutInputDim, seqLen: seqLen);
     }
 
@@ -698,8 +761,18 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         int qgElems = 2 * qElems;
 
         // 1. Fused Q+Gate projection.
+        // attn_q / attn_k / attn_v are all folded and share this input, so one rotation serves the
+        // three. HadamardScratch is untouched between here and the K/V projections below.
+        var attnProjIn = _state.NormOutput;
+        if (_hadamard is { } attnRot)
+        {
+            attnProjIn = _state.HadamardScratch!;
+            attnRot.RecordForward(cmdBuf, _state.NormOutput, attnProjIn, seqLen, attnW.QInputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+
         RecordMatmul(cmdBuf, attnW.QWeight, attnW.QDeviceQuantType,
-            _state.NormOutput, _state.QGateScratch,
+            attnProjIn, _state.QGateScratch,
             outputDim: attnW.QOutputDim, inputDim: attnW.QInputDim, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
@@ -727,10 +800,10 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
 
         // 3. K and V projections.
         RecordMatmul(cmdBuf, attnW.KWeight, attnW.KDeviceQuantType,
-            _state.NormOutput, _state.K,
+            attnProjIn, _state.K,
             outputDim: attnW.KOutputDim, inputDim: attnW.KInputDim, seqLen: seqLen);
         RecordMatmul(cmdBuf, attnW.VWeight, attnW.VDeviceQuantType,
-            _state.NormOutput, _state.V,
+            attnProjIn, _state.V,
             outputDim: attnW.VOutputDim, inputDim: attnW.VInputDim, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
@@ -804,8 +877,17 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 8. Output projection.
+        // Shares the 6144 sign vector with ssm_out but takes NO value-head permutation.
+        var oProjIn = _state.AttnOutput;
+        if (_hadamard is { } oRot)
+        {
+            oProjIn = _state.HadamardScratch!;
+            oRot.RecordForward(cmdBuf, _state.AttnOutput, oProjIn, seqLen, attnW.OInputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+
         RecordMatmul(cmdBuf, attnW.OWeight, attnW.ODeviceQuantType,
-            _state.AttnOutput, _state.NormOutput,
+            oProjIn, _state.NormOutput,
             outputDim: attnW.OOutputDim, inputDim: attnW.OInputDim, seqLen: seqLen);
     }
 
@@ -959,6 +1041,17 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             };
             VulkanApi.vkCmdCopyBuffer(cmdBuf, srcBuf, dstBuf, 1, region);
         }
+
+        // A Hadamard-latent embedding table stores rotated rows, so restore the primal basis right
+        // after the lookup. Note the INVERSE order — rotation then signs — which is the opposite of
+        // every folded-weight site. In place is safe here: without the permute each workgroup reads
+        // only the block it writes.
+        if (_hadamard is { } embRot)
+        {
+            KernelSupport.TransferToComputeBarrier(cmdBuf);
+            embRot.RecordInverseInPlace(cmdBuf, _state.HiddenState, tokenIds.Length, hiddenSize);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
     }
 
     private void UploadPositions(ReadOnlySpan<int> positions)
@@ -974,6 +1067,7 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         _state.Dispose();
         _weights.Dispose();
         _gdnCache.Dispose();
+        _hadamard?.Dispose();
         _kernels.Dispose();
         // Frees the CPU model's dequantised norm arrays and detaches it from the
         // GgufFile. The GgufFile itself is caller-owned.

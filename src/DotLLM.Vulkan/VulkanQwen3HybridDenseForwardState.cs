@@ -17,6 +17,7 @@ internal sealed class VulkanQwen3HybridDenseForwardState : IDisposable
     private readonly int _vocabSize;
     private readonly int _intermediateSize;
     private readonly int _qElems;          // numHeads * headDim
+    private readonly bool _hasHadamardFold;
     private readonly int _kvElems;         // numKvHeads * headDim
     private readonly int _convDim;         // (2*NKHead + NVHead) * DState
     private readonly int _dConv;
@@ -31,6 +32,18 @@ internal sealed class VulkanQwen3HybridDenseForwardState : IDisposable
     public VulkanDevice.Buffer Residual { get; private set; } = null!;
     public VulkanDevice.Buffer AddScratch { get; private set; } = null!;
     public VulkanDevice.Buffer NormOutput { get; private set; } = null!;
+
+    /// <summary>
+    /// Destination for the PrismML Hadamard activation transform (<c>prism.hadamard.*</c>).
+    /// Null for checkpoints without a fold.
+    /// </summary>
+    /// <remarks>
+    /// Sized to the widest folded activation (the SwiGLU result at <c>intermediateSize</c>). One
+    /// buffer serves every site because each rotation is consumed by the GEMMs that share it before
+    /// the next overwrites it. It must be distinct from the activation: <c>ssm_alpha</c> and
+    /// <c>ssm_beta</c> are not folded and read the unrotated <c>NormOutput</c>, as does the residual.
+    /// </remarks>
+    public VulkanDevice.Buffer? HadamardScratch { get; private set; }
 
     // ── Full attention ───────────────────────────────────────────────────────
     public VulkanDevice.Buffer QGateScratch { get; private set; } = null!;  // [seqLen, 2*qElems]
@@ -77,6 +90,7 @@ internal sealed class VulkanQwen3HybridDenseForwardState : IDisposable
         _gdnVDim = gdn.NVHead * gdn.DState;
         _gdnKDim = gdn.NKHead * gdn.DState;
         _nVHead = gdn.NVHead;
+        _hasHadamardFold = config.HadamardFold is not null;
 
         Logits = device.Allocate((long)_vocabSize * sizeof(float));
         PositionsBuffer = device.Allocate(Math.Max(1, initialSeqLen) * sizeof(int));
@@ -133,6 +147,16 @@ internal sealed class VulkanQwen3HybridDenseForwardState : IDisposable
         FfnUp = _device.AllocateDeviceLocal(ffnBytes);
         FfnSilu = _device.AllocateDeviceLocal(ffnBytes);
 
+        long hadamardBytes = 0;
+        if (_hasHadamardFold)
+        {
+            // The widest folded input is the SwiGLU result feeding ffn_down; hidden, qElems and the
+            // GDN value dim are all narrower.
+            int maxWidth = Math.Max(Math.Max(_hiddenSize, _qElems), Math.Max(_gdnVDim, _intermediateSize));
+            hadamardBytes = (long)seqLen * maxWidth * sizeof(float);
+            HadamardScratch = _device.AllocateDeviceLocal(hadamardBytes);
+        }
+
         PositionsBuffer.Dispose();
         PositionsBuffer = _device.Allocate((long)seqLen * sizeof(int));
 
@@ -140,12 +164,14 @@ internal sealed class VulkanQwen3HybridDenseForwardState : IDisposable
         AllocatedBytes = hiddenBytes * 4 + qBytes * 3 + kvBytes * 2 + qgBytes
             + convInputBytes + convBytes + vDimBytes * 3 + kDimBytes * 2 + alphaBytes * 2
             + ffnBytes * 3
-            + (long)_vocabSize * sizeof(float) + (long)seqLen * sizeof(int);
+            + (long)_vocabSize * sizeof(float) + (long)seqLen * sizeof(int)
+            + hadamardBytes;
     }
 
     private void ReleaseLayerScratch()
     {
         HiddenState?.Dispose(); Residual?.Dispose(); AddScratch?.Dispose(); NormOutput?.Dispose();
+        HadamardScratch?.Dispose(); HadamardScratch = null;
         QGateScratch?.Dispose(); Q?.Dispose(); GateScratch?.Dispose();
         K?.Dispose(); V?.Dispose(); AttnOutput?.Dispose();
         GdnConvInput?.Dispose(); GdnQkvBuf?.Dispose(); GdnZBuf?.Dispose();
