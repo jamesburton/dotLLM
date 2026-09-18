@@ -83,7 +83,10 @@ public sealed class HadamardFwhtF32Kernel : IDisposable
 
     /// <summary>Synchronous launch — wraps <see cref="Record"/>; used by unit tests.</summary>
     /// <param name="src">Source activation buffer, <c>[rows, width]</c> F32.</param>
-    /// <param name="dst">Destination buffer, same shape. May be the same buffer as <paramref name="src"/>.</param>
+    /// <param name="dst">
+    /// Destination buffer, same shape. May alias <paramref name="src"/> ONLY when
+    /// <paramref name="permute"/> is null — see <see cref="Record"/>.
+    /// </param>
     /// <param name="signs">±1 vector of <paramref name="width"/> floats; may be any bound buffer when <paramref name="applySigns"/> is false.</param>
     /// <param name="rows">Token rows.</param>
     /// <param name="width">Row width; must be a positive multiple of <paramref name="blockSize"/>.</param>
@@ -139,6 +142,17 @@ public sealed class HadamardFwhtF32Kernel : IDisposable
         if (width <= 0 || width % blockSize != 0)
             throw new ArgumentException(
                 $"Row width {width} is not a positive multiple of block size {blockSize}.", nameof(width));
+
+        // In permute mode a destination block gathers source heads from across the WHOLE row, i.e.
+        // from blocks owned by other workgroups that may already have written their output. There
+        // is no ordering between workgroups, so in-place would race and corrupt ssm_out
+        // intermittently. Without the permute each workgroup reads only its own block, which is
+        // safe in place.
+        if (permute is not null && src.Handle == dst.Handle)
+            throw new ArgumentException(
+                "In-place transform is not supported with the GDN permute: the remap reads across " +
+                "block boundaries, so workgroups would race. Pass a distinct destination buffer.",
+                nameof(dst));
 
         long bytes = (long)rows * width * sizeof(float);
         if (src.Size < bytes) throw new ArgumentException("src buffer too small.", nameof(src));
