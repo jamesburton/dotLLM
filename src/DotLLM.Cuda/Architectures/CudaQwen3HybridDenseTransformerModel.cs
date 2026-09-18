@@ -287,6 +287,17 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         CudaMtpHeadWeights? mtpHead = null,
         bool isHeadOnly = false)
     {
+        // A Hadamard-folded checkpoint (Bonsai 2) stores its weights in a rotated basis and needs
+        // the matching activation transform. The CUDA path does not implement it yet, and the
+        // failure mode is not a crash: the weights are well-formed values in the wrong basis, so
+        // the model would emit fluent nonsense. Refuse instead — the CPU and Vulkan backends carry
+        // the transform.
+        if (config.HadamardFold is not null)
+            throw new NotSupportedException(
+                "This checkpoint declares a PrismML Hadamard weight fold (prism.hadamard.*), which " +
+                "the CUDA backend does not implement yet. Run it on the CPU or Vulkan backend. " +
+                "Loading it here would generate plausible-looking but wrong output rather than fail.");
+
         Config = config;
         _isHeadOnly = isHeadOnly;
         _gguf = gguf;
