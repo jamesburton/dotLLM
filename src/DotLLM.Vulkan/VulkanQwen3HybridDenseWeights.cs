@@ -161,13 +161,27 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
         // maxStorageBufferRange — the model simply cannot load widened. Kept packed it is ~339 MB
         // and the gather runs as a compute dispatch (pq2_0_embed_gather_f32.comp) instead.
         bool packedEmbed = tokenEmbedQt == QuantizationType.PQ2_0;
-        var tokenEmbed = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging,
-            tokenEmbedWeight, tokenEmbedQt, config.VocabSize, config.HiddenSize,
-            forceF32: !packedEmbed, out var tokenEmbedDeviceQt, out long tokenEmbedBytes);
-        if (packedEmbed && tokenEmbedDeviceQt != QuantizationType.PQ2_0)
-            throw new NotSupportedException(
-                "PQ2_0 token embedding could not be kept packed on the device, and the F32 widening " +
-                "exceeds Vulkan's maxStorageBufferRange for this vocabulary.");
+        VulkanDevice.Buffer tokenEmbed;
+        QuantizationType tokenEmbedDeviceQt;
+        long tokenEmbedBytes;
+
+        if (packedEmbed)
+        {
+            // Uploaded directly rather than through UploadProjectionMatrix: that helper's KeepNative
+            // table has no PQ2_0 arm, and widening here is not an option at this vocabulary size.
+            tokenEmbedBytes = DotLLM.Cpu.Kernels.Dequantize.RowByteSize(config.HiddenSize, QuantizationType.PQ2_0)
+                            * (long)config.VocabSize;
+            tokenEmbed = device.AllocateDeviceLocal(tokenEmbedBytes);
+            staging.UploadBytes(tokenEmbedWeight, tokenEmbedBytes, tokenEmbed);
+            tokenEmbedDeviceQt = QuantizationType.PQ2_0;
+        }
+        else
+        {
+            tokenEmbed = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging,
+                tokenEmbedWeight, tokenEmbedQt, config.VocabSize, config.HiddenSize,
+                forceF32: true, out tokenEmbedDeviceQt, out tokenEmbedBytes);
+            tokenEmbedDeviceQt = QuantizationType.F32;
+        }
         totalBytes += tokenEmbedBytes;
 
         var layers = new LayerBuffers[config.NumLayers];
