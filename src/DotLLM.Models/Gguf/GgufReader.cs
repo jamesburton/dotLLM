@@ -61,6 +61,50 @@ public static class GgufReader
     }
 
     /// <summary>
+    /// PrismML's own ggml type id for <see cref="QuantizationType.PQ2_0"/>. Pristine Bonsai GGUFs —
+    /// both <c>Ternary-Bonsai-27B</c> and <c>Ternary-Bonsai-2-27B</c> — declare <c>142</c>
+    /// (<c>GGML_TYPE_PQ2_0</c> in the PrismML llama.cpp fork), not the <c>42</c> that
+    /// <see cref="QuantizationType.PQ2_0"/> was originally derived from. The block layout is
+    /// byte-identical either way (<c>fp16</c> scale then 32 code bytes per 128 weights), so this is
+    /// purely an id alias; <c>42</c> stays recognized for locally patched artifacts that carry it.
+    /// </summary>
+    private const uint GgufTypePrismPq2_0 = 142;
+
+    /// <summary>
+    /// PrismML <c>GGML_TYPE_PTQ1_0</c> — dense base-3 trit packing at group 128 (28 bytes per 128
+    /// weights, 1.75 bpw). Recognized only so that the failure is a clear diagnostic instead of a
+    /// downstream size overflow; no kernel consumes it yet.
+    /// </summary>
+    private const uint GgufTypePrismPtq1_0 = 143;
+
+    /// <summary>
+    /// Maps a raw GGUF tensor type id onto a <see cref="QuantizationType"/>, translating the
+    /// PrismML-private ids that are not mainline ggml types.
+    /// </summary>
+    /// <param name="rawType">The raw type id read from the tensor info entry.</param>
+    /// <param name="name">Tensor name, used only for diagnostics.</param>
+    /// <returns>The mapped quantization type.</returns>
+    /// <exception cref="NotSupportedException">
+    /// The id is unrecognized, or is a known-but-unimplemented format.
+    /// </exception>
+    private static QuantizationType MapGgufTensorType(uint rawType, string name)
+    {
+        if (rawType == GgufTypePrismPq2_0)
+            return QuantizationType.PQ2_0;
+
+        if (rawType == GgufTypePrismPtq1_0)
+            throw new NotSupportedException(
+                $"Tensor '{name}' is PTQ1_0 (PrismML ternary, GGUF type {rawType}), which dotLLM " +
+                "does not implement yet. Use the PQ2_0 packing of this model instead.");
+
+        if (!Enum.IsDefined(typeof(QuantizationType), (int)rawType))
+            throw new NotSupportedException(
+                $"Tensor '{name}' has unrecognized quantization type: {rawType}.");
+
+        return (QuantizationType)rawType;
+    }
+
+    /// <summary>
     /// Reads all tensor info entries from the current reader position.
     /// </summary>
     /// <param name="reader">A <see cref="BinaryReader"/> positioned after the metadata section.</param>
@@ -87,11 +131,7 @@ public static class GgufReader
             }
 
             uint rawType = reader.ReadUInt32();
-            if (!Enum.IsDefined(typeof(QuantizationType), (int)rawType))
-                throw new NotSupportedException(
-                    $"Tensor '{name}' has unrecognized quantization type: {rawType}.");
-
-            var quantType = (QuantizationType)rawType;
+            QuantizationType quantType = MapGgufTensorType(rawType, name);
             ulong offset = reader.ReadUInt64();
 
             tensors.Add(new GgufTensorDescriptor(name, new TensorShape(dims), quantType, offset));
