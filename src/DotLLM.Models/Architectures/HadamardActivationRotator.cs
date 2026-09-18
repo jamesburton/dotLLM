@@ -129,6 +129,83 @@ public sealed class HadamardActivationRotator
         }
     }
 
+    /// <summary>
+    /// Verifies that the checkpoint folds exactly the set of weights the <c>qwen35</c> forward pass
+    /// rotates, and nothing else.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The forward pass rotates at fixed, known sites rather than consulting the fold list per
+    /// matmul — that keeps the hot path free of name lookups and string formatting. The safety of
+    /// that shortcut rests entirely on the declared set matching what those sites cover, so it is
+    /// checked once here at load time.
+    /// </para>
+    /// <para>
+    /// If a future PrismML checkpoint folds a different subset (say it starts folding
+    /// <c>ssm_alpha</c>, or stops folding <c>output.weight</c>), this throws instead of quietly
+    /// generating text in the wrong basis.
+    /// </para>
+    /// </remarks>
+    /// <param name="layerCount">Number of transformer blocks.</param>
+    /// <param name="fullAttentionInterval">
+    /// <c>qwen35.full_attention_interval</c>: block <c>i</c> (1-indexed) is full GQA attention when
+    /// <c>i % interval == 0</c>, and Gated DeltaNet otherwise.
+    /// </param>
+    /// <exception cref="NotSupportedException">The declared fold set differs from the implemented one.</exception>
+    public void ValidateQwen35FoldSet(int layerCount, int fullAttentionInterval)
+    {
+        var expected = new HashSet<string>(StringComparer.Ordinal) { "output.weight" };
+
+        for (int layer = 0; layer < layerCount; layer++)
+        {
+            string prefix = $"blk.{layer}";
+            bool fullAttention = fullAttentionInterval > 0 && (layer + 1) % fullAttentionInterval == 0;
+
+            if (fullAttention)
+            {
+                expected.Add($"{prefix}.attn_q.weight");
+                expected.Add($"{prefix}.attn_k.weight");
+                expected.Add($"{prefix}.attn_v.weight");
+                expected.Add($"{prefix}.attn_output.weight");
+            }
+            else
+            {
+                expected.Add($"{prefix}.attn_qkv.weight");
+                expected.Add($"{prefix}.attn_gate.weight");
+                expected.Add($"{prefix}.ssm_out.weight");
+            }
+
+            expected.Add($"{prefix}.ffn_gate.weight");
+            expected.Add($"{prefix}.ffn_up.weight");
+            expected.Add($"{prefix}.ffn_down.weight");
+        }
+
+        var declared = _fold.FoldedWeights;
+
+        var missing = expected.Where(n => !declared.Contains(n)).Order(StringComparer.Ordinal).Take(5).ToArray();
+        var extra = declared.Where(n => !expected.Contains(n)).Order(StringComparer.Ordinal).Take(5).ToArray();
+
+        if (missing.Length > 0 || extra.Length > 0)
+        {
+            throw new NotSupportedException(
+                "prism.hadamard.weight_names does not match the set this build rotates. " +
+                $"Declared {declared.Count}, implemented {expected.Count}. " +
+                (missing.Length > 0 ? $"Rotated by us but not declared: {string.Join(", ", missing)}. " : "") +
+                (extra.Length > 0 ? $"Declared but not rotated by us: {string.Join(", ", extra)}. " : "") +
+                "Refusing to load — running with a mismatched fold set produces fluent garbage.");
+        }
+
+        // token_embd is the only inverse table the forward pass un-rotates after lookup.
+        var unexpectedInverse = _fold.InverseWeights
+            .Where(n => !string.Equals(n, "token_embd.weight", StringComparison.Ordinal))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (unexpectedInverse.Length > 0)
+            throw new NotSupportedException(
+                $"prism.hadamard.inverse_weight_names contains unsupported entries: " +
+                $"{string.Join(", ", unexpectedInverse)}. Only token_embd.weight is un-rotated after lookup.");
+    }
+
     private static bool IsSsmOut(string tensorName) =>
         tensorName.EndsWith(".ssm_out.weight", StringComparison.Ordinal);
 }
