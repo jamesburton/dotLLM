@@ -61,6 +61,10 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
     // PrismML Hadamard fold (prism.hadamard.*) — null outside the Bonsai 2 family; every rotation
     // site below is a no-op when it is null.
     private readonly VulkanHadamardRotation? _hadamard;
+
+    // Compute-dispatch gather for a token-embedding table kept packed on the device; null when the
+    // table was widened to F32 and the vkCmdCopyBuffer row copy applies.
+    private readonly Pq2_0EmbedGatherF32Kernel? _embedGather;
     private readonly VulkanGdnStateCache _gdnCache;
     private readonly VulkanQwen3MoeHybridKernels _kernels;
 
@@ -111,7 +115,8 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         int[] kvSlotForLayer, int attentionLayerCount,
         int[] gdnLayerOrdinal,
         int ropeDim, float ropeTheta,
-        VulkanHadamardRotation? hadamard)
+        VulkanHadamardRotation? hadamard,
+        Pq2_0EmbedGatherF32Kernel? embedGather)
     {
         _device = device;
         _ownsDevice = ownsDevice;
@@ -130,6 +135,7 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         _ropeDim = ropeDim;
         _ropeTheta = ropeTheta;
         _hadamard = hadamard;
+        _embedGather = embedGather;
 
         _submit = device.CreateSubmitContext();
     }
@@ -260,11 +266,15 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             ? VulkanHadamardRotation.Create(device, spvDir, fold, gdn)
             : null;
 
+        var embedGather = weights.TokenEmbeddingQuantType == QuantizationType.PQ2_0
+            ? Pq2_0EmbedGatherF32Kernel.Create(device, spvDir)
+            : null;
+
         return new VulkanQwen3HybridDenseTransformerModel(
             device, ownsDevice,
             config, gguf, cpuModel, weights, state, gdnCache, kernels,
             kvSlotForLayer, attentionLayerCount, gdnLayerOrdinal,
-            ropeDim, ropeTheta, hadamard);
+            ropeDim, ropeTheta, hadamard, embedGather);
     }
 
     // ── CPU-model accessors (we share the CPU loader; reach into its layers) ─
@@ -361,6 +371,7 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             // The FWHT kernel keeps its own handle-keyed descriptor cache, and a freed buffer handle
             // can be recycled into the new scratch allocation — which would bind the stale set.
             _hadamard?.InvalidateDescriptorCache();
+            _embedGather?.InvalidateDescriptorCache();
         }
 
         UploadPositions(positions);
@@ -1025,6 +1036,26 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
     private void RecordEmbeddingGather(nint cmdBuf, ReadOnlySpan<int> tokenIds)
     {
         int hiddenSize = Config.HiddenSize;
+
+        // Packed PQ2_0 table: gather + dequantize as a compute dispatch. The widened F32 form of
+        // Bonsai 2's token_embd is 5.08 GB, over Vulkan's 4 GiB maxStorageBufferRange, so this is
+        // the only way the table can be resident at all.
+        if (_embedGather is { } gather)
+        {
+            _device.Upload(System.Runtime.InteropServices.MemoryMarshal.AsBytes(tokenIds), _state.TokenIdsBuffer!);
+            KernelSupport.HostToComputeBarrier(cmdBuf);
+            gather.Record(cmdBuf, _weights.TokenEmbedding, _state.TokenIdsBuffer!, _state.HiddenState,
+                nTokens: tokenIds.Length, hidden: hiddenSize, vocabSize: Config.VocabSize);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            if (_hadamard is { } packedEmbRot)
+            {
+                packedEmbRot.RecordInverseInPlace(cmdBuf, _state.HiddenState, tokenIds.Length, hiddenSize);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
+            return;
+        }
+
         long rowBytes = (long)hiddenSize * sizeof(float);
         var srcBuf = _weights.TokenEmbedding.Handle;
         var dstBuf = _state.HiddenState.Handle;
@@ -1068,6 +1099,7 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         _weights.Dispose();
         _gdnCache.Dispose();
         _hadamard?.Dispose();
+        _embedGather?.Dispose();
         _kernels.Dispose();
         // Frees the CPU model's dequantised norm arrays and detaches it from the
         // GgufFile. The GgufFile itself is caller-owned.

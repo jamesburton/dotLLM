@@ -45,6 +45,9 @@ internal sealed class VulkanQwen3HybridDenseForwardState : IDisposable
     /// </remarks>
     public VulkanDevice.Buffer? HadamardScratch { get; private set; }
 
+    /// <summary>Token ids for a packed (non-F32) embedding gather dispatch.</summary>
+    public VulkanDevice.Buffer? TokenIdsBuffer { get; private set; }
+
     // ── Full attention ───────────────────────────────────────────────────────
     public VulkanDevice.Buffer QGateScratch { get; private set; } = null!;  // [seqLen, 2*qElems]
     public VulkanDevice.Buffer Q { get; private set; } = null!;
@@ -160,6 +163,12 @@ internal sealed class VulkanQwen3HybridDenseForwardState : IDisposable
         PositionsBuffer.Dispose();
         PositionsBuffer = _device.Allocate((long)seqLen * sizeof(int));
 
+        // Separate from PositionsBuffer: positions are uploaded before the submit and read by RoPE
+        // later in the same command buffer, so the embedding gather cannot borrow that buffer for
+        // its token ids without clobbering them.
+        TokenIdsBuffer?.Dispose();
+        TokenIdsBuffer = _device.Allocate((long)seqLen * sizeof(int));
+
         _capacitySeqLen = seqLen;
         AllocatedBytes = hiddenBytes * 4 + qBytes * 3 + kvBytes * 2 + qgBytes
             + convInputBytes + convBytes + vDimBytes * 3 + kDimBytes * 2 + alphaBytes * 2
@@ -172,6 +181,7 @@ internal sealed class VulkanQwen3HybridDenseForwardState : IDisposable
     {
         HiddenState?.Dispose(); Residual?.Dispose(); AddScratch?.Dispose(); NormOutput?.Dispose();
         HadamardScratch?.Dispose(); HadamardScratch = null;
+        TokenIdsBuffer?.Dispose(); TokenIdsBuffer = null;
         QGateScratch?.Dispose(); Q?.Dispose(); GateScratch?.Dispose();
         K?.Dispose(); V?.Dispose(); AttnOutput?.Dispose();
         GdnConvInput?.Dispose(); GdnQkvBuf?.Dispose(); GdnZBuf?.Dispose();

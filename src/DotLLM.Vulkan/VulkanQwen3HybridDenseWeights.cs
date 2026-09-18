@@ -96,6 +96,12 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
     public LayerBuffers[] Layers => _layers;
 
     public VulkanDevice.Buffer TokenEmbedding { get; }
+
+    /// <summary>
+    /// On-device layout of <see cref="TokenEmbedding"/>: <c>F32</c> for the ordinary widened table,
+    /// or <c>PQ2_0</c> when it is kept packed and gathered by a compute dispatch.
+    /// </summary>
+    public QuantizationType TokenEmbeddingQuantType { get; }
     public VulkanDevice.Buffer OutputNormWeight { get; }
     public VulkanDevice.Buffer OutputWeight { get; }
     public QuantizationType OutputDeviceQuantType { get; }
@@ -107,6 +113,7 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
     private VulkanQwen3HybridDenseWeights(
         LayerBuffers[] layers,
         VulkanDevice.Buffer tokenEmbedding,
+        QuantizationType tokenEmbeddingQuantType,
         VulkanDevice.Buffer outputNormWeight,
         VulkanDevice.Buffer outputWeight, QuantizationType outputQt,
         int outputOutputDim, int outputInputDim,
@@ -114,6 +121,7 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
     {
         _layers = layers;
         TokenEmbedding = tokenEmbedding;
+        TokenEmbeddingQuantType = tokenEmbeddingQuantType;
         OutputNormWeight = outputNormWeight;
         OutputWeight = outputWeight;
         OutputDeviceQuantType = outputQt;
@@ -147,11 +155,19 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
             outputOutputDim, outputInputDim, outputQt);
         using var staging = VulkanStagingBuffer.Create(device, stagingBytes);
 
-        // Token embedding always dequantises to F32 — the embedding gather uses
-        // vkCmdCopyBuffer byte offsets and needs a contiguous F32 layout.
+        // The embedding gather normally uses vkCmdCopyBuffer byte offsets and so needs a contiguous
+        // F32 layout. PQ2_0 is the exception, and not for tidiness: Bonsai 2's
+        // token_embd [5120, 248320] widens to 5,085,593,600 bytes, which EXCEEDS Vulkan's 4 GiB
+        // maxStorageBufferRange — the model simply cannot load widened. Kept packed it is ~339 MB
+        // and the gather runs as a compute dispatch (pq2_0_embed_gather_f32.comp) instead.
+        bool packedEmbed = tokenEmbedQt == QuantizationType.PQ2_0;
         var tokenEmbed = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging,
             tokenEmbedWeight, tokenEmbedQt, config.VocabSize, config.HiddenSize,
-            forceF32: true, out _, out long tokenEmbedBytes);
+            forceF32: !packedEmbed, out var tokenEmbedDeviceQt, out long tokenEmbedBytes);
+        if (packedEmbed && tokenEmbedDeviceQt != QuantizationType.PQ2_0)
+            throw new NotSupportedException(
+                "PQ2_0 token embedding could not be kept packed on the device, and the F32 widening " +
+                "exceeds Vulkan's maxStorageBufferRange for this vocabulary.");
         totalBytes += tokenEmbedBytes;
 
         var layers = new LayerBuffers[config.NumLayers];
@@ -187,7 +203,7 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
             forceF32: false, out var outputDeviceQt, out long outputBytes);
         totalBytes += outputBytes;
 
-        return new VulkanQwen3HybridDenseWeights(layers, tokenEmbed, outputNorm,
+        return new VulkanQwen3HybridDenseWeights(layers, tokenEmbed, tokenEmbedDeviceQt, outputNorm,
             outputW, outputDeviceQt, outputOutputDim, outputInputDim, totalBytes);
     }
 
