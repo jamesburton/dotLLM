@@ -105,7 +105,7 @@ KNOWN PRE-EXISTING FAILURES ELSEWHERE (not touched by this filter, do not chase)
   6x VulkanMatMulI2SGemvF32KernelTests.MultiRow_IsBitIdenticalToProduction
   1x VulkanPipelineParityTests.PipelinedForwardBatch_MatchesPerSequenceForward (flaky ~1 in 5, #433)
 
-WIDER REGRESSION SWEEP (~9 min GPU) — the suites that share the changed code:
+WIDER REGRESSION SWEEP (~5 min GPU) — the suites that share the changed code:
   dotnet test tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj --no-build -v q --nologo --filter `
     "FullyQualifiedName~Qwen3HybridDense|FullyQualifiedName~Qwen3MoeHybrid|FullyQualifiedName~VulkanNemotronH|FullyQualifiedName~VulkanRopeKvWriteFusion|FullyQualifiedName~VulkanSplitKvAttention|FullyQualifiedName~VulkanAttention|FullyQualifiedName~VulkanKvCache|FullyQualifiedName~VulkanFlashAttention"
   Expected: Passed: 158, Failed: 0, Skipped: 55 (the skips need GGUF fixtures that are absent here).
