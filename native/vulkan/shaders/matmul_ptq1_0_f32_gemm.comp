@@ -1,0 +1,115 @@
+#version 450
+// PTQ1_0 (PrismML Bonsai dense-trit ternary) matrix multiplication (prefill-path GEMM).
+//
+//   C[t, m] = sum_g scale(m,g) * sum_{e in group g} trit(m,g,e) * B[t, 128*g + e]
+//
+// Buffer conventions match the PQ2_0 GEMM kernels: B is [N, K] token-major, C is [N, M]
+// token-major (c[t*M + m]).
+//
+// DELIBERATELY CORRECTNESS-FIRST, NOT TILED. This is one workgroup per (output row,
+// token) pair — i.e. the GEMV body with a second dispatch dimension — and it re-reads
+// the whole weight row once per token, so it moves N times the weight traffic a tiled
+// kernel would. PQ2_0's prefill path went through several tiled variants (register-block
+// and two coopmat shapes, selected per device); PTQ1_0 gets none of that yet.
+//
+// The reason is scope, stated plainly so nobody mistakes this for a tuned kernel: issue
+// #436's gate is bit-exact decode correctness, and a tiled kernel that shares the decode
+// is a separate, benchmarkable change. What this shader buys is that the keep-packed
+// upload arm has a matching dispatch arm for every sequence length — an upload arm
+// without one is exactly the defect that broke the other hybrid model when PQ2_0 landed.
+// Prefill throughput here will be poor. That is known, not overlooked.
+//
+// Weight layout and the trit recurrence are identical to matmul_ptq1_0_f32_gemv.comp —
+// see that file's header for the full description, including why the fp16 group scale
+// sits at byte 26 (LAST) rather than byte 0 as in PQ2_0.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint blocksPerRow;   // = K / 128
+    uint rowUints;       // unused here; kept for push-constant layout parity
+} pc;
+
+const uint PTQ1_GROUP_SIZE    = 128u;
+const uint PTQ1_GROUP_BYTES   = 28u;
+const uint PTQ1_QS_BYTES      = 24u;
+const uint PTQ1_PAYLOAD_BYTES = 26u;
+const uint PTQ1_SCALE_OFFSET  = 26u;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readGroupScale(uint off) {
+    uint lo = readByte(off);
+    uint hi = readByte(off + 1u);
+    uint half16 = lo | (hi << 8u);
+    return unpackHalf2x16(half16).x;
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    if (m >= pc.M || t >= pc.N) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowBytes = pc.blocksPerRow * PTQ1_GROUP_BYTES;
+    uint rowByteBase = m * rowBytes;
+    uint bBase = t * pc.K;
+
+    uint totalPayloadBytes = pc.blocksPerRow * PTQ1_PAYLOAD_BYTES;
+    float acc = 0.0;
+
+    for (uint pb = tid; pb < totalPayloadBytes; pb += threads) {
+        uint g  = pb / PTQ1_PAYLOAD_BYTES;
+        uint gp = pb - g * PTQ1_PAYLOAD_BYTES;
+
+        uint groupByteBase = rowByteBase + g * PTQ1_GROUP_BYTES;
+        float scale = readGroupScale(groupByteBase + PTQ1_SCALE_OFFSET);
+
+        uint v = readByte(groupByteBase + gp);
+
+        uint eBase;
+        uint eStride;
+        uint tritCount;
+        if (gp < 16u) {
+            eBase = gp;                 eStride = 16u; tritCount = 5u;
+        } else if (gp < PTQ1_QS_BYTES) {
+            eBase = 80u + (gp - 16u);   eStride = 8u;  tritCount = 5u;
+        } else {
+            eBase = 120u + (gp - PTQ1_QS_BYTES); eStride = 2u; tritCount = 4u;
+        }
+
+        uint xBase = bBase + g * PTQ1_GROUP_SIZE + eBase;
+        float part = 0.0;
+        for (uint n = 0u; n < tritCount; ++n) {
+            float tr = float(int((v * 3u) >> 8u) - 1);
+            v = (v * 3u) & 0xFFu;
+            part += tr * b[xBase + n * eStride];
+        }
+
+        acc += scale * part;
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) c[t * pc.M + m] = partials[0];
+}
