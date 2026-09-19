@@ -1632,6 +1632,15 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 else
                     _kernels.MatMulIq1SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
+            case QuantizationType.PQ2_0:
+                // Shares VulkanQwen3MoeHybridWeights.KeepPQ2_0 with the dense hybrid model, so the
+                // dispatch has to match: a weights-side keep-packed arm with no matching kernel arm
+                // here would reach the default and throw.
+                if (seqLen == 1)
+                    _kernels.MatMulPQ2_0.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else
+                    _kernels.MatMulPQ2_0Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
             case QuantizationType.F16:
                 if (seqLen == 1)
                     _kernels.MatMulF16.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);

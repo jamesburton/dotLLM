@@ -1003,6 +1003,16 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
                 else
                     _kernels.MatMulIq1SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
+            case QuantizationType.PQ2_0:
+                // PQ2_0 (PrismML Bonsai ternary): 128-element group alignment, enforced upload-side
+                // by VulkanQwen3MoeHybridWeights.KeepPQ2_0. Each group carries its own fp16 scale,
+                // read and applied in-shader. Widening this to F32 instead is what used to make
+                // Bonsai 2 27B ask for ~108 GB of device-local memory.
+                if (seqLen == 1)
+                    _kernels.MatMulPQ2_0.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else
+                    _kernels.MatMulPQ2_0Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
             case QuantizationType.F16:
                 if (seqLen == 1)
                     _kernels.MatMulF16.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
