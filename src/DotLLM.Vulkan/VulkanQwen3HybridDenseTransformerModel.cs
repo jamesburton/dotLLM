@@ -625,9 +625,14 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         _multiRowLogits?.Dispose();
         _multiRowLogits = _device.AllocateHostReadback((long)rows * vocab * sizeof(float));
         _multiRowLogitsRows = rows;
-        // A freed buffer handle can be recycled into this allocation, and the matmul kernels key
-        // their descriptor sets on the handle — invalidate so no stale set is bound.
+        // A freed buffer handle can be recycled into this allocation, and every kernel here keys
+        // its descriptor sets on the handle — invalidate all three caches so no stale set survives
+        // into a dispatch that now means a different buffer. The FWHT and embed-gather kernels are
+        // included even though neither binds this buffer: the handle we just freed could equally be
+        // recycled into one of THEIR buffers on a later allocation.
         _kernels.InvalidateAll();
+        _hadamard?.InvalidateDescriptorCache();
+        _embedGather?.InvalidateDescriptorCache();
         return _multiRowLogits;
     }
 

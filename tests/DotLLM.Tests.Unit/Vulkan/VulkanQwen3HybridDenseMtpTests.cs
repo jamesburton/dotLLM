@@ -260,15 +260,30 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
         const int TotalNewTokens = 10;
         const int K = 3;
 
-        var (speculative, drafted, accepted) = RunSpeculative(path, spvDir, StartToken, TotalNewTokens, K);
+        var run = RunSpeculative(path, spvDir, StartToken, TotalNewTokens, K);
         List<int> plain = RunPlainGreedy(path, spvDir, StartToken, TotalNewTokens);
 
-        Assert.Equal(plain, speculative);
-        Assert.True(drafted > 0, "The decoder must actually have drafted something.");
-        Assert.True(accepted > 0, "Every round emits at least the corrected/bonus token.");
+        Assert.Equal(plain, run.Tokens);
+        Assert.True(run.Drafted > 0, "The decoder must actually have drafted something.");
+        Assert.True(run.Emitted > 0, "Every round emits at least the corrected/bonus token.");
+
+        // Without this the test would be vacuous for its stated purpose. A round that emits ONE
+        // token was rejected at draft position 0, before the verify batch ever ran, so nothing
+        // touched the GDN recurrence and no restore happened; a round that emits K+1 accepted
+        // everything and needs no restore either. ONLY a round emitting 2..K went through the
+        // verify batch and then rejected — that is the path RestoreRecurrentState exists for, and
+        // it is the path that silently corrupts a recurrent trunk when the checkpoint pair is
+        // missing. Assert it fired, or this test proves nothing about #435's checkpoint work.
+        Assert.True(run.PartialRejectionRounds > 0,
+            $"No round exercised the post-verify rejection path (emitted-per-round histogram: " +
+            $"[{string.Join(",", run.EmittedPerRound)}], K={K}). The GDN checkpoint/restore pair is " +
+            "therefore untested by this run — retune the fixture or the token budget.");
     }
 
-    private static (List<int> tokens, int drafted, int accepted) RunSpeculative(
+    private sealed record SpeculativeRun(
+        List<int> Tokens, int Drafted, int Emitted, int PartialRejectionRounds, List<int> EmittedPerRound);
+
+    private static SpeculativeRun RunSpeculative(
         string path, string spvDir, int startToken, int totalNewTokens, int k)
     {
         using var gguf = GgufFile.Open(path);
@@ -288,7 +303,8 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
         // of the single start token at slot 0 means position starts at 0, not 1.
         using (ITensor _ = model.Forward([startToken], [0], deviceId: -1, kvCache)) { }
 
-        int position = 0, drafted = 0, accepted = 0, guard = 0;
+        int position = 0, drafted = 0, emitted = 0, partialRejections = 0, guard = 0;
+        var emittedPerRound = new List<int>();
         Span<int> outputBuffer = stackalloc int[k + 1];
         while (generatedIds.Count - 1 < totalNewTokens && guard++ < totalNewTokens * 4)
         {
@@ -298,7 +314,10 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
 
             Assert.True(result.AcceptedCount > 0, "Every round must emit at least the corrected/bonus token.");
             drafted += result.DraftedCount;
-            accepted += result.AcceptedCount;
+            emitted += result.AcceptedCount;
+            emittedPerRound.Add(result.AcceptedCount);
+            if (result.AcceptedCount >= 2 && result.AcceptedCount <= k)
+                partialRejections++;
 
             for (int i = 0; i < result.AcceptedCount && generatedIds.Count - 1 < totalNewTokens; i++)
                 generatedIds.Add(outputBuffer[i]);
@@ -306,7 +325,8 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
             position += result.AcceptedCount;
         }
 
-        return (generatedIds.Take(totalNewTokens + 1).ToList(), drafted, accepted);
+        return new SpeculativeRun(
+            generatedIds.Take(totalNewTokens + 1).ToList(), drafted, emitted, partialRejections, emittedPerRound);
     }
 
     private static List<int> RunPlainGreedy(string path, string spvDir, int startToken, int totalNewTokens)
