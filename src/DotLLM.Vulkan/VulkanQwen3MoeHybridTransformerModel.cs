@@ -163,6 +163,15 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                Config.NumKvHeads, Config.HeadDim, maxSeqLen);
 
     /// <summary>
+    /// Creates the KV cache with an explicit initial row capacity (issue #437). Pass
+    /// <paramref name="initialCapacity"/> == <paramref name="maxSeqLen"/> for the pre-#437
+    /// eager allocation; the default <see cref="CreateKvCache(int)"/> starts small and grows.
+    /// </summary>
+    public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen, int initialCapacity)
+        => new(_device, _kvSlotForLayer, _attentionLayerCount,
+               Config.NumKvHeads, Config.HeadDim, maxSeqLen, initialCapacity);
+
+    /// <summary>
     /// Creates a fresh per-sequence <see cref="VulkanGdnStateCache"/> sized for this
     /// model's GDN-layer count. The scheduler / multi-seq dispatcher should
     /// allocate one of these per active sequence and pass it via
@@ -558,6 +567,15 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         }
 
         bool resized = _state.EnsureCapacity(seqLen);
+
+        // Grow the lazily-sized KV buffers BEFORE the command buffer opens (issue #437).
+        // Growth reallocates every per-layer K/V buffer, so it must not happen once commands
+        // referencing the old handles have been recorded — and the freed handles get recycled
+        // into the handle-keyed descriptor caches, hence the invalidation below.
+        if (kvCache is VulkanNemotronHKvCache growable
+            && growable.EnsureCapacity(VulkanNemotronHKvCache.RequiredLengthFor(positions)))
+            resized = true;
+
         if (resized) _kernels.InvalidateAll();
 
         UploadPositions(positions);

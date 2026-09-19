@@ -109,6 +109,152 @@ public sealed class VulkanNemotronHTransformerModelForwardTests
         AssertVulkanMatchesCpu(kinds, seqLen: 1, seed: 113, quantize: true);
     }
 
+    // ── Lazy KV-cache growth (issue #437) ────────────────────────────────────────────
+    // The KV buffers no longer allocate maxSeqLen eagerly; they start at a small capacity
+    // and are reallocated by VulkanNemotronHKvCache.EnsureCapacity, which the model calls
+    // before it opens its command buffer.
+    //
+    // Why the cases below are shaped the way they are:
+    //   * Reallocation frees Vulkan buffer handles, and the driver RECYCLES those handles.
+    //     The kernels' DescriptorSetCache is keyed on the handle, so a stale set can be
+    //     re-bound to a freed buffer and the decode goes correct-then-silently-ZEROS.
+    //     A single growth cannot catch that: the first growth's freed handles have not yet
+    //     been recycled into anything the cache would collide with. These tests therefore
+    //     decode far enough to grow TWICE (2 -> 4 -> 8 rows) and assert on the steps AFTER
+    //     the second growth, where the recycled handles are live.
+    //   * The oracle is an eagerly-allocated cache (initialCapacity == maxSeqLen) driven by
+    //     the SAME model instance shapes, so the comparison is BIT-EXACT: identical kernels,
+    //     identical dispatch order, identical reduction order. Any tolerance here would hide
+    //     exactly the zeros this is hunting for.
+
+    [SkippableFact]
+    public void Decode_GrowingKvCache_MatchesEagerCache_AcrossTwoGrowths()
+    {
+        var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm };
+        AssertGrowingKvCacheMatchesEager(kinds, seed: 437, decodeSteps: 30, initialCapacity: 1);
+    }
+
+    [SkippableFact]
+    public void Decode_GrowingKvCache_MatchesEagerCache_TwoAttentionLayers()
+    {
+        // Two attention layers => two KV slots, so a growth that mis-wires one slot's
+        // buffer (or leaves one descriptor set stale) diverges even if the other is fine.
+        var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Attention };
+        AssertGrowingKvCacheMatchesEager(kinds, seed: 4371, decodeSteps: 30, initialCapacity: 1);
+    }
+
+    [SkippableFact]
+    public void Prefill_ThenDecode_GrowingKvCache_MatchesEagerCache()
+    {
+        // Prefill overshoots the initial capacity in one step (positions 0..3 against a
+        // capacity of 2), exercising the multi-doubling loop, then decode grows again.
+        var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Ffn };
+        AssertGrowingKvCacheMatchesEager(kinds, seed: 4372, decodeSteps: 24, initialCapacity: 1, prefillLen: 4);
+    }
+
+    [SkippableFact]
+    public void RecordUpdate_BeyondCapacity_Throws()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+        using var device = VulkanDevice.Create();
+
+        // Layer 0 is attention, layer 1 is not — slot map mirrors the model's construction.
+        var cache = new VulkanNemotronHKvCache(device, new[] { 0, -1 }, attentionLayerCount: 1,
+            numKvHeads: 2, headDim: 8, maxSeqLen: 64, initialCapacity: 4);
+        using (cache)
+        {
+            Assert.Equal(4, cache.Capacity);
+            Assert.Equal(64, cache.MaxLength);
+
+            // EnsureCapacity is the documented pre-recording step; growth is by doubling,
+            // and it must report "reallocated" so the caller invalidates descriptor caches.
+            Assert.False(cache.EnsureCapacity(4));
+            Assert.True(cache.EnsureCapacity(5));
+            Assert.Equal(8, cache.Capacity);
+            Assert.True(cache.EnsureCapacity(20));
+            Assert.Equal(32, cache.Capacity);
+            Assert.Throws<ArgumentOutOfRangeException>(() => cache.EnsureCapacity(65));
+
+            Assert.Equal(4, VulkanNemotronHKvCache.RequiredLengthFor(new[] { 0, 1, 2, 3 }));
+            Assert.Equal(18, VulkanNemotronHKvCache.RequiredLengthFor(new[] { 17 }));
+        }
+    }
+
+    private void AssertGrowingKvCacheMatchesEager(
+        HybridLayerKind[] layerKinds, int seed, int decodeSteps, int initialCapacity, int prefillLen = 1)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        using var fixture = NemotronHFixtureBuilder.Build(layerKinds, seed, quantize: false);
+        var config = fixture.Config;
+        int vocabSize = config.VocabSize;
+        int hiddenSize = config.HiddenSize;
+        int maxSeqLen = prefillLen + decodeSteps;
+
+        float[][] Run(bool growing)
+        {
+            using var device = VulkanDevice.Create();
+            using var model = VulkanNemotronHTransformerModel.BuildFromPrebuiltWeights(
+                device, config, fixture.Layers, fixture.OutputNormWeight,
+                fixture.OutputWeightPtr, fixture.OutputQuantType, vocabSize, hiddenSize,
+                fixture.TokenEmbedPtr, QuantizationType.F32,
+                spvDir);
+            using var kv = growing
+                ? model.CreateKvCache(maxSeqLen, initialCapacity)
+                : model.CreateKvCache(maxSeqLen, maxSeqLen);   // pre-#437 eager allocation
+            using var ssm = model.CreateSsmState();
+
+            Assert.Equal(growing ? Math.Min(initialCapacity, maxSeqLen) : maxSeqLen, kv.Capacity);
+
+            var perStep = new List<float[]>();
+            int pos = 0;
+
+            int[] prefillTokens = new int[prefillLen];
+            int[] prefillPositions = new int[prefillLen];
+            for (int i = 0; i < prefillLen; i++) { prefillTokens[i] = i % vocabSize; prefillPositions[i] = pos++; }
+            using (ITensor logits = model.Forward(prefillTokens, prefillPositions, deviceId: -1, kv, ssm))
+                perStep.Add(CopyLogits(logits));
+
+            for (int s = 0; s < decodeSteps; s++)
+            {
+                int[] tok = { (s * 3 + 1) % vocabSize };
+                int[] posArr = { pos++ };
+                using ITensor logits = model.Forward(tok, posArr, deviceId: -1, kv, ssm);
+                perStep.Add(CopyLogits(logits));
+            }
+
+            if (growing)
+            {
+                // The point of the test: capacity must actually have moved at least twice.
+                Assert.True(kv.Capacity >= initialCapacity * 4,
+                    $"expected at least two growths from {initialCapacity}, ended at {kv.Capacity}");
+                Assert.True(kv.Capacity <= maxSeqLen);
+            }
+            return perStep.ToArray();
+        }
+
+        float[][] eager = Run(growing: false);
+        float[][] grown = Run(growing: true);
+
+        Assert.Equal(eager.Length, grown.Length);
+        for (int step = 0; step < eager.Length; step++)
+        {
+            for (int c = 0; c < vocabSize; c++)
+            {
+                // Bit-exact: same kernels, same order, only the buffer allocation differs.
+                Assert.True(eager[step][c].Equals(grown[step][c]),
+                    $"layers={string.Join(',', layerKinds)}, step={step} (0 = prefill), col={c}: "
+                    + $"eager={eager[step][c]:R} vs grown={grown[step][c]:R}. A step that is correct early "
+                    + "and zero later is the descriptor-cache handle-aliasing failure (issue #437).");
+            }
+        }
+
+        // Explicitly assert the post-second-growth tail is not silently zeroed — the
+        // handle-aliasing symptom would otherwise have to be inferred from the diff above.
+        float[] last = grown[^1];
+        Assert.Contains(last, v => v != 0f);
+    }
+
     private void AssertVulkanMatchesCpu(
         HybridLayerKind[] layerKinds, int seqLen, int seed, bool quantize = false)
     {

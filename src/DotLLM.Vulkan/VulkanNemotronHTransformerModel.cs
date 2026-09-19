@@ -188,6 +188,15 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         => new(_device, _kvSlotForLayer, _attentionLayerCount,
                Config.NumKvHeads, Config.HeadDim, maxSeqLen);
 
+    /// <summary>
+    /// Creates the KV cache with an explicit initial row capacity (issue #437). Pass
+    /// <paramref name="initialCapacity"/> == <paramref name="maxSeqLen"/> for the pre-#437
+    /// eager allocation; the default <see cref="CreateKvCache(int)"/> starts small and grows.
+    /// </summary>
+    public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen, int initialCapacity)
+        => new(_device, _kvSlotForLayer, _attentionLayerCount,
+               Config.NumKvHeads, Config.HeadDim, maxSeqLen, initialCapacity);
+
     private VulkanNemotronHTransformerModel(
         VulkanDevice device, bool ownsDevice,
         ModelConfig config,
@@ -681,6 +690,15 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         float eps = Config.NormEpsilon;
 
         bool scratchResized = _state.EnsureCapacity(seqLen);
+
+        // Grow the lazily-sized KV buffers BEFORE the command buffer opens (issue #437).
+        // Growth reallocates every per-layer K/V buffer, so it must not happen once commands
+        // referencing the old handles have been recorded — and the freed handles get recycled
+        // into the handle-keyed descriptor caches, hence the invalidation.
+        if (kvCache is VulkanNemotronHKvCache growable
+            && growable.EnsureCapacity(VulkanNemotronHKvCache.RequiredLengthFor(positions)))
+            scratchResized = true;
+
         if (scratchResized)
             InvalidateKernelCaches();
 
