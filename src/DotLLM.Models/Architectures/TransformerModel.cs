@@ -3554,6 +3554,8 @@ public sealed unsafe class TransformerModel : IModel
             MatMul.GemvI2_S((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.PQ2_0)
             MatMul.GemvPQ2_0((byte*)weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.PTQ1_0)
+            MatMul.GemvPTQ1_0((byte*)weights, x, y, m, k, _threadPool);
         else
             MatMul.GemvDequantRows((byte*)weights, qt, x, y, m, k, _threadPool);
     }
@@ -3586,6 +3588,8 @@ public sealed unsafe class TransformerModel : IModel
             MatMul.GemmI2_S((byte*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.PQ2_0)
             MatMul.GemmPQ2_0((byte*)weights, b, c, m, k, n, _threadPool);
+        else if (qt == QuantizationType.PTQ1_0)
+            MatMul.GemmPTQ1_0((byte*)weights, b, c, m, k, n, _threadPool);
         else
             // Formats with no dedicated vec_dot kernel (BF16, Q4_0/Q4_1/Q5_1, Q2_K/Q3_K, the IQ
             // family). MatMul.GemmDequantRows decodes each weight row once and reuses it across
