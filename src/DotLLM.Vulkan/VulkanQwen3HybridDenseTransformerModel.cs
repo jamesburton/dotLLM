@@ -446,6 +446,13 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
                     $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
         }
 
+        // Rows the LM head will cover — see MaxAllRowLogitsSeqLen. Resolved HERE, before any
+        // recording, because EnsureMultiRowLogits may reallocate and therefore invalidate every
+        // kernel's descriptor cache. That path calls vkResetDescriptorPool, which frees sets an
+        // already-recorded dispatch still references (DescriptorSetCache's own remarks document
+        // exactly this hazard), so it must never run against an open command buffer.
+        int headRows = seqLen <= MaxAllRowLogitsSeqLen ? seqLen : 1;
+
         bool resized = _state.EnsureCapacity(seqLen);
         if (resized)
         {
@@ -455,6 +462,8 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             _hadamard?.InvalidateDescriptorCache();
             _embedGather?.InvalidateDescriptorCache();
         }
+
+        var logitsBuf = headRows == 1 ? _state.Logits : EnsureMultiRowLogits(headRows, vocabSize);
 
         UploadPositions(positions);
 
@@ -559,7 +568,6 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         // no caller reads. So the head runs over every row for a SHORT batch — which is exactly
         // the speculative verify-batch regime MtpSpeculativeDecoder needs, and which it indexes
         // row-by-row — and stays last-row-only above that. See MaxAllRowLogitsSeqLen.
-        int headRows = seqLen <= MaxAllRowLogitsSeqLen ? seqLen : 1;
         long headSrcOffset = (long)(seqLen - headRows) * hiddenRowBytes;
 
         _submit.Begin();
@@ -582,7 +590,6 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
         }
 
-        var logitsBuf = headRows == 1 ? _state.Logits : EnsureMultiRowLogits(headRows, vocabSize);
         RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
             headIn, logitsBuf,
             outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: headRows);

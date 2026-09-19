@@ -1,4 +1,6 @@
 using DotLLM.Core.Configuration;
+using DotLLM.Engine;
+using DotLLM.Engine.Samplers;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Engine.KvCache;
@@ -231,6 +233,100 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
             Assert.Equal(i + 1, mtpState.CurrentLength);
         }
         return (tokens, logits);
+    }
+
+    /// <summary>
+    /// The end-to-end claim: <c>MtpSpeculativeDecoder</c> — completely unmodified by this work —
+    /// driving the real Vulkan model must produce the exact same token sequence as plain greedy
+    /// decode of that model alone. That is the whole point of self-speculation: same output, fewer
+    /// trunk forwards.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately uses the DEFAULT mixed GDN + full-attention fixture rather than the
+    /// all-full-attention one the equivalent CUDA test had to fall back to. A rejected draft
+    /// permanently advances the trunk's Gated-DeltaNet recurrence, which has no position addressing
+    /// to roll back, so this test only passes if <see cref="VulkanQwen3HybridDenseTransformerModel.CheckpointRecurrentState"/>
+    /// / <c>RestoreRecurrentState</c> (added in #435) actually work. Before them, Vulkan reported
+    /// <c>SupportsRecurrentStateCheckpoint == false</c> and this would diverge on the first
+    /// rejection — silently, because the corrected token is still the trunk's own argmax.
+    /// </remarks>
+    [SkippableFact]
+    public void DraftAndVerify_MatchesPlainGreedyDecode_OnRealVulkanModel()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        string path = WriteFixture(withMtp: true, name: "qwen35-mtp-e2e.gguf");
+
+        const int StartToken = 1;
+        const int TotalNewTokens = 10;
+        const int K = 3;
+
+        var (speculative, drafted, accepted) = RunSpeculative(path, spvDir, StartToken, TotalNewTokens, K);
+        List<int> plain = RunPlainGreedy(path, spvDir, StartToken, TotalNewTokens);
+
+        Assert.Equal(plain, speculative);
+        Assert.True(drafted > 0, "The decoder must actually have drafted something.");
+        Assert.True(accepted > 0, "Every round emits at least the corrected/bonus token.");
+    }
+
+    private static (List<int> tokens, int drafted, int accepted) RunSpeculative(
+        string path, string spvDir, int startToken, int totalNewTokens, int k)
+    {
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        using var model = VulkanQwen3HybridDenseTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
+        Assert.True(model.SupportsMtp);
+
+        var decoder = new MtpSpeculativeDecoder(greedy: true);
+        var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
+
+        var generatedIds = new List<int> { startToken };
+        using var kvCache = model.CreateKvCache(config.MaxSequenceLength);
+        using var mtpState = model.CreateMtpState()!;
+
+        // DraftAndVerify's contract: `position` is lastToken's OWN KV-cache slot, so the prefill
+        // of the single start token at slot 0 means position starts at 0, not 1.
+        using (ITensor _ = model.Forward([startToken], [0], deviceId: -1, kvCache)) { }
+
+        int position = 0, drafted = 0, accepted = 0, guard = 0;
+        Span<int> outputBuffer = stackalloc int[k + 1];
+        while (generatedIds.Count - 1 < totalNewTokens && guard++ < totalNewTokens * 4)
+        {
+            var result = decoder.DraftAndVerify(
+                model, kvCache, mtpState, pipeline, generatedIds,
+                constraint: null, position, vocabSize: config.VocabSize, numCandidates: k, outputBuffer);
+
+            Assert.True(result.AcceptedCount > 0, "Every round must emit at least the corrected/bonus token.");
+            drafted += result.DraftedCount;
+            accepted += result.AcceptedCount;
+
+            for (int i = 0; i < result.AcceptedCount && generatedIds.Count - 1 < totalNewTokens; i++)
+                generatedIds.Add(outputBuffer[i]);
+
+            position += result.AcceptedCount;
+        }
+
+        return (generatedIds.Take(totalNewTokens + 1).ToList(), drafted, accepted);
+    }
+
+    private static List<int> RunPlainGreedy(string path, string spvDir, int startToken, int totalNewTokens)
+    {
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        using var model = VulkanQwen3HybridDenseTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
+        using var kvCache = model.CreateKvCache(config.MaxSequenceLength);
+
+        var ids = new List<int> { startToken };
+        for (int step = 0; step < totalNewTokens; step++)
+        {
+            using ITensor logits = model.Forward([ids[^1]], [step], deviceId: -1, kvCache);
+            int rows = logits.Shape[0];
+            var last = Copy(logits, rows * config.VocabSize)
+                .AsSpan((rows - 1) * config.VocabSize, config.VocabSize).ToArray();
+            ids.Add(ArgMax(last));
+        }
+        return ids;
     }
 
     private static void AssertClose(float[] expected, float[] actual, string what)

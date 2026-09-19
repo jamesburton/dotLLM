@@ -282,6 +282,11 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
                         constraint?.Advance(targetArgmax);
                         RollbackState(targetModel, kvCacheTarget, position, acceptedCount,
                             outputBuffer, gdnCheckpoint, rejected: true);
+                        // A recurrent-state checkpoint can own device memory (issue #435:
+                        // VulkanGdnStateCache.Clone allocates one conv + one state buffer per GDN
+                        // layer — 96 device buffers on Bonsai 2's 48 GDN layers; CudaGdnStateCache
+                        // likewise cuMemAllocs). Dropping it on the floor leaked that every round.
+                        (gdnCheckpoint as IDisposable)?.Dispose();
                         return new SpeculativeResult(acceptedCount, draftTicks, verifyTicks, k);
                     }
                 }
@@ -303,6 +308,7 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
             // accepted history, so no GDN restore is needed here.
             RollbackState(targetModel, kvCacheTarget, position, acceptedCount,
                 outputBuffer, gdnCheckpoint, rejected: false);
+            (gdnCheckpoint as IDisposable)?.Dispose();
             return new SpeculativeResult(acceptedCount, draftTicks, verifyTicks, k);
         }
         finally
