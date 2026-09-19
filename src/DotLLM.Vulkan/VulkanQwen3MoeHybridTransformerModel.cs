@@ -625,7 +625,16 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             && growable.EnsureCapacity(VulkanNemotronHKvCache.RequiredLengthFor(positions)))
             resized = true;
 
-        if (resized) _kernels.InvalidateAll();
+        if (resized)
+        {
+            _kernels.InvalidateAll();
+            // InvalidateAll only reaches the MODEL-owned kernels. An F16 cache owns its own
+            // attention + pack kernels, whose descriptor sets are keyed on the forward-state
+            // handles just freed — and the driver recycles those handles. Missing this is the same
+            // correct-then-silently-ZEROS failure as the KV-growth case (issue #437).
+            if (kvCache is VulkanNemotronHKvCache { F16Kernels: { } cacheOwned })
+                cacheOwned.InvalidateDescriptorCaches();
+        }
 
         UploadPositions(positions);
 

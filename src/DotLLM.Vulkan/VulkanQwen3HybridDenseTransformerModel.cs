@@ -439,6 +439,12 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             // can be recycled into the new scratch allocation — which would bind the stale set.
             _hadamard?.InvalidateDescriptorCache();
             _embedGather?.InvalidateDescriptorCache();
+            // InvalidateAll only reaches the MODEL-owned kernels. An F16 cache owns its own
+            // attention + pack kernels, whose descriptor sets are keyed on the forward-state
+            // handles just freed — and the driver recycles those handles. Missing this is the same
+            // correct-then-silently-ZEROS failure as the KV-growth case (issue #437).
+            if (kvCache is VulkanNemotronHKvCache { F16Kernels: { } cacheOwned })
+                cacheOwned.InvalidateDescriptorCaches();
         }
 
         UploadPositions(positions);

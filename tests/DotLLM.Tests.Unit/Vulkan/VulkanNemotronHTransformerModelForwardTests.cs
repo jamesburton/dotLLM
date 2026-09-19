@@ -209,7 +209,10 @@ public sealed class VulkanNemotronHTransformerModelForwardTests
         var config = fixture.Config;
         int vocabSize = config.VocabSize;
         int hiddenSize = config.HiddenSize;
-        const int prefillLen = 4, decodeSteps = 8;
+        // 24 decode steps so seqKv passes the split-KV engage point (>= 17): without that, the
+        // F16 SPV this model will actually decode with at real scale
+        // (attention_f32_splitkv_kvf16) is never compared against an fp32 oracle.
+        const int prefillLen = 4, decodeSteps = 24;
         int maxSeqLen = prefillLen + decodeSteps;
 
         float[][] Run(VulkanKvDataType dt)
@@ -274,6 +277,89 @@ public sealed class VulkanNemotronHTransformerModelForwardTests
         Assert.True(maxDiff > 0f,
             "F16 and F32 logits are bit-identical, so the F16 store / _kvf16 kernels did not actually "
             + "run — the plumbing fell back to the fp32 path and this test would pass vacuously.");
+    }
+
+    /// <summary>
+    /// Decode-then-longer-prefill under F16, against the same sequence on the fp32 path.
+    /// </summary>
+    /// <remarks>
+    /// This is the second half of trap (b), and it is NOT the KV-growth case. The forward-state
+    /// scratch starts at seqLen 1 and grows on the first multi-token forward; when it does, the
+    /// model invalidates the kernels IT owns — but an F16 cache owns its own attention and pack
+    /// kernels, and their descriptor sets are keyed on the state handles just freed. The driver
+    /// recycles those handles (60 reuses over 12 generations, see
+    /// <see cref="VulkanKvCacheGrowthHandleReuseTests"/>), so a stale set can be rebound and the
+    /// output goes correct-then-silently-zeros exactly as in the growth case.
+    ///
+    /// The ordering matters: a short decode FIRST, then a prefill longer than the current state
+    /// capacity, then more decode. <c>Prefill_ThenDecode_F16KvCache_GrowingMatchesEager</c> cannot
+    /// catch it because it prefills first, so the state is already at its final size.
+    /// </remarks>
+    [SkippableFact]
+    public void Decode_ThenLongerPrefill_F16KvCache_MatchesF32Path()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        var layerKinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Attention };
+        using var fixture = NemotronHFixtureBuilder.Build(layerKinds, seed: 4379, quantize: false);
+        var config = fixture.Config;
+        int vocabSize = config.VocabSize;
+        const int midPrefill = 6, tailDecode = 20;
+        int maxSeqLen = 1 + midPrefill + tailDecode;
+
+        float[][] Run(VulkanKvDataType dt)
+        {
+            using var device = VulkanDevice.Create();
+            using var model = VulkanNemotronHTransformerModel.BuildFromPrebuiltWeights(
+                device, config, fixture.Layers, fixture.OutputNormWeight,
+                fixture.OutputWeightPtr, fixture.OutputQuantType, vocabSize, config.HiddenSize,
+                fixture.TokenEmbedPtr, QuantizationType.F32, spvDir);
+            using var kv = model.CreateKvCache(maxSeqLen, maxSeqLen, dt);
+            using var ssm = model.CreateSsmState();
+
+            var perStep = new List<float[]>();
+            int pos = 0;
+
+            // 1. Single-token decode — the forward state is still at its initial seqLen of 1.
+            using (ITensor l = model.Forward(new[] { 1 }, new[] { pos++ }, deviceId: -1, kv, ssm))
+                perStep.Add(CopyLogits(l));
+
+            // 2. Multi-token prefill — this is the forward-state reallocation.
+            int[] pTok = new int[midPrefill], pPos = new int[midPrefill];
+            for (int i = 0; i < midPrefill; i++) { pTok[i] = (i * 3) % vocabSize; pPos[i] = pos++; }
+            using (ITensor l = model.Forward(pTok, pPos, deviceId: -1, kv, ssm))
+                perStep.Add(CopyLogits(l));
+
+            // 3. Decode on, past the split-KV engage point, reading through the recycled handles.
+            for (int st = 0; st < tailDecode; st++)
+            {
+                using ITensor l = model.Forward(new[] { (st * 7 + 3) % vocabSize }, new[] { pos++ },
+                    deviceId: -1, kv, ssm);
+                perStep.Add(CopyLogits(l));
+            }
+            return perStep.ToArray();
+        }
+
+        float[][] f32 = Run(VulkanKvDataType.F32);
+        float[][] f16 = Run(VulkanKvDataType.F16);
+
+        const float absTol = 1e-2f, relTol = 1e-2f;   // same basis as Decode_F16KvCache_MatchesF32Path
+        float maxDiff = 0f;
+        for (int step = 0; step < f32.Length; step++)
+        {
+            for (int c = 0; c < vocabSize; c++)
+            {
+                float a = f32[step][c], b = f16[step][c];
+                float diff = MathF.Abs(a - b);
+                maxDiff = MathF.Max(maxDiff, diff);
+                Assert.True(diff <= absTol + relTol * MathF.Abs(a),
+                    $"step={step} (0=decode, 1=prefill, 2+=decode), col={c}: f32={a:F6} vs f16={b:F6} "
+                    + $"(|diff|={diff:E3}). Zeros from step 1 onwards means the cache-owned F16 kernels "
+                    + "kept descriptor sets keyed on the reallocated forward-state buffers (issue #437).");
+            }
+        }
+        Assert.True(maxDiff > 0f, "F16 and F32 are bit-identical — the F16 path did not run.");
+        Assert.Contains(f16[^1], v => v != 0f);
     }
 
     /// <summary>

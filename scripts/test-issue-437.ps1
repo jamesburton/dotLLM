@@ -73,9 +73,9 @@ exit $testExit
 <#
 EXPECTED OUTPUT
 ---------------
-    Passed!  - Failed:     0, Passed:    19, Skipped:     0, Total:    19
+    Passed!  - Failed:     0, Passed:    20, Skipped:     0, Total:    20
 
-19 = 6 pre-existing NemotronH CPU-parity tests + 13 added for #437.
+20 = 6 pre-existing NemotronH CPU-parity tests + 14 added for #437.
 
 The footprint table is printed by VulkanKvCacheFootprintTests and should read, at Bonsai 2
 geometry (16 full-attention layers, head_count_kv=4, key_length=value_length=256 => 128 KiB
@@ -108,5 +108,5 @@ KNOWN PRE-EXISTING FAILURES ELSEWHERE (not touched by this filter, do not chase)
 WIDER REGRESSION SWEEP (~9 min GPU) — the suites that share the changed code:
   dotnet test tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj --no-build -v q --nologo --filter `
     "FullyQualifiedName~Qwen3HybridDense|FullyQualifiedName~Qwen3MoeHybrid|FullyQualifiedName~VulkanNemotronH|FullyQualifiedName~VulkanRopeKvWriteFusion|FullyQualifiedName~VulkanSplitKvAttention|FullyQualifiedName~VulkanAttention|FullyQualifiedName~VulkanKvCache|FullyQualifiedName~VulkanFlashAttention"
-  Expected: Passed: 156, Failed: 0, Skipped: 55 (the skips need GGUF fixtures that are absent here).
+  Expected: Passed: 158, Failed: 0, Skipped: 55 (the skips need GGUF fixtures that are absent here).
 #>

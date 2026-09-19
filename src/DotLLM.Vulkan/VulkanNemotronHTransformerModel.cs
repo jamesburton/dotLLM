@@ -757,7 +757,15 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             scratchResized = true;
 
         if (scratchResized)
+        {
             InvalidateKernelCaches();
+            // InvalidateKernelCaches only reaches the MODEL-owned kernels. An F16 cache owns its
+            // own attention + pack kernels, whose descriptor sets are keyed on the forward-state
+            // handles that were just freed — and the driver recycles those handles. Missing this
+            // is the same correct-then-silently-ZEROS failure as the KV-growth case (issue #437).
+            if (kvCache is VulkanNemotronHKvCache { F16Kernels: { } cacheOwned })
+                cacheOwned.InvalidateDescriptorCaches();
+        }
 
         ValidateTokenIds(tokenIds);
         UploadPositions(positions);
