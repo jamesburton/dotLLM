@@ -182,6 +182,15 @@ public sealed class MatMulPQ2_0GemmF32Kernel : IDisposable
     private readonly int _tileN;
     private bool _disposed;
 
+    /// <summary>
+    /// Raw <c>VkPipeline</c> handle — diagnostics only, mirroring
+    /// <c>VulkanComputeKernelBase.PipelineHandle</c>. Exists so
+    /// <c>VulkanDevice.GetShaderStatisticsAmd</c> can report this kernel's
+    /// post-compile VGPR/LDS allocation; no codepath's correctness or performance
+    /// depends on it.
+    /// </summary>
+    internal nint PipelineHandle => _pipeline.Pipeline;
+
     private MatMulPQ2_0GemmF32Kernel(
         VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, int tileM, int tileN)
     {
