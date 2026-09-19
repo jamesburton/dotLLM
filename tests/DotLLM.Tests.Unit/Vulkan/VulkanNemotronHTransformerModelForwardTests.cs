@@ -152,6 +152,191 @@ public sealed class VulkanNemotronHTransformerModelForwardTests
         AssertGrowingKvCacheMatchesEager(kinds, seed: 4372, decodeSteps: 24, initialCapacity: 1, prefillLen: 4);
     }
 
+    // ── F16 KV store (issue #437) ────────────────────────────────────────────────────
+    // Opt-in; F32 stays the default until F16 has been measured. The store is half the size and
+    // the attention kernels read it natively through the _kvf16 shader variants, so the bytes
+    // moved per decode step halve too. That is the whole reason this is NOT a dequantise-into-
+    // scratch design: dequantising would read the F16 store, write an F32 scratch and then read
+    // the scratch again — 2.5x the fp32 baseline's traffic on a path that is bandwidth-bound.
+
+    [SkippableFact]
+    public void Decode_F16KvCache_GrowingMatchesEager_AcrossTwoGrowths()
+    {
+        var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm };
+        AssertGrowingKvCacheMatchesEager(kinds, seed: 4375, decodeSteps: 30, initialCapacity: 1,
+            dataType: VulkanKvDataType.F16);
+    }
+
+    [SkippableFact]
+    public void Prefill_ThenDecode_F16KvCache_GrowingMatchesEager()
+    {
+        var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Attention };
+        AssertGrowingKvCacheMatchesEager(kinds, seed: 4376, decodeSteps: 24, initialCapacity: 1, prefillLen: 4,
+            dataType: VulkanKvDataType.F16);
+    }
+
+    /// <summary>
+    /// F16 KV against the F32 path, same prompt and same weights.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Tolerance basis.</b> The only difference is that each cached K/V element is rounded
+    /// to binary16, whose unit roundoff is 2^-11 ~= 4.9e-4 relative. That enters twice: through the
+    /// Q.K scores, where a headDim-wide dot product of random-signed terms loses roughly
+    /// sqrt(headDim) to cancellation (sum |q_d k_d| is ~sqrt(d) times the result, so the relative
+    /// error is amplified by that factor), and through the weighted-V accumulation, where the
+    /// softmax weights form a convex combination so the error stays ~2^-11. Propagating the score
+    /// error through softmax and the remaining layers puts an abs 1e-2 / rel 1e-2 bound on the final
+    /// logits at the right order — about 20x the fp32 reduction-order noise the CPU-parity tests
+    /// above already tolerate (5e-3 / 1e-3), and far below the ~1 scale of the logits themselves.
+    /// It is a bound on THIS fixture, not a quality claim: perplexity on a real model is a separate
+    /// measurement and has not been done.</para>
+    ///
+    /// <para><b>Why maxDiff must be non-zero.</b> A flag or a capability check proves nothing about
+    /// which shader ran. Asserting that the F16 result DIFFERS from the F32 one proves the packed
+    /// store and the _kvf16 kernels were exercised — had the plumbing fallen back to the fp32 path,
+    /// the outputs would be bit-identical and this test would pass vacuously.</para>
+    ///
+    /// <para><b>Range.</b> binary16 saturates at 65504. The test checks the cached magnitudes stay
+    /// well inside that, so a tolerance pass cannot be masking an overflow to infinity.</para>
+    /// </remarks>
+    [SkippableFact]
+    public void Decode_F16KvCache_MatchesF32Path_WithinF16RoundingBound()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        var layerKinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Attention };
+        using var fixture = NemotronHFixtureBuilder.Build(layerKinds, seed: 4377, quantize: false);
+        var config = fixture.Config;
+        int vocabSize = config.VocabSize;
+        int hiddenSize = config.HiddenSize;
+        const int prefillLen = 4, decodeSteps = 8;
+        int maxSeqLen = prefillLen + decodeSteps;
+
+        float[][] Run(VulkanKvDataType dt)
+        {
+            using var device = VulkanDevice.Create();
+            using var model = VulkanNemotronHTransformerModel.BuildFromPrebuiltWeights(
+                device, config, fixture.Layers, fixture.OutputNormWeight,
+                fixture.OutputWeightPtr, fixture.OutputQuantType, vocabSize, hiddenSize,
+                fixture.TokenEmbedPtr, QuantizationType.F32, spvDir);
+            using var kv = model.CreateKvCache(maxSeqLen, maxSeqLen, dt);
+            using var ssm = model.CreateSsmState();
+            Assert.Equal(dt, kv.DataType);
+
+            var perStep = new List<float[]>();
+            int pos = 0;
+            int[] pTok = new int[prefillLen], pPos = new int[prefillLen];
+            for (int i = 0; i < prefillLen; i++) { pTok[i] = i % vocabSize; pPos[i] = pos++; }
+            using (ITensor logits = model.Forward(pTok, pPos, deviceId: -1, kv, ssm))
+                perStep.Add(CopyLogits(logits));
+
+            for (int st = 0; st < decodeSteps; st++)
+            {
+                int[] tok = { (st * 5 + 2) % vocabSize };
+                int[] posArr = { pos++ };
+                using ITensor logits = model.Forward(tok, posArr, deviceId: -1, kv, ssm);
+                perStep.Add(CopyLogits(logits));
+            }
+
+            // Cached magnitudes must stay inside the binary16 range, or a "within tolerance"
+            // result could be hiding a saturation to infinity.
+            int live = kv.CurrentLength * config.NumKvHeads * config.HeadDim;
+            float[] cachedK = new float[live];
+            if (dt == VulkanKvDataType.F16) kv.DownloadKeysF16ForTest(0, cachedK);
+            else kv.DownloadKeysForTest(0, cachedK);
+            float maxAbs = 0f;
+            foreach (float x in cachedK) maxAbs = MathF.Max(maxAbs, MathF.Abs(x));
+            Assert.True(maxAbs > 0f, "cached K is all zeros — the cache was never written");
+            Assert.True(maxAbs < 1000f,
+                $"cached |K| max {maxAbs} is uncomfortably close to the binary16 limit 65504");
+
+            return perStep.ToArray();
+        }
+
+        float[][] f32 = Run(VulkanKvDataType.F32);
+        float[][] f16 = Run(VulkanKvDataType.F16);
+
+        const float absTol = 1e-2f, relTol = 1e-2f;
+        float maxDiff = 0f;
+        for (int step = 0; step < f32.Length; step++)
+        {
+            for (int c = 0; c < vocabSize; c++)
+            {
+                float a = f32[step][c], b = f16[step][c];
+                float diff = MathF.Abs(a - b);
+                maxDiff = MathF.Max(maxDiff, diff);
+                float bar = absTol + relTol * MathF.Abs(a);
+                Assert.True(diff <= bar,
+                    $"step={step} (0 = prefill), col={c}: f32={a:F6} vs f16={b:F6} (|diff|={diff:E3} > {bar:E3})");
+            }
+        }
+
+        Assert.True(maxDiff > 0f,
+            "F16 and F32 logits are bit-identical, so the F16 store / _kvf16 kernels did not actually "
+            + "run — the plumbing fell back to the fp32 path and this test would pass vacuously.");
+    }
+
+    /// <summary>
+    /// The opt-in must be reachable from the shipping call path, not just from a test that names
+    /// the dtype. The CLI creates caches through the one-argument <c>CreateKvCache(maxSeqLen)</c>,
+    /// so that overload is what has to honour <c>DOTLLM_VK_KV_F16</c> — otherwise the "option"
+    /// exists only in code nobody calls.
+    /// </summary>
+    [SkippableFact]
+    public void DefaultCreateKvCache_HonoursF16EnvironmentOptIn()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        var layerKinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm };
+        using var fixture = NemotronHFixtureBuilder.Build(layerKinds, seed: 4378, quantize: false);
+        using var device = VulkanDevice.Create();
+        using var model = VulkanNemotronHTransformerModel.BuildFromPrebuiltWeights(
+            device, fixture.Config, fixture.Layers, fixture.OutputNormWeight,
+            fixture.OutputWeightPtr, fixture.OutputQuantType, fixture.Config.VocabSize,
+            fixture.Config.HiddenSize, fixture.TokenEmbedPtr, QuantizationType.F32, spvDir);
+
+        string? previous = Environment.GetEnvironmentVariable("DOTLLM_VK_KV_F16");
+        try
+        {
+            Environment.SetEnvironmentVariable("DOTLLM_VK_KV_F16", null);
+            Assert.Equal(VulkanKvDataType.F32, VulkanNemotronHTransformerModel.DefaultKvDataType);
+            using (var def = model.CreateKvCache(MaxSeqLen))
+                Assert.Equal(VulkanKvDataType.F32, def.DataType);
+
+            Environment.SetEnvironmentVariable("DOTLLM_VK_KV_F16", "1");
+            Assert.Equal(VulkanKvDataType.F16, VulkanNemotronHTransformerModel.DefaultKvDataType);
+            using (var opted = model.CreateKvCache(MaxSeqLen))
+            {
+                Assert.Equal(VulkanKvDataType.F16, opted.DataType);
+                Assert.NotNull(opted.F16Kernels);
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DOTLLM_VK_KV_F16", previous);
+        }
+    }
+
+    [SkippableFact]
+    public void F16Cache_HalvesAllocatedBytes()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        using var kernels = VulkanKvF16Kernels.Create(device, spvDir);
+
+        var slotMap = new[] { 0, -1 };
+        using var f32 = new VulkanNemotronHKvCache(device, slotMap, 1, numKvHeads: 4, headDim: 256,
+            maxSeqLen: 1024, initialCapacity: 1024);
+        using var f16 = new VulkanNemotronHKvCache(device, slotMap, 1, numKvHeads: 4, headDim: 256,
+            maxSeqLen: 1024, initialCapacity: 1024, VulkanKvDataType.F16, kernels, ownsKernels: false);
+
+        Assert.Equal(f32.AllocatedBytes / 2, f16.AllocatedBytes);
+        Assert.True(f16.IsF16);
+        Assert.False(f32.IsF16);
+        Assert.NotNull(f16.F16Kernels);
+        Assert.Null(f32.F16Kernels);
+    }
+
     [SkippableFact]
     public void RecordUpdate_BeyondCapacity_Throws()
     {
@@ -181,7 +366,8 @@ public sealed class VulkanNemotronHTransformerModelForwardTests
     }
 
     private void AssertGrowingKvCacheMatchesEager(
-        HybridLayerKind[] layerKinds, int seed, int decodeSteps, int initialCapacity, int prefillLen = 1)
+        HybridLayerKind[] layerKinds, int seed, int decodeSteps, int initialCapacity, int prefillLen = 1,
+        VulkanKvDataType dataType = VulkanKvDataType.F32)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -200,8 +386,9 @@ public sealed class VulkanNemotronHTransformerModelForwardTests
                 fixture.TokenEmbedPtr, QuantizationType.F32,
                 spvDir);
             using var kv = growing
-                ? model.CreateKvCache(maxSeqLen, initialCapacity)
-                : model.CreateKvCache(maxSeqLen, maxSeqLen);   // pre-#437 eager allocation
+                ? model.CreateKvCache(maxSeqLen, initialCapacity, dataType)
+                : model.CreateKvCache(maxSeqLen, maxSeqLen, dataType);   // pre-#437 eager allocation
+            Assert.Equal(dataType, kv.DataType);
             using var ssm = model.CreateSsmState();
 
             Assert.Equal(growing ? Math.Min(initialCapacity, maxSeqLen) : maxSeqLen, kv.Capacity);

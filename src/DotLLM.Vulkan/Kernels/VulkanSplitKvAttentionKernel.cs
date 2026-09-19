@@ -114,11 +114,21 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
 
     private bool _disposed;
 
+    // Bytes per cached K/V element: 4 for the fp32 PARTIAL shader, 2 for the _kvf16 one. The
+    // buffer size checks in Record depend on it — an F16 store is half the size and would
+    // otherwise be rejected as "too small" (issue #437).
+    private readonly int _kvElementBytes;
+
+    /// <summary>True when the PARTIAL pass dispatches the <c>_kvf16</c> SPV.</summary>
+    public bool ReadsKvAsF16 => _kvElementBytes == sizeof(ushort);
+
     private VulkanSplitKvAttentionKernel(
         VulkanDevice device,
         VulkanModule splitModule, ComputePipeline splitPipeline, nint splitPool,
-        VulkanModule mergeModule, ComputePipeline mergePipeline, nint mergePool)
+        VulkanModule mergeModule, ComputePipeline mergePipeline, nint mergePool,
+        bool kvF16)
     {
+        _kvElementBytes = kvF16 ? sizeof(ushort) : sizeof(float);
         _device = device;
         _splitModule = splitModule;
         _splitPipeline = splitPipeline;
@@ -133,11 +143,20 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     /// <summary>
     /// Loads <c>attention_f32_splitkv.spv</c> + <c>attention_f32_splitkv_merge.spv</c>
     /// and creates both pipelines. Throws if either SPV is missing — callers
-    /// wanting graceful fallback should use <see cref="TryCreate"/>.
+    /// wanting graceful fallback should use <see cref="TryCreate(VulkanDevice, string)"/>.
     /// </summary>
     public static VulkanSplitKvAttentionKernel Create(VulkanDevice device, string spvDir)
+        => Create(device, spvDir, kvF16: false);
+
+    /// <summary>
+    /// As <see cref="Create(VulkanDevice, string)"/>, but when <paramref name="kvF16"/> is set the
+    /// PARTIAL pass loads <c>attention_f32_splitkv_kvf16.spv</c> — the same kernel reading K/V as
+    /// IEEE-754 binary16 (two elements per uint) rather than fp32 (issue #437). The MERGE pass is
+    /// unchanged: it combines fp32 partials and never touches the KV store.
+    /// </summary>
+    public static VulkanSplitKvAttentionKernel Create(VulkanDevice device, string spvDir, bool kvF16)
     {
-        string splitPath = Path.Combine(spvDir, "attention_f32_splitkv.spv");
+        string splitPath = Path.Combine(spvDir, kvF16 ? "attention_f32_splitkv_kvf16.spv" : "attention_f32_splitkv.spv");
         string mergePath = Path.Combine(spvDir, "attention_f32_splitkv_merge.spv");
         if (!File.Exists(splitPath))
             throw new FileNotFoundException(
@@ -168,7 +187,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         nint splitPool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 5);
         nint mergePool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
         return new VulkanSplitKvAttentionKernel(
-            device, splitModule, splitPipeline, splitPool, mergeModule!, mergePipeline, mergePool);
+            device, splitModule, splitPipeline, splitPool, mergeModule!, mergePipeline, mergePool, kvF16);
     }
 
     /// <summary>
@@ -177,10 +196,14 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     /// back to the per-token / flash kernels.
     /// </summary>
     public static VulkanSplitKvAttentionKernel? TryCreate(VulkanDevice device, string spvDir)
+        => TryCreate(device, spvDir, kvF16: false);
+
+    /// <summary><see cref="TryCreate(VulkanDevice, string)"/> for the F16-KV variant.</summary>
+    public static VulkanSplitKvAttentionKernel? TryCreate(VulkanDevice device, string spvDir, bool kvF16)
     {
         try
         {
-            return Create(device, spvDir);
+            return Create(device, spvDir, kvF16);
         }
         catch (FileNotFoundException)
         {
@@ -280,7 +303,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
         long qBytes   = (long)numHeads   * headDim * sizeof(float);   // seqQ == 1
-        long kvBytes  = (long)seqKv * numKvHeads * headDim * sizeof(float);
+        long kvBytes  = (long)seqKv * numKvHeads * headDim * _kvElementBytes;
         if (q.Size      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
         if (k.Size      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));
         if (v.Size      < kvBytes)  throw new ArgumentException("V buffer too small.",      nameof(v));

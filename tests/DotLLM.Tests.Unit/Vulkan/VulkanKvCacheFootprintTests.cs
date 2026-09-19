@@ -72,6 +72,24 @@ public sealed class VulkanKvCacheFootprintTests
             Assert.True(lazy.AllocatedBytes < eagerBytes);
         }
 
+        // F16 store: the same rows at 2 bytes per element instead of 4.
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using (var f16Kernels = VulkanKvF16Kernels.Create(device, spvDir))
+        {
+            using var eagerF16 = new VulkanNemotronHKvCache(device, slotMap, AttentionLayers,
+                NumKvHeads, HeadDim, maxSeqLen, maxSeqLen, VulkanKvDataType.F16, f16Kernels, ownsKernels: false);
+            _out.WriteLine($"EAGER F16 (opt-in):   {eagerF16.AllocatedBytes / (1024.0 * 1024.0):F1} MiB  "
+                         + $"capacity={eagerF16.Capacity}  | {device.MemorySnapshot()}");
+            Assert.Equal(eagerBytes / 2, eagerF16.AllocatedBytes);
+
+            using var lazyF16 = new VulkanNemotronHKvCache(device, slotMap, AttentionLayers,
+                NumKvHeads, HeadDim, maxSeqLen, Math.Min(VulkanNemotronHKvCache.DefaultInitialCapacity, maxSeqLen),
+                VulkanKvDataType.F16, f16Kernels, ownsKernels: false);
+            lazyF16.EnsureCapacity(Math.Min(2048, maxSeqLen));
+            _out.WriteLine($"LAZY  F16 after 2k:   {lazyF16.AllocatedBytes / (1024.0 * 1024.0):F1} MiB  "
+                         + $"capacity={lazyF16.Capacity}  | {device.MemorySnapshot()}");
+        }
+
         // The arithmetic in the issue: 128 KiB per token across the 16 attention slots.
         Assert.Equal((long)maxSeqLen * 128 * 1024, eagerBytes);
         Assert.Equal((long)Math.Min(VulkanNemotronHKvCache.DefaultInitialCapacity, maxSeqLen) * 128 * 1024, lazyBytes);

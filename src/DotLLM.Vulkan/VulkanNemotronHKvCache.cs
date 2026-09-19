@@ -1,8 +1,23 @@
 using DotLLM.Core.Attention;
 using DotLLM.Core.Tensors;
 using DotLLM.Vulkan.Interop;
+using DotLLM.Vulkan.Kernels;
 
 namespace DotLLM.Vulkan;
+
+/// <summary>On-device element type of a <see cref="VulkanNemotronHKvCache"/>'s K/V store.</summary>
+public enum VulkanKvDataType
+{
+    /// <summary>IEEE-754 binary32. The default, and what every attention kernel reads natively.</summary>
+    F32 = 0,
+
+    /// <summary>
+    /// IEEE-754 binary16, two elements per uint. Halves the KV footprint and the bytes the
+    /// attention kernels move; requires the <c>_kvf16</c> shader variants and a pack dispatch on
+    /// the write path. Opt-in (issue #437) — see <see cref="VulkanNemotronHKvCache"/>.
+    /// </summary>
+    F16 = 1,
+}
 
 /// <summary>
 /// Sparse KV cache for the Vulkan NemotronH path. Mirrors
@@ -29,6 +44,10 @@ namespace DotLLM.Vulkan;
 /// zeros. <see cref="EnsureCapacity"/> returns <c>true</c> exactly when the caller must
 /// invalidate its kernel descriptor caches — the same contract the forward-state scratch
 /// buffers already use (<c>_state.EnsureCapacity</c> → <c>InvalidateKernelCaches</c>).</para>
+///
+/// <para><b>Element type (issue #437).</b> <see cref="DataType"/> selects fp32 (default) or
+/// F16. F16 halves the store and the bytes attention moves, but the caller must dispatch the
+/// <c>_kvf16</c> kernel variants and use <see cref="RecordPostUpdateBarrier"/>.</para>
 /// </remarks>
 public sealed class VulkanNemotronHKvCache : IKvCache
 {
@@ -42,6 +61,9 @@ public sealed class VulkanNemotronHKvCache : IKvCache
     private readonly int _maxSeqLen;
     private readonly int _kvStride;
     private readonly int _rowBytes;
+    private readonly VulkanKvDataType _dataType;
+    private readonly VulkanKvF16Kernels? _f16;
+    private readonly bool _ownsF16;
     private int _capacity;
     private int _currentLength;
     private bool _disposed;
@@ -74,6 +96,25 @@ public sealed class VulkanNemotronHKvCache : IKvCache
     public long AllocatedBytes => (long)_attentionLayerCount * 2 * _capacity * _rowBytes;
 
     /// <summary>
+    /// On-device element type of the K/V store. <see cref="VulkanKvDataType.F16"/> halves the
+    /// footprint and requires the caller to dispatch the <c>_kvf16</c> attention kernel variants
+    /// against <see cref="GetKeysBuffer"/> / <see cref="GetValuesBuffer"/>; the F32 kernels would
+    /// read the packed bytes as floats and produce garbage. The three consuming models select
+    /// their kernel set from this property.
+    /// </summary>
+    public VulkanKvDataType DataType => _dataType;
+
+    /// <summary>True when the store is F16 — shorthand for <c>DataType == VulkanKvDataType.F16</c>.</summary>
+    public bool IsF16 => _dataType == VulkanKvDataType.F16;
+
+    /// <summary>
+    /// The kernels that can read and write this store, or <c>null</c> for an fp32 store. A model
+    /// dispatching attention against <see cref="GetKeysBuffer"/> must take its attention kernels
+    /// from here whenever this is non-null.
+    /// </summary>
+    public VulkanKvF16Kernels? F16Kernels => _f16;
+
+    /// <summary>
     /// Creates the per-attention-layer K/V buffers. <paramref name="kvSlotForLayer"/> is the
     /// physical-layer-index -> slot mapping (<c>-1</c> for non-attention layers); the
     /// <c>attentionLayerCount</c> is derived as the maximum slot + 1. Buffers start at
@@ -94,6 +135,29 @@ public sealed class VulkanNemotronHKvCache : IKvCache
     /// </summary>
     public VulkanNemotronHKvCache(VulkanDevice device, int[] kvSlotForLayer, int attentionLayerCount,
         int numKvHeads, int headDim, int maxSeqLen, int initialCapacity)
+        : this(device, kvSlotForLayer, attentionLayerCount, numKvHeads, headDim, maxSeqLen,
+               initialCapacity, VulkanKvDataType.F32, f16Kernels: null, ownsKernels: false)
+    {
+    }
+
+    /// <summary>
+    /// Creates the cache with an explicit on-device element type (issue #437).
+    /// <see cref="VulkanKvDataType.F16"/> halves the store and requires
+    /// a matching kernel bundle — the F32 append is a <c>vkCmdCopyBuffer</c>, which cannot convert,
+    /// so an F16 store is written by a compute dispatch instead. That also changes the barrier the
+    /// caller must emit before attention reads the cache, which is why
+    /// <see cref="RecordPostUpdateBarrier"/> exists rather than leaving the choice to each model.
+    /// </summary>
+    /// <remarks>
+    /// <para><c>f16Kernels</c> supplies the pack + <c>_kvf16</c> attention kernels; it is required
+    /// for <see cref="VulkanKvDataType.F16"/> and ignored otherwise. The cache exposes them via
+    /// <see cref="F16Kernels"/> so a model reading this store cannot pick an fp32 kernel that would
+    /// silently misinterpret the packed bytes. <c>ownsKernels</c> transfers their lifetime to the
+    /// cache.</para>
+    /// </remarks>
+    public VulkanNemotronHKvCache(VulkanDevice device, int[] kvSlotForLayer, int attentionLayerCount,
+        int numKvHeads, int headDim, int maxSeqLen, int initialCapacity,
+        VulkanKvDataType dataType, VulkanKvF16Kernels? f16Kernels, bool ownsKernels)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(kvSlotForLayer);
@@ -103,6 +167,20 @@ public sealed class VulkanNemotronHKvCache : IKvCache
         if (maxSeqLen <= 0) throw new ArgumentOutOfRangeException(nameof(maxSeqLen));
         if (initialCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(initialCapacity));
         if (initialCapacity > maxSeqLen) initialCapacity = maxSeqLen;
+        if (dataType == VulkanKvDataType.F16)
+        {
+            if (f16Kernels is null)
+                throw new ArgumentNullException(nameof(f16Kernels),
+                    "An F16 KV store is written by a compute dispatch and read by the _kvf16 "
+                    + "attention variants; supply a VulkanKvF16Kernels bundle.");
+            // Two F16 per uint: a row must start on a uint boundary, or a pair would straddle
+            // two rows and the shader's `i >> 1` addressing would be wrong. Every architecture
+            // that reaches here has an even numKvHeads * headDim, so this is a guard, not a limit.
+            if (((numKvHeads * headDim) & 1) != 0)
+                throw new ArgumentException(
+                    $"F16 KV requires an even numKvHeads * headDim; got {numKvHeads * headDim}.",
+                    nameof(headDim));
+        }
 
         _device = device;
         _kvSlotForLayer = kvSlotForLayer;
@@ -111,7 +189,10 @@ public sealed class VulkanNemotronHKvCache : IKvCache
         _headDim = headDim;
         _maxSeqLen = maxSeqLen;
         _kvStride = numKvHeads * headDim;
-        _rowBytes = _kvStride * sizeof(float);
+        _dataType = dataType;
+        _f16 = dataType == VulkanKvDataType.F16 ? f16Kernels : null;
+        _ownsF16 = ownsKernels && _f16 is not null;
+        _rowBytes = _kvStride * (dataType == VulkanKvDataType.F16 ? sizeof(ushort) : sizeof(float));
         _capacity = initialCapacity;
 
         _keys = new VulkanDevice.Buffer[attentionLayerCount];
@@ -197,6 +278,10 @@ public sealed class VulkanNemotronHKvCache : IKvCache
             _values[i] = newValues[i];
         }
         _capacity = newCapacity;
+
+        // The cache owns these, so the model's InvalidateKernelCaches cannot reach them —
+        // and their descriptor sets are keyed on the buffer handles just retired.
+        _f16?.InvalidateDescriptorCaches();
         return true;
     }
 
@@ -219,13 +304,53 @@ public sealed class VulkanNemotronHKvCache : IKvCache
     /// <summary>Raw Vulkan buffer handle of a layer's value store. See <see cref="KeysHandleForTest"/>.</summary>
     public nint ValuesHandleForTest(int absoluteLayerIndex) => _values[RequireSlot(absoluteLayerIndex)].Handle;
 
-    /// <summary>Downloads the live key rows of a layer to host. Test helper.</summary>
+    /// <summary>Downloads the live key rows of a layer to host. Test helper; F32 stores only —
+    /// an F16 store's bytes are not floats and the download would silently return garbage.</summary>
     public void DownloadKeysForTest(int absoluteLayerIndex, Span<float> destination)
-        => _device.Download(_keys[RequireSlot(absoluteLayerIndex)], destination);
+    {
+        RequireF32ForDownload();
+        _device.Download(_keys[RequireSlot(absoluteLayerIndex)], destination);
+    }
 
-    /// <summary>Downloads the live value rows of a layer to host. Test helper.</summary>
+    /// <summary>Downloads the live value rows of a layer to host. See <see cref="DownloadKeysForTest"/>.</summary>
     public void DownloadValuesForTest(int absoluteLayerIndex, Span<float> destination)
-        => _device.Download(_values[RequireSlot(absoluteLayerIndex)], destination);
+    {
+        RequireF32ForDownload();
+        _device.Download(_values[RequireSlot(absoluteLayerIndex)], destination);
+    }
+
+    /// <summary>Downloads the live rows of an F16 key store, widened to fp32. Test helper.</summary>
+    public void DownloadKeysF16ForTest(int absoluteLayerIndex, Span<float> destination)
+        => DownloadHalf(_keys[RequireSlot(absoluteLayerIndex)], destination);
+
+    /// <summary>Downloads the live rows of an F16 value store, widened to fp32. Test helper.</summary>
+    public void DownloadValuesF16ForTest(int absoluteLayerIndex, Span<float> destination)
+        => DownloadHalf(_values[RequireSlot(absoluteLayerIndex)], destination);
+
+    private void RequireF32ForDownload()
+    {
+        if (_dataType != VulkanKvDataType.F32)
+            throw new InvalidOperationException(
+                $"Cache holds {_dataType}; use the F16 download helpers (the raw bytes are not fp32).");
+    }
+
+    private void DownloadHalf(VulkanDevice.Buffer buffer, Span<float> destination)
+    {
+        if (_dataType != VulkanKvDataType.F16)
+            throw new InvalidOperationException($"Cache holds {_dataType}, not F16.");
+        // VulkanDevice.Download speaks fp32 spans only, so pull the packed store as half as
+        // many "floats" and re-split each one into the two binary16 values it actually holds.
+        if ((destination.Length & 1) != 0)
+            throw new ArgumentException("destination length must be even (2 F16 per uint).", nameof(destination));
+        Span<float> packed = new float[destination.Length / 2];
+        _device.Download(buffer, packed);
+        for (int p = 0; p < packed.Length; p++)
+        {
+            uint bits = BitConverter.SingleToUInt32Bits(packed[p]);
+            destination[2 * p] = (float)BitConverter.UInt16BitsToHalf((ushort)(bits & 0xFFFFu));
+            destination[2 * p + 1] = (float)BitConverter.UInt16BitsToHalf((ushort)(bits >> 16));
+        }
+    }
 
     private int RequireSlot(int absoluteLayerIndex)
     {
@@ -268,6 +393,34 @@ public sealed class VulkanNemotronHKvCache : IKvCache
                 "growing mid-recording would free buffer handles the recording still references.");
         bool contiguous = IsContiguousAscending(positions);
 
+        if (_f16 is not null)
+        {
+            var pack = _f16.Pack;
+            // F16 store: convert instead of copy. Source rows are [seqLen, kvStride] fp32 in the
+            // model's K/V scratch; destination rows are kvStride F16 elements at `pos`.
+            if (contiguous)
+            {
+                long dstElem = (long)positions[0] * _kvStride;
+                long count = (long)seqLen * _kvStride;
+                pack.Record(cmdBuf, kDev, _keys[slot], 0, dstElem, count);
+                pack.Record(cmdBuf, vDev, _values[slot], 0, dstElem, count);
+            }
+            else
+            {
+                for (int i = 0; i < seqLen; i++)
+                {
+                    long srcElem = (long)i * _kvStride;
+                    long dstElem = (long)positions[i] * _kvStride;
+                    pack.Record(cmdBuf, kDev, _keys[slot], srcElem, dstElem, _kvStride);
+                    pack.Record(cmdBuf, vDev, _values[slot], srcElem, dstElem, _kvStride);
+                }
+            }
+
+            int packedLength = maxPos + 1;
+            if (packedLength > _currentLength) _currentLength = packedLength;
+            return;
+        }
+
         if (contiguous)
         {
             int startPos = positions[0];
@@ -299,6 +452,20 @@ public sealed class VulkanNemotronHKvCache : IKvCache
         int newLength = maxPos + 1;
         if (newLength > _currentLength)
             _currentLength = newLength;
+    }
+
+    /// <summary>
+    /// Emits the barrier that makes a just-recorded <see cref="RecordUpdate"/> visible to the
+    /// attention dispatch that reads the cache. Callers MUST use this rather than picking a
+    /// barrier themselves: the F32 store is appended with <c>vkCmdCopyBuffer</c>
+    /// (<c>TRANSFER -> COMPUTE</c>) but the F16 store is appended by a compute dispatch
+    /// (<c>COMPUTE -> COMPUTE</c>), and a transfer-stage source does not cover a shader write —
+    /// which Vulkan will not diagnose, it will just read stale KV.
+    /// </summary>
+    internal void RecordPostUpdateBarrier(nint cmdBuf)
+    {
+        if (_f16 is not null) KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        else KernelSupport.TransferToComputeBarrier(cmdBuf);
     }
 
     private int ValidateAndFindMaxPos(ReadOnlySpan<int> positions, int seqLen)
@@ -372,5 +539,6 @@ public sealed class VulkanNemotronHKvCache : IKvCache
             _keys[i]?.Dispose();
             _values[i]?.Dispose();
         }
+        if (_ownsF16) _f16!.Dispose();
     }
 }

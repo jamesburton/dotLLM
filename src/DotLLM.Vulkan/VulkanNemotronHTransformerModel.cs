@@ -111,6 +111,12 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private readonly MatMulBf16GemvF32Kernel _matmulBf16;
     private readonly MatMulBf16GemmF32Kernel _matmulBf16Gemm;
     private readonly RmsNormF32Kernel _rmsnorm;
+    // Shader directory the kernels above were loaded from. Not readonly only because the
+    // private constructor's parameter list is already at its practical limit; the Build* factories
+    // assign it immediately after construction and nothing else writes it. Needed so an F16 KV
+    // cache can be built on demand without re-plumbing every factory (issue #437).
+    private string? _spvDir;
+
     private readonly AttentionF32Kernel _attention;
     /// <summary>
     /// Flash-Attention F32 kernel for the GQA prefill path (seqQ &gt; 1). Null
@@ -185,6 +191,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
     /// <summary>Creates a sparse <see cref="VulkanNemotronHKvCache"/> sized for this model.</summary>
     public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen)
+        => CreateKvCache(maxSeqLen, DefaultKvDataType);
+
+    private VulkanNemotronHKvCache CreateF32KvCache(int maxSeqLen)
         => new(_device, _kvSlotForLayer, _attentionLayerCount,
                Config.NumKvHeads, Config.HeadDim, maxSeqLen);
 
@@ -196,6 +205,52 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen, int initialCapacity)
         => new(_device, _kvSlotForLayer, _attentionLayerCount,
                Config.NumKvHeads, Config.HeadDim, maxSeqLen, initialCapacity);
+
+    /// <summary>
+    /// Creates the KV cache with an explicit on-device element type (issue #437).
+    /// <see cref="VulkanKvDataType.F16"/> halves the store; the cache is handed a
+    /// <see cref="VulkanKvF16Kernels"/> bundle built from this model's shader directory, so the
+    /// attention dispatches automatically switch to the <c>_kvf16</c> variants that can read it.
+    /// F32 remains the default everywhere — this is opt-in until it has been measured.
+    /// </summary>
+    public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen, int initialCapacity, VulkanKvDataType dataType)
+    {
+        if (dataType == VulkanKvDataType.F32)
+            return CreateKvCache(maxSeqLen, initialCapacity);
+
+        string spv = _spvDir
+            ?? throw new InvalidOperationException(
+                "This model was built without a shader directory, so the F16 KV kernels cannot be "
+                + "loaded. Use the GGUF/prebuilt factories, which record it.");
+        var kernels = VulkanKvF16Kernels.Create(_device, spv);
+        try
+        {
+            return new VulkanNemotronHKvCache(_device, _kvSlotForLayer, _attentionLayerCount,
+                Config.NumKvHeads, Config.HeadDim, maxSeqLen, initialCapacity,
+                dataType, kernels, ownsKernels: true);
+        }
+        catch
+        {
+            kernels.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// <see cref="CreateKvCache(int, int, VulkanKvDataType)"/> with the default initial capacity.
+    /// <c>DOTLLM_VK_KV_F16=1</c> selects F16 without a code change.
+    /// </summary>
+    public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen, VulkanKvDataType dataType)
+        => dataType == VulkanKvDataType.F32
+            ? CreateF32KvCache(maxSeqLen)
+            : CreateKvCache(maxSeqLen, Math.Min(VulkanNemotronHKvCache.DefaultInitialCapacity, maxSeqLen), dataType);
+
+    /// <summary>The KV element type this process defaults to — F32 unless <c>DOTLLM_VK_KV_F16=1</c>.</summary>
+    public static VulkanKvDataType DefaultKvDataType =>
+        string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_KV_F16"), "1", StringComparison.Ordinal)
+            ? VulkanKvDataType.F16
+            : VulkanKvDataType.F32;
+
 
     private VulkanNemotronHTransformerModel(
         VulkanDevice device, bool ownsDevice,
@@ -542,7 +597,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         var submit = device.CreateSubmitContext();
 
-        return new VulkanNemotronHTransformerModel(
+        var built = new VulkanNemotronHTransformerModel(
             device, ownsDevice: false,
             config, weights, state, ssmCache,
             ssmLayerOrdinal, kvSlotForLayer, attentionLayerCount,
@@ -568,6 +623,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             conv1dCausal, siluInplace, mamba2Scan, ssmDSkip, groupRmsNorm, reluSquared,
             ssmSplitXbc,
             submit);
+        built._spvDir = spvDir;
+        return built;
     }
 
     /// <inheritdoc/>
@@ -1131,6 +1188,10 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         // NemotronHAttention rotate nothing — position information comes entirely
         // from the Mamba2 layers. Mirrors the CPU model's ForwardAttentionBody.
 
+        // Defaults are the model-owned fp32 kernels; an F16 KV cache swaps in its own below.
+        var splitKvAttention = _splitKvAttention;
+        var attention = _attention;
+        var flashAttention = _flashAttention;
         VulkanDevice.Buffer kSrc, vSrc;
         int seqKv;
         int positionOffset;
@@ -1138,11 +1199,23 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         {
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, absoluteLayerIndex);
-            KernelSupport.TransferToComputeBarrier(cmdBuf);
+            // The barrier depends on how the cache was appended: fp32 is a transfer copy,
+            // F16 is a compute pack. The cache owns that choice (issue #437).
+            vkCache.RecordPostUpdateBarrier(cmdBuf);
             kSrc = vkCache.GetKeysBuffer(absoluteLayerIndex);
             vSrc = vkCache.GetValuesBuffer(absoluteLayerIndex);
             seqKv = vkCache.CurrentLength;
             positionOffset = positions[0];
+
+            // An F16 store is unreadable by the fp32 attention kernels — they would read packed
+            // halves as floats and return garbage with no error. The cache carries the kernels
+            // that match its bytes, so take them from there (issue #437).
+            if (vkCache.F16Kernels is { } kvF16)
+            {
+                splitKvAttention = kvF16.SplitKv;
+                attention = kvF16.Attention;
+                flashAttention = null;   // no F16 flash variant; the tiled kernel covers prefill
+            }
         }
         else
         {
@@ -1153,28 +1226,28 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             positionOffset = 0;
         }
 
-        if (_splitKvAttention is not null && seqLen == 1
+        if (splitKvAttention is not null && seqLen == 1
             && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
             && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads))
         {
             // Decode: split the KV range across many workgroups (Flash-Decoding).
             // Engages from seqKv >= 17 with the shipping heuristic (issue #331);
             // only seqKv <= 16 falls through to the per-token kernel.
-            _splitKvAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+            splitKvAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: 0);
         }
-        else if (_flashAttention is not null && seqLen > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
+        else if (flashAttention is not null && seqLen > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
         {
-            _flashAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+            flashAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: 0);
         }
         else
         {
-            _attention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+            attention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: 0);
