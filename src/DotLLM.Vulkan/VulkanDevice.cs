@@ -1690,8 +1690,28 @@ public sealed class VulkanDevice : IDisposable
         if (allocResult < 0)
         {
             VulkanApi.vkDestroyBuffer(_device, buffer, 0);
+            // Name the memory type and heap we actually asked for. Without this an OOM on a part
+            // whose device-local heap reports tens of GiB free is undiagnosable from the outside.
+            uint chosenFlags = 0, chosenHeap = 0;
+            ulong heapSize = 0;
+            unsafe
+            {
+                VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var memDiag);
+                uint* typesDiag = (uint*)memDiag.memoryTypes;
+                if (preferredTypeIndex < memDiag.memoryTypeCount)
+                {
+                    chosenFlags = typesDiag[preferredTypeIndex * 2];
+                    chosenHeap = typesDiag[preferredTypeIndex * 2 + 1];
+                }
+                ulong* heapsDiag = (ulong*)memDiag.memoryHeaps;
+                if (chosenHeap < memDiag.memoryHeapCount)
+                    heapSize = heapsDiag[chosenHeap * 2];
+            }
+
             allocResult.ThrowOnError(
-                $"vkAllocateMemory ({bytes} bytes{(IsTransientMemoryResult(allocResult) ? $", {s_memRetries} retries exhausted" : "")})");
+                $"vkAllocateMemory ({bytes} bytes{(IsTransientMemoryResult(allocResult) ? $", {s_memRetries} retries exhausted" : "")}" +
+                $"; memoryTypeIndex={preferredTypeIndex} flags=0x{chosenFlags:X} heapIndex={chosenHeap} " +
+                $"heapSize={heapSize / (1024 * 1024)} MiB; typeBits=0x{req.memoryTypeBits:X})");
         }
 
         int bindResult = VulkanApi.vkBindBufferMemory(_device, buffer, memory, 0);
