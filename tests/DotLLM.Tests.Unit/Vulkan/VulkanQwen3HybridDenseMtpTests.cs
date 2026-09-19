@@ -46,9 +46,11 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
     private const float RelTol = 1e-3f;
 
     private readonly string _scratch;
+    private readonly Xunit.Abstractions.ITestOutputHelper _out;
 
-    public VulkanQwen3HybridDenseMtpTests()
+    public VulkanQwen3HybridDenseMtpTests(Xunit.Abstractions.ITestOutputHelper output)
     {
+        _out = output;
         _scratch = Path.Combine(Path.GetTempPath(), $"dotllm-vk-qwen35-mtp-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_scratch);
     }
@@ -242,13 +244,23 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
     /// trunk forwards.
     /// </summary>
     /// <remarks>
-    /// Deliberately uses the DEFAULT mixed GDN + full-attention fixture rather than the
-    /// all-full-attention one the equivalent CUDA test had to fall back to. A rejected draft
-    /// permanently advances the trunk's Gated-DeltaNet recurrence, which has no position addressing
-    /// to roll back, so this test only passes if <see cref="VulkanQwen3HybridDenseTransformerModel.CheckpointRecurrentState"/>
-    /// / <c>RestoreRecurrentState</c> (added in #435) actually work. Before them, Vulkan reported
-    /// <c>SupportsRecurrentStateCheckpoint == false</c> and this would diverge on the first
-    /// rejection — silently, because the corrected token is still the trunk's own argmax.
+    /// <para>
+    /// Uses the DEFAULT mixed GDN + full-attention fixture, unlike the equivalent CUDA test which
+    /// had to fall back to an all-full-attention trunk.
+    /// </para>
+    /// <para>
+    /// <b>What this does NOT cover, measured rather than assumed.</b> It was written expecting to
+    /// pin the recurrent checkpoint/restore pair, on the reasoning that a rejected draft advances
+    /// the GDN recurrence irreversibly. An assertion added to check that produced the
+    /// emitted-per-round histogram <c>[1,1,1,1,1,1,1,1,1,1]</c>: the MTP head and the trunk are
+    /// independently random on a synthetic fixture, so the head agrees with the trunk's argmax at
+    /// chance (1 in 12 here) and essentially every round is rejected at draft position 0 — BEFORE
+    /// the verify batch runs, so nothing ever touches the GDN state. No token budget fixes that.
+    /// This test therefore covers greedy equivalence and the position-0 reject/correction path;
+    /// the checkpoint pair is covered by
+    /// <see cref="CheckpointRestoreRecurrentState_RestoresGdnStateExactly"/> instead, which is
+    /// deterministic and does not depend on a random model agreeing with itself.
+    /// </para>
     /// </remarks>
     [SkippableFact]
     public void DraftAndVerify_MatchesPlainGreedyDecode_OnRealVulkanModel()
@@ -267,17 +279,105 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
         Assert.True(run.Drafted > 0, "The decoder must actually have drafted something.");
         Assert.True(run.Emitted > 0, "Every round emits at least the corrected/bonus token.");
 
-        // Without this the test would be vacuous for its stated purpose. A round that emits ONE
-        // token was rejected at draft position 0, before the verify batch ever ran, so nothing
-        // touched the GDN recurrence and no restore happened; a round that emits K+1 accepted
-        // everything and needs no restore either. ONLY a round emitting 2..K went through the
-        // verify batch and then rejected — that is the path RestoreRecurrentState exists for, and
-        // it is the path that silently corrupts a recurrent trunk when the checkpoint pair is
-        // missing. Assert it fired, or this test proves nothing about #435's checkpoint work.
-        Assert.True(run.PartialRejectionRounds > 0,
-            $"No round exercised the post-verify rejection path (emitted-per-round histogram: " +
-            $"[{string.Join(",", run.EmittedPerRound)}], K={K}). The GDN checkpoint/restore pair is " +
-            "therefore untested by this run — retune the fixture or the token budget.");
+        // Measured, not assumed: on this fixture the emitted-per-round histogram comes back
+        // [1,1,1,...] — the MTP head and the trunk are independently random, so the head's guess
+        // agrees with the trunk's argmax at chance (1/12), and essentially every round is rejected
+        // at draft position 0, BEFORE the verify batch runs. That means this test cannot reach
+        // RestoreRecurrentState no matter how the token budget is tuned, and it would be dishonest
+        // to claim it covers the checkpoint pair. It does not; it covers greedy equivalence and the
+        // reject/correction path. The checkpoint pair has its own deterministic test below —
+        // CheckpointRestoreRecurrentState_RestoresGdnStateExactly — which does not depend on a
+        // random model happening to agree with itself.
+        _out.WriteLine($"emitted-per-round histogram: [{string.Join(",", run.EmittedPerRound)}]  " +
+                       $"(K={K}, drafted={run.Drafted}, emitted={run.Emitted}, " +
+                       $"post-verify rejections={run.PartialRejectionRounds})");
+    }
+
+    /// <summary>
+    /// The deterministic test for the recurrent-state checkpoint pair added in #435, and the reason
+    /// speculative decoding is safe against a GDN trunk on Vulkan at all.
+    /// </summary>
+    /// <remarks>
+    /// Structure matters here. Asserting only "restore then re-run reproduces the first run" would
+    /// pass against a <b>no-op</b> restore whenever the forward happens not to depend on the
+    /// recurrent state. So this asserts both halves: the restored run must match bit-for-bit, AND
+    /// a run from the <i>mutated</i> state must differ. The second half is what makes the first
+    /// half mean something — it proves the GDN state genuinely affects this forward, so matching
+    /// after a restore is evidence the state really was rolled back.
+    /// </remarks>
+    [SkippableFact]
+    public void CheckpointRestoreRecurrentState_RestoresGdnStateExactly()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        string path = WriteFixture(withMtp: true, name: "qwen35-mtp-ckpt.gguf");
+
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        using var model = VulkanQwen3HybridDenseTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
+        Assert.True(model.SupportsRecurrentStateCheckpoint);
+
+        using var kv = model.CreateKvCache(config.MaxSequenceLength);
+
+        // Advance the GDN recurrence with a prefix, then snapshot it.
+        using (ITensor _ = model.Forward([1, 2, 3], [0, 1, 2], deviceId: -1, kv)) { }
+        object? checkpoint = model.CheckpointRecurrentState();
+        Assert.NotNull(checkpoint);
+
+        try
+        {
+            // First continuation from the snapshot point.
+            float[] first;
+            using (ITensor logits = model.Forward([4], [3], deviceId: -1, kv))
+                first = Copy(logits, VocabSize);
+
+            // A SECOND continuation without restoring: the GDN state has moved on, so this must
+            // differ. If it does not, the forward is insensitive to the recurrent state and the
+            // restore assertion below would be vacuous.
+            float[] mutated;
+            kv.Rollback(3);
+            using (ITensor logits = model.Forward([4], [3], deviceId: -1, kv))
+                mutated = Copy(logits, VocabSize);
+
+            bool anyDifference = false;
+            for (int i = 0; i < VocabSize && !anyDifference; i++)
+                anyDifference = first[i] != mutated[i];
+            Assert.True(anyDifference,
+                "Re-running the same token from a MUTATED recurrent state produced identical logits, " +
+                "so this forward does not depend on GDN state and the restore assertion below would " +
+                "prove nothing. The test needs a different shape.");
+
+            // Now restore and re-run: must reproduce the first continuation exactly. Bit-exactness
+            // is fair to demand — identical inputs, identical kernels, identical dispatch order.
+            kv.Rollback(3);
+            model.RestoreRecurrentState(checkpoint);
+            float[] restored;
+            using (ITensor logits = model.Forward([4], [3], deviceId: -1, kv))
+                restored = Copy(logits, VocabSize);
+
+            for (int i = 0; i < VocabSize; i++)
+                Assert.True(first[i] == restored[i],
+                    $"index {i}: before={first[i]:R} after restore={restored[i]:R} — " +
+                    "VulkanGdnStateCache.CopyTo did not reproduce the snapshot exactly.");
+
+            // The checkpoint must survive being restored FROM: the decoder holds one object across
+            // a restore-and-replay and only disposes it at the end of the round. A CopyTo that
+            // consumed or aliased its source would pass the first restore and fail here.
+            kv.Rollback(3);
+            model.RestoreRecurrentState(checkpoint);
+            using (ITensor logits = model.Forward([4], [3], deviceId: -1, kv))
+            {
+                float[] restoredAgain = Copy(logits, VocabSize);
+                for (int i = 0; i < VocabSize; i++)
+                    Assert.True(first[i] == restoredAgain[i],
+                        $"index {i}: second restore from the SAME checkpoint diverged " +
+                        $"({first[i]:R} vs {restoredAgain[i]:R}) — the checkpoint is not reusable.");
+            }
+        }
+        finally
+        {
+            (checkpoint as IDisposable)?.Dispose();
+        }
     }
 
     private sealed record SpeculativeRun(

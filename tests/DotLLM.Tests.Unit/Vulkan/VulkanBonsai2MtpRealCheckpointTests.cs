@@ -97,16 +97,25 @@ public sealed class VulkanBonsai2MtpRealCheckpointTests
         int[] positions = new int[PromptTokens.Length];
         for (int i = 0; i < positions.Length; i++) positions[i] = i;
 
-        int[] cpuDraft = RunCpuDraft(path!, positions);
-        int[] vkDraft = RunVulkanDraft(path!, spvDir, positions);
+        var cpu = RunCpuDraft(path!, positions);
+        var vk = RunVulkanDraft(path!, spvDir, positions);
 
-        _out.WriteLine($"cpu    draft tokens: {string.Join(",", cpuDraft)}");
-        _out.WriteLine($"vulkan draft tokens: {string.Join(",", vkDraft)}");
+        _out.WriteLine($"cpu    draft tokens: {string.Join(",", cpu.Tokens)}");
+        _out.WriteLine($"vulkan draft tokens: {string.Join(",", vk.Tokens)}");
+        // Printed unconditionally so a failure diagnoses itself without a second GPU-lock window:
+        // a top-2 gap at the reduction-order noise floor means the two backends agree and the
+        // argmax merely tipped, which is parity; a large gap means a real basis/weight error. The
+        // difference decides whether a red result is a bug or a tie, and you cannot tell from the
+        // token lists alone.
+        _out.WriteLine($"cpu    top-2 gaps:   {string.Join(",", cpu.Top2Gaps.Select(g => g.ToString("E3")))}");
+        _out.WriteLine($"vulkan top-2 gaps:   {string.Join(",", vk.Top2Gaps.Select(g => g.ToString("E3")))}");
 
-        Assert.Equal(cpuDraft, vkDraft);
+        Assert.Equal(cpu.Tokens, vk.Tokens);
     }
 
-    private static int[] RunCpuDraft(string path, int[] positions)
+    private sealed record DraftRun(int[] Tokens, float[] Top2Gaps);
+
+    private static DraftRun RunCpuDraft(string path, int[] positions)
     {
         using var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -122,7 +131,7 @@ public sealed class VulkanBonsai2MtpRealCheckpointTests
         return Draft(tok => model.ForwardMtp(mtpState, tok.token, tok.position), config.VocabSize, positions[^1]);
     }
 
-    private static int[] RunVulkanDraft(string path, string spvDir, int[] positions)
+    private static DraftRun RunVulkanDraft(string path, string spvDir, int[] positions)
     {
         using var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -139,10 +148,14 @@ public sealed class VulkanBonsai2MtpRealCheckpointTests
         return Draft(tok => model.ForwardMtp(mtpState, tok.token, tok.position), config.VocabSize, positions[^1]);
     }
 
-    /// <summary>Chains <see cref="DraftSteps"/> MTP steps through their own argmax, as the decoder does.</summary>
-    private static int[] Draft(Func<(int token, int position), ITensor> forwardMtp, int vocabSize, int lastPosition)
+    /// <summary>
+    /// Chains <see cref="DraftSteps"/> MTP steps through their own argmax, as the decoder does, and
+    /// records the winning-margin (top-1 minus top-2) at each step.
+    /// </summary>
+    private static DraftRun Draft(Func<(int token, int position), ITensor> forwardMtp, int vocabSize, int lastPosition)
     {
         var drafted = new int[DraftSteps];
+        var gaps = new float[DraftSteps];
         int token = PromptTokens[^1];
         for (int i = 0; i < DraftSteps; i++)
         {
@@ -151,12 +164,17 @@ public sealed class VulkanBonsai2MtpRealCheckpointTests
             {
                 var span = new ReadOnlySpan<float>((void*)logits.DataPointer, vocabSize);
                 int best = 0;
+                float second = float.NegativeInfinity;
                 for (int c = 1; c < vocabSize; c++)
-                    if (span[c] > span[best]) best = c;
+                {
+                    if (span[c] > span[best]) { second = span[best]; best = c; }
+                    else if (span[c] > second) second = span[c];
+                }
+                gaps[i] = span[best] - second;
                 token = best;
             }
             drafted[i] = token;
         }
-        return drafted;
+        return new DraftRun(drafted, gaps);
     }
 }
