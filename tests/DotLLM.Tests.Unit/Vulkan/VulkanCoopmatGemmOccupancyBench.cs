@@ -69,12 +69,22 @@ public sealed class VulkanCoopmatGemmOccupancyBench
 
             // Waves per SIMD from the VGPR file, workgroups per WGP from LDS.
             // Both are ceilings; the binding one is whichever is smaller.
-            uint wavesByVgpr = vgpr == 0 ? 0 : avail / vgpr;
+            // Occupancy comes from the PHYSICAL register file, NOT from
+            // numAvailableVgprs -- that field is the per-wave allocation CAP.
+            // Dividing by the cap yields a plausible and completely wrong
+            // "1 wave/SIMD"; an earlier revision of this bench did exactly that
+            // and a whole diagnosis was built on it. Allocation is granular, so
+            // round up before dividing.
+            const uint gran = 8;
+            uint alloc = vgpr == 0 ? 0 : ((vgpr + gran - 1) / gran) * gran;
+            double wavesByVgpr = alloc == 0 ? 0 : Math.Min(16.0, s.numPhysicalVgprs / (double)alloc);
             double wgByLds = lds == 0 ? double.PositiveInfinity : 65536.0 / lds;
 
             _output.WriteLine(name);
             _output.WriteLine($"   workgroup           : {s.computeWorkGroupSizeX} threads");
-            _output.WriteLine($"   VGPR used/available : {vgpr} / {avail}  (physical {s.numPhysicalVgprs})  -> {wavesByVgpr} waves/SIMD IF the budget is {avail}");
+            _output.WriteLine($"   VGPR used / per-wave cap : {vgpr} / {avail}   (physical file {s.numPhysicalVgprs})");
+            _output.WriteLine($"   -> {wavesByVgpr:F1} waves/SIMD by registers (alloc {alloc}); LDS gives {wgByLds / 2.0:F1} waves/SIMD");
+            _output.WriteLine($"   -> BINDING: {(wavesByVgpr <= wgByLds / 2.0 ? "registers" : "LDS")}");
             _output.WriteLine($"   SGPR used/available : {s.resourceUsage.numUsedSgprs} / {s.numAvailableSgprs} (physical {s.numPhysicalSgprs})");
             _output.WriteLine($"   LDS used            : {lds} B -> {wgByLds:F1} workgroups/WGP by LDS (64 KB)");
             _output.WriteLine($"   scratch (spill)     : {s.resourceUsage.scratchMemUsageInBytes} B");
