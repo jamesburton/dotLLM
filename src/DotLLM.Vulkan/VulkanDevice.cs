@@ -1442,7 +1442,14 @@ public sealed class VulkanDevice : IDisposable
         /// </summary>
         public bool IsHostVisible { get; }
 
-        internal Buffer(VulkanDevice device, nint buffer, nint memory, long size, bool hostVisible)
+        // Heap index and the ACTUAL allocated size (VkMemoryRequirements.size, which
+        // can exceed the requested Size), so disposal decrements exactly what
+        // AllocateInternal added to the per-heap accounting.
+        private readonly uint _heapIndex;
+        private readonly long _allocatedBytes;
+
+        internal Buffer(VulkanDevice device, nint buffer, nint memory, long size, bool hostVisible,
+            uint heapIndex = 0, long allocatedBytes = 0)
         {
             _device = device;
             _buffer = buffer;
@@ -1450,6 +1457,8 @@ public sealed class VulkanDevice : IDisposable
             Size = size;
             _hostImport = null;
             IsHostVisible = hostVisible;
+            _heapIndex = heapIndex;
+            _allocatedBytes = allocatedBytes;
         }
 
         internal Buffer(VulkanDevice device, HostVisibleBuffer hostImport)
@@ -1488,6 +1497,11 @@ public sealed class VulkanDevice : IDisposable
             {
                 VulkanApi.vkFreeMemory(_device._device, _memory, 0);
                 _memory = 0;
+                if (_allocatedBytes != 0)
+                {
+                    Interlocked.Add(ref _device._liveBytesByHeap[_heapIndex], -_allocatedBytes);
+                    Interlocked.Decrement(ref _device._liveCountByHeap[_heapIndex]);
+                }
             }
         }
     }
@@ -1571,6 +1585,73 @@ public sealed class VulkanDevice : IDisposable
         Environment.GetEnvironmentVariable("DOTLLM_VULKAN_STRICT_DEVICE_LOCAL") == "1";
 
     private long _deviceLocalFallbacks;
+
+    /// <summary>
+    /// Live allocated bytes and allocation count per memory heap, maintained by
+    /// <see cref="AllocateInternal"/> and <see cref="Buffer.Dispose"/>.
+    /// </summary>
+    /// <remarks>
+    /// Device-local memory is unmapped, so it does NOT appear in the process working
+    /// set — "the process held 5.17 GB" says nothing about what is on the GPU heap.
+    /// Without this counter an OOM on a heap reporting tens of GiB free is
+    /// undiagnosable from the outside (see .docs/BONSAI2_27B_SUPPORT.md).
+    /// Indexed by heapIndex; VK_MAX_MEMORY_HEAPS is 16.
+    /// </remarks>
+    private readonly long[] _liveBytesByHeap = new long[16];
+    private readonly long[] _liveCountByHeap = new long[16];
+
+    /// <summary>
+    /// <c>DOTLLM_VULKAN_MEM_TRACE=1</c> logs every device allocation with the running
+    /// per-heap totals, so the whole commit curve is visible rather than just the
+    /// endpoint an OOM reports.
+    /// </summary>
+    private static readonly bool s_memTrace =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE") == "1";
+
+    /// <summary>Resolves a memory type index to its heap index, or 0 if out of range.</summary>
+    private unsafe uint HeapOfType(uint typeIndex)
+    {
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        uint* types = (uint*)mem.memoryTypes;
+        return typeIndex < mem.memoryTypeCount ? types[typeIndex * 2 + 1] : 0u;
+    }
+
+    /// <summary>
+    /// Per-heap memory report: what this process has live (our own accounting) next to
+    /// what the driver reports through <c>VK_EXT_memory_budget</c>. The driver's numbers
+    /// are process-scoped, unlike <c>vulkaninfo</c>'s, which describe vulkaninfo.
+    /// </summary>
+    public unsafe string MemorySnapshot()
+    {
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        ulong* heaps = (ulong*)mem.memoryHeaps;
+
+        // VkPhysicalDeviceMemoryBudgetPropertiesEXT chained onto
+        // VkPhysicalDeviceMemoryProperties2. Diagnostic-only: when the driver does not
+        // fill it the values stay zero and we simply print our own accounting.
+        byte* budgetBlob = stackalloc byte[272];
+        new Span<byte>(budgetBlob, 272).Clear();
+        *(uint*)budgetBlob = 1000237000; // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT
+        byte* props2 = stackalloc byte[536];
+        new Span<byte>(props2, 536).Clear();
+        *(uint*)props2 = 1000059006; // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2
+        *(nint*)(props2 + 8) = (nint)budgetBlob;
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties2(_physicalDevice, props2);
+
+        var sb = new StringBuilder();
+        for (uint h = 0; h < mem.memoryHeapCount && h < 16; h++)
+        {
+            ulong size = heaps[h * 2];
+            ulong budget = *(ulong*)(budgetBlob + 16 + h * 8);
+            ulong usage = *(ulong*)(budgetBlob + 16 + 128 + h * 8);
+            if (sb.Length > 0) sb.Append("; ");
+            sb.Append($"heap{h} ours={Interlocked.Read(ref _liveBytesByHeap[h]) / (1024 * 1024)} MiB "
+                    + $"in {Interlocked.Read(ref _liveCountByHeap[h])} allocs, "
+                    + $"driver usage={usage / (1024 * 1024)} MiB, budget={budget / (1024 * 1024)} MiB, "
+                    + $"size={size / (1024 * 1024)} MiB");
+        }
+        return sb.ToString();
+    }
 
     /// <summary>
     /// Number of device-local allocations that fell back to a host-visible memory
@@ -1711,7 +1792,8 @@ public sealed class VulkanDevice : IDisposable
             allocResult.ThrowOnError(
                 $"vkAllocateMemory ({bytes} bytes{(IsTransientMemoryResult(allocResult) ? $", {s_memRetries} retries exhausted" : "")}" +
                 $"; memoryTypeIndex={preferredTypeIndex} flags=0x{chosenFlags:X} heapIndex={chosenHeap} " +
-                $"heapSize={heapSize / (1024 * 1024)} MiB; typeBits=0x{req.memoryTypeBits:X})");
+                $"heapSize={heapSize / (1024 * 1024)} MiB; typeBits=0x{req.memoryTypeBits:X}" +
+                $"; live: {MemorySnapshot()})");
         }
 
         int bindResult = VulkanApi.vkBindBufferMemory(_device, buffer, memory, 0);
@@ -1726,7 +1808,17 @@ public sealed class VulkanDevice : IDisposable
         // chosen type also carries HOST_VISIBLE (the UMA case). On a discrete GPU the strict
         // device-local type is NOT mappable, so Download/UploadToDeviceLocal must stage.
         bool hostVisible = !deviceLocal || MemoryTypeIsHostVisible(typeIndex);
-        return new Buffer(this, buffer, memory, bytes, hostVisible);
+
+        uint heapIndex = HeapOfType(typeIndex);
+        Interlocked.Add(ref _liveBytesByHeap[heapIndex], (long)req.size);
+        Interlocked.Increment(ref _liveCountByHeap[heapIndex]);
+        if (s_memTrace)
+        {
+            Console.Error.WriteLine(
+                $"[vulkan-mem] alloc {req.size} B type={typeIndex} heap={heapIndex} -> {MemorySnapshot()}");
+        }
+
+        return new Buffer(this, buffer, memory, bytes, hostVisible, heapIndex, (long)req.size);
     }
 
     private unsafe bool MemoryTypeIsHostVisible(uint typeIndex)
