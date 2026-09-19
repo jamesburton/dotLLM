@@ -1608,12 +1608,25 @@ public sealed class VulkanDevice : IDisposable
     private static readonly bool s_memTrace =
         Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE") == "1";
 
-    /// <summary>Resolves a memory type index to its heap index, or 0 if out of range.</summary>
+    /// <summary>
+    /// Memory type index to heap index. Built once — the mapping is immutable for the life of
+    /// the physical device, and <see cref="AllocateInternal"/> is on the model-load path where a
+    /// per-allocation <c>vkGetPhysicalDeviceMemoryProperties</c> would be pure waste.
+    /// </summary>
+    private uint[]? _typeToHeap;
+
     private unsafe uint HeapOfType(uint typeIndex)
     {
-        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
-        uint* types = (uint*)mem.memoryTypes;
-        return typeIndex < mem.memoryTypeCount ? types[typeIndex * 2 + 1] : 0u;
+        var map = _typeToHeap;
+        if (map is null)
+        {
+            VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+            uint* types = (uint*)mem.memoryTypes;
+            map = new uint[mem.memoryTypeCount];
+            for (uint i = 0; i < mem.memoryTypeCount; i++) map[i] = types[i * 2 + 1];
+            _typeToHeap = map;
+        }
+        return typeIndex < map.Length ? map[typeIndex] : 0u;
     }
 
     /// <summary>

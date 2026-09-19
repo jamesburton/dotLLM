@@ -19,6 +19,12 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// VK_ERROR_OUT_OF_DEVICE_MEMORY on a heap that looked empty. Nothing in the suite
 /// noticed, because every existing test either used a format that was already in the
 /// table or was gated on a fixture nobody had.
+/// <para>
+/// Known gap: <c>VulkanNemotronHWeights</c> carries its own copy of this table (the
+/// <c>KeepNative</c> comment says "same matrix as"), and these tests do not reach it. No
+/// PQ2_0 NemotronH checkpoint exists, so the two cannot currently disagree in a way that
+/// matters — but they can drift silently, and a shared policy type would be the real fix.
+/// </para>
 /// </remarks>
 public class VulkanHybridProjectionUploadPolicyTests
 {

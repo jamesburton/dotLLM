@@ -1,5 +1,4 @@
 #:property AllowUnsafeBlocks=true
-#:property LangVersion=preview
 
 // Standalone Vulkan device-local allocation probe.
 //
