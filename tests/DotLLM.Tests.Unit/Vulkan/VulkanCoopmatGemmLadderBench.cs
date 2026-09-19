@@ -100,9 +100,12 @@ public sealed class VulkanCoopmatGemmLadderBench
         _output.WriteLine($"spvDir: {spvDir}");
         _output.WriteLine($"tokens={tokens}  batch={batch}  {WarmupPasses} warmup + {Passes} interleaved order-reversed passes (median of per-pass RATIOS)");
         _output.WriteLine("");
-        _output.WriteLine("Intensity: shipping/ (a) = 4.0 MAC/byte, (b) = 16.0, (c) = 32.0.");
-        _output.WriteLine("Only (a)->(b) and (a)->(c) isolate intensity; the shipping rows also carry BK,");
-        _output.WriteLine("wave width and LDS padding. See .docs/COOPMAT_GEMM_DIAGNOSIS.md.");
+        _output.WriteLine("Intensity: shipping/(a)/(d) = 4.0 MAC/byte, (b) = 16.0, (c)/(e) = 32.0.");
+        _output.WriteLine("(d) and (e) are (a) and (c) with a cheaper PQ2_0 unpack and nothing else changed.");
+        _output.WriteLine("Only (a)->(b)->(c) and (d)->(e) isolate intensity; only (a)->(d) and (c)->(e)");
+        _output.WriteLine("isolate unpack cost. The shipping rows also carry BK, wave width and LDS padding.");
+        _output.WriteLine("Two hypotheses in one session: #439 tile vs #440 RGP counters (WMMA 0.46% of issue");
+        _output.WriteLine("slots, VALU 43.9%, ~95 VALU per WMMA). See .docs/COOPMAT_GEMM_DIAGNOSIS.md.");
 
         var pairs = new (string Label, PQ2_0GemmVariant Reference, PQ2_0GemmVariant Challenger)[]
         {
@@ -116,6 +119,19 @@ public sealed class VulkanCoopmatGemmLadderBench
                 PQ2_0GemmVariant.Ladder64x64x4, PQ2_0GemmVariant.Ladder128x128x4),
             ("shipping coopmat32 -> (c) 128x128/4sg [END TO END vs what ships]",
                 PQ2_0GemmVariant.Coopmat32, PQ2_0GemmVariant.Ladder128x128x4),
+
+            // --- #440's competing hypothesis: the dequant, not the tile. ---
+            ("(a) -> (d) cheap unpack, SAME 16x16 tile   [UNPACK, tile held constant]",
+                PQ2_0GemmVariant.Ladder16x16x1, PQ2_0GemmVariant.Ladder16x16x1FastUnpack),
+            ("(c) -> (e) cheap unpack, SAME 128x128 tile [UNPACK at the big tile]",
+                PQ2_0GemmVariant.Ladder128x128x4, PQ2_0GemmVariant.Ladder128x128x4FastUnpack),
+            ("(d) -> (e) big tile, unpack held cheap     [INTENSITY, unpack controlled]",
+                PQ2_0GemmVariant.Ladder16x16x1FastUnpack, PQ2_0GemmVariant.Ladder128x128x4FastUnpack),
+
+            // --- Decomposes the (a)-vs-shipping bundle: Coopmat is 64-thread wave64 at BK=128,
+            //     so this holds wave width constant and varies BK + padding + B coalescing. ---
+            ("coopmat (wave64, BK=128) -> (a) (wave64, BK=32) [BK+pad+coalescing, wave held]",
+                PQ2_0GemmVariant.Coopmat, PQ2_0GemmVariant.Ladder16x16x1),
         };
 
         foreach (var (label, refVariant, challVariant) in pairs)

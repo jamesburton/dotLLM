@@ -90,6 +90,7 @@ const uint STRIDE = BK + PAD;   // 40 f16 = 80 B per staged row
 
 const uint PQ2_GROUP_BYTES = 34u;   // 2 (fp16 scale) + 32 (packed codes)
 const uint PQ2_SLICE_BYTES = 8u;    // code bytes covering ONE BK=32 K-slice of a row
+const float16_t FS_ZERO = float16_t(0.0);
 
 const uint SG_ROWS     = BM / WM;   // subgroup grid: SG_ROWS x (NSG/SG_ROWS) == NSG
 const uint CMS_PER_ROW = WM / TM;   // 16x16 fragments down one subgroup's tile
@@ -146,21 +147,33 @@ void main() {
     //
     // WAVE WIDTH: this ladder runs at the DRIVER'S NATIVE wave64 and does NOT pin the pipeline
     // with VkPipelineShaderStageRequiredSubgroupSizeCreateInfo, unlike the shipping
-    // matmul_pq2_0_f32_gemm_coopmat32.comp. That is a measured decision, not an oversight.
+    // matmul_pq2_0_f32_gemm_coopmat32.comp. That is a measured decision, not an oversight, but
+    // the underlying driver behaviour is NOT fully isolated — read the next paragraph as three
+    // observations, not as a mechanism.
     //
-    // With a 32-wide pin and NSG=4 (128 threads), gl_SubgroupID only ever took two distinct
-    // values on gfx1151, so warp_c was always 0 and exactly half the output tile was never
-    // written; the per-subgroup LDS staging slots for subgroups 2 and 3 came back holding
-    // uninitialised memory, which is what proved only two subgroups existed. Recomputing the
-    // index as gl_LocalInvocationID.x/32 instead did not help — the coopmat ops themselves are
-    // at gl_ScopeSubgroup, so they follow the real wave, not our arithmetic. Dropping the pin
-    // and sizing the workgroup in wave64 units makes the whole thing consistent and correct.
+    // With requiredSubgroupSize=32 + RequireFullSubgroups:
+    //   * at NSG=1 (32 threads), merely READING gl_SubgroupID broke the coopmat store — output
+    //     rows congruent to {2,3} mod 4 were never written. Confirmed by A/B in both directions
+    //     with nothing else changed. Removing the read fixed it completely.
+    //   * at NSG=4 (128 threads), the DIRECT store path was correct (the 576x1024x64 parity
+    //     shape passes, and it can only pass if warp_c took both values, i.e. if four subgroups
+    //     really existed) while the LDS-STAGED boundary path was wrong, with the staging slots
+    //     for subgroups 2 and 3 reading back uninitialised memory. Those two facts do not have
+    //     one obvious common cause and I did not find it.
+    //   * recomputing the index as gl_LocalInvocationID.x/32 instead of gl_SubgroupID made NSG=4
+    //     worse, not better, in a way neither story explains.
+    // Unpinned wave64 is correct on all 11 parity gates, so that is what the ladder uses.
     //
     // The cost is that the ladder is not directly comparable to the shipping wave32 kernel on
     // wave width — issue #236 measured wave32 at 1.29-1.79x wave64 for the SAME 16x16 tile. That
     // is exactly why point (a) exists: it is a wave64 16x16 single-subgroup control, so the
     // (a) -> (b) -> (c) intensity ladder is internally consistent, and the shipping kernel is
     // reported separately as the absolute bar rather than as the ladder's baseline.
+    //
+    // NOTE FOR WHOEVER PICKS THIS UP: because the pinned NSG=4 direct path IS correct, and both
+    // timed shapes are exact multiples of 128 in M and N, a pinned-wave32 (c) can be TIMED today
+    // even though it cannot yet pass the boundary gate. Given #236 that is the obvious next
+    // measurement and it is minutes of GPU time, not a driver blocker.
 #if NSG == 1
     uint warp_i = 0u;
 #else
@@ -172,6 +185,12 @@ void main() {
     coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums[CMS_PER_ROW * CMS_PER_COL];
     [[unroll]] for (uint i = 0u; i < CMS_PER_ROW * CMS_PER_COL; i++)
         sums[i] = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+
+#ifdef FAST_UNPACK
+    // Hoisted across the chunk loop: the group scale changes only every 4th chunk.
+    float16_t fsPos = float16_t(0.0);
+    float16_t fsNeg = float16_t(0.0);
+#endif
 
     uint chunks = pc.blocksPerRow * 4u;   // K / BK
 
@@ -193,6 +212,43 @@ void main() {
         }
 
         // ---- 2. Unpack sharedA[BM, BK] as SCALED ternary in F16. ----
+#ifdef FAST_UNPACK
+        // CHEAP-UNPACK ARM (issue #440's counters, not #439's tile hypothesis). RGP on the
+        // shipping kernel measured the matrix pipe 99.5% idle with ~95 VALU ops issued per WMMA,
+        // and that ratio is set by THIS block, not by the tile. Two changes, both pure ALU:
+        //
+        //  1. The staged product is exactly {-scale, +/-0, +scale} (the whole reason the F16 A
+        //     operand is lossless here), so it is a SELECT, not arithmetic. The default arm pays
+        //     int-extract + int->float + f32 multiply + f32->f16 PER ELEMENT; this one hoists
+        //     +scale/-scale/0 out of the loop and pays two compares and two selects.
+        //  2. The group scale spans 128 elements = FOUR BK=32 chunks, so re-reading it every
+        //     chunk (4 byte loads + shifts + unpackHalf2x16) is 4x more often than necessary.
+        //     Refresh it only when the group index changes.
+        //
+        // Numerically identical to the default arm by construction — it selects among values the
+        // default arm computes exactly — and held to that by the same one-hot 1-ULP gate.
+        if (rowValid) {
+            if ((ch & 3u) == 0u) {
+                fsPos = float16_t(readGroupScale(rowByteBase + grp * PQ2_GROUP_BYTES));
+                fsNeg = -fsPos;
+            }
+            uint codeBase = rowByteBase + grp * PQ2_GROUP_BYTES + 2u + sliceInGrp * PQ2_SLICE_BYTES;
+
+            for (uint i = 0u; i < A_PER_THR; i++) {
+                uint sp = sp0 + i;
+                uint pk = readByte(codeBase + sp);
+                uint outIdx = sBase + 4u * sp;
+                uint c0 =  pk        & 3u;
+                uint c1 = (pk >> 2u) & 3u;
+                uint c2 = (pk >> 4u) & 3u;
+                uint c3 = (pk >> 6u) & 3u;
+                sharedA[outIdx]      = (c0 == 1u) ? FS_ZERO : ((c0 == 2u) ? fsPos : fsNeg);
+                sharedA[outIdx + 1u] = (c1 == 1u) ? FS_ZERO : ((c1 == 2u) ? fsPos : fsNeg);
+                sharedA[outIdx + 2u] = (c2 == 1u) ? FS_ZERO : ((c2 == 2u) ? fsPos : fsNeg);
+                sharedA[outIdx + 3u] = (c3 == 1u) ? FS_ZERO : ((c3 == 2u) ? fsPos : fsNeg);
+            }
+        } else {
+#else
         if (rowValid) {
             uint groupByteBase = rowByteBase + grp * PQ2_GROUP_BYTES;
             float scale = readGroupScale(groupByteBase);
@@ -208,6 +264,7 @@ void main() {
                 sharedA[outIdx + 3u] = float16_t(float(int((pk >> 6u) & 3u) - 1) * scale);
             }
         } else {
+#endif
             for (uint i = 0u; i < A_PER_THR; i++) {
                 uint outIdx = sBase + 4u * (sp0 + i);
                 sharedA[outIdx]      = float16_t(0.0);

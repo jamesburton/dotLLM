@@ -57,6 +57,8 @@ public sealed class VulkanCoopmatGemmOccupancyBench
             ("#439 ladder (a) 16x16 / 1 sg  / BK=32 CONTROL",  PQ2_0GemmVariant.Ladder16x16x1,   4.0),
             ("#439 ladder (b) 64x64 / 4 sg  / BK=32",          PQ2_0GemmVariant.Ladder64x64x4,  16.0),
             ("#439 ladder (c) 128x128 / 4 sg / BK=32",         PQ2_0GemmVariant.Ladder128x128x4, 32.0),
+            ("#439 arm (d) = (a) + CHEAP UNPACK",              PQ2_0GemmVariant.Ladder16x16x1FastUnpack, 4.0),
+            ("#439 arm (e) = (c) + CHEAP UNPACK",              PQ2_0GemmVariant.Ladder128x128x4FastUnpack, 32.0),
         };
 
         foreach (var (name, variant, macPerByte) in variants)

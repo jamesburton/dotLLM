@@ -1,0 +1,34 @@
+#version 450
+// Issue #439 ladder, arm (d) — THE UNPACK ARM. Added after issue #440's RGP capture.
+//
+// GEOMETRICALLY IDENTICAL to arm (a): 16x16 tile, one wave64 subgroup, BK=32, same LDS padding,
+// same staging, same store. The ONLY difference is FAST_UNPACK, which makes the PQ2_0 dequant
+// cheaper in ALU without touching the tile. So (a) -> (d) isolates unpack cost exactly the way
+// (a) -> (b) -> (c) isolates arithmetic intensity.
+//
+// It exists because the tile hypothesis and the hardware counters disagree. #440 measured, on the
+// shipping kernel at lm_head: WMMA 0.46% of issue slots (the matrix pipe 99.5% IDLE), VALU 43.9%,
+// LDS 14.8%, SALU 12.5%, waits 14.5% — about 95 VALU ops per WMMA, a ratio set by the dequant
+// rather than by the tile. On that reading, enlarging the tile schedules an idle pipe better and
+// should buy little. The #439 ladder measured (a) -> (c) at 3.89x on lm_head, which it plainly
+// did not. This arm attacks the constraint the counters name, so the two can be compared on the
+// same shape in the same session.
+//
+// What FAST_UNPACK changes (see the block in matmul_pq2_0_f32_gemm_ladder.glsl):
+//   * the staged value is {-scale, +/-0, +scale}, so it is chosen, not computed — two compares
+//     and two selects per element instead of int-extract + int->float + f32 multiply + f32->f16;
+//   * the group scale covers 128 elements = 4 BK=32 chunks, so it is refreshed once per group
+//     instead of once per chunk.
+//
+// Deliberately NOT a full unpack rewrite: no wide uint loads, no bitfieldExtract batching, no
+// relayout. One cheap arm, measured. The rewrite is its own issue.
+#define BM 16
+#define BN 16
+#define WM 16
+#define WN 16
+#define NSG 1
+#define WAVE 64
+#define FAST_UNPACK
+
+#extension GL_GOOGLE_include_directive : require
+#include "matmul_pq2_0_f32_gemm_ladder.glsl"
