@@ -202,7 +202,15 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         // Issue #438 — opt-in residency probe. The mapped tensor-data region is
         // [DataBasePointer, EOF); its pages are the ones every device upload reads from.
         nint mapBase = gguf.DataBasePointer;
-        long mapLength = new FileInfo(ggufPath).Length - gguf.DataSectionOffset;
+        // FileInfo.Length on a symlink reports the reparse point (0 bytes), and every
+        // model in the HF hub cache is reached through one — open the file to get the
+        // target's real length.
+        long mapLength = 0;
+        if (HostResidencyProbe.Enabled)
+        {
+            using var lenProbe = File.OpenRead(ggufPath);
+            mapLength = lenProbe.Length - gguf.DataSectionOffset;
+        }
         if (HostResidencyProbe.Enabled)
             HostResidencyProbe.Report("before-load", mapBase, mapLength, deviceSnapshot: null);
 
