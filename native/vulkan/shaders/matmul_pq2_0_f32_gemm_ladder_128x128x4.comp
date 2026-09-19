@@ -1,0 +1,30 @@
+#version 450
+// Issue #439 ladder point (c) — llama.cpp's actual configuration.
+//
+// 128x128 output tile from FOUR subgroups (256 threads at wave64) arranged 2x2, each owning a 64x64 warp
+// tile = 4x4 coopmat fragments. This is `l_warptile_mmq = {128, 128, 128, 32, ...}` from
+// ggml-vulkan.cpp's non-coopmat2 branch — BM=128, BN=128, BK=32 — the tile the fork actually
+// runs on this silicon, and the point of the whole ladder. (llama.cpp states it as 128 threads
+// because it pins wave32; at this device's native wave64 the same 4-subgroup grid is 256
+// threads.)
+//
+//   MACs per staged K-chunk : 128 * 128 * 32       = 524,288
+//   bytes staged            : (128 + 128) * 32 * 2 =  16,384
+//   arithmetic intensity    :                         32.0 MAC/byte  (8x the shipping kernel)
+//   LDS                     : 2 * 128 * 40 * 2 + 4 * 256 * 4 = 20,480 + 4,096 = 24,576 B
+//   accumulators            : 16 fragments * 256 f32 / 64 lanes = 64 VGPRs
+//
+// A spill here is a FINDING, not a failure, and VulkanCoopmatGemmOccupancyBench reports it
+// either way.
+//
+// 24,576 B of LDS is the reason BK had to come down to 32: at BK=128 this tile would need
+// 64 KB against a 32 KB device limit and the pipeline would not create at all.
+#define BM 128
+#define BN 128
+#define WM 64
+#define WN 64
+#define NSG 4
+#define WAVE 64
+
+#extension GL_GOOGLE_include_directive : require
+#include "matmul_pq2_0_f32_gemm_ladder.glsl"

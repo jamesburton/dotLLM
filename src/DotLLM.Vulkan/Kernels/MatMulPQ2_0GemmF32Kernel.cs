@@ -63,6 +63,48 @@ public readonly record struct PQ2_0GemmVariant(
             RequiresCooperativeMatrix: true, RequiresSubgroupSize: 32);
 
     /// <summary>
+    /// Issue #439 ladder point (a) — <b>the control</b>: the shipping 16x16 single-subgroup tile
+    /// re-expressed on the shared <c>matmul_pq2_0_f32_gemm_ladder.glsl</c> template at
+    /// <c>BK = 32</c>. 4.0 MAC/byte, unchanged from <see cref="Coopmat32"/>.
+    /// </summary>
+    /// <remarks>
+    /// Exists so the intensity ladder has a real control: it isolates the BK 128 -&gt; 32 change
+    /// (plus the template's uniform LDS padding and coalesced activation staging) from the tile
+    /// change, so anything (b) and (c) gain over <i>this</i> is attributable to arithmetic
+    /// intensity alone. Diagnostic; never selected by <see cref="SelectFor"/>.
+    /// </remarks>
+    public static PQ2_0GemmVariant Ladder16x16x1 =>
+        new("matmul_pq2_0_f32_gemm_ladder_16x16x1.spv", 16, 16, RequiresCooperativeMatrix: true);
+
+    /// <summary>
+    /// Issue #439 ladder point (b): 64x64 tile from four wave64 subgroups (256 threads, 2x2 warp grid),
+    /// <c>BK = 32</c>. 16.0 MAC/byte — 4x <see cref="Coopmat32"/>.
+    /// </summary>
+    /// <remarks>
+    /// <b>Unpinned</b>, unlike <see cref="Coopmat32"/>: the workgroup is sized in the driver's
+    /// native wave64 units (4 x 64 = 256 threads). Pinning the four-subgroup grid to wave32 was
+    /// tried first and produced only two subgroups on gfx1151, leaving half the output tile
+    /// unwritten; see the wave-width note in <c>matmul_pq2_0_f32_gemm_ladder.glsl</c>. That makes
+    /// the ladder internally consistent but not wave-width-comparable to the shipping kernel,
+    /// which is why <see cref="Ladder16x16x1"/> is the ladder's own control.
+    /// </remarks>
+    public static PQ2_0GemmVariant Ladder64x64x4 =>
+        new("matmul_pq2_0_f32_gemm_ladder_64x64x4.spv", 64, 64, RequiresCooperativeMatrix: true);
+
+    /// <summary>
+    /// Issue #439 ladder point (c): 128x128 tile from four wave64 subgroups (256 threads, 2x2 warp grid),
+    /// <c>BK = 32</c>. 32.0 MAC/byte — 8x <see cref="Coopmat32"/>, and exactly llama.cpp's
+    /// <c>l_warptile_mmq</c>, the configuration its applicable <c>VK_KHR_cooperative_matrix</c>
+    /// branch runs on this silicon.
+    /// </summary>
+    /// <remarks>
+    /// The discriminating point of the ladder. See <see cref="Ladder64x64x4"/> for why these
+    /// variants run unpinned at wave64.
+    /// </remarks>
+    public static PQ2_0GemmVariant Ladder128x128x4 =>
+        new("matmul_pq2_0_f32_gemm_ladder_128x128x4.spv", 128, 128, RequiresCooperativeMatrix: true);
+
+    /// <summary>
     /// Picks the fastest variant this device can actually run.
     /// </summary>
     /// <remarks>
@@ -100,6 +142,12 @@ public readonly record struct PQ2_0GemmVariant(
     /// Every variant <paramref name="device"/> can run, cheapest-first. Benchmarks and the
     /// correctness gates enumerate this so a variant cannot rot unmeasured.
     /// </summary>
+    /// <remarks>
+    /// The issue #439 ladder variants are included deliberately. They are diagnostic and
+    /// <see cref="SelectFor"/> never picks them, but enumerating them here puts them under the
+    /// existing synthetic-parity and one-hot-1-ULP gates for free — which is the whole point of
+    /// this method, and the only thing keeping a 128x128 prototype honest.
+    /// </remarks>
     /// <param name="device">Device to enumerate for.</param>
     /// <returns>The runnable variants, register-blocked first.</returns>
     public static IEnumerable<PQ2_0GemmVariant> AvailableOn(VulkanDevice device)
@@ -107,6 +155,9 @@ public readonly record struct PQ2_0GemmVariant(
         yield return RegisterBlocked;
         if (Coopmat.IsSupportedOn(device)) yield return Coopmat;
         if (Coopmat32.IsSupportedOn(device)) yield return Coopmat32;
+        if (Ladder16x16x1.IsSupportedOn(device)) yield return Ladder16x16x1;
+        if (Ladder64x64x4.IsSupportedOn(device)) yield return Ladder64x64x4;
+        if (Ladder128x128x4.IsSupportedOn(device)) yield return Ladder128x128x4;
     }
 }
 
