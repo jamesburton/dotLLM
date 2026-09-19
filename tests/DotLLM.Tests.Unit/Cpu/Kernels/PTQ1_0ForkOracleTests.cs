@@ -116,6 +116,92 @@ public sealed class PTQ1_0ForkOracleTests
         Assert.Contains(reference, v => v != 0f);
     }
 
+    /// <summary>
+    /// Cross-pack check: the SAME checkpoint is published as both PQ2_0 and PTQ1_0, and both are
+    /// ternary at group 128 — PTQ1_0's whole claim is that it is lossless for exactly such a
+    /// checkpoint. So the two packs must decode to the same weights, and a PTQ1_0 decode that is
+    /// self-consistently wrong in some way the fork's own routine happens to share would still
+    /// show up here as decorrelation against an independently-implemented decoder.
+    ///
+    /// <para>Three tensors, chosen to be structurally different rather than convenient:
+    /// <c>attn_qkv</c> (5120-wide), <c>ssm_out</c> (6144-wide — the <c>gdn_v_grouped</c> fold
+    /// site), and <c>ffn_down</c> (17408-wide, many groups per row).</para>
+    /// </summary>
+    [SkippableFact]
+    public unsafe void DecodesToTheSameWeightsAsThePQ2_0PackOfTheSameCheckpoint()
+    {
+        string? ptq1Path = ResolveFixturePath();
+        Skip.If(ptq1Path is null, $"Set {ModelPathEnvVar} to the path of {FileName}.");
+
+        string? pq2Path = ResolvePq2_0FixturePath();
+        Skip.If(pq2Path is null,
+            $"PQ2_0 sibling pack not found. Set {Pq2ModelPathEnvVar} to the path of {Pq2FileName}.");
+
+        using var ptq1 = GgufFile.Open(ptq1Path!);
+        using var pq2 = GgufFile.Open(pq2Path!);
+
+        string[] names = ["blk.0.attn_qkv.weight", "blk.0.ssm_out.weight", "blk.0.ffn_down.weight"];
+        foreach (string name in names)
+        {
+            var a = ptq1.Tensors.Single(t => t.Name == name);
+            var b = pq2.Tensors.Single(t => t.Name == name);
+            Assert.Equal(QuantizationType.PTQ1_0, a.QuantizationType);
+            Assert.Equal(QuantizationType.PQ2_0, b.QuantizationType);
+            Assert.Equal(a.Shape.ElementCount, b.Shape.ElementCount);
+
+            // A few rows is plenty and keeps the test off the multi-GB end of these files.
+            int rowLen = (int)a.Shape.Dimensions[0];
+            const int Rows = 4;
+            int n = rowLen * Rows;
+
+            var fromPtq1 = new float[n];
+            var fromPq2 = new float[n];
+            Dequantize.ToFloat32(ptq1.DataBasePointer + (nint)a.DataOffset, n, QuantizationType.PTQ1_0, fromPtq1);
+            Dequantize.ToFloat32(pq2.DataBasePointer + (nint)b.DataOffset, n, QuantizationType.PQ2_0, fromPq2);
+
+            double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+            int signMismatches = 0;
+            for (int i = 0; i < n; i++)
+            {
+                double x = fromPtq1[i], y = fromPq2[i];
+                sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y;
+                if (Math.Sign(x) != Math.Sign(y)) signMismatches++;
+            }
+
+            double cov = sxy / n - (sx / n) * (sy / n);
+            double corr = cov / (Math.Sqrt(sxx / n - (sx / n) * (sx / n)) * Math.Sqrt(syy / n - (sy / n) * (sy / n)));
+
+            Assert.True(corr > 0.999,
+                $"'{name}': PTQ1_0 vs PQ2_0 correlation {corr:F6} over {n} weights — the two packs of the "
+                + "same checkpoint should agree. A low value means one of the two decoders is wrong.");
+            Assert.True(signMismatches == 0,
+                $"'{name}': {signMismatches}/{n} weights differ in SIGN between the PTQ1_0 and PQ2_0 packs.");
+        }
+    }
+
+    private const string Pq2ModelPathEnvVar = "DOTLLM_BONSAI_2_PQ2_0_GGUF";
+    private const string Pq2FileName = "Ternary-Bonsai-2-27B-PQ2_0.gguf";
+
+    private static string? ResolvePq2_0FixturePath()
+    {
+        string? envPath = Environment.GetEnvironmentVariable(Pq2ModelPathEnvVar);
+        if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath))
+            return envPath;
+
+        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        string hub = Path.Combine(home, ".cache", "huggingface", "hub",
+            "models--prism-ml--Ternary-Bonsai-2-27B-gguf", "snapshots");
+        if (Directory.Exists(hub))
+            foreach (string snapshot in Directory.EnumerateDirectories(hub))
+            {
+                string candidate = Path.Combine(snapshot, Pq2FileName);
+                if (File.Exists(candidate))
+                    return candidate;
+            }
+
+        return null;
+    }
+
     private static string? ResolveGgmlDir()
     {
         string? envDir = Environment.GetEnvironmentVariable(GgmlDirEnvVar);
