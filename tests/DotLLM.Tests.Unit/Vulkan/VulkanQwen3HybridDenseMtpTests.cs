@@ -156,6 +156,63 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
     }
 
     /// <summary>
+    /// The all-row LM head deviates from <c>IModel</c>'s <c>[seq, vocab]</c> contract above
+    /// <see cref="VulkanQwen3HybridDenseTransformerModel.MaxAllRowLogitsSeqLen"/>, and this pins
+    /// the model declaring that honestly through <see cref="IModel.MaxAllRowLogitsLength"/>.
+    /// </summary>
+    /// <remarks>
+    /// Not bookkeeping — this is the regression test for a heap over-read. <c>BackendPerplexityModel.Probe</c>
+    /// decides between the single-pass and growing-prefix perplexity strategies from a <b>two-token</b>
+    /// forward. Two tokens is under the threshold, so the probe sees two rows, would conclude "this
+    /// backend returns every row", and the single-pass evaluator would then index rows 1..n-1 of a
+    /// buffer holding exactly one row at a 512- or 2048-token context — past the end of the
+    /// allocation, reporting a fabricated perplexity rather than throwing. The probe therefore has
+    /// to consult the declared bound as well as measure, and this asserts the bound is declared.
+    /// </remarks>
+    [SkippableFact]
+    public void Model_DeclaresItsAllRowLogitsBound()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        // The default fixture's context (16) equals the bound, so it cannot express "one token past
+        // it". Build this one with a longer context so both sides of the bound are reachable.
+        string path = SyntheticQwen35HybridDenseMtpGguf.Write(
+            Path.Combine(_scratch, "qwen35-mtp-bound.gguf"), withMtp: true, contextLength: 64);
+
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        using var model = VulkanQwen3HybridDenseTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
+
+        IModel asInterface = model;
+        Assert.NotEqual(int.MaxValue, asInterface.MaxAllRowLogitsLength);
+        Assert.Equal(VulkanQwen3HybridDenseTransformerModel.MaxAllRowLogitsSeqLen,
+            asInterface.MaxAllRowLogitsLength);
+
+        // And the bound must actually describe the behaviour: at the threshold, every row; one
+        // past it, a single row. A declared bound that does not match is worse than none.
+        int atBound = asInterface.MaxAllRowLogitsLength;
+        Assert.True(atBound + 1 <= config.MaxSequenceLength, "Fixture context is too short for this check.");
+
+        var tokens = new int[atBound + 1];
+        var positions = new int[atBound + 1];
+        for (int i = 0; i < tokens.Length; i++) { tokens[i] = i % VocabSize; positions[i] = i; }
+
+        using (var kv = model.CreateKvCache(config.MaxSequenceLength))
+        using (ITensor logits = model.Forward(tokens.AsSpan(0, atBound), positions.AsSpan(0, atBound),
+                                              deviceId: -1, kv))
+        {
+            Assert.Equal(atBound, logits.Shape[0]);
+        }
+
+        model.ResetSequenceState();
+        using (var kv = model.CreateKvCache(config.MaxSequenceLength))
+        using (ITensor logits = model.Forward(tokens, positions, deviceId: -1, kv))
+        {
+            Assert.Equal(1, logits.Shape[0]);
+        }
+    }
+
+    /// <summary>
     /// The acceptance criterion: the same draft tokens, at the same positions, from the same
     /// checkpoint. Runs the full round shape <c>MtpSpeculativeDecoder</c> uses — a trunk forward
     /// that captures the pre-final-norm hidden state, a seed from the captured row, then K

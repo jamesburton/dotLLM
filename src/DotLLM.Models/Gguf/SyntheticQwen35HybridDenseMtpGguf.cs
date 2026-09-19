@@ -77,8 +77,14 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     /// trunk can only ever put one layer on each side) — every other existing caller keeps the
     /// default 2-layer trunk unchanged.
     /// </param>
+    /// <param name="contextLength">
+    /// Overrides <see cref="ContextLength"/>'s default of 16. Issue #435 needs a fixture whose
+    /// context exceeds a backend's all-row-logits bound (also 16), so that a test can assert the
+    /// behaviour on BOTH sides of that bound; every other caller keeps the default.
+    /// </param>
     public static byte[] Build(uint seed = 0xC0FFEEu, bool withMtp = true, bool mtpHasOwnHeadTensors = true,
-        int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount)
+        int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount,
+        int contextLength = ContextLength)
     {
         var w = new GgufWriter();
         var rng = new SyntheticGemma4Gguf.Xorshift(seed);
@@ -90,7 +96,7 @@ public static class SyntheticQwen35HybridDenseMtpGguf
         w.AddUInt32("general.alignment", 32);
 
         int rawBlockCount = withMtp ? blockCount + 1 : blockCount;
-        w.AddUInt32($"{arch}.context_length", ContextLength);
+        w.AddUInt32($"{arch}.context_length", (uint)contextLength);
         w.AddUInt32($"{arch}.embedding_length", HiddenSize);
         w.AddUInt32($"{arch}.block_count", (uint)rawBlockCount);
         w.AddUInt32($"{arch}.attention.head_count", NumAttentionHeads);
@@ -169,9 +175,10 @@ public static class SyntheticQwen35HybridDenseMtpGguf
 
     /// <summary>Writes the synthetic fixture to <paramref name="path"/>.</summary>
     public static string Write(string path, uint seed = 0xC0FFEEu, bool withMtp = true, bool mtpHasOwnHeadTensors = true,
-        int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount)
+        int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount,
+        int contextLength = ContextLength)
     {
-        File.WriteAllBytes(path, Build(seed, withMtp, mtpHasOwnHeadTensors, fullAttnInterval, blockCount));
+        File.WriteAllBytes(path, Build(seed, withMtp, mtpHasOwnHeadTensors, fullAttnInterval, blockCount, contextLength));
         return path;
     }
 

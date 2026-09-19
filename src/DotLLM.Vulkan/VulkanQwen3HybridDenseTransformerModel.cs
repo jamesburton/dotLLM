@@ -616,6 +616,15 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
     /// </summary>
     public const int MaxAllRowLogitsSeqLen = MtpDefaultMaxDraftSteps;
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The honest declaration of the deviation documented on <see cref="MaxAllRowLogitsSeqLen"/>.
+    /// Without it, a caller that decides "does this backend return all rows?" from a short probe
+    /// forward gets <see langword="true"/> here and then indexes rows that do not exist at real
+    /// context lengths.
+    /// </remarks>
+    public int MaxAllRowLogitsLength => MaxAllRowLogitsSeqLen;
+
     /// <summary>Lazily (re)allocates the multi-row logits buffer for <paramref name="rows"/> x <paramref name="vocab"/>.</summary>
     private VulkanDevice.Buffer EnsureMultiRowLogits(int rows, int vocab)
     {
