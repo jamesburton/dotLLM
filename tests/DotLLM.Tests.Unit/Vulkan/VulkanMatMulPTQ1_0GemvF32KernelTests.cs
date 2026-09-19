@@ -114,6 +114,127 @@ public class VulkanMatMulPTQ1_0GemvF32KernelTests
     }
 
     /// <summary>
+    /// The prefill GEMM against the same reference, at N &gt; 1. Shares the decode with the GEMV,
+    /// so what this actually discriminates is the (row, token) indexing and the C layout
+    /// (<c>c[t·M + m]</c>, token-major) — a transposed output would still produce plausible
+    /// magnitudes.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(4, 128, 3)]
+    [InlineData(16, 512, 7)]
+    [InlineData(64, 256, 2)]
+    public unsafe void GemmLaunch_MatchesScalarReference(int m, int k, int n)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        var rng = new Random(0x2A_52 ^ (m * 7 + k * 11 + n * 13));
+        int groups = k / GroupSize;
+
+        sbyte[] ternary = new sbyte[m * k];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+
+        Half[] scales = new Half[m * groups];
+        for (int i = 0; i < scales.Length; i++) scales[i] = (Half)(rng.NextSingle() * 0.05f + 0.01f);
+
+        float[] b = new float[(long)n * k];
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
+
+        byte[] weights = PackPTQ1_0(ternary, scales, m, k);
+
+        float[] expected = new float[(long)n * m];
+        for (int t = 0; t < n; t++)
+            for (int r = 0; r < m; r++)
+            {
+                double acc = 0;
+                for (int g = 0; g < groups; g++)
+                {
+                    double groupScale = (float)scales[r * groups + g];
+                    double groupAcc = 0;
+                    for (int c = 0; c < GroupSize; c++)
+                        groupAcc += ternary[r * k + g * GroupSize + c] * (double)b[(long)t * k + g * GroupSize + c];
+                    acc += groupScale * groupAcc;
+                }
+                expected[(long)t * m + r] = (float)acc;
+            }
+
+        using var device = VulkanDevice.Create();
+        using var kernel = MatMulPTQ1_0GemmF32Kernel.Create(device, spvDir);
+
+        long weightsBufBytes = ((long)weights.Length + 3) & ~3L;
+        using var bufW = device.Allocate(weightsBufBytes);
+        using var bufB = device.Allocate((long)n * k * sizeof(float));
+        using var bufC = device.Allocate((long)n * m * sizeof(float));
+
+        device.Upload(new ReadOnlySpan<byte>(weights), bufW);
+        device.Upload(b, bufB);
+
+        kernel.Launch(bufW, bufB, bufC, m, k, n);
+
+        float[] actual = new float[(long)n * m];
+        device.Download(bufC, actual);
+
+        for (int i = 0; i < expected.Length; i++)
+        {
+            float diff = MathF.Abs(expected[i] - actual[i]);
+            float tol = AbsTol + RelTol * MathF.Abs(expected[i]);
+            Assert.True(diff <= tol,
+                $"index {i} (m={m}, k={k}, n={n}): expected {expected[i]:G9}, got {actual[i]:G9}, |Δ|={diff:G9} > tol {tol:G9}");
+        }
+    }
+
+    /// <summary>
+    /// The embedding gather must be <b>bit-identical</b> to a host dequant of the same rows — not
+    /// merely close. It replaces a <c>vkCmdCopyBuffer</c> of rows that were dequantized on the
+    /// host, so anything less than bit-identical changes the forward pass's input depending on
+    /// which path the table happened to take.
+    /// </summary>
+    [SkippableFact]
+    public unsafe void EmbedGather_IsBitIdenticalToHostDequant()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        const int Vocab = 97;
+        const int Hidden = 512;
+        int groups = Hidden / GroupSize;
+
+        var rng = new Random(0x2A_53);
+        sbyte[] ternary = new sbyte[Vocab * Hidden];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+
+        Half[] scales = new Half[Vocab * groups];
+        for (int i = 0; i < scales.Length; i++) scales[i] = (Half)(rng.NextSingle() * 0.05f + 0.01f);
+
+        byte[] table = PackPTQ1_0(ternary, scales, Vocab, Hidden);
+
+        int[] ids = [0, 5, 96, 42, 42, 1];
+        int rowBytes = groups * GroupBytes;
+
+        float[] expected = new float[ids.Length * Hidden];
+        for (int t = 0; t < ids.Length; t++)
+            fixed (byte* tp = &table[ids[t] * rowBytes])
+                Dequantize.ToFloat32((nint)tp, Hidden, QuantizationType.PTQ1_0,
+                    expected.AsSpan(t * Hidden, Hidden));
+
+        using var device = VulkanDevice.Create();
+        using var kernel = Ptq1_0EmbedGatherF32Kernel.Create(device, spvDir);
+
+        using var bufTable = device.Allocate(((long)table.Length + 3) & ~3L);
+        using var bufIds = device.Allocate((long)ids.Length * sizeof(int));
+        using var bufDst = device.Allocate((long)ids.Length * Hidden * sizeof(float));
+
+        device.Upload(new ReadOnlySpan<byte>(table), bufTable);
+        device.Upload(System.Runtime.InteropServices.MemoryMarshal.AsBytes<int>(ids), bufIds);
+
+        kernel.Launch(bufTable, bufIds, bufDst, ids.Length, Hidden, Vocab);
+
+        float[] actual = new float[ids.Length * Hidden];
+        device.Download(bufDst, actual);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(BitConverter.SingleToUInt32Bits(expected[i]), BitConverter.SingleToUInt32Bits(actual[i]));
+    }
+
+    /// <summary>
     /// Packs a row-major <c>[m, k]</c> ternary matrix plus per-(row, group) fp16 scales into the
     /// PTQ1_0 byte layout, following the fork's <c>quantize_row_ptq1_0_ref</c>: base-3 with the
     /// first value in the most significant trit, ceiling-encoded as <c>(q·256 + 242)/243</c>, and
