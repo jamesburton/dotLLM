@@ -75,7 +75,7 @@ public static class QuantFormat
     public const int IQ4_XSBlockBytes = 136;
 
     // ── Ternary / 2-bit 128-element group formats ──
-    /// <summary>Elements per group for the 2-bit 128-code packings (I2_S, PQ2_0).</summary>
+    /// <summary>Elements per group for the ternary 128-element packings (I2_S, PQ2_0, PTQ1_0).</summary>
     public const int TernaryGroupSize = 128;
     /// <summary>
     /// I2_S: 128 2-bit codes packed 4/byte = 32 bytes. The scale is NOT in the
@@ -85,6 +85,12 @@ public static class QuantFormat
     public const int I2_SBlockBytes = 32;
     /// <summary>PQ2_0: scale(f16) + 32 packed code bytes; scale is per-group, in-block.</summary>
     public const int PQ2_0BlockBytes = 34;
+    /// <summary>
+    /// PTQ1_0: qs[24] (5 base-3 trits per byte) + qh[2] (4 trits per byte) + scale(f16) =
+    /// 28 bytes per 128 weights. The scale is per-group and in-block, but it comes
+    /// <b>last</b>, not first as in PQ2_0.
+    /// </summary>
+    public const int PTQ1_0BlockBytes = 28;
 
     /// <summary>
     /// Static geometry for one quantization format. A <c>readonly record struct</c>
@@ -140,6 +146,7 @@ public static class QuantFormat
         QuantizationType.IQ4_XS => new Info(type, IQ4_XSBlockBytes, KQuantGroupSize, HasMin: false),
         QuantizationType.I2_S => new Info(type, I2_SBlockBytes, TernaryGroupSize, HasMin: false),
         QuantizationType.PQ2_0 => new Info(type, PQ2_0BlockBytes, TernaryGroupSize, HasMin: false),
+        QuantizationType.PTQ1_0 => new Info(type, PTQ1_0BlockBytes, TernaryGroupSize, HasMin: false),
         _ => null,
     };
 
@@ -157,6 +164,6 @@ public static class QuantFormat
         QuantizationType.IQ1_S, QuantizationType.IQ2_XXS, QuantizationType.IQ2_XS,
         QuantizationType.IQ2_S, QuantizationType.IQ3_XXS, QuantizationType.IQ3_S,
         QuantizationType.IQ4_XS,
-        QuantizationType.I2_S, QuantizationType.PQ2_0,
+        QuantizationType.I2_S, QuantizationType.PQ2_0, QuantizationType.PTQ1_0,
     ];
 }

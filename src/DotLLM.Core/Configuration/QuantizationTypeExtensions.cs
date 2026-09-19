@@ -49,6 +49,9 @@ public static class QuantizationTypeExtensions
         // PQ2_0: scale(Half, 2 bytes) + codes[32](uint8, 4 codes/byte) = 34 bytes / 128
         // elements (2.125 bpw) — one scale PER GROUP, not per tensor (contrast I2_S above).
         QuantizationType.PQ2_0 => elementCount / 128 * 34,
+        // PTQ1_0: qs[24](5 base-3 trits/byte) + qh[2](4 trits/byte) + scale(Half, 2 bytes)
+        // = 28 bytes / 128 elements (1.75 bpw). Scale is per-group and comes LAST.
+        QuantizationType.PTQ1_0 => elementCount / 128 * 28,
         _ => throw new ArgumentOutOfRangeException(nameof(qt), qt,
             $"Unknown quantization type: {qt}"),
     };
