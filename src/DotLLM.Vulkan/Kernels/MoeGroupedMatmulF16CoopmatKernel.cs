@@ -9,10 +9,36 @@ namespace DotLLM.Vulkan.Kernels;
 /// </summary>
 /// <param name="SpvFileName">File name of the SPIR-V module within the <c>spv</c> directory.</param>
 /// <param name="RequiredSubgroupSize">Non-zero pins the pipeline to this wave width.</param>
-public readonly record struct MoeGroupedCoopmatVariant(string SpvFileName, int RequiredSubgroupSize)
+/// <param name="TileM">Weight rows of the output produced per workgroup (sets the dispatch grid).</param>
+/// <param name="TileN">Packed rows of the output produced per workgroup (sets the dispatch grid).</param>
+public readonly record struct MoeGroupedCoopmatVariant(
+    string SpvFileName, int RequiredSubgroupSize, int TileM = 16, int TileN = 16)
 {
     /// <summary>Baseline 64-thread coopmat kernel.</summary>
     public static MoeGroupedCoopmatVariant Coopmat64 => new("moe_grouped_matmul_f16_coopmat.spv", 0);
+
+    /// <summary>
+    /// Issue #443: the 128x128, BK=32, four-wave64-subgroup blocked tile from the shared
+    /// <c>gemm_coopmat_blocked_*.glsl</c> template. <b>Not selected by default</b> — see remarks.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The expert indirection needed no new template machinery: both indirections are
+    /// workgroup-uniform base offsets (<c>expert * M * rowUints</c> on the weight bank,
+    /// <c>offsets[expert]</c> on the packed rows), not a per-row remap, so the template's
+    /// existing row-base macros plus a uniform prologue express it exactly.
+    /// </para>
+    /// <para>
+    /// <b>Why it is not the default.</b> <c>BN = 128</c> means a workgroup covers 128 packed
+    /// rows, but rows-per-expert is <c>expandedRows / numExperts</c> — tens, at pp512. #443
+    /// measured the blocked tile neutral-to-negative below n ~ 16 and 1.9-2.8x by n = 32 on the
+    /// dense GEMMs, so whether this pays is a property of the model's expert fan-out rather than
+    /// of the tile. No local F16-expert MoE model exists to settle it, so the variant ships
+    /// available-but-unselected rather than flipped on an argument.
+    /// </para>
+    /// </remarks>
+    public static MoeGroupedCoopmatVariant Blocked128x128x4 =>
+        new("moe_grouped_matmul_f16_coopmat_128x128x4.spv", 0, TileM: 128, TileN: 128);
 
     /// <summary>32-thread workgroup pinned to wave32.</summary>
     public static MoeGroupedCoopmatVariant Coopmat32 => new("moe_grouped_matmul_f16_coopmat32.spv", 32);
@@ -52,8 +78,9 @@ public sealed class MoeGroupedMatmulF16CoopmatKernel : IDisposable
     /// <summary>K must be a multiple of this value.</summary>
     public const int KChunk = 32;
 
-    private const int TileM = 16;
-    private const int TileN = 16;
+    // Dispatch grid comes from the VARIANT, not a constant (issue #443).
+    private readonly int _tileM;
+    private readonly int _tileN;
     private const int PushConstantBytes = 6 * sizeof(uint);
 
     private readonly VulkanDevice _device;
@@ -63,8 +90,10 @@ public sealed class MoeGroupedMatmulF16CoopmatKernel : IDisposable
     private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
 
-    private MoeGroupedMatmulF16CoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
+    private MoeGroupedMatmulF16CoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, int tileM, int tileN)
     {
+        _tileM = tileM;
+        _tileN = tileN;
         _device = device;
         _module = module;
         _pipeline = pipeline;
@@ -113,7 +142,7 @@ public sealed class MoeGroupedMatmulF16CoopmatKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-        return new MoeGroupedMatmulF16CoopmatKernel(device, module, pipeline, pool);
+        return new MoeGroupedMatmulF16CoopmatKernel(device, module, pipeline, pool, variant.TileM, variant.TileN);
     }
 
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
@@ -180,8 +209,8 @@ public sealed class MoeGroupedMatmulF16CoopmatKernel : IDisposable
                 0, PushConstantBytes, (nint)pcPtr);
         }
 
-        uint groupsX = (uint)((m + TileM - 1) / TileM);
-        uint groupsY = (uint)((rows + TileN - 1) / TileN);
+        uint groupsX = (uint)((m + _tileM - 1) / _tileM);
+        uint groupsY = (uint)((rows + _tileN - 1) / _tileN);
         VulkanApi.vkCmdDispatch(cmdBuf, groupsX, groupsY, (uint)numExperts);
     }
 
