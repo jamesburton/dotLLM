@@ -11,8 +11,14 @@ namespace DotLLM.Vulkan.Kernels;
 /// <param name="RequiredSubgroupSize">Non-zero pins the pipeline to this wave width.</param>
 /// <param name="TileM">Weight rows of <c>C</c> produced per workgroup (sets the dispatch grid).</param>
 /// <param name="TileN">Token rows of <c>C</c> produced per workgroup (sets the dispatch grid).</param>
+/// <param name="RequiresNativeSubgroupSize">
+/// When non-zero, the variant's fixed workgroup size only maps to the subgroup grid its shader
+/// assumes on a device whose <see cref="VulkanDevice.SubgroupSize"/> is exactly this. See
+/// <see cref="Blocked128x128x4"/>.
+/// </param>
 public readonly record struct F16GemmCoopmatVariant(
-    string SpvFileName, int RequiredSubgroupSize, int TileM = 16, int TileN = 16)
+    string SpvFileName, int RequiredSubgroupSize, int TileM = 16, int TileN = 16,
+    int RequiresNativeSubgroupSize = 0)
 {
     /// <summary>
     /// Environment variable that restores the pre-issue-#443 preference
@@ -46,9 +52,24 @@ public readonly record struct F16GemmCoopmatVariant(
     /// TK=16 <c>coopMatMulAdd</c> into one F32 accumulator), so it is held to the same parity
     /// tolerance, not a widened one.
     /// </para>
+    /// <para>
+    /// <b>wave64 ONLY, and that is a correctness gate, not a perf preference.</b> The shader
+    /// declares <c>local_size_x = NSG * WAVE = 4 * 64 = 256</c> and lays four subgroups out as a
+    /// 2x2 grid over the tile via <c>gl_SubgroupID</c>. On a device whose native subgroup is 32
+    /// the same 256 threads form EIGHT subgroups, so ids 4-7 index past the 2x2 grid: they read
+    /// <c>sharedB</c> beyond <c>BN * STRIDE</c> and store into the NEXT tile's rows, while
+    /// <c>tileAllIn</c> — evaluated on the workgroup tile — still says the fast path is safe.
+    /// Silent wrong answers, not a crash. Hence <c>RequiresNativeSubgroupSize = 64</c>.
+    /// </para>
+    /// <para>
+    /// The clean fix is a wave-count specialization constant, or pinning the pipeline to 64;
+    /// neither is what #443 measured, so the gate is the conservative form and the pin is a
+    /// follow-up.
+    /// </para>
     /// </remarks>
     public static F16GemmCoopmatVariant Blocked128x128x4 =>
-        new("matmul_f16_gemm_coopmat_128x128x4.spv", 0, TileM: 128, TileN: 128);
+        new("matmul_f16_gemm_coopmat_128x128x4.spv", 0, TileM: 128, TileN: 128,
+            RequiresNativeSubgroupSize: 64);
 
     /// <summary>
     /// Whether <paramref name="device"/> can create a pipeline for this variant right now: the
@@ -60,6 +81,10 @@ public readonly record struct F16GemmCoopmatVariant(
     {
         if (RequiredSubgroupSize != 0
             && !device.SupportsRequiredSubgroupSize((uint)RequiredSubgroupSize, VkShaderStageFlags.Compute))
+            return false;
+        // Issue #443: a fixed workgroup size only yields the subgroup grid the shader assumes at
+        // one native wave width. Getting this wrong is silent corruption, not a pipeline failure.
+        if (RequiresNativeSubgroupSize != 0 && device.SubgroupSize != (uint)RequiresNativeSubgroupSize)
             return false;
         return File.Exists(Path.Combine(spvDir, SpvFileName));
     }

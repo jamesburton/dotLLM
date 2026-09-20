@@ -7,7 +7,30 @@
 // accumulators held across the whole K loop, per-subgroup 16x16 LDS staging for the
 // boundary store.
 //
-// WAVE WIDTH: these instantiations run at the driver's NATIVE wave64 and do NOT pin the
+// ----------------------------------------------------------------------------------
+// WAVE WIDTH IS A CORRECTNESS PRECONDITION, NOT A TUNING KNOB. READ THIS BEFORE SELECTING.
+//
+// The workgroup is a FIXED `NSG * WAVE` threads and the subgroup grid is derived from
+// `gl_SubgroupID`, so `WAVE` must equal the device's NATIVE subgroup width. At NSG=4, WAVE=64
+// that is 256 threads forming four subgroups in a 2x2 grid. On a 32-wide device the SAME 256
+// threads form EIGHT subgroups: ids 4-7 compute warp_c = 2,3, which
+//   * `coopMatLoad` from `sharedB` past `BN * STRIDE` — out-of-bounds LDS, and
+//   * `coopMatStore` into `g_tBase + 128 ..` — the NEXT workgroup's output rows,
+// while `tileAllIn` still reports the direct path safe because it is evaluated on the workgroup
+// tile. The result is silent wrong answers, not a pipeline-creation failure, so nothing catches
+// it at load time.
+//
+// Every C# variant that names one of these shaders therefore carries
+// `RequiresNativeSubgroupSize = 64` (or, for I2SGemmVariant, an explicit `device.SubgroupSize ==
+// 64` in SelectFor). The principled fix is a wave-count specialization constant, or pinning the
+// pipeline to 64 — neither is what #443 measured, so the gate is the conservative form.
+//
+// NOTE FOR WHOEVER TOUCHES PQ2_0: matmul_pq2_0_f32_gemm_ladder.glsl has the SAME latent
+// assumption and PQ2_0GemmVariant.Ladder128x128x4 does NOT gate on it. Bonsai is AMD-only in
+// practice so nothing is broken today, but the gate belongs there too.
+// ----------------------------------------------------------------------------------
+//
+// These instantiations run at the driver's NATIVE wave64 and do NOT pin the
 // pipeline with VkPipelineShaderStageRequiredSubgroupSizeCreateInfo. That is measured, not
 // an oversight: #443 timed a wave32-pinned 128x128x4 PQ2_0 tile at 1.01x / 1.00x — the pin's
 // 1.29-1.79x on the OLD 16x16 kernel (#236) was lane utilisation, and a wave64 subgroup that

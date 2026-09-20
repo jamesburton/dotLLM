@@ -403,7 +403,16 @@ public class VulkanMatMulI2SGemmF32KernelTests
     [InlineData(129, 256, 129)]   // one past a full BLOCKED tile in both dims
     [InlineData(2560, 2560, 5)]   // BitNet hidden x hidden; N=5 is 4% of a 128-wide N tile
     public void Blocked128x128x4_MatchesScalarReference(int m, int k, int n)
-        => RunParity(I2SGemmVariant.Blocked128x128x4, m, k, n, absTol: 3e-2f, relTol: 5e-3f);
+    {
+        // The variant is wave64-only by construction (local_size_x = 256 maps to its 2x2
+        // subgroup grid only at a 64-wide native subgroup). RunParity does not consult
+        // SelectFor, so the skip has to be explicit here or a 32-wide device would run a shader
+        // whose subgroup ids 4-7 address out of bounds.
+        using (var device = VulkanDevice.Create())
+            Skip.IfNot(device.SubgroupSize == 64, $"Blocked128x128x4 is wave64-only; device is {device.SubgroupSize}-wide.");
+
+        RunParity(I2SGemmVariant.Blocked128x128x4, m, k, n, absTol: 3e-2f, relTol: 5e-3f);
+    }
 
     /// <summary>
     /// <see cref="I2SGemmVariant.SelectFor"/> must fall back to the bit-exact register-blocked

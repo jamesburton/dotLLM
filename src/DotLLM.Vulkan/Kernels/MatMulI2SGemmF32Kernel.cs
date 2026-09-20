@@ -303,11 +303,17 @@ public readonly record struct I2SGemmVariant(
         // n=4. It wins on the honest row at EVERY batch size tested, which the other #443
         // instantiations do not, so there is no small-n crossover to gate on here.
         //
-        // The blocked tile needs no subgroup-size pin (it is sized in the driver's native
-        // wave64 units and four subgroups own the tile), so it is offered BEFORE the pin check
-        // and is available on an AMD device that cannot pin at all.
+        // The blocked tile needs no subgroup-size PIN (it is sized in the driver's native wave64
+        // units and four subgroups own the tile), so it is offered BEFORE the pin check and is
+        // available on an AMD device that cannot pin at all. It does, however, REQUIRE that the
+        // native width actually be 64: local_size_x = 256 maps to the shader's 2x2 subgroup grid
+        // only there. On a 32-wide device the same threads form EIGHT subgroups, ids 4-7 index
+        // past the grid, and they read sharedB out of bounds and store into the NEXT tile's rows
+        // while tileAllIn still reports the fast path safe — silent wrong answers, not a
+        // pipeline failure. Gate, do not hope.
         // DOTLLM_VK_I2_S_GEMM_LEGACY=1 restores the previous preference exactly.
-        if (Environment.GetEnvironmentVariable(BlockedLegacyEnvVar) != "1")
+        if (Environment.GetEnvironmentVariable(BlockedLegacyEnvVar) != "1"
+            && device.SubgroupSize == 64)
             return Blocked128x128x4;
 
         // The 32-thread workgroup and the pin are a pair — refuse the variant outright where

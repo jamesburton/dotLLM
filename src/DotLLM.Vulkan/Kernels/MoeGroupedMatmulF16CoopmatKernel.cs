@@ -11,8 +11,14 @@ namespace DotLLM.Vulkan.Kernels;
 /// <param name="RequiredSubgroupSize">Non-zero pins the pipeline to this wave width.</param>
 /// <param name="TileM">Weight rows of the output produced per workgroup (sets the dispatch grid).</param>
 /// <param name="TileN">Packed rows of the output produced per workgroup (sets the dispatch grid).</param>
+/// <param name="RequiresNativeSubgroupSize">
+/// When non-zero, the variant's fixed workgroup size only maps to the subgroup grid its shader
+/// assumes on a device whose <see cref="VulkanDevice.SubgroupSize"/> is exactly this. See
+/// <see cref="Blocked128x128x4"/>.
+/// </param>
 public readonly record struct MoeGroupedCoopmatVariant(
-    string SpvFileName, int RequiredSubgroupSize, int TileM = 16, int TileN = 16)
+    string SpvFileName, int RequiredSubgroupSize, int TileM = 16, int TileN = 16,
+    int RequiresNativeSubgroupSize = 0)
 {
     /// <summary>Baseline 64-thread coopmat kernel.</summary>
     public static MoeGroupedCoopmatVariant Coopmat64 => new("moe_grouped_matmul_f16_coopmat.spv", 0);
@@ -36,9 +42,16 @@ public readonly record struct MoeGroupedCoopmatVariant(
     /// of the tile. No local F16-expert MoE model exists to settle it, so the variant ships
     /// available-but-unselected rather than flipped on an argument.
     /// </para>
+    /// <para>
+    /// <b>wave64 ONLY, and that is a correctness gate.</b> <c>local_size_x = 256</c> maps to four
+    /// subgroups in a 2x2 grid over the tile only at a 64-wide native subgroup; at 32 the same
+    /// threads form eight, and ids 4-7 index past the grid into out-of-bounds LDS and the next
+    /// tile's rows. Hence <c>RequiresNativeSubgroupSize = 64</c>.
+    /// </para>
     /// </remarks>
     public static MoeGroupedCoopmatVariant Blocked128x128x4 =>
-        new("moe_grouped_matmul_f16_coopmat_128x128x4.spv", 0, TileM: 128, TileN: 128);
+        new("moe_grouped_matmul_f16_coopmat_128x128x4.spv", 0, TileM: 128, TileN: 128,
+            RequiresNativeSubgroupSize: 64);
 
     /// <summary>32-thread workgroup pinned to wave32.</summary>
     public static MoeGroupedCoopmatVariant Coopmat32 => new("moe_grouped_matmul_f16_coopmat32.spv", 32);
@@ -53,6 +66,10 @@ public readonly record struct MoeGroupedCoopmatVariant(
     {
         if (RequiredSubgroupSize != 0
             && !device.SupportsRequiredSubgroupSize((uint)RequiredSubgroupSize, VkShaderStageFlags.Compute))
+            return false;
+        // Issue #443: a fixed workgroup size only yields the subgroup grid the shader assumes at
+        // one native wave width. Getting this wrong is silent corruption, not a pipeline failure.
+        if (RequiresNativeSubgroupSize != 0 && device.SubgroupSize != (uint)RequiresNativeSubgroupSize)
             return false;
         return File.Exists(Path.Combine(spvDir, SpvFileName));
     }
