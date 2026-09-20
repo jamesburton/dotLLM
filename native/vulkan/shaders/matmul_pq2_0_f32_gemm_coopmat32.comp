@@ -35,8 +35,13 @@
 //            bytes [0..1]  : little-endian IEEE-754 binary16 group scale
 //            bytes [2..33] : 32 packed code bytes, byte gp (0..31) holding the
 //                            ternary codes for group-relative elements
-//                            {gp, gp+32, gp+64, gp+96} at bit offsets {6,4,2,0};
-//                            value = code - 1.
+//                            {4*gp, +1, +2, +3} at ASCENDING bit offsets {0,2,4,6};
+//                            value = code - 1. A code byte therefore covers FOUR
+//                            CONSECUTIVE elements, not a stride-32 quartet -- that
+//                            is I2_S's layout (see matmul_i2_s_*.comp, which really
+//                            is {gp,+32,+64,+96} at descending offsets). Verified
+//                            against PrismML's reference dequantize_row_q2_0
+//                            (#269 follow-up, 2026-08-05); corrected 2026-09-20.
 //          Row stride = (K/128)*34 bytes. There is NO tensor-tail scale.
 //
 // WHY THE F16 A OPERAND COSTS NOTHING HERE — this is the whole reason coopmat is
@@ -73,8 +78,9 @@
 // the bit-exact reference. See issue #236.
 //
 // BK is one PQ2_0 group (128 elements): the byte layout forces the whole group to
-// be staged together (a single packed byte feeds positions {gp,gp+32,gp+64,gp+96},
-// spanning all 128) and it is also exactly the span over which one scale applies.
+// be staged together (historically justified by a MISREAD layout: a code byte feeds four
+// CONSECUTIVE elements {4*gp..4*gp+3}, so a 32-element K-slice is 8 contiguous
+// code bytes and BK=32 needs no bit-slicing -- see #439) and it is also exactly the span over which one scale applies.
 // Each outer iteration therefore issues BK/TK = 8 coopMatMulAdd. Shared cost is
 // (16+16) x 128 f16 = 8 KB.
 //
