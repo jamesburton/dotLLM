@@ -179,6 +179,13 @@ public readonly record struct PQ2_0GemmVariant(
     /// <returns>The variant to load.</returns>
     public static PQ2_0GemmVariant SelectFor(VulkanDevice device)
     {
+        // DOTLLM_VK_PQ2_0_GEMM_LEGACY=1 restores the pre-#439 preference. It exists so the
+        // 128x128 tile can be A/B'd against what shipped, in alternating processes, on a real
+        // model -- the ladder bench can only compare kernels in isolation.
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_PQ2_0_GEMM_LEGACY") != "1"
+            && Ladder128x128x4.IsSupportedOn(device))
+            return Ladder128x128x4;
+
         if (Coopmat32.IsSupportedOn(device)) return Coopmat32;
         if (Coopmat.IsSupportedOn(device)) return Coopmat;
         return RegisterBlocked;
