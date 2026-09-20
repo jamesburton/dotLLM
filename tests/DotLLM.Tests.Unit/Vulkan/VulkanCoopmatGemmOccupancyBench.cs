@@ -49,14 +49,19 @@ public sealed class VulkanCoopmatGemmOccupancyBench
         _output.WriteLine($"Device: {device.DeviceName}   SubgroupSize={device.SubgroupSize}");
         _output.WriteLine("");
 
-        var variants = new (string Name, PQ2_0GemmVariant V)[]
+        var variants = new (string Name, PQ2_0GemmVariant V, double MacPerByte)[]
         {
-            ("pq2_0 gemm coopmat32 (SHIPS on gfx1151)", PQ2_0GemmVariant.Coopmat32),
-            ("pq2_0 gemm coopmat (64-thread sibling)",  PQ2_0GemmVariant.Coopmat),
-            ("pq2_0 gemm register-blocked (oracle)",    PQ2_0GemmVariant.RegisterBlocked),
+            ("pq2_0 gemm coopmat32 (SHIPS on gfx1151)",        PQ2_0GemmVariant.Coopmat32,      4.0),
+            ("pq2_0 gemm coopmat (64-thread sibling)",         PQ2_0GemmVariant.Coopmat,        4.0),
+            ("pq2_0 gemm register-blocked (oracle)",           PQ2_0GemmVariant.RegisterBlocked, 1.0),
+            ("#439 ladder (a) 16x16 / 1 sg  / BK=32 CONTROL",  PQ2_0GemmVariant.Ladder16x16x1,   4.0),
+            ("#439 ladder (b) 64x64 / 4 sg  / BK=32",          PQ2_0GemmVariant.Ladder64x64x4,  16.0),
+            ("#439 ladder (c) 128x128 / 4 sg / BK=32",         PQ2_0GemmVariant.Ladder128x128x4, 32.0),
+            ("#439 arm (d) = (a) + CHEAP UNPACK",              PQ2_0GemmVariant.Ladder16x16x1FastUnpack, 4.0),
+            ("#439 arm (e) = (c) + CHEAP UNPACK",              PQ2_0GemmVariant.Ladder128x128x4FastUnpack, 32.0),
         };
 
-        foreach (var (name, variant) in variants)
+        foreach (var (name, variant, macPerByte) in variants)
         {
             if (!variant.IsSupportedOn(device)) { _output.WriteLine($"{name}: not supported on this device"); continue; }
 
@@ -64,25 +69,32 @@ public sealed class VulkanCoopmatGemmOccupancyBench
             var s = device.GetShaderStatisticsAmd(k.PipelineHandle);
 
             uint vgpr = s.resourceUsage.numUsedVgprs;
-            uint avail = s.numAvailableVgprs == 0 ? 256u : s.numAvailableVgprs;
+            uint cap = s.numAvailableVgprs == 0 ? 256u : s.numAvailableVgprs;
+            uint file = s.numPhysicalVgprs == 0 ? 1536u : s.numPhysicalVgprs;
             ulong lds = s.resourceUsage.ldsUsageSizeInBytes;
 
-            // Waves per SIMD from the VGPR file, workgroups per WGP from LDS.
-            // Both are ceilings; the binding one is whichever is smaller.
-            uint wavesByVgpr = vgpr == 0 ? 0 : avail / vgpr;
+            // WAVES PER SIMD COMES FROM THE REGISTER FILE, NOT THE PER-WAVE CAP. An earlier
+            // revision of this bench divided by numAvailableVgprs (256 — the driver's per-wave
+            // ALLOCATION CAP) and reported "1 wave/SIMD" for a kernel that actually runs at ~9.
+            // A whole diagnosis was built on that and then retracted; see the retraction block in
+            // .docs/COOPMAT_GEMM_DIAGNOSIS.md. The file is numPhysicalVgprs (1536 on gfx1151) and
+            // RDNA caps residency at 16 waves/SIMD regardless.
+            uint wavesByVgpr = vgpr == 0 ? 0 : Math.Min(16u, file / vgpr);
             double wgByLds = lds == 0 ? double.PositiveInfinity : 65536.0 / lds;
 
             _output.WriteLine(name);
+            _output.WriteLine($"   arithmetic intensity: {macPerByte:F1} MAC/byte staged");
             _output.WriteLine($"   workgroup           : {s.computeWorkGroupSizeX} threads");
-            _output.WriteLine($"   VGPR used/available : {vgpr} / {avail}  (physical {s.numPhysicalVgprs})  -> {wavesByVgpr} waves/SIMD IF the budget is {avail}");
+            _output.WriteLine($"   VGPR used           : {vgpr}  (per-wave cap {cap}, file {file}) -> {wavesByVgpr} waves/SIMD");
             _output.WriteLine($"   SGPR used/available : {s.resourceUsage.numUsedSgprs} / {s.numAvailableSgprs} (physical {s.numPhysicalSgprs})");
             _output.WriteLine($"   LDS used            : {lds} B -> {wgByLds:F1} workgroups/WGP by LDS (64 KB)");
             _output.WriteLine($"   scratch (spill)     : {s.resourceUsage.scratchMemUsageInBytes} B");
             _output.WriteLine("");
         }
 
-        _output.WriteLine("Interpretation: a 16x16 tile from ONE subgroup stages 8 KB for 32,768 MACs");
-        _output.WriteLine("= 4.0 MAC/byte. llama.cpp's applicable KHR_coopmat tile (128x128, BK=32,");
-        _output.WriteLine("128 threads) reaches 32.0 MAC/byte in 16 KB. See .docs/COOPMAT_GEMM_DIAGNOSIS.md.");
+        _output.WriteLine("Interpretation: a 16x16 tile from ONE subgroup stages 2 KB for 8,192 MACs at");
+        _output.WriteLine("BK=32 (8 KB / 32,768 at the shipping BK=128) = 4.0 MAC/byte either way.");
+        _output.WriteLine("llama.cpp's applicable KHR_coopmat tile (l_warptile_mmq: 128x128, BK=32, 128");
+        _output.WriteLine("threads) reaches 32.0 MAC/byte in 16 KB. See .docs/COOPMAT_GEMM_DIAGNOSIS.md.");
     }
 }

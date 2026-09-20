@@ -63,6 +63,80 @@ public readonly record struct PQ2_0GemmVariant(
             RequiresCooperativeMatrix: true, RequiresSubgroupSize: 32);
 
     /// <summary>
+    /// Issue #439 ladder point (a) — <b>the control</b>: the shipping 16x16 single-subgroup tile
+    /// re-expressed on the shared <c>matmul_pq2_0_f32_gemm_ladder.glsl</c> template at
+    /// <c>BK = 32</c>. 4.0 MAC/byte, unchanged from <see cref="Coopmat32"/>.
+    /// </summary>
+    /// <remarks>
+    /// Exists so the intensity ladder has a real control: it isolates the BK 128 -&gt; 32 change
+    /// (plus the template's uniform LDS padding and coalesced activation staging) from the tile
+    /// change, so anything (b) and (c) gain over <i>this</i> is attributable to arithmetic
+    /// intensity alone. Diagnostic; never selected by <see cref="SelectFor"/>.
+    /// </remarks>
+    public static PQ2_0GemmVariant Ladder16x16x1 =>
+        new("matmul_pq2_0_f32_gemm_ladder_16x16x1.spv", 16, 16, RequiresCooperativeMatrix: true);
+
+    /// <summary>
+    /// Issue #439 ladder point (b): 64x64 tile from four wave64 subgroups (256 threads, 2x2 warp grid),
+    /// <c>BK = 32</c>. 16.0 MAC/byte — 4x <see cref="Coopmat32"/>.
+    /// </summary>
+    /// <remarks>
+    /// <b>Unpinned</b>, unlike <see cref="Coopmat32"/>: the workgroup is sized in the driver's
+    /// native wave64 units (4 x 64 = 256 threads). A wave32-pinned four-subgroup grid was tried
+    /// first; its direct store path is correct but its LDS-staged boundary path is not, and the
+    /// cause was not isolated — see the wave-width note in
+    /// <c>matmul_pq2_0_f32_gemm_ladder.glsl</c>, which states exactly what was and was not
+    /// established. Unpinned wave64 passes every parity gate, so that is what the ladder uses.
+    /// It makes the ladder internally consistent but not wave-width-comparable to the shipping
+    /// kernel, which is why <see cref="Ladder16x16x1"/> is the ladder's own control.
+    /// </remarks>
+    public static PQ2_0GemmVariant Ladder64x64x4 =>
+        new("matmul_pq2_0_f32_gemm_ladder_64x64x4.spv", 64, 64, RequiresCooperativeMatrix: true);
+
+    /// <summary>
+    /// Issue #439 ladder point (c): 128x128 tile from four wave64 subgroups (256 threads, 2x2 warp grid),
+    /// <c>BK = 32</c>. 32.0 MAC/byte — 8x <see cref="Coopmat32"/>, and exactly llama.cpp's
+    /// <c>l_warptile_mmq</c>, the configuration its applicable <c>VK_KHR_cooperative_matrix</c>
+    /// branch runs on this silicon.
+    /// </summary>
+    /// <remarks>
+    /// The discriminating point of the ladder. See <see cref="Ladder64x64x4"/> for why these
+    /// variants run unpinned at wave64.
+    /// </remarks>
+    public static PQ2_0GemmVariant Ladder128x128x4 =>
+        new("matmul_pq2_0_f32_gemm_ladder_128x128x4.spv", 128, 128, RequiresCooperativeMatrix: true);
+
+    /// <summary>
+    /// Issue #439 arm (d) — <b>the unpack arm</b>: geometrically identical to
+    /// <see cref="Ladder16x16x1"/> (16x16, one wave64 subgroup, BK = 32), with a cheaper PQ2_0
+    /// dequant and nothing else changed.
+    /// </summary>
+    /// <remarks>
+    /// Added after issue #440's RGP capture, which measured the shipping kernel's matrix pipe
+    /// <b>99.5% idle</b> (WMMA 0.46% of issue slots) against VALU 43.9% — roughly 95 VALU ops per
+    /// WMMA, a ratio set by the dequant rather than by the tile. <c>Ladder16x16x1 -&gt;</c> this
+    /// isolates unpack cost exactly as (a) -&gt; (b) -&gt; (c) isolates arithmetic intensity, so
+    /// the two competing explanations can be measured on the same shape in the same session.
+    /// Numerically identical by construction: the staged value is selected from
+    /// {−scale, ±0, +scale} rather than computed, and those are the values the default arm
+    /// already produces exactly.
+    /// </remarks>
+    public static PQ2_0GemmVariant Ladder16x16x1FastUnpack =>
+        new("matmul_pq2_0_f32_gemm_ladder_16x16x1_fastunpack.spv", 16, 16, RequiresCooperativeMatrix: true);
+
+    /// <summary>
+    /// Issue #439 arm (e) — <b>both levers</b>: <see cref="Ladder128x128x4"/>'s tile with
+    /// <see cref="Ladder16x16x1FastUnpack"/>'s dequant.
+    /// </summary>
+    /// <remarks>
+    /// Decides whether the tile and the unpack are one bottleneck or two. If (e) matches (c) the
+    /// tile change already absorbed the unpack cost; if it matches (d) the tile win was a
+    /// dequant-volume win under another name; if it beats both, they are independent levers.
+    /// </remarks>
+    public static PQ2_0GemmVariant Ladder128x128x4FastUnpack =>
+        new("matmul_pq2_0_f32_gemm_ladder_128x128x4_fastunpack.spv", 128, 128, RequiresCooperativeMatrix: true);
+
+    /// <summary>
     /// Picks the fastest variant this device can actually run.
     /// </summary>
     /// <remarks>
@@ -100,6 +174,12 @@ public readonly record struct PQ2_0GemmVariant(
     /// Every variant <paramref name="device"/> can run, cheapest-first. Benchmarks and the
     /// correctness gates enumerate this so a variant cannot rot unmeasured.
     /// </summary>
+    /// <remarks>
+    /// The issue #439 ladder variants are included deliberately. They are diagnostic and
+    /// <see cref="SelectFor"/> never picks them, but enumerating them here puts them under the
+    /// existing synthetic-parity and one-hot-1-ULP gates for free — which is the whole point of
+    /// this method, and the only thing keeping a 128x128 prototype honest.
+    /// </remarks>
     /// <param name="device">Device to enumerate for.</param>
     /// <returns>The runnable variants, register-blocked first.</returns>
     public static IEnumerable<PQ2_0GemmVariant> AvailableOn(VulkanDevice device)
@@ -107,6 +187,11 @@ public readonly record struct PQ2_0GemmVariant(
         yield return RegisterBlocked;
         if (Coopmat.IsSupportedOn(device)) yield return Coopmat;
         if (Coopmat32.IsSupportedOn(device)) yield return Coopmat32;
+        if (Ladder16x16x1.IsSupportedOn(device)) yield return Ladder16x16x1;
+        if (Ladder64x64x4.IsSupportedOn(device)) yield return Ladder64x64x4;
+        if (Ladder128x128x4.IsSupportedOn(device)) yield return Ladder128x128x4;
+        if (Ladder16x16x1FastUnpack.IsSupportedOn(device)) yield return Ladder16x16x1FastUnpack;
+        if (Ladder128x128x4FastUnpack.IsSupportedOn(device)) yield return Ladder128x128x4FastUnpack;
     }
 }
 
