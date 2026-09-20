@@ -295,10 +295,24 @@ public readonly record struct I2SGemmVariant(
         ArgumentNullException.ThrowIfNull(device);
         if (IsCoopmatDisabled()) return Production;
         if (!device.HasCooperativeMatrix) return Production;
+        if (device.VendorId != AmdVendorId && !IsCoopmatForced()) return Production;
+
+        // Issue #443. Measured on gfx1151, interleaved order-reversed, median of per-pass
+        // ratios, against Coopmat32Wave32 — the variant this used to return — on the MALL-
+        // exceeding 65536x4096 shape: 7.70x at n=256, 2.79x at n=32, 1.55x at n=8, 1.34x at
+        // n=4. It wins on the honest row at EVERY batch size tested, which the other #443
+        // instantiations do not, so there is no small-n crossover to gate on here.
+        //
+        // The blocked tile needs no subgroup-size pin (it is sized in the driver's native
+        // wave64 units and four subgroups own the tile), so it is offered BEFORE the pin check
+        // and is available on an AMD device that cannot pin at all.
+        // DOTLLM_VK_I2_S_GEMM_LEGACY=1 restores the previous preference exactly.
+        if (Environment.GetEnvironmentVariable(BlockedLegacyEnvVar) != "1")
+            return Blocked128x128x4;
+
         // The 32-thread workgroup and the pin are a pair — refuse the variant outright where
         // the wave width cannot be pinned, rather than shipping a half-wave dispatch.
         if (!device.SupportsRequiredSubgroupSize(32, VkShaderStageFlags.Compute)) return Production;
-        if (device.VendorId != AmdVendorId && !IsCoopmatForced()) return Production;
         return Coopmat32Wave32;
     }
 

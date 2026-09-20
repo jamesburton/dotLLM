@@ -430,10 +430,11 @@ public class VulkanMatMulI2SGemmF32KernelTests
     }
 
     /// <summary>
-    /// <see cref="I2SGemmVariant.SelectFor"/> may only return a coopmat variant when the device
-    /// advertises BOTH cooperative matrix and a pinnable compute subgroup size of 32 — the two
-    /// are a pair, and a 32-thread workgroup dispatched at the driver's default width would be
-    /// half a wave (or two redundant subgroups).
+    /// A coopmat variant returned by <see cref="I2SGemmVariant.SelectFor"/> must be one the
+    /// device can actually dispatch correctly: either it declares no subgroup-size pin (issue
+    /// #443's blocked tile, sized in the driver's native wave units), or the device can pin the
+    /// width it declares. A 32-thread workgroup dispatched at the driver's default width would
+    /// be half a wave, or two subgroups redundantly computing one tile.
     /// </summary>
     [SkippableFact]
     public void SelectFor_OnlyPicksCoopmat_WhenBothCoopmatAndWave32PinAvailable()
@@ -454,9 +455,36 @@ public class VulkanMatMulI2SGemmF32KernelTests
         }
 
         Assert.True(device.HasCooperativeMatrix);
-        Assert.NotEqual(0u, picked.RequiredSubgroupSize);
-        Assert.True(device.SupportsRequiredSubgroupSize(
-            picked.RequiredSubgroupSize, DotLLM.Vulkan.Interop.VkShaderStageFlags.Compute));
+        if (picked.RequiredSubgroupSize != 0)
+        {
+            Assert.True(device.SupportsRequiredSubgroupSize(
+                picked.RequiredSubgroupSize, DotLLM.Vulkan.Interop.VkShaderStageFlags.Compute));
+        }
+    }
+
+    /// <summary>
+    /// <see cref="I2SGemmVariant.SelectFor"/> must honour
+    /// <see cref="I2SGemmVariant.BlockedLegacyEnvVar"/>, restoring the pre-issue-#443
+    /// preference exactly — that escape hatch is what makes an end-to-end A/B on a real
+    /// BitNet model possible, so it is gated rather than assumed.
+    /// </summary>
+    [SkippableFact]
+    public void SelectFor_BlockedLegacyEnvVar_RestoresPreviousPreference()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+        using var device = VulkanDevice.Create();
+
+        string? saved = Environment.GetEnvironmentVariable(I2SGemmVariant.BlockedLegacyEnvVar);
+        try
+        {
+            Environment.SetEnvironmentVariable(I2SGemmVariant.BlockedLegacyEnvVar, "1");
+            var picked = I2SGemmVariant.SelectFor(device);
+            Assert.NotEqual(I2SGemmVariant.Blocked128x128x4, picked);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(I2SGemmVariant.BlockedLegacyEnvVar, saved);
+        }
     }
 
     private static void RunParity(
