@@ -313,6 +313,7 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
         CudaContext? context = null;
         CudaStream? stream = null;
         CudaCublasHandle? cublas = null;
+        CudaKernels? kernels = null;
         CudaWeights? weights = null;
         CudaForwardState? state = null;
         try
@@ -324,7 +325,7 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
             stream = CudaStream.Create();
             cublas = CudaCublasHandle.Create();
             cublas.SetStream(stream);
-            var kernels = new CudaKernels(ptxDir);
+            kernels = new CudaKernels(ptxDir);
 
             weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
                 numGpuLayers: layerCount, firstLayer: firstLayer, skipTokenEmbed: skipTokenEmbed);
@@ -345,6 +346,10 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
         {
             state?.Dispose();
             weights?.Dispose();
+            // #383 review follow-up: kernels was previously left as a non-nullable `var` local,
+            // out of scope here — never disposed on failure. Hoisted to a nullable local above so
+            // all 12 factory sites in this issue dispose kernels uniformly on the catch path.
+            kernels?.Dispose();
             cublas?.Dispose();
             stream?.Dispose();
             context?.Dispose();
