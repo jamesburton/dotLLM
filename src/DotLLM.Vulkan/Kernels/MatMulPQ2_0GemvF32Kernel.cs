@@ -29,7 +29,7 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
     /// <summary>Elements per PQ2_0 group.</summary>
     public const int PQ2_0GroupSize = QuantFormat.TernaryGroupSize;
 
-    private const int PushConstantBytes = 4 * sizeof(uint);
+    private const int PushConstantBytes = 6 * sizeof(uint);
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
@@ -100,11 +100,50 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
     }
 
     /// <summary>Records the PQ2_0 GEMV into <paramref name="cmdBuf"/> without submitting.</summary>
-    public unsafe void Record(
+    public void Record(
         nint cmdBuf,
         VulkanDevice.Buffer weightsPQ2_0, VulkanDevice.Buffer x, VulkanDevice.Buffer y,
         int m, int k)
+        => Record(cmdBuf, weightsPQ2_0, x, y, m, k, xOffsetElements: 0, yOffsetElements: 0);
+
+    /// <summary>
+    /// Records the PQ2_0 GEMV for one row of a batched activation, reading
+    /// <c>x[xOffsetElements .. +k]</c> and writing <c>y[yOffsetElements .. +m]</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Issue #446. <see cref="VulkanDevice.Buffer"/> has no offset view, so a looped GEMV over an
+    /// <c>[n, K]</c> activation batch expresses the per-token stride in push constants instead of
+    /// by binding sub-ranges. Two consequences, both load-bearing for the loop being cheap: the
+    /// three bound handles are identical across tokens so the handle-keyed
+    /// <c>DescriptorSetCache</c> hits every time, and successive tokens touch disjoint
+    /// <c>y</c> ranges so the dispatches need <b>no barriers</b> between them and are free to
+    /// overlap.
+    /// </para>
+    /// <para>
+    /// <b>Why a caller would want this.</b> The 128x128 coopmat GEMM does a 128-wide N-tile's
+    /// worth of PQ2_0 unpack however few tokens it is given, so it is near-flat in <c>n</c> while
+    /// the GEMV loop is linear. Measured on gfx1151 against the shipping
+    /// <c>ladder_128x128x4</c> tile, the GEMM only overtakes the loop at <b>n ~ 4.4</b>
+    /// (<c>lm_head</c>) / <b>n ~ 6.5</b> (<c>ffn_gate/up</c>) — so at the 2-8 token verify batches
+    /// MTP speculative decoding produces, the single GEMM dispatch was the wrong call.
+    /// </para>
+    /// </remarks>
+    /// <param name="cmdBuf">Command buffer to record into.</param>
+    /// <param name="weightsPQ2_0">Packed PQ2_0 weights, <c>m</c> rows of <c>(k/128)*34</c> bytes.</param>
+    /// <param name="x">Activation buffer; this dispatch reads <c>k</c> floats from <paramref name="xOffsetElements"/>.</param>
+    /// <param name="y">Output buffer; this dispatch writes <c>m</c> floats at <paramref name="yOffsetElements"/>.</param>
+    /// <param name="m">Output rows.</param>
+    /// <param name="k">Inner dimension; must be a multiple of 128.</param>
+    /// <param name="xOffsetElements">First float of this token's activation row.</param>
+    /// <param name="yOffsetElements">First float of this token's output row.</param>
+    public unsafe void Record(
+        nint cmdBuf,
+        VulkanDevice.Buffer weightsPQ2_0, VulkanDevice.Buffer x, VulkanDevice.Buffer y,
+        int m, int k, int xOffsetElements, int yOffsetElements)
     {
+        if (xOffsetElements < 0) throw new ArgumentOutOfRangeException(nameof(xOffsetElements));
+        if (yOffsetElements < 0) throw new ArgumentOutOfRangeException(nameof(yOffsetElements));
         if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
         if ((k % PQ2_0GroupSize) != 0)
@@ -121,9 +160,9 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
             throw new ArgumentException(
                 $"Weights buffer too small: need >= {weightsMin} bytes (m·(k/128)·34), got {weightsPQ2_0.Size}.",
                 nameof(weightsPQ2_0));
-        if (x.Size < (long)k * sizeof(float))
+        if (x.Size < ((long)xOffsetElements + k) * sizeof(float))
             throw new ArgumentException("Input buffer too small.", nameof(x));
-        if (y.Size < (long)m * sizeof(float))
+        if (y.Size < ((long)yOffsetElements + m) * sizeof(float))
             throw new ArgumentException("Output buffer too small.", nameof(y));
 
         Span<nint> buffers = stackalloc nint[3] { weightsPQ2_0.Handle, x.Handle, y.Handle };
@@ -134,12 +173,14 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
             cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
             0, 1, descriptorSet, 0, 0);
 
-        Span<uint> pc = stackalloc uint[4]
+        Span<uint> pc = stackalloc uint[6]
         {
             (uint)m,
             (uint)k,
             (uint)blocksPerRow,
             (uint)rowUints,
+            (uint)xOffsetElements,
+            (uint)yOffsetElements,
         };
         fixed (uint* pcPtr = pc)
         {
