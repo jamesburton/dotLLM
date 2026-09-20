@@ -1,0 +1,124 @@
+#version 450
+// Grouped F16 MoE expert matmul on the shared 128x128 blocked coopmat template (issue #443).
+//
+//   Y[packedRow, m] = X[packedRow, :] @ W_f16[expert, m, :]^T
+//
+// Rows are grouped by expert using offsets[expert]..offsets[expert+1]; the dispatch grid is
+// (M tiles, pessimistic row tiles, experts) and row tiles past an expert's count early-out.
+//
+// ----------------------------------------------------------------------------------
+// THE EXPERT INDIRECTION DOES NOT NEED A ROW REMAP HOOK, and this file is the evidence.
+//
+// The obvious reading is that MoE scatters the A operand by expert index and therefore needs
+// the template's stage-A hook to take a per-row remap. It does not. Both indirections are
+// workgroup-UNIFORM base offsets, computed once in the prologue:
+//
+//   A: expert * pc.M * pc.rowUints   — the expert's slab in a contiguous [E, M, K] bank
+//   B: offsets[expert]               — the expert's first row in the packed [rows, K] input
+//
+// Within a workgroup, expert is gl_WorkGroupID.z, so nothing varies per row. The template's
+// existing GEMM_ROW_BASE / GEMM_ROW_LIMIT macros express the B side exactly, the A side is one
+// extra term inside this file's own gemmStageA, and GEMM_HAS_PROLOGUE covers the early-out.
+// A per-row remap hook would have been dead generality paid for by every other instantiation.
+//
+// What a genuinely indexed MoE kernel does (moe_indexed_matmul_*.comp, which reads a per-row
+// expert id) is a different shape of problem and is NOT what this file is.
+// ----------------------------------------------------------------------------------
+//
+// The early-out MUST stay workgroup-uniform: every barrier in the template sits in control flow
+// this predicate dominates, and a workgroup barrier reached by only some invocations is
+// undefined behaviour. expert and localRowBase are both derived from gl_WorkGroupID, so it is.
+//
+// CAVEAT ON THE TILE, recorded because the geometry is a data question and not a code one:
+// BN=128 means a workgroup covers 128 packed rows, but rows-per-expert at pp512 is tens
+// (expandedRows / numExperts). #443 measured the blocked tile NEUTRAL-to-NEGATIVE below n ~ 16
+// and a 1.9-2.8x win by n = 32 on the dense GEMMs, so whether this instantiation pays depends
+// entirely on the model's rows-per-expert, not on the template. Selection is therefore NOT
+// flipped to it; it is available for explicit A/B.
+
+#define BM  128
+#define BN  128
+#define WM  64
+#define WN  64
+#define NSG 4
+#define WAVE 64
+
+#extension GL_GOOGLE_include_directive : require
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW       { uint weight[]; }; // [E,M,K] F16
+layout(set = 0, binding = 1, std430) readonly  buffer BufX       { float x[]; };      // [rows,K] F32
+layout(set = 0, binding = 2, std430) readonly  buffer BufOffsets { uint offsets[]; }; // [E+1]
+layout(set = 0, binding = 3, std430) writeonly buffer BufY       { float y[]; };      // [rows,M] F32
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint rows;
+    uint numExperts;
+    uint pairsPerRow;
+    uint rowUints;
+} pc;
+
+#include "gemm_coopmat_blocked_decl.glsl"
+
+// Set by gemmPrologue, read by gemmStageA and the template's row macros. All workgroup-uniform.
+uint g_expertStart;
+uint g_expertRows;
+uint g_expertWeightBase;
+
+const uint A_UINTS_PER_ROW = BK / 2u;                          // 16 uints = 32 F16 elements
+const uint A_UINTS         = BM * A_UINTS_PER_ROW;
+const uint A_PER_THR       = A_UINTS / BLOCK_SIZE;
+const uint A_LANES_PER_ROW = A_UINTS_PER_ROW / A_PER_THR;
+
+#define GEMM_HAS_PROLOGUE
+
+bool gemmPrologue() {
+    uint expert = gl_WorkGroupID.z;
+    if (expert >= pc.numExperts) return false;
+
+    g_expertStart = offsets[expert];
+    g_expertRows  = offsets[expert + 1u] - g_expertStart;
+    if (g_tBase >= g_expertRows) return false;
+
+    g_expertWeightBase = expert * pc.M * pc.rowUints;
+    return true;
+}
+
+// Identical to matmul_f16_gemm_coopmat_128x128x4.comp's hook apart from the expert slab base.
+void gemmStageA(uint ch) {
+    uint uintFlat  = g_tid * A_PER_THR;
+    uint rowLocal  = uintFlat / A_UINTS_PER_ROW;
+    uint uintInRow = uintFlat % A_UINTS_PER_ROW;
+    uint mGlobal   = g_mBase + rowLocal;
+    uint sBase     = rowLocal * STRIDE;
+    uint col0      = uintInRow * 2u;
+
+    bool rowValid = mGlobal < pc.M;
+    uint srcBase  = rowValid
+        ? (g_expertWeightBase + mGlobal * pc.rowUints + ch * A_UINTS_PER_ROW + uintInRow)
+        : 0u;
+
+    for (uint q = 0u; q < A_PER_THR; q++) {
+        float lo = 0.0;
+        float hi = 0.0;
+        if (rowValid) {
+            vec2 wp = unpackHalf2x16(weight[srcBase + q]);
+            lo = wp.x;
+            hi = wp.y;
+        }
+        uint col = col0 + q * 2u;
+        sharedA[sBase + col]      = float16_t(lo);
+        sharedA[sBase + col + 1u] = float16_t(hi);
+    }
+}
+
+#define GEMM_M          pc.M
+#define GEMM_K          pc.K
+#define GEMM_CHUNKS     (pc.K / BK)
+#define GEMM_ROW_BASE   g_expertStart
+#define GEMM_ROW_LIMIT  g_expertRows
+#define GEMM_B_BUF      x
+#define GEMM_C_BUF      y
+
+#include "gemm_coopmat_blocked_main.glsl"

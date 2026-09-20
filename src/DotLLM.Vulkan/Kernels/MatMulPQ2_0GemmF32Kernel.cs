@@ -18,6 +18,15 @@ namespace DotLLM.Vulkan.Kernels;
 /// on a device with this <see cref="VulkanDevice.SubgroupSize"/>. Selecting it elsewhere is
 /// correct but wasteful (or, on a wider device, half a wave).
 /// </param>
+/// <param name="RequiresNativeSubgroupSize">
+/// When non-zero, the variant is only CORRECT on a device whose native
+/// <see cref="VulkanDevice.SubgroupSize"/> equals this value. The blocked ladder shaders hardcode
+/// <c>#define WAVE 64</c> and declare a workgroup of <c>NSG * WAVE</c> threads, then index an
+/// <c>NSG</c>-entry subgroup grid. On a natively 32-wide device that workgroup contains
+/// <c>2 * NSG</c> subgroups, and the surplus ones read <c>sharedB</c> out of bounds and store into
+/// the neighbouring tile's rows. The pipeline creates without error and the answers are silently
+/// wrong, so this must be gated at selection rather than caught at load.
+/// </param>
 /// <remarks>
 /// Variants exist so a benchmark can A/B them side by side in one process — the interleaved
 /// order-reversed methodology this box requires cannot span processes. Every variant computes the
@@ -25,7 +34,8 @@ namespace DotLLM.Vulkan.Kernels;
 /// </remarks>
 public readonly record struct PQ2_0GemmVariant(
     string SpvFileName, int TileM, int TileN,
-    bool RequiresCooperativeMatrix = false, int RequiresSubgroupSize = 0)
+    bool RequiresCooperativeMatrix = false, int RequiresSubgroupSize = 0,
+    int RequiresNativeSubgroupSize = 0)
 {
     /// <summary>
     /// Register-blocked F32: 32x32 tile, 16x16 threads each owning a 2x2 micro-tile
@@ -91,7 +101,7 @@ public readonly record struct PQ2_0GemmVariant(
     /// kernel, which is why <see cref="Ladder16x16x1"/> is the ladder's own control.
     /// </remarks>
     public static PQ2_0GemmVariant Ladder64x64x4 =>
-        new("matmul_pq2_0_f32_gemm_ladder_64x64x4.spv", 64, 64, RequiresCooperativeMatrix: true);
+        new("matmul_pq2_0_f32_gemm_ladder_64x64x4.spv", 64, 64, RequiresCooperativeMatrix: true, RequiresNativeSubgroupSize: 64);
 
     /// <summary>
     /// Issue #439 ladder point (c): 128x128 tile from four wave64 subgroups (256 threads, 2x2 warp grid),
@@ -104,7 +114,7 @@ public readonly record struct PQ2_0GemmVariant(
     /// variants run unpinned at wave64.
     /// </remarks>
     public static PQ2_0GemmVariant Ladder128x128x4 =>
-        new("matmul_pq2_0_f32_gemm_ladder_128x128x4.spv", 128, 128, RequiresCooperativeMatrix: true);
+        new("matmul_pq2_0_f32_gemm_ladder_128x128x4.spv", 128, 128, RequiresCooperativeMatrix: true, RequiresNativeSubgroupSize: 64);
 
     /// <summary>
     /// Issue #443 — <see cref="Ladder128x128x4"/> with the pipeline pinned to a 32-wide subgroup.
@@ -164,7 +174,7 @@ public readonly record struct PQ2_0GemmVariant(
     /// dequant-volume win under another name; if it beats both, they are independent levers.
     /// </remarks>
     public static PQ2_0GemmVariant Ladder128x128x4FastUnpack =>
-        new("matmul_pq2_0_f32_gemm_ladder_128x128x4_fastunpack.spv", 128, 128, RequiresCooperativeMatrix: true);
+        new("matmul_pq2_0_f32_gemm_ladder_128x128x4_fastunpack.spv", 128, 128, RequiresCooperativeMatrix: true, RequiresNativeSubgroupSize: 64);
 
     /// <summary>
     /// Picks the fastest variant this device can actually run.
@@ -204,6 +214,17 @@ public readonly record struct PQ2_0GemmVariant(
         if (RequiresSubgroupSize != 0
             && !device.SupportsRequiredSubgroupSize((uint)RequiresSubgroupSize, VkShaderStageFlags.Compute))
             return false;
+
+        // The blocked ladder shaders hardcode `#define WAVE 64` and declare a workgroup of
+        // NSG * WAVE threads, then index a 2x2 subgroup grid assuming exactly NSG subgroups.
+        // On a device whose NATIVE subgroup is 32 -- every NVIDIA part, Intel, and AMD in wave32
+        // mode -- that same 256-thread workgroup contains EIGHT subgroups, and ids 4..7 read
+        // sharedB out of bounds and store into the next tile's rows. The pipeline creates
+        // without error and the answers are silently wrong, so nothing catches it at load time.
+        // Mirrors the gate #443 added to the f16 / q8_0 / MoE blocked variants.
+        if (RequiresNativeSubgroupSize != 0 && device.SubgroupSize != (uint)RequiresNativeSubgroupSize)
+            return false;
+
         return true;
     }
 
