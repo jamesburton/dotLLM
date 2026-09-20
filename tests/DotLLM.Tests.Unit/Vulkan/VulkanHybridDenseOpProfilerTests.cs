@@ -152,9 +152,25 @@ public sealed class VulkanHybridDenseOpProfilerTests
 
             // The buckets that this fixture's graph must reach, whichever layer kind ran.
             Assert.Contains("proj_ffn", report.ByCategory.Keys);
-            Assert.Contains("gdn_scan", report.ByCategory.Keys);
-            Assert.Contains("attention", report.ByCategory.Keys);
             Assert.Contains("lm_head", report.ByCategory.Keys);
+
+            // #445 split gdn_scan and attention into their constituent ops. The PARENT names
+            // are therefore no longer marked directly — asserting the sub-buckets is what now
+            // proves the graph reached the recurrent scan and the attention kernel. If a future
+            // change collapses a sub-bucket back into its parent this fails, which is the point.
+            Assert.Contains("gdn_scan_core", report.ByCategory.Keys);
+            Assert.Contains("gdn_postgate", report.ByCategory.Keys);
+            Assert.Contains("attn_core", report.ByCategory.Keys);
+            Assert.Contains("attn_gate", report.ByCategory.Keys);
+            Assert.DoesNotContain("gdn_scan", report.ByCategory.Keys);
+            Assert.DoesNotContain("attention", report.ByCategory.Keys);
+
+            // ...and the roll-up must restore the #434-comparable parents in the formatted
+            // report, so the new numbers can be laid beside the old table.
+            string formatted = report.Format("t");
+            Assert.Contains("rolled up to #434 parent buckets", formatted);
+            Assert.Contains("gdn_scan ", formatted);
+            Assert.Contains("attention ", formatted);
 
             // The census must name a concrete kernel per projection shape, not a placeholder.
             Assert.NotEmpty(report.Dispatches);

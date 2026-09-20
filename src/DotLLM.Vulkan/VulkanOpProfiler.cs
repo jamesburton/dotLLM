@@ -91,13 +91,50 @@ internal sealed class VulkanOpProfiler : IDisposable
 
         /// <summary>Final LM-head projection.</summary>
         LmHead,
+
+        // ── #445 sub-buckets ────────────────────────────────────────────────
+        // gdn_scan and attention were single buckets in #434. Post-#439 they are
+        // 25.1 % and 17.4 % of a pp512 pass, so each is split into the ops it
+        // actually contains. The parent buckets are NOT retired: Format() rolls
+        // these up so the numbers stay comparable to #434's table.
+
+        /// <summary>#445: the GDN recurrent scan dispatch alone (<c>gdn_scan_multi_token_f32</c>).</summary>
+        GdnScanCore,
+
+        /// <summary>#445: the fused post-scan per-head RMSNorm x silu(z) gate.</summary>
+        GdnPostGate,
+
+        /// <summary>#445: RoPE on Q and K.</summary>
+        AttnRope,
+
+        /// <summary>#445: the KV-cache <c>vkCmdCopyBuffer</c> update.</summary>
+        AttnKvUpdate,
+
+        /// <summary>#445: the attention kernel itself (naive / flash / split-KV).</summary>
+        AttnCore,
+
+        /// <summary>#445: the sigmoid(gate) elementwise multiply on the attention output.</summary>
+        AttnGate,
     }
+
+    /// <summary>
+    /// #445 roll-up: which parent bucket each sub-bucket belongs to, so the report can print
+    /// #434-comparable totals alongside the finer split. Identity for every non-sub-bucket.
+    /// </summary>
+    internal static Cat Parent(Cat c) => c switch
+    {
+        Cat.GdnScanCore or Cat.GdnPostGate => Cat.GdnScan,
+        Cat.AttnRope or Cat.AttnKvUpdate or Cat.AttnCore or Cat.AttnGate => Cat.Attention,
+        _ => c,
+    };
 
     /// <summary>Reporting names, indexed by <see cref="Cat"/>.</summary>
     internal static readonly string[] CategoryNames =
     {
         "other", "embed", "norm", "hadamard", "proj_attn", "proj_gdn", "proj_ffn",
         "ffn_act", "gdn_pre", "gdn_scan", "attention", "resid", "copy_fanout", "lm_head",
+        // #445 sub-buckets, in Cat order after LmHead.
+        "gdn_scan_core", "gdn_postgate", "attn_rope", "attn_kvupdate", "attn_core", "attn_gate",
     };
 
     // 64 layers x ~14 marks would overflow a per-forward pool, so the pool is reset and
@@ -383,6 +420,25 @@ internal sealed record VulkanOpProfileReport(
 
         sb.AppendLine($"[{tag}]   {"UNATTRIBUTED",-12} {UnattributedMs,9:F1} ms  " +
             $"({UnattributedMs / Math.Max(WallMs, 1e-9) * 100.0,5:F1} % wall)");
+
+        // #445: roll the sub-buckets back into their #434 parents, so this report can be laid
+        // beside #434's table without re-deriving anything by hand.
+        var rolled = new Dictionary<string, double>(StringComparer.Ordinal);
+        foreach (var entry in ByCategory)
+        {
+            int idx = Array.IndexOf(VulkanOpProfiler.CategoryNames, entry.Key);
+            string parent = idx >= 0
+                ? VulkanOpProfiler.CategoryNames[(int)VulkanOpProfiler.Parent((VulkanOpProfiler.Cat)idx)]
+                : entry.Key;
+            rolled[parent] = rolled.TryGetValue(parent, out double v) ? v + entry.Value : entry.Value;
+        }
+
+        sb.AppendLine($"[{tag}] -- rolled up to #434 parent buckets --");
+        foreach (var entry in rolled.OrderByDescending(e => e.Value))
+        {
+            sb.AppendLine($"[{tag}]   {entry.Key,-14} {entry.Value,9:F1} ms  " +
+                $"({entry.Value / Math.Max(AttributedMs, 1e-9) * 100.0,5:F1} % attributed)");
+        }
         foreach (var kv in Dispatches.OrderByDescending(kv => kv.Value))
             sb.AppendLine($"[{tag}]   dispatch {kv.Key} x{kv.Value}");
         return sb.ToString();

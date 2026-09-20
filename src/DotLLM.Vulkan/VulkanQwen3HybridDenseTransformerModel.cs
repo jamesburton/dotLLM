@@ -769,7 +769,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             output: _state.GdnOut,
             seqLen: seqLen, nVHead: nVHead, nKHead: nKHead, dState: dState);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
-        ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnScan);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnScanCore);   // #445 sub-bucket
         ProfNote("gdn_scan_multitoken", m: nVHead, k: dState, n: seqLen);
 
         // ── 6. Per-head RMSNorm × silu(z) gate (fused) ───────────────────────
@@ -777,7 +777,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             gdnOut: _state.GdnOut, z: _state.GdnZBuf, ssmNormWeight: gdnW.SsmNormWeight,
             seqLen: seqLen, nVHead: nVHead, dState: dState, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
-        ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnScan);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnPostGate);   // #445 sub-bucket
 
         // ── 7. ssm_out projection back into NormOutput ───────────────────────
         // The one site taking the value-head permutation: the fold was computed in grouped
@@ -886,8 +886,10 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         if (kvCache is VulkanNemotronHKvCache vkCache)
         {
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnRope);      // #445 sub-bucket
             vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, absoluteLayerIdx);
             KernelSupport.TransferToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnKvUpdate);  // #445 sub-bucket
             kSrc = vkCache.GetKeysBuffer(absoluteLayerIdx);
             vSrc = vkCache.GetValuesBuffer(absoluteLayerIdx);
             seqKv = vkCache.CurrentLength;
@@ -896,6 +898,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         else
         {
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnRope);      // #445 sub-bucket
             kSrc = _state.K;
             vSrc = _state.V;
             seqKv = seqLen;
@@ -932,12 +935,13 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
                 positionOffset: positionOffset, slidingWindow: 0);
         }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnCore);      // #445 sub-bucket
 
         // 7. Apply sigmoid(gate) element-wise to attention output.
         _kernels.SigmoidGateMul.Record(cmdBuf, _state.AttnOutput, _state.GateScratch,
             nTotal: seqLen * qElems);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
-        ProfMark(cmdBuf, VulkanOpProfiler.Cat.Attention);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnGate);      // #445 sub-bucket
 
         // 8. Output projection.
         // Shares the 6144 sign vector with ssm_out but takes NO value-head permutation.
