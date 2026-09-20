@@ -1,4 +1,4 @@
-using DotLLM.Vulkan.Interop;
+﻿using DotLLM.Vulkan.Interop;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -334,6 +334,14 @@ public sealed class MatMulPQ2_0GemmF32Kernel : IDisposable
     /// </summary>
     internal nint PipelineHandle => _pipeline.Pipeline;
 
+    /// <summary>
+    /// The SPIR-V module this pipeline was created from — e.g.
+    /// <c>matmul_pq2_0_f32_gemm_coopmat32.spv</c>. Exposed so a profiler can record which
+    /// variant actually dispatched rather than asserting what <c>SelectFor</c> ought to pick
+    /// (issue #434).
+    /// </summary>
+    public string VariantName { get; private init; } = string.Empty;
+
     private MatMulPQ2_0GemmF32Kernel(
         VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, int tileM, int tileN)
     {
@@ -401,7 +409,10 @@ public sealed class MatMulPQ2_0GemmF32Kernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
-        return new MatMulPQ2_0GemmF32Kernel(device, module, pipeline, pool, variant.TileM, variant.TileN);
+        return new MatMulPQ2_0GemmF32Kernel(device, module, pipeline, pool, variant.TileM, variant.TileN)
+        {
+            VariantName = variant.SpvFileName,
+        };
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
