@@ -1,0 +1,84 @@
+#version 450
+// F16 native batched GEMM on the shared 128x128 blocked coopmat template (issue #443).
+//
+//   C[N, M] = B[N, K] @ W_f16[M, K]^T
+//
+// Functional parity with matmul_f16_gemm_coopmat.comp (16x16, one subgroup) and with the
+// scalar matmul_f16_gemm_f32.comp — same weight byte layout, same I/O semantics:
+//   W_f16  row-major [M, K] IEEE-754 binary16, 2 bytes / element, pc.rowUints uint stride.
+//   B      row-major [N, K] FP32.
+//   C      row-major [N, M] FP32; C[t, m] = dot(W[m, :], B[t, :]).
+//
+// F16 IS THE CLEANEST TEST OF THE TILE: there is no dequant at all, so nothing but the
+// M*K*N/BN staging-redundancy term changes between this and the 16x16 kernel. Whatever
+// this measures is the roofline of what the tile alone buys.
+//
+// Reduction order per output is UNCHANGED from the 16x16 kernel — both contract K in
+// BK=32 chunks as two TK=16 coopMatMulAdd into one F32 accumulator — so this must pass the
+// existing coopmat-tier parity tolerance, not a widened one. A failure here is a bug.
+
+#define BM  128
+#define BN  128
+#define WM  64
+#define WN  64
+#define NSG 4
+#define WAVE 64
+
+#extension GL_GOOGLE_include_directive : require
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; }; // F16 blob (2 F16 / uint)
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; };      // [N*K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };      // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;            // output dim
+    uint K;            // contraction dim (must be a multiple of 32)
+    uint N;            // batch size
+    uint pairsPerRow;  // K / 2
+    uint rowUints;     // per-row uint stride
+} pc;
+
+#include "gemm_coopmat_blocked_decl.glsl"
+
+// A-staging geometry. One chunk of A is BM rows x BK f16 = BM * (BK/2) uints.
+const uint A_UINTS_PER_ROW = BK / 2u;                          // 16
+const uint A_UINTS         = BM * A_UINTS_PER_ROW;
+const uint A_PER_THR       = A_UINTS / BLOCK_SIZE;             // uints per thread
+const uint A_LANES_PER_ROW = A_UINTS_PER_ROW / A_PER_THR;      // threads cooperating on one row
+
+// Each thread owns A_PER_THR CONSECUTIVE uints, which divides A_UINTS_PER_ROW for every
+// instantiation, so all of a thread's uints belong to ONE weight row.
+void gemmStageA(uint ch) {
+    uint uintFlat  = g_tid * A_PER_THR;
+    uint rowLocal  = uintFlat / A_UINTS_PER_ROW;
+    uint uintInRow = uintFlat % A_UINTS_PER_ROW;
+    uint mGlobal   = g_mBase + rowLocal;
+    uint sBase     = rowLocal * STRIDE;
+    uint col0      = uintInRow * 2u;
+
+    bool rowValid = mGlobal < pc.M;
+    uint srcBase  = rowValid ? (mGlobal * pc.rowUints + ch * A_UINTS_PER_ROW + uintInRow) : 0u;
+
+    for (uint q = 0u; q < A_PER_THR; q++) {
+        float lo = 0.0;
+        float hi = 0.0;
+        if (rowValid) {
+            vec2 wp = unpackHalf2x16(weight[srcBase + q]);
+            lo = wp.x;
+            hi = wp.y;
+        }
+        uint col = col0 + q * 2u;
+        sharedA[sBase + col]      = float16_t(lo);
+        sharedA[sBase + col + 1u] = float16_t(hi);
+    }
+}
+
+#define GEMM_M          pc.M
+#define GEMM_K          pc.K
+#define GEMM_CHUNKS     (pc.K / BK)
+#define GEMM_ROW_BASE   0u
+#define GEMM_ROW_LIMIT  pc.N
+#define GEMM_B_BUF      b
+#define GEMM_C_BUF      c
+
+#include "gemm_coopmat_blocked_main.glsl"
