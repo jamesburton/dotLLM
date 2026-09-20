@@ -74,18 +74,23 @@ public sealed class VulkanCoopmatGemmOccupancyBench
             ulong lds = s.resourceUsage.ldsUsageSizeInBytes;
 
             // WAVES PER SIMD COMES FROM THE REGISTER FILE, NOT THE PER-WAVE CAP. An earlier
-            // revision of this bench divided by numAvailableVgprs (256 — the driver's per-wave
-            // ALLOCATION CAP) and reported "1 wave/SIMD" for a kernel that actually runs at ~9.
+            // revision of this bench divided by numAvailableVgprs (256 - the driver's per-wave
+            // ALLOCATION CAP) and reported "1 wave/SIMD" for a kernel that actually runs near 9.
             // A whole diagnosis was built on that and then retracted; see the retraction block in
-            // .docs/COOPMAT_GEMM_DIAGNOSIS.md. The file is numPhysicalVgprs (1536 on gfx1151) and
-            // RDNA caps residency at 16 waves/SIMD regardless.
-            uint wavesByVgpr = vgpr == 0 ? 0 : Math.Min(16u, file / vgpr);
+            // .docs/COOPMAT_GEMM_DIAGNOSIS.md. The file is numPhysicalVgprs (1536 on gfx1151),
+            // RDNA caps residency at 16 waves/SIMD, and allocation is granular so the used count
+            // must be rounded UP to the 8-VGPR granule before dividing.
+            const uint gran = 8u;
+            uint alloc = vgpr == 0 ? 0u : ((vgpr + gran - 1u) / gran) * gran;
+            double wavesByVgpr = alloc == 0 ? 0 : Math.Min(16.0, file / (double)alloc);
             double wgByLds = lds == 0 ? double.PositiveInfinity : 65536.0 / lds;
 
             _output.WriteLine(name);
             _output.WriteLine($"   arithmetic intensity: {macPerByte:F1} MAC/byte staged");
             _output.WriteLine($"   workgroup           : {s.computeWorkGroupSizeX} threads");
-            _output.WriteLine($"   VGPR used           : {vgpr}  (per-wave cap {cap}, file {file}) -> {wavesByVgpr} waves/SIMD");
+            _output.WriteLine($"   VGPR used           : {vgpr} (alloc {alloc}, per-wave cap {cap}, file {file})");
+            _output.WriteLine($"   -> {wavesByVgpr:F1} waves/SIMD by registers; LDS gives {wgByLds / 2.0:F1} waves/SIMD");
+            _output.WriteLine($"   -> BINDING: {(wavesByVgpr <= wgByLds / 2.0 ? "registers" : "LDS")}");
             _output.WriteLine($"   SGPR used/available : {s.resourceUsage.numUsedSgprs} / {s.numAvailableSgprs} (physical {s.numPhysicalSgprs})");
             _output.WriteLine($"   LDS used            : {lds} B -> {wgByLds:F1} workgroups/WGP by LDS (64 KB)");
             _output.WriteLine($"   scratch (spill)     : {s.resourceUsage.scratchMemUsageInBytes} B");

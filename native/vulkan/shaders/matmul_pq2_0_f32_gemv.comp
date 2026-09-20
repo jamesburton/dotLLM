@@ -15,7 +15,10 @@
 //       bytes [0..1]  : float16 group scale (little-endian, IEEE-754 binary16)
 //       bytes [2..33] : 32 bytes packing 4 ternary codes (2 bits each) per byte —
 //                       byte gp (0..31) packs codes for group-relative elements
-//                       {gp, gp+32, gp+64, gp+96} at bit offsets {6, 4, 2, 0}.
+//                       {4*gp, +1, +2, +3} at ASCENDING bit offsets {0, 2, 4, 6} —
+//                       FOUR CONSECUTIVE elements, not a stride-32 quartet. The
+//                       strided form is I2_S's layout (matmul_i2_s_*.comp), and an
+//                       earlier version of this header wrongly claimed it here.
 //                       value = code - 1, scaled by this group's fp16 scale.
 //   Row stride = (K / 128) * 34 bytes. K must be a multiple of 128.
 //
@@ -70,7 +73,7 @@ void main() {
 
     // Stride all 128 lanes over the row's blocksPerRow groups' code bytes (one
     // code-byte = 4 ternary codes -> 4 elements at group-relative positions
-    // {gp, gp+32, gp+64, gp+96}). Total code-byte count = blocksPerRow * 32; a lane
+    // {4*gp, +1, +2, +3}). Total code-byte count = blocksPerRow * 32; a lane
     // handling code-byte index `cb` belongs to group `cb / 32` and byte-within-group
     // `cb % 32`. Adjacent lanes read adjacent code bytes (same/next uint word) so
     // the weight loads coalesce; the group scale is re-read (once per group-span,
