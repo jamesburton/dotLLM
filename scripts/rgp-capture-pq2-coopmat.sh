@@ -51,6 +51,7 @@ powershell.exe -NoProfile -Command "Get-Process RadeonDeveloperPanelCLI -ErrorAc
 
 echo "=== running the capture target ==="
 export DOTLLM_PQ2_0_CAPTURE=1
+export DOTLLM_PQ2_0_CAPTURE_VARIANT="${DOTLLM_PQ2_0_CAPTURE_VARIANT:-coopmat32}"
 export DOTLLM_PQ2_0_CAPTURE_TOKENS="${DOTLLM_PQ2_0_CAPTURE_TOKENS:-32}"
 export DOTLLM_PQ2_0_CAPTURE_HOLD_MS="${DOTLLM_PQ2_0_CAPTURE_HOLD_MS:-2000}"
 cd "$REPO"

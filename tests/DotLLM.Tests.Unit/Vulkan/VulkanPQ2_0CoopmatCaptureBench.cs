@@ -68,13 +68,17 @@ public sealed class VulkanPQ2_0CoopmatCaptureBench
         int k = EnvInt("DOTLLM_PQ2_0_CAPTURE_K", 5120);
 
         using var device = VulkanDevice.Create();
-        Skip.IfNot(PQ2_0GemmVariant.Coopmat32.IsSupportedOn(device), "coopmat32 variant unsupported on this device.");
 
-        var variant = PQ2_0GemmVariant.Coopmat32;
+        var variant = ResolveVariant(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_CAPTURE_VARIANT"));
+        Skip.IfNot(variant.IsSupportedOn(device), $"{variant.SpvFileName} unsupported on this device.");
         _output.WriteLine($"pid={Environment.ProcessId}  process={Process.GetCurrentProcess().ProcessName}");
         _output.WriteLine($"Device: {device.DeviceName}  SubgroupSize: {device.SubgroupSize}  Coopmat: {device.HasCooperativeMatrix}");
         _output.WriteLine($"variant={variant.SpvFileName}  (SelectFor => {PQ2_0GemmVariant.SelectFor(device).SpvFileName})");
         _output.WriteLine($"shape M={m} K={k} tokens={tokens}  warmups={warmups} traced={traced}  holdMs={holdMs}");
+        long tilesM = (m + variant.TileM - 1) / variant.TileM;
+        long tilesN = (tokens + variant.TileN - 1) / variant.TileN;
+        _output.WriteLine($"tile {variant.TileM}x{variant.TileN}  workgroups {tilesM}x{tilesN} = {tilesM * tilesN}  "
+            + $"outputs/workgroup {(long)variant.TileM * variant.TileN}");
 
         using var kernel = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir, variant);
 
@@ -123,6 +127,25 @@ public sealed class VulkanPQ2_0CoopmatCaptureBench
         sw.Stop();
         return sw.Elapsed.TotalMicroseconds;
     }
+
+    /// <summary>
+    /// Maps <c>DOTLLM_PQ2_0_CAPTURE_VARIANT</c> onto a GEMM variant. Defaults to the shipping
+    /// <c>coopmat32</c> kernel, so the original #440 capture reproduces unchanged.
+    /// </summary>
+    /// <param name="name">Variant name, case-insensitive; unset means the shipping kernel.</param>
+    /// <returns>The variant to capture.</returns>
+    private static PQ2_0GemmVariant ResolveVariant(string? name) => (name ?? "coopmat32").ToLowerInvariant() switch
+    {
+        "" or "coopmat32" => PQ2_0GemmVariant.Coopmat32,
+        "coopmat" => PQ2_0GemmVariant.Coopmat,
+        "rb" or "registerblocked" => PQ2_0GemmVariant.RegisterBlocked,
+        "ladder16" or "a" => PQ2_0GemmVariant.Ladder16x16x1,
+        "ladder64" or "b" => PQ2_0GemmVariant.Ladder64x64x4,
+        "ladder128" or "c" => PQ2_0GemmVariant.Ladder128x128x4,
+        "ladder16fast" or "d" => PQ2_0GemmVariant.Ladder16x16x1FastUnpack,
+        "ladder128fast" or "e" => PQ2_0GemmVariant.Ladder128x128x4FastUnpack,
+        var other => throw new ArgumentException($"unknown DOTLLM_PQ2_0_CAPTURE_VARIANT '{other}'", nameof(name)),
+    };
 
     private static int EnvInt(string name, int fallback)
         => int.TryParse(Environment.GetEnvironmentVariable(name), NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) && v >= 0 ? v : fallback;
