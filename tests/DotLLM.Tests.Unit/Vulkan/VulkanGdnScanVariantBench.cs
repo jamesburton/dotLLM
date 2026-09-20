@@ -244,6 +244,33 @@ public sealed class VulkanGdnScanVariantBench
                 $"{lds,7} {s.resourceUsage.scratchMemUsageInBytes,8} " +
                 $"{wavesByVgpr,16:F1}  {wgByLds,10:F1}  {wavesPerSimdByLds,15:F2}");
 
+            // THE WAVE WIDTH EACH PIPELINE WAS ACTUALLY COMPILED TO, read from the ISA rather
+            // than inferred from device.SubgroupSize. That property is the device DEFAULT; RDNA
+            // drivers choose wave32 or wave64 per pipeline, and the wave count per arm is what
+            // decides whether the LDS arms changed the memory level ALONE or also added
+            // wavefronts. VK_KHR_pipeline_executable_properties does not answer it — on this
+            // driver it reports the WORKGROUP size (see VulkanMmqSubgroupSizeBench). The exec
+            // mask does: 32-bit (`exec_lo`) in wave32, 64-bit (bare `exec`) in wave64.
+            if (device.HasShaderInfoAmd)
+            {
+                try
+                {
+                    string disasm = device.GetShaderDisassemblyAmd(kernel.PipelineHandle);
+                    int execLo = Count(disasm, "exec_lo");
+                    int execFull = Count(disasm, "exec") - execLo;
+                    string wave = execLo > 0 && execFull == 0 ? "wave32"
+                        : execFull > 0 && execLo == 0 ? "wave64"
+                        : "MIXED/INCONCLUSIVE";
+                    double wavesTotal = 48.0 * 128.0 / (wave == "wave32" ? 32.0 : 64.0);
+                    _output.WriteLine($"                 ISA: exec_lo={execLo} bare-exec={execFull} => {wave}" +
+                        (wave.StartsWith("wave", StringComparison.Ordinal)
+                            ? $"; {threads / (wave == "wave32" ? 32 : 64)} wave(s)/WG, " +
+                              $"{wavesTotal:F0} waves for the whole Bonsai 2 dispatch"
+                            : ""));
+                }
+                catch (Exception ex) { _output.WriteLine($"                 (disassembly unavailable: {ex.Message})"); }
+            }
+
             Assert.True(s.resourceUsage.scratchMemUsageInBytes == 0,
                 $"{arm} spills to scratch ({s.resourceUsage.scratchMemUsageInBytes} B) — " +
                 "an LDS or register arm that spills is measuring the spill, not the hypothesis.");
@@ -264,6 +291,15 @@ public sealed class VulkanGdnScanVariantBench
         kernel.Launch(state, q, k, v, g, beta, output, seqLen, nVHead, nKHead, dState);
         sw.Stop();
         return sw.Elapsed.TotalMilliseconds;
+    }
+
+    private static int Count(string haystack, string needle)
+    {
+        int n = 0;
+        for (int i = haystack.IndexOf(needle, StringComparison.Ordinal); i >= 0;
+             i = haystack.IndexOf(needle, i + needle.Length, StringComparison.Ordinal))
+            n++;
+        return n;
     }
 
     private static float[] RandomFloats(Random rng, int count, float range)
