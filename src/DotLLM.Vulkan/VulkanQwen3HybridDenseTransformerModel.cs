@@ -1008,10 +1008,13 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
                 // by VulkanQwen3MoeHybridWeights.KeepPQ2_0. Each group carries its own fp16 scale,
                 // read and applied in-shader. Widening this to F32 instead is what used to make
                 // Bonsai 2 27B ask for ~108 GB of device-local memory.
-                if (seqLen == 1)
-                    _kernels.MatMulPQ2_0.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
-                else
-                    _kernels.MatMulPQ2_0Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                // #446: the dispatch threshold is PQ2_0SmallNDispatch's, not a bare
+                // seqLen == 1 test -- the 128x128 GEMM tile only overtakes a per-token
+                // GEMV loop at n ~ 4.4 (lm_head) / ~6.5 (ffn), so 2-8 token verify
+                // batches were taking the slower kernel. DOTLLM_VK_PQ2_0_GEMV_LOOP_MAX_N=0
+                // restores the old behaviour.
+                PQ2_0SmallNDispatch.Record(cmdBuf, _kernels.MatMulPQ2_0, _kernels.MatMulPQ2_0Gemm,
+                    weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             case QuantizationType.F16:
                 if (seqLen == 1)

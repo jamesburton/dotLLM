@@ -37,6 +37,11 @@ layout(push_constant) uniform PushConstants {
     uint K;
     uint blocksPerRow;   // = K / 128 (number of 34-byte groups per row)
     uint rowUints;       // unused here; kept for push-constant layout parity
+    // Issue #446: element offsets into x and y, so a looped GEMV can compute token t
+    // of a [n, K] activation batch into row t of an [n, M] output without a buffer
+    // view (VulkanDevice.Buffer has none). Zero for the ordinary decode dispatch.
+    uint xOff;           // first element of this token's activation row
+    uint yOff;           // first element of this token's output row
 } pc;
 
 const uint PQ2_GROUP_SIZE   = 128u;
@@ -99,7 +104,7 @@ void main() {
         float c2 = float(int((pk >> 4u) & 3u) - 1);
         float c3 = float(int((pk >> 6u) & 3u) - 1);
 
-        uint xBase = g * PQ2_GROUP_SIZE + 4u * gp;
+        uint xBase = pc.xOff + g * PQ2_GROUP_SIZE + 4u * gp;
         acc += scale * (c0 * x[xBase]
                        + c1 * x[xBase + 1u]
                        + c2 * x[xBase + 2u]
@@ -113,5 +118,5 @@ void main() {
         barrier();
     }
 
-    if (tid == 0u) y[m] = partials[0];
+    if (tid == 0u) y[pc.yOff + m] = partials[0];
 }
