@@ -72,7 +72,20 @@ public sealed class VulkanGdnScanVariantBench
             GdnScanMultiTokenF32Kernel.Variant.Fused,
             GdnScanMultiTokenF32Kernel.Variant.Lds,
             GdnScanMultiTokenF32Kernel.Variant.LdsFused,
+            GdnScanMultiTokenF32Kernel.Variant.Lds64,
+            GdnScanMultiTokenF32Kernel.Variant.Lds64Fused,
         };
+
+        // Single-arm mode exists for RGP, not for timing: an SQTT capture identifies a kernel by
+        // DISPATCH INDEX, so a run that interleaves four arms makes the index ambiguous. Never
+        // read a speedup off a single-arm run — that is the cold-vs-warm launch comparison the
+        // class remarks rule out.
+        if (Environment.GetEnvironmentVariable("DOTLLM_GDN_SCAN_AB_ARM") is { Length: > 0 } only)
+        {
+            arms = arms.Where(a => string.Equals(a.ToString(), only, StringComparison.OrdinalIgnoreCase)).ToArray();
+            Assert.True(arms.Length == 1, $"DOTLLM_GDN_SCAN_AB_ARM='{only}' matched {arms.Length} arms.");
+            _output.WriteLine($"SINGLE-ARM MODE: {arms[0]} only. Timings here are NOT an A/B.");
+        }
 
         var rng = new Random(445);
         float[] state0 = RandomFloats(rng, nVHead * dState * dState, 0.1f);
@@ -120,6 +133,17 @@ public sealed class VulkanGdnScanVariantBench
             var all = new Dictionary<GdnScanMultiTokenF32Kernel.Variant, List<double>>();
             foreach (var arm in arms) { best[arm] = double.MaxValue; all[arm] = new List<double>(); }
 
+            // RGP only: give an externally launched Radeon Developer Panel time to attach and arm
+            // before the first dispatch. Without it this target can run to completion inside the
+            // panel's connect handshake, and the capture fails with "error trying to collect a
+            // trace" that looks like an SQTT overflow but is not one.
+            int holdMs = EnvInt("DOTLLM_GDN_SCAN_AB_HOLD_MS", 0);
+            if (holdMs > 0)
+            {
+                _output.WriteLine($"holding {holdMs} ms for a profiler to attach...");
+                Thread.Sleep(holdMs);
+            }
+
             for (int w = 0; w < warmups; w++)
                 foreach (var arm in arms)
                     TimeOne(device, kernels[arm], stateBuf, qBuf, kBuf, vBuf, gBuf, betaBuf, outBuf,
@@ -142,7 +166,8 @@ public sealed class VulkanGdnScanVariantBench
                     string.Join("  ", order.Select(a => $"{a}={all[a][^1]:F2}ms")));
             }
 
-            double baseMs = best[GdnScanMultiTokenF32Kernel.Variant.Baseline];
+            double baseMs = best.TryGetValue(GdnScanMultiTokenF32Kernel.Variant.Baseline, out double b)
+                ? b : double.NaN;
             _output.WriteLine("");
             _output.WriteLine("arm                min_ms    speedup_vs_baseline   all_ms");
             foreach (var arm in arms)
@@ -154,6 +179,74 @@ public sealed class VulkanGdnScanVariantBench
         finally
         {
             foreach (var kv in kernels) kv.Value.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Driver-reported post-compile resources for each #445 arm, via <c>VK_AMD_shader_info</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is hardware data, not timing, and it exists to test the one competing explanation
+    /// the A/B cannot rule out by itself. The shipping scan runs 48 workgroups of 128 threads —
+    /// 192 wave32 over 80 SIMDs, about 2.4 waves/SIMD — so "it is simply under-occupied" is a
+    /// live hypothesis. The LDS arms do <b>not</b> add waves (total threads are
+    /// <c>nVHead * dState</c> either way) and they consume 16 KiB of LDS per workgroup, which
+    /// caps residency further. If the LDS arm wins big while its occupancy is the same or worse,
+    /// occupancy was not the binding resource.
+    /// </para>
+    /// <para>
+    /// Waves per SIMD is derived from the register FILE (<c>numPhysicalVgprs</c>, 1536 on
+    /// gfx1151), not from the per-wave allocation cap — dividing by <c>numAvailableVgprs</c>
+    /// produced a wrong occupancy that a whole diagnosis was built on and then retracted
+    /// (see <c>.docs/COOPMAT_GEMM_DIAGNOSIS.md</c>). LDS residency is computed per CU from the
+    /// 64 KiB limit and then divided down to per-SIMD, which is the step that analysis missed.
+    /// </para>
+    /// </remarks>
+    [SkippableFact]
+    public void ShaderResources_PerArm()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasShaderInfoAmd, "VK_AMD_shader_info unavailable (AMD proprietary driver only).");
+
+        _output.WriteLine($"Device: {device.DeviceName}  subgroup={device.SubgroupSize}");
+        _output.WriteLine("arm              threads  waves/WG  VGPR  SGPR   LDS_B  scratch  " +
+            "waves/SIMD(vgpr)  WG/CU(lds)  waves/SIMD(lds)");
+
+        foreach (var arm in new[]
+        {
+            GdnScanMultiTokenF32Kernel.Variant.Baseline,
+            GdnScanMultiTokenF32Kernel.Variant.Fused,
+            GdnScanMultiTokenF32Kernel.Variant.Lds,
+            GdnScanMultiTokenF32Kernel.Variant.LdsFused,
+            GdnScanMultiTokenF32Kernel.Variant.Lds64,
+            GdnScanMultiTokenF32Kernel.Variant.Lds64Fused,
+        })
+        {
+            using var kernel = GdnScanMultiTokenF32Kernel.Create(device, spvDir, arm);
+            var s = device.GetShaderStatisticsAmd(kernel.PipelineHandle);
+
+            uint vgpr = s.resourceUsage.numUsedVgprs;
+            uint file = s.numPhysicalVgprs == 0 ? 1536u : s.numPhysicalVgprs;
+            ulong lds = s.resourceUsage.ldsUsageSizeInBytes;
+            uint threads = s.computeWorkGroupSizeX;
+            double wavesPerWg = Math.Max(1.0, threads / (double)Math.Max(1u, device.SubgroupSize));
+
+            const uint gran = 8u;
+            uint alloc = vgpr == 0 ? 0u : ((vgpr + gran - 1u) / gran) * gran;
+            double wavesByVgpr = alloc == 0 ? 0 : Math.Min(16.0, file / (double)alloc);
+            double wgByLds = lds == 0 ? double.PositiveInfinity : 65536.0 / lds;
+            // 2 SIMD32 per CU on RDNA; a workgroup's waves are co-resident on one CU.
+            double wavesPerSimdByLds = Math.Min(16.0, wgByLds * wavesPerWg / 2.0);
+
+            _output.WriteLine($"{arm,-16} {threads,7} {wavesPerWg,9:F0} {vgpr,5} {s.resourceUsage.numUsedSgprs,5} " +
+                $"{lds,7} {s.resourceUsage.scratchMemUsageInBytes,8} " +
+                $"{wavesByVgpr,16:F1}  {wgByLds,10:F1}  {wavesPerSimdByLds,15:F2}");
+
+            Assert.True(s.resourceUsage.scratchMemUsageInBytes == 0,
+                $"{arm} spills to scratch ({s.resourceUsage.scratchMemUsageInBytes} B) — " +
+                "an LDS or register arm that spills is measuring the spill, not the hypothesis.");
         }
     }
 

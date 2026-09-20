@@ -77,15 +77,37 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
 
         /// <summary>Arm 11 — both factors.</summary>
         LdsFused,
+
+        /// <summary>
+        /// Arm 01 at COLS=64 — the WAVE-COUNT-MATCHED control for factor B. The device reports
+        /// <c>subgroupSize</c> 64, so the COLS=32 arms run 192 half-empty wave64s where the
+        /// shipping kernel runs 96 full ones: they change the memory level AND double the
+        /// wavefront count. At COLS=64 the wavefront count is identical to the shipping kernel
+        /// (48 heads x 128 lanes / 64 = 96 either way) and only the memory level differs.
+        /// </summary>
+        Lds64,
+
+        /// <summary>Arm 11 at COLS=64 — wave-count-matched, both factors.</summary>
+        Lds64Fused,
     }
 
     /// <summary>Lanes per workgroup, and therefore state columns per workgroup, in the LDS arms.</summary>
     private const int LdsColsPerGroup = 32;
 
+    /// <summary>Columns per workgroup in the wave64-matched LDS arms — one full wave64 per group.</summary>
+    private const int LdsColsPerGroupWave64 = 64;
+
     private readonly Variant _variant;
 
     /// <summary>Which factorial arm this pipeline was built from (#445).</summary>
     public Variant ActiveVariant => _variant;
+
+    /// <summary>
+    /// Raw <c>VkPipeline</c> handle — diagnostics only, so
+    /// <c>VulkanDevice.GetShaderStatisticsAmd</c> can report this kernel's post-compile
+    /// VGPR/SGPR/LDS/scratch allocation. No codepath's correctness or performance depends on it.
+    /// </summary>
+    internal nint PipelineHandle => _pipeline.Pipeline;
 
     private static Variant VariantFromEnv() =>
         Environment.GetEnvironmentVariable("DOTLLM_VK_GDN_SCAN_VARIANT") switch
@@ -93,6 +115,8 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
             "fused" => Variant.Fused,
             "lds" => Variant.Lds,
             "ldsfused" => Variant.LdsFused,
+            "lds64" => Variant.Lds64,
+            "lds64fused" => Variant.Lds64Fused,
             _ => Variant.Baseline,
         };
 
@@ -101,6 +125,8 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
         Variant.Fused => "gdn_scan_multi_token_fused_f32.spv",
         Variant.Lds => "gdn_scan_multi_token_lds_f32.spv",
         Variant.LdsFused => "gdn_scan_multi_token_lds_fused_f32.spv",
+        Variant.Lds64 => "gdn_scan_multi_token_lds64_f32.spv",
+        Variant.Lds64Fused => "gdn_scan_multi_token_lds64_fused_f32.spv",
         _ => "gdn_scan_multi_token_f32.spv",
     };
 
@@ -205,9 +231,13 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
         // Arms 00/10 keep one workgroup of d_state lanes per value head. Arms 01/11 split
         // each head's columns across ceil(d_state / 32) single-wave workgroups so the slab
         // fits LDS; total threads are identical either way, so this adds no wavefronts.
-        uint groupsY = _variant is Variant.Lds or Variant.LdsFused
-            ? (uint)((dState + LdsColsPerGroup - 1) / LdsColsPerGroup)
-            : 1u;
+        int cols = _variant switch
+        {
+            Variant.Lds or Variant.LdsFused => LdsColsPerGroup,
+            Variant.Lds64 or Variant.Lds64Fused => LdsColsPerGroupWave64,
+            _ => 0,
+        };
+        uint groupsY = cols == 0 ? 1u : (uint)((dState + cols - 1) / cols);
         VulkanApi.vkCmdDispatch(cmdBuf, (uint)nVHead, groupsY, 1);
     }
 

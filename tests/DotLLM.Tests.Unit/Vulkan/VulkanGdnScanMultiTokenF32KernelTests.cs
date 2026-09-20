@@ -119,6 +119,8 @@ public class VulkanGdnScanMultiTokenF32KernelTests
     [InlineData(GdnScanMultiTokenF32Kernel.Variant.Fused)]
     [InlineData(GdnScanMultiTokenF32Kernel.Variant.Lds)]
     [InlineData(GdnScanMultiTokenF32Kernel.Variant.LdsFused)]
+    [InlineData(GdnScanMultiTokenF32Kernel.Variant.Lds64)]
+    [InlineData(GdnScanMultiTokenF32Kernel.Variant.Lds64Fused)]
     public void Variant_IsBitIdenticalToShippingKernel(GdnScanMultiTokenF32Kernel.Variant variant)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -160,6 +162,8 @@ public class VulkanGdnScanMultiTokenF32KernelTests
         GdnScanMultiTokenF32Kernel.Variant.Fused => "gdn_scan_multi_token_fused_f32.spv",
         GdnScanMultiTokenF32Kernel.Variant.Lds => "gdn_scan_multi_token_lds_f32.spv",
         GdnScanMultiTokenF32Kernel.Variant.LdsFused => "gdn_scan_multi_token_lds_fused_f32.spv",
+        GdnScanMultiTokenF32Kernel.Variant.Lds64 => "gdn_scan_multi_token_lds64_f32.spv",
+        GdnScanMultiTokenF32Kernel.Variant.Lds64Fused => "gdn_scan_multi_token_lds64_fused_f32.spv",
         _ => "gdn_scan_multi_token_f32.spv",
     };
 
