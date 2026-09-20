@@ -128,6 +128,15 @@ public sealed class VulkanCoopmatGemmLadderBench
             ("(d) -> (e) big tile, unpack held cheap     [INTENSITY, unpack controlled]",
                 PQ2_0GemmVariant.Ladder16x16x1FastUnpack, PQ2_0GemmVariant.Ladder128x128x4FastUnpack),
 
+            // --- #443: the last untested multiplier. MEASUREMENT ONLY, not shippable. ---
+            // RDNA3.5's WMMA is a wave32 instruction; the driver defaults compute to wave64, and
+            // pinning bought 1.29-1.79x on the 16x16 kernel (#236). Whether it survives at a
+            // 4-subgroup 128x128 tile is the open question. Valid ONLY because every shape here
+            // has M and N as exact multiples of 128, so the boundary path -- which IS broken
+            // under the pin at NSG=4 (#439) -- never executes. Guarded below.
+            ("(c) -> (c) WAVE32-PINNED                  [#443 WAVE WIDTH, not shippable]",
+                PQ2_0GemmVariant.Ladder128x128x4, PQ2_0GemmVariant.Ladder128x128x4Wave32),
+
             // --- Decomposes the (a)-vs-shipping bundle: Coopmat is 64-thread wave64 at BK=128,
             //     so this holds wave width constant and varies BK + padding + B coalescing. ---
             ("coopmat (wave64, BK=128) -> (a) (wave64, BK=32) [BK+pad+coalescing, wave held]",
@@ -151,6 +160,14 @@ public sealed class VulkanCoopmatGemmLadderBench
             _output.WriteLine("|---|---:|---:|---:|---:|---:|");
 
             var rng = new Random(0x4_39);
+            // The wave32-pinned arm is only meaningful where the (broken) boundary path never
+            // runs. Fail loudly rather than silently timing a wrong kernel.
+            Assert.True(tokens % 128 == 0,
+                $"#443's wave32 arm requires tokens (N) to be a multiple of 128; got {tokens}.");
+            foreach (var (tag, m, k) in Shapes)
+                Assert.True(m % 128 == 0,
+                    $"#443's wave32 arm requires M to be a multiple of 128; shape '{tag}' has M={m}.");
+
             foreach (var (tag, m, k) in Shapes)
             {
                 long rowBytes = (long)(k / GroupSize) * GroupBytes;

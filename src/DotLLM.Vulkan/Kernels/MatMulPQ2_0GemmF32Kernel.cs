@@ -107,6 +107,36 @@ public readonly record struct PQ2_0GemmVariant(
         new("matmul_pq2_0_f32_gemm_ladder_128x128x4.spv", 128, 128, RequiresCooperativeMatrix: true);
 
     /// <summary>
+    /// Issue #443 — <see cref="Ladder128x128x4"/> with the pipeline pinned to a 32-wide subgroup.
+    /// <b>MEASUREMENT ONLY. Do not ship or select this variant.</b>
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// RDNA3.5's WMMA is a wave32 instruction and the AMD driver defaults compute to wave64, so
+    /// pinning bought 1.29-1.79x on the 16x16 kernel (#236). Whether that survives at a
+    /// 4-subgroup 128x128 tile is unknown, and it is the last untested multiplier on top of
+    /// #439's measured 10-12x.
+    /// </para>
+    /// <para>
+    /// <b>Why it is not shippable.</b> Under the wave32 pin at NSG=4 the LDS-staged <i>boundary</i>
+    /// path is wrong (subgroups 2-3 read uninitialised staging slots); the <i>direct</i> store path
+    /// is correct, which #439 established by passing the <c>576x1024x64</c> parity shape — that
+    /// shape requires <c>warp_c</c> to take both values. Root cause is NOT isolated: at NSG=1
+    /// merely reading <c>gl_SubgroupID</c> breaks the coopmat store, and substituting
+    /// <c>gl_LocalInvocationID.x / 32</c> made NSG=4 worse. The pipeline creates without error in
+    /// every case.
+    /// </para>
+    /// <para>
+    /// So this variant is only meaningful on shapes whose M and N are exact multiples of 128, where
+    /// the boundary path never executes. The bench that uses it asserts exactly that, and #439's
+    /// earlier claim that "only two subgroups materialise" is withdrawn (commit 22441c1a).
+    /// </para>
+    /// </remarks>
+    public static PQ2_0GemmVariant Ladder128x128x4Wave32 =>
+        new("matmul_pq2_0_f32_gemm_ladder_128x128x4.spv", 128, 128,
+            RequiresCooperativeMatrix: true, RequiresSubgroupSize: 32);
+
+    /// <summary>
     /// Issue #439 arm (d) — <b>the unpack arm</b>: geometrically identical to
     /// <see cref="Ladder16x16x1"/> (16x16, one wave64 subgroup, BK = 32), with a cheaper PQ2_0
     /// dequant and nothing else changed.
