@@ -370,6 +370,42 @@ public class VulkanMatMulI2SGemmF32KernelTests
         => RunParity(I2SGemmVariant.CoopmatWarptileWave32, m, k, n, absTol: 3e-2f, relTol: 5e-3f);
 
     /// <summary>
+    /// Issue #443: parity for the 128x128 blocked coopmat tile from the shared template, at the
+    /// coopmat-tier tolerance and including the ragged shapes.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The ragged shapes are the point. A four-subgroup 128x128 tile's boundary path scatters
+    /// every subgroup's staged fragment through LDS and derives the owner from a flat index;
+    /// only a shape ragged in M <b>and</b> N distinguishes a correct scatter from one that
+    /// writes half the tile. 17x47, 33x33 and 15x3 mirror the shapes that let the PQ2_0
+    /// instantiation ship.
+    /// </para>
+    /// <para>
+    /// I2_S is also the one instantiation where BK=32 changes the <i>unpack</i>: its byte
+    /// <c>gp</c> is genuinely strided over <c>{gp, gp+32, gp+64, gp+96}</c>, so a 32-element
+    /// K-slice is all 32 code bytes read with a single bit field <c>6 - 2s</c>. A shape with
+    /// more than one 128-element block per row (K &gt;= 256) is what proves the slice index
+    /// advances correctly across blocks rather than merely within the first one.
+    /// </para>
+    /// </remarks>
+    /// <param name="m">Weight rows (output columns of C).</param>
+    /// <param name="k">Shared dimension; must be a multiple of 128.</param>
+    /// <param name="n">Token rows (batch).</param>
+    [SkippableTheory]
+    [InlineData(128, 256, 128)]   // exactly one blocked tile, 2 blocks per row
+    [InlineData(256, 512, 256)]   // 2x2 blocked tiles, 4 blocks per row
+    [InlineData(16, 128, 4)]      // one coopmat fragment: 1/64th of a tile, all-boundary
+    [InlineData(48, 768, 12)]     // partial in both dims, 6 blocks per row
+    [InlineData(33, 128, 33)]     // one past a full fragment in both dims
+    [InlineData(17, 256, 47)]     // ragged in BOTH dims
+    [InlineData(15, 128, 3)]      // below a single fragment in both dims
+    [InlineData(129, 256, 129)]   // one past a full BLOCKED tile in both dims
+    [InlineData(2560, 2560, 5)]   // BitNet hidden x hidden; N=5 is 4% of a 128-wide N tile
+    public void Blocked128x128x4_MatchesScalarReference(int m, int k, int n)
+        => RunParity(I2SGemmVariant.Blocked128x128x4, m, k, n, absTol: 3e-2f, relTol: 5e-3f);
+
+    /// <summary>
     /// <see cref="I2SGemmVariant.SelectFor"/> must fall back to the bit-exact register-blocked
     /// F32 kernel whenever the env opt-out is set — the guard that keeps a coopmat regression
     /// recoverable without a rebuild, and the same guard a device lacking coopmat or

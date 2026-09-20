@@ -21,10 +21,40 @@ namespace DotLLM.Vulkan.Kernels;
 /// top of the coopmat tile itself (PQ2_0 GEMM). This mirrors that fix
 /// (<c>PQ2_0GemmVariant</c>) for the Q8_0 GEMM coopmat kernel.
 /// </remarks>
-public readonly record struct Q8_0GemmCoopmatVariant(string SpvFileName, int RequiredSubgroupSize)
+/// <param name="TileM">Weight rows of <c>C</c> produced per workgroup (sets the dispatch grid).</param>
+/// <param name="TileN">Token rows of <c>C</c> produced per workgroup (sets the dispatch grid).</param>
+public readonly record struct Q8_0GemmCoopmatVariant(
+    string SpvFileName, int RequiredSubgroupSize, int TileM = 16, int TileN = 16)
 {
+    /// <summary>
+    /// Environment variable that restores the pre-issue-#443 preference in
+    /// <see cref="SelectFor"/>.
+    /// </summary>
+    public const string LegacyEnvVar = "DOTLLM_VK_Q8_0_GEMM_LEGACY";
+
     /// <summary>Baseline 64-thread coopmat kernel — one subgroup on a wave64 device, two on wave32.</summary>
     public static Q8_0GemmCoopmatVariant Coopmat64 => new("matmul_q8_0_gemm_coopmat.spv", 0);
+
+    /// <summary>
+    /// Issue #443: the proven 128x128, BK=32, four-wave64-subgroup blocked tile, instantiated
+    /// from the shared <c>gemm_coopmat_blocked_*.glsl</c> template.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// BK=32 is not a change for Q8_0 — <see cref="Coopmat64"/> already stepped K one 32-element
+    /// block at a time — so the <b>only</b> thing this variant changes is the output tile, and
+    /// with it the <c>M*K*N / BN</c> weight-staging term. The per-output reduction order is
+    /// identical, so it is held to the existing coopmat parity tolerance.
+    /// </para>
+    /// <para>
+    /// <b>This is not the Q8_0 prefill path on a device with dp4a.</b>
+    /// <c>VulkanTransformerModel</c> prefers <c>MatMulQ8_0MmqKernel</c> (issue #50) and reaches
+    /// the coopmat GEMM only as a fallback, so beating <see cref="Coopmat64"/> is necessary but
+    /// not sufficient for an end-to-end win; the honest competitor is MMQ.
+    /// </para>
+    /// </remarks>
+    public static Q8_0GemmCoopmatVariant Blocked128x128x4 =>
+        new("matmul_q8_0_gemm_coopmat_128x128x4.spv", 0, TileM: 128, TileN: 128);
 
     /// <summary>
     /// 32-thread workgroup pinned to wave32 via <c>VkPipelineShaderStageRequiredSubgroupSizeCreateInfo</c>.
@@ -76,7 +106,29 @@ public readonly record struct Q8_0GemmCoopmatVariant(string SpvFileName, int Req
     /// new measured evidence superseding the above.
     /// </remarks>
     public static Q8_0GemmCoopmatVariant SelectFor(VulkanDevice device, string spvDir)
-        => Coopmat64;
+    {
+        // DOTLLM_VK_Q8_0_GEMM_LEGACY=1 restores the pre-#443 preference so the blocked tile can
+        // be A/B'd against what shipped, in alternating processes, on a real model.
+        if (Environment.GetEnvironmentVariable(LegacyEnvVar) != "1"
+            && Blocked128x128x4.IsSupportedOn(device, spvDir))
+            return Blocked128x128x4;
+
+        return Coopmat64;
+    }
+
+    /// <summary>
+    /// Every variant <paramref name="device"/> can run. Benchmarks and the parity gates
+    /// enumerate this so a variant cannot rot unmeasured.
+    /// </summary>
+    /// <param name="device">Device to enumerate for.</param>
+    /// <param name="spvDir">Directory the compiled SPIR-V is loaded from.</param>
+    /// <returns>The runnable variants, legacy first.</returns>
+    public static IEnumerable<Q8_0GemmCoopmatVariant> AvailableOn(VulkanDevice device, string spvDir)
+    {
+        if (Coopmat64.IsSupportedOn(device, spvDir)) yield return Coopmat64;
+        if (Coopmat32.IsSupportedOn(device, spvDir)) yield return Coopmat32;
+        if (Blocked128x128x4.IsSupportedOn(device, spvDir)) yield return Blocked128x128x4;
+    }
 }
 
 /// <summary>
@@ -116,8 +168,11 @@ public sealed class MatMulQ8_0GemmCoopmatKernel : IDisposable
     /// <summary>Elements per Q8_0 block.</summary>
     public const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
 
-    private const int TileM = 16;
-    private const int TileN = 16;
+    // Dispatch grid comes from the VARIANT, not a constant: issue #443's blocked instantiation
+    // produces a 128x128 tile where the legacy kernel produces 16x16, and a stale 16 here would
+    // launch 64x too many workgroups, each recomputing and overwriting the same output.
+    private readonly int _tileM;
+    private readonly int _tileN;
     private const int PushConstantBytes = 5 * sizeof(uint); // M, K, N, blocksPerRow, rowUints
 
     private readonly VulkanDevice _device;
@@ -127,8 +182,11 @@ public sealed class MatMulQ8_0GemmCoopmatKernel : IDisposable
     private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
 
-    private MatMulQ8_0GemmCoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
+    private MatMulQ8_0GemmCoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
+        int tileM, int tileN)
     {
+        _tileM = tileM;
+        _tileN = tileN;
         _device = device;
         _module = module;
         _pipeline = pipeline;
@@ -186,7 +244,7 @@ public sealed class MatMulQ8_0GemmCoopmatKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
-        return new MatMulQ8_0GemmCoopmatKernel(device, module, pipeline, pool);
+        return new MatMulQ8_0GemmCoopmatKernel(device, module, pipeline, pool, variant.TileM, variant.TileN);
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
@@ -263,8 +321,8 @@ public sealed class MatMulQ8_0GemmCoopmatKernel : IDisposable
                 0, PushConstantBytes, (nint)pcPtr);
         }
 
-        uint groupsX = (uint)((m + TileM - 1) / TileM);
-        uint groupsY = (uint)((n + TileN - 1) / TileN);
+        uint groupsX = (uint)((m + _tileM - 1) / _tileM);
+        uint groupsY = (uint)((n + _tileN - 1) / _tileN);
         VulkanApi.vkCmdDispatch(cmdBuf, groupsX, groupsY, 1);
     }
 
