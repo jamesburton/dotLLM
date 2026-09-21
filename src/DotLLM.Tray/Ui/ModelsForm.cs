@@ -24,6 +24,8 @@ internal sealed class ModelsForm : Form
     private readonly ListView _pulls = NewListView();
     private readonly TextBox _repoId = new() { PlaceholderText = "org/repo (Hugging Face)" };
     private readonly TextBox _filename = new() { PlaceholderText = "model-Q4_K_M.gguf" };
+    private readonly ComboBox _loadDevice = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 130 };
+    private readonly TextBox _loadKeepAlive = new() { Width = 90, PlaceholderText = "keep-alive s" };
     private readonly Label _statusLabel = new() { AutoSize = true, Text = "" };
     private readonly System.Windows.Forms.Timer _poll = new() { Interval = 1500 };
     private bool _refreshing;
@@ -60,8 +62,12 @@ internal sealed class ModelsForm : Form
         Controls.Add(BuildLayout());
         _poll.Tick += async (_, _) => await ReloadAsync().ConfigureAwait(true);
 
+        _loadDevice.Items.Add("(server default)");
+        _loadDevice.SelectedIndex = 0;
+
         Shown += async (_, _) =>
         {
+            await LoadDevicesAsync().ConfigureAwait(true);
             await ReloadAsync().ConfigureAwait(true);
             _poll.Start();
         };
@@ -131,10 +137,37 @@ internal sealed class ModelsForm : Form
             if (_available.SelectedItems.Count == 0)
                 return;
             var model = (TrayAvailableModel)_available.SelectedItems[0].Tag!;
+
+            // Per-load overrides. Both are deliberately omitted when blank so the server keeps
+            // its own default rather than being handed the tray's idea of one: a keep_alive of 0
+            // means "unload after every request" and would be a very different setting from
+            // "unspecified".
+            double? keepAlive = null;
+            if (!string.IsNullOrWhiteSpace(_loadKeepAlive.Text))
+            {
+                if (!double.TryParse(_loadKeepAlive.Text, NumberStyles.Float, CultureInfo.CurrentCulture, out var parsed))
+                {
+                    SetStatus("Keep-alive must be a number of seconds (negative = never auto-unload).");
+                    return;
+                }
+
+                keepAlive = parsed;
+            }
+
             SetStatus($"Loading {model.ModelId}…");
-            await _api.LoadModelAsync(new TrayLoadRequest { Model = model.FullPath }).ConfigureAwait(true);
+            await _api.LoadModelAsync(new TrayLoadRequest
+            {
+                Model = model.FullPath,
+                Device = _loadDevice.SelectedIndex > 0 ? (string)_loadDevice.SelectedItem! : null,
+                KeepAlive = keepAlive,
+            }).ConfigureAwait(true);
             SetStatus("Loaded " + model.ModelId);
         }));
+
+        panel.Controls.Add(new Label { Text = "on", AutoSize = true, Padding = new Padding(8, 6, 2, 0) });
+        panel.Controls.Add(_loadDevice);
+        panel.Controls.Add(new Label { Text = "keep-alive", AutoSize = true, Padding = new Padding(8, 6, 2, 0) });
+        panel.Controls.Add(_loadKeepAlive);
 
         panel.Controls.Add(Button("Enable", async () =>
         {
@@ -203,6 +236,36 @@ internal sealed class ModelsForm : Form
             SetStatus($"Cancelling {job.Id}. The partial file is kept, so a later pull resumes it.");
         }));
         return panel;
+    }
+
+    /// <summary>
+    /// Fills the per-load device picker from <c>GET /v1/devices</c>, gated on
+    /// <c>servable</c> rather than <c>available</c>.
+    /// </summary>
+    /// <remarks>
+    /// Vulkan reports available-but-not-servable, because the server's load path dispatches to
+    /// CPU or CUDA only. Listing it would produce a load that silently lands on the CPU while the
+    /// UI claimed a GPU.
+    /// </remarks>
+    private async Task LoadDevicesAsync()
+    {
+        try
+        {
+            var devices = await _api.GetDevicesAsync().ConfigureAwait(true);
+            foreach (var backend in devices.Backends.Where(b => b.Servable))
+            {
+                foreach (var device in backend.Devices)
+                {
+                    if (device.DeviceString is { Length: > 0 } deviceString)
+                        _loadDevice.Items.Add(deviceString);
+                }
+            }
+        }
+        catch (Exception ex) when (ex is DotLlmApiException or HttpRequestException or TaskCanceledException)
+        {
+            // Not fatal: "(server default)" is still selectable, which is the pre-#455 behaviour.
+            SetStatus("Could not enumerate devices; loads will use the server default.");
+        }
     }
 
     private async Task ReloadAsync()

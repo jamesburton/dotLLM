@@ -43,6 +43,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private HttpClient _apiHttp;
     private DotLlmApiClient _api;
     private ServerSupervisor _supervisor;
+    private int _refreshing;
     private bool _disposed;
 
     /// <summary>Creates the tray context and shows the icon.</summary>
@@ -83,12 +84,23 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     private (HttpClient Http, DotLlmApiClient Api, ServerSupervisor Supervisor) BuildStack(TraySettings settings)
     {
+        // Ten minutes, because POST /v1/models/unload legitimately blocks behind an in-flight
+        // generation and POST /v1/models/load blocks for as long as a model takes to load. The
+        // health probes below deliberately do NOT inherit it.
         var http = new HttpClient { BaseAddress = settings.BaseAddress, Timeout = TimeSpan.FromMinutes(10) };
         var api = new DotLlmApiClient(http);
         var supervisor = new ServerSupervisor(
             new ProcessServerProcessRunner(),
             new ApiHealthProbe(api),
-            () => BuildLaunchSpec(settings));
+            () => BuildLaunchSpec(settings),
+            // `dotllm serve` loads the model BEFORE Kestrel starts listening (ServeCommand calls
+            // ServerStartup.LoadModel, then app.RunAsync), so with a startup model /health does
+            // not answer until the load and its warm-up passes finish. A 60 s budget would kill a
+            // legitimately loading 27B model and report it as a hang. A dead child is caught by
+            // the exit check, not by this timeout, so a generous budget costs nothing.
+            startTimeout: string.IsNullOrWhiteSpace(settings.StartupModel)
+                ? TimeSpan.FromSeconds(60)
+                : TimeSpan.FromMinutes(15));
         supervisor.StatusChanged += (_, status) => BeginInvokeOnUi(() => ApplyStatus(status));
         return (http, api, supervisor);
     }
@@ -125,6 +137,11 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     private async Task RefreshAsync()
     {
+        // One refresh at a time. The probes are budgeted to 3 s, but a slow machine can still
+        // overlap a 3 s tick, and overlapping refreshes publish out of order.
+        if (Interlocked.Exchange(ref _refreshing, 1) != 0)
+            return;
+
         try
         {
             await _supervisor.RefreshAsync().ConfigureAwait(true);
@@ -133,6 +150,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
         {
             // A refresh that cannot reach the server is information, not a crash; the next tick
             // will try again and ApplyStatus already renders the disconnected state.
+        }
+        finally
+        {
+            Volatile.Write(ref _refreshing, 0);
         }
     }
 
@@ -289,6 +310,18 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 if (string.IsNullOrEmpty(path))
                 {
                     Warn("Could not determine this application's path, so autostart cannot be enabled.");
+                    return;
+                }
+
+                // Under `dotnet dotllm-tray.dll` the host process IS dotnet.exe, so registering
+                // ProcessPath would put a bare `"...\dotnet.exe"` in the Run key — a logon entry
+                // that launches the SDK and exits. The shipped build is a single-file exe, so this
+                // only bites a developer running from source; refuse rather than write a Run value
+                // that silently does nothing.
+                if (Path.GetFileName(path).Equals("dotnet.exe", StringComparison.OrdinalIgnoreCase))
+                {
+                    Warn("Autostart needs the published dotllm-tray.exe. This instance is hosted by "
+                       + "dotnet.exe, so registering it would create a startup entry that does nothing.");
                     return;
                 }
 

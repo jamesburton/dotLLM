@@ -183,19 +183,32 @@ follows; removing both reap paths is what turns the test red).
 ### Verified against a real server
 
 A throwaway harness drove the real `DotLlmApiClient`, `ProcessServerProcessRunner` and
-`ServerSupervisor` against a real `dotllm serve` (no model, so no GPU) on ports 18097–18099:
+`ServerSupervisor` against a real `dotllm serve` on ports 18096–18099. Nothing below is mocked.
 
-- **24/24** — spawn, attach-instead-of-spawn, refuse-to-stop-an-attached-server, every ungated GET,
-  live `PUT /v1/settings` (including that a partial update leaves other fields alone),
+- **24/24, bare server** — spawn, attach-instead-of-spawn, refuse-to-stop-an-attached-server, every
+  ungated GET, live `PUT /v1/settings` (including that a partial update leaves other fields alone),
   enable/disable round-trip visible in `disabled_models`, `not_resident` unload, 404 on an unknown
   pull job, stop, and the PID actually gone.
-- **8/8** — a server started *without* `--allow-model-admin`: `GET /v1/settings` ungated and
+- **14/14, with a real model** (SmolLM-135M Q8_0 on CPU) — `POST /v1/models/load` with the
+  per-load `device` and `keep_alive` overrides the Models dialog sends; `/ready` flipping to 200;
+  `GET /v1/models` reporting the override (`keep_alive_seconds: 120`), a counting-down
+  `expires_in_seconds` and a real `size_bytes`; a real SSE pull (3 frames then `[DONE]`) reporting
+  hub-cache `blob_path` and a `model_path` hardlink; the job still listed afterwards (the
+  re-attach path); and unload-all.
+- **8/8, gate** — a server started *without* `--allow-model-admin`: `GET /v1/settings` ungated and
   reporting `model_admin_api_enabled: false`, and all five write routes refused with the flag named
   in the message.
-- **Orphan guarantee** — parent process holding the job object spawned a server (PID 34904), was
+- **Orphan guarantee** — a parent process holding the job object spawned a server (PID 34904), was
   hard-killed with `taskkill /F`, and the server was gone within 3 s with the port unreachable.
+- **Published artifact** — the single-file publish produces one 51 MB `dotllm-tray.exe`; it
+  launches, stays resident with no main window, and a second launch exits on the single-instance
+  mutex.
 - Confirmed on this machine: `cpu(available, servable)`, `cuda(unavailable)`,
   `vulkan(available, NOT servable)` — the exact shape the device picker must handle.
+
+**Not verified.** The Linux CI build of the WinForms project is expected to work via
+`EnableWindowsTargeting` but has not been run on a Linux host from here. Everything in the
+[manual plan](#manual-only--the-ui) below is exactly that — manual.
 
 ### Manual only — the UI
 
@@ -215,8 +228,10 @@ are not reachable from a unit test.
 4. **Web UI / copy URL.** Double-click the icon opens the browser at the base URL. "Copy base URL"
    puts it on the clipboard.
 5. **Models.** Open Models. Resident list shows the loaded model with size and a counting-down
-   "Auto-unload in"; a model with keep-alive −1 shows "never", not "0:00". Load an available model,
-   watch it appear in the resident list. Disable it and confirm the status line says it is still
+   "Auto-unload in"; a model with keep-alive −1 shows "never", not "0:00". Pick an available model,
+   set the per-load device and a keep-alive of e.g. `60`, and Load; confirm the resident row shows
+   keep-alive 60 rather than the server default. Confirm a non-numeric keep-alive is refused with a
+   message instead of being sent. Disable the model and confirm the status line says it is still
    loaded and that the setting resets on restart. Unload it. Unload All.
 6. **Pull.** Enter a small repo/file and Start download. Progress advances. **Close the Models
    window mid-download, reopen it, and confirm the job is still listed and still progressing** —

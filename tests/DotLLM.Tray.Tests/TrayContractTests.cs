@@ -378,6 +378,56 @@ public sealed class TrayContractTests
     }
 
     [Fact]
+    public void LoadResponse_RoundTrips()
+    {
+        var server = new ModelLoadResponse { Status = "loaded", Model = "m" };
+        var tray = RoundTrip(server, ServerJsonContext.Default.ModelLoadResponse,
+            TrayJsonContext.Default.TrayLoadResult);
+
+        Assert.Equal("loaded", tray.Status);
+        Assert.Equal("m", tray.Model);
+    }
+
+    [Fact]
+    public void StatusResponse_RoundTrips()
+    {
+        // The body DELETE /v1/models/pull/{id} answers with.
+        var server = new StatusResponse { Status = "cancelling" };
+        var tray = RoundTrip(server, ServerJsonContext.Default.StatusResponse,
+            TrayJsonContext.Default.TrayStatusResponse);
+
+        Assert.Equal("cancelling", tray.Status);
+    }
+
+    [Fact]
+    public void PullJobList_RoundTrips()
+    {
+        // The listing the Downloads panel polls, and the one that re-attaches progress to jobs
+        // started before the tray was opened.
+        var server = new ModelPullJobListResponse
+        {
+            Jobs =
+            [
+                new ModelPullJobDto
+                {
+                    Id = "j1", RepoId = "o/r", Filename = "f.gguf", Revision = "main",
+                    Status = "completed", BytesDownloaded = 10, StartedAt = 1, CompletedAt = 2,
+                    ModelPath = @"C:\models\f.gguf", BlobPath = @"C:\hub\blobs\abc",
+                },
+            ],
+        };
+
+        var tray = RoundTrip(server, ServerJsonContext.Default.ModelPullJobListResponse,
+            TrayJsonContext.Default.TrayPullJobList);
+
+        var job = Assert.Single(tray.Jobs);
+        Assert.Equal("j1", job.Id);
+        Assert.True(job.IsTerminal);
+        Assert.Equal(@"C:\models\f.gguf", job.ModelPath);
+        Assert.Equal(2, job.CompletedAt);
+    }
+
+    [Fact]
     public void ErrorResponse_RoundTripsSoTheGateMessageSurvives()
     {
         var server = new ErrorResponse

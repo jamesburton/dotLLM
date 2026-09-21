@@ -181,6 +181,62 @@ public sealed class ServerSupervisorTests
     }
 
     [Fact]
+    public async Task Refresh_AfterAnUnexpectedChildExit_KeepsFailed()
+    {
+        // The tray polls every 3 seconds. A crashed child looks exactly like "never started" to
+        // /health, so without a sticky Failed the red icon and its explanation would survive one
+        // tick and then be relabelled a neutral "Stopped" — a notification the user cannot catch.
+        var runner = new FakeProcessRunner();
+        var probe = new FakeHealthProbe { Healthy = false, BecomeHealthyAfter = 1 };
+        using var supervisor = Create(runner, probe);
+        await supervisor.StartAsync(CancellationToken.None);
+        runner.Handles[0].SimulateExit(139);
+        Assert.Equal(ServerState.Failed, supervisor.Status.State);
+
+        probe.Healthy = false;
+        probe.BecomeHealthyAfter = -1;
+        var afterOneTick = await supervisor.RefreshAsync(CancellationToken.None);
+        var afterManyTicks = await supervisor.RefreshAsync(CancellationToken.None);
+
+        Assert.Equal(ServerState.Failed, afterOneTick.State);
+        Assert.Equal(ServerState.Failed, afterManyTicks.State);
+        Assert.Contains("exited unexpectedly", afterManyTicks.Detail!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Refresh_AfterAFailedStart_KeepsTheReason()
+    {
+        // Same for "dotllm.exe not found": the message is shown once, and the state must still
+        // say Failed when the user opens the menu a minute later.
+        var runner = new FakeProcessRunner { StartFailure = new FileNotFoundException("dotllm.exe not found") };
+        var probe = new FakeHealthProbe { Healthy = false };
+        using var supervisor = Create(runner, probe);
+        await supervisor.StartAsync(CancellationToken.None);
+
+        var refreshed = await supervisor.RefreshAsync(CancellationToken.None);
+
+        Assert.Equal(ServerState.Failed, refreshed.State);
+        Assert.Contains("dotllm.exe", refreshed.Detail!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AnExplicitStart_ClearsAPreviousFailure()
+    {
+        // Sticky must not mean stuck: the user's own Start is what resets it.
+        var runner = new FakeProcessRunner { StartFailure = new FileNotFoundException("missing") };
+        var probe = new FakeHealthProbe { Healthy = false };
+        using var supervisor = Create(runner, probe);
+        await supervisor.StartAsync(CancellationToken.None);
+        Assert.Equal(ServerState.Failed, supervisor.Status.State);
+
+        runner.StartFailure = null;
+        probe.BecomeHealthyAfter = probe.HealthProbes + 1;
+        var status = await supervisor.StartAsync(CancellationToken.None);
+
+        Assert.Equal(ServerState.RunningOwned, status.State);
+    }
+
+    [Fact]
     public async Task Dispose_KillsAnOwnedChild()
     {
         var runner = new FakeProcessRunner();

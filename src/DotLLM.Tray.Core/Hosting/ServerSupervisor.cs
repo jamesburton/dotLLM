@@ -123,13 +123,29 @@ public sealed class ServerSupervisor : IDisposable
     /// Re-probes and updates the status without starting or stopping anything.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Distinguishes healthy-with-a-model from healthy-but-bare: the server may be started without
     /// a model and load one later, so <c>/health</c> ok with <c>/ready</c> 503 is a normal running
     /// state, not a failure.
+    /// </para>
+    /// <para>
+    /// <b><see cref="ServerState.Failed"/> is sticky.</b> A crashed child is, from
+    /// <c>/health</c>'s point of view, indistinguishable from a server that was never started, so
+    /// a naive refresh would relabel the red "exited unexpectedly" state as a neutral
+    /// <see cref="ServerState.Stopped"/> on the very next poll — one tick of a red icon for a
+    /// backend that died, which is worse than no notification at all. A failure therefore persists
+    /// until the user explicitly calls <see cref="StartAsync"/>. <see cref="ServerState.Stopping"/>
+    /// is held for the same reason: a refresh landing between the kill and the exit would
+    /// otherwise report <c>Starting</c>.
+    /// </para>
     /// </remarks>
     /// <param name="ct">Cancellation token.</param>
     public async Task<ServerStatus> RefreshAsync(CancellationToken ct = default)
     {
+        // A stop in progress owns the state until it finishes.
+        if (Status.State == ServerState.Stopping)
+            return Status;
+
         var healthy = await _probe.IsHealthyAsync(ct).ConfigureAwait(false);
         var child = _child;
         var childAlive = child is { HasExited: false };
@@ -138,6 +154,10 @@ public sealed class ServerSupervisor : IDisposable
         {
             // An owned child that is alive but not yet answering is still starting, not stopped.
             if (childAlive && Status.State == ServerState.Starting)
+                return Status;
+
+            // A failure outlives the poll that would otherwise erase it. See the remarks.
+            if (!childAlive && Status.State == ServerState.Failed)
                 return Status;
 
             return Publish(childAlive

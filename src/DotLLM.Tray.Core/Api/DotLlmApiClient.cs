@@ -22,6 +22,17 @@ namespace DotLLM.Tray.Api;
 /// </remarks>
 public sealed class DotLlmApiClient
 {
+    /// <summary>
+    /// Per-call budget for the <c>/health</c> and <c>/ready</c> probes.
+    /// </summary>
+    /// <remarks>
+    /// The shared <see cref="HttpClient"/> is given a long timeout because an unload waits behind
+    /// an in-flight generation and a load can take minutes. The probes must not inherit it: the
+    /// tray polls every few seconds, so a wedged server would otherwise stack minutes' worth of
+    /// outstanding probes.
+    /// </remarks>
+    private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(3);
+
     private readonly HttpClient _http;
 
     /// <summary>Creates a client over an already-configured <see cref="HttpClient"/>.</summary>
@@ -45,42 +56,33 @@ public sealed class DotLlmApiClient
     /// legitimate answer, not an error.
     /// </summary>
     /// <param name="ct">Cancellation token.</param>
-    public async Task<bool> IsHealthyAsync(CancellationToken ct = default)
-    {
-        try
-        {
-            using var response = await _http.GetAsync("/health", ct).ConfigureAwait(false);
-            return response.IsSuccessStatusCode;
-        }
-        catch (HttpRequestException)
-        {
-            return false;
-        }
-        catch (TaskCanceledException) when (!ct.IsCancellationRequested)
-        {
-            // Connect timeout. Nothing is answering.
-            return false;
-        }
-    }
+    public Task<bool> IsHealthyAsync(CancellationToken ct = default) => ProbeAsync("/health", ct);
 
     /// <summary>
     /// Probes <c>GET /ready</c>. False means the process is up but has no model loaded — the
     /// server allows starting without one, so this is a distinct state from "not running".
     /// </summary>
     /// <param name="ct">Cancellation token.</param>
-    public async Task<bool> IsReadyAsync(CancellationToken ct = default)
+    public Task<bool> IsReadyAsync(CancellationToken ct = default) => ProbeAsync("/ready", ct);
+
+    private async Task<bool> ProbeAsync(string route, CancellationToken ct)
     {
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        budget.CancelAfter(ProbeTimeout);
         try
         {
-            using var response = await _http.GetAsync("/ready", ct).ConfigureAwait(false);
+            using var response = await _http.GetAsync(route, budget.Token).ConfigureAwait(false);
             return response.IsSuccessStatusCode;
         }
         catch (HttpRequestException)
         {
+            // Connection refused: nothing is listening. A legitimate answer, not an error.
             return false;
         }
-        catch (TaskCanceledException) when (!ct.IsCancellationRequested)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
+            // Connect or probe timeout. Treated as "not answering" rather than propagated, so a
+            // wedged server shows as down instead of throwing out of a timer tick.
             return false;
         }
     }
