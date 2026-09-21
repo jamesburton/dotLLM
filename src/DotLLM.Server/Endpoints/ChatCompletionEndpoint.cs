@@ -138,6 +138,13 @@ public static class ChatCompletionEndpoint
                 state.Options.Threads, state.Options.DecodeThreads));
         options = options with { MaxTokens = effectiveMaxTokens };
 
+        // #456: tool_choice was parsed at the top of this method and then DISCARDED — the local
+        // had exactly one reference, its own assignment — so required/none/named-function had no
+        // effect on generation. The Anthropic surface has honoured it since #449; this shares
+        // that implementation rather than forking a second one.
+        var effectiveToolParser = ToolChoiceBinder.Apply(
+            toolChoice, tools, state.ToolCallParser, ref options, out bool forcedToolCall);
+
         // Diffusion routing: when the loaded model is a masked text-diffusion model, generation runs
         // through DiffusionTextGenerator (canvas denoising) instead of the autoregressive TextGenerator.
         // AR models leave DiffusionGenerator null and fall through to the unchanged path below.
@@ -159,10 +166,10 @@ public static class ChatCompletionEndpoint
 
         if (request.Stream)
             await HandleStreamingAsync(request, generator, state, httpContext, prompt, options,
-                requestId, modelId, tools, adapter, ct);
+                requestId, modelId, tools, effectiveToolParser, adapter, ct);
         else
             await HandleNonStreamingAsync(request, generator, state, httpContext, prompt, options,
-                requestId, modelId, tools, adapter, ct);
+                requestId, modelId, tools, effectiveToolParser, adapter, ct);
     }
 
     private static async Task HandleNonStreamingAsync(
@@ -174,6 +181,7 @@ public static class ChatCompletionEndpoint
         DotLLM.Core.Configuration.InferenceOptions options,
         string requestId, string modelId,
         ToolDefinition[]? tools,
+        IToolCallParser? toolParser,
         DotLLM.Core.Lora.ILoraAdapter? adapter,
         CancellationToken ct)
     {
@@ -205,9 +213,12 @@ public static class ChatCompletionEndpoint
         ToolCall[]? toolCalls = null;
         var finishReason = result.FinishReason;
 
-        if (state.ToolCallParser is not null && tools is { Length: > 0 })
+        // #456: the EFFECTIVE parser, not state's. tool_choice:none yields null here so no tool
+        // call is ever reported, and a forced choice yields the markerless parser that matches
+        // the constrained output.
+        if (toolParser is not null && tools is { Length: > 0 })
         {
-            var enriched = ToolCallDetector.DetectToolCalls(result, state.ToolCallParser);
+            var enriched = ToolCallDetector.DetectToolCalls(result, toolParser);
             text = enriched.Text;
             toolCalls = ApplyParallelToolCalls(enriched.ToolCalls, request.ParallelToolCalls);
             finishReason = enriched.FinishReason;
@@ -272,6 +283,7 @@ public static class ChatCompletionEndpoint
         DotLLM.Core.Configuration.InferenceOptions options,
         string requestId, string modelId,
         ToolDefinition[]? tools,
+        IToolCallParser? toolParser,
         DotLLM.Core.Lora.ILoraAdapter? adapter,
         CancellationToken ct)
     {
@@ -330,9 +342,10 @@ public static class ChatCompletionEndpoint
         // Detect tool calls in accumulated text
         string text = sb.ToString();
         ToolCall[]? toolCalls = null;
-        if (state.ToolCallParser is not null && tools is { Length: > 0 })
+        // #456: see the non-streaming path — the effective parser honours tool_choice.
+        if (toolParser is not null && tools is { Length: > 0 })
         {
-            toolCalls = ApplyParallelToolCalls(state.ToolCallParser.TryParse(text), request.ParallelToolCalls);
+            toolCalls = ApplyParallelToolCalls(toolParser.TryParse(text), request.ParallelToolCalls);
             if (toolCalls is { Length: > 0 })
                 finishReason = FinishReason.ToolCalls;
         }

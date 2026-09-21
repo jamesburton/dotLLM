@@ -133,65 +133,16 @@ public static class MessagesEndpoint
     }
 
     /// <summary>
-    /// Applies Anthropic <c>tool_choice</c> semantics and returns the tool-call parser this
-    /// request should use (null when tool calls must not be produced).
+    /// Delegates to <see cref="ToolChoiceBinder.Apply"/>. Kept so the Anthropic call sites and
+    /// #449's tests read unchanged; the logic is shared with the OpenAI path (#456).
     /// </summary>
-    /// <remarks>
-    /// <list type="bullet">
-    /// <item><c>auto</c> — the model's own parser, unconstrained.</item>
-    /// <item><c>any</c>/<c>tool</c> — decoding is constrained to a tool-call JSON schema, and the
-    /// markerless parser is used, because the constraint emits a bare JSON object rather than the
-    /// model's <c>&lt;tool_call&gt;</c> envelope. Same construction as the CLI's forced path.</item>
-    /// <item><c>none</c> — no parser, so nothing the model emits is reported as <c>tool_use</c>.</item>
-    /// </list>
-    /// A caller-supplied <c>response_format</c> does not exist on this surface, so the constraint
-    /// slot is always free.
-    /// </remarks>
-    /// <param name="toolChoice">The parsed Anthropic <c>tool_choice</c>.</param>
-    /// <param name="tools">The tool definitions the request supplied, if any.</param>
-    /// <param name="modelParser">The model's own tool-call parser, if the model has one.</param>
-    /// <param name="options">Inference options; a decoding constraint is installed on them.</param>
-    /// <param name="forcedToolCall">
-    /// True when decoding was constrained, i.e. the whole completion IS the tool call and none
-    /// of it is assistant text.
-    /// </param>
     internal static IToolCallParser? ApplyToolChoice(
         ToolChoice toolChoice,
         ToolDefinition[]? tools,
         IToolCallParser? modelParser,
         ref DotLLM.Core.Configuration.InferenceOptions options,
         out bool forcedToolCall)
-    {
-        forcedToolCall = false;
-        if (tools is not { Length: > 0 })
-            return null;
-        if (toolChoice is ToolChoice.None)
-            return null;
-        if (modelParser is null)
-            return null;
-
-        string argumentsKey = modelParser is LlamaToolCallParser ? "parameters" : "arguments";
-        var schema = toolChoice switch
-        {
-            ToolChoice.Required => ToolCallSchemaBuilder.BuildForRequired(tools, argumentsKey),
-            ToolChoice.Function fn when Array.Find(tools, t => t.Name == fn.Name) is { } target =>
-                ToolCallSchemaBuilder.BuildForFunction(target, argumentsKey),
-            _ => null,
-        };
-        if (schema is null)
-            return modelParser;
-
-        options = options with
-        {
-            ResponseFormat = new DotLLM.Core.Configuration.ResponseFormat.JsonSchema
-            {
-                Schema = schema,
-                Name = "tool_call",
-            },
-        };
-        forcedToolCall = true;
-        return ToolCallParserFactory.ForToolChoice(toolChoice, modelParser);
-    }
+        => ToolChoiceBinder.Apply(toolChoice, tools, modelParser, ref options, out forcedToolCall);
 
     private static async Task HandleNonStreamingAsync(
         AnthropicMessagesRequest request,
