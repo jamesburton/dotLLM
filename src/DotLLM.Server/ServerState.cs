@@ -198,13 +198,48 @@ public sealed class ServerState : IDisposable
     public CancellationToken ShutdownToken { get; set; } = CancellationToken.None;
 
     /// <summary>
-    /// Executes a request with sequential access control.
-    /// Only one request is processed at a time (Step 35 adds batching).
+    /// Executes a request with sequential access control: one direct-generator request at a time,
+    /// and never concurrently with a continuous-batch scheduler step.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>The request gate alone is not enough (#461).</b> When a scheduler is running it drives
+    /// forward passes on the same model from its own background loop, deliberately <i>outside</i>
+    /// this gate — batching is the whole point. The model's scratch buffers are shared mutable
+    /// state, so a direct-generator forward running beside a scheduler step is not a numerical
+    /// wobble: it tears down the shared <c>ComputeThreadPool</c> and the process dies with
+    /// <c>CountdownEvent ... below zero</c>.
+    /// </para>
+    /// <para>
+    /// The scheduler lease is therefore taken here, inside the gate, rather than left to each
+    /// caller to remember — which is the follow-up #461 asked for. Every direct forward in the
+    /// server already routes through this method, so the protection is now structural instead of
+    /// a convention: <b>streaming chat and completions always take the direct-generator path</b>,
+    /// so before this they raced the loop on every request that overlapped a batched one.
+    /// </para>
+    /// <para>
+    /// <b>Cost, stated:</b> the lease is held for the whole of <paramref name="work"/>, so a long
+    /// streaming generation stalls in-flight batched requests for its duration. That is the
+    /// correct trade — the two cannot run at once in any case — but it is a real throughput change
+    /// for a mixed workload, not a free fix. Callers that need finer granularity should take the
+    /// lease themselves around the forward only.
+    /// </para>
+    /// <para>
+    /// Lock order is gate-then-lease, matching what the embeddings path already documented. Never
+    /// acquire them the other way round, and never call this from inside a held lease — the
+    /// semaphores are not reentrant.
+    /// </para>
+    /// </remarks>
     public async Task ExecuteAsync(Func<Task> work, CancellationToken ct)
     {
         await _requestGate.WaitAsync(ct);
-        try { await work(); }
+        try
+        {
+            using var lease = Scheduler is { } scheduler
+                ? await scheduler.AcquireModelAsync(ct)
+                : null;
+            await work();
+        }
         finally { _requestGate.Release(); }
     }
 
