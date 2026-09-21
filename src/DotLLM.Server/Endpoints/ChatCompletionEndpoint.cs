@@ -209,7 +209,7 @@ public static class ChatCompletionEndpoint
         {
             var enriched = ToolCallDetector.DetectToolCalls(result, state.ToolCallParser);
             text = enriched.Text;
-            toolCalls = enriched.ToolCalls;
+            toolCalls = ApplyParallelToolCalls(enriched.ToolCalls, request.ParallelToolCalls);
             finishReason = enriched.FinishReason;
         }
 
@@ -332,7 +332,7 @@ public static class ChatCompletionEndpoint
         ToolCall[]? toolCalls = null;
         if (state.ToolCallParser is not null && tools is { Length: > 0 })
         {
-            toolCalls = state.ToolCallParser.TryParse(text);
+            toolCalls = ApplyParallelToolCalls(state.ToolCallParser.TryParse(text), request.ParallelToolCalls);
             if (toolCalls is { Length: > 0 })
                 finishReason = FinishReason.ToolCalls;
         }
@@ -380,10 +380,44 @@ public static class ChatCompletionEndpoint
         };
         await WriteSseChunk(httpContext, finalChunk, ct);
 
+        // stream_options.include_usage (#450): OpenAI closes the stream with a usage-only chunk
+        // (choices: []). The finish_reason chunk above also carries usage as a long-standing
+        // dotLLM extension; this adds the shape the SDKs actually look for, without removing it.
+        if (request.WantsUsageChunk)
+            await WriteSseChunk(httpContext, BuildUsageChunk(requestId, modelId, promptTokens, completionTokens), ct);
+
         // [DONE] sentinel
         await httpContext.Response.WriteAsync("data: [DONE]\n\n", ct);
         await httpContext.Response.Body.FlushAsync(ct);
     }
+
+    /// <summary>
+    /// Builds OpenAI's final usage chunk (#450): <c>usage</c> populated, <c>choices</c> empty.
+    /// SDKs tell it apart from a content chunk by exactly that empty array, so the shape is
+    /// load-bearing and not merely cosmetic.
+    /// </summary>
+    internal static ChatCompletionChunk BuildUsageChunk(
+        string requestId, string modelId, int promptTokens, int completionTokens) =>
+        new()
+        {
+            Id = requestId,
+            Model = modelId,
+            Choices = [],
+            Usage = new UsageDto
+            {
+                PromptTokens = promptTokens,
+                CompletionTokens = completionTokens,
+                TotalTokens = promptTokens + completionTokens,
+            },
+        };
+
+    /// <summary>
+    /// Enforces <c>parallel_tool_calls: false</c> (#450) by keeping at most the first detected
+    /// call. Nothing constrains the model during decode, so the cap is applied on the way out.
+    /// Null/true (the OpenAI default) passes the calls through untouched.
+    /// </summary>
+    internal static ToolCall[]? ApplyParallelToolCalls(ToolCall[]? toolCalls, bool? parallelToolCalls) =>
+        parallelToolCalls == false && toolCalls is { Length: > 1 } ? [toolCalls[0]] : toolCalls;
 
     private static async Task WriteSseChunk(HttpContext ctx, ChatCompletionChunk chunk, CancellationToken ct)
     {
@@ -596,6 +630,13 @@ public static class ChatCompletionEndpoint
             },
         };
         await WriteSseChunk(httpContext, finalChunk, ct);
+
+        // stream_options.include_usage (#450) — same closing shape as the autoregressive path.
+        if (request.WantsUsageChunk)
+        {
+            await WriteSseChunk(httpContext, BuildUsageChunk(
+                requestId, modelId, result.PromptTokenCount, result.GeneratedTokenCount), ct);
+        }
 
         await httpContext.Response.WriteAsync("data: [DONE]\n\n", ct);
         await httpContext.Response.Body.FlushAsync(ct);
