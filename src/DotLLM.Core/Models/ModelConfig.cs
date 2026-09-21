@@ -196,6 +196,13 @@ public record ModelConfig
     public string? ChatTemplate { get; init; }
 
     /// <summary>
+    /// Sequence-pooling strategy declared by the checkpoint (GGUF <c>{arch}.pooling_type</c>).
+    /// Null when the checkpoint does not declare one — which is the case for every ordinary
+    /// generative decoder. Consumed by the embeddings path (issue #451); ignored elsewhere.
+    /// </summary>
+    public PoolingType? PoolingType { get; init; }
+
+    /// <summary>
     /// Layer indices that skip RoPE entirely (NoPE — "no positional encoding").
     /// Null or empty means every layer applies RoPE per the standard
     /// <see cref="RoPEConfig"/>. SmolLM3 ships a sparse pattern
