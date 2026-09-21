@@ -135,19 +135,12 @@ public static class EmbeddingsEndpoint
 
         try
         {
-            // Two locks, both needed. ExecuteAsync serialises against the direct-generator path;
-            // the scheduler lease serialises against the continuous-batch run loop, which drives
-            // forward passes on this same model OUTSIDE the request gate. Either alone leaves the
-            // model's shared scratch buffers exposed to a concurrent forward - and that is not a
-            // subtle numerical wobble: with the lease removed, a generation running alongside an
-            // embedding tears down the shared ComputeThreadPool and the process dies. The lease is
-            // taken inside the gate so the two are always acquired in the same order.
+            // Both locks are still needed and both are still taken -- ExecuteAsync now acquires
+            // the scheduler lease itself (#461 follow-up), so this endpoint no longer takes it
+            // separately. Re-adding an inner AcquireModelAsync here would self-deadlock: the
+            // semaphore is not reentrant.
             await state.ExecuteAsync(async () =>
             {
-                using var lease = state.Scheduler is { } scheduler
-                    ? await scheduler.AcquireModelAsync(ct)
-                    : null;
-
                 for (int i = 0; i < sequences.Count; i++)
                 {
                     ct.ThrowIfCancellationRequested();
