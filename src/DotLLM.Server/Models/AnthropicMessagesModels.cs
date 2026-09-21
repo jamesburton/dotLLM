@@ -64,6 +64,24 @@ public sealed record AnthropicMessagesRequest
     /// <summary>Opaque request metadata (e.g. <c>user_id</c>). Accepted and ignored.</summary>
     [JsonPropertyName("metadata")]
     public JsonElement? Metadata { get; init; }
+
+    /// <summary>
+    /// Extended-thinking configuration (<c>{"type":"enabled","budget_tokens":N}</c> or
+    /// <c>{"type":"disabled"}</c>). Accepted so SDK callers are not rejected; dotLLM
+    /// emits no <c>thinking</c> content blocks today (#449).
+    /// </summary>
+    [JsonPropertyName("thinking")]
+    public JsonElement? Thinking { get; init; }
+}
+
+/// <summary>
+/// Response of <c>POST /v1/messages/count_tokens</c>: the number of input tokens the
+/// same request body would consume on <c>POST /v1/messages</c>.
+/// </summary>
+public sealed record AnthropicCountTokensResponse
+{
+    [JsonPropertyName("input_tokens")]
+    public int InputTokens { get; init; }
 }
 
 /// <summary>

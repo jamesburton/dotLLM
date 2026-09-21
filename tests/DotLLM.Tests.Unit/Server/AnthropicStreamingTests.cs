@@ -189,4 +189,84 @@ public sealed class AnthropicStreamingTests
             frames.Single(f => f.Event == "message_delta").Data.GetProperty("delta")
                   .GetProperty("stop_reason").GetString());
     }
+
+    // --- protocol invariants the official SDK relies on ----------------------
+
+    [Fact]
+    public async Task Streaming_EveryFrameCarriesATypeMatchingItsEventName()
+    {
+        // anthropic/_streaming.py dispatches on the SSE `event:` name and only fills in
+        // `data.type` when the payload omits it — a payload whose `type` disagreed with the
+        // event name would be routed as one event and parsed as another.
+        var parser = new FixedToolCallParser([new ToolCall("toolu_1", "get_weather", "{}")]);
+        var frames = await RunAsync(Tokens(("hi", FinishReason.Stop)), parser);
+
+        foreach (var frame in frames)
+            Assert.Equal(frame.Event, frame.Data.GetProperty("type").GetString());
+    }
+
+    [Fact]
+    public async Task Streaming_MessageStartIsFirstAndMessageStopIsLast()
+    {
+        // accumulate_event() raises "Unexpected event order" for anything before message_start.
+        var frames = await RunAsync(Tokens(("hi", FinishReason.Stop)));
+
+        Assert.Equal("message_start", frames[0].Event);
+        Assert.Equal("message_stop", frames[^1].Event);
+        Assert.Single(frames, f => f.Event == "message_start");
+        Assert.Single(frames, f => f.Event == "message_stop");
+    }
+
+    // --- mid-stream failure --------------------------------------------------
+
+    private static async IAsyncEnumerable<GenerationToken> ThrowingTokens(int okTokens)
+    {
+        for (int i = 0; i < okTokens; i++)
+        {
+            await Task.Yield();
+            yield return new GenerationToken(0, "tok", null);
+        }
+        await Task.Yield();
+        throw new InvalidOperationException("backend exploded");
+    }
+
+    [Fact]
+    public async Task Streaming_FailureAfterMessageStart_EmitsAnErrorEvent()
+    {
+        // Status headers are already flushed, so the only way to report the failure is the
+        // Anthropic stream protocol's named `error` event; the SDK turns it into an
+        // APIStatusError. Without it the client sees a truncated stream (#449).
+        var frames = await RunAsync(ThrowingTokens(okTokens: 2));
+
+        var error = Assert.Single(frames, f => f.Event == "error");
+        Assert.Equal("error", error.Data.GetProperty("type").GetString());
+        Assert.Equal("api_error", error.Data.GetProperty("error").GetProperty("type").GetString());
+        Assert.Contains("backend exploded",
+            error.Data.GetProperty("error").GetProperty("message").GetString()!);
+
+        // A failed stream must not also claim to have finished normally.
+        Assert.DoesNotContain(frames, f => f.Event == "message_delta");
+        Assert.DoesNotContain(frames, f => f.Event == "message_stop");
+        Assert.Equal("error", frames[^1].Event);
+
+        // Whatever was generated before the failure still reached the client.
+        Assert.Equal(2, frames.Count(f => f.Event == "content_block_delta"));
+    }
+
+    [Fact]
+    public async Task Streaming_ClientDisconnect_DoesNotEmitAnErrorEvent()
+    {
+        // A cancelled request is not a server error; the SDK would surface a spurious
+        // APIStatusError for a stream the caller itself abandoned.
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => RunAsync(CancelledTokens()));
+    }
+
+    private static async IAsyncEnumerable<GenerationToken> CancelledTokens()
+    {
+        await Task.Yield();
+        yield return new GenerationToken(0, "tok", null);
+        await Task.Yield();
+        throw new OperationCanceledException();
+    }
 }

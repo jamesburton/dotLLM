@@ -19,9 +19,10 @@ namespace DotLLM.Server.Endpoints;
 /// shape differs. Reference: <c>https://docs.anthropic.com/en/api/messages</c>.
 /// </para>
 /// <para>
-/// Fork-only feature (#448). Follow-on compatibility work — <c>/v1/messages/count_tokens</c>,
-/// the <c>anthropic-version</c>/<c>anthropic-beta</c> headers and extended-thinking blocks —
-/// is tracked separately in #449 and deliberately not implemented here.
+/// Fork-only feature (#448), completed by #449: <c>POST /v1/messages/count_tokens</c>, the
+/// <c>anthropic-version</c>/<c>anthropic-beta</c> headers, a mid-stream <c>error</c> event and
+/// input-side <c>thinking</c>/<c>redacted_thinking</c> blocks. dotLLM does not itself emit
+/// extended-thinking output blocks — see <c>docs/ANTHROPIC_API.md</c>.
 /// </para>
 /// </remarks>
 public static class MessagesEndpoint
@@ -29,16 +30,31 @@ public static class MessagesEndpoint
     private static readonly string[] CommonStopSequences =
         ["<|im_end|>", "<|eot_id|>", "<|eom_id|>", "<|end|>", "</s>", "</tool_call>"];
 
-    /// <summary>Maps <c>POST /v1/messages</c> onto <paramref name="app"/>.</summary>
-    /// <param name="app">The web application to map the route on.</param>
-    public static void Map(WebApplication app) =>
+    /// <summary>
+    /// Maps <c>POST /v1/messages</c> and <c>POST /v1/messages/count_tokens</c>
+    /// onto <paramref name="app"/>.
+    /// </summary>
+    /// <param name="app">The web application to map the routes on.</param>
+    public static void Map(WebApplication app)
+    {
         app.MapPost("/v1/messages", HandleAsync);
+        app.MapPost("/v1/messages/count_tokens", HandleCountTokensAsync);
+    }
 
     private static async Task HandleAsync(
         AnthropicMessagesRequest request,
         ServerState state,
         HttpContext httpContext)
     {
+        // anthropic-version / anthropic-beta are checked before anything else: a request pinned
+        // to a version dotLLM does not implement must not load a model as a side effect (#449).
+        var headerError = AnthropicHeaders.Validate(httpContext.Request.Headers);
+        if (headerError is not null)
+        {
+            await WriteErrorAsync(httpContext, 400, "invalid_request_error", headerError);
+            return;
+        }
+
         // (#369) Activate the requested model, mirroring the OpenAI surface: a cheap field-swap
         // when already resident, a lazy reload when it idled out, a fresh load otherwise.
         // Anthropic has no `keep_alive` request field, so the per-model override is left alone.
@@ -81,15 +97,7 @@ public static class MessagesEndpoint
         var modelId = state.Options.ModelId;
         var generator = state.Generator;
 
-        var messages = AnthropicConverter.ToMessages(request);
-        var tools = AnthropicConverter.ToTools(request.Tools);
-
-        var templateOptions = new ChatTemplateOptions
-        {
-            AddGenerationPrompt = true,
-            Tools = tools,
-        };
-        string prompt = state.ChatTemplate.Apply(messages, templateOptions);
+        string prompt = BuildPrompt(request, state, out var tools);
 
         int maxTokens = request.MaxTokens ?? state.SamplingDefaults.MaxTokens;
         var promptError = RequestValidator.ValidatePromptLength(
@@ -279,27 +287,46 @@ public static class MessagesEndpoint
         FinishReason finishReason = FinishReason.Length;
         int completionTokens = 0;
 
-        await execute(async () =>
+        try
         {
-            await foreach (var token in tokenSource(ct))
+            await execute(async () =>
             {
-                if (token.Text.Length > 0)
+                await foreach (var token in tokenSource(ct))
                 {
-                    completionTokens++;
-                    sb.Append(token.Text);
-                    await WriteEventAsync(httpContext, "content_block_delta",
-                        new AnthropicContentBlockDeltaEvent
-                        {
-                            Index = 0,
-                            Delta = new AnthropicStreamDeltaDto { Type = "text_delta", Text = token.Text },
-                        },
-                        ServerJsonContext.Default.AnthropicContentBlockDeltaEvent, ct);
-                }
+                    if (token.Text.Length > 0)
+                    {
+                        completionTokens++;
+                        sb.Append(token.Text);
+                        await WriteEventAsync(httpContext, "content_block_delta",
+                            new AnthropicContentBlockDeltaEvent
+                            {
+                                Index = 0,
+                                Delta = new AnthropicStreamDeltaDto { Type = "text_delta", Text = token.Text },
+                            },
+                            ServerJsonContext.Default.AnthropicContentBlockDeltaEvent, ct);
+                    }
 
-                if (token.FinishReason.HasValue)
-                    finishReason = token.FinishReason.Value;
-            }
-        }, ct);
+                    if (token.FinishReason.HasValue)
+                        finishReason = token.FinishReason.Value;
+                }
+            }, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // The headers and message_start are already on the wire, so there is no status code
+            // left to set. The Anthropic stream protocol covers exactly this: a named `error`
+            // event carrying the usual envelope, which the SDK turns back into an APIStatusError.
+            // Without it the client sees a truncated stream and reports a parse/connection error
+            // instead of the failure (#449).
+            await WriteEventAsync(httpContext, "error",
+                new AnthropicErrorResponse
+                {
+                    Error = new AnthropicErrorBody { Type = "api_error", Message = ex.Message },
+                },
+                ServerJsonContext.Default.AnthropicErrorResponse, ct);
+            await httpContext.Response.Body.FlushAsync(ct);
+            return;
+        }
 
         // Close the text block.
         await WriteEventAsync(httpContext, "content_block_stop",
@@ -383,7 +410,12 @@ public static class MessagesEndpoint
     /// <summary>Validates the structural invariants of an Anthropic Messages request.</summary>
     /// <param name="request">The deserialized request body.</param>
     /// <returns>An error message, or <see langword="null"/> when the request is well-formed.</returns>
-    internal static string? ValidateRequest(AnthropicMessagesRequest request)
+    /// <param name="requireMaxTokens">
+    /// True on <c>/v1/messages</c>, where <c>max_tokens</c> is a required field; false on
+    /// <c>/v1/messages/count_tokens</c>, whose request body has no <c>max_tokens</c> at all
+    /// (see <c>MessageCountTokensParams</c> in the official SDK).
+    /// </param>
+    internal static string? ValidateRequest(AnthropicMessagesRequest request, bool requireMaxTokens = true)
     {
         if (request.Messages is null || request.Messages.Length == 0)
             return "messages: at least one message is required";
@@ -391,10 +423,11 @@ public static class MessagesEndpoint
         if (request.Messages.Length > RequestValidator.MaxMessages)
             return $"messages: array exceeds maximum of {RequestValidator.MaxMessages}";
 
-        // max_tokens is a required field of the Anthropic Messages API (unlike OpenAI's).
-        if (!request.MaxTokens.HasValue)
+        // max_tokens is a required field of the Anthropic Messages API (unlike OpenAI's),
+        // but it is absent from the count_tokens body — hence the flag.
+        if (requireMaxTokens && !request.MaxTokens.HasValue)
             return "max_tokens: field required";
-        if (request.MaxTokens.Value <= 0)
+        if (request.MaxTokens.HasValue && request.MaxTokens.Value <= 0)
             return "max_tokens: must be a positive integer";
 
         // Roles and content kinds are checked here rather than left to the converter:
@@ -413,9 +446,122 @@ public static class MessagesEndpoint
 
             if (msg.Content.ValueKind is not (JsonValueKind.String or JsonValueKind.Array))
                 return $"messages[{i}].content: must be a string or an array of content blocks";
+
+            if (msg.Content.ValueKind == JsonValueKind.Array)
+            {
+                string? blockError = ValidateContentBlocks(msg.Content, i);
+                if (blockError is not null)
+                    return blockError;
+            }
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Rejects content blocks this surface cannot represent.
+    /// </summary>
+    /// <remarks>
+    /// The converter understands <c>text</c>, <c>tool_use</c> and <c>tool_result</c>, and
+    /// deliberately drops <c>thinking</c>/<c>redacted_thinking</c> (they carry no prompt content
+    /// dotLLM can replay). Anything else — <c>image</c>, <c>document</c>, a typo — would be
+    /// silently dropped, and a dropped image means the model answers about a picture it never
+    /// saw. The real API rejects an unknown block type, so dotLLM does too (#449).
+    /// </remarks>
+    private static string? ValidateContentBlocks(JsonElement content, int messageIndex)
+    {
+        int b = 0;
+        foreach (var block in content.EnumerateArray())
+        {
+            if (block.ValueKind != JsonValueKind.Object)
+                return $"messages[{messageIndex}].content[{b}]: must be an object";
+
+            string? type = block.TryGetProperty("type", out var t) && t.ValueKind == JsonValueKind.String
+                ? t.GetString()
+                : null;
+            if (type is null)
+                return $"messages[{messageIndex}].content[{b}].type: field required";
+
+            if (Array.IndexOf(SupportedContentBlockTypes, type) < 0)
+                return $"messages[{messageIndex}].content[{b}].type: unsupported content block type '{type}'";
+
+            b++;
+        }
+        return null;
+    }
+
+    // Input block types this surface accepts. thinking/redacted_thinking are accepted and then
+    // dropped, so a client replaying an extended-thinking transcript is not rejected.
+    private static readonly string[] SupportedContentBlockTypes =
+        ["text", "tool_use", "tool_result", "thinking", "redacted_thinking"];
+
+    /// <summary>
+    /// Builds the prompt for an Anthropic request: message flattening, tool definitions and the
+    /// chat template. Shared by <c>/v1/messages</c> and <c>/v1/messages/count_tokens</c> so the
+    /// count the latter reports cannot drift from the prompt the former actually runs.
+    /// </summary>
+    private static string BuildPrompt(
+        AnthropicMessagesRequest request, ServerState state, out ToolDefinition[]? tools)
+    {
+        var messages = AnthropicConverter.ToMessages(request);
+        tools = AnthropicConverter.ToTools(request.Tools);
+        return state.ChatTemplate!.Apply(messages, new ChatTemplateOptions
+        {
+            AddGenerationPrompt = true,
+            Tools = tools,
+        });
+    }
+
+    /// <summary>
+    /// Handles <c>POST /v1/messages/count_tokens</c>: the number of input tokens the same body
+    /// would consume on <c>POST /v1/messages</c>, without generating anything.
+    /// </summary>
+    /// <remarks>
+    /// The count is <c>ITokenizer.CountTokens</c> over the templated prompt — the same value
+    /// <see cref="RequestValidator.ValidatePromptLength"/> computes for the generating route, so
+    /// <c>count_tokens(body).input_tokens</c> matches <c>messages.create(body).usage.input_tokens</c>.
+    /// Unlike the generating route this needs only the tokenizer and the template, so the
+    /// diffusion-model refusal does not apply.
+    /// </remarks>
+    internal static async Task HandleCountTokensAsync(
+        AnthropicMessagesRequest request,
+        ServerState state,
+        HttpContext httpContext)
+    {
+        var headerError = AnthropicHeaders.Validate(httpContext.Request.Headers);
+        if (headerError is not null)
+        {
+            await WriteErrorAsync(httpContext, 400, "invalid_request_error", headerError);
+            return;
+        }
+
+        var activationError = await state.EnsureActiveAsync(
+            request.Model, keepAliveOverride: null, httpContext.RequestAborted);
+        if (activationError is not null)
+        {
+            await WriteErrorAsync(httpContext, 400, "invalid_request_error", activationError);
+            return;
+        }
+
+        if (!state.IsReady || state.ChatTemplate is null || state.Tokenizer is null)
+        {
+            await WriteErrorAsync(httpContext, 503, "api_error", "No model loaded");
+            return;
+        }
+
+        var validationError = ValidateRequest(request, requireMaxTokens: false);
+        if (validationError is not null)
+        {
+            await WriteErrorAsync(httpContext, 400, "invalid_request_error", validationError);
+            return;
+        }
+
+        string prompt = BuildPrompt(request, state, out _);
+        var response = new AnthropicCountTokensResponse { InputTokens = state.Tokenizer.CountTokens(prompt) };
+
+        httpContext.Response.ContentType = "application/json";
+        await JsonSerializer.SerializeAsync(httpContext.Response.Body, response,
+            ServerJsonContext.Default.AnthropicCountTokensResponse, httpContext.RequestAborted);
     }
 
     /// <summary>
