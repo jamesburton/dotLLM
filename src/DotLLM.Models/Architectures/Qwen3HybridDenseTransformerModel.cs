@@ -1843,10 +1843,21 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             var logits = logitsArr.AsSpan(0, vocabSize);
 
             // ── Embed predicted-from token, combine with pending trunk/MTP hidden state ──
+            bool usesTrunkEmbed = mtpHead.EmbedTokensWeight is null;
             EmbedOneToken(tokenId,
                 mtpHead.EmbedTokensWeight ?? _tokenEmbedWeight,
                 mtpHead.EmbedTokensWeight is not null ? mtpHead.EmbedTokensQuantType : _tokenEmbedQuantType,
                 tokEmbed, hiddenSize);
+
+            // PrismML Hadamard fold (#435): the MTP head falls back to the trunk's own
+            // token_embd.weight whenever the checkpoint ships no nextn.embed_tokens — and on a
+            // folded checkpoint (Bonsai 2) that table is in prism.hadamard.inverse_weight_names,
+            // i.e. it stores ROTATED rows. EmbedTokens restores the primal basis right after the
+            // lookup; this path must do the same or every MTP draft step runs on garbage. The MTP
+            // block's own nextn.embed_tokens (when present) is NOT folded, so it stays untouched.
+            if (usesTrunkEmbed && _hadamard is { } embRot)
+                fixed (float* tokEmbedPtr = tokEmbed)
+                    embRot.RotateInverseInPlace(tokEmbedPtr, 1, hiddenSize);
 
             RmsNorm.Execute(tokEmbed, mtpHead.EnormWeight, eps, eNorm);
             RmsNorm.Execute(state.PendingHidden, mtpHead.HnormWeight, eps, hNorm);
@@ -1944,14 +1955,43 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             float[] headNormWeight = mtpHead.SharedHeadNormWeight ?? _outputNormWeight;
             RmsNorm.Execute(cur, headNormWeight, eps, normedHead);
 
+            bool usesTrunkHead = mtpHead.SharedHeadHeadWeight is null;
             nint headWeight = mtpHead.SharedHeadHeadWeight ?? _outputWeight;
             QuantizationType headQt = mtpHead.SharedHeadHeadWeight is not null
                 ? mtpHead.SharedHeadHeadQuantType : _outputQuantType;
             int headOutputDim = mtpHead.SharedHeadHeadWeight is not null ? vocabSize : _outputOutputDim;
             int headInputDim = mtpHead.SharedHeadHeadWeight is not null ? hiddenSize : _outputInputDim;
 
+            // PrismML Hadamard fold (#435), the mirror of the embedding case above: falling back
+            // to the trunk's own output.weight means falling back to a FOLDED matrix (it is the
+            // first entry of prism.hadamard.weight_names), so its input needs the forward rotation
+            // exactly as the trunk's own lm_head does. A head-local nextn.shared_head_head is not
+            // folded and takes the unrotated input.
             fixed (float* normedHeadPtr = normedHead, logitsPtr = logits)
-                Gemm(headWeight, headQt, normedHeadPtr, logitsPtr, headOutputDim, headInputDim, 1);
+            {
+                float* headInPtr = normedHeadPtr;
+                float[]? headRotArr = null;
+                try
+                {
+                    if (usesTrunkHead && _hadamard is { } headRot)
+                    {
+                        headRotArr = pool.Rent(headInputDim);
+                        fixed (float* headRotPtr = headRotArr)
+                        {
+                            headRot.RotateForward(normedHeadPtr, headRotPtr, 1, headInputDim);
+                            Gemm(headWeight, headQt, headRotPtr, logitsPtr, headOutputDim, headInputDim, 1);
+                        }
+                    }
+                    else
+                    {
+                        Gemm(headWeight, headQt, headInPtr, logitsPtr, headOutputDim, headInputDim, 1);
+                    }
+                }
+                finally
+                {
+                    if (headRotArr is not null) pool.Return(headRotArr);
+                }
+            }
 
             var shape = new TensorShape(1, vocabSize);
             var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
