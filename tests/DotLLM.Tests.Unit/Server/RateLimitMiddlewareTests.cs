@@ -113,11 +113,15 @@ public class RateLimitMiddlewareTests
                 "Retry-After must be a positive integer seconds value.");
             Assert.Equal("Requests", rejected.Response.Headers["X-RateLimit-Limiter"].ToString());
 
-            // Body is a JSON ErrorResponse with the rejected limiter named.
+            // Body is the SDK-shaped error envelope (#452) with the rejected limiter named.
+            // `error` must be an OBJECT: the official SDKs read .type/.code off it, and the flat
+            // {"error": "<string>"} form this server used to emit gives them nothing to classify.
             rejected.Response.Body.Position = 0;
             using var doc = await JsonDocument.ParseAsync(rejected.Response.Body);
             Assert.True(doc.RootElement.TryGetProperty("error", out var errProp));
-            Assert.Contains("requests-per-minute", errProp.GetString()!, StringComparison.Ordinal);
+            Assert.Equal(JsonValueKind.Object, errProp.ValueKind);
+            Assert.Equal("rate_limit_error", errProp.GetProperty("type").GetString());
+            Assert.Contains("requests-per-minute", errProp.GetProperty("message").GetString()!, StringComparison.Ordinal);
         }
     }
 

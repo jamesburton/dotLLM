@@ -26,7 +26,7 @@ public static class CompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = activationError },
+                ErrorResponse.InvalidRequest(activationError, param: "model", code: "model_not_found"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -37,7 +37,7 @@ public static class CompletionEndpoint
         {
             httpContext.Response.StatusCode = 503;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = "No model loaded" },
+                ErrorResponse.Internal("No model loaded", code: "model_not_loaded"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -50,7 +50,7 @@ public static class CompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = validationError },
+                ErrorResponse.InvalidRequest(validationError),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -70,7 +70,7 @@ public static class CompletionEndpoint
             {
                 httpContext.Response.StatusCode = 400;
                 await httpContext.Response.WriteAsJsonAsync(
-                    new ErrorResponse { Error = $"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first." },
+                    ErrorResponse.InvalidRequest($"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first.", param: "prefix_id"),
                     ServerJsonContext.Default.ErrorResponse,
                     contentType: null,
                     httpContext.RequestAborted);
@@ -88,7 +88,7 @@ public static class CompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = ex.Message },
+                ErrorResponse.InvalidRequest(ex.Message, param: "lora_adapter"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -104,7 +104,7 @@ public static class CompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = promptError },
+                ErrorResponse.InvalidRequest(promptError, param: "prompt", code: "context_length_exceeded"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);

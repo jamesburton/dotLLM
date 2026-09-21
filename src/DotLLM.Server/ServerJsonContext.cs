@@ -27,6 +27,7 @@ namespace DotLLM.Server;
 [JsonSerializable(typeof(LogprobsDto))]
 [JsonSerializable(typeof(ModelInspectResponse))]
 [JsonSerializable(typeof(ErrorResponse))]
+[JsonSerializable(typeof(ErrorDetail))]
 [JsonSerializable(typeof(StatusResponse))]
 [JsonSerializable(typeof(LoraLoadRequest))]
 [JsonSerializable(typeof(LoraLoadResponse))]

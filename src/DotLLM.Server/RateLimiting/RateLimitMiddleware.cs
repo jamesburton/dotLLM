@@ -207,10 +207,11 @@ public sealed class RateLimitMiddleware
             LimiterKind.Concurrency => "max-concurrent",
             _ => "rate-limit",
         };
-        var body = new ErrorResponse
-        {
-            Error = $"Rate limit exceeded ({reason}). Retry in {result.RetryAfter}s.",
-        };
+        // SDK-shaped envelope (#452): the official clients classify a failure from `error.type`,
+        // so a flat string here leaves a 429 indistinguishable from any other error.
+        var body = ErrorResponse.RateLimit(
+            $"Rate limit exceeded ({reason}). Retry in {result.RetryAfter}s.",
+            code: reason);
         context.Response.ContentType = "application/json";
         await JsonSerializer.SerializeAsync(
             context.Response.Body, body,
