@@ -185,6 +185,16 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [Description("Total byte budget across all resident models. 0 (default) = unlimited, only --max-resident-models bounds residency.")]
         [DefaultValue(0L)]
         public long ResidentMemoryBudgetBytes { get; set; }
+
+        /// <summary>Enables the #454 model-administration write endpoints (off by default).</summary>
+        [CommandOption("--allow-model-admin")]
+        [Description("Enable the model-administration API (#454): POST /v1/models/unload, /pull, /enable, /disable and PUT /v1/settings. Off by default.")]
+        public bool AllowModelAdmin { get; set; }
+
+        /// <summary>Enables the LoRA admin write endpoints (off by default).</summary>
+        [CommandOption("--allow-lora-admin")]
+        [Description("Enable the LoRA admin API: POST /v1/lora/load and DELETE /v1/lora/{name}. Off by default.")]
+        public bool AllowLoraAdmin { get; set; }
     }
 
     /// <inheritdoc/>
@@ -217,6 +227,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             KeepAliveSeconds = settings.KeepAlive,
             MaxResidentModels = settings.MaxResidentModels,
             ResidentMemoryBudgetBytes = settings.ResidentMemoryBudgetBytes,
+            AllowModelAdminApi = settings.AllowModelAdmin,
+            AllowLoraAdminApi = settings.AllowLoraAdmin,
             ModelId = "none",
             RopeOverride = ServerOptions.BuildRopeOverride(settings.RopeScaling, settings.RopeFreqBase,
                 settings.RopeScale, settings.YarnOrigCtx, settings.YarnAttnFactor,
