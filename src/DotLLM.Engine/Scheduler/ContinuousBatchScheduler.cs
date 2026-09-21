@@ -1310,8 +1310,9 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                     // token would eat real output ("ld<|im_end|>" losing "ld"). Keep it and trim the
                     // matched suffix off the decoded text in CompleteSequence. Token-level stops
                     // (EOS) keep the original exclude-the-token semantics.
-                    if (StopSuffixTrimmer.MatchedSuffixLength(tail, seq.StopConditions) > 0)
-                        seq.StoppedOnStopString = true;
+                    string? matched = StopSuffixTrimmer.MatchedSuffix(tail, seq.StopConditions);
+                    if (matched is not null)
+                        seq.MatchedStopSequence = matched;
                     else
                         seq.GeneratedTokens.RemoveAt(seq.GeneratedTokens.Count - 1);
                 }
@@ -1332,7 +1333,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
 
         // The stop string itself is not part of the output (#459). Trimmed at the character
         // boundary so a token whose text only ends with the stop string keeps its prefix.
-        if (seq.StoppedOnStopString)
+        if (seq.MatchedStopSequence is not null)
             text = StopSuffixTrimmer.TrimMatchedSuffix(text, seq.StopConditions);
 
         long kvBytes = seq.KvCache is not null ? TextGenerator.GetKvCacheBytes(seq.KvCache) : 0;
@@ -1353,6 +1354,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             PromptTokenCount = seq.PromptLength,
             GeneratedTokenCount = seq.GeneratedTokens.Count,
             Timings = timings,
+            MatchedStopSequence = seq.MatchedStopSequence,
         };
 
         RecordPerKeyTokens(seq.Request.ApiKey, seq.GeneratedTokens.Count);

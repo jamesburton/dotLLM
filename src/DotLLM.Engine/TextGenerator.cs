@@ -1522,8 +1522,12 @@ public sealed class TextGenerator
         // contain a partial overlap with the stop string (e.g. last token decodes to
         // "ld<|im_end|>", stop string "<|im_end|>"). Trim at the char boundary so the
         // returned text preserves the "ld" prefix and excludes the matched suffix.
+        string? matchedStop = null;
         if (stopConditionsForSuffixTrim is not null && finishReason == FinishReason.Stop)
         {
+            // Capture WHICH stop string matched before trimming it away — afterwards the text no
+            // longer carries the evidence, and the Anthropic stop_sequence mapping needs it (#459).
+            matchedStop = StopSuffixTrimmer.MatchedSuffix(text.AsSpan(), stopConditionsForSuffixTrim);
             text = StopSuffixTrimmer.TrimMatchedSuffix(text, stopConditionsForSuffixTrim);
         }
 
@@ -1536,6 +1540,7 @@ public sealed class TextGenerator
             GeneratedTokenCount = generatedIds.Count,
             Timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvCacheBytes, cachedTokenCount, specDrafted, specAccepted),
             Logprobs = logprobs,
+            MatchedStopSequence = matchedStop,
         };
     }
 

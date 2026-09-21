@@ -188,9 +188,10 @@ public static class MessagesEndpoint
 
         // Determine whether a caller-supplied stop sequence ended generation, and strip it.
         bool matchedStopSequence = false;
+        string? engineStopMatch = null;
         if (finishReason == FinishReason.Stop)
             text = StripAndDetectStopSequence(text, request.StopSequences, options.StopSequences,
-                out matchedStopSequence, out _);
+                out matchedStopSequence, out engineStopMatch, result.MatchedStopSequence);
 
         AnthropicContentBlockDto[] content;
         string stopReason;
@@ -205,8 +206,10 @@ public static class MessagesEndpoint
             stopReason = AnthropicConverter.ToStopReason(finishReason, matchedStopSequence);
         }
 
+        // Prefer what the engine reported; fall back to matching the raw text for callers that
+        // report nothing.
         string? stopSequence = stopReason == "stop_sequence"
-            ? MatchStopSequence(result.Text, request.StopSequences)
+            ? engineStopMatch ?? MatchStopSequence(result.Text, request.StopSequences)
             : null;
 
         var response = new AnthropicMessageResponse
@@ -635,10 +638,21 @@ public static class MessagesEndpoint
     /// </summary>
     private static string StripAndDetectStopSequence(
         string text, string[]? requestStops, IReadOnlyList<string> allStops,
-        out bool matchedRequestStop, out string? matched)
+        out bool matchedRequestStop, out string? matched, string? engineMatch = null)
     {
         matchedRequestStop = false;
         matched = null;
+
+        // The engine reports the stop string it matched (#459), and has already trimmed it out of
+        // the text — so testing the text cannot find it, and this is the only reliable source.
+        // The text-based passes below remain for callers that do not report one.
+        if (engineMatch is not null)
+        {
+            matched = engineMatch;
+            matchedRequestStop = requestStops is not null
+                && Array.IndexOf(requestStops, engineMatch) >= 0;
+            return text;
+        }
 
         // Caller-supplied stop sequences are reported as "stop_sequence".
         string? requestMatch = MatchStopSequence(text, requestStops);

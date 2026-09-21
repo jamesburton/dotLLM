@@ -224,13 +224,18 @@ public static class ChatCompletionEndpoint
             finishReason = enriched.FinishReason;
         }
 
-        // Strip stop sequence suffixes
-        foreach (var seq in options.StopSequences)
+        // Strip stop-sequence suffixes. Only when the engine did NOT report a match: since #459 it
+        // trims the matched stop string itself, and stripping again would eat a second copy from
+        // text that legitimately ends with a repeat ("wait!!" with stop "!" becoming "wait").
+        if (result.MatchedStopSequence is null)
         {
-            if (text.EndsWith(seq, StringComparison.Ordinal))
+            foreach (var seq in options.StopSequences)
             {
-                text = text[..^seq.Length];
-                break;
+                if (text.EndsWith(seq, StringComparison.Ordinal))
+                {
+                    text = text[..^seq.Length];
+                    break;
+                }
             }
         }
 
