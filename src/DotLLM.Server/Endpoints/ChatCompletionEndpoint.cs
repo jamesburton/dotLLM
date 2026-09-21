@@ -63,6 +63,23 @@ public static class ChatCompletionEndpoint
             return;
         }
 
+        // n is implemented for the non-streaming path only (#460). Streaming would need per-choice
+        // index on every delta and an n-way interleave of the SSE stream; rather than silently
+        // returning one choice -- the defect this closes -- say so.
+        if (request.Stream && request.ChoiceCount != 1)
+        {
+            httpContext.Response.StatusCode = 400;
+            await httpContext.Response.WriteAsJsonAsync(
+                ErrorResponse.InvalidRequest(
+                    "n > 1 is not supported with stream: true. Request the choices without streaming, "
+                    + "or issue n separate streaming requests.",
+                    param: "n"),
+                ServerJsonContext.Default.ErrorResponse,
+                contentType: null,
+                httpContext.RequestAborted);
+            return;
+        }
+
         var ct = httpContext.RequestAborted;
         var requestId = RequestConverter.GenerateRequestId();
         var modelId = state.Options.ModelId;
@@ -155,6 +172,17 @@ public static class ChatCompletionEndpoint
             // the load-time generator (verified DiffusionConfig defaults). max_tokens → target length.
             var effective = ResolveDiffusionGenerator(diffusionGenerator, state, request.Diffusion);
 
+            if (request.ChoiceCount != 1)
+            {
+                httpContext.Response.StatusCode = 400;
+                await httpContext.Response.WriteAsJsonAsync(
+                    ErrorResponse.InvalidRequest(
+                        "n > 1 is not supported for diffusion models.", param: "n"),
+                    ServerJsonContext.Default.ErrorResponse,
+                    contentType: null, httpContext.RequestAborted);
+                return;
+            }
+
             if (request.Stream)
                 await HandleDiffusionStreamingAsync(request, effective, state, httpContext,
                     prompt, effectiveMaxTokens, requestId, modelId, ct);
@@ -185,7 +213,8 @@ public static class ChatCompletionEndpoint
         DotLLM.Core.Lora.ILoraAdapter? adapter,
         CancellationToken ct)
     {
-        InferenceResponse? result = null;
+        int choiceCount = request.ChoiceCount;
+        var results = new InferenceResponse[choiceCount];
 
         // Route through the continuous-batch scheduler when it's the right shape for it: no LoRA
         // adapter, no logprobs capture. Multiple concurrent requests pipeline through one model
@@ -193,21 +222,64 @@ public static class ChatCompletionEndpoint
         if (state.Scheduler is { } scheduler && adapter is null && !options.Logprobs)
         {
             int[] promptIds = state.Tokenizer!.Encode(prompt);
-            var inferenceRequest = new InferenceRequest
+            var inFlight = new Task<InferenceResponse>[choiceCount];
+            for (int i = 0; i < choiceCount; i++)
             {
-                TokenIds = promptIds,
-                Options = options,
-            };
-            result = await scheduler.EnqueueAsync(inferenceRequest, ct);
+                inFlight[i] = scheduler.EnqueueAsync(new InferenceRequest
+                {
+                    TokenIds = promptIds,
+                    Options = SeedForChoice(options, i),
+                }, ct);
+            }
+            // All n submitted before awaiting any: the scheduler batches concurrent sequences into
+            // one model dispatch per iteration, so n choices cost far less than n sequential runs.
+            results = await Task.WhenAll(inFlight);
         }
         else
         {
-            await state.ExecuteAsync(async () =>
+            // The generator path is serialized by ExecuteAsync, so the choices run one at a time.
+            for (int i = 0; i < choiceCount; i++)
             {
-                result = generator.Generate(prompt, options, adapter: adapter);
-            }, ct);
+                var choiceOptions = SeedForChoice(options, i);
+                InferenceResponse? one = null;
+                await state.ExecuteAsync(async () =>
+                {
+                    one = generator.Generate(prompt, choiceOptions, adapter: adapter);
+                }, ct);
+                results[i] = one!;
+            }
         }
 
+        var choices = new ChatChoiceDto[choiceCount];
+        for (int i = 0; i < choiceCount; i++)
+            choices[i] = BuildChoice(results[i], i);
+
+        var usage = BuildMultiChoiceUsage(results);
+
+        var response = new ChatCompletionResponse
+        {
+            Id = requestId,
+            Model = modelId,
+            Choices = choices,
+            Usage = usage,
+        };
+
+        // Report actuals to the rate-limit lease so unused token budget is refunded. Every choice
+        // ran the prompt, so the metered cost is n prompts plus the summed completions -- which is
+        // NOT what the reported usage says, because OpenAI counts the prompt once however many
+        // choices it produced. The limiter meters real work; the response reports the convention.
+        RateLimitMiddleware.GetLease(httpContext)
+            ?.ReportActualTokens(results[0].PromptTokenCount * choiceCount
+                + (usage.TotalTokens - usage.PromptTokens));
+
+        httpContext.Response.ContentType = "application/json";
+        await JsonSerializer.SerializeAsync(httpContext.Response.Body, response, ServerJsonContext.Default.ChatCompletionResponse, ct);
+        return;
+
+        // Local: turn one engine response into one choice. Identical to the single-choice path it
+        // replaces; the index is the only thing that varies.
+        ChatChoiceDto BuildChoice(InferenceResponse result, int index)
+        {
         // Detect tool calls
         string text = result!.Text;
         ToolCall[]? toolCalls = null;
@@ -252,32 +324,48 @@ public static class ChatCompletionEndpoint
             ? RequestConverter.ToLogprobsDto(result.Logprobs)
             : null;
 
-        var response = new ChatCompletionResponse
+        return new ChatChoiceDto
         {
-            Id = requestId,
-            Model = modelId,
-            Choices = [new ChatChoiceDto
-            {
-                Index = 0,
-                Message = message,
-                Logprobs = logprobsDto,
-                FinishReason = RequestConverter.ToFinishReasonString(finishReason),
-            }],
-            Usage = new UsageDto
-            {
-                PromptTokens = result.PromptTokenCount,
-                CompletionTokens = result.GeneratedTokenCount,
-                TotalTokens = result.PromptTokenCount + result.GeneratedTokenCount,
-            },
+            Index = index,
+            Message = message,
+            Logprobs = logprobsDto,
+            FinishReason = RequestConverter.ToFinishReasonString(finishReason),
         };
-
-        // Report actuals to the rate-limit lease so unused token budget is refunded.
-        RateLimitMiddleware.GetLease(httpContext)
-            ?.ReportActualTokens(result.PromptTokenCount + result.GeneratedTokenCount);
-
-        httpContext.Response.ContentType = "application/json";
-        await JsonSerializer.SerializeAsync(httpContext.Response.Body, response, ServerJsonContext.Default.ChatCompletionResponse, ct);
+        }
     }
+
+    /// <summary>
+    /// Usage across the <c>n</c> choices of one request. OpenAI reports the prompt <b>once</b>
+    /// however many choices were produced, and sums <c>completion_tokens</c> across them -- so
+    /// <c>total_tokens</c> is not <c>n x</c> anything, and a client reconciling spend against it
+    /// would be misled by any other arrangement.
+    /// </summary>
+    internal static UsageDto BuildMultiChoiceUsage(IReadOnlyList<InferenceResponse> results)
+    {
+        int promptTokens = results.Count > 0 ? results[0].PromptTokenCount : 0;
+        int completionTokens = 0;
+        for (int i = 0; i < results.Count; i++)
+            completionTokens += results[i].GeneratedTokenCount;
+
+        return new UsageDto
+        {
+            PromptTokens = promptTokens,
+            CompletionTokens = completionTokens,
+            TotalTokens = promptTokens + completionTokens,
+        };
+    }
+
+    /// <summary>
+    /// Per-choice sampling seed for <c>n &gt; 1</c>. Choice 0 keeps the caller's seed exactly, so
+    /// single-choice behaviour and its determinism are unchanged; later choices offset it so a
+    /// seeded request does not return n identical completions. An unseeded request already varies
+    /// (the pipeline builds a fresh <c>Random</c>) and is left alone.
+    /// </summary>
+    internal static DotLLM.Core.Configuration.InferenceOptions SeedForChoice(
+        DotLLM.Core.Configuration.InferenceOptions options, int index)
+        => index == 0 || options.Seed is null
+            ? options
+            : options with { Seed = unchecked(options.Seed.Value + index) };
 
     private static async Task HandleStreamingAsync(
         ChatCompletionRequest request,
