@@ -92,12 +92,13 @@ internal sealed class SchedulerRequest : ISchedulerRequest
     public int StopTailSize { get; set; }
 
     /// <summary>
-    /// True when the sequence stopped because a stop <i>string</i> matched, rather than EOS or
-    /// max-tokens. The triggering token is deliberately kept in <see cref="GeneratedTokens"/> —
-    /// the match may cover only a suffix of it — and the stop string is trimmed from the decoded
-    /// text instead, at the character boundary.
+    /// The stop <i>string</i> that ended this sequence, or <see langword="null"/> when it ended on
+    /// EOS, max-tokens or cancellation. The triggering token is deliberately kept in
+    /// <see cref="GeneratedTokens"/> — the match may cover only a suffix of it — and the stop
+    /// string is trimmed from the decoded text instead, at the character boundary. Recorded rather
+    /// than recomputed because the trim makes it unrecoverable from the returned text.
     /// </summary>
-    public bool StoppedOnStopString { get; set; }
+    public string? MatchedStopSequence { get; set; }
 
     /// <summary>Reason this sequence stopped (set when transitioning to <see cref="SequenceState.Completed"/>).</summary>
     public FinishReason FinishReason { get; set; } = FinishReason.Length;

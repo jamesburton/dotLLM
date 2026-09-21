@@ -142,6 +142,43 @@ public sealed partial class ContinuousBatchSchedulerTests
     }
 
     /// <summary>
+    /// The interaction the fix creates, pinned deliberately: on a real chat model the EOS token
+    /// <i>decodes to a string that is itself in</i> <c>CommonStopSequences</c> (<c>&lt;|eot_id|&gt;</c>,
+    /// <c>&lt;|im_end|&gt;</c>), which every server request registers. EOS therefore stops the
+    /// sequence <b>and</b> the decoded tail ends with a registered stop string, so the triggering
+    /// token is kept and the text is trimmed rather than the token being dropped.
+    /// </summary>
+    /// <remarks>
+    /// That means an EOS-terminated response now counts one more generated token than the pre-fix
+    /// scheduler reported. It is the behaviour <c>TextGenerator</c> has always had — it makes the
+    /// same tail-based decision — so the two generation paths agree, which is the property worth
+    /// keeping. Pinned here because nothing else would catch a change to it: the sibling tests use
+    /// a tokenizer that decodes EOS as <c>"0"</c>, which never matches a stop string.
+    /// </remarks>
+    [Fact]
+    public async Task EosWhoseTextIsARegisteredStopString_KeepsTheTokenAndTrimsTheText()
+    {
+        var tokenizer = new TextMapTokenizer(
+            new Dictionary<int, string> { [9] = "hi", [EosTokenId] = "<|eot_id|>" });
+
+        using var fix = new TestFixture(
+            tokenScript: TokenScript.Sequence([9, EosTokenId, 9, 9]),
+            tokenizer: tokenizer);
+
+        var handle = fix.Scheduler.Submit(MakeRequest(promptLen: 2, maxTokens: 4,
+            stopSequences: ["<|eot_id|>"]));
+        DriveUntilIdle(fix.Scheduler);
+
+        var response = await handle.Completion;
+
+        Assert.Equal(FinishReason.Stop, response.FinishReason);
+        Assert.Equal("hi", response.Text);
+        // Both tokens retained: "hi" and the EOS whose text was trimmed off.
+        Assert.Equal(2, response.GeneratedTokenCount);
+        Assert.Equal("<|eot_id|>", response.MatchedStopSequence);
+    }
+
+    /// <summary>
     /// Tokenizer whose decode is a literal per-token text map, so a test can place a stop string
     /// exactly where it needs it — at a token boundary, as a token suffix, or interior to a token.
     /// </summary>

@@ -81,6 +81,34 @@ internal static class StopSuffixTrimmer
     }
 
     /// <summary>
+    /// The longest stop string from <paramref name="conditions"/> that is a suffix of
+    /// <paramref name="text"/>, or <see langword="null"/> when none is.
+    /// </summary>
+    /// <remarks>
+    /// Same match as <see cref="MatchedSuffixLength"/>, returning the string itself so a caller can
+    /// report <i>which</i> stop sequence ended generation. Callers cannot recover it afterwards:
+    /// the match is trimmed out of the returned text.
+    /// </remarks>
+    public static string? MatchedSuffix(ReadOnlySpan<char> text, IReadOnlyList<IStopCondition> conditions)
+    {
+        string? longest = null;
+        for (int i = 0; i < conditions.Count; i++)
+        {
+            if (conditions[i] is StopStringCondition ssc)
+            {
+                string stop = ssc.StopString;
+                if (stop.Length == 0 || stop.Length > text.Length) continue;
+                if (text.EndsWith(stop.AsSpan(), StringComparison.Ordinal)
+                    && (longest is null || stop.Length > longest.Length))
+                {
+                    longest = stop;
+                }
+            }
+        }
+        return longest;
+    }
+
+    /// <summary>
     /// Returns <paramref name="text"/> with the longest matching stop-string suffix removed
     /// at the character boundary. Defensive against malformed UTF-16: if the trim point
     /// would land inside a surrogate pair, the trim is extended to include the high
