@@ -100,7 +100,9 @@ internal struct BranchState
             JsonParserState.InNumberExp => true,
             JsonParserState.InNumberExpSign => true,
             JsonParserState.InNumberExpDigits => IsNumberContinuationAllowed(c),
-            JsonParserState.InLiteral => true, // parser validates literal chars
+            // #458: a literal, like a number, is terminated by ',' or '}' rather than by a
+            // closing character of its own, so the enclosing object's rule must be asked here.
+            JsonParserState.InLiteral => IsValueTerminatorAllowed(c),
             JsonParserState.ArrayOpen => IsArrayOpenCharAllowed(c),
             JsonParserState.ArrayCommaOrClose => true, // parser handles syntax
             JsonParserState.ArrayNextValue => IsValueStartCharAllowed(c, GetArrayItemNodeIndex()) || IsWhitespace(c),
@@ -492,6 +494,61 @@ internal struct BranchState
                 return false;
         }
 
+        return IsValueTerminatorAllowed(c);
+    }
+
+    /// <summary>
+    /// Decides whether a character that <b>terminates</b> an in-progress number or literal is
+    /// legal, by asking the enclosing object the question it would be asked one state later.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #458: unlike a string, a number or literal has no closing character — it ends when a
+    /// <c>,</c> or <c>}</c> arrives. Those states previously returned <see langword="true"/> for
+    /// every character except <c>.</c>/<c>e</c>/<c>E</c>, so the object-level
+    /// "is another property legal?" test in
+    /// <see cref="IsObjectCommaOrCloseCharAllowed"/> was never consulted for a value that ended
+    /// in a number. Under a strict schema with every property already emitted and
+    /// <c>additionalProperties: false</c>, <c>}</c> was the only legal token, yet the tracker
+    /// accepted <c>,</c> — and then had no legal continuation, so decoding emitted whitespace
+    /// until <c>max_tokens</c>. Observed as unparseable strict JSON:
+    /// <c>{"city":"Paris","population":2140000, </c>.
+    /// </para>
+    /// <para>
+    /// The enclosing container is <c>_nodeStack[_stackDepth - 1]</c>, and a property's bit is
+    /// set when its KEY completes (see the emitted-mask write in the key handler), so the
+    /// property currently being written already counts as emitted here — which is what makes
+    /// asking the question early give the same answer as asking it late.
+    /// </para>
+    /// <para>
+    /// Arrays and unconstrained containers are unaffected: without
+    /// <see cref="SchemaNode.PropertyNames"/> there is no property rule to apply.
+    /// </para>
+    /// </remarks>
+    private readonly bool IsValueTerminatorAllowed(char c)
+    {
+        if (c is not (',' or '}'))
+            return true;
+        if (_stackDepth <= 0)
+            return true;
+
+        ref readonly var parent = ref GetNode(_nodeStack[_stackDepth - 1]);
+        if (parent.PropertyNames is null)
+            return true;
+
+        ulong emitted = _emittedProps[_stackDepth - 1];
+
+        if (c == '}')
+            return (parent.RequiredBitmask & ~emitted) == 0;
+
+        // ',' — only legal when a further property could still follow.
+        if (parent.AdditionalPropertiesForbidden)
+        {
+            ulong allProps = parent.PropertyNames.Length < 64
+                ? (1UL << parent.PropertyNames.Length) - 1
+                : ~0UL;
+            return (allProps & ~emitted) != 0;
+        }
         return true;
     }
 

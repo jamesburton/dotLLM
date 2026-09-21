@@ -743,4 +743,48 @@ public class JsonSchemaConstraintTests
         }
         return true;
     }
+
+    [Fact]
+    public void NumberValue_RejectsComma_WhenEveryPropertyIsAlreadyEmitted()
+    {
+        // #458: a number has no closing character — it ends when ',' or '}' arrives. The
+        // InNumber* states returned true for everything except '.'/'e'/'E', so the object's
+        // "is another property legal?" rule was never consulted for a value ending in a number.
+        // With both properties emitted under additionalProperties:false, '}' is the ONLY legal
+        // token; accepting ',' leaves the decoder with no legal continuation at all, which is
+        // how strict JSON came back as `{"name":"a","age":1, ` plus whitespace to max_tokens.
+        var constraint = CreateConstraint("""
+            { "type": "object",
+              "properties": { "name": { "type": "string" }, "age": { "type": "integer" } },
+              "required": ["name", "age"], "additionalProperties": false }
+            """);
+
+        // {"name":"a","age":1   — both properties emitted, sitting mid-number.
+        AdvanceString(constraint, "{\"name\":\"a\",\"age\":1");
+        var mask = constraint.GetAllowedTokens();
+
+        Assert.True(mask.IsAllowed(1), "'}' must be allowed — both required properties are emitted");
+        Assert.False(mask.IsAllowed(4),
+            "',' must NOT be allowed: every property is emitted and additionalProperties is false, "
+            + "so no further member can follow (#458)");
+    }
+
+    [Fact]
+    public void NumberValue_AllowsComma_WhenAPropertyIsStillMissing()
+    {
+        // The negative control for the test above: the fix must not forbid a legitimate
+        // separator. Only "age" has been emitted, so "name" can still follow.
+        var constraint = CreateConstraint("""
+            { "type": "object",
+              "properties": { "name": { "type": "string" }, "age": { "type": "integer" } },
+              "required": ["name", "age"], "additionalProperties": false }
+            """);
+
+        AdvanceString(constraint, "{\"age\":1");
+        var mask = constraint.GetAllowedTokens();
+
+        Assert.True(mask.IsAllowed(4), "',' must still be allowed while \"name\" is unemitted");
+        Assert.False(mask.IsAllowed(1),
+            "'}' must NOT be allowed while the required property \"name\" is missing");
+    }
 }
