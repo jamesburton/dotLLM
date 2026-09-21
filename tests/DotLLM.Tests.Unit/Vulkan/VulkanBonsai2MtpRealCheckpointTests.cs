@@ -1,7 +1,9 @@
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
+using DotLLM.Engine;
 using DotLLM.Engine.KvCache;
+using DotLLM.Engine.Samplers;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
@@ -111,6 +113,138 @@ public sealed class VulkanBonsai2MtpRealCheckpointTests
         _out.WriteLine($"vulkan top-2 gaps:   {string.Join(",", vk.Top2Gaps.Select(g => g.ToString("E3")))}");
 
         Assert.Equal(cpu.Tokens, vk.Tokens);
+    }
+
+    /// <summary>
+    /// Acceptance criteria 3 and 4 on the real checkpoint: the unmodified
+    /// <see cref="MtpSpeculativeDecoder"/> driving the Vulkan model must emit exactly what plain
+    /// greedy decode of the same Vulkan model emits, and the round counters give the Vulkan
+    /// acceptance rate to compare against the CPU figure.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>This is the only test that reads a verify-batch logit row on real weights, and that is
+    /// the point.</b> The draft-token parity test above chains <c>ForwardMtp</c> off captured
+    /// <i>pre-final-norm</i> hidden rows, so it never touches the trunk's LM head at
+    /// <c>seqLen &gt; 1</c>. That path — the all-row head introduced for MTP, its forward Hadamard
+    /// recorded over <c>headRows</c> rows at once, and the PQ2_0 matmul dispatched at the
+    /// verify-batch <c>n</c> rather than at <c>n = 1</c> — is what the decoder's accept/reject
+    /// decisions actually read. Get a verify row wrong and speculative decode stops matching greedy
+    /// decode, which is exactly what this asserts.
+    /// </para>
+    /// <para>
+    /// <b>Why greedy equivalence is evidence here but not everywhere.</b> It says nothing about
+    /// whether the <i>draft head</i> is any good — the trunk verifies every token, so a noise draft
+    /// head still yields correct output (the prior CPU Hadamard bug produced byte-identical text at
+    /// ~0% true acceptance). It says a great deal about the <i>verify</i> rows, because those rows
+    /// are the comparison basis: a wrong row 0..k-2 accepts or corrects against the wrong
+    /// distribution and the emitted sequence diverges. Acceptance rate is the observable for the
+    /// draft head; greedy equivalence is the observable for the verify rows. Both are printed.
+    /// </para>
+    /// <para>
+    /// The emitted-per-round histogram is printed and a setup guard requires at least one round to
+    /// have emitted more than one token — otherwise every round rejected at draft position 0, the
+    /// verify batch never ran, and the assertion would be vacuous with respect to the path above.
+    /// </para>
+    /// </remarks>
+    [SkippableFact]
+    public void DraftAndVerify_MatchesPlainGreedy_AndReportsAcceptanceRate_OnRealBonsai2MtpCheckpoint()
+    {
+        string? path = FindCheckpoint();
+        Skip.If(path is null,
+            "Bonsai 2 MTP checkpoint not found (set DOTLLM_BONSAI2_MTP_GGUF or populate the HF hub cache).");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        const int NewTokens = 10;
+        const int K = 4;
+
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        using var model = VulkanQwen3HybridDenseTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
+        Assert.True(model.SupportsMtp, "Checkpoint must carry an MTP head.");
+
+        int cacheLen = PromptTokens.Length + NewTokens + K + 4;
+        int[] promptPositions = new int[PromptTokens.Length];
+        for (int i = 0; i < promptPositions.Length; i++) promptPositions[i] = i;
+
+        // Speculative run.
+        model.ResetSequenceState();
+        var decoder = new MtpSpeculativeDecoder(greedy: true);
+        var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
+        var generated = new List<int>(PromptTokens);
+        int drafted = 0, emitted = 0;
+        var emittedPerRound = new List<int>();
+
+        using (var kv = model.CreateKvCache(cacheLen))
+        using (IMtpState mtpState = model.CreateMtpState()!)
+        {
+            using (ITensor _ = model.Forward(PromptTokens, promptPositions, deviceId: -1, kv, adapter: null, mtpState)) { }
+
+            // DraftAndVerify's `position` is the last generated token's OWN KV slot.
+            int position = PromptTokens.Length - 1;
+            int guard = 0;
+            int[] outputBuffer = new int[K + 1];
+            while (generated.Count - PromptTokens.Length < NewTokens && guard++ < NewTokens * 4)
+            {
+                var result = decoder.DraftAndVerify(
+                    model, kv, mtpState, pipeline, generated, constraint: null,
+                    position, vocabSize: config.VocabSize, numCandidates: K, outputBuffer);
+
+                Assert.True(result.AcceptedCount > 0, "Every round must emit at least the corrected/bonus token.");
+                drafted += result.DraftedCount;
+                emitted += result.AcceptedCount;
+                emittedPerRound.Add(result.AcceptedCount);
+
+                for (int i = 0; i < result.AcceptedCount && generated.Count - PromptTokens.Length < NewTokens; i++)
+                    generated.Add(outputBuffer[i]);
+                position += result.AcceptedCount;
+            }
+        }
+
+        List<int> speculative = generated.Skip(PromptTokens.Length).Take(NewTokens).ToList();
+
+        // Plain greedy run, same model instance, fresh recurrent and KV state.
+        model.ResetSequenceState();
+        var plain = new List<int>();
+        using (var kv = model.CreateKvCache(cacheLen))
+        {
+            int next;
+            using (ITensor logits = model.Forward(PromptTokens, promptPositions, deviceId: -1, kv))
+                next = LastRowArgMax(logits, config.VocabSize);
+
+            for (int step = 0; step < NewTokens; step++)
+            {
+                plain.Add(next);
+                if (plain.Count == NewTokens) break;
+                using ITensor stepLogits = model.Forward([next], [PromptTokens.Length + step], deviceId: -1, kv);
+                next = LastRowArgMax(stepLogits, config.VocabSize);
+            }
+        }
+
+        double trueAcceptance = drafted == 0 ? 0 : (emitted - emittedPerRound.Count) / (double)drafted;
+        _out.WriteLine($"speculative:  [{string.Join(",", speculative)}]");
+        _out.WriteLine($"plain greedy: [{string.Join(",", plain)}]");
+        _out.WriteLine($"rounds={emittedPerRound.Count} drafted={drafted} emitted={emitted} " +
+                       $"reported_rate={(drafted == 0 ? 0 : emitted / (double)drafted):F4} " +
+                       $"true_draft_acceptance={trueAcceptance:F4}");
+        _out.WriteLine($"emitted-per-round: [{string.Join(",", emittedPerRound)}]");
+
+        // Setup guard: without a round that emitted more than the always-emitted correction token,
+        // the verify batch never ran and the equality below says nothing about the verify rows.
+        Assert.Contains(emittedPerRound, n => n > 1);
+        Assert.Equal(plain, speculative);
+    }
+
+    private static unsafe int LastRowArgMax(ITensor logits, int vocabSize)
+    {
+        int rows = logits.Shape[0];
+        var span = new ReadOnlySpan<float>((void*)logits.DataPointer, rows * vocabSize)
+            .Slice((rows - 1) * vocabSize, vocabSize);
+        int best = 0;
+        for (int i = 1; i < vocabSize; i++)
+            if (span[i] > span[best]) best = i;
+        return best;
     }
 
     private sealed record DraftRun(int[] Tokens, float[] Top2Gaps);
