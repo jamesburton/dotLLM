@@ -177,6 +177,7 @@ shared on-disk cache:
 | Telemetry & observability | [docs/TELEMETRY.md](docs/TELEMETRY.md) | Metrics, request tracing |
 | Server & API | [docs/SERVER.md](docs/SERVER.md) | Endpoints, rate limiting, warm-up |
 | Anthropic Messages API | [docs/ANTHROPIC_API.md](docs/ANTHROPIC_API.md) | `/v1/messages`, content blocks, streaming events, mapping |
+| Windows system tray | [docs/TRAY.md](docs/TRAY.md) | Tray app, server lifecycle/ownership, autostart, packaging, updates |
 | Warm-up | [docs/WARMUP.md](docs/WARMUP.md) | Startup warm-up, JIT compilation, CUDA warm-up |
 | GPU inference | [docs/GPU.md](docs/GPU.md) | GPU forward pass, weight loading, KV-cache, CLI |
 | CUDA backend | [docs/CUDA.md](docs/CUDA.md) | PTX architecture, P/Invoke, kernel conventions, build |
