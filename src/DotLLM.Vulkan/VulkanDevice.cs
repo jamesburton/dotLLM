@@ -1726,15 +1726,31 @@ public sealed class VulkanDevice : IDisposable
     /// handle value hits the old descriptor set, which still addresses the freed allocation — on
     /// gfx1151 a resident model decoding with a fresh KV cache per request returned wrong tokens in
     /// ~60% of requests. Caches consult <see cref="BufferDestroyEpoch"/> on every lookup (one
-    /// volatile read) and only walk this log when it has moved.
+    /// volatile read) and only walk this log when it has moved. Only handles a cache has bound are
+    /// logged (<see cref="_boundHandles"/>), so the per-call staging buffers of
+    /// <see cref="Download"/> on a discrete GPU never move the epoch on the decode path.
     /// </remarks>
     internal const int DestroyLogCapacity = 4096;
     private readonly nint[] _destroyLog = new nint[DestroyLogCapacity];
     private readonly Lock _destroyLogLock = new();
+    private readonly HashSet<nint> _boundHandles = new();
     private long _bufferDestroyEpoch;
 
     /// <summary>Count of <c>VkBuffer</c> handles destroyed on this device; see <see cref="_destroyLog"/>.</summary>
     internal long BufferDestroyEpoch => Volatile.Read(ref _bufferDestroyEpoch);
+
+    /// <summary>Notes that a descriptor set now references <paramref name="handles"/>.</summary>
+    internal void RecordBuffersBound(ReadOnlySpan<nint> handles)
+    {
+        lock (_destroyLogLock)
+        {
+            foreach (nint handle in handles)
+            {
+                if (handle != 0)
+                    _boundHandles.Add(handle);
+            }
+        }
+    }
 
     /// <summary>Records that <paramref name="handle"/> is about to be destroyed and may be recycled.</summary>
     internal void RecordBufferDestroyed(nint handle)
@@ -1742,6 +1758,8 @@ public sealed class VulkanDevice : IDisposable
         if (handle == 0) return;
         lock (_destroyLogLock)
         {
+            if (!_boundHandles.Remove(handle))
+                return;
             long epoch = _bufferDestroyEpoch + 1;
             _destroyLog[(int)((epoch - 1) % DestroyLogCapacity)] = handle;
             Volatile.Write(ref _bufferDestroyEpoch, epoch);

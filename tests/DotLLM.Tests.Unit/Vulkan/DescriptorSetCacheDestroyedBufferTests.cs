@@ -44,6 +44,28 @@ public sealed class DescriptorSetCacheDestroyedBufferTests
     }
 
     [SkippableFact]
+    public void DestroyingANeverBoundBuffer_DoesNotMoveTheEpoch()
+    {
+        // Staging buffers (Download on a discrete GPU allocates one per call) are never bound in a
+        // descriptor set; logging them would make every cache rescan once per decoded token.
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        using var device = VulkanDevice.Create();
+        using var kernel = AddKernel.Create(device, spvDir);
+        using var a = device.Allocate(N * sizeof(float));
+        using var b = device.Allocate(N * sizeof(float));
+        using var c = device.Allocate(N * sizeof(float));
+        kernel.Launch(a, b, c, N);
+
+        long before = device.BufferDestroyEpoch;
+        device.Allocate(N * sizeof(float)).Dispose();
+        Assert.Equal(before, device.BufferDestroyEpoch);
+
+        c.Dispose();
+        Assert.Equal(before + 1, device.BufferDestroyEpoch);
+    }
+
+    [SkippableFact]
     public void PerRequestBufferChurn_ReusesEvictedSets_InsteadOfExhaustingThePool()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

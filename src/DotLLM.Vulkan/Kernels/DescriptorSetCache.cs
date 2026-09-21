@@ -156,6 +156,7 @@ internal sealed class DescriptorSetCache
             ? _freeSets[--_freeCount]
             : KernelSupport.AllocateDescriptorSet(_device, _pool, _setLayout);
         KernelSupport.WriteBufferBindings(_device, set, buffers);
+        _device.RecordBuffersBound(buffers);
 
         int slot = _count;
         int baseIdx = slot * MaxBuffersPerSet;
