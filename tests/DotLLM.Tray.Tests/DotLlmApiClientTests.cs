@@ -83,8 +83,13 @@ public sealed class DotLlmApiClientTests
     {
         // The #454 gate answers 403 with a body naming the flag. A tray that swallowed it would
         // leave the user with buttons that do nothing and no explanation.
+        //
+        // The body is the #452 SDK-shaped envelope ({"type":"error","error":{message,...}}), not
+        // the flat {"error":"<string>"} the gate originally emitted. This test caught the tray
+        // still parsing the old shape at merge time — the client read a bare string, found an
+        // object, and surfaced an empty message.
         const string GateBody = """
-            {"error":"POST /v1/models/unload is disabled. Start the server with --allow-model-admin (ServerOptions.AllowModelAdminApi) to enable the model-administration API."}
+            {"type":"error","error":{"message":"POST /v1/models/unload is disabled. Start the server with --allow-model-admin (ServerOptions.AllowModelAdminApi) to enable the model-administration API.","type":"invalid_request_error","param":null,"code":"admin_api_disabled"}}
             """;
 
         using var http = StubHttpMessageHandler.Client(

@@ -35,4 +35,5 @@ namespace DotLLM.Tray.Api;
 [JsonSerializable(typeof(TrayPullJobList))]
 [JsonSerializable(typeof(TrayStatusResponse))]
 [JsonSerializable(typeof(TrayErrorResponse))]
+[JsonSerializable(typeof(TrayErrorDetail))]
 public sealed partial class TrayJsonContext : JsonSerializerContext;

@@ -424,7 +424,32 @@ public sealed record TrayStatusResponse
 /// <summary>A <c>{ "error": ... }</c> body. The gated routes return this with their 403.</summary>
 public sealed record TrayErrorResponse
 {
-    /// <summary>The error message. For a gate refusal it names the flag to set.</summary>
+    /// <summary>
+    /// The error object. #452 reshaped the server envelope from a flat
+    /// <c>{"error":"&lt;string&gt;"}</c> to the SDK-shaped
+    /// <c>{"type":"error","error":{message,type,param,code}}</c>; a client still reading a bare
+    /// string gets nothing and shows a blank failure, so this follows the nested shape.
+    /// </summary>
     [JsonPropertyName("error")]
-    public string Error { get; init; } = "";
+    public TrayErrorDetail? Error { get; init; }
+
+    /// <summary>The message, or empty when the body was not the expected envelope.</summary>
+    [JsonIgnore]
+    public string Message => Error?.Message ?? "";
+}
+
+/// <summary>The body of a <see cref="TrayErrorResponse"/> — mirrors the server's ErrorDetail.</summary>
+public sealed record TrayErrorDetail
+{
+    /// <summary>Human-readable description. For a gate refusal it names the flag to set.</summary>
+    [JsonPropertyName("message")]
+    public string Message { get; init; } = "";
+
+    /// <summary>Error class, e.g. <c>invalid_request_error</c>.</summary>
+    [JsonPropertyName("type")]
+    public string? Type { get; init; }
+
+    /// <summary>Machine-readable code, e.g. <c>admin_api_disabled</c>.</summary>
+    [JsonPropertyName("code")]
+    public string? Code { get; init; }
 }

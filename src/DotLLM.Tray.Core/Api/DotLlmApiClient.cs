@@ -328,9 +328,9 @@ public sealed class DotLlmApiClient
             var error = await response.Content
                 .ReadFromJsonAsync(TrayJsonContext.Default.TrayErrorResponse, ct)
                 .ConfigureAwait(false);
-            message = string.IsNullOrWhiteSpace(error?.Error)
+            message = string.IsNullOrWhiteSpace(error?.Message)
                 ? DescribeStatus(response.StatusCode, route)
-                : error!.Error;
+                : error!.Message;
         }
         catch (Exception ex) when (ex is JsonException or NotSupportedException or HttpRequestException)
         {

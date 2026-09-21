@@ -430,15 +430,14 @@ public sealed class TrayContractTests
     [Fact]
     public void ErrorResponse_RoundTripsSoTheGateMessageSurvives()
     {
-        var server = new ErrorResponse
-        {
-            Error = "POST /v1/models/unload is disabled. Start the server with --allow-model-admin "
-                  + "(ServerOptions.AllowModelAdminApi) to enable the model-administration API.",
-        };
+        var server = ErrorResponse.InvalidRequest(
+            "POST /v1/models/unload is disabled. Start the server with --allow-model-admin "
+            + "(ServerOptions.AllowModelAdminApi) to enable the model-administration API.",
+            code: "admin_api_disabled");
 
         var tray = RoundTrip(server, ServerJsonContext.Default.ErrorResponse,
             TrayJsonContext.Default.TrayErrorResponse);
 
-        Assert.Contains("--allow-model-admin", tray.Error, StringComparison.Ordinal);
+        Assert.Contains("--allow-model-admin", tray.Message, StringComparison.Ordinal);
     }
 }

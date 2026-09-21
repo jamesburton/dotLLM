@@ -149,6 +149,9 @@ public sealed class RateLimitMiddleware
         "/v1/config",
         "/v1/settings",
         "/v1/devices",
+        // Tokenises only - no forward pass, same as /v1/tokenize. The
+        // generative /v1/messages itself is NOT exempt (segment-boundary match).
+        "/v1/messages/count_tokens",
         "/v1/tokenize",
         "/v1/detokenize",
     ];
