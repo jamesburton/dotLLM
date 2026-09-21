@@ -64,7 +64,7 @@ public sealed class TrayContractTests
         var tray = RoundTrip(server, ServerJsonContext.Default.ModelListResponse,
             TrayJsonContext.Default.TrayModelList);
 
-        var model = Assert.Single(tray.Data);
+        var model = Assert.Single(tray.Data!);
         Assert.Equal("qwen2.5-3b-instruct-q4_k_m", model.Id);
         Assert.True(model.IsActive);
         Assert.Equal(12.5, model.IdleSeconds);
@@ -87,7 +87,7 @@ public sealed class TrayContractTests
         var tray = RoundTrip(server, ServerJsonContext.Default.ModelListResponse,
             TrayJsonContext.Default.TrayModelList);
 
-        Assert.Null(Assert.Single(tray.Data).ExpiresInSeconds);
+        Assert.Null(Assert.Single(tray.Data!).ExpiresInSeconds);
     }
 
     [Fact]
@@ -112,7 +112,7 @@ public sealed class TrayContractTests
         var tray = RoundTrip(server, ServerJsonContext.Default.AvailableModelsResponse,
             TrayJsonContext.Default.TrayAvailableModelList);
 
-        var model = Assert.Single(tray.Models);
+        var model = Assert.Single(tray.Models!);
         // model_id is what the tray passes to enable/disable and correlates with GET /v1/models.
         Assert.Equal("Qwen2.5-3B-Instruct-Q4_K_M", model.ModelId);
         Assert.False(model.Enabled);
@@ -141,7 +141,7 @@ public sealed class TrayContractTests
         Assert.Equal(2.5, tray.IdleSweepIntervalSeconds);
         Assert.True(tray.ModelAdminApiEnabled);
         Assert.False(tray.LoraAdminApiEnabled);
-        Assert.Equal(["old-model"], tray.DisabledModels);
+        Assert.Equal(["old-model"], tray.DisabledModels!);
     }
 
     [Fact]
@@ -181,10 +181,10 @@ public sealed class TrayContractTests
         var tray = RoundTrip(server, ServerJsonContext.Default.SettingsUpdateResponse,
             TrayJsonContext.Default.TraySettingsUpdateResult);
 
-        Assert.Equal(60, tray.Settings.KeepAliveSeconds);
-        Assert.Equal(["keep_alive_seconds"], tray.Applied);
-        Assert.Empty(tray.RestartRequired);
-        Assert.Equal(["evicted-model"], tray.Evicted);
+        Assert.Equal(60, tray.Settings!.KeepAliveSeconds);
+        Assert.Equal(["keep_alive_seconds"], tray.Applied!);
+        Assert.Empty(tray.RestartRequired!);
+        Assert.Equal(["evicted-model"], tray.Evicted!);
     }
 
     [Fact]
@@ -218,7 +218,7 @@ public sealed class TrayContractTests
             TrayJsonContext.Default.TrayUnloadResult);
 
         Assert.Equal("unloaded", tray.Status);
-        Assert.Equal(["a", "b"], tray.Unloaded);
+        Assert.Equal(["a", "b"], tray.Unloaded!);
     }
 
     [Fact]
@@ -300,15 +300,15 @@ public sealed class TrayContractTests
         var tray = RoundTrip(server, ServerJsonContext.Default.DeviceListResponse,
             TrayJsonContext.Default.TrayDeviceList);
 
-        var vulkan = Assert.Single(tray.Backends, b => b.Name == "vulkan");
+        var vulkan = Assert.Single(tray.Backends!, b => b.Name == "vulkan");
         // available && !servable is the exact shape a device picker must not offer.
         Assert.True(vulkan.Available);
         Assert.False(vulkan.Servable);
         Assert.NotNull(vulkan.Note);
-        Assert.Null(Assert.Single(vulkan.Devices).DeviceString);
+        Assert.Null(Assert.Single(vulkan.Devices!).DeviceString);
 
-        var cpu = Assert.Single(tray.Backends, b => b.Name == "cpu");
-        Assert.Equal("cpu", Assert.Single(cpu.Devices).DeviceString);
+        var cpu = Assert.Single(tray.Backends!, b => b.Name == "cpu");
+        Assert.Equal("cpu", Assert.Single(cpu.Devices!).DeviceString);
     }
 
     [Fact]
@@ -420,7 +420,7 @@ public sealed class TrayContractTests
         var tray = RoundTrip(server, ServerJsonContext.Default.ModelPullJobListResponse,
             TrayJsonContext.Default.TrayPullJobList);
 
-        var job = Assert.Single(tray.Jobs);
+        var job = Assert.Single(tray.Jobs!);
         Assert.Equal("j1", job.Id);
         Assert.True(job.IsTerminal);
         Assert.Equal(@"C:\models\f.gguf", job.ModelPath);

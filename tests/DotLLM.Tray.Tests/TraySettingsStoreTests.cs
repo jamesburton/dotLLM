@@ -44,8 +44,11 @@ public sealed class TraySettingsStoreTests : IDisposable
         // A freshly-installed tray attaches to whatever is running; it does not launch a server
         // behind the user's back.
         Assert.False(settings.StartServerOnLaunch);
-        Assert.Equal("localhost", settings.Host);
-        Assert.Equal(8080, settings.Port);
+        // Host/Port carry no initializer -- one would be dropped by source generation on an `init`
+        // member (#462), so the defaults live in the resolved accessors and the store normalizes
+        // on load. Assert what the tray actually uses.
+        Assert.Equal("localhost", settings.EffectiveHost);
+        Assert.Equal(8080, settings.EffectivePort);
     }
 
     [Fact]

@@ -113,8 +113,9 @@ internal sealed class ModelsForm : Form
             // this can take as long as the current response. Say so instead of appearing hung.
             SetStatus($"Unloading {key} (waits for any in-flight generation)…");
             var result = await _api.UnloadModelAsync(new TrayUnloadRequest { Model = key }).ConfigureAwait(true);
-            SetStatus(result.Unloaded.Length > 0
-                ? "Unloaded " + string.Join(", ", result.Unloaded)
+            string[] unloaded = result.Unloaded ?? [];
+            SetStatus(unloaded.Length > 0
+                ? "Unloaded " + string.Join(", ", unloaded)
                 : "Nothing was resident under that key.");
         }));
 
@@ -122,7 +123,8 @@ internal sealed class ModelsForm : Form
         {
             SetStatus("Unloading every resident model…");
             var result = await _api.UnloadModelAsync(new TrayUnloadRequest { All = true }).ConfigureAwait(true);
-            SetStatus("Unloaded " + (result.Unloaded.Length == 0 ? "nothing" : string.Join(", ", result.Unloaded)));
+            string[] unloadedAll = result.Unloaded ?? [];
+            SetStatus("Unloaded " + (unloadedAll.Length == 0 ? "nothing" : string.Join(", ", unloadedAll)));
         }));
 
         return panel;
@@ -231,9 +233,14 @@ internal sealed class ModelsForm : Form
             if (_pulls.SelectedItems.Count == 0)
                 return;
             var job = (TrayPullJob)_pulls.SelectedItems[0].Tag!;
+            if (job.Id is not { Length: > 0 } jobId)
+            {
+                SetStatus("That job has no id to cancel.");
+                return;
+            }
             // DELETE is the only thing that stops a download. The partial file is kept for resume.
-            await _api.CancelPullAsync(job.Id).ConfigureAwait(true);
-            SetStatus($"Cancelling {job.Id}. The partial file is kept, so a later pull resumes it.");
+            await _api.CancelPullAsync(jobId).ConfigureAwait(true);
+            SetStatus($"Cancelling {jobId}. The partial file is kept, so a later pull resumes it.");
         }));
         return panel;
     }
@@ -252,9 +259,9 @@ internal sealed class ModelsForm : Form
         try
         {
             var devices = await _api.GetDevicesAsync().ConfigureAwait(true);
-            foreach (var backend in devices.Backends.Where(b => b.Servable))
+            foreach (var backend in (devices.Backends ?? []).Where(b => b.Servable))
             {
-                foreach (var device in backend.Devices)
+                foreach (var device in backend.Devices ?? [])
                 {
                     if (device.DeviceString is { Length: > 0 } deviceString)
                         _loadDevice.Items.Add(deviceString);
@@ -279,9 +286,9 @@ internal sealed class ModelsForm : Form
             var available = await _api.GetAvailableModelsAsync().ConfigureAwait(true);
             var pulls = await _api.GetPullJobsAsync().ConfigureAwait(true);
 
-            Fill(_resident, resident.Data, model =>
+            Fill(_resident, resident.Data ?? [], model =>
             [
-                model.Id,
+                model.Id ?? "",
                 model.IsActive ? "yes" : "",
                 FormatBytes(model.SizeBytes),
                 FormatSeconds(model.IdleSeconds),
@@ -290,19 +297,21 @@ internal sealed class ModelsForm : Form
                 model.ExpiresInSeconds is { } expires ? FormatSeconds(expires) : "never",
             ]);
 
-            Fill(_available, available.Models, model =>
+            Fill(_available, available.Models ?? [], model =>
             [
-                model.ModelId,
-                model.RepoId,
+                model.ModelId ?? "",
+                model.RepoId ?? "",
                 FormatBytes(model.SizeBytes),
-                model.Enabled ? "yes" : "no",
+                // IsEnabled, not Enabled: an absent `enabled` means enabled. Reading the raw
+                // property showed every model as disabled (#462).
+                model.IsEnabled ? "yes" : "no",
             ]);
 
-            Fill(_pulls, pulls.Jobs, job =>
+            Fill(_pulls, pulls.Jobs ?? [], job =>
             [
-                job.Id,
-                job.Filename,
-                job.Status,
+                job.Id ?? "",
+                job.Filename ?? "",
+                job.Status ?? "",
                 job.Percent is { } percent
                     ? percent.ToString("0.0", CultureInfo.CurrentCulture) + "%"
                     : FormatBytes(job.BytesDownloaded),

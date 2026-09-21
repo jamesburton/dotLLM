@@ -79,23 +79,42 @@ dotLLM/
 
 ## JSON DTO Rules (System.Text.Json source generation)
 
-- **Never express a default with a property initializer on a DTO that is deserialized and has a
-  `required` member.** Source-generated deserialization silently drops the initializer:
+- **Never express a default with a property initializer on an `init`-only property of a DTO that is
+  deserialized through a source-generated context.** The initializer is silently dropped:
 
   ```csharp
   public sealed record Req {
-      public required string[] Messages { get; init; }
       public bool Stream { get; init; } = true;   // arrives as FALSE
+      public string Name { get; init; } = "";     // arrives as NULL
   }
   ```
 
   No warning, no error. Direct construction (`new Req { ... }`) still honours it, so a test that
-  does not round-trip through JSON cannot see the bug. Use a nullable property and resolve the
-  default in code instead.
-- This is ordinary, idiomatic C# that is simply wrong here, so it recurs — it bit three times
-  independently in one day (`ModelPullRequest.Stream`, `TraySettings`, `ChatCompletionRequest.N`).
-  `JsonContextDefaultsTests` guards the whole `ServerJsonContext` surface; if you add a JSON
-  context, add the equivalent guard.
+  does not round-trip through JSON cannot see the bug.
+
+- **The trigger is the `init` accessor, not `required` and not `record`** — measured, not assumed
+  (`TrayJsonContextDefaultsTests`, .NET 10):
+
+  | shape | source-generated | reflection-based |
+  |---|---|---|
+  | `{ get; init; } = x` on a `record` | **dropped** | honoured |
+  | `{ get; init; } = x` on a `class` | **dropped** | honoured |
+  | `{ get; set; } = x` | honoured | honoured |
+  | `+ a required member` | **dropped** (no different) | honoured |
+
+  The first three hits (`ModelPullRequest.Stream`, `TraySettings`, `ChatCompletionRequest.N`) all
+  happened to sit on types that *also* had `required` members, which made `required` look causal.
+  It is a correlate. Any `init` property with an initializer is affected, which is a far larger
+  surface than the original rule described — and it is the house style, so it recurs.
+
+- **The fix**: make the property nullable and resolve the default in code
+  (`public int? N { get; init; }` + `public int ChoiceCount => N ?? 1;`). Switching to `set` also
+  restores the initializer, but trades away immutability for a behaviour that depends on a
+  serializer implementation detail — prefer nullable.
+- `JsonContextDefaultsTests` guards `ServerJsonContext` and `TrayJsonContextDefaultsTests` guards
+  the tray's two contexts. **If you add a JSON context, add the equivalent guard**: construct the
+  type directly, deserialize `{}`, and compare — initializers are invisible to reflection, so
+  direct construction is the only available oracle.
 
 ## Memory Management Rules
 
