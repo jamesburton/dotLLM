@@ -158,11 +158,21 @@ Errors use the Anthropic envelope:
 
 | Condition | HTTP | `error.type` |
 |-----------|------|--------------|
-| No model loaded | 503 | `api_error` |
+| No model loaded and no `model` given | 400 | `invalid_request_error` |
 | Unknown / unloadable `model` | 400 | `invalid_request_error` |
 | Empty `messages`, missing/invalid `max_tokens`, bad `role`/`content` kind | 400 | `invalid_request_error` |
 | Prompt exceeds context window | 400 | `invalid_request_error` |
 | Loaded model is a masked text-diffusion model | 400 | `invalid_request_error` |
+| Model became unavailable after activation succeeded | 503 | `api_error` |
+
+Note the ordering: model activation runs *before* the readiness check, so a bare
+server answers `400 "No model loaded and no model specified"` (matching the
+OpenAI surface's message) rather than `503`. The `503` branch is a backstop for
+the model going away between activation and use.
+
+A body that is not valid JSON, or that does not bind to the request shape, is
+rejected by ASP.NET's model binding before the handler runs — that produces a
+bare `400` with no Anthropic envelope. Same as the OpenAI surface.
 
 ## Limitations
 
