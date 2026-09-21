@@ -34,9 +34,28 @@ Primary chat endpoint. Accepts OpenAI-compatible request format.
   "dry_allowed_length": 2,
   "dry_penalty_last_n": 0,
   "dry_sequence_breakers": ["\n", ":", "\"", "*"],
-  "n": 1
+  "n": 1,
+  "stream_options": {"include_usage": true},
+  "parallel_tool_calls": false
 }
 ```
+
+**`stream_options.include_usage`** (#450) — when true, the stream emits one extra chunk before
+`data: [DONE]` carrying `usage` with an **empty `choices` array**. SDKs match on exactly that
+shape to close out their token accounting, so it is load-bearing rather than cosmetic. The
+pre-existing `finish_reason` chunk keeps its own `usage`/`timings` (a dotLLM extension the web UI
+reads) — `include_usage` adds a chunk, it does not change one. Supported on all three streaming
+paths: chat, diffusion chat, and `POST /v1/completions`.
+
+**`parallel_tool_calls`** (#450) — `false` means the assistant emits at most one tool call per
+turn. Nothing constrains the model during decode, so the cap is applied to the detected calls on
+the way out, on both the streaming and non-streaming paths. Absent/`true` is OpenAI's default
+(parallel calls allowed).
+
+**Accepted and ignored**: `user`, `store`, `service_tier`, `reasoning_effort`, `metadata`. These
+name concepts this server has no equivalent for, and a client that always sends them must never
+get a 400. Genuinely unknown fields are tolerated too (STJ source-gen skips unmapped members) —
+declaring these makes the intent explicit and guards against a future strict-DTO pass.
 
 Also accepted (not shown above): `top_k`, `min_p`, `repetition_penalty` — see [SAMPLING.md](SAMPLING.md)
 for the full parameter reference, including the DRY/top-nσ/logit-bias/frequency/presence-penalty
@@ -92,6 +111,15 @@ Lists every **resident** model — the active one plus any stashed-but-loaded mo
 ]}
 ```
 `expires_in_seconds` is omitted when the model's keep-alive is negative (pinned, never auto-unloads).
+
+### `GET /v1/models/{id}`
+Retrieves one model object — what the OpenAI SDK's `client.models.retrieve()` calls (#450). The
+route is a catch-all (`/v1/models/{**id}`) because ids are HuggingFace repo ids and contain `/`;
+the literal `/v1/models/{available,load,inspect}` routes are more specific and still win.
+Resolution goes through the same list the collection endpoint returns, so retrieve can never
+disagree with list — including on a bare server, where the configured-but-unloaded model id
+retrieves rather than 404s. An unknown id returns `404` with
+`{"error": {"type": "not_found_error", "code": "model_not_found", "param": "model", ...}}`.
 
 ## Model Keep-Alive / Idle-Unload / Multi-Model Residency (#369)
 
@@ -222,7 +250,7 @@ Clears all cached KV-cache sessions. Called automatically by the Chat UI when th
 
 ## Rate Limiting
 
-Per-API-key admission controls built on `System.Threading.RateLimiting`. Off by default — when no `RateLimit` configuration is present (or `Enabled: false`) the middleware short-circuits and adds zero overhead. When configured, the middleware sits between CORS and endpoint mapping and inspects every request to `/v1/chat/completions`, `/v1/completions`, and `/v1/embeddings`.
+Per-API-key admission controls built on `System.Threading.RateLimiting`. Off by default — when no `RateLimit` configuration is present (or `Enabled: false`) the middleware short-circuits and adds zero overhead. When configured, the middleware sits between CORS and endpoint mapping and inspects every request to a metered path (see § What gets metered — everything under `/v1/` except an explicit exemption list).
 
 Code lives in `src/DotLLM.Server/RateLimiting/`:
 
@@ -295,9 +323,13 @@ The tokens-per-minute limiter charges `prompt_estimate + max_tokens` upfront so 
 HTTP/1.1 429 Too Many Requests
 Retry-After: 12
 X-RateLimit-Limiter: Tokens
+x-request-id: 0HN7...
+x-ratelimit-limit-tokens: 6000
+x-ratelimit-remaining-tokens: 0
+x-ratelimit-reset-tokens: 60
 Content-Type: application/json
 
-{"error":"Rate limit exceeded (tokens-per-minute). Retry in 12s."}
+{"type":"error","error":{"message":"Rate limit exceeded (tokens-per-minute). Retry in 12s.","type":"rate_limit_error","param":null,"code":"tokens-per-minute"}}
 ```
 
 | Header | Meaning |
@@ -305,13 +337,55 @@ Content-Type: application/json
 | `Retry-After` | Seconds until the limiter can admit. Driven by the BCL limiter metadata where available. |
 | `X-RateLimit-Limiter` | Which of the three limiters rejected (`Requests`, `Tokens`, `Concurrency`). Useful for client backoff decisions. |
 
+## SDK-facing error envelope and observability headers (#452)
+
+Every error response is `{"type": "error", "error": {"message", "type", "param", "code"}}`. The
+official OpenAI and Anthropic SDKs parse this envelope to classify a failure; the flat
+`{"error": "<string>"}` this server used to emit left `.type`, `.code` and `.param` unreachable, so
+a 429 was indistinguishable from a 400 to anything reading the body. `param` and `code` are always
+present, as explicit `null`s when unknown, matching OpenAI. The top-level `"type": "error"`
+discriminator is what Anthropic's envelope requires and is inert for OpenAI clients, so one type
+serves both surfaces. Error types in use: `invalid_request_error`, `rate_limit_error`,
+`not_found_error`, `api_error`.
+
+`ResponseHeadersMiddleware` (registered unconditionally, and *outside* the limiter so the headers
+also land on its 429 short-circuit) emits:
+
+| Header | Meaning |
+|--------|---------|
+| `x-request-id` | Correlation id. A sane inbound value is echoed; otherwise the connection's trace identifier is used. Values over 128 chars, or containing control characters, are replaced rather than reflected. |
+| `openai-processing-ms` | Wall-clock milliseconds in the pipeline. Written from `Response.OnStarting`, so it is absent on a stream that started before generation finished. |
+| `x-ratelimit-limit-requests` / `-remaining-requests` / `-reset-requests` | Requests-per-minute budget. Omitted entirely when that limiter is not configured — advertising a limit of 0 would make a well-behaved SDK back off against a server that is not limiting it. |
+| `x-ratelimit-limit-tokens` / `-remaining-tokens` / `-reset-tokens` | Tokens-per-minute budget, same omission rule. `reset` is seconds until the bucket refills to its ceiling. |
+
+Inbound `OpenAI-Organization`, `OpenAI-Project`, `OpenAI-Beta` and `anthropic-beta` name concepts
+this server has no equivalent for. Nothing inspects them: they are accepted and ignored, never a
+400.
+
+The deterministic headers are written *before* the inner pipeline runs. That is deliberate — the
+SSE endpoints start the response on their first flush, and headers cannot be added after that.
+
 ### Authentication note
 
 `HeaderApiKeyResolver` exists only so rate-limit buckets can be partitioned per caller. dotLLM still has no built-in authentication — see § Security. Host applications wiring real auth (OAuth, JWT, mTLS) should register their own `IApiKeyResolver` implementation that returns the authenticated principal's stable ID. The rate-limit machinery is transport-independent and will bucket on whatever opaque string you return.
 
-### Unmetered endpoints
+### What gets metered
 
-`/health`, `/ready`, `/v1/models`, `/v1/tokenize`, `/v1/detokenize`, `/v1/lora`, `/v1/cache/clear`, `/props`, `/config`, and the chat UI are deliberately unmetered — they're either probes, control-plane operations, or static asset serving.
+**Everything under `/v1/` is metered unless it is explicitly exempt.** The exemptions are
+`/v1/models`, `/v1/lora`, `/v1/prompt-cache`, `/v1/cache`, `/v1/config`, `/v1/tokenize` and
+`/v1/detokenize` (matched on segment boundaries, so `/v1/models/{id}` is covered by
+`/v1/models`). Non-`/v1/` paths — `/health`, `/ready`, `/props`, the chat UI and its assets —
+are never metered. These are probes, control-plane operations, or static asset serving, and
+consume no inference budget.
+
+This is deliberately an **exemption list, not an allowlist**. It used to name the three paths that
+*were* metered, which meant every new generative endpoint shipped unmetered by omission with
+nothing failing when someone forgot — and the list had already drifted, naming `/v1/embeddings`
+(not yet built) while `/v1/messages` would have bypassed the limiter entirely. An unmetered path
+can never return 429, so its configured limits are simply unenforceable. Inverted, the failure mode
+is safe: forgetting to classify a new route over-meters a control-plane endpoint (visible,
+harmless) instead of silently leaving a hole in the limiter. Add a route to the exemption list only
+when it genuinely does not run the model.
 
 ## Warm-up
 
