@@ -56,7 +56,7 @@ public sealed class DotLlmApiClientTests
             .GetResidentModelsAsync(CancellationToken.None);
 
         Assert.Equal("/v1/models", Assert.Single(handler.Requests).Uri.AbsolutePath);
-        Assert.Equal(30, Assert.Single(result.Data).ExpiresInSeconds);
+        Assert.Equal(30, Assert.Single(result.Data!).ExpiresInSeconds);
     }
 
     [Fact]
@@ -75,7 +75,7 @@ public sealed class DotLlmApiClientTests
         Assert.Equal("/v1/settings", request.Uri.AbsolutePath);
         Assert.Contains("keep_alive_seconds", request.Body!, StringComparison.Ordinal);
         Assert.DoesNotContain("max_resident_models", request.Body!, StringComparison.Ordinal);
-        Assert.Equal(["keep_alive_seconds"], result.Applied);
+        Assert.Equal(["keep_alive_seconds"], result.Applied!);
     }
 
     [Fact]

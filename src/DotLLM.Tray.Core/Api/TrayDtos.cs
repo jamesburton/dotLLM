@@ -15,7 +15,7 @@ public sealed record TrayModelInfo
 {
     /// <summary>Model key. The same id the enable/disable/unload routes take.</summary>
     [JsonPropertyName("id")]
-    public string Id { get; init; } = "";
+    public string? Id { get; init; }
 
     /// <summary>Whether this model is wired to the live inference path right now.</summary>
     [JsonPropertyName("is_active")]
@@ -43,7 +43,7 @@ public sealed record TrayModelList
 {
     /// <summary>Resident models.</summary>
     [JsonPropertyName("data")]
-    public TrayModelInfo[] Data { get; init; } = [];
+    public TrayModelInfo[]? Data { get; init; }
 }
 
 /// <summary>A locally downloaded GGUF, from <c>GET /v1/models/available</c>.</summary>
@@ -51,15 +51,15 @@ public sealed record TrayAvailableModel
 {
     /// <summary>HuggingFace repo id the file came from.</summary>
     [JsonPropertyName("repo_id")]
-    public string RepoId { get; init; } = "";
+    public string? RepoId { get; init; }
 
     /// <summary>File name within the repo.</summary>
     [JsonPropertyName("filename")]
-    public string Filename { get; init; } = "";
+    public string? Filename { get; init; }
 
     /// <summary>Absolute path of the local file.</summary>
     [JsonPropertyName("full_path")]
-    public string FullPath { get; init; } = "";
+    public string? FullPath { get; init; }
 
     /// <summary>On-disk size in bytes.</summary>
     [JsonPropertyName("size_bytes")]
@@ -67,11 +67,20 @@ public sealed record TrayAvailableModel
 
     /// <summary>(#454) The model key a load of this file produces — correlates with <see cref="TrayModelInfo.Id"/>.</summary>
     [JsonPropertyName("model_id")]
-    public string ModelId { get; init; } = "";
+    public string? ModelId { get; init; }
 
-    /// <summary>(#454) False when an operator has disabled this key.</summary>
+    /// <summary>
+    /// (#454) False when an operator has disabled this key. Nullable because the initializer form
+    /// of this default was DROPPED by source generation, so an omitted <c>enabled</c> arrived as
+    /// <c>false</c> and every available model showed as disabled. Read
+    /// <see cref="IsEnabled"/>, never this.
+    /// </summary>
     [JsonPropertyName("enabled")]
-    public bool Enabled { get; init; } = true;
+    public bool? Enabled { get; init; }
+
+    /// <summary>Whether this model is enabled, treating an absent field as enabled.</summary>
+    [JsonIgnore]
+    public bool IsEnabled => Enabled ?? true;
 }
 
 /// <summary>Response body of <c>GET /v1/models/available</c>.</summary>
@@ -79,7 +88,7 @@ public sealed record TrayAvailableModelList
 {
     /// <summary>Locally downloaded models.</summary>
     [JsonPropertyName("models")]
-    public TrayAvailableModel[] Models { get; init; } = [];
+    public TrayAvailableModel[]? Models { get; init; }
 }
 
 /// <summary>Body of <c>GET /v1/settings</c> and the <c>settings</c> member of the PUT response.</summary>
@@ -111,7 +120,7 @@ public sealed record TraySettingsDto
 
     /// <summary>Model keys currently disabled.</summary>
     [JsonPropertyName("disabled_models")]
-    public string[] DisabledModels { get; init; } = [];
+    public string[]? DisabledModels { get; init; }
 }
 
 /// <summary>Partial update body for <c>PUT /v1/settings</c>. Null fields are omitted from the JSON.</summary>
@@ -143,19 +152,19 @@ public sealed record TraySettingsUpdateResult
 {
     /// <summary>Settings as they stand after the update.</summary>
     [JsonPropertyName("settings")]
-    public TraySettingsDto Settings { get; init; } = new();
+    public TraySettingsDto? Settings { get; init; }
 
     /// <summary>Field names that took effect immediately.</summary>
     [JsonPropertyName("applied")]
-    public string[] Applied { get; init; } = [];
+    public string[]? Applied { get; init; }
 
     /// <summary>Field names accepted but needing a server restart.</summary>
     [JsonPropertyName("restart_required")]
-    public string[] RestartRequired { get; init; } = [];
+    public string[]? RestartRequired { get; init; }
 
     /// <summary>Model keys evicted as a side effect of a tightened budget.</summary>
     [JsonPropertyName("evicted")]
-    public string[] Evicted { get; init; } = [];
+    public string[]? Evicted { get; init; }
 }
 
 /// <summary>Request body for <c>POST /v1/models/unload</c>.</summary>
@@ -176,11 +185,11 @@ public sealed record TrayUnloadResult
 {
     /// <summary><c>unloaded</c>, or <c>not_resident</c> when nothing matched.</summary>
     [JsonPropertyName("status")]
-    public string Status { get; init; } = "";
+    public string? Status { get; init; }
 
     /// <summary>Model keys actually unloaded.</summary>
     [JsonPropertyName("unloaded")]
-    public string[] Unloaded { get; init; } = [];
+    public string[]? Unloaded { get; init; }
 }
 
 /// <summary>Request body for <c>POST /v1/models/enable</c> and <c>/v1/models/disable</c>.</summary>
@@ -188,7 +197,7 @@ public sealed record TrayEnableRequest
 {
     /// <summary>Model key.</summary>
     [JsonPropertyName("model")]
-    public string Model { get; init; } = "";
+    public string? Model { get; init; }
 }
 
 /// <summary>Response body of the enable/disable routes.</summary>
@@ -196,7 +205,7 @@ public sealed record TrayEnableResult
 {
     /// <summary>The model key acted on.</summary>
     [JsonPropertyName("model")]
-    public string Model { get; init; } = "";
+    public string? Model { get; init; }
 
     /// <summary>Whether the model is loadable after this call.</summary>
     [JsonPropertyName("enabled")]
@@ -212,7 +221,7 @@ public sealed record TrayLoadRequest
 {
     /// <summary>Model path, repo id, or key.</summary>
     [JsonPropertyName("model")]
-    public string Model { get; init; } = "";
+    public string? Model { get; init; }
 
     /// <summary>Target device. Use a <see cref="TrayDeviceInfo.DeviceString"/> from <c>GET /v1/devices</c>.</summary>
     [JsonPropertyName("device")]
@@ -245,11 +254,11 @@ public sealed record TrayLoadResult
 {
     /// <summary>Always <c>loaded</c> on success.</summary>
     [JsonPropertyName("status")]
-    public string Status { get; init; } = "";
+    public string? Status { get; init; }
 
     /// <summary>The model argument that was loaded.</summary>
     [JsonPropertyName("model")]
-    public string Model { get; init; } = "";
+    public string? Model { get; init; }
 }
 
 /// <summary>One enumerated compute device, from <c>GET /v1/devices</c>.</summary>
@@ -261,7 +270,7 @@ public sealed record TrayDeviceInfo
 
     /// <summary>Human-readable device name.</summary>
     [JsonPropertyName("name")]
-    public string Name { get; init; } = "";
+    public string? Name { get; init; }
 
     /// <summary>The exact string to pass as <c>device</c> on a load, or null when not servable.</summary>
     [JsonPropertyName("device_string")]
@@ -281,7 +290,7 @@ public sealed record TrayBackendInfo
 {
     /// <summary><c>cpu</c>, <c>cuda</c> or <c>vulkan</c>.</summary>
     [JsonPropertyName("name")]
-    public string Name { get; init; } = "";
+    public string? Name { get; init; }
 
     /// <summary>Whether the backend's runtime is present on this machine.</summary>
     [JsonPropertyName("available")]
@@ -304,7 +313,7 @@ public sealed record TrayBackendInfo
 
     /// <summary>The enumerated devices.</summary>
     [JsonPropertyName("devices")]
-    public TrayDeviceInfo[] Devices { get; init; } = [];
+    public TrayDeviceInfo[]? Devices { get; init; }
 }
 
 /// <summary>Response body of <c>GET /v1/devices</c>.</summary>
@@ -312,7 +321,7 @@ public sealed record TrayDeviceList
 {
     /// <summary>The probed backends.</summary>
     [JsonPropertyName("backends")]
-    public TrayBackendInfo[] Backends { get; init; } = [];
+    public TrayBackendInfo[]? Backends { get; init; }
 }
 
 /// <summary>Request body for <c>POST /v1/models/pull</c>.</summary>
@@ -320,11 +329,11 @@ public sealed record TrayPullRequest
 {
     /// <summary>HuggingFace repo id.</summary>
     [JsonPropertyName("repo_id")]
-    public string RepoId { get; init; } = "";
+    public string? RepoId { get; init; }
 
     /// <summary>File within the repo.</summary>
     [JsonPropertyName("filename")]
-    public string Filename { get; init; } = "";
+    public string? Filename { get; init; }
 
     /// <summary>Git revision. Defaults to <c>main</c> server-side.</summary>
     [JsonPropertyName("revision")]
@@ -345,23 +354,23 @@ public sealed record TrayPullJob
 {
     /// <summary>Job id, used by <c>GET</c>/<c>DELETE /v1/models/pull/{id}</c>.</summary>
     [JsonPropertyName("id")]
-    public string Id { get; init; } = "";
+    public string? Id { get; init; }
 
     /// <summary>HuggingFace repo id.</summary>
     [JsonPropertyName("repo_id")]
-    public string RepoId { get; init; } = "";
+    public string? RepoId { get; init; }
 
     /// <summary>File within the repo.</summary>
     [JsonPropertyName("filename")]
-    public string Filename { get; init; } = "";
+    public string? Filename { get; init; }
 
     /// <summary>Git revision.</summary>
     [JsonPropertyName("revision")]
-    public string Revision { get; init; } = "";
+    public string? Revision { get; init; }
 
     /// <summary><c>running</c>, <c>completed</c>, <c>failed</c> or <c>cancelled</c>.</summary>
     [JsonPropertyName("status")]
-    public string Status { get; init; } = "";
+    public string? Status { get; init; }
 
     /// <summary>Bytes transferred so far.</summary>
     [JsonPropertyName("bytes_downloaded")]
@@ -410,7 +419,7 @@ public sealed record TrayPullJobList
 {
     /// <summary>All known jobs, running and terminal.</summary>
     [JsonPropertyName("jobs")]
-    public TrayPullJob[] Jobs { get; init; } = [];
+    public TrayPullJob[]? Jobs { get; init; }
 }
 
 /// <summary>A <c>{ "status": ... }</c> body.</summary>
@@ -418,7 +427,7 @@ public sealed record TrayStatusResponse
 {
     /// <summary>The status string.</summary>
     [JsonPropertyName("status")]
-    public string Status { get; init; } = "";
+    public string? Status { get; init; }
 }
 
 /// <summary>A <c>{ "error": ... }</c> body. The gated routes return this with their 403.</summary>
@@ -443,7 +452,7 @@ public sealed record TrayErrorDetail
 {
     /// <summary>Human-readable description. For a gate refusal it names the flag to set.</summary>
     [JsonPropertyName("message")]
-    public string Message { get; init; } = "";
+    public string? Message { get; init; }
 
     /// <summary>Error class, e.g. <c>invalid_request_error</c>.</summary>
     [JsonPropertyName("type")]

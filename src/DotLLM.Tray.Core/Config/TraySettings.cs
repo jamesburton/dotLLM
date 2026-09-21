@@ -15,13 +15,19 @@ namespace DotLLM.Tray.Config;
 /// </remarks>
 public sealed record TraySettings
 {
-    /// <summary>Host the tray-owned server binds, and the host the tray talks to.</summary>
+    /// <summary>
+    /// Host the tray-owned server binds, and the host the tray talks to. Nullable with no
+    /// initializer on purpose: source generation drops an initializer on an <c>init</c> property,
+    /// so a <c>= "localhost"</c> here would be a default that never actually applied to a loaded
+    /// file while looking like it did. <see cref="Normalized"/> is where the default lives.
+    /// </summary>
     [JsonPropertyName("host")]
-    public string Host { get; init; } = "localhost";
+    public string? Host { get; init; }
 
-    /// <summary>Port the tray-owned server binds.</summary>
+    /// <summary>Port the tray-owned server binds. Nullable for the same reason as
+    /// <see cref="Host"/>; resolved by <see cref="Normalized"/>.</summary>
     [JsonPropertyName("port")]
-    public int Port { get; init; } = 8080;
+    public int? Port { get; init; }
 
     /// <summary>Explicit path to <c>dotllm.exe</c>, or null to discover it.</summary>
     [JsonPropertyName("executable_path")]
@@ -77,12 +83,19 @@ public sealed record TraySettings
     /// Fills in any field a partial or older settings file left absent.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Necessary because <see cref="TraySettingsJsonContext"/> is source-generated and the
-    /// generated deserializer does <b>not</b> run this record's property initializers for members
-    /// the JSON omits — <c>Host</c> arrives as null and <c>Port</c> as 0, not as "localhost" and
-    /// 8080. Verified, not assumed: see
+    /// generated deserializer does <b>not</b> run property initializers on <c>init</c> members the
+    /// JSON omits. Verified, not assumed: see
     /// <c>TraySettingsStoreTests.Load_OfAPartialFile_KeepsDefaultsForTheMissingFields</c>, which
-    /// caught exactly this. It is the same trap #454 hit with <c>ModelPullRequest.Stream</c>.
+    /// caught exactly this.
+    /// </para>
+    /// <para>
+    /// The trigger is the <c>init</c> accessor, not a <c>required</c> member — this record has
+    /// none and is affected anyway. Measured four ways in
+    /// <c>TrayJsonContextDefaultsTests</c>; the earlier note here, and the project rule it came
+    /// from, both named <c>required</c> as the cause, which was a correlate.
+    /// </para>
     /// </remarks>
     public TraySettings Normalized() => this with
     {
@@ -90,11 +103,19 @@ public sealed record TraySettings
         Port = Port is > 0 and < 65536 ? Port : 8080,
     };
 
+    /// <summary>The host to use, with the default applied. Safe on an un-normalized instance.</summary>
+    [JsonIgnore]
+    public string EffectiveHost => string.IsNullOrWhiteSpace(Host) ? "localhost" : Host;
+
+    /// <summary>The port to use, with the default applied. Safe on an un-normalized instance.</summary>
+    [JsonIgnore]
+    public int EffectivePort => Port is > 0 and < 65536 ? Port.Value : 8080;
+
     /// <summary>Projects these settings onto the launch options for a tray-owned server.</summary>
     public ServerLaunchOptions ToLaunchOptions() => new()
     {
-        Host = Host,
-        Port = Port,
+        Host = EffectiveHost,
+        Port = EffectivePort,
         Model = StartupModel,
         Device = Device,
         GpuLayers = GpuLayers,
@@ -142,14 +163,14 @@ public sealed class TraySettingsStore
         try
         {
             if (!File.Exists(_path))
-                return new TraySettings();
+                return new TraySettings().Normalized();
             var json = File.ReadAllText(_path);
             var settings = JsonSerializer.Deserialize(json, TraySettingsJsonContext.Default.TraySettings);
             return settings?.Normalized() ?? new TraySettings();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
         {
-            return new TraySettings();
+            return new TraySettings().Normalized();
         }
     }
 

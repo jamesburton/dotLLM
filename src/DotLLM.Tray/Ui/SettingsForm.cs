@@ -65,8 +65,10 @@ internal sealed class SettingsForm : Form
         MinimizeBox = false;
         MaximizeBox = false;
 
-        _host.Text = settings.Host;
-        _port.Value = settings.Port;
+        // Effective*, not the raw properties: a settings file that omits these leaves them null,
+        // and the form must show what the tray will actually use (#462).
+        _host.Text = settings.EffectiveHost;
+        _port.Value = settings.EffectivePort;
         _executablePath.Text = settings.ExecutablePath ?? "";
         _startupModel.Text = settings.StartupModel ?? "";
         _device.Text = settings.Device ?? "";
@@ -250,13 +252,13 @@ internal sealed class SettingsForm : Form
         var current = _device.Text;
         _device.Items.Clear();
 
-        foreach (var backend in devices.Backends)
+        foreach (var backend in devices.Backends ?? [])
         {
             // Gated on Servable, not Available. Vulkan reports available-but-not-servable, and
             // offering it would produce a load that silently lands on the CPU.
             if (!backend.Servable)
                 continue;
-            foreach (var device in backend.Devices)
+            foreach (var device in backend.Devices ?? [])
             {
                 if (device.DeviceString is { Length: > 0 } deviceString)
                     _device.Items.Add(deviceString);
@@ -265,9 +267,9 @@ internal sealed class SettingsForm : Form
 
         _device.Text = current;
 
-        var unservable = devices.Backends
+        var unservable = (devices.Backends ?? [])
             .Where(b => b.Available && !b.Servable)
-            .Select(b => b.Name)
+            .Select(b => b.Name ?? "(unnamed)")
             .ToArray();
         if (unservable.Length > 0)
         {
@@ -289,11 +291,17 @@ internal sealed class SettingsForm : Form
                 IdleSweepIntervalSeconds = (double)_sweepInterval.Value,
             }).ConfigureAwait(true);
 
-            var message = "Applied: " + string.Join(", ", result.Applied);
-            if (result.Evicted.Length > 0)
-                message += ". Evicted by the new budget: " + string.Join(", ", result.Evicted);
-            if (result.RestartRequired.Length > 0)
-                message += ". Needs a restart: " + string.Join(", ", result.RestartRequired);
+            // Every one of these arrays can be absent: source generation drops the `= []`
+            // initializer on an init-only property, so "applied nothing" arrives as null (#462).
+            string[] applied = result.Applied ?? [];
+            string[] evicted = result.Evicted ?? [];
+            string[] restartRequired = result.RestartRequired ?? [];
+
+            var message = "Applied: " + (applied.Length > 0 ? string.Join(", ", applied) : "nothing");
+            if (evicted.Length > 0)
+                message += ". Evicted by the new budget: " + string.Join(", ", evicted);
+            if (restartRequired.Length > 0)
+                message += ". Needs a restart: " + string.Join(", ", restartRequired);
             _liveStatus.Text = message;
         }
         catch (DotLlmApiException ex)
