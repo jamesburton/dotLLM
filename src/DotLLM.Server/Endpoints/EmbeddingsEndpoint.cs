@@ -213,11 +213,24 @@ public static class EmbeddingsEndpoint
         return JsonSerializer.SerializeToElement(Convert.ToBase64String(bytes), ServerJsonContext.Default.String);
     }
 
+    /// <summary>
+    /// Maps an HTTP status onto the matching <see cref="ErrorResponse"/> factory (#452), so the
+    /// envelope's <c>error.type</c> agrees with the status code rather than defaulting to one
+    /// class for every failure.
+    /// </summary>
+    private static ErrorResponse ErrorForStatus(int statusCode, string message) => statusCode switch
+    {
+        StatusCodes.Status404NotFound => ErrorResponse.NotFound(message),
+        StatusCodes.Status429TooManyRequests => ErrorResponse.RateLimit(message),
+        >= 500 => ErrorResponse.Internal(message),
+        _ => ErrorResponse.InvalidRequest(message),
+    };
+
     private static Task WriteErrorAsync(HttpContext httpContext, int statusCode, string message)
     {
         httpContext.Response.StatusCode = statusCode;
         return httpContext.Response.WriteAsJsonAsync(
-            new ErrorResponse { Error = message },
+            ErrorForStatus(statusCode, message),
             ServerJsonContext.Default.ErrorResponse,
             contentType: null,
             httpContext.RequestAborted);

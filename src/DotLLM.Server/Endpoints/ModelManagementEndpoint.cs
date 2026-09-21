@@ -55,7 +55,7 @@ public static class ModelManagementEndpoint
             // legitimately name either.
             var loadKey = Path.GetFileNameWithoutExtension(resolvedPath);
             if (!state.Catalog.IsEnabled(request.Model) || !state.Catalog.IsEnabled(loadKey))
-                return Results.BadRequest(new ErrorResponse { Error = $"Model is disabled: {request.Model}" });
+                return Results.BadRequest(ErrorResponse.InvalidRequest($"Model is disabled: {request.Model}", param: "model", code: "model_disabled"));
 
             try
             {
@@ -157,7 +157,7 @@ public static class ModelManagementEndpoint
             if (!state.Options.AllowModelAdminApi)
                 return AdminGate.Forbidden("POST /v1/models/enable");
             if (string.IsNullOrWhiteSpace(request.Model))
-                return Results.BadRequest(new ErrorResponse { Error = "model is required" });
+                return Results.BadRequest(ErrorResponse.InvalidRequest("model is required", param: "model"));
 
             state.Catalog.Enable(request.Model);
             return Results.Ok(new ModelEnableResponse
@@ -173,7 +173,7 @@ public static class ModelManagementEndpoint
             if (!state.Options.AllowModelAdminApi)
                 return AdminGate.Forbidden("POST /v1/models/disable");
             if (string.IsNullOrWhiteSpace(request.Model))
-                return Results.BadRequest(new ErrorResponse { Error = "model is required" });
+                return Results.BadRequest(ErrorResponse.InvalidRequest("model is required", param: "model"));
 
             state.Catalog.Disable(request.Model);
 
@@ -207,7 +207,7 @@ public static class ModelManagementEndpoint
         {
             var job = state.PullManager.Get(id);
             return job is null
-                ? Results.NotFound(new ErrorResponse { Error = $"No such pull job: {id}" })
+                ? Results.NotFound(ErrorResponse.NotFound($"No such pull job: {id}", param: "id", code: "pull_job_not_found"))
                 : Results.Ok(job.ToDto());
         });
 
@@ -218,7 +218,7 @@ public static class ModelManagementEndpoint
 
             return state.PullManager.Cancel(id)
                 ? Results.Ok(new StatusResponse { Status = "cancelling" })
-                : Results.NotFound(new ErrorResponse { Error = $"No such pull job: {id}" });
+                : Results.NotFound(ErrorResponse.NotFound($"No such pull job: {id}", param: "id", code: "pull_job_not_found"));
         });
 
         app.MapPost("/v1/models/pull", async (ModelPullRequest request, HttpContext http, ServerState state) =>
@@ -226,9 +226,9 @@ public static class ModelManagementEndpoint
             if (!state.Options.AllowModelAdminApi)
                 return AdminGate.Forbidden("POST /v1/models/pull");
             if (string.IsNullOrWhiteSpace(request.RepoId))
-                return Results.BadRequest(new ErrorResponse { Error = "repo_id is required" });
+                return Results.BadRequest(ErrorResponse.InvalidRequest("repo_id is required", param: "repo_id"));
             if (string.IsNullOrWhiteSpace(request.Filename))
-                return Results.BadRequest(new ErrorResponse { Error = "filename is required" });
+                return Results.BadRequest(ErrorResponse.InvalidRequest("filename is required", param: "filename"));
 
             var job = state.PullManager.Start(request.RepoId, request.Filename, request.Revision);
 

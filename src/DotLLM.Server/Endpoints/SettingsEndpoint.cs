@@ -27,16 +27,15 @@ public static class SettingsEndpoint
                 return AdminGate.Forbidden("PUT /v1/settings");
 
             if (request.MaxResidentModels is < 1)
-                return Results.BadRequest(new ErrorResponse { Error = "max_resident_models must be >= 1" });
+                return Results.BadRequest(ErrorResponse.InvalidRequest("max_resident_models must be >= 1", param: "max_resident_models"));
             if (request.ResidentMemoryBudgetBytes is < 0)
-                return Results.BadRequest(new ErrorResponse { Error = "resident_memory_budget_bytes must be >= 0" });
+                return Results.BadRequest(ErrorResponse.InvalidRequest("resident_memory_budget_bytes must be >= 0", param: "resident_memory_budget_bytes"));
             // Bounded to exactly the range RunIdleSweepLoopAsync clamps to. Accepting 0.05 and
             // then silently sweeping at 0.1 while GET reported 0.05 would make the endpoint lie.
             if (request.IdleSweepIntervalSeconds is < 0.1 or > 3600)
-                return Results.BadRequest(new ErrorResponse
-                {
-                    Error = "idle_sweep_interval_seconds must be between 0.1 and 3600",
-                });
+                return Results.BadRequest(ErrorResponse.InvalidRequest(
+                    "idle_sweep_interval_seconds must be between 0.1 and 3600",
+                    param: "idle_sweep_interval_seconds"));
 
             return Results.Ok(Apply(state, request));
         });
@@ -130,10 +129,9 @@ internal static class AdminGate
 {
     internal static IResult Forbidden(string route) =>
         Results.Json(
-            new ErrorResponse
-            {
-                Error = $"{route} is disabled. Start the server with --allow-model-admin "
-                      + "(ServerOptions.AllowModelAdminApi) to enable the model-administration API.",
-            },
+            ErrorResponse.InvalidRequest(
+                $"{route} is disabled. Start the server with --allow-model-admin "
+                + "(ServerOptions.AllowModelAdminApi) to enable the model-administration API.",
+                code: "admin_api_disabled"),
             statusCode: StatusCodes.Status403Forbidden);
 }
