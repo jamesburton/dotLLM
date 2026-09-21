@@ -22,6 +22,7 @@
     <File Path="docs/SERVER.md" />
     <File Path="docs/SPECULATIVE.md" />
     <File Path="docs/TELEMETRY.md" />
+    <File Path="docs/TRAY.md" />
     <File Path="docs/TOKENIZERS.md" />
     <File Path="docs/VULKAN.md" />
   </Folder>
