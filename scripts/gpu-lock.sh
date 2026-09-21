@@ -38,6 +38,30 @@
 
 set -u
 
+# ── WSL guard ───────────────────────────────────────────────────────────────────
+# This lock exists to serialise access to ONE physical GPU across every process on
+# this Windows box. Under WSL's bash the script would resolve a DIFFERENT lock
+# directory (a /mnt/c path, or a Linux-side one), so two holders could each "acquire"
+# and both run on the GPU — mutual exclusion silently absent while every command
+# reports success. That is strictly worse than failing.
+#
+# This is not hypothetical. On 2026-09-21 an agent invoked `bash scripts/gpu-lock.sh
+# refresh <name>` from PowerShell, where `bash` on PATH is C:\WINDOWS\system32ash.exe
+# — WSL's bash. It could not see the Windows path at all, exited 127 on every call,
+# and the output was piped away, so the refreshes failed SILENTLY for 30 minutes and
+# the holder was force-released mid-measurement.
+#
+# From PowerShell, call Git bash by its full path:
+#   & "C:\Program Files\Gitinash.exe" scripts/gpu-lock.sh refresh <name>
+# or use the Bash tool, where `bash` is already Git bash.
+if [ -r /proc/version ] && grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
+    echo "[gpu-lock] REFUSING TO RUN UNDER WSL BASH." >&2
+    echo "[gpu-lock] The lock dir would differ from the Windows one, so this would provide" >&2
+    echo "[gpu-lock] NO mutual exclusion while appearing to succeed. Use Git bash:" >&2
+    echo "[gpu-lock]   & \"C:\Program Files\Git\bin\bash.exe\" scripts/gpu-lock.sh ..." >&2
+    exit 3
+fi
+
 # Default: <PRIMARY worktree>/.gpu-lock. Resolving to the *primary* worktree rather than
 # "the checkout this script lives in" is load-bearing: the lock exists to serialise access to
 # ONE physical GPU, so every worktree on the box must converge on the SAME directory.
