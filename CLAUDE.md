@@ -77,6 +77,26 @@ dotLLM/
 - `IAsyncEnumerable<T>` for streaming token generation.
 - Composability over inheritance. Interfaces and records, not deep class hierarchies.
 
+## JSON DTO Rules (System.Text.Json source generation)
+
+- **Never express a default with a property initializer on a DTO that is deserialized and has a
+  `required` member.** Source-generated deserialization silently drops the initializer:
+
+  ```csharp
+  public sealed record Req {
+      public required string[] Messages { get; init; }
+      public bool Stream { get; init; } = true;   // arrives as FALSE
+  }
+  ```
+
+  No warning, no error. Direct construction (`new Req { ... }`) still honours it, so a test that
+  does not round-trip through JSON cannot see the bug. Use a nullable property and resolve the
+  default in code instead.
+- This is ordinary, idiomatic C# that is simply wrong here, so it recurs — it bit three times
+  independently in one day (`ModelPullRequest.Stream`, `TraySettings`, `ChatCompletionRequest.N`).
+  `JsonContextDefaultsTests` guards the whole `ServerJsonContext` surface; if you add a JSON
+  context, add the equivalent guard.
+
 ## Memory Management Rules
 
 - **NEVER** allocate managed arrays for tensor data. Use `NativeMemory.AlignedAlloc` (64-byte for AVX-512, 32-byte for AVX2).

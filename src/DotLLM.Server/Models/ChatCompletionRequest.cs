@@ -155,8 +155,19 @@ public sealed record ChatCompletionRequest
     [JsonPropertyName("top_logprobs")]
     public int? TopLogprobs { get; init; }
 
+    /// <summary>
+    /// Number of choices to generate. Nullable rather than <c>= 1</c>: source-generated
+    /// deserialization drops an initializer on a type with a <c>required</c> member (#462), so
+    /// the old form arrived as <b>0</b>. Resolve the default through <see cref="ChoiceCount"/>,
+    /// never by reading <c>N</c> directly.
+    /// </summary>
+    /// <remarks><c>n</c> is currently accepted and ignored — see #460.</remarks>
     [JsonPropertyName("n")]
-    public int N { get; init; } = 1;
+    public int? N { get; init; }
+
+    /// <summary>The effective number of choices: <see cref="N"/> when given, else 1.</summary>
+    [JsonIgnore]
+    public int ChoiceCount => N ?? 1;
 
     /// <summary>
     /// Optional LoRA adapter name (must already be registered with the server's
@@ -259,8 +270,14 @@ public sealed record ChatMessageDto
 /// </summary>
 public sealed record ToolDefinitionDto
 {
+    /// <summary>
+    /// Constant discriminator. Read-only on purpose: an initialized settable property is
+    /// silently dropped by source-generated deserialization on a type with a <c>required</c>
+    /// member (#462), which made this arrive as <c>null</c> instead of <c>"function"</c>.
+    /// Nothing may set it, so nothing can lose it.
+    /// </summary>
     [JsonPropertyName("type")]
-    public string Type { get; init; } = "function";
+    public string Type => "function";
 
     [JsonPropertyName("function")]
     public required ToolFunctionDto Function { get; init; }
@@ -289,8 +306,9 @@ public sealed record ToolCallDto
     [JsonPropertyName("id")]
     public required string Id { get; init; }
 
+    /// <inheritdoc cref="ToolDefinitionDto.Type"/>
     [JsonPropertyName("type")]
-    public string Type { get; init; } = "function";
+    public string Type => "function";
 
     [JsonPropertyName("function")]
     public required ToolCallFunctionDto Function { get; init; }
