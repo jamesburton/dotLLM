@@ -15,7 +15,7 @@ namespace DotLLM.Tests.Unit.Engine;
 /// <summary>
 /// Tests for <see cref="MtpSpeculativeDecoder"/> (issue #253). Uses a synthetic MTP-capable mock
 /// model whose target and MTP-head predictions are each a plain deterministic function of the
-/// input token — this isolates the DECODER's draft-verify-accept-catchup mechanics (the thing
+/// input token — this isolates the DECODER's draft-verify-accept mechanics (the thing
 /// this class is responsible for) from the real MTP head's forward math (covered separately by
 /// <c>Qwen3HybridDenseMtpTests</c> against a real, if synthetic, GGUF-loaded model).
 /// </summary>
@@ -89,6 +89,26 @@ public sealed class MtpSpeculativeDecoderTests
     }
 
     /// <summary>
+    /// Issue #469: a round verifies <c>[lastToken, d1..dK]</c> in ONE trunk forward. The old
+    /// decoder also forwarded <c>lastToken</c> alone first, so it paid two forwards per round and
+    /// could never beat plain decode.
+    /// </summary>
+    [Fact]
+    public void DraftAndVerify_AllAccepted_CostsOneTrunkForwardPerRound()
+    {
+        int TargetFn(int t) => (t + 1) % VocabSize;
+
+        using var model = new MockMtpModel(TargetFn, TargetFn, supportsMtp: true);
+        var decoder = new MtpSpeculativeDecoder(greedy: true);
+        var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
+
+        RunSpeculative(model, decoder, pipeline, startToken: 1, totalNewTokens: 12, k: 3, out int rounds);
+
+        Assert.Equal(3, rounds);                 // 12 tokens / (3 drafts + 1 bonus)
+        Assert.Equal(rounds, model.TrunkForwardCount);
+    }
+
+    /// <summary>
     /// The MTP head disagrees with the target at specific tokens (forcing rejections every other
     /// round), and the target ALSO differs from a naive "always successor" rule at one special
     /// token (7 → 0 instead of 7 → 8) so a plain-decode oracle and a speculative-decode run can be
@@ -150,25 +170,22 @@ public sealed class MtpSpeculativeDecoderTests
     private static List<int> RunSpeculative(
         MockMtpModel model, MtpSpeculativeDecoder decoder, SamplerPipeline pipeline,
         int startToken, int totalNewTokens, int k)
+        => RunSpeculative(model, decoder, pipeline, startToken, totalNewTokens, k, out _);
+
+    private static List<int> RunSpeculative(
+        MockMtpModel model, MtpSpeculativeDecoder decoder, SamplerPipeline pipeline,
+        int startToken, int totalNewTokens, int k, out int rounds)
     {
         var generatedIds = new List<int> { startToken };
         using var kvCache = new SimpleKvCache(1, NumKvHeads, HeadDim, MaxSeqLen);
-        using var mtpState = new CpuMtpState(HiddenSize, MtpNumKvHeads, MtpHeadDim, maxSteps: Math.Max(k, 1) + 4);
+        using var mtpState = new CpuMtpState(HiddenSize, MtpNumKvHeads, MtpHeadDim, maxSteps: MaxSeqLen);
 
-        // Prefill: seed the target KV-cache with the start token at position 0. `position` must
-        // equal lastToken's OWN KV-cache slot (see DraftAndVerify's remarks: "lastToken already
-        // occupies position in kvCacheTarget"), matching SpeculativeDecoder's identical
-        // convention -- so it starts at 0 here, not 1. This mock model ignores position entirely
-        // for logit computation, so this correction has no effect on this test's assertions (both
-        // values pass); fixed for realism after a real (position-sensitive) CUDA model test caught
-        // an off-by-one derived from copying this exact pattern -- see issue #253's CUDA follow-up.
-        using (ITensor _ = model.Forward([startToken], [0], deviceId: -1, kvCache))
-        {
-        }
-
+        // startToken plays the part of a prefill's sampled token: it sits at position 0 and has not
+        // been forwarded through the trunk yet (issue #469's contract), so there is no prefill.
         int position = 0;
         Span<int> outputBuffer = stackalloc int[k + 1];
         int guard = 0;
+        rounds = 0;
         while (generatedIds.Count - 1 < totalNewTokens && guard++ < totalNewTokens * 4)
         {
             var result = decoder.DraftAndVerify(
@@ -176,13 +193,19 @@ public sealed class MtpSpeculativeDecoderTests
                 constraint: null, position, vocabSize: VocabSize, numCandidates: k, outputBuffer);
 
             Assert.True(result.AcceptedCount > 0, "Every round must accept at least the corrected/bonus token.");
+            rounds++;
 
             for (int i = 0; i < result.AcceptedCount && generatedIds.Count - 1 < totalNewTokens; i++)
                 generatedIds.Add(outputBuffer[i]);
 
             position += result.AcceptedCount;
+
+            // The head's KV-cache holds every committed position (issue #469): it is exactly as
+            // long as the next round's lastToken position.
+            Assert.Equal(position, mtpState.CurrentLength);
         }
 
+        Assert.Empty(model.PairingViolations);
         return generatedIds.Take(totalNewTokens + 1).ToList();
     }
 
@@ -225,8 +248,38 @@ public sealed class MtpSpeculativeDecoderTests
 
         public bool SupportsMtp => _supportsMtp;
 
-        public IMtpState? CreateMtpState() =>
-            _supportsMtp ? new CpuMtpState(HiddenSize, MtpNumKvHeads, MtpHeadDim, maxSteps: 32) : null;
+        public IMtpState? CreateMtpState() => CreateMtpState(MaxSeqLen);
+
+        public IMtpState? CreateMtpState(int maxSequenceLength) =>
+            _supportsMtp ? new CpuMtpState(HiddenSize, MtpNumKvHeads, MtpHeadDim, maxSequenceLength) : null;
+
+        /// <summary>Trunk forwards run so far (any overload).</summary>
+        public int TrunkForwardCount { get; private set; }
+
+        /// <summary>MTP steps whose pending hidden was neither a chained draft nor h_{position-1}.</summary>
+        public List<string> PairingViolations { get; } = [];
+
+        // Captured trunk row for position p is filled with TrunkRowMarker(p); a chained draft step
+        // leaves ChainedMarker. The first element of the pending hidden identifies which it was.
+        private static float TrunkRowMarker(int position) => 1000f + position;
+        private const float ChainedMarker = -1f;
+
+        private void CheckPairing(CpuMtpState state, int position, string where)
+        {
+            float pending = state.PendingHidden[0];
+            bool ok = pending == ChainedMarker
+                      || pending == TrunkRowMarker(position - 1)
+                      || (position == 0 && pending == 0f);
+            if (!ok)
+                PairingViolations.Add($"{where} at position {position}: pending={pending}");
+        }
+
+        private static void StepHead(CpuMtpState state, int position)
+        {
+            if (state.CurrentLength > position) state.Rollback(position);
+            Assert.Equal(position, state.CurrentLength);
+            state.Advance();
+        }
 
         public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
             => Forward(tokenIds, positions, deviceId, null);
@@ -242,6 +295,7 @@ public sealed class MtpSpeculativeDecoderTests
         public unsafe ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
             int deviceId, IKvCache? kvCache, DotLLM.Core.Lora.ILoraAdapter? adapter, IMtpState? mtpState)
         {
+            TrunkForwardCount++;
             int batchSize = tokenIds.Length;
             long totalFloats = (long)batchSize * VocabSize;
             nint ptr = (nint)NativeMemory.AlignedAlloc((nuint)(totalFloats * sizeof(float)), 64);
@@ -274,11 +328,20 @@ public sealed class MtpSpeculativeDecoderTests
 
             if (mtpState is CpuMtpState cap)
             {
-                // Content is irrelevant to this mock's ForwardMtp (which is purely a function of
-                // tokenId), but a real IMtpState consumer must see a well-formed capture.
-                float[] fake = new float[batchSize * HiddenSize];
-                for (int i = 0; i < fake.Length; i++) fake[i] = 0.01f * i;
-                cap.SetCapturedRows(fake, batchSize);
+                // Rows carry their position so the pairing can be checked; the absorb mirrors the
+                // real models': token i pairs with the carry (i == 0) or captured row i - 1.
+                float[] rows = new float[batchSize * HiddenSize];
+                for (int t = 0; t < batchSize; t++)
+                    rows.AsSpan(t * HiddenSize, HiddenSize).Fill(TrunkRowMarker(positions[t]));
+                cap.SetCapturedRows(rows, batchSize);
+                for (int t = 0; t < batchSize; t++)
+                {
+                    if (t == 0) cap.SetPendingFromCarry();
+                    else cap.SetPendingFromCapturedRow(t - 1);
+                    CheckPairing(cap, positions[t], "absorb");
+                    StepHead(cap, positions[t]);
+                }
+                cap.SeedFromCapturedRow(batchSize - 1);
             }
 
             return new UnmanagedTensor(shape, DType.Float32, deviceId, ptr);
@@ -296,7 +359,11 @@ public sealed class MtpSpeculativeDecoderTests
             row[_mtpFn(tokenId)] = 10f;
 
             if (state is CpuMtpState cap)
-                cap.Advance();
+            {
+                CheckPairing(cap, position, "draft");
+                StepHead(cap, position);
+                cap.PendingHiddenMutable.Fill(ChainedMarker);
+            }
 
             return new UnmanagedTensor(new TensorShape(1, VocabSize), DType.Float32, deviceId: -1, ptr);
         }
