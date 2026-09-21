@@ -27,6 +27,33 @@ namespace DotLLM.Engine.Samplers.StopConditions;
 internal static class StopSuffixTrimmer
 {
     /// <summary>
+    /// Size of the decoded-text window a caller must hand to <c>ShouldStop</c> for the stop
+    /// strings in <paramref name="conditions"/> to be matchable, or <c>0</c> when none are
+    /// registered.
+    /// </summary>
+    /// <remarks>
+    /// The window must cover the longest registered stop string; the cushion absorbs stop strings
+    /// contributed by custom <see cref="IStopCondition"/> implementations that this scan cannot
+    /// see. A zero return is the signal that no text is needed at all, which is what lets the
+    /// scheduler skip detokenizing for requests that registered only EOS and max-tokens (#459).
+    /// </remarks>
+    public static int TailWindowSize(IReadOnlyList<IStopCondition> conditions)
+    {
+        int maxStopLen = 0;
+        bool any = false;
+        for (int i = 0; i < conditions.Count; i++)
+        {
+            if (conditions[i] is StopStringCondition ssc)
+            {
+                any = true;
+                if (ssc.StopString.Length > maxStopLen)
+                    maxStopLen = ssc.StopString.Length;
+            }
+        }
+        return any ? Math.Max(64, maxStopLen + 16) : 0;
+    }
+
+    /// <summary>
     /// Finds the longest stop string from <paramref name="conditions"/> that is a suffix
     /// of <paramref name="text"/> and returns its character count. Returns 0 when no stop
     /// string is a suffix of the text.
