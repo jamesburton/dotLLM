@@ -1399,15 +1399,7 @@ public sealed class TextGenerator
     // Tail window passed to stop conditions. Must cover the longest stop string currently
     // registered; a safety cushion absorbs future stop strings added via custom conditions.
     private static int ComputeStopTailSize(List<IStopCondition> conditions)
-    {
-        int maxStopLen = 0;
-        for (int i = 0; i < conditions.Count; i++)
-        {
-            if (conditions[i] is StopStringCondition ssc && ssc.StopString.Length > maxStopLen)
-                maxStopLen = ssc.StopString.Length;
-        }
-        return Math.Max(64, maxStopLen + 16);
-    }
+        => Math.Max(64, StopSuffixTrimmer.TailWindowSize(conditions));
 
     // Speculative decoding's greedy acceptance path matches the target pipeline only when the pipeline
     // itself is effectively argmax. Temperature <= 0 forces argmax selection; repetition penalty can

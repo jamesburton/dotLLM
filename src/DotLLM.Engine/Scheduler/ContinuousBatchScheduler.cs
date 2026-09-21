@@ -252,6 +252,17 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             submissionOrder: Interlocked.Increment(ref _submissionCounter),
             tcs: tcs);
 
+        // Stop strings match on decoded text, so give this sequence a detokenizer to produce one
+        // (#459). Only when a stop string is actually registered — token-level conditions (EOS,
+        // max-tokens) need no text, and most requests carry nothing else.
+        int stopTailSize = StopSuffixTrimmer.TailWindowSize(stops);
+        if (stopTailSize > 0)
+        {
+            seq.StopTailSize = stopTailSize;
+            seq.StopScratch = new char[stopTailSize];
+            seq.Detokenizer = new IncrementalDetokenizer(_tokenizer, initialCapacity: Math.Max(64, maxTokens * 4));
+        }
+
         if (cancellationToken.CanBeCanceled)
         {
             seq.CancellationRegistration = cancellationToken.Register(static state =>
@@ -1278,22 +1289,31 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         result = StopResult.Continue;
         int last = seq.GeneratedTokens[^1];
 
-        // MVP: we do not pass a decoded-text tail. Stop-string conditions therefore won't fire.
-        // EOS and MaxTokens both work on tokenId / count alone, which covers the contract
-        // documented in CLAUDE.md. Tail-aware stop strings are a near-term enhancement —
-        // we'd need a per-sequence IncrementalDetokenizer (see DEFERRED note in the test class).
-        ReadOnlySpan<char> emptyTail = ReadOnlySpan<char>.Empty;
+        // Decoded tail for stop-string conditions (#459). Empty when this request registered none,
+        // in which case no condition reads it: EOS and max-tokens work on tokenId / count alone.
+        ReadOnlySpan<char> tail = ReadOnlySpan<char>.Empty;
+        if (seq.Detokenizer is { } detok)
+        {
+            detok.Append(last);
+            tail = detok.GetTailView(seq.StopTailSize, seq.StopScratch);
+        }
 
         for (int i = 0; i < seq.StopConditions.Count; i++)
         {
-            var r = seq.StopConditions[i].ShouldStop(last, seq.GeneratedTokens, emptyTail);
+            var r = seq.StopConditions[i].ShouldStop(last, seq.GeneratedTokens, tail);
             if (r != StopResult.Continue)
             {
                 result = r;
                 if (r == StopResult.Stop)
                 {
-                    // Stop semantics exclude the triggering token from output.
-                    seq.GeneratedTokens.RemoveAt(seq.GeneratedTokens.Count - 1);
+                    // A stop STRING may match only a suffix of the last token — dropping the whole
+                    // token would eat real output ("ld<|im_end|>" losing "ld"). Keep it and trim the
+                    // matched suffix off the decoded text in CompleteSequence. Token-level stops
+                    // (EOS) keep the original exclude-the-token semantics.
+                    if (StopSuffixTrimmer.MatchedSuffixLength(tail, seq.StopConditions) > 0)
+                        seq.StoppedOnStopString = true;
+                    else
+                        seq.GeneratedTokens.RemoveAt(seq.GeneratedTokens.Count - 1);
                 }
                 return true;
             }
@@ -1309,6 +1329,11 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         string text = seq.GeneratedTokens.Count > 0
             ? _tokenizer.Decode(CollectionsMarshal.AsSpan(seq.GeneratedTokens), stripBosSpace: false)
             : string.Empty;
+
+        // The stop string itself is not part of the output (#459). Trimmed at the character
+        // boundary so a token whose text only ends with the stop string keeps its prefix.
+        if (seq.StoppedOnStopString)
+            text = StopSuffixTrimmer.TrimMatchedSuffix(text, seq.StopConditions);
 
         long kvBytes = seq.KvCache is not null ? TextGenerator.GetKvCacheBytes(seq.KvCache) : 0;
 
