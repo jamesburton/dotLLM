@@ -1,9 +1,12 @@
 using System.Text;
 using System.Text.Json;
+using DotLLM.Core.Configuration;
 using DotLLM.Engine;
+using DotLLM.Engine.Constraints;
 using DotLLM.Server.Models;
 using DotLLM.Server.RateLimiting;
 using DotLLM.Tokenizers;
+using DotLLM.Tokenizers.ToolCallParsers;
 
 namespace DotLLM.Server.Endpoints;
 
@@ -19,9 +22,10 @@ namespace DotLLM.Server.Endpoints;
 /// shape differs. Reference: <c>https://docs.anthropic.com/en/api/messages</c>.
 /// </para>
 /// <para>
-/// Fork-only feature (#448). Follow-on compatibility work — <c>/v1/messages/count_tokens</c>,
-/// the <c>anthropic-version</c>/<c>anthropic-beta</c> headers and extended-thinking blocks —
-/// is tracked separately in #449 and deliberately not implemented here.
+/// Fork-only feature (#448), completed by #449: <c>POST /v1/messages/count_tokens</c>, the
+/// <c>anthropic-version</c>/<c>anthropic-beta</c> headers, a mid-stream <c>error</c> event and
+/// input-side <c>thinking</c>/<c>redacted_thinking</c> blocks. dotLLM does not itself emit
+/// extended-thinking output blocks — see <c>docs/ANTHROPIC_API.md</c>.
 /// </para>
 /// </remarks>
 public static class MessagesEndpoint
@@ -29,16 +33,31 @@ public static class MessagesEndpoint
     private static readonly string[] CommonStopSequences =
         ["<|im_end|>", "<|eot_id|>", "<|eom_id|>", "<|end|>", "</s>", "</tool_call>"];
 
-    /// <summary>Maps <c>POST /v1/messages</c> onto <paramref name="app"/>.</summary>
-    /// <param name="app">The web application to map the route on.</param>
-    public static void Map(WebApplication app) =>
+    /// <summary>
+    /// Maps <c>POST /v1/messages</c> and <c>POST /v1/messages/count_tokens</c>
+    /// onto <paramref name="app"/>.
+    /// </summary>
+    /// <param name="app">The web application to map the routes on.</param>
+    public static void Map(WebApplication app)
+    {
         app.MapPost("/v1/messages", HandleAsync);
+        app.MapPost("/v1/messages/count_tokens", HandleCountTokensAsync);
+    }
 
     private static async Task HandleAsync(
         AnthropicMessagesRequest request,
         ServerState state,
         HttpContext httpContext)
     {
+        // anthropic-version / anthropic-beta are checked before anything else: a request pinned
+        // to a version dotLLM does not implement must not load a model as a side effect (#449).
+        var headerError = AnthropicHeaders.Validate(httpContext.Request.Headers);
+        if (headerError is not null)
+        {
+            await WriteErrorAsync(httpContext, 400, "invalid_request_error", headerError);
+            return;
+        }
+
         // (#369) Activate the requested model, mirroring the OpenAI surface: a cheap field-swap
         // when already resident, a lazy reload when it idled out, a fresh load otherwise.
         // Anthropic has no `keep_alive` request field, so the per-model override is left alone.
@@ -81,15 +100,7 @@ public static class MessagesEndpoint
         var modelId = state.Options.ModelId;
         var generator = state.Generator;
 
-        var messages = AnthropicConverter.ToMessages(request);
-        var tools = AnthropicConverter.ToTools(request.Tools);
-
-        var templateOptions = new ChatTemplateOptions
-        {
-            AddGenerationPrompt = true,
-            Tools = tools,
-        };
-        string prompt = state.ChatTemplate.Apply(messages, templateOptions);
+        string prompt = BuildPrompt(request, state, out var tools);
 
         int maxTokens = request.MaxTokens ?? state.SamplingDefaults.MaxTokens;
         var promptError = RequestValidator.ValidatePromptLength(
@@ -106,12 +117,80 @@ public static class MessagesEndpoint
             new DotLLM.Core.Configuration.ThreadingConfig(state.Options.Threads, state.Options.DecodeThreads));
         options = options with { MaxTokens = effectiveMaxTokens };
 
+        // tool_choice was parsed and then dropped on the floor (#449): the prompt was built with
+        // the tools but nothing constrained or suppressed the model, so `{"type":"tool"}` was
+        // indistinguishable from `auto` and `none` still let a tool call through.
+        var toolChoice = AnthropicConverter.ParseToolChoice(request.ToolChoice);
+        var effectiveParser = ApplyToolChoice(
+            toolChoice, tools, state.ToolCallParser, ref options, out bool forcedToolCall);
+
         if (request.Stream)
             await HandleStreamingAsync(request, generator, state, httpContext, prompt, options,
-                messageId, modelId, tools, promptTokenCount, ct);
+                messageId, modelId, effectiveParser, forcedToolCall, promptTokenCount, ct);
         else
             await HandleNonStreamingAsync(request, generator, state, httpContext, prompt, options,
-                messageId, modelId, tools, ct);
+                messageId, modelId, effectiveParser, ct);
+    }
+
+    /// <summary>
+    /// Applies Anthropic <c>tool_choice</c> semantics and returns the tool-call parser this
+    /// request should use (null when tool calls must not be produced).
+    /// </summary>
+    /// <remarks>
+    /// <list type="bullet">
+    /// <item><c>auto</c> — the model's own parser, unconstrained.</item>
+    /// <item><c>any</c>/<c>tool</c> — decoding is constrained to a tool-call JSON schema, and the
+    /// markerless parser is used, because the constraint emits a bare JSON object rather than the
+    /// model's <c>&lt;tool_call&gt;</c> envelope. Same construction as the CLI's forced path.</item>
+    /// <item><c>none</c> — no parser, so nothing the model emits is reported as <c>tool_use</c>.</item>
+    /// </list>
+    /// A caller-supplied <c>response_format</c> does not exist on this surface, so the constraint
+    /// slot is always free.
+    /// </remarks>
+    /// <param name="toolChoice">The parsed Anthropic <c>tool_choice</c>.</param>
+    /// <param name="tools">The tool definitions the request supplied, if any.</param>
+    /// <param name="modelParser">The model's own tool-call parser, if the model has one.</param>
+    /// <param name="options">Inference options; a decoding constraint is installed on them.</param>
+    /// <param name="forcedToolCall">
+    /// True when decoding was constrained, i.e. the whole completion IS the tool call and none
+    /// of it is assistant text.
+    /// </param>
+    internal static IToolCallParser? ApplyToolChoice(
+        ToolChoice toolChoice,
+        ToolDefinition[]? tools,
+        IToolCallParser? modelParser,
+        ref DotLLM.Core.Configuration.InferenceOptions options,
+        out bool forcedToolCall)
+    {
+        forcedToolCall = false;
+        if (tools is not { Length: > 0 })
+            return null;
+        if (toolChoice is ToolChoice.None)
+            return null;
+        if (modelParser is null)
+            return null;
+
+        string argumentsKey = modelParser is LlamaToolCallParser ? "parameters" : "arguments";
+        var schema = toolChoice switch
+        {
+            ToolChoice.Required => ToolCallSchemaBuilder.BuildForRequired(tools, argumentsKey),
+            ToolChoice.Function fn when Array.Find(tools, t => t.Name == fn.Name) is { } target =>
+                ToolCallSchemaBuilder.BuildForFunction(target, argumentsKey),
+            _ => null,
+        };
+        if (schema is null)
+            return modelParser;
+
+        options = options with
+        {
+            ResponseFormat = new DotLLM.Core.Configuration.ResponseFormat.JsonSchema
+            {
+                Schema = schema,
+                Name = "tool_call",
+            },
+        };
+        forcedToolCall = true;
+        return ToolCallParserFactory.ForToolChoice(toolChoice, modelParser);
     }
 
     private static async Task HandleNonStreamingAsync(
@@ -122,7 +201,7 @@ public static class MessagesEndpoint
         string prompt,
         DotLLM.Core.Configuration.InferenceOptions options,
         string messageId, string modelId,
-        ToolDefinition[]? tools,
+        IToolCallParser? toolCallParser,
         CancellationToken ct)
     {
         InferenceResponse? result = null;
@@ -148,9 +227,9 @@ public static class MessagesEndpoint
         ToolCall[]? toolCalls = null;
         var finishReason = result.FinishReason;
 
-        if (state.ToolCallParser is not null && tools is { Length: > 0 })
+        if (toolCallParser is not null)
         {
-            var enriched = ToolCallDetector.DetectToolCalls(result, state.ToolCallParser);
+            var enriched = ToolCallDetector.DetectToolCalls(result, toolCallParser);
             text = enriched.Text;
             toolCalls = enriched.ToolCalls;
             finishReason = enriched.FinishReason;
@@ -211,16 +290,17 @@ public static class MessagesEndpoint
         string prompt,
         DotLLM.Core.Configuration.InferenceOptions options,
         string messageId, string modelId,
-        ToolDefinition[]? tools,
+        IToolCallParser? toolCallParser,
+        bool forcedToolCall,
         int promptTokenCount,
         CancellationToken ct)
         => await WriteMessageStreamAsync(
             httpContext,
             innerCt => generator.GenerateStreamingTokensAsync(prompt, options, innerCt),
             state.ExecuteAsync,
-            tools is { Length: > 0 } ? state.ToolCallParser : null,
+            toolCallParser,
             request.StopSequences,
-            messageId, modelId, promptTokenCount, ct);
+            messageId, modelId, promptTokenCount, ct, forcedToolCall);
 
     /// <summary>
     /// Emits the Anthropic SSE event sequence for one streaming request:
@@ -245,7 +325,8 @@ public static class MessagesEndpoint
         string messageId,
         string modelId,
         int promptTokenCount,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool forcedToolCall = false)
     {
         // No `Connection: keep-alive` — it is connection-specific and illegal over HTTP/2+.
         SseResponse.ApplyHeaders(httpContext);
@@ -279,27 +360,62 @@ public static class MessagesEndpoint
         FinishReason finishReason = FinishReason.Length;
         int completionTokens = 0;
 
-        await execute(async () =>
-        {
-            await foreach (var token in tokenSource(ct))
-            {
-                if (token.Text.Length > 0)
-                {
-                    completionTokens++;
-                    sb.Append(token.Text);
-                    await WriteEventAsync(httpContext, "content_block_delta",
-                        new AnthropicContentBlockDeltaEvent
-                        {
-                            Index = 0,
-                            Delta = new AnthropicStreamDeltaDto { Type = "text_delta", Text = token.Text },
-                        },
-                        ServerJsonContext.Default.AnthropicContentBlockDeltaEvent, ct);
-                }
+        // Tool-call markup must not ALSO go out as text_delta: the same payload would be
+        // reported twice — once as text, once as the tool_use block emitted below — and an SDK's
+        // text_stream would print raw JSON at the user. The accumulator holds text back from the
+        // moment the parser recognises a tool call; prose emitted before that is genuine and
+        // still streams. Under a forced tool_choice the whole completion is the call, so
+        // suppression starts immediately. For `auto`, only a marker-based parser drives
+        // suppression: GenericToolCallParser's heuristic fires on any `{ ... "name"`, which would
+        // swallow ordinary prose that merely looks JSON-ish.
+        var suppressor = toolCallParser is not null && !forcedToolCall && toolCallParser is not GenericToolCallParser
+            ? new StreamingToolCallAccumulator(toolCallParser)
+            : null;
 
-                if (token.FinishReason.HasValue)
-                    finishReason = token.FinishReason.Value;
-            }
-        }, ct);
+        try
+        {
+            await execute(async () =>
+            {
+                await foreach (var token in tokenSource(ct))
+                {
+                    if (token.Text.Length > 0)
+                    {
+                        completionTokens++;
+                        sb.Append(token.Text);
+                        bool suppress = forcedToolCall || (suppressor?.Append(token.Text) ?? false);
+                        if (!suppress)
+                        {
+                            await WriteEventAsync(httpContext, "content_block_delta",
+                                new AnthropicContentBlockDeltaEvent
+                                {
+                                    Index = 0,
+                                    Delta = new AnthropicStreamDeltaDto { Type = "text_delta", Text = token.Text },
+                                },
+                                ServerJsonContext.Default.AnthropicContentBlockDeltaEvent, ct);
+                        }
+                    }
+
+                    if (token.FinishReason.HasValue)
+                        finishReason = token.FinishReason.Value;
+                }
+            }, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // The headers and message_start are already on the wire, so there is no status code
+            // left to set. The Anthropic stream protocol covers exactly this: a named `error`
+            // event carrying the usual envelope, which the SDK turns back into an APIStatusError.
+            // Without it the client sees a truncated stream and reports a parse/connection error
+            // instead of the failure (#449).
+            await WriteEventAsync(httpContext, "error",
+                new AnthropicErrorResponse
+                {
+                    Error = new AnthropicErrorBody { Type = "api_error", Message = ex.Message },
+                },
+                ServerJsonContext.Default.AnthropicErrorResponse, ct);
+            await httpContext.Response.Body.FlushAsync(ct);
+            return;
+        }
 
         // Close the text block.
         await WriteEventAsync(httpContext, "content_block_stop",
@@ -383,7 +499,12 @@ public static class MessagesEndpoint
     /// <summary>Validates the structural invariants of an Anthropic Messages request.</summary>
     /// <param name="request">The deserialized request body.</param>
     /// <returns>An error message, or <see langword="null"/> when the request is well-formed.</returns>
-    internal static string? ValidateRequest(AnthropicMessagesRequest request)
+    /// <param name="requireMaxTokens">
+    /// True on <c>/v1/messages</c>, where <c>max_tokens</c> is a required field; false on
+    /// <c>/v1/messages/count_tokens</c>, whose request body has no <c>max_tokens</c> at all
+    /// (see <c>MessageCountTokensParams</c> in the official SDK).
+    /// </param>
+    internal static string? ValidateRequest(AnthropicMessagesRequest request, bool requireMaxTokens = true)
     {
         if (request.Messages is null || request.Messages.Length == 0)
             return "messages: at least one message is required";
@@ -391,10 +512,11 @@ public static class MessagesEndpoint
         if (request.Messages.Length > RequestValidator.MaxMessages)
             return $"messages: array exceeds maximum of {RequestValidator.MaxMessages}";
 
-        // max_tokens is a required field of the Anthropic Messages API (unlike OpenAI's).
-        if (!request.MaxTokens.HasValue)
+        // max_tokens is a required field of the Anthropic Messages API (unlike OpenAI's),
+        // but it is absent from the count_tokens body — hence the flag.
+        if (requireMaxTokens && !request.MaxTokens.HasValue)
             return "max_tokens: field required";
-        if (request.MaxTokens.Value <= 0)
+        if (request.MaxTokens.HasValue && request.MaxTokens.Value <= 0)
             return "max_tokens: must be a positive integer";
 
         // Roles and content kinds are checked here rather than left to the converter:
@@ -413,9 +535,131 @@ public static class MessagesEndpoint
 
             if (msg.Content.ValueKind is not (JsonValueKind.String or JsonValueKind.Array))
                 return $"messages[{i}].content: must be a string or an array of content blocks";
+
+            if (msg.Content.ValueKind == JsonValueKind.Array)
+            {
+                string? blockError = ValidateContentBlocks(msg.Content, i);
+                if (blockError is not null)
+                    return blockError;
+            }
+        }
+
+        // A forced tool that is not in `tools` can never be satisfied: the constraint has no
+        // schema to build from, so the request would silently degrade to an ordinary completion.
+        var toolChoice = AnthropicConverter.ParseToolChoice(request.ToolChoice);
+        if (toolChoice is ToolChoice.Function fn &&
+            (request.Tools is null || Array.FindIndex(request.Tools, t => t.Name == fn.Name) < 0))
+        {
+            return $"tool_choice.name: no tool named '{fn.Name}' was provided in tools";
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Rejects content blocks this surface cannot represent.
+    /// </summary>
+    /// <remarks>
+    /// The converter understands <c>text</c>, <c>tool_use</c> and <c>tool_result</c>, and
+    /// deliberately drops <c>thinking</c>/<c>redacted_thinking</c> (they carry no prompt content
+    /// dotLLM can replay). Anything else — <c>image</c>, <c>document</c>, a typo — would be
+    /// silently dropped, and a dropped image means the model answers about a picture it never
+    /// saw. The real API rejects an unknown block type, so dotLLM does too (#449).
+    /// </remarks>
+    private static string? ValidateContentBlocks(JsonElement content, int messageIndex)
+    {
+        int b = 0;
+        foreach (var block in content.EnumerateArray())
+        {
+            if (block.ValueKind != JsonValueKind.Object)
+                return $"messages[{messageIndex}].content[{b}]: must be an object";
+
+            string? type = block.TryGetProperty("type", out var t) && t.ValueKind == JsonValueKind.String
+                ? t.GetString()
+                : null;
+            if (type is null)
+                return $"messages[{messageIndex}].content[{b}].type: field required";
+
+            if (Array.IndexOf(SupportedContentBlockTypes, type) < 0)
+                return $"messages[{messageIndex}].content[{b}].type: unsupported content block type '{type}'";
+
+            b++;
+        }
+        return null;
+    }
+
+    // Input block types this surface accepts. thinking/redacted_thinking are accepted and then
+    // dropped, so a client replaying an extended-thinking transcript is not rejected.
+    private static readonly string[] SupportedContentBlockTypes =
+        ["text", "tool_use", "tool_result", "thinking", "redacted_thinking"];
+
+    /// <summary>
+    /// Builds the prompt for an Anthropic request: message flattening, tool definitions and the
+    /// chat template. Shared by <c>/v1/messages</c> and <c>/v1/messages/count_tokens</c> so the
+    /// count the latter reports cannot drift from the prompt the former actually runs.
+    /// </summary>
+    private static string BuildPrompt(
+        AnthropicMessagesRequest request, ServerState state, out ToolDefinition[]? tools)
+    {
+        var messages = AnthropicConverter.ToMessages(request);
+        tools = AnthropicConverter.ToTools(request.Tools);
+        return state.ChatTemplate!.Apply(messages, new ChatTemplateOptions
+        {
+            AddGenerationPrompt = true,
+            Tools = tools,
+        });
+    }
+
+    /// <summary>
+    /// Handles <c>POST /v1/messages/count_tokens</c>: the number of input tokens the same body
+    /// would consume on <c>POST /v1/messages</c>, without generating anything.
+    /// </summary>
+    /// <remarks>
+    /// The count is <c>ITokenizer.CountTokens</c> over the templated prompt — the same value
+    /// <see cref="RequestValidator.ValidatePromptLength"/> computes for the generating route, so
+    /// <c>count_tokens(body).input_tokens</c> matches <c>messages.create(body).usage.input_tokens</c>.
+    /// Unlike the generating route this needs only the tokenizer and the template, so the
+    /// diffusion-model refusal does not apply.
+    /// </remarks>
+    internal static async Task HandleCountTokensAsync(
+        AnthropicMessagesRequest request,
+        ServerState state,
+        HttpContext httpContext)
+    {
+        var headerError = AnthropicHeaders.Validate(httpContext.Request.Headers);
+        if (headerError is not null)
+        {
+            await WriteErrorAsync(httpContext, 400, "invalid_request_error", headerError);
+            return;
+        }
+
+        var activationError = await state.EnsureActiveAsync(
+            request.Model, keepAliveOverride: null, httpContext.RequestAborted);
+        if (activationError is not null)
+        {
+            await WriteErrorAsync(httpContext, 400, "invalid_request_error", activationError);
+            return;
+        }
+
+        if (!state.IsReady || state.ChatTemplate is null || state.Tokenizer is null)
+        {
+            await WriteErrorAsync(httpContext, 503, "api_error", "No model loaded");
+            return;
+        }
+
+        var validationError = ValidateRequest(request, requireMaxTokens: false);
+        if (validationError is not null)
+        {
+            await WriteErrorAsync(httpContext, 400, "invalid_request_error", validationError);
+            return;
+        }
+
+        string prompt = BuildPrompt(request, state, out _);
+        var response = new AnthropicCountTokensResponse { InputTokens = state.Tokenizer.CountTokens(prompt) };
+
+        httpContext.Response.ContentType = "application/json";
+        await JsonSerializer.SerializeAsync(httpContext.Response.Body, response,
+            ServerJsonContext.Default.AnthropicCountTokensResponse, httpContext.RequestAborted);
     }
 
     /// <summary>

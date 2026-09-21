@@ -60,6 +60,7 @@ namespace DotLLM.Server;
 [JsonSerializable(typeof(AnthropicMessagesRequest))]
 [JsonSerializable(typeof(AnthropicMessageResponse))]
 [JsonSerializable(typeof(AnthropicErrorResponse))]
+[JsonSerializable(typeof(AnthropicCountTokensResponse))]
 [JsonSerializable(typeof(AnthropicMessageStartEvent))]
 [JsonSerializable(typeof(AnthropicContentBlockStartEvent))]
 [JsonSerializable(typeof(AnthropicContentBlockDeltaEvent))]

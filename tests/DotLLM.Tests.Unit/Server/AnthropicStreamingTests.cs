@@ -4,6 +4,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Engine;
 using DotLLM.Server.Endpoints;
 using DotLLM.Tokenizers;
+using DotLLM.Tokenizers.ToolCallParsers;
 using Microsoft.AspNetCore.Http;
 using Xunit;
 
@@ -42,7 +43,8 @@ public sealed class AnthropicStreamingTests
     private static async Task<SseFrame[]> RunAsync(
         IAsyncEnumerable<GenerationToken> tokens,
         IToolCallParser? parser = null,
-        string[]? stopSequences = null)
+        string[]? stopSequences = null,
+        bool suppressToolCallText = false)
     {
         var ctx = new DefaultHttpContext();
         var body = new MemoryStream();
@@ -51,7 +53,7 @@ public sealed class AnthropicStreamingTests
         await MessagesEndpoint.WriteMessageStreamAsync(
             ctx, _ => tokens, NoGate, parser, stopSequences,
             messageId: "msg_test", modelId: "test-model", promptTokenCount: 7,
-            CancellationToken.None);
+            CancellationToken.None, suppressToolCallText);
 
         Assert.Equal("text/event-stream", ctx.Response.ContentType);
         // Connection-specific headers are illegal over HTTP/2 and must not be emitted.
@@ -188,5 +190,149 @@ public sealed class AnthropicStreamingTests
         Assert.Equal("end_turn",
             frames.Single(f => f.Event == "message_delta").Data.GetProperty("delta")
                   .GetProperty("stop_reason").GetString());
+    }
+
+    // --- protocol invariants the official SDK relies on ----------------------
+
+    [Fact]
+    public async Task Streaming_EveryFrameCarriesATypeMatchingItsEventName()
+    {
+        // anthropic/_streaming.py dispatches on the SSE `event:` name and only fills in
+        // `data.type` when the payload omits it — a payload whose `type` disagreed with the
+        // event name would be routed as one event and parsed as another.
+        var parser = new FixedToolCallParser([new ToolCall("toolu_1", "get_weather", "{}")]);
+        var frames = await RunAsync(Tokens(("hi", FinishReason.Stop)), parser);
+
+        foreach (var frame in frames)
+            Assert.Equal(frame.Event, frame.Data.GetProperty("type").GetString());
+    }
+
+    [Fact]
+    public async Task Streaming_MessageStartIsFirstAndMessageStopIsLast()
+    {
+        // accumulate_event() raises "Unexpected event order" for anything before message_start.
+        var frames = await RunAsync(Tokens(("hi", FinishReason.Stop)));
+
+        Assert.Equal("message_start", frames[0].Event);
+        Assert.Equal("message_stop", frames[^1].Event);
+        Assert.Single(frames, f => f.Event == "message_start");
+        Assert.Single(frames, f => f.Event == "message_stop");
+    }
+
+    // --- mid-stream failure --------------------------------------------------
+
+    private static async IAsyncEnumerable<GenerationToken> ThrowingTokens(int okTokens)
+    {
+        for (int i = 0; i < okTokens; i++)
+        {
+            await Task.Yield();
+            yield return new GenerationToken(0, "tok", null);
+        }
+        await Task.Yield();
+        throw new InvalidOperationException("backend exploded");
+    }
+
+    [Fact]
+    public async Task Streaming_FailureAfterMessageStart_EmitsAnErrorEvent()
+    {
+        // Status headers are already flushed, so the only way to report the failure is the
+        // Anthropic stream protocol's named `error` event; the SDK turns it into an
+        // APIStatusError. Without it the client sees a truncated stream (#449).
+        var frames = await RunAsync(ThrowingTokens(okTokens: 2));
+
+        var error = Assert.Single(frames, f => f.Event == "error");
+        Assert.Equal("error", error.Data.GetProperty("type").GetString());
+        Assert.Equal("api_error", error.Data.GetProperty("error").GetProperty("type").GetString());
+        Assert.Contains("backend exploded",
+            error.Data.GetProperty("error").GetProperty("message").GetString()!);
+
+        // A failed stream must not also claim to have finished normally.
+        Assert.DoesNotContain(frames, f => f.Event == "message_delta");
+        Assert.DoesNotContain(frames, f => f.Event == "message_stop");
+        Assert.Equal("error", frames[^1].Event);
+
+        // Whatever was generated before the failure still reached the client.
+        Assert.Equal(2, frames.Count(f => f.Event == "content_block_delta"));
+    }
+
+    [Fact]
+    public async Task Streaming_ClientDisconnect_DoesNotEmitAnErrorEvent()
+    {
+        // A cancelled request is not a server error; the SDK would surface a spurious
+        // APIStatusError for a stream the caller itself abandoned.
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => RunAsync(CancelledTokens()));
+    }
+
+    private static async IAsyncEnumerable<GenerationToken> CancelledTokens()
+    {
+        await Task.Yield();
+        yield return new GenerationToken(0, "tok", null);
+        await Task.Yield();
+        throw new OperationCanceledException();
+    }
+
+    // --- tool-call markup must not also be streamed as text ------------------
+
+    // Bare tool-call JSON, split across two tokens the way a model emits it.
+    private const string JsonHead = @"{""name"":""get_weather"",";
+    private const string JsonTail = @"""arguments"":{""city"":""Paris""}}";
+
+    private static string TextOf(SseFrame[] frames) => string.Concat(
+        frames.Where(f => f.Event == "content_block_delta" &&
+                          f.Data.GetProperty("delta").GetProperty("type").GetString() == "text_delta")
+              .Select(f => f.Data.GetProperty("delta").GetProperty("text").GetString()));
+
+    [Fact]
+    public async Task Streaming_ForcedToolCall_DoesNotAlsoStreamTheJsonAsText()
+    {
+        // With a forced tool_choice the model emits bare tool-call JSON. Streaming it as
+        // text_delta AND re-emitting it as a tool_use block reports the same payload twice:
+        // the SDK's stream.text_stream would print raw JSON to the user, and the accumulated
+        // message would carry a text block that the non-streaming route never produces.
+        var frames = await RunAsync(
+            Tokens((JsonHead, null), (JsonTail, FinishReason.Stop)),
+            new GenericToolCallParser(),
+            suppressToolCallText: true);
+
+        Assert.DoesNotContain("get_weather", TextOf(frames));
+        Assert.Contains(frames, f =>
+            f.Event == "content_block_start" &&
+            f.Data.GetProperty("content_block").GetProperty("type").GetString() == "tool_use");
+        Assert.Equal("tool_use",
+            frames.Single(f => f.Event == "message_delta").Data
+                  .GetProperty("delta").GetProperty("stop_reason").GetString());
+    }
+
+    [Fact]
+    public async Task Streaming_MarkerToolCall_StreamsThePreambleButNotTheMarkup()
+    {
+        // tool_choice=auto with a marker-based parser: text before the marker is genuine
+        // assistant prose and must still reach the client; the <tool_call> envelope must not.
+        var frames = await RunAsync(
+            Tokens(("Let me check. ", null),
+                   ("<tool_call>", null),
+                   ("""{"name":"get_weather","arguments":{"city":"Paris"}}""", null),
+                   ("</tool_call>", FinishReason.Stop)),
+            new HermesToolCallParser());
+
+        string text = TextOf(frames);
+        Assert.Contains("Let me check.", text);
+        Assert.DoesNotContain("tool_call", text);
+        Assert.DoesNotContain("get_weather", text);
+        Assert.Contains(frames, f =>
+            f.Event == "content_block_start" &&
+            f.Data.GetProperty("content_block").GetProperty("type").GetString() == "tool_use");
+    }
+
+    [Fact]
+    public async Task Streaming_NoToolMarkup_StreamsEverythingAsText()
+    {
+        // The suppression must not eat ordinary prose from a model that never calls a tool.
+        var frames = await RunAsync(
+            Tokens(("The answer ", null), ("is 4.", FinishReason.Stop)),
+            new HermesToolCallParser());
+
+        Assert.Equal("The answer is 4.", TextOf(frames));
     }
 }
