@@ -45,10 +45,13 @@
     <Project Path="src/DotLLM.Server/DotLLM.Server.csproj" />
     <Project Path="src/DotLLM.Telemetry/DotLLM.Telemetry.csproj" />
     <Project Path="src/DotLLM.Tokenizers/DotLLM.Tokenizers.csproj" />
+    <Project Path="src/DotLLM.Tray/DotLLM.Tray.csproj" />
+    <Project Path="src/DotLLM.Tray.Core/DotLLM.Tray.Core.csproj" />
     <Project Path="src/DotLLM.Vulkan/DotLLM.Vulkan.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/DotLLM.Tests.Integration/DotLLM.Tests.Integration.csproj" />
     <Project Path="tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj" />
+    <Project Path="tests/DotLLM.Tray.Tests/DotLLM.Tray.Tests.csproj" />
   </Folder>
 </Solution>
