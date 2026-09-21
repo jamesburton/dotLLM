@@ -30,6 +30,16 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// counter profile ("the memory unit is busy") names the unit and not the fix.
 /// </para>
 /// <para>
+/// <b>The <c>Naive</c> arm's absolute number does not reconcile with the model and must not be
+/// quoted.</b> It measures 84.11 ms at seq 512 for the same shape the model's own GPU timestamps
+/// put at ~38 ms per layer (<c>attn_core</c> 604-621 ms over 16 full-attention layers). The flash
+/// arms DO agree across the two harnesses - bench 3.32 ms vs ~2.6 ms in the pass, the gap being
+/// this harness's per-<c>Launch</c> submit-and-wait - so the discrepancy is specific to the naive
+/// arm and is unexplained. It is kept here as a correctness oracle and a rough sanity floor; size
+/// the win against the fallback from the end-to-end <c>attn_core</c> bucket
+/// (<c>scripts/441-e2e-ab.sh</c>) instead.
+/// </para>
+/// <para>
 /// <b>Correctness first.</b> Every arm's output is compared against the naive arm before any
 /// timing is reported. A faster kernel that computes something else is not a result.
 /// </para>

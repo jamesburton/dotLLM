@@ -79,6 +79,23 @@ public static class VulkanAttentionFallbackDiagnostics
     /// <returns>A kernel that can dispatch <paramref name="headDim"/>, or <c>null</c>.</returns>
     public static VulkanFlashAttentionF32Kernel? CreatePrefillFlashAttention(
         VulkanDevice device, string spvDir, int headDim, string modelKind)
+        => CreatePrefillFlashAttention(device, spvDir, headDim, modelKind, wideVariantOverride: null);
+
+    /// <summary>
+    /// <see cref="CreatePrefillFlashAttention(VulkanDevice, string, int, string)"/> with the
+    /// wide-variant choice supplied directly instead of read from the environment. Exists so a
+    /// test can drive the <c>None</c> case - the exact configuration that produced #441 - without
+    /// mutating process-wide environment state.
+    /// </summary>
+    /// <param name="device">Device to create the kernel on.</param>
+    /// <param name="spvDir">Directory holding the compiled SPIR-V blobs.</param>
+    /// <param name="headDim">The model's per-head dimension.</param>
+    /// <param name="modelKind">Model class name for the warning text.</param>
+    /// <param name="wideVariantOverride">Wide variant to load, or <c>null</c> to read the environment.</param>
+    /// <returns>A kernel that can dispatch <paramref name="headDim"/>, or <c>null</c>.</returns>
+    public static VulkanFlashAttentionF32Kernel? CreatePrefillFlashAttention(
+        VulkanDevice device, string spvDir, int headDim, string modelKind,
+        FlashAttentionWideVariant? wideVariantOverride)
     {
         if (VulkanTransformerModel.IsFlashAttentionDisabled())
         {
@@ -86,13 +103,25 @@ public static class VulkanAttentionFallbackDiagnostics
             return null;
         }
 
-        if (headDim > VulkanFlashAttentionF32Kernel.MaxSupportedHeadDim)
+        // Only pay for a wide pipeline when the model has a wide head. The gate this factory
+        // replaced existed precisely so an over-bound model would not build pipelines it could
+        // never dispatch; that property is kept, pointing the other way.
+        FlashAttentionWideVariant wideVariant = headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim
+            ? FlashAttentionWideVariant.None
+            : wideVariantOverride ?? VulkanFlashAttentionF32Kernel.WideVariantFromEnvironment();
+
+        int reachableMaxHeadDim = wideVariant == FlashAttentionWideVariant.None
+            ? VulkanFlashAttentionF32Kernel.MaxHeadDim
+            : VulkanFlashAttentionF32Kernel.WideMaxHeadDim;
+
+        if (headDim > reachableMaxHeadDim)
         {
-            ReportHeadDimTooWide(modelKind, headDim, VulkanFlashAttentionF32Kernel.MaxSupportedHeadDim);
+            ReportHeadDimTooWide(modelKind, headDim, reachableMaxHeadDim);
             return null;
         }
 
-        VulkanFlashAttentionF32Kernel? kernel = VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
+        VulkanFlashAttentionF32Kernel? kernel =
+            VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir, wideVariant);
         if (kernel is null)
         {
             ReportUnavailable(modelKind, "attention_flash_f32.spv is missing or its pipeline failed to build");
@@ -101,8 +130,8 @@ public static class VulkanAttentionFallbackDiagnostics
 
         if (headDim > kernel.SupportedMaxHeadDim)
         {
-            // The wide SPV was absent from this build (or switched off): the base shader alone
-            // cannot take this head. Report and drop the pipelines we would never dispatch.
+            // The wide SPV was absent from this build or the driver rejected it: the base shader
+            // alone cannot take this head. Report and drop pipelines we would never dispatch.
             ReportHeadDimTooWide(modelKind, headDim, kernel.SupportedMaxHeadDim);
             kernel.Dispose();
             return null;

@@ -84,14 +84,16 @@ Two things fix that:
 
 **BR is the opposite of what amortisation predicts at this width.** Same-process, order-reversed, interleaved A/B on gfx1151 at Bonsai 2's real shape (24/4 heads, head_dim 256), min-ms over 5 rounds:
 
-| seq | naive | br16 | br8 | br4 |
-|-----|-------|------|-----|-----|
-| 512 | 84.11 ms | 11.71 ms (7.2×) | 5.02 ms (16.8×) | 3.32 ms (25.4×) |
-| 2048 | 980.4 ms | 174.1 ms (5.6×) | 90.8 ms (10.8×) | 65.8 ms (14.9×) |
+| seq | br16 | br8 | br4 |
+|-----|------|-----|-----|
+| 512 | 11.71 ms | 5.02 ms | 3.32 ms |
+| 2048 | 174.1 ms | 90.8 ms | 65.8 ms |
+
+> The same bench carries a per-token-kernel arm; its numbers are **not** quoted. It measures 84.11 ms (seq 512) for a dispatch the model's own GPU timestamps put at ~38 ms, and the 2.2× discrepancy is unexplained — the flash arms agree across the two harnesses to within per-launch submit overhead, the naive arm does not. Size the win against the fallback from the end-to-end bucket below, not from that arm.
 
 Per-arm ranges are disjoint at both lengths. A *smaller* tile reads each KV row *more* times, so KV amortisation is not the binding constraint here — LDS residency is: `qTile + outAccum` both scale with `BR × MAX_HEAD_DIM`, so at 256 dims BR=16 costs 36.2 KB and pins one workgroup (4 wave64) per CU, BR=8 costs 18.1 KB, BR=4 costs 9.2 KB (~6 workgroups / 24 waves of latency hiding). BR=4 is the **floor for this geometry**, not a measured optimum: `ROWS_PER_SLICE = BR / (WG_SIZE / BC) = BR / 4`, so BR=2 would leave a wave slice zero rows. Going lower needs a narrower workgroup — a separate change.
 
-End-to-end pp512 on Bonsai 2 PQ2_0 (separate process launches, both orders, GDN scan pinned to `ldsfused`): `attn_core` **604.1–810.9 ms → 42.2–51.0 ms** (12–19×) across 3 launches per arm; whole-pass **148.0–166.8 → 200.7–205.2 tok/s** (~1.25×). Both ranges disjoint, and the cleanest pair ran br4 FIRST — the unfavourable slot if GPU clock ramp were doing the work.
+End-to-end pp512 on Bonsai 2 PQ2_0 (separate process launches, both orders, GDN scan pinned to `ldsfused` — #445 landed the variant but did **not** make it the default on this branch: unpinned, `gdn_scan_core` is 1394–1479 ms against 182–188 ms pinned, which puts attention at ~17–18.5 % of the pass instead of ~21 %): `attn_core` **604.1–810.9 ms → 42.2–51.0 ms** (12–19×) across 3 launches per arm; whole-pass **148.0–166.8 → 200.7–205.2 tok/s** (~1.25×). Both ranges disjoint, and the cleanest pair ran br4 FIRST — the unfavourable slot if GPU clock ramp were doing the work.
 
 Wave-width safety: these shaders have no subgroup ops. `slice = tid >> 6` and `c = tid & 63` index the `BC = 64` KV-column tile — tile geometry, not hardware wave width — so they are correct at subgroupSize 32 and 64 alike and need no native-subgroup-size gate (unlike `PQ2_0GemmVariant.RequiresNativeSubgroupSize`).
 

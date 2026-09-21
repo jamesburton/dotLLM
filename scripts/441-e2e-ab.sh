@@ -11,6 +11,11 @@
 # (off, on, on, off), and you read the attn_core BUCKET ratio - the only thing this change can
 # move - with end-to-end tok/s as corroboration, never as the claim.
 #
+# The GDN scan variant is PINNED to ldsfused. #445 landed the variant but did NOT make it the
+# default on this branch: an unpinned launch measured gdn_scan_core at 1394-1479 ms against
+# 182-188 ms pinned, which moves the whole pass enough to change attention's share from ~21 % to
+# ~17-18 %. Pinning keeps this script comparable to the profile the #441 sizing was taken from.
+#
 # Usage: scripts/441-e2e-ab.sh [outdir]
 
 set -uo pipefail
@@ -37,6 +42,7 @@ for arm in off br4 br4 off; do
   out="$OUTDIR/441-e2e-$arm-$i.txt"
   echo "=== launch $i: DOTLLM_VK_FLASH_HD256=$arm -> $out ==="
   DOTLLM_VK_FLASH_HD256="$arm" \
+  DOTLLM_VK_GDN_SCAN_VARIANT="${DOTLLM_VK_GDN_SCAN_VARIANT:-ldsfused}" \
   DOTLLM_VULKAN_HYBRID_PROFILE=1 \
   DOTLLM_VULKAN_HYBRID_PROFILE_MINSEQ=2 \
   DOTLLM_VULKAN_HYBRID_PROFILE_OUT="$out" \

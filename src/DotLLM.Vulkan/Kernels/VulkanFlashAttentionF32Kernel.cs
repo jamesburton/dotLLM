@@ -163,8 +163,12 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
             // br4 is the DEFAULT on measurement, not on symmetry. Same-process, order-reversed,
             // interleaved A/B at Bonsai 2's real attention shape (24/4 heads, headDim 256),
             // min-ms over 5 rounds on gfx1151:
-            //   seq  512: naive 84.11 | br16 11.71 | br8 5.02 | br4 3.32  (7.2x / 16.8x / 25.4x)
-            //   seq 2048: naive 980.4 | br16 174.1 | br8 90.8 | br4 65.8  (5.6x / 10.8x / 14.9x)
+            //   seq  512: br16 11.71 | br8 5.02 | br4 3.32
+            //   seq 2048: br16 174.1 | br8 90.8 | br4 65.8
+            // (The same bench's per-token-kernel arm is NOT quoted: it measures 84.11 ms for a
+            // dispatch the model's own GPU timestamps put at ~38 ms, unexplained. The size of the
+            // win over the fallback comes from the end-to-end profile instead - attn_core
+            // 604-811 ms -> 42-51 ms on a pp512 Bonsai 2 pass.)
             // Per-arm ranges are disjoint at both lengths. The ordering is the opposite of what
             // KV-traffic amortisation alone predicts - a smaller tile reads each KV row MORE
             // times - so amortisation is not the binding constraint at this head width: LDS
@@ -248,9 +252,15 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
             string widePath = Path.Combine(spvDir, WideSpvName(wideVariant));
             if (File.Exists(widePath))
             {
-                wideModule = VulkanModule.LoadFromFile(device, widePath);
+                // The LOAD is inside the try as well as the pipeline build: a corrupt or
+                // driver-rejected wide SPV must degrade this kernel to base-only, not throw out
+                // of Create() where TryCreate would swallow it, lose flash attention entirely,
+                // leak the base module/pipeline/pool, and then report "attention_flash_f32.spv is
+                // missing" - which would be false. (attention_flash_f32_coopmat_hd64's loader
+                // still has the un-guarded shape; noted, not copied.)
                 try
                 {
+                    wideModule = VulkanModule.LoadFromFile(device, widePath);
                     Span<VkDescriptorBinding> wideBindings = stackalloc VkDescriptorBinding[4];
                     wideBindings[0] = new VkDescriptorBinding(0);
                     wideBindings[1] = new VkDescriptorBinding(1);
@@ -264,9 +274,11 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
                 }
                 catch
                 {
-                    wideModule.Dispose();
+                    widePipeline?.Dispose();
+                    wideModule?.Dispose();
                     wideModule = null;
                     widePipeline = null;
+                    widePool = 0;
                 }
             }
         }

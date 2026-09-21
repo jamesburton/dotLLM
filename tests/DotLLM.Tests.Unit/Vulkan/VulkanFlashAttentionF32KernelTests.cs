@@ -256,6 +256,60 @@ public class VulkanFlashAttentionF32KernelTests
         Assert.Equal(VulkanFlashAttentionF32Kernel.MaxHeadDim, none.SupportedMaxHeadDim);
     }
 
+    [SkippableFact]
+    public void CreatePrefillFlashAttention_WideHeadWithNoWideVariant_ReportsAndReturnsNull()
+    {
+        // The exact configuration that produced #441: a 256-dim head with only the 128-dim base
+        // shader available. The factory must return null AND say so - a null return on its own is
+        // what made the bug invisible for a whole profiling campaign.
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+
+        VulkanAttentionFallbackDiagnostics.Reset();
+        VulkanFlashAttentionF32Kernel? kernel = VulkanAttentionFallbackDiagnostics
+            .CreatePrefillFlashAttention(device, spvDir, headDim: 256, modelKind: "TestModel",
+                wideVariantOverride: FlashAttentionWideVariant.None);
+
+        Assert.Null(kernel);
+        string message = Assert.Single(VulkanAttentionFallbackDiagnostics.Reported);
+        Assert.Contains("TestModel", message, StringComparison.Ordinal);
+        Assert.Contains("256 > shader MAX_HEAD_DIM 128", message, StringComparison.Ordinal);
+    }
+
+    [SkippableFact]
+    public void CreatePrefillFlashAttention_WideHeadWithWideVariant_SucceedsSilently()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+
+        VulkanAttentionFallbackDiagnostics.Reset();
+        using VulkanFlashAttentionF32Kernel? kernel = VulkanAttentionFallbackDiagnostics
+            .CreatePrefillFlashAttention(device, spvDir, headDim: 256, modelKind: "TestModel",
+                wideVariantOverride: FlashAttentionWideVariant.Hd256Br4);
+
+        Assert.NotNull(kernel);
+        Assert.Equal(256, kernel!.SupportedMaxHeadDim);
+        Assert.Empty(VulkanAttentionFallbackDiagnostics.Reported);
+    }
+
+    [SkippableFact]
+    public void CreatePrefillFlashAttention_NarrowHead_LoadsNoWidePipeline()
+    {
+        // A headDim-128 model must not pay for a 256-dim pipeline it can never dispatch - the
+        // resource property the old two-part gate existed to protect.
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+
+        VulkanAttentionFallbackDiagnostics.Reset();
+        using VulkanFlashAttentionF32Kernel? kernel = VulkanAttentionFallbackDiagnostics
+            .CreatePrefillFlashAttention(device, spvDir, headDim: 128, modelKind: "TestModel",
+                wideVariantOverride: FlashAttentionWideVariant.Hd256Br4);
+
+        Assert.NotNull(kernel);
+        Assert.Equal(FlashAttentionWideVariant.None, kernel!.WideVariant);
+        Assert.Empty(VulkanAttentionFallbackDiagnostics.Reported);
+    }
+
     // ─────────────────────────────────────────────────────────────
 
     private static void RunOne(int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
