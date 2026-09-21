@@ -88,15 +88,11 @@ public sealed class ModelManagementEndpointsTests
         Assert.Contains("GET /v1/config", routes);
     }
 
-    /// <summary>
-    /// #454 must not collide with the <c>/v1/messages</c> route owned by another issue (#448),
-    /// nor accidentally introduce it.
-    /// </summary>
-    [Fact]
-    public void MessagesRoute_NotIntroducedHere()
-    {
-        Assert.DoesNotContain("POST /v1/messages", MappedRoutes());
-    }
+    // RETIRED: `MessagesRoute_NotIntroducedHere` asserted that #454 did not introduce
+    // POST /v1/messages, which was true and worth pinning while #454 and #448 were developed
+    // in parallel worktrees. #448 has since landed and legitimately owns that route, so the
+    // assertion is now false BY DESIGN rather than by regression. It is removed instead of
+    // inverted: "some other issue registers this route" is not a property this file should own.
 
     // ───────────────────────── enable / disable semantics ─────────────────────
 

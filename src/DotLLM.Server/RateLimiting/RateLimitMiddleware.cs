@@ -147,6 +147,8 @@ public sealed class RateLimitMiddleware
         "/v1/prompt-cache",
         "/v1/cache",
         "/v1/config",
+        "/v1/settings",
+        "/v1/devices",
         "/v1/tokenize",
         "/v1/detokenize",
     ];
