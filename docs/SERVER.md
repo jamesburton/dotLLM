@@ -75,7 +75,7 @@ data: [DONE]
 ### `POST /v1/completions`
 Raw completion (no chat template). Same sampling parameters. Input is `prompt` (string) instead of `messages`.
 
-### `POST /v1/messages` (Anthropic-compatible, fork-only — #448)
+### `POST /v1/messages`, `POST /v1/messages/count_tokens` (Anthropic-compatible, fork-only — #448/#449)
 
 Anthropic Messages API endpoint, served alongside the OpenAI surface so that
 `anthropic` SDK clients can talk to dotLLM unchanged. Top-level `system`,
@@ -94,8 +94,13 @@ Two caveats worth knowing here rather than in the detail doc:
 - A masked text-diffusion model is refused on this route with a `400`; use
   `/v1/chat/completions` for those.
 
-Full reference: **[ANTHROPIC_API.md](ANTHROPIC_API.md)**. `count_tokens`, the
-`anthropic-version`/`anthropic-beta` headers and thinking blocks are tracked in #449.
+`POST /v1/messages/count_tokens` returns `{"input_tokens": N}` for the same body
+without generating, computed from the same templated prompt `/v1/messages` bills.
+`anthropic-version` is honoured (unknown value → `400`), `anthropic-beta` is
+accepted and ignored, and `x-api-key` is accepted — dotLLM performs no
+authentication (see [Security](#security)).
+
+Full reference: **[ANTHROPIC_API.md](ANTHROPIC_API.md)**.
 
 ### `POST /v1/embeddings`
 Extract embedding vectors from text.
