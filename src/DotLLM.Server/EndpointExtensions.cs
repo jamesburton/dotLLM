@@ -26,6 +26,7 @@ public static class EndpointExtensions
         PromptCacheEndpoint.Map(app);
         ModelManagementEndpoint.Map(app);
         ModelInspectEndpoint.Map(app);
+        EmbeddingsEndpoint.Map(app);
         LoraEndpoints.Map(app);
         SettingsEndpoint.Map(app);
         DeviceEndpoint.Map(app);

@@ -187,6 +187,52 @@ public static class GgufModelConfigExtractor
             Moe = moeConfig,
             GdnConfig = gdnConfig,
             ChatTemplate = chatTemplate,
+            PoolingType = ExtractPoolingType(metadata, arch),
+        };
+    }
+
+    /// <summary>
+    /// Reads the GGUF <c>{arch}.pooling_type</c> key. llama.cpp stores the raw
+    /// <c>llama_pooling_type</c> enum value there (<c>src/llama-model.cpp</c>:
+    /// <c>ml.get_key(LLM_KV_POOLING_TYPE, hparams.pooling_type, false)</c>), so the value maps
+    /// one-to-one onto <see cref="DotLLM.Core.Models.PoolingType"/>. Returns <c>null</c> when the
+    /// key is absent (every ordinary generative checkpoint) or holds an unrecognised value.
+    /// </summary>
+    private static PoolingType? ExtractPoolingType(GgufMetadata metadata, string arch)
+    {
+        if (!metadata.TryGetValue($"{arch}.pooling_type", out _))
+            return null;
+
+        // Written as UINT32 by convert_hf_to_gguf.py; accept INT32 too since the underlying
+        // C enum is signed and -1 (UNSPECIFIED) is representable.
+        uint raw;
+        try
+        {
+            raw = metadata.GetUInt32($"{arch}.pooling_type");
+        }
+        catch (InvalidOperationException)
+        {
+            try
+            {
+                int signed = metadata.GetInt32($"{arch}.pooling_type");
+                if (signed < 0)
+                    return null; // LLAMA_POOLING_TYPE_UNSPECIFIED
+                raw = (uint)signed;
+            }
+            catch (InvalidOperationException)
+            {
+                return null;
+            }
+        }
+
+        return raw switch
+        {
+            0 => Core.Models.PoolingType.None,
+            1 => Core.Models.PoolingType.Mean,
+            2 => Core.Models.PoolingType.Cls,
+            3 => Core.Models.PoolingType.Last,
+            4 => Core.Models.PoolingType.Rank,
+            _ => null,
         };
     }
 
