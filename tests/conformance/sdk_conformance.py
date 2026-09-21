@@ -133,7 +133,14 @@ def classify(exc: BaseException) -> tuple[str, str]:
     if isinstance(exc, RowNotExercised):
         return NOT_EXERCISED, str(exc)
     if isinstance(exc, (openai.NotFoundError, anthropic.NotFoundError)):
-        return NOT_IMPLEMENTED, "404 — endpoint not implemented"
+        # Only an *unrouted* 404 means "not implemented". ASP.NET's unmatched-route
+        # 404 carries no body; an implemented endpoint 404-ing for, say, an unknown
+        # model id carries a JSON error body — that is a FAIL of the row, not a
+        # missing feature. Without this split, #448/#450 landing would turn a
+        # wrong-id 404 into a green-adjacent NOT-IMPL.
+        if getattr(exc, "body", None) in (None, "", {}):
+            return NOT_IMPLEMENTED, "404, empty body — route not registered"
+        return FAIL, f"HTTP 404 with a body (route exists, request rejected): {_short(exc.body)}"
     if isinstance(exc, (openai.APIStatusError, anthropic.APIStatusError)):
         body = getattr(exc, "body", None)
         return FAIL, f"HTTP {exc.status_code}: {_short(body if body is not None else exc.message)}"
@@ -337,6 +344,19 @@ def oai_usage_stream(c: Ctx) -> str:
     check(final.choices == [], "the usage chunk must have an empty choices array")
     check(final.usage.total_tokens > 0, "usage.total_tokens is 0")
     return f"final chunk usage total={final.usage.total_tokens}"
+
+
+def oai_usage_stream_unrequested(c: Ctx) -> str:
+    """Without stream_options.include_usage, OpenAI sends no usage on any chunk."""
+    stream = c.oai.chat.completions.create(
+        model=c.model, messages=[{"role": "user", "content": "Hi."}],
+        max_tokens=8, temperature=0, seed=0, stream=True,
+    )
+    carrying = [i for i, ch in enumerate(stream) if ch.usage is not None]
+    check(not carrying,
+          f"{len(carrying)} chunk(s) carried usage although include_usage was not "
+          f"requested (indices {carrying[:5]})")
+    return "no unrequested usage"
 
 
 def oai_models_list(c: Ctx) -> str:
@@ -595,6 +615,7 @@ def build_rows() -> list[Row]:
         Row("openai/logprobs", "openai", "logprobs + top_logprobs", "—", oai_logprobs),
         Row("openai/usage.nonstream", "openai", "token counting via usage (non-stream)", "—", oai_usage_nonstream),
         Row("openai/usage.stream", "openai", "token counting via stream_options.include_usage", "#450", oai_usage_stream),
+        Row("openai/usage.stream.unrequested", "openai", "no usage when include_usage is absent", "#450", oai_usage_stream_unrequested),
         Row("openai/models.list", "openai", "model list", "—", oai_models_list),
         Row("openai/models.retrieve", "openai", "model retrieve", "#450", oai_models_retrieve),
         Row("openai/embeddings", "openai", "embeddings", "#451", oai_embeddings),
@@ -635,16 +656,42 @@ def resolve_fixture() -> tuple[str, str | None]:
         f"`dotllm model pull` one of: " + ", ".join(r for r, _ in FIXTURE_CANDIDATES))
 
 
+def cli_entrypoint() -> list[str]:
+    """Locate the *built* CLI, not `dotnet run`.
+
+    `dotnet run` spawns the app as a grandchild, so on Windows ``terminate()``
+    kills only the launcher and the real server survives holding the port. The
+    next run's ``wait_ready`` would then latch onto that orphan and silently
+    measure a stale build.
+    """
+    out = REPO_ROOT / "src" / "DotLLM.Cli" / "bin" / "Release"
+    for tfm in sorted(out.glob("net*"), reverse=True):
+        exe = tfm / ("DotLLM.Cli.exe" if sys.platform == "win32" else "DotLLM.Cli")
+        if exe.is_file():
+            return [str(exe)]
+        dll = tfm / "DotLLM.Cli.dll"
+        if dll.is_file():
+            return ["dotnet", str(dll)]
+    raise SystemExit("CLI not built — run: dotnet build src/DotLLM.Cli -c Release")
+
+
 def start_server(model: str, quant: str | None, port: int, device: str) -> subprocess.Popen:
-    cmd = ["dotnet", "run", "--project", str(REPO_ROOT / "src" / "DotLLM.Cli"),
-           "-c", "Release", "--no-build", "--", "serve", model,
-           "--port", str(port), "--device", device,
-           "--no-ui", "--no-browser"]
+    cmd = cli_entrypoint() + ["serve", model, "--port", str(port), "--device", device,
+                              "--no-ui", "--no-browser"]
     if quant:
         cmd += ["--quant", quant]
-    print(f"[server] {' '.join(cmd[7:])}")
+    print(f"[server] {' '.join(cmd[1:])}")
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             encoding="utf-8", errors="replace")
+
+
+def port_already_serving(base_url: str) -> bool:
+    """True if something already answers /health — an orphan from a prior run."""
+    try:
+        with urllib.request.urlopen(base_url + "/health", timeout=2) as r:
+            return r.status == 200
+    except Exception:
+        return False
 
 
 def wait_ready(base_url: str, timeout: float = 300) -> bool:
@@ -713,10 +760,16 @@ def main() -> int:
     fixture = "(external server)"
     try:
         if base_url is None:
+            base_url = f"http://127.0.0.1:{args.port}"
+            if port_already_serving(base_url):
+                print(f"error: something already answers {base_url}/health — most likely an "
+                      f"orphaned server from an earlier run. Kill it (a stale build would be "
+                      f"measured silently) or pass --base-url to target it deliberately.",
+                      file=sys.stderr)
+                return 2
             model_arg, quant = resolve_fixture()
             fixture = f"{model_arg}" + (f" [{quant}]" if quant else "")
             proc = start_server(model_arg, quant, args.port, args.device)
-            base_url = f"http://127.0.0.1:{args.port}"
             print(f"[server] waiting for {base_url} ...")
             if not wait_ready(base_url):
                 proc.terminate()

@@ -59,6 +59,7 @@ changed to produce it.**
 |---|---|---|
 | `openai/models.retrieve` | #450 | `GET /v1/models/{id}` is not routed — 404. Only the list endpoint exists. |
 | `openai/usage.stream` | #450 | `stream_options` is absent from `ChatCompletionRequest`, so `include_usage` is ignored. Usage is instead attached to the last *content* chunk — the one still carrying `choices[0].finish_reason` — plus a non-standard `timings` member. OpenAI's contract is a separate terminal chunk with `choices: []`, and usage only when requested. |
+| `openai/usage.stream.unrequested` | #450 | The server attaches `usage` to the final chunk of *every* stream. OpenAI sends usage only when `stream_options.include_usage` is set, so this row measures the other half of the same gap. |
 | `openai/tool.parallel` | #450 | `parallel_tool_calls` is absent from the request DTO too; the row also inherits the single-tool failure below. |
 | `openai/embeddings` | #451 | `POST /v1/embeddings` is not routed — 404. Note `RateLimitMiddleware.IsMeteredPath` already lists `/v1/embeddings`, so that allowlist is drifted ahead of reality. |
 | `openai/error.envelope` | #452 | A 400 returns the flat `{"error":"max_tokens must be a positive integer"}` from `Models/CommonResponses.cs`. OpenAI nests `{"message","type","param","code"}` under `error`; the SDK unwraps `body["error"]`, so `e.body` arrives as a bare string. |
@@ -87,7 +88,10 @@ the status code, so `RateLimitError` would be raised even by today's flat body
 and the row would pass vacuously. It additionally requires a structured error
 object with `message` and a rate-limit `type`, and a `Retry-After` response
 header. (`WriteRejection` already sets `Retry-After` and `X-RateLimit-Limiter`;
-it is the body that is flat.)
+it is the body that is flat.) **Note that the `--attempt-429` path has therefore
+never executed on this tree** — `_burst_until_429` and both `RateLimitError`
+assertion blocks are, by construction, untested code until rate limiting becomes
+reachable.
 
 ### Defects found that no sibling issue currently owns
 
@@ -98,14 +102,19 @@ it is the body that is flat.)
    therefore have no effect: a forced tool call is not forced and `"none"` does
    not suppress tools. This is why `openai/tool.single` is red despite using a
    forced `tool_choice` specifically to keep model flakiness out of the row.
-2. **`json_schema` constrained decoding never closes the object.** With strict
+2. **`json_schema` constrained decoding accepts a comma it should have
+   forbidden, then has no legal continuation.** With strict
    `response_format.json_schema` the server emits
    `{"city":"Paris","population":2140000, ` followed by an unbounded whitespace
    run until `max_tokens` (`finish_reason: "length"`). Reproduced at
-   `max_tokens` 64 **and** 300, so it is not a short budget: after the
-   separating comma the constraint appears to permit whitespace indefinitely
-   without requiring the next property name. `{"type":"json_object"}` works and
-   that row passes.
+   `max_tokens` 64 **and** 300, so it is not a short budget. Both required
+   properties were already emitted and the schema sets
+   `additionalProperties: false`, so at that point `}` is the *only* legal
+   token — the `,` itself is the illegal one. The grammar admitted it and was
+   then left with nothing but whitespace to emit. That points at the
+   schema→grammar translation ignoring `additionalProperties` / required-set
+   completion, not at a whitespace rule. `{"type":"json_object"}` works and that
+   row passes.
 3. **`<|eom_id|>` does not stop generation for Llama-3.2.**
    `CommonStopSequences` contains it, yet tool responses contain it verbatim and
    loop `<|python_tag|>{...}<|eom_id|><|start_header_id|>assistant…` until
