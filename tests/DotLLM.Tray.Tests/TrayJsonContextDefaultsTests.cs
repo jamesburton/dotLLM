@@ -31,12 +31,18 @@ namespace DotLLM.Tray.Tests;
 /// property. Anything that differs had its initializer dropped.
 /// </para>
 /// <para>
-/// <b>Why an empty payload and not "only the required members".</b> The server-side guard names
-/// the required members because those types have them. Nothing in the tray does — and
-/// <c>TraySettings.Normalized()</c> documents the defaults being dropped on a record with no
-/// <c>required</c> member at all. Whether that is really the same mechanism is settled by
-/// <see cref="TraySettings_PartialLoad_IsTheReasonNormalizedExists"/> below rather than assumed,
-/// because the answer decides whether <c>required</c> is the trigger or merely a correlate.
+/// <b>The trigger is the <c>init</c> accessor</b>, settled here rather than assumed. Writing this
+/// guard failed immediately on 36 properties across both tray contexts, on types with no
+/// <c>required</c> member anywhere — which refuted the project's then-current rule. Probed four
+/// ways on .NET 10: <c>init</c> drops on both a <c>record</c> and a plain <c>class</c>,
+/// <c>set</c> is honoured, adding a <c>required</c> member changes nothing, and reflection-based
+/// serialization is unaffected in every case. <c>required</c> was a correlate: the first three
+/// hits all happened to sit on types that also had one.
+/// </para>
+/// <para>
+/// This is why the payload here is empty rather than "only the required members" as the
+/// server-side guard does — nothing in the tray has a required member, and requiring one would
+/// have hidden every defect it found.
 /// </para>
 /// </remarks>
 public sealed class TrayJsonContextDefaultsTests
@@ -127,33 +133,34 @@ public sealed class TrayJsonContextDefaultsTests
 
     /// <summary>
     /// The structural precondition, caught one step earlier and with a clearer message than a
-    /// value mismatch: no tray DTO may combine a <c>required</c> member with a property
-    /// initializer. Nothing does today — which is exactly why this belongs here <i>now</i>, since
-    /// the day someone adds the first <c>required</c> member is the day the existing initializers
-    /// (<c>TrayAvailableModel.Enabled = true</c> among them, where a silent <c>false</c> would
-    /// disable models) become live bugs rather than latent ones.
+    /// value mismatch: <b>no <c>init</c> property of a tray DTO may carry an initializer</b>,
+    /// because source generation drops it.
     /// </summary>
+    /// <remarks>
+    /// The round-trip test above catches the same thing by its effect; this catches it by its
+    /// shape, and names the accessor responsible. An earlier version of this test looked for a
+    /// <c>required</c> member on the type — the rule the project held at the time — and would
+    /// therefore have passed cleanly over all 36 broken properties, since no tray DTO has one.
+    /// That is the whole reason it is written this way now.
+    /// </remarks>
     [Theory]
     [MemberData(nameof(Contexts))]
-    public void NoTypeCombinesARequiredMemberWithAPropertyInitializer(string name, JsonSerializerContext context)
+    public void NoInitOnlyPropertyCarriesAnInitializer(string name, JsonSerializerContext context)
     {
         var offenders = new List<string>();
 
         foreach (Type type in SerializableTypes(context).Where(IsPlainObject))
         {
-            PropertyInfo[] props = type.GetProperties(BindingFlags.Public | BindingFlags.Instance);
-            if (!props.Any(p => p.GetCustomAttribute<RequiredMemberAttribute>() is not null))
-                continue;
-
             object? direct;
             try { direct = Activator.CreateInstance(type, nonPublic: true); }
             catch (MissingMethodException) { continue; }
             if (direct is null) continue;
 
-            foreach (PropertyInfo p in props)
+            foreach (PropertyInfo p in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
             {
-                if (p.GetCustomAttribute<RequiredMemberAttribute>() is not null || !p.CanRead)
+                if (!p.CanRead || !IsInitOnly(p) || p.GetCustomAttribute<JsonIgnoreAttribute>() is not null)
                     continue;
+
                 object? value = SafeGet(p, direct);
                 if (value is not null && !IsDefaultOfType(value, p.PropertyType))
                     offenders.Add($"{type.Name}.{p.Name} (initializer '{value}')");
@@ -161,10 +168,16 @@ public sealed class TrayJsonContextDefaultsTests
         }
 
         Assert.True(offenders.Count == 0,
-            $"{name}: these properties carry an initializer on a type that also has a required member, "
-            + "which is the #462 shape — the initializer is dropped on deserialization. Make them "
-            + "nullable and resolve the default in code:\n" + string.Join("\n", offenders));
+            $"{name}: these `init` properties carry an initializer, which source generation drops on "
+            + "deserialization (#462). Make them nullable and resolve the default in code:\n"
+            + string.Join("\n", offenders));
     }
+
+    /// <summary>An <c>init</c>-only setter is marked by the <c>IsExternalInit</c> modreq.</summary>
+    private static bool IsInitOnly(PropertyInfo p) =>
+        p.SetMethod is { } setter
+        && setter.ReturnParameter.GetRequiredCustomModifiers()
+            .Any(m => m.FullName == "System.Runtime.CompilerServices.IsExternalInit");
 
     /// <summary>
     /// Settles what <c>TraySettings.Normalized()</c>'s remarks assert: that the generated
