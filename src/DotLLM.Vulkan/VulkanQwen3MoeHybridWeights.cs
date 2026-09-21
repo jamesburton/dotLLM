@@ -348,11 +348,19 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
     private static bool KeepF16(QuantizationType qt, int k) => qt == QuantizationType.F16 && (k & 1) == 0;
     private static bool KeepBf16(QuantizationType qt, int k) => qt == QuantizationType.BF16 && (k & 1) == 0;
 
+    // PQ2_0 (PrismML Bonsai ternary) packs 128 weights per group into 34 bytes: an f16 group
+    // scale plus 2.125 bits per weight. Widening it to F32 is a ~15x expansion — for Bonsai 2 27B
+    // that is ~108 GB of device-local memory against a 93 GiB budget, which is how the load used
+    // to die with VK_ERROR_OUT_OF_DEVICE_MEMORY on a heap that looked empty
+    // (.docs/BONSAI2_27B_SUPPORT.md). Keeping it packed is not an optimisation here, it is the
+    // difference between loading and not loading.
+    private static bool KeepPQ2_0(QuantizationType qt, int k) => qt == QuantizationType.PQ2_0 && (k % 128) == 0;
+
     private static bool KeepNative(QuantizationType qt, int k)
         => KeepQ8(qt, k) || KeepQ4K(qt, k) || KeepQ5K(qt, k) || KeepQ6K(qt, k)
         || KeepIq2Xxs(qt, k) || KeepIq2Xs(qt, k) || KeepIq2S(qt, k)
         || KeepIq3Xxs(qt, k) || KeepIq3S(qt, k)
-        || KeepF16(qt, k) || KeepBf16(qt, k);
+        || KeepF16(qt, k) || KeepBf16(qt, k) || KeepPQ2_0(qt, k);
 
     private static QuantizationType DeviceQuantTypeFor(QuantizationType qt, int k)
     {
@@ -367,6 +375,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         if (KeepIq3S(qt, k)) return QuantizationType.IQ3_S;
         if (KeepF16(qt, k)) return QuantizationType.F16;
         if (KeepBf16(qt, k)) return QuantizationType.BF16;
+        if (KeepPQ2_0(qt, k)) return QuantizationType.PQ2_0;
         return QuantizationType.F32;
     }
 

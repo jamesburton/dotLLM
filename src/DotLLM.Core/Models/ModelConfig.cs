@@ -158,6 +158,17 @@ public record ModelConfig
     public GatedDeltaNetConfig? GdnConfig { get; init; }
 
     /// <summary>
+    /// PrismML blockwise-Hadamard weight fold (GGUF <c>prism.hadamard.*</c>). Non-null only for
+    /// checkpoints stored in a rotated basis — currently the Bonsai 2 ternary family.
+    /// </summary>
+    /// <remarks>
+    /// When present, every folded weight's input activation must be transformed before the matmul
+    /// (and rotated lookup tables un-transformed after the lookup). Ignoring it does not fail: the
+    /// weights are well-formed values in the wrong basis, so the model generates fluent nonsense.
+    /// </remarks>
+    public HadamardFoldConfig? HadamardFold { get; init; }
+
+    /// <summary>
     /// Number of trailing Multi-Token Prediction (MTP / "NextN") head layers present in the
     /// checkpoint, beyond <see cref="NumLayers"/> trunk layers. 0 (default) means the GGUF has
     /// no MTP head — self-speculative decoding is unavailable and every other code path is

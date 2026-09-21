@@ -329,6 +329,107 @@ public sealed class VulkanPQ2_0GemmBench
         return sw.Elapsed.TotalMicroseconds / batch;
     }
 
+    /// <summary>
+    /// Issue #446 — the small-n dispatch crossover. Sweeps <c>n = 1..64</c> with the
+    /// <b>current default</b> GEMM variant (and <see cref="PQ2_0GemmVariant.Coopmat32"/> as the
+    /// tie-back to #435's numbers) against a looped GEMV, to locate the <c>n</c> at which
+    /// <c>RecordMatmul</c>'s <c>seqLen == 1 ? GEMV : GEMM</c> dispatch should actually switch.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>The GEMV arm is a lower bound on a real looped GEMV, so its verdict is one-sided.</b>
+    /// <see cref="RunGemvPass"/> re-dispatches over the same buffer offsets with no barriers, so
+    /// the dispatches overlap and every repeat after the first hits whatever the previous one
+    /// left in cache. A shippable loop would bind per-token sub-ranges; since the three buffer
+    /// handles are unchanged that costs only two extra push-constant words (the
+    /// <c>DescriptorSetCache</c> is handle-keyed and would still hit), and the disjoint
+    /// <c>y[t·M..]</c> writes still need no barriers — so the only real optimism left is cache
+    /// residency, which cannot apply to <c>lm_head</c> at 337 MB packed. <b>Therefore: wherever
+    /// the GEMM beats this arm, it also beats a real looped GEMV, and no crossover exists
+    /// there.</b> The converse is not safe to assert on the sub-32 MB projections.
+    /// </para>
+    /// <para>
+    /// <c>speedup</c> is GEMM-relative: <c>&gt; 1.00x</c> means the GEMM wins and the current
+    /// dispatch is right; <c>&lt; 1.00x</c> means a looped GEMV would be faster at that n.
+    /// Enable with <c>DOTLLM_PQ2_0_GEMM_BENCH=1</c>; override the ladder with
+    /// <c>DOTLLM_PQ2_0_CROSSOVER_N</c> (comma-separated).
+    /// </para>
+    /// </remarks>
+    [SkippableFact]
+    public void Bench_PQ2_0SmallNCrossover()
+    {
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_GEMM_BENCH"), "1", StringComparison.Ordinal),
+            "DOTLLM_PQ2_0_GEMM_BENCH=1 to enable this benchmark.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        PinToPCores();
+        int baseBatch = EnvInt("DOTLLM_PQ2_0_GEMM_BENCH_BATCH", 8);
+        int[] ns = ParseNs(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_CROSSOVER_N"))
+            ?? [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64];
+        var shapes = ParseShapes(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_GEMM_BENCH_SHAPES"))
+            ?? [DefaultShapes[2], DefaultShapes[4]];   // ffn_gate/up (fits MALL) + lm_head (does not)
+
+        using var device = VulkanDevice.Create();
+        using var gemv = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
+
+        var selected = PQ2_0GemmVariant.SelectFor(device);
+        _output.WriteLine($"Device: {device.DeviceName}  SubgroupSize: {device.SubgroupSize}  Coopmat: {device.HasCooperativeMatrix}");
+        _output.WriteLine($"SelectFor(device) => {selected.SpvFileName}   (THE CURRENT DEFAULT)");
+        _output.WriteLine($"baseBatch={baseBatch}  schedule: {WarmupPasses} warmup + {Passes} interleaved order-reversed passes (median of per-pass ratios)");
+        _output.WriteLine("speedup is GEMM-relative: >1.00x = GEMM wins (current dispatch correct); <1.00x = a looped GEMV would win.");
+
+        var arms = new List<(string Label, PQ2_0GemmVariant Variant)> { ($"DEFAULT {selected.SpvFileName}", selected) };
+        if (PQ2_0GemmVariant.Coopmat32.IsSupportedOn(device) && selected != PQ2_0GemmVariant.Coopmat32)
+            arms.Add(("#435 tie-back: coopmat32", PQ2_0GemmVariant.Coopmat32));
+
+        foreach (var (label, variant) in arms)
+        {
+            using var gemm = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir, variant);
+            foreach (var (tag, m, k) in shapes)
+            {
+                _output.WriteLine("");
+                _output.WriteLine($"### {label} — {tag}");
+                _output.WriteLine("| n | batch | looped-GEMV µs | GEMM µs | speedup |");
+                _output.WriteLine("|---:|---:|---:|---:|---:|");
+
+                long rowBytes = (long)(k / GroupSize) * GroupBytes;
+                long wBytes = m * rowBytes;
+                int maxN = ns.Max();
+                using var bufW = device.Allocate((wBytes + 3) & ~3L);
+                using var bufB = device.Allocate((long)maxN * k * sizeof(float));
+                using var bufC = device.Allocate((long)maxN * m * sizeof(float));
+
+                var rng = new Random(0x2A_53);
+                byte[] w = new byte[wBytes];
+                rng.NextBytes(w);              // random packed codes; timing is data-independent
+                float[] b = new float[(long)maxN * k];
+                for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
+                device.Upload(new ReadOnlySpan<byte>(w), bufW);
+                device.Upload(b, bufB);
+
+                foreach (int n in ns)
+                {
+                    // The GEMV arm costs O(n) dispatches, so hold total work roughly constant as
+                    // n grows or lm_head at n=64 takes ~a minute per pass and burns the lock.
+                    int batch = Math.Max(1, baseBatch / Math.Max(1, (n + 7) / 8));
+                    (double gemvUs, double gemmUs, double ratio) =
+                        MeasurePaired(device, gemv, gemm, bufW, bufB, bufC, m, k, n, batch);
+                    _output.WriteLine($"| {n} | {batch} | {gemvUs:F2} | {gemmUs:F2} | {ratio:F2}x |");
+                }
+            }
+        }
+    }
+
+    private static int[]? ParseNs(string? spec)
+    {
+        if (string.IsNullOrWhiteSpace(spec)) return null;
+        var list = new List<int>();
+        foreach (string entry in spec.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            if (int.TryParse(entry, NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) && v > 0)
+                list.Add(v);
+        return list.Count > 0 ? [.. list] : null;
+    }
+
     private static (string Tag, int M, int K)[]? ParseShapes(string? spec)
     {
         if (string.IsNullOrWhiteSpace(spec)) return null;

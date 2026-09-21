@@ -44,7 +44,7 @@ namespace DotLLM.Vulkan;
 /// MTP-accelerated speculative decoding is unavailable on Vulkan.
 /// </para>
 /// </remarks>
-public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
+public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
 {
     private readonly VulkanDevice _device;
     private readonly bool _ownsDevice;
@@ -57,6 +57,14 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
 
     private readonly VulkanQwen3HybridDenseWeights _weights;
     private readonly VulkanQwen3HybridDenseForwardState _state;
+
+    // PrismML Hadamard fold (prism.hadamard.*) — null outside the Bonsai 2 family; every rotation
+    // site below is a no-op when it is null.
+    private readonly VulkanHadamardRotation? _hadamard;
+
+    // Compute-dispatch gather for a token-embedding table kept packed on the device; null when the
+    // table was widened to F32 and the vkCmdCopyBuffer row copy applies.
+    private readonly Pq2_0EmbedGatherF32Kernel? _embedGather;
     private readonly VulkanGdnStateCache _gdnCache;
     private readonly VulkanQwen3MoeHybridKernels _kernels;
 
@@ -106,7 +114,9 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         VulkanQwen3MoeHybridKernels kernels,
         int[] kvSlotForLayer, int attentionLayerCount,
         int[] gdnLayerOrdinal,
-        int ropeDim, float ropeTheta)
+        int ropeDim, float ropeTheta,
+        VulkanHadamardRotation? hadamard,
+        Pq2_0EmbedGatherF32Kernel? embedGather)
     {
         _device = device;
         _ownsDevice = ownsDevice;
@@ -124,6 +134,8 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         _gdnLayerOrdinal = gdnLayerOrdinal;
         _ropeDim = ropeDim;
         _ropeTheta = ropeTheta;
+        _hadamard = hadamard;
+        _embedGather = embedGather;
 
         _submit = device.CreateSubmitContext();
     }
@@ -250,11 +262,19 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         var gdnCache = new VulkanGdnStateCache(device, gdn, gdnOrdinal);
         var kernels = VulkanQwen3MoeHybridKernels.Create(device, spvDir, config.HeadDim);
 
+        var hadamard = config.HadamardFold is { } fold
+            ? VulkanHadamardRotation.Create(device, spvDir, fold, gdn)
+            : null;
+
+        var embedGather = weights.TokenEmbeddingQuantType == QuantizationType.PQ2_0
+            ? Pq2_0EmbedGatherF32Kernel.Create(device, spvDir)
+            : null;
+
         return new VulkanQwen3HybridDenseTransformerModel(
             device, ownsDevice,
             config, gguf, cpuModel, weights, state, gdnCache, kernels,
             kvSlotForLayer, attentionLayerCount, gdnLayerOrdinal,
-            ropeDim, ropeTheta);
+            ropeDim, ropeTheta, hadamard, embedGather);
     }
 
     // ── CPU-model accessors (we share the CPU loader; reach into its layers) ─
@@ -345,19 +365,31 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         }
 
         bool resized = _state.EnsureCapacity(seqLen);
-        if (resized) _kernels.InvalidateAll();
+        if (resized)
+        {
+            _kernels.InvalidateAll();
+            // The FWHT kernel keeps its own handle-keyed descriptor cache, and a freed buffer handle
+            // can be recycled into the new scratch allocation — which would bind the stale set.
+            _hadamard?.InvalidateDescriptorCache();
+            _embedGather?.InvalidateDescriptorCache();
+        }
 
         UploadPositions(positions);
 
         var kinds = _layout.LayerKind;
 
+        ProfBeginForward(seqLen);
+
         // ── 1. Token embedding (single submission) ────────────────────────────
         _submit.Begin();
         nint cmdBuf = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(cmdBuf);
+        ProfBeginSubmit(cmdBuf);
         RecordEmbeddingGather(cmdBuf, tokenIds);
         KernelSupport.TransferToComputeBarrier(cmdBuf);
+        ProfBeforeSubmit(cmdBuf);
         _submit.SubmitAndWait();
+        ProfAfterSubmit();
 
         // ── 2. Per-layer body — ONE submission per layer. Unlike the MoE hybrid
         //      there is no host round-trip between token mixing and the FFN, so
@@ -370,15 +402,18 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             _submit.Begin();
             cmdBuf = _submit.CommandBuffer;
             KernelSupport.HostToComputeBarrier(cmdBuf);
+            ProfBeginSubmit(cmdBuf);
 
             // ── 2a. Token mixing ────────────────────────────────────────────
             RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.Residual,
                 0, 0, (ulong)((long)seqLen * hiddenRowBytes));
             KernelSupport.TransferToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Resid);
 
             _kernels.RmsNorm.Record(cmdBuf, _state.HiddenState, layerBuf.AttnNormWeight, _state.NormOutput,
                 rowCount: seqLen, n: hiddenSize, eps: eps);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Norm);
 
             if (kinds[layer] == HybridLayerKind.GatedDeltaNet)
             {
@@ -395,6 +430,7 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             _kernels.Add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch,
                 seqLen * hiddenSize);
             KernelSupport.ComputeToTransferBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Resid);
 
             // ── 2b. Dense SwiGLU FFN ────────────────────────────────────────
             // Post-norm → gate/up → SwiGLU → down → residual add. Mirrors
@@ -414,10 +450,12 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             RecordCopyBufferRange(cmdBuf, _state.AddScratch, _state.Residual,
                 0, 0, (ulong)((long)seqLen * hiddenRowBytes));
             KernelSupport.TransferToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Resid);
 
             _kernels.RmsNorm.Record(cmdBuf, _state.HiddenState, layerBuf.PostAttnNormWeight, _state.NormOutput,
                 rowCount: seqLen, n: hiddenSize, eps: eps);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Norm);
 
             RecordDenseFfn(cmdBuf, layerBuf.Ffn, seqLen, intermediateSize);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -428,28 +466,46 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             RecordCopyBufferRange(cmdBuf, _state.AddScratch, _state.HiddenState,
                 0, 0, (ulong)((long)seqLen * hiddenRowBytes));
             KernelSupport.ComputeToHostBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Resid);
+            ProfBeforeSubmit(cmdBuf);
             _submit.SubmitAndWait();
+            ProfAfterSubmit();
         }
 
         // ── 3. Final norm + LM head (single submission, last token only) ──────
         _submit.Begin();
         cmdBuf = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(cmdBuf);
+        ProfBeginSubmit(cmdBuf);
 
         long lastRowOffset = (long)(seqLen - 1) * hiddenRowBytes;
         RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
             srcOffset: (ulong)lastRowOffset, dstOffset: 0, size: (ulong)hiddenRowBytes);
         KernelSupport.TransferToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.Resid);
 
         _kernels.RmsNorm.Record(cmdBuf, _state.NormOutput, _weights.OutputNormWeight, _state.NormOutput,
             rowCount: 1, n: hiddenSize, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.Norm);
+
+        var headIn = _state.NormOutput;
+        if (_hadamard is { } headRot)
+        {
+            headIn = _state.HadamardScratch!;
+            headRot.RecordForward(cmdBuf, _state.NormOutput, headIn, 1, _weights.OutputInputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Hadamard);
+        }
 
         RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
-            _state.NormOutput, _state.Logits,
+            headIn, _state.Logits,
             outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: 1);
         KernelSupport.ComputeToHostBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.LmHead);
+        ProfBeforeSubmit(cmdBuf);
         _submit.SubmitAndWait();
+        ProfAfterSubmit();
 
         // ── 4. Download logits ───────────────────────────────────────────────
         var shape = new TensorShape(1, vocabSize);
@@ -459,6 +515,8 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             var dest = new Span<float>((void*)result.DataPointer, vocabSize);
             _device.Download(_state.Logits, dest);
         }
+
+        ProfEndForward();
         return result;
     }
 
@@ -541,21 +599,44 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         nint cmdBuf, in VulkanQwen3HybridDenseWeights.DenseFfnLayerBuffers ffn,
         int seqLen, int intermediateSize)
     {
+        // ffn_gate and ffn_up are both folded and share this input — one rotation serves both.
+        var ffnIn = _state.NormOutput;
+        if (_hadamard is { } ffnRot)
+        {
+            ffnIn = _state.HadamardScratch!;
+            ffnRot.RecordForward(cmdBuf, _state.NormOutput, ffnIn, seqLen, ffn.GateInputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Hadamard);
+        }
+
         RecordMatmul(cmdBuf, ffn.GateWeight, ffn.GateDeviceQuantType,
-            _state.NormOutput, _state.FfnGate,
+            ffnIn, _state.FfnGate,
             outputDim: ffn.GateOutputDim, inputDim: ffn.GateInputDim, seqLen: seqLen);
         RecordMatmul(cmdBuf, ffn.UpWeight, ffn.UpDeviceQuantType,
-            _state.NormOutput, _state.FfnUp,
+            ffnIn, _state.FfnUp,
             outputDim: ffn.UpOutputDim, inputDim: ffn.UpInputDim, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjFfn);
 
         _kernels.SwiGlu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.FfnSilu,
             n: checked(seqLen * intermediateSize));
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.FfnAct);
+
+        // Reusing the scratch is safe: the gate/up rotation above has been consumed by both GEMMs.
+        var downIn = _state.FfnSilu;
+        if (_hadamard is { } downRot)
+        {
+            downIn = _state.HadamardScratch!;
+            downRot.RecordForward(cmdBuf, _state.FfnSilu, downIn, seqLen, ffn.DownInputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Hadamard);
+        }
 
         RecordMatmul(cmdBuf, ffn.DownWeight, ffn.DownDeviceQuantType,
-            _state.FfnSilu, _state.NormOutput,
+            downIn, _state.NormOutput,
             outputDim: ffn.DownOutputDim, inputDim: ffn.DownInputDim, seqLen: seqLen);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjFfn);
     }
 
     // ── Token-mixing path: Gated DeltaNet ────────────────────────────────────
@@ -583,11 +664,22 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         var gdnStateBuf = gdnCache.GetGdnStateBuffer(gdnOrdinal);
 
         // ── 1. Projections ───────────────────────────────────────────────────
+        // Only attn_qkv and attn_gate are folded; ssm_alpha and ssm_beta below deliberately keep
+        // reading the UNROTATED NormOutput, which is why the rotation goes to a separate buffer.
+        var gdnProjIn = _state.NormOutput;
+        if (_hadamard is { } gdnRot)
+        {
+            gdnProjIn = _state.HadamardScratch!;
+            gdnRot.RecordForward(cmdBuf, _state.NormOutput, gdnProjIn, seqLen, gdnW.QkvInputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Hadamard);
+        }
+
         RecordMatmul(cmdBuf, gdnW.QkvWeight, gdnW.QkvDeviceQuantType,
-            _state.NormOutput, _state.GdnQkvBuf,
+            gdnProjIn, _state.GdnQkvBuf,
             outputDim: gdnW.QkvOutputDim, inputDim: gdnW.QkvInputDim, seqLen: seqLen);
         RecordMatmul(cmdBuf, gdnW.GateWeight, gdnW.GateDeviceQuantType,
-            _state.NormOutput, _state.GdnZBuf,
+            gdnProjIn, _state.GdnZBuf,
             outputDim: gdnW.GateOutputDim, inputDim: gdnW.GateInputDim, seqLen: seqLen);
         RecordMatmul(cmdBuf, gdnW.AlphaWeight, gdnW.AlphaDeviceQuantType,
             _state.NormOutput, _state.GdnAlphaBuf,
@@ -596,12 +688,14 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             _state.NormOutput, _state.GdnBetaBuf,
             outputDim: gdnW.BetaOutputDim, inputDim: gdnW.BetaInputDim, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjGdn);
 
         // ── 2. Fused on-device decay g and sigmoid(β) ─────────────────────────
         _kernels.GdnDecay.Record(cmdBuf, _state.GdnAlphaBuf, gdnW.DtBiasDevice, gdnW.ADevice,
             seqLen: seqLen, nVHead: nVHead);
         _kernels.SigmoidInplace.Record(cmdBuf, _state.GdnBetaBuf, n: seqLen * nVHead);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnPre);
 
         // ── 3. Build conv input + Conv1d + SiLU ───────────────────────────────
         // ConvInput = [convState (DConv-1 rows) | qkvBuf (seqLen rows)]
@@ -621,6 +715,8 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
                 srcOffset: srcOff, dstOffset: dstOff, size: (ulong)convDimBytes);
         }
         KernelSupport.TransferToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.CopyFanout);
+        ProfNote("copy_gdn_conv_input", m: convDim, k: dConv, n: seqLen);
 
         _kernels.Conv1dCausal.Record(cmdBuf, _state.GdnConvInput, gdnW.Conv1dWeight, gdnW.Conv1dBias,
             _state.GdnQkvBuf, dConv: dConv, channels: convDim, seqLen: seqLen);
@@ -628,6 +724,7 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
 
         _kernels.SiluInplace.Record(cmdBuf, _state.GdnQkvBuf, n: seqLen * convDim);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnPre);
 
         // Save the trailing (dConv-1) rows of the PRE-SiLU ConvInput back to
         // convState — same offset pattern as the MoE hybrid and VulkanNemotronH.
@@ -656,10 +753,13 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
                 srcOffset: rowBase + (ulong)(2 * kDimBytes), dstOffset: (ulong)((long)t * vDimBytes), size: (ulong)vDimBytes);
         }
         KernelSupport.TransferToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.CopyFanout);
+        ProfNote("copy_gdn_qkv_split", m: kDim, k: vDim, n: seqLen);
 
         _kernels.GdnL2Normalize.Record(cmdBuf, _state.GdnQBuf, totalHeads: seqLen * nKHead, dState: dState, eps: 1e-6f);
         _kernels.GdnL2Normalize.Record(cmdBuf, _state.GdnKBuf, totalHeads: seqLen * nKHead, dState: dState, eps: 1e-6f);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnPre);
 
         // ── 5. GDN scan — single multi-token dispatch ────────────────────────
         _kernels.GdnScanMultiToken.Record(cmdBuf,
@@ -669,17 +769,33 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             output: _state.GdnOut,
             seqLen: seqLen, nVHead: nVHead, nKHead: nKHead, dState: dState);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnScanCore);   // #445 sub-bucket
+        ProfNote("gdn_scan_multitoken", m: nVHead, k: dState, n: seqLen);
 
         // ── 6. Per-head RMSNorm × silu(z) gate (fused) ───────────────────────
         _kernels.GdnPostScanGate.Record(cmdBuf,
             gdnOut: _state.GdnOut, z: _state.GdnZBuf, ssmNormWeight: gdnW.SsmNormWeight,
             seqLen: seqLen, nVHead: nVHead, dState: dState, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnPostGate);   // #445 sub-bucket
 
         // ── 7. ssm_out projection back into NormOutput ───────────────────────
+        // The one site taking the value-head permutation: the fold was computed in grouped
+        // [dState, rep, nKHead] order while the scan emits tiled order.
+        var ssmOutIn = _state.GdnOut;
+        if (_hadamard is { } outRot)
+        {
+            ssmOutIn = _state.HadamardScratch!;
+            outRot.RecordForward(cmdBuf, _state.GdnOut, ssmOutIn, seqLen, gdnW.OutInputDim,
+                permuteGdnValueHeads: true);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Hadamard);
+        }
+
         RecordMatmul(cmdBuf, gdnW.OutWeight, gdnW.OutDeviceQuantType,
-            _state.GdnOut, _state.NormOutput,
+            ssmOutIn, _state.NormOutput,
             outputDim: gdnW.OutOutputDim, inputDim: gdnW.OutInputDim, seqLen: seqLen);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjGdn);
     }
 
     // ── Token-mixing path: full GQA attention ────────────────────────────────
@@ -698,10 +814,22 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         int qgElems = 2 * qElems;
 
         // 1. Fused Q+Gate projection.
+        // attn_q / attn_k / attn_v are all folded and share this input, so one rotation serves the
+        // three. HadamardScratch is untouched between here and the K/V projections below.
+        var attnProjIn = _state.NormOutput;
+        if (_hadamard is { } attnRot)
+        {
+            attnProjIn = _state.HadamardScratch!;
+            attnRot.RecordForward(cmdBuf, _state.NormOutput, attnProjIn, seqLen, attnW.QInputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Hadamard);
+        }
+
         RecordMatmul(cmdBuf, attnW.QWeight, attnW.QDeviceQuantType,
-            _state.NormOutput, _state.QGateScratch,
+            attnProjIn, _state.QGateScratch,
             outputDim: attnW.QOutputDim, inputDim: attnW.QInputDim, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjAttn);
 
         // 2. De-interleave per head into Q and Gate scratch buffers.
         //    Per token row: [Q_h0, Gate_h0, Q_h1, Gate_h1, ...] each headDim wide.
@@ -724,15 +852,18 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             }
         }
         KernelSupport.TransferToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.CopyFanout);
+        ProfNote("copy_qgate_deinterleave", m: numHeads, k: headDim, n: seqLen);
 
         // 3. K and V projections.
         RecordMatmul(cmdBuf, attnW.KWeight, attnW.KDeviceQuantType,
-            _state.NormOutput, _state.K,
+            attnProjIn, _state.K,
             outputDim: attnW.KOutputDim, inputDim: attnW.KInputDim, seqLen: seqLen);
         RecordMatmul(cmdBuf, attnW.VWeight, attnW.VDeviceQuantType,
-            _state.NormOutput, _state.V,
+            attnProjIn, _state.V,
             outputDim: attnW.VOutputDim, inputDim: attnW.VInputDim, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjAttn);
 
         // 4. QK-norm — per-head RMSNorm with attn_q_norm / attn_k_norm weights.
         _kernels.RmsNorm.Record(cmdBuf, _state.Q, attnW.QNormWeight, _state.Q,
@@ -740,6 +871,7 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         _kernels.RmsNorm.Record(cmdBuf, _state.K, attnW.KNormWeight, _state.K,
             rowCount: seqLen * numKvHeads, n: headDim, eps: Config.NormEpsilon);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.Norm);
 
         // 5. RoPE — NeoX pair pattern over the first ropeDim of each head, mirroring
         //    the CPU reference's choice so device output matches CPU output.
@@ -754,8 +886,10 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         if (kvCache is VulkanNemotronHKvCache vkCache)
         {
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnRope);      // #445 sub-bucket
             vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, absoluteLayerIdx);
             KernelSupport.TransferToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnKvUpdate);  // #445 sub-bucket
             kSrc = vkCache.GetKeysBuffer(absoluteLayerIdx);
             vSrc = vkCache.GetValuesBuffer(absoluteLayerIdx);
             seqKv = vkCache.CurrentLength;
@@ -764,6 +898,7 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         else
         {
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnRope);      // #445 sub-bucket
             kSrc = _state.K;
             vSrc = _state.V;
             seqKv = seqLen;
@@ -777,13 +912,15 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             // Decode: split the KV range across many workgroups (Flash-Decoding).
             // Engages from seqKv >= 17 with the shipping heuristic (issue #331);
             // only seqKv <= 16 falls through to the per-token kernel.
+            ProfNote("attn_splitkv", m: numHeads, k: headDim, n: seqKv);
             _kernels.SplitKvAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: 0);
         }
-        else if (_kernels.FlashAttention is not null && seqLen > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
+        else if (_kernels.FlashAttention is not null && seqLen > 1 && headDim <= _kernels.FlashAttention.SupportedMaxHeadDim)
         {
+            ProfNote("attn_flash", m: numHeads, k: headDim, n: seqKv);
             _kernels.FlashAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
@@ -791,22 +928,36 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         }
         else
         {
+            ProfNote("attn_naive", m: numHeads, k: headDim, n: seqKv);
             _kernels.Attention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: 0);
         }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnCore);      // #445 sub-bucket
 
         // 7. Apply sigmoid(gate) element-wise to attention output.
         _kernels.SigmoidGateMul.Record(cmdBuf, _state.AttnOutput, _state.GateScratch,
             nTotal: seqLen * qElems);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.AttnGate);      // #445 sub-bucket
 
         // 8. Output projection.
+        // Shares the 6144 sign vector with ssm_out but takes NO value-head permutation.
+        var oProjIn = _state.AttnOutput;
+        if (_hadamard is { } oRot)
+        {
+            oProjIn = _state.HadamardScratch!;
+            oRot.RecordForward(cmdBuf, _state.AttnOutput, oProjIn, seqLen, attnW.OInputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Hadamard);
+        }
+
         RecordMatmul(cmdBuf, attnW.OWeight, attnW.ODeviceQuantType,
-            _state.AttnOutput, _state.NormOutput,
+            oProjIn, _state.NormOutput,
             outputDim: attnW.OOutputDim, inputDim: attnW.OInputDim, seqLen: seqLen);
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjAttn);
     }
 
     // ── Matmul dispatch ──────────────────────────────────────────────────────
@@ -822,6 +973,8 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
         int outputDim, int inputDim, int seqLen)
     {
+        if (_prof is not null) ProfNoteMatmul(weightQt, outputDim, inputDim, seqLen);
+
         switch (weightQt)
         {
             case QuantizationType.Q8_0:
@@ -910,6 +1063,19 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
                 else
                     _kernels.MatMulIq1SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
+            case QuantizationType.PQ2_0:
+                // PQ2_0 (PrismML Bonsai ternary): 128-element group alignment, enforced upload-side
+                // by VulkanQwen3MoeHybridWeights.KeepPQ2_0. Each group carries its own fp16 scale,
+                // read and applied in-shader. Widening this to F32 instead is what used to make
+                // Bonsai 2 27B ask for ~108 GB of device-local memory.
+                // #446: the dispatch threshold is PQ2_0SmallNDispatch's, not a bare
+                // seqLen == 1 test -- the 128x128 GEMM tile only overtakes a per-token
+                // GEMV loop at n ~ 4.4 (lm_head) / ~6.5 (ffn), so 2-8 token verify
+                // batches were taking the slower kernel. DOTLLM_VK_PQ2_0_GEMV_LOOP_MAX_N=0
+                // restores the old behaviour.
+                PQ2_0SmallNDispatch.Record(cmdBuf, _kernels.MatMulPQ2_0, _kernels.MatMulPQ2_0Gemm,
+                    weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
             case QuantizationType.F16:
                 if (seqLen == 1)
                     _kernels.MatMulF16.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
@@ -943,6 +1109,28 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
     private void RecordEmbeddingGather(nint cmdBuf, ReadOnlySpan<int> tokenIds)
     {
         int hiddenSize = Config.HiddenSize;
+
+        // Packed PQ2_0 table: gather + dequantize as a compute dispatch. The widened F32 form of
+        // Bonsai 2's token_embd is 5.08 GB, over Vulkan's 4 GiB maxStorageBufferRange, so this is
+        // the only way the table can be resident at all.
+        if (_embedGather is { } gather)
+        {
+            _device.Upload(System.Runtime.InteropServices.MemoryMarshal.AsBytes(tokenIds), _state.TokenIdsBuffer!);
+            KernelSupport.HostToComputeBarrier(cmdBuf);
+            gather.Record(cmdBuf, _weights.TokenEmbedding, _state.TokenIdsBuffer!, _state.HiddenState,
+                nTokens: tokenIds.Length, hidden: hiddenSize, vocabSize: Config.VocabSize);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Embed);
+
+            if (_hadamard is { } packedEmbRot)
+            {
+                packedEmbRot.RecordInverseInPlace(cmdBuf, _state.HiddenState, tokenIds.Length, hiddenSize);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                ProfMark(cmdBuf, VulkanOpProfiler.Cat.Hadamard);
+            }
+            return;
+        }
+
         long rowBytes = (long)hiddenSize * sizeof(float);
         var srcBuf = _weights.TokenEmbedding.Handle;
         var dstBuf = _state.HiddenState.Handle;
@@ -959,6 +1147,20 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
             };
             VulkanApi.vkCmdCopyBuffer(cmdBuf, srcBuf, dstBuf, 1, region);
         }
+
+        ProfMark(cmdBuf, VulkanOpProfiler.Cat.Embed);
+
+        // A Hadamard-latent embedding table stores rotated rows, so restore the primal basis right
+        // after the lookup. Note the INVERSE order — rotation then signs — which is the opposite of
+        // every folded-weight site. In place is safe here: without the permute each workgroup reads
+        // only the block it writes.
+        if (_hadamard is { } embRot)
+        {
+            KernelSupport.TransferToComputeBarrier(cmdBuf);
+            embRot.RecordInverseInPlace(cmdBuf, _state.HiddenState, tokenIds.Length, hiddenSize);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Hadamard);
+        }
     }
 
     private void UploadPositions(ReadOnlySpan<int> positions)
@@ -970,10 +1172,15 @@ public sealed class VulkanQwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        // Before _device: the profiler owns a query pool on it.
+        _profiler?.Dispose();
+        _profiler = null;
         _submit.Dispose();
         _state.Dispose();
         _weights.Dispose();
         _gdnCache.Dispose();
+        _hadamard?.Dispose();
+        _embedGather?.Dispose();
         _kernels.Dispose();
         // Frees the CPU model's dequantised norm arrays and detaches it from the
         // GgufFile. The GgufFile itself is caller-owned.

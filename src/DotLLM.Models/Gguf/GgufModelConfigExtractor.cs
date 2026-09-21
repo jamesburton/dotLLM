@@ -186,6 +186,7 @@ public static class GgufModelConfigExtractor
             MlaConfig = mlaConfig,
             Moe = moeConfig,
             GdnConfig = gdnConfig,
+            HadamardFold = GgufHadamardFoldExtractor.TryExtract(metadata),
             ChatTemplate = chatTemplate,
         };
     }

@@ -1657,10 +1657,12 @@ public sealed class VulkanTransformerModel : IModel
         // env-var opt-out, by missing SPV (older builds), or when the model's
         // head_dim exceeds the shader bound — every gate falls back to the
         // legacy per-token attention kernel.
+        // Issue #441: every gate below now reports itself. The head-dim gate used to be silent,
+        // which is how a headDim-256 model spent ~20 % of its prefill on the per-token kernel
+        // without anything saying so.
         VulkanFlashAttentionF32Kernel? flashAttention =
-            IsFlashAttentionDisabled() || config.HeadDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
-                ? null
-                : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
+            VulkanAttentionFallbackDiagnostics.CreatePrefillFlashAttention(
+                device, spvDir, config.HeadDim, "VulkanTransformerModel");
         // Cooperative-matrix FA prefill kernel (issue #149) — preferred over the
         // scalar FA shader when the device has the 16x16x16 f16->f32 subgroup
         // tile (llama.cpp's FA_COOPMAT1 path). Kill-switch:
@@ -2100,7 +2102,7 @@ public sealed class VulkanTransformerModel : IModel
                 maskMode: maskMode, prefixLen: prefixLen);
             return;
         }
-        if (_flashAttention is not null && seqQ > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
+        if (_flashAttention is not null && seqQ > 1 && headDim <= _flashAttention.SupportedMaxHeadDim)
         {
             ProfNote("attn_flash", seqQ, seqKv, numHeads);
             _flashAttention.Record(cmdBuf, q, k, v, output,
@@ -6539,16 +6541,11 @@ public sealed class VulkanTransformerModel : IModel
             // GEMV, prefill via the 32x32 register-blocked GEMM (#233) — the port of the
             // shipped I2_S prefill kernel, which folds each group's scale into the staged
             // weight tile rather than applying one tensor scale to the finished accumulator.
-            if (seqLen == 1)
-            {
-                _matmulPQ2_0.Record(cmdBuf, weights, input, output,
-                    m: outputDim, k: inputDim);
-            }
-            else
-            {
-                _matmulPQ2_0Gemm.Record(cmdBuf, weights, input, output,
-                    m: outputDim, k: inputDim, n: seqLen);
-            }
+            // #446: the GEMV/GEMM crossing point on the shipping 128x128 tile is n ~ 4.4
+            // (lm_head) / ~6.5 (ffn), not n == 1, so the threshold lives in
+            // PQ2_0SmallNDispatch and is shared with the two hybrid models.
+            PQ2_0SmallNDispatch.Record(cmdBuf, _matmulPQ2_0, _matmulPQ2_0Gemm,
+                weights, input, output, m: outputDim, k: inputDim, n: seqLen);
         }
         else if (weightQt == QuantType.IQ1_S)
         {
