@@ -43,6 +43,11 @@ public sealed class VulkanMtpState : IMtpState, IDisposable
     private readonly VulkanDevice.Buffer _pendingHidden; // [hiddenSize] f32, host-visible
 
     private float[] _capturedRows = []; // host [rowCount, hiddenSize], grown on demand
+
+    // Host copy of the trunk hidden state at the last absorbed position (issue #469): the
+    // h_{p-1} the next absorb pairs its first token with. Drafting rewrites the device pending
+    // hidden with the head's own output; this survives it.
+    private readonly float[] _carryHidden;
     private int _capturedRowCount;
 
     private int _currentLength;
@@ -99,6 +104,7 @@ public sealed class VulkanMtpState : IMtpState, IDisposable
         _headDim = headDim;
         _maxSteps = maxSteps;
         _kvStride = numKvHeads * headDim;
+        _carryHidden = new float[hiddenSize];
 
         long kvBytes = (long)maxSteps * _kvStride * sizeof(float);
         long hiddenBytes = (long)hiddenSize * sizeof(float);
@@ -125,7 +131,7 @@ public sealed class VulkanMtpState : IMtpState, IDisposable
         if (_currentLength >= _maxSteps)
             throw new InvalidOperationException(
                 $"VulkanMtpState KV-cache exhausted: {_currentLength} steps already advanced against a " +
-                $"MaxSteps={_maxSteps} cache. Size the state for at least numCandidates steps.");
+                $"MaxSteps={_maxSteps} cache. Size the state for the whole sequence (prompt + generated + draft steps).");
         _currentLength++;
     }
 
@@ -162,7 +168,23 @@ public sealed class VulkanMtpState : IMtpState, IDisposable
             throw new ArgumentOutOfRangeException(nameof(rowIndex),
                 $"rowIndex {rowIndex} out of range [0, {_capturedRowCount}) — CapturedHiddenRows was not populated " +
                 "by a verify-phase Forward call, or has fewer rows than expected.");
-        _device.Upload((ReadOnlySpan<float>)_capturedRows.AsSpan(rowIndex * _hiddenSize, _hiddenSize), _pendingHidden);
+        var row = _capturedRows.AsSpan(rowIndex * _hiddenSize, _hiddenSize);
+        row.CopyTo(_carryHidden);
+        _device.Upload((ReadOnlySpan<float>)row, _pendingHidden);
+    }
+
+    /// <summary>Seeds the device pending hidden from the carried (last absorbed) trunk row.</summary>
+    internal void SetPendingFromCarry()
+    {
+        ThrowIfDisposed();
+        _device.Upload((ReadOnlySpan<float>)_carryHidden, _pendingHidden);
+    }
+
+    /// <summary>Seeds the device pending hidden from captured row <paramref name="row"/> without moving the carry.</summary>
+    internal void SetPendingFromCapturedRow(int row)
+    {
+        ThrowIfDisposed();
+        _device.Upload((ReadOnlySpan<float>)_capturedRows.AsSpan(row * _hiddenSize, _hiddenSize), _pendingHidden);
     }
 
     /// <summary>Total device bytes allocated for this state (excludes the small managed captured-rows buffer).</summary>

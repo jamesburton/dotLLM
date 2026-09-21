@@ -40,7 +40,7 @@ namespace DotLLM.Vulkan;
 /// </para>
 /// <para>
 /// <b>MTP ("NextN").</b> Implemented (issue #435): a <c>qwen35</c> checkpoint carrying an MTP
-/// block gets <see cref="SupportsMtp"/>, <see cref="CreateMtpState"/> and
+/// block gets <see cref="SupportsMtp"/>, <see cref="CreateMtpState(int)"/> and
 /// <see cref="ForwardMtp"/>, mirroring the CPU reference's <c>ForwardMtpCore</c> step for step,
 /// so <c>MtpSpeculativeDecoder</c> drives this model with no backend-specific branch of its own.
 /// </para>
@@ -81,6 +81,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
 
     // Host staging for the MTP pre-final-norm hidden capture (issue #435). Grown on demand.
     private float[] _mtpCaptureScratch = [];
+
+    // Host copy of output_norm.weight for the post-norm MTP capture; downloaded on first use.
+    private float[] _outputNormHost = [];
 
     private readonly HybridLayerLayout _layout;
     private readonly GatedDeltaNetConfig _gdn;
@@ -563,17 +566,30 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             ProfAfterSubmit();
         }
 
-        // ── 2c. MTP hidden capture (issue #435) ──────────────────────────────
-        // HiddenState now holds the pre-final-norm hidden state for every input position —
-        // exactly what llama.cpp's MTP head consumes as `h_pre_norm`. Captured BEFORE the final
-        // norm below, matching the CPU reference's capture point, and a pure side effect.
-        if (mtpState is VulkanMtpState mtpCapture)
+        // ── 2c. MTP hidden capture (issues #435, #469) ───────────────────────
+        // The head consumes llama.cpp's `h_nextn`: the hidden state AFTER output_norm, for every
+        // position. The device final norm below only covers the rows that get logits (the last
+        // row of a long prefill), so the rows are normalised on the host with the same RMSNorm
+        // the CPU reference uses. A pure side effect on the MTP state.
+        VulkanMtpState? mtpCapture = _mtpHead is not null ? mtpState as VulkanMtpState : null;
+        if (mtpCapture is not null)
         {
             int captureElems = checked(seqLen * hiddenSize);
             if (_mtpCaptureScratch.Length < captureElems)
                 _mtpCaptureScratch = new float[captureElems];
-            _device.Download(_state.HiddenState, _mtpCaptureScratch.AsSpan(0, captureElems));
-            mtpCapture.SetCapturedRows(_mtpCaptureScratch.AsSpan(0, captureElems), seqLen);
+            var rows = _mtpCaptureScratch.AsSpan(0, captureElems);
+            _device.Download(_state.HiddenState, rows);
+            if (_outputNormHost.Length == 0)
+            {
+                _outputNormHost = new float[hiddenSize];
+                _device.Download(_weights.OutputNormWeight, _outputNormHost);
+            }
+            for (int r = 0; r < seqLen; r++)
+            {
+                var row = rows.Slice(r * hiddenSize, hiddenSize);
+                DotLLM.Cpu.Kernels.RmsNorm.Execute(row, _outputNormHost, eps, row);
+            }
+            mtpCapture.SetCapturedRows(rows, seqLen);
         }
 
         // ── 3. Final norm + LM head (single submission) ───────────────────────
@@ -627,14 +643,49 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         }
 
         ProfEndForward();
+
+        if (mtpCapture is not null)
+            AbsorbMtp(_mtpHead!, mtpCapture, tokenIds, positions);
+
         return result;
+    }
+
+    /// <summary>
+    /// Runs the MTP head over every token of a trunk batch, without logits, so its KV-cache holds
+    /// the whole sequence — llama.cpp's <c>draft-mtp</c> <c>process()</c> (issue #469). Token
+    /// <c>i</c> pairs with the trunk hidden state of the previous position: the carried row for
+    /// <c>i == 0</c>, captured row <c>i - 1</c> otherwise. Mirrors the CPU reference.
+    /// </summary>
+    private void AbsorbMtp(VulkanQwen3HybridDenseMtpWeights mtpHead, VulkanMtpState state,
+                           ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions)
+    {
+        BindMtpState(state);
+        for (int i = 0; i < tokenIds.Length; i++)
+        {
+            if (i == 0) state.SetPendingFromCarry();
+            else state.SetPendingFromCapturedRow(i - 1);
+            ForwardMtpCore(mtpHead, state, tokenIds[i], positions[i], computeLogits: false);
+        }
+        state.SeedFromCapturedRow(tokenIds.Length - 1);
+    }
+
+    // A previously-disposed state's buffer handles can be recycled into this one's; invalidate the
+    // kernels' descriptor caches once per new state (belt and braces alongside #467's eviction).
+    private void BindMtpState(VulkanMtpState mtp)
+    {
+        if (ReferenceEquals(_lastMtpState, mtp))
+            return;
+        _kernels.InvalidateAll();
+        _hadamard?.InvalidateDescriptorCache();
+        _embedGather?.InvalidateDescriptorCache();
+        _lastMtpState = mtp;
     }
 
     /// <summary>
     /// Batch length up to which the LM head runs over <em>every</em> row, so <c>Forward</c> honours
     /// the <see cref="IModel"/> <c>[seq, vocab]</c> contract. Sized to
-    /// <see cref="MtpDefaultMaxDraftSteps"/>: an MTP verify batch is at most K rows and needs a
-    /// logit row per drafted position, while a real prefill is orders of magnitude longer and only
+    /// <see cref="MtpDefaultMaxDraftSteps"/>: an MTP verify batch is K+1 rows (the last token plus
+    /// K drafts) and needs a logit row per position, while a real prefill is orders of magnitude longer and only
     /// ever has its last row read.
     /// </summary>
     public const int MaxAllRowLogitsSeqLen = MtpDefaultMaxDraftSteps;
@@ -1122,18 +1173,59 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     public bool SupportsRecurrentStateCheckpoint => true;
 
     /// <inheritdoc/>
-    public object? CheckpointRecurrentState() => _gdnCache.Clone();
+    /// <remarks>
+    /// Snapshots are pooled (one spare): a speculative decoder takes one per round, and allocating
+    /// a fresh set of per-layer device buffers each time (96 on Bonsai 2) cost more than the copy.
+    /// Disposing the returned checkpoint hands its buffers back for the next round.
+    /// </remarks>
+    public object? CheckpointRecurrentState()
+    {
+        VulkanGdnStateCache snapshot = Interlocked.Exchange(ref _spareGdnCheckpoint, null)
+            ?? _gdnCache.CloneGeometry();
+        _gdnCache.CopyTo(snapshot);
+        return new PooledGdnCheckpoint(this, snapshot);
+    }
 
     /// <inheritdoc/>
     public void RestoreRecurrentState(object? checkpoint)
     {
-        if (checkpoint is null) return;
-        if (checkpoint is not VulkanGdnStateCache snapshot)
-            throw new ArgumentException(
-                $"{GetType().Name}.RestoreRecurrentState expects a VulkanGdnStateCache checkpoint; " +
-                $"got {checkpoint.GetType().Name}.",
-                nameof(checkpoint));
-        snapshot.CopyTo(_gdnCache);
+        switch (checkpoint)
+        {
+            case null:
+                return;
+            case PooledGdnCheckpoint pooled:
+                pooled.Snapshot.CopyTo(_gdnCache);
+                return;
+            case VulkanGdnStateCache snapshot:
+                snapshot.CopyTo(_gdnCache);
+                return;
+            default:
+                throw new ArgumentException(
+                    $"{GetType().Name}.RestoreRecurrentState expects a checkpoint from CheckpointRecurrentState; " +
+                    $"got {checkpoint.GetType().Name}.",
+                    nameof(checkpoint));
+        }
+    }
+
+    private VulkanGdnStateCache? _spareGdnCheckpoint;
+    private bool _disposed;
+
+    /// <summary>A pooled GDN snapshot; disposing returns its buffers to the owning model.</summary>
+    private sealed class PooledGdnCheckpoint(VulkanQwen3HybridDenseTransformerModel owner, VulkanGdnStateCache snapshot)
+        : IDisposable
+    {
+        private VulkanGdnStateCache? _snapshot = snapshot;
+
+        public VulkanGdnStateCache Snapshot
+            => _snapshot ?? throw new ObjectDisposedException(nameof(PooledGdnCheckpoint));
+
+        public void Dispose()
+        {
+            var s = Interlocked.Exchange(ref _snapshot, null);
+            if (s is null) return;
+            if (owner._disposed || Interlocked.CompareExchange(ref owner._spareGdnCheckpoint, s, null) is not null)
+                s.Dispose();
+        }
     }
 
     // ── MTP ("NextN") self-speculative decoding — issue #435 ─────────────────
@@ -1150,9 +1242,13 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     /// <remarks>
     /// Sized for the MTP head's own attention — the MTP block is a normal full-attention layer —
-    /// with a device-resident KV-cache deep enough for <see cref="MtpDefaultMaxDraftSteps"/> steps.
+    /// with a device-resident, position-indexed KV-cache of <see cref="MtpDefaultMaxSequenceLength"/>
+    /// positions (issue #469).
     /// </remarks>
-    public IMtpState? CreateMtpState()
+    public IMtpState? CreateMtpState() => CreateMtpState(MtpDefaultMaxSequenceLength);
+
+    /// <inheritdoc/>
+    public IMtpState? CreateMtpState(int maxSequenceLength)
     {
         if (_mtpHead is null)
             return null;
@@ -1160,8 +1256,14 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             hiddenSize: Config.HiddenSize,
             numKvHeads: _mtpHead.Attention.NumKvHeads,
             headDim: Config.HeadDim,
-            maxSteps: MtpDefaultMaxDraftSteps);
+            maxSteps: maxSequenceLength);
     }
+
+    /// <summary>
+    /// Default MTP KV-cache depth, in sequence positions, for <see cref="CreateMtpState()"/> —
+    /// the head's cache is indexed by position and absorbs the whole sequence (issue #469).
+    /// </summary>
+    public const int MtpDefaultMaxSequenceLength = 4096;
 
     /// <inheritdoc/>
     public ITensor ForwardMtp(IMtpState state, int tokenId, int position)
@@ -1180,18 +1282,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             throw new ArgumentOutOfRangeException(nameof(position),
                 $"Position {position} exceeds max sequence length {Config.MaxSequenceLength}.");
 
-        // A previously-disposed state's buffer handles can be recycled into this one's, and the
-        // kernels key their descriptor sets on the handle — a stale set reads the wrong (or a
-        // freed) buffer and the symptom is "correct, then zeros". Invalidate once per new state.
-        if (!ReferenceEquals(_lastMtpState, mtp))
-        {
-            _kernels.InvalidateAll();
-            _hadamard?.InvalidateDescriptorCache();
-            _embedGather?.InvalidateDescriptorCache();
-            _lastMtpState = mtp;
-        }
-
-        return ForwardMtpCore(mtpHead, mtp, tokenId, position);
+        BindMtpState(mtp);
+        return ForwardMtpCore(mtpHead, mtp, tokenId, position, computeLogits: true)!;
     }
 
     /// <summary>
@@ -1257,8 +1349,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     /// lm_head take. Getting this wrong is silent: the draft tokens come out plausible but
     /// uncorrelated, and the acceptance rate collapses to noise.
     /// </remarks>
-    private ITensor ForwardMtpCore(VulkanQwen3HybridDenseMtpWeights mtpHead, VulkanMtpState state,
-                                   int tokenId, int position)
+    private ITensor? ForwardMtpCore(VulkanQwen3HybridDenseMtpWeights mtpHead, VulkanMtpState state,
+                                    int tokenId, int position, bool computeLogits)
     {
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
@@ -1270,11 +1362,19 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         int intermediateSize = mtpHead.Ffn.GateOutputDim;
         float eps = Config.NormEpsilon;
 
-        int step = state.CurrentLength;
+        // Position-indexed head KV-cache (issue #469): slot p holds the pair (h_{p-1}, x_p).
+        if (state.CurrentLength > position)
+            state.Rollback(position);
+        else if (state.CurrentLength < position)
+            throw new InvalidOperationException(
+                $"MTP step at position {position} but the MTP KV-cache only covers {state.CurrentLength} " +
+                "positions. Every trunk Forward of the sequence must pass the MTP state so the head " +
+                "absorbs it (prefill included).");
+        int step = position;
         if (step >= state.MaxSteps)
             throw new InvalidOperationException(
-                $"VulkanMtpState KV-cache exhausted ({state.MaxSteps} steps advanced). Size the state " +
-                "for at least numCandidates MTP draft steps per speculation round.");
+                $"VulkanMtpState KV-cache exhausted at position {position} (MaxSteps={state.MaxSteps}). " +
+                "Create the state with CreateMtpState(maxSequenceLength) covering the whole sequence.");
 
         _state.EnsureCapacity(1);
         _mtpScratch ??= MtpScratch.Allocate(_device, hiddenSize);
@@ -1425,18 +1525,27 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         _kernels.Add.Record(cmdBuf, sc.Residual, sc.Cur, sc.AddOut, hiddenSize);
-        KernelSupport.ComputeToTransferBarrier(cmdBuf);
 
-        // AddOut is now the MTP block's own output hidden state ("h_pre_norm") — it seeds the NEXT
-        // ForwardMtp call, so hand it to the state before the head-norm below consumes it.
-        RecordCopyBufferRange(cmdBuf, sc.AddOut, state.PendingHidden, 0, 0, (ulong)hiddenRowBytes);
-        KernelSupport.TransferToComputeBarrier(cmdBuf);
+        if (!computeLogits)
+        {
+            // Absorb: only the KV row mattered; the caller seeds the next step from a trunk row.
+            KernelSupport.ComputeToHostBarrier(cmdBuf);
+            _submit.SubmitAndWait();
+            state.Advance();
+            return null;
+        }
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // ── 6. Shared LM head ────────────────────────────────────────────────
         var headNormWeight = mtpHead.SharedHeadNormWeight ?? _weights.OutputNormWeight;
         _kernels.RmsNorm.Record(cmdBuf, sc.AddOut, headNormWeight, sc.NormedHead,
             rowCount: 1, n: hiddenSize, eps: eps);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        KernelSupport.ComputeToTransferBarrier(cmdBuf);
+
+        // The next chained draft step pairs this step's hidden state with the token it predicts.
+        // llama.cpp chains the head's `h_nextn` — AFTER shared_head_norm (issue #469).
+        RecordCopyBufferRange(cmdBuf, sc.NormedHead, state.PendingHidden, 0, 0, (ulong)hiddenRowBytes);
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
 
         VulkanDevice.Buffer headWeight;
         QuantizationType headQt;
@@ -1694,6 +1803,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
+        Interlocked.Exchange(ref _spareGdnCheckpoint, null)?.Dispose();
         // Before _device: the profiler owns a query pool on it.
         _profiler?.Dispose();
         _profiler = null;

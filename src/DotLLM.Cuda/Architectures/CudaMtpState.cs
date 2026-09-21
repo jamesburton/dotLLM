@@ -28,6 +28,11 @@ public sealed class CudaMtpState : IMtpState, IDisposable
     private nint _pendingHiddenDevice; // [hiddenSize] f32, device-resident — seed for the next ForwardMtp call
 
     private float[] _capturedRows = []; // host [rowCount, hiddenSize], grown on demand
+
+    // Host copy of the trunk hidden state at the last absorbed position (issue #469): the
+    // h_{p-1} the next absorb pairs its first token with. Drafting rewrites the device pending
+    // hidden with the head's own output; this survives it.
+    private float[] _carryHidden = [];
     private int _capturedRowCount;
 
     private int _currentLength;
@@ -125,7 +130,7 @@ public sealed class CudaMtpState : IMtpState, IDisposable
         if (_currentLength >= _maxSteps)
             throw new InvalidOperationException(
                 $"CudaMtpState KV-cache exhausted: {_currentLength} steps already advanced against a " +
-                $"MaxSteps={_maxSteps} cache. Size the state for at least numCandidates steps.");
+                $"MaxSteps={_maxSteps} cache. Size the state for the whole sequence (prompt + generated + draft steps).");
         _currentLength++;
     }
 
@@ -174,7 +179,31 @@ public sealed class CudaMtpState : IMtpState, IDisposable
         // H2D: host-captured row -> device pending-hidden buffer. The very next ForwardMtp call
         // consumes _pendingHiddenDevice directly on-device (RMSNorm), so no further round-trip is
         // needed until the NEXT round's SeedFromCapturedRow.
-        fixed (float* p = &_capturedRows[rowIndex * _hiddenSize])
+        if (_carryHidden.Length != _hiddenSize)
+            _carryHidden = new float[_hiddenSize];
+        _capturedRows.AsSpan(rowIndex * _hiddenSize, _hiddenSize).CopyTo(_carryHidden);
+        UploadPending(_capturedRows.AsSpan(rowIndex * _hiddenSize, _hiddenSize));
+    }
+
+    /// <summary>Seeds the device pending hidden from the carried (last absorbed) trunk row.</summary>
+    internal void SetPendingFromCarry()
+    {
+        ThrowIfDisposed();
+        if (_carryHidden.Length != _hiddenSize)
+            _carryHidden = new float[_hiddenSize];   // nothing absorbed yet: h_{-1} is zero
+        UploadPending(_carryHidden);
+    }
+
+    /// <summary>Seeds the device pending hidden from captured row <paramref name="row"/> without moving the carry.</summary>
+    internal void SetPendingFromCapturedRow(int row)
+    {
+        ThrowIfDisposed();
+        UploadPending(_capturedRows.AsSpan(row * _hiddenSize, _hiddenSize));
+    }
+
+    private unsafe void UploadPending(ReadOnlySpan<float> row)
+    {
+        fixed (float* p = row)
         {
             CudaDriverApi.cuMemcpyHtoD_v2(_pendingHiddenDevice, (nint)p,
                 (nuint)((long)_hiddenSize * sizeof(float))).ThrowOnError();

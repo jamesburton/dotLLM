@@ -165,9 +165,19 @@ public sealed class VulkanGdnStateCache : IGdnState
     public VulkanGdnStateCache Clone()
     {
         ThrowIfDisposed();
-        var copy = new VulkanGdnStateCache(_device, _numGdnLayers, _convStateElements, _gdnStateElements);
+        var copy = CloneGeometry();
         CopyTo(copy);
         return copy;
+    }
+
+    /// <summary>
+    /// Allocates a cache with this one's geometry and unspecified contents, for use as a
+    /// <see cref="CopyTo"/> destination.
+    /// </summary>
+    public VulkanGdnStateCache CloneGeometry()
+    {
+        ThrowIfDisposed();
+        return new VulkanGdnStateCache(_device, _numGdnLayers, _convStateElements, _gdnStateElements);
     }
 
     /// <summary>
@@ -192,13 +202,28 @@ public sealed class VulkanGdnStateCache : IGdnState
 
         long convBytes = (long)_convStateElements * sizeof(float);
         long stateBytes = (long)_gdnStateElements * sizeof(float);
+
+        // One submission for every layer. A synchronous copy per buffer cost a submit + fence wait
+        // each — 96 of them per speculative round on Bonsai 2, which dominated MTP's round time.
+        using var ctx = _device.CreateSubmitContext();
+        ctx.Begin();
+        nint cmdBuf = ctx.CommandBuffer;
+        Kernels.KernelSupport.ComputeToTransferBarrier(cmdBuf);
         for (int i = 0; i < _numGdnLayers; i++)
         {
             if (convBytes > 0)
-                _device.CopyBufferSynchronous(_convStateBuffers[i], destination._convStateBuffers[i], (ulong)convBytes);
+                RecordCopy(cmdBuf, _convStateBuffers[i], destination._convStateBuffers[i], (ulong)convBytes);
             if (stateBytes > 0)
-                _device.CopyBufferSynchronous(_gdnStateBuffers[i], destination._gdnStateBuffers[i], (ulong)stateBytes);
+                RecordCopy(cmdBuf, _gdnStateBuffers[i], destination._gdnStateBuffers[i], (ulong)stateBytes);
         }
+        Kernels.KernelSupport.TransferToComputeBarrier(cmdBuf);
+        ctx.SubmitAndWait();
+    }
+
+    private static void RecordCopy(nint cmdBuf, VulkanDevice.Buffer src, VulkanDevice.Buffer dst, ulong size)
+    {
+        var region = new Interop.VkBufferCopy { srcOffset = 0, dstOffset = 0, size = size };
+        Interop.VulkanApi.vkCmdCopyBuffer(cmdBuf, src.Handle, dst.Handle, 1, region);
     }
 
     private void ThrowIfDisposed()

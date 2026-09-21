@@ -255,10 +255,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// <remarks>
     /// Sized for the MTP head's own attention (<see cref="Config"/>'s standard head count/dim —
     /// the MTP block is a normal full-attention layer, see <see cref="CudaMtpHeadWeights"/>), with a
-    /// device-resident KV-cache deep enough for <see cref="MtpDefaultMaxDraftSteps"/> autoregressive
-    /// draft steps. Mirrors the CPU host's <c>Qwen3HybridDenseTransformerModel.CreateMtpState</c>.
+    /// device-resident, position-indexed KV-cache of <see cref="MtpDefaultMaxSequenceLength"/>
+    /// positions. Mirrors the CPU host's <c>Qwen3HybridDenseTransformerModel.CreateMtpState</c>.
     /// </remarks>
-    public IMtpState? CreateMtpState()
+    public IMtpState? CreateMtpState() => CreateMtpState(MtpDefaultMaxSequenceLength);
+
+    /// <inheritdoc/>
+    public IMtpState? CreateMtpState(int maxSequenceLength)
     {
         if (_mtpHead is null)
             return null;
@@ -268,16 +271,14 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             hiddenSize: Config.HiddenSize,
             numKvHeads: _mtpHead.Value.Layer.FullAttn!.Value.NumKvHeads,
             headDim: Config.HeadDim,
-            maxSteps: MtpDefaultMaxDraftSteps);
+            maxSteps: maxSequenceLength);
     }
 
     /// <summary>
-    /// Default MTP KV-cache depth when a caller doesn't need a specific candidate count K up
-    /// front. Callers that know K in advance (e.g. an MTP self-speculative decoder, see issue
-    /// #253) can size their own <see cref="CudaMtpState"/> directly instead of going through
-    /// <see cref="CreateMtpState"/>.
+    /// Default MTP KV-cache depth, in sequence positions, for <see cref="CreateMtpState()"/> —
+    /// the head's cache is indexed by position and absorbs the whole sequence (issue #469).
     /// </summary>
-    public const int MtpDefaultMaxDraftSteps = 16;
+    public const int MtpDefaultMaxSequenceLength = 4096;
 
     private CudaQwen3HybridDenseTransformerModel(
         ModelConfig config,
@@ -1278,11 +1279,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         // synchronize first — the LM-head projection below queues fresh work after this point, so
         // this sync does not skip/reorder anything, only adds one extra host-blocking wait on the
         // (low-frequency, K+1-token-per-round) MTP verify/catchup path.
-        if (mtpCapture is not null)
-        {
-            _stream.Synchronize();
-            mtpCapture.SetCapturedRowsFromDevice(_state.HiddenState, seqLen);
-        }
 
         // Issue #185: only compute/copy the LAST token's logits when the caller has explicitly
         // opted in via lastTokenLogitsOnly (e.g. BenchRunner's untimed prefill / --depth context
@@ -1306,6 +1302,17 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             : _state.HiddenState + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
         _kernels.LaunchRmsNormF32(lmHeadInput, _outputNormDevice, lmHeadInput,
             hiddenSize, eps, logitsRows, streamH);
+
+        // MTP (issues #253, #469): the head consumes llama.cpp's `h_nextn` — the hidden state AFTER
+        // output_norm. The MTP-aware overload never sets lastTokenLogitsOnly, so every row has just
+        // been normalised in place. cuMemcpyDtoH does not wait for this model's stream: sync first.
+        if (mtpCapture is not null)
+        {
+            if (logitsRows != seqLen)
+                throw new InvalidOperationException("MTP capture needs every row normalised (lastTokenLogitsOnly must be false).");
+            _stream.Synchronize();
+            mtpCapture.SetCapturedRowsFromDevice(_state.HiddenState, seqLen);
+        }
         Gemm(_outputDevice, _outputQt, lmHeadInput, _state.Logits,
              _outputOutputDim, _outputInputDim, logitsRows);
         ProfMark("lm-head");
@@ -1321,7 +1328,28 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         ProfMark("output-copy");
         if (DebugTrace) LogVram("after D2H logits copy");
 
+        if (mtpCapture is not null && _mtpHead is { } absorbHead)
+            AbsorbMtp(absorbHead, mtpCapture, tokenIds, positions);
+
         return result;
+    }
+
+    /// <summary>
+    /// Runs the MTP head over every token of a trunk batch, without logits, so its KV-cache holds
+    /// the whole sequence — llama.cpp's <c>draft-mtp</c> <c>process()</c> (issue #469). Token
+    /// <c>i</c> pairs with the trunk hidden state of the previous position: the carried row for
+    /// <c>i == 0</c>, captured row <c>i - 1</c> otherwise. Mirrors the CPU reference.
+    /// </summary>
+    private void AbsorbMtp(in CudaMtpHeadWeights mtpHead, CudaMtpState state,
+                           ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions)
+    {
+        for (int i = 0; i < tokenIds.Length; i++)
+        {
+            if (i == 0) state.SetPendingFromCarry();
+            else state.SetPendingFromCapturedRow(i - 1);
+            ForwardMtpCore(mtpHead, state, tokenIds[i], positions[i], computeLogits: false);
+        }
+        state.SeedFromCapturedRow(tokenIds.Length - 1);
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -1413,7 +1441,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 nameof(state));
 
         _context.MakeCurrent();
-        return ForwardMtpCore(mtpHead, mtp, tokenId, position);
+        return ForwardMtpCore(mtpHead, mtp, tokenId, position, computeLogits: true)!;
     }
 
     /// <summary>
@@ -1434,7 +1462,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     ///         <c>shared_head_head</c> (or the trunk's own LM head fallback) → logits.</item>
     /// </list>
     /// </summary>
-    private ITensor ForwardMtpCore(in CudaMtpHeadWeights mtpHead, CudaMtpState state, int tokenId, int position)
+    private ITensor? ForwardMtpCore(in CudaMtpHeadWeights mtpHead, CudaMtpState state, int tokenId, int position,
+                                    bool computeLogits)
     {
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
@@ -1447,11 +1476,19 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         float eps = Config.NormEpsilon;
         nint streamH = _stream.Handle;
 
-        int step = state.CurrentLength;
+        // Position-indexed head KV-cache (issue #469): slot p holds the pair (h_{p-1}, x_p).
+        if (state.CurrentLength > position)
+            state.Rollback(position);
+        else if (state.CurrentLength < position)
+            throw new InvalidOperationException(
+                $"MTP step at position {position} but the MTP KV-cache only covers {state.CurrentLength} " +
+                "positions. Every trunk Forward of the sequence must pass the MTP state so the head " +
+                "absorbs it (prefill included).");
+        int step = position;
         if (step >= state.MaxSteps)
             throw new InvalidOperationException(
-                $"CudaMtpState KV-cache exhausted ({state.MaxSteps} steps advanced). Size the state for " +
-                "at least numCandidates MTP draft steps per speculation round.");
+                $"CudaMtpState KV-cache exhausted at position {position} (MaxSteps={state.MaxSteps}). " +
+                "Create the state with CreateMtpState(maxSequenceLength) covering the whole sequence.");
 
         _mtpScratch ??= CudaMtpScratch.Allocate(hiddenSize, qElems, intermediateSize, vocabSize);
         var s = _mtpScratch;
@@ -1565,17 +1602,23 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
         _kernels.LaunchAddF32(s.Residual, s.Cur, s.Cur, hiddenSize, streamH); // cur = ffn_residual + ffn_out
 
-        // `cur` is now the MTP block's own output hidden state ("h_pre_norm" in llama.cpp) — seed
-        // the NEXT ForwardMtp call's pending hidden with it (D2D, stays fully device-resident)
-        // before the head-norm below consumes it, then advance the MTP KV-cache length.
-        CudaDriverApi.cuMemcpyDtoDAsync_v2(state.PendingHiddenDevicePtr, s.Cur,
-            (nuint)((long)hiddenSize * sizeof(float)), streamH).ThrowOnError();
         state.Advance();
+        if (!computeLogits)
+        {
+            // Absorb: only the KV row mattered; the caller seeds the next step from a trunk row.
+            _stream.Synchronize();
+            return null;
+        }
 
         // ── Shared LM head (falls back to the trunk's output_norm/output.weight when the GGUF
         //    didn't ship head-local nextn.shared_head_* tensors) ──
         nint headNormWeight = mtpHead.SharedHeadNormDevice ?? _outputNormDevice;
         _kernels.LaunchRmsNormF32(s.Cur, headNormWeight, s.NormedHead, hiddenSize, eps, 1, streamH);
+
+        // The next chained draft step pairs this step's hidden state with the token it predicts.
+        // llama.cpp chains the head's `h_nextn` — AFTER shared_head_norm (issue #469).
+        CudaDriverApi.cuMemcpyDtoDAsync_v2(state.PendingHiddenDevicePtr, s.NormedHead,
+            (nuint)((long)hiddenSize * sizeof(float)), streamH).ThrowOnError();
 
         nint headWeight = mtpHead.SharedHeadHeadDevice ?? _outputDevice;
         QuantizationType headQt = mtpHead.SharedHeadHeadDevice is not null ? mtpHead.SharedHeadHeadQt : _outputQt;

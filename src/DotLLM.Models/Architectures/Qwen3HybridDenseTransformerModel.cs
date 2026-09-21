@@ -1123,13 +1123,6 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 TensorDump.Dump2D($"blk.{layer}.l_out", hidden, seqLen, hiddenSize);
         }
 
-        // MTP (issue #253): capture the pre-final-norm hidden state for every position, one row
-        // per input token, BEFORE the final RMSNorm below overwrites `hidden` in place. This is
-        // the exact quantity llama.cpp's MTP head consumes (`h_pre_norm` / `llama_get_embeddings_pre_norm`)
-        // — a pure side effect that never changes the logits this call returns.
-        if (mtpState is CpuMtpState mtpCapture)
-            mtpCapture.SetCapturedRows(new ReadOnlySpan<float>(hidden, seqLen * hiddenSize), seqLen);
-
         // Final output norm + logit projection.
         for (int t = 0; t < seqLen; t++)
         {
@@ -1140,6 +1133,14 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         }
         if (TensorDump.Enabled)
             TensorDump.Dump2D("result_norm", hidden, seqLen, hiddenSize);
+
+        // MTP (issues #253, #469): capture the POST-final-norm hidden state for every position —
+        // llama.cpp's `h_nextn`, taken after output_norm and before the lm_head (and before the
+        // Hadamard rotation that feeds it). Pre-norm rows are the wrong input: the head's hnorm
+        // is an RMSNorm, which cancels scale but not output_norm's per-channel weights.
+        CpuMtpState? mtpCapture = mtpState as CpuMtpState;
+        if (mtpCapture is not null && _mtpHead is not null)
+            mtpCapture.SetCapturedRows(new ReadOnlySpan<float>(hidden, seqLen * hiddenSize), seqLen);
 
         // output.weight is folded too — the final-norm output needs rotating before the lm_head.
         float* headIn = hidden;
@@ -1160,7 +1161,29 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         new Span<float>(logits, seqLen * vocabSize).CopyTo(
             new Span<float>((void*)result.DataPointer, seqLen * vocabSize));
 
+        if (mtpCapture is not null && _mtpHead is not null)
+            AbsorbMtp(_mtpHead, mtpCapture, tokenIds, positions);
+
         return result;
+    }
+
+    /// <summary>
+    /// Runs the MTP head over every token of a trunk batch, without logits, so its KV-cache holds
+    /// the whole sequence — llama.cpp's <c>common_speculative_impl_draft_mtp::process()</c>
+    /// (issue #469). Token <c>i</c> at <c>positions[i]</c> pairs with the trunk hidden state of
+    /// the PREVIOUS position: the carried row for <c>i == 0</c>, captured row <c>i - 1</c>
+    /// otherwise. Leaves the carry and the pending hidden at the batch's last captured row.
+    /// </summary>
+    private void AbsorbMtp(MtpHeadWeights mtpHead, CpuMtpState state,
+                           ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions)
+    {
+        for (int i = 0; i < tokenIds.Length; i++)
+        {
+            if (i == 0) state.SetPendingFromCarry();
+            else state.SetPendingFromCapturedRow(i - 1);
+            ForwardMtpCore(mtpHead, state, tokenIds[i], positions[i], computeLogits: false);
+        }
+        state.SeedFromCapturedRow(tokenIds.Length - 1);
     }
 
     /// <inheritdoc/>
@@ -1191,26 +1214,66 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     public bool SupportsRecurrentStateCheckpoint => true;
 
     /// <inheritdoc/>
-    public object? CheckpointRecurrentState() => _gdnCache.Clone();
+    /// <remarks>
+    /// Snapshots are pooled (one spare): a speculative decoder takes one per round, and allocating
+    /// and zeroing a fresh copy of every layer's recurrent state each time cost more than the copy
+    /// (issue #469). Disposing the returned checkpoint hands its buffers back for the next round.
+    /// </remarks>
+    public object? CheckpointRecurrentState()
+    {
+        GdnStateCache snapshot = Interlocked.Exchange(ref _spareGdnCheckpoint, null)
+            ?? new GdnStateCache(_gdn, _gdnCache.NumGdnLayers);
+        _gdnCache.CopyTo(snapshot);
+        return new PooledGdnCheckpoint(this, snapshot);
+    }
+
+    private GdnStateCache? _spareGdnCheckpoint;
+
+    /// <summary>A pooled GDN snapshot; disposing returns its buffers to the owning model.</summary>
+    private sealed class PooledGdnCheckpoint(Qwen3HybridDenseTransformerModel owner, GdnStateCache snapshot)
+        : IDisposable
+    {
+        private GdnStateCache? _snapshot = snapshot;
+
+        public GdnStateCache Snapshot
+            => _snapshot ?? throw new ObjectDisposedException(nameof(PooledGdnCheckpoint));
+
+        public void Dispose()
+        {
+            var s = Interlocked.Exchange(ref _snapshot, null);
+            if (s is null) return;
+            if (Interlocked.CompareExchange(ref owner._spareGdnCheckpoint, s, null) is not null)
+                s.Dispose();
+        }
+    }
 
     /// <inheritdoc/>
     public void RestoreRecurrentState(object? checkpoint)
     {
-        if (checkpoint is null) return;
-        if (checkpoint is not GdnStateCache snapshot)
-            throw new ArgumentException(
-                $"{GetType().Name}.RestoreRecurrentState expects a GdnStateCache checkpoint; got {checkpoint.GetType().Name}.",
-                nameof(checkpoint));
-        snapshot.CopyTo(_gdnCache);
+        GdnStateCache snapshot = checkpoint switch
+        {
+            null => null!,
+            PooledGdnCheckpoint pooled => pooled.Snapshot,
+            GdnStateCache raw => raw,
+            _ => throw new ArgumentException(
+                $"{GetType().Name}.RestoreRecurrentState expects a checkpoint from CheckpointRecurrentState; " +
+                $"got {checkpoint.GetType().Name}.",
+                nameof(checkpoint)),
+        };
+        snapshot?.CopyTo(_gdnCache);
     }
 
     /// <inheritdoc/>
     /// <remarks>
     /// Sized for the MTP head's own attention (<see cref="Config"/>'s standard head count/dim —
-    /// the MTP block is a normal full-attention layer, see <see cref="MtpHeadWeights"/>), with a
-    /// KV-cache deep enough for <see cref="MtpDefaultMaxDraftSteps"/> autoregressive draft steps.
+    /// the MTP block is a normal full-attention layer, see <see cref="MtpHeadWeights"/>). The head's
+    /// KV-cache is indexed by sequence position (issue #469), so it must cover the whole sequence;
+    /// this overload uses <see cref="MtpDefaultMaxSequenceLength"/>.
     /// </remarks>
-    public IMtpState? CreateMtpState()
+    public IMtpState? CreateMtpState() => CreateMtpState(MtpDefaultMaxSequenceLength);
+
+    /// <inheritdoc/>
+    public IMtpState? CreateMtpState(int maxSequenceLength)
     {
         if (_mtpHead is null)
             return null;
@@ -1219,16 +1282,14 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             hiddenSize: Config.HiddenSize,
             numKvHeads: _mtpHead.Layer.FullAttn!.NumKvHeads,
             headDim: Config.HeadDim,
-            maxSteps: MtpDefaultMaxDraftSteps);
+            maxSteps: maxSequenceLength);
     }
 
     /// <summary>
-    /// Default MTP KV-cache depth when a caller doesn't need a specific candidate count K up
-    /// front. Callers that know K in advance (e.g. an MTP self-speculative decoder, see issue
-    /// #253) can size their own <see cref="CpuMtpState"/> directly instead of going through
-    /// <see cref="CreateMtpState"/>.
+    /// Default MTP KV-cache depth, in sequence positions, for <see cref="CreateMtpState()"/>.
+    /// Callers that know their context length should use <see cref="CreateMtpState(int)"/>.
     /// </summary>
-    public const int MtpDefaultMaxDraftSteps = 16;
+    public const int MtpDefaultMaxSequenceLength = 4096;
 
     /// <inheritdoc/>
     public ITensor ForwardMtp(IMtpState state, int tokenId, int position)
@@ -1243,7 +1304,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         if ((uint)tokenId >= (uint)Config.VocabSize)
             throw new ArgumentOutOfRangeException(nameof(tokenId));
 
-        return ForwardMtpCore(_mtpHead, mtp, tokenId, position);
+        return ForwardMtpCore(_mtpHead, mtp, tokenId, position, computeLogits: true)!;
     }
 
     /// <summary>
@@ -1782,7 +1843,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     ///         <c>shared_head_head</c> (or the trunk's own LM head fallback) → logits.</item>
     /// </list>
     /// </remarks>
-    private ITensor ForwardMtpCore(MtpHeadWeights mtpHead, CpuMtpState state, int tokenId, int position)
+    private ITensor? ForwardMtpCore(MtpHeadWeights mtpHead, CpuMtpState state, int tokenId, int position,
+                                    bool computeLogits)
     {
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
@@ -1795,11 +1857,21 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         int intermediateSize = mtpHead.Layer.GateOutputDim;
         float eps = Config.NormEpsilon;
 
-        int step = state.CurrentLength;
+        // The head's KV-cache is indexed by sequence position (issue #469): slot p holds the pair
+        // (h_{p-1}, x_p). Writing at a later position discards anything speculative beyond it;
+        // a gap would leave unwritten slots inside the attention window.
+        if (state.CurrentLength > position)
+            state.Rollback(position);
+        else if (state.CurrentLength < position)
+            throw new InvalidOperationException(
+                $"MTP step at position {position} but the MTP KV-cache only covers {state.CurrentLength} " +
+                "positions. Every trunk Forward of the sequence must pass the MTP state so the head " +
+                "absorbs it (prefill included).");
+        int step = position;
         if (step >= state.MaxSteps)
             throw new InvalidOperationException(
-                $"CpuMtpState KV-cache exhausted ({state.MaxSteps} steps advanced). Size the state for " +
-                "at least numCandidates MTP draft steps per speculation round.");
+                $"CpuMtpState KV-cache exhausted at position {position} (MaxSteps={state.MaxSteps}). " +
+                "Create the state with CreateMtpState(maxSequenceLength) covering the whole sequence.");
 
         var pool = ArrayPool<float>.Shared;
         float[] tokEmbedArr = pool.Rent(hiddenSize);
@@ -1944,16 +2016,19 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
             Add.Execute(residual, cur, cur); // cur = ffn_residual + ffn_out
 
-            // `cur` is now the MTP block's own output hidden state ("h_pre_norm" in llama.cpp) —
-            // seed the NEXT ForwardMtp call's pending hidden with it before the head-norm below
-            // consumes it, then advance the MTP KV-cache length.
-            cur.CopyTo(state.PendingHiddenMutable);
             state.Advance();
+            if (!computeLogits)
+                return null;   // absorb: the caller seeds the next step from a trunk row
 
             // ── Shared LM head (falls back to the trunk's output_norm/output.weight when the
             //    GGUF didn't ship head-local nextn.shared_head_* tensors) ──
             float[] headNormWeight = mtpHead.SharedHeadNormWeight ?? _outputNormWeight;
             RmsNorm.Execute(cur, headNormWeight, eps, normedHead);
+
+            // The next chained draft step pairs this step's hidden state with the token it
+            // predicts. llama.cpp chains the head's `h_nextn`, i.e. AFTER shared_head_norm — the
+            // same post-norm convention as the trunk rows (issue #469).
+            normedHead.CopyTo(state.PendingHiddenMutable);
 
             bool usesTrunkHead = mtpHead.SharedHeadHeadWeight is null;
             nint headWeight = mtpHead.SharedHeadHeadWeight ?? _outputWeight;
@@ -2074,6 +2149,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             _threadPool?.Dispose();
         _state.Dispose();
         _gdnCache.Dispose();
+        Interlocked.Exchange(ref _spareGdnCheckpoint, null)?.Dispose();
         GC.SuppressFinalize(this);
     }
 

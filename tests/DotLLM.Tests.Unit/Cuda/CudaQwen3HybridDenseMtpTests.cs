@@ -28,6 +28,10 @@ namespace DotLLM.Tests.Unit.Cuda;
 [Collection(CudaCollection.Name)]
 public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
 {
+    // The token after the prompt the first draft step starts from (issue #469: the prefill absorbed
+    // positions 0..n-1, so drafting begins at position n with h_{n-1}).
+    private const int NextToken = 4;
+
     private readonly string _scratch;
     private readonly ITestOutputHelper _out;
 
@@ -184,20 +188,21 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
         using var kvCache = model.CreateKvCache(maxSeqLen: 64);
         using var mtpState = (CudaMtpState)model.CreateMtpState()!;
         using (ITensor _ = model.Forward(tokenIds, positions, deviceId: -1, kvCache, adapter: null, mtpState)) { }
-        mtpState.SeedFromCapturedRow(mtpState.CapturedRowCount - 1);
 
-        Assert.Equal(0, mtpState.CurrentLength);
+        // The prefill forward absorbed every prompt position into the head (issue #469).
+        Assert.Equal(tokenIds.Length, mtpState.CurrentLength);
 
-        using ITensor draft0 = model.ForwardMtp(mtpState, tokenId: tokenIds[^1], position: 2);
+        // First draft: the token after the prompt, at position 3, paired with h_2.
+        using ITensor draft0 = model.ForwardMtp(mtpState, tokenId: NextToken, position: 3);
         Assert.Equal(1, draft0.Shape[0]);
         Assert.Equal(config.VocabSize, draft0.Shape[1]);
-        Assert.Equal(1, mtpState.CurrentLength);
+        Assert.Equal(4, mtpState.CurrentLength);
         AssertAllFinite(draft0, config.VocabSize);
 
         // Second autoregressive MTP step, seeded from the head's own output (not the trunk's).
         int argmax0 = ArgMax(draft0, config.VocabSize);
-        using ITensor draft1 = model.ForwardMtp(mtpState, tokenId: argmax0, position: 3);
-        Assert.Equal(2, mtpState.CurrentLength);
+        using ITensor draft1 = model.ForwardMtp(mtpState, tokenId: argmax0, position: 4);
+        Assert.Equal(5, mtpState.CurrentLength);
         AssertAllFinite(draft1, config.VocabSize);
     }
 
@@ -236,9 +241,8 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
         using var kvCache = model.CreateKvCache(maxSeqLen: 64);
         using var mtpState = (CudaMtpState)model.CreateMtpState()!;
         using (ITensor _ = model.Forward(tokenIds, positions, deviceId: -1, kvCache, adapter: null, mtpState)) { }
-        mtpState.SeedFromCapturedRow(mtpState.CapturedRowCount - 1);
 
-        using ITensor draft = model.ForwardMtp(mtpState, tokenId: tokenIds[^1], position: 1);
+        using ITensor draft = model.ForwardMtp(mtpState, tokenId: NextToken, position: 2);
         AssertAllFinite(draft, config.VocabSize);
     }
 
@@ -433,9 +437,8 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
         using var kvCache = model.CreateKvCache(maxSeqLen: 64);
         using var mtpState = (CudaMtpState)model.CreateMtpState()!;
         using (ITensor _ = model.Forward(tokenIds, positions, deviceId: -1, kvCache, adapter: null, mtpState)) { }
-        mtpState.SeedFromCapturedRow(mtpState.CapturedRowCount - 1);
 
-        using ITensor draft = model.ForwardMtp(mtpState, tokenId: tokenIds[^1], position: 2);
+        using ITensor draft = model.ForwardMtp(mtpState, tokenId: NextToken, position: 3);
         unsafe
         {
             var span = new ReadOnlySpan<float>((void*)draft.DataPointer, config.VocabSize);

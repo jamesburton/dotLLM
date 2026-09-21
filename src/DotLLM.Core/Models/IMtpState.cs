@@ -17,16 +17,17 @@ namespace DotLLM.Core.Models;
 /// This state container is the small additional piece two-model speculative decoding doesn't need:
 /// it carries the MTP head's own KV-cache (sized for exactly the trailing MTP block(s), not the
 /// trunk) plus the "pending hidden" handoff row that seeds the head's next autoregressive step.
-/// Mirrors llama.cpp's <c>common_speculative_state_draft_mtp</c> (<c>common/speculative.cpp</c>):
-/// the trunk's pre-final-norm hidden state at each verified position is captured into
-/// <see cref="CapturedHiddenRows"/>, and <see cref="SeedFromCapturedRow"/> selects the row matching
-/// the last accepted position — the equivalent of llama.cpp's <c>accept()</c> picking
-/// <c>i_h = min(n_accepted, n_rows - 1)</c> out of <c>verify_h</c>.
+/// Mirrors llama.cpp's <c>common_speculative_impl_draft_mtp</c> (<c>common/speculative.cpp</c>):
+/// the trunk's post-final-norm hidden state at each forwarded position is captured into
+/// <see cref="CapturedHiddenRows"/>, every forwarded token is absorbed into the head's KV-cache
+/// (indexed by sequence position) paired with the hidden state of the position before it, and
+/// <see cref="SeedFromCapturedRow"/> selects the row matching the last accepted position — the
+/// equivalent of llama.cpp's <c>pending_h</c> hand-off (issue #469).
 /// </para>
 /// </remarks>
 public interface IMtpState : IDisposable
 {
-    /// <summary>Number of MTP-head decode steps advanced so far (drives the MTP head's own KV-cache length).</summary>
+    /// <summary>Number of sequence positions the MTP head's KV-cache covers (its next write slot).</summary>
     int CurrentLength { get; }
 
     /// <summary>
@@ -38,7 +39,7 @@ public interface IMtpState : IDisposable
     void Rollback(int length);
 
     /// <summary>
-    /// Captured pre-final-norm hidden state rows from the most recent target-model verify-phase
+    /// Captured post-final-norm hidden state rows from the most recent target-model
     /// forward pass, row-major <c>[<see cref="CapturedRowCount"/>, hiddenSize]</c> — one row per
     /// verified position, in the same order as that forward call's <c>tokenIds</c>/<c>positions</c>.
     /// Populated only by <see cref="IModel"/> implementations with <c>SupportsMtp == true</c>, and
@@ -53,9 +54,9 @@ public interface IMtpState : IDisposable
     int HiddenSize { get; }
 
     /// <summary>
-    /// Seeds the MTP head's next-step "pending hidden" input from
-    /// <c>CapturedHiddenRows[rowIndex]</c> — call after accept/reject with the row matching the
-    /// last accepted (or bonus) verified position. This is the hand-off that lets the next
+    /// Seeds the MTP head's next-step "pending hidden" input — and the carried row the next absorb
+    /// pairs its first token with — from <c>CapturedHiddenRows[rowIndex]</c>. Call after
+    /// accept/reject with the row of the last accepted verified position. This is the hand-off that lets the next
     /// speculation round's first <c>ForwardMtp</c> call seed from a hidden state the trunk model
     /// actually verified, rather than one of the (possibly rejected) MTP head's own speculative
     /// hidden states.

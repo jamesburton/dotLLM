@@ -422,10 +422,20 @@ public interface IModel : IDisposable
     IMtpState? CreateMtpState() => null;
 
     /// <summary>
-    /// Runs a forward pass that additionally captures the trunk's pre-final-norm hidden state
-    /// (one row per input position, in <paramref name="tokenIds"/> order) into
-    /// <paramref name="mtpState"/> when non-null, so a subsequent <see cref="ForwardMtp"/> call
-    /// can seed the MTP head's next autoregressive draft step from it.
+    /// Allocates an <see cref="IMtpState"/> whose MTP KV-cache covers
+    /// <paramref name="maxSequenceLength"/> positions. The head's cache is indexed by sequence
+    /// position and absorbs every trunk batch (issue #469), so it must be as long as the sequence
+    /// — prompt, generated tokens and the draft steps beyond them. Defaults to
+    /// <see cref="CreateMtpState()"/> for models that do not size it.
+    /// </summary>
+    /// <param name="maxSequenceLength">Longest sequence, in positions, the state must hold.</param>
+    IMtpState? CreateMtpState(int maxSequenceLength) => CreateMtpState();
+
+    /// <summary>
+    /// Runs a forward pass and, when <paramref name="mtpState"/> is non-null, feeds the batch to the
+    /// MTP head: captures the trunk's post-final-norm hidden state (one row per input position) and
+    /// absorbs every token into the head's KV-cache, pairing token <c>x_p</c> with the hidden state
+    /// of position <c>p - 1</c> — llama.cpp's <c>draft-mtp</c> <c>process()</c> (issue #469).
     /// </summary>
     /// <remarks>
     /// <para>The default implementation ignores <paramref name="mtpState"/> and forwards to
@@ -435,9 +445,12 @@ public interface IModel : IDisposable
     /// error (callers are expected to check <see cref="SupportsMtp"/> before ever constructing an
     /// <see cref="IMtpState"/> in the first place). Models that override
     /// <see cref="SupportsMtp"/> to <see langword="true"/> must override this overload too, and
-    /// populate <paramref name="mtpState"/> byte-identically to how they'd behave with
-    /// <paramref name="mtpState"/> null otherwise — capturing the hidden state is a pure side
-    /// effect that never changes the returned logits.</para>
+    /// return logits byte-identical to the <paramref name="mtpState"/>-null call — capturing and
+    /// absorbing are side effects on the MTP state only.</para>
+    /// <para>Every trunk forward of an MTP sequence, prefill included, must pass the state: the
+    /// head's KV-cache is indexed by position and <paramref name="positions"/> must continue it.
+    /// A forward that must not advance the head (replaying already-absorbed tokens after a
+    /// recurrent-state restore) passes <see langword="null"/>.</para>
     /// </remarks>
     /// <param name="tokenIds">Input token IDs for this step.</param>
     /// <param name="positions">Position indices for each token.</param>
@@ -445,8 +458,8 @@ public interface IModel : IDisposable
     /// <param name="kvCache">Optional KV-cache. When null, behaves identically to the uncached forward pass.</param>
     /// <param name="adapter">Optional LoRA adapter. When null, behaves like the adapter-less overload.</param>
     /// <param name="mtpState">
-    /// When non-null on an MTP-supporting model, receives the captured pre-final-norm hidden state
-    /// rows for every position in <paramref name="tokenIds"/>. Ignored otherwise.
+    /// When non-null on an MTP-supporting model, receives the captured post-final-norm hidden state
+    /// rows for every position in <paramref name="tokenIds"/> and absorbs the batch. Ignored otherwise.
     /// </param>
     /// <returns>Logits tensor of shape [seq, vocab_size] for all input positions — identical to the non-MTP overload.</returns>
     ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
@@ -458,7 +471,7 @@ public interface IModel : IDisposable
     /// with <paramref name="state"/>'s current pending hidden vector through the MTP block's own
     /// <c>enorm</c>/<c>hnorm</c>/<c>eh_proj</c> plus a single decoder block and shared LM head, and
     /// returns logits over the full vocabulary. Advances <paramref name="state"/>'s own KV-cache by
-    /// one step and updates its pending hidden vector with the MTP block's own output hidden state,
+    /// one step and updates its pending hidden vector with the MTP block's own post-head-norm output,
     /// ready for the <em>next</em> <see cref="ForwardMtp"/> call — the MTP head drafts K tokens by
     /// calling this K times in a row without re-invoking the trunk (matching llama.cpp's MTP draft
     /// loop in <c>common_speculative_state_draft_mtp::draft()</c>).
@@ -468,7 +481,10 @@ public interface IModel : IDisposable
     /// with a non-null <c>mtpState</c> and <see cref="IMtpState.SeedFromCapturedRow"/>.
     /// </param>
     /// <param name="tokenId">The token whose embedding feeds this MTP step (the previous step's accepted/drafted token).</param>
-    /// <param name="position">Sequence position this MTP step's RoPE angle and KV-cache slot correspond to.</param>
+    /// <param name="position">
+    /// Sequence position of <paramref name="tokenId"/>, which is also its KV-cache slot. Must not
+    /// exceed the head's current length; a smaller value discards the speculative steps beyond it.
+    /// </param>
     /// <returns>Logits tensor of shape [1, vocab_size] for the drafted position.</returns>
     /// <exception cref="NotSupportedException"><see cref="SupportsMtp"/> is <see langword="false"/>.</exception>
     ITensor ForwardMtp(IMtpState state, int tokenId, int position)
