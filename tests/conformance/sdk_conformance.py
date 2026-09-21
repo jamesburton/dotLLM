@@ -446,10 +446,21 @@ def oai_rate_limit(c: Ctx) -> str:
 
 
 def _burst_until_429(base_url: str, path: str, body: dict, tries: int = 12) -> int | None:
+    """Exhaust the rate limiter for THE SAME API KEY the SDK clients use.
+
+    The auth header is load-bearing, not decoration. Rate limits are per-API-key, so a burst
+    sent anonymously exhausts the anonymous bucket while the SDK call that follows uses
+    DUMMY_KEY's own, still-fresh bucket — the row then reports "no RateLimitError raised
+    despite an observed 429" no matter how correct the server is. Observed once #457 made a
+    429 reachable at all: the row went NOT-EXERCISED -> FAIL for a reason that had nothing to
+    do with the server. Send both header spellings, since the server accepts either.
+    """
     data = json.dumps(body).encode()
     for _ in range(tries):
         req = urllib.request.Request(base_url + path, data=data,
-                                     headers={"Content-Type": "application/json"}, method="POST")
+                                     headers={"Content-Type": "application/json",
+                                              "Authorization": f"Bearer {DUMMY_KEY}",
+                                              "X-API-Key": DUMMY_KEY}, method="POST")
         try:
             urllib.request.urlopen(req, timeout=60).read()
         except urllib.error.HTTPError as e:
