@@ -1214,17 +1214,53 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     public bool SupportsRecurrentStateCheckpoint => true;
 
     /// <inheritdoc/>
-    public object? CheckpointRecurrentState() => _gdnCache.Clone();
+    /// <remarks>
+    /// Snapshots are pooled (one spare): a speculative decoder takes one per round, and allocating
+    /// and zeroing a fresh copy of every layer's recurrent state each time cost more than the copy
+    /// (issue #469). Disposing the returned checkpoint hands its buffers back for the next round.
+    /// </remarks>
+    public object? CheckpointRecurrentState()
+    {
+        GdnStateCache snapshot = Interlocked.Exchange(ref _spareGdnCheckpoint, null)
+            ?? new GdnStateCache(_gdn, _gdnCache.NumGdnLayers);
+        _gdnCache.CopyTo(snapshot);
+        return new PooledGdnCheckpoint(this, snapshot);
+    }
+
+    private GdnStateCache? _spareGdnCheckpoint;
+
+    /// <summary>A pooled GDN snapshot; disposing returns its buffers to the owning model.</summary>
+    private sealed class PooledGdnCheckpoint(Qwen3HybridDenseTransformerModel owner, GdnStateCache snapshot)
+        : IDisposable
+    {
+        private GdnStateCache? _snapshot = snapshot;
+
+        public GdnStateCache Snapshot
+            => _snapshot ?? throw new ObjectDisposedException(nameof(PooledGdnCheckpoint));
+
+        public void Dispose()
+        {
+            var s = Interlocked.Exchange(ref _snapshot, null);
+            if (s is null) return;
+            if (Interlocked.CompareExchange(ref owner._spareGdnCheckpoint, s, null) is not null)
+                s.Dispose();
+        }
+    }
 
     /// <inheritdoc/>
     public void RestoreRecurrentState(object? checkpoint)
     {
-        if (checkpoint is null) return;
-        if (checkpoint is not GdnStateCache snapshot)
-            throw new ArgumentException(
-                $"{GetType().Name}.RestoreRecurrentState expects a GdnStateCache checkpoint; got {checkpoint.GetType().Name}.",
-                nameof(checkpoint));
-        snapshot.CopyTo(_gdnCache);
+        GdnStateCache snapshot = checkpoint switch
+        {
+            null => null!,
+            PooledGdnCheckpoint pooled => pooled.Snapshot,
+            GdnStateCache raw => raw,
+            _ => throw new ArgumentException(
+                $"{GetType().Name}.RestoreRecurrentState expects a checkpoint from CheckpointRecurrentState; " +
+                $"got {checkpoint.GetType().Name}.",
+                nameof(checkpoint)),
+        };
+        snapshot?.CopyTo(_gdnCache);
     }
 
     /// <inheritdoc/>
@@ -2113,6 +2149,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             _threadPool?.Dispose();
         _state.Dispose();
         _gdnCache.Dispose();
+        Interlocked.Exchange(ref _spareGdnCheckpoint, null)?.Dispose();
         GC.SuppressFinalize(this);
     }
 
