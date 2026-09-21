@@ -133,6 +133,11 @@ that has attended to the whole sequence — and is what llama.cpp's own tooling 
 honoured rather than rewritten: the request fails with a 400 telling the caller to pass `pooling`
 explicitly.
 
+**Known gaps.** There is no cap on the number of input items (OpenAI's is 2048) — a large batch
+holds the model lock for the whole request and stalls generation meanwhile. Batched embedding
+forwards, a GPU path, and `pooling: none` (one vector per token, via a non-OpenAI response shape)
+are all follow-ons.
+
 **Correctness.** Anchored against llama.cpp, not against itself: reference vectors are captured
 from `llama-server --embeddings` on the same GGUF (`tests/scripts/capture-llamacpp-embeddings.ps1`,
 committed with full provenance) and compared by cosine similarity in
