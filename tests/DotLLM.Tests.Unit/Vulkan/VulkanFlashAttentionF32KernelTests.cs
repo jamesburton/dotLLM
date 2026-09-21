@@ -154,11 +154,114 @@ public class VulkanFlashAttentionF32KernelTests
             maskMode: AttentionMaskMode.Hybrid, prefixLen: 0);
     }
 
+    // ── issue #441: headDim > 128 (Bonsai 2 declares key_length = value_length = 256) ──
+    //
+    // Before #441 these shapes had no flash path at all: the base shader's MAX_HEAD_DIM is 128,
+    // so every headDim-256 model silently ran the per-token kernel for its whole prefill. Both
+    // wide variants are asserted against the SAME CPU reference as the 128-dim cases, at the
+    // same tolerance - a wider qTile must not buy accuracy drift.
+
+    [SkippableFact]
+    public void Launch_Hd256_Br16_Bonsai2Shape()
+    {
+        // Bonsai 2's real full-attention shape: 24 Q heads / 4 KV heads (GQA-6), head_dim 256.
+        // seq 128 keeps the test quick while still spanning 8 Q-tiles and 2 KV tiles.
+        RunOne(seqQ: 128, seqKv: 128, numHeads: 24, numKvHeads: 4, headDim: 256, positionOffset: 0,
+               wideVariant: FlashAttentionWideVariant.Hd256Br16);
+    }
+
+    [SkippableFact]
+    public void Launch_Hd256_Br8_Bonsai2Shape()
+    {
+        // Same shape on the 8-row tile. BR is a dispatch-geometry constant, so this also checks
+        // the host side computed the workgroup count from the VARIANT's BR and not the base 16 -
+        // getting that wrong drops or duplicates whole query tiles.
+        RunOne(seqQ: 128, seqKv: 128, numHeads: 24, numKvHeads: 4, headDim: 256, positionOffset: 0,
+               wideVariant: FlashAttentionWideVariant.Hd256Br8);
+    }
+
+    [SkippableFact]
+    public void Launch_Hd256_Br4_Bonsai2Shape()
+    {
+        RunOne(seqQ: 128, seqKv: 128, numHeads: 24, numKvHeads: 4, headDim: 256, positionOffset: 0,
+               wideVariant: FlashAttentionWideVariant.Hd256Br4);
+    }
+
+    [SkippableFact]
+    public void Launch_Hd256_Br4_PartialQTile()
+    {
+        RunOne(seqQ: 13, seqKv: 13, numHeads: 2, numKvHeads: 1, headDim: 256, positionOffset: 0,
+               wideVariant: FlashAttentionWideVariant.Hd256Br4);
+    }
+
+    [SkippableFact]
+    public void Launch_Hd256_Br16_PartialQTile()
+    {
+        // seqQ 13 is neither a multiple of 16 nor of 8: exercises rowsInTile < BR on the wide
+        // shader, where the qTile/outAccum declarations are 2x the base shader's.
+        RunOne(seqQ: 13, seqKv: 13, numHeads: 2, numKvHeads: 1, headDim: 256, positionOffset: 0,
+               wideVariant: FlashAttentionWideVariant.Hd256Br16);
+    }
+
+    [SkippableFact]
+    public void Launch_Hd256_Br8_PartialQTile()
+    {
+        RunOne(seqQ: 13, seqKv: 13, numHeads: 2, numKvHeads: 1, headDim: 256, positionOffset: 0,
+               wideVariant: FlashAttentionWideVariant.Hd256Br8);
+    }
+
+    [SkippableFact]
+    public void Launch_Hd256_Br16_MultiKvTile_PositionOffset()
+    {
+        // Continuation prefill: 32 new queries against a 512-deep KV range, so the causal
+        // early-exit clamp and the positionOffset arithmetic both run on the wide shader.
+        RunOne(seqQ: 32, seqKv: 512, numHeads: 8, numKvHeads: 2, headDim: 256, positionOffset: 480,
+               wideVariant: FlashAttentionWideVariant.Hd256Br16);
+    }
+
+    [SkippableFact]
+    public void Launch_Hd256_Br8_MultiKvTile_PositionOffset()
+    {
+        RunOne(seqQ: 32, seqKv: 512, numHeads: 8, numKvHeads: 2, headDim: 256, positionOffset: 480,
+               wideVariant: FlashAttentionWideVariant.Hd256Br8);
+    }
+
+    [SkippableFact]
+    public void Hd256Variant_ReportsSupportedMaxHeadDim()
+    {
+        // The regression this guards: a dispatch gate that reads the MaxHeadDim CONSTANT (128)
+        // instead of the instance property sends a 256-dim head to the per-token kernel even
+        // though the wide pipeline is loaded and ready - i.e. reintroduces #441 silently.
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+
+        using var wide = VulkanFlashAttentionF32Kernel.Create(
+            device, spvDir, FlashAttentionWideVariant.Hd256Br16);
+        Assert.Equal(FlashAttentionWideVariant.Hd256Br16, wide.WideVariant);
+        Assert.Equal(VulkanFlashAttentionF32Kernel.WideMaxHeadDim, wide.SupportedMaxHeadDim);
+        Assert.Equal(VulkanFlashAttentionF32Kernel.QueryTileRows, wide.QueryTileRowsFor(256));
+
+        using var br8 = VulkanFlashAttentionF32Kernel.Create(
+            device, spvDir, FlashAttentionWideVariant.Hd256Br8);
+        Assert.Equal(8, br8.QueryTileRowsFor(256));
+        Assert.Equal(VulkanFlashAttentionF32Kernel.QueryTileRows, br8.QueryTileRowsFor(128));
+
+        using var br4 = VulkanFlashAttentionF32Kernel.Create(
+            device, spvDir, FlashAttentionWideVariant.Hd256Br4);
+        Assert.Equal(4, br4.QueryTileRowsFor(256));
+
+        using var none = VulkanFlashAttentionF32Kernel.Create(
+            device, spvDir, FlashAttentionWideVariant.None);
+        Assert.Equal(FlashAttentionWideVariant.None, none.WideVariant);
+        Assert.Equal(VulkanFlashAttentionF32Kernel.MaxHeadDim, none.SupportedMaxHeadDim);
+    }
+
     // ─────────────────────────────────────────────────────────────
 
     private static void RunOne(int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset, int slidingWindow = 0, float softCap = 0.0f, bool useAlibi = false,
-        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0,
+        FlashAttentionWideVariant wideVariant = FlashAttentionWideVariant.Hd256Br16)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -173,7 +276,11 @@ public class VulkanFlashAttentionF32KernelTests
             slidingWindow, softCap, useAlibi, maskMode, prefixLen);
 
         using var device = VulkanDevice.Create();
-        using var kernel = VulkanFlashAttentionF32Kernel.Create(device, spvDir);
+        using var kernel = VulkanFlashAttentionF32Kernel.Create(device, spvDir, wideVariant);
+        // A headDim the loaded variants cannot take would otherwise throw from Record() with a
+        // message the reader has to decode; skip explicitly instead.
+        Skip.If(headDim > kernel.SupportedMaxHeadDim,
+            $"headDim {headDim} needs the {wideVariant} SPV, which this build does not have.");
 
         using var bufQ   = device.Allocate((long)qh.Length * sizeof(float));
         using var bufK   = device.Allocate((long)kh.Length * sizeof(float));

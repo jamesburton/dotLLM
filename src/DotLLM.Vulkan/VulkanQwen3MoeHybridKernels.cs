@@ -300,9 +300,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         // the per-token attention kernel, so no output was ever wrong — this is resource and
         // consistency alignment, not a correctness fix.
         VulkanFlashAttentionF32Kernel? flashAttention =
-            VulkanTransformerModel.IsFlashAttentionDisabled() || headDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
-                ? null
-                : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
+            VulkanAttentionFallbackDiagnostics.CreatePrefillFlashAttention(
+                device, spvDir, headDim, "Qwen3Hybrid");
         VulkanSplitKvAttentionKernel? splitKvAttention =
             VulkanTransformerModel.IsSplitDecodeDisabled() || headDim > VulkanSplitKvAttentionKernel.MaxHeadDim
                 ? null
