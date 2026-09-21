@@ -38,6 +38,9 @@ namespace DotLLM.Tests.Unit.Vulkan;
 [Collection("VulkanKernels")]
 public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
 {
+    // The token after the prompt the first draft step starts from (issue #469).
+    private const int NextToken = 4;
+
     private const int VocabSize = SyntheticQwen35HybridDenseMtpGguf.VocabSize;
 
     // Loose enough for a different GEMM reduction order, tight enough that a wrong tensor,
@@ -89,10 +92,15 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
         Assert.Equal(config.HiddenSize, vkState.HiddenSize);
         Assert.Equal(0, vkState.CurrentLength);
 
+        // The checkpoint is opaque and caller-disposed (pooled since #469); a second one taken after
+        // disposing the first must work too, since it reuses the returned buffers.
         object? checkpoint = model.CheckpointRecurrentState();
-        Assert.IsType<VulkanGdnStateCache>(checkpoint);
+        Assert.IsAssignableFrom<IDisposable>(checkpoint);
         model.RestoreRecurrentState(checkpoint);
         ((IDisposable)checkpoint!).Dispose();
+        object? second = model.CheckpointRecurrentState();
+        model.RestoreRecurrentState(second);
+        ((IDisposable)second!).Dispose();
     }
 
     /// <summary>A checkpoint without an MTP head must be completely unaffected.</summary>
@@ -249,14 +257,14 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
         using var mtpState = model.CreateMtpState()!;
 
         using (ITensor _ = model.Forward(tokenIds, positions, deviceId: -1, kv, adapter: null, mtpState)) { }
-        mtpState.SeedFromCapturedRow(mtpState.CapturedRowCount - 1);
 
         var tokens = new int[draftSteps];
         var logits = new float[draftSteps][];
-        int draftToken = tokenIds[^1];
+        // Prefill absorbed positions 0..n-1 (issue #469); drafting starts at position n.
+        int draftToken = NextToken;
         for (int i = 0; i < draftSteps; i++)
         {
-            using ITensor step = model.ForwardMtp(mtpState, draftToken, positions[^1] + i);
+            using ITensor step = model.ForwardMtp(mtpState, draftToken, positions[^1] + 1 + i);
             logits[i] = Copy(step, VocabSize);
             draftToken = ArgMax(logits[i]);
             tokens[i] = draftToken;
@@ -276,20 +284,20 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
 
         using (ITensor _ = model.Forward(tokenIds, positions, deviceId: -1, kv, adapter: null, mtpState)) { }
         Assert.Equal(tokenIds.Length, mtpState.CapturedRowCount);
-        mtpState.SeedFromCapturedRow(mtpState.CapturedRowCount - 1);
 
         var tokens = new int[draftSteps];
         var logits = new float[draftSteps][];
-        int draftToken = tokenIds[^1];
+        Assert.Equal(tokenIds.Length, mtpState.CurrentLength);   // the prefill absorbed the prompt
+        int draftToken = NextToken;
         for (int i = 0; i < draftSteps; i++)
         {
-            using ITensor step = model.ForwardMtp(mtpState, draftToken, positions[^1] + i);
+            using ITensor step = model.ForwardMtp(mtpState, draftToken, positions[^1] + 1 + i);
             Assert.Equal(1, step.Shape[0]);
             Assert.Equal(VocabSize, step.Shape[1]);
             logits[i] = Copy(step, VocabSize);
             draftToken = ArgMax(logits[i]);
             tokens[i] = draftToken;
-            Assert.Equal(i + 1, mtpState.CurrentLength);
+            Assert.Equal(tokenIds.Length + i + 1, mtpState.CurrentLength);
         }
         return (tokens, logits);
     }
