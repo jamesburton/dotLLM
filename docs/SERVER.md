@@ -94,6 +94,28 @@ data: [DONE]
 ### `POST /v1/completions`
 Raw completion (no chat template). Same sampling parameters. Input is `prompt` (string) instead of `messages`.
 
+### `POST /v1/messages` (Anthropic-compatible, fork-only — #448)
+
+Anthropic Messages API endpoint, served alongside the OpenAI surface so that
+`anthropic` SDK clients can talk to dotLLM unchanged. Top-level `system`,
+string-or-block message `content`, `max_tokens` (required), `stop_sequences`,
+`tools`/`tool_choice`, and event-based streaming SSE (`message_start`,
+`content_block_*`, `message_delta`, `message_stop`). Reuses the same model
+residency, chat template, scheduler, sampler and tool-call parser as
+`/v1/chat/completions`; only the wire format differs.
+
+Errors use the Anthropic envelope, not this surface's `{"error": "..."}`:
+`{"type":"error","error":{"type":"invalid_request_error","message":"..."}}`.
+
+Two caveats worth knowing here rather than in the detail doc:
+- `/v1/messages` is **not** in `RateLimitMiddleware`'s metered-path allowlist,
+  so it currently bypasses per-API-key rate limiting (see [Rate Limiting](#rate-limiting)).
+- A masked text-diffusion model is refused on this route with a `400`; use
+  `/v1/chat/completions` for those.
+
+Full reference: **[ANTHROPIC_API.md](ANTHROPIC_API.md)**. `count_tokens`, the
+`anthropic-version`/`anthropic-beta` headers and thinking blocks are tracked in #449.
+
 ### `POST /v1/embeddings`
 Extract embedding vectors from text.
 

@@ -1,0 +1,195 @@
+# Anthropic Messages API — dotLLM
+
+dotLLM's server exposes an **Anthropic-compatible Messages API** alongside the
+OpenAI-compatible surface ([SERVER.md](SERVER.md)). Clients and SDKs written for
+the Anthropic Messages API (`anthropic` Python/TypeScript SDKs, anything that
+targets `POST /v1/messages`) can point at a running dotLLM server unchanged.
+
+The engine, tokenizer, chat-template, sampler and tool-calling pipeline are
+shared verbatim with the OpenAI endpoints — this layer only reshapes the wire
+format. Implementation: `MessagesEndpoint`, `AnthropicConverter`, and the
+`Anthropic*` DTOs in `DotLLM.Server`.
+
+Reference: <https://docs.anthropic.com/en/api/messages>
+
+> **Fork-only feature (#448).** This surface exists on this fork only; it is not
+> part of upstream `kkokosa/dotLLM`. Follow-on Anthropic compatibility work —
+> `POST /v1/messages/count_tokens`, the `anthropic-version` / `anthropic-beta`
+> request headers, and extended-thinking (`thinking`) content blocks — is
+> **not implemented** and is tracked in #449.
+
+## Endpoints
+
+### `POST /v1/messages`
+
+Primary endpoint. Accepts the Anthropic Messages request format; supports both
+non-streaming (JSON) and streaming (named SSE events).
+
+**Request body**:
+```json
+{
+  "model": "llama-3-8b-q4_k_m",
+  "max_tokens": 256,
+  "system": "You are helpful.",
+  "messages": [
+    {"role": "user", "content": "Hello!"},
+    {"role": "assistant", "content": [{"type": "text", "text": "Hi!"}]},
+    {"role": "user", "content": "What's the weather?"}
+  ],
+  "temperature": 0.7,
+  "top_p": 0.9,
+  "top_k": 40,
+  "stop_sequences": ["\n\nHuman:"],
+  "tools": [
+    {"name": "get_weather", "description": "Get weather",
+     "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}
+  ],
+  "tool_choice": {"type": "auto"},
+  "stream": false
+}
+```
+
+- `max_tokens` is **required** (per the Anthropic spec). Missing/`<= 0` → `400`.
+- `system` is a top-level string **or** an array of `{"type":"text","text":"..."}`
+  blocks; it becomes a leading `system` message in the chat template.
+- Each message `content` is a string **or** an array of content blocks
+  (`text`, `tool_use`, `tool_result`).
+- `tool_choice`: `{"type":"auto"}`, `{"type":"any"}` (→ required),
+  `{"type":"none"}`, or `{"type":"tool","name":"..."}`.
+- `messages[].role` must be `user` or `assistant`; any other role → `400`.
+  (The top-level `system` field is the only way to set a system prompt.)
+- `image` content blocks are not yet supported (no multimodal pipeline).
+- `model` selects the resident model, exactly as on the OpenAI surface: it is
+  passed to `ServerState.EnsureActiveAsync`, which activates an already-resident
+  model, lazily reloads one that idled out, or loads a new one by path / HF repo
+  id. A name that resolves to nothing → `400`. An Anthropic SDK's default
+  `model` (e.g. `claude-sonnet-4-...`) therefore has to be overridden with the
+  loaded model's id. The response `model` echoes the model that actually served
+  the request, not the requested alias.
+- `lora_adapter` is **not** honoured by this endpoint — per-request adapter
+  selection is not implemented on the server yet (the OpenAI surface does not
+  honour it either). Unknown fields are ignored, not rejected.
+
+**Response** (non-streaming):
+```json
+{
+  "id": "msg_...",
+  "type": "message",
+  "role": "assistant",
+  "model": "llama-3-8b-q4_k_m",
+  "content": [{"type": "text", "text": "It's sunny."}],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {"input_tokens": 15, "output_tokens": 8}
+}
+```
+
+When tool calls are detected, `content` contains `tool_use` blocks and
+`stop_reason` is `"tool_use"`:
+```json
+{
+  "content": [
+    {"type": "tool_use", "id": "toolu_...", "name": "get_weather",
+     "input": {"city": "Paris"}}
+  ],
+  "stop_reason": "tool_use"
+}
+```
+
+## Streaming
+
+With `"stream": true`, the response is a sequence of **named** SSE events
+(`event: <type>\ndata: <json>\n\n`):
+
+```
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_...","type":"message","role":"assistant","model":"...","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":15,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: ping
+data: {"type":"ping"}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"It's"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":15,"output_tokens":8}}
+
+event: message_stop
+data: {"type":"message_stop"}
+```
+
+Tool calls detected during streaming are emitted after the text block closes, as
+additional `tool_use` content blocks (`content_block_start` →
+`content_block_delta` with `input_json_delta` → `content_block_stop`) at index
+`1+`, and `stop_reason` becomes `"tool_use"`.
+
+## Mapping reference
+
+| Anthropic field | dotLLM engine |
+|-----------------|---------------|
+| `system` (string/array) | leading `system` `ChatMessage` |
+| message `content` string | `ChatMessage.Content` |
+| `text` block | concatenated into `ChatMessage.Content` |
+| `tool_use` block (assistant) | `ChatMessage.ToolCalls` (`ToolCall`) |
+| `tool_result` block (user) | separate `tool`-role `ChatMessage` keyed by `tool_use_id` |
+| `tools[].input_schema` | `ToolDefinition.ParametersSchema` |
+| `tool_choice` `auto`/`any`/`none`/`tool` | `ToolChoice.Auto`/`Required`/`None`/`Function` |
+| `stop_sequences` | `InferenceOptions.StopSequences` |
+
+| dotLLM `FinishReason` | Anthropic `stop_reason` |
+|-----------------------|-------------------------|
+| `Stop` (EOS / template stop) | `end_turn` |
+| `Stop` (caller `stop_sequences` matched) | `stop_sequence` (+ `stop_sequence` field) |
+| `Length` | `max_tokens` |
+| `ToolCalls` | `tool_use` |
+
+## Errors
+
+Errors use the Anthropic envelope:
+```json
+{"type": "error", "error": {"type": "invalid_request_error", "message": "max_tokens: field required"}}
+```
+
+| Condition | HTTP | `error.type` |
+|-----------|------|--------------|
+| No model loaded and no `model` given | 400 | `invalid_request_error` |
+| Unknown / unloadable `model` | 400 | `invalid_request_error` |
+| Empty `messages`, missing/invalid `max_tokens`, bad `role`/`content` kind | 400 | `invalid_request_error` |
+| Prompt exceeds context window | 400 | `invalid_request_error` |
+| Loaded model is a masked text-diffusion model | 400 | `invalid_request_error` |
+| Model became unavailable after activation succeeded | 503 | `api_error` |
+
+Note the ordering: model activation runs *before* the readiness check, so a bare
+server answers `400 "No model loaded and no model specified"` (matching the
+OpenAI surface's message) rather than `503`. The `503` branch is a backstop for
+the model going away between activation and use.
+
+A body that is not valid JSON, or that does not bind to the request shape, is
+rejected by ASP.NET's model binding before the handler runs — that produces a
+bare `400` with no Anthropic envelope. Same as the OpenAI surface.
+
+## Limitations
+
+- **Streaming tool calls** are detected post-generation (the engine parses tool
+  calls from the full output), so `tool_use` blocks are emitted at the end of the
+  stream rather than incrementally — matching the OpenAI streaming endpoint's
+  post-hoc detection.
+- **`image` / multimodal content blocks** are not supported.
+- **Masked text-diffusion models** are refused on this route with a `400`. The
+  diffusion decode path is only wired into `/v1/chat/completions`; refusing is
+  deliberate, so a diffusion checkpoint cannot silently produce autoregressive
+  output here.
+- **Rate limiting does not cover this route.** `RateLimitMiddleware.IsMeteredPath`
+  is a path allowlist naming `/v1/chat/completions`, `/v1/completions` and
+  `/v1/embeddings`, so `/v1/messages` bypasses the per-API-key limiter. The
+  handler already reports actual token usage to a lease when one exists, so
+  adding the path to that allowlist is the whole fix — tracked with the
+  rate-limit header work in #452.
+- The same single-request serialization, prompt caching, and validation rules as
+  the OpenAI endpoints apply (see [SERVER.md](SERVER.md)).

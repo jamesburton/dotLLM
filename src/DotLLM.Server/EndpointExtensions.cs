@@ -8,13 +8,15 @@ namespace DotLLM.Server;
 public static class EndpointExtensions
 {
     /// <summary>
-    /// Maps all dotLLM OpenAI-compatible API endpoints.
+    /// Maps all dotLLM API endpoints: the OpenAI-compatible surface plus the
+    /// Anthropic-compatible <c>POST /v1/messages</c> surface (#448).
     /// </summary>
     /// <param name="app">The web application.</param>
     /// <param name="serveUi">When true, also serves the embedded web chat UI at <c>GET /</c>.</param>
     public static WebApplication MapDotLLMEndpoints(this WebApplication app, bool serveUi = false)
     {
         ChatCompletionEndpoint.Map(app);
+        MessagesEndpoint.Map(app);
         CompletionEndpoint.Map(app);
         ModelEndpoint.Map(app);
         TokenizeEndpoint.Map(app);
