@@ -31,6 +31,13 @@ namespace DotLLM.Vulkan.Kernels;
 /// path that only hits when a caller runs more than <c>Capacity</c>
 /// distinct buffer tuples per kernel.
 /// </para>
+/// <para>
+/// Raw handles are only a safe key while the buffer lives: drivers recycle <c>VkBuffer</c>
+/// handle values, so a buffer destroyed and re-created (a per-request KV cache is the common
+/// case) can come back under a handle that still has an entry. Entries naming a destroyed
+/// buffer are therefore evicted via the device's destroy log before every lookup — see
+/// <see cref="VulkanDevice.BufferDestroyEpoch"/> and issue #467.
+/// </para>
 /// </remarks>
 internal sealed class DescriptorSetCache
 {
@@ -62,6 +69,16 @@ internal sealed class DescriptorSetCache
     private readonly nint[] _sets;
     private int _count;
 
+    // Descriptor sets whose entries were evicted because one of their buffers was destroyed
+    // (issue #467). Still allocated from _pool, so they are rewritten on the next miss rather
+    // than allocating afresh — without reuse, per-request KV caches would exhaust the pool.
+    private readonly nint[] _freeSets;
+    private int _freeCount;
+
+    // The device's BufferDestroyEpoch this cache has evicted up to; see EvictDestroyed.
+    private long _seenDestroyEpoch;
+    private HashSet<nint>? _destroyedScratch;
+
     /// <summary>
     /// Builds the cache against <paramref name="pipeline"/>'s descriptor-set
     /// layout. The pipeline also supplies its SPIR-V-reflected storage-buffer
@@ -82,7 +99,12 @@ internal sealed class DescriptorSetCache
         _buffersPerSet = buffersPerSet;
         _keys = new nint[Capacity * MaxBuffersPerSet];
         _sets = new nint[Capacity];
+        _freeSets = new nint[Capacity];
+        _seenDestroyEpoch = device.BufferDestroyEpoch;
     }
+
+    /// <summary>Live entries. Exposed for tests.</summary>
+    internal int Count => _count;
 
     /// <summary>
     /// Returns a populated descriptor set for <paramref name="buffers"/> —
@@ -103,6 +125,11 @@ internal sealed class DescriptorSetCache
         // RAW/WAR/WAW conflict. No-op (null) outside a tracked forward.
         _device.ActiveHazards?.OnDispatch(buffers, _writesMask);
 
+        // A destroyed buffer's handle value may already belong to a new buffer, so an entry keyed
+        // on it would bind the freed allocation (issue #467). One volatile read when nothing moved.
+        if (_device.BufferDestroyEpoch != _seenDestroyEpoch)
+            EvictDestroyed();
+
         // Linear scan — 256 entries × up-to-4 pointer comparisons is
         // ~a microsecond, well below vkAllocateDescriptorSets latency.
         for (int i = 0; i < _count; i++)
@@ -111,7 +138,7 @@ internal sealed class DescriptorSetCache
                 return _sets[i];
         }
 
-        // Miss — allocate + write + insert. Overflow is NOT recoverable mid-pass:
+        // Miss — write + insert, reusing an evicted set when there is one. Overflow is NOT recoverable mid-pass:
         // resetting the pool here would free sets still referenced by dispatches
         // already recorded in the open command buffer (silent corruption). Since
         // Capacity == the pool's maxSets, reaching here means the model needs more
@@ -125,7 +152,9 @@ internal sealed class DescriptorSetCache
                 $"{nameof(KernelSupport)}.{nameof(KernelSupport.DefaultMaxSetsPerPool)} (and this Capacity, kept equal to it).");
         }
 
-        nint set = KernelSupport.AllocateDescriptorSet(_device, _pool, _setLayout);
+        nint set = _freeCount > 0
+            ? _freeSets[--_freeCount]
+            : KernelSupport.AllocateDescriptorSet(_device, _pool, _setLayout);
         KernelSupport.WriteBufferBindings(_device, set, buffers);
 
         int slot = _count;
@@ -161,6 +190,60 @@ internal sealed class DescriptorSetCache
         Array.Clear(_keys);
         Array.Clear(_sets);
         _count = 0;
+        _freeCount = 0;
+        _seenDestroyEpoch = _device.BufferDestroyEpoch;
+    }
+
+    /// <summary>
+    /// Drops every entry that references a buffer destroyed since the last call, moving its set to
+    /// the free list for reuse.
+    /// </summary>
+    /// <remarks>
+    /// Rewriting an evicted set is safe even mid-recording: its entry names a destroyed buffer, so
+    /// no pending or recording command buffer can legally still use it. The one exception is the
+    /// overrun path — more than <see cref="VulkanDevice.DestroyLogCapacity"/> destroys since this
+    /// cache last ran — which evicts everything, including sets a recording command buffer might
+    /// hold. That needs thousands of buffer destroys between two dispatches of one kernel inside a
+    /// single recording, which no forward pass does; it is accepted rather than guarded.
+    /// </remarks>
+    private void EvictDestroyed()
+    {
+        var destroyed = _destroyedScratch ??= new HashSet<nint>();
+        destroyed.Clear();
+        bool complete = _device.TryCollectDestroyedSince(_seenDestroyEpoch, destroyed, out long epoch);
+        _seenDestroyEpoch = epoch;
+
+        int i = 0;
+        while (i < _count)
+        {
+            if (complete && !ReferencesAny(i, destroyed))
+            {
+                i++;
+                continue;
+            }
+
+            // Evict slot i: park its set, then move the last live entry into the hole.
+            _freeSets[_freeCount++] = _sets[i];
+            int last = --_count;
+            if (i != last)
+            {
+                Array.Copy(_keys, last * MaxBuffersPerSet, _keys, i * MaxBuffersPerSet, MaxBuffersPerSet);
+                _sets[i] = _sets[last];
+            }
+            Array.Clear(_keys, last * MaxBuffersPerSet, MaxBuffersPerSet);
+            _sets[last] = 0;
+        }
+    }
+
+    private bool ReferencesAny(int slot, HashSet<nint> handles)
+    {
+        int baseIdx = slot * MaxBuffersPerSet;
+        for (int j = 0; j < _buffersPerSet; j++)
+        {
+            if (handles.Contains(_keys[baseIdx + j]))
+                return true;
+        }
+        return false;
     }
 
     private bool Matches(int slot, ReadOnlySpan<nint> buffers)

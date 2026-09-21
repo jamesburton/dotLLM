@@ -65,6 +65,9 @@ public sealed class AddKernel : IDisposable
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
+    /// <summary>The kernel's descriptor-set cache. Exposed for tests.</summary>
+    internal DescriptorSetCache DescriptorCache => _descriptorCache;
+
     /// <summary>
     /// Dispatches the add kernel: <c>c[i] = a[i] + b[i]</c> for <paramref name="n"/>
     /// FP32 elements. All three buffers must be at least <c>n * sizeof(float)</c> bytes.

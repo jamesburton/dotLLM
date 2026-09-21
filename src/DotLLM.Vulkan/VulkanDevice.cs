@@ -1584,6 +1584,7 @@ public sealed class VulkanDevice : IDisposable
                 // inside another (ReaderWriterLockSlim is NoRecursion —
                 // that would throw). Clear our local copies so we don't
                 // double-free.
+                _device.RecordBufferDestroyed(_buffer);
                 _hostImport.Dispose();
                 _buffer = 0;
                 _memory = 0;
@@ -1599,6 +1600,7 @@ public sealed class VulkanDevice : IDisposable
             {
                 if (_buffer != 0)
                 {
+                    _device.RecordBufferDestroyed(_buffer);
                     VulkanApi.vkDestroyBuffer(_device._device, _buffer, 0);
                     _buffer = 0;
                 }
@@ -1713,6 +1715,57 @@ public sealed class VulkanDevice : IDisposable
     /// </remarks>
     private readonly long[] _liveBytesByHeap = new long[16];
     private readonly long[] _liveCountByHeap = new long[16];
+
+    /// <summary>
+    /// Ring of the most recently destroyed <c>VkBuffer</c> handles (issue #467). The epoch
+    /// <c>k</c> (1-based) destroy lives at slot <c>(k - 1) % DestroyLogCapacity</c>.
+    /// </summary>
+    /// <remarks>
+    /// Drivers recycle <c>VkBuffer</c> handle values, and every <see cref="Kernels.DescriptorSetCache"/>
+    /// keys on raw handles. Without this log, a buffer destroyed and re-created under the same
+    /// handle value hits the old descriptor set, which still addresses the freed allocation — on
+    /// gfx1151 a resident model decoding with a fresh KV cache per request returned wrong tokens in
+    /// ~60% of requests. Caches consult <see cref="BufferDestroyEpoch"/> on every lookup (one
+    /// volatile read) and only walk this log when it has moved.
+    /// </remarks>
+    internal const int DestroyLogCapacity = 4096;
+    private readonly nint[] _destroyLog = new nint[DestroyLogCapacity];
+    private readonly Lock _destroyLogLock = new();
+    private long _bufferDestroyEpoch;
+
+    /// <summary>Count of <c>VkBuffer</c> handles destroyed on this device; see <see cref="_destroyLog"/>.</summary>
+    internal long BufferDestroyEpoch => Volatile.Read(ref _bufferDestroyEpoch);
+
+    /// <summary>Records that <paramref name="handle"/> is about to be destroyed and may be recycled.</summary>
+    internal void RecordBufferDestroyed(nint handle)
+    {
+        if (handle == 0) return;
+        lock (_destroyLogLock)
+        {
+            long epoch = _bufferDestroyEpoch + 1;
+            _destroyLog[(int)((epoch - 1) % DestroyLogCapacity)] = handle;
+            Volatile.Write(ref _bufferDestroyEpoch, epoch);
+        }
+    }
+
+    /// <summary>
+    /// Adds every handle destroyed after <paramref name="sinceEpoch"/> to <paramref name="destroyed"/>
+    /// and returns the epoch the caller is now synchronised to. Returns <c>false</c> (with
+    /// <paramref name="currentEpoch"/> still set) when the ring no longer reaches back that far, in
+    /// which case the caller must treat every handle it holds as possibly destroyed.
+    /// </summary>
+    internal bool TryCollectDestroyedSince(long sinceEpoch, HashSet<nint> destroyed, out long currentEpoch)
+    {
+        lock (_destroyLogLock)
+        {
+            currentEpoch = _bufferDestroyEpoch;
+            if (currentEpoch - sinceEpoch > DestroyLogCapacity)
+                return false;
+            for (long epoch = sinceEpoch + 1; epoch <= currentEpoch; epoch++)
+                destroyed.Add(_destroyLog[(int)((epoch - 1) % DestroyLogCapacity)]);
+            return true;
+        }
+    }
 
     /// <summary>
     /// <c>DOTLLM_VULKAN_MEM_TRACE=1</c> logs every device allocation with the running
