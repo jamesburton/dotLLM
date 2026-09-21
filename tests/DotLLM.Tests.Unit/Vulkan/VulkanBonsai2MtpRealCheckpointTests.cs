@@ -179,10 +179,19 @@ public sealed class VulkanBonsai2MtpRealCheckpointTests
         using (var kv = model.CreateKvCache(cacheLen))
         using (IMtpState mtpState = model.CreateMtpState()!)
         {
-            using (ITensor _ = model.Forward(PromptTokens, promptPositions, deviceId: -1, kv, adapter: null, mtpState)) { }
+            // Mirror TextGenerator's shape exactly: prefill the whole prompt, sample the first
+            // token from the prefill's last logit row, and enter the round loop at THAT token's own
+            // KV slot (promptLen), never the last prompt token's (promptLen - 1). The decoder's
+            // catchup re-forwards `generatedIds[^1]` through the trunk, and its contract is that
+            // this token has never been forwarded as an input. A prompt token has been — so
+            // starting a round on one double-advances the GDN recurrence, which has no position
+            // addressing to undo it. TextGenerator is correct here (`pos = promptLen + step - 1`
+            // with `step` starting at 1); getting it wrong in a test fabricates a divergence that
+            // looks exactly like an MTP bug.
+            using (ITensor prefill = model.Forward(PromptTokens, promptPositions, deviceId: -1, kv, adapter: null, mtpState))
+                generated.Add(LastRowArgMax(prefill, config.VocabSize));
 
-            // DraftAndVerify's `position` is the last generated token's OWN KV slot.
-            int position = PromptTokens.Length - 1;
+            int position = PromptTokens.Length;
             int guard = 0;
             int[] outputBuffer = new int[K + 1];
             while (generated.Count - PromptTokens.Length < NewTokens && guard++ < NewTokens * 4)
