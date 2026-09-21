@@ -115,13 +115,67 @@ public sealed class RateLimitMiddleware
     public static RateLimitLease? GetLease(HttpContext context) =>
         context.Items.TryGetValue(LeaseItemKey, out var v) ? v as RateLimitLease : null;
 
-    private static bool IsMeteredPath(PathString path)
+    /// <summary>
+    /// Non-generative <c>/v1/</c> routes: model listing/management, adapter and prefix-cache
+    /// administration, tokenizer utilities, config. These consume no inference budget, so they
+    /// are exempt. Everything else under <c>/v1/</c> is metered.
+    /// </summary>
+    /// <remarks>
+    /// Add a route here only when it genuinely does not run the model. A prefix match is used,
+    /// so <c>/v1/models</c> also covers <c>/v1/models/{**id}</c>.
+    /// </remarks>
+    private static readonly string[] UnmeteredV1Prefixes =
+    [
+        "/v1/models",
+        "/v1/lora",
+        "/v1/prompt-cache",
+        "/v1/cache",
+        "/v1/config",
+        "/v1/tokenize",
+        "/v1/detokenize",
+    ];
+
+    /// <summary>
+    /// Decides whether a request path consumes inference budget.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>This is deliberately an exemption list, not an allowlist.</b> It used to name the three
+    /// paths that <i>were</i> metered, which meant every future generative endpoint shipped
+    /// unmetered by omission and nothing failed when someone forgot. That list was already
+    /// drifting from reality: it named <c>/v1/embeddings</c>, which does not exist yet, while
+    /// <c>/v1/messages</c> (#448) would have bypassed rate limiting entirely — and an unmetered
+    /// path can never return 429, so its configured limits are simply unenforceable.
+    /// </para>
+    /// <para>
+    /// Inverting it makes the failure mode safe: a new <c>/v1/</c> route is metered by default,
+    /// and forgetting to classify one produces an over-metered control-plane route (visible,
+    /// harmless) rather than a silent hole in the limiter.
+    /// </para>
+    /// <para>
+    /// Non-<c>/v1/</c> paths — health probes, <c>/props</c>, the chat UI and its assets — are
+    /// never metered.
+    /// </para>
+    /// </remarks>
+    internal static bool IsMeteredPath(PathString path)
     {
         if (!path.HasValue) return false;
         var p = path.Value!;
-        return p.StartsWith("/v1/chat/completions", StringComparison.OrdinalIgnoreCase)
-            || p.StartsWith("/v1/completions", StringComparison.OrdinalIgnoreCase)
-            || p.StartsWith("/v1/embeddings", StringComparison.OrdinalIgnoreCase);
+        if (!p.StartsWith("/v1/", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        foreach (var exempt in UnmeteredV1Prefixes)
+        {
+            // Segment-boundary match so /v1/models and /v1/models/{id} are exempt but a
+            // hypothetical /v1/modelsomething is not silently swept in with them.
+            if (p.StartsWith(exempt, StringComparison.OrdinalIgnoreCase) &&
+                (p.Length == exempt.Length || p[exempt.Length] == '/'))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>
