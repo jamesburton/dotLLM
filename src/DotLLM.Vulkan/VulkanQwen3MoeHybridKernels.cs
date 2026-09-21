@@ -60,6 +60,10 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulPQ2_0GemvF32Kernel MatMulPQ2_0 { get; }
     /// <summary>PQ2_0 GEMM — prefill. Variant chosen per device by <c>PQ2_0GemmVariant.SelectFor</c>.</summary>
     public MatMulPQ2_0GemmF32Kernel MatMulPQ2_0Gemm { get; }
+    /// <summary>PTQ1_0 (PrismML Bonsai dense-trit ternary) GEMV — decode.</summary>
+    public MatMulPTQ1_0GemvF32Kernel MatMulPTQ1_0 { get; }
+    /// <summary>PTQ1_0 GEMM — prefill. Untiled correctness-first kernel (#436), not a tuned one.</summary>
+    public MatMulPTQ1_0GemmF32Kernel MatMulPTQ1_0Gemm { get; }
     public MatMulF16GemvF32Kernel MatMulF16 { get; }
     public MatMulF16GemmF32Kernel MatMulF16Gemm { get; }
     public MatMulF16GemmCoopmatKernel? MatMulF16GemmCoopmat { get; }
@@ -159,6 +163,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulIq3SGemvF32Kernel matmulIq3S, MatMulIq3SGemmF32Kernel matmulIq3SGemm,
         MatMulIq1SGemvF32Kernel matmulIq1S, MatMulIq1SGemmF32Kernel matmulIq1SGemm,
         MatMulPQ2_0GemvF32Kernel matmulPQ2_0, MatMulPQ2_0GemmF32Kernel matmulPQ2_0Gemm,
+        MatMulPTQ1_0GemvF32Kernel matmulPTQ1_0, MatMulPTQ1_0GemmF32Kernel matmulPTQ1_0Gemm,
         MatMulF16GemvF32Kernel matmulF16, MatMulF16GemmF32Kernel matmulF16Gemm,
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
@@ -197,6 +202,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulIq3S = matmulIq3S; MatMulIq3SGemm = matmulIq3SGemm;
         MatMulIq1S = matmulIq1S; MatMulIq1SGemm = matmulIq1SGemm;
         MatMulPQ2_0 = matmulPQ2_0; MatMulPQ2_0Gemm = matmulPQ2_0Gemm;
+        MatMulPTQ1_0 = matmulPTQ1_0; MatMulPTQ1_0Gemm = matmulPTQ1_0Gemm;
         MatMulF16 = matmulF16; MatMulF16Gemm = matmulF16Gemm;
         MatMulF16GemmCoopmat = matmulF16GemmCoopmat;
         MatMulBf16 = matmulBf16; MatMulBf16Gemm = matmulBf16Gemm;
@@ -285,6 +291,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         // back to the register-blocked shader when cooperative matrix is unavailable.
         var matmulPQ2_0 = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
         var matmulPQ2_0Gemm = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir);
+        var matmulPTQ1_0 = MatMulPTQ1_0GemvF32Kernel.Create(device, spvDir);
+        var matmulPTQ1_0Gemm = MatMulPTQ1_0GemmF32Kernel.Create(device, spvDir);
         var matmulF16 = MatMulF16GemvF32Kernel.Create(device, spvDir);
         var matmulF16Gemm = MatMulF16GemmF32Kernel.Create(device, spvDir);
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat = null;
@@ -375,6 +383,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             matmulIq3S, matmulIq3SGemm,
             matmulIq1S, matmulIq1SGemm,
             matmulPQ2_0, matmulPQ2_0Gemm,
+            matmulPTQ1_0, matmulPTQ1_0Gemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
             rmsnorm, rope, attention, flashAttention, splitKvAttention, swiglu, add, silu, conv1d,
@@ -422,6 +431,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulIq1SGemm.InvalidateDescriptorCache();
         MatMulPQ2_0.InvalidateDescriptorCache();
         MatMulPQ2_0Gemm.InvalidateDescriptorCache();
+        MatMulPTQ1_0.InvalidateDescriptorCache();
+        MatMulPTQ1_0Gemm.InvalidateDescriptorCache();
         MatMulF16.InvalidateDescriptorCache();
         MatMulF16Gemm.InvalidateDescriptorCache();
         MatMulF16GemmCoopmat?.InvalidateDescriptorCache();
@@ -490,6 +501,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulF16GemmCoopmat?.Dispose();
         MatMulF16Gemm.Dispose();
         MatMulF16.Dispose();
+        MatMulPTQ1_0Gemm.Dispose();
+        MatMulPTQ1_0.Dispose();
         MatMulPQ2_0Gemm.Dispose();
         MatMulPQ2_0.Dispose();
         MatMulIq1SGemm.Dispose();

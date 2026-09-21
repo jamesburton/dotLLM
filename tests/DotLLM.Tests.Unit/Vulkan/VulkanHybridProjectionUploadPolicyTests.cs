@@ -74,6 +74,59 @@ public class VulkanHybridProjectionUploadPolicyTests
     }
 
     /// <summary>
+    /// The PTQ1_0 twin of <see cref="Pq2_0Projection_IsSizedPacked_NotWidenedToF32"/> (#436).
+    /// PTQ1_0 is 28 bytes per 128 weights against PQ2_0's 34, so the F32 widening is ~18x rather
+    /// than ~15x — and, crucially, this pack's <c>token_embd</c> widens past Vulkan's 4 GiB
+    /// maxStorageBufferRange, so getting it wrong is a hard load failure, not a fat one.
+    /// </summary>
+    [Fact]
+    public void Ptq1_0Projection_IsSizedPacked_NotWidenedToF32()
+    {
+        long actual = VulkanQwen3MoeHybridWeights.ProjectionUploadBytes(
+            OutputDim, InputDim, QuantizationType.PTQ1_0);
+
+        long packed = Dequantize.RowByteSize(InputDim, QuantizationType.PTQ1_0) * OutputDim;
+        long widened = (long)OutputDim * InputDim * sizeof(float);
+
+        Assert.Equal(packed, actual);
+        Assert.NotEqual(widened, actual);
+        Assert.True(widened > actual * 10,
+            $"expected the F32 form ({widened} B) to dwarf the packed form ({actual} B)");
+    }
+
+    /// <summary>
+    /// PTQ1_0 must move strictly less weight data than PQ2_0 for the same shape — 1.75 bpw
+    /// against 2.125, about 17% less. That ratio is the whole reason the pack is interesting on a
+    /// bandwidth-bound part, so it is pinned rather than left implicit in two block-size
+    /// constants that could drift apart.
+    /// </summary>
+    [Fact]
+    public void Ptq1_0Projection_IsSmallerThanPq2_0_ForTheSameShape()
+    {
+        long ptq1 = VulkanQwen3MoeHybridWeights.ProjectionUploadBytes(
+            OutputDim, InputDim, QuantizationType.PTQ1_0);
+        long pq2 = VulkanQwen3MoeHybridWeights.ProjectionUploadBytes(
+            OutputDim, InputDim, QuantizationType.PQ2_0);
+
+        Assert.True(ptq1 < pq2, $"PTQ1_0 ({ptq1} B) should be smaller than PQ2_0 ({pq2} B)");
+        Assert.Equal(28.0 / 34.0, (double)ptq1 / pq2, 6);
+    }
+
+    /// <summary>
+    /// The group-alignment guard applies to PTQ1_0 too: both its shaders read whole 128-element
+    /// groups.
+    /// </summary>
+    [Fact]
+    public void Ptq1_0Projection_WithUnalignedContractionAxis_FallsBackToF32()
+    {
+        const int unaligned = 5120 + 1;
+        long actual = VulkanQwen3MoeHybridWeights.ProjectionUploadBytes(
+            OutputDim, unaligned, QuantizationType.PTQ1_0);
+
+        Assert.Equal((long)OutputDim * unaligned * sizeof(float), actual);
+    }
+
+    /// <summary>
     /// Every format the policy claims to keep packed must actually be sized packed.
     /// A whole-table sweep, so the next format added to the dispatch switch without a
     /// matching upload arm (or vice versa) is caught here rather than by an OOM on a
@@ -90,6 +143,7 @@ public class VulkanHybridProjectionUploadPolicyTests
     [InlineData(QuantizationType.IQ3_XXS, 256)]
     [InlineData(QuantizationType.IQ3_S, 256)]
     [InlineData(QuantizationType.PQ2_0, 128)]
+    [InlineData(QuantizationType.PTQ1_0, 128)]
     public void KeptFormats_AreSizedPacked_OnAnAlignedAxis(QuantizationType qt, int groupSize)
     {
         int k = groupSize * 40; // aligned by construction

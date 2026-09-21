@@ -160,7 +160,9 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
         // token_embd [5120, 248320] widens to 5,085,593,600 bytes, which EXCEEDS Vulkan's 4 GiB
         // maxStorageBufferRange — the model simply cannot load widened. Kept packed it is ~339 MB
         // and the gather runs as a compute dispatch (pq2_0_embed_gather_f32.comp) instead.
-        bool packedEmbed = tokenEmbedQt == QuantizationType.PQ2_0;
+        // PTQ1_0 gets the same treatment for the same reason, only more acutely: it is 28 bytes
+        // per 128 weights against PQ2_0's 34, and its widened form is the same 5.08 GB.
+        bool packedEmbed = tokenEmbedQt is QuantizationType.PQ2_0 or QuantizationType.PTQ1_0;
         VulkanDevice.Buffer tokenEmbed;
         QuantizationType tokenEmbedDeviceQt;
         long tokenEmbedBytes;
@@ -168,12 +170,13 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
         if (packedEmbed)
         {
             // Uploaded directly rather than through UploadProjectionMatrix: that helper's KeepNative
-            // table has no PQ2_0 arm, and widening here is not an option at this vocabulary size.
-            tokenEmbedBytes = DotLLM.Cpu.Kernels.Dequantize.RowByteSize(config.HiddenSize, QuantizationType.PQ2_0)
+            // table has no arm for either ternary pack, and widening here is not an option at this
+            // vocabulary size.
+            tokenEmbedBytes = DotLLM.Cpu.Kernels.Dequantize.RowByteSize(config.HiddenSize, tokenEmbedQt)
                             * (long)config.VocabSize;
             tokenEmbed = device.AllocateDeviceLocal(tokenEmbedBytes);
             staging.UploadBytes(tokenEmbedWeight, tokenEmbedBytes, tokenEmbed);
-            tokenEmbedDeviceQt = QuantizationType.PQ2_0;
+            tokenEmbedDeviceQt = tokenEmbedQt;
         }
         else
         {

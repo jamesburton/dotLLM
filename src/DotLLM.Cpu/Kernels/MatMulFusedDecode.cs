@@ -444,6 +444,7 @@ public static unsafe partial class MatMul
                 case QuantizationType.Q6_K: GemvQ6_K(weights, input, result, m, k, pool); break;
                 case QuantizationType.I2_S: GemvI2_S(weights, input, result, m, k, pool); break;
                 case QuantizationType.PQ2_0: GemvPQ2_0(weights, input, result, m, k, pool); break;
+                case QuantizationType.PTQ1_0: GemvPTQ1_0(weights, input, result, m, k, pool); break;
                 case QuantizationType.MXFP4: GemvMxfp4(weights, input, result, m, k, pool); break;
                 default:
                     // No dedicated GEMV for this format. Rather than fail the whole decode step,

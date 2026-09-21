@@ -119,6 +119,10 @@ public sealed class VulkanTransformerModel : IModel
     // 32x32 register-blocked GEMM ported from the I2_S design (#233).
     private readonly MatMulPQ2_0GemvF32Kernel _matmulPQ2_0;
     private readonly MatMulPQ2_0GemmF32Kernel _matmulPQ2_0Gemm;
+    // PTQ1_0 matmul kernels — PrismML Bonsai dense-trit ternary (1.75 bpw incl. the per-group
+    // fp16 scale). Always created alongside the PQ2_0 pair (#436).
+    private readonly MatMulPTQ1_0GemvF32Kernel _matmulPTQ1_0;
+    private readonly MatMulPTQ1_0GemmF32Kernel _matmulPTQ1_0Gemm;
     // Q6_K_M matmul kernels — Phase 1 sibling of Q4_K / Q5_K, completing the
     // K-quant matmul kernel coverage. Q6_K is structurally simpler on the
     // metadata side (no dmin / 6-bit-packed scales) but has a more intricate
@@ -945,6 +949,7 @@ public sealed class VulkanTransformerModel : IModel
         MatMulIq1SGemvF32Kernel matmulIq1S, MatMulIq1SGemmF32Kernel matmulIq1SGemm,
         MatMulI2SGemvF32Kernel matmulI2S, MatMulI2SGemmF32Kernel matmulI2SGemm,
         MatMulPQ2_0GemvF32Kernel matmulPQ2_0, MatMulPQ2_0GemmF32Kernel matmulPQ2_0Gemm,
+        MatMulPTQ1_0GemvF32Kernel matmulPTQ1_0, MatMulPTQ1_0GemmF32Kernel matmulPTQ1_0Gemm,
         MatMulF16GemvF32Kernel matmulF16, MatMulF16GemmF32Kernel matmulF16Gemm,
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
@@ -1055,6 +1060,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulI2SGemm = matmulI2SGemm;
         _matmulPQ2_0 = matmulPQ2_0;
         _matmulPQ2_0Gemm = matmulPQ2_0Gemm;
+        _matmulPTQ1_0 = matmulPTQ1_0;
+        _matmulPTQ1_0Gemm = matmulPTQ1_0Gemm;
         _matmulF16 = matmulF16;
         _matmulF16Gemm = matmulF16Gemm;
         _matmulF16GemmCoopmat = matmulF16GemmCoopmat;
@@ -1589,6 +1596,8 @@ public sealed class VulkanTransformerModel : IModel
         // register-blocked F32 kernel everywhere else.
         var matmulPQ2_0 = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
         var matmulPQ2_0Gemm = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir);
+        var matmulPTQ1_0 = MatMulPTQ1_0GemvF32Kernel.Create(device, spvDir);
+        var matmulPTQ1_0Gemm = MatMulPTQ1_0GemmF32Kernel.Create(device, spvDir);
         // F16 / BF16 native matmul kernels — Phase 8. Always created; the
         // dispatcher routes per device-side QuantizationType. The F16 GEMM
         // coopmat path is opportunistic (null on devices without coopmat).
@@ -1824,6 +1833,7 @@ public sealed class VulkanTransformerModel : IModel
             matmulIq1S, matmulIq1SGemm,
             matmulI2S, matmulI2SGemm,
             matmulPQ2_0, matmulPQ2_0Gemm,
+            matmulPTQ1_0, matmulPTQ1_0Gemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
             rmsnormMatmulQ8Fused,
@@ -3968,6 +3978,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulI2SGemm.InvalidateDescriptorCache();
         _matmulPQ2_0.InvalidateDescriptorCache();
         _matmulPQ2_0Gemm.InvalidateDescriptorCache();
+        _matmulPTQ1_0.InvalidateDescriptorCache();
+        _matmulPTQ1_0Gemm.InvalidateDescriptorCache();
         _matmulF16.InvalidateDescriptorCache();
         _matmulF16Gemm.InvalidateDescriptorCache();
         _matmulF16GemmCoopmat?.InvalidateDescriptorCache();
@@ -6547,6 +6559,24 @@ public sealed class VulkanTransformerModel : IModel
             PQ2_0SmallNDispatch.Record(cmdBuf, _matmulPQ2_0, _matmulPQ2_0Gemm,
                 weights, input, output, m: outputDim, k: inputDim, n: seqLen);
         }
+        else if (weightQt == QuantType.PTQ1_0)
+        {
+            // PTQ1_0 (PrismML Bonsai dense-trit ternary, type 143): 128-element group alignment
+            // (enforced by KeepPTQ1_0OnDevice), 28 bytes per group at 1.75 bpw, fp16 group scale
+            // at the END of the block. Decode via GEMV; prefill via the untiled correctness-first
+            // GEMM (#436), which is one workgroup per (row, token) and re-reads the weight row per
+            // token. It is there so every sequence length has an arm, not because it is fast.
+            if (seqLen == 1)
+            {
+                _matmulPTQ1_0.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulPTQ1_0Gemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
         else if (weightQt == QuantType.IQ1_S)
         {
             // IQ1_S: 256-element super-block alignment, ~1.5-1.7 bpw smallest GGUF quant.
@@ -6808,6 +6838,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq1S.Dispose();
         _matmulI2SGemm.Dispose();
         _matmulI2S.Dispose();
+        _matmulPTQ1_0Gemm.Dispose();
+        _matmulPTQ1_0.Dispose();
         _matmulPQ2_0.Dispose();
         _matmulPQ2_0Gemm.Dispose();
         _matmulIq4XsGemm.Dispose();

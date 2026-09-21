@@ -62,9 +62,13 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     // site below is a no-op when it is null.
     private readonly VulkanHadamardRotation? _hadamard;
 
-    // Compute-dispatch gather for a token-embedding table kept packed on the device; null when the
-    // table was widened to F32 and the vkCmdCopyBuffer row copy applies.
+    // Compute-dispatch gather for a token-embedding table kept packed on the device; both null
+    // when the table was widened to F32 and the vkCmdCopyBuffer row copy applies. At most one is
+    // ever non-null — the pack the checkpoint actually uses. Two fields rather than one interface
+    // because InvalidateDescriptorCache is internal on both kernels and an interface member cannot
+    // be.
     private readonly Pq2_0EmbedGatherF32Kernel? _embedGather;
+    private readonly Ptq1_0EmbedGatherF32Kernel? _embedGatherPtq1_0;
     private readonly VulkanGdnStateCache _gdnCache;
     private readonly VulkanQwen3MoeHybridKernels _kernels;
 
@@ -174,7 +178,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         int[] gdnLayerOrdinal,
         int ropeDim, float ropeTheta,
         VulkanHadamardRotation? hadamard,
-        Pq2_0EmbedGatherF32Kernel? embedGather)
+        Pq2_0EmbedGatherF32Kernel? embedGather,
+        Ptq1_0EmbedGatherF32Kernel? embedGatherPtq1_0)
     {
         _device = device;
         _ownsDevice = ownsDevice;
@@ -194,6 +199,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         _ropeTheta = ropeTheta;
         _hadamard = hadamard;
         _embedGather = embedGather;
+        _embedGatherPtq1_0 = embedGatherPtq1_0;
 
         _submit = device.CreateSubmitContext();
     }
@@ -327,12 +333,15 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         var embedGather = weights.TokenEmbeddingQuantType == QuantizationType.PQ2_0
             ? Pq2_0EmbedGatherF32Kernel.Create(device, spvDir)
             : null;
+        var embedGatherPtq1_0 = weights.TokenEmbeddingQuantType == QuantizationType.PTQ1_0
+            ? Ptq1_0EmbedGatherF32Kernel.Create(device, spvDir)
+            : null;
 
         return new VulkanQwen3HybridDenseTransformerModel(
             device, ownsDevice,
             config, gguf, cpuModel, weights, state, gdnCache, kernels,
             kvSlotForLayer, attentionLayerCount, gdnLayerOrdinal,
-            ropeDim, ropeTheta, hadamard, embedGather);
+            ropeDim, ropeTheta, hadamard, embedGather, embedGatherPtq1_0);
     }
 
     // ── CPU-model accessors (we share the CPU loader; reach into its layers) ─
@@ -445,6 +454,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             // correct-then-silently-ZEROS failure as the KV-growth case (issue #437).
             if (kvCache is VulkanNemotronHKvCache { F16Kernels: { } cacheOwned })
                 cacheOwned.InvalidateDescriptorCaches();
+            // Same reasoning for the PTQ1_0 embedding gather, which is also model-owned but
+            // outside InvalidateAll's reach (issue #436).
+            _embedGatherPtq1_0?.InvalidateDescriptorCache();
         }
 
         UploadPositions(positions);
@@ -1165,6 +1177,17 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
                 PQ2_0SmallNDispatch.Record(cmdBuf, _kernels.MatMulPQ2_0, _kernels.MatMulPQ2_0Gemm,
                     weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
+            case QuantizationType.PTQ1_0:
+                // PTQ1_0 (PrismML Bonsai dense-trit ternary, type 143): 128-element group
+                // alignment, enforced upload-side by VulkanQwen3MoeHybridWeights.KeepPTQ1_0.
+                // 28 bytes per group against PQ2_0's 34, with the fp16 scale at the END of the
+                // block. Prefill goes through the untiled correctness-first GEMM (#436) — slow,
+                // but present, so no sequence length reaches the default and throws.
+                if (seqLen == 1)
+                    _kernels.MatMulPTQ1_0.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else
+                    _kernels.MatMulPTQ1_0Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
             case QuantizationType.F16:
                 if (seqLen == 1)
                     _kernels.MatMulF16.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
@@ -1199,15 +1222,26 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     {
         int hiddenSize = Config.HiddenSize;
 
-        // Packed PQ2_0 table: gather + dequantize as a compute dispatch. The widened F32 form of
-        // Bonsai 2's token_embd is 5.08 GB, over Vulkan's 4 GiB maxStorageBufferRange, so this is
-        // the only way the table can be resident at all.
-        if (_embedGather is { } gather)
+        // Packed ternary table (PQ2_0 or PTQ1_0): gather + dequantize as a compute dispatch. The
+        // widened F32 form of Bonsai 2's token_embd is 5.08 GB, over Vulkan's 4 GiB
+        // maxStorageBufferRange, so this is the only way the table can be resident at all — for
+        // either pack.
+        if (_embedGather is not null || _embedGatherPtq1_0 is not null)
         {
             _device.Upload(System.Runtime.InteropServices.MemoryMarshal.AsBytes(tokenIds), _state.TokenIdsBuffer!);
             KernelSupport.HostToComputeBarrier(cmdBuf);
-            gather.Record(cmdBuf, _weights.TokenEmbedding, _state.TokenIdsBuffer!, _state.HiddenState,
-                nTokens: tokenIds.Length, hidden: hiddenSize, vocabSize: Config.VocabSize);
+
+            if (_embedGather is { } gather)
+            {
+                gather.Record(cmdBuf, _weights.TokenEmbedding, _state.TokenIdsBuffer!, _state.HiddenState,
+                    nTokens: tokenIds.Length, hidden: hiddenSize, vocabSize: Config.VocabSize);
+            }
+            else
+            {
+                _embedGatherPtq1_0!.Record(cmdBuf, _weights.TokenEmbedding, _state.TokenIdsBuffer!, _state.HiddenState,
+                    nTokens: tokenIds.Length, hidden: hiddenSize, vocabSize: Config.VocabSize);
+            }
+
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             ProfMark(cmdBuf, VulkanOpProfiler.Cat.Embed);
 
@@ -1270,6 +1304,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         _gdnCache.Dispose();
         _hadamard?.Dispose();
         _embedGather?.Dispose();
+        _embedGatherPtq1_0?.Dispose();
         _kernels.Dispose();
         // Frees the CPU model's dequantised norm arrays and detaches it from the
         // GgufFile. The GgufFile itself is caller-owned.

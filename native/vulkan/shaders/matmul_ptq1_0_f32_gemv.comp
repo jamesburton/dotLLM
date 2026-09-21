@@ -1,0 +1,136 @@
+#version 450
+// PTQ1_0 (PrismML Bonsai dense-trit ternary) matrix-vector multiplication (decode-path GEMV).
+//
+//   y[m] = sum_g scale(m,g) * sum_{e in group g} trit(m,g,e) * x[128*g + e]
+//
+// Sibling of matmul_pq2_0_f32_gemv.comp — same dispatch model (one workgroup per output
+// row, 128 threads, shared-memory tree reduce) and the same per-128-element fp16 group
+// scale, but a denser packing: five base-3 trits to a byte instead of four 2-bit codes,
+// 28 bytes per 128 weights (1.75 bpw) against PQ2_0's 34 (2.125).
+//
+// Weight layout (matches DotLLM.Cpu.Kernels.MatMul.UnpackPTQ1_0Row /
+// DotLLM.Cpu.Kernels.Dequantize.DequantizePTQ1_0, which are themselves gated bit-exact
+// against the fork's dequantize_row_ptq1_0):
+//   Each 128 contiguous elements of a row form one 28-byte group:
+//       bytes [0..23]  : qs — 5 trits per byte, 120 values
+//       bytes [24..25] : qh — 4 trits per byte,   8 values
+//       bytes [26..27] : float16 group scale (little-endian) — NOTE: LAST, not first.
+//                        PQ2_0 puts its scale at bytes [0..1]; templating this shader
+//                        from that one without moving the read gives every group the
+//                        next group's payload bytes reinterpreted as a scale.
+//   Row stride = (K / 128) * 28 bytes. K must be a multiple of 128.
+//
+// Element order is NOT positional within a byte — it is trit-major over byte chunks,
+// exactly as the fork's ptq1_0.glsl states it:
+//       e <  80 : byte qs[e & 15],        trit n = e >> 4
+//       e < 120 : byte qs[16 + (t & 7)],  trit n = t >> 3,  t = e - 80
+//       else    : byte qh[t & 1],         trit n = t >> 1,  t = e - 120
+// Read the other way round — a lane owning one byte and walking its trits — a lane owning
+// payload byte `pb` emits, for ascending n, the elements at a fixed stride: 16 for the
+// first qs chunk, 8 for the second, 2 for qh. That is the form used below, because it
+// touches each weight byte exactly once and leaves adjacent lanes reading adjacent bytes.
+//
+// Trit extraction uses the base-3 remainder recurrence rather than a table:
+//       trit = int((v * 3) >> 8) - 1 ;  v = (v * 3) & 0xFF
+// The 8-bit mask is load-bearing — it is the `uint8_t` wrap the CPU reference relies on.
+// Dropping it yields a correct first trit and garbage for the other four.
+//
+// Dispatch: one workgroup per output row (gl_WorkGroupID.x = m), 128 threads stride across
+// the row's 26-payload-byte spans and accumulate the group-scaled partial dot product,
+// then reduce in shared memory.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow;   // = K / 128 (number of 28-byte groups per row)
+    uint rowUints;       // unused here; kept for push-constant layout parity
+} pc;
+
+const uint PTQ1_GROUP_SIZE    = 128u;
+const uint PTQ1_GROUP_BYTES   = 28u;   // 24 (qs) + 2 (qh) + 2 (fp16 scale)
+const uint PTQ1_QS_BYTES      = 24u;
+const uint PTQ1_PAYLOAD_BYTES = 26u;   // qs + qh; the scale is not a payload byte
+const uint PTQ1_SCALE_OFFSET  = 26u;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+// Reads the little-endian fp16 group scale at absolute byte offset `off` (off need not be
+// 4-byte aligned — 28-byte groups are 4-byte multiples, but the scale sits at +26 within
+// one, so it straddles) and converts to float32.
+float readGroupScale(uint off) {
+    uint lo = readByte(off);
+    uint hi = readByte(off + 1u);
+    uint half16 = lo | (hi << 8u);
+    return unpackHalf2x16(half16).x;
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowBytes = pc.blocksPerRow * PTQ1_GROUP_BYTES;
+    uint rowByteBase = m * rowBytes;
+
+    // Stride all 128 lanes over the row's payload bytes. A lane handling payload-byte index
+    // `pb` belongs to group `pb / 26` and byte-within-group `pb % 26`. Adjacent lanes read
+    // adjacent weight bytes (same or next uint word), so the weight loads coalesce; the x
+    // reads for a fixed trit index n are likewise adjacent across adjacent lanes.
+    uint totalPayloadBytes = pc.blocksPerRow * PTQ1_PAYLOAD_BYTES;
+    float acc = 0.0;
+
+    for (uint pb = tid; pb < totalPayloadBytes; pb += threads) {
+        uint g  = pb / PTQ1_PAYLOAD_BYTES;              // group index within the row
+        uint gp = pb - g * PTQ1_PAYLOAD_BYTES;          // 0..25 within the group
+
+        uint groupByteBase = rowByteBase + g * PTQ1_GROUP_BYTES;
+        float scale = readGroupScale(groupByteBase + PTQ1_SCALE_OFFSET);
+
+        uint v = readByte(groupByteBase + gp);
+
+        // Where this byte's trits land, and how many there are.
+        uint eBase;      // element index (within the group) of trit 0
+        uint eStride;    // element step per trit
+        uint tritCount;
+        if (gp < 16u) {
+            eBase = gp;                 eStride = 16u; tritCount = 5u;
+        } else if (gp < PTQ1_QS_BYTES) {
+            eBase = 80u + (gp - 16u);   eStride = 8u;  tritCount = 5u;
+        } else {
+            eBase = 120u + (gp - PTQ1_QS_BYTES); eStride = 2u; tritCount = 4u;
+        }
+
+        uint xBase = g * PTQ1_GROUP_SIZE + eBase;
+        float part = 0.0;
+        for (uint n = 0u; n < tritCount; ++n) {
+            float t = float(int((v * 3u) >> 8u) - 1);
+            v = (v * 3u) & 0xFFu;
+            part += t * x[xBase + n * eStride];
+        }
+
+        acc += scale * part;
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}

@@ -1285,6 +1285,17 @@ internal sealed class VulkanWeights : IDisposable
     private static bool KeepPQ2_0OnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.PQ2_0 && (inputDim % 128) == 0;
 
+    /// <summary>Returns true when the matrix will be kept on device as raw PTQ1_0 (PrismML
+    /// Bonsai dense-trit ternary) groups: (K/128)·28 bytes per row — <c>qs[24]</c> five base-3
+    /// trits to a byte, <c>qh[2]</c> four to a byte, then the fp16 group scale LAST (PQ2_0 puts
+    /// its scale first; the two are not interchangeable). Gated on the contraction axis being a
+    /// multiple of 128, which both the GEMV and the GEMM kernel require. Unlike PQ2_0 when it
+    /// first landed, both a decode and a prefill dispatch arm exist from the start (#436) — the
+    /// prefill one is correctness-first rather than tiled, but it exists, so no sequence length
+    /// reaches a throw.</summary>
+    private static bool KeepPTQ1_0OnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.PTQ1_0 && (inputDim % 128) == 0;
+
     /// <summary>Returns the on-device storage quant type for a projection: Q8_0 / Q4_K /
     /// Q5_K / Q6_K / IQ4_NL / IQ4_XS / F16 / BF16 / F32 depending on the source and the
     /// alignment constraints.</summary>
@@ -1341,6 +1352,7 @@ internal sealed class VulkanWeights : IDisposable
         if (KeepIq1SOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ1_S;
         if (KeepI2SOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.I2_S;
         if (KeepPQ2_0OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.PQ2_0;
+        if (KeepPTQ1_0OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.PTQ1_0;
         if (KeepF16OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.F16;
         if (KeepBf16OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.BF16;
         return QuantizationType.F32;
@@ -1458,6 +1470,9 @@ internal sealed class VulkanWeights : IDisposable
         if (KeepPQ2_0OnDevice(qt, inputDim, dequantToFp32))
             // m·(K/128)·34 bytes — no tensor-tail scale, each group carries its own (contrast I2_S).
             return Dequantize.RowByteSize(inputDim, QuantizationType.PQ2_0) * outputDim;
+        if (KeepPTQ1_0OnDevice(qt, inputDim, dequantToFp32))
+            // m·(K/128)·28 bytes — same per-group-scale story as PQ2_0, 17% less of it.
+            return Dequantize.RowByteSize(inputDim, QuantizationType.PTQ1_0) * outputDim;
         if (KeepF16OnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.F16) * outputDim;
         if (KeepBf16OnDevice(qt, inputDim, dequantToFp32))
