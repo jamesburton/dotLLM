@@ -124,6 +124,56 @@ public sealed class RateLimitManager : IDisposable
     }
 
     /// <summary>
+    /// Point-in-time view of the limiter budgets for one API key, for the <c>x-ratelimit-*</c>
+    /// response headers (#452). Returns <c>null</c> when rate limiting is off or the key has no
+    /// policy — in which case no headers should be emitted at all, because advertising a limit of
+    /// zero would make an SDK back off against a server that is not limiting it.
+    /// </summary>
+    /// <remarks>
+    /// Limiters are created lazily on a key's first metered request, so a key that has not been
+    /// seen yet reports its full configured budget rather than nothing.
+    /// </remarks>
+    public RateLimitSnapshot? GetSnapshot(string apiKey)
+    {
+        if (_disposed || !_config.Enabled)
+            return null;
+        var policy = _config.PolicyFor(apiKey);
+        if (policy is null)
+            return null;
+
+        _keys.TryGetValue(apiKey, out var state);
+
+        return new RateLimitSnapshot
+        {
+            RequestLimit = Math.Max(0, policy.RequestsPerMinute),
+            RequestsRemaining = Remaining(state?.Requests, policy.RequestsPerMinute),
+            RequestsResetSeconds = ResetSeconds(Remaining(state?.Requests, policy.RequestsPerMinute), policy.RequestsPerMinute),
+            TokenLimit = Math.Max(0, policy.TokensPerMinute),
+            TokensRemaining = Remaining(state?.Tokens, policy.TokensPerMinute),
+            TokensResetSeconds = ResetSeconds(Remaining(state?.Tokens, policy.TokensPerMinute), policy.TokensPerMinute),
+        };
+
+        static long Remaining(PartitionedRateLimiter<int>? limiter, int configured)
+        {
+            if (configured <= 0) return 0;
+            // No limiter yet (key unseen) => the full budget is still available.
+            var stats = limiter?.GetStatistics(0);
+            return stats is null ? configured : Math.Max(0, stats.CurrentAvailablePermits);
+        }
+
+        // Both buckets replenish at max(1, limit/60) permits per second, so the time to refill the
+        // consumed portion is (limit - remaining) / rate, rounded up. Seconds, matching Retry-After.
+        static int ResetSeconds(long remaining, int configured)
+        {
+            if (configured <= 0) return 0;
+            long deficit = Math.Max(0, configured - remaining);
+            if (deficit == 0) return 0;
+            int perSecond = Math.Max(1, configured / 60);
+            return (int)Math.Ceiling(deficit / (double)perSecond);
+        }
+    }
+
+    /// <summary>
     /// True up the tokens-per-minute budget for a completed request.
     /// If <paramref name="actualTokens"/> is less than the reserved
     /// estimate, the difference is refunded back to the bucket. Charges
@@ -215,6 +265,32 @@ public sealed class RateLimitManager : IDisposable
             Concurrency?.Dispose();
         }
     }
+}
+
+/// <summary>
+/// Point-in-time limiter budgets for one API key, as surfaced by the <c>x-ratelimit-*</c>
+/// response headers (#452). A limit of <c>0</c> means that limiter is not configured and its
+/// headers must be omitted.
+/// </summary>
+public readonly record struct RateLimitSnapshot
+{
+    /// <summary>Configured requests-per-minute ceiling. 0 = no per-request cap.</summary>
+    public int RequestLimit { get; init; }
+
+    /// <summary>Requests still admissible in the current window.</summary>
+    public long RequestsRemaining { get; init; }
+
+    /// <summary>Seconds until the requests bucket is back at <see cref="RequestLimit"/>.</summary>
+    public int RequestsResetSeconds { get; init; }
+
+    /// <summary>Configured tokens-per-minute ceiling. 0 = no per-token cap.</summary>
+    public int TokenLimit { get; init; }
+
+    /// <summary>Tokens still admissible in the current window.</summary>
+    public long TokensRemaining { get; init; }
+
+    /// <summary>Seconds until the tokens bucket is back at <see cref="TokenLimit"/>.</summary>
+    public int TokensResetSeconds { get; init; }
 }
 
 /// <summary>Result of <see cref="RateLimitManager.TryAcquireAsync"/>.</summary>

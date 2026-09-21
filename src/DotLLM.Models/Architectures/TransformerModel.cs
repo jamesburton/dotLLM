@@ -19,7 +19,7 @@ namespace DotLLM.Models.Architectures;
 /// Transformer forward pass: embedding lookup → N × transformer blocks → final norm → LM head → logits.
 /// Operates entirely on the CPU using pre-allocated scratch buffers for zero-allocation inference.
 /// </summary>
-public sealed unsafe class TransformerModel : IModel
+public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
 {
     /// <summary>Q8_0 block: 2 bytes (Half scale) + 32 bytes (sbyte values).</summary>
     private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
@@ -689,6 +689,31 @@ public sealed unsafe class TransformerModel : IModel
         RunLayersAndFinalNormCore(tokenIds, positions, kvCache);
         return RunLmHead(tokenIds.Length, deviceId);
     }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Runs exactly the same graph as <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
+    /// up to and including the final output norm, then stops: the LM head is not evaluated.
+    /// This is the tensor llama.cpp names <c>result_norm</c> and assigns to <c>res-&gt;t_embd</c>
+    /// (<c>src/models/llama.cpp</c>), i.e. the tensor its pooling operates on
+    /// (<c>llm_graph_context::build_pooling</c>).
+    /// </remarks>
+    public ITensor ForwardHidden(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
+    {
+        RunLayersAndFinalNormCore(tokenIds, positions, kvCache: null);
+
+        int seqLen = tokenIds.Length;
+        int hiddenSize = Config.HiddenSize;
+        float* hidden = (float*)_state.HiddenState;
+
+        var result = UnmanagedTensor.Allocate(new TensorShape(seqLen, hiddenSize), DType.Float32, deviceId);
+        new ReadOnlySpan<float>(hidden, seqLen * hiddenSize)
+            .CopyTo(new Span<float>((void*)result.DataPointer, seqLen * hiddenSize));
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public PoolingType? DeclaredPoolingType => Config.PoolingType;
 
     /// <summary>
     /// Returns the effective sliding-window size for <paramref name="layer"/>.

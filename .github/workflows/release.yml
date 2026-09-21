@@ -113,6 +113,25 @@ jobs:
             -p:DebugSymbols=false \
             -o publish/${{ matrix.rid }}
 
+      # (#455) The Windows system tray. Self-contained single-file, matching the CLI above, and
+      # deliberately NOT trimmed or AOT: WinForms supports neither. It ships in the same archive
+      # so dotllm.exe ends up beside dotllm-tray.exe, which is the layout the tray's executable
+      # locator probes first. See docs/TRAY.md.
+      - name: Publish tray (Windows only)
+        if: matrix.rid == 'win-x64'
+        shell: bash
+        run: |
+          dotnet publish src/DotLLM.Tray/DotLLM.Tray.csproj \
+            -c Release \
+            -r win-x64 \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:IncludeNativeLibrariesForSelfExtract=true \
+            -p:EnableCompressionInSingleFile=true \
+            -p:DebugType=none \
+            -p:DebugSymbols=false \
+            -o publish-tray/win-x64
+
       - name: Stage release payload
         shell: bash
         run: |
@@ -120,6 +139,9 @@ jobs:
           stage="stage/dotllm-${version}-${{ matrix.rid }}"
           mkdir -p "$stage"
           cp "publish/${{ matrix.rid }}/${{ matrix.exe }}" "$stage/"
+          if [ -f "publish-tray/win-x64/dotllm-tray.exe" ]; then
+            cp "publish-tray/win-x64/dotllm-tray.exe" "$stage/"
+          fi
           if [ -d "publish/${{ matrix.rid }}/ptx" ]; then
             cp -r "publish/${{ matrix.rid }}/ptx" "$stage/"
           fi

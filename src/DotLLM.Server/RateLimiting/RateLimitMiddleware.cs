@@ -17,10 +17,10 @@ namespace DotLLM.Server.RateLimiting;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Scope.</b> The middleware only consults rate limits on requests
-/// targeting the inference endpoints (<c>/v1/chat/completions</c>,
-/// <c>/v1/completions</c>, <c>/v1/embeddings</c>). Health probes,
-/// model-management, and the chat UI are intentionally unconstrained.
+/// <b>Scope.</b> Every <c>/v1/</c> path is metered except an explicit exemption
+/// list of control-plane routes — see <see cref="IsMeteredPath"/> for why that is
+/// an exemption list rather than an allowlist. Health probes, <c>/props</c> and
+/// the chat UI sit outside <c>/v1/</c> and are never metered.
 /// </para>
 /// <para>
 /// <b>Token estimation.</b> For accurate per-token accounting the
@@ -93,6 +93,14 @@ public sealed class RateLimitMiddleware
 
         var lease = result.Lease!;
         context.Items[LeaseItemKey] = lease;
+
+        // #452: ResponseHeadersMiddleware stamped a snapshot on the way in, but that predates this
+        // request's own acquire — so a success response would advertise the remaining budget as it
+        // was one request ago. Re-stamp now: still before the response starts, so this is safe on
+        // the SSE paths, whose first flush happens inside _next.
+        if (_manager.GetSnapshot(apiKey) is { } admitted)
+            ResponseHeadersMiddleware.ApplyRateLimitHeaders(context.Response, admitted);
+
         try
         {
             await _next(context);
@@ -115,13 +123,80 @@ public sealed class RateLimitMiddleware
     public static RateLimitLease? GetLease(HttpContext context) =>
         context.Items.TryGetValue(LeaseItemKey, out var v) ? v as RateLimitLease : null;
 
-    private static bool IsMeteredPath(PathString path)
+    /// <summary>
+    /// Non-generative <c>/v1/</c> routes: model listing/management, adapter and prefix-cache
+    /// administration, tokenizer utilities, config. Everything else under <c>/v1/</c> is metered.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Add a route here only when it genuinely does not consume inference budget. A
+    /// segment-boundary prefix match is used, so <c>/v1/models</c> also covers
+    /// <c>/v1/models/{**id}</c>.
+    /// </para>
+    /// <para>
+    /// <b>Known inexactness:</b> <c>POST /v1/prompt-cache/{id}</c> <i>does</i> run a prefill
+    /// through the model to populate the KV cache. It is exempt because it was unmetered before
+    /// this list was inverted and metering it now would be a behaviour change, not because it is
+    /// free. Revisit if prefix registration becomes a way to burn budget unbilled.
+    /// </para>
+    /// </remarks>
+    private static readonly string[] UnmeteredV1Prefixes =
+    [
+        "/v1/models",
+        "/v1/lora",
+        "/v1/prompt-cache",
+        "/v1/cache",
+        "/v1/config",
+        "/v1/settings",
+        "/v1/devices",
+        // Tokenises only - no forward pass, same as /v1/tokenize. The
+        // generative /v1/messages itself is NOT exempt (segment-boundary match).
+        "/v1/messages/count_tokens",
+        "/v1/tokenize",
+        "/v1/detokenize",
+    ];
+
+    /// <summary>
+    /// Decides whether a request path consumes inference budget.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>This is deliberately an exemption list, not an allowlist.</b> It used to name the three
+    /// paths that <i>were</i> metered, which meant every future generative endpoint shipped
+    /// unmetered by omission and nothing failed when someone forgot. That list was already
+    /// drifting from reality: it named <c>/v1/embeddings</c>, which does not exist yet, while
+    /// <c>/v1/messages</c> (#448) would have bypassed rate limiting entirely — and an unmetered
+    /// path can never return 429, so its configured limits are simply unenforceable.
+    /// </para>
+    /// <para>
+    /// Inverting it makes the failure mode safe: a new <c>/v1/</c> route is metered by default,
+    /// and forgetting to classify one produces an over-metered control-plane route (visible,
+    /// harmless) rather than a silent hole in the limiter.
+    /// </para>
+    /// <para>
+    /// Non-<c>/v1/</c> paths — health probes, <c>/props</c>, the chat UI and its assets — are
+    /// never metered.
+    /// </para>
+    /// </remarks>
+    internal static bool IsMeteredPath(PathString path)
     {
         if (!path.HasValue) return false;
         var p = path.Value!;
-        return p.StartsWith("/v1/chat/completions", StringComparison.OrdinalIgnoreCase)
-            || p.StartsWith("/v1/completions", StringComparison.OrdinalIgnoreCase)
-            || p.StartsWith("/v1/embeddings", StringComparison.OrdinalIgnoreCase);
+        if (!p.StartsWith("/v1/", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        foreach (var exempt in UnmeteredV1Prefixes)
+        {
+            // Segment-boundary match so /v1/models and /v1/models/{id} are exempt but a
+            // hypothetical /v1/modelsomething is not silently swept in with them.
+            if (p.StartsWith(exempt, StringComparison.OrdinalIgnoreCase) &&
+                (p.Length == exempt.Length || p[exempt.Length] == '/'))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -194,11 +269,17 @@ public sealed class RateLimitMiddleware
         return null;
     }
 
-    private static async Task WriteRejection(HttpContext context, AcquireResult result, string apiKey)
+    private async Task WriteRejection(HttpContext context, AcquireResult result, string apiKey)
     {
         context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
         context.Response.Headers["Retry-After"] = result.RetryAfter.ToString(CultureInfo.InvariantCulture);
         context.Response.Headers["X-RateLimit-Limiter"] = result.Rejected.ToString();
+
+        // #452: re-stamp the x-ratelimit-* trio with the post-rejection state. ResponseHeadersMiddleware
+        // already wrote a snapshot on the way in, but that one predates this request's attempt — the
+        // client needs the budget as it stands now, which is what its backoff is computed against.
+        if (_manager.GetSnapshot(apiKey) is { } snapshot)
+            ResponseHeadersMiddleware.ApplyRateLimitHeaders(context.Response, snapshot);
 
         string reason = result.Rejected switch
         {
@@ -207,10 +288,12 @@ public sealed class RateLimitMiddleware
             LimiterKind.Concurrency => "max-concurrent",
             _ => "rate-limit",
         };
-        var body = new ErrorResponse
-        {
-            Error = $"Rate limit exceeded ({reason}). Retry in {result.RetryAfter}s.",
-        };
+        // SDK-shaped envelope (#452): the official clients classify a failure from `error.type`,
+        // so a flat string here leaves a 429 indistinguishable from any other error.
+        // code is OpenAI's spelling; which limiter fired is carried by X-RateLimit-Limiter.
+        var body = ErrorResponse.RateLimit(
+            $"Rate limit exceeded ({reason}). Retry in {result.RetryAfter}s.",
+            code: "rate_limit_exceeded");
         context.Response.ContentType = "application/json";
         await JsonSerializer.SerializeAsync(
             context.Response.Body, body,
