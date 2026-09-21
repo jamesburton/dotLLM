@@ -684,8 +684,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     /// <summary>
     /// Batch length up to which the LM head runs over <em>every</em> row, so <c>Forward</c> honours
     /// the <see cref="IModel"/> <c>[seq, vocab]</c> contract. Sized to
-    /// <see cref="MtpDefaultMaxDraftSteps"/>: an MTP verify batch is at most K rows and needs a
-    /// logit row per drafted position, while a real prefill is orders of magnitude longer and only
+    /// <see cref="MtpDefaultMaxDraftSteps"/>: an MTP verify batch is K+1 rows (the last token plus
+    /// K drafts) and needs a logit row per position, while a real prefill is orders of magnitude longer and only
     /// ever has its last row read.
     /// </summary>
     public const int MaxAllRowLogitsSeqLen = MtpDefaultMaxDraftSteps;
@@ -1242,7 +1242,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     /// <remarks>
     /// Sized for the MTP head's own attention — the MTP block is a normal full-attention layer —
-    /// with a device-resident KV-cache deep enough for <see cref="MtpDefaultMaxDraftSteps"/> steps.
+    /// with a device-resident, position-indexed KV-cache of <see cref="MtpDefaultMaxSequenceLength"/>
+    /// positions (issue #469).
     /// </remarks>
     public IMtpState? CreateMtpState() => CreateMtpState(MtpDefaultMaxSequenceLength);
 
