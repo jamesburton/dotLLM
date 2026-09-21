@@ -84,14 +84,24 @@ public sealed class MeteredPathPolicyTests
 
         Assert.NotEmpty(registered);
 
-        // No route registered today is generative except the two completion endpoints, so every
-        // other registered route must be exempt. This is the assertion that would fire if a
-        // control-plane route were added under /v1/ without being classified.
-        string[] generative = ["/v1/chat/completions", "/v1/completions"];
+        // Routes that run the model. /v1/messages (#448) and /v1/embeddings (#451) are listed
+        // ahead of their arrival: a path that is not registered simply does not appear in
+        // `registered`, so naming it here is harmless now and correct the moment it lands.
+        string[] generative =
+        [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/embeddings",
+            "/v1/messages",
+        ];
+
         foreach (var path in registered)
         {
             bool expected = generative.Contains(path, StringComparer.Ordinal);
-            Assert.Equal(expected, RateLimitMiddleware.IsMeteredPath(path));
+            Assert.True(expected == RateLimitMiddleware.IsMeteredPath(path),
+                $"Route '{path}' is {(RateLimitMiddleware.IsMeteredPath(path) ? "metered" : "unmetered")} but the test expects it to be " +
+                $"{(expected ? "metered" : "unmetered")}. Classify it: if it runs the model, add it to `generative` in this test; " +
+                "if it is a control-plane route, add it to RateLimitMiddleware.UnmeteredV1Prefixes.");
         }
     }
 

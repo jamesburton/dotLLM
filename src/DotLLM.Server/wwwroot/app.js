@@ -1090,7 +1090,9 @@ async function handleModalLoad() {
             closeModelModal();
         } else {
             const err = await res.json().catch(() => ({}));
-            const errMsg = err.error || `HTTP ${res.status}`;
+            // #452: the error envelope is now {"error": {"message", ...}}. Read .message, but
+            // still tolerate a bare string so this keeps working against an older server.
+            const errMsg = (err.error && (err.error.message || err.error)) || `HTTP ${res.status}`;
             modalStatus.innerHTML = `<span class="text-red-400">Failed: ${esc(errMsg)}</span>`;
             setStatus(`Load failed: ${errMsg}`, 'text-red-400');
         }

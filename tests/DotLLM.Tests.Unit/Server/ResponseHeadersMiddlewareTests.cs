@@ -204,6 +204,34 @@ public sealed class ResponseHeadersMiddlewareTests
     }
 
     /// <summary>
+    /// A host wiring real auth registers its own <see cref="IApiKeyResolver"/>. This middleware
+    /// runs before the limiter has stashed the resolved key, so if it fell back to the default
+    /// header resolver it would report a different bucket's budget entirely.
+    /// </summary>
+    [Fact]
+    public async Task UsesTheConfiguredApiKeyResolver()
+    {
+        var cfg = new RateLimitConfig
+        {
+            Enabled = true,
+            DefaultPolicy = new RateLimitPolicy { RequestsPerMinute = 5 },
+            ApiKeys = new Dictionary<string, RateLimitPolicy> { ["vip"] = new RateLimitPolicy { RequestsPerMinute = 999 } },
+        };
+        using var manager = new RateLimitManager(cfg);
+        var ctx = NewContext(out _);
+
+        var mw = new ResponseHeadersMiddleware(_ => Task.CompletedTask, manager, new FixedKeyResolver("vip"));
+        await mw.InvokeAsync(ctx);
+
+        Assert.Equal("999", ctx.Response.Headers["x-ratelimit-limit-requests"].ToString());
+    }
+
+    private sealed class FixedKeyResolver(string key) : IApiKeyResolver
+    {
+        public string Resolve(HttpContext context) => key;
+    }
+
+    /// <summary>
     /// The snapshot must reflect consumption, not just the configured ceiling — otherwise
     /// <c>x-ratelimit-remaining-requests</c> is a constant and the SDK never sees pressure.
     /// </summary>

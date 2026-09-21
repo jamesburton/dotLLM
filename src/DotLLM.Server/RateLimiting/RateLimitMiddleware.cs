@@ -17,10 +17,10 @@ namespace DotLLM.Server.RateLimiting;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Scope.</b> The middleware only consults rate limits on requests
-/// targeting the inference endpoints (<c>/v1/chat/completions</c>,
-/// <c>/v1/completions</c>, <c>/v1/embeddings</c>). Health probes,
-/// model-management, and the chat UI are intentionally unconstrained.
+/// <b>Scope.</b> Every <c>/v1/</c> path is metered except an explicit exemption
+/// list of control-plane routes — see <see cref="IsMeteredPath"/> for why that is
+/// an exemption list rather than an allowlist. Health probes, <c>/props</c> and
+/// the chat UI sit outside <c>/v1/</c> and are never metered.
 /// </para>
 /// <para>
 /// <b>Token estimation.</b> For accurate per-token accounting the
@@ -93,6 +93,14 @@ public sealed class RateLimitMiddleware
 
         var lease = result.Lease!;
         context.Items[LeaseItemKey] = lease;
+
+        // #452: ResponseHeadersMiddleware stamped a snapshot on the way in, but that predates this
+        // request's own acquire — so a success response would advertise the remaining budget as it
+        // was one request ago. Re-stamp now: still before the response starts, so this is safe on
+        // the SSE paths, whose first flush happens inside _next.
+        if (_manager.GetSnapshot(apiKey) is { } admitted)
+            ResponseHeadersMiddleware.ApplyRateLimitHeaders(context.Response, admitted);
+
         try
         {
             await _next(context);
@@ -117,12 +125,20 @@ public sealed class RateLimitMiddleware
 
     /// <summary>
     /// Non-generative <c>/v1/</c> routes: model listing/management, adapter and prefix-cache
-    /// administration, tokenizer utilities, config. These consume no inference budget, so they
-    /// are exempt. Everything else under <c>/v1/</c> is metered.
+    /// administration, tokenizer utilities, config. Everything else under <c>/v1/</c> is metered.
     /// </summary>
     /// <remarks>
-    /// Add a route here only when it genuinely does not run the model. A prefix match is used,
-    /// so <c>/v1/models</c> also covers <c>/v1/models/{**id}</c>.
+    /// <para>
+    /// Add a route here only when it genuinely does not consume inference budget. A
+    /// segment-boundary prefix match is used, so <c>/v1/models</c> also covers
+    /// <c>/v1/models/{**id}</c>.
+    /// </para>
+    /// <para>
+    /// <b>Known inexactness:</b> <c>POST /v1/prompt-cache/{id}</c> <i>does</i> run a prefill
+    /// through the model to populate the KV cache. It is exempt because it was unmetered before
+    /// this list was inverted and metering it now would be a behaviour change, not because it is
+    /// free. Revisit if prefix registration becomes a way to burn budget unbilled.
+    /// </para>
     /// </remarks>
     private static readonly string[] UnmeteredV1Prefixes =
     [
@@ -269,9 +285,10 @@ public sealed class RateLimitMiddleware
         };
         // SDK-shaped envelope (#452): the official clients classify a failure from `error.type`,
         // so a flat string here leaves a 429 indistinguishable from any other error.
+        // code is OpenAI's spelling; which limiter fired is carried by X-RateLimit-Limiter.
         var body = ErrorResponse.RateLimit(
             $"Rate limit exceeded ({reason}). Retry in {result.RetryAfter}s.",
-            code: reason);
+            code: "rate_limit_exceeded");
         context.Response.ContentType = "application/json";
         await JsonSerializer.SerializeAsync(
             context.Response.Body, body,

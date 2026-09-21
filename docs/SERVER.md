@@ -358,6 +358,11 @@ also land on its 429 short-circuit) emits:
 | `x-ratelimit-limit-requests` / `-remaining-requests` / `-reset-requests` | Requests-per-minute budget. Omitted entirely when that limiter is not configured — advertising a limit of 0 would make a well-behaved SDK back off against a server that is not limiting it. |
 | `x-ratelimit-limit-tokens` / `-remaining-tokens` / `-reset-tokens` | Tokens-per-minute budget, same omission rule. `reset` is seconds until the bucket refills to its ceiling. |
 
+The budget is partitioned with the **same `IApiKeyResolver` the limiter uses** — a host that
+registers its own (see § Authentication note) gets headers for the right bucket. The limiter
+re-stamps the `x-ratelimit-*` values after it acquires, so a success response reports the budget
+including its own request rather than the state one request ago.
+
 Inbound `OpenAI-Organization`, `OpenAI-Project`, `OpenAI-Beta` and `anthropic-beta` name concepts
 this server has no equivalent for. Nothing inspects them: they are accepted and ignored, never a
 400.
@@ -374,7 +379,9 @@ SSE endpoints start the response on their first flush, and headers cannot be add
 **Everything under `/v1/` is metered unless it is explicitly exempt.** The exemptions are
 `/v1/models`, `/v1/lora`, `/v1/prompt-cache`, `/v1/cache`, `/v1/config`, `/v1/tokenize` and
 `/v1/detokenize` (matched on segment boundaries, so `/v1/models/{id}` is covered by
-`/v1/models`). Non-`/v1/` paths — `/health`, `/ready`, `/props`, the chat UI and its assets —
+`/v1/models`). One known inexactness: `POST /v1/prompt-cache/{id}` *does* prefill through the
+model, but is exempt because it was unmetered before the list was inverted — exempting it
+preserves behaviour rather than asserting it is free. Non-`/v1/` paths — `/health`, `/ready`, `/props`, the chat UI and its assets —
 are never metered. These are probes, control-plane operations, or static asset serving, and
 consume no inference budget.
 

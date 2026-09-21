@@ -58,11 +58,21 @@ public sealed class ResponseHeadersMiddleware
 
     private readonly RequestDelegate _next;
     private readonly RateLimitManager? _rateLimitManager;
+    private readonly IApiKeyResolver _resolver;
 
-    public ResponseHeadersMiddleware(RequestDelegate next, RateLimitManager? rateLimitManager)
+    /// <param name="next">Next delegate in the pipeline.</param>
+    /// <param name="rateLimitManager">Null when rate limiting is off; the id/timing headers are still emitted.</param>
+    /// <param name="resolver">
+    /// Must be the SAME <see cref="IApiKeyResolver"/> the limiter uses. A host that wires real auth
+    /// registers its own, and this middleware runs before <see cref="RateLimitMiddleware"/> has
+    /// stashed the resolved key — resolving with the default here would report another bucket's budget.
+    /// </param>
+    public ResponseHeadersMiddleware(RequestDelegate next, RateLimitManager? rateLimitManager,
+        IApiKeyResolver? resolver = null)
     {
         _next = next;
         _rateLimitManager = rateLimitManager;
+        _resolver = resolver ?? DefaultResolver;
     }
 
     public async Task InvokeAsync(HttpContext context)
@@ -142,14 +152,14 @@ public sealed class ResponseHeadersMiddleware
     }
 
     /// <summary>
-    /// Resolves the API key the same way <see cref="HeaderApiKeyResolver"/> does, preferring the
-    /// value <see cref="RateLimitMiddleware"/> already stashed when it ran (it will not have, on
-    /// this middleware's outbound leg, but the 429 path re-applies these headers anyway).
+    /// Resolves the API key, preferring the value <see cref="RateLimitMiddleware"/> already stashed.
+    /// On this middleware's inbound leg it will not have run yet, so the configured resolver is used —
+    /// which is why it must be the same instance the limiter partitions on.
     /// </summary>
-    private static string ResolveApiKey(HttpContext context) =>
+    private string ResolveApiKey(HttpContext context) =>
         context.Items.TryGetValue(RateLimitMiddleware.ApiKeyItemKey, out var stashed) && stashed is string s
             ? s
-            : DefaultResolver.Resolve(context);
+            : _resolver.Resolve(context);
 }
 
 /// <summary>Extension methods to wire <see cref="ResponseHeadersMiddleware"/> into a pipeline.</summary>
@@ -162,8 +172,8 @@ public static class ResponseHeadersMiddlewareExtensions
     /// limiting is disabled — the id and timing headers are emitted either way.
     /// </summary>
     public static IApplicationBuilder UseDotLLMResponseHeaders(this IApplicationBuilder app,
-        RateLimitManager? manager) =>
+        RateLimitManager? manager, IApiKeyResolver? resolver = null) =>
         // Constructed directly rather than through UseMiddleware: the manager is legitimately null
         // when rate limiting is off, and DI activation matches constructor arguments by type.
-        app.Use(next => new ResponseHeadersMiddleware(next, manager).InvokeAsync);
+        app.Use(next => new ResponseHeadersMiddleware(next, manager, resolver).InvokeAsync);
 }
