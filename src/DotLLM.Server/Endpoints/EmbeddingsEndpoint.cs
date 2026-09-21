@@ -16,9 +16,12 @@ namespace DotLLM.Server.Endpoints;
 /// Implemented</c> rather than silently producing an unvalidated vector. A GPU path is a
 /// follow-on.</para>
 /// <para>Each input item is its own forward pass with positions <c>0..n-1</c>; sequences are not
-/// packed into one batch, because the CPU forward has no per-sequence attention mask. The whole
-/// request runs under <see cref="ServerState.ExecuteAsync"/> — the model's scratch buffers are
-/// shared mutable state and concurrent forwards would corrupt each other.</para>
+/// packed into one batch, because the CPU forward has no per-sequence attention mask.</para>
+/// <para>The model's scratch buffers (and its compute thread pool) are shared mutable state, so
+/// the request holds <b>both</b> locks that guard the model: <see cref="ServerState.ExecuteAsync"/>
+/// against the direct-generator path, and — when a continuous-batch scheduler is active —
+/// <c>ContinuousBatchSchedulerService.AcquireModelAsync</c> against its run loop, which drives
+/// forward passes outside the request gate by design.</para>
 /// </remarks>
 public static class EmbeddingsEndpoint
 {
@@ -132,8 +135,19 @@ public static class EmbeddingsEndpoint
 
         try
         {
-            await state.ExecuteAsync(() =>
+            // Two locks, both needed. ExecuteAsync serialises against the direct-generator path;
+            // the scheduler lease serialises against the continuous-batch run loop, which drives
+            // forward passes on this same model OUTSIDE the request gate. Either alone leaves the
+            // model's shared scratch buffers exposed to a concurrent forward - and that is not a
+            // subtle numerical wobble: with the lease removed, a generation running alongside an
+            // embedding tears down the shared ComputeThreadPool and the process dies. The lease is
+            // taken inside the gate so the two are always acquired in the same order.
+            await state.ExecuteAsync(async () =>
             {
+                using var lease = state.Scheduler is { } scheduler
+                    ? await scheduler.AcquireModelAsync(ct)
+                    : null;
+
                 for (int i = 0; i < sequences.Count; i++)
                 {
                     ct.ThrowIfCancellationRequested();
@@ -160,8 +174,6 @@ public static class EmbeddingsEndpoint
                     };
                     promptTokens += tokens.Length;
                 }
-
-                return Task.CompletedTask;
             }, ct);
         }
         catch (NotSupportedException ex)

@@ -109,8 +109,18 @@ Extract embedding vectors from text (#451).
 **Implementation.** Each input item is its own forward pass with positions `0..n-1` (the CPU
 forward has no per-sequence attention mask, so sequences are not packed), stopping after the final
 output norm and before the LM head — the tensor llama.cpp names `result_norm` and assigns to
-`res->t_embd`, which is what its own pooling operates on. The whole request runs under the
-server's request gate, because the model's scratch buffers are shared mutable state.
+`res->t_embd`, which is what its own pooling operates on.
+
+**Concurrency.** The request holds *both* locks that guard the model: the server request gate
+(`ServerState.ExecuteAsync`, against the direct-generator path) and, when a continuous-batch
+scheduler is active, `ContinuousBatchSchedulerService.AcquireModelAsync` — the scheduler drives
+forward passes on the same model from its own run loop, deliberately outside the request gate,
+because batching rather than serialising is the point of it. The gate alone is not enough: the
+model's scratch buffers *and its compute thread pool* are shared mutable state, and an embedding
+taken alongside a generation without the lease crashes the process
+(`CountdownEvent … below zero` from `ComputeThreadPool`). `AcquireModelAsync` makes the run loop
+finish the step it is on and block before the next, so the embedding interleaves *between* steps.
+Cost to the scheduler is one uncontended semaphore per forward pass.
 
 **Pooling default.** Precedence is: explicit `pooling` → the checkpoint's GGUF
 `{arch}.pooling_type` → `last`. The GGUF value is llama.cpp's raw `llama_pooling_type` enum

@@ -263,6 +263,41 @@ public sealed class EmbeddingsEndpointHttpTests(EmbeddingsServerFixture fixture,
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
 
+    /// <summary>
+    /// An embedding computed while a completion is generating must be byte-identical to the same
+    /// embedding computed alone. The model's scratch buffers are shared mutable state, so this is
+    /// the discriminating test for the request gate: remove <c>ExecuteAsync</c> from the handler
+    /// and the two forwards interleave through the same <c>_state</c> buffers.
+    /// </summary>
+    /// <remarks>
+    /// This covers the direct-generator path, which is the default. When the continuous-batch
+    /// scheduler is enabled the endpoint refuses with 503 instead, because the scheduler runs
+    /// forward passes outside the gate — see <c>EmbeddingsEndpoint</c>.
+    /// </remarks>
+    [SkippableFact]
+    public async Task An_embedding_taken_during_a_generation_matches_the_sequential_result()
+    {
+        SkipIfNoModel();
+
+        const string text = "concurrency must not corrupt the scratch buffers";
+
+        var (baselineStatus, baselineBody) = await PostAsync(new { model = fixture.ModelId, input = text });
+        Assert.Equal(HttpStatusCode.OK, baselineStatus);
+        float[] sequential = ReadVector(baselineBody.RootElement.GetProperty("data")[0].GetProperty("embedding"));
+
+        var generation = Client.PostAsJsonAsync("/v1/completions",
+            new { model = fixture.ModelId, prompt = "Once upon a time", max_tokens = 48 }, Json);
+        var embedding = PostAsync(new { model = fixture.ModelId, input = text });
+
+        await Task.WhenAll(generation, embedding);
+        var (status, body) = await embedding;
+        Assert.Equal(HttpStatusCode.OK, status);
+        Assert.Equal(HttpStatusCode.OK, (await generation).StatusCode);
+
+        float[] concurrent = ReadVector(body.RootElement.GetProperty("data")[0].GetProperty("embedding"));
+        Assert.Equal(sequential, concurrent);
+    }
+
     private static float[] ReadVector(JsonElement array)
         => array.EnumerateArray().Select(x => x.GetSingle()).ToArray();
 }
