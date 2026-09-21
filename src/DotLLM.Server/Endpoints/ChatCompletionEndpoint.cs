@@ -357,12 +357,11 @@ public static class ChatCompletionEndpoint
                 Delta = finalDelta,
                 FinishReason = RequestConverter.ToFinishReasonString(finishReason),
             }],
-            Usage = new UsageDto
-            {
-                PromptTokens = promptTokens,
-                CompletionTokens = completionTokens,
-                TotalTokens = promptTokens + completionTokens,
-            },
+            // #450/#453: OpenAI puts usage in a DEDICATED final chunk (choices: []) and ONLY
+            // when stream_options.include_usage was requested. Carrying it on the last content
+            // chunk as well produced two usage-bearing chunks when requested and one when not
+            // — the conformance rows openai/usage.stream{,.unrequested} caught both.
+            // Timings stays: it is our own extension and no OpenAI client looks for it.
             Timings = timings.HasValue ? new TimingsDto
             {
                 PrefillTimeMs = timings.Value.PrefillTimeMs,

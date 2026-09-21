@@ -185,6 +185,10 @@ async function* streamChat(messages, params) {
     const body = {
         messages,
         stream: true,
+        // The server no longer carries usage on the final content chunk (OpenAI puts it in a
+        // dedicated chunk, and only on request) — so ask for it explicitly, or the token
+        // counts in the stats line go blank.
+        stream_options: { include_usage: true },
         temperature: params.temperature,
         top_p: params.top_p,
         top_k: params.top_k,
