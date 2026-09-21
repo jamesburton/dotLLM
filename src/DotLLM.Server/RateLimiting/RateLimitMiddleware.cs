@@ -205,7 +205,7 @@ public sealed class RateLimitMiddleware
     /// cheap char-count approximation for the prompt/messages. We buffer
     /// the body so the downstream endpoint can re-read it.
     /// </summary>
-    private static async ValueTask<int> EstimateTotalTokensAsync(HttpContext context, RateLimitConfig config)
+    internal static async ValueTask<int> EstimateTotalTokensAsync(HttpContext context, RateLimitConfig config)
     {
         var req = context.Request;
         if (!HttpMethods.IsPost(req.Method))
@@ -216,6 +216,7 @@ public sealed class RateLimitMiddleware
         long startPos = req.Body.CanSeek ? req.Body.Position : 0;
         int promptChars = 0;
         int? maxTokens = null;
+        int? choiceCount = null;
 
         try
         {
@@ -233,6 +234,7 @@ public sealed class RateLimitMiddleware
             string body = sb.ToString();
             promptChars = body.Length;
             maxTokens = TryReadMaxTokens(body);
+            choiceCount = TryReadChoiceCount(body);
         }
         catch (Exception) // malformed body — defer to endpoint validator
         {
@@ -249,7 +251,43 @@ public sealed class RateLimitMiddleware
         // tokenizers. Cheap and stable; trued up after generation.
         int promptEstimate = Math.Max(1, promptChars / 4);
         int completionEstimate = maxTokens ?? config.EstimatedCompletionTokensFallback;
-        return promptEstimate + Math.Max(0, completionEstimate);
+
+        // `n` multiplies the whole request: every choice re-runs the prompt and generates its own
+        // completion (#460). The reservation is the CAP -- TrueUpTokens ignores an actual above it
+        // -- so a per-choice estimate would make `n` a straight TPM bypass, un-enforcing #457 on
+        // the endpoint that just learned to honour `n`. Clamped defensively: the endpoint validator
+        // is what rejects an out-of-range value, and this runs before it.
+        int choices = Math.Clamp(choiceCount ?? 1, 1, MaxChoiceMultiplier);
+        return checked((promptEstimate + Math.Max(0, completionEstimate)) * choices);
+    }
+
+    /// <summary>
+    /// Ceiling on the `n` multiplier applied to a token reservation. Matches the endpoint's own
+    /// cap; a larger value in the body is refused there, and this must not be the thing that
+    /// overflows or reserves absurdly in the meantime.
+    /// </summary>
+    private const int MaxChoiceMultiplier = 8;
+
+    /// <summary>
+    /// Reads <c>n</c> from the request body so the token reservation can be sized for every choice.
+    /// Same cheap body scan as <see cref="TryReadMaxTokens"/>; a missing, malformed or non-positive
+    /// value yields <see langword="null"/> and the caller falls back to one choice.
+    /// </summary>
+    private static int? TryReadChoiceCount(string body)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return null;
+            if (doc.RootElement.TryGetProperty("n", out var n) &&
+                n.ValueKind == JsonValueKind.Number &&
+                n.TryGetInt32(out var v) && v > 0)
+            {
+                return v;
+            }
+        }
+        catch (JsonException) { }
+        return null;
     }
 
     private static int? TryReadMaxTokens(string body)
