@@ -61,8 +61,21 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
     /// Every arm is bit-exact against <c>DotLLM.Cpu.Kernels.GatedDeltaNetScan</c>; the arms
     /// change where values live and how often they are re-read, never what they are.
     /// Select with <c>DOTLLM_VK_GDN_SCAN_VARIANT</c> = <c>base</c> | <c>fused</c> |
-    /// <c>lds</c> | <c>ldsfused</c>. Default <see cref="Baseline"/> — nothing ships changed
-    /// until the A/B says which cell wins.
+    /// <c>lds</c> | <c>ldsfused</c>. <b>Default <see cref="LdsFused"/></b> — the A/B has since
+    /// said which cell wins, twice over, so it now ships on. Set <c>base</c> to opt out.
+    /// <para>
+    /// Evidence for the flip (Bonsai 2 27B PQ2_0, pp512, gfx1151, order-reversed interleaved,
+    /// quiet machine): LdsFused 172.83 / 171.11 / 168.28 against Baseline 134.93 / 133.55 /
+    /// 133.28 tok/s — 1.275x whole pass, ranges disjoint. Independently reproduced in a 2x2
+    /// factorial against the hd256 flash variant (#441), where the GDN factor alone measured
+    /// 1.42x and the two together 1.74x, confirming the two levers are near-independent.
+    /// </para>
+    /// <para>
+    /// The 2x2 also settled the mechanism: deleting a third of the state traffic (<see
+    /// cref="Fused"/>) REGRESSED to 0.955x while moving it to LDS (<see cref="Lds"/>) gave
+    /// 3.604x — so per-access cost binds, not traffic volume. Every arm is bit-exact, so the
+    /// flip changes speed only.
+    /// </para>
     /// </summary>
     public enum Variant
     {
@@ -117,7 +130,9 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
             "ldsfused" => Variant.LdsFused,
             "lds64" => Variant.Lds64,
             "lds64fused" => Variant.Lds64Fused,
-            _ => Variant.Baseline,
+            // Explicit opt-OUT now that LdsFused is the default (see the enum's doc comment).
+            "base" or "baseline" => Variant.Baseline,
+            _ => Variant.LdsFused,
         };
 
     private static string SpvFor(Variant v) => v switch
