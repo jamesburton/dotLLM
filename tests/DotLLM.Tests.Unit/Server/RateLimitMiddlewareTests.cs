@@ -113,6 +113,12 @@ public class RateLimitMiddlewareTests
                 "Retry-After must be a positive integer seconds value.");
             Assert.Equal("Requests", rejected.Response.Headers["X-RateLimit-Limiter"].ToString());
 
+            // #452: the SDKs read the standard x-ratelimit-* trio off the 429 to decide how long
+            // to wait. The limiter's state has to be on the wire, not just in the process.
+            Assert.Equal("2", rejected.Response.Headers["x-ratelimit-limit-requests"].ToString());
+            Assert.Equal("0", rejected.Response.Headers["x-ratelimit-remaining-requests"].ToString());
+            Assert.True(rejected.Response.Headers.ContainsKey("x-ratelimit-reset-requests"));
+
             // Body is the SDK-shaped error envelope (#452) with the rejected limiter named.
             // `error` must be an OBJECT: the official SDKs read .type/.code off it, and the flat
             // {"error": "<string>"} form this server used to emit gives them nothing to classify.

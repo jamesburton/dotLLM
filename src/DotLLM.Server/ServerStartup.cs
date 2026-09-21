@@ -483,6 +483,12 @@ public static class ServerStartup
         app.UseDeveloperExceptionPage();
         app.UseCors();
 
+        // SDK observability headers (#452) — x-request-id, openai-processing-ms and the
+        // x-ratelimit-* trio. Registered unconditionally and OUTSIDE the limiter so the headers
+        // also land on its 429 short-circuit; the manager is null when limiting is off, in which
+        // case only the id/timing headers are emitted.
+        app.UseDotLLMResponseHeaders(state.RateLimitManager);
+
         if (state.RateLimitManager is { } rlm)
         {
             var resolver = app.Services.GetRequiredService<IApiKeyResolver>();

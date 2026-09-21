@@ -194,11 +194,17 @@ public sealed class RateLimitMiddleware
         return null;
     }
 
-    private static async Task WriteRejection(HttpContext context, AcquireResult result, string apiKey)
+    private async Task WriteRejection(HttpContext context, AcquireResult result, string apiKey)
     {
         context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
         context.Response.Headers["Retry-After"] = result.RetryAfter.ToString(CultureInfo.InvariantCulture);
         context.Response.Headers["X-RateLimit-Limiter"] = result.Rejected.ToString();
+
+        // #452: re-stamp the x-ratelimit-* trio with the post-rejection state. ResponseHeadersMiddleware
+        // already wrote a snapshot on the way in, but that one predates this request's attempt — the
+        // client needs the budget as it stands now, which is what its backoff is computed against.
+        if (_manager.GetSnapshot(apiKey) is { } snapshot)
+            ResponseHeadersMiddleware.ApplyRateLimitHeaders(context.Response, snapshot);
 
         string reason = result.Rejected switch
         {
