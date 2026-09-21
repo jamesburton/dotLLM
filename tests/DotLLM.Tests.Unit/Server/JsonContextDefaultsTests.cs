@@ -13,30 +13,44 @@ namespace DotLLM.Tests.Unit.Server;
 
 /// <summary>
 /// Guards the whole <see cref="ServerJsonContext"/> surface against a System.Text.Json
-/// source-generation trap (#462): <b>a property initializer is silently ignored on
-/// deserialization when the enclosing type also has a <c>required</c> member.</b>
+/// source-generation trap (#462): <b>a property initializer on an <c>init</c>-only property is
+/// silently ignored on deserialization.</b>
 /// </summary>
 /// <remarks>
 /// <para>
-/// So <c>public bool Stream { get; init; } = true;</c> on such a type deserializes as
-/// <c>false</c>. There is no warning and no error — the default simply does not apply, and
-/// direct construction still honours it, so any test that does not round-trip through JSON
-/// cannot see the bug.
+/// So <c>public bool Stream { get; init; } = true;</c> deserializes as <c>false</c>, and
+/// <c>public string Name { get; init; } = "";</c> as <c>null</c> on a non-nullable reference type.
+/// There is no warning and no error — the default simply does not apply, and direct construction
+/// still honours it, so any test that does not round-trip through JSON cannot see the bug.
 /// </para>
 /// <para>
-/// This is idiomatic C# that happens to be wrong here, which is why it recurs. It bit three
-/// times independently in one day, in three separate worktrees, each found by accident:
-/// <c>ModelPullRequest.Stream</c> (#454 — every default pull silently became non-streaming),
-/// <c>TraySettings</c> (#455 — a partial config gave <c>Host=null, Port=0</c>), and
-/// <c>ChatCompletionRequest.N</c> (#460 — latent, invisible only because nothing reads it).
-/// Three local fixes would not have stopped a fourth; this test is the systemic guard.
+/// <b>The trigger is the <c>init</c> accessor</b>, not a <c>required</c> member and not
+/// <c>record</c> — measured four ways in <c>TrayJsonContextDefaultsTests</c> on .NET 10:
+/// <c>init</c> drops on both records and plain classes, <c>set</c> is honoured, adding a
+/// <c>required</c> member changes nothing, and reflection-based serialization is unaffected. This
+/// remark previously said <c>required</c> was the cause; the first three hits all happened to sit
+/// on types that also had one, which made a correlate look causal.
+/// </para>
+/// <para>
+/// It bit four times: <c>ModelPullRequest.Stream</c> (#454 — every default pull silently became
+/// non-streaming), <c>TraySettings</c> (#455 — a partial config gave <c>Host=null, Port=0</c>),
+/// <c>ChatCompletionRequest.N</c> (#460 — latent only because nothing read it), and the tray's
+/// entire client DTO surface, where <c>TrayAvailableModel.Enabled = true</c> meant every available
+/// model could arrive <b>disabled</b>.
 /// </para>
 /// <para>
 /// <b>How it can be general.</b> Property initializers are not visible to reflection — they run
-/// in the constructor. But <c>required</c> is enforced by the <i>compiler</i>, not the runtime,
-/// so <see cref="Activator.CreateInstance(Type)"/> bypasses the requirement and the initializers
-/// still run. That gives an oracle: construct directly, deserialize a payload that names only
-/// the required members, and compare every other property.
+/// in the constructor. But <c>required</c> is enforced by the <i>compiler</i>, not the runtime, so
+/// <see cref="Activator.CreateInstance(Type)"/> bypasses the requirement and the initializers
+/// still run. That gives an oracle: construct directly, deserialize a payload that names only the
+/// required members, and compare every other property.
+/// </para>
+/// <para>
+/// <b>Scope, stated honestly.</b> This test passing is <i>not</i> evidence that the server's
+/// <c>init</c> DTOs are clean — only that the <b>deserialized</b> ones are. The
+/// <c>ResponseOnly</c> list below exempts ~25 write-only types, which genuinely cannot lose a
+/// default they never deserialize; if any of them ever becomes a request shape, it leaves this
+/// guard's scope silently.
 /// </para>
 /// </remarks>
 public sealed class JsonContextDefaultsTests
