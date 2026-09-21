@@ -144,6 +144,36 @@ public sealed class ModelManagementEndpointsTests
         Assert.Contains("disabled", error!, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// A request may name a file path or repo id rather than the model key, so checking only the
+    /// raw request string leaves the curation bypassable: <c>model: "C:/…/foo.gguf"</c> resolves
+    /// to a file whose key ("foo") is disabled, and would load anyway.
+    /// </summary>
+    /// <remarks>
+    /// Discriminating without a real model: the fixture is an <b>empty</b> .gguf, so if the
+    /// catalog check did not fire before <c>LoadModel</c> the error would be a GGUF parse failure,
+    /// not "disabled". Asserting the message therefore also pins the check's position.
+    /// </remarks>
+    [Fact]
+    public async Task EnsureActive_DisabledKey_IsRefusedEvenWhenRequestedByPath()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "dotllm-454-key-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "curated-off.gguf");
+        await File.WriteAllBytesAsync(path, []);
+        try
+        {
+            var state = NewState();
+            state.Catalog.Disable("curated-off"); // the derived key, not the path
+
+            var error = await state.EnsureActiveAsync(path, keepAliveOverride: null, CancellationToken.None);
+
+            Assert.NotNull(error);
+            Assert.Contains("disabled", error!, StringComparison.OrdinalIgnoreCase);
+        }
+        finally { try { Directory.Delete(dir, recursive: true); } catch { } }
+    }
+
     [Fact]
     public async Task EnsureActive_EnabledButMissingModel_ReportsNotFound_NotDisabled()
     {

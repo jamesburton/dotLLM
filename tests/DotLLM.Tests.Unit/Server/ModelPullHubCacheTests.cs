@@ -25,12 +25,16 @@ namespace DotLLM.Tests.Unit.Server;
 /// against one that deletes partial state on abort.
 /// </para>
 /// </remarks>
+[Collection("SequentialFileIO")] // the HF_HUB_CACHE / HF_HOME cases mutate process-global env vars
 public sealed class ModelPullHubCacheTests : IDisposable
 {
     private const string RepoId = "acme/test-gguf";
     private const string Filename = "tiny-Q4_K_M.gguf";
     private const string Etag = "deadbeefcafe";
     private const string Commit = "0123456789abcdef0123456789abcdef01234567";
+
+    /// <summary>The unrelated ETag the CDN leg serves — a redirect-following HEAD would pick this up.</summary>
+    private const string CdnEtag = "cdnetagmustnotwin";
 
     private readonly string _root = Path.Combine(Path.GetTempPath(), "dotllm-454-" + Guid.NewGuid().ToString("N"));
     private string CacheRoot => Path.Combine(_root, "hub");
@@ -148,6 +152,62 @@ public sealed class ModelPullHubCacheTests : IDisposable
         }
         using var read = new FileStream(result.ModelPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         Assert.Equal(0x7F, read.ReadByte());
+    }
+
+    /// <summary>
+    /// Every GGUF on the Hub is an LFS/Xet object, so <c>/resolve/</c> answers <b>302</b> and the
+    /// identity headers — <c>X-Linked-ETag</c> (the sha256 <c>huggingface_hub</c> names blobs by),
+    /// <c>X-Repo-Commit</c>, <c>X-Linked-Size</c> — ride on that 302, not on the CDN response.
+    /// A HEAD that follows the redirect reads the CDN's unrelated ETag and no commit, so the blob
+    /// lands under the wrong name (a second physical copy beside whatever <c>hf download</c> wrote)
+    /// and the snapshot goes to <c>snapshots/main/</c>.
+    /// </summary>
+    /// <remarks>
+    /// Confirmed against the live Hub with a HEAD request (zero bytes transferred) before this test
+    /// was written; the stub reproduces exactly that response shape, with the redirect target
+    /// deliberately carrying a <i>different</i> ETag and no commit so a redirect-following
+    /// implementation cannot accidentally pass.
+    /// </remarks>
+    [Fact]
+    public async Task Download_LfsRedirect_TakesIdentityFromTheRedirectNotTheCdn()
+    {
+        var payload = MakePayload(2048);
+        using var stub = new StubHub(payload, lfsRedirect: true);
+
+        using var downloader = new HuggingFaceDownloader(cdnBase: stub.BaseUrl);
+        var result = await downloader.DownloadToHubCacheAsync(
+            RepoId, Filename, "main", CacheRoot, ModelsDir);
+
+        Assert.Equal(Path.Combine(CacheRoot, "models--acme--test-gguf", "blobs", Etag), result.BlobPath);
+        Assert.Equal(
+            Path.Combine(CacheRoot, "models--acme--test-gguf", "snapshots", Commit, Filename),
+            result.SnapshotPath);
+        Assert.DoesNotContain(CdnEtag, result.BlobPath, StringComparison.Ordinal);
+        Assert.Equal(payload, await File.ReadAllBytesAsync(result.BlobPath));
+        Assert.Equal(Commit, await File.ReadAllTextAsync(
+            Path.Combine(CacheRoot, "models--acme--test-gguf", "refs", "main")));
+    }
+
+    /// <summary>Re-pulling an already-mirrored file must not delete-and-relink the mirror.</summary>
+    /// <remarks>
+    /// On Windows a GGUF that a loaded model has memory-mapped cannot be deleted, so an
+    /// unconditional relink would fail with a sharing violation <i>after</i> a full download.
+    /// The open handle here stands in for that mmap.
+    /// </remarks>
+    [Fact]
+    public async Task Download_RePull_DoesNotDisturbAMirrorThatIsInUse()
+    {
+        using var stub = new StubHub(MakePayload(1024));
+        using var downloader = new HuggingFaceDownloader(cdnBase: stub.BaseUrl);
+        var first = await downloader.DownloadToHubCacheAsync(RepoId, Filename, "main", CacheRoot, ModelsDir);
+
+        // Exclusive-ish handle: deletion would throw.
+        using var held = new FileStream(first.ModelPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+
+        var again = await downloader.DownloadToHubCacheAsync(RepoId, Filename, "main", CacheRoot, ModelsDir);
+
+        Assert.Equal(first.ModelPath, again.ModelPath);
+        Assert.True(File.Exists(again.ModelPath));
     }
 
     /// <summary>A partial <c>.incomplete</c> file must be continued via a Range request, not re-fetched.</summary>
@@ -324,6 +384,7 @@ public sealed class ModelPullHubCacheTests : IDisposable
         private readonly int _throttleChunk;
         private readonly int _throttleDelayMs;
         private readonly HttpStatusCode? _failWith;
+        private readonly bool _lfsRedirect;
         private readonly CancellationTokenSource _cts = new();
 
         public string BaseUrl { get; }
@@ -331,12 +392,14 @@ public sealed class ModelPullHubCacheTests : IDisposable
         public long LastBodyBytesServed { get; private set; }
         public int GetCount;
 
-        public StubHub(byte[] payload, int throttleChunk = 0, int throttleDelayMs = 0, HttpStatusCode? failWith = null)
+        public StubHub(byte[] payload, int throttleChunk = 0, int throttleDelayMs = 0,
+            HttpStatusCode? failWith = null, bool lfsRedirect = false)
         {
             _payload = payload;
             _throttleChunk = throttleChunk;
             _throttleDelayMs = throttleDelayMs;
             _failWith = failWith;
+            _lfsRedirect = lfsRedirect;
 
             int port = FreePort();
             BaseUrl = $"http://127.0.0.1:{port}";
@@ -376,9 +439,29 @@ public sealed class ModelPullHubCacheTests : IDisposable
                     return;
                 }
 
-                ctx.Response.Headers["ETag"] = $"\"{Etag}\"";
-                ctx.Response.Headers["X-Linked-Etag"] = $"\"{Etag}\"";
-                ctx.Response.Headers["X-Repo-Commit"] = Commit;
+                // The CDN leg: no commit, and a different ETag, exactly as the real
+                // us.aws.cdn.hf.co response looks. A redirect-following HEAD lands here.
+                bool isCdnLeg = ctx.Request.Url?.AbsolutePath.StartsWith("/cdn/", StringComparison.Ordinal) == true;
+                if (isCdnLeg)
+                {
+                    ctx.Response.Headers["ETag"] = $"\"{CdnEtag}\"";
+                }
+                else
+                {
+                    ctx.Response.Headers["ETag"] = $"\"{Etag}\"";
+                    ctx.Response.Headers["X-Linked-Etag"] = $"\"{Etag}\"";
+                    ctx.Response.Headers["X-Repo-Commit"] = Commit;
+                    ctx.Response.Headers["X-Linked-Size"] = _payload.Length.ToString();
+                }
+
+                if (_lfsRedirect && !isCdnLeg)
+                {
+                    // 302 to the "CDN". The identity headers set above ride on THIS response.
+                    ctx.Response.StatusCode = (int)HttpStatusCode.Found;
+                    ctx.Response.Headers["Location"] = $"{BaseUrl}/cdn/blob";
+                    ctx.Response.Close();
+                    return;
+                }
 
                 if (ctx.Request.HttpMethod == "HEAD")
                 {

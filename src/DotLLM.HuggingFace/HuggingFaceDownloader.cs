@@ -174,16 +174,33 @@ public sealed class HuggingFaceDownloader : IDisposable
 
         // A HEAD gives the blob identity (etag) and the resolved commit without transferring
         // bytes, so the resume file can be named before the first byte arrives.
+        //
+        // It MUST NOT follow redirects. Every GGUF on the Hub is an LFS/Xet object, so
+        // /resolve/ answers 302 -> a CDN host, and X-Linked-ETag (the sha256 huggingface_hub
+        // names the blob by), X-Repo-Commit and X-Linked-Size ride on that 302 only — the CDN's
+        // own response carries a different, unrelated ETag and no commit. Following the redirect
+        // here would name the blob by the CDN's ETag (a second physical copy alongside whatever
+        // `hf download` already wrote, defeating the point of using the hub cache at all) and
+        // write snapshots/main/ instead of snapshots/{sha}/. Verified against the live Hub with a
+        // HEAD request, not assumed.
         string etag;
         string commit;
         long? headLength;
         using (var head = new HttpRequestMessage(HttpMethod.Head, url))
-        using (var headResponse = await _httpClient.SendAsync(head, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false))
+        using (var headResponse = await MetadataClient.SendAsync(head, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false))
         {
-            headResponse.EnsureSuccessStatusCode();
+            if (headResponse.StatusCode is not System.Net.HttpStatusCode.Found
+                and not System.Net.HttpStatusCode.MovedPermanently
+                and not System.Net.HttpStatusCode.TemporaryRedirect
+                and not System.Net.HttpStatusCode.PermanentRedirect)
+            {
+                headResponse.EnsureSuccessStatusCode();
+            }
+
             etag = ReadEtag(headResponse);
             commit = ReadHeader(headResponse, "X-Repo-Commit") ?? revision;
-            headLength = headResponse.Content.Headers.ContentLength;
+            headLength = headResponse.Content.Headers.ContentLength
+                ?? (long.TryParse(ReadHeader(headResponse, "X-Linked-Size"), out var linked) ? linked : null);
         }
 
         var blobPath = HubCache.BlobPath(repoId, etag, cacheRoot);
@@ -246,6 +263,29 @@ public sealed class HuggingFaceDownloader : IDisposable
             blobPath, snapshotPath, mirrorPath, new FileInfo(blobPath).Length, hardlinked);
     }
 
+    private HttpClient? _metadataClient;
+
+    /// <summary>
+    /// Redirect-free client used only for the metadata HEAD. Separate from
+    /// <see cref="_httpClient"/> so the body GET keeps its normal auto-redirect behaviour (and
+    /// .NET's stripping of the Authorization header when the redirect crosses to the CDN host),
+    /// while the HEAD can read the headers the Hub puts on the 302 itself. Created lazily so the
+    /// ordinary <see cref="DownloadFileAsync"/> path allocates nothing extra.
+    /// </summary>
+    private HttpClient MetadataClient
+    {
+        get
+        {
+            if (_metadataClient is not null) return _metadataClient;
+
+            var handler = new SocketsHttpHandler { AllowAutoRedirect = false };
+            var client = new HttpClient(handler, disposeHandler: true);
+            foreach (var header in _httpClient.DefaultRequestHeaders)
+                client.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value);
+            return _metadataClient = client;
+        }
+    }
+
     private static string ReadEtag(HttpResponseMessage response)
     {
         var raw = ReadHeader(response, "X-Linked-Etag") ?? ReadHeader(response, "ETag");
@@ -302,6 +342,8 @@ public sealed class HuggingFaceDownloader : IDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
+        _metadataClient?.Dispose();
+        _metadataClient = null;
         if (_ownsClient)
             _httpClient.Dispose();
     }

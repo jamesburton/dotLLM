@@ -103,6 +103,14 @@ public static class HubCache
     public static bool LinkOrCopy(string source, string target)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+
+        // An identically-sized file already sitting at the target is almost certainly the link
+        // we would recreate. Leaving it alone is not just an optimisation: on Windows a model
+        // that is currently memory-mapped by a loaded model cannot be deleted, so re-pulling a
+        // resident model would otherwise fail with a sharing violation *after* a full download.
+        if (File.Exists(target) && new FileInfo(target).Length == new FileInfo(source).Length)
+            return true;
+
         if (File.Exists(target)) File.Delete(target);
 
         try

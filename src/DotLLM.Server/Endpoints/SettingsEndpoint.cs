@@ -30,8 +30,13 @@ public static class SettingsEndpoint
                 return Results.BadRequest(new ErrorResponse { Error = "max_resident_models must be >= 1" });
             if (request.ResidentMemoryBudgetBytes is < 0)
                 return Results.BadRequest(new ErrorResponse { Error = "resident_memory_budget_bytes must be >= 0" });
-            if (request.IdleSweepIntervalSeconds is <= 0)
-                return Results.BadRequest(new ErrorResponse { Error = "idle_sweep_interval_seconds must be > 0" });
+            // Bounded to exactly the range RunIdleSweepLoopAsync clamps to. Accepting 0.05 and
+            // then silently sweeping at 0.1 while GET reported 0.05 would make the endpoint lie.
+            if (request.IdleSweepIntervalSeconds is < 0.1 or > 3600)
+                return Results.BadRequest(new ErrorResponse
+                {
+                    Error = "idle_sweep_interval_seconds must be between 0.1 and 3600",
+                });
 
             return Results.Ok(Apply(state, request));
         });

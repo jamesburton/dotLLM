@@ -302,6 +302,16 @@ public sealed class ServerState : IDisposable
                 var resolvedPath = ServerStartup.ResolveModelPath(targetKey, quant: null);
                 if (resolvedPath is null)
                     return $"Model not found: {targetKey}";
+
+                // (#454) Re-check the catalog against the key this load would actually produce.
+                // The check above only saw the raw request string, so a request naming a repo id
+                // or a file path ("org/Repo-GGUF", "C:/models/foo.gguf") would otherwise load a
+                // model whose catalog key ("foo") is disabled. Deliberately before LoadModel, so a
+                // disabled model is never parsed, let alone mapped into memory.
+                var resolvedKey = Path.GetFileNameWithoutExtension(resolvedPath);
+                if (!Catalog.IsEnabled(resolvedKey))
+                    return $"Model is disabled: {resolvedKey}";
+
                 reloadPath = resolvedPath;
                 loadOptions = Options with
                 {
