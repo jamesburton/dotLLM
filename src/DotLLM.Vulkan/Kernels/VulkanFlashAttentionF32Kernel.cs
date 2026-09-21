@@ -163,12 +163,11 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
             // br4 is the DEFAULT on measurement, not on symmetry. Same-process, order-reversed,
             // interleaved A/B at Bonsai 2's real attention shape (24/4 heads, headDim 256),
             // min-ms over 5 rounds on gfx1151:
-            //   seq  512: br16 11.71 | br8 5.02 | br4 3.32
-            //   seq 2048: br16 174.1 | br8 90.8 | br4 65.8
-            // (The same bench's per-token-kernel arm is NOT quoted: it measures 84.11 ms for a
-            // dispatch the model's own GPU timestamps put at ~38 ms, unexplained. The size of the
-            // win over the fallback comes from the end-to-end profile instead - attn_core
-            // 604-811 ms -> 42-51 ms on a pp512 Bonsai 2 pass.)
+            //   seq  512: naive 45.33 | br16 10.72 | br8 4.59 | br4 2.95  (4.2 / 9.9 / 15.3x)
+            //   seq 2048: naive 927.6 | br16 170.1 | br8 88.0 | br4 61.4  (5.5 / 10.5 / 15.1x)
+            // K/V are re-touched before each dispatch so residency matches the model; without
+            // that the naive arm alone mis-measures by 1.9x. The ~15x agrees with the end-to-end
+            // attn_core bucket (604-811 ms -> 42-51 ms over 16 layers on a pp512 Bonsai 2 pass).
             // Per-arm ranges are disjoint at both lengths. The ordering is the opposite of what
             // KV-traffic amortisation alone predicts - a smaller tile reads each KV row MORE
             // times - so amortisation is not the binding constraint at this head width: LDS

@@ -84,12 +84,12 @@ Two things fix that:
 
 **BR is the opposite of what amortisation predicts at this width.** Same-process, order-reversed, interleaved A/B on gfx1151 at Bonsai 2's real shape (24/4 heads, head_dim 256), min-ms over 5 rounds:
 
-| seq | br16 | br8 | br4 |
-|-----|------|-----|-----|
-| 512 | 11.71 ms | 5.02 ms | 3.32 ms |
-| 2048 | 174.1 ms | 90.8 ms | 65.8 ms |
+| seq | naive (per-token) | br16 | br8 | br4 |
+|-----|-------------------|------|-----|-----|
+| 512 | 45.33 ms | 10.72 ms (4.2×) | 4.59 ms (9.9×) | 2.95 ms (15.3×) |
+| 2048 | 927.6 ms | 170.1 ms (5.5×) | 88.0 ms (10.5×) | 61.4 ms (15.1×) |
 
-> The same bench carries a per-token-kernel arm; its numbers are **not** quoted. It measures 84.11 ms (seq 512) for a dispatch the model's own GPU timestamps put at ~38 ms, and the 2.2× discrepancy is unexplained — the flash arms agree across the two harnesses to within per-launch submit overhead, the naive arm does not. Size the win against the fallback from the end-to-end bucket below, not from that arm.
+> **KV residency is part of the shape.** The harness re-touches K/V before each dispatch, outside the timed region, because the model's KV-cache update writes them in the dispatch immediately before attention. The first version did not, and its naive arm then read 84.11 ms at seq 512 against the model's ~38 ms per layer — while the flash arms agreed with the model all along. Only the per-token kernel is residency-sensitive: it re-reads each KV row 12,288 times (one workgroup per token × head) against flash's ~128. The effect is also size-gated — at seq 2048 the KV set is ~16 MB, too large to stay resident either way, and pre-touching moves the naive arm by only 5 %. With it, kernel bench and end-to-end profile agree (≈15× vs the bucket's 12–19×).
 
 Per-arm ranges are disjoint at both lengths. A *smaller* tile reads each KV row *more* times, so KV amortisation is not the binding constraint here — LDS residency is: `qTile + outAccum` both scale with `BR × MAX_HEAD_DIM`, so at 256 dims BR=16 costs 36.2 KB and pins one workgroup (4 wave64) per CU, BR=8 costs 18.1 KB, BR=4 costs 9.2 KB (~6 workgroups / 24 waves of latency hiding). BR=4 is the **floor for this geometry**, not a measured optimum: `ROWS_PER_SLICE = BR / (WG_SIZE / BC) = BR / 4`, so BR=2 would leave a wave slice zero rows. Going lower needs a narrower workgroup — a separate change.
 

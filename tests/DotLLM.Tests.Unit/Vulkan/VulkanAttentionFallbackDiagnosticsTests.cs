@@ -7,6 +7,12 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// Tests for the issue #441 silent-fallback diagnostic. No GPU required — the reporting side
 /// is pure string handling, deliberately separable from the kernel it describes.
 /// </summary>
+/// <remarks>
+/// Shares the <c>VulkanKernels</c> collection despite needing no GPU: these tests Reset() and
+/// assert on the process-wide de-duplication set that the GPU-side factory tests also drive, so
+/// they must not run concurrently with them.
+/// </remarks>
+[Collection("VulkanKernels")]
 public sealed class VulkanAttentionFallbackDiagnosticsTests
 {
     /// <summary>The head-dim warning must name every fact needed to act on it.</summary>

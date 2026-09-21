@@ -30,14 +30,14 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// counter profile ("the memory unit is busy") names the unit and not the fix.
 /// </para>
 /// <para>
-/// <b>The <c>Naive</c> arm's absolute number does not reconcile with the model and must not be
-/// quoted.</b> It measures 84.11 ms at seq 512 for the same shape the model's own GPU timestamps
-/// put at ~38 ms per layer (<c>attn_core</c> 604-621 ms over 16 full-attention layers). The flash
-/// arms DO agree across the two harnesses - bench 3.32 ms vs ~2.6 ms in the pass, the gap being
-/// this harness's per-<c>Launch</c> submit-and-wait - so the discrepancy is specific to the naive
-/// arm and is unexplained. It is kept here as a correctness oracle and a rough sanity floor; size
-/// the win against the fallback from the end-to-end <c>attn_core</c> bucket
-/// (<c>scripts/441-e2e-ab.sh</c>) instead.
+/// <b>KV residency is part of the shape, not a detail.</b> The first version of this harness
+/// uploaded K/V once at the start, and its <c>Naive</c> arm then measured 84.11 ms at seq 512 for
+/// a dispatch the model's own GPU timestamps put at ~38 ms per layer - a 2.2x disagreement, while
+/// the flash arms agreed across both harnesses. Re-touching K/V before each dispatch (outside the
+/// timed region), as the model's KV-cache update does, closed it: Naive 45.33 ms, flash arms
+/// within 8-11 % of before. Only the per-token kernel is residency-sensitive because only it
+/// re-reads each KV row 12,288 times. The two harnesses now agree - <c>15.3x</c> here vs the
+/// end-to-end <c>attn_core</c> bucket's 12-19x.
 /// </para>
 /// <para>
 /// <b>Correctness first.</b> Every arm's output is compared against the naive arm before any
@@ -155,12 +155,34 @@ public sealed class VulkanFlashAttentionHd256VariantBench
             Assert.True(maxAbs < 1e-3, $"{arm} diverges from the naive kernel (maxAbs={maxAbs:E3}).");
         }
 
+        // K and V are re-uploaded immediately before each timed dispatch, OUTSIDE the timed
+        // region, because that is what the model does: the KV-cache update writes them in the
+        // dispatch right before attention, so they are cache-hot. Without it the harness
+        // mis-measured the Naive arm by 1.9x (84-110 ms vs 45-51 ms at seq 512) while barely
+        // moving the flash arms (8-11 %) - exactly the asymmetry the read counts predict: the
+        // per-token kernel reads each KV row 12,288 times (one workgroup per token x head)
+        // against the flash kernel's ~128, so only it is residency-sensitive. The effect is also
+        // size-gated, which closes the argument: at seq 2048 the KV set is ~16 MB, too big to
+        // stay resident either way, and pre-touching moves Naive by only 5 %.
+        // Set DOTLLM_FLASH_HD256_AB_HOT_KV=0 to reproduce the cold-KV measurement.
+        bool hotKv = Environment.GetEnvironmentVariable("DOTLLM_FLASH_HD256_AB_HOT_KV") != "0";
+        void Touch()
+        {
+            if (!hotKv) return;
+            device.Upload(k.AsSpan(), bufK);
+            device.Upload(v.AsSpan(), bufV);
+        }
+        _output.WriteLine($"hotKv={hotKv}");
+
         var best = arms.ToDictionary(a => a, _ => double.MaxValue);
         var all = arms.ToDictionary(a => a, _ => new List<double>());
 
         for (int w = 0; w < warmups; w++)
             foreach (Arm arm in arms)
+            {
+                Touch();
                 Time(Launch, arm);
+            }
 
         for (int round = 0; round < rounds; round++)
         {
@@ -170,6 +192,7 @@ public sealed class VulkanFlashAttentionHd256VariantBench
             Arm[] order = (round % 2 == 0) ? arms : arms.Reverse().ToArray();
             foreach (Arm arm in order)
             {
+                Touch();
                 double ms = Time(Launch, arm);
                 all[arm].Add(ms);
                 if (ms < best[arm]) best[arm] = ms;

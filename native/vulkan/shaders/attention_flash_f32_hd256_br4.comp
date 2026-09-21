@@ -23,22 +23,20 @@
 // BR = 8  -> 8 + 8 + 2.1 = 18.1 KB: three workgroups (12 waves) resident.
 // BR = 4  -> 4 + 4 + 1.0 =  9.2 KB: ~six workgroups (24 waves) resident.
 //
-// MEASURED on gfx1151 at Bonsai 2's shape (24/4 heads, headDim 256), min-ms over
-// 5 interleaved order-reversed rounds in one process:
-//   seq  512: br16 11.71 | br8 5.02 | br4 3.32
-//   seq 2048: br16 174.1 | br8 90.8 | br4 65.8
-// Ranges disjoint at both lengths. The ordering INVERTS the amortisation
-// prediction -- a smaller tile reads each KV row more times and still wins --
-// so LDS residency, not KV traffic, is the binding constraint at this head
-// width. br4 is the shipped default; it is also the FLOOR for this geometry,
-// since ROWS_PER_SLICE = BR / (WG_SIZE / BC) = BR / 4 would go to zero at BR=2.
+// MEASURED on gfx1151 at Bonsai 2's shape (24/4 heads, headDim 256), min-ms
+// over 5 interleaved order-reversed rounds in one process, K/V re-touched
+// before each dispatch so residency matches the model:
+//   seq  512: naive 45.33 | br16 10.72 | br8 4.59 | br4 2.95  (4.2/9.9/15.3x)
+//   seq 2048: naive 927.6 | br16 170.1 | br8 88.0 | br4 61.4  (5.5/10.5/15.1x)
+// Per-arm ranges disjoint at both lengths, and the ~15x agrees with the
+// end-to-end attn_core bucket (604-811 ms -> 42-51 ms over 16 layers).
 //
-// The size of the win over the kernel this REPLACES comes from the end-to-end
-// profile, not from that bench: its per-token-kernel arm measures 84.11 ms for
-// the same dispatch that the model's own GPU timestamps put at ~38 ms, and the
-// discrepancy is unexplained, so the bench's absolute naive number is not
-// quoted. In the pass itself the attn_core bucket goes 604-811 ms -> 42-51 ms.
-// See VulkanFlashAttentionHd256VariantBench for the harness and the caveat.
+// The ordering INVERTS the amortisation prediction -- a smaller tile reads each
+// KV row MORE times and still wins -- so LDS residency, not KV traffic, is the
+// binding constraint at this head width. br4 is the shipped default; it is also
+// the FLOOR for this geometry, since ROWS_PER_SLICE = BR / (WG_SIZE / BC)
+// = BR / 4 would go to zero at BR=2. Going lower needs a narrower workgroup.
+// See VulkanFlashAttentionHd256VariantBench for the harness.
 //
 // Wave-width safety: this shader has NO subgroup ops. `slice = tid >> 6` and
 // `c = tid & 63` index the BC = 64 KV-column tile, which is a tile geometry
