@@ -178,3 +178,33 @@ runner has a cached fixture: add a job that installs `requirements.txt`, builds
 `src/DotLLM.Cli -c Release`, restores the GGUF from cache, and runs the harness
 with `--json-out`. Leave `--strict` **off** until the sibling issues have
 landed, or the job fails by design on the expected-red baseline.
+
+## The 429 rows need their own server (two-pass)
+
+`--attempt-429` cannot be satisfied by the same server run as the rest of the matrix, and this
+is inherent, not a bug to fix:
+
+- `_burst_until_429` sends at most 12 requests, so the cap must be **below 12** for a 429 to be
+  provokable at all.
+- The other 20 rows make ~25 calls between them, so any cap low enough to burst through will
+  also 429 rows that should succeed.
+
+So run it in two passes:
+
+```bash
+# pass 1 — the matrix, no cap
+dotllm serve <model> --port 18453 ...
+python tests/conformance/sdk_conformance.py --base-url http://127.0.0.1:18453
+
+# pass 2 — the 429 rows only, against a tightly-capped server
+dotllm serve <model> --port 18461 ... --rate-limit-rpm 2
+python tests/conformance/sdk_conformance.py --base-url http://127.0.0.1:18461     --attempt-429 --only error
+```
+
+A single run with a loose cap reports the 429 rows as **NOT-EXERCISED** (`burst produced no
+429`), which is honest but not a result. Do not read it as a pass or a fail.
+
+**Note the auth header is load-bearing in the burst.** Rate limits are per-API-key, so a burst
+sent anonymously exhausts the anonymous bucket while the SDK call that follows uses its own
+fresh one — the row then fails regardless of server behaviour. `_burst_until_429` sends
+`DUMMY_KEY` for exactly this reason (#457); do not "simplify" it away.
