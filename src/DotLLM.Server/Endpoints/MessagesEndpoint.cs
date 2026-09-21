@@ -1,9 +1,12 @@
 using System.Text;
 using System.Text.Json;
+using DotLLM.Core.Configuration;
 using DotLLM.Engine;
+using DotLLM.Engine.Constraints;
 using DotLLM.Server.Models;
 using DotLLM.Server.RateLimiting;
 using DotLLM.Tokenizers;
+using DotLLM.Tokenizers.ToolCallParsers;
 
 namespace DotLLM.Server.Endpoints;
 
@@ -114,12 +117,69 @@ public static class MessagesEndpoint
             new DotLLM.Core.Configuration.ThreadingConfig(state.Options.Threads, state.Options.DecodeThreads));
         options = options with { MaxTokens = effectiveMaxTokens };
 
+        // tool_choice was parsed and then dropped on the floor (#449): the prompt was built with
+        // the tools but nothing constrained or suppressed the model, so `{"type":"tool"}` was
+        // indistinguishable from `auto` and `none` still let a tool call through.
+        var toolChoice = AnthropicConverter.ParseToolChoice(request.ToolChoice);
+        var effectiveParser = ApplyToolChoice(
+            toolChoice, tools, state.ToolCallParser, ref options);
+
         if (request.Stream)
             await HandleStreamingAsync(request, generator, state, httpContext, prompt, options,
-                messageId, modelId, tools, promptTokenCount, ct);
+                messageId, modelId, effectiveParser, promptTokenCount, ct);
         else
             await HandleNonStreamingAsync(request, generator, state, httpContext, prompt, options,
-                messageId, modelId, tools, ct);
+                messageId, modelId, effectiveParser, ct);
+    }
+
+    /// <summary>
+    /// Applies Anthropic <c>tool_choice</c> semantics and returns the tool-call parser this
+    /// request should use (null when tool calls must not be produced).
+    /// </summary>
+    /// <remarks>
+    /// <list type="bullet">
+    /// <item><c>auto</c> — the model's own parser, unconstrained.</item>
+    /// <item><c>any</c>/<c>tool</c> — decoding is constrained to a tool-call JSON schema, and the
+    /// markerless parser is used, because the constraint emits a bare JSON object rather than the
+    /// model's <c>&lt;tool_call&gt;</c> envelope. Same construction as the CLI's forced path.</item>
+    /// <item><c>none</c> — no parser, so nothing the model emits is reported as <c>tool_use</c>.</item>
+    /// </list>
+    /// A caller-supplied <c>response_format</c> does not exist on this surface, so the constraint
+    /// slot is always free.
+    /// </remarks>
+    internal static IToolCallParser? ApplyToolChoice(
+        ToolChoice toolChoice,
+        ToolDefinition[]? tools,
+        IToolCallParser? modelParser,
+        ref DotLLM.Core.Configuration.InferenceOptions options)
+    {
+        if (tools is not { Length: > 0 })
+            return null;
+        if (toolChoice is ToolChoice.None)
+            return null;
+        if (modelParser is null)
+            return null;
+
+        string argumentsKey = modelParser is LlamaToolCallParser ? "parameters" : "arguments";
+        var schema = toolChoice switch
+        {
+            ToolChoice.Required => ToolCallSchemaBuilder.BuildForRequired(tools, argumentsKey),
+            ToolChoice.Function fn when Array.Find(tools, t => t.Name == fn.Name) is { } target =>
+                ToolCallSchemaBuilder.BuildForFunction(target, argumentsKey),
+            _ => null,
+        };
+        if (schema is null)
+            return modelParser;
+
+        options = options with
+        {
+            ResponseFormat = new DotLLM.Core.Configuration.ResponseFormat.JsonSchema
+            {
+                Schema = schema,
+                Name = "tool_call",
+            },
+        };
+        return ToolCallParserFactory.ForToolChoice(toolChoice, modelParser);
     }
 
     private static async Task HandleNonStreamingAsync(
@@ -130,7 +190,7 @@ public static class MessagesEndpoint
         string prompt,
         DotLLM.Core.Configuration.InferenceOptions options,
         string messageId, string modelId,
-        ToolDefinition[]? tools,
+        IToolCallParser? toolCallParser,
         CancellationToken ct)
     {
         InferenceResponse? result = null;
@@ -156,9 +216,9 @@ public static class MessagesEndpoint
         ToolCall[]? toolCalls = null;
         var finishReason = result.FinishReason;
 
-        if (state.ToolCallParser is not null && tools is { Length: > 0 })
+        if (toolCallParser is not null)
         {
-            var enriched = ToolCallDetector.DetectToolCalls(result, state.ToolCallParser);
+            var enriched = ToolCallDetector.DetectToolCalls(result, toolCallParser);
             text = enriched.Text;
             toolCalls = enriched.ToolCalls;
             finishReason = enriched.FinishReason;
@@ -219,14 +279,14 @@ public static class MessagesEndpoint
         string prompt,
         DotLLM.Core.Configuration.InferenceOptions options,
         string messageId, string modelId,
-        ToolDefinition[]? tools,
+        IToolCallParser? toolCallParser,
         int promptTokenCount,
         CancellationToken ct)
         => await WriteMessageStreamAsync(
             httpContext,
             innerCt => generator.GenerateStreamingTokensAsync(prompt, options, innerCt),
             state.ExecuteAsync,
-            tools is { Length: > 0 } ? state.ToolCallParser : null,
+            toolCallParser,
             request.StopSequences,
             messageId, modelId, promptTokenCount, ct);
 
@@ -453,6 +513,15 @@ public static class MessagesEndpoint
                 if (blockError is not null)
                     return blockError;
             }
+        }
+
+        // A forced tool that is not in `tools` can never be satisfied: the constraint has no
+        // schema to build from, so the request would silently degrade to an ordinary completion.
+        var toolChoice = AnthropicConverter.ParseToolChoice(request.ToolChoice);
+        if (toolChoice is ToolChoice.Function fn &&
+            (request.Tools is null || Array.FindIndex(request.Tools, t => t.Name == fn.Name) < 0))
+        {
+            return $"tool_choice.name: no tool named '{fn.Name}' was provided in tools";
         }
 
         return null;
