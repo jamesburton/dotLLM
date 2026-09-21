@@ -918,7 +918,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: 0);
         }
-        else if (_kernels.FlashAttention is not null && seqLen > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
+        else if (_kernels.FlashAttention is not null && seqLen > 1 && headDim <= _kernels.FlashAttention.SupportedMaxHeadDim)
         {
             ProfNote("attn_flash", m: numHeads, k: headDim, n: seqKv);
             _kernels.FlashAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
