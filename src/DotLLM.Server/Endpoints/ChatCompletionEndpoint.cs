@@ -32,7 +32,7 @@ public static class ChatCompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = activationError },
+                ErrorResponse.InvalidRequest(activationError, param: "model", code: "model_not_found"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -43,7 +43,7 @@ public static class ChatCompletionEndpoint
         {
             httpContext.Response.StatusCode = 503;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = "No model loaded" },
+                ErrorResponse.Internal("No model loaded", code: "model_not_loaded"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -56,7 +56,7 @@ public static class ChatCompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = validationError },
+                ErrorResponse.InvalidRequest(validationError),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -76,7 +76,7 @@ public static class ChatCompletionEndpoint
             {
                 httpContext.Response.StatusCode = 400;
                 await httpContext.Response.WriteAsJsonAsync(
-                    new ErrorResponse { Error = $"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first." },
+                    ErrorResponse.InvalidRequest($"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first.", param: "prefix_id"),
                     ServerJsonContext.Default.ErrorResponse,
                     contentType: null,
                     httpContext.RequestAborted);
@@ -94,7 +94,7 @@ public static class ChatCompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = ex.Message },
+                ErrorResponse.InvalidRequest(ex.Message, param: "lora_adapter"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -123,7 +123,7 @@ public static class ChatCompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = promptError },
+                ErrorResponse.InvalidRequest(promptError, param: "messages", code: "context_length_exceeded"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -209,7 +209,7 @@ public static class ChatCompletionEndpoint
         {
             var enriched = ToolCallDetector.DetectToolCalls(result, state.ToolCallParser);
             text = enriched.Text;
-            toolCalls = enriched.ToolCalls;
+            toolCalls = ApplyParallelToolCalls(enriched.ToolCalls, request.ParallelToolCalls);
             finishReason = enriched.FinishReason;
         }
 
@@ -332,7 +332,7 @@ public static class ChatCompletionEndpoint
         ToolCall[]? toolCalls = null;
         if (state.ToolCallParser is not null && tools is { Length: > 0 })
         {
-            toolCalls = state.ToolCallParser.TryParse(text);
+            toolCalls = ApplyParallelToolCalls(state.ToolCallParser.TryParse(text), request.ParallelToolCalls);
             if (toolCalls is { Length: > 0 })
                 finishReason = FinishReason.ToolCalls;
         }
@@ -357,12 +357,11 @@ public static class ChatCompletionEndpoint
                 Delta = finalDelta,
                 FinishReason = RequestConverter.ToFinishReasonString(finishReason),
             }],
-            Usage = new UsageDto
-            {
-                PromptTokens = promptTokens,
-                CompletionTokens = completionTokens,
-                TotalTokens = promptTokens + completionTokens,
-            },
+            // #450/#453: OpenAI puts usage in a DEDICATED final chunk (choices: []) and ONLY
+            // when stream_options.include_usage was requested. Carrying it on the last content
+            // chunk as well produced two usage-bearing chunks when requested and one when not
+            // — the conformance rows openai/usage.stream{,.unrequested} caught both.
+            // Timings stays: it is our own extension and no OpenAI client looks for it.
             Timings = timings.HasValue ? new TimingsDto
             {
                 PrefillTimeMs = timings.Value.PrefillTimeMs,
@@ -380,10 +379,44 @@ public static class ChatCompletionEndpoint
         };
         await WriteSseChunk(httpContext, finalChunk, ct);
 
+        // stream_options.include_usage (#450): OpenAI closes the stream with a usage-only chunk
+        // (choices: []). The finish_reason chunk above also carries usage as a long-standing
+        // dotLLM extension; this adds the shape the SDKs actually look for, without removing it.
+        if (request.WantsUsageChunk)
+            await WriteSseChunk(httpContext, BuildUsageChunk(requestId, modelId, promptTokens, completionTokens), ct);
+
         // [DONE] sentinel
         await httpContext.Response.WriteAsync("data: [DONE]\n\n", ct);
         await httpContext.Response.Body.FlushAsync(ct);
     }
+
+    /// <summary>
+    /// Builds OpenAI's final usage chunk (#450): <c>usage</c> populated, <c>choices</c> empty.
+    /// SDKs tell it apart from a content chunk by exactly that empty array, so the shape is
+    /// load-bearing and not merely cosmetic.
+    /// </summary>
+    internal static ChatCompletionChunk BuildUsageChunk(
+        string requestId, string modelId, int promptTokens, int completionTokens) =>
+        new()
+        {
+            Id = requestId,
+            Model = modelId,
+            Choices = [],
+            Usage = new UsageDto
+            {
+                PromptTokens = promptTokens,
+                CompletionTokens = completionTokens,
+                TotalTokens = promptTokens + completionTokens,
+            },
+        };
+
+    /// <summary>
+    /// Enforces <c>parallel_tool_calls: false</c> (#450) by keeping at most the first detected
+    /// call. Nothing constrains the model during decode, so the cap is applied on the way out.
+    /// Null/true (the OpenAI default) passes the calls through untouched.
+    /// </summary>
+    internal static ToolCall[]? ApplyParallelToolCalls(ToolCall[]? toolCalls, bool? parallelToolCalls) =>
+        parallelToolCalls == false && toolCalls is { Length: > 1 } ? [toolCalls[0]] : toolCalls;
 
     private static async Task WriteSseChunk(HttpContext ctx, ChatCompletionChunk chunk, CancellationToken ct)
     {
@@ -596,6 +629,13 @@ public static class ChatCompletionEndpoint
             },
         };
         await WriteSseChunk(httpContext, finalChunk, ct);
+
+        // stream_options.include_usage (#450) — same closing shape as the autoregressive path.
+        if (request.WantsUsageChunk)
+        {
+            await WriteSseChunk(httpContext, BuildUsageChunk(
+                requestId, modelId, result.PromptTokenCount, result.GeneratedTokenCount), ct);
+        }
 
         await httpContext.Response.WriteAsync("data: [DONE]\n\n", ct);
         await httpContext.Response.Body.FlushAsync(ct);

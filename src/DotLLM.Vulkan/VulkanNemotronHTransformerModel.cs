@@ -513,9 +513,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var attention = AttentionF32Kernel.Create(device, spvDir);
         VulkanFlashAttentionF32Kernel? flashAttention =
-            VulkanTransformerModel.IsFlashAttentionDisabled() || config.HeadDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
-                ? null
-                : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
+            VulkanAttentionFallbackDiagnostics.CreatePrefillFlashAttention(
+                device, spvDir, config.HeadDim, "NemotronH");
         VulkanSplitKvAttentionKernel? splitKvAttention =
             VulkanTransformerModel.IsSplitDecodeDisabled() || config.HeadDim > VulkanSplitKvAttentionKernel.MaxHeadDim
                 ? null
@@ -1147,7 +1146,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: 0);
         }
-        else if (_flashAttention is not null && seqLen > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
+        else if (_flashAttention is not null && seqLen > 1 && headDim <= _flashAttention.SupportedMaxHeadDim)
         {
             _flashAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,

@@ -1,4 +1,4 @@
-using DotLLM.Vulkan.Interop;
+﻿using DotLLM.Vulkan.Interop;
 
 namespace DotLLM.Vulkan.Kernels;
 
@@ -18,6 +18,15 @@ namespace DotLLM.Vulkan.Kernels;
 /// on a device with this <see cref="VulkanDevice.SubgroupSize"/>. Selecting it elsewhere is
 /// correct but wasteful (or, on a wider device, half a wave).
 /// </param>
+/// <param name="RequiresNativeSubgroupSize">
+/// When non-zero, the variant is only CORRECT on a device whose native
+/// <see cref="VulkanDevice.SubgroupSize"/> equals this value. The blocked ladder shaders hardcode
+/// <c>#define WAVE 64</c> and declare a workgroup of <c>NSG * WAVE</c> threads, then index an
+/// <c>NSG</c>-entry subgroup grid. On a natively 32-wide device that workgroup contains
+/// <c>2 * NSG</c> subgroups, and the surplus ones read <c>sharedB</c> out of bounds and store into
+/// the neighbouring tile's rows. The pipeline creates without error and the answers are silently
+/// wrong, so this must be gated at selection rather than caught at load.
+/// </param>
 /// <remarks>
 /// Variants exist so a benchmark can A/B them side by side in one process — the interleaved
 /// order-reversed methodology this box requires cannot span processes. Every variant computes the
@@ -25,7 +34,8 @@ namespace DotLLM.Vulkan.Kernels;
 /// </remarks>
 public readonly record struct PQ2_0GemmVariant(
     string SpvFileName, int TileM, int TileN,
-    bool RequiresCooperativeMatrix = false, int RequiresSubgroupSize = 0)
+    bool RequiresCooperativeMatrix = false, int RequiresSubgroupSize = 0,
+    int RequiresNativeSubgroupSize = 0)
 {
     /// <summary>
     /// Register-blocked F32: 32x32 tile, 16x16 threads each owning a 2x2 micro-tile
@@ -63,6 +73,110 @@ public readonly record struct PQ2_0GemmVariant(
             RequiresCooperativeMatrix: true, RequiresSubgroupSize: 32);
 
     /// <summary>
+    /// Issue #439 ladder point (a) — <b>the control</b>: the shipping 16x16 single-subgroup tile
+    /// re-expressed on the shared <c>matmul_pq2_0_f32_gemm_ladder.glsl</c> template at
+    /// <c>BK = 32</c>. 4.0 MAC/byte, unchanged from <see cref="Coopmat32"/>.
+    /// </summary>
+    /// <remarks>
+    /// Exists so the intensity ladder has a real control: it isolates the BK 128 -&gt; 32 change
+    /// (plus the template's uniform LDS padding and coalesced activation staging) from the tile
+    /// change, so anything (b) and (c) gain over <i>this</i> is attributable to arithmetic
+    /// intensity alone. Diagnostic; never selected by <see cref="SelectFor"/>.
+    /// </remarks>
+    public static PQ2_0GemmVariant Ladder16x16x1 =>
+        new("matmul_pq2_0_f32_gemm_ladder_16x16x1.spv", 16, 16, RequiresCooperativeMatrix: true);
+
+    /// <summary>
+    /// Issue #439 ladder point (b): 64x64 tile from four wave64 subgroups (256 threads, 2x2 warp grid),
+    /// <c>BK = 32</c>. 16.0 MAC/byte — 4x <see cref="Coopmat32"/>.
+    /// </summary>
+    /// <remarks>
+    /// <b>Unpinned</b>, unlike <see cref="Coopmat32"/>: the workgroup is sized in the driver's
+    /// native wave64 units (4 x 64 = 256 threads). A wave32-pinned four-subgroup grid was tried
+    /// first; its direct store path is correct but its LDS-staged boundary path is not, and the
+    /// cause was not isolated — see the wave-width note in
+    /// <c>matmul_pq2_0_f32_gemm_ladder.glsl</c>, which states exactly what was and was not
+    /// established. Unpinned wave64 passes every parity gate, so that is what the ladder uses.
+    /// It makes the ladder internally consistent but not wave-width-comparable to the shipping
+    /// kernel, which is why <see cref="Ladder16x16x1"/> is the ladder's own control.
+    /// </remarks>
+    public static PQ2_0GemmVariant Ladder64x64x4 =>
+        new("matmul_pq2_0_f32_gemm_ladder_64x64x4.spv", 64, 64, RequiresCooperativeMatrix: true, RequiresNativeSubgroupSize: 64);
+
+    /// <summary>
+    /// Issue #439 ladder point (c): 128x128 tile from four wave64 subgroups (256 threads, 2x2 warp grid),
+    /// <c>BK = 32</c>. 32.0 MAC/byte — 8x <see cref="Coopmat32"/>, and exactly llama.cpp's
+    /// <c>l_warptile_mmq</c>, the configuration its applicable <c>VK_KHR_cooperative_matrix</c>
+    /// branch runs on this silicon.
+    /// </summary>
+    /// <remarks>
+    /// The discriminating point of the ladder. See <see cref="Ladder64x64x4"/> for why these
+    /// variants run unpinned at wave64.
+    /// </remarks>
+    public static PQ2_0GemmVariant Ladder128x128x4 =>
+        new("matmul_pq2_0_f32_gemm_ladder_128x128x4.spv", 128, 128, RequiresCooperativeMatrix: true, RequiresNativeSubgroupSize: 64);
+
+    /// <summary>
+    /// Issue #443 — <see cref="Ladder128x128x4"/> with the pipeline pinned to a 32-wide subgroup.
+    /// <b>MEASUREMENT ONLY. Do not ship or select this variant.</b>
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// RDNA3.5's WMMA is a wave32 instruction and the AMD driver defaults compute to wave64, so
+    /// pinning bought 1.29-1.79x on the 16x16 kernel (#236). Whether that survives at a
+    /// 4-subgroup 128x128 tile is unknown, and it is the last untested multiplier on top of
+    /// #439's measured 10-12x.
+    /// </para>
+    /// <para>
+    /// <b>Why it is not shippable.</b> Under the wave32 pin at NSG=4 the LDS-staged <i>boundary</i>
+    /// path is wrong (subgroups 2-3 read uninitialised staging slots); the <i>direct</i> store path
+    /// is correct, which #439 established by passing the <c>576x1024x64</c> parity shape — that
+    /// shape requires <c>warp_c</c> to take both values. Root cause is NOT isolated: at NSG=1
+    /// merely reading <c>gl_SubgroupID</c> breaks the coopmat store, and substituting
+    /// <c>gl_LocalInvocationID.x / 32</c> made NSG=4 worse. The pipeline creates without error in
+    /// every case.
+    /// </para>
+    /// <para>
+    /// So this variant is only meaningful on shapes whose M and N are exact multiples of 128, where
+    /// the boundary path never executes. The bench that uses it asserts exactly that, and #439's
+    /// earlier claim that "only two subgroups materialise" is withdrawn (commit 22441c1a).
+    /// </para>
+    /// </remarks>
+    public static PQ2_0GemmVariant Ladder128x128x4Wave32 =>
+        new("matmul_pq2_0_f32_gemm_ladder_128x128x4.spv", 128, 128,
+            RequiresCooperativeMatrix: true, RequiresSubgroupSize: 32);
+
+    /// <summary>
+    /// Issue #439 arm (d) — <b>the unpack arm</b>: geometrically identical to
+    /// <see cref="Ladder16x16x1"/> (16x16, one wave64 subgroup, BK = 32), with a cheaper PQ2_0
+    /// dequant and nothing else changed.
+    /// </summary>
+    /// <remarks>
+    /// Added after issue #440's RGP capture, which measured the shipping kernel's matrix pipe
+    /// <b>99.5% idle</b> (WMMA 0.46% of issue slots) against VALU 43.9% — roughly 95 VALU ops per
+    /// WMMA, a ratio set by the dequant rather than by the tile. <c>Ladder16x16x1 -&gt;</c> this
+    /// isolates unpack cost exactly as (a) -&gt; (b) -&gt; (c) isolates arithmetic intensity, so
+    /// the two competing explanations can be measured on the same shape in the same session.
+    /// Numerically identical by construction: the staged value is selected from
+    /// {−scale, ±0, +scale} rather than computed, and those are the values the default arm
+    /// already produces exactly.
+    /// </remarks>
+    public static PQ2_0GemmVariant Ladder16x16x1FastUnpack =>
+        new("matmul_pq2_0_f32_gemm_ladder_16x16x1_fastunpack.spv", 16, 16, RequiresCooperativeMatrix: true);
+
+    /// <summary>
+    /// Issue #439 arm (e) — <b>both levers</b>: <see cref="Ladder128x128x4"/>'s tile with
+    /// <see cref="Ladder16x16x1FastUnpack"/>'s dequant.
+    /// </summary>
+    /// <remarks>
+    /// Decides whether the tile and the unpack are one bottleneck or two. If (e) matches (c) the
+    /// tile change already absorbed the unpack cost; if it matches (d) the tile win was a
+    /// dequant-volume win under another name; if it beats both, they are independent levers.
+    /// </remarks>
+    public static PQ2_0GemmVariant Ladder128x128x4FastUnpack =>
+        new("matmul_pq2_0_f32_gemm_ladder_128x128x4_fastunpack.spv", 128, 128, RequiresCooperativeMatrix: true, RequiresNativeSubgroupSize: 64);
+
+    /// <summary>
     /// Picks the fastest variant this device can actually run.
     /// </summary>
     /// <remarks>
@@ -75,6 +189,13 @@ public readonly record struct PQ2_0GemmVariant(
     /// <returns>The variant to load.</returns>
     public static PQ2_0GemmVariant SelectFor(VulkanDevice device)
     {
+        // DOTLLM_VK_PQ2_0_GEMM_LEGACY=1 restores the pre-#439 preference. It exists so the
+        // 128x128 tile can be A/B'd against what shipped, in alternating processes, on a real
+        // model -- the ladder bench can only compare kernels in isolation.
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_PQ2_0_GEMM_LEGACY") != "1"
+            && Ladder128x128x4.IsSupportedOn(device))
+            return Ladder128x128x4;
+
         if (Coopmat32.IsSupportedOn(device)) return Coopmat32;
         if (Coopmat.IsSupportedOn(device)) return Coopmat;
         return RegisterBlocked;
@@ -93,6 +214,17 @@ public readonly record struct PQ2_0GemmVariant(
         if (RequiresSubgroupSize != 0
             && !device.SupportsRequiredSubgroupSize((uint)RequiresSubgroupSize, VkShaderStageFlags.Compute))
             return false;
+
+        // The blocked ladder shaders hardcode `#define WAVE 64` and declare a workgroup of
+        // NSG * WAVE threads, then index a 2x2 subgroup grid assuming exactly NSG subgroups.
+        // On a device whose NATIVE subgroup is 32 -- every NVIDIA part, Intel, and AMD in wave32
+        // mode -- that same 256-thread workgroup contains EIGHT subgroups, and ids 4..7 read
+        // sharedB out of bounds and store into the next tile's rows. The pipeline creates
+        // without error and the answers are silently wrong, so nothing catches it at load time.
+        // Mirrors the gate #443 added to the f16 / q8_0 / MoE blocked variants.
+        if (RequiresNativeSubgroupSize != 0 && device.SubgroupSize != (uint)RequiresNativeSubgroupSize)
+            return false;
+
         return true;
     }
 
@@ -100,6 +232,12 @@ public readonly record struct PQ2_0GemmVariant(
     /// Every variant <paramref name="device"/> can run, cheapest-first. Benchmarks and the
     /// correctness gates enumerate this so a variant cannot rot unmeasured.
     /// </summary>
+    /// <remarks>
+    /// The issue #439 ladder variants are included deliberately. They are diagnostic and
+    /// <see cref="SelectFor"/> never picks them, but enumerating them here puts them under the
+    /// existing synthetic-parity and one-hot-1-ULP gates for free — which is the whole point of
+    /// this method, and the only thing keeping a 128x128 prototype honest.
+    /// </remarks>
     /// <param name="device">Device to enumerate for.</param>
     /// <returns>The runnable variants, register-blocked first.</returns>
     public static IEnumerable<PQ2_0GemmVariant> AvailableOn(VulkanDevice device)
@@ -107,6 +245,11 @@ public readonly record struct PQ2_0GemmVariant(
         yield return RegisterBlocked;
         if (Coopmat.IsSupportedOn(device)) yield return Coopmat;
         if (Coopmat32.IsSupportedOn(device)) yield return Coopmat32;
+        if (Ladder16x16x1.IsSupportedOn(device)) yield return Ladder16x16x1;
+        if (Ladder64x64x4.IsSupportedOn(device)) yield return Ladder64x64x4;
+        if (Ladder128x128x4.IsSupportedOn(device)) yield return Ladder128x128x4;
+        if (Ladder16x16x1FastUnpack.IsSupportedOn(device)) yield return Ladder16x16x1FastUnpack;
+        if (Ladder128x128x4FastUnpack.IsSupportedOn(device)) yield return Ladder128x128x4FastUnpack;
     }
 }
 
@@ -182,6 +325,23 @@ public sealed class MatMulPQ2_0GemmF32Kernel : IDisposable
     private readonly int _tileN;
     private bool _disposed;
 
+    /// <summary>
+    /// Raw <c>VkPipeline</c> handle — diagnostics only, mirroring
+    /// <c>VulkanComputeKernelBase.PipelineHandle</c>. Exists so
+    /// <c>VulkanDevice.GetShaderStatisticsAmd</c> can report this kernel's
+    /// post-compile VGPR/LDS allocation; no codepath's correctness or performance
+    /// depends on it.
+    /// </summary>
+    internal nint PipelineHandle => _pipeline.Pipeline;
+
+    /// <summary>
+    /// The SPIR-V module this pipeline was created from — e.g.
+    /// <c>matmul_pq2_0_f32_gemm_coopmat32.spv</c>. Exposed so a profiler can record which
+    /// variant actually dispatched rather than asserting what <c>SelectFor</c> ought to pick
+    /// (issue #434).
+    /// </summary>
+    public string VariantName { get; private init; } = string.Empty;
+
     private MatMulPQ2_0GemmF32Kernel(
         VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, int tileM, int tileN)
     {
@@ -249,7 +409,10 @@ public sealed class MatMulPQ2_0GemmF32Kernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
-        return new MatMulPQ2_0GemmF32Kernel(device, module, pipeline, pool, variant.TileM, variant.TileN);
+        return new MatMulPQ2_0GemmF32Kernel(device, module, pipeline, pool, variant.TileM, variant.TileN)
+        {
+            VariantName = variant.SpvFileName,
+        };
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>

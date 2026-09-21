@@ -26,7 +26,7 @@ public static class CompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = activationError },
+                ErrorResponse.InvalidRequest(activationError, param: "model", code: "model_not_found"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -37,7 +37,7 @@ public static class CompletionEndpoint
         {
             httpContext.Response.StatusCode = 503;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = "No model loaded" },
+                ErrorResponse.Internal("No model loaded", code: "model_not_loaded"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -50,7 +50,7 @@ public static class CompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = validationError },
+                ErrorResponse.InvalidRequest(validationError),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -70,7 +70,7 @@ public static class CompletionEndpoint
             {
                 httpContext.Response.StatusCode = 400;
                 await httpContext.Response.WriteAsJsonAsync(
-                    new ErrorResponse { Error = $"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first." },
+                    ErrorResponse.InvalidRequest($"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first.", param: "prefix_id"),
                     ServerJsonContext.Default.ErrorResponse,
                     contentType: null,
                     httpContext.RequestAborted);
@@ -88,7 +88,7 @@ public static class CompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = ex.Message },
+                ErrorResponse.InvalidRequest(ex.Message, param: "lora_adapter"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -104,7 +104,7 @@ public static class CompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = promptError },
+                ErrorResponse.InvalidRequest(promptError, param: "prompt", code: "context_length_exceeded"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -119,7 +119,7 @@ public static class CompletionEndpoint
 
         if (request.Stream)
             await HandleStreamingAsync(generator, state, httpContext, request.Prompt, options,
-                requestId, modelId, adapter, ct);
+                requestId, modelId, adapter, request.WantsUsageChunk, ct);
         else
             await HandleNonStreamingAsync(generator, state, httpContext, request.Prompt, options,
                 requestId, modelId, adapter, ct);
@@ -196,6 +196,7 @@ public static class CompletionEndpoint
         string prompt, DotLLM.Core.Configuration.InferenceOptions options,
         string requestId, string modelId,
         DotLLM.Core.Lora.ILoraAdapter? adapter,
+        bool includeUsageChunk,
         CancellationToken ct)
     {
         // No Connection header: it is connection-specific and illegal over HTTP/2+. See SseResponse.
@@ -237,6 +238,27 @@ public static class CompletionEndpoint
         // Report actuals to the rate-limit lease so unused token budget is refunded.
         RateLimitMiddleware.GetLease(httpContext)
             ?.ReportActualTokens(promptTokens + completionTokens);
+
+        // stream_options.include_usage (#450): usage-only chunk with an empty choices array,
+        // which is the shape the SDKs match on to close out their token accounting.
+        if (includeUsageChunk)
+        {
+            var usageChunk = new CompletionChunk
+            {
+                Id = requestId,
+                Model = modelId,
+                Choices = [],
+                Usage = new UsageDto
+                {
+                    PromptTokens = promptTokens,
+                    CompletionTokens = completionTokens,
+                    TotalTokens = promptTokens + completionTokens,
+                },
+            };
+            await httpContext.Response.WriteAsync("data: ", ct);
+            await JsonSerializer.SerializeAsync(httpContext.Response.Body, usageChunk, ServerJsonContext.Default.CompletionChunk, ct);
+            await httpContext.Response.WriteAsync("\n\n", ct);
+        }
 
         await httpContext.Response.WriteAsync("data: [DONE]\n\n", ct);
         await httpContext.Response.Body.FlushAsync(ct);

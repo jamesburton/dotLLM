@@ -27,6 +27,18 @@ public sealed record AvailableModelDto
 
     [JsonPropertyName("size_bytes")]
     public long SizeBytes { get; init; }
+
+    /// <summary>
+    /// (#454) The model key a load of this file produces — the same id <c>GET /v1/models</c>
+    /// reports and the enable/disable routes take. Lets a client correlate the two listings
+    /// without re-deriving it from the filename.
+    /// </summary>
+    [JsonPropertyName("model_id")]
+    public string ModelId { get; init; } = "";
+
+    /// <summary>(#454) False when an operator has disabled this key via <c>POST /v1/models/disable</c>.</summary>
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; init; } = true;
 }
 
 /// <summary>

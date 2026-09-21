@@ -8,6 +8,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cuda;
 using DotLLM.Cuda.Architectures;
+using DotLLM.Cuda.Interop;
 using DotLLM.Engine.KvCache;
 using DotLLM.Models.Architectures;
 using Xunit;
@@ -301,6 +302,189 @@ public sealed class CudaNemotronHTransformerModelForwardTests
                     $"step={step} col={c}: cpu={cpu:F6} vs cuda={cuda:F6} (|diff|={diff:E3} > {bar:E3})");
             }
         }
+    }
+
+    /// <summary>
+    /// Regression coverage for issue #383: <see cref="CudaNemotronHTransformerModel.BuildFromPrebuiltWeights"/>
+    /// used to create <c>CudaContext</c>/<c>CudaStream</c>/<c>CudaCublasHandle</c>/<c>CudaKernels</c>
+    /// and upload every layer's device buffers with no try/catch — any exception partway through
+    /// (device OOM, a missing PTX module) leaked everything already created, including buffers
+    /// allocated inside a per-layer helper (<c>UploadDeviceSsmLayer</c> etc.) that never made it
+    /// into a stored <c>DeviceLayer</c> record.
+    /// </summary>
+    /// <remarks>
+    /// Uses a bogus <c>ptxDir</c> — the same reliable, deterministic, hardware-independent trigger
+    /// as <c>CudaMamba3FactoryLeakTests</c> (see that class's remarks for why a dtype/shape defect
+    /// isn't usable here either: <c>BuildFromPrebuiltWeights</c> takes already-resolved CPU
+    /// buffers with no equivalent pre-resource-creation validation gate, so this is simply the
+    /// most direct, safe way to reach a throw after <c>CudaContext</c>/<c>CudaStream</c>/
+    /// <c>CudaCublasHandle</c> already exist without depending on real GPU memory pressure).
+    /// </remarks>
+    [SkippableFact]
+    public void BuildFromPrebuiltWeights_BadPtxDir_ThrowsAndLeaksNoDeviceMemory()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+
+        var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Ffn };
+        using var fixture = NemotronHFixtureBuilder.Build(kinds, seed: 383);
+        var config = fixture.Config;
+        int hiddenSize = config.HiddenSize;
+        int vocabSize = config.VocabSize;
+
+        string badPtxDir = Path.Combine(Path.GetTempPath(), $"dotllm-cuda-nemotronh-no-such-ptx-{Guid.NewGuid():N}");
+
+        const int Iterations = 5;
+        nuint baselineFree = 0;
+
+        // See CudaMamba3FactoryLeakTests for why a dedicated probe context is needed:
+        // cuMemGetInfo operates on whatever context is current, and each failed
+        // BuildFromPrebuiltWeights call below both creates and (once the #383 fix disposes it in
+        // the catch path) destroys its own CudaContext, leaving no current context afterwards.
+        using var probeContext = CudaContext.Create(deviceId: 0);
+
+        for (int i = 0; i < Iterations; i++)
+        {
+            Assert.Throws<DirectoryNotFoundException>(() =>
+                CudaNemotronHTransformerModel.BuildFromPrebuiltWeights(
+                    config, fixture.Layers, fixture.OutputNormWeight,
+                    fixture.OutputWeightPtr, fixture.OutputQuantType, vocabSize, hiddenSize,
+                    fixture.TokenEmbedPtr, QuantizationType.F32,
+                    deviceId: 0, ptxDir: badPtxDir));
+
+            if (i == 0)
+            {
+                probeContext.MakeCurrent();
+                CudaDriverApi.cuMemGetInfo_v2(out baselineFree, out _).ThrowOnError();
+                _output.WriteLine($"Baseline free VRAM after 1st failed load: {baselineFree / (1024 * 1024)} MB");
+            }
+        }
+
+        probeContext.MakeCurrent();
+        CudaDriverApi.cuMemGetInfo_v2(out nuint freeAfter, out _).ThrowOnError();
+        _output.WriteLine($"Free VRAM after {Iterations} failed loads: {freeAfter / (1024 * 1024)} MB");
+
+        // Same noise floor and rationale as CudaMamba3FactoryLeakTests: pre-#383 each failed load
+        // leaked a live CudaContext (tens of MB alone) plus a CudaStream/CudaCublasHandle and any
+        // per-layer device buffers already uploaded — a real regression shows up as tens of MB
+        // per iteration, far past this floor.
+        const long NoiseFloorBytes = 16L * 1024 * 1024;
+        long drop = (long)baselineFree - (long)freeAfter;
+        Assert.True(drop < NoiseFloorBytes,
+            $"Free VRAM dropped by {drop / (1024.0 * 1024):F1} MB across {Iterations - 1} further failed loads " +
+            $"(baseline {baselineFree / (1024 * 1024)} MB -> {freeAfter / (1024 * 1024)} MB) — likely a leak.");
+    }
+
+    /// <summary>
+    /// Regression coverage for issue #383 review follow-up: the bogus-<c>ptxDir</c> test above
+    /// throws in <c>new CudaKernels(ptxDir)</c>, which runs BEFORE the first <c>cuMemAlloc</c> in
+    /// <c>BuildFromPrebuiltWeights</c> — so it only proves the context/stream/cublas/kernels
+    /// quartet is freed on failure. It never exercises the <c>allocs</c> ledger (the bulk of the
+    /// #383 diff): the reverse-order free of several real device buffers uploaded earlier in the
+    /// SAME failed load. This test forces a real <c>cuMemAlloc</c> failure partway through layer
+    /// 1's attention upload, after layer 0's full buffer set (and layer 1's own Q/K/V) are already
+    /// tracked in the ledger, and asserts they don't leak.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why a device-OOM trigger instead of a dropped GGUF tensor.</b> The reviewer's suggested
+    /// mechanism — remove a mid-model tensor so a GGUF-dictionary indexer throws
+    /// <see cref="KeyNotFoundException"/> — fits classes whose CUDA factory reads directly from a
+    /// <c>GgufFile</c>'s tensor-name dictionary inside its own per-layer loop (Qwen3HybridDense,
+    /// Qwen3MoeHybrid). <see cref="CudaNemotronHTransformerModel.BuildFromPrebuiltWeights"/> takes
+    /// no <c>GgufFile</c> at all — it uploads from already-resolved <see cref="NemotronHLayerWeights"/>
+    /// host pointers and declared dims, so there is no tensor-name indexer to trip. The dimension
+    /// fields (<c>OOutputDim</c> etc.) are declared independently of the actual host buffer size,
+    /// so inflating one to a value whose implied byte count exceeds any real GPU's VRAM makes
+    /// <c>cuMemAlloc_v2</c> itself fail deterministically — <see cref="UploadRawTensorFromHost"/>
+    /// never reads the (small, valid) host buffer at that size because the allocation fails first,
+    /// so this is safe (no out-of-bounds host read) as well as realistic (device OOM is exactly the
+    /// failure mode #383's issue text itself names). This is a genuine <see cref="CudaException"/>
+    /// (CUDA driver error, not a .NET-level guard), so it also proves the fix survives an error
+    /// class neither of this file's two BuildFromPrebuiltWeights tests reaches otherwise.
+    /// </para>
+    /// <para>
+    /// <b>Buffer accounting.</b> With <c>kinds = [Attention, Attention]</c>: the top-level factory
+    /// uploads output-norm + token-embed + dequant-scratch (3 buffers) before the per-layer loop;
+    /// layer 0 (uncorrupted) uploads attnNorm + Q/K/V/O + qNorm/kNorm (7 buffers); layer 1
+    /// (corrupted) uploads attnNorm + Q/K/V (4 buffers) before O's inflated <c>OOutputDim</c> makes
+    /// its <c>cuMemAlloc_v2</c> fail — 14 real device buffers must be freed in reverse order by the
+    /// ledger for this test to pass. A PQ2_0-repack variant (to also exercise
+    /// <c>CudaQwen3HybridDenseTransformerModel.UploadRawTensor</c>'s <c>allocs.Remove(...)</c>
+    /// transient-buffer path) was considered but not added: PQ2_0 is a packed on-disk layout with
+    /// no synthetic-fixture writer in the test tree today, and constructing valid packed bytes by
+    /// hand purely to exercise one `Remove` call was judged not cheap enough to be worth the risk
+    /// of an unrelated format bug — noted here as a documented gap instead.
+    /// </para>
+    /// </remarks>
+    [SkippableFact]
+    public void BuildFromPrebuiltWeights_MidLoadDeviceOom_FreesLedgerAndLeaksNoDeviceMemory()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+
+        var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Attention };
+        using var fixture = NemotronHFixtureBuilder.Build(kinds, seed: 3831);
+        var config = fixture.Config;
+        int hiddenSize = config.HiddenSize;
+        int vocabSize = config.VocabSize;
+
+        // Corrupt layer 1's attention O-projection output dim to a value whose implied byte count
+        // (RowByteSize(OInputDim, F32) * OOutputDim) is far beyond any real GPU's VRAM — Q/K/V
+        // upload first and succeed (real dims, real small host buffers), then O's cuMemAlloc_v2
+        // fails. AttnNormWeight/host pointers are reused unchanged from the original fixture layer
+        // — never touched, since the failing allocation happens before any host read.
+        var originalAttn = fixture.Layers[1].Attention!;
+        var corruptedAttn = new NemotronHAttentionWeights
+        {
+            QWeight = originalAttn.QWeight, QQuantType = originalAttn.QQuantType,
+            QInputDim = originalAttn.QInputDim, QOutputDim = originalAttn.QOutputDim,
+            KWeight = originalAttn.KWeight, KQuantType = originalAttn.KQuantType,
+            KInputDim = originalAttn.KInputDim, KOutputDim = originalAttn.KOutputDim,
+            VWeight = originalAttn.VWeight, VQuantType = originalAttn.VQuantType,
+            VInputDim = originalAttn.VInputDim, VOutputDim = originalAttn.VOutputDim,
+            OWeight = originalAttn.OWeight, OQuantType = originalAttn.OQuantType,
+            OInputDim = originalAttn.OInputDim,
+            OOutputDim = 2_000_000_000, // implies ~128 GB for F32 at this fixture's OInputDim
+            NumKvHeads = originalAttn.NumKvHeads,
+        };
+        fixture.Layers[1] = new NemotronHLayerWeights
+        {
+            AttnNormWeight = fixture.Layers[1].AttnNormWeight,
+            Attention = corruptedAttn,
+        };
+
+        const int Iterations = 5;
+        nuint baselineFree = 0;
+
+        // Same probe-context rationale as the bad-ptxDir test above.
+        using var probeContext = CudaContext.Create(deviceId: 0);
+
+        for (int i = 0; i < Iterations; i++)
+        {
+            var ex = Assert.Throws<CudaException>(() =>
+                CudaNemotronHTransformerModel.BuildFromPrebuiltWeights(
+                    config, fixture.Layers, fixture.OutputNormWeight,
+                    fixture.OutputWeightPtr, fixture.OutputQuantType, vocabSize, hiddenSize,
+                    fixture.TokenEmbedPtr, QuantizationType.F32,
+                    deviceId: 0));
+            if (i == 0) _output.WriteLine($"First failure: {ex.Message} (ErrorCode={ex.ErrorCode})");
+
+            if (i == 0)
+            {
+                probeContext.MakeCurrent();
+                CudaDriverApi.cuMemGetInfo_v2(out baselineFree, out _).ThrowOnError();
+                _output.WriteLine($"Baseline free VRAM after 1st failed load: {baselineFree / (1024 * 1024)} MB");
+            }
+        }
+
+        probeContext.MakeCurrent();
+        CudaDriverApi.cuMemGetInfo_v2(out nuint freeAfter, out _).ThrowOnError();
+        _output.WriteLine($"Free VRAM after {Iterations} failed loads: {freeAfter / (1024 * 1024)} MB");
+
+        const long NoiseFloorBytes = 16L * 1024 * 1024;
+        long drop = (long)baselineFree - (long)freeAfter;
+        Assert.True(drop < NoiseFloorBytes,
+            $"Free VRAM dropped by {drop / (1024.0 * 1024):F1} MB across {Iterations - 1} further failed loads " +
+            $"(baseline {baselineFree / (1024 * 1024)} MB -> {freeAfter / (1024 * 1024)} MB) — likely a leak.");
     }
 
     /// <summary>Owns a randomly-generated NemotronH "model" in unmanaged memory. Verbatim port of

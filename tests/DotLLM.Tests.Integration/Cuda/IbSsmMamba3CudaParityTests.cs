@@ -7,6 +7,7 @@ using DotLLM.Cuda.Architectures;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.SafeTensors;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -78,13 +79,17 @@ public sealed class IbSsmMamba3CudaParityTests
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
 
         var cpuLoadWatch = Stopwatch.StartNew();
-        var (cpuModel, cpuFile, config) = ModelLoader.LoadFromSafetensors(checkpointPath!);
+        var (cpuModel, cpuFile, config) = CheckpointGuard.LoadOrSkip(
+            checkpointPath!, "ib-ssm/mamba3-370M-10BT checkpoint (CPU)",
+            () => ModelLoader.LoadFromSafetensors(checkpointPath!));
         cpuLoadWatch.Stop();
         Assert.Equal(Architecture.Mamba3, config.Architecture);
         _output.WriteLine($"CPU load: {cpuLoadWatch.Elapsed.TotalSeconds:F1} s");
 
         var cudaLoadWatch = Stopwatch.StartNew();
-        var (cudaModel, cudaSource, _) = CudaModelLoader.LoadMamba3FromSafetensors(checkpointPath!);
+        var (cudaModel, cudaSource, _) = CheckpointGuard.LoadOrSkip(
+            checkpointPath!, "ib-ssm/mamba3-370M-10BT checkpoint (CUDA)",
+            () => CudaModelLoader.LoadMamba3FromSafetensors(checkpointPath!));
         cudaLoadWatch.Stop();
         _output.WriteLine($"CUDA load: {cudaLoadWatch.Elapsed.TotalSeconds:F1} s");
 
@@ -118,8 +123,12 @@ public sealed class IbSsmMamba3CudaParityTests
             $"ib-ssm/mamba3-370M-10BT checkpoint not found. Set {CheckpointPathEnvVar}.");
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
 
-        var (cpuModel, cpuFile, config) = ModelLoader.LoadFromSafetensors(checkpointPath!);
-        var (cudaModel, cudaSource, _) = CudaModelLoader.LoadMamba3FromSafetensors(checkpointPath!);
+        var (cpuModel, cpuFile, config) = CheckpointGuard.LoadOrSkip(
+            checkpointPath!, "ib-ssm/mamba3-370M-10BT checkpoint (CPU)",
+            () => ModelLoader.LoadFromSafetensors(checkpointPath!));
+        var (cudaModel, cudaSource, _) = CheckpointGuard.LoadOrSkip(
+            checkpointPath!, "ib-ssm/mamba3-370M-10BT checkpoint (CUDA)",
+            () => CudaModelLoader.LoadMamba3FromSafetensors(checkpointPath!));
         try
         {
             var cpuM3 = Assert.IsType<Mamba3TransformerModel>(cpuModel);

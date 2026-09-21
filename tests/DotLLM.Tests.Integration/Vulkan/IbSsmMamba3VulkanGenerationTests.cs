@@ -5,6 +5,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.SafeTensors;
+using DotLLM.Tests.Integration.Fixtures;
 using DotLLM.Tokenizers;
 using DotLLM.Vulkan;
 using Xunit;
@@ -106,7 +107,9 @@ public sealed class IbSsmMamba3VulkanGenerationTests
 
         // ── CPU model ──────────────────────────────────────────────────
         var cpuLoadWatch = Stopwatch.StartNew();
-        var (cpuModel, cpuFile, config) = ModelLoader.LoadFromSafetensors(weightsPath);
+        var (cpuModel, cpuFile, config) = CheckpointGuard.LoadOrSkip(
+            weightsPath, "ib-ssm/mamba3-370M-10BT checkpoint (CPU)",
+            () => ModelLoader.LoadFromSafetensors(weightsPath));
         cpuLoadWatch.Stop();
         Assert.Equal(Architecture.Mamba3, config.Architecture);
         _output.WriteLine(
@@ -212,7 +215,11 @@ public sealed class IbSsmMamba3VulkanGenerationTests
     private static ISafetensorsTensorSource OpenSafetensorsFile(string path)
     {
         if (path.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase) && File.Exists(path))
-            return SafetensorsFile.Open(path);
+        {
+            return CheckpointGuard.LoadOrSkip(
+                path, "ib-ssm/mamba3-370M-10BT checkpoint (Vulkan)",
+                () => SafetensorsFile.Open(path));
+        }
         throw new FileNotFoundException(
             $"Expected a single-shard *.safetensors file for the Mamba-3 ib-ssm 370M checkpoint at {path}.",
             path);

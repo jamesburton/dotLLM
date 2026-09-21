@@ -21,11 +21,16 @@
 // Dispatch:
 //   local_size_x = WG_SIZE                (typically 64)
 //   groupCount.x = nHead                  (one workgroup per head; heads independent)
-// Each thread tid owns the lane index k = tid + n*WG_SIZE for n covering
-// [0, numRopeAngles). For typical Mamba-3 numRopeAngles ∈ {32, 64} this is
-// a single iteration per thread. Sequential over t inside the shader: the
-// recurrence cum[h, k] += ... is per-head per-lane and cannot be parallelised
-// across t without a chunked prefix-scan (out of scope for the foundation port).
+// Each thread strides over lane indices k = tid, tid + WG_SIZE, ... covering
+// [0, numRopeAngles) — for typical Mamba-3 numRopeAngles ∈ {32, 64} this is a
+// single iteration per thread, but the loop form supports numRopeAngles up to
+// MAX_RA (256, the shared-mem bound) with WG_SIZE=64 (issue #376: the
+// rotation loop previously used a one-shot 'tid < nra' guard instead of this
+// stride, silently under-rotating lanes 64..nra-1 whenever nra > 64 — fixed
+// to match the seed/writeback loops, which were already strided correctly).
+// Sequential over t inside the shader: the recurrence cum[h, k] += ... is
+// per-head per-lane and cannot be parallelised across t without a chunked
+// prefix-scan (out of scope for the foundation port).
 //
 // Cum_angle state-thread:
 //   hasCumPrev  (push constant) — when 1, seed cum[h, k] from cumPrev buffer;
@@ -131,11 +136,13 @@ void main() {
         barrier();
 
         // 2b. Apply rotation to b and c at this token, ALL rank slices, head h.
-        //     Strategy 1: thread k owns its lane-pair and rotates it for every r.
-        //     Tail lanes (k >= numRopeAngles) do nothing — pass-through.
-        if (tid < nra) {
-            float co = sharedCos[tid];
-            float si = sharedSin[tid];
+        //     Strided over k = tid, tid + WG_SIZE, ... so numRopeAngles > WG_SIZE
+        //     still works (each thread rotates multiple lane-pairs) — mirrors the
+        //     seed/writeback loops above. Tail lanes beyond numRopeAngles simply
+        //     never get a k value — pass-through.
+        for (uint k = tid; k < nra; k += WG_SIZE) {
+            float co = sharedCos[k];
+            float si = sharedSin[k];
 
             uint tokenBase = t * bcTokenStride;
 
@@ -144,7 +151,7 @@ void main() {
 
                 if (pc.mode == 0u) {
                     // Pairwise: rotate (v[2k], v[2k+1]).
-                    uint i0 = bcBase + 2u * tid;
+                    uint i0 = bcBase + 2u * k;
                     uint i1 = i0 + 1u;
                     float be = bArr[i0]; float bo = bArr[i1];
                     float ce = cArr[i0]; float co2 = cArr[i1];
@@ -154,9 +161,9 @@ void main() {
                     cArr[i1] = si * ce + co * co2;
                 } else {
                     // Halved: rotate (v[k], v[k + halfDState]). Only the first
-                    // numRopeAngles lanes of each half — guarded by tid < nra.
-                    uint i0 = bcBase + tid;
-                    uint i1 = bcBase + halfDState + tid;
+                    // numRopeAngles lanes of each half — guarded by k < nra.
+                    uint i0 = bcBase + k;
+                    uint i1 = bcBase + halfDState + k;
                     float be = bArr[i0]; float bo = bArr[i1];
                     float ce = cArr[i0]; float co2 = cArr[i1];
                     bArr[i0] = co * be - si * bo;

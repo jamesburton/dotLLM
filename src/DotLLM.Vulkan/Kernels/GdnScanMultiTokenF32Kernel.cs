@@ -35,8 +35,9 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
     private bool _disposed;
 
     private GdnScanMultiTokenF32Kernel(
-        VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
+        VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, Variant variant)
     {
+        _variant = variant;
         _device = device;
         _module = module;
         _pipeline = pipeline;
@@ -44,10 +45,117 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 7);
     }
 
-    /// <summary>Loads <c>gdn_scan_multi_token_f32.spv</c> from <paramref name="spvDir"/>.</summary>
-    public static GdnScanMultiTokenF32Kernel Create(VulkanDevice device, string spvDir)
+    /// <summary>
+    /// #445 factorial arms for the scan. Two independent hypotheses about why this kernel
+    /// costs 26 % of a pp512 pass, crossed so they can be told apart in four measurements
+    /// rather than guessed at in a ladder:
+    /// <list type="bullet">
+    /// <item><description><b>A — phase fusion.</b> Each state element is touched six times
+    /// per token (decay r+w, retrieve r, rank-1 r+w, read r); fusing decay into retrieve and
+    /// rank-1 into read-out makes it four.</description></item>
+    /// <item><description><b>B — LDS residency.</b> The state matrix lives in a global SSBO.
+    /// Splitting each head's columns across four workgroups of 32 lanes puts a
+    /// <c>d_state x 32</c> slab (16 KiB) in LDS, read from and written to global exactly once
+    /// per dispatch.</description></item>
+    /// </list>
+    /// Every arm is bit-exact against <c>DotLLM.Cpu.Kernels.GatedDeltaNetScan</c>; the arms
+    /// change where values live and how often they are re-read, never what they are.
+    /// Select with <c>DOTLLM_VK_GDN_SCAN_VARIANT</c> = <c>base</c> | <c>fused</c> |
+    /// <c>lds</c> | <c>ldsfused</c>. <b>Default <see cref="LdsFused"/></b> — the A/B has since
+    /// said which cell wins, twice over, so it now ships on. Set <c>base</c> to opt out.
+    /// <para>
+    /// Evidence for the flip (Bonsai 2 27B PQ2_0, pp512, gfx1151, order-reversed interleaved,
+    /// quiet machine): LdsFused 172.83 / 171.11 / 168.28 against Baseline 134.93 / 133.55 /
+    /// 133.28 tok/s — 1.275x whole pass, ranges disjoint. Independently reproduced in a 2x2
+    /// factorial against the hd256 flash variant (#441), where the GDN factor alone measured
+    /// 1.42x and the two together 1.74x, confirming the two levers are near-independent.
+    /// </para>
+    /// <para>
+    /// The 2x2 also settled the mechanism: deleting a third of the state traffic (<see
+    /// cref="Fused"/>) REGRESSED to 0.955x while moving it to LDS (<see cref="Lds"/>) gave
+    /// 3.604x — so per-access cost binds, not traffic volume. Every arm is bit-exact, so the
+    /// flip changes speed only.
+    /// </para>
+    /// </summary>
+    public enum Variant
     {
-        string path = Path.Combine(spvDir, "gdn_scan_multi_token_f32.spv");
+        /// <summary>Arm 00 — shipping: global state, six accesses per token.</summary>
+        Baseline,
+
+        /// <summary>Arm 10 — factor A only: global state, four accesses per token.</summary>
+        Fused,
+
+        /// <summary>Arm 01 — factor B only: LDS-resident state, six accesses per token.</summary>
+        Lds,
+
+        /// <summary>Arm 11 — both factors.</summary>
+        LdsFused,
+
+        /// <summary>
+        /// Arm 01 at COLS=64 — the WAVE-COUNT-MATCHED control for factor B. The device reports
+        /// <c>subgroupSize</c> 64, so the COLS=32 arms run 192 half-empty wave64s where the
+        /// shipping kernel runs 96 full ones: they change the memory level AND double the
+        /// wavefront count. At COLS=64 the wavefront count is identical to the shipping kernel
+        /// (48 heads x 128 lanes / 64 = 96 either way) and only the memory level differs.
+        /// </summary>
+        Lds64,
+
+        /// <summary>Arm 11 at COLS=64 — wave-count-matched, both factors.</summary>
+        Lds64Fused,
+    }
+
+    /// <summary>Lanes per workgroup, and therefore state columns per workgroup, in the LDS arms.</summary>
+    private const int LdsColsPerGroup = 32;
+
+    /// <summary>Columns per workgroup in the wave64-matched LDS arms — one full wave64 per group.</summary>
+    private const int LdsColsPerGroupWave64 = 64;
+
+    private readonly Variant _variant;
+
+    /// <summary>Which factorial arm this pipeline was built from (#445).</summary>
+    public Variant ActiveVariant => _variant;
+
+    /// <summary>
+    /// Raw <c>VkPipeline</c> handle — diagnostics only, so
+    /// <c>VulkanDevice.GetShaderStatisticsAmd</c> can report this kernel's post-compile
+    /// VGPR/SGPR/LDS/scratch allocation. No codepath's correctness or performance depends on it.
+    /// </summary>
+    internal nint PipelineHandle => _pipeline.Pipeline;
+
+    private static Variant VariantFromEnv() =>
+        Environment.GetEnvironmentVariable("DOTLLM_VK_GDN_SCAN_VARIANT") switch
+        {
+            "fused" => Variant.Fused,
+            "lds" => Variant.Lds,
+            "ldsfused" => Variant.LdsFused,
+            "lds64" => Variant.Lds64,
+            "lds64fused" => Variant.Lds64Fused,
+            // Explicit opt-OUT now that LdsFused is the default (see the enum's doc comment).
+            "base" or "baseline" => Variant.Baseline,
+            _ => Variant.LdsFused,
+        };
+
+    private static string SpvFor(Variant v) => v switch
+    {
+        Variant.Fused => "gdn_scan_multi_token_fused_f32.spv",
+        Variant.Lds => "gdn_scan_multi_token_lds_f32.spv",
+        Variant.LdsFused => "gdn_scan_multi_token_lds_fused_f32.spv",
+        Variant.Lds64 => "gdn_scan_multi_token_lds64_f32.spv",
+        Variant.Lds64Fused => "gdn_scan_multi_token_lds64_fused_f32.spv",
+        _ => "gdn_scan_multi_token_f32.spv",
+    };
+
+    /// <summary>Loads the selected variant's SPIR-V from <paramref name="spvDir"/>.</summary>
+    public static GdnScanMultiTokenF32Kernel Create(VulkanDevice device, string spvDir)
+        => Create(device, spvDir, VariantFromEnv());
+
+    /// <summary>Loads a specific #445 factorial arm — used by the A/B harness and the parity tests.</summary>
+    /// <param name="device">Device to create the pipeline on.</param>
+    /// <param name="spvDir">Directory holding the compiled <c>.spv</c> blobs.</param>
+    /// <param name="variant">Which arm to build.</param>
+    public static GdnScanMultiTokenF32Kernel Create(VulkanDevice device, string spvDir, Variant variant)
+    {
+        string path = Path.Combine(spvDir, SpvFor(variant));
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
@@ -70,7 +178,7 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 7);
-        return new GdnScanMultiTokenF32Kernel(device, module, pipeline, pool);
+        return new GdnScanMultiTokenF32Kernel(device, module, pipeline, pool, variant);
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
@@ -135,7 +243,17 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
                 0, PushConstantBytes, (nint)pcPtr);
         }
 
-        VulkanApi.vkCmdDispatch(cmdBuf, (uint)nVHead, 1, 1);
+        // Arms 00/10 keep one workgroup of d_state lanes per value head. Arms 01/11 split
+        // each head's columns across ceil(d_state / 32) single-wave workgroups so the slab
+        // fits LDS; total threads are identical either way, so this adds no wavefronts.
+        int cols = _variant switch
+        {
+            Variant.Lds or Variant.LdsFused => LdsColsPerGroup,
+            Variant.Lds64 or Variant.Lds64Fused => LdsColsPerGroupWave64,
+            _ => 0,
+        };
+        uint groupsY = cols == 0 ? 1u : (uint)((dState + cols - 1) / cols);
+        VulkanApi.vkCmdDispatch(cmdBuf, (uint)nVHead, groupsY, 1);
     }
 
     /// <inheritdoc/>

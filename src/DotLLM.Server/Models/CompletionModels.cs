@@ -26,6 +26,40 @@ public sealed record CompletionRequest
     [JsonPropertyName("stream")]
     public bool Stream { get; init; }
 
+    /// <summary>Streaming options (#450). See <see cref="StreamOptionsDto"/>.</summary>
+    [JsonPropertyName("stream_options")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public StreamOptionsDto? StreamOptions { get; init; }
+
+    /// <summary>True when this request asked for the final <c>choices: []</c> usage chunk.</summary>
+    [JsonIgnore]
+    public bool WantsUsageChunk => StreamOptions?.IncludeUsage == true;
+
+    /// <summary>End-user identifier. Accepted and ignored (#450).</summary>
+    [JsonPropertyName("user")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? User { get; init; }
+
+    /// <summary>Completion persistence flag. Accepted and ignored (#450).</summary>
+    [JsonPropertyName("store")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Store { get; init; }
+
+    /// <summary>Latency tier hint. Accepted and ignored (#450).</summary>
+    [JsonPropertyName("service_tier")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ServiceTier { get; init; }
+
+    /// <summary>Reasoning-budget hint. Accepted and ignored (#450).</summary>
+    [JsonPropertyName("reasoning_effort")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReasoningEffort { get; init; }
+
+    /// <summary>Opaque client key/value tags. Accepted and ignored (#450).</summary>
+    [JsonPropertyName("metadata")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? Metadata { get; init; }
+
     [JsonPropertyName("stop")]
     public JsonElement? Stop { get; init; }
 
@@ -178,6 +212,14 @@ public sealed record CompletionChunk
 
     [JsonPropertyName("choices")]
     public required CompletionChunkChoiceDto[] Choices { get; init; }
+
+    /// <summary>
+    /// Populated only on the final usage chunk emitted for
+    /// <c>stream_options.include_usage</c> (#450), which carries an empty <c>choices</c> array.
+    /// </summary>
+    [JsonPropertyName("usage")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public UsageDto? Usage { get; init; }
 }
 
 /// <summary>
