@@ -37,10 +37,11 @@ public sealed class AnthropicToolChoiceTests
         var options = BaseOptions();
         var model = new HermesToolCallParser();
 
-        var parser = MessagesEndpoint.ApplyToolChoice(Choice("""{"type":"auto"}"""), Tools, model, ref options);
+        var parser = MessagesEndpoint.ApplyToolChoice(Choice("""{"type":"auto"}"""), Tools, model, ref options, out bool forced);
 
         Assert.Same(model, parser);
         Assert.Null(options.ResponseFormat);
+        Assert.False(forced);
     }
 
     [Fact]
@@ -49,11 +50,12 @@ public sealed class AnthropicToolChoiceTests
         var options = BaseOptions();
 
         var parser = MessagesEndpoint.ApplyToolChoice(
-            Choice("""{"type":"none"}"""), Tools, new HermesToolCallParser(), ref options);
+            Choice("""{"type":"none"}"""), Tools, new HermesToolCallParser(), ref options, out bool forced);
 
         // No parser means nothing the model emits can be reported as a tool_use block.
         Assert.Null(parser);
         Assert.Null(options.ResponseFormat);
+        Assert.False(forced);
     }
 
     [Fact]
@@ -62,7 +64,7 @@ public sealed class AnthropicToolChoiceTests
         var options = BaseOptions();
 
         var parser = MessagesEndpoint.ApplyToolChoice(
-            Choice("""{"type":"tool","name":"get_time"}"""), Tools, new HermesToolCallParser(), ref options);
+            Choice("""{"type":"tool","name":"get_time"}"""), Tools, new HermesToolCallParser(), ref options, out bool forced);
 
         var format = Assert.IsType<ResponseFormat.JsonSchema>(options.ResponseFormat);
         Assert.Contains("get_time", format.Schema);
@@ -71,6 +73,8 @@ public sealed class AnthropicToolChoiceTests
         // The constraint emits a bare JSON object, not the model's <tool_call> envelope, so the
         // markerless parser must be used or the call is parsed back as plain text.
         Assert.IsType<GenericToolCallParser>(parser);
+        // The whole completion is the call, so none of it may be streamed as assistant text.
+        Assert.True(forced);
     }
 
     [Fact]
@@ -79,7 +83,7 @@ public sealed class AnthropicToolChoiceTests
         var options = BaseOptions();
 
         var parser = MessagesEndpoint.ApplyToolChoice(
-            Choice("""{"type":"any"}"""), Tools, new HermesToolCallParser(), ref options);
+            Choice("""{"type":"any"}"""), Tools, new HermesToolCallParser(), ref options, out bool forced);
 
         var format = Assert.IsType<ResponseFormat.JsonSchema>(options.ResponseFormat);
         Assert.Contains("get_weather", format.Schema);
@@ -95,7 +99,7 @@ public sealed class AnthropicToolChoiceTests
         var options = BaseOptions();
 
         MessagesEndpoint.ApplyToolChoice(
-            Choice("""{"type":"tool","name":"get_time"}"""), Tools, new LlamaToolCallParser(), ref options);
+            Choice("""{"type":"tool","name":"get_time"}"""), Tools, new LlamaToolCallParser(), ref options, out bool forced);
 
         var format = Assert.IsType<ResponseFormat.JsonSchema>(options.ResponseFormat);
         Assert.Contains("parameters", format.Schema);
@@ -107,7 +111,8 @@ public sealed class AnthropicToolChoiceTests
         var options = BaseOptions();
 
         Assert.Null(MessagesEndpoint.ApplyToolChoice(
-            Choice("""{"type":"any"}"""), tools: null, new HermesToolCallParser(), ref options));
+            Choice("""{"type":"any"}"""), tools: null, new HermesToolCallParser(), ref options, out bool forced));
+        Assert.False(forced);
         Assert.Null(options.ResponseFormat);
     }
 

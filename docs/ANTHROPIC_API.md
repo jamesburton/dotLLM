@@ -194,6 +194,14 @@ server error.
 Every frame's `data.type` equals its `event:` name (the SDK dispatches on the
 event name and only fills `type` in when the payload omits it).
 
+Tool-call markup is **not** streamed as text as well. With a forced `tool_choice`
+the whole completion is the call, so no `text_delta` is emitted (the index-0 text
+block is still opened and closed empty — the real API would emit only the
+`tool_use` block). With `tool_choice: auto` and a marker-based parser, prose
+emitted before the marker still streams and the envelope itself is held back;
+with the markerless fallback parser nothing is suppressed, because its heuristic
+fires on any JSON-ish text.
+
 Tool calls detected during streaming are emitted after the text block closes, as
 additional `tool_use` content blocks (`content_block_start` →
 `content_block_delta` with `input_json_delta` → `content_block_stop`) at index

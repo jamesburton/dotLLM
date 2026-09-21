@@ -4,6 +4,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Engine;
 using DotLLM.Server.Endpoints;
 using DotLLM.Tokenizers;
+using DotLLM.Tokenizers.ToolCallParsers;
 using Microsoft.AspNetCore.Http;
 using Xunit;
 
@@ -42,7 +43,8 @@ public sealed class AnthropicStreamingTests
     private static async Task<SseFrame[]> RunAsync(
         IAsyncEnumerable<GenerationToken> tokens,
         IToolCallParser? parser = null,
-        string[]? stopSequences = null)
+        string[]? stopSequences = null,
+        bool suppressToolCallText = false)
     {
         var ctx = new DefaultHttpContext();
         var body = new MemoryStream();
@@ -51,7 +53,7 @@ public sealed class AnthropicStreamingTests
         await MessagesEndpoint.WriteMessageStreamAsync(
             ctx, _ => tokens, NoGate, parser, stopSequences,
             messageId: "msg_test", modelId: "test-model", promptTokenCount: 7,
-            CancellationToken.None);
+            CancellationToken.None, suppressToolCallText);
 
         Assert.Equal("text/event-stream", ctx.Response.ContentType);
         // Connection-specific headers are illegal over HTTP/2 and must not be emitted.
@@ -268,5 +270,69 @@ public sealed class AnthropicStreamingTests
         yield return new GenerationToken(0, "tok", null);
         await Task.Yield();
         throw new OperationCanceledException();
+    }
+
+    // --- tool-call markup must not also be streamed as text ------------------
+
+    // Bare tool-call JSON, split across two tokens the way a model emits it.
+    private const string JsonHead = @"{""name"":""get_weather"",";
+    private const string JsonTail = @"""arguments"":{""city"":""Paris""}}";
+
+    private static string TextOf(SseFrame[] frames) => string.Concat(
+        frames.Where(f => f.Event == "content_block_delta" &&
+                          f.Data.GetProperty("delta").GetProperty("type").GetString() == "text_delta")
+              .Select(f => f.Data.GetProperty("delta").GetProperty("text").GetString()));
+
+    [Fact]
+    public async Task Streaming_ForcedToolCall_DoesNotAlsoStreamTheJsonAsText()
+    {
+        // With a forced tool_choice the model emits bare tool-call JSON. Streaming it as
+        // text_delta AND re-emitting it as a tool_use block reports the same payload twice:
+        // the SDK's stream.text_stream would print raw JSON to the user, and the accumulated
+        // message would carry a text block that the non-streaming route never produces.
+        var frames = await RunAsync(
+            Tokens((JsonHead, null), (JsonTail, FinishReason.Stop)),
+            new GenericToolCallParser(),
+            suppressToolCallText: true);
+
+        Assert.DoesNotContain("get_weather", TextOf(frames));
+        Assert.Contains(frames, f =>
+            f.Event == "content_block_start" &&
+            f.Data.GetProperty("content_block").GetProperty("type").GetString() == "tool_use");
+        Assert.Equal("tool_use",
+            frames.Single(f => f.Event == "message_delta").Data
+                  .GetProperty("delta").GetProperty("stop_reason").GetString());
+    }
+
+    [Fact]
+    public async Task Streaming_MarkerToolCall_StreamsThePreambleButNotTheMarkup()
+    {
+        // tool_choice=auto with a marker-based parser: text before the marker is genuine
+        // assistant prose and must still reach the client; the <tool_call> envelope must not.
+        var frames = await RunAsync(
+            Tokens(("Let me check. ", null),
+                   ("<tool_call>", null),
+                   ("""{"name":"get_weather","arguments":{"city":"Paris"}}""", null),
+                   ("</tool_call>", FinishReason.Stop)),
+            new HermesToolCallParser());
+
+        string text = TextOf(frames);
+        Assert.Contains("Let me check.", text);
+        Assert.DoesNotContain("tool_call", text);
+        Assert.DoesNotContain("get_weather", text);
+        Assert.Contains(frames, f =>
+            f.Event == "content_block_start" &&
+            f.Data.GetProperty("content_block").GetProperty("type").GetString() == "tool_use");
+    }
+
+    [Fact]
+    public async Task Streaming_NoToolMarkup_StreamsEverythingAsText()
+    {
+        // The suppression must not eat ordinary prose from a model that never calls a tool.
+        var frames = await RunAsync(
+            Tokens(("The answer ", null), ("is 4.", FinishReason.Stop)),
+            new HermesToolCallParser());
+
+        Assert.Equal("The answer is 4.", TextOf(frames));
     }
 }

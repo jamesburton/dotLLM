@@ -122,11 +122,11 @@ public static class MessagesEndpoint
         // indistinguishable from `auto` and `none` still let a tool call through.
         var toolChoice = AnthropicConverter.ParseToolChoice(request.ToolChoice);
         var effectiveParser = ApplyToolChoice(
-            toolChoice, tools, state.ToolCallParser, ref options);
+            toolChoice, tools, state.ToolCallParser, ref options, out bool forcedToolCall);
 
         if (request.Stream)
             await HandleStreamingAsync(request, generator, state, httpContext, prompt, options,
-                messageId, modelId, effectiveParser, promptTokenCount, ct);
+                messageId, modelId, effectiveParser, forcedToolCall, promptTokenCount, ct);
         else
             await HandleNonStreamingAsync(request, generator, state, httpContext, prompt, options,
                 messageId, modelId, effectiveParser, ct);
@@ -147,12 +147,22 @@ public static class MessagesEndpoint
     /// A caller-supplied <c>response_format</c> does not exist on this surface, so the constraint
     /// slot is always free.
     /// </remarks>
+    /// <param name="toolChoice">The parsed Anthropic <c>tool_choice</c>.</param>
+    /// <param name="tools">The tool definitions the request supplied, if any.</param>
+    /// <param name="modelParser">The model's own tool-call parser, if the model has one.</param>
+    /// <param name="options">Inference options; a decoding constraint is installed on them.</param>
+    /// <param name="forcedToolCall">
+    /// True when decoding was constrained, i.e. the whole completion IS the tool call and none
+    /// of it is assistant text.
+    /// </param>
     internal static IToolCallParser? ApplyToolChoice(
         ToolChoice toolChoice,
         ToolDefinition[]? tools,
         IToolCallParser? modelParser,
-        ref DotLLM.Core.Configuration.InferenceOptions options)
+        ref DotLLM.Core.Configuration.InferenceOptions options,
+        out bool forcedToolCall)
     {
+        forcedToolCall = false;
         if (tools is not { Length: > 0 })
             return null;
         if (toolChoice is ToolChoice.None)
@@ -179,6 +189,7 @@ public static class MessagesEndpoint
                 Name = "tool_call",
             },
         };
+        forcedToolCall = true;
         return ToolCallParserFactory.ForToolChoice(toolChoice, modelParser);
     }
 
@@ -280,6 +291,7 @@ public static class MessagesEndpoint
         DotLLM.Core.Configuration.InferenceOptions options,
         string messageId, string modelId,
         IToolCallParser? toolCallParser,
+        bool forcedToolCall,
         int promptTokenCount,
         CancellationToken ct)
         => await WriteMessageStreamAsync(
@@ -288,7 +300,7 @@ public static class MessagesEndpoint
             state.ExecuteAsync,
             toolCallParser,
             request.StopSequences,
-            messageId, modelId, promptTokenCount, ct);
+            messageId, modelId, promptTokenCount, ct, forcedToolCall);
 
     /// <summary>
     /// Emits the Anthropic SSE event sequence for one streaming request:
@@ -313,7 +325,8 @@ public static class MessagesEndpoint
         string messageId,
         string modelId,
         int promptTokenCount,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool forcedToolCall = false)
     {
         // No `Connection: keep-alive` — it is connection-specific and illegal over HTTP/2+.
         SseResponse.ApplyHeaders(httpContext);
@@ -347,6 +360,18 @@ public static class MessagesEndpoint
         FinishReason finishReason = FinishReason.Length;
         int completionTokens = 0;
 
+        // Tool-call markup must not ALSO go out as text_delta: the same payload would be
+        // reported twice — once as text, once as the tool_use block emitted below — and an SDK's
+        // text_stream would print raw JSON at the user. The accumulator holds text back from the
+        // moment the parser recognises a tool call; prose emitted before that is genuine and
+        // still streams. Under a forced tool_choice the whole completion is the call, so
+        // suppression starts immediately. For `auto`, only a marker-based parser drives
+        // suppression: GenericToolCallParser's heuristic fires on any `{ ... "name"`, which would
+        // swallow ordinary prose that merely looks JSON-ish.
+        var suppressor = toolCallParser is not null && !forcedToolCall && toolCallParser is not GenericToolCallParser
+            ? new StreamingToolCallAccumulator(toolCallParser)
+            : null;
+
         try
         {
             await execute(async () =>
@@ -357,13 +382,17 @@ public static class MessagesEndpoint
                     {
                         completionTokens++;
                         sb.Append(token.Text);
-                        await WriteEventAsync(httpContext, "content_block_delta",
-                            new AnthropicContentBlockDeltaEvent
-                            {
-                                Index = 0,
-                                Delta = new AnthropicStreamDeltaDto { Type = "text_delta", Text = token.Text },
-                            },
-                            ServerJsonContext.Default.AnthropicContentBlockDeltaEvent, ct);
+                        bool suppress = forcedToolCall || (suppressor?.Append(token.Text) ?? false);
+                        if (!suppress)
+                        {
+                            await WriteEventAsync(httpContext, "content_block_delta",
+                                new AnthropicContentBlockDeltaEvent
+                                {
+                                    Index = 0,
+                                    Delta = new AnthropicStreamDeltaDto { Type = "text_delta", Text = token.Text },
+                                },
+                                ServerJsonContext.Default.AnthropicContentBlockDeltaEvent, ct);
+                        }
                     }
 
                     if (token.FinishReason.HasValue)
