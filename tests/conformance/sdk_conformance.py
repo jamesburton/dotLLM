@@ -295,6 +295,75 @@ def oai_json_schema(c: Ctx) -> str:
     return _short(json.dumps(obj), 60)
 
 
+def oai_stop_sequence(c: Ctx) -> str:
+    """#459. A user-supplied stop string must truncate generation and report finish_reason=stop.
+
+    Pre-fix this was unfalsifiable from outside: the scheduler passed an empty decoded tail to
+    every stop condition, so `stop` was accepted and returned byte-identical text. The row asserts
+    the stop string is absent from the content -- the engine trims the match -- and that the model
+    stopped rather than running to max_tokens.
+    """
+    prompt = "Reply with exactly: RED. GREEN. BLUE."
+    r = c.oai.chat.completions.create(
+        model=c.model,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=64, temperature=0, seed=0, stop=["GREEN"],
+    )
+    ch = r.choices[0]
+    content = ch.message.content or ""
+    check(ch.finish_reason == "stop", f"finish_reason={ch.finish_reason!r} (expected stop)")
+    check("GREEN" not in content, f"stop string not trimmed from content={_short(content, 60)!r}")
+    return f"content={_short(content, 40)!r} finish={ch.finish_reason}"
+
+
+def oai_n_choices(c: Ctx) -> str:
+    """#460. `n` was accepted and never read -- n:3 silently returned one choice.
+
+    Asserts the count, that the indices are the contiguous 0..n-1 an SDK expects, and that usage
+    counts the prompt ONCE across the choices (the OpenAI convention) while summing completions.
+    """
+    n = 3
+    r = c.oai.chat.completions.create(
+        model=c.model,
+        messages=[{"role": "user", "content": "Name one colour."}],
+        max_tokens=16, temperature=1.0, n=n,
+    )
+    check(len(r.choices) == n, f"choices={len(r.choices)} (expected {n})")
+    check(sorted(ch.index for ch in r.choices) == list(range(n)),
+          f"indices={[ch.index for ch in r.choices]!r} (expected 0..{n - 1})")
+    for ch in r.choices:
+        check(bool(ch.message.content is not None), f"choice {ch.index} has no content")
+    if r.usage is not None:
+        check(r.usage.total_tokens == r.usage.prompt_tokens + r.usage.completion_tokens,
+              f"usage does not add up: {r.usage!r}")
+    return f"choices={len(r.choices)} usage={r.usage.total_tokens if r.usage else '-'}"
+
+
+def oai_n_streaming_rejected(c: Ctx) -> str:
+    """#460. n > 1 with stream: true is refused explicitly rather than silently giving one choice.
+
+    A documented refusal is the acceptable outcome for an unsupported option; silently returning
+    one choice is the defect. The row asserts a 400 that names the parameter, so a client is told
+    which field to change.
+    """
+    try:
+        stream = c.oai.chat.completions.create(
+            model=c.model,
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=8, n=2, stream=True,
+        )
+        for _ in stream:
+            pass
+    except Exception as exc:  # noqa: BLE001 - the SDK's typed error is what we are classifying
+        kind, detail = classify(exc)
+        check("BadRequest" in kind or "400" in detail,
+              f"expected a 400 for n>1 with stream, got {kind}: {_short(detail)}")
+        check("n" in detail, f"400 does not name the parameter: {_short(detail)}")
+        return f"rejected as {kind}"
+    raise AssertionError("n>1 with stream:true was accepted; it must be refused, not silently "
+                         "reduced to one choice")
+
+
 def oai_logprobs(c: Ctx) -> str:
     r = c.oai.chat.completions.create(
         model=c.model,
@@ -560,6 +629,25 @@ def ant_structured(c: Ctx) -> str:
     return _short(json.dumps(data), 60)
 
 
+def ant_stop_sequence(c: Ctx) -> str:
+    """#459 follow-up. stop_reason must be "stop_sequence" and stop_sequence must name the match.
+
+    This is the row that proves the follow-up commit: the mapping used to detect a stop by testing
+    whether the returned text ENDS WITH a caller stop sequence, which worked only while stop
+    strings never fired. Once the engine began trimming the match, text-matching could no longer
+    find it, and the response would have reported end_turn with stop_sequence: null.
+    """
+    r = c.ant.messages.create(
+        model=c.model,
+        max_tokens=64,
+        messages=[{"role": "user", "content": "Reply with exactly: RED. GREEN. BLUE."}],
+        stop_sequences=["GREEN"],
+    )
+    check(r.stop_reason == "stop_sequence", f"stop_reason={r.stop_reason!r} (expected stop_sequence)")
+    check(r.stop_sequence == "GREEN", f"stop_sequence={r.stop_sequence!r} (expected 'GREEN')")
+    return f"stop_reason={r.stop_reason} stop_sequence={r.stop_sequence!r}"
+
+
 def ant_count_tokens(c: Ctx) -> str:
     r = c.ant.messages.count_tokens(
         model=c.model,
@@ -623,6 +711,9 @@ def build_rows() -> list[Row]:
         Row("openai/tool.parallel", "openai", "tool call (parallel)", "#450", oai_tool_parallel),
         Row("openai/json.object", "openai", "JSON output (json_object)", "—", oai_json_object),
         Row("openai/json.schema", "openai", "structured output (json_schema, strict)", "—", oai_json_schema),
+        Row("openai/stop.sequence", "openai", "stop string truncates generation", "#459", oai_stop_sequence),
+        Row("openai/n.choices", "openai", "n > 1 returns n choices", "#460", oai_n_choices),
+        Row("openai/n.stream.rejected", "openai", "n > 1 + stream is refused, not ignored", "#460", oai_n_streaming_rejected),
         Row("openai/logprobs", "openai", "logprobs + top_logprobs", "—", oai_logprobs),
         Row("openai/usage.nonstream", "openai", "token counting via usage (non-stream)", "—", oai_usage_nonstream),
         Row("openai/usage.stream", "openai", "token counting via stream_options.include_usage", "#450", oai_usage_stream),
@@ -637,6 +728,7 @@ def build_rows() -> list[Row]:
         Row("anthropic/messages.stream", "anthropic", "streaming (SSE event types)", "#448/#449", ant_stream),
         Row("anthropic/tool.single", "anthropic", "tool call (single, forced)", "#448", ant_tool_single),
         Row("anthropic/structured", "anthropic", "structured output (forced tool)", "#448", ant_structured),
+        Row("anthropic/stop.sequence", "anthropic", "stop_sequence reported on the response", "#459", ant_stop_sequence),
         Row("anthropic/count_tokens", "anthropic", "token counting via count_tokens", "#449", ant_count_tokens),
         Row("anthropic/usage", "anthropic", "usage on the message response", "#448", ant_usage),
         Row("anthropic/error.429", "anthropic", "429 → typed exception", "#452", ant_rate_limit),
