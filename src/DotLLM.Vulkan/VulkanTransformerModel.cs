@@ -2699,6 +2699,27 @@ public sealed class VulkanTransformerModel : IModel
         var posBytes = MemoryMarshal.AsBytes(packedPositions.AsSpan(0, totalTokens));
         _device.Upload(posBytes, _state.PositionsBuffer);
 
+        // #465: pre-warm the split-KV scratch for the LONGEST sequence in the batch, before the
+        // command buffer opens. EnsureScratch's safety argument assumes seqKv is constant within
+        // one forward — true for Forward, false here, because seqKv is read per sequence from its
+        // own cache below. Without this, a batch with ascending KV lengths grows the scratch
+        // mid-recording and vkResetDescriptorPool frees descriptor sets that dispatches already
+        // recorded for earlier sequences still reference: silent cross-sequence corruption that a
+        // pipeline barrier cannot fix. Pre-warming restores the invariant rather than weakening
+        // it — every later EnsureScratch call then takes its early-return path.
+        if (_splitKvAttention is { } splitKvPrewarm)
+        {
+            int maxSeqKv = 0;
+            for (int s = 0; s < simpleCount; s++)
+            {
+                var prewarmCache = (VulkanKvCache)requests[simpleIdx[s]].KvCache;
+                if (prewarmCache.CurrentLength > maxSeqKv)
+                    maxSeqKv = prewarmCache.CurrentLength;
+            }
+            if (maxSeqKv > 0)
+                splitKvPrewarm.PrewarmScratch(numHeads, maxSeqKv);
+        }
+
         // Begin the single per-batch command buffer.
         _submit.Begin();
         nint cmdBuf = _submit.CommandBuffer;

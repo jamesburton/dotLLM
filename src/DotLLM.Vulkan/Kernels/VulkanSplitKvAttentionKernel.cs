@@ -361,6 +361,34 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         VulkanApi.vkCmdDispatch(cmdBuf, (uint)numHeads, 1, 1);
     }
 
+    /// <summary>
+    /// Grows the scratch for the largest <paramref name="maxSeqKv"/> a batch will use, BEFORE the
+    /// command buffer opens. Call this once per forward when sequences may differ in KV length.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #465: <see cref="EnsureScratch"/>'s safety argument assumes <c>seqKv</c> — and therefore
+    /// <c>numSplits</c> — is constant within one forward. That holds for single-sequence
+    /// <c>Forward</c>. It is <b>false</b> for <c>ForwardBatch</c>, which reads
+    /// <c>seqKv = vkCache.CurrentLength</c> inside its per-sequence loop, so a batch whose
+    /// sequences have ascending KV lengths grows the scratch mid-recording and resets the
+    /// descriptor pool underneath dispatches already recorded for earlier sequences.
+    /// Continuous batching produces mixed KV lengths as its normal operating state, so this is
+    /// reachable in ordinary server use, not an edge case.
+    /// </para>
+    /// <para>
+    /// Pre-warming restores the invariant the comment in <see cref="EnsureScratch"/> relies on,
+    /// rather than weakening it: after this call the scratch is already large enough for every
+    /// sequence in the batch, so <see cref="EnsureScratch"/> takes its early-return path and
+    /// never reallocates during recording. This is the same discipline the other ~13
+    /// <c>EnsureCapacity</c> sites already follow.
+    /// </para>
+    /// </remarks>
+    /// <param name="numHeads">Attention head count for the forward.</param>
+    /// <param name="maxSeqKv">The largest KV length across every sequence in the batch.</param>
+    public void PrewarmScratch(int numHeads, int maxSeqKv)
+        => EnsureScratch(numHeads, ComputeSplits(maxSeqKv, numHeads));
+
     private void EnsureScratch(int numHeads, int numSplits)
     {
         // Size partOut by MaxHeadDim, NOT the call's headDim. Within one forward
@@ -371,6 +399,11 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         // (and resets the descriptor pool) MID command-buffer — which would free
         // descriptor sets already recorded for earlier layers of this forward.
         // The shaders index with the actual headDim, staying within the buffer.
+        //
+        // #465: the "seqKv is constant within one forward" half of that argument holds for
+        // Forward but NOT for ForwardBatch, whose per-sequence seqKv varies. Batched callers
+        // must call PrewarmScratch(numHeads, maxSeqKv) before opening the command buffer; this
+        // method then early-returns for every sequence and never resets the pool mid-recording.
         long needOut = (long)numHeads * numSplits * MaxHeadDim;
         long needMS  = (long)numHeads * numSplits * 2;
         if (_partOut is not null && needOut <= _partOutFloats && _partMS is not null && needMS <= _partMSFloats)
