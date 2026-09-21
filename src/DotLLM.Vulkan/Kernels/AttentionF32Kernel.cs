@@ -111,13 +111,22 @@ public sealed class AttentionF32Kernel : IDisposable
     /// <summary>True when this kernel dispatches the cooperative-matrix SPV.</summary>
     public bool UsesCooperativeMatrix => _mode == DispatchMode.Coopmat;
 
+    // Bytes per cached K/V element: 4 for the fp32 shaders, 2 for the _kvf16 variants. The buffer
+    // size checks in Record depend on it — an F16 store is half the size and would otherwise be
+    // rejected as "too small" (issue #437).
+    private readonly int _kvElementBytes;
+
+    /// <summary>True when this kernel dispatches the <c>_kvf16</c> SPVs, which read K/V as binary16.</summary>
+    public bool ReadsKvAsF16 => _kvElementBytes == sizeof(ushort);
+
     private AttentionF32Kernel(
         VulkanDevice device,
         VulkanModule sharedModule, ComputePipeline sharedPipeline,
         VulkanModule? subgroupModule, ComputePipeline? subgroupPipeline,
         VulkanModule? coopmatModule, ComputePipeline? coopmatPipeline,
-        nint pool, DispatchMode mode)
+        nint pool, DispatchMode mode, bool kvF16)
     {
+        _kvElementBytes = kvF16 ? sizeof(ushort) : sizeof(float);
         _device = device;
         _sharedModule = sharedModule;
         _sharedPipeline = sharedPipeline;
@@ -149,8 +158,25 @@ public sealed class AttentionF32Kernel : IDisposable
     /// builds keep working without the newer shaders.
     /// </remarks>
     public static AttentionF32Kernel Create(VulkanDevice device, string spvDir)
+        => Create(device, spvDir, kvF16: false);
+
+    /// <summary>
+    /// As <see cref="Create(VulkanDevice, string)"/>, but when <paramref name="kvF16"/> is set it
+    /// loads the <c>_kvf16</c> shader variants — identical kernels that read the K/V storage
+    /// buffers as IEEE-754 binary16 (two elements per uint) instead of fp32. Used by an F16
+    /// <see cref="VulkanNemotronHKvCache"/> (issue #437); the Q, output and push-constant
+    /// contracts are unchanged, so <see cref="Record"/> is identical for both.
+    /// </summary>
+    /// <remarks>
+    /// There is deliberately no <c>attention_f32_coopmat_kvf16.spv</c>: coopmat attention is
+    /// opt-in and measured slower on the reference hardware, so the F16 variant covers the two
+    /// modes that actually dispatch (subgroup, shared) and silently degrades from coopmat to
+    /// subgroup. That is a prefill-throughput caveat of the opt-in F16 mode, not a correctness one.
+    /// </remarks>
+    public static AttentionF32Kernel Create(VulkanDevice device, string spvDir, bool kvF16)
     {
-        string sharedPath = Path.Combine(spvDir, "attention_f32.spv");
+        string suffix = kvF16 ? "_kvf16" : "";
+        string sharedPath = Path.Combine(spvDir, $"attention_f32{suffix}.spv");
         if (!File.Exists(sharedPath))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {sharedPath}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
@@ -173,7 +199,7 @@ public sealed class AttentionF32Kernel : IDisposable
         bool subgroupAvailable = device.HasSubgroupArithmetic && !RmsNormF32Kernel.IsForceSharedReduce();
         if (subgroupAvailable)
         {
-            string subgroupPath = Path.Combine(spvDir, "attention_f32_sg.spv");
+            string subgroupPath = Path.Combine(spvDir, $"attention_f32_sg{suffix}.spv");
             if (File.Exists(subgroupPath))
             {
                 try
@@ -208,7 +234,7 @@ public sealed class AttentionF32Kernel : IDisposable
             && !RmsNormF32Kernel.IsForceSharedReduce();
         if (coopmatAvailable)
         {
-            string coopmatPath = Path.Combine(spvDir, "attention_f32_coopmat.spv");
+            string coopmatPath = Path.Combine(spvDir, $"attention_f32_coopmat{suffix}.spv");
             if (File.Exists(coopmatPath))
             {
                 try
@@ -241,7 +267,7 @@ public sealed class AttentionF32Kernel : IDisposable
             device, sharedModule, sharedPipeline,
             subgroupModule, subgroupPipeline,
             coopmatModule, coopmatPipeline,
-            pool, mode);
+            pool, mode, kvF16);
     }
 
     internal static bool IsUseCoopmat() =>
@@ -337,7 +363,7 @@ public sealed class AttentionF32Kernel : IDisposable
         if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
         long qBytes   = (long)seqQ  * numHeads   * headDim * sizeof(float);
-        long kvBytes  = (long)seqKv * numKvHeads * headDim * sizeof(float);
+        long kvBytes  = (long)seqKv * numKvHeads * headDim * _kvElementBytes;
         long outBytes = qBytes;
         if (q.Size      < qBytes)   throw new ArgumentException("Q buffer too small.",      nameof(q));
         if (k.Size      < kvBytes)  throw new ArgumentException("K buffer too small.",      nameof(k));

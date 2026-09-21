@@ -1,0 +1,45 @@
+#version 450
+// F32 -> F16 pack for the KV-cache write path (issue #437).
+//
+//   dst[dstPairOffset + p] = packHalf2x16(vec2(src[2p], src[2p+1]))
+//
+// The F32 KV cache appends with vkCmdCopyBuffer, which cannot convert. An F16
+// cache therefore needs a compute dispatch here instead of a transfer copy —
+// with the consequence that the barrier after the append is COMPUTE -> COMPUTE,
+// not TRANSFER -> COMPUTE (a transfer-stage source does not cover a shader
+// write, and getting that wrong is silent corruption rather than a validation
+// error). VulkanNemotronHKvCache.RecordPostUpdateBarrier owns that choice so the
+// three consuming models cannot pick the wrong one.
+//
+// Layout: source rows are [seqLen, kvStride] fp32, contiguous. Destination is
+// the cache's [capacity, kvStride] F16 store, two elements per uint. kvStride
+// (numKvHeads * headDim) is even for every model that can select this path, so a
+// row always starts on a uint boundary and no pair straddles two rows — the
+// caller is responsible for that invariant and the cache asserts it.
+//
+// packHalf2x16 is core GLSL (no extension, no device feature) and rounds to
+// nearest-even, matching the IEEE-754 binary16 conversion the CPU side would do.
+// Values outside the binary16 range (+-65504) saturate to infinity; K is
+// post-QK-norm and V is a projection output, both O(1) for the architectures
+// that reach here, but that is a property of the model, not of this kernel.
+//
+// Dispatch: one invocation per destination uint (pair of F32 source elements).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufSrc { float src[]; };  // [nPairs * 2] fp32
+layout(set = 0, binding = 1, std430) writeonly buffer BufDst { uint  dst[]; };  // F16 store, 2 per uint
+
+layout(push_constant) uniform PushConstants {
+    uint nPairs;         // number of uints to write = (seqLen * kvStride) / 2
+    uint srcPairOffset;  // first source pair to read  (in pairs, i.e. 2 floats each)
+    uint dstPairOffset;  // first destination uint to write
+} pc;
+
+void main() {
+    uint p = gl_GlobalInvocationID.x;
+    if (p >= pc.nPairs) return;
+
+    uint s = (pc.srcPairOffset + p) << 1u;
+    dst[pc.dstPairOffset + p] = packHalf2x16(vec2(src[s], src[s + 1u]));
+}

@@ -218,6 +218,13 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeSigmoidGatedAdd = moeSigmoidGatedAdd;
     }
 
+    /// <summary>
+    /// Directory the SPIR-V blobs were loaded from. Retained so a model holding this bundle can
+    /// build further kernel sets later — the F16 KV kernels are created on demand, only when an
+    /// F16 cache is actually requested (issue #437).
+    /// </summary>
+    public string SpvDir { get; private set; } = string.Empty;
+
     /// <param name="device">Device the pipelines are created on.</param>
     /// <param name="spvDir">Directory the compiled <c>.spv</c> shader modules are loaded from.</param>
     /// <param name="headDim">
@@ -350,7 +357,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         var moeScatter = MoeWeightedScatterF32Kernel.Create(device, spvDir);
         var moeSigmoidGatedAdd = MoeSigmoidGatedAddF32Kernel.Create(device, spvDir);
 
-        return new VulkanQwen3MoeHybridKernels(
+        var bundle = new VulkanQwen3MoeHybridKernels(
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
             matmulQ2K, matmulQ2KGemm,
             matmulQ3K, matmulQ3KGemm,
@@ -376,6 +383,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             sigGateMul,
             moeTopk, moeBroadcast, moeIndexed, moeIndexedQ6K, moeIndexedQ4K, moeIndexedQ5K,
             moeIndexedQ4KMmq, quantizeQ8_1Rows, moeIndexedQ5KMmq, moeScatter, moeSigmoidGatedAdd);
+        bundle.SpvDir = spvDir;
+        return bundle;
     }
 
     /// <summary>Invalidates every kernel's cached descriptor sets. Call after scratch buffers re-allocate.</summary>
