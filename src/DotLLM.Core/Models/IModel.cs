@@ -396,6 +396,24 @@ public interface IModel : IDisposable
     bool SupportsMtp => false;
 
     /// <summary>
+    /// Longest <c>tokenIds</c> length for which <c>Forward</c> returns a logit row per input
+    /// position rather than the last position's row alone. <see cref="int.MaxValue"/> (the default)
+    /// means the documented <c>[seq, vocab]</c> contract always holds.
+    /// </summary>
+    /// <remarks>
+    /// <para>This exists because a GPU backend can face a genuine conflict between the contract and
+    /// tractability: running a 248320-row LM head over a 2048-token prefill both dominates prefill
+    /// time and materialises a multi-gigabyte tensor no caller reads, so some backends compute the
+    /// head for the last row only. That is a deviation, and callers that index logits row-by-row
+    /// need to know its extent rather than discover it by reading past the end of the buffer.</para>
+    /// <para><b>Probe with a short sequence and you will be told the wrong thing.</b> A model that
+    /// returns all rows up to some bound looks fully conformant to a two-token probe and is not, so
+    /// any caller deciding between an "all rows in one pass" and a "row at a time" strategy must
+    /// consult this in addition to measuring — see <c>BackendPerplexityModel.Probe</c>.</para>
+    /// </remarks>
+    int MaxAllRowLogitsLength => int.MaxValue;
+
+    /// <summary>
     /// Allocates a fresh <see cref="IMtpState"/> — the MTP head's own tiny KV-cache plus pending
     /// hidden-state handoff — or <see langword="null"/> when <see cref="SupportsMtp"/> is
     /// <see langword="false"/>. The caller owns the returned state's lifetime (one per in-flight

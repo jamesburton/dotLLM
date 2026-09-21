@@ -221,7 +221,7 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
             outputW, outputDeviceQt, outputOutputDim, outputInputDim, totalBytes);
     }
 
-    private static DenseFfnLayerBuffers UploadDenseFfnLayer(
+    internal static DenseFfnLayerBuffers UploadDenseFfnLayer(
         VulkanDevice device, VulkanStagingBuffer staging,
         Qwen3HybridDenseLayerWeights lw, out long uploadedBytes)
     {
