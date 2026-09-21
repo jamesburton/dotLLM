@@ -76,12 +76,58 @@ data: [DONE]
 Raw completion (no chat template). Same sampling parameters. Input is `prompt` (string) instead of `messages`.
 
 ### `POST /v1/embeddings`
-Extract embedding vectors from text.
+Extract embedding vectors from text (#451).
 
-**Request**: `{"input": "text to embed", "model": "..."}`
-**Response**: `{"data": [{"embedding": [0.1, -0.2, ...], "index": 0}]}`
+> **Backend coverage: CPU only.** The pooled hidden state comes from
+> `IEmbeddingModel.ForwardHidden`, which only the CPU `TransformerModel` implements. When a
+> Vulkan or CUDA model is loaded the endpoint returns **501 Not Implemented** with a message
+> naming the model type, rather than silently returning an unvalidated vector. A GPU path is a
+> follow-on, not a blocker.
 
-Implementation: Run input through the model, capture hidden state at `PreLmHead` hook point, apply pooling (mean pool over tokens by default, configurable), L2 normalize. Minimal additional code given the hook system.
+**Request**
+
+| field | type | notes |
+|---|---|---|
+| `input` | string \| string[] \| int[] \| int[][] | Required. A flat int array is **one** pre-tokenised sequence; a nested one is many. Pre-tokenised ids are range-checked against the vocabulary. |
+| `model` | string | Optional. Activates that model (same semantics as `/v1/chat/completions`). |
+| `encoding_format` | `"float"` (default) \| `"base64"` | `base64` is the raw little-endian float32 payload, base64-encoded — what the OpenAI SDK's numpy path decodes. |
+| `pooling` | `"last"` \| `"mean"` \| `"cls"` | dotLLM extension, mirrors llama.cpp's `--pooling`. Omit to use the model default. |
+| `normalize` | bool, default `true` | dotLLM extension. `true` is L2 / Euclidean, matching llama.cpp's `--embd-normalize 2` default and OpenAI's unit-norm vectors. |
+| `dimensions` | — | **Rejected with 400.** dotLLM returns the model's full hidden size; there is no Matryoshka truncation. |
+
+**Response**
+
+```json
+{"object": "list",
+ "data": [{"object": "embedding", "index": 0, "embedding": [0.1, -0.2, "..."]}],
+ "model": "smollm2-135m-instruct",
+ "usage": {"prompt_tokens": 21, "total_tokens": 21}}
+```
+
+`data[i]` corresponds to `input[i]`. `usage.prompt_tokens` is the sum of the per-item token counts.
+
+**Implementation.** Each input item is its own forward pass with positions `0..n-1` (the CPU
+forward has no per-sequence attention mask, so sequences are not packed), stopping after the final
+output norm and before the LM head — the tensor llama.cpp names `result_norm` and assigns to
+`res->t_embd`, which is what its own pooling operates on. The whole request runs under the
+server's request gate, because the model's scratch buffers are shared mutable state.
+
+**Pooling default.** Precedence is: explicit `pooling` → the checkpoint's GGUF
+`{arch}.pooling_type` → `last`. The GGUF value is llama.cpp's raw `llama_pooling_type` enum
+(`0=none, 1=mean, 2=cls, 3=last, 4=rank`) and is mapped value-for-value. The final fallback is a
+**deliberate deviation** from llama.cpp, whose `hparams.pooling_type` defaults to `NONE` when the
+key is absent: `NONE` means one vector per token and is not representable in an OpenAI embeddings
+response. `last` is the right default for a causal decoder — the last token is the only position
+that has attended to the whole sequence — and is what llama.cpp's own tooling makes you pass
+(`--pooling last`) to embed a generative model. A checkpoint that *declares* `none` or `rank` is
+honoured rather than rewritten: the request fails with a 400 telling the caller to pass `pooling`
+explicitly.
+
+**Correctness.** Anchored against llama.cpp, not against itself: reference vectors are captured
+from `llama-server --embeddings` on the same GGUF (`tests/scripts/capture-llamacpp-embeddings.ps1`,
+committed with full provenance) and compared by cosine similarity in
+`EmbeddingLlamaCppParityTests`. See that test's remarks for the measured correct-vs-broken
+separation the tolerance is derived from.
 
 ### `GET /v1/models`
 Lists every **resident** model — the active one plus any stashed-but-loaded models (#369):
