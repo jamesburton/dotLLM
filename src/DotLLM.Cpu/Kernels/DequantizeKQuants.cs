@@ -54,6 +54,39 @@ public static unsafe partial class Dequantize
         }
     }
 
+    /// <summary>
+    /// Unpacks Q3_K's 12 packed scale bytes into 16 <b>unsigned</b> 6-bit sub-block scales.
+    /// Callers apply the format's bias themselves: the signed scale is <c>dest16[sub] - 32</c>.
+    /// </summary>
+    /// <remarks>
+    /// Per llama.cpp <c>ggml-quants.c dequantize_row_q3_K</c> (the 32-bit <c>aux</c>/<c>kmask</c>
+    /// shuffle, written out per sub-block):
+    /// <code>
+    ///   scales[ 0+b] = (s[  b] &amp; 0xF) | (((s[8+b] >> 0) &amp; 3) &lt;&lt; 4)
+    ///   scales[ 4+b] = (s[4+b] &amp; 0xF) | (((s[8+b] >> 2) &amp; 3) &lt;&lt; 4)
+    ///   scales[ 8+b] = (s[  b] >>  4)  | (((s[8+b] >> 4) &amp; 3) &lt;&lt; 4)
+    ///   scales[12+b] = (s[4+b] >>  4)  | (((s[8+b] >> 6) &amp; 3) &lt;&lt; 4)     for b in 0..3
+    /// </code>
+    /// i.e. the low nibble comes from bytes 0..7 (low nibble for sub 0..7, high nibble for
+    /// sub 8..15) and the high 2 bits from byte <c>8 + (sub % 4)</c> at shift <c>2 * (sub / 4)</c>.
+    /// That byte/shift pair is <b>transposed</b> relative to the obvious-looking
+    /// <c>8 + sub/4 @ (sub%4)*2</c>; getting it the wrong way round scrambles 12 of the 16
+    /// sub-blocks. Shared by the dequantizer and the Q3_K × Q8_K dots so the two cannot drift.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void UnpackQ3KScales(byte* scales12, byte* dest16)
+    {
+        for (int sub = 0; sub < 16; sub++)
+        {
+            int lowSrcByte = sub < 8 ? sub : sub - 8;  // sub 8..15 → bytes 0..7 high nibble
+            int lowNibble = sub < 8 ? scales12[lowSrcByte] & 0x0F : (scales12[lowSrcByte] >> 4) & 0x0F;
+            int hiByte = 8 + (sub % 4);
+            int hiShift = (sub / 4) * 2;
+            int hiBits = (scales12[hiByte] >> hiShift) & 0x03;
+            dest16[sub] = (byte)(lowNibble | (hiBits << 4));
+        }
+    }
+
     // ──────────────────── Q6_K ────────────────────
 
     /// <summary>
@@ -295,7 +328,7 @@ public static unsafe partial class Dequantize
         long numBlocks = elementCount / KQuantGroupSize;
         byte* blockBase = (byte*)src;
         long destOffset = 0;
-        Span<byte> scales = stackalloc byte[16];
+        byte* scales = stackalloc byte[16];
 
         for (long b = 0; b < numBlocks; b++)
         {
@@ -305,26 +338,7 @@ public static unsafe partial class Dequantize
             ushort dHalf = *(ushort*)(blockBase + 32 + 64 + 12);
             float d = (float)BitConverter.UInt16BitsToHalf(dHalf);
 
-            // Unpack 12 bytes → 16 unsigned 6-bit scales (then biased by -32).
-            // Per llama.cpp ggml-quants.c dequantize_row_q3_K (the `aux` shuffle):
-            //   scales[ 0+b] = (s[  b] & 0xF) | (((s[8+b] >> 0) & 3) << 4)
-            //   scales[ 4+b] = (s[4+b] & 0xF) | (((s[8+b] >> 2) & 3) << 4)
-            //   scales[ 8+b] = (s[  b] >> 4)  | (((s[8+b] >> 4) & 3) << 4)
-            //   scales[12+b] = (s[4+b] >> 4)  | (((s[8+b] >> 6) & 3) << 4)   for b in 0..3
-            // i.e. the low nibble comes from bytes 0..7 (low nibble for sub 0..7,
-            // high nibble for sub 8..15) and the high 2 bits come from
-            // byte 8 + (sub % 4) at shift 2 * (sub / 4). The byte/shift pair is
-            // TRANSPOSED relative to the obvious-looking 8 + sub/4 @ (sub%4)*2 —
-            // getting it the wrong way round scrambles 12 of the 16 sub-blocks.
-            for (int sub = 0; sub < 16; sub++)
-            {
-                int lowSrcByte = sub < 8 ? sub : sub - 8;  // sub 8..15 → bytes 0..7 high nibble
-                int lowNibble = sub < 8 ? scales12[lowSrcByte] & 0x0F : (scales12[lowSrcByte] >> 4) & 0x0F;
-                int hiByte = 8 + (sub % 4);
-                int hiShift = (sub / 4) * 2;
-                int hiBits = (scales12[hiByte] >> hiShift) & 0x03;
-                scales[sub] = (byte)(lowNibble | (hiBits << 4));
-            }
+            UnpackQ3KScales(scales12, scales);
 
             // 16 sub-blocks × 16 elements = 256 elements per super-block.
             //

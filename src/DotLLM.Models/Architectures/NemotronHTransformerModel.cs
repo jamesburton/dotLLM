@@ -1127,6 +1127,12 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             case QuantizationType.Q5_0:
                 MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
                 return;
+            case QuantizationType.Q2_K:
+                MatMul.GemmQ2_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                return;
+            case QuantizationType.Q3_K:
+                MatMul.GemmQ3_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                return;
             case QuantizationType.Q4_K:
                 MatMul.GemmQ4_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
                 return;
@@ -1162,7 +1168,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static byte* QuantizeInput(float* input, byte* scratch, int dim, int seqLen, QuantizationType qt)
     {
-        if (qt == QuantizationType.Q4_K || qt == QuantizationType.Q5_K || qt == QuantizationType.Q6_K)
+        if (MatMul.UsesQ8KDot(qt))
         {
             int blockCount = dim / 256;
             int q8kRowBytes = blockCount * MatMul.Q8_K_BlockBytes;
