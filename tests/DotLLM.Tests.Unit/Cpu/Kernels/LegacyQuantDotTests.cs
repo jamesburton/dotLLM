@@ -193,6 +193,44 @@ public sealed unsafe class LegacyQuantDotTests
     }
 
     /// <summary>
+    /// The AVX2 4-rows-per-lane kernel — the one <c>ComputeRowsLegacyQuant</c> actually dispatches
+    /// on AVX2 hardware — against the scalar dot per row, bit for bit. It reduces each block
+    /// exactly and does its float work four-wide in block order, so unlike the AVX2 single-row
+    /// kernel it is bit-exact; asserting that here is what makes the dispatch tests' tolerance
+    /// bound a formality rather than a hiding place.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(FormatsAndBlockCounts))]
+    public void Avx2Tier_4Rows_BitExactWithScalarPerRow(QuantizationType qt, int blockCount)
+    {
+        Skip.IfNot(Avx2.IsSupported, "needs AVX2");
+        var rng = new Random(4915 + (int)qt * 31 + blockCount);
+        int rowBytes = blockCount * BlockBytes(qt);
+        byte* w = (byte*)NativeMemory.Alloc((nuint)(4 * rowBytes));
+        byte* x = (byte*)NativeMemory.Alloc((nuint)(blockCount * Q81Bytes));
+        float* res = stackalloc float[4];
+        try
+        {
+            for (int r = 0; r < 4; r++) FillWeightRow(rng, qt, w + r * rowBytes, blockCount, unitScales: false);
+            QuantizedQ8_1Row(rng, x, blockCount);
+
+            MatMul.VecDotLegacyQuantAvx2_4Rows(qt, w, rowBytes, x, blockCount, res);
+            for (int r = 0; r < 4; r++)
+                AssertBitEqual(MatMul.VecDotLegacyQuantScalar(qt, w + r * rowBytes, x, blockCount), res[r],
+                    $"{qt} AVX2 4-rows r={r} bc={blockCount}");
+
+            if (Ssse3.IsSupported)
+            {
+                float* sseRes = stackalloc float[4];
+                MatMul.VecDotLegacyQuantSse_4Rows(qt, w, rowBytes, x, blockCount, sseRes);
+                for (int r = 0; r < 4; r++)
+                    AssertBitEqual(sseRes[r], res[r], $"{qt} AVX2 vs SSE 4-rows r={r} bc={blockCount}");
+            }
+        }
+        finally { NativeMemory.Free(w); NativeMemory.Free(x); }
+    }
+
+    /// <summary>
     /// The IQ4_NL sign trick needs PSIGN's operand never to be −128. That is a property of
     /// <see cref="MatMul.QuantizeF32ToQ8_1"/>, not of the kernel, so it is pinned here — including
     /// the inputs most likely to round to −128 (an exact negative maximum).

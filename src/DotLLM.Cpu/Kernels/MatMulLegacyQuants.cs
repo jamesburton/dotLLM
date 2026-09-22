@@ -311,6 +311,82 @@ public static unsafe partial class MatMul
         => VecDotLegacyAvx2(QuantizationType.IQ4_NL, w, q8, blockCount);
 
 
+    /// <summary>
+    /// Folds four 8-lane int vectors into one 4-lane vector holding their four totals — exact,
+    /// and the AVX2 counterpart of <see cref="Reduce4"/>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<int> Reduce4Avx2(Vector256<int> a, Vector256<int> b,
+        Vector256<int> c, Vector256<int> d)
+    {
+        Vector256<int> ab = Avx2.HorizontalAdd(a, b);
+        Vector256<int> cd = Avx2.HorizontalAdd(c, d);
+        Vector256<int> abcd = Avx2.HorizontalAdd(ab, cd);
+        return Sse2.Add(abcd.GetLower(), abcd.GetUpper());
+    }
+
+    /// <summary>
+    /// Four rows at once with one <em>row</em> per 32-bit lane: the Q8_1 block is loaded once for
+    /// all four, the four block sums are folded into one vector, and every float operation runs
+    /// four-wide. That amortizes the three per-block Half conversions and breaks the serial
+    /// offset-accumulator chain that make the single-row kernel 3–4x slower per block — measured
+    /// on Zen 5 at the SmolLM-135M ffn_gate shape.
+    ///
+    /// <para>Bit-exact per row with <see cref="VecDotLegacyQuantScalar"/>, like the 128-bit
+    /// 4-row kernel and unlike the single-row AVX2 kernel.</para>
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void VecDotLegacyQuantAvx2_4Rows(QuantizationType qt, byte* w, nint rowStride,
+        byte* q8, int blockCount, float* results)
+    {
+        int blockBytes = LegacyBlockBytes(qt);
+        bool hasMin = qt is QuantizationType.Q4_1 or QuantizationType.Q5_1;
+        bool isIq4 = qt == QuantizationType.IQ4_NL;
+        Vector256<short> ones = Vector256.Create((short)1);
+        Vector256<sbyte> lut = Iq4NlLutAvx2;
+
+        Vector128<float> acc = Vector128<float>.Zero;
+        Vector128<float> off = Vector128<float>.Zero;
+
+        for (int block = 0; block < blockCount; block++)
+        {
+            byte* wb = w + block * blockBytes;
+            byte* xb = q8 + block * Q8_1BlockBytes;
+            Vector256<sbyte> q8v = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb + 4);
+
+            Vector128<int> s = Reduce4Avx2(
+                LegacyBlockDotAvx2(qt, wb, q8v, lut, ones, isIq4),
+                LegacyBlockDotAvx2(qt, wb + rowStride, q8v, lut, ones, isIq4),
+                LegacyBlockDotAvx2(qt, wb + 2 * rowStride, q8v, lut, ones, isIq4),
+                LegacyBlockDotAvx2(qt, wb + 3 * rowStride, q8v, lut, ones, isIq4));
+
+            Vector128<float> d = HalfToSingleSse2(LoadHalf4(wb, rowStride));
+            Vector128<float> d8 = HalfToSingleSse2(Vector128.Create((int)Unsafe.ReadUnaligned<ushort>(xb)));
+            acc = Sse.Add(acc, Sse.Multiply(Sse.Multiply(d, d8), Sse2.ConvertToVector128Single(s)));
+
+            if (isIq4) continue;
+            Vector128<float> offd = hasMin ? HalfToSingleSse2(LoadHalf4(wb + 2, rowStride)) : d;
+            Vector128<float> s8 = HalfToSingleSse2(Vector128.Create((int)Unsafe.ReadUnaligned<ushort>(xb + 2)));
+            off = Sse.Add(off, Sse.Multiply(offd, s8));
+        }
+
+        Vector128<float> result = isIq4 ? acc
+            : hasMin ? Sse.Add(acc, off)
+            : Sse.Subtract(acc, Sse.Multiply(Vector128.Create(8.0f), off));
+        Unsafe.WriteUnaligned(results, result);
+    }
+
+    /// <summary>Exact int32 lane partials of one block's <c>Σ q·q8</c> for <paramref name="qt"/>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<int> LegacyBlockDotAvx2(QuantizationType qt, byte* wb, Vector256<sbyte> q8v,
+        Vector256<sbyte> lut, Vector256<short> ones, bool isIq4)
+    {
+        Vector256<byte> q = UnpackLegacyAvx2(qt, wb, lut, out Vector256<sbyte> signSrc);
+        if (isIq4) q8v = Avx2.Sign(q8v, signSrc);
+        return Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(q, q8v), ones);
+    }
+
     // ──────────────────── Tier selection ────────────────────
 
     /// <summary>Best available single-row dot for <paramref name="qt"/> (AVX2, then SSSE3, then scalar).</summary>
@@ -360,14 +436,24 @@ public static unsafe partial class MatMul
     {
         nint rowBytes = (nint)blockCount * LegacyBlockBytes(qt);
 
-        if (!Avx2.IsSupported && Ssse3.IsSupported)
+        if (Avx2.IsSupported)
+        {
+            int row = 0;
+            for (; row + 3 < m; row += 4)
+                VecDotLegacyQuantAvx2_4Rows(qt, weights + row * rowBytes, rowBytes, xQ8, blockCount, result + row);
+            for (; row < m; row++)
+                result[row] = VecDotLegacyAvx2(qt, weights + row * rowBytes, xQ8, blockCount);
+            return;
+        }
+
+        if (Ssse3.IsSupported)
         {
             ComputeRowsLegacyQuantSse(qt, weights, xQ8, result, m, blockCount);
             return;
         }
 
         for (int row = 0; row < m; row++)
-            result[row] = VecDotLegacyQuantRow(qt, weights + row * rowBytes, xQ8, blockCount);
+            result[row] = VecDotLegacyQuantScalar(qt, weights + row * rowBytes, xQ8, blockCount);
     }
 
     /// <summary>Token columns a multi-column step folds together — one weight unpack feeds all of them.</summary>
