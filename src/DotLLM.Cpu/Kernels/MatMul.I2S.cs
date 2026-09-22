@@ -145,7 +145,15 @@ public static unsafe partial class MatMul
     /// </summary>
     private static readonly bool I2SUseW2A8Enabled = ResolveI2SUseW2A8();
 
-    private static bool I2SUseW2A8 => I2SUseW2A8Enabled;
+    private static bool I2SUseW2A8 => I2SUseW2A8Override ?? I2SUseW2A8Enabled;
+
+    /// <summary>
+    /// In-process override of <see cref="I2SUseW2A8Enabled"/> (tests only; read per call). A test whose
+    /// oracle must be the exact float (W2A16) reference pins this to <c>false</c>, so the reference does
+    /// not silently become the int8-activation tier on hardware where it is available (issue #487 —
+    /// #477 enabled W2A8 down to SSSE3, which moved this oracle on pre-AVX2 CUDA boxes).
+    /// </summary>
+    internal static bool? I2SUseW2A8Override { get; set; }
 
     private static bool ResolveI2SUseW2A8()
     {

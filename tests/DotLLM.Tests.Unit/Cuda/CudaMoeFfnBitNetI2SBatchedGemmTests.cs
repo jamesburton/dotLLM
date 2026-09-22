@@ -44,6 +44,10 @@ public sealed class CudaMoeFfnBitNetI2SBatchedGemmTests : IDisposable
 
     public CudaMoeFfnBitNetI2SBatchedGemmTests()
     {
+        // #487: the CPU oracle must be the exact float (W2A16) I2_S reference. #477 enabled the
+        // int8-activation W2A8 tier down to SSSE3, which on a pre-AVX2 CUDA box (the T5500) moved the
+        // oracle itself and broke this CUDA-vs-CPU tolerance by ~1e-3. Pin the reference tier here.
+        MatMul.I2SUseW2A8Override = false;
         if (!CudaDevice.IsAvailable()) return;
         _ctx = CudaContext.Create(0);
         _stream = CudaStream.Create();
@@ -56,6 +60,7 @@ public sealed class CudaMoeFfnBitNetI2SBatchedGemmTests : IDisposable
 
     public void Dispose()
     {
+        MatMul.I2SUseW2A8Override = null;
         _kernels?.Dispose();
         _cublas?.Dispose();
         _stream?.Dispose();
