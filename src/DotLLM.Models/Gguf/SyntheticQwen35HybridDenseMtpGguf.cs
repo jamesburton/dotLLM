@@ -82,10 +82,24 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     /// context exceeds a backend's all-row-logits bound (also 16), so that a test can assert the
     /// behaviour on BOTH sides of that bound; every other caller keeps the default.
     /// </param>
+    /// <param name="gdnKeyHeads">
+    /// Overrides the GDN key-head count (<c>ssm.group_count</c>, default 1). Issue #479 needs
+    /// <c>NKHead &gt;= 2</c>: with a single key head the PrismML <c>gdn_v_grouped</c> tiled→grouped
+    /// value-head permute is the identity, so a test on the default fixture cannot tell a missing
+    /// permute from a correct one.
+    /// </param>
+    /// <param name="gdnValueHeads">
+    /// Overrides the GDN value-head count (<c>ssm.time_step_rank</c>, default 2). Must be a multiple
+    /// of <paramref name="gdnKeyHeads"/>.
+    /// </param>
     public static byte[] Build(uint seed = 0xC0FFEEu, bool withMtp = true, bool mtpHasOwnHeadTensors = true,
         int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount,
-        int contextLength = ContextLength)
+        int contextLength = ContextLength, int gdnKeyHeads = NKHead, int gdnValueHeads = NVHead)
     {
+        if (gdnKeyHeads <= 0 || gdnValueHeads <= 0 || gdnValueHeads % gdnKeyHeads != 0)
+            throw new ArgumentException(
+                $"GDN value heads ({gdnValueHeads}) must be a positive multiple of key heads ({gdnKeyHeads}).");
+
         var w = new GgufWriter();
         var rng = new SyntheticGemma4Gguf.Xorshift(seed);
         const string arch = "qwen35";
@@ -119,10 +133,10 @@ public static class SyntheticQwen35HybridDenseMtpGguf
             w.AddUInt32($"{arch}.nextn_predict_layers", 1);
 
         // GDN ({arch}.ssm.* reused with qwen35 semantics — see TryExtractGdnConfig).
-        w.AddUInt32($"{arch}.ssm.inner_size", DInner);
+        w.AddUInt32($"{arch}.ssm.inner_size", (uint)(gdnValueHeads * DState));
         w.AddUInt32($"{arch}.ssm.state_size", DState);
-        w.AddUInt32($"{arch}.ssm.time_step_rank", NVHead);
-        w.AddUInt32($"{arch}.ssm.group_count", NKHead);
+        w.AddUInt32($"{arch}.ssm.time_step_rank", (uint)gdnValueHeads);
+        w.AddUInt32($"{arch}.ssm.group_count", (uint)gdnKeyHeads);
         w.AddUInt32($"{arch}.ssm.conv_kernel", DConv);
 
         AddTokenizer(w);
@@ -145,7 +159,7 @@ public static class SyntheticQwen35HybridDenseMtpGguf
             if (fullAttn)
                 AddFullAttnLayer(w, rng, p);
             else
-                AddGdnLayer(w, rng, p);
+                AddGdnLayer(w, rng, p, gdnKeyHeads, gdnValueHeads);
 
             AddDenseFfnLayer(w, rng, p);
         }
@@ -176,9 +190,10 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     /// <summary>Writes the synthetic fixture to <paramref name="path"/>.</summary>
     public static string Write(string path, uint seed = 0xC0FFEEu, bool withMtp = true, bool mtpHasOwnHeadTensors = true,
         int fullAttnInterval = FullAttnInterval, int blockCount = BlockCount,
-        int contextLength = ContextLength)
+        int contextLength = ContextLength, int gdnKeyHeads = NKHead, int gdnValueHeads = NVHead)
     {
-        File.WriteAllBytes(path, Build(seed, withMtp, mtpHasOwnHeadTensors, fullAttnInterval, blockCount, contextLength));
+        File.WriteAllBytes(path, Build(seed, withMtp, mtpHasOwnHeadTensors, fullAttnInterval, blockCount, contextLength,
+            gdnKeyHeads, gdnValueHeads));
         return path;
     }
 
@@ -186,10 +201,11 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     /// GDN (Gated DeltaNet) token-mixing tensors. Note: NO attn_output.weight — GDN layers have
     /// no attention output projection.
     /// </summary>
-    private static void AddGdnLayer(GgufWriter w, SyntheticGemma4Gguf.Xorshift rng, string p)
+    private static void AddGdnLayer(GgufWriter w, SyntheticGemma4Gguf.Xorshift rng, string p,
+        int nKHead, int nVHead)
     {
-        int gdnKDim = NKHead * DState;
-        int gdnVDim = NVHead * DState;
+        int gdnKDim = nKHead * DState;
+        int gdnVDim = nVHead * DState;
         int qkvOut = 2 * gdnKDim + gdnVDim;
         int convDim = qkvOut; // (2*NKHead + NVHead) * DState
 
@@ -197,20 +213,20 @@ public static class SyntheticQwen35HybridDenseMtpGguf
         AddMatrixF32(w, rng, $"{p}.attn_gate.weight", inK: HiddenSize, outM: gdnVDim, 0.05f);
 
         // ssm_a: per-V-head decay base — must be negative (exp(a·dt) < 1).
-        var a = new float[NVHead];
-        for (int i = 0; i < NVHead; i++) a[i] = -0.5f + rng.NextSigned(0.25f);
-        AddF32Tensor(w, $"{p}.ssm_a", [NVHead], a);
+        var a = new float[nVHead];
+        for (int i = 0; i < nVHead; i++) a[i] = -0.5f + rng.NextSigned(0.25f);
+        AddF32Tensor(w, $"{p}.ssm_a", [nVHead], a);
 
-        AddMatrixF32(w, rng, $"{p}.ssm_alpha.weight", inK: HiddenSize, outM: NVHead, 0.05f);
-        AddMatrixF32(w, rng, $"{p}.ssm_beta.weight", inK: HiddenSize, outM: NVHead, 0.05f);
+        AddMatrixF32(w, rng, $"{p}.ssm_alpha.weight", inK: HiddenSize, outM: nVHead, 0.05f);
+        AddMatrixF32(w, rng, $"{p}.ssm_beta.weight", inK: HiddenSize, outM: nVHead, 0.05f);
 
         var conv = new float[DConv * convDim];
         for (int i = 0; i < conv.Length; i++) conv[i] = rng.NextSigned(0.1f);
         AddF32Tensor(w, $"{p}.ssm_conv1d.weight", [DConv, convDim], conv);
 
-        var dtBias = new float[NVHead];
-        for (int i = 0; i < NVHead; i++) dtBias[i] = rng.NextSigned(0.1f);
-        AddF32Tensor(w, $"{p}.ssm_dt.bias", [NVHead], dtBias);
+        var dtBias = new float[nVHead];
+        for (int i = 0; i < nVHead; i++) dtBias[i] = rng.NextSigned(0.1f);
+        AddF32Tensor(w, $"{p}.ssm_dt.bias", [nVHead], dtBias);
 
         AddNorm(w, rng, $"{p}.ssm_norm.weight", DState);
         AddMatrixF32(w, rng, $"{p}.ssm_out.weight", inK: gdnVDim, outM: HiddenSize, 0.05f);
