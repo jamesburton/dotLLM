@@ -64,7 +64,17 @@ public sealed class CudaBonsai2RealCheckpointTests
             "Bonsai 2 MTP checkpoint not found (set DOTLLM_BONSAI2_MTP_GGUF or populate the HF hub cache).");
         string ptxDir = SkipUnlessCudaWithFwht();
 
-        var cuda = RunCudaGreedy(path!, ptxDir);
+        Run cuda;
+        try
+        {
+            // The F16-activation path, whatever DOTLLM_CUDA_PQ2_0_DP4A says (the dp4a run is its own test).
+            CudaSmallSGemvDispatch.Dp4aOverride = false;
+            cuda = RunCudaGreedy(path!, ptxDir);
+        }
+        finally
+        {
+            CudaSmallSGemvDispatch.Dp4aOverride = null;
+        }
         _out.WriteLine($"cuda greedy:  {string.Join(",", cuda.Tokens)}");
         _out.WriteLine($"cuda top-2 gaps: {string.Join(",", cuda.Gaps.Select(g => g.ToString("E3")))}");
 

@@ -89,6 +89,16 @@ public static class CudaSmallSGemvDispatch
     internal static bool? Dp4aOverride { get; set; }
 
     /// <summary>
+    /// Whether projections reading the same input share one dp4a activation quantization (default
+    /// true). Only <see cref="ShareDp4aInputOverride"/> turns it off — a test A/B whose results must be
+    /// bit-identical, proving the shared scratch is never stale.
+    /// </summary>
+    public static bool ShareDp4aInputs => ShareDp4aInputOverride ?? true;
+
+    /// <summary>In-process override of <see cref="ShareDp4aInputs"/> (tests only).</summary>
+    internal static bool? ShareDp4aInputOverride { get; set; }
+
+    /// <summary>
     /// Whether a PQ2_0 projection over <paramref name="seqLen"/> token rows should take the dp4a
     /// GEMV (given that its kernels are loaded): <c>seqLen == 1</c>, or the multi-column range
     /// <c>2..</c><see cref="MaxColumns"/>, when <see cref="UseDp4a"/> is on.

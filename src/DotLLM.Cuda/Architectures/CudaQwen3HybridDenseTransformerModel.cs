@@ -96,6 +96,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private long _activQ8InScratchElems;
     private nint _activQ8MetaScratch;
     private bool _warnedNoPQ2_0GemvDp4a;
+    private int _dp4aGemvLaunches;      // test-visible launch counters (Dp4aLaunchCounts)
+    private int _dp4aQuantizeLaunches;
 #if DEBUG
     // What _activQ8InScratch currently holds — checked when a caller claims it pre-quantized x.
     private (nint X, int K, int SeqLen) _dp4aQuantizedFor;
@@ -3281,6 +3283,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             if (xQuantized) AssertDp4aQuantizedFor(x, k, seqLen);
             else QuantizeDp4aInput(x, k, seqLen);
             _kernels.LaunchPQ2_0GemvDp4a(weight, _activQ8InScratch, _activQ8MetaScratch, y, m, k, seqLen, streamH);
+            _dp4aGemvLaunches++;
             return;
         }
 
@@ -3426,7 +3429,21 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// both take the dp4a path and have the same input width.
     /// </summary>
     private bool SharesDp4aInput(QuantizationType qtA, QuantizationType qtB, int kA, int kB, int seqLen)
+        => CudaSmallSGemvDispatch.ShareDp4aInputs && BothDp4a(qtA, qtB, kA, kB, seqLen);
+
+    /// <summary>Whether both projections of a pair take the dp4a path with the same input width.</summary>
+    private bool BothDp4a(QuantizationType qtA, QuantizationType qtB, int kA, int kB, int seqLen)
         => kA == kB && Dp4aActive(qtA, seqLen) && Dp4aActive(qtB, seqLen);
+
+    /// <summary>
+    /// Test hook (issue #485): dp4a GEMV and quantizer launches since the last
+    /// <see cref="ResetDp4aLaunchCounts"/>, so a test can prove the same projections take the dp4a path
+    /// at every seqLen (coverage) and that input sharing removes quantize launches.
+    /// </summary>
+    internal (int Gemv, int Quantize) Dp4aLaunchCounts => (_dp4aGemvLaunches, _dp4aQuantizeLaunches);
+
+    /// <summary>Resets <see cref="Dp4aLaunchCounts"/>.</summary>
+    internal void ResetDp4aLaunchCounts() => (_dp4aGemvLaunches, _dp4aQuantizeLaunches) = (0, 0);
 
     /// <summary>
     /// Quantizes <paramref name="x"/> (<c>[seqLen, k]</c> F32) into the dp4a int8 scratch (issue #485).
@@ -3438,6 +3455,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         int elems = checked(seqLen * k);
         EnsureActivQ8InScratch(elems);
         _kernels.LaunchPQ2_0Dp4aQuantizeX(x, _activQ8InScratch, _activQ8MetaScratch, elems, _stream.Handle);
+        _dp4aQuantizeLaunches++;
 #if DEBUG
         _dp4aQuantizedFor = (x, k, seqLen);
 #endif
@@ -3500,13 +3518,18 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     {
         // #485: with the dp4a GEMV on, a pair sharing one input quantizes it once and launches twice —
         // for S = 1 and for the 2..8-row verify widths alike.
-        if (SharesDp4aInput(qt0, qt1, k0, k1, seqLen))
+        if (BothDp4a(qt0, qt1, k0, k1, seqLen))
         {
-            if (xQuantized) AssertDp4aQuantizedFor(x, k0, seqLen);
+            // Sharing off (a test-only A/B, CudaSmallSGemvDispatch.ShareDp4aInputOverride) re-quantizes
+            // before each launch — the results must be bit-identical either way.
+            bool share = CudaSmallSGemvDispatch.ShareDp4aInputs;
+            if (xQuantized && share) AssertDp4aQuantizedFor(x, k0, seqLen);
             else QuantizeDp4aInput(x, k0, seqLen);
             nint s = _stream.Handle;
             _kernels.LaunchPQ2_0GemvDp4a(weight0, _activQ8InScratch, _activQ8MetaScratch, y0, m0, k0, seqLen, s);
+            if (!share) QuantizeDp4aInput(x, k0, seqLen);
             _kernels.LaunchPQ2_0GemvDp4a(weight1, _activQ8InScratch, _activQ8MetaScratch, y1, m1, k0, seqLen, s);
+            _dp4aGemvLaunches += 2;
             return true;
         }
 

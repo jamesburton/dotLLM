@@ -50,11 +50,15 @@ internal static class SyntheticHadamardFold
     /// Trunk depth (default 2). The CPU/GPU split tests (#481) pass 4 so a split boundary can put a
     /// GDN and an attention block on each side.
     /// </param>
+    /// <param name="pq2_0Projections">
+    /// Issue #485: the PQ2_0 variant (projection input widths 128/256/512, all divisible by
+    /// <see cref="BlockSize"/>), so the CUDA PQ2_0 GEMVs run under a fold.
+    /// </param>
     internal static string WriteFixture(string path, bool withMtp = true,
-        int blockCount = SyntheticQwen35HybridDenseMtpGguf.BlockCount) =>
+        int blockCount = SyntheticQwen35HybridDenseMtpGguf.BlockCount, bool pq2_0Projections = false) =>
         SyntheticQwen35HybridDenseMtpGguf.Write(
             path, withMtp: withMtp, mtpHasOwnHeadTensors: false, blockCount: blockCount,
-            gdnKeyHeads: GdnKeyHeads, gdnValueHeads: GdnValueHeads);
+            gdnKeyHeads: GdnKeyHeads, gdnValueHeads: GdnValueHeads, pq2_0Projections: pq2_0Projections);
 
     /// <summary>
     /// Returns a fold declaration covering exactly the weights the <c>qwen35</c> forward pass

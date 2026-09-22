@@ -232,6 +232,61 @@ public sealed class CudaPQ2_0GemvDp4aTests
         }
     }
 
+    /// <summary>
+    /// The per-column arithmetic is S-independent by construction, so an S-wide launch must be
+    /// BIT-identical to S single-column launches over the same quantized rows. Any column mixing,
+    /// width-dependent indexing or accumulation-order difference fails this exactly.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(2, 513, 5120)]
+    [InlineData(3, 513, 17408)]
+    [InlineData(8, 37, 5120)]
+    public unsafe void Dp4a_SWideLaunch_BitIdenticalToSingleColumnLaunches(int columns, int n, int k)
+    {
+        string ptxDir = SkipUnlessDp4aKernel();
+        var rng = new Random(48501 + columns + n + k);
+        byte[] packed = RandomPackedPQ2_0WithCode3(rng, n, k);
+        float[] x = RealisticActivations(rng, columns * k);
+
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir);
+        Assert.True(kernels.HasPQ2_0GemvDp4a, kernels.PQ2_0GemvDp4aUnavailableReason);
+        nint s = stream.Handle;
+        int elems = x.Length, bpr = k / 32;
+        nint devW = Alloc(packed.LongLength), devWSplit = Alloc(CudaKernels.PQ2_0SplitLayoutBytes(n, k));
+        nint devX = Alloc((long)elems * sizeof(float));
+        nint devQ = Alloc(elems), devMeta = Alloc((long)elems / 32 * CudaKernels.Pq2_0Dp4aMetaBytesPerBlock);
+        nint devYWide = Alloc((long)columns * n * sizeof(float)), devYOne = Alloc((long)columns * n * sizeof(float));
+        try
+        {
+            fixed (byte* w = packed)
+                CudaDriverApi.cuMemcpyHtoD_v2(devW, (nint)w, (nuint)packed.LongLength).ThrowOnError();
+            fixed (float* px = x)
+                CudaDriverApi.cuMemcpyHtoD_v2(devX, (nint)px, (nuint)((long)elems * sizeof(float))).ThrowOnError();
+            kernels.LaunchPQ2_0RepackSplitF16(devW, devWSplit, n, k, s);
+            kernels.LaunchPQ2_0Dp4aQuantizeX(devX, devQ, devMeta, elems, s);
+            kernels.LaunchPQ2_0GemvDp4a(devWSplit, devQ, devMeta, devYWide, n, k, columns, s);
+            for (int c = 0; c < columns; c++)
+                kernels.LaunchPQ2_0GemvDp4a(devWSplit,
+                    devQ + (nint)((long)c * k),
+                    devMeta + (nint)((long)c * bpr * CudaKernels.Pq2_0Dp4aMetaBytesPerBlock),
+                    devYOne + (nint)((long)c * n * sizeof(float)), n, k, 1, s);
+            stream.Synchronize();
+
+            float[] wide = Download<float>(devYWide, columns * n);
+            float[] one = Download<float>(devYOne, columns * n);
+            for (int i = 0; i < wide.Length; i++)
+                Assert.True(BitConverter.SingleToInt32Bits(wide[i]) == BitConverter.SingleToInt32Bits(one[i]),
+                    $"S={columns}: column {i / n} row {i % n}: S-wide {wide[i]:R} vs single-column {one[i]:R}");
+        }
+        finally
+        {
+            foreach (nint p in new[] { devW, devWSplit, devX, devQ, devMeta, devYWide, devYOne })
+                CudaDriverApi.cuMemFree_v2(p);
+        }
+    }
+
     private void AssertWithin(string label, double[] expected, double[] absSum, float[] actual,
         int columns, int n, int k, double relToAbsSum)
     {
