@@ -1,0 +1,7 @@
+#version 450
+// Issue #496 — int8-activation PQ2_0 GEMV, 4 rows per 64-lane workgroup, 6 column(s).
+// Exact-width variant: #470 measured 2/4/8-only variants costing ~40% at S = 5.
+#define ROWS  4
+#define NCOLS 6
+#define WG    64
+#include "matmul_pq2_0_int8_gemv.glsl"

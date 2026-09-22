@@ -97,6 +97,14 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
     private readonly DescriptorSetCache _descriptorCache;
     private readonly MultiColumnPipeline[] _multiColumn;
     private readonly PQ2_0GemvMultiRowPipeline[] _multiRow;
+
+    // Issue #496 — the opt-in int8-activation path. Null unless DOTLLM_VK_PQ2_0_INT8=1 (or the
+    // in-process override) AND the device advertises VK_KHR_shader_integer_dot_product.
+    private MatMulPQ2_0Int8GemvKernel? _int8Gemv;
+    private QuantizePQ2_0Int8Kernel? _int8Quantize;
+    private VulkanDevice.Buffer? _int8Xq;
+    private VulkanDevice.Buffer? _int8Xmeta;
+    private readonly List<VulkanDevice.Buffer> _int8Retired = [];
     private bool _disposed;
 
     private MatMulPQ2_0GemvF32Kernel(
@@ -187,7 +195,75 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
             throw;
         }
 
-        return new MatMulPQ2_0GemvF32Kernel(device, module, pipeline, pool, multiColumn.ToArray(), multiRow.ToArray());
+        var kernel = new MatMulPQ2_0GemvF32Kernel(device, module, pipeline, pool, multiColumn.ToArray(), multiRow.ToArray());
+
+        // Issue #496 — opt-in int8-activation path. Both halves must load or neither is used.
+        try
+        {
+            var int8Gemv = MatMulPQ2_0Int8GemvKernel.TryCreate(device, spvDir);
+            if (int8Gemv is not null)
+            {
+                var int8Quant = QuantizePQ2_0Int8Kernel.TryCreate(device, spvDir);
+                if (int8Quant is null) int8Gemv.Dispose();
+                else
+                {
+                    kernel._int8Gemv = int8Gemv;
+                    kernel._int8Quantize = int8Quant;
+                }
+            }
+        }
+        catch
+        {
+            kernel.Dispose();
+            throw;
+        }
+
+        return kernel;
+    }
+
+    /// <summary>
+    /// Issue #496 — whether this instance routes through the int8-activation GEMV
+    /// (<see cref="MatMulPQ2_0Int8GemvKernel"/>) instead of the float multi-row kernels.
+    /// </summary>
+    public bool UsesInt8 => _int8Gemv is not null && _int8Quantize is not null;
+
+    /// <summary>
+    /// Grows the int8 activation scratch to hold <paramref name="columns"/> rows of
+    /// <paramref name="k"/> elements. Old buffers are retired rather than freed: a command buffer
+    /// recorded earlier in this frame may still reference them, and the scratch is at most a few
+    /// hundred KB. Reallocating invalidates every descriptor set keyed on the old handles (#467).
+    /// </summary>
+    private void EnsureInt8Scratch(int k, int columns)
+    {
+        long packed = QuantizePQ2_0Int8Kernel.PackedBytes(k, columns);
+        long meta = QuantizePQ2_0Int8Kernel.MetaBytes(k, columns);
+        if (_int8Xq is not null && _int8Xq.Size >= packed && _int8Xmeta is not null && _int8Xmeta.Size >= meta)
+            return;
+
+        if (_int8Xq is not null) _int8Retired.Add(_int8Xq);
+        if (_int8Xmeta is not null) _int8Retired.Add(_int8Xmeta);
+
+        _int8Xq = _device.AllocateDeviceLocal(Math.Max(packed, _int8Xq?.Size ?? 0));
+        _int8Xmeta = _device.AllocateDeviceLocal(Math.Max(meta, _int8Xmeta?.Size ?? 0));
+        _int8Quantize!.InvalidateDescriptorCache();
+        _int8Gemv!.InvalidateDescriptorCache();
+    }
+
+    /// <summary>
+    /// Records quantize → barrier → int8 GEMV. The leading barrier covers the write-after-read on
+    /// the shared scratch when a previous PQ2_0 matmul in the same command buffer is still reading
+    /// it.
+    /// </summary>
+    private void RecordInt8(
+        nint cmdBuf,
+        VulkanDevice.Buffer weightsPQ2_0, VulkanDevice.Buffer x, VulkanDevice.Buffer y,
+        int m, int k, int columns, int xOffsetElements, int yOffsetElements)
+    {
+        EnsureInt8Scratch(k, columns);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        _int8Quantize!.Record(cmdBuf, x, _int8Xq!, _int8Xmeta!, k, columns, xOffsetElements);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        _int8Gemv!.Record(cmdBuf, weightsPQ2_0, _int8Xq!, _int8Xmeta!, y, m, k, columns, yOffsetElements);
     }
 
     private static MultiColumnPipeline CreateMultiColumn(VulkanDevice device, string spvDir, int width)
@@ -233,6 +309,8 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
         _descriptorCache.Reset();
         foreach (var mc in _multiColumn) mc.Cache.Reset();
         foreach (var mr in _multiRow) mr.InvalidateDescriptorCache();
+        _int8Quantize?.InvalidateDescriptorCache();
+        _int8Gemv?.InvalidateDescriptorCache();
     }
 
     /// <summary>Dispatches the GEMV synchronously.</summary>
@@ -311,6 +389,14 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
             throw new ArgumentException("Input buffer too small.", nameof(x));
         if (y.Size < ((long)yOffsetElements + m) * sizeof(float))
             throw new ArgumentException("Output buffer too small.", nameof(y));
+
+        // #496: the int8 path quantizes from x + xOffsetElements into compacted scratch, so it
+        // carries no alignment requirement of its own beyond k % 128 == 0 (checked above).
+        if (UsesInt8)
+        {
+            RecordInt8(cmdBuf, weightsPQ2_0, x, y, m, k, 1, xOffsetElements, yOffsetElements);
+            return;
+        }
 
         // #474: the multi-row kernel reads x as vec4, so an unaligned offset keeps the #470 kernel.
         if (UsesMultiRow && (xOffsetElements & 3) == 0)
@@ -414,6 +500,12 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
         if (y.Size < ((long)yOffsetElements + (long)columns * m) * sizeof(float))
             throw new ArgumentException("Output buffer too small.", nameof(y));
 
+        if (UsesInt8)
+        {
+            RecordInt8(cmdBuf, weightsPQ2_0, x, y, m, k, columns, xOffsetElements, yOffsetElements);
+            return;
+        }
+
         if (UsesMultiRow)
         {
             _multiRow[columns - 1].Record(cmdBuf, weightsPQ2_0, x, y, m, k, columns, xOffsetElements, yOffsetElements);
@@ -458,6 +550,13 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
 
         foreach (var mr in _multiRow) mr.Dispose();
         foreach (var mc in _multiColumn) mc.Dispose();
+
+        _int8Gemv?.Dispose();
+        _int8Quantize?.Dispose();
+        _int8Xq?.Dispose();
+        _int8Xmeta?.Dispose();
+        foreach (var b in _int8Retired) b.Dispose();
+        _int8Retired.Clear();
 
         if (_descriptorPool != 0)
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);

@@ -1,0 +1,143 @@
+#version 450
+// Issue #496 — activation quantizer for the int8 PQ2_0 GEMV (the Vulkan twin of CUDA #485's
+// `pq2_0_dp4a_quantize_x`, native/kernels/pq2_0_gemv_dp4a.cu).
+//
+// Turns an FP32 activation batch x[ncols, K] into the (xq, xmeta) pair that
+// matmul_pq2_0_int8_gemv.glsl consumes, so each 4 ternary weights x 4 activations become one
+// dotPacked4x8AccSatEXT instead of 4 float FMAs plus 4 int->float converts.
+//
+// ───────────────────────── Numerics: the CPU W2A8 tier ─────────────────────────
+// Mirrors DotLLM.Cpu.Kernels.MatMul.QuantizeF32ToQ8_0 — the activation quantizer the CPU's W2A8
+// PQ2_0 GEMV applies to x, and the tier the Bonsai 2 greedy oracle is defined against:
+//     per 32-element block:  amax  = max |x_i|
+//                            scale = amax / 127                    (fp32)
+//                            q_i   = roundEven(x_i * (1 / scale))  clamped to [-127, 127];
+//                                    all zero when scale == 0
+//                            d     = float(half(scale))            (the dot uses the HALF-rounded
+//                                                                   scale — the CPU stores
+//                                                                   (Half)scale and reads it back)
+// Note q uses `scale`, NOT the half-rounded `d`, exactly as the CPU does.
+//
+// SPIR-V OpFDiv is only 2.5 ULP (GLSL has no correctly-rounded divide), so byte-exactness against
+// the CPU is not guaranteed the way the CUDA kernel guarantees it; `roundEven` IS specified
+// (round-half-to-even), so ties match. MEASURED on gfx1151: 0 int8 mismatches in 13k elements
+// across k = 128..2560. The fp16 scale needed help — `packHalf2x16` disagreed with .NET's
+// `(Half)` on ~40% of blocks by up to one ULP, so `halfRoundEven` below does that rounding in
+// software. VulkanMatMulPQ2_0Int8GemvKernelTests re-measures both rates.
+//
+// Group size 32 (not PQ2_0's weight group of 128) because that IS the CPU W2A8 block, so the CPU
+// quantizer is an oracle; and because a per-32 max-abs bounds each block's rounding error by its
+// own max, so one activation outlier degrades 32 values, not 128. The per-block int32 sum can
+// never overflow: |sum code*q| <= 3*127*32 = 12192.
+//
+// ───────────────────────── Output layout (the contract) ─────────────────────────
+//   xq    : int8, [ncols, K] row-major and COMPACTED (column s starts at byte s*K, whatever
+//           pc.xOff was), but PERMUTED within every 16-element chunk: chunk c's uint word i
+//           (bytes 4i..4i+3) holds elements 16c+i, 16c+4+i, 16c+8+i, 16c+12+i — i.e. element
+//           16c + 4j + i sits at byte 16c + 4i + j, a 4x4 byte transpose (its own inverse).
+//
+//           Why: a PQ2_0 code word packs elements 4b..4b+3 of byte b at bit offsets {0,2,4,6}, so
+//           in the 32-bit word covering 16 elements, element 4b+i sits at bit 8b+2i and
+//               (codeWord >> 2i) & 0x03030303 = { code(i), code(4+i), code(8+i), code(12+i) }
+//           — exactly permuted word i. The weight decode then needs no byte shuffles at all.
+//   xmeta : uvec2, [ncols, K/32]: .x = floatBitsToUint(d), .y = uint(int sum_i q_i).
+//           The GEMV seeds its dp4a chain at -sum so that codes 0..3 map to values -1..+2 for
+//           free: sum (code-1)*q == dot(code, q) - sum q.
+//
+// Dispatch: one invocation per 32-element block, 256 per workgroup, ceil(totalBlocks/256)
+// workgroups. Blocks never straddle columns (K % 128 == 0).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX     { float x[]; };      // [.., ncols, K]
+layout(set = 0, binding = 1, std430) writeonly buffer BufXq    { uint  xq[]; };     // [ncols*K/4]
+layout(set = 0, binding = 2, std430) writeonly buffer BufXMeta { uvec2 xmeta[]; };  // [ncols*K/32]
+
+layout(push_constant) uniform PushConstants {
+    uint K;             // elements per column, a multiple of 128
+    uint blocksPerCol;  // = K / 32
+    uint totalBlocks;   // = ncols * blocksPerCol
+    uint xOff;          // first element of column 0's activation row; column s at xOff + s*K
+} pc;
+
+const uint QK = 32u;    // elements per activation quant block
+
+// float(half(f)) with IEEE round-to-nearest-EVEN, done in software.
+//
+// `packHalf2x16` was measured on the gfx1151 driver to disagree with .NET's `(Half)` on ~40% of
+// blocks by up to one fp16 ULP (SPIR-V leaves the rounding mode unspecified), which showed up as a
+// ~3e-4 relative RMS divergence of the whole GEMV from the CPU W2A8 oracle. Doing the rounding
+// explicitly costs ~15 ALU ops once per 32 elements and makes the CPU quantizer byte-exact again.
+// f is finite and non-negative here (it is amax/127).
+float halfRoundEven(float f) {
+    uint a = floatBitsToUint(f) & 0x7FFFFFFFu;
+
+    if (a >= 0x47800000u)                       // overflows fp16 -> +inf
+        return uintBitsToFloat(0x7F800000u);
+
+    uint bits;
+    if (a < 0x38800000u) {                      // fp16 subnormal (or zero)
+        if (a < 0x33000000u) return 0.0;        // below half the smallest subnormal
+        uint e = a >> 23u;
+        uint shift = 126u - e;                  // 14..24
+        uint m = (a & 0x007FFFFFu) | 0x00800000u;
+        uint q = m >> shift;
+        uint rem = m & ((1u << shift) - 1u);
+        uint mid = 1u << (shift - 1u);
+        if (rem > mid || (rem == mid && (q & 1u) != 0u)) q++;
+        bits = q;                               // exponent field stays 0
+    } else {
+        uint e = a >> 23u;
+        uint m = a & 0x007FFFFFu;
+        uint q = m >> 13u;
+        uint rem = m & 0x1FFFu;
+        // A carry out of q propagates into the exponent field by construction of the sum below.
+        if (rem > 0x1000u || (rem == 0x1000u && (q & 1u) != 0u)) q++;
+        bits = ((e - 112u) << 10u) + q;
+    }
+
+    return unpackHalf2x16(bits).x;
+}
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= pc.totalBlocks) return;
+
+    uint s   = b / pc.blocksPerCol;              // column
+    uint blk = b - s * pc.blocksPerCol;          // 32-element block within the column
+    uint src = pc.xOff + s * pc.K + blk * QK;    // first element this invocation reads
+
+    float v[QK];
+    float amax = 0.0;
+    for (uint i = 0u; i < QK; i++) {
+        v[i] = x[src + i];
+        amax = max(amax, abs(v[i]));
+    }
+
+    float scale = amax / 127.0;
+    // d = float(half(scale)) — the half-rounded scale the dot product actually uses.
+    float d = halfRoundEven(scale);
+    float inv = (scale != 0.0) ? (1.0 / scale) : 0.0;
+
+    int q[QK];
+    int sum = 0;
+    for (uint i = 0u; i < QK; i++) {
+        // roundEven is SPIR-V OpRoundEven (round-half-to-even), matching MathF.Round's default.
+        q[i] = clamp(int(roundEven(v[i] * inv)), -127, 127);
+        sum += q[i];
+    }
+
+    // Permute: chunk c (16 elements) -> word i = bytes { q[16c+i], q[16c+4+i], q[16c+8+i], q[16c+12+i] }.
+    uint dst = (s * pc.K + blk * QK) >> 2u;   // uint index of this block's 8 packed words
+    for (uint c = 0u; c < 2u; c++) {
+        for (uint i = 0u; i < 4u; i++) {
+            uint w =  (uint(q[16u * c + i])       & 0xFFu)
+                   | ((uint(q[16u * c + 4u  + i]) & 0xFFu) << 8u)
+                   | ((uint(q[16u * c + 8u  + i]) & 0xFFu) << 16u)
+                   | ((uint(q[16u * c + 12u + i]) & 0xFFu) << 24u);
+            xq[dst + 4u * c + i] = w;
+        }
+    }
+
+    xmeta[b] = uvec2(floatBitsToUint(d), uint(sum));
+}
