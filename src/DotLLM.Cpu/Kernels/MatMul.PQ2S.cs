@@ -607,7 +607,12 @@ public static unsafe partial class MatMul
             UnpackPQ2_0RowI8Scalar(rowPtr, dest, groupScales, k);
     }
 
-    /// <summary>AVX2 tier of <see cref="UnpackPQ2_0RowI8"/>.</summary>
+    /// <summary>
+    /// Former AVX2 tier of <see cref="UnpackPQ2_0RowI8"/>, <b>no longer dispatched</b> (issue #477):
+    /// its scalar re-interleave loop made it ~3.5x slower end-to-end than
+    /// <see cref="UnpackPQ2_0RowI8Sse"/>, which interleaves in registers and is byte-exact with it.
+    /// Kept as an independent oracle for <c>W2A8SseTierTests</c>.
+    /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     internal static void UnpackPQ2_0RowI8Avx2(byte* rowPtr, sbyte* dest, float* groupScales, int k)
