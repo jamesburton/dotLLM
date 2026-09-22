@@ -179,6 +179,8 @@ public sealed class CudaBonsai2RealCheckpointTests
             }
 
             for (int i = 0; i <= DraftSteps; i++) verifyPositions[i] = p + i;
+            // Deliberate for a perf probe: kv.Rollback below does not restore the GDN recurrent
+            // state, so later rounds verify from an advanced state — same cost, values not meaningful.
             mtp.Rollback(p);
             long v0 = System.Diagnostics.Stopwatch.GetTimestamp();
             using (ITensor _ = model.Forward(verifyTokens, verifyPositions, -1, kv, adapter: null, mtp)) { }

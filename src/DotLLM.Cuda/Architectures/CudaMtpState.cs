@@ -111,7 +111,8 @@ public sealed class CudaMtpState : IMtpState, IDisposable
     {
         ThrowIfDisposed();
         if (position < 0 || count < 0 || (long)position + count > _maxSteps)
-            throw new ArgumentOutOfRangeException(nameof(position));
+            throw new ArgumentOutOfRangeException(nameof(position),
+                $"positions [{position}, {(long)position + count}) exceed MaxSteps={_maxSteps}.");
         return _positionIotaDevice + (nint)((long)position * sizeof(int));
     }
 
