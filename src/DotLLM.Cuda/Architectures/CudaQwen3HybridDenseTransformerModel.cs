@@ -1439,6 +1439,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
 
         _profileActiveForThisCall = seqLen == 1;
+        _mtpEmbedPrefetchRows = 0;   // #492: no claim survives a call boundary
 
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
@@ -1510,6 +1511,19 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         {
             RunSingleLayerBody(layer, seqLen, positions, hiddenSize,
                 numHeads, numKvHeads, headDim, eps, kvCache);
+        }
+
+        // Issue #492: every layer is now queued on the stream and the host has nothing to wait for
+        // until the MTP capture's synchronize below, so this is the one window in the call where
+        // host work is free. Run the batched absorb's embedding gather here instead of after the
+        // trunk, where it sat on the critical path (mtp-absorb-1-host-embed-pair). Pure hoisting:
+        // the rows are byte-identical and the absorb refills them if the claim does not apply.
+        if (mtpCapture is not null && _mtpHead is not null)
+        {
+            bool profPrevPre = _profileActiveForThisCall;
+            if (ProfileTrace) { _profileActiveForThisCall = true; ProfStart(); }
+            PrefetchMtpAbsorbEmbedRows(mtpCapture, tokenIds, positions);
+            if (ProfileTrace) { ProfMark("mtp-absorb-1a-embed-hoisted"); _profileActiveForThisCall = profPrevPre; }
         }
 
         if (DebugTrace) { _stream.Synchronize(); Console.Error.WriteLine("[hybrid-debug] all layers done, starting lm_head"); Console.Error.Flush(); LogVram("before lm-head"); }
@@ -1684,6 +1698,136 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private CudaMtpAbsorbScratch? _mtpAbsorbScratch;
 
     /// <summary>
+    /// Rows of <see cref="CudaMtpAbsorbScratch.EmbedHost"/> that <see cref="PrefetchMtpAbsorbEmbedRows"/>
+    /// has already filled for the batched absorb at the end of the current <c>Forward</c> (issue #492),
+    /// or 0. Claimed exactly once by <see cref="AbsorbMtpBatched"/> and cleared on every
+    /// <c>Forward</c> entry, so a throwing or short-circuiting call can never leave a stale claim.
+    /// </summary>
+    private int _mtpEmbedPrefetchRows;
+
+    /// <summary>Allocates (or grows) the batched-absorb scratch for <paramref name="chunkRows"/> rows.</summary>
+    private CudaMtpAbsorbScratch EnsureMtpAbsorbScratch(int chunkRows, int hiddenSize)
+    {
+        if (_mtpAbsorbScratch is null || _mtpAbsorbScratch.Rows < chunkRows)
+        {
+            _mtpAbsorbScratch?.Dispose();
+            _mtpAbsorbScratch = CudaMtpAbsorbScratch.Allocate(chunkRows, hiddenSize);
+        }
+        return _mtpAbsorbScratch;
+    }
+
+    /// <summary>
+    /// Dequantises <paramref name="count"/> embedding rows for <c>tokenIds[start ..]</c> into the
+    /// pinned staging buffer and, for a folded checkpoint's trunk table, restores the primal basis —
+    /// the batched absorb's whole host-side embedding gather, factored out so the trunk forward can
+    /// run it early (<see cref="PrefetchMtpAbsorbEmbedRows"/>).
+    /// </summary>
+    private void FillMtpAbsorbEmbedRows(in CudaMtpHeadWeights mtpHead, ReadOnlySpan<int> tokenIds,
+                                        int start, int count, float* embedHost, int hiddenSize)
+    {
+        // Same embedding-table selection as ForwardMtpCore: head-local nextn.embed_tokens when the
+        // GGUF ships one, the trunk table otherwise.
+        nint embedHostBase = mtpHead.EmbedTokensHostBase ?? _embedDataBase;
+        ulong embedDataOffset = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensDataOffset : _embedDataOffset;
+        long embedRowBytes = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensRowBytes : _embedRowBytes;
+        QuantizationType embedQt = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensQt : _tokenEmbedQt;
+
+        for (int i = 0; i < count; i++)
+        {
+            nint rowSrc = embedHostBase + (nint)(embedDataOffset + (ulong)tokenIds[start + i] * (ulong)embedRowBytes);
+            Dequantize.ToFloat32(rowSrc, hiddenSize, embedQt, new Span<float>(embedHost + (long)i * hiddenSize, hiddenSize));
+        }
+        // A folded checkpoint's trunk embedding is stored in the rotated basis (#479); the
+        // head-local table, when shipped, is not. Same rule as ForwardMtpCore's gather.
+        if (mtpHead.EmbedTokensHostBase is null && _hadamard is { } embRot)
+            embRot.RotateInverseInPlaceHost(embedHost, count, hiddenSize);
+    }
+
+    /// <summary>
+    /// Issue #492: runs the batched absorb's host-side embedding gather for the first chunk while the
+    /// trunk's layers are still executing on the stream, so its cost (a mmap-resident dequant per
+    /// token plus the inverse Hadamard) overlaps GPU work instead of sitting on the critical path
+    /// after it. Pure hoisting — <see cref="AbsorbMtpBatched"/> produces byte-identical rows either
+    /// way, and falls back to filling them itself if the claim is not there (a different chunk shape,
+    /// the per-token absorb path, or a caller that never reaches the absorb).
+    /// </summary>
+    /// <remarks>
+    /// Safe to overwrite the pinned rows here: every previous absorb chunk ended in a stream
+    /// synchronize, so no H2D is still reading them.
+    /// </remarks>
+    private void PrefetchMtpAbsorbEmbedRows(CudaMtpState state, ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions)
+    {
+        if (_mtpHead is not { } mtpHead)
+            return;
+        if (DotLLM.Models.Architectures.MtpAbsorbDispatch.UsePerToken
+            || !DotLLM.Models.Architectures.MtpAbsorbDispatch.IsContiguous(positions))
+            return;
+        int hiddenSize = Config.HiddenSize;
+        int chunkRows = Math.Max(1, Math.Min(tokenIds.Length, MtpAbsorbChunkRows));
+        var sc = EnsureMtpAbsorbScratch(chunkRows, hiddenSize);
+        int s = Math.Min(chunkRows, tokenIds.Length);
+        FillMtpAbsorbEmbedRows(mtpHead, tokenIds, 0, s, (float*)sc.EmbedHost, hiddenSize);
+        _mtpEmbedPrefetchRows = s;
+        _ = state;   // the claim is per-Forward, not per-state; kept for call-site clarity
+    }
+
+    /// <summary>
+    /// Copies <paramref name="rows"/> contiguous rows of <paramref name="rowBytes"/> into a
+    /// destination whose row pitch is <c>2 * rowBytes</c> — the absorb's <c>[e_i, h_i]</c> interleave,
+    /// in one strided launch rather than one per row (issue #492).
+    /// </summary>
+    /// <remarks>
+    /// The driver documents that an intra-device <c>cuMemcpy2D</c> "may fail for pitches not computed
+    /// by cuMemAllocPitch", and there is no async unaligned variant — so a refusal here is a
+    /// documented outcome for a small hidden size, not a bug. It falls back to the per-row loop this
+    /// replaced and latches, because the answer is a property of the model's row pitch and will not
+    /// change between chunks.
+    /// </remarks>
+    private void CopyRowsStrided(nint src, nint dst, long rowBytes, int rows, nint stream)
+    {
+        if (_mtpConcatStridedUnsupported)
+        {
+            CopyRowsPerRow(src, dst, rowBytes, rows, stream);
+            return;
+        }
+        var copy = new CudaDriverApi.CudaMemcpy2D
+        {
+            SrcMemoryType = CudaDriverApi.CU_MEMORYTYPE_DEVICE,
+            SrcDevice = src,
+            SrcPitch = (nuint)rowBytes,
+            DstMemoryType = CudaDriverApi.CU_MEMORYTYPE_DEVICE,
+            DstDevice = dst,
+            DstPitch = (nuint)(2 * rowBytes),
+            WidthInBytes = (nuint)rowBytes,
+            Height = (nuint)rows,
+        };
+        if (CudaDriverApi.cuMemcpy2DAsync_v2(ref copy, stream) == 0)
+            return;
+        _mtpConcatStridedUnsupported = true;
+        CopyRowsPerRow(src, dst, rowBytes, rows, stream);
+    }
+
+    /// <summary>The pre-#492 interleave: one <c>cuMemcpyDtoDAsync</c> per row.</summary>
+    private static void CopyRowsPerRow(nint src, nint dst, long rowBytes, int rows, nint stream)
+    {
+        for (int i = 0; i < rows; i++)
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(dst + (nint)(2 * i * rowBytes), src + (nint)(i * rowBytes),
+                (nuint)rowBytes, stream).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Latched when this model's row pitch is one the driver's 2-D device-to-device copy refuses
+    /// (issue #492) — see <see cref="CopyRowsStrided"/>.
+    /// </summary>
+    private bool _mtpConcatStridedUnsupported;
+
+    /// <summary>
+    /// Test hook (issue #492): <see langword="false"/> once the driver has refused the 2-D
+    /// device-to-device interleave for this model's row pitch and the per-row fallback has latched.
+    /// </summary>
+    internal bool MtpConcatUsesStridedCopy => !_mtpConcatStridedUnsupported;
+
+    /// <summary>
     /// Batched, KV-only absorb of S contiguous positions (issue #472, ported in #478) — see
     /// <c>MtpAbsorbDispatch</c>. Computes exactly the K/V rows <see cref="ForwardMtpCore"/> writes
     /// per token and nothing past them: an absorbed step's output hidden is discarded (the next
@@ -1707,6 +1851,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// Processed in chunks of <see cref="MtpAbsorbChunkRows"/> rows so a long prefill does not size
     /// the scratch to the prompt. Chunking cannot change a row's result for the same reason.
     /// </para>
+    /// <para>
+    /// Issue #492 moved work around without changing any of it: the first chunk's embedding rows are
+    /// normally gathered by <see cref="PrefetchMtpAbsorbEmbedRows"/> while the trunk's layers are
+    /// still on the stream, and the <c>[e_i, h_i]</c> interleave is two strided copies rather than
+    /// two per row. The stage marks are finer too (<c>0a</c>/<c>0b</c> for the setup,
+    /// <c>1a</c>/<c>1b</c> for the gather and the pairing).
+    /// </para>
     /// </remarks>
     private void AbsorbMtpBatched(in CudaMtpHeadWeights mtpHead, CudaMtpState state,
                                   ReadOnlySpan<int> tokenIds, int firstPosition)
@@ -1721,42 +1872,35 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         long hiddenRowBytes = (long)hiddenSize * sizeof(float);
 
         state.BeginAbsorb(firstPosition, total);
+        ProfMark("mtp-absorb-0a-begin");
 
         int chunkRows = Math.Max(1, Math.Min(total, MtpAbsorbChunkRows));
-        if (_mtpAbsorbScratch is null || _mtpAbsorbScratch.Rows < chunkRows)
-        {
-            _mtpAbsorbScratch?.Dispose();
-            _mtpAbsorbScratch = CudaMtpAbsorbScratch.Allocate(chunkRows, hiddenSize);
-        }
-        var sc = _mtpAbsorbScratch;
-
-        // Same embedding-table selection as ForwardMtpCore: head-local nextn.embed_tokens when the
-        // GGUF ships one, the trunk table otherwise.
-        nint embedHostBase = mtpHead.EmbedTokensHostBase ?? _embedDataBase;
-        ulong embedDataOffset = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensDataOffset : _embedDataOffset;
-        long embedRowBytes = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensRowBytes : _embedRowBytes;
-        QuantizationType embedQt = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensQt : _tokenEmbedQt;
+        var sc = EnsureMtpAbsorbScratch(chunkRows, hiddenSize);
+        ProfMark("mtp-absorb-0b-scratch");
 
         float* embedHost = (float*)sc.EmbedHost;
         float* pairHost = (float*)sc.PairHost;
+        // Issue #492: the first chunk's embedding rows may already have been dequantised (and
+        // un-rotated) into the pinned buffer while the trunk's layers were still running on the
+        // GPU — see PrefetchMtpAbsorbEmbedRows. Consume the claim exactly once.
+        int prefetched = _mtpEmbedPrefetchRows;
+        _mtpEmbedPrefetchRows = 0;
         ProfMark("mtp-absorb-0-setup");
         for (int start = 0; start < total; start += chunkRows)
         {
             int s = Math.Min(chunkRows, total - start);
             int elems = s * hiddenSize;
 
-            for (int i = 0; i < s; i++)
+            if (start == 0 && prefetched == s)
+                ProfMark("mtp-absorb-1a-embed-prefetched");
+            else
             {
-                nint rowSrc = embedHostBase + (nint)(embedDataOffset + (ulong)tokenIds[start + i] * (ulong)embedRowBytes);
-                Dequantize.ToFloat32(rowSrc, hiddenSize, embedQt, new Span<float>(embedHost + (long)i * hiddenSize, hiddenSize));
+                FillMtpAbsorbEmbedRows(mtpHead, tokenIds, start, s, embedHost, hiddenSize);
+                ProfMark("mtp-absorb-1a-embed");
             }
-            // A folded checkpoint's trunk embedding is stored in the rotated basis (#479); the
-            // head-local table, when shipped, is not. Same rule as ForwardMtpCore's gather.
-            if (mtpHead.EmbedTokensHostBase is null && _hadamard is { } embRot)
-                embRot.RotateInverseInPlaceHost(embedHost, s, hiddenSize);
             // Pairing (#469): row r goes with h_{p-1} — the carry for r == 0, captured row r-1 otherwise.
             state.CopyAbsorbPairingRows(start, s, new Span<float>(pairHost, elems));
-            ProfMark("mtp-absorb-1-host-embed-pair");
+            ProfMark("mtp-absorb-1b-pair");
 
             // Pinned rows (issue #486): async on the stream; the chunk-end synchronize below is what
             // makes rewriting them for the next chunk safe.
@@ -1764,18 +1908,14 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             CudaDriverApi.cuMemcpyHtoDAsync_v2(sc.Pair, (nint)pairHost, (nuint)((long)elems * sizeof(float)), streamH).ThrowOnError();
             ProfMark("mtp-absorb-2-h2d");
 
-            // enorm / hnorm over s rows, then interleave into concat rows [e_i, h_i].
+            // enorm / hnorm over s rows, then interleave into concat rows [e_i, h_i]. The interleave
+            // is two strided copies (issue #492: it was 2 * s separate cuMemcpyDtoDAsync launches,
+            // ~10 us of driver overhead each against ~20 KB of payload) — dst pitch 2 * hiddenRowBytes,
+            // src pitch hiddenRowBytes, s rows. Identical bytes, 2 launches instead of 2 * s.
             _kernels.LaunchRmsNormF32(sc.Embed, mtpHead.EnormDevice, sc.ENorm, hiddenSize, eps, s, streamH);
             _kernels.LaunchRmsNormF32(sc.Pair, mtpHead.HnormDevice, sc.HNorm, hiddenSize, eps, s, streamH);
-            for (int i = 0; i < s; i++)
-            {
-                nint rowOff = (nint)(i * hiddenRowBytes);
-                nint catOff = (nint)(2 * i * hiddenRowBytes);
-                CudaDriverApi.cuMemcpyDtoDAsync_v2(sc.Concat + catOff, sc.ENorm + rowOff,
-                    (nuint)hiddenRowBytes, streamH).ThrowOnError();
-                CudaDriverApi.cuMemcpyDtoDAsync_v2(sc.Concat + catOff + (nint)hiddenRowBytes, sc.HNorm + rowOff,
-                    (nuint)hiddenRowBytes, streamH).ThrowOnError();
-            }
+            CopyRowsStrided(sc.ENorm, sc.Concat, hiddenRowBytes, s, streamH);
+            CopyRowsStrided(sc.HNorm, sc.Concat + (nint)hiddenRowBytes, hiddenRowBytes, s, streamH);
             ProfMark("mtp-absorb-3-norms-concat");
 
             // cur = eh_proj @ concat over s rows — one multi-column GEMV reading the weights once
@@ -1974,6 +2114,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
     /// <summary>Test hook (issue #486): whether the MTP path is dispatching Q8_0 to the register-blocked kernel.</summary>
     internal bool MtpUsesRbQ8Gemv => _mtpQ8Rb is not null;
+
+    /// <summary>
+    /// Test hook (issue #492): whether a batched absorb of <paramref name="cols"/> rows will run the
+    /// NCOLS-specialised multi-column kernel rather than the generic 8-column one — so a parity test
+    /// can prove it is not silently measuring the fallback.
+    /// </summary>
+    internal bool MtpUsesSpecializedRbQ8Gemv(int cols) => _mtpQ8Rb?.HasSpecialized(cols) == true;
 
     /// <summary>
     /// Test hook (issue #485): whether the dp4a PQ2_0 GEMV module is loaded, so a test that switches

@@ -79,11 +79,19 @@ public sealed class CudaQwen3HybridDenseMtpBatchedAbsorbTests : IDisposable
         // Guard against a vacuous pass: the absorbed rows must be real, distinct data.
         Assert.Contains(batched.Keys, v => v != 0f);
         _out.WriteLine($"absorbed {batched.Length} positions; K/V/pending/logits bit-identical " +
-                       $"(Q8_0 head: {q8_0MtpHead}; register-blocked Q8_0 GEMV: {batched.UsesRbQ8})");
+                       $"(Q8_0 head: {q8_0MtpHead}; register-blocked Q8_0 GEMV: {batched.UsesRbQ8}; " +
+                       $"NCOLS-specialised multi (#492): {batched.UsesSpecializedRbQ8})");
+        // Issue #492: when the register-blocked kernel is loaded at all, the batch shapes here
+        // (3 and 4 rows, then a 3-row verify) must go through the specialised entry points — this
+        // assertion is what stops the parity above from silently proving the fallback instead.
+        if (batched.UsesRbQ8 && !CudaQ8_0RbGemv.SpecializedDisabledByEnv)
+            Assert.True(batched.UsesSpecializedRbQ8,
+                "the register-blocked Q8_0 GEMV loaded but its NCOLS-specialised entry points did not — " +
+                "regenerate q8_0_gemv_f32in_rb.ptx from the #492 kernel source");
     }
 
     private sealed record Snapshot(int Length, float[] Keys, float[] Values, float[] Pending, float[] DraftLogits,
-                                   bool UsesRbQ8);
+                                   bool UsesRbQ8, bool UsesSpecializedRbQ8);
 
     private static unsafe Snapshot Run(string path, string ptxDir, bool perToken)
     {
@@ -106,7 +114,8 @@ public sealed class CudaQwen3HybridDenseMtpBatchedAbsorbTests : IDisposable
 
             using ITensor draft = model.ForwardMtp(state, 9, p);
             float[] logits = new ReadOnlySpan<float>((void*)draft.DataPointer, config.VocabSize).ToArray();
-            return new Snapshot(p, keys, values, pending, logits, model.MtpUsesRbQ8Gemv);
+            return new Snapshot(p, keys, values, pending, logits, model.MtpUsesRbQ8Gemv,
+                                model.MtpUsesSpecializedRbQ8Gemv(3) && model.MtpUsesSpecializedRbQ8Gemv(4));
         }
         finally
         {
