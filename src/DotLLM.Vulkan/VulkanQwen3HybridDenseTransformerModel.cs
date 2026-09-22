@@ -660,6 +660,12 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
                            ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions)
     {
         BindMtpState(state);
+        if (!MtpAbsorbDispatch.UsePerToken && MtpAbsorbDispatch.IsContiguous(positions))
+        {
+            AbsorbMtpBatched(mtpHead, state, tokenIds, positions[0]);
+            state.SeedFromCapturedRow(tokenIds.Length - 1);
+            return;
+        }
         for (int i = 0; i < tokenIds.Length; i++)
         {
             if (i == 0) state.SetPendingFromCarry();
@@ -667,6 +673,203 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             ForwardMtpCore(mtpHead, state, tokenIds[i], positions[i], computeLogits: false);
         }
         state.SeedFromCapturedRow(tokenIds.Length - 1);
+    }
+
+    /// <summary>
+    /// S-row device scratch for <see cref="AbsorbMtpBatched"/>, grown to the largest batch seen.
+    /// <see cref="Pair"/> is host-visible: the pairing rows come from host-side captured rows.
+    /// </summary>
+    private sealed class MtpAbsorbScratch : IDisposable
+    {
+        public required int Rows { get; init; }
+        public required VulkanDevice.Buffer Pair { get; init; }    // [rows, hidden], host-visible
+        public required VulkanDevice.Buffer ENorm { get; init; }   // [rows, hidden]
+        public required VulkanDevice.Buffer HNorm { get; init; }   // [rows, hidden]
+        public required VulkanDevice.Buffer Concat { get; init; }  // [rows, 2 * hidden]
+        public required VulkanDevice.Buffer Cur { get; init; }     // [rows, hidden]
+        public required VulkanDevice.Buffer Normed { get; init; }  // [rows, hidden]
+
+        public static MtpAbsorbScratch Allocate(VulkanDevice device, int rows, int hiddenSize)
+        {
+            long h = (long)rows * hiddenSize * sizeof(float);
+            return new MtpAbsorbScratch
+            {
+                Rows = rows,
+                Pair = device.Allocate(h),
+                ENorm = device.AllocateDeviceLocal(h),
+                HNorm = device.AllocateDeviceLocal(h),
+                Concat = device.AllocateDeviceLocal(2 * h),
+                Cur = device.AllocateDeviceLocal(h),
+                Normed = device.AllocateDeviceLocal(h),
+            };
+        }
+
+        public void Dispose()
+        {
+            Pair.Dispose(); ENorm.Dispose(); HNorm.Dispose();
+            Concat.Dispose(); Cur.Dispose(); Normed.Dispose();
+        }
+    }
+
+    private MtpAbsorbScratch? _mtpAbsorbScratch;
+
+    /// <summary>
+    /// Batched, KV-only absorb of S contiguous positions in ONE submit (issue #472) — see
+    /// <see cref="MtpAbsorbDispatch"/>. Computes exactly the K/V rows <see cref="ForwardMtpCore"/>
+    /// writes per token, for all S rows at once, and nothing past them: an absorbed step's output
+    /// hidden is discarded, so its attention, O-projection and FFN are dead compute. Mirrors the CPU
+    /// reference <c>Qwen3HybridDenseTransformerModel.AbsorbMtpBatched</c>.
+    /// </summary>
+    private void AbsorbMtpBatched(VulkanQwen3HybridDenseMtpWeights mtpHead, VulkanMtpState state,
+                                  ReadOnlySpan<int> tokenIds, int firstPosition)
+    {
+        int s = tokenIds.Length;
+        int hiddenSize = Config.HiddenSize;
+        int numKvHeads = mtpHead.Attention.NumKvHeads;
+        int headDim = Config.HeadDim;
+        int kvStride = numKvHeads * headDim;
+        float eps = Config.NormEpsilon;
+        var attnW = mtpHead.Attention;
+
+        state.BeginAbsorb(firstPosition, s);
+
+        // Every (re)allocation happens BEFORE recording: a grow must invalidate the handle-keyed
+        // descriptor caches, and that resets pools an open command buffer may still reference.
+        bool resized = _state.EnsureCapacity(s);
+        if (_mtpAbsorbScratch is null || _mtpAbsorbScratch.Rows < s)
+        {
+            _mtpAbsorbScratch?.Dispose();
+            _mtpAbsorbScratch = MtpAbsorbScratch.Allocate(_device, s, hiddenSize);
+            resized = true;
+        }
+        if (resized)
+        {
+            _kernels.InvalidateAll();
+            _hadamard?.InvalidateDescriptorCache();
+            _embedGather?.InvalidateDescriptorCache();
+        }
+        var sc = _mtpAbsorbScratch;
+
+        // Pairing (#469): token i goes with h_{p-1} — the carry for i == 0, captured row i-1 otherwise.
+        int pairElems = checked(s * hiddenSize);
+        if (_mtpCaptureScratch.Length < pairElems)
+            _mtpCaptureScratch = new float[pairElems];
+        var pair = _mtpCaptureScratch.AsSpan(0, pairElems);
+        state.CopyAbsorbPairingRows(s, pair);
+        _device.Upload((ReadOnlySpan<float>)pair, sc.Pair);
+
+        Span<int> pos = s <= 256 ? stackalloc int[s] : new int[s];
+        for (int i = 0; i < s; i++) pos[i] = firstPosition + i;
+        UploadPositions(pos);
+
+        long hiddenRowBytes = (long)hiddenSize * sizeof(float);
+
+        _submit.Begin();
+        nint cmdBuf = _submit.CommandBuffer;
+        KernelSupport.HostToComputeBarrier(cmdBuf);
+
+        // ── 1. Embed all S tokens into HiddenState rows [0, S) ──────────────
+        if (mtpHead.EmbedTokensWeight is { } headEmbed)
+        {
+            // Head-local table: plain F32 row copies, NOT Hadamard-latent.
+            for (int i = 0; i < s; i++)
+            {
+                var region = new VkBufferCopy
+                {
+                    srcOffset = (ulong)((long)tokenIds[i] * hiddenRowBytes),
+                    dstOffset = (ulong)((long)i * hiddenRowBytes),
+                    size = (ulong)hiddenRowBytes,
+                };
+                VulkanApi.vkCmdCopyBuffer(cmdBuf, headEmbed.Handle, _state.HiddenState.Handle, 1, region);
+            }
+        }
+        else
+        {
+            // Trunk table: its gather handles packed PQ2_0 and the inverse Hadamard rotation.
+            RecordEmbeddingGather(cmdBuf, tokenIds);
+        }
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+        // ── 2. enorm / hnorm over S rows, interleaved into concat rows [e_i, h_i] ──
+        _kernels.RmsNorm.Record(cmdBuf, _state.HiddenState, mtpHead.EnormWeight, sc.ENorm,
+            rowCount: s, n: hiddenSize, eps: eps);
+        _kernels.RmsNorm.Record(cmdBuf, sc.Pair, mtpHead.HnormWeight, sc.HNorm,
+            rowCount: s, n: hiddenSize, eps: eps);
+        KernelSupport.ComputeToTransferBarrier(cmdBuf);
+
+        for (int i = 0; i < s; i++)
+        {
+            ulong rowOff = (ulong)((long)i * hiddenRowBytes);
+            ulong catOff = (ulong)((long)i * 2 * hiddenRowBytes);
+            RecordCopyBufferRange(cmdBuf, sc.ENorm, sc.Concat, rowOff, catOff, (ulong)hiddenRowBytes);
+            RecordCopyBufferRange(cmdBuf, sc.HNorm, sc.Concat, rowOff, catOff + (ulong)hiddenRowBytes,
+                (ulong)hiddenRowBytes);
+        }
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+        // ── 3. cur = eh_proj @ concat; normed = attn_norm(cur) ──────────────
+        RecordMatmul(cmdBuf, mtpHead.EhProjWeight, mtpHead.EhProjDeviceQuantType,
+            sc.Concat, sc.Cur,
+            outputDim: mtpHead.EhProjOutputDim, inputDim: mtpHead.EhProjInputDim, seqLen: s);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        _kernels.RmsNorm.Record(cmdBuf, sc.Cur, mtpHead.AttnNormWeight, sc.Normed,
+            rowCount: s, n: hiddenSize, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // ── 4. K/V projections, K-norm, RoPE on K ───────────────────────────
+        RecordMatmul(cmdBuf, attnW.KWeight, attnW.KDeviceQuantType,
+            sc.Normed, _state.K,
+            outputDim: attnW.KOutputDim, inputDim: attnW.KInputDim, seqLen: s);
+        RecordMatmul(cmdBuf, attnW.VWeight, attnW.VDeviceQuantType,
+            sc.Normed, _state.V,
+            outputDim: attnW.VOutputDim, inputDim: attnW.VInputDim, seqLen: s);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        _kernels.RmsNorm.Record(cmdBuf, _state.K, attnW.KNormWeight, _state.K,
+            rowCount: s * numKvHeads, n: headDim, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // The RoPE kernel always rotates a Q operand too; give it one head of the (dead) Q scratch.
+        _kernels.Rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
+            seqLen: s, numHeads: 1, numKvHeads: numKvHeads,
+            headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
+            variant: RopeF32Kernel.Variant.NeoX);
+        KernelSupport.ComputeToTransferBarrier(cmdBuf);
+
+        // ── 5. One slab copy into cache slots [firstPosition, firstPosition + S) ──
+        long kvRowBytes = (long)kvStride * sizeof(float);
+        ulong slab = (ulong)((long)s * kvRowBytes);
+        ulong slabOff = (ulong)((long)firstPosition * kvRowBytes);
+        RecordCopyBufferRange(cmdBuf, _state.K, state.KeyCache, 0, slabOff, slab);
+        RecordCopyBufferRange(cmdBuf, _state.V, state.ValueCache, 0, slabOff, slab);
+        TransferToAllBarrier(cmdBuf);
+        _submit.SubmitAndWait();
+
+        state.EndAbsorb(firstPosition + s);
+    }
+
+    /// <summary>
+    /// <c>TRANSFER_WRITE → SHADER_READ | TRANSFER_READ | HOST_READ</c>: the absorb's last commands are
+    /// the slab copies into the head's KV-cache, which the next draft step's attention reads (and a
+    /// later absorb may overwrite). <see cref="KernelSupport"/> has no transfer-sourced edge to the host.
+    /// </summary>
+    private static unsafe void TransferToAllBarrier(nint cmdBuf)
+    {
+        var barrier = new VkMemoryBarrier
+        {
+            sType = VkStructureType.MemoryBarrier,
+            srcAccessMask = VkAccessFlags.TransferWrite,
+            dstAccessMask = VkAccessFlags.ShaderRead | VkAccessFlags.TransferRead | VkAccessFlags.TransferWrite | VkAccessFlags.HostRead,
+        };
+        VulkanApi.vkCmdPipelineBarrier(
+            cmdBuf,
+            srcStageMask: VkPipelineStageFlags.Transfer,
+            dstStageMask: VkPipelineStageFlags.ComputeShader | VkPipelineStageFlags.Transfer | VkPipelineStageFlags.Host,
+            dependencyFlags: 0,
+            memoryBarrierCount: 1, pMemoryBarriers: barrier,
+            bufferMemoryBarrierCount: 0, pBufferMemoryBarriers: 0,
+            imageMemoryBarrierCount: 0, pImageMemoryBarriers: 0);
     }
 
     // A previously-disposed state's buffer handles can be recycled into this one's; invalidate the
@@ -1816,6 +2019,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         _embedGather?.Dispose();
         _mtpHead?.Dispose();
         _mtpScratch?.Dispose();
+        _mtpAbsorbScratch?.Dispose();
         _multiRowLogits?.Dispose();
         _kernels.Dispose();
         // Frees the CPU model's dequantised norm arrays and detaches it from the

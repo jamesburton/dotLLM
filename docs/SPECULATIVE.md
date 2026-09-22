@@ -312,6 +312,20 @@ target model's own just-verified hidden state, so the MTP head only ever needs c
 self-attention over the *current* round's own K draft steps, never across rounds. Simpler to
 reason about for a first CPU implementation; does not affect correctness.
 
+> Superseded by #469: the head's KV-cache is now persistent and position-indexed, and every trunk
+> `Forward` of an MTP sequence (prefill and verify) *absorbs* its tokens into it — see below.
+
+### Absorbing trunk batches into the head (#469, #472)
+
+Slot `p` of the head's KV-cache holds the pair `(h_{p-1}, x_p)`: token `i` of a trunk batch pairs
+with the carried row for `i == 0` and captured row `i - 1` otherwise. An absorbed step's output
+hidden is never used (the next draft seeds from a trunk row), so the absorb only needs the K/V
+rows. Since #472 all backends except CUDA absorb a contiguous batch in ONE KV-only pass — embed,
+`enorm`/`hnorm`, `eh_proj`, `attn_norm`, K/V projections (n = S), K-norm, RoPE, one slab write — and
+skip attention, the O-projection and the FFN entirely. `DOTLLM_MTP_ABSORB_PER_TOKEN=1` restores the
+per-token loop (CUDA still uses it). Bonsai 2 27B, Vulkan: S=3 (a K=2 verify) 12.9 → 1.7 ms; S=256
+prefill 1171 → 5 ms. CPU: S=3 178 → 15 ms.
+
 ### Correctness (demonstrated, not asserted)
 
 `MtpSpeculativeDecoderTests` proves token-for-token equivalence between MTP self-speculative

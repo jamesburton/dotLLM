@@ -135,6 +135,51 @@ public sealed class VulkanMtpState : IMtpState, IDisposable
         _currentLength++;
     }
 
+    /// <summary>
+    /// Prepares a batched absorb of <paramref name="count"/> contiguous positions starting at
+    /// <paramref name="firstPosition"/> (issue #472): rolls speculative slots back to it, rejects a
+    /// gap, and bounds-checks the whole slab before anything is recorded.
+    /// </summary>
+    internal void BeginAbsorb(int firstPosition, int count)
+    {
+        ThrowIfDisposed();
+        if (_currentLength > firstPosition)
+            _currentLength = firstPosition;
+        else if (_currentLength < firstPosition)
+            throw new InvalidOperationException(
+                $"MTP absorb at position {firstPosition} but the MTP KV-cache only covers {_currentLength} " +
+                "positions. Every trunk Forward of the sequence must pass the MTP state so the head " +
+                "absorbs it (prefill included).");
+        if ((long)firstPosition + count > _maxSteps)
+            throw new InvalidOperationException(
+                $"VulkanMtpState KV-cache exhausted absorbing positions [{firstPosition}, {firstPosition + count}) " +
+                $"(MaxSteps={_maxSteps}). Create the state with CreateMtpState(maxSequenceLength) covering the whole sequence.");
+    }
+
+    /// <summary>Completes a batched absorb begun by <see cref="BeginAbsorb"/>: the cache now covers <paramref name="length"/> positions.</summary>
+    internal void EndAbsorb(int length)
+    {
+        ThrowIfDisposed();
+        if (length < _currentLength || length > _maxSteps)
+            throw new ArgumentOutOfRangeException(nameof(length));
+        _currentLength = length;
+    }
+
+    /// <summary>
+    /// Writes the hidden-state rows a batch of <paramref name="count"/> tokens pairs with (issue
+    /// #469): row 0 is the carried row (the trunk hidden of the position before the batch), row
+    /// <c>i</c> is captured row <c>i - 1</c>. <paramref name="dest"/> is <c>[count, hiddenSize]</c>.
+    /// </summary>
+    internal void CopyAbsorbPairingRows(int count, Span<float> dest)
+    {
+        ThrowIfDisposed();
+        if (count > _capturedRowCount)
+            throw new ArgumentOutOfRangeException(nameof(count));
+        _carryHidden.CopyTo(dest);
+        if (count > 1)
+            _capturedRows.AsSpan(0, (count - 1) * _hiddenSize).CopyTo(dest.Slice(_hiddenSize));
+    }
+
     /// <inheritdoc/>
     public void Rollback(int length)
     {
