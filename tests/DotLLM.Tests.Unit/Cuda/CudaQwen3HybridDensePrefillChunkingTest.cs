@@ -119,6 +119,11 @@ public class CudaQwen3HybridDensePrefillChunkingTest
                                       int tile, int expectRows)
     {
         CudaQwen3HybridDenseTransformerModel.PrefillChunkOverride = tile;
+        // #500: tiling changes M, and M decides which PQ2_0 path a projection takes (dp4a int8 for
+        // small S, dequant+cuBLAS F16 above). Comparing across that boundary measures the dp4a
+        // numeric trade, not the tiling invariance this test is about, so pin one path for both arms.
+        bool? dp4aWas = CudaSmallSGemvDispatch.Dp4aOverride;
+        CudaSmallSGemvDispatch.Dp4aOverride = false;
         try
         {
             using var gguf = GgufFile.Open(path);
@@ -132,6 +137,7 @@ public class CudaQwen3HybridDensePrefillChunkingTest
         finally
         {
             CudaQwen3HybridDenseTransformerModel.PrefillChunkOverride = null;
+            CudaSmallSGemvDispatch.Dp4aOverride = dp4aWas;
         }
     }
 

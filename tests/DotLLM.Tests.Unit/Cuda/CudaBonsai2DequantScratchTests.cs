@@ -163,7 +163,15 @@ public sealed class CudaBonsai2DequantScratchTests
 
             _out.WriteLine($"all-rows prefill with the packed PQ2_0 GEMM: {model.DequantScratchF16WeightBytes} B "
                            + $"(old policy: {Mib(lmHeadBytes)} at load)");
-            Assert.Equal(0L, model.DequantScratchF16WeightBytes);
+            // #500: MMQ covers the PQ2_0 projections, but Bonsai 2's ssm_alpha/ssm_beta are BF16 and
+            // always take the dequant path (measured: 491,520 elements = 960 KiB), so "every
+            // projection" was never literally true. What this test is really asserting is that the
+            // weight-sized lm_head tile never appears; bound it well under that instead of at zero.
+            long alphaBetaCeiling = TileBytes(config.HiddenSize, 64);
+            Assert.InRange(model.DequantScratchF16WeightBytes, 0L, alphaBetaCeiling);
+            Assert.True(model.DequantScratchF16WeightBytes < lmHeadBytes / 100,
+                $"scratch {model.DequantScratchF16WeightBytes} B is not negligible against the "
+                + $"lm_head tile the old policy allocated ({lmHeadBytes} B)");
         }
         finally
         {
