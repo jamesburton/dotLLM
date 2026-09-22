@@ -352,6 +352,51 @@ public interface IModel : IDisposable
     void RestoreRecurrentState(object? checkpoint) { }
 
     /// <summary>
+    /// True when <see cref="ForwardWithRecurrentSnapshots"/> and
+    /// <see cref="RestoreRecurrentStateToRow"/> are implemented: the model can record its
+    /// model-owned recurrent state after every row of a multi-token forward and later roll back to
+    /// any one of those rows without recomputing (issue #473).
+    /// </summary>
+    /// <remarks>
+    /// The alternative to <see cref="CheckpointRecurrentState"/> + replay for speculative verify:
+    /// llama.cpp's per-token recurrent snapshots (<c>n_rs_seq</c>). A partial rejection then costs
+    /// a state copy instead of a second trunk forward over the accepted prefix. Default
+    /// <see langword="false"/>; callers fall back to checkpoint + replay.
+    /// </remarks>
+    bool SupportsRecurrentRowSnapshots => false;
+
+    /// <summary>
+    /// Runs <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, ILoraAdapter?, IMtpState?)"/>
+    /// on the model-owned recurrent state and additionally records that state as it stood after
+    /// each row <c>0 .. tokenIds.Length - 2</c> (the state after the last row is the live state).
+    /// Returns logits identical to the plain forward.
+    /// </summary>
+    /// <remarks>
+    /// The recorded snapshots are model-owned scratch, valid until the next forward of any kind.
+    /// Restore one with <see cref="RestoreRecurrentStateToRow"/>.
+    /// </remarks>
+    /// <exception cref="NotSupportedException"><see cref="SupportsRecurrentRowSnapshots"/> is <see langword="false"/>.</exception>
+    ITensor ForwardWithRecurrentSnapshots(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                                          IKvCache? kvCache, IMtpState? mtpState)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not record per-row recurrent snapshots (SupportsRecurrentRowSnapshots=false).");
+
+    /// <summary>
+    /// Sets the model-owned recurrent state to what it was right after row <paramref name="row"/>
+    /// of the most recent <see cref="ForwardWithRecurrentSnapshots"/> call — exactly the state a
+    /// forward of only rows <c>0..row</c> would have left.
+    /// </summary>
+    /// <param name="row">
+    /// A row index in <c>[0, seqLen - 1)</c> of that call. <c>seqLen - 1</c> (the live state) is
+    /// accepted as a no-op.
+    /// </param>
+    /// <exception cref="NotSupportedException"><see cref="SupportsRecurrentRowSnapshots"/> is <see langword="false"/>.</exception>
+    /// <exception cref="InvalidOperationException">No snapshots are available (none recorded, or a later forward invalidated them).</exception>
+    void RestoreRecurrentStateToRow(int row)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not record per-row recurrent snapshots (SupportsRecurrentRowSnapshots=false).");
+
+    /// <summary>
     /// Runs a fused forward pass across multiple in-flight sequences.
     /// </summary>
     /// <remarks>

@@ -1042,6 +1042,11 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
         _state.EnsureCapacity(seqLen);
 
+        // Any forward moves the model-owned state on, so earlier row snapshots no longer describe
+        // it (issue #473). ForwardWithRecurrentSnapshots re-validates after this call returns.
+        if (ReferenceEquals(gdnCache, _gdnCache))
+            _rowSnapshotValidRows = 0;
+
         // Adaptive dispatch mode: spin-wait for decode (short, frequent dispatches),
         // event-based for prefill (long dispatches where kernel transition cost is negligible).
         _threadPool?.SetDispatchMode(seqLen == 1 ? DispatchMode.SpinWait : DispatchMode.EventBased);
@@ -1263,6 +1268,103 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         snapshot?.CopyTo(_gdnCache);
     }
 
+    // ── Per-row recurrent snapshots (issue #473) ─────────────────────────────
+
+    // Model-owned, lazily grown: [layer][row] blocks of the GDN matrix state and of the conv
+    // window. Capacity is the most rows any verify has asked for; reused every round.
+    private nint _rowSnapGdn;
+    private nint _rowSnapConv;
+    private int _rowSnapCapacity;
+    private int _rowSnapshotRequestRows;   // > 0 only while ForwardWithRecurrentSnapshots runs
+    private int _rowSnapshotValidRows;     // rows the last such forward recorded; 0 = none
+
+    /// <summary>Bytes currently held by the per-row recurrent snapshot scratch (issue #473).</summary>
+    public long RecurrentRowSnapshotBytes =>
+        (long)_rowSnapCapacity * _gdnCache.NumGdnLayers
+        * (_gdnCache.GdnStateElements + _gdnCache.ConvStateElements) * sizeof(float);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Costs <c>(seqLen-1) x layers x (NVHead*DState^2 + conv)</c> floats of scratch, kept for the
+    /// model's lifetime; the scan copies its state out after each row, so every snapshot is
+    /// bit-identical to the state a forward of only that prefix would leave.
+    /// </remarks>
+    public bool SupportsRecurrentRowSnapshots => true;
+
+    /// <inheritdoc/>
+    public ITensor ForwardWithRecurrentSnapshots(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                                                 int deviceId, IKvCache? kvCache, IMtpState? mtpState)
+    {
+        int rows = Math.Max(tokenIds.Length - 1, 0);
+        EnsureRowSnapshotCapacity(rows);
+        _rowSnapshotRequestRows = rows;
+        ITensor logits;
+        try
+        {
+            logits = Forward(tokenIds, positions, deviceId, kvCache, gdnState: null, mtpState);
+        }
+        finally
+        {
+            _rowSnapshotRequestRows = 0;
+        }
+        _rowSnapshotValidRows = rows;
+        return logits;
+    }
+
+    /// <inheritdoc/>
+    public void RestoreRecurrentStateToRow(int row)
+    {
+        if (row == _rowSnapshotValidRows && row > 0)
+            return; // the live state IS the state after the last row
+        if ((uint)row >= (uint)_rowSnapshotValidRows)
+            throw new InvalidOperationException(
+                $"No recurrent snapshot for row {row}: the last ForwardWithRecurrentSnapshots recorded " +
+                $"{_rowSnapshotValidRows} row(s), or a later forward invalidated them.");
+
+        for (int l = 0; l < _gdnCache.NumGdnLayers; l++)
+        {
+            RowSnapshotGdn(l, row).CopyTo(_gdnCache.GetGdnState(l));
+            RowSnapshotConv(l, row).CopyTo(_gdnCache.GetConvState(l));
+        }
+        _rowSnapshotValidRows = 0;
+    }
+
+    private void EnsureRowSnapshotCapacity(int rows)
+    {
+        if (rows <= _rowSnapCapacity) return;
+        FreeRowSnapshots();
+        int layers = _gdnCache.NumGdnLayers;
+        nuint gdnBytes = (nuint)((long)layers * rows * _gdnCache.GdnStateElements * sizeof(float));
+        nuint convBytes = (nuint)((long)layers * rows * _gdnCache.ConvStateElements * sizeof(float));
+        _rowSnapGdn = (nint)System.Runtime.InteropServices.NativeMemory.AlignedAlloc(Math.Max(gdnBytes, 64), 64);
+        _rowSnapConv = (nint)System.Runtime.InteropServices.NativeMemory.AlignedAlloc(Math.Max(convBytes, 64), 64);
+        _rowSnapCapacity = rows;
+    }
+
+    private void FreeRowSnapshots()
+    {
+        if (_rowSnapGdn != 0) { System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)_rowSnapGdn); _rowSnapGdn = 0; }
+        if (_rowSnapConv != 0) { System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)_rowSnapConv); _rowSnapConv = 0; }
+        _rowSnapCapacity = 0;
+        _rowSnapshotValidRows = 0;
+    }
+
+    /// <summary>All of GDN layer <paramref name="ordinal"/>'s row snapshots, row-major.</summary>
+    private Span<float> RowSnapshotGdnLayer(int ordinal)
+    {
+        long n = (long)_rowSnapCapacity * _gdnCache.GdnStateElements;
+        return new Span<float>((float*)_rowSnapGdn + ordinal * n, checked((int)n));
+    }
+
+    private Span<float> RowSnapshotGdn(int ordinal, int row)
+        => RowSnapshotGdnLayer(ordinal).Slice(row * _gdnCache.GdnStateElements, _gdnCache.GdnStateElements);
+
+    private Span<float> RowSnapshotConv(int ordinal, int row)
+    {
+        int n = _gdnCache.ConvStateElements;
+        return new Span<float>((float*)_rowSnapConv + ((long)ordinal * _rowSnapCapacity + row) * n, n);
+    }
+
     /// <inheritdoc/>
     /// <remarks>
     /// Sized for the MTP head's own attention (<see cref="Config"/>'s standard head count/dim —
@@ -1463,6 +1565,19 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 .CopyTo(convState.Slice(r * convDim, convDim));
         }
 
+        // Issue #473: record the conv state as it stands after each of the first snapRows rows.
+        // After row t the rolling window is convInput rows t+1 .. t+dConv-1 — the same slice the
+        // save above takes for t = seqLen-1.
+        int snapRows = _rowSnapshotRequestRows > 0 && ReferenceEquals(gdnCache, _gdnCache)
+            ? Math.Min(_rowSnapshotRequestRows, seqLen - 1)
+            : 0;
+        int convStateElems = (dConv - 1) * convDim;
+        for (int t = 0; t < snapRows; t++)
+        {
+            new ReadOnlySpan<float>(convInput + (t + 1) * convDim, convStateElems)
+                .CopyTo(RowSnapshotConv(gdnOrdinal, t));
+        }
+
         // ── 4. De-interleave Q/K/V and L2-normalise Q and K ──────────────────
         // Conv output layout per token: [Q (kDim) | K (kDim) | V (vDim)]
         for (int t = 0; t < seqLen; t++)
@@ -1499,7 +1614,9 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             nVHead: nVHead,
             nKHead: nKHead,
             dState: dState,
-            seqLen: seqLen);
+            seqLen: seqLen,
+            rowSnapshots: snapRows > 0 ? RowSnapshotGdnLayer(gdnOrdinal) : default,
+            snapshotRows: snapRows);
         if (TensorDump.Enabled)
             TensorDump.Dump3D($"blk.{absoluteLayerIdx}.attn_output", gdnOut, seqLen, nVHead, dState);
 
@@ -2150,6 +2267,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         _state.Dispose();
         _gdnCache.Dispose();
         Interlocked.Exchange(ref _spareGdnCheckpoint, null)?.Dispose();
+        FreeRowSnapshots();
         GC.SuppressFinalize(this);
     }
 
