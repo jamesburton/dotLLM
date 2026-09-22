@@ -33,6 +33,26 @@ namespace DotLLM.Vulkan.Kernels;
 /// each 4 output rows per 64-lane workgroup: #470 measured 2/4/8-only variants costing ~40% at
 /// S = 5 from the dead columns.
 /// </para>
+/// <para>
+/// <b>Measured on gfx1151, and why it is still opt-in.</b> The kernel itself wins everywhere
+/// (<c>Bench_PQ2_0Int8Gemv</c>, Bonsai 2 27B projection shapes, cost relative to the float
+/// dispatch): 0.80-0.84x at <c>n = 1</c> on the projections, 0.42-0.63x at <c>n >= 2</c>, and
+/// 0.97x / 0.59x on <c>lm_head</c> at <c>n = 1</c> / <c>n = 8</c>. But <b>end to end it is a
+/// wash</b>: plain Bonsai 2 27B decode measured 18.3-19.0 tok/s float against 14.1-18.6 tok/s
+/// int8 across three interleaved order-reversed process pairs, <c>decode_min_ms</c> 1195-1306
+/// against 1231-1688 — a spread within one arm that exceeds the difference between the arms
+/// (this UMA box swings ~40% on CPU memory-bandwidth contention).
+/// </para>
+/// <para>
+/// <b>The suspect is the integration, not the kernel.</b> <see cref="MatMulPQ2_0GemvF32Kernel"/>
+/// records quantize + barrier + GEMV per matmul into ONE shared scratch, so a 27B decode step
+/// pays a few hundred extra dispatches and, worse, a few hundred full compute-to-compute
+/// barriers — and the shared scratch serialises Q/K/V, which read the SAME activation row and
+/// would otherwise overlap. The Q8_0 MMVQ path already solves this
+/// (<c>VulkanTransformerModel.CanShareMmvqQuant</c>): quantize once per shared projection input
+/// and hand the same buffers to every projection. Hoisting this quantizer the same way is the
+/// follow-up, and is the precondition for making the path default-on.
+/// </para>
 /// </remarks>
 public sealed class MatMulPQ2_0Int8GemvKernel : IDisposable
 {
