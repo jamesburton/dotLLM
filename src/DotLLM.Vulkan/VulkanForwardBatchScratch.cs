@@ -97,7 +97,7 @@ internal sealed class VulkanForwardBatchScratch : IDisposable
             long lastRowBytes = (long)batchSeqs * _hiddenSize * sizeof(float);
             long batchedLogitsBytes = (long)batchSeqs * _vocabSize * sizeof(float);
             LastRowHidden = _device.AllocateDeviceLocal(lastRowBytes);
-            BatchedLogits = _device.Allocate(batchedLogitsBytes); // host-readable for download
+            BatchedLogits = _device.AllocateHostReadback(batchedLogitsBytes); // host-read: HOST_CACHED, not write-combined (#143, #471)
             _batchCapacitySeqs = batchSeqs;
             resized = true;
         }

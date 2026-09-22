@@ -3804,7 +3804,7 @@ public sealed class VulkanTransformerModel : IModel
         if (_diffusionLogits is null || _diffusionLogitsCapacityRows < rows)
         {
             _diffusionLogits?.Dispose();
-            _diffusionLogits = _device.Allocate((long)rows * vocab * sizeof(float));
+            _diffusionLogits = _device.AllocateHostReadback((long)rows * vocab * sizeof(float));
             _diffusionLogitsCapacityRows = rows;
             // The new handle invalidates any cached lm-head matmul descriptor set.
             InvalidateKernelCaches();

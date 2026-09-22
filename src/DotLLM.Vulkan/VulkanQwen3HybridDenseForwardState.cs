@@ -95,7 +95,11 @@ internal sealed class VulkanQwen3HybridDenseForwardState : IDisposable
         _nVHead = gdn.NVHead;
         _hasHadamardFold = config.HadamardFold is not null;
 
-        Logits = device.Allocate((long)_vocabSize * sizeof(float));
+        // Read back by the host every decode step and every MTP draft step, so it must be
+        // HOST_CACHED: the default host-visible type is write-combined, and reading Bonsai 2's
+        // 248k-float row from it took 3.6 ms, a third of a draft step (#471, as #143 found for
+        // the other models).
+        Logits = device.AllocateHostReadback((long)_vocabSize * sizeof(float));
         PositionsBuffer = device.Allocate(Math.Max(1, initialSeqLen) * sizeof(int));
 
         AllocateForCapacity(Math.Max(1, initialSeqLen));

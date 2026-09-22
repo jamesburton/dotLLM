@@ -126,7 +126,8 @@ internal sealed class VulkanQwen3MoeHybridForwardState : IDisposable
         _moeTopK = moe.NumExpertsPerTok;
         _moeSharedIntermediate = moe.SharedExpertIntermediateSize ?? 0;
 
-        Logits = device.Allocate((long)_vocabSize * sizeof(float));
+        // Read back by the host every decoded token: HOST_CACHED, not write-combined (#143, #471).
+        Logits = device.AllocateHostReadback((long)_vocabSize * sizeof(float));
         PositionsBuffer = device.Allocate(Math.Max(1, initialSeqLen) * sizeof(int));
 
         // Per-token GDN scan slice buffers are sized once and reused.

@@ -95,6 +95,60 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
     /// <summary>Opens a submit for profiling — resets the query pool and writes the baseline stamp.</summary>
     private void ProfBeginSubmit(nint cmdBuf) => _prof?.BeginSubmit(cmdBuf);
 
+    // ── #471: MTP draft-step attribution ─────────────────────────────────────
+    // A draft step (ForwardMtp with logits) is profiled on its own switch, so a trunk profile is
+    // not drowned in one extra report per drafted token, and vice versa.
+
+    private static readonly bool MtpProfileEnabledFromEnv =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MTP_PROFILE") == "1";
+
+    /// <summary>Test hook: profile every MTP draft step irrespective of the environment.</summary>
+    internal bool MtpProfileOverride { get; set; }
+
+    /// <summary>The most recent MTP draft-step profile, or <see langword="null"/> if none.</summary>
+    internal VulkanOpProfileReport? LastMtpProfile { get; private set; }
+
+    /// <summary>
+    /// Host time of the most recent profiled draft step spent after the GPU finished (reading the
+    /// result back). It is part of the report's unattributed remainder.
+    /// </summary>
+    internal double LastMtpHostTailMs { get; private set; }
+
+    private long _mtpProfTailStart;
+
+    private void ProfBeginMtpStep()
+    {
+        if (!(MtpProfileEnabledFromEnv || MtpProfileOverride))
+        {
+            _prof = null;
+            return;
+        }
+
+        _profiler ??= new VulkanOpProfiler(_device, _submit)
+        {
+            SplitSubmits = ProfileSplitFromEnv || ProfileSplitOverride,
+        };
+        _prof = _profiler;
+        _prof.BeginForward(1, 1);
+    }
+
+    private void ProfMtpTailStart()
+    {
+        if (_prof is not null) _mtpProfTailStart = System.Diagnostics.Stopwatch.GetTimestamp();
+    }
+
+    private void ProfEndMtpStep()
+    {
+        if (_prof is null) return;
+        LastMtpHostTailMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _mtpProfTailStart) * 1000.0
+                            / System.Diagnostics.Stopwatch.Frequency;
+        var report = _prof.EndForward();
+        _prof = null;
+        LastMtpProfile = report;
+        if (MtpProfileEnabledFromEnv)
+            Console.Error.Write(report.Format("mtp-profile"));
+    }
+
     /// <summary>Category boundary: charges everything since the previous mark to <paramref name="cat"/>.</summary>
     private void ProfMark(nint cmdBuf, VulkanOpProfiler.Cat cat) => _prof?.Mark(cmdBuf, cat);
 
@@ -121,6 +175,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
             DotLLM.Core.Configuration.QuantizationType.PQ2_0 => gemv
                 ? "matmul_pq2_0_gemv"
                 : $"matmul_pq2_0_gemm[{_kernels.MatMulPQ2_0Gemm.VariantName}]",
+            DotLLM.Core.Configuration.QuantizationType.Q8_0 when gemv =>
+                $"matmul_q8_0_gemv[{_kernels.MatMulQ8.VariantName}]",
             DotLLM.Core.Configuration.QuantizationType.Q8_0 when !gemv =>
                 _kernels.MatMulQ8GemmCoopmat is not null ? "matmul_q8_0_gemm_coopmat" : "matmul_q8_0_gemm",
             DotLLM.Core.Configuration.QuantizationType.F16 when !gemv =>

@@ -66,7 +66,7 @@ internal sealed class VulkanNemotronHForwardBatchScratch : IDisposable
         // LastRowHidden is touched only by the in-submit copy + compute matmul — device-local.
         LastRowHidden = _device.AllocateDeviceLocal(lastRowBytes);
         // BatchedLogits is host-readable for the post-submit download path.
-        BatchedLogits = _device.Allocate(batchedLogitsBytes);
+        BatchedLogits = _device.AllocateHostReadback(batchedLogitsBytes); // host-read (#143, #471)
         _batchCapacitySeqs = batchSeqs;
         AllocatedBytes = lastRowBytes + batchedLogitsBytes;
         return true;
