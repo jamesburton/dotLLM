@@ -781,6 +781,17 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                     $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
         }
 
+        // The handle is length-only, but callers rely on its CurrentLength: speculative decoding
+        // rolls it back to a committed position after a rejected round. Nothing used to advance
+        // it, so Rollback(n > 0) always threw (surfaced by the MTP replay path on real hardware).
+        if (kvCache is CudaHybridKvCacheHandle handle)
+        {
+            int maxPos = 0;
+            for (int i = 0; i < positions.Length; i++)
+                if (positions[i] > maxPos) maxPos = positions[i];
+            handle.Advance(maxPos + 1);
+        }
+
         _context.MakeCurrent();
         _state.EnsureCapacity(seqLen);
 
@@ -1217,6 +1228,17 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             if ((uint)positions[i] >= (uint)maxSeq)
                 throw new ArgumentOutOfRangeException(nameof(positions),
                     $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
+        }
+
+        // The handle is length-only, but callers rely on its CurrentLength: speculative decoding
+        // rolls it back to a committed position after a rejected round. Nothing used to advance
+        // it, so Rollback(n > 0) always threw (surfaced by the MTP replay path on real hardware).
+        if (kvCache is CudaHybridKvCacheHandle handle)
+        {
+            int maxPos = 0;
+            for (int i = 0; i < positions.Length; i++)
+                if (positions[i] > maxPos) maxPos = positions[i];
+            handle.Advance(maxPos + 1);
         }
 
         // Category profiler bracket (issue #168): MakeCurrent + EnsureCapacity + H2D

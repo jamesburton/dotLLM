@@ -99,6 +99,37 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
         Assert.IsType<CudaMtpState>(state);
     }
 
+    /// <summary>
+    /// The length-only KV handle must track what <c>Forward</c> wrote. Speculative decoding
+    /// rolls it back to a committed position after a rejected round; before this was fixed
+    /// nothing advanced the handle, <c>CurrentLength</c> stayed 0, and <c>Rollback(n &gt; 0)</c>
+    /// threw on the first partial rejection. Only real hardware exposed it, because CUDA MTP was
+    /// build-verified at #469.
+    /// </summary>
+    [SkippableFact]
+    public void Forward_AdvancesKvHandle_SoRollbackToACommittedPositionWorks()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir is null, "PTX files not found");
+
+        string path = WriteFixture(withMtp: true, name: "qwen35-mtp-kvhandle.gguf");
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var model = CudaQwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
+        using var kv = model.CreateKvCache(config.MaxSequenceLength);
+
+        using (model.Forward([1, 2, 3], [0, 1, 2], deviceId: -1, kv)) { }
+        Assert.Equal(3, kv.CurrentLength);
+
+        // A verify-shaped batch that re-writes the last committed slot and runs past it.
+        using (model.Forward([3, 4, 5], [2, 3, 4], deviceId: -1, kv)) { }
+        Assert.Equal(5, kv.CurrentLength);
+
+        kv.Rollback(3);   // threw before the fix
+        Assert.Equal(3, kv.CurrentLength);
+    }
+
     [SkippableFact]
     public void LoadFromGguf_WithoutMtp_ZeroBehaviorChange()
     {
