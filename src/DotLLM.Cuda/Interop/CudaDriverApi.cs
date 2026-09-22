@@ -172,6 +172,41 @@ internal static partial class CudaDriverApi
     internal static partial int cuMemcpyDtoD_v2(
         nint dstDevice, nint srcDevice, nuint byteCount);
 
+    /// <summary>CU_MEMORYTYPE_DEVICE — the only memory type <see cref="cuMemcpy2DAsync_v2"/> is used with here.</summary>
+    internal const uint CU_MEMORYTYPE_DEVICE = 2;
+
+    /// <summary>
+    /// <c>CUDA_MEMCPY2D</c> (issue #492). Field order and the implicit padding after each
+    /// <c>CUmemorytype</c> match the driver header exactly under x64 sequential layout.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct CudaMemcpy2D
+    {
+        public nuint SrcXInBytes;
+        public nuint SrcY;
+        public uint SrcMemoryType;
+        public nint SrcHost;
+        public nint SrcDevice;
+        public nint SrcArray;
+        public nuint SrcPitch;
+        public nuint DstXInBytes;
+        public nuint DstY;
+        public uint DstMemoryType;
+        public nint DstHost;
+        public nint DstDevice;
+        public nint DstArray;
+        public nuint DstPitch;
+        public nuint WidthInBytes;
+        public nuint Height;
+    }
+
+    /// <summary>
+    /// Strided device-to-device copy on a stream — one launch for a whole row-interleave instead of
+    /// one per row (issue #492: the MTP batched absorb's <c>[e_i, h_i]</c> concat).
+    /// </summary>
+    [LibraryImport(LibName)]
+    internal static partial int cuMemcpy2DAsync_v2(ref CudaMemcpy2D pCopy, nint hStream);
+
     [LibraryImport(LibName)]
     internal static partial int cuMemcpyHtoDAsync_v2(
         nint dstDevice, nint srcHost, nuint byteCount, nint stream);
