@@ -590,10 +590,10 @@ public static unsafe partial class MatMul
     {
         if (!Avx2.IsSupported)
         {
-            results[0] = VecDotQ4_K_Q8_KScalar(w0, q8k, superBlockCount);
-            results[1] = VecDotQ4_K_Q8_KScalar(w1, q8k, superBlockCount);
-            results[2] = VecDotQ4_K_Q8_KScalar(w2, q8k, superBlockCount);
-            results[3] = VecDotQ4_K_Q8_KScalar(w3, q8k, superBlockCount);
+            results[0] = VecDotQ4_K_Q8_KPortable(w0, q8k, superBlockCount);
+            results[1] = VecDotQ4_K_Q8_KPortable(w1, q8k, superBlockCount);
+            results[2] = VecDotQ4_K_Q8_KPortable(w2, q8k, superBlockCount);
+            results[3] = VecDotQ4_K_Q8_KPortable(w3, q8k, superBlockCount);
             return;
         }
 
@@ -728,10 +728,10 @@ public static unsafe partial class MatMul
     {
         if (!Avx2.IsSupported)
         {
-            results[0] = VecDotQ5_K_Q8_KScalar(w0, q8k, superBlockCount);
-            results[1] = VecDotQ5_K_Q8_KScalar(w1, q8k, superBlockCount);
-            results[2] = VecDotQ5_K_Q8_KScalar(w2, q8k, superBlockCount);
-            results[3] = VecDotQ5_K_Q8_KScalar(w3, q8k, superBlockCount);
+            results[0] = VecDotQ5_K_Q8_KPortable(w0, q8k, superBlockCount);
+            results[1] = VecDotQ5_K_Q8_KPortable(w1, q8k, superBlockCount);
+            results[2] = VecDotQ5_K_Q8_KPortable(w2, q8k, superBlockCount);
+            results[3] = VecDotQ5_K_Q8_KPortable(w3, q8k, superBlockCount);
             return;
         }
 
@@ -890,10 +890,10 @@ public static unsafe partial class MatMul
     {
         if (!Avx2.IsSupported)
         {
-            results[0] = VecDotQ6_K_Q8_KScalar(w0, q8k, superBlockCount);
-            results[1] = VecDotQ6_K_Q8_KScalar(w1, q8k, superBlockCount);
-            results[2] = VecDotQ6_K_Q8_KScalar(w2, q8k, superBlockCount);
-            results[3] = VecDotQ6_K_Q8_KScalar(w3, q8k, superBlockCount);
+            results[0] = VecDotQ6_K_Q8_KPortable(w0, q8k, superBlockCount);
+            results[1] = VecDotQ6_K_Q8_KPortable(w1, q8k, superBlockCount);
+            results[2] = VecDotQ6_K_Q8_KPortable(w2, q8k, superBlockCount);
+            results[3] = VecDotQ6_K_Q8_KPortable(w3, q8k, superBlockCount);
             return;
         }
 
@@ -1050,7 +1050,7 @@ public static unsafe partial class MatMul
         else
         {
             for (; row < m; row++)
-                result[row] = VecDotQ4_K_Q8_KScalar(weights + (long)row * rowBytes, xQ8K, superBlockCount);
+                result[row] = VecDotQ4_K_Q8_KPortable(weights + (long)row * rowBytes, xQ8K, superBlockCount);
         }
     }
 
@@ -1078,7 +1078,7 @@ public static unsafe partial class MatMul
         else
         {
             for (; row < m; row++)
-                result[row] = VecDotQ5_K_Q8_KScalar(weights + (long)row * rowBytes, xQ8K, superBlockCount);
+                result[row] = VecDotQ5_K_Q8_KPortable(weights + (long)row * rowBytes, xQ8K, superBlockCount);
         }
     }
 
@@ -1106,7 +1106,7 @@ public static unsafe partial class MatMul
         else
         {
             for (; row < m; row++)
-                result[row] = VecDotQ6_K_Q8_KScalar(weights + (long)row * rowBytes, xQ8K, superBlockCount);
+                result[row] = VecDotQ6_K_Q8_KPortable(weights + (long)row * rowBytes, xQ8K, superBlockCount);
         }
     }
 
@@ -1172,7 +1172,7 @@ public static unsafe partial class MatMul
             {
                 for (int r = 0; r < 4; r++)
                     result[g * 4 + r] = VecDotKQuantScalarR4(groupBase, r, xQ8K,
-                        superBlockCount, Q4_K_BlockBytes, &VecDotQ4_K_Q8_KScalar);
+                        superBlockCount, Q4_K_BlockBytes, &VecDotQ4_K_Q8_KPortable);
             }
         }
 
@@ -1183,7 +1183,7 @@ public static unsafe partial class MatMul
             for (int r = 0; r < tailRows; r++)
                 result[fullGroups * 4 + r] = Avx2.IsSupported
                     ? VecDotQ4_K_Q8_KAvx2(tailBase + (long)r * rowBytes, xQ8K, superBlockCount)
-                    : VecDotQ4_K_Q8_KScalar(tailBase + (long)r * rowBytes, xQ8K, superBlockCount);
+                    : VecDotQ4_K_Q8_KPortable(tailBase + (long)r * rowBytes, xQ8K, superBlockCount);
         }
     }
 
@@ -1220,7 +1220,7 @@ public static unsafe partial class MatMul
             {
                 for (int r = 0; r < 4; r++)
                     result[g * 4 + r] = VecDotKQuantScalarR4(groupBase, r, xQ8K,
-                        superBlockCount, Q5_K_BlockBytes, &VecDotQ5_K_Q8_KScalar);
+                        superBlockCount, Q5_K_BlockBytes, &VecDotQ5_K_Q8_KPortable);
             }
         }
 
@@ -1231,7 +1231,7 @@ public static unsafe partial class MatMul
             for (int r = 0; r < tailRows; r++)
                 result[fullGroups * 4 + r] = Avx2.IsSupported
                     ? VecDotQ5_K_Q8_KAvx2(tailBase + (long)r * rowBytes, xQ8K, superBlockCount)
-                    : VecDotQ5_K_Q8_KScalar(tailBase + (long)r * rowBytes, xQ8K, superBlockCount);
+                    : VecDotQ5_K_Q8_KPortable(tailBase + (long)r * rowBytes, xQ8K, superBlockCount);
         }
     }
 
@@ -1268,7 +1268,7 @@ public static unsafe partial class MatMul
             {
                 for (int r = 0; r < 4; r++)
                     result[g * 4 + r] = VecDotKQuantScalarR4(groupBase, r, xQ8K,
-                        superBlockCount, Q6_K_BlockBytes, &VecDotQ6_K_Q8_KScalar);
+                        superBlockCount, Q6_K_BlockBytes, &VecDotQ6_K_Q8_KPortable);
             }
         }
 
@@ -1279,7 +1279,7 @@ public static unsafe partial class MatMul
             for (int r = 0; r < tailRows; r++)
                 result[fullGroups * 4 + r] = Avx2.IsSupported
                     ? VecDotQ6_K_Q8_KAvx2(tailBase + (long)r * rowBytes, xQ8K, superBlockCount)
-                    : VecDotQ6_K_Q8_KScalar(tailBase + (long)r * rowBytes, xQ8K, superBlockCount);
+                    : VecDotQ6_K_Q8_KPortable(tailBase + (long)r * rowBytes, xQ8K, superBlockCount);
         }
     }
 
@@ -1803,7 +1803,7 @@ public static unsafe partial class MatMul
         PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
         if (count == 0) return;
         ComputeKQuantR4Range(ref ctx, start, count, Q4_K_BlockBytes,
-            &VecDotQ4_K_Q8_K_4Rows, &VecDotQ4_K_Q8_KAvx2, &VecDotQ4_K_Q8_KScalar);
+            &VecDotQ4_K_Q8_K_4Rows, &VecDotQ4_K_Q8_KAvx2, &VecDotQ4_K_Q8_KPortable);
     }
 
     private static void ComputeRowsQ5_KR4Worker(nint ctxPtr, int threadIdx, int threadCount)
@@ -1812,7 +1812,7 @@ public static unsafe partial class MatMul
         PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
         if (count == 0) return;
         ComputeKQuantR4Range(ref ctx, start, count, Q5_K_BlockBytes,
-            &VecDotQ5_K_Q8_K_4Rows, &VecDotQ5_K_Q8_KAvx2, &VecDotQ5_K_Q8_KScalar);
+            &VecDotQ5_K_Q8_K_4Rows, &VecDotQ5_K_Q8_KAvx2, &VecDotQ5_K_Q8_KPortable);
     }
 
     private static void ComputeRowsQ6_KR4Worker(nint ctxPtr, int threadIdx, int threadCount)
@@ -1821,7 +1821,7 @@ public static unsafe partial class MatMul
         PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
         if (count == 0) return;
         ComputeKQuantR4Range(ref ctx, start, count, Q6_K_BlockBytes,
-            &VecDotQ6_K_Q8_K_4Rows, &VecDotQ6_K_Q8_KAvx2, &VecDotQ6_K_Q8_KScalar);
+            &VecDotQ6_K_Q8_K_4Rows, &VecDotQ6_K_Q8_KAvx2, &VecDotQ6_K_Q8_KPortable);
     }
 
     /// <summary>

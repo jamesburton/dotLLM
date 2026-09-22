@@ -292,10 +292,9 @@ public sealed unsafe class PQ2_0Tests
     [InlineData(7, 256, 5)]
     public void GemmPQ2_0_W2A8_MatchesFloatReference_WithinQuantTolerance(int m, int k, int n)
     {
-        // The W2A8 tier is AVX2-only by design (production dispatch gates it on Avx2.IsSupported);
-        // this test calls it directly, so it must skip on SSE-only hardware (found on a Westmere
-        // Xeon X5670, where it threw PlatformNotSupportedException).
-        Skip.IfNot(System.Runtime.Intrinsics.X86.Avx2.IsSupported, "W2A8 PQ2_0 GEMM requires AVX2.");
+        // The W2A8 tier needs SSSE3 at minimum (AVX2 → 256-bit tier, else the 128-bit tier added in
+        // issue #477); this test calls it directly, so it must skip on hardware without SSSE3.
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Ssse3.IsSupported, "W2A8 PQ2_0 GEMM requires SSSE3.");
         var rng = new Random(4026 + m * 1000 + k * 10 + n);
         sbyte[] ternary = new sbyte[m * k];
         for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
