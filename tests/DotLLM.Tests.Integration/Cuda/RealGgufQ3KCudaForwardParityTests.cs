@@ -64,7 +64,28 @@ public sealed class RealGgufQ3KCudaForwardParityTests
         string? ptxDir = FindPtxDir();
         Skip.If(ptxDir is null, "PTX files not found");
 
-        using GgufFile gguf = GgufFile.Open(path!);
+        // CUDA has no native Q3_K kernel (see remarks): every Q3_K tensor goes through the
+        // load-time dequant-and-expand fallback, which CudaKernels.EnsureQuantExpansionAllowed
+        // refuses by default. That fallback is exactly the path this test measures, so opt in
+        // for the duration of this test only. AllowQuantExpansion is read from
+        // DOTLLM_CUDA_ALLOW_QUANT_EXPANSION once, at type init, so the static is the lever, not
+        // the env var. Flipping a process-global is race-free only because every CUDA class is
+        // in the non-parallel GPU collection (#483).
+        bool prevAllowExpansion = CudaKernels.AllowQuantExpansion;
+        CudaKernels.AllowQuantExpansion = true;
+        try
+        {
+            RunParity(path!, ptxDir!);
+        }
+        finally
+        {
+            CudaKernels.AllowQuantExpansion = prevAllowExpansion;
+        }
+    }
+
+    private void RunParity(string path, string ptxDir)
+    {
+        using GgufFile gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         _output.WriteLine(
             $"{Path.GetFileName(path)}: {config.Architecture} {config.NumLayers}L/{config.HiddenSize}H "
@@ -87,7 +108,7 @@ public sealed class RealGgufQ3KCudaForwardParityTests
 
         var cpuModel = TransformerModel.LoadFromGguf(gguf, config);
         using var cpuKv = new SimpleKvCache(config.NumLayers, config.NumKvHeads, config.HeadDim, kvCapacity);
-        var cudaModel = CudaTransformerModel.LoadFromGguf(gguf, config, 0, ptxDir!);
+        var cudaModel = CudaTransformerModel.LoadFromGguf(gguf, config, 0, ptxDir);
         using var cudaKv = cudaModel.CreateKvCache(kvCapacity);
 
         try

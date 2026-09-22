@@ -18,6 +18,7 @@ namespace DotLLM.Tests.Unit.Models.Architectures;
 /// finite logits. The decisive evidence that the GGUF MLA + MoE loader chain
 /// actually works end-to-end without needing a 10 GB downloaded checkpoint.
 /// </summary>
+[Collection(DotLLM.Tests.Unit.Cuda.CudaCollection.Name)]
 public sealed class DeepSeekV2GgufLoadTests
 {
     // Tiny shapes that exercise both monolithic-Q (V2-Lite) and the
@@ -451,7 +452,7 @@ public sealed class DeepSeekV2GgufLoadTests
         // headroom). Real production sizes to actual prompt+decode budget.
         var config = fullConfig with { MaxSequenceLength = 16 };
 
-        using var model = CudaTransformerModel.LoadFromGguf(gguf, config);
+        using var model = LoadCudaAllowingQuantExpansion(gguf, config);
 
         // Prefill on 4 tokens. MLA dispatch uses the model's internal
         // _mlaKvCache; the kvCache parameter is ignored on the MLA path.
@@ -516,7 +517,7 @@ public sealed class DeepSeekV2GgufLoadTests
         // OOM the 12 GB cap before any inference.
         var config = fullConfig with { MaxSequenceLength = 16 };
 
-        using var model = CudaTransformerModel.LoadFromGguf(gguf, config);
+        using var model = LoadCudaAllowingQuantExpansion(gguf, config);
 
         // Prefill on 4 tokens. MLA dispatch uses the model's internal
         // _mlaKvCache; the kvCache parameter is ignored on the MLA path.
@@ -538,6 +539,32 @@ public sealed class DeepSeekV2GgufLoadTests
                 deviceId: 0, kvCache: null);
             AssertAllFinite(step, $"Q2_K decode step {i}");
             curTok = ArgmaxLogits(step);
+        }
+    }
+
+    /// <summary>
+    /// Loads on CUDA with <see cref="CudaKernels.AllowQuantExpansion"/> opted in for the load
+    /// only. The Q3_K_M and Q2_K mixtures carry Q3_K tensors (Q3_K_M's token_embd among them),
+    /// which CUDA has no native kernel for, so they take the load-time dequant-and-expand
+    /// fallback that <see cref="CudaKernels.EnsureQuantExpansionAllowed"/> refuses by default.
+    /// These smokes predate that guard and are about whether the full model loads and decodes
+    /// within 12 GB, so they opt in. The flag is read from the env var once at type init, so the
+    /// static is the lever; it is process-global, which is why this class is in the
+    /// non-parallel CUDA collection (the flag must not flip under
+    /// <c>CudaQuantExpansionGateTests</c>, which asserts the default).
+    /// </summary>
+    private static CudaTransformerModel LoadCudaAllowingQuantExpansion(
+        GgufFile gguf, DotLLM.Core.Models.ModelConfig config)
+    {
+        bool prevAllowExpansion = CudaKernels.AllowQuantExpansion;
+        CudaKernels.AllowQuantExpansion = true;
+        try
+        {
+            return CudaTransformerModel.LoadFromGguf(gguf, config);
+        }
+        finally
+        {
+            CudaKernels.AllowQuantExpansion = prevAllowExpansion;
         }
     }
 
