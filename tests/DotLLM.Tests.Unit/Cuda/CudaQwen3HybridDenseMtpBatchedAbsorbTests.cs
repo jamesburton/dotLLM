@@ -53,17 +53,19 @@ public sealed class CudaQwen3HybridDenseMtpBatchedAbsorbTests : IDisposable
     }
 
     [SkippableTheory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void BatchedAbsorb_IsBitIdenticalToPerTokenAbsorb(bool mtpHasOwnHeadTensors)
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]    // issue #486: Q8_0 head -> multi-column absorb vs single-row per-token GEMVs
+    [InlineData(false, true)]
+    public void BatchedAbsorb_IsBitIdenticalToPerTokenAbsorb(bool mtpHasOwnHeadTensors, bool q8_0MtpHead)
     {
         Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
         string? ptxDir = FindPtxDir();
         Skip.If(ptxDir is null, "PTX files not found");
 
         string path = SyntheticQwen35HybridDenseMtpGguf.Write(
-            Path.Combine(_scratch, $"mtp-own{mtpHasOwnHeadTensors}.gguf"),
-            withMtp: true, mtpHasOwnHeadTensors: mtpHasOwnHeadTensors);
+            Path.Combine(_scratch, $"mtp-own{mtpHasOwnHeadTensors}-q8{q8_0MtpHead}.gguf"),
+            withMtp: true, mtpHasOwnHeadTensors: mtpHasOwnHeadTensors, q8_0MtpHead: q8_0MtpHead);
 
         var perToken = Run(path, ptxDir!, perToken: true);
         var batched = Run(path, ptxDir!, perToken: false);
@@ -76,10 +78,12 @@ public sealed class CudaQwen3HybridDenseMtpBatchedAbsorbTests : IDisposable
 
         // Guard against a vacuous pass: the absorbed rows must be real, distinct data.
         Assert.Contains(batched.Keys, v => v != 0f);
-        _out.WriteLine($"absorbed {batched.Length} positions; K/V/pending/logits bit-identical");
+        _out.WriteLine($"absorbed {batched.Length} positions; K/V/pending/logits bit-identical " +
+                       $"(Q8_0 head: {q8_0MtpHead}; register-blocked Q8_0 GEMV: {batched.UsesRbQ8})");
     }
 
-    private sealed record Snapshot(int Length, float[] Keys, float[] Values, float[] Pending, float[] DraftLogits);
+    private sealed record Snapshot(int Length, float[] Keys, float[] Values, float[] Pending, float[] DraftLogits,
+                                   bool UsesRbQ8);
 
     private static unsafe Snapshot Run(string path, string ptxDir, bool perToken)
     {
@@ -102,7 +106,7 @@ public sealed class CudaQwen3HybridDenseMtpBatchedAbsorbTests : IDisposable
 
             using ITensor draft = model.ForwardMtp(state, 9, p);
             float[] logits = new ReadOnlySpan<float>((void*)draft.DataPointer, config.VocabSize).ToArray();
-            return new Snapshot(p, keys, values, pending, logits);
+            return new Snapshot(p, keys, values, pending, logits, model.MtpUsesRbQ8Gemv);
         }
         finally
         {

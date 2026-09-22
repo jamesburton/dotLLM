@@ -84,6 +84,22 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
     internal bool UseRecurrentRowSnapshots { get; set; } =
         Environment.GetEnvironmentVariable(DisableRowSnapshotsEnvVar) != "0";
 
+    /// <summary>Env switch that forces full-logits draft steps even on models with a native draft argmax.</summary>
+    internal const string DisableDraftArgMaxEnvVar = "DOTLLM_MTP_DRAFT_ARGMAX";
+
+    /// <summary>
+    /// Take the draft token from <see cref="IModel.ForwardMtpArgMax"/> when the draft is unconstrained
+    /// and the model reports <see cref="IModel.SupportsMtpArgMax"/> (issue #486) — one int from the
+    /// device instead of a full-vocabulary logits row per draft step. Defaults to on unless
+    /// <c>DOTLLM_MTP_DRAFT_ARGMAX=0</c>; tests flip it in-process. A constrained draft always takes
+    /// full logits, because the mask must be applied before the argmax.
+    /// </summary>
+    internal bool UseDraftArgMax { get; set; } =
+        Environment.GetEnvironmentVariable(DisableDraftArgMaxEnvVar) != "0";
+
+    /// <summary>Draft steps whose token came from <see cref="IModel.ForwardMtpArgMax"/>.</summary>
+    internal int DraftArgMaxSteps { get; private set; }
+
     /// <summary>Rounds whose rejection was rolled back by a row snapshot instead of a replay.</summary>
     internal int ReplaysAvoided { get; private set; }
 
@@ -150,20 +166,32 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
             //    later step pairs the head's own output with the token it just drafted. ──
             int originalGenCount = generatedIds.Count;
             int draftToken = lastToken;
+            // Issue #486: an unconstrained greedy draft needs only the argmax, which a GPU model can
+            // reduce on the device. The decoder is greedy-only, so the constraint is the only gate.
+            bool draftArgMax = draftConstraint is null && UseDraftArgMax && targetModel.SupportsMtpArgMax;
             try
             {
                 for (int i = 0; i < k; i++)
                 {
                     long fwdStart = Stopwatch.GetTimestamp();
-                    using ITensor draftLogits = targetModel.ForwardMtp(mtpState, draftToken, position + i);
-                    draftTicks += Stopwatch.GetTimestamp() - fwdStart;
-
-                    unsafe
+                    if (draftArgMax)
                     {
-                        var logitSpan = new Span<float>((void*)draftLogits.DataPointer, vocabSize);
-                        if (draftConstraint != null)
-                            TokenMaskApplier.Apply(logitSpan, draftConstraint.GetAllowedTokens());
-                        draftToken = TensorPrimitives.IndexOfMax((ReadOnlySpan<float>)logitSpan);
+                        draftToken = targetModel.ForwardMtpArgMax(mtpState, draftToken, position + i);
+                        draftTicks += Stopwatch.GetTimestamp() - fwdStart;
+                        DraftArgMaxSteps++;
+                    }
+                    else
+                    {
+                        using ITensor draftLogits = targetModel.ForwardMtp(mtpState, draftToken, position + i);
+                        draftTicks += Stopwatch.GetTimestamp() - fwdStart;
+
+                        unsafe
+                        {
+                            var logitSpan = new Span<float>((void*)draftLogits.DataPointer, vocabSize);
+                            if (draftConstraint != null)
+                                TokenMaskApplier.Apply(logitSpan, draftConstraint.GetAllowedTokens());
+                            draftToken = TensorPrimitives.IndexOfMax((ReadOnlySpan<float>)logitSpan);
+                        }
                     }
 
                     draftTokens[i] = draftToken;

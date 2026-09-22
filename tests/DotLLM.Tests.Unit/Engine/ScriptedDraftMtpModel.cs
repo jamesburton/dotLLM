@@ -51,6 +51,9 @@ internal sealed class ScriptedDraftMtpModel(IModel inner, IReadOnlyList<int> gre
     public void RestoreRecurrentStateToRow(int row) => inner.RestoreRecurrentStateToRow(row);
 
     public bool SupportsMtp => inner.SupportsMtp;
+
+    // Deliberately NOT forwarded (issue #486): SupportsMtpArgMax stays false, so the decoder always
+    // calls ForwardMtp below and the scripted logits rewrite cannot be bypassed by a native argmax.
     public int MaxAllRowLogitsLength => inner.MaxAllRowLogitsLength;
     public IMtpState? CreateMtpState() => inner.CreateMtpState();
     public IMtpState? CreateMtpState(int maxSequenceLength) => inner.CreateMtpState(maxSequenceLength);

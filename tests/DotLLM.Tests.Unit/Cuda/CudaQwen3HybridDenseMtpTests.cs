@@ -4,6 +4,7 @@ using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
 using DotLLM.Cuda.Architectures;
+using DotLLM.Cuda.Interop;
 using DotLLM.Engine;
 using DotLLM.Engine.Samplers;
 using DotLLM.Models.Gguf;
@@ -462,6 +463,116 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
             Assert.Equal(nextLogitsClean[i], nextLogitsFromDecoder[i]); // byte-identical float compare
     }
 
+    // ── Issue #486: device argmax for the unconstrained greedy draft ─────────
+
+    /// <summary>
+    /// <see cref="CudaQwen3HybridDenseTransformerModel.ForwardMtpArgMax"/> must draft exactly the
+    /// tokens the host argmax of <see cref="CudaQwen3HybridDenseTransformerModel.ForwardMtp"/> drafts,
+    /// and leave the head's state (KV rows, pending hidden) bit-identical — it is the same draft step
+    /// with a different read-back. Four chained steps on two fresh model instances, with the F32 head
+    /// and with the Q8_0 head (register-blocked GEMV path).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ForwardMtpArgMax_MatchesHostArgMaxOfForwardMtp_AndLeavesStateIdentical(bool q8_0MtpHead)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir is null, "PTX files not found");
+
+        string path = SyntheticQwen35HybridDenseMtpGguf.Write(
+            Path.Combine(_scratch, $"qwen35-mtp-argmax-q8{q8_0MtpHead}.gguf"), withMtp: true, q8_0MtpHead: q8_0MtpHead);
+
+        var full = RunDraftChain(path, ptxDir!, deviceArgMax: false);
+        var device = RunDraftChain(path, ptxDir!, deviceArgMax: true);
+        Skip.IfNot(device.Supported, "argmax_f32.ptx not generated (nvcc -ptx -arch=compute_75 on a CUDA box)");
+
+        _out.WriteLine($"host argmax:   {string.Join(",", full.Tokens)}");
+        _out.WriteLine($"device argmax: {string.Join(",", device.Tokens)}");
+        Assert.Equal(full.Tokens, device.Tokens);
+        Assert.Equal(full.Keys.Length, device.Keys.Length);
+        for (int i = 0; i < full.Keys.Length; i++)
+            Assert.Equal(BitConverter.SingleToInt32Bits(full.Keys[i]), BitConverter.SingleToInt32Bits(device.Keys[i]));
+        for (int i = 0; i < full.Pending.Length; i++)
+            Assert.Equal(BitConverter.SingleToInt32Bits(full.Pending[i]), BitConverter.SingleToInt32Bits(device.Pending[i]));
+    }
+
+    /// <summary>
+    /// Decoder level: with the device argmax on (the default when its PTX is present) and off, MTP
+    /// decode must produce the same tokens as plain greedy decode — and the "on" run must actually
+    /// have taken the argmax path.
+    /// </summary>
+    [SkippableFact]
+    public void DraftAndVerify_DeviceArgMaxOnAndOff_BothMatchPlainGreedy_OnRealCudaModel()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir is null, "PTX files not found");
+
+        string path = SyntheticQwen35HybridDenseMtpGguf.Write(
+            Path.Combine(_scratch, "qwen35-mtp-fullattn-argmax.gguf"), withMtp: true, fullAttnInterval: 1);
+
+        const int startToken = 1, totalNewTokens = 12, k = 3;
+        List<int> plain = RunPlainGreedy(path, ptxDir!, startToken, totalNewTokens);
+        List<int> on = RunSpeculative(path, ptxDir!, startToken, totalNewTokens, k, useDraftArgMax: true,
+            out int argMaxSteps, out bool supported);
+        List<int> off = RunSpeculative(path, ptxDir!, startToken, totalNewTokens, k, useDraftArgMax: false,
+            out int argMaxStepsOff, out _);
+
+        _out.WriteLine($"device argmax supported: {supported}; argmax draft steps on={argMaxSteps} off={argMaxStepsOff}");
+        Assert.Equal(plain, on);
+        Assert.Equal(plain, off);
+        Assert.Equal(0, argMaxStepsOff);
+        if (supported)
+            Assert.True(argMaxSteps > 0, "device argmax is available but the decoder never used it");
+        else
+            Assert.Equal(0, argMaxSteps);
+    }
+
+    private sealed record DraftChain(bool Supported, int[] Tokens, float[] Keys, float[] Pending);
+
+    private static unsafe DraftChain RunDraftChain(string path, string ptxDir, bool deviceArgMax)
+    {
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var model = CudaQwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
+        if (deviceArgMax && !model.SupportsMtpArgMax)
+            return new DraftChain(false, [], [], []);
+
+        using var kvCache = model.CreateKvCache(maxSeqLen: 64);
+        using var mtpState = (CudaMtpState)model.CreateMtpState()!;
+        using (ITensor _ = model.Forward([0, 1, 2], [0, 1, 2], deviceId: -1, kvCache, adapter: null, mtpState)) { }
+
+        const int steps = 4;
+        var tokens = new int[steps];
+        int token = NextToken;
+        for (int i = 0; i < steps; i++)
+        {
+            if (deviceArgMax)
+            {
+                token = model.ForwardMtpArgMax(mtpState, token, 3 + i);
+            }
+            else
+            {
+                using ITensor logits = model.ForwardMtp(mtpState, token, 3 + i);
+                token = System.Numerics.Tensors.TensorPrimitives.IndexOfMax(
+                    new ReadOnlySpan<float>((void*)logits.DataPointer, config.VocabSize));
+            }
+            tokens[i] = token;
+        }
+
+        int n = mtpState.CurrentLength * mtpState.KvStride;
+        var keys = new float[n];
+        fixed (float* p = keys)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, mtpState.KeyCacheDevicePtr, (nuint)(n * sizeof(float))).ThrowOnError();
+        var pending = new float[config.HiddenSize];
+        fixed (float* p = pending)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, mtpState.PendingHiddenDevicePtr,
+                (nuint)(pending.Length * sizeof(float))).ThrowOnError();
+        return new DraftChain(true, tokens, keys, pending);
+    }
+
     private static float[] RunSingleMtpStep(string path, string ptxDir)
     {
         using var gguf = GgufFile.Open(path);
@@ -503,13 +614,21 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
 
     private static List<int> RunSpeculative(
         string path, string ptxDir, int startToken, int totalNewTokens, int k)
+        => RunSpeculative(path, ptxDir, startToken, totalNewTokens, k, useDraftArgMax: null, out _, out _);
+
+    private static List<int> RunSpeculative(
+        string path, string ptxDir, int startToken, int totalNewTokens, int k, bool? useDraftArgMax,
+        out int draftArgMaxSteps, out bool argMaxSupported)
     {
         using var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         using var model = CudaQwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
         Assert.True(model.SupportsMtp);
+        argMaxSupported = model.SupportsMtpArgMax;
 
         var decoder = new MtpSpeculativeDecoder(greedy: true);
+        if (useDraftArgMax is { } use)
+            decoder.UseDraftArgMax = use;
         var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
 
         var generatedIds = new List<int> { startToken };
@@ -546,6 +665,7 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
             position += result.AcceptedCount;
         }
 
+        draftArgMaxSteps = decoder.DraftArgMaxSteps;
         return generatedIds.Take(totalNewTokens + 1).ToList();
     }
 
