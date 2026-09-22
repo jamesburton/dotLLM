@@ -536,4 +536,29 @@ public interface IModel : IDisposable
         => throw new NotSupportedException(
             $"{GetType().Name} does not support MTP self-speculative decoding (SupportsMtp=false). " +
             "Check SupportsMtp before creating an IMtpState or calling ForwardMtp. See issue #253.");
+
+    /// <summary>
+    /// True when <see cref="ForwardMtpArgMax"/> is implemented natively — typically a GPU backend
+    /// that reduces the draft logits on the device and returns one token id instead of copying the
+    /// whole vocabulary row to the host (issue #486). Default <see langword="false"/>: callers use
+    /// <see cref="ForwardMtp"/> and take the argmax themselves.
+    /// </summary>
+    bool SupportsMtpArgMax => false;
+
+    /// <summary>
+    /// Runs exactly the draft step <see cref="ForwardMtp"/> runs — same state updates — but returns
+    /// only the argmax of its logits: the index of the largest value, the <b>lowest</b> such index on
+    /// a tie, the first NaN if any value is NaN, and <c>+0</c> ranked above <c>-0</c> — the contract of
+    /// <c>System.Numerics.Tensors.TensorPrimitives.IndexOfMax</c> over
+    /// the <see cref="ForwardMtp"/> row. Only for an <b>unconstrained greedy</b> draft: a caller that
+    /// must mask or sample the logits needs <see cref="ForwardMtp"/>.
+    /// </summary>
+    /// <param name="state">As for <see cref="ForwardMtp"/>.</param>
+    /// <param name="tokenId">As for <see cref="ForwardMtp"/>.</param>
+    /// <param name="position">As for <see cref="ForwardMtp"/>.</param>
+    /// <returns>The drafted token id.</returns>
+    /// <exception cref="NotSupportedException"><see cref="SupportsMtpArgMax"/> is <see langword="false"/>.</exception>
+    int ForwardMtpArgMax(IMtpState state, int tokenId, int position)
+        => throw new NotSupportedException(
+            $"{GetType().Name} has no native MTP draft argmax (SupportsMtpArgMax=false); use ForwardMtp.");
 }

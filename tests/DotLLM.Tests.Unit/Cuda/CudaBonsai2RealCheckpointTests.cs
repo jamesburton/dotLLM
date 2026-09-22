@@ -125,6 +125,45 @@ public sealed class CudaBonsai2RealCheckpointTests
     }
 
     /// <summary>
+    /// Issue #486: the device-argmax draft (<c>ForwardMtpArgMax</c>, what the decoder uses for an
+    /// unconstrained greedy draft) must draft the same tokens on the real checkpoint as the host
+    /// argmax of the full logits — including when two logits tie. One prefill; the head is rewound
+    /// to the post-prefill state between the two chains.
+    /// </summary>
+    [SkippableFact]
+    public void MtpDraftTokens_DeviceArgMax_MatchesFullLogits_OnRealBonsai2Checkpoint()
+    {
+        string? path = FindCheckpoint();
+        Skip.If(path is null,
+            "Bonsai 2 MTP checkpoint not found (set DOTLLM_BONSAI2_MTP_GGUF or populate the HF hub cache).");
+        string ptxDir = SkipUnlessCudaWithFwht();
+
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var model = CudaQwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
+        Skip.IfNot(model.SupportsMtpArgMax, "argmax_f32.ptx not generated (nvcc -ptx -arch=compute_75 on a CUDA box)");
+        int p = PromptTokens.Length;
+        using var kv = model.CreateKvCache(p + DraftSteps + 2);
+        using var mtp = model.CreateMtpState()!;
+        int first;
+        using (ITensor prefill = model.Forward(PromptTokens, Positions(p), -1, kv, adapter: null, mtp))
+            first = ArgMaxWithGap(prefill, config.VocabSize, lastRow: true).Token;
+
+        Run full = Draft((t, pos) => model.ForwardMtp(mtp, t, pos), first, config.VocabSize);
+
+        mtp.Rollback(p);
+        mtp.SeedFromCapturedRow(p - 1);   // the prefill absorb's own seed
+        var device = new int[DraftSteps];
+        int token = first;
+        for (int i = 0; i < DraftSteps; i++)
+            device[i] = token = model.ForwardMtpArgMax(mtp, token, p + i);
+
+        _out.WriteLine($"full-logits draft:   {string.Join(",", full.Tokens)}  gaps {string.Join(",", full.Gaps.Select(g => g.ToString("E3")))}");
+        _out.WriteLine($"device-argmax draft: {string.Join(",", device)}");
+        Assert.Equal(full.Tokens, device);
+    }
+
+    /// <summary>
     /// Issue #482 perf probe (no perf assertion): wall-clock ms per MTP draft step on the real
     /// checkpoint, plus — with <c>DOTLLM_HYBRID_PROFILE=1</c> — the <c>mtp-*</c> category breakdown
     /// of <c>ForwardMtpCore</c> and the batched verify absorb. Each round drafts
@@ -192,7 +231,8 @@ public sealed class CudaBonsai2RealCheckpointTests
 
         double tickMs = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         _out.WriteLine($"MTP draft: {draftTicks * tickMs / drafts:F3} ms/step over {drafts} steps " +
-                       $"(staged Q8_0 GEMV {(model.MtpUsesStagedQ8Gemv ? "ON" : "off — PTX absent or disabled")}; profiler {(Environment.GetEnvironmentVariable("DOTLLM_HYBRID_PROFILE") == "1" ? "ON — timings perturbed by per-mark syncs" : "off")})");
+                       $"(Q8_0 GEMV: {(model.MtpUsesRbQ8Gemv ? "register-blocked" : model.MtpUsesStagedQ8Gemv ? "staged" : "original — PTX absent or disabled")}; " +
+                       $"profiler {(Environment.GetEnvironmentVariable("DOTLLM_HYBRID_PROFILE") == "1" ? "ON — timings perturbed by per-mark syncs" : "off")})");
         _out.WriteLine($"verify S={DraftSteps + 1} (incl. batched absorb): {verifyTicks * tickMs / rounds:F3} ms/round");
         // Mirror the profiler's totals into the test output (ProfileReportAndReset writes stderr).
         foreach (var kvp in CudaQwen3HybridDenseTransformerModel.ProfileTotalsMs.OrderBy(e => e.Key, StringComparer.Ordinal))
@@ -201,6 +241,43 @@ public sealed class CudaBonsai2RealCheckpointTests
             _out.WriteLine($"  {kvp.Key,-28} total={kvp.Value,9:F2}ms  calls={n,5}  avg={kvp.Value / n,8:F4}ms");
         }
         CudaQwen3HybridDenseTransformerModel.ProfileReportAndReset(); // no-op when the env var is unset
+
+        // Issue #486: the same draft steps through the device argmax (what the decoder takes for an
+        // unconstrained greedy draft) — no 248k-float logits D2H per step.
+        if (!model.SupportsMtpArgMax)
+        {
+            _out.WriteLine("MTP draft (device argmax): skipped — argmax_f32.ptx absent");
+            return;
+        }
+        long argTicks = 0;
+        int argDrafts = 0;
+        for (int r = 0; r < warmupRounds + rounds; r++)
+        {
+            if (r == warmupRounds)
+            {
+                CudaQwen3HybridDenseTransformerModel.ProfileReportAndReset();
+                argTicks = 0;
+                argDrafts = 0;
+            }
+            mtp.Rollback(p);
+            mtp.SeedFromCapturedRow(0);
+            int token = first;
+            for (int i = 0; i < DraftSteps; i++)
+            {
+                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                token = model.ForwardMtpArgMax(mtp, token, p + i);
+                argTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+                argDrafts++;
+                Assert.InRange(token, 0, config.VocabSize - 1);
+            }
+        }
+        _out.WriteLine($"MTP draft (device argmax): {argTicks * tickMs / argDrafts:F3} ms/step over {argDrafts} steps");
+        foreach (var kvp in CudaQwen3HybridDenseTransformerModel.ProfileTotalsMs.OrderBy(e => e.Key, StringComparer.Ordinal))
+        {
+            int n = CudaQwen3HybridDenseTransformerModel.ProfileCounts.GetValueOrDefault(kvp.Key, 1);
+            _out.WriteLine($"  {kvp.Key,-28} total={kvp.Value,9:F2}ms  calls={n,5}  avg={kvp.Value / n,8:F4}ms");
+        }
+        CudaQwen3HybridDenseTransformerModel.ProfileReportAndReset();
     }
 
     // ── runs ─────────────────────────────────────────────────────────────────

@@ -1601,7 +1601,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         {
             if (i == 0) state.SetPendingFromCarry();
             else state.SetPendingFromCapturedRow(i - 1);
-            ForwardMtpCore(mtpHead, state, tokenIds[i], positions[i], computeLogits: false);
+            ForwardMtpCore(mtpHead, state, tokenIds[i], positions[i], MtpStepOutput.None, out _);
         }
         state.SeedFromCapturedRow(tokenIds.Length - 1);
     }
@@ -1964,6 +1964,58 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     public ITensor ForwardMtp(IMtpState state, int tokenId, int position)
     {
+        var (mtpHead, mtp) = ValidateMtpCall(state);
+        _context.MakeCurrent();
+        return ForwardMtpCore(mtpHead, mtp, tokenId, position, MtpStepOutput.Logits, out _)!;
+    }
+
+    /// <summary>What a <see cref="ForwardMtpCore"/> step hands back.</summary>
+    private enum MtpStepOutput
+    {
+        /// <summary>Absorb: only the KV row matters; stops before the LM head.</summary>
+        None,
+        /// <summary>Draft: the full logits row, copied to a host tensor.</summary>
+        Logits,
+        /// <summary>Greedy draft (issue #486): the argmax, reduced on the device — one int copied back.</summary>
+        ArgMax,
+    }
+
+    // Issue #486: optional device argmax for the unconstrained greedy draft, probed on first use.
+    private CudaArgMaxF32? _mtpArgMax;
+    private bool _mtpArgMaxProbed;
+
+    private CudaArgMaxF32? EnsureMtpArgMax()
+    {
+        if (!_mtpArgMaxProbed)
+        {
+            _context.MakeCurrent();
+            _mtpArgMax = CudaArgMaxF32.TryLoad(_kernels.PtxDirectory);
+            _mtpArgMaxProbed = true;
+        }
+        return _mtpArgMax;
+    }
+
+    /// <summary>
+    /// True when the model has an MTP head and the device argmax kernel loaded (issue #486): the
+    /// decoder then takes an unconstrained greedy draft token from <see cref="ForwardMtpArgMax"/>
+    /// instead of copying the 248k-float logits row to the host every draft step.
+    /// </summary>
+    public bool SupportsMtpArgMax => !_disposed && _mtpHead is not null && EnsureMtpArgMax() is not null;
+
+    /// <inheritdoc/>
+    public int ForwardMtpArgMax(IMtpState state, int tokenId, int position)
+    {
+        var (mtpHead, mtp) = ValidateMtpCall(state);
+        if (EnsureMtpArgMax() is null)
+            throw new NotSupportedException(
+                $"{CudaArgMaxF32.PtxFileName} is not available (SupportsMtpArgMax=false); use ForwardMtp.");
+        _context.MakeCurrent();
+        ForwardMtpCore(mtpHead, mtp, tokenId, position, MtpStepOutput.ArgMax, out int token);
+        return token;
+    }
+
+    private (CudaMtpHeadWeights Head, CudaMtpState State) ValidateMtpCall(IMtpState state)
+    {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_mtpHead is not { } mtpHead)
             throw new NotSupportedException(
@@ -1972,9 +2024,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             throw new ArgumentException(
                 $"CudaQwen3HybridDenseTransformerModel requires a CUDA CudaMtpState; got {state.GetType().Name}.",
                 nameof(state));
-
-        _context.MakeCurrent();
-        return ForwardMtpCore(mtpHead, mtp, tokenId, position, computeLogits: true)!;
+        return (mtpHead, mtp);
     }
 
     /// <summary>
@@ -1996,20 +2046,20 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// </list>
     /// </summary>
     private ITensor? ForwardMtpCore(in CudaMtpHeadWeights mtpHead, CudaMtpState state, int tokenId, int position,
-                                    bool computeLogits)
+                                    MtpStepOutput output, out int argmax)
     {
         // Category profiler (issue #482): the trunk arms it only for seqLen == 1, and a draft step
         // runs right after an S = K+1 verify, so it would otherwise always be disarmed here. Arm it
-        // for DRAFT steps only (computeLogits) — per-token absorb steps would pollute the same keys —
-        // and restore the caller's state on exit. Every category is prefixed "mtp-".
+        // for DRAFT steps only — per-token absorb steps would pollute the same keys — and restore
+        // the caller's state on exit. Every category is prefixed "mtp-".
         if (!ProfileTrace)
-            return ForwardMtpCoreBody(mtpHead, state, tokenId, position, computeLogits);
+            return ForwardMtpCoreBody(mtpHead, state, tokenId, position, output, out argmax);
 
         bool profPrev = _profileActiveForThisCall;
-        _profileActiveForThisCall = computeLogits;
+        _profileActiveForThisCall = output != MtpStepOutput.None;
         try
         {
-            return ForwardMtpCoreBody(mtpHead, state, tokenId, position, computeLogits);
+            return ForwardMtpCoreBody(mtpHead, state, tokenId, position, output, out argmax);
         }
         finally
         {
@@ -2018,8 +2068,9 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     }
 
     private ITensor? ForwardMtpCoreBody(in CudaMtpHeadWeights mtpHead, CudaMtpState state, int tokenId, int position,
-                                        bool computeLogits)
+                                        MtpStepOutput output, out int argmax)
     {
+        argmax = -1;
         ProfStart();
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
@@ -2174,7 +2225,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         ProfMark("mtp-7b-ffn-swiglu-down");
 
         state.Advance();
-        if (!computeLogits)
+        if (output == MtpStepOutput.None)
         {
             // Absorb: only the KV row mattered; the caller seeds the next step from a trunk row.
             _stream.Synchronize();
@@ -2210,6 +2261,17 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         ProfMark("mtp-8-head-norm-rot");
         MtpGemm(headWeight, headQt, headIn, s.LogitsDevice, headOutputDim, headInputDim);
         ProfMark("mtp-9-lm-head");
+
+        if (output == MtpStepOutput.ArgMax)
+        {
+            // Issue #486: reduce on the device over the same vocabSize floats the Logits path copies,
+            // and read back one int (pinned slot, async copy on the stream) — no host tensor.
+            _mtpArgMax!.Launch(s.LogitsDevice, vocabSize, streamH);
+            _stream.Synchronize();
+            argmax = _mtpArgMax.Result;
+            ProfMark("mtp-10-argmax-d2h");
+            return null;
+        }
 
         _stream.Synchronize();
         var shape = new TensorShape(1, vocabSize);
@@ -3605,6 +3667,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _mtpQ8Staged = null;
         _mtpQ8Rb?.Dispose();
         _mtpQ8Rb = null;
+        _mtpArgMax?.Dispose();
+        _mtpArgMax = null;
         _hadamard?.Dispose();
 
         _state.Dispose();
