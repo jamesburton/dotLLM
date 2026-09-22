@@ -22,6 +22,12 @@ namespace DotLLM.Cuda;
 /// single-token decode through the S=1 instantiation of the same kernel — an A/B switch only; the
 /// shipped decode path stays on <c>pq2_0_gemv_f32io</c> until a measurement says otherwise.
 /// </para>
+/// <para>
+/// <b>Issue #485.</b> <c>DOTLLM_CUDA_PQ2_0_DP4A=1</c> takes precedence over both of the above for
+/// <c>seqLen == 1</c> and <c>2..</c><see cref="MaxColumns"/>: the activations are quantized to int8
+/// (the CPU W2A8 tier's per-32 Q8_0 rounding) and the GEMV runs on <c>__dp4a</c>
+/// (<see cref="CudaKernels.LaunchPQ2_0GemvDp4a"/>). Opt-in until measured.
+/// </para>
 /// </remarks>
 public static class CudaSmallSGemvDispatch
 {

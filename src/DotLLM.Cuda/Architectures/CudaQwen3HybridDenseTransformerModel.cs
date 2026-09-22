@@ -1927,6 +1927,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// <summary>Test hook (issue #482): whether the MTP path is dispatching Q8_0 to the staged kernel.</summary>
     internal bool MtpUsesStagedQ8Gemv => _mtpQ8Staged is not null;
 
+    /// <summary>
+    /// Test hook (issue #485): whether the dp4a PQ2_0 GEMV module is loaded, so a test that switches
+    /// the path on can prove it is not silently measuring the fallback.
+    /// </summary>
+    internal bool PQ2_0Dp4aAvailable => _kernels.HasPQ2_0GemvDp4a;
+
     /// <inheritdoc/>
     public ITensor ForwardMtp(IMtpState state, int tokenId, int position)
     {
