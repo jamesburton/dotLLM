@@ -29,7 +29,8 @@
 //     segment [c0 + 32*warp, c0 + 32*warp + 32).
 //   * Per block: s = 0; s = fma((float)q_j, x_j, s) for j = 0..31 in order; acc = fma(d, s, acc).
 //     Explicit __fmaf_rn (the original's PTX is exactly these fma.rn.f32 under nvcc's default
-//     -fmad=true), so the result does not depend on -fmad.
+//     -fmad=true), so the result does not depend on -fmad. (float)q_j is produced by an exact
+//     PRMT + FSUB conversion (q8r_byte) instead of I2F — a different instruction, the same value.
 //   * Reduction: the same 5-step __shfl_down tree per 32-lane warp (lanes owning no block
 //     contribute +0.0, as in the original), then the same 8-slot second-stage tree. Warps the
 //     original launches but that own no block would contribute a partial of exactly +0.0f; they
@@ -61,10 +62,15 @@
 static_assert(Q8R_ROWS * Q8R_SEG_STRIDE <= Q8R_BUF_BYTES, "weight slots must fit the warp buffer");
 static_assert(Q8R_SEG_STRIDE % 16 == 0, "row slots must stay 16-byte aligned");
 
-// Signed byte `b` of a little-endian word, as float (exact, like (float)(int8_t)q).
-__device__ __forceinline__ float q8r_byte(uint32_t w, int b)
+// Signed byte `b` of a little-endian word, as float — exactly (float)(int8_t)q, but without the
+// quarter-rate I2F conversion (one per weight would load the conversion unit to ~45% at 360 GB/s on
+// sm_86). `wx` is the word with every byte's sign bit flipped (w ^ 0x80808080), so byte b holds the
+// unsigned u = q + 128. PRMT builds the float 0x4B0000uu = 2^23 + u (exact: every integer below 2^24
+// is representable), and subtracting 2^23 + 128 leaves q exactly (+0.0 for q = 0, like the I2F).
+// __fsub_rn keeps the compiler from contracting the subtraction into the following fma.
+__device__ __forceinline__ float q8r_byte(uint32_t wx, int b)
 {
-    return __int2float_rn(((int)(w << (24 - 8 * b))) >> 24);
+    return __fsub_rn(__int_as_float((int)__byte_perm(wx, 0x4B000000u, 0x7540u + (unsigned)b)), 8388736.0f);
 }
 
 template <int NCOLS>
@@ -174,7 +180,7 @@ __device__ __forceinline__ void q8r_body(
                 const unsigned short dbits = (unsigned short)(odd ? (wv[0] >> 16) : (wv[0] & 0xFFFFu));
                 dsc[r] = __half2float(__ushort_as_half(dbits));
                 #pragma unroll
-                for (int i = 0; i < 8; i++) qw[r][i] = __funnelshift_rc(wv[i], wv[i + 1], sh);
+                for (int i = 0; i < 8; i++) qw[r][i] = __funnelshift_rc(wv[i], wv[i + 1], sh) ^ 0x80808080u;   // sign-flipped for q8r_byte
             }
         }
         __syncwarp();                               // wb is reused for x below
