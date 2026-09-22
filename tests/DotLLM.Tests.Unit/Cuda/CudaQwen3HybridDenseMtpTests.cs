@@ -511,22 +511,24 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
         using var kvCache = model.CreateKvCache(maxSeqLen: 64);
         using var mtpState = (CudaMtpState)model.CreateMtpState()!;
 
-        // Prefill: seed the target KV-cache with the start token at position 0. DraftAndVerify's
-        // own contract (see its remarks: "lastToken already occupies position in kvCacheTarget")
-        // means `position` must equal lastToken's OWN KV-cache slot, not "prompt length + decoded
-        // so far" naively read as generatedIds.Count -- so it starts at 0 (matching the prefill
-        // call just above, not 1). Confirmed against SpeculativeDecoder's identical convention
-        // (verifyPositions[0] = position, holding lastToken). The CPU mock-model engine tests this
-        // was originally copied from never caught an off-by-one here because their mock Forward
-        // ignores position entirely for logit computation; this real (position-sensitive,
-        // RoPE-using) CUDA model does not tolerate it.
-        using (ITensor _ = model.Forward([startToken], [0], deviceId: -1, kvCache)) { }
+        // Mirror TextGenerator (issue #475): prefill the prompt [startToken] WITH the MTP state, so
+        // the head absorbs it and is seeded from h_0, sample t1 from the prefill, and enter the round
+        // loop at t1's own KV slot (1). `position` is lastToken's own slot, and since #469 the verify
+        // forward [lastToken, d1..dK] is the first time the trunk sees lastToken — so lastToken must
+        // never have been forwarded. The old helper prefilled startToken WITHOUT the state and then
+        // started at position 0, forwarding the start token twice (harmless for this test's
+        // all-attention trunk, where the KV write is positional, but a double GDN step on the default
+        // fixture) and drafting round 1 from a never-seeded head, a path production never takes.
+        using (ITensor prefill = model.Forward([startToken], [0], deviceId: -1, kvCache, adapter: null, mtpState))
+            generatedIds.Add(ArgMax(prefill, config.VocabSize));
+        Assert.Equal(1, mtpState.CurrentLength);
 
-        int position = 0;
+        int position = 1;
         Span<int> outputBuffer = stackalloc int[k + 1];
         int guard = 0;
         while (generatedIds.Count - 1 < totalNewTokens && guard++ < totalNewTokens * 4)
         {
+            Engine.MtpSpeculativeDecoderGdnStateTests.AssertRoundEntryInvariants(kvCache, mtpState, position);
             var result = decoder.DraftAndVerify(
                 model, kvCache, mtpState, pipeline, generatedIds,
                 constraint: null, position, vocabSize: config.VocabSize, numCandidates: k, outputBuffer);
