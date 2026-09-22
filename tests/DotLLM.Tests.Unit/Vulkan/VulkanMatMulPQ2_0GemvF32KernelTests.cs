@@ -193,15 +193,19 @@ public class VulkanMatMulPQ2_0GemvF32KernelTests
     /// </summary>
     /// <remarks>
     /// Runs the same <c>[n, K]</c> batch through the dispatcher and through the GEMM directly and
-    /// requires agreement, at every <c>n</c> that straddles the shipped threshold of 4. Without
+    /// requires agreement at every <c>n</c> the multi-column kernel covers (2-8) and one past it. Without
     /// this, an off-by-one in the loop's offsets would only ever surface as a quality regression
     /// on a real model.
     /// </remarks>
     [SkippableTheory]
     [InlineData(2)]
+    [InlineData(3)]
     [InlineData(4)]
     [InlineData(5)]
+    [InlineData(6)]
+    [InlineData(7)]
     [InlineData(8)]
+    [InlineData(9)]      // first n past the multi-column range: the GEMM itself
     public void SmallNDispatch_AgreesWithTheGemmItReplaces(int n)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -251,6 +255,110 @@ public class VulkanMatMulPQ2_0GemvF32KernelTests
 
         for (int t = 0; t < n; t++)
             AssertClose(viaGemm.AsSpan(t * M, M).ToArray(), viaDispatch.AsSpan(t * M, M).ToArray(), M, K);
+    }
+
+    /// <summary>
+    /// Issue #470 — the multi-column GEMV must match the per-token loop it replaces to within
+    /// float rounding, for every column count 1..8, including the runtime tails (3, 5, 6, 7) that
+    /// run a wider compiled variant with dead columns.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why not bit-exact.</b> The multi-column shader keeps the single-column kernel's
+    /// per-lane partition and tree reduce, so each column performs the same operations in the
+    /// same order. Measured on gfx1151, though, the two pipelines disagree by one ULP on some
+    /// outputs (0.23716736 vs 0.23716734): the driver fuses multiply-adds differently in the two
+    /// shaders. The tolerance here, 1e-5 absolute plus 1e-5 relative on outputs of magnitude
+    /// ~0.1-1, is 500x tighter than the scalar-reference tests. Every bug this test exists to
+    /// catch (a wrong x row, an ignored offset, a column written to the wrong y row) moves an
+    /// output by the full size of a dot product.
+    /// </para>
+    /// <para>
+    /// Every token row is distinct, so reading the wrong x row fails. Nonzero base offsets make
+    /// ignoring <c>xOff</c>/<c>yOff</c> fail. The output buffer is pre-filled with a sentinel
+    /// that must survive past the last live column, so writing a dead column fails. K = 384 gives
+    /// an odd group count, so groups straddle uint words differently row to row. M = 67 is ragged.
+    /// </para>
+    /// </remarks>
+    [SkippableTheory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(5)]
+    [InlineData(6)]
+    [InlineData(7)]
+    [InlineData(8)]
+    public void RecordColumns_MatchesTheLoopedGemv(int n)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        const int M = 67, K = 384;
+        const int XBase = 3 * K, YBase = 2 * M;       // nonzero base offsets
+        const float Sentinel = -12345.5f;
+        var rng = new Random(0x2A_70 ^ n);
+        int groups = K / GroupSize;
+
+        sbyte[] ternary = new sbyte[M * K];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        Half[] scales = new Half[M * groups];
+        for (int i = 0; i < scales.Length; i++) scales[i] = (Half)(rng.NextSingle() * 0.05f + 0.01f);
+
+        // One extra activation row past the batch, so a clamp or stride bug that reads row n
+        // gets real data, not zeros.
+        long xLen = XBase + (long)(n + 1) * K;
+        float[] x = new float[xLen];
+        for (int i = 0; i < x.Length; i++) x[i] = rng.NextSingle() * 2f - 1f;
+
+        byte[] weightsPQ2_0 = PackPQ2_0(ternary, scales, M, K);
+
+        using var device = VulkanDevice.Create();
+        using var kernel = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
+
+        long yLen = YBase + (long)(MatMulPQ2_0GemvF32Kernel.MaxColumns + 1) * M;
+        float[] sentinel = new float[yLen];
+        Array.Fill(sentinel, Sentinel);
+
+        using var bufW = device.Allocate(((long)weightsPQ2_0.Length + 3) & ~3L);
+        using var bufX = device.Allocate(xLen * sizeof(float));
+        using var bufLoop = device.Allocate(yLen * sizeof(float));
+        using var bufCols = device.Allocate(yLen * sizeof(float));
+
+        device.Upload(new ReadOnlySpan<byte>(weightsPQ2_0), bufW);
+        device.Upload(x, bufX);
+        device.Upload(sentinel, bufLoop);
+        device.Upload(sentinel, bufCols);
+
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            for (int t = 0; t < n; t++)
+                kernel.Record(ctx.CommandBuffer, bufW, bufX, bufLoop, M, K,
+                    xOffsetElements: XBase + t * K, yOffsetElements: YBase + t * M);
+            ctx.SubmitAndWait();
+        }
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            kernel.RecordColumns(ctx.CommandBuffer, bufW, bufX, bufCols, M, K, n,
+                xOffsetElements: XBase, yOffsetElements: YBase);
+            ctx.SubmitAndWait();
+        }
+
+        float[] viaLoop = new float[yLen];
+        float[] viaCols = new float[yLen];
+        device.Download(bufLoop, viaLoop);
+        device.Download(bufCols, viaCols);
+
+        for (long i = 0; i < yLen; i++)
+        {
+            bool live = i >= YBase && i < YBase + (long)n * M;
+            if (!live)
+                Assert.True(viaCols[i] == Sentinel, $"element {i} outside the {n} live columns was written: {viaCols[i]}");
+            else
+                Assert.True(MathF.Abs(viaLoop[i] - viaCols[i]) <= 1e-5f + 1e-5f * MathF.Abs(viaLoop[i]),
+                    $"n={n} column {(i - YBase) / M} row {(i - YBase) % M}: loop {viaLoop[i]:R} vs multi-column {viaCols[i]:R}");
+        }
     }
 
     /// <summary>

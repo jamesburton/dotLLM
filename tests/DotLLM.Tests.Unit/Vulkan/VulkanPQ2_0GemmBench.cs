@@ -420,6 +420,101 @@ public sealed class VulkanPQ2_0GemmBench
         }
     }
 
+    /// <summary>
+    /// Issue #470 — the multi-column GEMV against the two kernels it sits between: the real
+    /// per-token GEMV loop it replaces (per-token offsets, as <see cref="PQ2_0SmallNDispatch"/>
+    /// records it) and the default GEMM. Three arms, and the order rotates every pass.
+    /// </summary>
+    /// <remarks>
+    /// Every column is reported against <b>one single-column GEMV</b> (<c>n = 1</c> of the loop
+    /// arm), which is the ratio #470's targets are stated in (S=2 at 1.2x or less, S=4 at 1.4x
+    /// or less). Read <c>lm_head</c> as the honest row. It is 337 MB packed, so each repetition is
+    /// a DRAM read, as in a real forward. The projections fit the 32 MB MALL, so their repetitions
+    /// are cache hits and flatter both GEMV arms. Enable with <c>DOTLLM_PQ2_0_GEMM_BENCH=1</c>;
+    /// <c>DOTLLM_PQ2_0_CROSSOVER_N</c> overrides the column ladder (max 8).
+    /// </remarks>
+    [SkippableFact]
+    public void Bench_PQ2_0MultiColumnGemv()
+    {
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_GEMM_BENCH"), "1", StringComparison.Ordinal),
+            "DOTLLM_PQ2_0_GEMM_BENCH=1 to enable this benchmark.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        PinToPCores();
+        int batch = EnvInt("DOTLLM_PQ2_0_GEMM_BENCH_BATCH", 8);
+        int[] ns = (ParseNs(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_CROSSOVER_N")) ?? [1, 2, 3, 4, 5, 6, 7, 8])
+            .Where(n => n <= MatMulPQ2_0GemvF32Kernel.MaxColumns).ToArray();
+        var shapes = ParseShapes(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_GEMM_BENCH_SHAPES")) ?? DefaultShapes;
+
+        using var device = VulkanDevice.Create();
+        using var gemv = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
+        var variant = PQ2_0GemmVariant.SelectFor(device);
+        using var gemm = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir, variant);
+
+        _output.WriteLine($"Device: {device.DeviceName}  SubgroupSize: {device.SubgroupSize}  GEMM: {variant.SpvFileName}");
+        _output.WriteLine($"batch={batch}  schedule: {WarmupPasses} warmup + {Passes} passes, 3 arms, order rotated every pass (medians)");
+
+        foreach (var (tag, m, k) in shapes)
+        {
+            _output.WriteLine("");
+            _output.WriteLine($"### {tag}");
+            _output.WriteLine("| n | loop µs | multi-col µs | GEMM µs | loop / 1-col | multi-col / 1-col | GEMM / 1-col |");
+            _output.WriteLine("|---:|---:|---:|---:|---:|---:|---:|");
+
+            long wBytes = (long)m * (k / GroupSize) * GroupBytes;
+            int maxN = ns.Max();
+            using var bufW = device.Allocate((wBytes + 3) & ~3L);
+            using var bufB = device.Allocate((long)maxN * k * sizeof(float));
+            using var bufC = device.Allocate((long)maxN * m * sizeof(float));
+
+            var rng = new Random(0x2A_70);
+            byte[] w = new byte[wBytes];
+            rng.NextBytes(w);
+            float[] b = new float[(long)maxN * k];
+            for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
+            device.Upload(new ReadOnlySpan<byte>(w), bufW);
+            device.Upload(b, bufB);
+
+            double oneColUs = 0;
+            foreach (int n in ns)
+            {
+                Func<double>[] arms =
+                [
+                    () => Time(device, batch, cb => { for (int t = 0; t < n; t++) gemv.Record(cb, bufW, bufB, bufC, m, k, t * k, t * m); }),
+                    () => Time(device, batch, cb => gemv.RecordColumns(cb, bufW, bufB, bufC, m, k, n)),
+                    () => Time(device, batch, cb => gemm.Record(cb, bufW, bufB, bufC, m, k, n)),
+                ];
+                for (int i = 0; i < WarmupPasses; i++)
+                    foreach (var arm in arms) arm();
+
+                var us = new double[arms.Length][];
+                for (int a = 0; a < arms.Length; a++) us[a] = new double[Passes];
+                for (int p = 0; p < Passes; p++)
+                    for (int j = 0; j < arms.Length; j++)
+                    {
+                        int a = (p + j) % arms.Length;   // rotate which arm goes first
+                        us[a][p] = arms[a]();
+                    }
+
+                double[] med = us.Select(v => { Array.Sort(v); return v[Passes / 2]; }).ToArray();
+                if (n == 1 || oneColUs == 0) oneColUs = med[0];
+                _output.WriteLine($"| {n} | {med[0]:F1} | {med[1]:F1} | {med[2]:F1} | "
+                    + $"{med[0] / oneColUs:F2}x | {med[1] / oneColUs:F2}x | {med[2] / oneColUs:F2}x |");
+            }
+        }
+    }
+
+    private static double Time(VulkanDevice device, int batch, Action<nint> record)
+    {
+        using var ctx = device.CreateSubmitContext();
+        var sw = Stopwatch.StartNew();
+        ctx.Begin();
+        for (int i = 0; i < batch; i++) record(ctx.CommandBuffer);
+        ctx.SubmitAndWait();
+        sw.Stop();
+        return sw.Elapsed.TotalMicroseconds / batch;
+    }
+
     private static int[]? ParseNs(string? spec)
     {
         if (string.IsNullOrWhiteSpace(spec)) return null;
