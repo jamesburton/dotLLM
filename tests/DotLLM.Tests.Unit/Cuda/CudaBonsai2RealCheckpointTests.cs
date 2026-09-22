@@ -64,9 +64,53 @@ public sealed class CudaBonsai2RealCheckpointTests
             "Bonsai 2 MTP checkpoint not found (set DOTLLM_BONSAI2_MTP_GGUF or populate the HF hub cache).");
         string ptxDir = SkipUnlessCudaWithFwht();
 
-        var cuda = RunCudaGreedy(path!, ptxDir);
+        Run cuda;
+        try
+        {
+            // The F16-activation path, whatever DOTLLM_CUDA_PQ2_0_DP4A says (the dp4a run is its own test).
+            CudaSmallSGemvDispatch.Dp4aOverride = false;
+            cuda = RunCudaGreedy(path!, ptxDir);
+        }
+        finally
+        {
+            CudaSmallSGemvDispatch.Dp4aOverride = null;
+        }
         _out.WriteLine($"cuda greedy:  {string.Join(",", cuda.Tokens)}");
         _out.WriteLine($"cuda top-2 gaps: {string.Join(",", cuda.Gaps.Select(g => g.ToString("E3")))}");
+
+        int[] expected = ResolveCpuOracle(path!);
+        Assert.Equal(expected, cuda.Tokens);
+    }
+
+    /// <summary>
+    /// Issue #485: the same greedy run with the int8-activation dp4a PQ2_0 GEMV switched on (what
+    /// <c>DOTLLM_CUDA_PQ2_0_DP4A=1</c> does), against the same CPU oracle. The CPU PQ2_0 GEMV on
+    /// SSSE3/AVX2 hardware is itself the W2A8 tier with the identical activation quantization, so the
+    /// dp4a path should track it at least as closely as the F16-activation path does. The 15-token
+    /// prefill stays on dequant + cuBLAS; every decode step's PQ2_0 projections run dp4a.
+    /// </summary>
+    [SkippableFact]
+    public void GreedyDecode_Dp4a_MatchesCpu_OnRealBonsai2Checkpoint()
+    {
+        string? path = FindCheckpoint();
+        Skip.If(path is null,
+            "Bonsai 2 MTP checkpoint not found (set DOTLLM_BONSAI2_MTP_GGUF or populate the HF hub cache).");
+        string ptxDir = SkipUnlessCudaWithFwht();
+        Skip.IfNot(File.Exists(Path.Combine(ptxDir, "pq2_0_gemv_dp4a.ptx")),
+            "pq2_0_gemv_dp4a.ptx not generated (run native/build_ptx.bat on a CUDA box)");
+
+        Run cuda;
+        try
+        {
+            CudaSmallSGemvDispatch.Dp4aOverride = true;
+            cuda = RunCudaGreedy(path!, ptxDir, requireDp4a: true);
+        }
+        finally
+        {
+            CudaSmallSGemvDispatch.Dp4aOverride = null;
+        }
+        _out.WriteLine($"cuda dp4a greedy:  {string.Join(",", cuda.Tokens)}");
+        _out.WriteLine($"cuda dp4a top-2 gaps: {string.Join(",", cuda.Gaps.Select(g => g.ToString("E3")))}");
 
         int[] expected = ResolveCpuOracle(path!);
         Assert.Equal(expected, cuda.Tokens);
@@ -284,12 +328,14 @@ public sealed class CudaBonsai2RealCheckpointTests
 
     private sealed record Run(int[] Tokens, float[] Gaps);
 
-    private static Run RunCudaGreedy(string path, string ptxDir)
+    private static Run RunCudaGreedy(string path, string ptxDir, bool requireDp4a = false)
     {
         using var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         Assert.NotNull(config.HadamardFold); // the whole point: a folded checkpoint now loads on CUDA
         using var model = CudaQwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
+        if (requireDp4a)
+            Assert.True(model.PQ2_0Dp4aAvailable, "pq2_0_gemv_dp4a.ptx present but the dp4a module did not load (stale PTX?)");
         using var kv = model.CreateKvCache(PromptTokens.Length + NewTokens + 1);
         return Greedy((toks, pos) => model.Forward(toks, pos, -1, kv), config.VocabSize);
     }

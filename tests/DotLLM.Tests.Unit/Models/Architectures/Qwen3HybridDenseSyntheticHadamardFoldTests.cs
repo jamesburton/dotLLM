@@ -63,6 +63,21 @@ public sealed class Qwen3HybridDenseSyntheticHadamardFoldTests : IDisposable
         Assert.True(model.SupportsMtp);
     }
 
+    /// <summary>
+    /// Issue #485: the PQ2_0 variant of the fold fixture (the CUDA dp4a S=3-vs-S=1 test runs on it)
+    /// must load with the fold declaration, stay finite, and actually be changed by the fold.
+    /// </summary>
+    [Fact]
+    public void Pq2_0Fixture_FoldValidates_AndChangesLogits()
+    {
+        string path = SyntheticHadamardFold.WriteFixture(Path.Combine(_scratch, "fold-pq2.gguf"), withMtp: false,
+            pq2_0Projections: true);
+        float[] plain = Forward(path, fold: null);
+        float[] folded = Forward(path, c => SyntheticHadamardFold.For(c));
+        AssertAllFinite(folded);
+        AssertDiffers(plain, folded, "PQ2_0 fixture: fold vs no fold");
+    }
+
     [Fact]
     public void Fold_ChangesLogits()
     {

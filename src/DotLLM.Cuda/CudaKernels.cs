@@ -121,6 +121,16 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint[] _pq2_0GemvMultiFuncs = new nint[Pq2_0GemvMultiMaxColumns + 1];
     private readonly string? _pq2_0GemvMultiUnavailableReason;
     private readonly bool _hasPQ2_0GemvMulti;   // cached: read on every seqLen 2..8 PQ2_0 projection
+
+    // PQ2_0 GEMV v2 — int8 activations + dp4a (pq2_0_gemv_dp4a.ptx), optional module (issue #485).
+    // One activation quantizer plus one exact-width GEMV entry point per S = 1..8 (index 0 unused).
+    // All zero when the PTX is absent, stale or fails to JIT: HasPQ2_0GemvDp4a then reports false and
+    // the #482 / single-column paths stay in charge.
+    private readonly CudaModule? _pq2_0GemvDp4aModule;
+    private readonly nint _pq2_0Dp4aQuantizeFunc;
+    private readonly nint[] _pq2_0GemvDp4aFuncs = new nint[Pq2_0GemvMultiMaxColumns + 1];
+    private readonly string? _pq2_0GemvDp4aUnavailableReason;
+    private readonly bool _hasPQ2_0GemvDp4a;   // cached: read on every dp4a-eligible PQ2_0 projection
     private readonly nint _quantizedGemvQ2_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ4_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ5_KMmqPreqFunc;
@@ -716,6 +726,33 @@ public sealed unsafe class CudaKernels : IDisposable
         else
         {
             _pq2_0GemvMultiUnavailableReason = $"pq2_0_gemv_multi.ptx not found in {ptxDir}";
+        }
+
+        string pq2_0GemvDp4aPath = Path.Combine(ptxDir, "pq2_0_gemv_dp4a.ptx");
+        if (File.Exists(pq2_0GemvDp4aPath))
+        {
+            try
+            {
+                _pq2_0GemvDp4aModule = CudaModule.LoadFromFile(pq2_0GemvDp4aPath);
+                _pq2_0Dp4aQuantizeFunc = _pq2_0GemvDp4aModule.TryGetFunction("pq2_0_dp4a_quantize_x");
+                for (int s = 1; s <= Pq2_0GemvMultiMaxColumns; s++)
+                    _pq2_0GemvDp4aFuncs[s] = _pq2_0GemvDp4aModule.TryGetFunction($"pq2_0_gemv_dp4a_f32y_{s}");
+                _hasPQ2_0GemvDp4a = AllPQ2_0GemvDp4aFuncsLoaded();
+                if (!_hasPQ2_0GemvDp4a)
+                    _pq2_0GemvDp4aUnavailableReason =
+                        "pq2_0_gemv_dp4a.ptx is stale (missing pq2_0_dp4a_quantize_x or a pq2_0_gemv_dp4a_f32y_{1..8} entry point)";
+            }
+            catch (CudaException ex)
+            {
+                Array.Clear(_pq2_0GemvDp4aFuncs);
+                _pq2_0Dp4aQuantizeFunc = 0;
+                _hasPQ2_0GemvDp4a = false;
+                _pq2_0GemvDp4aUnavailableReason = $"pq2_0_gemv_dp4a.ptx failed to load: {ex.Message}";
+            }
+        }
+        else
+        {
+            _pq2_0GemvDp4aUnavailableReason = $"pq2_0_gemv_dp4a.ptx not found in {ptxDir}";
         }
 
         _rmsnormFunc = _rmsnormModule.GetFunction("rmsnorm_f16");
@@ -5485,6 +5522,95 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
+    /// <summary>Elements per activation quantization block of the dp4a PQ2_0 GEMV (the CPU Q8_0 block).</summary>
+    public const int Pq2_0Dp4aQuantBlock = 32;
+
+    /// <summary>
+    /// Bytes of per-block metadata the dp4a quantizer writes: one <c>{ float d, int sum }</c> pair per
+    /// <see cref="Pq2_0Dp4aQuantBlock"/> activations.
+    /// </summary>
+    public const int Pq2_0Dp4aMetaBytesPerBlock = 8;
+
+    /// <summary>
+    /// Whether the int8-activation dp4a PQ2_0 GEMV (<c>pq2_0_gemv_dp4a.ptx</c>, issue #485) — its
+    /// activation quantizer and every exact-width entry point — is loaded.
+    /// </summary>
+    public bool HasPQ2_0GemvDp4a => _hasPQ2_0GemvDp4a;
+
+    /// <summary>Why <see cref="HasPQ2_0GemvDp4a"/> is false, or <see langword="null"/> when it is true.</summary>
+    public string? PQ2_0GemvDp4aUnavailableReason => HasPQ2_0GemvDp4a ? null : _pq2_0GemvDp4aUnavailableReason;
+
+    private bool AllPQ2_0GemvDp4aFuncsLoaded()
+    {
+        if (_pq2_0Dp4aQuantizeFunc == 0) return false;
+        for (int s = 1; s <= Pq2_0GemvMultiMaxColumns; s++)
+            if (_pq2_0GemvDp4aFuncs[s] == 0) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Quantizes F32 activations to the int8 layout the dp4a PQ2_0 GEMV consumes (issue #485): per
+    /// block of 32, exactly the CPU W2A8 activation quantizer's rounding
+    /// (<c>MatMul.QuantizeF32ToQ8_0</c>), with the int8 values permuted within each 16-element chunk
+    /// and one <c>{ half-rounded scale as float bits, int32 sum of the block's int8 values }</c> pair
+    /// per block. The layout contract is in native/kernels/pq2_0_gemv_dp4a.cu.
+    /// </summary>
+    /// <param name="xF32">F32 activations, <paramref name="elements"/> long (e.g. <c>[S, k]</c>), 16-byte aligned.</param>
+    /// <param name="xQ8">Output int8, <paramref name="elements"/> bytes, 16-byte aligned.</param>
+    /// <param name="xMeta">Output metadata, <c>elements / 32 * 8</c> bytes, 8-byte aligned.</param>
+    /// <param name="elements">Element count, a positive multiple of 32.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchPQ2_0Dp4aQuantizeX(nint xF32, nint xQ8, nint xMeta, int elements, nint stream)
+    {
+        if (elements <= 0 || elements % Pq2_0Dp4aQuantBlock != 0)
+            throw new ArgumentException(
+                $"elements must be a positive multiple of {Pq2_0Dp4aQuantBlock}, got {elements}.", nameof(elements));
+        if (_pq2_0Dp4aQuantizeFunc == 0)
+            throw new InvalidOperationException($"pq2_0_dp4a_quantize_x not loaded ({_pq2_0GemvDp4aUnavailableReason}).");
+
+        nint xArg = xF32, qArg = xQ8, mArg = xMeta;
+        int blocks = elements / Pq2_0Dp4aQuantBlock;
+        void** args = stackalloc void*[] { &xArg, &qArg, &mArg, &blocks };
+        CudaDriverApi.cuLaunchKernel(_pq2_0Dp4aQuantizeFunc,
+                (uint)((blocks + BlockSize - 1) / BlockSize), 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// dp4a PQ2_0 GEMV (issue #485): <c>y[s, row] = W[row, :] · x[s, :]</c> for <c>s &lt; columns</c>
+    /// on int8 activations produced by <see cref="LaunchPQ2_0Dp4aQuantizeX"/> over the same
+    /// <c>[columns, k]</c> rows. Numerically the CPU W2A8 tier; only FP32 summation order differs.
+    /// </summary>
+    /// <param name="quantWeight">Split-layout PQ2_0 weight <c>[n, k]</c> (see <see cref="LaunchPQ2_0RepackSplitF16"/>).</param>
+    /// <param name="xQ8">Quantized activations <c>[columns, k]</c>.</param>
+    /// <param name="xMeta">Quantizer metadata <c>[columns, k/32]</c>.</param>
+    /// <param name="yF32">F32 output <c>[columns, n]</c>.</param>
+    /// <param name="n">Output rows.</param>
+    /// <param name="k">Input width, a multiple of 128.</param>
+    /// <param name="columns">Token columns, 1..<see cref="Pq2_0GemvMultiMaxColumns"/>.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchPQ2_0GemvDp4a(nint quantWeight, nint xQ8, nint xMeta, nint yF32, int n, int k, int columns, nint stream)
+    {
+        if ((uint)(columns - 1) >= Pq2_0GemvMultiMaxColumns)
+            throw new ArgumentOutOfRangeException(nameof(columns), columns,
+                $"dp4a PQ2_0 GEMV supports 1..{Pq2_0GemvMultiMaxColumns} columns.");
+        if (k <= 0 || k % 128 != 0)
+            throw new ArgumentException($"PQ2_0 k must be a positive multiple of 128, got {k}.", nameof(k));
+        nint func = _pq2_0GemvDp4aFuncs[columns];
+        if (func == 0)
+            throw new InvalidOperationException(
+                $"pq2_0_gemv_dp4a_f32y_{columns} not loaded ({_pq2_0GemvDp4aUnavailableReason}).");
+        if (n <= 0) return;
+
+        nint wArg = quantWeight, qArg = xQ8, mArg = xMeta, yArg = yF32;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] { &wArg, &qArg, &mArg, &yArg, &nArg, &kArg };
+        uint grid = (uint)((n + Pq2_0GemvMultiRowsPerBlock - 1) / Pq2_0GemvMultiRowsPerBlock);
+        CudaDriverApi.cuLaunchKernel(func,
+                grid, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <summary>Whether the TurboQuant KV codec kernels are loaded (turboquant.ptx present).</summary>
     public bool TurboQuantAvailable => _turboquantDequantF32Func != 0 && _turboquantEncodeF32Func != 0;
 
@@ -6770,6 +6896,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _turboquantModule?.Dispose();
         _hadamardFwhtModule?.Dispose();
         _pq2_0GemvMultiModule?.Dispose();
+        _pq2_0GemvDp4aModule?.Dispose();
         _kvWriteModule?.Dispose();
         _fusedRopeKvWriteModule?.Dispose();
         _attentionMlaModule?.Dispose();
