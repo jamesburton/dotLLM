@@ -1417,6 +1417,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private void AbsorbMtp(in CudaMtpHeadWeights mtpHead, CudaMtpState state,
                            ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions)
     {
+        if (!DotLLM.Models.Architectures.MtpAbsorbDispatch.UsePerToken
+            && DotLLM.Models.Architectures.MtpAbsorbDispatch.IsContiguous(positions))
+        {
+            AbsorbMtpBatched(mtpHead, state, tokenIds, positions[0]);
+            state.SeedFromCapturedRow(tokenIds.Length - 1);
+            return;
+        }
         for (int i = 0; i < tokenIds.Length; i++)
         {
             if (i == 0) state.SetPendingFromCarry();
@@ -1424,6 +1431,191 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             ForwardMtpCore(mtpHead, state, tokenIds[i], positions[i], computeLogits: false);
         }
         state.SeedFromCapturedRow(tokenIds.Length - 1);
+    }
+
+    /// <summary>Rows per chunk of <see cref="AbsorbMtpBatched"/>: bounds its scratch on a long prefill.</summary>
+    private const int MtpAbsorbChunkRows = 64;
+
+    /// <summary>
+    /// Device scratch for <see cref="AbsorbMtpBatched"/>, sized for up to
+    /// <see cref="MtpAbsorbChunkRows"/> rows and allocated on first use.
+    /// </summary>
+    private sealed class CudaMtpAbsorbScratch : IDisposable
+    {
+        public int Rows;
+        public nint Embed;      // [rows, hidden]
+        public nint Pair;       // [rows, hidden]
+        public nint ENorm;      // [rows, hidden]
+        public nint HNorm;      // [rows, hidden]
+        public nint Concat;     // [rows, 2 * hidden]
+        public nint Cur;        // [rows, hidden]
+        public nint Normed;     // [rows, hidden]
+        public nint Positions;  // [rows] int32
+
+        public static CudaMtpAbsorbScratch Allocate(int rows, int hiddenSize)
+        {
+            long h = (long)rows * hiddenSize * sizeof(float);
+            return new CudaMtpAbsorbScratch
+            {
+                Rows = rows,
+                Embed = AllocDevice(h),
+                Pair = AllocDevice(h),
+                ENorm = AllocDevice(h),
+                HNorm = AllocDevice(h),
+                Concat = AllocDevice(2 * h),
+                Cur = AllocDevice(h),
+                Normed = AllocDevice(h),
+                Positions = AllocDevice((long)rows * sizeof(int)),
+            };
+        }
+
+        public void Dispose()
+        {
+            FreeIfNonZero(ref Embed);
+            FreeIfNonZero(ref Pair);
+            FreeIfNonZero(ref ENorm);
+            FreeIfNonZero(ref HNorm);
+            FreeIfNonZero(ref Concat);
+            FreeIfNonZero(ref Cur);
+            FreeIfNonZero(ref Normed);
+            FreeIfNonZero(ref Positions);
+        }
+    }
+
+    private CudaMtpAbsorbScratch? _mtpAbsorbScratch;
+
+    /// <summary>
+    /// Batched, KV-only absorb of S contiguous positions (issue #472, ported in #478) — see
+    /// <c>MtpAbsorbDispatch</c>. Computes exactly the K/V rows <see cref="ForwardMtpCore"/> writes
+    /// per token and nothing past them: an absorbed step's output hidden is discarded (the next
+    /// draft seeds from a trunk row), so its attention, O-projection, FFN and the per-token stream
+    /// sync are dead work.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Bit-identical to the per-token absorb, deliberately.</b> The embed dequant, the pairing
+    /// rows, every RMSNorm (enorm, hnorm, attn_norm, K-norm) and RoPE are batched over S rows — all
+    /// of them are per-row kernels (one block per row / one thread per pair), so a row's result does
+    /// not depend on the batch. The three projections (eh_proj, K, V) are NOT batched: this model's
+    /// <see cref="Gemm"/> takes a different route for <c>seqLen &gt; 1</c> (dequant to F16 + cuBLAS
+    /// HGEMM on F16-staged activations) than for one row (the F32-native GEMV the per-token path
+    /// uses), so an S-row GEMM would change the head's K/V bits on quantized weights. They run as S
+    /// single-row GEMVs instead. A batched-GEMM variant would be faster on a long prefill; it is a
+    /// separate, output-changing decision.
+    /// </para>
+    /// <para>
+    /// Processed in chunks of <see cref="MtpAbsorbChunkRows"/> rows so a long prefill does not size
+    /// the scratch to the prompt. Chunking cannot change a row's result for the same reason.
+    /// </para>
+    /// </remarks>
+    private void AbsorbMtpBatched(in CudaMtpHeadWeights mtpHead, CudaMtpState state,
+                                  ReadOnlySpan<int> tokenIds, int firstPosition)
+    {
+        int total = tokenIds.Length;
+        int hiddenSize = Config.HiddenSize;
+        var attn = mtpHead.Layer.FullAttn!.Value;
+        int numKvHeads = attn.NumKvHeads;
+        int headDim = Config.HeadDim;
+        float eps = Config.NormEpsilon;
+        nint streamH = _stream.Handle;
+        long hiddenRowBytes = (long)hiddenSize * sizeof(float);
+
+        state.BeginAbsorb(firstPosition, total);
+
+        int chunkRows = Math.Max(1, Math.Min(total, MtpAbsorbChunkRows));
+        if (_mtpAbsorbScratch is null || _mtpAbsorbScratch.Rows < chunkRows)
+        {
+            _mtpAbsorbScratch?.Dispose();
+            _mtpAbsorbScratch = CudaMtpAbsorbScratch.Allocate(chunkRows, hiddenSize);
+        }
+        var sc = _mtpAbsorbScratch;
+
+        // Same embedding-table selection as ForwardMtpCore: head-local nextn.embed_tokens when the
+        // GGUF ships one, the trunk table otherwise.
+        nint embedHostBase = mtpHead.EmbedTokensHostBase ?? _embedDataBase;
+        ulong embedDataOffset = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensDataOffset : _embedDataOffset;
+        long embedRowBytes = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensRowBytes : _embedRowBytes;
+        QuantizationType embedQt = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensQt : _tokenEmbedQt;
+
+        int chunkElems = chunkRows * hiddenSize;
+        float[] embedHost = System.Buffers.ArrayPool<float>.Shared.Rent(chunkElems);
+        float[] pairHost = System.Buffers.ArrayPool<float>.Shared.Rent(chunkElems);
+        int[] posHost = System.Buffers.ArrayPool<int>.Shared.Rent(chunkRows);
+        try
+        {
+            for (int start = 0; start < total; start += chunkRows)
+            {
+                int s = Math.Min(chunkRows, total - start);
+                int elems = s * hiddenSize;
+
+                for (int i = 0; i < s; i++)
+                {
+                    nint rowSrc = embedHostBase + (nint)(embedDataOffset + (ulong)tokenIds[start + i] * (ulong)embedRowBytes);
+                    Dequantize.ToFloat32(rowSrc, hiddenSize, embedQt, embedHost.AsSpan(i * hiddenSize, hiddenSize));
+                    posHost[i] = firstPosition + start + i;
+                }
+                // Pairing (#469): row r goes with h_{p-1} — the carry for r == 0, captured row r-1 otherwise.
+                state.CopyAbsorbPairingRows(start, s, pairHost.AsSpan(0, elems));
+
+                // Synchronous H2D: the pooled host arrays are reused by the next chunk.
+                fixed (float* pEmbed = embedHost)
+                    CudaDriverApi.cuMemcpyHtoD_v2(sc.Embed, (nint)pEmbed, (nuint)((long)elems * sizeof(float))).ThrowOnError();
+                fixed (float* pPair = pairHost)
+                    CudaDriverApi.cuMemcpyHtoD_v2(sc.Pair, (nint)pPair, (nuint)((long)elems * sizeof(float))).ThrowOnError();
+                fixed (int* pPos = posHost)
+                    CudaDriverApi.cuMemcpyHtoD_v2(sc.Positions, (nint)pPos, (nuint)(s * sizeof(int))).ThrowOnError();
+
+                // enorm / hnorm over s rows, then interleave into concat rows [e_i, h_i].
+                _kernels.LaunchRmsNormF32(sc.Embed, mtpHead.EnormDevice, sc.ENorm, hiddenSize, eps, s, streamH);
+                _kernels.LaunchRmsNormF32(sc.Pair, mtpHead.HnormDevice, sc.HNorm, hiddenSize, eps, s, streamH);
+                for (int i = 0; i < s; i++)
+                {
+                    nint rowOff = (nint)(i * hiddenRowBytes);
+                    nint catOff = (nint)(2 * i * hiddenRowBytes);
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(sc.Concat + catOff, sc.ENorm + rowOff,
+                        (nuint)hiddenRowBytes, streamH).ThrowOnError();
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(sc.Concat + catOff + (nint)hiddenRowBytes, sc.HNorm + rowOff,
+                        (nuint)hiddenRowBytes, streamH).ThrowOnError();
+                }
+
+                // cur = eh_proj @ concat — one GEMV per row (see remarks), then attn_norm over s rows.
+                for (int i = 0; i < s; i++)
+                {
+                    Gemm(mtpHead.EhProjDevice, mtpHead.EhProjQt,
+                         sc.Concat + (nint)(2 * i * hiddenRowBytes), sc.Cur + (nint)(i * hiddenRowBytes),
+                         mtpHead.EhProjOutputDim, mtpHead.EhProjInputDim, 1);
+                }
+                _kernels.LaunchRmsNormF32(sc.Cur, mtpHead.Layer.AttnNormWeightDevice, sc.Normed, hiddenSize, eps, s, streamH);
+
+                // K/V straight into the head's cache slab [p, p + s): one contiguous [maxSteps, kvStride] buffer.
+                int p = firstPosition + start;
+                for (int i = 0; i < s; i++)
+                {
+                    nint normedRow = sc.Normed + (nint)(i * hiddenRowBytes);
+                    Gemm(attn.KDevice, attn.KQt, normedRow, state.GetKeyRowDevicePtr(p + i),
+                         attn.KOutputDim, attn.KInputDim, 1);
+                    Gemm(attn.VDevice, attn.VQt, normedRow, state.GetValueRowDevicePtr(p + i),
+                         attn.VOutputDim, attn.VInputDim, 1);
+                }
+
+                nint kSlab = state.GetKeyRowDevicePtr(p);
+                _kernels.LaunchRmsNormF32(kSlab, attn.KNormDevice, kSlab, headDim, eps, s * numKvHeads, streamH);
+                // numHeads = 0: the kernel rotates no Q pairs, so its Q operand is never touched.
+                _kernels.LaunchRoPEF32(kSlab, kSlab, sc.Positions, s, 0, numKvHeads, headDim,
+                    _ropeDim, _ropeTheta, 1, streamH);
+
+                // The next chunk overwrites the device scratch.
+                _stream.Synchronize();
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(embedHost);
+            System.Buffers.ArrayPool<float>.Shared.Return(pairHost);
+            System.Buffers.ArrayPool<int>.Shared.Return(posHost);
+        }
+
+        state.EndAbsorb(firstPosition + total);
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -2976,6 +3168,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         }
         _mtpScratch?.Dispose();
         _mtpScratch = null;
+        _mtpAbsorbScratch?.Dispose();
+        _mtpAbsorbScratch = null;
 
         _state.Dispose();
         _gdnCache.Dispose();

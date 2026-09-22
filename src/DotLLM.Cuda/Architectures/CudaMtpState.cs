@@ -134,6 +134,64 @@ public sealed class CudaMtpState : IMtpState, IDisposable
         _currentLength++;
     }
 
+    /// <summary>
+    /// Prepares a batched absorb of <paramref name="count"/> contiguous positions starting at
+    /// <paramref name="firstPosition"/> (issue #472, ported in #478): rolls speculative slots back to
+    /// it, rejects a gap, and bounds-checks the whole slab before anything is written. Mirrors
+    /// <see cref="DotLLM.Models.Architectures.CpuMtpState"/>.
+    /// </summary>
+    internal void BeginAbsorb(int firstPosition, int count)
+    {
+        ThrowIfDisposed();
+        if (_currentLength > firstPosition)
+            _currentLength = firstPosition;
+        else if (_currentLength < firstPosition)
+            throw new InvalidOperationException(
+                $"MTP absorb at position {firstPosition} but the MTP KV-cache only covers {_currentLength} " +
+                "positions. Every trunk Forward of the sequence must pass the MTP state so the head " +
+                "absorbs it (prefill included).");
+        if ((long)firstPosition + count > _maxSteps)
+            throw new InvalidOperationException(
+                $"CudaMtpState KV-cache exhausted absorbing positions [{firstPosition}, {firstPosition + count}) " +
+                $"(MaxSteps={_maxSteps}). Create the state with CreateMtpState(maxSequenceLength) covering the whole sequence.");
+    }
+
+    /// <summary>Completes a batched absorb begun by <see cref="BeginAbsorb"/>: the cache now covers <paramref name="length"/> positions.</summary>
+    internal void EndAbsorb(int length)
+    {
+        ThrowIfDisposed();
+        if (length < _currentLength || length > _maxSteps)
+            throw new ArgumentOutOfRangeException(nameof(length));
+        _currentLength = length;
+    }
+
+    /// <summary>
+    /// Writes the hidden-state rows that batch rows <c>[startRow, startRow + count)</c> pair with
+    /// (issue #469): row 0 is the carried row (the trunk hidden of the position before the batch —
+    /// zero when nothing has been absorbed yet), row <c>i</c> is captured row <c>i - 1</c>.
+    /// <paramref name="dest"/> is <c>[count, hiddenSize]</c>. Exactly the rows the per-token absorb
+    /// uploads through <see cref="SetPendingFromCarry"/> / <see cref="SetPendingFromCapturedRow"/>.
+    /// </summary>
+    internal void CopyAbsorbPairingRows(int startRow, int count, Span<float> dest)
+    {
+        ThrowIfDisposed();
+        if (startRow < 0 || count < 0 || startRow + count > _capturedRowCount)
+            throw new ArgumentOutOfRangeException(nameof(count));
+        if (dest.Length < count * _hiddenSize)
+            throw new ArgumentException("dest too small.", nameof(dest));
+        for (int i = 0; i < count; i++)
+        {
+            int row = startRow + i;
+            var d = dest.Slice(i * _hiddenSize, _hiddenSize);
+            if (row > 0)
+                _capturedRows.AsSpan((row - 1) * _hiddenSize, _hiddenSize).CopyTo(d);
+            else if (_carryHidden.Length == _hiddenSize)
+                _carryHidden.CopyTo(d);
+            else
+                d.Clear();   // nothing absorbed yet: h_{-1} is zero (matches SetPendingFromCarry)
+        }
+    }
+
     /// <inheritdoc/>
     public void Rollback(int length)
     {
