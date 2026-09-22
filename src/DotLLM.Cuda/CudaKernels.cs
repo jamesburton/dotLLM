@@ -131,6 +131,16 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint[] _pq2_0GemvDp4aFuncs = new nint[Pq2_0GemvMultiMaxColumns + 1];
     private readonly string? _pq2_0GemvDp4aUnavailableReason;
     private readonly bool _hasPQ2_0GemvDp4a;   // cached: read on every dp4a-eligible PQ2_0 projection
+
+    // Packed PQ2_0 PREFILL GEMM (pq2_0_mmq_dp4a.ptx) — optional module (issue #490). Two tile
+    // instantiations over the same body; consumes #485's quantizer output unchanged. All zero when
+    // the PTX is absent, stale or fails to JIT: HasPQ2_0MmqDp4a then reports false and PQ2_0
+    // projections wider than the GEMV keep the dequant-to-F16 + cuBLAS path.
+    private readonly CudaModule? _pq2_0MmqDp4aModule;
+    private readonly nint _pq2_0MmqDp4aBn32Func;
+    private readonly nint _pq2_0MmqDp4aBn16Func;
+    private readonly string? _pq2_0MmqDp4aUnavailableReason;
+    private readonly bool _hasPQ2_0MmqDp4a;   // cached: read on every prefill-width PQ2_0 projection
     private readonly nint _quantizedGemvQ2_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ4_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ5_KMmqPreqFunc;
@@ -753,6 +763,32 @@ public sealed unsafe class CudaKernels : IDisposable
         else
         {
             _pq2_0GemvDp4aUnavailableReason = $"pq2_0_gemv_dp4a.ptx not found in {ptxDir}";
+        }
+
+        string pq2_0MmqDp4aPath = Path.Combine(ptxDir, "pq2_0_mmq_dp4a.ptx");
+        if (File.Exists(pq2_0MmqDp4aPath))
+        {
+            try
+            {
+                _pq2_0MmqDp4aModule = CudaModule.LoadFromFile(pq2_0MmqDp4aPath);
+                _pq2_0MmqDp4aBn32Func = _pq2_0MmqDp4aModule.TryGetFunction("pq2_0_mmq_dp4a_f32y_bn32");
+                _pq2_0MmqDp4aBn16Func = _pq2_0MmqDp4aModule.TryGetFunction("pq2_0_mmq_dp4a_f32y_bn16");
+                _hasPQ2_0MmqDp4a = _pq2_0MmqDp4aBn32Func != 0 && _pq2_0MmqDp4aBn16Func != 0;
+                if (!_hasPQ2_0MmqDp4a)
+                    _pq2_0MmqDp4aUnavailableReason =
+                        "pq2_0_mmq_dp4a.ptx is stale (missing pq2_0_mmq_dp4a_f32y_bn32 or pq2_0_mmq_dp4a_f32y_bn16)";
+            }
+            catch (CudaException ex)
+            {
+                _pq2_0MmqDp4aBn32Func = 0;
+                _pq2_0MmqDp4aBn16Func = 0;
+                _hasPQ2_0MmqDp4a = false;
+                _pq2_0MmqDp4aUnavailableReason = $"pq2_0_mmq_dp4a.ptx failed to load: {ex.Message}";
+            }
+        }
+        else
+        {
+            _pq2_0MmqDp4aUnavailableReason = $"pq2_0_mmq_dp4a.ptx not found in {ptxDir}";
         }
 
         _rmsnormFunc = _rmsnormModule.GetFunction("rmsnorm_f16");
@@ -5611,6 +5647,81 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
+    /// <summary>Token columns per block tile of the wide (default) PQ2_0 MMQ instantiation. Must match <c>pq2_0_mmq_dp4a_f32y_bn32</c>.</summary>
+    public const int Pq2_0MmqTileColumnsWide = 32;
+
+    /// <summary>Output rows per block tile of the wide PQ2_0 MMQ instantiation (<c>BM = 32 * TM</c>).</summary>
+    public const int Pq2_0MmqTileRowsWide = 128;
+
+    /// <summary>Token columns per block tile of the narrow PQ2_0 MMQ instantiation (<c>pq2_0_mmq_dp4a_f32y_bn16</c>).</summary>
+    public const int Pq2_0MmqTileColumnsNarrow = 16;
+
+    /// <summary>Output rows per block tile of the narrow PQ2_0 MMQ instantiation.</summary>
+    public const int Pq2_0MmqTileRowsNarrow = 256;
+
+    /// <summary>
+    /// Whether the packed PQ2_0 prefill GEMM (<c>pq2_0_mmq_dp4a.ptx</c>, issue #490) is loaded. It
+    /// consumes <see cref="LaunchPQ2_0Dp4aQuantizeX"/>'s output, so
+    /// <see cref="HasPQ2_0GemvDp4a"/> must hold too for the path to be usable.
+    /// </summary>
+    public bool HasPQ2_0MmqDp4a => _hasPQ2_0MmqDp4a;
+
+    /// <summary>Why <see cref="HasPQ2_0MmqDp4a"/> is false, or <see langword="null"/> when it is true.</summary>
+    public string? PQ2_0MmqDp4aUnavailableReason => HasPQ2_0MmqDp4a ? null : _pq2_0MmqDp4aUnavailableReason;
+
+    /// <summary>
+    /// Packed PQ2_0 prefill GEMM (issue #490): <c>y[s, row] = W[row, :] · x[s, :]</c> for
+    /// <c>s &lt; columns</c>, reading the weights PACKED and decoding them in registers instead of
+    /// dequantizing the whole matrix to F16 for cuBLAS. Numerically the CPU W2A8 tier, exactly like
+    /// <see cref="LaunchPQ2_0GemvDp4a"/> (whose quantizer output it consumes unchanged); only the
+    /// FP32 summation order differs.
+    /// </summary>
+    /// <remarks>
+    /// The grid is (column tile, row tile) in that order on purpose — the blocks sharing a weight row
+    /// tile are scheduled together so the weight stream is read from DRAM about once and served to its
+    /// siblings from L2. See native/kernels/pq2_0_mmq_dp4a.cu.
+    /// </remarks>
+    /// <param name="quantWeight">Split-layout PQ2_0 weight <c>[n, k]</c> (see <see cref="LaunchPQ2_0RepackSplitF16"/>).</param>
+    /// <param name="xQ8">Quantized activations <c>[columns, k]</c> from <see cref="LaunchPQ2_0Dp4aQuantizeX"/>.</param>
+    /// <param name="xMeta">Quantizer metadata <c>[columns, k/32]</c>.</param>
+    /// <param name="yF32">F32 output <c>[columns, n]</c>.</param>
+    /// <param name="n">Output rows.</param>
+    /// <param name="k">Input width, a multiple of 128.</param>
+    /// <param name="columns">Token columns (any positive count; tails are masked).</param>
+    /// <param name="tileColumns">
+    /// Column tile: <see cref="Pq2_0MmqTileColumnsWide"/> or <see cref="Pq2_0MmqTileColumnsNarrow"/>.
+    /// </param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchPQ2_0MmqDp4a(nint quantWeight, nint xQ8, nint xMeta, nint yF32,
+        int n, int k, int columns, int tileColumns, nint stream)
+    {
+        if (columns <= 0)
+            throw new ArgumentOutOfRangeException(nameof(columns), columns, "columns must be positive.");
+        if (k <= 0 || k % 128 != 0)
+            throw new ArgumentException($"PQ2_0 k must be a positive multiple of 128, got {k}.", nameof(k));
+
+        bool narrow = tileColumns == Pq2_0MmqTileColumnsNarrow;
+        if (!narrow && tileColumns != Pq2_0MmqTileColumnsWide)
+            throw new ArgumentOutOfRangeException(nameof(tileColumns), tileColumns,
+                $"PQ2_0 MMQ tiles are {Pq2_0MmqTileColumnsNarrow} or {Pq2_0MmqTileColumnsWide} columns.");
+
+        nint func = narrow ? _pq2_0MmqDp4aBn16Func : _pq2_0MmqDp4aBn32Func;
+        if (func == 0)
+            throw new InvalidOperationException(
+                $"pq2_0_mmq_dp4a_f32y_bn{tileColumns} not loaded ({_pq2_0MmqDp4aUnavailableReason}).");
+        if (n <= 0) return;
+
+        int tileRows = narrow ? Pq2_0MmqTileRowsNarrow : Pq2_0MmqTileRowsWide;
+        nint wArg = quantWeight, qArg = xQ8, mArg = xMeta, yArg = yF32;
+        int nArg = n, kArg = k, cArg = columns;
+        void** args = stackalloc void*[] { &wArg, &qArg, &mArg, &yArg, &nArg, &kArg, &cArg };
+        CudaDriverApi.cuLaunchKernel(func,
+                (uint)((columns + tileColumns - 1) / tileColumns),   // x = column tile (L2 reuse order)
+                (uint)((n + tileRows - 1) / tileRows), 1,
+                BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <summary>Whether the TurboQuant KV codec kernels are loaded (turboquant.ptx present).</summary>
     public bool TurboQuantAvailable => _turboquantDequantF32Func != 0 && _turboquantEncodeF32Func != 0;
 
@@ -6897,6 +7008,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _hadamardFwhtModule?.Dispose();
         _pq2_0GemvMultiModule?.Dispose();
         _pq2_0GemvDp4aModule?.Dispose();
+        _pq2_0MmqDp4aModule?.Dispose();
         _kvWriteModule?.Dispose();
         _fusedRopeKvWriteModule?.Dispose();
         _attentionMlaModule?.Dispose();
