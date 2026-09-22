@@ -332,6 +332,11 @@ contents) but costs one extra single-token trunk forward per round versus a maxi
 implementation that reuses the catchup call's own logits as the verify batch's row-0 comparison
 basis — documented here as a known, correctness-first simplification.
 
+> Superseded by #469: there is no catchup forward. One verify forward runs over
+> `[lastToken, d1..dK]` with the reference pairing `(h_{p-1}, x_p)`, so the MTP decoder now
+> behaves like `SpeculativeDecoder` in the rollback asymmetry described under
+> "Recurrent (GDN) Trunk State Rollback": `lastToken` is row 0 of the verify batch.
+
 ### MTP head's own KV-cache lifetime — a second documented simplification
 
 llama.cpp's MTP draft context keeps a KV-cache that persists across speculation rounds with
