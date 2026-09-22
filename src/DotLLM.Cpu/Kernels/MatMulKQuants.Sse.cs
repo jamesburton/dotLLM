@@ -23,6 +23,16 @@ namespace DotLLM.Cpu.Kernels;
 /// </summary>
 public static unsafe partial class MatMul
 {
+    /// <summary>
+    /// Converts the two adjacent Half scales at <paramref name="p"/> (<c>d</c>, <c>dmin</c>) to
+    /// Single in lanes 0 and 1, exactly as <c>(float)Half</c> does, without F16C: the software
+    /// <c>(float)Half</c> costs ~1.2 ns each, ~12% of a 19 ns Q4_K super-block on the target.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<float> LoadHalfPairSse2(byte* p) =>
+        HalfToSingleSse2(Sse2.UnpackLow(Vector128.CreateScalar(Unsafe.ReadUnaligned<uint>(p)).AsUInt16(),
+            Vector128<ushort>.Zero).AsInt32());
+
     /// <summary>128-bit twin of <see cref="VecDotQ4_K_Q8_KAvx2"/>.</summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -37,8 +47,9 @@ public static unsafe partial class MatMul
 
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float d4 = (float)Unsafe.ReadUnaligned<Half>(qk);
-            float dmin = (float)Unsafe.ReadUnaligned<Half>(qk + 2);
+            Vector128<float> dd = LoadHalfPairSse2(qk);
+            float d4 = dd.ToScalar();
+            float dmin = dd.GetElement(1);
             Dequantize.UnpackQ4Q5Scales(qk + 4, scBuf, mnBuf);
             byte* qs = qk + 16;
 
@@ -93,8 +104,9 @@ public static unsafe partial class MatMul
 
         for (int sb = 0; sb < superBlockCount; sb++)
         {
-            float d5 = (float)Unsafe.ReadUnaligned<Half>(qk);
-            float dmin = (float)Unsafe.ReadUnaligned<Half>(qk + 2);
+            Vector128<float> dd = LoadHalfPairSse2(qk);
+            float d5 = dd.ToScalar();
+            float dmin = dd.GetElement(1);
             Dequantize.UnpackQ4Q5Scales(qk + 4, scBuf, mnBuf);
             byte* qh = qk + 16;
             byte* qs = qk + 48;
@@ -158,7 +170,7 @@ public static unsafe partial class MatMul
             byte* ql = qk;
             byte* qh = qk + 128;
             sbyte* scales = (sbyte*)(qk + 192);
-            float d6 = (float)Unsafe.ReadUnaligned<Half>(qk + 208);
+            float d6 = (float)Unsafe.ReadUnaligned<Half>(qk + 208); // one scale per super-block: SSE conversion measured neutral
 
             float d8 = Unsafe.ReadUnaligned<float>(q8k);
             sbyte* q8qs = (sbyte*)(q8k + 4);
