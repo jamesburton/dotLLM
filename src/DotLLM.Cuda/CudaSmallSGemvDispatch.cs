@@ -111,6 +111,69 @@ public static class CudaSmallSGemvDispatch
     public static bool CoversDp4a(int seqLen)
         => UseDp4a && (seqLen == 1 || (seqLen >= 2 && seqLen <= MaxColumns));
 
+    /// <summary>
+    /// Environment variable that, when set to <c>1</c>, routes PQ2_0 projections WIDER than
+    /// <see cref="MaxColumns"/> (prefill, and perplexity's whole-window forward) to the packed dp4a
+    /// GEMM (issue #490) instead of dequantizing the matrix to F16 for cuBLAS. OPT-IN until measured:
+    /// like #485 this is a numerics change (int8 activations, the CPU W2A8 tier), and unlike #485 it
+    /// is on the path perplexity scores.
+    /// </summary>
+    public const string MmqEnvVar = "DOTLLM_CUDA_PQ2_0_MMQ";
+
+    private static readonly bool MmqFromEnv = Environment.GetEnvironmentVariable(MmqEnvVar) == "1";
+
+    /// <summary>Whether the packed PQ2_0 prefill GEMM is enabled (<see cref="MmqEnvVar"/>, default off).</summary>
+    public static bool UseMmq => MmqOverride ?? MmqFromEnv;
+
+    /// <summary>In-process override of <see cref="UseMmq"/> (tests/benches only; read per projection).</summary>
+    internal static bool? MmqOverride { get; set; }
+
+    /// <summary>
+    /// Whether a PQ2_0 projection over <paramref name="seqLen"/> token rows should take the packed
+    /// prefill GEMM (given that its kernels are loaded): every width the GEMV does not already cover.
+    /// </summary>
+    /// <remarks>
+    /// The floor is <c>max(1, MaxColumns)</c>, not <see cref="MaxColumns"/>: with
+    /// <c>DOTLLM_CUDA_SMALL_S_MAX=0</c> the GEMV range is off and a plain <c>&gt; MaxColumns</c> would
+    /// send single-token decode to a GEMM tile that idles 31 of its 32 columns.
+    /// </remarks>
+    /// <param name="seqLen">Token rows in the projection.</param>
+    public static bool CoversMmq(int seqLen)
+        => UseMmq && seqLen > Math.Max(1, MaxColumns);
+
+    /// <summary>
+    /// Environment variable forcing the PQ2_0 MMQ column tile (<c>16</c> or <c>32</c>); unset picks
+    /// <see cref="MmqTileColumns"/>'s width for the token count.
+    /// </summary>
+    public const string MmqTileEnvVar = "DOTLLM_CUDA_PQ2_0_MMQ_BN";
+
+    private static readonly int MmqTileFromEnv = ReadMmqTile();
+
+    /// <summary>In-process override of the MMQ column tile, <c>16</c> or <c>32</c> (tests/benches only).</summary>
+    internal static int? MmqTileOverride { get; set; }
+
+    /// <summary>
+    /// Column tile for a <paramref name="seqLen"/>-row MMQ projection: the narrow (16-column, 256-row)
+    /// instantiation at or below 16 tokens, where the 32-wide tile would idle half its lanes, and the
+    /// wide (32-column, 128-row) one above. <see cref="MmqTileEnvVar"/> pins either.
+    /// </summary>
+    /// <param name="seqLen">Token rows in the projection.</param>
+    public static int MmqTileColumns(int seqLen)
+    {
+        int forced = MmqTileOverride ?? MmqTileFromEnv;
+        if (forced != 0) return forced;
+        return seqLen <= CudaKernels.Pq2_0MmqTileColumnsNarrow
+            ? CudaKernels.Pq2_0MmqTileColumnsNarrow
+            : CudaKernels.Pq2_0MmqTileColumnsWide;
+    }
+
+    private static int ReadMmqTile()
+        => int.TryParse(Environment.GetEnvironmentVariable(MmqTileEnvVar),
+               NumberStyles.Integer, CultureInfo.InvariantCulture, out int v)
+           && (v == CudaKernels.Pq2_0MmqTileColumnsNarrow || v == CudaKernels.Pq2_0MmqTileColumnsWide)
+           ? v
+           : 0;
+
     private static int ReadMaxColumns()
         => int.TryParse(Environment.GetEnvironmentVariable(MaxColumnsEnvVar),
                NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) && v >= 0

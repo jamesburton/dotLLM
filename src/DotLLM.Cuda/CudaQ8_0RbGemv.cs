@@ -42,22 +42,87 @@ internal sealed class CudaQ8_0RbGemv : IDisposable
     /// <summary>Env switch: <c>DOTLLM_CUDA_Q8_RB_GEMV=0</c> disables this kernel.</summary>
     public const string DisableEnvVar = "DOTLLM_CUDA_Q8_RB_GEMV";
 
+    /// <summary>
+    /// Env switch (issue #492): <c>DOTLLM_CUDA_Q8_RB_MULTI_SPECIALIZED=0</c> keeps
+    /// <see cref="LaunchMulti"/> on the generic <c>_rb_multi</c> kernel, so the specialised
+    /// entry points can be A/B'd against the exact code that shipped with #486.
+    /// </summary>
+    public const string DisableSpecializedEnvVar = "DOTLLM_CUDA_Q8_RB_MULTI_SPECIALIZED";
+
+    /// <summary>Name of the <paramref name="cols"/>-column specialised entry point.</summary>
+    public static string SpecializedKernelName(int cols) => $"{MultiKernelName}_c{cols}";
+
     /// <summary><see langword="true"/> when <c>DOTLLM_CUDA_Q8_RB_GEMV=0</c> disables the kernel.</summary>
     public static bool DisabledByEnv { get; } = Environment.GetEnvironmentVariable(DisableEnvVar) == "0";
+
+    /// <summary><see langword="true"/> when <c>DOTLLM_CUDA_Q8_RB_MULTI_SPECIALIZED=0</c> forces the generic kernel.</summary>
+    public static bool SpecializedDisabledByEnv { get; } =
+        Environment.GetEnvironmentVariable(DisableSpecializedEnvVar) == "0";
 
     private CudaModule? _module;
     private readonly nint _func;
     private readonly nint _multiFunc;
 
-    private CudaQ8_0RbGemv(CudaModule module, nint func, nint multiFunc)
+    /// <summary>
+    /// Specialised multi-column entry points indexed by column count (slot 0 unused), or 0 when the
+    /// PTX predates issue #492. Resolved once at load; <see cref="LaunchMulti"/> only indexes it.
+    /// </summary>
+    private readonly nint[] _colFuncs;
+
+    private CudaQ8_0RbGemv(CudaModule module, nint func, nint multiFunc, nint[] colFuncs)
     {
         _module = module;
         _func = func;
         _multiFunc = multiFunc;
+        _colFuncs = colFuncs;
     }
 
     /// <summary>Whether the multi-column entry point loaded (it ships in the same PTX).</summary>
     public bool HasMulti => _multiFunc != 0;
+
+    /// <summary>
+    /// Whether the <paramref name="cols"/>-column specialised entry point (issue #492) is present
+    /// <em>and</em> enabled — i.e. whether <see cref="LaunchMulti"/> will use it for that group size.
+    /// Test hook: a parity/perf test can assert it is not silently measuring the generic kernel.
+    /// </summary>
+    public bool HasSpecialized(int cols) =>
+        !SpecializedDisabledByEnv && (uint)cols < (uint)_colFuncs.Length && _colFuncs[cols] != 0;
+
+    /// <summary>
+    /// Diagnostic (issue #492): the driver's static attributes for the <paramref name="cols"/>-column
+    /// specialised kernel — registers per thread, static shared bytes, local (spill) bytes and the
+    /// resident blocks per SM at <paramref name="k"/>'s launch shape. Returns <see langword="false"/>
+    /// when that entry point is absent. Lets a test print what <c>-Xptxas -v</c> would, without a
+    /// <c>-cubin</c> build. Not used by any production path.
+    /// </summary>
+    public bool TryGetKernelInfo(int cols, int k, out int regs, out int sharedBytes, out int localBytes, out int blocksPerSm)
+    {
+        regs = sharedBytes = localBytes = blocksPerSm = 0;
+        if ((uint)cols >= (uint)_colFuncs.Length || _colFuncs[cols] == 0)
+            return false;
+        nint f = _colFuncs[cols];
+        CudaDriverApi.cuFuncGetAttribute(out regs, CudaDriverApi.CU_FUNC_ATTRIBUTE_NUM_REGS, f);
+        CudaDriverApi.cuFuncGetAttribute(out sharedBytes, CudaDriverApi.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, f);
+        CudaDriverApi.cuFuncGetAttribute(out localBytes, CudaDriverApi.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, f);
+        CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(out blocksPerSm, f, (int)BlockDim(k), 0);
+        return true;
+    }
+
+    /// <summary>
+    /// Same diagnostic for the generic <c>_rb_multi</c> kernel — the A/B baseline's side of the
+    /// register/shared/occupancy comparison.
+    /// </summary>
+    public bool TryGetGenericKernelInfo(int k, out int regs, out int sharedBytes, out int localBytes, out int blocksPerSm)
+    {
+        regs = sharedBytes = localBytes = blocksPerSm = 0;
+        if (_multiFunc == 0)
+            return false;
+        CudaDriverApi.cuFuncGetAttribute(out regs, CudaDriverApi.CU_FUNC_ATTRIBUTE_NUM_REGS, _multiFunc);
+        CudaDriverApi.cuFuncGetAttribute(out sharedBytes, CudaDriverApi.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, _multiFunc);
+        CudaDriverApi.cuFuncGetAttribute(out localBytes, CudaDriverApi.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, _multiFunc);
+        CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(out blocksPerSm, _multiFunc, (int)BlockDim(k), 0);
+        return true;
+    }
 
     /// <summary>
     /// Loads the kernel from <paramref name="ptxDir"/>, or returns <see langword="null"/> when it is
@@ -82,7 +147,21 @@ internal sealed class CudaQ8_0RbGemv : IDisposable
                 module.Dispose();
                 return null;
             }
-            return new CudaQ8_0RbGemv(module, func, module.TryGetFunction(MultiKernelName));
+            // Issue #492: the NCOLS-specialised entries ship in the same module. Absent in an older
+            // PTX -> the slot stays 0 and LaunchMulti falls back to the generic kernel.
+            var colFuncs = new nint[MaxColumns + 1];
+            for (int c = 1; c <= MaxColumns; c++)
+            {
+                nint cf = module.TryGetFunction(SpecializedKernelName(c));
+                colFuncs[c] = cf;
+                // Their 37,888 B of static shared memory only leaves room for the two blocks per SM
+                // that __launch_bounds__(256, 2) budgets registers for at the maximum carveout; ask
+                // for it explicitly rather than trusting the driver's default heuristic. Advisory:
+                // a driver that rejects the attribute simply keeps its own choice.
+                if (cf != 0)
+                    CudaDriverApi.cuFuncSetAttribute(cf, CudaDriverApi.CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100);
+            }
+            return new CudaQ8_0RbGemv(module, func, module.TryGetFunction(MultiKernelName), colFuncs);
         }
         catch (Exception ex) when (ex is CudaException or IOException)
         {
@@ -123,9 +202,26 @@ internal sealed class CudaQ8_0RbGemv : IDisposable
     /// groups of <see cref="MaxColumns"/> are launched in turn. Each output column is bit-identical to
     /// <see cref="Launch"/> on that input column. Requires <see cref="HasMulti"/> and
     /// <see cref="Accepts"/>(x, k, ldx).
+    /// <para>
+    /// Issue #492: a group whose size has a specialised entry point goes to it instead of the generic
+    /// 8-column kernel — same bits, sized accumulators and two resident blocks per SM instead of one.
+    /// </para>
     /// </summary>
-    public unsafe void LaunchMulti(nint quantWeight, nint xF32, int ldx, nint yF32, int ldy,
-                                   int n, int k, int ncols, nint stream)
+    public void LaunchMulti(nint quantWeight, nint xF32, int ldx, nint yF32, int ldy,
+                            int n, int k, int ncols, nint stream) =>
+        LaunchMultiCore(quantWeight, xF32, ldx, yF32, ldy, n, k, ncols, stream, preferSpecialized: true);
+
+    /// <summary>
+    /// <see cref="LaunchMulti"/> pinned to the generic <c>_rb_multi</c> kernel — the A/B baseline the
+    /// specialised entries (issue #492) must match bit for bit, and the shape
+    /// <c>DOTLLM_CUDA_Q8_RB_MULTI_SPECIALIZED=0</c> selects. Test/benchmark hook.
+    /// </summary>
+    public void LaunchMultiGeneric(nint quantWeight, nint xF32, int ldx, nint yF32, int ldy,
+                                   int n, int k, int ncols, nint stream) =>
+        LaunchMultiCore(quantWeight, xF32, ldx, yF32, ldy, n, k, ncols, stream, preferSpecialized: false);
+
+    private unsafe void LaunchMultiCore(nint quantWeight, nint xF32, int ldx, nint yF32, int ldy,
+                                        int n, int k, int ncols, nint stream, bool preferSpecialized)
     {
         ObjectDisposedException.ThrowIf(_module is null, this);
         if (_multiFunc == 0)
@@ -134,13 +230,17 @@ internal sealed class CudaQ8_0RbGemv : IDisposable
         uint block = BlockDim(k);
         nint wArg = quantWeight, xArg = 0, yArg = 0;
         int ldxArg = ldx, ldyArg = ldy, nArg = n, kArg = k, colsArg = 0;
+        // The specialised entries (issue #492) take the same arguments minus the runtime column
+        // count, so one stackalloc'd array serves both: the generic kernel reads 8 slots, a
+        // specialised one reads the first 7.
         void** args = stackalloc void*[] { &wArg, &xArg, &ldxArg, &yArg, &ldyArg, &nArg, &kArg, &colsArg };
         for (int c0 = 0; c0 < ncols; c0 += MaxColumns)
         {
             xArg = xF32 + (nint)((long)c0 * ldx * sizeof(float));
             yArg = yF32 + (nint)((long)c0 * ldy * sizeof(float));
             colsArg = Math.Min(MaxColumns, ncols - c0);
-            CudaDriverApi.cuLaunchKernel(_multiFunc, grid, 1, 1, block, 1, 1,
+            nint func = preferSpecialized && HasSpecialized(colsArg) ? _colFuncs[colsArg] : _multiFunc;
+            CudaDriverApi.cuLaunchKernel(func, grid, 1, 1, block, 1, 1,
                     0, stream, (nint)args, 0).ThrowOnError();
         }
     }

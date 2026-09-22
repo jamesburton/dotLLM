@@ -907,10 +907,14 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 ITensor logits;
                 try
                 {
+                    // Issue #493: FinishPrefill below samples row Shape[0]-1 only, and a
+                    // PendingPrefill always covers the prompt suffix through its final token
+                    // (MaxPrefillTokensPerStep gates ADMISSION of a whole prompt, it does not
+                    // split one across steps), so the last-row hint is safe on every path here.
                     logits = _model.Forward(
                         seq.PromptTokenIds.AsSpan(p.ForwardStart, p.ForwardLen),
                         _prefillPositions.AsSpan(posOff, p.ForwardLen),
-                        deviceId: -1, seq.KvCache);
+                        deviceId: -1, seq.KvCache, lastTokenLogitsOnly: true);
                 }
                 catch (OperationCanceledException)
                 {
@@ -1080,7 +1084,9 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             }
             else
             {
-                using ITensor _ = _model.Forward(ctx.AsSpan(0, rebuildLen), positions, deviceId: -1, seq.KvCache);
+                // Logits discarded — this forward only rebuilds the recurrent/KV state (issue #493).
+                using ITensor _ = _model.Forward(ctx.AsSpan(0, rebuildLen), positions, deviceId: -1,
+                    seq.KvCache, lastTokenLogitsOnly: true);
             }
             seq.PrefillTicks += Stopwatch.GetTimestamp() - ts0;
         }

@@ -122,37 +122,94 @@ public sealed class CudaQ8_0RbGemvTests
             dY = Alloc(cols * ldy);
             Poison(dY, cols * ldy);
 
-            env.Rb.LaunchMulti(dW, dX, ldx, dY, ldy, n, k, cols, env.Stream.Handle);
-            env.Stream.Synchronize();
-            float[] y = Download(dY, cols * ldy);
-
-            for (int c = 0; c < cols; c++)
+            // Both dispatch shapes, against the same single-column oracle: the default (issue #492's
+            // NCOLS-specialised entry point when the PTX carries one) and the generic 8-column
+            // kernel the specialisation must match bit for bit.
+            foreach (bool specialized in new[] { true, false })
             {
-                nint xc = dX + (nint)((long)c * ldx * sizeof(float));
-                env.Kernels.LaunchQuantizedGemvF32In(dW, xc, dYRef, n, k, env.Stream.Handle);
+                if (specialized && !env.Rb.HasSpecialized(Math.Min(cols, CudaQ8_0RbGemv.MaxColumns)))
+                    continue;                          // PTX predates #492: only the generic shape exists
+                Poison(dY, cols * ldy);
+                if (specialized)
+                    env.Rb.LaunchMulti(dW, dX, ldx, dY, ldy, n, k, cols, env.Stream.Handle);
+                else
+                    env.Rb.LaunchMultiGeneric(dW, dX, ldx, dY, ldy, n, k, cols, env.Stream.Handle);
                 env.Stream.Synchronize();
-                float[] yRef = Download(dYRef, n);
-                AssertBitEqual(yRef, y.AsSpan(c * ldy, n).ToArray(), $"column {c} (n={n} k={k} cols={cols})");
-                for (int g = n; g < ldy; g++)
-                    Assert.True(float.IsNaN(y[c * ldy + g]), $"column {c}: padding slot {g} was written");
+                float[] y = Download(dY, cols * ldy);
+
+                for (int c = 0; c < cols; c++)
+                {
+                    nint xc = dX + (nint)((long)c * ldx * sizeof(float));
+                    env.Kernels.LaunchQuantizedGemvF32In(dW, xc, dYRef, n, k, env.Stream.Handle);
+                    env.Stream.Synchronize();
+                    float[] yRef = Download(dYRef, n);
+                    AssertBitEqual(yRef, y.AsSpan(c * ldy, n).ToArray(),
+                        $"{(specialized ? "specialized" : "generic")} column {c} (n={n} k={k} cols={cols})");
+                    for (int g = n; g < ldy; g++)
+                        Assert.True(float.IsNaN(y[c * ldy + g]),
+                            $"{(specialized ? "specialized" : "generic")} column {c}: padding slot {g} was written");
+                }
             }
 
             if (time)
             {
                 double tMulti = TimeMs(() => env.Rb.LaunchMulti(dW, dX, ldx, dY, ldy, n, k, cols, env.Stream.Handle), env.Stream);
+                double tGeneric = TimeMs(() => env.Rb.LaunchMultiGeneric(dW, dX, ldx, dY, ldy, n, k, cols, env.Stream.Handle), env.Stream);
                 double tSingle = TimeMs(() =>
                 {
                     for (int c = 0; c < cols; c++)
                         env.Rb.Launch(dW, dX + (nint)((long)c * ldx * sizeof(float)),
                                       dY + (nint)((long)c * ldy * sizeof(float)), n, k, env.Stream.Handle);
                 }, env.Stream);
-                _out.WriteLine($"  {cols} columns: multi {tMulti:F3} ms vs {cols} x single {tSingle:F3} ms " +
-                               $"({tSingle / tMulti:F2}x)");
+                double gb = (double)w.Length / 1e6;    // MB of weights read once per multi launch
+                _out.WriteLine($"  {cols} columns: multi {tMulti:F3} ms ({gb / tMulti:F0} GB/s) vs " +
+                               $"generic {tGeneric:F3} ms ({gb / tGeneric:F0} GB/s) vs {cols} x single {tSingle:F3} ms " +
+                               $"(specialized/generic {tGeneric / tMulti:F2}x, vs single {tSingle / tMulti:F2}x)");
+                if (env.Rb.TryGetKernelInfo(cols, k, out int r1, out int s1, out int l1, out int b1))
+                    _out.WriteLine($"    _c{cols}: {r1} regs, {s1} B smem, {l1} B local, {b1} blocks/SM");
+                if (env.Rb.TryGetGenericKernelInfo(k, out int r0, out int s0, out int l0, out int b0))
+                    _out.WriteLine($"    generic: {r0} regs, {s0} B smem, {l0} B local, {b0} blocks/SM");
             }
         }
         finally
         {
             Free(dW); Free(dX); Free(dYRef); Free(dY);
+        }
+    }
+
+    /// <summary>
+    /// Issue #492: the whole point of the specialised entry points is the launch shape, so assert it
+    /// rather than only the bits. At eh_proj's geometry each <c>_c{cols}</c> kernel must stay inside
+    /// the <c>__launch_bounds__(256, 2)</c> budget (registers capped, no local spill) and must be
+    /// resident at least as many blocks per SM as the generic 8-column kernel it replaces — which was
+    /// one, at 184 registers. A regression that pushes registers back up shows here as a lower
+    /// blocks/SM, long before anyone re-runs a model-level profile.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(5120, 10240)]   // nextn.eh_proj — blockDim 256, the shape that was 1 block/SM
+    [InlineData(1024, 5120)]    // absorb K / V — blockDim 160
+    public void RbMulti_SpecializedKernels_AreNotOccupancyStarved(int n, int k)
+    {
+        using var env = Env.Open(_out);
+        if (env is null) return;
+        Skip.IfNot(env.Rb.HasMulti, $"{CudaQ8_0RbGemv.MultiKernelName} missing from the PTX");
+        Skip.IfNot(env.Rb.HasSpecialized(1),
+            $"{CudaQ8_0RbGemv.SpecializedKernelName(1)} missing from the PTX (pre-#492 build, or " +
+            $"{CudaQ8_0RbGemv.DisableSpecializedEnvVar}=0)");
+
+        Assert.True(env.Rb.TryGetGenericKernelInfo(k, out int gRegs, out int gSmem, out int gLocal, out int gBlocks));
+        _out.WriteLine($"n={n} k={k}: generic {gRegs} regs, {gSmem} B smem, {gLocal} B local, {gBlocks} blocks/SM");
+        for (int cols = 1; cols <= CudaQ8_0RbGemv.MaxColumns; cols++)
+        {
+            Assert.True(env.Rb.HasSpecialized(cols), $"{CudaQ8_0RbGemv.SpecializedKernelName(cols)} missing");
+            Assert.True(env.Rb.TryGetKernelInfo(cols, k, out int regs, out int smem, out int local, out int blocks));
+            _out.WriteLine($"  _c{cols}: {regs} regs, {smem} B smem, {local} B local, {blocks} blocks/SM" +
+                           (local > 0 ? "   ** SPILLED **" : ""));
+            Assert.True(regs <= 128, $"_c{cols}: {regs} registers — __launch_bounds__(256, 2) should cap at 128");
+            // Spill is reported, not asserted: it is a perf signal whose acceptable level depends on
+            // the card, and the occupancy assertion below is the one that must hold.
+            Assert.True(blocks >= gBlocks,
+                $"_c{cols}: {blocks} blocks/SM vs the generic kernel's {gBlocks} — the specialisation lost occupancy");
         }
     }
 

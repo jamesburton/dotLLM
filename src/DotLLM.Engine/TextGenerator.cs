@@ -1448,6 +1448,9 @@ public sealed class TextGenerator
     /// (llama.cpp <c>-ub</c> analog — bounds peak activation memory per forward pass). Returns the
     /// logits tensor of the <b>last</b> chunk only (the caller samples from its final row); earlier
     /// chunks' logits are disposed here.
+    /// Every chunk opts in to <c>lastTokenLogitsOnly</c> (issue #493) — only row
+    /// <c>Shape[0] - 1</c> of the final chunk is ever read, so the caller must index the last row
+    /// by shape and never assume one row per input token.
     /// </summary>
     private ITensor ForwardPrefill(int[] promptIds, int prefillStart, int prefillLen,
         Core.Attention.IKvCache kvCache, ILoraAdapter? adapter, DotLLM.Core.Models.IMtpState? mtpState = null)
@@ -1466,11 +1469,13 @@ public sealed class TextGenerator
                     positions[i] = prefillStart + offset + i;
 
                 logits?.Dispose();
-                logits = mtpState is null
-                    ? _model.Forward(promptIds.AsSpan(prefillStart + offset, len), positions,
-                        deviceId: -1, kvCache, adapter)
-                    : _model.Forward(promptIds.AsSpan(prefillStart + offset, len), positions,
-                        deviceId: -1, kvCache, adapter, mtpState);
+                // Issue #493: this driver samples row Shape[0]-1 of the LAST chunk and nothing
+                // else — every earlier chunk's logits are disposed unread, and within the last
+                // chunk only the final row is read. So opt in to last-row-only logits. Models that
+                // ignore the hint keep returning [len, vocab] and both call sites index
+                // Shape[0]-1, so the behaviour is unchanged for them.
+                logits = _model.Forward(promptIds.AsSpan(prefillStart + offset, len), positions,
+                    deviceId: -1, kvCache, adapter, mtpState, lastTokenLogitsOnly: true);
                 offset += len;
             }
             return logits!;
@@ -1504,8 +1509,10 @@ public sealed class TextGenerator
                 for (int i = 0; i < len; i++)
                     positions[i] = offset + i;
 
+                // The draft prefill discards its logits entirely — it runs only to populate the
+                // draft KV-cache — so the last-row hint is always safe here (issue #493).
                 using ITensor _ = _draftModel!.Forward(promptIds.AsSpan(offset, len),
-                    positions.AsSpan(0, len), deviceId: -1, draftKvCache);
+                    positions.AsSpan(0, len), deviceId: -1, draftKvCache, lastTokenLogitsOnly: true);
                 offset += len;
             }
         }
