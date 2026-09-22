@@ -38,13 +38,14 @@ public sealed class Qwen3HybridDenseMtpBatchedAbsorbTests : IDisposable
     }
 
     [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void BatchedAbsorb_KvCacheMatchesPerTokenAbsorb(bool mtpHasOwnHeadTensors)
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]    // issue #486: the Q8_0-head fixture variant loads and absorbs on CPU too
+    public void BatchedAbsorb_KvCacheMatchesPerTokenAbsorb(bool mtpHasOwnHeadTensors, bool q8_0MtpHead)
     {
         string path = SyntheticQwen35HybridDenseMtpGguf.Write(
-            Path.Combine(_scratch, $"mtp-own{mtpHasOwnHeadTensors}.gguf"),
-            withMtp: true, mtpHasOwnHeadTensors: mtpHasOwnHeadTensors);
+            Path.Combine(_scratch, $"mtp-own{mtpHasOwnHeadTensors}-q8{q8_0MtpHead}.gguf"),
+            withMtp: true, mtpHasOwnHeadTensors: mtpHasOwnHeadTensors, q8_0MtpHead: q8_0MtpHead);
 
         var perToken = RunSequence(path, perToken: true);
         var batched = RunSequence(path, perToken: false);

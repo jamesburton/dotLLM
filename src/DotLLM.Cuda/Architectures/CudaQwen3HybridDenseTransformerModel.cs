@@ -1587,13 +1587,14 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         if (!DotLLM.Models.Architectures.MtpAbsorbDispatch.UsePerToken
             && DotLLM.Models.Architectures.MtpAbsorbDispatch.IsContiguous(positions))
         {
-            // Profiler (issue #482): the whole batched absorb is one category, armed regardless of
-            // the trunk's seqLen (a verify is S = K+1 > 1, which leaves the trunk profiler off).
+            // Profiler (issue #482): the batched absorb is armed regardless of the trunk's seqLen (a
+            // verify is S = K+1 > 1, which leaves the trunk profiler off). Its categories are the
+            // "mtp-absorb-*" stages (issue #486); their sum is the whole absorb.
             bool profPrev = _profileActiveForThisCall;
             if (ProfileTrace) { _profileActiveForThisCall = true; ProfStart(); }
             AbsorbMtpBatched(mtpHead, state, tokenIds, positions[0]);
             state.SeedFromCapturedRow(tokenIds.Length - 1);
-            if (ProfileTrace) { ProfMark("mtp-absorb-batched"); _profileActiveForThisCall = profPrev; }
+            if (ProfileTrace) { ProfMark("mtp-absorb-7-seed"); _profileActiveForThisCall = profPrev; }
             return;
         }
         for (int i = 0; i < tokenIds.Length; i++)
@@ -1623,12 +1624,25 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         public nint Cur;        // [rows, hidden]
         public nint Normed;     // [rows, hidden]
 
+        /// <summary>
+        /// Pinned host staging rows ([rows, hidden] f32 each) for the embedding and pairing uploads
+        /// (issue #486). Replaces pooled managed arrays, whose pageable H2D goes through a driver
+        /// staging copy; page-locked rows let the copies run async on the stream. Reuse is safe
+        /// because every chunk ends in a stream synchronize.
+        /// </summary>
+        public nint EmbedHost;
+        public nint PairHost;
+
         public static CudaMtpAbsorbScratch Allocate(int rows, int hiddenSize)
         {
             long h = (long)rows * hiddenSize * sizeof(float);
+            CudaDriverApi.cuMemHostAlloc(out nint embedHost, (nuint)h, 0).ThrowOnError();
+            CudaDriverApi.cuMemHostAlloc(out nint pairHost, (nuint)h, 0).ThrowOnError();
             return new CudaMtpAbsorbScratch
             {
                 Rows = rows,
+                EmbedHost = embedHost,
+                PairHost = pairHost,
                 Embed = AllocDevice(h),
                 Pair = AllocDevice(h),
                 ENorm = AllocDevice(h),
@@ -1648,6 +1662,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             FreeIfNonZero(ref Concat);
             FreeIfNonZero(ref Cur);
             FreeIfNonZero(ref Normed);
+            if (EmbedHost != 0) { CudaDriverApi.cuMemFreeHost(EmbedHost); EmbedHost = 0; }
+            if (PairHost != 0) { CudaDriverApi.cuMemFreeHost(PairHost); PairHost = 0; }
         }
     }
 
@@ -1665,12 +1681,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// <b>Bit-identical to the per-token absorb, deliberately.</b> The embed dequant, the pairing
     /// rows, every RMSNorm (enorm, hnorm, attn_norm, K-norm) and RoPE are batched over S rows — all
     /// of them are per-row kernels (one block per row / one thread per pair), so a row's result does
-    /// not depend on the batch. The three projections (eh_proj, K, V) are NOT batched: this model's
-    /// <see cref="Gemm"/> takes a different route for <c>seqLen &gt; 1</c> (dequant to F16 + cuBLAS
+    /// not depend on the batch. The three projections (eh_proj, K, V) do NOT use <see cref="Gemm"/>'s
+    /// S-row route: it takes a different path for <c>seqLen &gt; 1</c> (dequant to F16 + cuBLAS
     /// HGEMM on F16-staged activations) than for one row (the F32-native GEMV the per-token path
-    /// uses), so an S-row GEMM would change the head's K/V bits on quantized weights. They run as S
-    /// single-row GEMVs instead. A batched-GEMM variant would be faster on a long prefill; it is a
-    /// separate, output-changing decision.
+    /// uses), so an S-row GEMM would change the head's K/V bits on quantized weights. They go through
+    /// <see cref="MtpGemmRows"/> instead: for Q8_0 (Bonsai 2's whole head) one multi-column GEMV that
+    /// reads the weights once and is bit-identical per row to the single-row kernel (issue #486);
+    /// otherwise S single-row GEMVs.
     /// </para>
     /// <para>
     /// Processed in chunks of <see cref="MtpAbsorbChunkRows"/> rows so a long prefill does not size
@@ -1706,85 +1723,75 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         long embedRowBytes = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensRowBytes : _embedRowBytes;
         QuantizationType embedQt = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensQt : _tokenEmbedQt;
 
-        int chunkElems = chunkRows * hiddenSize;
-        float[] embedHost = System.Buffers.ArrayPool<float>.Shared.Rent(chunkElems);
-        float[] pairHost = System.Buffers.ArrayPool<float>.Shared.Rent(chunkElems);
-        try
+        float* embedHost = (float*)sc.EmbedHost;
+        float* pairHost = (float*)sc.PairHost;
+        ProfMark("mtp-absorb-0-setup");
+        for (int start = 0; start < total; start += chunkRows)
         {
-            for (int start = 0; start < total; start += chunkRows)
+            int s = Math.Min(chunkRows, total - start);
+            int elems = s * hiddenSize;
+
+            for (int i = 0; i < s; i++)
             {
-                int s = Math.Min(chunkRows, total - start);
-                int elems = s * hiddenSize;
-
-                for (int i = 0; i < s; i++)
-                {
-                    nint rowSrc = embedHostBase + (nint)(embedDataOffset + (ulong)tokenIds[start + i] * (ulong)embedRowBytes);
-                    Dequantize.ToFloat32(rowSrc, hiddenSize, embedQt, embedHost.AsSpan(i * hiddenSize, hiddenSize));
-                }
-                // A folded checkpoint's trunk embedding is stored in the rotated basis (#479); the
-                // head-local table, when shipped, is not. Same rule as ForwardMtpCore's gather.
-                if (mtpHead.EmbedTokensHostBase is null && _hadamard is { } embRot)
-                {
-                    fixed (float* pEmbedRows = embedHost)
-                        embRot.RotateInverseInPlaceHost(pEmbedRows, s, hiddenSize);
-                }
-                // Pairing (#469): row r goes with h_{p-1} — the carry for r == 0, captured row r-1 otherwise.
-                state.CopyAbsorbPairingRows(start, s, pairHost.AsSpan(0, elems));
-
-                // Synchronous H2D: the pooled host arrays are reused by the next chunk.
-                fixed (float* pEmbed = embedHost)
-                    CudaDriverApi.cuMemcpyHtoD_v2(sc.Embed, (nint)pEmbed, (nuint)((long)elems * sizeof(float))).ThrowOnError();
-                fixed (float* pPair = pairHost)
-                    CudaDriverApi.cuMemcpyHtoD_v2(sc.Pair, (nint)pPair, (nuint)((long)elems * sizeof(float))).ThrowOnError();
-
-                // enorm / hnorm over s rows, then interleave into concat rows [e_i, h_i].
-                _kernels.LaunchRmsNormF32(sc.Embed, mtpHead.EnormDevice, sc.ENorm, hiddenSize, eps, s, streamH);
-                _kernels.LaunchRmsNormF32(sc.Pair, mtpHead.HnormDevice, sc.HNorm, hiddenSize, eps, s, streamH);
-                for (int i = 0; i < s; i++)
-                {
-                    nint rowOff = (nint)(i * hiddenRowBytes);
-                    nint catOff = (nint)(2 * i * hiddenRowBytes);
-                    CudaDriverApi.cuMemcpyDtoDAsync_v2(sc.Concat + catOff, sc.ENorm + rowOff,
-                        (nuint)hiddenRowBytes, streamH).ThrowOnError();
-                    CudaDriverApi.cuMemcpyDtoDAsync_v2(sc.Concat + catOff + (nint)hiddenRowBytes, sc.HNorm + rowOff,
-                        (nuint)hiddenRowBytes, streamH).ThrowOnError();
-                }
-
-                // cur = eh_proj @ concat — one GEMV per row (see remarks), then attn_norm over s rows.
-                for (int i = 0; i < s; i++)
-                {
-                    MtpGemm(mtpHead.EhProjDevice, mtpHead.EhProjQt,
-                            sc.Concat + (nint)(2 * i * hiddenRowBytes), sc.Cur + (nint)(i * hiddenRowBytes),
-                            mtpHead.EhProjOutputDim, mtpHead.EhProjInputDim);
-                }
-                _kernels.LaunchRmsNormF32(sc.Cur, mtpHead.Layer.AttnNormWeightDevice, sc.Normed, hiddenSize, eps, s, streamH);
-
-                // K/V straight into the head's cache slab [p, p + s): one contiguous [maxSteps, kvStride] buffer.
-                int p = firstPosition + start;
-                for (int i = 0; i < s; i++)
-                {
-                    nint normedRow = sc.Normed + (nint)(i * hiddenRowBytes);
-                    MtpGemm(attn.KDevice, attn.KQt, normedRow, state.GetKeyRowDevicePtr(p + i),
-                            attn.KOutputDim, attn.KInputDim);
-                    MtpGemm(attn.VDevice, attn.VQt, normedRow, state.GetValueRowDevicePtr(p + i),
-                            attn.VOutputDim, attn.VInputDim);
-                }
-
-                nint kSlab = state.GetKeyRowDevicePtr(p);
-                _kernels.LaunchRmsNormF32(kSlab, attn.KNormDevice, kSlab, headDim, eps, s * numKvHeads, streamH);
-                // numHeads = 0: the kernel rotates no Q pairs, so its Q operand is never touched.
-                // Positions [p, p + s) are a slice of the state's device iota (issue #482) — no upload.
-                _kernels.LaunchRoPEF32(kSlab, kSlab, state.GetPositionDevicePtr(p, s), s, 0, numKvHeads, headDim,
-                    _ropeDim, _ropeTheta, 1, streamH);
-
-                // The next chunk overwrites the device scratch.
-                _stream.Synchronize();
+                nint rowSrc = embedHostBase + (nint)(embedDataOffset + (ulong)tokenIds[start + i] * (ulong)embedRowBytes);
+                Dequantize.ToFloat32(rowSrc, hiddenSize, embedQt, new Span<float>(embedHost + (long)i * hiddenSize, hiddenSize));
             }
-        }
-        finally
-        {
-            System.Buffers.ArrayPool<float>.Shared.Return(embedHost);
-            System.Buffers.ArrayPool<float>.Shared.Return(pairHost);
+            // A folded checkpoint's trunk embedding is stored in the rotated basis (#479); the
+            // head-local table, when shipped, is not. Same rule as ForwardMtpCore's gather.
+            if (mtpHead.EmbedTokensHostBase is null && _hadamard is { } embRot)
+                embRot.RotateInverseInPlaceHost(embedHost, s, hiddenSize);
+            // Pairing (#469): row r goes with h_{p-1} — the carry for r == 0, captured row r-1 otherwise.
+            state.CopyAbsorbPairingRows(start, s, new Span<float>(pairHost, elems));
+            ProfMark("mtp-absorb-1-host-embed-pair");
+
+            // Pinned rows (issue #486): async on the stream; the chunk-end synchronize below is what
+            // makes rewriting them for the next chunk safe.
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(sc.Embed, (nint)embedHost, (nuint)((long)elems * sizeof(float)), streamH).ThrowOnError();
+            CudaDriverApi.cuMemcpyHtoDAsync_v2(sc.Pair, (nint)pairHost, (nuint)((long)elems * sizeof(float)), streamH).ThrowOnError();
+            ProfMark("mtp-absorb-2-h2d");
+
+            // enorm / hnorm over s rows, then interleave into concat rows [e_i, h_i].
+            _kernels.LaunchRmsNormF32(sc.Embed, mtpHead.EnormDevice, sc.ENorm, hiddenSize, eps, s, streamH);
+            _kernels.LaunchRmsNormF32(sc.Pair, mtpHead.HnormDevice, sc.HNorm, hiddenSize, eps, s, streamH);
+            for (int i = 0; i < s; i++)
+            {
+                nint rowOff = (nint)(i * hiddenRowBytes);
+                nint catOff = (nint)(2 * i * hiddenRowBytes);
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(sc.Concat + catOff, sc.ENorm + rowOff,
+                    (nuint)hiddenRowBytes, streamH).ThrowOnError();
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(sc.Concat + catOff + (nint)hiddenRowBytes, sc.HNorm + rowOff,
+                    (nuint)hiddenRowBytes, streamH).ThrowOnError();
+            }
+            ProfMark("mtp-absorb-3-norms-concat");
+
+            // cur = eh_proj @ concat over s rows — one multi-column GEMV reading the weights once
+            // when the Q8_0 register-blocked kernel is present (issue #486), else one GEMV per row
+            // (see remarks); both leave each row bit-identical to the per-token path. Then attn_norm.
+            MtpGemmRows(mtpHead.EhProjDevice, mtpHead.EhProjQt,
+                        sc.Concat, 2 * hiddenSize, sc.Cur, hiddenSize,
+                        mtpHead.EhProjOutputDim, mtpHead.EhProjInputDim, s);
+            _kernels.LaunchRmsNormF32(sc.Cur, mtpHead.Layer.AttnNormWeightDevice, sc.Normed, hiddenSize, eps, s, streamH);
+            ProfMark("mtp-absorb-4-eh-proj");
+
+            // K/V straight into the head's cache slab [p, p + s): one contiguous [maxSteps, kvStride] buffer.
+            int p = firstPosition + start;
+            int kvStride = state.KvStride;
+            MtpGemmRows(attn.KDevice, attn.KQt, sc.Normed, hiddenSize, state.GetKeyRowDevicePtr(p), kvStride,
+                        attn.KOutputDim, attn.KInputDim, s);
+            MtpGemmRows(attn.VDevice, attn.VQt, sc.Normed, hiddenSize, state.GetValueRowDevicePtr(p), kvStride,
+                        attn.VOutputDim, attn.VInputDim, s);
+            ProfMark("mtp-absorb-5-kv-proj");
+
+            nint kSlab = state.GetKeyRowDevicePtr(p);
+            _kernels.LaunchRmsNormF32(kSlab, attn.KNormDevice, kSlab, headDim, eps, s * numKvHeads, streamH);
+            // numHeads = 0: the kernel rotates no Q pairs, so its Q operand is never touched.
+            // Positions [p, p + s) are a slice of the state's device iota (issue #482) — no upload.
+            _kernels.LaunchRoPEF32(kSlab, kSlab, state.GetPositionDevicePtr(p, s), s, 0, numKvHeads, headDim,
+                _ropeDim, _ropeTheta, 1, streamH);
+
+            // The next chunk overwrites the device scratch and the pinned host rows.
+            _stream.Synchronize();
+            ProfMark("mtp-absorb-6-knorm-rope-sync");
         }
 
         state.EndAbsorb(firstPosition + total);
@@ -1885,6 +1892,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
     // Issue #482: optional staged Q8_0 GEMV for the MTP head, probed on first MTP use.
     private CudaQ8_0StagedGemv? _mtpQ8Staged;
+    private CudaQ8_0RbGemv? _mtpQ8Rb;           // issue #486, probed together with the staged kernel
     private bool _mtpQ8StagedProbed;
 
     /// <summary>
@@ -1898,10 +1906,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     {
         if (qt == QuantizationType.Q8_0)
         {
-            if (!_mtpQ8StagedProbed)
+            EnsureMtpQ8Probed();
+            // Issue #486: the register-blocked kernel first — same bits as the staged one.
+            if (_mtpQ8Rb is { } rb && CudaQ8_0RbGemv.Accepts(x, k, k))
             {
-                _mtpQ8Staged = CudaQ8_0StagedGemv.TryLoad(_kernels.PtxDirectory);
-                _mtpQ8StagedProbed = true;
+                rb.Launch(weight, x, y, m, k, _stream.Handle);
+                return;
             }
             if (_mtpQ8Staged is { } staged)
             {
@@ -1912,8 +1922,44 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         Gemm(weight, qt, x, y, m, k, 1);
     }
 
+    /// <summary>
+    /// <paramref name="cols"/>-row projection for the batched absorb (issue #486): input row
+    /// <c>c</c> at <c>x + c * ldx</c> floats, output row <c>c</c> at <c>y + c * ldy</c> floats. A Q8_0
+    /// weight goes to the multi-column register-blocked kernel, which reads the weights once and
+    /// leaves every output row bit-identical to <see cref="MtpGemm"/> on that row. Anything else
+    /// loops <see cref="MtpGemm"/> row by row, exactly as before.
+    /// </summary>
+    private void MtpGemmRows(nint weight, QuantizationType qt, nint x, int ldx, nint y, int ldy,
+                             int m, int k, int cols)
+    {
+        if (qt == QuantizationType.Q8_0)
+        {
+            EnsureMtpQ8Probed();
+            if (_mtpQ8Rb is { HasMulti: true } rb && CudaQ8_0RbGemv.Accepts(x, k, ldx))
+            {
+                rb.LaunchMulti(weight, x, ldx, y, ldy, m, k, cols, _stream.Handle);
+                return;
+            }
+        }
+        long xStride = (long)ldx * sizeof(float), yStride = (long)ldy * sizeof(float);
+        for (int c = 0; c < cols; c++)
+            MtpGemm(weight, qt, x + (nint)(c * xStride), y + (nint)(c * yStride), m, k);
+    }
+
+    private void EnsureMtpQ8Probed()
+    {
+        if (_mtpQ8StagedProbed)
+            return;
+        _mtpQ8Staged = CudaQ8_0StagedGemv.TryLoad(_kernels.PtxDirectory);
+        _mtpQ8Rb = CudaQ8_0RbGemv.TryLoad(_kernels.PtxDirectory);
+        _mtpQ8StagedProbed = true;
+    }
+
     /// <summary>Test hook (issue #482): whether the MTP path is dispatching Q8_0 to the staged kernel.</summary>
     internal bool MtpUsesStagedQ8Gemv => _mtpQ8Staged is not null;
+
+    /// <summary>Test hook (issue #486): whether the MTP path is dispatching Q8_0 to the register-blocked kernel.</summary>
+    internal bool MtpUsesRbQ8Gemv => _mtpQ8Rb is not null;
 
     /// <inheritdoc/>
     public ITensor ForwardMtp(IMtpState state, int tokenId, int position)
@@ -3557,6 +3603,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _mtpAbsorbScratch = null;
         _mtpQ8Staged?.Dispose();
         _mtpQ8Staged = null;
+        _mtpQ8Rb?.Dispose();
+        _mtpQ8Rb = null;
         _hadamard?.Dispose();
 
         _state.Dispose();
