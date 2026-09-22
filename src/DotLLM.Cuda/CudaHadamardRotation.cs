@@ -61,15 +61,27 @@ public sealed class CudaHadamardRotation : IDisposable
     /// <param name="fold">The parsed <c>prism.hadamard.*</c> declaration.</param>
     /// <param name="gdn">GDN geometry (fold-set validation and the <c>ssm_out</c> permute).</param>
     /// <param name="fullLayerCount">
-    /// The FULL trunk's layer count. A partial-offload head instance still validates against the
-    /// whole model, because the checkpoint's declaration covers every layer.
+    /// The FULL trunk's layer count. A partial-offload head instance still passes the whole model's
+    /// count, because the checkpoint's declaration covers every layer.
+    /// </param>
+    /// <param name="ownedFirstLayer">First GLOBAL block this instance rotates (0 for a whole model).</param>
+    /// <param name="ownedLayerCount">
+    /// Blocks this instance rotates; negative (the default) means through the end of the trunk. A
+    /// partial-offload head passes its <c>numGpuLayers</c> (#481): it must find every name IT rotates
+    /// declared, and must refuse any declared name no block of the whole model rotates, but the
+    /// tail's blocks are the CPU tail's to validate.
+    /// </param>
+    /// <param name="ownsLmHead">
+    /// Whether this instance runs the folded lm_head (<c>output.weight</c>). False for a
+    /// partial-offload head, which stops at the boundary hidden state.
     /// </param>
     /// <exception cref="NotSupportedException">
     /// The kernel is unavailable (stale PTX), the block size exceeds the kernel's staging limit, or
     /// the declared fold set differs from what the forward pass rotates.
     /// </exception>
     public static CudaHadamardRotation Create(
-        CudaKernels kernels, HadamardFoldConfig fold, GatedDeltaNetConfig gdn, int fullLayerCount)
+        CudaKernels kernels, HadamardFoldConfig fold, GatedDeltaNetConfig gdn, int fullLayerCount,
+        int ownedFirstLayer = 0, int ownedLayerCount = -1, bool ownsLmHead = true)
     {
         ArgumentNullException.ThrowIfNull(kernels);
         ArgumentNullException.ThrowIfNull(fold);
@@ -91,7 +103,8 @@ public sealed class CudaHadamardRotation : IDisposable
         // blk.{NumLayers}.* projections, which no backend rotates), and token_embd must be the only
         // inverse table.
         var host = new HadamardActivationRotator(fold, gdn);
-        host.ValidateQwen35FoldSet(fullLayerCount, gdn.FullAttnInterval);
+        host.ValidateQwen35FoldSet(fullLayerCount, gdn.FullAttnInterval,
+            ownedFirstLayer, ownedLayerCount, ownsLmHead);
 
         int permDState = 0, permNKHead = 0, permRep = 0;
         if (fold.GdnVGrouped)

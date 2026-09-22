@@ -811,11 +811,16 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
         kernels = new CudaKernels(ptxDir);
 
-        // PrismML Hadamard fold (issue #479). Validated against the FULL trunk's layer count: the
-        // checkpoint's declaration covers every layer, not just this head's prefix. (The CPU tail
-        // this head is paired with validates its own sliced config — see LoadTailFromGguf.)
+        // PrismML Hadamard fold (issues #479, #481). The declaration names every block of the FULL
+        // trunk, so validation takes the full layer count, but this head only rotates its prefix
+        // [0, numGpuLayers) and never runs the lm_head: it requires just those names to be declared
+        // (plus refusing any declared name no block of the whole model rotates). The CPU tail it is
+        // paired with validates its own blocks + output.weight the same way (LoadTailFromGguf), so
+        // together the two halves cover exactly the whole-model check. The token_embd inverse is
+        // this head's: ForwardHead does the embedding lookup.
         if (fullConfig.HadamardFold is { } fold)
-            hadamard = CudaHadamardRotation.Create(kernels, fold, fullConfig.GdnConfig!.Value, fullConfig.NumLayers);
+            hadamard = CudaHadamardRotation.Create(kernels, fold, fullConfig.GdnConfig!.Value, fullConfig.NumLayers,
+                ownedFirstLayer: 0, ownedLayerCount: numGpuLayers, ownsLmHead: false);
 
         nint dataBase = gguf.DataBasePointer;
         var tensors = gguf.TensorsByName;
