@@ -1567,6 +1567,12 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     public static void GemvF16(nint weights, float* x, float* y, int m, int k)
     {
+        if (F16SseTier)
+        {
+            GemvF16Sse((ushort*)weights, x, y, m, k);
+            return;
+        }
+
         const int stackThreshold = 2048; // 8KB of floats
         Half* weightsHalf = (Half*)weights;
 
@@ -1609,6 +1615,14 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     public static void GemmF16(nint weights, float* b, float* c, int m, int k, int n)
     {
+        if (n == 1)
+        {
+            // Mirrors the pooled overload: single-token calls (e.g. MoE expert decode) take the
+            // GEMV path, which on the SSE tier is the fused convert+dot.
+            GemvF16(weights, b, c, m, k);
+            return;
+        }
+
         int rowBytes = k * sizeof(Half);
         int tileM = ComputeTileM(rowBytes);
         Half* weightsHalf = (Half*)weights;
@@ -1622,6 +1636,12 @@ public static unsafe partial class MatMul
                 {
                     int tileRows = Math.Min(tileM, m - mStart);
                     Half* tileWeightsHalf = weightsHalf + (long)mStart * k;
+
+                    if (F16SseTier)
+                    {
+                        GemmF16RowsSse(tileWeightsHalf, tileRows, b, c + mStart, m, k, n, rowBuf);
+                        continue;
+                    }
 
                     for (int t = 0; t < n; t++)
                     {
@@ -2453,6 +2473,11 @@ public static unsafe partial class MatMul
         ref var ctx = ref Unsafe.AsRef<GemvF16Ctx>((void*)ctxPtr);
         PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
         if (count == 0) return;
+        if (F16SseTier)
+        {
+            GemvF16Sse((ushort*)ctx.Weights + (long)start * ctx.K, ctx.X, ctx.Y + start, count, ctx.K);
+            return;
+        }
         Half* weightsHalf = (Half*)ctx.Weights;
         float* scratch = (float*)ctx.ScratchPtrs[threadIdx];
         var xSpan = new ReadOnlySpan<float>(ctx.X, ctx.K);
@@ -2552,6 +2577,11 @@ public static unsafe partial class MatMul
             int mStart = tile * ctx.TileM;
             int tileRows = Math.Min(ctx.TileM, ctx.M - mStart);
             Half* tileWeightsHalf = weightsHalf + (long)mStart * ctx.K;
+            if (F16SseTier)
+            {
+                GemmF16RowsSse(tileWeightsHalf, tileRows, ctx.B, ctx.C + mStart, ctx.M, ctx.K, ctx.N, rowBuf);
+                continue;
+            }
             for (int t = 0; t < ctx.N; t++)
             {
                 float* xPtr = ctx.B + t * ctx.K;

@@ -442,6 +442,10 @@ public static unsafe partial class MatMul
             for (; row < m; row++)
                 result[row] = VecDotQ5_0Q8_1Avx2(weights + (long)row * rowBytes, xQ8, blockCount);
         }
+        else if (Ssse3.IsSupported)
+        {
+            ComputeRowsQ5_0Sse(weights, xQ8, result, m, blockCount);
+        }
         else
         {
             for (int row = 0; row < m; row++)
@@ -581,23 +585,8 @@ public static unsafe partial class MatMul
     {
         int groupBytes = 4 * blockCount * Q5_0BlockBytes;
 
-        if (Avx2.IsSupported)
-        {
-            for (int g = 0; g < fullGroups; g++)
-            {
-                byte* groupBase = repackedWeights + (long)g * groupBytes;
-                VecDotQ5_0Q8_1Avx2_4RowsR4(groupBase, xQ8, blockCount, result + g * 4);
-            }
-        }
-        else
-        {
-            for (int g = 0; g < fullGroups; g++)
-            {
-                byte* groupBase = repackedWeights + (long)g * groupBytes;
-                for (int r = 0; r < 4; r++)
-                    result[g * 4 + r] = VecDotQ5_0Q8_1ScalarR4(groupBase, r, xQ8, blockCount);
-            }
-        }
+        for (int g = 0; g < fullGroups; g++)
+            VecDotQ5_0Q8_1Group4R4(repackedWeights + (long)g * groupBytes, xQ8, blockCount, result + g * 4);
 
         // Tail rows (row-major)
         if (tailRows > 0)
@@ -605,9 +594,7 @@ public static unsafe partial class MatMul
             int rowBytes = blockCount * Q5_0BlockBytes;
             byte* tailBase = repackedWeights + (long)fullGroups * groupBytes;
             for (int r = 0; r < tailRows; r++)
-                result[fullGroups * 4 + r] = Avx2.IsSupported
-                    ? VecDotQ5_0Q8_1Avx2(tailBase + (long)r * rowBytes, xQ8, blockCount)
-                    : VecDotQ5_0Q8_1Scalar(tailBase + (long)r * rowBytes, xQ8, blockCount);
+                result[fullGroups * 4 + r] = VecDotQ5_0Q8_1Row(tailBase + (long)r * rowBytes, xQ8, blockCount);
         }
     }
 
@@ -916,11 +903,7 @@ public static unsafe partial class MatMul
         for (int g = startGroup; g < endGroup; g++)
         {
             byte* groupBase = ctx.RepackedWeights + (long)g * groupBytes;
-            if (Avx2.IsSupported)
-                VecDotQ5_0Q8_1Avx2_4RowsR4(groupBase, ctx.XQ, ctx.BlockCount, ctx.Result + g * 4);
-            else
-                for (int r = 0; r < 4; r++)
-                    ctx.Result[g * 4 + r] = VecDotQ5_0Q8_1ScalarR4(groupBase, r, ctx.XQ, ctx.BlockCount);
+            VecDotQ5_0Q8_1Group4R4(groupBase, ctx.XQ, ctx.BlockCount, ctx.Result + g * 4);
         }
 
         if (ctx.TailRows > 0 && end > ctx.FullGroups * 4)
@@ -929,9 +912,7 @@ public static unsafe partial class MatMul
             int tailEnd = Math.Min(end, ctx.M) - ctx.FullGroups * 4;
             byte* tailBase = ctx.RepackedWeights + (long)ctx.FullGroups * groupBytes;
             for (int r = tailStart; r < tailEnd; r++)
-                ctx.Result[ctx.FullGroups * 4 + r] = Avx2.IsSupported
-                    ? VecDotQ5_0Q8_1Avx2(tailBase + (long)r * rowBytes, ctx.XQ, ctx.BlockCount)
-                    : VecDotQ5_0Q8_1Scalar(tailBase + (long)r * rowBytes, ctx.XQ, ctx.BlockCount);
+                ctx.Result[ctx.FullGroups * 4 + r] = VecDotQ5_0Q8_1Row(tailBase + (long)r * rowBytes, ctx.XQ, ctx.BlockCount);
         }
     }
 
@@ -1140,11 +1121,8 @@ public static unsafe partial class MatMul
             else
             {
                 for (; t < n; t++)
-                {
-                    for (int r = 0; r < 4; r++)
-                        c[(long)t * m + baseRow + r] = VecDotQ5_0Q8_1ScalarR4(
-                            groupBase, r, inputQ8 + (long)t * q8RowBytes, blockCount);
-                }
+                    VecDotQ5_0Q8_1Group4R4(groupBase, inputQ8 + (long)t * q8RowBytes, blockCount,
+                        c + (long)t * m + baseRow);
             }
         }
 
@@ -1160,9 +1138,7 @@ public static unsafe partial class MatMul
                 byte* xQ8 = inputQ8 + (long)t * q8RowBytes;
                 for (int r = 0; r < tailRows; r++)
                 {
-                    c[(long)t * m + baseRow + r] = Avx2.IsSupported
-                        ? VecDotQ5_0Q8_1Avx2(tailBase + (long)r * rowBytes, xQ8, blockCount)
-                        : VecDotQ5_0Q8_1Scalar(tailBase + (long)r * rowBytes, xQ8, blockCount);
+                    c[(long)t * m + baseRow + r] = VecDotQ5_0Q8_1Row(tailBase + (long)r * rowBytes, xQ8, blockCount);
                 }
             }
         }
@@ -1245,11 +1221,8 @@ public static unsafe partial class MatMul
                 else
                 {
                     for (; t < ctx.N; t++)
-                    {
-                        for (int r = 0; r < 4; r++)
-                            ctx.C[(long)t * ctx.M + baseRow + r] = VecDotQ5_0Q8_1ScalarR4(
-                                groupBase, r, ctx.InputQ8 + (long)t * q8RowBytes, ctx.BlockCount);
-                    }
+                        VecDotQ5_0Q8_1Group4R4(groupBase, ctx.InputQ8 + (long)t * q8RowBytes, ctx.BlockCount,
+                            ctx.C + (long)t * ctx.M + baseRow);
                 }
             }
             else
@@ -1262,9 +1235,7 @@ public static unsafe partial class MatMul
                     byte* xQ8 = ctx.InputQ8 + (long)t * q8RowBytes;
                     for (int r = 0; r < ctx.TailRows; r++)
                     {
-                        ctx.C[(long)t * ctx.M + baseRow + r] = Avx2.IsSupported
-                            ? VecDotQ5_0Q8_1Avx2(tailBase + (long)r * rowBytes, xQ8, ctx.BlockCount)
-                            : VecDotQ5_0Q8_1Scalar(tailBase + (long)r * rowBytes, xQ8, ctx.BlockCount);
+                        ctx.C[(long)t * ctx.M + baseRow + r] = VecDotQ5_0Q8_1Row(tailBase + (long)r * rowBytes, xQ8, ctx.BlockCount);
                     }
                 }
             }
