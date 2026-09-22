@@ -62,14 +62,15 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
     }
 
     /// <summary>
-    /// Every format listed in issue #257 as failing must report as unsupported so callers route it
-    /// to the standard GEMM path instead of the fused kernels.
+    /// Every format from issue #257 that still lacks a fused kernel must report as unsupported so
+    /// callers route it to the standard GEMM path. Formats leave this list as kernels are written
+    /// for them — Q4_0/Q4_1/Q5_1/IQ4_NL in #489, Q2_K/Q3_K in #497.
     /// </summary>
     [Theory]
     [InlineData(QuantizationType.BF16)]
     [InlineData(QuantizationType.MXFP4)]
-    [InlineData(QuantizationType.Q2_K)]
-    [InlineData(QuantizationType.Q3_K)]
+    // Q2_K and Q3_K left this list in #497: they now have packed x Q8_K ComputeRows kernels,
+    // so SupportsFusedDecode is true for them and the fused path is the right route.
     [InlineData(QuantizationType.IQ4_XS)]
     [InlineData(QuantizationType.IQ3_S)]
     [InlineData(QuantizationType.IQ3_XXS)]
