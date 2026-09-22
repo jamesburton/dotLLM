@@ -64,13 +64,31 @@ namespace DotLLM.Engine;
 /// <b>Recurrent trunks (issue #287).</b> A Gated DeltaNet/Mamba state is a sequential recurrence
 /// with no positions to roll back, so the verify forward is bracketed by a recurrent-state
 /// checkpoint; on a rejection the state is restored and the committed prefix replayed (without the
-/// MTP state — the head already absorbed those rows). llama.cpp avoids that replay with per-token
-/// state snapshots; that remains a follow-up here.
+/// MTP state — the head already absorbed those rows). A model that reports
+/// <see cref="IModel.SupportsRecurrentRowSnapshots"/> instead records its state after every verify
+/// row and rolls back to row <c>accepted</c> directly, like llama.cpp's <c>n_rs_seq</c> (issue
+/// #473): no checkpoint copy before the verify and no replay forward after a rejection.
 /// </para>
 /// </remarks>
 public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
 {
     private readonly bool _greedy;
+
+    /// <summary>Env switch that forces checkpoint + replay even on snapshot-capable models.</summary>
+    internal const string DisableRowSnapshotsEnvVar = "DOTLLM_MTP_GDN_SNAPSHOTS";
+
+    /// <summary>
+    /// Use per-row recurrent snapshots when the model supports them (issue #473). Defaults to on
+    /// unless <c>DOTLLM_MTP_GDN_SNAPSHOTS=0</c>; tests and the A/B harness flip it in-process.
+    /// </summary>
+    internal bool UseRecurrentRowSnapshots { get; set; } =
+        Environment.GetEnvironmentVariable(DisableRowSnapshotsEnvVar) != "0";
+
+    /// <summary>Rounds whose rejection was rolled back by a row snapshot instead of a replay.</summary>
+    internal int ReplaysAvoided { get; private set; }
+
+    /// <summary>Replay forwards issued after a rejection (checkpoint path).</summary>
+    internal int Replays { get; private set; }
 
     /// <summary>
     /// Creates a new MTP self-speculative decoder.
@@ -165,8 +183,10 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
 
             // Issue #287: the verify forward advances a recurrent (GDN) trunk for every row before
             // accept/reject is known, and a sequential recurrence has no positions to roll back.
-            // Checkpoint first so a partial rejection can restore and replay the accepted prefix.
-            gdnCheckpoint = targetModel.SupportsRecurrentStateCheckpoint
+            // Either record the state after every row (#473) or checkpoint first so a partial
+            // rejection can restore and replay the accepted prefix.
+            bool rowSnapshots = UseRecurrentRowSnapshots && targetModel.SupportsRecurrentRowSnapshots;
+            gdnCheckpoint = !rowSnapshots && targetModel.SupportsRecurrentStateCheckpoint
                 ? targetModel.CheckpointRecurrentState()
                 : null;
 
@@ -186,8 +206,11 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
             }
 
             long verifyStart = Stopwatch.GetTimestamp();
-            using ITensor targetLogits = targetModel.Forward(
-                verifyTokens, verifyPositions, deviceId: -1, kvCacheTarget, adapter: null, mtpState);
+            using ITensor targetLogits = rowSnapshots
+                ? targetModel.ForwardWithRecurrentSnapshots(
+                    verifyTokens, verifyPositions, deviceId: -1, kvCacheTarget, mtpState)
+                : targetModel.Forward(
+                    verifyTokens, verifyPositions, deviceId: -1, kvCacheTarget, adapter: null, mtpState);
             verifyTicks += Stopwatch.GetTimestamp() - verifyStart;
 
             int accepted = 0;       // drafts accepted
@@ -222,8 +245,16 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
             // hidden state of the last committed position: verify row `accepted`.
             mtpState.SeedFromCapturedRow(accepted);
 
-            if (accepted < k && gdnCheckpoint is not null)
+            if (accepted < k && rowSnapshots)
             {
+                // The state after verify row `accepted` is exactly what replaying rows 0..accepted
+                // would produce; the attention KV was already rolled back above.
+                targetModel.RestoreRecurrentStateToRow(accepted);
+                ReplaysAvoided++;
+            }
+            else if (accepted < k && gdnCheckpoint is not null)
+            {
+                Replays++;
                 // The recurrent trunk advanced through rejected rows. Restore it and replay the
                 // committed prefix — WITHOUT mtpState, the head already absorbed those rows.
                 targetModel.RestoreRecurrentState(gdnCheckpoint);

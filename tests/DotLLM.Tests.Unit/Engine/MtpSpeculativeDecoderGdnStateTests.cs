@@ -123,7 +123,12 @@ public sealed class MtpSpeculativeDecoderGdnStateTests : IDisposable
             using var gguf = GgufFile.Open(path);
             var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
             using var model = (Qwen3HybridDenseTransformerModel)ModelLoader.CreateCpuModelFromGguf(gguf, config);
-            var decoder = new MtpSpeculativeDecoder(greedy: true);
+            // Pinned to checkpoint + replay: byte-identity with a serial decode holds only because
+            // every rejection here happens at row 0, so the replay is a 1-row forward exactly like
+            // the serial one. Row snapshots (issue #473) come from inside the K+1-row verify batch,
+            // whose GEMM reduces in a different order — ~1 ULP apart. MtpRecurrentRowSnapshotTests
+            // covers that path against this one within tolerance.
+            var decoder = new MtpSpeculativeDecoder(greedy: true) { UseRecurrentRowSnapshots = false };
             var pipeline = new SamplerPipeline(new DotLLM.Core.Configuration.InferenceOptions { Temperature = 0f });
 
             var generatedIds = new List<int> { startToken };

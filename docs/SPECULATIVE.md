@@ -124,6 +124,35 @@ checkpoint/restore/re-batch cycles back-to-back leaves a benign float32-ULP-scal
 addition is not associative across differently-shaped batched re-computation), four orders of
 magnitude below what either real bug produced.
 
+### Per-row recurrent snapshots (issue #473)
+
+Checkpoint + replay costs a second trunk forward on every partially rejected round, plus a full
+state copy before every verify. A model that reports `SupportsRecurrentRowSnapshots` instead offers
+`ForwardWithRecurrentSnapshots` (a normal forward that also records the recurrent state after each
+row `0..S-2`; the state after the last row is the live state) and `RestoreRecurrentStateToRow(n)`.
+This is llama.cpp's `n_rs_seq` snapshot ring. `MtpSpeculativeDecoder` uses it when available: it
+verifies `[lastToken, d1..dK]` through the snapshot forward, skips the checkpoint, and on a
+rejection at `accepted` restores row `accepted`. There is no replay. Both the GDN matrix state and
+the conv1d window are captured, the latter as `ConvInput` rows `t+1 .. t+dConv-1`.
+
+- **Implemented:** CPU `Qwen3HybridDenseTransformerModel` (`GatedDeltaNetScan.Execute` copies
+  the state out after each row) and `VulkanQwen3HybridDenseTransformerModel` (the
+  `gdn_scan_multi_token_lds_fused_snap_f32` twin of the shipping scan writes each row's state from
+  LDS). CUDA keeps checkpoint + replay.
+- **Opt-out:** `DOTLLM_MTP_GDN_SNAPSHOTS=0`, or `MtpSpeculativeDecoder.UseRecurrentRowSnapshots`
+  in-process. `Replays` and `ReplaysAvoided` count each path.
+- **Memory:** `K x GDN layers x (NVHead*DState^2 + conv)` floats, grown to the largest K seen and
+  kept. That is about 150 MiB per row on Bonsai 2 27B (449 MiB at K=3).
+- **Numerics:** a snapshot comes from inside the K+1-row batch, and a replay is a shorter batch, so
+  the two differ at ULP scale (CPU GEMM tiles by n, Vulkan picks its matmul pipeline by width).
+  Greedy output is identical. `MtpSpeculativeDecoderGdnStateTests`' byte-exact serial comparison
+  is pinned to the replay path for that reason, and `MtpRecurrentRowSnapshotTests` compares the
+  two paths within tolerance.
+- **Measured (Bonsai 2 27B, Vulkan, gfx1151, same-session order-reversed A/B):** vs plain decode,
+  K=2 runs at 1.168x with snapshots and 1.013x with replay; K=3 runs at 1.117x and 0.930x. Round
+  time falls from 180 to 156 ms at K=2 and from 232 to 193 ms at K=3. The snapshot writes add about
+  4 ms to each verify.
+
 ## Constraint Interaction
 
 When constrained decoding is active:
