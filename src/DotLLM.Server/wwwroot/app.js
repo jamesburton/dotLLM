@@ -1073,7 +1073,7 @@ async function handleModalLoad() {
 
     // Get speculative model selection
     const specPath = modalSpeculativeSelect.value || undefined;
-    const specK = parseInt(modalSpeculativeK.value) || 5;
+    const specK = parseInt(modalSpeculativeK.value) || 3;
 
     try {
         const res = await loadModel(repo, quant, {

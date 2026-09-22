@@ -38,6 +38,15 @@ public sealed class TextGenerator
     private readonly int _prefillChunkSize;
 
     /// <summary>
+    /// Default draft tokens per speculative round (K), for MTP self-speculation and for a
+    /// separate draft model. Issue #466: Bonsai 2 27B MTP peaks at K=3 on both CPU and Vulkan
+    /// (Vulkan tok/s at K=2/3/4: 22.46/23.95/21.86). K=5 also held ~750 MiB of the #473
+    /// per-row recurrent snapshots, against ~450 MiB at K=3. The CLI and server defaults
+    /// reference this constant.
+    /// </summary>
+    public const int DefaultSpeculativeCandidates = 3;
+
+    /// <summary>
     /// Creates a new text generator.
     /// </summary>
     /// <param name="model">The model to use for forward passes.</param>
@@ -82,7 +91,7 @@ public sealed class TextGenerator
                           PrefixCache? prefixCache = null,
                           IModel? draftModel = null,
                           Func<ModelConfig, int, Core.Attention.IKvCache>? draftKvCacheFactory = null,
-                          int speculativeCandidates = 5,
+                          int speculativeCandidates = DefaultSpeculativeCandidates,
                           bool mtpEnabled = true,
                           HybridPrefillDecodeStrategy? hybridStrategy = null,
                           PrefixTrieManager? prefixTrieManager = null,

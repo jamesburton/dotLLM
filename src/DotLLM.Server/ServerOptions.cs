@@ -58,7 +58,7 @@ public sealed record ServerOptions
     /// <summary>Number of draft candidates per speculative step (K). Also used as K for MTP
     /// self-speculative decoding (<see cref="MtpEnabled"/>) — both are the same "candidates per
     /// round" concept.</summary>
-    public int SpeculativeCandidates { get; init; } = 5;
+    public int SpeculativeCandidates { get; init; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
 
     /// <summary>
     /// Enables Multi-Token Prediction (MTP) self-speculative decoding (issue #253) when the loaded
@@ -183,7 +183,7 @@ public sealed record ServerOptions
         int warmupIterations = 3;
         bool schedulerFairness = false;
         string? speculativeModel = null;
-        int speculativeCandidates = 5;
+        int speculativeCandidates = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
         bool mtpEnabled = false;
         int prefillChunkSize = 0;
         string? ropeScaling = null;
