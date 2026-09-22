@@ -46,15 +46,17 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
 
     /// <summary>
     /// Issue #474 — the shipped multi-row variant for each column count 1..<see cref="MaxColumns"/>
-    /// (index = columns - 1). Every one takes 4 rows per 64-lane workgroup. One and two columns
-    /// read a uint of codes (16 elements) per lane; three and more read one code byte per lane,
-    /// because the uint mapping leaves adjacent lanes' activation loads 64 bytes apart and that
-    /// cost grows with the column count. See <see cref="PQ2_0SmallNDispatch"/> for the numbers.
+    /// (index = columns - 1). Every one takes 4 rows per 64-lane workgroup. One column reads a uint
+    /// of codes (16 elements) per lane; two and more read one code byte per lane, because the uint
+    /// mapping leaves adjacent lanes' activation loads 64 bytes apart and that cost grows with the
+    /// column count. Two columns is the close call: the uint mapping won the microbenchmark on the
+    /// cache-resident projections, but lost the in-situ Bonsai 27B S=2 forward (95.0 ms against
+    /// 80.6 ms, same session), so the byte mapping ships. See <see cref="PQ2_0SmallNDispatch"/>.
     /// </summary>
     private static readonly string[] MultiRowSpvNames =
     [
         "matmul_pq2_0_f32_gemv_mr_r4_c1_b4_w64.spv",
-        "matmul_pq2_0_f32_gemv_mr_r4_c2_b4_w64.spv",
+        "matmul_pq2_0_f32_gemv_mr_r4_c2_b1_w64.spv",
         "matmul_pq2_0_f32_gemv_mr_r4_c3_b1_w64.spv",
         "matmul_pq2_0_f32_gemv_mr_r4_c4_b1_w64.spv",
         "matmul_pq2_0_f32_gemv_mr_r4_c5_b1_w64.spv",
