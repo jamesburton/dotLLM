@@ -445,6 +445,94 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Issue #473, row selection on Vulkan: restoring the GDN snapshot of verify row <c>n</c> and
+    /// probing the next token must match a checkpoint restore + replay of rows <c>0..n</c>, and must
+    /// miss the replay of rows <c>n±1</c> — so a snapshot index off by one (state or conv window)
+    /// fails. Tolerance, not bit-equality: the replay is a shorter batch, and the matmul pipeline
+    /// is chosen by batch width (#470), which contracts FMAs differently.
+    /// </summary>
+    [SkippableFact]
+    public void RestoreRecurrentStateToRow_MatchesPrefixReplay_AndNotItsNeighbours()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        string path = WriteFixture(withMtp: true, name: "qwen35-mtp-rowsnap.gguf");
+
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        using var model = VulkanQwen3HybridDenseTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
+        Assert.True(model.SupportsRecurrentRowSnapshots);
+
+        float[][] snap = Engine.MtpRecurrentRowSnapshotTests.RowProbes(
+            model, config, useSnapshots: true, kvFactory: () => model.CreateKvCache(config.MaxSequenceLength));
+        float[][] replay = Engine.MtpRecurrentRowSnapshotTests.RowProbes(
+            model, config, useSnapshots: false, kvFactory: () => model.CreateKvCache(config.MaxSequenceLength));
+        Engine.MtpRecurrentRowSnapshotTests.AssertRowSelection(snap, replay, AbsTol, RelTol, _out);
+        _out.WriteLine($"snapshot scratch: {model.RecurrentRowSnapshotBytes} bytes for 3 rows");
+    }
+
+    /// <summary>
+    /// Issue #473, decoder level on Vulkan: drafts scripted so rounds roll back to rows 0, 1 and 2
+    /// of K=3 (and one clean round). Snapshots on and off must both reproduce plain greedy decode,
+    /// restore exactly where the other replays, and leave next-token logits within tolerance.
+    /// </summary>
+    [SkippableFact]
+    public void DraftAndVerify_ScriptedPartialRejections_SnapshotsMatchGreedyAndReplay()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        string path = WriteFixture(withMtp: true, name: "qwen35-mtp-rowsnap-dec.gguf");
+        const int StartToken = 3, NewTokens = 12, K = 3;
+
+        List<int> greedy = RunPlainGreedy(path, spvDir, StartToken, NewTokens + K);
+        var on = RunScripted(path, spvDir, greedy, StartToken, NewTokens, K, snapshots: true);
+        var off = RunScripted(path, spvDir, greedy, StartToken, NewTokens, K, snapshots: false);
+        _out.WriteLine($"greedy: [{string.Join(",", greedy.Take(NewTokens + 1))}]");
+        _out.WriteLine($"on : emitted/round [{string.Join(",", on.PerRound)}] avoided={on.Avoided} replays={on.Replays}");
+        _out.WriteLine($"off: emitted/round [{string.Join(",", off.PerRound)}] avoided={off.Avoided} replays={off.Replays}");
+
+        Assert.Equal(greedy.Take(NewTokens + 1), on.Tokens);
+        Assert.Equal(greedy.Take(NewTokens + 1), off.Tokens);
+        for (int emitted = 1; emitted <= K + 1; emitted++)
+            Assert.Contains(emitted, on.PerRound);
+        Assert.True(on.Avoided > 0 && on.Replays == 0, "snapshot run must roll back without replaying");
+        Assert.True(off.Avoided == 0 && off.Replays == on.Avoided);
+        AssertClose(off.NextLogits, on.NextLogits, "next-token logits, snapshots vs replay");
+    }
+
+    private sealed record ScriptedRun(List<int> Tokens, List<int> PerRound, int Avoided, int Replays, float[] NextLogits);
+
+    private static ScriptedRun RunScripted(
+        string path, string spvDir, List<int> greedy, int start, int newTokens, int k, bool snapshots)
+    {
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        using var real = VulkanQwen3HybridDenseTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
+        var model = new Engine.ScriptedDraftMtpModel(real, greedy, wrongAt: p => p is 1 or 3 or 6 or 11 or 13);
+        using var kv = real.CreateKvCache(config.MaxSequenceLength);
+        using var mtp = model.CreateMtpState()!;
+        var decoder = new MtpSpeculativeDecoder(greedy: true) { UseRecurrentRowSnapshots = snapshots };
+        var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
+
+        // No prefill: position 0 is the start token's own slot, and the first verify forwards it.
+        var ids = new List<int> { start };
+        var perRound = new List<int>();
+        int position = 0;
+        Span<int> outBuf = stackalloc int[k + 1];
+        while (ids.Count - 1 < newTokens)
+        {
+            var r = decoder.DraftAndVerify(model, kv, mtp, pipeline, ids, null, position, config.VocabSize, k, outBuf);
+            perRound.Add(r.AcceptedCount);
+            for (int i = 0; i < r.AcceptedCount; i++) ids.Add(outBuf[i]);
+            position += r.AcceptedCount;
+        }
+
+        using ITensor next = model.Forward([ids[position]], [position], deviceId: -1, kv);
+        float[] nextRow = Engine.MtpRecurrentRowSnapshotTests.LastRow(next, config.VocabSize);
+        return new ScriptedRun(ids.Take(newTokens + 1).ToList(), perRound, decoder.ReplaysAvoided, decoder.Replays, nextRow);
+    }
+
     private sealed record SpeculativeRun(
         List<int> Tokens, int Drafted, int Emitted, int PartialRejectionRounds, List<int> EmittedPerRound);
 
