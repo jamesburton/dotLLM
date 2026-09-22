@@ -96,8 +96,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private long _activQ8InScratchElems;
     private nint _activQ8MetaScratch;
     private bool _warnedNoPQ2_0GemvDp4a;
+    private bool _warnedNoPQ2_0Mmq;     // #490
     private int _dp4aGemvLaunches;      // test-visible launch counters (Dp4aLaunchCounts)
     private int _dp4aQuantizeLaunches;
+    private int _pq2_0MmqLaunches;      // #490 (Pq2_0MmqLaunchCount)
 #if DEBUG
     // What _activQ8InScratch currently holds — checked when a caller claims it pre-quantized x.
     private (nint X, int K, int SeqLen) _dp4aQuantizedFor;
@@ -1981,6 +1983,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// </summary>
     internal bool PQ2_0Dp4aAvailable => _kernels.HasPQ2_0GemvDp4a;
 
+    /// <summary>
+    /// Test hook (issue #490): whether the packed PQ2_0 prefill GEMM is loaded (with the quantizer it
+    /// reuses), so a test that switches the path on can prove it is not measuring the fallback.
+    /// </summary>
+    internal bool PQ2_0MmqAvailable => _kernels.HasPQ2_0MmqDp4a && _kernels.HasPQ2_0GemvDp4a;
+
     /// <inheritdoc/>
     public ITensor ForwardMtp(IMtpState state, int tokenId, int position)
     {
@@ -3385,13 +3393,15 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             return;
         }
 
-        // #485 (opt-in, DOTLLM_CUDA_PQ2_0_DP4A=1): int8 activations + dp4a for 1..8 token rows.
-        if (Dp4aActive(qt, seqLen))
+        // #485 (default on): int8 activations + dp4a for 1..8 token rows.
+        // #490 (opt-in, DOTLLM_CUDA_PQ2_0_MMQ=1): the same W2A8 numerics, tiled, for every wider
+        // projection — prefill and perplexity's whole-window forward — instead of dequantizing the
+        // matrix to F16 for cuBLAS below.
+        if (Dp4aActive(qt, seqLen) || Pq2_0MmqActive(qt, seqLen))
         {
             if (xQuantized) AssertDp4aQuantizedFor(x, k, seqLen);
             else QuantizeDp4aInput(x, k, seqLen);
-            _kernels.LaunchPQ2_0GemvDp4a(weight, _activQ8InScratch, _activQ8MetaScratch, y, m, k, seqLen, streamH);
-            _dp4aGemvLaunches++;
+            LaunchPq2_0Quantized(weight, y, m, k, seqLen, streamH);
             return;
         }
 
@@ -3533,15 +3543,62 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     }
 
     /// <summary>
+    /// Whether a <paramref name="qt"/> projection over <paramref name="seqLen"/> rows takes the packed
+    /// dp4a prefill GEMM (issue #490): PQ2_0, a width the GEMV does not cover
+    /// (<see cref="CudaSmallSGemvDispatch.CoversMmq"/>), the env/override on, and BOTH
+    /// <c>pq2_0_mmq_dp4a.ptx</c> and <c>pq2_0_gemv_dp4a.ptx</c> (whose quantizer it reuses) loaded.
+    /// When the switch is on but either PTX is missing or stale it warns once and returns
+    /// <see langword="false"/>, so the dequant+cuBLAS prefill keeps running.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool Pq2_0MmqActive(QuantizationType qt, int seqLen)
+    {
+        if (qt != QuantizationType.PQ2_0 || !CudaSmallSGemvDispatch.CoversMmq(seqLen)) return false;
+        if (_kernels.HasPQ2_0MmqDp4a && _kernels.HasPQ2_0GemvDp4a) return true;
+        if (!_warnedNoPQ2_0Mmq)
+        {
+            _warnedNoPQ2_0Mmq = true;
+            Console.Error.WriteLine(
+                "[dotLLM.Cuda] " + CudaSmallSGemvDispatch.MmqEnvVar + "=1 but the packed PQ2_0 prefill GEMM is unavailable (" +
+                (_kernels.PQ2_0MmqDp4aUnavailableReason ?? _kernels.PQ2_0GemvDp4aUnavailableReason) +
+                ") — keeping dequant-to-F16 + cuBLAS for wide PQ2_0 projections.");
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Runs the PQ2_0 projection that matches <paramref name="seqLen"/> over the already-quantized
+    /// activation scratch: #485's exact-width GEMV at 1..8 rows, #490's tiled GEMM above.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void LaunchPq2_0Quantized(nint weight, nint y, int m, int k, int seqLen, nint streamH)
+    {
+        if (CudaSmallSGemvDispatch.CoversDp4a(seqLen) && seqLen <= CudaKernels.Pq2_0GemvMultiMaxColumns)
+        {
+            _kernels.LaunchPQ2_0GemvDp4a(weight, _activQ8InScratch, _activQ8MetaScratch, y, m, k, seqLen, streamH);
+            _dp4aGemvLaunches++;
+            return;
+        }
+        _kernels.LaunchPQ2_0MmqDp4a(weight, _activQ8InScratch, _activQ8MetaScratch, y, m, k, seqLen,
+            CudaSmallSGemvDispatch.MmqTileColumns(seqLen), streamH);
+        _pq2_0MmqLaunches++;
+    }
+
+    /// <summary>
     /// Whether two projections reading the same input can share one dp4a activation quantization:
-    /// both take the dp4a path and have the same input width.
+    /// both take an int8-activation path (#485's GEMV or #490's GEMM) and have the same input width.
     /// </summary>
     private bool SharesDp4aInput(QuantizationType qtA, QuantizationType qtB, int kA, int kB, int seqLen)
         => CudaSmallSGemvDispatch.ShareDp4aInputs && BothDp4a(qtA, qtB, kA, kB, seqLen);
 
-    /// <summary>Whether both projections of a pair take the dp4a path with the same input width.</summary>
+    /// <summary>
+    /// Whether both projections of a pair take an int8-activation path with the same input width.
+    /// Both sides see the same <paramref name="seqLen"/>, so they always pick the same kernel.
+    /// </summary>
     private bool BothDp4a(QuantizationType qtA, QuantizationType qtB, int kA, int kB, int seqLen)
-        => kA == kB && Dp4aActive(qtA, seqLen) && Dp4aActive(qtB, seqLen);
+        => kA == kB
+           && (Dp4aActive(qtA, seqLen) || Pq2_0MmqActive(qtA, seqLen))
+           && (Dp4aActive(qtB, seqLen) || Pq2_0MmqActive(qtB, seqLen));
 
     /// <summary>
     /// Test hook (issue #485): dp4a GEMV and quantizer launches since the last
@@ -3550,8 +3607,16 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// </summary>
     internal (int Gemv, int Quantize) Dp4aLaunchCounts => (_dp4aGemvLaunches, _dp4aQuantizeLaunches);
 
-    /// <summary>Resets <see cref="Dp4aLaunchCounts"/>.</summary>
-    internal void ResetDp4aLaunchCounts() => (_dp4aGemvLaunches, _dp4aQuantizeLaunches) = (0, 0);
+    /// <summary>
+    /// Test hook (issue #490): packed prefill GEMM launches since the last
+    /// <see cref="ResetDp4aLaunchCounts"/> — the control proving a wide forward actually took the new
+    /// kernel rather than dequant+cuBLAS.
+    /// </summary>
+    internal int Pq2_0MmqLaunchCount => _pq2_0MmqLaunches;
+
+    /// <summary>Resets <see cref="Dp4aLaunchCounts"/> and <see cref="Pq2_0MmqLaunchCount"/>.</summary>
+    internal void ResetDp4aLaunchCounts()
+        => (_dp4aGemvLaunches, _dp4aQuantizeLaunches, _pq2_0MmqLaunches) = (0, 0, 0);
 
     /// <summary>
     /// Quantizes <paramref name="x"/> (<c>[seqLen, k]</c> F32) into the dp4a int8 scratch (issue #485).
@@ -3634,10 +3699,9 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             if (xQuantized && share) AssertDp4aQuantizedFor(x, k0, seqLen);
             else QuantizeDp4aInput(x, k0, seqLen);
             nint s = _stream.Handle;
-            _kernels.LaunchPQ2_0GemvDp4a(weight0, _activQ8InScratch, _activQ8MetaScratch, y0, m0, k0, seqLen, s);
+            LaunchPq2_0Quantized(weight0, y0, m0, k0, seqLen, s);
             if (!share) QuantizeDp4aInput(x, k0, seqLen);
-            _kernels.LaunchPQ2_0GemvDp4a(weight1, _activQ8InScratch, _activQ8MetaScratch, y1, m1, k0, seqLen, s);
-            _dp4aGemvLaunches += 2;
+            LaunchPq2_0Quantized(weight1, y1, m1, k0, seqLen, s);
             return true;
         }
 
