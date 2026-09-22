@@ -120,6 +120,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule? _pq2_0GemvMultiModule;
     private readonly nint[] _pq2_0GemvMultiFuncs = new nint[Pq2_0GemvMultiMaxColumns + 1];
     private readonly string? _pq2_0GemvMultiUnavailableReason;
+    private readonly bool _hasPQ2_0GemvMulti;   // cached: read on every seqLen 2..8 PQ2_0 projection
     private readonly nint _quantizedGemvQ2_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ4_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ5_KMmqPreqFunc;
@@ -693,13 +694,15 @@ public sealed unsafe class CudaKernels : IDisposable
                 _pq2_0GemvMultiModule = CudaModule.LoadFromFile(pq2_0GemvMultiPath);
                 for (int s = 1; s <= Pq2_0GemvMultiMaxColumns; s++)
                     _pq2_0GemvMultiFuncs[s] = _pq2_0GemvMultiModule.TryGetFunction($"pq2_0_gemv_multi_f16x_f32y_{s}");
-                if (!HasPQ2_0GemvMulti)
+                _hasPQ2_0GemvMulti = AllPQ2_0GemvMultiFuncsLoaded();
+                if (!_hasPQ2_0GemvMulti)
                     _pq2_0GemvMultiUnavailableReason =
                         "pq2_0_gemv_multi.ptx is stale (missing a pq2_0_gemv_multi_f16x_f32y_{1..8} entry point)";
             }
             catch (CudaException ex)
             {
                 Array.Clear(_pq2_0GemvMultiFuncs);
+                _hasPQ2_0GemvMulti = false;
                 _pq2_0GemvMultiUnavailableReason = $"pq2_0_gemv_multi.ptx failed to load: {ex.Message}";
             }
         }
@@ -5337,14 +5340,13 @@ public sealed unsafe class CudaKernels : IDisposable
     /// Whether every exact-width entry point of the small-S multi-column PQ2_0 GEMV
     /// (<c>pq2_0_gemv_multi.ptx</c>, issue #482) is loaded.
     /// </summary>
-    public bool HasPQ2_0GemvMulti
+    public bool HasPQ2_0GemvMulti => _hasPQ2_0GemvMulti;
+
+    private bool AllPQ2_0GemvMultiFuncsLoaded()
     {
-        get
-        {
-            for (int s = 1; s <= Pq2_0GemvMultiMaxColumns; s++)
-                if (_pq2_0GemvMultiFuncs[s] == 0) return false;
-            return true;
-        }
+        for (int s = 1; s <= Pq2_0GemvMultiMaxColumns; s++)
+            if (_pq2_0GemvMultiFuncs[s] == 0) return false;
+        return true;
     }
 
     /// <summary>Why <see cref="HasPQ2_0GemvMulti"/> is false, or <see langword="null"/> when it is true.</summary>

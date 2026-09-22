@@ -21,12 +21,14 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// single-column tolerance, so the two GPU kernels cannot agree on the same wrong answer.
 /// </para>
 /// <para>
-/// <b>What a mutant looks like.</b> Reading column 1's activations one element late
-/// (<c>x + (size_t)s * k + xElem</c> → <c>x + (size_t)s * k + (s == 1 ? 1 : 0) + xElem</c>, or
-/// equivalently staging column 1 from <c>x + k + 1</c>) moves column 1 by O(|y|) ≈ 1 while every
-/// other column still passes; oracle A's bound is ~1e-4·max|y|. Swapping two columns' output rows,
-/// dropping the tail-group predicate (k = 17408 has 136 groups, a multiple of 4, but n = 37/513
-/// exercise the row clamp) or mis-mapping the 16 codes of a lane's word fails the same way.
+/// <b>What a mutant looks like.</b> Reading column 1's activations from the wrong window —
+/// in <c>pq2_0_gemv_multi.cu</c>, <c>x + (size_t)s * k + xElem</c> →
+/// <c>x + (size_t)s * k + xElem + (s == 1 ? 16 : 0)</c> (16 halfs keeps the 16-byte alignment the
+/// <c>uint4</c> loads need; an odd offset would fault with "misaligned address" instead of failing
+/// numerically) — moves column 1 by O(|y|) while every other column still passes; oracle A's bound
+/// is ~1e-4·max|y|, and oracle B fails it too. Swapping two columns' output rows or mis-mapping the
+/// 16 codes of a lane's word fails the same way; k = 640 (5 groups) exercises the tail-group
+/// predicate and n = 37/513 the row clamp.
 /// </para>
 /// <para>
 /// Shapes: k ∈ {5120, 17408} (Bonsai 2 hidden / ffn), k = 640 (5 groups, so the last warp step
