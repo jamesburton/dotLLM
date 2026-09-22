@@ -25,10 +25,14 @@ namespace DotLLM.Cuda;
 /// fused gate+up / K+V pairs.
 /// </para>
 /// <para>
-/// <b>Issue #485.</b> <c>DOTLLM_CUDA_PQ2_0_DP4A=1</c> takes precedence over both of the above for
-/// <c>seqLen == 1</c> and <c>2..</c><see cref="MaxColumns"/>: the activations are quantized to int8
-/// (the CPU W2A8 tier's per-32 Q8_0 rounding) and the GEMV runs on <c>__dp4a</c>
-/// (<see cref="CudaKernels.LaunchPQ2_0GemvDp4a"/>). Opt-in until measured.
+/// <b>Issue #485.</b> The dp4a path is the default and takes precedence over both of the above for
+/// <c>seqLen == 1</c> and <c>2..</c><see cref="MaxColumns"/>. The activations are quantized to int8
+/// (the CPU W2A8 tier's per-32 Q8_0 rounding), and the GEMV runs on <c>__dp4a</c>
+/// (<see cref="CudaKernels.LaunchPQ2_0GemvDp4a"/>). Measured on the T5500 (RTX 3060, Bonsai 2 27B,
+/// same-session order-reversed A/B): plain decode went from 18.3–18.6 to 20.1 tok/s, and MTP K=3 from
+/// 22.7–23.7 to 29.1–29.8 tok/s. Greedy output matches the CPU oracle, which itself runs W2A8 on
+/// AVX2/SSSE3. This is a numerics change, the same one the CPU tiers make: <c>DOTLLM_CUDA_PQ2_0_DP4A=0</c>
+/// restores the F16-activation kernels.
 /// </para>
 /// </remarks>
 public static class CudaSmallSGemvDispatch
@@ -74,13 +78,13 @@ public static class CudaSmallSGemvDispatch
         => seqLen == 1 ? UseMultiForSingleColumn : seqLen >= 2 && seqLen <= MaxColumns;
 
     /// <summary>
-    /// Environment variable that, when <c>1</c>, routes PQ2_0 projections of <c>seqLen == 1</c> and
-    /// <c>2 &lt;= seqLen &lt;= </c><see cref="MaxColumns"/> through the int8-activation dp4a GEMV
-    /// (issue #485) instead of the #482 / single-column F16-activation kernels. Opt-in until measured.
+    /// Environment variable that, when <c>0</c>, stops PQ2_0 projections of <c>seqLen == 1</c> and
+    /// <c>2 &lt;= seqLen &lt;= </c><see cref="MaxColumns"/> from using the int8-activation dp4a GEMV
+    /// (issue #485, the default) and sends them to the #482 / single-column F16-activation kernels.
     /// </summary>
     public const string Dp4aEnvVar = "DOTLLM_CUDA_PQ2_0_DP4A";
 
-    private static readonly bool Dp4aFromEnv = Environment.GetEnvironmentVariable(Dp4aEnvVar) == "1";
+    private static readonly bool Dp4aFromEnv = Environment.GetEnvironmentVariable(Dp4aEnvVar) != "0";
 
     /// <summary>Whether the dp4a (W2A8) PQ2_0 GEMV is enabled (<see cref="Dp4aEnvVar"/>).</summary>
     public static bool UseDp4a => Dp4aOverride ?? Dp4aFromEnv;
