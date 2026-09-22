@@ -22,7 +22,8 @@ namespace DotLLM.Cpu.Kernels;
 /// <para><b>Saturation / -128.</b> Via <see cref="BlockDotSsse3"/> the unsigned PMADDUBSW operand
 /// is the <em>weight</em> magnitude <c>|w|</c> (a weight byte of <c>-128</c> becomes the unsigned
 /// 128, which is correct) and the signed one is <c>Sign(x, w)</c> with the activation from our
-/// quantizer (<c>|x| ≤ 127</c>, never <c>-128</c>). A pair sum is at most <c>2·128·127 = 32512 &lt;
+/// quantizer (<c>|x| ≤ 127</c>, never <c>-128</c>: every <c>QuantizeF32ToQ8_0*</c> tier clamps to
+/// <c>[-127, 127]</c> — this is the kernels' <b>precondition</b> on the second operand). A pair sum is at most <c>2·128·127 = 32512 &lt;
 /// 32767</c>, so nothing saturates and every weight byte, including <c>-128</c>, matches the scalar
 /// tier. (The AVX2 tier puts <c>|x|</c> unsigned and <c>Sign(w, x)</c> signed, which wraps a
 /// <c>-128</c> weight against a negative activation; llama.cpp never emits <c>-128</c>.)</para>
