@@ -275,3 +275,220 @@ extern "C" __global__ void __launch_bounds__(Q8R_GROUP) q8_0_gemv_f32in_rb_multi
     __shared__ float red[Q8R_ROWS * Q8R_MAX_COLS][Q8R_WARPS];           // 1024 B
     q8r_body<Q8R_MAX_COLS>(weight, x, ldx, y, ldy, n, k, ncols, buf, red);
 }
+
+// ──────────────────────────────────────────────────────────────────────────────────────────────
+//  Issue #492: NCOLS-specialised multi-column entry points.
+//
+//  q8_0_gemv_f32in_rb_multi above is compiled once for Q8R_MAX_COLS = 8 columns and costs 184
+//  registers + 37,888 B of shared memory on sm_86. For eh_proj (k = 10240 -> blockDim = 256) that
+//  is 184 * 256 = 47,104 of the SM's 65,536 registers: ONE block per SM, 8 of 48 warp slots. The
+//  kernel then has 2-3 warps per SM sub-partition to hide a ~500-cycle global load behind ~384
+//  cycles of FMA, and the measured absorb eh_proj runs at ~52 GB/s against the 257-320 GB/s the
+//  single-row kernel reaches on the same card.
+//
+//  Two changes, neither of which touches the arithmetic:
+//    * __launch_bounds__(Q8R_GROUP, 2) — ".minnctapersm 2" survives into the JIT, so ptxas budgets
+//      128 registers per thread and the SM holds 2 blocks (16 warps). Shared memory allows exactly
+//      2 blocks at the 100 KB carveout, which the host requests explicitly.
+//    * NCOLS is a compile-time constant, so acc[4][NCOLS] is sized to the real column count (an
+//      absorb of S = K+1 = 5 rows carried 8 accumulators per row), the per-column `c < ncols`
+//      predicates vanish, and `red` shrinks to 32 * NCOLS floats. Plus the segment staging runs
+//      row by row instead of issuing all 4 rows' loads before any store, which halves the live
+//      uint4 staging temporaries (v[4][3] = 48 registers -> 12) that sat on top of acc.
+//
+//  Bit-identity: q8r_body_ct is q8r_body with `ncols` folded to NCOLS and the staging loads/stores
+//  interleaved per row. Same ownership map, same per-block `s = fma(q_j, x_j, s)` order, same d
+//  fold, same two-stage shuffle reduction, same +0.0f slots for unlaunched logical warps. Every
+//  column equals the single-column kernel bit for bit, exactly as the generic form does.
+//
+//  The generic q8_0_gemv_f32in_rb_multi stays byte-for-byte as it was: it remains the fallback and
+//  the A/B baseline (DOTLLM_CUDA_Q8_RB_MULTI_SPECIALIZED=0).
+//
+//  Build (the committed PTX, same line as above — the new entry points ship in the same module):
+//    nvcc -ptx -arch=compute_75 -o native/ptx/q8_0_gemv_f32in_rb.ptx native/kernels/q8_0_gemv_f32in_rb.cu
+//  Diagnostic only (nvcc -ptx never runs ptxas, so -Xptxas -v prints nothing there):
+//    nvcc -cubin -arch=sm_86 -Xptxas -v -o /dev/null native/kernels/q8_0_gemv_f32in_rb.cu
+// ──────────────────────────────────────────────────────────────────────────────────────────────
+
+template <int NCOLS>
+__device__ __forceinline__ void q8r_body_ct(
+    const uint8_t* __restrict__ weight,
+    const float* __restrict__ x, const int ldx,
+    float* __restrict__ y, const int ldy,
+    const int n, const int k,
+    uint8_t (* __restrict__ buf)[Q8R_BUF_BYTES],
+    float (* __restrict__ red)[Q8R_WARPS])
+{
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int nwarps = blockDim.x >> 5;
+    const int bpr = k >> 5;
+    const size_t row_bytes = (size_t)bpr * Q8R_BLOCK_BYTES;
+    const int row0 = blockIdx.x * Q8R_ROWS;
+    uint8_t* wb = buf[wid];
+    float* xbuf = reinterpret_cast<float*>(wb);
+    const bool vec16 = ((reinterpret_cast<size_t>(weight) & 15) == 0) && ((row_bytes & 15) == 0);
+
+    float acc[Q8R_ROWS][NCOLS];
+    #pragma unroll
+    for (int r = 0; r < Q8R_ROWS; r++)
+        #pragma unroll
+        for (int c = 0; c < NCOLS; c++)
+            acc[r][c] = 0.0f;
+
+    for (int c0 = 0; c0 < bpr; c0 += Q8R_GROUP)
+    {
+        const int seg0 = c0 + wid * 32;
+        if (seg0 >= bpr) break;
+        const int nblk = min(32, bpr - seg0);
+        const int seg_bytes = nblk * Q8R_BLOCK_BYTES;
+
+        __syncwarp();
+
+        // ── 1. Stage the 4 rows' segments, one row at a time (the only data-flow change). ──
+        if (vec16)
+        {
+            const int nwords = seg_bytes >> 4;
+            const int tail = seg_bytes & 15;
+            #pragma unroll
+            for (int r = 0; r < Q8R_ROWS; r++)
+            {
+                const int row = min(row0 + r, n - 1);
+                const uint8_t* src = weight + (size_t)row * row_bytes + (size_t)seg0 * Q8R_BLOCK_BYTES;
+                const uint4* s4 = reinterpret_cast<const uint4*>(src);
+                uint4 v[3];
+                unsigned short tv = 0;
+                #pragma unroll
+                for (int q = 0; q < 3; q++)
+                    if (lane + 32 * q < nwords) v[q] = __ldg(s4 + lane + 32 * q);
+                if (lane < (tail >> 1))
+                    tv = __ldg(reinterpret_cast<const unsigned short*>(src + (nwords << 4)) + lane);
+                uint8_t* dst = wb + r * Q8R_SEG_STRIDE;
+                uint4* d4 = reinterpret_cast<uint4*>(dst);
+                #pragma unroll
+                for (int q = 0; q < 3; q++)
+                    if (lane + 32 * q < nwords) d4[lane + 32 * q] = v[q];
+                if (lane < (tail >> 1))
+                    reinterpret_cast<unsigned short*>(dst + (nwords << 4))[lane] = tv;
+            }
+        }
+        else
+        {
+            const int nhalf = seg_bytes >> 1;
+            #pragma unroll
+            for (int r = 0; r < Q8R_ROWS; r++)
+            {
+                const int row = min(row0 + r, n - 1);
+                const unsigned short* s2 = reinterpret_cast<const unsigned short*>(
+                    weight + (size_t)row * row_bytes + (size_t)seg0 * Q8R_BLOCK_BYTES);
+                unsigned short* d2 = reinterpret_cast<unsigned short*>(wb + r * Q8R_SEG_STRIDE);
+                for (int i = lane; i < nhalf; i += 32) d2[i] = __ldg(s2 + i);
+            }
+        }
+        __syncwarp();
+
+        // ── 2. This lane's block of every row into registers (unchanged). ──
+        const bool owns = lane < nblk;
+        uint32_t qw[Q8R_ROWS][8];
+        float dsc[Q8R_ROWS];
+        if (owns)
+        {
+            const int off = lane * Q8R_BLOCK_BYTES;
+            const bool odd = (off & 2) != 0;
+            const uint32_t sh = odd ? 32u : 16u;
+            #pragma unroll
+            for (int r = 0; r < Q8R_ROWS; r++)
+            {
+                const uint32_t* wp = reinterpret_cast<const uint32_t*>(wb + r * Q8R_SEG_STRIDE) + (off >> 2);
+                uint32_t wv[9];
+                #pragma unroll
+                for (int i = 0; i < 9; i++) wv[i] = wp[i];
+                const unsigned short dbits = (unsigned short)(odd ? (wv[0] >> 16) : (wv[0] & 0xFFFFu));
+                dsc[r] = __half2float(__ushort_as_half(dbits));
+                #pragma unroll
+                for (int i = 0; i < 8; i++) qw[r][i] = __funnelshift_rc(wv[i], wv[i + 1], sh) ^ 0x80808080u;
+            }
+        }
+        __syncwarp();
+
+        // ── 3. Per column: stage x's slice, accumulate all 4 rows (unchanged arithmetic). ──
+        #pragma unroll
+        for (int c = 0; c < NCOLS; c++)
+        {
+            const float4* xs4 = reinterpret_cast<const float4*>(x + (size_t)c * ldx + (size_t)seg0 * 32);
+            for (int i = lane; i < nblk * 8; i += 32)
+                *reinterpret_cast<float4*>(xbuf + (i >> 3) * Q8R_XSTRIDE + ((i & 7) << 2)) = __ldg(xs4 + i);
+            __syncwarp();
+            if (owns)
+            {
+                float s[Q8R_ROWS];
+                #pragma unroll
+                for (int r = 0; r < Q8R_ROWS; r++) s[r] = 0.0f;
+                const float* xr = xbuf + lane * Q8R_XSTRIDE;
+                #pragma unroll
+                for (int q = 0; q < 8; q++)
+                {
+                    const float4 xv = *reinterpret_cast<const float4*>(xr + 4 * q);
+                    #pragma unroll
+                    for (int r = 0; r < Q8R_ROWS; r++)
+                    {
+                        const uint32_t wq = qw[r][q];
+                        s[r] = __fmaf_rn(q8r_byte(wq, 0), xv.x, s[r]);
+                        s[r] = __fmaf_rn(q8r_byte(wq, 1), xv.y, s[r]);
+                        s[r] = __fmaf_rn(q8r_byte(wq, 2), xv.z, s[r]);
+                        s[r] = __fmaf_rn(q8r_byte(wq, 3), xv.w, s[r]);
+                    }
+                }
+                #pragma unroll
+                for (int r = 0; r < Q8R_ROWS; r++) acc[r][c] = __fmaf_rn(dsc[r], s[r], acc[r][c]);
+            }
+            __syncwarp();
+        }
+    }
+
+    // ── 4. The original's two-stage reduction, unchanged. ──
+    #pragma unroll
+    for (int r = 0; r < Q8R_ROWS; r++)
+    {
+        #pragma unroll
+        for (int c = 0; c < NCOLS; c++)
+        {
+            float v = acc[r][c];
+            for (int o = 16; o > 0; o >>= 1)
+                v = __fadd_rn(v, __shfl_down_sync(0xFFFFFFFF, v, o));
+            if (lane == 0) red[r * NCOLS + c][wid] = v;
+        }
+    }
+    __syncthreads();
+    for (int idx = wid; idx < Q8R_ROWS * NCOLS; idx += nwarps)
+    {
+        const int r = idx / NCOLS, c = idx % NCOLS;
+        const int row = row0 + r;
+        if (row >= n) continue;                     // warp-uniform
+        float v = (lane < nwarps) ? red[idx][lane] : 0.0f;
+        for (int o = 16; o > 0; o >>= 1)
+            v = __fadd_rn(v, __shfl_down_sync(0xFFFFFFFF, v, o));
+        if (lane == 0) y[(size_t)c * ldy + row] = v;
+    }
+}
+
+#define Q8R_DEFINE_MULTI(NC)                                                                    \
+extern "C" __global__ void __launch_bounds__(Q8R_GROUP, 2) q8_0_gemv_f32in_rb_multi_c##NC(      \
+    const uint8_t* __restrict__ weight,                                                         \
+    const float* __restrict__ x, const int ldx,                                                 \
+    float* __restrict__ y, const int ldy,                                                       \
+    const int n, const int k)                                                                   \
+{                                                                                               \
+    __shared__ __align__(16) uint8_t buf[Q8R_WARPS][Q8R_BUF_BYTES];                             \
+    __shared__ float red[Q8R_ROWS * (NC)][Q8R_WARPS];                                           \
+    q8r_body_ct<(NC)>(weight, x, ldx, y, ldy, n, k, buf, red);                                  \
+}
+
+Q8R_DEFINE_MULTI(1)
+Q8R_DEFINE_MULTI(2)
+Q8R_DEFINE_MULTI(3)
+Q8R_DEFINE_MULTI(4)
+Q8R_DEFINE_MULTI(5)
+Q8R_DEFINE_MULTI(6)
+Q8R_DEFINE_MULTI(7)
+Q8R_DEFINE_MULTI(8)

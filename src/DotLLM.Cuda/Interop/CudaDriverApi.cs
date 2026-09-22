@@ -88,6 +88,14 @@ internal static partial class CudaDriverApi
     /// <summary>CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES — opt in to >48 KB dynamic shmem.</summary>
     internal const int CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
 
+    /// <summary>
+    /// CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT — percentage of the unified L1/shared
+    /// block to give shared memory (-1 = let the driver choose). Issue #492: a kernel whose static
+    /// shared memory is just over a third of the SM's shared budget only gets two resident blocks
+    /// at the *maximum* carveout, and the driver's default heuristic may pick a smaller one.
+    /// </summary>
+    internal const int CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 9;
+
     // ── Kernel launch ───────────────────────────────────────────────
 
     [LibraryImport(LibName)]

@@ -1976,6 +1976,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     internal bool MtpUsesRbQ8Gemv => _mtpQ8Rb is not null;
 
     /// <summary>
+    /// Test hook (issue #492): whether a batched absorb of <paramref name="cols"/> rows will run the
+    /// NCOLS-specialised multi-column kernel rather than the generic 8-column one — so a parity test
+    /// can prove it is not silently measuring the fallback.
+    /// </summary>
+    internal bool MtpUsesSpecializedRbQ8Gemv(int cols) => _mtpQ8Rb?.HasSpecialized(cols) == true;
+
+    /// <summary>
     /// Test hook (issue #485): whether the dp4a PQ2_0 GEMV module is loaded, so a test that switches
     /// the path on can prove it is not silently measuring the fallback.
     /// </summary>
