@@ -69,12 +69,15 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     // Model-owned device F16 scratch for on-the-fly weight dequant in the prefill path
     // (seqLen > 1). Holds the dequantised weight tile that cuBLAS HGEMM then consumes —
     // mirrors the dense CudaTransformerModel.Project() prefill branch which dequants
-    // quantised weights into an F16 scratch and runs F16 GEMM. Sized to the largest single
-    // weight tile we ever GEMM with (`maxTileFloats` halves in element count → halves in
-    // bytes vs the previous F32 scratch since each F16 element is 2 bytes vs 4). The
-    // routed-expert dequant has its own dedicated scratch in _state.MoeW{1,2,3}Scratch.
+    // quantised weights into an F16 scratch and runs F16 GEMM. Sized to the `m*k` of the
+    // projection that first needs it and grown from there. The routed-expert dequant has its
+    // own dedicated scratch in _state.MoeW{1,2,3}Scratch.
     // Decode-time (seqLen == 1) projections bypass this entirely via the quantised GEMV
     // path (LaunchQuantizedGemv / LaunchQuantizedGemvMmq / LaunchQuantizedGemvF32In).
+    // #495: LAZY and demand-sized — see the identical field in
+    // CudaQwen3HybridDenseTransformerModel for the full rationale. It used to be allocated at
+    // load sized to the widest tile in the model (the lm_head), which is dead weight for every
+    // projection a packed/GEMV path covers.
     private nint _dequantScratchF16Weight;
     private long _dequantScratchElems;
 
@@ -203,7 +206,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         CudaQwen3MoeHybridForwardState state, CudaGdnStateCache gdnCache,
         CudaStream stream, CudaCublasHandle cublas, CudaContext context, CudaKernels kernels,
         int deviceId,
-        long dequantScratchElems, nint dequantScratchDevice,
         CudaMoeScratch moeScratch)
     {
         Config = config;
@@ -233,8 +235,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         _context = context;
         _kernels = kernels;
         _deviceId = deviceId;
-        _dequantScratchElems = dequantScratchElems;
-        _dequantScratchF16Weight = dequantScratchDevice;
         _moeScratch = moeScratch;
 
         _gdnLayerOrdinal = new int[config.NumLayers];
@@ -393,11 +393,10 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         var kvSlotForLayer = new int[config.NumLayers];
         int attentionLayerCount = 0;
         var owned = new List<nint>(); // CPU-side mmap pointers the GGUF loader may own
-        long maxTileFloats = 0;
 
         for (int i = 0; i < config.NumLayers; i++)
         {
-            layers[i] = LoadLayerDevice(i, dataBase, tensors, config, owned, ref maxTileFloats, allocs);
+            layers[i] = LoadLayerDevice(i, dataBase, tensors, config, owned, allocs);
             kvSlotForLayer[i] = layout.LayerKind[i] == HybridLayerKind.Attention
                 ? attentionLayerCount++
                 : -1;
@@ -409,8 +408,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         // _state. Decode (seqLen == 1) bypasses this scratch entirely via the quantised
         // GEMV kernels (LaunchQuantizedGemv / LaunchQuantizedGemvMmq /
         // LaunchQuantizedGemvF32In).
-        maxTileFloats = Math.Max(maxTileFloats, (long)outputOutputDim * outputInputDim);
-        nint dequantScratchDevice = AllocDevice(maxTileFloats * sizeof(ushort), allocs);
 
         // ── GDN ordinal count + state cache + scratch state ──
         int gdnLayerCount = 0;
@@ -448,7 +445,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             kvSlotForLayer, attentionLayerCount,
             ropeTheta, ropeDim,
             state, gdnCache, stream, cublas, context, kernels, deviceId,
-            maxTileFloats, dequantScratchDevice, moeScratch);
+            moeScratch);
         }
         catch
         {
@@ -499,11 +496,9 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// <see cref="LoadSingleLayerWeightsFromGguf"/>.
     /// </para>
     /// <para>
-    /// <b>Dequant scratch sizing.</b> Walks every <c>blk.NN.*</c> projection descriptor up
-    /// front and sizes <c>_dequantScratchF16Weight</c> to the widest tile encountered — so
-    /// any subsequent per-layer load can GEMM (prefill HGEMM path) into a pre-allocated
-    /// scratch without reallocation. Cost: <c>O(numTensors)</c> descriptor inspection, no
-    /// byte uploads.
+    /// <b>Dequant scratch sizing.</b> Nothing to do (issue #495): <c>_dequantScratchF16Weight</c>
+    /// is allocated on first actual use at the size that use needs and grown from there, so a
+    /// layer streamed in later needs no pre-sized buffer.
     /// </para>
     /// </remarks>
     /// <param name="gguf">Opened GGUF file. Must remain alive for the model's lifetime.</param>
@@ -631,56 +626,20 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
                 $"Qwen3MoeHybrid rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.");
         float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
 
-        // ── Per-layer descriptor walk to compute max tile + kvSlot ordinals ──
-        // No bytes uploaded; just metadata inspection. Mirrors what LoadGdnLayerDevice /
-        // LoadFullAttnLayerDevice / UploadMoeLayer call UpdateMaxTile on, so a subsequent
-        // per-layer load can GEMM into a pre-allocated scratch without resizing.
+        // ── Per-layer kvSlot ordinals ──
+        // #495: this used to also walk every blk.NN.* projection descriptor to pre-size the F16
+        // dequant scratch to the widest tile in the model, so a later per-layer streaming load
+        // could GEMM into a pre-allocated buffer. The scratch is now allocated on first actual
+        // use and grown from there (EnsureDequantScratchF16Weight), so the walk is unnecessary
+        // — a layer loaded later simply grows the buffer when it first needs one.
         var kvSlotForLayer = new int[config.NumLayers];
         int attentionLayerCount = 0;
-        long maxTileFloats = 0;
         for (int i = 0; i < config.NumLayers; i++)
         {
             kvSlotForLayer[i] = layout.LayerKind[i] == HybridLayerKind.Attention
                 ? attentionLayerCount++
                 : -1;
-            string prefix = $"blk.{i}";
-            // Token-mixing tile sizes — GDN or full-attn.
-            if (layout.LayerKind[i] == HybridLayerKind.GatedDeltaNet)
-            {
-                foreach (string suffix in new[]
-                {
-                    "attn_qkv.weight", "attn_gate.weight",
-                    "ssm_alpha.weight", "ssm_beta.weight", "ssm_out.weight",
-                })
-                {
-                    var d = tensors[$"{prefix}.{suffix}"];
-                    UpdateMaxTile(ref maxTileFloats, (long)d.Shape[0] * d.Shape[1]);
-                }
-            }
-            else
-            {
-                foreach (string suffix in new[]
-                {
-                    "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
-                })
-                {
-                    var d = tensors[$"{prefix}.{suffix}"];
-                    UpdateMaxTile(ref maxTileFloats, (long)d.Shape[0] * d.Shape[1]);
-                }
-            }
-            // MoE tile sizes — per-expert routed gate/up/down, all with [I, hidden] or [hidden, I].
-            // UploadMoeLayer only updates with W1 (I × hidden) and W2 (hidden × I); UploadMoeLayerFromHost
-            // does the same. Mirror the smaller set so the budget matches the production loader exactly.
-            if (tensors.TryGetValue($"{prefix}.ffn_gate_exps.weight", out var gateExps))
-                UpdateMaxTile(ref maxTileFloats, (long)gateExps.Shape[0] * gateExps.Shape[1]);
-            if (tensors.TryGetValue($"{prefix}.ffn_down_exps.weight", out var downExps))
-                UpdateMaxTile(ref maxTileFloats, (long)downExps.Shape[0] * downExps.Shape[1]);
         }
-        // Include the lm_head tile. Scratch holds the dequantised F16 weight tile for
-        // the prefill HGEMM path; decode goes through the quantised GEMV kernels and
-        // doesn't touch it. 2 bytes per element vs the previous 4-byte F32 layout.
-        maxTileFloats = Math.Max(maxTileFloats, (long)outputOutputDim * outputInputDim);
-        nint dequantScratchDevice = AllocDevice(maxTileFloats * sizeof(ushort), allocs);
 
         // ── GDN ordinal count + state cache + activation scratch ──
         int gdnLayerCount = 0;
@@ -718,7 +677,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             kvSlotForLayer, attentionLayerCount,
             ropeTheta, ropeDim,
             state, gdnCache, stream, cublas, context, kernels, deviceId,
-            maxTileFloats, dequantScratchDevice, moeScratch);
+            moeScratch);
         }
         catch
         {
@@ -762,7 +721,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         _context.MakeCurrent();
         nint dataBase = _gguf.DataBasePointer;
         var tensors = _gguf.TensorsByName;
-        long maxTileFloats = _dequantScratchElems; // already sized to the global max
         // #383: this is a post-construction, per-layer streaming load on an already-valid model
         // (not model construction itself), but LoadLayerDevice still makes several device
         // allocations before returning its DeviceLayer record — a throw partway through (e.g.
@@ -776,7 +734,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         try
         {
             _layers[layerIdx] = LoadLayerDevice(layerIdx, dataBase, tensors, Config,
-                owned: new List<nint>(), ref maxTileFloats, allocs);
+                owned: new List<nint>(), allocs);
         }
         catch
         {
@@ -1137,10 +1095,9 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         var deviceLayers = new DeviceLayer[config.NumLayers];
         var kvSlotForLayer = new int[config.NumLayers];
         int attentionLayerCount = 0;
-        long maxTileFloats = 0;
         for (int i = 0; i < config.NumLayers; i++)
         {
-            deviceLayers[i] = UploadLayerFromHost(i, layers[i], config, ref maxTileFloats, allocs);
+            deviceLayers[i] = UploadLayerFromHost(i, layers[i], config, allocs);
             kvSlotForLayer[i] = layout.LayerKind[i] == HybridLayerKind.Attention
                 ? attentionLayerCount++
                 : -1;
@@ -1148,8 +1105,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
 
         // Account for the lm_head tile in the dequant scratch sizing. F16 element width
         // (2 bytes) — see _dequantScratchF16Weight field comment for the rewire rationale.
-        maxTileFloats = Math.Max(maxTileFloats, (long)outputOutputDim * outputInputDim);
-        nint dequantScratchDevice = AllocDevice(maxTileFloats * sizeof(ushort), allocs);
 
         // ── GDN ordinal count + state cache + scratch state ──
         int gdnLayerCount = 0;
@@ -1183,7 +1138,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             kvSlotForLayer, attentionLayerCount,
             ropeTheta, ropeDim,
             state, gdnCache, stream, cublas, context, kernels, deviceId,
-            maxTileFloats, dequantScratchDevice, moeScratch);
+            moeScratch);
         }
         catch
         {
@@ -1210,7 +1165,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// </summary>
     private static DeviceLayer UploadLayerFromHost(
         int layerIdx, Qwen3MoeLayerWeights host,
-        ModelConfig config, ref long maxTileFloats, List<nint> allocs)
+        ModelConfig config, List<nint> allocs)
     {
         int hiddenSize = config.HiddenSize;
         var layout = config.HybridLayout!;
@@ -1227,21 +1182,21 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
                     throw new ArgumentException(
                         $"Layer {layerIdx} is GDN in HybridLayout but Qwen3MoeLayerWeights.Gdn is null.",
                         nameof(host));
-                gdnDev = UploadGdnLayer(host.Gdn, ref maxTileFloats, allocs);
+                gdnDev = UploadGdnLayer(host.Gdn, allocs);
                 break;
             case HybridLayerKind.Attention:
                 if (host.FullAttn is null)
                     throw new ArgumentException(
                         $"Layer {layerIdx} is Attention in HybridLayout but Qwen3MoeLayerWeights.FullAttn is null.",
                         nameof(host));
-                attnDev = UploadFullAttnLayer(host.FullAttn, ref maxTileFloats, allocs);
+                attnDev = UploadFullAttnLayer(host.FullAttn, allocs);
                 break;
             default:
                 throw new InvalidOperationException(
                     $"Unexpected HybridLayerKind {layout.LayerKind[layerIdx]} at layer {layerIdx} in Qwen3MoeHybrid.");
         }
 
-        DeviceMoe moeDev = UploadMoeLayerFromHost(host.Moe, hiddenSize, ref maxTileFloats, allocs);
+        DeviceMoe moeDev = UploadMoeLayerFromHost(host.Moe, hiddenSize, allocs);
 
         return new DeviceLayer
         {
@@ -1257,7 +1212,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         };
     }
 
-    private static DeviceGdn UploadGdnLayer(GdnTokenMixingWeights gdn, ref long maxTileFloats, List<nint> allocs)
+    private static DeviceGdn UploadGdnLayer(GdnTokenMixingWeights gdn, List<nint> allocs)
     {
         // Quantised-projection upload: each projection's raw bytes already lay out in the
         // declared quant format ([M*K] elements packed via Dequantize.RowByteSize). The
@@ -1276,11 +1231,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         nint dtBiasDevice = UploadF32Array(gdn.DtBias, allocs);
         nint ssmNormDevice = UploadF32Array(gdn.SsmNormWeight, allocs);
 
-        UpdateMaxTile(ref maxTileFloats, (long)gdn.QkvInputDim * gdn.QkvOutputDim);
-        UpdateMaxTile(ref maxTileFloats, (long)gdn.GateInputDim * gdn.GateOutputDim);
-        UpdateMaxTile(ref maxTileFloats, (long)gdn.AlphaInputDim * gdn.AlphaOutputDim);
-        UpdateMaxTile(ref maxTileFloats, (long)gdn.BetaInputDim * gdn.BetaOutputDim);
-        UpdateMaxTile(ref maxTileFloats, (long)gdn.OutInputDim * gdn.OutOutputDim);
 
         return new DeviceGdn
         {
@@ -1307,7 +1257,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         };
     }
 
-    private static DeviceFullAttn UploadFullAttnLayer(Qwen3FullAttnWeights attn, ref long maxTileFloats, List<nint> allocs)
+    private static DeviceFullAttn UploadFullAttnLayer(Qwen3FullAttnWeights attn, List<nint> allocs)
     {
         // Quant-aware upload: see UploadGdnLayer for rationale; the QQt/KQt/VQt/OQt fields
         // drive Gemm() dispatch in the per-layer body.
@@ -1319,10 +1269,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         nint qNormDevice = UploadF32Array(attn.QNormWeight, allocs);
         nint kNormDevice = UploadF32Array(attn.KNormWeight, allocs);
 
-        UpdateMaxTile(ref maxTileFloats, (long)attn.QInputDim * attn.QOutputDim);
-        UpdateMaxTile(ref maxTileFloats, (long)attn.KInputDim * attn.KOutputDim);
-        UpdateMaxTile(ref maxTileFloats, (long)attn.VInputDim * attn.VOutputDim);
-        UpdateMaxTile(ref maxTileFloats, (long)attn.OInputDim * attn.OOutputDim);
 
         return new DeviceFullAttn
         {
@@ -1351,7 +1297,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// gate, shared-expert F32 projections, and the optional shared-expert sigmoid gate
     /// are uploaded one-shot from their managed-array hosts.
     /// </summary>
-    private static DeviceMoe UploadMoeLayerFromHost(MoeLayerWeights moe, int hiddenSize, ref long maxTileFloats, List<nint> allocs)
+    private static DeviceMoe UploadMoeLayerFromHost(MoeLayerWeights moe, int hiddenSize, List<nint> allocs)
     {
         int E = moe.NumExperts;
         int I = moe.IntermediateSize;
@@ -1383,8 +1329,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             CopyHtoD(downExpsDevice + (nint)(e * downBytesPerExpert), moe.W2[e], downBytesPerExpert);
         }
 
-        UpdateMaxTile(ref maxTileFloats, (long)I * hiddenSize);
-        UpdateMaxTile(ref maxTileFloats, (long)hiddenSize * I);
 
         // Shared experts — F32 [sI, hidden] / [hidden, sI] managed pointers.
         int numShared = moe.NumSharedExperts;
@@ -1484,7 +1428,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     private static DeviceLayer LoadLayerDevice(
         int layerIdx, nint dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
-        ModelConfig config, List<nint> owned, ref long maxTileFloats, List<nint> allocs)
+        ModelConfig config, List<nint> owned, List<nint> allocs)
     {
         string prefix = $"blk.{layerIdx}";
         int hiddenSize = config.HiddenSize;
@@ -1501,11 +1445,11 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         switch (layout.LayerKind[layerIdx])
         {
             case HybridLayerKind.GatedDeltaNet:
-                gdnDev = LoadGdnLayerDevice(prefix, dataBase, tensors, config, ref maxTileFloats, allocs);
+                gdnDev = LoadGdnLayerDevice(prefix, dataBase, tensors, config, allocs);
                 break;
             case HybridLayerKind.Attention:
                 attnDev = LoadFullAttnLayerDevice(prefix, dataBase, tensors, config,
-                    layout.HeadCountKv[layerIdx], ref maxTileFloats, allocs);
+                    layout.HeadCountKv[layerIdx], allocs);
                 break;
             default:
                 throw new InvalidOperationException(
@@ -1515,7 +1459,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         // Routed-expert raw-quant view + shared expert F32 weights (small).
         MoeLayerWeights moeHost = TransformerWeights.LoadDeepSeekMoeLayer(
             layerIdx, dataBase, tensors, config, owned, skipRoutedF32Only: true);
-        DeviceMoe moeDev = UploadMoeLayer(moeHost, hiddenSize, ref maxTileFloats, allocs);
+        DeviceMoe moeDev = UploadMoeLayer(moeHost, hiddenSize, allocs);
 
         return new DeviceLayer
         {
@@ -1531,7 +1475,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     private static DeviceGdn LoadGdnLayerDevice(
         string prefix, nint dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
-        ModelConfig config, ref long maxTileFloats, List<nint> allocs)
+        ModelConfig config, List<nint> allocs)
     {
         var gdn = config.GdnConfig!.Value;
         int convDim = (2 * gdn.NKHead + gdn.NVHead) * gdn.DState;
@@ -1565,11 +1509,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         nint dtBiasDevice = UploadF32Tensor(dataBase, dtBDesc, gdn.NVHead, allocs);
         nint ssmNormDevice = UploadF32Tensor(dataBase, ssmNormDesc, gdn.DState, allocs);
 
-        UpdateMaxTile(ref maxTileFloats, (long)qkvDesc.Shape[0] * qkvDesc.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)gateDesc.Shape[0] * gateDesc.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)alphaDesc.Shape[0] * alphaDesc.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)betaDesc.Shape[0] * betaDesc.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)outDesc.Shape[0] * outDesc.Shape[1]);
 
         return new DeviceGdn
         {
@@ -1599,7 +1538,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     private static DeviceFullAttn LoadFullAttnLayerDevice(
         string prefix, nint dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
-        ModelConfig config, int numKvHeads, ref long maxTileFloats, List<nint> allocs)
+        ModelConfig config, int numKvHeads, List<nint> allocs)
     {
         var q = tensors[$"{prefix}.attn_q.weight"];
         var k = tensors[$"{prefix}.attn_k.weight"];
@@ -1622,10 +1561,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         nint qNormDevice = UploadF32Tensor(dataBase, tensors[$"{prefix}.attn_q_norm.weight"], config.HeadDim, allocs);
         nint kNormDevice = UploadF32Tensor(dataBase, tensors[$"{prefix}.attn_k_norm.weight"], config.HeadDim, allocs);
 
-        UpdateMaxTile(ref maxTileFloats, (long)q.Shape[0] * q.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)k.Shape[0] * k.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)v.Shape[0] * v.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)o.Shape[0] * o.Shape[1]);
 
         return new DeviceFullAttn
         {
@@ -1652,7 +1587,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// quant bytes (host mmap → device). Shared expert F32 dequants are uploaded as F32.
     /// The router gate.weight is F32 (already produced by the CPU loader).
     /// </summary>
-    private static DeviceMoe UploadMoeLayer(MoeLayerWeights moe, int hiddenSize, ref long maxTileFloats, List<nint> allocs)
+    private static DeviceMoe UploadMoeLayer(MoeLayerWeights moe, int hiddenSize, List<nint> allocs)
     {
         // Router gate weight [numExperts, hiddenSize] F32 — small, upload directly.
         long routerFloats = (long)moe.NumExperts * hiddenSize;
@@ -1680,8 +1615,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         CopyHtoD(upExpsDevice, moe.UpExpsRaw, upExpsBytes);
         CopyHtoD(downExpsDevice, moe.DownExpsRaw, downExpsBytes);
 
-        UpdateMaxTile(ref maxTileFloats, (long)moe.GateExpsMDim * moe.GateExpsKDim);
-        UpdateMaxTile(ref maxTileFloats, (long)moe.DownExpsMDim * moe.DownExpsKDim);
 
         // Shared experts: F32 pointers from the CPU loader → device F32.
         // Qwen3.6-A3B ships exactly one shared expert (verified from the Q6_K_XL GGUF
@@ -2744,15 +2677,16 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     ///   </item>
     ///   <item><term>Prefill (<paramref name="seqLen"/> &gt; 1)</term><description>Dequantise
     ///     the weight tile to <see cref="_dequantScratchF16Weight"/> (F16) → stage input F32→F16 →
-    ///     cuBLAS HGEMM → stage output F16→F32. Mirrors the dense prefill branch. F16 weight
-    ///     scratch is <c>maxTileFloats × 2 B</c>, half the bytes of the previous F32 scratch.
+    ///     cuBLAS HGEMM → stage output F16→F32. Mirrors the dense prefill branch. The F16 weight
+    ///     scratch is <c>m*k × 2 B</c>, allocated on first use and grown only (issue #495).
     ///     </description></item>
     ///   <item><term>F16 weights</term><description>Decode goes via the F16→F16 GEMV path
     ///     directly (no dequant). Prefill copies the F16 weight to the dequant scratch (no
     ///     conversion) and runs HGEMM.</description></item>
     /// </list>
-    /// The big <c>_dequantScratchF16Weight</c> persistent allocation is only touched on
-    /// prefill — decode-time projections never expand a weight tile to dense memory.
+    /// The <c>_dequantScratchF16Weight</c> allocation is only touched on prefill — decode-time
+    /// projections never expand a weight tile to dense memory, so on a model whose prefill is
+    /// fully covered by packed paths it is never allocated at all (issue #495).
     /// </summary>
     /// <param name="weight">Device pointer to raw weight bytes (quant-format or F16/F32).</param>
     /// <param name="qt">Quantization type of the weight.</param>
@@ -2827,7 +2761,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         // ── Prefill (seqLen > 1) and decode fallback ──
         // Dequant the weight tile to F16, stage input F32→F16, cuBLAS HGEMM, stage
         // output F16→F32. The F16 weight scratch is the model-owned _dequantScratchF16Weight
-        // (sized at load to maxTileFloats halfs). All quant types that LaunchDequantToF16
+        // (issue #495: allocated here on first use, grown only). All quant types that LaunchDequantToF16
         // covers route through here — same kernel coverage as the dense prefill path.
         long totalElems = (long)m * k;
         int totalElemsI = checked((int)totalElems);
@@ -2842,6 +2776,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
 
         // F16-weight branch: no dequant needed — copy is implicit (LaunchDequantToF16
         // handles QuantizationType.F16 as a DtoD copy already).
+        EnsureDequantScratchF16Weight(totalElems);   // #495: demand-sized, grow-only
         _kernels.LaunchDequantToF16(weight, qt, _dequantScratchF16Weight, totalElemsI, streamH);
         _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, activInElems, streamH);
         CudaGemm.LinearF16(_cublas.Handle, _activF16InScratch, _dequantScratchF16Weight,
@@ -2864,6 +2799,19 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         _activF16OutScratch = AllocDevice(halfs * sizeof(ushort));
         _activF16OutScratchElems = halfs;
     }
+
+    /// <summary>Issue #495: grows the F16 weight-dequant scratch to the <c>m*k</c> of the
+    /// projection about to run. Grow-only, allocated on first actual use.</summary>
+    private void EnsureDequantScratchF16Weight(long halfs)
+    {
+        if (halfs <= _dequantScratchElems) return;
+        FreeIfNonZero(ref _dequantScratchF16Weight);
+        _dequantScratchF16Weight = AllocDevice(halfs * sizeof(ushort));
+        _dequantScratchElems = halfs;
+    }
+
+    /// <summary>Device bytes currently held by the F16 weight-dequant scratch (issue #495).</summary>
+    public long DequantScratchF16WeightBytes => _dequantScratchElems * sizeof(ushort);
 
     // ──────────────────────────────────────────────────────────────────────
     //  Host fallbacks — temporary CPU paths used while waiting on CUDA kernels.
@@ -3009,6 +2957,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         }
 
         FreeIfNonZero(ref _dequantScratchF16Weight);
+        _dequantScratchElems = 0;
         FreeIfNonZero(ref _activF16InScratch);
         FreeIfNonZero(ref _activF16OutScratch);
 
@@ -3173,11 +3122,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         nint device = AllocDevice(bytes, allocs);
         CopyHtoD(device, dataBase + (nint)desc.DataOffset, bytes);
         return device;
-    }
-
-    private static void UpdateMaxTile(ref long max, long candidate)
-    {
-        if (candidate > max) max = candidate;
     }
 
     // ──────────────────────────────────────────────────────────────────────
