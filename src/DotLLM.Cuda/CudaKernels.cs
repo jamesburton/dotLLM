@@ -106,6 +106,12 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _turboquantEncodeF32Func;
     private readonly nint _turboquantDequantF16Func;
     private readonly nint _turboquantEncodeF16Func;
+
+    // PrismML Hadamard activation transform (hadamard_fwht.ptx) — optional module. The CUDA twin
+    // of the Vulkan hadamard_fwht_f32 shader and DotLLM.Cpu.Kernels.Hadamard (issue #479). 0 when
+    // the PTX is absent/stale; Hadamard-folded checkpoints then refuse to load on CUDA.
+    private readonly CudaModule? _hadamardFwhtModule;
+    private readonly nint _hadamardFwhtF32Func;
     private readonly nint _quantizedGemvQ2_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ4_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ5_KMmqPreqFunc;
@@ -662,6 +668,13 @@ public sealed unsafe class CudaKernels : IDisposable
             _turboquantEncodeF32Func = _turboquantModule.TryGetFunction("turboquant_encode_f32");
             _turboquantDequantF16Func = _turboquantModule.TryGetFunction("turboquant_dequant_f16");
             _turboquantEncodeF16Func = _turboquantModule.TryGetFunction("turboquant_encode_f16");
+        }
+
+        string hadamardFwhtPath = Path.Combine(ptxDir, "hadamard_fwht.ptx");
+        if (File.Exists(hadamardFwhtPath))
+        {
+            _hadamardFwhtModule = CudaModule.LoadFromFile(hadamardFwhtPath);
+            _hadamardFwhtF32Func = _hadamardFwhtModule.TryGetFunction("hadamard_fwht_f32");
         }
 
         _rmsnormFunc = _rmsnormModule.GetFunction("rmsnorm_f16");
@@ -5218,7 +5231,71 @@ public sealed unsafe class CudaKernels : IDisposable
         return numChunks * bytesPerChunk;
     }
 
-    /// <summary>Dequantize a weight matrix to FP32 on the GPU.</summary>
+    /// <summary>Largest Hadamard block width <see cref="LaunchHadamardFwhtF32"/> supports (its shared-memory staging size).</summary>
+    public const int HadamardFwhtMaxBlockSize = 1024;
+
+    /// <summary>Threads per CUDA block for <c>hadamard_fwht_f32</c>. Must match <c>HADAMARD_THREADS</c> in native/kernels/hadamard_fwht.cu.</summary>
+    private const int HadamardFwhtThreads = 256;
+
+    /// <summary>Whether the PrismML Hadamard FWHT kernel is loaded (hadamard_fwht.ptx present and current).</summary>
+    public bool HasHadamardFwht => _hadamardFwhtF32Func != 0;
+
+    /// <summary>
+    /// Blockwise normalized Sylvester Walsh-Hadamard transform over a <c>[rows, width]</c> F32
+    /// activation (PrismML <c>prism.hadamard.*</c> fold, issue #479). One CUDA block per
+    /// (row, <paramref name="blockSize"/>-wide block), staged in shared memory.
+    /// </summary>
+    /// <remarks>
+    /// Forward (<paramref name="inverse"/> false): optional GDN tiled→grouped permute → sign flip →
+    /// FWHT. Inverse: FWHT → sign flip. <paramref name="src"/> may equal <paramref name="dst"/>
+    /// only when <paramref name="permute"/> is false (the permute reads across blocks).
+    /// <paramref name="scale"/> must be <c>1f / MathF.Sqrt(blockSize)</c> — computed on the host so
+    /// the kernel matches the CPU oracle exactly.
+    /// </remarks>
+    /// <param name="src">Source activation, device F32 <c>[rows, width]</c>.</param>
+    /// <param name="dst">Destination, device F32 <c>[rows, width]</c>.</param>
+    /// <param name="signs">Device F32 ±1 vector of <paramref name="width"/> elements; may be 0 when <paramref name="applySigns"/> is false.</param>
+    /// <param name="rows">Token rows.</param>
+    /// <param name="width">Row width; a positive multiple of <paramref name="blockSize"/>.</param>
+    /// <param name="blockSize">Power of two in <c>[1, HadamardFwhtMaxBlockSize]</c>.</param>
+    /// <param name="applySigns">False for the identity sign step.</param>
+    /// <param name="inverse">True for the inverse order (signs after the rotation).</param>
+    /// <param name="permute">True to apply the GDN value-head permute on load (<c>ssm_out</c> input only).</param>
+    /// <param name="permDState">Head width for the permute.</param>
+    /// <param name="permNKHead">Key heads for the permute.</param>
+    /// <param name="permRep">Value heads per key head for the permute.</param>
+    /// <param name="scale"><c>1f / MathF.Sqrt(blockSize)</c>.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public unsafe void LaunchHadamardFwhtF32(
+        nint src, nint dst, nint signs, int rows, int width, int blockSize,
+        bool applySigns, bool inverse, bool permute, int permDState, int permNKHead, int permRep,
+        float scale, nint stream)
+    {
+        if (_hadamardFwhtF32Func == 0)
+            throw new InvalidOperationException("hadamard_fwht_f32 not loaded (hadamard_fwht.ptx missing/stale).");
+        if (blockSize <= 0 || (blockSize & (blockSize - 1)) != 0 || blockSize > HadamardFwhtMaxBlockSize)
+            throw new ArgumentOutOfRangeException(nameof(blockSize),
+                $"Hadamard block size must be a power of two <= {HadamardFwhtMaxBlockSize}, got {blockSize}.");
+        if (width <= 0 || width % blockSize != 0)
+            throw new ArgumentException($"Activation width {width} is not a positive multiple of Hadamard block size {blockSize}.", nameof(width));
+        if (permute && src == dst)
+            throw new ArgumentException("The GDN permute reads across blocks; src must not alias dst.", nameof(dst));
+        if (permute && (permDState <= 0 || permNKHead <= 0 || permRep <= 0 || permDState * permNKHead * permRep != width))
+            throw new ArgumentException(
+                $"GDN permute geometry {permDState}x{permNKHead}x{permRep} does not match width {width}.", nameof(width));
+        if (rows <= 0) return;
+
+        nint s = src, d = dst, sg = signs;
+        int r = rows, w = width, bs = blockSize;
+        int aps = applySigns ? 1 : 0, inv = inverse ? 1 : 0, perm = permute ? 1 : 0;
+        int pds = permDState, pnk = permNKHead, prp = permRep;
+        float sc = scale;
+        void** args = stackalloc void*[] { &s, &d, &sg, &r, &w, &bs, &aps, &inv, &perm, &pds, &pnk, &prp, &sc };
+        CudaDriverApi.cuLaunchKernel(_hadamardFwhtF32Func,
+                (uint)(width / blockSize), (uint)rows, 1, HadamardFwhtThreads, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <summary>Whether the TurboQuant KV codec kernels are loaded (turboquant.ptx present).</summary>
     public bool TurboQuantAvailable => _turboquantDequantF32Func != 0 && _turboquantEncodeF32Func != 0;
 
@@ -6502,6 +6579,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _fusedAddRmsNormF32ResModule.Dispose();
         _quantKvModule?.Dispose();
         _turboquantModule?.Dispose();
+        _hadamardFwhtModule?.Dispose();
         _kvWriteModule?.Dispose();
         _fusedRopeKvWriteModule?.Dispose();
         _attentionMlaModule?.Dispose();

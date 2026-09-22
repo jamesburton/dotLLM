@@ -23,6 +23,7 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
     private readonly int _gdnKDim;       // NKHead * DState
     private readonly int _gdnHeads;      // NVHead
     private readonly int _intermediateSize;
+    private readonly int _hadamardWidth; // widest folded activation; 0 without a Hadamard fold
 
     private int _currentSeqLen;
     private int _logitsCurrentRows;
@@ -81,6 +82,18 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
     public nint FfnUp;          // [seqLen * intermediateSize] — ffn_up.weight @ normOutput
     public nint SiluOutput;     // [seqLen * intermediateSize] — silu(FfnGate) * FfnUp
 
+    // ── PrismML Hadamard fold (issue #479) ────────────────────────────────────
+    /// <summary>
+    /// Destination for the forward Hadamard activation transform (<c>prism.hadamard.*</c>):
+    /// <c>[seqLen, maxFoldedWidth]</c>, where the width covers every folded input — hidden
+    /// (attn/GDN/FFN inputs, lm_head), <c>NVHead·DState</c> (<c>ssm_out</c>), <c>qElems</c>
+    /// (<c>attn_output</c>) and <c>intermediateSize</c> (<c>ffn_down</c>). A separate buffer rather
+    /// than in-place because unfolded consumers (<c>ssm_alpha</c>/<c>ssm_beta</c>) read the very same
+    /// <see cref="NormOutput"/> the folded GDN projections rotate. 0 (never allocated) when the
+    /// checkpoint declares no fold.
+    /// </summary>
+    public nint HadamardScratch;
+
     // ── Token-id / position H2D staging ───────────────────────────────────────
     public nint TokenIdsDevice;
     public nint PositionsDevice;
@@ -95,7 +108,8 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
         int nVHead,
         int nKHead,
         int dState,
-        int intermediateSize)
+        int intermediateSize,
+        bool hasHadamardFold = false)
     {
         _hiddenSize = hiddenSize;
         _vocabSize = vocabSize;
@@ -107,6 +121,9 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
         _gdnKDim = nKHead * dState;
         _gdnHeads = nVHead;
         _intermediateSize = intermediateSize;
+        _hadamardWidth = hasHadamardFold
+            ? Math.Max(Math.Max(hiddenSize, qElems), Math.Max(_gdnVDim, intermediateSize))
+            : 0;
 
         _currentSeqLen = 0;
         EnsureCapacity(1);
@@ -201,6 +218,9 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
         FfnUp = AllocDevice((long)cap * _intermediateSize * sizeof(float));
         SiluOutput = AllocDevice((long)cap * _intermediateSize * sizeof(float));
 
+        if (_hadamardWidth > 0)
+            HadamardScratch = AllocDevice((long)cap * _hadamardWidth * sizeof(float));
+
         TokenIdsDevice = AllocDevice((long)cap * sizeof(int));
         PositionsDevice = AllocDevice((long)cap * sizeof(int));
 
@@ -262,6 +282,7 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
         FreeIfNonZero(ref FfnGate);
         FreeIfNonZero(ref FfnUp);
         FreeIfNonZero(ref SiluOutput);
+        FreeIfNonZero(ref HadamardScratch);
         FreeIfNonZero(ref TokenIdsDevice);
         FreeIfNonZero(ref PositionsDevice);
     }
