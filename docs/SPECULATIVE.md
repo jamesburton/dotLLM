@@ -202,7 +202,7 @@ dotllm run qwen3.6-27b-mtp.gguf -p "Hello"
 dotllm run qwen3.6-27b-mtp.gguf --no-mtp -p "Hello"
 
 # Serve: MTP is opt-in (default off) — takes the continuous-batch scheduler offline when enabled
-dotllm serve qwen3.6-27b-mtp.gguf --mtp --speculative-k 5
+dotllm serve qwen3.6-27b-mtp.gguf --mtp
 ```
 
 `--draft-model` and `--draft-tokens` are accepted as aliases of `--speculative-model` and
