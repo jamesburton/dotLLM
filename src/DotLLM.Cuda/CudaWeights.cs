@@ -29,6 +29,15 @@ internal readonly struct CudaLayerWeights
     // BitNet Sub-LN weights on device (FP16). 0 when absent (non-BitNet models).
     public readonly nint AttnSubNormWeight, FfnSubNormWeight;
 
+    /// <summary>
+    /// gpt-oss per-head attention sink logits on device (issue #365) — <b>F32</b>, one element
+    /// per QUERY head, uploaded verbatim (NOT converted to FP16 like the norm weights above):
+    /// every sink-aware attention kernel takes <c>const float*</c>. 0 when the layer has no
+    /// <c>attn_sinks.weight</c> tensor, which is every non-gpt-oss model — and 0 makes the
+    /// kernels bit-identical to their pre-#365 form.
+    /// </summary>
+    public readonly nint AttnSinksDevice;
+
     // Bias on device (FP16, 0 when absent)
     public readonly nint QBias, KBias, VBias, OBias;
     public readonly nint GateBias, UpBias, DownBias;
@@ -64,7 +73,8 @@ internal readonly struct CudaLayerWeights
         nint gateQuant, QuantizationType gateQt, nint upQuant, QuantizationType upQt,
         nint downQuant, QuantizationType downQt,
         nint qkvPacked, QuantizationType qkvPackedQt, int qkvPackedOut,
-        nint gateUpPacked, QuantizationType gateUpPackedQt, int gateUpPackedOut)
+        nint gateUpPacked, QuantizationType gateUpPackedQt, int gateUpPackedOut,
+        nint attnSinks)
     {
         Q = q; QOutputDim = qOut; QInputDim = qIn;
         K = k; KOutputDim = kOut; KInputDim = kIn;
@@ -76,6 +86,7 @@ internal readonly struct CudaLayerWeights
         AttnNormWeight = attnNorm; FfnNormWeight = ffnNorm;
         QNormWeight = qNorm; KNormWeight = kNorm;
         AttnSubNormWeight = attnSubNorm; FfnSubNormWeight = ffnSubNorm;
+        AttnSinksDevice = attnSinks;
         QBias = qBias; KBias = kBias; VBias = vBias; OBias = oBias;
         GateBias = gateBias; UpBias = upBias; DownBias = downBias;
         QQuant = qQuant; QQuantType = qQt; KQuant = kQuant; KQuantType = kQt;
@@ -127,6 +138,41 @@ internal sealed class CudaWeights : IDisposable
     /// </summary>
     public CudaGemma4LayerWeights?[]? Gemma4Layers { get; }
 
+    /// <summary>
+    /// Device buffer holding the dense-YaRN ramped inverse frequencies — <c>ropeDim / 2</c>
+    /// F32 values produced by <see cref="RoPE.ComputeYarnInverseFrequencies"/>, the same
+    /// routine the CPU reference uses inside <c>RoPE.PrecomputeFrequencyTableYarn</c>.
+    /// <c>0</c> when <see cref="DotLLM.Core.PositionEncoding.RoPEConfig.IsDenseYarnActive"/>
+    /// is false, and also for MLA models — which are excluded because they never reach the
+    /// kernels this buffer feeds: MLA runs a separate, table-driven RoPE path
+    /// (<c>CudaTransformerModel.EnsureMlaState</c> uploads its own cos/sin tables).
+    /// The RoPE kernels treat 0 as "compute frequencies from theta in-kernel", which is
+    /// bit-identical to pre-#366 behaviour.
+    /// <para>
+    /// <b>MLA's own dense-YaRN gap is NOT addressed by #366.</b> That path builds its tables
+    /// with the PLAIN <c>RoPE.PrecomputeFrequencyTable</c>, whereas the CPU MLA path uses
+    /// <c>RoPE.PrecomputeFrequencyTableYarn</c> — so CUDA MLA carries the same class of
+    /// CPU/CUDA divergence for DeepSeek-V2/V3 long context. Do not read the exclusion below
+    /// as "already handled". Tracked in issue #430.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// An inverse-frequency vector rather than a position-indexed cos/sin table: it is
+    /// <c>ropeDim/2</c> floats regardless of context length (no max-sequence-length sizing
+    /// and no chance of an out-of-range row read), and the kernels already index by
+    /// <c>positions[t]</c>. The kernel then evaluates the identical expression the CPU
+    /// table stores, <c>cos/sin(pos * invFreq[i]) * mscale</c>.
+    /// </remarks>
+    public nint RopeYarnInvFreqDevice { get; }
+
+    /// <summary>
+    /// Dense-YaRN cos/sin multiplier (mscale) matching
+    /// <see cref="DotLLM.Core.PositionEncoding.RoPEConfig.ComputeYarnMscaleMultiplier"/>.
+    /// <c>1.0f</c> when YaRN is inactive — an exact IEEE identity multiply, so the
+    /// non-YaRN path is unchanged bit-for-bit.
+    /// </summary>
+    public float RopeYarnMscale { get; }
+
     public nint TokenEmbedDevice { get; }
     public QuantizationType TokenEmbedQuantType { get; }
     public nint OutputNormWeight { get; }
@@ -144,8 +190,11 @@ internal sealed class CudaWeights : IDisposable
                           List<nint> allocs,
                           CudaMlaLayerWeights[]? mlaLayers,
                           CudaMoeLayerWeights?[]? moeLayers,
-                          CudaGemma4LayerWeights?[]? gemma4Layers)
+                          CudaGemma4LayerWeights?[]? gemma4Layers,
+                          nint ropeYarnInvFreq, float ropeYarnMscale)
     {
+        RopeYarnInvFreqDevice = ropeYarnInvFreq;
+        RopeYarnMscale = ropeYarnMscale;
         Layers = layers;
         TokenEmbedDevice = tokenEmbed;
         TokenEmbedQuantType = tokenEmbedQt;
@@ -444,6 +493,15 @@ internal sealed class CudaWeights : IDisposable
             nint attnSubNorm = lw.AttnSubNormWeight is not null ? UploadNormWeight(lw.AttnSubNormWeight, allocs, kernels, stream) : 0;
             nint ffnSubNorm = lw.FfnSubNormWeight is not null ? UploadNormWeight(lw.FfnSubNormWeight, allocs, kernels, stream) : 0;
 
+            // gpt-oss per-head attention sinks (issue #365), from the layer's
+            // `attn_sinks.weight` GGUF tensor (bound CPU-side to TransformerLayerWeights.AttnSinks).
+            // Uploaded as RAW F32 — the sink-aware attention kernels take `const float*`, so this
+            // deliberately does NOT go through UploadNormWeight (which converts to FP16).
+            // Placed here, outside the MLA/MoE conditionals above, so it is reached for every
+            // layer shape — gpt-oss has a MoE FFN but standard GQA attention.
+            // 0 for every model without the tensor, which keeps the kernels bit-identical.
+            nint attnSinks = lw.AttnSinks is not null ? UploadF32Vector(lw.AttnSinks, allocs) : 0;
+
             layers[i] = new CudaLayerWeights(
                 q, lw.QOutputDim, lw.QInputDim, k, lw.KOutputDim, lw.KInputDim,
                 v, lw.VOutputDim, lw.VInputDim, o, lw.OOutputDim, lw.OInputDim,
@@ -457,7 +515,8 @@ internal sealed class CudaWeights : IDisposable
                 gateQuant, lw.GateQuantType, upQuant, lw.UpQuantType,
                 downQuant, lw.DownQuantType,
                 qkvPacked, qkvPackedQt, qkvPackedOut,
-                gateUpPacked, gateUpPackedQt, gateUpPackedOut);
+                gateUpPacked, gateUpPackedQt, gateUpPackedOut,
+                attnSinks);
 
             if (isMlaLayer)
             {
@@ -514,10 +573,19 @@ internal sealed class CudaWeights : IDisposable
                 cpuWeights.OutputOutputDim, cpuWeights.OutputInputDim, allocs);
         }
 
+        // Dense-YaRN inverse frequencies (#366). The CUDA RoPE kernels previously derived
+        // every frequency from theta alone, silently dropping rope.scaling.* — for gpt-oss
+        // (yarn, factor=32, orig_ctx=4096) that is wrong from position 0, because YaRN's
+        // mscale multiplies cos AND sin at every position. Mirrors the CPU gate in
+        // TransformerModel.BuildFromPrebuiltWeightsInternal: dense path only (MLA models
+        // carry their own YaRN cos/sin tables through CudaTransformerModel's MLA state).
+        var (ropeYarnInvFreq, ropeYarnMscale) = UploadDenseYarnInvFreq(config, allocs);
+
         return new CudaWeights(layers, tokenEmbed, tokenEmbedQt,
             outputNorm, outputWeight, cpuWeights.OutputOutputDim, cpuWeights.OutputInputDim,
             outputWeightQuant, cpuWeights.OutputQuantType, allocs,
-            mlaLayers, moeLayers, gemma4Layers);
+            mlaLayers, moeLayers, gemma4Layers,
+            ropeYarnInvFreq, ropeYarnMscale);
         }
         catch
         {
@@ -534,6 +602,62 @@ internal sealed class CudaWeights : IDisposable
     private static void FreeDeviceIfNonZero(nint ptr)
     {
         if (ptr != 0) CudaDriverApi.cuMemFree_v2(ptr);
+    }
+
+    /// <summary>
+    /// Computes and uploads the dense-YaRN ramped inverse frequencies for
+    /// <paramref name="config"/>, returning the device pointer and the companion mscale
+    /// multiplier. Returns <c>(0, 1.0f)</c> — the "no scaling" sentinel the RoPE kernels
+    /// treat as bit-identical to their pre-#366 behaviour — when the model has no dense
+    /// YaRN scaling.
+    /// </summary>
+    /// <remarks>
+    /// The ramp math is NOT reimplemented here: it comes from
+    /// <see cref="RoPE.ComputeYarnInverseFrequencies"/>, the same routine the CPU reference
+    /// path uses inside <c>RoPE.PrecomputeFrequencyTableYarn</c>, and the mscale convention
+    /// comes from <see cref="DotLLM.Core.PositionEncoding.RoPEConfig.ComputeYarnMscaleMultiplier"/>.
+    /// Both are shared with the CPU so the two backends cannot drift.
+    /// The allocation is appended to <paramref name="allocs"/> (the #383 ledger), so it is
+    /// released both by the mid-load failure unwind and by <see cref="Dispose"/>.
+    /// </remarks>
+    private static unsafe (nint InvFreqDevice, float Mscale) UploadDenseYarnInvFreq(
+        ModelConfig config, List<nint> allocs)
+    {
+        // MLA is excluded because it never consumes the kernels this buffer feeds — it runs
+        // a separate, table-driven RoPE path whose cos/sin tables CudaTransformerModel
+        // uploads itself. NOT because MLA's YaRN is already handled: that path calls the
+        // PLAIN RoPE.PrecomputeFrequencyTable (CudaTransformerModel.cs, EnsureMlaState),
+        // while the CPU MLA path calls RoPE.PrecomputeFrequencyTableYarn
+        // (TransformerModel.cs, the MlaConfig.RopeScalingFactor branch). CUDA MLA therefore
+        // has the SAME class of CPU/CUDA divergence #366 closes for the dense path, and it
+        // remains OPEN — tracked in issue #430. Wiring it here would be wrong (different
+        // kernels); it needs the MLA table build to switch routines.
+        if (config.MlaConfig is not null) return (0, 1.0f);
+        if (config.RoPEConfig is not DotLLM.Core.PositionEncoding.RoPEConfig rope) return (0, 1.0f);
+        if (!rope.IsDenseYarnActive) return (0, 1.0f);
+
+        // Same rope-width derivation as the CPU (TransformerModel, non-MLA branch) and as
+        // CudaTransformerModel's _ropeDim — these must agree or the kernel would index a
+        // differently-sized inverse-frequency vector.
+        int ropeDim = rope.DimensionCount != 0 ? rope.DimensionCount : config.HeadDim;
+        if (ropeDim == 0) ropeDim = config.HeadDim;
+        if (ropeDim <= 0 || ropeDim % 2 != 0) return (0, 1.0f);
+
+        int halfDim = ropeDim / 2;
+        float[] invFreq = new float[halfDim];
+        RoPE.ComputeYarnInverseFrequencies(
+            ropeDim, rope.Theta, rope.ScalingFactor, rope.OrigMaxSeqLen,
+            rope.BetaFast, rope.BetaSlow, invFreq);
+
+        // AllocAndUpload goes through cuMemcpyHtoD_v2 — the SYNCHRONOUS copy — so the
+        // `fixed` pin covers the whole transfer and the managed array is free to move
+        // again once the block exits. (An async copy here would be a use-after-unpin.)
+        long bytes = (long)halfDim * sizeof(float);
+        nint devPtr;
+        fixed (float* p = invFreq)
+            devPtr = AllocAndUpload((nint)p, bytes, allocs);
+
+        return (devPtr, rope.ComputeYarnMscaleMultiplier(config.Architecture));
     }
 
     /// <summary>Upload raw quantized weight bytes to GPU (no dequant). For decode quantized GEMV.</summary>
@@ -734,6 +858,22 @@ internal sealed class CudaWeights : IDisposable
         kernels.LaunchConvertF32ToF16(devF32, devF16, n, stream);
 
         return devF16;
+    }
+
+    /// <summary>
+    /// Upload a float[] to device as RAW F32 (no FP16 conversion) — for kernel parameters typed
+    /// <c>const float*</c>, e.g. the gpt-oss attention sinks (#365). The allocation is appended to
+    /// <paramref name="allocs"/> immediately after <c>cuMemAlloc_v2</c> (issue #383 ledger pattern)
+    /// so a failure of the copy, or of any later step in the load, still unwinds this buffer.
+    /// </summary>
+    private static unsafe nint UploadF32Vector(float[] values, List<nint> allocs)
+    {
+        long bytes = (long)values.Length * sizeof(float);
+        AllocOrThrowWithContext(bytes, "attention sinks upload", out nint devPtr);
+        allocs.Add(devPtr);
+        fixed (float* ptr = values)
+            MemcpyHtoDOrThrowWithContext(devPtr, (nint)ptr, bytes, "attention sinks upload");
+        return devPtr;
     }
 
     /// <summary>Upload optional float[] bias → FP16 on device. Returns 0 if bias is null.</summary>

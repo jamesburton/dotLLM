@@ -260,6 +260,7 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
     private readonly CudaWeights _weights;
     private readonly CudaForwardState _state;
     private readonly int _layerCount;       // layers resident on THIS device (window size)
+    private readonly int _firstLayer;       // global layer index this stage's local layer 0 maps to
     private readonly bool _isFinalStage;    // true ⇒ applies final norm + LM head, returns logits
     private readonly float _ropeTheta;
     private readonly int _ropeDim;
@@ -282,7 +283,7 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
     private CudaPipelineStage(
         ModelConfig config, CudaContext context, CudaStream stream, CudaCublasHandle cublas,
         CudaKernels kernels, CudaWeights weights, CudaForwardState state,
-        int layerCount, bool isFinalStage, float ropeTheta, int ropeDim, int ropeType)
+        int layerCount, int firstLayer, bool isFinalStage, float ropeTheta, int ropeDim, int ropeType)
     {
         _config = config;
         _context = context;
@@ -292,6 +293,7 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
         _weights = weights;
         _state = state;
         _layerCount = layerCount;
+        _firstLayer = firstLayer;
         _isFinalStage = isFinalStage;
         _ropeTheta = ropeTheta;
         _ropeDim = ropeDim;
@@ -340,7 +342,7 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
             int ropeType = CudaKernels.ToCudaRopeType(config.RoPEConfig?.Type ?? RoPEType.Norm);
 
             return new CudaPipelineStage(config, context, stream, cublas, kernels, weights, state,
-                layerCount, isFinalStage, ropeTheta, ropeDim, ropeType);
+                layerCount, firstLayer, isFinalStage, ropeTheta, ropeDim, ropeType);
         }
         catch
         {
@@ -438,7 +440,6 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
         int intermediateSize = _config.IntermediateSize;
         int vocabSize = _config.VocabSize;
         float eps = _config.NormEpsilon;
-        int slidingWindow = _config.SlidingWindowSize ?? 0;
         int h = sizeof(ushort); // FP16 element size
 
         nint s = _stream.Handle;
@@ -458,6 +459,15 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
             ref readonly var lw = ref _weights.Layers[local];
             int cacheLayer = local; // per-stage KV cache is 0-based over this stage's layers
 
+            // Per-layer window: gpt-oss alternates window/dense (pattern=2), Gemma-3 uses
+            // pattern=6; uniform-window and no-window models resolve identically to the old
+            // hoisted value. 0 = dense (kernel convention). Mirrors CPU GetLayerSlidingWindow.
+            // Weights/KV-cache are stage-local (windowed upload), but the pattern/per-layer
+            // resolution needs the GLOBAL layer index, so offset `local` by `_firstLayer`.
+            int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                _config.SlidingWindowSize, _config.SlidingWindowPattern,
+                _config.PerLayerSlidingWindow, _firstLayer + local);
+
             // ── ATTENTION BLOCK ──
             Project(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutput, _state.Q,
                 lw.QOutputDim, lw.QInputDim, seqLen, s, cublasH);
@@ -475,21 +485,30 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
             if (lw.KNormWeight != 0)
                 _kernels.LaunchPerHeadRmsNorm(_state.K, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
 
+            // Dense-YaRN scaling (#366) rides on the weights bundle; (0, 1.0f) when inactive.
             _kernels.LaunchRoPE(_state.Q, _state.K, _state.PositionsDevice,
-                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _ropeType, s);
+                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _ropeType, s,
+                _weights.RopeYarnInvFreqDevice, _weights.RopeYarnMscale);
 
             if (kvCache is not null)
             {
                 kvCache.UpdateDevice(_state.K, _state.V, positions, seqLen, cacheLayer, s);
                 int seqKv = kvCache.CurrentLength;
+                // lw.AttnSinksDevice (#365): 0 unless the GGUF carried `attn_sinks.weight`, so this
+                // is bit-identical for every model that has no sinks. Plumbed for the same reason
+                // as HybridTransformerModel's pair — sink loading is tensor-driven, not
+                // architecture-gated, so a future dense sinks model split across pipeline stages
+                // must not drop them silently.
                 _kernels.LaunchAttention(_state.Q, kvCache.GetKeysPtr(cacheLayer),
                     kvCache.GetValuesPtr(cacheLayer), _state.AttnOutput,
-                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], slidingWindow, s);
+                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], slidingWindow, s,
+                    lw.AttnSinksDevice);
             }
             else
             {
                 _kernels.LaunchAttention(_state.Q, _state.K, _state.V, _state.AttnOutput,
-                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s);
+                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s,
+                    lw.AttnSinksDevice);
             }
 
             Project(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutput, _state.NormOutput,
