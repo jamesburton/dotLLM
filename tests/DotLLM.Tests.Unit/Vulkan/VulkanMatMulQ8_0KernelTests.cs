@@ -110,13 +110,26 @@ public class VulkanMatMulQ8_0KernelTests
 
         // Round buffer size up to 4-byte multiple — the shader reads the weights
         // buffer as a uint array.
-        long weightsBufBytes = ((long)totalBytes + 3) & ~3L;
+        //
+        // Both inputs carry a poisoned tail (#471). Production scratch is sized for the largest
+        // shape, so a kernel that reads past K finds real data there, not the zeros robust buffer
+        // access returns past the end of an exact-size buffer. The poison makes an over-read show.
+        const int PoisonFloats = 1024;
+        const int PoisonBytes = 4096;
+        long weightsBufBytes = (((long)totalBytes + 3) & ~3L) + PoisonBytes;
         using var bufW = device.Allocate(weightsBufBytes);
-        using var bufX = device.Allocate((long)k * sizeof(float));
+        using var bufX = device.Allocate((long)(k + PoisonFloats) * sizeof(float));
         using var bufY = device.Allocate((long)m * sizeof(float));
 
-        device.Upload(new ReadOnlySpan<byte>(weightsQ8), bufW);
-        device.Upload(x, bufX);
+        byte[] wPadded = new byte[weightsBufBytes];
+        weightsQ8.CopyTo(wPadded, 0);
+        wPadded.AsSpan(totalBytes).Fill(0x5A);
+        float[] xPadded = new float[k + PoisonFloats];
+        x.CopyTo(xPadded, 0);
+        xPadded.AsSpan(k).Fill(1000f);
+
+        device.Upload(new ReadOnlySpan<byte>(wPadded), bufW);
+        device.Upload(xPadded, bufX);
 
         kernel.Launch(bufW, bufX, bufY, m, k);
 
