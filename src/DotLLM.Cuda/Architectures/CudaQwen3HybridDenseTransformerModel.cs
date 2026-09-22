@@ -144,6 +144,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// </summary>
     internal int DebugF16CacheCurrentLengthForTest => _f16CacheCurrentLength;
 
+    /// <summary>
+    /// Test-only counter (issue #478): full-range F16→F32 KV reconversions taken by
+    /// <see cref="ForwardFullAttnBody"/> (one per attention slot per forward that misses the
+    /// incremental #182 path). Lets a test prove a post-rollback append stays incremental.
+    /// </summary>
+    internal int DebugFullKvReconvertCountForTest { get; private set; }
+
     // Opt-in split-KV attention (issue #183) scratch: partial (max, sum, out) per (head, split).
     // Sized once for the model's fixed (numHeads, headDim) shape and reused every decode step.
     private nint _attnSplitKvPartialMax;
@@ -781,16 +788,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                     $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
         }
 
-        // The handle is length-only, but callers rely on its CurrentLength: speculative decoding
-        // rolls it back to a committed position after a rejected round. Nothing used to advance
-        // it, so Rollback(n > 0) always threw (surfaced by the MTP replay path on real hardware).
-        if (kvCache is CudaHybridKvCacheHandle handle)
-        {
-            int maxPos = 0;
-            for (int i = 0; i < positions.Length; i++)
-                if (positions[i] > maxPos) maxPos = positions[i];
-            handle.Advance(maxPos + 1);
-        }
+        AdvanceKvHandleAndSyncLengths(kvCache, positions);
 
         _context.MakeCurrent();
         _state.EnsureCapacity(seqLen);
@@ -833,6 +831,32 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.HiddenState,
             (nuint)((long)seqLen * hiddenSize * sizeof(float))).ThrowOnError();
         return result;
+    }
+
+    /// <summary>
+    /// Advances the length-only KV handle to cover <paramref name="positions"/> and, first, syncs the
+    /// model-owned KV lengths to the handle's committed length (issues #476, #478).
+    /// </summary>
+    /// <remarks>
+    /// The handle is length-only, but callers rely on its <c>CurrentLength</c>: speculative decoding
+    /// rolls it back to a committed position after a rejected round. Nothing used to advance it, so
+    /// <c>Rollback(n &gt; 0)</c> always threw (#476). Its length BEFORE this call is the committed
+    /// prefix; <see cref="_f16CacheCurrentLength"/> and every <see cref="_f32KvValidLength"/> slot
+    /// shrink to it, so post-rollback appends take the incremental #182 conversion instead of a
+    /// full-range reconversion (#478). Runs once per forward, before any attention layer reads them.
+    /// </remarks>
+    private void AdvanceKvHandleAndSyncLengths(IKvCache? kvCache, ReadOnlySpan<int> positions)
+    {
+        if (kvCache is not CudaHybridKvCacheHandle handle)
+            return;
+
+        _f16CacheCurrentLength = HybridKvLengthBookkeeping.SyncToCommitted(
+            _f16CacheCurrentLength, _f32KvValidLength ?? Span<int>.Empty, handle.CurrentLength);
+
+        int maxPos = 0;
+        for (int i = 0; i < positions.Length; i++)
+            if (positions[i] > maxPos) maxPos = positions[i];
+        handle.Advance(maxPos + 1);
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -1230,16 +1254,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                     $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
         }
 
-        // The handle is length-only, but callers rely on its CurrentLength: speculative decoding
-        // rolls it back to a committed position after a rejected round. Nothing used to advance
-        // it, so Rollback(n > 0) always threw (surfaced by the MTP replay path on real hardware).
-        if (kvCache is CudaHybridKvCacheHandle handle)
-        {
-            int maxPos = 0;
-            for (int i = 0; i < positions.Length; i++)
-                if (positions[i] > maxPos) maxPos = positions[i];
-            handle.Advance(maxPos + 1);
-        }
+        AdvanceKvHandleAndSyncLengths(kvCache, positions);
 
         // Category profiler bracket (issue #168): MakeCurrent + EnsureCapacity + H2D
         // token/position copy + host embed-lookup dequant + H2D embed copy. Confirmed via a
@@ -2151,7 +2166,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             // (that case cannot be told apart here from ordinary appends by length alone, but ANY
             // deviation from "starts exactly at the recorded valid length" -- including the
             // shrink case the position range would otherwise imply -- is treated as untrusted and
-            // triggers the safe full reconversion).
+            // triggers the safe full reconversion). Issue #478: a speculative-decoding rollback is
+            // NOT such a deviation any more -- AdvanceKvHandleAndSyncLengths shrinks this slot's
+            // valid length to the handle's committed length before the first layer runs, so the
+            // post-rollback append starts exactly at it and stays incremental.
             //
             // Result (issue #182, RTX 3060, real Bonsai-27B, single continuous decode sequence --
             // NOT `dotllm bench -r N>1`, which was found during this work to be unsuitable for
@@ -2175,8 +2193,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             // observed regression in any round (unlike this file's several genuine negative results,
             // which all showed consistent, large regressions from added sync overhead).
             int prevValid = _f32KvValidLength![slot];
-            bool contiguousAppend = !ForceFullKvReconvertForTest
-                && IsContiguousAscendingRun(positions) && positions[0] == prevValid;
+            bool contiguousAppend = HybridKvLengthBookkeeping.IsIncrementalAppend(
+                positions, prevValid, ForceFullKvReconvertForTest);
 
             if (contiguousAppend)
             {
@@ -2199,6 +2217,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 _kernels.LaunchConvertF16ToF32(_f16KCache![slot], kStage, kvLiveElems, streamH);
                 _kernels.LaunchConvertF16ToF32(_f16VCache![slot], vStage, kvLiveElems, streamH);
                 _f32KvValidLength[slot] = seqKv;
+                DebugFullKvReconvertCountForTest++;
             }
             ProfMark("attn-6b-kvdequant");
 
@@ -2459,15 +2478,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _f32KvValidLength![slot] = 0;
     }
 
-    /// <summary>True if <paramref name="positions"/> is a strictly-ascending run of consecutive
-    /// integers (e.g. <c>[5]</c>, <c>[5,6,7]</c>). Used to gate the incremental KV F16->F32
-    /// staging fast path -- see the call site in <c>ForwardFullAttnBody</c>.</summary>
-    private static bool IsContiguousAscendingRun(ReadOnlySpan<int> positions)
-    {
-        for (int i = 1; i < positions.Length; i++)
-            if (positions[i] != positions[i - 1] + 1) return false;
-        return true;
-    }
 
     /// <summary>
     /// Ensures the opt-in split-KV attention (issue #183) partial scratch buffers can hold
@@ -2545,14 +2555,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         int totalElems = seqLen * kvElems;
 
         bool contiguous = seqLen > 0;
-        int maxPos = positions[0];
         for (int i = 0; i < seqLen; i++)
         {
             int p = positions[i];
             if ((uint)p >= (uint)_f16CacheMaxSeqLen)
                 throw new ArgumentOutOfRangeException(nameof(positions),
                     $"Position {p} at index {i} exceeds F16 KV cache capacity {_f16CacheMaxSeqLen}.");
-            if (p > maxPos) maxPos = p;
             if (i > 0 && positions[i] != positions[i - 1] + 1) contiguous = false;
         }
 
@@ -2595,9 +2603,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             }
         }
 
-        int newLength = maxPos + 1;
-        if (newLength > _f16CacheCurrentLength)
-            _f16CacheCurrentLength = newLength;
+        _f16CacheCurrentLength = HybridKvLengthBookkeeping.LengthAfterWrite(_f16CacheCurrentLength, positions);
     }
 
     // ──────────────────────────────────────────────────────────────────────
