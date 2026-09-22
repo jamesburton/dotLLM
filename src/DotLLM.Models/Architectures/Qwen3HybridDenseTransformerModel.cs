@@ -461,6 +461,10 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 nameof(gdnState));
         }
 
+        // Mirrors Forward: advancing the model-owned state invalidates row snapshots (issue #473).
+        if (ReferenceEquals(gdnCache, _gdnCache))
+            _rowSnapshotValidRows = 0;
+
         int vocabSize = Config.VocabSize;
         int intermediateSize = Config.IntermediateSize;
         int numHeads = Config.NumAttentionHeads;
@@ -1197,7 +1201,11 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     /// caller-supplied <see cref="IGdnState"/>. Callers that treat each forward as an independent
     /// sequence (perplexity windows) must call this between sequences — see issue #261.
     /// </remarks>
-    public void ResetSequenceState() => _gdnCache.Reset();
+    public void ResetSequenceState()
+    {
+        _gdnCache.Reset();
+        _rowSnapshotValidRows = 0;   // issue #473: snapshots no longer describe the state
+    }
 
     /// <inheritdoc/>
     public bool RequiresPerSequenceState => true;
@@ -1266,6 +1274,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
                 nameof(checkpoint)),
         };
         snapshot?.CopyTo(_gdnCache);
+        if (snapshot is not null)
+            _rowSnapshotValidRows = 0;   // issue #473
     }
 
     // ── Per-row recurrent snapshots (issue #473) ─────────────────────────────

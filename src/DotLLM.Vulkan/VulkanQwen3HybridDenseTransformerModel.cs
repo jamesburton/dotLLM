@@ -739,7 +739,11 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     /// each forward as an independent sequence (perplexity windows) must call this
     /// between sequences — see issue #261.
     /// </remarks>
-    public void ResetSequenceState() => _gdnCache.Reset();
+    public void ResetSequenceState()
+    {
+        _gdnCache.Reset();
+        _rowSnapshotValidRows = 0;   // issue #473: snapshots no longer describe the state
+    }
 
     /// <inheritdoc/>
     public bool RequiresPerSequenceState => true;
@@ -1234,9 +1238,11 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
                 return;
             case PooledGdnCheckpoint pooled:
                 pooled.Snapshot.CopyTo(_gdnCache);
+                _rowSnapshotValidRows = 0;   // issue #473
                 return;
             case VulkanGdnStateCache snapshot:
                 snapshot.CopyTo(_gdnCache);
+                _rowSnapshotValidRows = 0;   // issue #473
                 return;
             default:
                 throw new ArgumentException(
@@ -1365,7 +1371,12 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             _rowSnapConv[l] = _device.AllocateDeviceLocal(Math.Max(convBytes, 4));
         }
         _rowSnapCapacity = rows;
-        // Freed handles can be recycled into the new buffers; no command buffer is open here.
+        // Freed handles can be recycled into the new buffers (or into any kernel's later
+        // allocations) — invalidate every cache, as EnsureMultiRowLogits does. No command buffer
+        // is open here.
+        _kernels.InvalidateAll();
+        _hadamard?.InvalidateDescriptorCache();
+        _embedGather?.InvalidateDescriptorCache();
         _gdnSnapScan?.InvalidateDescriptorCache();
     }
 

@@ -314,17 +314,14 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
     /// had to fall back to an all-full-attention trunk.
     /// </para>
     /// <para>
-    /// <b>What this does NOT cover, measured rather than assumed.</b> It was written expecting to
-    /// pin the recurrent checkpoint/restore pair, on the reasoning that a rejected draft advances
-    /// the GDN recurrence irreversibly. An assertion added to check that produced the
-    /// emitted-per-round histogram <c>[1,1,1,1,1,1,1,1,1,1]</c>: the MTP head and the trunk are
-    /// independently random on a synthetic fixture, so the head agrees with the trunk's argmax at
-    /// chance (1 in 12 here) and essentially every round is rejected at draft position 0 — BEFORE
-    /// the verify batch runs, so nothing ever touches the GDN state. No token budget fixes that.
-    /// This test therefore covers greedy equivalence and the position-0 reject/correction path;
-    /// the checkpoint pair is covered by
-    /// <see cref="CheckpointRestoreRecurrentState_RestoresGdnStateExactly"/> instead, which is
-    /// deterministic and does not depend on a random model agreeing with itself.
+    /// <b>What this covers.</b> The emitted-per-round histogram is <c>[1,1,1,1,1,1,1,1,1,1]</c>:
+    /// the MTP head and the trunk are independently random on a synthetic fixture, so the head
+    /// agrees with the trunk's argmax at chance (1 in 12 here) and nearly every round rejects
+    /// draft 1. Since #469 the verify batch runs every round regardless, so each round rolls the
+    /// GDN state back to row 0 — through the #473 row snapshot by default. Rollback to rows 1 and
+    /// up needs scripted drafts: see
+    /// <see cref="DraftAndVerify_ScriptedPartialRejections_SnapshotsMatchGreedyAndReplay"/>. The
+    /// checkpoint pair is covered by <see cref="CheckpointRestoreRecurrentState_RestoresGdnStateExactly"/>.
     /// </para>
     /// </remarks>
     [SkippableFact]
@@ -344,15 +341,12 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
         Assert.True(run.Drafted > 0, "The decoder must actually have drafted something.");
         Assert.True(run.Emitted > 0, "Every round emits at least the corrected/bonus token.");
 
-        // Measured, not assumed: on this fixture the emitted-per-round histogram comes back
-        // [1,1,1,...] — the MTP head and the trunk are independently random, so the head's guess
-        // agrees with the trunk's argmax at chance (1/12), and essentially every round is rejected
-        // at draft position 0, BEFORE the verify batch runs. That means this test cannot reach
-        // RestoreRecurrentState no matter how the token budget is tuned, and it would be dishonest
-        // to claim it covers the checkpoint pair. It does not; it covers greedy equivalence and the
-        // reject/correction path. The checkpoint pair has its own deterministic test below —
-        // CheckpointRestoreRecurrentState_RestoresGdnStateExactly — which does not depend on a
-        // random model happening to agree with itself.
+        // On this fixture the emitted-per-round histogram comes back [1,1,1,...]: the random MTP
+        // head agrees with the trunk at chance (1/12), so nearly every round rejects draft 1.
+        // Since #469 the verify batch still runs every round, so each of those rounds rolls the
+        // GDN state back to row 0 (via the #473 row snapshot by default). Rollback to rows >= 1
+        // is covered by DraftAndVerify_ScriptedPartialRejections_SnapshotsMatchGreedyAndReplay,
+        // and the checkpoint pair by CheckpointRestoreRecurrentState_RestoresGdnStateExactly.
         _out.WriteLine($"emitted-per-round histogram: [{string.Join(",", run.EmittedPerRound)}]  " +
                        $"(K={K}, drafted={run.Drafted}, emitted={run.Emitted}, " +
                        $"post-verify rejections={run.PartialRejectionRounds})");
