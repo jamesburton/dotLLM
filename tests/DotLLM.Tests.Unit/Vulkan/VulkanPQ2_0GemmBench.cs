@@ -504,6 +504,103 @@ public sealed class VulkanPQ2_0GemmBench
         }
     }
 
+    /// <summary>
+    /// Issue #474 — every compiled <c>matmul_pq2_0_f32_gemv_mr_r{R}_c{C}_b{B}_w{W}.spv</c> variant
+    /// against the shipping dispatch for the same column count (<c>Record</c> at n = 1,
+    /// <c>RecordColumns</c> above), same session, arm order rotated every pass, medians.
+    /// </summary>
+    /// <remarks>
+    /// Enable with <c>DOTLLM_PQ2_0_GEMM_BENCH=1</c>. <c>DOTLLM_PQ2_0_MR_FILTER</c> is a comma list
+    /// of substrings a variant name must contain one of; <c>DOTLLM_PQ2_0_CROSSOVER_N</c> the column
+    /// ladder. A variant runs at n when its compiled capacity C is n (exact width) or, with
+    /// <c>DOTLLM_PQ2_0_MR_ALLOW_WIDER=1</c>, any C &gt;= n.
+    /// </remarks>
+    [SkippableFact]
+    public void Bench_PQ2_0MultiRowGemv()
+    {
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_GEMM_BENCH"), "1", StringComparison.Ordinal),
+            "DOTLLM_PQ2_0_GEMM_BENCH=1 to enable this benchmark.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        PinToPCores();
+        int batch = EnvInt("DOTLLM_PQ2_0_GEMM_BENCH_BATCH", 8);
+        int[] ns = (ParseNs(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_CROSSOVER_N")) ?? [1, 2, 4, 8])
+            .Where(n => n <= MatMulPQ2_0GemvF32Kernel.MaxColumns).ToArray();
+        var shapes = ParseShapes(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_GEMM_BENCH_SHAPES")) ?? DefaultShapes;
+        string[] filter = (Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_MR_FILTER") ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        bool allowWider = Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_MR_ALLOW_WIDER") == "1";
+
+        using var device = VulkanDevice.Create();
+        using var gemv = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
+        gemv.MultiRowOverride = false;                  // "current" = the #470 kernels
+        var variants = VulkanMatMulPQ2_0GemvF32KernelTests.EnumerateMultiRowVariants(spvDir)
+            .Where(v => filter.Length == 0 || filter.Any(f => v.Spv.Contains(f, StringComparison.Ordinal)))
+            .Select(v => PQ2_0GemvMultiRowPipeline.Create(device, spvDir, v.Spv, v.Rows, v.Cols))
+            .ToList();
+        try
+        {
+            _output.WriteLine($"Device: {device.DeviceName}  SubgroupSize: {device.SubgroupSize}  variants: {variants.Count}");
+            _output.WriteLine($"batch={batch}  schedule: {WarmupPasses} warmup + {Passes} passes, order rotated every pass (medians)");
+
+            foreach (var (tag, m, k) in shapes)
+            {
+                long wBytes = (long)m * (k / GroupSize) * GroupBytes;
+                int maxN = ns.Max();
+                using var bufW = device.Allocate((wBytes + 3) & ~3L);
+                using var bufB = device.Allocate((long)maxN * k * sizeof(float));
+                using var bufC = device.Allocate((long)maxN * m * sizeof(float));
+
+                var rng = new Random(0x2A_74);
+                byte[] w = new byte[wBytes];
+                rng.NextBytes(w);
+                float[] b = new float[(long)maxN * k];
+                for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
+                device.Upload(new ReadOnlySpan<byte>(w), bufW);
+                device.Upload(b, bufB);
+
+                foreach (int n in ns)
+                {
+                    var eligible = variants.Where(v => v.Columns == n || (allowWider && v.Columns > n)).ToList();
+                    var labels = new List<string> { n == 1 ? "#470 Record" : "#470 RecordColumns" };
+                    var arms = new List<Func<double>>
+                    {
+                        () => Time(device, batch, cb => gemv.RecordColumns(cb, bufW, bufB, bufC, m, k, n)),
+                    };
+                    foreach (var v in eligible)
+                    {
+                        labels.Add(v.SpvFileName.Replace("matmul_pq2_0_f32_gemv_mr_", "").Replace(".spv", ""));
+                        arms.Add(() => Time(device, batch, cb => v.Record(cb, bufW, bufB, bufC, m, k, n, 0, 0)));
+                    }
+
+                    for (int i = 0; i < WarmupPasses; i++)
+                        foreach (var arm in arms) arm();
+                    var us = new double[arms.Count][];
+                    for (int a = 0; a < arms.Count; a++) us[a] = new double[Passes];
+                    for (int p = 0; p < Passes; p++)
+                        for (int j = 0; j < arms.Count; j++)
+                        {
+                            int a = (p + j) % arms.Count;
+                            us[a][p] = arms[a]();
+                        }
+                    double[] med = us.Select(v => { Array.Sort(v); return v[Passes / 2]; }).ToArray();
+
+                    _output.WriteLine("");
+                    _output.WriteLine($"### {tag}  n={n}");
+                    _output.WriteLine("| arm | µs | vs current | weight GB/s |");
+                    _output.WriteLine("|---|---:|---:|---:|");
+                    var order = Enumerable.Range(0, arms.Count).OrderBy(i => i == 0 ? double.MinValue : med[i]);
+                    foreach (int i in order)
+                        _output.WriteLine($"| {labels[i]} | {med[i]:F1} | {med[i] / med[0]:F3}x | {wBytes / (med[i] * 1e3):F1} |");
+                }
+            }
+        }
+        finally
+        {
+            foreach (var v in variants) v.Dispose();
+        }
+    }
+
     private static double Time(VulkanDevice device, int batch, Action<nint> record)
     {
         using var ctx = device.CreateSubmitContext();
