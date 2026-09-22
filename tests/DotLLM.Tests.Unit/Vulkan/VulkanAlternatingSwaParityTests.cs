@@ -36,8 +36,8 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// the stage-local index there flips every layer's windowed/dense role).
 /// </para>
 /// <para>
-/// <b>Tolerance / mutant evidence</b> (Strix Halo gfx1151, 2026-09-22; F32 weights on both
-/// sides): see <see cref="AbsTol"/>.
+/// <b>Tolerance / mutant evidence</b> (Strix Halo gfx1151, 2026-09-22): see the comment on
+/// <c>AbsTol</c>.
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
@@ -60,7 +60,12 @@ public sealed unsafe class VulkanAlternatingSwaParityTests
     private const int SlidingWindowSize = 8;
     private const int SlidingWindowPattern = 2;
 
-    // Calibrated on this fixture (see class remarks and the report on #480).
+    // Calibrated on this fixture (Strix Halo gfx1151, 2026-09-22). Fixed code: max |diff| vs the CPU
+    // oracle = 1.016e-4 (prefill, pipeline, batch[0]), 9.41e-5 (decode), 5.72e-5 (batch[1]).
+    // Mutant A, the pre-#480 behaviour (GetLayerSlidingWindow passing pattern 0 = window on every
+    // layer): 8.027e-3 on all four GPU tests (CPU-side mask delta 7.972e-3). Mutant B, stage-local
+    // index instead of _firstLayer + layer: only the split-at-layer-1 pipeline test fails, 1.056e-2.
+    // With logits ~0.1-0.2 the bar is ~7-9e-4: ~7x above the pass floor, ~9x below both mutants.
     private const float AbsTol = 5e-4f;
     private const float RelTol = 2e-3f;
 
@@ -328,6 +333,7 @@ public sealed unsafe class VulkanAlternatingSwaParityTests
                     downWeight: downW, downQuantType: QuantizationType.F32, downOutputDim: HiddenSize, downInputDim: IntermediateSize);
             }
 
+            Weights?.Dispose();
             Weights = TransformerWeights.CreateFromSafetensors(
                 tokenEmbedWeight: tokenEmbed, tokenEmbedQt: QuantizationType.F32,
                 vocabSize: VocabSize, hiddenSize: HiddenSize,
