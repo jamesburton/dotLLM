@@ -94,7 +94,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         int[] kvSlotForLayer, int attentionLayerCount,
         float[] ropeCosTable, float[] ropeSinTable, int ropeDim,
         ComputeThreadPool? threadPool, bool ownsPool,
-        MtpHeadWeights? mtpHead = null)
+        MtpHeadWeights? mtpHead = null,
+        int hadamardFirstLayer = 0, int hadamardFullLayerCount = 0)
     {
         Config = config;
         _gguf = gguf;
@@ -147,7 +148,16 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             // Cheap insurance for the fixed-site rotation strategy: if a checkpoint ever folds a
             // different set of weights than the sites below cover, fail here rather than generate
             // fluent text in the wrong basis.
-            _hadamard.ValidateQwen35FoldSet(config.NumLayers, _gdn.FullAttnInterval);
+            //
+            // A partial-offload tail (LoadTailFromGguf) is a sliced instance: its config.NumLayers
+            // is the slice, local block i is GLOBAL block hadamardFirstLayer + i, and the
+            // declaration still names every block of the full trunk. It therefore validates the
+            // blocks it owns (plus the lm_head it runs) against the full declaration (#481) —
+            // the GPU head does the same for its prefix, and both refuse any declared name that
+            // no block of the whole model rotates.
+            int fullLayerCount = hadamardFullLayerCount > 0 ? hadamardFullLayerCount : config.NumLayers;
+            _hadamard.ValidateQwen35FoldSet(fullLayerCount, _gdn.FullAttnInterval,
+                ownedFirstLayer: hadamardFirstLayer, ownedLayerCount: config.NumLayers, ownsLmHead: true);
         }
     }
 
@@ -399,7 +409,8 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             kvSlotForLayer, attentionLayerCount,
             ropeCos, ropeSin, ropeDim,
             pool, ownsPool: pool is not null,
-            mtpHead: null);
+            mtpHead: null,
+            hadamardFirstLayer: startLayer, hadamardFullLayerCount: fullConfig.NumLayers);
     }
 
     /// <summary>

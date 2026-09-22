@@ -44,9 +44,16 @@ internal static class SyntheticHadamardFold
     /// <c>nextn.shared_head_head</c>, so the head falls back to the trunk's Hadamard-latent
     /// embedding and folded lm_head — the two MTP fold sites.
     /// </summary>
-    internal static string WriteFixture(string path, bool withMtp = true) =>
+    /// <param name="path">Destination file.</param>
+    /// <param name="withMtp">Append the MTP block.</param>
+    /// <param name="blockCount">
+    /// Trunk depth (default 2). The CPU/GPU split tests (#481) pass 4 so a split boundary can put a
+    /// GDN and an attention block on each side.
+    /// </param>
+    internal static string WriteFixture(string path, bool withMtp = true,
+        int blockCount = SyntheticQwen35HybridDenseMtpGguf.BlockCount) =>
         SyntheticQwen35HybridDenseMtpGguf.Write(
-            path, withMtp: withMtp, mtpHasOwnHeadTensors: false,
+            path, withMtp: withMtp, mtpHasOwnHeadTensors: false, blockCount: blockCount,
             gdnKeyHeads: GdnKeyHeads, gdnValueHeads: GdnValueHeads);
 
     /// <summary>

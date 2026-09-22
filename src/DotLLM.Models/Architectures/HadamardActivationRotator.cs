@@ -147,51 +147,65 @@ public sealed class HadamardActivationRotator
     /// <c>ssm_alpha</c>, or stops folding <c>output.weight</c>), this throws instead of quietly
     /// generating text in the wrong basis.
     /// </para>
+    /// <para>
+    /// <b>Partial-offload splits (issue #481).</b> A CPU/GPU split loads each half as its own model
+    /// instance, and each half rotates only the blocks it owns. Such a half passes its GLOBAL owned
+    /// layer range (<paramref name="ownedFirstLayer"/>, <paramref name="ownedLayerCount"/>) and whether
+    /// it runs the lm_head (<paramref name="ownsLmHead"/>). Two checks then run against different sets:
+    /// every declared name must be one the WHOLE model rotates (so a declaration neither half covers,
+    /// e.g. a folded MTP block or a folded <c>ssm_alpha</c>, is still refused by both halves), and
+    /// every name THIS instance rotates must be declared. The defaults describe a whole-model
+    /// instance, for which the two checks together are exact set equality.
+    /// </para>
     /// </remarks>
-    /// <param name="layerCount">Number of transformer blocks.</param>
+    /// <param name="layerCount">
+    /// Number of transformer blocks in the FULL trunk (not a partial-offload half's slice): the
+    /// checkpoint's declaration covers every block.
+    /// </param>
     /// <param name="fullAttentionInterval">
-    /// <c>qwen35.full_attention_interval</c>: block <c>i</c> (1-indexed) is full GQA attention when
-    /// <c>i % interval == 0</c>, and Gated DeltaNet otherwise.
+    /// <c>qwen35.full_attention_interval</c>: block <c>i</c> (1-indexed, GLOBAL) is full GQA attention
+    /// when <c>i % interval == 0</c>, and Gated DeltaNet otherwise.
+    /// </param>
+    /// <param name="ownedFirstLayer">First GLOBAL block index this instance rotates (0 for a whole model).</param>
+    /// <param name="ownedLayerCount">
+    /// Number of blocks this instance rotates, starting at <paramref name="ownedFirstLayer"/>; negative
+    /// (the default) means through the end of the trunk.
+    /// </param>
+    /// <param name="ownsLmHead">
+    /// Whether this instance runs the folded lm_head (<c>output.weight</c>). False for the GPU head of
+    /// a split, which stops at the boundary hidden state.
     /// </param>
     /// <exception cref="NotSupportedException">The declared fold set differs from the implemented one.</exception>
-    public void ValidateQwen35FoldSet(int layerCount, int fullAttentionInterval)
+    public void ValidateQwen35FoldSet(int layerCount, int fullAttentionInterval,
+        int ownedFirstLayer = 0, int ownedLayerCount = -1, bool ownsLmHead = true)
     {
-        var expected = new HashSet<string>(StringComparer.Ordinal) { "output.weight" };
+        if (ownedLayerCount < 0)
+            ownedLayerCount = layerCount - ownedFirstLayer;
+        if (ownedFirstLayer < 0 || ownedLayerCount < 0 || ownedFirstLayer + ownedLayerCount > layerCount)
+            throw new ArgumentOutOfRangeException(nameof(ownedFirstLayer),
+                $"Owned block range [{ownedFirstLayer}, {ownedFirstLayer + ownedLayerCount}) is outside the " +
+                $"{layerCount}-block trunk.");
 
-        for (int layer = 0; layer < layerCount; layer++)
-        {
-            string prefix = $"blk.{layer}";
-            bool fullAttention = fullAttentionInterval > 0 && (layer + 1) % fullAttentionInterval == 0;
-
-            if (fullAttention)
-            {
-                expected.Add($"{prefix}.attn_q.weight");
-                expected.Add($"{prefix}.attn_k.weight");
-                expected.Add($"{prefix}.attn_v.weight");
-                expected.Add($"{prefix}.attn_output.weight");
-            }
-            else
-            {
-                expected.Add($"{prefix}.attn_qkv.weight");
-                expected.Add($"{prefix}.attn_gate.weight");
-                expected.Add($"{prefix}.ssm_out.weight");
-            }
-
-            expected.Add($"{prefix}.ffn_gate.weight");
-            expected.Add($"{prefix}.ffn_up.weight");
-            expected.Add($"{prefix}.ffn_down.weight");
-        }
+        // What the whole model rotates: anything declared outside this set is rotated by nobody.
+        var expected = Qwen35FoldedNames(0, layerCount, fullAttentionInterval, includeLmHead: true);
+        // What this instance rotates: every one of these must be declared.
+        var owned = Qwen35FoldedNames(ownedFirstLayer, ownedFirstLayer + ownedLayerCount,
+            fullAttentionInterval, ownsLmHead);
 
         var declared = _fold.FoldedWeights;
 
-        var missing = expected.Where(n => !declared.Contains(n)).Order(StringComparer.Ordinal).Take(5).ToArray();
+        var missing = owned.Where(n => !declared.Contains(n)).Order(StringComparer.Ordinal).Take(5).ToArray();
         var extra = declared.Where(n => !expected.Contains(n)).Order(StringComparer.Ordinal).Take(5).ToArray();
 
         if (missing.Length > 0 || extra.Length > 0)
         {
             throw new NotSupportedException(
                 "prism.hadamard.weight_names does not match the set this build rotates. " +
-                $"Declared {declared.Count}, implemented {expected.Count}. " +
+                $"Declared {declared.Count}, implemented {expected.Count}" +
+                (owned.Count != expected.Count
+                    ? $" (this instance owns blocks [{ownedFirstLayer}, {ownedFirstLayer + ownedLayerCount})" +
+                      $"{(ownsLmHead ? " + lm_head" : "")}: {owned.Count})"
+                    : "") + ". " +
                 (missing.Length > 0 ? $"Rotated by us but not declared: {string.Join(", ", missing)}. " : "") +
                 (extra.Length > 0 ? $"Declared but not rotated by us: {string.Join(", ", extra)}. " : "") +
                 "Refusing to load — running with a mismatched fold set produces fluent garbage.");
@@ -206,6 +220,44 @@ public sealed class HadamardActivationRotator
             throw new NotSupportedException(
                 $"prism.hadamard.inverse_weight_names contains unsupported entries: " +
                 $"{string.Join(", ", unexpectedInverse)}. Only token_embd.weight is un-rotated after lookup.");
+    }
+
+    /// <summary>
+    /// The folded weight names the <c>qwen35</c> forward pass rotates for GLOBAL blocks
+    /// <c>[firstLayer, endLayer)</c>, plus <c>output.weight</c> when <paramref name="includeLmHead"/>.
+    /// </summary>
+    private static HashSet<string> Qwen35FoldedNames(int firstLayer, int endLayer, int fullAttentionInterval,
+        bool includeLmHead)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        if (includeLmHead)
+            names.Add("output.weight");
+
+        for (int layer = firstLayer; layer < endLayer; layer++)
+        {
+            string prefix = $"blk.{layer}";
+            bool fullAttention = fullAttentionInterval > 0 && (layer + 1) % fullAttentionInterval == 0;
+
+            if (fullAttention)
+            {
+                names.Add($"{prefix}.attn_q.weight");
+                names.Add($"{prefix}.attn_k.weight");
+                names.Add($"{prefix}.attn_v.weight");
+                names.Add($"{prefix}.attn_output.weight");
+            }
+            else
+            {
+                names.Add($"{prefix}.attn_qkv.weight");
+                names.Add($"{prefix}.attn_gate.weight");
+                names.Add($"{prefix}.ssm_out.weight");
+            }
+
+            names.Add($"{prefix}.ffn_gate.weight");
+            names.Add($"{prefix}.ffn_up.weight");
+            names.Add($"{prefix}.ffn_down.weight");
+        }
+
+        return names;
     }
 
     private static bool IsSsmOut(string tensorName) =>
