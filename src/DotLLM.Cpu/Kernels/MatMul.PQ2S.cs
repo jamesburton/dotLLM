@@ -70,6 +70,7 @@ public static unsafe partial class MatMul
     {
         public byte* Weights;
         public byte* XQ8;   // quantized activations (Q8_0), one token
+        public float* XScales; // XQ8's block scales, pre-converted to float (issue #477)
         public float* Result;
         public int M;
         public int K;
@@ -79,6 +80,7 @@ public static unsafe partial class MatMul
     {
         public byte* Weights;
         public byte* BQ8;   // quantized activations (Q8_0), N tokens contiguous
+        public float* BScales; // BQ8's block scales as float, [N, K/32] (issue #477)
         public float* C;
         public int M;
         public int K;
@@ -325,25 +327,29 @@ public static unsafe partial class MatMul
         int xQ8Bytes = blockCount * Q8_0BlockBytes;
 
         byte[] xQ8Buf = ArrayPool<byte>.Shared.Rent(xQ8Bytes);
+        float[] xScaleBuf = ArrayPool<float>.Shared.Rent(blockCount);
         try
         {
             fixed (byte* xQ8 = xQ8Buf)
+            fixed (float* xScales = xScaleBuf)
             {
                 QuantizeF32ToQ8_0(x, xQ8, k);
+                ConvertQ8_0Scales(xQ8, xScales, blockCount);
 
                 if (threadPool is null || m < ParallelMinRows)
                 {
-                    GemvPQ2_0W2A8Rows(weights, xQ8, result, 0, m, k);
+                    GemvPQ2_0W2A8Rows(weights, xQ8, xScales, result, 0, m, k);
                     return;
                 }
 
-                var ctx = new GemvPQ2SQ8Ctx { Weights = weights, XQ8 = xQ8, Result = result, M = m, K = k };
+                var ctx = new GemvPQ2SQ8Ctx { Weights = weights, XQ8 = xQ8, XScales = xScales, Result = result, M = m, K = k };
                 threadPool.Dispatch((nint)(&ctx), &GemvPQ2_0W2A8Worker);
             }
         }
         finally
         {
             ArrayPool<byte>.Shared.Return(xQ8Buf);
+            ArrayPool<float>.Shared.Return(xScaleBuf);
         }
     }
 
@@ -353,13 +359,13 @@ public static unsafe partial class MatMul
         ref var ctx = ref Unsafe.AsRef<GemvPQ2SQ8Ctx>((void*)ctxPtr);
         PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
         if (count == 0) return;
-        GemvPQ2_0W2A8Rows(ctx.Weights, ctx.XQ8, ctx.Result, start, count, ctx.K);
+        GemvPQ2_0W2A8Rows(ctx.Weights, ctx.XQ8, ctx.XScales, ctx.Result, start, count, ctx.K);
     }
 
     /// <summary>Computes <paramref name="rowCount"/> output rows (W2A8) starting at <paramref name="startRow"/>.</summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void GemvPQ2_0W2A8Rows(byte* weights, byte* xQ8, float* result,
+    private static void GemvPQ2_0W2A8Rows(byte* weights, byte* xQ8, float* xScales, float* result,
                                           int startRow, int rowCount, int k)
     {
         int rowBytes = (k / PQ2_0GroupSize) * PQ2_0GroupBytes;
@@ -376,7 +382,7 @@ public static unsafe partial class MatMul
                 for (int r = startRow; r < startRow + rowCount; r++)
                 {
                     UnpackPQ2_0RowI8(weights + (long)r * rowBytes, wI8, groupScales, k);
-                    result[r] = VecDotPQ2_0Q8(wI8, groupScales, xQ8, blockCount);
+                    result[r] = VecDotPQ2_0Q8(wI8, groupScales, xQ8, xScales, blockCount);
                 }
             }
         }
@@ -419,26 +425,30 @@ public static unsafe partial class MatMul
         long bQ8Bytes = (long)n * q8RowBytes;
 
         byte[] bQ8Buf = ArrayPool<byte>.Shared.Rent(checked((int)bQ8Bytes));
+        float[] bScaleBuf = ArrayPool<float>.Shared.Rent(checked(n * blockCount));
         try
         {
             fixed (byte* bQ8 = bQ8Buf)
+            fixed (float* bScales = bScaleBuf)
             {
                 for (int t = 0; t < n; t++)
                     QuantizeF32ToQ8_0(b + (long)t * k, bQ8 + (long)t * q8RowBytes, k);
+                ConvertQ8_0Scales(bQ8, bScales, n * blockCount);
 
                 if (threadPool is null || m < ParallelMinRows)
                 {
-                    GemmPQ2_0W2A8Rows(weights, bQ8, c, m, 0, m, k, n);
+                    GemmPQ2_0W2A8Rows(weights, bQ8, bScales, c, m, 0, m, k, n);
                     return;
                 }
 
-                var ctx = new GemmPQ2SQ8Ctx { Weights = weights, BQ8 = bQ8, C = c, M = m, K = k, N = n };
+                var ctx = new GemmPQ2SQ8Ctx { Weights = weights, BQ8 = bQ8, BScales = bScales, C = c, M = m, K = k, N = n };
                 threadPool.Dispatch((nint)(&ctx), &GemmPQ2_0W2A8Worker);
             }
         }
         finally
         {
             ArrayPool<byte>.Shared.Return(bQ8Buf);
+            ArrayPool<float>.Shared.Return(bScaleBuf);
         }
     }
 
@@ -448,7 +458,7 @@ public static unsafe partial class MatMul
         ref var ctx = ref Unsafe.AsRef<GemmPQ2SQ8Ctx>((void*)ctxPtr);
         PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
         if (count == 0) return;
-        GemmPQ2_0W2A8Rows(ctx.Weights, ctx.BQ8, ctx.C, ctx.M, start, count, ctx.K, ctx.N);
+        GemmPQ2_0W2A8Rows(ctx.Weights, ctx.BQ8, ctx.BScales, ctx.C, ctx.M, start, count, ctx.K, ctx.N);
     }
 
     /// <summary>
@@ -458,7 +468,7 @@ public static unsafe partial class MatMul
     /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void GemmPQ2_0W2A8Rows(byte* weights, byte* bQ8, float* c, int m,
+    private static void GemmPQ2_0W2A8Rows(byte* weights, byte* bQ8, float* bScales, float* c, int m,
                                           int startRow, int rowCount, int k, int n)
     {
         int rowBytes = (k / PQ2_0GroupSize) * PQ2_0GroupBytes;
@@ -479,7 +489,7 @@ public static unsafe partial class MatMul
                     for (int t = 0; t < n; t++)
                     {
                         byte* xQ8 = bQ8 + (long)t * q8RowBytes;
-                        c[(long)t * m + r] = VecDotPQ2_0Q8(wI8, groupScales, xQ8, blockCount);
+                        c[(long)t * m + r] = VecDotPQ2_0Q8(wI8, groupScales, xQ8, bScales + (long)t * blockCount, blockCount);
                     }
                 }
             }
@@ -513,15 +523,15 @@ public static unsafe partial class MatMul
     /// the sign trick (see <c>MatMul.I2S.cs</c>'s class summary for the derivation).</para>
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static float VecDotPQ2_0Q8(sbyte* wI8, float* groupScales, byte* xQ8, int blockCount)
+    private static float VecDotPQ2_0Q8(sbyte* wI8, float* groupScales, byte* xQ8, float* xScales, int blockCount)
         => Avx2.IsSupported
-            ? VecDotPQ2_0Q8Avx2(wI8, groupScales, xQ8, blockCount)
-            : VecDotPQ2_0Q8Sse(wI8, groupScales, xQ8, blockCount);
+            ? VecDotPQ2_0Q8Avx2(wI8, groupScales, xQ8, xScales, blockCount)
+            : VecDotPQ2_0Q8Sse(wI8, groupScales, xQ8, xScales, blockCount);
 
     /// <summary>AVX2/AVX-VNNI tier of <see cref="VecDotPQ2_0Q8"/>.</summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    internal static float VecDotPQ2_0Q8Avx2(sbyte* wI8, float* groupScales, byte* xQ8, int blockCount)
+    internal static float VecDotPQ2_0Q8Avx2(sbyte* wI8, float* groupScales, byte* xQ8, float* xScales, int blockCount)
     {
         const int blocksPerGroup = PQ2_0GroupSize / Q8_0GroupSize; // 128 / 32 = 4
 
@@ -533,7 +543,7 @@ public static unsafe partial class MatMul
         {
             // Activation Q8_0 block: 2-byte Half scale + 32 sbyte values.
             byte* xBlock = xQ8 + block * Q8_0BlockBytes;
-            float dx = (float)Unsafe.ReadUnaligned<Half>(xBlock);
+            float dx = xScales[block];   // pre-converted once per activation row (see ConvertQ8_0Scales)
 
             // Weight-side per-128-group scale: 4 consecutive Q8_0 blocks share one PQ2_0 group.
             float gScale = groupScales[block / blocksPerGroup];

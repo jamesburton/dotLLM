@@ -39,7 +39,7 @@ public static unsafe partial class MatMul
     /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    internal static float VecDotPQ2_0Q8Sse(sbyte* wI8, float* groupScales, byte* xQ8, int blockCount)
+    internal static float VecDotPQ2_0Q8Sse(sbyte* wI8, float* groupScales, byte* xQ8, float* xScales, int blockCount)
     {
         const int blocksPerGroup = PQ2_0GroupSize / Q8_0GroupSize; // 128 / 32 = 4
 
@@ -49,8 +49,7 @@ public static unsafe partial class MatMul
         for (int block = 0; block < blockCount; block++)
         {
             byte* xBlock = xQ8 + block * Q8_0BlockBytes;
-            float dx = (float)Unsafe.ReadUnaligned<Half>(xBlock);
-            float dCombined = dx * groupScales[block / blocksPerGroup];
+            float dCombined = xScales[block] * groupScales[block / blocksPerGroup];
 
             Vector128<int> isum = BlockDotSsse3(wI8 + block * Q8_0GroupSize, xBlock + 2, ones);
 
@@ -115,7 +114,7 @@ public static unsafe partial class MatMul
     /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    internal static float VecDotI2SQ8Sse(sbyte* wI8, byte* xQ8, int blockCount)
+    internal static float VecDotI2SQ8Sse(sbyte* wI8, byte* xQ8, float* xScales, int blockCount)
     {
         Vector128<float> acc = Vector128<float>.Zero;
         Vector128<short> ones = Vector128.Create((short)1);
@@ -123,7 +122,7 @@ public static unsafe partial class MatMul
         for (int block = 0; block < blockCount; block++)
         {
             byte* xBlock = xQ8 + block * Q8_0BlockBytes;
-            float dx = (float)Unsafe.ReadUnaligned<Half>(xBlock);
+            float dx = xScales[block];
 
             Vector128<int> isum = BlockDotSsse3(wI8 + block * Q8_0GroupSize, xBlock + 2, ones);
 
@@ -174,35 +173,52 @@ public static unsafe partial class MatMul
     /// </summary>
     [SkipLocalsInit]
     internal static void GemvPQ2_0Sse128ForBench(byte* weights, float* x, float* result, int m, int k,
-                                                 byte* xQ8Scratch, sbyte* rowScratch, float* groupScratch)
+                                                 byte* xQ8Scratch, float* xScaleScratch, sbyte* rowScratch,
+                                                 float* groupScratch)
     {
         int rowBytes = (k / PQ2_0GroupSize) * PQ2_0GroupBytes;
         int blockCount = k / Q8_0GroupSize;
         QuantizeF32ToQ8_0Scalar(x, xQ8Scratch, k);
+        ConvertQ8_0Scales(xQ8Scratch, xScaleScratch, blockCount);
         for (int r = 0; r < m; r++)
         {
             UnpackPQ2_0RowI8Sse(weights + (long)r * rowBytes, rowScratch, groupScratch, k);
-            result[r] = VecDotPQ2_0Q8Sse(rowScratch, groupScratch, xQ8Scratch, blockCount);
+            result[r] = VecDotPQ2_0Q8Sse(rowScratch, groupScratch, xQ8Scratch, xScaleScratch, blockCount);
         }
     }
 
     /// <summary>I2_S analog of <see cref="GemvPQ2_0Sse128ForBench"/> (per-tensor scale from the tail).</summary>
     [SkipLocalsInit]
     internal static void GemvI2_SSse128ForBench(byte* weights, float* x, float* result, int m, int k,
-                                                byte* xQ8Scratch, sbyte* rowScratch)
+                                                byte* xQ8Scratch, float* xScaleScratch, sbyte* rowScratch)
     {
         float scale = Unsafe.ReadUnaligned<float>(weights + (long)m * k / 4);
         int rowBytes = k / 4;
         int blockCount = k / Q8_0GroupSize;
         QuantizeF32ToQ8_0Scalar(x, xQ8Scratch, k);
+        ConvertQ8_0Scales(xQ8Scratch, xScaleScratch, blockCount);
         for (int r = 0; r < m; r++)
         {
             UnpackRowI8Sse(weights + (long)r * rowBytes, rowScratch, k);
-            result[r] = VecDotI2SQ8Sse(rowScratch, xQ8Scratch, blockCount) * scale;
+            result[r] = VecDotI2SQ8Sse(rowScratch, xQ8Scratch, xScaleScratch, blockCount) * scale;
         }
     }
 
     // ─────────────────────────── shared ───────────────────────────
+
+    /// <summary>
+    /// Converts the Half block scales of <paramref name="blockCount"/> consecutive Q8_0 blocks to
+    /// float, once per activation row. The W2A8 dots used to convert <c>d_b</c> inside the per-row
+    /// block loop, i.e. once per (weight row, block); <c>(float)Half</c> is a managed software
+    /// routine on .NET 10 (with or without F16C), and at ~1.2 ns it cost more than the SIMD block
+    /// dot itself (issue #477: 128-bit dot-only 2.4 -> 1.0 ns/block on Zen 5 once pre-converted).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void ConvertQ8_0Scales(byte* q8, float* dest, int blockCount)
+    {
+        for (int b = 0; b < blockCount; b++)
+            dest[b] = (float)Unsafe.ReadUnaligned<Half>(q8 + (long)b * Q8_0BlockBytes);
+    }
 
     /// <summary>
     /// Exact int32 lane sums of <c>Σ w[i]·q[i]</c> over one 32-element block (two 16-byte halves),

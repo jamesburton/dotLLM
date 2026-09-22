@@ -115,22 +115,23 @@ public sealed unsafe class W2A8SseTierTests
         sbyte* w = RandomCodes(rng, k, maxCode: 2);        // {-1,0,+1,+2}
         float* gs = (float*)NativeMemory.Alloc((nuint)(groups * sizeof(float)));
         byte* xQ8 = RandomQ8(rng, k);
+        float* xs = ScalesOf(xQ8, blocks);
         try
         {
             for (int g = 0; g < groups; g++) gs[g] = 0.005f + rng.NextSingle() * 0.08f;
 
             (double exact, double mag) = ReferencePQ2_0(w, gs, xQ8, blocks);
-            float sse = MatMul.VecDotPQ2_0Q8Sse(w, gs, xQ8, blocks);
+            float sse = MatMul.VecDotPQ2_0Q8Sse(w, gs, xQ8, xs, blocks);
             AssertTight(exact, mag, sse, "SSE vs exact");
 
             if (Avx2.IsSupported)
             {
-                float avx2 = MatMul.VecDotPQ2_0Q8Avx2(w, gs, xQ8, blocks);
+                float avx2 = MatMul.VecDotPQ2_0Q8Avx2(w, gs, xQ8, xs, blocks);
                 AssertTight(exact, mag, avx2, "AVX2 vs exact");
                 AssertTight(avx2, mag, sse, "SSE vs AVX2");
             }
         }
-        finally { NativeMemory.Free(w); NativeMemory.Free(gs); NativeMemory.Free(xQ8); }
+        finally { NativeMemory.Free(w); NativeMemory.Free(gs); NativeMemory.Free(xQ8); NativeMemory.Free(xs); }
     }
 
     [SkippableTheory]
@@ -147,20 +148,21 @@ public sealed unsafe class W2A8SseTierTests
 
         sbyte* w = RandomCodes(rng, k, maxCode: 1);        // {-1,0,+1}
         byte* xQ8 = RandomQ8(rng, k);
+        float* xs = ScalesOf(xQ8, blocks);
         try
         {
             (double exact, double mag) = ReferenceI2S(w, xQ8, blocks);
-            float sse = MatMul.VecDotI2SQ8Sse(w, xQ8, blocks);
+            float sse = MatMul.VecDotI2SQ8Sse(w, xQ8, xs, blocks);
             AssertTight(exact, mag, sse, "SSE vs exact");
 
             if (Avx2.IsSupported)
             {
-                float avx2 = MatMul.VecDotI2SQ8Avx2(w, xQ8, blocks);
+                float avx2 = MatMul.VecDotI2SQ8Avx2(w, xQ8, xs, blocks);
                 AssertTight(exact, mag, avx2, "AVX2 vs exact");
                 AssertTight(avx2, mag, sse, "SSE vs AVX2");
             }
         }
-        finally { NativeMemory.Free(w); NativeMemory.Free(xQ8); }
+        finally { NativeMemory.Free(w); NativeMemory.Free(xQ8); NativeMemory.Free(xs); }
     }
 
     /// <summary>
@@ -187,8 +189,10 @@ public sealed unsafe class W2A8SseTierTests
                 sbyte* q = (sbyte*)(xQ8 + b * Q8BlockBytes + 2);
                 for (int i = 0; i < Q8Block; i++) q[i] = (sbyte)(i % 2 == 0 ? 127 : -127);
             }
+            float* xs = ScalesOf(xQ8, blocks);
             (double exact, double mag) = ReferencePQ2_0(w, gs, xQ8, blocks);
-            AssertTight(exact, mag, MatMul.VecDotPQ2_0Q8Sse(w, gs, xQ8, blocks), "extreme");
+            AssertTight(exact, mag, MatMul.VecDotPQ2_0Q8Sse(w, gs, xQ8, xs, blocks), "extreme");
+            NativeMemory.Free(xs);
         }
         finally { NativeMemory.Free(w); NativeMemory.Free(gs); NativeMemory.Free(xQ8); }
     }
@@ -367,6 +371,14 @@ public sealed unsafe class W2A8SseTierTests
             for (int i = 0; i < 32; i++) gb[2 + i] = (byte)rng.Next(256);
         }
         return row;
+    }
+
+    /// <summary>Pre-converted Q8_0 block scales, as the W2A8 drivers pass to the dots.</summary>
+    private static float* ScalesOf(byte* xQ8, int blocks)
+    {
+        float* xs = (float*)NativeMemory.Alloc((nuint)(blocks * sizeof(float)));
+        MatMul.ConvertQ8_0Scales(xQ8, xs, blocks);
+        return xs;
     }
 
     private static sbyte* RandomCodes(Random rng, int k, int maxCode)

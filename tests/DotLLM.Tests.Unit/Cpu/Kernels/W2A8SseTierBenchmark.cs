@@ -48,6 +48,7 @@ public sealed unsafe class W2A8SseTierBenchmark
         float* ySse = (float*)NativeMemory.Alloc((nuint)(m * sizeof(float)));
         float* yRef = (float*)NativeMemory.Alloc((nuint)(m * sizeof(float)));
         byte* xQ8 = (byte*)NativeMemory.Alloc((nuint)(k / 32 * 34));
+        float* xs = (float*)NativeMemory.Alloc((nuint)(k / 32 * sizeof(float)));
         sbyte* row = (sbyte*)NativeMemory.Alloc((nuint)k);
         float* gs = (float*)NativeMemory.Alloc((nuint)(groups * sizeof(float)));
         try
@@ -62,11 +63,11 @@ public sealed unsafe class W2A8SseTierBenchmark
             }
             for (int i = 0; i < k; i++) x[i] = rng.NextSingle() * 2f - 1f;
 
-            MatMul.GemvPQ2_0Sse128ForBench(w, x, ySse, m, k, xQ8, row, gs);
+            MatMul.GemvPQ2_0Sse128ForBench(w, x, ySse, m, k, xQ8, xs, row, gs);
             MatMul.GemvPQ2_0Scalar(w, x, yRef, m, k);
             AssertMeanRel(ySse, yRef, m, label);
 
-            double sse = Median(() => MatMul.GemvPQ2_0Sse128ForBench(w, x, ySse, m, k, xQ8, row, gs));
+            double sse = Median(() => MatMul.GemvPQ2_0Sse128ForBench(w, x, ySse, m, k, xQ8, xs, row, gs));
             double scalar = Median(() => MatMul.GemvPQ2_0Scalar(w, x, yRef, m, k));
             double dispatch = Median(() => MatMul.GemvPQ2_0(w, x, ySse, m, k, null));
             Report(label, m, k, (long)m * rowBytes, scalar, sse, dispatch);
@@ -74,7 +75,7 @@ public sealed unsafe class W2A8SseTierBenchmark
         finally
         {
             NativeMemory.Free(w); NativeMemory.Free(x); NativeMemory.Free(ySse); NativeMemory.Free(yRef);
-            NativeMemory.Free(xQ8); NativeMemory.Free(row); NativeMemory.Free(gs);
+            NativeMemory.Free(xQ8); NativeMemory.Free(xs); NativeMemory.Free(row); NativeMemory.Free(gs);
         }
     }
 
@@ -93,6 +94,7 @@ public sealed unsafe class W2A8SseTierBenchmark
         float* ySse = (float*)NativeMemory.Alloc((nuint)(m * sizeof(float)));
         float* yRef = (float*)NativeMemory.Alloc((nuint)(m * sizeof(float)));
         byte* xQ8 = (byte*)NativeMemory.Alloc((nuint)(k / 32 * 34));
+        float* xs = (float*)NativeMemory.Alloc((nuint)(k / 32 * sizeof(float)));
         sbyte* row = (sbyte*)NativeMemory.Alloc((nuint)k);
         try
         {
@@ -101,11 +103,11 @@ public sealed unsafe class W2A8SseTierBenchmark
             *(float*)(w + packed) = 0.03f;
             for (int i = 0; i < k; i++) x[i] = rng.NextSingle() * 2f - 1f;
 
-            MatMul.GemvI2_SSse128ForBench(w, x, ySse, m, k, xQ8, row);
+            MatMul.GemvI2_SSse128ForBench(w, x, ySse, m, k, xQ8, xs, row);
             MatMul.GemvI2_SScalar(w, x, yRef, m, k);
             AssertMeanRel(ySse, yRef, m, label);
 
-            double sse = Median(() => MatMul.GemvI2_SSse128ForBench(w, x, ySse, m, k, xQ8, row));
+            double sse = Median(() => MatMul.GemvI2_SSse128ForBench(w, x, ySse, m, k, xQ8, xs, row));
             double scalar = Median(() => MatMul.GemvI2_SScalar(w, x, yRef, m, k));
             double dispatch = Median(() => MatMul.GemvI2_S(w, x, ySse, m, k, null));
             Report(label, m, k, packed, scalar, sse, dispatch);
@@ -113,7 +115,7 @@ public sealed unsafe class W2A8SseTierBenchmark
         finally
         {
             NativeMemory.Free(w); NativeMemory.Free(x); NativeMemory.Free(ySse); NativeMemory.Free(yRef);
-            NativeMemory.Free(xQ8); NativeMemory.Free(row);
+            NativeMemory.Free(xQ8); NativeMemory.Free(xs); NativeMemory.Free(row);
         }
     }
 
@@ -140,6 +142,8 @@ public sealed unsafe class W2A8SseTierBenchmark
             for (int i = 0; i < k; i++) { w[i] = (sbyte)(rng.Next(3) - 1); x[i] = rng.NextSingle() * 2f - 1f; }
             for (int g = 0; g < groups; g++) gs[g] = 0.02f;
             MatMul.QuantizeF32ToQ8_0Scalar(x, xQ8, k);
+            float* xs = stackalloc float[blocks];
+            MatMul.ConvertQ8_0Scales(xQ8, xs, blocks);
 
             float sink = 0;
             var sse = new List<double>();
@@ -151,8 +155,8 @@ public sealed unsafe class W2A8SseTierBenchmark
                 {
                     bool doSse = (pass == 0) == sseFirst;
                     var sw = Stopwatch.StartNew();
-                    if (doSse) for (int r = 0; r < reps; r++) sink += MatMul.VecDotPQ2_0Q8Sse(w, gs, xQ8, blocks);
-                    else for (int r = 0; r < reps; r++) sink += MatMul.VecDotPQ2_0Q8Avx2(w, gs, xQ8, blocks);
+                    if (doSse) for (int r = 0; r < reps; r++) sink += MatMul.VecDotPQ2_0Q8Sse(w, gs, xQ8, xs, blocks);
+                    else for (int r = 0; r < reps; r++) sink += MatMul.VecDotPQ2_0Q8Avx2(w, gs, xQ8, xs, blocks);
                     (doSse ? sse : avx).Add(sw.Elapsed.TotalMilliseconds * 1e6 / ((double)reps * blocks));
                 }
             }
