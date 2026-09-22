@@ -479,7 +479,6 @@ public sealed unsafe class HybridTransformerModel : IModel
         int vocabSize = Config.VocabSize;
         int kvStride = numKvHeads * headDim;
         float eps = Config.NormEpsilon;
-        int slidingWindow = Config.SlidingWindowSize ?? 0;
         int h = sizeof(ushort); // FP16 element size
 
         int totalLayers = Config.NumLayers;
@@ -544,6 +543,14 @@ public sealed unsafe class HybridTransformerModel : IModel
         {
             ref readonly var lw = ref _gpuWeights.Layers[layer];
 
+            // Per-layer window: gpt-oss alternates window/dense (pattern=2), Gemma-3 uses
+            // pattern=6; uniform-window and no-window models resolve identically to the old
+            // hoisted value. 0 = dense (kernel convention). Mirrors CPU GetLayerSlidingWindow.
+            // `layer` is the absolute (global) index (GPU phase = global layers 0..gpuLayers-1).
+            int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                Config.SlidingWindowSize, Config.SlidingWindowPattern,
+                Config.PerLayerSlidingWindow, layer);
+
             // ── ATTENTION BLOCK ──
             ProjectGpu(lw.QQuant, lw.QQuantType, lw.Q, _gpuState.NormOutput, _gpuState.Q,
                 lw.QOutputDim, lw.QInputDim, seqLen);
@@ -573,8 +580,10 @@ public sealed unsafe class HybridTransformerModel : IModel
             if (lw.KNormWeight != 0)
                 _kernels.LaunchPerHeadRmsNorm(_gpuState.K, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
 
+            // Dense-YaRN scaling (#366) rides on the weights bundle; (0, 1.0f) when inactive.
             _kernels.LaunchRoPE(_gpuState.Q, _gpuState.K, _gpuState.PositionsDevice,
-                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _gpuRopeType, s);
+                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _gpuRopeType, s,
+                _gpuWeights.RopeYarnInvFreqDevice, _gpuWeights.RopeYarnMscale);
 
             // KV-cache update + Attention
             var gpuKvCache = hybridKvCache?.GpuCache;
@@ -582,14 +591,29 @@ public sealed unsafe class HybridTransformerModel : IModel
             {
                 gpuKvCache.UpdateDevice(_gpuState.K, _gpuState.V, positions, seqLen, layer, s);
                 int seqKv = gpuKvCache.CurrentLength;
+                // lw.AttnSinksDevice (#365): 0 unless the GGUF carried `attn_sinks.weight`, so this
+                // is bit-identical for every model that has no sinks. See the else branch for why
+                // this class cannot currently reach a sink-bearing model in practice.
                 _kernels.LaunchAttention(_gpuState.Q, gpuKvCache.GetKeysPtr(layer),
                     gpuKvCache.GetValuesPtr(layer), _gpuState.AttnOutput,
-                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], slidingWindow, s);
+                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], slidingWindow, s,
+                    lw.AttnSinksDevice);
             }
             else
             {
+                // gpt-oss (the model #365 targets) is MoE and this class has no MoE FFN branch, so
+                // it cannot complete a valid forward here today. Sinks are plumbed anyway because
+                // `attn_sinks.weight` loading is tensor-driven, not architecture-gated
+                // (TransformerWeights.cs LoadOptionalBias) — a future DENSE sinks-bearing model
+                // would run through this partial-offload path (`--gpu-layers N`) and would
+                // otherwise drop its sinks silently, with no error.
+                // NOTE: this class's CPU half (the Attention.Execute calls in the CPU layer loop)
+                // is still sink-unaware — a pre-existing gap, out of scope here, analogous to the
+                // #366 hybrid CPU-tail YaRN gap. A dense sinks model on this path would need that
+                // fixed too before it were correct end to end.
                 _kernels.LaunchAttention(_gpuState.Q, _gpuState.K, _gpuState.V, _gpuState.AttnOutput,
-                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s);
+                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s,
+                    lw.AttnSinksDevice);
             }
 
             // Optional attention Sub-LN (BitNet): RMSNorm over the attention output before o_proj.

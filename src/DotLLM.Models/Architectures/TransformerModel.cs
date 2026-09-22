@@ -366,18 +366,17 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         // factor==1) is byte-identical to the non-YaRN path).
         else if (config.MlaConfig is null
                  && config.RoPEConfig is RoPEConfig rcfg
-                 && rcfg.ScalingType == RoPEScalingType.YaRN
-                 && rcfg.ScalingFactor > 1.0f
-                 && rcfg.OrigMaxSeqLen > 0)
+                 && rcfg.IsDenseYarnActive)
         {
             // gpt-oss (llama.cpp ggml_rope_ext yarn, ext_factor=1) additionally
             // applies the attention-magnitude concentration
             // mscale = attn_factor * (1 + 0.1 * ln(factor)) to cos/sin. Other
             // dense-YaRN archs (SmolLM3, Llama 3.1+) keep the plain AttnFactor
-            // convention established when they were wired.
-            float mscaleMultiplier = config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss
-                ? rcfg.AttnFactor * (1.0f + 0.1f * MathF.Log(rcfg.ScalingFactor))
-                : rcfg.AttnFactor;
+            // convention established when they were wired. Both the predicate and
+            // the mscale convention live on RoPEConfig so the CUDA backend's
+            // inverse-frequency upload (CudaWeights.RopeYarnInvFreqDevice) gates and
+            // scales identically — see #366.
+            float mscaleMultiplier = rcfg.ComputeYarnMscaleMultiplier(config.Architecture);
             DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTableYarn(
                 config.MaxSequenceLength, ropeDim, ropeTheta,
                 rcfg.ScalingFactor, rcfg.OrigMaxSeqLen,

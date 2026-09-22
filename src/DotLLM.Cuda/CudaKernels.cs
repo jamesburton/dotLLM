@@ -2239,11 +2239,21 @@ public sealed unsafe class CudaKernels : IDisposable
     /// for the standard <c>ropeDim/2</c> (Qwen3 / NemotronH / Llama — matches CPU
     /// <c>RoPE.Execute</c>); pass <c>headDim/2</c> for Gemma-4 partial global layers (matches CPU
     /// <c>RoPE.ApplyRotationNeoXPartial</c>).
+    /// <para>
+    /// <paramref name="ropeInvFreq"/> / <paramref name="ropeMscale"/> carry the dense-YaRN
+    /// scaling (#366): a device buffer of <c>ropeDim/2</c> floats holding the ramped
+    /// inverse frequencies produced by <c>RoPE.ComputeYarnInverseFrequencies</c>, plus the
+    /// cos/sin multiplier from <c>RoPEConfig.ComputeYarnMscaleMultiplier</c>. The defaults
+    /// (<c>0</c> / <c>1.0f</c>) select the kernel's original in-kernel
+    /// <c>powf(theta, ...)</c> and are bit-identical to the pre-#366 behaviour. When
+    /// <paramref name="ropeInvFreq"/> is non-zero it supersedes <paramref name="freqDim"/>.
+    /// </para>
     /// </summary>
     public void LaunchRoPEF32(nint q, nint k, nint positions,
                                 int seqLen, int numHeads, int numKvHeads, int headDim,
                                 int ropeDim, float theta, int ropeType, nint stream,
-                                int freqDim = 0, int neoxPairOffset = 0)
+                                int freqDim = 0, int neoxPairOffset = 0,
+                                nint ropeInvFreq = 0, float ropeMscale = 1.0f)
     {
         nint qArg = q, kArg = k, posArg = positions;
         int slArg = seqLen, nhArg = numHeads, nkvArg = numKvHeads;
@@ -2251,9 +2261,12 @@ public sealed unsafe class CudaKernels : IDisposable
         int fdArg = freqDim; // 0 ⇒ kernel falls back to rope_dim
         int npoArg = neoxPairOffset; // 0 ⇒ kernel falls back to rope_dim/2 (standard)
         float thetaArg = theta;
+        nint invFreqArg = ropeInvFreq; // 0 ⇒ nullptr ⇒ in-kernel powf(theta, ...)
+        float mscaleArg = ropeMscale;
 
         void** args = stackalloc void*[] {&qArg, &kArg, &posArg, &slArg, &nhArg, &nkvArg,
-                        &hdArg, &rdArg, &thetaArg, &rtArg, &fdArg, &npoArg};
+                        &hdArg, &rdArg, &thetaArg, &rtArg, &fdArg, &npoArg,
+                        &invFreqArg, &mscaleArg};
 
         int halfRope = ropeDim / 2;
         int totalPairs = seqLen * Math.Max(numHeads, numKvHeads) * halfRope;
@@ -2264,20 +2277,44 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
-    /// <summary>FP32 attention: Q/K/V/output all FP32.</summary>
+    /// <summary>
+    /// FP32 attention: Q/K/V/output all FP32.
+    /// </summary>
+    /// <param name="q">Device pointer to the query tensor, <c>[seqQ, numHeads, headDim]</c>.</param>
+    /// <param name="k">Device pointer to the cached keys, <c>[seqKv, numKvHeads, headDim]</c>.</param>
+    /// <param name="v">Device pointer to the cached values, <c>[seqKv, numKvHeads, headDim]</c>.</param>
+    /// <param name="output">Device pointer to the output, <c>[seqQ, numHeads, headDim]</c>. Overwritten.</param>
+    /// <param name="seqQ">Number of query positions in this launch.</param>
+    /// <param name="seqKv">Cached KV length (causal upper bound is <paramref name="positionOffset"/>).</param>
+    /// <param name="numHeads">Number of query attention heads.</param>
+    /// <param name="numKvHeads">Number of KV heads (GQA broadcast group = numHeads/numKvHeads).</param>
+    /// <param name="headDim">Per-head dimension.</param>
+    /// <param name="positionOffset">Position of the first query row (causal mask upper bound).</param>
+    /// <param name="slidingWindow">Sliding window size, or 0 for full causal attention.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    /// <param name="sinks">
+    /// Optional device pointer to <c>numHeads</c> per-head gpt-oss sink logits (issue #365).
+    /// <c>0</c> (default) selects nullptr, disabling the sink — bit-identical to pre-#365
+    /// behaviour. When non-zero, the kernel folds each head's sink logit into that row's
+    /// softmax denominator (extra "no-op" attention slot that absorbs probability mass but
+    /// contributes no value vector), matching the CPU reference's
+    /// <see cref="DotLLM.Cpu.Kernels.Attention.SoftmaxRowWithSink"/> convention.
+    /// </param>
     public void LaunchAttentionF32(nint q, nint k, nint v, nint output,
                                      int seqQ, int seqKv,
                                      int numHeads, int numKvHeads, int headDim,
-                                     int positionOffset, int slidingWindow, nint stream)
+                                     int positionOffset, int slidingWindow, nint stream,
+                                     nint sinks = 0)
     {
         nint qArg = q, kArg = k, vArg = v, outArg = output;
         int sqArg = seqQ, skvArg = seqKv;
         int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
         int poArg = positionOffset, swArg = slidingWindow;
+        nint sinksArg = sinks; // 0 ⇒ nullptr ⇒ sink disabled (pre-#365 behaviour)
 
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &sqArg, &skvArg, &nhArg, &nkvArg, &hdArg,
-                        &poArg, &swArg};
+                        &poArg, &swArg, &sinksArg};
 
         int numBlocks = seqQ * numHeads;
         // Tiled online softmax: q_shared[headDim] + score_tile[256] + out_accum[headDim] + warp_scratch[32]
@@ -2385,19 +2422,29 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <param name="partialSum">Scratch, <c>[numHeads, AttentionKvSplit]</c> floats.</param>
     /// <param name="partialOut">Scratch, <c>[numHeads, AttentionKvSplit, headDim]</c> floats.</param>
     /// <param name="stream">CUDA stream handle.</param>
+    /// <param name="sinks">
+    /// Optional device pointer to <c>numHeads</c> per-head gpt-oss sink logits (issue #365).
+    /// <c>0</c> (default) selects nullptr, disabling the sink — bit-identical to pre-#365
+    /// behaviour. When non-zero, the kernel folds each head's sink logit into that row's
+    /// softmax denominator (extra "no-op" attention slot that absorbs probability mass but
+    /// contributes no value vector), matching the CPU reference's
+    /// <see cref="DotLLM.Cpu.Kernels.Attention.SoftmaxRowWithSink"/> convention.
+    /// </param>
     public void LaunchAttentionF32SplitKv(nint q, nint k, nint v, nint output,
                                      int seqKv, int numHeads, int numKvHeads, int headDim,
                                      int positionOffset, int slidingWindow,
-                                     nint partialMax, nint partialSum, nint partialOut, nint stream)
+                                     nint partialMax, nint partialSum, nint partialOut, nint stream,
+                                     nint sinks = 0)
     {
         nint qArg = q, kArg = k, vArg = v, outArg = output;
         int skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
         int poArg = positionOffset, swArg = slidingWindow;
         nint pmArg = partialMax, psArg = partialSum, poutArg = partialOut;
+        nint sinksArg = sinks; // 0 ⇒ nullptr ⇒ sink disabled (pre-#365 behaviour)
 
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &skvArg, &nhArg, &nkvArg, &hdArg,
-                        &poArg, &swArg, &pmArg, &psArg, &poutArg};
+                        &poArg, &swArg, &pmArg, &psArg, &poutArg, &sinksArg};
 
         const int TileKv = 256;
         uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
@@ -3840,18 +3887,26 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
-    /// <summary>Rotary position embedding. In-place on Q and K.</summary>
+    /// <summary>
+    /// Rotary position embedding. In-place on Q and K.
+    /// <paramref name="ropeInvFreq"/> / <paramref name="ropeMscale"/> carry the dense-YaRN
+    /// scaling (#366) — see <see cref="LaunchRoPEF32"/> for the contract. The defaults
+    /// (<c>0</c> / <c>1.0f</c>) are bit-identical to the pre-#366 behaviour.
+    /// </summary>
     public void LaunchRoPE(nint q, nint k, nint positions,
                             int seqLen, int numHeads, int numKvHeads, int headDim,
-                            int ropeDim, float theta, int ropeType, nint stream)
+                            int ropeDim, float theta, int ropeType, nint stream,
+                            nint ropeInvFreq = 0, float ropeMscale = 1.0f)
     {
         nint qArg = q, kArg = k, posArg = positions;
         int slArg = seqLen, nhArg = numHeads, nkvArg = numKvHeads;
         int hdArg = headDim, rdArg = ropeDim, rtArg = ropeType;
         float thetaArg = theta;
+        nint invFreqArg = ropeInvFreq;
+        float mscaleArg = ropeMscale;
 
         void** args = stackalloc void*[] {&qArg, &kArg, &posArg, &slArg, &nhArg, &nkvArg,
-                        &hdArg, &rdArg, &thetaArg, &rtArg};
+                        &hdArg, &rdArg, &thetaArg, &rtArg, &invFreqArg, &mscaleArg};
 
         int halfRope = ropeDim / 2;
         int totalPairs = seqLen * Math.Max(numHeads, numKvHeads) * halfRope;
@@ -4064,20 +4119,29 @@ public sealed unsafe class CudaKernels : IDisposable
         _ => false,
     };
 
-    /// <summary>Naive scaled dot-product attention with causal mask and GQA.</summary>
+    /// <summary>
+    /// Naive scaled dot-product attention with causal mask and GQA.
+    /// <para>
+    /// <c>sinks</c> (issue #365): optional device pointer to gpt-oss per-head sink logits —
+    /// <b>F32</b>, <c>numHeads</c> elements, indexed by QUERY head. 0 ⇒ nullptr ⇒ sink disabled,
+    /// which is bit-identical to the pre-#365 kernel.
+    /// </para>
+    /// </summary>
     public void LaunchAttention(nint q, nint k, nint v, nint output,
                                  int seqQ, int seqKv,
                                  int numHeads, int numKvHeads, int headDim,
-                                 int positionOffset, int slidingWindow, nint stream)
+                                 int positionOffset, int slidingWindow, nint stream,
+                                 nint sinks = 0)
     {
         nint qArg = q, kArg = k, vArg = v, outArg = output;
         int sqArg = seqQ, skvArg = seqKv;
         int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
         int poArg = positionOffset, swArg = slidingWindow;
+        nint sinksArg = sinks; // 0 ⇒ nullptr ⇒ sink disabled (pre-#365 behaviour)
 
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &sqArg, &skvArg, &nhArg, &nkvArg, &hdArg,
-                        &poArg, &swArg};
+                        &poArg, &swArg, &sinksArg};
 
         int numBlocks = seqQ * numHeads;
         // Tiled online softmax: q_shared[headDim] + score_tile[256] + out_accum[headDim] + warp_scratch[32]
@@ -4101,7 +4165,8 @@ public sealed unsafe class CudaKernels : IDisposable
     public void LaunchAttentionDyn(nint q, nint k, nint v, nint output,
                                     int seqQ, nint seqKvPtr,
                                     int numHeads, int numKvHeads, int headDim,
-                                    nint positionOffsetPtr, int slidingWindow, nint stream)
+                                    nint positionOffsetPtr, int slidingWindow, nint stream,
+                                    nint sinks = 0)
     {
         nint qArg = q, kArg = k, vArg = v, outArg = output;
         int sqArg = seqQ;
@@ -4109,10 +4174,15 @@ public sealed unsafe class CudaKernels : IDisposable
         int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
         nint poPtrArg = positionOffsetPtr;
         int swArg = slidingWindow;
+        // 0 ⇒ nullptr ⇒ sink disabled. Graph-safe: the sink buffer is a fixed per-layer
+        // allocation whose CONTENTS never change between decode steps, so baking this
+        // pointer into the captured graph is valid across every replay (unlike seqKv /
+        // positionOffset, which is exactly why those two are passed indirectly).
+        nint sinksArg = sinks;
 
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &sqArg, &skvPtrArg, &nhArg, &nkvArg, &hdArg,
-                        &poPtrArg, &swArg};
+                        &poPtrArg, &swArg, &sinksArg};
 
         int numBlocks = seqQ * numHeads;
         const int TileKv = 256;
@@ -4350,6 +4420,14 @@ public sealed unsafe class CudaKernels : IDisposable
     /// Q is rotated in place on <paramref name="qSrc"/>; K is rotated and the rotated row
     /// is written to <paramref name="kCacheBase"/><c> + cachePos * kvStride</c>; V is plain-copied
     /// to <paramref name="vCacheBase"/><c> + cachePos * kvStride</c>.
+    /// <para>
+    /// <paramref name="ropeInvFreq"/> / <paramref name="ropeMscale"/> carry the dense-YaRN
+    /// scaling (#366) — see <see cref="LaunchRoPEF32"/> for the contract. This launcher is
+    /// the one that matters most for YaRN: decode takes it by default, so leaving it
+    /// unscaled would mis-rotate every generated token. Both values are model constants,
+    /// so baking them into a captured CUDA graph is safe (the per-step values — positions
+    /// and cache row — are already read from device memory by the Dyn variant).
+    /// </para>
     /// </summary>
     public void LaunchFusedRopeKvWriteF16(
         nint qSrc, nint kSrc, nint vSrc,
@@ -4357,7 +4435,7 @@ public sealed unsafe class CudaKernels : IDisposable
         nint positionsDevice, int cachePos,
         int numHeads, int numKvHeads, int headDim,
         int ropeDim, int kvStride, float theta, int ropeType,
-        nint stream)
+        nint stream, nint ropeInvFreq = 0, float ropeMscale = 1.0f)
     {
         if (_fusedRopeKvWriteModule == null)
             throw new InvalidOperationException(
@@ -4371,13 +4449,16 @@ public sealed unsafe class CudaKernels : IDisposable
         int rdArg = ropeDim, kvStrideArg = kvStride;
         float thetaArg = theta;
         int rtArg = ropeType;
+        nint invFreqArg = ropeInvFreq;
+        float mscaleArg = ropeMscale;
 
         void** args = stackalloc void*[] {
             &qArg, &kArg, &vArg, &kCacheArg, &vCacheArg,
             &posArg, &cachePosArg,
             &nhArg, &nkvArg, &hdArg,
             &rdArg, &kvStrideArg,
-            &thetaArg, &rtArg
+            &thetaArg, &rtArg,
+            &invFreqArg, &mscaleArg
         };
 
         int halfRope = ropeDim / 2;
@@ -4404,7 +4485,7 @@ public sealed unsafe class CudaKernels : IDisposable
         nint positionsDevice, nint cachePosPtr,
         int numHeads, int numKvHeads, int headDim,
         int ropeDim, int kvStride, float theta, int ropeType,
-        nint stream)
+        nint stream, nint ropeInvFreq = 0, float ropeMscale = 1.0f)
     {
         if (_fusedRopeKvWriteModule == null)
             throw new InvalidOperationException(
@@ -4418,13 +4499,16 @@ public sealed unsafe class CudaKernels : IDisposable
         int rdArg = ropeDim, kvStrideArg = kvStride;
         float thetaArg = theta;
         int rtArg = ropeType;
+        nint invFreqArg = ropeInvFreq;
+        float mscaleArg = ropeMscale;
 
         void** args = stackalloc void*[] {
             &qArg, &kArg, &vArg, &kCacheArg, &vCacheArg,
             &posArg, &cachePosPtrArg,
             &nhArg, &nkvArg, &hdArg,
             &rdArg, &kvStrideArg,
-            &thetaArg, &rtArg
+            &thetaArg, &rtArg,
+            &invFreqArg, &mscaleArg
         };
 
         int halfRope = ropeDim / 2;
