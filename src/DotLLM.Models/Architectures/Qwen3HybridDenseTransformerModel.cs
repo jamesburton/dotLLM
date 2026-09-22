@@ -2378,6 +2378,13 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             case QuantizationType.F16:
                 MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);
                 return;
+            case QuantizationType.Q4_0:
+            case QuantizationType.Q4_1:
+            case QuantizationType.Q5_1:
+            case QuantizationType.IQ4_NL:
+                // Packed x Q8_1 dot instead of dequantize-to-F32 (#489).
+                MatMul.GemmLegacyQuantOrDequant((byte*)weights, qt, b, c, m, k, n, _threadPool, preQuantizedInput);
+                return;
             default:
                 // Shared dequantize-and-dot fallback (#263): decodes each weight row once and
                 // reuses it across all n columns instead of re-decoding the matrix per token.
