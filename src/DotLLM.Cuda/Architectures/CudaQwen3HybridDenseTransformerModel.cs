@@ -179,6 +179,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     // Qwen3HybridDenseTransformerModel._mtpHead (DotLLM.Models.Architectures.MtpHeadWeights).
     private readonly CudaMtpHeadWeights? _mtpHead;
 
+    // PrismML Hadamard fold (prism.hadamard.*, issue #479) — null for every checkpoint outside the
+    // Bonsai 2 family, and every rotation site below is a single null check on it, so an unfolded
+    // model pays nothing. Mirrors the CPU host's Qwen3HybridDenseTransformerModel._hadamard.
+    private readonly CudaHadamardRotation? _hadamard;
+
     private bool _disposed;
 
     // Issue #291: true for an instance built via LoadHeadFromGguf (the GPU half of a CPU/GPU
@@ -446,24 +451,29 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         int deviceId,
         nint dequantScratchDevice,
         CudaMtpHeadWeights? mtpHead = null,
-        bool isHeadOnly = false)
+        bool isHeadOnly = false,
+        CudaHadamardRotation? hadamard = null)
     {
         // A Hadamard-folded checkpoint (Bonsai 2) stores its weights in a rotated basis and needs
-        // the matching activation transform. The CUDA path does not implement it yet, and the
-        // failure mode is not a crash: the weights are well-formed values in the wrong basis, so
-        // the model would emit fluent nonsense. Refuse instead — the CPU and Vulkan backends carry
-        // the transform.
-        if (config.HadamardFold is not null)
+        // the matching activation transform, and the failure mode of skipping it is not a crash:
+        // the weights are well-formed values in the wrong basis, so the model emits fluent
+        // nonsense. The loaders build the transform (CudaHadamardRotation.Create validates the
+        // declared fold set and refuses anything the rotation sites below do not cover); any path
+        // that reaches here with a fold but without the transform must refuse rather than guess.
+        if (config.HadamardFold is not null && hadamard is null)
             throw new NotSupportedException(
-                "This checkpoint declares a PrismML Hadamard weight fold (prism.hadamard.*), which " +
-                "the CUDA backend does not implement yet. Run it on the CPU or Vulkan backend. " +
-                "Loading it here would generate plausible-looking but wrong output rather than fail.");
+                "This checkpoint declares a PrismML Hadamard weight fold (prism.hadamard.*) but no " +
+                "CUDA Hadamard transform was built for it. Loading it without one would generate " +
+                "plausible-looking but wrong output rather than fail.");
+        if (hadamard is not null && !ReferenceEquals(hadamard.Fold, config.HadamardFold))
+            throw new ArgumentException("The Hadamard transform does not belong to this model's config.", nameof(hadamard));
 
         Config = config;
         _isHeadOnly = isHeadOnly;
         _gguf = gguf;
         _layers = layers;
         _mtpHead = mtpHead;
+        _hadamard = hadamard;
         _tokenEmbedDevice = tokenEmbedDevice;
         _tokenEmbedQt = tokenEmbedQt;
         _embedDataBase = embedDataBase;
@@ -533,6 +543,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         CudaKernels? kernels = null;
         CudaQwen3HybridDenseForwardState? state = null;
         CudaGdnStateCache? gdnCache = null;
+        CudaHadamardRotation? hadamard = null;
         var allocs = new List<nint>();
         try
         {
@@ -556,6 +567,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
         ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
         kernels = new CudaKernels(ptxDir);
+
+        // PrismML Hadamard fold (issue #479): validate + upload signs before any weight upload, so
+        // an unsupported declaration fails fast instead of after gigabytes of H2D traffic.
+        if (config.HadamardFold is { } fold)
+            hadamard = CudaHadamardRotation.Create(kernels, fold, config.GdnConfig!.Value, config.NumLayers);
 
         nint dataBase = gguf.DataBasePointer;
         var tensors = gguf.TensorsByName;
@@ -675,7 +691,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             nVHead: gdn.NVHead,
             nKHead: gdn.NKHead,
             dState: gdn.DState,
-            intermediateSize: config.IntermediateSize);
+            intermediateSize: config.IntermediateSize,
+            hasHadamardFold: hadamard is not null);
 
         int gdnLayerCount = 0;
         for (int i = 0; i < config.NumLayers; i++)
@@ -691,10 +708,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             kvSlotForLayer, attentionLayerCount,
             ropeTheta, ropeDim,
             state, gdnCache, stream, cublas, context, kernels, deviceId,
-            dequantScratchDevice, mtpHead);
+            dequantScratchDevice, mtpHead, hadamard: hadamard);
         }
         catch
         {
+            hadamard?.Dispose();
             gdnCache?.Dispose();
             state?.Dispose();
             for (int i = allocs.Count - 1; i >= 0; i--)
@@ -775,6 +793,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         CudaKernels? kernels = null;
         CudaQwen3HybridDenseForwardState? state = null;
         CudaGdnStateCache? gdnCache = null;
+        CudaHadamardRotation? hadamard = null;
         var allocs = new List<nint>();
         try
         {
@@ -791,6 +810,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
         ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
         kernels = new CudaKernels(ptxDir);
+
+        // PrismML Hadamard fold (issue #479). Validated against the FULL trunk's layer count: the
+        // checkpoint's declaration covers every layer, not just this head's prefix. (The CPU tail
+        // this head is paired with validates its own sliced config — see LoadTailFromGguf.)
+        if (fullConfig.HadamardFold is { } fold)
+            hadamard = CudaHadamardRotation.Create(kernels, fold, fullConfig.GdnConfig!.Value, fullConfig.NumLayers);
 
         nint dataBase = gguf.DataBasePointer;
         var tensors = gguf.TensorsByName;
@@ -840,7 +865,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             nVHead: gdn.NVHead,
             nKHead: gdn.NKHead,
             dState: gdn.DState,
-            intermediateSize: fullConfig.IntermediateSize);
+            intermediateSize: fullConfig.IntermediateSize,
+            hasHadamardFold: hadamard is not null);
 
         int gdnLayerCount = 0;
         for (int i = 0; i < numGpuLayers; i++)
@@ -873,10 +899,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             kvSlotForLayer, attentionLayerCount,
             ropeTheta, ropeDim,
             state, gdnCache, stream, cublas, context, kernels, deviceId,
-            dequantScratchDevice, mtpHead: null, isHeadOnly: true);
+            dequantScratchDevice, mtpHead: null, isHeadOnly: true, hadamard: hadamard);
         }
         catch
         {
+            hadamard?.Dispose();
             gdnCache?.Dispose();
             state?.Dispose();
             for (int i = allocs.Count - 1; i >= 0; i--)
@@ -961,6 +988,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         }
         fixed (float* pEmbedHost = embedHost)
         {
+            // A Hadamard-latent token_embd (prism.hadamard.inverse_weight_names) stores rotated
+            // rows: restore the primal basis before the upload (rotation, then signs) — the CPU
+            // host's EmbedTokens code path, run on the same host rows (issue #479).
+            if (_hadamard is { } embRot)
+                embRot.RotateInverseInPlaceHost(pEmbedHost, seqLen, hiddenSize);
             CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.HiddenState, (nint)pEmbedHost,
                 (nuint)((long)seqLen * hiddenSize * sizeof(float)), streamH).ThrowOnError();
         }
@@ -1440,6 +1472,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         }
         fixed (float* pEmbedHost = embedHost)
         {
+            // A Hadamard-latent token_embd (prism.hadamard.inverse_weight_names) stores rotated
+            // rows: restore the primal basis before the upload (rotation, then signs) — the CPU
+            // host's EmbedTokens code path, run on the same host rows (issue #479).
+            if (_hadamard is { } embRot)
+                embRot.RotateInverseInPlaceHost(pEmbedHost, seqLen, hiddenSize);
             CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.HiddenState, (nint)pEmbedHost,
                 (nuint)((long)seqLen * hiddenSize * sizeof(float)), streamH).ThrowOnError();
         }
@@ -1499,7 +1536,16 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             _stream.Synchronize();
             mtpCapture.SetCapturedRowsFromDevice(_state.HiddenState, seqLen);
         }
-        Gemm(_outputDevice, _outputQt, lmHeadInput, _state.Logits,
+        // output.weight is folded too — rotate the final-norm output before the lm_head. After the
+        // MTP capture above, which wants the post-norm, PRE-rotation rows (same order as the CPU).
+        nint headIn = lmHeadInput;
+        if (_hadamard is { } headRot)
+        {
+            headIn = _state.HadamardScratch;
+            headRot.RotateForward(lmHeadInput, headIn, logitsRows, _outputInputDim,
+                permuteGdnValueHeads: false, streamH);
+        }
+        Gemm(_outputDevice, _outputQt, headIn, _state.Logits,
              _outputOutputDim, _outputInputDim, logitsRows);
         ProfMark("lm-head");
         if (DebugTrace) { _stream.Synchronize(); Console.Error.WriteLine("[hybrid-debug] lm_head done"); Console.Error.Flush(); LogVram("after lm-head"); }
@@ -1666,6 +1712,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                     Dequantize.ToFloat32(rowSrc, hiddenSize, embedQt, embedHost.AsSpan(i * hiddenSize, hiddenSize));
                     posHost[i] = firstPosition + start + i;
                 }
+                // A folded checkpoint's trunk embedding is stored in the rotated basis (#479); the
+                // head-local table, when shipped, is not. Same rule as ForwardMtpCore's gather.
+                if (mtpHead.EmbedTokensHostBase is null && _hadamard is { } embRot)
+                {
+                    fixed (float* pEmbedRows = embedHost)
+                        embRot.RotateInverseInPlaceHost(pEmbedRows, s, hiddenSize);
+                }
                 // Pairing (#469): row r goes with h_{p-1} — the carry for r == 0, captured row r-1 otherwise.
                 state.CopyAbsorbPairingRows(start, s, pairHost.AsSpan(0, elems));
 
@@ -1758,6 +1811,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         public nint FfnUp;       // [intermediateSize]
         public nint Silu;        // [intermediateSize]
         public nint NormedHead;  // [hiddenSize]
+        public nint HeadRot;     // [hiddenSize] — Hadamard-rotated NormedHead (folded trunk lm_head fallback only)
         public nint LogitsDevice; // [vocabSize]
         public nint PositionDevice; // [1] int32
 
@@ -1778,6 +1832,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 FfnUp = AllocDevice((long)intermediateSize * sizeof(float)),
                 Silu = AllocDevice((long)intermediateSize * sizeof(float)),
                 NormedHead = AllocDevice((long)hiddenSize * sizeof(float)),
+                HeadRot = AllocDevice((long)hiddenSize * sizeof(float)),
                 LogitsDevice = AllocDevice((long)vocabSize * sizeof(float)),
                 PositionDevice = AllocDevice(sizeof(int)),
             };
@@ -1799,6 +1854,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             FreeIfNonZero(ref FfnUp);
             FreeIfNonZero(ref Silu);
             FreeIfNonZero(ref NormedHead);
+            FreeIfNonZero(ref HeadRot);
             FreeIfNonZero(ref LogitsDevice);
             FreeIfNonZero(ref PositionDevice);
         }
@@ -1883,6 +1939,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         Dequantize.ToFloat32(rowSrc, hiddenSize, embedQt, embedHost);
         fixed (float* pEmbedHost = embedHost)
         {
+            // PrismML Hadamard fold (#435/#479): falling back to the trunk's token_embd.weight means
+            // reading ROTATED rows, so restore the primal basis exactly as the trunk lookup does. A
+            // head-local nextn.embed_tokens is not folded and stays untouched. Mirrors the CPU host.
+            if (mtpHead.EmbedTokensHostBase is null && _hadamard is { } embRot)
+                embRot.RotateInverseInPlaceHost(pEmbedHost, 1, hiddenSize);
             CudaDriverApi.cuMemcpyHtoDAsync_v2(s.Embed, (nint)pEmbedHost,
                 (nuint)((long)hiddenSize * sizeof(float)), streamH).ThrowOnError();
         }
@@ -2003,7 +2064,18 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         int headOutputDim = mtpHead.SharedHeadHeadDevice is not null ? mtpHead.SharedHeadHeadOutputDim : _outputOutputDim;
         int headInputDim = mtpHead.SharedHeadHeadDevice is not null ? mtpHead.SharedHeadHeadInputDim : _outputInputDim;
 
-        Gemm(headWeight, headQt, s.NormedHead, s.LogitsDevice, headOutputDim, headInputDim, 1);
+        // PrismML Hadamard fold (#435/#479), the mirror of the embedding case above: the trunk's
+        // output.weight fallback is a FOLDED matrix, so its input needs the forward rotation exactly
+        // as the trunk's own lm_head does. A head-local nextn.shared_head_head is not folded. The
+        // pending-hidden copy above stays unrotated (it feeds the next step's hnorm).
+        nint headIn = s.NormedHead;
+        if (mtpHead.SharedHeadHeadDevice is null && _hadamard is { } headRot)
+        {
+            headIn = s.HeadRot;
+            headRot.RotateForward(s.NormedHead, headIn, 1, headInputDim,
+                permuteGdnValueHeads: false, streamH);
+        }
+        Gemm(headWeight, headQt, headIn, s.LogitsDevice, headOutputDim, headInputDim, 1);
 
         _stream.Synchronize();
         var shape = new TensorShape(1, vocabSize);
@@ -2205,9 +2277,18 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
         ProfStart();
         // ── 1. Projections from the normed input ──
-        Gemm(gdnW.QkvDevice, gdnW.QkvQt, normOut, qkvBuf,
+        // PrismML Hadamard fold: only qkv and gate are folded. alpha and beta are NOT, so they must
+        // keep reading the unrotated normOut — hence the rotation goes to scratch, never in place.
+        nint foldedIn = normOut;
+        if (_hadamard is { } rot)
+        {
+            foldedIn = _state.HadamardScratch;
+            rot.RotateForward(normOut, foldedIn, seqLen, gdnW.QkvInputDim,
+                permuteGdnValueHeads: false, streamH);
+        }
+        Gemm(gdnW.QkvDevice, gdnW.QkvQt, foldedIn, qkvBuf,
              gdnW.QkvOutputDim, gdnW.QkvInputDim, seqLen);
-        Gemm(gdnW.GateDevice, gdnW.GateQt, normOut, zBuf,
+        Gemm(gdnW.GateDevice, gdnW.GateQt, foldedIn, zBuf,
              gdnW.GateOutputDim, gdnW.GateInputDim, seqLen);
         // Alpha/Beta project to tiny output dims (NVHead each) — their decode-time GEMV cost is
         // dominated by the fixed shared-x staging overhead, not compute, so fusing them (unlike
@@ -2396,7 +2477,16 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         ProfMark("gdn-6-normgate");
 
         // ── 7. ssm_out projection into NormOutput ──
-        Gemm(gdnW.OutDevice, gdnW.OutQt, gdnOut, normOut,
+        // Folded in GROUPED value-head order (prism.hadamard.gdn_v_grouped) while the recurrence
+        // emits tiled order: the rotation permutes tiled -> grouped on load, then signs, then FWHT.
+        nint outIn = gdnOut;
+        if (_hadamard is { } outRot)
+        {
+            outIn = _state.HadamardScratch;
+            outRot.RotateForward(gdnOut, outIn, seqLen, gdnW.OutInputDim,
+                permuteGdnValueHeads: true, streamH);
+        }
+        Gemm(gdnW.OutDevice, gdnW.OutQt, outIn, normOut,
              gdnW.OutOutputDim, gdnW.OutInputDim, seqLen);
         ProfMark("gdn-7-outproj");
     }
@@ -2424,7 +2514,17 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
         ProfStart();
         // ── 1. Fused Q+Gate projection ──
-        Gemm(attn.QDevice, attn.QQt, normOut, qgBuf, attn.QOutputDim, attn.QInputDim, seqLen);
+        // PrismML Hadamard fold: attn_q, attn_k and attn_v are all folded and read the same
+        // normOut, so one rotation feeds all three. HadamardScratch is untouched between here and
+        // the K/V projections below.
+        nint projIn = normOut;
+        if (_hadamard is { } qkvRot)
+        {
+            projIn = _state.HadamardScratch;
+            qkvRot.RotateForward(normOut, projIn, seqLen, attn.QInputDim,
+                permuteGdnValueHeads: false, streamH);
+        }
+        Gemm(attn.QDevice, attn.QQt, projIn, qgBuf, attn.QOutputDim, attn.QInputDim, seqLen);
         DumpDevice2D($"blk.{layer}.fa_qg", qgBuf, seqLen, qgElems);
         ProfMark("attn-1-qgproj");
 
@@ -2463,11 +2563,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
         // ── 3. K and V projections ──
         if (!TryFusedPQ2_0Gemm2(attn.KDevice, attn.KQt, attn.VDevice, attn.VQt,
-                normOut, k, v, attn.KOutputDim, attn.VOutputDim,
+                projIn, k, v, attn.KOutputDim, attn.VOutputDim,
                 attn.KInputDim, attn.VInputDim, seqLen))
         {
-            Gemm(attn.KDevice, attn.KQt, normOut, k, attn.KOutputDim, attn.KInputDim, seqLen);
-            Gemm(attn.VDevice, attn.VQt, normOut, v, attn.VOutputDim, attn.VInputDim, seqLen);
+            Gemm(attn.KDevice, attn.KQt, projIn, k, attn.KOutputDim, attn.KInputDim, seqLen);
+            Gemm(attn.VDevice, attn.VQt, projIn, v, attn.VOutputDim, attn.VInputDim, seqLen);
         }
         DumpDevice2D($"blk.{layer}.fa_k", k, seqLen, numKvHeads * headDim);
         DumpDevice2D($"blk.{layer}.fa_v", v, seqLen, numKvHeads * headDim);
@@ -2731,8 +2831,15 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         DumpDevice2D($"blk.{layer}.fa_attnout_postgate", attnOut, seqLen, qElems);
         ProfMark("attn-7-gate");
 
-        // ── 8. Output projection ──
-        Gemm(attn.ODevice, attn.OQt, attnOut, _state.NormOutput,
+        // ── 8. Output projection (attn_output is folded) ──
+        nint oIn = attnOut;
+        if (_hadamard is { } oRot)
+        {
+            oIn = _state.HadamardScratch;
+            oRot.RotateForward(attnOut, oIn, seqLen, attn.OInputDim,
+                permuteGdnValueHeads: false, streamH);
+        }
+        Gemm(attn.ODevice, attn.OQt, oIn, _state.NormOutput,
              attn.OOutputDim, attn.OInputDim, seqLen);
         ProfMark("attn-8-outproj");
     }
@@ -2988,17 +3095,33 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint siluOut = _state.SiluOutput;
 
         ProfStart();
+        // PrismML Hadamard fold: ffn_gate and ffn_up are folded and share one rotated input.
+        nint ffnIn = normOut;
+        if (_hadamard is { } ffnRot)
+        {
+            ffnIn = _state.HadamardScratch;
+            ffnRot.RotateForward(normOut, ffnIn, seqLen, lw.GateInputDim,
+                permuteGdnValueHeads: false, streamH);
+        }
         if (!TryFusedPQ2_0Gemm2(lw.GateWeight, lw.GateQt, lw.UpWeight, lw.UpQt,
-                normOut, ffnGate, ffnUp, lw.GateOutputDim, lw.UpOutputDim,
+                ffnIn, ffnGate, ffnUp, lw.GateOutputDim, lw.UpOutputDim,
                 lw.GateInputDim, lw.UpInputDim, seqLen))
         {
-            Gemm(lw.GateWeight, lw.GateQt, normOut, ffnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
-            Gemm(lw.UpWeight, lw.UpQt, normOut, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+            Gemm(lw.GateWeight, lw.GateQt, ffnIn, ffnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
+            Gemm(lw.UpWeight, lw.UpQt, ffnIn, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
         }
         ProfMark("ffn-1-gateup");
         _kernels.LaunchSwiGLUF32(ffnGate, ffnUp, siluOut, _intermediateSize, seqLen, streamH);
         ProfMark("ffn-2-swiglu");
-        Gemm(lw.DownWeight, lw.DownQt, siluOut, normOut, lw.DownOutputDim, lw.DownInputDim, seqLen);
+        // ffn_down is folded: rotate the SwiGLU output before the down projection.
+        nint downIn = siluOut;
+        if (_hadamard is { } downRot)
+        {
+            downIn = _state.HadamardScratch;
+            downRot.RotateForward(siluOut, downIn, seqLen, lw.DownInputDim,
+                permuteGdnValueHeads: false, streamH);
+        }
+        Gemm(lw.DownWeight, lw.DownQt, downIn, normOut, lw.DownOutputDim, lw.DownInputDim, seqLen);
         ProfMark("ffn-3-down");
     }
 
@@ -3304,6 +3427,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _mtpScratch = null;
         _mtpAbsorbScratch?.Dispose();
         _mtpAbsorbScratch = null;
+        _hadamard?.Dispose();
 
         _state.Dispose();
         _gdnCache.Dispose();
