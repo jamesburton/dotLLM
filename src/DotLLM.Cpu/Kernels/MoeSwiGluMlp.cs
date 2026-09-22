@@ -976,8 +976,15 @@ public static unsafe partial class MoeSwiGluMlp
                 else
                     MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
                 return;
+            case QuantizationType.Q4_0:
+            case QuantizationType.Q4_1:
+            case QuantizationType.Q5_1:
+            case QuantizationType.IQ4_NL:
+                // Packed × Q8_1 dot instead of dequantize-to-F32 (#489).
+                MatMul.GemmLegacyQuantOrDequant((byte*)weights, qt, b, c, m, k, n, pool, preQuantizedInput);
+                return;
             default:
-                // Fallback for quant types without a direct kernel (Q4_0, Q4_1, Q5_1, IQ*, BF16).
+                // Fallback for quant types without a direct kernel (remaining IQ*, BF16).
                 // Dequant per row then F32 dot, row-parallel and dequantizing each row once for
                 // all n columns (#263). Shares MatMul.GemmDequantRows with the model's own
                 // fallback so both stay bit-identical.

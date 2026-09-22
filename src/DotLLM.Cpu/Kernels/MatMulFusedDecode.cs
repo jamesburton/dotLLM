@@ -26,6 +26,9 @@ public static unsafe partial class MatMul
     {
         QuantizationType.Q8_0 => QuantFamily.Q8_0Family,
         QuantizationType.Q5_0 => QuantFamily.Q8_1Family,
+        // Packed legacy quants — same Q8_1 activation block as Q5_0, so they share pre-quant (#489).
+        QuantizationType.Q4_0 or QuantizationType.Q4_1
+            or QuantizationType.Q5_1 or QuantizationType.IQ4_NL => QuantFamily.Q8_1Family,
         QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K => QuantFamily.KQuantFamily,
         _ => QuantFamily.None,
     };
@@ -45,8 +48,24 @@ public static unsafe partial class MatMul
         QuantizationType.Q4_K => &ComputeRowsQ4_K,
         QuantizationType.Q5_K => &ComputeRowsQ5_K,
         QuantizationType.Q6_K => &ComputeRowsQ6_K,
+        QuantizationType.Q4_0 => &ComputeRowsQ4_0,
+        QuantizationType.Q4_1 => &ComputeRowsQ4_1,
+        QuantizationType.Q5_1 => &ComputeRowsQ5_1,
+        QuantizationType.IQ4_NL => &ComputeRowsIQ4_NL,
         _ => null,
     };
+
+    private static void ComputeRowsQ4_0(byte* w, byte* xQ8, float* result, int m, int blockCount)
+        => ComputeRowsLegacyQuant(QuantizationType.Q4_0, w, xQ8, result, m, blockCount);
+
+    private static void ComputeRowsQ4_1(byte* w, byte* xQ8, float* result, int m, int blockCount)
+        => ComputeRowsLegacyQuant(QuantizationType.Q4_1, w, xQ8, result, m, blockCount);
+
+    private static void ComputeRowsQ5_1(byte* w, byte* xQ8, float* result, int m, int blockCount)
+        => ComputeRowsLegacyQuant(QuantizationType.Q5_1, w, xQ8, result, m, blockCount);
+
+    private static void ComputeRowsIQ4_NL(byte* w, byte* xQ8, float* result, int m, int blockCount)
+        => ComputeRowsLegacyQuant(QuantizationType.IQ4_NL, w, xQ8, result, m, blockCount);
 
     /// <summary>
     /// Reports whether the fused decode path can compute a projection for <paramref name="qt"/>.
@@ -76,6 +95,10 @@ public static unsafe partial class MatMul
         QuantizationType.Q4_K => Q4_K_BlockBytes,
         QuantizationType.Q5_K => Q5_K_BlockBytes,
         QuantizationType.Q6_K => Q6_K_BlockBytes,
+        QuantizationType.Q4_0 => Q4_0BlockBytes,
+        QuantizationType.Q4_1 => Q4_1BlockBytes,
+        QuantizationType.Q5_1 => Q5_1BlockBytes,
+        QuantizationType.IQ4_NL => IQ4_NLBlockBytes,
         _ => 0,
     };
 
@@ -445,6 +468,11 @@ public static unsafe partial class MatMul
                 case QuantizationType.I2_S: GemvI2_S(weights, input, result, m, k, pool); break;
                 case QuantizationType.PQ2_0: GemvPQ2_0(weights, input, result, m, k, pool); break;
                 case QuantizationType.MXFP4: GemvMxfp4(weights, input, result, m, k, pool); break;
+                case QuantizationType.Q4_0:
+                case QuantizationType.Q4_1:
+                case QuantizationType.Q5_1:
+                case QuantizationType.IQ4_NL:
+                    GemvLegacyQuant(weights, qt, input, result, m, k, pool); break;
                 default:
                     // No dedicated GEMV for this format. Rather than fail the whole decode step,
                     // dequantize row-by-row and dot — the same last-resort path the MoE MLP uses.

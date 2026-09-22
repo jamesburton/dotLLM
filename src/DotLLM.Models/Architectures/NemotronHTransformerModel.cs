@@ -1142,6 +1142,13 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             case QuantizationType.F16:
                 MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);
                 return;
+            case QuantizationType.Q4_0:
+            case QuantizationType.Q4_1:
+            case QuantizationType.Q5_1:
+            case QuantizationType.IQ4_NL:
+                // Packed x Q8_1 dot instead of dequantize-to-F32 (#489).
+                MatMul.GemmLegacyQuantOrDequant((byte*)weights, qt, b, c, m, k, n, _threadPool, preQuantizedInput);
+                return;
             default:
                 // Shared dequantize-and-dot fallback (#263): decodes each weight row once and
                 // reuses it across all n columns instead of re-decoding the matrix per token.
@@ -1164,7 +1171,8 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             return scratch;
         }
 
-        if (qt == QuantizationType.Q5_0)
+        // Q5_0 and the packed legacy quants (Q4_0/Q4_1/Q5_1/IQ4_NL, #489) all dot against Q8_1.
+        if (qt == QuantizationType.Q5_0 || MatMul.UsesPackedLegacyDot(qt, seqLen))
         {
             int blockCount = dim / Q8_1GroupSize;
             int q8_1RowBytes = blockCount * MatMul.Q8_1BlockBytes;

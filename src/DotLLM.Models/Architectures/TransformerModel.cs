@@ -3578,6 +3578,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             MatMul.GemvI2_S((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.PQ2_0)
             MatMul.GemvPQ2_0((byte*)weights, x, y, m, k, _threadPool);
+        else if (MatMul.HasPackedLegacyDot(qt))
+            // Q4_0/Q4_1/Q5_1/IQ4_NL — packed × Q8_1 dot instead of dequantize-to-F32 (#489).
+            MatMul.GemvLegacyQuant((byte*)weights, qt, x, y, m, k, _threadPool);
         else
             MatMul.GemvDequantRows((byte*)weights, qt, x, y, m, k, _threadPool);
     }
@@ -3610,6 +3613,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             MatMul.GemmI2_S((byte*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.PQ2_0)
             MatMul.GemmPQ2_0((byte*)weights, b, c, m, k, n, _threadPool);
+        else if (MatMul.HasPackedLegacyDot(qt))
+            // Q4_0/Q4_1/Q5_1/IQ4_NL — packed × Q8_1 dot instead of dequantize-to-F32 (#489).
+            MatMul.GemmLegacyQuantOrDequant((byte*)weights, qt, b, c, m, k, n, _threadPool, preQuantizedInput);
         else
             // Formats with no dedicated vec_dot kernel (BF16, Q4_0/Q4_1/Q5_1, Q2_K/Q3_K, the IQ
             // family). MatMul.GemmDequantRows decodes each weight row once and reuses it across
@@ -3786,7 +3792,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             return scratch;
         }
 
-        if (qt == QuantizationType.Q5_0)
+        // Q5_0 and the packed legacy quants (Q4_0/Q4_1/Q5_1/IQ4_NL, #489) all dot against Q8_1.
+        if (qt == QuantizationType.Q5_0 || MatMul.UsesPackedLegacyDot(qt, seqLen))
         {
             int blockCount = dim / Q8_1GroupSize;
             int q8_1RowBytes = blockCount * MatMul.Q8_1BlockBytes;
