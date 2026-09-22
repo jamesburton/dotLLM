@@ -193,15 +193,19 @@ public class VulkanMatMulPQ2_0GemvF32KernelTests
     /// </summary>
     /// <remarks>
     /// Runs the same <c>[n, K]</c> batch through the dispatcher and through the GEMM directly and
-    /// requires agreement, at every <c>n</c> that straddles the shipped threshold of 4. Without
+    /// requires agreement at every <c>n</c> the multi-column kernel covers (2-8) and one past it. Without
     /// this, an off-by-one in the loop's offsets would only ever surface as a quality regression
     /// on a real model.
     /// </remarks>
     [SkippableTheory]
     [InlineData(2)]
+    [InlineData(3)]
     [InlineData(4)]
     [InlineData(5)]
+    [InlineData(6)]
+    [InlineData(7)]
     [InlineData(8)]
+    [InlineData(9)]      // first n past the multi-column range: the GEMM itself
     public void SmallNDispatch_AgreesWithTheGemmItReplaces(int n)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

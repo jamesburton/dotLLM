@@ -1636,11 +1636,10 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 // Shares VulkanQwen3MoeHybridWeights.KeepPQ2_0 with the dense hybrid model, so the
                 // dispatch has to match: a weights-side keep-packed arm with no matching kernel arm
                 // here would reach the default and throw.
-                // #446: the dispatch threshold is PQ2_0SmallNDispatch's, not a bare
-                // seqLen == 1 test -- the 128x128 GEMM tile only overtakes a per-token
-                // GEMV loop at n ~ 4.4 (lm_head) / ~6.5 (ffn), so 2-8 token verify
-                // batches were taking the slower kernel. DOTLLM_VK_PQ2_0_GEMV_LOOP_MAX_N=0
-                // restores the old behaviour.
+                // #446/#470: the kernel choice is PQ2_0SmallNDispatch's, not a bare
+                // seqLen == 1 test -- 2-8 token verify batches go to the multi-column GEMV,
+                // which reads the weights once for all of them; the 128x128 GEMM tile costs
+                // 4-6 single-token GEMVs even at n = 2.
                 PQ2_0SmallNDispatch.Record(cmdBuf, _kernels.MatMulPQ2_0, _kernels.MatMulPQ2_0Gemm,
                     weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;

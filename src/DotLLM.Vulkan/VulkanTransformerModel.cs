@@ -6541,9 +6541,9 @@ public sealed class VulkanTransformerModel : IModel
             // GEMV, prefill via the 32x32 register-blocked GEMM (#233) — the port of the
             // shipped I2_S prefill kernel, which folds each group's scale into the staged
             // weight tile rather than applying one tensor scale to the finished accumulator.
-            // #446: the GEMV/GEMM crossing point on the shipping 128x128 tile is n ~ 4.4
-            // (lm_head) / ~6.5 (ffn), not n == 1, so the threshold lives in
-            // PQ2_0SmallNDispatch and is shared with the two hybrid models.
+            // #446/#470: small batches (2-8 tokens) go to the multi-column GEMV, not the
+            // 128x128 GEMM tile; the policy lives in PQ2_0SmallNDispatch and is shared with
+            // the two hybrid models.
             PQ2_0SmallNDispatch.Record(cmdBuf, _matmulPQ2_0, _matmulPQ2_0Gemm,
                 weights, input, output, m: outputDim, k: inputDim, n: seqLen);
         }
