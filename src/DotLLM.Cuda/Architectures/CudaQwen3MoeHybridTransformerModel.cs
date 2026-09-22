@@ -1782,6 +1782,17 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
                     $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
         }
 
+        // The handle is length-only, but callers rely on its CurrentLength: speculative decoding
+        // rolls it back to a committed position after a rejected round. Nothing used to advance
+        // it, so Rollback(n > 0) always threw (surfaced by the MTP replay path on real hardware).
+        if (kvCache is CudaHybridKvCacheHandle handle)
+        {
+            int maxPos = 0;
+            for (int i = 0; i < positions.Length; i++)
+                if (positions[i] > maxPos) maxPos = positions[i];
+            handle.Advance(maxPos + 1);
+        }
+
         _context.MakeCurrent();
         if (DebugTrace) LogVram($"before EnsureCapacity(seqLen={seqLen})");
         _state.EnsureCapacity(seqLen);
