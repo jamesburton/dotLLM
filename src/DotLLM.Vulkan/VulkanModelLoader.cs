@@ -36,7 +36,9 @@ public static class VulkanModelLoader
     /// cache type and there is no common <c>CreateKvCache</c> interface.
     /// </returns>
     /// <exception cref="NotSupportedException">
-    /// The architecture has no GGUF representation at all (Mamba-3).
+    /// The architecture has no GGUF representation at all (Mamba-3), is recognized but not
+    /// runnable on Vulkan yet (nemotron_h_moe), or needs attention features Vulkan lacks
+    /// (gpt-oss: attention sinks, dense YaRN; #480).
     /// </exception>
     public static (IModel Model, Func<int, IKvCache> KvCacheFactory) CreateFromGguf(
         VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir,
@@ -88,6 +90,14 @@ public static class VulkanModelLoader
                     "general.architecture and no GGUF tensor-naming convention, so GgufModelConfigExtractor " +
                     "cannot produce Architecture.Mamba3 in the first place. Mamba-3 is safetensors-first on " +
                     "every backend — load it via VulkanMamba3TransformerModel.LoadFromSafetensors.");
+
+            // gpt-oss (#480): no attention sinks and no dense YaRN on Vulkan. Without this arm it
+            // falls into `default` and the generic model loads it happily and emits wrong logits.
+            // VulkanTransformerModel.RejectUnsupportedArchitecture throws the same message, which is
+            // what keeps the direct-LoadFromGguf / pipeline / hybrid side doors shut too; this arm
+            // exists so the dispatch point documents the refusal (as CUDA's did before #365).
+            case Architecture.GptOss:
+                throw new NotSupportedException(VulkanTransformerModel.GptOssUnsupportedMessage);
 
             default:
             {
