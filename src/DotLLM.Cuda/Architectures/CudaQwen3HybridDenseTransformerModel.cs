@@ -144,6 +144,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// </summary>
     internal int DebugF16CacheCurrentLengthForTest => _f16CacheCurrentLength;
 
+    /// <summary>
+    /// Test-only counter (issue #478): full-range F16→F32 KV reconversions taken by
+    /// <see cref="ForwardFullAttnBody"/> (one per attention slot per forward that misses the
+    /// incremental #182 path). Lets a test prove a post-rollback append stays incremental.
+    /// </summary>
+    internal int DebugFullKvReconvertCountForTest { get; private set; }
+
     // Opt-in split-KV attention (issue #183) scratch: partial (max, sum, out) per (head, split).
     // Sized once for the model's fixed (numHeads, headDim) shape and reused every decode step.
     private nint _attnSplitKvPartialMax;
@@ -205,6 +212,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     {
         _context.MakeCurrent();
         _gdnCache.Reset();
+        _rowSnapshotValidRows = 0;   // issue #473: snapshots no longer describe the state
     }
 
     /// <inheritdoc/>
@@ -222,23 +230,165 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     public bool SupportsRecurrentStateCheckpoint => true;
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Snapshots are pooled (one spare), mirroring the CPU and Vulkan hosts (issue #469, ported in
+    /// #478): a speculative decoder takes one per round, and a fresh <see cref="CudaGdnStateCache"/>
+    /// each time cost two <c>cuMemAlloc</c> + two <c>cuMemset</c> + two <c>cuMemFree</c> on top of
+    /// the copy. Disposing the returned checkpoint hands its buffers back for the next round. The
+    /// contents are the same D2D copy <see cref="CudaGdnStateCache.Clone"/> made, so restores are
+    /// bit-identical to before.
+    /// </remarks>
     public object? CheckpointRecurrentState()
     {
         _context.MakeCurrent();
-        return _gdnCache.Clone();
+        CudaGdnStateCache snapshot = Interlocked.Exchange(ref _spareGdnCheckpoint, null)
+            ?? new CudaGdnStateCache(_gdn, _gdnCache.NumGdnLayers);
+        _gdnCache.CopyTo(snapshot);
+        return new PooledGdnCheckpoint(this, snapshot);
     }
 
     /// <inheritdoc/>
     public void RestoreRecurrentState(object? checkpoint)
     {
-        if (checkpoint is null) return;
-        if (checkpoint is not CudaGdnStateCache snapshot)
-            throw new ArgumentException(
-                $"{GetType().Name}.RestoreRecurrentState expects a CudaGdnStateCache checkpoint; got {checkpoint.GetType().Name}.",
-                nameof(checkpoint));
+        CudaGdnStateCache? snapshot = checkpoint switch
+        {
+            null => null,
+            PooledGdnCheckpoint pooled => pooled.Snapshot,
+            CudaGdnStateCache raw => raw,
+            _ => throw new ArgumentException(
+                $"{GetType().Name}.RestoreRecurrentState expects a checkpoint from CheckpointRecurrentState; " +
+                $"got {checkpoint.GetType().Name}.",
+                nameof(checkpoint)),
+        };
+        if (snapshot is null) return;
         _context.MakeCurrent();
         snapshot.CopyTo(_gdnCache);
+        _rowSnapshotValidRows = 0;   // issue #473
     }
+
+    private CudaGdnStateCache? _spareGdnCheckpoint;
+
+    /// <summary>A pooled GDN snapshot; disposing returns its buffers to the owning model (issue #469).</summary>
+    private sealed class PooledGdnCheckpoint(CudaQwen3HybridDenseTransformerModel owner, CudaGdnStateCache snapshot)
+        : IDisposable
+    {
+        private CudaGdnStateCache? _snapshot = snapshot;
+
+        public CudaGdnStateCache Snapshot
+            => _snapshot ?? throw new ObjectDisposedException(nameof(PooledGdnCheckpoint));
+
+        public void Dispose()
+        {
+            var s = Interlocked.Exchange(ref _snapshot, null);
+            if (s is null) return;
+            if (owner._disposed || Interlocked.CompareExchange(ref owner._spareGdnCheckpoint, s, null) is not null)
+                s.Dispose();
+        }
+    }
+
+    // ── Per-row recurrent snapshots (issue #473, ported in #478) ─────────────
+
+    // Model-owned device scratch, laid out [row][gdnLayer][elements] so that one row's snapshot has
+    // exactly the layout of the live CudaGdnStateCache ([gdnLayer][elements], contiguous) and a
+    // restore is ONE D2D copy per buffer rather than one per layer. Grown to the largest verify
+    // seen and kept for the model's lifetime.
+    private nint _rowSnapGdn;
+    private nint _rowSnapConv;
+    private int _rowSnapCapacity;
+    private int _rowSnapshotRequestRows;   // > 0 only while ForwardWithRecurrentSnapshots runs
+    private int _rowSnapshotValidRows;     // rows the last such forward recorded; 0 = none
+
+    /// <summary>Device bytes currently held by the per-row recurrent snapshot scratch (issue #473).</summary>
+    public long RecurrentRowSnapshotBytes =>
+        (long)_rowSnapCapacity * _gdnCache.NumGdnLayers
+        * (_gdnCache.GdnStateElements + _gdnCache.ConvStateElements) * sizeof(float);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The verify forward copies the GDN matrix state after each scan step (the CUDA scan is already
+    /// one launch per token) and each row's conv window, so every snapshot is bit-identical to the
+    /// live state at that row. Scratch is <c>K × gdnLayers × (NVHead·DState² + conv)</c> floats of
+    /// device memory, grown to the largest K seen — about 144 MiB per row on Bonsai 27B, so ~430 MiB
+    /// at K=3, which has to fit next to the weights on a 12 GB card. It replaces the per-round
+    /// checkpoint copy and the replay forward after a rejection. <c>DOTLLM_MTP_GDN_SNAPSHOTS=0</c>
+    /// makes the decoder keep checkpoint + replay instead.
+    /// </remarks>
+    public bool SupportsRecurrentRowSnapshots => _gdnCache.NumGdnLayers > 0;
+
+    /// <inheritdoc/>
+    public ITensor ForwardWithRecurrentSnapshots(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                                                 int deviceId, IKvCache? kvCache, IMtpState? mtpState)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        int rows = Math.Max(tokenIds.Length - 1, 0);
+        _context.MakeCurrent();
+        EnsureRowSnapshotCapacity(rows);
+        _rowSnapshotRequestRows = rows;
+        ITensor logits;
+        try
+        {
+            logits = ForwardCore(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly: false,
+                                 mtpCapture: mtpState as CudaMtpState);
+        }
+        finally
+        {
+            _rowSnapshotRequestRows = 0;
+        }
+        _rowSnapshotValidRows = rows;
+        return logits;
+    }
+
+    /// <inheritdoc/>
+    public void RestoreRecurrentStateToRow(int row)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (row == _rowSnapshotValidRows && row > 0)
+            return; // the live state IS the state after the last row
+        if ((uint)row >= (uint)_rowSnapshotValidRows)
+            throw new InvalidOperationException(
+                $"No recurrent snapshot for row {row}: the last ForwardWithRecurrentSnapshots recorded " +
+                $"{_rowSnapshotValidRows} row(s), or a later forward invalidated them.");
+
+        _context.MakeCurrent();
+        nint streamH = _stream.Handle;
+        int layers = _gdnCache.NumGdnLayers;
+        long gdnRowBytes = (long)layers * _gdnCache.GdnStateElements * sizeof(float);
+        long convRowBytes = (long)layers * _gdnCache.ConvStateElements * sizeof(float);
+        if (gdnRowBytes > 0)
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_gdnCache.GetGdnStatePtr(0), RowSnapshotGdnPtr(row, 0),
+                (nuint)gdnRowBytes, streamH).ThrowOnError();
+        if (convRowBytes > 0)
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_gdnCache.GetConvStatePtr(0), RowSnapshotConvPtr(row, 0),
+                (nuint)convRowBytes, streamH).ThrowOnError();
+        _stream.Synchronize();
+        _rowSnapshotValidRows = 0;
+    }
+
+    private void EnsureRowSnapshotCapacity(int rows)
+    {
+        if (rows <= _rowSnapCapacity) return;
+        FreeRowSnapshots();
+        int layers = _gdnCache.NumGdnLayers;
+        _rowSnapGdn = AllocDevice(Math.Max((long)rows * layers * _gdnCache.GdnStateElements * sizeof(float), 4));
+        _rowSnapConv = AllocDevice(Math.Max((long)rows * layers * _gdnCache.ConvStateElements * sizeof(float), 4));
+        _rowSnapCapacity = rows;
+    }
+
+    private void FreeRowSnapshots()
+    {
+        FreeIfNonZero(ref _rowSnapGdn);
+        FreeIfNonZero(ref _rowSnapConv);
+        _rowSnapCapacity = 0;
+        _rowSnapshotValidRows = 0;
+    }
+
+    /// <summary>Device pointer to GDN layer <paramref name="gdnOrdinal"/>'s matrix-state snapshot after row <paramref name="row"/>.</summary>
+    private nint RowSnapshotGdnPtr(int row, int gdnOrdinal)
+        => _rowSnapGdn + (nint)(((long)row * _gdnCache.NumGdnLayers + gdnOrdinal) * _gdnCache.GdnStateElements * sizeof(float));
+
+    /// <summary>Device pointer to GDN layer <paramref name="gdnOrdinal"/>'s conv-window snapshot after row <paramref name="row"/>.</summary>
+    private nint RowSnapshotConvPtr(int row, int gdnOrdinal)
+        => _rowSnapConv + (nint)(((long)row * _gdnCache.NumGdnLayers + gdnOrdinal) * _gdnCache.ConvStateElements * sizeof(float));
 
     /// <summary>Number of full-attention layers — matches the sparse KV-cache slot count.</summary>
     public int AttentionLayerCount => _attentionLayerCount;
@@ -781,16 +931,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                     $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
         }
 
-        // The handle is length-only, but callers rely on its CurrentLength: speculative decoding
-        // rolls it back to a committed position after a rejected round. Nothing used to advance
-        // it, so Rollback(n > 0) always threw (surfaced by the MTP replay path on real hardware).
-        if (kvCache is CudaHybridKvCacheHandle handle)
-        {
-            int maxPos = 0;
-            for (int i = 0; i < positions.Length; i++)
-                if (positions[i] > maxPos) maxPos = positions[i];
-            handle.Advance(maxPos + 1);
-        }
+        AdvanceKvHandleAndSyncLengths(kvCache, positions);
+        // Any forward moves the model-owned GDN state on, so earlier row snapshots no longer
+        // describe it (issue #473). ForwardWithRecurrentSnapshots re-validates after it returns.
+        _rowSnapshotValidRows = 0;
 
         _context.MakeCurrent();
         _state.EnsureCapacity(seqLen);
@@ -833,6 +977,32 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.HiddenState,
             (nuint)((long)seqLen * hiddenSize * sizeof(float))).ThrowOnError();
         return result;
+    }
+
+    /// <summary>
+    /// Advances the length-only KV handle to cover <paramref name="positions"/> and, first, syncs the
+    /// model-owned KV lengths to the handle's committed length (issues #476, #478).
+    /// </summary>
+    /// <remarks>
+    /// The handle is length-only, but callers rely on its <c>CurrentLength</c>: speculative decoding
+    /// rolls it back to a committed position after a rejected round. Nothing used to advance it, so
+    /// <c>Rollback(n &gt; 0)</c> always threw (#476). Its length BEFORE this call is the committed
+    /// prefix; <see cref="_f16CacheCurrentLength"/> and every <see cref="_f32KvValidLength"/> slot
+    /// shrink to it, so post-rollback appends take the incremental #182 conversion instead of a
+    /// full-range reconversion (#478). Runs once per forward, before any attention layer reads them.
+    /// </remarks>
+    private void AdvanceKvHandleAndSyncLengths(IKvCache? kvCache, ReadOnlySpan<int> positions)
+    {
+        if (kvCache is not CudaHybridKvCacheHandle handle)
+            return;
+
+        _f16CacheCurrentLength = HybridKvLengthBookkeeping.SyncToCommitted(
+            _f16CacheCurrentLength, _f32KvValidLength ?? Span<int>.Empty, handle.CurrentLength);
+
+        int maxPos = 0;
+        for (int i = 0; i < positions.Length; i++)
+            if (positions[i] > maxPos) maxPos = positions[i];
+        handle.Advance(maxPos + 1);
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -1230,16 +1400,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                     $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
         }
 
-        // The handle is length-only, but callers rely on its CurrentLength: speculative decoding
-        // rolls it back to a committed position after a rejected round. Nothing used to advance
-        // it, so Rollback(n > 0) always threw (surfaced by the MTP replay path on real hardware).
-        if (kvCache is CudaHybridKvCacheHandle handle)
-        {
-            int maxPos = 0;
-            for (int i = 0; i < positions.Length; i++)
-                if (positions[i] > maxPos) maxPos = positions[i];
-            handle.Advance(maxPos + 1);
-        }
+        AdvanceKvHandleAndSyncLengths(kvCache, positions);
+        // Any forward moves the model-owned GDN state on, so earlier row snapshots no longer
+        // describe it (issue #473). ForwardWithRecurrentSnapshots re-validates after it returns.
+        _rowSnapshotValidRows = 0;
 
         // Category profiler bracket (issue #168): MakeCurrent + EnsureCapacity + H2D
         // token/position copy + host embed-lookup dequant + H2D embed copy. Confirmed via a
@@ -1365,6 +1529,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private void AbsorbMtp(in CudaMtpHeadWeights mtpHead, CudaMtpState state,
                            ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions)
     {
+        if (!DotLLM.Models.Architectures.MtpAbsorbDispatch.UsePerToken
+            && DotLLM.Models.Architectures.MtpAbsorbDispatch.IsContiguous(positions))
+        {
+            AbsorbMtpBatched(mtpHead, state, tokenIds, positions[0]);
+            state.SeedFromCapturedRow(tokenIds.Length - 1);
+            return;
+        }
         for (int i = 0; i < tokenIds.Length; i++)
         {
             if (i == 0) state.SetPendingFromCarry();
@@ -1372,6 +1543,191 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             ForwardMtpCore(mtpHead, state, tokenIds[i], positions[i], computeLogits: false);
         }
         state.SeedFromCapturedRow(tokenIds.Length - 1);
+    }
+
+    /// <summary>Rows per chunk of <see cref="AbsorbMtpBatched"/>: bounds its scratch on a long prefill.</summary>
+    private const int MtpAbsorbChunkRows = 64;
+
+    /// <summary>
+    /// Device scratch for <see cref="AbsorbMtpBatched"/>, sized for up to
+    /// <see cref="MtpAbsorbChunkRows"/> rows and allocated on first use.
+    /// </summary>
+    private sealed class CudaMtpAbsorbScratch : IDisposable
+    {
+        public int Rows;
+        public nint Embed;      // [rows, hidden]
+        public nint Pair;       // [rows, hidden]
+        public nint ENorm;      // [rows, hidden]
+        public nint HNorm;      // [rows, hidden]
+        public nint Concat;     // [rows, 2 * hidden]
+        public nint Cur;        // [rows, hidden]
+        public nint Normed;     // [rows, hidden]
+        public nint Positions;  // [rows] int32
+
+        public static CudaMtpAbsorbScratch Allocate(int rows, int hiddenSize)
+        {
+            long h = (long)rows * hiddenSize * sizeof(float);
+            return new CudaMtpAbsorbScratch
+            {
+                Rows = rows,
+                Embed = AllocDevice(h),
+                Pair = AllocDevice(h),
+                ENorm = AllocDevice(h),
+                HNorm = AllocDevice(h),
+                Concat = AllocDevice(2 * h),
+                Cur = AllocDevice(h),
+                Normed = AllocDevice(h),
+                Positions = AllocDevice((long)rows * sizeof(int)),
+            };
+        }
+
+        public void Dispose()
+        {
+            FreeIfNonZero(ref Embed);
+            FreeIfNonZero(ref Pair);
+            FreeIfNonZero(ref ENorm);
+            FreeIfNonZero(ref HNorm);
+            FreeIfNonZero(ref Concat);
+            FreeIfNonZero(ref Cur);
+            FreeIfNonZero(ref Normed);
+            FreeIfNonZero(ref Positions);
+        }
+    }
+
+    private CudaMtpAbsorbScratch? _mtpAbsorbScratch;
+
+    /// <summary>
+    /// Batched, KV-only absorb of S contiguous positions (issue #472, ported in #478) — see
+    /// <c>MtpAbsorbDispatch</c>. Computes exactly the K/V rows <see cref="ForwardMtpCore"/> writes
+    /// per token and nothing past them: an absorbed step's output hidden is discarded (the next
+    /// draft seeds from a trunk row), so its attention, O-projection, FFN and the per-token stream
+    /// sync are dead work.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Bit-identical to the per-token absorb, deliberately.</b> The embed dequant, the pairing
+    /// rows, every RMSNorm (enorm, hnorm, attn_norm, K-norm) and RoPE are batched over S rows — all
+    /// of them are per-row kernels (one block per row / one thread per pair), so a row's result does
+    /// not depend on the batch. The three projections (eh_proj, K, V) are NOT batched: this model's
+    /// <see cref="Gemm"/> takes a different route for <c>seqLen &gt; 1</c> (dequant to F16 + cuBLAS
+    /// HGEMM on F16-staged activations) than for one row (the F32-native GEMV the per-token path
+    /// uses), so an S-row GEMM would change the head's K/V bits on quantized weights. They run as S
+    /// single-row GEMVs instead. A batched-GEMM variant would be faster on a long prefill; it is a
+    /// separate, output-changing decision.
+    /// </para>
+    /// <para>
+    /// Processed in chunks of <see cref="MtpAbsorbChunkRows"/> rows so a long prefill does not size
+    /// the scratch to the prompt. Chunking cannot change a row's result for the same reason.
+    /// </para>
+    /// </remarks>
+    private void AbsorbMtpBatched(in CudaMtpHeadWeights mtpHead, CudaMtpState state,
+                                  ReadOnlySpan<int> tokenIds, int firstPosition)
+    {
+        int total = tokenIds.Length;
+        int hiddenSize = Config.HiddenSize;
+        var attn = mtpHead.Layer.FullAttn!.Value;
+        int numKvHeads = attn.NumKvHeads;
+        int headDim = Config.HeadDim;
+        float eps = Config.NormEpsilon;
+        nint streamH = _stream.Handle;
+        long hiddenRowBytes = (long)hiddenSize * sizeof(float);
+
+        state.BeginAbsorb(firstPosition, total);
+
+        int chunkRows = Math.Max(1, Math.Min(total, MtpAbsorbChunkRows));
+        if (_mtpAbsorbScratch is null || _mtpAbsorbScratch.Rows < chunkRows)
+        {
+            _mtpAbsorbScratch?.Dispose();
+            _mtpAbsorbScratch = CudaMtpAbsorbScratch.Allocate(chunkRows, hiddenSize);
+        }
+        var sc = _mtpAbsorbScratch;
+
+        // Same embedding-table selection as ForwardMtpCore: head-local nextn.embed_tokens when the
+        // GGUF ships one, the trunk table otherwise.
+        nint embedHostBase = mtpHead.EmbedTokensHostBase ?? _embedDataBase;
+        ulong embedDataOffset = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensDataOffset : _embedDataOffset;
+        long embedRowBytes = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensRowBytes : _embedRowBytes;
+        QuantizationType embedQt = mtpHead.EmbedTokensHostBase is not null ? mtpHead.EmbedTokensQt : _tokenEmbedQt;
+
+        int chunkElems = chunkRows * hiddenSize;
+        float[] embedHost = System.Buffers.ArrayPool<float>.Shared.Rent(chunkElems);
+        float[] pairHost = System.Buffers.ArrayPool<float>.Shared.Rent(chunkElems);
+        int[] posHost = System.Buffers.ArrayPool<int>.Shared.Rent(chunkRows);
+        try
+        {
+            for (int start = 0; start < total; start += chunkRows)
+            {
+                int s = Math.Min(chunkRows, total - start);
+                int elems = s * hiddenSize;
+
+                for (int i = 0; i < s; i++)
+                {
+                    nint rowSrc = embedHostBase + (nint)(embedDataOffset + (ulong)tokenIds[start + i] * (ulong)embedRowBytes);
+                    Dequantize.ToFloat32(rowSrc, hiddenSize, embedQt, embedHost.AsSpan(i * hiddenSize, hiddenSize));
+                    posHost[i] = firstPosition + start + i;
+                }
+                // Pairing (#469): row r goes with h_{p-1} — the carry for r == 0, captured row r-1 otherwise.
+                state.CopyAbsorbPairingRows(start, s, pairHost.AsSpan(0, elems));
+
+                // Synchronous H2D: the pooled host arrays are reused by the next chunk.
+                fixed (float* pEmbed = embedHost)
+                    CudaDriverApi.cuMemcpyHtoD_v2(sc.Embed, (nint)pEmbed, (nuint)((long)elems * sizeof(float))).ThrowOnError();
+                fixed (float* pPair = pairHost)
+                    CudaDriverApi.cuMemcpyHtoD_v2(sc.Pair, (nint)pPair, (nuint)((long)elems * sizeof(float))).ThrowOnError();
+                fixed (int* pPos = posHost)
+                    CudaDriverApi.cuMemcpyHtoD_v2(sc.Positions, (nint)pPos, (nuint)(s * sizeof(int))).ThrowOnError();
+
+                // enorm / hnorm over s rows, then interleave into concat rows [e_i, h_i].
+                _kernels.LaunchRmsNormF32(sc.Embed, mtpHead.EnormDevice, sc.ENorm, hiddenSize, eps, s, streamH);
+                _kernels.LaunchRmsNormF32(sc.Pair, mtpHead.HnormDevice, sc.HNorm, hiddenSize, eps, s, streamH);
+                for (int i = 0; i < s; i++)
+                {
+                    nint rowOff = (nint)(i * hiddenRowBytes);
+                    nint catOff = (nint)(2 * i * hiddenRowBytes);
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(sc.Concat + catOff, sc.ENorm + rowOff,
+                        (nuint)hiddenRowBytes, streamH).ThrowOnError();
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(sc.Concat + catOff + (nint)hiddenRowBytes, sc.HNorm + rowOff,
+                        (nuint)hiddenRowBytes, streamH).ThrowOnError();
+                }
+
+                // cur = eh_proj @ concat — one GEMV per row (see remarks), then attn_norm over s rows.
+                for (int i = 0; i < s; i++)
+                {
+                    Gemm(mtpHead.EhProjDevice, mtpHead.EhProjQt,
+                         sc.Concat + (nint)(2 * i * hiddenRowBytes), sc.Cur + (nint)(i * hiddenRowBytes),
+                         mtpHead.EhProjOutputDim, mtpHead.EhProjInputDim, 1);
+                }
+                _kernels.LaunchRmsNormF32(sc.Cur, mtpHead.Layer.AttnNormWeightDevice, sc.Normed, hiddenSize, eps, s, streamH);
+
+                // K/V straight into the head's cache slab [p, p + s): one contiguous [maxSteps, kvStride] buffer.
+                int p = firstPosition + start;
+                for (int i = 0; i < s; i++)
+                {
+                    nint normedRow = sc.Normed + (nint)(i * hiddenRowBytes);
+                    Gemm(attn.KDevice, attn.KQt, normedRow, state.GetKeyRowDevicePtr(p + i),
+                         attn.KOutputDim, attn.KInputDim, 1);
+                    Gemm(attn.VDevice, attn.VQt, normedRow, state.GetValueRowDevicePtr(p + i),
+                         attn.VOutputDim, attn.VInputDim, 1);
+                }
+
+                nint kSlab = state.GetKeyRowDevicePtr(p);
+                _kernels.LaunchRmsNormF32(kSlab, attn.KNormDevice, kSlab, headDim, eps, s * numKvHeads, streamH);
+                // numHeads = 0: the kernel rotates no Q pairs, so its Q operand is never touched.
+                _kernels.LaunchRoPEF32(kSlab, kSlab, sc.Positions, s, 0, numKvHeads, headDim,
+                    _ropeDim, _ropeTheta, 1, streamH);
+
+                // The next chunk overwrites the device scratch.
+                _stream.Synchronize();
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(embedHost);
+            System.Buffers.ArrayPool<float>.Shared.Return(pairHost);
+            System.Buffers.ArrayPool<int>.Shared.Return(posHost);
+        }
+
+        state.EndAbsorb(firstPosition + total);
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -1832,6 +2188,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         int kDim = nKHead * dState;
         int gdnOrdinal = _gdnLayerOrdinal[absoluteLayerIdx];
 
+        // Issue #473: rows whose post-row state this forward records (verify forwards only). A
+        // request implies seqLen >= 2, so the general (convInput) conv path below always runs.
+        int snapRows = _rowSnapshotRequestRows > 0 ? Math.Min(_rowSnapshotRequestRows, seqLen - 1) : 0;
+
         nint normOut = _state.NormOutput;
         nint qkvBuf = _state.GdnQkvBuf;
         nint zBuf = _state.GdnZBuf;
@@ -1929,6 +2289,16 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             nint trailRowsSrc = convInput + (nint)((long)seqLen * convDim * sizeof(float));
             CudaDriverApi.cuMemcpyDtoDAsync_v2(convStateDev, trailRowsSrc,
                 (nuint)convStateBytes, streamH).ThrowOnError();
+
+            // Issue #473: the conv window after row t is convInput rows t+1 .. t+dConv-1 — the
+            // slice the save above takes for t = seqLen-1. Same stream, so ordered before the next
+            // layer reuses convInput.
+            for (int t = 0; t < snapRows; t++)
+            {
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(RowSnapshotConvPtr(t, gdnOrdinal),
+                    convInput + (nint)((long)(t + 1) * convDim * sizeof(float)),
+                    (nuint)convStateBytes, streamH).ThrowOnError();
+            }
         }
         ProfMark("gdn-3-conv1d");
 
@@ -2003,6 +2373,14 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             {
                 _kernels.LaunchGdnScanStepF32(gdnStateDev, qT, kT, vT, gT, betaT, outT,
                     nVHead, nKHead, dState, streamH);
+            }
+
+            // Issue #473: the scan is already one launch per token, so the state after row t is a
+            // plain D2D copy of the live state here — bit-identical by construction, no new kernel.
+            if (t < snapRows)
+            {
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(RowSnapshotGdnPtr(t, gdnOrdinal), gdnStateDev,
+                    (nuint)((long)_gdnCache.GdnStateElements * sizeof(float)), streamH).ThrowOnError();
             }
         }
         ProfMark("gdn-5-scan");
@@ -2151,7 +2529,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             // (that case cannot be told apart here from ordinary appends by length alone, but ANY
             // deviation from "starts exactly at the recorded valid length" -- including the
             // shrink case the position range would otherwise imply -- is treated as untrusted and
-            // triggers the safe full reconversion).
+            // triggers the safe full reconversion). Issue #478: a speculative-decoding rollback is
+            // NOT such a deviation any more -- AdvanceKvHandleAndSyncLengths shrinks this slot's
+            // valid length to the handle's committed length before the first layer runs, so the
+            // post-rollback append starts exactly at it and stays incremental.
             //
             // Result (issue #182, RTX 3060, real Bonsai-27B, single continuous decode sequence --
             // NOT `dotllm bench -r N>1`, which was found during this work to be unsuitable for
@@ -2175,8 +2556,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             // observed regression in any round (unlike this file's several genuine negative results,
             // which all showed consistent, large regressions from added sync overhead).
             int prevValid = _f32KvValidLength![slot];
-            bool contiguousAppend = !ForceFullKvReconvertForTest
-                && IsContiguousAscendingRun(positions) && positions[0] == prevValid;
+            bool contiguousAppend = HybridKvLengthBookkeeping.IsIncrementalAppend(
+                positions, prevValid, ForceFullKvReconvertForTest);
 
             if (contiguousAppend)
             {
@@ -2199,6 +2580,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 _kernels.LaunchConvertF16ToF32(_f16KCache![slot], kStage, kvLiveElems, streamH);
                 _kernels.LaunchConvertF16ToF32(_f16VCache![slot], vStage, kvLiveElems, streamH);
                 _f32KvValidLength[slot] = seqKv;
+                DebugFullKvReconvertCountForTest++;
             }
             ProfMark("attn-6b-kvdequant");
 
@@ -2459,15 +2841,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _f32KvValidLength![slot] = 0;
     }
 
-    /// <summary>True if <paramref name="positions"/> is a strictly-ascending run of consecutive
-    /// integers (e.g. <c>[5]</c>, <c>[5,6,7]</c>). Used to gate the incremental KV F16->F32
-    /// staging fast path -- see the call site in <c>ForwardFullAttnBody</c>.</summary>
-    private static bool IsContiguousAscendingRun(ReadOnlySpan<int> positions)
-    {
-        for (int i = 1; i < positions.Length; i++)
-            if (positions[i] != positions[i - 1] + 1) return false;
-        return true;
-    }
 
     /// <summary>
     /// Ensures the opt-in split-KV attention (issue #183) partial scratch buffers can hold
@@ -2545,14 +2918,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         int totalElems = seqLen * kvElems;
 
         bool contiguous = seqLen > 0;
-        int maxPos = positions[0];
         for (int i = 0; i < seqLen; i++)
         {
             int p = positions[i];
             if ((uint)p >= (uint)_f16CacheMaxSeqLen)
                 throw new ArgumentOutOfRangeException(nameof(positions),
                     $"Position {p} at index {i} exceeds F16 KV cache capacity {_f16CacheMaxSeqLen}.");
-            if (p > maxPos) maxPos = p;
             if (i > 0 && positions[i] != positions[i - 1] + 1) contiguous = false;
         }
 
@@ -2595,9 +2966,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             }
         }
 
-        int newLength = maxPos + 1;
-        if (newLength > _f16CacheCurrentLength)
-            _f16CacheCurrentLength = newLength;
+        _f16CacheCurrentLength = HybridKvLengthBookkeeping.LengthAfterWrite(_f16CacheCurrentLength, positions);
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -2933,9 +3302,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         }
         _mtpScratch?.Dispose();
         _mtpScratch = null;
+        _mtpAbsorbScratch?.Dispose();
+        _mtpAbsorbScratch = null;
 
         _state.Dispose();
         _gdnCache.Dispose();
+        Interlocked.Exchange(ref _spareGdnCheckpoint, null)?.Dispose();
+        FreeRowSnapshots();
         _kernels.Dispose();
         _cublas.Dispose();
         _stream.Dispose();

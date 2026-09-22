@@ -376,7 +376,12 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
             Assert.True(model.SupportsMtp);
             Assert.True(model.SupportsRecurrentStateCheckpoint);
 
-            var decoder = new MtpSpeculativeDecoder(greedy: true);
+            // Pinned to checkpoint + replay (issue #478, as the CPU twin was at #473): byte-identity
+            // with a serial decode holds only because every rejection here happens at row 0, so the
+            // replay is a 1-row forward exactly like the serial one. A row snapshot comes from inside
+            // the K+1-row verify batch, whose trunk GEMMs take a different route by batch width.
+            // CudaQwen3HybridDenseGdnRowSnapshotTests covers the snapshot path within tolerance.
+            var decoder = new MtpSpeculativeDecoder(greedy: true) { UseRecurrentRowSnapshots = false };
             var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
 
             var generatedIds = new List<int> { startToken };

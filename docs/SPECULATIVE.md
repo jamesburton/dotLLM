@@ -138,7 +138,10 @@ the conv1d window are captured, the latter as `ConvInput` rows `t+1 .. t+dConv-1
 - **Implemented:** CPU `Qwen3HybridDenseTransformerModel` (`GatedDeltaNetScan.Execute` copies
   the state out after each row) and `VulkanQwen3HybridDenseTransformerModel` (the
   `gdn_scan_multi_token_lds_fused_snap_f32` twin of the shipping scan writes each row's state from
-  LDS). CUDA keeps checkpoint + replay.
+  LDS), and since #478 `CudaQwen3HybridDenseTransformerModel` (no new kernel: the CUDA scan is
+  already one launch per token, so each row's state is a D2D copy right after its launch; the
+  scratch is laid out `[row][layer]` so a restore is two copies). The CUDA checkpoint is pooled
+  (one spare) like the CPU and Vulkan ones (#469).
 - **Opt-out:** `DOTLLM_MTP_GDN_SNAPSHOTS=0`, or `MtpSpeculativeDecoder.UseRecurrentRowSnapshots`
   in-process. `Replays` and `ReplaysAvoided` count each path.
 - **Memory:** `K x GDN layers x (NVHead*DState^2 + conv)` floats, grown to the largest K seen and
@@ -354,10 +357,13 @@ reason about for a first CPU implementation; does not affect correctness.
 Slot `p` of the head's KV-cache holds the pair `(h_{p-1}, x_p)`: token `i` of a trunk batch pairs
 with the carried row for `i == 0` and captured row `i - 1` otherwise. An absorbed step's output
 hidden is never used (the next draft seeds from a trunk row), so the absorb only needs the K/V
-rows. Since #472 all backends except CUDA absorb a contiguous batch in ONE KV-only pass — embed,
+rows. Since #472 every backend absorbs a contiguous batch in ONE KV-only pass — embed,
 `enorm`/`hnorm`, `eh_proj`, `attn_norm`, K/V projections (n = S), K-norm, RoPE, one slab write — and
-skip attention, the O-projection and the FFN entirely. `DOTLLM_MTP_ABSORB_PER_TOKEN=1` restores the
-per-token loop (CUDA still uses it). Bonsai 2 27B, Vulkan: S=3 (a K=2 verify) 12.9 → 1.7 ms; S=256
+skips attention, the O-projection and the FFN entirely. `DOTLLM_MTP_ABSORB_PER_TOKEN=1` restores the
+per-token loop. CUDA (#478) batches the per-row kernels but keeps the three projections as S
+single-row GEMVs: its `Gemm` routes n > 1 through dequant-to-F16 + HGEMM, which would change the
+head's K/V bits on quantized weights, so the CUDA batched absorb stays bit-identical to its
+per-token loop (one stream sync per 64-row chunk instead of one per token). Bonsai 2 27B, Vulkan: S=3 (a K=2 verify) 12.9 → 1.7 ms; S=256
 prefill 1171 → 5 ms. CPU: S=3 178 → 15 ms.
 
 ### Correctness (demonstrated, not asserted)
