@@ -1417,6 +1417,19 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         => ForwardCore(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly: false,
                         mtpCapture: mtpState as CudaMtpState);
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Issue #493: honours <paramref name="lastTokenLogitsOnly"/> <b>together with</b>
+    /// <paramref name="mtpState"/>. The MTP capture needs every position's post-<c>output_norm</c>
+    /// row, but the LM head does not — <see cref="ForwardCore"/> normalises all rows and still
+    /// projects only the last one, so an MTP prefill gets the same VRAM saving as a plain one.
+    /// </remarks>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ILoraAdapter? adapter,
+                           IMtpState? mtpState, bool lastTokenLogitsOnly)
+        => ForwardCore(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly,
+                        mtpCapture: mtpState as CudaMtpState);
+
     /// <summary>
     /// Core forward-pass implementation shared by every public <c>Forward</c> overload above.
     /// <paramref name="mtpCapture"/> is non-null only from the MTP-aware overload — see that
@@ -1519,9 +1532,9 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         // per input token, BEFORE the final RMSNorm below overwrites _state.HiddenState in place.
         // This is the exact quantity llama.cpp's MTP head consumes (`h_pre_norm` /
         // `llama_get_embeddings_pre_norm`) — a pure side effect that never changes the logits this
-        // call returns. The MTP-aware Forward overload always passes lastTokenLogitsOnly=false, so
-        // _state.HiddenState always holds all `seqLen` valid rows here regardless of logitsRows
-        // below. cuMemcpyDtoH_v2 does not implicitly wait for this model's non-default _stream, so
+        // call returns. Every layer writes all `seqLen` rows, so _state.HiddenState always holds
+        // all of them here regardless of the logits row count chosen below (the final norm's
+        // row count is decided separately — see `normRows`). cuMemcpyDtoH_v2 does not implicitly wait for this model's non-default _stream, so
         // synchronize first — the LM-head projection below queues fresh work after this point, so
         // this sync does not skip/reorder anything, only adds one extra host-blocking wait on the
         // (low-frequency, K+1-token-per-round) MTP verify/catchup path.
@@ -1543,19 +1556,24 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         // per-position logits, unchanged from before this fix.
         int logitsRows = lastTokenLogitsOnly ? 1 : seqLen;
         _state.EnsureLogitsCapacity(logitsRows);
-        nint lmHeadInput = logitsRows == seqLen
-            ? _state.HiddenState
-            : _state.HiddenState + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
-        _kernels.LaunchRmsNormF32(lmHeadInput, _outputNormDevice, lmHeadInput,
-            hiddenSize, eps, logitsRows, streamH);
+        // Issue #493: the LM head and the MTP capture want different row counts. The head only
+        // needs the last row when the caller opted in; the MTP head consumes llama.cpp's `h_nextn`
+        // for EVERY position, so the final norm must still cover all `seqLen` rows whenever a
+        // capture is active. Normalise `normRows` rows, then project the last `logitsRows` of them
+        // — the two are independent, so an MTP prefill can also skip the [seqLen, vocab] LM head.
+        int normRows = mtpCapture is not null ? seqLen : logitsRows;
+        nint lastRowPtr = _state.HiddenState + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
+        nint normInput = normRows == seqLen ? _state.HiddenState : lastRowPtr;
+        _kernels.LaunchRmsNormF32(normInput, _outputNormDevice, normInput,
+            hiddenSize, eps, normRows, streamH);
+        nint lmHeadInput = logitsRows == seqLen ? _state.HiddenState : lastRowPtr;
 
         // MTP (issues #253, #469): the head consumes llama.cpp's `h_nextn` — the hidden state AFTER
-        // output_norm. The MTP-aware overload never sets lastTokenLogitsOnly, so every row has just
-        // been normalised in place. cuMemcpyDtoH does not wait for this model's stream: sync first.
+        // output_norm. `normRows == seqLen` whenever a capture is active (issue #493), so every row
+        // has just been normalised in place, whatever the LM head's row count is.
+        // cuMemcpyDtoH does not wait for this model's stream: sync first.
         if (mtpCapture is not null)
         {
-            if (logitsRows != seqLen)
-                throw new InvalidOperationException("MTP capture needs every row normalised (lastTokenLogitsOnly must be false).");
             _stream.Synchronize();
             mtpCapture.SetCapturedRowsFromDevice(_state.HiddenState, seqLen);
         }

@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
@@ -1755,6 +1756,18 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache)
         => Forward(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly: false);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Issue #493: this model has neither LoRA nor MTP support, so both extra arguments are
+    /// ignored (per the <see cref="IModel"/> contract) and the hint is honoured regardless. The
+    /// override exists because the interface default drops the hint whenever an adapter is
+    /// non-null, which a LoRA-configured <c>TextGenerator</c> would hit on every prefill.
+    /// </remarks>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ILoraAdapter? adapter,
+                           IMtpState? mtpState, bool lastTokenLogitsOnly)
+        => Forward(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly);
 
     /// <inheritdoc/>
     [SkipLocalsInit]
