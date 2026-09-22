@@ -305,6 +305,69 @@ public sealed unsafe class W2A8SseTierTests
         }
     }
 
+    /// <summary>
+    /// The pooled W2A8 drivers (row-partitioned workers reading the context structs, including the
+    /// pre-converted activation scales) must be bit-identical to the single-threaded drivers: each
+    /// row runs the same kernels in the same order. m is above ParallelMinRows (32) and not a
+    /// multiple of the thread count, so the pool path engages with uneven partitions.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("pq2", 97, 640, 1)]
+    [InlineData("i2s", 97, 384, 1)]
+    [InlineData("i2s", 97, 384, 3)]
+    [InlineData("i2s", 101, 256, 6)]   // 4x4 tile + token remainder on AVX2; per-cell on SSE
+    public void Pooled_MatchesSingleThreaded_BitExact(string format, int m, int k, int n)
+    {
+        Skip.IfNot(Ssse3.IsSupported, "needs SSSE3");
+        var rng = new Random(477_600 + m + k + n);
+        bool pq2 = format == "pq2";
+        long wBytes = pq2 ? (long)m * (k / 128) * 34 : (long)m * k / 4 + 4;
+        byte* weights = (byte*)NativeMemory.Alloc((nuint)wBytes);
+        float* b = (float*)NativeMemory.Alloc((nuint)(n * k * sizeof(float)));
+        float* c1 = (float*)NativeMemory.Alloc((nuint)(n * m * sizeof(float)));
+        float* cP = (float*)NativeMemory.Alloc((nuint)(n * m * sizeof(float)));
+        using var pool = new DotLLM.Cpu.Threading.ComputeThreadPool(5);
+        try
+        {
+            if (pq2)
+            {
+                int rowBytes = (k / 128) * 34;
+                for (int r = 0; r < m; r++)
+                {
+                    byte* row = RandomPQ2_0Row(rng, k / 128);
+                    Buffer.MemoryCopy(row, weights + r * rowBytes, rowBytes, rowBytes);
+                    NativeMemory.Free(row);
+                }
+            }
+            else
+            {
+                for (long i = 0; i < wBytes - 4; i++)
+                    weights[i] = (byte)(rng.Next(3) | (rng.Next(3) << 2) | (rng.Next(3) << 4) | (rng.Next(3) << 6));
+                *(float*)(weights + wBytes - 4) = 0.041f;
+            }
+            for (int i = 0; i < n * k; i++) b[i] = rng.NextSingle() * 2f - 1f;
+
+            if (pq2)
+            {
+                MatMul.GemvPQ2_0(weights, b, c1, m, k, null);
+                MatMul.GemvPQ2_0(weights, b, cP, m, k, pool);
+            }
+            else
+            {
+                MatMul.GemmI2_S(weights, b, c1, m, k, n, null);
+                MatMul.GemmI2_S(weights, b, cP, m, k, n, pool);
+            }
+
+            for (int i = 0; i < n * m; i++)
+                Assert.True(BitConverter.SingleToInt32Bits(c1[i]) == BitConverter.SingleToInt32Bits(cP[i]),
+                    $"{format} element {i}: single-threaded {c1[i]} vs pooled {cP[i]}");
+        }
+        finally
+        {
+            NativeMemory.Free(weights); NativeMemory.Free(b); NativeMemory.Free(c1); NativeMemory.Free(cP);
+        }
+    }
+
     // ──────────────────── helpers ────────────────────
 
     /// <summary>Σ_b (float)(d_b·g_{b/4}) · Σ w·q, with the integer block sum exact and the float
