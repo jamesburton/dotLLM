@@ -222,6 +222,14 @@ public static unsafe partial class Dequantize
     /// scales[16] (4-bit scale + 4-bit dmin coef per sub-block, packed) +
     /// qs[64] (2-bit elements, 4 per byte) + d (half) + dmin (half) = 84 bytes per 256 elements.
     /// Per-element decode: <c>value = d × scale × q2 − dmin × dmin_coef</c>.
+    /// <para><b>Element ordering is transposed</b>, exactly as in Q3_K. Per llama.cpp
+    /// <c>dequantize_row_q2_K</c>, each 128-element half consumes 32 <c>qs</c> bytes and each byte
+    /// supplies FOUR elements 32 apart: element <c>e</c> reads bit-pair <c>(e&gt;&gt;5)&amp;3</c> of byte
+    /// <c>32·(e&gt;&gt;7) + (e&amp;31)</c>. Reading it as <c>e/4 @ (e%4)·2</c> — the obvious-looking layout
+    /// this kernel shipped with until issue #498 — permutes every element into the wrong sub-block
+    /// scale; decoded weights then correlate ~0.07 with the true values (measured on
+    /// <c>Llama-3.2-1B-pure-Q2_K</c> against Q8_0 of the same base; the correct layout scores 0.954).
+    /// The scale/dmin sub-block index <c>e&gt;&gt;4</c> was and remains correct.</para>
     /// </summary>
     [SkipLocalsInit]
     internal static unsafe void DequantizeQ2_K(nint src, long elementCount, Span<float> dest)
@@ -244,9 +252,9 @@ public static unsafe partial class Dequantize
             int outOffset = (int)(sb * KQuantGroupSize);
             for (int t = 0; t < KQuantGroupSize; t++)
             {
-                int sub = t >> 4;          // t / 16
-                int byteIdx = t >> 2;      // t / 4
-                int bitOff = (t & 0x3) << 1; // (t % 4) * 2
+                int sub = t >> 4;                        // t / 16 — scale sub-block
+                int byteIdx = ((t >> 7) << 5) | (t & 31); // 32*(t/128) + t%32
+                int bitOff = ((t >> 5) & 0x3) << 1;       // 2 * ((t/32) % 4)
                 int q2 = (qs[byteIdx] >> bitOff) & 0x3;
                 int scale = scales[sub] & 0xF;
                 int dmCoef = (scales[sub] >> 4) & 0xF;
