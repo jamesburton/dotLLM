@@ -76,15 +76,21 @@ public static unsafe partial class Dequantize
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void UnpackQ3KScales(byte* scales12, byte* dest16)
     {
-        for (int sub = 0; sub < 16; sub++)
-        {
-            int lowSrcByte = sub < 8 ? sub : sub - 8;  // sub 8..15 → bytes 0..7 high nibble
-            int lowNibble = sub < 8 ? scales12[lowSrcByte] & 0x0F : (scales12[lowSrcByte] >> 4) & 0x0F;
-            int hiByte = 8 + (sub % 4);
-            int hiShift = (sub / 4) * 2;
-            int hiBits = (scales12[hiByte] >> hiShift) & 0x03;
-            dest16[sub] = (byte)(lowNibble | (hiBits << 4));
-        }
+        // llama.cpp's own 4-word form, not the per-sub-block loop: this runs once per 256-element
+        // super-block on the Q3_K dot's hot path, where a 16-iteration branchy loop was measurable
+        // (~2.3x the per-super-block cost of Q2_K, which has no such unpack). The byte order of
+        // the result is the sub-block order, so it is the same 16 values either way.
+        const uint kmask1 = 0x03030303u;  // the 2 high bits of each scale, packed 4-per-byte
+        const uint kmask2 = 0x0f0f0f0fu;  // the low nibble of each scale
+
+        uint a0 = Unsafe.ReadUnaligned<uint>(scales12);
+        uint a1 = Unsafe.ReadUnaligned<uint>(scales12 + 4);
+        uint tmp = Unsafe.ReadUnaligned<uint>(scales12 + 8);
+
+        Unsafe.WriteUnaligned(dest16, (a0 & kmask2) | (((tmp >> 0) & kmask1) << 4));
+        Unsafe.WriteUnaligned(dest16 + 4, (a1 & kmask2) | (((tmp >> 2) & kmask1) << 4));
+        Unsafe.WriteUnaligned(dest16 + 8, ((a0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4));
+        Unsafe.WriteUnaligned(dest16 + 12, ((a1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4));
     }
 
     // ──────────────────── Q6_K ────────────────────
