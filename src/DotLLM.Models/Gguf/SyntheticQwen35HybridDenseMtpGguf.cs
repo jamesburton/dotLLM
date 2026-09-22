@@ -47,7 +47,6 @@ public static class SyntheticQwen35HybridDenseMtpGguf
     private const int NKHead = 1;              // ssm.group_count
     private const int DState = 8;              // ssm.state_size
     private const int DConv = 4;               // ssm.conv_kernel
-    private const int DInner = NVHead * DState; // ssm.inner_size
 
     /// <summary>Builds the synthetic <c>qwen35</c> fixture, optionally with a trailing MTP head.</summary>
     /// <param name="seed">Xorshift PRNG seed — deterministic weights, no <c>Random</c>/time.</param>

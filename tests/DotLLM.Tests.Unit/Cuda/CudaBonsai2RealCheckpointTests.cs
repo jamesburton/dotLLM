@@ -85,7 +85,10 @@ public sealed class CudaBonsai2RealCheckpointTests
             "Bonsai 2 MTP checkpoint not found (set DOTLLM_BONSAI2_MTP_GGUF or populate the HF hub cache).");
         string ptxDir = SkipUnlessCudaWithFwht();
 
+        // Both chains start from the SAME token (the CPU prefill's argmax, handed to CUDA too), so a
+        // near-tie in the trunk's last-row argmax cannot desynchronise the two draft chains.
         Run cpu;
+        int first;
         using (var gguf = GgufFile.Open(path!))
         {
             var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -95,7 +98,6 @@ public sealed class CudaBonsai2RealCheckpointTests
             using var kv = new SimpleKvCache(model.AttentionLayerCount, config.NumKvHeads, config.HeadDim,
                 PromptTokens.Length + DraftSteps + 2);
             using var mtp = model.CreateMtpState()!;
-            int first;
             using (ITensor prefill = model.Forward(PromptTokens, Positions(PromptTokens.Length), -1, kv, adapter: null, mtp))
                 first = ArgMaxWithGap(prefill, config.VocabSize, lastRow: true).Token;
             cpu = Draft((t, p) => model.ForwardMtp(mtp, t, p), first, config.VocabSize);
@@ -109,9 +111,11 @@ public sealed class CudaBonsai2RealCheckpointTests
             Assert.True(model.SupportsMtp);
             using var kv = model.CreateKvCache(PromptTokens.Length + DraftSteps + 2);
             using var mtp = model.CreateMtpState()!;
-            int first;
             using (ITensor prefill = model.Forward(PromptTokens, Positions(PromptTokens.Length), -1, kv, adapter: null, mtp))
-                first = ArgMaxWithGap(prefill, config.VocabSize, lastRow: true).Token;
+            {
+                int cudaFirst = ArgMaxWithGap(prefill, config.VocabSize, lastRow: true).Token;
+                _out.WriteLine($"prefill argmax: cpu={first} cuda={cudaFirst}");
+            }
             gpu = Draft((t, p) => model.ForwardMtp(mtp, t, p), first, config.VocabSize);
         }
 

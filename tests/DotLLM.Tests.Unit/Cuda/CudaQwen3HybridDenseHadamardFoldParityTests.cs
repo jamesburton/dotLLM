@@ -88,6 +88,29 @@ public sealed unsafe class CudaQwen3HybridDenseHadamardFoldParityTests : IDispos
     }
 
     /// <summary>
+    /// Control for the test above: the same non-default GDN geometry (NKHead=2, NVHead=4) with NO
+    /// fold. If the fold test fails and this passes, the fault is in the fold; if both fail, it is
+    /// a pre-existing CUDA GDN divergence at this head geometry, not the fold. Needs no
+    /// <c>hadamard_fwht.ptx</c>.
+    /// </summary>
+    [SkippableFact]
+    public void Forward_PrefillAndDecode_NoFold_SameGeometry_MatchesCpu()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir is null, "PTX files not found");
+        string path = SyntheticHadamardFold.WriteFixture(Path.Combine(_scratch, "nofold.gguf"));
+        int[] decodeTokens = [4, 6, 8];
+
+        List<float[]> cpu = RunCpu(path, decodeTokens, Unfolded);
+        List<float[]> gpu = RunCuda(path, ptxDir!, decodeTokens, Unfolded);
+
+        Assert.Equal(cpu.Count, gpu.Count);
+        for (int i = 0; i < cpu.Count; i++)
+            AssertLogitsMatch(cpu[i], gpu[i], i == 0 ? "no-fold prefill (all rows)" : $"no-fold decode step {i}");
+    }
+
+    /// <summary>
     /// <c>lastTokenLogitsOnly</c> rotates only the last row, from an offset into the hidden state —
     /// the lm_head rotation must use that row, not row 0.
     /// </summary>
@@ -108,7 +131,7 @@ public sealed unsafe class CudaQwen3HybridDenseHadamardFoldParityTests : IDispos
         using ITensor logits = model.Forward(Prompt, Positions(Prompt.Length), deviceId: -1, kv, lastTokenLogitsOnly: true);
         Assert.Equal(1, logits.Shape[0]);
 
-        AssertLogitsMatch(cpuLast, ToArray(logits, vocab), "lastTokenLogitsOnly");
+        AssertLogitsMatch(cpuLast, ToArray(logits, 1, vocab), "lastTokenLogitsOnly");
     }
 
     /// <summary>
@@ -178,40 +201,43 @@ public sealed unsafe class CudaQwen3HybridDenseHadamardFoldParityTests : IDispos
     private static ModelConfig WithFold(ModelConfig config) =>
         config with { HadamardFold = SyntheticHadamardFold.For(config) };
 
+    private static ModelConfig Unfolded(ModelConfig config) => config;
+
     private static int[] Positions(int n) => Enumerable.Range(0, n).ToArray();
 
-    private static List<float[]> RunCpu(string path, int[] decodeTokens)
+    private static List<float[]> RunCpu(string path, int[] decodeTokens, Func<ModelConfig, ModelConfig>? configure = null)
     {
         using var gguf = GgufFile.Open(path);
-        var config = WithFold(GgufModelConfigExtractor.Extract(gguf.Metadata));
+        var config = (configure ?? WithFold)(GgufModelConfigExtractor.Extract(gguf.Metadata));
         using var model = Qwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, ThreadingConfig.SingleThreaded);
         using var kv = new SimpleKvCache(model.AttentionLayerCount, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength);
 
         var results = new List<float[]>();
         using (ITensor prefill = model.Forward(Prompt, Positions(Prompt.Length), deviceId: -1, kv))
-            results.Add(ToArray(prefill, Prompt.Length * config.VocabSize));
+            results.Add(ToArray(prefill, Prompt.Length, config.VocabSize));
         for (int i = 0; i < decodeTokens.Length; i++)
         {
             using ITensor step = model.Forward([decodeTokens[i]], [Prompt.Length + i], deviceId: -1, kv);
-            results.Add(ToArray(step, config.VocabSize));
+            results.Add(ToArray(step, 1, config.VocabSize));
         }
         return results;
     }
 
-    private static List<float[]> RunCuda(string path, string ptxDir, int[] decodeTokens)
+    private static List<float[]> RunCuda(string path, string ptxDir, int[] decodeTokens,
+        Func<ModelConfig, ModelConfig>? configure = null)
     {
         using var gguf = GgufFile.Open(path);
-        var config = WithFold(GgufModelConfigExtractor.Extract(gguf.Metadata));
+        var config = (configure ?? WithFold)(GgufModelConfigExtractor.Extract(gguf.Metadata));
         using var model = CudaQwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
         using var kv = model.CreateKvCache(config.MaxSequenceLength);
 
         var results = new List<float[]>();
         using (ITensor prefill = model.Forward(Prompt, Positions(Prompt.Length), deviceId: -1, kv))
-            results.Add(ToArray(prefill, Prompt.Length * config.VocabSize));
+            results.Add(ToArray(prefill, Prompt.Length, config.VocabSize));
         for (int i = 0; i < decodeTokens.Length; i++)
         {
             using ITensor step = model.Forward([decodeTokens[i]], [Prompt.Length + i], deviceId: -1, kv);
-            results.Add(ToArray(step, config.VocabSize));
+            results.Add(ToArray(step, 1, config.VocabSize));
         }
         return results;
     }
@@ -228,13 +254,19 @@ public sealed unsafe class CudaQwen3HybridDenseHadamardFoldParityTests : IDispos
         for (int i = 0; i < tokens.Length; i++)
         {
             using ITensor logits = forwardMtp(tokens[i], Prompt.Length + i);
-            outp[i] = ToArray(logits, vocab);
+            outp[i] = ToArray(logits, 1, vocab);
         }
         return outp;
     }
 
-    private static float[] ToArray(ITensor t, int count) =>
-        new ReadOnlySpan<float>((void*)t.DataPointer, count).ToArray();
+    /// <summary>Copies a <c>[rows, vocab]</c> logits tensor out, asserting its shape first.</summary>
+    private static float[] ToArray(ITensor t, int rows, int vocab)
+    {
+        Assert.Equal(2, t.Shape.Rank);
+        Assert.Equal(rows, t.Shape[0]);
+        Assert.Equal(vocab, t.Shape[1]);
+        return new ReadOnlySpan<float>((void*)t.DataPointer, rows * vocab).ToArray();
+    }
 
     private void AssertLogitsMatch(float[] cpu, float[] gpu, string what)
     {
