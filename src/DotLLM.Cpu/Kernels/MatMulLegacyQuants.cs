@@ -225,20 +225,6 @@ public static unsafe partial class MatMul
         return Vector256.Create(lo, hi);
     }
 
-    /// <summary>Exact int32 <c>Σ q·q8</c> for one 32-element block of unsigned quants.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int UnsignedBlockSumAvx2(Vector256<byte> q, Vector256<sbyte> q8, Vector256<short> ones)
-        => HorizontalSumInt(Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(q, q8), ones));
-
-    /// <summary>Exact int32 horizontal sum of eight lanes.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int HorizontalSumInt(Vector256<int> v)
-    {
-        Vector128<int> s = Sse2.Add(v.GetLower(), v.GetUpper());
-        s = Ssse3.HorizontalAdd(s, s);
-        s = Ssse3.HorizontalAdd(s, s);
-        return s.ToScalar();
-    }
 
     /// <summary>
     /// IQ4_NL codebook broadcast into both 128-bit lanes, so <c>vpshufb</c> maps a 0..15 nibble
@@ -581,15 +567,22 @@ public static unsafe partial class MatMul
     ///
     /// <para>At <c>n == 1</c> (decode) the packed dot is the whole win: nothing amortizes the
     /// dequantize, so <c>GemvDequantRows</c> pays a full F32 expansion of the weight matrix per
-    /// token. Measured on SmolLM-135M pure fixtures (Zen 5, 32 threads, <c>bench -n 32</c>):
-    /// Q4_0 100 → 272 tok/s, Q4_1 101 → 240, Q5_1 74 → 209, IQ4_NL 100 → 236.</para>
+    /// token. Measured on SmolLM-135M pure fixtures (Zen 5, 32 threads, interleaved and
+    /// order-reversed <c>bench -p 32 -n 32 -r 3</c> against the same commit's parent):
+    /// Q4_0 96 → 273 tok/s, Q4_1 93 → 293, Q5_1 72 → 261, IQ4_NL 99 → 301.</para>
     ///
     /// <para>At prefill it inverts. <c>GemmDequantRows</c> decodes a row <em>once</em> and then
     /// runs <c>TensorPrimitives.Dot</c> — 16-wide AVX-512 FMA, ~36 instructions for a k = 576 row —
     /// against every column, so its per-column cost is far below the ~5 integer ops per 32
     /// elements a packed dot needs, however well the unpack is amortized. Measured at
     /// <c>-p 32</c>: Q4_0 prefill 808 → 197 tok/s with the packed GEMM, i.e. a 4x regression.
-    /// So the packed path is taken for decode only and prefill keeps the existing kernel.</para>
+    /// So the packed path is taken for decode only and prefill keeps the existing kernel.
+    /// <c>LegacyQuantTierBenchmark.Gemm_PackedVsDequantize_ColumnCrossover</c> records the whole
+    /// curve at m = 1536, k = 576: packed is 9.9x/3.5x (Q4_0/IQ4_NL) the dequantize path at
+    /// n = 1, 4.7x/1.9x at n = 2, 2.8x/1.25x at n = 4 and 0.71x/0.46x at n = 32. Raising this
+    /// constant to 4 is therefore a measured win for speculative/MTP verify batches; it is left
+    /// at 1 because it also makes a token's result depend on how many other tokens shared its
+    /// step, which wants a deliberate decision rather than a perf argument.</para>
     ///
     /// <para>Beating dequantize-then-GEMM at prefill needs an MMQ-style repacked-weight GEMM
     /// (llama.cpp's approach) rather than a column loop over a row kernel — that is a separate
