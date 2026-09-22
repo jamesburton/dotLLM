@@ -29,7 +29,9 @@ public static unsafe partial class MatMul
         // Packed legacy quants — same Q8_1 activation block as Q5_0, so they share pre-quant (#489).
         QuantizationType.Q4_0 or QuantizationType.Q4_1
             or QuantizationType.Q5_1 or QuantizationType.IQ4_NL => QuantFamily.Q8_1Family,
-        QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K => QuantFamily.KQuantFamily,
+        QuantizationType.Q2_K or QuantizationType.Q3_K
+            or QuantizationType.Q4_K or QuantizationType.Q5_K
+            or QuantizationType.Q6_K => QuantFamily.KQuantFamily,
         _ => QuantFamily.None,
     };
 
@@ -45,6 +47,8 @@ public static unsafe partial class MatMul
     {
         QuantizationType.Q8_0 => &ComputeRows,
         QuantizationType.Q5_0 => &ComputeRowsQ5_0,
+        QuantizationType.Q2_K => &ComputeRowsQ2_K,
+        QuantizationType.Q3_K => &ComputeRowsQ3_K,
         QuantizationType.Q4_K => &ComputeRowsQ4_K,
         QuantizationType.Q5_K => &ComputeRowsQ5_K,
         QuantizationType.Q6_K => &ComputeRowsQ6_K,
@@ -92,6 +96,8 @@ public static unsafe partial class MatMul
     {
         QuantizationType.Q8_0 => Q8_0BlockBytes,
         QuantizationType.Q5_0 => Q5_0BlockBytes,
+        QuantizationType.Q2_K => Q2_K_BlockBytes,
+        QuantizationType.Q3_K => Q3_K_BlockBytes,
         QuantizationType.Q4_K => Q4_K_BlockBytes,
         QuantizationType.Q5_K => Q5_K_BlockBytes,
         QuantizationType.Q6_K => Q6_K_BlockBytes,
@@ -462,6 +468,8 @@ public static unsafe partial class MatMul
             {
                 case QuantizationType.Q8_0: GemvQ8_0(weights, input, result, m, k, pool); break;
                 case QuantizationType.Q5_0: GemvQ5_0(weights, input, result, m, k, pool); break;
+                case QuantizationType.Q2_K: GemvQ2_K(weights, input, result, m, k, pool); break;
+                case QuantizationType.Q3_K: GemvQ3_K(weights, input, result, m, k, pool); break;
                 case QuantizationType.Q4_K: GemvQ4_K(weights, input, result, m, k, pool); break;
                 case QuantizationType.Q5_K: GemvQ5_K(weights, input, result, m, k, pool); break;
                 case QuantizationType.Q6_K: GemvQ6_K(weights, input, result, m, k, pool); break;

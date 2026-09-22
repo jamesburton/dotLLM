@@ -5,9 +5,9 @@ using System.Runtime.Intrinsics.X86;
 namespace DotLLM.Cpu.Kernels;
 
 /// <summary>
-/// 128-bit (SSE2/SSE3/SSSE3) tier of the K-quant x Q8_K dots — Q4_K, Q5_K, Q6_K (issue #477,
-/// Westmere / pre-AVX2 hardware). Before this tier every K-quant GEMV/GEMM on a box without AVX2
-/// ran the scalar per-element loop.
+/// 128-bit (SSE2/SSE3/SSSE3) tier of the K-quant x Q8_K dots — Q4_K, Q5_K, Q6_K (issue #477),
+/// plus Q2_K and Q3_K (issue #497) — for Westmere / pre-AVX2 hardware. Before this tier every
+/// K-quant GEMV/GEMM on a box without AVX2 ran the scalar per-element loop.
 ///
 /// <para><b>Math mirrors the AVX2 tier, not the scalar one.</b> Each super-block is reduced to an
 /// exact int32 "scale-in-madd" sum <c>Σ_sub sc_sub · Σ_i q_i · q8_i</c> (PMADDUBSW with the
@@ -214,8 +214,165 @@ public static unsafe partial class MatMul
         return HorizontalSumSse(acc) - sumBias;
     }
 
+    /// <summary>128-bit twin of <see cref="VecDotQ2_K_Q8_KAvx2"/>.</summary>
+    /// <remarks>
+    /// Q2_K's transposed element order makes the 128-bit split natural: for each
+    /// (half, shift-step) pair the low 16 <c>qs</c> bytes are one whole sub-block and the high 16
+    /// are the next, so each 128-bit lane carries exactly one scale — no <c>scaleVec</c> split is
+    /// needed, unlike the 256-bit tier.
+    /// </remarks>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static float VecDotQ2_K_Q8_KSse(byte* qk, byte* q8k, int superBlockCount)
+    {
+        Vector128<float> acc = Vector128<float>.Zero;
+        Vector128<byte> mask03 = Vector128.Create((byte)0x03);
+        float sumMin = 0;
+
+        for (int sb = 0; sb < superBlockCount; sb++)
+        {
+            byte* sc = qk;
+            byte* q2 = qk + 16;
+            Vector128<float> dd = LoadHalfPairSse2(qk + 80);
+            float d2 = dd.ToScalar();
+            float dmin2 = dd.GetElement(1);
+
+            float d8 = Unsafe.ReadUnaligned<float>(q8k);
+            sbyte* q8qs = (sbyte*)(q8k + 4);
+            short* bsums = (short*)(q8k + 260);
+
+            int minCorr = 0;
+            for (int j = 0; j < 16; j++)
+                minCorr += (sc[j] >> 4) * bsums[j];
+            sumMin += dmin2 * d8 * minCorr;
+
+            Vector128<int> sumi = Vector128<int>.Zero;
+            for (int half = 0; half < 2; half++)
+            {
+                Vector128<byte> raw0 = Unsafe.ReadUnaligned<Vector128<byte>>(q2 + half * 32);
+                Vector128<byte> raw1 = Unsafe.ReadUnaligned<Vector128<byte>>(q2 + half * 32 + 16);
+                for (int j = 0; j < 4; j++)
+                {
+                    Vector128<ushort> shiftCount = Vector128.CreateScalar((ulong)(j * 2)).AsUInt16();
+                    Vector128<byte> lo = j == 0
+                        ? Sse2.And(raw0, mask03)
+                        : Sse2.And(Sse2.ShiftRightLogical(raw0.AsUInt16(), shiftCount).AsByte(), mask03);
+                    Vector128<byte> hi = j == 0
+                        ? Sse2.And(raw1, mask03)
+                        : Sse2.And(Sse2.ShiftRightLogical(raw1.AsUInt16(), shiftCount).AsByte(), mask03);
+
+                    int sub = half * 8 + j * 2;
+                    int q8Off = half * 128 + j * 32;
+                    Vector128<sbyte> q8Lo = Unsafe.ReadUnaligned<Vector128<sbyte>>(q8qs + q8Off);
+                    Vector128<sbyte> q8Hi = Unsafe.ReadUnaligned<Vector128<sbyte>>(q8qs + q8Off + 16);
+
+                    sumi = Sse2.Add(sumi, Sse2.Add(
+                        Sse2.MultiplyAddAdjacent(Ssse3.MultiplyAddAdjacent(lo, q8Lo),
+                            Vector128.Create((short)(sc[sub] & 0xF))),
+                        Sse2.MultiplyAddAdjacent(Ssse3.MultiplyAddAdjacent(hi, q8Hi),
+                            Vector128.Create((short)(sc[sub + 1] & 0xF)))));
+                }
+            }
+
+            acc = Sse.Add(acc, Sse.Multiply(Vector128.Create(d2 * d8), Sse2.ConvertToVector128Single(sumi)));
+
+            qk += Q2_K_BlockBytes;
+            q8k += Q8_K_BlockBytes;
+        }
+
+        return HorizontalSumSse(acc) - sumMin;
+    }
+
+    /// <summary>128-bit twin of <see cref="VecDotQ3_K_Q8_KAvx2"/>.</summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static float VecDotQ3_K_Q8_KSse(byte* qk, byte* q8k, int superBlockCount)
+    {
+        Vector128<float> acc = Vector128<float>.Zero;
+        Vector128<byte> mask03 = Vector128.Create((byte)0x03);
+        Vector128<byte> mask01 = Vector128.Create((byte)0x01);
+        float sumBias = 0;
+        byte* scales = stackalloc byte[16];
+
+        for (int sb = 0; sb < superBlockCount; sb++)
+        {
+            byte* hm = qk;
+            byte* q3 = qk + 32;
+            Dequantize.UnpackQ3KScales(qk + 96, scales);
+            float d3 = (float)Unsafe.ReadUnaligned<Half>(qk + 108); // one scale per super-block
+
+            float d8 = Unsafe.ReadUnaligned<float>(q8k);
+            sbyte* q8qs = (sbyte*)(q8k + 4);
+            short* bsums = (short*)(q8k + 260);
+
+            int biasCorr = 0;
+            for (int s = 0; s < 16; s++)
+                biasCorr += (scales[s] - 32) * bsums[s];
+            sumBias += 4.0f * d3 * d8 * biasCorr;
+
+            Vector128<byte> hm0 = Unsafe.ReadUnaligned<Vector128<byte>>(hm);
+            Vector128<byte> hm1 = Unsafe.ReadUnaligned<Vector128<byte>>(hm + 16);
+
+            Vector128<int> sumi = Vector128<int>.Zero;
+            int m = 0;
+            for (int half = 0; half < 2; half++)
+            {
+                Vector128<byte> raw0 = Unsafe.ReadUnaligned<Vector128<byte>>(q3 + half * 32);
+                Vector128<byte> raw1 = Unsafe.ReadUnaligned<Vector128<byte>>(q3 + half * 32 + 16);
+                for (int j = 0; j < 4; j++, m++)
+                {
+                    Vector128<ushort> qShift = Vector128.CreateScalar((ulong)(j * 2)).AsUInt16();
+                    Vector128<ushort> hShift = Vector128.CreateScalar((ulong)m).AsUInt16();
+
+                    Vector128<byte> lo = Sse2.Or(
+                        j == 0 ? Sse2.And(raw0, mask03)
+                               : Sse2.And(Sse2.ShiftRightLogical(raw0.AsUInt16(), qShift).AsByte(), mask03),
+                        Sse2.ShiftLeftLogical(
+                            (m == 0 ? Sse2.And(hm0, mask01)
+                                    : Sse2.And(Sse2.ShiftRightLogical(hm0.AsUInt16(), hShift).AsByte(), mask01))
+                                .AsUInt16(), 2).AsByte());
+                    Vector128<byte> hi = Sse2.Or(
+                        j == 0 ? Sse2.And(raw1, mask03)
+                               : Sse2.And(Sse2.ShiftRightLogical(raw1.AsUInt16(), qShift).AsByte(), mask03),
+                        Sse2.ShiftLeftLogical(
+                            (m == 0 ? Sse2.And(hm1, mask01)
+                                    : Sse2.And(Sse2.ShiftRightLogical(hm1.AsUInt16(), hShift).AsByte(), mask01))
+                                .AsUInt16(), 2).AsByte());
+
+                    int sub = half * 8 + j * 2;
+                    int q8Off = half * 128 + j * 32;
+                    Vector128<sbyte> q8Lo = Unsafe.ReadUnaligned<Vector128<sbyte>>(q8qs + q8Off);
+                    Vector128<sbyte> q8Hi = Unsafe.ReadUnaligned<Vector128<sbyte>>(q8qs + q8Off + 16);
+
+                    sumi = Sse2.Add(sumi, Sse2.Add(
+                        Sse2.MultiplyAddAdjacent(Ssse3.MultiplyAddAdjacent(lo, q8Lo),
+                            Vector128.Create((short)(scales[sub] - 32))),
+                        Sse2.MultiplyAddAdjacent(Ssse3.MultiplyAddAdjacent(hi, q8Hi),
+                            Vector128.Create((short)(scales[sub + 1] - 32)))));
+                }
+            }
+
+            acc = Sse.Add(acc, Sse.Multiply(Vector128.Create(d3 * d8), Sse2.ConvertToVector128Single(sumi)));
+
+            qk += Q3_K_BlockBytes;
+            q8k += Q8_K_BlockBytes;
+        }
+
+        return HorizontalSumSse(acc) - sumBias;
+    }
+
     // Best non-AVX2 single-row K-quant dots: the 128-bit tier on SSSE3 hardware, scalar otherwise.
     // Used by every dispatch site's pre-AVX2 branch (row-major 4-row fallback, tails, R4).
+
+    /// <summary>Best non-AVX2 Q2_K dot (SSSE3, else scalar).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static float VecDotQ2_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount) =>
+        Ssse3.IsSupported ? VecDotQ2_K_Q8_KSse(qk, q8k, superBlockCount) : VecDotQ2_K_Q8_KScalar(qk, q8k, superBlockCount);
+
+    /// <summary>Best non-AVX2 Q3_K dot (SSSE3, else scalar).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static float VecDotQ3_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount) =>
+        Ssse3.IsSupported ? VecDotQ3_K_Q8_KSse(qk, q8k, superBlockCount) : VecDotQ3_K_Q8_KScalar(qk, q8k, superBlockCount);
 
     /// <summary>Best non-AVX2 Q4_K dot (SSSE3, else scalar).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

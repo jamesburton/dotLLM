@@ -38,14 +38,48 @@ OUT=~/.dotllm/quant-ladder/Llama-3.2-1B-pure
 # 1. Convert the HF checkpoint to an F16 GGUF once.
 python convert_hf_to_gguf.py meta-llama/Llama-3.2-1B --outtype f16 --outfile "$BASE"
 
-# 2. Requantize per type. --output-tensor-type / --token-embd-type pin the embedding and
+# 2. Requantize per type. --output-tensor-type / --token-embedding-type pin the embedding and
 #    output tensors to Q8_0: several low-bit ftypes need imatrix coverage those two tensors
 #    lack, and the gate deliberately excludes them from its block-type assertion.
 for T in Q8_0 Q4_0 Q4_1 Q5_0 Q5_1 Q2_K Q3_K_M Q4_K_M Q5_K_M Q6_K; do
-  llama-quantize --output-tensor-type q8_0 --token-embd-type q8_0 \
+  llama-quantize --output-tensor-type q8_0 --token-embedding-type q8_0 \
     "$BASE" "$OUT/Llama-3.2-1B-pure-$T.gguf" "$T"
 done
 ```
+
+The flag is `--token-embedding-type`, not `--token-embd-type`: current llama.cpp rejects the
+short spelling and prints its usage banner, so a script that only greps the tail of the output
+will look like it succeeded.
+
+### Starting from a published Q8_0 instead of an F16 base
+
+Converting the HF checkpoint needs the safetensors and `convert_hf_to_gguf.py`. When all that is
+wanted is a coverage or kernel fixture, requantizing a published Q8_0 is enough and much quicker
+— and that same Q8_0 then doubles as the correlation oracle for checking a low-bit dequantizer,
+which is how the Q2_K element-layout bug in #498 was caught and confirmed:
+
+```bash
+hf download bartowski/Llama-3.2-1B-Instruct-GGUF Llama-3.2-1B-Instruct-Q8_0.gguf
+OUT=~/.dotllm/quant-ladder/Llama-3.2-1B-pure
+BASE=<the blob path hf download printed>
+
+# The oracle. Hardlink, never copy (CLAUDE.md, "Localise via links"). On Windows:
+#   New-Item -ItemType HardLink -Path "$OUT/Llama-3.2-1B-pure-Q8_0.gguf" -Target "$BASE"
+ln "$BASE" "$OUT/Llama-3.2-1B-pure-Q8_0.gguf"
+
+for T in Q2_K Q3_K; do
+  llama-quantize --allow-requantize --pure \
+    --output-tensor-type q8_0 --token-embedding-type q8_0 \
+    "$BASE" "$OUT/Llama-3.2-1B-pure-$T.gguf" "$T"
+done
+```
+
+`--allow-requantize` is mandatory and its extra rounding is real, so these are fixtures for
+kernel and layout work, not for quoting absolute quality.
+
+Note the base model matters for the 256-element super-block types: 1B's hidden size is 2048, a
+multiple of 256, whereas SmolLM-135M's 576 is not — `llama-quantize` aborts on
+`GGML_ASSERT(start % blck_size == 0)`, which is why the SmolLM ladder has no Q2_K or Q3_K entry.
 
 ### ftype vs block type
 
@@ -59,7 +93,7 @@ For the pure per-type ladder, force every block tensor to the target with an exp
 `--pure` build, or generate from a quantization tool that writes a single block type:
 
 ```bash
-llama-quantize --pure --output-tensor-type q8_0 --token-embd-type q8_0 \
+llama-quantize --pure --output-tensor-type q8_0 --token-embedding-type q8_0 \
   "$BASE" "$OUT/Llama-3.2-1B-pure-IQ2_XS.gguf" IQ2_XS
 ```
 
@@ -68,7 +102,7 @@ IQ-family types additionally need an importance matrix:
 ```bash
 llama-imatrix -m "$BASE" -f wikitext-2-raw/wiki.train.raw -o "$OUT/imatrix.dat"
 llama-quantize --pure --imatrix "$OUT/imatrix.dat" \
-  --output-tensor-type q8_0 --token-embd-type q8_0 \
+  --output-tensor-type q8_0 --token-embedding-type q8_0 \
   "$BASE" "$OUT/Llama-3.2-1B-pure-IQ2_XS.gguf" IQ2_XS
 ```
 
