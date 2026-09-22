@@ -466,7 +466,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             _embedGather?.InvalidateDescriptorCache();
         }
 
-        var logitsBuf = headRows == 1 ? _state.Logits : EnsureMultiRowLogits(headRows, vocabSize);
+        var logitsBuf = headRows == 1 ? SingleRowLogits : EnsureMultiRowLogits(headRows, vocabSize);
 
         UploadPositions(positions);
 
@@ -698,6 +698,34 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     /// context lengths.
     /// </remarks>
     public int MaxAllRowLogitsLength => MaxAllRowLogitsSeqLen;
+
+    /// <summary>
+    /// Test hook for a same-process A/B (#471): when <see langword="true"/>, single-row logits
+    /// (decode and MTP draft steps) go through a plain, write-combined host-visible buffer, the
+    /// memory type used before #471, instead of the HOST_CACHED <c>_state.Logits</c>.
+    /// </summary>
+    internal static bool LogitsWriteCombinedOverride { get; set; }
+
+    private VulkanDevice.Buffer? _wcLogits;
+
+    /// <summary>The single-row logits buffer: <c>_state.Logits</c> unless the #471 A/B hook says otherwise.</summary>
+    private VulkanDevice.Buffer SingleRowLogits
+    {
+        get
+        {
+            if (!LogitsWriteCombinedOverride)
+                return _state.Logits;
+            if (_wcLogits is null)
+            {
+                _wcLogits = _device.Allocate((long)Config.VocabSize * sizeof(float));
+                // Same reasoning as EnsureMultiRowLogits: a recycled handle must not hit a stale set.
+                _kernels.InvalidateAll();
+                _hadamard?.InvalidateDescriptorCache();
+                _embedGather?.InvalidateDescriptorCache();
+            }
+            return _wcLogits;
+        }
+    }
 
     /// <summary>Lazily (re)allocates the multi-row logits buffer for <paramref name="rows"/> x <paramref name="vocab"/>.</summary>
     private VulkanDevice.Buffer EnsureMultiRowLogits(int rows, int vocab)
@@ -1386,6 +1414,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         // RoPE reads the position from the shared positions buffer.
         Span<int> posOne = stackalloc int[1];
         posOne[0] = position;
+        // Resolved before recording: the A/B hook may allocate and invalidate descriptor caches.
+        var logitsBuf = computeLogits ? SingleRowLogits : null;
         if (computeLogits) ProfBeginMtpStep();
         UploadPositions(posOne);
 
@@ -1600,7 +1630,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             ProfMark(cmdBuf, VulkanOpProfiler.Cat.Hadamard);
         }
 
-        RecordMatmul(cmdBuf, headWeight, headQt, headIn, _state.Logits,
+        RecordMatmul(cmdBuf, headWeight, headQt, headIn, logitsBuf!,
             outputDim: headOutputDim, inputDim: headInputDim, seqLen: 1);
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.LmHead);
@@ -1616,7 +1646,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         unsafe
         {
             var dest = new Span<float>((void*)result.DataPointer, vocabSize);
-            _device.Download(_state.Logits, dest);
+            _device.Download(logitsBuf!, dest);
         }
         ProfEndMtpStep();
         return result;
@@ -1848,6 +1878,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         _mtpHead?.Dispose();
         _mtpScratch?.Dispose();
         _multiRowLogits?.Dispose();
+        _wcLogits?.Dispose();
         _kernels.Dispose();
         // Frees the CPU model's dequantised norm arrays and detaches it from the
         // GgufFile. The GgufFile itself is caller-owned.
