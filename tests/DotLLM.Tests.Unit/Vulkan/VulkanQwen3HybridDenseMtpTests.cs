@@ -314,7 +314,16 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
     /// had to fall back to an all-full-attention trunk.
     /// </para>
     /// <para>
-    /// <b>What this covers.</b> The emitted-per-round histogram is <c>[1,1,1,1,1,1,1,1,1,1]</c>:
+    /// <b>Shape.</b> The run mirrors <c>TextGenerator</c>: prefill <c>[start]</c> with the MTP state,
+    /// sample <c>t1</c>, then rounds from <c>t1</c>'s own slot (issue #475). The helper asserts at
+    /// every round entry that neither the trunk KV nor the head has seen <c>lastToken</c> yet — the
+    /// only check here that catches a double-forwarded start token, because on this fixture one
+    /// extra GDN step shifts logits by ~1.6e-3 (CPU, measured), which flips no argmax and sits
+    /// inside the Vulkan tolerance. The bit-tight CPU counterpart is
+    /// <c>MtpSpeculativeDecoderGdnStateTests.DraftAndVerify_PrefillThenRounds_LikeTextGenerator_NextLogitsMatchSerialReplay</c>.
+    /// </para>
+    /// <para>
+    /// <b>What this covers.</b> The emitted-per-round histogram is (almost) all 1s:
     /// the MTP head and the trunk are independently random on a synthetic fixture, so the head
     /// agrees with the trunk's argmax at chance (1 in 12 here) and nearly every round rejects
     /// draft 1. Since #469 the verify batch runs every round regardless, so each round rolls the
@@ -341,7 +350,7 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
         Assert.True(run.Drafted > 0, "The decoder must actually have drafted something.");
         Assert.True(run.Emitted > 0, "Every round emits at least the corrected/bonus token.");
 
-        // On this fixture the emitted-per-round histogram comes back [1,1,1,...]: the random MTP
+        // On this fixture the emitted-per-round histogram comes back mostly 1s: the random MTP
         // head agrees with the trunk at chance (1/12), so nearly every round rejects draft 1.
         // Since #469 the verify batch still runs every round, so each of those rounds rolls the
         // GDN state back to row 0 (via the #473 row snapshot by default). Rollback to rows >= 1
@@ -546,15 +555,27 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
         using var kvCache = model.CreateKvCache(config.MaxSequenceLength);
         using var mtpState = model.CreateMtpState()!;
 
-        // DraftAndVerify's contract: `position` is lastToken's OWN KV-cache slot, so the prefill
-        // of the single start token at slot 0 means position starts at 0, not 1.
-        using (ITensor _ = model.Forward([startToken], [0], deviceId: -1, kvCache)) { }
+        // Mirror TextGenerator (issue #475): prefill the prompt [startToken] WITH the MTP state, so
+        // the head absorbs it and is seeded from h_0, sample t1 from the prefill, and enter the round
+        // loop at t1's own slot. Every trunk forward of an MTP sequence carries the state (#469), and
+        // DraftAndVerify's verify forwards `lastToken` itself, so the round's lastToken must be one
+        // the trunk has never seen. The old helper prefilled startToken without the state and then
+        // started the loop at position 0 — the start token went through the GDN recurrence twice and
+        // the first draft came from a never-seeded head, a path production never takes.
+        using (ITensor prefill = model.Forward([startToken], [0], deviceId: -1, kvCache, adapter: null, mtpState))
+        {
+            int rows = prefill.Shape[0];
+            generatedIds.Add(ArgMax(Copy(prefill, rows * config.VocabSize)
+                .AsSpan((rows - 1) * config.VocabSize, config.VocabSize).ToArray()));
+        }
+        Assert.Equal(1, mtpState.CurrentLength);
 
-        int position = 0, drafted = 0, emitted = 0, partialRejections = 0, guard = 0;
+        int position = 1, drafted = 0, emitted = 0, partialRejections = 0, guard = 0;
         var emittedPerRound = new List<int>();
         Span<int> outputBuffer = stackalloc int[k + 1];
         while (generatedIds.Count - 1 < totalNewTokens && guard++ < totalNewTokens * 4)
         {
+            Engine.MtpSpeculativeDecoderGdnStateTests.AssertRoundEntryInvariants(kvCache, mtpState, position);
             var result = decoder.DraftAndVerify(
                 model, kvCache, mtpState, pipeline, generatedIds,
                 constraint: null, position, vocabSize: config.VocabSize, numCandidates: k, outputBuffer);

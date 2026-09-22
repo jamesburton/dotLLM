@@ -208,7 +208,143 @@ public sealed class MtpSpeculativeDecoderGdnStateTests : IDisposable
             Assert.Equal(nextLogitsClean[i], nextLogitsFromDecoder[i]); // byte-identical float compare
     }
 
+    /// <summary>
+    /// Issue #475: the TextGenerator shape — prefill the prompt WITH the MTP state, sample
+    /// <c>t1</c>, then rounds from <c>t1</c>'s own slot — must leave the trunk's GDN state exactly
+    /// where a serial decode of the same tokens leaves it, and a helper that forwards the start token
+    /// twice (the shape the Vulkan and CUDA E2E helpers had) must be caught.
+    /// </summary>
+    /// <remarks>
+    /// Why raw logits and a tight bar: the double forward is one extra GDN step through one token.
+    /// On this fixture it shifts next-token logits by ~1.6e-3 and flips no argmax (measured over
+    /// start tokens 1 and 3, 10-12 tokens, K=3), so the token-level greedy comparison the GPU E2E
+    /// tests make cannot see it, and neither can the Vulkan tolerance (5e-3 + 1e-3·|x|). The correct
+    /// shape lands within ~6e-8 of the serial replay here — replays after a row-n rejection are
+    /// (n+1)-row batches, so not bit-identical — which leaves four orders of magnitude between the
+    /// bar and the mutant.
+    /// </remarks>
+    [Fact]
+    public void DraftAndVerify_PrefillThenRounds_LikeTextGenerator_NextLogitsMatchSerialReplay()
+    {
+        string path = SyntheticQwen35HybridDenseMtpGguf.Write(
+            Path.Combine(_scratch, "qwen35-mtp-gdn-prefill.gguf"), withMtp: true);
+        const int startToken = 1, totalNewTokens = 12, k = 3;
+        const float Bar = 1e-5f;
+
+        var (history, logits) = RunPrefillThenRounds(path, startToken, totalNewTokens, k, doubleForwardStart: false);
+        float[] serial = SerialNextLogits(path, history);
+        Assert.Equal(RunPlainGreedy(path, startToken, history.Count - 1), history);
+        float correctDiff = MaxAbsDiff(serial, logits);
+        _output.WriteLine($"history=[{string.Join(",", history)}] correct shape: max |Δlogit| = {correctDiff:E3}");
+        Assert.True(correctDiff <= Bar, $"next-token logits drift {correctDiff:E3} > {Bar:E0} from a serial replay.");
+
+        // Sensitivity: the old helper shape (prefill without the state, then round 1 at slot 0) must
+        // fail the same bar — otherwise the assertion above proves nothing about GDN double-advance.
+        var (mutantHistory, mutantLogits) = RunPrefillThenRounds(path, startToken, totalNewTokens, k, doubleForwardStart: true);
+        float mutantDiff = MaxAbsDiff(SerialNextLogits(path, mutantHistory), mutantLogits);
+        _output.WriteLine($"double-forwarded start: max |Δlogit| = {mutantDiff:E3}");
+        Assert.True(mutantDiff > Bar * 10,
+            $"a double-forwarded start token moved logits by only {mutantDiff:E3}; this test no longer discriminates.");
+    }
+
+    /// <summary>
+    /// Round-entry invariants of the TextGenerator shape, shared with the Vulkan and CUDA E2E
+    /// helpers (issue #475): <paramref name="position"/> is <c>lastToken</c>'s own slot and neither
+    /// the trunk nor the MTP head has seen <c>lastToken</c> yet — the verify forward is the first
+    /// time it is forwarded. A helper that also forwarded it beforehand (the double forward) trips
+    /// the KV check; one that skipped the state on the prefill trips the head check.
+    /// </summary>
+    internal static void AssertRoundEntryInvariants(DotLLM.Core.Attention.IKvCache kvCache, IMtpState mtpState, int position)
+    {
+        Assert.True(kvCache.CurrentLength == position,
+            $"trunk KV holds {kvCache.CurrentLength} positions at round entry, expected {position}: " +
+            "lastToken has already been forwarded, so the verify would forward it twice.");
+        Assert.True(mtpState.CurrentLength == position,
+            $"MTP head holds {mtpState.CurrentLength} positions at round entry, expected {position}: " +
+            "a trunk forward ran without the IMtpState (issue #469).");
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    private static (List<int> history, float[] nextLogits) RunPrefillThenRounds(
+        string path, int startToken, int totalNewTokens, int k, bool doubleForwardStart)
+    {
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var model = (Qwen3HybridDenseTransformerModel)ModelLoader.CreateCpuModelFromGguf(gguf, config);
+        // Checkpoint + replay: a row-0 rejection replays a 1-row forward, the serial reference's own
+        // op order (row snapshots would come from inside the K+1-row verify batch).
+        var decoder = new MtpSpeculativeDecoder(greedy: true) { UseRecurrentRowSnapshots = false };
+        var pipeline = new SamplerPipeline(new DotLLM.Core.Configuration.InferenceOptions { Temperature = 0f });
+        using var kvCache = new SimpleKvCache(
+            model.AttentionLayerCount, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength);
+        using var mtpState = model.CreateMtpState()!;
+
+        var generatedIds = new List<int> { startToken };
+        int position;
+        if (doubleForwardStart)
+        {
+            // The pre-#475 GPU helper shape: kept only as this test's mutant.
+            using (ITensor _ = model.Forward([startToken], [0], deviceId: -1, kvCache)) { }
+            position = 0;
+            // The invariant the GPU helpers now assert must reject this shape outright.
+            Assert.ThrowsAny<Xunit.Sdk.XunitException>(() => AssertRoundEntryInvariants(kvCache, mtpState, position));
+        }
+        else
+        {
+            using (ITensor prefill = model.Forward([startToken], [0], deviceId: -1, kvCache, adapter: null, mtpState))
+                generatedIds.Add(ArgMax(prefill, config.VocabSize));
+            position = 1;
+            AssertRoundEntryInvariants(kvCache, mtpState, position);
+        }
+
+        Span<int> outputBuffer = stackalloc int[k + 1];
+        int guard = 0;
+        while (generatedIds.Count - 1 < totalNewTokens && guard++ < totalNewTokens * 4)
+        {
+            if (!doubleForwardStart)
+                AssertRoundEntryInvariants(kvCache, mtpState, position);
+            var result = decoder.DraftAndVerify(
+                model, kvCache, mtpState, pipeline, generatedIds,
+                constraint: null, position, vocabSize: config.VocabSize, numCandidates: k, outputBuffer);
+            Assert.True(result.AcceptedCount > 0);
+            for (int i = 0; i < result.AcceptedCount; i++)
+                generatedIds.Add(outputBuffer[i]);
+            position += result.AcceptedCount;
+        }
+
+        // generatedIds[position] is the pending token; forward it against the decoder-managed state.
+        using ITensor next = model.Forward([generatedIds[position]], [position], deviceId: -1, kvCache);
+        return (generatedIds.Take(position + 1).ToList(), MtpRecurrentRowSnapshotTests.LastRow(next, config.VocabSize));
+    }
+
+    private static float[] SerialNextLogits(string path, List<int> history)
+    {
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var model = (Qwen3HybridDenseTransformerModel)ModelLoader.CreateCpuModelFromGguf(gguf, config);
+        using var kvCache = new SimpleKvCache(
+            model.AttentionLayerCount, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength);
+        float[] last = [];
+        for (int pos = 0; pos < history.Count; pos++)
+        {
+            using ITensor logits = model.Forward([history[pos]], [pos], deviceId: -1, kvCache);
+            last = MtpRecurrentRowSnapshotTests.LastRow(logits, config.VocabSize);
+        }
+        return last;
+    }
+
+    private static float MaxAbsDiff(float[] expected, float[] actual)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        float max = 0f;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            Assert.True(float.IsFinite(actual[i]), $"index {i} is not finite ({actual[i]}).");
+            max = MathF.Max(max, MathF.Abs(expected[i] - actual[i]));
+        }
+        return max;
+    }
 
     private static List<int> RunPlainGreedy(string path, int startToken, int totalNewTokens)
     {
