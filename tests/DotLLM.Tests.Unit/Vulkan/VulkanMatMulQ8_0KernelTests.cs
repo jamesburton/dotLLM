@@ -60,6 +60,32 @@ public class VulkanMatMulQ8_0KernelTests
     [InlineData(7, 96)]                   // 21 blocks, 714 bytes ≡ 2 (mod 4)
     [InlineData(3, 32)]                   // 3 blocks, 102 bytes ≡ 2 (mod 4)
     public void Launch_MatchesCpuReference(int m, int k)
+        => RunParity(m, k, coalesced: null);
+
+    /// <summary>
+    /// Issue #471: both variants against the same oracle, pinned explicitly so neither hides
+    /// behind the default. The extra shapes are the Bonsai 2 MTP head's (K = 5120, 6144, 10240,
+    /// 17408, all whole 16-block windows) plus K = 2080 (65 blocks: a partial final window) and
+    /// odd row counts, so the window-tail guard and the per-row base both carry weight.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(1, 32, true)]
+    [InlineData(8, 32, true)]
+    [InlineData(7, 96, true)]
+    [InlineData(2, 160, true)]
+    [InlineData(1536, 576, true)]
+    [InlineData(576, 1536, true)]
+    [InlineData(33, 2080, true)]
+    [InlineData(64, 5120, true)]
+    [InlineData(17, 6144, true)]
+    [InlineData(9, 10240, true)]
+    [InlineData(5, 17408, true)]
+    [InlineData(33, 2080, false)]
+    [InlineData(9, 10240, false)]
+    public void Launch_PinnedVariant_MatchesCpuReference(int m, int k, bool coalesced)
+        => RunParity(m, k, coalesced);
+
+    private static void RunParity(int m, int k, bool? coalesced)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -77,7 +103,10 @@ public class VulkanMatMulQ8_0KernelTests
         float[] expected = CpuGemvQ8_0(weightsQ8, x, m, k);
 
         using var device = VulkanDevice.Create();
-        using var kernel = MatMulQ8_0Kernel.Create(device, spvDir);
+        Skip.If(coalesced == true && !device.HasSubgroupArithmetic, "device has no subgroup arithmetic");
+        using var kernel = MatMulQ8_0Kernel.Create(device, spvDir, coalesced);
+        if (coalesced is { } pinned)
+            Assert.Equal(pinned, kernel.UsesCoalesced);
 
         // Round buffer size up to 4-byte multiple — the shader reads the weights
         // buffer as a uint array.

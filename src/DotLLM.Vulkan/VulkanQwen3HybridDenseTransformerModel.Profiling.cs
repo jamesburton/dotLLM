@@ -175,6 +175,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
             DotLLM.Core.Configuration.QuantizationType.PQ2_0 => gemv
                 ? "matmul_pq2_0_gemv"
                 : $"matmul_pq2_0_gemm[{_kernels.MatMulPQ2_0Gemm.VariantName}]",
+            DotLLM.Core.Configuration.QuantizationType.Q8_0 when gemv =>
+                $"matmul_q8_0_gemv[{_kernels.MatMulQ8.VariantName}]",
             DotLLM.Core.Configuration.QuantizationType.Q8_0 when !gemv =>
                 _kernels.MatMulQ8GemmCoopmat is not null ? "matmul_q8_0_gemm_coopmat" : "matmul_q8_0_gemm",
             DotLLM.Core.Configuration.QuantizationType.F16 when !gemv =>
