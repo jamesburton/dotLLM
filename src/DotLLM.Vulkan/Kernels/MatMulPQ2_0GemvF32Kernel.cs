@@ -228,15 +228,32 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
     public bool UsesInt8 => _int8Gemv is not null && _int8Quantize is not null;
 
     /// <summary>
-    /// Grows the int8 activation scratch to hold <paramref name="columns"/> rows of
+    /// Grows the int8 activation scratch to hold <see cref="MaxColumns"/> rows of
     /// <paramref name="k"/> elements. Old buffers are retired rather than freed: a command buffer
     /// recorded earlier in this frame may still reference them, and the scratch is at most a few
     /// hundred KB. Reallocating invalidates every descriptor set keyed on the old handles (#467).
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Always sized for <see cref="MaxColumns"/>, never for the caller's <c>columns</c>.</b>
+    /// Growing the scratch resets the descriptor caches, and a reset mid-command-buffer pulls the
+    /// rug from under dispatches already recorded against the old sets — the #467 hazard. Sizing
+    /// by the request made that happen on every forward: a decode step settles the scratch at the
+    /// widest <c>k</c> for ONE column, and then the first S = 5 MTP verify grows it five-fold
+    /// while the verify's own command buffer is being recorded. Sizing by <see cref="MaxColumns"/>
+    /// costs a few hundred KB and confines growth to the first forward that widens <c>k</c>.
+    /// </para>
+    /// <para>
+    /// This still assumes the caller records sequentially into one command buffer at a time — the
+    /// scratch is shared by every PQ2_0 matmul, so a concurrent-command-buffer path would race on
+    /// it. Moot while the int8 path is opt-in; the fix is the same hoist tracked as the follow-up.
+    /// </para>
+    /// </remarks>
     private void EnsureInt8Scratch(int k, int columns)
     {
-        long packed = QuantizePQ2_0Int8Kernel.PackedBytes(k, columns);
-        long meta = QuantizePQ2_0Int8Kernel.MetaBytes(k, columns);
+        _ = columns;
+        long packed = QuantizePQ2_0Int8Kernel.PackedBytes(k, MaxColumns);
+        long meta = QuantizePQ2_0Int8Kernel.MetaBytes(k, MaxColumns);
         if (_int8Xq is not null && _int8Xq.Size >= packed && _int8Xmeta is not null && _int8Xmeta.Size >= meta)
             return;
 

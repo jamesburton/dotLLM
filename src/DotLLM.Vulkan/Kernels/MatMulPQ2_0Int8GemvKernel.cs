@@ -22,6 +22,33 @@ namespace DotLLM.Vulkan.Kernels;
 /// dispatched (or a stale <c>.spv</c> was copied into <c>bin/</c>).
 /// </para>
 /// <para>
+/// <b>OPEN DEFECT — do not make this default-on.</b>
+/// <c>VulkanBonsai2MtpRealCheckpointTests.DraftAndVerify_MatchesPlainGreedy_…</c> FAILS with this
+/// path enabled and passes without it. What is established on the real 27B checkpoint:
+/// </para>
+/// <list type="bullet">
+///   <item>The MTP <b>draft</b> tokens still match the CPU oracle exactly
+///     (<c>ForwardMtp_DraftTokens_MatchCpuOracle_…</c> passes), and the plain-greedy sequence is
+///     byte-identical to the float path's. So the S = 1 decode path is right end to end.</item>
+///   <item>The S = 5 <b>verify</b> forward is not: the emitted sequence diverges at position 1 and
+///     then echoes a verbatim tail of the prompt.</item>
+///   <item><b>Not the multi-column kernels</b> — it reproduces identically with
+///     <c>DOTLLM_VK_PQ2_0_MULTICOL_MAX_N=0</c> + <c>DOTLLM_VK_PQ2_0_GEMV_LOOP_MAX_N=8</c>, i.e.
+///     with every GEMV at <c>columns = 1</c>.</item>
+///   <item><b>Not scratch growth</b> — sizing the scratch for <see cref="MatMulPQ2_0GemvF32Kernel.MaxColumns"/>
+///     up front (so it never grows mid-command-buffer and never resets a descriptor cache a
+///     recorded dispatch depends on) changes nothing. That sizing was kept anyway.</item>
+///   <item>Every kernel-level oracle passes: byte-exact quantizer, 1e-4 against the CPU W2A8
+///     GEMV, argmax-exact against the float kernel at all eight widths, and five mutants killed.</item>
+/// </list>
+/// <para>
+/// Leading hypothesis: the single shared activation scratch in
+/// <see cref="MatMulPQ2_0GemvF32Kernel"/>. It is safe only while one command buffer is recorded
+/// at a time, and the verify path ("batched absorb") is where this model stops doing that. The
+/// follow-up that gives the quantized activation a model-owned, per-call-site home is therefore
+/// both the performance fix and, most likely, this one.
+/// </para>
+/// <para>
 /// <b>Opt-in.</b> <see cref="TryCreate"/> returns <c>null</c> unless the device advertises
 /// <see cref="VulkanDevice.HasIntegerDotProduct"/>, the SPIR-V is present, and
 /// <see cref="EnvVar"/> (<c>DOTLLM_VK_PQ2_0_INT8</c>) is <c>1</c> — or
@@ -167,6 +194,13 @@ public sealed class MatMulPQ2_0Int8GemvKernel : IDisposable
             foreach (var v in variants) v.Dispose();
             throw;
         }
+
+        // Say so on stderr. TryCreate returns null silently for three different reasons (flag off,
+        // no device feature, missing SPIR-V), and a silent fall-through to the float kernel looks
+        // exactly like "int8 made no difference" in an A/B. Anyone who set the flag wants to know
+        // the path is actually live; the in-process override (benchmarks, tests) stays quiet.
+        if (EnabledFromEnv)
+            Console.Error.WriteLine($"[dotllm] {EnvVar}=1: PQ2_0 decode GEMV is running int8 activations (dotPacked4x8AccSatEXT).");
 
         return new MatMulPQ2_0Int8GemvKernel(device, variants.ToArray());
     }
