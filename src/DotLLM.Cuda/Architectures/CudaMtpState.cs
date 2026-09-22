@@ -26,6 +26,7 @@ public sealed class CudaMtpState : IMtpState, IDisposable
     private nint _keyCacheDevice;     // [maxSteps, kvStride] f32, device-resident
     private nint _valueCacheDevice;   // [maxSteps, kvStride] f32, device-resident
     private nint _pendingHiddenDevice; // [hiddenSize] f32, device-resident — seed for the next ForwardMtp call
+    private nint _positionIotaDevice;  // [maxSteps] int32, device-resident — element p holds p (issue #482)
 
     private float[] _capturedRows = []; // host [rowCount, hiddenSize], grown on demand
 
@@ -87,6 +88,32 @@ public sealed class CudaMtpState : IMtpState, IDisposable
         long hiddenBytes = (long)hiddenSize * sizeof(float);
         CudaDriverApi.cuMemAlloc_v2(out _pendingHiddenDevice, (nuint)hiddenBytes).ThrowOnError();
         CudaDriverApi.cuMemsetD8_v2(_pendingHiddenDevice, 0, (nuint)hiddenBytes).ThrowOnError();
+
+        // Positions as a device-resident iota (issue #482): a draft step's RoPE and a batched absorb's
+        // contiguous positions are slices of it, so neither uploads positions per call. Filled once.
+        int[] iota = new int[maxSteps];
+        for (int i = 0; i < maxSteps; i++) iota[i] = i;
+        long iotaBytes = (long)maxSteps * sizeof(int);
+        CudaDriverApi.cuMemAlloc_v2(out _positionIotaDevice, (nuint)iotaBytes).ThrowOnError();
+        unsafe
+        {
+            fixed (int* p = iota)
+                CudaDriverApi.cuMemcpyHtoD_v2(_positionIotaDevice, (nint)p, (nuint)iotaBytes).ThrowOnError();
+        }
+    }
+
+    /// <summary>
+    /// Device pointer to <paramref name="count"/> contiguous int32 positions starting at
+    /// <paramref name="position"/> (<c>[position, position + count)</c>), read-only — a slice of a
+    /// device iota table filled at construction.
+    /// </summary>
+    internal nint GetPositionDevicePtr(int position, int count = 1)
+    {
+        ThrowIfDisposed();
+        if (position < 0 || count < 0 || (long)position + count > _maxSteps)
+            throw new ArgumentOutOfRangeException(nameof(position),
+                $"positions [{position}, {(long)position + count}) exceed MaxSteps={_maxSteps}.");
+        return _positionIotaDevice + (nint)((long)position * sizeof(int));
     }
 
     /// <summary>Device pointer to the pending-hidden vector ([hiddenSize] f32) that seeds the next <c>ForwardMtp</c> call.</summary>
@@ -269,7 +296,7 @@ public sealed class CudaMtpState : IMtpState, IDisposable
     }
 
     /// <summary>Total bytes allocated for this state's own KV-cache + pending-hidden buffer (device memory).</summary>
-    public long AllocatedBytes => (2L * _maxSteps * _kvStride + _hiddenSize) * sizeof(float);
+    public long AllocatedBytes => (2L * _maxSteps * _kvStride + _hiddenSize) * sizeof(float) + (long)_maxSteps * sizeof(int);
 
     private void ThrowIfDisposed()
     {
@@ -283,6 +310,7 @@ public sealed class CudaMtpState : IMtpState, IDisposable
         if (_keyCacheDevice != 0) { CudaDriverApi.cuMemFree_v2(_keyCacheDevice); _keyCacheDevice = 0; }
         if (_valueCacheDevice != 0) { CudaDriverApi.cuMemFree_v2(_valueCacheDevice); _valueCacheDevice = 0; }
         if (_pendingHiddenDevice != 0) { CudaDriverApi.cuMemFree_v2(_pendingHiddenDevice); _pendingHiddenDevice = 0; }
+        if (_positionIotaDevice != 0) { CudaDriverApi.cuMemFree_v2(_positionIotaDevice); _positionIotaDevice = 0; }
         _disposed = true;
         GC.SuppressFinalize(this);
     }

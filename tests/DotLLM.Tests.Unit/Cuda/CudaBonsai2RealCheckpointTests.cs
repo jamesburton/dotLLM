@@ -124,6 +124,85 @@ public sealed class CudaBonsai2RealCheckpointTests
         Assert.Equal(cpu.Tokens, gpu.Tokens);
     }
 
+    /// <summary>
+    /// Issue #482 perf probe (no perf assertion): wall-clock ms per MTP draft step on the real
+    /// checkpoint, plus — with <c>DOTLLM_HYBRID_PROFILE=1</c> — the <c>mtp-*</c> category breakdown
+    /// of <c>ForwardMtpCore</c> and the batched verify absorb. Each round drafts
+    /// <see cref="DraftSteps"/> tokens from the same position (the head rolls its own KV back) and
+    /// then runs one S = DraftSteps+1 verify forward with the MTP state, like the decoder does.
+    /// </summary>
+    [SkippableFact]
+    public void MtpDraftCost_Profile_OnRealBonsai2Checkpoint()
+    {
+        string? path = FindCheckpoint();
+        Skip.If(path is null,
+            "Bonsai 2 MTP checkpoint not found (set DOTLLM_BONSAI2_MTP_GGUF or populate the HF hub cache).");
+        string ptxDir = SkipUnlessCudaWithFwht();
+        const int warmupRounds = 2;
+        const int rounds = 12;
+
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var model = CudaQwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
+        Assert.True(model.SupportsMtp);
+        int p = PromptTokens.Length;
+        using var kv = model.CreateKvCache(p + DraftSteps + 2);
+        using var mtp = model.CreateMtpState()!;
+        int first;
+        using (ITensor prefill = model.Forward(PromptTokens, Positions(p), -1, kv, adapter: null, mtp))
+            first = ArgMaxWithGap(prefill, config.VocabSize, lastRow: true).Token;
+
+        var verifyTokens = new int[DraftSteps + 1];
+        var verifyPositions = new int[DraftSteps + 1];
+        long draftTicks = 0, verifyTicks = 0;
+        int drafts = 0;
+        for (int r = 0; r < warmupRounds + rounds; r++)
+        {
+            if (r == warmupRounds)
+            {
+                CudaQwen3HybridDenseTransformerModel.ProfileReportAndReset(); // drop prefill + warm-up
+                draftTicks = verifyTicks = 0;
+                drafts = 0;
+            }
+
+            int token = first;
+            verifyTokens[0] = first;
+            for (int i = 0; i < DraftSteps; i++)
+            {
+                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                using ITensor logits = model.ForwardMtp(mtp, token, p + i);
+                draftTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+                drafts++;
+                token = ArgMaxWithGap(logits, config.VocabSize, lastRow: true).Token;
+                Assert.InRange(token, 0, config.VocabSize - 1);
+                verifyTokens[i + 1] = token;
+            }
+
+            for (int i = 0; i <= DraftSteps; i++) verifyPositions[i] = p + i;
+            // Deliberate for a perf probe: kv.Rollback below does not restore the GDN recurrent
+            // state, so later rounds verify from an advanced state — same cost, values not meaningful.
+            mtp.Rollback(p);
+            long v0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            using (ITensor _ = model.Forward(verifyTokens, verifyPositions, -1, kv, adapter: null, mtp)) { }
+            verifyTicks += System.Diagnostics.Stopwatch.GetTimestamp() - v0;
+            kv.Rollback(p);
+            mtp.Rollback(p);
+            mtp.SeedFromCapturedRow(0);
+        }
+
+        double tickMs = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        _out.WriteLine($"MTP draft: {draftTicks * tickMs / drafts:F3} ms/step over {drafts} steps " +
+                       $"(staged Q8_0 GEMV {(model.MtpUsesStagedQ8Gemv ? "ON" : "off — PTX absent or disabled")}; profiler {(Environment.GetEnvironmentVariable("DOTLLM_HYBRID_PROFILE") == "1" ? "ON — timings perturbed by per-mark syncs" : "off")})");
+        _out.WriteLine($"verify S={DraftSteps + 1} (incl. batched absorb): {verifyTicks * tickMs / rounds:F3} ms/round");
+        // Mirror the profiler's totals into the test output (ProfileReportAndReset writes stderr).
+        foreach (var kvp in CudaQwen3HybridDenseTransformerModel.ProfileTotalsMs.OrderBy(e => e.Key, StringComparer.Ordinal))
+        {
+            int n = CudaQwen3HybridDenseTransformerModel.ProfileCounts.GetValueOrDefault(kvp.Key, 1);
+            _out.WriteLine($"  {kvp.Key,-28} total={kvp.Value,9:F2}ms  calls={n,5}  avg={kvp.Value / n,8:F4}ms");
+        }
+        CudaQwen3HybridDenseTransformerModel.ProfileReportAndReset(); // no-op when the env var is unset
+    }
+
     // ── runs ─────────────────────────────────────────────────────────────────
 
     private sealed record Run(int[] Tokens, float[] Gaps);
