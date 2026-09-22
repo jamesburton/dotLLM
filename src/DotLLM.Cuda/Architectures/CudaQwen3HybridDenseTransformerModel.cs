@@ -1431,15 +1431,129 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                         mtpCapture: mtpState as CudaMtpState);
 
     /// <summary>
-    /// Core forward-pass implementation shared by every public <c>Forward</c> overload above.
-    /// <paramref name="mtpCapture"/> is non-null only from the MTP-aware overload — see that
-    /// overload's remarks and the capture point below, right before the final RMSNorm overwrites
-    /// <see cref="CudaQwen3HybridDenseForwardState.HiddenState"/> in place.
+    /// Default prefill tile, in tokens (issue #494). A prefill forward's working set — the F32
+    /// activation buffers, the per-projection F16 dequant scratch and the cuBLAS workspace — all
+    /// scale with the submitted token count, so a single 4096-token call pinned a 12 GB RTX 3060 at
+    /// 12,035 / 12,288 MiB on Bonsai 2 27B and thrashed, while p=1024 was comfortable. Tiling the
+    /// forward bounds that working set by the tile instead of by the prompt.
     /// </summary>
-    [SkipLocalsInit]
+    /// <remarks>
+    /// Chosen as the largest size the issue records as healthy on a 12 GB card rather than derived
+    /// from free VRAM: <see cref="CudaQwen3HybridDenseForwardState.AllocatedBytes"/> covers neither
+    /// the cuBLAS workspace nor the KV staging, so any "fit it to <c>cuMemGetInfo</c>" formula
+    /// would be a guess that silently mis-sizes on an unfamiliar card. Override with
+    /// <c>DOTLLM_CUDA_PREFILL_CHUNK</c> (0 disables tiling entirely and restores the single call).
+    /// </remarks>
+    private const int DefaultPrefillChunkTokens = 1024;
+
+    /// <summary>
+    /// Resolved tile size: <c>DOTLLM_CUDA_PREFILL_CHUNK</c> when it parses to a non-negative int,
+    /// otherwise <see cref="DefaultPrefillChunkTokens"/>. 0 disables tiling.
+    /// </summary>
+    private static readonly int PrefillChunkFromEnv =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_CUDA_PREFILL_CHUNK"), out int envChunk) && envChunk >= 0
+            ? envChunk
+            : DefaultPrefillChunkTokens;
+
+    /// <summary>
+    /// When set, overrides the environment on the CURRENT thread. Thread-static, so parallel test
+    /// classes and in-process A/B sweeps cannot flip each other's tile size — the forward runs
+    /// synchronously on the thread that called it. Mirrors <c>MtpAbsorbDispatch.PerTokenOverride</c>.
+    /// </summary>
+    [ThreadStatic]
+    internal static int? PrefillChunkOverride;
+
+    /// <summary>Tile size in force for this thread: the override, else the environment/default.</summary>
+    internal static int PrefillChunkTokens => PrefillChunkOverride ?? PrefillChunkFromEnv;
+
+    /// <summary>
+    /// Core forward pass. Tiles a long prefill over tokens (issue #494) so peak VRAM is bounded by
+    /// <see cref="PrefillChunkTokens"/> rather than by the prompt length, then delegates each tile
+    /// to <see cref="ForwardTile"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>Tiling is exactly what <c>TextGenerator</c>'s <c>--prefill-chunk-size</c> already does
+    /// one level up, and is correct for the same reason: with a KV-cache present, tile <c>t</c>
+    /// attends to the keys/values tiles <c>0..t-1</c> already committed, and the GDN state advances
+    /// sequentially across tiles just as it does across calls. It lives HERE as well because the
+    /// engine knob is off by default and does not cover the callers that hit the ceiling —
+    /// <c>bench -p 4096</c> submits the whole prompt in one <c>Forward</c> (only its untimed
+    /// <c>--depth</c> walk chunks, via <c>BenchRunner</c>'s own <c>DepthExtensionChunkSize</c>), and
+    /// so does any direct <c>IModel</c> caller. The engine knob remains the user-facing <c>-ub</c>
+    /// analog; this is the backend defending its own VRAM ceiling.</para>
+    /// <para>Four gates keep it off where it would change behaviour rather than just memory:</para>
+    /// <list type="bullet">
+    /// <item><c>kvCache is null</c> — later tiles would have nothing to attend to. A cacheless
+    /// caller (<c>PerplexityEvaluator</c>, <c>debug forward-pass</c>) also wants every row, so it
+    /// pays the full-S working set inherently.</item>
+    /// <item><c>!lastTokenLogitsOnly</c> — the caller wants a row per position, which a tile loop
+    /// would have to reassemble. Every long-prompt caller opts into the hint (issue #493); the
+    /// all-rows callers submit short batches (a speculative verify is K+1 tokens).</item>
+    /// <item><c>mtpCapture is not null</c> — the per-tile capture/absorb sequence is very probably
+    /// equivalent (each tile seeds the carry from its own last row, which is what the next tile's
+    /// token 0 pairs with), but that equivalence is UNTESTED and the #469 absorb path is owned
+    /// elsewhere. An MTP prefill therefore keeps the single-call behaviour.</item>
+    /// <item><c>_rowSnapshotRequestRows &gt; 0</c> — <c>ForwardWithRecurrentSnapshots</c> (#473)
+    /// records a GDN snapshot per input row; a tile loop would leave only the last tile's rows
+    /// valid.</item>
+    /// </list>
+    /// <para><b>Not bit-identical</b> to the single call: each layer's GEMMs run with a different
+    /// M per tile and cuBLAS selects per-M algorithms, so the last row's logits agree only to the
+    /// usual accumulation-order tolerance — the same caveat
+    /// <c>CudaQwen3HybridDenseLastTokenLogitsOnlyTest</c> already documents for the row-count hint.
+    /// The KV-cache contents are unaffected in kind: each tile writes the same positions it would
+    /// have written in the single call.</para>
+    /// </remarks>
     private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly,
                            CudaMtpState? mtpCapture)
+    {
+        int chunk = PrefillChunkTokens;
+        int total = tokenIds.Length;
+        if (chunk <= 0 || total <= chunk || kvCache is null || !lastTokenLogitsOnly
+            || mtpCapture is not null || _rowSnapshotRequestRows > 0)
+        {
+            return ForwardTile(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly,
+                               mtpCapture, produceLogits: true)!;
+        }
+
+        ITensor? logits = null;
+        try
+        {
+            for (int offset = 0; offset < total; offset += chunk)
+            {
+                int len = Math.Min(chunk, total - offset);
+                bool isFinal = offset + len >= total;
+                // Non-final tiles skip the final norm, the LM-head GEMM and the D2H copy entirely:
+                // the caller asked for the last row only, so their logits would be discarded. That
+                // is a prefill-time win on top of the VRAM one.
+                logits = ForwardTile(tokenIds.Slice(offset, len), positions.Slice(offset, len),
+                                     deviceId, kvCache, lastTokenLogitsOnly: true,
+                                     mtpCapture: null, produceLogits: isFinal);
+            }
+            return logits!;
+        }
+        catch
+        {
+            logits?.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// One forward pass over a tile of tokens — the whole layer stack for those tokens, against the
+    /// shared KV-cache and recurrent state. This is the body every public <c>Forward</c> overload
+    /// ultimately runs; <see cref="ForwardCore"/> above calls it once, or once per tile.
+    /// <paramref name="mtpCapture"/> is non-null only from the MTP-aware overloads — see their
+    /// remarks and the capture point below, right before the final RMSNorm overwrites
+    /// <see cref="CudaQwen3HybridDenseForwardState.HiddenState"/> in place.
+    /// <paramref name="produceLogits"/> is false only for a non-final tile, which runs purely to
+    /// advance the KV-cache and the GDN state; it returns <see langword="null"/>.
+    /// </summary>
+    [SkipLocalsInit]
+    private ITensor? ForwardTile(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly,
+                           CudaMtpState? mtpCapture, bool produceLogits)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_isHeadOnly)
@@ -1526,6 +1640,17 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         }
 
         if (DebugTrace) { _stream.Synchronize(); Console.Error.WriteLine("[hybrid-debug] all layers done, starting lm_head"); Console.Error.Flush(); LogVram("before lm-head"); }
+
+        if (!produceLogits)
+        {
+            // Non-final prefill tile (issue #494): advancing the KV-cache and the GDN state is all
+            // this tile exists to do. Still synchronize before returning — the embedding H2D above
+            // reads a managed float[] under `fixed`, which must not move or be reused while the
+            // copy is in flight, and the single-call path relies on the same guarantee.
+            _stream.Synchronize();
+            return null;
+        }
+
         ProfStart();
 
         // MTP (issue #253): capture the pre-final-norm hidden state for every position, one row
