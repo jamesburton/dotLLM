@@ -1,0 +1,10 @@
+#version 450
+// Issue #474 — PQ2_0 GEMV, 4 row(s) x 7 column(s) per workgroup, 1 code byte(s) per lane, 64 lanes.
+// See matmul_pq2_0_f32_gemv_multirow.glsl.
+#define ROWS 4
+#define NCOLS 7
+#define LANE_BYTES 1
+#define WG 64
+
+#extension GL_GOOGLE_include_directive : require
+#include "matmul_pq2_0_f32_gemv_multirow.glsl"

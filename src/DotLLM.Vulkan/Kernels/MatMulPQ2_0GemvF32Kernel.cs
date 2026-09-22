@@ -17,8 +17,10 @@ namespace DotLLM.Vulkan.Kernels;
 /// applies each group's own scale to that group's partial dot product — the group scale is
 /// read in-shader per 128-element span, not once at the end.
 /// Row stride is <c>(K/128)·34</c> bytes; there is no per-tensor tail scale (contrast I2_S).
-/// Activation <c>x</c> and output <c>y</c> are FP32. One workgroup per output row, 128 threads,
-/// shared-memory tree reduce. Correctness-first baseline (no coopmat / dp4a MMVQ path yet) —
+/// Activation <c>x</c> and output <c>y</c> are FP32. The #470 kernels run one workgroup per output
+/// row, 128 threads, shared-memory tree reduce; since #474 the default is the multi-row family
+/// (<c>matmul_pq2_0_f32_gemv_multirow.glsl</c>: 4 rows per 64-lane workgroup, each activation load
+/// reused across the 4 rows), with the #470 kernels kept behind <see cref="MultiRowEnvVar"/>. Correctness-first baseline (no coopmat / dp4a MMVQ path yet) —
 /// GEMV/decode only; GEMM/prefill is explicit follow-on scope (#205).
 /// </remarks>
 public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
@@ -42,17 +44,64 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
 
     private const int MultiColumnPushConstantBytes = 7 * sizeof(uint);
 
+    /// <summary>
+    /// Issue #474 — the shipped multi-row variant for each column count 1..<see cref="MaxColumns"/>
+    /// (index = columns - 1). Every one takes 4 rows per 64-lane workgroup. One column reads a uint
+    /// of codes (16 elements) per lane; two and more read one code byte per lane, because the uint
+    /// mapping leaves adjacent lanes' activation loads 64 bytes apart and that cost grows with the
+    /// column count. Two columns is the close call: the uint mapping won the microbenchmark on the
+    /// cache-resident projections, but lost the in-situ Bonsai 27B S=2 forward (95.0 ms against
+    /// 80.6 ms, same session), so the byte mapping ships. See <see cref="PQ2_0SmallNDispatch"/>.
+    /// </summary>
+    private static readonly string[] MultiRowSpvNames =
+    [
+        "matmul_pq2_0_f32_gemv_mr_r4_c1_b4_w64.spv",
+        "matmul_pq2_0_f32_gemv_mr_r4_c2_b1_w64.spv",
+        "matmul_pq2_0_f32_gemv_mr_r4_c3_b1_w64.spv",
+        "matmul_pq2_0_f32_gemv_mr_r4_c4_b1_w64.spv",
+        "matmul_pq2_0_f32_gemv_mr_r4_c5_b1_w64.spv",
+        "matmul_pq2_0_f32_gemv_mr_r4_c6_b1_w64.spv",
+        "matmul_pq2_0_f32_gemv_mr_r4_c7_b1_w64.spv",
+        "matmul_pq2_0_f32_gemv_mr_r4_c8_b1_w64.spv",
+    ];
+
+    private const int MultiRowRows = 4;
+
+    /// <summary>Environment variable; <c>0</c> disables the #474 multi-row kernels (read once).</summary>
+    public const string MultiRowEnvVar = "DOTLLM_VK_PQ2_0_MULTIROW";
+
+    private static readonly bool MultiRowFromEnv =
+        Environment.GetEnvironmentVariable(MultiRowEnvVar) is not "0";
+
+    /// <summary>
+    /// In-process override of the multi-row switch for every kernel instance, so a benchmark can
+    /// A/B the #474 kernels against the #470 ones in one session. Read at record time; not for
+    /// production use.
+    /// </summary>
+    internal static bool? MultiRowGlobalOverride { get; set; }
+
+    /// <summary>
+    /// Per-instance override of the multi-row switch; takes precedence over
+    /// <see cref="MultiRowGlobalOverride"/>. Tests use it to keep an instance on the #470 kernels as
+    /// an oracle without touching global state.
+    /// </summary>
+    internal bool? MultiRowOverride { get; set; }
+
+    /// <summary>Whether this instance records the #474 multi-row kernels.</summary>
+    internal bool UsesMultiRow => MultiRowOverride ?? MultiRowGlobalOverride ?? MultiRowFromEnv;
+
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
     private readonly MultiColumnPipeline[] _multiColumn;
+    private readonly PQ2_0GemvMultiRowPipeline[] _multiRow;
     private bool _disposed;
 
     private MatMulPQ2_0GemvF32Kernel(
         VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
-        MultiColumnPipeline[] multiColumn)
+        MultiColumnPipeline[] multiColumn, PQ2_0GemvMultiRowPipeline[] multiRow)
     {
         _device = device;
         _module = module;
@@ -60,6 +109,7 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
         _descriptorPool = pool;
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 3);
         _multiColumn = multiColumn;
+        _multiRow = multiRow;
     }
 
     /// <summary>One compiled <c>NCOLS</c> variant of the multi-column GEMV and its descriptor state.</summary>
@@ -119,13 +169,17 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
 
         var multiColumn = new List<MultiColumnPipeline>(MultiColumnWidths.Length);
+        var multiRow = new List<PQ2_0GemvMultiRowPipeline>(MultiRowSpvNames.Length);
         try
         {
             foreach (int width in MultiColumnWidths)
                 multiColumn.Add(CreateMultiColumn(device, spvDir, width));
+            for (int c = 1; c <= MultiRowSpvNames.Length; c++)
+                multiRow.Add(PQ2_0GemvMultiRowPipeline.Create(device, spvDir, MultiRowSpvNames[c - 1], MultiRowRows, c));
         }
         catch
         {
+            foreach (var mr in multiRow) mr.Dispose();
             foreach (var mc in multiColumn) mc.Dispose();
             VulkanApi.vkDestroyDescriptorPool(device.Handle, pool, 0);
             pipeline.Dispose();
@@ -133,7 +187,7 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
             throw;
         }
 
-        return new MatMulPQ2_0GemvF32Kernel(device, module, pipeline, pool, multiColumn.ToArray());
+        return new MatMulPQ2_0GemvF32Kernel(device, module, pipeline, pool, multiColumn.ToArray(), multiRow.ToArray());
     }
 
     private static MultiColumnPipeline CreateMultiColumn(VulkanDevice device, string spvDir, int width)
@@ -178,6 +232,7 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
     {
         _descriptorCache.Reset();
         foreach (var mc in _multiColumn) mc.Cache.Reset();
+        foreach (var mr in _multiRow) mr.InvalidateDescriptorCache();
     }
 
     /// <summary>Dispatches the GEMV synchronously.</summary>
@@ -257,6 +312,13 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
         if (y.Size < ((long)yOffsetElements + m) * sizeof(float))
             throw new ArgumentException("Output buffer too small.", nameof(y));
 
+        // #474: the multi-row kernel reads x as vec4, so an unaligned offset keeps the #470 kernel.
+        if (UsesMultiRow && (xOffsetElements & 3) == 0)
+        {
+            _multiRow[0].Record(cmdBuf, weightsPQ2_0, x, y, m, k, 1, xOffsetElements, yOffsetElements);
+            return;
+        }
+
         Span<nint> buffers = stackalloc nint[3] { weightsPQ2_0.Handle, x.Handle, y.Handle };
         nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
 
@@ -297,9 +359,11 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
     /// once and applies it to every column.
     /// </para>
     /// <para>
-    /// Each column is computed in the single-column kernel's exact per-lane order and tree
-    /// reduce, so the result is <b>bit-identical</b> to <paramref name="columns"/> calls of the
-    /// offset <c>Record</c> overload. The tests assert equality, not a tolerance.
+    /// The #470 kernels compute each column in the single-column kernel's per-lane order and tree
+    /// reduce, but the result is not bit-identical to <paramref name="columns"/> calls of the offset
+    /// <c>Record</c> overload: gfx1151 contracts multiply-adds differently per pipeline (1 ULP).
+    /// The #474 multi-row kernels (the default) also change the per-lane order for one and two
+    /// columns. The tests hold both to 1e-5 of the looped #470 kernel.
     /// </para>
     /// <para>
     /// <paramref name="columns"/> = 1 records the ordinary single-column kernel; every other
@@ -350,6 +414,12 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
         if (y.Size < ((long)yOffsetElements + (long)columns * m) * sizeof(float))
             throw new ArgumentException("Output buffer too small.", nameof(y));
 
+        if (UsesMultiRow)
+        {
+            _multiRow[columns - 1].Record(cmdBuf, weightsPQ2_0, x, y, m, k, columns, xOffsetElements, yOffsetElements);
+            return;
+        }
+
         MultiColumnPipeline variant = _multiColumn[columns - MultiColumnWidths[0]];
 
         Span<nint> buffers = stackalloc nint[3] { weightsPQ2_0.Handle, x.Handle, y.Handle };
@@ -386,6 +456,7 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
         if (_disposed) return;
         _disposed = true;
 
+        foreach (var mr in _multiRow) mr.Dispose();
         foreach (var mc in _multiColumn) mc.Dispose();
 
         if (_descriptorPool != 0)

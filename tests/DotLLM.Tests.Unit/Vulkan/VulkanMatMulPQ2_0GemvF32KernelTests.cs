@@ -279,17 +279,30 @@ public class VulkanMatMulPQ2_0GemvF32KernelTests
     /// that must survive past the last live column, so writing a dead column fails. K = 384 gives
     /// an odd group count, so groups straddle uint words differently row to row. M = 67 is ragged.
     /// </para>
+    /// <para>
+    /// The oracle loop always runs the #470 single-column kernel. <paramref name="multiRow"/>
+    /// selects whether <c>RecordColumns</c> runs the #474 multi-row kernels (the default) or the
+    /// #470 multi-column ones. M = 67 is ragged for the 4-row workgroups too.
+    /// </para>
     /// </remarks>
     [SkippableTheory]
-    [InlineData(1)]
-    [InlineData(2)]
-    [InlineData(3)]
-    [InlineData(4)]
-    [InlineData(5)]
-    [InlineData(6)]
-    [InlineData(7)]
-    [InlineData(8)]
-    public void RecordColumns_MatchesTheLoopedGemv(int n)
+    [InlineData(1, false)]
+    [InlineData(2, false)]
+    [InlineData(3, false)]
+    [InlineData(4, false)]
+    [InlineData(5, false)]
+    [InlineData(6, false)]
+    [InlineData(7, false)]
+    [InlineData(8, false)]
+    [InlineData(1, true)]
+    [InlineData(2, true)]
+    [InlineData(3, true)]
+    [InlineData(4, true)]
+    [InlineData(5, true)]
+    [InlineData(6, true)]
+    [InlineData(7, true)]
+    [InlineData(8, true)]
+    public void RecordColumns_MatchesTheLoopedGemv(int n, bool multiRow)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -314,6 +327,9 @@ public class VulkanMatMulPQ2_0GemvF32KernelTests
 
         using var device = VulkanDevice.Create();
         using var kernel = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
+        kernel.MultiRowOverride = multiRow;
+        using var legacy = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
+        legacy.MultiRowOverride = false;
 
         long yLen = YBase + (long)(MatMulPQ2_0GemvF32Kernel.MaxColumns + 1) * M;
         float[] sentinel = new float[yLen];
@@ -333,7 +349,7 @@ public class VulkanMatMulPQ2_0GemvF32KernelTests
         {
             ctx.Begin();
             for (int t = 0; t < n; t++)
-                kernel.Record(ctx.CommandBuffer, bufW, bufX, bufLoop, M, K,
+                legacy.Record(ctx.CommandBuffer, bufW, bufX, bufLoop, M, K,
                     xOffsetElements: XBase + t * K, yOffsetElements: YBase + t * M);
             ctx.SubmitAndWait();
         }
@@ -359,6 +375,149 @@ public class VulkanMatMulPQ2_0GemvF32KernelTests
                 Assert.True(MathF.Abs(viaLoop[i] - viaCols[i]) <= 1e-5f + 1e-5f * MathF.Abs(viaLoop[i]),
                     $"n={n} column {(i - YBase) / M} row {(i - YBase) % M}: loop {viaLoop[i]:R} vs multi-column {viaCols[i]:R}");
         }
+    }
+
+    /// <summary>
+    /// Issue #474 — every compiled multi-row variant (<c>matmul_pq2_0_f32_gemv_mr_*.spv</c>) at every
+    /// live column count it supports, against the looped single-column kernel (1e-5) and the scalar
+    /// reference (the parity tolerance above).
+    /// </summary>
+    /// <remarks>
+    /// Shapes: <c>M = 67</c> is ragged for R = 2, 4 and 8, so the last workgroup has clamped dead
+    /// rows whose writes must be suppressed (a sentinel fill catches a stray write). <c>K = 384</c>
+    /// has an odd group count, so rows alternate between uint-aligned and half-aligned and the
+    /// 4-byte code reads take the funnel-shift path; <c>K = 256</c> keeps every row aligned. Every
+    /// column has a distinct activation row, and there is one more real row past the batch.
+    /// </remarks>
+    [SkippableTheory]
+    [InlineData(67, 384)]
+    [InlineData(67, 256)]
+    [InlineData(13, 1280)]
+    public void MultiRowVariants_MatchTheLoopedGemvAndReference(int M, int K)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        var variants = EnumerateMultiRowVariants(spvDir);
+        Skip.If(variants.Count == 0, "no matmul_pq2_0_f32_gemv_mr_*.spv compiled");
+
+        const int MaxN = MatMulPQ2_0GemvF32Kernel.MaxColumns;
+        const int XBase = 4 * 3, YBase = 5;           // nonzero base offsets (x must stay vec4-aligned)
+        const float Sentinel = -12345.5f;
+        var rng = new Random(0x2A_74 ^ (M * 31 + K));
+        int groups = K / GroupSize;
+
+        sbyte[] ternary = new sbyte[M * K];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        Half[] scales = new Half[M * groups];
+        for (int i = 0; i < scales.Length; i++) scales[i] = (Half)(rng.NextSingle() * 0.05f + 0.01f);
+        long xLen = XBase + (long)(MaxN + 1) * K;
+        float[] x = new float[xLen];
+        for (int i = 0; i < x.Length; i++) x[i] = rng.NextSingle() * 2f - 1f;
+        byte[] weightsPQ2_0 = PackPQ2_0(ternary, scales, M, K);
+
+        // Scalar reference per column.
+        double[] reference = new double[MaxN * M];
+        for (int s = 0; s < MaxN; s++)
+            for (int r = 0; r < M; r++)
+            {
+                double acc = 0;
+                for (int g = 0; g < groups; g++)
+                {
+                    double ga = 0;
+                    for (int c = 0; c < GroupSize; c++)
+                        ga += ternary[r * K + g * GroupSize + c] * (double)x[XBase + s * K + g * GroupSize + c];
+                    acc += (float)scales[r * groups + g] * ga;
+                }
+                reference[s * M + r] = acc;
+            }
+
+        using var device = VulkanDevice.Create();
+        using var kernel = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
+        kernel.MultiRowOverride = false;                // the #470 kernel is the oracle
+
+        long yLen = YBase + (long)(MaxN + 1) * M;
+        float[] sentinel = new float[yLen];
+        Array.Fill(sentinel, Sentinel);
+
+        using var bufW = device.Allocate(((long)weightsPQ2_0.Length + 3) & ~3L);
+        using var bufX = device.Allocate(xLen * sizeof(float));
+        using var bufLoop = device.Allocate(yLen * sizeof(float));
+        using var bufOut = device.Allocate(yLen * sizeof(float));
+        device.Upload(new ReadOnlySpan<byte>(weightsPQ2_0), bufW);
+        device.Upload(x, bufX);
+
+        device.Upload(sentinel, bufLoop);
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            for (int t = 0; t < MaxN; t++)
+                kernel.Record(ctx.CommandBuffer, bufW, bufX, bufLoop, M, K,
+                    xOffsetElements: XBase + t * K, yOffsetElements: YBase + t * M);
+            ctx.SubmitAndWait();
+        }
+        float[] viaLoop = new float[yLen];
+        device.Download(bufLoop, viaLoop);
+
+        var failures = new List<string>();
+        int checkedCount = 0;
+        foreach (var (spv, rows, cols) in variants)
+        {
+            using var variant = PQ2_0GemvMultiRowPipeline.Create(device, spvDir, spv, rows, cols);
+            for (int n = 1; n <= cols; n++)
+            {
+                device.Upload(sentinel, bufOut);
+                using (var ctx = device.CreateSubmitContext())
+                {
+                    ctx.Begin();
+                    variant.Record(ctx.CommandBuffer, bufW, bufX, bufOut, M, K, n, XBase, YBase);
+                    ctx.SubmitAndWait();
+                }
+                float[] got = new float[yLen];
+                device.Download(bufOut, got);
+                checkedCount++;
+
+                for (long i = 0; i < yLen; i++)
+                {
+                    bool live = i >= YBase && i < YBase + (long)n * M;
+                    if (!live)
+                    {
+                        if (got[i] != Sentinel)
+                        {
+                            failures.Add($"{spv} n={n}: element {i} outside the live output was written ({got[i]})");
+                            break;
+                        }
+                        continue;
+                    }
+                    long j = i - YBase;
+                    float loop = viaLoop[i];
+                    double refv = reference[j];
+                    if (MathF.Abs(loop - got[i]) > 1e-5f + 1e-5f * MathF.Abs(loop)
+                        || Math.Abs(refv - got[i]) > AbsTol + RelTol * Math.Abs(refv))
+                    {
+                        failures.Add($"{spv} n={n} column {j / M} row {j % M}: loop {loop:R}, ref {refv:R}, got {got[i]:R}");
+                        break;
+                    }
+                }
+            }
+        }
+
+        Assert.True(failures.Count == 0, $"{failures.Count} of {checkedCount} dispatches failed:" + Environment.NewLine + string.Join(Environment.NewLine, failures.Take(20)));
+    }
+
+    /// <summary>Every <c>matmul_pq2_0_f32_gemv_mr_r{R}_c{C}_b{B}_w{W}.spv</c> in <paramref name="spvDir"/>.</summary>
+    internal static List<(string Spv, int Rows, int Cols)> EnumerateMultiRowVariants(string spvDir)
+    {
+        var re = new System.Text.RegularExpressions.Regex(@"^matmul_pq2_0_f32_gemv_mr_r(?<r>\d+)_c(?<c>\d+)_b\d+_w\d+\.spv$",
+            System.Text.RegularExpressions.RegexOptions.ExplicitCapture, TimeSpan.FromSeconds(1));
+        var list = new List<(string, int, int)>();
+        foreach (string path in Directory.EnumerateFiles(spvDir, "matmul_pq2_0_f32_gemv_mr_*.spv"))
+        {
+            string name = Path.GetFileName(path);
+            var mt = re.Match(name);
+            if (mt.Success)
+                list.Add((name, int.Parse(mt.Groups["r"].Value, System.Globalization.CultureInfo.InvariantCulture), int.Parse(mt.Groups["c"].Value, System.Globalization.CultureInfo.InvariantCulture)));
+        }
+        list.Sort((a, b) => string.CompareOrdinal(a.Item1, b.Item1));
+        return list;
     }
 
     /// <summary>

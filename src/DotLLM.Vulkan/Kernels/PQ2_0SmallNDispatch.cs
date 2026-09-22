@@ -37,6 +37,28 @@ namespace DotLLM.Vulkan.Kernels;
 /// more than 7x, so 8 is also where the GEMM should take over.
 /// </para>
 /// <para>
+/// <b>#474 multi-row kernels.</b> Both GEMV paths now default to 4 output rows per 64-lane
+/// workgroup, so each activation load feeds 4 weight rows (see
+/// <see cref="MatMulPQ2_0GemvF32Kernel"/>; <c>DOTLLM_VK_PQ2_0_MULTIROW=0</c> restores the #470
+/// kernels). The table above is the #470 baseline. Measured against it
+/// (<c>Bench_PQ2_0MultiRowGemv</c>, same session, new cost / #470 cost):
+/// </para>
+/// <code>
+///                  n=1    n=2    n=3    n=4    n=5    n=6    n=7    n=8
+/// attn_q          0.57   0.80   0.83   0.81   0.75   0.62   0.51   0.44
+/// attn_output     0.57   0.83   0.80   0.76   0.70   0.57   0.45   0.39
+/// ffn_gate/up     0.54   0.83   0.81   0.79   0.71   0.61   0.54   0.46
+/// ffn_down        0.56   0.85   0.76   0.62   0.50   0.48   0.44   0.42
+/// lm_head         0.59   0.69   0.68   0.62   0.57   0.55   0.53   0.51   (S=1: 3.11 -> 1.84 ms)
+/// </code>
+/// <para>
+/// At n = 2 the uint-per-lane variant measured 0.59-0.70 here but lost in situ (below), so the
+/// byte-per-lane one ships. End to end on Bonsai 2 27B the forward
+/// costs 0.78 / 0.84 / 0.85 / 0.79 / 0.63 / 0.66 of #470 at S = 1 / 2 / 3 / 4 / 6 / 8, and plain
+/// decode goes from 13.25 to 16.69 tok/s. The multi-column path is now further below the GEMM at
+/// n = 8 than before, so the GEMM crossover has likely moved above 8; not yet measured.
+/// </para>
+/// <para>
 /// <b>Escape hatches</b>, read once on first use because this sits on the record path:
 /// <c>DOTLLM_VK_PQ2_0_MULTICOL_MAX_N</c> caps the multi-column range (<c>0</c> disables it);
 /// <c>DOTLLM_VK_PQ2_0_GEMV_LOOP_MAX_N</c> is the #446 loop threshold that applies beyond it
