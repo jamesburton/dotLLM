@@ -159,6 +159,28 @@ A single CUDA stream executes all operations sequentially on the GPU. **No host�
 
 For eligible BitNet single-token decode on the plain CUDA KV-cache, dotLLM captures the decode launch sequence as a CUDA graph and replays it by default. This removes most CPU-side per-token launch dispatch overhead after the first captured token. Set `DOTLLM_CUDA_GRAPH=0` to disable graph replay when debugging or comparing against the raw launch path.
 
+### Prefill tiling (issue #494)
+
+A prefill forward's working set scales with the number of tokens submitted in one call: the F32
+activation buffers (`S × intermediate × 4 B` — 285 MB each at S=4096 on Bonsai 2 27B), the
+per-projection F16 dequant scratch, the cuBLAS workspace, and the F16 KV plus its F32 staging. A
+single 4096-token call on a 12 GB RTX 3060 therefore pinned VRAM at 12,035 / 12,288 MiB and
+thrashed, while p=1024 was comfortable.
+
+`CudaQwen3HybridDenseTransformerModel` now tiles a long prefill over tokens by default (1024 per
+tile), so peak VRAM is bounded by the tile rather than by the prompt. Tile `t` attends to the keys
+and values tiles `0..t-1` already committed to the KV-cache, and the GDN state advances
+sequentially — the same argument that makes the engine-level `--prefill-chunk-size` (llama.cpp's
+`-ub`) correct. The backend-level tiling exists in addition because the engine knob is off by
+default and does not cover `bench`, which submits the whole prompt in one `Forward`.
+
+- `DOTLLM_CUDA_PREFILL_CHUNK=<n>` overrides the tile size; `0` restores the single call.
+- Tiling is off when there is no KV-cache, when the caller wants a logits row per position, when an
+  MTP state is capturing, and under `ForwardWithRecurrentSnapshots` — see `ForwardCore`'s remarks.
+- Output is **not** bit-identical to the single call: each layer's GEMMs run with a different M per
+  tile and cuBLAS picks algorithms per M. The drift is the usual accumulation-order kind and is
+  bounded by the standard CUDA fixture-parity tolerance (abs 1e-4 + rel 1e-3).
+
 ## cuBLAS GEMM/GEMV
 
 cuBLAS provides the most compute-intensive operations:

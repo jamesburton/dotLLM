@@ -512,6 +512,45 @@ public interface IModel : IDisposable
         => Forward(tokenIds, positions, deviceId, kvCache, adapter);
 
     /// <summary>
+    /// The full forward overload: KV-cache, LoRA adapter, MTP state <b>and</b> the
+    /// <paramref name="lastTokenLogitsOnly"/> hint in one call. This is what a prefill driver that
+    /// only samples the final position wants (issue #493): <c>TextGenerator.ForwardPrefill</c> reads
+    /// row <c>Shape[0] - 1</c> and nothing else, so on a large vocabulary the intermediate rows are
+    /// pure waste (248,320 x 4096 x 4 B ~= 4.0 GB on Bonsai 2 at a 4096-token prompt).
+    /// </summary>
+    /// <remarks>
+    /// <para>The default implementation routes to the plain hint-aware overload
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, bool)"/> when there
+    /// is neither an adapter nor an MTP state — so EVERY model that already honours the hint keeps
+    /// honouring it with no code change, and every model that ignores the hint keeps returning full
+    /// per-position logits. With an adapter or an MTP state present it routes to the
+    /// adapter/MTP-aware overload and the hint is dropped (the safe direction: more rows, never
+    /// fewer), unless the implementation overrides this method — the CUDA hybrid models do.</para>
+    /// <para>Because a model MAY return <c>[1, vocab]</c> here, callers must index the last row as
+    /// <c>Shape[0] - 1</c> and must never assume <c>Shape[0] == tokenIds.Length</c>.</para>
+    /// </remarks>
+    /// <param name="tokenIds">Input token IDs for this step.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    /// <param name="kvCache">Optional KV-cache. When null, behaves identically to the uncached forward pass.</param>
+    /// <param name="adapter">Optional LoRA adapter. When null, behaves like the adapter-less overload.</param>
+    /// <param name="mtpState">Optional MTP state — see the overload above for the capture/absorb contract.</param>
+    /// <param name="lastTokenLogitsOnly">
+    /// When true, implementations MAY return only the last position's logits (<c>[1, vocab_size]</c>).
+    /// The MTP capture/absorb side effects are unaffected: a model honouring the hint must still
+    /// capture every position's post-final-norm row.
+    /// </param>
+    /// <returns>
+    /// Logits of shape <c>[1, vocab_size]</c> when the hint is honoured, otherwise <c>[seq, vocab_size]</c>.
+    /// </returns>
+    ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                    IKvCache? kvCache, ILoraAdapter? adapter, IMtpState? mtpState,
+                    bool lastTokenLogitsOnly)
+        => adapter is null && mtpState is null
+            ? Forward(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly)
+            : Forward(tokenIds, positions, deviceId, kvCache, adapter, mtpState);
+
+    /// <summary>
     /// Runs one MTP head autoregressive draft step: embeds <paramref name="tokenId"/>, combines it
     /// with <paramref name="state"/>'s current pending hidden vector through the MTP block's own
     /// <c>enorm</c>/<c>hnorm</c>/<c>eh_proj</c> plus a single decoder block and shared LM head, and
