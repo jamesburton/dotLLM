@@ -120,6 +120,10 @@ public sealed unsafe class F16SseTierTests
             MatMul.GemmF16((nint)w, x, actual, m, k, n);
             AssertExact(expected, actual, n * m, "GemmF16");
 
+            new Span<float>(actual, m).Clear();
+            MatMul.GemmF16((nint)w, x, actual, m, k, 1);
+            AssertExact(expected, actual, m, "GemmF16 n=1");
+
             using var pool = new ComputeThreadPool(4);
             new Span<float>(actual, m).Clear();
             MatMul.GemvF16((nint)w, x, actual, m, k, pool);

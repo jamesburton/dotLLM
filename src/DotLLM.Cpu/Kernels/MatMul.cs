@@ -1615,6 +1615,14 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     public static void GemmF16(nint weights, float* b, float* c, int m, int k, int n)
     {
+        if (n == 1)
+        {
+            // Mirrors the pooled overload: single-token calls (e.g. MoE expert decode) take the
+            // GEMV path, which on the SSE tier is the fused convert+dot.
+            GemvF16(weights, b, c, m, k);
+            return;
+        }
+
         int rowBytes = k * sizeof(Half);
         int tileM = ComputeTileM(rowBytes);
         Half* weightsHalf = (Half*)weights;
