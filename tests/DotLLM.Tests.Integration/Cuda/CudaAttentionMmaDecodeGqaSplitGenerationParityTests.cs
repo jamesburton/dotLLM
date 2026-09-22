@@ -18,6 +18,7 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// explicitly flagged this exact gap as the next required step before it could ship even opt-in.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class CudaAttentionMmaDecodeGqaSplitGenerationParityTests
 {
     private readonly ITestOutputHelper _output;

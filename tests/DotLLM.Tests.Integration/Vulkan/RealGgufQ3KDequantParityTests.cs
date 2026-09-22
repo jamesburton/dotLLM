@@ -29,6 +29,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class RealGgufQ3KDequantParityTests
 {
     private const int Q3KGroupSize = 256;

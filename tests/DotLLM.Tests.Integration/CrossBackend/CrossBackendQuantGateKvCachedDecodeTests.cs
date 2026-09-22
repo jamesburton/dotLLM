@@ -34,6 +34,7 @@ namespace DotLLM.Tests.Integration.CrossBackend;
 /// asymmetry is inherent to how CPU decode works today, not a shortcut taken here.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class CrossBackendQuantGateKvCachedDecodeTests
 {
     private readonly ITestOutputHelper _output;

@@ -33,6 +33,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// single decode step it checks.</para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class Gemma4MoeMmvqParityTests
 {
     private readonly ITestOutputHelper _output;

@@ -58,6 +58,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class VulkanSplitDecodeParityTests
 {
     private const int Context = 384;     // long-context routing guard (S = 10 on a 24-head model)

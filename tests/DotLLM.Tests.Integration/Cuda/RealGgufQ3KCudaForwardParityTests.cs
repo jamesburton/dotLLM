@@ -40,6 +40,7 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class RealGgufQ3KCudaForwardParityTests
 {
     private const float LogitsAbsTol = 3.0f;

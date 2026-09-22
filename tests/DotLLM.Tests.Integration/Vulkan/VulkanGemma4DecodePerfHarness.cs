@@ -18,6 +18,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// Uses the portable synthetic gemma4 <c>Bench</c> fixture — no checkpoint needed.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class VulkanGemma4DecodePerfHarness
 {
     private readonly ITestOutputHelper _output;

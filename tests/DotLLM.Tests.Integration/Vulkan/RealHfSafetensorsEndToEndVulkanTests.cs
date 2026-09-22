@@ -57,6 +57,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class RealHfSafetensorsEndToEndVulkanTests
 {
     // Tolerances mirrored from VulkanTransformerModelTests.

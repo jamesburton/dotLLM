@@ -24,6 +24,7 @@ namespace DotLLM.Tests.Integration.Models.Lora;
 /// Model path is hardcoded to the cached location; test skips gracefully if not present.
 /// Kept in its own class to avoid cross-class GPU parallelism.
 /// </remarks>
+[Collection(GpuCollection.Name)]
 public sealed class HybridLoraParityTests
 {
     private readonly ITestOutputHelper _output;
