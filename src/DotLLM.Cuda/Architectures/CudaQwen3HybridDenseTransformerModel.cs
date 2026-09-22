@@ -1776,8 +1776,20 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// destination whose row pitch is <c>2 * rowBytes</c> — the absorb's <c>[e_i, h_i]</c> interleave,
     /// in one strided launch rather than one per row (issue #492).
     /// </summary>
-    private static void CopyRowsStrided(nint src, nint dst, long rowBytes, int rows, nint stream)
+    /// <remarks>
+    /// The driver documents that an intra-device <c>cuMemcpy2D</c> "may fail for pitches not computed
+    /// by cuMemAllocPitch", and there is no async unaligned variant — so a refusal here is a
+    /// documented outcome for a small hidden size, not a bug. It falls back to the per-row loop this
+    /// replaced and latches, because the answer is a property of the model's row pitch and will not
+    /// change between chunks.
+    /// </remarks>
+    private void CopyRowsStrided(nint src, nint dst, long rowBytes, int rows, nint stream)
     {
+        if (_mtpConcatStridedUnsupported)
+        {
+            CopyRowsPerRow(src, dst, rowBytes, rows, stream);
+            return;
+        }
         var copy = new CudaDriverApi.CudaMemcpy2D
         {
             SrcMemoryType = CudaDriverApi.CU_MEMORYTYPE_DEVICE,
@@ -1789,8 +1801,31 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             WidthInBytes = (nuint)rowBytes,
             Height = (nuint)rows,
         };
-        CudaDriverApi.cuMemcpy2DAsync_v2(ref copy, stream).ThrowOnError();
+        if (CudaDriverApi.cuMemcpy2DAsync_v2(ref copy, stream) == 0)
+            return;
+        _mtpConcatStridedUnsupported = true;
+        CopyRowsPerRow(src, dst, rowBytes, rows, stream);
     }
+
+    /// <summary>The pre-#492 interleave: one <c>cuMemcpyDtoDAsync</c> per row.</summary>
+    private static void CopyRowsPerRow(nint src, nint dst, long rowBytes, int rows, nint stream)
+    {
+        for (int i = 0; i < rows; i++)
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(dst + (nint)(2 * i * rowBytes), src + (nint)(i * rowBytes),
+                (nuint)rowBytes, stream).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Latched when this model's row pitch is one the driver's 2-D device-to-device copy refuses
+    /// (issue #492) — see <see cref="CopyRowsStrided"/>.
+    /// </summary>
+    private bool _mtpConcatStridedUnsupported;
+
+    /// <summary>
+    /// Test hook (issue #492): <see langword="false"/> once the driver has refused the 2-D
+    /// device-to-device interleave for this model's row pitch and the per-row fallback has latched.
+    /// </summary>
+    internal bool MtpConcatUsesStridedCopy => !_mtpConcatStridedUnsupported;
 
     /// <summary>
     /// Batched, KV-only absorb of S contiguous positions (issue #472, ported in #478) — see

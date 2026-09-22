@@ -3,9 +3,13 @@
 //
 //   y[c][n] = W_q8_0[n,k] @ x[c][k]   for c in [0, ncols), output FP32.
 //
-// Two entry points:
-//   q8_0_gemv_f32in_rb        one input column   (the MTP draft step's projections)
-//   q8_0_gemv_f32in_rb_multi  up to 8 columns    (the MTP batched absorb: eh_proj / K / V over S rows)
+// Entry points:
+//   q8_0_gemv_f32in_rb            one input column   (the MTP draft step's projections)
+//   q8_0_gemv_f32in_rb_multi      up to 8 columns    (the MTP batched absorb: eh_proj / K / V over S rows)
+//   q8_0_gemv_f32in_rb_multi_c1
+//     .. _c8                      exactly N columns  (issue #492 — the default multi-column path;
+//                                 same bits, sized accumulators, two resident blocks per SM instead
+//                                 of one. See the #492 section at the bottom of this file.)
 // Every column of the multi kernel is bit-identical to the single-column kernel, which is
 // bit-identical to the original — the weights are simply read once for all columns.
 //
@@ -307,7 +311,8 @@ extern "C" __global__ void __launch_bounds__(Q8R_GROUP) q8_0_gemv_f32in_rb_multi
 //  Build (the committed PTX, same line as above — the new entry points ship in the same module):
 //    nvcc -ptx -arch=compute_75 -o native/ptx/q8_0_gemv_f32in_rb.ptx native/kernels/q8_0_gemv_f32in_rb.cu
 //  Diagnostic only (nvcc -ptx never runs ptxas, so -Xptxas -v prints nothing there):
-//    nvcc -cubin -arch=sm_86 -Xptxas -v -o /dev/null native/kernels/q8_0_gemv_f32in_rb.cu
+//    nvcc -cubin -arch=sm_86 -Xptxas -v -o q8_0_gemv_f32in_rb.cubin native\kernels\q8_0_gemv_f32in_rb.cu
+//  (the .cubin is a throwaway; -Xptxas -v prints nothing under -ptx, which never runs ptxas)
 // ──────────────────────────────────────────────────────────────────────────────────────────────
 
 template <int NCOLS>
