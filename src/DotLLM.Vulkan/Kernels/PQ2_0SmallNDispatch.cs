@@ -44,16 +44,16 @@ namespace DotLLM.Vulkan.Kernels;
 /// (<c>Bench_PQ2_0MultiRowGemv</c>, same session, new cost / #470 cost):
 /// </para>
 /// <code>
-///                  n=1    n=2    n=3    n=4    n=6    n=8
-/// attn_q          0.56   0.59*  0.83   0.82   0.63   0.44
-/// attn_output     0.56   0.63*  0.82   0.77   0.56   0.39
-/// ffn_gate/up     0.51   0.60*  0.84   0.78   0.62   0.46
-/// ffn_down        0.55   0.67*  0.77   0.60   0.48   0.41
-/// lm_head         0.58   0.70*  0.69   0.63   0.57   0.52     (S=1: 3.23 ms -> 1.86 ms)
+///                  n=1    n=2    n=3    n=4    n=5    n=6    n=7    n=8
+/// attn_q          0.57   0.80   0.83   0.81   0.75   0.62   0.51   0.44
+/// attn_output     0.57   0.83   0.80   0.76   0.70   0.57   0.45   0.39
+/// ffn_gate/up     0.54   0.83   0.81   0.79   0.71   0.61   0.54   0.46
+/// ffn_down        0.56   0.85   0.76   0.62   0.50   0.48   0.44   0.42
+/// lm_head         0.59   0.69   0.68   0.62   0.57   0.55   0.53   0.51   (S=1: 3.11 -> 1.84 ms)
 /// </code>
 /// <para>
-/// (* the uint-per-lane n=2 variant; the shipped byte-per-lane one measured 0.80-0.84 on the
-/// projections and 0.69 on lm_head, but won in situ.) End to end on Bonsai 2 27B the forward
+/// At n = 2 the uint-per-lane variant measured 0.59-0.70 here but lost in situ (below), so the
+/// byte-per-lane one ships. End to end on Bonsai 2 27B the forward
 /// costs 0.78 / 0.84 / 0.85 / 0.79 / 0.63 / 0.66 of #470 at S = 1 / 2 / 3 / 4 / 6 / 8, and plain
 /// decode goes from 13.25 to 16.69 tok/s. The multi-column path is now further below the GEMM at
 /// n = 8 than before, so the GEMM crossover has likely moved above 8; not yet measured.
