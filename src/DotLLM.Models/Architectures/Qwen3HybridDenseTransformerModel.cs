@@ -1177,6 +1177,12 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     private void AbsorbMtp(MtpHeadWeights mtpHead, CpuMtpState state,
                            ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions)
     {
+        if (!MtpAbsorbDispatch.UsePerToken && MtpAbsorbDispatch.IsContiguous(positions))
+        {
+            AbsorbMtpBatched(mtpHead, state, tokenIds, positions[0]);
+            state.SeedFromCapturedRow(tokenIds.Length - 1);
+            return;
+        }
         for (int i = 0; i < tokenIds.Length; i++)
         {
             if (i == 0) state.SetPendingFromCarry();
@@ -1184,6 +1190,106 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             ForwardMtpCore(mtpHead, state, tokenIds[i], positions[i], computeLogits: false);
         }
         state.SeedFromCapturedRow(tokenIds.Length - 1);
+    }
+
+    /// <summary>
+    /// Batched, KV-only absorb of S contiguous positions (issue #472) — see
+    /// <see cref="MtpAbsorbDispatch"/>. Computes exactly the K/V rows <see cref="ForwardMtpCore"/>
+    /// writes per token, for all S rows at once, and nothing past them: an absorbed step's output
+    /// hidden is discarded, so its attention, O-projection and FFN are dead compute.
+    /// </summary>
+    private void AbsorbMtpBatched(MtpHeadWeights mtpHead, CpuMtpState state,
+                                  ReadOnlySpan<int> tokenIds, int firstPosition)
+    {
+        int s = tokenIds.Length;
+        int hiddenSize = Config.HiddenSize;
+        var attn = mtpHead.Layer.FullAttn!;
+        int numKvHeads = attn.NumKvHeads;
+        int headDim = Config.HeadDim;
+        int kvStride = numKvHeads * headDim;
+        float eps = Config.NormEpsilon;
+
+        state.BeginAbsorb(firstPosition, s);
+
+        var pool = ArrayPool<float>.Shared;
+        float[] embedArr = pool.Rent(s * hiddenSize);
+        float[] pairArr = pool.Rent(s * hiddenSize);
+        float[] concatArr = pool.Rent(s * 2 * hiddenSize);
+        float[] curArr = pool.Rent(s * hiddenSize);
+        float[] normedArr = pool.Rent(s * hiddenSize);
+        int[] posArr = ArrayPool<int>.Shared.Rent(s);
+        try
+        {
+            var embed = embedArr.AsSpan(0, s * hiddenSize);
+            var pair = pairArr.AsSpan(0, s * hiddenSize);
+            var concat = concatArr.AsSpan(0, s * 2 * hiddenSize);
+            var cur = curArr.AsSpan(0, s * hiddenSize);
+            var normed = normedArr.AsSpan(0, s * hiddenSize);
+            var pos = posArr.AsSpan(0, s);
+            for (int i = 0; i < s; i++) pos[i] = firstPosition + i;
+
+            // ── Embed all S tokens. The trunk-table fallback goes through EmbedTokens, which also
+            //    restores the primal basis of a Hadamard-latent table (#435); a head-local
+            //    nextn.embed_tokens is not folded. ──
+            if (mtpHead.EmbedTokensWeight is { } headEmbed)
+            {
+                for (int i = 0; i < s; i++)
+                    EmbedOneToken(tokenIds[i], headEmbed, mtpHead.EmbedTokensQuantType,
+                        embed.Slice(i * hiddenSize, hiddenSize), hiddenSize);
+            }
+            else
+            {
+                fixed (float* embedPtr = embed)
+                    EmbedTokens(tokenIds, embedPtr, hiddenSize);
+            }
+
+            // Pairing (#469): token i goes with h_{p-1} — the carry for i == 0, captured row i-1 otherwise.
+            state.CopyAbsorbPairingRows(s, pair);
+
+            // concat row i = [enorm(embed_i), hnorm(h_i)]
+            for (int i = 0; i < s; i++)
+            {
+                var row = concat.Slice(i * 2 * hiddenSize, 2 * hiddenSize);
+                RmsNorm.Execute(embed.Slice(i * hiddenSize, hiddenSize), mtpHead.EnormWeight, eps,
+                    row.Slice(0, hiddenSize));
+                RmsNorm.Execute(pair.Slice(i * hiddenSize, hiddenSize), mtpHead.HnormWeight, eps,
+                    row.Slice(hiddenSize, hiddenSize));
+            }
+
+            fixed (float* concatPtr = concat, curPtr = cur)
+                Gemm(mtpHead.EhProjWeight, mtpHead.EhProjQuantType, concatPtr, curPtr,
+                     mtpHead.EhProjOutputDim, mtpHead.EhProjInputDim, s);
+
+            for (int i = 0; i < s; i++)
+                RmsNorm.Execute(cur.Slice(i * hiddenSize, hiddenSize), mtpHead.Layer.AttnNormWeight, eps,
+                    normed.Slice(i * hiddenSize, hiddenSize));
+
+            // K/V projections write straight into the head's cache slab [firstPosition, +s): the
+            // cache is one contiguous [maxSteps, kvStride] buffer.
+            float* kDst = state.KeyCachePtr + (long)firstPosition * kvStride;
+            float* vDst = state.ValueCachePtr + (long)firstPosition * kvStride;
+            fixed (float* normedPtr = normed)
+            {
+                Gemm(attn.KWeight, attn.KQuantType, normedPtr, kDst, attn.KOutputDim, attn.KInputDim, s);
+                Gemm(attn.VWeight, attn.VQuantType, normedPtr, vDst, attn.VOutputDim, attn.VInputDim, s);
+            }
+
+            var kSlab = new Span<float>(kDst, s * kvStride);
+            Mamba3QkNorm.Execute(kSlab, attn.KNormWeight, eps, s, numKvHeads, headDim);
+            RoPE.Execute(Span<float>.Empty, kSlab, pos, /* numHeads */ 0, numKvHeads, headDim, _ropeDim,
+                _ropeCosTable, _ropeSinTable, RoPEType.NeoX);
+
+            state.EndAbsorb(firstPosition + s);
+        }
+        finally
+        {
+            pool.Return(embedArr);
+            pool.Return(pairArr);
+            pool.Return(concatArr);
+            pool.Return(curArr);
+            pool.Return(normedArr);
+            ArrayPool<int>.Shared.Return(posArr);
+        }
     }
 
     /// <inheritdoc/>
