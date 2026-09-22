@@ -190,7 +190,7 @@ public sealed class CudaBonsai2RealCheckpointTests
 
         double tickMs = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         _out.WriteLine($"MTP draft: {draftTicks * tickMs / drafts:F3} ms/step over {drafts} steps " +
-                       $"(profiler {(Environment.GetEnvironmentVariable("DOTLLM_HYBRID_PROFILE") == "1" ? "ON — timings perturbed by per-mark syncs" : "off")})");
+                       $"(staged Q8_0 GEMV {(model.MtpUsesStagedQ8Gemv ? "ON" : "off — PTX absent or disabled")}; profiler {(Environment.GetEnvironmentVariable("DOTLLM_HYBRID_PROFILE") == "1" ? "ON — timings perturbed by per-mark syncs" : "off")})");
         _out.WriteLine($"verify S={DraftSteps + 1} (incl. batched absorb): {verifyTicks * tickMs / rounds:F3} ms/round");
         // Mirror the profiler's totals into the test output (ProfileReportAndReset writes stderr).
         foreach (var kvp in CudaQwen3HybridDenseTransformerModel.ProfileTotalsMs.OrderBy(e => e.Key, StringComparer.Ordinal))

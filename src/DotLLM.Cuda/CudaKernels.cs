@@ -522,12 +522,19 @@ public sealed unsafe class CudaKernels : IDisposable
 
 
     /// <summary>
+    /// The directory this instance loaded its PTX from — lets an optional, separately-owned kernel
+    /// module (e.g. <see cref="CudaQ8_0StagedGemv"/>) resolve its file next to the rest.
+    /// </summary>
+    internal string PtxDirectory { get; }
+
+    /// <summary>
     /// Loads all PTX modules from the specified directory.
     /// </summary>
     /// <param name="ptxDir">Directory containing compiled .ptx files.</param>
     public CudaKernels(string ptxDir)
     {
-        _rmsnormModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "rmsnorm.ptx"));
+        PtxDirectory = ptxDir;
+        _rmsnormModule =CudaModule.LoadFromFile(Path.Combine(ptxDir, "rmsnorm.ptx"));
         _ropeModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "rope.ptx"));
         _swigluModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "swiglu.ptx"));
         _addModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "add.ptx"));

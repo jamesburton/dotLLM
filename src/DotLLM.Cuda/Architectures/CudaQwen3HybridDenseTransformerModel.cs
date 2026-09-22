@@ -1744,9 +1744,9 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 // cur = eh_proj @ concat — one GEMV per row (see remarks), then attn_norm over s rows.
                 for (int i = 0; i < s; i++)
                 {
-                    Gemm(mtpHead.EhProjDevice, mtpHead.EhProjQt,
-                         sc.Concat + (nint)(2 * i * hiddenRowBytes), sc.Cur + (nint)(i * hiddenRowBytes),
-                         mtpHead.EhProjOutputDim, mtpHead.EhProjInputDim, 1);
+                    MtpGemm(mtpHead.EhProjDevice, mtpHead.EhProjQt,
+                            sc.Concat + (nint)(2 * i * hiddenRowBytes), sc.Cur + (nint)(i * hiddenRowBytes),
+                            mtpHead.EhProjOutputDim, mtpHead.EhProjInputDim);
                 }
                 _kernels.LaunchRmsNormF32(sc.Cur, mtpHead.Layer.AttnNormWeightDevice, sc.Normed, hiddenSize, eps, s, streamH);
 
@@ -1755,10 +1755,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 for (int i = 0; i < s; i++)
                 {
                     nint normedRow = sc.Normed + (nint)(i * hiddenRowBytes);
-                    Gemm(attn.KDevice, attn.KQt, normedRow, state.GetKeyRowDevicePtr(p + i),
-                         attn.KOutputDim, attn.KInputDim, 1);
-                    Gemm(attn.VDevice, attn.VQt, normedRow, state.GetValueRowDevicePtr(p + i),
-                         attn.VOutputDim, attn.VInputDim, 1);
+                    MtpGemm(attn.KDevice, attn.KQt, normedRow, state.GetKeyRowDevicePtr(p + i),
+                            attn.KOutputDim, attn.KInputDim);
+                    MtpGemm(attn.VDevice, attn.VQt, normedRow, state.GetValueRowDevicePtr(p + i),
+                            attn.VOutputDim, attn.VInputDim);
                 }
 
                 nint kSlab = state.GetKeyRowDevicePtr(p);
@@ -1873,6 +1873,38 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     }
 
     private CudaMtpScratch? _mtpScratch;
+
+    // Issue #482: optional staged Q8_0 GEMV for the MTP head, probed on first MTP use.
+    private CudaQ8_0StagedGemv? _mtpQ8Staged;
+    private bool _mtpQ8StagedProbed;
+
+    /// <summary>
+    /// Single-row projection for the MTP head (draft and absorb). A Q8_0 weight — every projection of
+    /// Bonsai 2's MTP block — goes to <see cref="CudaQ8_0StagedGemv"/> when its PTX is present: a
+    /// coalesced, bit-identical twin of the <c>LaunchQuantizedGemvF32In</c> kernel <see cref="Gemm"/>
+    /// uses for Q8_0 at one row, whose uncoalesced loads dominate the draft step (issue #482).
+    /// Everything else, and Q8_0 without the PTX, goes through <see cref="Gemm"/> unchanged.
+    /// </summary>
+    private void MtpGemm(nint weight, QuantizationType qt, nint x, nint y, int m, int k)
+    {
+        if (qt == QuantizationType.Q8_0)
+        {
+            if (!_mtpQ8StagedProbed)
+            {
+                _mtpQ8Staged = CudaQ8_0StagedGemv.TryLoad(_kernels.PtxDirectory);
+                _mtpQ8StagedProbed = true;
+            }
+            if (_mtpQ8Staged is { } staged)
+            {
+                staged.Launch(weight, x, y, m, k, _stream.Handle);
+                return;
+            }
+        }
+        Gemm(weight, qt, x, y, m, k, 1);
+    }
+
+    /// <summary>Test hook (issue #482): whether the MTP path is dispatching Q8_0 to the staged kernel.</summary>
+    internal bool MtpUsesStagedQ8Gemv => _mtpQ8Staged is not null;
 
     /// <inheritdoc/>
     public ITensor ForwardMtp(IMtpState state, int tokenId, int position)
@@ -1995,8 +2027,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         ProfMark("mtp-3a-enorm-hnorm");
 
         // cur = eh_proj @ concat(e_norm, h_norm)
-        Gemm(mtpHead.EhProjDevice, mtpHead.EhProjQt, s.Concat, s.Cur,
-             mtpHead.EhProjOutputDim, mtpHead.EhProjInputDim, 1);
+        MtpGemm(mtpHead.EhProjDevice, mtpHead.EhProjQt, s.Concat, s.Cur,
+             mtpHead.EhProjOutputDim, mtpHead.EhProjInputDim);
 
         // inpSA: the attention sub-block's residual is the eh_proj output, not the raw input.
         CudaDriverApi.cuMemcpyDtoDAsync_v2(s.Residual, s.Cur, (nuint)((long)hiddenSize * sizeof(float)), streamH)
@@ -2006,7 +2038,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         // ── Attention sub-block — same gated-QKV math as ForwardFullAttnBody, seqQ=1 ──
         _kernels.LaunchRmsNormF32(s.Cur, mtpHead.Layer.AttnNormWeightDevice, s.Normed, hiddenSize, eps, 1, streamH);
 
-        Gemm(attn.QDevice, attn.QQt, s.Normed, s.Qg, attn.QOutputDim, attn.QInputDim, 1);
+        MtpGemm(attn.QDevice, attn.QQt, s.Normed, s.Qg, attn.QOutputDim, attn.QInputDim);
 
         if (_kernels.HasDeinterleaveF32)
         {
@@ -2032,8 +2064,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         // `k.CopyTo(state.GetKeyRow(step))` / `v.CopyTo(state.GetValueRow(step))`.
         nint kRowDst = state.GetKeyRowDevicePtr(step);
         nint vRowDst = state.GetValueRowDevicePtr(step);
-        Gemm(attn.KDevice, attn.KQt, s.Normed, kRowDst, attn.KOutputDim, attn.KInputDim, 1);
-        Gemm(attn.VDevice, attn.VQt, s.Normed, vRowDst, attn.VOutputDim, attn.VInputDim, 1);
+        MtpGemm(attn.KDevice, attn.KQt, s.Normed, kRowDst, attn.KOutputDim, attn.KInputDim);
+        MtpGemm(attn.VDevice, attn.VQt, s.Normed, vRowDst, attn.VOutputDim, attn.VInputDim);
         ProfMark("mtp-4b-kv-proj");
 
         // Per-head QK-norm (RMSNorm over headDim, one "row" per head — seqLen=1 * numHeads/numKvHeads rows).
@@ -2064,7 +2096,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         else
             LaunchSigmoidMulHostFallback(s.AttnOut, s.Gate, qElems);
 
-        Gemm(attn.ODevice, attn.OQt, s.AttnOut, s.Cur, attn.OOutputDim, attn.OInputDim, 1);
+        MtpGemm(attn.ODevice, attn.OQt, s.AttnOut, s.Cur, attn.OOutputDim, attn.OInputDim);
 
         _kernels.LaunchAddF32(s.Residual, s.Cur, s.Cur, hiddenSize, streamH); // cur = inpSA + attn_out_projected
         ProfMark("mtp-6-attn-gate-o-proj");
@@ -2074,14 +2106,14 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             .ThrowOnError(); // ffn_residual
         _kernels.LaunchRmsNormF32(s.Cur, mtpHead.Layer.PostAttnNormWeightDevice, s.Normed, hiddenSize, eps, 1, streamH);
 
-        Gemm(mtpHead.Layer.GateWeight, mtpHead.Layer.GateQt, s.Normed, s.FfnGate,
-             mtpHead.Layer.GateOutputDim, mtpHead.Layer.GateInputDim, 1);
-        Gemm(mtpHead.Layer.UpWeight, mtpHead.Layer.UpQt, s.Normed, s.FfnUp,
-             mtpHead.Layer.UpOutputDim, mtpHead.Layer.UpInputDim, 1);
+        MtpGemm(mtpHead.Layer.GateWeight, mtpHead.Layer.GateQt, s.Normed, s.FfnGate,
+             mtpHead.Layer.GateOutputDim, mtpHead.Layer.GateInputDim);
+        MtpGemm(mtpHead.Layer.UpWeight, mtpHead.Layer.UpQt, s.Normed, s.FfnUp,
+             mtpHead.Layer.UpOutputDim, mtpHead.Layer.UpInputDim);
         ProfMark("mtp-7a-ffn-norm-gate-up");
         _kernels.LaunchSwiGLUF32(s.FfnGate, s.FfnUp, s.Silu, intermediateSize, 1, streamH);
-        Gemm(mtpHead.Layer.DownWeight, mtpHead.Layer.DownQt, s.Silu, s.Cur,
-             mtpHead.Layer.DownOutputDim, mtpHead.Layer.DownInputDim, 1);
+        MtpGemm(mtpHead.Layer.DownWeight, mtpHead.Layer.DownQt, s.Silu, s.Cur,
+             mtpHead.Layer.DownOutputDim, mtpHead.Layer.DownInputDim);
 
         _kernels.LaunchAddF32(s.Residual, s.Cur, s.Cur, hiddenSize, streamH); // cur = ffn_residual + ffn_out
         ProfMark("mtp-7b-ffn-swiglu-down");
@@ -2121,7 +2153,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 permuteGdnValueHeads: false, streamH);
         }
         ProfMark("mtp-8-head-norm-rot");
-        Gemm(headWeight, headQt, headIn, s.LogitsDevice, headOutputDim, headInputDim, 1);
+        MtpGemm(headWeight, headQt, headIn, s.LogitsDevice, headOutputDim, headInputDim);
         ProfMark("mtp-9-lm-head");
 
         _stream.Synchronize();
@@ -3475,6 +3507,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _mtpScratch = null;
         _mtpAbsorbScratch?.Dispose();
         _mtpAbsorbScratch = null;
+        _mtpQ8Staged?.Dispose();
+        _mtpQ8Staged = null;
         _hadamard?.Dispose();
 
         _state.Dispose();
