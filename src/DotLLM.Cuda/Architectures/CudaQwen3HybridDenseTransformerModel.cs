@@ -85,6 +85,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private nint _activF16OutScratch;
     private long _activF16OutScratchElems;
 
+    // #482: set once the "multi-column PQ2_0 GEMV unavailable" warning has been printed, so a
+    // missing/stale pq2_0_gemv_multi.ptx is reported once per model, not once per projection.
+    private bool _warnedNoPQ2_0GemvMulti;
+
     // Host-side per-row embedding lookup (NOT a full-table GPU pre-dequant — see the
     // LoadFromGguf remarks for why). Points at the mmap'd GGUF data region backing
     // token_embd.weight; each Forward call dequantizes only its `seqLen` rows on the CPU
@@ -3154,6 +3158,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             return;
         }
 
+        // #482: 2..8 token rows (an MTP / speculative verify, a short prefill) read the packed PQ2_0
+        // weights once for all rows instead of dequantizing the whole matrix to F16 for cuBLAS below.
+        if (qt == QuantizationType.PQ2_0 && CudaSmallSGemvDispatch.Covers(seqLen)
+            && TryPQ2_0GemvMulti(weight, x, y, m, k, seqLen, streamH))
+            return;
+
         if (seqLen == 1)
         {
             if (qt == QuantizationType.Q8_0)
@@ -3235,6 +3245,34 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y, activOutElems, streamH);
     }
 
+    /// <summary>
+    /// Multi-column PQ2_0 projection (issue #482): converts the <c>[seqLen, k]</c> F32 activations
+    /// to F16 in the shared staging scratch (the same rounding the single-column kernel applies when
+    /// it stages x) and runs one exact-width multi-column GEMV into <c>y[seqLen, m]</c>. Returns
+    /// <see langword="false"/> — after a one-time warning — when <c>pq2_0_gemv_multi.ptx</c> is not
+    /// loaded, so the caller keeps the old path.
+    /// </summary>
+    private bool TryPQ2_0GemvMulti(nint weight, nint x, nint y, int m, int k, int seqLen, nint streamH)
+    {
+        if (!_kernels.HasPQ2_0GemvMulti)
+        {
+            if (!_warnedNoPQ2_0GemvMulti)
+            {
+                _warnedNoPQ2_0GemvMulti = true;
+                Console.Error.WriteLine(
+                    "[dotLLM.Cuda] Multi-column PQ2_0 GEMV unavailable (" + _kernels.PQ2_0GemvMultiUnavailableReason +
+                    ") — 2..8-token PQ2_0 projections fall back to dequant+cuBLAS (MTP verify will be slow).");
+            }
+            return false;
+        }
+
+        int activInElems = checked(seqLen * k);
+        EnsureActivF16InScratch(activInElems);
+        _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, activInElems, streamH);
+        _kernels.LaunchPQ2_0GemvMulti(weight, _activF16InScratch, y, m, k, seqLen, streamH);
+        return true;
+    }
+
     private void EnsureActivF16InScratch(long halfs)
     {
         if (halfs <= _activF16InScratchElems) return;
@@ -3273,6 +3311,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     {
         if (seqLen != 1 || k0 != k1
             || qt0 != QuantizationType.PQ2_0 || qt1 != QuantizationType.PQ2_0)
+            return false;
+        // #482 A/B switch: with DOTLLM_CUDA_PQ2_0_S1_MULTI=1 every S=1 PQ2_0 projection (the fused
+        // pairs included) goes through Gemm's multi-column S=1 variant, so the whole decode step is
+        // measured on one kernel family.
+        if (CudaSmallSGemvDispatch.UseMultiForSingleColumn && _kernels.HasPQ2_0GemvMulti)
             return false;
 
         nint streamH = _stream.Handle;
