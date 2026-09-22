@@ -881,6 +881,8 @@ public static unsafe partial class MoeSwiGluMlp
                 // Q5_0 weight × Q8_1 input: 36 bytes per 32-element block.
                 if (k % 32 != 0) return 0;
                 return batch * (k / 32) * 36;
+            case QuantizationType.Q2_K:
+            case QuantizationType.Q3_K:
             case QuantizationType.Q4_K:
             case QuantizationType.Q5_K:
             case QuantizationType.Q6_K:
@@ -916,6 +918,8 @@ public static unsafe partial class MoeSwiGluMlp
                         MatMul.QuantizeF32ToQ8_1(src + b * k, dest + b * rowBytes, k);
                     break;
                 }
+            case QuantizationType.Q2_K:
+            case QuantizationType.Q3_K:
             case QuantizationType.Q4_K:
             case QuantizationType.Q5_K:
             case QuantizationType.Q6_K:
@@ -957,6 +961,21 @@ public static unsafe partial class MoeSwiGluMlp
                     MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
                 else
                     MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                return;
+            // Q2_K/Q3_K are safe here where the packed legacy quants are not (see the note on
+            // the default arm): their ComputeRows does not vary with n, so a token's result does
+            // not depend on how many others routed to the same expert.
+            case QuantizationType.Q2_K:
+                if (pool is not null)
+                    MatMul.GemmQ2_K((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
+                else
+                    MatMul.GemmQ2_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                return;
+            case QuantizationType.Q3_K:
+                if (pool is not null)
+                    MatMul.GemmQ3_K((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
+                else
+                    MatMul.GemmQ3_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
                 return;
             case QuantizationType.Q4_K:
                 if (pool is not null)

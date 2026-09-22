@@ -9,13 +9,19 @@
 //   bytes [ 0.. 15] = scales[16]  — per-sub-block low nibble = 4-bit unsigned
 //                     scale (0..15), high nibble = 4-bit unsigned dmin
 //                     coefficient (0..15). 16 sub-blocks of 16 elements each.
-//   bytes [16.. 79] = qs[64]      — 2-bit unsigned quants, 4 elements per byte
-//                     (element t: byteIdx = t/4, bit offset = (t%4)*2).
+//   bytes [16.. 79] = qs[64]      — 2-bit unsigned quants, 4 elements per byte,
+//                     TRANSPOSED: each 128-element half consumes 32 qs bytes and
+//                     each byte supplies four elements 32 apart (issue #498 —
+//                     this was previously decoded as four *consecutive*
+//                     elements per byte, which is wrong). Authority:
+//                     ggml/src/ggml-quants.c dequantize_row_q2_K.
+//                         byteIdx = 32*(t>>7) + (t & 31)
+//                         shift   = 2*((t>>5) & 3)
 //   bytes [80, 81]  = fp16 d      — global delta.
 //   bytes [82, 83]  = fp16 dmin   — global min delta.
 //
-// Per-element decode (sub = t / 16):
-//   q2     = (qs[t/4] >> ((t%4)*2)) & 0x3              // 0..3
+// Per-element decode (sub = t / 16 — scale indexing is NOT transposed):
+//   q2     = (qs[32*(t>>7) + (t&31)] >> (2*((t>>5)&3))) & 0x3   // 0..3
 //   scale  =  scales[sub] & 0xF                         // 0..15
 //   dmCoef = (scales[sub] >> 4) & 0xF                   // 0..15
 //   value  =  d * scale * q2  -  dmin * dmCoef
@@ -71,9 +77,10 @@ void main() {
     uint scale    = scByte & 0xFu;
     uint dmCoef   = (scByte >> 4u) & 0xFu;
 
-    uint qByteOff = blockBase + 16u + (t >> 2u);
+    // Transposed 2-bit layout (issue #498): byte 32*(t>>7) + (t&31), shift 2*((t>>5)&3).
+    uint qByteOff = blockBase + 16u + 32u * (t >> 7u) + (t & 31u);
     uint qByte    = readByte(qByteOff);
-    uint bitOff   = (t & 3u) << 1u;
+    uint bitOff   = ((t >> 5u) & 3u) << 1u;
     uint q2       = (qByte >> bitOff) & 0x3u;
 
     float value = d * float(scale) * float(q2) - dmin * float(dmCoef);
