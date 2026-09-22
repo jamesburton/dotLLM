@@ -35,7 +35,8 @@ namespace DotLLM.Tests.Unit.Cuda;
 public sealed class CudaQwen3HybridDenseMmqPrefillTests : IDisposable
 {
     // 12 tokens: > 8, so the whole prefill (and the lm_head over 12 rows) takes the MMQ path.
-    private static readonly int[] Prompt = [1, 3, 5, 7, 9, 2, 4, 6, 8, 10, 12, 11];
+    // Every id is inside the synthetic fixture's 12-token vocabulary.
+    private static readonly int[] Prompt = [1, 3, 5, 7, 9, 2, 4, 6, 8, 10, 11, 0];
 
     private readonly string _scratch;
     private readonly ITestOutputHelper _out;
@@ -95,23 +96,41 @@ public sealed class CudaQwen3HybridDenseMmqPrefillTests : IDisposable
 
     private void RunAndAssert(CudaQwen3HybridDenseTransformerModel model, int vocab, string label, int[] prompt)
     {
-        float[][] mmq, old, singles;
-        int mmqLaunches, oldLaunches;
+        float[][] mmq, mmqNoShare, old, singles;
+        int mmqLaunches, mmqNoShareLaunches, oldLaunches;
+        (int Gemv, int Quantize) counts, countsNoShare;
         try
         {
             CudaSmallSGemvDispatch.Dp4aOverride = true;      // the S = 1 reference is #485's W2A8 GEMV
+            CudaSmallSGemvDispatch.ShareDp4aInputOverride = null;
             CudaSmallSGemvDispatch.MmqOverride = true;
-            mmq = RunBatched(model, vocab, prompt, out mmqLaunches);
+            mmq = RunBatched(model, vocab, prompt, out mmqLaunches, out counts);
+            // #490 widened SharesDp4aInput to prefill widths: with sharing off every projection
+            // re-quantizes its own input, and the logits must be bit-identical — a stale shared int8
+            // scratch cannot hide behind the tolerance below.
+            CudaSmallSGemvDispatch.ShareDp4aInputOverride = false;
+            mmqNoShare = RunBatched(model, vocab, prompt, out mmqNoShareLaunches, out countsNoShare);
+            CudaSmallSGemvDispatch.ShareDp4aInputOverride = null;
             CudaSmallSGemvDispatch.MmqOverride = false;
-            old = RunBatched(model, vocab, prompt, out oldLaunches);
+            old = RunBatched(model, vocab, prompt, out oldLaunches, out _);
             CudaSmallSGemvDispatch.MmqOverride = null;
             singles = RunSingles(model, vocab, prompt);
         }
         finally
         {
             CudaSmallSGemvDispatch.MmqOverride = null;
+            CudaSmallSGemvDispatch.ShareDp4aInputOverride = null;
             CudaSmallSGemvDispatch.Dp4aOverride = null;
         }
+
+        _out.WriteLine($"{label}: prefill launches (mmq, gemv, quantize): sharing on ({mmqLaunches}, {counts.Gemv}, " +
+                       $"{counts.Quantize}), off ({countsNoShare.Gemv}, {countsNoShare.Quantize})");
+        Assert.True(counts.Quantize <= mmqLaunches + counts.Gemv,
+            $"{label}: more quantize launches than projections with input sharing on");
+        Assert.Equal(mmqNoShareLaunches + countsNoShare.Gemv, countsNoShare.Quantize);   // sharing off: one quantize each
+        Assert.True(BitwiseEqual(mmq, mmqNoShare),
+            $"{label}: prefill logits change when dp4a input sharing is turned off (max|diff| " +
+            $"{MaxAbsDiff(mmq[prompt.Length - 1], mmqNoShare[prompt.Length - 1]):E3}) — a shared quantized scratch is stale.");
 
         // Structural: the new kernel ran, the old arm did not use it, and the two arms differ.
         _out.WriteLine($"{label}: MMQ launches per prefill forward: on {mmqLaunches}, off {oldLaunches}");
@@ -141,7 +160,7 @@ public sealed class CudaQwen3HybridDenseMmqPrefillTests : IDisposable
     }
 
     private static float[][] RunBatched(CudaQwen3HybridDenseTransformerModel model, int vocab, int[] prompt,
-        out int mmqLaunches)
+        out int mmqLaunches, out (int Gemv, int Quantize) dp4aCounts)
     {
         model.ResetSequenceState();
         using var kv = model.CreateKvCache(maxSeqLen: 64);
@@ -150,6 +169,7 @@ public sealed class CudaQwen3HybridDenseMmqPrefillTests : IDisposable
         model.ResetDp4aLaunchCounts();
         using var logits = model.Forward(prompt, positions, deviceId: -1, kv);
         mmqLaunches = model.Pq2_0MmqLaunchCount;
+        dp4aCounts = model.Dp4aLaunchCounts;
         Assert.Equal(prompt.Length, logits.Shape[0]);
         float[][] rows = new float[prompt.Length][];
         for (int r = 0; r < rows.Length; r++) rows[r] = Row(logits, r, vocab);

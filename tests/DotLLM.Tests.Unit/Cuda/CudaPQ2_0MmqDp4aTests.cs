@@ -126,6 +126,35 @@ public sealed class CudaPQ2_0MmqDp4aTests
         }
     }
 
+    /// <summary>
+    /// The compiled kernel must be BIT-identical to <see cref="PQ2_0MmqLayoutEmulationTests"/>'s port
+    /// of its body on the same inputs: same accumulation order, same exact int→float, same unfused
+    /// <c>d·ws</c>. A difference here does not mean a wrong answer — it means nvcc emitted something
+    /// other than the reviewed source (FMA contraction being the usual culprit), which is worth
+    /// knowing before any tolerance-based result is trusted.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(13, 129, 256)]
+    [InlineData(17, 257, 384)]
+    public void Mmq_IsBitIdenticalToTheCpuEmulationOfItsBody(int columns, int n, int k)
+    {
+        string ptxDir = SkipUnlessMmqKernel();
+        var rng = new Random(49020 + columns + n + k);
+        byte[] packed = CudaPQ2_0GemvDp4aTests.RandomPackedPQ2_0WithCode3(rng, n, k);
+        float[] x = CudaPQ2_0GemvDp4aTests.RealisticActivations(rng, columns * k);
+
+        MmqRun run = RunMmq(ptxDir, packed, x, n, k, columns, withF16Oracle: false, keepRaw: true);
+
+        int tile = CudaSmallSGemvDispatch.MmqTileColumns(columns);
+        float[] emulated = PQ2_0MmqLayoutEmulationTests.Emulate(
+            run.Split!, run.PermutedQ!, run.D, run.Sum!, n, k, columns, tile);
+        for (long i = 0; i < emulated.LongLength; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(emulated[i]) == BitConverter.SingleToInt32Bits(run.Y[i]),
+                $"S={columns} n={n} k={k} BN={tile}: column {i / n} row {i % n}: " +
+                $"emulation {emulated[i]:R} vs kernel {run.Y[i]:R}");
+        _out.WriteLine($"S={columns} n={n} k={k} BN={tile}: {emulated.Length} outputs bit-identical to the CPU emulation");
+    }
+
     private void AssertMatchesReference(string label, byte[] packed, sbyte[] q, float[] d, float[] y,
         int n, int k, int columns)
     {
@@ -194,7 +223,8 @@ public sealed class CudaPQ2_0MmqDp4aTests
 
     // ───────────────────────── GPU plumbing ─────────────────────────
 
-    private sealed record MmqRun(float[] Y, float[]? YOtherTile, float[]? YF16, sbyte[] Q, float[] D);
+    private sealed record MmqRun(float[] Y, float[]? YOtherTile, float[]? YF16, sbyte[] Q, float[] D,
+        byte[]? Split = null, sbyte[]? PermutedQ = null, int[]? Sum = null);
 
     /// <summary>
     /// Stages exactly as <c>CudaQwen3HybridDenseTransformerModel.Gemm</c>'s #490 branch does
@@ -203,7 +233,7 @@ public sealed class CudaPQ2_0MmqDp4aTests
     /// </summary>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private static unsafe MmqRun RunMmq(string ptxDir, byte[] packed, float[] x, int n, int k, int columns,
-        bool withF16Oracle)
+        bool withF16Oracle, bool keepRaw = false)
     {
         using var ctx = CudaContext.Create(0);
         using var stream = CudaStream.Create();
@@ -252,7 +282,16 @@ public sealed class CudaPQ2_0MmqDp4aTests
             float[] yOther = Download<float>(devYOther, (long)columns * n);
             float[]? yF16 = withF16Oracle ? Download<float>(devYF16, (long)columns * n) : null;
             (sbyte[] q, float[] d) = DownloadQuant(devQ, devMeta, elems);
-            return new MmqRun(y, yOther, yF16, q, d);
+            if (!keepRaw) return new MmqRun(y, yOther, yF16, q, d);
+
+            // Raw inputs for the bit-identical emulation check: the split-layout weight exactly as the
+            // kernel reads it, the still-permuted int8, and the per-block sums.
+            byte[] split = Download<byte>(devWSplit, CudaKernels.PQ2_0SplitLayoutBytes(n, k));
+            sbyte[] permuted = Download<sbyte>(devQ, elems);
+            int[] meta = Download<int>(devMeta, (long)blocks * 2);
+            var sum = new int[blocks];
+            for (int b = 0; b < blocks; b++) sum[b] = meta[2 * b + 1];
+            return new MmqRun(y, yOther, yF16, q, d, split, permuted, sum);
         }
         finally
         {

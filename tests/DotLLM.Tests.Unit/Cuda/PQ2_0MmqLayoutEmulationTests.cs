@@ -122,7 +122,13 @@ public sealed class PQ2_0MmqLayoutEmulationTests
 
     // ───────────────────────── the emulation ─────────────────────────
 
-    private static float[] Emulate(byte[] split, sbyte[] permuted, float[] xd, int[] xsum,
+    /// <summary>
+    /// The emulated kernel output. Exposed so the GPU parity test can assert the compiled kernel is
+    /// BIT-identical to this port on a small shape: the accumulation order, the exact int-to-float
+    /// conversion and the unfused <c>d*ws</c> product are the same on both sides, so any difference
+    /// means nvcc compiled something other than the reviewed source (FMA contraction, say).
+    /// </summary>
+    internal static float[] Emulate(byte[] split, sbyte[] permuted, float[] xd, int[] xsum,
         int n, int k, int columns, int tileColumns)
     {
         var y = new float[(long)columns * n];
