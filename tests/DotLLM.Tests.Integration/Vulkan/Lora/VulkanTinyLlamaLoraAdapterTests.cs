@@ -32,6 +32,7 @@ namespace DotLLM.Tests.Integration.Vulkan.Lora;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class VulkanTinyLlamaLoraAdapterTests
 {
     private const int MaxBaseBytes = 50 * 1024 * 1024;

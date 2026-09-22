@@ -101,6 +101,7 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class CudaGptOssParitySyntheticTests : IDisposable
 {
     // ── Fixture shape ──

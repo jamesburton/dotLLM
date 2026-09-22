@@ -25,6 +25,7 @@ namespace DotLLM.Tests.Integration.Models.Lora;
 /// a GPU; the test passes trivially via early return. Schedule it for the RTX 3060 run tomorrow.
 /// Kept in its own class to avoid cross-class GPU parallelism.
 /// </remarks>
+[Collection(GpuCollection.Name)]
 public sealed class LoraStackCudaParityTests
 {
     private readonly ITestOutputHelper _output;

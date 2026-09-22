@@ -53,7 +53,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 // below can be met while reading the wrong model's report. Verified empirically
 // (#344), and the risk did not go away when #352 took the expected count to 0 —
 // a report from a fully-packed model reads 0 just as readily.
-[Collection("VulkanResidencyReport")]
+[Collection(VulkanResidencyReportCollection.Name)]
 public sealed class RealGgufVulkanParityTests
 {
     private const float LogitsAbsTol = 3.0f;

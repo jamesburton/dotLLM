@@ -23,7 +23,7 @@ namespace DotLLM.Tests.Integration.Backends;
 /// <see cref="TimingBackend.Cpu"/> against the same GGUF; the CSV rows compose because both
 /// backends emit the identical <c>phase,name,ms,tokens_per_sec</c> shape.</para>
 /// </remarks>
-[Collection("SmallModel")]
+[Collection(SmallModelGpuCollection.Name)]
 [Trait("Category", "GPU")]
 public sealed class VulkanCrossBackendTimingDemoTests
 {

@@ -71,6 +71,7 @@ namespace DotLLM.Tests.Integration.CrossBackend;
 /// "astronomical") would have missed it - both large numbers looked equally destroyed until
 /// diffed against a third backend on identical tokens.</para>
 /// </remarks>
+[Collection(GpuCollection.Name)]
 public sealed class CrossBackendQuantGateTests
 {
     private readonly ITestOutputHelper _output;

@@ -24,6 +24,7 @@ namespace DotLLM.Tests.Integration.Backends;
 /// update the gap report and convert this into a real parity test.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class Gemma4GpuGapProbeTests
 {
     private readonly ITestOutputHelper _output;

@@ -21,6 +21,7 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// architecture under test.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class CudaUnsupportedArchitectureGuardTests
 {
     [SkippableTheory]

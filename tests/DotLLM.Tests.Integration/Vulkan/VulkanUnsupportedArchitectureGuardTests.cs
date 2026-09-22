@@ -30,6 +30,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class VulkanUnsupportedArchitectureGuardTests
 {
     private static FixtureLocation ResolveAnyGguf() => TestFixtureResolver.ResolveFile(

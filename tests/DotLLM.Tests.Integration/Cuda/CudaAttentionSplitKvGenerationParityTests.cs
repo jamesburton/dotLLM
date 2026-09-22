@@ -28,6 +28,7 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// </list>
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class CudaAttentionSplitKvGenerationParityTests
 {
     private readonly ITestOutputHelper _output;

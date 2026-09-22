@@ -22,6 +22,7 @@ namespace DotLLM.Tests.Integration.Models.Lora;
 /// or when CUDA is unavailable — no SkippableFact dependency needed.
 /// Kept in its own class to avoid cross-class GPU parallelism.
 /// </remarks>
+[Collection(GpuCollection.Name)]
 public sealed class BitNetCudaLoraParityTests
 {
     private readonly ITestOutputHelper _output;
