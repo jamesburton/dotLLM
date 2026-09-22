@@ -3392,9 +3392,9 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         if (seqLen != 1 || k0 != k1
             || qt0 != QuantizationType.PQ2_0 || qt1 != QuantizationType.PQ2_0)
             return false;
-        // #482 A/B switch: with DOTLLM_CUDA_PQ2_0_S1_MULTI=1 every S=1 PQ2_0 projection (the fused
-        // pairs included) goes through Gemm's multi-column S=1 variant, so the whole decode step is
-        // measured on one kernel family.
+        // #482: by default (DOTLLM_CUDA_PQ2_0_S1_MULTI != 0) every S=1 PQ2_0 projection, the fused
+        // pairs included, goes through Gemm's multi-column S=1 variant. It measured faster for the
+        // whole decode step than the fused single-column pairs.
         if (CudaSmallSGemvDispatch.UseMultiForSingleColumn && _kernels.HasPQ2_0GemvMulti)
             return false;
 

@@ -18,9 +18,11 @@ namespace DotLLM.Cuda;
 /// <para>
 /// <b>Escape hatches</b>, read once on first use because this sits on the per-projection path:
 /// <c>DOTLLM_CUDA_SMALL_S_MAX</c> caps the multi-column range (default 8, clamped to 8; <c>0</c> or
-/// <c>1</c> restores the pre-#482 dispatch). <c>DOTLLM_CUDA_PQ2_0_S1_MULTI=1</c> additionally routes
-/// single-token decode through the S=1 instantiation of the same kernel — an A/B switch only; the
-/// shipped decode path stays on <c>pq2_0_gemv_f32io</c> until a measurement says otherwise.
+/// <c>1</c> restores the pre-#482 dispatch). Single-token decode also goes through the S=1
+/// instantiation of the same kernel by default: measured on the T5500 (RTX 3060, Bonsai 2 27B,
+/// same-session order-reversed A/B), plain decode went from 16.9 to 18.2 tok/s, and greedy output still
+/// matches the CPU oracle. <c>DOTLLM_CUDA_PQ2_0_S1_MULTI=0</c> restores <c>pq2_0_gemv_f32io</c> and the
+/// fused gate+up / K+V pairs.
 /// </para>
 /// </remarks>
 public static class CudaSmallSGemvDispatch
@@ -31,12 +33,12 @@ public static class CudaSmallSGemvDispatch
     /// <summary>Environment variable overriding <see cref="DefaultMaxColumns"/>; <c>0</c> disables the path.</summary>
     public const string MaxColumnsEnvVar = "DOTLLM_CUDA_SMALL_S_MAX";
 
-    /// <summary>Environment variable that, when <c>1</c>, routes seqLen == 1 PQ2_0 decode through the multi-column kernel's S=1 variant.</summary>
+    /// <summary>Environment variable that, when <c>0</c>, sends seqLen == 1 PQ2_0 decode back to the single-column kernel (default: multi-column S=1).</summary>
     public const string SingleColumnEnvVar = "DOTLLM_CUDA_PQ2_0_S1_MULTI";
 
     private static readonly int MaxColumnsFromEnv = ReadMaxColumns();
     private static readonly bool SingleColumnFromEnv =
-        Environment.GetEnvironmentVariable(SingleColumnEnvVar) == "1";
+        Environment.GetEnvironmentVariable(SingleColumnEnvVar) != "0";
 
     /// <summary>
     /// Effective multi-column range: <c>2 &lt;= seqLen &lt;= </c> this goes to the multi-column
@@ -44,7 +46,7 @@ public static class CudaSmallSGemvDispatch
     /// </summary>
     public static int MaxColumns => MaxColumnsOverride ?? MaxColumnsFromEnv;
 
-    /// <summary>Whether single-token PQ2_0 decode uses the multi-column kernel's S=1 variant (A/B only).</summary>
+    /// <summary>Whether single-token PQ2_0 decode uses the multi-column kernel's S=1 variant (default on).</summary>
     public static bool UseMultiForSingleColumn => SingleColumnOverride ?? SingleColumnFromEnv;
 
     /// <summary>
