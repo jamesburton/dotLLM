@@ -221,8 +221,9 @@ public sealed class CudaPQ2_0GemvDp4aTests
             (int argDp4a, _) = ArgMaxWithGap(run.Y, c * n, n);
             _out.WriteLine($"S={columns} col {c}: rel RMS |dp4a-f16| {relRms:E3}, max diff {maxDiff:E3}, " +
                            $"argmax f16={argF16} dp4a={argDp4a}, f16 top-2 gap {gap:E3}");
-            // W2A8 error on N(0,1)-like activations is ~0.5% of the output RMS; 2% leaves headroom for
-            // the outliers but not for a lost block or column (those are O(100%) on the hit outputs).
+            // Estimated W2A8 error on these activations (~15% of blocks carry an outlier) is ~0.7-1.3% of
+            // the output RMS. This bound is calibration, not physics — oracles A/B in the parity test are
+            // the correctness signal; a lost block or column is O(100%) on the hit outputs.
             Assert.True(relRms <= 2e-2, $"column {c}: relative RMS error {relRms:E3} vs the F16-activation kernel exceeds 2e-2");
             if (gap > 2 * maxDiff)
                 Assert.Equal(argF16, argDp4a);
