@@ -27,8 +27,11 @@ namespace DotLLM.Cpu.Kernels;
 /// Q8_0 blocks of 32 elements, since <see cref="PQ2_0GroupSize"/> == 4 · <c>Q8_0GroupSize</c>),
 /// multiplied in alongside the activation's own Q8_0 block scale — see
 /// <see cref="VecDotPQ2_0Q8"/>.</item>
+/// <item><b>128-bit W2A8</b> (issue #477): on pre-AVX2 hardware with SSSE3 (e.g. Westmere) the
+/// same W2A8 path runs with the PMADDUBSW/PMADDWD kernels in <c>MatMul.W2A8Sse.cs</c>.</item>
 /// <item><b>Float fallback</b> (unpack row once into a per-group-scaled float buffer, then dot
-/// via <see cref="TensorPrimitives.Dot"/>): used on hardware without AVX2 (e.g. Westmere), and
+/// via <see cref="TensorPrimitives.Dot"/>): used on hardware without SSSE3, when
+/// <c>DOTLLM_PQ2_W2A8=0</c>, and
 /// — <b>unlike I2_S</b> — always used by <see cref="GemmPQ2_0"/> (GEMM/prefill) regardless of
 /// ISA. Issue #204 added the W2A8 tier and benchmarked both entry points: GEMV/decode got a
 /// solid, repeatable 2.4x-3.1x win and dispatches to W2A8 on AVX2/AVX-VNNI hardware as expected,
@@ -82,16 +85,28 @@ public static unsafe partial class MatMul
         public int N;
     }
 
-    /// <summary>True when a SIMD W2A8 (int8-activation) path is available.</summary>
-    private static bool PQ2_0UseW2A8 => Avx2.IsSupported;
+    /// <summary>
+    /// True when a SIMD W2A8 (int8-activation) path is available and enabled: the AVX2/AVX-VNNI
+    /// tier, or (issue #477) the 128-bit SSSE3 tier in <c>MatMul.W2A8Sse.cs</c> on pre-AVX2
+    /// hardware such as Westmere. Overridable via <c>DOTLLM_PQ2_W2A8=0</c> to force the float
+    /// (W2A16) tier for A/B runs (mirrors <c>DOTLLM_I2S_W2A8</c>).
+    /// </summary>
+    private static readonly bool PQ2_0UseW2A8 = ResolvePQ2_0UseW2A8();
+
+    private static bool ResolvePQ2_0UseW2A8()
+    {
+        string? env = Environment.GetEnvironmentVariable("DOTLLM_PQ2_W2A8");
+        if (env is "0" or "false" or "off") return false;
+        return Ssse3.IsSupported;
+    }
 
     /// <summary>
     /// PQ2_0 ternary GEMV: <c>result[r] = dot(perGroupScaled(A[r,:]), x)</c>.
     /// A is [M,K] packed PQ2_0 (row-major, K a multiple of 128, row stride
-    /// <c>(K/128)·34</c> bytes); x is f32 [K]; result is f32 [M]. On AVX2/AVX-VNNI hardware the
-    /// activation is quantized to int8 (Q8_0) once and the W2A8 SIMD path runs; older hardware
-    /// falls back to the float path. Output rows are partitioned across
-    /// <paramref name="threadPool"/> workers when present.
+    /// <c>(K/128)·34</c> bytes); x is f32 [K]; result is f32 [M]. On SSSE3-or-better hardware the
+    /// activation is quantized to int8 (Q8_0) once and the W2A8 SIMD path runs (256-bit on AVX2,
+    /// 128-bit otherwise — issue #477); hardware without SSSE3 falls back to the float path.
+    /// Output rows are partitioned across <paramref name="threadPool"/> workers when present.
     /// </summary>
     [SkipLocalsInit]
     public static void GemvPQ2_0(byte* weights, float* x, float* result, int m, int k,
@@ -493,12 +508,20 @@ public static unsafe partial class MatMul
     /// applies <c>d_b</c> alone — the per-tensor <c>scale</c> multiply I2_S does at the very end
     /// has no equivalent here (there is no single tensor-wide scale to apply).</para>
     ///
-    /// <para>Dispatches to the VNNI tier when available, else the AVX2 (maddubs) tier. Both
-    /// tiers use the sign trick (see <c>MatMul.I2S.cs</c>'s class summary for the derivation).</para>
+    /// <para>Dispatches to the AVX2 tier (VNNI when available, else maddubs) or, on pre-AVX2
+    /// hardware, the 128-bit SSSE3 tier <see cref="VecDotPQ2_0Q8Sse"/> (issue #477). All tiers use
+    /// the sign trick (see <c>MatMul.I2S.cs</c>'s class summary for the derivation).</para>
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float VecDotPQ2_0Q8(sbyte* wI8, float* groupScales, byte* xQ8, int blockCount)
+        => Avx2.IsSupported
+            ? VecDotPQ2_0Q8Avx2(wI8, groupScales, xQ8, blockCount)
+            : VecDotPQ2_0Q8Sse(wI8, groupScales, xQ8, blockCount);
+
+    /// <summary>AVX2/AVX-VNNI tier of <see cref="VecDotPQ2_0Q8"/>.</summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static float VecDotPQ2_0Q8(sbyte* wI8, float* groupScales, byte* xQ8, int blockCount)
+    internal static float VecDotPQ2_0Q8Avx2(sbyte* wI8, float* groupScales, byte* xQ8, int blockCount)
     {
         const int blocksPerGroup = PQ2_0GroupSize / Q8_0GroupSize; // 128 / 32 = 4
 
@@ -568,9 +591,20 @@ public static unsafe partial class MatMul
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void UnpackPQ2_0RowI8(byte* rowPtr, sbyte* dest, float* groupScales, int k)
     {
-        int groups = k / PQ2_0GroupSize;
-
         if (Avx2.IsSupported)
+            UnpackPQ2_0RowI8Avx2(rowPtr, dest, groupScales, k);
+        else if (Sse2.IsSupported)
+            UnpackPQ2_0RowI8Sse(rowPtr, dest, groupScales, k);
+        else
+            UnpackPQ2_0RowI8Scalar(rowPtr, dest, groupScales, k);
+    }
+
+    /// <summary>AVX2 tier of <see cref="UnpackPQ2_0RowI8"/>.</summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void UnpackPQ2_0RowI8Avx2(byte* rowPtr, sbyte* dest, float* groupScales, int k)
+    {
+        int groups = k / PQ2_0GroupSize;
         {
             sbyte* field0 = stackalloc sbyte[32]; // element 4b   (bit offset 0)
             sbyte* field2 = stackalloc sbyte[32]; // element 4b+1 (bit offset 2)
@@ -605,9 +639,14 @@ public static unsafe partial class MatMul
                     outp[outIdx + 3] = field6[b];
                 }
             }
-            return;
         }
+    }
 
+    /// <summary>Scalar reference tier of <see cref="UnpackPQ2_0RowI8"/>.</summary>
+    [SkipLocalsInit]
+    internal static void UnpackPQ2_0RowI8Scalar(byte* rowPtr, sbyte* dest, float* groupScales, int k)
+    {
+        int groups = k / PQ2_0GroupSize;
         for (int g = 0; g < groups; g++)
         {
             byte* groupBase = rowPtr + g * PQ2_0GroupBytes;
