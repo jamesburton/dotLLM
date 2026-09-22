@@ -115,6 +115,9 @@ internal sealed class VulkanOpProfiler : IDisposable
 
         /// <summary>#445: the sigmoid(gate) elementwise multiply on the attention output.</summary>
         AttnGate,
+
+        /// <summary>#471: the MTP head's <c>eh_proj</c> fusion of the embedding and hidden rows.</summary>
+        MtpEhProj,
     }
 
     /// <summary>
@@ -135,6 +138,8 @@ internal sealed class VulkanOpProfiler : IDisposable
         "ffn_act", "gdn_pre", "gdn_scan", "attention", "resid", "copy_fanout", "lm_head",
         // #445 sub-buckets, in Cat order after LmHead.
         "gdn_scan_core", "gdn_postgate", "attn_rope", "attn_kvupdate", "attn_core", "attn_gate",
+        // #471 MTP draft step.
+        "mtp_eh_proj",
     };
 
     // 64 layers x ~14 marks would overflow a per-forward pool, so the pool is reset and
