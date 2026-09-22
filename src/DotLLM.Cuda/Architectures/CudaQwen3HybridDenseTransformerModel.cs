@@ -229,22 +229,59 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     public bool SupportsRecurrentStateCheckpoint => true;
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Snapshots are pooled (one spare), mirroring the CPU and Vulkan hosts (issue #469, ported in
+    /// #478): a speculative decoder takes one per round, and a fresh <see cref="CudaGdnStateCache"/>
+    /// each time cost two <c>cuMemAlloc</c> + two <c>cuMemset</c> + two <c>cuMemFree</c> on top of
+    /// the copy. Disposing the returned checkpoint hands its buffers back for the next round. The
+    /// contents are the same D2D copy <see cref="CudaGdnStateCache.Clone"/> made, so restores are
+    /// bit-identical to before.
+    /// </remarks>
     public object? CheckpointRecurrentState()
     {
         _context.MakeCurrent();
-        return _gdnCache.Clone();
+        CudaGdnStateCache snapshot = Interlocked.Exchange(ref _spareGdnCheckpoint, null)
+            ?? new CudaGdnStateCache(_gdn, _gdnCache.NumGdnLayers);
+        _gdnCache.CopyTo(snapshot);
+        return new PooledGdnCheckpoint(this, snapshot);
     }
 
     /// <inheritdoc/>
     public void RestoreRecurrentState(object? checkpoint)
     {
-        if (checkpoint is null) return;
-        if (checkpoint is not CudaGdnStateCache snapshot)
-            throw new ArgumentException(
-                $"{GetType().Name}.RestoreRecurrentState expects a CudaGdnStateCache checkpoint; got {checkpoint.GetType().Name}.",
-                nameof(checkpoint));
+        CudaGdnStateCache? snapshot = checkpoint switch
+        {
+            null => null,
+            PooledGdnCheckpoint pooled => pooled.Snapshot,
+            CudaGdnStateCache raw => raw,
+            _ => throw new ArgumentException(
+                $"{GetType().Name}.RestoreRecurrentState expects a checkpoint from CheckpointRecurrentState; " +
+                $"got {checkpoint.GetType().Name}.",
+                nameof(checkpoint)),
+        };
+        if (snapshot is null) return;
         _context.MakeCurrent();
         snapshot.CopyTo(_gdnCache);
+    }
+
+    private CudaGdnStateCache? _spareGdnCheckpoint;
+
+    /// <summary>A pooled GDN snapshot; disposing returns its buffers to the owning model (issue #469).</summary>
+    private sealed class PooledGdnCheckpoint(CudaQwen3HybridDenseTransformerModel owner, CudaGdnStateCache snapshot)
+        : IDisposable
+    {
+        private CudaGdnStateCache? _snapshot = snapshot;
+
+        public CudaGdnStateCache Snapshot
+            => _snapshot ?? throw new ObjectDisposedException(nameof(PooledGdnCheckpoint));
+
+        public void Dispose()
+        {
+            var s = Interlocked.Exchange(ref _snapshot, null);
+            if (s is null) return;
+            if (owner._disposed || Interlocked.CompareExchange(ref owner._spareGdnCheckpoint, s, null) is not null)
+                s.Dispose();
+        }
     }
 
     /// <summary>Number of full-attention layers — matches the sparse KV-cache slot count.</summary>
@@ -2942,6 +2979,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
         _state.Dispose();
         _gdnCache.Dispose();
+        Interlocked.Exchange(ref _spareGdnCheckpoint, null)?.Dispose();
         _kernels.Dispose();
         _cublas.Dispose();
         _stream.Dispose();
