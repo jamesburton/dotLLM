@@ -112,6 +112,14 @@ public sealed unsafe class CudaKernels : IDisposable
     // the PTX is absent/stale; Hadamard-folded checkpoints then refuse to load on CUDA.
     private readonly CudaModule? _hadamardFwhtModule;
     private readonly nint _hadamardFwhtF32Func;
+
+    // Small-S multi-column PQ2_0 GEMV (pq2_0_gemv_multi.ptx) — optional module (issue #482). One
+    // exact-width entry point per S = 1..8; index 0 unused. All zero when the PTX is absent, stale or
+    // fails to JIT: HasPQ2_0GemvMulti then reports false and seqLen 2..8 PQ2_0 projections keep the
+    // dequant+cuBLAS path.
+    private readonly CudaModule? _pq2_0GemvMultiModule;
+    private readonly nint[] _pq2_0GemvMultiFuncs = new nint[Pq2_0GemvMultiMaxColumns + 1];
+    private readonly string? _pq2_0GemvMultiUnavailableReason;
     private readonly nint _quantizedGemvQ2_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ4_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ5_KMmqPreqFunc;
@@ -675,6 +683,29 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             _hadamardFwhtModule = CudaModule.LoadFromFile(hadamardFwhtPath);
             _hadamardFwhtF32Func = _hadamardFwhtModule.TryGetFunction("hadamard_fwht_f32");
+        }
+
+        string pq2_0GemvMultiPath = Path.Combine(ptxDir, "pq2_0_gemv_multi.ptx");
+        if (File.Exists(pq2_0GemvMultiPath))
+        {
+            try
+            {
+                _pq2_0GemvMultiModule = CudaModule.LoadFromFile(pq2_0GemvMultiPath);
+                for (int s = 1; s <= Pq2_0GemvMultiMaxColumns; s++)
+                    _pq2_0GemvMultiFuncs[s] = _pq2_0GemvMultiModule.TryGetFunction($"pq2_0_gemv_multi_f16x_f32y_{s}");
+                if (!HasPQ2_0GemvMulti)
+                    _pq2_0GemvMultiUnavailableReason =
+                        "pq2_0_gemv_multi.ptx is stale (missing a pq2_0_gemv_multi_f16x_f32y_{1..8} entry point)";
+            }
+            catch (CudaException ex)
+            {
+                Array.Clear(_pq2_0GemvMultiFuncs);
+                _pq2_0GemvMultiUnavailableReason = $"pq2_0_gemv_multi.ptx failed to load: {ex.Message}";
+            }
+        }
+        else
+        {
+            _pq2_0GemvMultiUnavailableReason = $"pq2_0_gemv_multi.ptx not found in {ptxDir}";
         }
 
         _rmsnormFunc = _rmsnormModule.GetFunction("rmsnorm_f16");
@@ -5296,6 +5327,71 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
+    /// <summary>Widest column count the multi-column PQ2_0 GEMV has an exact-width entry point for.</summary>
+    public const int Pq2_0GemvMultiMaxColumns = 8;
+
+    /// <summary>Rows per block of <c>pq2_0_gemv_multi_*</c>. Must match <c>PQ2M_ROWS_PER_BLOCK</c> in native/kernels/pq2_0_gemv_multi.cu.</summary>
+    private const int Pq2_0GemvMultiRowsPerBlock = 16;
+
+    /// <summary>
+    /// Whether every exact-width entry point of the small-S multi-column PQ2_0 GEMV
+    /// (<c>pq2_0_gemv_multi.ptx</c>, issue #482) is loaded.
+    /// </summary>
+    public bool HasPQ2_0GemvMulti
+    {
+        get
+        {
+            for (int s = 1; s <= Pq2_0GemvMultiMaxColumns; s++)
+                if (_pq2_0GemvMultiFuncs[s] == 0) return false;
+            return true;
+        }
+    }
+
+    /// <summary>Why <see cref="HasPQ2_0GemvMulti"/> is false, or <see langword="null"/> when it is true.</summary>
+    public string? PQ2_0GemvMultiUnavailableReason => HasPQ2_0GemvMulti ? null : _pq2_0GemvMultiUnavailableReason;
+
+    /// <summary>
+    /// Multi-column PQ2_0 GEMV (issue #482): <c>y[s, row] = W[row, :] · x[s, :]</c> for
+    /// <c>s &lt; columns</c>, reading and decoding each packed weight byte once for all columns.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="quantWeight"/> is the load-time SPLIT layout (see
+    /// <see cref="LaunchPQ2_0RepackSplitF16"/>). <paramref name="xF16"/> is HALF activations,
+    /// <c>[columns, k]</c> row-major and 16-byte aligned — convert F32 activations with
+    /// <see cref="LaunchConvertF32ToF16"/> first, which applies the same rounding the single-column
+    /// kernel's own staging does. <paramref name="yF32"/> is <c>[columns, n]</c> row-major.
+    /// Not bit-identical to <paramref name="columns"/> single-column launches (FP32 reassociation);
+    /// see native/kernels/pq2_0_gemv_multi.cu.
+    /// </remarks>
+    /// <param name="quantWeight">Split-layout PQ2_0 weight <c>[n, k]</c>.</param>
+    /// <param name="xF16">Half activations <c>[columns, k]</c>.</param>
+    /// <param name="yF32">F32 output <c>[columns, n]</c>.</param>
+    /// <param name="n">Output rows.</param>
+    /// <param name="k">Input width, a multiple of 128.</param>
+    /// <param name="columns">Token columns, 1..<see cref="Pq2_0GemvMultiMaxColumns"/>.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchPQ2_0GemvMulti(nint quantWeight, nint xF16, nint yF32, int n, int k, int columns, nint stream)
+    {
+        if ((uint)(columns - 1) >= Pq2_0GemvMultiMaxColumns)
+            throw new ArgumentOutOfRangeException(nameof(columns), columns,
+                $"Multi-column PQ2_0 GEMV supports 1..{Pq2_0GemvMultiMaxColumns} columns.");
+        if (k <= 0 || k % 128 != 0)
+            throw new ArgumentException($"PQ2_0 k must be a positive multiple of 128, got {k}.", nameof(k));
+        nint func = _pq2_0GemvMultiFuncs[columns];
+        if (func == 0)
+            throw new InvalidOperationException(
+                $"pq2_0_gemv_multi_f16x_f32y_{columns} not loaded ({_pq2_0GemvMultiUnavailableReason}).");
+        if (n <= 0) return;
+
+        nint wArg = quantWeight, xArg = xF16, yArg = yF32;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] { &wArg, &xArg, &yArg, &nArg, &kArg };
+        uint grid = (uint)((n + Pq2_0GemvMultiRowsPerBlock - 1) / Pq2_0GemvMultiRowsPerBlock);
+        CudaDriverApi.cuLaunchKernel(func,
+                grid, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <summary>Whether the TurboQuant KV codec kernels are loaded (turboquant.ptx present).</summary>
     public bool TurboQuantAvailable => _turboquantDequantF32Func != 0 && _turboquantEncodeF32Func != 0;
 
@@ -6580,6 +6676,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _quantKvModule?.Dispose();
         _turboquantModule?.Dispose();
         _hadamardFwhtModule?.Dispose();
+        _pq2_0GemvMultiModule?.Dispose();
         _kvWriteModule?.Dispose();
         _fusedRopeKvWriteModule?.Dispose();
         _attentionMlaModule?.Dispose();
