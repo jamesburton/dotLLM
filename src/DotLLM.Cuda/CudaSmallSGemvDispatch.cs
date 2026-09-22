@@ -24,6 +24,12 @@ namespace DotLLM.Cuda;
 /// matches the CPU oracle. <c>DOTLLM_CUDA_PQ2_0_S1_MULTI=0</c> restores <c>pq2_0_gemv_f32io</c> and the
 /// fused gate+up / K+V pairs.
 /// </para>
+/// <para>
+/// <b>Issue #485.</b> <c>DOTLLM_CUDA_PQ2_0_DP4A=1</c> takes precedence over both of the above for
+/// <c>seqLen == 1</c> and <c>2..</c><see cref="MaxColumns"/>: the activations are quantized to int8
+/// (the CPU W2A8 tier's per-32 Q8_0 rounding) and the GEMV runs on <c>__dp4a</c>
+/// (<see cref="CudaKernels.LaunchPQ2_0GemvDp4a"/>). Opt-in until measured.
+/// </para>
 /// </remarks>
 public static class CudaSmallSGemvDispatch
 {
@@ -66,6 +72,30 @@ public static class CudaSmallSGemvDispatch
     /// <param name="seqLen">Token rows in the projection.</param>
     public static bool Covers(int seqLen)
         => seqLen == 1 ? UseMultiForSingleColumn : seqLen >= 2 && seqLen <= MaxColumns;
+
+    /// <summary>
+    /// Environment variable that, when <c>1</c>, routes PQ2_0 projections of <c>seqLen == 1</c> and
+    /// <c>2 &lt;= seqLen &lt;= </c><see cref="MaxColumns"/> through the int8-activation dp4a GEMV
+    /// (issue #485) instead of the #482 / single-column F16-activation kernels. Opt-in until measured.
+    /// </summary>
+    public const string Dp4aEnvVar = "DOTLLM_CUDA_PQ2_0_DP4A";
+
+    private static readonly bool Dp4aFromEnv = Environment.GetEnvironmentVariable(Dp4aEnvVar) == "1";
+
+    /// <summary>Whether the dp4a (W2A8) PQ2_0 GEMV is enabled (<see cref="Dp4aEnvVar"/>).</summary>
+    public static bool UseDp4a => Dp4aOverride ?? Dp4aFromEnv;
+
+    /// <summary>In-process override of <see cref="UseDp4a"/> (tests/benches only; read per projection).</summary>
+    internal static bool? Dp4aOverride { get; set; }
+
+    /// <summary>
+    /// Whether a PQ2_0 projection over <paramref name="seqLen"/> token rows should take the dp4a
+    /// GEMV (given that its kernels are loaded): <c>seqLen == 1</c>, or the multi-column range
+    /// <c>2..</c><see cref="MaxColumns"/>, when <see cref="UseDp4a"/> is on.
+    /// </summary>
+    /// <param name="seqLen">Token rows in the projection.</param>
+    public static bool CoversDp4a(int seqLen)
+        => UseDp4a && (seqLen == 1 || (seqLen >= 2 && seqLen <= MaxColumns));
 
     private static int ReadMaxColumns()
         => int.TryParse(Environment.GetEnvironmentVariable(MaxColumnsEnvVar),

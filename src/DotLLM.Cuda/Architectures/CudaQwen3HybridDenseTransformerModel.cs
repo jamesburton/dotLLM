@@ -89,6 +89,18 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     // missing/stale pq2_0_gemv_multi.ptx is reported once per model, not once per projection.
     private bool _warnedNoPQ2_0GemvMulti;
 
+    // #485: int8 activation scratch for the dp4a PQ2_0 GEMV — the permuted int8 rows [seqLen, k] and
+    // one 8-byte { scale, sum } pair per 32 elements. Lazily grown (never shrunk) like the F16
+    // staging buffers above, so steady-state decode/verify allocates nothing.
+    private nint _activQ8InScratch;
+    private long _activQ8InScratchElems;
+    private nint _activQ8MetaScratch;
+    private bool _warnedNoPQ2_0GemvDp4a;
+#if DEBUG
+    // What _activQ8InScratch currently holds — checked when a caller claims it pre-quantized x.
+    private (nint X, int K, int SeqLen) _dp4aQuantizedFor;
+#endif
+
     // Host-side per-row embedding lookup (NOT a full-table GPU pre-dequant — see the
     // LoadFromGguf remarks for why). Points at the mmap'd GGUF data region backing
     // token_embd.weight; each Forward call dequantizes only its `seqLen` rows on the CPU
@@ -1915,6 +1927,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// <summary>Test hook (issue #482): whether the MTP path is dispatching Q8_0 to the staged kernel.</summary>
     internal bool MtpUsesStagedQ8Gemv => _mtpQ8Staged is not null;
 
+    /// <summary>
+    /// Test hook (issue #485): whether the dp4a PQ2_0 GEMV module is loaded, so a test that switches
+    /// the path on can prove it is not silently measuring the fallback.
+    /// </summary>
+    internal bool PQ2_0Dp4aAvailable => _kernels.HasPQ2_0GemvDp4a;
+
     /// <inheritdoc/>
     public ITensor ForwardMtp(IMtpState state, int tokenId, int position)
     {
@@ -2375,22 +2393,29 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             rot.RotateForward(normOut, foldedIn, seqLen, gdnW.QkvInputDim,
                 permuteGdnValueHeads: false, streamH);
         }
+        // #485: qkv and gate read the same input — with the dp4a GEMV on, quantize it once.
+        bool gdnDp4aShared = SharesDp4aInput(gdnW.QkvQt, gdnW.GateQt, gdnW.QkvInputDim, gdnW.GateInputDim, seqLen);
+        if (gdnDp4aShared) QuantizeDp4aInput(foldedIn, gdnW.QkvInputDim, seqLen);
         Gemm(gdnW.QkvDevice, gdnW.QkvQt, foldedIn, qkvBuf,
-             gdnW.QkvOutputDim, gdnW.QkvInputDim, seqLen);
+             gdnW.QkvOutputDim, gdnW.QkvInputDim, seqLen, xQuantized: gdnDp4aShared);
         Gemm(gdnW.GateDevice, gdnW.GateQt, foldedIn, zBuf,
-             gdnW.GateOutputDim, gdnW.GateInputDim, seqLen);
+             gdnW.GateOutputDim, gdnW.GateInputDim, seqLen, xQuantized: gdnDp4aShared);
+        // Without a Hadamard fold alpha/beta read that same (unrotated) input, so the scratch still
+        // holds it; with one they read normOut, not foldedIn, and quantize their own.
+        bool abDp4aShared = gdnDp4aShared && foldedIn == normOut
+            && gdnW.AlphaInputDim == gdnW.QkvInputDim && gdnW.BetaInputDim == gdnW.QkvInputDim;
         // Alpha/Beta project to tiny output dims (NVHead each) — their decode-time GEMV cost is
         // dominated by the fixed shared-x staging overhead, not compute, so fusing them (unlike
         // gate+up/K+V above, which showed no measurable win — compute already dominates there)
         // avoids paying that staging cost twice.
         if (!TryFusedPQ2_0Gemm2(gdnW.AlphaDevice, gdnW.AlphaQt, gdnW.BetaDevice, gdnW.BetaQt,
                 normOut, alphaBuf, betaBuf, gdnW.AlphaOutputDim, gdnW.BetaOutputDim,
-                gdnW.AlphaInputDim, gdnW.BetaInputDim, seqLen))
+                gdnW.AlphaInputDim, gdnW.BetaInputDim, seqLen, xQuantized: abDp4aShared))
         {
             Gemm(gdnW.AlphaDevice, gdnW.AlphaQt, normOut, alphaBuf,
-                 gdnW.AlphaOutputDim, gdnW.AlphaInputDim, seqLen);
+                 gdnW.AlphaOutputDim, gdnW.AlphaInputDim, seqLen, xQuantized: abDp4aShared);
             Gemm(gdnW.BetaDevice, gdnW.BetaQt, normOut, betaBuf,
-                 gdnW.BetaOutputDim, gdnW.BetaInputDim, seqLen);
+                 gdnW.BetaOutputDim, gdnW.BetaInputDim, seqLen, xQuantized: abDp4aShared);
         }
         ProfMark("gdn-1-proj");
 
@@ -2613,7 +2638,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             qkvRot.RotateForward(normOut, projIn, seqLen, attn.QInputDim,
                 permuteGdnValueHeads: false, streamH);
         }
-        Gemm(attn.QDevice, attn.QQt, projIn, qgBuf, attn.QOutputDim, attn.QInputDim, seqLen);
+        // #485: Q, K and V read the same projIn — with the dp4a GEMV on, quantize it once here and
+        // reuse it for K/V below (nothing in between runs a projection).
+        bool attnDp4aShared = SharesDp4aInput(attn.QQt, attn.KQt, attn.QInputDim, attn.KInputDim, seqLen)
+            && SharesDp4aInput(attn.KQt, attn.VQt, attn.KInputDim, attn.VInputDim, seqLen);
+        if (attnDp4aShared) QuantizeDp4aInput(projIn, attn.QInputDim, seqLen);
+        Gemm(attn.QDevice, attn.QQt, projIn, qgBuf, attn.QOutputDim, attn.QInputDim, seqLen, xQuantized: attnDp4aShared);
         DumpDevice2D($"blk.{layer}.fa_qg", qgBuf, seqLen, qgElems);
         ProfMark("attn-1-qgproj");
 
@@ -2653,10 +2683,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         // ── 3. K and V projections ──
         if (!TryFusedPQ2_0Gemm2(attn.KDevice, attn.KQt, attn.VDevice, attn.VQt,
                 projIn, k, v, attn.KOutputDim, attn.VOutputDim,
-                attn.KInputDim, attn.VInputDim, seqLen))
+                attn.KInputDim, attn.VInputDim, seqLen, xQuantized: attnDp4aShared))
         {
-            Gemm(attn.KDevice, attn.KQt, projIn, k, attn.KOutputDim, attn.KInputDim, seqLen);
-            Gemm(attn.VDevice, attn.VQt, projIn, v, attn.VOutputDim, attn.VInputDim, seqLen);
+            Gemm(attn.KDevice, attn.KQt, projIn, k, attn.KOutputDim, attn.KInputDim, seqLen, xQuantized: attnDp4aShared);
+            Gemm(attn.VDevice, attn.VQt, projIn, v, attn.VOutputDim, attn.VInputDim, seqLen, xQuantized: attnDp4aShared);
         }
         DumpDevice2D($"blk.{layer}.fa_k", k, seqLen, numKvHeads * headDim);
         DumpDevice2D($"blk.{layer}.fa_v", v, seqLen, numKvHeads * headDim);
@@ -3227,14 +3257,30 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// is a pre-existing, separate gap (tracked, not fixed here — out of scope for this
     /// dense-architecture addition).
     /// </summary>
+    /// <remarks>
+    /// #485: <c>xQuantized</c> means the caller has already run <see cref="QuantizeDp4aInput"/> on
+    /// exactly this <c>x</c>/<c>k</c>/<c>seqLen</c> (one activation feeding several projections), so
+    /// the dp4a path skips its own quantize launch. Only meaningful when <see cref="Dp4aActive"/> is
+    /// true for <c>qt</c>; ignored otherwise.
+    /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void Gemm(nint weight, QuantizationType qt, nint x, nint y, int m, int k, int seqLen)
+    private void Gemm(nint weight, QuantizationType qt, nint x, nint y, int m, int k, int seqLen,
+        bool xQuantized = false)
     {
         nint streamH = _stream.Handle;
 
         if (qt == QuantizationType.F32)
         {
             CudaGemm.LinearF32(_cublas.Handle, x, weight, y, seqLen, k, m, streamH);
+            return;
+        }
+
+        // #485 (opt-in, DOTLLM_CUDA_PQ2_0_DP4A=1): int8 activations + dp4a for 1..8 token rows.
+        if (Dp4aActive(qt, seqLen))
+        {
+            if (xQuantized) AssertDp4aQuantizedFor(x, k, seqLen);
+            else QuantizeDp4aInput(x, k, seqLen);
+            _kernels.LaunchPQ2_0GemvDp4a(weight, _activQ8InScratch, _activQ8MetaScratch, y, m, k, seqLen, streamH);
             return;
         }
 
@@ -3353,6 +3399,69 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         return true;
     }
 
+    /// <summary>
+    /// Whether a <paramref name="qt"/> projection over <paramref name="seqLen"/> rows takes the
+    /// int8-activation dp4a GEMV (issue #485): PQ2_0, the env/override on
+    /// (<see cref="CudaSmallSGemvDispatch.CoversDp4a"/>), and <c>pq2_0_gemv_dp4a.ptx</c> loaded. When
+    /// the switch is on but the PTX is missing or stale it warns once and returns
+    /// <see langword="false"/>, so the #482 / single-column kernels keep running.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool Dp4aActive(QuantizationType qt, int seqLen)
+    {
+        if (qt != QuantizationType.PQ2_0 || !CudaSmallSGemvDispatch.CoversDp4a(seqLen)) return false;
+        if (_kernels.HasPQ2_0GemvDp4a) return true;
+        if (!_warnedNoPQ2_0GemvDp4a)
+        {
+            _warnedNoPQ2_0GemvDp4a = true;
+            Console.Error.WriteLine(
+                "[dotLLM.Cuda] " + CudaSmallSGemvDispatch.Dp4aEnvVar + "=1 but the dp4a PQ2_0 GEMV is unavailable (" +
+                _kernels.PQ2_0GemvDp4aUnavailableReason + ") — keeping the F16-activation PQ2_0 kernels.");
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Whether two projections reading the same input can share one dp4a activation quantization:
+    /// both take the dp4a path and have the same input width.
+    /// </summary>
+    private bool SharesDp4aInput(QuantizationType qtA, QuantizationType qtB, int kA, int kB, int seqLen)
+        => kA == kB && Dp4aActive(qtA, seqLen) && Dp4aActive(qtB, seqLen);
+
+    /// <summary>
+    /// Quantizes <paramref name="x"/> (<c>[seqLen, k]</c> F32) into the dp4a int8 scratch (issue #485).
+    /// Every dp4a projection reads the scratch, so a caller sharing it across projections must not
+    /// run another dp4a projection on a different input in between.
+    /// </summary>
+    private void QuantizeDp4aInput(nint x, int k, int seqLen)
+    {
+        int elems = checked(seqLen * k);
+        EnsureActivQ8InScratch(elems);
+        _kernels.LaunchPQ2_0Dp4aQuantizeX(x, _activQ8InScratch, _activQ8MetaScratch, elems, _stream.Handle);
+#if DEBUG
+        _dp4aQuantizedFor = (x, k, seqLen);
+#endif
+    }
+
+    [System.Diagnostics.Conditional("DEBUG")]
+    private void AssertDp4aQuantizedFor(nint x, int k, int seqLen)
+    {
+#if DEBUG
+        System.Diagnostics.Debug.Assert(_dp4aQuantizedFor == (x, k, seqLen),
+            $"dp4a scratch holds {_dp4aQuantizedFor}, but a projection claimed it pre-quantized ({x}, {k}, {seqLen}).");
+#endif
+    }
+
+    private void EnsureActivQ8InScratch(long elems)
+    {
+        if (elems <= _activQ8InScratchElems) return;
+        FreeIfNonZero(ref _activQ8InScratch);
+        FreeIfNonZero(ref _activQ8MetaScratch);
+        _activQ8InScratch = AllocDevice(elems);
+        _activQ8MetaScratch = AllocDevice(elems / CudaKernels.Pq2_0Dp4aQuantBlock * CudaKernels.Pq2_0Dp4aMetaBytesPerBlock);
+        _activQ8InScratchElems = elems;
+    }
+
     private void EnsureActivF16InScratch(long halfs)
     {
         if (halfs <= _activF16InScratchElems) return;
@@ -3387,8 +3496,20 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool TryFusedPQ2_0Gemm2(
         nint weight0, QuantizationType qt0, nint weight1, QuantizationType qt1,
-        nint x, nint y0, nint y1, int m0, int m1, int k0, int k1, int seqLen)
+        nint x, nint y0, nint y1, int m0, int m1, int k0, int k1, int seqLen, bool xQuantized = false)
     {
+        // #485: with the dp4a GEMV on, a pair sharing one input quantizes it once and launches twice —
+        // for S = 1 and for the 2..8-row verify widths alike.
+        if (SharesDp4aInput(qt0, qt1, k0, k1, seqLen))
+        {
+            if (xQuantized) AssertDp4aQuantizedFor(x, k0, seqLen);
+            else QuantizeDp4aInput(x, k0, seqLen);
+            nint s = _stream.Handle;
+            _kernels.LaunchPQ2_0GemvDp4a(weight0, _activQ8InScratch, _activQ8MetaScratch, y0, m0, k0, seqLen, s);
+            _kernels.LaunchPQ2_0GemvDp4a(weight1, _activQ8InScratch, _activQ8MetaScratch, y1, m1, k0, seqLen, s);
+            return true;
+        }
+
         if (seqLen != 1 || k0 != k1
             || qt0 != QuantizationType.PQ2_0 || qt1 != QuantizationType.PQ2_0)
             return false;
@@ -3500,6 +3621,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         FreeIfNonZero(ref _dequantScratchF16Weight);
         FreeIfNonZero(ref _activF16InScratch);
         FreeIfNonZero(ref _activF16OutScratch);
+        FreeIfNonZero(ref _activQ8InScratch);
+        FreeIfNonZero(ref _activQ8MetaScratch);
 
         nint outNormPtr = _outputNormDevice;
         if (outNormPtr != 0) CudaDriverApi.cuMemFree_v2(outNormPtr);
