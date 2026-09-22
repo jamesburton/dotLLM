@@ -79,7 +79,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     //
     // #495: LAZY and demand-sized. This used to be allocated at model load sized to the widest
     // weight tile in the whole model, which on Bonsai 2 27B is the lm_head (248320 x 5120) =
-    // 2.54 GiB of device F16 — allocated before a single token was seen, on a card that is
+    // 2.54 GB (2425 MiB) of device F16 — allocated before a single token was seen, on a card that is
     // already holding ~7.6 GB of weights. Every PQ2_0 projection the model actually runs is now
     // covered by a packed path (#482 multi-column GEMV at 2..8 rows, #485 dp4a W2A8 GEMV,
     // #490 tiled MMQ prefill), so on a folded PQ2_0 checkpoint that buffer was dead weight.
@@ -3952,6 +3952,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private void EnsureDequantScratchF16Weight(long halfs)
     {
         if (halfs <= _dequantScratchF16WeightElems) return;
+        // Round up to a whole K-quant super-block: dequant_q{2,3,4,5,6}_k_f16 are driven by a
+        // super-block count and each block unconditionally writes all 256 of its elements, with no
+        // per-element tail guard. Every block-quantised GGUF tensor has a row length that is a
+        // multiple of its block size, so m*k already is — but the old buffer was sized to the
+        // largest tile and so carried slack for every smaller one, and an exactly-sized buffer does
+        // not. 510 bytes of insurance against a shape that is not.
+        halfs = (halfs + 255) & ~255L;
         FreeIfNonZero(ref _dequantScratchF16Weight);
         _dequantScratchF16Weight = AllocDevice(halfs * sizeof(ushort));
         _dequantScratchF16WeightElems = halfs;
@@ -3960,7 +3967,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// <summary>
     /// Device bytes currently held by the F16 weight-dequant scratch (issue #495). Zero until the
     /// first projection that actually falls back to dequant + cuBLAS; it used to be
-    /// <c>maxTileFloats * 2</c> — 2.54 GiB on Bonsai 2 27B — from the moment the model loaded.
+    /// <c>maxTileFloats * 2</c> — 2.54 GB (2425 MiB) on Bonsai 2 27B — from the moment the model loaded.
     /// Test-visible so the reduction can be asserted against the model's own accounting rather
     /// than a process- or driver-level memory reading.
     /// </summary>

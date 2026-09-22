@@ -2805,6 +2805,13 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     private void EnsureDequantScratchF16Weight(long halfs)
     {
         if (halfs <= _dequantScratchElems) return;
+        // Round up to a whole K-quant super-block: dequant_q{2,3,4,5,6}_k_f16 are driven by a
+        // super-block count and each block unconditionally writes all 256 of its elements, with no
+        // per-element tail guard. Every block-quantised GGUF tensor has a row length that is a
+        // multiple of its block size, so m*k already is — but the old buffer was sized to the
+        // largest tile and so carried slack for every smaller one, and an exactly-sized buffer does
+        // not. 510 bytes of insurance against a shape that is not.
+        halfs = (halfs + 255) & ~255L;
         FreeIfNonZero(ref _dequantScratchF16Weight);
         _dequantScratchF16Weight = AllocDevice(halfs * sizeof(ushort));
         _dequantScratchElems = halfs;

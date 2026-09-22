@@ -25,7 +25,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <b>The "before" number is arithmetic, not a measurement.</b> The old policy was
 /// <c>maxTileFloats * sizeof(ushort)</c> with <c>maxTileFloats</c> including the lm_head tile, i.e.
 /// exactly <c>vocab * hidden * 2</c> bytes, unconditionally, at load. On Bonsai 2 27B that is
-/// 248320 x 5120 x 2 = 2.54 GiB. Each test prints it next to what the new policy actually allocated.
+/// 248320 x 5120 x 2 = 2.54 GB (2425 MiB). Each test prints it next to what the new policy actually allocated.
 /// </para>
 /// <para>
 /// <b>Gated</b> on <c>DOTLLM_BONSAI2_MTP_GGUF</c> / the HF hub cache and on a CUDA device with the
@@ -60,8 +60,8 @@ public sealed class CudaBonsai2DequantScratchTests
         using var gguf = GgufFile.Open(path!);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
 
-        long lmHeadBytes = (long)config.VocabSize * config.HiddenSize * sizeof(ushort);
-        long ffnBytes = (long)config.IntermediateSize * config.HiddenSize * sizeof(ushort);
+        long lmHeadBytes = TileBytes(config.VocabSize, config.HiddenSize);
+        long ffnBytes = TileBytes(config.IntermediateSize, config.HiddenSize);
         _out.WriteLine($"old policy (load-time, unconditional): {Mib(lmHeadBytes)}  (lm_head {config.VocabSize} x {config.HiddenSize})");
         _out.WriteLine($"widest non-lm_head tile:               {Mib(ffnBytes)}  (ffn {config.IntermediateSize} x {config.HiddenSize})");
 
@@ -86,6 +86,7 @@ public sealed class CudaBonsai2DequantScratchTests
             {
             }
 
+            model.ResetSequenceState();
             long afterGenPrefill = model.DequantScratchF16WeightBytes;
             _out.WriteLine($"after last-token-only prefill:         {Mib(afterGenPrefill)}");
             Assert.True(afterGenPrefill > 0,
@@ -104,6 +105,7 @@ public sealed class CudaBonsai2DequantScratchTests
             {
             }
 
+            model.ResetSequenceState();
             long afterFullPrefill = model.DequantScratchF16WeightBytes;
             _out.WriteLine($"after all-rows prefill:                {Mib(afterFullPrefill)}");
             Assert.Equal(lmHeadBytes, afterFullPrefill);
@@ -127,7 +129,7 @@ public sealed class CudaBonsai2DequantScratchTests
     /// <summary>
     /// With the packed PQ2_0 paths covering every projection (#485 at 1..8 rows, #490 above), a
     /// folded PQ2_0 checkpoint never dequantizes a weight tile at all — so the buffer that used to
-    /// cost 2.54 GiB at load is never allocated, for the whole life of the model.
+    /// cost 2.54 GB at load is never allocated, for the whole life of the model.
     /// </summary>
     [SkippableFact]
     public void DequantScratch_StaysZero_WhenThePackedPrefillCoversEveryProjection()
@@ -141,7 +143,7 @@ public sealed class CudaBonsai2DequantScratchTests
 
         using var gguf = GgufFile.Open(path!);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
-        long lmHeadBytes = (long)config.VocabSize * config.HiddenSize * sizeof(ushort);
+        long lmHeadBytes = TileBytes(config.VocabSize, config.HiddenSize);
 
         bool? dp4a = CudaSmallSGemvDispatch.Dp4aOverride;
         bool? mmq = CudaSmallSGemvDispatch.MmqOverride;
@@ -225,9 +227,16 @@ public sealed class CudaBonsai2DequantScratchTests
 
         if (preSize)
         {
-            using var warm = model.CreateKvCache(PromptTokens.Length + 2);
-            using ITensor _ = model.Forward(PromptTokens, Positions(PromptTokens.Length), -1, warm,
-                                            lastTokenLogitsOnly: false);
+            using (var warm = model.CreateKvCache(PromptTokens.Length + 2))
+            using (ITensor _ = model.Forward(PromptTokens, Positions(PromptTokens.Length), -1, warm,
+                                             lastTokenLogitsOnly: false))
+            {
+            }
+
+            // The GDN recurrent state persists across forwards on this model (issue #261) and is
+            // only cleared here — without this the pre-sizing pass would leave stale state and the
+            // measured pass would differ for a reason that has nothing to do with #495.
+            model.ResetSequenceState();
         }
 
         bytesBefore = model.DequantScratchF16WeightBytes;
@@ -240,6 +249,10 @@ public sealed class CudaBonsai2DequantScratchTests
         new ReadOnlySpan<float>((void*)logits.DataPointer, n).CopyTo(copy);
         return copy;
     }
+
+    /// <summary>Device bytes <c>EnsureDequantScratchF16Weight</c> holds for an <c>m x k</c> tile:
+    /// the element count rounded up to a whole 256-element K-quant super-block, times 2.</summary>
+    private static long TileBytes(int m, int k) => (((long)m * k + 255) & ~255L) * sizeof(ushort);
 
     private static string Mib(long bytes) => $"{bytes / (1024.0 * 1024.0):F1} MiB";
 
