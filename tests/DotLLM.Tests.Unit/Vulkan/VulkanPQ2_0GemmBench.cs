@@ -601,6 +601,125 @@ public sealed class VulkanPQ2_0GemmBench
         }
     }
 
+    /// <summary>
+    /// Issue #496 — the int8-activation GEMV against the shipping float dispatch, same session,
+    /// arm order rotated every pass, medians.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Three arms per <c>n</c>, which separates the two questions a single number confuses:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><b>float</b> — the shipping <see cref="MatMulPQ2_0GemvF32Kernel"/> dispatch (#474
+    ///     multi-row).</item>
+    ///   <item><b>int8 gemv</b> — the int8 GEMV alone, against activations quantized outside the
+    ///     timed region. This is the kernel win.</item>
+    ///   <item><b>int8 q+gemv</b> — quantize + barrier + GEMV, what the model actually records
+    ///     today. The gap to the arm above is the per-matmul quantization overhead, which a later
+    ///     change can hoist to once per shared projection input the way the Q8_0 MMVQ path
+    ///     already does.</item>
+    /// </list>
+    /// <para>Enable with <c>DOTLLM_PQ2_0_GEMM_BENCH=1</c>; <c>DOTLLM_PQ2_0_CROSSOVER_N</c>
+    /// overrides the column ladder.</para>
+    /// </remarks>
+    [SkippableFact]
+    public void Bench_PQ2_0Int8Gemv()
+    {
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_GEMM_BENCH"), "1", StringComparison.Ordinal),
+            "DOTLLM_PQ2_0_GEMM_BENCH=1 to enable this benchmark.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        PinToPCores();
+        int batch = EnvInt("DOTLLM_PQ2_0_GEMM_BENCH_BATCH", 8);
+        int[] ns = (ParseNs(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_CROSSOVER_N")) ?? [1, 2, 3, 4, 5, 6, 7, 8])
+            .Where(n => n <= MatMulPQ2_0GemvF32Kernel.MaxColumns).ToArray();
+        var shapes = ParseShapes(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_GEMM_BENCH_SHAPES")) ?? DefaultShapes;
+
+        using var device = VulkanDevice.Create();
+        using var gemv = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);   // float arm (shipping default)
+
+        bool? saved = MatMulPQ2_0Int8GemvKernel.EnabledGlobalOverride;
+        MatMulPQ2_0Int8GemvKernel.EnabledGlobalOverride = true;
+        MatMulPQ2_0Int8GemvKernel? int8;
+        QuantizePQ2_0Int8Kernel? quant;
+        try
+        {
+            int8 = MatMulPQ2_0Int8GemvKernel.TryCreate(device, spvDir);
+            quant = int8 is null ? null : QuantizePQ2_0Int8Kernel.TryCreate(device, spvDir);
+        }
+        finally
+        {
+            MatMulPQ2_0Int8GemvKernel.EnabledGlobalOverride = saved;
+        }
+        Skip.If(int8 is null || quant is null, "No integer dot product on this device, or the int8 SPIR-V is missing.");
+
+        try
+        {
+            _output.WriteLine($"Device: {device.DeviceName}  SubgroupSize: {device.SubgroupSize}");
+            _output.WriteLine($"batch={batch}  schedule: {WarmupPasses} warmup + {Passes} passes, order rotated every pass (medians)");
+
+            foreach (var (tag, m, k) in shapes)
+            {
+                long wBytes = (long)m * (k / GroupSize) * GroupBytes;
+                int maxN = ns.Max();
+                using var bufW = device.Allocate((wBytes + 3) & ~3L);
+                using var bufB = device.Allocate((long)maxN * k * sizeof(float));
+                using var bufC = device.Allocate((long)maxN * m * sizeof(float));
+                using var bufXq = device.Allocate(QuantizePQ2_0Int8Kernel.PackedBytes(k, maxN));
+                using var bufMeta = device.Allocate(QuantizePQ2_0Int8Kernel.MetaBytes(k, maxN));
+
+                var rng = new Random(0x2A_96);
+                byte[] w = new byte[wBytes];
+                rng.NextBytes(w);
+                float[] b = new float[(long)maxN * k];
+                for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
+                device.Upload(new ReadOnlySpan<byte>(w), bufW);
+                device.Upload(b, bufB);
+                quant!.Launch(bufB, bufXq, bufMeta, k, maxN);   // pre-quantize for the kernel-only arm
+
+                foreach (int n in ns)
+                {
+                    string[] labels = ["float (shipping)", "int8 gemv", "int8 q+gemv"];
+                    Func<double>[] arms =
+                    [
+                        () => Time(device, batch, cb => gemv.RecordColumns(cb, bufW, bufB, bufC, m, k, n)),
+                        () => Time(device, batch, cb => int8!.Record(cb, bufW, bufXq, bufMeta, bufC, m, k, n)),
+                        () => Time(device, batch, cb =>
+                        {
+                            quant.Record(cb, bufB, bufXq, bufMeta, k, n);
+                            KernelSupport.ComputeToComputeBarrier(cb);
+                            int8!.Record(cb, bufW, bufXq, bufMeta, bufC, m, k, n);
+                        }),
+                    ];
+
+                    for (int i = 0; i < WarmupPasses; i++)
+                        foreach (var arm in arms) arm();
+                    var us = new double[arms.Length][];
+                    for (int a = 0; a < arms.Length; a++) us[a] = new double[Passes];
+                    for (int p = 0; p < Passes; p++)
+                        for (int j = 0; j < arms.Length; j++)
+                        {
+                            int a = (p + j) % arms.Length;
+                            us[a][p] = arms[a]();
+                        }
+                    double[] med = us.Select(v => { Array.Sort(v); return v[Passes / 2]; }).ToArray();
+
+                    _output.WriteLine("");
+                    _output.WriteLine($"### {tag}  n={n}");
+                    _output.WriteLine("| arm | µs | vs float | weight GB/s |");
+                    _output.WriteLine("|---|---:|---:|---:|");
+                    for (int i = 0; i < arms.Length; i++)
+                        _output.WriteLine($"| {labels[i]} | {med[i]:F1} | {med[i] / med[0]:F3}x | {wBytes / (med[i] * 1e3):F1} |");
+                }
+            }
+        }
+        finally
+        {
+            int8?.Dispose();
+            quant?.Dispose();
+        }
+    }
+
     private static double Time(VulkanDevice device, int batch, Action<nint> record)
     {
         using var ctx = device.CreateSubmitContext();
