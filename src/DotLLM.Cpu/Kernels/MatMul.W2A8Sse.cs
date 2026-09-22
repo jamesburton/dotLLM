@@ -165,6 +165,43 @@ public static unsafe partial class MatMul
         }
     }
 
+    // ─────────────────────────── bench entries ───────────────────────────
+
+    /// <summary>
+    /// Benchmark-only single-threaded PQ2_0 GEMV that always takes the 128-bit tier, regardless of
+    /// the host's ISA, so it can be timed head-to-head with <see cref="GemvPQ2_0Scalar"/> on an
+    /// AVX2 box. The activation is quantized with the scalar Q8_0 quantizer, as on Westmere.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void GemvPQ2_0Sse128ForBench(byte* weights, float* x, float* result, int m, int k,
+                                                 byte* xQ8Scratch, sbyte* rowScratch, float* groupScratch)
+    {
+        int rowBytes = (k / PQ2_0GroupSize) * PQ2_0GroupBytes;
+        int blockCount = k / Q8_0GroupSize;
+        QuantizeF32ToQ8_0Scalar(x, xQ8Scratch, k);
+        for (int r = 0; r < m; r++)
+        {
+            UnpackPQ2_0RowI8Sse(weights + (long)r * rowBytes, rowScratch, groupScratch, k);
+            result[r] = VecDotPQ2_0Q8Sse(rowScratch, groupScratch, xQ8Scratch, blockCount);
+        }
+    }
+
+    /// <summary>I2_S analog of <see cref="GemvPQ2_0Sse128ForBench"/> (per-tensor scale from the tail).</summary>
+    [SkipLocalsInit]
+    internal static void GemvI2_SSse128ForBench(byte* weights, float* x, float* result, int m, int k,
+                                                byte* xQ8Scratch, sbyte* rowScratch)
+    {
+        float scale = Unsafe.ReadUnaligned<float>(weights + (long)m * k / 4);
+        int rowBytes = k / 4;
+        int blockCount = k / Q8_0GroupSize;
+        QuantizeF32ToQ8_0Scalar(x, xQ8Scratch, k);
+        for (int r = 0; r < m; r++)
+        {
+            UnpackRowI8Sse(weights + (long)r * rowBytes, rowScratch, k);
+            result[r] = VecDotI2SQ8Sse(rowScratch, xQ8Scratch, blockCount) * scale;
+        }
+    }
+
     // ─────────────────────────── shared ───────────────────────────
 
     /// <summary>

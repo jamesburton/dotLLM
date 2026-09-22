@@ -591,9 +591,7 @@ public static unsafe partial class MatMul
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void UnpackPQ2_0RowI8(byte* rowPtr, sbyte* dest, float* groupScales, int k)
     {
-        if (Avx2.IsSupported)
-            UnpackPQ2_0RowI8Avx2(rowPtr, dest, groupScales, k);
-        else if (Sse2.IsSupported)
+        if (Sse2.IsSupported)
             UnpackPQ2_0RowI8Sse(rowPtr, dest, groupScales, k);
         else
             UnpackPQ2_0RowI8Scalar(rowPtr, dest, groupScales, k);
