@@ -31,20 +31,54 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
 
     private const int PushConstantBytes = 6 * sizeof(uint);
 
+    /// <summary>
+    /// Issue #470 — the widest multi-column variant. <see cref="RecordColumns"/> accepts at most
+    /// this many columns per call.
+    /// </summary>
+    public const int MaxColumns = 8;
+
+    /// <summary>Column counts with a compiled <c>matmul_pq2_0_f32_gemv_multicol_{n}.spv</c>, ascending.</summary>
+    private static readonly int[] MultiColumnWidths = [2, 4, 8];
+
+    private const int MultiColumnPushConstantBytes = 7 * sizeof(uint);
+
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
+    private readonly MultiColumnPipeline[] _multiColumn;
     private bool _disposed;
 
-    private MatMulPQ2_0GemvF32Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
+    private MatMulPQ2_0GemvF32Kernel(
+        VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
+        MultiColumnPipeline[] multiColumn)
     {
         _device = device;
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 3);
+        _multiColumn = multiColumn;
+    }
+
+    /// <summary>One compiled <c>NCOLS</c> variant of the multi-column GEMV and its descriptor state.</summary>
+    private sealed class MultiColumnPipeline : IDisposable
+    {
+        public required int Width { get; init; }
+        public required VulkanDevice Device { get; init; }
+        public required VulkanModule Module { get; init; }
+        public required ComputePipeline Pipeline { get; init; }
+        public required nint Pool { get; init; }
+        public required DescriptorSetCache Cache { get; init; }
+
+        public void Dispose()
+        {
+            if (Pool != 0)
+                VulkanApi.vkDestroyDescriptorPool(Device.Handle, Pool, 0);
+            Pipeline.Dispose();
+            Module.Dispose();
+        }
     }
 
     /// <summary>Loads <c>matmul_pq2_0_f32_gemv.spv</c> from the given directory and creates the pipeline.</summary>
@@ -83,10 +117,68 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
-        return new MatMulPQ2_0GemvF32Kernel(device, module, pipeline, pool);
+
+        var multiColumn = new List<MultiColumnPipeline>(MultiColumnWidths.Length);
+        try
+        {
+            foreach (int width in MultiColumnWidths)
+                multiColumn.Add(CreateMultiColumn(device, spvDir, width));
+        }
+        catch
+        {
+            foreach (var mc in multiColumn) mc.Dispose();
+            VulkanApi.vkDestroyDescriptorPool(device.Handle, pool, 0);
+            pipeline.Dispose();
+            module.Dispose();
+            throw;
+        }
+
+        return new MatMulPQ2_0GemvF32Kernel(device, module, pipeline, pool, multiColumn.ToArray());
     }
 
-    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
+    private static MultiColumnPipeline CreateMultiColumn(VulkanDevice device, string spvDir, int width)
+    {
+        string path = Path.Combine(spvDir, $"matmul_pq2_0_f32_gemv_multicol_{width}.spv");
+        if (!File.Exists(path))
+            throw new FileNotFoundException(
+                $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
+
+        var module = VulkanModule.LoadFromFile(device, path);
+        ComputePipeline pipeline;
+        try
+        {
+            Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[3];
+            bindings[0] = new VkDescriptorBinding(0);
+            bindings[1] = new VkDescriptorBinding(1);
+            bindings[2] = new VkDescriptorBinding(2);
+            pipeline = module.CreateComputePipeline(
+                entryPoint: "main",
+                bindings: bindings,
+                pushConstantBytes: MultiColumnPushConstantBytes);
+        }
+        catch
+        {
+            module.Dispose();
+            throw;
+        }
+
+        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
+        return new MultiColumnPipeline
+        {
+            Width = width,
+            Device = device,
+            Module = module,
+            Pipeline = pipeline,
+            Pool = pool,
+            Cache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 3),
+        };
+    }
+
+    internal void InvalidateDescriptorCache()
+    {
+        _descriptorCache.Reset();
+        foreach (var mc in _multiColumn) mc.Cache.Reset();
+    }
 
     /// <summary>Dispatches the GEMV synchronously.</summary>
     public void Launch(
@@ -192,11 +284,112 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
         VulkanApi.vkCmdDispatch(cmdBuf, (uint)m, 1, 1);
     }
 
+    /// <summary>
+    /// Issue #470 — records <c>y[s, :] = W @ x[s, :]</c> for the <paramref name="columns"/>
+    /// activation rows of a <c>[columns, k]</c> batch into a <c>[columns, m]</c> output,
+    /// reading each weight byte once for all of them.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A speculative / MTP verify forward runs 2-8 tokens. The #446 loop recorded one
+    /// single-column dispatch per token and re-read the whole weight matrix each time, so a
+    /// verify of S tokens cost about S decode steps. Here each workgroup decodes its weight row
+    /// once and applies it to every column.
+    /// </para>
+    /// <para>
+    /// Each column is computed in the single-column kernel's exact per-lane order and tree
+    /// reduce, so the result is <b>bit-identical</b> to <paramref name="columns"/> calls of the
+    /// offset <c>Record</c> overload. The tests assert equality, not a tolerance.
+    /// </para>
+    /// <para>
+    /// <paramref name="columns"/> = 1 records the ordinary single-column kernel. Otherwise the
+    /// narrowest compiled variant that fits is used; 3 runs the 4-wide variant with one dead
+    /// column, which is loaded but never written.
+    /// </para>
+    /// </remarks>
+    /// <param name="cmdBuf">Command buffer to record into.</param>
+    /// <param name="weightsPQ2_0">Packed PQ2_0 weights, <c>m</c> rows of <c>(k/128)*34</c> bytes.</param>
+    /// <param name="x">Activations, <c>[columns, k]</c> row-major, from <paramref name="xOffsetElements"/>.</param>
+    /// <param name="y">Output, <c>[columns, m]</c> row-major, from <paramref name="yOffsetElements"/>.</param>
+    /// <param name="m">Output rows per column.</param>
+    /// <param name="k">Inner dimension; must be a multiple of 128.</param>
+    /// <param name="columns">Column (token) count, 1..<see cref="MaxColumns"/>.</param>
+    /// <param name="xOffsetElements">First float of column 0's activation row.</param>
+    /// <param name="yOffsetElements">First float of column 0's output row.</param>
+    public unsafe void RecordColumns(
+        nint cmdBuf,
+        VulkanDevice.Buffer weightsPQ2_0, VulkanDevice.Buffer x, VulkanDevice.Buffer y,
+        int m, int k, int columns, int xOffsetElements = 0, int yOffsetElements = 0)
+    {
+        if (columns < 1 || columns > MaxColumns) throw new ArgumentOutOfRangeException(nameof(columns));
+        if (columns == 1)
+        {
+            Record(cmdBuf, weightsPQ2_0, x, y, m, k, xOffsetElements, yOffsetElements);
+            return;
+        }
+
+        if (xOffsetElements < 0) throw new ArgumentOutOfRangeException(nameof(xOffsetElements));
+        if (yOffsetElements < 0) throw new ArgumentOutOfRangeException(nameof(yOffsetElements));
+        if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
+        if ((k % PQ2_0GroupSize) != 0)
+            throw new ArgumentException($"k must be a multiple of {PQ2_0GroupSize}, got {k}", nameof(k));
+
+        int blocksPerRow = k / PQ2_0GroupSize;
+        long rowBytes = (long)blocksPerRow * PQ2_0GroupBytes;
+        int rowUints = (int)((rowBytes + 3) / 4);
+
+        long weightsMin = (long)m * rowBytes;
+        if (weightsPQ2_0.Size < weightsMin)
+            throw new ArgumentException(
+                $"Weights buffer too small: need >= {weightsMin} bytes (m·(k/128)·34), got {weightsPQ2_0.Size}.",
+                nameof(weightsPQ2_0));
+        if (x.Size < ((long)xOffsetElements + (long)columns * k) * sizeof(float))
+            throw new ArgumentException("Input buffer too small.", nameof(x));
+        if (y.Size < ((long)yOffsetElements + (long)columns * m) * sizeof(float))
+            throw new ArgumentException("Output buffer too small.", nameof(y));
+
+        MultiColumnPipeline variant = _multiColumn[^1];
+        foreach (var mc in _multiColumn)
+        {
+            if (mc.Width >= columns) { variant = mc; break; }
+        }
+
+        Span<nint> buffers = stackalloc nint[3] { weightsPQ2_0.Handle, x.Handle, y.Handle };
+        nint descriptorSet = variant.Cache.GetOrCreate(buffers);
+
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, variant.Pipeline.Pipeline);
+        VulkanApi.vkCmdBindDescriptorSets(
+            cmdBuf, VkPipelineBindPoint.Compute, variant.Pipeline.Layout,
+            0, 1, descriptorSet, 0, 0);
+
+        Span<uint> pc = stackalloc uint[7]
+        {
+            (uint)m,
+            (uint)k,
+            (uint)blocksPerRow,
+            (uint)rowUints,
+            (uint)xOffsetElements,
+            (uint)yOffsetElements,
+            (uint)columns,
+        };
+        fixed (uint* pcPtr = pc)
+        {
+            VulkanApi.vkCmdPushConstants(
+                cmdBuf, variant.Pipeline.Layout, VkShaderStageFlags.Compute,
+                0, MultiColumnPushConstantBytes, (nint)pcPtr);
+        }
+
+        VulkanApi.vkCmdDispatch(cmdBuf, (uint)m, 1, 1);
+    }
+
     /// <inheritdoc/>
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+
+        foreach (var mc in _multiColumn) mc.Dispose();
 
         if (_descriptorPool != 0)
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);
