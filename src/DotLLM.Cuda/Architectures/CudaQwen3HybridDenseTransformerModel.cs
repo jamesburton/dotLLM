@@ -76,7 +76,19 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     // Model-owned device F16 scratch for on-the-fly weight dequant in the prefill path
     // (seqLen > 1). See CudaQwen3MoeHybridTransformerModel's field doc for the full
     // rationale — identical convention here.
+    //
+    // #495: LAZY and demand-sized. This used to be allocated at model load sized to the widest
+    // weight tile in the whole model, which on Bonsai 2 27B is the lm_head (248320 x 5120) =
+    // 2.54 GB (2425 MiB) of device F16 — allocated before a single token was seen, on a card that is
+    // already holding ~7.6 GB of weights. Every PQ2_0 projection the model actually runs is now
+    // covered by a packed path (#482 multi-column GEMV at 2..8 rows, #485 dp4a W2A8 GEMV,
+    // #490 tiled MMQ prefill), so on a folded PQ2_0 checkpoint that buffer was dead weight.
+    // It is now allocated on first actual use at exactly the m*k that use needs and grown (never
+    // shrunk) from there, exactly like _activF16InScratch/_activF16OutScratch below — so a weight
+    // type or shape that still needs dequant + cuBLAS gets it on demand, and a model whose every
+    // projection stays on a packed path never pays for it at all.
     private nint _dequantScratchF16Weight;
+    private long _dequantScratchF16WeightElems;
 
     // Lazily allocated F16 activation staging buffers for the decode/prefill F16 GEMV/GEMM
     // path. Activations live in F32; the quantised GEMV kernels and cuBLAS HGEMM consume F16.
@@ -469,7 +481,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         CudaQwen3HybridDenseForwardState state, CudaGdnStateCache gdnCache,
         CudaStream stream, CudaCublasHandle cublas, CudaContext context, CudaKernels kernels,
         int deviceId,
-        nint dequantScratchDevice,
         CudaMtpHeadWeights? mtpHead = null,
         bool isHeadOnly = false,
         CudaHadamardRotation? hadamard = null)
@@ -519,7 +530,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _context = context;
         _kernels = kernels;
         _deviceId = deviceId;
-        _dequantScratchF16Weight = dequantScratchDevice;
         _mmaDecodeGqaSplit = new DotLLM.Cuda.CudaAttentionMmaDecodeGqaSplit(kernels);
 
         _gdnLayerOrdinal = new int[config.NumLayers];
@@ -681,11 +691,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         var layers = new DeviceLayer[config.NumLayers];
         var kvSlotForLayer = new int[config.NumLayers];
         int attentionLayerCount = 0;
-        long maxTileFloats = 0;
 
         for (int i = 0; i < config.NumLayers; i++)
         {
-            layers[i] = LoadLayerDevice(i, dataBase, tensors, config, ref maxTileFloats, allocs);
+            layers[i] = LoadLayerDevice(i, dataBase, tensors, config, allocs);
             kvSlotForLayer[i] = layout.LayerKind[i] == HybridLayerKind.Attention
                 ? attentionLayerCount++
                 : -1;
@@ -695,10 +704,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         // change for every other checkpoint — LoadMtpHeadIfPresent returns null unless
         // config.NextnPredictLayers > 0 AND the nextn.* tensors are actually present. Mirrors the
         // CPU host's Qwen3HybridDenseTransformerModel.LoadMtpHeadIfPresent tensor layout exactly.
-        CudaMtpHeadWeights? mtpHead = LoadMtpHeadIfPresent(dataBase, tensors, config, ref maxTileFloats, allocs);
-
-        maxTileFloats = Math.Max(maxTileFloats, (long)outputOutputDim * outputInputDim);
-        nint dequantScratchDevice = AllocDevice(maxTileFloats * sizeof(ushort), allocs);
+        CudaMtpHeadWeights? mtpHead = LoadMtpHeadIfPresent(dataBase, tensors, config, allocs);
 
         var gdn = config.GdnConfig!.Value;
         state = new CudaQwen3HybridDenseForwardState(
@@ -728,7 +734,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             kvSlotForLayer, attentionLayerCount,
             ropeTheta, ropeDim,
             state, gdnCache, stream, cublas, context, kernels, deviceId,
-            dequantScratchDevice, mtpHead, hadamard: hadamard);
+            mtpHead, hadamard: hadamard);
         }
         catch
         {
@@ -866,14 +872,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         var layers = new DeviceLayer[numGpuLayers];
         var kvSlotForLayer = new int[numGpuLayers];
         int attentionLayerCount = 0;
-        long maxTileFloats = 0;
 
         for (int i = 0; i < numGpuLayers; i++)
         {
             // i IS the global raw GGUF block index here — the GPU head always owns the layer
             // PREFIX [0, numGpuLayers), so local and global indices coincide (unlike the CPU
             // tail's LoadTailFromGguf, which must offset by startLayer).
-            layers[i] = LoadLayerDevice(i, dataBase, tensors, fullConfig, ref maxTileFloats, allocs);
+            layers[i] = LoadLayerDevice(i, dataBase, tensors, fullConfig, allocs);
             kvSlotForLayer[i] = fullLayout.LayerKind[i] == HybridLayerKind.Attention
                 ? attentionLayerCount++
                 : -1;
@@ -909,11 +914,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         };
         var headConfig = fullConfig with { NumLayers = numGpuLayers, HybridLayout = headLayout, NextnPredictLayers = 0 };
 
-        // maxTileFloats only reflects the GDN/attention/FFN tiles actually processed on this GPU
-        // head (no lm_head tile folded in, unlike LoadFromGguf) — correct, since this instance
-        // never runs the lm_head projection at all.
-        nint dequantScratchDevice = AllocDevice(Math.Max(maxTileFloats, 1) * sizeof(ushort), allocs);
-
         return new CudaQwen3HybridDenseTransformerModel(
             headConfig, gguf, layers,
             tokenEmbedDevice: 0, embDesc.QuantizationType,
@@ -924,7 +924,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             kvSlotForLayer, attentionLayerCount,
             ropeTheta, ropeDim,
             state, gdnCache, stream, cublas, context, kernels, deviceId,
-            dequantScratchDevice, mtpHead: null, isHeadOnly: true, hadamard: hadamard);
+            mtpHead: null, isHeadOnly: true, hadamard: hadamard);
         }
         catch
         {
@@ -1069,7 +1069,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private static DeviceLayer LoadLayerDevice(
         int layerIdx, nint dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
-        ModelConfig config, ref long maxTileFloats, List<nint> allocs)
+        ModelConfig config, List<nint> allocs)
     {
         string prefix = $"blk.{layerIdx}";
         int hiddenSize = config.HiddenSize;
@@ -1086,11 +1086,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         switch (layout.LayerKind[layerIdx])
         {
             case HybridLayerKind.GatedDeltaNet:
-                gdnDev = LoadGdnLayerDevice(prefix, dataBase, tensors, config, ref maxTileFloats, allocs);
+                gdnDev = LoadGdnLayerDevice(prefix, dataBase, tensors, config, allocs);
                 break;
             case HybridLayerKind.Attention:
                 attnDev = LoadFullAttnLayerDevice(prefix, dataBase, tensors, config,
-                    layout.HeadCountKv[layerIdx], ref maxTileFloats, allocs);
+                    layout.HeadCountKv[layerIdx], allocs);
                 break;
             default:
                 throw new InvalidOperationException(
@@ -1105,9 +1105,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint gateDevice = UploadRawTensor(dataBase, gateDesc, allocs);
         nint upDevice = UploadRawTensor(dataBase, upDesc, allocs);
         nint downDevice = UploadRawTensor(dataBase, downDesc, allocs);
-        UpdateMaxTile(ref maxTileFloats, (long)gateDesc.Shape[0] * gateDesc.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)upDesc.Shape[0] * upDesc.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)downDesc.Shape[0] * downDesc.Shape[1]);
 
         return new DeviceLayer
         {
@@ -1130,7 +1127,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private static DeviceGdn LoadGdnLayerDevice(
         string prefix, nint dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
-        ModelConfig config, ref long maxTileFloats, List<nint> allocs)
+        ModelConfig config, List<nint> allocs)
     {
         var gdn = config.GdnConfig!.Value;
         int convDim = (2 * gdn.NKHead + gdn.NVHead) * gdn.DState;
@@ -1160,11 +1157,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint dtBiasDevice = UploadF32Tensor(dataBase, dtBDesc, gdn.NVHead, allocs);
         nint ssmNormDevice = UploadF32Tensor(dataBase, ssmNormDesc, gdn.DState, allocs);
 
-        UpdateMaxTile(ref maxTileFloats, (long)qkvDesc.Shape[0] * qkvDesc.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)gateDesc.Shape[0] * gateDesc.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)alphaDesc.Shape[0] * alphaDesc.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)betaDesc.Shape[0] * betaDesc.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)outDesc.Shape[0] * outDesc.Shape[1]);
 
         return new DeviceGdn
         {
@@ -1194,7 +1186,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private static DeviceFullAttn LoadFullAttnLayerDevice(
         string prefix, nint dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
-        ModelConfig config, int numKvHeads, ref long maxTileFloats, List<nint> allocs)
+        ModelConfig config, int numKvHeads, List<nint> allocs)
     {
         var q = tensors[$"{prefix}.attn_q.weight"];
         var k = tensors[$"{prefix}.attn_k.weight"];
@@ -1217,10 +1209,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint qNormDevice = UploadF32Tensor(dataBase, tensors[$"{prefix}.attn_q_norm.weight"], config.HeadDim, allocs);
         nint kNormDevice = UploadF32Tensor(dataBase, tensors[$"{prefix}.attn_k_norm.weight"], config.HeadDim, allocs);
 
-        UpdateMaxTile(ref maxTileFloats, (long)q.Shape[0] * q.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)k.Shape[0] * k.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)v.Shape[0] * v.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)o.Shape[0] * o.Shape[1]);
 
         return new DeviceFullAttn
         {
@@ -1259,7 +1247,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config,
-        ref long maxTileFloats,
         List<nint> allocs)
     {
         if (config.NextnPredictLayers <= 0)
@@ -1290,7 +1277,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint postAttnNormDevice = UploadF32Tensor(dataBase, postNormDesc, hiddenSize, allocs);
 
         DeviceFullAttn attnDev = LoadFullAttnLayerDevice(prefix, dataBase, tensors, config,
-            config.NumKvHeads, ref maxTileFloats, allocs);
+            config.NumKvHeads, allocs);
 
         var gateDesc = tensors[$"{prefix}.ffn_gate.weight"];
         var upDesc = tensors[$"{prefix}.ffn_up.weight"];
@@ -1298,9 +1285,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint gateDevice = UploadRawTensor(dataBase, gateDesc, allocs);
         nint upDevice = UploadRawTensor(dataBase, upDesc, allocs);
         nint downDevice = UploadRawTensor(dataBase, downDesc, allocs);
-        UpdateMaxTile(ref maxTileFloats, (long)gateDesc.Shape[0] * gateDesc.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)upDesc.Shape[0] * upDesc.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)downDesc.Shape[0] * downDesc.Shape[1]);
 
         var layer = new DeviceLayer
         {
@@ -1321,7 +1305,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
         var ehProjDesc = tensors[$"{prefix}.nextn.eh_proj.weight"];
         nint ehProjDevice = UploadRawTensor(dataBase, ehProjDesc, allocs);
-        UpdateMaxTile(ref maxTileFloats, (long)ehProjDesc.Shape[0] * ehProjDesc.Shape[1]);
 
         nint enormDevice = UploadF32Tensor(dataBase, tensors[$"{prefix}.nextn.enorm.weight"], hiddenSize, allocs);
         nint hnormDevice = UploadF32Tensor(dataBase, tensors[$"{prefix}.nextn.hnorm.weight"], hiddenSize, allocs);
@@ -1355,7 +1338,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             sharedHeadHeadQt = sharedHeadDesc.QuantizationType;
             sharedHeadHeadInputDim = sharedHeadDesc.Shape[0];
             sharedHeadHeadOutputDim = sharedHeadDesc.Shape[1];
-            UpdateMaxTile(ref maxTileFloats, (long)sharedHeadDesc.Shape[0] * sharedHeadDesc.Shape[1]);
         }
 
         nint? sharedHeadNormDevice = tensors.TryGetValue($"{prefix}.nextn.shared_head_norm.weight", out var shnDesc)
@@ -3768,6 +3750,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         int activOutElems = checked((int)((long)seqLen * m));
         EnsureActivF16InScratch(activInElems);
         EnsureActivF16OutScratch(activOutElems);
+        EnsureDequantScratchF16Weight(totalElems);   // #495: demand-sized, grow-only
 
         if (qt == QuantizationType.I2_S)
             _kernels.LaunchDequantI2_SToF16(weight, _dequantScratchF16Weight, m, k, streamH);
@@ -3959,6 +3942,37 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _activF16OutScratchElems = halfs;
     }
 
+    /// <summary>
+    /// Issue #495: grows the F16 weight-dequant scratch to <paramref name="halfs"/> elements, the
+    /// <c>m*k</c> of the projection about to run. Grow-only (never shrunk), so a steady-state
+    /// prefill allocates once and every later projection of the same or smaller tile is free — the
+    /// same convention as the activation staging buffers above. Allocates nothing at all for a
+    /// model whose every projection stays on a packed path.
+    /// </summary>
+    private void EnsureDequantScratchF16Weight(long halfs)
+    {
+        if (halfs <= _dequantScratchF16WeightElems) return;
+        // Round up to a whole K-quant super-block: dequant_q{2,3,4,5,6}_k_f16 are driven by a
+        // super-block count and each block unconditionally writes all 256 of its elements, with no
+        // per-element tail guard. Every block-quantised GGUF tensor has a row length that is a
+        // multiple of its block size, so m*k already is — but the old buffer was sized to the
+        // largest tile and so carried slack for every smaller one, and an exactly-sized buffer does
+        // not. 510 bytes of insurance against a shape that is not.
+        halfs = (halfs + 255) & ~255L;
+        FreeIfNonZero(ref _dequantScratchF16Weight);
+        _dequantScratchF16Weight = AllocDevice(halfs * sizeof(ushort));
+        _dequantScratchF16WeightElems = halfs;
+    }
+
+    /// <summary>
+    /// Device bytes currently held by the F16 weight-dequant scratch (issue #495). Zero until the
+    /// first projection that actually falls back to dequant + cuBLAS; it used to be
+    /// <c>maxTileFloats * 2</c> — 2.54 GB (2425 MiB) on Bonsai 2 27B — from the moment the model loaded.
+    /// Test-visible so the reduction can be asserted against the model's own accounting rather
+    /// than a process- or driver-level memory reading.
+    /// </summary>
+    public long DequantScratchF16WeightBytes => _dequantScratchF16WeightElems * sizeof(ushort);
+
     // ──────────────────────────────────────────────────────────────────────
     //  Fused 2-way PQ2_0 decode dispatch — dense FFN gate+up, full-attention K+V.
     // ──────────────────────────────────────────────────────────────────────
@@ -4104,6 +4118,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         }
 
         FreeIfNonZero(ref _dequantScratchF16Weight);
+        _dequantScratchF16WeightElems = 0;
         FreeIfNonZero(ref _activF16InScratch);
         FreeIfNonZero(ref _activF16OutScratch);
         FreeIfNonZero(ref _activQ8InScratch);
@@ -4351,11 +4366,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         FreeIfNonZero(ref device);
         allocs?.Remove(tempDevice);
         return splitDevice;
-    }
-
-    private static void UpdateMaxTile(ref long max, long candidate)
-    {
-        if (candidate > max) max = candidate;
     }
 
     // ──────────────────────────────────────────────────────────────────────
