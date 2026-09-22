@@ -1578,8 +1578,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         if (!DotLLM.Models.Architectures.MtpAbsorbDispatch.UsePerToken
             && DotLLM.Models.Architectures.MtpAbsorbDispatch.IsContiguous(positions))
         {
+            // Profiler (issue #482): the whole batched absorb is one category, armed regardless of
+            // the trunk's seqLen (a verify is S = K+1 > 1, which leaves the trunk profiler off).
+            bool profPrev = _profileActiveForThisCall;
+            if (ProfileTrace) { _profileActiveForThisCall = true; ProfStart(); }
             AbsorbMtpBatched(mtpHead, state, tokenIds, positions[0]);
             state.SeedFromCapturedRow(tokenIds.Length - 1);
+            if (ProfileTrace) { ProfMark("mtp-absorb-batched"); _profileActiveForThisCall = profPrev; }
             return;
         }
         for (int i = 0; i < tokenIds.Length; i++)
@@ -1899,6 +1904,29 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private ITensor? ForwardMtpCore(in CudaMtpHeadWeights mtpHead, CudaMtpState state, int tokenId, int position,
                                     bool computeLogits)
     {
+        // Category profiler (issue #482): the trunk arms it only for seqLen == 1, and a draft step
+        // runs right after an S = K+1 verify, so it would otherwise always be disarmed here. Arm it
+        // for DRAFT steps only (computeLogits) — per-token absorb steps would pollute the same keys —
+        // and restore the caller's state on exit. Every category is prefixed "mtp-".
+        if (!ProfileTrace)
+            return ForwardMtpCoreBody(mtpHead, state, tokenId, position, computeLogits);
+
+        bool profPrev = _profileActiveForThisCall;
+        _profileActiveForThisCall = computeLogits;
+        try
+        {
+            return ForwardMtpCoreBody(mtpHead, state, tokenId, position, computeLogits);
+        }
+        finally
+        {
+            _profileActiveForThisCall = profPrev;
+        }
+    }
+
+    private ITensor? ForwardMtpCoreBody(in CudaMtpHeadWeights mtpHead, CudaMtpState state, int tokenId, int position,
+                                        bool computeLogits)
+    {
+        ProfStart();
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
         var attn = mtpHead.Layer.FullAttn!.Value;
@@ -1926,6 +1954,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
         _mtpScratch ??= CudaMtpScratch.Allocate(hiddenSize, qElems, intermediateSize, vocabSize);
         var s = _mtpScratch;
+        ProfMark("mtp-0-setup");
 
         // ── Embed predicted-from token (host dequant of one row + tiny H2D — same pattern as the
         //    trunk's own per-token embedding lookup in ForwardCore) ──
@@ -1944,9 +1973,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             // head-local nextn.embed_tokens is not folded and stays untouched. Mirrors the CPU host.
             if (mtpHead.EmbedTokensHostBase is null && _hadamard is { } embRot)
                 embRot.RotateInverseInPlaceHost(pEmbedHost, 1, hiddenSize);
+            ProfMark("mtp-1-embed-host");
             CudaDriverApi.cuMemcpyHtoDAsync_v2(s.Embed, (nint)pEmbedHost,
                 (nuint)((long)hiddenSize * sizeof(float)), streamH).ThrowOnError();
         }
+        ProfMark("mtp-2-embed-h2d");
 
         // ── h_norm / e_norm — written directly into the two halves of the eh_proj concat buffer
         //    (avoids an extra D2D copy vs. normalizing into standalone buffers first) ──
@@ -1954,6 +1985,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint hNormDst = s.Concat + (nint)((long)hiddenSize * sizeof(float));
         _kernels.LaunchRmsNormF32(s.Embed, mtpHead.EnormDevice, eNormDst, hiddenSize, eps, 1, streamH);
         _kernels.LaunchRmsNormF32(state.PendingHiddenDevicePtr, mtpHead.HnormDevice, hNormDst, hiddenSize, eps, 1, streamH);
+        ProfMark("mtp-3a-enorm-hnorm");
 
         // cur = eh_proj @ concat(e_norm, h_norm)
         Gemm(mtpHead.EhProjDevice, mtpHead.EhProjQt, s.Concat, s.Cur,
@@ -1962,6 +1994,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         // inpSA: the attention sub-block's residual is the eh_proj output, not the raw input.
         CudaDriverApi.cuMemcpyDtoDAsync_v2(s.Residual, s.Cur, (nuint)((long)hiddenSize * sizeof(float)), streamH)
             .ThrowOnError();
+        ProfMark("mtp-3b-eh-proj");
 
         // ── Attention sub-block — same gated-QKV math as ForwardFullAttnBody, seqQ=1 ──
         _kernels.LaunchRmsNormF32(s.Cur, mtpHead.Layer.AttnNormWeightDevice, s.Normed, hiddenSize, eps, 1, streamH);
@@ -1985,6 +2018,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                     (nuint)perHeadBytes, streamH).ThrowOnError();
             }
         }
+        ProfMark("mtp-4a-attn-norm-q-proj");
 
         // K/V projections write directly into this step's KV-cache row — appends this step's K/V
         // into the MTP head's own tiny cache (no extra copy), matching the CPU host's
@@ -1993,6 +2027,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint vRowDst = state.GetValueRowDevicePtr(step);
         Gemm(attn.KDevice, attn.KQt, s.Normed, kRowDst, attn.KOutputDim, attn.KInputDim, 1);
         Gemm(attn.VDevice, attn.VQt, s.Normed, vRowDst, attn.VOutputDim, attn.VInputDim, 1);
+        ProfMark("mtp-4b-kv-proj");
 
         // Per-head QK-norm (RMSNorm over headDim, one "row" per head — seqLen=1 * numHeads/numKvHeads rows).
         _kernels.LaunchRmsNormF32(s.Q, attn.QNormDevice, s.Q, headDim, eps, numHeads, streamH);
@@ -2006,6 +2041,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         }
         _kernels.LaunchRoPEF32(s.Q, kRowDst, s.PositionDevice, 1, numHeads, numKvHeads, headDim,
             _ropeDim, _ropeTheta, 1, streamH);
+        ProfMark("mtp-4c-qknorm-rope");
 
         // Append this step's K/V (already written above) and attend causally over everything
         // drafted so far in this round (NOT the trunk's KV-cache) — positionOffset=step means every
@@ -2015,6 +2051,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _kernels.LaunchAttentionF32(s.Q, state.KeyCacheDevicePtr, state.ValueCacheDevicePtr, s.AttnOut,
             /* seqQ */ 1, /* seqKv */ seqKv, numHeads, numKvHeads, headDim,
             /* positionOffset */ step, /* slidingWindow */ 0, streamH);
+        ProfMark("mtp-5-attn-core");
 
         // attnOut *= sigmoid(gate) — Qwen3.5/3.6 gated attention, applied before the O-proj.
         if (_kernels.HasElementwiseF32)
@@ -2025,6 +2062,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         Gemm(attn.ODevice, attn.OQt, s.AttnOut, s.Cur, attn.OOutputDim, attn.OInputDim, 1);
 
         _kernels.LaunchAddF32(s.Residual, s.Cur, s.Cur, hiddenSize, streamH); // cur = inpSA + attn_out_projected
+        ProfMark("mtp-6-attn-gate-o-proj");
 
         // ── Dense SwiGLU FFN sub-layer ──
         CudaDriverApi.cuMemcpyDtoDAsync_v2(s.Residual, s.Cur, (nuint)((long)hiddenSize * sizeof(float)), streamH)
@@ -2035,11 +2073,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
              mtpHead.Layer.GateOutputDim, mtpHead.Layer.GateInputDim, 1);
         Gemm(mtpHead.Layer.UpWeight, mtpHead.Layer.UpQt, s.Normed, s.FfnUp,
              mtpHead.Layer.UpOutputDim, mtpHead.Layer.UpInputDim, 1);
+        ProfMark("mtp-7a-ffn-norm-gate-up");
         _kernels.LaunchSwiGLUF32(s.FfnGate, s.FfnUp, s.Silu, intermediateSize, 1, streamH);
         Gemm(mtpHead.Layer.DownWeight, mtpHead.Layer.DownQt, s.Silu, s.Cur,
              mtpHead.Layer.DownOutputDim, mtpHead.Layer.DownInputDim, 1);
 
         _kernels.LaunchAddF32(s.Residual, s.Cur, s.Cur, hiddenSize, streamH); // cur = ffn_residual + ffn_out
+        ProfMark("mtp-7b-ffn-swiglu-down");
 
         state.Advance();
         if (!computeLogits)
@@ -2075,13 +2115,16 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             headRot.RotateForward(s.NormedHead, headIn, 1, headInputDim,
                 permuteGdnValueHeads: false, streamH);
         }
+        ProfMark("mtp-8-head-norm-rot");
         Gemm(headWeight, headQt, headIn, s.LogitsDevice, headOutputDim, headInputDim, 1);
+        ProfMark("mtp-9-lm-head");
 
         _stream.Synchronize();
         var shape = new TensorShape(1, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
         CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, s.LogitsDevice,
             (nuint)((long)vocabSize * sizeof(float))).ThrowOnError();
+        ProfMark("mtp-10-logits-d2h");
         return result;
     }
 
