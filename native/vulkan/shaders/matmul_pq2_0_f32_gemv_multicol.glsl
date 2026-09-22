@@ -23,10 +23,14 @@
 #error "NCOLS must be defined by the including .comp"
 #endif
 
+#extension GL_EXT_control_flow_attributes : require
+
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
-layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };
+// x is read as vec4: a code byte covers four consecutive elements, so one 16-byte load feeds
+// it. The caller guarantees xOff % 4 == 0 (K is a multiple of 128, so every column stays aligned).
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { vec4 x4[]; };
 layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };
 
 layout(push_constant) uniform PushConstants {
@@ -34,7 +38,7 @@ layout(push_constant) uniform PushConstants {
     uint K;
     uint blocksPerRow;   // = K / 128
     uint rowUints;       // unused; push-constant layout parity with the single-column kernel
-    uint xOff;           // first element of column 0's activation row; column s is at xOff + s*K
+    uint xOff;           // first element of column 0's activation row, a multiple of 4; column s is at xOff + s*K
     uint yOff;           // first element of column 0's output row;     column s is at yOff + s*M
     uint ncols;          // live columns, 1..NCOLS
 } pc;
@@ -68,12 +72,13 @@ void main() {
     uint rowBytes = pc.blocksPerRow * PQ2_GROUP_BYTES;
     uint rowByteBase = m * rowBytes;
 
-    uint colX[NCOLS];
-    for (uint s = 0u; s < NCOLS; s++)
-        colX[s] = pc.xOff + min(s, pc.ncols - 1u) * pc.K;
+    // Column s's activation row, in vec4 units.
+    uint colX4[NCOLS];
+    [[unroll]] for (uint s = 0u; s < NCOLS; s++)
+        colX4[s] = (pc.xOff + min(s, pc.ncols - 1u) * pc.K) >> 2u;
 
     float acc[NCOLS];
-    for (uint s = 0u; s < NCOLS; s++) acc[s] = 0.0;
+    [[unroll]] for (uint s = 0u; s < NCOLS; s++) acc[s] = 0.0;
 
     uint totalCodeBytes = pc.blocksPerRow * PQ2_CODE_BYTES;
     for (uint cb = tid; cb < totalCodeBytes; cb += threads) {
@@ -88,21 +93,21 @@ void main() {
         float c2 = float(int((pk >> 4u) & 3u) - 1);
         float c3 = float(int((pk >> 6u) & 3u) - 1);
 
-        uint rel = g * PQ2_GROUP_SIZE + 4u * gp;
-        for (uint s = 0u; s < NCOLS; s++) {
-            uint xBase = colX[s] + rel;
-            acc[s] += scale * (c0 * x[xBase]
-                              + c1 * x[xBase + 1u]
-                              + c2 * x[xBase + 2u]
-                              + c3 * x[xBase + 3u]);
+        // Element g*128 + 4*gp is vec4 index g*32 + gp, which is cb itself.
+        [[unroll]] for (uint s = 0u; s < NCOLS; s++) {
+            vec4 xv = x4[colX4[s] + cb];
+            acc[s] += scale * (c0 * xv.x
+                              + c1 * xv.y
+                              + c2 * xv.z
+                              + c3 * xv.w);
         }
     }
 
-    for (uint s = 0u; s < NCOLS; s++) partials[s][tid] = acc[s];
+    [[unroll]] for (uint s = 0u; s < NCOLS; s++) partials[s][tid] = acc[s];
     barrier();
     for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
         if (tid < stride) {
-            for (uint s = 0u; s < NCOLS; s++)
+            [[unroll]] for (uint s = 0u; s < NCOLS; s++)
                 partials[s][tid] = partials[s][tid] + partials[s][tid + stride];
         }
         barrier();

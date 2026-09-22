@@ -38,7 +38,7 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
     public const int MaxColumns = 8;
 
     /// <summary>Column counts with a compiled <c>matmul_pq2_0_f32_gemv_multicol_{n}.spv</c>, ascending.</summary>
-    private static readonly int[] MultiColumnWidths = [2, 4, 8];
+    private static readonly int[] MultiColumnWidths = [2, 3, 4, 5, 6, 7, 8];
 
     private const int MultiColumnPushConstantBytes = 7 * sizeof(uint);
 
@@ -302,9 +302,9 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
     /// offset <c>Record</c> overload. The tests assert equality, not a tolerance.
     /// </para>
     /// <para>
-    /// <paramref name="columns"/> = 1 records the ordinary single-column kernel. Otherwise the
-    /// narrowest compiled variant that fits is used; 3 runs the 4-wide variant with one dead
-    /// column, which is loaded but never written.
+    /// <paramref name="columns"/> = 1 records the ordinary single-column kernel; every other
+    /// width has its own compiled variant. (An earlier 2/4/8-only set ran 5 columns on the 8-wide
+    /// kernel and paid about 40% for the three dead ones.)
     /// </para>
     /// </remarks>
     /// <param name="cmdBuf">Command buffer to record into.</param>
@@ -314,7 +314,7 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
     /// <param name="m">Output rows per column.</param>
     /// <param name="k">Inner dimension; must be a multiple of 128.</param>
     /// <param name="columns">Column (token) count, 1..<see cref="MaxColumns"/>.</param>
-    /// <param name="xOffsetElements">First float of column 0's activation row.</param>
+    /// <param name="xOffsetElements">First float of column 0's activation row; a multiple of 4, because the shader reads activations as <c>vec4</c>.</param>
     /// <param name="yOffsetElements">First float of column 0's output row.</param>
     public unsafe void RecordColumns(
         nint cmdBuf,
@@ -328,7 +328,8 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
             return;
         }
 
-        if (xOffsetElements < 0) throw new ArgumentOutOfRangeException(nameof(xOffsetElements));
+        if (xOffsetElements < 0 || (xOffsetElements & 3) != 0)
+            throw new ArgumentOutOfRangeException(nameof(xOffsetElements), xOffsetElements, "Must be a non-negative multiple of 4.");
         if (yOffsetElements < 0) throw new ArgumentOutOfRangeException(nameof(yOffsetElements));
         if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
@@ -349,11 +350,7 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
         if (y.Size < ((long)yOffsetElements + (long)columns * m) * sizeof(float))
             throw new ArgumentException("Output buffer too small.", nameof(y));
 
-        MultiColumnPipeline variant = _multiColumn[^1];
-        foreach (var mc in _multiColumn)
-        {
-            if (mc.Width >= columns) { variant = mc; break; }
-        }
+        MultiColumnPipeline variant = _multiColumn[columns - MultiColumnWidths[0]];
 
         Span<nint> buffers = stackalloc nint[3] { weightsPQ2_0.Handle, x.Handle, y.Handle };
         nint descriptorSet = variant.Cache.GetOrCreate(buffers);
