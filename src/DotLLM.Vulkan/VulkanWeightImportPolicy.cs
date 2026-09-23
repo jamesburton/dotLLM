@@ -153,7 +153,13 @@ internal static class VulkanWeightImportPolicy
         var wrapped = device.TryWrapHostVisible(srcPtr, bytes);
         if (wrapped is null)
         {
-            LastFallbackReason = "import_rejected";
+            // "rejected" on its own is not a cause. Carry the driver's own verdict —
+            // which Vulkan call refused and with what VkResult — because the whole
+            // import was dead on the real load path for want of exactly this line:
+            // synthetic-memory tests passed while every production tensor was refused.
+            LastFallbackReason =
+                $"import_rejected({Interop.HostVisibleBuffer.LastImportFailureStage}" +
+                $":{Interop.HostVisibleBuffer.LastImportFailureCode})";
             return false;
         }
 
