@@ -18,8 +18,14 @@ namespace DotLLM.Cli.Commands;
 /// </summary>
 /// <remarks>
 /// Defaults to <see cref="PerplexityMode.SlidingWindow"/> with <c>stride = context / 2</c>, which
-/// reproduces llama.cpp's <c>--perplexity</c> methodology, so the reported figure is directly
-/// comparable to published numbers for the same model, corpus, context and stride.
+/// reproduces llama.cpp's <c>--perplexity</c> methodology, so the reported figure is comparable to
+/// published numbers for the same model, corpus, context and stride — <b>provided both engines
+/// tokenize the same bytes</b>. That proviso is not automatic: a CRLF corpus is read differently
+/// by an MSVC-built <c>llama-perplexity</c> (text mode collapses <c>\r\n</c>) than by dotLLM, and
+/// measured on wikitext-2 that made 501 of the 512 tokens in chunk 0 differ (issue #506). The
+/// command therefore scans for CR bytes and warns. See <c>docs/PERPLEXITY.md</c> for the LF
+/// fixture and the <c>--kl-divergence-base</c> / <c>--tokens-file</c> protocol that removes the
+/// assumption entirely.
 /// </remarks>
 internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Settings>
 {
