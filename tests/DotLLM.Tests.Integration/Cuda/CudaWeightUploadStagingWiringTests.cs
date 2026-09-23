@@ -44,6 +44,14 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// <b>Counters are process-wide and never reset</b>, and CUDA classes share the process, so every
 /// assertion here is on a <i>delta</i> across the load rather than an absolute value.
 /// </para>
+/// <para>
+/// <b>First green run</b> (T5500, RTX 3060, Llama-3.2-1B Q8_0, 2026-09-23): opted in, 10 staging
+/// chunks carrying 558,170,112 B at the default 67,108,864 B chunk; opted out, 0 staging chunks and
+/// 1,592,066,048 B direct. Note the opted-in arm still sends most of the model direct — staging
+/// only claims tensors above the one-chunk threshold, which is the documented design, so
+/// <c>TotalDirectBytes</c> moving in the opted-in arm is expected and is deliberately not asserted
+/// against.
+/// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
 [Collection(GpuCollection.Name)]
