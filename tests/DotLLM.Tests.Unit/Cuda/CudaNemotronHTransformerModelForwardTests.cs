@@ -391,13 +391,15 @@ public sealed class CudaNemotronHTransformerModelForwardTests
 
     /// <summary>
     /// Regression coverage for issue #383 review follow-up: the bogus-<c>ptxDir</c> test above
-    /// throws in <c>new CudaKernels(ptxDir)</c>, which runs BEFORE the first <c>cuMemAlloc</c> in
-    /// <c>BuildFromPrebuiltWeights</c> — so it only proves the context/stream/cublas/kernels
-    /// quartet is freed on failure. It never exercises the <c>allocs</c> ledger (the bulk of the
-    /// #383 diff): the reverse-order free of several real device buffers uploaded earlier in the
-    /// SAME failed load. This test forces a real <c>cuMemAlloc</c> failure partway through layer
-    /// 1's attention upload, after layer 0's full buffer set (and layer 1's own Q/K/V) are already
-    /// tracked in the ledger, and asserts they don't leak.
+    /// never reaches the <c>allocs</c> ledger (the bulk of the #383 diff) — the reverse-order free
+    /// of several real device buffers uploaded earlier in the SAME failed load. Since #484 it does
+    /// not reach <c>CudaContext.Create</c> either, which makes THIS test the only remaining
+    /// exerciser of <c>BuildFromPrebuiltWeights</c>'s catch block (teardown of the bare
+    /// context/stream/cuBLAS trio is covered directly by
+    /// <c>DotLLM.Tests.Integration.Cuda.CudaPrimitiveTeardownLeakTests</c>). It forces a real
+    /// <c>cuMemAlloc</c> failure partway through layer 1's attention upload, after layer 0's full
+    /// buffer set (and layer 1's own Q/K/V) are already tracked in the ledger, and asserts they
+    /// don't leak.
     /// </summary>
     /// <remarks>
     /// <para>

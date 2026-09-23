@@ -606,6 +606,29 @@ First-time PTX loading incurs ~100–500ms per module as the driver compiles PTX
 
 ---
 
+## PTX Pre-flight: `CudaKernels.ResolveAndValidatePtxDirectory` (issue #484)
+
+**Every CUDA model factory must call `CudaKernels.ResolveAndValidatePtxDirectory(ptxDir)` before
+`CudaContext.Create`, and pass its return value to `new CudaKernels(...)`.** Never write
+`ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx")` in a factory — that is what the helper
+does, plus the check.
+
+The factories set up in the order `CudaContext.Create` → `CudaStream.Create` → `cublasCreate` →
+`new CudaKernels(ptxDir)`. A missing or incomplete PTX deployment is the most common way a load
+fails, and without the pre-flight it is detected only *after* three device-backed handles already
+exist — a failure path whose unwind must then be re-proven correct at every call site. Validating
+up front is pure file-system I/O and makes the whole class of leak structurally impossible.
+
+- Throws `DirectoryNotFoundException` if the directory is absent, `FileNotFoundException` naming the
+  first missing module otherwise.
+- `CudaKernels.RequiredPtxFiles` lists every module the constructor loads unconditionally, and
+  `CudaKernelsPtxValidationTests.RequiredPtxFiles_MatchesUnconditionalConstructorLoads` parses the
+  constructor to keep the two in sync. **Adding an unconditional `CudaModule.LoadFromFile` to the
+  constructor requires adding the file to that list** (the test fails otherwise). Optional modules,
+  loaded behind `File.Exists`, must stay out of it.
+
+---
+
 ## Kernel Catalog
 
 All kernels compiled to PTX, loaded via `cuModuleLoadData`, launched via `cuLaunchKernel`:
