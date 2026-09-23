@@ -222,6 +222,7 @@ shared on-disk cache:
 | CUDA backend | [docs/CUDA.md](docs/CUDA.md) | PTX architecture, P/Invoke, kernel conventions, build |
 | Multi-GPU | [docs/MULTI_GPU.md](docs/MULTI_GPU.md) | Tensor/pipeline parallelism, NCCL |
 | Native AOT deployment | [docs/AOT.md](docs/AOT.md) | AOT publishing, trimming, deployment |
+| Perplexity & llama.cpp comparison | [docs/PERPLEXITY.md](docs/PERPLEXITY.md) | Quality measurement, corpus fixtures, CRLF trap (#506) |
 | Implementation roadmap | [docs/ROADMAP.md](docs/ROADMAP.md) | Planning, task sequencing |
 
 ## Development Workflow

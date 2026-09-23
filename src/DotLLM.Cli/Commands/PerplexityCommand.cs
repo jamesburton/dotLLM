@@ -39,6 +39,11 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         [Description("Path to a UTF-8 text corpus (e.g. wiki.test.raw).")]
         public string Corpus { get; set; } = string.Empty;
 
+        [CommandOption("--normalize-line-endings")]
+        [Description("Collapse CRLF to LF while reading --corpus, as MSVC text mode does. OFF by default. Use ONLY when the reference figure came from a Windows llama.cpp build reading the same CRLF file; llama.cpp on Linux keeps the CRs, so normalizing there creates a mismatch. Preferred fix is an LF corpus (see docs/PERPLEXITY.md, issue #506).")]
+        [DefaultValue(false)]
+        public bool NormalizeLineEndings { get; set; }
+
         [CommandOption("--context|-c")]
         [Description("Context window in tokens. Clamped to the model's maximum sequence length.")]
         [DefaultValue(512)]
@@ -120,6 +125,20 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         {
             AnsiConsole.MarkupLine($"[red]Corpus not found: {Markup.Escape(settings.Corpus)}[/]");
             return 1;
+        }
+
+        // Issue #506: a CRLF corpus makes dotLLM and a Windows llama.cpp build tokenize different
+        // text, which silently invalidated every end-to-end quality comparison made that way.
+        // Warned before the model loads so it is the first thing on screen, and repeated in the
+        // results table below because the table is what gets pasted into an issue.
+        long corpusCarriageReturns = 0;
+        if (settings.TokensFile is null)
+        {
+            corpusCarriageReturns = CorpusLineEndings.CountCarriageReturns(settings.Corpus);
+            string? lineEndingWarning =
+                CorpusLineEndings.DescribeMismatchRisk(settings.Corpus, corpusCarriageReturns);
+            if (lineEndingWarning is not null)
+                AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(lineEndingWarning)}[/]");
         }
 
         if (!TryParseMode(settings.Mode, out PerplexityMode mode))
@@ -216,7 +235,12 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         }
         else
         {
-            using var reader = new StreamReader(settings.Corpus);
+            using var fileReader = new StreamReader(settings.Corpus);
+            // Default is the raw bytes: llama.cpp on Linux keeps the CRs too, so stripping them
+            // unconditionally would trade a Windows mismatch for a Linux one (issue #506).
+            using TextReader reader = settings.NormalizeLineEndings
+                ? new CrlfNormalizingTextReader(fileReader)
+                : fileReader;
             foreach (int id in CorpusReader.StreamTokens(reader, tokenizer, settings.MaxTokens))
                 tokens.Add(id);
         }
@@ -280,6 +304,11 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         table.AddRow("Stride", $"{effectiveStride:N0}");
         table.AddRow("Unscored prefix", $"{effectivePrefix:N0}");
         table.AddRow("Corpus tokens", $"{tokens.Count:N0}");
+        if (settings.TokensFile is null)
+        {
+            table.AddRow("Corpus line endings", Markup.Escape(
+                CorpusLineEndings.SummarizeForReport(corpusCarriageReturns, settings.NormalizeLineEndings)));
+        }
         table.AddRow("Elapsed", $"{sw.Elapsed.TotalSeconds:F2} s");
         AnsiConsole.Write(table);
 
