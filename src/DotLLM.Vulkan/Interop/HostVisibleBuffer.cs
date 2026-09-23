@@ -266,11 +266,13 @@ public sealed class HostVisibleBuffer : IDisposable
 
                 if (!device.TryFindHostImportMemoryType(typeBits, out uint typeIndex))
                 {
-                    // #507: the import is gated on a DEVICE_LOCAL|HOST_VISIBLE
-                    // memory type. A distinct stage name so a discrete-GPU
-                    // refusal is diagnosable from the surviving mask.
+                    // #507: the import is gated on an integrated (or CPU)
+                    // physical device — imported host memory would otherwise
+                    // leave every weight in system RAM behind a PCIe link.
+                    // Distinct stage name so a discrete-GPU refusal is
+                    // diagnosable from a genuine type-mask miss.
                     LastImportFailureCode = 0;
-                    LastImportFailureStage = "no_device_local_host_visible_type";
+                    LastImportFailureStage = "not_integrated_gpu";
                     continue;
                 }
 

@@ -2304,6 +2304,20 @@ public sealed class VulkanDevice : IDisposable
     }
 
     /// <summary>
+    /// <c>VkPhysicalDeviceProperties.deviceType</c> of the selected physical
+    /// device — one of the <see cref="VkPhysicalDeviceType"/> constants. Read
+    /// on demand; used to gate the zero-copy host-pointer import (issue #507).
+    /// </summary>
+    internal unsafe int PhysicalDeviceTypeValue
+    {
+        get
+        {
+            VulkanApi.vkGetPhysicalDeviceProperties(_physicalDevice, out var props);
+            return props.deviceType;
+        }
+    }
+
+    /// <summary>
     /// Picks a memory type index for an imported host pointer. The candidate
     /// <paramref name="typeBits"/> is the intersection of
     /// <c>vkGetBufferMemoryRequirements.memoryTypeBits</c> and
@@ -2324,55 +2338,73 @@ public sealed class VulkanDevice : IDisposable
         for (uint i = 0; i < count; i++)
             flags[(int)i] = (VkMemoryPropertyFlags)types[i * 2];
 
-        return TrySelectHostImportMemoryType(typeBits, flags, out memoryTypeIndex);
+        return TrySelectHostImportMemoryType(
+            typeBits, flags, PhysicalDeviceTypeValue, out memoryTypeIndex);
     }
 
     /// <summary>
     /// Pure memory-type selection for a <c>VK_EXT_external_memory_host</c>
-    /// import: returns the lowest index set in <paramref name="typeBits"/>
-    /// whose property flags are <b>both</b> <c>DEVICE_LOCAL</c> and
-    /// <c>HOST_VISIBLE</c>. Index <c>i</c> of <paramref name="memoryTypes"/>
-    /// is memory type <c>i</c>. Returns false when no such type exists —
-    /// there is deliberately no permissive fallback.
+    /// import. Returns false outright unless <paramref name="deviceType"/> is
+    /// an integrated GPU (or a software/CPU device); otherwise returns the
+    /// lowest index set in <paramref name="typeBits"/> whose property flags
+    /// include <c>HOST_VISIBLE</c>. Index <c>i</c> of
+    /// <paramref name="memoryTypes"/> is memory type <c>i</c>. There is
+    /// deliberately no permissive "any type" fallback — a memory type that is
+    /// not host-visible is nonsense for imported host memory.
     /// </summary>
     /// <remarks>
     /// <para>
     /// This is the UMA gate for the zero-copy weight import (issue #507).
-    /// Imported host memory is system RAM by construction, so a device that
-    /// "succeeds" here without a device-local type would keep every weight in
-    /// host RAM and read it across PCIe for the model's lifetime — presenting
-    /// as mysteriously slow inference rather than as an error.
+    /// Imported host memory is system RAM by construction. On an integrated
+    /// GPU that RAM <i>is</i> the GPU's memory, so the import is a genuine
+    /// zero-copy win. On a discrete GPU the weights would never reach VRAM and
+    /// every matmul would read them across PCIe for the model's lifetime —
+    /// presenting as mysteriously slow inference rather than as an error, so
+    /// the import is refused and the caller's staging path runs instead.
     /// </para>
     /// <para>
-    /// Testing the memory properties is preferable to an
-    /// <c>IntegratedGpu</c> device-type allow-list because it keys on the
-    /// physical property that actually matters: on a UMA part the heap
-    /// carrying the importable types is itself device-local, so the import
-    /// still engages; on a discrete GPU the type bits reported by
-    /// <c>vkGetMemoryHostPointerPropertiesEXT</c> describe host memory and
-    /// will not include a device-local VRAM type, so the import is refused
-    /// and the caller's existing staging path runs — which is the correct
-    /// behaviour there.
+    /// <b>Why the device type and not the memory properties.</b> The issue
+    /// proposed requiring the chosen type to be <c>DEVICE_LOCAL</c> as well as
+    /// <c>HOST_VISIBLE</c>, on the theory that on UMA every heap is both. That
+    /// was implemented and <b>measured to be false on the target hardware</b>:
+    /// on Strix Halo (gfx1151, amdvlk/Windows) the driver partitions the one
+    /// physical DRAM into a GTT heap 0 — host-visible, <i>not</i> flagged
+    /// device-local — and a device-local VRAM carve-out heap 1, and
+    /// <c>vkGetMemoryHostPointerPropertiesEXT</c> reports masks
+    /// <c>0x2222</c> (foreign memory) / <c>0xAAAA</c> (host allocation), all of
+    /// which are heap-0 types. The device-local types 2/10 are not importable.
+    /// A <c>DEVICE_LOCAL</c> requirement therefore refuses on UMA too — it
+    /// keys on driver heap bookkeeping, not on locality, and cannot
+    /// discriminate the two cases. The device type can.
+    /// </para>
+    /// <para>
+    /// <c>Cpu</c> (software rasterizers such as lavapipe) is allowed for the
+    /// same reason as an iGPU: there is no separate device memory to miss.
+    /// <c>Other</c> and <c>VirtualGpu</c> are refused conservatively — staging
+    /// is always correct, only slower to load.
     /// </para>
     /// </remarks>
     /// <param name="typeBits">Candidate memory-type mask (bit <c>i</c> = type <c>i</c>).</param>
     /// <param name="memoryTypes">Property flags of each memory type, indexed by type index.</param>
+    /// <param name="deviceType">The device's <c>VkPhysicalDeviceType</c> value.</param>
     /// <param name="memoryTypeIndex">The selected memory type index; 0 when the method returns false.</param>
     internal static bool TrySelectHostImportMemoryType(
-        uint typeBits, ReadOnlySpan<VkMemoryPropertyFlags> memoryTypes, out uint memoryTypeIndex)
+        uint typeBits, ReadOnlySpan<VkMemoryPropertyFlags> memoryTypes, int deviceType,
+        out uint memoryTypeIndex)
     {
-        const VkMemoryPropertyFlags Required =
-            VkMemoryPropertyFlags.DeviceLocal | VkMemoryPropertyFlags.HostVisible;
+        memoryTypeIndex = 0;
+
+        if (deviceType is not (VkPhysicalDeviceType.IntegratedGpu or VkPhysicalDeviceType.Cpu))
+            return false;
 
         for (int i = 0; i < memoryTypes.Length && i < 32; i++)
         {
             if ((typeBits & (1u << i)) == 0) continue;
-            if ((memoryTypes[i] & Required) != Required) continue;
+            if ((memoryTypes[i] & VkMemoryPropertyFlags.HostVisible) == 0) continue;
             memoryTypeIndex = (uint)i;
             return true;
         }
 
-        memoryTypeIndex = 0;
         return false;
     }
 
