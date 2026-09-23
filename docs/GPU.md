@@ -557,8 +557,14 @@ Both come from `VkPhysicalDeviceExternalMemoryHostPropertiesEXT` chained off `vk
 When the driver rejects a specific import (`vkAllocateMemory` returns `VK_ERROR_INVALID_EXTERNAL_HANDLE`), `HostVisibleBuffer.TryCreate` returns `null` and `VulkanWeights.UploadMatrix` falls through to the staging-copy path. Diagnostic statics make the rejection visible:
 
 - `VulkanWeights.LastUploadFallbackReason` — `"feature_absent"`, `"env_disabled"`, `"null_src"`, or `"import_rejected"`.
-- `HostVisibleBuffer.LastImportFailureStage` — the specific Vulkan call that failed (`"vkAllocateMemory"`, `"vkBindBufferMemory"`, etc.).
+- `HostVisibleBuffer.LastImportFailureStage` — the specific Vulkan call that failed (`"vkAllocateMemory"`, `"vkBindBufferMemory"`, etc.), or `"not_integrated_gpu"` for the UMA gate below.
 - `HostVisibleBuffer.LastImportFailureCode` — the VkResult error code.
+
+### UMA gate (#507)
+
+Imported host memory is system RAM by construction. On a **discrete** GPU an accepted import would leave every weight in host RAM and read it across PCIe for the model's lifetime — presenting as mysteriously slow inference, not as an error. `VulkanDevice.TrySelectHostImportMemoryType` therefore refuses the import unless `VkPhysicalDeviceProperties.deviceType` is `INTEGRATED_GPU` or `CPU`, and within that still requires a `HOST_VISIBLE` memory type (no "any type" fallback). The decision is a pure static so the discrete-GPU branch is unit-tested on a UMA-only host (`VulkanHostImportMemoryTypeSelectionTests`).
+
+Requiring the chosen type to be `DEVICE_LOCAL` as well as `HOST_VISIBLE` — the originally proposed gate — was implemented and **measured to be wrong on gfx1151**: amdvlk splits the single UMA DRAM into a GTT heap 0 (host-visible, *not* flagged device-local) and a device-local VRAM carve-out heap 1, and `vkGetMemoryHostPointerPropertiesEXT` reports `memoryTypeBits` `0x2222` (foreign memory) / `0xAAAA` (host allocation) — all heap-0 types. The device-local types 2/10 are not importable, so that rule refuses on UMA too. `DEVICE_LOCAL` is driver heap bookkeeping here, not locality.
 
 Set `DOTLLM_VULKAN_DISABLE_HOST_IMPORT=1` to force the staging path even when the driver supports the import. Used by parity tests and to measure the staging baseline in the microbench.
 

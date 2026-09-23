@@ -15,10 +15,46 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// import-succeeds path additionally requires
 /// <see cref="VulkanDevice.HasExternalMemoryHost"/>.
 /// </summary>
+/// <remarks>
+/// Issue #507: the import is additionally gated on the device being integrated
+/// (or a CPU/software device). On a discrete GPU the correct outcome is a
+/// refusal with stage <c>"not_integrated_gpu"</c>, not a successful import — so
+/// the import-succeeds tests assert on <see cref="ExpectsZeroCopyImport"/>
+/// rather than unconditionally on non-null. That makes the dGPU half of the
+/// acceptance criteria executable on a discrete box.
+/// </remarks>
 [Trait("Category", "GPU")]
 [Collection("VulkanKernels")]
 public class HostVisibleBufferTests
 {
+    /// <summary>
+    /// True when the #507 UMA gate permits the zero-copy import on this device —
+    /// i.e. an integrated GPU or a CPU/software device. False on a discrete GPU,
+    /// where the import must be refused so the caller stages into VRAM.
+    /// </summary>
+    private static bool ExpectsZeroCopyImport(VulkanDevice device)
+        => device.PhysicalDeviceTypeValue is VkPhysicalDeviceType.IntegratedGpu
+            or VkPhysicalDeviceType.Cpu;
+
+    /// <summary>
+    /// Asserts the #507-correct outcome for an import attempt: a live buffer on
+    /// an integrated device, a null + <c>"not_integrated_gpu"</c> refusal on a
+    /// discrete one. Returns true when the caller should go on to assert the
+    /// import's layout properties.
+    /// </summary>
+    private static bool AssertImportGateOutcome(VulkanDevice device, HostVisibleBuffer? buf)
+    {
+        if (ExpectsZeroCopyImport(device))
+        {
+            Assert.NotNull(buf);
+            return true;
+        }
+
+        Assert.Null(buf);
+        Assert.Equal("not_integrated_gpu", HostVisibleBuffer.LastImportFailureStage);
+        return false;
+    }
+
     [SkippableFact]
     public void Probe_DoesNotCrash_WhenExtensionAbsent()
     {
@@ -100,7 +136,7 @@ public class HostVisibleBufferTests
             new Span<byte>(host, (int)chunkBytes).Fill(0xA5);
 
             using var buf = HostVisibleBuffer.TryCreate(device, (nint)host, (long)chunkBytes);
-            Assert.NotNull(buf);
+            if (!AssertImportGateOutcome(device, buf)) return;
             Assert.Equal((long)chunkBytes, buf!.Size);
             Assert.Equal(0L, buf.BindOffset);
             Assert.Equal((nint)host, buf.ImportedHostPointer);
@@ -137,7 +173,7 @@ public class HostVisibleBufferTests
             long logicalSize = (long)alignment; // one full page worth, fits within the 2-page alloc
 
             using var buf = HostVisibleBuffer.TryCreate(device, unaligned, logicalSize);
-            Assert.NotNull(buf);
+            if (!AssertImportGateOutcome(device, buf)) return;
             Assert.Equal(logicalSize, buf!.Size);
             // BindOffset must equal the original misalignment so the shader
             // descriptor reads logical byte 0 at the requested pointer.
@@ -172,6 +208,14 @@ public class HostVisibleBufferTests
             try
             {
                 using var buf = device.TryWrapHostVisible((nint)host, (long)alignment);
+                if (!ExpectsZeroCopyImport(device))
+                {
+                    // #507: a discrete GPU must refuse — an accepted import would
+                    // leave the pages in system RAM behind PCIe.
+                    Assert.Null(buf);
+                    Assert.Equal("not_integrated_gpu", HostVisibleBuffer.LastImportFailureStage);
+                    return;
+                }
                 Assert.NotNull(buf);
                 Assert.True(buf!.IsHostImported);
                 Assert.Equal((long)alignment, buf.Size);
