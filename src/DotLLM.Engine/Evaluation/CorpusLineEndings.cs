@@ -80,9 +80,10 @@ public static class CorpusLineEndings
         if (carriageReturns <= 0) return null;
 
         return $"""
-            WARNING: corpus '{path}' contains {carriageReturns:N0} CR (0x0D) bytes - it has CRLF line endings.
-            llama.cpp on Windows reads its prompt file in MSVC text mode, which strips those CRs before
-            tokenizing; dotLLM keeps them. The two engines therefore score DIFFERENT TEXT and any
+            WARNING: corpus '{path}' contains {carriageReturns:N0} CR (0x0D) bytes - most likely CRLF line endings.
+            llama.cpp on Windows reads its prompt file in MSVC text mode, which strips the CR of every
+            CRLF before tokenizing; dotLLM keeps them. (A lone CR survives text mode, so a corpus whose
+            CRs are all bare is safe - scripts/make_lf_corpus.py reports the CRLF count separately.) The two engines therefore score DIFFERENT TEXT and any
             dotLLM-vs-llama.cpp perplexity comparison made from this file is NOT like-for-like.
             (llama.cpp on Linux keeps the CRs, which is why dotLLM does not strip them by default.)
             Fix the corpus, not the reader: use an LF copy (scripts/make_lf_corpus.py writes one into

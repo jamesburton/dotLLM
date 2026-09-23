@@ -15,8 +15,8 @@ dotllm perplexity <model.gguf> --corpus ~/.dotllm/test-cache/corpora/wikitext-2-
 every `\r\n` to `\n` before the tokenizer sees it. dotLLM reads the bytes and keeps the `\r`.
 
 If the corpus has CRLF line endings, the two engines tokenize **different text**. Measured
-2026-09-23 on `wiki.test.raw` (1,299,263 bytes, 13,641 CRs) with Llama-3.2-1B: **501 of the 512
-tokens in chunk 0 differed.** The paired per-chunk standard deviation on this corpus is ~0.2 nats,
+2026-09-23 on `wiki.test.raw` (1,299,263 bytes, 7,249 CRs, all of them CRLF) with Llama-3.2-1B:
+**501 of the 512 tokens in chunk 0 differed.** The paired per-chunk standard deviation on this corpus is ~0.2 nats,
 an order of magnitude larger than the quantization effects usually being chased, so any aggregate
 agreement observed that way was luck rather than validation.
 
@@ -51,8 +51,10 @@ python scripts/make_lf_corpus.py C:/Development/bitnet-tests/data/wikitext-2-raw
 
 The conversion is byte-level: no decoding, no BOM (a BOM would add a U+FEFF that tokenizes to a real
 token), no appended trailing newline. The script prints input/output sizes and CR counts and asserts
-that the byte delta equals the CRLF count and that no CRLF remains — for `wiki.test.raw` the delta
-is 13,641 bytes, giving 1,285,622 bytes out.
+that the byte delta equals the CRLF count and that no CRLF remains. Measured on `wiki.test.raw`:
+1,299,263 bytes in, 7,249 CR / 7,249 CRLF, **1,292,014 bytes out**. (Issue #506 quotes 1,285,622 —
+that is the *decoded character* count, which is smaller than the byte count because wikitext-2
+contains multi-byte UTF-8; the byte figure above is the one the script prints.)
 
 Point **both** engines at this file:
 
