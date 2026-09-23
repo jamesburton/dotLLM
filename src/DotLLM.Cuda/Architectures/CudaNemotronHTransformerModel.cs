@@ -425,6 +425,12 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
         var ssm = config.SsmConfig!.Value;
         int hiddenSize = config.HiddenSize;
 
+        // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+        // incomplete ptxDir is by far the most common way this factory throws, and doing the
+        // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+        // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
+
         // #383: context creation cannot leak on its own throw (nothing allocated yet), so it
         // stays outside the try/catch — everything created from here on is disposed on any
         // failure before rethrowing. `allocs` is the ledger every UploadXxx/AllocDevice call
@@ -444,7 +450,6 @@ public sealed unsafe class CudaNemotronHTransformerModel : IModel
             cublas = CudaCublasHandle.Create();
             cublas.SetStream(stream);
 
-            ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
             kernels = new CudaKernels(ptxDir);
 
             long maxTileFloats = 0;

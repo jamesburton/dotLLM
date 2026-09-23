@@ -143,6 +143,12 @@ public sealed unsafe class HybridTransformerModel : IModel
         {
             cpuWeights.RepackWeights();
 
+            // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+            // incomplete ptxDir is by far the most common way this factory throws, and doing the
+            // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+            // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+            string ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(null);
+
             // 2. Initialize CUDA. Context creation cannot leak on its own throw (nothing
             // allocated yet), so it stays outside the inner try/catch — everything created
             // from here on is disposed on any failure before rethrowing.
@@ -160,7 +166,6 @@ public sealed unsafe class HybridTransformerModel : IModel
                 cublas = CudaCublasHandle.Create();
                 cublas.SetStream(stream);
 
-                string? ptxDir = Path.Combine(AppContext.BaseDirectory, "ptx");
                 kernels = new CudaKernels(ptxDir);
 
                 // 3. Upload only GPU layers to VRAM
@@ -312,7 +317,10 @@ public sealed unsafe class HybridTransformerModel : IModel
         //    cannot leak on its own throw (nothing allocated yet), so it stays outside the
         //    try/catch — everything created from here on is disposed on any failure before
         //    rethrowing. `cpuWeights` is caller-owned (see this method's doc) — never disposed
-        //    here.
+        //    here. #484: the PTX deployment is validated BEFORE the context exists, so a bad or
+        //    incomplete ptxDir — the most common way this factory throws — can no longer orphan
+        //    a context/stream/cuBLAS handle whatever the unwind path does.
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
         var context = CudaContext.Create(deviceId);
         CudaStream? stream = null;
         CudaCublasHandle? cublas = null;
@@ -327,7 +335,6 @@ public sealed unsafe class HybridTransformerModel : IModel
             cublas = CudaCublasHandle.Create();
             cublas.SetStream(stream);
 
-            ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
             kernels = new CudaKernels(ptxDir);
 
             // 3. Upload only GPU layers to VRAM
