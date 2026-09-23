@@ -30,9 +30,16 @@ public static class Softmax
     }
 
     /// <summary>
-    /// Fast approximate softmax using IEEE-754 bit-manipulation exp.
-    /// For attention scores where full precision is unnecessary — exp errors get normalized
-    /// away when dividing by the sum. Standard <see cref="Execute"/> should be used for sampling.
+    /// Single-pass softmax for attention scores, built on <see cref="FastMath.ExpSumAndStore"/>
+    /// (fused shift + exp + store + sum) rather than separate Add/Exp/Sum passes.
+    /// <para>
+    /// The name is historical: this path used an IEEE-754 bit-manipulation approximation of
+    /// <c>exp</c> on the premise that "exp errors get normalized away when dividing by the sum".
+    /// #501 measured that premise false (the error is relative and per-element, so it survives
+    /// normalization) and made the exp precise by default; the approximation now only returns
+    /// under <c>DOTLLM_FAST_EXP=1</c>. "Fast" here means fewer passes, not lower precision.
+    /// Standard <see cref="Execute"/> should still be used for sampling.
+    /// </para>
     /// </summary>
     /// <param name="input">Input span (logits).</param>
     /// <param name="result">Destination span. Must have length &gt;= <paramref name="input"/>.Length.

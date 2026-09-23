@@ -176,7 +176,8 @@ public static class Attention
                 ApplySoftCap(scores, softCap);
             ApplyMask(scores, seqQ, seqKv, positionOffset, maskMode, prefixLen, slidingWindowSize);
 
-            // 3. Fast softmax per row (approximate exp — sufficient for attention).
+            // 3. Fused shift+exp+store+sum softmax per row. The exp is precise since #501
+            //    (DOTLLM_FAST_EXP=1 restores the Schraudolph approximation, opt-in and CPU-only).
             //    With a sink logit (gpt-oss), the exact TensorPrimitives path is used so
             //    exp(-inf) masked entries map to exactly 0.
             if (sinks.IsEmpty)

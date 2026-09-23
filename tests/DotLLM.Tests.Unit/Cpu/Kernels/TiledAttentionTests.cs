@@ -12,9 +12,13 @@ namespace DotLLM.Tests.Unit.Cpu.Kernels;
 public sealed class TiledAttentionTests
 {
     /// <summary>
-    /// Tolerance widened from 1e-4 to 2e-2 to account for fast approximate exp (Schraudolph)
-    /// used in attention softmax. Individual exp values have ≤5% relative error, which propagates
-    /// through softmax normalization and value weighting. Scalar reference uses MathF.Exp.
+    /// Tolerance was widened from 1e-4 to 2e-2 when the attention softmax used the Schraudolph
+    /// approximate exp (≤5% relative error per exp value, propagating through the softmax
+    /// normalization and value weighting) while the scalar reference used MathF.Exp. <b>#501 made
+    /// the attention exp precise by default</b>, so both sides now use MathF.Exp and this bound is
+    /// far looser than the residual (SIMD/tiling reassociation) it still has to cover. Left as-is
+    /// rather than retightened, which needs its own measurement pass. Setting
+    /// <c>DOTLLM_FAST_EXP=1</c> restores the approximation and the original justification.
     /// </summary>
     private const float Tolerance = 2e-2f;
 

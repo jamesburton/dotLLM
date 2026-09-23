@@ -71,8 +71,9 @@ public static class FastMath
         Environment.GetEnvironmentVariable("DOTLLM_FAST_EXP") == "1";
 
     /// <summary>
-    /// Scalar fast approximate exp. ~1-2% max relative error.
-    /// Clamped to [-87.3, 88.7] for general use.
+    /// Scalar exp, clamped to [-87.3, 88.7]. Precise (<see cref="MathF.Exp"/>) by default since
+    /// #501; the Schraudolph bit trick (~1-2% max relative error) only runs under
+    /// <see cref="UseFastExp"/>.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static float FastExp(float x)
@@ -84,9 +85,11 @@ public static class FastMath
     }
 
     /// <summary>
-    /// Fused shift + fast exp + store + sum in a single pass.
-    /// Computes: <c>output[i] = fast_exp(input[i] + offset)</c>, returns <c>sum(output)</c>.
+    /// Fused shift + exp + store + sum in a single pass.
+    /// Computes: <c>output[i] = exp(input[i] + offset)</c>, returns <c>sum(output)</c>.
     /// Replaces separate <c>TensorPrimitives.Add + Exp + Sum</c> with one pass over the data.
+    /// The exp is precise since #501; <c>DOTLLM_FAST_EXP=1</c> selects the Schraudolph
+    /// bit-trick variants below (see <see cref="UseFastExp"/>).
     /// </summary>
     /// <param name="input">Input span (e.g., attention scores for one tile).</param>
     /// <param name="output">Output span. May alias <paramref name="input"/> for in-place operation.</param>
