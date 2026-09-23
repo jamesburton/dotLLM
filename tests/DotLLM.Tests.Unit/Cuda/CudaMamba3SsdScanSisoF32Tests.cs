@@ -31,6 +31,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// O(0.1+).
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaMamba3SsdScanSisoF32Tests
 {
     private const float Tolerance = 1e-4f;

@@ -33,6 +33,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </para>
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed unsafe class CudaAttentionMmaDecodeGqaSplitTests
 {
     private const float AbsTol = 5e-3f;

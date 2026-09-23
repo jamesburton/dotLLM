@@ -28,6 +28,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// tolerance (same combine formula, same partial-buffer layout) -- no new tolerance category.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaAttentionF32GqaSplitTests
 {
     private readonly ITestOutputHelper _out;

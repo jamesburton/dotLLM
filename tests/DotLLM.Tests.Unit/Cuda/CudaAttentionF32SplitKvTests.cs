@@ -36,6 +36,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// empirically rather than assuming it.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaAttentionF32SplitKvTests
 {
     private readonly ITestOutputHelper _out;

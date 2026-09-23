@@ -16,6 +16,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// or machine-specific llama.cpp captures.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaLlamaCppLogitsParitySidecarTests
 {
     private const string ModelPathEnvVar = "DOTLLM_IQ4_XS_GGUF_PATH";
