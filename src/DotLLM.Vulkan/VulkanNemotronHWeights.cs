@@ -382,9 +382,12 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     private static bool KeepBf16OnDevice(QuantizationType qt, int inputDim)
         => qt == QuantizationType.BF16 && (inputDim & 1) == 0;
 
-    /// <summary>True iff the source projection is a supported on-device dtype (Q8_0 /
-    /// Q4_K / Q5_K / Q6_K / F16 / BF16) AND the contraction axis is aligned to that
-    /// format's group size — i.e. the raw bytes can stay on device verbatim.</summary>
+    /// <summary>True iff the source projection is a supported on-device dtype (Q8_0, the
+    /// K-quants Q2_K/Q3_K/Q4_K/Q5_K/Q6_K, the IQ family IQ1_S/IQ2_*/IQ3_*/IQ4_*, F16 or
+    /// BF16) AND the contraction axis is aligned to that format's group size — i.e. the raw
+    /// bytes can stay on device verbatim. The disjunction below is the authority; keep this
+    /// list in step with it. Narrower than the dense path's
+    /// <c>VulkanWeights.DeviceQuantTypeFor</c>, which also keeps Q5_0, I2_S and PQ2_0.</summary>
     private static bool KeepQuantOnDevice(QuantizationType qt, int inputDim)
         => KeepQ8OnDevice(qt, inputDim)
         || KeepQ2KOnDevice(qt, inputDim)
