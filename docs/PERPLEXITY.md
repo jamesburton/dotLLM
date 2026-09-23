@@ -141,10 +141,17 @@ numeric differences, so the 8.26% gap does **not** imply a numeric error of simi
 it is the weakest of the three rows as evidence about kernel correctness. The Q3_K row (22.18 vs
 13.90 — a plausible degradation for the format) is the more trustworthy signal.
 
-**The signs are opposite**, which is worth noting because it rules out the tidiest single
-explanation: dotLLM is *better* than llama.cpp at Q2_K and *worse* at Q3_K, so this is not one
-global precision difference (higher-precision accumulation would move both the same way). Two
-distinct path differences, not one.
+**The signs are opposite** — dotLLM is *better* at Q2_K and *worse* at Q3_K. That rules out a
+single *shared-path* precision difference, since higher-precision accumulation on a common path
+would move both the same way. It does **not** rule out the engines taking *different paths*: if
+dotLLM's run dequantized to F32 where llama.cpp used its packed `× q8_K` dot, one mechanism could
+produce both signs (quantized activations cost most where the weights are already coarsest). That
+is #515's first check, and it must be settled before anyone reads this table as two separate
+kernel bugs.
+
+**On the raw log's `n_ctx`.** llama.cpp reports `n_ctx = 2048, n_ctx_seq = 512, n_seq = 4` — it
+batches four sequences of the requested 512. The per-chunk context is 512 on both sides, and both
+engines report **564 chunks**, so the geometries match despite the differing header line.
 
 ## Reporting a comparison
 
