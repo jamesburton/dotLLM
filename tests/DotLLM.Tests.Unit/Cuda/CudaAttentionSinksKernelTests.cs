@@ -16,8 +16,9 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <para>
 /// <b>Test 1 tolerance (no-regression gate):</b> <c>sinks=0</c> (nullptr) must reproduce the
 /// pre-#365 CPU reference exactly at the SAME tolerance already established by
-/// <c>AttentionF32ParityTests</c> (<c>abs=5e-3, rel=5e-3</c> — both sides use the Schraudolph
-/// fast-exp approximation, so only matched-approximation / reduction-order drift is expected).
+/// <c>AttentionF32ParityTests</c> (<c>abs=5e-3, rel=5e-3</c> — when this was written both sides
+/// used the Schraudolph fast-exp approximation, so only matched-approximation / reduction-order
+/// drift was expected; since #501 both sides use precise exp, so only reduction-order drift is).
 /// Observed on the last local GPU run: maxAbs=9.8068E-07, maxRel=1.2621E-04 (idx 103, expected
 /// 0.007770, actual 0.007769) — effectively bit-identical, as expected since <c>sinks=0</c>
 /// introduces no new approximation and both sides still use the fast-exp path identically.
@@ -26,10 +27,15 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <b>Test 2 tolerance (sink-bearing parity):</b> the CPU sink path
 /// (<see cref="Attention.SoftmaxRowWithSink"/>) deliberately switches to exact
 /// <c>TensorPrimitives.Exp</c>/<c>MathF.Exp</c> (so masked <c>-inf</c> entries map to exactly 0),
-/// while the CUDA epilogue still uses <c>fast_exp_neg</c> (the Schraudolph bit-trick). That
-/// approximation-mismatch is the same one <c>attention_f32.cu</c>'s file header documents as
-/// worth ~1% / ~5e-3 abs on plain (no-sink) attention output when the two sides' softmax
-/// implementations disagree. Per Task 1's hand-off, the plan's guessed "~1e-6 expected" tolerance
+/// while the CUDA epilogue, at the time this was written, still used <c>fast_exp_neg</c> (the
+/// Schraudolph bit-trick). That approximation-mismatch is the same one <c>attention_f32.cu</c>'s
+/// file header documented as worth ~1% / ~5e-3 abs on plain (no-sink) attention output when the
+/// two sides' softmax implementations disagree.
+/// <b>#501 removed <c>fast_exp_neg</c> from the CUDA kernel</b>, so the mismatch this tolerance
+/// was calibrated around no longer exists and the bound below is expected to be far looser than
+/// needed. It is deliberately left untouched here: re-run this test on CUDA hardware and
+/// re-baseline it downward from the observed peak, rather than trusting a number derived from a
+/// defect that is gone. Per Task 1's hand-off, the plan's guessed "~1e-6 expected" tolerance
 /// is not achievable here and was not fought — the tolerance below is calibrated from what was
 /// actually observed on the first real run: <c>maxAbs=1.1829E-02</c> (idx 78, expected 0.190795,
 /// actual 0.202624; <c>maxRel</c> is dominated by a handful of near-zero-expected elements and is

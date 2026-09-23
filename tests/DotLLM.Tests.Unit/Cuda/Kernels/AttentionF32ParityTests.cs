@@ -12,18 +12,20 @@ namespace DotLLM.Tests.Unit.Cuda.Kernels;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Both sides use the fast softmax (CUDA kernel: <c>fast_exp_neg</c>; CPU:
-/// <see cref="Softmax.ExecuteFast"/>). The CPU path already wires
-/// <see cref="Softmax.ExecuteFast"/> into <see cref="Attention.Execute"/>, so the parity
-/// tolerance here is tight (matched-approximation drift only).
+/// Both sides use precise exp since #501 (the CUDA kernel's <c>fast_exp_neg</c> and the CPU's
+/// Schraudolph path in <see cref="FastMath"/> were removed together). Before #501 both used the
+/// matching approximation, and the tolerance below was set for matched-approximation drift; it
+/// now covers reduction-order drift alone and is a candidate for tightening.
 /// </para>
 /// <para>
-/// Trap-the-bug verification for softmax precision drift: if the CUDA side were swapped
-/// to precise <c>expf</c> while the CPU stays on the fast polynomial, max-abs-diff
-/// jumps above ~5e-3 (well outside the parity tolerance below) for random softmax
-/// inputs. Empirically verified by temporarily switching the CPU oracle to
-/// <see cref="Attention.ExecuteScalar"/> (precise softmax) — the parity assertion fails
-/// with maxAbsDiff &gt; 5e-3. Restored to <see cref="Attention.Execute"/> before commit.
+/// <b>Historical trap-the-bug verification, no longer reproducible (#501).</b> It read: if the
+/// CUDA side were swapped to precise <c>expf</c> while the CPU stays on the fast polynomial,
+/// max-abs-diff jumps above ~5e-3 — empirically verified by temporarily switching the CPU oracle
+/// to <see cref="Attention.ExecuteScalar"/> (precise softmax), which failed the assertion with
+/// maxAbsDiff &gt; 5e-3. #501 made precise exp the default on both sides, so that mutation is now
+/// a no-op. A replacement discriminator, if one is wanted, is to run with
+/// <c>DOTLLM_FAST_EXP=1</c>, which restores the bit trick on the CPU only (CUDA has no such
+/// lever — its PTX is precompiled) and should reopen the same ~5e-3 gap.
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
@@ -56,16 +58,22 @@ public sealed class AttentionF32ParityTests : IDisposable
         float[] v = CudaKernelTestHarness.RandomF32(rng, seqKv * NumKvHeads * HeadDim, scale: 1.0f);
 
         float[] cpuOutput = new float[seqQ * NumHeads * HeadDim];
-        // Empirically verified that swapping this to Attention.ExecuteScalar (which uses
-        // precise expf via Softmax.ExecuteScalar) trips the assertion at maxAbs ~1.5e-2
-        // on 57/128 elements — well outside the 5e-3 tolerance. The current code path
-        // matches CUDA's fast_exp_neg implementation.
+        // STALE SINCE #501 — kept for provenance, do not act on it as written. It used to
+        // read: "swapping this to Attention.ExecuteScalar (precise expf via
+        // Softmax.ExecuteScalar) trips the assertion at maxAbs ~1.5e-2 on 57/128 elements,
+        // well outside the 5e-3 tolerance; the current code path matches CUDA's
+        // fast_exp_neg." That was a real measurement of the Schraudolph-vs-precise gap.
+        // #501 removed the approximation from BOTH sides, so Attention.Execute and
+        // Attention.ExecuteScalar now use the same precise exp as the CUDA kernel and the
+        // swap no longer discriminates. The 5e-3 tolerance below is therefore calibrated
+        // around a difference that no longer exists — re-run on CUDA hardware and
+        // re-baseline it downward. Left unwidened and untightened here on purpose.
         Attention.Execute(q, k, v, cpuOutput, seqQ, seqKv, NumHeads, NumKvHeads, HeadDim, posOffset);
 
         float[] gpuOutput = RunGpuAttention(q, k, v, seqQ, seqKv, posOffset);
 
-        // FastExp polynomial bound + reduction-order differences leave us a few e-3 of
-        // headroom; tighter than this and benign FP nondeterminism trips the test.
+        // Originally: FastExp polynomial bound + reduction-order differences leave us a few
+        // e-3 of headroom. Since #501 only the reduction-order term remains (see above).
         CudaKernelTestHarness.AssertClose("AttentionF32-decode", cpuOutput, gpuOutput,
                                           absoluteTolerance: 5e-3f, relativeTolerance: 5e-3f);
     }

@@ -317,10 +317,11 @@ __device__ __forceinline__ void attention_f16_body(
     // sink logit per query head (mirrors the CPU reference and attention_f32.cu).
     // nullptr => bit-identical to the pre-#365 kernel (no rescale, no added term).
     //
-    // Uses expf, matching every other exp in this kernel. (attention_f32.cu's twin
-    // epilogue uses its file-local Schraudolph fast_exp_neg because that file's
-    // tile loop does too — mixing exp flavours within one softmax would make the
-    // sink term inconsistent with the tile terms it is normalised against.)
+    // Uses expf, matching every other exp in this kernel — and, since #501, every exp
+    // in attention_f32.cu's twin epilogue too (that file used to carry a file-local
+    // Schraudolph fast_exp_neg; mixing exp flavours within one softmax would make the
+    // sink term inconsistent with the tile terms it is normalised against, so it was
+    // all-or-nothing per file, and it is now uniformly precise in both).
     if (sinks != nullptr)
     {
         float sink = sinks[hq];

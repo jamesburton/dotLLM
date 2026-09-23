@@ -871,9 +871,10 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
     since the kernel can't engage there), +0.30% post-gate. **Recommendation: #183 stays opt-in/
     default-OFF** — the fastest kernel found here is not a safe default despite the win being real.
   - **#226/#227: tried fp64 accumulation in the cross-split combine step to reduce the
-    reassociation error — no improvement, clean negative result.** Root cause is *not* `fast_exp_neg`
-    (this file's header already documents why precise `expf` was rejected — CPU/GPU parity, both
-    the baseline and split-KV kernels already use the same approximation identically) and *not* the
+    reassociation error — no improvement, clean negative result.** Root cause is *not* the softmax
+    exponential (at the time that was the Schraudolph `fast_exp_neg`, used identically by both the
+    baseline and split-KV kernels; #501 replaced it with precise `expf` in all of them at once, so
+    the "identical in both" premise is unchanged) and *not* the
     final 4-way merge arithmetic: the double-precision combine variant (`attention_f32_split_kv_hp`,
     opt-in `DOTLLM_ATTN_SPLIT_KV_HP=1`, PR #227 open/not merged) diverges at the *identical* step
     225 with an essentially identical margin and perplexity delta. The reassociation error is
