@@ -61,14 +61,14 @@
 //     for the single-warp case; here it is genuinely 8-way parallel.
 // This QK/PV split is intentionally simple (no cross-warp reduction) to keep the new-bug
 // surface small: each warp's per-phase math is byte-for-byte the same computation v1already
-// validated (ldmatrix/mma addressing, fast_exp_neg/expf split), just distributed across more
+// validated (ldmatrix/mma addressing, softmax exponentials), just distributed across more
 // warps/threads rather than reinvented. A further QK-side win (splitting the K-dimension
 // across more warps with a small reduction) is a plausible follow-up, not attempted here --
 // QK and PV have equal total mma-instruction counts per tile (32 each), so this leaves QK
 // somewhat less parallelized (2-way) than PV (8-way); documented, not hidden.
 //
 // ─── Combine phase: ported verbatim from attention_f32_gqa_split_kv ───────────────────────
-// The cross-split combine (grid.sync() + fast_exp_neg-reweighted merge of partial_max/
+// The cross-split combine (grid.sync() + exp-reweighted merge of partial_max/
 // partial_sum/partial_out, kv_split==1 fast path) is copied unchanged from that kernel's
 // already-proven-correct implementation (attention_f32.cu, issues #197/#198), just applied
 // per (hq = hkv*group+g) the same way. This is deliberate de-risking: the combine algebra is
@@ -77,12 +77,19 @@
 //
 // ─── Precision ──────────────────────────────────────────────────────────────────────────
 // Reuses v1's hard-won precision groundwork verbatim: FP16 Q/K/V, FP32 mma accumulator
-// (hardware property of mma.sync.aligned.m16n8k16...f32.f16.f16.f32, not a choice),
-// fast_exp_neg for per-key softmax weights, PRECISE expf (not fast_exp_neg) for the
-// cross-KV-tile online-softmax correction factor -- v1 found and fixed a real bug here
-// (fast_exp_neg's ~1% approximation error compounds geometrically across KV_TILE=16's many
-// more rescale events than attention_f32's TILE_KV=256 ever exercises). This kernel's KV_TILE
-// is unchanged (still 16, still mma.sync.m16n8k16-dictated) so the SAME fix applies --
+// (hardware property of mma.sync.aligned.m16n8k16...f32.f16.f16.f32, not a choice), and
+// PRECISE expf for EVERY softmax exponential -- both the per-key P weights and the
+// cross-KV-tile online-softmax correction factor.
+//
+// Historically only the correction factor was precise: the per-key weights used the
+// Schraudolph bit trick (`fast_exp_neg`), and v1 found and fixed a real bug by making the
+// correction precise (the ~1% approximation error compounds geometrically across KV_TILE=16's
+// many more rescale events than attention_f32's TILE_KV=256 ever exercises). #501 removed the
+// approximation from the per-key side as well -- it does not compound there, but it does not
+// cancel under normalization either, and it cost +1.71% perplexity on Q3_K Llama-3.2-1B on the
+// CPU path that this kernel was mirroring. So the split v1 discovered is now moot: there is
+// one exp flavour, and it is the accurate one. This kernel's KV_TILE is unchanged (still 16,
+// still mma.sync.m16n8k16-dictated), so v1's finding remains satisfied a fortiori --
 // re-verified (not just assumed) against the CPU oracle and the F32 GPU baseline in
 // CudaAttentionMmaDecodeGqaSplitTests.cs, since the new multi-warp PV split and cross-split
 // combine are each a new source of reassociated float summation that could in principle
@@ -106,19 +113,8 @@
 #define NUM_WARPS 8               // blockDim = NUM_WARPS*32 = 256, matches this project's BlockSize convention.
 #define PV_CHUNKS_PER_WARP (HEAD_DIM / 8 / NUM_WARPS)   // 256/8/8 = 4
 
-// Schraudolph fast-exp constants (mirror FastMath.cs, attention_f32.cu, and v1's decode
-// kernel). See the file header above for the precise-expf-for-cross-tile-correction /
-// fast_exp_neg-for-per-key-P split this project found necessary at KV_TILE=16.
-#define FASTEXP_C0 12102203.0f
-#define FASTEXP_C1 1064866805.0f
-#define FASTEXP_MIN_CLAMP -87.3f
-
-__device__ __forceinline__ float fast_exp_neg(float x)
-{
-    x = fmaxf(x, FASTEXP_MIN_CLAMP);
-    int bits = __float2int_rz(fmaf(x, FASTEXP_C0, FASTEXP_C1));
-    return __int_as_float(bits);
-}
+// (#501 removed the Schraudolph `fast_exp_neg` helper that used to live here — see the
+// Precision section of the file header. Every exponential in this kernel is now `expf`.)
 
 // ── PTX helpers -- duplicated verbatim from attention_flash_mma.cu / v1's decode kernel ───
 // (see attention_flash_mma.cu's header for the fragment-layout notes; unchanged here).
@@ -315,9 +311,9 @@ extern "C" __global__ void __launch_bounds__(NUM_WARPS * 32) attention_flash_mma
                 if (sc > m_cur) m_cur = sc;
             }
 
-            // Precise expf here, NOT fast_exp_neg -- see file header (ported verbatim from
-            // v1's bring-up finding, KV_TILE=16 unchanged so the same compounding-error
-            // mechanism applies).
+            // Precise expf, as everywhere in this kernel since #501. Historically only this
+            // cross-tile correction was precise while the per-key P weights used a bit-trick
+            // approximation; see the Precision section of the file header.
             float correction = (m_prev == -FLT_MAX) ? 1.0f : expf(m_prev - m_cur);
             float l_cur = l_prev * correction;
 
@@ -326,7 +322,7 @@ extern "C" __global__ void __launch_bounds__(NUM_WARPS * 32) attention_flash_mma
                 float p = 0.0f;
                 if (j < gk_limit)
                 {
-                    p = fast_exp_neg(sScore[lane * KV_TILE + j] - m_cur);
+                    p = expf(sScore[lane * KV_TILE + j] - m_cur);
                     l_cur += p;
                 }
                 sP[lane * KV_TILE + j] = __float2half(p);
@@ -408,7 +404,7 @@ extern "C" __global__ void __launch_bounds__(NUM_WARPS * 32) attention_flash_mma
 
         if (kv_split == 1)
         {
-            // Trivial one-way combine: nothing to reassociate, skip fast_exp_neg(0) entirely
+            // Trivial one-way combine: nothing to reassociate, skip the expf(0) reweighting
             // so this path stays as close as possible to the un-split accumulation.
             if (threadIdx.x == 0)
             {
@@ -435,7 +431,7 @@ extern "C" __global__ void __launch_bounds__(NUM_WARPS * 32) attention_flash_mma
             {
                 float mi = partial_max[(size_t)hq * kv_split + i];
                 float li = partial_sum[(size_t)hq * kv_split + i];
-                float w = (mi > -FLT_MAX + 1.0f) ? fast_exp_neg(mi - m) : 0.0f;
+                float w = (mi > -FLT_MAX + 1.0f) ? expf(mi - m) : 0.0f;
                 l += li * w;
             }
             s_combined_max = m;
@@ -452,7 +448,7 @@ extern "C" __global__ void __launch_bounds__(NUM_WARPS * 32) attention_flash_mma
             for (int i = 0; i < kv_split; i++)
             {
                 float mi = partial_max[(size_t)hq * kv_split + i];
-                float w = (mi > -FLT_MAX + 1.0f) ? fast_exp_neg(mi - m) : 0.0f;
+                float w = (mi > -FLT_MAX + 1.0f) ? expf(mi - m) : 0.0f;
                 float oi = partial_out[((size_t)hq * kv_split + i) * HEAD_DIM + d];
                 o += oi * w;
             }

@@ -11,9 +11,10 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// Correctness + drift-characterization coverage for <see cref="CudaKernels.LaunchAttentionF32SplitKv"/>
 /// (the opt-in, default-OFF split-KV "Flash-Decoding" <c>attention_f32_split_kv</c> CUDA kernel,
 /// issue #183) against the CPU oracle, <see cref="Attention.Execute(float*, float*, float*, float*,
-/// int, int, int, int, int, int, ComputeThreadPool?, int?)"/> (which itself uses the same
-/// Schraudolph fast-exp approximation via <see cref="Softmax.ExecuteFast"/>/<see cref="FastMath"/>
-/// that <c>attention_f32.cu</c>'s <c>fast_exp_neg</c> mirrors).
+/// int, int, int, int, int, int, ComputeThreadPool?, int?)"/> (which, like the CUDA kernel, uses
+/// precise exp since #501 — both sides previously shared the Schraudolph fast-exp approximation,
+/// the CPU via <see cref="Softmax.ExecuteFast"/>/<see cref="FastMath"/> and CUDA via
+/// <c>attention_f32.cu</c>'s <c>fast_exp_neg</c>, and both lost it in the same change).
 ///
 /// UNLIKE a bit-exact test, this uses a TOLERANCE comparison — splitting the KV dimension across
 /// blocks reassociates the online-softmax accumulation (independent partial (max, sum, out) per

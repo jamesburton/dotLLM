@@ -61,6 +61,11 @@ public static class FastMath
     /// the mixture materially. The cost scales with how damaged the model is — exactly the
     /// regime aggressive quantization exists to serve — so the approximation is kept only as an
     /// opt-in benchmarking lever.</para>
+    /// <para><b>This lever is CPU-only.</b> #501 also removed the mirrored <c>fast_exp_neg</c>
+    /// from the CUDA attention kernels, and those ship as precompiled PTX with no equivalent
+    /// switch. Setting <c>DOTLLM_FAST_EXP=1</c> therefore makes the CPU and CUDA backends diverge
+    /// by roughly the approximation's own error (~1%, ~5e-3 abs on attention output) — useful as
+    /// a deliberate discriminator, but do not run cross-backend parity with it set.</para>
     /// </remarks>
     internal static readonly bool UseFastExp =
         Environment.GetEnvironmentVariable("DOTLLM_FAST_EXP") == "1";
