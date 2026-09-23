@@ -1012,6 +1012,12 @@ internal sealed class VulkanWeights : IDisposable
                 srcBuf = AllocateAndUploadPacked(device, staging, weights.TokenEmbedWeight, qBytes);
             }
 
+            // #510: staging copies are now submitted without a per-chunk host wait, and
+            // separate vkQueueSubmit calls on one queue are not ordered against each
+            // other. This dequant dispatch READS srcBuf, so drain the staging queue
+            // first — otherwise the kernel can race the copy that fills its input.
+            staging.WaitAll();
+
             if (qt == QuantizationType.Q4_K)
             {
                 using var kernel = Q4KDequantF32Kernel.Create(device, spvDir!);
@@ -1109,12 +1115,9 @@ internal sealed class VulkanWeights : IDisposable
         var buf = device.AllocateDeviceLocal(padded);
         try
         {
-            staging.UploadBytes(srcPtr, bytes, buf);
-            if (padded != bytes)
-            {
-                uint zero = 0;
-                staging.UploadBytes((nint)(&zero), padded - bytes, buf, bytes);
-            }
+            // #510: the 0-3 pad bytes ride in the LAST data chunk's copy region rather
+            // than costing their own command buffer, submit and full host fence stall.
+            staging.UploadBytes(srcPtr, bytes, buf, dstOffset: 0, zeroTailBytes: padded - bytes);
         }
         catch
         {

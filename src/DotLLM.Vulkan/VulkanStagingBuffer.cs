@@ -16,13 +16,41 @@ namespace DotLLM.Vulkan;
 /// <c>VK_ERROR_MEMORY_MAP_FAILED</c> load flake under memory pressure.
 /// </para>
 /// <para>
-/// This type caps the staging allocation at <see cref="MaxChunkBytes"/>
+/// This type caps total staging host commit at <see cref="MaxChunkBytes"/>
 /// (<c>DOTLLM_VULKAN_STAGING_MB</c>, default 64 MiB) and maps it <b>once</b> for its
-/// lifetime — uploads larger than the capacity stream through it in bounded chunks
-/// (<see cref="UploadBytes"/> / <see cref="UploadRows"/>), each chunk fence-waited by
-/// <see cref="Flush"/> before the mapped region is reused. Host commit attributable to
+/// lifetime — uploads larger than a slot stream through it in bounded chunks
+/// (<see cref="UploadBytes"/> / <see cref="UploadRows"/>). Host commit attributable to
 /// staging is therefore bounded by the cap for the whole load, and there are zero
 /// re-maps after construction.
+/// </para>
+/// <para>
+/// <b>Double buffering (issue #510).</b> The cap is split across
+/// <see cref="SlotCount"/> = 2 slots, each with its own command buffer and fence.
+/// <see cref="Flush"/> submits the current slot <i>without waiting</i> and rotates to
+/// the other, so the host fills slot B while slot A's copy is in flight; a slot is
+/// fence-waited only when it comes round again, and <see cref="WaitAll"/> /
+/// <see cref="Dispose"/> drain the rest. Before #510 every chunk was submit +
+/// <c>vkWaitForFences</c> with nothing in flight across the wait.
+/// </para>
+/// <para>
+/// <b>Consequence for <see cref="Capacity"/>.</b> Because the cap is now split two
+/// ways, the per-call writable window is half what it was — 32 MiB at the default cap
+/// rather than 64 MiB. That doubles the chunk count for single tensors above 32 MiB
+/// (each chunk is now overlapped, so this is not a stall), and moves the
+/// <c>fpBytes &lt;= staging.Capacity</c> I2_S whole-tensor dequant branch in
+/// <c>VulkanWeights.UploadMatrix</c> into its else arm slightly earlier. Raise
+/// <c>DOTLLM_VULKAN_STAGING_MB</c> to restore the old window.
+/// </para>
+/// <para>
+/// <b>Synchronization contract.</b> After <see cref="Flush"/> or
+/// <see cref="UploadBytes"/> returns, the copy may still be executing on the GPU.
+/// Separate <c>vkQueueSubmit</c> calls on one queue are NOT ordered against each other
+/// without a barrier or fence, so any consumer of the destination buffer — a compute
+/// dispatch, a <c>Download</c>, or disposing the destination — must be preceded by
+/// <see cref="WaitAll"/>. <see cref="Dispose"/> calls it, so the normal
+/// <c>using var staging = VulkanStagingBuffer.Create(...)</c> loader shape needs no
+/// extra call; only a loader that runs a kernel over just-staged bytes before the
+/// staging goes out of scope does (see <c>VulkanWeights.UploadTokenEmbedding</c>).
 /// </para>
 /// </remarks>
 internal sealed unsafe class VulkanStagingBuffer : IDisposable
@@ -30,8 +58,12 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
     /// <summary>Default staging cap: 64 MiB (chosen by the #147 sweep of 32/64/128/256 MiB).</summary>
     public const long DefaultMaxChunkBytes = 64L * 1024 * 1024;
 
+    /// <summary>Number of rotating staging slots (issue #510 double buffering).</summary>
+    public const int SlotCount = 2;
+
     /// <summary>
-    /// Staging cap in bytes. Override with <c>DOTLLM_VULKAN_STAGING_MB</c> (1..4096).
+    /// Total staging cap in bytes, across all slots. Override with
+    /// <c>DOTLLM_VULKAN_STAGING_MB</c> (1..4096).
     /// </summary>
     public static long MaxChunkBytes { get; } = ParseChunkBytes();
 
@@ -43,68 +75,165 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
             : DefaultMaxChunkBytes;
     }
 
+    /// <summary>One rotating slot: mapped host memory + the command buffer/fence that drains it.</summary>
+    private sealed class Slot
+    {
+        public required VulkanDevice.Buffer Buffer { get; init; }
+        public required nint Mapped { get; init; }
+        public required nint CommandBuffer { get; init; }
+        public required nint Fence { get; init; }
+        public bool InFlight { get; set; }
+    }
+
     private readonly VulkanDevice _device;
-    private readonly VulkanDevice.Buffer _buffer;
+    private readonly Slot[] _slots;
+    private int _current;
     private bool _disposed;
 
-    /// <summary>Persistent host pointer to the mapped staging memory (valid until <see cref="Dispose"/>).</summary>
-    public nint Mapped { get; }
+    /// <summary>Persistent host pointer to the CURRENT slot's mapped memory. Re-read it after every
+    /// <see cref="Flush"/> — the slot rotates.</summary>
+    public nint Mapped => _slots[_current].Mapped;
 
-    /// <summary>Usable staging bytes — <c>min(neededBytes, MaxChunkBytes)</c> at creation.</summary>
+    /// <summary>Usable staging bytes per call — <c>min(neededBytes, MaxChunkBytes / SlotCount)</c>.</summary>
     public long Capacity { get; }
 
-    private VulkanStagingBuffer(VulkanDevice device, VulkanDevice.Buffer buffer, nint mapped, long capacity)
+    /// <summary>Diagnostic (issue #510): total <c>vkQueueSubmit</c> calls this staging buffer has made.</summary>
+    public long Submits { get; private set; }
+
+    /// <summary>Diagnostic (issue #510): total host <c>vkWaitForFences</c> stalls. Before #510 this
+    /// equalled <see cref="Submits"/> by construction.</summary>
+    public long FenceWaits { get; private set; }
+
+    private VulkanStagingBuffer(VulkanDevice device, Slot[] slots, long capacity)
     {
         _device = device;
-        _buffer = buffer;
-        Mapped = mapped;
+        _slots = slots;
         Capacity = capacity;
     }
 
     /// <summary>
-    /// Allocates a host-visible staging buffer of <c>min(neededBytes, MaxChunkBytes)</c>
-    /// bytes and maps it once. <paramref name="neededBytes"/> is the largest single
-    /// upload the caller will push through — smaller models get a smaller buffer.
+    /// Allocates <see cref="SlotCount"/> host-visible staging slots of
+    /// <c>min(neededBytes, MaxChunkBytes / SlotCount)</c> bytes each and maps them once.
+    /// <paramref name="neededBytes"/> is the largest single upload the caller will push
+    /// through — smaller models get smaller slots.
     /// </summary>
     public static VulkanStagingBuffer Create(VulkanDevice device, long neededBytes)
     {
-        long capacity = Math.Max(4096, Math.Min(neededBytes, MaxChunkBytes));
-        var buffer = device.Allocate(capacity);
-        nint mapped;
+        long capacity = Math.Max(4096, Math.Min(neededBytes, MaxChunkBytes / SlotCount));
+        var slots = new Slot[SlotCount];
+        int built = 0;
         try
         {
-            mapped = device.MapMemoryWithRetry(
-                buffer.Memory, 0, (ulong)capacity, "vkMapMemory VulkanStagingBuffer (persistent)");
+            for (; built < SlotCount; built++)
+            {
+                var buffer = device.Allocate(capacity);
+                nint mapped;
+                nint cmd = 0;
+                nint fence = 0;
+                try
+                {
+                    mapped = device.MapMemoryWithRetry(
+                        buffer.Memory, 0, (ulong)capacity, "vkMapMemory VulkanStagingBuffer (persistent)");
+                    cmd = device.AllocateTransferCommandBuffer();
+                    fence = device.CreateUnsignalledFence();
+                }
+                catch
+                {
+                    device.FreeTransferCommandBuffer(cmd);
+                    device.DestroyOwnedFence(fence);
+                    buffer.Dispose();
+                    throw;
+                }
+                slots[built] = new Slot
+                {
+                    Buffer = buffer,
+                    Mapped = mapped,
+                    CommandBuffer = cmd,
+                    Fence = fence,
+                };
+            }
         }
         catch
         {
-            buffer.Dispose();
+            for (int i = 0; i < built; i++) DestroySlot(device, slots[i]);
             throw;
         }
-        return new VulkanStagingBuffer(device, buffer, mapped, capacity);
+        return new VulkanStagingBuffer(device, slots, capacity);
+    }
+
+    private static void DestroySlot(VulkanDevice device, Slot slot)
+    {
+        VulkanApi.vkUnmapMemory(device.Handle, slot.Buffer.Memory);
+        device.FreeTransferCommandBuffer(slot.CommandBuffer);
+        device.DestroyOwnedFence(slot.Fence);
+        slot.Buffer.Dispose();
     }
 
     /// <summary>
-    /// Synchronously copies the first <paramref name="bytes"/> bytes of the staging
-    /// buffer into <paramref name="dst"/> at <paramref name="dstOffset"/> (fence-waited —
-    /// the mapped region is reusable on return).
+    /// Queues a copy of the first <paramref name="bytes"/> bytes of the CURRENT staging
+    /// slot into <paramref name="dst"/> at <paramref name="dstOffset"/> and rotates to
+    /// the next slot. <b>Does not wait</b> — see the synchronization contract on the
+    /// type. On return, <see cref="Mapped"/> points at a slot that is safe to write.
     /// </summary>
     public void Flush(VulkanDevice.Buffer dst, long dstOffset, long bytes)
-        => _device.CopyBufferRangeSynchronous(_buffer, dst, srcOffset: 0, dstOffset: (ulong)dstOffset, size: (ulong)bytes);
+    {
+        if (bytes <= 0) return;
+        var slot = _slots[_current];
+        _device.SubmitCopyDeferred(
+            slot.CommandBuffer, slot.Fence, slot.Buffer, dst,
+            srcOffset: 0, dstOffset: (ulong)dstOffset, size: (ulong)bytes);
+        slot.InFlight = true;
+        Submits++;
+
+        _current = (_current + 1) % SlotCount;
+        var next = _slots[_current];
+        if (next.InFlight)
+        {
+            _device.WaitAndResetFence(next.Fence);
+            next.InFlight = false;
+            FenceWaits++;
+        }
+    }
+
+    /// <summary>
+    /// Host-waits for every queued copy to complete. Required before any consumer of a
+    /// destination buffer (compute dispatch, download, disposal) and called by
+    /// <see cref="Dispose"/>.
+    /// </summary>
+    public void WaitAll()
+    {
+        for (int i = 0; i < _slots.Length; i++)
+        {
+            if (!_slots[i].InFlight) continue;
+            _device.WaitAndResetFence(_slots[i].Fence);
+            _slots[i].InFlight = false;
+            FenceWaits++;
+        }
+    }
 
     /// <summary>
     /// Streams <paramref name="bytes"/> raw bytes from <paramref name="src"/> into
     /// <paramref name="dst"/> at <paramref name="dstOffset"/>, in chunks of at most
-    /// <see cref="Capacity"/> bytes.
+    /// <see cref="Capacity"/> bytes, optionally followed by
+    /// <paramref name="zeroTailBytes"/> zero bytes.
     /// </summary>
-    public void UploadBytes(nint src, long bytes, VulkanDevice.Buffer dst, long dstOffset = 0)
+    /// <remarks>
+    /// The zero tail is written into the same staging slot directly after the final
+    /// data chunk and copied in the SAME region (issue #510) — the packed-SSBO
+    /// round-up pad of every Q8_0 / Q6_K tensor with an odd block count used to cost a
+    /// separate command buffer, submit and full host stall to move ≤ 3 bytes.
+    /// </remarks>
+    public void UploadBytes(nint src, long bytes, VulkanDevice.Buffer dst, long dstOffset = 0, long zeroTailBytes = 0)
     {
-        for (long off = 0; off < bytes;)
+        var plan = new VulkanStagingChunkPlan(bytes, zeroTailBytes, Capacity);
+        while (plan.MoveNext())
         {
-            long chunk = Math.Min(Capacity, bytes - off);
-            System.Buffer.MemoryCopy((void*)(src + off), (void*)Mapped, Capacity, chunk);
-            Flush(dst, dstOffset + off, chunk);
-            off += chunk;
+            nint mapped = Mapped;
+            if (plan.Length > 0)
+                System.Buffer.MemoryCopy((void*)(src + (nint)plan.SrcOffset), (void*)mapped, Capacity, plan.Length);
+            if (plan.ZeroTail > 0)
+                new Span<byte>((void*)(mapped + (nint)plan.Length), (int)plan.ZeroTail).Clear();
+            Flush(dst, dstOffset + plan.SrcOffset, plan.Length + plan.ZeroTail);
         }
     }
 
@@ -157,7 +286,8 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        VulkanApi.vkUnmapMemory(_device.Handle, _buffer.Memory);
-        _buffer.Dispose();
+        WaitAll();
+        for (int i = 0; i < _slots.Length; i++)
+            DestroySlot(_device, _slots[i]);
     }
 }
