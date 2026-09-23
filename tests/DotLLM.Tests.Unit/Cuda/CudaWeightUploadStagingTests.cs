@@ -42,65 +42,81 @@ public sealed class CudaWeightUploadStagingTests
 
     [SkippableTheory]
     [MemberData(nameof(Sizes))]
-    public unsafe void StagedUpload_PutsByteIdenticalContentOnDevice(long bytes)
+    public unsafe void BothArms_PutByteIdenticalContentOnDevice(long bytes)
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
         using var ctx = CudaContext.Create(0);
 
+        int n = checked((int)bytes);
         byte* src = (byte*)NativeMemory.AlignedAlloc((nuint)bytes, 64);
-        byte* back = (byte*)NativeMemory.AlignedAlloc((nuint)bytes, 64);
-        nint dev = 0;
+        byte* direct = (byte*)NativeMemory.AlignedAlloc((nuint)bytes, 64);
+        byte* staged = (byte*)NativeMemory.AlignedAlloc((nuint)bytes, 64);
+        nint devDirect = 0, devStaged = 0;
         try
         {
             var rng = new Random(509);
             for (long i = 0; i < bytes; i++) src[i] = (byte)rng.Next(256);
-            new Span<byte>(back, checked((int)bytes)).Clear();
+            new Span<byte>(direct, n).Clear();
+            new Span<byte>(staged, n).Clear();
 
-            CudaDriverApi.cuMemAlloc_v2(out dev, (nuint)bytes).ThrowOnError();
-            CudaDriverApi.cuMemsetD8_v2(dev, 0xCD, (nuint)bytes).ThrowOnError();
+            // ── Arm A: the DEFAULT path (opt-in off) — one synchronous pageable copy. ──
+            CudaDriverApi.cuMemAlloc_v2(out devDirect, (nuint)bytes).ThrowOnError();
+            CudaDriverApi.cuMemsetD8_v2(devDirect, 0xCD, (nuint)bytes).ThrowOnError();
+            using (var offScope = OpenScope(enabled: false))
+            {
+                Assert.False(offScope.ShouldStage(bytes), "the opt-in is off, so nothing may stage");
+                CudaDriverApi.cuMemcpyHtoD_v2(devDirect, (nint)src, (nuint)bytes).ThrowOnError();
+                Assert.Equal(0, offScope.StagedChunks);
+            }
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)direct, devDirect, (nuint)bytes).ThrowOnError();
 
+            // ── Arm B: the OPT-IN pinned, chunked, double-buffered path. ──
             long stagedChunks;
             long stagedBytes;
-            long? savedChunk = CudaWeightUploadStaging.ChunkBytesOverride;
-            long? savedMin = CudaWeightUploadStaging.MinStagedBytesOverride;
-            bool? savedEnabled = CudaWeightUploadStaging.EnabledOverride;
-            try
+            CudaDriverApi.cuMemAlloc_v2(out devStaged, (nuint)bytes).ThrowOnError();
+            CudaDriverApi.cuMemsetD8_v2(devStaged, 0xCD, (nuint)bytes).ThrowOnError();
+            using (var onScope = OpenScope(enabled: true))
             {
-                CudaWeightUploadStaging.ChunkBytesOverride = TestChunk;
-                CudaWeightUploadStaging.MinStagedBytesOverride = 0;   // force even a sub-chunk tensor through the loop
-                CudaWeightUploadStaging.EnabledOverride = true;
-
-                using var scope = CudaWeightUploadStaging.BeginScope();
-                Assert.True(scope.ShouldStage(bytes), "the override should force even a sub-chunk tensor to stage");
-                Assert.Equal(0, scope.Upload(dev, (nint)src, bytes));   // -1 would mean the pinned pair failed
-                stagedChunks = scope.StagedChunks;
-                stagedBytes = scope.StagedBytes;
+                Assert.True(onScope.ShouldStage(bytes), "the override should force even a sub-chunk tensor to stage");
+                Assert.Equal(0, onScope.Upload(devStaged, (nint)src, bytes));  // -1 would mean the pinned pair failed
+                stagedChunks = onScope.StagedChunks;
+                stagedBytes = onScope.StagedBytes;
             }
-            finally
-            {
-                CudaWeightUploadStaging.ChunkBytesOverride = savedChunk;
-                CudaWeightUploadStaging.MinStagedBytesOverride = savedMin;
-                CudaWeightUploadStaging.EnabledOverride = savedEnabled;
-            }
-
-            CudaDriverApi.cuMemcpyDtoH_v2((nint)back, dev, (nuint)bytes).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)staged, devStaged, (nuint)bytes).ThrowOnError();
 
             Assert.Equal(bytes, stagedBytes);
             Assert.Equal((bytes + TestChunk - 1) / TestChunk, stagedChunks);
+
+            var source = new ReadOnlySpan<byte>(src, n);
+            Assert.True(source.SequenceEqual(new ReadOnlySpan<byte>(direct, n)),
+                $"default arm differs from the host source for {bytes} bytes " +
+                $"(first mismatch at {FirstMismatch(src, direct, bytes)})");
+            Assert.True(source.SequenceEqual(new ReadOnlySpan<byte>(staged, n)),
+                $"staged arm differs from the host source for {bytes} bytes " +
+                $"(first mismatch at {FirstMismatch(src, staged, bytes)})");
             Assert.True(
-                new ReadOnlySpan<byte>(src, checked((int)bytes))
-                    .SequenceEqual(new ReadOnlySpan<byte>(back, checked((int)bytes))),
-                $"device contents differ from the host source for {bytes} bytes " +
-                $"(first mismatch at {FirstMismatch(src, back, bytes)})");
+                new ReadOnlySpan<byte>(direct, n).SequenceEqual(new ReadOnlySpan<byte>(staged, n)),
+                $"the two arms disagree for {bytes} bytes " +
+                $"(first mismatch at {FirstMismatch(direct, staged, bytes)})");
         }
         finally
         {
-            if (dev != 0) CudaDriverApi.cuMemFree_v2(dev);
+            if (devDirect != 0) CudaDriverApi.cuMemFree_v2(devDirect);
+            if (devStaged != 0) CudaDriverApi.cuMemFree_v2(devStaged);
             NativeMemory.AlignedFree(src);
-            NativeMemory.AlignedFree(back);
+            NativeMemory.AlignedFree(direct);
+            NativeMemory.AlignedFree(staged);
         }
     }
+
+    /// <summary>
+    /// Opens a scope with the test chunk size and a zero threshold (so even a sub-chunk tensor
+    /// exercises the chunking loop) and the given opt-in state. The static overrides are restored
+    /// by <see cref="OverrideScope.Dispose"/> so a failing case cannot leak 64 KiB chunks into a
+    /// sibling test.
+    /// </summary>
+    private static OverrideScope OpenScope(bool enabled) => new(TestChunk, minStagedBytes: 0, enabled);
 
     /// <summary>
     /// The default threshold is exactly one chunk: at or below it there is no second chunk to
@@ -133,36 +149,33 @@ public sealed class CudaWeightUploadStagingTests
     }
 
     /// <summary>
-    /// The <c>DOTLLM_CUDA_PINNED_UPLOAD=0</c> escape hatch must genuinely disable the path, and the
-    /// counters must show it — that is what makes the orchestrator's A/B provably an A/B rather
-    /// than two runs of the same code.
+    /// The path is <b>opt-in</b>: with no <c>DOTLLM_CUDA_PINNED_UPLOAD</c> set, nothing stages, no
+    /// matter how large the tensor. Read against the real environment (no override), so this fails
+    /// if the switch is ever silently flipped to default-on without a measurement.
     /// </summary>
-    [Fact]
-    public void EscapeHatch_DisablesStaging_AndTheCountersSaySo()
+    [SkippableFact]
+    public void OptIn_IsOffByDefault()
     {
-        bool? enabled = CudaWeightUploadStaging.EnabledOverride;
-        long? chunk = CudaWeightUploadStaging.ChunkBytesOverride;
-        long? min = CudaWeightUploadStaging.MinStagedBytesOverride;
+        Skip.If(Environment.GetEnvironmentVariable(CudaWeightUploadStaging.EnabledEnvVar) is not null,
+            $"{CudaWeightUploadStaging.EnabledEnvVar} is set in this environment");
+        bool? saved = CudaWeightUploadStaging.EnabledOverride;
         try
         {
-            CudaWeightUploadStaging.ChunkBytesOverride = TestChunk;
-            CudaWeightUploadStaging.MinStagedBytesOverride = 0;
-            CudaWeightUploadStaging.EnabledOverride = false;
+            CudaWeightUploadStaging.EnabledOverride = null;   // fall through to the env-var read
+            Assert.False(CudaWeightUploadStaging.Enabled);
 
             using var scope = CudaWeightUploadStaging.BeginScope();
-            Assert.False(scope.ShouldStage(100L * 1024 * 1024));
+            Assert.False(scope.ShouldStage(1024L * 1024 * 1024));
             Assert.Equal(0, scope.StagedBytes);
             Assert.Equal(0, scope.StagedChunks);
 
-            // The direct counter is what the benchmark reads to confirm the legacy path ran.
+            // The direct counter is what a benchmark reads to confirm the legacy path ran.
             scope.RecordDirect(4096);
             Assert.Equal(4096, scope.DirectBytes);
         }
         finally
         {
-            CudaWeightUploadStaging.EnabledOverride = enabled;
-            CudaWeightUploadStaging.ChunkBytesOverride = chunk;
-            CudaWeightUploadStaging.MinStagedBytesOverride = min;
+            CudaWeightUploadStaging.EnabledOverride = saved;
         }
     }
 
@@ -188,5 +201,44 @@ public sealed class CudaWeightUploadStagingTests
         for (long i = 0; i < n; i++)
             if (a[i] != b[i]) return $"offset {i}: expected 0x{a[i]:X2}, got 0x{b[i]:X2}";
         return "none";
+    }
+
+    /// <summary>
+    /// A <see cref="CudaWeightUploadStaging"/> scope that also sets and restores the three static
+    /// test overrides around it.
+    /// </summary>
+    private sealed class OverrideScope : IDisposable
+    {
+        private readonly CudaWeightUploadStaging _inner;
+        private readonly long? _savedChunk;
+        private readonly long? _savedMin;
+        private readonly bool? _savedEnabled;
+
+        public OverrideScope(long chunkBytes, long minStagedBytes, bool enabled)
+        {
+            _savedChunk = CudaWeightUploadStaging.ChunkBytesOverride;
+            _savedMin = CudaWeightUploadStaging.MinStagedBytesOverride;
+            _savedEnabled = CudaWeightUploadStaging.EnabledOverride;
+            CudaWeightUploadStaging.ChunkBytesOverride = chunkBytes;
+            CudaWeightUploadStaging.MinStagedBytesOverride = minStagedBytes;
+            CudaWeightUploadStaging.EnabledOverride = enabled;
+            _inner = CudaWeightUploadStaging.BeginScope();
+        }
+
+        public long StagedBytes => _inner.StagedBytes;
+
+        public long StagedChunks => _inner.StagedChunks;
+
+        public bool ShouldStage(long bytes) => _inner.ShouldStage(bytes);
+
+        public int Upload(nint devPtr, nint hostPtr, long bytes) => _inner.Upload(devPtr, hostPtr, bytes);
+
+        public void Dispose()
+        {
+            _inner.Dispose();
+            CudaWeightUploadStaging.ChunkBytesOverride = _savedChunk;
+            CudaWeightUploadStaging.MinStagedBytesOverride = _savedMin;
+            CudaWeightUploadStaging.EnabledOverride = _savedEnabled;
+        }
     }
 }

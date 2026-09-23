@@ -264,10 +264,12 @@ internal sealed class CudaWeights : IDisposable
         bool isHybrid = (firstLayer + layerCount) < config.NumLayers;
 
         // #509: pinned, chunked, double-buffered H2D staging for the large weight tensors.
-        // Opening the scope pins nothing — the 2 x 64 MiB chunk pair is allocated lazily by the
-        // first transfer big enough to benefit and freed deterministically when this scope is
-        // disposed, so a load that never stages (all-small tensors, or DOTLLM_CUDA_PINNED_UPLOAD=0)
-        // never page-locks a byte. Declared before the try so it unwinds after `allocs`.
+        // OPT-IN and OFF by default (DOTLLM_CUDA_PINNED_UPLOAD=1) because no available host can
+        // measure the benefit yet — see CudaWeightUploadStaging's remarks. Opening the scope pins
+        // nothing either way: the 2 x 64 MiB chunk pair is allocated lazily by the first transfer
+        // big enough to benefit and freed deterministically when this scope is disposed, so a load
+        // that never stages never page-locks a byte. Declared before the try so it unwinds after
+        // `allocs`.
         using var uploadStaging = CudaWeightUploadStaging.BeginScope();
 
         var allocs = new List<nint>();

@@ -48,8 +48,20 @@ namespace DotLLM.Cuda;
 /// attention sinks, the YaRN table — on the unchanged path.)
 /// </para>
 /// <para>
-/// <b>Escape hatches</b> (read once, <see cref="CudaSmallSGemvDispatch"/> convention):
-/// <c>DOTLLM_CUDA_PINNED_UPLOAD=0</c> forces the legacy synchronous path for every tensor;
+/// <b>This path is OPT-IN and OFF by default</b> — <c>DOTLLM_CUDA_PINNED_UPLOAD=1</c> turns it on;
+/// unset, every tensor takes the unchanged synchronous pageable copy. That is not doubt about the
+/// code: it is that <b>no machine currently available can measure the benefit</b>. The T5500 is
+/// PCIe Gen 2 with its models on a 10k mechanical disk (~0.15–0.2 GB/s), an order of magnitude
+/// below the link, so transfer-side work cannot move its number; the Framework box (RTX 3060,
+/// NVMe) is a contended daily driver with possible thermal throttling and is usable for
+/// <i>functional</i> validation only, not for timing. The project ships an unmeasured optimisation
+/// opt-in in exactly this situation (see #490's MMQ). <b>Flip the default on</b> when a clean
+/// before/after profile — file read separated from H2D transfer — has been taken on a quiet host
+/// with NVMe storage and a full-width PCIe Gen 3 (or better) link, per issue #509's acceptance
+/// criteria.
+/// </para>
+/// <para>
+/// <b>Knobs</b> (read once, <see cref="CudaSmallSGemvDispatch"/> convention):
 /// <c>DOTLLM_CUDA_PINNED_UPLOAD_CHUNK_MIB</c> overrides the chunk size in MiB (clamped to
 /// 1..1024). <see cref="TotalStagedBytes"/>, <see cref="TotalStagedChunks"/> and
 /// <see cref="TotalDirectBytes"/> are process-wide counters a benchmark reads <i>after</i> a load
@@ -61,7 +73,7 @@ public sealed class CudaWeightUploadStaging : IDisposable
     /// <summary>Default staging chunk size in bytes (64 MiB); the pair costs twice this.</summary>
     public const long DefaultChunkBytes = 64L * 1024 * 1024;
 
-    /// <summary>Environment variable that, when <c>0</c>, forces the legacy synchronous upload.</summary>
+    /// <summary>Environment variable that, when <c>1</c>, opts in to the pinned staged upload.</summary>
     public const string EnabledEnvVar = "DOTLLM_CUDA_PINNED_UPLOAD";
 
     /// <summary>Environment variable overriding the chunk size, in MiB (clamped to 1..1024).</summary>
@@ -73,8 +85,10 @@ public sealed class CudaWeightUploadStaging : IDisposable
     /// <summary><c>CU_STREAM_NON_BLOCKING</c> — must not serialise against the legacy default stream.</summary>
     private const uint StreamNonBlocking = 1;
 
+    // OPT-IN (`== "1"`, the CudaSmallSGemvDispatch MmqEnvVar convention for an unmeasured path)
+    // rather than the `!= "0"` form the measured-and-defaulted flags use. See the class remarks.
     private static readonly bool EnabledFromEnv =
-        Environment.GetEnvironmentVariable(EnabledEnvVar) != "0";
+        Environment.GetEnvironmentVariable(EnabledEnvVar) == "1";
 
     private static readonly long ChunkBytesFromEnv = ReadChunkBytes();
 
@@ -99,7 +113,11 @@ public sealed class CudaWeightUploadStaging : IDisposable
         _previous = previous;
     }
 
-    /// <summary>Whether staging is enabled at all (the <see cref="EnabledEnvVar"/> hatch).</summary>
+    /// <summary>
+    /// Whether the pinned staged path is opted in (<c>DOTLLM_CUDA_PINNED_UPLOAD=1</c>).
+    /// <b>False by default</b> — see the class remarks for why, and for what must be measured
+    /// before the default flips.
+    /// </summary>
     public static bool Enabled => EnabledOverride ?? EnabledFromEnv;
 
     /// <summary>Effective chunk size in bytes.</summary>
