@@ -24,7 +24,17 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// prefill + decode coverage that exercises <see cref="CudaNemotronHKvCache"/> and
 /// <see cref="CudaNemotronHSsmStateCache"/>, which the cacheless cases never touch.
 /// </summary>
+/// <remarks>
+/// Issue #484: this class MUST stay in <see cref="CudaCollection"/>. Two of its tests
+/// (<c>BuildFromPrebuiltWeights_BadPtxDir_ThrowsAndLeaksNoDeviceMemory</c> and
+/// <c>BuildFromPrebuiltWeights_MidLoadDeviceOom_FreesLedgerAndLeaksNoDeviceMemory</c>) assert on
+/// <c>cuMemGetInfo</c>, which is a <b>device-wide</b> reading. Left uncollected, xUnit gives the
+/// class its own collection and runs it in parallel with every other collection — any concurrent
+/// class allocating device buffers shows up as "free VRAM dropped by N MB", i.e. a phantom leak.
+/// This was the state the class was in when #484 was filed from a T5500 run.
+/// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaNemotronHTransformerModelForwardTests
 {
     private readonly ITestOutputHelper _output;
@@ -323,6 +333,11 @@ public sealed class CudaNemotronHTransformerModelForwardTests
     [SkippableFact]
     public void BuildFromPrebuiltWeights_BadPtxDir_ThrowsAndLeaksNoDeviceMemory()
     {
+        // #484: since CudaKernels.ResolveAndValidatePtxDirectory now runs BEFORE
+        // CudaContext.Create, this path allocates nothing at all — the DirectoryNotFoundException
+        // below is raised while the process still holds zero CUDA resources for this load. The
+        // VRAM assertion therefore no longer probes an unwind path; it pins the stronger property
+        // that a bad ptxDir never reaches the driver.
         Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
 
         var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Ffn };
@@ -376,13 +391,15 @@ public sealed class CudaNemotronHTransformerModelForwardTests
 
     /// <summary>
     /// Regression coverage for issue #383 review follow-up: the bogus-<c>ptxDir</c> test above
-    /// throws in <c>new CudaKernels(ptxDir)</c>, which runs BEFORE the first <c>cuMemAlloc</c> in
-    /// <c>BuildFromPrebuiltWeights</c> — so it only proves the context/stream/cublas/kernels
-    /// quartet is freed on failure. It never exercises the <c>allocs</c> ledger (the bulk of the
-    /// #383 diff): the reverse-order free of several real device buffers uploaded earlier in the
-    /// SAME failed load. This test forces a real <c>cuMemAlloc</c> failure partway through layer
-    /// 1's attention upload, after layer 0's full buffer set (and layer 1's own Q/K/V) are already
-    /// tracked in the ledger, and asserts they don't leak.
+    /// never reaches the <c>allocs</c> ledger (the bulk of the #383 diff) — the reverse-order free
+    /// of several real device buffers uploaded earlier in the SAME failed load. Since #484 it does
+    /// not reach <c>CudaContext.Create</c> either, which makes THIS test the only remaining
+    /// exerciser of <c>BuildFromPrebuiltWeights</c>'s catch block (teardown of the bare
+    /// context/stream/cuBLAS trio is covered directly by
+    /// <c>DotLLM.Tests.Integration.Cuda.CudaPrimitiveTeardownLeakTests</c>). It forces a real
+    /// <c>cuMemAlloc</c> failure partway through layer 1's attention upload, after layer 0's full
+    /// buffer set (and layer 1's own Q/K/V) are already tracked in the ledger, and asserts they
+    /// don't leak.
     /// </summary>
     /// <remarks>
     /// <para>

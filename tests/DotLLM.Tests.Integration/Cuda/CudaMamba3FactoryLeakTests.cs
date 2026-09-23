@@ -24,10 +24,21 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// has been allocated yet, so a BF16 checkpoint no longer reaches the leaking code path at all
 /// (this looks like it changed independently of #383; <c>UploadF32</c>'s own dtype guard is now
 /// dead code for every <c>ResolveRequired</c>-sourced tensor). This test instead uses a bogus
-/// <c>ptxDir</c>, which makes <c>new CudaKernels(ptxDir)</c> throw a plain
-/// <see cref="DirectoryNotFoundException"/> AFTER <c>CudaContext</c>/<c>CudaStream</c>/<c>CudaCublasHandle</c>
-/// already exist — the exact resource triple named in the issue title, and a failure mode that
-/// remains fully reachable (a misconfigured/missing PTX deployment).
+/// <c>ptxDir</c> — a failure mode that remains fully reachable (a misconfigured or missing PTX
+/// deployment).
+/// </para>
+/// <para>
+/// <b>What this test proves changed with #484.</b> It was written when the bogus <c>ptxDir</c>
+/// threw from <c>new CudaKernels(ptxDir)</c>, i.e. AFTER
+/// <c>CudaContext</c>/<c>CudaStream</c>/<c>CudaCublasHandle</c> already existed — the resource
+/// triple named in the issue title — so it exercised #383's dispose-on-failure catch. #484 moved
+/// the check to <c>CudaKernels.ResolveAndValidatePtxDirectory</c>, which runs BEFORE
+/// <c>CudaContext.Create</c>. The exception type is unchanged, but the property under test is now
+/// stronger and different: a bad <c>ptxDir</c> never reaches the driver at all. Teardown of the
+/// triple itself is covered directly by <c>CudaPrimitiveTeardownLeakTests</c>; the only remaining
+/// exerciser of this factory's catch block would be a mid-load device-OOM twin of
+/// <c>CudaNemotronHTransformerModelForwardTests.BuildFromPrebuiltWeights_MidLoadDeviceOom_...</c>,
+/// which does not exist for Mamba-3 today.
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
@@ -52,6 +63,14 @@ public sealed class CudaMamba3FactoryLeakTests : IDisposable
     [SkippableFact]
     public void LoadFromSafetensors_BadPtxDir_ThrowsAndLeaksNoDeviceMemory()
     {
+        // #484: since CudaKernels.ResolveAndValidatePtxDirectory now runs BEFORE
+        // CudaContext.Create, this path allocates nothing at all — the DirectoryNotFoundException
+        // below is raised while the process still holds zero CUDA resources for this load. The
+        // VRAM assertion therefore no longer probes an unwind path; it pins the stronger property
+        // that a bad ptxDir never reaches the driver. That also makes the probe context below
+        // LOAD-BEARING rather than a workaround: the factory no longer creates a context at all,
+        // so the probe is the only context in the process and cuMemGetInfo would otherwise fail
+        // with CUDA_ERROR_INVALID_CONTEXT.
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
 
         string modelPath = Path.Combine(_scratch, "model.safetensors");

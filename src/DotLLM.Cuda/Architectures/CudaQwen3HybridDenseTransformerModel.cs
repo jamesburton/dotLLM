@@ -563,6 +563,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         if (config.GdnConfig is null)
             throw new ArgumentException("Qwen3HybridDense config must have GdnConfig populated.", nameof(config));
 
+        // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+        // incomplete ptxDir is by far the most common way this factory throws, and doing the
+        // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+        // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
+
         // #383: context creation cannot leak on its own throw (nothing allocated yet), so it
         // stays outside the try/catch — everything created from here on (stream/cublas/kernels/
         // state/gdnCache/every device buffer, tracked via `allocs`) is disposed on any failure
@@ -595,7 +601,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         s_pq2_0RepackFunc = 0;
         s_pq2_0RepackContext = 0;
 
-        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
         kernels = new CudaKernels(ptxDir);
 
         // PrismML Hadamard fold (issue #479): validate + upload signs before any weight upload, so
@@ -810,6 +815,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             throw new ArgumentOutOfRangeException(nameof(numGpuLayers),
                 $"numGpuLayers must be between 1 and {fullConfig.NumLayers - 1} for a GPU/CPU split.");
 
+        // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+        // incomplete ptxDir is by far the most common way this factory throws, and doing the
+        // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+        // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
+
         // #383: context creation cannot leak on its own throw (nothing allocated yet), so it
         // stays outside the try/catch — everything created from here on is disposed on any
         // failure before rethrowing.
@@ -834,7 +845,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         s_pq2_0RepackFunc = 0;
         s_pq2_0RepackContext = 0;
 
-        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
         kernels = new CudaKernels(ptxDir);
 
         // PrismML Hadamard fold (issues #479, #481). The declaration names every block of the FULL

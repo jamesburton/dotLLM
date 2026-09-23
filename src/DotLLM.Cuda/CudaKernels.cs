@@ -557,8 +557,81 @@ public sealed unsafe class CudaKernels : IDisposable
     internal string PtxDirectory { get; }
 
     /// <summary>
+    /// Every PTX file the <see cref="CudaKernels(string)"/> constructor loads <b>unconditionally</b>
+    /// (i.e. via a bare <c>CudaModule.LoadFromFile</c>, not behind a <c>File.Exists</c> guard).
+    /// A missing entry aborts construction, so these are exactly the files whose absence makes a
+    /// CUDA model load impossible.
+    /// </summary>
+    /// <remarks>
+    /// Kept in sync with the constructor by <c>CudaKernelsRequiredPtxListTests</c>, which parses
+    /// the constructor body and asserts set equality — the list is a pre-flight mirror, not a
+    /// second source of truth.
+    /// </remarks>
+    public static readonly IReadOnlyList<string> RequiredPtxFiles =
+    [
+        "rmsnorm.ptx", "rope.ptx", "swiglu.ptx", "add.ptx", "softmax.ptx", "embedding.ptx",
+        "attention.ptx", "kv_cache_update.ptx", "bias_add.ptx", "per_head_rmsnorm.ptx",
+        "convert.ptx", "dequant.ptx", "quantized_gemv.ptx", "fused_add_rmsnorm.ptx",
+        "rmsnorm_f32in.ptx", "add_f32.ptx", "embedding_f32out.ptx", "rope_f32.ptx",
+        "attention_f32.ptx", "swiglu_f32.ptx", "bias_add_f32.ptx", "per_head_rmsnorm_f32.ptx",
+        "rmsnorm_f32.ptx", "quantized_gemv_f32in.ptx", "i2_s_gemv.ptx", "dequant_i2_s.ptx",
+        "pq2_0_gemv.ptx", "dequant_pq2_0.ptx", "pq2_0_repack.ptx", "relu2.ptx", "relu2_f32.ptx",
+        "relu2_glu_rmsnorm.ptx", "fused_add_rmsnorm_f32res.ptx",
+    ];
+
+    /// <summary>
+    /// Resolves <paramref name="ptxDir"/> (null =&gt; <c>AppContext.BaseDirectory/ptx</c>) and
+    /// verifies the PTX deployment is complete, <b>without touching CUDA</b>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Issue #484. Every CUDA model factory follows the order
+    /// <c>CudaContext.Create</c> → <c>CudaStream.Create</c> → <c>cublasCreate</c> →
+    /// <c>new CudaKernels(ptxDir)</c>, so a bad or incomplete PTX directory used to throw only
+    /// <i>after</i> a context, stream and cuBLAS handle already existed on the device. #383 added
+    /// catch-blocks that dispose that trio, but "allocate three device-backed handles, then throw,
+    /// then unwind" is a failure path that has to be re-proven correct at every one of the twelve
+    /// factory call sites and on every driver.
+    /// </para>
+    /// <para>
+    /// Calling this <b>before</b> <c>CudaContext.Create</c> makes the whole class of failure
+    /// structurally impossible instead: a misconfigured PTX deployment — by far the most common
+    /// way these factories throw — now fails with zero CUDA resources ever allocated, so there is
+    /// nothing to leak whatever the unwind path does.
+    /// </para>
+    /// </remarks>
+    /// <param name="ptxDir">Directory containing compiled .ptx files, or null to auto-detect.</param>
+    /// <returns>The resolved, validated PTX directory to hand to <see cref="CudaKernels(string)"/>.</returns>
+    /// <exception cref="DirectoryNotFoundException">The resolved directory does not exist.</exception>
+    /// <exception cref="FileNotFoundException">The directory exists but is missing a required PTX file.</exception>
+    public static string ResolveAndValidatePtxDirectory(string? ptxDir)
+    {
+        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
+
+        if (!Directory.Exists(ptxDir))
+            throw new DirectoryNotFoundException(
+                $"CUDA PTX directory not found: '{ptxDir}'. Build the native PTX targets or pass an explicit ptxDir.");
+
+        foreach (string required in RequiredPtxFiles)
+        {
+            string path = Path.Combine(ptxDir, required);
+            if (!File.Exists(path))
+                throw new FileNotFoundException(
+                    $"CUDA PTX directory '{ptxDir}' is incomplete: required kernel module '{required}' is missing. "
+                    + "Rebuild the native PTX targets.",
+                    path);
+        }
+
+        return ptxDir;
+    }
+
+    /// <summary>
     /// Loads all PTX modules from the specified directory.
     /// </summary>
+    /// <remarks>
+    /// Callers that create CUDA resources before this point must run
+    /// <see cref="ResolveAndValidatePtxDirectory"/> first — see its remarks (issue #484).
+    /// </remarks>
     /// <param name="ptxDir">Directory containing compiled .ptx files.</param>
     public CudaKernels(string ptxDir)
     {

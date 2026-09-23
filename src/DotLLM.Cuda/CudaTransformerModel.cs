@@ -571,6 +571,12 @@ public sealed unsafe class CudaTransformerModel : IModel
         TransformerWeights cpuWeights, ModelConfig config, GgufFile? gguf,
         int deviceId, string? ptxDir, long estimatedWeightBytes)
     {
+        // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+        // incomplete ptxDir is by far the most common way this factory throws, and doing the
+        // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+        // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
+
         // #383: context creation cannot leak on its own throw (nothing allocated yet), so it
         // stays outside the try/catch — everything created from here on (stream/cublas/kernels/
         // weights/state) is disposed on any failure before rethrowing.
@@ -586,7 +592,6 @@ public sealed unsafe class CudaTransformerModel : IModel
         cublas = CudaCublasHandle.Create();
         cublas.SetStream(stream);
 
-        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
         kernels = new CudaKernels(ptxDir);
 
         string? vramWarning = null;
