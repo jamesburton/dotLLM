@@ -14,14 +14,17 @@
 // byte-for-byte):
 //   Each 256 contiguous elements of a row form one Q2_K super-block of 84 bytes:
 //       bytes [ 0.. 15] = scales[16] — sub_lo nibble = scale, sub_hi nibble = dmCoef
-//       bytes [16.. 79] = qs[64]     — 256 × 2-bit values, 4 per byte
+//       bytes [16.. 79] = qs[64]     — 256 × 2-bit values, 4 per byte, TRANSPOSED
 //       bytes [80, 81]  = fp16 d
 //       bytes [82, 83]  = fp16 dmin
 //   Row stride = (K / 256) * 84 bytes.
 //
-// Reconstruction (mirrors DequantizeQ2_K). For element t in [0, 256):
-//   sub      = t / 16                                       // 0..15
-//   q2       = (qs[t / 4] >> ((t % 4) * 2)) & 0x3            // 0..3
+// Reconstruction (mirrors llama.cpp dequantize_row_q2_K). For element t in
+// [0, 256) — see issue #498; the 2-bit indexing below was previously
+// (qs[t/4] >> ((t%4)*2)), i.e. four *consecutive* elements per byte, which is
+// not how llama.cpp packs Q2_K:
+//   sub      = t / 16                                       // 0..15 (NOT transposed)
+//   q2       = (qs[32*(t>>7) + (t&31)] >> (2*((t>>5)&3))) & 0x3
 //   scale    =  scales[sub] & 0xF                            // 0..15
 //   dmCoef   = (scales[sub] >> 4) & 0xF                      // 0..15
 //   value    = d * scale * q2 - dmin * dmCoef
@@ -29,6 +32,10 @@
 // Loop tiling: per super-block we iterate the 16 sub-blocks of 16 elements
 // each. The (scale, dmCoef) pair is loaded once per sub-block and held
 // constant across the 16-element inner loop.
+//
+// The transposed layout is in fact a *nicer* access pattern for this loop:
+// a sub-block's 16 elements come from 16 CONTIGUOUS qs bytes (= 4 contiguous
+// uint words) that all share ONE shift. See the inner loop for the derivation.
 //
 // Storage-buffer access:
 //   `weight` is bound as `uint[]` because GLSL storage buffers cannot hold
@@ -108,17 +115,21 @@ void main() {
             float sc = d * float(scByte & 0xFu);
             float mn = dmin * float((scByte >> 4u) & 0xFu);
 
-            // All 16 two-bit values of a sub-block pack into ONE 32-bit word
-            // (4 bytes × 4 values); value l sits at bit l*2. Fetch it once and
-            // bitfield-extract into vec4 lanes — the old path read each of the
-            // 16 values with its own scalar word load (4× redundant).
-            uint qw = weight[qsUintBase + sub];
-            uint outBase = xBase + sub * 16u;
+            // Transposed 2-bit layout (issue #498). Element t = sub*16 + l has
+            //   byte  = 32*(t>>7) + (t&31) = 32*(sub>>3) + 16*(sub&1) + l
+            //   shift = 2*((t>>5)&3)       = 2*((sub>>1)&3)               (l-invariant)
+            // so a sub-block reads 16 CONTIGUOUS bytes = 4 contiguous uint
+            // words, all at the SAME shift. Word g holds elements l = 4g..4g+3
+            // in its bytes 0..3, hence `(w >> shift) & 0x03030303` extracts all
+            // four at once.
+            uint wordBase = qsUintBase + 8u * (sub >> 3u) + 4u * (sub & 1u);
+            uint shift    = ((sub >> 1u) & 3u) << 1u;
+            uint outBase  = xBase + sub * 16u;
             float subSum = 0.0;
             for (uint g = 0u; g < 4u; g++) {
-                uint s = g * 8u;             // base bit for this group of 4 (l*2, l=g*4)
-                vec4 q2 = vec4((qw >> s) & 3u, (qw >> (s + 2u)) & 3u,
-                               (qw >> (s + 4u)) & 3u, (qw >> (s + 6u)) & 3u);
+                uint qw = (weight[wordBase + g] >> shift) & 0x03030303u;
+                vec4 q2 = vec4(qw & 0xFFu, (qw >> 8u) & 0xFFu,
+                               (qw >> 16u) & 0xFFu, (qw >> 24u) & 0xFFu);
                 uint xb = outBase + g * 4u;
                 vec4 xv = vec4(x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]);
                 subSum += dot(xv, sc * q2 - vec4(mn));
