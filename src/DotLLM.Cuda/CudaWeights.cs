@@ -263,6 +263,15 @@ internal sealed class CudaWeights : IDisposable
         // so it does NOT own the output norm + LM head (caller owns them separately).
         bool isHybrid = (firstLayer + layerCount) < config.NumLayers;
 
+        // #509: pinned, chunked, double-buffered H2D staging for the large weight tensors.
+        // OPT-IN and OFF by default (DOTLLM_CUDA_PINNED_UPLOAD=1) because no available host can
+        // measure the benefit yet — see CudaWeightUploadStaging's remarks. Opening the scope pins
+        // nothing either way: the 2 x 64 MiB chunk pair is allocated lazily by the first transfer
+        // big enough to benefit and freed deterministically when this scope is disposed, so a load
+        // that never stages never page-locks a byte. Declared before the try so it unwinds after
+        // `allocs`.
+        using var uploadStaging = CudaWeightUploadStaging.BeginScope();
+
         var allocs = new List<nint>();
         // #383: `allocs` already tracked every device buffer this method (and the MLA/MoE/
         // Gemma4 per-layer loaders below, which share this same list by reference) allocates —
@@ -420,9 +429,11 @@ internal sealed class CudaWeights : IDisposable
                 kNorm = lw.KNormWeight is not null ? UploadNormWeight(lw.KNormWeight, allocs, kernels, stream) : 0;
 
                 // Direct-to-device streaming: every host→device copy of the attention
-                // projections above used the SYNCHRONOUS cuMemcpyHtoD_v2 (via AllocAndUpload /
-                // UploadQuantized / TryUploadPackedThree), which blocks until the transfer is
-                // complete. The on-device dequant kernels queued on `stream` read the uploaded
+                // projections above is HOST-SYNCHRONOUS (via AllocAndUpload / UploadQuantized /
+                // TryUploadPackedThree — either the plain cuMemcpyHtoD_v2 or, for tensors over one
+                // chunk, the #509 pinned staging path, which likewise does not return until the
+                // host source is consumed and both DMA streams are drained). The on-device dequant
+                // kernels queued on `stream` read the uploaded
                 // DEVICE buffers only — never these host pointers — so the host scratch is safe
                 // to free now, before the final cuStreamSynchronize. Each owned host buffer is
                 // read exactly once in this block (F32 upcasts via UploadAndDequant; I2_S via the
@@ -649,9 +660,12 @@ internal sealed class CudaWeights : IDisposable
             ropeDim, rope.Theta, rope.ScalingFactor, rope.OrigMaxSeqLen,
             rope.BetaFast, rope.BetaSlow, invFreq);
 
-        // AllocAndUpload goes through cuMemcpyHtoD_v2 — the SYNCHRONOUS copy — so the
-        // `fixed` pin covers the whole transfer and the managed array is free to move
-        // again once the block exits. (An async copy here would be a use-after-unpin.)
+        // AllocAndUpload is HOST-SYNCHRONOUS — it does not return until the source bytes have been
+        // read — so the `fixed` pin covers the whole transfer and the managed array is free to move
+        // again once the block exits. (A bare async copy here would be a use-after-unpin.) That
+        // holds for the #509 pinned staging path too: it finishes its host-side memcpy out of this
+        // array, and drains both DMA streams, before returning. This vector is also far below the
+        // staging threshold, so in practice it takes the plain cuMemcpyHtoD_v2 anyway.
         long bytes = (long)halfDim * sizeof(float);
         nint devPtr;
         fixed (float* p = invFreq)
@@ -926,13 +940,39 @@ internal sealed class CudaWeights : IDisposable
     }
 
     /// <summary>
-    /// Synchronous H2D copy that augments OOM-class failures with VRAM context.
+    /// Host-synchronous H2D copy that augments OOM-class failures with VRAM context.
     /// CUDA can defer page commits until first write, so an alloc may succeed and
     /// the subsequent memcpy reports OOM.
     /// </summary>
+    /// <remarks>
+    /// Issue #509: when a <see cref="CudaWeightUploadStaging"/> scope is open on this thread and
+    /// the transfer is larger than one staging chunk, the bytes go through the pinned,
+    /// double-buffered chunk pair instead of a single pageable <c>cuMemcpyHtoD_v2</c>. The
+    /// observable contract is unchanged — the call still does not return until the host source has
+    /// been fully read and the device buffer fully written (see the staging class's remarks for
+    /// the three callers that depend on exactly that). A staging failure to create its pinned pair
+    /// degrades silently to the direct path; a staging failure mid-transfer falls through to the
+    /// same diagnostic throw below.
+    /// </remarks>
     private static void MemcpyHtoDOrThrowWithContext(nint devPtr, nint hostPtr, long bytes, string label)
     {
-        int rc = CudaDriverApi.cuMemcpyHtoD_v2(devPtr, hostPtr, (nuint)bytes);
+        var staging = CudaWeightUploadStaging.Current;
+        int rc;
+        if (staging is not null && staging.ShouldStage(bytes))
+        {
+            rc = staging.Upload(devPtr, hostPtr, bytes);
+            if (rc == -1)
+            {
+                // Pinned pair unavailable on this host — fall back to the legacy path.
+                rc = CudaDriverApi.cuMemcpyHtoD_v2(devPtr, hostPtr, (nuint)bytes);
+                if (rc == 0) staging.RecordDirect(bytes);
+            }
+        }
+        else
+        {
+            rc = CudaDriverApi.cuMemcpyHtoD_v2(devPtr, hostPtr, (nuint)bytes);
+            if (rc == 0) staging?.RecordDirect(bytes);
+        }
         if (rc == 0) return;
         nuint free = 0, total = 0;
         _ = CudaDriverApi.cuMemGetInfo_v2(out free, out total);
