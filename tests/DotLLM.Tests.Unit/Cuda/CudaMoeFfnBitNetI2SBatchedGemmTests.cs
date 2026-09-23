@@ -34,7 +34,10 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// directory's existing convention of not cross-referencing between test classes).
 /// </para>
 /// </remarks>
+// #502: see the note on CudaMoeFfnBitNetI2STests — the two classes pin the same process-wide static
+// and ran in parallel, so whichever finished first un-pinned the other's oracle.
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaMoeFfnBitNetI2SBatchedGemmTests : IDisposable
 {
     private readonly CudaContext? _ctx;
