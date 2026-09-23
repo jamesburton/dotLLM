@@ -7,9 +7,16 @@ using System.Runtime.Intrinsics.X86;
 namespace DotLLM.Cpu.Kernels;
 
 /// <summary>
-/// Fast approximate math functions using IEEE-754 bit-manipulation tricks.
-/// Intended for attention softmax where full precision is unnecessary — errors in exp
-/// get normalized away when dividing by the sum.
+/// Exponential helpers for the attention softmax: a fused shift+exp+store+sum, plus an
+/// approximate <c>exp</c> built on IEEE-754 bit manipulation.
+/// <para>
+/// <b>The approximation is off by default (#501).</b> This class was written on the premise that
+/// "errors in exp get normalized away when dividing by the sum". That is false: normalizing fixes
+/// the <em>mean</em> of the weights, but the ~1-2% error is <em>relative and per-element</em>, so
+/// it survives normalization as a reweighting of the mixture each head computes. It is free on a
+/// full-precision model and expensive on a heavily quantized one — Q3_K Llama-3.2-1B pays
+/// +1.71% perplexity for it, Q8_0 pays nothing. See <see cref="UseFastExp"/> for the measurements.
+/// </para>
 /// <para>
 /// The core trick (Schraudolph 1999): <c>exp(x) ≈ reinterpret_as_float((int)(x * C0 + C1))</c> where
 /// <c>C0 = 2^23 / ln(2)</c> maps x into the IEEE-754 exponent field and <c>C1</c> is a bias constant.
@@ -34,6 +41,31 @@ public static class FastMath
     private const float MaxClamp = 88.7f;
 
     /// <summary>
+    /// Opt-in switch (<c>DOTLLM_FAST_EXP=1</c>) that restores the Schraudolph bit-trick
+    /// <c>exp</c> on every path in this class. <b>Off by default</b> since #501.
+    /// </summary>
+    /// <remarks>
+    /// <para>The premise "errors in exp get normalized away when dividing by the sum" is only
+    /// true for the <em>mean</em> of the attention weights; the ~1-2% <em>relative</em> error is
+    /// per-element and does not cancel, so it perturbs which values the head actually mixes.</para>
+    /// <para>Measured on <c>Llama-3.2-1B-pure</c>, wikitext-2, ctx 512, 40 chunks, CPU, on
+    /// llama.cpp's exact token stream — paired per-chunk, accurate minus approximate:</para>
+    /// <list type="bullet">
+    ///   <item><description><b>Q8_0</b>: +0.00042 +/- 0.00059 nats (t = +0.7) — no effect.
+    ///   This is why the approximation looked free: it is, on a full-precision model.</description></item>
+    ///   <item><description><b>Q3_K</b>: <b>-0.01724 +/- 0.00185 nats</b> (t = -9.3), i.e. -1.71%
+    ///   perplexity. Against llama.cpp the gap goes from +2.03% (t = +5.7) to +0.28% (t = +0.8,
+    ///   not significant).</description></item>
+    /// </list>
+    /// <para>A 3-bit model's attention scores sit closer together, so a 1-2% reweighting changes
+    /// the mixture materially. The cost scales with how damaged the model is — exactly the
+    /// regime aggressive quantization exists to serve — so the approximation is kept only as an
+    /// opt-in benchmarking lever.</para>
+    /// </remarks>
+    internal static readonly bool UseFastExp =
+        Environment.GetEnvironmentVariable("DOTLLM_FAST_EXP") == "1";
+
+    /// <summary>
     /// Scalar fast approximate exp. ~1-2% max relative error.
     /// Clamped to [-87.3, 88.7] for general use.
     /// </summary>
@@ -41,6 +73,7 @@ public static class FastMath
     public static float FastExp(float x)
     {
         x = Math.Clamp(x, MinClamp, MaxClamp);
+        if (!UseFastExp) return MathF.Exp(x);
         int bits = (int)(x * C0 + C1);
         return Unsafe.BitCast<int, float>(bits);
     }
@@ -63,6 +96,9 @@ public static class FastMath
     [SkipLocalsInit]
     public static float ExpSumAndStore(ReadOnlySpan<float> input, Span<float> output, float offset)
     {
+        if (!UseFastExp)
+            return ExpSumAndStoreAccurate(input, output, offset);
+
         int length = input.Length;
         ref float src = ref MemoryMarshal.GetReference(input);
         ref float dst = ref MemoryMarshal.GetReference(output);
@@ -74,6 +110,25 @@ public static class FastMath
             return ExpSumAndStoreAvx2(ref src, ref dst, length, offset);
 
         return ExpSumAndStoreScalar(ref src, ref dst, length, offset);
+    }
+
+    /// <summary>
+    /// Accurate <c>exp(input + offset)</c> + store + sum, via <see cref="TensorPrimitives"/>.
+    /// </summary>
+    /// <remarks>
+    /// Three vectorized passes over one attention tile rather than the bit trick's one, which is
+    /// affordable because a tile is sized to stay in L1 — the passes hit cache, not memory. The
+    /// lower clamp is kept so a <c>-infinity</c> running max (an empty online-softmax
+    /// accumulator) still produces <c>~0</c> rather than a NaN downstream.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float ExpSumAndStoreAccurate(ReadOnlySpan<float> input, Span<float> output, float offset)
+    {
+        Span<float> dst = output[..input.Length];
+        TensorPrimitives.Add(input, offset, dst);
+        TensorPrimitives.Max(dst, MinClamp, dst);
+        TensorPrimitives.Exp(dst, dst);
+        return TensorPrimitives.Sum(dst);
     }
 
     /// <summary>
