@@ -23,6 +23,11 @@ agreement observed that way was luck rather than validation.
 Every end-to-end dotLLM-vs-llama.cpp perplexity comparison in which each side tokenized the file
 itself is suspect. Comparisons where dotLLM was fed llama.cpp's exact token ids are not affected.
 
+**Re-measured 2026-09-23 — see [the LF-corpus baseline](#measured-the-lf-corpus-baseline-2026-09-23)
+below.** "Suspect" turned out to mean *wrong in magnitude*, not *wrong in existence*: the Q2_K and
+Q3_K gaps both survive on identical bytes, with the Q8_0 control agreeing to −0.086%. Tracked as
+issue #515. The Bonsai and Nemotron-H claims are still unverified and are tracked as #514.
+
 ### Why the reader is not "fixed"
 
 llama.cpp on **Linux** keeps the `\r` as well — the platform-dependent part is the MSVC text-mode
@@ -103,6 +108,43 @@ dotllm perplexity <model.gguf> --tokens-file llama_tokens.txt --context 512
 Both engines have now provably scored the same ids, so a residual difference is in the scoring
 maths or the kernels and nowhere else. This is the arm that validated the harness to +0.25% against
 llama.cpp on wikitext-2.
+
+## Measured: the LF-corpus baseline (2026-09-23)
+
+The first end-to-end comparison taken **after** #506, with both engines reading the same LF bytes.
+Llama-3.2-1B "pure" quantizations (every tensor at the named format) from
+`~/.dotllm/quant-ladder/Llama-3.2-1B-pure/`, `wiki.test.lf.raw` (1,292,014 bytes, **0 CR**), CPU
+both sides, `-c 512` / `--context 512` passed explicitly rather than relying on the two defaults
+agreeing. 564 chunks, 143,820 scored tokens each. Raw logs:
+`.docs/measurements/2026-09-23-lf-corpus-triad.out`.
+
+| quant | dotLLM | llama.cpp | delta | bars |
+|---|---|---|---|---|
+| **Q8_0** (control) | 13.9040 ± 0.10359 | 13.9160 ± 0.10331 | **−0.086%** | overlap |
+| Q2_K | 1342.0853 ± 14.52088 | 1462.8547 ± 15.76961 | **−8.26%** | **disjoint** |
+| Q3_K | 22.1764 ± 0.17231 | 21.1623 ± 0.16364 | **+4.79%** | **disjoint** |
+
+**Read the Q8_0 row first.** It is the control, and at −0.086% the two engines agree far inside
+their error bars. That is what makes the other two rows interpretable: the harness, the chunk
+geometry, the tokenizer and the corpus are all common to the three runs, so a disjoint delta at
+Q2_K or Q3_K is a property of *that quant's path*, not of the measurement. Before #506 no such
+statement was possible, because each engine was tokenizing different text.
+
+**The pre-#506 claims were right about the sign and wrong about the size.** Q2_K was recorded as
+−2.9% and is −8.26%; #501's Q3_K was recorded as +8.9% and is +4.79%. Neither gap was a CRLF
+artifact — both survive on identical bytes — so the underlying divergences are real and remain
+open (issue #515).
+
+**Caveat on the Q2_K row.** Pure-Q2_K on a 1.2 B model is a destroyed model: perplexity 1342
+against a 13.90 Q8_0 baseline, ~97× worse. In that regime perplexity is hypersensitive to small
+numeric differences, so the 8.26% gap does **not** imply a numeric error of similar magnitude, and
+it is the weakest of the three rows as evidence about kernel correctness. The Q3_K row (22.18 vs
+13.90 — a plausible degradation for the format) is the more trustworthy signal.
+
+**The signs are opposite**, which is worth noting because it rules out the tidiest single
+explanation: dotLLM is *better* than llama.cpp at Q2_K and *worse* at Q3_K, so this is not one
+global precision difference (higher-precision accumulation would move both the same way). Two
+distinct path differences, not one.
 
 ## Reporting a comparison
 
