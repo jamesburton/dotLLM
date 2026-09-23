@@ -611,18 +611,19 @@ a host with a small or disabled pagefile where the read-only map succeeded. `Rea
 offered: CoW gets the same acceptance while making it physically impossible for a stray write to
 reach the checkpoint on disk.
 
-### What the import actually buys — and costs
+### What the import actually buys, and costs
 
 On Bonsai 2 27B PQ2_0, a 32 GiB UMA box previously held **13.9 GiB** for the weights: 6.86 GiB of
-still-resident mmap plus 7.01 GiB of device-local copy. With the import engaged, 546 of 851
-tensors alias instead of copying — **~6.85 GiB not duplicated** (the remaining 305 are 1-D
-norm/bias vectors held as managed `float[]`, which have no mmap to alias). Nemotron-Nano-9B-v2
-Q4_K_M: 101 of 341 tensors, 2.20 GiB.
+still-resident mmap plus 7.01 GiB of device-local copy. With the import engaged, **546 of 851
+tensors alias instead of copying — 6.70 GiB** (the remaining 305 are 1-D norm/bias vectors held
+as managed `float[]`, which have no mmap to alias). Nemotron-Nano-9B-v2 Q4_K_M: 101 of 341
+tensors, 2.20 GiB. Both are GGUF-metadata censuses, no GPU (#508 commit `c5ba864e`).
 
 Against that, an imported weight is read from a host-visible heap rather than a device-local one,
-and on gfx1151 that costs roughly **10-13% decode throughput**. So this is a
-memory-for-throughput trade, which is the other reason it is opt-in rather than default-on: take
-it when the model would not otherwise fit, not to go faster.
+and on gfx1151 that was measured to cost roughly **10-13% decode throughput** (#508 acceptance
+run, 2026-09-23 — **that number is not recorded anywhere in the tree; re-measure before quoting
+it further**). So this is a memory-for-throughput trade, which is the other reason it is opt-in
+rather than default-on: take it when the model would not otherwise fit, not to go faster.
 
 Composition with #438 (stage, then unmap the GGUF) is explicit — you cannot unmap pages you have
 imported. `VulkanWeightImportPolicy.MayReleaseWholeHostMapping` is true iff nothing imported;
@@ -662,7 +663,7 @@ about the cause: the refusal was the read-only mapping, not a driver defect.
 dotnet run --project benchmarks/DotLLM.Benchmarks -c Release -- profile-vulkan-host-import --gguf path/to/model.gguf
 ```
 
-Reports wall time and process RSS delta for both staging and host-import paths, plus the per-matrix import success/fail breakdown. Default model: TinyLlama-1.1B Q8_0 from HuggingFace.
+Reports wall time and process RSS delta for both staging and host-import paths, plus the per-matrix import success/fail breakdown. Default model: TinyLlama-1.1B Q8_0 from HuggingFace. **Run it with `DOTLLM_GGUF_MAP_COW=1`** — without that the GGUF is mapped read-only, every import is refused, and both arms measure staging.
 
 ```
 dotnet run --project benchmarks/DotLLM.Benchmarks -c Release -- profile-vulkan-load --gguf path/to/model.gguf [--no-forward]

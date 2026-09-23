@@ -17,7 +17,10 @@ namespace DotLLM.Cli.Commands;
 /// Computes perplexity over a text corpus: load → stream-tokenize → score.
 /// </summary>
 /// <remarks>
-/// Defaults to <see cref="PerplexityMode.SlidingWindow"/> with <c>stride = context / 2</c>, which
+/// Defaults to <see cref="PerplexityMode.SlidingWindow"/> with <c>stride = context</c> —
+/// non-overlapping chunks, scoring the second half of each, per
+/// <see cref="PerplexityOptions.LlamaCppDefault"/> (the remark used to say <c>context / 2</c>,
+/// which is a different measurement: it scores every token rather than half of them). This
 /// reproduces llama.cpp's <c>--perplexity</c> methodology, so the reported figure is comparable to
 /// published numbers for the same model, corpus, context and stride — <b>provided both engines
 /// tokenize the same bytes</b>. That proviso is not automatic: a CRLF corpus is read differently
