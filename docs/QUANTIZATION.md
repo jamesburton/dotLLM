@@ -166,16 +166,32 @@ The Vulkan backend ships native matmul kernels (GEMV decode + GEMM prefill, with
 | IQ2_XS | ✓ | ✓ | — | `743984c` |
 | IQ2_S (also IQ2_M) | ✓ | ✓ | — | `9ecce75` |
 | IQ1_S | ✓ | ✓ | — | IQ-family — smallest GGUF quant (~1.5-1.7 bpw) |
-| I2_S | ✓ | ✓ | ✓ (`matmul_i2_s_f32_gemm_coopmat*`) | BitNet b1.58 ternary |
-| PQ2_0 | ✓ | ✓ | ✓ (`matmul_pq2_0_f32_gemm_coopmat*`) | PrismML ternary + per-group scale |
+| I2_S | ✓ | ✓ | ✓ (`MatMulI2SGemmF32Kernel`) | BitNet b1.58 ternary |
+| PQ2_0 | ✓ | ✓ | ✓ (`MatMulPQ2_0GemmF32Kernel`) | PrismML ternary + per-group scale |
 | Q4_0 / Q4_1 / Q5_1 | — | — | — | **not shipped** — see below |
 
 **The unshipped set is exactly Q4_0, Q4_1 and Q5_1.** For those three the upload path falls back to
 F32 dequant, so weight memory is doubled / quadrupled; every other `QuantizationType` stays on device
-in its packed source form. The authority for this list is
-`VulkanWeights.DeviceQuantTypeFor` — each `Keep*OnDevice` predicate there additionally requires the
-contraction axis to be a multiple of the format's group size, and a misaligned tensor of *any* format
-falls back to F32 regardless of kernel availability.
+in its packed source form. The authority is `VulkanWeights.DeviceQuantTypeFor` — each
+`Keep*OnDevice` predicate there additionally requires the contraction axis to be a multiple of the
+format's group size, and a misaligned tensor of *any* format falls back to F32 regardless of kernel
+availability.
+
+**This table is the kernel inventory and the _dense_ (`VulkanWeights`) loader's coverage. The other
+weight loaders keep strictly less**, because each carries its own `DeviceQuantTypeFor` /
+`KeepQuantOnDevice` rather than sharing the dense one — a format having a kernel does not mean every
+architecture's loader will route to it:
+
+| loader | additionally falls back to F32 |
+|---|---|
+| `VulkanWeights` (dense) | — (the table above) |
+| `VulkanNemotronHWeights`, `VulkanMamba3Weights` | Q5_0, I2_S, PQ2_0 |
+| `VulkanQwen3MoeHybridWeights` | Q5_0, Q2_K, Q3_K, IQ4_NL, IQ4_XS, IQ1_S, I2_S |
+| `VulkanQwen3HybridDenseWeights` | everything but PQ2_0 (it handles only the packed token embed) |
+
+Widening a hybrid loader is mechanical — add the missing `Keep*OnDevice` arms — but it is a code
+change, not a documentation one, so check the loader for the architecture you are running before
+assuming a format stays packed.
 
 One caveat on Q5_1: it has no general projection kernel, but it *is* supported as a routed-MoE
 `down` bank (`moe_indexed_matmul_q5_1_{f32,mmvq}.comp`), and Q5_0 `down` banks are repacked
