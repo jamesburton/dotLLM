@@ -2240,6 +2240,103 @@ public sealed class VulkanDevice : IDisposable
         CopyBufferSynchronous(staging, dst, (ulong)source.Length);
     }
 
+    // ────────────────────────────────────────────────────────────────
+    // Deferred transfer primitives (issue #510)
+    //
+    // CopyBufferRangeSynchronous below allocates a command buffer and a
+    // fence, submits, waits, and frees — per copy. VulkanStagingBuffer needs
+    // to keep a copy in flight while the host fills the other slot, so it
+    // owns long-lived command-buffer/fence pairs and drives them through
+    // these three helpers instead.
+    // ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Allocates one primary command buffer from the device's transfer/compute
+    /// pool, for a caller that will reuse it across many submissions. The
+    /// caller owns it until <see cref="FreeTransferCommandBuffer"/>.
+    /// </summary>
+    internal nint AllocateTransferCommandBuffer()
+    {
+        var cbai = new VkCommandBufferAllocateInfo
+        {
+            sType = VkStructureType.CommandBufferAllocateInfo,
+            commandPool = _commandPool,
+            level = VkCommandBufferLevel.Primary,
+            commandBufferCount = 1,
+        };
+        VulkanApi.vkAllocateCommandBuffers(_device, cbai, out nint cmdBuf)
+            .ThrowOnError("vkAllocateCommandBuffers AllocateTransferCommandBuffer");
+        return cmdBuf;
+    }
+
+    /// <summary>Frees a command buffer obtained from <see cref="AllocateTransferCommandBuffer"/>.</summary>
+    internal void FreeTransferCommandBuffer(nint cmdBuf)
+    {
+        if (cmdBuf == 0) return;
+        nint local = cmdBuf;
+        VulkanApi.vkFreeCommandBuffers(_device, _commandPool, 1, local);
+    }
+
+    /// <summary>Creates an unsignalled fence owned by the caller.</summary>
+    internal nint CreateUnsignalledFence()
+    {
+        var fenceCi = new VkFenceCreateInfo { sType = VkStructureType.FenceCreateInfo };
+        VulkanApi.vkCreateFence(_device, fenceCi, 0, out nint fence)
+            .ThrowOnError("vkCreateFence CreateUnsignalledFence");
+        return fence;
+    }
+
+    /// <summary>Destroys a fence from <see cref="CreateUnsignalledFence"/>.</summary>
+    internal void DestroyOwnedFence(nint fence)
+    {
+        if (fence == 0) return;
+        VulkanApi.vkDestroyFence(_device, fence, 0);
+    }
+
+    /// <summary>
+    /// Records a single <c>vkCmdCopyBuffer</c> region into
+    /// <paramref name="cmdBuf"/> and submits it signalling
+    /// <paramref name="fence"/>. <b>Does not wait.</b> The caller must
+    /// <see cref="WaitAndResetFence"/> before reusing either the command
+    /// buffer, the fence, or the source memory.
+    /// </summary>
+    internal unsafe void SubmitCopyDeferred(
+        nint cmdBuf, nint fence, Buffer src, Buffer dst,
+        ulong srcOffset, ulong dstOffset, ulong size)
+    {
+        VulkanApi.vkResetCommandBuffer(cmdBuf, 0).ThrowOnError("vkResetCommandBuffer SubmitCopyDeferred");
+
+        var begin = new VkCommandBufferBeginInfo
+        {
+            sType = VkStructureType.CommandBufferBeginInfo,
+            flags = VkCommandBufferUsageFlags.OneTimeSubmit,
+        };
+        VulkanApi.vkBeginCommandBuffer(cmdBuf, begin).ThrowOnError("vkBeginCommandBuffer SubmitCopyDeferred");
+
+        var region = new VkBufferCopy { srcOffset = srcOffset, dstOffset = dstOffset, size = size };
+        VulkanApi.vkCmdCopyBuffer(cmdBuf, src.Handle, dst.Handle, 1, region);
+
+        VulkanApi.vkEndCommandBuffer(cmdBuf).ThrowOnError("vkEndCommandBuffer SubmitCopyDeferred");
+
+        nint cmdBufLocal = cmdBuf;
+        var submit = new VkSubmitInfo
+        {
+            sType = VkStructureType.SubmitInfo,
+            commandBufferCount = 1,
+            pCommandBuffers = (nint)(&cmdBufLocal),
+        };
+        VulkanApi.vkQueueSubmit(_queue, 1, submit, fence).ThrowOnError("vkQueueSubmit SubmitCopyDeferred");
+    }
+
+    /// <summary>Host-waits on <paramref name="fence"/> and resets it for reuse.</summary>
+    internal void WaitAndResetFence(nint fence)
+    {
+        nint local = fence;
+        VulkanApi.vkWaitForFences(_device, 1, local, waitAll: 1, ulong.MaxValue)
+            .ThrowOnError("vkWaitForFences WaitAndResetFence");
+        VulkanApi.vkResetFences(_device, 1, local).ThrowOnError("vkResetFences WaitAndResetFence");
+    }
+
     /// <summary>
     /// Records a one-shot <c>vkCmdCopyBuffer</c> from offset 0 of
     /// <paramref name="src"/> to offset 0 of <paramref name="dst"/> and waits

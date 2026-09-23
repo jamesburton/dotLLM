@@ -1012,6 +1012,12 @@ internal sealed class VulkanWeights : IDisposable
                 srcBuf = AllocateAndUploadPacked(device, staging, weights.TokenEmbedWeight, qBytes);
             }
 
+            // #510: staging copies are now submitted without a per-chunk host wait, and
+            // separate vkQueueSubmit calls on one queue are not ordered against each
+            // other. This dequant dispatch READS srcBuf, so drain the staging queue
+            // first — otherwise the kernel can race the copy that fills its input.
+            staging.WaitAll();
+
             if (qt == QuantizationType.Q4_K)
             {
                 using var kernel = Q4KDequantF32Kernel.Create(device, spvDir!);
@@ -1070,16 +1076,6 @@ internal sealed class VulkanWeights : IDisposable
     public static long LastUploadZeroCopyBytes { get; private set; }
 
     /// <summary>
-    /// Set <c>DOTLLM_VULKAN_DISABLE_HOST_IMPORT=1</c> in the environment to
-    /// force the staging-copy path even when the driver supports
-    /// <c>VK_EXT_external_memory_host</c>. Used by parity tests to verify
-    /// that the zero-copy import produces bit-identical kernel output, and
-    /// by the microbench to measure the staging baseline.
-    /// </summary>
-    private static bool IsHostImportDisabled() =>
-        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_HOST_IMPORT") == "1";
-
-    /// <summary>
     /// Rounds a packed-weight byte size up to a 4-byte multiple (issue #361).
     /// The packed-matmul shaders read their weight SSBO through a <c>uint</c>-addressed
     /// funnel, so when the packed size is ≡ 2 (mod 4) — ten formats have a block size
@@ -1109,12 +1105,9 @@ internal sealed class VulkanWeights : IDisposable
         var buf = device.AllocateDeviceLocal(padded);
         try
         {
-            staging.UploadBytes(srcPtr, bytes, buf);
-            if (padded != bytes)
-            {
-                uint zero = 0;
-                staging.UploadBytes((nint)(&zero), padded - bytes, buf, bytes);
-            }
+            // #510: the 0-3 pad bytes ride in the LAST data chunk's copy region rather
+            // than costing their own command buffer, submit and full host fence stall.
+            staging.UploadBytes(srcPtr, bytes, buf, dstOffset: 0, zeroTailBytes: padded - bytes);
         }
         catch
         {
@@ -1135,34 +1128,19 @@ internal sealed class VulkanWeights : IDisposable
         VulkanDevice device, nint srcPtr, long bytes,
         out VulkanDevice.Buffer? buf)
     {
-        buf = null;
-        if (!device.HasExternalMemoryHost)
+        // #508: the decision itself (and the #438 release ledger) lives in
+        // VulkanWeightImportPolicy, shared with the four hybrid/recurrent model paths.
+        // This wrapper only keeps VulkanWeights' own long-standing counters in sync.
+        if (VulkanWeightImportPolicy.TryImport(device, srcPtr, bytes, out buf))
         {
-            LastUploadFallbackReason = "feature_absent";
-            return false;
-        }
-        if (IsHostImportDisabled())
-        {
-            LastUploadFallbackReason = "env_disabled";
-            return false;
-        }
-        if (srcPtr == 0)
-        {
-            LastUploadFallbackReason = "null_src";
-            return false;
+            LastUploadFallbackReason = string.Empty;
+            LastUploadZeroCopyMatrices++;
+            LastUploadZeroCopyBytes += bytes;
+            return true;
         }
 
-        var wrapped = device.TryWrapHostVisible(srcPtr, bytes);
-        if (wrapped is null)
-        {
-            LastUploadFallbackReason = "import_rejected";
-            return false;
-        }
-
-        LastUploadZeroCopyMatrices++;
-        LastUploadZeroCopyBytes += bytes;
-        buf = wrapped;
-        return true;
+        LastUploadFallbackReason = VulkanWeightImportPolicy.LastFallbackReason;
+        return false;
     }
 
     /// <summary>
@@ -1171,7 +1149,7 @@ internal sealed class VulkanWeights : IDisposable
     /// "feature_absent" (driver does not expose VK_EXT_external_memory_host),
     /// "env_disabled" (DOTLLM_VULKAN_DISABLE_HOST_IMPORT=1), "null_src"
     /// (source pointer is null), "import_rejected" (driver rejected the
-    /// vkAllocateMemory import). Empty string when the most recent call took
+    /// vkAllocateMemory import), "too_small" (below one import page). Empty string when the most recent call took
     /// the zero-copy path or when no fallback decision has been made.
     /// </summary>
     public static string LastUploadFallbackReason { get; private set; } = string.Empty;
@@ -1184,6 +1162,7 @@ internal sealed class VulkanWeights : IDisposable
         LastUploadStagingMatrices = 0;
         LastUploadZeroCopyBytes = 0;
         LastUploadFallbackReason = string.Empty;
+        VulkanWeightImportPolicy.Reset();
     }
 
     /// <summary>Capacity of the dedicated norm-vec/bias staging buffer (256 KiB —
@@ -1529,6 +1508,7 @@ internal sealed class VulkanWeights : IDisposable
 
             var buf = AllocateAndUploadPacked(device, staging, srcPtr, bytes);
 
+            VulkanWeightImportPolicy.NoteStaged(srcPtr, bytes);
             LastUploadStagingMatrices++;
             deviceQuantType = keepQt;
             uploadedBytes = bytes;
@@ -2123,6 +2103,7 @@ internal sealed class VulkanWeights : IDisposable
             // Q8_0 banks (34 bytes/block) can be ≡ 2 (mod 4) — round up like every
             // packed staging upload (#361).
             var rawBank = AllocateAndUploadPacked(device, stage, raw, bankBytes);
+            VulkanWeightImportPolicy.NoteStaged(raw, bankBytes);
             LastUploadStagingMatrices++;
             return rawBank;
         }

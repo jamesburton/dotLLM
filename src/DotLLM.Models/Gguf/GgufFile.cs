@@ -11,6 +11,57 @@ namespace DotLLM.Models.Gguf;
 /// </summary>
 public sealed unsafe class GgufFile : IDisposable
 {
+    /// <summary>
+    /// How the tensor data section is mapped. <see cref="MemoryMappedFileAccess.Read"/> by
+    /// default; <c>DOTLLM_GGUF_MAP_COW=1</c> selects
+    /// <see cref="MemoryMappedFileAccess.CopyOnWrite"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>READ THIS BEFORE FLIPPING THE DEFAULT — this mapping is shared by every backend.</b>
+    /// </para>
+    /// <para>
+    /// <b>Why the switch exists.</b> The Vulkan zero-copy weight import
+    /// (<c>VK_EXT_external_memory_host</c>, issues #508/#507) is refused outright on read-only
+    /// pages: measured on gfx1151/amdvlk, <c>vkAllocateMemory</c> returns
+    /// <c>VK_ERROR_INVALID_EXTERNAL_HANDLE</c> (-1000072003) for a
+    /// <see cref="MemoryMappedFileAccess.Read"/> view and succeeds for the identical bytes in a
+    /// <see cref="MemoryMappedFileAccess.CopyOnWrite"/> view or in anonymous read-write memory.
+    /// Because every GGUF is mapped read-only, the import has aliased <b>zero bytes of every
+    /// real model</b> since it was written; the existing import tests all pass because they
+    /// import <c>NativeMemory.AlignedAlloc</c> pages. See
+    /// <c>VulkanHostImportMmapAccessModeTests</c>.
+    /// </para>
+    /// <para>
+    /// <b>What copy-on-write costs</b>, measured on the same box over a 256 MiB mapping:
+    /// creating the view reserves commit charge equal to the mapped size <i>up front</i>
+    /// (+256 MiB), reading every page adds <b>no</b> private commit (the pages stay shared with
+    /// the page cache, working set grows as normal), and the Vulkan import adds <b>no</b>
+    /// private commit either — the driver pins without breaking copy-on-write. So it does not
+    /// duplicate the weights, which was the thing that would have made it pointless.
+    /// </para>
+    /// <para>
+    /// <b>What it risks.</b> (1) The up-front commit reservation is the whole file: a 30 GB
+    /// checkpoint reserves 30 GB of commit charge, so mapping can fail on a machine with a
+    /// small or disabled pagefile where the read-only map would have succeeded. (2) A stray
+    /// write no longer throws — it silently privatises a page instead of faulting. That is
+    /// still strictly safer than <see cref="MemoryMappedFileAccess.ReadWrite"/>, which would
+    /// write the corruption through to the checkpoint on disk; CoW cannot touch the file.
+    /// (3) Cross-process page-cache sharing is preserved, since CoW pages stay shared until
+    /// written.
+    /// </para>
+    /// <para>
+    /// It is opt-in rather than the default precisely because of (1): the CPU path depends on
+    /// this mapping and gains nothing from the change, so the whole engine should not take a
+    /// commit-charge regression for one backend's optimisation until the trade has been
+    /// measured on the large checkpoints.
+    /// </para>
+    /// </remarks>
+    public static MemoryMappedFileAccess MappingAccess { get; } =
+        string.Equals(Environment.GetEnvironmentVariable("DOTLLM_GGUF_MAP_COW"), "1", StringComparison.Ordinal)
+            ? MemoryMappedFileAccess.CopyOnWrite
+            : MemoryMappedFileAccess.Read;
+
     private MemoryMappedFile? _mmf;
     private MemoryMappedViewAccessor? _accessor;
     private byte* _basePointer;
@@ -125,8 +176,9 @@ public sealed unsafe class GgufFile : IDisposable
         {
             try
             {
-                mmf = MemoryMappedFile.CreateFromFile(filePath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
-                accessor = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+                MemoryMappedFileAccess access = MappingAccess;
+                mmf = MemoryMappedFile.CreateFromFile(filePath, FileMode.Open, null, 0, access);
+                accessor = mmf.CreateViewAccessor(0, 0, access);
                 accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref basePointer);
                 dataBasePointer = (nint)(basePointer + accessor.PointerOffset + dataSectionOffset);
             }
