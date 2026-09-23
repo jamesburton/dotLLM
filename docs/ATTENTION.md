@@ -25,6 +25,32 @@ Single implementation covers three variants via `num_kv_heads`:
 7. Weights = softmax(scores)
 8. Output = weights @ V → reshape → output @ W_o
 
+### Softmax exp precision (#501)
+
+Step 7's exponential is **precise on every backend by default**. CPU uses
+`TensorPrimitives.Exp` (through `FastMath.ExpSumAndStore`, which keeps the fused
+shift+exp+store+sum structure and only changes the exp); CUDA's `attention_f32.cu` and
+`attention_flash_mma_decode_gqa_split.cu` use `expf`; Vulkan shaders use GLSL `exp()`.
+(`attention_flash_mma.cu` uses `__expf`, the ~2-ULP hardware intrinsic — a different and
+accepted tradeoff.)
+
+Until #501 the CPU path and its two CUDA twins used the Schraudolph 1999 bit trick (~1-2% max
+relative error), on the premise that "errors in exp get normalized away when dividing by the
+sum". That is true only of the *mean* of the attention weights: the error is relative and
+per-element, so it survives normalization as a reweighting of the mixture each head computes,
+and the cost scales with how close a model's attention scores already sit to each other.
+Measured on Llama-3.2-1B-pure / wikitext-2 / ctx 512 / 40 chunks, paired per chunk:
+**Q8_0 unmoved** (+0.0004 ± 0.0006 nats, t = +0.7) but **Q3_K −1.71% perplexity**
+(−0.01724 ± 0.00185 nats, t = −9.3). Throughput was unchanged at ctx 512 — the accurate path
+is extra vectorized passes over an attention tile sized to stay in L1.
+
+`DOTLLM_FAST_EXP=1` restores the bit trick as a benchmarking lever. **It is CPU-only**: CUDA
+ships precompiled PTX with no equivalent switch, so setting it makes the CPU and CUDA backends
+diverge by roughly the approximation's own error (~1%, ~5e-3 abs on attention output). That is
+useful as a deliberate discriminator, but do not run cross-backend parity with it set. Several
+CPU↔CPU and CPU↔CUDA attention tolerances were calibrated against the approximation and are now
+looser than they need to be; each says so in place.
+
 ### Sliding Window
 
 Mask modifier, not separate mechanism. Limits attention to `[pos - window_size, pos]`. KV-cache evicts older entries. Configured via `ModelConfig.SlidingWindowSize`.

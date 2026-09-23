@@ -126,10 +126,21 @@ public sealed class HostVisibleBuffer : IDisposable
     /// <c>VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT</c> (process-
     /// allocated memory, e.g. <see cref="System.Runtime.InteropServices.NativeMemory.AlignedAlloc"/>),
     /// then falls back to <c>HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT</c> (memory
-    /// mapped from a non-Vulkan source, e.g. <c>MemoryMappedFile</c>). amdvlk
-    /// on Strix Halo (gfx1151) accepts heap-allocated pages via
-    /// HOST_ALLOCATION but rejects read-only mmap'd file views — the foreign-
-    /// memory handle type is the correct path for GGUF mmaps.
+    /// mapped from a non-Vulkan source, e.g. <c>MemoryMappedFile</c>).
+    /// </para>
+    /// <para>
+    /// <b>The handle type is not the discriminator — the page protection is (#508).</b> This
+    /// remark used to claim amdvlk on Strix Halo (gfx1151) rejects read-only mmap'd file views
+    /// under HOST_ALLOCATION but accepts them under HOST_MAPPED_FOREIGN_MEMORY. Measured
+    /// (<c>VulkanHostImportMmapAccessModeTests</c>, same bytes, same size, same alignment, only
+    /// the host mapping differing): <b>both</b> candidate handle types are refused at
+    /// <c>vkAllocateMemory</c> with <c>VK_ERROR_INVALID_EXTERNAL_HANDLE</c> (-1000072003) for a
+    /// <c>MemoryMappedFileAccess.Read</c> view, and both succeed for anonymous read-write memory
+    /// or for a <c>CopyOnWrite</c> view of the same file. This is why the import aliased zero
+    /// bytes of every real model until <c>DOTLLM_GGUF_MAP_COW=1</c> existed: every GGUF was
+    /// mapped read-only, while every import test used <c>NativeMemory.AlignedAlloc</c> pages.
+    /// The candidate order below is retained (it costs nothing and other drivers do differ),
+    /// but it is not what decides acceptance here.
     /// </para>
     /// </remarks>
     public static unsafe HostVisibleBuffer? TryCreate(
@@ -170,9 +181,11 @@ public sealed class HostVisibleBuffer : IDisposable
         // Candidate handle types, in order of preference for typical workloads.
         // HOST_ALLOCATION covers heap-allocated process memory (NativeMemory.AlignedAlloc,
         // malloc) and works on virtually every driver. HOST_MAPPED_FOREIGN_MEMORY is the
-        // correct bit for memory NOT allocated by the process — read-only mmap'd file
-        // views via MemoryMappedFile in particular — and is what amdvlk on gfx1151 requires
-        // for GGUF imports. We don't pick one upfront because vkGetMemoryHostPointerPropertiesEXT
+        // correct bit for memory NOT allocated by the process — mmap'd file views via
+        // MemoryMappedFile in particular. (#508: on gfx1151/amdvlk neither bit rescues a
+        // READ-ONLY mapping — both are refused at vkAllocateMemory; what decides acceptance is
+        // the page protection, so GgufFile must map CopyOnWrite. See TryCreate's remarks.)
+        // We don't pick one upfront because vkGetMemoryHostPointerPropertiesEXT
         // returning success doesn't guarantee vkAllocateMemory will accept the pointer with
         // that handle type — driver bugs occur. Instead we collect all candidates that
         // pass the query and try each in sequence inside the buffer/memory construction.
@@ -207,10 +220,10 @@ public sealed class HostVisibleBuffer : IDisposable
 
         // Try each viable handle type in order — vkGetMemoryHostPointerPropertiesEXT
         // returning success doesn't guarantee vkAllocateMemory will accept the
-        // import (driver bugs / handle-type semantics mismatches occur). amdvlk
-        // on gfx1151 in particular returns VK_ERROR_INVALID_EXTERNAL_HANDLE for
-        // HOST_ALLOCATION on read-only MemoryMappedFile views but accepts
-        // HOST_MAPPED_FOREIGN_MEMORY for the same pointer.
+        // import (driver bugs / handle-type semantics mismatches occur). On gfx1151/amdvlk
+        // a read-only MemoryMappedFile view is refused here with
+        // VK_ERROR_INVALID_EXTERNAL_HANDLE under BOTH handle types (#508) — the earlier claim
+        // that HOST_MAPPED_FOREIGN_MEMORY accepts such a pointer was refuted by measurement.
         //
         // #369: shared READ lock around the whole loop — see
         // VulkanDevice.s_lifecycleLock's doc comment. This loop's

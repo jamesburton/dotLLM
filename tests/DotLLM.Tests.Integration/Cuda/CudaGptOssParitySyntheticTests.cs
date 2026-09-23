@@ -152,9 +152,12 @@ public sealed class CudaGptOssParitySyntheticTests : IDisposable
 
     // Parity tolerance: F32 CPU oracle vs the FP16-internal CUDA dense forward
     // (weights upload as F16, cuBLAS HGEMM, attention_f16), so the noise floor is
-    // dominated by FP16 GEMM rounding accumulated over 4 layers plus the CPU's
-    // Schraudolph exp approximation vs the kernel's expf in both the attention
-    // softmax and the MoE router softmax.
+    // dominated by FP16 GEMM rounding accumulated over 4 layers. When this was calibrated it
+    // also carried the CPU's Schraudolph exp approximation against the kernel's expf in both the
+    // attention softmax and the MoE router softmax; #501 removed that approximation from the CPU
+    // default, so that component is gone and the bound is looser than it needs to be. Left as
+    // measured — retightening needs a CUDA box — and it is still the calibrated bound under
+    // DOTLLM_FAST_EXP=1.
     //
     // Empirically calibrated on THIS fixture (2026-09-02, RTX 3060 — raw runs in
     // task-5-report.md). AbsTol is NOT a predicted number; it was set from what

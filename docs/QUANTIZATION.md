@@ -229,6 +229,29 @@ Q4_0 / Q4_1 / Q5_0 / Q5_1 / IQ-family Vulkan kernels are not yet shipped — the
 
 Combined, the old decode produced **noise**: dequantized Bielik-1.5B Q3_K tensors correlated **0.006** with the same tensors from the Q8_0 build of the model (0.988 after the fix). This was invisible to CPU↔Vulkan parity because all backends shared the bug, and invisible to the kernel unit tests because `Q3KFixture` *encoded* with the same wrong layout it decoded with — a closed loop that never touched real GGUF bytes. `DequantizeKQuantTests.Q3_K_DenseRandomBlocks_MatchLlamaCppReference` now pins the CPU oracle to a literal transcription of llama.cpp over dense pseudorandom super-blocks, which is the layer that had been missing.
 
+**Q2_K layout (fixed in #498).** Q2_K carries the *same* element transposition Q3_K did, and it
+survived the #311 sweep because nobody re-checked Q2_K at the time — the Q3_K fix comment in
+`DequantizeKQuants.cs` already named the wrong form as "the old dotLLM layout". Authority is
+llama.cpp's `dequantize_row_q2_K` (`ggml-quants.c`):
+
+- **Element ordering (was wrong).** The 2-bit quants are **not** four consecutive elements per
+  byte. Each 128-element half of the super-block consumes 32 `qs` bytes and every byte supplies
+  **four elements 32 apart**: element `t` is at byte `32*(t>>7) + (t&31)`, shift `2*((t>>5)&3)`.
+  The old `qs[t/4] >> (t%4)*2` form scatters every element.
+- **Scale/dmin sub-block (was, and remains, correct).** The 4-bit scale and 4-bit dmin for element
+  `t` come from sub-block `t>>4`. That index is **not** transposed — only the `qs` addressing was.
+
+Evidence: `blk.0.attn_q.weight` of `Llama-3.2-1B-pure-Q2_K.gguf` correlated against the same
+tensor from the Q8_0 build of the same base gives **0.954** under the llama.cpp layout and
+**0.069** under the old one (Q3_K, checked identically as a control, is 0.988 — correct and
+untouched). As with Q3_K, the unit tests could not see it: `Q2_K_SingleBlock_HandCalculated`
+writes one non-zero `qs` byte and reads elements 0/1/16, the three indices where the two layouts
+coincide, and `Q2KFixture` *encoded* with the same wrong order it decoded with. The oracle that
+was missing is `DequantizeKQuantTests.Q2_K_DenseRandomBlocks_MatchLlamaCppReference`, a literal
+transcription of llama.cpp over dense pseudorandom super-blocks. Vulkan and CUDA carried the same
+transposition and were fixed in the same issue. **Any Q2_K quality number from before #498 is
+meaningless** — the decoded weights were noise.
+
 See [docs/VULKAN.md](VULKAN.md) for runtime selection details and [docs/CUDA.md](CUDA.md) for the CUDA backend's coverage (Q2_K through Q8_0 plus pre-Q8_1 + MMVQ-large + MMQ + grouped-MoE-GEMV variants).
 
 ### MoE indexed-expert matmul (per-row routed dispatch)
