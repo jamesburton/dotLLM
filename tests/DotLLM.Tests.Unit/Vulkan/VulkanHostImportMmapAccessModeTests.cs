@@ -173,6 +173,80 @@ public class VulkanHostImportMmapAccessModeTests(ITestOutputHelper output)
     }
 
     /// <summary>
+    /// What does <see cref="MemoryMappedFileAccess.CopyOnWrite"/> actually COST? It is only a
+    /// fix for the read-only refusal if the pages stay shared with the page cache. If the
+    /// driver pins them for write at import, every page breaks copy-on-write and the mapping
+    /// is duplicated into private memory — which is precisely the second resident copy #508
+    /// exists to remove, so the "fix" would buy nothing.
+    /// </summary>
+    /// <remarks>
+    /// Reports Windows <i>commit charge</i> (<c>PrivateMemorySize64</c> — CoW copies land here)
+    /// and working set across: baseline, after mapping, after reading every page, and after the
+    /// import. A CoW break shows up as private commit growing by roughly the mapped size.
+    /// </remarks>
+    [SkippableFact]
+    public unsafe void CopyOnWriteImport_PrivateCommitCost()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasExternalMemoryHost,
+            "Driver does not expose VK_EXT_external_memory_host on this host.");
+
+        const long bytes = 256L * 1024 * 1024;
+        string path = WritePayload(bytes);
+        var proc = System.Diagnostics.Process.GetCurrentProcess();
+
+        static long Mib(long b) => b / (1024 * 1024);
+        long Commit() { proc.Refresh(); return proc.PrivateMemorySize64; }
+        long Ws() { proc.Refresh(); return proc.WorkingSet64; }
+
+        try
+        {
+            long commit0 = Commit(), ws0 = Ws();
+            _output.WriteLine($"mapped size            : {Mib(bytes)} MiB");
+            _output.WriteLine($"[0] baseline           : commit {Mib(commit0)} MiB, ws {Mib(ws0)} MiB");
+
+            using var mmf = MemoryMappedFile.CreateFromFile(
+                path, FileMode.Open, null, 0, MemoryMappedFileAccess.CopyOnWrite);
+            using var acc = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.CopyOnWrite);
+            byte* basePtr = null;
+            acc.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
+            try
+            {
+                long commit1 = Commit();
+                _output.WriteLine($"[1] after CoW map      : commit {Mib(commit1)} MiB (+{Mib(commit1 - commit0)}), ws {Mib(Ws())} MiB");
+
+                // Read every page. Reads must NOT break copy-on-write.
+                byte* p = basePtr + acc.PointerOffset;
+                long sink = 0;
+                for (long off = 0; off < bytes; off += 4096) sink += p[off];
+                Assert.True(sink >= 0);
+                long commit2 = Commit();
+                _output.WriteLine($"[2] after reading all  : commit {Mib(commit2)} MiB (+{Mib(commit2 - commit1)}), ws {Mib(Ws())} MiB");
+
+                using var buf = HostVisibleBuffer.TryCreate(device, (nint)p, bytes);
+                long commit3 = Commit();
+                _output.WriteLine($"[3] after import       : {Verdict(buf)}");
+                _output.WriteLine($"                         commit {Mib(commit3)} MiB (+{Mib(commit3 - commit2)}), ws {Mib(Ws())} MiB");
+
+                Skip.If(buf is null, "CopyOnWrite import refused on this device — nothing to cost.");
+
+                long brokenPages = commit3 - commit2;
+                _output.WriteLine(brokenPages > bytes / 2
+                    ? $"  => IMPORT BREAKS COPY-ON-WRITE: +{Mib(brokenPages)} MiB private for a "
+                      + $"{Mib(bytes)} MiB mapping. CoW duplicates the weights and is NOT a fix."
+                    : $"  => import added {Mib(brokenPages)} MiB private for a {Mib(bytes)} MiB "
+                      + "mapping — copy-on-write held, so CoW is a viable fix on this driver.");
+            }
+            finally { acc.SafeMemoryMappedViewHandle.ReleasePointer(); }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch (IOException) { /* best effort */ }
+        }
+    }
+
+    /// <summary>
     /// Production tensors are multi-MB and start at arbitrary sub-page offsets inside the
     /// mapping. Repeats the read-only probe at a realistic size and a non-zero offset so a
     /// refusal that only appears at scale cannot hide behind the 16 KiB case above.
