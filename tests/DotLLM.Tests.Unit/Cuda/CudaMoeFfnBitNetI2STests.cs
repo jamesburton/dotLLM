@@ -24,7 +24,11 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// upload replaces the originally-anticipated device-side repack kernel.
 /// </para>
 /// </remarks>
+// #502: this class pins MatMul.I2SUseW2A8Override for the whole of its lifetime, and that static is
+// process-wide. Outside the serialized collection, a sibling class's Dispose un-pins it mid-run and
+// the CPU oracle silently moves to the W2A8 tier.
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaMoeFfnBitNetI2STests : IDisposable
 {
     private readonly CudaContext? _ctx;

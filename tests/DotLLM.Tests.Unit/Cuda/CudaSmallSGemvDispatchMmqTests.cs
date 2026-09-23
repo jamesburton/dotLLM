@@ -7,6 +7,13 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// The #490 dispatch policy — which token counts go to the packed PQ2_0 prefill GEMM and on which
 /// tile. Pure policy, so it runs without a GPU.
 /// </summary>
+/// <remarks>
+/// #502: needs no GPU, but joins the serialized CUDA collection anyway. <c>CudaSmallSGemvDispatch</c>
+/// is read <b>per projection</b> on the live forward path, so setting its overrides while a model
+/// test runs in another collection reroutes that test's kernel choice — a policy test silently
+/// changing which GEMV a parity test measures.
+/// </remarks>
+[Collection(CudaCollection.Name)]
 public sealed class CudaSmallSGemvDispatchMmqTests : IDisposable
 {
     public void Dispose()
