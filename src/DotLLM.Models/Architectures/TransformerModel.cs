@@ -3562,6 +3562,10 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             MatMul.GemvQ8_0((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.Q5_0)
             MatMul.GemvQ5_0((byte*)weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.Q2_K)
+            MatMul.GemvQ2_K((byte*)weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.Q3_K)
+            MatMul.GemvQ3_K((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.Q4_K)
             MatMul.GemvQ4_K((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.Q5_K)
@@ -3597,6 +3601,10 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             MatMul.GemmQ8_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
         else if (qt == QuantizationType.Q5_0)
             MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+        else if (qt == QuantizationType.Q2_K)
+            MatMul.GemmQ2_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+        else if (qt == QuantizationType.Q3_K)
+            MatMul.GemmQ3_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
         else if (qt == QuantizationType.Q4_K)
             MatMul.GemmQ4_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
         else if (qt == QuantizationType.Q5_K)
@@ -3764,8 +3772,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     {
         if (preQuantSource == target) return true;
 
-        bool sourceIsKQuant = preQuantSource is QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K;
-        bool targetIsKQuant = target is QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K;
+        bool sourceIsKQuant = MatMul.UsesQ8KDot(preQuantSource);
+        bool targetIsKQuant = MatMul.UsesQ8KDot(target);
         if (sourceIsKQuant && targetIsKQuant) return true;
 
         // Q8_0 and Q5_0 no longer share input format — Q8_0 uses Q8_0, Q5_0 uses Q8_1.
@@ -3783,7 +3791,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     private static byte* QuantizeInput(float* input, byte* scratch, int dim, int seqLen,
                                        QuantizationType qt)
     {
-        if (qt == QuantizationType.Q4_K || qt == QuantizationType.Q5_K || qt == QuantizationType.Q6_K)
+        if (MatMul.UsesQ8KDot(qt))
         {
             int blockCount = dim / 256; // Q8_K_GroupSize
             int q8kRowBytes = blockCount * MatMul.Q8_K_BlockBytes;
