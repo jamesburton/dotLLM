@@ -30,6 +30,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// this issue.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed unsafe class CudaTransformerModelBitNetMoeTests : IDisposable
 {
     // Wider tolerance than the isolated kernel-level parity in CudaMoeFfnBitNetI2STests

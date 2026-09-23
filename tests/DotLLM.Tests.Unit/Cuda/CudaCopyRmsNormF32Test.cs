@@ -14,6 +14,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// numerically match what the two separate calls would have produced.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaCopyRmsNormF32Test
 {
     private readonly ITestOutputHelper _out;

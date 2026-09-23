@@ -66,6 +66,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </para>
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaLogitsMatchPyTorchReferenceTests
 {
     private readonly ITestOutputHelper _output;

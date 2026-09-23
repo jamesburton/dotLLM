@@ -30,6 +30,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </remarks>
 [Trait("Category", "GPU")]
 [Trait("Category", "Benchmark")]
+[Collection(CudaCollection.Name)]
 public class CudaGraphDecodeDepthProfileTest
 {
     private readonly ITestOutputHelper _out;

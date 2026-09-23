@@ -17,6 +17,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// observable drift would be a bug.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaMoeGroupedGemvTests
 {
     private readonly ITestOutputHelper _out;

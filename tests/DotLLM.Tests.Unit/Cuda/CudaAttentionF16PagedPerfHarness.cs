@@ -27,6 +27,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// does, and does not require a downloaded GGUF model to run.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaAttentionF16PagedPerfHarness
 {
     private readonly ITestOutputHelper _output;
