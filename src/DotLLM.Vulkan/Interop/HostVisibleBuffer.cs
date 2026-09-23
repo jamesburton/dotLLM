@@ -81,7 +81,10 @@ public sealed class HostVisibleBuffer : IDisposable
     /// Diagnostic: name of the Vulkan call that returned the most recent
     /// failure. Empty string when the last call succeeded. Possible values:
     /// "vkGetMemoryHostPointerPropertiesEXT", "vkCreateBuffer",
-    /// "vkAllocateMemory", "vkBindBufferMemory", "memory_type_intersection".
+    /// "vkAllocateMemory", "vkBindBufferMemory", "memory_type_intersection",
+    /// "not_integrated_gpu" (issue #507 — the zero-copy import is refused on a
+    /// discrete GPU, where the imported host pages would be read across PCIe
+    /// for the model's lifetime).
     /// </summary>
     public static string LastImportFailureStage { get; private set; } = string.Empty;
 
@@ -269,10 +272,14 @@ public sealed class HostVisibleBuffer : IDisposable
                     // #507: the import is gated on an integrated (or CPU)
                     // physical device — imported host memory would otherwise
                     // leave every weight in system RAM behind a PCIe link.
-                    // Distinct stage name so a discrete-GPU refusal is
-                    // diagnosable from a genuine type-mask miss.
+                    // Distinguish that refusal from a genuine type-mask miss so
+                    // the dGPU case is diagnosable from the counter alone.
                     LastImportFailureCode = 0;
-                    LastImportFailureStage = "not_integrated_gpu";
+                    LastImportFailureStage =
+                        device.PhysicalDeviceTypeValue is VkPhysicalDeviceType.IntegratedGpu
+                            or VkPhysicalDeviceType.Cpu
+                            ? "memory_type_intersection"
+                            : "not_integrated_gpu";
                     continue;
                 }
 
