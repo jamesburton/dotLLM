@@ -1293,13 +1293,15 @@ internal sealed class VulkanWeights : IDisposable
     private static bool KeepIq3SOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.IQ3_S && (inputDim % 256) == 0;
 
-    /// <summary>Returns the on-device storage quant type for a projection: Q8_0 / Q4_K /
-    /// Q5_K / Q6_K / IQ2_XXS / IQ2_XS / IQ2_S / F16 / BF16 / F32 depending on the source
-    /// Q5_K / Q6_K / IQ4_NL / IQ4_XS / IQ1_S / F16 / BF16 / F32 depending on the source
-    /// and the alignment constraints.</summary>
-    /// <summary>Returns the on-device storage quant type for a projection: Q8_0 / Q2_K /
-    /// Q3_K / Q4_K / Q5_K / Q6_K / F16 / BF16 / F32 depending on the source and the
-    /// alignment constraints.</summary>
+    /// <summary>Returns the on-device storage quant type for a projection. Every
+    /// <see cref="QuantizationType"/> is kept in its packed source form <em>except</em>
+    /// Q4_0, Q4_1 and Q5_1, which have no Vulkan projection kernel and so return
+    /// <see cref="QuantizationType.F32"/> (Q5_1 is nonetheless supported as a routed-MoE
+    /// <c>down</c> bank — see <c>moe_indexed_matmul_q5_1_*</c>). Any format also falls back
+    /// to F32 when <paramref name="inputDim"/> is not a multiple of its group size, or when
+    /// <paramref name="dequantToFp32"/> forces expansion. The <c>Keep*OnDevice</c> predicates
+    /// below are the per-format detail; this method's dispatch order is the authority for
+    /// <c>docs/QUANTIZATION.md</c>'s "Vulkan Backend Coverage" table.</summary>
     private static QuantizationType DeviceQuantTypeFor(
         QuantizationType srcQt, int inputDim, bool dequantToFp32)
     {

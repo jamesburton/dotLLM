@@ -152,16 +152,44 @@ The Vulkan backend ships native matmul kernels (GEMV decode + GEMM prefill, with
 | F16 | ✓ | ✓ | ✓ (F16xF16→F32, M=N=K=16 tile) | `c9c08c5` |
 | BF16 | ✓ | ✓ | — (BF16 tiles not enumerated on RDNA3.5; use shift-left-16 reinterpret) | `c9c08c5` |
 | Q8_0 | ✓ | ✓ | ✓ (`MatMulQ8_0GemmCoopmatKernel`) | pre-existing |
-| Q2_K | ✓ | ✓ | — | (this branch) |
-| Q3_K | ✓ | ✓ | — | (this branch) |
-| Q4_K_M | ✓ | ✓ | — (Phase 1 follow-up) | `afb2272` + `b1ee6bc` |
-| Q5_K_M | ✓ | ✓ | — | `15099b9` + `83e0732` |
-| Q6_K_M | ✓ | ✓ | — | `29a1459` + `39b7646` |
+| Q2_K | ✓ | ✓ | — | layout fixed in #498 |
+| Q3_K | ✓ | ✓ | — | layout fixed in #311 |
+| Q4_K | ✓ | ✓ | — (Phase 1 follow-up) | `afb2272` + `b1ee6bc` |
+| Q5_K | ✓ | ✓ | — | `15099b9` + `83e0732` |
+| Q6_K | ✓ | ✓ | — | `29a1459` + `39b7646` |
+| Q5_0 | ✓ | ✓ | — | legacy-quant pair of Q8_0 |
 | IQ4_NL | ✓ | ✓ | — | IQ-family Phase 2 |
 | IQ4_XS | ✓ | ✓ | — | IQ-family Phase 2 |
+| IQ3_XXS | ✓ | ✓ | — | IQ-family |
+| IQ3_S | ✓ | ✓ | — | IQ-family |
+| IQ2_XXS | ✓ | ✓ | — | `79cca9b` |
+| IQ2_XS | ✓ | ✓ | — | `743984c` |
+| IQ2_S (also IQ2_M) | ✓ | ✓ | — | `9ecce75` |
 | IQ1_S | ✓ | ✓ | — | IQ-family — smallest GGUF quant (~1.5-1.7 bpw) |
+| I2_S | ✓ | ✓ | ✓ (`matmul_i2_s_f32_gemm_coopmat*`) | BitNet b1.58 ternary |
+| PQ2_0 | ✓ | ✓ | ✓ (`matmul_pq2_0_f32_gemm_coopmat*`) | PrismML ternary + per-group scale |
+| Q4_0 / Q4_1 / Q5_1 | — | — | — | **not shipped** — see below |
 
-Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q2_K / Q3_K / IQ3_x / IQ2_x Vulkan kernels are not yet shipped — the upload path falls back to F32 dequant for those formats, so weight memory is doubled / quadrupled. K-quant Q4/5/6 priority was chosen because they cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most checkpoints); IQ4_NL and IQ4_XS followed because they are the most-used IQ-family quants in production (Llama-3.1 / Qwen2.5 IQ4_XS). IQ1_S closes the IQ family at the smallest end. Q2_K + Q3_K + IQ3 / IQ2 are present in the CUDA backend (lighter-weight reference kernels) and are tracked as Vulkan follow-ups.
+**The unshipped set is exactly Q4_0, Q4_1 and Q5_1.** For those three the upload path falls back to
+F32 dequant, so weight memory is doubled / quadrupled; every other `QuantizationType` stays on device
+in its packed source form. The authority for this list is
+`VulkanWeights.DeviceQuantTypeFor` — each `Keep*OnDevice` predicate there additionally requires the
+contraction axis to be a multiple of the format's group size, and a misaligned tensor of *any* format
+falls back to F32 regardless of kernel availability.
+
+One caveat on Q5_1: it has no general projection kernel, but it *is* supported as a routed-MoE
+`down` bank (`moe_indexed_matmul_q5_1_{f32,mmvq}.comp`), and Q5_0 `down` banks are repacked
+bit-exactly to Q5_1 at upload. So "Q5_1 unshipped" is true of dense projections only.
+
+Ordering rationale, for why the family filled in as it did: K-quant Q4/5/6 came first because they
+cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most
+checkpoints). IQ4_NL and IQ4_XS followed as the most-used IQ-family quants in production
+(Llama-3.1 / Qwen2.5 IQ4_XS). The IQ2 family was prioritised to enable Qwen3.6-A3B-IQ2_M
+(~11.5 GB GGUFs) on Strix Halo without a 4× expansion to F32 (~46 GB) at upload. IQ1_S closed the IQ
+family at the smallest end, and Q2_K + Q3_K — the densest K-quants — closed the K-quant family;
+their matmul kernels share the dispatch shape of Q4/5/6_K (one workgroup per output row at decode,
+16×16 output tile at prefill) but use a 16-element K-chunk to match Q2/3_K's 16-element sub-block
+size.
 
 ### IQ4_NL / IQ4_XS layout (Vulkan)
 
@@ -189,11 +217,6 @@ per sub-block ib:
 ```
 
 Alignment: IQ4_NL kernels require `inputDim % 32 == 0`; IQ4_XS kernels require `inputDim % 256 == 0`. The upload path's `KeepIq4NlOnDevice` / `KeepIq4XsOnDevice` predicates gate on these.
-| IQ2_XXS | ✓ | ✓ | — | `79cca9b` |
-| IQ2_XS | ✓ | ✓ | — | `743984c` |
-| IQ2_S (also IQ2_M) | ✓ | ✓ | — | `9ecce75` |
-
-Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q2_K / Q3_K / IQ4_NL / IQ4_XS / IQ1_*, IQ3_* Vulkan kernels are not yet shipped — the upload path falls back to F32 dequant for those formats. K-quant Q4/5/6 priority was chosen because they cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most checkpoints). Q2_K + Q3_K + IQ4_NL + IQ4_XS are present in the CUDA backend and are tracked as Vulkan follow-ups (parallel agent landed CUDA IQ4 in `6f12eab`'s sibling commits). The IQ2 family was prioritised on Vulkan to enable Qwen3.6-A3B-IQ2_M (~11.5 GB GGUFs) on Strix Halo without a 4× expansion to F32 (~46 GB) at upload.
 
 ### IQ1_S layout (Vulkan)
 
@@ -220,7 +243,6 @@ per group l in [0..4):
 ```
 
 Alignment: IQ1_S kernels require `inputDim % 256 == 0`. The upload path's `KeepIq1SOnDevice` predicate gates on this.
-Q4_0 / Q4_1 / Q5_0 / Q5_1 / IQ-family Vulkan kernels are not yet shipped — the upload path falls back to F32 dequant for those formats, so weight memory is doubled / quadrupled. K-quant Q4/5/6 priority was chosen because they cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most checkpoints). Q2_K and Q3_K — the densest K-quants — close the K-quant family on Vulkan; matmul kernels share the dispatch shape of Q4/5/6_K (one workgroup per output row at decode, 16×16 output tile at prefill) but use a 16-element K-chunk to match Q2/3_K's 16-element sub-block size.
 
 **Q3_K layout (fixed in #311).** Q3_K's decode is the easiest K-quant to get wrong, and dotLLM shipped it wrong in *every* backend until #311. Two independent transpositions, both now corrected against llama.cpp's `dequantize_row_q3_K`:
 
