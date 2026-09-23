@@ -480,14 +480,17 @@ internal sealed class VulkanMamba3Weights : IDisposable
     private static VulkanDevice.Buffer AllocateRawBytes(
         VulkanDevice device, VulkanStagingBuffer staging, nint srcPtr, long bytes)
     {
-        if (VulkanWeightImportPolicy.TryImport(device, srcPtr, bytes, out var imported))
-            return imported!;
+        // Deliberately NOT an import site. These pointers come from the optional Q8_0 /
+        // K-quant overlay on Mamba3Weights, which production safetensors loaders never
+        // attach — only mixed-quant test configs do, and those own the buffer themselves
+        // with no contract that it outlives the Vulkan model. An import would alias it
+        // for the model's lifetime. Staging keeps the copy semantics the overlay assumes.
+        VulkanWeightImportPolicy.NoteStaged(srcPtr, bytes, "not_lifetime_owned");
 
         var dst = device.AllocateDeviceLocal(bytes);
         try
         {
             staging.UploadBytes(srcPtr, bytes, dst);
-            VulkanWeightImportPolicy.NoteStaged(srcPtr, bytes);
         }
         catch
         {
@@ -544,16 +547,22 @@ internal sealed class VulkanMamba3Weights : IDisposable
         long bytes = expectedElements * sizeof(float);
         uploadedBytes = bytes;
 
-        // #508: F32 safetensors tensors go to the device byte-for-byte, so the mapped
-        // pages can be aliased rather than copied.
-        if (VulkanWeightImportPolicy.TryImport(device, handle.Pointer, bytes, out var imported))
+        // #508: an F32 safetensors tensor goes to the device byte-for-byte, so the mapped
+        // pages can be aliased rather than copied — but ONLY when the handle points into
+        // the caller's mmap (OwnsMemory == false). An OwnsMemory == true handle is a
+        // conversion buffer that Mamba3Weights.Dispose frees, and BuildOnDevice's contract
+        // explicitly leaves that disposal to the caller, who may do it the moment the
+        // model is built. Aliasing it would be a use-after-free on the GPU.
+        if (!handle.OwnsMemory
+            && VulkanWeightImportPolicy.TryImport(device, handle.Pointer, bytes, out var imported))
             return imported!;
 
         var buf = device.AllocateDeviceLocal(bytes);
         try
         {
             staging.UploadBytes(handle.Pointer, bytes, buf);
-            VulkanWeightImportPolicy.NoteStaged(handle.Pointer, bytes);
+            VulkanWeightImportPolicy.NoteStaged(
+                handle.Pointer, bytes, handle.OwnsMemory ? "not_lifetime_owned" : null);
         }
         catch
         {

@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Vulkan;
+using DotLLM.Vulkan.Kernels;
 using Xunit;
 
 namespace DotLLM.Tests.Unit.Vulkan;
@@ -32,7 +33,7 @@ public class VulkanHybridHostImportParityTests
     [SkippableFact]
     public unsafe void Q8_0Projection_ImportAndStagingPutIdenticalBytesOnDevice()
     {
-        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
         Skip.IfNot(device.HasExternalMemoryHost,
             "Driver does not expose VK_EXT_external_memory_host on this host.");
@@ -63,8 +64,16 @@ public class VulkanHybridHostImportParityTests
                     MatMul.QuantizeF32ToQ8_0(srcPtr + (long)row * k, (byte*)host + (long)row * rowBytes, k);
             }
 
-            float[] staged = new float[totalBytes / 4];
-            float[] imported = new float[totalBytes / 4];
+            float[] x = new float[k];
+            for (int i = 0; i < k; i++) x[i] = (float)((rng.NextDouble() * 2.0 - 1.0));
+
+            // The comparison runs a kernel over each arm's buffer and compares the OUTPUT,
+            // exactly as VulkanHostImportParityTests does. Downloading the weight buffer
+            // itself would put the imported allocation's host mapping on trial rather than
+            // the bytes the shader actually reads.
+            using var kernel = MatMulQ8_0Kernel.Create(device, spvDir);
+            float[] staged = new float[m];
+            float[] imported = new float[m];
 
             // Arm 1 — staging, forced.
             Environment.SetEnvironmentVariable(DisableEnv, "1");
@@ -78,7 +87,12 @@ public class VulkanHybridHostImportParityTests
                 Assert.False(buf.IsHostImported, "arm 1 must be the staging path");
                 Assert.Equal(QuantizationType.Q8_0, stagedQt);
                 Assert.Equal(totalBytes, stagedBytes);
-                device.Download(buf, staged.AsSpan());
+
+                using var bufX = device.Allocate((long)k * sizeof(float));
+                using var bufY = device.Allocate((long)m * sizeof(float));
+                device.Upload(x, bufX);
+                kernel.Launch(buf, bufX, bufY, m, k);
+                device.Download(bufY, staged);
             }
 
             // Arm 2 — import allowed.
@@ -95,14 +109,19 @@ public class VulkanHybridHostImportParityTests
                     "(a discrete GPU is refused by design — issue #507).");
                 Assert.Equal(QuantizationType.Q8_0, importedQt);
                 Assert.Equal(totalBytes, importedBytes);
-                device.Download(buf, imported.AsSpan());
+
+                using var bufX = device.Allocate((long)k * sizeof(float));
+                using var bufY = device.Allocate((long)m * sizeof(float));
+                device.Upload(x, bufX);
+                kernel.Launch(buf, bufX, bufY, m, k);
+                device.Download(bufY, imported);
             }
 
-            for (int i = 0; i < staged.Length; i++)
+            for (int i = 0; i < m; i++)
             {
                 Assert.True(
                     BitConverter.SingleToInt32Bits(staged[i]) == BitConverter.SingleToInt32Bits(imported[i]),
-                    $"word {i} differs: staged={staged[i]} imported={imported[i]}");
+                    $"row {i} differs: staged={staged[i]} imported={imported[i]}");
             }
         }
         finally

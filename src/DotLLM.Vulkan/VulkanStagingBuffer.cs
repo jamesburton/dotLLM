@@ -25,7 +25,9 @@ namespace DotLLM.Vulkan;
 /// </para>
 /// <para>
 /// <b>Double buffering (issue #510).</b> The cap is split across
-/// <see cref="SlotCount"/> = 2 slots, each with its own command buffer and fence.
+/// <see cref="SlotCount"/> = 2 slots, each with its own command buffer and fence
+/// (the second allocated lazily on the first rotation, so single-chunk uploads are
+/// unchanged).
 /// <see cref="Flush"/> submits the current slot <i>without waiting</i> and rotates to
 /// the other, so the host fills slot B while slot A's copy is in flight; a slot is
 /// fence-waited only when it comes round again, and <see cref="WaitAll"/> /
@@ -86,13 +88,13 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
     }
 
     private readonly VulkanDevice _device;
-    private readonly Slot[] _slots;
+    private readonly Slot?[] _slots;
     private int _current;
     private bool _disposed;
 
     /// <summary>Persistent host pointer to the CURRENT slot's mapped memory. Re-read it after every
     /// <see cref="Flush"/> — the slot rotates.</summary>
-    public nint Mapped => _slots[_current].Mapped;
+    public nint Mapped => _slots[_current]!.Mapped;
 
     /// <summary>Usable staging bytes per call — <c>min(neededBytes, MaxChunkBytes / SlotCount)</c>.</summary>
     public long Capacity { get; }
@@ -101,10 +103,20 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
     public long Submits { get; private set; }
 
     /// <summary>Diagnostic (issue #510): total host <c>vkWaitForFences</c> stalls. Before #510 this
-    /// equalled <see cref="Submits"/> by construction.</summary>
+    /// equalled <see cref="Submits"/> by construction; after it, it is still roughly
+    /// <c>Submits - 1</c> because the rotation waits on the slot it is about to reuse. The
+    /// count is NOT the win — <see cref="FenceWaitMilliseconds"/> is.</summary>
     public long FenceWaits { get; private set; }
 
-    private VulkanStagingBuffer(VulkanDevice device, Slot[] slots, long capacity)
+    private long _fenceWaitTicks;
+
+    /// <summary>Diagnostic (issue #510): total host time spent blocked in
+    /// <c>vkWaitForFences</c>. This is the number #510 moves: the wait COUNT barely
+    /// changes, but each wait now finds a copy that has been running since the previous
+    /// chunk's memcpy started, instead of one that was submitted moments ago.</summary>
+    public double FenceWaitMilliseconds => _fenceWaitTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+    private VulkanStagingBuffer(VulkanDevice device, Slot?[] slots, long capacity)
     {
         _device = device;
         _slots = slots;
@@ -112,53 +124,53 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
     }
 
     /// <summary>
-    /// Allocates <see cref="SlotCount"/> host-visible staging slots of
-    /// <c>min(neededBytes, MaxChunkBytes / SlotCount)</c> bytes each and maps them once.
+    /// Allocates a host-visible staging slot of
+    /// <c>min(neededBytes, MaxChunkBytes / SlotCount)</c> bytes and maps it once.
     /// <paramref name="neededBytes"/> is the largest single upload the caller will push
     /// through — smaller models get smaller slots.
     /// </summary>
+    /// <remarks>
+    /// Only the FIRST slot is built here. The second is allocated on the first rotation,
+    /// so a staging buffer that only ever does one <see cref="Flush"/> costs exactly what
+    /// it did before #510 — which matters because <c>VulkanQwen3MoeMoeUpload</c> creates
+    /// and destroys one of these per MoE layer per forward on the non-resident streaming
+    /// decode path, where an extra unused allocation + map would be a per-token cost.
+    /// </remarks>
     public static VulkanStagingBuffer Create(VulkanDevice device, long neededBytes)
     {
         long capacity = Math.Max(4096, Math.Min(neededBytes, MaxChunkBytes / SlotCount));
-        var slots = new Slot[SlotCount];
-        int built = 0;
+        var slots = new Slot?[SlotCount];
+        slots[0] = CreateSlot(device, capacity);
+        return new VulkanStagingBuffer(device, slots, capacity);
+    }
+
+    private static Slot CreateSlot(VulkanDevice device, long capacity)
+    {
+        var buffer = device.Allocate(capacity);
+        nint mapped;
+        nint cmd = 0;
+        nint fence = 0;
         try
         {
-            for (; built < SlotCount; built++)
-            {
-                var buffer = device.Allocate(capacity);
-                nint mapped;
-                nint cmd = 0;
-                nint fence = 0;
-                try
-                {
-                    mapped = device.MapMemoryWithRetry(
-                        buffer.Memory, 0, (ulong)capacity, "vkMapMemory VulkanStagingBuffer (persistent)");
-                    cmd = device.AllocateTransferCommandBuffer();
-                    fence = device.CreateUnsignalledFence();
-                }
-                catch
-                {
-                    device.FreeTransferCommandBuffer(cmd);
-                    device.DestroyOwnedFence(fence);
-                    buffer.Dispose();
-                    throw;
-                }
-                slots[built] = new Slot
-                {
-                    Buffer = buffer,
-                    Mapped = mapped,
-                    CommandBuffer = cmd,
-                    Fence = fence,
-                };
-            }
+            mapped = device.MapMemoryWithRetry(
+                buffer.Memory, 0, (ulong)capacity, "vkMapMemory VulkanStagingBuffer (persistent)");
+            cmd = device.AllocateTransferCommandBuffer();
+            fence = device.CreateUnsignalledFence();
         }
         catch
         {
-            for (int i = 0; i < built; i++) DestroySlot(device, slots[i]);
+            device.FreeTransferCommandBuffer(cmd);
+            device.DestroyOwnedFence(fence);
+            buffer.Dispose();
             throw;
         }
-        return new VulkanStagingBuffer(device, slots, capacity);
+        return new Slot
+        {
+            Buffer = buffer,
+            Mapped = mapped,
+            CommandBuffer = cmd,
+            Fence = fence,
+        };
     }
 
     private static void DestroySlot(VulkanDevice device, Slot slot)
@@ -178,7 +190,7 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
     public void Flush(VulkanDevice.Buffer dst, long dstOffset, long bytes)
     {
         if (bytes <= 0) return;
-        var slot = _slots[_current];
+        var slot = _slots[_current]!;
         _device.SubmitCopyDeferred(
             slot.CommandBuffer, slot.Fence, slot.Buffer, dst,
             srcOffset: 0, dstOffset: (ulong)dstOffset, size: (ulong)bytes);
@@ -186,10 +198,12 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
         Submits++;
 
         _current = (_current + 1) % SlotCount;
-        var next = _slots[_current];
+        var next = _slots[_current] ??= CreateSlot(_device, Capacity);
         if (next.InFlight)
         {
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             _device.WaitAndResetFence(next.Fence);
+            _fenceWaitTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
             next.InFlight = false;
             FenceWaits++;
         }
@@ -204,9 +218,11 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
     {
         for (int i = 0; i < _slots.Length; i++)
         {
-            if (!_slots[i].InFlight) continue;
-            _device.WaitAndResetFence(_slots[i].Fence);
-            _slots[i].InFlight = false;
+            if (_slots[i] is not { InFlight: true } slot) continue;
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            _device.WaitAndResetFence(slot.Fence);
+            _fenceWaitTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+            slot.InFlight = false;
             FenceWaits++;
         }
     }
@@ -281,13 +297,29 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
         }
     }
 
+    /// <summary>
+    /// <c>DOTLLM_VULKAN_MEM_TRACE=1</c> also prints the #508 import ledger and the #510
+    /// submit/stall counters when the staging buffer is torn down — i.e. at the end of
+    /// each weights load. Without this the numbers both issues are measured by are
+    /// unobservable from outside the process.
+    /// </summary>
+    private static readonly bool s_trace =
+        string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE"), "1", StringComparison.Ordinal);
+
     /// <inheritdoc/>
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
         WaitAll();
+        if (s_trace)
+        {
+            Console.Error.WriteLine(
+                $"[vulkan-mem] staging({Capacity / (1024 * 1024)} MiB x{SlotCount}) " +
+                $"submits={Submits} fenceWaits={FenceWaits} stall={FenceWaitMilliseconds:F1} ms; " +
+                VulkanWeightImportPolicy.Summary());
+        }
         for (int i = 0; i < _slots.Length; i++)
-            DestroySlot(_device, _slots[i]);
+            if (_slots[i] is { } slot) DestroySlot(_device, slot);
     }
 }

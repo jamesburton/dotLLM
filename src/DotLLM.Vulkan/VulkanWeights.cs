@@ -1149,7 +1149,7 @@ internal sealed class VulkanWeights : IDisposable
     /// "feature_absent" (driver does not expose VK_EXT_external_memory_host),
     /// "env_disabled" (DOTLLM_VULKAN_DISABLE_HOST_IMPORT=1), "null_src"
     /// (source pointer is null), "import_rejected" (driver rejected the
-    /// vkAllocateMemory import). Empty string when the most recent call took
+    /// vkAllocateMemory import), "too_small" (below one import page). Empty string when the most recent call took
     /// the zero-copy path or when no fallback decision has been made.
     /// </summary>
     public static string LastUploadFallbackReason { get; private set; } = string.Empty;

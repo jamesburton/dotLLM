@@ -17,7 +17,9 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// releasable regardless. A policy that let both be "on" would either lose the memory
 /// win or unmap live device memory.
 /// </remarks>
-[Collection("VulkanWeightImportPolicy")]
+// The policy is process-wide static state that every weights load mutates, so this
+// class must not run concurrently with the GPU tests that load models.
+[Collection("VulkanKernels")]
 public class VulkanWeightImportPolicyTests : IDisposable
 {
     public VulkanWeightImportPolicyTests() => VulkanWeightImportPolicy.Reset();
