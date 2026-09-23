@@ -97,9 +97,17 @@
 // already gives for why ITS grouped-warp design needed its own bit-exactness check rather
 // than inheriting attention_f32's for free).
 //
-// Ships opt-in (DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=1, default OFF), same #180/#183 precedent as
-// v1 and the plain GQA-split kernel: a new precision + reassociation axis on this
-// architecture, not yet backed by a real generation-level validation pass.
+// Shipped opt-in (DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=1, default OFF) when first written, on the
+// same #180/#183 precedent as v1 and the plain GQA-split kernel: a new precision +
+// reassociation axis on this architecture, not yet backed by a real generation-level
+// validation pass.
+//
+// **Default ON as of 2026-07-30**; opt OUT with DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=0. The
+// precondition above is now satisfied -- CudaAttentionMmaDecodeGqaSplitGenerationParityTests.cs
+// is the #222-style real-generation pass (pre-gate bit-identical, post-gate perplexity improves
+// 0.173%, greedy divergence at the same step/depth 225/257 already accepted for the sibling
+// attention_f32_gqa_split_kv). CudaAttentionMmaDecodeGqaSplit.cs's Enabled field is the
+// authority for the effective default; keep this comment in step with it.
 
 #include <cuda_fp16.h>
 #include <float.h>
