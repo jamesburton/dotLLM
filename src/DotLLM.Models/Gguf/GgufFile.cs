@@ -89,12 +89,26 @@ public sealed unsafe class GgufFile : IDisposable
     /// <summary>Byte offset of the tensor data section from the start of the file.</summary>
     public long DataSectionOffset { get; }
 
+    /// <summary>
+    /// Byte length of the tensor data section — exactly the range <see cref="DataBasePointer"/>
+    /// maps, and so the length a page-residency census of the mapping must use.
+    /// </summary>
+    /// <remarks>
+    /// Exposed because the alternative, reopening the file to ask its length, does not work:
+    /// <see cref="FileInfo.Length"/> on a symlink reports the reparse point (every model in the HF
+    /// hub cache is reached through one), and a second <c>File.OpenRead</c> hits a sharing violation
+    /// whenever the mapping is copy-on-write — that mode needs write access, so the mapping holds the
+    /// file with <c>FileShare.None</c>. This value is already known at parse time; use it.
+    /// </remarks>
+    public long DataSectionLength { get; }
+
     private GgufFile(
         GgufHeader header,
         GgufMetadata metadata,
         IReadOnlyList<GgufTensorDescriptor> tensors,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensorsByName,
         long dataSectionOffset,
+        long dataSectionLength,
         nint dataBasePointer,
         MemoryMappedFile? mmf,
         MemoryMappedViewAccessor? accessor,
@@ -105,6 +119,7 @@ public sealed unsafe class GgufFile : IDisposable
         Tensors = tensors;
         TensorsByName = tensorsByName;
         DataSectionOffset = dataSectionOffset;
+        DataSectionLength = dataSectionLength;
         DataBasePointer = dataBasePointer;
         _mmf = mmf;
         _accessor = accessor;
@@ -198,6 +213,7 @@ public sealed unsafe class GgufFile : IDisposable
             tensors.AsReadOnly(),
             tensorsByName,
             dataSectionOffset,
+            dataSectionLength,
             dataBasePointer,
             mmf,
             accessor,
