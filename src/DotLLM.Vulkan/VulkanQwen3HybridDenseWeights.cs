@@ -153,6 +153,7 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
 
         long stagingBytes = ComputeMaxStagingBytes(config, cpuLayers, outputNormWeight,
             outputOutputDim, outputInputDim, outputQt);
+        VulkanWeightImportPolicy.Reset();
         using var staging = VulkanStagingBuffer.Create(device, stagingBytes);
 
         // The embedding gather normally uses vkCmdCopyBuffer byte offsets and so needs a contiguous
@@ -171,8 +172,19 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
             // table has no PQ2_0 arm, and widening here is not an option at this vocabulary size.
             tokenEmbedBytes = DotLLM.Cpu.Kernels.Dequantize.RowByteSize(config.HiddenSize, QuantizationType.PQ2_0)
                             * (long)config.VocabSize;
-            tokenEmbed = device.AllocateDeviceLocal(tokenEmbedBytes);
-            staging.UploadBytes(tokenEmbedWeight, tokenEmbedBytes, tokenEmbed);
+            // #508: kept packed means the device image IS the mmap'd bytes — on Bonsai 2
+            // this single tensor is ~339 MB, so aliasing it rather than copying is worth
+            // as much as most of the projection matrices put together.
+            if (VulkanWeightImportPolicy.TryImport(device, tokenEmbedWeight, tokenEmbedBytes, out var importedEmbed))
+            {
+                tokenEmbed = importedEmbed!;
+            }
+            else
+            {
+                tokenEmbed = device.AllocateDeviceLocal(tokenEmbedBytes);
+                staging.UploadBytes(tokenEmbedWeight, tokenEmbedBytes, tokenEmbed);
+                VulkanWeightImportPolicy.NoteStaged(tokenEmbedWeight, tokenEmbedBytes);
+            }
             tokenEmbedDeviceQt = QuantizationType.PQ2_0;
         }
         else

@@ -234,6 +234,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         // on-device byte form — Q8_0 blocks for kept-Q8_0, F32 elsewhere).
         long stagingBytes = ComputeMaxStagingBytes(config, cpuLayers, outputNormWeight,
             outputOutputDim, outputInputDim, outputQuantType);
+        VulkanWeightImportPolicy.Reset();
         using var staging = VulkanStagingBuffer.Create(device, stagingBytes);
 
         // Token embedding [vocab, hidden] — always dequantised on upload (the embedding
@@ -606,6 +607,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         out long uploadedBytes)
     {
         long elems = (long)outputDim * inputDim;
+        long sourceBytes = Dequantize.RowByteSize(inputDim, qt) * outputDim;
 
         if (!forceF32 && KeepQuantOnDevice(qt, inputDim))
         {
@@ -615,13 +617,32 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             long rowBytes = Dequantize.RowByteSize(inputDim, keepQt);
             long bytes = rowBytes * outputDim;
 
-            var buf = device.AllocateDeviceLocal(bytes);
-            staging.UploadBytes(srcPtr, bytes, buf);
-
             deviceQuantType = keepQt;
             uploadedBytes = bytes;
+
+            // #508: the device image IS the source bytes, so alias the mmap'd pages
+            // instead of copying them. Staging is the fallback.
+            if (VulkanWeightImportPolicy.TryImport(device, srcPtr, bytes, out var imported))
+                return imported!;
+
+            var buf = device.AllocateDeviceLocal(bytes);
+            staging.UploadBytes(srcPtr, bytes, buf);
+            VulkanWeightImportPolicy.NoteStaged(srcPtr, bytes);
             return buf;
         }
+
+        deviceQuantType = QuantizationType.F32;
+        uploadedBytes = elems * sizeof(float);
+
+        // An F32 source reaches the device byte-for-byte even on the "widening" arm —
+        // there is nothing to widen — so it is an import candidate too (#508).
+        if (qt == QuantizationType.F32
+            && VulkanWeightImportPolicy.TryImport(device, srcPtr, uploadedBytes, out var importedF32))
+            return importedF32!;
+
+        VulkanWeightImportPolicy.NoteStaged(
+            srcPtr, sourceBytes,
+            qt == QuantizationType.F32 ? null : "not_source_bytes");
 
         // F32 dequantised upload — covers F32 source, F16 source, every K-quant /
         // Q5_0 (no Vulkan kernel for those yet), and the forceF32-token-embedding
