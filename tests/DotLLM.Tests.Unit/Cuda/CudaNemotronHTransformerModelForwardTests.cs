@@ -24,7 +24,17 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// prefill + decode coverage that exercises <see cref="CudaNemotronHKvCache"/> and
 /// <see cref="CudaNemotronHSsmStateCache"/>, which the cacheless cases never touch.
 /// </summary>
+/// <remarks>
+/// Issue #484: this class MUST stay in <see cref="CudaCollection"/>. Two of its tests
+/// (<c>BuildFromPrebuiltWeights_BadPtxDir_ThrowsAndLeaksNoDeviceMemory</c> and
+/// <c>BuildFromPrebuiltWeights_MidLoadDeviceOom_FreesLedgerAndLeaksNoDeviceMemory</c>) assert on
+/// <c>cuMemGetInfo</c>, which is a <b>device-wide</b> reading. Left uncollected, xUnit gives the
+/// class its own collection and runs it in parallel with every other collection — any concurrent
+/// class allocating device buffers shows up as "free VRAM dropped by N MB", i.e. a phantom leak.
+/// This was the state the class was in when #484 was filed from a T5500 run.
+/// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaNemotronHTransformerModelForwardTests
 {
     private readonly ITestOutputHelper _output;
@@ -323,6 +333,11 @@ public sealed class CudaNemotronHTransformerModelForwardTests
     [SkippableFact]
     public void BuildFromPrebuiltWeights_BadPtxDir_ThrowsAndLeaksNoDeviceMemory()
     {
+        // #484: since CudaKernels.ResolveAndValidatePtxDirectory now runs BEFORE
+        // CudaContext.Create, this path allocates nothing at all — the DirectoryNotFoundException
+        // below is raised while the process still holds zero CUDA resources for this load. The
+        // VRAM assertion therefore no longer probes an unwind path; it pins the stronger property
+        // that a bad ptxDir never reaches the driver.
         Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
 
         var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Ffn };

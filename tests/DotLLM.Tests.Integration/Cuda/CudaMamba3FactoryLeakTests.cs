@@ -52,6 +52,13 @@ public sealed class CudaMamba3FactoryLeakTests : IDisposable
     [SkippableFact]
     public void LoadFromSafetensors_BadPtxDir_ThrowsAndLeaksNoDeviceMemory()
     {
+        // #484: since CudaKernels.ResolveAndValidatePtxDirectory now runs BEFORE
+        // CudaContext.Create, this path allocates nothing at all — the DirectoryNotFoundException
+        // below is raised while the process still holds zero CUDA resources for this load. The
+        // VRAM assertion therefore no longer probes an unwind path; it pins the stronger property
+        // that a bad ptxDir never reaches the driver. (The probe context below is now redundant
+        // for keeping a context current, but is kept: it makes cuMemGetInfo valid regardless of
+        // what the factory does, so the test stays correct if that ordering ever changes back.)
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
 
         string modelPath = Path.Combine(_scratch, "model.safetensors");

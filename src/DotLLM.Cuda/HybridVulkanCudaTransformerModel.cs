@@ -220,6 +220,12 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         ModelConfig config, VulkanTransformerModel vulkanModel, int numVulkanLayers,
         TransformerWeights cpuWeights, int cudaDeviceId, string? ptxDir)
     {
+        // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+        // incomplete ptxDir is by far the most common way this factory throws, and doing the
+        // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+        // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
+
         // Initialize CUDA. #383: context creation cannot leak on its own throw (nothing
         // allocated yet), so it stays outside the try/catch — everything created from here on
         // is disposed on any failure before rethrowing. This method does NOT own
@@ -237,7 +243,6 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
             cublas = CudaCublasHandle.Create();
             cublas.SetStream(stream);
 
-            ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
             kernels = new CudaKernels(ptxDir);
 
             // Upload only the CUDA-resident layers to CUDA VRAM. Layers 0..numVulkanLayers-1

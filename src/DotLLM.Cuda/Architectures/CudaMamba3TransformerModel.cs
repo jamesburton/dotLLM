@@ -233,6 +233,12 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
                     $"Mamba-3 weights are incomplete ({weights.Report.MissingRequiredCount} required tensors "
                     + "missing). Inspect Mamba3Weights.Report.Problems before attempting a CUDA load.");
 
+            // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+            // incomplete ptxDir is by far the most common way this factory throws, and doing the
+            // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+            // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+            ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
+
             // #383: context creation is the one call in this sequence that cannot leak on its
             // own throw (nothing has been allocated yet), so it stays outside the try/catch
             // below — everything created from here on (stream/cublas/kernels/device buffers)
@@ -253,7 +259,6 @@ public sealed unsafe class CudaMamba3TransformerModel : IModel
             {
                 stream = CudaStream.Create();
                 cublas = CudaCublasHandle.Create();
-                ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
                 kernels = new CudaKernels(ptxDir);
 
                 var m3 = config.Mamba3Config;

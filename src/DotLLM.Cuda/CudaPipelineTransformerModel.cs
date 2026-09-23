@@ -96,7 +96,7 @@ public sealed unsafe class CudaPipelineTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
         ValidateSplit(splitLayer, config.NumLayers);
-        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);   // #484: before any CUDA resource exists
 
         // Shared host weights (full model) feed both windowed device uploads. The GPU-only load skips the
         // F32 host dequant of per-expert MoE tensors (matches CudaTransformerModel.LoadFromGguf).
@@ -131,7 +131,7 @@ public sealed unsafe class CudaPipelineTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(cpuWeights);
         ArgumentNullException.ThrowIfNull(config);
         ValidateSplit(splitLayer, config.NumLayers);
-        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);   // #484: before any CUDA resource exists
 
         cpuWeights.RepackWeights(); // idempotent
         CudaPipelineStage? stage0 = null;
@@ -312,6 +312,12 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
         ModelConfig config, TransformerWeights cpuWeights, int deviceId, string ptxDir,
         int firstLayer, int layerCount, bool isFinalStage, bool skipTokenEmbed = false)
     {
+        // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+        // incomplete ptxDir is by far the most common way this factory throws, and doing the
+        // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+        // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
+
         CudaContext? context = null;
         CudaStream? stream = null;
         CudaCublasHandle? cublas = null;
