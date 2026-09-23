@@ -162,9 +162,17 @@ public sealed class LoraStackCudaParityTests
         //     2 × 1.48e-2 rad, i.e. costs 1 − cos ≤ (2·1.48e-2)²/2 = 4.4e-4.
         //   Observed defect signatures are far smaller still: adapter dropped 1.6e-4,
         //   alpha/r omitted 2.4e-4, rank blocks mis-ordered 4.1e-4, FP16 staging 1.0e-4.
-        // The reported 1.09e-3 deficit is therefore ~2.5× larger than the entire LoRA path can
-        // produce however broken it is, so it belongs to the FP16 base path — which cosineBase
-        // now measures directly, in the same process, on the same device.
+        // The reported 1.09e-3 deficit is therefore ~2.5× larger than any magnitude-preserving or
+        // magnitude-shrinking LoRA defect can produce, so it belongs to the FP16 base path — which
+        // cosineBase now measures directly, in the same process, on the same device. (A
+        // magnitude-INFLATING defect — a doubled scale, a wrong leading dimension — is unbounded
+        // and is exactly the class this gate still catches.)
+        //
+        // Prediction to check on the first RTX 3060 run: with the GPU delta effectively a random
+        // vector of the right magnitude, benign behaviour is cosine ≈ cosineBase − 2e-4
+        // (√2 · 1.48e-2 rad, near-orthogonal in a 49k-dim space). cosineBase ≈ 0.9991 with the
+        // stack at 0.998909 is precisely that benign case; cosineBase ≥ 0.9996 with the stack
+        // still at 0.998909 fails this gate and means a real, magnitude-class LoRA defect.
         //
         // δ = 6e-4 = the 4.4e-4 worst-case LoRA budget plus headroom for the FP16 activations,
         // FP16 LoraTmp and FP16-accumulate GEMM (DOTLLM_CUDA_GEMM_16F defaults ON for GeForce

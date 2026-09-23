@@ -29,12 +29,26 @@ namespace DotLLM.Tests.Integration.Models.Lora;
 /// whole-logit cosine, which is 2.5× SMALLER than the 1.09e-3 deficit in #488.</item>
 /// <item>Defect signatures in whole-logit cosine: adapter dropped 1.6e-4, weights halved 2.4e-4,
 /// alpha/r omitted 2.4e-4, rank blocks mis-ordered 4.1e-4, FP16 staging round-trip 1.0e-4.</item>
-/// <item>Delta-space (<c>logits − base</c>) cosine separates defects loudly (0.23 / −0.11 /
-/// −0.38) but is NOT usable as a GPU gate: the end-to-end delta direction is chaotic in the
-/// adapter weights — an FP16 staging round-trip alone rotates it to cosine 0.39 (single) and
-/// −0.06 (stack), and a 1e-4 relative weight nudge already moves the logits by 0.42·||delta||.
-/// Composition correctness is therefore gated here, on the deterministic CPU path.</item>
+/// <item>Delta-space (<c>logits − base</c>) cosine separates the mutants loudly (0.23 / −0.11 /
+/// −0.38) but is NOT usable as a gate of any kind: an FP16 staging round-trip alone rotates the
+/// delta to cosine 0.39 (single) / −0.06 (stack), and a 1e-4 relative weight nudge already moves
+/// the logits by 0.42·||delta|| with a non-monotone response (1e-3 → 1.47·||delta||, 1e-2 →
+/// 0.83·||delta||). That discreteness is the CPU reference's own Q8_0 <i>activation</i>
+/// quantization (see <c>MatMulVnni</c> / <c>MatMul.Q8_0Sse</c>, which quantize the activation to
+/// int8 with a per-32-block scale): a 1.48% perturbation sits at the Q8 activation-quant noise
+/// floor, so no whole-logit metric can see the delta's <i>direction</i>.</item>
 /// </list>
+/// </para>
+/// <para>
+/// Scope, stated plainly: the bound above covers composition defects that preserve or shrink the
+/// delta magnitude. A magnitude-<i>inflating</i> defect (e.g. a double-applied scale or a wrong
+/// leading dimension) is unbounded and cannot be excluded from CPU — that class is what
+/// <c>LoraStackCudaParityTests</c> GATE D now catches. The four composition mutants below are
+/// documented signatures, not a discriminating gate; the discriminating coverage for composition
+/// maths is <c>LoraComposerTests</c> (F32, elementwise, 1e-4). Making GATE D discriminating for
+/// them too would need <c>SyntheticLoraAdapterFactory</c>'s ±0.01 weights enlarged (±0.03 gives a
+/// ~13%-of-norm delta, clear of the Q8 floor) — that touches every sibling parity test and needs
+/// a CUDA run, so it is a follow-up, not part of #488.
 /// </para>
 /// </summary>
 public sealed unsafe class LoraStackCpuErrorBudgetTests
@@ -127,7 +141,9 @@ public sealed unsafe class LoraStackCpuErrorBudgetTests
             $"{maxLoraAttributableDeficit:E2} of whole-logit cosine, which reaches the 1.09e-3 CUDA " +
             "deficit. #488's 'the deficit cannot be the LoRA path' argument no longer holds.");
 
-        // (2) In delta space every defect is loud — this is the measurement the CUDA gate should use.
+        // (2) In delta space every defect is loud. This is NOT a usable GPU gate (FP16 staging
+        //     alone rotates the delta as far — see the class remarks); it pins the signatures so
+        //     the numbers quoted in #488 stay honest as the model/adapters evolve.
         AssertDeltaSignature(dDropped, "adapter2 dropped");
         AssertDeltaSignature(dHalved, "weights halved");
         AssertDeltaSignature(dNoScale, "alpha/r omitted");
