@@ -504,6 +504,54 @@ for cu_file in "$(dirname "$0")"/kernels/*.cu; do
 done
 ```
 
+### The csproj also regenerates PTX — and it does not pin the toolkit
+
+`native/build_ptx.bat` is not the only thing that writes `native/ptx/*.ptx`.
+`src/DotLLM.Cuda/DotLLM.Cuda.csproj` has a `CompileCudaPtx` target that runs
+`BeforeTargets="BeforeBuild"` with `Inputs`/`Outputs` over `.cu` → `.ptx`, so **a plain
+`dotnet build` silently regenerates every `.ptx` whose `.cu` is newer.** It resolves `nvcc` by
+running `nvcc --version` **from `PATH`**, and the host compiler from `VCToolsInstallDir` or, when
+that is unset, `vswhere -latest`.
+
+On a box with more than one CUDA toolkit installed that is a trap:
+
+- PTX whose ISA version exceeds the driver's is rejected outright with
+  `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. CUDA 12.8 emits `.version 8.7`, which is what every
+  committed `.ptx` in this tree declares; CUDA 13.1 emits `.version 9.1`, which no pre-13.1
+  driver will load.
+- The wrong PTX compiles, commits and reviews exactly like the right PTX. It only fails on
+  someone else's older driver.
+- `build_ptx.bat` guards against this (it takes `nvcc` from `%CUDA_PATH%` and asserts
+  `DOTLLM_PTX_EXPECT_VERSION`, default `8.7`, per file at the moment of generation). **The
+  MSBuild target has no such guard** — it takes whatever `PATH` hands it.
+- This mechanism has now regressed **three times**: #124, #318, and again on 2026-09-23.
+
+**The fix is to pin both resolutions before building**, so the MSBuild path compiles with the
+same toolkit `build_ptx.bat` would:
+
+```bat
+set "CUDA_PATH=<the pinned toolkit>"
+set "PATH=%CUDA_PATH%\bin;%PATH%"
+set "VCToolsInstallDir=<...>\VC\Tools\MSVC\<ver>\"
+dotnet build
+```
+
+After any build that may have regenerated PTX, check the tree before committing:
+
+```bash
+grep -m1 '^.version' native/ptx/*.ptx | sort -u -k2   # every file must say 8.7
+```
+
+**Do not delete a `.ptx` to force a rebuild.** MSBuild evaluates the `<Content Include="..\..\native\ptx\*.ptx">`
+glob at *project load*, so a file that does not exist when the build starts is not in the item
+list — `CompileCudaPtx` regenerates it, but nothing copies it to the output directory in that
+same build, and the kernel is missing at runtime. Touch the `.cu`, or rebuild twice.
+
+Related: the target's per-kernel `Arch` metadata mirrors `build_ptx.bat`'s `ARCH_86` list for the
+same reason. A kernel using `mma.sync`/`cp.async` compiled at the `compute_75` default produces
+PTX that parses at build time and fails to JIT at module load, which `CudaKernels` catches and
+turns into a silently disabled kernel — no build error, no crash.
+
 ### .NET Integration
 
 PTX files are included as content files in the project, copied to output directory:
