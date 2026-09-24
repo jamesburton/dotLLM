@@ -330,6 +330,15 @@ type surface unified on `KvGeometry`). Next: Phase 1 (TurboQuant codec).
   `SimpleKvCache` reference vs `tq4` and `tq4q`. **Results** (vs F32 PPL 3.038):
   `tq4` PPL **3.091 (+0.05)**, top-1 argmax agreement **97.9%**, mean|Δlogit| 0.196, meanKL 0.0089 —
   4-bit MSE TurboQuant is quality-neutral. `tq4q` PPL 3.309 (+0.27), top-1 93.8%, mean|Δlogit| 0.418.
+  > **Audit #527 — the weights are fine, the sample is not.** Llama-3.1-8B **Q4_K_M** is a
+  > shipping-grade quant, so this row is *not* a quant-ladder claim and needs no F32 control.
+  > What is unsupported is the word **quality-neutral**: the sample is **48 teacher-forced decode
+  > tokens** with no error bar, and +0.05 on a PPL of 3.038 is **+1.7%** — larger than the +0.30%
+  > at which this project *rejected* a CUDA attention kernel as a default (`docs/CUDA.md`, #222).
+  > Either 48 tokens cannot distinguish +1.7% from zero (in which case "neutral" is unmeasured), or
+  > it can (in which case it is not neutral); the run does not say which, and the test asserts only
+  > `top-1 >= 0.80`, not the PPL. Re-measuring on the standard `dotllm perplexity` corpus path
+  > would settle it and was deliberately not run here.
   **Finding:** at an iso-*total*-bit budget, plain MSE beats QJL — QJL (3-bit MSE + 1-bit residual)
   removes the inner-product *bias* but the extra JL noise costs more ℓ2 accuracy than the debiasing
   buys at 4-bit. QJL is expected to help only at very low bits or iso-*MSE*-bits, not iso-budget.

@@ -44,6 +44,21 @@ Measured on Llama-3.2-1B-pure / wikitext-2 / ctx 512 / 40 chunks, paired per chu
 (−0.01724 ± 0.00185 nats, t = −9.3). Throughput was unchanged at ctx 512 — the accurate path
 is extra vectorized passes over an attention tile sized to stay in L1.
 
+> **The −1.71% is not a quality figure for any model anyone ships** (audit #527). Both arms are
+> dotLLM, paired on the same tokens, so this is not a BOS-misalignment casualty — the *significance*
+> (t = −9.3) is real. But the only model it was measured on is `Llama-3.2-1B-pure` **Q3_K**, a pure
+> quant-ladder fixture, and a degraded model amplifies a fixed difference by one to two orders of
+> magnitude (measured: the same engine delta reads +0.029% / +0.359% / +2.319% on Q8_0- / Q3_K- /
+> Q2_K-derived weights — [PERPLEXITY.md](PERPLEXITY.md#how-to-measure-quality-against-llamacpp-then)).
+> The nearest thing to a shipping-grade row here is the Q8_0 control, and it is **null**. No
+> Q4_K_M / Q5_K_M / Q6_K row was taken, so the cost of the approximation on a shipping quant is
+> unmeasured, not small.
+>
+> **The decision to default the approximation OFF still stands** — it rests on "no measured
+> throughput benefit", which no amount of amplification touches. What must not be repeated is the
+> quotation of 1.71% as the quality cost. Settling that needs a re-measurement on a shipping-grade
+> quant with #516 in place; it was deliberately not run as part of this audit.
+
 `DOTLLM_FAST_EXP=1` restores the bit trick as a benchmarking lever. **It is CPU-only**: CUDA
 ships precompiled PTX with no equivalent switch, so setting it makes the CPU and CUDA backends
 diverge by roughly the approximation's own error (~1%, ~5e-3 abs on attention output). That is

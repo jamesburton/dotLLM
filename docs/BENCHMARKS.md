@@ -35,6 +35,12 @@ Throughput comparisons live here; **quality** comparisons are documented separat
 end-to-end dotLLM-vs-llama.cpp perplexity comparison score different text, the canonical LF
 fixture, and the `--kl-divergence-base` shared-token-ids protocol.
 
+Two later corrections live there too, and a quality number quoted without them is not usable:
+the **BOS misalignment** (#515, fixed in #516/#518) — identical *bytes* were never the
+requirement, identical *tokens* were — and the measurement rule that **degraded models amplify a
+small fixed difference** (#519/#520), so pure quant-ladder fixtures are the wrong instrument for
+an engine-vs-engine claim.
+
 ## Current Results (2026-03-06)
 
 All results on: **AMD Ryzen 7 5800HS**, 16 GB DDR4, 8 cores / 16 threads, Windows 11, CPU-only, .NET 10, llama.cpp b5291.

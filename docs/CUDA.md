@@ -918,6 +918,11 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
     subsequent tokens differ. Perplexity confirms independently: flat pre-gate (-0.02%, as expected
     since the kernel can't engage there), +0.30% post-gate. **Recommendation: #183 stays opt-in/
     default-OFF** — the fastest kernel found here is not a safe default despite the win being real.
+    *(Audit #527: the +0.30% here and the −0.173% below are measured on real Bonsai-27B weights —
+    PQ2_0 is the form that model ships in, not a quant-ladder degradation — so both are valid
+    quality claims. Neither reports a **paired standard error** over its ~780 scored steps, and
+    neither transfers to another model: see the annotation in `docs/GPU.md` on why a delta measured
+    on one weight set cannot be divided by one measured on another.)*
   - **#226/#227: tried fp64 accumulation in the cross-split combine step to reduce the
     reassociation error — no improvement, clean negative result.** Root cause is *not* the softmax
     exponential (at the time that was the Schraudolph `fast_exp_neg`, used identically by both the

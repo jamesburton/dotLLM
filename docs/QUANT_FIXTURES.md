@@ -25,6 +25,18 @@ DOTLLM_QUANT_FIXTURE_<TYPE>=/absolute/path/to/model.gguf
 Fixtures are model weights and therefore **never** live inside the repository — see the
 "Model & Fixture Storage Rules" section of `CLAUDE.md`.
 
+> **These fixtures are for coverage and cross-backend gating, not for quality claims.**
+> They are `--pure` requantizations: every tensor forced to one type, including the ones a real
+> quantization scheme deliberately keeps wide. Pure-Q2_K on this 1.2 B base is a *destroyed* model
+> (PPL ~1400 against ~13.9 at Q8_0), and a degraded model amplifies any fixed difference between
+> two implementations by one to two orders of magnitude — measured, not asserted: the same engine
+> delta reads +0.029% / +0.095% / +0.359% / +2.319% on Q8_0- / Q6_K- / Q3_K- / Q2_K-derived
+> weights, with the Q6_K row (coarse grid, healthy model) null. Three quality claims died to this
+> (#515, #519, #520). Use a shipping-grade quant for any engine-vs-engine or kernel-quality
+> number, and if a degraded one is unavoidable report the F32-decoded control for the same weights
+> (`scripts/make_f32_decoded_gguf.py`). Full rule:
+> [PERPLEXITY.md](PERPLEXITY.md#how-to-measure-quality-against-llamacpp-then).
+
 ## Generating the ladder
 
 The fixtures are one small base model requantized once per type, so that a divergence between

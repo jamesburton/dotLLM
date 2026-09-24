@@ -31,6 +31,14 @@ aligned protocol Q3_K is **+1.33%**, not +4.79%, and what survives is a narrower
 Q3_K quantization costs ~2.9× llama.cpp's. The Bonsai and Nemotron-H claims are
 still unverified and are tracked as #514.
 
+> **The "~2.9×" in the paragraph above did not survive either** (audit #527, 2026-09-24). It is
+> computed from the 564-chunk table's two Q3_K rows, i.e. from a *degraded* weight set, and the
+> same ratio **reverses to 0.62× on a healthy model** — see
+> [Degraded models amplify](#degraded-models-amplify-a-small-fixed-difference) and the closure of
+> #519. Kept here rather than deleted because this is the third layer of the same mistake: each
+> time a number was narrowed it was narrowed to another figure measured on the same amplifier.
+> What survives from this section is the method (share the token ids, pass `--bos`), not a ratio.
+
 ### Why the reader is not "fixed"
 
 llama.cpp on **Linux** keeps the `\r` as well — the platform-dependent part is the MSVC text-mode

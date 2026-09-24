@@ -16,6 +16,8 @@ namespace DotLLM.Cpu.Kernels;
 /// it survives normalization as a reweighting of the mixture each head computes. It is free on a
 /// full-precision model and expensive on a heavily quantized one — Q3_K Llama-3.2-1B pays
 /// +1.71% perplexity for it, Q8_0 pays nothing. See <see cref="UseFastExp"/> for the measurements.
+/// <b>Audit #527: "+1.71%" is a pure quant-ladder number with a null Q8_0 control and no
+/// shipping-grade row — read it as "the cost is unmeasured on shipping quants", not as a size.</b>
 /// </para>
 /// <para>
 /// The core trick (Schraudolph 1999): <c>exp(x) ≈ reinterpret_as_float((int)(x * C0 + C1))</c> where
@@ -57,6 +59,19 @@ public static class FastMath
     ///   perplexity. Against llama.cpp the gap goes from +2.03% (t = +5.7) to +0.28% (t = +0.8,
     ///   not significant).</description></item>
     /// </list>
+    /// <para><b>Audit #527: the -1.71% is not a shipping-grade quality figure, and the
+    /// "+2.03% -> +0.28% against llama.cpp" line above is not a valid engine claim.</b> Both arms
+    /// of the A/B are dotLLM on the same tokens, so the paired significance (t = -9.3) is real;
+    /// what is not established is the size on anything anyone ships. <c>Llama-3.2-1B-pure</c> Q3_K
+    /// is a pure quant-ladder fixture, and a degraded model amplifies a fixed difference by one to
+    /// two orders of magnitude (the same engine delta measures +0.029% / +0.359% / +2.319% on
+    /// Q8_0- / Q3_K- / Q2_K-derived weights). The Q8_0 control here is null; no shipping-grade
+    /// quant (Q4_K_M / Q5_K_M / Q6_K) was measured. The engine-vs-engine numbers additionally
+    /// predate #516 and carry the BOS caveat: a <c>--tokens-file</c> stream holds BOS at index 0
+    /// only, so unless <c>--bos</c> was also passed every chunk but the first was scored with no
+    /// attention sink - a softmax-regime confound in a softmax-precision experiment. See
+    /// <c>docs/PERPLEXITY.md</c>, "How to measure quality against llama.cpp, then". The
+    /// default-OFF decision is unaffected: it rests on the absence of a throughput benefit.</para>
     /// <para>A 3-bit model's attention scores sit closer together, so a 1-2% reweighting changes
     /// the mixture materially. The cost scales with how damaged the model is — exactly the
     /// regime aggressive quantization exists to serve — so the approximation is kept only as an
