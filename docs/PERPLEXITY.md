@@ -236,7 +236,17 @@ anyone ships. Their sensitivity is what makes such a comparison look dramatic an
   works. A defect big enough to matter will show there.
 - If a degraded quant must be used, **report the F32-decoded control for the same weights**. Only
   the gap between control and quantized row is attributable to the quant path; the control itself
-  measures the amplifier.
+  measures the amplifier. Build one with
+  [`scripts/make_f32_decoded_gguf.py`](../scripts/make_f32_decoded_gguf.py) — it replaces every
+  tensor of a given quantization type with **llama.cpp's own `gguf-py` decode**, so the control's
+  weights do not come from dotLLM:
+
+  ```bash
+  python scripts/make_f32_decoded_gguf.py model-Q3_K.gguf model-Q3_K-decoded-F32.gguf --keep-token-embd
+  ```
+
+  `--keep-token-embd` leaves the (tied) lm_head quantized, which is usually what you want so the
+  control differs from the quantized run only in the transformer matmul tensors.
 - **Never read a degraded-model delta as a kernel property without that control.** This is the
   third time in this investigation that a weight-set-dependent effect was read as a fixed one —
   first the BOS offset hiding under a healthy control, then the Q3_K "2.9×", then the F32
