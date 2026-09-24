@@ -173,35 +173,19 @@ streams verified identical end to end with `llama-tokenize --ids --no-escape` vs
 
 #515 was opened on a Q3_K figure of **+4.79%** and a Q2_K figure of **−8.26%**.
 
-> **Superseded 2026-09-24 — the "2.9×" below is an amplifier, not a kernel defect.** Measuring
-> the same quantity on a *healthy* model reverses it: on Q8_0, dotLLM's cost of quantizing is
-> **+0.048%** against llama.cpp's **+0.078%** — dotLLM is *better*, 0.62×. And on exact F32 weights
-> the dotLLM-vs-llama.cpp residual tracks how degraded the weights are: **+0.029%** (healthy),
-> **+0.359%** (Q3_K-derived), **+2.319%** (Q2_K-derived, a 94×-degraded model). See
-> [Degraded models amplify](#degraded-models-amplify-a-small-fixed-difference) below. Direct kernel
-> evidence agrees: dotLLM's Q3_K dot is at the Q8_K quantization floor and its Q8_K quantizer has
-> identical reconstruction error to llama.cpp's.
+**What these rows do and do not say.** The Q8_0 control agreeing to −0.110% establishes that the
+harness, geometry, tokenizer and corpus are common to all three runs. It does **not** license
+reading the other rows as kernel properties: the two lower rows are *degraded* models, and a
+degraded model amplifies any small difference between the engines by one to two orders of
+magnitude. See [Degraded models amplify](#degraded-models-amplify-a-small-fixed-difference) — the
+"cost of quantizing" computed from these rows (llama.cpp +0.337%, dotLLM +0.978%, a 2.9× ratio)
+**reverses on a healthy model**, where dotLLM is the better of the two at 0.62×. Direct kernel
+evidence agrees: dotLLM's Q3_K dot sits at the Q8_K quantization floor and its Q8_K quantizer has
+reconstruction error identical to llama.cpp's.
 
-**The finding that survives: dotLLM's Q3_K quantization costs ~2.9× llama.cpp's.** Compare each
-engine against *its own* exact-F32 run of the same weights, which cancels the forward-path
-difference that the F32 row exposes:
-
-| engine | F32 | Q3_K | cost of quantizing |
-|---|---|---|---|
-| llama.cpp | 21.0912 | 21.1623 | **+0.337%** |
-| dotLLM | 21.2349 | 21.4426 | **+0.978%** |
-
-A 64-chunk sample gave 2.7× independently. Both engines are deterministic across thread counts,
-the weights are bit-identical, and the token streams are identical — so this is a property of the
-Q3_K consumption path. The natural candidate is **Q8_K activation quantization** (`QuantizeF32ToQ8_K`);
-it was never ruled out, only exonerated as the cause of the spurious 4% gap.
-
-**A separate, smaller residual: +0.681% on exact F32 weights**, i.e. with no quantization anywhere
-and identical tokens. Ruled out for it: RoPE scaling (this GGUF has no `rope_scaling` keys at all),
-KV-cache precision and flash attention (0.03%). The Q8_0 control has the *opposite* sign (dotLLM
-better by 0.110%), which would argue against a single shared precision difference — but only if
-that row is distinguishable from zero, which per-run bars cannot establish. Localise with
-`--per-window` before chasing it.
+Ruled out along the way, each by measurement rather than inspection: RoPE scaling (this GGUF has
+no `rope_scaling` keys at all), KV-cache precision and flash attention (0.03%), FP reduction order
+(both engines reproduce to 4 dp across thread counts), and tokenization (288,938 ids, 0 differ).
 
 **On the error bars.** These are per-run standard errors. The measurements are **paired** — same
 chunks, same ids — so overlapping individual bars do not make a difference insignificant; the
@@ -213,16 +197,22 @@ paired standard error is much smaller. Quote a residual as established only afte
 residual scales with how degraded the weights are.** All three models were built by replacing the
 112 transformer matmul tensors with llama.cpp's own `gguf-py` decode, `token_embd` kept at Q8_0:
 
-| model (exact F32 both sides) | dotLLM | llama.cpp | residual | its own degradation |
-|---|---|---|---|---|
-| Q8_0-derived | 15.1280 | 15.1236 | **+0.029%** | 1.0× |
-| Q3_K-derived | 23.2145 | 23.1314 | **+0.359%** | 1.5× |
-| Q2_K-derived | 1451.3694 | 1418.4704 | **+2.319%** | 93.8× |
+Tested **paired** (same chunks, same ids — `--per-window` against llama.cpp's running per-chunk
+series). The Q6_K row is the control that separates *grid coarseness* from *degradation*: it was
+Q6_K-quantized from the healthy F32 model and decoded back, so its weights sit on a **coarser
+6-bit grid than Q8_0** while the model itself is **not degraded**.
 
-A ~79× spread in mean-NLL difference from a fixed pair of implementations doing identical
-arithmetic on identical inputs. The two engines differ by a **small fixed amount** — about 0.03% on
-a healthy model, plausibly accumulation order or intermediate precision — and a degraded model,
-whose predictions are already near-uniform, responds far more sharply to it.
+| model (exact F32 both sides) | its PPL | grid | degradation | residual | t (63 df) | 95% CI |
+|---|---|---|---|---|---|---|
+| Q8_0-derived | 15.124 | 8-bit | 1.00× | +0.029% | **+0.19** | [−0.28%, +0.34%] |
+| **Q6_K-derived** | 15.166 | **6-bit** | **1.003×** | +0.095% | **+0.64** | [−0.20%, +0.39%] |
+| Q3_K-derived | 23.131 | 3-bit | 1.53× | +0.359% | +1.34 | [−0.17%, +0.89%] |
+| Q2_K-derived | 1418.470 | 2-bit | 93.8× | +2.319% | **+3.02** | [+0.81%, +3.85%] |
+
+**On a healthy model the two engines are indistinguishable** (t = 0.19), and that holds for a
+coarse 6-bit grid too (t = 0.64) — so grid coarseness is not what drives the residual, degradation
+is. Only the destroyed model reaches significance. A ~79× spread in mean-NLL difference from a
+fixed pair of implementations doing identical arithmetic on identical inputs.
 
 The same reversal shows in the cost of quantizing:
 
