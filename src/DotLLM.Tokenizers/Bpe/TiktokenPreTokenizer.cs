@@ -84,30 +84,18 @@ internal static class TiktokenPreTokenizer
     ];
 
     // ── Qwen 2 / Qwen 3 (llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN2) ──────
-    // Identical to the Llama-3 expression EXCEPT the digit alternative is a bare
-    // `\p{N}` (one digit per segment) instead of `\p{N}{1,3}`, so BPE never merges
-    // across digits. This is the ORIGINAL tokenizer.json pattern that llama.cpp
-    // quotes verbatim in the comment above its own copy (llama-vocab.cpp, the
-    // QWEN2 case); llama.cpp spells the contractions out as `'[sS]|'[tT]|…` only
-    // because std::regex has no `(?i:…)` group — the two are equivalent and .NET
-    // supports the original form directly.
+    // Byte-identical to the expression llama.cpp EXECUTES for the
+    // STABLELM2 / QWEN2 / HUNYUAN / SOLAR_OPEN case block (llama-vocab.cpp,
+    // b11166-7-g84e76d8a). Differs from the Llama-3 expression in exactly one
+    // place: the digit alternative is a bare `\p{N}` (one digit per segment)
+    // instead of `\p{N}{1,3}`, so BPE never merges across digits.
+    // The contractions are spelled out per character rather than via `(?i:…)`,
+    // matching llama.cpp character for character (see Qwen35Pipeline above,
+    // which uses the same spelling).
+    // clean_spaces = false for this type, which is this pipeline's default.
     private static readonly Regex[] Qwen2Pipeline =
     [
-        new(@"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
-            RegexOptions.Compiled),
-    ];
-
-    // ── Qwen 3.5 (llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN35) ────────────
-    // Qwen2's expression with combining marks folded into the letter run:
-    // `[\p{L}\p{M}]+` instead of `\p{L}+`, and `\p{M}` excluded from the
-    // punctuation class (`[^\s\p{L}\p{M}\p{N}]+`). A decomposed "e" + U+0301
-    // therefore stays ONE segment here but splits into letter + mark under
-    // qwen2/llama3/gpt2 — the property the discriminating test exercises.
-    // Original tokenizer.json pattern, quoted verbatim by llama.cpp above its
-    // QWEN35 case.
-    private static readonly Regex[] Qwen35Pipeline =
-    [
-        new(@"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        new(@"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
             RegexOptions.Compiled),
     ];
 
@@ -165,7 +153,6 @@ internal static class TiktokenPreTokenizer
         "qwen35" => Qwen35Pipeline,
         "gpt-4o" or "llama4" => Gpt4oPipeline,
         "tekken" => TekkenPipeline,
-        "qwen35" => Qwen35Pipeline,
         _ => Environment.GetEnvironmentVariable("DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER") == "1"
             ? Gpt2Pipeline
             : throw new InvalidDataException(
