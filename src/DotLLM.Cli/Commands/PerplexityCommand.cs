@@ -92,9 +92,8 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         public bool PerWindow { get; set; }
 
         [CommandOption("--bos")]
-        [Description("Substitute BOS at the start of each window. Match the model's add_bos setting: llama.cpp only does this when the tokenizer requests it.")]
-        [DefaultValue(false)]
-        public bool Bos { get; set; }
+        [Description("Prepend BOS to the stream and substitute it at each window start. Defaults to the model's own setting, derived from the vocab exactly as llama.cpp derives it; pass --bos true/false only to override that.")]
+        public bool? Bos { get; set; }
 
         [CommandOption("--quant")]
         [Description("Quantization to select when resolving a HuggingFace repo ID.")]
@@ -164,6 +163,12 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         using GgufFile gguf = GgufFile.Open(resolvedPath);
         ModelConfig config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+
+        // Issue #515/#516: llama.cpp prepends BOS to the whole stream when the vocab asks for it,
+        // and dotLLM did not -- so every chunk boundary sat one token off llama.cpp's and the two
+        // engines scored different text. The setting is a property of the vocab, not a user
+        // preference, so it is derived here and --bos only overrides it.
+        bool addBos = settings.Bos ?? GgufAddBosResolver.Resolve(gguf.Metadata);
 
         if (!TryParseDevice(settings.Device, out string backend, out int gpuId))
         {
@@ -250,7 +255,9 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             using TextReader reader = settings.NormalizeLineEndings
                 ? new CrlfNormalizingTextReader(fileReader)
                 : fileReader;
-            foreach (int id in CorpusReader.StreamTokens(reader, tokenizer, settings.MaxTokens))
+            foreach (int id in CorpusReader.StreamTokens(
+                         reader, tokenizer, settings.MaxTokens,
+                         bosTokenId: addBos ? tokenizer.BosTokenId : -1))
                 tokens.Add(id);
         }
 
@@ -273,7 +280,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         AnsiConsole.MarkupLine(
             $"[grey]device: {Markup.Escape(deviceLabel)}  all-rows logits: {returnsAllRows} "
             + $"({(returnsAllRows ? "single-pass O(n)" : "growing-prefix O(n^2)")})[/]");
-        int bosTokenId = settings.Bos ? tokenizer.BosTokenId : -1;
+        int bosTokenId = addBos ? tokenizer.BosTokenId : -1;
         var options = new PerplexityOptions(
             mode, effectiveContext, effectiveStride, settings.MaxTokens, effectivePrefix, bosTokenId);
 
