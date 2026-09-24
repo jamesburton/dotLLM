@@ -241,7 +241,17 @@ public sealed class EmbeddingsEndpointHttpTests(EmbeddingsServerFixture fixture,
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
 
         using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-        string error = body.RootElement.GetProperty("error").GetString() ?? "";
+
+        // #452 replaced the flat {"error": "<string>"} body with the SDK envelope
+        // {"error": {"message", "type", ...}} — neither SDK can read .type/.code/.param off a bare
+        // string. Assert the envelope's shape, not just its message, so the next shape change fails
+        // here rather than silently reading a null message. (#523: this test kept the old shape and
+        // threw on every case for as long as the fixture happened to be present.)
+        var envelope = body.RootElement.GetProperty("error");
+        Assert.Equal(JsonValueKind.Object, envelope.ValueKind);
+        Assert.False(string.IsNullOrWhiteSpace(envelope.GetProperty("type").GetString()));
+
+        string error = envelope.GetProperty("message").GetString() ?? "";
         Assert.False(string.IsNullOrWhiteSpace(error));
 
         // The 400 must come from validating THIS request, not from model activation — an earlier
