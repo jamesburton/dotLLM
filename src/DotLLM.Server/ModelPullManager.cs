@@ -151,9 +151,15 @@ public sealed class PullJob
     private DateTimeOffset? _completedAt;
 
     /// <summary>
-    /// Raised on every progress report. Handlers must not throw and must not block — the download
-    /// loop invokes this synchronously.
+    /// Raised on every progress report, and once more when the job reaches a terminal state.
+    /// Handlers must not throw and must not block.
     /// </summary>
+    /// <remarks>
+    /// Delivery is on a thread pool thread, not the download loop: <see cref="Progress{T}"/> posts
+    /// its callbacks. Ticks can therefore arrive out of order with respect to the download, and a
+    /// tick dispatched after completion is dropped rather than applied (#521) — so read state from
+    /// <see cref="ToDto"/> rather than assuming the last raise carries the last value.
+    /// </remarks>
     public event Action<PullJob>? Progress;
 
     /// <summary>Requests cancellation. Leaves the <c>.incomplete</c> file so a re-POST resumes.</summary>
@@ -165,21 +171,36 @@ public sealed class PullJob
     /// <summary>Completes when the job reaches a terminal state. Never faults.</summary>
     public Task WaitAsync() => _completion.Task;
 
+    /// <summary>
+    /// Applies one progress report and raises <see cref="Progress"/>, unless the job has already
+    /// reached a terminal state (#521).
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Progress{T}"/> has no synchronization context here, so it posts every callback to
+    /// the thread pool: a tick reported in the last moments of a download can be dispatched
+    /// <b>after</b> <see cref="Run"/>'s completion block has stamped the exact size. Without this
+    /// guard that tick rolls <see cref="BytesDownloaded"/> backwards and <c>/v1/models/pull/{id}</c>
+    /// serves a <c>completed</c> job at under 100 percent.
+    /// </remarks>
+    internal void ApplyProgress(long bytesDownloaded, long? totalBytes)
+    {
+        lock (_stateLock)
+        {
+            if (Status != "running") return;
+            BytesDownloaded = bytesDownloaded;
+            TotalBytes = totalBytes;
+        }
+        Progress?.Invoke(this);
+    }
+
     internal void Run(HuggingFaceDownloader downloader, string? cacheRoot, string? modelsDir)
     {
         _ = Task.Run(async () =>
         {
             try
             {
-                var progress = new Progress<(long bytesDownloaded, long? totalBytes)>(p =>
-                {
-                    lock (_stateLock)
-                    {
-                        BytesDownloaded = p.bytesDownloaded;
-                        TotalBytes = p.totalBytes;
-                    }
-                    Progress?.Invoke(this);
-                });
+                var progress = new Progress<(long bytesDownloaded, long? totalBytes)>(
+                    p => ApplyProgress(p.bytesDownloaded, p.totalBytes));
 
                 var result = await downloader.DownloadToHubCacheAsync(
                     RepoId, Filename, Revision, cacheRoot, modelsDir, progress, _cts.Token)
