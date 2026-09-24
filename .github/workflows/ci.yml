@@ -2,7 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `dev` is here for the model cache, not only for post-merge CI (#526): a cache saved by
+    # a pull_request run belongs to the merge ref (`refs/pull/.../merge`) and "can only be
+    # restored by re-runs of the pull request", while a run may restore caches from its own
+    # branch, its base branch or the default branch (GitHub dependency-caching docs,
+    # "Restrictions for accessing a cache"). PRs in this fork target `dev`, so without a
+    # `dev`-triggered run nothing ever writes an entry that a *different* PR can read, and
+    # every PR's first run would still start cold.
+    branches: [main, dev]
   pull_request:
 
 env:
