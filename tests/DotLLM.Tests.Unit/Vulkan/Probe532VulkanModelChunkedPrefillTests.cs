@@ -111,6 +111,10 @@ public sealed class Probe532VulkanModelChunkedPrefillTests
 
     private static string? FindLlama32_1B_Q8_0()
     {
+        string? probeOverride = Environment.GetEnvironmentVariable("PROBE532_MODEL_GGUF");
+        if (!string.IsNullOrEmpty(probeOverride))
+            return File.Exists(probeOverride) ? probeOverride : null;
+
         string? overridePath = Environment.GetEnvironmentVariable("DOTLLM_LLAMA32_1B_Q8_0_GGUF");
         if (!string.IsNullOrEmpty(overridePath))
             return File.Exists(overridePath) ? overridePath : null;
