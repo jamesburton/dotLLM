@@ -25,10 +25,14 @@ namespace DotLLM.Tests.Integration.Engine;
 /// length at the split, so the sweep is prompt length x chunk size.
 /// </para>
 /// <para>
-/// <b>The F32 arm is a sensitivity control, not extra coverage.</b> The F32-decoded model is clean
-/// throughout this bug (its spread was 1.7e-7 while Q8_0 spread 0.043), so an F32-only test would
-/// pass either way and prove nothing. It is here to show the harness is measuring the model and not
-/// itself; the load-bearing arm is Q8_0.
+/// <b>The F32 arm is a sensitivity control, not extra coverage.</b> The load-bearing arm is Q8_0:
+/// the broken form moved its final logits row by <c>4.193E-01</c>, while the F32-decoded model --
+/// the same weights dequantized outside dotLLM's lineage -- moved by <c>1.049E-05</c>, four orders
+/// of magnitude less, and never changed a token. That separation is the control: it shows the Q8_0
+/// number is quantization amplifying a ULP rather than the harness measuring itself. (The F32 arm
+/// does sit just over the shared budget on the broken form; its raw-logit deltas are ~5e-7
+/// *relative* on logits spanning tens, consistent with the 1.7e-7 logprob spread the issue reported
+/// after softmax.) Both arms are bit-exact once the fix is in.
 /// </para>
 /// </summary>
 public sealed class ChunkedPrefillInvarianceTests
@@ -71,8 +75,9 @@ public sealed class ChunkedPrefillInvarianceTests
 
     /// <summary>
     /// Sensitivity control: the same sweep on an F32 decode of the same weights, produced outside
-    /// dotLLM's lineage. This arm passed before the fix as well — that is the point. It shows the
-    /// Q8_0 arm above is reporting on the model rather than on a harness artefact.
+    /// dotLLM's lineage. Its worst delta on the broken form was 1.049E-05 against Q8_0's 4.193E-01 —
+    /// four orders of magnitude — and no token ever changed. That separation is what shows the Q8_0
+    /// number is quantization amplifying a reduction-order ULP, not a harness artefact.
     /// </summary>
     [SkippableFact]
     public void F32Decoded_ChunkedPrefillLogits_MatchSinglePass_Control()
@@ -85,7 +90,9 @@ public sealed class ChunkedPrefillInvarianceTests
     /// <summary>
     /// End-to-end acceptance from the issue: for the reported prompt every prefill chunk size must
     /// produce the same tokens and the same pos-0 top-1 logprob. Before the fix chunk 1 and 3 gave
-    /// -0.55704731 while 0/2/4/5 gave -0.51405847.
+    /// -0.55704731 while 0/2/4/5 gave -0.51405847. Re-measured on this tree (after #501's precise
+    /// exp) the broken form gives -0.55717152 vs -0.51418936, with the token sequences diverging
+    /// from position 1.
     /// </summary>
     [SkippableFact]
     public void Q8_0_CapitalOfFrance_AllPrefillChunkSizesAgree()
