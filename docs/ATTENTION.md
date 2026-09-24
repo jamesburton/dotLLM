@@ -59,6 +59,39 @@ is extra vectorized passes over an attention tile sized to stay in L1.
 > quotation of 1.71% as the quality cost. Settling that needs a re-measurement on a shipping-grade
 > quant with #516 in place; it was deliberately not run as part of this audit.
 
+**Measured (#531, 2026-09-24).** That re-measurement was run: `dev`, CPU, wikitext-2 LF, ctx 512,
+**64 windows**, plain `--corpus` (BOS-aligned by default since #516), paired per window, 63 df,
+**fast minus accurate** so positive = the approximation costs perplexity. Full working:
+`.docs/measurements/2026-09-24-531-fastexp-shipping-grade.md`.
+
+| model | fast-exp | accurate | ΔNLL (nats) | PPL % | t | 95% CI on PPL % |
+|---|---|---|---|---|---|---|
+| **Q4_K_M** (shipping-grade) | 15.7620 | 15.7669 | −0.00031 ± 0.00066 | −0.031% | **−0.47** | **[−0.163%, +0.101%]** |
+| Q4_K_M decoded to F32 (control) | 15.7378 | 15.7359 | +0.00012 ± 0.00037 | +0.012% | +0.32 | [−0.063%, +0.086%] |
+| Q3_K (pure ladder) | 23.8620 | 23.4613 | +0.01693 ± 0.00178 | +1.708% | +9.50 | [+1.346%, +2.071%] |
+| Q3_K decoded to F32 (control) | 23.6171 | 23.2145 | +0.01719 ± 0.00136 | +1.734% | +12.61 | [+1.457%, +2.012%] |
+
+Two results, and the second is the one that changes how the paragraph above should be read.
+
+1. **On a shipping-grade quant the cost is not resolvable at n = 64.** Q4_K_M and its F32 control
+   are both consistent with zero and with each other; the honest statement is a bound, ≲0.16%, not
+   a size. (Q4_K_M here is `llama-quantize --allow-requantize … Q4_K_M` of the healthy
+   Q8_0-derived F32 model, so the row is on the same lineage as the amplification table.)
+2. **The −1.71% on Q3_K reproduces (+1.708%) — and its F32-decoded control moves by the same
+   +1.734%.** The control has no quantized matmul in it at all. So the penalty is **not** a
+   property of the Q3_K path, and "the cost scales with how close a model's attention scores sit"
+   is right while any reading of it as *a 3-bit format's* cost is wrong. It is a property of
+   weights degraded to PPL ≈ 23, by whatever means.
+
+**What was not wrong: the alignment.** #531 also settled the contradiction between the 40-chunk
+figures quoted here and PERPLEXITY.md's — see
+[PERPLEXITY.md](PERPLEXITY.md#501s-40-chunk-q3_k-rows-are-the-f32-decoded-path-531). The 2026-09-23
+run did pass `--bos`; what it did not run is today's packed Q3_K × Q8_K kernel. Its numbers
+reproduce digit-for-digit on the **`Q3_K-decoded-F32`** fixture (22.2692 / 21.8886, window 0
+11.763354) and on neither packed row (22.5090 / 22.1019). The "+2.03% → +0.28% against llama.cpp"
+line that accompanied them is therefore F32-decoded dotLLM against packed-Q3_K llama.cpp; the
+like-for-like packed gap is +1.03% (64 chunks) / +1.325% (564).
+
 `DOTLLM_FAST_EXP=1` restores the bit trick as a benchmarking lever. **It is CPU-only**: CUDA
 ships precompiled PTX with no equivalent switch, so setting it makes the CPU and CUDA backends
 diverge by roughly the approximation's own error (~1%, ~5e-3 abs on attention output). That is
