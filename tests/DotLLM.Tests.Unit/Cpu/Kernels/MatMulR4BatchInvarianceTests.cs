@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Cpu.Kernels;
+using DotLLM.Cpu.Threading;
 using Xunit;
 
 namespace DotLLM.Tests.Unit.Cpu.Kernels;
@@ -77,9 +78,18 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
         var f = new Fixture(qt, n, seed: 530 + n);
         try
         {
-            f.RunMultiTokenGemm(f.Actual);
-            f.RunSingleTokenPerRow(f.Expected);
+            f.RunMultiTokenGemm(f.Actual, pool: null);
+            f.RunSingleTokenPerRow(f.Expected, pool: null);
             f.AssertBitExact($"{qt} n={n}: multi-token GEMM diverges from the single-token kernel");
+
+            // Same property with the thread pool engaged on both arms: M = 38 is above
+            // ParallelMinRows, so production reaches the pooled workers, and group boundaries
+            // must not move with the thread count.
+            using var pool = new ComputeThreadPool(4);
+            f.RunMultiTokenGemm(f.Actual, pool);
+            f.AssertBitExact($"{qt} n={n}: pooled multi-token GEMM diverges from the single-token kernel");
+            f.RunSingleTokenPerRow(f.Actual, pool);
+            f.AssertBitExact($"{qt} n={n}: pooled single-token kernel diverges from the serial one");
         }
         finally
         {
@@ -110,7 +120,7 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
         try
         {
             f.RunRowMajorGemm(f.Actual);
-            f.RunSingleTokenPerRow(f.Expected);
+            f.RunSingleTokenPerRow(f.Expected, pool: null);
             f.AssertBitExact($"{qt}: row-major GEMM diverges from the repacked kernel");
         }
         finally
@@ -136,11 +146,11 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
         try
         {
             f.RunRowMajorGemm(f.Actual);
-            f.RunSingleTokenPerRow(f.Expected);
+            f.RunSingleTokenPerRow(f.Expected, pool: null);
             Assert.True(f.AnyBitDifference(),
                 "Q8_0's R4 and row-major kernels now agree bit-exactly — delete this test and add " +
                 "Q8_0 to LayoutParityQuants.");
-            Assert.True(f.MaxRelativeDifference() < 1e-5f,
+            Assert.True(f.MaxRelativeDifference() < 2e-6f,
                 $"Q8_0 R4-vs-row-major divergence grew beyond the recorded bound: {f.MaxRelativeDifference():E3}");
         }
         finally
@@ -196,30 +206,30 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
         }
 
         /// <summary>The post-fix multi-token arm: tiled GEMM over the repacked weights.</summary>
-        public void RunMultiTokenGemm(float* c)
+        public void RunMultiTokenGemm(float* c, ComputeThreadPool? pool)
         {
             byte* w = (byte*)_rw.Ptr;
             switch (_qt)
             {
                 case QuantizationType.Q4_K:
                     MatMul.GemmR4TiledQ4_K(w, _b, _inputQ, c, _rw.FullGroupCount, _rw.TailRows,
-                        _blockCount, M, K, _n, null);
+                        _blockCount, M, K, _n, pool);
                     break;
                 case QuantizationType.Q5_K:
                     MatMul.GemmR4TiledQ5_K(w, _b, _inputQ, c, _rw.FullGroupCount, _rw.TailRows,
-                        _blockCount, M, K, _n, null);
+                        _blockCount, M, K, _n, pool);
                     break;
                 case QuantizationType.Q6_K:
                     MatMul.GemmR4TiledQ6_K(w, _b, _inputQ, c, _rw.FullGroupCount, _rw.TailRows,
-                        _blockCount, M, K, _n, null);
+                        _blockCount, M, K, _n, pool);
                     break;
                 case QuantizationType.Q5_0:
                     MatMul.GemmR4TiledQ5_0(w, _b, _inputQ, c, _rw.FullGroupCount, _rw.TailRows,
-                        _blockCount, M, K, _n, null);
+                        _blockCount, M, K, _n, pool);
                     break;
                 case QuantizationType.Q8_0:
                     MatMul.GemmR4TiledQ8_0(w, _b, _inputQ, c, _rw.FullGroupCount, _rw.TailRows,
-                        _blockCount, M, K, _n, null);
+                        _blockCount, M, K, _n, pool);
                     break;
                 default:
                     throw new NotSupportedException(_qt.ToString());
@@ -253,7 +263,7 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
         }
 
         /// <summary>The single-token arm: repacked ComputeRows, once per token.</summary>
-        public void RunSingleTokenPerRow(float* c)
+        public void RunSingleTokenPerRow(float* c, ComputeThreadPool? pool)
         {
             byte* w = (byte*)_rw.Ptr;
             for (int t = 0; t < _n; t++)
@@ -263,19 +273,19 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
                 switch (_qt)
                 {
                     case QuantizationType.Q4_K:
-                        MatMul.ComputeRowsQ4_KInterleaved(w, x, y, _rw.FullGroupCount, _rw.TailRows, _blockCount);
+                        MatMul.ComputeRowsQ4_KInterleaved(w, x, y, _rw.FullGroupCount, _rw.TailRows, _blockCount, pool);
                         break;
                     case QuantizationType.Q5_K:
-                        MatMul.ComputeRowsQ5_KInterleaved(w, x, y, _rw.FullGroupCount, _rw.TailRows, _blockCount);
+                        MatMul.ComputeRowsQ5_KInterleaved(w, x, y, _rw.FullGroupCount, _rw.TailRows, _blockCount, pool);
                         break;
                     case QuantizationType.Q6_K:
-                        MatMul.ComputeRowsQ6_KInterleaved(w, x, y, _rw.FullGroupCount, _rw.TailRows, _blockCount);
+                        MatMul.ComputeRowsQ6_KInterleaved(w, x, y, _rw.FullGroupCount, _rw.TailRows, _blockCount, pool);
                         break;
                     case QuantizationType.Q5_0:
-                        MatMul.ComputeRowsQ5_0Interleaved(w, x, y, _rw.FullGroupCount, _rw.TailRows, _blockCount);
+                        MatMul.ComputeRowsQ5_0Interleaved(w, x, y, _rw.FullGroupCount, _rw.TailRows, _blockCount, pool);
                         break;
                     case QuantizationType.Q8_0:
-                        MatMul.ComputeRowsQ8_0Interleaved(w, x, y, _rw.FullGroupCount, _rw.TailRows, _blockCount);
+                        MatMul.ComputeRowsQ8_0Interleaved(w, x, y, _rw.FullGroupCount, _rw.TailRows, _blockCount, pool);
                         break;
                     default:
                         throw new NotSupportedException(_qt.ToString());
