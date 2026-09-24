@@ -132,6 +132,115 @@ public class Probe532CudaAttentionKvLengthTests
     }
 
     /// <summary>
+    /// CUDA <c>attention_f16</c> (<c>LaunchAttention</c>) — the ACTUAL production dense
+    /// path in <c>CudaTransformerModel</c> (the F32 kernel above is the F32-state variant).
+    /// <c>attention.cu</c> is structurally the same kernel as <c>attention_f32.cu</c>:
+    /// tiles from 0 in <c>TILE_KV</c> steps, masks with <c>-FLT_MAX</c>, fixed-width warp
+    /// reduction over <c>nw = ceil(blockDim.x/warpSize)</c>, <c>score_tile[t] &gt; 0.0f</c>
+    /// skip in the weighted-V loop. Predicted invariant.
+    /// </summary>
+    [SkippableFact]
+    public void Cuda_DenseF16_KvPadding()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir!);
+
+        const int numHeads = 9, numKvHeads = 3, headDim = 64;
+        var sb = new StringBuilder();
+        sb.AppendLine("=== CUDA attention_f16 (production dense path) — KV padding ===");
+        long worst = 0;
+
+        foreach (var (v, kvPad, seqQ, posOff) in new[]
+                 {
+                     (3, 4, 3, 0), (3, 5, 3, 0), (3, 7, 3, 0),
+                     (5, 7, 5, 0), (5, 9, 5, 0),
+                     (17, 19, 17, 0), (17, 21, 17, 0),
+                     (250, 260, 250, 0), (3, 300, 3, 0),
+                     // decode
+                     (3, 5, 1, 2), (16, 260, 1, 15),
+                     // chunked-prefill: later chunk at positionOffset > 0
+                     (5, 7, 2, 3), (103, 105, 3, 100),
+                 })
+        {
+            var rng = new Random(0x532 + v * 31 + kvPad * 7 + seqQ * 3 + posOff);
+            ushort[] q = RandHalf(rng, seqQ * numHeads * headDim);
+            ushort[] k = RandHalf(rng, kvPad * numKvHeads * headDim);
+            ushort[] vv = RandHalf(rng, kvPad * numKvHeads * headDim);
+            int outLen = seqQ * numHeads * headDim;
+            ushort[] a = new ushort[outLen], b = new ushort[outLen];
+
+            RunF16Pair(kernels, stream, q, k, vv, a, b,
+                seqQ, v, kvPad, numHeads, numKvHeads, headDim, posOff);
+
+            long d = 0; float maxAbs = 0;
+            for (int i = 0; i < outLen; i++)
+            {
+                if (a[i] != b[i])
+                { d++; maxAbs = MathF.Max(maxAbs, MathF.Abs((float)BitConverter.UInt16BitsToHalf(a[i]) - (float)BitConverter.UInt16BitsToHalf(b[i]))); }
+            }
+            worst = Math.Max(worst, d);
+            sb.AppendLine($"  seqQ={seqQ,4} posOff={posOff,4} V={v,4} seqKv={kvPad,4}: differing={d,6}/{outLen,-7} maxAbs={maxAbs:E3}");
+        }
+
+        sb.AppendLine();
+        sb.AppendLine(worst == 0
+            ? "VERDICT: CUDA attention_f16 is BITWISE INVARIANT to KV padding."
+            : $"VERDICT: CUDA attention_f16 IS KV-length dependent (worst {worst} elements).");
+        _out.WriteLine(sb.ToString());
+    }
+
+    private static ushort[] RandHalf(Random rng, int n)
+    {
+        var a = new ushort[n];
+        for (int i = 0; i < n; i++)
+            a[i] = BitConverter.HalfToUInt16Bits((Half)(rng.NextDouble() * 2.0 - 1.0));
+        return a;
+    }
+
+    private static unsafe void RunF16Pair(
+        CudaKernels kernels, CudaStream stream,
+        ushort[] q, ushort[] k, ushort[] v, ushort[] outA, ushort[] outB,
+        int seqQ, int seqKvA, int seqKvB, int numHeads, int numKvHeads, int headDim, int posOff)
+    {
+        long qBytes = (long)q.Length * sizeof(ushort);
+        long kvBytes = (long)k.Length * sizeof(ushort);
+        long oBytes = (long)outA.Length * sizeof(ushort);
+        nint dQ = 0, dK = 0, dV = 0, dA = 0, dB = 0;
+        try
+        {
+            CudaDriverApi.cuMemAlloc_v2(out dQ, (nuint)qBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dK, (nuint)kvBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dV, (nuint)kvBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dA, (nuint)oBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dB, (nuint)oBytes).ThrowOnError();
+            fixed (ushort* p = q) CudaDriverApi.cuMemcpyHtoD_v2(dQ, (nint)p, (nuint)qBytes).ThrowOnError();
+            fixed (ushort* p = k) CudaDriverApi.cuMemcpyHtoD_v2(dK, (nint)p, (nuint)kvBytes).ThrowOnError();
+            fixed (ushort* p = v) CudaDriverApi.cuMemcpyHtoD_v2(dV, (nint)p, (nuint)kvBytes).ThrowOnError();
+
+            nint s = stream.Handle;
+            kernels.LaunchAttention(dQ, dK, dV, dA, seqQ, seqKvA, numHeads, numKvHeads, headDim, posOff, 0, s);
+            kernels.LaunchAttention(dQ, dK, dV, dB, seqQ, seqKvB, numHeads, numKvHeads, headDim, posOff, 0, s);
+            stream.Synchronize();
+
+            fixed (ushort* p = outA) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dA, (nuint)oBytes).ThrowOnError();
+            fixed (ushort* p = outB) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dB, (nuint)oBytes).ThrowOnError();
+        }
+        finally
+        {
+            if (dQ != 0) CudaDriverApi.cuMemFree_v2(dQ);
+            if (dK != 0) CudaDriverApi.cuMemFree_v2(dK);
+            if (dV != 0) CudaDriverApi.cuMemFree_v2(dV);
+            if (dA != 0) CudaDriverApi.cuMemFree_v2(dA);
+            if (dB != 0) CudaDriverApi.cuMemFree_v2(dB);
+        }
+    }
+
+    /// <summary>
     /// CUDA SPLIT-KV <c>attention_f32_split_kv</c> (opt-in, #183). Structurally
     /// identical exposure to the Vulkan split-KV kernel that MEASURED affected:
     /// <c>chunk = ceil(seq_kv / ATTN_KV_SPLIT)</c> moves the reduction boundaries

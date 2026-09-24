@@ -174,6 +174,16 @@ public class Probe532VulkanAttentionKvLengthTests
             worst = Math.Max(worst, r.Differing);
             sb.AppendLine($"  V={v,4} seqKv={kvPad,4}: differing={r.Differing,6}/{r.Total,-7} maxAbs={r.MaxAbs:E3}");
         }
+        // The literal chunked-prefill shape: a later chunk at positionOffset > 0.
+        sb.AppendLine();
+        sb.AppendLine("Chunked-prefill shape: seqQ=2 at posOff=P, seqKv=P+2 vs P+2+pad");
+        foreach (var (p, seqQ, pad) in new[] { (3, 2, 2), (3, 2, 4), (100, 3, 2), (100, 3, 160) })
+        {
+            var r = Probe532Harness.VulkanFlashCoopmatOffsetPair(device, flash!, p, seqQ, pad, numHeads: 9, numKvHeads: 3, headDim: 64);
+            worst = Math.Max(worst, r.Differing);
+            sb.AppendLine($"  posOff={p,4} seqQ={seqQ} seqKv={p + seqQ,4}->{p + seqQ + pad,4}: differing={r.Differing,5}/{r.Total,-6} maxAbs={r.MaxAbs:E3}");
+        }
+
         sb.AppendLine();
         sb.AppendLine(worst == 0
             ? "VERDICT: Vulkan flash-coopmat attention is BITWISE INVARIANT to KV padding."
@@ -385,6 +395,40 @@ internal static class Probe532Harness
 
         kernel.Launch(bq, bk, bv, bo1, visible, visible, numHeads, numKvHeads, headDim, positionOffset: 0);
         kernel.Launch(bq, bk, bv, bo2, visible, paddedKv, numHeads, numKvHeads, headDim, positionOffset: 0);
+
+        float[] a = new float[outLen], b = new float[outLen];
+        device.Download(bo1, a);
+        device.Download(bo2, b);
+        return Compare(a, b, outLen);
+    }
+
+    /// <summary>
+    /// Chunked-prefill shape: a later prefill chunk of <paramref name="seqQ"/> rows at
+    /// <paramref name="posOff"/>, with the KV cache declared at its true length vs padded.
+    /// </summary>
+    internal static Diff VulkanFlashCoopmatOffsetPair(
+        VulkanDevice device, VulkanFlashAttentionCoopmatKernel kernel,
+        int posOff, int seqQ, int pad, int numHeads, int numKvHeads, int headDim)
+    {
+        int kvA = posOff + seqQ;
+        int kvB = kvA + pad;
+        var rng = new Random(Seed + posOff * 31 + seqQ * 7 + pad + 1700);
+        float[] qh = Rand(rng, seqQ * numHeads * headDim);
+        float[] kh = Rand(rng, kvB * numKvHeads * headDim);
+        float[] vh = Rand(rng, kvB * numKvHeads * headDim);
+        int outLen = seqQ * numHeads * headDim;
+
+        using var bq = device.Allocate((long)qh.Length * sizeof(float));
+        using var bk = device.Allocate((long)kh.Length * sizeof(float));
+        using var bv = device.Allocate((long)vh.Length * sizeof(float));
+        using var bo1 = device.Allocate((long)outLen * sizeof(float));
+        using var bo2 = device.Allocate((long)outLen * sizeof(float));
+        device.Upload(qh.AsSpan(), bq);
+        device.Upload(kh.AsSpan(), bk);
+        device.Upload(vh.AsSpan(), bv);
+
+        kernel.Launch(bq, bk, bv, bo1, seqQ, kvA, numHeads, numKvHeads, headDim, positionOffset: posOff);
+        kernel.Launch(bq, bk, bv, bo2, seqQ, kvB, numHeads, numKvHeads, headDim, positionOffset: posOff);
 
         float[] a = new float[outLen], b = new float[outLen];
         device.Download(bo1, a);
