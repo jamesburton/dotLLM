@@ -139,7 +139,11 @@ internal sealed class JinjaEvaluator
                 SetVariable(node.VariableName, item);
             }
 
-            // Set loop variable
+            // Set loop variable. previtem/nextitem are intentionally omitted rather than set to
+            // Undefined at the first/last iteration respectively — member access on a
+            // Dictionary<string, object?> already yields Undefined for an absent key (see
+            // EvalMemberAccess), so this reuses the evaluator's existing undefined convention
+            // instead of inventing a new one, and never throws at the boundary (Jinja2 semantics).
             var loopVar = new Dictionary<string, object?>
             {
                 ["index"] = i + 1,
@@ -150,6 +154,10 @@ internal sealed class JinjaEvaluator
                 ["revindex"] = length - i,
                 ["revindex0"] = length - i - 1,
             };
+            if (i > 0)
+                loopVar["previtem"] = itemList[i - 1];
+            if (i < length - 1)
+                loopVar["nextitem"] = itemList[i + 1];
             SetVariable("loop", loopVar);
 
             foreach (var bodyNode in node.Body)
@@ -583,6 +591,10 @@ internal sealed class JinjaEvaluator
         bool result = expr.TestName switch
         {
             "none" => value is null,
+            // "is defined" is parsed separately as IsDefinedExpr (see JinjaParser), but "is
+            // undefined" falls through to the generic identifier-test path here — mirror the
+            // same Undefined-sentinel check so both spellings agree.
+            "undefined" => ReferenceEquals(value, Undefined),
             "mapping" => value is Dictionary<string, object?>,
             "string" => value is string,
             "sequence" => value is IList,
