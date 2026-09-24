@@ -29,7 +29,7 @@ namespace DotLLM.Tests.Integration.Cpu;
 /// <para>
 /// Written for issue #519, which alleged dotLLM's Q3_K quantization cost ~2.9× llama.cpp's. This
 /// decomposition showed the dot was already at the floor — there was no room for such a defect —
-/// and the 2.9% turned out to be degraded-model amplification, not a kernel property. The test
+/// and the 2.9x turned out to be degraded-model amplification, not a kernel property. The test
 /// stays so that a future change which *does* put error into the dot is caught as a kernel
 /// regression rather than rediscovered through perplexity on a degraded model.
 /// </para>

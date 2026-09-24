@@ -79,6 +79,16 @@ public sealed class VulkanSplitDecodeParityTests
     // Sized against this project's own precedent: CUDA's #183 was rejected at
     // +0.30%, the MMA-decode GQA-split kernel accepted at −0.173%. Anything inside
     // ±0.10% is well below both and is reduction-order noise, not a quality change.
+    //
+    // Flagged by audit #527 — deliberately not retuned. The bound is fine in itself: it guards a
+    // shipping-grade fixture (Llama-3.2-3B-Instruct IQ4_XS), the observed deltas are 0.005–0.012%,
+    // so it carries ~10x headroom and is not derived from a degraded measurement. What is unsound
+    // is the *sizing argument* above — the +0.30% / −0.173% precedents were measured on
+    // Bonsai-27B PQ2_0, a different weight set, and a fixed difference reads across a ~79x spread
+    // depending purely on the weights it is measured on (docs/PERPLEXITY.md, "Degraded models
+    // amplify a small fixed difference"). Those numbers justify the *vocabulary* ("this project
+    // treats tenths of a percent as decision-relevant"), not the magnitude. If this bound is ever
+    // re-derived, derive it from this fixture's own noise floor.
     private const double PplRatioTol = 0.0010;
 
     // Deep-context arm: the depth range #345's 2.1x/2.8x win was measured at.

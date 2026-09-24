@@ -168,6 +168,15 @@ public sealed class CrossBackendQuantGateTests
     /// perplexity) - a genuine CPU IQ1_S defect that a magnitude-only ("perplexity isn't
     /// astronomical") check would have missed, since a --pure 1-bit fixture is *supposed* to
     /// have a huge absolute perplexity.
+    /// <para><b>Flagged by audit #527 - deliberately not retuned.</b> Both the bound and the
+    /// divergence it was sourced from were measured on <c>--pure</c> quant-ladder fixtures, where
+    /// signal and noise are *both* amplified (see <c>docs/PERPLEXITY.md</c>, "Degraded models
+    /// amplify a small fixed difference"). That is internally consistent here, because this gate
+    /// only ever runs on those fixtures, and the amplification cuts the safe way: a real defect
+    /// shows up *larger* on a degraded fixture than it would on a shipping quant. What the number
+    /// does <i>not</i> license is reuse - 0.05 nats says nothing about the cross-backend spread
+    /// that should be tolerated on Q4_K_M/Q6_K weights. If this gate is ever extended to
+    /// shipping-grade fixtures, the bound must be re-derived there, not inherited.</para>
     /// </summary>
     private const double NatsTolerance = 0.05;
 

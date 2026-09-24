@@ -338,6 +338,25 @@ default at **−0.173%**. Vulkan split-KV moves perplexity by 0.005–0.012% in 
 the rejected one — so the CUDA "keep it off" conclusion does **not** transfer as a
 quality prediction, only as the (correct) warning that token-level equality will not hold.
 
+> **The "~25x / ~60x" are not comparable quantities** (audit #527). They divide a
+> Llama-3.2-3B-Instruct IQ4_XS delta by two Bonsai-27B PQ2_0 deltas — *different weight sets*.
+> The measured fact that motivated the rule in
+> [PERPLEXITY.md](PERPLEXITY.md#degraded-models-amplify-a-small-fixed-difference) is that one
+> fixed engine difference reads across a **79x spread** purely by changing how degraded the
+> weights are; a ratio taken across two weight sets therefore carries the amplifier, not the
+> kernel. Each of the three numbers is individually fine — all three were measured on weights
+> those models actually ship (PQ2_0 is Bonsai's trained form, not a post-hoc quant-ladder
+> degradation), and each is a paired same-token A/B against its own baseline. It is the
+> *division* that has no meaning. The paragraph's conclusion survives — arguably it is stronger
+> without the numbers, since cross-model transfer of a quality delta is exactly what the rule
+> forbids. Settling the comparison would need the CUDA kernels re-measured on this model, or the
+> Vulkan one on Bonsai; neither was run for this audit.
+>
+> Separately: none of the three deltas is reported with a **paired standard error**, and
+> PERPLEXITY.md's own closing line says to compute one before calling a difference real. The
+> accept/reject decisions at -0.173% and +0.30% (`docs/CUDA.md`) rest on point estimates over
+> ~1000 steps. Likely significant given the pairing, but unreported.
+
 Real-GGUF end-to-end coverage: **Llama only** (`VulkanSplitDecodeParityTests`).
 Two gaps remain, both recorded rather than implied:
 
