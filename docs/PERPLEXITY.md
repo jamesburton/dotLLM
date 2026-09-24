@@ -26,8 +26,9 @@ itself is suspect. Comparisons where dotLLM was fed llama.cpp's exact token ids 
 **Re-measured 2026-09-23, then again 2026-09-24.** The 2026-09-23 pass concluded the Q2_K and Q3_K
 gaps "survive on identical bytes". They did not: identical bytes are not identical *tokens*, and
 the streams were offset by a BOS — see [the BOS trap](#the-bos-trap-issue-515) and the
-[corrected baseline](#measured-the-corrected-baseline-2026-09-24). Under the aligned protocol the
-Q8_0 control agrees to **−0.0007%** and no row is disjoint. The Bonsai and Nemotron-H claims are
+[aligned 564-chunk baseline](#measured-the-aligned-564-chunk-baseline-2026-09-24). Under the
+aligned protocol Q3_K is **+1.33%**, not +4.79%, and what survives is a narrower claim: dotLLM's
+Q3_K quantization costs ~2.9× llama.cpp's. The Bonsai and Nemotron-H claims are
 still unverified and are tracked as #514.
 
 ### Why the reader is not "fixed"
@@ -156,7 +157,108 @@ it. On Llama-3.2-1B the same offset was worth **0.086% on Q8_0 against 4.8% on Q
 and **0.5% against 4.0%** at 64 chunks (Q8_0 15.0595 unaligned → 15.1353 aligned). **A healthy control agreeing therefore does not license reading a degraded row as a
 property of that quant's path.** That inference, made explicitly below, is wrong in principle.
 
-### Measured: the corrected baseline (2026-09-24)
+### Measured: the aligned 564-chunk baseline (2026-09-24)
+
+**This is the citable table.** Both engines provably score the same tokens, over the full corpus.
+dotLLM ran plain `--corpus` with **no flags** — since #516 that is aligned by default. Token
+streams verified identical end to end with `llama-tokenize --ids --no-escape` vs `--dump-tokens`:
+**288,938 ids, 0 differ.** Full working:
+`.docs/measurements/2026-09-24-516-564chunk-aligned.md`.
+
+| model | dotLLM | llama.cpp | delta |
+|---|---|---|---|
+| **Q8_0** (control) | 13.9007 ± 0.10355 | 13.9160 ± 0.10331 | **−0.110%** |
+| Q3_K decoded to F32 | 21.2349 ± 0.16442 | 21.0912 ± 0.16308 | **+0.681%** |
+| Q3_K | 21.4426 ± 0.16612 | 21.1623 ± 0.16364 | **+1.325%** |
+
+#515 was opened on a Q3_K figure of **+4.79%** and a Q2_K figure of **−8.26%**.
+
+**What these rows do and do not say.** The Q8_0 control agreeing to −0.110% establishes that the
+harness, geometry, tokenizer and corpus are common to all three runs. It does **not** license
+reading the other rows as kernel properties: the two lower rows are *degraded* models, and a
+degraded model amplifies any small difference between the engines by one to two orders of
+magnitude. See [Degraded models amplify](#degraded-models-amplify-a-small-fixed-difference) — the
+"cost of quantizing" computed from these rows (llama.cpp +0.337%, dotLLM +0.978%, a 2.9× ratio)
+**reverses on a healthy model**, where dotLLM is the better of the two at 0.62×. Direct kernel
+evidence agrees: dotLLM's Q3_K dot sits at the Q8_K quantization floor and its Q8_K quantizer has
+reconstruction error identical to llama.cpp's.
+
+Ruled out along the way, each by measurement rather than inspection: RoPE scaling (this GGUF has
+no `rope_scaling` keys at all), KV-cache precision and flash attention (0.03%), FP reduction order
+(both engines reproduce to 4 dp across thread counts), and tokenization (288,938 ids, 0 differ).
+
+**On the error bars.** These are per-run standard errors. The measurements are **paired** — same
+chunks, same ids — so overlapping individual bars do not make a difference insignificant; the
+paired standard error is much smaller. Quote a residual as established only after computing it.
+
+## Degraded models amplify a small fixed difference
+
+**With exact F32 weights in both engines — no quantization anywhere, identical token ids — the
+residual scales with how degraded the weights are.** All three models were built by replacing the
+112 transformer matmul tensors with llama.cpp's own `gguf-py` decode, `token_embd` kept at Q8_0:
+
+Tested **paired** (same chunks, same ids — `--per-window` against llama.cpp's running per-chunk
+series). The Q6_K row is the control that separates *grid coarseness* from *degradation*: it was
+Q6_K-quantized from the healthy F32 model and decoded back, so its weights sit on a **coarser
+6-bit grid than Q8_0** while the model itself is **not degraded**.
+
+| model (exact F32 both sides) | its PPL | grid | degradation | residual | t (63 df) | 95% CI |
+|---|---|---|---|---|---|---|
+| Q8_0-derived | 15.124 | 8-bit | 1.00× | +0.029% | **+0.19** | [−0.28%, +0.34%] |
+| **Q6_K-derived** | 15.166 | **6-bit** | **1.003×** | +0.095% | **+0.64** | [−0.20%, +0.39%] |
+| Q3_K-derived | 23.131 | 3-bit | 1.53× | +0.359% | +1.34 | [−0.17%, +0.89%] |
+| Q2_K-derived | 1418.470 | 2-bit | 93.8× | +2.319% | **+3.02** | [+0.81%, +3.85%] |
+
+**On a healthy model the two engines are indistinguishable** (t = 0.19), and that holds for a
+coarse 6-bit grid too (t = 0.64) — so grid coarseness is not what drives the residual, degradation
+is. Only the destroyed model reaches significance. A ~79× spread in mean-NLL difference from a
+fixed pair of implementations doing identical arithmetic on identical inputs.
+
+The same reversal shows in the cost of quantizing:
+
+| model | engine | F32 | quantized | cost | ratio |
+|---|---|---|---|---|---|
+| Q8_0 | llama.cpp | 15.1236 | 15.1354 | +0.078% | — |
+| Q8_0 | dotLLM | 15.1280 | 15.1353 | **+0.048%** | **0.62×** |
+| Q3_K | llama.cpp | 23.1314 | 23.2225 | +0.394% | — |
+| Q3_K | dotLLM | 23.2145 | 23.4613 | +1.063% | **2.71×** |
+
+dotLLM quantizes *better* than llama.cpp on the healthy model and "worse" on the degraded one. A
+kernel defect does not behave that way.
+
+### How to measure quality against llama.cpp, then
+
+**The `quant-ladder` "pure" quantizations are the wrong instrument for engine-vs-engine claims.**
+Pure-Q2_K on a 1.2 B model is a destroyed model (PPL ~1400) and pure-Q3_K is well outside what
+anyone ships. Their sensitivity is what makes such a comparison look dramatic and mean nothing.
+
+- Prefer a **shipping-grade** quantization (Q4_K_M, Q5_K_M, Q6_K, Q8_0), where the model still
+  works. A defect big enough to matter will show there.
+- If a degraded quant must be used, **report the F32-decoded control for the same weights**. Only
+  the gap between control and quantized row is attributable to the quant path; the control itself
+  measures the amplifier. Build one with
+  [`scripts/make_f32_decoded_gguf.py`](../scripts/make_f32_decoded_gguf.py) — it replaces every
+  tensor of a given quantization type with **llama.cpp's own `gguf-py` decode**, so the control's
+  weights do not come from dotLLM:
+
+  ```bash
+  python scripts/make_f32_decoded_gguf.py model-Q3_K.gguf model-Q3_K-decoded-F32.gguf --keep-token-embd
+  ```
+
+  `--keep-token-embd` leaves the (tied) lm_head quantized, which is usually what you want so the
+  control differs from the quantized run only in the transformer matmul tensors.
+- **Never read a degraded-model delta as a kernel property without that control.** This is the
+  third time in this investigation that a weight-set-dependent effect was read as a fixed one —
+  first the BOS offset hiding under a healthy control, then the Q3_K "2.9×", then the F32
+  "residual".
+
+Full working: `.docs/measurements/2026-09-24-521-amplification-not-kernel-defects.md`.
+
+### Superseded: the first corrected baseline (2026-09-24, 64 chunks)
+
+Kept because it is what the `--tokens-file --bos` protocol produces and is a useful cross-check;
+the 564-chunk table above is the one to cite.
+
 
 Both engines scoring **identical ids with BOS at every window start** — dotLLM fed the ids from a
 `--chunks 64 --kl-divergence-base` run via `--tokens-file … --bos`. 64 chunks, 16,320 scored
