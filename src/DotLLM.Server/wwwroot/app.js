@@ -185,6 +185,10 @@ async function* streamChat(messages, params) {
     const body = {
         messages,
         stream: true,
+        // The server no longer carries usage on the final content chunk (OpenAI puts it in a
+        // dedicated chunk, and only on request) — so ask for it explicitly, or the token
+        // counts in the stats line go blank.
+        stream_options: { include_usage: true },
         temperature: params.temperature,
         top_p: params.top_p,
         top_k: params.top_k,
@@ -1069,7 +1073,7 @@ async function handleModalLoad() {
 
     // Get speculative model selection
     const specPath = modalSpeculativeSelect.value || undefined;
-    const specK = parseInt(modalSpeculativeK.value) || 5;
+    const specK = parseInt(modalSpeculativeK.value) || 3;
 
     try {
         const res = await loadModel(repo, quant, {
@@ -1090,7 +1094,9 @@ async function handleModalLoad() {
             closeModelModal();
         } else {
             const err = await res.json().catch(() => ({}));
-            const errMsg = err.error || `HTTP ${res.status}`;
+            // #452: the error envelope is now {"error": {"message", ...}}. Read .message, but
+            // still tolerate a bare string so this keeps working against an older server.
+            const errMsg = (err.error && (err.error.message || err.error)) || `HTTP ${res.status}`;
             modalStatus.innerHTML = `<span class="text-red-400">Failed: ${esc(errMsg)}</span>`;
             setStatus(`Load failed: ${errMsg}`, 'text-red-400');
         }

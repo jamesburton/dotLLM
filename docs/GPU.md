@@ -87,7 +87,7 @@ For sources that materialize **owned host scratch** — the safetensors bf16/f16
 - The per-tensor free is driven by an `onHostTensorUploaded` hook threaded into `CudaWeights.LoadFromGguf`, invoked for each per-layer Q/K/V/O and dense Gate/Up/Down host pointer after its copy. `TransformerWeights.TryReleaseOwnedHostAllocation` frees only *owned* allocations and ignores mmap views (never freed).
 - **Memory-safety:** `cuMemcpyHtoD_v2` blocks the host until the transfer finishes; the on-device dequant kernels queued on the stream read the uploaded device buffers only, never the host pointer — so the buffer is safe to free before the final `cuStreamSynchronize`. Each owned buffer is read exactly once in its block.
 - **Disabled when host weights are retained for CPU-side compute:** the high-precision I-quant forward and the Gemma-4 host LM head keep `_cpuWeights` alive, so streaming is turned off up front (`WillRetainHostWeights`, a conservative superset of the retain decision). Hybrid/pipeline splits also retain the host bundle and do not stream.
-- **Vulkan does not apply this.** The Vulkan backend deliberately retains the full host `TransformerWeights` for the model's lifetime (host-side embedding lookup, per-layer norm reads, self-conditioning, Gemma-4 scales), and its `UploadMatrix` can *zero-copy import* an owned host buffer directly into a device buffer (`VK_EXT_external_memory_host`) — freeing such a buffer would be a use-after-free. Applying the CUDA-style per-tensor free there would require a larger redesign (device-side embedding + threading the import-vs-staging decision back to the caller).
+- **Vulkan does not apply this.** The Vulkan backend deliberately retains the full host `TransformerWeights` for the model's lifetime (host-side embedding lookup, per-layer norm reads, self-conditioning, Gemma-4 scales), and its upload path can *zero-copy import* an owned host buffer directly into a device buffer (`VK_EXT_external_memory_host`, opt-in — see [Unified-Memory Zero-Copy Weight Upload](#unified-memory-zero-copy-weight-upload-vulkan-uma-apus)) — freeing such a buffer would be a use-after-free. Applying the CUDA-style per-tensor free there would require a larger redesign (device-side embedding + threading the import-vs-staging decision back to the caller).
 
 ### VRAM Estimation
 
@@ -158,6 +158,28 @@ The GPU forward pass mirrors the CPU path in `TransformerModel.Forward()` but al
 A single CUDA stream executes all operations sequentially on the GPU. **No host–device synchronization occurs during the forward pass** — all kernel launches and cuBLAS calls are asynchronous. The only sync point is `cuStreamSynchronize` before the final logits D2H copy. This minimizes PCIe roundtrips and CPU overhead.
 
 For eligible BitNet single-token decode on the plain CUDA KV-cache, dotLLM captures the decode launch sequence as a CUDA graph and replays it by default. This removes most CPU-side per-token launch dispatch overhead after the first captured token. Set `DOTLLM_CUDA_GRAPH=0` to disable graph replay when debugging or comparing against the raw launch path.
+
+### Prefill tiling (issue #494)
+
+A prefill forward's working set scales with the number of tokens submitted in one call: the F32
+activation buffers (`S × intermediate × 4 B` — 285 MB each at S=4096 on Bonsai 2 27B), the
+per-projection F16 dequant scratch, the cuBLAS workspace, and the F16 KV plus its F32 staging. A
+single 4096-token call on a 12 GB RTX 3060 therefore pinned VRAM at 12,035 / 12,288 MiB and
+thrashed, while p=1024 was comfortable.
+
+`CudaQwen3HybridDenseTransformerModel` now tiles a long prefill over tokens by default (1024 per
+tile), so peak VRAM is bounded by the tile rather than by the prompt. Tile `t` attends to the keys
+and values tiles `0..t-1` already committed to the KV-cache, and the GDN state advances
+sequentially — the same argument that makes the engine-level `--prefill-chunk-size` (llama.cpp's
+`-ub`) correct. The backend-level tiling exists in addition because the engine knob is off by
+default and does not cover `bench`, which submits the whole prompt in one `Forward`.
+
+- `DOTLLM_CUDA_PREFILL_CHUNK=<n>` overrides the tile size; `0` restores the single call.
+- Tiling is off when there is no KV-cache, when the caller wants a logits row per position, when an
+  MTP state is capturing, and under `ForwardWithRecurrentSnapshots` — see `ForwardCore`'s remarks.
+- Output is **not** bit-identical to the single call: each layer's GEMMs run with a different M per
+  tile and cuBLAS picks algorithms per M. The drift is the usual accumulation-order kind and is
+  bounded by the standard CUDA fixture-parity tolerance (abs 1e-4 + rel 1e-3).
 
 ## cuBLAS GEMM/GEMV
 
@@ -501,16 +523,29 @@ On unified-memory APUs (AMD Strix Halo / Ryzen AI Max+ 395, Intel iGPUs, Apple S
 
 The Vulkan backend supports `VK_EXT_external_memory_host` to eliminate this copy. The same physical pages that back the CPU's `MemoryMappedFile` mmap of the GGUF file are imported directly into a `VkDeviceMemory` via `VkImportMemoryHostPointerInfoEXT`, and a `VkBuffer` is bound to the import. The GPU compute shader reads the bytes in place.
 
+> **Read this before quoting the import as how weights are loaded.** Until #507/#508 (2026-09-23)
+> it never engaged on a real model: every GGUF is mapped read-only, and a read-only mapping is
+> refused by the driver. It engages only when **all three** hold — the device is integrated
+> ([UMA gate](#uma-gate-507)), the GGUF is mapped copy-on-write via `DOTLLM_GGUF_MAP_COW=1`
+> ([below](#the-copy-on-write-requirement-508)), and the tensor's device image *is* its source
+> bytes. It is **opt-in and off by default**, and when it does engage it is a trade, not a free
+> win: see [the trade-off](#what-the-import-actually-buys-and-costs).
+
 ### Code path
 
 ```
 GgufFile.Open(path)
   ├── MemoryMappedFile.CreateFromFile  (host page table populated lazily)
+  │     access = Read by default; CopyOnWrite under DOTLLM_GGUF_MAP_COW=1 — the
+  │     ONLY mode the import is accepted from (#508)
   └── DataBasePointer = base + dataSectionOffset
 
-VulkanWeights.Upload(weights)
+VulkanWeights.Upload(weights)   (and the four hybrid weight loaders, all via
+                                 VulkanWeightImportPolicy.TryImport since #508)
   └── for each raw quant block (Q8_0 / Q4_K / Q5_K / Q6_K / F16 / BF16):
-        ├── if device.HasExternalMemoryHost && !DOTLLM_VULKAN_DISABLE_HOST_IMPORT:
+        ├── if device is integrated (#507) && device.HasExternalMemoryHost
+        │      && !DOTLLM_VULKAN_DISABLE_HOST_IMPORT && the device image IS the
+        │      source bytes && bytes >= one import page:
         │     HostVisibleBuffer.TryCreate(device, srcPtr, bytes)
         │     ├── round srcPtr down to minImportedHostPointerAlignment (4 KiB on x86-64)
         │     ├── vkGetMemoryHostPointerPropertiesEXT for HOST_ALLOCATION + HOST_MAPPED_FOREIGN
@@ -535,29 +570,92 @@ Both come from `VkPhysicalDeviceExternalMemoryHostPropertiesEXT` chained off `vk
 When the driver rejects a specific import (`vkAllocateMemory` returns `VK_ERROR_INVALID_EXTERNAL_HANDLE`), `HostVisibleBuffer.TryCreate` returns `null` and `VulkanWeights.UploadMatrix` falls through to the staging-copy path. Diagnostic statics make the rejection visible:
 
 - `VulkanWeights.LastUploadFallbackReason` — `"feature_absent"`, `"env_disabled"`, `"null_src"`, or `"import_rejected"`.
-- `HostVisibleBuffer.LastImportFailureStage` — the specific Vulkan call that failed (`"vkAllocateMemory"`, `"vkBindBufferMemory"`, etc.).
+- `HostVisibleBuffer.LastImportFailureStage` — the specific Vulkan call that failed (`"vkAllocateMemory"`, `"vkBindBufferMemory"`, etc.), or `"not_integrated_gpu"` for the UMA gate below.
 - `HostVisibleBuffer.LastImportFailureCode` — the VkResult error code.
 
+### UMA gate (#507)
+
+Imported host memory is system RAM by construction. On a **discrete** GPU an accepted import would leave every weight in host RAM and read it across PCIe for the model's lifetime — presenting as mysteriously slow inference, not as an error. `VulkanDevice.TrySelectHostImportMemoryType` therefore refuses the import unless `VkPhysicalDeviceProperties.deviceType` is `INTEGRATED_GPU` or `CPU`, and within that still requires a `HOST_VISIBLE` memory type (no "any type" fallback). The decision is a pure static so the discrete-GPU branch is unit-tested on a UMA-only host (`VulkanHostImportMemoryTypeSelectionTests`).
+
+Requiring the chosen type to be `DEVICE_LOCAL` as well as `HOST_VISIBLE` — the originally proposed gate — was implemented and **measured to be wrong on gfx1151**: amdvlk splits the single UMA DRAM into a GTT heap 0 (host-visible, *not* flagged device-local) and a device-local VRAM carve-out heap 1, and `vkGetMemoryHostPointerPropertiesEXT` reports `memoryTypeBits` `0x2222` (foreign memory) / `0xAAAA` (host allocation) — all heap-0 types. The device-local types 2/10 are not importable, so that rule refuses on UMA too. `DEVICE_LOCAL` is driver heap bookkeeping here, not locality.
+
 Set `DOTLLM_VULKAN_DISABLE_HOST_IMPORT=1` to force the staging path even when the driver supports the import. Used by parity tests and to measure the staging baseline in the microbench.
+
+### The copy-on-write requirement (#508)
+
+The import was written in 2026 and **aliased zero bytes of every real model** until #508, on the
+pre-existing `VulkanWeights` path as much as on the four hybrid paths #508 added. Every existing
+import test passed because it imported `NativeMemory.AlignedAlloc` pages — private, read-write —
+while `GgufFile` maps its weights `MemoryMappedFileAccess.Read`. The mechanism was tested; the
+thing production does was not.
+
+Measured on gfx1151/amdvlk (`VulkanHostImportMmapAccessModeTests` — same bytes, same size, same
+alignment, only the host mapping differing):
+
+| host mapping | verdict |
+|---|---|
+| anonymous read-write | **accepted** (what every pre-#508 import test used) |
+| mmap `Read` | **refused** at `vkAllocateMemory`, `VK_ERROR_INVALID_EXTERNAL_HANDLE` (-1000072003) — what `GgufFile` does by default |
+| mmap `CopyOnWrite` | **accepted** |
+
+The same refusal reproduces at 64 MiB with a 544-byte sub-page offset, so it is not a size or
+offset effect: **page protection is the discriminator, not the handle type** — both
+`HOST_ALLOCATION` and `HOST_MAPPED_FOREIGN_MEMORY` are refused on a read-only view.
+
+`DOTLLM_GGUF_MAP_COW=1` therefore switches `GgufFile` to `MemoryMappedFileAccess.CopyOnWrite`.
+It is **opt-in, and the default is unchanged** — that mapping is shared by every backend.
+Copy-on-write does *not* duplicate the weights (measured over a 256 MiB mapping: reading every
+page adds no private commit; the driver pins without breaking CoW), but it reserves commit charge
+equal to the whole file at map time, so a 30 GB checkpoint reserves 30 GB and can fail to map on
+a host with a small or disabled pagefile where the read-only map succeeded. `ReadWrite` is not
+offered: CoW gets the same acceptance while making it physically impossible for a stray write to
+reach the checkpoint on disk.
+
+### What the import actually buys, and costs
+
+On Bonsai 2 27B PQ2_0, a 32 GiB UMA box previously held **13.9 GiB** for the weights: 6.86 GiB of
+still-resident mmap plus 7.01 GiB of device-local copy. With the import engaged, **546 of 851
+tensors alias instead of copying — 6.70 GiB** (the remaining 305 are 1-D norm/bias vectors held
+as managed `float[]`, which have no mmap to alias). Nemotron-Nano-9B-v2 Q4_K_M: 101 of 341
+tensors, 2.20 GiB. Both are GGUF-metadata censuses, no GPU (#508 commit `c5ba864e`).
+
+Against that, an imported weight is read from a host-visible heap rather than a device-local one,
+and on gfx1151 that was measured to cost roughly **10-13% decode throughput** (#508 acceptance
+run, 2026-09-23 — **that number is not recorded anywhere in the tree; re-measure before quoting
+it further**). So this is a memory-for-throughput trade, which is the other reason it is opt-in
+rather than default-on: take it when the model would not otherwise fit, not to go faster.
+
+Composition with #438 (stage, then unmap the GGUF) is explicit — you cannot unmap pages you have
+imported. `VulkanWeightImportPolicy.MayReleaseWholeHostMapping` is true iff nothing imported;
+`StagedSourceRanges` lists the ranges that are dead after upload so a UMA load with live imports
+can still release those page-wise. `DOTLLM_VULKAN_MEM_TRACE=1` prints the ledger.
 
 ### Known driver behavior
 
 | Driver | Strix Halo / gfx1151 | Other |
 |---|---|---|
-| amdvlk (Windows) | Advertises extension. **Rejects** mmap'd `MemoryMappedFile` pages at `vkAllocateMemory` (returns `VK_ERROR_INVALID_EXTERNAL_HANDLE`). Accepts `NativeMemory.AlignedAlloc` heap pages via `HOST_ALLOCATION_BIT_EXT`. | — |
+| amdvlk (Windows) | Advertises extension. **Rejects read-only** `MemoryMappedFile` pages at `vkAllocateMemory` (`VK_ERROR_INVALID_EXTERNAL_HANDLE`) under *both* handle types; **accepts** the same file mapped `CopyOnWrite`, and accepts `NativeMemory.AlignedAlloc` heap pages. See [the copy-on-write requirement](#the-copy-on-write-requirement-508). | — |
 | Mesa radv (Linux) | Expected to accept foreign-memory imports of mmap'd ranges (unverified on this hardware). | Same on RDNA2/3. |
 | NVIDIA proprietary | Accepts `HOST_ALLOCATION_BIT_EXT` for both mmap'd and heap pages on post-Pascal generations. | — |
 | Intel ANV | Accepts `HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT` for mmap'd ranges. | — |
 | MoltenVK | Implements via Metal `MTLBuffer.contents`; accepts mmap'd ranges. | — |
 
-On the Strix Halo amdvlk path, the framework still loads correctly (staging fallback fires on every weight matrix) — the import is opportunistic, not load-bearing. The win arrives when the driver matures or when Linux Mesa radv is used.
+Every row except amdvlk records an *expectation*, and none of them has been retested against the
+read-only-vs-copy-on-write distinction #508 found, so treat "accepts mmap'd ranges" as
+"accepts *some* mmap'd ranges" until measured.
+
+The framework always loads correctly whichever way this goes: the staging fallback fires per
+tensor, so the import is opportunistic, never load-bearing. What #508 changed is that it is now
+*reachable* on Strix Halo (via `DOTLLM_GGUF_MAP_COW=1`) rather than waiting on a driver change —
+the earlier "the win arrives when the driver matures or when Linux Mesa radv is used" was wrong
+about the cause: the refusal was the read-only mapping, not a driver defect.
 
 ### Scope and anti-goals
 
-- **Scope**: raw quant-block weight uploads in `VulkanWeights.UploadMatrix` (Q8_0 / Q4_K / Q5_K / Q6_K / F16 / BF16). When the contraction axis is aligned to the format's group size and the matrix is kept on device verbatim, the upload is a candidate for zero-copy import.
+- **Scope**: raw quant-block weight uploads — whichever formats *the loader in use* keeps packed on device. For the dense `VulkanWeights` path that is every `QuantizationType` except Q4_0, Q4_1 and Q5_1; the four hybrid loaders each keep a strictly narrower set (see the per-loader table in [QUANTIZATION.md](QUANTIZATION.md#vulkan-backend-coverage)). When the contraction axis is aligned to the format's group size and the matrix is kept on device verbatim, the upload is a candidate for zero-copy import. Since #508 the decision lives in `VulkanWeightImportPolicy.TryImport`, used by all five weight loaders — `VulkanWeights`, `VulkanQwen3MoeHybridWeights` (Qwen3-MoE-hybrid, Bonsai 2 / Qwen3 hybrid dense, dense MTP head), `VulkanQwen3HybridDenseWeights`' packed PQ2_0 token embed, `VulkanNemotronHWeights`, and `VulkanMamba3Weights` — not just `VulkanWeights.UploadMatrix`.
 - **Also in scope (#147)**: raw-quant routed-MoE banks (the GGUF fused-expert tensor is expert-contiguous with exactly the packed bank's per-expert stride, so the whole bank imports as one range — `VulkanWeights.UploadRoutedBankWhole`), and the QUANTIZED token-embed source feeding the GPU-side dequant (see below).
-- **Out of scope**: F32-dequant uploads (norm vectors, FP32 weights) cannot be zero-copy imported because the bytes have to be transformed host-side before the GPU sees them. Same for Gemma-4 fused `gate_up` banks (gate/up rows interleave per expert — the packed W1/W3 layout differs from the source) and the repacked/scale-folded Gemma-4 down banks. KV-cache and forward-pass scratch buffers are device-local (written by kernels, no host alias).
-- **Not changed**: the CPU GGUF loading path. The original read-only `MemoryMappedFile` is the source of truth; the Vulkan import path reads the same pages without modifying mmap semantics.
+- **Out of scope**: anything whose device image is *not* its source bytes — a host dequant, widen or convert — cannot be zero-copy imported, and nor can a tensor smaller than one import page (a whole `VkDeviceMemory` object to save a few hundred bytes, against a finite `maxMemoryAllocationCount`). Note this is narrower than "F32 uploads": an **F32 source reaches the device byte-for-byte even on the widening arm**, so it is an import candidate (#508); what is excluded is the norm/bias vectors held as managed `float[]`, which have no mmap to alias. Also excluded: Gemma-4 fused `gate_up` banks (gate/up rows interleave per expert — the packed W1/W3 layout differs from the source) and the repacked/scale-folded Gemma-4 down banks. KV-cache and forward-pass scratch buffers are device-local (written by kernels, no host alias).
+- **Not changed by default**: the CPU GGUF loading path. The `MemoryMappedFile` is the source of truth and the Vulkan import path reads the same pages. The one exception is the mapping's *access mode*: `DOTLLM_GGUF_MAP_COW=1` makes `GgufFile` map `CopyOnWrite` instead of `Read`, which every backend then shares. That is why it is opt-in and why its commit-charge cost is documented above — the CPU path gains nothing from it.
 
 ### Microbench
 
@@ -565,7 +663,7 @@ On the Strix Halo amdvlk path, the framework still loads correctly (staging fall
 dotnet run --project benchmarks/DotLLM.Benchmarks -c Release -- profile-vulkan-host-import --gguf path/to/model.gguf
 ```
 
-Reports wall time and process RSS delta for both staging and host-import paths, plus the per-matrix import success/fail breakdown. Default model: TinyLlama-1.1B Q8_0 from HuggingFace.
+Reports wall time and process RSS delta for both staging and host-import paths, plus the per-matrix import success/fail breakdown. Default model: TinyLlama-1.1B Q8_0 from HuggingFace. **Run it with `DOTLLM_GGUF_MAP_COW=1`** — without that the GGUF is mapped read-only, every import is refused, and both arms measure staging.
 
 ```
 dotnet run --project benchmarks/DotLLM.Benchmarks -c Release -- profile-vulkan-load --gguf path/to/model.gguf [--no-forward]
@@ -623,7 +721,7 @@ immediately.
 - **Fused Quantized GEMM**: Custom PTX kernels for Q4_K × FP16 (Marlin-style or MMQ-style) to eliminate per-projection dequant overhead during prefill
 - **Multi-GPU** (Step 51): NCCL-based tensor parallelism
 - **Fatbin distribution**: Pre-compiled SASS for common architectures to eliminate JIT overhead
-- **Mesa radv host-import validation**: confirm Linux Mesa radv accepts mmap'd GGUF pointers via `HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT`, unblocks zero-copy on Strix Halo Linux.
+- **Mesa radv host-import validation**: confirm Linux Mesa radv accepts mmap'd GGUF pointers via `HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT`, and in particular whether it needs the `DOTLLM_GGUF_MAP_COW=1` mapping that amdvlk does (#508) or accepts a read-only one. If it accepts read-only, zero-copy works on Strix Halo Linux without the CoW commit-charge cost.
 - **NVIDIA dGPU host-import rejection** (#147 follow-up): on an RTX 3060 the driver accepts the
   `vkGetMemoryHostPointerPropertiesEXT` query but rejects the subsequent `vkAllocateMemory` with
   `VK_ERROR_OUT_OF_DEVICE_MEMORY` (not `VK_ERROR_INVALID_EXTERNAL_HANDLE` as on Strix Halo amdvlk) —

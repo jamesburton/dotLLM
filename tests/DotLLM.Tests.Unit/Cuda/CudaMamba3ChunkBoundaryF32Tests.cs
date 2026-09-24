@@ -27,6 +27,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// stride/index/broadcast/rank-sum order).
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaMamba3ChunkBoundaryF32Tests
 {
     private const float Tolerance = 1e-5f;

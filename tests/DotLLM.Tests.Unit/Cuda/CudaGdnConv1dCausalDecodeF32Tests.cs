@@ -14,6 +14,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// trailing-state-extract memcpy.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaGdnConv1dCausalDecodeF32Tests
 {
     private readonly ITestOutputHelper _out;

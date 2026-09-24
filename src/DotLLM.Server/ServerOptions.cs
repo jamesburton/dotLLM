@@ -58,7 +58,7 @@ public sealed record ServerOptions
     /// <summary>Number of draft candidates per speculative step (K). Also used as K for MTP
     /// self-speculative decoding (<see cref="MtpEnabled"/>) — both are the same "candidates per
     /// round" concept.</summary>
-    public int SpeculativeCandidates { get; init; } = 5;
+    public int SpeculativeCandidates { get; init; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
 
     /// <summary>
     /// Enables Multi-Token Prediction (MTP) self-speculative decoding (issue #253) when the loaded
@@ -100,6 +100,18 @@ public sealed record ServerOptions
     /// is always available. Defaults to <c>false</c> — opt-in via configuration.
     /// </summary>
     public bool AllowLoraAdminApi { get; init; }
+
+    /// <summary>
+    /// Whether the model-administration write endpoints introduced in #454 are enabled:
+    /// <c>POST /v1/models/unload</c>, <c>POST /v1/models/pull</c> (+ its cancel route),
+    /// <c>POST /v1/models/enable</c>, <c>POST /v1/models/disable</c> and
+    /// <c>PUT /v1/settings</c>. The matching read-only routes (<c>GET /v1/settings</c>,
+    /// <c>GET /v1/devices</c>, <c>GET /v1/models/pull</c>) are always available.
+    /// Defaults to <c>false</c> — opt in via <c>--allow-model-admin</c>, mirroring
+    /// <see cref="AllowLoraAdminApi"/>. Deliberately a separate flag: unloading models and
+    /// rewriting residency settings is a different trust boundary from registering a LoRA adapter.
+    /// </summary>
+    public bool AllowModelAdminApi { get; init; }
 
     /// <summary>
     /// Per-API-key rate-limit configuration. When <see cref="RateLimitConfig.Enabled"/>
@@ -171,7 +183,7 @@ public sealed record ServerOptions
         int warmupIterations = 3;
         bool schedulerFairness = false;
         string? speculativeModel = null;
-        int speculativeCandidates = 5;
+        int speculativeCandidates = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
         bool mtpEnabled = false;
         int prefillChunkSize = 0;
         string? ropeScaling = null;
@@ -184,6 +196,8 @@ public sealed record ServerOptions
         double keepAliveSeconds = 300;
         int maxResidentModels = 1;
         long residentMemoryBudgetBytes = 0;
+        bool allowModelAdmin = false;
+        bool allowLoraAdmin = false;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -254,6 +268,10 @@ public sealed record ServerOptions
                     maxResidentModels = int.Parse(next!); i++; break;
                 case "--resident-memory-budget":
                     residentMemoryBudgetBytes = long.Parse(next!); i++; break;
+                case "--allow-model-admin":
+                    allowModelAdmin = true; break;
+                case "--allow-lora-admin":
+                    allowLoraAdmin = true; break;
                 default:
                     // Positional: treat as model if not set
                     if (model is null && !arg.StartsWith('-'))
@@ -302,6 +320,8 @@ public sealed record ServerOptions
             KeepAliveSeconds = keepAliveSeconds,
             MaxResidentModels = maxResidentModels,
             ResidentMemoryBudgetBytes = residentMemoryBudgetBytes,
+            AllowModelAdminApi = allowModelAdmin,
+            AllowLoraAdminApi = allowLoraAdmin,
             ModelId = modelId,
             RopeOverride = BuildRopeOverride(ropeScaling, ropeFreqBase, ropeScale,
                 yarnOrigCtx, yarnAttnFactor, yarnBetaFast, yarnBetaSlow),

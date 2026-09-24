@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
@@ -68,12 +69,15 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     // Model-owned device F16 scratch for on-the-fly weight dequant in the prefill path
     // (seqLen > 1). Holds the dequantised weight tile that cuBLAS HGEMM then consumes —
     // mirrors the dense CudaTransformerModel.Project() prefill branch which dequants
-    // quantised weights into an F16 scratch and runs F16 GEMM. Sized to the largest single
-    // weight tile we ever GEMM with (`maxTileFloats` halves in element count → halves in
-    // bytes vs the previous F32 scratch since each F16 element is 2 bytes vs 4). The
-    // routed-expert dequant has its own dedicated scratch in _state.MoeW{1,2,3}Scratch.
+    // quantised weights into an F16 scratch and runs F16 GEMM. Sized to the `m*k` of the
+    // projection that first needs it and grown from there. The routed-expert dequant has its
+    // own dedicated scratch in _state.MoeW{1,2,3}Scratch.
     // Decode-time (seqLen == 1) projections bypass this entirely via the quantised GEMV
     // path (LaunchQuantizedGemv / LaunchQuantizedGemvMmq / LaunchQuantizedGemvF32In).
+    // #495: LAZY and demand-sized — see the identical field in
+    // CudaQwen3HybridDenseTransformerModel for the full rationale. It used to be allocated at
+    // load sized to the widest tile in the model (the lm_head), which is dead weight for every
+    // projection a packed/GEMV path covers.
     private nint _dequantScratchF16Weight;
     private long _dequantScratchElems;
 
@@ -172,7 +176,11 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// (perplexity windows) would leak state exactly as the CPU host did. Overridden for parity with
     /// the CPU / Vulkan hosts — see issue #261.
     /// </remarks>
-    public void ResetSequenceState() => _gdnCache.Reset();
+    public void ResetSequenceState()
+    {
+        _context.MakeCurrent();
+        _gdnCache.Reset();
+    }
 
     /// <summary>Number of full-attention layers — matches the sparse KV-cache slot count.</summary>
     public int AttentionLayerCount => _attentionLayerCount;
@@ -198,7 +206,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         CudaQwen3MoeHybridForwardState state, CudaGdnStateCache gdnCache,
         CudaStream stream, CudaCublasHandle cublas, CudaContext context, CudaKernels kernels,
         int deviceId,
-        long dequantScratchElems, nint dequantScratchDevice,
         CudaMoeScratch moeScratch)
     {
         Config = config;
@@ -228,8 +235,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         _context = context;
         _kernels = kernels;
         _deviceId = deviceId;
-        _dequantScratchElems = dequantScratchElems;
-        _dequantScratchF16Weight = dequantScratchDevice;
         _moeScratch = moeScratch;
 
         _gdnLayerOrdinal = new int[config.NumLayers];
@@ -265,13 +270,31 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         if (config.Moe is null)
             throw new ArgumentException("Qwen3MoeHybrid config must have Moe populated.", nameof(config));
 
+        // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+        // incomplete ptxDir is by far the most common way this factory throws, and doing the
+        // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+        // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
+
+        // #383: context creation cannot leak on its own throw (nothing allocated yet), so it
+        // stays outside the try/catch — everything created from here on (stream/cublas/kernels/
+        // state/gdnCache/moeScratch/every device buffer, tracked via `allocs`) is disposed on
+        // any failure before rethrowing.
         var context = CudaContext.Create(deviceId);
-        var stream = CudaStream.Create();
-        var cublas = CudaCublasHandle.Create();
+        CudaStream? stream = null;
+        CudaCublasHandle? cublas = null;
+        CudaKernels? kernels = null;
+        CudaQwen3MoeHybridForwardState? state = null;
+        CudaGdnStateCache? gdnCache = null;
+        CudaMoeScratch? moeScratch = null;
+        var allocs = new List<nint>();
+        try
+        {
+        stream = CudaStream.Create();
+        cublas = CudaCublasHandle.Create();
         cublas.SetStream(stream);
 
-        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
-        var kernels = new CudaKernels(ptxDir);
+        kernels = new CudaKernels(ptxDir);
 
         nint dataBase = gguf.DataBasePointer;
         var tensors = gguf.TensorsByName;
@@ -282,7 +305,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         var embDesc = tensors["token_embd.weight"];
         long embRowBytes = Dequantize.RowByteSize(hiddenSize, embDesc.QuantizationType);
         long embTotalBytes = embRowBytes * config.VocabSize;
-        nint tokenEmbedDevice = AllocDevice(embTotalBytes);
+        nint tokenEmbedDevice = AllocDevice(embTotalBytes, allocs);
         CopyHtoD(tokenEmbedDevice, dataBase + (nint)embDesc.DataOffset, embTotalBytes);
 
         // If the embed quant type is not directly supported by LaunchEmbeddingLookupF32
@@ -307,7 +330,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             CudaKernels.EnsureQuantExpansionAllowed(
                 embDesc.QuantizationType, "token embedding table", embTotalBytes, embedF32Bytes);
 
-            embedF32Device = AllocDevice(embedF32Bytes);
+            embedF32Device = AllocDevice(embedF32Bytes, allocs);
             ownsEmbedF32 = true;
             // Host-side full-table dequant then H2D — once per load.
             float[] embedF32Host = new float[totalElems];
@@ -324,7 +347,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         float[] outputNormHost = new float[hiddenSize];
         Dequantize.ToFloat32(dataBase + (nint)outNormDesc.DataOffset, hiddenSize,
             outNormDesc.QuantizationType, outputNormHost);
-        nint outputNormDevice = AllocDevice((long)hiddenSize * sizeof(float));
+        nint outputNormDevice = AllocDevice((long)hiddenSize * sizeof(float), allocs);
         fixed (float* p = outputNormHost)
         {
             CopyHtoD(outputNormDevice, (nint)p, (long)hiddenSize * sizeof(float));
@@ -344,7 +367,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         {
             long outRowBytes = Dequantize.RowByteSize(outDesc.Shape[0], outDesc.QuantizationType);
             long outTotalBytes = outRowBytes * outDesc.Shape[1];
-            outputDevice = AllocDevice(outTotalBytes);
+            outputDevice = AllocDevice(outTotalBytes, allocs);
             CopyHtoD(outputDevice, dataBase + (nint)outDesc.DataOffset, outTotalBytes);
             outputQt = outDesc.QuantizationType;
             outputInputDim = outDesc.Shape[0];
@@ -375,11 +398,10 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         var kvSlotForLayer = new int[config.NumLayers];
         int attentionLayerCount = 0;
         var owned = new List<nint>(); // CPU-side mmap pointers the GGUF loader may own
-        long maxTileFloats = 0;
 
         for (int i = 0; i < config.NumLayers; i++)
         {
-            layers[i] = LoadLayerDevice(i, dataBase, tensors, config, owned, ref maxTileFloats);
+            layers[i] = LoadLayerDevice(i, dataBase, tensors, config, owned, allocs);
             kvSlotForLayer[i] = layout.LayerKind[i] == HybridLayerKind.Attention
                 ? attentionLayerCount++
                 : -1;
@@ -391,8 +413,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         // _state. Decode (seqLen == 1) bypasses this scratch entirely via the quantised
         // GEMV kernels (LaunchQuantizedGemv / LaunchQuantizedGemvMmq /
         // LaunchQuantizedGemvF32In).
-        maxTileFloats = Math.Max(maxTileFloats, (long)outputOutputDim * outputInputDim);
-        nint dequantScratchDevice = AllocDevice(maxTileFloats * sizeof(ushort));
 
         // ── GDN ordinal count + state cache + scratch state ──
         int gdnLayerCount = 0;
@@ -405,7 +425,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         // on each MoE forward via CudaMoeFfn (grouped GEMV when available). Pre-allocating the
         // full [3 × numExperts × intermediate × hidden] F32 scratch alone is ~3.2 GiB at
         // qwen35moe shapes and OOMs any sub-A6000 GPU. Leave the scratch fields at zero.
-        var state = new CudaQwen3MoeHybridForwardState(
+        state = new CudaQwen3MoeHybridForwardState(
             hiddenSize: hiddenSize,
             vocabSize: config.VocabSize,
             qElems: config.NumAttentionHeads * config.HeadDim,
@@ -418,8 +438,8 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             moeNumExperts: moe.NumExperts,
             moeIntermediate: moe.MoeIntermediateSize,
             allocFullExpertDequantScratch: false);
-        var gdnCache = new CudaGdnStateCache(gdn, gdnLayerCount);
-        var moeScratch = new CudaMoeScratch();
+        gdnCache = new CudaGdnStateCache(gdn, gdnLayerCount);
+        moeScratch = new CudaMoeScratch();
 
         return new CudaQwen3MoeHybridTransformerModel(
             config, gguf, layers,
@@ -430,7 +450,29 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             kvSlotForLayer, attentionLayerCount,
             ropeTheta, ropeDim,
             state, gdnCache, stream, cublas, context, kernels, deviceId,
-            maxTileFloats, dequantScratchDevice, moeScratch);
+            moeScratch);
+        }
+        catch
+        {
+            moeScratch?.Dispose();
+            gdnCache?.Dispose();
+            state?.Dispose();
+            for (int i = allocs.Count - 1; i >= 0; i--)
+                FreeIfNonZeroValue(allocs[i]);
+            kernels?.Dispose();
+            cublas?.Dispose();
+            stream?.Dispose();
+            // CudaContext.Create (above) makes the context current on THIS thread, and this
+            // catch runs synchronously on the same thread — no MakeCurrent() call is needed
+            // here (matches #368's convention).
+            context.Dispose();
+            throw;
+        }
+    }
+
+    private static void FreeIfNonZeroValue(nint ptr)
+    {
+        if (ptr != 0) CudaDriverApi.cuMemFree_v2(ptr);
     }
 
     /// <summary>
@@ -459,11 +501,9 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// <see cref="LoadSingleLayerWeightsFromGguf"/>.
     /// </para>
     /// <para>
-    /// <b>Dequant scratch sizing.</b> Walks every <c>blk.NN.*</c> projection descriptor up
-    /// front and sizes <c>_dequantScratchF16Weight</c> to the widest tile encountered — so
-    /// any subsequent per-layer load can GEMM (prefill HGEMM path) into a pre-allocated
-    /// scratch without reallocation. Cost: <c>O(numTensors)</c> descriptor inspection, no
-    /// byte uploads.
+    /// <b>Dequant scratch sizing.</b> Nothing to do (issue #495): <c>_dequantScratchF16Weight</c>
+    /// is allocated on first actual use at the size that use needs and grown from there, so a
+    /// layer streamed in later needs no pre-sized buffer.
     /// </para>
     /// </remarks>
     /// <param name="gguf">Opened GGUF file. Must remain alive for the model's lifetime.</param>
@@ -486,13 +526,30 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         if (config.Moe is null)
             throw new ArgumentException("Qwen3MoeHybrid config must have Moe populated.", nameof(config));
 
+        // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+        // incomplete ptxDir is by far the most common way this factory throws, and doing the
+        // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+        // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
+
+        // #383: context creation cannot leak on its own throw (nothing allocated yet), so it
+        // stays outside the try/catch — everything created from here on is disposed on any
+        // failure before rethrowing.
         var context = CudaContext.Create(deviceId);
-        var stream = CudaStream.Create();
-        var cublas = CudaCublasHandle.Create();
+        CudaStream? stream = null;
+        CudaCublasHandle? cublas = null;
+        CudaKernels? kernels = null;
+        CudaQwen3MoeHybridForwardState? state = null;
+        CudaGdnStateCache? gdnCache = null;
+        CudaMoeScratch? moeScratch = null;
+        var allocs = new List<nint>();
+        try
+        {
+        stream = CudaStream.Create();
+        cublas = CudaCublasHandle.Create();
         cublas.SetStream(stream);
 
-        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
-        var kernels = new CudaKernels(ptxDir);
+        kernels = new CudaKernels(ptxDir);
 
         nint dataBase = gguf.DataBasePointer;
         var tensors = gguf.TensorsByName;
@@ -503,7 +560,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         var embDesc = tensors["token_embd.weight"];
         long embRowBytes = Dequantize.RowByteSize(hiddenSize, embDesc.QuantizationType);
         long embTotalBytes = embRowBytes * config.VocabSize;
-        nint tokenEmbedDevice = AllocDevice(embTotalBytes);
+        nint tokenEmbedDevice = AllocDevice(embTotalBytes, allocs);
         CopyHtoD(tokenEmbedDevice, dataBase + (nint)embDesc.DataOffset, embTotalBytes);
 
         nint embedF32Device = 0;
@@ -521,7 +578,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             CudaKernels.EnsureQuantExpansionAllowed(
                 embDesc.QuantizationType, "token embedding table", embTotalBytes, embedF32Bytes);
 
-            embedF32Device = AllocDevice(embedF32Bytes);
+            embedF32Device = AllocDevice(embedF32Bytes, allocs);
             ownsEmbedF32 = true;
             float[] embedF32Host = new float[totalElems];
             Dequantize.ToFloat32(dataBase + (nint)embDesc.DataOffset, totalElems,
@@ -537,7 +594,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         float[] outputNormHost = new float[hiddenSize];
         Dequantize.ToFloat32(dataBase + (nint)outNormDesc.DataOffset, hiddenSize,
             outNormDesc.QuantizationType, outputNormHost);
-        nint outputNormDevice = AllocDevice((long)hiddenSize * sizeof(float));
+        nint outputNormDevice = AllocDevice((long)hiddenSize * sizeof(float), allocs);
         fixed (float* p = outputNormHost)
         {
             CopyHtoD(outputNormDevice, (nint)p, (long)hiddenSize * sizeof(float));
@@ -553,7 +610,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         {
             long outRowBytes = Dequantize.RowByteSize(outDesc.Shape[0], outDesc.QuantizationType);
             long outTotalBytes = outRowBytes * outDesc.Shape[1];
-            outputDevice = AllocDevice(outTotalBytes);
+            outputDevice = AllocDevice(outTotalBytes, allocs);
             CopyHtoD(outputDevice, dataBase + (nint)outDesc.DataOffset, outTotalBytes);
             outputQt = outDesc.QuantizationType;
             outputInputDim = outDesc.Shape[0];
@@ -579,56 +636,20 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
                 $"Qwen3MoeHybrid rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.");
         float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
 
-        // ── Per-layer descriptor walk to compute max tile + kvSlot ordinals ──
-        // No bytes uploaded; just metadata inspection. Mirrors what LoadGdnLayerDevice /
-        // LoadFullAttnLayerDevice / UploadMoeLayer call UpdateMaxTile on, so a subsequent
-        // per-layer load can GEMM into a pre-allocated scratch without resizing.
+        // ── Per-layer kvSlot ordinals ──
+        // #495: this used to also walk every blk.NN.* projection descriptor to pre-size the F16
+        // dequant scratch to the widest tile in the model, so a later per-layer streaming load
+        // could GEMM into a pre-allocated buffer. The scratch is now allocated on first actual
+        // use and grown from there (EnsureDequantScratchF16Weight), so the walk is unnecessary
+        // — a layer loaded later simply grows the buffer when it first needs one.
         var kvSlotForLayer = new int[config.NumLayers];
         int attentionLayerCount = 0;
-        long maxTileFloats = 0;
         for (int i = 0; i < config.NumLayers; i++)
         {
             kvSlotForLayer[i] = layout.LayerKind[i] == HybridLayerKind.Attention
                 ? attentionLayerCount++
                 : -1;
-            string prefix = $"blk.{i}";
-            // Token-mixing tile sizes — GDN or full-attn.
-            if (layout.LayerKind[i] == HybridLayerKind.GatedDeltaNet)
-            {
-                foreach (string suffix in new[]
-                {
-                    "attn_qkv.weight", "attn_gate.weight",
-                    "ssm_alpha.weight", "ssm_beta.weight", "ssm_out.weight",
-                })
-                {
-                    var d = tensors[$"{prefix}.{suffix}"];
-                    UpdateMaxTile(ref maxTileFloats, (long)d.Shape[0] * d.Shape[1]);
-                }
-            }
-            else
-            {
-                foreach (string suffix in new[]
-                {
-                    "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
-                })
-                {
-                    var d = tensors[$"{prefix}.{suffix}"];
-                    UpdateMaxTile(ref maxTileFloats, (long)d.Shape[0] * d.Shape[1]);
-                }
-            }
-            // MoE tile sizes — per-expert routed gate/up/down, all with [I, hidden] or [hidden, I].
-            // UploadMoeLayer only updates with W1 (I × hidden) and W2 (hidden × I); UploadMoeLayerFromHost
-            // does the same. Mirror the smaller set so the budget matches the production loader exactly.
-            if (tensors.TryGetValue($"{prefix}.ffn_gate_exps.weight", out var gateExps))
-                UpdateMaxTile(ref maxTileFloats, (long)gateExps.Shape[0] * gateExps.Shape[1]);
-            if (tensors.TryGetValue($"{prefix}.ffn_down_exps.weight", out var downExps))
-                UpdateMaxTile(ref maxTileFloats, (long)downExps.Shape[0] * downExps.Shape[1]);
         }
-        // Include the lm_head tile. Scratch holds the dequantised F16 weight tile for
-        // the prefill HGEMM path; decode goes through the quantised GEMV kernels and
-        // doesn't touch it. 2 bytes per element vs the previous 4-byte F32 layout.
-        maxTileFloats = Math.Max(maxTileFloats, (long)outputOutputDim * outputInputDim);
-        nint dequantScratchDevice = AllocDevice(maxTileFloats * sizeof(ushort));
 
         // ── GDN ordinal count + state cache + activation scratch ──
         int gdnLayerCount = 0;
@@ -637,7 +658,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
 
         var gdn = config.GdnConfig!.Value;
         var moe = config.Moe!;
-        var state = new CudaQwen3MoeHybridForwardState(
+        state = new CudaQwen3MoeHybridForwardState(
             hiddenSize: hiddenSize,
             vocabSize: config.VocabSize,
             qElems: config.NumAttentionHeads * config.HeadDim,
@@ -650,8 +671,8 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             moeNumExperts: moe.NumExperts,
             moeIntermediate: moe.MoeIntermediateSize,
             allocFullExpertDequantScratch: false);
-        var gdnCache = new CudaGdnStateCache(gdn, gdnLayerCount);
-        var moeScratch = new CudaMoeScratch();
+        gdnCache = new CudaGdnStateCache(gdn, gdnLayerCount);
+        moeScratch = new CudaMoeScratch();
 
         // Per-layer device slots — left zeroed; populated lazily by
         // LoadSingleLayerWeightsFromGguf.
@@ -666,7 +687,24 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             kvSlotForLayer, attentionLayerCount,
             ropeTheta, ropeDim,
             state, gdnCache, stream, cublas, context, kernels, deviceId,
-            maxTileFloats, dequantScratchDevice, moeScratch);
+            moeScratch);
+        }
+        catch
+        {
+            moeScratch?.Dispose();
+            gdnCache?.Dispose();
+            state?.Dispose();
+            for (int i = allocs.Count - 1; i >= 0; i--)
+                FreeIfNonZeroValue(allocs[i]);
+            kernels?.Dispose();
+            cublas?.Dispose();
+            stream?.Dispose();
+            // CudaContext.Create (above) makes the context current on THIS thread, and this
+            // catch runs synchronously on the same thread — no MakeCurrent() call is needed
+            // here (matches #368's convention).
+            context.Dispose();
+            throw;
+        }
     }
 
     /// <summary>
@@ -693,9 +731,27 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         _context.MakeCurrent();
         nint dataBase = _gguf.DataBasePointer;
         var tensors = _gguf.TensorsByName;
-        long maxTileFloats = _dequantScratchElems; // already sized to the global max
-        _layers[layerIdx] = LoadLayerDevice(layerIdx, dataBase, tensors, Config,
-            owned: new List<nint>(), ref maxTileFloats);
+        // #383: this is a post-construction, per-layer streaming load on an already-valid model
+        // (not model construction itself), but LoadLayerDevice still makes several device
+        // allocations before returning its DeviceLayer record — a throw partway through (e.g.
+        // device OOM on this layer's multi-GB routed-expert tensors, the single largest
+        // allocation class in this model) would otherwise leak everything uploaded so far for
+        // this one layer. `_layers[layerIdx]` is intentionally left at its already-zeroed slot
+        // state on failure (never partially assigned), matching this method's own precondition
+        // check above (`AttnNormWeightDevice != 0` means loaded) for the next
+        // LoadSingleLayerWeightsFromGguf/FreeSingleLayerWeights call.
+        var allocs = new List<nint>();
+        try
+        {
+            _layers[layerIdx] = LoadLayerDevice(layerIdx, dataBase, tensors, Config,
+                owned: new List<nint>(), allocs);
+        }
+        catch
+        {
+            for (int i = allocs.Count - 1; i >= 0; i--)
+                FreeIfNonZeroValue(allocs[i]);
+            throw;
+        }
     }
 
     /// <summary>
@@ -977,13 +1033,30 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
                 $"BuildFromPrebuiltWeights expects F32 outputQuantType, got {outputQuantType}.",
                 nameof(outputQuantType));
 
+        // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+        // incomplete ptxDir is by far the most common way this factory throws, and doing the
+        // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+        // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
+
+        // #383: context creation cannot leak on its own throw (nothing allocated yet), so it
+        // stays outside the try/catch — everything created from here on is disposed on any
+        // failure before rethrowing.
         var context = CudaContext.Create(deviceId);
-        var stream = CudaStream.Create();
-        var cublas = CudaCublasHandle.Create();
+        CudaStream? stream = null;
+        CudaCublasHandle? cublas = null;
+        CudaKernels? kernels = null;
+        CudaQwen3MoeHybridForwardState? state = null;
+        CudaGdnStateCache? gdnCache = null;
+        CudaMoeScratch? moeScratch = null;
+        var allocs = new List<nint>();
+        try
+        {
+        stream = CudaStream.Create();
+        cublas = CudaCublasHandle.Create();
         cublas.SetStream(stream);
 
-        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
-        var kernels = new CudaKernels(ptxDir);
+        kernels = new CudaKernels(ptxDir);
 
         var layout = config.HybridLayout!;
         int hiddenSize = config.HiddenSize;
@@ -991,11 +1064,11 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
 
         // ── Token embedding (F32 host → F32 device) ──
         long embTotalBytes = (long)vocabSize * hiddenSize * sizeof(float);
-        nint tokenEmbedDevice = AllocDevice(embTotalBytes);
+        nint tokenEmbedDevice = AllocDevice(embTotalBytes, allocs);
         CopyHtoD(tokenEmbedDevice, tokenEmbedWeight, embTotalBytes);
 
         // ── Output norm — F32 [hiddenSize] from managed array → device ──
-        nint outputNormDevice = AllocDevice((long)hiddenSize * sizeof(float));
+        nint outputNormDevice = AllocDevice((long)hiddenSize * sizeof(float), allocs);
         unsafe
         {
             fixed (float* p = outputNormWeight)
@@ -1018,7 +1091,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         else
         {
             long outBytes = (long)outputOutputDim * outputInputDim * sizeof(float);
-            outputDevice = AllocDevice(outBytes);
+            outputDevice = AllocDevice(outBytes, allocs);
             CopyHtoD(outputDevice, outputWeight, outBytes);
             ownsOutputDevice = true;
         }
@@ -1037,10 +1110,9 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         var deviceLayers = new DeviceLayer[config.NumLayers];
         var kvSlotForLayer = new int[config.NumLayers];
         int attentionLayerCount = 0;
-        long maxTileFloats = 0;
         for (int i = 0; i < config.NumLayers; i++)
         {
-            deviceLayers[i] = UploadLayerFromHost(i, layers[i], config, ref maxTileFloats);
+            deviceLayers[i] = UploadLayerFromHost(i, layers[i], config, allocs);
             kvSlotForLayer[i] = layout.LayerKind[i] == HybridLayerKind.Attention
                 ? attentionLayerCount++
                 : -1;
@@ -1048,8 +1120,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
 
         // Account for the lm_head tile in the dequant scratch sizing. F16 element width
         // (2 bytes) — see _dequantScratchF16Weight field comment for the rewire rationale.
-        maxTileFloats = Math.Max(maxTileFloats, (long)outputOutputDim * outputInputDim);
-        nint dequantScratchDevice = AllocDevice(maxTileFloats * sizeof(ushort));
 
         // ── GDN ordinal count + state cache + scratch state ──
         int gdnLayerCount = 0;
@@ -1058,7 +1128,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
 
         var gdn = config.GdnConfig!.Value;
         var moe = config.Moe!;
-        var state = new CudaQwen3MoeHybridForwardState(
+        state = new CudaQwen3MoeHybridForwardState(
             hiddenSize: hiddenSize,
             vocabSize: vocabSize,
             qElems: config.NumAttentionHeads * config.HeadDim,
@@ -1071,8 +1141,8 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             moeNumExperts: moe.NumExperts,
             moeIntermediate: moe.MoeIntermediateSize,
             allocFullExpertDequantScratch: false);
-        var gdnCache = new CudaGdnStateCache(gdn, gdnLayerCount);
-        var moeScratch = new CudaMoeScratch();
+        gdnCache = new CudaGdnStateCache(gdn, gdnLayerCount);
+        moeScratch = new CudaMoeScratch();
 
         return new CudaQwen3MoeHybridTransformerModel(
             config, gguf: null, deviceLayers,
@@ -1083,7 +1153,24 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             kvSlotForLayer, attentionLayerCount,
             ropeTheta, ropeDim,
             state, gdnCache, stream, cublas, context, kernels, deviceId,
-            maxTileFloats, dequantScratchDevice, moeScratch);
+            moeScratch);
+        }
+        catch
+        {
+            moeScratch?.Dispose();
+            gdnCache?.Dispose();
+            state?.Dispose();
+            for (int i = allocs.Count - 1; i >= 0; i--)
+                FreeIfNonZeroValue(allocs[i]);
+            kernels?.Dispose();
+            cublas?.Dispose();
+            stream?.Dispose();
+            // CudaContext.Create (above) makes the context current on THIS thread, and this
+            // catch runs synchronously on the same thread — no MakeCurrent() call is needed
+            // here (matches #368's convention).
+            context.Dispose();
+            throw;
+        }
     }
 
     /// <summary>
@@ -1093,13 +1180,13 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// </summary>
     private static DeviceLayer UploadLayerFromHost(
         int layerIdx, Qwen3MoeLayerWeights host,
-        ModelConfig config, ref long maxTileFloats)
+        ModelConfig config, List<nint> allocs)
     {
         int hiddenSize = config.HiddenSize;
         var layout = config.HybridLayout!;
 
-        nint attnNormDevice = UploadF32Array(host.AttnNormWeight);
-        nint postAttnNormDevice = UploadF32Array(host.PostAttnNormWeight);
+        nint attnNormDevice = UploadF32Array(host.AttnNormWeight, allocs);
+        nint postAttnNormDevice = UploadF32Array(host.PostAttnNormWeight, allocs);
 
         DeviceGdn? gdnDev = null;
         DeviceFullAttn? attnDev = null;
@@ -1110,21 +1197,21 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
                     throw new ArgumentException(
                         $"Layer {layerIdx} is GDN in HybridLayout but Qwen3MoeLayerWeights.Gdn is null.",
                         nameof(host));
-                gdnDev = UploadGdnLayer(host.Gdn, ref maxTileFloats);
+                gdnDev = UploadGdnLayer(host.Gdn, allocs);
                 break;
             case HybridLayerKind.Attention:
                 if (host.FullAttn is null)
                     throw new ArgumentException(
                         $"Layer {layerIdx} is Attention in HybridLayout but Qwen3MoeLayerWeights.FullAttn is null.",
                         nameof(host));
-                attnDev = UploadFullAttnLayer(host.FullAttn, ref maxTileFloats);
+                attnDev = UploadFullAttnLayer(host.FullAttn, allocs);
                 break;
             default:
                 throw new InvalidOperationException(
                     $"Unexpected HybridLayerKind {layout.LayerKind[layerIdx]} at layer {layerIdx} in Qwen3MoeHybrid.");
         }
 
-        DeviceMoe moeDev = UploadMoeLayerFromHost(host.Moe, hiddenSize, ref maxTileFloats);
+        DeviceMoe moeDev = UploadMoeLayerFromHost(host.Moe, hiddenSize, allocs);
 
         return new DeviceLayer
         {
@@ -1140,30 +1227,25 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         };
     }
 
-    private static DeviceGdn UploadGdnLayer(GdnTokenMixingWeights gdn, ref long maxTileFloats)
+    private static DeviceGdn UploadGdnLayer(GdnTokenMixingWeights gdn, List<nint> allocs)
     {
         // Quantised-projection upload: each projection's raw bytes already lay out in the
         // declared quant format ([M*K] elements packed via Dequantize.RowByteSize). The
         // Gemm() dispatcher reads QkvQt / GateQt / ... and routes through the matching
         // CUDA branch (decode-direct quantised GEMV, prefill F16-dequant + cuBLAS HGEMM,
         // or cuBLAS LinearF32 for the F32 fast path).
-        nint qkvDevice = UploadProjectionPtr(gdn.QkvWeight, gdn.QkvOutputDim, gdn.QkvInputDim, gdn.QkvQuantType);
-        nint gateDevice = UploadProjectionPtr(gdn.GateWeight, gdn.GateOutputDim, gdn.GateInputDim, gdn.GateQuantType);
-        nint alphaDevice = UploadProjectionPtr(gdn.AlphaWeight, gdn.AlphaOutputDim, gdn.AlphaInputDim, gdn.AlphaQuantType);
-        nint betaDevice = UploadProjectionPtr(gdn.BetaWeight, gdn.BetaOutputDim, gdn.BetaInputDim, gdn.BetaQuantType);
-        nint outDevice = UploadProjectionPtr(gdn.OutWeight, gdn.OutOutputDim, gdn.OutInputDim, gdn.OutQuantType);
+        nint qkvDevice = UploadProjectionPtr(gdn.QkvWeight, gdn.QkvOutputDim, gdn.QkvInputDim, gdn.QkvQuantType, allocs);
+        nint gateDevice = UploadProjectionPtr(gdn.GateWeight, gdn.GateOutputDim, gdn.GateInputDim, gdn.GateQuantType, allocs);
+        nint alphaDevice = UploadProjectionPtr(gdn.AlphaWeight, gdn.AlphaOutputDim, gdn.AlphaInputDim, gdn.AlphaQuantType, allocs);
+        nint betaDevice = UploadProjectionPtr(gdn.BetaWeight, gdn.BetaOutputDim, gdn.BetaInputDim, gdn.BetaQuantType, allocs);
+        nint outDevice = UploadProjectionPtr(gdn.OutWeight, gdn.OutOutputDim, gdn.OutInputDim, gdn.OutQuantType, allocs);
 
-        nint conv1dWeightDevice = UploadF32Array(gdn.Conv1dWeight);
-        nint conv1dBiasDevice = UploadF32Array(gdn.Conv1dBias);
-        nint aDevice = UploadF32Array(gdn.A);
-        nint dtBiasDevice = UploadF32Array(gdn.DtBias);
-        nint ssmNormDevice = UploadF32Array(gdn.SsmNormWeight);
+        nint conv1dWeightDevice = UploadF32Array(gdn.Conv1dWeight, allocs);
+        nint conv1dBiasDevice = UploadF32Array(gdn.Conv1dBias, allocs);
+        nint aDevice = UploadF32Array(gdn.A, allocs);
+        nint dtBiasDevice = UploadF32Array(gdn.DtBias, allocs);
+        nint ssmNormDevice = UploadF32Array(gdn.SsmNormWeight, allocs);
 
-        UpdateMaxTile(ref maxTileFloats, (long)gdn.QkvInputDim * gdn.QkvOutputDim);
-        UpdateMaxTile(ref maxTileFloats, (long)gdn.GateInputDim * gdn.GateOutputDim);
-        UpdateMaxTile(ref maxTileFloats, (long)gdn.AlphaInputDim * gdn.AlphaOutputDim);
-        UpdateMaxTile(ref maxTileFloats, (long)gdn.BetaInputDim * gdn.BetaOutputDim);
-        UpdateMaxTile(ref maxTileFloats, (long)gdn.OutInputDim * gdn.OutOutputDim);
 
         return new DeviceGdn
         {
@@ -1190,22 +1272,18 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         };
     }
 
-    private static DeviceFullAttn UploadFullAttnLayer(Qwen3FullAttnWeights attn, ref long maxTileFloats)
+    private static DeviceFullAttn UploadFullAttnLayer(Qwen3FullAttnWeights attn, List<nint> allocs)
     {
         // Quant-aware upload: see UploadGdnLayer for rationale; the QQt/KQt/VQt/OQt fields
         // drive Gemm() dispatch in the per-layer body.
-        nint qDevice = UploadProjectionPtr(attn.QWeight, attn.QOutputDim, attn.QInputDim, attn.QQuantType);
-        nint kDevice = UploadProjectionPtr(attn.KWeight, attn.KOutputDim, attn.KInputDim, attn.KQuantType);
-        nint vDevice = UploadProjectionPtr(attn.VWeight, attn.VOutputDim, attn.VInputDim, attn.VQuantType);
-        nint oDevice = UploadProjectionPtr(attn.OWeight, attn.OOutputDim, attn.OInputDim, attn.OQuantType);
+        nint qDevice = UploadProjectionPtr(attn.QWeight, attn.QOutputDim, attn.QInputDim, attn.QQuantType, allocs);
+        nint kDevice = UploadProjectionPtr(attn.KWeight, attn.KOutputDim, attn.KInputDim, attn.KQuantType, allocs);
+        nint vDevice = UploadProjectionPtr(attn.VWeight, attn.VOutputDim, attn.VInputDim, attn.VQuantType, allocs);
+        nint oDevice = UploadProjectionPtr(attn.OWeight, attn.OOutputDim, attn.OInputDim, attn.OQuantType, allocs);
 
-        nint qNormDevice = UploadF32Array(attn.QNormWeight);
-        nint kNormDevice = UploadF32Array(attn.KNormWeight);
+        nint qNormDevice = UploadF32Array(attn.QNormWeight, allocs);
+        nint kNormDevice = UploadF32Array(attn.KNormWeight, allocs);
 
-        UpdateMaxTile(ref maxTileFloats, (long)attn.QInputDim * attn.QOutputDim);
-        UpdateMaxTile(ref maxTileFloats, (long)attn.KInputDim * attn.KOutputDim);
-        UpdateMaxTile(ref maxTileFloats, (long)attn.VInputDim * attn.VOutputDim);
-        UpdateMaxTile(ref maxTileFloats, (long)attn.OInputDim * attn.OOutputDim);
 
         return new DeviceFullAttn
         {
@@ -1234,7 +1312,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// gate, shared-expert F32 projections, and the optional shared-expert sigmoid gate
     /// are uploaded one-shot from their managed-array hosts.
     /// </summary>
-    private static DeviceMoe UploadMoeLayerFromHost(MoeLayerWeights moe, int hiddenSize, ref long maxTileFloats)
+    private static DeviceMoe UploadMoeLayerFromHost(MoeLayerWeights moe, int hiddenSize, List<nint> allocs)
     {
         int E = moe.NumExperts;
         int I = moe.IntermediateSize;
@@ -1244,7 +1322,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
                 $"(W1={moe.W1.Length}, W2={moe.W2.Length}, W3={moe.W3.Length}).", nameof(moe));
 
         // Router gate — F32 [E, hidden] managed array.
-        nint gateRouterDevice = UploadF32Array(moe.Gate);
+        nint gateRouterDevice = UploadF32Array(moe.Gate, allocs);
 
         // Routed experts — concatenate W1/W3 ([I, hidden]) and W2 ([hidden, I]) into fused
         // device buffers. Per-expert byte stride = M*K*4 (F32). The forward path in
@@ -1256,9 +1334,9 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         long upBytesPerExpert = gateBytesPerExpert;
         long downBytesPerExpert = (long)hiddenSize * I * sizeof(float);
 
-        nint gateExpsDevice = AllocDevice((long)E * gateBytesPerExpert);
-        nint upExpsDevice = AllocDevice((long)E * upBytesPerExpert);
-        nint downExpsDevice = AllocDevice((long)E * downBytesPerExpert);
+        nint gateExpsDevice = AllocDevice((long)E * gateBytesPerExpert, allocs);
+        nint upExpsDevice = AllocDevice((long)E * upBytesPerExpert, allocs);
+        nint downExpsDevice = AllocDevice((long)E * downBytesPerExpert, allocs);
         for (int e = 0; e < E; e++)
         {
             CopyHtoD(gateExpsDevice + (nint)(e * gateBytesPerExpert), moe.W1[e], gateBytesPerExpert);
@@ -1266,8 +1344,6 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             CopyHtoD(downExpsDevice + (nint)(e * downBytesPerExpert), moe.W2[e], downBytesPerExpert);
         }
 
-        UpdateMaxTile(ref maxTileFloats, (long)I * hiddenSize);
-        UpdateMaxTile(ref maxTileFloats, (long)hiddenSize * I);
 
         // Shared experts — F32 [sI, hidden] / [hidden, sI] managed pointers.
         int numShared = moe.NumSharedExperts;
@@ -1281,14 +1357,14 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         long sharedFloats = (long)moe.SharedIntermediateSize * hiddenSize;
         for (int s = 0; s < numShared; s++)
         {
-            sharedGateDevice[s] = UploadF32Ptr(moe.SharedGateProj[s], sharedFloats);
-            sharedUpDevice[s] = UploadF32Ptr(moe.SharedUpProj[s], sharedFloats);
-            sharedDownDevice[s] = UploadF32Ptr(moe.SharedDownProj[s], sharedFloats);
+            sharedGateDevice[s] = UploadF32Ptr(moe.SharedGateProj[s], sharedFloats, allocs);
+            sharedUpDevice[s] = UploadF32Ptr(moe.SharedUpProj[s], sharedFloats, allocs);
+            sharedDownDevice[s] = UploadF32Ptr(moe.SharedDownProj[s], sharedFloats, allocs);
         }
 
         nint sharedExpertGateDevice = 0;
         if (moe.SharedExpertGate is not null)
-            sharedExpertGateDevice = UploadF32Array(moe.SharedExpertGate);
+            sharedExpertGateDevice = UploadF32Array(moe.SharedExpertGate, allocs);
 
         return new DeviceMoe
         {
@@ -1316,10 +1392,10 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     }
 
     /// <summary>Allocates a device F32 buffer and copies <paramref name="elemCount"/> floats from <paramref name="hostF32Ptr"/>.</summary>
-    private static nint UploadF32Ptr(nint hostF32Ptr, long elemCount)
+    private static nint UploadF32Ptr(nint hostF32Ptr, long elemCount, List<nint>? allocs = null)
     {
         long bytes = elemCount * sizeof(float);
-        nint device = AllocDevice(bytes);
+        nint device = AllocDevice(bytes, allocs);
         CopyHtoD(device, hostF32Ptr, bytes);
         return device;
     }
@@ -1336,19 +1412,20 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// <param name="m">Output dim (rows).</param>
     /// <param name="k">Input/contraction dim (columns per row of un-quantised view).</param>
     /// <param name="qt">Quantisation format of the row bytes.</param>
-    private static nint UploadProjectionPtr(nint hostPtr, int m, int k, QuantizationType qt)
+    /// <param name="allocs">#383 allocation ledger — see <see cref="AllocDevice"/>.</param>
+    private static nint UploadProjectionPtr(nint hostPtr, int m, int k, QuantizationType qt, List<nint>? allocs = null)
     {
         long bytes = Dequantize.RowByteSize(k, qt) * m;
-        nint device = AllocDevice(bytes);
+        nint device = AllocDevice(bytes, allocs);
         CopyHtoD(device, hostPtr, bytes);
         return device;
     }
 
     /// <summary>Allocates a device F32 buffer and copies a managed <c>float[]</c> into it.</summary>
-    private static nint UploadF32Array(float[] hostArray)
+    private static nint UploadF32Array(float[] hostArray, List<nint>? allocs = null)
     {
         long bytes = (long)hostArray.Length * sizeof(float);
-        nint device = AllocDevice(bytes);
+        nint device = AllocDevice(bytes, allocs);
         unsafe
         {
             fixed (float* p = hostArray)
@@ -1366,7 +1443,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     private static DeviceLayer LoadLayerDevice(
         int layerIdx, nint dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
-        ModelConfig config, List<nint> owned, ref long maxTileFloats)
+        ModelConfig config, List<nint> owned, List<nint> allocs)
     {
         string prefix = $"blk.{layerIdx}";
         int hiddenSize = config.HiddenSize;
@@ -1374,20 +1451,20 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
 
         // Norms — F32 [hiddenSize].
         var attnNormDesc = tensors[$"{prefix}.attn_norm.weight"];
-        nint attnNormDevice = UploadF32Tensor(dataBase, attnNormDesc, hiddenSize);
+        nint attnNormDevice = UploadF32Tensor(dataBase, attnNormDesc, hiddenSize, allocs);
         var postNormDesc = tensors[$"{prefix}.post_attention_norm.weight"];
-        nint postAttnNormDevice = UploadF32Tensor(dataBase, postNormDesc, hiddenSize);
+        nint postAttnNormDevice = UploadF32Tensor(dataBase, postNormDesc, hiddenSize, allocs);
 
         DeviceGdn? gdnDev = null;
         DeviceFullAttn? attnDev = null;
         switch (layout.LayerKind[layerIdx])
         {
             case HybridLayerKind.GatedDeltaNet:
-                gdnDev = LoadGdnLayerDevice(prefix, dataBase, tensors, config, ref maxTileFloats);
+                gdnDev = LoadGdnLayerDevice(prefix, dataBase, tensors, config, allocs);
                 break;
             case HybridLayerKind.Attention:
                 attnDev = LoadFullAttnLayerDevice(prefix, dataBase, tensors, config,
-                    layout.HeadCountKv[layerIdx], ref maxTileFloats);
+                    layout.HeadCountKv[layerIdx], allocs);
                 break;
             default:
                 throw new InvalidOperationException(
@@ -1397,7 +1474,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         // Routed-expert raw-quant view + shared expert F32 weights (small).
         MoeLayerWeights moeHost = TransformerWeights.LoadDeepSeekMoeLayer(
             layerIdx, dataBase, tensors, config, owned, skipRoutedF32Only: true);
-        DeviceMoe moeDev = UploadMoeLayer(moeHost, hiddenSize, ref maxTileFloats);
+        DeviceMoe moeDev = UploadMoeLayer(moeHost, hiddenSize, allocs);
 
         return new DeviceLayer
         {
@@ -1413,7 +1490,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     private static DeviceGdn LoadGdnLayerDevice(
         string prefix, nint dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
-        ModelConfig config, ref long maxTileFloats)
+        ModelConfig config, List<nint> allocs)
     {
         var gdn = config.GdnConfig!.Value;
         int convDim = (2 * gdn.NKHead + gdn.NVHead) * gdn.DState;
@@ -1429,29 +1506,24 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         var outDesc = tensors[$"{prefix}.ssm_out.weight"];
 
         // Quantized projections — upload raw bytes.
-        nint qkvDevice = UploadRawTensor(dataBase, qkvDesc);
-        nint gateDevice = UploadRawTensor(dataBase, gateDesc);
-        nint alphaDevice = UploadRawTensor(dataBase, alphaDesc);
-        nint betaDevice = UploadRawTensor(dataBase, betaDesc);
-        nint outDevice = UploadRawTensor(dataBase, outDesc);
+        nint qkvDevice = UploadRawTensor(dataBase, qkvDesc, allocs);
+        nint gateDevice = UploadRawTensor(dataBase, gateDesc, allocs);
+        nint alphaDevice = UploadRawTensor(dataBase, alphaDesc, allocs);
+        nint betaDevice = UploadRawTensor(dataBase, betaDesc, allocs);
+        nint outDevice = UploadRawTensor(dataBase, outDesc, allocs);
 
         // Conv1d weight — F32 [DConv, convDim]; CPU oracle host-dequants then we H2D.
-        nint conv1dWeightDevice = UploadF32Tensor(dataBase, conv1dWDesc, gdn.DConv * convDim);
+        nint conv1dWeightDevice = UploadF32Tensor(dataBase, conv1dWDesc, gdn.DConv * convDim, allocs);
         // Conv bias is zero-filled (GDN has no conv bias tensor).
-        nint conv1dBiasDevice = AllocDevice((long)convDim * sizeof(float));
+        nint conv1dBiasDevice = AllocDevice((long)convDim * sizeof(float), allocs);
         CudaDriverApi.cuMemsetD8_v2(conv1dBiasDevice, 0, (nuint)((long)convDim * sizeof(float)))
             .ThrowOnError();
 
         // Small F32 scalars — A, dt_bias, ssm_norm.
-        nint aDevice = UploadF32Tensor(dataBase, aDesc, gdn.NVHead);
-        nint dtBiasDevice = UploadF32Tensor(dataBase, dtBDesc, gdn.NVHead);
-        nint ssmNormDevice = UploadF32Tensor(dataBase, ssmNormDesc, gdn.DState);
+        nint aDevice = UploadF32Tensor(dataBase, aDesc, gdn.NVHead, allocs);
+        nint dtBiasDevice = UploadF32Tensor(dataBase, dtBDesc, gdn.NVHead, allocs);
+        nint ssmNormDevice = UploadF32Tensor(dataBase, ssmNormDesc, gdn.DState, allocs);
 
-        UpdateMaxTile(ref maxTileFloats, (long)qkvDesc.Shape[0] * qkvDesc.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)gateDesc.Shape[0] * gateDesc.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)alphaDesc.Shape[0] * alphaDesc.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)betaDesc.Shape[0] * betaDesc.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)outDesc.Shape[0] * outDesc.Shape[1]);
 
         return new DeviceGdn
         {
@@ -1481,7 +1553,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     private static DeviceFullAttn LoadFullAttnLayerDevice(
         string prefix, nint dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
-        ModelConfig config, int numKvHeads, ref long maxTileFloats)
+        ModelConfig config, int numKvHeads, List<nint> allocs)
     {
         var q = tensors[$"{prefix}.attn_q.weight"];
         var k = tensors[$"{prefix}.attn_k.weight"];
@@ -1496,18 +1568,14 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
                 $"{expectedQGateOut} = 2 * {config.NumAttentionHeads} * {config.HeadDim} (Q+Gate fused).");
         }
 
-        nint qDevice = UploadRawTensor(dataBase, q);
-        nint kDevice = UploadRawTensor(dataBase, k);
-        nint vDevice = UploadRawTensor(dataBase, v);
-        nint oDevice = UploadRawTensor(dataBase, o);
+        nint qDevice = UploadRawTensor(dataBase, q, allocs);
+        nint kDevice = UploadRawTensor(dataBase, k, allocs);
+        nint vDevice = UploadRawTensor(dataBase, v, allocs);
+        nint oDevice = UploadRawTensor(dataBase, o, allocs);
 
-        nint qNormDevice = UploadF32Tensor(dataBase, tensors[$"{prefix}.attn_q_norm.weight"], config.HeadDim);
-        nint kNormDevice = UploadF32Tensor(dataBase, tensors[$"{prefix}.attn_k_norm.weight"], config.HeadDim);
+        nint qNormDevice = UploadF32Tensor(dataBase, tensors[$"{prefix}.attn_q_norm.weight"], config.HeadDim, allocs);
+        nint kNormDevice = UploadF32Tensor(dataBase, tensors[$"{prefix}.attn_k_norm.weight"], config.HeadDim, allocs);
 
-        UpdateMaxTile(ref maxTileFloats, (long)q.Shape[0] * q.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)k.Shape[0] * k.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)v.Shape[0] * v.Shape[1]);
-        UpdateMaxTile(ref maxTileFloats, (long)o.Shape[0] * o.Shape[1]);
 
         return new DeviceFullAttn
         {
@@ -1534,11 +1602,11 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// quant bytes (host mmap → device). Shared expert F32 dequants are uploaded as F32.
     /// The router gate.weight is F32 (already produced by the CPU loader).
     /// </summary>
-    private static DeviceMoe UploadMoeLayer(MoeLayerWeights moe, int hiddenSize, ref long maxTileFloats)
+    private static DeviceMoe UploadMoeLayer(MoeLayerWeights moe, int hiddenSize, List<nint> allocs)
     {
         // Router gate weight [numExperts, hiddenSize] F32 — small, upload directly.
         long routerFloats = (long)moe.NumExperts * hiddenSize;
-        nint gateDevice = AllocDevice(routerFloats * sizeof(float));
+        nint gateDevice = AllocDevice(routerFloats * sizeof(float), allocs);
         fixed (float* pGate = moe.Gate)
         {
             CopyHtoD(gateDevice, (nint)pGate, routerFloats * sizeof(float));
@@ -1552,15 +1620,16 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         long downExpsBytes = Dequantize.RowByteSize(moe.DownExpsKDim, moe.DownExpsRawQt) *
                              moe.DownExpsMDim * moe.NumExperts;
 
-        nint gateExpsDevice = AllocDevice(gateExpsBytes);
-        nint upExpsDevice = AllocDevice(upExpsBytes);
-        nint downExpsDevice = AllocDevice(downExpsBytes);
+        // #383: these three fused-expert tensors are the largest allocations in the whole
+        // model (multi-GB each at qwen35moe scale) — exactly where a device-OOM throw is most
+        // likely to occur, and exactly the buffers a leak here would be most expensive to lose.
+        nint gateExpsDevice = AllocDevice(gateExpsBytes, allocs);
+        nint upExpsDevice = AllocDevice(upExpsBytes, allocs);
+        nint downExpsDevice = AllocDevice(downExpsBytes, allocs);
         CopyHtoD(gateExpsDevice, moe.GateExpsRaw, gateExpsBytes);
         CopyHtoD(upExpsDevice, moe.UpExpsRaw, upExpsBytes);
         CopyHtoD(downExpsDevice, moe.DownExpsRaw, downExpsBytes);
 
-        UpdateMaxTile(ref maxTileFloats, (long)moe.GateExpsMDim * moe.GateExpsKDim);
-        UpdateMaxTile(ref maxTileFloats, (long)moe.DownExpsMDim * moe.DownExpsKDim);
 
         // Shared experts: F32 pointers from the CPU loader → device F32.
         // Qwen3.6-A3B ships exactly one shared expert (verified from the Q6_K_XL GGUF
@@ -1579,11 +1648,11 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         long sharedHiddenIntFloats = (long)moe.SharedIntermediateSize * hiddenSize;
         for (int s = 0; s < numShared; s++)
         {
-            sharedGateDevice[s] = AllocDevice(sharedHiddenIntFloats * sizeof(float));
+            sharedGateDevice[s] = AllocDevice(sharedHiddenIntFloats * sizeof(float), allocs);
             CopyHtoD(sharedGateDevice[s], moe.SharedGateProj[s], sharedHiddenIntFloats * sizeof(float));
-            sharedUpDevice[s] = AllocDevice(sharedHiddenIntFloats * sizeof(float));
+            sharedUpDevice[s] = AllocDevice(sharedHiddenIntFloats * sizeof(float), allocs);
             CopyHtoD(sharedUpDevice[s], moe.SharedUpProj[s], sharedHiddenIntFloats * sizeof(float));
-            sharedDownDevice[s] = AllocDevice(sharedHiddenIntFloats * sizeof(float));
+            sharedDownDevice[s] = AllocDevice(sharedHiddenIntFloats * sizeof(float), allocs);
             CopyHtoD(sharedDownDevice[s], moe.SharedDownProj[s], sharedHiddenIntFloats * sizeof(float));
         }
 
@@ -1591,7 +1660,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         nint sharedExpertGateDevice = 0;
         if (moe.SharedExpertGate is not null)
         {
-            sharedExpertGateDevice = AllocDevice((long)hiddenSize * sizeof(float));
+            sharedExpertGateDevice = AllocDevice((long)hiddenSize * sizeof(float), allocs);
             fixed (float* pGateShared = moe.SharedExpertGate)
             {
                 CopyHtoD(sharedExpertGateDevice, (nint)pGateShared, (long)hiddenSize * sizeof(float));
@@ -1637,6 +1706,18 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         => Forward(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly: false);
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Issue #493: this model has neither LoRA nor MTP support, so both extra arguments are
+    /// ignored (per the <see cref="IModel"/> contract) and the hint is honoured regardless. The
+    /// override exists because the interface default drops the hint whenever an adapter is
+    /// non-null, which a LoRA-configured <c>TextGenerator</c> would hit on every prefill.
+    /// </remarks>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ILoraAdapter? adapter,
+                           IMtpState? mtpState, bool lastTokenLogitsOnly)
+        => Forward(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly);
+
+    /// <inheritdoc/>
     [SkipLocalsInit]
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly)
@@ -1660,6 +1741,25 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             if ((uint)positions[i] >= (uint)maxSeq)
                 throw new ArgumentOutOfRangeException(nameof(positions),
                     $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
+        }
+
+        // The handle is length-only, but callers rely on its CurrentLength: speculative decoding
+        // rolls it back to a committed position after a rejected round. Nothing used to advance
+        // it, so Rollback(n > 0) always threw (surfaced by the MTP replay path on real hardware).
+        if (kvCache is CudaHybridKvCacheHandle handle)
+        {
+            // Issue #478: the handle's length before this call is the committed prefix. After a
+            // speculative rollback the model's own cursor still sits at the old maximum, and every
+            // later forward would convert and attend over the rejected rows until the sequence
+            // outgrew it (masked by position, so wasted work rather than wrong output). This model
+            // has no incremental #182 staging, so only the F16 cursor needs the sync.
+            _f16CacheCurrentLength = HybridKvLengthBookkeeping.SyncToCommitted(
+                _f16CacheCurrentLength, Span<int>.Empty, handle.CurrentLength);
+
+            int maxPos = 0;
+            for (int i = 0; i < positions.Length; i++)
+                if (positions[i] > maxPos) maxPos = positions[i];
+            handle.Advance(maxPos + 1);
         }
 
         _context.MakeCurrent();
@@ -2592,15 +2692,16 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     ///   </item>
     ///   <item><term>Prefill (<paramref name="seqLen"/> &gt; 1)</term><description>Dequantise
     ///     the weight tile to <see cref="_dequantScratchF16Weight"/> (F16) → stage input F32→F16 →
-    ///     cuBLAS HGEMM → stage output F16→F32. Mirrors the dense prefill branch. F16 weight
-    ///     scratch is <c>maxTileFloats × 2 B</c>, half the bytes of the previous F32 scratch.
+    ///     cuBLAS HGEMM → stage output F16→F32. Mirrors the dense prefill branch. The F16 weight
+    ///     scratch is <c>m*k × 2 B</c>, allocated on first use and grown only (issue #495).
     ///     </description></item>
     ///   <item><term>F16 weights</term><description>Decode goes via the F16→F16 GEMV path
     ///     directly (no dequant). Prefill copies the F16 weight to the dequant scratch (no
     ///     conversion) and runs HGEMM.</description></item>
     /// </list>
-    /// The big <c>_dequantScratchF16Weight</c> persistent allocation is only touched on
-    /// prefill — decode-time projections never expand a weight tile to dense memory.
+    /// The <c>_dequantScratchF16Weight</c> allocation is only touched on prefill — decode-time
+    /// projections never expand a weight tile to dense memory, so on a model whose prefill is
+    /// fully covered by packed paths it is never allocated at all (issue #495).
     /// </summary>
     /// <param name="weight">Device pointer to raw weight bytes (quant-format or F16/F32).</param>
     /// <param name="qt">Quantization type of the weight.</param>
@@ -2675,7 +2776,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         // ── Prefill (seqLen > 1) and decode fallback ──
         // Dequant the weight tile to F16, stage input F32→F16, cuBLAS HGEMM, stage
         // output F16→F32. The F16 weight scratch is the model-owned _dequantScratchF16Weight
-        // (sized at load to maxTileFloats halfs). All quant types that LaunchDequantToF16
+        // (issue #495: allocated here on first use, grown only). All quant types that LaunchDequantToF16
         // covers route through here — same kernel coverage as the dense prefill path.
         long totalElems = (long)m * k;
         int totalElemsI = checked((int)totalElems);
@@ -2690,6 +2791,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
 
         // F16-weight branch: no dequant needed — copy is implicit (LaunchDequantToF16
         // handles QuantizationType.F16 as a DtoD copy already).
+        EnsureDequantScratchF16Weight(totalElems);   // #495: demand-sized, grow-only
         _kernels.LaunchDequantToF16(weight, qt, _dequantScratchF16Weight, totalElemsI, streamH);
         _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, activInElems, streamH);
         CudaGemm.LinearF16(_cublas.Handle, _activF16InScratch, _dequantScratchF16Weight,
@@ -2712,6 +2814,26 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         _activF16OutScratch = AllocDevice(halfs * sizeof(ushort));
         _activF16OutScratchElems = halfs;
     }
+
+    /// <summary>Issue #495: grows the F16 weight-dequant scratch to the <c>m*k</c> of the
+    /// projection about to run. Grow-only, allocated on first actual use.</summary>
+    private void EnsureDequantScratchF16Weight(long halfs)
+    {
+        if (halfs <= _dequantScratchElems) return;
+        // Round up to a whole K-quant super-block: dequant_q{2,3,4,5,6}_k_f16 are driven by a
+        // super-block count and each block unconditionally writes all 256 of its elements, with no
+        // per-element tail guard. Every block-quantised GGUF tensor has a row length that is a
+        // multiple of its block size, so m*k already is — but the old buffer was sized to the
+        // largest tile and so carried slack for every smaller one, and an exactly-sized buffer does
+        // not. 510 bytes of insurance against a shape that is not.
+        halfs = (halfs + 255) & ~255L;
+        FreeIfNonZero(ref _dequantScratchF16Weight);
+        _dequantScratchF16Weight = AllocDevice(halfs * sizeof(ushort));
+        _dequantScratchElems = halfs;
+    }
+
+    /// <summary>Device bytes currently held by the F16 weight-dequant scratch (issue #495).</summary>
+    public long DequantScratchF16WeightBytes => _dequantScratchElems * sizeof(ushort);
 
     // ──────────────────────────────────────────────────────────────────────
     //  Host fallbacks — temporary CPU paths used while waiting on CUDA kernels.
@@ -2848,6 +2970,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     {
         if (_disposed) return;
         _disposed = true;
+        _context.MakeCurrent();
 
         // Per-layer weight free.
         for (int i = 0; i < _layers.Length; i++)
@@ -2856,6 +2979,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         }
 
         FreeIfNonZero(ref _dequantScratchF16Weight);
+        _dequantScratchElems = 0;
         FreeIfNonZero(ref _activF16InScratch);
         FreeIfNonZero(ref _activF16OutScratch);
 
@@ -2960,9 +3084,18 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     //  Static helpers
     // ──────────────────────────────────────────────────────────────────────
 
-    private static nint AllocDevice(long bytes)
+    /// <summary>
+    /// Allocates a device buffer. <paramref name="allocs"/> (#383), when supplied, is the
+    /// caller's allocation ledger — every pointer is appended the instant <c>cuMemAlloc</c>
+    /// succeeds, so a throw anywhere later in the same load sequence can free everything
+    /// allocated so far. Null (the default) preserves every pre-existing runtime call site's
+    /// behavior unchanged (per-instance scratch buffers own their own field-based cleanup via
+    /// <c>Dispose</c>, not this ledger).
+    /// </summary>
+    private static nint AllocDevice(long bytes, List<nint>? allocs = null)
     {
         CudaDriverApi.cuMemAlloc_v2(out nint ptr, (nuint)bytes).ThrowOnError();
+        allocs?.Add(ptr);
         return ptr;
     }
 
@@ -2985,12 +3118,12 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// Used for norms, A, dt_bias, ssm_norm, conv1d_weight (host-dequant is cheap for
     /// these shapes).
     /// </summary>
-    private static nint UploadF32Tensor(nint dataBase, GgufTensorDescriptor desc, int expectedElems)
+    private static nint UploadF32Tensor(nint dataBase, GgufTensorDescriptor desc, int expectedElems, List<nint>? allocs = null)
     {
         float[] host = new float[expectedElems];
         Dequantize.ToFloat32(dataBase + (nint)desc.DataOffset, expectedElems,
             desc.QuantizationType, host);
-        nint device = AllocDevice((long)expectedElems * sizeof(float));
+        nint device = AllocDevice((long)expectedElems * sizeof(float), allocs);
         fixed (float* p = host)
         {
             CopyHtoD(device, (nint)p, (long)expectedElems * sizeof(float));
@@ -3003,19 +3136,14 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// pointer holds the same byte representation as the source mmap region; dequant
     /// happens at GEMM time via <see cref="Gemm"/>.
     /// </summary>
-    private static nint UploadRawTensor(nint dataBase, GgufTensorDescriptor desc)
+    private static nint UploadRawTensor(nint dataBase, GgufTensorDescriptor desc, List<nint>? allocs = null)
     {
         int innerDim = desc.Shape[0];
         long outerDim = desc.Shape.ElementCount / innerDim;
         long bytes = Dequantize.RowByteSize(innerDim, desc.QuantizationType) * outerDim;
-        nint device = AllocDevice(bytes);
+        nint device = AllocDevice(bytes, allocs);
         CopyHtoD(device, dataBase + (nint)desc.DataOffset, bytes);
         return device;
-    }
-
-    private static void UpdateMaxTile(ref long max, long candidate)
-    {
-        if (candidate > max) max = candidate;
     }
 
     // ──────────────────────────────────────────────────────────────────────

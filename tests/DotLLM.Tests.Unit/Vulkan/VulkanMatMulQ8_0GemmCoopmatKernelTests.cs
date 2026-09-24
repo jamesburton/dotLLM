@@ -112,6 +112,69 @@ public class VulkanMatMulQ8_0GemmCoopmatKernelTests
         RunAndAssert(device, spvDir, variant, m, k, n);
     }
 
+    /// <summary>
+    /// Issue #443: the same parity gate against the 128x128 blocked coopmat tile, with the
+    /// <b>ragged</b> shapes the legacy theory only half covers.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The boundary path of a four-subgroup 128x128 tile scatters every subgroup's staged
+    /// fragment and derives the owning subgroup from a flat index. Only a shape ragged in M
+    /// <b>and</b> N discriminates a correct scatter from one that writes the <c>warp_c == 0</c>
+    /// half only — the exact bug #439 hit on the PQ2_0 instantiation.
+    /// </para>
+    /// <para>
+    /// Same tolerance as the legacy kernel, deliberately: BK=32 is one whole Q8_0 block for both,
+    /// so the per-output reduction order is identical and a failure here is a bug.
+    /// </para>
+    /// </remarks>
+    /// <param name="n">Token rows (batch).</param>
+    /// <param name="m">Weight rows (output columns of C).</param>
+    /// <param name="k">Contraction dim; must be a multiple of 32.</param>
+    [SkippableTheory]
+    [InlineData(128, 128, 256)]      // exactly one blocked tile in both dims
+    [InlineData(256, 256, 512)]      // 2x2 blocked tiles
+    [InlineData(1, 1, 32)]           // single-cell output
+    [InlineData(17, 33, 64)]         // ragged in both dims
+    [InlineData(33, 33, 128)]        // one past a full fragment in both dims
+    [InlineData(3, 15, 128)]         // below a single fragment in both dims
+    [InlineData(129, 129, 256)]      // one past a full BLOCKED tile in both dims
+    [InlineData(64, 4096, 4096)]     // Llama-3-8B projection: N=64 is half a 128-wide N tile
+    public void Launch_Blocked128x128x4MatchesCpuReference(int n, int m, int k)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasCooperativeMatrix, "Device does not advertise VK_KHR_cooperative_matrix.");
+
+        var variant = Q8_0GemmCoopmatVariant.Blocked128x128x4;
+        Skip.IfNot(variant.IsSupportedOn(device, spvDir),
+            $"{variant.SpvFileName} not compiled (native/vulkan/build.ps1/build.sh).");
+
+        RunAndAssert(device, spvDir, variant, m, k, n);
+    }
+
+    /// <summary>
+    /// <see cref="Q8_0GemmCoopmatVariant.SelectFor"/> must honour
+    /// <see cref="Q8_0GemmCoopmatVariant.LegacyEnvVar"/>.
+    /// </summary>
+    [SkippableFact]
+    public void SelectFor_LegacyEnvVar_RestoresCoopmat64()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+
+        string? saved = Environment.GetEnvironmentVariable(Q8_0GemmCoopmatVariant.LegacyEnvVar);
+        try
+        {
+            Environment.SetEnvironmentVariable(Q8_0GemmCoopmatVariant.LegacyEnvVar, "1");
+            Assert.Equal(Q8_0GemmCoopmatVariant.Coopmat64, Q8_0GemmCoopmatVariant.SelectFor(device, spvDir));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(Q8_0GemmCoopmatVariant.LegacyEnvVar, saved);
+        }
+    }
+
     private void RunAndAssert(VulkanDevice device, string spvDir, Q8_0GemmCoopmatVariant variant, int m, int k, int n)
     {
         var rng = new Random(0xBEEF + n * 31 + m * 17 + k * 3);

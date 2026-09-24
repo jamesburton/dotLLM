@@ -36,6 +36,9 @@
     <None Update="Fixtures\Mamba3\ib_ssm_config.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <None Update="Fixtures\Embeddings\llamacpp-smollm2-135m-instruct-q8_0.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
   <ItemGroup>

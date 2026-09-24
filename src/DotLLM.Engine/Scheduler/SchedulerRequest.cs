@@ -69,6 +69,37 @@ internal sealed class SchedulerRequest : ISchedulerRequest
     /// <summary>Optional decoding constraint for structured output (JSON / schema / regex / grammar).</summary>
     public IDecodingConstraint? Constraint { get; }
 
+    /// <summary>
+    /// Per-sequence incremental detokenizer, present <b>only</b> when this request registered at
+    /// least one <see cref="DotLLM.Engine.Samplers.StopConditions.StopStringCondition"/> (#459).
+    /// Stop strings match on decoded text, so without it the scheduler had no tail to test and
+    /// every stop string — user-supplied or built-in like <c>&lt;|eom_id|&gt;</c> — was silently
+    /// inert. <see langword="null"/> when only token-level conditions (EOS, max-tokens) are
+    /// registered, which keeps the detokenize cost off requests that cannot use it.
+    /// </summary>
+    public IncrementalDetokenizer? Detokenizer { get; set; }
+
+    /// <summary>Scratch buffer for <see cref="IncrementalDetokenizer.GetTailView"/>, sized by
+    /// <see cref="StopTailSize"/>. Allocated once per request rather than pooled: a sequence has
+    /// a dozen distinct terminal paths (completion, cancellation, six failure sites) with no
+    /// single place to return a rented array, and the hot-path guarantee is per <i>token</i>, not
+    /// per request — this is one ~128-byte array beside an already-allocated
+    /// <c>List&lt;int&gt;(maxTokens)</c>.</summary>
+    public char[] StopScratch { get; set; } = [];
+
+    /// <summary>Character window handed to stop conditions; covers the longest registered stop
+    /// string with a cushion.</summary>
+    public int StopTailSize { get; set; }
+
+    /// <summary>
+    /// The stop <i>string</i> that ended this sequence, or <see langword="null"/> when it ended on
+    /// EOS, max-tokens or cancellation. The triggering token is deliberately kept in
+    /// <see cref="GeneratedTokens"/> — the match may cover only a suffix of it — and the stop
+    /// string is trimmed from the decoded text instead, at the character boundary. Recorded rather
+    /// than recomputed because the trim makes it unrecoverable from the returned text.
+    /// </summary>
+    public string? MatchedStopSequence { get; set; }
+
     /// <summary>Reason this sequence stopped (set when transitioning to <see cref="SequenceState.Completed"/>).</summary>
     public FinishReason FinishReason { get; set; } = FinishReason.Length;
 

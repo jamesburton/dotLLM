@@ -107,7 +107,7 @@ internal sealed class VulkanMamba3ForwardScratch : IDisposable
         _numRopeAngles = m3.NumRopeAngles;
         _vocabSize = config.VocabSize;
 
-        Logits = device.Allocate((long)_vocabSize * sizeof(float));
+        Logits = device.AllocateHostReadback((long)_vocabSize * sizeof(float)); // host-read (#143, #471)
         // Per-head boundary-adjustment coefficient buffer — fixed-size (no seqLen
         // dependence), so allocated once here and reused across every Forward.
         BoundaryCoef = device.Allocate((long)_nHead * sizeof(float));

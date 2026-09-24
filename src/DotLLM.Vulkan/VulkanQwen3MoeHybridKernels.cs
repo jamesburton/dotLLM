@@ -56,6 +56,10 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulIq3SGemmF32Kernel MatMulIq3SGemm { get; }
     public MatMulIq1SGemvF32Kernel MatMulIq1S { get; }
     public MatMulIq1SGemmF32Kernel MatMulIq1SGemm { get; }
+    /// <summary>PQ2_0 (PrismML Bonsai ternary) GEMV — decode.</summary>
+    public MatMulPQ2_0GemvF32Kernel MatMulPQ2_0 { get; }
+    /// <summary>PQ2_0 GEMM — prefill. Variant chosen per device by <c>PQ2_0GemmVariant.SelectFor</c>.</summary>
+    public MatMulPQ2_0GemmF32Kernel MatMulPQ2_0Gemm { get; }
     public MatMulF16GemvF32Kernel MatMulF16 { get; }
     public MatMulF16GemmF32Kernel MatMulF16Gemm { get; }
     public MatMulF16GemmCoopmatKernel? MatMulF16GemmCoopmat { get; }
@@ -154,6 +158,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulIq3XxsGemvF32Kernel matmulIq3Xxs, MatMulIq3XxsGemmF32Kernel matmulIq3XxsGemm,
         MatMulIq3SGemvF32Kernel matmulIq3S, MatMulIq3SGemmF32Kernel matmulIq3SGemm,
         MatMulIq1SGemvF32Kernel matmulIq1S, MatMulIq1SGemmF32Kernel matmulIq1SGemm,
+        MatMulPQ2_0GemvF32Kernel matmulPQ2_0, MatMulPQ2_0GemmF32Kernel matmulPQ2_0Gemm,
         MatMulF16GemvF32Kernel matmulF16, MatMulF16GemmF32Kernel matmulF16Gemm,
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
@@ -191,6 +196,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulIq3Xxs = matmulIq3Xxs; MatMulIq3XxsGemm = matmulIq3XxsGemm;
         MatMulIq3S = matmulIq3S; MatMulIq3SGemm = matmulIq3SGemm;
         MatMulIq1S = matmulIq1S; MatMulIq1SGemm = matmulIq1SGemm;
+        MatMulPQ2_0 = matmulPQ2_0; MatMulPQ2_0Gemm = matmulPQ2_0Gemm;
         MatMulF16 = matmulF16; MatMulF16Gemm = matmulF16Gemm;
         MatMulF16GemmCoopmat = matmulF16GemmCoopmat;
         MatMulBf16 = matmulBf16; MatMulBf16Gemm = matmulBf16Gemm;
@@ -267,6 +273,11 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         var matmulIq3SGemm   = MatMulIq3SGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq3Codebooks);
         var matmulIq1S = MatMulIq1SGemvF32Kernel.Create(device, spvDir);
         var matmulIq1SGemm = MatMulIq1SGemmF32Kernel.Create(device, spvDir);
+        // PQ2_0 GEMV + GEMM. Always created, same as the generic VulkanTransformerModel:
+        // the GEMM variant is picked per device by PQ2_0GemmVariant.SelectFor, which falls
+        // back to the register-blocked shader when cooperative matrix is unavailable.
+        var matmulPQ2_0 = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
+        var matmulPQ2_0Gemm = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir);
         var matmulF16 = MatMulF16GemvF32Kernel.Create(device, spvDir);
         var matmulF16Gemm = MatMulF16GemmF32Kernel.Create(device, spvDir);
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat = null;
@@ -289,9 +300,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         // the per-token attention kernel, so no output was ever wrong — this is resource and
         // consistency alignment, not a correctness fix.
         VulkanFlashAttentionF32Kernel? flashAttention =
-            VulkanTransformerModel.IsFlashAttentionDisabled() || headDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
-                ? null
-                : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
+            VulkanAttentionFallbackDiagnostics.CreatePrefillFlashAttention(
+                device, spvDir, headDim, "Qwen3Hybrid");
         VulkanSplitKvAttentionKernel? splitKvAttention =
             VulkanTransformerModel.IsSplitDecodeDisabled() || headDim > VulkanSplitKvAttentionKernel.MaxHeadDim
                 ? null
@@ -357,6 +367,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             matmulIq3Xxs, matmulIq3XxsGemm,
             matmulIq3S, matmulIq3SGemm,
             matmulIq1S, matmulIq1SGemm,
+            matmulPQ2_0, matmulPQ2_0Gemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
             rmsnorm, rope, attention, flashAttention, splitKvAttention, swiglu, add, silu, conv1d,
@@ -400,6 +411,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulIq3SGemm.InvalidateDescriptorCache();
         MatMulIq1S.InvalidateDescriptorCache();
         MatMulIq1SGemm.InvalidateDescriptorCache();
+        MatMulPQ2_0.InvalidateDescriptorCache();
+        MatMulPQ2_0Gemm.InvalidateDescriptorCache();
         MatMulF16.InvalidateDescriptorCache();
         MatMulF16Gemm.InvalidateDescriptorCache();
         MatMulF16GemmCoopmat?.InvalidateDescriptorCache();
@@ -468,6 +481,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulF16GemmCoopmat?.Dispose();
         MatMulF16Gemm.Dispose();
         MatMulF16.Dispose();
+        MatMulPQ2_0Gemm.Dispose();
+        MatMulPQ2_0.Dispose();
         MatMulIq1SGemm.Dispose();
         MatMulIq1S.Dispose();
         MatMulIq4XsGemm.Dispose();

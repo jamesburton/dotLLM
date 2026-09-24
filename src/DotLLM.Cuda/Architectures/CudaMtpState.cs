@@ -26,8 +26,14 @@ public sealed class CudaMtpState : IMtpState, IDisposable
     private nint _keyCacheDevice;     // [maxSteps, kvStride] f32, device-resident
     private nint _valueCacheDevice;   // [maxSteps, kvStride] f32, device-resident
     private nint _pendingHiddenDevice; // [hiddenSize] f32, device-resident — seed for the next ForwardMtp call
+    private nint _positionIotaDevice;  // [maxSteps] int32, device-resident — element p holds p (issue #482)
 
     private float[] _capturedRows = []; // host [rowCount, hiddenSize], grown on demand
+
+    // Host copy of the trunk hidden state at the last absorbed position (issue #469): the
+    // h_{p-1} the next absorb pairs its first token with. Drafting rewrites the device pending
+    // hidden with the head's own output; this survives it.
+    private float[] _carryHidden = [];
     private int _capturedRowCount;
 
     private int _currentLength;
@@ -82,6 +88,32 @@ public sealed class CudaMtpState : IMtpState, IDisposable
         long hiddenBytes = (long)hiddenSize * sizeof(float);
         CudaDriverApi.cuMemAlloc_v2(out _pendingHiddenDevice, (nuint)hiddenBytes).ThrowOnError();
         CudaDriverApi.cuMemsetD8_v2(_pendingHiddenDevice, 0, (nuint)hiddenBytes).ThrowOnError();
+
+        // Positions as a device-resident iota (issue #482): a draft step's RoPE and a batched absorb's
+        // contiguous positions are slices of it, so neither uploads positions per call. Filled once.
+        int[] iota = new int[maxSteps];
+        for (int i = 0; i < maxSteps; i++) iota[i] = i;
+        long iotaBytes = (long)maxSteps * sizeof(int);
+        CudaDriverApi.cuMemAlloc_v2(out _positionIotaDevice, (nuint)iotaBytes).ThrowOnError();
+        unsafe
+        {
+            fixed (int* p = iota)
+                CudaDriverApi.cuMemcpyHtoD_v2(_positionIotaDevice, (nint)p, (nuint)iotaBytes).ThrowOnError();
+        }
+    }
+
+    /// <summary>
+    /// Device pointer to <paramref name="count"/> contiguous int32 positions starting at
+    /// <paramref name="position"/> (<c>[position, position + count)</c>), read-only — a slice of a
+    /// device iota table filled at construction.
+    /// </summary>
+    internal nint GetPositionDevicePtr(int position, int count = 1)
+    {
+        ThrowIfDisposed();
+        if (position < 0 || count < 0 || (long)position + count > _maxSteps)
+            throw new ArgumentOutOfRangeException(nameof(position),
+                $"positions [{position}, {(long)position + count}) exceed MaxSteps={_maxSteps}.");
+        return _positionIotaDevice + (nint)((long)position * sizeof(int));
     }
 
     /// <summary>Device pointer to the pending-hidden vector ([hiddenSize] f32) that seeds the next <c>ForwardMtp</c> call.</summary>
@@ -125,8 +157,66 @@ public sealed class CudaMtpState : IMtpState, IDisposable
         if (_currentLength >= _maxSteps)
             throw new InvalidOperationException(
                 $"CudaMtpState KV-cache exhausted: {_currentLength} steps already advanced against a " +
-                $"MaxSteps={_maxSteps} cache. Size the state for at least numCandidates steps.");
+                $"MaxSteps={_maxSteps} cache. Size the state for the whole sequence (prompt + generated + draft steps).");
         _currentLength++;
+    }
+
+    /// <summary>
+    /// Prepares a batched absorb of <paramref name="count"/> contiguous positions starting at
+    /// <paramref name="firstPosition"/> (issue #472, ported in #478): rolls speculative slots back to
+    /// it, rejects a gap, and bounds-checks the whole slab before anything is written. Mirrors
+    /// <see cref="DotLLM.Models.Architectures.CpuMtpState"/>.
+    /// </summary>
+    internal void BeginAbsorb(int firstPosition, int count)
+    {
+        ThrowIfDisposed();
+        if (_currentLength > firstPosition)
+            _currentLength = firstPosition;
+        else if (_currentLength < firstPosition)
+            throw new InvalidOperationException(
+                $"MTP absorb at position {firstPosition} but the MTP KV-cache only covers {_currentLength} " +
+                "positions. Every trunk Forward of the sequence must pass the MTP state so the head " +
+                "absorbs it (prefill included).");
+        if ((long)firstPosition + count > _maxSteps)
+            throw new InvalidOperationException(
+                $"CudaMtpState KV-cache exhausted absorbing positions [{firstPosition}, {firstPosition + count}) " +
+                $"(MaxSteps={_maxSteps}). Create the state with CreateMtpState(maxSequenceLength) covering the whole sequence.");
+    }
+
+    /// <summary>Completes a batched absorb begun by <see cref="BeginAbsorb"/>: the cache now covers <paramref name="length"/> positions.</summary>
+    internal void EndAbsorb(int length)
+    {
+        ThrowIfDisposed();
+        if (length < _currentLength || length > _maxSteps)
+            throw new ArgumentOutOfRangeException(nameof(length));
+        _currentLength = length;
+    }
+
+    /// <summary>
+    /// Writes the hidden-state rows that batch rows <c>[startRow, startRow + count)</c> pair with
+    /// (issue #469): row 0 is the carried row (the trunk hidden of the position before the batch —
+    /// zero when nothing has been absorbed yet), row <c>i</c> is captured row <c>i - 1</c>.
+    /// <paramref name="dest"/> is <c>[count, hiddenSize]</c>. Exactly the rows the per-token absorb
+    /// uploads through <see cref="SetPendingFromCarry"/> / <see cref="SetPendingFromCapturedRow"/>.
+    /// </summary>
+    internal void CopyAbsorbPairingRows(int startRow, int count, Span<float> dest)
+    {
+        ThrowIfDisposed();
+        if (startRow < 0 || count < 0 || startRow + count > _capturedRowCount)
+            throw new ArgumentOutOfRangeException(nameof(count));
+        if (dest.Length < count * _hiddenSize)
+            throw new ArgumentException("dest too small.", nameof(dest));
+        for (int i = 0; i < count; i++)
+        {
+            int row = startRow + i;
+            var d = dest.Slice(i * _hiddenSize, _hiddenSize);
+            if (row > 0)
+                _capturedRows.AsSpan((row - 1) * _hiddenSize, _hiddenSize).CopyTo(d);
+            else if (_carryHidden.Length == _hiddenSize)
+                _carryHidden.CopyTo(d);
+            else
+                d.Clear();   // nothing absorbed yet: h_{-1} is zero (matches SetPendingFromCarry)
+        }
     }
 
     /// <inheritdoc/>
@@ -174,7 +264,31 @@ public sealed class CudaMtpState : IMtpState, IDisposable
         // H2D: host-captured row -> device pending-hidden buffer. The very next ForwardMtp call
         // consumes _pendingHiddenDevice directly on-device (RMSNorm), so no further round-trip is
         // needed until the NEXT round's SeedFromCapturedRow.
-        fixed (float* p = &_capturedRows[rowIndex * _hiddenSize])
+        if (_carryHidden.Length != _hiddenSize)
+            _carryHidden = new float[_hiddenSize];
+        _capturedRows.AsSpan(rowIndex * _hiddenSize, _hiddenSize).CopyTo(_carryHidden);
+        UploadPending(_capturedRows.AsSpan(rowIndex * _hiddenSize, _hiddenSize));
+    }
+
+    /// <summary>Seeds the device pending hidden from the carried (last absorbed) trunk row.</summary>
+    internal void SetPendingFromCarry()
+    {
+        ThrowIfDisposed();
+        if (_carryHidden.Length != _hiddenSize)
+            _carryHidden = new float[_hiddenSize];   // nothing absorbed yet: h_{-1} is zero
+        UploadPending(_carryHidden);
+    }
+
+    /// <summary>Seeds the device pending hidden from captured row <paramref name="row"/> without moving the carry.</summary>
+    internal void SetPendingFromCapturedRow(int row)
+    {
+        ThrowIfDisposed();
+        UploadPending(_capturedRows.AsSpan(row * _hiddenSize, _hiddenSize));
+    }
+
+    private unsafe void UploadPending(ReadOnlySpan<float> row)
+    {
+        fixed (float* p = row)
         {
             CudaDriverApi.cuMemcpyHtoD_v2(_pendingHiddenDevice, (nint)p,
                 (nuint)((long)_hiddenSize * sizeof(float))).ThrowOnError();
@@ -182,7 +296,7 @@ public sealed class CudaMtpState : IMtpState, IDisposable
     }
 
     /// <summary>Total bytes allocated for this state's own KV-cache + pending-hidden buffer (device memory).</summary>
-    public long AllocatedBytes => (2L * _maxSteps * _kvStride + _hiddenSize) * sizeof(float);
+    public long AllocatedBytes => (2L * _maxSteps * _kvStride + _hiddenSize) * sizeof(float) + (long)_maxSteps * sizeof(int);
 
     private void ThrowIfDisposed()
     {
@@ -196,6 +310,7 @@ public sealed class CudaMtpState : IMtpState, IDisposable
         if (_keyCacheDevice != 0) { CudaDriverApi.cuMemFree_v2(_keyCacheDevice); _keyCacheDevice = 0; }
         if (_valueCacheDevice != 0) { CudaDriverApi.cuMemFree_v2(_valueCacheDevice); _valueCacheDevice = 0; }
         if (_pendingHiddenDevice != 0) { CudaDriverApi.cuMemFree_v2(_pendingHiddenDevice); _pendingHiddenDevice = 0; }
+        if (_positionIotaDevice != 0) { CudaDriverApi.cuMemFree_v2(_positionIotaDevice); _positionIotaDevice = 0; }
         _disposed = true;
         GC.SuppressFinalize(this);
     }

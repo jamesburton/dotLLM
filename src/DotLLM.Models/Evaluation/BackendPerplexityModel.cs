@@ -65,7 +65,15 @@ public sealed class BackendPerplexityModel : IPerplexityModel
     /// in a fact that lives in each backend's forward implementation and can change without this
     /// adapter noticing, and the failure mode is a silently wrong perplexity rather than an
     /// exception. A two-token probe costs one trivial forward and cannot be wrong about the backend
-    /// it just ran.
+    /// it just ran <i>at two tokens</i>.
+    /// <para><b>Which is exactly the limit of what measuring can tell you</b>, so the measurement is
+    /// combined with <see cref="IModel.MaxAllRowLogitsLength"/>. A backend may return every row up to
+    /// some bound and the last row only beyond it (the Vulkan hybrid-dense host does, so that a
+    /// speculative verify batch gets the per-position logits it indexes, without paying a
+    /// 248320-row head on a 2048-token prefill). Such a model answers the two-token probe with two
+    /// rows and would be scored single-pass, whereupon the evaluator would index rows 1..n-1 of a
+    /// buffer holding one — reading past the end of the allocation and reporting a fabricated
+    /// perplexity. Only a model that returns all rows for <em>any</em> length is eligible.</para>
     /// <para><b>The probe leaves no trace.</b> On a recurrent architecture the probe's forward
     /// advances model-owned recurrent state, so without the reset below the two throwaway tokens
     /// would have been prepended to the very first scored window (issue #261). The reset runs in a
@@ -81,7 +89,8 @@ public sealed class BackendPerplexityModel : IPerplexityModel
             ReadOnlySpan<int> tokens = stackalloc int[2] { 0, 0 };
             ReadOnlySpan<int> positions = stackalloc int[2] { 0, 1 };
             using ITensor logits = model.Forward(tokens, positions, deviceId);
-            return logits.ElementCount >= 2L * model.Config.VocabSize;
+            return logits.ElementCount >= 2L * model.Config.VocabSize
+                && model.MaxAllRowLogitsLength == int.MaxValue;
         }
         finally
         {

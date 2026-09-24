@@ -25,6 +25,7 @@ namespace DotLLM.Tests.Integration.Models.Lora;
 /// GPU-phase FP32 residual, FP32 boundary transfer). Kept in its own class to avoid
 /// cross-class GPU parallelism.
 /// </remarks>
+[Collection(GpuCollection.Name)]
 public sealed class HybridBitNetParityTests
 {
     private readonly ITestOutputHelper _output;

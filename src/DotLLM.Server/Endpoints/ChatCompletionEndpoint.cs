@@ -32,7 +32,7 @@ public static class ChatCompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = activationError },
+                ErrorResponse.InvalidRequest(activationError, param: "model", code: "model_not_found"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -43,7 +43,7 @@ public static class ChatCompletionEndpoint
         {
             httpContext.Response.StatusCode = 503;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = "No model loaded" },
+                ErrorResponse.Internal("No model loaded", code: "model_not_loaded"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -56,7 +56,24 @@ public static class ChatCompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = validationError },
+                ErrorResponse.InvalidRequest(validationError),
+                ServerJsonContext.Default.ErrorResponse,
+                contentType: null,
+                httpContext.RequestAborted);
+            return;
+        }
+
+        // n is implemented for the non-streaming path only (#460). Streaming would need per-choice
+        // index on every delta and an n-way interleave of the SSE stream; rather than silently
+        // returning one choice -- the defect this closes -- say so.
+        if (request.Stream && request.ChoiceCount != 1)
+        {
+            httpContext.Response.StatusCode = 400;
+            await httpContext.Response.WriteAsJsonAsync(
+                ErrorResponse.InvalidRequest(
+                    "n > 1 is not supported with stream: true. Request the choices without streaming, "
+                    + "or issue n separate streaming requests.",
+                    param: "n"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -76,7 +93,7 @@ public static class ChatCompletionEndpoint
             {
                 httpContext.Response.StatusCode = 400;
                 await httpContext.Response.WriteAsJsonAsync(
-                    new ErrorResponse { Error = $"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first." },
+                    ErrorResponse.InvalidRequest($"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first.", param: "prefix_id"),
                     ServerJsonContext.Default.ErrorResponse,
                     contentType: null,
                     httpContext.RequestAborted);
@@ -94,7 +111,7 @@ public static class ChatCompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = ex.Message },
+                ErrorResponse.InvalidRequest(ex.Message, param: "lora_adapter"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -123,7 +140,7 @@ public static class ChatCompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = promptError },
+                ErrorResponse.InvalidRequest(promptError, param: "messages", code: "context_length_exceeded"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -138,6 +155,13 @@ public static class ChatCompletionEndpoint
                 state.Options.Threads, state.Options.DecodeThreads));
         options = options with { MaxTokens = effectiveMaxTokens };
 
+        // #456: tool_choice was parsed at the top of this method and then DISCARDED — the local
+        // had exactly one reference, its own assignment — so required/none/named-function had no
+        // effect on generation. The Anthropic surface has honoured it since #449; this shares
+        // that implementation rather than forking a second one.
+        var effectiveToolParser = ToolChoiceBinder.Apply(
+            toolChoice, tools, state.ToolCallParser, ref options, out bool forcedToolCall);
+
         // Diffusion routing: when the loaded model is a masked text-diffusion model, generation runs
         // through DiffusionTextGenerator (canvas denoising) instead of the autoregressive TextGenerator.
         // AR models leave DiffusionGenerator null and fall through to the unchanged path below.
@@ -147,6 +171,17 @@ public static class ChatCompletionEndpoint
             // fresh generator over the same model with a tweaked DiffusionConfig; absent overrides reuse
             // the load-time generator (verified DiffusionConfig defaults). max_tokens → target length.
             var effective = ResolveDiffusionGenerator(diffusionGenerator, state, request.Diffusion);
+
+            if (request.ChoiceCount != 1)
+            {
+                httpContext.Response.StatusCode = 400;
+                await httpContext.Response.WriteAsJsonAsync(
+                    ErrorResponse.InvalidRequest(
+                        "n > 1 is not supported for diffusion models.", param: "n"),
+                    ServerJsonContext.Default.ErrorResponse,
+                    contentType: null, httpContext.RequestAborted);
+                return;
+            }
 
             if (request.Stream)
                 await HandleDiffusionStreamingAsync(request, effective, state, httpContext,
@@ -159,10 +194,10 @@ public static class ChatCompletionEndpoint
 
         if (request.Stream)
             await HandleStreamingAsync(request, generator, state, httpContext, prompt, options,
-                requestId, modelId, tools, adapter, ct);
+                requestId, modelId, tools, effectiveToolParser, adapter, ct);
         else
             await HandleNonStreamingAsync(request, generator, state, httpContext, prompt, options,
-                requestId, modelId, tools, adapter, ct);
+                requestId, modelId, tools, effectiveToolParser, adapter, ct);
     }
 
     private static async Task HandleNonStreamingAsync(
@@ -174,10 +209,12 @@ public static class ChatCompletionEndpoint
         DotLLM.Core.Configuration.InferenceOptions options,
         string requestId, string modelId,
         ToolDefinition[]? tools,
+        IToolCallParser? toolParser,
         DotLLM.Core.Lora.ILoraAdapter? adapter,
         CancellationToken ct)
     {
-        InferenceResponse? result = null;
+        int choiceCount = request.ChoiceCount;
+        var results = new InferenceResponse[choiceCount];
 
         // Route through the continuous-batch scheduler when it's the right shape for it: no LoRA
         // adapter, no logprobs capture. Multiple concurrent requests pipeline through one model
@@ -185,41 +222,92 @@ public static class ChatCompletionEndpoint
         if (state.Scheduler is { } scheduler && adapter is null && !options.Logprobs)
         {
             int[] promptIds = state.Tokenizer!.Encode(prompt);
-            var inferenceRequest = new InferenceRequest
+            var inFlight = new Task<InferenceResponse>[choiceCount];
+            for (int i = 0; i < choiceCount; i++)
             {
-                TokenIds = promptIds,
-                Options = options,
-            };
-            result = await scheduler.EnqueueAsync(inferenceRequest, ct);
+                inFlight[i] = scheduler.EnqueueAsync(new InferenceRequest
+                {
+                    TokenIds = promptIds,
+                    Options = SeedForChoice(options, i),
+                }, ct);
+            }
+            // All n submitted before awaiting any: the scheduler batches concurrent sequences into
+            // one model dispatch per iteration, so n choices cost far less than n sequential runs.
+            results = await Task.WhenAll(inFlight);
         }
         else
         {
-            await state.ExecuteAsync(async () =>
+            // The generator path is serialized by ExecuteAsync, so the choices run one at a time.
+            for (int i = 0; i < choiceCount; i++)
             {
-                result = generator.Generate(prompt, options, adapter: adapter);
-            }, ct);
+                var choiceOptions = SeedForChoice(options, i);
+                InferenceResponse? one = null;
+                await state.ExecuteAsync(async () =>
+                {
+                    one = generator.Generate(prompt, choiceOptions, adapter: adapter);
+                }, ct);
+                results[i] = one!;
+            }
         }
 
+        var choices = new ChatChoiceDto[choiceCount];
+        for (int i = 0; i < choiceCount; i++)
+            choices[i] = BuildChoice(results[i], i);
+
+        var usage = BuildMultiChoiceUsage(results);
+
+        var response = new ChatCompletionResponse
+        {
+            Id = requestId,
+            Model = modelId,
+            Choices = choices,
+            Usage = usage,
+        };
+
+        // Report actuals to the rate-limit lease so unused token budget is refunded. Every choice
+        // ran the prompt, so the metered cost is n prompts plus the summed completions -- which is
+        // NOT what the reported usage says, because OpenAI counts the prompt once however many
+        // choices it produced. The limiter meters real work; the response reports the convention.
+        RateLimitMiddleware.GetLease(httpContext)
+            ?.ReportActualTokens(results[0].PromptTokenCount * choiceCount
+                + (usage.TotalTokens - usage.PromptTokens));
+
+        httpContext.Response.ContentType = "application/json";
+        await JsonSerializer.SerializeAsync(httpContext.Response.Body, response, ServerJsonContext.Default.ChatCompletionResponse, ct);
+        return;
+
+        // Local: turn one engine response into one choice. Identical to the single-choice path it
+        // replaces; the index is the only thing that varies.
+        ChatChoiceDto BuildChoice(InferenceResponse result, int index)
+        {
         // Detect tool calls
         string text = result!.Text;
         ToolCall[]? toolCalls = null;
         var finishReason = result.FinishReason;
 
-        if (state.ToolCallParser is not null && tools is { Length: > 0 })
+        // #456: the EFFECTIVE parser, not state's. tool_choice:none yields null here so no tool
+        // call is ever reported, and a forced choice yields the markerless parser that matches
+        // the constrained output.
+        if (toolParser is not null && tools is { Length: > 0 })
         {
-            var enriched = ToolCallDetector.DetectToolCalls(result, state.ToolCallParser);
+            var enriched = ToolCallDetector.DetectToolCalls(result, toolParser);
             text = enriched.Text;
-            toolCalls = enriched.ToolCalls;
+            toolCalls = ApplyParallelToolCalls(enriched.ToolCalls, request.ParallelToolCalls);
             finishReason = enriched.FinishReason;
         }
 
-        // Strip stop sequence suffixes
-        foreach (var seq in options.StopSequences)
+        // Strip stop-sequence suffixes. Only when the engine did NOT report a match: since #459 it
+        // trims the matched stop string itself, and stripping again would eat a second copy from
+        // text that legitimately ends with a repeat ("wait!!" with stop "!" becoming "wait").
+        if (result.MatchedStopSequence is null)
         {
-            if (text.EndsWith(seq, StringComparison.Ordinal))
+            foreach (var seq in options.StopSequences)
             {
-                text = text[..^seq.Length];
-                break;
+                if (text.EndsWith(seq, StringComparison.Ordinal))
+                {
+                    text = text[..^seq.Length];
+                    break;
+                }
             }
         }
 
@@ -236,32 +324,48 @@ public static class ChatCompletionEndpoint
             ? RequestConverter.ToLogprobsDto(result.Logprobs)
             : null;
 
-        var response = new ChatCompletionResponse
+        return new ChatChoiceDto
         {
-            Id = requestId,
-            Model = modelId,
-            Choices = [new ChatChoiceDto
-            {
-                Index = 0,
-                Message = message,
-                Logprobs = logprobsDto,
-                FinishReason = RequestConverter.ToFinishReasonString(finishReason),
-            }],
-            Usage = new UsageDto
-            {
-                PromptTokens = result.PromptTokenCount,
-                CompletionTokens = result.GeneratedTokenCount,
-                TotalTokens = result.PromptTokenCount + result.GeneratedTokenCount,
-            },
+            Index = index,
+            Message = message,
+            Logprobs = logprobsDto,
+            FinishReason = RequestConverter.ToFinishReasonString(finishReason),
         };
-
-        // Report actuals to the rate-limit lease so unused token budget is refunded.
-        RateLimitMiddleware.GetLease(httpContext)
-            ?.ReportActualTokens(result.PromptTokenCount + result.GeneratedTokenCount);
-
-        httpContext.Response.ContentType = "application/json";
-        await JsonSerializer.SerializeAsync(httpContext.Response.Body, response, ServerJsonContext.Default.ChatCompletionResponse, ct);
+        }
     }
+
+    /// <summary>
+    /// Usage across the <c>n</c> choices of one request. OpenAI reports the prompt <b>once</b>
+    /// however many choices were produced, and sums <c>completion_tokens</c> across them -- so
+    /// <c>total_tokens</c> is not <c>n x</c> anything, and a client reconciling spend against it
+    /// would be misled by any other arrangement.
+    /// </summary>
+    internal static UsageDto BuildMultiChoiceUsage(IReadOnlyList<InferenceResponse> results)
+    {
+        int promptTokens = results.Count > 0 ? results[0].PromptTokenCount : 0;
+        int completionTokens = 0;
+        for (int i = 0; i < results.Count; i++)
+            completionTokens += results[i].GeneratedTokenCount;
+
+        return new UsageDto
+        {
+            PromptTokens = promptTokens,
+            CompletionTokens = completionTokens,
+            TotalTokens = promptTokens + completionTokens,
+        };
+    }
+
+    /// <summary>
+    /// Per-choice sampling seed for <c>n &gt; 1</c>. Choice 0 keeps the caller's seed exactly, so
+    /// single-choice behaviour and its determinism are unchanged; later choices offset it so a
+    /// seeded request does not return n identical completions. An unseeded request already varies
+    /// (the pipeline builds a fresh <c>Random</c>) and is left alone.
+    /// </summary>
+    internal static DotLLM.Core.Configuration.InferenceOptions SeedForChoice(
+        DotLLM.Core.Configuration.InferenceOptions options, int index)
+        => index == 0 || options.Seed is null
+            ? options
+            : options with { Seed = unchecked(options.Seed.Value + index) };
 
     private static async Task HandleStreamingAsync(
         ChatCompletionRequest request,
@@ -272,6 +376,7 @@ public static class ChatCompletionEndpoint
         DotLLM.Core.Configuration.InferenceOptions options,
         string requestId, string modelId,
         ToolDefinition[]? tools,
+        IToolCallParser? toolParser,
         DotLLM.Core.Lora.ILoraAdapter? adapter,
         CancellationToken ct)
     {
@@ -330,9 +435,10 @@ public static class ChatCompletionEndpoint
         // Detect tool calls in accumulated text
         string text = sb.ToString();
         ToolCall[]? toolCalls = null;
-        if (state.ToolCallParser is not null && tools is { Length: > 0 })
+        // #456: see the non-streaming path — the effective parser honours tool_choice.
+        if (toolParser is not null && tools is { Length: > 0 })
         {
-            toolCalls = state.ToolCallParser.TryParse(text);
+            toolCalls = ApplyParallelToolCalls(toolParser.TryParse(text), request.ParallelToolCalls);
             if (toolCalls is { Length: > 0 })
                 finishReason = FinishReason.ToolCalls;
         }
@@ -357,12 +463,11 @@ public static class ChatCompletionEndpoint
                 Delta = finalDelta,
                 FinishReason = RequestConverter.ToFinishReasonString(finishReason),
             }],
-            Usage = new UsageDto
-            {
-                PromptTokens = promptTokens,
-                CompletionTokens = completionTokens,
-                TotalTokens = promptTokens + completionTokens,
-            },
+            // #450/#453: OpenAI puts usage in a DEDICATED final chunk (choices: []) and ONLY
+            // when stream_options.include_usage was requested. Carrying it on the last content
+            // chunk as well produced two usage-bearing chunks when requested and one when not
+            // — the conformance rows openai/usage.stream{,.unrequested} caught both.
+            // Timings stays: it is our own extension and no OpenAI client looks for it.
             Timings = timings.HasValue ? new TimingsDto
             {
                 PrefillTimeMs = timings.Value.PrefillTimeMs,
@@ -380,10 +485,44 @@ public static class ChatCompletionEndpoint
         };
         await WriteSseChunk(httpContext, finalChunk, ct);
 
+        // stream_options.include_usage (#450): OpenAI closes the stream with a usage-only chunk
+        // (choices: []). The finish_reason chunk above also carries usage as a long-standing
+        // dotLLM extension; this adds the shape the SDKs actually look for, without removing it.
+        if (request.WantsUsageChunk)
+            await WriteSseChunk(httpContext, BuildUsageChunk(requestId, modelId, promptTokens, completionTokens), ct);
+
         // [DONE] sentinel
         await httpContext.Response.WriteAsync("data: [DONE]\n\n", ct);
         await httpContext.Response.Body.FlushAsync(ct);
     }
+
+    /// <summary>
+    /// Builds OpenAI's final usage chunk (#450): <c>usage</c> populated, <c>choices</c> empty.
+    /// SDKs tell it apart from a content chunk by exactly that empty array, so the shape is
+    /// load-bearing and not merely cosmetic.
+    /// </summary>
+    internal static ChatCompletionChunk BuildUsageChunk(
+        string requestId, string modelId, int promptTokens, int completionTokens) =>
+        new()
+        {
+            Id = requestId,
+            Model = modelId,
+            Choices = [],
+            Usage = new UsageDto
+            {
+                PromptTokens = promptTokens,
+                CompletionTokens = completionTokens,
+                TotalTokens = promptTokens + completionTokens,
+            },
+        };
+
+    /// <summary>
+    /// Enforces <c>parallel_tool_calls: false</c> (#450) by keeping at most the first detected
+    /// call. Nothing constrains the model during decode, so the cap is applied on the way out.
+    /// Null/true (the OpenAI default) passes the calls through untouched.
+    /// </summary>
+    internal static ToolCall[]? ApplyParallelToolCalls(ToolCall[]? toolCalls, bool? parallelToolCalls) =>
+        parallelToolCalls == false && toolCalls is { Length: > 1 } ? [toolCalls[0]] : toolCalls;
 
     private static async Task WriteSseChunk(HttpContext ctx, ChatCompletionChunk chunk, CancellationToken ct)
     {
@@ -596,6 +735,13 @@ public static class ChatCompletionEndpoint
             },
         };
         await WriteSseChunk(httpContext, finalChunk, ct);
+
+        // stream_options.include_usage (#450) — same closing shape as the autoregressive path.
+        if (request.WantsUsageChunk)
+        {
+            await WriteSseChunk(httpContext, BuildUsageChunk(
+                requestId, modelId, result.PromptTokenCount, result.GeneratedTokenCount), ct);
+        }
 
         await httpContext.Response.WriteAsync("data: [DONE]\n\n", ct);
         await httpContext.Response.Body.FlushAsync(ct);

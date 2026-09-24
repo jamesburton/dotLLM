@@ -94,6 +94,132 @@ public class VulkanGdnScanMultiTokenF32KernelTests
         AssertCloseUlp(cpuOut, gpuOut, "output");
     }
 
+    /// <summary>
+    /// #445: every factorial arm must reproduce the shipping kernel's output <b>bit for bit</b>,
+    /// not merely within the 4 ULP the CPU-oracle test allows.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The arms change only where the state matrix lives (global SSBO vs an LDS column slab)
+    /// and how many times each element is re-read per token (six vs four). Every reduction
+    /// keeps its order and its <c>precise</c> qualifier, and each fusion reuses from a register
+    /// the exact f32 the preceding store rounded to. So the correct assertion is equality, and
+    /// a 4 ULP tolerance here would be <i>too loose to discriminate</i> — it would pass an arm
+    /// that had quietly let the driver contract a multiply-add into an FMA, which is precisely
+    /// the failure the shipping shader's <c>precise</c> discipline exists to prevent.
+    /// </para>
+    /// <para>
+    /// Run at Bonsai 2's real GDN shape (nVHead 48, nKHead 16, dState 128) because the LDS arms
+    /// split columns 32 at a time: a dState of 32 would put every head in a single workgroup and
+    /// leave the split itself untested. seqLen 12 is enough for the recurrence to carry state
+    /// across many tokens while keeping the test quick.
+    /// </para>
+    /// </remarks>
+    [SkippableTheory]
+    [InlineData(GdnScanMultiTokenF32Kernel.Variant.Fused)]
+    [InlineData(GdnScanMultiTokenF32Kernel.Variant.Lds)]
+    [InlineData(GdnScanMultiTokenF32Kernel.Variant.LdsFused)]
+    [InlineData(GdnScanMultiTokenF32Kernel.Variant.Lds64)]
+    [InlineData(GdnScanMultiTokenF32Kernel.Variant.Lds64Fused)]
+    public void Variant_IsBitIdenticalToShippingKernel(GdnScanMultiTokenF32Kernel.Variant variant)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        Skip.IfNot(File.Exists(Path.Combine(spvDir, "gdn_scan_multi_token_f32.spv")),
+            "gdn_scan_multi_token_f32.spv not compiled (glslc / Vulkan SDK required).");
+
+        const int seqLen = 12, nVHead = 48, nKHead = 16, dState = 128;
+
+        var rng = new Random(445);
+        float[] state0 = RandomFloats(rng, nVHead * dState * dState, 0.1f);
+        float[] q = RandomFloats(rng, seqLen * nKHead * dState, 1.0f);
+        float[] k = RandomFloats(rng, seqLen * nKHead * dState, 1.0f);
+        float[] v = RandomFloats(rng, seqLen * nVHead * dState, 1.0f);
+        float[] g = new float[seqLen * nVHead];
+        float[] beta = new float[seqLen * nVHead];
+        for (int i = 0; i < g.Length; i++)
+        {
+            g[i] = 0.5f + 0.5f * (float)rng.NextDouble();
+            beta[i] = (float)rng.NextDouble();
+        }
+
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(File.Exists(Path.Combine(spvDir, VariantSpv(variant))),
+            $"{VariantSpv(variant)} not compiled (glslc / Vulkan SDK required).");
+
+        var (baseState, baseOut) = RunArm(
+            device, spvDir, GdnScanMultiTokenF32Kernel.Variant.Baseline,
+            state0, q, k, v, g, beta, seqLen, nVHead, nKHead, dState);
+        var (armState, armOut) = RunArm(
+            device, spvDir, variant,
+            state0, q, k, v, g, beta, seqLen, nVHead, nKHead, dState);
+
+        AssertBitIdentical(baseState, armState, $"{variant} state");
+        AssertBitIdentical(baseOut, armOut, $"{variant} output");
+    }
+
+    private static string VariantSpv(GdnScanMultiTokenF32Kernel.Variant v) => v switch
+    {
+        GdnScanMultiTokenF32Kernel.Variant.Fused => "gdn_scan_multi_token_fused_f32.spv",
+        GdnScanMultiTokenF32Kernel.Variant.Lds => "gdn_scan_multi_token_lds_f32.spv",
+        GdnScanMultiTokenF32Kernel.Variant.LdsFused => "gdn_scan_multi_token_lds_fused_f32.spv",
+        GdnScanMultiTokenF32Kernel.Variant.Lds64 => "gdn_scan_multi_token_lds64_f32.spv",
+        GdnScanMultiTokenF32Kernel.Variant.Lds64Fused => "gdn_scan_multi_token_lds64_fused_f32.spv",
+        _ => "gdn_scan_multi_token_f32.spv",
+    };
+
+    private static (float[] State, float[] Out) RunArm(
+        VulkanDevice device, string spvDir, GdnScanMultiTokenF32Kernel.Variant variant,
+        float[] state0, float[] q, float[] k, float[] v, float[] g, float[] beta,
+        int seqLen, int nVHead, int nKHead, int dState)
+    {
+        using var kernel = GdnScanMultiTokenF32Kernel.Create(device, spvDir, variant);
+        // Allocated fresh per arm and never reused across iterations: a recycled handle can
+        // land back in the handle-keyed DescriptorSetCache and hand the second arm the first
+        // arm's descriptor set, which reads as a correct-then-zeros kernel bug.
+        using var stateBuf = device.Allocate((long)state0.Length * sizeof(float));
+        using var qBuf = device.Allocate((long)q.Length * sizeof(float));
+        using var kBuf = device.Allocate((long)k.Length * sizeof(float));
+        using var vBuf = device.Allocate((long)v.Length * sizeof(float));
+        using var gBuf = device.Allocate((long)g.Length * sizeof(float));
+        using var betaBuf = device.Allocate((long)beta.Length * sizeof(float));
+        using var outBuf = device.Allocate((long)seqLen * nVHead * dState * sizeof(float));
+        device.Upload(state0.AsSpan(), stateBuf);
+        device.Upload(q.AsSpan(), qBuf);
+        device.Upload(k.AsSpan(), kBuf);
+        device.Upload(v.AsSpan(), vBuf);
+        device.Upload(g.AsSpan(), gBuf);
+        device.Upload(beta.AsSpan(), betaBuf);
+
+        kernel.Launch(stateBuf, qBuf, kBuf, vBuf, gBuf, betaBuf, outBuf,
+            seqLen, nVHead, nKHead, dState);
+
+        float[] outState = new float[state0.Length];
+        float[] outVals = new float[seqLen * nVHead * dState];
+        device.Download(stateBuf, outState);
+        device.Download(outBuf, outVals);
+        return (outState, outVals);
+    }
+
+    private static void AssertBitIdentical(float[] expected, float[] actual, string label)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        int mismatches = 0;
+        int firstIdx = -1;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            if (BitConverter.SingleToInt32Bits(expected[i]) == BitConverter.SingleToInt32Bits(actual[i]))
+                continue;
+            if (firstIdx < 0) firstIdx = i;
+            mismatches++;
+        }
+
+        Assert.True(mismatches == 0,
+            $"{label}: {mismatches}/{expected.Length} elements differ from the shipping kernel; " +
+            (firstIdx >= 0
+                ? $"first at [{firstIdx}] expected {expected[firstIdx]:R} actual {actual[firstIdx]:R}"
+                : string.Empty));
+    }
+
     private static float[] RandomFloats(Random rng, int count, float range)
     {
         var arr = new float[count];

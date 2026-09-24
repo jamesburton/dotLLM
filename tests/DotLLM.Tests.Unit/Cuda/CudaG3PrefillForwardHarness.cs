@@ -25,6 +25,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// cached Llama-3.2-1B-Instruct-Q8_0 / SmolLM-135M.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaG3PrefillForwardHarness
 {
     private const float AbsTol = 5e-3f;

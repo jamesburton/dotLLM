@@ -409,12 +409,16 @@ public sealed unsafe class DequantizeKQuantTests
             block[0] = 0x23;
 
             // qs[0] (offset 16): set element 0's 2 low bits to 0b10 (= 2).
-            // qs encoding: 4 elements per byte, low-to-high.
+            // qs encoding: 4 elements per byte, low-to-high, but the four elements a byte
+            // carries are 32 APART, not consecutive (#498) —
             //   byte 0, bits 0-1 → element 0
-            //   byte 0, bits 2-3 → element 1
-            //   byte 0, bits 4-5 → element 2
-            //   byte 0, bits 6-7 → element 3
-            block[16 + 0] = 0x02;  // element 0 = 2, elements 1-3 = 0
+            //   byte 0, bits 2-3 → element 32
+            //   byte 0, bits 4-5 → element 64
+            //   byte 0, bits 6-7 → element 96
+            // Element 1 lives in byte 1, bits 0-1. This block leaves every other byte zero, so
+            // the assertions below hold under either layout: that degeneracy is precisely what
+            // Q2_K_DenseRandomBlocks_MatchLlamaCppReference exists to cover.
+            block[16 + 0] = 0x02;  // element 0 = 2; elements 32/64/96 = 0
 
             // Element 0: q2 = 2, scale = 3, dmin_coef = 2
             //   value = d * scale * q2 - dmin * dmin_coef
@@ -437,6 +441,106 @@ public sealed unsafe class DequantizeKQuantTests
         {
             NativeMemory.AlignedFree((void*)ptr);
         }
+    }
+
+    /// <summary>
+    /// Discriminating Q2_K oracle test (#498) — the Q2_K twin of
+    /// <see cref="Q3_K_DenseRandomBlocks_MatchLlamaCppReference"/>, and added for the same reason.
+    /// <see cref="Q2_K_SingleBlock_HandCalculated"/> only exercises elements 0, 1 and 16 of a
+    /// block whose <c>qs</c> is zero everywhere except byte 0 — a degenerate case where the
+    /// correct and the shipped-wrong bit layouts coincide, which is exactly why a total scramble
+    /// of Q2_K shipped undetected (decoded weights correlated 0.07 with the truth).
+    ///
+    /// Dense pseudorandom super-block bytes are driven through <see cref="Dequantize.ToFloat32"/>
+    /// and compared against a LITERAL transcription of llama.cpp's
+    /// <c>ggml-quants.c dequantize_row_q2_K</c>, kept in its original <c>shift</c>/<c>is</c>
+    /// control-flow shape rather than the production kernel's closed-form indexing, so agreement
+    /// is evidence rather than a shared-mistake tautology.
+    ///
+    /// Discrimination proof: reverting the element ordering to
+    /// <c>qs[t/4] @ (t%4)*2</c> makes this red on the very first block.
+    /// </summary>
+    [Fact]
+    public void Q2_K_DenseRandomBlocks_MatchLlamaCppReference()
+    {
+        const int blocks = 5;
+        const int elements = blocks * KQuantGroupSize;
+        nuint totalBytes = (nuint)(blocks * Q2_K_BlockBytes);
+        nint ptr = (nint)NativeMemory.AlignedAlloc(totalBytes, 64);
+        try
+        {
+            var rng = new Random(20260922);
+            byte* raw = (byte*)ptr;
+            for (int i = 0; i < (int)totalBytes; i++) raw[i] = (byte)rng.Next(256);
+            // Keep the two fp16 super-block deltas finite and O(1): this compares bit layout,
+            // not NaN/Inf plumbing.
+            for (int b = 0; b < blocks; b++)
+            {
+                Unsafe.WriteUnaligned(raw + b * Q2_K_BlockBytes + 80, (Half)(0.25f + 0.125f * b));
+                Unsafe.WriteUnaligned(raw + b * Q2_K_BlockBytes + 82, (Half)(0.0625f * (b + 1)));
+            }
+
+            float[] actual = new float[elements];
+            Dequantize.ToFloat32(ptr, elements, QuantizationType.Q2_K, actual);
+
+            float[] expected = LlamaCppDequantizeRowQ2K(raw, blocks);
+
+            for (int i = 0; i < elements; i++)
+            {
+                Assert.True(expected[i] == actual[i],
+                    $"Q2_K element {i} (block {i / KQuantGroupSize}, sub {(i % KQuantGroupSize) / 16}, "
+                    + $"lane {i % 16}): llama.cpp reference {expected[i]} != dotLLM {actual[i]}");
+            }
+        }
+        finally
+        {
+            NativeMemory.AlignedFree((void*)ptr);
+        }
+    }
+
+    /// <summary>
+    /// Literal transcription of llama.cpp <c>ggml-quants.c dequantize_row_q2_K</c>
+    /// (the authoritative GGUF Q2_K semantics), kept in its original control-flow shape
+    /// on purpose — see <see cref="Q2_K_DenseRandomBlocks_MatchLlamaCppReference"/>.
+    /// </summary>
+    private static float[] LlamaCppDequantizeRowQ2K(byte* src, int nb)
+    {
+        var y = new float[nb * KQuantGroupSize];
+        int outIdx = 0;
+
+        for (int i = 0; i < nb; i++)
+        {
+            byte* block = src + i * Q2_K_BlockBytes;
+            byte* scales = block;            // scales[16]
+            byte* q = block + 16;            // qs[64]
+            float d = (float)Unsafe.ReadUnaligned<Half>(block + 80);
+            float min = (float)Unsafe.ReadUnaligned<Half>(block + 82);
+
+            int isIdx = 0;
+            int qOff = 0;
+            for (int n = 0; n < KQuantGroupSize; n += 128)
+            {
+                int shift = 0;
+                for (int j = 0; j < 4; ++j)
+                {
+                    byte sc = scales[isIdx++];
+                    float dl = d * (sc & 0xF);
+                    float ml = min * (sc >> 4);
+                    for (int l = 0; l < 16; ++l)
+                        y[outIdx++] = dl * ((q[qOff + l] >> shift) & 3) - ml;
+
+                    sc = scales[isIdx++];
+                    dl = d * (sc & 0xF);
+                    ml = min * (sc >> 4);
+                    for (int l = 0; l < 16; ++l)
+                        y[outIdx++] = dl * ((q[qOff + l + 16] >> shift) & 3) - ml;
+
+                    shift += 2;
+                }
+                qOff += 32;
+            }
+        }
+        return y;
     }
 
     [Fact]

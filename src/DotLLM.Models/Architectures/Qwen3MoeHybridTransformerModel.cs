@@ -1704,6 +1704,12 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
             case QuantizationType.Q5_0:
                 MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
                 return;
+            case QuantizationType.Q2_K:
+                MatMul.GemmQ2_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                return;
+            case QuantizationType.Q3_K:
+                MatMul.GemmQ3_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+                return;
             case QuantizationType.Q4_K:
                 MatMul.GemmQ4_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
                 return;
@@ -1718,6 +1724,13 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
                 return;
             case QuantizationType.F16:
                 MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);
+                return;
+            case QuantizationType.Q4_0:
+            case QuantizationType.Q4_1:
+            case QuantizationType.Q5_1:
+            case QuantizationType.IQ4_NL:
+                // Packed x Q8_1 dot instead of dequantize-to-F32 (#489).
+                MatMul.GemmLegacyQuantOrDequant((byte*)weights, qt, b, c, m, k, n, _threadPool, preQuantizedInput);
                 return;
             default:
                 // Shared dequantize-and-dot fallback (#263): decodes each weight row once and

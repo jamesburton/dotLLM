@@ -43,11 +43,11 @@ public static class PromptCacheEndpoint
         app.MapGet("/v1/prompt-cache/{id}", (string id, ServerState state) =>
         {
             var mgr = state.PrefixTrieManager;
-            if (mgr is null) return Results.NotFound(new ErrorResponse { Error = "Prefix cache disabled." });
+            if (mgr is null) return Results.NotFound(ErrorResponse.NotFound("Prefix cache disabled."));
 
             var info = mgr.InspectNamedPrefix(id);
             return info is null
-                ? Results.NotFound(new ErrorResponse { Error = $"prefix_id '{id}' not registered." })
+                ? Results.NotFound(ErrorResponse.NotFound($"prefix_id '{id}' not registered.", param: "prefix_id"))
                 : Results.Ok(new PromptCacheResponse
                 {
                     PrefixId = info.Value.PrefixId,
@@ -65,11 +65,11 @@ public static class PromptCacheEndpoint
 
             var mgr = state.PrefixTrieManager;
             if (mgr is null)
-                return Results.BadRequest(new ErrorResponse { Error = "Paged KV-cache + prefix sharing is not enabled on this server." });
+                return Results.BadRequest(ErrorResponse.InvalidRequest("Paged KV-cache + prefix sharing is not enabled on this server."));
 
             int[] tokens = request.TokenIds ?? state.Tokenizer.Encode(request.Prompt ?? string.Empty);
             if (tokens.Length == 0)
-                return Results.BadRequest(new ErrorResponse { Error = "Either 'prompt' or 'token_ids' must be supplied with at least one token." });
+                return Results.BadRequest(ErrorResponse.InvalidRequest("Either 'prompt' or 'token_ids' must be supplied with at least one token.", param: "prompt"));
 
             // Pre-warm the trie by running the prompt through the generator once with
             // MaxTokens=0 (no generation). The KV-cache is captured by RecordCompletion
@@ -93,14 +93,13 @@ public static class PromptCacheEndpoint
             }
             catch (InvalidOperationException)
             {
-                return Results.Conflict(new ErrorResponse { Error = $"prefix_id '{id}' is already registered." });
+                return Results.Conflict(ErrorResponse.InvalidRequest($"prefix_id '{id}' is already registered.", param: "prefix_id"));
             }
 
             if (matched == 0)
-                return Results.UnprocessableEntity(new ErrorResponse
-                {
-                    Error = "Prompt did not produce a cacheable prefix (too short, or generation skipped the prefix cache).",
-                });
+                return Results.UnprocessableEntity(ErrorResponse.InvalidRequest(
+                    "Prompt did not produce a cacheable prefix (too short, or generation skipped the prefix cache).",
+                    param: "prompt"));
 
             return Results.Ok(new PromptCacheResponse
             {
@@ -114,11 +113,11 @@ public static class PromptCacheEndpoint
         app.MapDelete("/v1/prompt-cache/{id}", (string id, ServerState state) =>
         {
             var mgr = state.PrefixTrieManager;
-            if (mgr is null) return Results.NotFound(new ErrorResponse { Error = "Prefix cache disabled." });
+            if (mgr is null) return Results.NotFound(ErrorResponse.NotFound("Prefix cache disabled."));
 
             return mgr.UnpinNamedPrefix(id)
                 ? Results.Ok(new StatusResponse { Status = "unregistered" })
-                : Results.NotFound(new ErrorResponse { Error = $"prefix_id '{id}' not registered." });
+                : Results.NotFound(ErrorResponse.NotFound($"prefix_id '{id}' not registered.", param: "prefix_id"));
         });
 
         app.MapDelete("/v1/prompt-cache", (ServerState state) =>

@@ -20,6 +20,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// back-to-back launches (no per-launch host sync) to capture pure GPU execution time.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed unsafe class CudaAttentionDynVsScalarPerfTest
 {
     private readonly ITestOutputHelper _out;

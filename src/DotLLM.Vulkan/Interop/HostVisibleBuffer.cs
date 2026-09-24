@@ -81,7 +81,10 @@ public sealed class HostVisibleBuffer : IDisposable
     /// Diagnostic: name of the Vulkan call that returned the most recent
     /// failure. Empty string when the last call succeeded. Possible values:
     /// "vkGetMemoryHostPointerPropertiesEXT", "vkCreateBuffer",
-    /// "vkAllocateMemory", "vkBindBufferMemory", "memory_type_intersection".
+    /// "vkAllocateMemory", "vkBindBufferMemory", "memory_type_intersection",
+    /// "not_integrated_gpu" (issue #507 — the zero-copy import is refused on a
+    /// discrete GPU, where the imported host pages would be read across PCIe
+    /// for the model's lifetime).
     /// </summary>
     public static string LastImportFailureStage { get; private set; } = string.Empty;
 
@@ -123,10 +126,21 @@ public sealed class HostVisibleBuffer : IDisposable
     /// <c>VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT</c> (process-
     /// allocated memory, e.g. <see cref="System.Runtime.InteropServices.NativeMemory.AlignedAlloc"/>),
     /// then falls back to <c>HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT</c> (memory
-    /// mapped from a non-Vulkan source, e.g. <c>MemoryMappedFile</c>). amdvlk
-    /// on Strix Halo (gfx1151) accepts heap-allocated pages via
-    /// HOST_ALLOCATION but rejects read-only mmap'd file views — the foreign-
-    /// memory handle type is the correct path for GGUF mmaps.
+    /// mapped from a non-Vulkan source, e.g. <c>MemoryMappedFile</c>).
+    /// </para>
+    /// <para>
+    /// <b>The handle type is not the discriminator — the page protection is (#508).</b> This
+    /// remark used to claim amdvlk on Strix Halo (gfx1151) rejects read-only mmap'd file views
+    /// under HOST_ALLOCATION but accepts them under HOST_MAPPED_FOREIGN_MEMORY. Measured
+    /// (<c>VulkanHostImportMmapAccessModeTests</c>, same bytes, same size, same alignment, only
+    /// the host mapping differing): <b>both</b> candidate handle types are refused at
+    /// <c>vkAllocateMemory</c> with <c>VK_ERROR_INVALID_EXTERNAL_HANDLE</c> (-1000072003) for a
+    /// <c>MemoryMappedFileAccess.Read</c> view, and both succeed for anonymous read-write memory
+    /// or for a <c>CopyOnWrite</c> view of the same file. This is why the import aliased zero
+    /// bytes of every real model until <c>DOTLLM_GGUF_MAP_COW=1</c> existed: every GGUF was
+    /// mapped read-only, while every import test used <c>NativeMemory.AlignedAlloc</c> pages.
+    /// The candidate order below is retained (it costs nothing and other drivers do differ),
+    /// but it is not what decides acceptance here.
     /// </para>
     /// </remarks>
     public static unsafe HostVisibleBuffer? TryCreate(
@@ -167,9 +181,11 @@ public sealed class HostVisibleBuffer : IDisposable
         // Candidate handle types, in order of preference for typical workloads.
         // HOST_ALLOCATION covers heap-allocated process memory (NativeMemory.AlignedAlloc,
         // malloc) and works on virtually every driver. HOST_MAPPED_FOREIGN_MEMORY is the
-        // correct bit for memory NOT allocated by the process — read-only mmap'd file
-        // views via MemoryMappedFile in particular — and is what amdvlk on gfx1151 requires
-        // for GGUF imports. We don't pick one upfront because vkGetMemoryHostPointerPropertiesEXT
+        // correct bit for memory NOT allocated by the process — mmap'd file views via
+        // MemoryMappedFile in particular. (#508: on gfx1151/amdvlk neither bit rescues a
+        // READ-ONLY mapping — both are refused at vkAllocateMemory; what decides acceptance is
+        // the page protection, so GgufFile must map CopyOnWrite. See TryCreate's remarks.)
+        // We don't pick one upfront because vkGetMemoryHostPointerPropertiesEXT
         // returning success doesn't guarantee vkAllocateMemory will accept the pointer with
         // that handle type — driver bugs occur. Instead we collect all candidates that
         // pass the query and try each in sequence inside the buffer/memory construction.
@@ -204,10 +220,18 @@ public sealed class HostVisibleBuffer : IDisposable
 
         // Try each viable handle type in order — vkGetMemoryHostPointerPropertiesEXT
         // returning success doesn't guarantee vkAllocateMemory will accept the
-        // import (driver bugs / handle-type semantics mismatches occur). amdvlk
-        // on gfx1151 in particular returns VK_ERROR_INVALID_EXTERNAL_HANDLE for
-        // HOST_ALLOCATION on read-only MemoryMappedFile views but accepts
-        // HOST_MAPPED_FOREIGN_MEMORY for the same pointer.
+        // import (driver bugs / handle-type semantics mismatches occur). On gfx1151/amdvlk
+        // a read-only MemoryMappedFile view is refused here with
+        // VK_ERROR_INVALID_EXTERNAL_HANDLE under BOTH handle types (#508) — the earlier claim
+        // that HOST_MAPPED_FOREIGN_MEMORY accepts such a pointer was refuted by measurement.
+        //
+        // #369: shared READ lock around the whole loop — see
+        // VulkanDevice.s_lifecycleLock's doc comment. This loop's
+        // vkCreateBuffer/vkAllocateMemory/vkBindBufferMemory are the same
+        // create-vs-device-create hazard class as VulkanDevice.AllocateInternal.
+        VulkanDevice.s_lifecycleLock.EnterReadLock();
+        try
+        {
         for (int attempt = 0; attempt < usableCount; attempt++)
         {
             uint handleType = usable[attempt];
@@ -258,8 +282,17 @@ public sealed class HostVisibleBuffer : IDisposable
 
                 if (!device.TryFindHostImportMemoryType(typeBits, out uint typeIndex))
                 {
+                    // #507: the import is gated on an integrated (or CPU)
+                    // physical device — imported host memory would otherwise
+                    // leave every weight in system RAM behind a PCIe link.
+                    // Distinguish that refusal from a genuine type-mask miss so
+                    // the dGPU case is diagnosable from the counter alone.
                     LastImportFailureCode = 0;
-                    LastImportFailureStage = "memory_type_intersection";
+                    LastImportFailureStage =
+                        device.PhysicalDeviceTypeValue is VkPhysicalDeviceType.IntegratedGpu
+                            or VkPhysicalDeviceType.Cpu
+                            ? "memory_type_intersection"
+                            : "not_integrated_gpu";
                     continue;
                 }
 
@@ -332,6 +365,11 @@ public sealed class HostVisibleBuffer : IDisposable
         // All candidate handle types rejected — LastImportFailureCode/Stage
         // reflect the most recent attempt.
         return null;
+        }
+        finally
+        {
+            VulkanDevice.s_lifecycleLock.ExitReadLock();
+        }
     }
 
     /// <inheritdoc/>
@@ -340,18 +378,29 @@ public sealed class HostVisibleBuffer : IDisposable
         if (_disposed) return;
         _disposed = true;
 
-        if (_buffer != 0)
+        // #369: shared READ lock — see VulkanDevice.s_lifecycleLock's doc
+        // comment. Same hazard class as VulkanDevice.Buffer.Dispose's
+        // vkDestroyBuffer/vkFreeMemory.
+        VulkanDevice.s_lifecycleLock.EnterReadLock();
+        try
         {
-            VulkanApi.vkDestroyBuffer(_device.Handle, _buffer, 0);
-            _buffer = 0;
+            if (_buffer != 0)
+            {
+                VulkanApi.vkDestroyBuffer(_device.Handle, _buffer, 0);
+                _buffer = 0;
+            }
+            // The imported VkDeviceMemory must be freed BUT it does NOT release
+            // the underlying host mmap — that's the caller's lifecycle. The
+            // mmap'd pages live in the GgufFile owning MemoryMappedFile.
+            if (_memory != 0)
+            {
+                VulkanApi.vkFreeMemory(_device.Handle, _memory, 0);
+                _memory = 0;
+            }
         }
-        // The imported VkDeviceMemory must be freed BUT it does NOT release
-        // the underlying host mmap — that's the caller's lifecycle. The
-        // mmap'd pages live in the GgufFile owning MemoryMappedFile.
-        if (_memory != 0)
+        finally
         {
-            VulkanApi.vkFreeMemory(_device.Handle, _memory, 0);
-            _memory = 0;
+            VulkanDevice.s_lifecycleLock.ExitReadLock();
         }
     }
 }

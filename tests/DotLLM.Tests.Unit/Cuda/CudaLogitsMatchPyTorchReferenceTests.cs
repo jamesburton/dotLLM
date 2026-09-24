@@ -10,6 +10,7 @@ using DotLLM.Engine.KvCache;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -65,6 +66,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </para>
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaLogitsMatchPyTorchReferenceTests
 {
     private readonly ITestOutputHelper _output;
@@ -404,8 +406,9 @@ public sealed class CudaLogitsMatchPyTorchReferenceTests
         _output.WriteLine($"PTX dir:    {ptxDir}");
 
         var loadWatch = Stopwatch.StartNew();
-        var (gpuModel, source, config) = CudaModelLoader.LoadFromSafetensors(
-            root, deviceId: 0, ptxDir);
+        var (gpuModel, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint (CUDA)",
+            () => CudaModelLoader.LoadFromSafetensors(root, deviceId: 0, ptxDir));
         loadWatch.Stop();
         _output.WriteLine(
             $"CUDA load: {loadWatch.Elapsed.TotalMilliseconds:F1} ms "

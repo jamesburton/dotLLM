@@ -45,7 +45,7 @@ function Assert-PtxVersion {
 # across time steps, so the two kernels backing it disable FMA fusion AND
 # precise math (no --use_fast_math). The bit-perfect set is small; everything
 # else stays on the legacy fast-math path that this build script ships with.
-$bitPerfect = @('conv1d_causal', 'gated_delta_net_scan')
+$bitPerfect = @('conv1d_causal', 'gated_delta_net_scan', 'hadamard_fwht')
 
 Write-Host "Compiling CUDA kernels -> PTX (target: $arch)..."
 

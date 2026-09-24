@@ -65,9 +65,25 @@ internal static class KernelSupport
             pSetLayouts = (nint)(&setLayoutLocal),
         };
         Interop.ProfileCounters.DescriptorAllocs++;
-        VulkanApi.vkAllocateDescriptorSets(device.Handle, dsai, out nint descriptorSet)
-            .ThrowOnError("vkAllocateDescriptorSets");
-        return descriptorSet;
+
+        // #369: shared READ lock — see VulkanDevice.s_lifecycleLock's doc
+        // comment. Precautionary rather than evidenced (the reproduced
+        // crash implicated vkAllocateMemory specifically, not this call),
+        // but vkAllocateDescriptorSets is the same "device allocates an
+        // object" hazard class and this call is hot enough
+        // (~200/forward-pass) that an uncontended read lock's cost is
+        // negligible next to the correctness upside.
+        VulkanDevice.s_lifecycleLock.EnterReadLock();
+        try
+        {
+            VulkanApi.vkAllocateDescriptorSets(device.Handle, dsai, out nint descriptorSet)
+                .ThrowOnError("vkAllocateDescriptorSets");
+            return descriptorSet;
+        }
+        finally
+        {
+            VulkanDevice.s_lifecycleLock.ExitReadLock();
+        }
     }
 
     /// <summary>
@@ -114,7 +130,19 @@ internal static class KernelSupport
 
     /// <summary>Resets all descriptor sets allocated from <paramref name="pool"/>.</summary>
     internal static void ResetPool(VulkanDevice device, nint pool)
-        => VulkanApi.vkResetDescriptorPool(device.Handle, pool, 0).ThrowOnError("vkResetDescriptorPool");
+    {
+        // #369: shared READ lock — see VulkanDevice.s_lifecycleLock's doc
+        // comment; same rationale as DescriptorSetCache.Reset.
+        VulkanDevice.s_lifecycleLock.EnterReadLock();
+        try
+        {
+            VulkanApi.vkResetDescriptorPool(device.Handle, pool, 0).ThrowOnError("vkResetDescriptorPool");
+        }
+        finally
+        {
+            VulkanDevice.s_lifecycleLock.ExitReadLock();
+        }
+    }
 
     /// <summary>
     /// Inserts a <c>COMPUTE_SHADER → COMPUTE_SHADER</c> pipeline barrier with

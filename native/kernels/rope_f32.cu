@@ -1,5 +1,16 @@
 // RoPE kernel with FP32 Q/K data.
 // Q and K are processed independently — reuse attempts hurt GQA models.
+//
+// YaRN scaling (#366): when `inv_freq` is non-null it supplies the ramped per-pair
+// inverse frequencies (rope_dim/2 floats, uploaded once at load from the CPU
+// reference RoPE.ComputeYarnInverseFrequencies) and replaces the in-kernel
+// powf(theta, ...). `mscale` is YaRN's attention-magnitude concentration factor,
+// multiplied into BOTH cos and sin at EVERY position — including position 0.
+// Non-YaRN callers pass inv_freq = nullptr and mscale = 1.0f, which is bit-identical
+// to the previous behaviour (IEEE multiply by exactly 1.0f is the identity).
+// NOTE: inv_freq already encodes the frequency denominator, so it supersedes
+// `freq_dim`; the two are never combined (Gemma-4 partial-rotary uses freq_dim and
+// has no YaRN scaling, dense YaRN models use inv_freq and pass freq_dim = 0).
 
 #include <math.h>
 
@@ -9,7 +20,9 @@ extern "C" __global__ void __launch_bounds__(256) rope_f32(
     const int* __restrict__ positions,
     const int seq_len, const int num_heads, const int num_kv_heads,
     const int head_dim, const int rope_dim, const float theta, const int rope_type,
-    const int freq_dim, const int neox_pair_offset_arg)
+    const int freq_dim, const int neox_pair_offset_arg,
+    const float* __restrict__ inv_freq,  // [rope_dim/2] YaRN inverse freqs, or nullptr
+    const float mscale)                  // YaRN cos/sin multiplier; 1.0f when inactive
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half_rope = rope_dim / 2;
@@ -38,9 +51,11 @@ extern "C" __global__ void __launch_bounds__(256) rope_f32(
         int head = remainder % num_heads;
         int t = remainder / num_heads;
 
-        float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)fd);
+        float freq = (inv_freq != nullptr)
+            ? inv_freq[pair]
+            : 1.0f / powf(theta, (float)(2 * pair) / (float)fd);
         float angle = (float)positions[t] * freq;
-        float cos_val = cosf(angle), sin_val = sinf(angle);
+        float cos_val = cosf(angle) * mscale, sin_val = sinf(angle) * mscale;
 
         int base_idx = t * num_heads * head_dim + head * head_dim;
         int i0 = (rope_type == 1) ? base_idx + pair : base_idx + 2 * pair;
@@ -58,9 +73,11 @@ extern "C" __global__ void __launch_bounds__(256) rope_f32(
         int head = remainder % num_kv_heads;
         int t = remainder / num_kv_heads;
 
-        float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)fd);
+        float freq = (inv_freq != nullptr)
+            ? inv_freq[pair]
+            : 1.0f / powf(theta, (float)(2 * pair) / (float)fd);
         float angle = (float)positions[t] * freq;
-        float cos_val = cosf(angle), sin_val = sinf(angle);
+        float cos_val = cosf(angle) * mscale, sin_val = sinf(angle) * mscale;
 
         int base_idx = t * num_kv_heads * head_dim + head * head_dim;
         int i0 = (rope_type == 1) ? base_idx + pair : base_idx + 2 * pair;

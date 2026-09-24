@@ -20,6 +20,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaMlaPhaseBTests : IDisposable
 {
     private const float DefaultTolerance = 1e-3f;

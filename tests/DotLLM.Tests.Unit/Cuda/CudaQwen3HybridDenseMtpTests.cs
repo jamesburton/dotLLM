@@ -4,6 +4,7 @@ using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
 using DotLLM.Cuda.Architectures;
+using DotLLM.Cuda.Interop;
 using DotLLM.Engine;
 using DotLLM.Engine.Samplers;
 using DotLLM.Models.Gguf;
@@ -28,6 +29,10 @@ namespace DotLLM.Tests.Unit.Cuda;
 [Collection(CudaCollection.Name)]
 public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
 {
+    // The token after the prompt the first draft step starts from (issue #469: the prefill absorbed
+    // positions 0..n-1, so drafting begins at position n with h_{n-1}).
+    private const int NextToken = 4;
+
     private readonly string _scratch;
     private readonly ITestOutputHelper _out;
 
@@ -93,6 +98,37 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
         using IMtpState? state = model.CreateMtpState();
         Assert.NotNull(state);
         Assert.IsType<CudaMtpState>(state);
+    }
+
+    /// <summary>
+    /// The length-only KV handle must track what <c>Forward</c> wrote. Speculative decoding
+    /// rolls it back to a committed position after a rejected round; before this was fixed
+    /// nothing advanced the handle, <c>CurrentLength</c> stayed 0, and <c>Rollback(n &gt; 0)</c>
+    /// threw on the first partial rejection. Only real hardware exposed it, because CUDA MTP was
+    /// build-verified at #469.
+    /// </summary>
+    [SkippableFact]
+    public void Forward_AdvancesKvHandle_SoRollbackToACommittedPositionWorks()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir is null, "PTX files not found");
+
+        string path = WriteFixture(withMtp: true, name: "qwen35-mtp-kvhandle.gguf");
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var model = CudaQwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
+        using var kv = model.CreateKvCache(config.MaxSequenceLength);
+
+        using (model.Forward([1, 2, 3], [0, 1, 2], deviceId: -1, kv)) { }
+        Assert.Equal(3, kv.CurrentLength);
+
+        // A verify-shaped batch that re-writes the last committed slot and runs past it.
+        using (model.Forward([3, 4, 5], [2, 3, 4], deviceId: -1, kv)) { }
+        Assert.Equal(5, kv.CurrentLength);
+
+        kv.Rollback(3);   // threw before the fix
+        Assert.Equal(3, kv.CurrentLength);
     }
 
     [SkippableFact]
@@ -184,20 +220,21 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
         using var kvCache = model.CreateKvCache(maxSeqLen: 64);
         using var mtpState = (CudaMtpState)model.CreateMtpState()!;
         using (ITensor _ = model.Forward(tokenIds, positions, deviceId: -1, kvCache, adapter: null, mtpState)) { }
-        mtpState.SeedFromCapturedRow(mtpState.CapturedRowCount - 1);
 
-        Assert.Equal(0, mtpState.CurrentLength);
+        // The prefill forward absorbed every prompt position into the head (issue #469).
+        Assert.Equal(tokenIds.Length, mtpState.CurrentLength);
 
-        using ITensor draft0 = model.ForwardMtp(mtpState, tokenId: tokenIds[^1], position: 2);
+        // First draft: the token after the prompt, at position 3, paired with h_2.
+        using ITensor draft0 = model.ForwardMtp(mtpState, tokenId: NextToken, position: 3);
         Assert.Equal(1, draft0.Shape[0]);
         Assert.Equal(config.VocabSize, draft0.Shape[1]);
-        Assert.Equal(1, mtpState.CurrentLength);
+        Assert.Equal(4, mtpState.CurrentLength);
         AssertAllFinite(draft0, config.VocabSize);
 
         // Second autoregressive MTP step, seeded from the head's own output (not the trunk's).
         int argmax0 = ArgMax(draft0, config.VocabSize);
-        using ITensor draft1 = model.ForwardMtp(mtpState, tokenId: argmax0, position: 3);
-        Assert.Equal(2, mtpState.CurrentLength);
+        using ITensor draft1 = model.ForwardMtp(mtpState, tokenId: argmax0, position: 4);
+        Assert.Equal(5, mtpState.CurrentLength);
         AssertAllFinite(draft1, config.VocabSize);
     }
 
@@ -236,9 +273,8 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
         using var kvCache = model.CreateKvCache(maxSeqLen: 64);
         using var mtpState = (CudaMtpState)model.CreateMtpState()!;
         using (ITensor _ = model.Forward(tokenIds, positions, deviceId: -1, kvCache, adapter: null, mtpState)) { }
-        mtpState.SeedFromCapturedRow(mtpState.CapturedRowCount - 1);
 
-        using ITensor draft = model.ForwardMtp(mtpState, tokenId: tokenIds[^1], position: 1);
+        using ITensor draft = model.ForwardMtp(mtpState, tokenId: NextToken, position: 2);
         AssertAllFinite(draft, config.VocabSize);
     }
 
@@ -341,7 +377,12 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
             Assert.True(model.SupportsMtp);
             Assert.True(model.SupportsRecurrentStateCheckpoint);
 
-            var decoder = new MtpSpeculativeDecoder(greedy: true);
+            // Pinned to checkpoint + replay (issue #478, as the CPU twin was at #473): byte-identity
+            // with a serial decode holds only because every rejection here happens at row 0, so the
+            // replay is a 1-row forward exactly like the serial one. A row snapshot comes from inside
+            // the K+1-row verify batch, whose trunk GEMMs take a different route by batch width.
+            // CudaQwen3HybridDenseGdnRowSnapshotTests covers the snapshot path within tolerance.
+            var decoder = new MtpSpeculativeDecoder(greedy: true) { UseRecurrentRowSnapshots = false };
             var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
 
             var generatedIds = new List<int> { startToken };
@@ -422,6 +463,116 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
             Assert.Equal(nextLogitsClean[i], nextLogitsFromDecoder[i]); // byte-identical float compare
     }
 
+    // ── Issue #486: device argmax for the unconstrained greedy draft ─────────
+
+    /// <summary>
+    /// <see cref="CudaQwen3HybridDenseTransformerModel.ForwardMtpArgMax"/> must draft exactly the
+    /// tokens the host argmax of <see cref="CudaQwen3HybridDenseTransformerModel.ForwardMtp"/> drafts,
+    /// and leave the head's state (KV rows, pending hidden) bit-identical — it is the same draft step
+    /// with a different read-back. Four chained steps on two fresh model instances, with the F32 head
+    /// and with the Q8_0 head (register-blocked GEMV path).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ForwardMtpArgMax_MatchesHostArgMaxOfForwardMtp_AndLeavesStateIdentical(bool q8_0MtpHead)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir is null, "PTX files not found");
+
+        string path = SyntheticQwen35HybridDenseMtpGguf.Write(
+            Path.Combine(_scratch, $"qwen35-mtp-argmax-q8{q8_0MtpHead}.gguf"), withMtp: true, q8_0MtpHead: q8_0MtpHead);
+
+        var full = RunDraftChain(path, ptxDir!, deviceArgMax: false);
+        var device = RunDraftChain(path, ptxDir!, deviceArgMax: true);
+        Skip.IfNot(device.Supported, "argmax_f32.ptx not generated (nvcc -ptx -arch=compute_75 on a CUDA box)");
+
+        _out.WriteLine($"host argmax:   {string.Join(",", full.Tokens)}");
+        _out.WriteLine($"device argmax: {string.Join(",", device.Tokens)}");
+        Assert.Equal(full.Tokens, device.Tokens);
+        Assert.Equal(full.Keys.Length, device.Keys.Length);
+        for (int i = 0; i < full.Keys.Length; i++)
+            Assert.Equal(BitConverter.SingleToInt32Bits(full.Keys[i]), BitConverter.SingleToInt32Bits(device.Keys[i]));
+        for (int i = 0; i < full.Pending.Length; i++)
+            Assert.Equal(BitConverter.SingleToInt32Bits(full.Pending[i]), BitConverter.SingleToInt32Bits(device.Pending[i]));
+    }
+
+    /// <summary>
+    /// Decoder level: with the device argmax on (the default when its PTX is present) and off, MTP
+    /// decode must produce the same tokens as plain greedy decode — and the "on" run must actually
+    /// have taken the argmax path.
+    /// </summary>
+    [SkippableFact]
+    public void DraftAndVerify_DeviceArgMaxOnAndOff_BothMatchPlainGreedy_OnRealCudaModel()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir is null, "PTX files not found");
+
+        string path = SyntheticQwen35HybridDenseMtpGguf.Write(
+            Path.Combine(_scratch, "qwen35-mtp-fullattn-argmax.gguf"), withMtp: true, fullAttnInterval: 1);
+
+        const int startToken = 1, totalNewTokens = 12, k = 3;
+        List<int> plain = RunPlainGreedy(path, ptxDir!, startToken, totalNewTokens);
+        List<int> on = RunSpeculative(path, ptxDir!, startToken, totalNewTokens, k, useDraftArgMax: true,
+            out int argMaxSteps, out bool supported);
+        List<int> off = RunSpeculative(path, ptxDir!, startToken, totalNewTokens, k, useDraftArgMax: false,
+            out int argMaxStepsOff, out _);
+
+        _out.WriteLine($"device argmax supported: {supported}; argmax draft steps on={argMaxSteps} off={argMaxStepsOff}");
+        Assert.Equal(plain, on);
+        Assert.Equal(plain, off);
+        Assert.Equal(0, argMaxStepsOff);
+        if (supported)
+            Assert.True(argMaxSteps > 0, "device argmax is available but the decoder never used it");
+        else
+            Assert.Equal(0, argMaxSteps);
+    }
+
+    private sealed record DraftChain(bool Supported, int[] Tokens, float[] Keys, float[] Pending);
+
+    private static unsafe DraftChain RunDraftChain(string path, string ptxDir, bool deviceArgMax)
+    {
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var model = CudaQwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
+        if (deviceArgMax && !model.SupportsMtpArgMax)
+            return new DraftChain(false, [], [], []);
+
+        using var kvCache = model.CreateKvCache(maxSeqLen: 64);
+        using var mtpState = (CudaMtpState)model.CreateMtpState()!;
+        using (ITensor _ = model.Forward([0, 1, 2], [0, 1, 2], deviceId: -1, kvCache, adapter: null, mtpState)) { }
+
+        const int steps = 4;
+        var tokens = new int[steps];
+        int token = NextToken;
+        for (int i = 0; i < steps; i++)
+        {
+            if (deviceArgMax)
+            {
+                token = model.ForwardMtpArgMax(mtpState, token, 3 + i);
+            }
+            else
+            {
+                using ITensor logits = model.ForwardMtp(mtpState, token, 3 + i);
+                token = System.Numerics.Tensors.TensorPrimitives.IndexOfMax(
+                    new ReadOnlySpan<float>((void*)logits.DataPointer, config.VocabSize));
+            }
+            tokens[i] = token;
+        }
+
+        int n = mtpState.CurrentLength * mtpState.KvStride;
+        var keys = new float[n];
+        fixed (float* p = keys)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, mtpState.KeyCacheDevicePtr, (nuint)(n * sizeof(float))).ThrowOnError();
+        var pending = new float[config.HiddenSize];
+        fixed (float* p = pending)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, mtpState.PendingHiddenDevicePtr,
+                (nuint)(pending.Length * sizeof(float))).ThrowOnError();
+        return new DraftChain(true, tokens, keys, pending);
+    }
+
     private static float[] RunSingleMtpStep(string path, string ptxDir)
     {
         using var gguf = GgufFile.Open(path);
@@ -433,9 +584,8 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
         using var kvCache = model.CreateKvCache(maxSeqLen: 64);
         using var mtpState = (CudaMtpState)model.CreateMtpState()!;
         using (ITensor _ = model.Forward(tokenIds, positions, deviceId: -1, kvCache, adapter: null, mtpState)) { }
-        mtpState.SeedFromCapturedRow(mtpState.CapturedRowCount - 1);
 
-        using ITensor draft = model.ForwardMtp(mtpState, tokenId: tokenIds[^1], position: 2);
+        using ITensor draft = model.ForwardMtp(mtpState, tokenId: NextToken, position: 3);
         unsafe
         {
             var span = new ReadOnlySpan<float>((void*)draft.DataPointer, config.VocabSize);
@@ -464,35 +614,45 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
 
     private static List<int> RunSpeculative(
         string path, string ptxDir, int startToken, int totalNewTokens, int k)
+        => RunSpeculative(path, ptxDir, startToken, totalNewTokens, k, useDraftArgMax: null, out _, out _);
+
+    private static List<int> RunSpeculative(
+        string path, string ptxDir, int startToken, int totalNewTokens, int k, bool? useDraftArgMax,
+        out int draftArgMaxSteps, out bool argMaxSupported)
     {
         using var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         using var model = CudaQwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
         Assert.True(model.SupportsMtp);
+        argMaxSupported = model.SupportsMtpArgMax;
 
         var decoder = new MtpSpeculativeDecoder(greedy: true);
+        if (useDraftArgMax is { } use)
+            decoder.UseDraftArgMax = use;
         var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
 
         var generatedIds = new List<int> { startToken };
         using var kvCache = model.CreateKvCache(maxSeqLen: 64);
         using var mtpState = (CudaMtpState)model.CreateMtpState()!;
 
-        // Prefill: seed the target KV-cache with the start token at position 0. DraftAndVerify's
-        // own contract (see its remarks: "lastToken already occupies position in kvCacheTarget")
-        // means `position` must equal lastToken's OWN KV-cache slot, not "prompt length + decoded
-        // so far" naively read as generatedIds.Count -- so it starts at 0 (matching the prefill
-        // call just above, not 1). Confirmed against SpeculativeDecoder's identical convention
-        // (verifyPositions[0] = position, holding lastToken). The CPU mock-model engine tests this
-        // was originally copied from never caught an off-by-one here because their mock Forward
-        // ignores position entirely for logit computation; this real (position-sensitive,
-        // RoPE-using) CUDA model does not tolerate it.
-        using (ITensor _ = model.Forward([startToken], [0], deviceId: -1, kvCache)) { }
+        // Mirror TextGenerator (issue #475): prefill the prompt [startToken] WITH the MTP state, so
+        // the head absorbs it and is seeded from h_0, sample t1 from the prefill, and enter the round
+        // loop at t1's own KV slot (1). `position` is lastToken's own slot, and since #469 the verify
+        // forward [lastToken, d1..dK] is the first time the trunk sees lastToken — so lastToken must
+        // never have been forwarded. The old helper prefilled startToken WITHOUT the state and then
+        // started at position 0, forwarding the start token twice (harmless for this test's
+        // all-attention trunk, where the KV write is positional, but a double GDN step on the default
+        // fixture) and drafting round 1 from a never-seeded head, a path production never takes.
+        using (ITensor prefill = model.Forward([startToken], [0], deviceId: -1, kvCache, adapter: null, mtpState))
+            generatedIds.Add(ArgMax(prefill, config.VocabSize));
+        Assert.Equal(1, mtpState.CurrentLength);
 
-        int position = 0;
+        int position = 1;
         Span<int> outputBuffer = stackalloc int[k + 1];
         int guard = 0;
         while (generatedIds.Count - 1 < totalNewTokens && guard++ < totalNewTokens * 4)
         {
+            Engine.MtpSpeculativeDecoderGdnStateTests.AssertRoundEntryInvariants(kvCache, mtpState, position);
             var result = decoder.DraftAndVerify(
                 model, kvCache, mtpState, pipeline, generatedIds,
                 constraint: null, position, vocabSize: config.VocabSize, numCandidates: k, outputBuffer);
@@ -505,6 +665,7 @@ public sealed class CudaQwen3HybridDenseMtpTests : IDisposable
             position += result.AcceptedCount;
         }
 
+        draftArgMaxSteps = decoder.DraftArgMaxSteps;
         return generatedIds.Take(totalNewTokens + 1).ToList();
     }
 

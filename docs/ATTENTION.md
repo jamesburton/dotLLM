@@ -25,6 +25,32 @@ Single implementation covers three variants via `num_kv_heads`:
 7. Weights = softmax(scores)
 8. Output = weights @ V → reshape → output @ W_o
 
+### Softmax exp precision (#501)
+
+Step 7's exponential is **precise on every backend by default**. CPU uses
+`TensorPrimitives.Exp` (through `FastMath.ExpSumAndStore`, which keeps the fused
+shift+exp+store+sum structure and only changes the exp); CUDA's `attention_f32.cu` and
+`attention_flash_mma_decode_gqa_split.cu` use `expf`; Vulkan shaders use GLSL `exp()`.
+(`attention_flash_mma.cu` uses `__expf`, the ~2-ULP hardware intrinsic — a different and
+accepted tradeoff.)
+
+Until #501 the CPU path and its two CUDA twins used the Schraudolph 1999 bit trick (~1-2% max
+relative error), on the premise that "errors in exp get normalized away when dividing by the
+sum". That is true only of the *mean* of the attention weights: the error is relative and
+per-element, so it survives normalization as a reweighting of the mixture each head computes,
+and the cost scales with how close a model's attention scores already sit to each other.
+Measured on Llama-3.2-1B-pure / wikitext-2 / ctx 512 / 40 chunks, paired per chunk:
+**Q8_0 unmoved** (+0.0004 ± 0.0006 nats, t = +0.7) but **Q3_K −1.71% perplexity**
+(−0.01724 ± 0.00185 nats, t = −9.3). Throughput was unchanged at ctx 512 — the accurate path
+is extra vectorized passes over an attention tile sized to stay in L1.
+
+`DOTLLM_FAST_EXP=1` restores the bit trick as a benchmarking lever. **It is CPU-only**: CUDA
+ships precompiled PTX with no equivalent switch, so setting it makes the CPU and CUDA backends
+diverge by roughly the approximation's own error (~1%, ~5e-3 abs on attention output). That is
+useful as a deliberate discriminator, but do not run cross-backend parity with it set. Several
+CPU↔CPU and CPU↔CUDA attention tolerances were calibrated against the approximation and are now
+looser than they need to be; each says so in place.
+
 ### Sliding Window
 
 Mask modifier, not separate mechanism. Limits attention to `[pos - window_size, pos]`. KV-cache evicts older entries. Configured via `ModelConfig.SlidingWindowSize`.
@@ -58,17 +84,44 @@ Vulkan attention has two F32 paths sharing one descriptor surface:
 |--------|--------|----------------|-----|
 | `AttentionF32Kernel` | `attention_f32.comp` (+ `_sg`, `_coopmat`) | one (query token, head) | Decode (seq_q = 1); fallback for FA-ineligible shapes |
 | `VulkanFlashAttentionF32Kernel` | `attention_flash_f32.comp` | one (head, query-tile of BR=16 rows) | Prefill (seq_q > 1), head_dim ≤ 128 |
+| `VulkanFlashAttentionF32Kernel` (wide) | `attention_flash_f32_hd256_br{4,8,16}.comp` | one (head, query-tile of BR rows) | Prefill (seq_q > 1), 128 < head_dim ≤ 256 |
 
 The FA shader is Flash-Attention-v2 style: each workgroup holds BR=16 Q-rows in shared memory and walks the KV stream in BC=64 column tiles. Each KV row is read **once per Q-tile** (= BR× amortisation vs the per-token shader). Online softmax is maintained per Q-row (per-row running max + sum_exp), with one workgroup-wide tree reduce per (Q-row, KV-tile) pair using subgroupMax / subgroupAdd + cross-subgroup shared-memory combine — portable across subgroup widths.
 
 Dispatch decision (`VulkanTransformerModel.RecordAttention` and analogous sites in `VulkanNemotronHTransformerModel` / `VulkanQwen3MoeHybridTransformerModel`):
 
 ```
-if (_flashAttention != null && seqQ > 1 && headDim <= 128) -> FA
-else                                                        -> naive per-token
+if (_flashAttention != null && seqQ > 1 && headDim <= _flashAttention.SupportedMaxHeadDim) -> FA
+else                                                                                      -> naive per-token
 ```
 
-Env-var opt-out: `DOTLLM_VULKAN_DISABLE_FLASH_ATTENTION=1` forces every dispatch onto the legacy per-token kernel. The FA path is null when the SPV is missing (older builds) or when head_dim exceeds the shader bound — both gates fall back automatically.
+Gate on the **instance** property `SupportedMaxHeadDim`, never on the `MaxHeadDim` constant (128, the base shader's bound). A gate that reads the constant sends a 256-dim head to the per-token kernel even when the wide pipeline is loaded — that is issue #441 reintroduced.
+
+Env-var opt-out: `DOTLLM_VULKAN_DISABLE_FLASH_ATTENTION=1` forces every dispatch onto the legacy per-token kernel. The FA path is null when the SPV is missing (older builds) or when head_dim exceeds every loaded shader bound — both gates fall back automatically.
+
+### Wide heads (head_dim > 128) and the silent-fallback diagnostic — issue #441
+
+`attention_flash_f32.comp` bakes `MAX_HEAD_DIM = 128` into its `qTile` / `outAccum` shared-memory **declarations**, so it is a hard dispatch gate, not a slow path. Bonsai 2 (`qwen35`) declares `attention.key_length = value_length = 256`, so all 16 of its full-attention layers ran the per-token kernel on every prefill — **~20 % of the whole pass**, with nothing warning about it. It took a per-op profiling campaign to notice, which is the real defect.
+
+Two things fix that:
+
+1. **Wide SPV variants.** `attention_flash_f32_hd256_br{16,8,4}.comp` are byte-identical to the base shader apart from `MAX_HEAD_DIM` and `BR`; the compute loops already bound on `pc.headDim`. `FlashAttentionWideVariant` selects one, overridable with `DOTLLM_VK_FLASH_HD256=br4|br8|br16|off` (default `br4`).
+2. **`VulkanAttentionFallbackDiagnostics`.** The single factory every Vulkan model uses to obtain its prefill FA kernel. It applies all the gates and prints a one-shot stderr warning naming the model, the head dim, the bound that rejected it and the remedy. Silenceable with `DOTLLM_VULKAN_QUIET_ATTENTION_FALLBACK=1`; the reported set stays queryable for tests.
+
+**BR is the opposite of what amortisation predicts at this width.** Same-process, order-reversed, interleaved A/B on gfx1151 at Bonsai 2's real shape (24/4 heads, head_dim 256), min-ms over 5 rounds:
+
+| seq | naive (per-token) | br16 | br8 | br4 |
+|-----|-------------------|------|-----|-----|
+| 512 | 45.33 ms | 10.72 ms (4.2×) | 4.59 ms (9.9×) | 2.95 ms (15.3×) |
+| 2048 | 927.6 ms | 170.1 ms (5.5×) | 88.0 ms (10.5×) | 61.4 ms (15.1×) |
+
+> **KV residency is part of the shape.** The harness re-touches K/V before each dispatch, outside the timed region, because the model's KV-cache update writes them in the dispatch immediately before attention. The first version did not, and its naive arm then read 84.11 ms at seq 512 against the model's ~38 ms per layer — while the flash arms agreed with the model all along. Only the per-token kernel is residency-sensitive: it re-reads each KV row 12,288 times (one workgroup per token × head) against flash's ~128. The effect is also size-gated — at seq 2048 the KV set is ~16 MB, too large to stay resident either way, and pre-touching moves the naive arm by only 5 %. With it, kernel bench and end-to-end profile agree (≈15× vs the bucket's 12–19×).
+
+Per-arm ranges are disjoint at both lengths. A *smaller* tile reads each KV row *more* times, so KV amortisation is not the binding constraint here — LDS residency is: `qTile + outAccum` both scale with `BR × MAX_HEAD_DIM`, so at 256 dims BR=16 costs 36.2 KB and pins one workgroup (4 wave64) per CU, BR=8 costs 18.1 KB, BR=4 costs 9.2 KB (~6 workgroups / 24 waves of latency hiding). BR=4 is the **floor for this geometry**, not a measured optimum: `ROWS_PER_SLICE = BR / (WG_SIZE / BC) = BR / 4`, so BR=2 would leave a wave slice zero rows. Going lower needs a narrower workgroup — a separate change.
+
+End-to-end pp512 on Bonsai 2 PQ2_0 (separate process launches, both orders, GDN scan pinned to `ldsfused` — #445 landed the variant but did **not** make it the default on this branch: unpinned, `gdn_scan_core` is 1394–1479 ms against 182–188 ms pinned, which puts attention at ~17–18.5 % of the pass instead of ~21 %): `attn_core` **604.1–810.9 ms → 42.2–51.0 ms** (12–19×) across 3 launches per arm; whole-pass **148.0–166.8 → 200.7–205.2 tok/s** (~1.25×). Both ranges disjoint, and the cleanest pair ran br4 FIRST — the unfavourable slot if GPU clock ramp were doing the work.
+
+Wave-width safety: these shaders have no subgroup ops. `slice = tid >> 6` and `c = tid & 63` index the `BC = 64` KV-column tile — tile geometry, not hardware wave width — so they are correct at subgroupSize 32 and 64 alike and need no native-subgroup-size gate (unlike `PQ2_0GemmVariant.RequiresNativeSubgroupSize`).
 
 Tile sizing rationale (Strix Halo / RDNA3.5, 64-wide wavefronts, 64 KB LDS):
 - WG_SIZE = BC = 64: one wavefront per workgroup, reductions in a single subgroup step.

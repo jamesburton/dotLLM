@@ -17,9 +17,18 @@ namespace DotLLM.Cli.Commands;
 /// Computes perplexity over a text corpus: load → stream-tokenize → score.
 /// </summary>
 /// <remarks>
-/// Defaults to <see cref="PerplexityMode.SlidingWindow"/> with <c>stride = context / 2</c>, which
-/// reproduces llama.cpp's <c>--perplexity</c> methodology, so the reported figure is directly
-/// comparable to published numbers for the same model, corpus, context and stride.
+/// Defaults to <see cref="PerplexityMode.SlidingWindow"/> with <c>stride = context</c> —
+/// non-overlapping chunks, scoring the second half of each, per
+/// <see cref="PerplexityOptions.LlamaCppDefault"/> (the remark used to say <c>context / 2</c>,
+/// which is a different measurement: it scores every token rather than half of them). This
+/// reproduces llama.cpp's <c>--perplexity</c> methodology, so the reported figure is comparable to
+/// published numbers for the same model, corpus, context and stride — <b>provided both engines
+/// tokenize the same bytes</b>. That proviso is not automatic: a CRLF corpus is read differently
+/// by an MSVC-built <c>llama-perplexity</c> (text mode collapses <c>\r\n</c>) than by dotLLM, and
+/// measured on wikitext-2 that made 501 of the 512 tokens in chunk 0 differ (issue #506). The
+/// command therefore scans for CR bytes and warns. See <c>docs/PERPLEXITY.md</c> for the LF
+/// fixture and the <c>--kl-divergence-base</c> / <c>--tokens-file</c> protocol that removes the
+/// assumption entirely.
 /// </remarks>
 internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Settings>
 {
@@ -38,6 +47,11 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         [CommandOption("--corpus|-f")]
         [Description("Path to a UTF-8 text corpus (e.g. wiki.test.raw).")]
         public string Corpus { get; set; } = string.Empty;
+
+        [CommandOption("--normalize-line-endings")]
+        [Description("Collapse CRLF to LF while reading --corpus, as MSVC text mode does. OFF by default. Use ONLY when the reference figure came from a Windows llama.cpp build reading the same CRLF file; llama.cpp on Linux keeps the CRs, so normalizing there creates a mismatch. Preferred fix is an LF corpus (see docs/PERPLEXITY.md, issue #506).")]
+        [DefaultValue(false)]
+        public bool NormalizeLineEndings { get; set; }
 
         [CommandOption("--context|-c")]
         [Description("Context window in tokens. Clamped to the model's maximum sequence length.")]
@@ -78,9 +92,8 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         public bool PerWindow { get; set; }
 
         [CommandOption("--bos")]
-        [Description("Substitute BOS at the start of each window. Match the model's add_bos setting: llama.cpp only does this when the tokenizer requests it.")]
-        [DefaultValue(false)]
-        public bool Bos { get; set; }
+        [Description("Prepend BOS to the stream and substitute it at each window start. Defaults to the model's own setting, derived from the vocab exactly as llama.cpp derives it; pass --bos true/false only to override that.")]
+        public bool? Bos { get; set; }
 
         [CommandOption("--quant")]
         [Description("Quantization to select when resolving a HuggingFace repo ID.")]
@@ -122,6 +135,20 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             return 1;
         }
 
+        // Issue #506: a CRLF corpus makes dotLLM and a Windows llama.cpp build tokenize different
+        // text, which silently invalidated every end-to-end quality comparison made that way.
+        // Warned before the model loads so it is the first thing on screen, and repeated in the
+        // results table below because the table is what gets pasted into an issue.
+        long corpusCarriageReturns = 0;
+        if (settings.TokensFile is null)
+        {
+            corpusCarriageReturns = CorpusLineEndings.CountCarriageReturns(settings.Corpus);
+            string? lineEndingWarning =
+                CorpusLineEndings.DescribeMismatchRisk(settings.Corpus, corpusCarriageReturns);
+            if (lineEndingWarning is not null)
+                AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(lineEndingWarning)}[/]");
+        }
+
         if (!TryParseMode(settings.Mode, out PerplexityMode mode))
         {
             AnsiConsole.MarkupLine(
@@ -136,6 +163,12 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         using GgufFile gguf = GgufFile.Open(resolvedPath);
         ModelConfig config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+
+        // Issue #515/#516: llama.cpp prepends BOS to the whole stream when the vocab asks for it,
+        // and dotLLM did not -- so every chunk boundary sat one token off llama.cpp's and the two
+        // engines scored different text. The setting is a property of the vocab, not a user
+        // preference, so it is derived here and --bos only overrides it.
+        bool addBos = settings.Bos ?? GgufAddBosResolver.Resolve(gguf.Metadata);
 
         if (!TryParseDevice(settings.Device, out string backend, out int gpuId))
         {
@@ -216,8 +249,15 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         }
         else
         {
-            using var reader = new StreamReader(settings.Corpus);
-            foreach (int id in CorpusReader.StreamTokens(reader, tokenizer, settings.MaxTokens))
+            using var fileReader = new StreamReader(settings.Corpus);
+            // Default is the raw bytes: llama.cpp on Linux keeps the CRs too, so stripping them
+            // unconditionally would trade a Windows mismatch for a Linux one (issue #506).
+            using TextReader reader = settings.NormalizeLineEndings
+                ? new CrlfNormalizingTextReader(fileReader)
+                : fileReader;
+            foreach (int id in CorpusReader.StreamTokens(
+                         reader, tokenizer, settings.MaxTokens,
+                         bosTokenId: addBos ? tokenizer.BosTokenId : -1))
                 tokens.Add(id);
         }
 
@@ -240,7 +280,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         AnsiConsole.MarkupLine(
             $"[grey]device: {Markup.Escape(deviceLabel)}  all-rows logits: {returnsAllRows} "
             + $"({(returnsAllRows ? "single-pass O(n)" : "growing-prefix O(n^2)")})[/]");
-        int bosTokenId = settings.Bos ? tokenizer.BosTokenId : -1;
+        int bosTokenId = addBos ? tokenizer.BosTokenId : -1;
         var options = new PerplexityOptions(
             mode, effectiveContext, effectiveStride, settings.MaxTokens, effectivePrefix, bosTokenId);
 
@@ -280,6 +320,11 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         table.AddRow("Stride", $"{effectiveStride:N0}");
         table.AddRow("Unscored prefix", $"{effectivePrefix:N0}");
         table.AddRow("Corpus tokens", $"{tokens.Count:N0}");
+        if (settings.TokensFile is null)
+        {
+            table.AddRow("Corpus line endings", Markup.Escape(
+                CorpusLineEndings.SummarizeForReport(corpusCarriageReturns, settings.NormalizeLineEndings)));
+        }
         table.AddRow("Elapsed", $"{sw.Elapsed.TotalSeconds:F2} s");
         AnsiConsole.Write(table);
 

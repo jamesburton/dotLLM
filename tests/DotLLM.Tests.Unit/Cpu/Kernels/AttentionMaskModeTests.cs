@@ -238,8 +238,11 @@ public sealed class AttentionMaskModeTests
                                 0, scale, alibiSlopes: ReadOnlySpan<float>.Empty, slidingWindowSize: null, softCap: 0f,
                                 maskMode: AttentionMaskMode.Hybrid, prefixLen: prefixLen);
 
-        // Tolerance set to 5e-2 to account for the fast approximate-exp softmax used by the
-        // tiled SIMD path vs the exact scalar reference (matches AttentionTests convention).
+        // Tolerance set to 5e-2 when the tiled SIMD path used the approximate-exp softmax and
+        // the scalar reference did not (matches AttentionTests convention). #501 made the
+        // attention exp precise by default, so this now only has to cover SIMD/tiling
+        // reassociation; left wide rather than retightened, and still correct under
+        // DOTLLM_FAST_EXP=1.
         for (int i = 0; i < tiled.Length; i++)
             Assert.Equal(scalar[i], tiled[i], 5e-2f);
     }
@@ -259,8 +262,10 @@ public sealed class AttentionMaskModeTests
                                 0, scale, alibiSlopes: ReadOnlySpan<float>.Empty, slidingWindowSize: null, softCap: 0f,
                                 maskMode: AttentionMaskMode.Bidirectional, prefixLen: 0);
 
-        // Tolerance set to 5e-2 to account for the fast approximate-exp softmax used by the
-        // naive SIMD path vs the exact scalar reference (matches AttentionTests convention).
+        // Tolerance set to 5e-2 when the naive SIMD path used the approximate-exp softmax and
+        // the scalar reference did not (matches AttentionTests convention). #501 made the
+        // attention exp precise by default, so this now only has to cover SIMD reassociation;
+        // left wide rather than retightened, and still correct under DOTLLM_FAST_EXP=1.
         for (int i = 0; i < naive.Length; i++)
             Assert.Equal(scalar[i], naive[i], 5e-2f);
     }

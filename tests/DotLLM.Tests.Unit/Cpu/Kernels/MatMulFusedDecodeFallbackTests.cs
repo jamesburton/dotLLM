@@ -20,14 +20,15 @@ namespace DotLLM.Tests.Unit.Cpu.Kernels;
 /// <em>was</em> supplied but in a format the projection could not consume — producing zeros
 /// instead of an exception.</item>
 /// </list>
-/// Q4_1 is used as the representative unsupported format: it is one of the 14 affected types and
-/// its block layout is simple enough to decode independently inside the test, so the expected
-/// values do not come from the same code path under test.
+/// BF16 is the representative unsupported format: it is one of the 14 affected types and its
+/// layout is simple enough to decode independently inside the test, so the expected values do not
+/// come from the same code path under test. It replaced Q4_1 in issue #489, which gave Q4_0, Q4_1,
+/// Q5_1 and IQ4_NL packed x Q8_1 fused kernels — they are no longer "unsupported", and their
+/// packed path quantizes the activations, so they would also no longer match an F32 reference to
+/// 1e-3.
 /// </remarks>
 public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
 {
-    private const int Q4_1GroupSize = 32;
-    private const int Q4_1BlockBytes = 20; // d(Half) + m(Half) + 16 packed nibble bytes
     private const int Q8_0GroupSize = 32;
     private const int Q8_0BlockBytes = 34;
 
@@ -50,23 +51,26 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
     [InlineData(QuantizationType.Q4_K)]
     [InlineData(QuantizationType.Q5_K)]
     [InlineData(QuantizationType.Q6_K)]
+    // Gained a packed x Q8_1 ComputeRows kernel in issue #489, so they now fuse too.
+    [InlineData(QuantizationType.Q4_0)]
+    [InlineData(QuantizationType.Q4_1)]
+    [InlineData(QuantizationType.Q5_1)]
+    [InlineData(QuantizationType.IQ4_NL)]
     public void SupportsFusedDecode_ReturnsTrue_ForFormatsWithAFusedKernel(QuantizationType qt)
     {
         Assert.True(MatMul.SupportsFusedDecode(qt));
     }
 
     /// <summary>
-    /// Every format listed in issue #257 as failing must report as unsupported so callers route it
-    /// to the standard GEMM path instead of the fused kernels.
+    /// Every format from issue #257 that still lacks a fused kernel must report as unsupported so
+    /// callers route it to the standard GEMM path. Formats leave this list as kernels are written
+    /// for them — Q4_0/Q4_1/Q5_1/IQ4_NL in #489, Q2_K/Q3_K in #497.
     /// </summary>
     [Theory]
     [InlineData(QuantizationType.BF16)]
-    [InlineData(QuantizationType.Q4_1)]
-    [InlineData(QuantizationType.Q5_1)]
-    [InlineData(QuantizationType.IQ4_NL)]
     [InlineData(QuantizationType.MXFP4)]
-    [InlineData(QuantizationType.Q2_K)]
-    [InlineData(QuantizationType.Q3_K)]
+    // Q2_K and Q3_K left this list in #497: they now have packed x Q8_K ComputeRows kernels,
+    // so SupportsFusedDecode is true for them and the fused path is the right route.
     [InlineData(QuantizationType.IQ4_XS)]
     [InlineData(QuantizationType.IQ3_S)]
     [InlineData(QuantizationType.IQ3_XXS)]
@@ -84,7 +88,7 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
     // ──────────────────── Kernel-level fallback ────────────────────
 
     /// <summary>
-    /// Q/K/V all Q4_1 with no pre-quantized input. Before the fix this threw
+    /// Q/K/V all BF16 with no pre-quantized input. Before the fix this threw
     /// <see cref="NotSupportedException"/> — the exact failure reported in issue #257.
     /// </summary>
     [Fact]
@@ -93,9 +97,9 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
         const int m = 64, k = 256;
         var rng = new Random(1234);
 
-        byte* w0 = AllocQ4_1Weights(m, k, rng);
-        byte* w1 = AllocQ4_1Weights(m, k, rng);
-        byte* w2 = AllocQ4_1Weights(m, k, rng);
+        byte* w0 = AllocBF16Weights(m, k, rng);
+        byte* w1 = AllocBF16Weights(m, k, rng);
+        byte* w2 = AllocBF16Weights(m, k, rng);
         float* input = AllocFloats(k, rng);
         float* r0 = AllocResult(m);
         float* r1 = AllocResult(m);
@@ -104,9 +108,9 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
         try
         {
             MatMul.FusedDecodeGemv3(
-                w0, QuantizationType.Q4_1, r0, m,
-                w1, QuantizationType.Q4_1, r1, m,
-                w2, QuantizationType.Q4_1, r2, m,
+                w0, QuantizationType.BF16, r0, m,
+                w1, QuantizationType.BF16, r1, m,
+                w2, QuantizationType.BF16, r2, m,
                 input, preQuantInput: null, k, _pool);
 
             AssertMatchesReference(w0, input, r0, m, k, "Proj0");
@@ -120,7 +124,7 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
     }
 
     /// <summary>
-    /// Gate/Up both Q4_1 with no pre-quantized input — the FFN half of the same defect.
+    /// Gate/Up both BF16 with no pre-quantized input — the FFN half of the same defect.
     /// </summary>
     [Fact]
     public void FusedDecodeGemv2_UnsupportedType_NoPreQuant_FallsBackInsteadOfThrowing()
@@ -128,8 +132,8 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
         const int m = 64, k = 256;
         var rng = new Random(4321);
 
-        byte* w0 = AllocQ4_1Weights(m, k, rng);
-        byte* w1 = AllocQ4_1Weights(m, k, rng);
+        byte* w0 = AllocBF16Weights(m, k, rng);
+        byte* w1 = AllocBF16Weights(m, k, rng);
         float* input = AllocFloats(k, rng);
         float* r0 = AllocResult(m);
         float* r1 = AllocResult(m);
@@ -137,8 +141,8 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
         try
         {
             MatMul.FusedDecodeGemv2(
-                w0, QuantizationType.Q4_1, r0, m,
-                w1, QuantizationType.Q4_1, r1, m,
+                w0, QuantizationType.BF16, r0, m,
+                w1, QuantizationType.BF16, r1, m,
                 input, preQuantInput: null, k, _pool);
 
             AssertMatchesReference(w0, input, r0, m, k, "Proj0");
@@ -151,7 +155,7 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
     }
 
     /// <summary>
-    /// Q4_1 leading projection with a non-null pre-quantized input. The old dispatcher matched the
+    /// BF16 leading projection with a non-null pre-quantized input. The old dispatcher matched the
     /// "pre-quantized input available" branch, found no <c>ComputeRows</c> function pointer and
     /// returned without writing anything, leaving the caller's buffer at its previous contents —
     /// silently wrong output rather than an exception. Result buffers are poisoned with a sentinel
@@ -163,15 +167,15 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
         const int m = 64, k = 256;
         var rng = new Random(777);
 
-        byte* w0 = AllocQ4_1Weights(m, k, rng);
-        byte* w1 = AllocQ4_1Weights(m, k, rng);
-        byte* w2 = AllocQ4_1Weights(m, k, rng);
+        byte* w0 = AllocBF16Weights(m, k, rng);
+        byte* w1 = AllocBF16Weights(m, k, rng);
+        byte* w2 = AllocBF16Weights(m, k, rng);
         float* input = AllocFloats(k, rng);
         float* r0 = AllocResult(m);
         float* r1 = AllocResult(m);
         float* r2 = AllocResult(m);
 
-        // A Q8_0-encoded activation buffer — valid bytes, but not a format Q4_1 weights can consume.
+        // A Q8_0-encoded activation buffer — valid bytes, but not a format BF16 weights can consume.
         int blockCount = k / Q8_0GroupSize;
         byte* preQuant = (byte*)NativeMemory.AlignedAlloc((nuint)(blockCount * Q8_0BlockBytes), 64);
         MatMul.QuantizeF32ToQ8_0(input, preQuant, k);
@@ -179,9 +183,9 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
         try
         {
             MatMul.FusedDecodeGemv3(
-                w0, QuantizationType.Q4_1, r0, m,
-                w1, QuantizationType.Q4_1, r1, m,
-                w2, QuantizationType.Q4_1, r2, m,
+                w0, QuantizationType.BF16, r0, m,
+                w1, QuantizationType.BF16, r1, m,
+                w2, QuantizationType.BF16, r2, m,
                 input, preQuant, k, _pool);
 
             AssertMatchesReference(w0, input, r0, m, k, "Proj0");
@@ -196,7 +200,7 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
     }
 
     /// <summary>
-    /// Mixed layer: a supported Q8_0 query projection alongside unsupported Q4_1 K/V. The supported
+    /// Mixed layer: a supported Q8_0 query projection alongside unsupported BF16 K/V. The supported
     /// projection must still be computed correctly while the unsupported ones fall back.
     /// </summary>
     [Fact]
@@ -206,8 +210,8 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
         var rng = new Random(2024);
 
         byte* wQ = AllocQ8_0Weights(m, k, rng);
-        byte* wK = AllocQ4_1Weights(m, k, rng);
-        byte* wV = AllocQ4_1Weights(m, k, rng);
+        byte* wK = AllocBF16Weights(m, k, rng);
+        byte* wV = AllocBF16Weights(m, k, rng);
         float* input = AllocFloats(k, rng);
         float* rQ = AllocResult(m);
         float* rK = AllocResult(m);
@@ -222,8 +226,8 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
         {
             MatMul.FusedDecodeGemv3(
                 wQ, QuantizationType.Q8_0, rQ, m,
-                wK, QuantizationType.Q4_1, rK, m,
-                wV, QuantizationType.Q4_1, rV, m,
+                wK, QuantizationType.BF16, rK, m,
+                wV, QuantizationType.BF16, rV, m,
                 input, preQuant, k, _pool);
 
             // Q keeps taking the fused Q8_0 kernel — compare against the standard GEMM (n=1).
@@ -245,20 +249,19 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
     // ──────────────────── Helpers ────────────────────
 
     /// <summary>
-    /// Independently decodes the Q4_1 weight matrix and asserts the kernel output matches
+    /// Independently decodes the BF16 weight matrix and asserts the kernel output matches
     /// <c>W · x</c> within float tolerance.
     /// </summary>
     private static void AssertMatchesReference(byte* weights, float* input, float* actual,
                                                int m, int k, string label)
     {
-        int blocksPerRow = k / Q4_1GroupSize;
-        int rowBytes = blocksPerRow * Q4_1BlockBytes;
+        int rowBytes = k * 2;
         var row = new float[k];
         bool anyNonZero = false;
 
         for (int i = 0; i < m; i++)
         {
-            DecodeQ4_1Row(weights + (long)i * rowBytes, blocksPerRow, row);
+            DecodeBF16Row(weights + (long)i * rowBytes, k, row);
 
             double expected = 0;
             for (int j = 0; j < k; j++)
@@ -276,39 +279,20 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
         Assert.True(anyNonZero, $"{label}: every output element is zero — the projection never ran");
     }
 
-    /// <summary>Decodes one Q4_1 row (<c>d(Half) + m(Half) + 16 nibble bytes</c> per 32 elements).</summary>
-    private static void DecodeQ4_1Row(byte* rowPtr, int blocksPerRow, float[] dest)
+    /// <summary>Decodes one BF16 row: each element is the top 16 bits of an IEEE-754 float.</summary>
+    private static void DecodeBF16Row(byte* rowPtr, int k, float[] dest)
     {
-        for (int b = 0; b < blocksPerRow; b++)
-        {
-            byte* block = rowPtr + b * Q4_1BlockBytes;
-            float d = (float)BitConverter.UInt16BitsToHalf(*(ushort*)block);
-            float min = (float)BitConverter.UInt16BitsToHalf(*(ushort*)(block + 2));
-            byte* qs = block + 4;
-
-            for (int j = 0; j < Q4_1GroupSize / 2; j++)
-            {
-                dest[b * Q4_1GroupSize + j] = d * (qs[j] & 0x0F) + min;
-                dest[b * Q4_1GroupSize + j + Q4_1GroupSize / 2] = d * (qs[j] >> 4) + min;
-            }
-        }
+        ushort* src = (ushort*)rowPtr;
+        for (int j = 0; j < k; j++)
+            dest[j] = BitConverter.Int32BitsToSingle(src[j] << 16);
     }
 
-    private static byte* AllocQ4_1Weights(int m, int k, Random rng)
+    private static byte* AllocBF16Weights(int m, int k, Random rng)
     {
-        int blocksPerRow = k / Q4_1GroupSize;
-        int totalBytes = m * blocksPerRow * Q4_1BlockBytes;
-        byte* ptr = (byte*)NativeMemory.AlignedAlloc((nuint)totalBytes, 64);
-
-        for (int i = 0; i < m * blocksPerRow; i++)
-        {
-            byte* block = ptr + i * Q4_1BlockBytes;
-            *(ushort*)block = BitConverter.HalfToUInt16Bits((Half)(0.01f + (float)rng.NextDouble() * 0.05f));
-            *(ushort*)(block + 2) = BitConverter.HalfToUInt16Bits((Half)((float)rng.NextDouble() * 0.2f - 0.1f));
-            for (int j = 0; j < Q4_1GroupSize / 2; j++)
-                block[4 + j] = (byte)rng.Next(256);
-        }
-
+        byte* ptr = (byte*)NativeMemory.AlignedAlloc((nuint)((long)m * k * 2), 64);
+        ushort* v = (ushort*)ptr;
+        for (long i = 0; i < (long)m * k; i++)
+            v[i] = (ushort)(BitConverter.SingleToInt32Bits((float)(rng.NextDouble() * 0.2 - 0.1)) >> 16);
         return ptr;
     }
 

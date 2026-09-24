@@ -9,6 +9,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <summary>Correctness anchor for <see cref="CudaKernels.LaunchReluSquaredInplaceF32"/>
 /// against <see cref="ReluSquared.Execute"/>.</summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaReluSquaredInplaceF32Tests
 {
     private static bool IsCudaDriverPresent()

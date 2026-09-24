@@ -120,9 +120,9 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>Number of draft candidates per speculative step.</summary>
         [CommandOption("--speculative-k|--draft-tokens")]
-        [Description("Number of draft tokens per speculative step (K). Default 5. Also used as K for --mtp.")]
-        [DefaultValue(5)]
-        public int SpeculativeK { get; set; } = 5;
+        [Description("Number of draft tokens per speculative step (K). Default 3. Also used as K for --mtp.")]
+        [DefaultValue(DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates)]
+        public int SpeculativeK { get; set; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
 
         /// <summary>Opt-in to MTP self-speculative decoding when the loaded GGUF carries an MTP head.</summary>
         [CommandOption("--mtp")]
@@ -185,6 +185,63 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [Description("Total byte budget across all resident models. 0 (default) = unlimited, only --max-resident-models bounds residency.")]
         [DefaultValue(0L)]
         public long ResidentMemoryBudgetBytes { get; set; }
+
+        /// <summary>Enables the #454 model-administration write endpoints (off by default).</summary>
+        [CommandOption("--allow-model-admin")]
+        [Description("Enable the model-administration API (#454): POST /v1/models/unload, /pull, /enable, /disable and PUT /v1/settings. Off by default.")]
+        public bool AllowModelAdmin { get; set; }
+
+        /// <summary>Enables the LoRA admin write endpoints (off by default).</summary>
+        [CommandOption("--allow-lora-admin")]
+        [Description("Enable the LoRA admin API: POST /v1/lora/load and DELETE /v1/lora/{name}. Off by default.")]
+        public bool AllowLoraAdmin { get; set; }
+
+        /// <summary>
+        /// Per-API-key request cap (#457). 0 = no per-request cap. Any of the three rate-limit
+        /// options being set turns the limiter on; it is off by default.
+        /// </summary>
+        [CommandOption("--rate-limit-rpm")]
+        [Description("Rate limit: max requests per minute per API key. 0 = unlimited. Setting any --rate-limit-* option enables rate limiting (off by default).")]
+        public int RateLimitRequestsPerMinute { get; set; }
+
+        /// <summary>Per-API-key token cap (#457). 0 = no per-token cap.</summary>
+        [CommandOption("--rate-limit-tpm")]
+        [Description("Rate limit: max tokens per minute per API key (prompt + completion). 0 = unlimited.")]
+        public int RateLimitTokensPerMinute { get; set; }
+
+        /// <summary>Per-API-key concurrency cap (#457). 0 = no concurrency cap.</summary>
+        [CommandOption("--rate-limit-concurrency")]
+        [Description("Rate limit: max concurrent in-flight requests per API key. 0 = unlimited.")]
+        public int RateLimitConcurrency { get; set; }
+    }
+
+    /// <summary>
+    /// Builds the rate-limit config from the CLI options (#457), or <see langword="null"/> when
+    /// no cap was requested.
+    /// </summary>
+    /// <remarks>
+    /// Returning null (rather than a disabled config) keeps <c>RateLimitMiddleware</c> on its
+    /// pass-through path, so an unconfigured server pays nothing.
+    /// </remarks>
+    private static DotLLM.Server.RateLimiting.RateLimitConfig? BuildRateLimit(Settings settings)
+    {
+        if (settings.RateLimitRequestsPerMinute <= 0
+            && settings.RateLimitTokensPerMinute <= 0
+            && settings.RateLimitConcurrency <= 0)
+        {
+            return null;
+        }
+
+        return new DotLLM.Server.RateLimiting.RateLimitConfig
+        {
+            Enabled = true,
+            DefaultPolicy = new DotLLM.Server.RateLimiting.RateLimitPolicy
+            {
+                RequestsPerMinute = settings.RateLimitRequestsPerMinute,
+                TokensPerMinute = settings.RateLimitTokensPerMinute,
+                MaxConcurrent = settings.RateLimitConcurrency,
+            },
+        };
     }
 
     /// <inheritdoc/>
@@ -217,6 +274,13 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             KeepAliveSeconds = settings.KeepAlive,
             MaxResidentModels = settings.MaxResidentModels,
             ResidentMemoryBudgetBytes = settings.ResidentMemoryBudgetBytes,
+            AllowModelAdminApi = settings.AllowModelAdmin,
+            AllowLoraAdminApi = settings.AllowLoraAdmin,
+            // #457: nothing in src/ ever assigned RateLimit, so the entire RateLimiting
+            // subsystem was unreachable — no invocation of `dotllm serve` could produce a 429,
+            // and the limiter was exercised only by unit tests constructing the config directly.
+            // Off unless a cap is given, so the default behaviour is unchanged.
+            RateLimit = BuildRateLimit(settings),
             ModelId = "none",
             RopeOverride = ServerOptions.BuildRopeOverride(settings.RopeScaling, settings.RopeFreqBase,
                 settings.RopeScale, settings.YarnOrigCtx, settings.YarnAttnFactor,

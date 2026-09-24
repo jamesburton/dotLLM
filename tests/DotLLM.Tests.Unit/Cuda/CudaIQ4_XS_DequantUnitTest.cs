@@ -17,6 +17,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </summary>
 [Trait("Category", "GPU")]
 [Trait("Category", "Diagnostics")]
+[Collection(CudaCollection.Name)]
 public sealed unsafe class CudaIQ4_XS_DequantUnitTest
 {
     private readonly ITestOutputHelper _output;

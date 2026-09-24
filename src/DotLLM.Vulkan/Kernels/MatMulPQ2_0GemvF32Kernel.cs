@@ -17,8 +17,10 @@ namespace DotLLM.Vulkan.Kernels;
 /// applies each group's own scale to that group's partial dot product — the group scale is
 /// read in-shader per 128-element span, not once at the end.
 /// Row stride is <c>(K/128)·34</c> bytes; there is no per-tensor tail scale (contrast I2_S).
-/// Activation <c>x</c> and output <c>y</c> are FP32. One workgroup per output row, 128 threads,
-/// shared-memory tree reduce. Correctness-first baseline (no coopmat / dp4a MMVQ path yet) —
+/// Activation <c>x</c> and output <c>y</c> are FP32. The #470 kernels run one workgroup per output
+/// row, 128 threads, shared-memory tree reduce; since #474 the default is the multi-row family
+/// (<c>matmul_pq2_0_f32_gemv_multirow.glsl</c>: 4 rows per 64-lane workgroup, each activation load
+/// reused across the 4 rows), with the #470 kernels kept behind <see cref="MultiRowEnvVar"/>. Correctness-first baseline (no coopmat / dp4a MMVQ path yet) —
 /// GEMV/decode only; GEMM/prefill is explicit follow-on scope (#205).
 /// </remarks>
 public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
@@ -29,22 +31,104 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
     /// <summary>Elements per PQ2_0 group.</summary>
     public const int PQ2_0GroupSize = QuantFormat.TernaryGroupSize;
 
-    private const int PushConstantBytes = 4 * sizeof(uint);
+    private const int PushConstantBytes = 6 * sizeof(uint);
+
+    /// <summary>
+    /// Issue #470 — the widest multi-column variant. <see cref="RecordColumns"/> accepts at most
+    /// this many columns per call.
+    /// </summary>
+    public const int MaxColumns = 8;
+
+    /// <summary>Column counts with a compiled <c>matmul_pq2_0_f32_gemv_multicol_{n}.spv</c>, ascending.</summary>
+    private static readonly int[] MultiColumnWidths = [2, 3, 4, 5, 6, 7, 8];
+
+    private const int MultiColumnPushConstantBytes = 7 * sizeof(uint);
+
+    /// <summary>
+    /// Issue #474 — the shipped multi-row variant for each column count 1..<see cref="MaxColumns"/>
+    /// (index = columns - 1). Every one takes 4 rows per 64-lane workgroup. One column reads a uint
+    /// of codes (16 elements) per lane; two and more read one code byte per lane, because the uint
+    /// mapping leaves adjacent lanes' activation loads 64 bytes apart and that cost grows with the
+    /// column count. Two columns is the close call: the uint mapping won the microbenchmark on the
+    /// cache-resident projections, but lost the in-situ Bonsai 27B S=2 forward (95.0 ms against
+    /// 80.6 ms, same session), so the byte mapping ships. See <see cref="PQ2_0SmallNDispatch"/>.
+    /// </summary>
+    private static readonly string[] MultiRowSpvNames =
+    [
+        "matmul_pq2_0_f32_gemv_mr_r4_c1_b4_w64.spv",
+        "matmul_pq2_0_f32_gemv_mr_r4_c2_b1_w64.spv",
+        "matmul_pq2_0_f32_gemv_mr_r4_c3_b1_w64.spv",
+        "matmul_pq2_0_f32_gemv_mr_r4_c4_b1_w64.spv",
+        "matmul_pq2_0_f32_gemv_mr_r4_c5_b1_w64.spv",
+        "matmul_pq2_0_f32_gemv_mr_r4_c6_b1_w64.spv",
+        "matmul_pq2_0_f32_gemv_mr_r4_c7_b1_w64.spv",
+        "matmul_pq2_0_f32_gemv_mr_r4_c8_b1_w64.spv",
+    ];
+
+    private const int MultiRowRows = 4;
+
+    /// <summary>Environment variable; <c>0</c> disables the #474 multi-row kernels (read once).</summary>
+    public const string MultiRowEnvVar = "DOTLLM_VK_PQ2_0_MULTIROW";
+
+    private static readonly bool MultiRowFromEnv =
+        Environment.GetEnvironmentVariable(MultiRowEnvVar) is not "0";
+
+    /// <summary>
+    /// In-process override of the multi-row switch for every kernel instance, so a benchmark can
+    /// A/B the #474 kernels against the #470 ones in one session. Read at record time; not for
+    /// production use.
+    /// </summary>
+    internal static bool? MultiRowGlobalOverride { get; set; }
+
+    /// <summary>
+    /// Per-instance override of the multi-row switch; takes precedence over
+    /// <see cref="MultiRowGlobalOverride"/>. Tests use it to keep an instance on the #470 kernels as
+    /// an oracle without touching global state.
+    /// </summary>
+    internal bool? MultiRowOverride { get; set; }
+
+    /// <summary>Whether this instance records the #474 multi-row kernels.</summary>
+    internal bool UsesMultiRow => MultiRowOverride ?? MultiRowGlobalOverride ?? MultiRowFromEnv;
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
+    private readonly MultiColumnPipeline[] _multiColumn;
+    private readonly PQ2_0GemvMultiRowPipeline[] _multiRow;
     private bool _disposed;
 
-    private MatMulPQ2_0GemvF32Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
+    private MatMulPQ2_0GemvF32Kernel(
+        VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
+        MultiColumnPipeline[] multiColumn, PQ2_0GemvMultiRowPipeline[] multiRow)
     {
         _device = device;
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 3);
+        _multiColumn = multiColumn;
+        _multiRow = multiRow;
+    }
+
+    /// <summary>One compiled <c>NCOLS</c> variant of the multi-column GEMV and its descriptor state.</summary>
+    private sealed class MultiColumnPipeline : IDisposable
+    {
+        public required int Width { get; init; }
+        public required VulkanDevice Device { get; init; }
+        public required VulkanModule Module { get; init; }
+        public required ComputePipeline Pipeline { get; init; }
+        public required nint Pool { get; init; }
+        public required DescriptorSetCache Cache { get; init; }
+
+        public void Dispose()
+        {
+            if (Pool != 0)
+                VulkanApi.vkDestroyDescriptorPool(Device.Handle, Pool, 0);
+            Pipeline.Dispose();
+            Module.Dispose();
+        }
     }
 
     /// <summary>Loads <c>matmul_pq2_0_f32_gemv.spv</c> from the given directory and creates the pipeline.</summary>
@@ -83,10 +167,73 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
-        return new MatMulPQ2_0GemvF32Kernel(device, module, pipeline, pool);
+
+        var multiColumn = new List<MultiColumnPipeline>(MultiColumnWidths.Length);
+        var multiRow = new List<PQ2_0GemvMultiRowPipeline>(MultiRowSpvNames.Length);
+        try
+        {
+            foreach (int width in MultiColumnWidths)
+                multiColumn.Add(CreateMultiColumn(device, spvDir, width));
+            for (int c = 1; c <= MultiRowSpvNames.Length; c++)
+                multiRow.Add(PQ2_0GemvMultiRowPipeline.Create(device, spvDir, MultiRowSpvNames[c - 1], MultiRowRows, c));
+        }
+        catch
+        {
+            foreach (var mr in multiRow) mr.Dispose();
+            foreach (var mc in multiColumn) mc.Dispose();
+            VulkanApi.vkDestroyDescriptorPool(device.Handle, pool, 0);
+            pipeline.Dispose();
+            module.Dispose();
+            throw;
+        }
+
+        return new MatMulPQ2_0GemvF32Kernel(device, module, pipeline, pool, multiColumn.ToArray(), multiRow.ToArray());
     }
 
-    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
+    private static MultiColumnPipeline CreateMultiColumn(VulkanDevice device, string spvDir, int width)
+    {
+        string path = Path.Combine(spvDir, $"matmul_pq2_0_f32_gemv_multicol_{width}.spv");
+        if (!File.Exists(path))
+            throw new FileNotFoundException(
+                $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
+
+        var module = VulkanModule.LoadFromFile(device, path);
+        ComputePipeline pipeline;
+        try
+        {
+            Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[3];
+            bindings[0] = new VkDescriptorBinding(0);
+            bindings[1] = new VkDescriptorBinding(1);
+            bindings[2] = new VkDescriptorBinding(2);
+            pipeline = module.CreateComputePipeline(
+                entryPoint: "main",
+                bindings: bindings,
+                pushConstantBytes: MultiColumnPushConstantBytes);
+        }
+        catch
+        {
+            module.Dispose();
+            throw;
+        }
+
+        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
+        return new MultiColumnPipeline
+        {
+            Width = width,
+            Device = device,
+            Module = module,
+            Pipeline = pipeline,
+            Pool = pool,
+            Cache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 3),
+        };
+    }
+
+    internal void InvalidateDescriptorCache()
+    {
+        _descriptorCache.Reset();
+        foreach (var mc in _multiColumn) mc.Cache.Reset();
+        foreach (var mr in _multiRow) mr.InvalidateDescriptorCache();
+    }
 
     /// <summary>Dispatches the GEMV synchronously.</summary>
     public void Launch(
@@ -100,11 +247,50 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
     }
 
     /// <summary>Records the PQ2_0 GEMV into <paramref name="cmdBuf"/> without submitting.</summary>
-    public unsafe void Record(
+    public void Record(
         nint cmdBuf,
         VulkanDevice.Buffer weightsPQ2_0, VulkanDevice.Buffer x, VulkanDevice.Buffer y,
         int m, int k)
+        => Record(cmdBuf, weightsPQ2_0, x, y, m, k, xOffsetElements: 0, yOffsetElements: 0);
+
+    /// <summary>
+    /// Records the PQ2_0 GEMV for one row of a batched activation, reading
+    /// <c>x[xOffsetElements .. +k]</c> and writing <c>y[yOffsetElements .. +m]</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Issue #446. <see cref="VulkanDevice.Buffer"/> has no offset view, so a looped GEMV over an
+    /// <c>[n, K]</c> activation batch expresses the per-token stride in push constants instead of
+    /// by binding sub-ranges. Two consequences, both load-bearing for the loop being cheap: the
+    /// three bound handles are identical across tokens so the handle-keyed
+    /// <c>DescriptorSetCache</c> hits every time, and successive tokens touch disjoint
+    /// <c>y</c> ranges so the dispatches need <b>no barriers</b> between them and are free to
+    /// overlap.
+    /// </para>
+    /// <para>
+    /// <b>Why a caller would want this.</b> The 128x128 coopmat GEMM does a 128-wide N-tile's
+    /// worth of PQ2_0 unpack however few tokens it is given, so it is near-flat in <c>n</c> while
+    /// the GEMV loop is linear. Measured on gfx1151 against the shipping
+    /// <c>ladder_128x128x4</c> tile, the GEMM only overtakes the loop at <b>n ~ 4.4</b>
+    /// (<c>lm_head</c>) / <b>n ~ 6.5</b> (<c>ffn_gate/up</c>) — so at the 2-8 token verify batches
+    /// MTP speculative decoding produces, the single GEMM dispatch was the wrong call.
+    /// </para>
+    /// </remarks>
+    /// <param name="cmdBuf">Command buffer to record into.</param>
+    /// <param name="weightsPQ2_0">Packed PQ2_0 weights, <c>m</c> rows of <c>(k/128)*34</c> bytes.</param>
+    /// <param name="x">Activation buffer; this dispatch reads <c>k</c> floats from <paramref name="xOffsetElements"/>.</param>
+    /// <param name="y">Output buffer; this dispatch writes <c>m</c> floats at <paramref name="yOffsetElements"/>.</param>
+    /// <param name="m">Output rows.</param>
+    /// <param name="k">Inner dimension; must be a multiple of 128.</param>
+    /// <param name="xOffsetElements">First float of this token's activation row.</param>
+    /// <param name="yOffsetElements">First float of this token's output row.</param>
+    public unsafe void Record(
+        nint cmdBuf,
+        VulkanDevice.Buffer weightsPQ2_0, VulkanDevice.Buffer x, VulkanDevice.Buffer y,
+        int m, int k, int xOffsetElements, int yOffsetElements)
     {
+        if (xOffsetElements < 0) throw new ArgumentOutOfRangeException(nameof(xOffsetElements));
+        if (yOffsetElements < 0) throw new ArgumentOutOfRangeException(nameof(yOffsetElements));
         if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
         if ((k % PQ2_0GroupSize) != 0)
@@ -121,10 +307,17 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
             throw new ArgumentException(
                 $"Weights buffer too small: need >= {weightsMin} bytes (m·(k/128)·34), got {weightsPQ2_0.Size}.",
                 nameof(weightsPQ2_0));
-        if (x.Size < (long)k * sizeof(float))
+        if (x.Size < ((long)xOffsetElements + k) * sizeof(float))
             throw new ArgumentException("Input buffer too small.", nameof(x));
-        if (y.Size < (long)m * sizeof(float))
+        if (y.Size < ((long)yOffsetElements + m) * sizeof(float))
             throw new ArgumentException("Output buffer too small.", nameof(y));
+
+        // #474: the multi-row kernel reads x as vec4, so an unaligned offset keeps the #470 kernel.
+        if (UsesMultiRow && (xOffsetElements & 3) == 0)
+        {
+            _multiRow[0].Record(cmdBuf, weightsPQ2_0, x, y, m, k, 1, xOffsetElements, yOffsetElements);
+            return;
+        }
 
         Span<nint> buffers = stackalloc nint[3] { weightsPQ2_0.Handle, x.Handle, y.Handle };
         nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
@@ -134,12 +327,14 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
             cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
             0, 1, descriptorSet, 0, 0);
 
-        Span<uint> pc = stackalloc uint[4]
+        Span<uint> pc = stackalloc uint[6]
         {
             (uint)m,
             (uint)k,
             (uint)blocksPerRow,
             (uint)rowUints,
+            (uint)xOffsetElements,
+            (uint)yOffsetElements,
         };
         fixed (uint* pcPtr = pc)
         {
@@ -151,11 +346,118 @@ public sealed class MatMulPQ2_0GemvF32Kernel : IDisposable
         VulkanApi.vkCmdDispatch(cmdBuf, (uint)m, 1, 1);
     }
 
+    /// <summary>
+    /// Issue #470 — records <c>y[s, :] = W @ x[s, :]</c> for the <paramref name="columns"/>
+    /// activation rows of a <c>[columns, k]</c> batch into a <c>[columns, m]</c> output,
+    /// reading each weight byte once for all of them.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A speculative / MTP verify forward runs 2-8 tokens. The #446 loop recorded one
+    /// single-column dispatch per token and re-read the whole weight matrix each time, so a
+    /// verify of S tokens cost about S decode steps. Here each workgroup decodes its weight row
+    /// once and applies it to every column.
+    /// </para>
+    /// <para>
+    /// The #470 kernels compute each column in the single-column kernel's per-lane order and tree
+    /// reduce, but the result is not bit-identical to <paramref name="columns"/> calls of the offset
+    /// <c>Record</c> overload: gfx1151 contracts multiply-adds differently per pipeline (1 ULP).
+    /// The #474 multi-row kernels (the default) also change the per-lane order for one and two
+    /// columns. The tests hold both to 1e-5 of the looped #470 kernel.
+    /// </para>
+    /// <para>
+    /// <paramref name="columns"/> = 1 records the ordinary single-column kernel; every other
+    /// width has its own compiled variant. (An earlier 2/4/8-only set ran 5 columns on the 8-wide
+    /// kernel and paid about 40% for the three dead ones.)
+    /// </para>
+    /// </remarks>
+    /// <param name="cmdBuf">Command buffer to record into.</param>
+    /// <param name="weightsPQ2_0">Packed PQ2_0 weights, <c>m</c> rows of <c>(k/128)*34</c> bytes.</param>
+    /// <param name="x">Activations, <c>[columns, k]</c> row-major, from <paramref name="xOffsetElements"/>.</param>
+    /// <param name="y">Output, <c>[columns, m]</c> row-major, from <paramref name="yOffsetElements"/>.</param>
+    /// <param name="m">Output rows per column.</param>
+    /// <param name="k">Inner dimension; must be a multiple of 128.</param>
+    /// <param name="columns">Column (token) count, 1..<see cref="MaxColumns"/>.</param>
+    /// <param name="xOffsetElements">First float of column 0's activation row; a multiple of 4, because the shader reads activations as <c>vec4</c>.</param>
+    /// <param name="yOffsetElements">First float of column 0's output row.</param>
+    public unsafe void RecordColumns(
+        nint cmdBuf,
+        VulkanDevice.Buffer weightsPQ2_0, VulkanDevice.Buffer x, VulkanDevice.Buffer y,
+        int m, int k, int columns, int xOffsetElements = 0, int yOffsetElements = 0)
+    {
+        if (columns < 1 || columns > MaxColumns) throw new ArgumentOutOfRangeException(nameof(columns));
+        if (columns == 1)
+        {
+            Record(cmdBuf, weightsPQ2_0, x, y, m, k, xOffsetElements, yOffsetElements);
+            return;
+        }
+
+        if (xOffsetElements < 0 || (xOffsetElements & 3) != 0)
+            throw new ArgumentOutOfRangeException(nameof(xOffsetElements), xOffsetElements, "Must be a non-negative multiple of 4.");
+        if (yOffsetElements < 0) throw new ArgumentOutOfRangeException(nameof(yOffsetElements));
+        if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
+        if ((k % PQ2_0GroupSize) != 0)
+            throw new ArgumentException($"k must be a multiple of {PQ2_0GroupSize}, got {k}", nameof(k));
+
+        int blocksPerRow = k / PQ2_0GroupSize;
+        long rowBytes = (long)blocksPerRow * PQ2_0GroupBytes;
+        int rowUints = (int)((rowBytes + 3) / 4);
+
+        long weightsMin = (long)m * rowBytes;
+        if (weightsPQ2_0.Size < weightsMin)
+            throw new ArgumentException(
+                $"Weights buffer too small: need >= {weightsMin} bytes (m·(k/128)·34), got {weightsPQ2_0.Size}.",
+                nameof(weightsPQ2_0));
+        if (x.Size < ((long)xOffsetElements + (long)columns * k) * sizeof(float))
+            throw new ArgumentException("Input buffer too small.", nameof(x));
+        if (y.Size < ((long)yOffsetElements + (long)columns * m) * sizeof(float))
+            throw new ArgumentException("Output buffer too small.", nameof(y));
+
+        if (UsesMultiRow)
+        {
+            _multiRow[columns - 1].Record(cmdBuf, weightsPQ2_0, x, y, m, k, columns, xOffsetElements, yOffsetElements);
+            return;
+        }
+
+        MultiColumnPipeline variant = _multiColumn[columns - MultiColumnWidths[0]];
+
+        Span<nint> buffers = stackalloc nint[3] { weightsPQ2_0.Handle, x.Handle, y.Handle };
+        nint descriptorSet = variant.Cache.GetOrCreate(buffers);
+
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, variant.Pipeline.Pipeline);
+        VulkanApi.vkCmdBindDescriptorSets(
+            cmdBuf, VkPipelineBindPoint.Compute, variant.Pipeline.Layout,
+            0, 1, descriptorSet, 0, 0);
+
+        Span<uint> pc = stackalloc uint[7]
+        {
+            (uint)m,
+            (uint)k,
+            (uint)blocksPerRow,
+            (uint)rowUints,
+            (uint)xOffsetElements,
+            (uint)yOffsetElements,
+            (uint)columns,
+        };
+        fixed (uint* pcPtr = pc)
+        {
+            VulkanApi.vkCmdPushConstants(
+                cmdBuf, variant.Pipeline.Layout, VkShaderStageFlags.Compute,
+                0, MultiColumnPushConstantBytes, (nint)pcPtr);
+        }
+
+        VulkanApi.vkCmdDispatch(cmdBuf, (uint)m, 1, 1);
+    }
+
     /// <inheritdoc/>
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+
+        foreach (var mr in _multiRow) mr.Dispose();
+        foreach (var mc in _multiColumn) mc.Dispose();
 
         if (_descriptorPool != 0)
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);

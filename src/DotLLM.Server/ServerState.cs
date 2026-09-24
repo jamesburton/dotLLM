@@ -168,6 +168,29 @@ public sealed class ServerState : IDisposable
     public long EstimatedBytes { get; set; }
 
     /// <summary>
+    /// Operator-curated enable/disable list (#454). Always non-null; empty by default, so every
+    /// model is loadable unless explicitly disabled via <c>POST /v1/models/disable</c>.
+    /// </summary>
+    public ModelCatalog Catalog { get; init; } = new();
+
+    /// <summary>
+    /// Background model-download jobs (#454, <c>POST /v1/models/pull</c>). Always non-null;
+    /// idle until a pull is requested.
+    /// </summary>
+    public ModelPullManager PullManager { get; init; } = new();
+
+    /// <summary>
+    /// Live idle-sweep interval in seconds (#454). Mutable so <c>PUT /v1/settings</c> takes effect
+    /// without a restart: <see cref="RunIdleSweepLoopAsync"/> re-reads this on every tick and
+    /// re-arms its <see cref="PeriodicTimer"/>. Seeded from
+    /// <see cref="ServerOptions.IdleSweepInterval"/>, and deliberately NOT stored back on
+    /// <see cref="Options"/> — that record is replaced wholesale on every model swap
+    /// (<see cref="ActivateSnapshotLocked"/>, <c>POST /v1/models/load</c>), which would silently
+    /// revert any runtime setting kept there.
+    /// </summary>
+    public double IdleSweepIntervalSeconds { get; set; } = 5;
+
+    /// <summary>
     /// Host-shutdown token, wired by <see cref="ServerStartup.BuildApp"/>. Used by
     /// <see cref="StartSchedulerLoop"/> so schedulers rebuilt on model reactivation (#369) also
     /// stop cleanly at shutdown, same as the initially-loaded one.
@@ -175,13 +198,48 @@ public sealed class ServerState : IDisposable
     public CancellationToken ShutdownToken { get; set; } = CancellationToken.None;
 
     /// <summary>
-    /// Executes a request with sequential access control.
-    /// Only one request is processed at a time (Step 35 adds batching).
+    /// Executes a request with sequential access control: one direct-generator request at a time,
+    /// and never concurrently with a continuous-batch scheduler step.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>The request gate alone is not enough (#461).</b> When a scheduler is running it drives
+    /// forward passes on the same model from its own background loop, deliberately <i>outside</i>
+    /// this gate — batching is the whole point. The model's scratch buffers are shared mutable
+    /// state, so a direct-generator forward running beside a scheduler step is not a numerical
+    /// wobble: it tears down the shared <c>ComputeThreadPool</c> and the process dies with
+    /// <c>CountdownEvent ... below zero</c>.
+    /// </para>
+    /// <para>
+    /// The scheduler lease is therefore taken here, inside the gate, rather than left to each
+    /// caller to remember — which is the follow-up #461 asked for. Every direct forward in the
+    /// server already routes through this method, so the protection is now structural instead of
+    /// a convention: <b>streaming chat and completions always take the direct-generator path</b>,
+    /// so before this they raced the loop on every request that overlapped a batched one.
+    /// </para>
+    /// <para>
+    /// <b>Cost, stated:</b> the lease is held for the whole of <paramref name="work"/>, so a long
+    /// streaming generation stalls in-flight batched requests for its duration. That is the
+    /// correct trade — the two cannot run at once in any case — but it is a real throughput change
+    /// for a mixed workload, not a free fix. Callers that need finer granularity should take the
+    /// lease themselves around the forward only.
+    /// </para>
+    /// <para>
+    /// Lock order is gate-then-lease, matching what the embeddings path already documented. Never
+    /// acquire them the other way round, and never call this from inside a held lease — the
+    /// semaphores are not reentrant.
+    /// </para>
+    /// </remarks>
     public async Task ExecuteAsync(Func<Task> work, CancellationToken ct)
     {
         await _requestGate.WaitAsync(ct);
-        try { await work(); }
+        try
+        {
+            using var lease = Scheduler is { } scheduler
+                ? await scheduler.AcquireModelAsync(ct)
+                : null;
+            await work();
+        }
         finally { _requestGate.Release(); }
     }
 
@@ -248,6 +306,12 @@ public sealed class ServerState : IDisposable
             if (string.IsNullOrEmpty(targetKey) || targetKey == "none")
                 return "No model loaded and no model specified";
 
+            // (#454) A disabled model may not be (re)activated. Checked here rather than only in
+            // the endpoint so the implicit activation driven by a chat request's `model` field is
+            // covered too, not just the explicit POST /v1/models/load path.
+            if (!Catalog.IsEnabled(targetKey))
+                return $"Model is disabled: {targetKey}";
+
             var snapshot = Residency.TryTake(targetKey);
             if (snapshot is not null)
             {
@@ -273,6 +337,16 @@ public sealed class ServerState : IDisposable
                 var resolvedPath = ServerStartup.ResolveModelPath(targetKey, quant: null);
                 if (resolvedPath is null)
                     return $"Model not found: {targetKey}";
+
+                // (#454) Re-check the catalog against the key this load would actually produce.
+                // The check above only saw the raw request string, so a request naming a repo id
+                // or a file path ("org/Repo-GGUF", "C:/models/foo.gguf") would otherwise load a
+                // model whose catalog key ("foo") is disabled. Deliberately before LoadModel, so a
+                // disabled model is never parsed, let alone mapped into memory.
+                var resolvedKey = Path.GetFileNameWithoutExtension(resolvedPath);
+                if (!Catalog.IsEnabled(resolvedKey))
+                    return $"Model is disabled: {resolvedKey}";
+
                 reloadPath = resolvedPath;
                 loadOptions = Options with
                 {
@@ -354,13 +428,81 @@ public sealed class ServerState : IDisposable
     /// until <paramref name="ct"/> is cancelled (host shutdown).</summary>
     public async Task RunIdleSweepLoopAsync(TimeSpan interval, CancellationToken ct)
     {
+        IdleSweepIntervalSeconds = interval.TotalSeconds;
         using var timer = new PeriodicTimer(interval);
         try
         {
             while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+            {
                 await SweepIdleAsync().ConfigureAwait(false);
+
+                // (#454) Re-read the mutable interval each tick so PUT /v1/settings takes effect
+                // without a restart. PeriodicTimer.Period is settable; clamped to a sane floor so
+                // a bad value cannot turn this into a spin loop.
+                var desired = TimeSpan.FromSeconds(Math.Clamp(IdleSweepIntervalSeconds, 0.1, 3600));
+                if (desired != timer.Period) timer.Period = desired;
+            }
         }
         catch (OperationCanceledException) { /* shutdown */ }
+    }
+
+    /// <summary>
+    /// Explicitly unloads resident models (#454) — the HTTP-reachable counterpart of the
+    /// keep-alive sweep. Returns the keys actually unloaded.
+    /// </summary>
+    /// <param name="key">
+    /// Model key to unload. Null/empty means "the active model". Ignored when
+    /// <paramref name="all"/> is true.
+    /// </param>
+    /// <param name="all">When true, unloads the active model and every stashed one.</param>
+    /// <param name="ct">Cancellation for the request-gate wait.</param>
+    /// <remarks>
+    /// Unloading the active model takes the request gate and therefore <b>waits behind an
+    /// in-flight generation</b> rather than interrupting it. It reuses exactly the same
+    /// stop-scheduler-then-dispose sequence as <see cref="SweepIdleAsync"/>, and likewise keeps
+    /// <see cref="Options"/>/<see cref="LoadedModelPath"/> so a later request can lazily reload
+    /// the same model. Stashed models are not in use by any in-flight request, so they are
+    /// disposed without the gate — same as <see cref="ModelResidencyManager.SweepExpired"/>.
+    /// </remarks>
+    public async Task<IReadOnlyList<string>> UnloadAsync(string? key, bool all, CancellationToken ct)
+    {
+        var unloaded = new List<string>();
+
+        if (all)
+        {
+            foreach (var info in Residency.Snapshot(DateTimeOffset.UtcNow))
+            {
+                if (Residency.TryTake(info.Key) is { } snap) { snap.Dispose(); unloaded.Add(info.Key); }
+            }
+        }
+        else if (!string.IsNullOrWhiteSpace(key) && Residency.TryTake(key!) is { } stashed)
+        {
+            stashed.Dispose();
+            unloaded.Add(key!);
+            return unloaded;
+        }
+
+        bool targetsActive = all
+            || string.IsNullOrWhiteSpace(key)
+            || string.Equals(Options.ModelId, key, StringComparison.OrdinalIgnoreCase);
+
+        if (targetsActive && Model is not null)
+        {
+            await _requestGate.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                if (Model is not null)
+                {
+                    await StopSchedulerAsync().ConfigureAwait(false);
+                    DisposeActiveLiveFieldsKeepPathAndOptions();
+                    IsReady = false;
+                    unloaded.Add(Options.ModelId);
+                }
+            }
+            finally { _requestGate.Release(); }
+        }
+
+        return unloaded;
     }
 
     /// <summary>
@@ -596,6 +738,7 @@ public sealed class ServerState : IDisposable
         try { StopSchedulerAsync().GetAwaiter().GetResult(); }
         catch { /* shutdown best-effort */ }
         RateLimitManager?.Dispose();
+        PullManager.Dispose();
         PrefixCache?.Dispose();
         PrefixTrieManager?.Dispose();
         PagedFactory?.Dispose();

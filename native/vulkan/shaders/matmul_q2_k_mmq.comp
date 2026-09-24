@@ -15,7 +15,12 @@
 // oracle (argmax + tolerance). 16×16 tile, weights decoded into shared int8 once/super-block.
 //
 // Q2_K super-block layout (84 bytes / 256; matches matmul_q2_k_mmvq.comp):
-//   [0..15]=scales[16] (low nibble = scale, high = dmCoef)  [16..79]=qs[64] (2-bit, 16/sub)
+//   [0..15]=scales[16] (low nibble = scale, high = dmCoef)
+//   [16..79]=qs[64] — 256 × 2-bit, 4 per byte, TRANSPOSED (issue #498): element t
+//            is at byte 32*(t>>7) + (t&31), shift 2*((t>>5)&3). A sub-block's 16
+//            elements are therefore 16 contiguous bytes at one shared shift — NOT
+//            (as this kernel previously assumed) a single qs uint per sub-block.
+//            Authority: ggml-quants.c dequantize_row_q2_K.
 //   [80,81]=fp16 d  [82,83]=fp16 dmin.
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
@@ -65,12 +70,13 @@ float readHalf(uint absByteOff) {
     return unpackHalf2x16(half16).x;
 }
 
-uint packQ2(uint qw, uint bit0) {
-    uint v0 = (qw >> bit0)        & 3u;
-    uint v1 = (qw >> (bit0 + 2u)) & 3u;
-    uint v2 = (qw >> (bit0 + 4u)) & 3u;
-    uint v3 = (qw >> (bit0 + 6u)) & 3u;
-    return v0 | (v1 << 8u) | (v2 << 16u) | (v3 << 24u);
+// Load the element-order quartet `u` (elements 4u..4u+3 of the super-block) from
+// the transposed Q2_K qs blob, packed as 4 int8 lanes (0..3 each) for dp4a (#498).
+// Element t = 4u+j sits at byte 4*(8*(u>>5) + (u&7)) + j with a j-invariant shift
+// 2*((u>>3)&3), so the quartet is one uint word masked at that shift.
+uint loadQ2Quartet(uint qsUintBase, uint u) {
+    uint w = weight[qsUintBase + 8u * (u >> 5u) + (u & 7u)];
+    return (w >> (((u >> 3u) & 3u) << 1u)) & 0x03030303u;
 }
 
 void main() {
@@ -89,15 +95,12 @@ void main() {
         for (uint s = 0u; s < 4u; s++) {
             uint idx = tid + s * 256u;       // 0..1023
             uint rLocal = idx >> 6u;         // 0..15 weight row
-            uint u      = idx & 63u;         // 0..63 element-order uint
-            uint sub = u >> 2u;              // 0..15 sub-block
-            uint p   = u & 3u;               // 0..3 quartet within sub-block
+            uint u      = idx & 63u;         // 0..63 element-order uint (elements 4u..4u+3)
             uint mGlobal = mBase + rLocal;
             uint packed = 0u;
             if (mGlobal < pc.M) {
                 uint blockByteBase = mGlobal * rowByteStride + kSB * SB_BYTES;
-                uint qw = weight[((blockByteBase + 16u) >> 2u) + sub]; // sub-block's 16 2-bit values
-                packed = packQ2(qw, p * 8u);
+                packed = loadQ2Quartet((blockByteBase + 16u) >> 2u, u);
             }
             sharedWq[rLocal * UINTS_PER_SB + u] = packed;
         }

@@ -35,6 +35,6 @@ public sealed class CudaStream : IDisposable
     {
         nint stream = Interlocked.Exchange(ref _stream, 0);
         if (stream != 0)
-            CudaDriverApi.cuStreamDestroy_v2(stream);
+            CudaTeardownDiagnostics.RecordDestroy("CUstream", CudaDriverApi.cuStreamDestroy_v2(stream));
     }
 }
