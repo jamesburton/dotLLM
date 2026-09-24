@@ -43,8 +43,14 @@ public sealed class Q3KDotIsAtQuantizationFloorTests
     /// <summary>
     /// Error the dot may add beyond the quantization floor, as a fraction of ‖w_row‖·‖x‖.
     /// Observed worst is ~1.6e−8 on both tensors (AVX2), against a quantization floor of
-    /// ~2e−4 — four orders of magnitude below it. The limit leaves ~600× headroom for a different
-    /// SIMD tier while still sitting ~20× below the floor it has to discriminate against.
+    /// ~2e−4 — four orders of magnitude below it.
+    /// <para>
+    /// <b>Measured sensitivity</b> (by scaling the kernel's return value and re-running): the test
+    /// fails at a multiplicative dot error of <b>1e−3</b> and above, and passes at 1e−4 and below.
+    /// That is the right place for the line — the Q8_K floor is ~5.7% of a dot's value, so a 1e−4
+    /// error is ~0.2% of the noise it rides on and cannot affect quality, while anything ≥1e−3
+    /// means the dot has acquired a real error term.
+    /// </para>
     /// </summary>
     private const double MaxDotErrorBeyondFloor = 1e-5;
 
