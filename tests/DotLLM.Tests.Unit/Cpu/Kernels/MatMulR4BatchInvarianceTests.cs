@@ -134,9 +134,11 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
     /// (<c>VecDotQ8_0Avx2_4RowsR4</c>) and its row-major kernel are not bit-identical. Nothing in
     /// the transformer's O / FFN / lm_head path depends on that — both batch-size arms run the R4
     /// kernel — but the fused decode QKV path (<c>FusedDecodeGemv3</c>) reads the ORIGINAL
-    /// row-major weights while prefill QKV runs R4, so for Q8_0 the QKV projections still depend
-    /// on batch size. Fixing that means teaching the fused decode path the repacked layout, which
-    /// is a separate change.
+    /// row-major weights while prefill QKV runs R4, so for Q8_0 the QKV projections can depend on
+    /// batch size wherever both layouts are actually in play. On SmolLM-135M they are not
+    /// (measured 0.0 end-to-end, see ChunkedPrefillLogitsQ8_0Tests), so this is a kernel-level
+    /// finding only. Closing it means teaching the fused decode path the repacked layout — a
+    /// separate change, and that kernel is perf-tuned.
     /// </summary>
     [Fact]
     public void Q8_0_RowMajorVsRepacked_StillDiverges()
