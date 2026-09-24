@@ -614,10 +614,18 @@ public sealed unsafe class TransformerModel : IModel
     }
 
     /// <summary>
-    /// GEMM using R4-interleaved repacked weights. For single-token (n=1) uses interleaved ComputeRows.
-    /// Multi-token (n&gt;1) falls back to original Gemm — outer-product microkernels don't win on AVX2
-    /// due to RyuJIT register pressure (12 YMM accumulators spill with only 16 registers available).
+    /// GEMM using R4-interleaved repacked weights, for every batch size.
     /// </summary>
+    /// <remarks>
+    /// Issue #530: this used to dispatch on batch size — <c>n == 1</c> through the repacked
+    /// <c>ComputeRows*Interleaved</c> kernels, <c>n &gt; 1</c> through <see cref="Gemm"/> over the
+    /// original row-major weights for every non-Q8_0 quant. That made a token's logits depend on
+    /// how many tokens shared its forward pass. Both arms now run the repacked kernels, so a row's
+    /// output is bit-identical regardless of <paramref name="n"/>.
+    /// The multi-token form tiles over 4-row groups (the L2-tiled shape that already won for Q8_0),
+    /// not the outer-product microkernels, which don't win on AVX2 due to RyuJIT register pressure
+    /// (12 YMM accumulators spill with only 16 registers available).
+    /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void GemmInterleaved(nint origWeights, QuantizationType qt, float* b, float* c,
                                  int m, int k, int n, byte* preQuantizedInput,
@@ -640,6 +648,33 @@ public sealed unsafe class TransformerModel : IModel
                 MatMul.GemmR4TiledQ8_0((byte*)rw.Ptr, preQuantizedInput, c,
                     rw.FullGroupCount, rw.TailRows, k / 32, m, n, _threadPool);
                 return;
+            }
+
+            // Every other repackable quant takes the same R4 kernels the n == 1 arm uses, so the
+            // result does not depend on batch size (#530). Self-quantizes when the caller had no
+            // compatible pre-quantized buffer.
+            switch (qt)
+            {
+                case QuantizationType.Q8_0:
+                    MatMul.GemmR4TiledQ8_0((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 32, m, k, n, _threadPool);
+                    return;
+                case QuantizationType.Q5_0:
+                    MatMul.GemmR4TiledQ5_0((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 32, m, k, n, _threadPool);
+                    return;
+                case QuantizationType.Q4_K:
+                    MatMul.GemmR4TiledQ4_K((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 256, m, k, n, _threadPool);
+                    return;
+                case QuantizationType.Q5_K:
+                    MatMul.GemmR4TiledQ5_K((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 256, m, k, n, _threadPool);
+                    return;
+                case QuantizationType.Q6_K:
+                    MatMul.GemmR4TiledQ6_K((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 256, m, k, n, _threadPool);
+                    return;
             }
 
             Gemm(origWeights, qt, b, c, m, k, n, preQuantizedInput);
