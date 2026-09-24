@@ -173,6 +173,15 @@ streams verified identical end to end with `llama-tokenize --ids --no-escape` vs
 
 #515 was opened on a Q3_K figure of **+4.79%** and a Q2_K figure of **−8.26%**.
 
+> **Superseded 2026-09-24 — the "2.9×" below is an amplifier, not a kernel defect.** Measuring
+> the same quantity on a *healthy* model reverses it: on Q8_0, dotLLM's cost of quantizing is
+> **+0.048%** against llama.cpp's **+0.078%** — dotLLM is *better*, 0.62×. And on exact F32 weights
+> the dotLLM-vs-llama.cpp residual tracks how degraded the weights are: **+0.029%** (healthy),
+> **+0.359%** (Q3_K-derived), **+2.319%** (Q2_K-derived, a 94×-degraded model). See
+> [Degraded models amplify](#degraded-models-amplify-a-small-fixed-difference) below. Direct kernel
+> evidence agrees: dotLLM's Q3_K dot is at the Q8_K quantization floor and its Q8_K quantizer has
+> identical reconstruction error to llama.cpp's.
+
 **The finding that survives: dotLLM's Q3_K quantization costs ~2.9× llama.cpp's.** Compare each
 engine against *its own* exact-F32 run of the same weights, which cancels the forward-path
 difference that the F32 row exposes:
@@ -197,6 +206,53 @@ that row is distinguishable from zero, which per-run bars cannot establish. Loca
 **On the error bars.** These are per-run standard errors. The measurements are **paired** — same
 chunks, same ids — so overlapping individual bars do not make a difference insignificant; the
 paired standard error is much smaller. Quote a residual as established only after computing it.
+
+## Degraded models amplify a small fixed difference
+
+**With exact F32 weights in both engines — no quantization anywhere, identical token ids — the
+residual scales with how degraded the weights are.** All three models were built by replacing the
+112 transformer matmul tensors with llama.cpp's own `gguf-py` decode, `token_embd` kept at Q8_0:
+
+| model (exact F32 both sides) | dotLLM | llama.cpp | residual | its own degradation |
+|---|---|---|---|---|
+| Q8_0-derived | 15.1280 | 15.1236 | **+0.029%** | 1.0× |
+| Q3_K-derived | 23.2145 | 23.1314 | **+0.359%** | 1.5× |
+| Q2_K-derived | 1451.3694 | 1418.4704 | **+2.319%** | 93.8× |
+
+A ~79× spread in mean-NLL difference from a fixed pair of implementations doing identical
+arithmetic on identical inputs. The two engines differ by a **small fixed amount** — about 0.03% on
+a healthy model, plausibly accumulation order or intermediate precision — and a degraded model,
+whose predictions are already near-uniform, responds far more sharply to it.
+
+The same reversal shows in the cost of quantizing:
+
+| model | engine | F32 | quantized | cost | ratio |
+|---|---|---|---|---|---|
+| Q8_0 | llama.cpp | 15.1236 | 15.1354 | +0.078% | — |
+| Q8_0 | dotLLM | 15.1280 | 15.1353 | **+0.048%** | **0.62×** |
+| Q3_K | llama.cpp | 23.1314 | 23.2225 | +0.394% | — |
+| Q3_K | dotLLM | 23.2145 | 23.4613 | +1.063% | **2.71×** |
+
+dotLLM quantizes *better* than llama.cpp on the healthy model and "worse" on the degraded one. A
+kernel defect does not behave that way.
+
+### How to measure quality against llama.cpp, then
+
+**The `quant-ladder` "pure" quantizations are the wrong instrument for engine-vs-engine claims.**
+Pure-Q2_K on a 1.2 B model is a destroyed model (PPL ~1400) and pure-Q3_K is well outside what
+anyone ships. Their sensitivity is what makes such a comparison look dramatic and mean nothing.
+
+- Prefer a **shipping-grade** quantization (Q4_K_M, Q5_K_M, Q6_K, Q8_0), where the model still
+  works. A defect big enough to matter will show there.
+- If a degraded quant must be used, **report the F32-decoded control for the same weights**. Only
+  the gap between control and quantized row is attributable to the quant path; the control itself
+  measures the amplifier.
+- **Never read a degraded-model delta as a kernel property without that control.** This is the
+  third time in this investigation that a weight-set-dependent effect was read as a fixed one —
+  first the BOS offset hiding under a healthy control, then the Q3_K "2.9×", then the F32
+  "residual".
+
+Full working: `.docs/measurements/2026-09-24-521-amplification-not-kernel-defects.md`.
 
 ### Superseded: the first corrected baseline (2026-09-24, 64 chunks)
 
