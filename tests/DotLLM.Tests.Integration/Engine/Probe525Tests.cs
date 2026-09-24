@@ -131,6 +131,66 @@ public class Probe525Tests
     /// (single-pass: cache holds 5, positions 3..4 causally masked out for query row 2).
     /// </summary>
     /// <summary>Is the seed in the softmax row sum, or in WeightedValues?</summary>
+    /// <summary>Names the amplifier: does the Q8_0 activation quantization of attnOut flip?</summary>
+    [Fact]
+    public unsafe void Probe_QuantizerAmplifier()
+    {
+        var (model, gguf) = LoadModel();
+        using var _ = gguf;
+        using var __ = model;
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        int[] tokens = tokenizer.Encode("The capital of France is");
+        int[][] Split(params int[] sizes)
+        {
+            var res = new List<int[]>();
+            int p = 0;
+            foreach (int s in sizes) { res.Add(tokens[p..(p + s)]); p += s; }
+            return res.ToArray();
+        }
+        int layer = 21;
+
+        Dictionary<int, byte[]> Run(int[][] chunks)
+        {
+            var caps = new Dictionary<int, byte[]>();
+            using var kv = new SimpleKvCache(model.Config.NumLayers, model.Config.NumKvHeads, model.Config.HeadDim, 64);
+            int pos = 0, chunkStart = 0;
+            model.DebugQuantBytes = (l, label, rows, width, ptr) =>
+            {
+                if (l != layer || ptr == 0) return;
+                int rowBytes = (width / 32) * 34; // Q8_0: 18 blocks x (2-byte scale + 32 int8)
+                for (int r = 0; r < rows; r++)
+                    caps[chunkStart + r] = new Span<byte>((byte*)ptr + (long)r * rowBytes, rowBytes).ToArray();
+            };
+            foreach (var chunk in chunks)
+            {
+                chunkStart = pos;
+                var positions = Enumerable.Range(pos, chunk.Length).ToArray();
+                pos += chunk.Length;
+                using ITensor logits = model.Forward(chunk, positions, -1, kv, null);
+            }
+            model.DebugQuantBytes = null;
+            return caps;
+        }
+
+        var baseline = Run(Split(5));
+        var bad = Run(Split(3, 2));
+        foreach (int p in baseline.Keys.OrderBy(x => x))
+        {
+            if (!bad.ContainsKey(p)) continue;
+            var a = baseline[p]; var b = bad[p];
+            int diffBytes = 0, diffScales = 0, diffQ = 0, maxQ = 0;
+            for (int blk = 0; blk < a.Length / 34; blk++)
+            {
+                int off = blk * 34;
+                if (a[off] != b[off] || a[off + 1] != b[off + 1]) diffScales++;
+                for (int i = 2; i < 34; i++)
+                    if (a[off + i] != b[off + i]) { diffQ++; maxQ = Math.Max(maxQ, Math.Abs((sbyte)a[off + i] - (sbyte)b[off + i])); }
+            }
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) diffBytes++;
+            _out.WriteLine($"  L{layer} preQuantAttn p{p}: bytes differing={diffBytes}, block scales differing={diffScales}/{a.Length / 34}, int8 values differing={diffQ}, max |delta| (int8 steps)={maxQ}");
+        }
+    }
+
     [Fact]
     public void Probe_SoftmaxRowLengthInvariance()
     {

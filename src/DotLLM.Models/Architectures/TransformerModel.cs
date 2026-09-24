@@ -113,6 +113,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     /// <summary>PROBE525 (temporary): (layer, label, rows, cols, ptr).</summary>
     internal Action<int, string, int, int, nint>? DebugTensor { get; set; }
 
+    /// <summary>PROBE525 (temporary).</summary>
+    internal Action<int, string, int, int, nint>? DebugQuantBytes { get; set; }
+
     /// <summary>
     /// Diagnostic hybrid hook (bug-#2 bisection). When set, Gemma-4 layers
     /// selected by <see cref="Gemma4LayerOverrideSelector"/> are computed by this
@@ -1459,6 +1462,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             // f. Batched O projection. The O projection input width is the
             // attention output stride (numHeads * headDimLayer == lw.OInputDim).
             byte* preQuantAttn = QuantizeInput(attnOut, inputQ8Scratch, qStrideLayer, seqLen, lw.OQuantType);
+            DebugQuantBytes?.Invoke(layer, "preQuantAttn", seqLen, qStrideLayer, (nint)preQuantAttn);
             var rwO = rl?.O ?? default;
             GemmInterleaved(lw.OWeight, lw.OQuantType, attnOut, normOut, lw.OOutputDim, lw.OInputDim, seqLen,
                 preQuantAttn, in rwO);
