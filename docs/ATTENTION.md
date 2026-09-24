@@ -51,8 +51,8 @@ is extra vectorized passes over an attention tile sized to stay in L1.
 > magnitude (measured: the same engine delta reads +0.029% / +0.359% / +2.319% on Q8_0- / Q3_K- /
 > Q2_K-derived weights — [PERPLEXITY.md](PERPLEXITY.md#how-to-measure-quality-against-llamacpp-then)).
 > The nearest thing to a shipping-grade row here is the Q8_0 control, and it is **null**. No
-> Q4_K_M / Q5_K_M / Q6_K row was taken, so the cost of the approximation on a shipping quant is
-> unmeasured, not small.
+> Q4_K_M / Q5_K_M / Q6_K row is recorded anywhere, so as far as the record goes the cost of the
+> approximation on a shipping quant is unmeasured, not small.
 >
 > **The decision to default the approximation OFF still stands** — it rests on "no measured
 > throughput benefit", which no amount of amplification touches. What must not be repeated is the

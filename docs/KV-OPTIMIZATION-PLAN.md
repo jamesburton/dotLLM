@@ -333,9 +333,11 @@ type surface unified on `KvGeometry`). Next: Phase 1 (TurboQuant codec).
   > **Audit #527 — the weights are fine, the sample is not.** Llama-3.1-8B **Q4_K_M** is a
   > shipping-grade quant, so this row is *not* a quant-ladder claim and needs no F32 control.
   > What is unsupported is the word **quality-neutral**: the sample is **48 teacher-forced decode
-  > tokens** with no error bar, and +0.05 on a PPL of 3.038 is **+1.7%** — larger than the +0.30%
-  > at which this project *rejected* a CUDA attention kernel as a default (`docs/CUDA.md`, #222).
-  > Either 48 tokens cannot distinguish +1.7% from zero (in which case "neutral" is unmeasured), or
+  > tokens** with no error bar, and +0.05 on a PPL of 3.038 is **+1.7%**. (Not comparable to the
+  > +0.30% at which a CUDA kernel was rejected elsewhere — that is a different weight set, and
+  > dividing deltas across weight sets is exactly what the amplification rule forbids. It is a
+  > precedent about *vocabulary* only: this project has not previously called a move of that order
+  > neutral.) Either 48 tokens cannot distinguish +1.7% from zero (in which case "neutral" is unmeasured), or
   > it can (in which case it is not neutral); the run does not say which, and the test asserts only
   > `top-1 >= 0.80`, not the PPL. Re-measuring on the standard `dotllm perplexity` corpus path
   > would settle it and was deliberately not run here.
