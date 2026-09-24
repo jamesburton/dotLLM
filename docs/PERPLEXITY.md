@@ -23,10 +23,12 @@ agreement observed that way was luck rather than validation.
 Every end-to-end dotLLM-vs-llama.cpp perplexity comparison in which each side tokenized the file
 itself is suspect. Comparisons where dotLLM was fed llama.cpp's exact token ids are not affected.
 
-**Re-measured 2026-09-23 — see [the LF-corpus baseline](#measured-the-lf-corpus-baseline-2026-09-23)
-below.** "Suspect" turned out to mean *wrong in magnitude*, not *wrong in existence*: the Q2_K and
-Q3_K gaps both survive on identical bytes, with the Q8_0 control agreeing to −0.086%. Tracked as
-issue #515. The Bonsai and Nemotron-H claims are still unverified and are tracked as #514.
+**Re-measured 2026-09-23, then again 2026-09-24.** The 2026-09-23 pass concluded the Q2_K and Q3_K
+gaps "survive on identical bytes". They did not: identical bytes are not identical *tokens*, and
+the streams were offset by a BOS — see [the BOS trap](#the-bos-trap-issue-515) and the
+[corrected baseline](#measured-the-corrected-baseline-2026-09-24). Under the aligned protocol the
+Q8_0 control agrees to **−0.0007%** and no row is disjoint. The Bonsai and Nemotron-H claims are
+still unverified and are tracked as #514.
 
 ### Why the reader is not "fixed"
 
@@ -105,11 +107,88 @@ open("llama_tokens.txt", "w").write(" ".join(map(str, ids)))
 dotllm perplexity <model.gguf> --tokens-file llama_tokens.txt --context 512
 ```
 
-Both engines have now provably scored the same ids, so a residual difference is in the scoring
-maths or the kernels and nowhere else. This is the arm that validated the harness to +0.25% against
-llama.cpp on wikitext-2.
+> **`--tokens-file` alone is not enough on an `add_bos_token` model — pass `--bos` as well.**
+> `perplexity.cpp` writes the ids to `kld.bin` *before* the eval loop, and substitutes the
+> per-chunk BOS at eval time. The file therefore carries BOS at **index 0 only**, while
+> llama.cpp evaluated *every* chunk with BOS at position 0. Scoring those ids without `--bos`
+> gives dotLLM no attention sink on any chunk but the first. Measured on Llama-3.2-1B
+> (2026-09-24): on a degraded weight set that single omission moved perplexity from 20.31 to
+> 21.53 — a 6% phantom "divergence". Check it rather than trusting it: if the file matched
+> what llama.cpp evaluated, **every** chunk would start with the BOS id; on an add-BOS model
+> only chunk 0 does.
 
-## Measured: the LF-corpus baseline (2026-09-23)
+```bash
+dotllm perplexity <model.gguf> --tokens-file llama_tokens.txt --context 512 --bos
+```
+
+With the ids shared **and** `--bos` set, both engines have provably scored the same tokens, so a
+residual difference is in the scoring maths or the kernels and nowhere else. This is the arm that
+validated the harness to **−0.0007%** against llama.cpp on wikitext-2 (Q8_0, 64 chunks: 15.1353 vs
+15.1354). An earlier "+0.25%" figure for this arm predates the `--bos` correction.
+
+## The BOS trap (issue #515)
+
+> The LF-corpus baseline below is **superseded**. It is kept because the way it failed is the
+> point, and because the numbers were cited elsewhere.
+
+`llama-perplexity` prepends **BOS (128000)** to the whole token stream before chunking it on a
+Llama-3.2 model. dotLLM's `--corpus` path did not. (Note it is **not** driven by a
+`tokenizer.ggml.add_bos_token` key — these GGUFs carry no such key, verified with gguf-py; the
+default comes from the tokenizer/pre-type. See #516.) Measured 2026-09-24 by
+diffing dotLLM `--dump-tokens` against the ids in llama.cpp's `--kl-divergence-base`:
+
+```
+llama  first 12: [128000, 198, 284, 8563, 426, 11206, 466, 284, 15073, 8563, 426, 11206]
+dotllm first 12: [        198, 284, 8563, 426, 11206, 466, 284, 15073, 8563, 426, 11206, 466]
+4043 of 4096 ids differ;  shift-by-one matches: 4095/4095
+```
+
+One token of offset, propagated through every chunk boundary: **chunk N of the two engines
+covers different text.** This is the CRLF trap one layer further in — same failure mode, same
+consequence, and it survived the LF fixture that was built to end it.
+
+`--bos` does **not** repair a `--corpus` run. It substitutes BOS at each *window* start without
+prepending BOS to the stream, so the content stays shifted; it recovers part of the gap, which is
+precisely what makes it look like a fix.
+
+**What the offset cost.** Its effect is *weight-set dependent* — which is why the control missed
+it. On Llama-3.2-1B the same offset was worth **0.086% on Q8_0 against 4.8% on Q3_K** at 564 chunks,
+and **0.5% against 4.0%** at 64 chunks (Q8_0 15.0595 unaligned → 15.1353 aligned). **A healthy control agreeing therefore does not license reading a degraded row as a
+property of that quant's path.** That inference, made explicitly below, is wrong in principle.
+
+### Measured: the corrected baseline (2026-09-24)
+
+Both engines scoring **identical ids with BOS at every window start** — dotLLM fed the ids from a
+`--chunks 64 --kl-divergence-base` run via `--tokens-file … --bos`. 64 chunks, 16,320 scored
+tokens. Full working: `.docs/measurements/2026-09-24-515-q3k-investigation.md`.
+
+| quant | dotLLM | llama.cpp | delta | bars |
+|---|---|---|---|---|
+| **Q8_0** (control) | 15.1353 ± 0.33711 | 15.1354 ± 0.33582 | **−0.0007%** | overlap |
+| Q2_K | 1446.4130 ± 46.14533 | 1409.1593 ± 44.81472 | +2.64% | overlap |
+| Q3_K | 23.4613 ± 0.54245 | 23.2225 ± 0.53566 | +1.03% | overlap |
+| Q3_K decoded to F32 | 23.2145 ± 0.53639 | 23.1314 ± 0.53336 | +0.36% | overlap |
+
+**Nothing is disjoint any more.** Every row has the same sign — dotLLM marginally higher — and
+every row's bars overlap. The Q3_K gap went from +4.79% to +1.03%; **the Q2_K gap changed sign**,
+from −8.26% to +2.64%. The "opposite signs" that #515 was opened to explain were an artifact of
+the offset; there were never two signs to reconcile.
+
+The fourth row is the strongest single result: all 112 Q3_K tensors replaced by their **exact F32
+decode** (produced by llama.cpp's own `gguf-py`, not by dotLLM), so no quantization is involved in
+any matmul — and the residual is +0.36%. Whatever is left is not the quantized path.
+
+**What was ruled out along the way**, each by measurement rather than inspection:
+
+| hypothesis | verdict |
+|---|---|
+| dotLLM dequantized where llama.cpp used its packed `× q8_K` dot (#515's first check) | **refuted** — forcing either path moves Q3_K by 0.16% |
+| dotLLM's Q3_K block decode is wrong | **refuted** — bit-exact vs `gguf-py` on 21M elements |
+| Q8_K activation quantization explains the 4% gap | **refuted** — the dequant arm bypasses it entirely and moves Q3_K by 0.16%. It remains the natural candidate for the ≲0.7% *residual*: dotLLM's packed−F32 gap is +1.06% (23.4613 → 23.2145) against llama.cpp's +0.39% (23.2225 → 23.1314) |
+| FP reduction order / thread partitioning | **refuted** — both engines reproduce to 4 dp across thread counts |
+| KV-cache precision, flash attention | **refuted** — `-ctk f32 -ctv f32 -fa off` moves llama.cpp by 0.03% |
+
+### Superseded: the LF-corpus baseline (2026-09-23)
 
 The first end-to-end comparison taken **after** #506, with both engines reading the same LF bytes.
 Llama-3.2-1B "pure" quantizations (every tensor at the named format) from
@@ -124,16 +203,30 @@ agreeing. 564 chunks, 143,820 scored tokens each. Raw logs:
 | Q2_K | 1342.0853 ± 14.52088 | 1462.8547 ± 15.76961 | **−8.26%** | **disjoint** |
 | Q3_K | 22.1764 ± 0.17231 | 21.1623 ± 0.16364 | **+4.79%** | **disjoint** |
 
+> **Every delta in the table above is invalid** — the two engines' chunks covered different
+> text (see *The BOS trap*). The paragraphs that follow are kept as written, because the
+> reasoning error in them is instructive, but **none of their conclusions hold.**
+
 **Read the Q8_0 row first.** It is the control, and at −0.086% the two engines agree far inside
 their error bars. That is what makes the other two rows interpretable: the harness, the chunk
 geometry, the tokenizer and the corpus are all common to the three runs, so a disjoint delta at
 Q2_K or Q3_K is a property of *that quant's path*, not of the measurement. Before #506 no such
 statement was possible, because each engine was tokenizing different text.
 
+> **This is the sentence that failed.** The control *was* common to the three runs, and it *did*
+> agree — but the defect it was meant to catch scales with how degraded the weights are, so it
+> hid under Q8_0 and dominated Q2_K/Q3_K. A control only licenses reading the other rows if it
+> is sensitive to the errors you are worried about; this one was not, and nothing in the
+> agreement itself said so.
+
 **The pre-#506 claims were right about the sign and wrong about the size.** Q2_K was recorded as
 −2.9% and is −8.26%; #501's Q3_K was recorded as +8.9% and is +4.79%. Neither gap was a CRLF
 artifact — both survive on identical bytes — so the underlying divergences are real and remain
 open (issue #515).
+
+> Wrong on both counts. Under the aligned protocol Q2_K is **+2.64%**, not −8.26% — the sign
+> flipped — and Q3_K is **+1.03%**, not +4.79%. The gaps did not "survive on identical bytes":
+> identical *bytes* were never the requirement, identical *tokens* were.
 
 **Caveat on the Q2_K row.** Pure-Q2_K on a 1.2 B model is a destroyed model: perplexity 1342
 against a 13.90 Q8_0 baseline, ~97× worse. In that regime perplexity is hypersensitive to small
@@ -148,6 +241,12 @@ dotLLM's run dequantized to F32 where llama.cpp used its packed `× q8_K` dot, o
 produce both signs (quantized activations cost most where the weights are already coarsest). That
 is #515's first check, and it must be settled before anyone reads this table as two separate
 kernel bugs.
+
+> #515's first check was run on 2026-09-24 and is **negative**: forcing either path changes Q3_K
+> by 0.16%, because `TransformerModel.Gemm` already dispatches the packed `× q8_K` dot at prefill
+> exactly as llama.cpp does. The signs were never opposite — Q2_K's sign was an artifact. Note
+> what this paragraph did: it reasoned at length about which mechanism could explain a pattern,
+> without first checking that the pattern was real.
 
 **On the raw log's `n_ctx`.** llama.cpp reports `n_ctx = 2048, n_ctx_seq = 512, n_seq = 4` — it
 batches four sequences of the requested 512. The per-chunk context is 512 on both sides, and both
