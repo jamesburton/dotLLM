@@ -296,6 +296,64 @@ public sealed class ModelPullHubCacheTests : IDisposable
         Assert.True(progressTicks > 0);
     }
 
+    /// <summary>
+    /// A progress tick dispatched after the job has finished must not roll its state backwards (#521).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="Progress{T}"/> constructed off a synchronization context posts each callback to the
+    /// thread pool, so a tick reported in the final moments of a download can run <b>after</b> the
+    /// completion block that stamps the exact size. That ordering made
+    /// <see cref="PullManager_RunsJobToCompletion_AndReportsProgress"/> fail in CI with
+    /// <c>Expected: 4096, Actual: 3856</c> while <c>Status</c> was already <c>completed</c> —
+    /// a served <c>completed</c> job whose <c>percent</c> is under 100.
+    /// </para>
+    /// <para>
+    /// That race is not reproducible on demand, so this case applies the late tick directly and
+    /// deterministically. It fails against a build whose progress path writes unconditionally,
+    /// which is what shipped.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task PullManager_LateProgressTick_DoesNotRollBackCompletedState()
+    {
+        var payload = MakePayload(4096);
+        using var stub = new StubHub(payload);
+        using var manager = new ModelPullManager(
+            () => new HuggingFaceDownloader(cdnBase: stub.BaseUrl), CacheRoot, ModelsDir);
+
+        var job = manager.Start(RepoId, Filename, revision: null);
+        await job.WaitAsync();
+        Assert.Equal("completed", job.ToDto().Status);
+
+        // Exactly the ordering CI hit: a mid-download tick delivered after completion.
+        job.ApplyProgress(payload.Length - 240, payload.Length);
+
+        var dto = job.ToDto();
+        Assert.Equal("completed", dto.Status);
+        Assert.Equal(payload.Length, dto.BytesDownloaded);
+        Assert.Equal(100d, dto.Percent);
+    }
+
+    /// <summary>A late tick must not resurrect a cancelled job's counters either (#521).</summary>
+    [Fact]
+    public async Task PullManager_LateProgressTick_DoesNotMutateCancelledJob()
+    {
+        using var stub = new StubHub(MakePayload(1 << 20), throttleChunk: 16 * 1024, throttleDelayMs: 25);
+        using var manager = new ModelPullManager(
+            () => new HuggingFaceDownloader(cdnBase: stub.BaseUrl), CacheRoot, ModelsDir);
+
+        var job = manager.Start(RepoId, Filename, revision: null);
+        job.Cancel();
+        await job.WaitAsync();
+        Assert.Equal("cancelled", job.ToDto().Status);
+
+        long bytesAtCancel = job.ToDto().BytesDownloaded;
+        job.ApplyProgress(bytesAtCancel + 4096, bytesAtCancel + 8192);
+
+        Assert.Equal(bytesAtCancel, job.ToDto().BytesDownloaded);
+    }
+
     /// <summary>Two POSTs for the same file must not race two writers against one <c>.incomplete</c>.</summary>
     [Fact]
     public void PullManager_DeduplicatesConcurrentJobsForTheSameTarget()
