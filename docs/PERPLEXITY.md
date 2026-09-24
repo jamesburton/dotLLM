@@ -189,8 +189,9 @@ it was never ruled out, only exonerated as the cause of the spurious 4% gap.
 
 **A separate, smaller residual: +0.681% on exact F32 weights**, i.e. with no quantization anywhere
 and identical tokens. Ruled out for it: RoPE scaling (this GGUF has no `rope_scaling` keys at all),
-KV-cache precision and flash attention (0.03%). Note the Q8_0 control has the *opposite* sign
-(dotLLM better by 0.110%), so this is not one shared precision difference; localise with
+KV-cache precision and flash attention (0.03%). The Q8_0 control has the *opposite* sign (dotLLM
+better by 0.110%), which would argue against a single shared precision difference — but only if
+that row is distinguishable from zero, which per-run bars cannot establish. Localise with
 `--per-window` before chasing it.
 
 **On the error bars.** These are per-run standard errors. The measurements are **paired** — same
