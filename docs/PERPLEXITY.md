@@ -113,8 +113,9 @@ dotllm perplexity <model.gguf> --tokens-file llama_tokens.txt --context 512
 > llama.cpp evaluated *every* chunk with BOS at position 0. Scoring those ids without `--bos`
 > gives dotLLM no attention sink on any chunk but the first. Measured on Llama-3.2-1B
 > (2026-09-24): on a degraded weight set that single omission moved perplexity from 20.31 to
-> 21.53 — a 6% phantom "divergence". Check it rather than trusting it: the first id of each
-> chunk in `kld.bin` should be the BOS id, and on an `add_bos_token` model it will not be.
+> 21.53 — a 6% phantom "divergence". Check it rather than trusting it: if the file matched
+> what llama.cpp evaluated, **every** chunk would start with the BOS id; on an add-BOS model
+> only chunk 0 does.
 
 ```bash
 dotllm perplexity <model.gguf> --tokens-file llama_tokens.txt --context 512 --bos
@@ -130,8 +131,10 @@ validated the harness to **−0.0007%** against llama.cpp on wikitext-2 (Q8_0, 6
 > The LF-corpus baseline below is **superseded**. It is kept because the way it failed is the
 > point, and because the numbers were cited elsewhere.
 
-Llama-3.2 sets `add_bos_token`, so `llama-perplexity` prepends **BOS (128000)** to the whole
-token stream before chunking it. dotLLM's `--corpus` path did not. Measured 2026-09-24 by
+`llama-perplexity` prepends **BOS (128000)** to the whole token stream before chunking it on a
+Llama-3.2 model. dotLLM's `--corpus` path did not. (Note it is **not** driven by a
+`tokenizer.ggml.add_bos_token` key — these GGUFs carry no such key, verified with gguf-py; the
+default comes from the tokenizer/pre-type. See #516.) Measured 2026-09-24 by
 diffing dotLLM `--dump-tokens` against the ids in llama.cpp's `--kl-divergence-base`:
 
 ```
@@ -149,8 +152,8 @@ prepending BOS to the stream, so the content stays shifted; it recovers part of 
 precisely what makes it look like a fix.
 
 **What the offset cost.** Its effect is *weight-set dependent* — which is why the control missed
-it. On Llama-3.2-1B, 64 chunks, the same offset was worth ~0.1% on Q8_0 and ~4% on a degraded
-Q3_K model. **A healthy control agreeing therefore does not license reading a degraded row as a
+it. On Llama-3.2-1B the same offset was worth **0.086% on Q8_0 against 4.8% on Q3_K** at 564 chunks,
+and **0.5% against 4.0%** at 64 chunks (Q8_0 15.0595 unaligned → 15.1353 aligned). **A healthy control agreeing therefore does not license reading a degraded row as a
 property of that quant's path.** That inference, made explicitly below, is wrong in principle.
 
 ### Measured: the corrected baseline (2026-09-24)
@@ -181,7 +184,7 @@ any matmul — and the residual is +0.36%. Whatever is left is not the quantized
 |---|---|
 | dotLLM dequantized where llama.cpp used its packed `× q8_K` dot (#515's first check) | **refuted** — forcing either path moves Q3_K by 0.16% |
 | dotLLM's Q3_K block decode is wrong | **refuted** — bit-exact vs `gguf-py` on 21M elements |
-| Q8_K activation quantization | **refuted** — the dequant arm bypasses it entirely |
+| Q8_K activation quantization explains the 4% gap | **refuted** — the dequant arm bypasses it entirely and moves Q3_K by 0.16%. It remains the natural candidate for the ≲0.7% *residual*: dotLLM's packed−F32 gap is +1.06% (23.4613 → 23.2145) against llama.cpp's +0.39% (23.2225 → 23.1314) |
 | FP reduction order / thread partitioning | **refuted** — both engines reproduce to 4 dp across thread counts |
 | KV-cache precision, flash attention | **refuted** — `-ctk f32 -ctv f32 -fa off` moves llama.cpp by 0.03% |
 
