@@ -96,12 +96,28 @@ worker, sliding window, soft-cap, ALiBi and sinks) and `ChunkedPrefillInvariance
 sampled tokens — argmax insensitivity is what hid this — swept over prompt length × chunk size on
 Q8_0 with an F32-decoded sensitivity control).
 
-Skipping the padding is also strictly less work: causal prefill now scores a triangle rather than a
-square.
+Reduction order was not the whole mechanism. `FastMath.ExpSumAndStore` clamps its shifted input at
+`MinClamp = -87.3` in **both** the precise and the approximate exp paths, so a masked `-inf` entry
+did not become exactly `0` — it became `exp(-87.3) ≈ 1.3e-38`. Every padding column therefore added
+a term to the softmax denominator, and the number of those terms was the KV-cache length. It also
+makes the `w == 0f` short-circuit comment in `WeightedValues` ("exp(-inf) is exactly 0f") wrong on
+the padded path. The visible-prefix form removes both: invisible keys are never scored, so nothing
+is clamped and nothing is accumulated.
+
+The work saved is confined to the dense path: prompts short enough to take it (`seqQ * seqKv * 4 <=
+8192`, so ≈45 tokens single-pass, or any chunk of a chunked prefill) now score a triangle instead of
+a square. The tiled path already walked only the visible range, so long-prompt prefill and decode
+are neutral. Treat the change as correctness-motivated, not a perf win.
 
 > The `#501` fast-exp figures above were measured against the padded reduction. They compare
 > fast-exp on vs off, and both arms shifted by the same ULPs, so the comparison stands; the absolute
-> attention outputs on either arm have changed by ~1e-7.
+> attention outputs on either arm have changed by ~1e-7. A re-measurement (#531) will run against
+> the new reduction.
+
+Decode numerics are unchanged **without** a sliding window: a decode row's visible length equals the
+declared `seqKv`, and the one-shot threshold is the same 8 KiB budget in floats. With a sliding
+window, decode previously softmaxed over `seqKv` with the out-of-window entries masked and now
+softmaxes over `window` entries — a genuine (ULP-scale) change on Gemma-2/3 and Mistral-style models.
 
 ### Sliding Window
 
