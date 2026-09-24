@@ -107,6 +107,12 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     /// <summary>Debug: limit the number of transformer layers processed. 0 = all layers (default). -1 = skip all layers (embedding + LM head only).</summary>
     internal int DebugMaxLayers { get; set; }
 
+    /// <summary>PROBE525 (temporary): (layer, seqLen, hiddenPtr) after each transformer layer.</summary>
+    internal Action<int, int, nint>? DebugLayerHidden { get; set; }
+
+    /// <summary>PROBE525 (temporary): (layer, label, rows, cols, ptr).</summary>
+    internal Action<int, string, int, int, nint>? DebugTensor { get; set; }
+
     /// <summary>
     /// Diagnostic hybrid hook (bug-#2 bisection). When set, Gemma-4 layers
     /// selected by <see cref="Gemma4LayerOverrideSelector"/> are computed by this
@@ -1357,6 +1363,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             if (lw.KNormWeight is not null)
                 ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeadsLayer, headDimLayer, seqLen, eps);
 
+            DebugTensor?.Invoke(layer, "qkv.preRoPE.q", seqLen, qStrideLayer, (nint)q);
+            DebugTensor?.Invoke(layer, "qkv.preRoPE.k", seqLen, kvStrideLayer, (nint)k);
+            DebugTensor?.Invoke(layer, "qkv.preRoPE.v", seqLen, kvStrideLayer, (nint)v);
             // d. RoPE (in-place on Q and K for all tokens). SmolLM3 marks
             // selected layers as NoPE (skip RoPE entirely) via
             // ModelConfig.NoRopeLayers — the attention math runs unmodified on
@@ -1374,6 +1383,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                     ropeCos, ropeSin, ropeTypeLayer);
             }
 
+            DebugTensor?.Invoke(layer, "rope.q", seqLen, qStrideLayer, (nint)q);
+            DebugTensor?.Invoke(layer, "rope.k", seqLen, kvStrideLayer, (nint)k);
             // e. Attention — with or without KV-cache
             // Gemma 3 family extras (no-op on every other architecture):
             //  - PerLayerSlidingWindow[layer]: per-layer sliding-window override
@@ -1444,6 +1455,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 }
             }
 
+            DebugTensor?.Invoke(layer, "attnOut", seqLen, qStrideLayer, (nint)attnOut);
             // f. Batched O projection. The O projection input width is the
             // attention output stride (numHeads * headDimLayer == lw.OInputDim).
             byte* preQuantAttn = QuantizeInput(attnOut, inputQ8Scratch, qStrideLayer, seqLen, lw.OQuantType);
@@ -1473,6 +1485,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                         new Span<float>(normOut + t * hiddenSize, hiddenSize));
             }
 
+            DebugTensor?.Invoke(layer, "oProj", seqLen, hiddenSize, (nint)normOut);
             // g. Residual add (per token)
             for (int t = 0; t < seqLen; t++)
             {
@@ -1689,6 +1702,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                                preQ_up, lw.UpQuantType);
             }
 
+            DebugTensor?.Invoke(layer, "ffn.gate", seqLen, intermediateSize, (nint)ffnGate);
+            DebugTensor?.Invoke(layer, "ffn.up", seqLen, intermediateSize, (nint)ffnUp);
             // Fused gate activation: GeGLU (tanh-approx GELU) for Gemma (GELUTanh),
             // ReLU² for BitNet (ReluSquared), otherwise SwiGLU (SiLU). Single tiled
             // pass per token; all kernels are shape-identical (down(act(gate) * up)).
@@ -1721,6 +1736,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 }
             }
 
+            DebugTensor?.Invoke(layer, "ffn.act", seqLen, intermediateSize, (nint)siluOut);
             // Pre-quantize siluOutput for Down projection (different input dim = intermediateSize)
             byte* preQuantSilu = QuantizeInput(siluOut, inputQ8Scratch, intermediateSize, seqLen, lw.DownQuantType);
 
@@ -1741,6 +1757,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                                preQuantSilu, lw.DownQuantType);
             }
 
+            DebugTensor?.Invoke(layer, "ffn.down", seqLen, hiddenSize, (nint)normOut);
             // j0. Gemma post-FFN RMSNorm — applied to the FFN sublayer output
             // (normOut) BEFORE the residual add (four-norm layout). No-op for
             // non-Gemma (PostFfnNormWeight is null).
@@ -1761,6 +1778,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                     new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
                     new Span<float>(hidden + t * hiddenSize, hiddenSize));
             }
+
+            // PROBE525 (temporary): capture the float hidden state after each layer.
+            DebugLayerHidden?.Invoke(layer, seqLen, (nint)hidden);
 
             // l. Per-Layer Embeddings (PLE) injection — Gemma-4 dense text tower.
             // Gated residual added to the layer output using this layer's slice of the
