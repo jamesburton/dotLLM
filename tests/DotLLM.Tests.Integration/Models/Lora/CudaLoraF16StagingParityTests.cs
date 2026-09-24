@@ -20,6 +20,7 @@ namespace DotLLM.Tests.Integration.Models.Lora;
 /// Plain [Fact], env-gated on a cached GGUF + CUDA availability; no-op when
 /// absent. Mirrors <see cref="BitNetCudaLoraParityTests"/>.
 /// </remarks>
+[Collection(GpuCollection.Name)]
 public sealed class CudaLoraF16StagingParityTests
 {
     private readonly ITestOutputHelper _output;

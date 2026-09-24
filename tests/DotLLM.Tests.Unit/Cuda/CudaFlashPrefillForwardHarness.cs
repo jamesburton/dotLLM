@@ -43,6 +43,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaFlashPrefillForwardHarness
 {
     private const float AbsTol = 5e-3f;

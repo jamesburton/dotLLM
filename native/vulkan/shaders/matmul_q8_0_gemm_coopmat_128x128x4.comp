@@ -1,0 +1,109 @@
+#version 450
+// Q8_0 batched GEMM on the shared 128x128 blocked coopmat template (issue #443).
+//
+//   C[N, M] = B[N, K] @ W_q8_0[M, K]^T,  W dequantised on the fly.
+//
+// Functional parity with matmul_q8_0_gemm_coopmat.comp (16x16, one subgroup) and the scalar
+// matmul_q8_0_gemm.comp. Weight layout unchanged: 34-byte blocks of 32 elements — an fp16
+// scale `d` then 32 int8 codes — row stride pc.blocksPerRow * 34 bytes.
+//
+// LAYOUT CHECK, read off the UNPACK LOOP and not a header: Q8_0's 32 codes are one byte each
+// and CONSECUTIVE within the block, so a BK=32 K-chunk is exactly one whole block and needs no
+// slicing of any kind. (That is a different fact from I2_S, which shares this shader family and
+// a 2-bit code width but stores element {gp, gp+32, gp+64, gp+96} in byte gp — genuinely
+// strided — and from PQ2_0, whose byte gp holds the four CONSECUTIVE elements {4gp..4gp+3}.
+// The three formats differ in exactly this and a stale header already misled two documents.)
+//
+// So BK=32 here is not a change at all: the legacy 16x16 kernel already stepped K one Q8_0
+// block at a time. The ONLY difference this file introduces is the output tile, hence the
+// M*K*N/BN staging-redundancy term, and the per-output reduction order is bit-for-bit the same
+// sequence of two TK=16 coopMatMulAdd per block into one F32 accumulator. Parity is therefore
+// held at the EXISTING coopmat tolerance (abs 5e-3 / rel 5e-3), not a widened one.
+//
+// PRECISION (unchanged from the 16x16 kernel): the per-block scale is folded into the F16 A
+// operand as d*q, so A carries ~2^-11 relative error. That is inherent to Q8_0 + F16 operands,
+// not to the tile.
+
+#define BM  128
+#define BN  128
+#define WM  64
+#define WN  64
+#define NSG 4
+#define WAVE 64
+
+#extension GL_GOOGLE_include_directive : require
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; }; // Q8_0 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; };      // [N*K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };      // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim (number of weight rows)
+    uint K;             // contraction dim (must be a multiple of 32)
+    uint N;             // batch size (number of input rows)
+    uint blocksPerRow;  // = K / 32
+    uint rowUints;      // per-row uint stride
+} pc;
+
+#include "gemm_coopmat_blocked_decl.glsl"
+
+const uint BLOCK_BYTES = 34u;   // 2 (fp16 scale) + 32 (int8 codes)
+
+// A-staging geometry: BK == one Q8_0 block, so one chunk of A is BM blocks.
+const uint A_LANES_PER_ROW = BLOCK_SIZE / BM;        // threads cooperating on one weight row
+const uint A_COLS_PER_THR  = BK / A_LANES_PER_ROW;   // codes per thread
+
+int readQsByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    int bv = int((u >> shift) & 0xFFu);
+    return (bv ^ 0x80) - 0x80;
+}
+
+// Little-endian fp16 at an arbitrary byte offset. 34-byte blocks straddle uint-word boundaries
+// after the first, so this cannot assume alignment.
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+void gemmStageA(uint ch) {
+    uint rowLocal  = g_tid / A_LANES_PER_ROW;
+    uint laneOfRow = g_tid % A_LANES_PER_ROW;
+    uint mGlobal   = g_mBase + rowLocal;
+    uint sBase     = rowLocal * STRIDE;
+    uint col0      = laneOfRow * A_COLS_PER_THR;
+
+    bool rowValid = mGlobal < pc.M;
+    float d = 0.0;
+    uint blockBase = 0u;
+    if (rowValid) {
+        blockBase = mGlobal * (pc.blocksPerRow * BLOCK_BYTES) + ch * BLOCK_BYTES;
+        d = readHalf(blockBase);
+    }
+
+    for (uint j = 0u; j < A_COLS_PER_THR; j++) {
+        uint col = col0 + j;
+        float q = rowValid ? (d * float(readQsByte(blockBase + 2u + col))) : 0.0;
+        sharedA[sBase + col] = float16_t(q);
+    }
+}
+
+#define GEMM_M          pc.M
+#define GEMM_K          pc.K
+#define GEMM_CHUNKS     pc.blocksPerRow
+#define GEMM_ROW_BASE   0u
+#define GEMM_ROW_LIMIT  pc.N
+#define GEMM_B_BUF      b
+#define GEMM_C_BUF      c
+
+#include "gemm_coopmat_blocked_main.glsl"

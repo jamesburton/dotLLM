@@ -24,6 +24,7 @@ namespace DotLLM.Tests.Integration.Backends;
 /// argmax over the canvas region (the signal the unmask sampler consumes) must agree exactly.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class Gemma4DiffusionVulkanTests
 {
     private readonly ITestOutputHelper _out;

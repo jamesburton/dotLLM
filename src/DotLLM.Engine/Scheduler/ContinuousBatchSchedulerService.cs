@@ -32,6 +32,13 @@ public sealed class ContinuousBatchSchedulerService : IScheduler, IDisposable
 {
     private readonly ContinuousBatchScheduler _inner;
     private readonly SemaphoreSlim _wakeup = new(initialCount: 0, maxCount: int.MaxValue);
+
+    /// <summary>
+    /// Guards exclusive use of the shared model between the run loop's <c>Step</c> calls and any
+    /// out-of-band forward pass a host needs to take on the same model — see
+    /// <see cref="AcquireModelAsync"/>.
+    /// </summary>
+    private readonly SemaphoreSlim _modelLock = new(1, 1);
     private readonly KvBlockPool? _pagedPool;
     private readonly bool _ownsTelemetryProviders;
     private bool _disposed;
@@ -119,7 +126,22 @@ public sealed class ContinuousBatchSchedulerService : IScheduler, IDisposable
                 // Drain pending work in a tight loop; yield only when idle.
                 while (!cancellationToken.IsCancellationRequested && !_inner.IsIdle)
                 {
-                    bool didWork = _inner.Step();
+                    // One step == one forward pass over the shared model. Held under the model
+                    // lock so an out-of-band forward (e.g. the embeddings endpoint, #451) can
+                    // interleave BETWEEN steps instead of racing one: the model's scratch
+                    // buffers are shared mutable state. Uncontended this is a completed-task
+                    // await, negligible against a forward pass.
+                    bool didWork;
+                    await _modelLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        didWork = _inner.Step();
+                    }
+                    finally
+                    {
+                        _modelLock.Release();
+                    }
+
                     if (!didWork)
                     {
                         // Defensive yield — Step returning false on a non-idle scheduler shouldn't
@@ -155,5 +177,35 @@ public sealed class ContinuousBatchSchedulerService : IScheduler, IDisposable
         }
         _inner.Dispose();
         _wakeup.Dispose();
+        _modelLock.Dispose();
+    }
+
+    /// <summary>
+    /// Takes exclusive use of the scheduled model until the returned handle is disposed. The run
+    /// loop finishes the step it is on, then blocks before starting the next one.
+    /// </summary>
+    /// <remarks>
+    /// <para>The scheduler drives forward passes on the model from its own background loop,
+    /// deliberately outside any host-level request gate — batching is the whole point. A host that
+    /// needs a forward pass of its own on the same model (the embeddings endpoint, issue #451)
+    /// therefore cannot rely on that gate: the model's scratch buffers are shared mutable state
+    /// and both results would be silently corrupt. This is the handshake for it.</para>
+    /// <para>Hold it for as short a time as possible: in-flight generations stall meanwhile.</para>
+    /// </remarks>
+    public async Task<IDisposable> AcquireModelAsync(CancellationToken cancellationToken = default)
+    {
+        await _modelLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return new ModelLease(_modelLock);
+    }
+
+    private sealed class ModelLease(SemaphoreSlim semaphore) : IDisposable
+    {
+        private SemaphoreSlim? _semaphore = semaphore;
+
+        public void Dispose()
+        {
+            var s = Interlocked.Exchange(ref _semaphore, null);
+            s?.Release();
+        }
     }
 }

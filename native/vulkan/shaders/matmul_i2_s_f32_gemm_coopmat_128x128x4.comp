@@ -1,0 +1,117 @@
+#version 450
+// I2_S (BitNet b1.58 ternary) batched GEMM on the shared 128x128 blocked coopmat template
+// (issue #443).
+//
+//   C[N, M] = scale * ( B[N, K] @ W_i2s[M, K]^T )
+//
+// Functional parity with matmul_i2_s_f32_gemm.comp (scalar) and matmul_i2_s_f32_gemm_rb.comp
+// (register-blocked F32 — the PRODUCTION kernel and the bar this must clear; the existing 16x16
+// I2_S coopmat variants never beat it, which is why I2SGemmVariant.Production is RegisterBlocked).
+//
+// ----------------------------------------------------------------------------------
+// LAYOUT, read off matmul_i2_s_f32_gemm_rb.comp's UNPACK LOOP and not off a header.
+//
+// I2_S GENUINELY IS STRIDED, unlike PQ2_0. One 128-element block is 32 bytes; byte `gp`
+// (0..31) packs the four ternary codes for elements {gp, gp+32, gp+64, gp+96} at DESCENDING
+// bit offsets {6, 4, 2, 0}; value = code - 1. Row stride = K/4 bytes. One per-tensor float32
+// scale for the whole matrix lives at byte offset M*(K/4).
+//
+// PQ2_0's byte `gp` instead holds the four CONSECUTIVE elements {4gp, +1, +2, +3} at ASCENDING
+// offsets. The two formats share this shader family and a code-byte width and differ in exactly
+// this; a stale PQ2_0 header claiming the strided form misled two documents before it was caught
+// (679b29ac). Do not carry an assumption across.
+//
+// CONSEQUENCE FOR BK=32: a 32-element K-slice `s` of a block is element {gp + 32s : gp=0..31},
+// i.e. ALL 32 code bytes read with the single bit field (6 - 2s). So this is the one
+// instantiation where BK=32 does need the bit-slice the campaign document described — and where
+// each code byte is fetched FOUR times across a block instead of once. That costs 4 KB of extra
+// A-side VMEM per chunk against 16 KB of B staging, and it is bounded and L2-friendly, whereas
+// keeping BK=128 would need 64 KB of LDS against a 32 KB device limit and the pipeline would
+// not create at all.
+// ----------------------------------------------------------------------------------
+//
+// PRECISION: the A operand stages RAW ternary {-1, 0, +1}, all exact in F16, and the single
+// per-tensor scale is applied to the F32 accumulator AFTER the K loop (the template's
+// GEMM_EPILOGUE_SCALE hook). So the weight side contributes NO rounding error; all F16 error is
+// the activation cast, ~2^-11 relative per element accumulating as a sqrt(K) random walk. Same
+// story, and the same 3e-2 / 5e-3 tolerance, as the existing I2_S coopmat variants.
+//
+// The per-output reduction order IS changed relative to the BK=128 coopmat kernel: K is now
+// contracted in 32-element slices in ascending element order rather than 128-element blocks.
+// Both sum the same 16-element coopmat fragments; only the outer grouping differs. That is well
+// inside the F16-operand tolerance the coopmat tier is already held to.
+
+#define BM  128
+#define BN  128
+#define WM  64
+#define WN  64
+#define NSG 4
+#define WAVE 64
+
+#extension GL_GOOGLE_include_directive : require
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; }; // I2_S blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; };      // [N*K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };      // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim (number of weight rows)
+    uint K;             // contraction dim (must be a multiple of 128)
+    uint N;             // batch size (number of input rows)
+    uint blocksPerRow;  // = K / 128
+    uint rowUints;      // unused here; kept for push-constant layout parity
+} pc;
+
+#include "gemm_coopmat_blocked_decl.glsl"
+
+const uint I2S_BLOCK_BYTES = 32u;   // one 128-element block
+
+// A-staging geometry: one chunk needs BM rows x 32 code bytes (all of them, one bit field each).
+const uint A_LANES_PER_ROW = BLOCK_SIZE / BM;                    // threads cooperating on a row
+const uint A_BYTES_PER_THR = I2S_BLOCK_BYTES / A_LANES_PER_ROW;  // code bytes per thread
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+void gemmStageA(uint ch) {
+    uint rowLocal  = g_tid / A_LANES_PER_ROW;
+    uint laneOfRow = g_tid % A_LANES_PER_ROW;
+    uint mGlobal   = g_mBase + rowLocal;
+    uint sBase     = rowLocal * STRIDE;
+    uint gp0       = laneOfRow * A_BYTES_PER_THR;
+
+    uint blk   = ch >> 2u;          // 128-element block
+    uint slice = ch & 3u;           // 32-element K-slice within it
+    uint shift = 6u - 2u * slice;   // DESCENDING bit offsets {6,4,2,0}
+
+    bool rowValid = mGlobal < pc.M;
+    uint byteBase = rowValid
+        ? (mGlobal * (pc.K >> 2u) + blk * I2S_BLOCK_BYTES)
+        : 0u;
+
+    for (uint i = 0u; i < A_BYTES_PER_THR; i++) {
+        uint gp = gp0 + i;
+        float v = 0.0;
+        if (rowValid) {
+            uint pk = readByte(byteBase + gp);
+            v = float(int((pk >> shift) & 3u) - 1);
+        }
+        // Slice `s` maps element (gp + 32s) of the block to K-chunk position `gp`.
+        sharedA[sBase + gp] = float16_t(v);
+    }
+}
+
+#define GEMM_M          pc.M
+#define GEMM_K          pc.K
+#define GEMM_CHUNKS     (pc.blocksPerRow * 4u)
+#define GEMM_ROW_BASE   0u
+#define GEMM_ROW_LIMIT  pc.N
+#define GEMM_B_BUF      b
+#define GEMM_C_BUF      c
+// Per-tensor f32 scale at the weight-buffer tail, word-aligned because K is a multiple of 128.
+#define GEMM_EPILOGUE_SCALE  uintBitsToFloat(weight[(pc.M * (pc.K >> 2u)) >> 2u])
+
+#include "gemm_coopmat_blocked_main.glsl"

@@ -85,7 +85,8 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
         _nHead = ssm.NHead;
         _bcDim = ssm.NGroup * ssm.DState;
 
-        Logits = device.Allocate((long)vocabSize * sizeof(float));
+        // Read back by the host every decoded token: HOST_CACHED, not write-combined (#143, #471).
+        Logits = device.AllocateHostReadback((long)vocabSize * sizeof(float));
         PositionsBuffer = device.Allocate(Math.Max(1, initialSeqLen) * sizeof(int));
 
         AllocateForCapacity(Math.Max(1, initialSeqLen));

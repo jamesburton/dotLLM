@@ -28,6 +28,13 @@ python scripts/bench_compare.py --model QuantFactory/SmolLM-135M-GGUF --prompt-s
 python scripts/bench_compare.py --model bartowski/Llama-3.2-3B-Instruct-GGUF --quant Q8_0 --prompt-size large
 ```
 
+### Quality (perplexity)
+
+Throughput comparisons live here; **quality** comparisons are documented separately in
+[PERPLEXITY.md](PERPLEXITY.md) — including the CRLF corpus trap (issue #506) that made every
+end-to-end dotLLM-vs-llama.cpp perplexity comparison score different text, the canonical LF
+fixture, and the `--kl-divergence-base` shared-token-ids protocol.
+
 ## Current Results (2026-03-06)
 
 All results on: **AMD Ryzen 7 5800HS**, 16 GB DDR4, 8 cores / 16 threads, Windows 11, CPU-only, .NET 10, llama.cpp b5291.

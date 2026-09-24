@@ -21,11 +21,15 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// architecture under test.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class CudaUnsupportedArchitectureGuardTests
 {
     [SkippableTheory]
+    // GptOss was listed here until #365 completed its CUDA attention support
+    // (per-head sinks, on top of #366's alternating SWA and #348's MoE
+    // bias/clamped-SwiGLU). It now loads through the `default` CudaTransformerModel
+    // arm — covered by CudaGptOssParitySyntheticTests instead of this guard.
     [InlineData(Architecture.Mamba3)]
-    [InlineData(Architecture.GptOss)]
     public void CreateFromGguf_UnsupportedArchitecture_ThrowsNotSupportedInsteadOfSilentFallthrough(
         Architecture architecture)
     {

@@ -208,9 +208,9 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         /// <summary>Number of draft candidates per speculative step.</summary>
         [CommandOption("--speculative-k|--draft-tokens")]
-        [Description("Number of draft tokens per speculative step (K). Default 5.")]
-        [DefaultValue(5)]
-        public int SpeculativeK { get; set; } = 5;
+        [Description("Number of draft tokens per speculative step (K). Default 3.")]
+        [DefaultValue(DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates)]
+        public int SpeculativeK { get; set; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
 
         /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
         [CommandOption("--prefill-chunk-size|--ubatch-size")]

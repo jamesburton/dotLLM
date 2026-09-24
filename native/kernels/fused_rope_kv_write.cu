@@ -29,6 +29,17 @@
 // graph-friendly variant `fused_rope_kv_write_f16_dyn` reads it from a device
 // pointer instead so the address `cache_K + cache_pos * kv_stride` is computed
 // device-side — preventing CUDA Graphs from baking in the row index.
+//
+// YaRN scaling (#366): `inv_freq` (when non-null) supplies the ramped per-pair
+// inverse frequencies (rope_dim/2 floats, uploaded once at load from the CPU
+// reference RoPE.ComputeYarnInverseFrequencies) in place of the in-kernel
+// powf(theta, ...), and `mscale` is YaRN's attention-magnitude concentration
+// factor multiplied into BOTH cos and sin at EVERY position — position 0 included.
+// This kernel matters most for YaRN correctness because DECODE takes it by default
+// (CudaTransformerModel's useFusedRopeKv branch and the graph-replay path), so a
+// fix confined to rope_f16/rope_f32 would leave every generated token unscaled.
+// Non-YaRN callers pass inv_freq = nullptr and mscale = 1.0f, bit-identical to the
+// previous behaviour (IEEE multiply by exactly 1.0f is the identity).
 
 #include <cuda_fp16.h>
 
@@ -46,7 +57,9 @@ extern "C" __global__ void __launch_bounds__(256) fused_rope_kv_write_f16(
     int rope_dim,
     int kv_stride,                       // = num_kv_heads * head_dim
     float theta,
-    int rope_type)                       // 0 = standard (interleaved pairs), 1 = neox (split halves)
+    int rope_type,                       // 0 = standard (interleaved pairs), 1 = neox (split halves)
+    const float* __restrict__ inv_freq,  // [rope_dim/2] YaRN inverse freqs, or nullptr
+    float mscale)                        // YaRN cos/sin multiplier; 1.0f when inactive
 {
     const int half_rope = rope_dim / 2;
     const int tail = head_dim - rope_dim;
@@ -68,10 +81,12 @@ extern "C" __global__ void __launch_bounds__(256) fused_rope_kv_write_f16(
         const int pair = tid % half_rope;
         const int head = tid / half_rope;
 
-        const float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
+        const float freq = (inv_freq != nullptr)
+            ? inv_freq[pair]
+            : 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
         const float angle = (float)pos * freq;
-        const float c = cosf(angle);
-        const float s = sinf(angle);
+        const float c = cosf(angle) * mscale;
+        const float s = sinf(angle) * mscale;
 
         const int base_idx = head * head_dim;
         int i0, i1;
@@ -100,10 +115,12 @@ extern "C" __global__ void __launch_bounds__(256) fused_rope_kv_write_f16(
         const int pair = local % half_rope;
         const int head = local / half_rope;
 
-        const float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
+        const float freq = (inv_freq != nullptr)
+            ? inv_freq[pair]
+            : 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
         const float angle = (float)pos * freq;
-        const float c = cosf(angle);
-        const float s = sinf(angle);
+        const float c = cosf(angle) * mscale;
+        const float s = sinf(angle) * mscale;
 
         const int base_idx = head * head_dim;
         int i0, i1;
@@ -164,7 +181,9 @@ extern "C" __global__ void __launch_bounds__(256) fused_rope_kv_write_f16_dyn(
     int rope_dim,
     int kv_stride,
     float theta,
-    int rope_type)
+    int rope_type,
+    const float* __restrict__ inv_freq,
+    float mscale)
 {
     const int half_rope = rope_dim / 2;
     const int tail = head_dim - rope_dim;
@@ -185,10 +204,12 @@ extern "C" __global__ void __launch_bounds__(256) fused_rope_kv_write_f16_dyn(
     {
         const int pair = tid % half_rope;
         const int head = tid / half_rope;
-        const float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
+        const float freq = (inv_freq != nullptr)
+            ? inv_freq[pair]
+            : 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
         const float angle = (float)pos * freq;
-        const float c = cosf(angle);
-        const float s = sinf(angle);
+        const float c = cosf(angle) * mscale;
+        const float s = sinf(angle) * mscale;
         const int base_idx = head * head_dim;
         int i0, i1;
         if (rope_type == 1) { i0 = base_idx + pair; i1 = base_idx + pair + half_rope; }
@@ -205,10 +226,12 @@ extern "C" __global__ void __launch_bounds__(256) fused_rope_kv_write_f16_dyn(
         const int local = tid - r0;
         const int pair = local % half_rope;
         const int head = local / half_rope;
-        const float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
+        const float freq = (inv_freq != nullptr)
+            ? inv_freq[pair]
+            : 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
         const float angle = (float)pos * freq;
-        const float c = cosf(angle);
-        const float s = sinf(angle);
+        const float c = cosf(angle) * mscale;
+        const float s = sinf(angle) * mscale;
         const int base_idx = head * head_dim;
         int i0, i1;
         if (rope_type == 1) { i0 = base_idx + pair; i1 = base_idx + pair + half_rope; }

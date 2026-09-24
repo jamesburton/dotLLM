@@ -40,9 +40,10 @@ namespace DotLLM.Tests.Unit.Models.Architectures;
 ///   </description></item>
 /// </list>
 /// <para>
-/// The fixture dims are intentionally tiny (2 layers, hidden=16, H=2, R=2,
-/// N=8) — the forward is microseconds, every per-layer tensor fits in
-/// &lt; 2 KB, and the whole fixture file is &lt; 20 KB.
+/// The fixture dims are intentionally tiny (2 layers, hidden=12, H=2, P=6, R=3,
+/// N=8 — see issue #385 for why all of NumHeads/HeadDim/StateSize/HiddenSize/
+/// MimoRank are pairwise distinct) — the forward is microseconds, every
+/// per-layer tensor fits in &lt; 2 KB, and the whole fixture file is &lt; 20 KB.
 /// </para>
 /// </remarks>
 public sealed class Mamba3TransformerModelMimoTests : IDisposable
@@ -53,20 +54,27 @@ public sealed class Mamba3TransformerModelMimoTests : IDisposable
     //   num_rope_angles = int(state_size * rope_fraction) / 2  (Mamba3Config)
     //   bc_per_token = state_size * num_bc_heads * mimo_rank   (MIMO: R-expanded)
     //   d_in_proj = 2*d_inner + 2*bc_per_token + 3*n_head + num_rope_angles
-    private const int HiddenSize = 16;
+    //
+    // Issue #385: widened from a degenerate tuple (HeadDim==StateSize==8,
+    // MimoRank==NumHeads==2) so NumHeads/HeadDim/StateSize/HiddenSize/MimoRank are
+    // all pairwise distinct — an H<->P or a [R,H,N]/[H,R,N]-style rank/head-stride
+    // transposition now lands on a genuinely different element instead of staying
+    // in bounds. Expand kept at 1 with hiddenSize == d_inner (12 == 2*6) to satisfy
+    // Mamba3ConfigExtractor's num_heads*head_dim == expand*hidden_size invariant.
+    private const int HiddenSize = 12;
     private const int VocabSize = 16;
     private const int NumLayers = 2;
     private const int NumHeads = 2;
-    private const int HeadDim = 8;
-    private const int DInner = NumHeads * HeadDim;              // 16
+    private const int HeadDim = 6;
+    private const int DInner = NumHeads * HeadDim;              // 12
     private const int Expand = 1;                               // hidden * 1 == d_inner
     private const int StateSize = 8;
     private const int NumBcHeads = 1;
-    private const int MimoRank = 2;
+    private const int MimoRank = 3;
     private const float RopeFraction = 0.5f;
     private const int NumRopeAngles = 2;                        // int(8 * 0.5) / 2
-    private const int BcPerToken = StateSize * NumBcHeads * MimoRank; // 16
-    private const int DInProj = 2 * DInner + 2 * BcPerToken + 3 * NumHeads + NumRopeAngles; // 72
+    private const int BcPerToken = StateSize * NumBcHeads * MimoRank; // 24
+    private const int DInProj = 2 * DInner + 2 * BcPerToken + 3 * NumHeads + NumRopeAngles; // 80
 
     private readonly string _scratch;
     private readonly ITestOutputHelper _output;

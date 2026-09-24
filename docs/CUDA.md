@@ -504,6 +504,54 @@ for cu_file in "$(dirname "$0")"/kernels/*.cu; do
 done
 ```
 
+### The csproj also regenerates PTX — and it does not pin the toolkit
+
+`native/build_ptx.bat` is not the only thing that writes `native/ptx/*.ptx`.
+`src/DotLLM.Cuda/DotLLM.Cuda.csproj` has a `CompileCudaPtx` target that runs
+`BeforeTargets="BeforeBuild"` with `Inputs`/`Outputs` over `.cu` → `.ptx`, so **a plain
+`dotnet build` silently regenerates every `.ptx` whose `.cu` is newer.** It resolves `nvcc` by
+running `nvcc --version` **from `PATH`**, and the host compiler from `VCToolsInstallDir` or, when
+that is unset, `vswhere -latest`.
+
+On a box with more than one CUDA toolkit installed that is a trap:
+
+- PTX whose ISA version exceeds the driver's is rejected outright with
+  `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. CUDA 12.8 emits `.version 8.7`, which is what every
+  committed `.ptx` in this tree declares; CUDA 13.1 emits `.version 9.1`, which no pre-13.1
+  driver will load.
+- The wrong PTX compiles, commits and reviews exactly like the right PTX. It only fails on
+  someone else's older driver.
+- `build_ptx.bat` guards against this (it takes `nvcc` from `%CUDA_PATH%` and asserts
+  `DOTLLM_PTX_EXPECT_VERSION`, default `8.7`, per file at the moment of generation). **The
+  MSBuild target has no such guard** — it takes whatever `PATH` hands it.
+- This mechanism has now regressed **three times**: #124, #318, and again on 2026-09-23.
+
+**The fix is to pin both resolutions before building**, so the MSBuild path compiles with the
+same toolkit `build_ptx.bat` would:
+
+```bat
+set "CUDA_PATH=<the pinned toolkit>"
+set "PATH=%CUDA_PATH%\bin;%PATH%"
+set "VCToolsInstallDir=<...>\VC\Tools\MSVC\<ver>\"
+dotnet build
+```
+
+After any build that may have regenerated PTX, check the tree before committing:
+
+```bash
+grep -m1 '^.version' native/ptx/*.ptx | sort -u -k2   # every file must say 8.7
+```
+
+**Do not delete a `.ptx` to force a rebuild.** MSBuild evaluates the `<Content Include="..\..\native\ptx\*.ptx">`
+glob at *project load*, so a file that does not exist when the build starts is not in the item
+list — `CompileCudaPtx` regenerates it, but nothing copies it to the output directory in that
+same build, and the kernel is missing at runtime. Touch the `.cu`, or rebuild twice.
+
+Related: the target's per-kernel `Arch` metadata mirrors `build_ptx.bat`'s `ARCH_86` list for the
+same reason. A kernel using `mma.sync`/`cp.async` compiled at the `compute_75` default produces
+PTX that parses at build time and fails to JIT at module load, which `CudaKernels` catches and
+turns into a silently disabled kernel — no build error, no crash.
+
 ### .NET Integration
 
 PTX files are included as content files in the project, copied to output directory:
@@ -603,6 +651,29 @@ First-time PTX loading incurs ~100–500ms per module as the driver compiles PTX
    ```
    Load with `cuModuleLoadData` — same API, auto-selects SASS if available, falls back to PTX.
 3. **Startup amortization**: all modules loaded during model initialization (which already takes 1–10s for GGUF mmap + weight upload). PTX JIT adds negligible overhead relative to weight transfer.
+
+---
+
+## PTX Pre-flight: `CudaKernels.ResolveAndValidatePtxDirectory` (issue #484)
+
+**Every CUDA model factory must call `CudaKernels.ResolveAndValidatePtxDirectory(ptxDir)` before
+`CudaContext.Create`, and pass its return value to `new CudaKernels(...)`.** Never write
+`ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx")` in a factory — that is what the helper
+does, plus the check.
+
+The factories set up in the order `CudaContext.Create` → `CudaStream.Create` → `cublasCreate` →
+`new CudaKernels(ptxDir)`. A missing or incomplete PTX deployment is the most common way a load
+fails, and without the pre-flight it is detected only *after* three device-backed handles already
+exist — a failure path whose unwind must then be re-proven correct at every call site. Validating
+up front is pure file-system I/O and makes the whole class of leak structurally impossible.
+
+- Throws `DirectoryNotFoundException` if the directory is absent, `FileNotFoundException` naming the
+  first missing module otherwise.
+- `CudaKernels.RequiredPtxFiles` lists every module the constructor loads unconditionally, and
+  `CudaKernelsPtxValidationTests.RequiredPtxFiles_MatchesUnconditionalConstructorLoads` parses the
+  constructor to keep the two in sync. **Adding an unconditional `CudaModule.LoadFromFile` to the
+  constructor requires adding the file to that list** (the test fails otherwise). Optional modules,
+  loaded behind `File.Exists`, must stay out of it.
 
 ---
 
@@ -848,9 +919,10 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
     since the kernel can't engage there), +0.30% post-gate. **Recommendation: #183 stays opt-in/
     default-OFF** — the fastest kernel found here is not a safe default despite the win being real.
   - **#226/#227: tried fp64 accumulation in the cross-split combine step to reduce the
-    reassociation error — no improvement, clean negative result.** Root cause is *not* `fast_exp_neg`
-    (this file's header already documents why precise `expf` was rejected — CPU/GPU parity, both
-    the baseline and split-KV kernels already use the same approximation identically) and *not* the
+    reassociation error — no improvement, clean negative result.** Root cause is *not* the softmax
+    exponential (at the time that was the Schraudolph `fast_exp_neg`, used identically by both the
+    baseline and split-KV kernels; #501 replaced it with precise `expf` in all of them at once, so
+    the "identical in both" premise is unchanged) and *not* the
     final 4-way merge arithmetic: the double-precision combine variant (`attention_f32_split_kv_hp`,
     opt-in `DOTLLM_ATTN_SPLIT_KV_HP=1`, PR #227 open/not merged) diverges at the *identical* step
     225 with an essentially identical margin and perplexity delta. The reassociation error is
@@ -955,7 +1027,10 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
   opt-in/default-OFF (`DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=1`) per the standing #180/#183
   precedent — this session validated synthetic-fixture parity and wall-clock, not real
   end-to-end generation parity (the #222-style test that caught #183's real-world precision
-  problem despite it passing synthetic parity), so a default-on flip should wait on that. Not
+  problem despite it passing synthetic parity), so a default-on flip should wait on that.
+  **Superseded: the kernel is default-ON as of 2026-07-30** once that generation-parity pass
+  landed — see the 2026-07-30 entry below, and opt out with
+  `DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=0`. Not
   wired into any model's forward pass this session (kernel-level validation was the scope,
   matching the precedent that `attention_f32_gqa_split_kv` itself also isn't wired into
   `CudaQwen3MoeHybridTransformerModel`). **This is the first positive wall-clock result in the
@@ -1015,9 +1090,11 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
   confident decision) consistent with that already-characterized, already-accepted reassociation
   sensitivity rather than a new correctness problem this kernel introduces. Full CUDA unit suite
   (423 tests, 380 real + 43 env-gated skips) passes with zero regressions from the model-file
-  changes. **Still opt-in/default-OFF** (`DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=1`) pending a maintainer
-  decision on default-on, but the precondition that gap existed for (#222-style real generation
-  validation) is now satisfied.
+  changes. The precondition the opt-in gate existed for (#222-style real generation validation) is
+  satisfied by this pass, and the kernel was **flipped default-ON on 2026-07-30** on the strength of
+  it: `CudaAttentionMmaDecodeGqaSplit.Enabled` is `env != "0"`, so opting *out* now needs
+  `DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=0`. (The sentence here previously read "still
+  opt-in/default-OFF … pending a maintainer decision", which the flip made wrong.)
 - **BitNet decode CUDA-graph capture, and the generic `attention_f16_dyn` slowdown behind it** (issues #212/#213/#218/#221, PRs #214/#217/#223/#224, 2026-07-28): BitNet was the only supported architecture excluded from the project's default-on decode CUDA-graph capture (the generic captured body omitted BitNet's FP32-residual/Sub-LN/ReLU² ops). #214 ported those ops in and removed the exclusion — bit-exact vs eager, +9-11% decode at shallow depth on both real BitNet models (2B-4T, `bitnet_b1_58-xl`). **Caveat (#338): treat the "bit-exact vs eager" claim as unverified until it is re-measured.** The equivalence suite that backed it (`CudaGraphCaptureEquivalenceTest`) could pass eager-vs-eager — nothing checked that capture actually engaged — and its logit bound had been widened from `1e-3f` to `5.0f`, i.e. ~20-25x the observed drift, leaving argmax equality as the effective gate. Both are fixed in the test (graph-engagement assertions from `GraphReplayCount`, and every step's logits compared rather than step 0's), but the numbers behind this paragraph were produced before that and need one CUDA-box run to reconcile. This surfaced a real depth-dependent regression, fixed for BitNet specifically via #217's depth ceiling (`BitNetGraphCaptureMaxDepth`, default 384).
 
   **#218 then found and fixed the underlying kernel-level cause, and generalized the mitigation to every architecture.** An elevated `ncu --set full` capture (`.perf-runs/ncu-2026-07-28/README.md`) first suggested a CTA-barrier-stall hypothesis (the `seq_kv`/`position_offset` device-pointer reads landing too close to a sync point) — **this was refuted** by direct SASS inspection (`ptxas -arch=sm_86` + `cuobjdump --dump-sass`, no elevation needed): `ptxas` already schedules both loads as the first two real instructions, with 50-90 independent instructions before first use. The actual cause: all 256 threads in `attention_f16_dyn` each independently re-read the same block-uniform pointer values — 8x the redundant memory-latency exposure `attention_f16` doesn't pay (it reads from the near-free constant/parameter bank instead). Fixed by templating the shared kernel body on a `DeviceIndirect` compile-time bool; the `_dyn` instantiation has only thread 0 dereference the pointers once, broadcasting via the dead tail of the existing `warp_scratch[32]` shared buffer — no new shared memory, no new barrier, and `attention_f16`'s SASS is byte-for-byte unaffected (verified via SASS diff). This closed roughly a third of the regression on its own; the rest was closed by generalizing #217's pattern into a new `GraphCaptureMaxDepth` (default 512, `DOTLLM_GRAPH_MAX_DEPTH` override) covering every graph-capable architecture, with BitNet keeping its own tighter, separately-validated ceiling. Falcon-E-3B/Falcon3-3B regression fully closed at every depth ≥512 tested; shallow-depth graph win preserved (+2.8% to +7.9%).

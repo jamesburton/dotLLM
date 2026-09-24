@@ -198,7 +198,9 @@ public sealed class HybridPrefillDecodeStrategy
             for (int i = 0; i < promptLen; i++) positions[i] = i;
 
             long t0 = Stopwatch.GetTimestamp();
-            using (ITensor prefillLogits = _prefillModel.Forward(promptIds, positions, deviceId: -1, hostCache))
+            // Only row `rows - 1` is extracted below, so opt in to last-row-only logits (#493).
+            using (ITensor prefillLogits = _prefillModel.Forward(promptIds, positions, deviceId: -1,
+                       hostCache, lastTokenLogitsOnly: true))
             {
                 ticks = Stopwatch.GetTimestamp() - t0;
 

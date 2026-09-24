@@ -1657,10 +1657,12 @@ public sealed class VulkanTransformerModel : IModel
         // env-var opt-out, by missing SPV (older builds), or when the model's
         // head_dim exceeds the shader bound — every gate falls back to the
         // legacy per-token attention kernel.
+        // Issue #441: every gate below now reports itself. The head-dim gate used to be silent,
+        // which is how a headDim-256 model spent ~20 % of its prefill on the per-token kernel
+        // without anything saying so.
         VulkanFlashAttentionF32Kernel? flashAttention =
-            IsFlashAttentionDisabled() || config.HeadDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
-                ? null
-                : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
+            VulkanAttentionFallbackDiagnostics.CreatePrefillFlashAttention(
+                device, spvDir, config.HeadDim, "VulkanTransformerModel");
         // Cooperative-matrix FA prefill kernel (issue #149) — preferred over the
         // scalar FA shader when the device has the 16x16x16 f16->f32 subgroup
         // tile (llama.cpp's FA_COOPMAT1 path). Kill-switch:
@@ -2100,7 +2102,7 @@ public sealed class VulkanTransformerModel : IModel
                 maskMode: maskMode, prefixLen: prefixLen);
             return;
         }
-        if (_flashAttention is not null && seqQ > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
+        if (_flashAttention is not null && seqQ > 1 && headDim <= _flashAttention.SupportedMaxHeadDim)
         {
             ProfNote("attn_flash", seqQ, seqKv, numHeads);
             _flashAttention.Record(cmdBuf, q, k, v, output,
@@ -2124,20 +2126,46 @@ public sealed class VulkanTransformerModel : IModel
     /// Returns the effective sliding-window size for <paramref name="layer"/>.
     /// Honours <see cref="ModelConfig.PerLayerSlidingWindow"/> when set (each
     /// entry may be null for full attention or a positive int for sliding);
-    /// otherwise falls back to the model-wide <see cref="_slidingWindow"/>.
-    /// Used for Gemma 3's interleaved local/global pattern. Mirrors the CPU
-    /// <c>TransformerModel.GetLayerSlidingWindow</c> helper.
+    /// otherwise falls back to the model-wide <see cref="_slidingWindow"/>,
+    /// modulated by <see cref="ModelConfig.SlidingWindowPattern"/> (see
+    /// <see cref="ResolveLayerSlidingWindow"/>). Used for Gemma 3's interleaved
+    /// local/global list and gpt-oss's alternating sliding/dense pattern.
+    /// Mirrors the CPU <c>TransformerModel.GetLayerSlidingWindow</c> helper and
+    /// CUDA's <c>CudaSlidingWindowResolver</c> (#366).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int GetLayerSlidingWindow(int layer)
+        // PerLayerSlidingWindow and the pattern are both defined over the FULL model's layer index;
+        // offset the window-local layer to its global index for a pipeline stage (_firstLayer == 0 on a
+        // single-device model, so this is a no-op there). Using the local index would flip every
+        // layer's windowed/dense role on a stage that starts at an odd layer (pattern = 2).
+        => ResolveLayerSlidingWindow(
+            _slidingWindow, Config.SlidingWindowPattern, Config.PerLayerSlidingWindow, _firstLayer + layer);
+
+    /// <summary>
+    /// Per-layer sliding-window resolution in the Vulkan attention-kernel convention
+    /// (<c>0</c> = dense / full attention, positive = window length). Semantics are
+    /// exactly the CPU reference <c>TransformerModel.GetLayerSlidingWindow</c>:
+    /// an explicit <paramref name="perLayer"/> entry wins (null = dense); otherwise
+    /// with no window the layer is dense; with <paramref name="pattern"/> &lt;= 0 the
+    /// window applies uniformly; with pattern N &gt; 0 it applies only where
+    /// <c>layer % N &lt; N - 1</c> (llama.cpp <c>set_swa_pattern(N, dense_first=false)</c>;
+    /// gpt-oss N = 2: even layers windowed, odd dense). Before #480 the pattern was
+    /// ignored and the window landed on every layer.
+    /// </summary>
+    /// <param name="slidingWindow">Model-wide window, <c>0</c> = none.</param>
+    /// <param name="pattern"><see cref="ModelConfig.SlidingWindowPattern"/>.</param>
+    /// <param name="perLayer"><see cref="ModelConfig.PerLayerSlidingWindow"/>, full-model length.</param>
+    /// <param name="globalLayer">Layer index in the FULL model (not stage-local).</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static int ResolveLayerSlidingWindow(
+        int slidingWindow, int pattern, IReadOnlyList<int?>? perLayer, int globalLayer)
     {
-        // PerLayerSlidingWindow is full-model length; offset the window-local layer to its global index
-        // for a pipeline stage (_firstLayer == 0 on a single-device model, so this is a no-op there).
-        int globalLayer = _firstLayer + layer;
-        var perLayer = Config.PerLayerSlidingWindow;
         if (perLayer is not null && (uint)globalLayer < (uint)perLayer.Count)
             return perLayer[globalLayer] ?? 0;
-        return _slidingWindow;
+        if (slidingWindow <= 0) return 0;
+        if (pattern <= 0) return slidingWindow;
+        return (globalLayer % pattern) < pattern - 1 ? slidingWindow : 0;
     }
 
     /// <summary>
@@ -2217,7 +2245,19 @@ public sealed class VulkanTransformerModel : IModel
         return p;
     }
 
-    private static void RejectUnsupportedArchitecture(ModelConfig config)
+    /// <summary>
+    /// Refusal text for gpt-oss on Vulkan (#480). One definition, shared by
+    /// <see cref="RejectUnsupportedArchitecture"/> and <see cref="VulkanModelLoader.CreateFromGguf"/>,
+    /// so the two cannot drift. Names the missing features so the caller knows what would have
+    /// silently gone wrong.
+    /// </summary>
+    internal const string GptOssUnsupportedMessage =
+        "Architecture GptOss (gpt-oss) is not supported on the Vulkan backend: Vulkan implements "
+        + "neither its per-head attention sinks nor its dense YaRN RoPE scaling, so loading it would "
+        + "silently produce wrong output rather than fail. Use the CPU backend, or CUDA (which "
+        + "implements both since #365/#366), for gpt-oss checkpoints. Tracked in issue #480.";
+
+    internal static void RejectUnsupportedArchitecture(ModelConfig config)
     {
         // Architectures with a dedicated Vulkan model class must say so BEFORE the generic
         // "hybrid unsupported" message below — Qwen3MoeHybrid / Qwen3HybridDense / NemotronH
@@ -2227,6 +2267,14 @@ public sealed class VulkanTransformerModel : IModel
         // on the Vulkan backend yet" is simply untrue and sends the caller down a dead end
         // (issue #324).
         TransformerWeights.ThrowIfArchitectureNeedsDedicatedLoader(config);
+
+        // gpt-oss (#480): the dense VulkanTransformerModel would load it and produce wrong output
+        // with no error — see GptOssUnsupportedMessage. Checked here (not only in
+        // VulkanModelLoader.CreateFromGguf) because every factory on this class calls this first,
+        // which closes the side doors: direct LoadFromGguf callers (benchmarks), the Vulkan pipeline
+        // model's stages, and HybridVulkanCudaTransformerModel's Vulkan half.
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
+            throw new NotSupportedException(GptOssUnsupportedMessage);
 
         if (config.HybridLayout is not null || config.SsmConfig is not null || config.Mamba3Config is not null)
             throw new NotSupportedException("Hybrid SSM / Mamba architectures are not supported on the Vulkan backend yet.");
@@ -3802,7 +3850,7 @@ public sealed class VulkanTransformerModel : IModel
         if (_diffusionLogits is null || _diffusionLogitsCapacityRows < rows)
         {
             _diffusionLogits?.Dispose();
-            _diffusionLogits = _device.Allocate((long)rows * vocab * sizeof(float));
+            _diffusionLogits = _device.AllocateHostReadback((long)rows * vocab * sizeof(float));
             _diffusionLogitsCapacityRows = rows;
             // The new handle invalidates any cached lm-head matmul descriptor set.
             InvalidateKernelCaches();
@@ -6539,16 +6587,11 @@ public sealed class VulkanTransformerModel : IModel
             // GEMV, prefill via the 32x32 register-blocked GEMM (#233) — the port of the
             // shipped I2_S prefill kernel, which folds each group's scale into the staged
             // weight tile rather than applying one tensor scale to the finished accumulator.
-            if (seqLen == 1)
-            {
-                _matmulPQ2_0.Record(cmdBuf, weights, input, output,
-                    m: outputDim, k: inputDim);
-            }
-            else
-            {
-                _matmulPQ2_0Gemm.Record(cmdBuf, weights, input, output,
-                    m: outputDim, k: inputDim, n: seqLen);
-            }
+            // #446/#470: small batches (2-8 tokens) go to the multi-column GEMV, not the
+            // 128x128 GEMM tile; the policy lives in PQ2_0SmallNDispatch and is shared with
+            // the two hybrid models.
+            PQ2_0SmallNDispatch.Record(cmdBuf, _matmulPQ2_0, _matmulPQ2_0Gemm,
+                weights, input, output, m: outputDim, k: inputDim, n: seqLen);
         }
         else if (weightQt == QuantType.IQ1_S)
         {

@@ -27,6 +27,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// same session and prefer <c>decode_min_ms</c> as the contention-free indicator.</para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class Gemma4VulkanRealDecodeTests
 {
     /// <summary>

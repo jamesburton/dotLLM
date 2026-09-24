@@ -15,21 +15,21 @@ public static class ModelInspectEndpoint
         app.MapGet("/v1/models/inspect", (string path, ServerState state) =>
         {
             if (string.IsNullOrEmpty(path))
-                return Results.BadRequest(new ErrorResponse { Error = "Path is required" });
+                return Results.BadRequest(ErrorResponse.InvalidRequest("Path is required", param: "path"));
 
             var fullPath = Path.GetFullPath(path);
 
             if (!IsAllowedModelPath(fullPath, state))
                 return Results.Json(
-                    new ErrorResponse { Error = "Path is outside allowed model directories" },
+                    ErrorResponse.InvalidRequest("Path is outside allowed model directories", param: "path"),
                     ServerJsonContext.Default.ErrorResponse,
                     statusCode: 403);
 
             if (!fullPath.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase))
-                return Results.BadRequest(new ErrorResponse { Error = "Only .gguf files are supported" });
+                return Results.BadRequest(ErrorResponse.InvalidRequest("Only .gguf files are supported", param: "path"));
 
             if (!File.Exists(fullPath))
-                return Results.BadRequest(new ErrorResponse { Error = "File not found" });
+                return Results.BadRequest(ErrorResponse.InvalidRequest("File not found", param: "path"));
 
             try
             {
@@ -51,7 +51,7 @@ public static class ModelInspectEndpoint
             }
             catch
             {
-                return Results.BadRequest(new ErrorResponse { Error = "Failed to read GGUF metadata" });
+                return Results.BadRequest(ErrorResponse.InvalidRequest("Failed to read GGUF metadata", param: "path"));
             }
         });
 

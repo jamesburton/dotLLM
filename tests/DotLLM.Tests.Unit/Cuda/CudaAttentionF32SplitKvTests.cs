@@ -11,9 +11,10 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// Correctness + drift-characterization coverage for <see cref="CudaKernels.LaunchAttentionF32SplitKv"/>
 /// (the opt-in, default-OFF split-KV "Flash-Decoding" <c>attention_f32_split_kv</c> CUDA kernel,
 /// issue #183) against the CPU oracle, <see cref="Attention.Execute(float*, float*, float*, float*,
-/// int, int, int, int, int, int, ComputeThreadPool?, int?)"/> (which itself uses the same
-/// Schraudolph fast-exp approximation via <see cref="Softmax.ExecuteFast"/>/<see cref="FastMath"/>
-/// that <c>attention_f32.cu</c>'s <c>fast_exp_neg</c> mirrors).
+/// int, int, int, int, int, int, ComputeThreadPool?, int?)"/> (which, like the CUDA kernel, uses
+/// precise exp since #501 — both sides previously shared the Schraudolph fast-exp approximation,
+/// the CPU via <see cref="Softmax.ExecuteFast"/>/<see cref="FastMath"/> and CUDA via
+/// <c>attention_f32.cu</c>'s <c>fast_exp_neg</c>, and both lost it in the same change).
 ///
 /// UNLIKE a bit-exact test, this uses a TOLERANCE comparison — splitting the KV dimension across
 /// blocks reassociates the online-softmax accumulation (independent partial (max, sum, out) per
@@ -36,6 +37,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// empirically rather than assuming it.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaAttentionF32SplitKvTests
 {
     private readonly ITestOutputHelper _out;
@@ -194,6 +196,153 @@ public class CudaAttentionF32SplitKvTests
             if (dV != 0) CudaDriverApi.cuMemFree_v2(dV);
             if (dOutExact != 0) CudaDriverApi.cuMemFree_v2(dOutExact);
             if (dOutSplit != 0) CudaDriverApi.cuMemFree_v2(dOutSplit);
+            if (dPartialMax != 0) CudaDriverApi.cuMemFree_v2(dPartialMax);
+            if (dPartialSum != 0) CudaDriverApi.cuMemFree_v2(dPartialSum);
+            if (dPartialOut != 0) CudaDriverApi.cuMemFree_v2(dPartialOut);
+        }
+    }
+
+    /// <summary>
+    /// Issue #365 gap: <c>attention_f32_split_kv</c> is a single cooperative-launch kernel that runs
+    /// across <see cref="CudaKernels.AttentionKvSplit"/> blocks per head and must inject the gpt-oss
+    /// sink logit EXACTLY ONCE, at the single post-<c>grid.sync()</c> merge point — not once per
+    /// split (which would multiply-count it into the combined softmax denominator). That design was
+    /// reviewed by careful reading when Task 1 added it, but until this test, NOTHING in the repo
+    /// ever launched this kernel with a non-zero sink pointer:
+    /// <see cref="AttentionF32SplitKv_MatchesCpuReferenceWithinTolerance_AtRealDepth"/> above always
+    /// passes <c>sinks=0</c>, and at the model level only
+    /// <c>CudaQwen3HybridDenseTransformerModel</c> dispatches to split-KV at all (and it never passes
+    /// sinks) — so the combine-with-sink path is currently unreachable in production, but the kernel
+    /// code claims to handle it correctly and nothing had ever run it to check.
+    /// <para>
+    /// Same GQA repeat-2 fixture (heads=4, kvHeads=2 so <c>hkv = hq / 2</c>) and the same distinct
+    /// per-head sink values as <c>CudaAttentionSinksKernelTests.WithSinks_MatchesCpuSoftmaxRowWithSink</c>
+    /// (head 3's +5.0 provably dominates any attainable score, head 0's -20.0 is provably negligible,
+    /// heads 1/2 sit mid-band) — a wrong-head-index bug would show here too, though that indexing
+    /// convention is already proven by the mutation check on the shared epilogue in
+    /// <c>CudaAttentionSinksKernelTests</c>'s remarks. This test's job is narrower and different: prove
+    /// the MERGE that's unique to the split-KV kernel folds the sink in once, at the combine step, not
+    /// once per split block.
+    /// </para>
+    /// <para>
+    /// Run at REAL depth (seqKv=256 and 1024) per this file's established convention — shallow depth
+    /// would barely exercise the cross-split combine this test exists to check.
+    /// </para>
+    /// <para>
+    /// <b>Tolerance.</b> Calibrated the same way as this file's other tolerances: run once, observe,
+    /// set with headroom. Two error sources stack here that don't in the plain (no-sink) split-KV
+    /// test above: (1) the same reassociation error from the cross-block combine, plus (2) the same
+    /// approximation mismatch <c>CudaAttentionSinksKernelTests</c> documents for the sink epilogue —
+    /// the CPU sink path (<see cref="Attention.SoftmaxRowWithSink"/>) uses exact
+    /// <c>MathF.Exp</c>/<c>TensorPrimitives.Exp</c> while <c>attention_f32.cu</c>'s epilogue (shared by
+    /// both the plain and split-KV kernels) uses the Schraudolph <c>fast_exp_neg</c> approximation.
+    /// </para>
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(256)]
+    [InlineData(1024)]
+    public void AttentionF32SplitKv_WithSinks_MatchesCpuSoftmaxRowWithSink(int seqKv)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir!);
+
+        Skip.IfNot(kernels.HasAttentionF32SplitKv, "attention_f32_split_kv not present in PTX (stale build)");
+
+        const int numHeads = 4, numKvHeads = 2, headDim = 16;
+        Skip.IfNot(kernels.IsAttentionSplitKvSafe(numHeads, headDim),
+            $"split-KV cooperative launch not safe for numHeads={numHeads}, headDim={headDim} on this GPU");
+
+        var rng = new Random(0x365F1A ^ seqKv);
+
+        int qElems = numHeads * headDim;
+        int kvElems = numKvHeads * headDim;
+        int positionOffset = seqKv - 1; // decode: query is the most-recently-cached position
+
+        float[] q = RandomVec(rng, qElems);
+        float[] k = RandomVec(rng, seqKv * kvElems);
+        float[] v = RandomVec(rng, seqKv * kvElems);
+
+        // Distinct per head; same regimes as CudaAttentionSinksKernelTests' GQA fixture (see remarks).
+        float[] sinks = [-20.0f, -1.0f, 0.4f, 5.0f];
+
+        // CPU oracle WITH sinks (Attention.SoftmaxRowWithSink convention).
+        float[] cpuOut = new float[qElems];
+        unsafe
+        {
+            fixed (float* pq = q, pk = k, pv = v, pOut = cpuOut)
+                Attention.Execute(pq, pk, pv, pOut, seqQ: 1, seqKv, numHeads, numKvHeads, headDim,
+                    positionOffset, pool: null, slidingWindowSize: null, sinks: sinks);
+        }
+
+        nint dQ = 0, dK = 0, dV = 0, dOutSplit = 0, dSinks = 0;
+        nint dPartialMax = 0, dPartialSum = 0, dPartialOut = 0;
+        try
+        {
+            long qBytes = (long)qElems * sizeof(float);
+            long kvBytes = (long)seqKv * kvElems * sizeof(float);
+            CudaDriverApi.cuMemAlloc_v2(out dQ, (nuint)qBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dK, (nuint)kvBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dV, (nuint)kvBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dOutSplit, (nuint)qBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dSinks, (nuint)(numHeads * sizeof(float))).ThrowOnError();
+
+            long scalarBytes = (long)numHeads * CudaKernels.AttentionKvSplit * sizeof(float);
+            long outPartialBytes = scalarBytes * headDim;
+            CudaDriverApi.cuMemAlloc_v2(out dPartialMax, (nuint)scalarBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dPartialSum, (nuint)scalarBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dPartialOut, (nuint)outPartialBytes).ThrowOnError();
+
+            unsafe
+            {
+                fixed (float* p = q) CudaDriverApi.cuMemcpyHtoD_v2(dQ, (nint)p, (nuint)qBytes).ThrowOnError();
+                fixed (float* p = k) CudaDriverApi.cuMemcpyHtoD_v2(dK, (nint)p, (nuint)kvBytes).ThrowOnError();
+                fixed (float* p = v) CudaDriverApi.cuMemcpyHtoD_v2(dV, (nint)p, (nuint)kvBytes).ThrowOnError();
+                fixed (float* p = sinks) CudaDriverApi.cuMemcpyHtoD_v2(dSinks, (nint)p, (nuint)(numHeads * sizeof(float))).ThrowOnError();
+            }
+
+            nint s = stream.Handle;
+            kernels.LaunchAttentionF32SplitKv(dQ, dK, dV, dOutSplit, seqKv, numHeads, numKvHeads, headDim,
+                positionOffset, slidingWindow: 0, dPartialMax, dPartialSum, dPartialOut, s, sinks: dSinks);
+            stream.Synchronize();
+
+            float[] gpuSplit = new float[qElems];
+            unsafe
+            {
+                fixed (float* p = gpuSplit) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dOutSplit, (nuint)qBytes).ThrowOnError();
+            }
+
+            double maxAbsSplitVsCpu = 0;
+            for (int i = 0; i < qElems; i++)
+            {
+                Assert.False(float.IsNaN(gpuSplit[i]) || float.IsInfinity(gpuSplit[i]),
+                    $"NaN/Inf in split-KV sink-bearing GPU output at index {i}");
+                maxAbsSplitVsCpu = Math.Max(maxAbsSplitVsCpu, Math.Abs((double)gpuSplit[i] - cpuOut[i]));
+            }
+
+            _out.WriteLine($"seqKv={seqKv}: sink-bearing split-KV maxAbs(splitGPU-CPU)={maxAbsSplitVsCpu:e3}");
+
+            // Calibrated from observed runs on a real RTX 3060 (2026-09-02): maxAbs=2.064E-003 at
+            // seqKv=256, 9.896E-004 at seqKv=1024 — both notably smaller than the shallow-depth
+            // (seqQ=5, seqKv=9) F32 GQA sink test's 1.18E-002 in CudaAttentionSinksKernelTests,
+            // because at this depth the sink's share of the softmax denominator (and thus the
+            // fast_exp_neg-vs-exact-exp mismatch it's exposed to) is a much smaller fraction of a
+            // much larger sum. ~5x headroom over the worse of the two observed values, consistent
+            // with this file's other split-KV tolerances (also ~5-20x over their observed maxAbs).
+            Assert.True(maxAbsSplitVsCpu < 1e-2,
+                $"sink-bearing split-KV GPU kernel vs CPU oracle exceeded tolerance: {maxAbsSplitVsCpu:e3}");
+        }
+        finally
+        {
+            if (dQ != 0) CudaDriverApi.cuMemFree_v2(dQ);
+            if (dK != 0) CudaDriverApi.cuMemFree_v2(dK);
+            if (dV != 0) CudaDriverApi.cuMemFree_v2(dV);
+            if (dOutSplit != 0) CudaDriverApi.cuMemFree_v2(dOutSplit);
+            if (dSinks != 0) CudaDriverApi.cuMemFree_v2(dSinks);
             if (dPartialMax != 0) CudaDriverApi.cuMemFree_v2(dPartialMax);
             if (dPartialSum != 0) CudaDriverApi.cuMemFree_v2(dPartialSum);
             if (dPartialOut != 0) CudaDriverApi.cuMemFree_v2(dPartialOut);

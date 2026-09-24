@@ -102,20 +102,27 @@ public static class CudaModelLoader
                 return (nemotronH, size => nemotronH.CreateKvCache(size));
             }
 
-            // gpt-oss's MoE per-expert bias and OAI-clamped-SwiGLU activation are now
-            // implemented (issue #348) and CudaMoeFfn/CudaMoeWeightsLoader handle them
-            // correctly. However, gpt-oss ALSO requires per-head attention sinks (a learned
-            // scalar per head joining the softmax denominator) and an alternating
-            // sliding-window/dense attention pattern (window on even layers, dense on odd) —
-            // neither exists anywhere in src/DotLLM.Cuda/ or native/kernels/. CUDA attention
-            // would silently run standard GQA with a uniform window, producing wrong output
-            // rather than failing. Fail loudly until both are implemented.
-            case Architecture.GptOss:
-                throw new NotSupportedException(
-                    "CUDA implements GptOss's MoE bias/activation (#348) but not its per-head "
-                    + "attention sinks or its alternating sliding-window/dense attention "
-                    + "pattern — loading would silently produce wrong output rather than fail. "
-                    + "Use the CPU backend for gpt-oss checkpoints.");
+            // gpt-oss (llama.cpp LLM_ARCH_OPENAI_MOE) routes to the plain
+            // CudaTransformerModel via `default` — it is Llama-shaped (GQA attention +
+            // routed-MoE FFN, standard blk.N tensor naming), differing only in three
+            // features that are now all implemented on CUDA rather than in model
+            // structure, so it needs no dedicated model class. This mirrors the CPU
+            // side, where ModelLoader.CreateCpuModelFromGguf's `_` arm sends GptOss to
+            // the plain TransformerModel. The three deltas and where each landed:
+            //   • Per-expert MoE bias + clamped `swiglu_oai` activation — issue #348
+            //     (CudaMoeWeightsLoader.LoadLayerQuant uploads the biases,
+            //     CudaMoeFfn.Forward runs LaunchSwiGLUOaiF32).
+            //   • Alternating sliding-window/dense attention (window on even layers,
+            //     dense on odd; SlidingWindowPattern=2) — issue #366
+            //     (CudaSlidingWindowResolver, plumbed into every per-layer attention
+            //     dispatch), plus that issue's dense-YaRN RoPE mscale fix, which
+            //     gpt-oss's factor=32 scaling depends on.
+            //   • Per-head attention sinks — issue #365 (attn_sinks.weight uploaded in
+            //     CudaWeights as TransformerLayerWeights.AttnSinksDevice, consumed by
+            //     the sink epilogue in the attention_f32 and attention_f16 kernels).
+            // Composition of all three is gated by CudaGptOssParitySyntheticTests, which
+            // runs a synthetic four-feature gpt-oss GGUF through both this dispatch and
+            // the CPU oracle and compares last-token logits.
 
             default:
             {

@@ -27,6 +27,33 @@ namespace DotLLM.Engine.Samplers.StopConditions;
 internal static class StopSuffixTrimmer
 {
     /// <summary>
+    /// Size of the decoded-text window a caller must hand to <c>ShouldStop</c> for the stop
+    /// strings in <paramref name="conditions"/> to be matchable, or <c>0</c> when none are
+    /// registered.
+    /// </summary>
+    /// <remarks>
+    /// The window must cover the longest registered stop string; the cushion absorbs stop strings
+    /// contributed by custom <see cref="IStopCondition"/> implementations that this scan cannot
+    /// see. A zero return is the signal that no text is needed at all, which is what lets the
+    /// scheduler skip detokenizing for requests that registered only EOS and max-tokens (#459).
+    /// </remarks>
+    public static int TailWindowSize(IReadOnlyList<IStopCondition> conditions)
+    {
+        int maxStopLen = 0;
+        bool any = false;
+        for (int i = 0; i < conditions.Count; i++)
+        {
+            if (conditions[i] is StopStringCondition ssc)
+            {
+                any = true;
+                if (ssc.StopString.Length > maxStopLen)
+                    maxStopLen = ssc.StopString.Length;
+            }
+        }
+        return any ? Math.Max(64, maxStopLen + 16) : 0;
+    }
+
+    /// <summary>
     /// Finds the longest stop string from <paramref name="conditions"/> that is a suffix
     /// of <paramref name="text"/> and returns its character count. Returns 0 when no stop
     /// string is a suffix of the text.
@@ -47,6 +74,34 @@ internal static class StopSuffixTrimmer
                 if (text.EndsWith(stop.AsSpan(), StringComparison.Ordinal) && stop.Length > longest)
                 {
                     longest = stop.Length;
+                }
+            }
+        }
+        return longest;
+    }
+
+    /// <summary>
+    /// The longest stop string from <paramref name="conditions"/> that is a suffix of
+    /// <paramref name="text"/>, or <see langword="null"/> when none is.
+    /// </summary>
+    /// <remarks>
+    /// Same match as <see cref="MatchedSuffixLength"/>, returning the string itself so a caller can
+    /// report <i>which</i> stop sequence ended generation. Callers cannot recover it afterwards:
+    /// the match is trimmed out of the returned text.
+    /// </remarks>
+    public static string? MatchedSuffix(ReadOnlySpan<char> text, IReadOnlyList<IStopCondition> conditions)
+    {
+        string? longest = null;
+        for (int i = 0; i < conditions.Count; i++)
+        {
+            if (conditions[i] is StopStringCondition ssc)
+            {
+                string stop = ssc.StopString;
+                if (stop.Length == 0 || stop.Length > text.Length) continue;
+                if (text.EndsWith(stop.AsSpan(), StringComparison.Ordinal)
+                    && (longest is null || stop.Length > longest.Length))
+                {
+                    longest = stop;
                 }
             }
         }

@@ -38,6 +38,15 @@ public sealed class TextGenerator
     private readonly int _prefillChunkSize;
 
     /// <summary>
+    /// Default draft tokens per speculative round (K), for MTP self-speculation and for a
+    /// separate draft model. Issue #466: Bonsai 2 27B MTP peaks at K=3 on both CPU and Vulkan
+    /// (Vulkan tok/s at K=2/3/4: 22.46/23.95/21.86). K=5 also held ~750 MiB of the #473
+    /// per-row recurrent snapshots, against ~450 MiB at K=3. The CLI and server defaults
+    /// reference this constant.
+    /// </summary>
+    public const int DefaultSpeculativeCandidates = 3;
+
+    /// <summary>
     /// Creates a new text generator.
     /// </summary>
     /// <param name="model">The model to use for forward passes.</param>
@@ -82,7 +91,7 @@ public sealed class TextGenerator
                           PrefixCache? prefixCache = null,
                           IModel? draftModel = null,
                           Func<ModelConfig, int, Core.Attention.IKvCache>? draftKvCacheFactory = null,
-                          int speculativeCandidates = 5,
+                          int speculativeCandidates = DefaultSpeculativeCandidates,
                           bool mtpEnabled = true,
                           HybridPrefillDecodeStrategy? hybridStrategy = null,
                           PrefixTrieManager? prefixTrieManager = null,
@@ -230,7 +239,9 @@ public sealed class TextGenerator
 
         // Hybrid mode is enabled when a strategy is wired up, the prompt is short enough,
         // and we have a clean cache (no prefix-cache reuse, no speculative draft model, no MTP).
-        bool useMtp = ShouldUseMtp(captureLogprobs, options);
+        // MTP needs the whole sequence absorbed into its head from position 0 (issue #469), so a
+        // prefix-cache hit — which skips the cached prefix's forward — runs without it.
+        bool useMtp = ShouldUseMtp(captureLogprobs, options) && cachedTokenCount == 0;
         bool useHybrid = _hybridStrategy is not null
             && _hybridStrategy.ShouldRunHybrid(promptLen)
             && cachedTokenCount == 0
@@ -241,6 +252,7 @@ public sealed class TextGenerator
         // the zero-GC-pressure guarantee on the inference hot path.
         int stopTailSize = ComputeStopTailSize(stopConditions);
         char[] stopScratch = ArrayPool<char>.Shared.Rent(stopTailSize);
+        DotLLM.Core.Models.IMtpState? mtpState = useMtp ? CreateMtpState(kvCache) : null;
 
         try
         {
@@ -352,7 +364,7 @@ public sealed class TextGenerator
                 {
                     // Prefill suffix tokens — chunked when a prefill chunk size is configured
                     // (llama.cpp -ub analog); otherwise a single forward pass, as before.
-                    using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter))
+                    using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter, mtpState))
                     {
                         long ts1 = Stopwatch.GetTimestamp();
                         prefillTicks = ts1 - ts0;
@@ -539,9 +551,6 @@ public sealed class TextGenerator
                 //    lightweight head drafts candidates from its own hidden state — no second
                 //    model, no second full-model KV-cache, just the model's own IMtpState. ──
                 var mtpDecoder = new MtpSpeculativeDecoder(greedy: true);
-                using DotLLM.Core.Models.IMtpState mtpState = _model.CreateMtpState()
-                    ?? throw new InvalidOperationException(
-                        $"{_model.GetType().Name}.SupportsMtp is true but CreateMtpState() returned null.");
                 int[] specBuffer = ArrayPool<int>.Shared.Rent(_speculativeCandidates + 1);
                 try
                 {
@@ -555,7 +564,7 @@ public sealed class TextGenerator
                         int k = Math.Min(_speculativeCandidates, remaining);
 
                         var result = mtpDecoder.DraftAndVerify(
-                            _model, kvCache, mtpState,
+                            _model, kvCache, mtpState!,
                             pipeline, generatedIds, constraint,
                             pos, vocabSize, k, specBuffer);
 
@@ -694,6 +703,7 @@ public sealed class TextGenerator
         finally
         {
             ArrayPool<char>.Shared.Return(stopScratch);
+            mtpState?.Dispose();
             if (ownsKvCache)
                 kvCache.Dispose();
             telemetry.RequestSpan?.Dispose();
@@ -776,7 +786,9 @@ public sealed class TextGenerator
         long kvBytes = GetKvCacheBytes(kvCache);
 
         // Hybrid mode: same gating as the non-streaming path.
-        bool useMtp = ShouldUseMtp(captureLogprobs, options);
+        // MTP needs the whole sequence absorbed into its head from position 0 (issue #469), so a
+        // prefix-cache hit — which skips the cached prefix's forward — runs without it.
+        bool useMtp = ShouldUseMtp(captureLogprobs, options) && cachedTokenCount == 0;
         bool useHybrid = _hybridStrategy is not null
             && _hybridStrategy.ShouldRunHybrid(promptLen)
             && cachedTokenCount == 0
@@ -788,6 +800,7 @@ public sealed class TextGenerator
         // normal completion, exception, or consumer-side cancellation (Dispose of the enumerator).
         int stopTailSize = ComputeStopTailSize(stopConditions);
         char[] stopScratch = ArrayPool<char>.Shared.Rent(stopTailSize);
+        DotLLM.Core.Models.IMtpState? mtpState = useMtp ? CreateMtpState(kvCache) : null;
         var generatedIds = new List<int>(maxTokens);
         long prefillTicks = 0;
         long decodeTicks = 0;
@@ -852,7 +865,7 @@ public sealed class TextGenerator
                 {
                     // Prefill suffix tokens — chunked when a prefill chunk size is configured
                     // (llama.cpp -ub analog); otherwise a single forward pass, as before.
-                    using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter))
+                    using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter, mtpState))
                     {
                         long ts1 = Stopwatch.GetTimestamp();
                         prefillTicks = ts1 - ts0;
@@ -1052,9 +1065,6 @@ public sealed class TextGenerator
             {
                 // ── MTP self-speculative decode loop (issue #253) — streaming variant. ──
                 var mtpDecoder = new MtpSpeculativeDecoder(greedy: true);
-                using DotLLM.Core.Models.IMtpState mtpState = _model.CreateMtpState()
-                    ?? throw new InvalidOperationException(
-                        $"{_model.GetType().Name}.SupportsMtp is true but CreateMtpState() returned null.");
                 int[] specBuffer = ArrayPool<int>.Shared.Rent(_speculativeCandidates + 1);
                 try
                 {
@@ -1070,7 +1080,7 @@ public sealed class TextGenerator
                         int kk = Math.Min(_speculativeCandidates, remaining);
 
                         var result = mtpDecoder.DraftAndVerify(
-                            _model, kvCache, mtpState,
+                            _model, kvCache, mtpState!,
                             pipeline, generatedIds, constraint,
                             pos, vocabSize, kk, specBuffer);
 
@@ -1225,6 +1235,7 @@ public sealed class TextGenerator
                 decodeTicks * 1000.0 / Stopwatch.Frequency,
                 FinishReason.Length);
             ArrayPool<char>.Shared.Return(stopScratch);
+            mtpState?.Dispose();
             if (ownsKvCache)
                 kvCache.Dispose();
         }
@@ -1399,15 +1410,7 @@ public sealed class TextGenerator
     // Tail window passed to stop conditions. Must cover the longest stop string currently
     // registered; a safety cushion absorbs future stop strings added via custom conditions.
     private static int ComputeStopTailSize(List<IStopCondition> conditions)
-    {
-        int maxStopLen = 0;
-        for (int i = 0; i < conditions.Count; i++)
-        {
-            if (conditions[i] is StopStringCondition ssc && ssc.StopString.Length > maxStopLen)
-                maxStopLen = ssc.StopString.Length;
-        }
-        return Math.Max(64, maxStopLen + 16);
-    }
+        => Math.Max(64, StopSuffixTrimmer.TailWindowSize(conditions));
 
     // Speculative decoding's greedy acceptance path matches the target pipeline only when the pipeline
     // itself is effectively argmax. Temperature <= 0 forces argmax selection; repetition penalty can
@@ -1425,6 +1428,15 @@ public sealed class TextGenerator
     /// decoding is effectively greedy (same distributional-correctness gate as the two-model path,
     /// see <see cref="IsEffectivelyGreedy"/>).
     /// </summary>
+    /// <summary>
+    /// Creates the MTP state for one request, sized to the KV-cache: the head's cache is indexed by
+    /// sequence position, so it must reach as far as the trunk's (issue #469).
+    /// </summary>
+    private DotLLM.Core.Models.IMtpState CreateMtpState(Core.Attention.IKvCache kvCache)
+        => _model.CreateMtpState(kvCache.MaxLength)
+           ?? throw new InvalidOperationException(
+               $"{_model.GetType().Name}.SupportsMtp is true but CreateMtpState() returned null.");
+
     private bool ShouldUseMtp(bool captureLogprobs, DotLLM.Core.Configuration.InferenceOptions options)
         => _mtpEnabled && _draftModel is null && _model.SupportsMtp
            && !captureLogprobs && IsEffectivelyGreedy(options);
@@ -1436,9 +1448,12 @@ public sealed class TextGenerator
     /// (llama.cpp <c>-ub</c> analog — bounds peak activation memory per forward pass). Returns the
     /// logits tensor of the <b>last</b> chunk only (the caller samples from its final row); earlier
     /// chunks' logits are disposed here.
+    /// Every chunk opts in to <c>lastTokenLogitsOnly</c> (issue #493) — only row
+    /// <c>Shape[0] - 1</c> of the final chunk is ever read, so the caller must index the last row
+    /// by shape and never assume one row per input token.
     /// </summary>
     private ITensor ForwardPrefill(int[] promptIds, int prefillStart, int prefillLen,
-        Core.Attention.IKvCache kvCache, ILoraAdapter? adapter)
+        Core.Attention.IKvCache kvCache, ILoraAdapter? adapter, DotLLM.Core.Models.IMtpState? mtpState = null)
     {
         int chunkSize = _prefillChunkSize > 0 ? Math.Min(_prefillChunkSize, prefillLen) : prefillLen;
         int[] positionsArray = ArrayPool<int>.Shared.Rent(chunkSize);
@@ -1454,8 +1469,13 @@ public sealed class TextGenerator
                     positions[i] = prefillStart + offset + i;
 
                 logits?.Dispose();
+                // Issue #493: this driver samples row Shape[0]-1 of the LAST chunk and nothing
+                // else — every earlier chunk's logits are disposed unread, and within the last
+                // chunk only the final row is read. So opt in to last-row-only logits. Models that
+                // ignore the hint keep returning [len, vocab] and both call sites index
+                // Shape[0]-1, so the behaviour is unchanged for them.
                 logits = _model.Forward(promptIds.AsSpan(prefillStart + offset, len), positions,
-                    deviceId: -1, kvCache, adapter);
+                    deviceId: -1, kvCache, adapter, mtpState, lastTokenLogitsOnly: true);
                 offset += len;
             }
             return logits!;
@@ -1489,8 +1509,10 @@ public sealed class TextGenerator
                 for (int i = 0; i < len; i++)
                     positions[i] = offset + i;
 
+                // The draft prefill discards its logits entirely — it runs only to populate the
+                // draft KV-cache — so the last-row hint is always safe here (issue #493).
                 using ITensor _ = _draftModel!.Forward(promptIds.AsSpan(offset, len),
-                    positions.AsSpan(0, len), deviceId: -1, draftKvCache);
+                    positions.AsSpan(0, len), deviceId: -1, draftKvCache, lastTokenLogitsOnly: true);
                 offset += len;
             }
         }
@@ -1530,8 +1552,12 @@ public sealed class TextGenerator
         // contain a partial overlap with the stop string (e.g. last token decodes to
         // "ld<|im_end|>", stop string "<|im_end|>"). Trim at the char boundary so the
         // returned text preserves the "ld" prefix and excludes the matched suffix.
+        string? matchedStop = null;
         if (stopConditionsForSuffixTrim is not null && finishReason == FinishReason.Stop)
         {
+            // Capture WHICH stop string matched before trimming it away — afterwards the text no
+            // longer carries the evidence, and the Anthropic stop_sequence mapping needs it (#459).
+            matchedStop = StopSuffixTrimmer.MatchedSuffix(text.AsSpan(), stopConditionsForSuffixTrim);
             text = StopSuffixTrimmer.TrimMatchedSuffix(text, stopConditionsForSuffixTrim);
         }
 
@@ -1544,6 +1570,7 @@ public sealed class TextGenerator
             GeneratedTokenCount = generatedIds.Count,
             Timings = BuildTimings(promptLen, generatedIds.Count, prefillTicks, decodeTicks, samplerTicks, kvCacheBytes, cachedTokenCount, specDrafted, specAccepted),
             Logprobs = logprobs,
+            MatchedStopSequence = matchedStop,
         };
     }
 

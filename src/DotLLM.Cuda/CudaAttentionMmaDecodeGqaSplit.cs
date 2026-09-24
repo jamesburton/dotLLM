@@ -38,11 +38,14 @@ namespace DotLLM.Cuda;
 /// </para>
 /// <para>
 /// <b>Precision.</b> Inherits v1's hard-won precision groundwork (FP16 Q/K/V, FP32 mma
-/// accumulator, fast_exp_neg-for-P / precise-expf-for-cross-tile-correction split) plus
+/// accumulator) plus
 /// <see cref="CudaKernels.LaunchAttentionF32GqaSplit"/>'s already-characterized cross-split
 /// reassociation tolerance at <c>kvSplit&gt;1</c> — re-verified for this kernel's new
 /// multi-warp PV split and packed-M-dim layout in
-/// <c>CudaAttentionMmaDecodeGqaSplitTests.cs</c>, not just assumed. Real generation-parity
+/// <c>CudaAttentionMmaDecodeGqaSplitTests.cs</c>, not just assumed. #501 then removed the
+/// Schraudolph <c>fast_exp_neg</c> from the per-key weights as well, so v1's deliberate
+/// approximate-P / precise-correction split is moot: every softmax exponential in this kernel
+/// is now <c>expf</c> (see the .cu file's Precision header). Real generation-parity
 /// validated (<c>CudaAttentionMmaDecodeGqaSplitGenerationParityTests.cs</c>, same harness shape
 /// as #222's split-KV test): pre-gate bit-identical, post-gate perplexity IMPROVES slightly
 /// (-0.173%), greedy generation diverges at the same step/depth (225/257) #222 already
