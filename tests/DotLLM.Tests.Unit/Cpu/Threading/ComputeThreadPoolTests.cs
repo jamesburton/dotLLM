@@ -241,6 +241,7 @@ public sealed unsafe class ComputeThreadPoolTests
         public int ArraySize;
     }
 
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void SumWorker(nint ctx, int threadIdx, int threadCount)
     {
@@ -254,5 +255,61 @@ public sealed unsafe class ComputeThreadPoolTests
             sum += c.Data[i];
 
         c.PartialSums[threadIdx] = sum;
+    }
+}
+
+/// <summary>
+/// Dispatching immediately after construction must not deadlock.
+/// </summary>
+/// <remarks>
+/// Regression test. <c>WorkerLoop</c> takes its generation snapshot when the worker thread
+/// actually starts running. A dispatch issued before a worker reached that line made it
+/// snapshot the already-incremented generation, consume the work-ready event, and then take
+/// the stale-wake <c>continue</c> — never running the work function and never signalling
+/// completion, so the caller blocked in <c>_completion.Wait()</c> forever. The constructor now
+/// waits for every worker to publish its snapshot.
+///
+/// Construct-then-dispatch-immediately, repeated, is what exposes it: a single iteration wins
+/// the race most of the time. 25 iterations hung this test host every run before the fix; a
+/// 50 ms sleep between construction and dispatch made it pass, which is what identified the
+/// race rather than resource exhaustion. If this regresses it HANGS rather than failing, so
+/// it carries its own timeout (xunit only honours Timeout on async tests, so the work runs on
+/// a worker task the test waits on).
+/// </remarks>
+public sealed class ComputeThreadPoolStartupRaceTests
+{
+    [Fact(Timeout = 30_000)]
+    public async Task DispatchImmediatelyAfterConstruction_DoesNotDeadlock()
+    {
+        int dispatches = await Task.Run(ChurnPoolsWithImmediateDispatch);
+
+        // 4 threads (caller + 3 workers) per dispatch: every worker must have run and signalled.
+        Assert.Equal(25 * 4, dispatches);
+    }
+
+    private static unsafe int ChurnPoolsWithImmediateDispatch()
+    {
+        int* counter = (int*)NativeMemory.AlignedAlloc(sizeof(int), 64);
+        try
+        {
+            *counter = 0;
+            for (int i = 0; i < 25; i++)
+            {
+                using var pool = new ComputeThreadPool(4);
+                pool.Dispatch((nint)counter, &CountingWorker);
+            }
+
+            return *counter;
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(counter);
+        }
+    }
+
+    private static unsafe void CountingWorker(nint ctx, int threadIdx, int threadCount)
+    {
+        ref int counter = ref Unsafe.AsRef<int>((void*)ctx);
+        Interlocked.Increment(ref counter);
     }
 }

@@ -26,6 +26,13 @@ public sealed unsafe class ComputeThreadPool : IDisposable
     private readonly Thread[] _workers;
     private readonly ManualResetEventSlim[] _workReady;
     private readonly CountdownEvent _completion;
+
+    /// <summary>
+    /// Signalled once by each worker after it has published its initial generation snapshot.
+    /// The constructor waits on this so that no <see cref="Dispatch"/> can run before every
+    /// worker is parked — see the remarks in the constructor.
+    /// </summary>
+    private readonly CountdownEvent _startupComplete;
     private readonly int _threadCount;
     private readonly int _decodeThreadCount;
     private readonly int[] _workerCoreAssignment; // maps worker index → logical processor ID (or -1)
@@ -104,6 +111,7 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         _workers = new Thread[workerCount];
         _workReady = new ManualResetEventSlim[workerCount];
         _completion = new CountdownEvent(workerCount);
+        _startupComplete = new CountdownEvent(workerCount);
         _workerScratch = new nint[threadCount];
         _workerScratchSize = new int[threadCount];
 
@@ -121,6 +129,19 @@ public sealed unsafe class ComputeThreadPool : IDisposable
             };
             _workers[i].Start(i);
         }
+
+        // Block until every worker has taken its generation snapshot and is parked.
+        //
+        // Without this, a Dispatch issued before a worker reaches WorkerLoop's
+        //     int lastGeneration = Volatile.Read(ref _dispatchGeneration);
+        // makes that worker snapshot the ALREADY-INCREMENTED generation. It then consumes the
+        // work-ready event, re-reads the same value, and the stale-wake guard
+        // (lastGeneration == previousGen) sends it back round the loop — so it never runs the
+        // work function and never calls _completion.Signal(). The caller then blocks forever in
+        // _completion.Wait(). Production hid this because a pool is built at model load and first
+        // dispatched much later; constructing a pool and dispatching immediately hits it
+        // reliably (#530 follow-up).
+        _startupComplete.Wait();
     }
 
     /// <summary>
@@ -220,6 +241,10 @@ public sealed unsafe class ComputeThreadPool : IDisposable
             CpuAffinity.PinCurrentThread(_workerCoreAssignment[arrayIdx]);
 
         int lastGeneration = Volatile.Read(ref _dispatchGeneration);
+
+        // Publish readiness only after the snapshot: the constructor's wait on this guarantees
+        // no dispatch can have advanced the generation before the line above ran.
+        _startupComplete.Signal();
 
         while (true)
         {
@@ -416,6 +441,7 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         for (int i = 0; i < _workReady.Length; i++)
             _workReady[i].Dispose();
         _completion.Dispose();
+        _startupComplete.Dispose();
 
         // Free scratch buffers
         for (int i = 0; i < _workerScratch.Length; i++)
