@@ -156,7 +156,49 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     /// <summary>KV tile columns per workgroup iteration (Bc).</summary>
     public const int KvTileCols = 64;
 
-    private const int PushConstantBytes = 12 * sizeof(uint);
+    private const int PushConstantBytes = 13 * sizeof(uint);
+
+    /// <summary>PCI vendor ID of AMD, whose coopmat P.V needs the #533 safe-tile gate.</summary>
+    private const uint VendorAmd = 0x1002;
+
+    /// <summary>PCI vendor ID of NVIDIA — measured clean for #533 at every KV length.</summary>
+    private const uint VendorNvidia = 0x10DE;
+
+    /// <summary>
+    /// #533: whether this device needs the KV-length-invariant P.V path (1) or can
+    /// run coopmat over every tile (0).
+    /// </summary>
+    private readonly uint _requireInvariantPv;
+
+    /// <summary>
+    /// #533 vendor policy. The defect — coopmat P.V not reproducing the same
+    /// accumulator for the <c>0 * v</c> contributions of masked / padding columns —
+    /// is an AMD implementation property: an RTX 3060 is exactly 0-differing at
+    /// every KV length on the SAME committed SPIR-V, which is how #533 was decided.
+    /// The gate costs AMD ~10-19% at short prefill and NVIDIA ~19% at the
+    /// <c>seqKv &gt;= 640</c> hd64 gate, so it is applied only where it buys
+    /// correctness.
+    /// <para>
+    /// NVIDIA is the ONLY vendor exempted, and only because it was measured.
+    /// Everything else — Intel, Qualcomm, Mesa/RADV, anything new — gets the gate:
+    /// an unmeasured device is assumed affected, because the failure mode is
+    /// silently different generated text, not a crash.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// <c>DOTLLM_VULKAN_533_GATE=0|1</c> overrides the vendor policy. This exists so
+    /// the defect can be REPRODUCED on demand: with the gate off, this shader is
+    /// bitwise identical to the pre-fix one on every measured arm, which is what
+    /// lets a regression test demonstrate RED without keeping a second copy of the
+    /// shader around to drift out of date. Setting it to 0 on AMD re-enables a
+    /// known wrong-output path — it is a diagnostic, not a tuning knob.
+    /// </remarks>
+    internal static uint RequiresInvariantPv(uint vendorId)
+    {
+        string? o = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_533_GATE");
+        if (o is not null) return string.Equals(o, "0", StringComparison.Ordinal) ? 0u : 1u;
+        return vendorId == VendorNvidia ? 0u : 1u;
+    }
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
@@ -171,9 +213,11 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
 
     private VulkanFlashAttentionCoopmatKernel(
         VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
-        VulkanModule? hd64Module, ComputePipeline? hd64Pipeline, nint hd64Pool)
+        VulkanModule? hd64Module, ComputePipeline? hd64Pipeline, nint hd64Pool,
+        uint requireInvariantPv)
     {
         _device = device;
+        _requireInvariantPv = requireInvariantPv;
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
@@ -242,7 +286,8 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     /// never pass this.
     /// </summary>
     internal static VulkanFlashAttentionCoopmatKernel Create(
-        VulkanDevice device, string spvDir, FlashAttentionCoopmatVariant variant, string shaderBaseName)
+        VulkanDevice device, string spvDir, FlashAttentionCoopmatVariant variant, string shaderBaseName,
+        uint? requireInvariantPv = null)
     {
         if (!SupportsDevice(device))
             throw new InvalidOperationException(
@@ -317,7 +362,9 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-        return new VulkanFlashAttentionCoopmatKernel(device, module, pipeline, pool, hd64Module, hd64Pipeline, hd64Pool);
+        return new VulkanFlashAttentionCoopmatKernel(
+            device, module, pipeline, pool, hd64Module, hd64Pipeline, hd64Pool,
+            requireInvariantPv ?? RequiresInvariantPv(device.VendorId));
     }
 
     /// <summary>
@@ -424,7 +471,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
             cmdBuf, VkPipelineBindPoint.Compute, pipeline.Layout,
             0, 1, descriptorSet, 0, 0);
 
-        Span<uint> pc = stackalloc uint[12];
+        Span<uint> pc = stackalloc uint[13];
         pc[0]  = (uint)seqQ;
         pc[1]  = (uint)seqKv;
         pc[2]  = (uint)numHeads;
@@ -437,6 +484,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         pc[9]  = BitConverter.SingleToUInt32Bits(scaleOverride);
         pc[10] = (uint)maskMode;
         pc[11] = (uint)prefixLen;
+        pc[12] = _requireInvariantPv;
         fixed (uint* pcPtr = pc)
         {
             VulkanApi.vkCmdPushConstants(

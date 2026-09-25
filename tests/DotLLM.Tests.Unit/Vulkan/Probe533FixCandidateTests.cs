@@ -40,8 +40,11 @@ namespace DotLLM.Tests.Unit.Vulkan;
 ///         column is duplicated into the first pad slot when <c>tileLen</c> is odd, so the
 ///         non-zero column count is always even. REFUTED: no effect, which is what
 ///         moved the diagnosis from column-count parity to the <c>0 * v</c> reading.</item>
-///   <item><c>_pre533</c> — the shipping shader as it stood before the fix, kept so this
-///         test discriminates rather than merely reports.</item>
+///   <item><c>[gate-off]</c> — the SHIPPED SPIR-V with <c>requireInvariantPv = 0</c>, which is
+///         the pre-fix all-coopmat path and what the vendor policy runs on NVIDIA. Measured
+///         bitwise identical to the retired <c>_pre533</c> copy on every arm, so it is the RED
+///         control: being the same module, it cannot drift out of date the way a second copy of
+///         the shader could.</item>
 /// </list>
 /// <para>Enable with <c>DOTLLM_533_FIX_PROBE=1</c>.</para>
 /// </remarks>
@@ -56,11 +59,28 @@ public sealed class Probe533FixCandidateTests
     private static readonly string[] Candidates =
     [
         "attention_flash_f32_coopmat",              // PRODUCTION (carries the #533 fix)
-        "attention_flash_f32_coopmat_pre533",       // the pre-fix control: MUST still fail
+        GateOffCandidate,                           // SAME spv, requireInvariantPv=0 — the RED control
         "attention_flash_f32_coopmat_v1scalarqk",
         "attention_flash_f32_coopmat_v2scalarpv",
         "attention_flash_f32_coopmat_v3duppad",
+        // OPTIONAL, normally absent — the shader as it stood before the fix, whose
+        // .comp/.spv were retired once [gate-off] was measured bitwise identical to
+        // it. The name is kept so the pre-fix module can be dropped back into the
+        // spv dir (`git show <old-rev>:native/vulkan/spv/<name>.spv`) to answer one
+        // question the in-module control cannot: whether adding the push constant
+        // and the gate branch changed the cost of the all-coopmat path itself, which
+        // is what the NVIDIA exemption depends on. Reports UNAVAILABLE when absent.
+        "attention_flash_f32_coopmat_pre533",
     ];
+
+    /// <summary>
+    /// The production shader with the #533 safe-tile gate forced OFF via the
+    /// <c>requireInvariantPv</c> push constant — i.e. exactly what a device the
+    /// vendor policy exempts (NVIDIA) executes. Not a separate SPIR-V: it is the
+    /// shipped module with one push-constant word changed, which is what makes
+    /// it a control the shader cannot drift away from.
+    /// </summary>
+    private const string GateOffCandidate = "attention_flash_f32_coopmat[gate-off]";
 
     private readonly ITestOutputHelper _out;
     public Probe533FixCandidateTests(ITestOutputHelper output) => _out = output;
@@ -108,8 +128,11 @@ public sealed class Probe533FixCandidateTests
             VulkanFlashAttentionCoopmatKernel kernel;
             try
             {
+                bool gateOff = name == GateOffCandidate;
                 kernel = VulkanFlashAttentionCoopmatKernel.Create(
-                    device, spvDir, FlashAttentionCoopmatVariant.Default, name);
+                    device, spvDir, FlashAttentionCoopmatVariant.Default,
+                    gateOff ? "attention_flash_f32_coopmat" : name,
+                    requireInvariantPv: gateOff ? 0u : null);
             }
             catch (Exception ex)
             {
@@ -119,7 +142,8 @@ public sealed class Probe533FixCandidateTests
 
             using (kernel)
             {
-                bool hd64 = File.Exists(Path.Combine(spvDir, name + "_hd64.spv"));
+                bool hd64 = File.Exists(Path.Combine(
+                    spvDir, (name == GateOffCandidate ? "attention_flash_f32_coopmat" : name) + "_hd64.spv"));
                 sb.AppendLine();
                 sb.AppendLine($"### {name}  (hd64 spv present: {hd64})");
 
@@ -222,16 +246,16 @@ public sealed class Probe533FixCandidateTests
         // landmine this assert exists to catch (the sweep passed for months while
         // merely REPORTING the defect), so there it still fails.
         const uint VendorAmd = 0x1002;
-        if (differingByCandidate.TryGetValue("attention_flash_f32_coopmat_pre533", out long pre) && pre == 0)
+        if (differingByCandidate.TryGetValue(GateOffCandidate, out long pre) && pre == 0)
         {
             Skip.IfNot(device.VendorId == VendorAmd,
-                $"pre-#533 control is invariant on this device (VendorId 0x{device.VendorId:X4}), " +
+                $"#533 gate-off control is invariant on this device (VendorId 0x{device.VendorId:X4}), " +
                 "which is the expected non-AMD result — the fix arm above is clean but this run " +
                 "cannot demonstrate that the test discriminates. Run it on AMD for that.");
             Assert.Fail(
-                "The pre-#533-fix control shader came back invariant on an AMD device — either the " +
-                "driver changed or the control is no longer the pre-fix code. This test no longer " +
-                "discriminates the fix; re-derive the control before trusting it.");
+                "The gate-off control came back invariant on an AMD device — either the driver " +
+                "changed or requireInvariantPv is no longer reaching the shader. This test no " +
+                "longer discriminates the fix; re-derive the control before trusting it.");
         }
     }
 
@@ -263,16 +287,19 @@ public sealed class Probe533FixCandidateTests
         using var device = VulkanDevice.Create();
         Skip.IfNot(VulkanFlashAttentionCoopmatKernel.SupportsDevice(device), "No coopmat tile.");
 
-        // Reference arm = the PRE-FIX shader, challenger arm = everything else
-        // (including the production shader, which now carries the fix).
+        // Reference arm = the pre-fix all-coopmat path, which is now the SHIPPED
+        // module with requireInvariantPv = 0 rather than a second copy of the
+        // shader. Challenger arm = everything else, including the production
+        // kernel at its vendor default.
         using var baseline = VulkanFlashAttentionCoopmatKernel.Create(
-            device, spvDir, FlashAttentionCoopmatVariant.Default, "attention_flash_f32_coopmat_pre533");
+            device, spvDir, FlashAttentionCoopmatVariant.Default,
+            "attention_flash_f32_coopmat", requireInvariantPv: 0u);
 
         var sb = new StringBuilder();
         sb.AppendLine($"Device: {device.DeviceName} SubgroupSize {device.SubgroupSize}");
         sb.AppendLine($"Passes={Passes} (median, min-max reported) Batch={Batch} dispatches/pass, order reversed per pass.");
 
-        foreach (string name in Candidates.Where(n => !string.Equals(n, "attention_flash_f32_coopmat_pre533", StringComparison.Ordinal)))
+        foreach (string name in Candidates.Where(n => !string.Equals(n, GateOffCandidate, StringComparison.Ordinal)))
         {
             VulkanFlashAttentionCoopmatKernel cand;
             try

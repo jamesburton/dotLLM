@@ -88,6 +88,7 @@ layout(push_constant) uniform PushConstants {
     float scaleOverride;   // 0.0 = use 1/sqrt(headDim), >0 = use this scale (Gemma 3 QPAS)
     uint  maskMode;        // 0 = Causal, 1 = Bidirectional, 2 = Hybrid (diffusion canvas)
     uint  prefixLen;       // Hybrid only: positions < prefixLen stay causal, >= are bidirectional
+    uint  requireInvariantPv; // #533: 0 = coopmat P.V for every tile (pre-fix path), 1 = safe-tile gate
 } pc;
 
 // Causal-component mask — byte-identical semantics to attention_flash_f32.comp
@@ -346,8 +347,16 @@ void main() {
         // dispatch, so the staged tile is identical either way. Only columns a
         // longer dispatch fills past this dispatch's kvEnd differ, and the
         // causal clause below already excludes those tiles.
-        bool tileSafe = (tileLen == uint(BC))
-            && (pc.maskMode == 1u || (tStart + uint(BC)) <= firstPosQ + 1u);
+        //
+        // requireInvariantPv == 0 makes EVERY tile safe, which restores the
+        // pre-fix all-coopmat path exactly. The host sets it per vendor: the
+        // defect is an AMD implementation property, and an RTX 3060 is
+        // 0-differing at every length on this same SPIR-V, so NVIDIA does not
+        // pay the scalar tail for a bug it does not have. Anything not measured
+        // clean gets the gate.
+        bool tileSafe = (pc.requireInvariantPv == 0u)
+            || ((tileLen == uint(BC))
+                && (pc.maskMode == 1u || (tStart + uint(BC)) <= firstPosQ + 1u));
         if (!tileSafe) {
             if (d0 < hdCeil) {
                 for (uint i = 0u; i < uint(O_CELLS); i++) {
