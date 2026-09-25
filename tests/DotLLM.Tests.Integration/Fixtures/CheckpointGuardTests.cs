@@ -82,6 +82,27 @@ public sealed class CheckpointGuardTests
 
             try
             {
+                // Wait for the writer to have ACTUALLY appended before asserting.
+                //
+                // Without this the test races its own writer: the loader fails within
+                // milliseconds (header says 50, file is 8), so IsPlausiblyInFlight samples the
+                // length, sleeps InFlightRecheckDelay and samples again — and on a loaded CI
+                // runner the Task.Run writer may not have been scheduled at all in that window.
+                // The file is then still exactly the 8-byte prefix, the guard correctly
+                // concludes "not growing", and the InvalidDataException propagates. Observed
+                // twice on #546, including on a job re-run, with "file length 8" in the message
+                // naming the cause (#547).
+                //
+                // Waiting here makes the precondition the test asserts about — a file that is
+                // observably growing — true by construction, rather than by scheduling luck. It
+                // does not weaken the assertion.
+                var grew = new System.Diagnostics.Stopwatch();
+                grew.Start();
+                while (new FileInfo(path).Length <= sizeof(ulong) && grew.Elapsed < TimeSpan.FromSeconds(10))
+                    Thread.Sleep(10);
+                Assert.True(new FileInfo(path).Length > sizeof(ulong),
+                    "the writer task never appended, so this test cannot exercise the in-flight path");
+
                 var ex = Assert.Throws<Xunit.SkipException>(() =>
                     CheckpointGuard.LoadOrSkip(path, "regression fixture", () => SafetensorsFile.Open(path)));
                 Assert.Contains(
@@ -212,6 +233,27 @@ public sealed class CheckpointGuardTests
 
             try
             {
+                // Wait for the writer to have ACTUALLY appended before asserting.
+                //
+                // Without this the test races its own writer: the loader fails within
+                // milliseconds (header says 50, file is 8), so IsPlausiblyInFlight samples the
+                // length, sleeps InFlightRecheckDelay and samples again — and on a loaded CI
+                // runner the Task.Run writer may not have been scheduled at all in that window.
+                // The file is then still exactly the 8-byte prefix, the guard correctly
+                // concludes "not growing", and the InvalidDataException propagates. Observed
+                // twice on #546, including on a job re-run, with "file length 8" in the message
+                // naming the cause (#547).
+                //
+                // Waiting here makes the precondition the test asserts about — a file that is
+                // observably growing — true by construction, rather than by scheduling luck. It
+                // does not weaken the assertion.
+                var grew = new System.Diagnostics.Stopwatch();
+                grew.Start();
+                while (new FileInfo(path).Length <= sizeof(ulong) && grew.Elapsed < TimeSpan.FromSeconds(10))
+                    Thread.Sleep(10);
+                Assert.True(new FileInfo(path).Length > sizeof(ulong),
+                    "the writer task never appended, so this test cannot exercise the in-flight path");
+
                 var ex = Assert.Throws<Xunit.SkipException>(() =>
                     CheckpointGuard.LoadOrSkip(path, "regression fixture", () => SafetensorsFile.Open(path)));
                 Assert.Contains(
