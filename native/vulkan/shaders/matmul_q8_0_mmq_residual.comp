@@ -42,6 +42,14 @@ const uint BLOCK_BYTES = 34u;
 const uint UINTS_PER_BLOCK = 8u; // 32 int8 / 4 per uint
 const uint CHUNK_STRIDE = 9u;    // +1 uint pad -> LDS bank-conflict-free strided reads
 
+// #544: two-level (pairwise) accumulation over the K blocks — MUST stay in step
+// with matmul_q8_0_mmq.comp. VulkanMatMulQ8_0ResidualFusedKernelTests asserts
+// this kernel is BIT-EXACT against unfused matmul-then-add, so changing the
+// accumulation order in one and not the other breaks that invariant outright
+// (it did: 11401/16384 elements differed). See that shader for why the depth
+// matters; the accuracy gain applies here identically.
+const uint FLUSH_BLOCKS = 8u;
+
 // One K-block tile: 64 rows x 8 uints of packed int8 each (padded), for B and W.
 shared uint  sharedXq[TILE_N * CHUNK_STRIDE];
 shared uint  sharedWq[TILE_M * CHUNK_STRIDE];
@@ -74,9 +82,12 @@ void main() {
     uint rowByteStride = pc.blocksPerRow * BLOCK_BYTES;
 
     float acc[TM][TN];
+    float accPart[TM][TN];   // #544: partial over the current FLUSH_BLOCKS window
     for (uint i = 0u; i < TM; i++)
-        for (uint j = 0u; j < TN; j++)
+        for (uint j = 0u; j < TN; j++) {
             acc[i][j] = 0.0;
+            accPart[i][j] = 0.0;
+        }
 
     for (uint kBlock = 0u; kBlock < pc.blocksPerRow; kBlock++) {
         // ---- 1. Stage sharedXq[64][8] + sharedDx[64]. ----
@@ -163,13 +174,28 @@ void main() {
                 float dw = sharedDw[tx + 16u * i];
                 for (uint j = 0u; j < TN; j++) {
                     float dx = sharedDx[ty + 16u * j];
-                    acc[i][j] += dw * dx * float(dotI[i][j]);
+                    accPart[i][j] += dw * dx * float(dotI[i][j]);
                 }
             }
         }
 
+        // #544: fold the window partial into the running total and restart it.
+        // Workgroup-uniform branch, so no divergence.
+        if ((kBlock % FLUSH_BLOCKS) == FLUSH_BLOCKS - 1u) {
+            for (uint i = 0u; i < TM; i++)
+                for (uint j = 0u; j < TN; j++) {
+                    acc[i][j] += accPart[i][j];
+                    accPart[i][j] = 0.0;
+                }
+        }
+
         barrier();
     }
+
+    // Tail: blocksPerRow need not be a multiple of FLUSH_BLOCKS.
+    for (uint i = 0u; i < TM; i++)
+        for (uint j = 0u; j < TN; j++)
+            acc[i][j] += accPart[i][j];
 
     // ---- 4. Store output tile (+ fused residual) if within [N, M] bounds. ----
     for (uint j = 0u; j < TN; j++) {

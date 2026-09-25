@@ -261,23 +261,24 @@ public sealed class Probe538Q8SplitTests
             Assert.True(rmsQ < 1e-5 && maxQ < 1e-4,
                 $"MMQ has drifted from the f64 oracle at m={m} k={k}: rms={rmsQ:E3} max={maxQ:E3}");
 
-            // ...and that the PREFILL path does not fall further behind the decode
-            // path. MMQ is measured 1.65x / 1.73x / 2.37x the RMS error of MMVQ on
-            // these three shapes — prefill is the less accurate of the two, which
-            // is the reason the fix for #538 must NOT be "route n==1 through MMQ".
+            // ...and that the PREFILL path does not fall behind the decode path.
             //
-            // The mechanism is REDUCTION DEPTH, read off both shaders and
-            // corroborated by the ratio widening with K (64 blocks -> 1.65-1.73x,
-            // 256 blocks -> 2.37x). Both scale per 32-block, so it is not a
-            // missing scale: MMVQ splits the blocks across a subgroup and finishes
-            // with subgroupAdd (a tree), while MMQ accumulates all K/32 blocks
-            // sequentially into one float. Sequential summation grows error with
-            // O(n) against the tree's O(log n).
-            // 5x leaves room for the measured spread while still catching a real
-            // regression in the prefill accumulation.
-            Assert.True(rmsQ < 5.0 * rmsV,
+            // This bound was 5.00 when the gap was real: MMQ measured 1.65x /
+            // 1.73x / 2.37x MMVQ's RMS error, widening with K because it summed
+            // all K/32 blocks sequentially (O(n)) while MMVQ splits them across a
+            // subgroup and finishes with subgroupAdd (O(log n)).
+            //
+            // #544 gave MMQ a two-level accumulation, and the ratio is now
+            // 0.949 / 0.964 / 0.973 — at or slightly better than the decode
+            // kernel on every shape, with the largest gain (2.44x) exactly where
+            // the depth was greatest (K=8192, 256 blocks), which is the signature
+            // that confirms the mechanism. The bound tightens to hold that.
+            const double MmqVsMmvqRmsBound = 1.50;
+            Assert.True(rmsQ < MmqVsMmvqRmsBound * rmsV,
                 $"MMQ (prefill) accuracy has regressed relative to MMVQ (decode) at m={m} k={k}: "
-                + $"rms {rmsQ:E3} vs {rmsV:E3} (ratio {rmsQ / rmsV:F2}, bound 5.00)");
+                + $"rms {rmsQ:E3} vs {rmsV:E3} (ratio {rmsQ / rmsV:F2}, bound {MmqVsMmvqRmsBound:F2}). "
+                + "#544 brought this to ~0.95-0.97; a return toward 1.65+ means the two-level "
+                + "accumulation in matmul_q8_0_mmq.comp has been undone.");
 
         }
 

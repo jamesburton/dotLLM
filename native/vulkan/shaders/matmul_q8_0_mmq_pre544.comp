@@ -62,23 +62,6 @@ const uint BLOCK_BYTES = 34u;
 const uint UINTS_PER_BLOCK = 8u; // 32 int8 / 4 per uint
 const uint CHUNK_STRIDE = 9u;    // +1 uint pad -> LDS bank-conflict-free strided reads
 
-// #544: two-level (pairwise) accumulation over the K blocks. Accumulating all
-// blocksPerRow block products into one float grows rounding error with O(n),
-// which made this GEMM measurably less accurate than the decode GEMV — 1.65x its
-// RMS error at K=2048 and 2.37x at K=8192, the gap widening with K precisely
-// because the depth is n (see #538 / Probe538Q8SplitTests).
-//
-// matmul_q8_0_mmvq.comp does not have this problem because it splits the blocks
-// across a subgroup and finishes with subgroupAdd: each lane sums
-// blocksPerRow/WINDOW_BLOCKS terms, then a 5-deep tree. This constant mirrors
-// that shape in registers — sum FLUSH_BLOCKS blocks into a partial, then fold
-// the partial into the running total — giving depth FLUSH_BLOCKS +
-// blocksPerRow/FLUSH_BLOCKS instead of blocksPerRow. At K=8192 that is 8 + 32
-// against 256.
-//
-// 8 matches MMVQ's WINDOW_BLOCKS so the two paths have comparable depth.
-const uint FLUSH_BLOCKS = 8u;
-
 // One K-block tile: 64 rows x 8 uints of packed int8 each (padded), for B and W.
 shared uint  sharedXq[TILE_N * CHUNK_STRIDE];
 shared uint  sharedWq[TILE_M * CHUNK_STRIDE];
@@ -111,12 +94,9 @@ void main() {
     uint rowByteStride = pc.blocksPerRow * BLOCK_BYTES;
 
     float acc[TM][TN];
-    float accPart[TM][TN];   // #544: partial over the current FLUSH_BLOCKS window
     for (uint i = 0u; i < TM; i++)
-        for (uint j = 0u; j < TN; j++) {
+        for (uint j = 0u; j < TN; j++)
             acc[i][j] = 0.0;
-            accPart[i][j] = 0.0;
-        }
 
     for (uint kBlock = 0u; kBlock < pc.blocksPerRow; kBlock++) {
         // ---- 1. Stage sharedXq[64][8] + sharedDx[64]. ----
@@ -203,29 +183,13 @@ void main() {
                 float dw = sharedDw[tx + 16u * i];
                 for (uint j = 0u; j < TN; j++) {
                     float dx = sharedDx[ty + 16u * j];
-                    accPart[i][j] += dw * dx * float(dotI[i][j]);
+                    acc[i][j] += dw * dx * float(dotI[i][j]);
                 }
             }
         }
 
-        // #544: fold the window partial into the running total and restart it.
-        // The branch is workgroup-uniform (kBlock is the loop counter), so it
-        // costs no divergence.
-        if ((kBlock % FLUSH_BLOCKS) == FLUSH_BLOCKS - 1u) {
-            for (uint i = 0u; i < TM; i++)
-                for (uint j = 0u; j < TN; j++) {
-                    acc[i][j] += accPart[i][j];
-                    accPart[i][j] = 0.0;
-                }
-        }
-
         barrier();
     }
-
-    // Tail: blocksPerRow need not be a multiple of FLUSH_BLOCKS.
-    for (uint i = 0u; i < TM; i++)
-        for (uint j = 0u; j < TN; j++)
-            acc[i][j] += accPart[i][j];
 
     // ---- 4. Store output tile if within [N, M] bounds. ----
     for (uint j = 0u; j < TN; j++) {
