@@ -339,7 +339,7 @@ public sealed class Probe533VulkanRowCountInvarianceTests
                 {
                     coop.Launch(bufQ, bufK, bufV, bufO, n, n, numHeads, numKvHeads, headDim);
                     return DownloadRows(device, bufO, n, qRow);
-                });
+                }, assertInvariant: true);
 
                 // Which axis carries the parity? rowsInTile (= seqQ) held at 8,
                 // seqKv swept. Note the causal early-exit clamps kvEnd to
@@ -349,7 +349,7 @@ public sealed class Probe533VulkanRowCountInvarianceTests
                 {
                     coop.Launch(bufQ, bufK, bufV, bufO, MaxN, n, numHeads, numKvHeads, headDim);
                     return DownloadRows(device, bufO, n, qRow);
-                });
+                }, assertInvariant: true);
             }
 
         _out.WriteLine(sb.ToString());
@@ -396,6 +396,7 @@ public sealed class Probe533VulkanRowCountInvarianceTests
             }
 
             float[] reference = Run(refN);
+            long swept = 0;
             var sb = new StringBuilder();
             sb.AppendLine($"=== #533 coopmat FA long-prefill invariance (reference L={refN}) ===");
             foreach (int n in new[] { 61, 62, 63, 64, 65, 66, 67, 68, 126, 127, 128, 129, 130 })
@@ -416,8 +417,11 @@ public sealed class Probe533VulkanRowCountInvarianceTests
                     }
                 sb.AppendLine($"  L={n,3} ({(n % 2 == 0 ? "even" : "odd ")}) lastTileLen={((n - 1) % 64) + 1,2}: " +
                               $"differing={diff,7} maxAbs={maxAbs:E3} rows[{firstRow}..{lastRow}]");
+                swept += diff;
             }
             _out.WriteLine(sb.ToString());
+            // #533 REGRESSION GATE - see Sweep().
+            Assert.True(swept == 0, $"coopmat FA is not KV-length invariant: {swept} differing elements (see the sweep above).");
         }
     }
 
@@ -430,8 +434,9 @@ public sealed class Probe533VulkanRowCountInvarianceTests
     /// reports, per n, how many of the first n rows differ bitwise from the
     /// n = MaxN result.
     /// </summary>
-    private static void Sweep(StringBuilder sb, string label, int rowLen, Func<int, float[]> run)
+    private static void Sweep(StringBuilder sb, string label, int rowLen, Func<int, float[]> run, bool assertInvariant = false)
     {
+        long swept = 0;
         float[] reference = run(MaxN);
         sb.AppendLine($"  {label}:");
         for (int n = 1; n < MaxN; n++)
@@ -451,7 +456,13 @@ public sealed class Probe533VulkanRowCountInvarianceTests
                 }
             sb.AppendLine($"    n={n} ({(n % 2 == 0 ? "even" : "odd ")}): differing={diff,8}/{(long)n * rowLen,-8} " +
                           $"maxAbs={maxAbs:E3} firstDiffRow={firstRow}");
+            swept += diff;
         }
+        // #533 REGRESSION GATE. This sweep PRINTED the defect for months while
+        // passing; a row-independent op must be bitwise row-count invariant, so
+        // the coopmat arms now assert it.
+        if (assertInvariant)
+            Assert.True(swept == 0, $"{label} is not row-count invariant: {swept} differing elements (see the sweep above).");
     }
 
     private static float[] DownloadRows(VulkanDevice device, VulkanDevice.Buffer buf, int n, int rowLen)
