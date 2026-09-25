@@ -18,6 +18,12 @@ namespace DotLLM.Cpu.Kernels;
 /// +1.71% perplexity for it, Q8_0 pays nothing. See <see cref="UseFastExp"/> for the measurements.
 /// <b>Audit #527: "+1.71%" is a pure quant-ladder number with a null Q8_0 control and no
 /// shipping-grade row — read it as "the cost is unmeasured on shipping quants", not as a size.</b>
+/// <b>Measured since (#531, 2026-09-24): on Q4_K_M the cost is -0.031% (t = -0.47, 95% CI
+/// [-0.163%, +0.101%], n = 64) — not resolvable at that sample size and bounded below ~0.16%.
+/// The +1.71% on Q3_K reproduces exactly, but its F32-decoded control moves by the same
+/// +1.73%, so the penalty tracks how <em>degraded</em> the weights are and not the quantized
+/// path.</b> "Expensive on a heavily quantized one" above is therefore the wrong axis: it is
+/// expensive on a heavily <em>damaged</em> one.
 /// </para>
 /// <para>
 /// The core trick (Schraudolph 1999): <c>exp(x) ≈ reinterpret_as_float((int)(x * C0 + C1))</c> where
@@ -72,10 +78,40 @@ public static class FastMath
     /// attention sink - a softmax-regime confound in a softmax-precision experiment. See
     /// <c>docs/PERPLEXITY.md</c>, "How to measure quality against llama.cpp, then". The
     /// default-OFF decision is unaffected: it rests on the absence of a throughput benefit.</para>
+    /// <para><b>#531 (2026-09-24) settled both halves of that paragraph, and the BOS half was
+    /// wrong.</b> The 2026-09-23 run <em>did</em> pass <c>--bos</c> over llama.cpp's own ids; its
+    /// stream was aligned. What it was not is the Q3_K kernel this engine runs today. Re-run on
+    /// <c>dev</c> with plain <c>--corpus</c> (BOS-aligned since #516), 40-window prefix of a
+    /// 64-window sweep: the <c>Q3_K-decoded-F32</c> fixture returns <b>22.2692 / 21.8886</b> and
+    /// window 0 = <b>11.763354</b> — the two rows above and #501's quoted window 0, to every
+    /// printed digit — while the packed <c>Q3_K</c> fixture returns <b>22.5090 / 22.1019</b>.
+    /// So the "+2.03% -> +0.28%" line compares dotLLM running <em>F32-decoded weights</em>
+    /// against llama.cpp running real packed Q3_K. The like-for-like packed figure is
+    /// <b>+1.03%</b> (64 chunks) / <b>+1.325%</b> (564) and <c>docs/PERPLEXITY.md</c> is the
+    /// aligned source for it; +0.28% belongs beside that document's decoded-F32 rows (+0.36% /
+    /// +0.681%), not beside its packed ones.</para>
+    /// <para><b>The shipping-grade measurement #527 asked for</b> (#531; Llama-3.2-1B Q4_K_M
+    /// requantized from the healthy Q8_0-derived F32 model, wikitext-2 LF, ctx 512, 64 windows,
+    /// plain <c>--corpus</c>, paired per window, 63 df, fast minus accurate):</para>
+    /// <list type="bullet">
+    ///   <item><description><b>Q4_K_M</b>: -0.00031 +/- 0.00066 nats (t = -0.47), -0.031% PPL,
+    ///   95% CI [-0.163%, +0.101%] — <b>not resolvable at n = 64</b>, bounded below ~0.16%.</description></item>
+    ///   <item><description><b>Q4_K_M decoded to F32</b> (control): +0.00012 +/- 0.00037 nats
+    ///   (t = +0.32) — the control agrees with the quantized row, so nothing is hiding in the
+    ///   K-quant path.</description></item>
+    ///   <item><description><b>Q3_K</b>: +0.01693 +/- 0.00178 nats (t = +9.50), +1.708% — the
+    ///   -1.71% above, reproduced under the aligned protocol.</description></item>
+    ///   <item><description><b>Q3_K decoded to F32</b> (control): +0.01719 +/- 0.00136 nats
+    ///   (t = +12.61), +1.734% — <b>the control moves as much as the quantized row.</b> There is
+    ///   no quantized matmul in it at all, so the penalty is not a property of Q3_K; it is a
+    ///   property of weights degraded to PPL ~23.</description></item>
+    /// </list>
+    /// <para>Full working: <c>.docs/measurements/2026-09-24-531-fastexp-shipping-grade.md</c>.</para>
     /// <para>A 3-bit model's attention scores sit closer together, so a 1-2% reweighting changes
     /// the mixture materially. The cost scales with how damaged the model is — exactly the
     /// regime aggressive quantization exists to serve — so the approximation is kept only as an
-    /// opt-in benchmarking lever.</para>
+    /// opt-in benchmarking lever. (#531 confirms the "how damaged" part and removes the
+    /// "how quantized" part: a shipping Q4_K_M is damaged too little to pay anything measurable.)</para>
     /// <para><b>This lever is CPU-only.</b> #501 also removed the mirrored <c>fast_exp_neg</c>
     /// from the CUDA attention kernels, and those ship as precompiled PTX with no equivalent
     /// switch. Setting <c>DOTLLM_FAST_EXP=1</c> therefore makes the CPU and CUDA backends diverge

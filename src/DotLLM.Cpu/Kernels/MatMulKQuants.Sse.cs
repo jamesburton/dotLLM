@@ -37,6 +37,16 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     internal static float VecDotQ4_K_Q8_KSse(byte* qk, byte* q8k, int superBlockCount)
+        => VecDotQ4_K_Q8_KSse(qk, q8k, superBlockCount, Q4_K_BlockBytes);
+
+    /// <summary>
+    /// Stride-aware Q4_K SSSE3 dot. <paramref name="wStride"/> is the byte distance between
+    /// consecutive super-blocks of the same row: Q4_K_BlockBytes row-major, 4 * Q4_K_BlockBytes for
+    /// R4-interleaved weights. Lets the R4 layout run one call over the whole K, in the same
+    /// accumulation order as row-major, on non-AVX2 hardware too (#530).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static float VecDotQ4_K_Q8_KSse(byte* qk, byte* q8k, int superBlockCount, int wStride)
     {
         Vector128<float> acc = Vector128<float>.Zero;
         Vector128<byte> mask0F = Vector128.Create((byte)0x0F);
@@ -82,7 +92,7 @@ public static unsafe partial class MatMul
 
             acc = Sse.Add(acc, Sse.Multiply(Vector128.Create(d4 * d8), Sse2.ConvertToVector128Single(sumi)));
 
-            qk += Q4_K_BlockBytes;
+            qk += wStride;
             q8k += Q8_K_BlockBytes;
         }
 
@@ -93,6 +103,16 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     internal static float VecDotQ5_K_Q8_KSse(byte* qk, byte* q8k, int superBlockCount)
+        => VecDotQ5_K_Q8_KSse(qk, q8k, superBlockCount, Q5_K_BlockBytes);
+
+    /// <summary>
+    /// Stride-aware Q5_K SSSE3 dot. <paramref name="wStride"/> is the byte distance between
+    /// consecutive super-blocks of the same row: Q5_K_BlockBytes row-major, 4 * Q5_K_BlockBytes for
+    /// R4-interleaved weights. Lets the R4 layout run one call over the whole K, in the same
+    /// accumulation order as row-major, on non-AVX2 hardware too (#530).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static float VecDotQ5_K_Q8_KSse(byte* qk, byte* q8k, int superBlockCount, int wStride)
     {
         Vector128<float> acc = Vector128<float>.Zero;
         Vector128<byte> mask0F = Vector128.Create((byte)0x0F);
@@ -148,7 +168,7 @@ public static unsafe partial class MatMul
 
             acc = Sse.Add(acc, Sse.Multiply(Vector128.Create(d5 * d8), Sse2.ConvertToVector128Single(sumi)));
 
-            qk += Q5_K_BlockBytes;
+            qk += wStride;
             q8k += Q8_K_BlockBytes;
         }
 
@@ -159,6 +179,16 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     internal static float VecDotQ6_K_Q8_KSse(byte* qk, byte* q8k, int superBlockCount)
+        => VecDotQ6_K_Q8_KSse(qk, q8k, superBlockCount, Q6_K_BlockBytes);
+
+    /// <summary>
+    /// Stride-aware Q6_K SSSE3 dot. <paramref name="wStride"/> is the byte distance between
+    /// consecutive super-blocks of the same row: Q6_K_BlockBytes row-major, 4 * Q6_K_BlockBytes for
+    /// R4-interleaved weights. Lets the R4 layout run one call over the whole K, in the same
+    /// accumulation order as row-major, on non-AVX2 hardware too (#530).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static float VecDotQ6_K_Q8_KSse(byte* qk, byte* q8k, int superBlockCount, int wStride)
     {
         Vector128<float> acc = Vector128<float>.Zero;
         Vector128<byte> mask0F = Vector128.Create((byte)0x0F);
@@ -207,7 +237,7 @@ public static unsafe partial class MatMul
 
             acc = Sse.Add(acc, Sse.Multiply(Vector128.Create(d6 * d8), Sse2.ConvertToVector128Single(sumi)));
 
-            qk += Q6_K_BlockBytes;
+            qk += wStride;
             q8k += Q8_K_BlockBytes;
         }
 
@@ -379,13 +409,31 @@ public static unsafe partial class MatMul
     internal static float VecDotQ4_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount) =>
         Ssse3.IsSupported ? VecDotQ4_K_Q8_KSse(qk, q8k, superBlockCount) : VecDotQ4_K_Q8_KScalar(qk, q8k, superBlockCount);
 
+    /// <inheritdoc cref="VecDotQ4_K_Q8_KSse(byte*, byte*, int, int)"/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static float VecDotQ4_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount, int wStride) =>
+        Ssse3.IsSupported ? VecDotQ4_K_Q8_KSse(qk, q8k, superBlockCount, wStride)
+                          : VecDotQ4_K_Q8_KScalar(qk, q8k, superBlockCount, wStride);
+
     /// <summary>Best non-AVX2 Q5_K dot (SSSE3, else scalar).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotQ5_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount) =>
         Ssse3.IsSupported ? VecDotQ5_K_Q8_KSse(qk, q8k, superBlockCount) : VecDotQ5_K_Q8_KScalar(qk, q8k, superBlockCount);
 
+    /// <inheritdoc cref="VecDotQ5_K_Q8_KSse(byte*, byte*, int, int)"/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static float VecDotQ5_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount, int wStride) =>
+        Ssse3.IsSupported ? VecDotQ5_K_Q8_KSse(qk, q8k, superBlockCount, wStride)
+                          : VecDotQ5_K_Q8_KScalar(qk, q8k, superBlockCount, wStride);
+
     /// <summary>Best non-AVX2 Q6_K dot (SSSE3, else scalar).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float VecDotQ6_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount) =>
         Ssse3.IsSupported ? VecDotQ6_K_Q8_KSse(qk, q8k, superBlockCount) : VecDotQ6_K_Q8_KScalar(qk, q8k, superBlockCount);
+
+    /// <inheritdoc cref="VecDotQ6_K_Q8_KSse(byte*, byte*, int, int)"/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static float VecDotQ6_K_Q8_KPortable(byte* qk, byte* q8k, int superBlockCount, int wStride) =>
+        Ssse3.IsSupported ? VecDotQ6_K_Q8_KSse(qk, q8k, superBlockCount, wStride)
+                          : VecDotQ6_K_Q8_KScalar(qk, q8k, superBlockCount, wStride);
 }

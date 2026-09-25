@@ -1348,8 +1348,40 @@ public sealed unsafe class HybridTransformerModel : IModel
                                  int m, int k, int n, byte* preQuantizedInput,
                                  in WeightRepacking.RepackedWeight rw)
     {
-        if (rw.Ptr == 0 || n > 1 || rw.RowBytes < InterleavedMinRowBytes)
+        if (rw.Ptr == 0 || rw.RowBytes < InterleavedMinRowBytes)
         {
+            Gemm(origWeights, qt, b, c, m, k, n, preQuantizedInput);
+            return;
+        }
+
+        if (n > 1)
+        {
+            // #530: the multi-token arm must run the same repacked kernels as the n == 1 arm,
+            // otherwise a row's output depends on how many tokens shared the forward pass.
+            switch (qt)
+            {
+                case QuantizationType.Q8_0:
+                    MatMul.GemmR4TiledQ8_0((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 32, m, k, n, _threadPool);
+                    return;
+                case QuantizationType.Q5_0:
+                    MatMul.GemmR4TiledQ5_0((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 32, m, k, n, _threadPool);
+                    return;
+                case QuantizationType.Q4_K:
+                    MatMul.GemmR4TiledQ4_K((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 256, m, k, n, _threadPool);
+                    return;
+                case QuantizationType.Q5_K:
+                    MatMul.GemmR4TiledQ5_K((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 256, m, k, n, _threadPool);
+                    return;
+                case QuantizationType.Q6_K:
+                    MatMul.GemmR4TiledQ6_K((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 256, m, k, n, _threadPool);
+                    return;
+            }
+
             Gemm(origWeights, qt, b, c, m, k, n, preQuantizedInput);
             return;
         }

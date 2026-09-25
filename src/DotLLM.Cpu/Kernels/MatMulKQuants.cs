@@ -181,6 +181,16 @@ public static unsafe partial class MatMul
     /// </summary>
     [SkipLocalsInit]
     internal static float VecDotQ6_K_Q8_KScalar(byte* qk, byte* q8k, int superBlockCount)
+        => VecDotQ6_K_Q8_KScalar(qk, q8k, superBlockCount, Q6_K_BlockBytes);
+
+    /// <summary>
+    /// Stride-aware Q6_K x Q8_K dot product. <paramref name="wStride"/> is the byte distance
+    /// between consecutive super-blocks of the SAME row: Q6_K_BlockBytes for row-major
+    /// weights, 4 * Q6_K_BlockBytes for R4-interleaved weights. Accumulation order is
+    /// therefore identical for both layouts (#530).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static float VecDotQ6_K_Q8_KScalar(byte* qk, byte* q8k, int superBlockCount, int wStride)
     {
         float sumf = 0;
 
@@ -224,7 +234,7 @@ public static unsafe partial class MatMul
                 sumf += sc * sumi;
             }
 
-            qk += Q6_K_BlockBytes;
+            qk += wStride;
             q8k += Q8_K_BlockBytes;
         }
 
@@ -241,6 +251,16 @@ public static unsafe partial class MatMul
     /// </summary>
     [SkipLocalsInit]
     internal static float VecDotQ4_K_Q8_KScalar(byte* qk, byte* q8k, int superBlockCount)
+        => VecDotQ4_K_Q8_KScalar(qk, q8k, superBlockCount, Q4_K_BlockBytes);
+
+    /// <summary>
+    /// Stride-aware Q4_K x Q8_K dot product. <paramref name="wStride"/> is the byte distance
+    /// between consecutive super-blocks of the SAME row: Q4_K_BlockBytes for row-major
+    /// weights, 4 * Q4_K_BlockBytes for R4-interleaved weights. Accumulation order is
+    /// therefore identical for both layouts (#530).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static float VecDotQ4_K_Q8_KScalar(byte* qk, byte* q8k, int superBlockCount, int wStride)
     {
         float sumf = 0;
 
@@ -281,7 +301,7 @@ public static unsafe partial class MatMul
                 sumf += d8 * (sc * prodSum - mn * q8Sum);
             }
 
-            qk += Q4_K_BlockBytes;
+            qk += wStride;
             q8k += Q8_K_BlockBytes;
         }
 
@@ -297,6 +317,16 @@ public static unsafe partial class MatMul
     /// </summary>
     [SkipLocalsInit]
     internal static float VecDotQ5_K_Q8_KScalar(byte* qk, byte* q8k, int superBlockCount)
+        => VecDotQ5_K_Q8_KScalar(qk, q8k, superBlockCount, Q5_K_BlockBytes);
+
+    /// <summary>
+    /// Stride-aware Q5_K x Q8_K dot product. <paramref name="wStride"/> is the byte distance
+    /// between consecutive super-blocks of the SAME row: Q5_K_BlockBytes for row-major
+    /// weights, 4 * Q5_K_BlockBytes for R4-interleaved weights. Accumulation order is
+    /// therefore identical for both layouts (#530).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static float VecDotQ5_K_Q8_KScalar(byte* qk, byte* q8k, int superBlockCount, int wStride)
     {
         float sumf = 0;
 
@@ -339,7 +369,7 @@ public static unsafe partial class MatMul
                 sumf += d8 * (sc * prodSum - mn * q8Sum);
             }
 
-            qk += Q5_K_BlockBytes;
+            qk += wStride;
             q8k += Q8_K_BlockBytes;
         }
 
@@ -587,13 +617,25 @@ public static unsafe partial class MatMul
     internal static void VecDotQ4_K_Q8_K_4Rows(
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, float* results)
+        => VecDotQ4_K_Q8_K_4Rows(w0, w1, w2, w3, q8k, superBlockCount, Q4_K_BlockBytes, results);
+
+    /// <summary>
+    /// Stride-aware 4-row Q4_K x Q8_K. <paramref name="wStride"/> is the byte distance between
+    /// consecutive super-blocks of the same row — Q4_K_BlockBytes row-major, 4 * Q4_K_BlockBytes
+    /// for R4-interleaved weights. One call covers the whole K, so the R4 layout accumulates
+    /// in the same vector accumulators, in the same order, as the row-major layout (#530).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void VecDotQ4_K_Q8_K_4Rows(
+        byte* w0, byte* w1, byte* w2, byte* w3,
+        byte* q8k, int superBlockCount, int wStride, float* results)
     {
         if (!Avx2.IsSupported)
         {
-            results[0] = VecDotQ4_K_Q8_KPortable(w0, q8k, superBlockCount);
-            results[1] = VecDotQ4_K_Q8_KPortable(w1, q8k, superBlockCount);
-            results[2] = VecDotQ4_K_Q8_KPortable(w2, q8k, superBlockCount);
-            results[3] = VecDotQ4_K_Q8_KPortable(w3, q8k, superBlockCount);
+            results[0] = VecDotQ4_K_Q8_KPortable(w0, q8k, superBlockCount, wStride);
+            results[1] = VecDotQ4_K_Q8_KPortable(w1, q8k, superBlockCount, wStride);
+            results[2] = VecDotQ4_K_Q8_KPortable(w2, q8k, superBlockCount, wStride);
+            results[3] = VecDotQ4_K_Q8_KPortable(w3, q8k, superBlockCount, wStride);
             return;
         }
 
@@ -707,8 +749,8 @@ public static unsafe partial class MatMul
                 acc3 = Avx.Add(acc3, Avx.Multiply(Vector256.Create(d4_3 * d8), Avx.ConvertToVector256Single(sumi3)));
             }
 
-            w0 += Q4_K_BlockBytes; w1 += Q4_K_BlockBytes;
-            w2 += Q4_K_BlockBytes; w3 += Q4_K_BlockBytes;
+            w0 += wStride; w1 += wStride;
+            w2 += wStride; w3 += wStride;
             q8k += Q8_K_BlockBytes;
         }
 
@@ -725,13 +767,25 @@ public static unsafe partial class MatMul
     internal static void VecDotQ5_K_Q8_K_4Rows(
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, float* results)
+        => VecDotQ5_K_Q8_K_4Rows(w0, w1, w2, w3, q8k, superBlockCount, Q5_K_BlockBytes, results);
+
+    /// <summary>
+    /// Stride-aware 4-row Q5_K x Q8_K. <paramref name="wStride"/> is the byte distance between
+    /// consecutive super-blocks of the same row — Q5_K_BlockBytes row-major, 4 * Q5_K_BlockBytes
+    /// for R4-interleaved weights. One call covers the whole K, so the R4 layout accumulates
+    /// in the same vector accumulators, in the same order, as the row-major layout (#530).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void VecDotQ5_K_Q8_K_4Rows(
+        byte* w0, byte* w1, byte* w2, byte* w3,
+        byte* q8k, int superBlockCount, int wStride, float* results)
     {
         if (!Avx2.IsSupported)
         {
-            results[0] = VecDotQ5_K_Q8_KPortable(w0, q8k, superBlockCount);
-            results[1] = VecDotQ5_K_Q8_KPortable(w1, q8k, superBlockCount);
-            results[2] = VecDotQ5_K_Q8_KPortable(w2, q8k, superBlockCount);
-            results[3] = VecDotQ5_K_Q8_KPortable(w3, q8k, superBlockCount);
+            results[0] = VecDotQ5_K_Q8_KPortable(w0, q8k, superBlockCount, wStride);
+            results[1] = VecDotQ5_K_Q8_KPortable(w1, q8k, superBlockCount, wStride);
+            results[2] = VecDotQ5_K_Q8_KPortable(w2, q8k, superBlockCount, wStride);
+            results[3] = VecDotQ5_K_Q8_KPortable(w3, q8k, superBlockCount, wStride);
             return;
         }
 
@@ -869,8 +923,8 @@ public static unsafe partial class MatMul
                 acc3 = Avx.Add(acc3, Avx.Multiply(Vector256.Create(d5_3 * d8), Avx.ConvertToVector256Single(sumi3)));
             }
 
-            w0 += Q5_K_BlockBytes; w1 += Q5_K_BlockBytes;
-            w2 += Q5_K_BlockBytes; w3 += Q5_K_BlockBytes;
+            w0 += wStride; w1 += wStride;
+            w2 += wStride; w3 += wStride;
             q8k += Q8_K_BlockBytes;
         }
 
@@ -887,13 +941,25 @@ public static unsafe partial class MatMul
     internal static void VecDotQ6_K_Q8_K_4Rows(
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, float* results)
+        => VecDotQ6_K_Q8_K_4Rows(w0, w1, w2, w3, q8k, superBlockCount, Q6_K_BlockBytes, results);
+
+    /// <summary>
+    /// Stride-aware 4-row Q6_K x Q8_K. <paramref name="wStride"/> is the byte distance between
+    /// consecutive super-blocks of the same row — Q6_K_BlockBytes row-major, 4 * Q6_K_BlockBytes
+    /// for R4-interleaved weights. One call covers the whole K, so the R4 layout accumulates
+    /// in the same vector accumulators, in the same order, as the row-major layout (#530).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void VecDotQ6_K_Q8_K_4Rows(
+        byte* w0, byte* w1, byte* w2, byte* w3,
+        byte* q8k, int superBlockCount, int wStride, float* results)
     {
         if (!Avx2.IsSupported)
         {
-            results[0] = VecDotQ6_K_Q8_KPortable(w0, q8k, superBlockCount);
-            results[1] = VecDotQ6_K_Q8_KPortable(w1, q8k, superBlockCount);
-            results[2] = VecDotQ6_K_Q8_KPortable(w2, q8k, superBlockCount);
-            results[3] = VecDotQ6_K_Q8_KPortable(w3, q8k, superBlockCount);
+            results[0] = VecDotQ6_K_Q8_KPortable(w0, q8k, superBlockCount, wStride);
+            results[1] = VecDotQ6_K_Q8_KPortable(w1, q8k, superBlockCount, wStride);
+            results[2] = VecDotQ6_K_Q8_KPortable(w2, q8k, superBlockCount, wStride);
+            results[3] = VecDotQ6_K_Q8_KPortable(w3, q8k, superBlockCount, wStride);
             return;
         }
 
@@ -1013,8 +1079,8 @@ public static unsafe partial class MatMul
                 acc3 = Avx.Add(acc3, Avx.Multiply(Vector256.Create(d6_3 * d8), Avx.ConvertToVector256Single(sumi3)));
             }
 
-            w0 += Q6_K_BlockBytes; w1 += Q6_K_BlockBytes;
-            w2 += Q6_K_BlockBytes; w3 += Q6_K_BlockBytes;
+            w0 += wStride; w1 += wStride;
+            w2 += wStride; w3 += wStride;
             q8k += Q8_K_BlockBytes;
         }
 
@@ -1113,30 +1179,6 @@ public static unsafe partial class MatMul
     // ──────────────────── R4 Interleaved ComputeRows for K-quants ────────────────────
 
     /// <summary>
-    /// Scalar K-quant dot product for a single row within an R4-interleaved group.
-    /// Super-blocks from 4 rows are interleaved; block stride is 4 * blockBytes.
-    /// Extracts per-super-block pointers with R4 addressing and delegates to the scalar kernel.
-    /// </summary>
-    [SkipLocalsInit]
-    private static float VecDotKQuantScalarR4(
-        byte* groupBase, int rowInGroup, byte* q8k, int superBlockCount,
-        int blockBytes,
-        delegate*<byte*, byte*, int, float> scalarFn)
-    {
-        // Cannot call scalar VecDot directly since it expects contiguous super-blocks.
-        // Instead, accumulate per-super-block results with R4 addressing.
-        float sumf = 0;
-        int wStride = 4 * blockBytes;
-        for (int sb = 0; sb < superBlockCount; sb++)
-        {
-            byte* wSb = groupBase + sb * wStride + rowInGroup * blockBytes;
-            byte* q8Sb = q8k + sb * Q8_K_BlockBytes;
-            sumf += scalarFn(wSb, q8Sb, 1);
-        }
-        return sumf;
-    }
-
-    /// <summary>
     /// Processes R4-interleaved Q4_K weights. For full groups, extracts 4 row pointers
     /// from the R4 layout and delegates to existing 4-row VecDot with R4 block stride.
     /// K-quant super-blocks are large enough (144+ bytes) that the R4 adjacency
@@ -1152,28 +1194,12 @@ public static unsafe partial class MatMul
         for (int g = 0; g < fullGroups; g++)
         {
             byte* groupBase = repackedWeights + (long)g * groupBytes;
-            if (Avx2.IsSupported)
-            {
-                float r0 = 0, r1 = 0, r2 = 0, r3 = 0;
-                int wStride = 4 * Q4_K_BlockBytes;
-                float* tmp = result + g * 4; // reuse output as scratch
-                for (int sb = 0; sb < superBlockCount; sb++)
-                {
-                    byte* sbBase = groupBase + sb * wStride;
-                    VecDotQ4_K_Q8_K_4Rows(sbBase, sbBase + Q4_K_BlockBytes,
-                        sbBase + 2 * Q4_K_BlockBytes, sbBase + 3 * Q4_K_BlockBytes,
-                        xQ8K + sb * Q8_K_BlockBytes, 1, tmp);
-                    r0 += tmp[0]; r1 += tmp[1]; r2 += tmp[2]; r3 += tmp[3];
-                }
-                result[g * 4] = r0; result[g * 4 + 1] = r1;
-                result[g * 4 + 2] = r2; result[g * 4 + 3] = r3;
-            }
-            else
-            {
-                for (int r = 0; r < 4; r++)
-                    result[g * 4 + r] = VecDotKQuantScalarR4(groupBase, r, xQ8K,
-                        superBlockCount, Q4_K_BlockBytes, &VecDotQ4_K_Q8_KPortable);
-            }
+            // One strided call over the whole K, exactly as the row-major ComputeRowsQ4_K
+            // path does - same accumulators, same order, so the R4 and row-major layouts
+            // produce bit-identical results (#530).
+            VecDotQ4_K_Q8_K_4Rows(groupBase, groupBase + Q4_K_BlockBytes,
+                groupBase + 2 * Q4_K_BlockBytes, groupBase + 3 * Q4_K_BlockBytes,
+                xQ8K, superBlockCount, 4 * Q4_K_BlockBytes, result + g * 4);
         }
 
         if (tailRows > 0)
@@ -1200,28 +1226,12 @@ public static unsafe partial class MatMul
         for (int g = 0; g < fullGroups; g++)
         {
             byte* groupBase = repackedWeights + (long)g * groupBytes;
-            if (Avx2.IsSupported)
-            {
-                float r0 = 0, r1 = 0, r2 = 0, r3 = 0;
-                int wStride = 4 * Q5_K_BlockBytes;
-                float* tmp = result + g * 4;
-                for (int sb = 0; sb < superBlockCount; sb++)
-                {
-                    byte* sbBase = groupBase + sb * wStride;
-                    VecDotQ5_K_Q8_K_4Rows(sbBase, sbBase + Q5_K_BlockBytes,
-                        sbBase + 2 * Q5_K_BlockBytes, sbBase + 3 * Q5_K_BlockBytes,
-                        xQ8K + sb * Q8_K_BlockBytes, 1, tmp);
-                    r0 += tmp[0]; r1 += tmp[1]; r2 += tmp[2]; r3 += tmp[3];
-                }
-                result[g * 4] = r0; result[g * 4 + 1] = r1;
-                result[g * 4 + 2] = r2; result[g * 4 + 3] = r3;
-            }
-            else
-            {
-                for (int r = 0; r < 4; r++)
-                    result[g * 4 + r] = VecDotKQuantScalarR4(groupBase, r, xQ8K,
-                        superBlockCount, Q5_K_BlockBytes, &VecDotQ5_K_Q8_KPortable);
-            }
+            // One strided call over the whole K, exactly as the row-major ComputeRowsQ5_K
+            // path does - same accumulators, same order, so the R4 and row-major layouts
+            // produce bit-identical results (#530).
+            VecDotQ5_K_Q8_K_4Rows(groupBase, groupBase + Q5_K_BlockBytes,
+                groupBase + 2 * Q5_K_BlockBytes, groupBase + 3 * Q5_K_BlockBytes,
+                xQ8K, superBlockCount, 4 * Q5_K_BlockBytes, result + g * 4);
         }
 
         if (tailRows > 0)
@@ -1248,28 +1258,12 @@ public static unsafe partial class MatMul
         for (int g = 0; g < fullGroups; g++)
         {
             byte* groupBase = repackedWeights + (long)g * groupBytes;
-            if (Avx2.IsSupported)
-            {
-                float r0 = 0, r1 = 0, r2 = 0, r3 = 0;
-                int wStride = 4 * Q6_K_BlockBytes;
-                float* tmp = result + g * 4;
-                for (int sb = 0; sb < superBlockCount; sb++)
-                {
-                    byte* sbBase = groupBase + sb * wStride;
-                    VecDotQ6_K_Q8_K_4Rows(sbBase, sbBase + Q6_K_BlockBytes,
-                        sbBase + 2 * Q6_K_BlockBytes, sbBase + 3 * Q6_K_BlockBytes,
-                        xQ8K + sb * Q8_K_BlockBytes, 1, tmp);
-                    r0 += tmp[0]; r1 += tmp[1]; r2 += tmp[2]; r3 += tmp[3];
-                }
-                result[g * 4] = r0; result[g * 4 + 1] = r1;
-                result[g * 4 + 2] = r2; result[g * 4 + 3] = r3;
-            }
-            else
-            {
-                for (int r = 0; r < 4; r++)
-                    result[g * 4 + r] = VecDotKQuantScalarR4(groupBase, r, xQ8K,
-                        superBlockCount, Q6_K_BlockBytes, &VecDotQ6_K_Q8_KPortable);
-            }
+            // One strided call over the whole K, exactly as the row-major ComputeRowsQ6_K
+            // path does - same accumulators, same order, so the R4 and row-major layouts
+            // produce bit-identical results (#530).
+            VecDotQ6_K_Q8_K_4Rows(groupBase, groupBase + Q6_K_BlockBytes,
+                groupBase + 2 * Q6_K_BlockBytes, groupBase + 3 * Q6_K_BlockBytes,
+                xQ8K, superBlockCount, 4 * Q6_K_BlockBytes, result + g * 4);
         }
 
         if (tailRows > 0)
@@ -1831,7 +1825,7 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     private static void ComputeKQuantR4Range(ref ComputeRowsR4Ctx ctx, int start, int count,
         int kBlockBytes,
-        delegate*<byte*, byte*, byte*, byte*, byte*, int, float*, void> vecDot4Rows,
+        delegate*<byte*, byte*, byte*, byte*, byte*, int, int, float*, void> vecDot4Rows,
         delegate*<byte*, byte*, int, float> vecDotAvx2,
         delegate*<byte*, byte*, int, float> vecDotScalar)
     {
@@ -1845,28 +1839,10 @@ public static unsafe partial class MatMul
         for (int g = startGroup; g < endGroup; g++)
         {
             byte* groupBase = ctx.RepackedWeights + (long)g * groupBytes;
-            if (Avx2.IsSupported)
-            {
-                float r0 = 0, r1 = 0, r2 = 0, r3 = 0;
-                int wStride = 4 * kBlockBytes;
-                float* tmp = ctx.Result + g * 4;
-                for (int sb = 0; sb < ctx.BlockCount; sb++)
-                {
-                    byte* sbBase = groupBase + sb * wStride;
-                    vecDot4Rows(sbBase, sbBase + kBlockBytes,
-                        sbBase + 2 * kBlockBytes, sbBase + 3 * kBlockBytes,
-                        ctx.XQ + sb * Q8_K_BlockBytes, 1, tmp);
-                    r0 += tmp[0]; r1 += tmp[1]; r2 += tmp[2]; r3 += tmp[3];
-                }
-                ctx.Result[g * 4] = r0; ctx.Result[g * 4 + 1] = r1;
-                ctx.Result[g * 4 + 2] = r2; ctx.Result[g * 4 + 3] = r3;
-            }
-            else
-            {
-                for (int r = 0; r < 4; r++)
-                    ctx.Result[g * 4 + r] = VecDotKQuantScalarR4(groupBase, r, ctx.XQ,
-                        ctx.BlockCount, kBlockBytes, vecDotScalar);
-            }
+            // Single strided call over the whole K — see ComputeRowsQ4_KInterleaved (#530).
+            vecDot4Rows(groupBase, groupBase + kBlockBytes,
+                groupBase + 2 * kBlockBytes, groupBase + 3 * kBlockBytes,
+                ctx.XQ, ctx.BlockCount, 4 * kBlockBytes, ctx.Result + g * 4);
         }
 
         if (ctx.TailRows > 0 && end > ctx.FullGroups * 4)

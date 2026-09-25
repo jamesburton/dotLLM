@@ -262,6 +262,57 @@ anyone ships. Their sensitivity is what makes such a comparison look dramatic an
 
 Full working: `.docs/measurements/2026-09-24-521-amplification-not-kernel-defects.md`.
 
+### #501's 40-chunk Q3_K rows are the F32-decoded path (#531)
+
+`src/DotLLM.Cpu/Kernels/FastMath.cs` recorded a Q3_K gap to llama.cpp of **+2.03% → +0.28%** (40
+chunks, 2026-09-23), against the **+1.03%** / **+1.325%** in the tables above for what looked like
+the same fixture. The suspicion when #531 was opened was a BOS omission on the `--tokens-file`
+path. **It was not.** That run passed `--bos`, and a misaligned stream could not reproduce
+today's default-aligned `--corpus` run to six decimals — which it does. Re-run on `dev`,
+2026-09-24, 40-window prefix of a 64-window sweep, `DOTLLM_FAST_EXP` on / off:
+
+| fixture | approximate exp | accurate exp | window 0 (approx) |
+|---|---|---|---|
+| `Llama-3.2-1B-pure-Q3_K` (packed Q3_K × Q8_K) | 22.5090 | 22.1019 | 11.942101 |
+| **`Llama-3.2-1B-pure-Q3_K-decoded-F32`** | **22.2692** | **21.8886** | **11.763354** |
+
+The bold row is #501's two figures and its quoted window 0, to every printed digit. So the two
+documents were never measuring the same thing: the #501 run's Q3_K prefill was arithmetically the
+F32-decoded path (its own FINDINGS.md says a `llama-quantize … F32` expansion reproduced it
+exactly, and that `Gemm` routed Q3_K to `GemmDequantRows`), while everything since runs the packed
+dot. The 1.06% between them is the same packed-vs-F32 gap the 64-chunk table above already shows
+(23.4613 vs 23.2145).
+
+Consequences: **+0.28% is a valid figure in the decoded-F32 column** — it sits beside this
+document's +0.36% / +0.681%, not beside its packed +1.03% / +1.325% — and the sentence
+"against llama.cpp the gap goes from +2.03% to +0.28%" is not an engine claim, because only one
+side of it was running Q3_K. The tables in this document are the aligned, like-for-like ones.
+
+**A fourth instance of the same lesson, with a new axis.** Each earlier time a number was wrong,
+the two sides had scored different *text* (CRLF, then BOS). This time they scored identical text
+with different *kernels*. Record which code path produced a figure, not only which file and which
+tokens — a fixture name is not a path.
+
+### Measured: what the fast-exp approximation actually costs (#531)
+
+Same protocol, both arms dotLLM (`DOTLLM_FAST_EXP=1` vs off), plain `--corpus`, 64 windows,
+paired per window, 63 df. ΔNLL is **fast minus accurate**. Full working:
+`.docs/measurements/2026-09-24-531-fastexp-shipping-grade.md`.
+
+| model | fast-exp | accurate | ΔNLL (nats) | PPL % | t | 95% CI on PPL % |
+|---|---|---|---|---|---|---|
+| **Q4_K_M** (shipping-grade) | 15.7620 | 15.7669 | −0.00031 ± 0.00066 | −0.031% | **−0.47** | **[−0.163%, +0.101%]** |
+| Q4_K_M decoded to F32 (control) | 15.7378 | 15.7359 | +0.00012 ± 0.00037 | +0.012% | +0.32 | [−0.063%, +0.086%] |
+| Q3_K (pure ladder) | 23.8620 | 23.4613 | +0.01693 ± 0.00178 | +1.708% | +9.50 | [+1.346%, +2.071%] |
+| Q3_K decoded to F32 (control) | 23.6171 | 23.2145 | +0.01719 ± 0.00136 | +1.734% | +12.61 | [+1.457%, +2.012%] |
+
+**On a shipping quant it is not resolvable at n = 64** — the answer is a bound (≲0.16%), not a
+size. And the Q3_K control is the point of the exercise: it moves by as much as the quantized row
+while containing no quantized matmul, so the famous "−1.71% on Q3_K" is a property of *degraded
+weights*, not of the Q3_K path. This is the amplification rule applying to a claim that was not
+an engine comparison at all — both arms were dotLLM — which is worth noting, because the rule was
+written for engine-vs-engine work and generalizes further than that.
+
 ### Superseded: the first corrected baseline (2026-09-24, 64 chunks)
 
 Kept because it is what the `--tokens-file --bos` protocol produces and is a useful cross-check;
