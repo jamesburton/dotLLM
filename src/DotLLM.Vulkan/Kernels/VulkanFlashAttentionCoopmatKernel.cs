@@ -229,6 +229,20 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     /// or validate independently of the existing correctness tests.
     /// </summary>
     public static VulkanFlashAttentionCoopmatKernel Create(VulkanDevice device, string spvDir, FlashAttentionCoopmatVariant variant)
+        => Create(device, spvDir, variant, DefaultShaderBaseName);
+
+    /// <summary>The production SPV base name (<c>attention_flash_f32_coopmat</c>).</summary>
+    internal const string DefaultShaderBaseName = "attention_flash_f32_coopmat";
+
+    /// <summary>
+    /// Issue #533 measurement hook: loads <c>{shaderBaseName}.spv</c> (and
+    /// <c>{shaderBaseName}_hd64.spv</c> when present) instead of the production
+    /// pair, so a probe/bench can hold the shipping kernel and a candidate-fix
+    /// shader open in ONE process and A/B them same-session. Production callers
+    /// never pass this.
+    /// </summary>
+    internal static VulkanFlashAttentionCoopmatKernel Create(
+        VulkanDevice device, string spvDir, FlashAttentionCoopmatVariant variant, string shaderBaseName)
     {
         if (!SupportsDevice(device))
             throw new InvalidOperationException(
@@ -240,7 +254,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
                 $"Device cannot pin the compute stage to requiredSubgroupSize={variant.RequiredSubgroupSize}. " +
                 "Check FlashAttentionCoopmatVariant.IsSupportedOn(device) before calling Create() with an explicit variant.");
 
-        string path = Path.Combine(spvDir, "attention_flash_f32_coopmat.spv");
+        string path = Path.Combine(spvDir, shaderBaseName + ".spv");
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
@@ -271,7 +285,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         VulkanModule? hd64Module = null;
         ComputePipeline? hd64Pipeline = null;
         nint hd64Pool = 0;
-        string hd64Path = Path.Combine(spvDir, "attention_flash_f32_coopmat_hd64.spv");
+        string hd64Path = Path.Combine(spvDir, shaderBaseName + "_hd64.spv");
         if (File.Exists(hd64Path))
         {
             hd64Module = VulkanModule.LoadFromFile(device, hd64Path);
