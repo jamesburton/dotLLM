@@ -121,7 +121,7 @@ public class ChunkedPrefillLogitsQ5_0Tests(Q5_0ModelFixture fixture)
 /// <summary>
 /// Q8_0 carries a gap #530 does not close, but only at kernel level: its R4 and row-major kernels
 /// are not bit-identical (see
-/// <c>MatMulR4BatchInvarianceTests.Q8_0_RowMajorVsRepacked_StillDiverges</c>), and the fused decode
+/// <c>MatMulR4BatchInvarianceTests.Q8_0_RowMajorVsRepacked_StaysWithinBound</c>), and the fused decode
 /// QKV path (<c>FusedDecodeGemv3</c>) reads the original row-major weights while prefill QKV runs
 /// the R4 kernels. On SmolLM-135M that never surfaces — measured 0.0 delta at every chunk size —
 /// so this arm records the measurement rather than asserting a symptom no model here exhibits.

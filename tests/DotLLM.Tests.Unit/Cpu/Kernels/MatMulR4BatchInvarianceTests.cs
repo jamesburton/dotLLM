@@ -40,7 +40,7 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
 
     /// <summary>
     /// Quants whose R4 and row-major kernels are required to agree bit for bit. Q8_0 is absent on
-    /// purpose — see <see cref="Q8_0_RowMajorVsRepacked_StillDiverges"/>.
+    /// purpose — see <see cref="Q8_0_RowMajorVsRepacked_StaysWithinBound"/>.
     /// </summary>
     public static TheoryData<QuantizationType> LayoutParityQuants() => new()
     {
@@ -107,9 +107,8 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
     /// RED before the fix for Q4_K / Q5_K / Q6_K: the R4 kernel used to horizontally reduce and
     /// accumulate once per super-block, while the row-major kernel accumulated the whole K in
     /// vector accumulators. Q5_0 passes either way (its R4 kernel already accumulated across the
-    /// whole K); Q8_0 does not, which is a separate pre-existing gap — see
-    /// <see cref="Q8_0_RowMajorVsRepacked_StillDiverges"/>, which is also what shows this harness
-    /// is sensitive rather than simply lenient.
+    /// whole K); Q8_0 is absent because whether it agrees is tier-dependent — see
+    /// <see cref="Q8_0_RowMajorVsRepacked_StaysWithinBound"/> and #535.
     /// </remarks>
     [Theory]
     [MemberData(nameof(LayoutParityQuants))]
@@ -130,18 +129,32 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
     }
 
     /// <summary>
-    /// Records a gap #530 does NOT close, so it is not mistaken for fixed: Q8_0's R4 kernel
-    /// (<c>VecDotQ8_0Avx2_4RowsR4</c>) and its row-major kernel are not bit-identical. Nothing in
-    /// the transformer's O / FFN / lm_head path depends on that — both batch-size arms run the R4
-    /// kernel — but the fused decode QKV path (<c>FusedDecodeGemv3</c>) reads the ORIGINAL
-    /// row-major weights while prefill QKV runs R4, so for Q8_0 the QKV projections can depend on
-    /// batch size wherever both layouts are actually in play. On SmolLM-135M they are not
-    /// (measured 0.0 end-to-end, see ChunkedPrefillLogitsQ8_0Tests), so this is a kernel-level
-    /// finding only. Closing it means teaching the fused decode path the repacked layout — a
-    /// separate change, and that kernel is perf-tuned.
+    /// Bounds a gap #530 does NOT close (#535): Q8_0's R4 kernel
+    /// (<c>VecDotQ8_0Avx2_4RowsR4</c>) and its row-major kernel can disagree. Asserts only the
+    /// upper bound, because how much they disagree — including whether they disagree at all — is
+    /// hardware-tier-dependent.
     /// </summary>
+    /// <remarks>
+    /// Measured, and a datum for #535: 4.304E-006 relative on a Zen 5 box (row-major on the VNNI
+    /// tier, <c>ComputeRowsVnni</c>), 2.564E-006 on the same box with <c>DOTNET_EnableAVXVNNI=0</c>,
+    /// and bit-exact agreement on the GitHub runner. So the two layouts DO agree on at least one
+    /// shipping tier and disagree on others.
+    ///
+    /// An earlier version asserted <c>AnyBitDifference()</c> unconditionally and encoded a property
+    /// of one machine: green locally, red in CI. Gating that assertion on the VNNI tier would have
+    /// been a second guess of the same kind — disabling VNNI here does not make the two agree, so
+    /// VNNI is not the predicate, and nothing available on this box identifies the one that is.
+    /// The bound is what holds everywhere, so the bound is what this asserts; if the tiers ever
+    /// converge, this test simply keeps passing and #535 closes on its own evidence.
+    ///
+    /// Nothing in the transformer's O / FFN / lm_head path depends on the two agreeing: both
+    /// batch-size arms run the R4 kernel. The fused decode QKV path (<c>FusedDecodeGemv3</c>)
+    /// does read the ORIGINAL row-major weights while prefill QKV runs R4, so Q8_0 QKV can depend
+    /// on batch size wherever both layouts are in play — on SmolLM-135M it measures 0.0
+    /// end-to-end (see ChunkedPrefillLogitsQ8_0Tests), so this stays a kernel-level finding.
+    /// </remarks>
     [Fact]
-    public void Q8_0_RowMajorVsRepacked_StillDiverges()
+    public void Q8_0_RowMajorVsRepacked_StaysWithinBound()
     {
         const int n = 3;
         var f = new Fixture(QuantizationType.Q8_0, n, seed: 4530);
@@ -149,11 +162,7 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
         {
             f.RunRowMajorGemm(f.Actual);
             f.RunSingleTokenPerRow(f.Expected, pool: null);
-            Assert.True(f.AnyBitDifference(),
-                "Q8_0's R4 and row-major kernels now agree bit-exactly — delete this test and add " +
-                "Q8_0 to LayoutParityQuants.");
-            // Measured worst case 4.304E-006 relative (max over all outputs; the small-magnitude
-            // ones dominate the ratio). 1e-5 is ~2.3x headroom — tight enough to notice growth.
+
             Assert.True(f.MaxRelativeDifference() < 1e-5f,
                 $"Q8_0 R4-vs-row-major divergence grew beyond the recorded bound: {f.WorstPair()}");
         }
@@ -331,17 +340,7 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
             }
         }
 
-        public bool AnyBitDifference()
-        {
-            for (int i = 0; i < _n * M; i++)
-            {
-                if (BitConverter.SingleToInt32Bits(Expected[i]) != BitConverter.SingleToInt32Bits(Actual[i]))
-                    return true;
-            }
-
-            return false;
-        }
-
+        /// <summary>Worst offending element, so a failure shows noise vs functional break.</summary>
         public string WorstPair()
         {
             int worstIdx = 0;
@@ -355,7 +354,8 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
                 if (rel > worst) { worst = rel; worstIdx = i; }
             }
 
-            return $"worst rel {worst:E3} at [{worstIdx}] expected={Expected[worstIdx]:R} actual={Actual[worstIdx]:R}; max abs {worstAbs:E3}";
+            return $"worst rel {worst:E3} at [{worstIdx}] expected={Expected[worstIdx]:R} " +
+                   $"actual={Actual[worstIdx]:R}; max abs {worstAbs:E3}";
         }
 
         public float MaxRelativeDifference()
