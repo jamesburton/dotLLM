@@ -64,6 +64,7 @@ public sealed class Probe533VulkanKvBisectTests
         (float[][] baseK, float[][] baseV, float[] baseLogits) = RunAndCapture(model, device, config, Prompt.Length);
 
         int stride0 = KvStride(model, config, 0);
+        var notInvariant = new List<string>();
         foreach (int c in new[] { 1, 2, 3, 4, 5, 6 })
         {
             (float[][] k, float[][] v, _) = RunAndCapture(model, device, config, c);
@@ -76,6 +77,13 @@ public sealed class Probe533VulkanKvBisectTests
             }
             sb.AppendLine($"  chunk={c} ({(c % 2 == 0 ? "even" : "odd ")}): " +
                           (firstBadLayer < 0 ? "KV IDENTICAL across all 16 layers" : $"first bad layer={firstBadLayer}"));
+            // #533 REGRESSION GATE. c == 1 is EXCLUDED on purpose: a 1-token chunk
+            // never reaches the coopmat FA kernel and additionally crosses the
+            // n == 1 matmul dispatch split, so it measures #538, not this issue
+            // (see the class remarks). Every c >= 2 is a genuine odd-vs-even KV
+            // tile comparison and must be bit-identical after the fix.
+            if (c > 1 && firstBadLayer >= 0)
+                notInvariant.Add($"chunk={c} diverges from layer {firstBadLayer}");
             // Per-row profile for the first three layers.
             for (int layer = 0; layer < 3; layer++)
             {
@@ -92,6 +100,9 @@ public sealed class Probe533VulkanKvBisectTests
         _ = baseLogits;
 
         _out.WriteLine(sb.ToString());
+        Assert.True(notInvariant.Count == 0,
+            "chunked prefill must write a bit-identical KV cache regardless of chunk length: "
+            + string.Join("; ", notInvariant) + Environment.NewLine + sb);
     }
 
     /// <summary>
@@ -118,6 +129,7 @@ public sealed class Probe533VulkanKvBisectTests
         sb.AppendLine($"model={Path.GetFileName(path)} prompt={Prompt.Length} tokens, generate={gen}");
 
         int[] baseline = Generate(model, config, [Prompt.Length], gen);
+        var flipped = new List<string>();
         foreach (int[] split in new[] { new[] { 2, 2, 2 }, new[] { 3, 3 }, new[] { 1, 5 }, new[] { 5, 1 }, new[] { 2, 1, 3 } })
         {
             int[] got = Generate(model, config, split, gen);
@@ -125,8 +137,24 @@ public sealed class Probe533VulkanKvBisectTests
             for (int i = 0; i < gen; i++) if (baseline[i] != got[i]) { first = i; break; }
             sb.AppendLine($"  chunks=[{string.Join(",", split)}] ({(Array.TrueForAll(split, s => s % 2 == 0) ? "all even" : "has odd")}): " +
                           (first < 0 ? "IDENTICAL 64 tokens" : $"FIRST DIFFERENT TOKEN at step {first}: {baseline[first]} -> {got[first]}"));
+
+            // #533 REGRESSION GATE, end to end on a real model. [3,3] is THE
+            // demonstration of this issue: before the fix it flipped at step 41
+            // (469 -> 21970) while [2,2,2] was already identical.
+            //
+            // Splits containing a size-1 chunk ([1,5], [5,1], [2,1,3]) are
+            // deliberately NOT gated: they still diverge, but for #538 — a size-1
+            // chunk skips the coopmat FA kernel entirely and crosses the n == 1
+            // matmul dispatch split. Gating them here would make this test fail
+            // for a defect it does not cover, and would hide a #533 regression
+            // behind an unrelated red.
+            if (Array.TrueForAll(split, s => s > 1) && first >= 0)
+                flipped.Add($"[{string.Join(",", split)}] flips at step {first} ({baseline[first]} -> {got[first]})");
         }
         _out.WriteLine(sb.ToString());
+        Assert.True(flipped.Count == 0,
+            "chunked prefill changed the generated text: " + string.Join("; ", flipped)
+            + Environment.NewLine + sb);
     }
 
     private static unsafe int[] Generate(
