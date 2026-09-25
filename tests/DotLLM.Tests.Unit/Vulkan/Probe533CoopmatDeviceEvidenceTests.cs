@@ -136,6 +136,80 @@ public sealed class Probe533CoopmatDeviceEvidenceTests
         _out.WriteLine(sb.ToString());
     }
 
+    /// <summary>
+    /// Wave-width discriminator. NVIDIA runs this shader at subgroup size 32 and
+    /// AMD gfx1151 at 64, so a clean NVIDIA result alone cannot separate "AMD
+    /// compiler" from "the wave64 compilation of this shader". This arm pins the
+    /// coopmat FA pipeline to <c>requiredSubgroupSize=32</c> on whatever device is
+    /// present and re-runs the square-prefill parity sweep.
+    /// </summary>
+    /// <remarks>
+    /// On AMD: parity gone at 32 =&gt; the defect belongs to the wave64 compile.
+    /// Parity still present at 32 =&gt; vendor-wide on AMD, independent of wave width.
+    /// </remarks>
+    [SkippableFact]
+    public void Coopmat_SubgroupSizePinnedTo32_ParitySweep()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+
+        var pinned32 = new FlashAttentionCoopmatVariant(32);
+        Skip.IfNot(device.HasCooperativeMatrix, "no coopmat on this device");
+        Skip.IfNot(pinned32.IsSupportedOn(device), "device cannot pin requiredSubgroupSize=32 for compute");
+
+        const int numHeads = 32, numKvHeads = 8, headDim = 64, maxN = 8;
+        int qRow = numHeads * headDim, kvRow = numKvHeads * headDim;
+
+        var rng = new Random(5334); // SAME seed as Attention_SquarePrefillInvariance
+        float[] q = RandomFloats(rng, maxN * qRow);
+        float[] kk = RandomFloats(rng, maxN * kvRow);
+        float[] vv = RandomFloats(rng, maxN * kvRow);
+
+        using var bufQ = device.Allocate((long)maxN * qRow * sizeof(float));
+        using var bufK = device.Allocate((long)maxN * kvRow * sizeof(float));
+        using var bufV = device.Allocate((long)maxN * kvRow * sizeof(float));
+        using var bufO = device.Allocate((long)maxN * qRow * sizeof(float));
+        device.Upload(q, bufQ);
+        device.Upload(kk, bufK);
+        device.Upload(vv, bufV);
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"=== #533 coopmat FA parity with requiredSubgroupSize=32 PINNED ({device.DeviceName}, native SubgroupSize={device.SubgroupSize}) ===");
+
+        using (var coop = VulkanFlashAttentionCoopmatKernel.Create(device, spvDir, pinned32))
+        {
+            float[] Run(int n)
+            {
+                coop.Launch(bufQ, bufK, bufV, bufO, n, n, numHeads, numKvHeads, headDim);
+                var all = new float[(long)maxN * qRow];
+                device.Download(bufO, all);
+                return all;
+            }
+
+            float[] reference = Run(maxN);
+            for (int n = 1; n < maxN; n++)
+            {
+                float[] got = Run(n);
+                long diff = 0; float maxAbs = 0; int firstRow = -1;
+                for (int r = 0; r < n; r++)
+                    for (int i = 0; i < qRow; i++)
+                    {
+                        int idx = r * qRow + i;
+                        if (BitConverter.SingleToInt32Bits(reference[idx]) != BitConverter.SingleToInt32Bits(got[idx]))
+                        {
+                            diff++;
+                            maxAbs = MathF.Max(maxAbs, MathF.Abs(reference[idx] - got[idx]));
+                            if (firstRow < 0) firstRow = r;
+                        }
+                    }
+                sb.AppendLine($"    n={n} ({(n % 2 == 0 ? "even" : "odd ")}): differing={diff,8}/{(long)n * qRow,-8} " +
+                              $"maxAbs={maxAbs:E3} firstDiffRow={firstRow}");
+            }
+        }
+
+        _out.WriteLine(sb.ToString());
+    }
+
     private static float[] RandomFloats(Random rng, int count)
     {
         var arr = new float[count];
