@@ -30,16 +30,23 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// <list type="number">
 ///   <item>runs both quantizers on the SAME single row and compares the packed
 ///     bytes and the (d, s) scale pairs <b>bitwise</b>;</item>
-///   <item>feeds ONE quantized buffer — whichever the comparison licenses — to
-///     both matmuls and compares their outputs, so any gap measured there is the
-///     matmul alone and cannot be inherited from the quantizer.</item>
+///   <item>runs each matmul on the buffer it actually consumes in the forward
+///     pass, and compares the outputs. Stage 1's gate is what makes that a
+///     matmul-only comparison; the buffers are not substituted for each other,
+///     so the production n&gt;1 arm keeps being measured even if the quantizers
+///     ever diverge.</item>
 /// </list>
 /// <para>
 /// Both stages carry a negative control that perturbs one input element by one
 /// ULP and re-runs; a comparison whose count does not move is not looking at
 /// anything, and that is how a "clean" verdict gets published wrongly.
 /// </para>
-/// <para>Enable with <c>DOTLLM_538_PROBE=1</c>.</para>
+/// <para>
+/// Runs by default rather than behind an opt-in flag: it takes ~0.4 s, it is
+/// anchored to a CPU f64 oracle rather than to another GPU kernel, and the
+/// accuracy gates guard the PREFILL path for every future kernel change — which
+/// matters beyond this issue, since perplexity is scored through prefill.
+/// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
 [Collection("VulkanKernels")]
@@ -51,8 +58,6 @@ public sealed class Probe538Q8SplitTests
     private readonly ITestOutputHelper _out;
     public Probe538Q8SplitTests(ITestOutputHelper output) => _out = output;
 
-    private static bool Enabled =>
-        string.Equals(Environment.GetEnvironmentVariable("DOTLLM_538_PROBE"), "1", StringComparison.Ordinal);
 
     /// <summary>Llama-3.2-1B projection shapes, which is where #538 was observed.</summary>
     public static TheoryData<int, int> Shapes => new()
@@ -65,7 +70,6 @@ public sealed class Probe538Q8SplitTests
     [SkippableFact]
     public void Q8_1Quantizers_AgreeAtN1_AndMatmulsCompared()
     {
-        Skip.IfNot(Enabled, "DOTLLM_538_PROBE=1 to enable.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
         Skip.IfNot(device.HasIntegerDotProduct,
@@ -142,14 +146,18 @@ public sealed class Probe538Q8SplitTests
                 for (int i = 0; i < xds1.Length; i++)
                     if (BitConverter.SingleToInt32Bits(xds1[i]) != BitConverter.SingleToInt32Bits(xdsR[i])) dsd++;
 
-                // Stage 2 — ONE quantized buffer into both matmuls. If stage 1 is
-                // clean the choice is immaterial; if it is not, this still isolates
-                // the matmul by construction rather than measuring the sum of both.
+                // Stage 2 — each matmul reads the buffer it actually consumes in
+                // the forward pass: MMVQ the n==1 quantizer's, MMQ the rows
+                // quantizer's. Sharing one buffer would be simpler and would give
+                // the same numbers TODAY (stage 1 is bitwise clean), but it would
+                // stop measuring the production n>1 arm the moment the quantizers
+                // diverged — the gate below is what makes the two comparable, not
+                // a licence to substitute one for the other.
                 using (var ctx = device.CreateSubmitContext())
                 {
                     ctx.Begin();
                     mmvq.Record(ctx.CommandBuffer, bufW, bufXq1, bufXds1, bufCv, m, k);
-                    mmq.Record(ctx.CommandBuffer, bufW, bufXq1, bufXds1, bufCq, m, k, 1);
+                    mmq.Record(ctx.CommandBuffer, bufW, bufXqR, bufXdsR, bufCq, m, k, 1);
                     ctx.SubmitAndWait();
                 }
 
@@ -198,11 +206,26 @@ public sealed class Probe538Q8SplitTests
             // against an f64 CPU oracle over the SAME Q8_0 weights and the SAME
             // dequantized Q8_1 activation, so the only thing that varies is the
             // order of the float accumulation.
+            // Re-quantize BOTH buffers from x first. The stage-1 control above
+            // deliberately writes a different row into bufXqR/bufXdsR, and leaving
+            // that in place made MMQ score 2.098 RMS against the oracle — the
+            // probe measuring a stale activation, not a kernel. Caught only
+            // because MMQ now reads its own buffer instead of sharing MMVQ's.
+            using (var ctx = device.CreateSubmitContext())
+            {
+                ctx.Begin();
+                device.Upload(x, bufX);
+                q1.Record(ctx.CommandBuffer, bufX, bufXq1, bufXds1, k);
+                qRows.Record(ctx.CommandBuffer, bufX, bufXqR, bufXdsR, 1, k);
+                ctx.SubmitAndWait();
+            }
+
             double[] oracle = OracleF64(weightsQ8, xqBytesOf(device, bufXq1, k), xdsOf(device, bufXds1, k), m, k);
             var cvF = new float[m];
             var cqF = new float[m];
-            device.Download(bufCv, cvF);   // still holds MMVQ from the self-consistency run
-            RunMmqInto(device, mmq, bufW, bufXq1, bufXds1, bufCq, m, k);
+            RunMmvqInto(device, mmvq, bufW, bufXq1, bufXds1, bufCv, m, k);
+            device.Download(bufCv, cvF);
+            RunMmqInto(device, mmq, bufW, bufXqR, bufXdsR, bufCq, m, k);
             device.Download(bufCq, cqF);
             (double rmsV, double maxV) = ScoreAgainst(oracle, cvF);
             (double rmsQ, double maxQ) = ScoreAgainst(oracle, cqF);
@@ -242,6 +265,14 @@ public sealed class Probe538Q8SplitTests
             // path. MMQ is measured 1.65x / 1.73x / 2.37x the RMS error of MMVQ on
             // these three shapes — prefill is the less accurate of the two, which
             // is the reason the fix for #538 must NOT be "route n==1 through MMQ".
+            //
+            // The mechanism is REDUCTION DEPTH, read off both shaders and
+            // corroborated by the ratio widening with K (64 blocks -> 1.65-1.73x,
+            // 256 blocks -> 2.37x). Both scale per 32-block, so it is not a
+            // missing scale: MMVQ splits the blocks across a subgroup and finishes
+            // with subgroupAdd (a tree), while MMQ accumulates all K/32 blocks
+            // sequentially into one float. Sequential summation grows error with
+            // O(n) against the tree's O(log n).
             // 5x leaves room for the measured spread while still catching a real
             // regression in the prefill accumulation.
             Assert.True(rmsQ < 5.0 * rmsV,
@@ -352,6 +383,17 @@ public sealed class Probe538Q8SplitTests
         var w = new float[QuantizeQ8_1Kernel.ScaleBytes(k) / sizeof(float)];
         device.Download(buf, w);
         return w;
+    }
+
+    private static void RunMmvqInto(
+        VulkanDevice device, MatMulQ8_0MmvqKernel mmvq,
+        VulkanDevice.Buffer bufW, VulkanDevice.Buffer bufXq, VulkanDevice.Buffer bufXds,
+        VulkanDevice.Buffer dst, int m, int k)
+    {
+        using var ctx = device.CreateSubmitContext();
+        ctx.Begin();
+        mmvq.Record(ctx.CommandBuffer, bufW, bufXq, bufXds, dst, m, k);
+        ctx.SubmitAndWait();
     }
 
     private static void RunMmqInto(
