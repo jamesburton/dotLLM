@@ -142,6 +142,44 @@ GGUF files can have different types per tensor. Dispatch to correct kernel based
 - GPU: custom CUDA kernels dequantize in shared memory, use tensor cores. Ref: llama.cpp `ggml-cuda/mmq.cu`.
 - Block alignment awkward for SIMD — handle tail elements carefully.
 
+### Decode and prefill are two valid orderings of the same sum (issue #538)
+
+A quantized projection is computed by a **different kernel** depending on how many
+tokens are in flight, and the two do not agree bitwise. On Vulkan Q8_0, `n == 1`
+takes `matmul_q8_0_mmvq` (the decode GEMV) and `n > 1` takes `matmul_q8_0_mmq`
+(the prefill GEMM). This is expected, not a defect — but two things about it are
+easy to get wrong, so they are recorded here.
+
+**The activations are identical; only the accumulation order differs.** The two
+Q8_1 activation quantizers (`QuantizeQ8_1Kernel` and `QuantizeQ8_1RowsKernel`)
+emit **bitwise identical** `xq`/`xds` at `n == 1`, measured, with a control that
+reports a difference on two different rows. So the arms are summing the same
+numbers in a different order, and both land ~1E-07 RMS from an f64 accumulation
+of the same quantities. Neither is wrong.
+
+**But the prefill kernel is the less accurate of the two**, by 1.65× at K=2048
+and 2.37× at K=8192 — and the gap widens with K because the mechanism is
+**reduction depth**, not a missing scale (both scale per 32-block):
+
+| | how the block products are summed | error growth |
+|---|---|---|
+| `matmul_q8_0_mmvq` (decode) | blocks split across a subgroup, finished with `subgroupAdd` — a tree | O(log n) |
+| `matmul_q8_0_mmq` (prefill) | all K/32 blocks accumulated sequentially into one float | O(n) |
+
+Two consequences worth carrying:
+
+1. **Do not "unify" a dispatch split by routing `n == 1` through the `n > 1`
+   kernel.** In both halves of #538 the multi-token path is the *less* accurate
+   one (the same is true of attention, where prefill uses f16 coopmat tiles and
+   the 1-token path the f32 dense kernel). Converging on it degrades output.
+2. **Perplexity is scored through the prefill path**, so prefill accuracy is a
+   quality lever in its own right, independent of any chunking-consistency
+   question.
+
+`Probe538Q8SplitTests` holds this as a standing gate: the quantizers must stay
+bit-identical, MMVQ must stay deterministic, neither arm may drift from the f64
+oracle, and MMQ may not fall further than 5× behind MMVQ.
+
 ## Vulkan Backend Coverage
 
 The Vulkan backend ships native matmul kernels (GEMV decode + GEMM prefill, with an opt-in F16 cooperative-matrix tile when the device enumerates F16xF16→F32) for the following source dtypes / quant formats. Source bytes stay on device — dequantisation happens in the shader inner loop, so memory cost is the GGUF source size (not 2-4× expanded F32):
