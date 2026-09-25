@@ -192,6 +192,21 @@ public sealed class Probe538Q8SplitTests
             // must be bitwise identical.
             long mmvqSelfDiff = MmvqSelfConsistency(device, mmvq, bufW, bufXq1, bufXds1, bufCv, bufCq, m, k);
 
+            // Which of the two is RIGHT? A difference between two kernels says
+            // nothing about that on its own, and "accept a bound" is only the
+            // honest disposition if neither is systematically worse. Score both
+            // against an f64 CPU oracle over the SAME Q8_0 weights and the SAME
+            // dequantized Q8_1 activation, so the only thing that varies is the
+            // order of the float accumulation.
+            double[] oracle = OracleF64(weightsQ8, xqBytesOf(device, bufXq1, k), xdsOf(device, bufXds1, k), m, k);
+            var cvF = new float[m];
+            var cqF = new float[m];
+            device.Download(bufCv, cvF);   // still holds MMVQ from the self-consistency run
+            RunMmqInto(device, mmq, bufW, bufXq1, bufXds1, bufCq, m, k);
+            device.Download(bufCq, cqF);
+            (double rmsV, double maxV) = ScoreAgainst(oracle, cvF);
+            (double rmsQ, double maxQ) = ScoreAgainst(oracle, cqF);
+
             sb.AppendLine($"  m={m,5} k={k,5}");
             sb.AppendLine($"    stage 1  quantizer xq words differing = {r.qDiff}/{QuantizeQ8_1Kernel.PackedBytes(k) / sizeof(float)}"
                         + $"   xds (d,s) floats differing = {r.dsDiff}/{QuantizeQ8_1Kernel.ScaleBytes(k) / sizeof(float)}");
@@ -201,6 +216,8 @@ public sealed class Probe538Q8SplitTests
                         + $"   maxAbs={r.mmMaxAbs:E3}  maxRel={r.mmMaxRel:E3}");
             sb.AppendLine($"      control: MMVQ vs MMVQ (same kernel twice) -> {mmvqSelfDiff}/{m} differing"
                         + "  (must be 0, else the gap above is nondeterminism not a kernel difference)");
+            sb.AppendLine($"    vs f64 oracle   MMVQ rms={rmsV:E3} max={maxV:E3}   MMQ rms={rmsQ:E3} max={maxQ:E3}"
+                        + $"   ratio(MMQ/MMVQ rms)={rmsQ / rmsV:F3}");
 
             Assert.True(qDiffXX > 0 && dsDiffXX > 0,
                 $"the quantizer comparator cannot distinguish two different rows at m={m} k={k}; "
@@ -211,6 +228,25 @@ public sealed class Probe538Q8SplitTests
 
             totalQuantDiff += r.qDiff + r.dsDiff;
             totalMatmulDiff += r.mmDiff;
+
+            // Accuracy gates. Neither kernel is wrong — both sit ~1E-07 RMS from
+            // an f64 accumulation of the identical quantities — so the MMVQ/MMQ
+            // difference is two valid float orderings, not a defect, and there is
+            // nothing to collapse. What IS worth holding is that neither drifts:
+            Assert.True(rmsV < 1e-5 && maxV < 1e-4,
+                $"MMVQ has drifted from the f64 oracle at m={m} k={k}: rms={rmsV:E3} max={maxV:E3}");
+            Assert.True(rmsQ < 1e-5 && maxQ < 1e-4,
+                $"MMQ has drifted from the f64 oracle at m={m} k={k}: rms={rmsQ:E3} max={maxQ:E3}");
+
+            // ...and that the PREFILL path does not fall further behind the decode
+            // path. MMQ is measured 1.65x / 1.73x / 2.37x the RMS error of MMVQ on
+            // these three shapes — prefill is the less accurate of the two, which
+            // is the reason the fix for #538 must NOT be "route n==1 through MMQ".
+            // 5x leaves room for the measured spread while still catching a real
+            // regression in the prefill accumulation.
+            Assert.True(rmsQ < 5.0 * rmsV,
+                $"MMQ (prefill) accuracy has regressed relative to MMVQ (decode) at m={m} k={k}: "
+                + $"rms {rmsQ:E3} vs {rmsV:E3} (ratio {rmsQ / rmsV:F2}, bound 5.00)");
 
         }
 
@@ -302,6 +338,84 @@ public sealed class Probe538Q8SplitTests
         for (int i = 0; i < m; i++)
             if (BitConverter.SingleToInt32Bits(a[i]) != BitConverter.SingleToInt32Bits(b[i])) d++;
         return d;
+    }
+
+    private static float[] xqBytesOf(VulkanDevice device, VulkanDevice.Buffer buf, int k)
+    {
+        var w = new float[QuantizeQ8_1Kernel.PackedBytes(k) / sizeof(float)];
+        device.Download(buf, w);
+        return w;
+    }
+
+    private static float[] xdsOf(VulkanDevice device, VulkanDevice.Buffer buf, int k)
+    {
+        var w = new float[QuantizeQ8_1Kernel.ScaleBytes(k) / sizeof(float)];
+        device.Download(buf, w);
+        return w;
+    }
+
+    private static void RunMmqInto(
+        VulkanDevice device, MatMulQ8_0MmqKernel mmq,
+        VulkanDevice.Buffer bufW, VulkanDevice.Buffer bufXq, VulkanDevice.Buffer bufXds,
+        VulkanDevice.Buffer dst, int m, int k)
+    {
+        using var ctx = device.CreateSubmitContext();
+        ctx.Begin();
+        mmq.Record(ctx.CommandBuffer, bufW, bufXq, bufXds, dst, m, k, 1);
+        ctx.SubmitAndWait();
+    }
+
+    /// <summary>
+    /// f64 reference for one Q8_0 row-major weight matrix times one Q8_1 activation
+    /// row, accumulated in double. Both GPU kernels compute exactly this quantity;
+    /// they differ only in the order and precision of the accumulation, so the
+    /// distance from this oracle says which ordering is more accurate.
+    /// </summary>
+    private static double[] OracleF64(byte[] weightsQ8, float[] xqWords, float[] xds, int m, int k)
+    {
+        int blocks = k / Q8_0GroupSize;
+        int rowBytes = blocks * Q8_0BlockBytes;
+
+        // Unpack the Q8_1 activation: xq is 4 int8 per 32-bit word; xds is (d, s)
+        // per 32-element block.
+        var xInt = new sbyte[k];
+        for (int w = 0; w < xqWords.Length; w++)
+        {
+            int bits = BitConverter.SingleToInt32Bits(xqWords[w]);
+            for (int b = 0; b < 4; b++) xInt[w * 4 + b] = (sbyte)((bits >> (b * 8)) & 0xFF);
+        }
+
+        var outp = new double[m];
+        for (int row = 0; row < m; row++)
+        {
+            int baseOff = row * rowBytes;
+            double acc = 0.0;
+            for (int blk = 0; blk < blocks; blk++)
+            {
+                int off = baseOff + blk * Q8_0BlockBytes;
+                double dW = (double)BitConverter.UInt16BitsToHalf(
+                    (ushort)(weightsQ8[off] | (weightsQ8[off + 1] << 8)));
+                double dX = xds[blk * 2];
+                long dot = 0;
+                for (int e = 0; e < Q8_0GroupSize; e++)
+                    dot += (sbyte)weightsQ8[off + 2 + e] * (long)xInt[blk * Q8_0GroupSize + e];
+                acc += dW * dX * dot;
+            }
+            outp[row] = acc;
+        }
+        return outp;
+    }
+
+    private static (double rms, double max) ScoreAgainst(double[] oracle, float[] got)
+    {
+        double se = 0, mx = 0;
+        for (int i = 0; i < oracle.Length; i++)
+        {
+            double d = Math.Abs(got[i] - oracle[i]);
+            se += d * d;
+            mx = Math.Max(mx, d);
+        }
+        return (Math.Sqrt(se / oracle.Length), mx);
     }
 
     private static float[] RandomFloats(Random rng, int count, float range)
