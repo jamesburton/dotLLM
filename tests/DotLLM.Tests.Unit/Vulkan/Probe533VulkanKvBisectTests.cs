@@ -19,6 +19,21 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// compares the KV-cache rows <c>0..c-1</c> of EVERY layer bitwise. The first
 /// layer that differs, and which rows differ, localizes the op.
 /// </remarks>
+/// <remarks>
+/// <para>
+/// READ THE c == 1 ROW SEPARATELY — it is a DIFFERENT defect and the commit that
+/// introduced this file described its F32 arm wrongly. Production never routes
+/// <c>seqQ == 1</c> to the coopmat FA kernel (decode goes to the dense / split-KV
+/// kernel), so a 1-token chunk is not comparing an odd tile against an even one,
+/// it is comparing two different attention kernels. On Q8_0 it ALSO crosses the
+/// <c>n == 1</c> MMVQ/GEMV vs MMQ/GEMM matmul dispatch split (the Vulkan analogue
+/// of #530), which is why it seeds at layer 0 there and at layer 1 on F32.
+/// </para>
+/// <para>
+/// The clean #533 arms are the ones with no size-1 chunk: <c>[3,3]</c> and
+/// <c>[2,2,2]</c> / <c>[2,4]</c> / <c>[4,2]</c>.
+/// </para>
+/// </remarks>
 [Trait("Category", "GPU")]
 [Trait("Category", "RealModel")]
 [Collection("VulkanKernels")]
