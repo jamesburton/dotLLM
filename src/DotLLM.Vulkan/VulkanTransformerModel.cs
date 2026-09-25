@@ -62,6 +62,14 @@ public sealed class VulkanTransformerModel : IModel
     private readonly VulkanWeights _weights;
     private readonly VulkanForwardState _state;
 
+    /// <summary>
+    /// The device this model's buffers live on. Test-visible only — probes that
+    /// read back device memory MUST use the model's own <see cref="VulkanDevice"/>
+    /// (a second device sees different buffer handles; see the descriptor-cache
+    /// handle-aliasing note in #467).
+    /// </summary>
+    internal VulkanDevice Device => _device;
+
     // Kernels — one instance each, pipelines are reused across all launches.
     private readonly MatMulF32Kernel _matmul;
     private readonly MatMulQ8_0Kernel _matmulQ8;

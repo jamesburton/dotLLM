@@ -1,5 +1,19 @@
 #version 450
 
+// headDim<=64-specialized variant of attention_flash_f32_coopmat.comp (issue #378).
+//
+// Byte-for-byte identical to attention_flash_f32_coopmat.comp except
+// MAX_HEAD_DIM is 64 instead of 128. The compute loops in the base shader
+// already bound on hdCeil (the model's actual headDim rounded up to the
+// coopmat chunk), not MAX_HEAD_DIM — only the qTile/kvTile shared-memory
+// array DECLARATIONS and the O_CELLS register count scale with
+// MAX_HEAD_DIM, wasting exactly half the LDS (qTile 4KB->2KB, kvTile
+// 16KB->8KB, ~10KB of the base shader's documented ~30KB) and half the
+// live O accumulator registers for any headDim<=64 model (SmolLM and many
+// other small Llama/Qwen-family configs) for zero compute benefit. See
+// VulkanFlashAttentionCoopmatKernel for the headDim<=64 dispatch gate that
+// selects this SPV instead of the base one.
+//
 // KHR_cooperative_matrix variant of attention_flash_f32.comp (issue #149).
 //
 // Same Flash-Attention-v2 tiling as the scalar prefill shader — one workgroup
@@ -53,11 +67,20 @@
 #define BR              16
 #define BC              64
 #define WG_SIZE         256
-#define MAX_HEAD_DIM    128
+#define MAX_HEAD_DIM    64
+// #378: the register/thread mapping below (rHi, the "r = (i << ROW_LANE_SHIFT)
+// + rHi" pattern) depends on WG_SIZE/MAX_HEAD_DIM ("row lanes") — the base
+// 128-dim shader hardcodes shift-by-7/shift-by-1 for its 2 row lanes. This
+// variant has WG_SIZE/MAX_HEAD_DIM = 256/64 = 4 row lanes, so those shifts
+// must change to 6 and 2 respectively. Keep in sync with MAX_HEAD_DIM by
+// hand (both are compile-time constants for this specialized shader, not
+// computed from a general formula, since GLSL macros can't take log2).
+#define HD_SHIFT         6                  // log2(MAX_HEAD_DIM)
+#define ROW_LANE_SHIFT   2                  // log2(WG_SIZE / MAX_HEAD_DIM)
 #define MAT_K           16                  // coopmat inner-dim chunk
 #define NUM_SLICES      (BC / 16)           // 4 KV-column slices of 16
-#define PV_ROUNDS_MAX   (MAX_HEAD_DIM / (16 * NUM_SLICES))  // 2
-#define O_CELLS         (BR * MAX_HEAD_DIM / WG_SIZE)       // 8 f32 regs/thread
+#define PV_ROUNDS_MAX   (MAX_HEAD_DIM / (16 * NUM_SLICES))  // 1
+#define O_CELLS         (BR * MAX_HEAD_DIM / WG_SIZE)       // 4 f32 regs/thread
 #define NEG_INF         (-3.4e38)
 
 // Score-tile row stride: +4 floats keeps coopMatStore rows 16-byte aligned
@@ -89,16 +112,6 @@ layout(push_constant) uniform PushConstants {
     uint  maskMode;        // 0 = Causal, 1 = Bidirectional, 2 = Hybrid (diffusion canvas)
     uint  prefixLen;       // Hybrid only: positions < prefixLen stay causal, >= are bidirectional
 } pc;
-
-// #533 — SPECIALIZATION constant, deliberately not a push constant. It must be
-// substituted BEFORE the driver's backend compiler runs, so that with the gate
-// off the scalar tail below is dead code and costs no registers. A uniform push
-// constant was tried first and MEASURED: on an RTX 3060 it recovered nothing at
-// the seqKv >= 640 hd64 shape (0.82x either way), because the scalar path's
-// register pressure is paid at compile time whether or not it executes.
-// Defaults to 1: a pipeline created without specialization data must fail SAFE,
-// toward the invariant path.
-layout(constant_id = 0) const uint REQUIRE_INVARIANT_PV = 1u;
 
 // Causal-component mask — byte-identical semantics to attention_flash_f32.comp
 // and the CPU reference (DotLLM.Cpu.Kernels.Attention.ApplyMask).
@@ -203,7 +216,7 @@ void main() {
         oReg[i] = 0.0;
     }
     uint d0   = tid & (uint(MAX_HEAD_DIM) - 1u);
-    uint rHi  = tid >> 7u;                       // 0 or 1: row parity offset
+    uint rHi  = tid >> uint(HD_SHIFT);            // 0..(WG_SIZE/MAX_HEAD_DIM - 1): row-lane offset
     barrier();
 
     // 2. KV tile loop. Causal early-exit identical to the scalar FA shader.
@@ -323,7 +336,7 @@ void main() {
         // 2e. Rescale the register O accumulator by this tile's per-row
         //     correction (register cells have fixed rows, see step 1).
         for (uint i = 0u; i < uint(O_CELLS); i++) {
-            uint r = (i << 1u) + rHi;
+            uint r = (i << uint(ROW_LANE_SHIFT)) + rHi;
             oReg[i] *= corrShared[r];
         }
 
@@ -331,65 +344,19 @@ void main() {
         //     d-block per round (round layout: d = round*64 + slice*16). The
         //     coopmat result is staged through oStage and folded into the
         //     register accumulator by the owning threads.
-        //
-        // #533: the P·V cooperative-matrix multiply is used ONLY for KV tiles
-        // whose staged (P, V) contents are INDEPENDENT of this dispatch's KV
-        // length — a tile that is completely full (tileLen == BC) and carries
-        // no masked cell for ANY row of this query tile.
-        //
-        // Every other tile has exact zeros in P exactly where a LONGER
-        // dispatch of the same prompt has real V data in the same columns
-        // (masked cells, the short final tile, and the fully-masked tiles a
-        // longer dispatch adds past a row's causal limit). On AMD the coopmat
-        // P·V does not return the same value for those columns' `0 * v`
-        // contributions, so the LAST causally visible query row came out ~1
-        // f32 ULP different whenever the effective KV length was odd — which
-        // amplified into a demonstrated token flip through 16 layers (#533;
-        // measured 0-differing on NVIDIA at every length, so it is an AMD
-        // implementation property, not our arithmetic). Those tiles take a
-        // flat scalar loop over the same f16 LDS tiles instead; measured at
-        // 0.97-1.07x of the all-coopmat path across 4 same-session,
-        // order-reversed A/B runs (see Probe533FixCandidateTests).
-        uint firstPosQ = pc.positionOffset + qStartRow;
-        // A sliding window does NOT need to force the scalar path: its masked
-        // cells sit at columns that carry the SAME real V data in a longer
-        // dispatch, so the staged tile is identical either way. Only columns a
-        // longer dispatch fills past this dispatch's kvEnd differ, and the
-        // causal clause below already excludes those tiles.
-        //
-        // requireInvariantPv == 0 makes EVERY tile safe, which restores the
-        // pre-fix all-coopmat path exactly. The host sets it per vendor: the
-        // defect is an AMD implementation property, and an RTX 3060 is
-        // 0-differing at every length on this same SPIR-V, so NVIDIA does not
-        // pay the scalar tail for a bug it does not have. Anything not measured
-        // clean gets the gate.
-        bool tileSafe = (REQUIRE_INVARIANT_PV == 0u)
-            || ((tileLen == uint(BC))
-                && (pc.maskMode == 1u || (tStart + uint(BC)) <= firstPosQ + 1u));
-        if (!tileSafe) {
+        // #533 PROBE VARIANT V2 (hd64): scalar P.V, coopmat QK^T.
             if (d0 < hdCeil) {
                 for (uint i = 0u; i < uint(O_CELLS); i++) {
-                    uint r = (i << 1u) + rHi;
-                    // `precise` pins the whole reduction: left to itself the
-                    // compiler reassociates/unrolls this loop differently in the
-                    // 128-dim and the hd64 shader (different live-register
-                    // pressure), and the #378 seqKv>=640 gate would then switch
-                    // between two 1-ULP-different results mid-prompt — exactly
-                    // the invariance class #533 is about. An explicit fma() with
-                    // no `precise` was MEASURED and is NOT enough (the split
-                    // reappears at posOff=100, arm C): it pins the multiply-add
-                    // but not the accumulation order. `precise` costs ~15-19% at
-                    // the short-prefill shapes where this scalar tail dominates.
-                    precise float acc = 0.0;
+                    uint r = (i << uint(ROW_LANE_SHIFT)) + rHi;
+                    float acc = 0.0;
                     for (uint c = 0u; c < uint(BC); c++) {
                         acc += float(pTile[r * uint(P_STRIDE) + c]) * float(kvTile[c * uint(MAX_HEAD_DIM) + d0]);
                     }
                     oReg[i] += acc;
                 }
             }
-            barrier();
-        }
-        for (uint round = 0u; tileSafe && round < pvRounds; round++) {
+        barrier();
+        for (uint round = 0u; round < 0u; round++) {
             uint dBlock = round * uint(16 * NUM_SLICES) + slice * 16u;
             if (dBlock < hdCeil) {
                 coopmat<float, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseAccumulator> accO =
@@ -410,7 +377,7 @@ void main() {
                 uint s  = (d0 - roundBase) >> 4u;
                 uint dd = d0 & 15u;
                 for (uint i = 0u; i < uint(O_CELLS); i++) {
-                    uint r = (i << 1u) + rHi;
+                    uint r = (i << uint(ROW_LANE_SHIFT)) + rHi;
                     oReg[i] += oStage[s * 256u + r * 16u + dd];
                 }
             }
@@ -421,7 +388,7 @@ void main() {
     // 3. Normalize and write this thread's register cells.
     if (d0 < pc.headDim) {
         for (uint i = 0u; i < uint(O_CELLS); i++) {
-            uint r = (i << 1u) + rHi;
+            uint r = (i << uint(ROW_LANE_SHIFT)) + rHi;
             if (r >= rowsInTile) continue;
             float sum = runningSum[r];
             float inv = (sum > 1e-10) ? (1.0 / sum) : 0.0;

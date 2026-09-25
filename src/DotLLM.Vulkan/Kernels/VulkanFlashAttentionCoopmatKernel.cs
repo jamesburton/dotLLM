@@ -158,6 +158,49 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
 
     private const int PushConstantBytes = 12 * sizeof(uint);
 
+    /// <summary>PCI vendor ID of AMD, whose coopmat P.V needs the #533 safe-tile gate.</summary>
+    private const uint VendorAmd = 0x1002;
+
+    /// <summary>PCI vendor ID of NVIDIA — measured clean for #533 at every KV length.</summary>
+    private const uint VendorNvidia = 0x10DE;
+
+    /// <summary>
+    /// #533: whether this kernel's pipelines were specialized to the
+    /// KV-length-invariant P.V path (1) or to plain all-coopmat (0). Test-visible
+    /// so a probe can print which variant it actually built.
+    /// </summary>
+    internal uint RequireInvariantPv { get; }
+
+    /// <summary>
+    /// #533 vendor policy. The defect — coopmat P.V not reproducing the same
+    /// accumulator for the <c>0 * v</c> contributions of masked / padding columns —
+    /// is an AMD implementation property: an RTX 3060 is exactly 0-differing at
+    /// every KV length on the SAME committed SPIR-V, which is how #533 was decided.
+    /// The gate costs AMD ~10-19% at short prefill and NVIDIA ~19% at the
+    /// <c>seqKv &gt;= 640</c> hd64 gate, so it is applied only where it buys
+    /// correctness.
+    /// <para>
+    /// NVIDIA is the ONLY vendor exempted, and only because it was measured.
+    /// Everything else — Intel, Qualcomm, Mesa/RADV, anything new — gets the gate:
+    /// an unmeasured device is assumed affected, because the failure mode is
+    /// silently different generated text, not a crash.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// <c>DOTLLM_VULKAN_533_GATE=0|1</c> overrides the vendor policy. This exists so
+    /// the defect can be REPRODUCED on demand: with the gate off, this shader is
+    /// bitwise identical to the pre-fix one on every measured arm, which is what
+    /// lets a regression test demonstrate RED without keeping a second copy of the
+    /// shader around to drift out of date. Setting it to 0 on AMD re-enables a
+    /// known wrong-output path — it is a diagnostic, not a tuning knob.
+    /// </remarks>
+    internal static uint RequiresInvariantPv(uint vendorId)
+    {
+        string? o = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_533_GATE");
+        if (o is not null) return string.Equals(o, "0", StringComparison.Ordinal) ? 0u : 1u;
+        return vendorId == VendorNvidia ? 0u : 1u;
+    }
+
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
@@ -171,9 +214,11 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
 
     private VulkanFlashAttentionCoopmatKernel(
         VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
-        VulkanModule? hd64Module, ComputePipeline? hd64Pipeline, nint hd64Pool)
+        VulkanModule? hd64Module, ComputePipeline? hd64Pipeline, nint hd64Pool,
+        uint requireInvariantPv)
     {
         _device = device;
+        RequireInvariantPv = requireInvariantPv;
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
@@ -229,6 +274,21 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     /// or validate independently of the existing correctness tests.
     /// </summary>
     public static VulkanFlashAttentionCoopmatKernel Create(VulkanDevice device, string spvDir, FlashAttentionCoopmatVariant variant)
+        => Create(device, spvDir, variant, DefaultShaderBaseName);
+
+    /// <summary>The production SPV base name (<c>attention_flash_f32_coopmat</c>).</summary>
+    internal const string DefaultShaderBaseName = "attention_flash_f32_coopmat";
+
+    /// <summary>
+    /// Issue #533 measurement hook: loads <c>{shaderBaseName}.spv</c> (and
+    /// <c>{shaderBaseName}_hd64.spv</c> when present) instead of the production
+    /// pair, so a probe/bench can hold the shipping kernel and a candidate-fix
+    /// shader open in ONE process and A/B them same-session. Production callers
+    /// never pass this.
+    /// </summary>
+    internal static VulkanFlashAttentionCoopmatKernel Create(
+        VulkanDevice device, string spvDir, FlashAttentionCoopmatVariant variant, string shaderBaseName,
+        uint? requireInvariantPv = null)
     {
         if (!SupportsDevice(device))
             throw new InvalidOperationException(
@@ -240,12 +300,19 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
                 $"Device cannot pin the compute stage to requiredSubgroupSize={variant.RequiredSubgroupSize}. " +
                 "Check FlashAttentionCoopmatVariant.IsSupportedOn(device) before calling Create() with an explicit variant.");
 
-        string path = Path.Combine(spvDir, "attention_flash_f32_coopmat.spv");
+        string path = Path.Combine(spvDir, shaderBaseName + ".spv");
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
 
         uint requiredSubgroupSize = (uint)variant.RequiredSubgroupSize;
+
+        // #533: resolved ONCE here and given to BOTH pipelines. A pipeline that
+        // misses the specialization silently defaults to 1 (the gate), which on
+        // the hd64 pipeline would look like "the fix did not recover its cost"
+        // rather than like a wiring bug — so both call sites pass `spec`.
+        uint gate = requireInvariantPv ?? RequiresInvariantPv(device.VendorId);
+        ReadOnlySpan<uint> spec = stackalloc uint[1] { gate };
 
         VulkanModule module = VulkanModule.LoadFromFile(device, path);
         ComputePipeline pipeline;
@@ -260,7 +327,8 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
                 entryPoint: "main",
                 bindings: bindings,
                 pushConstantBytes: PushConstantBytes,
-                requiredSubgroupSize: requiredSubgroupSize);
+                requiredSubgroupSize: requiredSubgroupSize,
+                specConstants: spec);
         }
         catch
         {
@@ -271,7 +339,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         VulkanModule? hd64Module = null;
         ComputePipeline? hd64Pipeline = null;
         nint hd64Pool = 0;
-        string hd64Path = Path.Combine(spvDir, "attention_flash_f32_coopmat_hd64.spv");
+        string hd64Path = Path.Combine(spvDir, shaderBaseName + "_hd64.spv");
         if (File.Exists(hd64Path))
         {
             hd64Module = VulkanModule.LoadFromFile(device, hd64Path);
@@ -286,7 +354,8 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
                     entryPoint: "main",
                     bindings: bindings,
                     pushConstantBytes: PushConstantBytes,
-                    requiredSubgroupSize: requiredSubgroupSize);
+                    requiredSubgroupSize: requiredSubgroupSize,
+                    specConstants: spec);
                 // Separate pool per pipeline: DescriptorSetCache.Reset() calls
                 // vkResetDescriptorPool on its whole pool, which would silently
                 // invalidate the OTHER pipeline's still-referenced sets
@@ -303,7 +372,8 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-        return new VulkanFlashAttentionCoopmatKernel(device, module, pipeline, pool, hd64Module, hd64Pipeline, hd64Pool);
+        return new VulkanFlashAttentionCoopmatKernel(
+            device, module, pipeline, pool, hd64Module, hd64Pipeline, hd64Pool, gate);
     }
 
     /// <summary>
