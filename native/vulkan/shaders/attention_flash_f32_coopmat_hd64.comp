@@ -364,19 +364,27 @@ void main() {
         // 0.97-1.07x of the all-coopmat path across 4 same-session,
         // order-reversed A/B runs (see Probe533FixCandidateTests).
         uint firstPosQ = pc.positionOffset + qStartRow;
+        // A sliding window does NOT need to force the scalar path: its masked
+        // cells sit at columns that carry the SAME real V data in a longer
+        // dispatch, so the staged tile is identical either way. Only columns a
+        // longer dispatch fills past this dispatch's kvEnd differ, and the
+        // causal clause below already excludes those tiles.
         bool tileSafe = (tileLen == uint(BC))
-            && (pc.slidingWindow == 0u)
             && (pc.maskMode == 1u || (tStart + uint(BC)) <= firstPosQ + 1u);
         if (!tileSafe) {
             if (d0 < hdCeil) {
                 for (uint i = 0u; i < uint(O_CELLS); i++) {
                     uint r = (i << uint(ROW_LANE_SHIFT)) + rHi;
-                    // `precise` pins the multiply-add sequence: without it the
-                    // compiler is free to contract this loop differently in the
+                    // `precise` pins the whole reduction: left to itself the
+                    // compiler reassociates/unrolls this loop differently in the
                     // 128-dim and the hd64 shader (different live-register
                     // pressure), and the #378 seqKv>=640 gate would then switch
                     // between two 1-ULP-different results mid-prompt — exactly
-                    // the invariance class #533 is about.
+                    // the invariance class #533 is about. An explicit fma() with
+                    // no `precise` was MEASURED and is NOT enough (the split
+                    // reappears at posOff=100, arm C): it pins the multiply-add
+                    // but not the accumulation order. `precise` costs ~15-19% at
+                    // the short-prefill shapes where this scalar tail dominates.
                     precise float acc = 0.0;
                     for (uint c = 0u; c < uint(BC); c++) {
                         acc += float(pTile[r * uint(P_STRIDE) + c]) * float(kvTile[c * uint(MAX_HEAD_DIM) + d0]);

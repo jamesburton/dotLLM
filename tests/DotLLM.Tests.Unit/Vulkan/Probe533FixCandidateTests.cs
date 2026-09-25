@@ -21,8 +21,12 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// LAST causally visible query row whenever the effective KV length is odd, on
 /// AMD only. The shader already zero-pads its KV tile to the full
 /// <c>BC = 64</c> columns, so no partially-filled coopmat tile is ever fed to
-/// the matrix op — the only thing an odd KV length changes before the coopmat
-/// stage is the PARITY OF THE NON-ZERO COLUMN COUNT in the staged tile.
+/// the matrix op. The MEASURED mechanism (v1/v2/v3 below) is narrower than the
+/// "non-zero column count parity" reading this file first carried — v3 refuted
+/// that: P holds exact zeros in exactly the columns where a LONGER dispatch of
+/// the same prompt holds real V data, and AMD's coopmat P·V does not return the
+/// same value for those columns' <c>0 * v</c> contributions. QK^T is innocent
+/// (v1 changes nothing); P·V alone carries it (v2 goes to 0 everywhere).
 /// </para>
 /// <para>
 /// Each candidate is a separate <c>.comp</c> so baseline and candidate are held
@@ -34,8 +38,10 @@ namespace DotLLM.Tests.Unit.Vulkan;
 ///   <item><c>_v2scalarpv</c> — P·V on a scalar loop, QK^T still coopmat (stage isolation).</item>
 ///   <item><c>_v3duppad</c> — both matmuls stay on the matrix cores; the last real KV
 ///         column is duplicated into the first pad slot when <c>tileLen</c> is odd, so the
-///         non-zero column count is always even. Masking already NEG_INFs <c>c &gt;= tileLen</c>,
-///         so the softmax is untouched.</item>
+///         non-zero column count is always even. REFUTED: no effect, which is what
+///         moved the diagnosis from column-count parity to the <c>0 * v</c> reading.</item>
+///   <item><c>_pre533</c> — the shipping shader as it stood before the fix, kept so this
+///         test discriminates rather than merely reports.</item>
 /// </list>
 /// <para>Enable with <c>DOTLLM_533_FIX_PROBE=1</c>.</para>
 /// </remarks>
@@ -119,9 +125,9 @@ public sealed class Probe533FixCandidateTests
 
                 long totalDiff = 0;
 
-                float[] Run(int seqQ, int seqKv, int posOff)
+                float[] Run(int seqQ, int seqKv, int posOff, int slidingWindow = 0)
                 {
-                    kernel.Launch(bufQ, bufK, bufV, bufO, seqQ, seqKv, NumHeads, NumKvHeads, HeadDim, posOff);
+                    kernel.Launch(bufQ, bufK, bufV, bufO, seqQ, seqKv, NumHeads, NumKvHeads, HeadDim, posOff, slidingWindow);
                     var all = new float[(long)refN * QRow];
                     device.Download(bufO, all);
                     return all;
@@ -177,6 +183,20 @@ public sealed class Probe533FixCandidateTests
                         (string line, long d) = CompareRows(reference, got, 32, P + 32);
                         totalDiff += d;
                         sb.AppendLine($"     posOff={P,3} ({(P % 2 == 0 ? "even" : "odd ")}) " + line);
+                    }
+                }
+
+                // --- D. sliding window (Gemma-3 local layers / Mistral family) ---
+                //     The fix deliberately does NOT force the scalar path on a
+                //     sliding window; this arm is what makes that claim measured.
+                {
+                    float[] reference = Run(160, 160, 0, 40);
+                    sb.AppendLine("  D. square prefill, slidingWindow=40, reference L=160:");
+                    foreach (int L in new[] { 61, 62, 63, 64, 65, 66, 67 })
+                    {
+                        (string line, long d) = CompareRows(reference, Run(L, L, 0, 40), L, L);
+                        totalDiff += d;
+                        sb.AppendLine("     " + line);
                     }
                 }
 
