@@ -347,9 +347,11 @@ void main() {
         // amplified into a demonstrated token flip through 16 layers (#533;
         // measured 0-differing on NVIDIA at every length, so it is an AMD
         // implementation property, not our arithmetic). Those tiles take a
-        // flat scalar loop over the same f16 LDS tiles instead; measured at
-        // 0.97-1.07x of the all-coopmat path across 4 same-session,
-        // order-reversed A/B runs (see Probe533FixCandidateTests).
+        // flat scalar loop over the same f16 LDS tiles instead. Final measured
+        // cost vs the pre-fix module, same-session and order-reversed: 0.809x at
+        // p128_even and at or above parity everywhere else on gfx1151, with the
+        // p2048 hd64 rows a 3-5% GAIN because the scalar tail skips the oStage
+        // round-trip and two barriers (see Probe533FixCandidateTests).
         uint firstPosQ = pc.positionOffset + qStartRow;
         // A sliding window does NOT need to force the scalar path: its masked
         // cells sit at columns that carry the SAME real V data in a longer
