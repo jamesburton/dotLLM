@@ -340,7 +340,6 @@ public sealed unsafe class ComputeThreadPoolTests
         public int ArraySize;
     }
 
-
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void SumWorker(nint ctx, int threadIdx, int threadCount)
     {
