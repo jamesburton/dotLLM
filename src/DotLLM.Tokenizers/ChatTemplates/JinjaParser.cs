@@ -80,6 +80,7 @@ internal sealed class JinjaParser
             JinjaTokenType.If => ParseIf(),
             JinjaTokenType.For => ParseFor(),
             JinjaTokenType.Set => ParseSet(),
+            JinjaTokenType.Macro => ParseMacro(),
             _ => throw Error($"Unexpected statement keyword: {keyword.Type}")
         };
     }
@@ -187,6 +188,60 @@ internal sealed class JinjaParser
         var expr = ParseExpression();
         Expect(JinjaTokenType.StmtEnd);
         return new SetNode(name, expr);
+    }
+
+    /// <summary>
+    /// Parses <c>{% macro name(a, b=default) %} body {% endmacro %}</c>. Real-world templates
+    /// (e.g. Qwen3-family <c>render_content</c> helpers) define a macro once near the top of the
+    /// template and call it repeatedly later — so unlike a "skip and ignore" approach, the body
+    /// must be captured as a real node list for the evaluator to invoke per call site.
+    /// </summary>
+    private MacroNode ParseMacro()
+    {
+        Expect(JinjaTokenType.Macro);
+        string name = ExpectIdentifier();
+
+        Expect(JinjaTokenType.LeftParen);
+        var parameters = ParseMacroParamList();
+        Expect(JinjaTokenType.RightParen);
+        Expect(JinjaTokenType.StmtEnd);
+
+        var body = ParseBody(JinjaTokenType.EndMacro);
+
+        Expect(JinjaTokenType.StmtStart);
+        Expect(JinjaTokenType.EndMacro);
+        Expect(JinjaTokenType.StmtEnd);
+
+        return new MacroNode(name, parameters, body);
+    }
+
+    private List<(string Name, IExpression? Default)> ParseMacroParamList()
+    {
+        var parameters = new List<(string, IExpression?)>();
+        if (!CurrentIs(JinjaTokenType.RightParen))
+        {
+            parameters.Add(ParseMacroParam());
+            while (CurrentIs(JinjaTokenType.Comma))
+            {
+                Advance();
+                if (CurrentIs(JinjaTokenType.RightParen))
+                    break; // trailing comma
+                parameters.Add(ParseMacroParam());
+            }
+        }
+        return parameters;
+    }
+
+    private (string Name, IExpression? Default) ParseMacroParam()
+    {
+        string name = ExpectIdentifier();
+        IExpression? defaultValue = null;
+        if (CurrentIs(JinjaTokenType.Assign))
+        {
+            Advance();
+            defaultValue = ParseExpression();
+        }
+        return (name, defaultValue);
     }
 
     // ── Expression parsing with precedence climbing ──
@@ -413,33 +468,35 @@ internal sealed class JinjaParser
                 continue;
             }
 
-            // Index/bracket access: [expr] or slice: [start:stop]
+            // Index/bracket access: [expr] or slice: [start:stop:step] (any part optional)
             if (CurrentIs(JinjaTokenType.LeftBracket))
             {
                 Advance();
 
                 IExpression? start = null;
                 IExpression? stop = null;
+                IExpression? step = null;
                 bool isSlice = false;
+
+                // start (absent for [:stop] / [::step] / [:])
+                if (!CurrentIs(JinjaTokenType.Colon))
+                    start = ParseExpression();
 
                 if (CurrentIs(JinjaTokenType.Colon))
                 {
-                    // [:stop] or [:]
+                    // first ':' makes this a slice
                     isSlice = true;
                     Advance();
-                    if (!CurrentIs(JinjaTokenType.RightBracket))
+                    // stop (absent for [start:] / [start::step] / [:])
+                    if (!CurrentIs(JinjaTokenType.Colon) && !CurrentIs(JinjaTokenType.RightBracket))
                         stop = ParseExpression();
-                }
-                else
-                {
-                    start = ParseExpression();
+
                     if (CurrentIs(JinjaTokenType.Colon))
                     {
-                        // [start:stop] or [start:]
-                        isSlice = true;
+                        // second ':' introduces the optional step
                         Advance();
                         if (!CurrentIs(JinjaTokenType.RightBracket))
-                            stop = ParseExpression();
+                            step = ParseExpression();
                     }
                 }
 
@@ -447,7 +504,7 @@ internal sealed class JinjaParser
 
                 if (isSlice)
                 {
-                    expr = new SliceExpr(expr, start, stop);
+                    expr = new SliceExpr(expr, start, stop, step);
                 }
                 else
                 {

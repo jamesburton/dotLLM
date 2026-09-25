@@ -81,6 +81,12 @@ internal readonly record struct SchemaNode
     /// </summary>
     public int EnumTrieIndex { get; init; }
 
+    /// <summary>For String: JSON-Schema <c>maxLength</c> (max content chars), or -1 if unset.</summary>
+    public int MaxLength { get; init; }
+
+    /// <summary>For String: JSON-Schema <c>minLength</c> (min content chars), or -1 if unset.</summary>
+    public int MinLength { get; init; }
+
     /// <summary>Creates a default unconstrained node.</summary>
     public static SchemaNode Unconstrained => new()
     {
@@ -90,5 +96,7 @@ internal readonly record struct SchemaNode
         ItemsNodeIndex = -1,
         PropertyTrieIndex = -1,
         EnumTrieIndex = -1,
+        MaxLength = -1,
+        MinLength = -1,
     };
 }

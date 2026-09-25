@@ -10,6 +10,7 @@ public sealed unsafe class DequantizeTests
 {
     private const int Q8_0BlockBytes = 34;
     private const int Q8_0GroupSize = 32;
+    private const int Q4_0BlockBytes = 18;
     private const int Q5_0BlockBytes = 22;
     private const int Q5_0GroupSize = 32;
 
@@ -238,6 +239,121 @@ public sealed unsafe class DequantizeTests
         }
     }
 
+    // ──────────────────── Q4_0 ────────────────────
+
+    [Fact]
+    public void Q4_0_ZeroPayload_Gives_NegativeEightTimesScale()
+    {
+        // All nibbles = 0 → every value becomes (0 - 8) * scale.
+        nint ptr = AllocQ4_0Block(scale: (Half)0.5f, fillQs: _ => 0);
+        try
+        {
+            float[] dest = new float[Q8_0GroupSize];
+            Dequantize.ToFloat32(ptr, Q8_0GroupSize, QuantizationType.Q4_0, dest);
+            for (int i = 0; i < Q8_0GroupSize; i++)
+                Assert.Equal(-4.0f, dest[i]);
+        }
+        finally
+        {
+            NativeMemory.AlignedFree((void*)ptr);
+        }
+    }
+
+    [Fact]
+    public void Q4_0_AllBitsSet_Gives_PositiveSevenTimesScale()
+    {
+        // All nibbles = 0xF → every value becomes (15 - 8) * scale = 7 * scale.
+        nint ptr = AllocQ4_0Block(scale: (Half)2.0f, fillQs: _ => 0xFF);
+        try
+        {
+            float[] dest = new float[Q8_0GroupSize];
+            Dequantize.ToFloat32(ptr, Q8_0GroupSize, QuantizationType.Q4_0, dest);
+            for (int i = 0; i < Q8_0GroupSize; i++)
+                Assert.Equal(14.0f, dest[i]);
+        }
+        finally
+        {
+            NativeMemory.AlignedFree((void*)ptr);
+        }
+    }
+
+    [Fact]
+    public void Q4_0_HandPackedBlock_MatchesExactExpectedValues()
+    {
+        // Discriminating layout test. Byte j packs (hi << 4) | lo, where the LOW nibble is
+        // element j and the HIGH nibble is element j + 16 (llama.cpp dequantize_row_q4_0).
+        // The low half is a rising ramp 0..15 and the high half a falling ramp 15..0, so the
+        // two halves are never equal for any j — swapping nibble order, or emitting adjacent
+        // pairs instead of the j / j+16 split, changes every output element.
+        const float scale = 0.25f;
+        nint ptr = AllocQ4_0Block(
+            scale: (Half)scale,
+            fillQs: j => (byte)(((15 - j) << 4) | j));
+        try
+        {
+            float[] dest = new float[Q8_0GroupSize];
+            Dequantize.ToFloat32(ptr, Q8_0GroupSize, QuantizationType.Q4_0, dest);
+
+            for (int j = 0; j < 16; j++)
+            {
+                Assert.Equal((j - 8) * scale, dest[j]);
+                Assert.Equal(((15 - j) - 8) * scale, dest[j + 16]);
+            }
+        }
+        finally
+        {
+            NativeMemory.AlignedFree((void*)ptr);
+        }
+    }
+
+    [Fact]
+    public void Q4_0_MultipleBlocks_AdvanceByEighteenBytes()
+    {
+        // Two blocks with distinct scales; a wrong block stride would bleed block 0's scale
+        // into block 1 (or read misaligned garbage).
+        const int blockCount = 2;
+        const int totalElements = blockCount * Q8_0GroupSize;
+        nint ptr = (nint)NativeMemory.AlignedAlloc((nuint)(blockCount * Q4_0BlockBytes), 64);
+        try
+        {
+            byte* p = (byte*)ptr;
+            for (int b = 0; b < blockCount; b++)
+            {
+                *(Half*)p = (Half)(b + 1);
+
+                // Nibble value 0xF in the low half, 0x0 in the high half.
+                for (int i = 0; i < 16; i++)
+                    (p + 2)[i] = 0x0F;
+                p += Q4_0BlockBytes;
+            }
+
+            float[] dest = new float[totalElements];
+            Dequantize.ToFloat32(ptr, totalElements, QuantizationType.Q4_0, dest);
+
+            for (int b = 0; b < blockCount; b++)
+            {
+                float d = b + 1;
+                for (int j = 0; j < 16; j++)
+                {
+                    Assert.Equal(7.0f * d, dest[(b * Q8_0GroupSize) + j]);
+                    Assert.Equal(-8.0f * d, dest[(b * Q8_0GroupSize) + j + 16]);
+                }
+            }
+        }
+        finally
+        {
+            NativeMemory.AlignedFree((void*)ptr);
+        }
+    }
+
+    [Fact]
+    public void Q4_0_NonAlignedCount_Throws()
+    {
+        float[] dest = new float[64];
+        Assert.Throws<ArgumentException>(() =>
+            Dequantize.ToFloat32(nint.Zero, 33, QuantizationType.Q4_0, dest));
+    }
+
     // ──────────────────── Q5_0 ────────────────────
 
     [Fact]
@@ -353,9 +469,10 @@ public sealed unsafe class DequantizeTests
     [Fact]
     public void UnsupportedType_Throws()
     {
+        // Q8_1 (GGML type 9) is not in QuantizationType and is not handled by the switch.
         float[] dest = new float[32];
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            Dequantize.ToFloat32(nint.Zero, 32, QuantizationType.Q4_0, dest));
+            Dequantize.ToFloat32(nint.Zero, 32, (QuantizationType)9, dest));
     }
 
     [Fact]
@@ -384,6 +501,16 @@ public sealed unsafe class DequantizeTests
         *(Half*)p = scale;
         for (int i = 0; i < Q8_0GroupSize; i++)
             ((sbyte*)(p + 2))[i] = fillQs(i);
+        return ptr;
+    }
+
+    private static nint AllocQ4_0Block(Half scale, Func<int, byte> fillQs)
+    {
+        nint ptr = (nint)NativeMemory.AlignedAlloc(Q4_0BlockBytes, 32);
+        byte* p = (byte*)ptr;
+        *(Half*)p = scale;
+        for (int i = 0; i < 16; i++)
+            (p + 2)[i] = fillQs(i);
         return ptr;
     }
 

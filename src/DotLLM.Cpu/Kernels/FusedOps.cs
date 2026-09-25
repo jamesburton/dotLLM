@@ -27,13 +27,21 @@ public static unsafe class FusedOps
     /// Uses tiled <see cref="TensorPrimitives.Sigmoid"/> for exact precision, with the
     /// sigmoid intermediate staying in L1 via a small stack buffer. Eliminates one full
     /// memory pass over intermediateSize compared to separate SiLU + Multiply calls.
+    /// Safe to call when <paramref name="up"/> aliases <paramref name="result"/>
+    /// (the common in-place pattern <c>SwiGLU(gate, y, y)</c>).
     /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void SwiGLU(ReadOnlySpan<float> gate, ReadOnlySpan<float> up, Span<float> result)
     {
         int length = gate.Length;
+
+        // If up aliases result, the second Multiply below would compute SiLU(gate)² (reading
+        // and writing the same buffer) instead of SiLU(gate) * up. Snapshot up per tile.
+        bool upAliases = up.Overlaps(result);
+
         Span<float> sigBuf = stackalloc float[SwiGLUTileSize];
+        Span<float> upBuf = stackalloc float[SwiGLUTileSize];
 
         int i = 0;
         for (; i + SwiGLUTileSize <= length; i += SwiGLUTileSize)
@@ -42,9 +50,12 @@ public static unsafe class FusedOps
             var uTile = up.Slice(i, SwiGLUTileSize);
             var rTile = result.Slice(i, SwiGLUTileSize);
 
+            if (upAliases) uTile.CopyTo(upBuf);
+            ReadOnlySpan<float> uReadable = upAliases ? (ReadOnlySpan<float>)upBuf : uTile;
+
             TensorPrimitives.Sigmoid(gTile, sigBuf);
             TensorPrimitives.Multiply(gTile, sigBuf, rTile);
-            TensorPrimitives.Multiply((ReadOnlySpan<float>)rTile, uTile, rTile);
+            TensorPrimitives.Multiply((ReadOnlySpan<float>)rTile, uReadable, rTile);
         }
 
         // Tail
@@ -55,10 +66,14 @@ public static unsafe class FusedOps
             var uTile = up.Slice(i, remaining);
             var rTile = result.Slice(i, remaining);
             var sigTail = sigBuf.Slice(0, remaining);
+            var upTail = upBuf.Slice(0, remaining);
+
+            if (upAliases) uTile.CopyTo(upTail);
+            ReadOnlySpan<float> uReadable = upAliases ? (ReadOnlySpan<float>)upTail : uTile;
 
             TensorPrimitives.Sigmoid(gTile, sigTail);
             TensorPrimitives.Multiply(gTile, sigTail, rTile);
-            TensorPrimitives.Multiply((ReadOnlySpan<float>)rTile, uTile, rTile);
+            TensorPrimitives.Multiply((ReadOnlySpan<float>)rTile, uReadable, rTile);
         }
     }
 
@@ -77,16 +92,196 @@ public static unsafe class FusedOps
         }
     }
 
+    // ──────────────────── GeGLU (tanh) Fusion ────────────────────
+    // Fuses GELU-tanh-approximate(gate) + Multiply(geluOut, up) into one tiled
+    // operation. Used by Gemma 2 / Gemma 3 MLP blocks (hidden_activation =
+    // "gelu_pytorch_tanh"); shape-identical to SwiGLU, only the gate activation
+    // differs.
+    //
+    //   gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+    //   result[i]    = gelu_tanh(gate[i]) * up[i]
+    //
+    // This matches PyTorch's `nn.functional.gelu(approximate="tanh")` and HF's
+    // ACT2FN["gelu_pytorch_tanh"] / ACT2FN["gelu_new"] used by Gemma checkpoints.
+    // Uses TensorPrimitives.Tanh for SIMD-accelerated tanh; the polynomial inside
+    // the tanh argument is computed with element-wise primitives.
+
+    /// <summary>Tile size for GeGLU. 256 floats = 1024 bytes — fits in L1 data cache.</summary>
+    private const int GeGLUTileSize = 256;
+
+    /// <summary>The constant <c>sqrt(2/π)</c> used in the tanh-approximate GELU formula.</summary>
+    private const float GeluTanhSqrt2OverPi = 0.7978845608028654f;
+
+    /// <summary>The cubic coefficient in the tanh-approximate GELU formula.</summary>
+    private const float GeluTanhCubicCoeff = 0.044715f;
+
+    /// <summary>
+    /// Fused GeGLU activation (tanh-approximate GELU):
+    /// <c>result[i] = gelu_tanh(gate[i]) * up[i]</c> where
+    /// <c>gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))</c>.
+    /// Used by Gemma 2 / Gemma 3 MLP blocks. Bit-equivalent (within F32 reorder noise)
+    /// to <see cref="GeGLUTanhScalar"/>. Safe to call in-place when
+    /// <paramref name="up"/> aliases <paramref name="result"/>.
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void GeGLUTanh(ReadOnlySpan<float> gate, ReadOnlySpan<float> up, Span<float> result)
+    {
+        int length = gate.Length;
+
+        // Snapshot up per tile when it aliases result, mirroring the SwiGLU fix.
+        bool upAliases = up.Overlaps(result);
+
+        Span<float> innerBuf = stackalloc float[GeGLUTileSize]; // sqrt(2/π) * (x + 0.044715 * x^3)
+        Span<float> tanhBuf = stackalloc float[GeGLUTileSize];  // tanh(innerBuf)
+        Span<float> upBuf = stackalloc float[GeGLUTileSize];
+
+        int i = 0;
+        for (; i + GeGLUTileSize <= length; i += GeGLUTileSize)
+        {
+            var gTile = gate.Slice(i, GeGLUTileSize);
+            var uTile = up.Slice(i, GeGLUTileSize);
+            var rTile = result.Slice(i, GeGLUTileSize);
+
+            if (upAliases) uTile.CopyTo(upBuf);
+            ReadOnlySpan<float> uReadable = upAliases ? (ReadOnlySpan<float>)upBuf : uTile;
+
+            GeluTanhTile(gTile, innerBuf, tanhBuf, rTile);
+            TensorPrimitives.Multiply((ReadOnlySpan<float>)rTile, uReadable, rTile);
+        }
+
+        if (i < length)
+        {
+            int remaining = length - i;
+            var gTile = gate.Slice(i, remaining);
+            var uTile = up.Slice(i, remaining);
+            var rTile = result.Slice(i, remaining);
+            var innerTail = innerBuf.Slice(0, remaining);
+            var tanhTail = tanhBuf.Slice(0, remaining);
+            var upTail = upBuf.Slice(0, remaining);
+
+            if (upAliases) uTile.CopyTo(upTail);
+            ReadOnlySpan<float> uReadable = upAliases ? (ReadOnlySpan<float>)upTail : uTile;
+
+            GeluTanhTile(gTile, innerTail, tanhTail, rTile);
+            TensorPrimitives.Multiply((ReadOnlySpan<float>)rTile, uReadable, rTile);
+        }
+    }
+
+    /// <summary>
+    /// Computes <c>rTile = gelu_tanh(gTile)</c> using the three-stage decomposition:
+    /// (1) inner = sqrt(2/π) * (gate + 0.044715 * gate^3);
+    /// (2) tanh(inner);
+    /// (3) rTile = 0.5 * gate * (1 + tanh(inner)).
+    /// All ops route through <see cref="TensorPrimitives"/>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void GeluTanhTile(
+        ReadOnlySpan<float> gTile, Span<float> innerBuf, Span<float> tanhBuf, Span<float> rTile)
+    {
+        // inner = gate * gate * gate  (g^3 in tanhBuf as scratch)
+        TensorPrimitives.Multiply(gTile, gTile, tanhBuf);
+        TensorPrimitives.Multiply((ReadOnlySpan<float>)tanhBuf, gTile, innerBuf);
+        // inner = 0.044715 * inner
+        TensorPrimitives.Multiply((ReadOnlySpan<float>)innerBuf, GeluTanhCubicCoeff, innerBuf);
+        // inner = gate + inner
+        TensorPrimitives.Add(gTile, (ReadOnlySpan<float>)innerBuf, innerBuf);
+        // inner = sqrt(2/π) * inner
+        TensorPrimitives.Multiply((ReadOnlySpan<float>)innerBuf, GeluTanhSqrt2OverPi, innerBuf);
+        // tanh(inner) → tanhBuf
+        TensorPrimitives.Tanh((ReadOnlySpan<float>)innerBuf, tanhBuf);
+        // rTile = 1 + tanh(inner)
+        TensorPrimitives.Add((ReadOnlySpan<float>)tanhBuf, 1.0f, rTile);
+        // rTile = gate * (1 + tanh(inner))
+        TensorPrimitives.Multiply((ReadOnlySpan<float>)rTile, gTile, rTile);
+        // rTile = 0.5 * rTile
+        TensorPrimitives.Multiply((ReadOnlySpan<float>)rTile, 0.5f, rTile);
+    }
+
+    /// <summary>
+    /// Scalar GeGLU reference implementation for correctness verification.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void GeGLUTanhScalar(ReadOnlySpan<float> gate, ReadOnlySpan<float> up, Span<float> result)
+    {
+        for (int i = 0; i < gate.Length; i++)
+        {
+            float g = gate[i];
+            float u = up[i];
+            float inner = GeluTanhSqrt2OverPi * (g + GeluTanhCubicCoeff * g * g * g);
+            float gelu = 0.5f * g * (1.0f + MathF.Tanh(inner));
+            result[i] = gelu * u;
+        }
+    }
+
+    // ──────────────────── ReLU² GLU Fusion ────────────────────
+    // Fuses relu(gate)² + Multiply(reluSq, up) into a tiled operation:
+    //   result[i] = max(0, gate[i])² * up[i]
+    // This is the squared-ReLU ("relu2") gating used by BitNet b1.58 in place of SwiGLU.
+    // Tiles of 256 floats (1KB) keep the relu intermediate in L1 cache.
+
+    /// <summary>
+    /// Fused squared-ReLU GLU activation: <c>result[i] = max(0, gate[i])² * up[i]</c>.
+    /// Uses tiled <see cref="TensorPrimitives"/> with the relu intermediate staying in L1
+    /// via a small stack buffer. This is BitNet's FFN gating (in place of SwiGLU).
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void ReLU2GLU(ReadOnlySpan<float> gate, ReadOnlySpan<float> up, Span<float> result)
+    {
+        int length = gate.Length;
+        Span<float> reluBuf = stackalloc float[SwiGLUTileSize];
+
+        int i = 0;
+        for (; i + SwiGLUTileSize <= length; i += SwiGLUTileSize)
+        {
+            var gTile = gate.Slice(i, SwiGLUTileSize);
+            var uTile = up.Slice(i, SwiGLUTileSize);
+            var rTile = result.Slice(i, SwiGLUTileSize);
+
+            TensorPrimitives.Max(gTile, 0f, reluBuf);                       // relu(gate)
+            TensorPrimitives.Multiply((ReadOnlySpan<float>)reluBuf, reluBuf, reluBuf); // squared
+            TensorPrimitives.Multiply((ReadOnlySpan<float>)reluBuf, uTile, rTile);     // * up
+        }
+
+        // Tail
+        if (i < length)
+        {
+            int remaining = length - i;
+            var gTile = gate.Slice(i, remaining);
+            var uTile = up.Slice(i, remaining);
+            var rTile = result.Slice(i, remaining);
+            var reluTail = reluBuf.Slice(0, remaining);
+
+            TensorPrimitives.Max(gTile, 0f, reluTail);
+            TensorPrimitives.Multiply((ReadOnlySpan<float>)reluTail, reluTail, reluTail);
+            TensorPrimitives.Multiply((ReadOnlySpan<float>)reluTail, uTile, rTile);
+        }
+    }
+
+    /// <summary>
+    /// Scalar ReLU² GLU reference implementation for correctness verification.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void ReLU2GLUScalar(ReadOnlySpan<float> gate, ReadOnlySpan<float> up, Span<float> result)
+    {
+        for (int i = 0; i < gate.Length; i++)
+        {
+            float r = MathF.Max(0f, gate[i]);
+            result[i] = r * r * up[i];
+        }
+    }
+
     // ──────────────────── RMSNorm + Quantize Fusion ────────────────────
     // Fuses RmsNorm(hidden → normOut) + Quantize(normOut → Q8 scratch) into one kernel
     // that reads hidden once and writes quantized output directly — skipping normOut.
 
-    private const int Q8_0GroupSize = 32;
-    private const int Q8_0BlockBytes = 34;
-    private const int Q8_1GroupSize = 32;
-    private const int Q8_1BlockBytes = 36;
-    private const int Q8_K_GroupSize = 256;
-    private const int Q8_K_BlockBytes = 292;
+    private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
+    private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
+    private const int Q8_1GroupSize = QuantFormat.LegacyGroupSize;
+    private const int Q8_1BlockBytes = QuantFormat.Q8_1BlockBytes;
+    private const int Q8_K_GroupSize = QuantFormat.KQuantGroupSize;
+    private const int Q8_K_BlockBytes = QuantFormat.Q8_KBlockBytes;
 
     /// <summary>
     /// Dispatches fused RmsNorm+Quantize based on quant type.
@@ -106,7 +301,8 @@ public static unsafe class FusedOps
             RmsNormQuantizeQ8_1(input, weight, eps, dest, dim);
             return dest;
         }
-        if (qt is QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K)
+        if (qt is QuantizationType.Q2_K or QuantizationType.Q3_K
+                or QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K)
         {
             RmsNormQuantizeQ8_K(input, weight, eps, dest, dim);
             return dest;
@@ -368,7 +564,7 @@ public static unsafe class FusedOps
     /// <summary>
     /// Fused RMSNorm + Q8_K quantization. Reads input once, applies normalization,
     /// and quantizes directly to Q8_K format (float32 scale, 256-element blocks with 16 bsums).
-    /// Used for K-quant weight types (Q4_K, Q5_K, Q6_K).
+    /// Used for K-quant weight types (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K).
     /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]

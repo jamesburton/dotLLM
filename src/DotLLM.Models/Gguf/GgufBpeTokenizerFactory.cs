@@ -6,7 +6,8 @@ namespace DotLLM.Models.Gguf;
 /// Creates a <see cref="BpeTokenizer"/> from the tokenizer metadata embedded in a GGUF file.
 /// Reads the <c>tokenizer.ggml.*</c> metadata keys and dispatches to the appropriate
 /// tokenizer variant (SentencePiece for <c>"llama"</c>/<c>"mistral"</c>,
-/// tiktoken for <c>"gpt2"</c>/<c>"llama3"</c>).
+/// tiktoken for <c>"gpt2"</c>/<c>"llama3"</c>, SPM-style merge-ranked BPE for
+/// <c>"gemma4"</c>).
 /// </summary>
 public static class GgufBpeTokenizerFactory
 {
@@ -31,8 +32,20 @@ public static class GgufBpeTokenizerFactory
         return model switch
         {
             "gpt2" or "llama3" => LoadTiktoken(metadata, tokens, tokenTypes, bosId, eosId),
+            // gemma-4 GGUFs carry merge-ranked BPE (llama.cpp LLAMA_VOCAB_PRE_TYPE_GEMMA4:
+            // spaces escaped to ▁, newline-only pre-split, raw UTF-8). Files without a
+            // merge table keep the historical SentencePiece longest-match fallback.
+            "gemma4" when metadata.ContainsKey("tokenizer.ggml.merges") =>
+                LoadGemma4(metadata, tokens, tokenTypes, bosId, eosId),
             _ => LoadSentencePiece(metadata, tokens, tokenTypes, bosId, eosId),
         };
+    }
+
+    private static BpeTokenizer LoadGemma4(
+        GgufMetadata metadata, string[] tokens, int[]? tokenTypes, int bosId, int eosId)
+    {
+        string[] merges = metadata.GetStringArray("tokenizer.ggml.merges");
+        return BpeTokenizer.CreateGemma4(tokens, merges, tokenTypes, bosId, eosId);
     }
 
     private static BpeTokenizer LoadSentencePiece(
@@ -42,7 +55,13 @@ public static class GgufBpeTokenizerFactory
             ? metadata.GetFloat32Array("tokenizer.ggml.scores")
             : new float[tokens.Length];
 
-        return BpeTokenizer.CreateSentencePiece(tokens, scores, tokenTypes, bosId, eosId);
+        // tokenizer.ggml.add_space_prefix: SentencePiece defaults to prepending ▁
+        // to text that doesn't start with a space; gemma4 (and some Llama
+        // derivatives) explicitly disable it — "The" must encode to the bare 'The'
+        // token, not '▁The'. Absent key keeps the historical default (true).
+        bool addSpacePrefix = metadata.GetBoolOrDefault("tokenizer.ggml.add_space_prefix", true);
+
+        return BpeTokenizer.CreateSentencePiece(tokens, scores, tokenTypes, bosId, eosId, addSpacePrefix);
     }
 
     private static BpeTokenizer LoadTiktoken(

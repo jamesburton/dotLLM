@@ -1,0 +1,321 @@
+using DotLLM.Vulkan.Interop;
+
+namespace DotLLM.Vulkan.Kernels;
+
+/// <summary>
+/// Identifies an F16 coopmat GEMM shader variant — see
+/// <see cref="Kernels.Q8_0GemmCoopmatVariant"/> (issue #240) for the rationale; this is the
+/// same wave-width-pin fix applied to <see cref="MatMulF16GemmCoopmatKernel"/>.
+/// </summary>
+/// <param name="SpvFileName">File name of the SPIR-V module within the <c>spv</c> directory.</param>
+/// <param name="RequiredSubgroupSize">Non-zero pins the pipeline to this wave width.</param>
+/// <param name="TileM">Weight rows of <c>C</c> produced per workgroup (sets the dispatch grid).</param>
+/// <param name="TileN">Token rows of <c>C</c> produced per workgroup (sets the dispatch grid).</param>
+/// <param name="RequiresNativeSubgroupSize">
+/// When non-zero, the variant's fixed workgroup size only maps to the subgroup grid its shader
+/// assumes on a device whose <see cref="VulkanDevice.SubgroupSize"/> is exactly this. See
+/// <see cref="Blocked128x128x4"/>.
+/// </param>
+public readonly record struct F16GemmCoopmatVariant(
+    string SpvFileName, int RequiredSubgroupSize, int TileM = 16, int TileN = 16,
+    int RequiresNativeSubgroupSize = 0)
+{
+    /// <summary>
+    /// Environment variable that restores the pre-issue-#443 preference
+    /// (<see cref="Coopmat64"/>) in <see cref="SelectFor"/>.
+    /// </summary>
+    /// <remarks>
+    /// Exists so <see cref="Blocked128x128x4"/> can be A/B'd against what shipped, in
+    /// alternating processes on a real model — a kernel bench can only compare in isolation.
+    /// </remarks>
+    public const string LegacyEnvVar = "DOTLLM_VK_F16_GEMM_LEGACY";
+
+    /// <summary>Baseline 64-thread coopmat kernel, 16x16 tile from one subgroup.</summary>
+    public static F16GemmCoopmatVariant Coopmat64 => new("matmul_f16_gemm_coopmat.spv", 0);
+
+    /// <summary>32-thread workgroup pinned to wave32.</summary>
+    public static F16GemmCoopmatVariant Coopmat32 => new("matmul_f16_gemm_coopmat32.spv", 32);
+
+    /// <summary>
+    /// Issue #443: the proven 128x128, BK=32, four-wave64-subgroup blocked tile, instantiated
+    /// from the shared <c>gemm_coopmat_blocked_*.glsl</c> template.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Total weight-staging work is <c>M*K*N / BN</c> — each weight element is re-staged once
+    /// per N-tile, so BN 16 -&gt; 128 deletes 8x of it at N=512. On PQ2_0 that measured 12.2x
+    /// on the kernel and 5.47x end to end (#439/#440). F16 has <b>no dequant at all</b>, so
+    /// whatever it measures here is the tile's contribution in isolation.
+    /// </para>
+    /// <para>
+    /// Reduction order per output is unchanged from <see cref="Coopmat64"/> (BK=32 chunks, two
+    /// TK=16 <c>coopMatMulAdd</c> into one F32 accumulator), so it is held to the same parity
+    /// tolerance, not a widened one.
+    /// </para>
+    /// <para>
+    /// <b>wave64 ONLY, and that is a correctness gate, not a perf preference.</b> The shader
+    /// declares <c>local_size_x = NSG * WAVE = 4 * 64 = 256</c> and lays four subgroups out as a
+    /// 2x2 grid over the tile via <c>gl_SubgroupID</c>. On a device whose native subgroup is 32
+    /// the same 256 threads form EIGHT subgroups, so ids 4-7 index past the 2x2 grid: they read
+    /// <c>sharedB</c> beyond <c>BN * STRIDE</c> and store into the NEXT tile's rows, while
+    /// <c>tileAllIn</c> — evaluated on the workgroup tile — still says the fast path is safe.
+    /// Silent wrong answers, not a crash. Hence <c>RequiresNativeSubgroupSize = 64</c>.
+    /// </para>
+    /// <para>
+    /// The clean fix is a wave-count specialization constant, or pinning the pipeline to 64;
+    /// neither is what #443 measured, so the gate is the conservative form and the pin is a
+    /// follow-up.
+    /// </para>
+    /// </remarks>
+    public static F16GemmCoopmatVariant Blocked128x128x4 =>
+        new("matmul_f16_gemm_coopmat_128x128x4.spv", 0, TileM: 128, TileN: 128,
+            RequiresNativeSubgroupSize: 64);
+
+    /// <summary>
+    /// Whether <paramref name="device"/> can create a pipeline for this variant right now: the
+    /// pinnable subgroup size (when declared) AND the compiled SPIR-V present in
+    /// <paramref name="spvDir"/> — see <see cref="Q8_0GemmCoopmatVariant.IsSupportedOn"/>'s
+    /// remarks for why the file-existence check matters.
+    /// </summary>
+    public bool IsSupportedOn(VulkanDevice device, string spvDir)
+    {
+        if (RequiredSubgroupSize != 0
+            && !device.SupportsRequiredSubgroupSize((uint)RequiredSubgroupSize, VkShaderStageFlags.Compute))
+            return false;
+        // Issue #443: a fixed workgroup size only yields the subgroup grid the shader assumes at
+        // one native wave width. Getting this wrong is silent corruption, not a pipeline failure.
+        if (RequiresNativeSubgroupSize != 0 && device.SubgroupSize != (uint)RequiresNativeSubgroupSize)
+            return false;
+        return File.Exists(Path.Combine(spvDir, SpvFileName));
+    }
+
+    /// <summary>
+    /// Picks the default variant for this device. Defaults to <see cref="Coopmat64"/> —
+    /// see <see cref="Q8_0GemmCoopmatVariant.SelectFor"/>'s remarks (issue #298): real
+    /// cross-vendor A/B measurement showed <see cref="Coopmat32"/> regresses 0.73x-0.91x at
+    /// medium/large shapes on gfx1151. <see cref="Coopmat32"/> remains available via the
+    /// explicit-selection overload.
+    /// </summary>
+    public static F16GemmCoopmatVariant SelectFor(VulkanDevice device, string spvDir)
+    {
+        // DOTLLM_VK_F16_GEMM_LEGACY=1 restores the pre-#443 preference so the blocked tile can
+        // be A/B'd against what shipped, in alternating processes, on a real model.
+        if (Environment.GetEnvironmentVariable(LegacyEnvVar) != "1"
+            && Blocked128x128x4.IsSupportedOn(device, spvDir))
+            return Blocked128x128x4;
+
+        return Coopmat64;
+    }
+
+    /// <summary>
+    /// Every variant <paramref name="device"/> can run. Benchmarks and the parity gates
+    /// enumerate this so a variant cannot rot unmeasured.
+    /// </summary>
+    /// <param name="device">Device to enumerate for.</param>
+    /// <param name="spvDir">Directory the compiled SPIR-V is loaded from.</param>
+    /// <returns>The runnable variants, legacy first.</returns>
+    public static IEnumerable<F16GemmCoopmatVariant> AvailableOn(VulkanDevice device, string spvDir)
+    {
+        if (Coopmat64.IsSupportedOn(device, spvDir)) yield return Coopmat64;
+        if (Coopmat32.IsSupportedOn(device, spvDir)) yield return Coopmat32;
+        if (Blocked128x128x4.IsSupportedOn(device, spvDir)) yield return Blocked128x128x4;
+    }
+}
+
+/// <summary>
+/// F16 native batched GEMM via <c>VK_KHR_cooperative_matrix</c>:
+/// <c>C[N, M] = B[N, K] @ W_f16[M, K]^T</c>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Semantic and binding parity with <see cref="MatMulF16GemmF32Kernel"/> —
+/// same descriptor layout (3 storage buffers: F16 weights, F32 input, F32
+/// output), same push constants (M, K, N, pairsPerRow, rowUints), same weight
+/// byte format. Drift versus the scalar kernel is the standard F16-vs-F32
+/// staging delta — within abs 5e-3 / rel 1e-3 of the scalar reference at
+/// the K shapes the parity tests cover.
+/// </para>
+/// <para>
+/// Availability: this kernel requires the physical device to advertise
+/// <c>VK_KHR_cooperative_matrix</c> with a 16x16x16 F16xF16->F32 subgroup
+/// tile. Callers must check <see cref="VulkanDevice.HasCooperativeMatrix"/>
+/// before calling <see cref="Create(VulkanDevice, string)"/> — otherwise an exception is thrown.
+/// The orchestrator wires runtime dispatch selection (coopmat vs scalar) in
+/// <c>RecordMatmul</c>.
+/// </para>
+/// <para>
+/// Dispatch: 2-D grid, workgroup <c>(64, 1, 1)</c> — one subgroup per
+/// output tile. Tile shape: 16 rows x 16 cols of C, K stepped 32 at a time
+/// with TK=16 (two coopMatMulAdd per chunk).
+/// </para>
+/// </remarks>
+public sealed class MatMulF16GemmCoopmatKernel : IDisposable
+{
+    /// <summary>Bytes per F16 element on device.</summary>
+    public const int F16ElementBytes = 2;
+
+    /// <summary>K must be a multiple of this value.</summary>
+    public const int KChunk = 32;
+
+    private const int PushConstantBytes = 5 * sizeof(uint); // M, K, N, pairsPerRow, rowUints
+
+    private readonly VulkanDevice _device;
+    private readonly VulkanModule _module;
+    private readonly ComputePipeline _pipeline;
+    private readonly nint _descriptorPool;
+    private readonly DescriptorSetCache _descriptorCache;
+    // Dispatch grid comes from the VARIANT, not a constant: issue #443's blocked instantiation
+    // produces a 128x128 tile where the legacy kernel produces 16x16, and a stale 16 here would
+    // launch 64x too many workgroups, each recomputing and overwriting the same output.
+    private readonly int _tileM;
+    private readonly int _tileN;
+    private bool _disposed;
+
+    private MatMulF16GemmCoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
+        int tileM, int tileN)
+    {
+        _tileM = tileM;
+        _tileN = tileN;
+        _device = device;
+        _module = module;
+        _pipeline = pipeline;
+        _descriptorPool = pool;
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 3);
+    }
+
+    /// <summary>
+    /// Loads the fastest coopmat variant <paramref name="device"/> can run right now
+    /// (<see cref="F16GemmCoopmatVariant.SelectFor"/>) and creates the pipeline. Requires
+    /// <see cref="VulkanDevice.HasCooperativeMatrix"/> to be <c>true</c> —
+    /// throws <see cref="InvalidOperationException"/> otherwise so the caller
+    /// can fall back to <see cref="MatMulF16GemmF32Kernel"/>.
+    /// </summary>
+    public static MatMulF16GemmCoopmatKernel Create(VulkanDevice device, string spvDir)
+        => Create(device, spvDir, F16GemmCoopmatVariant.SelectFor(device, spvDir));
+
+    /// <summary>
+    /// Loads the SPIR-V for <paramref name="variant"/> and creates the pipeline. The explicit
+    /// overload exists so a benchmark can A/B <see cref="F16GemmCoopmatVariant.Coopmat64"/> vs
+    /// <see cref="F16GemmCoopmatVariant.Coopmat32"/> side by side in one process.
+    /// </summary>
+    /// <exception cref="FileNotFoundException">The variant's SPIR-V is missing from <paramref name="spvDir"/>.</exception>
+    public static MatMulF16GemmCoopmatKernel Create(VulkanDevice device, string spvDir, F16GemmCoopmatVariant variant)
+    {
+        if (!device.HasCooperativeMatrix)
+            throw new InvalidOperationException(
+                "MatMulF16GemmCoopmatKernel requires VK_KHR_cooperative_matrix support. " +
+                "Check VulkanDevice.HasCooperativeMatrix before calling Create() and fall " +
+                "back to MatMulF16GemmF32Kernel when it is false.");
+
+        string path = Path.Combine(spvDir, variant.SpvFileName);
+        if (!File.Exists(path))
+            throw new FileNotFoundException(
+                $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
+
+        var module = VulkanModule.LoadFromFile(device, path);
+        ComputePipeline pipeline;
+        try
+        {
+            Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[3];
+            bindings[0] = new VkDescriptorBinding(0);
+            bindings[1] = new VkDescriptorBinding(1);
+            bindings[2] = new VkDescriptorBinding(2);
+            pipeline = module.CreateComputePipeline(
+                entryPoint: "main",
+                bindings: bindings,
+                pushConstantBytes: PushConstantBytes,
+                requiredSubgroupSize: (uint)variant.RequiredSubgroupSize);
+        }
+        catch
+        {
+            module.Dispose();
+            throw;
+        }
+
+        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
+        return new MatMulF16GemmCoopmatKernel(device, module, pipeline, pool, variant.TileM, variant.TileN);
+    }
+
+    /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
+    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
+
+    /// <summary>
+    /// Dispatches the coopmat GEMM synchronously (wraps <see cref="Record"/>
+    /// with a one-shot submit + fence wait).
+    /// </summary>
+    public void Launch(
+        VulkanDevice.Buffer weightsF16, VulkanDevice.Buffer inputB, VulkanDevice.Buffer outputC,
+        int m, int k, int n)
+    {
+        using var ctx = _device.CreateSubmitContext();
+        ctx.Begin();
+        Record(ctx.CommandBuffer, weightsF16, inputB, outputC, m, k, n);
+        ctx.SubmitAndWait();
+    }
+
+    /// <summary>Records the coopmat F16 GEMM into <paramref name="cmdBuf"/> without submitting.</summary>
+    public unsafe void Record(
+        nint cmdBuf,
+        VulkanDevice.Buffer weightsF16, VulkanDevice.Buffer inputB, VulkanDevice.Buffer outputC,
+        int m, int k, int n)
+    {
+        if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
+        if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n));
+        if ((k % KChunk) != 0)
+            throw new ArgumentException($"k must be a multiple of {KChunk}, got {k}", nameof(k));
+
+        int pairsPerRow = k / 2;
+        long rowBytes = (long)k * F16ElementBytes;
+        int rowUints = pairsPerRow;
+
+        long weightsMin = (long)m * rowBytes;
+        if (weightsF16.Size < weightsMin)
+            throw new ArgumentException(
+                $"Weights buffer too small: need >= {weightsMin} bytes, got {weightsF16.Size}.",
+                nameof(weightsF16));
+        long bMin = (long)n * k * sizeof(float);
+        long cMin = (long)n * m * sizeof(float);
+        if (inputB.Size < bMin) throw new ArgumentException("Input buffer too small.", nameof(inputB));
+        if (outputC.Size < cMin) throw new ArgumentException("Output buffer too small.", nameof(outputC));
+
+        Span<nint> buffers = stackalloc nint[3] { weightsF16.Handle, inputB.Handle, outputC.Handle };
+        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
+
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
+        VulkanApi.vkCmdBindDescriptorSets(
+            cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
+            0, 1, descriptorSet, 0, 0);
+
+        Span<uint> pc = stackalloc uint[5]
+        {
+            (uint)m,
+            (uint)k,
+            (uint)n,
+            (uint)pairsPerRow,
+            (uint)rowUints,
+        };
+        fixed (uint* pcPtr = pc)
+        {
+            VulkanApi.vkCmdPushConstants(
+                cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute,
+                0, PushConstantBytes, (nint)pcPtr);
+        }
+
+        uint groupsX = (uint)((m + _tileM - 1) / _tileM);
+        uint groupsY = (uint)((n + _tileN - 1) / _tileN);
+        VulkanApi.vkCmdDispatch(cmdBuf, groupsX, groupsY, 1);
+    }
+
+    /// <inheritdoc/>
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        if (_descriptorPool != 0)
+            VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);
+        _pipeline.Dispose();
+        _module.Dispose();
+    }
+}

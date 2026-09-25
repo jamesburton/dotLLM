@@ -22,4 +22,11 @@ public record InferenceRequest
 
     /// <summary>Optional LoRA adapter ID to use for this request.</summary>
     public string? AdapterId { get; init; }
+
+    /// <summary>
+    /// Optional fairness identity (typically the resolved API key) used for per-key admission fairness
+    /// when <see cref="DotLLM.Engine.Scheduler.ContinuousBatchSchedulerOptions.EnableFairness"/> is set.
+    /// <see langword="null"/> shares a single "anonymous" fairness bucket. Ignored when fairness is off.
+    /// </summary>
+    public string? ApiKey { get; init; }
 }

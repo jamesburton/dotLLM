@@ -26,8 +26,24 @@ public static class RequestValidator
         if (request.MaxTokens.HasValue && request.MaxTokens.Value <= 0)
             return "max_tokens must be a positive integer";
 
+        // n used to be accepted and never read, so n:3 silently returned one choice (#460).
+        // Range-check it here so an unsupportable value is refused rather than quietly reinterpreted.
+        if (request.N.HasValue)
+        {
+            if (request.N.Value < 1)
+                return "n must be a positive integer";
+            if (request.N.Value > MaxChoices)
+                return $"n exceeds the maximum of {MaxChoices} supported by this server";
+        }
+
         return null;
     }
+
+    /// <summary>
+    /// Upper bound on <c>n</c>. Each choice is an independent generation over the same prompt, so
+    /// the cost is linear in <c>n</c>; the cap keeps one request from monopolising the batch.
+    /// </summary>
+    public const int MaxChoices = 8;
 
     /// <summary>
     /// Validates a raw completion request before inference.
@@ -53,8 +69,6 @@ public static class RequestValidator
         string prompt, ITokenizer tokenizer, int maxSequenceLength,
         int requestedMaxTokens, out int effectiveMaxTokens, out int promptTokenCount)
     {
-        // TODO: BpeTokenizer.CountTokens currently delegates to Encode().Length (same allocation).
-        // When a streaming/counting-only tokenizer path is added, this will benefit automatically.
         promptTokenCount = tokenizer.CountTokens(prompt);
 
         if (promptTokenCount >= maxSequenceLength)

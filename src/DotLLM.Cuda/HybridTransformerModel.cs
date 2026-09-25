@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
@@ -24,9 +25,9 @@ namespace DotLLM.Cuda;
 /// </summary>
 public sealed unsafe class HybridTransformerModel : IModel
 {
-    private const int Q8_0BlockBytes = 34;
-    private const int Q8_0GroupSize = 32;
-    private const int Q8_1GroupSize = 32;
+    private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
+    private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
+    private const int Q8_1GroupSize = QuantFormat.LegacyGroupSize;
     private const int InterleavedMinRowBytes = 1024;
 
     // ── GPU resources ──
@@ -44,7 +45,7 @@ public sealed unsafe class HybridTransformerModel : IModel
     private readonly bool _ownsThreadPool;
 
     // ── Shared ──
-    private readonly GgufFile _gguf;
+    private readonly GgufFile? _gguf;
     private readonly int _numGpuLayers;
     private readonly int _deviceId;
     private readonly float _ropeTheta;
@@ -54,6 +55,14 @@ public sealed unsafe class HybridTransformerModel : IModel
     private readonly int? _slidingWindowSize;
     private nint _fp16TransferBuffer;
     private int _fp16TransferCapacity; // in elements
+
+    // ── LoRA adapter staging (GPU phase) ──
+    // Set by the 5-arg Forward overload; read in the GPU layer loop to apply the
+    // per-projection device delta. Mirrors CudaTransformerModel's M2 fields. The CPU
+    // phase delta (Task 2) will read _currentAdapter separately. Null → adapter-less
+    // path is byte-identical to the 4-arg Forward.
+    private ILoraAdapter? _currentAdapter;
+    private CudaLoraWeights? _cudaLora;
 
     /// <inheritdoc/>
     public ModelConfig Config { get; }
@@ -77,7 +86,7 @@ public sealed unsafe class HybridTransformerModel : IModel
         ModelConfig config, CudaWeights gpuWeights, CudaForwardState gpuState,
         CudaStream stream, CudaCublasHandle cublas, CudaContext context,
         CudaKernels kernels, TransformerWeights cpuWeights, TransformerForwardState cpuState,
-        ComputeThreadPool? threadPool, bool ownsPool, GgufFile gguf,
+        ComputeThreadPool? threadPool, bool ownsPool, GgufFile? gguf,
         int numGpuLayers, int deviceId, float ropeTheta, int ropeDim,
         int gpuRopeType, RoPEType cpuRopeType, int? slidingWindowSize,
         string? vramWarning)
@@ -126,78 +135,278 @@ public sealed unsafe class HybridTransformerModel : IModel
                 $"numGpuLayers must be between 1 and {config.NumLayers - 1} for hybrid mode. " +
                 $"Use TransformerModel for pure CPU or CudaTransformerModel for pure GPU.");
 
-        // 1. Load CPU weights (mmap references only)
+        // 1. Load CPU weights (mmap references only). #383: this is created before any GPU
+        // resource, so a failure below must dispose it explicitly — it isn't reachable from
+        // any partially-built model instance.
         var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config);
+        try
+        {
+            cpuWeights.RepackWeights();
+
+            // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+            // incomplete ptxDir is by far the most common way this factory throws, and doing the
+            // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+            // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+            string ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(null);
+
+            // 2. Initialize CUDA. Context creation cannot leak on its own throw (nothing
+            // allocated yet), so it stays outside the inner try/catch — everything created
+            // from here on is disposed on any failure before rethrowing.
+            var context = CudaContext.Create(deviceId);
+            CudaStream? stream = null;
+            CudaCublasHandle? cublas = null;
+            CudaKernels? kernels = null;
+            CudaWeights? gpuWeights = null;
+            CudaForwardState? gpuState = null;
+            TransformerForwardState? cpuState = null;
+            ComputeThreadPool? pool = null;
+            try
+            {
+                stream = CudaStream.Create();
+                cublas = CudaCublasHandle.Create();
+                cublas.SetStream(stream);
+
+                kernels = new CudaKernels(ptxDir);
+
+                // 3. Upload only GPU layers to VRAM
+                gpuWeights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle, numGpuLayers);
+
+                // 4. VRAM estimation and warning
+                string? vramWarning = null;
+                if (CudaDriverApi.cuMemGetInfo_v2(out nuint freeAfter, out nuint totalVram) == 0
+                    && totalVram > 0)
+                {
+                    // Rough check: if less than 10% free after loading, warn
+                    double freePercent = (double)freeAfter / totalVram;
+                    if (freePercent < 0.10)
+                    {
+                        long freeMb = (long)freeAfter / (1024 * 1024);
+                        long totalMb = (long)totalVram / (1024 * 1024);
+                        vramWarning = $"VRAM nearly full after loading {numGpuLayers}/{config.NumLayers} layers " +
+                                      $"({freeMb}/{totalMb} MB free). Consider reducing --gpu-layers.";
+                    }
+                }
+
+                // 5. GPU scratch buffers. BitNet's residual stream exceeds FP16 range in deep
+                //    layers, so it carries the residual in FP32 (overflow→NaN otherwise). Mirrors
+                //    CudaTransformerModel.LoadFromGguf.
+                gpuState = new CudaForwardState(
+                    config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
+                    config.HeadDim, config.IntermediateSize, config.VocabSize,
+                    useFp32Residual: config.Architecture == DotLLM.Core.Configuration.Architecture.BitNet);
+
+                // 6. CPU scratch buffers (with RoPE tables)
+                int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
+                if (ropeDim == 0) ropeDim = config.HeadDim;
+                float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+                RoPEType cpuRopeType = config.RoPEConfig?.Type ?? RoPEType.Norm;
+                // Translate the public RoPEType enum (Norm=0, NeoX=2) to the CUDA
+                // kernel's encoding (Norm=0, NeoX=1). The CPU half of this hybrid
+                // model still consumes the enum directly via cpuRopeType; only the
+                // GPU dispatch needs the kernel-side integer encoding.
+                int gpuRopeType = CudaKernels.ToCudaRopeType(cpuRopeType);
+
+                cpuState = new TransformerForwardState(
+                    config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
+                    config.HeadDim, config.IntermediateSize, config.VocabSize,
+                    config.MaxSequenceLength, ropeDim, ropeTheta);
+
+                // 7. ComputeThreadPool for CPU layers
+                if (threading.IsParallel)
+                {
+                    int effectiveThreads = threading.EffectiveThreadCount;
+                    if (threading.EnableNumaPinning || threading.EnablePCorePinning)
+                    {
+                        var topology = NumaTopology.Detect();
+                        if (threading.EnablePCorePinning && topology.IsHybrid)
+                            effectiveThreads = Math.Min(effectiveThreads, topology.PerformanceCoreIds.Count);
+                        pool = new ComputeThreadPool(effectiveThreads, topology, threading);
+                    }
+                    else
+                    {
+                        pool = new ComputeThreadPool(effectiveThreads, topology: null, threading);
+                    }
+                }
+
+                return new HybridTransformerModel(
+                    config, gpuWeights, gpuState, stream, cublas, context, kernels,
+                    cpuWeights, cpuState, pool, ownsPool: pool is not null, gguf,
+                    numGpuLayers, deviceId, ropeTheta, ropeDim, gpuRopeType, cpuRopeType,
+                    config.SlidingWindowSize, vramWarning);
+            }
+            catch
+            {
+                // #383 review follow-up: ComputeThreadPool.Dispose() joins worker threads and can
+                // itself throw — that would replace the original exception (the reason we're in
+                // this catch at all) with an unrelated teardown failure, losing the real
+                // diagnostic. Swallow it, same as the stream-drain guard elsewhere in this file.
+                try { pool?.Dispose(); } catch { /* don't mask the original exception */ }
+                cpuState?.Dispose();
+                gpuState?.Dispose();
+                gpuWeights?.Dispose();
+                kernels?.Dispose();
+                cublas?.Dispose();
+                stream?.Dispose();
+                // CudaContext.Create (above) makes the context current on THIS thread, and this
+                // catch runs synchronously on the same thread — no MakeCurrent() call is needed
+                // here (matches #368's convention).
+                context.Dispose();
+                throw;
+            }
+        }
+        catch
+        {
+            // #383 review follow-up: TransformerWeights.Dispose() releases host allocations and
+            // can itself throw — see the ComputeThreadPool.Dispose() note above for why this must
+            // not be allowed to replace the original exception.
+            try { cpuWeights.Dispose(); } catch { /* don't mask the original exception */ }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Test-only factory that wires a hybrid CPU/GPU model around an already-built
+    /// <see cref="TransformerWeights"/> bundle — used by synthetic parity fixtures
+    /// that do not have a GGUF file. Mirrors
+    /// <see cref="CudaTransformerModel.BuildFromPrebuiltWeights(TransformerWeights, ModelConfig, int, string?)"/>
+    /// and the production <see cref="LoadFromGguf"/> path on every plumbing step
+    /// (RepackWeights, CudaWeights.LoadFromGguf, RoPE-type translation via
+    /// <see cref="CudaKernels.ToCudaRopeType"/>, CPU/GPU scratch buffers); the
+    /// only differences are: no GGUF anchor (the model carries <c>null</c> for
+    /// the gguf reference) and no VRAM-availability warning emission.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Ownership: caller retains the underlying host F32 weight allocations. The
+    /// model's <see cref="Dispose"/> still calls <c>_cpuWeights.Dispose()</c> —
+    /// for synthetic fixtures that pass an empty <c>ownedAllocations</c> list to
+    /// <see cref="TransformerWeights.CreateFromSafetensors"/> this is benign
+    /// (double-Dispose only nulls the already-nulled <c>RepackedLayers</c>),
+    /// mirroring the contract of
+    /// <see cref="CudaTransformerModel.BuildFromPrebuiltWeights(TransformerWeights, ModelConfig, int, string?)"/>.
+    /// </para>
+    /// </remarks>
+    /// <param name="cpuWeights">Already-built weight bundle (host F32 pointers OK).</param>
+    /// <param name="config">Matching model configuration.</param>
+    /// <param name="numGpuLayers">Number of layers to run on GPU (must be &gt; 0 and &lt; <c>config.NumLayers</c>).</param>
+    /// <param name="deviceId">GPU device ordinal (0-based).</param>
+    /// <param name="threading">CPU threading configuration for CPU-side layers. Null → <see cref="ThreadingConfig.SingleThreaded"/>.</param>
+    /// <param name="ptxDir">Directory containing compiled PTX files. Null auto-detects.</param>
+    internal static HybridTransformerModel BuildFromPrebuiltWeights(
+        TransformerWeights cpuWeights, ModelConfig config, int numGpuLayers,
+        int deviceId = 0, ThreadingConfig? threading = null, string? ptxDir = null)
+    {
+        ArgumentNullException.ThrowIfNull(cpuWeights);
+        ArgumentNullException.ThrowIfNull(config);
+        if (numGpuLayers <= 0 || numGpuLayers >= config.NumLayers)
+            throw new ArgumentOutOfRangeException(nameof(numGpuLayers),
+                $"numGpuLayers must be between 1 and {config.NumLayers - 1} for hybrid mode. " +
+                $"Use TransformerModel for pure CPU or CudaTransformerModel for pure GPU.");
+
+        ThreadingConfig effectiveThreading = threading ?? ThreadingConfig.SingleThreaded;
+
+        // 1. Repack CPU weights — idempotent for F32/F16 (TryRepack returns
+        //    default for non-block-structured types), so safe even if the same
+        //    TransformerWeights instance has already been threaded through
+        //    TransformerModel.BuildFromPrebuiltWeights earlier in the test.
         cpuWeights.RepackWeights();
 
-        // 2. Initialize CUDA
+        // 2. Initialize CUDA — mirror LoadFromGguf in every step except the
+        //    PTX dir defaulting (caller-supplied for parity tests so the test
+        //    can locate native/ptx/ from its output directory). #383: context creation
+        //    cannot leak on its own throw (nothing allocated yet), so it stays outside the
+        //    try/catch — everything created from here on is disposed on any failure before
+        //    rethrowing. `cpuWeights` is caller-owned (see this method's doc) — never disposed
+        //    here. #484: the PTX deployment is validated BEFORE the context exists, so a bad or
+        //    incomplete ptxDir — the most common way this factory throws — can no longer orphan
+        //    a context/stream/cuBLAS handle whatever the unwind path does.
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
         var context = CudaContext.Create(deviceId);
-        var stream = CudaStream.Create();
-        var cublas = CudaCublasHandle.Create();
-        cublas.SetStream(stream);
-
-        string? ptxDir = Path.Combine(AppContext.BaseDirectory, "ptx");
-        var kernels = new CudaKernels(ptxDir);
-
-        // 3. Upload only GPU layers to VRAM
-        var gpuWeights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle, numGpuLayers);
-
-        // 4. VRAM estimation and warning
-        string? vramWarning = null;
-        if (CudaDriverApi.cuMemGetInfo_v2(out nuint freeAfter, out nuint totalVram) == 0
-            && totalVram > 0)
-        {
-            // Rough check: if less than 10% free after loading, warn
-            double freePercent = (double)freeAfter / totalVram;
-            if (freePercent < 0.10)
-            {
-                long freeMb = (long)freeAfter / (1024 * 1024);
-                long totalMb = (long)totalVram / (1024 * 1024);
-                vramWarning = $"VRAM nearly full after loading {numGpuLayers}/{config.NumLayers} layers " +
-                              $"({freeMb}/{totalMb} MB free). Consider reducing --gpu-layers.";
-            }
-        }
-
-        // 5. GPU scratch buffers
-        var gpuState = new CudaForwardState(
-            config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
-            config.HeadDim, config.IntermediateSize, config.VocabSize);
-
-        // 6. CPU scratch buffers (with RoPE tables)
-        int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
-        if (ropeDim == 0) ropeDim = config.HeadDim;
-        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        RoPEType cpuRopeType = config.RoPEConfig?.Type ?? RoPEType.Norm;
-        int gpuRopeType = (int)cpuRopeType;
-
-        var cpuState = new TransformerForwardState(
-            config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
-            config.HeadDim, config.IntermediateSize, config.VocabSize,
-            config.MaxSequenceLength, ropeDim, ropeTheta);
-
-        // 7. ComputeThreadPool for CPU layers
+        CudaStream? stream = null;
+        CudaCublasHandle? cublas = null;
+        CudaKernels? kernels = null;
+        CudaWeights? gpuWeights = null;
+        CudaForwardState? gpuState = null;
+        TransformerForwardState? cpuState = null;
         ComputeThreadPool? pool = null;
-        if (threading.IsParallel)
+        try
         {
-            int effectiveThreads = threading.EffectiveThreadCount;
-            if (threading.EnableNumaPinning || threading.EnablePCorePinning)
-            {
-                var topology = NumaTopology.Detect();
-                if (threading.EnablePCorePinning && topology.IsHybrid)
-                    effectiveThreads = Math.Min(effectiveThreads, topology.PerformanceCoreIds.Count);
-                pool = new ComputeThreadPool(effectiveThreads, topology, threading);
-            }
-            else
-            {
-                pool = new ComputeThreadPool(effectiveThreads, topology: null, threading);
-            }
-        }
+            stream = CudaStream.Create();
+            cublas = CudaCublasHandle.Create();
+            cublas.SetStream(stream);
 
-        return new HybridTransformerModel(
-            config, gpuWeights, gpuState, stream, cublas, context, kernels,
-            cpuWeights, cpuState, pool, ownsPool: pool is not null, gguf,
-            numGpuLayers, deviceId, ropeTheta, ropeDim, gpuRopeType, cpuRopeType,
-            config.SlidingWindowSize, vramWarning);
+            kernels = new CudaKernels(ptxDir);
+
+            // 3. Upload only GPU layers to VRAM
+            gpuWeights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle, numGpuLayers);
+
+            // 4. Skip the VRAM-pressure warning — synthetic fixtures are tiny and
+            //    the cuMemGetInfo probe would just clutter the test output.
+
+            // 5. GPU scratch buffers. BitNet's residual stream exceeds FP16 range in deep
+            //    layers, so it carries the residual in FP32 (overflow→NaN otherwise). Mirrors
+            //    CudaTransformerModel.LoadFromGguf / the production LoadFromGguf above.
+            gpuState = new CudaForwardState(
+                config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
+                config.HeadDim, config.IntermediateSize, config.VocabSize,
+                useFp32Residual: config.Architecture == DotLLM.Core.Configuration.Architecture.BitNet);
+
+            // 6. CPU scratch buffers (with RoPE tables)
+            int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
+            if (ropeDim == 0) ropeDim = config.HeadDim;
+            float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+            RoPEType cpuRopeType = config.RoPEConfig?.Type ?? RoPEType.Norm;
+            // Translate the public RoPEType enum (Norm=0, NeoX=2) to the CUDA
+            // kernel's encoding (Norm=0, NeoX=1). Same translation site as
+            // LoadFromGguf — fixed in #36; the parity test built on top of this
+            // factory pins that fix for the hybrid split.
+            int gpuRopeType = CudaKernels.ToCudaRopeType(cpuRopeType);
+
+            cpuState = new TransformerForwardState(
+                config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
+                config.HeadDim, config.IntermediateSize, config.VocabSize,
+                config.MaxSequenceLength, ropeDim, ropeTheta);
+
+            // 7. ComputeThreadPool for CPU layers — mirror the LoadFromGguf branch
+            if (effectiveThreading.IsParallel)
+            {
+                int effectiveThreads = effectiveThreading.EffectiveThreadCount;
+                if (effectiveThreading.EnableNumaPinning || effectiveThreading.EnablePCorePinning)
+                {
+                    var topology = NumaTopology.Detect();
+                    if (effectiveThreading.EnablePCorePinning && topology.IsHybrid)
+                        effectiveThreads = Math.Min(effectiveThreads, topology.PerformanceCoreIds.Count);
+                    pool = new ComputeThreadPool(effectiveThreads, topology, effectiveThreading);
+                }
+                else
+                {
+                    pool = new ComputeThreadPool(effectiveThreads, topology: null, effectiveThreading);
+                }
+            }
+
+            return new HybridTransformerModel(
+                config, gpuWeights, gpuState, stream, cublas, context, kernels,
+                cpuWeights, cpuState, pool, ownsPool: pool is not null, gguf: null,
+                numGpuLayers, deviceId, ropeTheta, ropeDim, gpuRopeType, cpuRopeType,
+                config.SlidingWindowSize, vramWarning: null);
+        }
+        catch
+        {
+            // #383 review follow-up: see LoadFromGguf's identical guard above — Dispose() joining
+            // worker threads can itself throw, which must not replace the original exception.
+            try { pool?.Dispose(); } catch { /* don't mask the original exception */ }
+            cpuState?.Dispose();
+            gpuState?.Dispose();
+            gpuWeights?.Dispose();
+            kernels?.Dispose();
+            cublas?.Dispose();
+            stream?.Dispose();
+            // CudaContext.Create (above) makes the context current on THIS thread, and this
+            // catch runs synchronously on the same thread — no MakeCurrent() call is needed
+            // here (matches #368's convention).
+            context.Dispose();
+            throw;
+        }
     }
 
     /// <summary>Creates a <see cref="HybridKvCache"/> for this model.</summary>
@@ -213,6 +422,41 @@ public sealed unsafe class HybridTransformerModel : IModel
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
         => Forward(tokenIds, positions, deviceId, kvCache: null);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Implements <see cref="IModel"/>'s default 5-arg overload. When
+    /// <paramref name="adapter"/> is null this delegates to the 4-arg
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>,
+    /// reproducing the adapter-less forward byte-for-byte. Otherwise it stages the
+    /// adapter onto the GPU (identity-cached on <see cref="CudaLoraWeights.Source"/>),
+    /// then runs the 4-arg forward with <see cref="_currentAdapter"/> set so the GPU
+    /// layer loop applies the per-projection delta. The CPU-phase delta is added by a
+    /// separate task; the GPU-phase delta lands here.
+    /// </remarks>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ILoraAdapter? adapter)
+    {
+        if (adapter is null)
+            return Forward(tokenIds, positions, deviceId, kvCache); // byte-equivalent
+
+        _context.MakeCurrent();
+        if (!ReferenceEquals(_cudaLora?.Source, adapter))
+        {
+            _cudaLora?.Dispose();
+            _cudaLora = CudaLoraWeights.Stage(adapter, Config, _kernels, _stream.Handle);
+        }
+
+        _currentAdapter = adapter;
+        try
+        {
+            return Forward(tokenIds, positions, deviceId, kvCache);
+        }
+        finally
+        {
+            _currentAdapter = null;
+        }
+    }
 
     /// <inheritdoc/>
     /// <remarks>
@@ -242,7 +486,6 @@ public sealed unsafe class HybridTransformerModel : IModel
         int vocabSize = Config.VocabSize;
         int kvStride = numKvHeads * headDim;
         float eps = Config.NormEpsilon;
-        int slidingWindow = Config.SlidingWindowSize ?? 0;
         int h = sizeof(ushort); // FP16 element size
 
         int totalLayers = Config.NumLayers;
@@ -265,6 +508,12 @@ public sealed unsafe class HybridTransformerModel : IModel
         nint s = _stream.Handle;
         nint cublasH = _cublas.Handle;
 
+        // BitNet's residual stream exceeds FP16's ~65504 ceiling in deep layers, so it
+        // carries the residual in FP32 (overflow→NaN/zero logits otherwise). Mirrors
+        // CudaTransformerModel.Forward. ResidualF32 is always allocated, so isBitNet gates.
+        bool isBitNet = Config.Architecture == DotLLM.Core.Configuration.Architecture.BitNet;
+        bool fp32Res = _gpuState.ResidualF32 != 0 && isBitNet;
+
         _gpuState.EnsureCapacity(seqLen);
 
         // 1. Upload tokenIds + positions
@@ -286,8 +535,12 @@ public sealed unsafe class HybridTransformerModel : IModel
 
         if (gpuLayers > 0)
         {
-            CudaDriverApi.cuMemcpyDtoDAsync_v2(_gpuState.Residual, _gpuState.HiddenState,
-                (nuint)hiddenBytes, s).ThrowOnError();
+            // BitNet carries the residual in FP32 (widen the FP16 embedding into ResidualF32).
+            if (fp32Res)
+                _kernels.LaunchCopyF16ToF32(_gpuState.HiddenState, _gpuState.ResidualF32, seqLen * hiddenSize, s);
+            else
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(_gpuState.Residual, _gpuState.HiddenState,
+                    (nuint)hiddenBytes, s).ThrowOnError();
             _kernels.LaunchRmsNorm(_gpuState.HiddenState, _gpuWeights.Layers[0].AttnNormWeight,
                 _gpuState.NormOutput, hiddenSize, eps, seqLen, s);
         }
@@ -296,6 +549,14 @@ public sealed unsafe class HybridTransformerModel : IModel
         for (int layer = 0; layer < gpuLayers; layer++)
         {
             ref readonly var lw = ref _gpuWeights.Layers[layer];
+
+            // Per-layer window: gpt-oss alternates window/dense (pattern=2), Gemma-3 uses
+            // pattern=6; uniform-window and no-window models resolve identically to the old
+            // hoisted value. 0 = dense (kernel convention). Mirrors CPU GetLayerSlidingWindow.
+            // `layer` is the absolute (global) index (GPU phase = global layers 0..gpuLayers-1).
+            int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                Config.SlidingWindowSize, Config.SlidingWindowPattern,
+                Config.PerLayerSlidingWindow, layer);
 
             // ── ATTENTION BLOCK ──
             ProjectGpu(lw.QQuant, lw.QQuantType, lw.Q, _gpuState.NormOutput, _gpuState.Q,
@@ -309,13 +570,27 @@ public sealed unsafe class HybridTransformerModel : IModel
             if (lw.KBias != 0) _kernels.LaunchBiasAdd(_gpuState.K, lw.KBias, lw.KOutputDim, seqLen, s);
             if (lw.VBias != 0) _kernels.LaunchBiasAdd(_gpuState.V, lw.VBias, lw.VOutputDim, seqLen, s);
 
+            // LoRA delta (q/k/v): y += scale · (NormOutput · B) · A. Applied AFTER bias and
+            // BEFORE QK-norm + RoPE — mirrors CudaTransformerModel.ApplyLoraDeltaDevice (M2)
+            // and the CPU oracle (TransformerModel.cs). x = NormOutput (projection input),
+            // y = Q/K/V. No-op for projections the adapter does not target (TryGet returns false).
+            // `layer` is the absolute index (GPU phase = global layers 0..gpuLayers-1).
+            if (_currentAdapter is not null)
+            {
+                ApplyLoraDeltaDeviceGpu(layer, "q_proj", _gpuState.NormOutput, _gpuState.Q, seqLen);
+                ApplyLoraDeltaDeviceGpu(layer, "k_proj", _gpuState.NormOutput, _gpuState.K, seqLen);
+                ApplyLoraDeltaDeviceGpu(layer, "v_proj", _gpuState.NormOutput, _gpuState.V, seqLen);
+            }
+
             if (lw.QNormWeight != 0)
                 _kernels.LaunchPerHeadRmsNorm(_gpuState.Q, lw.QNormWeight, eps, numHeads, headDim, seqLen, s);
             if (lw.KNormWeight != 0)
                 _kernels.LaunchPerHeadRmsNorm(_gpuState.K, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
 
+            // Dense-YaRN scaling (#366) rides on the weights bundle; (0, 1.0f) when inactive.
             _kernels.LaunchRoPE(_gpuState.Q, _gpuState.K, _gpuState.PositionsDevice,
-                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _gpuRopeType, s);
+                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _gpuRopeType, s,
+                _gpuWeights.RopeYarnInvFreqDevice, _gpuWeights.RopeYarnMscale);
 
             // KV-cache update + Attention
             var gpuKvCache = hybridKvCache?.GpuCache;
@@ -323,24 +598,56 @@ public sealed unsafe class HybridTransformerModel : IModel
             {
                 gpuKvCache.UpdateDevice(_gpuState.K, _gpuState.V, positions, seqLen, layer, s);
                 int seqKv = gpuKvCache.CurrentLength;
+                // lw.AttnSinksDevice (#365): 0 unless the GGUF carried `attn_sinks.weight`, so this
+                // is bit-identical for every model that has no sinks. See the else branch for why
+                // this class cannot currently reach a sink-bearing model in practice.
                 _kernels.LaunchAttention(_gpuState.Q, gpuKvCache.GetKeysPtr(layer),
                     gpuKvCache.GetValuesPtr(layer), _gpuState.AttnOutput,
-                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], slidingWindow, s);
+                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], slidingWindow, s,
+                    lw.AttnSinksDevice);
             }
             else
             {
+                // gpt-oss (the model #365 targets) is MoE and this class has no MoE FFN branch, so
+                // it cannot complete a valid forward here today. Sinks are plumbed anyway because
+                // `attn_sinks.weight` loading is tensor-driven, not architecture-gated
+                // (TransformerWeights.cs LoadOptionalBias) — a future DENSE sinks-bearing model
+                // would run through this partial-offload path (`--gpu-layers N`) and would
+                // otherwise drop its sinks silently, with no error.
+                // NOTE: this class's CPU half (the Attention.Execute calls in the CPU layer loop)
+                // is still sink-unaware — a pre-existing gap, out of scope here, analogous to the
+                // #366 hybrid CPU-tail YaRN gap. A dense sinks model on this path would need that
+                // fixed too before it were correct end to end.
                 _kernels.LaunchAttention(_gpuState.Q, _gpuState.K, _gpuState.V, _gpuState.AttnOutput,
-                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s);
+                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s,
+                    lw.AttnSinksDevice);
             }
+
+            // Optional attention Sub-LN (BitNet): RMSNorm over the attention output before o_proj.
+            if (lw.AttnSubNormWeight != 0)
+                _kernels.LaunchRmsNorm(_gpuState.AttnOutput, lw.AttnSubNormWeight, _gpuState.AttnOutput,
+                    numHeads * headDim, eps, seqLen, s);
 
             // O projection → NormOutput
             ProjectGpu(lw.OQuant, lw.OQuantType, lw.O, _gpuState.AttnOutput, _gpuState.NormOutput,
                 lw.OOutputDim, lw.OInputDim, seqLen);
             if (lw.OBias != 0) _kernels.LaunchBiasAdd(_gpuState.NormOutput, lw.OBias, lw.OOutputDim, seqLen, s);
 
+            // LoRA delta (o_proj): y += scale · (AttnOutput · B) · A. x = _gpuState.AttnOutput,
+            // which holds the Sub-LN'd attention output when AttnSubNormWeight ran in place above —
+            // the exact O-projection input the CPU oracle uses. y = NormOutput (the O output).
+            // Applied after the O bias and BEFORE the fused residual add. Mirrors M2.
+            if (_currentAdapter is not null)
+                ApplyLoraDeltaDeviceGpu(layer, "o_proj", _gpuState.AttnOutput, _gpuState.NormOutput, seqLen);
+
             // ── FUSED: attention residual + FFN norm ──
-            _kernels.LaunchFusedAddRmsNorm(_gpuState.Residual, _gpuState.NormOutput,
-                lw.FfnNormWeight, _gpuState.NormOutput, hiddenSize, eps, seqLen, s);
+            // BitNet carries the residual in FP32 to avoid FP16 overflow.
+            if (fp32Res)
+                _kernels.LaunchFusedAddRmsNormF32Res(_gpuState.ResidualF32, _gpuState.NormOutput,
+                    lw.FfnNormWeight, _gpuState.NormOutput, hiddenSize, eps, seqLen, s);
+            else
+                _kernels.LaunchFusedAddRmsNorm(_gpuState.Residual, _gpuState.NormOutput,
+                    lw.FfnNormWeight, _gpuState.NormOutput, hiddenSize, eps, seqLen, s);
 
             // ── FFN BLOCK ──
             ProjectGpu(lw.GateQuant, lw.GateQuantType, lw.Gate, _gpuState.NormOutput, _gpuState.FfnGate,
@@ -351,26 +658,71 @@ public sealed unsafe class HybridTransformerModel : IModel
             if (lw.GateBias != 0) _kernels.LaunchBiasAdd(_gpuState.FfnGate, lw.GateBias, lw.GateOutputDim, seqLen, s);
             if (lw.UpBias != 0) _kernels.LaunchBiasAdd(_gpuState.FfnUp, lw.UpBias, lw.UpOutputDim, seqLen, s);
 
-            _kernels.LaunchSwiGLU(_gpuState.FfnGate, _gpuState.FfnUp, _gpuState.SiluOutput,
-                intermediateSize, seqLen, s);
+            // LoRA delta (gate/up): y += scale · (NormOutput · B) · A. x = NormOutput (FFN-normed
+            // input), y = FfnGate/FfnUp (raw projection outputs). Applied after biases and BEFORE
+            // the GLU activation below — mirrors M2 and the CPU oracle.
+            if (_currentAdapter is not null)
+            {
+                ApplyLoraDeltaDeviceGpu(layer, "gate_proj", _gpuState.NormOutput, _gpuState.FfnGate, seqLen);
+                ApplyLoraDeltaDeviceGpu(layer, "up_proj", _gpuState.NormOutput, _gpuState.FfnUp, seqLen);
+            }
+
+            // BitNet's relu(gate)²·up intermediate overflows FP16; fuse activation + Sub-LN RMSNorm
+            // (kept in FP32) when the Sub-LN weight is present. See CudaTransformerModel for rationale.
+            if (Config.ActivationFunction == ActivationFunction.ReluSquared && lw.FfnSubNormWeight != 0)
+            {
+                _kernels.LaunchReLU2GluRmsNorm(_gpuState.FfnGate, _gpuState.FfnUp, lw.FfnSubNormWeight,
+                    _gpuState.SiluOutput, intermediateSize, eps, seqLen, s);
+            }
+            else
+            {
+                if (Config.ActivationFunction == ActivationFunction.ReluSquared)
+                    _kernels.LaunchReLU2(_gpuState.FfnGate, _gpuState.FfnUp, _gpuState.SiluOutput,
+                        intermediateSize, seqLen, s);
+                else
+                    _kernels.LaunchSwiGLU(_gpuState.FfnGate, _gpuState.FfnUp, _gpuState.SiluOutput,
+                        intermediateSize, seqLen, s);
+
+                if (lw.FfnSubNormWeight != 0)
+                    _kernels.LaunchRmsNorm(_gpuState.SiluOutput, lw.FfnSubNormWeight, _gpuState.SiluOutput,
+                        intermediateSize, eps, seqLen, s);
+            }
 
             ProjectGpu(lw.DownQuant, lw.DownQuantType, lw.Down, _gpuState.SiluOutput, _gpuState.NormOutput,
                 lw.DownOutputDim, lw.DownInputDim, seqLen);
             if (lw.DownBias != 0) _kernels.LaunchBiasAdd(_gpuState.NormOutput, lw.DownBias, lw.DownOutputDim, seqLen, s);
 
+            // LoRA delta (down_proj): y += scale · (SiluOutput · B) · A. x = SiluOutput (the
+            // post-GLU, possibly FFN-Sub-LN'd, down-projection input), y = NormOutput (down
+            // output). Applied after the down bias and BEFORE the FFN residual add. Mirrors M2.
+            if (_currentAdapter is not null)
+                ApplyLoraDeltaDeviceGpu(layer, "down_proj", _gpuState.SiluOutput, _gpuState.NormOutput, seqLen);
+
             // ── FUSED: FFN residual + next layer setup ──
             if (layer < gpuLayers - 1)
             {
-                // Not last GPU layer: FusedAddRmsNorm for next GPU layer
+                // Not last GPU layer: FusedAddRmsNorm for next GPU layer.
+                // BitNet carries the residual in FP32 to avoid FP16 overflow.
                 ref readonly var nextLw = ref _gpuWeights.Layers[layer + 1];
-                _kernels.LaunchFusedAddRmsNorm(_gpuState.Residual, _gpuState.NormOutput,
-                    nextLw.AttnNormWeight, _gpuState.NormOutput, hiddenSize, eps, seqLen, s);
+                if (fp32Res)
+                    _kernels.LaunchFusedAddRmsNormF32Res(_gpuState.ResidualF32, _gpuState.NormOutput,
+                        nextLw.AttnNormWeight, _gpuState.NormOutput, hiddenSize, eps, seqLen, s);
+                else
+                    _kernels.LaunchFusedAddRmsNorm(_gpuState.Residual, _gpuState.NormOutput,
+                        nextLw.AttnNormWeight, _gpuState.NormOutput, hiddenSize, eps, seqLen, s);
             }
             else
             {
-                // Last GPU layer: plain Add → HiddenState (boundary transfer source)
-                _kernels.LaunchAdd(_gpuState.Residual, _gpuState.NormOutput, _gpuState.HiddenState,
-                    seqLen * hiddenSize, s);
+                // Last GPU layer: add residual + FFN output. For BitNet, accumulate into the
+                // FP32 residual (ResidualF32 holds the boundary-transfer source — the un-normed
+                // residual the CPU phase resumes from — never truncated to FP16). For non-BitNet
+                // the FP16 HiddenState is the boundary source (unchanged).
+                if (fp32Res)
+                    _kernels.LaunchAddF32F16(_gpuState.ResidualF32, _gpuState.NormOutput, _gpuState.ResidualF32,
+                        seqLen * hiddenSize, s);
+                else
+                    _kernels.LaunchAdd(_gpuState.Residual, _gpuState.NormOutput, _gpuState.HiddenState,
+                        seqLen * hiddenSize, s);
             }
         }
 
@@ -382,17 +734,26 @@ public sealed unsafe class HybridTransformerModel : IModel
         {
             _stream.Synchronize();
 
-            // D2H: HiddenState [seqLen, hiddenSize] as FP16
             int transferElements = seqLen * hiddenSize;
-            EnsureTransferCapacity(transferElements);
-
-            long transferBytes = (long)transferElements * h;
-            CudaDriverApi.cuMemcpyDtoH_v2(_fp16TransferBuffer, _gpuState.HiddenState,
-                (nuint)transferBytes).ThrowOnError();
-
-            // FP16 → FP32 conversion into CPU state
             _cpuState.EnsureCapacity(seqLen);
-            ConvertFp16ToFp32(_fp16TransferBuffer, _cpuState.HiddenState, transferElements);
+
+            if (fp32Res)
+            {
+                // BitNet: the un-normalized residual at the boundary overflows FP16, so the last
+                // GPU layer accumulated it into ResidualF32 (fix above). Transfer that FP32 buffer
+                // straight into the host-side CPU hidden state — skip the FP16 buffer + conversion.
+                CudaDriverApi.cuMemcpyDtoH_v2(_cpuState.HiddenState, _gpuState.ResidualF32,
+                    (nuint)((long)transferElements * sizeof(float))).ThrowOnError();
+            }
+            else
+            {
+                // D2H: HiddenState [seqLen, hiddenSize] as FP16, then widen to FP32 CPU state.
+                EnsureTransferCapacity(transferElements);
+                long transferBytes = (long)transferElements * h;
+                CudaDriverApi.cuMemcpyDtoH_v2(_fp16TransferBuffer, _gpuState.HiddenState,
+                    (nuint)transferBytes).ThrowOnError();
+                ConvertFp16ToFp32(_fp16TransferBuffer, _cpuState.HiddenState, transferElements);
+            }
         }
 
         // ═══════════════════════════════════════════════════
@@ -431,6 +792,15 @@ public sealed unsafe class HybridTransformerModel : IModel
                 var rl = repackedLayers?[layer];
                 int cpuCacheLayer = layer; // HybridKvCache handles remapping
 
+                // When a LoRA adapter is active the F32 LoRA delta reads the normed
+                // projection input (normOut for Q/K/V and gate/up). The fused
+                // RmsNormQuantize decode fast-path skips materialising normOut (it
+                // writes only the quantised bytes), so force the unfused (prefill-
+                // style) path in both the attention and FFN blocks below — exactly
+                // as TransformerModel does. Adapter-less path keeps the fused fast
+                // path → byte-identical to the 4-arg Forward.
+                bool adapterActive = _currentAdapter is not null;
+
                 // a. Copy hiddenState → residual
                 new Span<float>(hidden, seqLen * hiddenSize)
                     .CopyTo(new Span<float>(residual, seqLen * hiddenSize));
@@ -438,7 +808,14 @@ public sealed unsafe class HybridTransformerModel : IModel
                 // b. RMSNorm + Pre-quantize + Q/K/V projections
                 byte* inputQ8Scratch = (byte*)_cpuState.InputQ8Scratch;
 
-                if (seqLen == 1 && _threadPool != null)
+                // Only formats with a dedicated fused decode kernel take the fused path; the rest
+                // (ternary, IQ formats, BF16, MXFP4, …) route through the standard unfused
+                // projection path below. Capability-driven via MatMul.SupportsFusedDecode so this
+                // tracks the kernel's own dispatch tables. Mirrors TransformerModel's Q/K/V gate.
+                if (seqLen == 1 && _threadPool != null && !adapterActive
+                    && MatMul.SupportsFusedDecode(lw.QQuantType)
+                    && MatMul.SupportsFusedDecode(lw.KQuantType)
+                    && MatMul.SupportsFusedDecode(lw.VQuantType))
                 {
                     // Decode path: try fused RmsNorm+Quantize
                     byte* preQuantNorm = null;
@@ -489,6 +866,17 @@ public sealed unsafe class HybridTransformerModel : IModel
                 AddBias(lw.KBias, k, lw.KOutputDim, seqLen);
                 AddBias(lw.VBias, v, lw.VOutputDim, seqLen);
 
+                // LoRA delta (q/k/v): y += scale · (normOut · B) · A. Applied AFTER
+                // bias and BEFORE QK-norm / RoPE — mirrors TransformerModel and the
+                // GPU phase. x = normOut (F32, materialised by the !adapterActive
+                // gate above), y = q/k/v. `layer` is the absolute (global) index.
+                if (_currentAdapter is not null)
+                {
+                    ApplyLoraDeltaCpu(layer, "q_proj", normOut, q, seqLen, lw.QInputDim, lw.QOutputDim);
+                    ApplyLoraDeltaCpu(layer, "k_proj", normOut, k, seqLen, lw.KInputDim, lw.KOutputDim);
+                    ApplyLoraDeltaCpu(layer, "v_proj", normOut, v, seqLen, lw.VInputDim, lw.VOutputDim);
+                }
+
                 // Optional QK-norms
                 if (lw.QNormWeight is not null)
                     ApplyPerHeadNorm(lw.QNormWeight, q, numHeads, headDim, seqLen, eps);
@@ -524,12 +912,30 @@ public sealed unsafe class HybridTransformerModel : IModel
                         _slidingWindowSize);
                 }
 
+                // Optional attention Sub-LN (BitNet): RMSNorm over the attention output before o_proj.
+                if (lw.AttnSubNormWeight is not null)
+                {
+                    int attnDim = numHeads * headDim;
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        var sp = new Span<float>(attnOut + t * attnDim, attnDim);
+                        RmsNorm.Execute(sp, lw.AttnSubNormWeight, eps, sp);
+                    }
+                }
+
                 // O projection
                 byte* preQuantAttn = QuantizeInput(attnOut, inputQ8Scratch, numHeads * headDim, seqLen, lw.OQuantType);
                 var rwO = rl?.O ?? default;
                 GemmInterleaved(lw.OWeight, lw.OQuantType, attnOut, normOut, lw.OOutputDim, lw.OInputDim, seqLen,
                     preQuantAttn, in rwO);
                 AddBias(lw.OBias, normOut, lw.OOutputDim, seqLen);
+
+                // LoRA delta (o_proj): y += scale · (attnOut · B) · A. x = attnOut,
+                // which holds the Sub-LN'd attention output (the optional Sub-LN above
+                // ran in-place into attnOut) — the exact O-projection input. y = normOut
+                // (the O output). Applied after the O bias and BEFORE the residual add.
+                if (_currentAdapter is not null)
+                    ApplyLoraDeltaCpu(layer, "o_proj", attnOut, normOut, seqLen, lw.OInputDim, lw.OOutputDim);
 
                 // Residual add
                 for (int t = 0; t < seqLen; t++)
@@ -544,8 +950,14 @@ public sealed unsafe class HybridTransformerModel : IModel
                 new Span<float>(hidden, seqLen * hiddenSize)
                     .CopyTo(new Span<float>(residual, seqLen * hiddenSize));
 
-                // FFN: RMSNorm + Pre-quantize + Gate/Up projections
-                if (seqLen == 1 && _threadPool != null)
+                // FFN: RMSNorm + Pre-quantize + Gate/Up projections.
+                // Force the unfused path when an adapter is active so normOut (F32)
+                // is materialised for the gate/up LoRA delta — same trap as Q/K/V.
+                // Same capability gate as Q/K/V: formats without a fused decode kernel take the
+                // standard unfused projection path instead of failing.
+                if (seqLen == 1 && _threadPool != null && !adapterActive
+                    && MatMul.SupportsFusedDecode(lw.GateQuantType)
+                    && MatMul.SupportsFusedDecode(lw.UpQuantType))
                 {
                     byte* preQuantFfn = null;
                     if (IsCompatiblePreQuant(lw.GateQuantType, lw.UpQuantType))
@@ -587,13 +999,37 @@ public sealed unsafe class HybridTransformerModel : IModel
                 AddBias(lw.GateBias, ffnGate, lw.GateOutputDim, seqLen);
                 AddBias(lw.UpBias, ffnUp, lw.UpOutputDim, seqLen);
 
-                // Fused SwiGLU
+                // LoRA delta (gate/up): y += scale · (normOut · B) · A. x = normOut
+                // (FFN-normed input, F32, materialised by the !adapterActive gate
+                // above), y = ffnGate/ffnUp. Applied after biases and BEFORE the GLU
+                // activation below — mirrors TransformerModel and the GPU phase.
+                if (_currentAdapter is not null)
+                {
+                    ApplyLoraDeltaCpu(layer, "gate_proj", normOut, ffnGate, seqLen, lw.GateInputDim, lw.GateOutputDim);
+                    ApplyLoraDeltaCpu(layer, "up_proj", normOut, ffnUp, seqLen, lw.UpInputDim, lw.UpOutputDim);
+                }
+
+                // Gated activation: SwiGLU (default) or squared-ReLU GLU (BitNet b1.58).
+                bool useReluSquared = Config.ActivationFunction == ActivationFunction.ReluSquared;
                 for (int t = 0; t < seqLen; t++)
                 {
-                    FusedOps.SwiGLU(
-                        new ReadOnlySpan<float>(ffnGate + t * intermediateSize, intermediateSize),
-                        new ReadOnlySpan<float>(ffnUp + t * intermediateSize, intermediateSize),
-                        new Span<float>(siluOut + t * intermediateSize, intermediateSize));
+                    var gateSpan = new ReadOnlySpan<float>(ffnGate + t * intermediateSize, intermediateSize);
+                    var upSpan = new ReadOnlySpan<float>(ffnUp + t * intermediateSize, intermediateSize);
+                    var outSpan = new Span<float>(siluOut + t * intermediateSize, intermediateSize);
+                    if (useReluSquared)
+                        FusedOps.ReLU2GLU(gateSpan, upSpan, outSpan);
+                    else
+                        FusedOps.SwiGLU(gateSpan, upSpan, outSpan);
+                }
+
+                // Optional FFN Sub-LN (BitNet): RMSNorm over the gated intermediate before ffn_down.
+                if (lw.FfnSubNormWeight is not null)
+                {
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        var sp = new Span<float>(siluOut + t * intermediateSize, intermediateSize);
+                        RmsNorm.Execute(sp, lw.FfnSubNormWeight, eps, sp);
+                    }
                 }
 
                 // Down projection
@@ -602,6 +1038,12 @@ public sealed unsafe class HybridTransformerModel : IModel
                 GemmInterleaved(lw.DownWeight, lw.DownQuantType, siluOut, normOut, lw.DownOutputDim, lw.DownInputDim, seqLen,
                     preQuantSilu, in rwDown);
                 AddBias(lw.DownBias, normOut, lw.DownOutputDim, seqLen);
+
+                // LoRA delta (down_proj): y += scale · (siluOut · B) · A. x = siluOut
+                // (the post-GLU, possibly FFN-Sub-LN'd, down-projection input), y = normOut
+                // (down output). Applied after the down bias and BEFORE the FFN residual add.
+                if (_currentAdapter is not null)
+                    ApplyLoraDeltaCpu(layer, "down_proj", siluOut, normOut, seqLen, lw.DownInputDim, lw.DownOutputDim);
 
                 // Residual add
                 for (int t = 0; t < seqLen; t++)
@@ -667,13 +1109,29 @@ public sealed unsafe class HybridTransformerModel : IModel
             nint w = fp16Weight;
             if (w == 0)
             {
-                _kernels.LaunchDequantToF16(quantWeight, qt, _gpuState.DequantScratch,
-                    outputDim * inputDim, s);
+                // Ragged K (issue #206) — see CudaTransformerModel.Project for the full rationale:
+                // the aligned dequant/GEMV kernels assume k % 128 == 0 and silently drop tail
+                // elements (dequant) or read misaligned memory (GEMV) otherwise.
+                if (qt == QuantizationType.I2_S && inputDim % 128 != 0)
+                    _kernels.LaunchDequantI2_SToF16Ragged(quantWeight, _gpuState.DequantScratch, outputDim, inputDim, s);
+                else if (qt == QuantizationType.I2_S)
+                    _kernels.LaunchDequantI2_SToF16(quantWeight, _gpuState.DequantScratch, outputDim, inputDim, s);
+                else
+                    _kernels.LaunchDequantToF16(quantWeight, qt, _gpuState.DequantScratch,
+                        outputDim * inputDim, s);
                 w = _gpuState.DequantScratch;
             }
             CudaGemm.LinearF16(_cublas.Handle, input, w, output, seqLen, inputDim, outputDim, s);
         }
-        else if (quantWeight != 0 && CudaKernels.HasQuantizedGemv(qt))
+        else if (quantWeight != 0 && qt == QuantizationType.I2_S && inputDim % 128 != 0)
+        {
+            _kernels.LaunchI2_SGemvF16InRagged(quantWeight, input, output, outputDim, inputDim, s);
+        }
+        else if (quantWeight != 0 && qt == QuantizationType.I2_S)
+        {
+            _kernels.LaunchI2_SGemvF16In(quantWeight, input, output, outputDim, inputDim, s);
+        }
+        else if (quantWeight != 0 && _kernels.HasQuantizedGemvKernel(qt))
         {
             _kernels.LaunchQuantizedGemv(quantWeight, qt, input, output, outputDim, inputDim, s);
         }
@@ -688,6 +1146,71 @@ public sealed unsafe class HybridTransformerModel : IModel
             }
             CudaGemm.GemvF16(_cublas.Handle, w, input, output, outputDim, inputDim, s);
         }
+    }
+
+    /// <summary>
+    /// Applies the GPU-phase LoRA delta for one projection: <c>y += scale · (x · B) · A</c>,
+    /// using the staged FP16 factors (<c>B[rank, inputDim]</c>, <c>A[outputDim, rank]</c>) via
+    /// the shared <c>_gpuState.LoraTmp</c> scratch. Mirrors
+    /// <c>CudaTransformerModel.ApplyLoraDeltaDevice</c> (M2): decode (seqLen==1) uses two GEMVs,
+    /// prefill (seqLen&gt;1) uses two batched GEMMs. Early-returns when no adapter is staged or
+    /// the adapter does not target <paramref name="proj"/> at this layer.
+    /// </summary>
+    private void ApplyLoraDeltaDeviceGpu(int layer, string proj, nint xDev, nint yDev, int seqLen)
+    {
+        if (_cudaLora is null)
+            return;
+        if (!_cudaLora.TryGet(layer, proj, out nint aF16, out nint bF16, out int inputDim, out int outputDim))
+            return;
+
+        int rank = _cudaLora.Rank;
+        if (rank > CudaForwardState.MaxLoraRank)
+            throw new InvalidOperationException(
+                $"LoRA rank {rank} exceeds the device delta rank cap ({CudaForwardState.MaxLoraRank}). " +
+                $"Reduce adapter rank or rebuild with a higher MaxLoraRank.");
+
+        float scale = _cudaLora.Scale;
+        nint tmp = _gpuState.LoraTmp;  // [seqLen, MaxLoraRank] FP16
+        nint s = _stream.Handle;
+        nint cublasH = _cublas.Handle;
+
+        if (seqLen == 1)
+        {
+            // Decode path — two GEMVs.
+            // Step 1: tmp[rank] = B[rank, inputDim] · x[inputDim]  (overwrites tmp)
+            CudaGemm.GemvF16(cublasH, bF16, xDev, tmp, rank, inputDim, s);
+
+            // Step 2: y[outputDim] += scale · A[outputDim, rank] · tmp[rank]
+            CudaGemm.GemvF16Accum(cublasH, aF16, tmp, yDev, outputDim, rank, scale, s);
+        }
+        else
+        {
+            // Prefill path — two batched GEMMs.
+            // Step 1: tmp[seqLen, rank] = X[seqLen, inputDim] × B^T  (overwrites tmp)
+            CudaGemm.LinearF16(cublasH, xDev, bF16, tmp, seqLen, inputDim, rank, s);
+
+            // Step 2: Y[seqLen, outputDim] += scale · tmp[seqLen, rank] × A^T
+            CudaGemm.LinearF16Accum(cublasH, tmp, aF16, yDev, seqLen, rank, outputDim, scale, s);
+        }
+    }
+
+    /// <summary>
+    /// Applies the CPU-phase LoRA delta for one projection: <c>y += scale · (x · B) · A</c>,
+    /// delegating to the shared full dtype-aware <see cref="LoraProjection.Apply"/>. This gives the
+    /// hybrid CPU-resident layers identical adapter-dtype support to the full-CPU
+    /// <c>TransformerModel</c> path — F32 / F16 / BF16 / Q8_0 adapter weights plus the Phase-4d.6
+    /// outer-product stage-2 fast path. Early-returns (inside the shared helper) when no adapter is
+    /// staged or the adapter does not target <paramref name="proj"/> at this layer.
+    /// The hybrid CPU loop does not pre-quantise x for the LoRA path, so <c>preQuantX</c> is null
+    /// (the dequant-once F32 fallback handles every dtype). <paramref name="layer"/> is the
+    /// absolute (global) layer index.
+    /// </summary>
+    private void ApplyLoraDeltaCpu(int layer, string proj, float* x, float* y,
+                                   int seqLen, int inputDim, int outputDim)
+    {
+        LoraProjection.Apply(_currentAdapter!, layer, proj, x, y,
+                             seqLen, inputDim, outputDim, _threadPool,
+                             preQuantX: null, preQuantXType: QuantizationType.F32);
     }
 
     // ═══════════════════════════════════════════════════
@@ -711,6 +1234,11 @@ public sealed unsafe class HybridTransformerModel : IModel
             MatMul.GemvF32((float*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.F16)
             MatMul.GemvF16(weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.I2_S)
+            // BitNet b1.58 ternary: per-tensor scale at the tensor tail (NOT per-row), so the
+            // generic per-row dequant fallback reads garbage. Dispatch the dedicated I2_S GEMV.
+            // Mirrors TransformerModel.cs:2772.
+            MatMul.GemvI2_S((byte*)weights, x, y, m, k, _threadPool);
         else
             GemvDequantFallback(weights, qt, x, y, m, k);
     }
@@ -753,6 +1281,11 @@ public sealed unsafe class HybridTransformerModel : IModel
             MatMul.GemmF32((float*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.F16)
             MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);
+        else if (qt == QuantizationType.I2_S)
+            // BitNet b1.58 ternary: per-tensor scale at the tensor tail (NOT per-row), so the
+            // generic per-row dequant fallback reads garbage. Dispatch the dedicated I2_S GEMM.
+            // Mirrors TransformerModel.cs:2825.
+            MatMul.GemmI2_S((byte*)weights, b, c, m, k, n, _threadPool);
         else
             GemmDequantFallback(weights, qt, b, c, m, k, n);
     }
@@ -1031,6 +1564,8 @@ public sealed unsafe class HybridTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        _context.MakeCurrent();
+        _cudaLora?.Dispose();
         _gpuState.Dispose();
         _gpuWeights.Dispose();
         _kernels.Dispose();

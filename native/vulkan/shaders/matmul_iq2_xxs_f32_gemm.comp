@@ -1,0 +1,171 @@
+#version 450
+// IQ2_XXS batched matrix multiplication (prefill-path GEMM).
+//
+//   C[N, M] = B[N, K] @ W_iq2xxs[M, K]^T   with W_iq2xxs dequantized on the fly.
+//
+// Tile: 16x16 cells per workgroup. K-chunk = 32 elements = one IQ2_XXS
+// sub-block (4 pairs of 8 elements). 8 chunks per super-block.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW       { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufB       { float b[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufC       { float c[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer BufGrid    { uint  iq2xxsGrid[]; };
+layout(set = 0, binding = 4, std430) readonly  buffer BufKsigns  { uint  ksigns[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;             // multiple of 256
+    uint N;
+    uint blocksPerRow;  // = K / 256 (super-blocks)
+    uint rowUints;
+} pc;
+
+const uint TILE_M = 16u;
+const uint TILE_N = 16u;
+const uint CHUNK  = 32u;
+const uint IQ2_XXS_BLOCK_BYTES = 66u;
+const uint IQ2_XXS_GROUP_SIZE  = 256u;
+const uint NUM_SUBBLOCKS       = 8u;
+
+shared float sharedB[TILE_N * CHUNK];
+shared float sharedW[TILE_M * CHUNK];
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+uint gridByte(uint absIdx) {
+    uint u = iq2xxsGrid[absIdx >> 2u];
+    return (u >> ((absIdx & 3u) * 8u)) & 0xFFu;
+}
+
+uint ksignByte(uint absIdx) {
+    uint u = ksigns[absIdx >> 2u];
+    return (u >> ((absIdx & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x * TILE_M + gl_LocalInvocationID.x;
+    uint t = gl_WorkGroupID.y * TILE_N + gl_LocalInvocationID.y;
+    uint tid = gl_LocalInvocationID.y * TILE_M + gl_LocalInvocationID.x;
+
+    uint mBase = gl_WorkGroupID.x * TILE_M;
+    uint tBase = gl_WorkGroupID.y * TILE_N;
+
+    uint rowByteStride = pc.blocksPerRow * IQ2_XXS_BLOCK_BYTES;
+
+    float acc = 0.0;
+
+    uint totalChunks = pc.blocksPerRow * NUM_SUBBLOCKS;
+    for (uint chunk = 0u; chunk < totalChunks; chunk++) {
+        uint kBlock = chunk / NUM_SUBBLOCKS;
+        uint ib32   = chunk - kBlock * NUM_SUBBLOCKS;
+        uint kBase  = kBlock * IQ2_XXS_GROUP_SIZE + ib32 * CHUNK;
+
+        // ── 1. Stage sharedB[TILE_N, 32]. 256 threads load 2 floats each. ──
+        {
+            uint flat0 = tid * 2u;
+            uint flat1 = flat0 + 1u;
+            uint row0 = flat0 >> 5u;
+            uint col0 = flat0 - (row0 << 5u);
+            uint row1 = flat1 >> 5u;
+            uint col1 = flat1 - (row1 << 5u);
+            uint tGlobal0 = tBase + row0;
+            uint tGlobal1 = tBase + row1;
+            float v0 = 0.0;
+            float v1 = 0.0;
+            if (tGlobal0 < pc.N) v0 = b[tGlobal0 * pc.K + kBase + col0];
+            if (tGlobal1 < pc.N) v1 = b[tGlobal1 * pc.K + kBase + col1];
+            sharedB[flat0] = v0;
+            sharedB[flat1] = v1;
+        }
+
+        // ── 2. Dequantize sharedW[TILE_M, 32]. 16 rows × 16 lanes; each
+        //      lane writes columns (lane, lane+16). ──
+        {
+            uint mLocal  = tid >> 4u;
+            uint lane    = tid - (mLocal << 4u);
+            uint mGlobal = mBase + mLocal;
+            bool rowValid = mGlobal < pc.M;
+
+            float wLo = 0.0;
+            float wHi = 0.0;
+            if (rowValid) {
+                uint blockByteBase = mGlobal * rowByteStride + kBlock * IQ2_XXS_BLOCK_BYTES;
+                float d = readHalf(blockByteBase);
+                uint p = blockByteBase + 2u + 8u * ib32;
+                uint a0 = readByte(p)
+                        | (readByte(p + 1u) << 8)
+                        | (readByte(p + 2u) << 16)
+                        | (readByte(p + 3u) << 24);
+                uint a1 = readByte(p + 4u)
+                        | (readByte(p + 5u) << 8)
+                        | (readByte(p + 6u) << 16)
+                        | (readByte(p + 7u) << 24);
+                float db = d * (0.5 + float(a1 >> 28)) * 0.25;
+
+                // lane in [0..15] -> (column lane) and (column lane+16).
+                // colLo: pair lL = lane>>3 (0..1), j = lane & 7.
+                // colHi: pair lH = (lane+16)>>3 = (lane>>3)+2 (2..3), j = lane & 7.
+                uint lL = lane >> 3u;
+                uint lH = lL + 2u;
+                uint jJ = lane & 7u;
+
+                uint gridIdxL  = (a0 >> (8u * lL)) & 0xFFu;
+                uint signsIdxL = (a1 >> (7u * lL)) & 0x7Fu;
+                uint signsL    = ksignByte(signsIdxL);
+                float gL    = float(gridByte(gridIdxL * 8u + jJ));
+                float signL = ((signsL & (1u << jJ)) != 0u) ? -1.0 : 1.0;
+                wLo = db * gL * signL;
+
+                uint gridIdxH  = (a0 >> (8u * lH)) & 0xFFu;
+                uint signsIdxH = (a1 >> (7u * lH)) & 0x7Fu;
+                uint signsH    = ksignByte(signsIdxH);
+                float gH    = float(gridByte(gridIdxH * 8u + jJ));
+                float signH = ((signsH & (1u << jJ)) != 0u) ? -1.0 : 1.0;
+                wHi = db * gH * signH;
+            }
+
+            uint sBase = mLocal * CHUNK;
+            sharedW[sBase + lane]         = wLo;
+            sharedW[sBase + lane + 16u]   = wHi;
+        }
+
+        barrier();
+
+        // ── 3. Partial dot product for this K-chunk. ──
+        {
+            uint bOff = gl_LocalInvocationID.y * CHUNK;
+            uint wOff = gl_LocalInvocationID.x * CHUNK;
+            float chunkSum = 0.0;
+            for (uint j = 0u; j < CHUNK; j++) {
+                chunkSum += sharedB[bOff + j] * sharedW[wOff + j];
+            }
+            acc += chunkSum;
+        }
+
+        barrier();
+    }
+
+    if (m < pc.M && t < pc.N) {
+        c[t * pc.M + m] = acc;
+    }
+}

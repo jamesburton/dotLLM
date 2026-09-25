@@ -1,0 +1,81 @@
+{
+  "label": "vulkan-strixhalo-llama1b-q8",
+  "timestamp": "2026-05-14T01:21:50+00:00",
+  "git": {
+    "commit": "05242766bf251afa7ea11dd1d6ee137856eb64c5",
+    "branch": "worktree-agent-a480e8ccd7f9935e4",
+    "dirty": true
+  },
+  "system": {
+    "cpu": "AMD64 Family 26 Model 112 Stepping 0, AuthenticAMD",
+    "cores": 32,
+    "os": "Windows 11",
+    "ram_gb": null
+  },
+  "config": {
+    "prompt_size": "short",
+    "max_tokens": 30,
+    "models": [
+      "Llama-3.2-1B-Instruct-Q8_0.gguf"
+    ],
+    "device": "vulkan"
+  },
+  "results": [
+    {
+      "engine": "dotLLM (vulkan)",
+      "model": "Llama-3.2-1B-Instruct-Q8_0",
+      "prefill_ms": 27.8638,
+      "decode_ms": 354.3331,
+      "prefill_tokens": 5,
+      "decode_tokens": 29,
+      "prefill_tok_per_sec": 179.44429690135587,
+      "decode_tok_per_sec": 81.8438920891105,
+      "decode_ms_per_tok": 12.21838275862069,
+      "total_tok_per_sec": 88.95938193114596,
+      "bdn_mean_ns": 410221233.3333333,
+      "bdn_stddev_ns": 8235119.059451013,
+      "median_prefill_tok_per_sec": 175.2817654379415,
+      "median_decode_tok_per_sec": 80.37818768805724,
+      "median_prefill_ms": 28.525499999999997,
+      "median_decode_ms": 360.7944,
+      "decode_cv": 0.011772325634457275,
+      "prefill_cv": 0.136804189392657,
+      "all_decode_tok_per_sec": [
+        79.63556568300267,
+        81.03238612993795,
+        80.50249099690677,
+        80.37818768805724,
+        80.3354364596561,
+        81.8438920891105,
+        78.88597766384346
+      ],
+      "all_prefill_tok_per_sec": [
+        115.7589620588426,
+        175.12950827136666,
+        177.20693517061483,
+        179.44429690135587,
+        172.50837528161992,
+        177.10650476770712,
+        175.2817654379415
+      ],
+      "all_decode_ms": [
+        364.1589,
+        357.88160000000005,
+        360.2373,
+        360.7944,
+        360.9864,
+        354.3331,
+        367.6192
+      ],
+      "all_prefill_ms": [
+        43.193200000000004,
+        28.5503,
+        28.215600000000002,
+        27.8638,
+        28.984099999999998,
+        28.2316,
+        28.525499999999997
+      ]
+    }
+  ]
+}

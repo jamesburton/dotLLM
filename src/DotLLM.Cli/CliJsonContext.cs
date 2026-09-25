@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using DotLLM.Cli.Benchmarking;
 using DotLLM.Cli.Commands;
 
 namespace DotLLM.Cli;
@@ -8,6 +9,7 @@ namespace DotLLM.Cli;
 /// Enables Native AOT compilation by eliminating reflection-based serialization.
 /// </summary>
 [JsonSerializable(typeof(RunJsonResult))]
+[JsonSerializable(typeof(BenchJsonResult))]
 [JsonSourceGenerationOptions(
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]

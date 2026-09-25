@@ -6,17 +6,45 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Required for testing the rate-limit middleware (DefaultHttpContext,
+         IApplicationBuilder, etc.). The Server project is built against
+         Microsoft.AspNetCore.App, this aligns the test harness. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\DotLLM.Core\DotLLM.Core.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Models\DotLLM.Models.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Tokenizers\DotLLM.Tokenizers.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Cpu\DotLLM.Cpu.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Engine\DotLLM.Engine.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Cuda\DotLLM.Cuda.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Vulkan\DotLLM.Vulkan.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Hip\DotLLM.Hip.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Diagnostics\DotLLM.Diagnostics.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Telemetry\DotLLM.Telemetry.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Server\DotLLM.Server.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.HuggingFace\DotLLM.HuggingFace.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Cli\DotLLM.Cli.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- #338: the CUDA suites hard-coded absolute fixture paths (`E:/.cache/huggingface/...`),
+         duplicated across files so the literals drifted, and green-by-skip on every machine but
+         one. They now use the same resolver the integration suite standardised in #308. Linked
+         rather than copied so the two projects cannot diverge; both files are `internal`, so each
+         assembly gets its own copy and neither leaks API. -->
+    <Compile Include="..\DotLLM.Tests.Integration\Fixtures\TestFixtureResolver.cs"
+             Link="Fixtures\TestFixtureResolver.cs" />
+    <Compile Include="..\DotLLM.Tests.Integration\Fixtures\KnownTestFixtures.cs"
+             Link="Fixtures\KnownTestFixtures.cs" />
+    <!-- TestFixtureResolver probes TestModelDownloader.CacheDirectory (the $DOTLLM_TEST_CACHE_DIR
+         / ~/.dotllm/test-cache root), so it comes along. -->
+    <Compile Include="..\DotLLM.Tests.Integration\Fixtures\TestModelDownloader.cs"
+             Link="Fixtures\TestModelDownloader.cs" />
+    <!-- #384: shared checkpoint-load-to-skip helper (partial/locked download tolerance). -->
+    <Compile Include="..\DotLLM.Tests.Integration\Fixtures\CheckpointGuard.cs"
+             Link="Fixtures\CheckpointGuard.cs" />
   </ItemGroup>
 
   <ItemGroup>

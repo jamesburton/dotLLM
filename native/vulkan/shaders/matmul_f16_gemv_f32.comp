@@ -1,0 +1,81 @@
+#version 450
+// F16 native matrix-vector multiplication (decode-path GEMV).
+//
+//   y[m] = sum_k  W_f16[m, k] * x[k]
+//
+// Weights are stored on device in their source IEEE-754 binary16 format —
+// 2 bytes per element, row-major [M, K]. Activations / output are FP32.
+// Accumulation is FP32. This kernel is the F16 sibling of matmul_q8_0.comp
+// and matmul_q4_k_gemv_f32.comp — same dispatch shape, same shared-memory
+// reduction, same FP32-x convention.
+//
+// Why this exists: BF16 / F16 SafeTensors weights used to be expanded to
+// F32 at upload (doubling VRAM). With this kernel + KeepF16OnDevice predicate,
+// F16 weights stay 2 bytes per element on device, halving the matmul-weight
+// VRAM cost for the SafeTensors path that today dominates the BF16 / F16
+// HuggingFace ecosystem.
+//
+// Storage-buffer access:
+//   `weight` is bound as `uint[]` because GLSL storage buffers cannot hold
+//   float16 scalars without optional extensions. Each uint holds two F16
+//   elements; we extract them with `unpackHalf2x16` — same pattern the Q4_K /
+//   Q8_0 shaders use to read fp16 d / dmin scales. No GL_EXT_shader_*
+//   extension is required; this kernel runs on every Vulkan 1.0+ driver.
+//
+// Dispatch:
+//   One workgroup per output row (gl_WorkGroupID.x = m).
+//   local_size_x = 128 — threads stride across the K axis in 2-element pairs
+//   (one uint = two F16 elements) and accumulate partial sums in FP32, then
+//   the workgroup reduces in shared memory.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; }; // F16 blob, 4-byte indexable (2 F16 per uint)
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };       // [K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };       // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;            // number of output rows
+    uint K;            // contraction dim (must be a multiple of 2 for tightly packed F16; we require %2==0)
+    uint pairsPerRow;  // = K / 2 — number of uints per row (each uint holds 2 F16 elements)
+    uint rowUints;     // per-row uint stride (== pairsPerRow when K%2==0)
+} pc;
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    // F16 row stride in uints. K is constrained to be even at the C# wrapper
+    // (and on every real model K is at minimum a multiple of head_dim ≥ 32),
+    // so pairsPerRow = K/2 fully describes the row.
+    uint rowUintBase = m * pc.rowUints;
+
+    float acc = 0.0;
+
+    // Each thread strides through the row in uint (= 2 F16) units. For each
+    // uint loaded, we get two F16 elements via unpackHalf2x16, multiply by the
+    // matching FP32 x-elements, and accumulate.
+    for (uint p = tid; p < pc.pairsPerRow; p += threads) {
+        uint packed = weight[rowUintBase + p];
+        vec2 wPair = unpackHalf2x16(packed);   // wPair.x = element 2p, wPair.y = element 2p+1
+        uint kBase = p * 2u;
+        acc += wPair.x * x[kBase];
+        acc += wPair.y * x[kBase + 1u];
+    }
+
+    // Workgroup reduction via shared memory. No subgroup intrinsics — broadest
+    // driver portability, mirrors the Q8_0 / Q4_K GEMV pattern.
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}

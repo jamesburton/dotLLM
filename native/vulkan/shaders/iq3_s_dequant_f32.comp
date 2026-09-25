@@ -1,0 +1,109 @@
+#version 450
+// IQ3_S dequantization to FP32. 110 bytes per 256-element super-block.
+// Layout matches llama.cpp's block_iq3_s and the dotLLM CPU oracle
+// Dequantize.DequantizeIQ3_S:
+//     bytes [0,1]      = fp16 d
+//     bytes [2..65]    = qs[64]     — low 8 bits of grid index per pair-of-8
+//     bytes [66..73]   = qh[8]      — 1 high-bit per grid index, 4 bits per sub-block
+//     bytes [74..105]  = signs[32]  — 8-bit sign mask per pair (no ksigns indirection)
+//     bytes [106..109] = scales[4]  — two 4-bit sub-scales per byte
+//
+// Sub-blocks come in pairs sharing scales[ib32/2] + qh[ib32]/qh[ib32+1]:
+//   For ib32 even -> db = d * (1 + 2*(scales[ib32/2] & 0xf));
+//       ib32 odd  -> db = d * (1 + 2*(scales[ib32/2] >> 4)).
+// Per pair-of-8 l in [0..4):
+//   g1 = qs[qsRel + 2*l + 0] | ((qh[ib32] << (8 - 2*l)) & 0x100)
+//   g2 = qs[qsRel + 2*l + 1] | ((qh[ib32] << (7 - 2*l)) & 0x100)
+//   signs = signs[signsRel + l]
+//   for j in [0..4):
+//     y[l*8 + j + 0] = db * grid[g1*4 + j] * (signs & (1<<(j+0)) ? -1 : +1)
+//     y[l*8 + j + 4] = db * grid[g2*4 + j] * (signs & (1<<(j+4)) ? -1 : +1)
+// where qsRel and signsRel advance by (8, 4) per sub-block within the super-block.
+//
+// Dispatch: one workgroup per super-block, 256 threads (1 per element).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW       { uint  src[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer BufY       { float dst[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufGrid    { uint  iq3sGrid[]; };  // 2048 bytes = 512 uints
+
+layout(push_constant) uniform PushConstants {
+    uint totalSuperblocks;
+    uint srcUints;
+} pc;
+
+const uint IQ3_S_BLOCK_BYTES = 110u;
+const uint IQ3_S_GROUP_SIZE  = 256u;
+
+uint readByte(uint absByteOff) {
+    uint u = src[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = src[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = src[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+uint gridByte(uint absIdx) {
+    uint u = iq3sGrid[absIdx >> 2u];
+    return (u >> ((absIdx & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    uint sb = gl_WorkGroupID.x;
+    if (sb >= pc.totalSuperblocks) return;
+
+    uint t = gl_LocalInvocationID.x;
+    uint blockBase = sb * IQ3_S_BLOCK_BYTES;
+    float d = readHalf(blockBase);
+
+    uint qsBase     = blockBase + 2u;
+    uint qhBase     = blockBase + 2u + IQ3_S_GROUP_SIZE / 4u;     // = + 66
+    uint signsBase  = blockBase + 2u + IQ3_S_GROUP_SIZE / 4u + IQ3_S_GROUP_SIZE / 32u;  // = + 74
+    uint scalesBase = blockBase + 2u + IQ3_S_GROUP_SIZE / 4u + IQ3_S_GROUP_SIZE / 32u + IQ3_S_GROUP_SIZE / 8u;  // = + 106
+
+    uint ib32 = t >> 5u;     // 0..7
+    uint rem  = t & 31u;
+    uint l    = rem >> 3u;   // 0..3
+    uint jj   = rem & 7u;    // 0..7
+
+    // Per-pair scale: each byte of scales[] holds two 4-bit sub-scales.
+    // sub_scale  = ib32 even -> (scaleByte & 0xf)
+    //              ib32 odd  -> (scaleByte >> 4)
+    uint scaleByte = readByte(scalesBase + (ib32 >> 1u));
+    uint subScale  = ((ib32 & 1u) == 0u) ? (scaleByte & 0xFu) : (scaleByte >> 4u);
+    float db = d * float(1u + 2u * subScale);
+
+    // qh / qs / signs lay out one sub-block per (8 qs bytes, 4 signs, 1 qh).
+    uint qhByte    = readByte(qhBase + ib32);
+    uint qsSubBase = qsBase + ib32 * 8u;
+    uint sgSubBase = signsBase + ib32 * 4u;
+
+    bool useG2 = (jj >= 4u);
+    uint j4    = useG2 ? (jj - 4u) : jj;
+    // ggml: (qh << (8 - 2*l)) & 256 picks bit (2*l) of qh -> 0x100 if set (g1).
+    // ggml: (qh << (7 - 2*l)) & 256 picks bit (2*l + 1) of qh -> 0x100 if set (g2).
+    uint hiBit = useG2
+        ? ((qhByte << (7u - 2u * l)) & 0x100u)
+        : ((qhByte << (8u - 2u * l)) & 0x100u);
+    uint lo = readByte(qsSubBase + 2u * l + (useG2 ? 1u : 0u));
+    uint gridIdx = lo | hiBit;
+    uint signs   = readByte(sgSubBase + l);
+
+    float g    = float(gridByte(gridIdx * 4u + j4));
+    float sign = ((signs & (1u << jj)) != 0u) ? -1.0 : 1.0;
+
+    dst[sb * IQ3_S_GROUP_SIZE + t] = db * g * sign;
+}

@@ -24,18 +24,37 @@ public sealed class TransformerArchitecture : IModelArchitecture
 
     /// <inheritdoc/>
     public IReadOnlyList<Architecture> SupportedArchitectures { get; } =
-        [Architecture.Llama, Architecture.Mistral, Architecture.Phi, Architecture.Qwen];
+        [Architecture.Llama, Architecture.Mistral, Architecture.Phi, Architecture.Qwen,
+         Architecture.NemotronH, Architecture.Qwen3MoeHybrid,
+         Architecture.DeepSeekV2, Architecture.DeepSeekV3,
+         // Gemma 3 / Gemma 4 MoE / DiffusionGemma all ride the standard
+         // TransformerModel forward path (four RMSNorms, GeGLU, (1+w) norm,
+         // embed-scale, QK-norm, per-attention-type RoPE, dual KV-head/head-dim,
+         // sparse MoE, soft-cap). DiffusionGemma adds only a DiffusionConfig the
+         // generator consumes — the tower itself is the Gemma-4 MoE backbone.
+         Architecture.Gemma3, Architecture.Gemma4, Architecture.DiffusionGemma,
+         Architecture.BitNet];
 
     /// <inheritdoc/>
     public IModel CreateModel(ModelConfig config, IBackend backend)
     {
+#pragma warning disable CS0618 // Legacy DeepSeek must remain detectable for compatibility diagnostics.
         if (config.Architecture is Architecture.DeepSeek)
+#pragma warning restore CS0618
             throw new NotSupportedException(
-                "DeepSeek models require Multi-Latent Attention (MLA) which is not yet implemented. " +
-                "See roadmap Step 48.");
+                "Pre-V2 DeepSeek (legacy 'deepseek' arch string in GGUF) is not supported — " +
+                "the kernel set targets DeepSeek-V2 / V3 (MLA + MoE). Re-export from a V2/V3 checkpoint.");
+
+        if (config.Architecture is Architecture.NemotronH)
+            return NemotronHTransformerModel.LoadFromGguf(_gguf, config);
+
+        if (config.Architecture is Architecture.Qwen3MoeHybrid)
+            return Qwen3MoeHybridTransformerModel.LoadFromGguf(_gguf, config);
 
         if (config.Architecture is not (Architecture.Llama or Architecture.Mistral
-                                    or Architecture.Phi or Architecture.Qwen))
+                                    or Architecture.Phi or Architecture.Qwen
+                                    or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
+                                    or Architecture.BitNet))
             throw new ArgumentException(
                 $"TransformerArchitecture does not support {config.Architecture}.", nameof(config));
 

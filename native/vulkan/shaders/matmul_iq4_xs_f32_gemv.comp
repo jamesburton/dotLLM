@@ -1,0 +1,140 @@
+#version 450
+// IQ4_XS matrix-vector multiplication (decode-path GEMV).
+//
+//   y[m] = sum_k  W_iq4xs[m, k] * x[k]      with W_iq4xs dequantized on the fly.
+//
+// Weight layout mirrors llama.cpp's block_iq4_xs / DotLLM.Cpu.Kernels.Dequantize
+// .DequantizeIQ4_XS: each 256 contiguous elements of a row form one IQ4_XS
+// super-block of 136 bytes:
+//     bytes [0,1]    = fp16 d
+//     bytes [2,3]    = scales_h (uint16 LE) — top 2 bits of each 6-bit sub-block scale
+//     bytes [4..7]   = scales_l[4]          — low 4 bits of each 6-bit sub-block scale
+//     bytes [8..135] = qs[128]              — 8 sub-blocks of 16 bytes each (32 nibbles)
+//   Row stride = (K / 256) * 136 bytes.
+//
+// Reconstruction. 8 sub-blocks of 32 elements each. For sub-block ib in [0,8):
+//     low6  = (scales_l[ib / 2] >> (4 * (ib & 1))) & 0xF
+//     high2 = (scales_h >> (2 * ib))               & 0x3
+//     ls    = low6 | (high2 << 4)                  // 6-bit unsigned in [0..63]
+//     dl    = d * float(ls - 32)                   // signed effective scale
+//
+// Within sub-block ib, the 16 qs bytes encode 32 nibble indices into the same
+// kvalues_iq4nl[16] lookup as IQ4_NL. Low nibble of qs[ib*16 + j] produces
+// element j; high nibble produces element j + 16.
+//
+// x[] is FP32. Output y[] is FP32. N=1 decode path.
+//
+// Dispatch:
+//   One workgroup per output row, 128 threads, shared-memory tree reduce.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;             // multiple of 256
+    uint blocksPerRow;  // = K / 256
+    uint rowUints;
+} pc;
+
+const uint IQ4_XS_BLOCK_BYTES     = 136u;
+const uint IQ4_XS_GROUP_SIZE      = 256u;
+const uint IQ4_XS_SUB_BLOCK_SIZE  = 32u;
+const uint IQ4_XS_NUM_SUB_BLOCKS  = 8u;
+
+const float KVALUES_IQ4NL[16] = float[16](
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+       1.0,   13.0,  25.0,  38.0,  53.0,  69.0,  89.0, 113.0
+);
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowByteStride = pc.blocksPerRow * IQ4_XS_BLOCK_BYTES;
+    uint rowByteBase = m * rowByteStride;
+
+    float acc = 0.0;
+
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * IQ4_XS_BLOCK_BYTES;
+        float d = readHalf(blockByteBase);
+        // scales_h is a 2-byte LE uint16 at offset 2 of the super-block.
+        uint scalesH = (readByte(blockByteBase + 2u))
+                     | (readByte(blockByteBase + 3u) << 8u);
+        uint scalesLBase = blockByteBase + 4u;
+        uint qsBase      = blockByteBase + 8u;
+        uint xBase = b * IQ4_XS_GROUP_SIZE;
+
+        for (uint ib = 0u; ib < IQ4_XS_NUM_SUB_BLOCKS; ib++) {
+            uint scalesLByte = readByte(scalesLBase + (ib >> 1u));
+            uint low  = (scalesLByte >> (4u * (ib & 1u))) & 0xFu;
+            uint high = (scalesH >> (2u * ib)) & 0x3u;
+            int  ls   = int(low | (high << 4u)) - 32;
+            float dl  = d * float(ls);
+
+            // The sub-block's qs region is 16 bytes = 4 words, word-aligned
+            // (the 136-byte super-block puts qs at offset 8 and each 16-byte
+            // sub-block stride keeps it 4-aligned). Read each word ONCE and
+            // bitfield-extract the 8 nibbles instead of issuing 16 byte loads
+            // that reload each shared word 4 times. Codebook is a compile-time
+            // const float[16] (register/LDS), so the byte reads were the
+            // redundant weight traffic.
+            uint subQsUint = (qsBase + ib * 16u) >> 2u;   // 4-aligned
+            uint subXBase  = xBase + ib * IQ4_XS_SUB_BLOCK_SIZE;
+
+            float loSum = 0.0;
+            float hiSum = 0.0;
+            for (uint w = 0u; w < 4u; w++) {
+                uint cur = weight[subQsUint + w];
+                uint e = w * 4u;
+                loSum += x[subXBase + e + 0u] * KVALUES_IQ4NL[ cur        & 0xFu]
+                       + x[subXBase + e + 1u] * KVALUES_IQ4NL[(cur >>  8u) & 0xFu]
+                       + x[subXBase + e + 2u] * KVALUES_IQ4NL[(cur >> 16u) & 0xFu]
+                       + x[subXBase + e + 3u] * KVALUES_IQ4NL[(cur >> 24u) & 0xFu];
+                hiSum += x[subXBase + e + 16u] * KVALUES_IQ4NL[(cur >>  4u) & 0xFu]
+                       + x[subXBase + e + 17u] * KVALUES_IQ4NL[(cur >> 12u) & 0xFu]
+                       + x[subXBase + e + 18u] * KVALUES_IQ4NL[(cur >> 20u) & 0xFu]
+                       + x[subXBase + e + 19u] * KVALUES_IQ4NL[(cur >> 28u) & 0xFu];
+            }
+            acc += dl * (loSum + hiSum);
+        }
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}

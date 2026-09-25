@@ -68,6 +68,50 @@ struct block_q5_K {          // 176 bytes, 256 values
 };
 ```
 
+### MXFP4 (4.25 bits/weight)
+
+```
+struct block_mxfp4 {         // 17 bytes, 32 values (GGUF type 39)
+    uint8_t e;               // E8M0 shared scale (power of two)
+    uint8_t qs[16];          // 32 × 4-bit e2m1 indices packed into 16 bytes
+};
+Value table (doubled e2m1): {0,1,2,3,4,6,8,12, 0,-1,-2,-3,-4,-6,-8,-12}
+Scale: e8m0_to_fp32_half(e) = 2^(e-127) / 2  (halved to compensate doubling)
+Unpack: lo nibbles → elements 0..15, hi nibbles → elements 16..31
+Dequantize: val = kvalues[nibble] * scale
+```
+
+OCP Microscaling FP4. Used by OpenAI gpt-oss checkpoints for MoE expert
+weights. CPU vec_dot pairs MXFP4 weights with Q8_0-quantized activations
+(nibble→sbyte pshufb LUT + integer MAC), mirroring llama.cpp's
+`ggml_vec_dot_mxfp4_q8_0`.
+
+### I2_S (BitNet b1.58 ternary, ~2 bits/weight, GGUF type 36)
+
+```
+Row-major W[m,k]: 4 ternary codes {0,1,2} → {-1,0,+1} packed per byte (2 bits each).
+128-element block = 32 bytes. Byte at group_pos (0..31) holds codes for elements
+{group_pos, +32, +64, +96} at bit offsets {6,4,2,0}.
+ONE per-tensor float32 scale at the tensor tail, byte offset m·k/4.
+Dequantize: val = (code - 1) * scale
+```
+
+**Ragged K (`k % 128 != 0`, issue #206).** Most I2_S GGUFs have every row length (`k`) an exact
+multiple of 128 (e.g. microsoft/bitnet-b1.58-2B-4T: 2560/6912). At least one real checkpoint family
+(1bitLLM-style `bitnet_b1_58-large`/`-xl`: hidden=2048, intermediate=5460, `5460 % 128 == 84`) has a
+genuinely non-128-aligned `ffn_down` row length. The critical subtlety, verified against the real
+GGUF's tensor byte offsets and against the upstream bitnet.cpp writer (`ggml-bitnet-mad.cpp`'s
+`quantize_i2_s`): **the 128-element block interleave is computed over the flattened `m·k` element
+stream, not reset at each row boundary.** So a ragged row generally does not start on a block
+boundary at all (only every `128/gcd(k,128)`-th row does) — a "tail cleanup after the fast path"
+approach would be wrong for most of a ragged tensor's rows, not just the last few elements. When `k`
+is a multiple of 128 this is moot: every row boundary is also a block boundary, so per-row
+block-reset addressing and the flattened-stream addressing are bit-identical (why the 128-aligned
+fast paths never noticed the distinction). dotLLM's ragged-K support (CPU: `MatMul.I2S.cs`'s
+`I2SRaggedCode`/`UnpackRowRagged`; CUDA: `i2_s_gemv_{f16,f32}in_ragged` / `dequant_i2_s_f16_ragged`
+in `native/kernels/`) is a scalar, correctness-first fallback reached only when `k % 128 != 0` — the
+aligned SIMD/uint4 fast paths are untouched.
+
 ## Kernel Types
 
 Each quantization format needs two kernels:
@@ -97,3 +141,280 @@ GGUF files can have different types per tensor. Dispatch to correct kernel based
 - Vec_dot dominant for decode (GEMV). Dequant+BLAS may win for prefill (GEMM).
 - GPU: custom CUDA kernels dequantize in shared memory, use tensor cores. Ref: llama.cpp `ggml-cuda/mmq.cu`.
 - Block alignment awkward for SIMD — handle tail elements carefully.
+
+## Vulkan Backend Coverage
+
+The Vulkan backend ships native matmul kernels (GEMV decode + GEMM prefill, with an opt-in F16 cooperative-matrix tile when the device enumerates F16xF16→F32) for the following source dtypes / quant formats. Source bytes stay on device — dequantisation happens in the shader inner loop, so memory cost is the GGUF source size (not 2-4× expanded F32):
+
+| Format | GEMV | GEMM | Coopmat | Reference |
+|---|---|---|---|---|
+| F32 | ✓ | ✓ | — | baseline |
+| F16 | ✓ | ✓ | ✓ (F16xF16→F32, M=N=K=16 tile) | `c9c08c5` |
+| BF16 | ✓ | ✓ | — (BF16 tiles not enumerated on RDNA3.5; use shift-left-16 reinterpret) | `c9c08c5` |
+| Q8_0 | ✓ | ✓ | ✓ (`MatMulQ8_0GemmCoopmatKernel`) | pre-existing |
+| Q2_K | ✓ | ✓ | — | layout fixed in #498 |
+| Q3_K | ✓ | ✓ | — | layout fixed in #311 |
+| Q4_K | ✓ | ✓ | — (Phase 1 follow-up) | `afb2272` + `b1ee6bc` |
+| Q5_K | ✓ | ✓ | — | `15099b9` + `83e0732` |
+| Q6_K | ✓ | ✓ | — | `29a1459` + `39b7646` |
+| Q5_0 | ✓ | ✓ | — | legacy-quant pair of Q8_0 |
+| IQ4_NL | ✓ | ✓ | — | IQ-family Phase 2 |
+| IQ4_XS | ✓ | ✓ | — | IQ-family Phase 2 |
+| IQ3_XXS | ✓ | ✓ | — | IQ-family |
+| IQ3_S | ✓ | ✓ | — | IQ-family |
+| IQ2_XXS | ✓ | ✓ | — | `79cca9b` |
+| IQ2_XS | ✓ | ✓ | — | `743984c` |
+| IQ2_S (also IQ2_M) | ✓ | ✓ | — | `9ecce75` |
+| IQ1_S | ✓ | ✓ | — | IQ-family — smallest GGUF quant (~1.5-1.7 bpw) |
+| I2_S | ✓ | ✓ | ✓ (`MatMulI2SGemmF32Kernel`) | BitNet b1.58 ternary |
+| PQ2_0 | ✓ | ✓ | ✓ (`MatMulPQ2_0GemmF32Kernel`) | PrismML ternary + per-group scale |
+| Q4_0 / Q4_1 / Q5_1 | — | — | — | **not shipped** — see below |
+
+**The unshipped set is exactly Q4_0, Q4_1 and Q5_1.** For those three the upload path falls back to
+F32 dequant, so weight memory is doubled / quadrupled; every other `QuantizationType` stays on device
+in its packed source form. The authority is `VulkanWeights.DeviceQuantTypeFor` — each
+`Keep*OnDevice` predicate there additionally requires the contraction axis to be a multiple of the
+format's group size, and a misaligned tensor of *any* format falls back to F32 regardless of kernel
+availability.
+
+**This table is the kernel inventory and the _dense_ (`VulkanWeights`) loader's coverage. The other
+weight loaders keep strictly less**, because each carries its own `DeviceQuantTypeFor` /
+`KeepQuantOnDevice` rather than sharing the dense one — a format having a kernel does not mean every
+architecture's loader will route to it:
+
+| loader | additionally falls back to F32 |
+|---|---|
+| `VulkanWeights` (dense) | — (the table above) |
+| `VulkanNemotronHWeights`, `VulkanMamba3Weights` | Q5_0, I2_S, PQ2_0 |
+| `VulkanQwen3MoeHybridWeights` | Q5_0, Q2_K, Q3_K, IQ4_NL, IQ4_XS, IQ1_S, I2_S |
+| `VulkanQwen3HybridDenseWeights` | everything but PQ2_0 (it handles only the packed token embed) |
+
+Widening a hybrid loader is mechanical — add the missing `Keep*OnDevice` arms — but it is a code
+change, not a documentation one, so check the loader for the architecture you are running before
+assuming a format stays packed.
+
+One caveat on Q5_1: it has no general projection kernel, but it *is* supported as a routed-MoE
+`down` bank (`moe_indexed_matmul_q5_1_{f32,mmvq}.comp`), and Q5_0 `down` banks are repacked
+bit-exactly to Q5_1 at upload. So "Q5_1 unshipped" is true of dense projections only.
+
+Ordering rationale, for why the family filled in as it did: K-quant Q4/5/6 came first because they
+cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most
+checkpoints). IQ4_NL and IQ4_XS followed as the most-used IQ-family quants in production
+(Llama-3.1 / Qwen2.5 IQ4_XS). The IQ2 family was prioritised to enable Qwen3.6-A3B-IQ2_M
+(~11.5 GB GGUFs) on Strix Halo without a 4× expansion to F32 (~46 GB) at upload. IQ1_S closed the IQ
+family at the smallest end, and Q2_K + Q3_K — the densest K-quants — closed the K-quant family;
+their matmul kernels share the dispatch shape of Q4/5/6_K (one workgroup per output row at decode,
+16×16 output tile at prefill) but use a 16-element K-chunk to match Q2/3_K's 16-element sub-block
+size.
+
+### IQ4_NL / IQ4_XS layout (Vulkan)
+
+Both IQ4 formats share the 16-entry signed-int8 codebook `kvalues_iq4nl = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113}`. The 4-bit `qs` nibble is an *index* into the codebook, not a signed int — so the Vulkan dequant path does a constant-array lookup rather than a linear subtract. The codebook is duplicated as a `const float[16]` inside each shader (≈ 64 bytes per shader, well under push-constant / register pressure thresholds).
+
+**IQ4_NL** (32-element block, 18 bytes/block):
+```
+bytes [0,1]   = fp16 d
+bytes [2..17] = qs[16]   // low nibble = element j, high nibble = element j + 16
+value         = d * float(kvalues_iq4nl[nibble])
+```
+
+**IQ4_XS** (256-element super-block, 136 bytes/super-block):
+```
+bytes [0,1]    = fp16 d
+bytes [2,3]    = scales_h (uint16 LE)             // top 2 bits of each 6-bit ls
+bytes [4..7]   = scales_l[4]                       // low 4 bits of each 6-bit ls
+bytes [8..135] = qs[128]                           // 8 sub-blocks of 16 bytes / 32 nibbles
+per sub-block ib:
+    low6  = (scales_l[ib/2] >> (4*(ib&1))) & 0xF
+    high2 = (scales_h >> (2*ib))           & 0x3
+    ls    = low6 | (high2 << 4)            // 6-bit unsigned in [0..63]
+    dl    = d * float(ls - 32)             // signed effective scale, range ≈ [-32, 31]
+    value = dl * float(kvalues_iq4nl[nibble])
+```
+
+Alignment: IQ4_NL kernels require `inputDim % 32 == 0`; IQ4_XS kernels require `inputDim % 256 == 0`. The upload path's `KeepIq4NlOnDevice` / `KeepIq4XsOnDevice` predicates gate on these.
+
+### IQ1_S layout (Vulkan)
+
+IQ1_S is the smallest GGUF quant (~1.5-1.7 bpw) and uses a 2048-entry signed-int8 codebook (`iq1s_grid`) — 8 ternary values {-1, 0, +1} packed into each `uint64` entry — together with a per-32-element `qh` field that carries a 3-bit scale, a sign-of-delta bit, and four 3-bit grid-index high parts. The codebook is duplicated as a `const uint[4096]` (each ggml uint64 split into a low/high uint pair, 16 KB total) inside each shader. SPV blobs are ~24-30 KB — bigger than the IQ4 kernels but still fast to JIT.
+
+**IQ1_S** (256-element super-block, 50 bytes/super-block):
+```
+bytes [0,1]    = fp16 d
+bytes [2..33]  = qs[32]                   // low 8 bits of grid index per group of 8 elements
+bytes [34..49] = qh[8]                    // uint16 LE, per 32-element sub-block:
+                                          //   bits  0..2  = grid-index high 3 bits, group 0
+                                          //   bits  3..5  = ...                       group 1
+                                          //   bits  6..8  = ...                       group 2
+                                          //   bits  9..11 = ...                       group 3
+                                          //   bits 12..14 = 3-bit per-block scale
+                                          //   bit  15     = sign of delta (0 -> +0.125, 1 -> -)
+per sub-block ib (8 sub-blocks per super-block, 4 groups of 8 elements per sub-block):
+    dl    = d * (2 * ((qh[ib] >> 12) & 7) + 1)
+    delta = (qh[ib] & 0x8000) ? -0.125 : +0.125
+per group l in [0..4):
+    idx   = qs[ib*4 + l] | (((qh[ib] >> 3*l) & 7) << 8)   // 11-bit, 2048 entries
+    grid  = iq1s_grid[idx]                                // 8 packed signed-int8 ternary values
+    y[j]  = dl * (grid[j] + delta)                        // for j in [0..8)
+```
+
+Alignment: IQ1_S kernels require `inputDim % 256 == 0`. The upload path's `KeepIq1SOnDevice` predicate gates on this.
+
+**Q3_K layout (fixed in #311).** Q3_K's decode is the easiest K-quant to get wrong, and dotLLM shipped it wrong in *every* backend until #311. Two independent transpositions, both now corrected against llama.cpp's `dequantize_row_q3_K`:
+
+1. **6-bit scale high bits.** The high 2 bits of sub-block `sub`'s scale live in `scales12[8 + (sub % 4)]` at shift `(sub / 4) * 2` — **not** `scales12[8 + sub/4]` at shift `(sub % 4) * 2`. The two agree only for `sub ∈ {0, 5, 10, 15}`, so the wrong form corrupts 12 of 16 sub-block scales.
+2. **Element ordering.** The 2-bit quants are **not** stored four consecutive elements per byte. Each 128-element half of the super-block uses 32 `qs` bytes, and every byte supplies **four elements 32 apart**: element `t` reads bit-pair `(t/32) % 4` of `qs[(t % 32) + 32*(t/128)]`. The `hmask` is transposed the same way: bit `t/32` of `hmask[t % 32]` (llama.cpp's `shift`/`m` loop). The old `qs[t/4] >> (t%4)*2` / `hmask[t/8] >> t%8` form scatters every element into the wrong sub-block scale.
+
+Combined, the old decode produced **noise**: dequantized Bielik-1.5B Q3_K tensors correlated **0.006** with the same tensors from the Q8_0 build of the model (0.988 after the fix). This was invisible to CPU↔Vulkan parity because all backends shared the bug, and invisible to the kernel unit tests because `Q3KFixture` *encoded* with the same wrong layout it decoded with — a closed loop that never touched real GGUF bytes. `DequantizeKQuantTests.Q3_K_DenseRandomBlocks_MatchLlamaCppReference` now pins the CPU oracle to a literal transcription of llama.cpp over dense pseudorandom super-blocks, which is the layer that had been missing.
+
+**Q2_K layout (fixed in #498).** Q2_K carries the *same* element transposition Q3_K did, and it
+survived the #311 sweep because nobody re-checked Q2_K at the time — the Q3_K fix comment in
+`DequantizeKQuants.cs` already named the wrong form as "the old dotLLM layout". Authority is
+llama.cpp's `dequantize_row_q2_K` (`ggml-quants.c`):
+
+- **Element ordering (was wrong).** The 2-bit quants are **not** four consecutive elements per
+  byte. Each 128-element half of the super-block consumes 32 `qs` bytes and every byte supplies
+  **four elements 32 apart**: element `t` is at byte `32*(t>>7) + (t&31)`, shift `2*((t>>5)&3)`.
+  The old `qs[t/4] >> (t%4)*2` form scatters every element.
+- **Scale/dmin sub-block (was, and remains, correct).** The 4-bit scale and 4-bit dmin for element
+  `t` come from sub-block `t>>4`. That index is **not** transposed — only the `qs` addressing was.
+
+Evidence: `blk.0.attn_q.weight` of `Llama-3.2-1B-pure-Q2_K.gguf` correlated against the same
+tensor from the Q8_0 build of the same base gives **0.954** under the llama.cpp layout and
+**0.069** under the old one (Q3_K, checked identically as a control, is 0.988 — correct and
+untouched). As with Q3_K, the unit tests could not see it: `Q2_K_SingleBlock_HandCalculated`
+writes one non-zero `qs` byte and reads elements 0/1/16, the three indices where the two layouts
+coincide, and `Q2KFixture` *encoded* with the same wrong order it decoded with. The oracle that
+was missing is `DequantizeKQuantTests.Q2_K_DenseRandomBlocks_MatchLlamaCppReference`, a literal
+transcription of llama.cpp over dense pseudorandom super-blocks. Vulkan and CUDA carried the same
+transposition and were fixed in the same issue. **Any Q2_K quality number from before #498 is
+meaningless** — the decoded weights were noise.
+
+See [docs/VULKAN.md](VULKAN.md) for runtime selection details and [docs/CUDA.md](CUDA.md) for the CUDA backend's coverage (Q2_K through Q8_0 plus pre-Q8_1 + MMVQ-large + MMQ + grouped-MoE-GEMV variants).
+
+### MoE indexed-expert matmul (per-row routed dispatch)
+
+Sparse-MoE forward (Mixtral / Qwen-MoE / Qwen3MoeHybrid) needs a kernel shape distinct from dense matmul: a single dispatch reads a per-row expert index and reaches into a packed expert bank `[numExperts, M, K]` for that row's weight matrix. The Vulkan backend ships:
+
+| Bank format | Kernel | Source layout on device | Used by |
+|---|---|---|---|
+| F32 | `MoeIndexedMatmulF32Kernel` (`moe_indexed_matmul_f32.comp`) | Dequantised at upload time, `[numExperts, M, K]` floats. | Default for all MoE models (streaming uploads per layer per forward; fits any quant since it dequants on the host). |
+| Q8_0 | `MoeIndexedMatmulQ8_0F32Kernel` (`moe_indexed_matmul_q8_0_f32.comp`) | Raw Q8_0 blocks `[numExperts, M, (K/32)*34]`. Per-row dequant in shader. | Reserved for the resident-quant MoE path (no model wires it yet — Q8_0 banks fit at F32 too). |
+| Q6_K | `MoeIndexedMatmulQ6_KF32Kernel` (`moe_indexed_matmul_q6_k_f32.comp`) | Raw Q6_K super-blocks `[numExperts, M, (K/256)*210]`. Per-row Q6_K dequant in shader (matches `DequantizeQ6_KScalar` byte-for-byte). | Qwen3MoeHybrid (Qwen3.6-A3B) when both `DOTLLM_VK_MOE_RESIDENT=1` AND the source banks are uniformly Q6_K — required for `Qwen3.6-A3B-UD-Q6_K_XL` to fit on Strix Halo's 128 GB unified memory (≈25 GB Q6_K-resident vs ≈120 GB if dequantised to F32). |
+
+The Q6_K MoE kernel completes the original Phase 10 follow-up gap noted in `VulkanQwen3MoeHybridTransformerModel`: with this kernel in place, opting in to `DOTLLM_VK_MOE_RESIDENT=1` on a Q6_K-source Qwen3MoeHybrid model now uploads the routed banks once and keeps them resident across forwards, eliminating the per-forward host→device dequant + upload cost. Mixed-quant layers (e.g. UD checkpoints with Q5_K W2 and Q6_K W1/W3) fall back to the F32 path automatically.
+
+## IQ-family (importance-quant) Coverage
+
+I-quants encode weight values via a small codebook lookup rather than linear quantization — the on-disk bytes index into a per-quant-type grid table (256/512/1024 entries × 8 bytes) and an 8-bit sign mask. The base scale (`d`, Half) plus 4-bit per-pair sub-scales decode to floats as `db * grid[idx][j] * sign[j]`.
+
+| Format | Block | bpw | CPU dequant | CPU MatMul | CUDA dequant | CUDA GEMV | Vulkan dequant | Vulkan GEMV/GEMM | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| IQ4_NL | 32 | 4.5 | ✓ | dequant-fallback | ✓ (`dequant_iq4_nl_{f16,f32}`) | ✓ (`quantized_gemv_iq4_nl`) | — (parallel agent) | — (parallel agent) | Plus MMQ-preq + MMVQ-large + MoE-grouped. |
+| IQ4_XS | 256 | 4.25 | ✓ | dequant-fallback | ✓ | ✓ | — (parallel agent) | — (parallel agent) | Plus MMQ-preq + MMVQ-large + MoE-grouped. |
+| IQ2_XXS | 256 | 2.0625 | ✓ | dequant-fallback | ✓ (`dequant_iq2_xxs_{f16,f32}`) | ✓ (`quantized_gemv_iq2_xxs`) | ✓ (`iq2_xxs_dequant_f32.spv`) | ✓ (`matmul_iq2_xxs_f32_{gemv,gemm}.spv`) | 256-entry codebook + 4×7-bit sign indices per 32-elem sub-block + shared 4-bit scale. |
+| IQ2_XS | 256 | 2.3125 | ✓ | dequant-fallback | ✓ | ✓ | ✓ | ✓ | 512-entry codebook; 7-bit sign indices in upper bits of `qs[uint16]`. |
+| IQ2_S | 256 | 2.5625 | ✓ | dequant-fallback | ✓ | ✓ | ✓ | ✓ | 1024-entry codebook; high index bits in `qh`. **Also stores `MOSTLY_IQ2_M` file-type tensors** (Qwen3.6-A3B-IQ2_M ~11.5 GB GGUFs). |
+
+The Vulkan IQ2 family kernels store the codebook tables as readonly SSBOs uploaded once per model load (3 grids + ksigns ≈ 14 KB on device, shared by all 6 IQ2 matmul kernels via `Iq2Codebooks`). Per-element decode is `db * grid[gridIdx*8+j] * sign_j`; per-pair scale uses the same `db = d * (0.5 + sub_scale) * 0.25` arithmetic as the CPU oracle. IQ2_XXS / IQ2_XS resolve `sign_j` via the 128-entry `ksigns_iq2xs` lookup; IQ2_S stores the 8-bit sign mask directly per pair.
+| Format | Block | bpw | CPU dequant | CPU MatMul | CUDA dequant | CUDA GEMV | Notes |
+|---|---|---|---|---|---|---|---|
+| IQ4_NL | 32 | 4.5 | ✓ | dequant-fallback | ✓ (`dequant_iq4_nl_{f16,f32}`) | ✓ (`quantized_gemv_iq4_nl`) | Plus MMQ-preq + MMVQ-large + MoE-grouped. |
+| IQ4_XS | 256 | 4.25 | ✓ | dequant-fallback | ✓ | ✓ | Plus MMQ-preq + MMVQ-large + MoE-grouped. |
+| IQ2_XXS | 256 | 2.0625 | ✓ | dequant-fallback | ✓ (`dequant_iq2_xxs_{f16,f32}`) | ✓ (`quantized_gemv_iq2_xxs`) | 256-entry codebook + 4×7-bit sign indices per 32-elem sub-block + shared 4-bit scale. |
+| IQ2_XS | 256 | 2.3125 | ✓ | dequant-fallback | ✓ | ✓ | 512-entry codebook; 7-bit sign indices in upper bits of `qs[uint16]`. |
+| IQ2_S | 256 | 2.5625 | ✓ | dequant-fallback | ✓ | ✓ | 1024-entry codebook; high index bits in `qh`. **Also stores `MOSTLY_IQ2_M` file-type tensors** (Qwen3.6-A3B-IQ2_M ~11.5 GB GGUFs). |
+| IQ1_S | 256 | ~1.5625 | ✓ | dequant-fallback | — | — | **Vulkan-only on GPU.** 2048-entry codebook of 8 ternary {-1, 0, +1} values packed into each uint64. Per-sub-block 3-bit scale + sign-of-delta in `qh[uint16]`. Smallest GGUF quant. |
+| IQ3_XXS | 256 | 3.0625 | ✓ | dequant-fallback | — | — | **Vulkan-only on GPU.** 256-entry codebook (4 unsigned int8 grid points per row); 4-bit per-32-element sub-block scale + 4×7-bit sign indices packed into a uint32 (`scales_and_signs[8]`); signs resolved via the shared 128-entry `ksigns_iq2xs` table. 98 B / super-block. |
+| IQ3_S | 256 | 3.4375 | ✓ | dequant-fallback | — | — | **Vulkan-only on GPU.** 512-entry codebook (4 unsigned int8 grid points per row); 9-bit grid indices split low 8 bits in `qs` + high 1 bit in `qh`; 32-byte `signs[]` stores the 8-bit sign mask per pair directly (no ksigns indirection). Paired sub-blocks share a 4-bit scale byte. 110 B / super-block. |
+
+**IQ1_S, IQ3_XXS, and IQ3_S** are supported on CPU and Vulkan (dequant + GEMV + GEMM); the CUDA backend treats them as CPU-only fallbacks. **IQ1_M** remains out of scope. MMQ-preq / MMVQ-large / MoE-grouped variants for the IQ2 / IQ3 families are deferred; CUDA prefill falls back to dequant→cuBLAS via the `dequant_iq2_*_f32` kernels.
+
+The Vulkan IQ3 family kernels store the two codebook tables as readonly SSBOs uploaded once per model load (1 KB `Iq3XxsGrid` + 2 KB `Iq3SGrid` + the 128-byte `ksigns_iq2xs` table shared with the IQ2 family ≈ 3 KB on device, shared by all 6 IQ3 matmul/dequant kernels via `Iq3Codebooks`). Per-element decode is `db * grid[gridIdx*4 + j] * sign_j` with two grid rows per 8-element pair (g1 for elements 0..3, g2 for 4..7). The IQ3_XXS shaders bind the shared `ksigns_iq2xs` SSBO at binding 4 (matching the IQ2_XXS layout); IQ3_S omits this binding since the 8-bit sign mask is stored inline per pair.
+
+## Mach-1 Additive Codec (issue #266, Phases A & B)
+
+`SyzygyResearch/Mach-1-Additive-35B` (a Qwen3.6-35B-A3B checkpoint, `Architecture.Qwen3MoeHybrid`) ships a bespoke ~1.7 bpw "additive" trellis codec — a tail-biting-trellis + randomized-Hadamard-transform (QTIP/QuIP#-family) format, not a GGUF quant type. It has no GGUF representation (no container for trellis + RHT + per-tile gamma) and is decoded via a ported, standalone C# codec rather than the GGUF dequant pipeline described above.
+
+**Phase A (this section) is decoder-only**: `src/DotLLM.Models/Quantization/Mach1/` reproduces the vendor's own `decode.py` (Apache-2.0, ported with attribution) primitive-for-primitive:
+
+| Primitive | Type | Notes |
+|---|---|---|
+| Tail-biting trellis bit-unpack | `Mach1TrellisCodec.UnpackTileStates`/`UnpackAllTiles` | `L`-bit shift register, `K·V` fresh bits/step, MSB-first big-endian-word packing, final `L-K·V` bits wrap from the stream start. |
+| `quantlut_sym` LUT expansion | `Mach1QuantLutSym` / `Mach1LutCache` | Hashes a persisted `[2^tlutBits, V]` table up to the full `[2^L, V]` table via `p=s*(s+1)`; cached by `(L, tlutBits, content hash)`. |
+| Orthonormal Walsh-Hadamard transform | `Mach1WalshHadamard` | Sylvester order, single fp32 **division** by `sqrt(dim)` (not a reciprocal multiply) after the butterfly passes — bit-exactness depends on this. |
+| Wavefront tile gamma | `Mach1WaveGamma` | 16×16-tile granularity; the wavefront schedule deliberately double-writes the top-right corner tile, later wave wins. |
+| int5-g64 (LM head) | `Mach1Int5G64Codec` | 8 signed 5-bit codes packed into 5 little-endian bytes; per-64 fp16 scale; optional exact protected-row overrides. |
+| Affine int-bits (embeddings) | `Mach1AffineEmbedCodec` | Asymmetric per-64-group int4 (or int3), MSB-first bit-packed; optional exact bf16-bit-pattern exceptions. |
+| Trellis weight reconstruction | `Mach1TrellisWeightDecoder` | Full op order: `unpack → recons → fp16 round-trip → [wave_gamma] → [×wscale] → H_n → ×su → transpose → H_m → ×sv → transpose → crop`. No FMA fusion anywhere in this path — the reference multiplies/adds/divides as separate fp32 ops, and the port matches that exactly. |
+
+Two expert-tier containers exist and are dispatched on the layer file's own metadata, never assumed (`Mach1ExpertContainerKind`/`Mach1ExpertContainer.Detect`): the chunked `trained_susv_wave_gamma_chunked_v1` container (`Mach1ExpertLayerDecoderV3T`, the one shipped in the current repo) and the older per-expert manifest-driven container (`Mach1ExpertLayerDecoderV2`, structurally ported but unverified — no sample of this container currently exists to check against). The NE ("spine": attention / linear-attn / shared-expert) tier uses the same trellis workhorse with int8-sign SU/SV + a scalar Wscale instead of continuous su/sv (`Mach1NeSpineDecoder`).
+
+**Bit-exactness is validated**, not just approximated: `tests/DotLLM.Tests.Integration/Models/Quantization/Mach1/Mach1GoldenBitExactTests.cs` decodes layer 0 / expert 0's gate/up/down projections and compares every element's raw bit pattern against the vendor's own `goldens/L0_e0_fp32.safetensors` — zero mismatches. The fixture resolves via `DOTLLM_MACH1_35B_DIR`, falling back to `~/.dotllm/test-cache/SyzygyResearch/Mach-1-Additive-35B/`, and the test skips (does not fail) when absent. Per-primitive unit tests in `tests/DotLLM.Tests.Unit/Models/Quantization/Mach1/` use discriminating shapes (non-power-of-two dims that force real padding, `Mb != Nb` grids) and, for the trellis/quantlut_sym/expert-pipeline primitives, cross-check against vectors captured by running the vendor's own `decode.py` — not a re-derivation of this port.
+
+**Phase B (load path)** wires the Phase A decoders into the standard model-loading surface, entirely via existing infrastructure — the `packed/` layout turned out to be readable by the existing generic `SafetensorsFile` reader as-is (composite `|`-delimited keys and per-file `__metadata__` blobs are just ordinary safetensors headers), so no new binary parser was needed:
+
+- **`Mach1PackedCheckpoint`** (`src/DotLLM.Models/Quantization/Mach1/Mach1PackedCheckpoint.cs`) orchestrates the four tiers: opens `packed/experts/codec.json` and dispatches the expert-tier container per-file via `Mach1ExpertContainer.Detect` (never assumes a fixed layout — issue #266 explicitly calls out `container` field churn), lazily opens one experts file + one NE file at a time (closing the previous on layer change), and decodes experts/NE/head/embeddings on demand. An optional `__zsc__` zstd sidecar (mentioned in `decode.py`'s reader as present on some v3 files) is detected and rejected with a clear `NotSupportedException` rather than silently mis-read — no file in the real fixture (as of 2026-08) carries one, and zstd decompression is not wired in.
+- **`Mach1ExtrasReader`** reads `extras.safetensors` (~52 MB, bf16) — the small sidecar of tensors the codec does not quantize at all: per-layer RMSNorm gains, GDN scalars (`A_log`, `dt_bias`, `conv1d.weight`, alpha/beta input projections), the MoE router gate, the shared-expert sigmoid gate, and full-attention-layer QK-norm.
+- **`Qwen35MoeConfigExtractor`** (`src/DotLLM.Models/SafeTensors/Qwen35MoeConfigExtractor.cs`) parses `qwen3_5_moe` / `qwen3_5_moe_text` `config.json`, hoisting the nested `text_config` and skipping `vision_config` (mirrors `Gemma3nConfigExtractor`'s pattern), and builds `GatedDeltaNetConfig`/`MoeConfig`/`HybridLayerLayout` from the HF key names (`linear_num_key_heads`, `linear_key_head_dim`, `full_attention_interval`, `layer_types`, ...). Wired into `ModelLoader.OpenSafetensorsAndConfig`'s dispatch, alongside the `gemma3n` hoist.
+- **`Qwen3MoeHybridTransformerModel.LoadFromMach1Packed`** decodes every tensor to dense fp32 `NativeMemory`-owned buffers and populates the *exact same* `Qwen3MoeLayerWeights` / `GdnTokenMixingWeights` / `Qwen3FullAttnWeights` / `MoeLayerWeights` shapes `LoadFromGguf` builds for this architecture — **zero forward-pass changes**. HF tensor names (verified against the real fixture, not guessed): GDN layers carry `linear_attn.{in_proj_qkv,in_proj_z,out_proj}.weight`; full-attention layers carry `self_attn.{q,k,v,o}_proj.weight` with `q_proj` fused Q+Gate at `2*numAttentionHeads*headDim` output width (same convention the GGUF path's `attn_q.weight` already assumes); both carry `mlp.shared_expert.{gate,up,down}_proj.weight` and route through `mlp.gate.weight` (router). The GDN `conv1d.weight`'s HF shape `[channels, 1, dConv]` (PyTorch depthwise `Conv1d`) flattens row-major to the exact same `c*dConv+k` byte layout `Conv1dCausal.Execute` already expects for GGUF's `[dConv, channels]` — no transpose needed, just a dtype upcast.
+
+**Resident-weights design matches the GGUF path exactly — this is not a loader inefficiency.** `LoadFromMach1Packed` opens and decodes `packed/experts/L{LL}.safetensors` / `packed/ne/L{LL}.safetensors` layer files sequentially (one pair open at a time, closed on layer change) purely to bound *decode-time* scratch, but the resulting per-layer weight bundles are all kept resident in the `layers` array for the model's lifetime — identical to `LoadFromGguf`, which also builds one `layers` array once and keeps every layer resident for as long as the model is alive. The only difference is *where* the bytes live: GGUF's bundle is zero-copy pointers into an mmap'd, OS-page-cached file (so "resident" is cheap — pages fault in on first touch and are shareable across processes), while Mach-1's bundle is genuinely-owned `NativeMemory`-allocated dense fp32 (decoding is mandatory here — the trellis + RHT codec has no "raw bytes, dequant this row on demand" shortcut the way GGUF's K-quants do, so there is no cheaper representation to memory-map). Both loaders therefore hold **100% of layers resident simultaneously** by design; Mach-1 is more expensive only because F32-dense is a larger on-disk-equivalent footprint than any GGUF quant, not because the loading strategy differs.
+
+**Memory is consequently the load-bearing constraint on full-model validation, not correctness.** Decoding all 256 experts × 40 layers × 3 projections to F32 is ≈128 GB resident, and even bf16 would be ≈64 GB — both a known, hardware-driven limitation (not a bug, not something this loader should paper over): the issue itself frames dense-decode as "a validation vehicle, not a deliverable" needing on this order of RAM. Full 40-layer end-to-end generation and top-1 token agreement vs. the base GGUF therefore require a machine with substantially more RAM than a typical workstation (the *loading path* itself has no such requirement below full-model scale — see the validated-at-real-scale coverage below); running that comparison is not attempted in this repo state and needs a bigger-RAM machine to execute. Full-scale resident-memory avoidance without needing that RAM is exactly what Phase C's fused-kernel path solves (computing the GEMV directly in the rotated/trellis domain, so routed-expert weights never leave their ~6.2 GB packed-byte form) — it is not something Phase B's loader is expected to solve, and no attempt was made to redesign it into a streaming/lazy-per-layer architecture to work around the RAM ceiling (that redesign is Phase C's job).
+
+**Phase B validation coverage, all against the real fixture (`DOTLLM_MACH1_35B_DIR`, skip-if-absent), no synthetic substitutes:**
+
+| Tier | Test | What it proves |
+|---|---|---|
+| Config extraction | `Mach1PackedCheckpointLoaderTests.ConfigExtractor_RealConfigJson_MatchesExpectedShape` | Nested `text_config` hoist + `vision_config` skip against the real `config.json`; GDN/MoE/RoPE/HybridLayout fields match the known real values. |
+| NE spine (GDN) | `DecodeNeTensor_GdnLayer0_ProducesFiniteDeterministicValues` | `linear_attn.{in_proj_qkv,in_proj_z,out_proj}` + shared-expert decode to finite, deterministic (decode-twice, bit-identical) tensors. |
+| NE spine (full-attn) | `DecodeNeTensor_FullAttnLayer3_ProducesFiniteDeterministicValues` | `self_attn.{q,k,v,o}_proj` (Q+Gate fused width confirmed against the real file's own `dims` metadata, not assumed) decode the same way. |
+| Extras (norms/scalars) | `ExtrasReader_RealExtrasSafetensors_ResolvesLayerAndModelLevelNorms` | GDN-vs-full-attention key presence (`linear_attn.*` XOR `self_attn.q_norm`/`k_norm`) matches `layer_types`; bf16 upcast is finite. |
+| Routed experts | `DecodeExpertProjection_Layer0Expert0_MatchesVendorGolden_ThroughOrchestrationLayer` | `Mach1PackedCheckpoint`'s orchestration (not just the bare Phase A primitive) reproduces the vendor's `goldens/L0_e0_fp32.safetensors` bit-exactly. |
+| LM head (`int5g64_packed`) | `DecodeHead_RealFixture_FiniteDeterministic_NoChunkBoundaryGaps` | All 8 `head_c{0..7}of8.safetensors` chunks assemble into a finite, deterministic `[248320, 2048]` table with no all-zero/stale row at any of the 8 chunk-row boundaries (31,040 rows/chunk, matching each chunk's own declared dims). |
+| Embeddings (affine int4 + exceptions) | `DecodeEmbedding_RealFixture_FiniteDeterministic_AndAppliesExceptionOverrides` | Full `[248320, 2048]` table decodes finite/deterministic, AND a sample of the 246,714 exact-overwrite exceptions is cross-checked against the raw `exc_idx`/`exc_bits` tensors via the same bf16-bit-pattern formula the decoder uses — proves the override path actually fires, not just the group-quant fallback. |
+| Full per-layer weight mapping (GDN) | `Mach1SingleLayerLoadTests.LoadLayerFromMach1_GdnLayer0_BuildsCorrectlyShapedWeights` | The complete `LoadLayerFromMach1`/`LoadGdnLayerFromMach1`/`LoadMoeLayerFromMach1` wiring (not the lower-level tier decoders in isolation) builds a correctly-shaped `Qwen3MoeLayerWeights` bundle for a GDN layer, with `W1[0]` (expert 0 gate) cross-checked bit-exact against the vendor golden. ~9.5 min (256-expert single-threaded CPU decode). |
+| Full per-layer weight mapping (full-attn) | `LoadLayerFromMach1_FullAttnLayer3_BuildsCorrectlyShapedWeights` | Same, for a full-attention layer — confirms `LoadFullAttnLayerFromMach1`'s shape wiring. |
+| Chat template | `Mach1ChatTemplateTests` (3 tests) | The real `chat_template.jinja`'s `{% macro render_content %}` (macro support landed separately, issue #273) renders correctly: simple turns, system+history ordering, tool-call round-trip. |
+
+**Not yet run: the full public `LoadFromMach1Packed` entry point end-to-end** (all 40 layers + embed + head in one call) and consequently **full-model generation / top-1 token agreement vs. `DOTLLM_QWEN36_A3B_Q6_K_XL_GGUF` / perplexity delta**. Every tier and both layer kinds are independently validated above (including bit-exactness against the vendor golden where a golden exists); what remains untested is purely the "all 40 layers simultaneously resident" scale, which is gated on the ~70-128 GB RAM this section describes, not on any known defect.
+
+### Mach-1 fused additive expert GEMV (issue #266, Phase C — CPU, partial)
+
+**Status: CPU-only, correctness-validated on real weights, not yet wired into the forward pass; CUDA/Vulkan not started.** This is the actual point of the codec: computing `y = W·x` directly from the packed trellis stream so the routed-expert weights (6.21 of 7.53 GB) never leave their packed-byte form, instead of decoding to dense fp32 first (which is what Phase A/B's `DecodeExpertProjection` does, and what makes full-model dense-decode need ~70-128 GB — see above).
+
+**Derivation.** `Mach1TrellisWeightDecoder.Decode` builds the dense weight as `W = diag(sv) · H_m · [wave_gamma ⊙ Wunit] · H_n · diag(su)` (crop omitted). For a GEMV `y = W·x`, both orthonormal (hence symmetric) Hadamard transforms and `diag(su)` move onto the activation side by associativity instead of being baked into a materialized weight matrix:
+
+```
+y = diag(sv) · H_m · [wave_gamma ⊙ Wunit] · x'      where x' = H_n(su ⊙ x)
+```
+
+`Mach1FusedExpertGemv.Compute` (`src/DotLLM.Models/Quantization/Mach1/Mach1FusedExpertGemv.cs`) implements exactly this: (1) pad + scale the activation by `su` and Hadamard-transform it — `O(n log n)`, once per call; (2) unpack each 16×16 tile's trellis states and immediately multiply-accumulate its lattice values against `x'` — the trellis is never written to a dense `[m,n]` buffer, matching `codec.json`'s own documented `kernel_contract` (per-weight ops are add/subtract-dominated on the exact integer lattice, `wave_gamma` applied at tile granularity); (3) Hadamard-transform the accumulated `[m]`-length result and scale by `sv`, crop to `m0`. `Mach1ExpertLayerDecoderV3T.GemvExpertProjection` / `Mach1PackedCheckpoint.GemvExpertProjection` expose it with the identical key-lookup/su/sv/gamma extraction as `DecodeExpertProjection`, so the two paths are directly A/B-comparable.
+
+**Correctness**, both synthetic (fixture-free, `Mach1FusedExpertGemvTests`, non-power-of-two/non-square/`Mb != Nb` shapes with production `cb_params`) and against real fixture weights (`Mach1FusedExpertGemvRealFixtureTests.GemvExpertProjection_Expert0AllProjections_MatchesDenseDecodeThenMatVec`, layer 0 / expert 0, all three projections), comparing the fused path against dense-decode-then-matvec (`DecodeExpertProjection` + a plain row-dot-product loop) as reference:
+
+| Case | max abs error | max rel error |
+|---|---|---|
+| Synthetic, m0=16 n0=16 (single tile) | 3.6e-6 | 5.1e-5 |
+| Synthetic, m0=48 n0=20 | 3.8e-6 | 6.1e-6 |
+| Synthetic, m0=20 n0=48, with gamma | 8.1e-6 | 2.2e-6 |
+| Synthetic, m0=20 n0=48, no gamma | 5.7e-6 | 1.5e-5 |
+| Real fixture, expert 0 gate [512×2048] | 1.1e-6 | 2.3e-3 |
+| Real fixture, expert 0 up [512×2048] | 7.0e-7 | 4.0e-4 |
+| Real fixture, expert 0 down [2048×512] | 2.8e-7 | 1.5e-4 |
+
+All errors are consistent with ordinary fp32 reassociation noise (the two paths sum the same terms in different orders — direct row-dot-product vs. Hadamard-butterfly reformulation), not a structural bug; a real transpose/index/gamma error produces errors many orders of magnitude larger, which is what these tests are actually built to catch (see the test docstrings for why the shapes are chosen).
+
+**Performance** (`Mach1FusedExpertGemvRealFixtureTests.Perf_InterleavedAB_DenseDecodeVsFusedGemv_Expert0Gate`, interleaved A/B, 10 trials, real layer-0/expert-0 gate weights, this project's `MtpBenchProfile`-style methodology): dense-decode-then-matvec median **107.3 ms/call**, fused GEMV median **35.2 ms/call** — **~3.0x faster**, single-threaded, scalar (no SIMD in either path). This is not primarily a memory-vs-compute tradeoff: the fused path is asymptotically cheaper because it Hadamard-transforms one `n`-length vector and one `m`-length vector (`O(n log n + m log m)`) instead of Hadamard-transforming *every row* of the dense `[m,n]` matrix twice, once per axis (`O(m·n·log n + n·m·log m)`), plus it skips the dense path's two full-matrix transpose passes.
+
+**Resident memory** (`Mach1FusedExpertGemvRealFixtureTests.Memory_DenseDecodeRetained_vs_FusedDiscarded_NExperts`, real layer-0 weights, 32 experts' gate projection = one full chunk, managed-heap growth via `GC.GetTotalMemory` bracketing each phase): decoding and retaining 32 dense `[512,2048]` fp32 arrays grew the heap by **138.9 MB** (theoretical 128.0 MB, difference is array-object/GC overhead); computing the fused GEMV for the same 32 experts and discarding each result grew it by **1.0 MB**. This is a micro-scale, single-projection/single-layer measurement (RAM-budget-appropriate for this session, not a full-model run); the model-wide claim — 256 experts × 3 projections × 40 layers dense fp32 (~64 GB) vs. 6.21 GB packed-resident — is issue #266's own figure, not independently re-measured here, but this test's per-expert delta (≈4.3 MB retained per dense `[512,2048]` projection vs. ≈0 retained for fused) is directly consistent with it by simple multiplication.
+
+**What Phase C still needs to close issue #266:**
+
+- **CUDA and Vulkan implementations**, each validated against this same dense-decode reference (issue #266 explicitly requires all three backends; this session is CPU-only per its own scope, gated on the CPU measurement above per the issue's phasing).
+- **SIMD vectorization of the CPU inner loop.** `Mach1FusedExpertGemv.Compute` is scalar; the accumulate loop (`temp[row] += w * xPrime[col]`) and the trellis bit-unpack are both unvectorized. The ~3x win above is from the algorithmic reformulation alone.
+- **The `kernel_contract`'s documented perf reordering**: accumulate each tile's raw lattice-value·`x'` partial sum first (add/subtract-dominated, since `Wunit` is an exact integer lattice), then apply the tile's single `wave_gamma` multiply to the partial sum ("~1 multiply per 16 weights") instead of per-element — algebraically identical, not yet implemented.
+- **Wiring into the actual MoE forward pass** (`Qwen3MoeHybridTransformerModel`'s FFN dispatch) — this pass validates the kernel in isolation against real weights, not end-to-end token generation through the fused path. The forward pass currently uses `LoadFromMach1Packed`'s dense-decode-then-cache route only.
+- **The other three tiers' stepping-stone completion** (NE spine 0.70 GB, LM head 0.33 GB, embeddings 0.29 GB) — issue #266's permitted stepping-stone decodes these to dense/Q8_0 at load while only the routed-expert GEMV fuses; that decode-at-load path already exists from Phase B, it just hasn't been threaded into a real "packed-resident" load mode (currently everything, including these three tiers, decodes to dense fp32 the same way, so the ~7.5 GB headline number is not yet achievable end-to-end).
+- **Model-scale (not per-expert) resident-memory and perplexity/top-1 measurement**, gated on the ~70-128 GB RAM issue #266 already documents as needed for a full dense-decode baseline run, or on the forward-pass wiring above making a dense baseline unnecessary.

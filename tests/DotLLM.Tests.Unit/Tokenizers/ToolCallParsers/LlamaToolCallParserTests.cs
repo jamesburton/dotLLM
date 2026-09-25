@@ -17,7 +17,7 @@ public class LlamaToolCallParserTests
         Assert.NotNull(calls);
         Assert.Single(calls);
         Assert.Equal("get_weather", calls[0].FunctionName);
-        Assert.Contains("Paris", calls[0].Arguments);
+        Assert.Contains("Paris", calls[0].Arguments, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -29,7 +29,7 @@ public class LlamaToolCallParserTests
 
         Assert.NotNull(calls);
         // Arguments field should contain the parameters JSON
-        Assert.Contains("dotnet", calls![0].Arguments);
+        Assert.Contains("dotnet", calls![0].Arguments, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -153,6 +153,6 @@ public class LlamaToolCallParserTests
         var calls = _parser.TryParse(text);
 
         Assert.NotNull(calls);
-        Assert.Contains("test", calls![0].Arguments);
+        Assert.Contains("test", calls![0].Arguments, StringComparison.Ordinal);
     }
 }

@@ -1,0 +1,153 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+// I2_S (BitNet b1.58 ternary) prefill GEMM — REGISTER-BLOCKED + INT8 WEIGHT TILE.
+//
+//   C[N, M] = B[N, K] @ W_i2s[M, K]^T      with W_i2s dequantized on the fly.
+//
+// Same tiling as the production kernel; the only change is that sharedW is stored
+// as int8 rather than F16. sharedB stays F32.
+//
+// Direct follow-on from the finding in issue #229. Elevated VTune showed the GEMM
+// is memory-latency-bound (86.9% XVE stalled at 73.3% occupancy), and the ladder
+// of experiments identified SLM READ TRAFFIC VOLUME as the specific cause:
+//
+//   f32 weight tile (original)  16 KB, 4 bytes/access   baseline
+//   f16 weight tile (shipped)    8 KB, 2 bytes/access   1.22-1.50x
+//   int8 weight tile (here)      4 KB, 1 byte /access   <- quarters vs f32
+//
+// If the win really does scale with bytes moved through SLM, this should extend
+// the F16 gain rather than plateau. If it plateaus, the traffic model is
+// incomplete and something else takes over at this point — either result sharpens
+// the picture.
+//
+// BIT-EXACT, for the same reason F16 was: the staged values are raw ternary
+// {-1, 0, +1}, all exactly representable in int8, so float(int8_t(v)) == v and
+// neither the products nor the accumulation order change. Activations are never
+// rounded because sharedB stays F32.
+//
+// Requires GL_EXT_shader_8bit_storage (8-bit types in shared memory). The kernel
+// is gated on that at pipeline-creation time; devices without it keep the F16 tile.
+//
+// Shared: sharedB 32x128 F32 (16 KB) + sharedW 32x128 int8 (4 KB) = 20 KB.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;             // multiple of 128
+    uint N;
+    uint blocksPerRow;  // = K / 128
+    uint rowUints;      // unused here; kept for push-constant layout parity
+} pc;
+
+const uint TILE_M = 32u;
+const uint TILE_N = 32u;
+const uint SUB    = 16u;          // micro-tile stride (= workgroup dim)
+const uint I2S_BLOCK = 128u;      // K-chunk = one I2_S block
+const uint I2S_BLOCK_BYTES = 32u;
+
+shared float sharedB[TILE_N * I2S_BLOCK];   // 32 x 128 token tile
+shared int8_t sharedW[TILE_M * I2S_BLOCK];   // 32 x 128 dequantised weight tile
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+void main() {
+    uint lx = gl_LocalInvocationID.x;   // 0..15 -> weight rows {lx, lx+16}
+    uint ly = gl_LocalInvocationID.y;   // 0..15 -> token rows  {ly, ly+16}
+    uint tid = ly * SUB + lx;           // 0..255
+
+    uint mBase = gl_WorkGroupID.x * TILE_M;
+    uint tBase = gl_WorkGroupID.y * TILE_N;
+
+    uint rowBytes = pc.K >> 2u;        // K/4 packed bytes per row (= blocksPerRow * 32)
+
+    // Per-tensor float32 scale at the weight-buffer tail (byte offset M*(K/4)),
+    // word-aligned because K is a multiple of 128.
+    uint scaleByteOff = pc.M * rowBytes;
+    float scale = uintBitsToFloat(weight[scaleByteOff >> 2u]);
+
+    float acc00 = 0.0;   // (token ly,      weight lx)
+    float acc01 = 0.0;   // (token ly,      weight lx+16)
+    float acc10 = 0.0;   // (token ly+16,   weight lx)
+    float acc11 = 0.0;   // (token ly+16,   weight lx+16)
+
+    for (uint blk = 0u; blk < pc.blocksPerRow; blk++) {
+        uint kBase = blk * I2S_BLOCK;
+
+        // ── 1. Stage sharedB[TILE_N, 128] (32x128 floats). 256 threads load 16 each. ──
+        for (uint i = 0u; i < 16u; i++) {
+            uint bIdx = tid * 16u + i;         // 0..4095
+            uint row  = bIdx >> 7u;            // 0..31  (token within tile)
+            uint col  = bIdx & 127u;           // 0..127 (element within block)
+            uint tGlobal = tBase + row;
+            sharedB[bIdx] = (tGlobal < pc.N) ? b[tGlobal * pc.K + kBase + col] : 0.0;
+        }
+
+        // ── 2. Dequantise sharedW[TILE_M, 128]. 32 rows x 32 bytes = 1024 bytes; ──
+        //       256 threads decode 4 bytes each (4 ternary codes per byte).
+        for (uint i = 0u; i < 4u; i++) {
+            uint byteFlat = tid * 4u + i;      // 0..1023
+            uint rowLocal = byteFlat >> 5u;    // 0..31  (weight row within tile)
+            uint gp       = byteFlat & 31u;    // 0..31  (byte within block)
+            uint mGlobal  = mBase + rowLocal;
+            uint sBase    = rowLocal * I2S_BLOCK;
+
+            if (mGlobal < pc.M) {
+                uint pk = readByte(mGlobal * rowBytes + blk * I2S_BLOCK_BYTES + gp);
+                sharedW[sBase + gp]        = int8_t(int((pk >> 6u) & 3u) - 1);
+                sharedW[sBase + gp + 32u]  = int8_t(int((pk >> 4u) & 3u) - 1);
+                sharedW[sBase + gp + 64u]  = int8_t(int((pk >> 2u) & 3u) - 1);
+                sharedW[sBase + gp + 96u]  = int8_t(int( pk        & 3u) - 1);
+            } else {
+                sharedW[sBase + gp]        = int8_t(0);
+                sharedW[sBase + gp + 32u]  = int8_t(0);
+                sharedW[sBase + gp + 64u]  = int8_t(0);
+                sharedW[sBase + gp + 96u]  = int8_t(0);
+            }
+        }
+
+        barrier();
+
+        // ── 3. Partial dot products for this K-chunk — 4 loads feed 4 MACs. ──
+        uint bOff0 = ly * I2S_BLOCK;
+        uint bOff1 = (ly + SUB) * I2S_BLOCK;
+        uint wOff0 = lx * I2S_BLOCK;
+        uint wOff1 = (lx + SUB) * I2S_BLOCK;
+
+        for (uint j = 0u; j < I2S_BLOCK; j++) {
+            float b0 = sharedB[bOff0 + j];
+            float b1 = sharedB[bOff1 + j];
+            float w0 = float(sharedW[wOff0 + j]);   // exact: ternary is lossless in int8
+            float w1 = float(sharedW[wOff1 + j]);
+            acc00 += b0 * w0;
+            acc01 += b0 * w1;
+            acc10 += b1 * w0;
+            acc11 += b1 * w1;
+        }
+
+        barrier();
+    }
+
+    uint m0 = mBase + lx;
+    uint m1 = mBase + lx + SUB;
+    uint t0 = tBase + ly;
+    uint t1 = tBase + ly + SUB;
+
+    if (t0 < pc.N) {
+        if (m0 < pc.M) c[t0 * pc.M + m0] = acc00 * scale;
+        if (m1 < pc.M) c[t0 * pc.M + m1] = acc01 * scale;
+    }
+    if (t1 < pc.N) {
+        if (m0 < pc.M) c[t1 * pc.M + m0] = acc10 * scale;
+        if (m1 < pc.M) c[t1 * pc.M + m1] = acc11 * scale;
+    }
+}

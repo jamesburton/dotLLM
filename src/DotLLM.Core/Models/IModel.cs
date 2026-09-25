@@ -1,4 +1,5 @@
 using DotLLM.Core.Attention;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Tensors;
 
 namespace DotLLM.Core.Models;
@@ -39,4 +40,564 @@ public interface IModel : IDisposable
     /// <param name="kvCache">Optional KV-cache. When null, behaves identically to the uncached forward pass.</param>
     /// <returns>Logits tensor of shape [1, vocab_size] for the last token.</returns>
     ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache);
+
+    /// <summary>
+    /// Runs a forward pass with optional KV-cache, with an explicit hint about whether the caller
+    /// only needs the last input position's logits.
+    /// </summary>
+    /// <remarks>
+    /// <para>Some callers (e.g. <c>BenchRunner</c>'s untimed prefill / <c>--depth</c> context
+    /// extension) submit many tokens in one call purely to advance the KV-cache/hidden state, and
+    /// only ever read the LAST position's logits (via argmax) — never the intermediate positions'.
+    /// Others (e.g. speculative-decoding verification, which submits the last-accepted token plus
+    /// K draft tokens in one call and inspects EVERY position's logits to accept/reject each draft)
+    /// genuinely need every position. The model cannot tell these two cases apart from
+    /// <paramref name="tokenIds"/>/<paramref name="kvCache"/> alone, so callers that only want the
+    /// last row must say so explicitly via <paramref name="lastTokenLogitsOnly"/>.</para>
+    /// <para>The default implementation ignores the hint and forwards to
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>, so every
+    /// existing implementor keeps its current behavior unless it explicitly overrides this
+    /// overload to act on the hint (currently the CUDA <c>Qwen3HybridDense</c> / <c>Qwen3MoeHybrid</c>
+    /// models, whose LM-head Logits scratch buffer scales with <c>seqLen × vocab_size</c> and can be
+    /// large enough at high <c>seqLen</c> to matter for VRAM headroom — see issue #185).</para>
+    /// </remarks>
+    /// <param name="tokenIds">Input token IDs for this step.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    /// <param name="kvCache">Optional KV-cache. When null, behaves identically to the uncached forward pass.</param>
+    /// <param name="lastTokenLogitsOnly">
+    /// When true AND <paramref name="tokenIds"/> has more than one token, implementations MAY
+    /// return logits for only the last position (shape [1, vocab_size]) instead of every position.
+    /// Ignored (always full per-position logits) when false — the safe default for any caller that
+    /// hasn't been audited to only ever read the last row. Has no effect when
+    /// <paramref name="tokenIds"/>.Length is already 1.
+    /// </param>
+    /// <returns>
+    /// Logits tensor of shape [1, vocab_size] when <paramref name="lastTokenLogitsOnly"/> is honored,
+    /// otherwise [seq, vocab_size] for all input positions (same as the non-hinted overload).
+    /// </returns>
+    ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                    IKvCache? kvCache, bool lastTokenLogitsOnly)
+        => Forward(tokenIds, positions, deviceId, kvCache);
+
+    /// <summary>
+    /// Runs a forward pass with optional KV-cache and an optional LoRA adapter.
+    /// When <paramref name="adapter"/> is non-null and supplies <c>(layer, proj)</c>
+    /// factor pairs that match the current model's projection sites, the runtime
+    /// adds the LoRA delta <c>alpha × (x · B) · A</c> to each adapted projection.
+    /// </summary>
+    /// <param name="tokenIds">Input token IDs for this step.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    /// <param name="kvCache">Optional KV-cache. When null, behaves identically to the uncached forward pass.</param>
+    /// <param name="adapter">
+    /// Optional LoRA adapter. When null, behaves byte-equivalently to the
+    /// adapter-less <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
+    /// overload (default implementation forwards to it).
+    /// </param>
+    /// <returns>Logits tensor of shape [seq, vocab_size] for all input positions.</returns>
+    ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                    IKvCache? kvCache, ILoraAdapter? adapter)
+        => Forward(tokenIds, positions, deviceId, kvCache);
+
+    /// <summary>
+    /// Runs a forward pass with an explicit attention-mask mode (causal / bidirectional / hybrid).
+    /// </summary>
+    /// <remarks>
+    /// <para>The default implementation forwards to
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, ILoraAdapter?)"/>
+    /// when <paramref name="maskSpec"/> is the causal default, so EVERY existing implementor keeps the
+    /// byte-identical autoregressive behaviour with no code change. Implementations that do not support
+    /// non-causal masking throw <see cref="NotSupportedException"/> for the non-causal modes via this
+    /// default — only backends that implement bidirectional / hybrid attention (currently the CPU
+    /// <c>TransformerModel</c>) override this method.</para>
+    /// </remarks>
+    /// <param name="tokenIds">Input token IDs for this step.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    /// <param name="kvCache">Optional KV-cache. When null, behaves identically to the uncached forward pass.</param>
+    /// <param name="adapter">Optional LoRA adapter. When null, behaves like the adapter-less overload.</param>
+    /// <param name="maskSpec">Attention-mask mode. Defaults to <see cref="AttentionMaskSpec.Causal"/>.</param>
+    /// <returns>Logits tensor of shape [seq, vocab_size] for all input positions.</returns>
+    ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                    IKvCache? kvCache, ILoraAdapter? adapter, AttentionMaskSpec maskSpec)
+    {
+        if (!maskSpec.IsCausal)
+            throw new NotSupportedException(
+                $"{GetType().Name} does not support non-causal attention (mask mode {maskSpec.Mode}). " +
+                "Only the CPU TransformerModel currently implements bidirectional / hybrid attention.");
+        return Forward(tokenIds, positions, deviceId, kvCache, adapter);
+    }
+
+    /// <summary>
+    /// Supplies the DiffusionGemma self-conditioning (SC) state consumed by the NEXT
+    /// <c>Forward</c> over a <see cref="AttentionMaskSpec.Hybrid(int)"/> canvas: the
+    /// PREVIOUS denoise step's canvas-region logits (post-softcap) plus the SC gate.
+    /// </summary>
+    /// <remarks>
+    /// <para>On a diffusion-gemma model with <c>scUse &gt; 0</c> and a non-empty
+    /// <paramref name="prevCanvasLogits"/>, the next forward replaces the canvas region's
+    /// plain <c>rms_noscale(scaled_embed)</c> with <c>rms_noscale(scaled_embed + sc_sig)</c>,
+    /// where <c>sc_sig</c> is a gated GeGLU MLP over a soft token-embedding of the previous
+    /// logits (the trained self-conditioning denoiser feedback). On step 0 of a canvas the
+    /// generator passes <c>scUse = 0</c> (and may pass an empty span), reproducing the
+    /// zero-SC first-step behaviour byte-for-byte.</para>
+    /// <para>The default implementation is a no-op — only the CPU <c>TransformerModel</c>
+    /// implements diffusion self-conditioning. Single-threaded per generation (the model's
+    /// forward state is instance-scoped), matching the existing mask/adapter state contract.</para>
+    /// </remarks>
+    /// <param name="prevCanvasLogits">Previous step's canvas-region logits, row-major
+    /// <c>[canvasLen, vocabSize]</c> (post-softcap). Empty when <paramref name="scUse"/> is 0.</param>
+    /// <param name="canvasLen">Number of canvas rows in <paramref name="prevCanvasLogits"/>.</param>
+    /// <param name="scUse">Self-conditioning gate: 0 on the first denoise step (zero-SC), 1 thereafter.</param>
+    void SetDiffusionSelfCond(ReadOnlySpan<float> prevCanvasLogits, int canvasLen, float scUse) { }
+
+    /// <summary>
+    /// True when this model implements the DiffusionGemma prompt-KV (PKV) prefill/decode
+    /// cache — the throughput optimisation that captures the prompt's per-layer K/V once
+    /// (<see cref="DiffusionPrefillPromptKv"/>) and reuses them on every denoise step
+    /// (<see cref="DiffusionDecodeWithPromptKv"/>) instead of recomputing the prompt prefix.
+    /// Default false: callers fall back to the cacheless unified <c>[prompt | canvas]</c> forward.
+    /// </summary>
+    bool SupportsDiffusionPromptKv => false;
+
+    /// <summary>
+    /// PKV <b>prefill</b>: runs a prompt-only causal forward (over the <paramref name="promptTokens"/>)
+    /// and captures each transformer layer's post-norm/post-rope prompt <c>K</c> and weight-less-normed
+    /// prompt <c>V</c> into <paramref name="store"/> for reuse by <see cref="DiffusionDecodeWithPromptKv"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>The captured K/V are byte-equivalent to the prompt rows the cacheless unified forward would
+    /// compute (the prompt embedding is fixed across denoise steps, and K/V projections do not depend on
+    /// the attention mask). On V-less global layers <c>V</c> is the raw <c>K</c> projection, exactly as
+    /// the unified path. The default implementation throws — only models reporting
+    /// <see cref="SupportsDiffusionPromptKv"/> implement it.</para>
+    /// </remarks>
+    /// <param name="promptTokens">Prompt token ids (the causal prefix to cache).</param>
+    /// <param name="positions">Position indices for the prompt tokens (typically <c>0..P-1</c>).</param>
+    /// <param name="store">Destination prompt-KV store; resized and filled for the current prompt.</param>
+    void DiffusionPrefillPromptKv(
+        ReadOnlySpan<int> promptTokens, ReadOnlySpan<int> positions, DiffusionPromptKvStore store)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not support DiffusionGemma prompt-KV prefill.");
+
+    /// <summary>
+    /// PKV <b>decode</b>: runs a canvas-only forward (over the <paramref name="canvasTokens"/>, length C)
+    /// that, for each layer, computes fresh canvas Q/K/V and attends over the concatenation
+    /// <c>[cached prompt K/V | fresh canvas K/V]</c> under a rectangular bidirectional mask
+    /// (a canvas query attends all prompt keys + all canvas keys, clipped by the per-layer sliding
+    /// window). The canvas region embedding (weight-less rms + self-conditioning) and the canvas
+    /// <c>layer_output_scale</c> apply to all C rows exactly as the unified forward.
+    /// </summary>
+    /// <remarks>
+    /// <para>Produces canvas logits byte-equivalent to the cacheless unified forward's canvas rows — a
+    /// pure optimisation. The canvas RoPE positions are <c>promptLen + 0 .. promptLen + C - 1</c>
+    /// (supplied via <paramref name="positions"/>). Self-conditioning is supplied beforehand via
+    /// <see cref="SetDiffusionSelfCond"/>, identical to the unified path. The default implementation
+    /// throws — only models reporting <see cref="SupportsDiffusionPromptKv"/> implement it.</para>
+    /// </remarks>
+    /// <param name="canvasTokens">Canvas token ids for this step (length C).</param>
+    /// <param name="positions">Canvas RoPE positions (<c>promptLen .. promptLen+C-1</c>).</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    /// <param name="store">Prompt-KV store filled by a prior <see cref="DiffusionPrefillPromptKv"/>.</param>
+    /// <returns>Logits tensor of shape <c>[C, vocabSize]</c> for the canvas positions.</returns>
+    ITensor DiffusionDecodeWithPromptKv(
+        ReadOnlySpan<int> canvasTokens, ReadOnlySpan<int> positions, int deviceId,
+        DiffusionPromptKvStore store)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not support DiffusionGemma prompt-KV decode.");
+
+    /// <summary>
+    /// True when this model's per-sequence forward carries recurrent state (SSM / linear-attention)
+    /// that the caller must supply per request, beyond the KV-cache. Default <c>false</c>.
+    /// </summary>
+    /// <remarks>
+    /// Recurrent architectures (Mamba-3, Qwen3-MoE-Hybrid GDN, Nemotron-H) require a per-sequence
+    /// <see cref="SequenceForwardRequest.MambaState"/> / <see cref="SequenceForwardRequest.GdnState"/>
+    /// on every request when <see cref="ForwardBatch"/> is called with 2+ entries (a null state
+    /// throws or corrupts cross-sequence recurrence). The continuous-batch scheduler does not yet
+    /// allocate/thread that state, so it gates batched decode on this flag: <c>false</c> ⇒ a stateless
+    /// (dense KV-only) model whose decode can be safely fused via <see cref="ForwardBatch"/>;
+    /// <c>true</c> ⇒ keep the per-sequence decode loop. Threading recurrent state to lift this is a
+    /// follow-up.
+    /// </remarks>
+    bool RequiresPerSequenceState => false;
+
+    /// <summary>
+    /// Re-zeroes any <em>model-owned</em> recurrent state, so the next <c>Forward</c> that does not
+    /// carry a caller-threaded state container starts a genuinely fresh sequence.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Why this exists.</b> The uncached
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int)"/> overload takes no state
+    /// container, so a recurrent architecture falls back to a model-owned default state (the
+    /// <c>_gdnCache</c> / <c>_ssmCache</c> instance). That state persists across calls, which is
+    /// correct for prefill-then-decode of one sequence and <b>silently wrong</b> for a caller that
+    /// treats each forward as an independent sequence. Perplexity scoring is exactly such a caller —
+    /// every window is an independent sequence, and it cannot use <see cref="ForwardBatch"/> (whose
+    /// <see cref="SequenceForwardRequest.KvCache"/> is required and non-nullable) to thread state
+    /// itself. Without this hook the throwaway probe forward and every preceding window leaked into
+    /// the scored window's state and corrupted the reported number with no error (issue #261).</para>
+    /// <para><b>Why the default throws for recurrent models.</b> A silent no-op default would let a
+    /// future recurrent architecture inherit exactly the bug this method fixes, and the failure mode
+    /// is a plausible-looking wrong number rather than an exception. So the default is a no-op only
+    /// for stateless architectures; a model that declares <see cref="RequiresPerSequenceState"/>
+    /// must override this method — even if only to document that its uncached forward allocates a
+    /// scratch state per call and therefore has nothing to reset.</para>
+    /// <para>Idempotent, and safe to call on a stateless model (does nothing). Does not touch
+    /// caller-threaded state containers — those are reset via
+    /// <see cref="IRecurrentSequenceState.Reset"/> by whoever owns them.</para>
+    /// </remarks>
+    /// <exception cref="NotSupportedException">
+    /// The model declares <see cref="RequiresPerSequenceState"/> but has not overridden this method.
+    /// </exception>
+    void ResetSequenceState()
+    {
+        if (RequiresPerSequenceState)
+            throw new NotSupportedException(
+                $"{GetType().Name} declares {nameof(RequiresPerSequenceState)} but does not implement " +
+                $"{nameof(ResetSequenceState)}(). A recurrent model must re-zero its model-owned " +
+                "recurrent state (or explicitly document that it owns none), otherwise callers that " +
+                "score independent sequences through the uncached Forward — e.g. perplexity — silently " +
+                "leak state across sequences. See issue #261.");
+    }
+
+    /// <summary>
+    /// True when this model can have its per-sequence recurrent state <em>threaded by the caller</em>:
+    /// the caller allocates one container per sequence via <see cref="CreateSequenceState"/> and supplies
+    /// it on every <see cref="ForwardBatch"/> request (via <see cref="SequenceForwardRequest.MambaState"/> /
+    /// <see cref="SequenceForwardRequest.GdnState"/>). Default <c>false</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>For a recurrent model (<see cref="RequiresPerSequenceState"/> = <c>true</c>) this is what lets
+    /// the continuous-batch scheduler fuse its decode/prefill via <see cref="ForwardBatch"/> instead of the
+    /// per-sequence loop: when <c>true</c>, the scheduler allocates and threads a state per sequence and
+    /// dispatches everything through <see cref="ForwardBatch"/> (the only entrypoint that carries the state),
+    /// which also fixes the latent cross-sequence corruption of running &gt;1 concurrent recurrent sequence
+    /// against a shared model-owned default state. When <c>false</c> on a recurrent model (e.g. Nemotron-H,
+    /// whose SSM state has no <see cref="IRecurrentSequenceState"/> container yet), the scheduler keeps the
+    /// per-sequence forward loop. A non-recurrent (dense) model leaves this <c>false</c> and ignores it.</para>
+    /// </remarks>
+    bool SupportsThreadedSequenceState => false;
+
+    /// <summary>
+    /// Allocates a fresh, zero-initialised per-sequence recurrent-state container for this model, or
+    /// <see langword="null"/> when the model carries no caller-threadable recurrent state.
+    /// </summary>
+    /// <remarks>
+    /// Returns non-null exactly when <see cref="SupportsThreadedSequenceState"/> is <c>true</c> — a
+    /// recurrent host returns its concrete <see cref="IMambaState"/> / <see cref="IGdnState"/> sized for
+    /// the model's recurrent layers. The caller owns the returned container's lifetime (dispose when the
+    /// sequence finishes) and supplies it on that sequence's <see cref="ForwardBatch"/> requests. The
+    /// default implementation returns <see langword="null"/>.
+    /// </remarks>
+    IRecurrentSequenceState? CreateSequenceState() => null;
+
+    /// <summary>
+    /// True when this model's MODEL-OWNED recurrent state (the state an explicit-state-less
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/> call implicitly
+    /// threads and advances — see <see cref="ResetSequenceState"/>) can be checkpointed and
+    /// restored via <see cref="CheckpointRecurrentState"/> / <see cref="RestoreRecurrentState"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Why this exists (issue #287).</b> Speculative decoding (<c>SpeculativeDecoder</c> /
+    /// <c>MtpSpeculativeDecoder</c>) verifies K drafted tokens via a single batched
+    /// <c>Forward</c> call BEFORE knowing which of them will be accepted. For position-indexed
+    /// attention KV-cache, a rejected token's cache entries are simply unreachable once
+    /// <see cref="IKvCache"/> is rolled back to the accepted boundary. But a recurrent trunk layer
+    /// (Gated DeltaNet, Mamba) has no position addressing — every input token mutates the running
+    /// state in place, in call order, regardless of the position label attached to it. Once the
+    /// batched verify <c>Forward</c> has run, a rejected token's contribution to that state has
+    /// already happened and cannot be addressed away the way stale KV-cache entries can.</para>
+    /// <para>A model that reports <see langword="true"/> here lets the speculative decoders
+    /// checkpoint state immediately before a batched verify call and, if any drafted token in that
+    /// batch is rejected, restore the checkpoint and re-forward only the tokens that turned out to
+    /// be genuinely accepted — bringing the recurrent state to exactly the state it would be in had
+    /// the rejected tokens never been drafted.</para>
+    /// <para>Default <see langword="false"/>: models that declare <see cref="RequiresPerSequenceState"/>
+    /// but have not implemented this pair (e.g. <c>Qwen3MoeHybridTransformerModel</c>,
+    /// <c>Mamba3TransformerModel</c> as of this writing — neither currently has a real speculative-
+    /// decoding call path, since MTP self-speculation requires <see cref="SupportsMtp"/> and today
+    /// only the GDN-bearing <c>Qwen3HybridDenseTransformerModel</c> family implements that) keep
+    /// today's documented behavior unchanged rather than silently corrupting an un-audited model or
+    /// throwing where nothing previously threw. Implementing this pair for those architectures if
+    /// they ever gain a speculative-decoding call path is a follow-up, not a blocker.</para>
+    /// </remarks>
+    bool SupportsRecurrentStateCheckpoint => false;
+
+    /// <summary>
+    /// Captures an opaque snapshot of this model's current model-owned recurrent state (see
+    /// <see cref="SupportsRecurrentStateCheckpoint"/>). Returns <see langword="null"/> when
+    /// <see cref="SupportsRecurrentStateCheckpoint"/> is <see langword="false"/>.
+    /// </summary>
+    /// <remarks>
+    /// The returned object is owned by the caller until passed to
+    /// <see cref="RestoreRecurrentState"/> (or discarded, when the round it was captured for turns
+    /// out not to need a rollback). Implementations that allocate for the snapshot (e.g. cloning a
+    /// GDN state buffer) do so fresh per call.
+    /// </remarks>
+    object? CheckpointRecurrentState() => null;
+
+    /// <summary>
+    /// Restores model-owned recurrent state from a snapshot previously returned by
+    /// <see cref="CheckpointRecurrentState"/>, undoing every <c>Forward</c> call issued against
+    /// this model's model-owned state since that snapshot was captured.
+    /// </summary>
+    /// <remarks>
+    /// No-op when <see cref="SupportsRecurrentStateCheckpoint"/> is <see langword="false"/> or
+    /// <paramref name="checkpoint"/> is <see langword="null"/>. Implementations should throw
+    /// <see cref="ArgumentException"/> if <paramref name="checkpoint"/> is non-null but not the
+    /// concrete snapshot type this model itself produces.
+    /// </remarks>
+    void RestoreRecurrentState(object? checkpoint) { }
+
+    /// <summary>
+    /// True when <see cref="ForwardWithRecurrentSnapshots"/> and
+    /// <see cref="RestoreRecurrentStateToRow"/> are implemented: the model can record its
+    /// model-owned recurrent state after every row of a multi-token forward and later roll back to
+    /// any one of those rows without recomputing (issue #473).
+    /// </summary>
+    /// <remarks>
+    /// The alternative to <see cref="CheckpointRecurrentState"/> + replay for speculative verify:
+    /// llama.cpp's per-token recurrent snapshots (<c>n_rs_seq</c>). A partial rejection then costs
+    /// a state copy instead of a second trunk forward over the accepted prefix. Default
+    /// <see langword="false"/>; callers fall back to checkpoint + replay.
+    /// </remarks>
+    bool SupportsRecurrentRowSnapshots => false;
+
+    /// <summary>
+    /// Runs <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, ILoraAdapter?, IMtpState?)"/>
+    /// on the model-owned recurrent state and additionally records that state as it stood after
+    /// each row <c>0 .. tokenIds.Length - 2</c> (the state after the last row is the live state).
+    /// Returns logits identical to the plain forward.
+    /// </summary>
+    /// <remarks>
+    /// The recorded snapshots are model-owned scratch, valid until the next forward of any kind.
+    /// Restore one with <see cref="RestoreRecurrentStateToRow"/>.
+    /// </remarks>
+    /// <exception cref="NotSupportedException"><see cref="SupportsRecurrentRowSnapshots"/> is <see langword="false"/>.</exception>
+    ITensor ForwardWithRecurrentSnapshots(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                                          IKvCache? kvCache, IMtpState? mtpState)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not record per-row recurrent snapshots (SupportsRecurrentRowSnapshots=false).");
+
+    /// <summary>
+    /// Sets the model-owned recurrent state to what it was right after row <paramref name="row"/>
+    /// of the most recent <see cref="ForwardWithRecurrentSnapshots"/> call — exactly the state a
+    /// forward of only rows <c>0..row</c> would have left.
+    /// </summary>
+    /// <param name="row">
+    /// A row index in <c>[0, seqLen - 1)</c> of that call. <c>seqLen - 1</c> (the live state) is
+    /// accepted as a no-op.
+    /// </param>
+    /// <exception cref="NotSupportedException"><see cref="SupportsRecurrentRowSnapshots"/> is <see langword="false"/>.</exception>
+    /// <exception cref="InvalidOperationException">No snapshots are available (none recorded, or a later forward invalidated them).</exception>
+    void RestoreRecurrentStateToRow(int row)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not record per-row recurrent snapshots (SupportsRecurrentRowSnapshots=false).");
+
+    /// <summary>
+    /// Runs a fused forward pass across multiple in-flight sequences.
+    /// </summary>
+    /// <remarks>
+    /// <para>The continuous-batch scheduler calls this once per iteration when 2+ sequences are
+    /// active, instead of looping <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, ILoraAdapter?)"/>
+    /// per sequence. Each <paramref name="requests"/> entry carries its own tokens, positions,
+    /// and KV-cache — sequences are independent at the attention level (no cross-sequence
+    /// attention).</para>
+    /// <para>The default implementation simply loops over <c>Forward</c> per request and returns
+    /// the results in input order. Implementations can override to fuse the per-sequence GEMVs
+    /// into batched GEMMs and avoid the per-iteration kernel-dispatch overhead — this is the
+    /// principal continuous-batching throughput win.</para>
+    /// <para>The returned tensors follow the same shape contract as <c>Forward</c>: each entry
+    /// is <c>[N_i, vocab_size]</c> where <c>N_i</c> matches that request's token count (CPU
+    /// model) or <c>[1, vocab_size]</c> for the last token only (GPU/hybrid). The caller is
+    /// responsible for disposing each returned tensor.</para>
+    /// </remarks>
+    /// <param name="requests">One entry per active sequence. Order is preserved in the result.</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    /// <returns>Logits tensors, one per request, in the same order.</returns>
+    IReadOnlyList<ITensor> ForwardBatch(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+
+        var results = new ITensor[requests.Count];
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var r = requests[i];
+            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.Adapter);
+        }
+        return results;
+    }
+
+    /// <summary>
+    /// True when this model's checkpoint carries a Multi-Token Prediction (MTP / "NextN") head
+    /// (<see cref="ModelConfig.NextnPredictLayers"/> &gt; 0 <em>and</em> the loader found the
+    /// <c>nextn.*</c> tensors) — see issue #253. Default <see langword="false"/>: every model
+    /// that doesn't override this is completely unaffected by the MTP members below, which all
+    /// either no-op or throw.
+    /// </summary>
+    bool SupportsMtp => false;
+
+    /// <summary>
+    /// Longest <c>tokenIds</c> length for which <c>Forward</c> returns a logit row per input
+    /// position rather than the last position's row alone. <see cref="int.MaxValue"/> (the default)
+    /// means the documented <c>[seq, vocab]</c> contract always holds.
+    /// </summary>
+    /// <remarks>
+    /// <para>This exists because a GPU backend can face a genuine conflict between the contract and
+    /// tractability: running a 248320-row LM head over a 2048-token prefill both dominates prefill
+    /// time and materialises a multi-gigabyte tensor no caller reads, so some backends compute the
+    /// head for the last row only. That is a deviation, and callers that index logits row-by-row
+    /// need to know its extent rather than discover it by reading past the end of the buffer.</para>
+    /// <para><b>Probe with a short sequence and you will be told the wrong thing.</b> A model that
+    /// returns all rows up to some bound looks fully conformant to a two-token probe and is not, so
+    /// any caller deciding between an "all rows in one pass" and a "row at a time" strategy must
+    /// consult this in addition to measuring — see <c>BackendPerplexityModel.Probe</c>.</para>
+    /// </remarks>
+    int MaxAllRowLogitsLength => int.MaxValue;
+
+    /// <summary>
+    /// Allocates a fresh <see cref="IMtpState"/> — the MTP head's own tiny KV-cache plus pending
+    /// hidden-state handoff — or <see langword="null"/> when <see cref="SupportsMtp"/> is
+    /// <see langword="false"/>. The caller owns the returned state's lifetime (one per in-flight
+    /// sequence using MTP self-speculative decoding).
+    /// </summary>
+    IMtpState? CreateMtpState() => null;
+
+    /// <summary>
+    /// Allocates an <see cref="IMtpState"/> whose MTP KV-cache covers
+    /// <paramref name="maxSequenceLength"/> positions. The head's cache is indexed by sequence
+    /// position and absorbs every trunk batch (issue #469), so it must be as long as the sequence
+    /// — prompt, generated tokens and the draft steps beyond them. Defaults to
+    /// <see cref="CreateMtpState()"/> for models that do not size it.
+    /// </summary>
+    /// <param name="maxSequenceLength">Longest sequence, in positions, the state must hold.</param>
+    IMtpState? CreateMtpState(int maxSequenceLength) => CreateMtpState();
+
+    /// <summary>
+    /// Runs a forward pass and, when <paramref name="mtpState"/> is non-null, feeds the batch to the
+    /// MTP head: captures the trunk's post-final-norm hidden state (one row per input position) and
+    /// absorbs every token into the head's KV-cache, pairing token <c>x_p</c> with the hidden state
+    /// of position <c>p - 1</c> — llama.cpp's <c>draft-mtp</c> <c>process()</c> (issue #469).
+    /// </summary>
+    /// <remarks>
+    /// <para>The default implementation ignores <paramref name="mtpState"/> and forwards to
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, ILoraAdapter?)"/> —
+    /// exactly the "capability off" behavior every model already has today, so passing a non-null
+    /// state to a model with <see cref="SupportsMtp"/> false is a silent no-op rather than an
+    /// error (callers are expected to check <see cref="SupportsMtp"/> before ever constructing an
+    /// <see cref="IMtpState"/> in the first place). Models that override
+    /// <see cref="SupportsMtp"/> to <see langword="true"/> must override this overload too, and
+    /// return logits byte-identical to the <paramref name="mtpState"/>-null call — capturing and
+    /// absorbing are side effects on the MTP state only.</para>
+    /// <para>Every trunk forward of an MTP sequence, prefill included, must pass the state: the
+    /// head's KV-cache is indexed by position and <paramref name="positions"/> must continue it.
+    /// A forward that must not advance the head (replaying already-absorbed tokens after a
+    /// recurrent-state restore) passes <see langword="null"/>.</para>
+    /// </remarks>
+    /// <param name="tokenIds">Input token IDs for this step.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    /// <param name="kvCache">Optional KV-cache. When null, behaves identically to the uncached forward pass.</param>
+    /// <param name="adapter">Optional LoRA adapter. When null, behaves like the adapter-less overload.</param>
+    /// <param name="mtpState">
+    /// When non-null on an MTP-supporting model, receives the captured post-final-norm hidden state
+    /// rows for every position in <paramref name="tokenIds"/> and absorbs the batch. Ignored otherwise.
+    /// </param>
+    /// <returns>Logits tensor of shape [seq, vocab_size] for all input positions — identical to the non-MTP overload.</returns>
+    ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                    IKvCache? kvCache, ILoraAdapter? adapter, IMtpState? mtpState)
+        => Forward(tokenIds, positions, deviceId, kvCache, adapter);
+
+    /// <summary>
+    /// The full forward overload: KV-cache, LoRA adapter, MTP state <b>and</b> the
+    /// <paramref name="lastTokenLogitsOnly"/> hint in one call. This is what a prefill driver that
+    /// only samples the final position wants (issue #493): <c>TextGenerator.ForwardPrefill</c> reads
+    /// row <c>Shape[0] - 1</c> and nothing else, so on a large vocabulary the intermediate rows are
+    /// pure waste (248,320 x 4096 x 4 B ~= 4.0 GB on Bonsai 2 at a 4096-token prompt).
+    /// </summary>
+    /// <remarks>
+    /// <para>The default implementation routes to the plain hint-aware overload
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, bool)"/> when there
+    /// is neither an adapter nor an MTP state — so EVERY model that already honours the hint keeps
+    /// honouring it with no code change, and every model that ignores the hint keeps returning full
+    /// per-position logits. With an adapter or an MTP state present it routes to the
+    /// adapter/MTP-aware overload and the hint is dropped (the safe direction: more rows, never
+    /// fewer), unless the implementation overrides this method — the CUDA hybrid models do.</para>
+    /// <para>Because a model MAY return <c>[1, vocab]</c> here, callers must index the last row as
+    /// <c>Shape[0] - 1</c> and must never assume <c>Shape[0] == tokenIds.Length</c>.</para>
+    /// </remarks>
+    /// <param name="tokenIds">Input token IDs for this step.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    /// <param name="kvCache">Optional KV-cache. When null, behaves identically to the uncached forward pass.</param>
+    /// <param name="adapter">Optional LoRA adapter. When null, behaves like the adapter-less overload.</param>
+    /// <param name="mtpState">Optional MTP state — see the overload above for the capture/absorb contract.</param>
+    /// <param name="lastTokenLogitsOnly">
+    /// When true, implementations MAY return only the last position's logits (<c>[1, vocab_size]</c>).
+    /// The MTP capture/absorb side effects are unaffected: a model honouring the hint must still
+    /// capture every position's post-final-norm row.
+    /// </param>
+    /// <returns>
+    /// Logits of shape <c>[1, vocab_size]</c> when the hint is honoured, otherwise <c>[seq, vocab_size]</c>.
+    /// </returns>
+    ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                    IKvCache? kvCache, ILoraAdapter? adapter, IMtpState? mtpState,
+                    bool lastTokenLogitsOnly)
+        => adapter is null && mtpState is null
+            ? Forward(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly)
+            : Forward(tokenIds, positions, deviceId, kvCache, adapter, mtpState);
+
+    /// <summary>
+    /// Runs one MTP head autoregressive draft step: embeds <paramref name="tokenId"/>, combines it
+    /// with <paramref name="state"/>'s current pending hidden vector through the MTP block's own
+    /// <c>enorm</c>/<c>hnorm</c>/<c>eh_proj</c> plus a single decoder block and shared LM head, and
+    /// returns logits over the full vocabulary. Advances <paramref name="state"/>'s own KV-cache by
+    /// one step and updates its pending hidden vector with the MTP block's own post-head-norm output,
+    /// ready for the <em>next</em> <see cref="ForwardMtp"/> call — the MTP head drafts K tokens by
+    /// calling this K times in a row without re-invoking the trunk (matching llama.cpp's MTP draft
+    /// loop in <c>common_speculative_state_draft_mtp::draft()</c>).
+    /// </summary>
+    /// <param name="state">
+    /// The sequence's <see cref="IMtpState"/>, previously seeded via a <c>Forward</c> call
+    /// with a non-null <c>mtpState</c> and <see cref="IMtpState.SeedFromCapturedRow"/>.
+    /// </param>
+    /// <param name="tokenId">The token whose embedding feeds this MTP step (the previous step's accepted/drafted token).</param>
+    /// <param name="position">
+    /// Sequence position of <paramref name="tokenId"/>, which is also its KV-cache slot. Must not
+    /// exceed the head's current length; a smaller value discards the speculative steps beyond it.
+    /// </param>
+    /// <returns>Logits tensor of shape [1, vocab_size] for the drafted position.</returns>
+    /// <exception cref="NotSupportedException"><see cref="SupportsMtp"/> is <see langword="false"/>.</exception>
+    ITensor ForwardMtp(IMtpState state, int tokenId, int position)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not support MTP self-speculative decoding (SupportsMtp=false). " +
+            "Check SupportsMtp before creating an IMtpState or calling ForwardMtp. See issue #253.");
+
+    /// <summary>
+    /// True when <see cref="ForwardMtpArgMax"/> is implemented natively — typically a GPU backend
+    /// that reduces the draft logits on the device and returns one token id instead of copying the
+    /// whole vocabulary row to the host (issue #486). Default <see langword="false"/>: callers use
+    /// <see cref="ForwardMtp"/> and take the argmax themselves.
+    /// </summary>
+    bool SupportsMtpArgMax => false;
+
+    /// <summary>
+    /// Runs exactly the draft step <see cref="ForwardMtp"/> runs — same state updates — but returns
+    /// only the argmax of its logits: the index of the largest value, the <b>lowest</b> such index on
+    /// a tie, the first NaN if any value is NaN, and <c>+0</c> ranked above <c>-0</c> — the contract of
+    /// <c>System.Numerics.Tensors.TensorPrimitives.IndexOfMax</c> over
+    /// the <see cref="ForwardMtp"/> row. Only for an <b>unconstrained greedy</b> draft: a caller that
+    /// must mask or sample the logits needs <see cref="ForwardMtp"/>.
+    /// </summary>
+    /// <param name="state">As for <see cref="ForwardMtp"/>.</param>
+    /// <param name="tokenId">As for <see cref="ForwardMtp"/>.</param>
+    /// <param name="position">As for <see cref="ForwardMtp"/>.</param>
+    /// <returns>The drafted token id.</returns>
+    /// <exception cref="NotSupportedException"><see cref="SupportsMtpArgMax"/> is <see langword="false"/>.</exception>
+    int ForwardMtpArgMax(IMtpState state, int tokenId, int position)
+        => throw new NotSupportedException(
+            $"{GetType().Name} has no native MTP draft argmax (SupportsMtpArgMax=false); use ForwardMtp.");
 }

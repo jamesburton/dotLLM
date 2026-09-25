@@ -64,6 +64,25 @@ public sealed class CudaModule : IDisposable
         return func;
     }
 
+    /// <summary>
+    /// Like <see cref="GetFunction"/> but returns 0 when the function is absent
+    /// (e.g. a stale PTX that does not contain the kernel yet). Caches the
+    /// successful result; absence is not cached so a later rebuild is picked up.
+    /// </summary>
+    /// <param name="name">The <c>extern "C"</c> kernel function name.</param>
+    public nint TryGetFunction(string name)
+    {
+        if (_functions.TryGetValue(name, out nint func))
+            return func;
+
+        // CUDA_SUCCESS = 0; non-zero means the symbol isn't in this module.
+        if (CudaDriverApi.cuModuleGetFunction(out func, _module, name) != 0)
+            return 0;
+
+        _functions[name] = func;
+        return func;
+    }
+
 
     /// <inheritdoc/>
     public void Dispose()

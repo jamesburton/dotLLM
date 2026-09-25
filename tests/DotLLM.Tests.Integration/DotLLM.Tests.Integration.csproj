@@ -12,15 +12,39 @@
     <ProjectReference Include="..\..\src\DotLLM.Tokenizers\DotLLM.Tokenizers.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Cpu\DotLLM.Cpu.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Cuda\DotLLM.Cuda.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Vulkan\DotLLM.Vulkan.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Engine\DotLLM.Engine.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Diagnostics\DotLLM.Diagnostics.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Telemetry\DotLLM.Telemetry.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Server\DotLLM.Server.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Cli\DotLLM.Cli.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="Fixtures\Mamba3\fixture.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Fixtures\Mamba3\fixture_mimo.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Fixtures\Mamba3\fixture_canonical.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Fixtures\Mamba3\fixture_canonical_mimo.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Fixtures\Mamba3\ib_ssm_config.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Fixtures\Embeddings\llamacpp-smollm2-135m-instruct-q8_0.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="xunit" />
     <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Xunit.SkippableFact" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
   </ItemGroup>
 

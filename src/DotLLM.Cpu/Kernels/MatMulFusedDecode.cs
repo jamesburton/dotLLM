@@ -26,7 +26,12 @@ public static unsafe partial class MatMul
     {
         QuantizationType.Q8_0 => QuantFamily.Q8_0Family,
         QuantizationType.Q5_0 => QuantFamily.Q8_1Family,
-        QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K => QuantFamily.KQuantFamily,
+        // Packed legacy quants — same Q8_1 activation block as Q5_0, so they share pre-quant (#489).
+        QuantizationType.Q4_0 or QuantizationType.Q4_1
+            or QuantizationType.Q5_1 or QuantizationType.IQ4_NL => QuantFamily.Q8_1Family,
+        QuantizationType.Q2_K or QuantizationType.Q3_K
+            or QuantizationType.Q4_K or QuantizationType.Q5_K
+            or QuantizationType.Q6_K => QuantFamily.KQuantFamily,
         _ => QuantFamily.None,
     };
 
@@ -42,11 +47,48 @@ public static unsafe partial class MatMul
     {
         QuantizationType.Q8_0 => &ComputeRows,
         QuantizationType.Q5_0 => &ComputeRowsQ5_0,
+        QuantizationType.Q2_K => &ComputeRowsQ2_K,
+        QuantizationType.Q3_K => &ComputeRowsQ3_K,
         QuantizationType.Q4_K => &ComputeRowsQ4_K,
         QuantizationType.Q5_K => &ComputeRowsQ5_K,
         QuantizationType.Q6_K => &ComputeRowsQ6_K,
+        QuantizationType.Q4_0 => &ComputeRowsQ4_0,
+        QuantizationType.Q4_1 => &ComputeRowsQ4_1,
+        QuantizationType.Q5_1 => &ComputeRowsQ5_1,
+        QuantizationType.IQ4_NL => &ComputeRowsIQ4_NL,
         _ => null,
     };
+
+    private static void ComputeRowsQ4_0(byte* w, byte* xQ8, float* result, int m, int blockCount)
+        => ComputeRowsLegacyQuant(QuantizationType.Q4_0, w, xQ8, result, m, blockCount);
+
+    private static void ComputeRowsQ4_1(byte* w, byte* xQ8, float* result, int m, int blockCount)
+        => ComputeRowsLegacyQuant(QuantizationType.Q4_1, w, xQ8, result, m, blockCount);
+
+    private static void ComputeRowsQ5_1(byte* w, byte* xQ8, float* result, int m, int blockCount)
+        => ComputeRowsLegacyQuant(QuantizationType.Q5_1, w, xQ8, result, m, blockCount);
+
+    private static void ComputeRowsIQ4_NL(byte* w, byte* xQ8, float* result, int m, int blockCount)
+        => ComputeRowsLegacyQuant(QuantizationType.IQ4_NL, w, xQ8, result, m, blockCount);
+
+    /// <summary>
+    /// Reports whether the fused decode path can compute a projection for <paramref name="qt"/>.
+    /// </summary>
+    /// <remarks>
+    /// The answer is derived from the dispatch tables the fused kernels actually use
+    /// (<see cref="GetComputeRowsFn"/> plus the two float formats handled directly by
+    /// <c>DispatchSingle</c>), so adding a new <c>ComputeRows</c> entry automatically makes the
+    /// type eligible — there is no separate list to keep in sync. Callers that own a
+    /// general-purpose GEMM should consult this before invoking
+    /// <see cref="FusedDecodeGemv3"/>/<see cref="FusedDecodeGemv2"/> and route unsupported types
+    /// through that GEMM instead, which is both faster and format-complete compared with the
+    /// dequantize-per-row fallback the fused path uses as a last resort.
+    /// </remarks>
+    /// <param name="qt">Weight quantization type of the projection.</param>
+    /// <returns><see langword="true"/> when a dedicated fused decode kernel exists.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool SupportsFusedDecode(QuantizationType qt) =>
+        qt is QuantizationType.F32 or QuantizationType.F16 || GetComputeRowsFn(qt) != null;
 
     /// <summary>Returns per-row weight block bytes for the given quant type.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -54,9 +96,15 @@ public static unsafe partial class MatMul
     {
         QuantizationType.Q8_0 => Q8_0BlockBytes,
         QuantizationType.Q5_0 => Q5_0BlockBytes,
+        QuantizationType.Q2_K => Q2_K_BlockBytes,
+        QuantizationType.Q3_K => Q3_K_BlockBytes,
         QuantizationType.Q4_K => Q4_K_BlockBytes,
         QuantizationType.Q5_K => Q5_K_BlockBytes,
         QuantizationType.Q6_K => Q6_K_BlockBytes,
+        QuantizationType.Q4_0 => Q4_0BlockBytes,
+        QuantizationType.Q4_1 => Q4_1BlockBytes,
+        QuantizationType.Q5_1 => Q5_1BlockBytes,
+        QuantizationType.IQ4_NL => IQ4_NLBlockBytes,
         _ => 0,
     };
 
@@ -399,12 +447,9 @@ public static unsafe partial class MatMul
             return;
         }
 
-        if (preQuantInput != null)
+        if (preQuantInput != null && GetComputeRowsFn(qt) != null)
         {
             // Pre-quantized input available and format-compatible → dispatch via ComputeRows
-            var fn = GetComputeRowsFn(qt);
-            if (fn == null) return;
-
             int blockCount = GetBlockCount(k, qt);
             var ctx = new FusedDecode2Ctx
             {
@@ -423,12 +468,28 @@ public static unsafe partial class MatMul
             {
                 case QuantizationType.Q8_0: GemvQ8_0(weights, input, result, m, k, pool); break;
                 case QuantizationType.Q5_0: GemvQ5_0(weights, input, result, m, k, pool); break;
+                case QuantizationType.Q2_K: GemvQ2_K(weights, input, result, m, k, pool); break;
+                case QuantizationType.Q3_K: GemvQ3_K(weights, input, result, m, k, pool); break;
                 case QuantizationType.Q4_K: GemvQ4_K(weights, input, result, m, k, pool); break;
                 case QuantizationType.Q5_K: GemvQ5_K(weights, input, result, m, k, pool); break;
                 case QuantizationType.Q6_K: GemvQ6_K(weights, input, result, m, k, pool); break;
+                case QuantizationType.I2_S: GemvI2_S(weights, input, result, m, k, pool); break;
+                case QuantizationType.PQ2_0: GemvPQ2_0(weights, input, result, m, k, pool); break;
+                case QuantizationType.MXFP4: GemvMxfp4(weights, input, result, m, k, pool); break;
+                case QuantizationType.Q4_0:
+                case QuantizationType.Q4_1:
+                case QuantizationType.Q5_1:
+                case QuantizationType.IQ4_NL:
+                    GemvLegacyQuant(weights, qt, input, result, m, k, pool); break;
                 default:
-                    throw new NotSupportedException(
-                        $"Fused decode does not support {qt}. Use standard Gemm path.");
+                    // No dedicated GEMV for this format. Rather than fail the whole decode step,
+                    // dequantize row-by-row and dot — the same last-resort path the MoE MLP uses.
+                    // Callers with a full GEMM should have gated on SupportsFusedDecode and never
+                    // reach here; this exists so the kernel API is total instead of throwing.
+                    // Row-parallel via the pool: the fallback being format-complete is no reason
+                    // for it to also be single-threaded (#263).
+                    GemvDequantRows(weights, qt, input, result, m, k, pool);
+                    break;
             }
         }
     }

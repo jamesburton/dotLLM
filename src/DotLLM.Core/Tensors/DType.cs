@@ -50,6 +50,9 @@ public readonly record struct DType(string Name, int SizeInBytes, bool IsQuantiz
     /// <summary>6-bit K-quant.</summary>
     public static readonly DType Q6_K = new("q6_k", 0, true, BlockByteSize: 210, BlockElementCount: 256);
 
+    /// <summary>MXFP4 (OCP Microscaling FP4): E8M0 shared scale + 32 × 4-bit E2M1 values, 17 bytes per block.</summary>
+    public static readonly DType MXFP4 = new("mxfp4", 0, true, BlockByteSize: 17, BlockElementCount: 32);
+
     /// <summary>
     /// Computes the total byte count for <paramref name="elementCount"/> elements of this type.
     /// Handles both quantized (block-based) and non-quantized (per-element) types correctly.

@@ -1,0 +1,147 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Q6_K MMVQ decode GEMV: integer-dot (dp4a) matrix-vector multiply.
+//
+//   y[m] = sum_k W_q6k[m,k] * x[k]
+//
+// NEW dp4a path for Q6_K (previously only the F32-dequant GEMV existed). The
+// activation x[] is pre-quantized to Q8_1 (int8 qs + fp32 scale d_x, one block
+// per 32 elements). Q6_K reconstructs w_i = d · scale_sub · (q6_i - 32) with a
+// per-256 super-block scale d, a signed int8 per-16-element sub-block scale, and
+// a 6-bit quant q6 (0..63) assembled from a 4-bit ql nibble + a 2-bit qh field.
+// Per 16-element sub-block j:
+//   sum_i w_i·x_i = d · scale[j] · sum_i((q6_i-32)·x_i)
+//                 = d · scale[j] · d_x · dp4a((q6-32) signed bytes, xq)
+// The −32 is folded into each quant byte BEFORE the dp4a (mirrors llama.cpp's
+// __vsubss4 in vec_dot_q6_K_q8_1_impl_mmvq), so no separate block-sum term.
+//
+// NOT bit-exact (x is int8-quantized); validated argmax + tolerance vs CPU F32.
+//
+// ── COALESCED lane=K-position layout (issue #338) ─────────────────────────────
+// One wave32 subgroup computes ONE output row; the 32 lanes cooperatively
+// consume one 256-element super-block per iteration. The F32 reference splits a
+// super-block into 8 chunks of 32 elements (2 halves × 4 groups); here 4 lanes
+// share a chunk (32 lanes / 8 chunks), so lane L handles chunk c = L/4, quarter
+// q = L%4 → its 8 elements [q*8 .. q*8+8) of chunk c (= 2 dp4a). The 4 lanes of
+// a chunk read its 32 contiguous ql + 32 contiguous qh bytes (8+8 uints) →
+// coalesced 32-byte runs; the whole subgroup sweeps all 128 ql + 64 qh bytes.
+// Reduction: a single subgroupAdd (no shared memory, no barriers). Replaces the
+// old lane=whole-super-block (210-byte-strided, uncoalesced, 16/128 threads idle)
+// F32-dequant GEMV on the decode path.
+//
+// Q6_K super-block layout (210 bytes / 256 elements; matches matmul_q6_k_gemv_f32.comp):
+//   [0..127]   = ql[128]  (low 4 bits, two per byte)
+//   [128..191] = qh[64]   (high 2 bits per element, four per byte)
+//   [192..207] = scales[16] (signed int8, per-16-element sub-block)
+//   [208,209]  = fp16 d
+//   Row stride = (K/256) * 210 bytes (210 % 4 == 2 ⇒ funnelled 4-byte reads).
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; }; // Q6_K blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };      // [K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };     // [K/32] (d_x, s)
+layout(set = 0, binding = 3, std430) writeonly buffer BufY   { float y[]; };       // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;            // output rows
+    uint K;            // columns (multiple of 256)
+    uint blocksPerRow; // = K / 256 (super-blocks)
+    uint pad;
+} pc;
+
+const uint Q6K_BLOCK_BYTES = 210u;
+
+int readSByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint b = (u >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+    return int(b) - int((b & 0x80u) << 1);   // sign-extend int8
+}
+
+// 4 consecutive bytes LE, funnelled across the word boundary (210-byte stride
+// makes ql/qh bases 2-mod-4 on alternate blocks).
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// Assemble 4 signed (q6-32) bytes from one ql word + one qh word into a uint
+// ready for dp4a. useHigh selects the high nibble of each ql byte; shift selects
+// the 2-bit qh field (group*2).
+uint packQ6Signed(uint ql4, uint qh4, bool useHigh, uint shift) {
+    uint res = 0u;
+    for (uint e = 0u; e < 4u; e++) {
+        uint qlb = (ql4 >> (e * 8u)) & 0xFFu;
+        uint qhb = (qh4 >> (e * 8u)) & 0xFFu;
+        uint nib = useHigh ? ((qlb >> 4u) & 0xFu) : (qlb & 0xFu);
+        uint high2 = (qhb >> shift) & 3u;
+        int q6 = int(nib | (high2 << 4u)) - 32;     // -32..31
+        res |= (uint(q6) & 0xFFu) << (e * 8u);
+    }
+    return res;
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint lane  = gl_LocalInvocationID.x;   // 0..31 (one subgroup per workgroup)
+    uint c     = lane >> 2u;               // chunk 0..7
+    uint q     = lane & 3u;                // quarter 0..3 (8 elements each)
+    uint hf    = c >> 2u;                  // super-block half 0..1
+    uint group = c & 3u;                   // group 0..3
+    bool useHigh = (group >= 2u);          // groups 2,3 take the ql high nibble
+    uint shift   = group * 2u;             // qh field shift 0,2,4,6
+    uint isc     = q >> 1u;                // which of the chunk's two 16-elem scales
+    uint scIdx   = hf * 8u + isc + 2u * group;       // 0..15
+    uint qlChunkOff = hf * 64u + (group & 1u) * 32u; // within ql[128]
+    uint qhChunkOff = hf * 32u;                       // within qh[64]
+
+    uint rowByteBase = m * pc.blocksPerRow * Q6K_BLOCK_BYTES;
+    float acc = 0.0;
+
+    for (uint b = 0u; b < pc.blocksPerRow; b++) {
+        uint blockByteBase = rowByteBase + b * Q6K_BLOCK_BYTES;
+        float d  = readHalf(blockByteBase + 208u);
+        float sc = float(readSByte(blockByteBase + 192u + scIdx));
+
+        // This lane's 8 ql + 8 qh bytes (its quarter of the chunk).
+        uint qlByteBase = blockByteBase + qlChunkOff + q * 8u;
+        uint qhByteBase = blockByteBase + 128u + qhChunkOff + q * 8u;
+        uint w0 = packQ6Signed(read4Bytes(qlByteBase),      read4Bytes(qhByteBase),      useHigh, shift);
+        uint w1 = packQ6Signed(read4Bytes(qlByteBase + 4u), read4Bytes(qhByteBase + 4u), useHigh, shift);
+
+        // Matching 8 activations: element index b*256 + c*32 + q*8 → xq uint b*64 + c*8 + q*2.
+        uint xqi = b * 64u + c * 8u + q * 2u;
+        int dotI = dotPacked4x8AccSatEXT(int(w0), int(xq[xqi]), 0);
+        dotI = dotPacked4x8AccSatEXT(int(w1), int(xq[xqi + 1u]), dotI);
+
+        // Activation scale: the chunk is one Q8_1 block (b*8 + c).
+        float dX = xds[b * 8u + c].x;
+        acc += (d * sc) * (dX * float(dotI));
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[m] = total;
+}

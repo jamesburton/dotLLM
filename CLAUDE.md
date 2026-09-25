@@ -77,6 +77,45 @@ dotLLM/
 - `IAsyncEnumerable<T>` for streaming token generation.
 - Composability over inheritance. Interfaces and records, not deep class hierarchies.
 
+## JSON DTO Rules (System.Text.Json source generation)
+
+- **Never express a default with a property initializer on an `init`-only property of a DTO that is
+  deserialized through a source-generated context.** The initializer is silently dropped:
+
+  ```csharp
+  public sealed record Req {
+      public bool Stream { get; init; } = true;   // arrives as FALSE
+      public string Name { get; init; } = "";     // arrives as NULL
+  }
+  ```
+
+  No warning, no error. Direct construction (`new Req { ... }`) still honours it, so a test that
+  does not round-trip through JSON cannot see the bug.
+
+- **The trigger is the `init` accessor, not `required` and not `record`** — measured, not assumed
+  (`TrayJsonContextDefaultsTests`, .NET 10):
+
+  | shape | source-generated | reflection-based |
+  |---|---|---|
+  | `{ get; init; } = x` on a `record` | **dropped** | honoured |
+  | `{ get; init; } = x` on a `class` | **dropped** | honoured |
+  | `{ get; set; } = x` | honoured | honoured |
+  | `+ a required member` | **dropped** (no different) | honoured |
+
+  The first three hits (`ModelPullRequest.Stream`, `TraySettings`, `ChatCompletionRequest.N`) all
+  happened to sit on types that *also* had `required` members, which made `required` look causal.
+  It is a correlate. Any `init` property with an initializer is affected, which is a far larger
+  surface than the original rule described — and it is the house style, so it recurs.
+
+- **The fix**: make the property nullable and resolve the default in code
+  (`public int? N { get; init; }` + `public int ChoiceCount => N ?? 1;`). Switching to `set` also
+  restores the initializer, but trades away immutability for a behaviour that depends on a
+  serializer implementation detail — prefer nullable.
+- `JsonContextDefaultsTests` guards `ServerJsonContext` and `TrayJsonContextDefaultsTests` guards
+  the tray's two contexts. **If you add a JSON context, add the equivalent guard**: construct the
+  type directly, deserialize `{}`, and compare — initializers are invisible to reflection, so
+  direct construction is the only available oracle.
+
 ## Memory Management Rules
 
 - **NEVER** allocate managed arrays for tensor data. Use `NativeMemory.AlignedAlloc` (64-byte for AVX-512, 32-byte for AVX2).
@@ -85,6 +124,34 @@ dotLLM/
 - All unmanaged memory wrapped in `IDisposable` with deterministic cleanup.
 - Tensor metadata (shape, stride, pointer): structs, not classes.
 - GC: Server GC, `SustainedLowLatency` mode during inference.
+
+## Model & Fixture Storage Rules
+
+**Model weights NEVER live in the repository, and are never committed.** They belong in the
+shared on-disk cache:
+
+| location | holds |
+|---|---|
+| `~/.dotllm/models/` | models fetched for normal use (`dotllm model pull`) |
+| `~/.dotllm/test-cache/{org}/{repo}/` | fixtures the test suite resolves, incl. `DOTLLM_*_GGUF` overrides |
+| `~/.dotllm/quant-ladder/` | generated per-quantization coverage fixtures |
+
+- **If a path inside the tree needs a model, symlink to the cache — never copy it in.**
+- Reference fixtures from tests via the existing `DOTLLM_*_GGUF` environment overrides
+  (see `docs/QUANT_FIXTURES.md`), not by relative path into the working tree.
+- **Why this matters, beyond tidiness:** a single GGUF is 0.1–50 GB; git keeps a committed
+  blob forever *even after deletion*, so one mistake permanently bloats every clone. The
+  cache also lets the OS page cache share **one** on-disk copy across every process and
+  worktree — the same property the mmap loading strategy above depends on.
+- `.gitignore` carries an extension-level backstop (`*.gguf`, `*.safetensors`, `*.ckpt`,
+  `*.pt`, `*.pth`, `*.onnx`, …) because the directory rules only cover the paths people
+  remembered to use. **Do not add broad binary globs**: `*.spv` and `*.ptx` are tracked on
+  purpose (216 compiled Vulkan/CUDA shaders are legitimate build artifacts).
+- Activation/tensor dumps are scratch — write them under the session scratch dir or
+  `.docs/`, never the repo root and never a drive root (a debug run once left four
+  `C:\dotllm_qwen35_*` dump folders behind).
+- Large *generated* corpora and results also stay out: `.docs/` is git-ignored and is where
+  the wikitext corpus, sweep drivers and results tables live.
 
 ## SIMD & Vectorization Rules
 
@@ -127,6 +194,8 @@ dotLLM/
 
 **Read the relevant doc(s) before starting work on a module.**
 
+**Local handoff:** If `.docs/HANDOFF.md` exists, read it at session start before planning or editing. It is a private, git-ignored progress/task summary for the current local workspace. Maintain it when you discover durable progress, next tasks, benchmark results, or decision context. Use sibling files in `.docs/` such as `.docs/FUTURE_TASKS.md` for load-on-demand detail and link them from the handoff instead of bloating the summary.
+
 | Topic | Document | Read when working on... |
 |-------|----------|------------------------|
 | System architecture & data flow | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Any major feature, onboarding |
@@ -146,11 +215,14 @@ dotLLM/
 | Diagnostics & interpretability | [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | Hooks, logit lens, SAE |
 | Telemetry & observability | [docs/TELEMETRY.md](docs/TELEMETRY.md) | Metrics, request tracing |
 | Server & API | [docs/SERVER.md](docs/SERVER.md) | Endpoints, rate limiting, warm-up |
+| Anthropic Messages API | [docs/ANTHROPIC_API.md](docs/ANTHROPIC_API.md) | `/v1/messages`, content blocks, streaming events, mapping |
+| Windows system tray | [docs/TRAY.md](docs/TRAY.md) | Tray app, server lifecycle/ownership, autostart, packaging, updates |
 | Warm-up | [docs/WARMUP.md](docs/WARMUP.md) | Startup warm-up, JIT compilation, CUDA warm-up |
 | GPU inference | [docs/GPU.md](docs/GPU.md) | GPU forward pass, weight loading, KV-cache, CLI |
 | CUDA backend | [docs/CUDA.md](docs/CUDA.md) | PTX architecture, P/Invoke, kernel conventions, build |
 | Multi-GPU | [docs/MULTI_GPU.md](docs/MULTI_GPU.md) | Tensor/pipeline parallelism, NCCL |
 | Native AOT deployment | [docs/AOT.md](docs/AOT.md) | AOT publishing, trimming, deployment |
+| Perplexity & llama.cpp comparison | [docs/PERPLEXITY.md](docs/PERPLEXITY.md) | Quality measurement, corpus fixtures, CRLF trap (#506) |
 | Implementation roadmap | [docs/ROADMAP.md](docs/ROADMAP.md) | Planning, task sequencing |
 
 ## Development Workflow
@@ -164,6 +236,64 @@ All development follows an issue-driven workflow.
 5. **One issue, one branch, one PR.** If scope grows, split into a new issue.
 6. **Read the relevant docs first.** Before starting, read docs listed in the Documentation Index for the module being implemented.
 7. **Keep README in sync.** When a PR completes a roadmap step, update `docs/ROADMAP.md` (add `:white_check_mark:` to the step) and `README.md` (bump the step count in the Roadmap table, e.g., "4/9" → "5/9"; when a phase completes change status to "Done"; add a News entry for significant milestones).
+
+### Working through large pre-existing feature branches
+
+When a long-lived experimental branch (e.g. `feature/mamba-3`, `feature/qwen3.6`) needs to be decomposed into small, reviewable PRs:
+
+1. **Maintain a `dev` branch** off `main`. `dev` is the integration mirror that tracks the latest in-progress code while keeping individual PRs to upstream small and focused.
+2. **As each focused PR is opened against upstream `main`, merge the same commits into `dev`** — **only when `dev` does not already contain equivalent content via prior WIP commits.** If `dev` already has the content (e.g. the PR was extracted from a WIP commit that is itself on `dev`), the merge produces add/add conflicts and gives no incremental tracking value. In that case skip the merge and let `dev` re-sync naturally once the PR lands upstream and `forked-from/main` advances. The merge step exists for PRs that introduce content `dev` lacks (e.g. new tests authored during extraction, scope adjustments, or workflow-only commits like the CLAUDE.md updates).
+3. **Use `git diff dev...feature/<name>` to see what is still uncovered** in the source branch. Each remaining diff hunk is a candidate for the next issue / PR pair.
+4. **Work one source branch to completion before moving to the next.** When `feature/<name>` is fully covered by extracted PRs, move on to the branch that built on top of it (e.g. `feature/qwen3.6` after `feature/mamba-3`).
+5. **Do not push direct commits to `dev`.** Only merge from extracted PR branches — that keeps `dev`'s history reflecting the actual upstream-ready chunks, and the diff against `feature/<name>` continues to mean "what's left to extract".
+
+### Preview / unmerged-runtime optimizations (the `dev-dotnet11` track)
+
+Some optimizations depend on **.NET runtime intrinsics that we have PR'd but that are not yet in a
+shipping (RC/final) mainstream .NET release** — currently the AVX-512 work in `C:\dotnet-runtime`:
+`feature/avxvnni.v512` (**`AvxVnni.V512`** / VPDPBUSD-512) and `feature/avx512bf16`
+(**`Avx512Bf16`** / VDPBF16PS). These can be the key to topping the performance stakes, but **we
+cannot assume they are available to everyone until they reach RC/final**. So we keep two parallel
+tracks:
+
+- **`main` / `dev` (the default):** optimize for **currently-shipping intrinsics only** — APIs
+  present in the pinned mainstream SDK (`global.json` = .NET 10). Anything that builds and runs for
+  every user. This is where normal development happens; **this is the priority track.** (E.g. the
+  mainstream `Avx512Vnni` / VPDPBUSD path lives here.)
+- **`dev-dotnet11` (preview track):** the integration base for optimizations that **require the
+  preview-runtime APIs**. Built/tested against the dogfood SDK in `C:\dotnet-runtime` (use
+  `C:\dotnet-runtime\dotnet.cmd`, or point `DOTNET_ROOT` at its built
+  `artifacts\bin\testhost\net11.0-windows-Release-x64`). Existing preview work to integrate here:
+  `issue/322-q8-avx512-vnni-net11`, `issue/321-q8-vnni-outer-product`, `issue/q8-bf16-prefill-e2e`,
+  and the Vulkan f16/bf16 issues (#233/#235/#238). A dedicated agent can "fill operator gaps" on
+  this track using the PR'd intrinsics.
+
+**Merge direction is ONE-WAY:**
+- Mainstream → preview: regularly merge `dev` **into** `dev-dotnet11` to keep it current.
+- Preview → mainstream: **do NOT merge `dev-dotnet11`'s preview-dependent changes back into
+  `dev`/`main` until the runtime APIs they use ship in a mainstream RC/final release.** When an API
+  ships, retarget that optimization to the mainstream API (or `#if`/`IsSupported`-gate it with a
+  mainstream fallback) and only then extract it as a normal PR onto `dev`/`main`.
+- Prefer writing preview-track kernels so they **degrade gracefully**: gate on `*.IsSupported` with a
+  mainstream-supported fallback, so the same code path can move to `dev` unchanged once the API lands.
+
+Do not block a mainstream optimization on a preview one: if both a current-support and a
+preview-only implementation exist, ship the current-support version on `dev` and keep the faster
+preview variant parallel on `dev-dotnet11`.
+
+### Pinging idle upstream PRs
+
+If a PR to upstream sits without maintainer activity for **two weeks**, post a polite re-ping summarising current status (CI state, threads resolved, anything still pending). Fortnightly cadence — not weekly.
+
+## Cross-Backend Critical Bugs
+
+**If a critical correctness bug is identified in one backend (CPU/CUDA/Vulkan/HIP) and the same logic is duplicated in other backends, ALL affected backends MUST be fixed in the same change before the diagnostic information is lost — even if the active task only targets one backend.** This takes priority over narrowing of focus or "out of scope" demarcations:
+
+- Critical-bug fixes propagate across backends. Inconsistent backends silently degrade quality and burn debugging time on the next backend the bug surfaces in.
+- When fixing, search for the routine across `src/DotLLM.Cpu/`, `src/DotLLM.Cuda/`, `src/DotLLM.Vulkan/`, `src/DotLLM.Hip/`, `native/kernels/`, and `native/vulkan/shaders/` before declaring done.
+- Add a regression test that **discriminates** between the broken and fixed forms — tests using degenerate shapes (e.g. NKHead=1 where `vh/N` and `vh%N` coincide) cannot catch broadcast-style bugs and have already let one bug ship.
+- If a parallel agent is working on a backend listed in a task's "do not touch" surface, document the cross-backend fix you applied so they can pick it up; do NOT defer the fix.
+- Reference llama.cpp's CPU implementation (`ggml/src/ggml-cpu/ops.cpp`) as the authoritative source for any GGUF-format model op semantics — including head-broadcast conventions, sign conventions, and accumulator placement.
 
 ## What Claude Should Know
 

@@ -26,6 +26,66 @@ public sealed record ChatCompletionRequest
     [JsonPropertyName("stream")]
     public bool Stream { get; init; }
 
+    /// <summary>
+    /// Streaming options (#450). Today only <c>include_usage</c> is meaningful: it asks for a
+    /// final usage-only chunk, which SDKs rely on for token accounting over a stream.
+    /// </summary>
+    [JsonPropertyName("stream_options")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public StreamOptionsDto? StreamOptions { get; init; }
+
+    /// <summary>
+    /// True when this request asked for the final <c>choices: []</c> usage chunk.
+    /// </summary>
+    [JsonIgnore]
+    public bool WantsUsageChunk => StreamOptions?.IncludeUsage == true;
+
+    /// <summary>
+    /// When <c>false</c>, the assistant may emit at most one tool call per turn (#450). Null =
+    /// OpenAI's default, i.e. parallel calls are allowed. The model is not constrained during
+    /// decode, so this is enforced on the response.
+    /// </summary>
+    [JsonPropertyName("parallel_tool_calls")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? ParallelToolCalls { get; init; }
+
+    /// <summary>
+    /// End-user identifier for abuse tracking. Accepted and ignored — this server has no
+    /// per-end-user concept, and a client that always sends it must not get a 400 (#450).
+    /// </summary>
+    [JsonPropertyName("user")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? User { get; init; }
+
+    /// <summary>
+    /// Whether to persist the completion for OpenAI's dashboard. Accepted and ignored — nothing
+    /// is stored server-side here (#450).
+    /// </summary>
+    [JsonPropertyName("store")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Store { get; init; }
+
+    /// <summary>
+    /// Latency tier hint. Accepted and ignored — there is one tier (#450).
+    /// </summary>
+    [JsonPropertyName("service_tier")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ServiceTier { get; init; }
+
+    /// <summary>
+    /// Reasoning-budget hint for o-series models. Accepted and ignored (#450).
+    /// </summary>
+    [JsonPropertyName("reasoning_effort")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReasoningEffort { get; init; }
+
+    /// <summary>
+    /// Opaque client key/value tags. Accepted and ignored (#450).
+    /// </summary>
+    [JsonPropertyName("metadata")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? Metadata { get; init; }
+
     [JsonPropertyName("stop")]
     public JsonElement? Stop { get; init; }
 
@@ -56,14 +116,135 @@ public sealed record ChatCompletionRequest
     [JsonPropertyName("min_p")]
     public float? MinP { get; init; }
 
+    /// <summary>
+    /// Per-token additive logit bias (OpenAI API compatible): a map from token id (as a string key)
+    /// to a bias value applied before sampling. Typical range is -100..100.
+    /// </summary>
+    [JsonPropertyName("logit_bias")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, float>? LogitBias { get; init; }
+
+    /// <summary>Top-nσ sampling threshold (llama.cpp <c>--top-nsigma</c>). Negative = disabled.</summary>
+    [JsonPropertyName("top_n_sigma")]
+    public float? TopNSigma { get; init; }
+
+    /// <summary>DRY repetition penalty multiplier. 0/absent = disabled.</summary>
+    [JsonPropertyName("dry_multiplier")]
+    public float? DryMultiplier { get; init; }
+
+    /// <summary>DRY exponential base for the match-length penalty curve.</summary>
+    [JsonPropertyName("dry_base")]
+    public float? DryBase { get; init; }
+
+    /// <summary>Minimum matched n-gram length before DRY starts penalizing.</summary>
+    [JsonPropertyName("dry_allowed_length")]
+    public int? DryAllowedLength { get; init; }
+
+    /// <summary>Number of recent tokens considered for DRY matching. 0 = full history.</summary>
+    [JsonPropertyName("dry_penalty_last_n")]
+    public int? DryPenaltyLastN { get; init; }
+
+    /// <summary>Token strings that reset DRY n-gram matching.</summary>
+    [JsonPropertyName("dry_sequence_breakers")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string[]? DrySequenceBreakers { get; init; }
+
     [JsonPropertyName("logprobs")]
     public bool? Logprobs { get; init; }
 
     [JsonPropertyName("top_logprobs")]
     public int? TopLogprobs { get; init; }
 
+    /// <summary>
+    /// Number of choices to generate. Nullable rather than <c>= 1</c>: source-generated
+    /// deserialization drops an initializer on a type with a <c>required</c> member (#462), so
+    /// the old form arrived as <b>0</b>. Resolve the default through <see cref="ChoiceCount"/>,
+    /// never by reading <c>N</c> directly.
+    /// </summary>
+    /// <remarks><c>n</c> is currently accepted and ignored — see #460.</remarks>
     [JsonPropertyName("n")]
-    public int N { get; init; } = 1;
+    public int? N { get; init; }
+
+    /// <summary>The effective number of choices: <see cref="N"/> when given, else 1.</summary>
+    [JsonIgnore]
+    public int ChoiceCount => N ?? 1;
+
+    /// <summary>
+    /// Optional LoRA adapter name (must already be registered with the server's
+    /// <c>LoraAdapterRegistry</c>). When null/empty, the request runs against
+    /// the base model with no adapter delta. Phase 4c additive field — does not
+    /// alter behaviour for existing requests.
+    /// </summary>
+    [JsonPropertyName("lora_adapter")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? LoraAdapter { get; init; }
+
+    /// <summary>
+    /// Optional named prefix id registered via <c>POST /v1/prompt-cache/{id}</c>.
+    /// When supplied the engine ensures the named prefix is honoured for this
+    /// request (best-effort hint — the trie still does longest-prefix matching).
+    /// </summary>
+    [JsonPropertyName("prefix_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? PrefixId { get; init; }
+
+    /// <summary>
+    /// Optional diffusion-decode overrides. Honoured only when the loaded model
+    /// is a diffusion model (its <c>ModelConfig.DiffusionConfig</c> is non-null);
+    /// ignored entirely on the autoregressive path. When null, the model's
+    /// verified <c>DiffusionConfig</c> defaults are used unchanged.
+    /// </summary>
+    [JsonPropertyName("diffusion")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DiffusionOptionsDto? Diffusion { get; init; }
+
+    /// <summary>
+    /// Idle-unload duration in seconds for the target model (#369, ollama parity). Null = use the
+    /// server-wide default. 0 = unload immediately after this request. Negative = never
+    /// auto-unload. Combine with <see cref="Model"/> to route to (and keep resident) a specific
+    /// model when the server has more than one loaded.
+    /// </summary>
+    [JsonPropertyName("keep_alive")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? KeepAlive { get; init; }
+}
+
+/// <summary>
+/// OpenAI <c>stream_options</c> (#450). Shared by the chat and raw-completion requests.
+/// </summary>
+public sealed record StreamOptionsDto
+{
+    /// <summary>
+    /// When true, the stream emits one extra chunk before <c>[DONE]</c> carrying <c>usage</c>
+    /// and an empty <c>choices</c> array. SDKs use it to report token counts for a stream.
+    /// </summary>
+    [JsonPropertyName("include_usage")]
+    public bool IncludeUsage { get; init; }
+}
+
+/// <summary>
+/// Per-request diffusion-decode overrides (additive — only consulted on the
+/// diffusion path). Every field is nullable; a null field falls back to the
+/// model's <c>DiffusionConfig</c> default. <c>max_tokens</c> still maps to the
+/// overall target length; these tune the canvas/schedule shape.
+/// </summary>
+public sealed record DiffusionOptionsDto
+{
+    /// <summary>Override the per-canvas length (<c>DiffusionConfig.CanvasLength</c>).</summary>
+    [JsonPropertyName("canvas_length")]
+    public int? CanvasLength { get; init; }
+
+    /// <summary>Override the max denoise steps per canvas (<c>DiffusionConfig.MaxDenoisingSteps</c>).</summary>
+    [JsonPropertyName("max_denoising_steps")]
+    public int? MaxDenoisingSteps { get; init; }
+
+    /// <summary>Override the upper bound of the linear temperature schedule (<c>t_max</c>).</summary>
+    [JsonPropertyName("temperature_max")]
+    public float? TemperatureMax { get; init; }
+
+    /// <summary>Override the lower bound of the linear temperature schedule (<c>t_min</c>).</summary>
+    [JsonPropertyName("temperature_min")]
+    public float? TemperatureMin { get; init; }
 }
 
 /// <summary>
@@ -89,8 +270,14 @@ public sealed record ChatMessageDto
 /// </summary>
 public sealed record ToolDefinitionDto
 {
+    /// <summary>
+    /// Constant discriminator. Read-only on purpose: an initialized settable property is
+    /// silently dropped by source-generated deserialization on a type with a <c>required</c>
+    /// member (#462), which made this arrive as <c>null</c> instead of <c>"function"</c>.
+    /// Nothing may set it, so nothing can lose it.
+    /// </summary>
     [JsonPropertyName("type")]
-    public string Type { get; init; } = "function";
+    public string Type => "function";
 
     [JsonPropertyName("function")]
     public required ToolFunctionDto Function { get; init; }
@@ -119,8 +306,9 @@ public sealed record ToolCallDto
     [JsonPropertyName("id")]
     public required string Id { get; init; }
 
+    /// <inheritdoc cref="ToolDefinitionDto.Type"/>
     [JsonPropertyName("type")]
-    public string Type { get; init; } = "function";
+    public string Type => "function";
 
     [JsonPropertyName("function")]
     public required ToolCallFunctionDto Function { get; init; }

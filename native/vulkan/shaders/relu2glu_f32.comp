@@ -1,0 +1,28 @@
+#version 450
+// Gated squared-ReLU activation: y[i] = relu(gate[i])^2 * up[i]
+//   relu(x) = max(0, x)
+// Mirrors DotLLM.Cpu.Kernels.FusedOps.ReLU2GLU and the CUDA relu2glu_f32 kernel.
+// This is BitNet b1.58's FFN gate non-linearity (vs SwiGLU's silu(gate)*up).
+//
+// Pointwise, no reduction — one thread per output element.
+// Dispatch:
+//   local_size_x = 256
+//   groupCount.x = ceil(n / 256)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufGate   { float gate[];   };
+layout(set = 0, binding = 1, std430) readonly  buffer BufUp     { float up[];     };
+layout(set = 0, binding = 2, std430) writeonly buffer BufResult { float result[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+
+    float r = max(0.0, gate[i]);
+    result[i] = r * r * up[i];
+}

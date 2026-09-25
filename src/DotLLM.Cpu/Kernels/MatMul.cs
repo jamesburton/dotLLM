@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using DotLLM.Cpu.Threading;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -15,16 +16,16 @@ namespace DotLLM.Cpu.Kernels;
 public static unsafe partial class MatMul
 {
     /// <summary>Q8_0 block size in bytes: 2 (Half scale) + 32 (sbyte quantized values).</summary>
-    private const int Q8_0BlockBytes = 34;
+    private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
 
     /// <summary>Number of elements per Q8_0 block.</summary>
-    private const int Q8_0GroupSize = 32;
+    private const int Q8_0GroupSize = QuantFormat.LegacyGroupSize;
 
     /// <summary>Q8_1 block size in bytes: 2 (Half d) + 2 (Half s) + 32 (sbyte quantized values).</summary>
-    public const int Q8_1BlockBytes = 36;
+    public const int Q8_1BlockBytes = QuantFormat.Q8_1BlockBytes;
 
     /// <summary>Number of elements per Q8_1 block.</summary>
-    private const int Q8_1GroupSize = 32;
+    private const int Q8_1GroupSize = QuantFormat.LegacyGroupSize;
 
     /// <summary>Stackalloc threshold in bytes. Above this, use ArrayPool.</summary>
     private const int StackAllocThreshold = 8192;
@@ -58,7 +59,7 @@ public static unsafe partial class MatMul
 
         for (int row = 0; row < m; row++)
         {
-            var rowSpan = new ReadOnlySpan<float>(a + row * k, k);
+            var rowSpan = new ReadOnlySpan<float>(a + (long)row * k, k);
             result[row] = TensorPrimitives.Dot(rowSpan, xSpan);
         }
     }
@@ -72,7 +73,7 @@ public static unsafe partial class MatMul
         for (int row = 0; row < m; row++)
         {
             float sum = 0;
-            float* rowPtr = a + row * k;
+            float* rowPtr = a + (long)row * k;
             for (int j = 0; j < k; j++)
                 sum += rowPtr[j] * x[j];
             result[row] = sum;
@@ -131,23 +132,11 @@ public static unsafe partial class MatMul
     {
         int rowBytes = blockCount * Q8_0BlockBytes;
 
-        if (Avx512BW.IsSupported && AvxVnni.IsSupported)
+        if (IsQ8_0VnniSupported)
         {
-            int row = 0;
-            // Process 4 rows at a time for cache efficiency.
-            for (; row + 3 < m; row += 4)
-            {
-                VecDotQ8_0Vnni_4Rows(
-                    weightsQ8 + row * rowBytes,
-                    weightsQ8 + (row + 1) * rowBytes,
-                    weightsQ8 + (row + 2) * rowBytes,
-                    weightsQ8 + (row + 3) * rowBytes,
-                    xQ8, blockCount, result + row);
-            }
-            for (; row < m; row++)
-            {
-                result[row] = VecDotQ8_0Avx512(weightsQ8 + row * rowBytes, xQ8, blockCount);
-            }
+            // VNNI vpdpbusd fused integer dot: 1 instruction / 32-lane block vs the
+            // abs/sign + dual-madd AVX2/AVX-512 emulation. See MatMulVnni.cs.
+            ComputeRowsVnni(weightsQ8, xQ8, result, m, blockCount);
         }
         else if (Avx512BW.IsSupported)
         {
@@ -156,15 +145,15 @@ public static unsafe partial class MatMul
             for (; row + 3 < m; row += 4)
             {
                 VecDotQ8_0Avx512_4Rows(
-                    weightsQ8 + row * rowBytes,
-                    weightsQ8 + (row + 1) * rowBytes,
-                    weightsQ8 + (row + 2) * rowBytes,
-                    weightsQ8 + (row + 3) * rowBytes,
+                    weightsQ8 + (long)row * rowBytes,
+                    weightsQ8 + (long)(row + 1) * rowBytes,
+                    weightsQ8 + (long)(row + 2) * rowBytes,
+                    weightsQ8 + (long)(row + 3) * rowBytes,
                     xQ8, blockCount, result + row);
             }
             for (; row < m; row++)
             {
-                result[row] = VecDotQ8_0Avx512(weightsQ8 + row * rowBytes, xQ8, blockCount);
+                result[row] = VecDotQ8_0Avx512(weightsQ8 + (long)row * rowBytes, xQ8, blockCount);
             }
         }
         else if (Avx2.IsSupported)
@@ -174,22 +163,27 @@ public static unsafe partial class MatMul
             for (; row + 3 < m; row += 4)
             {
                 VecDotQ8_0Avx2_4Rows(
-                    weightsQ8 + row * rowBytes,
-                    weightsQ8 + (row + 1) * rowBytes,
-                    weightsQ8 + (row + 2) * rowBytes,
-                    weightsQ8 + (row + 3) * rowBytes,
+                    weightsQ8 + (long)row * rowBytes,
+                    weightsQ8 + (long)(row + 1) * rowBytes,
+                    weightsQ8 + (long)(row + 2) * rowBytes,
+                    weightsQ8 + (long)(row + 3) * rowBytes,
                     xQ8, blockCount, result + row);
             }
             for (; row < m; row++)
             {
-                result[row] = VecDotQ8_0Avx2(weightsQ8 + row * rowBytes, xQ8, blockCount);
+                result[row] = VecDotQ8_0Avx2(weightsQ8 + (long)row * rowBytes, xQ8, blockCount);
             }
+        }
+        else if (Ssse3.IsSupported)
+        {
+            // 128-bit tier for pre-AVX2 hardware (Westmere, #477); bit-exact with scalar.
+            ComputeRowsQ8_0Sse(weightsQ8, xQ8, result, m, blockCount);
         }
         else
         {
             for (int row = 0; row < m; row++)
             {
-                result[row] = VecDotQ8_0Scalar(weightsQ8 + row * rowBytes, xQ8, blockCount);
+                result[row] = VecDotQ8_0Scalar(weightsQ8 + (long)row * rowBytes, xQ8, blockCount);
             }
         }
     }
@@ -434,6 +428,14 @@ public static unsafe partial class MatMul
                 VecDotQ8_0Avx2_4RowsR4(groupBase, xQ8, blockCount, result + g * 4);
             }
         }
+        else if (Ssse3.IsSupported)
+        {
+            for (int g = 0; g < fullGroups; g++)
+            {
+                byte* groupBase = repackedWeights + (long)g * groupBytes;
+                VecDotQ8_0Sse_4RowsR4(groupBase, xQ8, blockCount, result + g * 4);
+            }
+        }
         else
         {
             for (int g = 0; g < fullGroups; g++)
@@ -450,9 +452,7 @@ public static unsafe partial class MatMul
             int rowBytes = blockCount * Q8_0BlockBytes;
             byte* tailBase = repackedWeights + (long)fullGroups * groupBytes;
             for (int r = 0; r < tailRows; r++)
-                result[fullGroups * 4 + r] = Avx2.IsSupported
-                    ? VecDotQ8_0Avx2(tailBase + (long)r * rowBytes, xQ8, blockCount)
-                    : VecDotQ8_0Scalar(tailBase + (long)r * rowBytes, xQ8, blockCount);
+                result[fullGroups * 4 + r] = VecDotQ8_0Row(tailBase + (long)r * rowBytes, xQ8, blockCount);
         }
     }
 
@@ -560,9 +560,7 @@ public static unsafe partial class MatMul
         int groupBytes = 4 * q8RowBytes;
 
         // Partition groups across threads, then tile within each thread's share.
-        int groupsPerThread = (ctx.FullGroups + threadCount - 1) / threadCount;
-        int startGroup = threadIdx * groupsPerThread;
-        int endGroup = Math.Min(startGroup + groupsPerThread, ctx.FullGroups);
+        ComputeThreadPool.PartitionRange(ctx.FullGroups, threadIdx, threadCount, out int startGroup, out int endGroup);
 
         for (int gStart = startGroup; gStart < endGroup; gStart += ctx.TileGroups)
         {
@@ -974,6 +972,19 @@ public static unsafe partial class MatMul
     /// (<c>vpmaddubsw</c> + <c>vpmaddwd</c>) is replaced by a single <c>vpdpbusd</c>.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// <b>Requires AVX-512F in addition to AVX-VNNI.</b> Despite the name, the block-pair
+    /// accumulator is a <see cref="Vector512{T}"/> fed by <c>Avx512F.ConvertToVector512Single</c>
+    /// and <c>Avx512F.FusedMultiplyAdd</c> (see <c>ProcessVnniDualBlock</c>), so an
+    /// <c>AvxVnni.IsSupported</c>-only guard is <em>not</em> sufficient: on AVX-VNNI-without-AVX-512
+    /// hardware (Meteor Lake, Alder/Raptor Lake) this throws
+    /// <c>PlatformNotSupportedException</c> as soon as <paramref name="blockCount"/> reaches 2 —
+    /// at <c>blockCount == 1</c> the paired loop never runs and the fault is not reached, which is
+    /// exactly what made a mis-guarded call site look like a partial failure. Guard on
+    /// <c>Avx512BW.IsSupported &amp;&amp; AvxVnni.IsSupported</c>. For the AVX-VNNI-only 4-row path
+    /// use <see cref="VecDotQ8_0VnniZp_4Rows"/>, which is what <see cref="ComputeRowsVnni"/>
+    /// dispatches to.
+    /// </para>
     /// Both forms group 4 consecutive byte products into one int32 lane, so results match
     /// bit-for-bit over the Q8_0 value range: the i16 intermediate in the non-VNNI path
     /// saturates only above 32767, and |x|,|w| &lt;= 127 bounds each lane at 2*127*127 = 32258.
@@ -1556,6 +1567,12 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     public static void GemvF16(nint weights, float* x, float* y, int m, int k)
     {
+        if (F16SseTier)
+        {
+            GemvF16Sse((ushort*)weights, x, y, m, k);
+            return;
+        }
+
         const int stackThreshold = 2048; // 8KB of floats
         Half* weightsHalf = (Half*)weights;
 
@@ -1564,7 +1581,7 @@ public static unsafe partial class MatMul
             float* rowBuf = stackalloc float[k];
             for (int row = 0; row < m; row++)
             {
-                var srcRow = new ReadOnlySpan<Half>(weightsHalf + row * k, k);
+                var srcRow = new ReadOnlySpan<Half>(weightsHalf + (long)row * k, k);
                 var destRow = new Span<float>(rowBuf, k);
                 TensorPrimitives.ConvertToSingle(srcRow, destRow);
                 y[row] = TensorPrimitives.Dot(destRow, new ReadOnlySpan<float>(x, k));
@@ -1577,7 +1594,7 @@ public static unsafe partial class MatMul
             {
                 for (int row = 0; row < m; row++)
                 {
-                    var srcRow = new ReadOnlySpan<Half>(weightsHalf + row * k, k);
+                    var srcRow = new ReadOnlySpan<Half>(weightsHalf + (long)row * k, k);
                     var destRow = rented.AsSpan(0, k);
                     TensorPrimitives.ConvertToSingle(srcRow, destRow);
                     y[row] = TensorPrimitives.Dot(destRow, new ReadOnlySpan<float>(x, k));
@@ -1598,6 +1615,14 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     public static void GemmF16(nint weights, float* b, float* c, int m, int k, int n)
     {
+        if (n == 1)
+        {
+            // Mirrors the pooled overload: single-token calls (e.g. MoE expert decode) take the
+            // GEMV path, which on the SSE tier is the fused convert+dot.
+            GemvF16(weights, b, c, m, k);
+            return;
+        }
+
         int rowBytes = k * sizeof(Half);
         int tileM = ComputeTileM(rowBytes);
         Half* weightsHalf = (Half*)weights;
@@ -1612,6 +1637,12 @@ public static unsafe partial class MatMul
                     int tileRows = Math.Min(tileM, m - mStart);
                     Half* tileWeightsHalf = weightsHalf + (long)mStart * k;
 
+                    if (F16SseTier)
+                    {
+                        GemmF16RowsSse(tileWeightsHalf, tileRows, b, c + mStart, m, k, n, rowBuf);
+                        continue;
+                    }
+
                     for (int t = 0; t < n; t++)
                     {
                         float* xPtr = b + t * k;
@@ -1619,6 +1650,10 @@ public static unsafe partial class MatMul
                         var xSpan = new ReadOnlySpan<float>(xPtr, k);
                         var destRow = new Span<float>(rowBuf, k);
 
+                        // `row * k` stays in int on purpose (issue #429 audit): the whole-tensor
+                        // offset is already carried in 64-bit by `tileWeightsHalf`, and
+                        // row < tileRows <= tileM <= 256 (ComputeTileM clamps), so the residual
+                        // product tops out at 255 * k — 4.2M for a 16384-wide 405B tensor.
                         for (int row = 0; row < tileRows; row++)
                         {
                             var srcRow = new ReadOnlySpan<Half>(tileWeightsHalf + row * k, k);
@@ -1719,9 +1754,9 @@ public static unsafe partial class MatMul
         c[2 * cStride + 0] = acc02; c[2 * cStride + 1] = acc12; c[2 * cStride + 2] = acc22; c[2 * cStride + 3] = acc32;
     }
 
-    // TODO: Experiment with 2×3 tile (2 rows × 3 tokens): 6 acc + 6 token + 1 ones + 3 temps = 16 YMM.
-    // This would process rows in pairs instead of individually, reducing token reloads by 2×
-    // while staying within AVX2's 16 YMM register budget. Needs benchmarking.
+    // Tile note: a 2x3 AVX2 variant fits the 16-YMM register budget on paper
+    // (6 acc + 6 token + 1 ones + 3 temps), but remains an optimization idea
+    // rather than a correctness gap. Keep the proven 1x4 path until benchmarked.
 
     /// <summary>
     /// AVX2 outer-product microkernel for Q8_0 R4 layout.
@@ -1962,9 +1997,10 @@ public static unsafe partial class MatMul
         absXHi = Avx2.Sign(vxHi, vxHi);
     }
 
-    // TODO: Check disasm on AVX-512 hardware — Vector512.Create(vec256, vec256) may emit
-    // unnecessary vinsertf64x4 instead of using ZMM directly. Consider manual Avx512F
-    // intrinsics if overhead is measurable.
+    // AVX-512 note: Vector512.Create(vec256, vec256) may lower through
+    // vinsertf64x4 on some JIT/hardware combinations. The current path is
+    // correct; revisit with manual Avx512F intrinsics only if disassembly and
+    // benchmarks show measurable overhead.
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void Avx512DualBlockFma(
@@ -2180,9 +2216,7 @@ public static unsafe partial class MatMul
 
         // Partition groups across threads
         int totalGroups = ctx.FullGroups + (ctx.TailRows > 0 ? 1 : 0);
-        int groupsPerThread = (totalGroups + threadCount - 1) / threadCount;
-        int startGroup = threadIdx * groupsPerThread;
-        int endGroup = Math.Min(startGroup + groupsPerThread, totalGroups);
+        ComputeThreadPool.PartitionRange(totalGroups, threadIdx, threadCount, out int startGroup, out int endGroup);
 
         if (startGroup >= totalGroups) return;
 
@@ -2398,6 +2432,8 @@ public static unsafe partial class MatMul
             byte* groupBase = ctx.RepackedWeights + (long)g * groupBytes;
             if (Avx2.IsSupported)
                 VecDotQ8_0Avx2_4RowsR4(groupBase, ctx.XQ, ctx.BlockCount, ctx.Result + g * 4);
+            else if (Ssse3.IsSupported)
+                VecDotQ8_0Sse_4RowsR4(groupBase, ctx.XQ, ctx.BlockCount, ctx.Result + g * 4);
             else
                 for (int r = 0; r < 4; r++)
                     ctx.Result[g * 4 + r] = VecDotQ8_0ScalarR4(groupBase, r, ctx.XQ, ctx.BlockCount);
@@ -2410,9 +2446,7 @@ public static unsafe partial class MatMul
             int tailEnd = Math.Min(end, ctx.M) - ctx.FullGroups * 4;
             byte* tailBase = ctx.RepackedWeights + (long)ctx.FullGroups * groupBytes;
             for (int r = tailStart; r < tailEnd; r++)
-                ctx.Result[ctx.FullGroups * 4 + r] = Avx2.IsSupported
-                    ? VecDotQ8_0Avx2(tailBase + (long)r * rowBytes, ctx.XQ, ctx.BlockCount)
-                    : VecDotQ8_0Scalar(tailBase + (long)r * rowBytes, ctx.XQ, ctx.BlockCount);
+                ctx.Result[ctx.FullGroups * 4 + r] = VecDotQ8_0Row(tailBase + (long)r * rowBytes, ctx.XQ, ctx.BlockCount);
         }
     }
 
@@ -2439,6 +2473,11 @@ public static unsafe partial class MatMul
         ref var ctx = ref Unsafe.AsRef<GemvF16Ctx>((void*)ctxPtr);
         PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
         if (count == 0) return;
+        if (F16SseTier)
+        {
+            GemvF16Sse((ushort*)ctx.Weights + (long)start * ctx.K, ctx.X, ctx.Y + start, count, ctx.K);
+            return;
+        }
         Half* weightsHalf = (Half*)ctx.Weights;
         float* scratch = (float*)ctx.ScratchPtrs[threadIdx];
         var xSpan = new ReadOnlySpan<float>(ctx.X, ctx.K);
@@ -2455,28 +2494,63 @@ public static unsafe partial class MatMul
     {
         ref var ctx = ref Unsafe.AsRef<GemmTiledQ8Ctx>((void*)ctxPtr);
         int totalTiles = (ctx.M + ctx.TileM - 1) / ctx.TileM;
-        int tilesPerThread = (totalTiles + threadCount - 1) / threadCount;
-        int startTile = threadIdx * tilesPerThread;
-        int endTile = Math.Min(startTile + tilesPerThread, totalTiles);
 
-        for (int tile = startTile; tile < endTile; tile++)
+        // 2D partition: when totalTiles < threadCount (common for small models
+        // with narrow projections like SmolLM-135M QKV at 576×576), pure
+        // row-tile partition leaves threads idle. Split each tile across a
+        // subset of threads along N (the token dimension), preserving the
+        // L2-resident weight tile while restoring full parallelism.
+        if (totalTiles >= threadCount)
         {
-            int mStart = tile * ctx.TileM;
-            int tileRows = Math.Min(ctx.TileM, ctx.M - mStart);
-            byte* tileWeights = ctx.WeightsQ8 + (long)mStart * ctx.Q8RowBytes;
-            for (int t = 0; t < ctx.N; t++)
-                ComputeRows(tileWeights, ctx.InputQ8 + t * ctx.Q8RowBytes,
-                            ctx.C + t * ctx.M + mStart, tileRows, ctx.BlockCount);
+            // Row-only partition — enough tiles for every thread.
+            int tilesPerThread = (totalTiles + threadCount - 1) / threadCount;
+            int startTile = threadIdx * tilesPerThread;
+            int endTile = Math.Min(startTile + tilesPerThread, totalTiles);
+
+            for (int tile = startTile; tile < endTile; tile++)
+            {
+                int mStart = tile * ctx.TileM;
+                int tileRows = Math.Min(ctx.TileM, ctx.M - mStart);
+                byte* tileWeights = ctx.WeightsQ8 + (long)mStart * ctx.Q8RowBytes;
+                for (int t = 0; t < ctx.N; t++)
+                    ComputeRows(tileWeights, ctx.InputQ8 + t * ctx.Q8RowBytes,
+                                ctx.C + t * ctx.M + mStart, tileRows, ctx.BlockCount);
+            }
+            return;
         }
+
+        // 2D partition: evenly split M into `totalTiles` row-groups (may differ
+        // from TileM when M % TileM ≠ 0 — balances per-thread work), then split
+        // each row-group's N tokens across the threads assigned to it.
+        int rowGroup = threadIdx % totalTiles;
+        int tokenGroup = threadIdx / totalTiles;
+        int threadsInRowGroup = (threadCount - rowGroup + totalTiles - 1) / totalTiles;
+
+        // Uniform row partition: rowsPerGroup * totalTiles may exceed M so the
+        // last row-group's tail clips naturally via Math.Min below. Align to 4
+        // so each group still hits the 4-row VecDot batch path.
+        int rowsPerGroup = ((ctx.M + totalTiles - 1) / totalTiles + 3) & ~3;
+        int mStart2 = rowGroup * rowsPerGroup;
+        if (mStart2 >= ctx.M) return;
+        int tileRows2 = Math.Min(rowsPerGroup, ctx.M - mStart2);
+        byte* tileWeights2 = ctx.WeightsQ8 + (long)mStart2 * ctx.Q8RowBytes;
+
+        // Partition [0, N) across the threads in this row-group.
+        int tokensPerGroup = (ctx.N + threadsInRowGroup - 1) / threadsInRowGroup;
+        int tStart = tokenGroup * tokensPerGroup;
+        if (tStart >= ctx.N) return;
+        int tEnd = Math.Min(tStart + tokensPerGroup, ctx.N);
+
+        for (int t = tStart; t < tEnd; t++)
+            ComputeRows(tileWeights2, ctx.InputQ8 + t * ctx.Q8RowBytes,
+                        ctx.C + t * ctx.M + mStart2, tileRows2, ctx.BlockCount);
     }
 
     private static void GemmTiledF32Worker(nint ctxPtr, int threadIdx, int threadCount)
     {
         ref var ctx = ref Unsafe.AsRef<GemmTiledF32Ctx>((void*)ctxPtr);
         int totalTiles = (ctx.M + ctx.TileM - 1) / ctx.TileM;
-        int tilesPerThread = (totalTiles + threadCount - 1) / threadCount;
-        int startTile = threadIdx * tilesPerThread;
-        int endTile = Math.Min(startTile + tilesPerThread, totalTiles);
+        ComputeThreadPool.PartitionRange(totalTiles, threadIdx, threadCount, out int startTile, out int endTile);
 
         for (int tile = startTile; tile < endTile; tile++)
         {
@@ -2492,9 +2566,7 @@ public static unsafe partial class MatMul
     {
         ref var ctx = ref Unsafe.AsRef<GemmTiledF16Ctx>((void*)ctxPtr);
         int totalTiles = (ctx.M + ctx.TileM - 1) / ctx.TileM;
-        int tilesPerThread = (totalTiles + threadCount - 1) / threadCount;
-        int startTile = threadIdx * tilesPerThread;
-        int endTile = Math.Min(startTile + tilesPerThread, totalTiles);
+        ComputeThreadPool.PartitionRange(totalTiles, threadIdx, threadCount, out int startTile, out int endTile);
 
         Half* weightsHalf = (Half*)ctx.Weights;
         float* rowBuf = (float*)ctx.ScratchPtrs[threadIdx];
@@ -2505,11 +2577,18 @@ public static unsafe partial class MatMul
             int mStart = tile * ctx.TileM;
             int tileRows = Math.Min(ctx.TileM, ctx.M - mStart);
             Half* tileWeightsHalf = weightsHalf + (long)mStart * ctx.K;
+            if (F16SseTier)
+            {
+                GemmF16RowsSse(tileWeightsHalf, tileRows, ctx.B, ctx.C + mStart, ctx.M, ctx.K, ctx.N, rowBuf);
+                continue;
+            }
             for (int t = 0; t < ctx.N; t++)
             {
                 float* xPtr = ctx.B + t * ctx.K;
                 float* outPtr = ctx.C + t * ctx.M + mStart;
                 var xSpan = new ReadOnlySpan<float>(xPtr, ctx.K);
+                // See GemmF16: `row * ctx.K` is deliberately int — the tensor-scale offset lives
+                // in `tileWeightsHalf` (64-bit) and row < tileRows <= ctx.TileM <= 256.
                 for (int row = 0; row < tileRows; row++)
                 {
                     var srcRow = new ReadOnlySpan<Half>(tileWeightsHalf + row * ctx.K, ctx.K);
@@ -2656,9 +2735,15 @@ public static unsafe partial class MatMul
         int tileM = ComputeTileM(q8RowBytes);
         int totalTiles = (m + tileM - 1) / tileM;
 
+        // Only skip dispatch when a single token on a single tile isn't worth
+        // the Dispatch round-trip. `GemmTiledQ8Worker` handles totalTiles=1 via
+        // the 2D (row × token) partition, so totalTiles=1 with N>1 still wins
+        // from parallelism (SmolLM-135M K/V is 192×576×512, totalTiles=1).
+        bool singleThread = totalTiles < 2 && n < 4;
+
         if (preQuantizedInput != null)
         {
-            if (totalTiles < 2)
+            if (singleThread)
             {
                 ComputeGemmTiled(weightsQ8, preQuantizedInput, c, m, n, blockCount2);
                 return;
@@ -2680,7 +2765,7 @@ public static unsafe partial class MatMul
             for (int t = 0; t < n; t++)
                 QuantizeF32ToQ8_0(b + t * k, rentedPtr + t * q8RowBytes, k);
 
-            if (totalTiles < 2)
+            if (singleThread)
             {
                 ComputeGemmTiled(weightsQ8, rentedPtr, c, m, n, blockCount2);
             }

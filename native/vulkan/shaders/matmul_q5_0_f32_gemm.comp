@@ -1,0 +1,182 @@
+#version 450
+// Q5_0 batched matrix multiplication (prefill-path GEMM).
+//
+//   C[N, M] = B[N, K] @ W_q5_0[M, K]^T      with W_q5_0 dequantized on the fly.
+//
+// Companion to matmul_q5_0_f32_gemv.comp (decode-path GEMV) and q5_0_dequant_f32.comp
+// (Task 4, proven against real GGUF bytes). Structural sibling of
+// matmul_q8_0_gemm.comp: Q5_0 and Q8_0 both organise a row as (K/32) direct
+// blocks (no K-quant super-block/sub-block nesting), so the tile shape and
+// shared-memory staging pattern here are copied verbatim from that file with
+// only the block decode swapped in.
+//
+// Block layout (matches q5_0_dequant_f32.comp / matmul_q5_0_f32_gemv.comp /
+// DotLLM.Cpu.Kernels.Dequantize.DequantizeQ5_0Scalar), 22 bytes, 32 elements:
+//   bytes [0,1]   = fp16 d
+//   bytes [2..5]  = qh (uint32) — the 5th bit of every element
+//   bytes [6..21] = qs[16]      — two 4-bit nibbles per byte
+//
+// Per-element decode, j in [0,16):
+//   lo = qs[j] & 0xF          high bit = (qh >> j)        & 1  -> element j
+//   hi = (qs[j] >> 4) & 0xF   high bit = (qh >> (j + 16)) & 1  -> element j + 16
+//   value = d * ((bit << 4 | nibble) - 16)
+// This is the EXACT expression from q5_0_dequant_f32.comp (Task 4) — Q5_0
+// hides the 5th bit in a separate word, the same class of indexing that
+// shipped transposed in Q3_K, so it is not re-derived here. Note the high
+// half is element j + 16, never j — its x/W column index carries the +16.
+//
+// Tiling (copied verbatim from matmul_q8_0_gemm.comp — not a new tile shape):
+//   Output tile  = 16 rows of C (TILE_N) × 16 cols of C (TILE_M) = 256 cells.
+//   Workgroup    = (16, 16, 1) = 256 threads, one thread per output cell.
+//   K-chunk      = 32 elements (exactly one Q5_0 block).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint blocksPerRow;
+    uint rowUints;
+} pc;
+
+const uint TILE_M = 16u;
+const uint TILE_N = 16u;
+const uint BLOCK = 32u;               // Q5_0 group size
+const uint Q5_0_BLOCK_BYTES = 22u;
+
+shared float sharedB[TILE_N * BLOCK];
+shared float sharedW[TILE_M * BLOCK];
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+uint readUint(uint absByteOff) {
+    return readByte(absByteOff)
+         | (readByte(absByteOff + 1u) << 8)
+         | (readByte(absByteOff + 2u) << 16)
+         | (readByte(absByteOff + 3u) << 24);
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x * TILE_M + gl_LocalInvocationID.x;
+    uint t = gl_WorkGroupID.y * TILE_N + gl_LocalInvocationID.y;
+
+    uint tid = gl_LocalInvocationID.y * TILE_M + gl_LocalInvocationID.x;
+
+    uint mBase = gl_WorkGroupID.x * TILE_M;
+    uint tBase = gl_WorkGroupID.y * TILE_N;
+
+    uint rowByteStride = pc.blocksPerRow * Q5_0_BLOCK_BYTES;
+
+    float acc = 0.0;
+
+    for (uint kBlock = 0u; kBlock < pc.blocksPerRow; kBlock++) {
+        uint kBase = kBlock * BLOCK;
+
+        // ── 1. Stage sharedB[TILE_N, 32] (16×32 = 512 floats). ──
+        // 256 threads, 2 floats per thread.
+        {
+            uint flat0 = tid * 2u;
+            uint flat1 = flat0 + 1u;
+
+            uint row0 = flat0 / BLOCK;
+            uint col0 = flat0 - row0 * BLOCK;
+            uint row1 = flat1 / BLOCK;
+            uint col1 = flat1 - row1 * BLOCK;
+
+            uint tGlobal0 = tBase + row0;
+            uint tGlobal1 = tBase + row1;
+
+            float v0 = 0.0;
+            float v1 = 0.0;
+            if (tGlobal0 < pc.N) v0 = b[tGlobal0 * pc.K + kBase + col0];
+            if (tGlobal1 < pc.N) v1 = b[tGlobal1 * pc.K + kBase + col1];
+            sharedB[flat0] = v0;
+            sharedB[flat1] = v1;
+        }
+
+        // ── 2. Dequantize sharedW[TILE_M, 32] (16×32 = 512 floats). ──
+        // 16 threads per weight row (tid / 16 -> mLocal, tid % 16 -> lane).
+        // lane in [0,16) picks the qs byte (element `lane` = low nibble,
+        // element `lane + 16` = high nibble), matching the dequant/GEMV
+        // kernels exactly.
+        {
+            uint mLocal = tid / TILE_M;
+            uint lane   = tid - mLocal * TILE_M;
+            uint mGlobal = mBase + mLocal;
+
+            float d = 0.0;
+            uint qh = 0u;
+            uint qsBase = 0u;
+            bool rowValid = mGlobal < pc.M;
+            if (rowValid) {
+                uint blockBase = mGlobal * rowByteStride + kBlock * Q5_0_BLOCK_BYTES;
+                d = readHalf(blockBase);
+                qh = readUint(blockBase + 2u);
+                qsBase = blockBase + 6u;
+            }
+
+            uint colLo = lane;
+            uint colHi = lane + 16u;
+
+            float wLo = 0.0;
+            float wHi = 0.0;
+            if (rowValid) {
+                uint qsByte = readByte(qsBase + lane);
+                uint nibbleLo = qsByte & 0xFu;
+                uint nibbleHi = (qsByte >> 4) & 0xFu;
+                uint bitLo = (qh >> lane) & 1u;
+                uint bitHi = (qh >> (lane + 16u)) & 1u;
+                int qLo = int(nibbleLo | (bitLo << 4)) - 16;
+                int qHi = int(nibbleHi | (bitHi << 4)) - 16;
+                wLo = d * float(qLo);
+                wHi = d * float(qHi);
+            }
+
+            uint sBase = mLocal * BLOCK;
+            sharedW[sBase + colLo] = wLo;
+            sharedW[sBase + colHi] = wHi;
+        }
+
+        barrier();
+
+        // ── 3. Partial dot product. ──
+        {
+            uint bOff = gl_LocalInvocationID.y * BLOCK;
+            uint wOff = gl_LocalInvocationID.x * BLOCK;
+            float chunk = 0.0;
+            for (uint j = 0u; j < BLOCK; j++) {
+                chunk += sharedB[bOff + j] * sharedW[wOff + j];
+            }
+            acc += chunk;
+        }
+
+        barrier();
+    }
+
+    if (m < pc.M && t < pc.N) {
+        c[t * pc.M + m] = acc;
+    }
+}

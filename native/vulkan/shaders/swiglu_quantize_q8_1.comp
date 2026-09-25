@@ -1,0 +1,83 @@
+#version 450
+// Fused SwiGLU activation + Q8_1 activation quantization for the decode path
+// (issue #71, sibling of rmsnorm_quantize_q8_1.comp / issue #145). One
+// dispatch producing BOTH the gated F32 row
+//   siluOut[i] = gate[i] * sigmoid(gate[i]) * up[i]
+// AND its Q8_1 quantization (packed int8 xq + per-32-block (scale, sum) xds)
+// for the down_proj dp4a MMVQ GEMV. Replaces the standalone
+//   swiglu_f32 (1 WG)  ->  barrier  ->  quantize_q8_1 (1 WG)
+// pair that runs before the down_proj MMVQ GEMV at every dense-FFN decode
+// layer, saving one dispatch + one full-pipeline barrier per layer.
+//
+// Unlike rmsnorm_quantize_q8_1.comp, this fusion needs NO reduction phase —
+// SwiGLU is pointwise (no cross-element dependency), so there is no barrier
+// inside this shader either; every thread computes its block(s) independently
+// straight from gate[]/up[] into siluOut[]/xq[]/xds[].
+//
+// PARITY CONTRACT: outputs must be bit-identical to the standalone pair.
+//   - `g * sig * u` uses the exact expression order of swiglu_f32.comp.
+//   - The quantization (amax loop, d = amax/127, round, pack, block sum) is
+//     copied verbatim from quantize_q8_1.comp / rmsnorm_quantize_q8_1.comp.
+//
+// Also writes the gated F32 row (siluOut) because a downstream consumer
+// besides the GEMV reads it (the down_proj LoRA delta).
+//
+// Dispatch: ONE workgroup (decode => one activation row); n multiple of 32.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufGate    { float gate[];    }; // [n]
+layout(set = 0, binding = 1, std430) readonly  buffer BufUp      { float up[];      }; // [n]
+layout(set = 0, binding = 2, std430) writeonly buffer BufSiluOut { float siluOut[]; }; // [n]
+layout(set = 0, binding = 3, std430) writeonly buffer BufXq      { uint  xq[];      }; // [n/4]
+layout(set = 0, binding = 4, std430) writeonly buffer BufXds     { vec2  xds[];     }; // [n/32]
+
+layout(push_constant) uniform PushConstants {
+    uint n;            // row length (multiple of 32)
+    uint blocksPerRow; // = n / 32
+} pc;
+
+const uint QK = 32u; // elements per Q8_1 block
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    // Gate + quantize, one thread per 32-block (grid-strided). No reduction,
+    // no barrier — SwiGLU is pointwise, so every block is independent.
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint base = b * QK;
+
+        float vals[QK];
+        float amax = 0.0;
+        for (uint i = 0u; i < QK; i++) {
+            float g = gate[base + i];
+            float sig = 1.0 / (1.0 + exp(-g));
+            float v = g * sig * up[base + i];
+            vals[i] = v;
+            siluOut[base + i] = v;
+            amax = max(amax, abs(v));
+        }
+
+        float d = amax / 127.0;
+        float id = (d != 0.0) ? (1.0 / d) : 0.0;
+
+        int sumI = 0;
+        uint qBase = base >> 2u; // 4 elements per uint
+        for (uint g2 = 0u; g2 < QK / 4u; g2++) {
+            uint e = g2 * 4u;
+            int q0 = int(round(vals[e + 0u] * id));
+            int q1 = int(round(vals[e + 1u] * id));
+            int q2 = int(round(vals[e + 2u] * id));
+            int q3 = int(round(vals[e + 3u] * id));
+            sumI += q0 + q1 + q2 + q3;
+            uint packed = (uint(q0) & 0xFFu)
+                        | ((uint(q1) & 0xFFu) << 8u)
+                        | ((uint(q2) & 0xFFu) << 16u)
+                        | ((uint(q3) & 0xFFu) << 24u);
+            xq[qBase + g2] = packed;
+        }
+
+        xds[b] = vec2(d, d * float(sumI));
+    }
+}

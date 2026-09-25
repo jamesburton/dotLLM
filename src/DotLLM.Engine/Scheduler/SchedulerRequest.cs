@@ -1,0 +1,165 @@
+using System.Diagnostics;
+using DotLLM.Core.Attention;
+using DotLLM.Core.Constraints;
+using DotLLM.Core.Models;
+using DotLLM.Core.Sampling;
+using DotLLM.Engine.Samplers;
+
+namespace DotLLM.Engine.Scheduler;
+
+/// <summary>
+/// Concrete in-flight sequence state owned by <see cref="ContinuousBatchScheduler"/>.
+/// </summary>
+/// <remarks>
+/// This type holds mutable scheduler state — generated tokens, KV-cache handle,
+/// sampler pipeline, stop conditions, completion source. Callers see this through
+/// <see cref="ISchedulerRequest"/> which exposes only safe read-only properties.
+/// </remarks>
+internal sealed class SchedulerRequest : ISchedulerRequest
+{
+    public InferenceRequest Request { get; }
+    public InferenceOptionsLike Options { get; }
+    public SequenceState State { get; set; }
+    public int PromptLength { get; }
+
+    /// <summary>Maximum tokens to generate (already clamped to model context length).</summary>
+    public int MaxTokens { get; }
+
+    /// <summary>The prompt token IDs. Borrowed from the request — never mutated.</summary>
+    public int[] PromptTokenIds => Request.TokenIds;
+
+    /// <summary>Tokens generated since prefill ended. Lazily allocated.</summary>
+    public List<int> GeneratedTokens { get; } = new();
+
+    public int GeneratedCount => GeneratedTokens.Count;
+    public int Position => PromptLength + GeneratedCount;
+
+    /// <summary>KV-cache assigned at admission time. Released when the sequence is evicted.</summary>
+    public IKvCache? KvCache { get; set; }
+
+    /// <summary>
+    /// Per-sequence recurrent state (Mamba SSM / GDN) for recurrent hosts that support caller-threaded
+    /// state (<see cref="IModel.SupportsThreadedSequenceState"/>). Allocated at admission, threaded
+    /// through this sequence's prefill/decode/resume forwards, and disposed when the KV-cache is
+    /// released. <see langword="null"/> for dense models and recurrent hosts without a threadable
+    /// state container (those keep the per-sequence model-owned-state loop).
+    /// </summary>
+    public IRecurrentSequenceState? RecurrentState { get; set; }
+
+    /// <summary>True when the cache was minted by the prefix trie manager; its completion
+    /// must be routed through <c>PrefixTrieManager.RecordCompletion</c> before disposal.</summary>
+    public bool IsPrefixCached { get; set; }
+
+    /// <summary>Prompt tokens that were reused from the prefix trie (no prefill needed).</summary>
+    public int PrefixCachedTokens { get; set; }
+
+    /// <summary>
+    /// True when this sequence was preempted and re-queued and must be re-admitted via the
+    /// recompute-on-resume path (rebuild KV from prompt + already-generated tokens) instead of a
+    /// fresh prompt prefill. Set when the scheduler preempts the sequence; cleared on resume.
+    /// </summary>
+    public bool IsResuming { get; set; }
+
+    /// <summary>Sampler pipeline built from the request's <c>InferenceOptions</c>.</summary>
+    public SamplerPipeline SamplerPipeline { get; }
+
+    /// <summary>Stop conditions (EOS + max-tokens + user-supplied stop strings).</summary>
+    public IReadOnlyList<IStopCondition> StopConditions { get; }
+
+    /// <summary>Optional decoding constraint for structured output (JSON / schema / regex / grammar).</summary>
+    public IDecodingConstraint? Constraint { get; }
+
+    /// <summary>
+    /// Per-sequence incremental detokenizer, present <b>only</b> when this request registered at
+    /// least one <see cref="DotLLM.Engine.Samplers.StopConditions.StopStringCondition"/> (#459).
+    /// Stop strings match on decoded text, so without it the scheduler had no tail to test and
+    /// every stop string — user-supplied or built-in like <c>&lt;|eom_id|&gt;</c> — was silently
+    /// inert. <see langword="null"/> when only token-level conditions (EOS, max-tokens) are
+    /// registered, which keeps the detokenize cost off requests that cannot use it.
+    /// </summary>
+    public IncrementalDetokenizer? Detokenizer { get; set; }
+
+    /// <summary>Scratch buffer for <see cref="IncrementalDetokenizer.GetTailView"/>, sized by
+    /// <see cref="StopTailSize"/>. Allocated once per request rather than pooled: a sequence has
+    /// a dozen distinct terminal paths (completion, cancellation, six failure sites) with no
+    /// single place to return a rented array, and the hot-path guarantee is per <i>token</i>, not
+    /// per request — this is one ~128-byte array beside an already-allocated
+    /// <c>List&lt;int&gt;(maxTokens)</c>.</summary>
+    public char[] StopScratch { get; set; } = [];
+
+    /// <summary>Character window handed to stop conditions; covers the longest registered stop
+    /// string with a cushion.</summary>
+    public int StopTailSize { get; set; }
+
+    /// <summary>
+    /// The stop <i>string</i> that ended this sequence, or <see langword="null"/> when it ended on
+    /// EOS, max-tokens or cancellation. The triggering token is deliberately kept in
+    /// <see cref="GeneratedTokens"/> — the match may cover only a suffix of it — and the stop
+    /// string is trimmed from the decoded text instead, at the character boundary. Recorded rather
+    /// than recomputed because the trim makes it unrecoverable from the returned text.
+    /// </summary>
+    public string? MatchedStopSequence { get; set; }
+
+    /// <summary>Reason this sequence stopped (set when transitioning to <see cref="SequenceState.Completed"/>).</summary>
+    public FinishReason FinishReason { get; set; } = FinishReason.Length;
+
+    /// <summary>Wall-clock prefill ticks (set during admission's prefill pass).</summary>
+    public long PrefillTicks { get; set; }
+
+    /// <summary>Cumulative decode forward-pass ticks across all iterations.</summary>
+    public long DecodeTicks { get; set; }
+
+    /// <summary>Cumulative sampling ticks across all iterations.</summary>
+    public long SamplerTicks { get; set; }
+
+    /// <summary>Completion source resolved when the sequence finishes.</summary>
+    public TaskCompletionSource<InferenceResponse> CompletionSource { get; }
+
+    public Task<InferenceResponse> Completion => CompletionSource.Task;
+
+    /// <summary>Cancellation registration on the caller's token; disposed on completion.</summary>
+    public CancellationTokenRegistration CancellationRegistration { get; set; }
+
+    /// <summary>Monotonic submission counter used for FIFO tie-breaking among same-priority requests.</summary>
+    public long SubmissionOrder { get; }
+
+    /// <summary>
+    /// Start-time-fair-queuing start tag assigned at submission (0 when fairness is disabled). Used as
+    /// the intra-priority-tier ordering key and preserved across preemption re-queues so a resumed
+    /// request keeps its fair position. See <c>ContinuousBatchSchedulerOptions.EnableFairness</c>.
+    /// </summary>
+    public long FairnessTag { get; set; }
+
+    public SchedulerRequest(
+        InferenceRequest request,
+        InferenceOptionsLike options,
+        int promptLength,
+        int maxTokens,
+        SamplerPipeline samplerPipeline,
+        IReadOnlyList<IStopCondition> stopConditions,
+        IDecodingConstraint? constraint,
+        long submissionOrder,
+        TaskCompletionSource<InferenceResponse> tcs)
+    {
+        Debug.Assert(request != null);
+        Debug.Assert(promptLength > 0);
+        Debug.Assert(maxTokens > 0);
+
+        Request = request;
+        Options = options;
+        PromptLength = promptLength;
+        MaxTokens = maxTokens;
+        SamplerPipeline = samplerPipeline;
+        StopConditions = stopConditions;
+        Constraint = constraint;
+        SubmissionOrder = submissionOrder;
+        CompletionSource = tcs;
+        State = SequenceState.Queued;
+    }
+}
+
+/// <summary>
+/// Minimal projection of <see cref="DotLLM.Core.Configuration.InferenceOptions"/> the scheduler
+/// needs after pipeline construction. Avoids carrying the full options record per sequence.
+/// </summary>
+internal readonly record struct InferenceOptionsLike(int MaxTokens, bool Logprobs, int TopLogprobs);

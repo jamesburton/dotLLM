@@ -1,0 +1,33 @@
+#version 450
+// GeGLU activation (tanh-approximate GELU): y[i] = gelu_tanh(gate[i]) * up[i]
+//   gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+// Mirrors DotLLM.Cpu.Kernels.FusedOps.GeGLUTanh (Gemma 2 / Gemma 3 MLP).
+//
+// Pointwise, no reduction — one thread per output element. Shape-identical to
+// swiglu_f32; only the gate activation differs (GELU-tanh vs SiLU).
+// Dispatch:
+//   local_size_x = 256
+//   groupCount.x = ceil(n / 256)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufGate   { float gate[];   };
+layout(set = 0, binding = 1, std430) readonly  buffer BufUp     { float up[];     };
+layout(set = 0, binding = 2, std430) writeonly buffer BufResult { float result[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+} pc;
+
+const float SQRT_2_OVER_PI = 0.7978845608028654;
+const float CUBIC_COEFF    = 0.044715;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+
+    float g = gate[i];
+    float inner = SQRT_2_OVER_PI * (g + CUBIC_COEFF * g * g * g);
+    float gelu = 0.5 * g * (1.0 + tanh(inner));
+    result[i] = gelu * up[i];
+}

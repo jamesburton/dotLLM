@@ -1,0 +1,369 @@
+using System.Runtime.InteropServices;
+
+namespace DotLLM.Vulkan.Interop;
+
+/// <summary>
+/// Minimal P/Invoke declarations against the Vulkan loader (libvulkan.so.1 / vulkan-1.dll).
+/// All functions return <c>VkResult</c> (int): 0 = VK_SUCCESS, negative = error,
+/// positive = non-error status (e.g. VK_INCOMPLETE).
+/// </summary>
+/// <remarks>
+/// The library name "vulkan-1" is rewritten to the correct OS binary by
+/// <see cref="VulkanLibraryResolver"/> at runtime.
+/// Handles (VkInstance, VkDevice, VkBuffer, etc.) cross the boundary as <c>nint</c>
+/// so tensor payloads never traverse P/Invoke — only opaque pointers.
+/// </remarks>
+internal static partial class VulkanApi
+{
+    private const string LibName = "vulkan-1";
+
+    // ── Instance ────────────────────────────────────────────────────
+
+    [LibraryImport(LibName)]
+    internal static partial int vkCreateInstance(
+        in VkInstanceCreateInfo pCreateInfo, nint pAllocator, out nint pInstance);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkDestroyInstance(nint instance, nint pAllocator);
+
+    // ── Physical device ─────────────────────────────────────────────
+
+    [LibraryImport(LibName)]
+    internal static partial int vkEnumeratePhysicalDevices(
+        nint instance, ref uint pPhysicalDeviceCount,
+        [Out] nint[]? pPhysicalDevices);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkGetPhysicalDeviceProperties(
+        nint physicalDevice, out VkPhysicalDeviceProperties pProperties);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkGetPhysicalDeviceMemoryProperties(
+        nint physicalDevice, out VkPhysicalDeviceMemoryProperties pMemoryProperties);
+
+    // Vulkan 1.1 core: chain-aware memory-property query. Used only for
+    // diagnostics, to chain VkPhysicalDeviceMemoryBudgetPropertiesEXT and read
+    // the driver's PER-PROCESS heap usage/budget at an allocation failure.
+    // Takes a raw blob because the chained struct is written by hand at the
+    // call site (see VulkanDevice.MemorySnapshot).
+    [LibraryImport(LibName)]
+    internal static unsafe partial void vkGetPhysicalDeviceMemoryProperties2(
+        nint physicalDevice, byte* pMemoryProperties);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkGetPhysicalDeviceQueueFamilyProperties(
+        nint physicalDevice, ref uint pQueueFamilyPropertyCount,
+        [Out] VkQueueFamilyProperties[]? pQueueFamilyProperties);
+
+    // Vulkan 1.1 core entry point: chain-aware property query. We use it to
+    // fetch VkPhysicalDeviceSubgroupProperties via pNext. On Vulkan 1.0-only
+    // drivers this symbol may be missing; VulkanDevice guards the call by
+    // inspecting the reported apiVersion before invoking.
+    [LibraryImport(LibName)]
+    internal static partial void vkGetPhysicalDeviceProperties2(
+        nint physicalDevice, ref VkPhysicalDeviceProperties2 pProperties);
+
+    // Vulkan 1.1 core: chain-aware feature query. Used by the cooperative
+    // matrix probe to check the VkPhysicalDeviceCooperativeMatrixFeaturesKHR
+    // bit after the extension is verified.
+    [LibraryImport(LibName)]
+    internal static partial void vkGetPhysicalDeviceFeatures2(
+        nint physicalDevice, ref VkPhysicalDeviceFeatures2 pFeatures);
+
+    // Enumerates device extensions reported by a physical device. Used by the
+    // cooperative-matrix probe to gate on VK_KHR_cooperative_matrix before
+    // attempting to resolve the associated function pointer — drivers that
+    // don't advertise the extension may not implement the query at all.
+    [LibraryImport(LibName)]
+    internal static partial int vkEnumerateDeviceExtensionProperties(
+        nint physicalDevice, nint pLayerName,
+        ref uint pPropertyCount, nint pProperties);
+
+    // vkGetInstanceProcAddr — Vulkan 1.0 core loader function. Returns a
+    // native function pointer for an instance-level entry point. Used for
+    // dynamically resolving extension functions (e.g.
+    // vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) that aren't linked
+    // statically through the loader's symbol table on every driver.
+    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint vkGetInstanceProcAddr(nint instance, string pName);
+
+    // vkGetDeviceProcAddr — Vulkan 1.0 core. Returns a native function
+    // pointer for a device-level entry point. Used to resolve
+    // vkGetMemoryHostPointerPropertiesEXT for the host-import zero-copy
+    // weight path (VK_EXT_external_memory_host).
+    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint vkGetDeviceProcAddr(nint device, string pName);
+
+    // ── Logical device ──────────────────────────────────────────────
+
+    [LibraryImport(LibName)]
+    internal static partial int vkCreateDevice(
+        nint physicalDevice, in VkDeviceCreateInfo pCreateInfo,
+        nint pAllocator, out nint pDevice);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkDestroyDevice(nint device, nint pAllocator);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkGetDeviceQueue(
+        nint device, uint queueFamilyIndex, uint queueIndex, out nint pQueue);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkDeviceWaitIdle(nint device);
+
+    // ── Memory ──────────────────────────────────────────────────────
+
+    [LibraryImport(LibName)]
+    internal static partial int vkAllocateMemory(
+        nint device, in VkMemoryAllocateInfo pAllocateInfo,
+        nint pAllocator, out nint pMemory);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkFreeMemory(
+        nint device, nint memory, nint pAllocator);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkMapMemory(
+        nint device, nint memory, ulong offset, ulong size,
+        uint flags, out nint ppData);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkUnmapMemory(nint device, nint memory);
+
+    // ── Buffers ─────────────────────────────────────────────────────
+
+    [LibraryImport(LibName)]
+    internal static partial int vkCreateBuffer(
+        nint device, in VkBufferCreateInfo pCreateInfo,
+        nint pAllocator, out nint pBuffer);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkDestroyBuffer(
+        nint device, nint buffer, nint pAllocator);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkBindBufferMemory(
+        nint device, nint buffer, nint memory, ulong memoryOffset);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkGetBufferMemoryRequirements(
+        nint device, nint buffer, out VkMemoryRequirements pMemoryRequirements);
+
+    // ── Shader modules ──────────────────────────────────────────────
+
+    [LibraryImport(LibName)]
+    internal static partial int vkCreateShaderModule(
+        nint device, in VkShaderModuleCreateInfo pCreateInfo,
+        nint pAllocator, out nint pShaderModule);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkDestroyShaderModule(
+        nint device, nint shaderModule, nint pAllocator);
+
+    // ── Pipeline layout & compute pipeline ──────────────────────────
+
+    [LibraryImport(LibName)]
+    internal static partial int vkCreatePipelineLayout(
+        nint device, in VkPipelineLayoutCreateInfo pCreateInfo,
+        nint pAllocator, out nint pPipelineLayout);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkDestroyPipelineLayout(
+        nint device, nint pipelineLayout, nint pAllocator);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkCreateComputePipelines(
+        nint device, nint pipelineCache, uint createInfoCount,
+        in VkComputePipelineCreateInfo pCreateInfos,
+        nint pAllocator, out nint pPipelines);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkDestroyPipeline(
+        nint device, nint pipeline, nint pAllocator);
+
+    // ── Descriptor sets ─────────────────────────────────────────────
+
+    [LibraryImport(LibName)]
+    internal static partial int vkCreateDescriptorSetLayout(
+        nint device, in VkDescriptorSetLayoutCreateInfo pCreateInfo,
+        nint pAllocator, out nint pSetLayout);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkDestroyDescriptorSetLayout(
+        nint device, nint descriptorSetLayout, nint pAllocator);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkCreateDescriptorPool(
+        nint device, in VkDescriptorPoolCreateInfo pCreateInfo,
+        nint pAllocator, out nint pDescriptorPool);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkDestroyDescriptorPool(
+        nint device, nint descriptorPool, nint pAllocator);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkAllocateDescriptorSets(
+        nint device, in VkDescriptorSetAllocateInfo pAllocateInfo,
+        out nint pDescriptorSets);
+
+    /// <summary>Returns all descriptor sets from the pool to the pool's free list; safe once no command buffer using them is still in flight.</summary>
+    [LibraryImport(LibName)]
+    internal static partial int vkResetDescriptorPool(
+        nint device, nint descriptorPool, uint flags);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkUpdateDescriptorSets(
+        nint device, uint descriptorWriteCount,
+        nint pDescriptorWrites,
+        uint descriptorCopyCount, nint pDescriptorCopies);
+
+    // ── Command pool & command buffers ──────────────────────────────
+
+    [LibraryImport(LibName)]
+    internal static partial int vkCreateCommandPool(
+        nint device, in VkCommandPoolCreateInfo pCreateInfo,
+        nint pAllocator, out nint pCommandPool);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkDestroyCommandPool(
+        nint device, nint commandPool, nint pAllocator);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkAllocateCommandBuffers(
+        nint device, in VkCommandBufferAllocateInfo pAllocateInfo,
+        out nint pCommandBuffers);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkFreeCommandBuffers(
+        nint device, nint commandPool, uint commandBufferCount,
+        in nint pCommandBuffers);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkBeginCommandBuffer(
+        nint commandBuffer, in VkCommandBufferBeginInfo pBeginInfo);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkEndCommandBuffer(nint commandBuffer);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkCmdBindPipeline(
+        nint commandBuffer, int pipelineBindPoint, nint pipeline);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkCmdBindDescriptorSets(
+        nint commandBuffer, int pipelineBindPoint, nint layout,
+        uint firstSet, uint descriptorSetCount, in nint pDescriptorSets,
+        uint dynamicOffsetCount, nint pDynamicOffsets);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkCmdPushConstants(
+        nint commandBuffer, nint layout, uint stageFlags,
+        uint offset, uint size, nint pValues);
+
+    // ── Timestamp queries (decode profiler, issue #143) ─────────────
+
+    [LibraryImport(LibName)]
+    internal static partial int vkCreateQueryPool(
+        nint device, in VkQueryPoolCreateInfo pCreateInfo, nint pAllocator, out nint pQueryPool);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkDestroyQueryPool(nint device, nint queryPool, nint pAllocator);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkCmdResetQueryPool(
+        nint commandBuffer, nint queryPool, uint firstQuery, uint queryCount);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkCmdWriteTimestamp(
+        nint commandBuffer, uint pipelineStage, nint queryPool, uint query);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkGetQueryPoolResults(
+        nint device, nint queryPool, uint firstQuery, uint queryCount,
+        nuint dataSize, nint pData, ulong stride, uint flags);
+
+    [LibraryImport(LibName, EntryPoint = "vkCmdDispatch")]
+    private static partial void vkCmdDispatchNative(
+        nint commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ);
+
+    /// <summary>Counted wrapper over <c>vkCmdDispatch</c> (see <see cref="ProfileCounters"/>).</summary>
+    internal static void vkCmdDispatch(
+        nint commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ)
+    {
+        ProfileCounters.Dispatches++;
+        vkCmdDispatchNative(commandBuffer, groupCountX, groupCountY, groupCountZ);
+    }
+
+    [LibraryImport(LibName, EntryPoint = "vkCmdCopyBuffer")]
+    private static partial void vkCmdCopyBufferNative(
+        nint commandBuffer, nint srcBuffer, nint dstBuffer,
+        uint regionCount, in VkBufferCopy pRegions);
+
+    /// <summary>Counted wrapper over <c>vkCmdCopyBuffer</c> (see <see cref="ProfileCounters"/>).</summary>
+    internal static void vkCmdCopyBuffer(
+        nint commandBuffer, nint srcBuffer, nint dstBuffer,
+        uint regionCount, in VkBufferCopy pRegions)
+    {
+        ProfileCounters.Copies++;
+        vkCmdCopyBufferNative(commandBuffer, srcBuffer, dstBuffer, regionCount, in pRegions);
+    }
+
+    // Inserts an execution / memory dependency between commands. Used on the
+    // hot forward path to chain kernel dispatches without a host wait: a
+    // SHADER_WRITE -> SHADER_READ memory barrier between kernels is enough to
+    // keep each kernel reading the previous kernel's outputs.
+    [LibraryImport(LibName)]
+    internal static partial void vkCmdPipelineBarrier(
+        nint commandBuffer,
+        uint srcStageMask, uint dstStageMask, uint dependencyFlags,
+        uint memoryBarrierCount, in VkMemoryBarrier pMemoryBarriers,
+        uint bufferMemoryBarrierCount, nint pBufferMemoryBarriers,
+        uint imageMemoryBarrierCount, nint pImageMemoryBarriers);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkQueueSubmit(
+        nint queue, uint submitCount, in VkSubmitInfo pSubmits, nint fence);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkQueueWaitIdle(nint queue);
+
+    // ── Fences ──────────────────────────────────────────────────────
+
+    [LibraryImport(LibName)]
+    internal static partial int vkCreateFence(
+        nint device, in VkFenceCreateInfo pCreateInfo,
+        nint pAllocator, out nint pFence);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkDestroyFence(
+        nint device, nint fence, nint pAllocator);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkWaitForFences(
+        nint device, uint fenceCount, in nint pFences,
+        [MarshalAs(UnmanagedType.U4)] uint waitAll, ulong timeout);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkResetFences(
+        nint device, uint fenceCount, in nint pFences);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkResetCommandBuffer(
+        nint commandBuffer, uint flags);
+
+    // ── Semaphores ──────────────────────────────────────────────────
+    // Used by the M3 cross-API handoff: an exportable VkSemaphore (created with
+    // VkExportSemaphoreCreateInfo on pNext) is signalled by the Vulkan forward
+    // submit and waited on by CUDA via cuWaitExternalSemaphoresAsync. The Win32
+    // HANDLE getter (vkGetSemaphoreWin32HandleKHR) is an extension entry point
+    // resolved at runtime via vkGetDeviceProcAddr — see VulkanDevice.
+
+    [LibraryImport(LibName)]
+    internal static partial int vkCreateSemaphore(
+        nint device, in VkSemaphoreCreateInfo pCreateInfo,
+        nint pAllocator, out nint pSemaphore);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkDestroySemaphore(
+        nint device, nint semaphore, nint pAllocator);
+}

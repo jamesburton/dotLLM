@@ -1,0 +1,84 @@
+#version 450
+// BF16 native matrix-vector multiplication (decode-path GEMV).
+//
+//   y[m] = sum_k  W_bf16[m, k] * x[k]
+//
+// Weights stored on device as IEEE-754-truncated brain float (BF16): 1 sign /
+// 8 exponent / 7 mantissa bits, 2 bytes per element. Activations / output are
+// FP32; accumulation FP32. Companion to matmul_f16_gemv_f32.comp — same
+// dispatch shape, same FP32-x convention. The only structural difference is
+// the unpack: BF16 → F32 is a left-shift-by-16 + reinterpret rather than
+// `unpackHalf2x16`.
+//
+// BF16 unpack: SPIR-V / GLSL 4.5 has no native bfloat16 type. The standard
+// trick is `f32 = uintBitsToFloat(bf16_bits << 16)` — BF16 is the top 16
+// bits of the F32 binary representation, so shifting them into the high half
+// and clearing the low 16 bits reconstructs F32 with zero mantissa-truncation
+// error (the truncation already happened at quantisation time). Standard,
+// fully portable, no extension required.
+//
+// Storage-buffer access:
+//   `weight` is bound as `uint[]`; each uint holds two BF16 elements
+//   (low 16 bits = element 2p, high 16 bits = element 2p+1). Extract with
+//   bit shifts; expand to F32 via shift-left-16 + uintBitsToFloat. This
+//   shader runs on every Vulkan 1.0+ driver — no float16 / bfloat16 extension
+//   used.
+//
+// Dispatch:
+//   One workgroup per output row. local_size_x = 128, shared-memory tree
+//   reduce. Mirrors matmul_q8_0.comp / matmul_f16_gemv_f32.comp.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; }; // BF16 blob, 4-byte indexable (2 BF16 per uint)
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };       // [K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };       // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;            // number of output rows
+    uint K;            // contraction dim (must be a multiple of 2)
+    uint pairsPerRow;  // = K / 2 — uints per row (each uint holds 2 BF16 elements)
+    uint rowUints;     // per-row uint stride (== pairsPerRow when K%2==0)
+} pc;
+
+shared float partials[128];
+
+// Expand a 16-bit BF16 bit pattern (in low 16 bits of `bits`) to F32.
+//   F32 = (uint(BF16) << 16) reinterpreted as float. Identical exponent
+//   layout to F32, mantissa low 16 bits zero (BF16 truncation is intrinsic
+//   to the source). Handles ±zero / ±inf / NaN naturally.
+float bf16_to_f32(uint bits) {
+    return uintBitsToFloat(bits << 16);
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowUintBase = m * pc.rowUints;
+
+    float acc = 0.0;
+
+    for (uint p = tid; p < pc.pairsPerRow; p += threads) {
+        uint packed = weight[rowUintBase + p];
+        uint loBits = packed & 0xFFFFu;
+        uint hiBits = (packed >> 16) & 0xFFFFu;
+        float w0 = bf16_to_f32(loBits);
+        float w1 = bf16_to_f32(hiBits);
+        uint kBase = p * 2u;
+        acc += w0 * x[kBase];
+        acc += w1 * x[kBase + 1u];
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}

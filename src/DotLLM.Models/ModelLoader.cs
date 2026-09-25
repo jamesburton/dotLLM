@@ -1,13 +1,20 @@
+using System.Buffers.Binary;
+using System.Text.Json;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
+using DotLLM.Tokenizers;
+using DotLLM.Tokenizers.Bpe;
+using DotLLM.Tokenizers.Hf;
 
 namespace DotLLM.Models;
 
 /// <summary>
-/// Convenience helper encapsulating the GGUF-open → config-extract → model-load pattern.
-/// Single dispatch point for all architecture creation.
+/// Convenience helper encapsulating the format-open → config-extract → model-load
+/// pattern. Single dispatch point for all architecture creation from either
+/// GGUF or HuggingFace safetensors on-disk layouts.
 /// </summary>
 public static class ModelLoader
 {
@@ -17,13 +24,549 @@ public static class ModelLoader
     /// </summary>
     /// <param name="path">Path to the GGUF model file.</param>
     /// <param name="threading">Threading configuration. Null defaults to single-threaded.</param>
+    /// <param name="diffusionOverride">
+    /// Optional masked-diffusion decode configuration to attach to the loaded
+    /// <see cref="ModelConfig.DiffusionConfig"/>. GGUF carries no diffusion
+    /// metadata, so a diffusion model (e.g. LLaDA-8B, which is a Llama backbone
+    /// generating by masked diffusion) must have its mask token id + canvas /
+    /// step / temperature schedule injected explicitly here. When
+    /// <see langword="null"/> (the default) the GGUF load is unchanged — the
+    /// resulting <see cref="ModelConfig.DiffusionConfig"/> stays whatever the
+    /// extractor produced (always <see langword="null"/> for GGUF today), so the
+    /// model decodes autoregressively. When supplied, the returned model is a
+    /// normal <see cref="TransformerModel"/> that
+    /// <c>DiffusionTextGenerator</c> drives via the hybrid mask.
+    /// </param>
     /// <returns>The loaded model, GGUF file handle, and model configuration.</returns>
     public static (IModel Model, GgufFile Gguf, ModelConfig Config) LoadFromGguf(
-        string path, ThreadingConfig? threading = null)
+        string path, ThreadingConfig? threading = null, DiffusionConfig? diffusionOverride = null)
     {
         var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
-        var model = TransformerModel.LoadFromGguf(gguf, config, threading ?? ThreadingConfig.SingleThreaded);
+        if (diffusionOverride is not null)
+            config = config with { DiffusionConfig = diffusionOverride };
+        IModel model = CreateCpuModelFromGguf(gguf, config, threading);
         return (model, gguf, config);
+    }
+
+    /// <summary>
+    /// Creates the architecture-appropriate CPU <see cref="IModel"/> for an already-opened
+    /// GGUF file. This is THE per-architecture CPU dispatch point — CLI commands and the
+    /// server call it so hybrid architectures (Nemotron-H Mamba layers, Qwen3MoeHybrid
+    /// Gated-DeltaNet layers) route to their dedicated loaders instead of the plain
+    /// <see cref="TransformerModel"/>, whose tensor naming they do not follow (e.g. a GDN
+    /// layer has no <c>attn_output.weight</c>).
+    /// </summary>
+    /// <param name="gguf">An opened GGUF file. Must remain alive for the lifetime of the model.</param>
+    /// <param name="config">Model configuration extracted from <paramref name="gguf"/>.</param>
+    /// <param name="threading">Threading configuration. Null defaults to single-threaded.</param>
+    /// <returns>The loaded CPU model.</returns>
+    public static IModel CreateCpuModelFromGguf(GgufFile gguf, ModelConfig config, ThreadingConfig? threading = null)
+    {
+        var effectiveThreading = threading ?? ThreadingConfig.SingleThreaded;
+        return config.Architecture switch
+        {
+            Architecture.NemotronH => NemotronHTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+            // #375 slice 2: nemotron_h_moe shares the NemotronH model class — the MoE
+            // FFN layers are detected per-layer by the ffn_gate_inp router tensor.
+            Architecture.NemotronHMoe => NemotronHTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+            Architecture.Qwen3MoeHybrid => Qwen3MoeHybridTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+            Architecture.Qwen3HybridDense => Qwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+            _ => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+        };
+    }
+
+    /// <summary>
+    /// Loads a GGUF model and attaches the supplied masked-diffusion decode
+    /// configuration, returning the loaded model together with the GGUF's
+    /// embedded tokenizer ready to hand to <c>DiffusionTextGenerator</c>.
+    /// </summary>
+    /// <remarks>
+    /// Convenience wrapper over <see cref="LoadFromGguf(string, ThreadingConfig?, DiffusionConfig?)"/>
+    /// for the diffusion case: a GGUF whose backbone is an autoregressive
+    /// architecture (LLaDA-8B is a Llama backbone) but which generates by masked
+    /// diffusion. The diffusion seam is not a model concern — the model exposes
+    /// the hybrid-mask canvas forward the generator drives, and the
+    /// <paramref name="diffusion"/> record (mask token + canvas / steps /
+    /// temperatures) supplies what GGUF metadata cannot.
+    /// </remarks>
+    /// <param name="path">Path to the GGUF model file.</param>
+    /// <param name="diffusion">Masked-diffusion decode configuration (required).</param>
+    /// <param name="threading">Threading configuration. Null defaults to single-threaded.</param>
+    /// <returns>The loaded model, GGUF file handle, model configuration (with
+    /// <see cref="ModelConfig.DiffusionConfig"/> set), and the embedded tokenizer.</returns>
+    public static (IModel Model, GgufFile Gguf, ModelConfig Config, BpeTokenizer Tokenizer) LoadGgufAsDiffusion(
+        string path, DiffusionConfig diffusion, ThreadingConfig? threading = null)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        ArgumentNullException.ThrowIfNull(diffusion);
+
+        var (model, gguf, config) = LoadFromGguf(path, threading, diffusion);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        return (model, gguf, config, tokenizer);
+    }
+
+    /// <summary>
+    /// Loads a model from a HuggingFace safetensors checkpoint. Accepts any of
+    /// three forms for <paramref name="safetensorsPath"/>:
+    /// <list type="bullet">
+    /// <item>A <c>*.safetensors</c> file — single-shard ingest, as before.</item>
+    /// <item>A <c>model.safetensors.index.json</c> file — multi-shard ingest driven
+    /// by the index's <c>weight_map</c>.</item>
+    /// <item>A directory — probed for <c>model.safetensors.index.json</c> first
+    /// (multi-shard), then a single <c>*.safetensors</c> (single-shard).</item>
+    /// </list>
+    /// In every case the directory containing the weights is scanned for a
+    /// <c>config.json</c> which drives both architecture dispatch and
+    /// <see cref="ModelConfig"/> population.
+    /// </summary>
+    /// <param name="safetensorsPath">
+    /// A <c>*.safetensors</c> file, a <c>model.safetensors.index.json</c>, or a
+    /// directory containing one of the above.
+    /// </param>
+    /// <param name="threading">Threading configuration. Null defaults to single-threaded.</param>
+    /// <returns>The loaded model, safetensors source, and model configuration.</returns>
+    /// <exception cref="FileNotFoundException">
+    /// The path or an accompanying <c>config.json</c> is missing.
+    /// </exception>
+    /// <exception cref="InvalidDataException">
+    /// <c>config.json</c> is malformed or declares an unsupported architecture,
+    /// or a multi-shard index references files missing on disk.
+    /// </exception>
+    public static (IModel Model, ISafetensorsTensorSource Safetensors, ModelConfig Config) LoadFromSafetensors(
+        string safetensorsPath, ThreadingConfig? threading = null)
+    {
+        ArgumentNullException.ThrowIfNull(safetensorsPath);
+
+        (ISafetensorsTensorSource source, ModelConfig config) = OpenSafetensorsAndConfig(safetensorsPath);
+
+        // BitNet checkpoints quantize every linear to ternary I2_S at load; an on-disk cache of
+        // the packed bytes lets repeat loads skip that dominant cost. Null for non-BitNet archs,
+        // when disabled via DOTLLM_I2S_CACHE=0, or when the cache dir is not writable.
+        BitNetI2SCacheContext? i2sCache = TryCreateBitNetI2SCache(safetensorsPath, config);
+
+        try
+        {
+            IModel model = config.Architecture switch
+            {
+                Architecture.Llama or Architecture.Mistral or Architecture.Phi or Architecture.Qwen
+                    or Architecture.Mixtral or Architecture.QwenMoe or Architecture.GraniteMoe
+                    or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
+                    or Architecture.SmolLM3
+                    or Architecture.Gemma3 or Architecture.Gemma4
+                    or Architecture.Gemma3n
+                    or Architecture.DiffusionGemma
+                    // BitNet b1.58 reuses the standard TransformerModel tower: the
+                    // safetensors loader quantizes each linear projection to ternary
+                    // I2_S (BitNetQuantize) and wires the attention/FFN Sub-LN weights,
+                    // while the forward pass honours the squared-ReLU FFN + Sub-LN from
+                    // the ModelConfig (ActivationFunction.ReluSquared + the Sub-LN
+                    // weights being present) — exactly as the GGUF BitNet path does.
+                    or Architecture.BitNet
+                    // DiffusionGemma reuses the Gemma-4 MoE transformer tower verbatim
+                    // (same forward path, same safetensors loader). The diffusion decode
+                    // seam is NOT a model concern — it lives in DiffusionTextGenerator,
+                    // which consumes this IModel + ModelConfig.DiffusionConfig (populated
+                    // by DiffusionGemmaConfigExtractor). The model exposes the hybrid-mask
+                    // canvas Forward (PR-3) the generator drives, so no wrapper is needed.
+                    => TransformerModel.LoadFromSafetensors(source, config, threading ?? ThreadingConfig.SingleThreaded, i2sCache),
+                Architecture.Mamba3
+                    => Mamba3TransformerModel.LoadFromSafetensors(source, config),
+                _ => throw new NotSupportedException(
+                    $"Safetensors loader does not yet dispatch architecture {config.Architecture}. "
+                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, DeepSeekV2, DeepSeekV3, SmolLM3, Gemma3, Gemma4, Gemma3n, DiffusionGemma, BitNet, Mamba3."),
+            };
+
+            return (model, source, config);
+        }
+        catch
+        {
+            source.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Loads a Qwen3.6-35B-A3B model from a Mach-1 additive-codec HF repo's
+    /// <c>packed/</c> directory tree (issue #266 Phase B) — e.g.
+    /// <c>SyzygyResearch/Mach-1-Additive-35B</c>. Unlike <see cref="LoadFromSafetensors"/>,
+    /// this layout has no <c>model.safetensors.index.json</c> and its tensors
+    /// are not directly readable weight bytes (trellis + randomized-Hadamard
+    /// + wave-gamma codec) — every tensor is decoded via
+    /// <see cref="DotLLM.Models.Quantization.Mach1.Mach1PackedCheckpoint"/> and
+    /// Phase A's codec decoders, then wired into the exact same weight
+    /// structures <see cref="Qwen3MoeHybridTransformerModel.LoadFromGguf(GgufFile, ModelConfig)"/>
+    /// produces — the forward pass is unmodified.
+    /// </summary>
+    /// <param name="checkpointRoot">
+    /// The checkpoint root directory (containing <c>packed/</c>,
+    /// <c>extras.safetensors</c>, <c>config.json</c>).
+    /// </param>
+    /// <param name="threading">Threading configuration. Null defaults to single-threaded.</param>
+    /// <returns>The loaded model and its configuration. There is no file handle to
+    /// return (unlike GGUF/safetensors) — every tensor is decoded into
+    /// NativeMemory the model owns and frees on <c>Dispose</c>.</returns>
+    /// <exception cref="FileNotFoundException"><c>config.json</c> or <c>packed/experts/codec.json</c> is missing.</exception>
+    /// <exception cref="InvalidDataException"><c>config.json</c> is not a <c>qwen3_5_moe</c> checkpoint.</exception>
+    public static (IModel Model, ModelConfig Config) LoadFromMach1Packed(
+        string checkpointRoot, ThreadingConfig? threading = null)
+    {
+        ArgumentNullException.ThrowIfNull(checkpointRoot);
+
+        string configPath = Path.Combine(checkpointRoot, "config.json");
+        if (!File.Exists(configPath))
+            throw new FileNotFoundException(
+                $"Expected HuggingFace config.json at '{configPath}'.", configPath);
+
+        using var doc = JsonDocument.Parse(File.ReadAllText(configPath));
+        string? modelType = doc.RootElement.TryGetProperty("model_type", out var mt) && mt.ValueKind == JsonValueKind.String
+            ? mt.GetString()
+            : null;
+        if (!string.Equals(modelType, "qwen3_5_moe", StringComparison.Ordinal)
+            && !string.Equals(modelType, "qwen3_5_moe_text", StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                $"LoadFromMach1Packed requires config.json model_type='qwen3_5_moe' (Mach-1 additive-codec " +
+                $"Qwen3.6-35B-A3B checkpoints), got '{modelType}'.");
+        }
+
+        ModelConfig config = Qwen35MoeConfigExtractor.Extract(doc.RootElement);
+        IModel model = Qwen3MoeHybridTransformerModel.LoadFromMach1Packed(checkpointRoot, config, threading);
+        return (model, config);
+    }
+
+    /// <summary>
+    /// Opens an HF safetensors checkpoint and parses its <c>config.json</c>
+    /// into a <see cref="ModelConfig"/>, without creating any model instance.
+    /// Used by alternative loaders (e.g. CUDA) that need the source + config
+    /// to hand to a backend-specific model constructor. Caller owns the
+    /// returned <see cref="ISafetensorsTensorSource"/> and must dispose it.
+    /// </summary>
+    /// <param name="safetensorsPath">A <c>*.safetensors</c> file, a
+    /// <c>model.safetensors.index.json</c>, or a directory containing one.</param>
+    /// <exception cref="FileNotFoundException">Path or sibling <c>config.json</c> missing.</exception>
+    /// <exception cref="InvalidDataException">config.json declares an unsupported
+    /// architecture or a multi-shard index references missing files.</exception>
+    public static (ISafetensorsTensorSource Source, ModelConfig Config) OpenSafetensorsAndConfig(
+        string safetensorsPath)
+    {
+        ArgumentNullException.ThrowIfNull(safetensorsPath);
+
+        (ISafetensorsTensorSource source, string weightsDir) = OpenSafetensorsSource(safetensorsPath);
+
+        try
+        {
+            string configPath = Path.Combine(weightsDir, "config.json");
+            if (!File.Exists(configPath))
+                throw new FileNotFoundException(
+                    $"Expected HuggingFace config.json next to the safetensors weights, but '{configPath}' does not exist.",
+                    configPath);
+
+            string configJson = File.ReadAllText(configPath);
+            using var doc = JsonDocument.Parse(configJson);
+
+            // DiffusionGemma wrapper: model_type=diffusion_gemma /
+            // diffusion_gemma_text houses a Gemma-4 MoE text tower plus the block
+            // masked-diffusion decode parameters. DiffusionGemmaConfigExtractor
+            // hoists `text_config`, reads top-level `canvas_length`, builds the full
+            // Gemma-4 MoE ModelConfig, and attaches a DiffusionConfig (resolving the
+            // mask token id from the checkpoint tokenizer files). Checked BEFORE
+            // ResolveArchitecture so the dedicated path wins over the generic
+            // "unsupported architecture" error (issue #29). Mirrors the Mamba-3
+            // model_type probe below.
+            string? topModelType = doc.RootElement.TryGetProperty("model_type", out var topMt)
+                                   && topMt.ValueKind == JsonValueKind.String
+                ? topMt.GetString()
+                : null;
+            if (string.Equals(topModelType, "diffusion_gemma", StringComparison.Ordinal)
+                || string.Equals(topModelType, "diffusion_gemma_text", StringComparison.Ordinal))
+            {
+                ModelConfig diffusionConfig =
+                    DiffusionGemmaConfigExtractor.ExtractFromDirectory(doc.RootElement, weightsDir);
+                return (source, diffusionConfig);
+            }
+
+            // Gemma-3n wrapper: model_type=gemma3n / gemma3n_text houses the text
+            // tower under `text_config` (audio_config / vision_config skipped —
+            // text-only) plus the Gemma-3n-only AltUp/Laurel/activation-sparsity
+            // fields Gemma3nConfigExtractor understands. Checked BEFORE
+            // ResolveArchitecture for the same reason as the diffusion_gemma probe
+            // above (issue #136).
+            if (string.Equals(topModelType, "gemma3n", StringComparison.Ordinal)
+                || string.Equals(topModelType, "gemma3n_text", StringComparison.Ordinal))
+            {
+                ModelConfig gemma3nConfig = Gemma3nConfigExtractor.Extract(doc.RootElement);
+                return (source, gemma3nConfig);
+            }
+
+            // Qwen3.6-35B-A3B (qwen35moe / Architecture.Qwen3MoeHybrid) wrapper:
+            // model_type=qwen3_5_moe / qwen3_5_moe_text houses the text tower under
+            // `text_config` (vision_config skipped — text-only) plus the Gated
+            // DeltaNet hybrid config Qwen35MoeConfigExtractor understands. Checked
+            // BEFORE ResolveArchitecture for the same reason as the gemma3n probe
+            // above (issue #266 Phase B). Note: this hoist covers *config
+            // extraction* for any qwen3_5_moe checkpoint (e.g. a hypothetical plain
+            // bf16 HF safetensors dump); the Mach-1 additive-codec `packed/` layout
+            // this checkpoint family ships today has no `model.safetensors.index.json`
+            // / single-shard file this generic OpenSafetensorsSource probe can open —
+            // that layout is loaded via the dedicated
+            // <see cref="LoadFromMach1Packed"/> entry point instead.
+            if (string.Equals(topModelType, "qwen3_5_moe", StringComparison.Ordinal)
+                || string.Equals(topModelType, "qwen3_5_moe_text", StringComparison.Ordinal))
+            {
+                ModelConfig qwen35MoeConfig = Qwen35MoeConfigExtractor.Extract(doc.RootElement);
+                return (source, qwen35MoeConfig);
+            }
+
+            Architecture arch;
+            try
+            {
+                arch = HfConfigExtractor.ResolveArchitecture(doc.RootElement);
+            }
+            catch (InvalidDataException)
+            {
+                // Fall through to Mamba-3 probe: model_type=mamba3 is handled by a
+                // dedicated extractor, not HfConfigExtractor.
+                string? modelType = doc.RootElement.TryGetProperty("model_type", out var mt)
+                                    && mt.ValueKind == JsonValueKind.String
+                    ? mt.GetString()
+                    : null;
+                if (!string.Equals(modelType, "mamba3", StringComparison.Ordinal))
+                    throw;
+                arch = Architecture.Mamba3;
+            }
+
+            ModelConfig config = arch switch
+            {
+                Architecture.Mamba3 => Mamba3ConfigExtractor.Extract(doc.RootElement),
+                _ => HfConfigExtractor.Extract(doc.RootElement),
+            };
+
+            return (source, config);
+        }
+        catch
+        {
+            source.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Builds a <see cref="BitNetI2SCacheContext"/> for a BitNet checkpoint so repeated loads
+    /// reuse the ternary I2_S packing instead of re-quantizing bf16 weights. The cache lives in
+    /// a hidden <c>.dotllm-i2s-cache</c> folder beside the checkpoint and is keyed on the
+    /// <c>config.json</c> bytes, the safetensors shard manifest (name + length), and the packer
+    /// version — so a changed checkpoint or packer never reuses stale entries. Returns
+    /// <c>null</c> (caching off) when the architecture is not BitNet, the environment sets
+    /// <c>DOTLLM_I2S_CACHE=0</c>, or the cache directory cannot be created (e.g. a read-only
+    /// checkpoint mount).
+    /// </summary>
+    internal static BitNetI2SCacheContext? TryCreateBitNetI2SCache(string safetensorsPath, ModelConfig config)
+    {
+        if (config.Architecture is not Architecture.BitNet)
+            return null;
+        if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_I2S_CACHE"), "0", StringComparison.Ordinal))
+            return null;
+
+        try
+        {
+            string weightsDir = Directory.Exists(safetensorsPath)
+                ? safetensorsPath
+                : Path.GetDirectoryName(Path.GetFullPath(safetensorsPath)) ?? safetensorsPath;
+
+            string configPath = Path.Combine(weightsDir, "config.json");
+            if (!File.Exists(configPath))
+                return null;
+
+            byte[] configBytes = File.ReadAllBytes(configPath);
+            var shards = new DirectoryInfo(weightsDir)
+                .GetFiles("*.safetensors")
+                .OrderBy(f => f.Name, StringComparer.Ordinal)
+                .Select(f => (f.Name, f.Length))
+                .ToArray();
+            if (shards.Length == 0)
+                return null;
+
+            string modelKey = BitNetI2SCache.ComputeModelKey(configBytes, shards, BitNetI2SCache.QuantizerVersion);
+            string cacheDir = Path.Combine(weightsDir, ".dotllm-i2s-cache");
+            Directory.CreateDirectory(cacheDir); // probes writability; throws → caught → cache off
+
+            return new BitNetI2SCacheContext(cacheDir, modelKey);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            // Any filesystem obstacle disables caching rather than failing the load.
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Resolves <paramref name="path"/> to an opened
+    /// <see cref="ISafetensorsTensorSource"/> (single- or multi-shard) and the
+    /// directory that contains it. Extracted from
+    /// <see cref="LoadFromSafetensors"/> so the auto-detection logic is
+    /// testable in isolation.
+    /// </summary>
+    private static (ISafetensorsTensorSource Source, string WeightsDir) OpenSafetensorsSource(string path)
+    {
+        // Case 1: directory — probe for index.json first, single shard second.
+        if (Directory.Exists(path))
+        {
+            string indexPath = Path.Combine(path, "model.safetensors.index.json");
+            if (File.Exists(indexPath))
+                return (MultiShardSafetensorsFile.Open(indexPath), path);
+
+            string[] candidates = Directory.GetFiles(path, "*.safetensors", SearchOption.TopDirectoryOnly);
+            // Filter out any pre-shard artefact we don't want to treat as single-shard.
+            // (e.g. stale 'model.safetensors' sitting next to an incomplete shard set.)
+            if (candidates.Length == 1)
+                return (SafetensorsFile.Open(candidates[0]), path);
+            if (candidates.Length == 0)
+                throw new FileNotFoundException(
+                    $"Directory '{path}' contains no *.safetensors and no model.safetensors.index.json.",
+                    indexPath);
+            // Multiple .safetensors files but no index.json is unusual — we reject
+            // rather than guess, because every candidate is a plausible single-shard
+            // root and picking the wrong one would silently load partial weights.
+            throw new InvalidDataException(
+                $"Directory '{path}' contains {candidates.Length} *.safetensors files "
+                + "but no model.safetensors.index.json to arbitrate between them.");
+        }
+
+        if (!File.Exists(path))
+            throw new FileNotFoundException($"Safetensors path not found: {path}", path);
+
+        // Case 2: an index.json file.
+        if (path.EndsWith(".safetensors.index.json", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(Path.GetFileName(path), "model.safetensors.index.json", StringComparison.OrdinalIgnoreCase))
+        {
+            string dir = Path.GetDirectoryName(path)
+                         ?? throw new InvalidDataException(
+                             $"Could not determine parent directory of index file '{path}'.");
+            return (MultiShardSafetensorsFile.Open(path), dir);
+        }
+
+        // Case 3: a single *.safetensors file. If a sibling index.json exists,
+        // prefer the multi-shard path — it is authoritative and the caller just
+        // happens to have pointed at one shard.
+        string? weightsDir = Path.GetDirectoryName(path);
+        if (string.IsNullOrEmpty(weightsDir))
+            throw new InvalidDataException(
+                $"Could not determine directory of safetensors path '{path}'.");
+        string siblingIndex = Path.Combine(weightsDir, "model.safetensors.index.json");
+        if (File.Exists(siblingIndex))
+            return (MultiShardSafetensorsFile.Open(siblingIndex), weightsDir);
+
+        return (SafetensorsFile.Open(path), weightsDir);
+    }
+
+    /// <summary>
+    /// Top-level dispatcher that auto-detects GGUF vs safetensors by file
+    /// extension, falling back to magic-byte probing when the extension is
+    /// ambiguous. Returns an opaque file handle (either
+    /// <see cref="GgufFile"/> or <see cref="SafetensorsFile"/>) plus the
+    /// loaded model and its config.
+    /// </summary>
+    /// <remarks>
+    /// Callers that need to force a specific format should call
+    /// <see cref="LoadFromGguf"/> or <see cref="LoadFromSafetensors"/>
+    /// directly — this entry point exists only as a convenience for
+    /// generic "given a path, load a model" code paths.
+    /// </remarks>
+    public static (IModel Model, IDisposable File, ModelConfig Config) Load(
+        string path, ThreadingConfig? threading = null)
+    {
+        if (!File.Exists(path))
+            throw new FileNotFoundException($"Model file not found: {path}", path);
+
+        LoadFormat format = DetectFormat(path);
+        switch (format)
+        {
+            case LoadFormat.Gguf:
+            {
+                var (model, gguf, config) = LoadFromGguf(path, threading);
+                return (model, gguf, config);
+            }
+            case LoadFormat.Safetensors:
+            {
+                var (model, st, config) = LoadFromSafetensors(path, threading);
+                return (model, st, config);
+            }
+            default:
+                throw new InvalidDataException(
+                    $"Cannot determine model format for '{path}'. Expected .gguf or .safetensors.");
+        }
+    }
+
+    /// <summary>
+    /// Loads a HuggingFace <c>tokenizer.json</c> from a checkpoint directory
+    /// and returns it as an <see cref="ITokenizer"/>. Accepts either the
+    /// checkpoint directory path or a path to a file inside it (e.g. the
+    /// <c>model.safetensors</c> path).
+    /// </summary>
+    /// <param name="directoryOrFilePath">
+    /// A checkpoint directory or a path to a file in that directory. The
+    /// parent directory is scanned for <c>tokenizer.json</c>.
+    /// </param>
+    /// <returns>
+    /// A ready-to-use tokenizer, or <see langword="null"/> when the directory
+    /// contains no <c>tokenizer.json</c>.
+    /// </returns>
+    /// <remarks>
+    /// Pairs with <see cref="LoadFromSafetensors"/> — HF checkpoints ship the
+    /// tokenizer alongside the weights, but we surface it via a separate call
+    /// so existing <c>(IModel, IDisposable, ModelConfig)</c> tuple contracts
+    /// do not change. Callers that want weights and tokenizer in one call
+    /// invoke both and compose the result.
+    /// </remarks>
+    public static ITokenizer? LoadTokenizerFromHfDirectory(string directoryOrFilePath)
+    {
+        ArgumentNullException.ThrowIfNull(directoryOrFilePath);
+        string dir = Directory.Exists(directoryOrFilePath)
+            ? directoryOrFilePath
+            : Path.GetDirectoryName(directoryOrFilePath) ?? directoryOrFilePath;
+        return HfBpeTokenizerFactory.TryLoadFromDirectory(dir);
+    }
+
+    private enum LoadFormat { Unknown, Gguf, Safetensors }
+
+    /// <summary>
+    /// Detects the on-disk format of a model file. Extension check first
+    /// (fast and unambiguous in practice), then a magic-byte probe for
+    /// corner cases like extensionless files in a test harness.
+    /// </summary>
+    private static LoadFormat DetectFormat(string path)
+    {
+        string ext = Path.GetExtension(path).ToLowerInvariant();
+        if (ext == ".gguf") return LoadFormat.Gguf;
+        if (ext == ".safetensors") return LoadFormat.Safetensors;
+
+        // Magic-byte sniff: GGUF starts with ASCII "GGUF" (0x47 0x47 0x55 0x46).
+        // Safetensors starts with an 8-byte LE u64 header length — not a magic
+        // sequence, but we can sanity-check that the first 8 bytes would be
+        // a plausible header length (small but not tiny, not exceeding file size).
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            Span<byte> buf = stackalloc byte[8];
+            int read = fs.Read(buf);
+            if (read < 4) return LoadFormat.Unknown;
+            if (buf[0] == 0x47 && buf[1] == 0x47 && buf[2] == 0x55 && buf[3] == 0x46)
+                return LoadFormat.Gguf;
+            if (read == 8)
+            {
+                ulong headerLen = BinaryPrimitives.ReadUInt64LittleEndian(buf);
+                long fileLen = fs.Length;
+                // Plausibility: 2 <= headerLen <= fileLen - 8 and headerLen doesn't
+                // exceed a few MB (HF headers top out around low MB in practice).
+                if (headerLen >= 2 && (long)headerLen + 8 <= fileLen && headerLen < 64 * 1024 * 1024)
+                    return LoadFormat.Safetensors;
+            }
+        }
+        catch
+        {
+            // Fall through to Unknown.
+        }
+        return LoadFormat.Unknown;
     }
 }

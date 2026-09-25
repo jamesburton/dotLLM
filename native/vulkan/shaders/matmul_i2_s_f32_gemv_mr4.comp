@@ -1,0 +1,114 @@
+#version 450
+// I2_S (BitNet b1.58 ternary) decode GEMV — MULTI-ROW variant (4 rows/workgroup).
+//
+//   y[m] = scale * sum_k (code(m,k) - 1) * x[k]
+//
+// Analysis behind this (issue #229). The GEMM turned out to be SLM-read-traffic
+// bound, but the GEMV is a different shape entirely and that finding does NOT
+// transfer:
+//
+//   GEMM : 32 KB shared, 4 shared reads per k-step in the hot loop
+//   GEMV :  512 B shared (partials[128]) used ONLY for the final tree reduce
+//
+// So SLM is not the GEMV's problem. What is: the baseline gives each workgroup a
+// SINGLE output row. At BitNet dims (K=2560) that is rowBytes = K/4 = 640 bytes
+// spread over 128 threads = FIVE loop iterations per thread, followed by a
+// 7-step shared-memory tree reduce. The reduction costs more instructions than
+// the dot product it reduces, and M=2560 launches 2560 such workgroups. The
+// earlier bench corroborates this: weight-GB/s tops out at 14-20 against an Arc
+// ceiling around 100, i.e. nowhere near bandwidth-bound, and the whole thing
+// stays launch-bound even at batch=2048.
+//
+// Second cost: x[] is re-read from global memory once per OUTPUT ROW. Each byte
+// of weight consumes 4 activations, so per row the kernel reads K/4 weight bytes
+// but 4*(K/4) = K activations — 16x more activation bytes than weight bytes.
+// Across M rows that is M*K*4 bytes of activation traffic for M*(K/4) of weights.
+//
+// This variant fixes both by giving each workgroup ROWS=4 output rows:
+//   - 4x fewer workgroups, so launch/reduction overhead amortizes over 4x work
+//   - each x[] value is loaded ONCE into a register and reused across all 4 rows,
+//     cutting activation traffic 4x
+// It is the GEMV analogue of the register-blocking that won 1.65x on the GEMM,
+// and for the same underlying reason: raise work-per-load.
+//
+// BIT-EXACT: each output element accumulates over exactly the same k in the same
+// order, through the same per-thread stride and the same tree reduce. Only the
+// row-to-workgroup mapping changes.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow;   // = K / 128
+    uint rowUints;       // unused here; kept for push-constant layout parity
+} pc;
+
+const uint I2S_BLOCK_BYTES = 32u;
+const uint I2S_GROUP_SIZE  = 128u;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+const uint ROWS = 4u;            // output rows per workgroup
+shared float partials[ROWS * 128u];
+
+void main() {
+    uint mBase = gl_WorkGroupID.x * ROWS;
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowBytes = pc.K >> 2u;        // K/4 packed bytes per row
+
+    // Per-tensor float32 scale at the weight-buffer tail (byte offset M*(K/4)).
+    uint scaleByteOff = pc.M * rowBytes;
+    float scale = uintBitsToFloat(weight[scaleByteOff >> 2u]);
+
+    float acc[ROWS];
+    for (uint r = 0u; r < ROWS; r++) acc[r] = 0.0;
+
+    // Same byte-per-lane mapping as the production kernel: all 128 lanes stride
+    // over the row's K/4 bytes. The difference is that the four x[] values for a
+    // byte position are fetched ONCE and reused across all ROWS weight rows.
+    for (uint byteIdx = tid; byteIdx < rowBytes; byteIdx += threads) {
+        uint b  = byteIdx >> 5u;       // block index (32 bytes per block)
+        uint gp = byteIdx & 31u;       // 0..31 within the block
+        uint xBase = b * I2S_GROUP_SIZE + gp;
+
+        float x0 = x[xBase];
+        float x1 = x[xBase + 32u];
+        float x2 = x[xBase + 64u];
+        float x3 = x[xBase + 96u];
+
+        for (uint r = 0u; r < ROWS; r++) {
+            uint m = mBase + r;
+            if (m >= pc.M) break;
+            uint pk = readByte(m * rowBytes + byteIdx);
+            acc[r] += float(int((pk >> 6u) & 3u) - 1) * x0
+                    + float(int((pk >> 4u) & 3u) - 1) * x1
+                    + float(int((pk >> 2u) & 3u) - 1) * x2
+                    + float(int( pk        & 3u) - 1) * x3;
+        }
+    }
+
+    for (uint r = 0u; r < ROWS; r++) partials[r * threads + tid] = acc[r];
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride)
+            for (uint r = 0u; r < ROWS; r++)
+                partials[r * threads + tid] = partials[r * threads + tid] + partials[r * threads + tid + stride];
+        barrier();
+    }
+
+    if (tid < ROWS) {
+        uint m = mBase + tid;
+        if (m < pc.M) y[m] = partials[tid * threads] * scale;
+    }
+}

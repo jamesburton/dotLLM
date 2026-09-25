@@ -16,8 +16,57 @@ internal sealed unsafe class TransformerForwardState : IDisposable
     private readonly int _headDim;
     private readonly int _intermediateSize;
     private readonly int _vocabSize;
+    // Per-token element counts that drive the Q/AttnOutput and K/V scratch
+    // allocation. For a uniform head dim these are numHeads*headDim and
+    // numKvHeads*headDim respectively. For Gemma 4 with a distinct
+    // global_head_dim the full-attention layers project a wider per-head
+    // slice (and a different KV-head count), so these are sized to the LARGER
+    // per-layer block so a single allocation covers both layer types.
+    private readonly int _qBlockElems;   // max over layer types of numHeads   * layerHeadDim
+    private readonly int _kvBlockElems;  // max over layer types of kvHeads(L) * layerHeadDim
+    // AttnOutput block size. Equals _qBlockElems for GQA/MHA/MQA models (the
+    // attention kernel writes the pre-o_proj, numHeads*headDim-wide output
+    // here; o_proj is applied afterward into a separate buffer). MLA models
+    // fuse o_proj INSIDE the kernel and write the already-projected,
+    // hiddenSize-wide result directly into AttnOutput instead — callers pass
+    // an explicit (possibly larger) size for that case. See TransformerModel
+    // .BuildFromPrebuiltWeightsInternal and #193.
+    private readonly int _attnOutBlockElems;
 
     private int _currentSeqLen;
+
+    /// <summary>
+    /// Per-token byte size of <see cref="InputQ8Scratch"/>: the largest quantized-input
+    /// row across every GEMM whose activation is pre-quantized through that buffer —
+    /// Q/K/V and gate/up (hidden-wide), down (intermediate-wide), and the attention
+    /// output projection, whose input is the attention block stride
+    /// (<c>numHeads × headDim</c>), NOT the hidden size. Those coincide for almost every
+    /// architecture, but gpt-oss projects a wider attention block than its residual
+    /// stream (64 heads × 64 dim = 4096 vs hidden 2880), so omitting the Q/attn-output
+    /// block widths under-allocates the buffer and the o_proj pre-quantization runs off
+    /// the end of it (issue #260).
+    /// Sized for the largest of Q8_0 (34B/32 elements), Q8_1 (36B/32), and Q8_K (292B/256).
+    /// </summary>
+    private int InputScratchRowBytes
+    {
+        get
+        {
+            int maxInputDim = Math.Max(
+                Math.Max(_hiddenSize, _intermediateSize),
+                Math.Max(_qBlockElems, _attnOutBlockElems));
+            int q8_0RowBytes = (maxInputDim / 32) * 34;
+            int q8_1RowBytes = (maxInputDim / 32) * 36;
+            int q8_kRowBytes = (maxInputDim / 256) * 292;
+            return Math.Max(Math.Max(q8_0RowBytes, q8_1RowBytes), q8_kRowBytes);
+        }
+    }
+
+    /// <summary>
+    /// Total bytes currently allocated for <see cref="InputQ8Scratch"/>
+    /// (<c>capacity × per-token row bytes</c>). Exposed for regression coverage of the
+    /// under-allocation fixed in issue #260.
+    /// </summary>
+    internal long InputQ8ScratchBytes => (long)_currentSeqLen * InputScratchRowBytes;
 
     /// <summary>Total bytes currently allocated for inference scratch buffers.</summary>
     public long AllocatedBytes
@@ -29,19 +78,16 @@ internal sealed unsafe class TransformerForwardState : IDisposable
 
             long bytes = 0;
             bytes += s * _hiddenSize * 3;                    // HiddenState + Residual + NormOutput
-            bytes += s * _numHeads * _headDim * 2;           // Q + AttnOutput
-            bytes += s * _numKvHeads * _headDim * 2;         // K + V
+            bytes += s * (_qBlockElems + _attnOutBlockElems); // Q + AttnOutput
+            bytes += s * _kvBlockElems * 2;                  // K + V
             bytes += s * _intermediateSize * 3;              // FfnGate + FfnUp + SiluOutput
             bytes += s * _vocabSize;                          // Logits (all positions for speculative verify)
             bytes *= sizeof(float);
-            // InputQ8Scratch: seqLen × max(Q8_0, Q8_1, Q8_K) row bytes
-            int maxInputDim = Math.Max(_hiddenSize, _intermediateSize);
-            int q8_0Bytes = (maxInputDim / 32) * 34;
-            int q8_1Bytes = (maxInputDim / 32) * 36;
-            int q8_kBytes = (maxInputDim / 256) * 292;
-            bytes += s * Math.Max(Math.Max(q8_0Bytes, q8_1Bytes), q8_kBytes);
+            bytes += s * InputScratchRowBytes;
             // RoPE tables (managed, but still part of compute memory)
             bytes += (CosTable.Length + SinTable.Length) * sizeof(float);
+            if (GlobalCosTable is not null && GlobalSinTable is not null)
+                bytes += (GlobalCosTable.Length + GlobalSinTable.Length) * sizeof(float);
             return bytes;
         }
     }
@@ -72,10 +118,40 @@ internal sealed unsafe class TransformerForwardState : IDisposable
     /// <summary>Pre-computed RoPE sine table [maxSeqLen * halfDim].</summary>
     public float[] SinTable { get; }
 
+    /// <summary>
+    /// Number of rotated dimensions for the primary (sliding-window) RoPE table.
+    /// Equals the <c>ropeDim</c> the primary table was built with.
+    /// </summary>
+    public int RopeDim { get; }
+
+    /// <summary>
+    /// Optional secondary RoPE cosine table for the FULL-attention layers
+    /// (Gemma 4 per-attention-type RoPE — different base theta + partial-rotary
+    /// factor). Null when the model uses a single RoPE configuration for every
+    /// layer.
+    /// </summary>
+    public float[]? GlobalCosTable { get; }
+
+    /// <summary>Optional secondary RoPE sine table for the full-attention layers. Null when unused.</summary>
+    public float[]? GlobalSinTable { get; }
+
+    /// <summary>
+    /// Number of rotated dimensions for the secondary (full-attention) RoPE
+    /// table. May be smaller than <see cref="RopeDim"/> when a partial-rotary
+    /// factor is in effect (only the leading <c>GlobalRopeDim</c> dims rotate).
+    /// Zero when <see cref="GlobalCosTable"/> is null.
+    /// </summary>
+    public int GlobalRopeDim { get; }
+
     public TransformerForwardState(
         int hiddenSize, int numHeads, int numKvHeads, int headDim,
         int intermediateSize, int vocabSize, int maxSeqLen, int ropeDim,
-        float ropeTheta)
+        float ropeTheta,
+        int globalRopeDim = 0, float globalRopeTheta = 0f,
+        int qBlockElems = 0, int kvBlockElems = 0,
+        int attnOutBlockElems = 0,
+        int globalFullHeadDim = 0,
+        float[]? globalFreqFactors = null)
     {
         _hiddenSize = hiddenSize;
         _numHeads = numHeads;
@@ -83,12 +159,49 @@ internal sealed unsafe class TransformerForwardState : IDisposable
         _headDim = headDim;
         _intermediateSize = intermediateSize;
         _vocabSize = vocabSize;
+        // Default the per-token Q/KV block sizes to the uniform-head-dim layout
+        // when the caller does not pass explicit (per-layer max) sizes — keeps
+        // every existing caller byte-identical.
+        _qBlockElems = qBlockElems > 0 ? qBlockElems : numHeads * headDim;
+        _kvBlockElems = kvBlockElems > 0 ? kvBlockElems : numKvHeads * headDim;
+        // Defaults to _qBlockElems when the caller doesn't pass an explicit
+        // size — keeps every existing (non-MLA) caller byte-identical.
+        _attnOutBlockElems = attnOutBlockElems > 0 ? attnOutBlockElems : _qBlockElems;
 
         // Pre-compute RoPE frequency tables
         int halfDim = ropeDim / 2;
+        RopeDim = ropeDim;
         CosTable = new float[maxSeqLen * halfDim];
         SinTable = new float[maxSeqLen * halfDim];
         DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTable(maxSeqLen, ropeDim, ropeTheta, CosTable, SinTable);
+
+        // Optional secondary table for the full-attention layers (Gemma 4):
+        // different base theta and (via globalRopeDim < ropeDim) partial rotary.
+        if (globalRopeDim > 0)
+        {
+            GlobalRopeDim = globalRopeDim;
+            int globalHalfDim = globalRopeDim / 2;
+            GlobalCosTable = new float[maxSeqLen * globalHalfDim];
+            GlobalSinTable = new float[maxSeqLen * globalHalfDim];
+            // Partial rotary (Gemma 4 global layers): only globalRopeDim dims
+            // rotate, but the per-pair frequency denominator is the FULL head dim
+            // (globalFullHeadDim, e.g. 512) — NOT the rotated count. When
+            // globalFullHeadDim <= globalRopeDim (Gemma 3 / full rotation) the two
+            // coincide and the standard precompute is used.
+            // Proportional-rope frequency factors (Gemma-4 E2B/E4B rope_freqs
+            // tensor): the full-attention layers rotate the FULL head dim with the
+            // per-pair theta divided by the factor (ggml theta/ff). Mutually
+            // exclusive with the 26B partial-rotary path in practice.
+            if (globalFreqFactors is not null)
+                DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTableWithFactors(
+                    maxSeqLen, globalRopeDim, globalRopeTheta, globalFreqFactors, GlobalCosTable, GlobalSinTable);
+            else if (globalFullHeadDim > globalRopeDim)
+                DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTablePartial(
+                    maxSeqLen, globalRopeDim, globalFullHeadDim, globalRopeTheta, GlobalCosTable, GlobalSinTable);
+            else
+                DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTable(
+                    maxSeqLen, globalRopeDim, globalRopeTheta, GlobalCosTable, GlobalSinTable);
+        }
 
         // Initial allocation for 1 token (decode mode)
         _currentSeqLen = 0;
@@ -110,31 +223,21 @@ internal sealed unsafe class TransformerForwardState : IDisposable
         HiddenState = AllocFloats(newCapacity * _hiddenSize);
         Residual = AllocFloats(newCapacity * _hiddenSize);
         NormOutput = AllocFloats(newCapacity * _hiddenSize);
-        Q = AllocFloats(newCapacity * _numHeads * _headDim);
-        K = AllocFloats(newCapacity * _numKvHeads * _headDim);
-        V = AllocFloats(newCapacity * _numKvHeads * _headDim);
-        AttnOutput = AllocFloats(newCapacity * _numHeads * _headDim);
+        Q = AllocFloats((long)newCapacity * _qBlockElems);
+        K = AllocFloats((long)newCapacity * _kvBlockElems);
+        V = AllocFloats((long)newCapacity * _kvBlockElems);
+        AttnOutput = AllocFloats((long)newCapacity * _attnOutBlockElems);
         FfnGate = AllocFloats(newCapacity * _intermediateSize);
         FfnUp = AllocFloats(newCapacity * _intermediateSize);
         SiluOutput = AllocFloats(newCapacity * _intermediateSize);
         Logits = AllocFloats((long)newCapacity * _vocabSize); // All positions' logits for speculative verify
 
-        // InputQ8Scratch: seqLen × max(q8_0RowBytes, q8_1RowBytes, q8_kRowBytes) for pre-quantized GEMM input reuse.
-        // Q8_0: 34 bytes per 32-element block. Q8_1: 36 bytes per 32-element block. Q8_K: 292 bytes per 256-element block.
-        int maxInputDim = Math.Max(_hiddenSize, _intermediateSize);
-        int q8_0RowBytes = (maxInputDim / 32) * 34;
-        int q8_1RowBytes = (maxInputDim / 32) * 36;
-        int q8_kRowBytes = (maxInputDim / 256) * 292;
-        int scratchRowBytes = Math.Max(Math.Max(q8_0RowBytes, q8_1RowBytes), q8_kRowBytes);
-        InputQ8Scratch = AllocBytes(newCapacity * scratchRowBytes);
+        InputQ8Scratch = AllocBytes((long)newCapacity * InputScratchRowBytes);
 
         _currentSeqLen = newCapacity;
     }
 
-    private static nint AllocFloats(long count)
-    {
-        return (nint)NativeMemory.AlignedAlloc((nuint)(count * sizeof(float)), 64);
-    }
+    private static nint AllocFloats(long count) => AllocBytes(count * sizeof(float));
 
     private static nint AllocBytes(long count)
     {

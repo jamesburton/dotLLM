@@ -20,6 +20,8 @@ internal enum JinjaTokenType
     In,
     Endfor,
     Set,
+    Macro,
+    EndMacro,
     Not,
     And,
     Or,

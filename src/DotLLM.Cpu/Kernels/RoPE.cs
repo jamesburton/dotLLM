@@ -65,6 +65,86 @@ public static class RoPE
         }
     }
 
+    /// <summary>
+    /// Precomputes a PARTIAL-rotary cos/sin table: only the leading
+    /// <paramref name="rotatedDim"/> dimensions of each head rotate, but the
+    /// per-pair frequency uses the FULL head dimension
+    /// (<paramref name="fullHeadDim"/>) as the denominator —
+    /// <c>θ_i = theta^(-2i / fullHeadDim)</c> for <c>i ∈ [0, rotatedDim/2)</c>.
+    /// This matches llama.cpp's Gemma-4 global-attention partial rope (n_rot is
+    /// the full head dim 512; the first 64 pairs rotate with freq_factor 1.0, the
+    /// rest are identity). The tables are sized for <c>rotatedDim/2</c> pairs and
+    /// consumed by the partial-rotary <see cref="Execute(Span{float}, Span{float}, ReadOnlySpan{int}, int, int, int, int, ReadOnlySpan{float}, ReadOnlySpan{float}, RoPEType)"/>
+    /// overload with <c>ropeDim = rotatedDim</c>.
+    /// </summary>
+    public static void PrecomputeFrequencyTablePartial(
+        int maxSeqLen, int rotatedDim, int fullHeadDim, float theta,
+        Span<float> cosTable, Span<float> sinTable)
+    {
+        if (rotatedDim <= 0 || rotatedDim % 2 != 0)
+            throw new ArgumentException($"rotatedDim must be a positive even number, got {rotatedDim}", nameof(rotatedDim));
+        if (fullHeadDim < rotatedDim || fullHeadDim % 2 != 0)
+            throw new ArgumentException($"fullHeadDim ({fullHeadDim}) must be even and >= rotatedDim ({rotatedDim}).", nameof(fullHeadDim));
+
+        int halfDim = rotatedDim / 2;
+        if (halfDim * sizeof(float) <= StackAllocThreshold)
+        {
+            Span<float> freqs = stackalloc float[halfDim];
+            FillTables(maxSeqLen, fullHeadDim, theta, cosTable, sinTable, freqs);
+        }
+        else
+        {
+            float[] rented = ArrayPool<float>.Shared.Rent(halfDim);
+            FillTables(maxSeqLen, fullHeadDim, theta, cosTable, sinTable, rented.AsSpan(0, halfDim));
+            ArrayPool<float>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>
+    /// Pre-computes cos/sin tables with per-pair PROPORTIONAL frequency factors
+    /// (llama.cpp <c>rope_freqs.weight</c> / ggml <c>freq_factors</c>, used by the
+    /// Gemma-4 E2B/E4B full-attention layers and Llama-3.1-style long-rope). The
+    /// angle for pair <c>i</c> is <c>pos * θ^(-2i/headDim) / factors[i]</c> —
+    /// ggml's <c>ggml_rope_cache_init</c> divides the pair's theta by
+    /// <c>freq_factors[i0/2]</c> (<c>theta/ff</c>). Table layout is identical to
+    /// <see cref="PrecomputeFrequencyTable"/> (<c>table[pos * headDim/2 + i]</c>),
+    /// so the standard <c>Execute</c> overloads consume it unchanged.
+    /// </summary>
+    /// <param name="maxSeqLen">Maximum sequence length to pre-compute.</param>
+    /// <param name="headDim">Rotated dimension count (must be even).</param>
+    /// <param name="theta">Base frequency.</param>
+    /// <param name="factors">Per-pair divisors, length <c>headDim / 2</c>.</param>
+    /// <param name="cosTable">Destination cosine table; length ≥ maxSeqLen * headDim / 2.</param>
+    /// <param name="sinTable">Destination sine table; length ≥ maxSeqLen * headDim / 2.</param>
+    public static void PrecomputeFrequencyTableWithFactors(
+        int maxSeqLen, int headDim, float theta, ReadOnlySpan<float> factors,
+        Span<float> cosTable, Span<float> sinTable)
+    {
+        if (headDim <= 0 || headDim % 2 != 0)
+            throw new ArgumentException($"headDim must be a positive even number, got {headDim}", nameof(headDim));
+        int halfDim = headDim / 2;
+        if (factors.Length < halfDim)
+            throw new ArgumentException(
+                $"factors length {factors.Length} must be >= headDim/2 ({halfDim}).", nameof(factors));
+
+        float[] rented = ArrayPool<float>.Shared.Rent(halfDim);
+        Span<float> freqs = rented.AsSpan(0, halfDim);
+        for (int i = 0; i < halfDim; i++)
+            freqs[i] = 1.0f / (MathF.Pow(theta, 2.0f * i / headDim) * factors[i]);
+
+        for (int pos = 0; pos < maxSeqLen; pos++)
+        {
+            int tableBase = pos * halfDim;
+            for (int i = 0; i < halfDim; i++)
+            {
+                float angle = pos * freqs[i];
+                cosTable[tableBase + i] = MathF.Cos(angle);
+                sinTable[tableBase + i] = MathF.Sin(angle);
+            }
+        }
+        ArrayPool<float>.Shared.Return(rented);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void FillTables(int maxSeqLen, int headDim, float theta,
                                     Span<float> cosTable, Span<float> sinTable, Span<float> freqs)
@@ -83,6 +163,137 @@ public static class RoPE
                 sinTable[tableBase + i] = MathF.Sin(angle);
             }
         }
+    }
+
+    /// <summary>
+    /// Pre-computes cos/sin frequency tables using the YaRN ramped per-dim
+    /// inverse-frequency mixing used by DeepSeek-V2/V3. Mirrors HF
+    /// <c>DeepseekV2YarnRotaryEmbedding._set_cos_sin_cache</c>:
+    /// <code>
+    /// freq_extra[i] = 1 / (base ^ (2i/headDim))
+    /// freq_inter[i] = 1 / (scalingFactor * base ^ (2i/headDim))
+    /// (low, high)   = yarn_find_correction_range(betaFast, betaSlow, headDim,
+    ///                                            base, originalMaxPositionEmbeddings)
+    /// mask[i]       = clamp((i - low) / (high - low), 0, 1)     // linear ramp
+    /// inv_freq[i]   = freq_inter[i] * mask[i] + freq_extra[i] * (1 - mask[i])
+    /// cos/sin[pos,i] = cos/sin(pos * inv_freq[i]) * mscaleMultiplier
+    /// </code>
+    /// Note HF multiplies cos/sin by
+    /// <c>yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)</c>
+    /// — for V2-Lite (mscale == mscale_all_dim) this ratio is 1.0 so the caller
+    /// normally passes <c>mscaleMultiplier = 1.0f</c>.
+    /// </summary>
+    /// <param name="maxSeqLen">Maximum sequence length to pre-compute.</param>
+    /// <param name="headDim">Dimension per attention head (must be even).</param>
+    /// <param name="theta">Base frequency (e.g. 10000.0).</param>
+    /// <param name="scalingFactor">YaRN context-length scaling factor (HF <c>rope_scaling.factor</c>, e.g. 40 for V2-Lite).</param>
+    /// <param name="originalMaxPositionEmbeddings">Baseline context length YaRN ramps around (HF <c>original_max_position_embeddings</c>).</param>
+    /// <param name="betaFast">Rotation threshold above which dims extrapolate at the original base (default HF 32).</param>
+    /// <param name="betaSlow">Rotation threshold below which dims interpolate at the scaled base (default HF 1).</param>
+    /// <param name="mscaleMultiplier">Scalar applied to cos/sin values (HF <c>_mscale</c>, default 1.0).</param>
+    /// <param name="cosTable">Destination cosine table; length &gt;= maxSeqLen * headDim / 2.</param>
+    /// <param name="sinTable">Destination sine table; length &gt;= maxSeqLen * headDim / 2.</param>
+    [SkipLocalsInit]
+    public static void PrecomputeFrequencyTableYarn(
+        int maxSeqLen, int headDim, float theta,
+        float scalingFactor, int originalMaxPositionEmbeddings,
+        float betaFast, float betaSlow, float mscaleMultiplier,
+        Span<float> cosTable, Span<float> sinTable)
+    {
+        if (headDim <= 0 || headDim % 2 != 0)
+            throw new ArgumentException($"headDim must be a positive even number, got {headDim}", nameof(headDim));
+        if (scalingFactor <= 1.0f)
+            throw new ArgumentException($"YaRN scalingFactor must be > 1, got {scalingFactor}", nameof(scalingFactor));
+        if (originalMaxPositionEmbeddings <= 0)
+            throw new ArgumentException(
+                $"originalMaxPositionEmbeddings must be positive, got {originalMaxPositionEmbeddings}",
+                nameof(originalMaxPositionEmbeddings));
+
+        int halfDim = headDim / 2;
+
+        Span<float> invFreq = halfDim * sizeof(float) <= StackAllocThreshold
+            ? stackalloc float[halfDim]
+            : new float[halfDim];
+        ComputeYarnInverseFrequencies(headDim, theta, scalingFactor,
+            originalMaxPositionEmbeddings, betaFast, betaSlow, invFreq);
+
+        // Fill cos/sin with optional mscale pre-multiply.
+        for (int pos = 0; pos < maxSeqLen; pos++)
+        {
+            int tableBase = pos * halfDim;
+            for (int i = 0; i < halfDim; i++)
+            {
+                float angle = pos * invFreq[i];
+                cosTable[tableBase + i] = MathF.Cos(angle) * mscaleMultiplier;
+                sinTable[tableBase + i] = MathF.Sin(angle) * mscaleMultiplier;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds the YaRN ramped per-pair inverse-frequency vector — the frequency half of
+    /// <see cref="PrecomputeFrequencyTableYarn"/>, factored out so GPU backends can upload
+    /// the same <c>headDim / 2</c> floats and evaluate <c>cos/sin(pos * invFreq[i]) * mscale</c>
+    /// in-kernel at arbitrary positions, instead of either re-deriving the ramp (drift) or
+    /// uploading a position-indexed table bounded by some assumed max sequence length.
+    /// This is the single source of truth for the ramp math: <see cref="PrecomputeFrequencyTableYarn"/>
+    /// calls it too, so CPU and GPU cannot diverge.
+    /// </summary>
+    /// <param name="headDim">Dimension per attention head (must be even).</param>
+    /// <param name="theta">Base frequency (e.g. 10000.0).</param>
+    /// <param name="scalingFactor">YaRN context-length scaling factor (HF <c>rope_scaling.factor</c>).</param>
+    /// <param name="originalMaxPositionEmbeddings">Baseline context length YaRN ramps around.</param>
+    /// <param name="betaFast">Rotation threshold above which dims extrapolate at the original base (HF default 32).</param>
+    /// <param name="betaSlow">Rotation threshold below which dims interpolate at the scaled base (HF default 1).</param>
+    /// <param name="invFreq">Destination, length &gt;= <c>headDim / 2</c>.</param>
+    public static void ComputeYarnInverseFrequencies(
+        int headDim, float theta, float scalingFactor, int originalMaxPositionEmbeddings,
+        float betaFast, float betaSlow, Span<float> invFreq)
+    {
+        if (headDim <= 0 || headDim % 2 != 0)
+            throw new ArgumentException($"headDim must be a positive even number, got {headDim}", nameof(headDim));
+        int halfDim = headDim / 2;
+        if (invFreq.Length < halfDim)
+            throw new ArgumentException(
+                $"invFreq length {invFreq.Length} must be >= headDim/2 ({halfDim}).", nameof(invFreq));
+
+        // yarn_find_correction_range in HF returns clamped integer bounds in the
+        // FULL-dim space [0, headDim-1], but the linear ramp is applied over
+        // dim // 2 entries (i.e. halfDim). That matches the mixing formula
+        // because freq tables are indexed by half-dim i in [0, halfDim).
+        float low = MathF.Floor(YarnFindCorrectionDim(betaFast, headDim, theta, originalMaxPositionEmbeddings));
+        float high = MathF.Ceiling(YarnFindCorrectionDim(betaSlow, headDim, theta, originalMaxPositionEmbeddings));
+        low = MathF.Max(low, 0.0f);
+        high = MathF.Min(high, headDim - 1.0f);
+        if (low == high) high += 0.001f; // prevent divide-by-zero per HF yarn_linear_ramp_mask
+
+        for (int i = 0; i < halfDim; i++)
+        {
+            float exponent = 2.0f * i / headDim;
+            float freqExtra = 1.0f / MathF.Pow(theta, exponent);
+            float freqInter = 1.0f / (scalingFactor * MathF.Pow(theta, exponent));
+            // Linear ramp on [low, high] in half-dim index space.
+            float linear = (i - low) / (high - low);
+            float mask = linear < 0.0f ? 0.0f : (linear > 1.0f ? 1.0f : linear);
+            // HF: inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+            // where inv_freq_mask = 1 - linear_ramp_mask. Expanding:
+            //   inv_freq = freq_inter * linear_ramp + freq_extra * (1 - linear_ramp)
+            invFreq[i] = freqInter * mask + freqExtra * (1.0f - mask);
+        }
+    }
+
+    /// <summary>
+    /// HF <c>yarn_find_correction_dim</c>: returns the (real-valued) head-dim
+    /// index at which a rotation count of <paramref name="numRotations"/> is
+    /// reached given the base sequence length.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static float YarnFindCorrectionDim(float numRotations, int dim, float theta, int maxPositionEmbeddings)
+    {
+        // dim * log(maxPos / (numRotations * 2 * pi)) / (2 * log(base))
+        double numerator = dim * Math.Log(maxPositionEmbeddings / (numRotations * 2.0 * Math.PI));
+        double denominator = 2.0 * Math.Log(theta);
+        return (float)(numerator / denominator);
     }
 
     /// <summary>
@@ -348,6 +559,64 @@ public static class RoPE
                 else
                     ApplyRotation(headSlice, cos, sin, ropeDim);
             }
+        }
+    }
+
+    /// <summary>
+    /// PARTIAL NeoX RoPE: rotates only the leading <paramref name="rotatedPairs"/>
+    /// dimension PAIRS of each head, where pair <c>i</c> couples
+    /// <c>(vec[i], vec[i + headDim/2])</c> — the HuggingFace/llama.cpp "rotate_half"
+    /// convention with the pairing offset over the FULL head dim. This matches
+    /// llama.cpp's Gemma-4 global-attention rope (n_rot = full head dim 512, but
+    /// freq_factors freeze pairs ≥ 64, so only the first 64 pairs — dims [0,64) ↔
+    /// [256,320) — actually rotate). Cos/sin tables hold <paramref name="rotatedPairs"/>
+    /// entries per position (built via <see cref="PrecomputeFrequencyTablePartial"/>).
+    /// NeoX-only (Gemma uses NeoX pairing).
+    /// </summary>
+    [SkipLocalsInit]
+    public static void ExecutePartialNeoX(
+        Span<float> q, Span<float> k, ReadOnlySpan<int> positions,
+        int numHeads, int numKvHeads, int headDim, int rotatedPairs,
+        ReadOnlySpan<float> cosTable, ReadOnlySpan<float> sinTable)
+    {
+        int halfDim = headDim / 2;
+        int qStride = numHeads * headDim;
+        int kStride = numKvHeads * headDim;
+        int seqLen = positions.Length;
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            int pos = positions[t];
+            var cos = cosTable.Slice(pos * rotatedPairs, rotatedPairs);
+            var sin = sinTable.Slice(pos * rotatedPairs, rotatedPairs);
+
+            for (int h = 0; h < numHeads; h++)
+                ApplyRotationNeoXPartial(
+                    q.Slice(t * qStride + h * headDim, headDim), cos, sin, halfDim, rotatedPairs);
+            for (int h = 0; h < numKvHeads; h++)
+                ApplyRotationNeoXPartial(
+                    k.Slice(t * kStride + h * headDim, headDim), cos, sin, halfDim, rotatedPairs);
+        }
+    }
+
+    /// <summary>
+    /// Partial NeoX rotation on one head vector: rotates pairs
+    /// <c>(vec[i], vec[i + halfDim])</c> for <c>i ∈ [0, rotatedPairs)</c>; the
+    /// remaining dims pass through unchanged. <paramref name="halfDim"/> is the FULL
+    /// head's half-dim (the pairing offset), <paramref name="rotatedPairs"/> ≤
+    /// <paramref name="halfDim"/> is how many leading pairs rotate.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void ApplyRotationNeoXPartial(
+        Span<float> vec, ReadOnlySpan<float> cos, ReadOnlySpan<float> sin,
+        int halfDim, int rotatedPairs)
+    {
+        for (int i = 0; i < rotatedPairs; i++)
+        {
+            float e = vec[i];
+            float o = vec[i + halfDim];
+            vec[i] = e * cos[i] - o * sin[i];
+            vec[i + halfDim] = e * sin[i] + o * cos[i];
         }
     }
 

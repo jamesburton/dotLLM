@@ -1,7 +1,13 @@
 // RMS Normalization kernel for dotLLM.
 // out[i] = (input[i] / rms) * weight[i], rms = sqrt(mean(input^2) + eps)
 // FP16 in/out, FP32 accumulation for numerical stability.
-// One block per row, warp shuffle reduction.
+// One block per row.
+//
+// Optimizations vs the naive scalar version:
+//   * half2 vectorized loads/stores (one transaction per 2 elements)
+//   * __shfl_xor_sync warp reduction (symmetric — every lane holds the sum)
+//   * Pre-folds 1/n into the rsqrt argument via fmaf
+//   * No dynamic shared memory; only a tiny static warp-scratch buffer
 
 #include <cuda_fp16.h>
 
@@ -12,52 +18,69 @@ extern "C" __global__ void __launch_bounds__(256) rmsnorm_f16(
     const int n,
     const float eps)
 {
-    // Each block processes one row of length n
     const int row = blockIdx.x;
     const half* x = input + (size_t)row * n;
     half* y = output + (size_t)row * n;
+    const int tid = threadIdx.x;
+    const int n2 = n >> 1;
 
-    // Step 1: compute sum of squares using FP32 accumulation
+    const half2* __restrict__ x2 = reinterpret_cast<const half2*>(x);
+    const half2* __restrict__ w2 = reinterpret_cast<const half2*>(weight);
+    half2* __restrict__       y2 = reinterpret_cast<half2*>(y);
+
+    // ── Pass 1: sum of squares via vectorized half2 loads ──
     float sum_sq = 0.0f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x)
+    for (int i = tid; i < n2; i += blockDim.x)
     {
-        float v = __half2float(x[i]);
-        sum_sq += v * v;
+        half2 v = x2[i];
+        float v0 = __low2float(v), v1 = __high2float(v);
+        sum_sq = fmaf(v0, v0, sum_sq);
+        sum_sq = fmaf(v1, v1, sum_sq);
+    }
+    if ((n & 1) && tid == 0)
+    {
+        float v = __half2float(x[n - 1]);
+        sum_sq = fmaf(v, v, sum_sq);
     }
 
-    // Warp-level reduction
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    // ── Warp reduction (symmetric) ──
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
 
-    // Cross-warp reduction via shared memory
     __shared__ float warp_sums[32]; // max 32 warps per block
-    int lane = threadIdx.x % warpSize;
-    int warp_id = threadIdx.x / warpSize;
-
-    if (lane == 0)
-        warp_sums[warp_id] = sum_sq;
+    int lane = tid & 31;
+    int warp_id = tid >> 5;
+    if (lane == 0) warp_sums[warp_id] = sum_sq;
     __syncthreads();
 
-    // First warp reduces all warp sums
     if (warp_id == 0)
     {
-        int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        int num_warps = (blockDim.x + 31) >> 5;
         sum_sq = (lane < num_warps) ? warp_sums[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
+        if (lane == 0)
+            warp_sums[0] = rsqrtf(fmaf(sum_sq, 1.0f / (float)n, eps));
     }
-
-    // Broadcast result
-    __shared__ float rms_inv;
-    if (threadIdx.x == 0)
-        rms_inv = rsqrtf(sum_sq / (float)n + eps);
     __syncthreads();
+    const float rms_inv = warp_sums[0];
 
-    // Step 2: normalize and scale
-    for (int i = threadIdx.x; i < n; i += blockDim.x)
+    // ── Pass 2: vectorized normalize and scale ──
+    for (int i = tid; i < n2; i += blockDim.x)
     {
-        float v = __half2float(x[i]);
-        float w = __half2float(weight[i]);
-        y[i] = __float2half(v * rms_inv * w);
+        half2 v  = x2[i];
+        half2 wh = w2[i];
+        float v0 = __low2float(v),  v1 = __high2float(v);
+        float w0 = __low2float(wh), w1 = __high2float(wh);
+        y2[i] = __floats2half2_rn(v0 * rms_inv * w0, v1 * rms_inv * w1);
+    }
+    if ((n & 1) && tid == 0)
+    {
+        int last = n - 1;
+        float v = __half2float(x[last]);
+        float w = __half2float(weight[last]);
+        y[last] = __float2half(v * rms_inv * w);
     }
 }

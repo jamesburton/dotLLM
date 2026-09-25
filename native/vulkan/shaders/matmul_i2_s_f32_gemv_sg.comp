@@ -1,0 +1,105 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// I2_S (BitNet b1.58 ternary) decode GEMV — SUBGROUP-REDUCTION variant.
+//
+//   y[m] = scale * sum_k (code(m,k) - 1) * x[k]
+//
+// A/B comparand for matmul_i2_s_f32_gemv.comp. Identical maths, identical byte
+// layout and identical byte-per-lane accumulation loop (the mapping that measured
+// 1.2-1.85x over block-per-lane and is the production kernel). The ONLY change is
+// the final reduction.
+//
+// Baseline: a 128-entry shared-memory tree reduce — 7 barrier-separated halving
+// steps, each round-tripping through shared memory.
+// Here: one subgroupAdd collapses each subgroup's lanes in registers, one shared
+// slot per subgroup, then subgroup 0 reduces those few values with a second
+// subgroupAdd. That is 2 subgroup ops + 1 barrier instead of 7 barriers.
+//
+// Deliberately written subgroup-size-AGNOSTIC via gl_NumSubgroups /
+// gl_SubgroupID / gl_SubgroupInvocationID rather than hardcoding 32. Arc
+// (Xe-LPG) is subgroupSize=32 -> 4 subgroups; Strix Halo (RDNA 3.5) is 64 ->
+// 2 subgroups. Same SPIR-V serves both, which matters because this kernel is
+// part of the Strix handoff base.
+//
+// Correctness note: the cross-subgroup step requires gl_NumSubgroups <=
+// gl_SubgroupSize so a single subgroup can absorb all partials. With 128 threads
+// that holds for any subgroupSize >= 12 (128/32=4 <= 32; 128/64=2 <= 64).
+//
+// Dispatch is unchanged: one workgroup per output row, 128 threads.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow;   // = K / 128
+    uint rowUints;       // unused here; kept for push-constant layout parity
+} pc;
+
+const uint I2S_BLOCK_BYTES = 32u;
+const uint I2S_GROUP_SIZE  = 128u;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+// One slot per subgroup. 64 is headroom: 128 threads yields at most 32 subgroups
+// even at the 4-lane minimum subgroup size. Matches the sizing in attention_f32_sg.comp.
+shared float partials[64];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;   // workgroup-uniform: every lane takes this branch together
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowBytes = pc.K >> 2u;        // K/4 packed bytes per row (= blocksPerRow * 32)
+    uint rowByteBase = m * rowBytes;
+
+    // Per-tensor float32 scale at the weight-buffer tail (byte offset M*(K/4)).
+    // M*(K/4) is a multiple of 4, so it is word-aligned — read it directly.
+    uint scaleByteOff = pc.M * rowBytes;
+    float scale = uintBitsToFloat(weight[scaleByteOff >> 2u]);
+
+    // Unchanged byte-per-lane accumulation: all 128 lanes stride over the row's
+    // K/4 bytes (one byte = 4 ternary codes at block-relative positions
+    // {gp, gp+32, gp+64, gp+96}). Adjacent lanes read adjacent bytes so the
+    // weight loads coalesce.
+    float acc = 0.0;
+    for (uint byteIdx = tid; byteIdx < rowBytes; byteIdx += threads) {
+        uint b  = byteIdx >> 5u;       // block index (32 bytes per block)
+        uint gp = byteIdx & 31u;       // 0..31 within the block
+        uint xBase = b * I2S_GROUP_SIZE + gp;
+
+        uint pk = readByte(rowByteBase + byteIdx);
+        float c0 = float(int((pk >> 6u) & 3u) - 1);
+        float c1 = float(int((pk >> 4u) & 3u) - 1);
+        float c2 = float(int((pk >> 2u) & 3u) - 1);
+        float c3 = float(int( pk        & 3u) - 1);
+        acc += c0 * x[xBase]
+             + c1 * x[xBase + 32u]
+             + c2 * x[xBase + 64u]
+             + c3 * x[xBase + 96u];
+    }
+
+    // ── Reduction: intra-subgroup in registers, then one cross-subgroup step. ──
+    float sgSum = subgroupAdd(acc);
+    if (subgroupElect()) partials[gl_SubgroupID] = sgSum;
+    barrier();
+
+    if (gl_SubgroupID == 0u) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+            ? partials[gl_SubgroupInvocationID]
+            : 0.0;
+        float total = subgroupAdd(v);
+        if (subgroupElect()) y[m] = total * scale;
+    }
+}

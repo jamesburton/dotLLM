@@ -5,7 +5,9 @@ namespace DotLLM.Models.Gguf;
 
 /// <summary>
 /// Static binary parser for the GGUF file format. Pure functions: bytes in, structs out.
-/// Handles both GGUF v2 (uint32 counts) and v3 (uint64 counts).
+/// Supports GGUF v2 and v3, which are identical on the wire: tensor/metadata counts,
+/// string lengths and array lengths are all <c>uint64</c>. (The <c>uint32</c> form belongs to
+/// the obsolete v1, which the header validation rejects.)
 /// </summary>
 public static class GgufReader
 {
@@ -30,19 +32,9 @@ public static class GgufReader
             throw new InvalidDataException(
                 $"Unsupported GGUF version: {version}. Only versions 2 and 3 are supported.");
 
-        ulong tensorCount;
-        ulong metadataKvCount;
-
-        if (version == 2)
-        {
-            tensorCount = reader.ReadUInt32();
-            metadataKvCount = reader.ReadUInt32();
-        }
-        else
-        {
-            tensorCount = reader.ReadUInt64();
-            metadataKvCount = reader.ReadUInt64();
-        }
+        // GGUF v2 and v3 both store these counts as uint64 (the uint32 form was v1 only).
+        ulong tensorCount = reader.ReadUInt64();
+        ulong metadataKvCount = reader.ReadUInt64();
 
         return new GgufHeader(version, tensorCount, metadataKvCount);
     }
@@ -66,6 +58,50 @@ public static class GgufReader
         }
 
         return metadata;
+    }
+
+    /// <summary>
+    /// PrismML's own ggml type id for <see cref="QuantizationType.PQ2_0"/>. Pristine Bonsai GGUFs —
+    /// both <c>Ternary-Bonsai-27B</c> and <c>Ternary-Bonsai-2-27B</c> — declare <c>142</c>
+    /// (<c>GGML_TYPE_PQ2_0</c> in the PrismML llama.cpp fork), not the <c>42</c> that
+    /// <see cref="QuantizationType.PQ2_0"/> was originally derived from. The block layout is
+    /// byte-identical either way (<c>fp16</c> scale then 32 code bytes per 128 weights), so this is
+    /// purely an id alias; <c>42</c> stays recognized for locally patched artifacts that carry it.
+    /// </summary>
+    private const uint GgufTypePrismPq2_0 = 142;
+
+    /// <summary>
+    /// PrismML <c>GGML_TYPE_PTQ1_0</c> — dense base-3 trit packing at group 128 (28 bytes per 128
+    /// weights, 1.75 bpw). Recognized only so that the failure is a clear diagnostic instead of a
+    /// downstream size overflow; no kernel consumes it yet.
+    /// </summary>
+    private const uint GgufTypePrismPtq1_0 = 143;
+
+    /// <summary>
+    /// Maps a raw GGUF tensor type id onto a <see cref="QuantizationType"/>, translating the
+    /// PrismML-private ids that are not mainline ggml types.
+    /// </summary>
+    /// <param name="rawType">The raw type id read from the tensor info entry.</param>
+    /// <param name="name">Tensor name, used only for diagnostics.</param>
+    /// <returns>The mapped quantization type.</returns>
+    /// <exception cref="NotSupportedException">
+    /// The id is unrecognized, or is a known-but-unimplemented format.
+    /// </exception>
+    private static QuantizationType MapGgufTensorType(uint rawType, string name)
+    {
+        if (rawType == GgufTypePrismPq2_0)
+            return QuantizationType.PQ2_0;
+
+        if (rawType == GgufTypePrismPtq1_0)
+            throw new NotSupportedException(
+                $"Tensor '{name}' is PTQ1_0 (PrismML ternary, GGUF type {rawType}), which dotLLM " +
+                "does not implement yet. Use the PQ2_0 packing of this model instead.");
+
+        if (!Enum.IsDefined(typeof(QuantizationType), (int)rawType))
+            throw new NotSupportedException(
+                $"Tensor '{name}' has unrecognized quantization type: {rawType}.");
+
+        return (QuantizationType)rawType;
     }
 
     /// <summary>
@@ -95,11 +131,7 @@ public static class GgufReader
             }
 
             uint rawType = reader.ReadUInt32();
-            if (!Enum.IsDefined(typeof(QuantizationType), (int)rawType))
-                throw new NotSupportedException(
-                    $"Tensor '{name}' has unrecognized quantization type: {rawType}.");
-
-            var quantType = (QuantizationType)rawType;
+            QuantizationType quantType = MapGgufTensorType(rawType, name);
             ulong offset = reader.ReadUInt64();
 
             tensors.Add(new GgufTensorDescriptor(name, new TensorShape(dims), quantType, offset));
@@ -109,11 +141,12 @@ public static class GgufReader
     }
 
     /// <summary>
-    /// Reads a GGUF length-prefixed UTF-8 string. V2 uses uint32 length, v3 uses uint64.
+    /// Reads a GGUF length-prefixed UTF-8 string. The length is uint64 in both supported
+    /// versions (v2 and v3); only the obsolete v1 used a uint32 length.
     /// </summary>
     internal static string ReadGgufString(BinaryReader reader, uint version)
     {
-        ulong length = version == 2 ? reader.ReadUInt32() : reader.ReadUInt64();
+        ulong length = reader.ReadUInt64();
 
         if (length == 0)
             return string.Empty;
@@ -149,7 +182,8 @@ public static class GgufReader
     private static object ReadArray(BinaryReader reader, uint version)
     {
         var elementType = (GgufValueType)reader.ReadUInt32();
-        ulong count = version == 2 ? reader.ReadUInt32() : reader.ReadUInt64();
+        // Array length is uint64 in both supported versions (v2 and v3); v1 used uint32.
+        ulong count = reader.ReadUInt64();
 
         if (count > int.MaxValue)
             throw new InvalidDataException($"GGUF array length {count} exceeds Int32.MaxValue.");

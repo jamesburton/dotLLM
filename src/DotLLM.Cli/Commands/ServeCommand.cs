@@ -114,15 +114,134 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         public bool NoPaged { get; set; }
 
         /// <summary>Draft model for speculative decoding.</summary>
-        [CommandOption("--speculative-model")]
+        [CommandOption("--speculative-model|--draft-model")]
         [Description("Path or HuggingFace repo ID for a draft model. Enables speculative decoding for faster generation. Must share vocabulary with the main model.")]
         public string? SpeculativeModel { get; set; }
 
         /// <summary>Number of draft candidates per speculative step.</summary>
-        [CommandOption("--speculative-k")]
-        [Description("Number of draft tokens per speculative step (K). Default 5.")]
-        [DefaultValue(5)]
-        public int SpeculativeK { get; set; } = 5;
+        [CommandOption("--speculative-k|--draft-tokens")]
+        [Description("Number of draft tokens per speculative step (K). Default 3. Also used as K for --mtp.")]
+        [DefaultValue(DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates)]
+        public int SpeculativeK { get; set; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
+
+        /// <summary>Opt-in to MTP self-speculative decoding when the loaded GGUF carries an MTP head.</summary>
+        [CommandOption("--mtp")]
+        [Description("Enable Multi-Token Prediction (MTP) self-speculative decoding when the loaded GGUF carries " +
+                     "an MTP head (nextn.* tensors); no-op otherwise. Off by default for serve (unlike run/chat, " +
+                     "which auto-detect): enabling it disables the continuous-batch scheduler for this model, " +
+                     "same restriction as --speculative-model, which would be a surprising throughput trade for " +
+                     "concurrent server traffic to make silently.")]
+        [DefaultValue(false)]
+        public bool Mtp { get; set; }
+
+        /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
+        [CommandOption("--prefill-chunk-size|--ubatch-size")]
+        [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default). With the continuous-batch scheduler this caps prefill tokens admitted per step instead.")]
+        [DefaultValue(0)]
+        public int PrefillChunkSize { get; set; }
+
+        [CommandOption("--rope-scaling")]
+        [Description("RoPE scaling override: 'none', 'linear', 'yarn', 'ntk', 'dynamic'. Overrides the GGUF-derived value.")]
+        public string? RopeScaling { get; set; }
+
+        [CommandOption("--rope-freq-base")]
+        [Description("RoPE base frequency (theta) override. Overrides the GGUF-derived value.")]
+        public float? RopeFreqBase { get; set; }
+
+        [CommandOption("--rope-scale")]
+        [Description("RoPE scaling factor override (linear/YaRN/NTK). Overrides the GGUF-derived value.")]
+        public float? RopeScale { get; set; }
+
+        [CommandOption("--yarn-orig-ctx")]
+        [Description("YaRN original context length override.")]
+        public int? YarnOrigCtx { get; set; }
+
+        [CommandOption("--yarn-attn-factor")]
+        [Description("YaRN attention factor override.")]
+        public float? YarnAttnFactor { get; set; }
+
+        [CommandOption("--yarn-beta-fast")]
+        [Description("YaRN beta-fast parameter override.")]
+        public float? YarnBetaFast { get; set; }
+
+        [CommandOption("--yarn-beta-slow")]
+        [Description("YaRN beta-slow parameter override.")]
+        public float? YarnBetaSlow { get; set; }
+
+        /// <summary>Idle-unload duration in seconds (#369, ollama parity).</summary>
+        [CommandOption("--keep-alive")]
+        [Description("Idle-unload duration in seconds (ollama parity; default 300 = 5 min). 0 = unload after each request. Negative = never unload.")]
+        [DefaultValue(300.0)]
+        public double KeepAlive { get; set; } = 300;
+
+        /// <summary>Maximum number of models resident at once (#369).</summary>
+        [CommandOption("--max-resident-models")]
+        [Description("Maximum number of models resident at once, counting the active one (default 1 = classic single-model hot-swap). Set > 1 to hold multiple models concurrently.")]
+        [DefaultValue(1)]
+        public int MaxResidentModels { get; set; } = 1;
+
+        /// <summary>Total byte budget across all resident models (#369).</summary>
+        [CommandOption("--resident-memory-budget")]
+        [Description("Total byte budget across all resident models. 0 (default) = unlimited, only --max-resident-models bounds residency.")]
+        [DefaultValue(0L)]
+        public long ResidentMemoryBudgetBytes { get; set; }
+
+        /// <summary>Enables the #454 model-administration write endpoints (off by default).</summary>
+        [CommandOption("--allow-model-admin")]
+        [Description("Enable the model-administration API (#454): POST /v1/models/unload, /pull, /enable, /disable and PUT /v1/settings. Off by default.")]
+        public bool AllowModelAdmin { get; set; }
+
+        /// <summary>Enables the LoRA admin write endpoints (off by default).</summary>
+        [CommandOption("--allow-lora-admin")]
+        [Description("Enable the LoRA admin API: POST /v1/lora/load and DELETE /v1/lora/{name}. Off by default.")]
+        public bool AllowLoraAdmin { get; set; }
+
+        /// <summary>
+        /// Per-API-key request cap (#457). 0 = no per-request cap. Any of the three rate-limit
+        /// options being set turns the limiter on; it is off by default.
+        /// </summary>
+        [CommandOption("--rate-limit-rpm")]
+        [Description("Rate limit: max requests per minute per API key. 0 = unlimited. Setting any --rate-limit-* option enables rate limiting (off by default).")]
+        public int RateLimitRequestsPerMinute { get; set; }
+
+        /// <summary>Per-API-key token cap (#457). 0 = no per-token cap.</summary>
+        [CommandOption("--rate-limit-tpm")]
+        [Description("Rate limit: max tokens per minute per API key (prompt + completion). 0 = unlimited.")]
+        public int RateLimitTokensPerMinute { get; set; }
+
+        /// <summary>Per-API-key concurrency cap (#457). 0 = no concurrency cap.</summary>
+        [CommandOption("--rate-limit-concurrency")]
+        [Description("Rate limit: max concurrent in-flight requests per API key. 0 = unlimited.")]
+        public int RateLimitConcurrency { get; set; }
+    }
+
+    /// <summary>
+    /// Builds the rate-limit config from the CLI options (#457), or <see langword="null"/> when
+    /// no cap was requested.
+    /// </summary>
+    /// <remarks>
+    /// Returning null (rather than a disabled config) keeps <c>RateLimitMiddleware</c> on its
+    /// pass-through path, so an unconfigured server pays nothing.
+    /// </remarks>
+    private static DotLLM.Server.RateLimiting.RateLimitConfig? BuildRateLimit(Settings settings)
+    {
+        if (settings.RateLimitRequestsPerMinute <= 0
+            && settings.RateLimitTokensPerMinute <= 0
+            && settings.RateLimitConcurrency <= 0)
+        {
+            return null;
+        }
+
+        return new DotLLM.Server.RateLimiting.RateLimitConfig
+        {
+            Enabled = true,
+            DefaultPolicy = new DotLLM.Server.RateLimiting.RateLimitPolicy
+            {
+                RequestsPerMinute = settings.RateLimitRequestsPerMinute,
+                TokensPerMinute = settings.RateLimitTokensPerMinute,
+                MaxConcurrent = settings.RateLimitConcurrency,
+            },
+        };
     }
 
     /// <inheritdoc/>
@@ -150,7 +269,22 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             UsePaged = !settings.NoPaged,
             SpeculativeModel = settings.SpeculativeModel,
             SpeculativeCandidates = settings.SpeculativeK,
+            MtpEnabled = settings.Mtp,
+            PrefillChunkSize = settings.PrefillChunkSize,
+            KeepAliveSeconds = settings.KeepAlive,
+            MaxResidentModels = settings.MaxResidentModels,
+            ResidentMemoryBudgetBytes = settings.ResidentMemoryBudgetBytes,
+            AllowModelAdminApi = settings.AllowModelAdmin,
+            AllowLoraAdminApi = settings.AllowLoraAdmin,
+            // #457: nothing in src/ ever assigned RateLimit, so the entire RateLimiting
+            // subsystem was unreachable — no invocation of `dotllm serve` could produce a 429,
+            // and the limiter was exercised only by unit tests constructing the config directly.
+            // Off unless a cap is given, so the default behaviour is unchanged.
+            RateLimit = BuildRateLimit(settings),
             ModelId = "none",
+            RopeOverride = ServerOptions.BuildRopeOverride(settings.RopeScaling, settings.RopeFreqBase,
+                settings.RopeScale, settings.YarnOrigCtx, settings.YarnAttnFactor,
+                settings.YarnBetaFast, settings.YarnBetaSlow),
         };
 
         ServerState? state = null;

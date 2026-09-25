@@ -15,6 +15,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// Compares CPU vs GPU logits token by token to diagnose divergence.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaLogitComparisonTest
 {
     private readonly ITestOutputHelper _out;
@@ -22,28 +23,33 @@ public class CudaLogitComparisonTest
     public CudaLogitComparisonTest(ITestOutputHelper output) => _out = output;
 
     [SkippableFact]
-    public unsafe void CompareLogits_PrefillAndDecode()
+    public unsafe void CompareLogits_PrefillAndDecode() => RunCompareLogits("SmolLM-135M.Q8_0.gguf");
+
+    [SkippableFact]
+    public unsafe void CompareLogits_PrefillAndDecode_Q4KM() => RunCompareLogits("SmolLM-135M.Q4_K_M.gguf");
+
+    private unsafe void RunCompareLogits(string ggufFile)
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
         string modelPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
+            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", ggufFile);
         string? ggufPath = File.Exists(modelPath) ? modelPath : null;
-        Skip.If(ggufPath == null, "SmolLM-135M Q8_0 GGUF not found (run: dotllm run QuantFactory/SmolLM-135M-GGUF -q Q8_0)");
+        Skip.If(ggufPath == null, $"{ggufFile} not found (run: dotllm run QuantFactory/SmolLM-135M-GGUF)");
 
-        var gguf = GgufFile.Open(ggufPath);
+        using var gguf = GgufFile.Open(ggufPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         _out.WriteLine($"Model: {config.Architecture} {config.NumLayers}L/{config.HiddenSize}H");
 
         // Load CPU model
         var cpuModel = TransformerModel.LoadFromGguf(gguf, config);
-        var cpuKv = new SimpleKvCache(config.NumLayers, config.NumKvHeads, config.HeadDim, 64);
+        using var cpuKv = new SimpleKvCache(config.NumLayers, config.NumKvHeads, config.HeadDim, 64);
 
         // Load GPU model
         string ptxDir = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "native", "ptx"));
         var gpuModel = CudaTransformerModel.LoadFromGguf(gguf, config, 0, ptxDir);
-        var gpuKv = gpuModel.CreateKvCache(64);
+        using var gpuKv = gpuModel.CreateKvCache(64);
 
         // Prompt tokens: "The capital of France is" for SmolLM
         int[] promptTokens = [510, 5765, 302, 6181, 349]; // approximate; use actual tokenizer
@@ -54,16 +60,25 @@ public class CudaLogitComparisonTest
         int[] positions = new int[promptTokens.Length];
         for (int i = 0; i < positions.Length; i++) positions[i] = i;
 
-        // Step 1: Prefill
+        // Step 1: Prefill. CPU returns [seqLen, vocabSize] (logits for every
+        // prompt position, enabling speculative-decode verify). GPU returns
+        // [1, vocabSize] (last-position only) because that's all the sampler
+        // needs and the LM-head GEMM is the single hottest kernel. Compare
+        // apples-to-apples by indexing into CPU's last-position row.
         using var cpuLogits1 = cpuModel.Forward(promptTokens, positions, -1, cpuKv);
         using var gpuLogits1 = gpuModel.Forward(promptTokens, positions, 0, gpuKv);
 
-        CompareLogits("Prefill", cpuLogits1, gpuLogits1, config.VocabSize);
+        int lastTokenOffset = (promptTokens.Length - 1) * config.VocabSize;
+        float* cpuLastLogits = (float*)cpuLogits1.DataPointer + lastTokenOffset;
 
-        // Sample greedy from CPU
-        int token1 = ArgMax((float*)cpuLogits1.DataPointer, config.VocabSize);
+        CompareLogitsPointer("Prefill (last position)", cpuLastLogits,
+            (float*)gpuLogits1.DataPointer, config.VocabSize);
+
+        // Sample greedy from CPU (last-token logits)
+        int token1 = ArgMax(cpuLastLogits, config.VocabSize);
         int gpuToken1 = ArgMax((float*)gpuLogits1.DataPointer, config.VocabSize);
         _out.WriteLine($"Prefill → CPU token: {token1} ({tokenizer.Decode([token1])}), GPU token: {gpuToken1} ({tokenizer.Decode([gpuToken1])})");
+        Assert.Equal(gpuToken1, token1);
 
         // Step 2: First decode — FORCE same token for both
         int pos1 = promptTokens.Length;
@@ -90,15 +105,13 @@ public class CudaLogitComparisonTest
 
         cpuModel.Dispose();
         gpuModel.Dispose();
-        cpuKv.Dispose();
-        gpuKv.Dispose();
     }
 
     private unsafe void CompareLogits(string step, ITensor cpuLogits, ITensor gpuLogits, int vocabSize)
-    {
-        float* cpu = (float*)cpuLogits.DataPointer;
-        float* gpu = (float*)gpuLogits.DataPointer;
+        => CompareLogitsPointer(step, (float*)cpuLogits.DataPointer, (float*)gpuLogits.DataPointer, vocabSize);
 
+    private unsafe void CompareLogitsPointer(string step, float* cpu, float* gpu, int vocabSize)
+    {
         // Find top-5 for both
         var cpuTop = TopK(cpu, vocabSize, 5);
         var gpuTop = TopK(gpu, vocabSize, 5);

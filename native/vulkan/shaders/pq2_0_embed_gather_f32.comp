@@ -1,0 +1,92 @@
+#version 450
+// PQ2_0 token-embedding gather + dequantize — the PQ2_0 twin of q8_0_embed_gather_f32.comp (#352).
+//
+// Without this, a PQ2_0 embedding table falls through VulkanWeights.UploadTokenEmbedding's
+// `dequantToFp32: true` path and is widened to F32 at upload. For Bonsai 2's
+// token_embd.weight [5120, 248320] that is ~339 MB packed -> ~5.08 GB resident: a 15x blow-up of a
+// single tensor, on a model whose entire packed weight set is 7.2 GB. Keeping the table packed and
+// dequantizing the handful of rows a batch actually touches is the whole point of running a ternary
+// model on an iGPU.
+//
+// A dense PQ2_0 matmul kernel does NOT cover this: the embedding lookup dispatches on this table
+// alone, so it needs its own gather.
+//
+// Layout (matches DotLLM.Cpu.Kernels.Dequantize.DequantizePQ2_0 and matmul_pq2_0_f32_gemv.comp
+// byte-for-byte):
+//
+//   Each 128 weights = one 34-byte group:
+//     bytes [0..1]  : fp16 scale
+//     bytes [2..33] : 32 bytes, 4 ternary codes per byte at ASCENDING bit offsets {0,2,4,6}
+//                     mapping to CONSECUTIVE elements {4*gp, +1, +2, +3} — not the strided
+//                     {gp,+32,+64,+96} layout an earlier revision assumed (#271).
+//   Value = (code - 1) * scale, i.e. codes {0,1,2} -> {-1,0,+1}.
+//   Row stride = (hidden/128) * 34 bytes.
+//
+// Math is ordered exactly as the CPU scalar oracle (single multiply of scale by the ternary value)
+// so gathered rows are bit-identical to a host dequant of the same rows.
+//
+// NOTE: for a Hadamard-folded checkpoint the gathered row is still in the ROTATED basis. The
+// inverse transform (FWHT then signs) is a separate dispatch of hadamard_fwht_f32.comp with
+// inverse=1 — deliberately not fused here, so this shader stays the exact analogue of the Q8_0 one.
+//
+// Dispatch:
+//   gl_WorkGroupID.y = token index (0..nTokens-1)
+//   gl_GlobalInvocationID.x = column within the row (0..hidden-1)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  src[]; };  // PQ2_0 table
+layout(set = 0, binding = 1, std430) readonly  buffer BufIds { int   ids[]; };  // [nTokens]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY   { float dst[]; };  // [nTokens*hidden]
+
+layout(push_constant) uniform PushConstants {
+    uint nTokens;      // number of tokens to gather
+    uint hidden;       // row length in elements (multiple of 128)
+    uint blocksPerRow; // = hidden / 128
+    uint vocabSize;    // row-count bound (defensive clamp)
+} pc;
+
+const uint PQ2_GROUP_SIZE  = 128u;
+const uint PQ2_GROUP_BYTES = 34u;   // 2 (fp16 scale) + 32 (packed codes)
+
+uint readByte(uint absByteOff) {
+    uint u = src[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+// The 34-byte group stride makes group bases alternate 0-mod-4 / 2-mod-4, so the fp16 scale is read
+// through byte-addressed halves rather than assuming uint alignment.
+float readGroupScale(uint groupByteBase) {
+    uint lo = readByte(groupByteBase);
+    uint hi = readByte(groupByteBase + 1u);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+void main() {
+    uint t = gl_WorkGroupID.y;
+    if (t >= pc.nTokens) return;
+
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.hidden) return;
+
+    // Token ids are host-validated before recording; the clamp is a defensive second gate so a bad
+    // id can never read outside the table.
+    uint row = uint(ids[t]);
+    if (row >= pc.vocabSize) row = 0u;
+
+    uint rowBase = row * pc.blocksPerRow * PQ2_GROUP_BYTES;
+
+    uint g       = c / PQ2_GROUP_SIZE;            // group within the row
+    uint r       = c - g * PQ2_GROUP_SIZE;        // element within the group (0..127)
+    uint gp      = r >> 2u;                       // code byte within the group (0..31)
+    uint bitOff  = (r & 3u) << 1u;                // ascending {0,2,4,6}
+
+    uint groupByteBase = rowBase + g * PQ2_GROUP_BYTES;
+    float scale = readGroupScale(groupByteBase);
+    uint  pk    = readByte(groupByteBase + 2u + gp);
+    int   code  = int((pk >> bitOff) & 3u) - 1;   // {0,1,2} -> {-1,0,+1}
+
+    precise float v = scale * float(code);
+    dst[t * pc.hidden + c] = v;
+}

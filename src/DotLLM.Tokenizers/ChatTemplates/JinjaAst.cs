@@ -24,6 +24,16 @@ internal sealed record SetNode(string Name, IExpression Value) : ITemplateNode;
 internal sealed record SetAttributeNode(
     string ObjectName, string AttributeName, IExpression Value) : ITemplateNode;
 
+/// <summary>
+/// <c>{% macro name(params) %}...{% endmacro %}</c>. Parameters may declare a default
+/// expression (<c>param=expr</c>); parameters without one carry a <see langword="null"/> default
+/// and are <see cref="JinjaEvaluator.Undefined"/> when the call site omits them.
+/// </summary>
+internal sealed record MacroNode(
+    string Name,
+    IReadOnlyList<(string Name, IExpression? Default)> Parameters,
+    IReadOnlyList<ITemplateNode> Body) : ITemplateNode;
+
 // ── Root ──
 
 internal sealed record JinjaTemplate(IReadOnlyList<ITemplateNode> Nodes);
@@ -60,7 +70,7 @@ internal sealed record ListExpr(IReadOnlyList<IExpression> Items) : IExpression;
 
 internal sealed record DictExpr(IReadOnlyList<(IExpression Key, IExpression Value)> Pairs) : IExpression;
 
-internal sealed record SliceExpr(IExpression Object, IExpression? Start, IExpression? Stop) : IExpression;
+internal sealed record SliceExpr(IExpression Object, IExpression? Start, IExpression? Stop, IExpression? Step = null) : IExpression;
 
 // ── Operators ──
 

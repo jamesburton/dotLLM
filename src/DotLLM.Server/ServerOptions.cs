@@ -1,4 +1,7 @@
+using DotLLM.Core.Configuration;
 using DotLLM.Engine;
+using DotLLM.Engine.Scheduler;
+using DotLLM.Server.RateLimiting;
 
 namespace DotLLM.Server;
 
@@ -52,11 +55,111 @@ public sealed record ServerOptions
     /// <summary>Draft model for speculative decoding. Null = disabled.</summary>
     public string? SpeculativeModel { get; init; }
 
-    /// <summary>Number of draft candidates per speculative step (K).</summary>
-    public int SpeculativeCandidates { get; init; } = 5;
+    /// <summary>Number of draft candidates per speculative step (K). Also used as K for MTP
+    /// self-speculative decoding (<see cref="MtpEnabled"/>) — both are the same "candidates per
+    /// round" concept.</summary>
+    public int SpeculativeCandidates { get; init; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
+
+    /// <summary>
+    /// Enables Multi-Token Prediction (MTP) self-speculative decoding (issue #253) when the loaded
+    /// checkpoint carries an MTP head. Unlike <see cref="SpeculativeModel"/> this needs no second
+    /// model — it's a no-op for any GGUF without an MTP head. Defaults to <c>false</c> (opt-in via
+    /// <c>--mtp</c>) for <c>serve</c>, unlike the CLI's <c>run</c>/<c>chat</c> commands where MTP
+    /// auto-detects and defaults on: enabling it here also disables the continuous-batch scheduler
+    /// for this model (mirrors the existing <see cref="SpeculativeModel"/> restriction — MTP's
+    /// single-sequence self-speculative loop doesn't support multi-request batching in this
+    /// iteration), which would be a surprising throughput regression for concurrent server traffic
+    /// to trigger purely from which GGUF happened to load.
+    /// </summary>
+    public bool MtpEnabled { get; init; }
+
+    /// <summary>
+    /// Maximum prompt tokens per prefill forward pass (llama.cpp <c>-ub</c> / micro-batch analog).
+    /// 0 (default) = whole prompt in one forward pass. On the single-request
+    /// <see cref="DotLLM.Engine.TextGenerator"/> path this chunks the prompt-suffix prefill; when
+    /// the continuous-batch scheduler is active it is applied as the scheduler's per-step prefill
+    /// admission cap (<see cref="ContinuousBatchSchedulerOptions.MaxPrefillTokensPerStep"/>) unless
+    /// the <see cref="Scheduler"/> section already sets one — a single prompt longer than the cap
+    /// still prefills in one forward pass there (admission-level cap, not intra-prompt chunking).
+    /// </summary>
+    public int PrefillChunkSize { get; init; }
 
     /// <summary>Model display name (derived from file path).</summary>
     public string ModelId { get; init; } = "default";
+
+    /// <summary>
+    /// RoPE scaling overrides applied on top of the GGUF-derived config at load time
+    /// (llama.cpp <c>--rope-scaling</c>/<c>--rope-freq-base</c>/<c>--yarn-*</c> flag family).
+    /// Null = use the GGUF-derived <see cref="Core.Models.ModelConfig.RoPEConfig"/> unchanged.
+    /// </summary>
+    public RoPEOverrideOptions? RopeOverride { get; init; }
+
+    /// <summary>
+    /// Whether the LoRA admin write endpoints (<c>POST /v1/lora/load</c>,
+    /// <c>DELETE /v1/lora/{name}</c>) are enabled. Read-only <c>GET /v1/lora</c>
+    /// is always available. Defaults to <c>false</c> — opt-in via configuration.
+    /// </summary>
+    public bool AllowLoraAdminApi { get; init; }
+
+    /// <summary>
+    /// Whether the model-administration write endpoints introduced in #454 are enabled:
+    /// <c>POST /v1/models/unload</c>, <c>POST /v1/models/pull</c> (+ its cancel route),
+    /// <c>POST /v1/models/enable</c>, <c>POST /v1/models/disable</c> and
+    /// <c>PUT /v1/settings</c>. The matching read-only routes (<c>GET /v1/settings</c>,
+    /// <c>GET /v1/devices</c>, <c>GET /v1/models/pull</c>) are always available.
+    /// Defaults to <c>false</c> — opt in via <c>--allow-model-admin</c>, mirroring
+    /// <see cref="AllowLoraAdminApi"/>. Deliberately a separate flag: unloading models and
+    /// rewriting residency settings is a different trust boundary from registering a LoRA adapter.
+    /// </summary>
+    public bool AllowModelAdminApi { get; init; }
+
+    /// <summary>
+    /// Per-API-key rate-limit configuration. When <see cref="RateLimitConfig.Enabled"/>
+    /// is <c>false</c> (or this property is <c>null</c>) the rate-limit middleware
+    /// is not wired and the server has no per-caller limits. See <see cref="RateLimitConfig"/>
+    /// for the JSON shape loaded from <c>appsettings.json</c>.
+    /// </summary>
+    public RateLimitConfig? RateLimit { get; init; }
+
+    /// <summary>
+    /// Continuous-batch scheduler options. When <c>null</c>, the scheduler uses its defaults
+    /// (fairness off, preemption off, etc.). A host binding <see cref="ServerOptions"/> from
+    /// <c>appsettings.json</c> can set this section to enable per-API-key fairness
+    /// (<see cref="ContinuousBatchSchedulerOptions.EnableFairness"/>), bound recurrent concurrency,
+    /// preemption, the prefill-token cap, and the active-sequence/reserve limits.
+    /// </summary>
+    public ContinuousBatchSchedulerOptions? Scheduler { get; init; }
+
+    /// <summary>
+    /// Server-wide default idle-unload duration in seconds (#369, ollama parity — ollama's own
+    /// default is 5 min). Per-model/per-request <c>keep_alive</c> overrides take precedence when
+    /// present. 0 = unload immediately after each use. Negative = never auto-unload.
+    /// </summary>
+    public double KeepAliveSeconds { get; init; } = 300;
+
+    /// <summary>
+    /// Maximum number of models resident at once, counting the active one (#369). Default 1
+    /// reproduces the original single-model hot-swap behavior exactly — the previous model is
+    /// evicted the instant a new one loads. Set &gt; 1 to hold multiple models concurrently
+    /// (subject to <see cref="ResidentMemoryBudgetBytes"/>), servable via the <c>model</c> field on
+    /// chat/completion requests or an explicit <c>POST /v1/models/load</c>.
+    /// </summary>
+    public int MaxResidentModels { get; init; } = 1;
+
+    /// <summary>
+    /// Total byte budget across all resident models (#369). 0 (default) = unlimited — only
+    /// <see cref="MaxResidentModels"/> bounds residency. Accounted against each model's GGUF file
+    /// size on disk as a proxy for its host-RAM (mmap) or VRAM footprint.
+    /// </summary>
+    public long ResidentMemoryBudgetBytes { get; init; }
+
+    /// <summary>
+    /// Interval between idle-unload sweeps (#369). Default 5s — bounds the worst-case delay
+    /// between a model crossing its keep-alive and actually being unloaded (including the
+    /// <c>keep_alive: 0</c> "unload after each use" case, which is enforced on the next tick
+    /// rather than synchronously in the request path, to keep response latency unaffected).
+    /// </summary>
+    public TimeSpan IdleSweepInterval { get; init; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Parses command-line arguments into <see cref="ServerOptions"/>.
@@ -78,6 +181,23 @@ public sealed record ServerOptions
         bool usePaged = true;
         bool warmupEnabled = true;
         int warmupIterations = 3;
+        bool schedulerFairness = false;
+        string? speculativeModel = null;
+        int speculativeCandidates = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
+        bool mtpEnabled = false;
+        int prefillChunkSize = 0;
+        string? ropeScaling = null;
+        float? ropeFreqBase = null;
+        float? ropeScale = null;
+        int? yarnOrigCtx = null;
+        float? yarnAttnFactor = null;
+        float? yarnBetaFast = null;
+        float? yarnBetaSlow = null;
+        double keepAliveSeconds = 300;
+        int maxResidentModels = 1;
+        long residentMemoryBudgetBytes = 0;
+        bool allowModelAdmin = false;
+        bool allowLoraAdmin = false;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -118,6 +238,40 @@ public sealed record ServerOptions
                     warmupEnabled = false; break;
                 case "--warmup-iterations":
                     warmupIterations = int.Parse(next!); i++; break;
+                case "--scheduler-fairness":
+                    schedulerFairness = true; break;
+                case "--speculative-model" or "--draft-model":
+                    speculativeModel = next; i++; break;
+                case "--speculative-k" or "--draft-tokens":
+                    speculativeCandidates = int.Parse(next!); i++; break;
+                case "--mtp":
+                    mtpEnabled = true; break;
+                case "--prefill-chunk-size" or "--ubatch-size":
+                    prefillChunkSize = int.Parse(next!); i++; break;
+                case "--rope-scaling":
+                    ropeScaling = next; i++; break;
+                case "--rope-freq-base":
+                    ropeFreqBase = float.Parse(next!); i++; break;
+                case "--rope-scale":
+                    ropeScale = float.Parse(next!); i++; break;
+                case "--yarn-orig-ctx":
+                    yarnOrigCtx = int.Parse(next!); i++; break;
+                case "--yarn-attn-factor":
+                    yarnAttnFactor = float.Parse(next!); i++; break;
+                case "--yarn-beta-fast":
+                    yarnBetaFast = float.Parse(next!); i++; break;
+                case "--yarn-beta-slow":
+                    yarnBetaSlow = float.Parse(next!); i++; break;
+                case "--keep-alive":
+                    keepAliveSeconds = double.Parse(next!); i++; break;
+                case "--max-resident-models":
+                    maxResidentModels = int.Parse(next!); i++; break;
+                case "--resident-memory-budget":
+                    residentMemoryBudgetBytes = long.Parse(next!); i++; break;
+                case "--allow-model-admin":
+                    allowModelAdmin = true; break;
+                case "--allow-lora-admin":
+                    allowLoraAdmin = true; break;
                 default:
                     // Positional: treat as model if not set
                     if (model is null && !arg.StartsWith('-'))
@@ -156,7 +310,54 @@ public sealed record ServerOptions
                 Enabled = warmupEnabled,
                 Iterations = warmupIterations,
             },
+            Scheduler = schedulerFairness
+                ? new ContinuousBatchSchedulerOptions { EnableFairness = true }
+                : null,
+            SpeculativeModel = speculativeModel,
+            SpeculativeCandidates = speculativeCandidates,
+            MtpEnabled = mtpEnabled,
+            PrefillChunkSize = prefillChunkSize,
+            KeepAliveSeconds = keepAliveSeconds,
+            MaxResidentModels = maxResidentModels,
+            ResidentMemoryBudgetBytes = residentMemoryBudgetBytes,
+            AllowModelAdminApi = allowModelAdmin,
+            AllowLoraAdminApi = allowLoraAdmin,
             ModelId = modelId,
+            RopeOverride = BuildRopeOverride(ropeScaling, ropeFreqBase, ropeScale,
+                yarnOrigCtx, yarnAttnFactor, yarnBetaFast, yarnBetaSlow),
         };
     }
+
+    /// <summary>
+    /// Builds a <see cref="RoPEOverrideOptions"/> from individually-parsed CLI flag values.
+    /// Returns null (no-op) when none were set. Shared by the raw <see cref="Parse"/> path and
+    /// (indirectly, via matching flags) the Spectre.Console-based <c>dotllm serve</c> command.
+    /// </summary>
+    public static RoPEOverrideOptions? BuildRopeOverride(string? scalingType, float? freqBase,
+        float? scalingFactor, int? origCtx, float? attnFactor, float? betaFast, float? betaSlow)
+    {
+        var overrides = new RoPEOverrideOptions
+        {
+            ScalingType = scalingType is null ? null : ParseRopeScalingType(scalingType),
+            FreqBase = freqBase,
+            ScalingFactor = scalingFactor,
+            OrigMaxSeqLen = origCtx,
+            AttnFactor = attnFactor,
+            BetaFast = betaFast,
+            BetaSlow = betaSlow,
+        };
+        return overrides.HasAnyOverride ? overrides : null;
+    }
+
+    private static RoPEScalingType ParseRopeScalingType(string value) => value.ToLowerInvariant() switch
+    {
+        "none" => RoPEScalingType.None,
+        "linear" => RoPEScalingType.Linear,
+        "yarn" => RoPEScalingType.YaRN,
+        "ntk" => RoPEScalingType.NTK,
+        "dynamic" or "dynamic_ntk" or "dynamic-ntk" => RoPEScalingType.DynamicNTK,
+        "su" or "longrope" => RoPEScalingType.Su,
+        _ => throw new InvalidOperationException(
+            $"Unknown --rope-scaling value '{value}'. Expected: none, linear, yarn, ntk, dynamic."),
+    };
 }

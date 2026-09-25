@@ -1,0 +1,52 @@
+{
+  "benchmark": "throughput_openai",
+  "run_started_at": "2026-04-24T14:02:19.573290+00:00",
+  "run_finished_at": "2026-04-24T14:02:31.739610+00:00",
+  "output_path": "C:\\Development\\dotLLM-mamba3\\.perf-runs\\cross-lib-20260424\\llamacpp-throughput.json",
+  "base_url": "http://127.0.0.1:8000",
+  "host_details": {
+    "captured_at": "2026-04-24T14:02:21.979783+00:00",
+    "hostname": "Strix",
+    "host_slug": "strix",
+    "os": {
+      "system": "Windows",
+      "release": "11",
+      "version": "10.0.26200",
+      "machine": "AMD64"
+    },
+    "manufacturer": "Bosgame",
+    "model": "BeyondMax Series",
+    "processor": "AMD64 Family 26 Model 112 Stepping 0, AuthenticAMD",
+    "logical_cpu_count": 32,
+    "total_memory_gb": 63.65,
+    "python_version": "3.12.10",
+    "ollama_version": "Warning: could not connect to a running Ollama instance",
+    "gpus": [
+      {
+        "Name": "AMD Radeon(TM) 8060S Graphics",
+        "AdapterRAM": 4293918720,
+        "DriverVersion": "32.0.12064.27",
+        "VideoProcessor": "AMD Radeon Graphics Processor (0x1586)",
+        "Status": "OK"
+      }
+    ]
+  },
+  "models": [
+    "SmolLM-135M"
+  ],
+  "results": [
+    {
+      "model": "SmolLM-135M",
+      "completion_tokens": 192,
+      "toks_per_s": 34.73,
+      "total_s": 5.528,
+      "cpu_avg_pct": 0,
+      "cpu_peak_pct": 0,
+      "ram_peak_gb": 0.25,
+      "gpu_util_avg": 14.6,
+      "gpu_util_peak": 14.6,
+      "gpu_mem_peak_gb": 3.29,
+      "response_preview": "Write a concise explanation of dependency injection with one short Python example.\n\n# Python\n\nimport requests\nimport json\nimport time\n\n# 1.\n# 2.\n# 3.\n# 4.\n# 5.\n# 6.\n# 7.\n# 8.\n# 9.\n# 10.\n# 11.\n# 12.\n# "
+    }
+  ]
+}

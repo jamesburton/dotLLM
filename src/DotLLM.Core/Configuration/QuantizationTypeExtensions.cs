@@ -15,14 +15,40 @@ public static class QuantizationTypeExtensions
     {
         QuantizationType.F32 => elementCount * 4,
         QuantizationType.F16 => elementCount * 2,
+        QuantizationType.BF16 => elementCount * 2,
         QuantizationType.Q4_0 => elementCount / 32 * 18,
         QuantizationType.Q4_1 => elementCount / 32 * 20,
         QuantizationType.Q5_0 => elementCount / 32 * 22,
         QuantizationType.Q5_1 => elementCount / 32 * 24,
         QuantizationType.Q8_0 => elementCount / 32 * 34,
+        QuantizationType.Q2_K => elementCount / 256 * 84,
+        QuantizationType.Q3_K => elementCount / 256 * 110,
         QuantizationType.Q4_K => elementCount / 256 * 144,
         QuantizationType.Q5_K => elementCount / 256 * 176,
         QuantizationType.Q6_K => elementCount / 256 * 210,
+        QuantizationType.IQ4_NL => elementCount / 32 * 18,
+        QuantizationType.IQ4_XS => elementCount / 256 * 136,
+        // IQ2_XXS:  d(2) + qs[QK_K/8](uint16) = 2 + 64 = 66 bytes / 256 elements (2.0625 bpw).
+        QuantizationType.IQ2_XXS => elementCount / 256 * 66,
+        // IQ2_XS:   d(2) + qs[QK_K/8](uint16) + scales[QK_K/32] = 2 + 64 + 8 = 74 bytes / 256 (2.3125 bpw).
+        QuantizationType.IQ2_XS => elementCount / 256 * 74,
+        // IQ2_S:    d(2) + qs[QK_K/4] + qh[QK_K/32] + scales[QK_K/32] = 2 + 64 + 8 + 8 = 82 bytes / 256.
+        // Also the on-disk type for MOSTLY_IQ2_M file-type recipe (~2.5625 bpw).
+        QuantizationType.IQ2_S => elementCount / 256 * 82,
+        // IQ1_S:    d(2) + qs[QK_K/8] + qh[QK_K/32](uint16) = 2 + 32 + 16 = 50 bytes / 256 (~1.5625 bpw).
+        QuantizationType.IQ1_S => elementCount / 256 * 50,
+        // IQ3_XXS:  d(2) + qs[QK_K/4] + scales_and_signs[QK_K/8] = 2 + 64 + 32 = 98 bytes / 256 (3.0625 bpw).
+        QuantizationType.IQ3_XXS => elementCount / 256 * 98,
+        // IQ3_S:    d(2) + qs[QK_K/4] + qh[QK_K/32] + signs[QK_K/8] + scales[QK_K/64]
+        //        =  2 + 64 + 8 + 32 + 4 = 110 bytes / 256 (3.4375 bpw).
+        QuantizationType.IQ3_S => elementCount / 256 * 110,
+        // I2_S: n/4 packed bytes (4 ternary codes/byte) + one trailing per-tensor float32 scale.
+        QuantizationType.I2_S => elementCount / 4 + 4,
+        // MXFP4: e(1, E8M0 scale) + qs[16] = 17 bytes / 32 elements (4.25 bpw).
+        QuantizationType.MXFP4 => elementCount / 32 * 17,
+        // PQ2_0: scale(Half, 2 bytes) + codes[32](uint8, 4 codes/byte) = 34 bytes / 128
+        // elements (2.125 bpw) — one scale PER GROUP, not per tensor (contrast I2_S above).
+        QuantizationType.PQ2_0 => elementCount / 128 * 34,
         _ => throw new ArgumentOutOfRangeException(nameof(qt), qt,
             $"Unknown quantization type: {qt}"),
     };

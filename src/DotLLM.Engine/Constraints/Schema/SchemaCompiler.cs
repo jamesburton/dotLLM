@@ -70,6 +70,8 @@ internal static class SchemaCompiler
         int[]? anyOfNodeIndices = null;
         int propertyTrieIndex = -1;
         int enumTrieIndex = -1;
+        int maxLength = -1;
+        int minLength = -1;
 
         // Parse type
         if (element.TryGetProperty("type", out var typeProp))
@@ -237,6 +239,12 @@ internal static class SchemaCompiler
             }
         }
 
+        // Parse string length bounds
+        if (element.TryGetProperty("maxLength", out var maxLp) && maxLp.TryGetInt32(out int ml) && ml >= 0)
+            maxLength = ml;
+        if (element.TryGetProperty("minLength", out var minLp) && minLp.TryGetInt32(out int nl) && nl >= 0)
+            minLength = nl;
+
         // Build final node
         ctx.Nodes[nodeIndex] = new SchemaNode
         {
@@ -251,6 +259,8 @@ internal static class SchemaCompiler
             AnyOfNodeIndices = anyOfNodeIndices,
             PropertyTrieIndex = propertyTrieIndex,
             EnumTrieIndex = enumTrieIndex,
+            MaxLength = maxLength,
+            MinLength = minLength,
         };
 
         return nodeIndex;

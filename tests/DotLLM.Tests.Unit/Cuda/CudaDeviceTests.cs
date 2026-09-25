@@ -8,6 +8,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// Skip if no GPU is available.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaDeviceTests
 {
     [SkippableFact]

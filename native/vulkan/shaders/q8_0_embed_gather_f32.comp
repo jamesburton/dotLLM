@@ -1,0 +1,100 @@
+#version 450
+// Q8_0 token-embedding gather + dequantize (issue #352).
+//
+// Gathers one embedding row per input token from a RAW Q8_0 table that stays
+// resident on the device in its quantized byte layout, dequantizing on the fly
+// into the F32 hidden-state buffer:
+//
+//   dst[t*hidden + c] = float(d[row(t), c/32]) * float(qs[row(t), c])
+//
+// This replaces the vkCmdCopyBuffer row copy used when the table was widened
+// to F32 at upload time. Keeping the table Q8_0 saves ~3.76x its device bytes
+// (34 bytes per 32 weights vs 128) — ~772 MB on Llama-3.2-1B-Instruct-Q8_0.
+//
+// Layout (mirrors DotLLM.Cpu.Kernels.Dequantize.DequantizeQ8_0Scalar and
+// llama.cpp's block_q8_0 byte-for-byte):
+//
+//   Each 32 weights = one 34-byte block:
+//     bytes [0..1]  = fp16 scale d
+//     bytes [2..33] = 32 signed int8 qs
+//   Row stride = (hidden/32) * 34 bytes.
+//
+// The 34-byte block stride means block bases alternate 0-mod-4 / 2-mod-4, so
+// every read goes through the byte-addressed helpers below (same funnel the
+// K-quant dequant shaders use) rather than assuming uint alignment.
+//
+// Math is `precise` and ordered exactly as the CPU scalar oracle
+// (scale * qs, single multiply) so the gathered rows are bit-identical to the
+// host dequant of the same rows — the F32-upload path this replaces produced
+// exactly those bytes.
+//
+// Dispatch:
+//   gl_WorkGroupID.y = token index (0..nTokens-1)
+//   gl_GlobalInvocationID.x = column within the row (0..hidden-1)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  src[]; };  // Q8_0 table
+layout(set = 0, binding = 1, std430) readonly  buffer BufIds { int   ids[]; };  // [nTokens]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY   { float dst[]; };  // [nTokens*hidden]
+
+layout(push_constant) uniform PushConstants {
+    uint nTokens;      // number of tokens to gather
+    uint hidden;       // row length in elements (multiple of 32)
+    uint blocksPerRow; // = hidden / 32
+    uint vocabSize;    // row-count bound (defensive clamp)
+} pc;
+
+const uint Q8_0_BLOCK_BYTES = 34u;
+const uint Q8_0_GROUP_SIZE  = 32u;
+
+uint readByte(uint absByteOff) {
+    uint u = src[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+// fp16 read at an arbitrary (possibly 2-mod-4) byte offset.
+float readHalf(uint absByteOff) {
+    uint alignedIdx  = absByteOff >> 2u;
+    uint byteInWord  = absByteOff & 3u;
+    uint u = src[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = src[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// int8 read (two's complement).
+int readSByte(uint absByteOff) {
+    int b = int(readByte(absByteOff));
+    return b >= 128 ? b - 256 : b;
+}
+
+void main() {
+    uint t = gl_WorkGroupID.y;
+    if (t >= pc.nTokens) return;
+
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.hidden) return;
+
+    // Token ids are host-validated before recording; the clamp is a defensive
+    // second gate so a bad id can never read outside the table.
+    uint row = uint(ids[t]);
+    if (row >= pc.vocabSize) row = 0u;
+
+    uint rowBase   = row * pc.blocksPerRow * Q8_0_BLOCK_BYTES;
+    uint block     = c / Q8_0_GROUP_SIZE;
+    uint lane      = c - block * Q8_0_GROUP_SIZE;
+    uint blockBase = rowBase + block * Q8_0_BLOCK_BYTES;
+
+    float d = readHalf(blockBase);
+    int   q = readSByte(blockBase + 2u + lane);
+
+    precise float v = d * float(q);
+    dst[t * pc.hidden + c] = v;
+}

@@ -1,0 +1,168 @@
+{
+  "_comment": [
+    "Work queue for scripts/parity_model_sweep.py — the resumable CPU<->Vulkan parity sweep.",
+    "",
+    "This file is DATA. Add a model by appending an object to `models`; never edit the harness.",
+    "",
+    "Fields:",
+    "  id           (required) stable slug — the key used in the state file. Never rename.",
+    "  repo         (required) Hugging Face repo id. Downloaded into the HF hub cache.",
+    "  file         (required) file name inside that repo (the GGUF).",
+    "  filter       (required) narrow `dotnet test --filter` expression. MUST be narrow:",
+    "               the full unit suite takes ~57 min and hangs, and any filter containing",
+    "               the substring 'Quant' drags in the whole Vulkan GPU suite (46+ min).",
+    "  env          (optional) DOTLLM_* env var the test reads; set to the fetched path.",
+    "  stage_path   (optional) conventional path the test falls back to when `env` is unset.",
+    "               The harness HARDLINKS the hub-cache blob here (never copies) and removes",
+    "               the hardlink during cleanup.",
+    "  size_bytes   (optional) fallback size used for smallest-first ordering when the HF API",
+    "               is unreachable. The harness prefers the live API size.",
+    "  timeout_sec  (optional) per-model test timeout, default 1800.",
+    "  available    (optional, default true) set false for a model that cannot be fetched;",
+    "               the harness records it as `skipped` without touching the network.",
+    "  skip_reason  (optional) why `available` is false.",
+    "  notes        (optional) free text, echoed into the log.",
+    "",
+    "Derived from the actual fixture resolution in tests/DotLLM.Tests.Integration/ —",
+    "grep for `envVar:` / `conventional:` there if a test's fixture contract changes."
+  ],
+
+  "test_project": "tests/DotLLM.Tests.Integration/DotLLM.Tests.Integration.csproj",
+
+  "models": [
+    {
+      "id": "bielik-1.5b-q3_k_m",
+      "repo": "second-state/Bielik-1.5B-v3.0-Instruct-GGUF",
+      "file": "Bielik-1.5B-v3.0-Instruct-Q3_K_M.gguf",
+      "env": "DOTLLM_BIELIK_15B_Q3_K_M_GGUF",
+      "stage_path": "~/.dotllm/test-cache/second-state/Bielik-1.5B-v3.0-Instruct-GGUF/Bielik-1.5B-v3.0-Instruct-Q3_K_M.gguf",
+      "filter": "FullyQualifiedName~RealGgufVulkanParityTests.Bielik15B_Q3_K_M",
+      "size_bytes": 782000000,
+      "notes": "Q3_K coverage — smallest missing candidate, the sweep's canary."
+    },
+    {
+      "id": "bielik-1.5b-q4_k_m",
+      "repo": "second-state/Bielik-1.5B-v3.0-Instruct-GGUF",
+      "file": "Bielik-1.5B-v3.0-Instruct-Q4_K_M.gguf",
+      "env": "DOTLLM_BIELIK_15B_Q4_K_M_GGUF",
+      "stage_path": "~/.dotllm/test-cache/second-state/Bielik-1.5B-v3.0-Instruct-GGUF/Bielik-1.5B-v3.0-Instruct-Q4_K_M.gguf",
+      "filter": "FullyQualifiedName~RealGgufVulkanParityTests.Bielik15B_Q4_K_M",
+      "size_bytes": 972797408,
+      "notes": "Already cached on this box — exercises the pre-existing/no-delete path."
+    },
+    {
+      "id": "llama32-1b-q8_0",
+      "repo": "bartowski/Llama-3.2-1B-Instruct-GGUF",
+      "file": "Llama-3.2-1B-Instruct-Q8_0.gguf",
+      "env": "DOTLLM_LLAMA32_1B_Q8_0_GGUF",
+      "stage_path": "~/.dotllm/test-cache/bartowski/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q8_0.gguf",
+      "filter": "FullyQualifiedName~RealGgufVulkanParityTests.Llama32_1B_Q8_0",
+      "size_bytes": 1321083008,
+      "notes": "Already cached — Q8_0 dense baseline."
+    },
+    {
+      "id": "llama32-3b-iq4_xs-splitkv",
+      "repo": "bartowski/Llama-3.2-3B-Instruct-GGUF",
+      "file": "Llama-3.2-3B-Instruct-IQ4_XS.gguf",
+      "env": "DOTLLM_SPLIT_PARITY_GGUF",
+      "stage_path": "C:/Development/gguf-cache/Llama-3.2-3B-Instruct-IQ4_XS.gguf",
+      "filter": "FullyQualifiedName~VulkanSplitDecodeParityTests",
+      "size_bytes": 1832000000,
+      "notes": "Split-KV flash-decoding CPU<->Vulkan parity (#345). Already staged in gguf-cache."
+    },
+    {
+      "id": "llama31-8b-iq1_s",
+      "repo": "mradermacher/Meta-Llama-3.1-8B-Instruct-i1-GGUF",
+      "file": "Meta-Llama-3.1-8B-Instruct.i1-IQ1_S.gguf",
+      "env": "DOTLLM_LLAMA31_8B_IQ1_S_GGUF",
+      "stage_path": "~/.dotllm/test-cache/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-IQ1_S.gguf",
+      "filter": "FullyQualifiedName~RealGgufVulkanParityTests.Llama31_8B_IQ1_S",
+      "size_bytes": 2019000000,
+      "notes": "bartowski's 8B repo has no IQ1_S; mradermacher's i1 imatrix repo does. Same arch/quant the test targets."
+    },
+    {
+      "id": "llama31-8b-iq4_xs",
+      "repo": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+      "file": "Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf",
+      "env": "DOTLLM_LLAMA31_8B_IQ4_XS_GGUF",
+      "stage_path": "~/.dotllm/test-cache/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf",
+      "filter": "FullyQualifiedName~RealGgufVulkanParityTests.Llama31_8B_IQ4_XS",
+      "size_bytes": 4447000000,
+      "notes": "Most-used IQ quant in production deployments."
+    },
+    {
+      "id": "mistral-7b-q4_k_m",
+      "repo": "TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+      "file": "mistral-7b-instruct-v0.2.Q4_K_M.gguf",
+      "env": "DOTLLM_MISTRAL_7B_Q4_K_M_GGUF",
+      "stage_path": "~/.dotllm/models/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/mistral-7b-instruct-v0.2.Q4_K_M.gguf",
+      "filter": "FullyQualifiedName~RealGgufVulkanParityTests.Mistral7B_Q4_K_M",
+      "size_bytes": 4368439584,
+      "notes": "Already cached on this box."
+    },
+    {
+      "id": "deepseek-coder-v2-lite-q2_k",
+      "repo": "bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF",
+      "file": "DeepSeek-Coder-V2-Lite-Instruct-Q2_K.gguf",
+      "env": "DOTLLM_DEEPSEEK_CODER_V2_LITE_Q2_K_GGUF",
+      "stage_path": "~/.dotllm/test-cache/bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF/DeepSeek-Coder-V2-Lite-Instruct-Q2_K.gguf",
+      "filter": "FullyQualifiedName~RealGgufVulkanParityTests.DeepSeekCoderV2Lite_Q2_K",
+      "size_bytes": 6433000000,
+      "timeout_sec": 3600,
+      "notes": "Q2_K + MLA/MoE coverage."
+    },
+    {
+      "id": "deepseek-v2-lite-q4_k_m",
+      "repo": "mradermacher/DeepSeek-V2-Lite-GGUF",
+      "file": "DeepSeek-V2-Lite.Q4_K_M.gguf",
+      "env": "DOTLLM_DEEPSEEK_V2_LITE_Q4_K_M_GGUF",
+      "stage_path": "~/.dotllm/test-cache/mradermacher/DeepSeek-V2-Lite-GGUF/DeepSeek-V2-Lite.Q4_K_M.gguf",
+      "filter": "FullyQualifiedName~RealGgufVulkanParityTests.DeepSeekV2Lite_Q4_K_M",
+      "size_bytes": 10364416736,
+      "timeout_sec": 3600,
+      "notes": "Already cached. Known to OOM on this box's host-F32-expert-dequant path — expect a recorded failure, not a hang."
+    },
+    {
+      "id": "qwen36-35b-a3b-iq2_xxs",
+      "repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
+      "file": "Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf",
+      "env": "DOTLLM_QWEN36_A3B_IQ2_XXS_GGUF",
+      "stage_path": "~/.dotllm/test-cache/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-IQ2_XXS.gguf",
+      "filter": "FullyQualifiedName~RealGgufVulkanParityTests.Qwen36A3B_IQ2_XXS",
+      "size_bytes": 10760000000,
+      "timeout_sec": 5400,
+      "notes": "Upstream ships UD-prefixed filenames; stage_path uses the name the test's conventional path expects."
+    },
+    {
+      "id": "qwen36-35b-a3b-iq2_m",
+      "repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
+      "file": "Qwen3.6-35B-A3B-UD-IQ2_M.gguf",
+      "env": "DOTLLM_QWEN36_A3B_IQ2_M_GGUF",
+      "stage_path": "~/.dotllm/test-cache/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-IQ2_M.gguf",
+      "filter": "FullyQualifiedName~RealGgufVulkanParityTests.Qwen36A3B_IQ2_M",
+      "size_bytes": 11520000000,
+      "timeout_sec": 5400
+    },
+    {
+      "id": "qwen36-35b-a3b-q6_k_xl",
+      "repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
+      "file": "Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf",
+      "env": "DOTLLM_QWEN36_A3B_Q6_K_XL_GGUF",
+      "stage_path": "~/.dotllm/test-cache/unsloth/Qwen3.6-A3B-GGUF/Qwen3.6-A3B-UD-Q6_K_XL.gguf",
+      "filter": "FullyQualifiedName~Qwen3MoeHybridQ6KResidentSmokeTests",
+      "size_bytes": 31840000000,
+      "timeout_sec": 7200,
+      "notes": "31.8 GB — by far the most expensive entry. Run it last (it sorts last) or --only it deliberately."
+    },
+    {
+      "id": "bonsai-27b-pq2_0",
+      "repo": "PrismML/Ternary-Bonsai-27B-GGUF",
+      "file": "Ternary-Bonsai-27B-Q2_0.gguf",
+      "env": "DOTLLM_BONSAI_PQ2_0_GGUF",
+      "filter": "FullyQualifiedName~PQ2_0RealGgufSmokeTests",
+      "available": false,
+      "skip_reason": "PrismML/Ternary-Bonsai-27B-GGUF returns HTTP 404 on the HF API (verified 2026-08-10) — the repo is not publicly reachable, with or without a token. Flip `available` to true and fix `repo`/`file` once a source exists.",
+      "size_bytes": 7000000000
+    }
+  ]
+}

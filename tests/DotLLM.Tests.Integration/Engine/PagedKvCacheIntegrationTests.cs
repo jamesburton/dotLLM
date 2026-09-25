@@ -91,6 +91,54 @@ public class PagedKvCacheIntegrationTests
     }
 
     [Fact]
+    public void PagedKvCache_WithPrefixCache_DoesNotReuseUndersizedEntry()
+    {
+        // Regression test: a stored prefix-cache entry whose KV-cache was sized for
+        // a small max_tokens must NOT be reused for a later request that needs more
+        // generation room. Reusing a too-small cache causes silent early-termination
+        // once the decode loop hits pos >= cacheSize.
+        //
+        // Pre-fix: the ResolveKvCache short-circuit `|| entry.KvCache.MaxLength >= promptLen`
+        // accepted any entry big enough to fit just the prompt, with zero room for generation,
+        // so the second call would terminate after ~0 decode tokens when cache saturates.
+        var (model, gguf, tokenizer, config) = LoadModel();
+        using var _ = gguf;
+        using var __ = model;
+
+        using var pagedFactory = new PagedKvCacheFactory(
+            config.NumLayers, config.NumKvHeads, config.HeadDim);
+        using var prefixCache = new PrefixCache(maxEntries: 2);
+
+        var generator = new TextGenerator(model, tokenizer,
+            kvCacheFactory: (cfg, size) => pagedFactory.Create(size),
+            prefixCache: prefixCache);
+
+        const string prompt = "The capital of France is";
+        const int firstMaxTokens = 2;
+        const int secondMaxTokens = 32;
+
+        // First call: tiny max_tokens so the stored cache is tightly sized
+        // (MaxLength = promptLen + firstMaxTokens).
+        var response1 = generator.Generate(prompt, new InferenceOptions { Temperature = 0f, MaxTokens = firstMaxTokens });
+        Assert.Equal(firstMaxTokens, response1.GeneratedTokenCount);
+
+        // Second call with the same prompt but much larger max_tokens. The stored cache
+        // from call 1 has room for only firstMaxTokens extra positions past the prompt;
+        // without the fix, the decode loop breaks once pos >= cacheSize and generation
+        // silently truncates at ~firstMaxTokens tokens despite the larger budget.
+        var response2 = generator.Generate(prompt, new InferenceOptions { Temperature = 0f, MaxTokens = secondMaxTokens });
+
+        // Require at least 4× the first-call budget — well above the buggy cap of
+        // firstMaxTokens + 1 and still safely below secondMaxTokens even if the model
+        // hits EOS part-way through.
+        int minimumExpected = firstMaxTokens * 4;
+        Assert.True(response2.GeneratedTokenCount >= minimumExpected,
+            $"Expected response2 to generate at least {minimumExpected} tokens with " +
+            $"MaxTokens={secondMaxTokens} after a prior MaxTokens={firstMaxTokens} call " +
+            $"(got {response2.GeneratedTokenCount}). A too-small reused prefix-cache entry is truncating output.");
+    }
+
+    [Fact]
     public async Task PagedKvCache_StreamingMatchesSynchronous()
     {
         var (model, gguf, tokenizer, config) = LoadModel();

@@ -1,0 +1,964 @@
+using System.Runtime.InteropServices;
+
+namespace DotLLM.Vulkan.Interop;
+
+// Vulkan uses int32 "structure type" tags (sType) on every struct to permit
+// forward extension. Only the tags we actually use are listed here.
+internal static class VkStructureType
+{
+    internal const int ApplicationInfo = 0;
+    internal const int InstanceCreateInfo = 1;
+    internal const int DeviceQueueCreateInfo = 2;
+    internal const int DeviceCreateInfo = 3;
+    internal const int SubmitInfo = 4;
+    internal const int MemoryAllocateInfo = 5;
+    internal const int MappedMemoryRange = 6;
+    internal const int BindSparseInfo = 7;
+    internal const int FenceCreateInfo = 8;
+    internal const int SemaphoreCreateInfo = 9;
+    internal const int BufferCreateInfo = 12;
+    internal const int ShaderModuleCreateInfo = 16;
+    internal const int PipelineLayoutCreateInfo = 30;
+    internal const int ComputePipelineCreateInfo = 29;
+    internal const int PipelineShaderStageCreateInfo = 18;
+    internal const int DescriptorSetLayoutCreateInfo = 32;
+    internal const int DescriptorPoolCreateInfo = 33;
+    internal const int DescriptorSetAllocateInfo = 34;
+    internal const int WriteDescriptorSet = 35;
+    internal const int CommandPoolCreateInfo = 39;
+    internal const int CommandBufferAllocateInfo = 40;
+    internal const int CommandBufferBeginInfo = 42;
+    internal const int MemoryBarrier = 46;
+    // Vulkan 1.1 core structure types (used by vkGetPhysicalDeviceProperties2).
+    internal const int PhysicalDeviceProperties2 = 1000059001;
+    internal const int PhysicalDeviceFeatures2 = 1000059000;
+    internal const int PhysicalDeviceSubgroupProperties = 1000094000;
+    // VK_KHR_cooperative_matrix extension structures.
+    internal const int PhysicalDeviceCooperativeMatrixFeaturesKhr = 1000506000;
+    internal const int CooperativeMatrixPropertiesKhr = 1000506001;
+    internal const int PhysicalDeviceCooperativeMatrixPropertiesKhr = 1000506002;
+    // VK_KHR_external_memory / Vulkan 1.1 core — VkExternalMemoryBufferCreateInfo
+    // chains off VkBufferCreateInfo.pNext to declare the buffer will be bound
+    // to imported memory.
+    internal const int ExternalMemoryBufferCreateInfo = 1000072002;
+    // VK_EXT_external_memory_host extension structures.
+    // Drives the host-mmap zero-copy weight path (see MemoryDomain.HostVisibleZeroCopy
+    // / HostVisibleBuffer). The Properties struct carries
+    // `minImportedHostPointerAlignment`, the alignment a host pointer must satisfy
+    // to be importable by vkAllocateMemory; the ImportInfo struct chains off
+    // VkMemoryAllocateInfo.pNext to declare the imported pointer + handle type.
+    internal const int ImportMemoryHostPointerInfoExt = 1000178000;
+    internal const int MemoryHostPointerPropertiesExt = 1000178001;
+    internal const int PhysicalDeviceExternalMemoryHostPropertiesExt = 1000178002;
+    // VK_KHR_shader_integer_dot_product (promoted to Vulkan 1.3 core). The
+    // features struct chains off VkPhysicalDeviceFeatures2 for both the probe
+    // and the device-create enable. Drives the dp4a MMVQ decode path
+    // (dotPacked4x8AccSatEXT / GL_EXT_integer_dot_product).
+    internal const int PhysicalDeviceShaderIntegerDotProductFeatures = 1000280000;
+    // VK_EXT_subgroup_size_control (promoted to Vulkan 1.3 core). The Properties
+    // struct (chained off VkPhysicalDeviceProperties2) reports min/max subgroup
+    // size and which shader stages accept a required size; the Features struct
+    // (chained off VkPhysicalDeviceFeatures2 at device create) carries the
+    // subgroupSizeControl + computeFullSubgroups enables. The
+    // RequiredSubgroupSizeCreateInfo struct chains off
+    // VkPipelineShaderStageCreateInfo.pNext to pin a single compute pipeline to
+    // a specific wave width (e.g. 32 for the K-quant decode GEMV on RDNA3.5,
+    // whose driver defaults compute to wave64).
+    internal const int PhysicalDeviceSubgroupSizeControlProperties = 1000225000;
+    internal const int PhysicalDeviceSubgroupSizeControlFeatures = 1000225001;
+    internal const int PipelineShaderStageRequiredSubgroupSizeCreateInfo = 1000225002;
+    // VK_KHR_pipeline_executable_properties. The Features struct (chained off
+    // VkPhysicalDeviceFeatures2 at device create) carries `pipelineExecutableInfo`;
+    // VkPipelineInfoKHR names the pipeline to introspect; VkPipelineExecutablePropertiesKHR
+    // is the per-executable result and — uniquely among the introspection APIs we
+    // already have — reports the `subgroupSize` the driver ACTUALLY compiled the
+    // stage for. VK_AMD_shader_info's statistics do not expose the wave width, and
+    // it is invisible to timing A/Bs and to SPIR-V disassembly (issue #241).
+    internal const int PhysicalDevicePipelineExecutablePropertiesFeaturesKhr = 1000269000;
+    internal const int PipelineInfoKhr = 1000269001;
+    internal const int PipelineExecutablePropertiesKhr = 1000269002;
+    // VK_KHR_external_semaphore (core 1.1) — VkExportSemaphoreCreateInfo chains
+    // off VkSemaphoreCreateInfo.pNext to declare which handle type(s) the
+    // semaphore may be exported as. Drives the M3 Vulkan→CUDA async handoff.
+    internal const int ExportSemaphoreCreateInfo = 1000077000;
+    // VK_KHR_external_semaphore_win32 — VkSemaphoreGetWin32HandleInfoKHR is the
+    // argument to vkGetSemaphoreWin32HandleKHR; VkExportSemaphoreWin32HandleInfoKHR
+    // optionally chains security attrs/access onto the export create info.
+    internal const int SemaphoreGetWin32HandleInfoKhr = 1000078003;
+    internal const int ExportSemaphoreWin32HandleInfoKhr = 1000078001;
+    // VK_KHR_timeline_semaphore (core 1.2) — VkSemaphoreTypeCreateInfo chains off
+    // VkSemaphoreCreateInfo.pNext to request a TIMELINE semaphore. Required for the
+    // D3D12_FENCE export type CUDA imports cross-vendor (Intel Vulkan → NVIDIA CUDA);
+    // the OPAQUE_WIN32 binary form fails import on that pairing (CUresult 999).
+    internal const int SemaphoreTypeCreateInfo = 1000207002;
+    // VkTimelineSemaphoreSubmitInfo chains off VkSubmitInfo.pNext to carry the
+    // per-semaphore signal/wait counter values for a timeline submit.
+    internal const int TimelineSemaphoreSubmitInfo = 1000207003;
+    // Feature struct enabling the timelineSemaphore capability at device create.
+    internal const int PhysicalDeviceTimelineSemaphoreFeatures = 1000207000;
+}
+
+// VkSemaphoreType — binary (default) vs timeline (monotonic counter).
+internal static class VkSemaphoreType
+{
+    internal const int Binary = 0;
+    internal const int Timeline = 1;
+}
+
+// VkExternalSemaphoreHandleTypeFlagBits — handle types a semaphore may be
+// exported/imported as (VK_KHR_external_semaphore). OpaqueWin32 is the same-stack
+// NT handle; D3D12Fence is the cross-vendor-portable Win32 fence handle that
+// both Intel Vulkan and NVIDIA CUDA understand.
+[Flags]
+internal enum VkExternalSemaphoreHandleTypeFlags : uint
+{
+    OpaqueFd = 0x00000001,
+    OpaqueWin32 = 0x00000002,
+    OpaqueWin32Kmt = 0x00000004,
+    D3D12Fence = 0x00000008,
+    SyncFd = 0x00000010,
+}
+
+// VkComponentTypeKHR — component type of an element in a cooperative matrix.
+// Values from the VK_KHR_cooperative_matrix specification.
+internal static class VkComponentTypeKhr
+{
+    internal const int Float16 = 0;
+    internal const int Float32 = 1;
+    internal const int Float64 = 2;
+    internal const int Sint8   = 3;
+    internal const int Sint16  = 4;
+    internal const int Sint32  = 5;
+    internal const int Sint64  = 6;
+    internal const int Uint8   = 7;
+    internal const int Uint16  = 8;
+    internal const int Uint32  = 9;
+    internal const int Uint64  = 10;
+}
+
+// VkScopeKHR — scope at which a cooperative matrix is allocated. For
+// VK_KHR_cooperative_matrix (KHR, not NV) only Subgroup scope is standardised.
+internal static class VkScopeKhr
+{
+    internal const int Device     = 1;
+    internal const int Workgroup  = 2;
+    internal const int Subgroup   = 3;
+    internal const int QueueFamily = 5;
+}
+
+// VkSubgroupFeatureFlagBits — capabilities advertised by the driver for a given
+// subgroup size. ARITHMETIC is the one we care about (subgroupAdd, subgroupMax,
+// subgroupMin, etc.). Others listed for reference; matching the spec bit values.
+[Flags]
+internal enum VkSubgroupFeatureFlags : uint
+{
+    Basic        = 0x00000001,
+    Vote         = 0x00000002,
+    Arithmetic   = 0x00000004,
+    Ballot       = 0x00000008,
+    Shuffle      = 0x00000010,
+    ShuffleRelative = 0x00000020,
+    Clustered    = 0x00000040,
+    Quad         = 0x00000080,
+}
+
+// VkPhysicalDeviceType (chosen enum values)
+internal static class VkPhysicalDeviceType
+{
+    internal const int Other = 0;
+    internal const int IntegratedGpu = 1;
+    internal const int DiscreteGpu = 2;
+    internal const int VirtualGpu = 3;
+    internal const int Cpu = 4;
+}
+
+// VkBufferUsageFlagBits (bitflags)
+[Flags]
+internal enum VkBufferUsageFlags : uint
+{
+    TransferSrc = 0x00000001,
+    TransferDst = 0x00000002,
+    StorageBuffer = 0x00000020,
+}
+
+// VkMemoryPropertyFlagBits (bitflags)
+[Flags]
+internal enum VkMemoryPropertyFlags : uint
+{
+    DeviceLocal = 0x00000001,
+    HostVisible = 0x00000002,
+    HostCoherent = 0x00000004,
+    HostCached = 0x00000008,
+}
+
+[Flags]
+internal enum VkMemoryHeapFlags : uint
+{
+    DeviceLocal = 0x00000001,
+}
+
+[Flags]
+internal enum VkQueueFlags : uint
+{
+    Graphics = 0x00000001,
+    Compute = 0x00000002,
+    Transfer = 0x00000004,
+    SparseBinding = 0x00000008,
+}
+
+internal static class VkDescriptorType
+{
+    internal const int StorageBuffer = 7;
+}
+
+internal static class VkShaderStageFlags
+{
+    internal const uint Compute = 0x00000020;
+}
+
+// VkPipelineShaderStageCreateFlagBits — flags on VkPipelineShaderStageCreateInfo.
+// REQUIRE_FULL_SUBGROUPS_BIT (VK_EXT_subgroup_size_control / Vulkan 1.3 core)
+// asserts the local workgroup size is a multiple of the (required) subgroup
+// size so every subgroup is fully populated — paired with
+// VkPipelineShaderStageRequiredSubgroupSizeCreateInfo when pinning a wave width.
+internal static class VkPipelineShaderStageCreateFlags
+{
+    internal const uint RequireFullSubgroups = 0x00000002;
+}
+
+internal static class VkCommandPoolCreateFlags
+{
+    internal const uint ResetCommandBuffer = 0x00000002;
+}
+
+internal static class VkCommandBufferLevel
+{
+    internal const int Primary = 0;
+}
+
+internal static class VkCommandBufferUsageFlags
+{
+    internal const uint OneTimeSubmit = 0x00000001;
+}
+
+internal static class VkSharingMode
+{
+    internal const int Exclusive = 0;
+}
+
+internal static class VkPipelineBindPoint
+{
+    internal const int Compute = 1;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkApplicationInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal nint pApplicationName;
+    internal uint applicationVersion;
+    internal nint pEngineName;
+    internal uint engineVersion;
+    internal uint apiVersion;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkInstanceCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal nint pApplicationInfo;
+    internal uint enabledLayerCount;
+    internal nint ppEnabledLayerNames;
+    internal uint enabledExtensionCount;
+    internal nint ppEnabledExtensionNames;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkDeviceQueueCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal uint queueFamilyIndex;
+    internal uint queueCount;
+    internal nint pQueuePriorities;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkDeviceCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal uint queueCreateInfoCount;
+    internal nint pQueueCreateInfos;
+    internal uint enabledLayerCount;
+    internal nint ppEnabledLayerNames;
+    internal uint enabledExtensionCount;
+    internal nint ppEnabledExtensionNames;
+    internal nint pEnabledFeatures;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkQueueFamilyProperties
+{
+    internal VkQueueFlags queueFlags;
+    internal uint queueCount;
+    internal uint timestampValidBits;
+    // VkExtent3D minImageTransferGranularity
+    internal uint minTransferWidth;
+    internal uint minTransferHeight;
+    internal uint minTransferDepth;
+}
+
+// VkPhysicalDeviceProperties is a large struct with VkPhysicalDeviceLimits
+// and VkPhysicalDeviceSparseProperties tails. We only need the header fields
+// (apiVersion..deviceName). The tail is reserved as an oversized byte buffer
+// to ensure the native callee has enough space to write without blowing the
+// stack — we never read those bytes.
+//
+// Upper-bound size: Vulkan 1.3 reports the total is 824 bytes; rounding up
+// to 2048 gives plenty of headroom across any future extension and avoids
+// maintenance when minor versions add fields at the tail.
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkPhysicalDeviceProperties
+{
+    internal uint apiVersion;
+    internal uint driverVersion;
+    internal uint vendorID;
+    internal uint deviceID;
+    internal int deviceType;
+    internal fixed byte deviceName[256]; // VK_MAX_PHYSICAL_DEVICE_NAME_SIZE
+    internal fixed byte pipelineCacheUUID[16];
+    // Limits + SparseProperties tail — intentionally oversized.
+    internal fixed byte tail[2048];
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkPhysicalDeviceMemoryProperties
+{
+    internal uint memoryTypeCount;
+    // 32 * VkMemoryType (each 8 bytes: propertyFlags + heapIndex)
+    internal fixed byte memoryTypes[32 * 8];
+    internal uint memoryHeapCount;
+    // 16 * VkMemoryHeap (each 16 bytes: size(u64) + flags(u32) + padding)
+    internal fixed byte memoryHeaps[16 * 16];
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkMemoryRequirements
+{
+    internal ulong size;
+    internal ulong alignment;
+    internal uint memoryTypeBits;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkMemoryAllocateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal ulong allocationSize;
+    internal uint memoryTypeIndex;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkBufferCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal ulong size;
+    internal VkBufferUsageFlags usage;
+    internal int sharingMode;
+    internal uint queueFamilyIndexCount;
+    internal nint pQueueFamilyIndices;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkShaderModuleCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal nuint codeSize;
+    internal nint pCode; // uint32_t array
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkDescriptorSetLayoutBinding
+{
+    internal uint binding;
+    internal int descriptorType;
+    internal uint descriptorCount;
+    internal uint stageFlags;
+    internal nint pImmutableSamplers;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkDescriptorSetLayoutCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal uint bindingCount;
+    internal nint pBindings;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPushConstantRange
+{
+    internal uint stageFlags;
+    internal uint offset;
+    internal uint size;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPipelineLayoutCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal uint setLayoutCount;
+    internal nint pSetLayouts;
+    internal uint pushConstantRangeCount;
+    internal nint pPushConstantRanges;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPipelineShaderStageCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal uint stage;
+    internal nint module;
+    internal nint pName; // entry-point name, null-terminated UTF-8
+    internal nint pSpecializationInfo;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkComputePipelineCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal VkPipelineShaderStageCreateInfo stage;
+    internal nint layout;
+    internal nint basePipelineHandle;
+    internal int basePipelineIndex;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkDescriptorPoolSize
+{
+    internal int type;
+    internal uint descriptorCount;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkDescriptorPoolCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal uint maxSets;
+    internal uint poolSizeCount;
+    internal nint pPoolSizes;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkDescriptorSetAllocateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal nint descriptorPool;
+    internal uint descriptorSetCount;
+    internal nint pSetLayouts;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkDescriptorBufferInfo
+{
+    internal nint buffer;
+    internal ulong offset;
+    internal ulong range;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkWriteDescriptorSet
+{
+    internal int sType;
+    internal nint pNext;
+    internal nint dstSet;
+    internal uint dstBinding;
+    internal uint dstArrayElement;
+    internal uint descriptorCount;
+    internal int descriptorType;
+    internal nint pImageInfo;
+    internal nint pBufferInfo;
+    internal nint pTexelBufferView;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkCommandPoolCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal uint queueFamilyIndex;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkCommandBufferAllocateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal nint commandPool;
+    internal int level;
+    internal uint commandBufferCount;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkCommandBufferBeginInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal nint pInheritanceInfo;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkSubmitInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint waitSemaphoreCount;
+    internal nint pWaitSemaphores;
+    internal nint pWaitDstStageMask;
+    internal uint commandBufferCount;
+    internal nint pCommandBuffers;
+    internal uint signalSemaphoreCount;
+    internal nint pSignalSemaphores;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkBufferCopy
+{
+    internal ulong srcOffset;
+    internal ulong dstOffset;
+    internal ulong size;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkMemoryBarrier
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint srcAccessMask;
+    internal uint dstAccessMask;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkFenceCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+}
+
+// VkSemaphoreCreateInfo — a binary semaphore by default. Chain a
+// VkExportSemaphoreCreateInfo on pNext to make it exportable (M3 handoff).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkSemaphoreCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+}
+
+// VkExportSemaphoreCreateInfo (VK_KHR_external_semaphore, core 1.1). Chained
+// onto VkSemaphoreCreateInfo.pNext; handleTypes declares which external handle
+// types the created semaphore may later be exported as.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkExportSemaphoreCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint handleTypes; // VkExternalSemaphoreHandleTypeFlags
+}
+
+// VkSemaphoreGetWin32HandleInfoKHR (VK_KHR_external_semaphore_win32). Argument
+// to vkGetSemaphoreWin32HandleKHR — requests the Win32 HANDLE for an
+// already-created exportable semaphore.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkSemaphoreGetWin32HandleInfoKhr
+{
+    internal int sType;
+    internal nint pNext;
+    internal nint semaphore;   // VkSemaphore
+    internal uint handleType;  // single VkExternalSemaphoreHandleTypeFlags bit
+}
+
+// VkSemaphoreTypeCreateInfo (VK_KHR_timeline_semaphore, core 1.2). Chains onto
+// VkSemaphoreCreateInfo.pNext (before VkExportSemaphoreCreateInfo) to request a
+// timeline semaphore with an initial counter value.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkSemaphoreTypeCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal int semaphoreType; // VkSemaphoreType
+    internal ulong initialValue;
+}
+
+// VkTimelineSemaphoreSubmitInfo (core 1.2). Chains onto VkSubmitInfo.pNext to
+// carry the per-semaphore counter values for timeline wait/signal. The array
+// lengths must match VkSubmitInfo's wait/signal semaphore counts.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkTimelineSemaphoreSubmitInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint waitSemaphoreValueCount;
+    internal nint pWaitSemaphoreValues;   // const uint64_t*
+    internal uint signalSemaphoreValueCount;
+    internal nint pSignalSemaphoreValues; // const uint64_t*
+}
+
+// VkPhysicalDeviceTimelineSemaphoreFeatures — chains off
+// VkPhysicalDeviceFeatures2.pNext to enable timelineSemaphore at device create.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceTimelineSemaphoreFeatures
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint timelineSemaphore; // VkBool32
+}
+
+// VkQueryPoolCreateInfo — timestamp query pool for the env-gated decode
+// profiler (issue #143). sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO (11),
+// queryType = VK_QUERY_TYPE_TIMESTAMP (2).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkQueryPoolCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal int queryType;
+    internal uint queryCount;
+    internal uint pipelineStatistics;
+}
+
+// VkPipelineStageFlagBits — stage masks for vkCmdPipelineBarrier. Only the few
+// we need in the compute-only hot loop are listed.
+internal static class VkPipelineStageFlags
+{
+    internal const uint TopOfPipe = 0x00000001;
+    internal const uint Transfer = 0x00001000;
+    internal const uint ComputeShader = 0x00000800;
+    internal const uint BottomOfPipe = 0x00002000;
+    internal const uint Host = 0x00004000;
+}
+
+// VkAccessFlagBits — memory access masks for vkCmdPipelineBarrier.
+internal static class VkAccessFlags
+{
+    internal const uint ShaderRead = 0x00000020;
+    internal const uint ShaderWrite = 0x00000040;
+    internal const uint TransferRead = 0x00000800;
+    internal const uint TransferWrite = 0x00001000;
+    internal const uint HostRead = 0x00002000;
+    internal const uint HostWrite = 0x00004000;
+    internal const uint MemoryRead = 0x00008000;
+    internal const uint MemoryWrite = 0x00010000;
+}
+
+// VkPhysicalDeviceSubgroupProperties — returned by vkGetPhysicalDeviceProperties2
+// on Vulkan 1.1+ when chained via pNext. `subgroupSize` is the hardware-fixed
+// wave/warp width (32 on NVIDIA/Intel, 64 on AMD GCN/RDNA pre-3, 32-or-64 on
+// RDNA3+). `supportedStages` tells us which shader stages may use subgroup ops,
+// and `supportedOperations` is the VkSubgroupFeatureFlags bitmask.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceSubgroupProperties
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint subgroupSize;
+    internal uint supportedStages;       // VkShaderStageFlags bitmask
+    internal uint supportedOperations;   // VkSubgroupFeatureFlags bitmask
+    internal uint quadOperationsInAllStages; // VkBool32
+}
+
+// VkPhysicalDeviceProperties2 — Vulkan 1.1 core. We only read the `sType`
+// (driver ignores) and `pNext` (chain). `properties` is a VkPhysicalDeviceProperties
+// which is large; we reserve the full upper-bound byte tail exactly as in the
+// 1.0 struct to guarantee the driver has room to write without stack issues.
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkPhysicalDeviceProperties2
+{
+    internal int sType;
+    internal nint pNext;
+    // Inline VkPhysicalDeviceProperties body — same layout as the 1.0 struct.
+    internal uint apiVersion;
+    internal uint driverVersion;
+    internal uint vendorID;
+    internal uint deviceID;
+    internal int deviceType;
+    internal fixed byte deviceName[256];
+    internal fixed byte pipelineCacheUUID[16];
+    internal fixed byte tail[2048];
+}
+
+// VkPhysicalDeviceFeatures2 — Vulkan 1.1 core feature-query header. `features`
+// is a VkPhysicalDeviceFeatures (55 VkBool32 fields = 220 bytes). We reserve a
+// generously-oversized byte tail rather than spelling out every feature bit;
+// no kernel actually reads from this struct after the driver writes it — we
+// only set the sType/pNext chain for feature-extension queries (e.g. the
+// cooperative-matrix feature struct chained off pNext).
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkPhysicalDeviceFeatures2
+{
+    internal int sType;
+    internal nint pNext;
+    // 55 VkBool32 fields. Oversize to 512 bytes for forward-compat safety;
+    // any driver that writes fewer bytes is still covered.
+    internal fixed byte features[512];
+}
+
+// VkPhysicalDeviceCooperativeMatrixFeaturesKHR — feature bits from the
+// VK_KHR_cooperative_matrix extension. Chained off VkPhysicalDeviceFeatures2
+// via pNext for feature-enable at device creation.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceCooperativeMatrixFeaturesKhr
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint cooperativeMatrix;                // VkBool32
+    internal uint cooperativeMatrixRobustBufferAccess; // VkBool32
+}
+
+// VkPhysicalDeviceShaderIntegerDotProductFeatures — feature bit from
+// VK_KHR_shader_integer_dot_product (Vulkan 1.3 core). Chained off
+// VkPhysicalDeviceFeatures2 via pNext for both the support probe and the
+// feature-enable at device creation. `shaderIntegerDotProduct` gates the
+// SPIR-V DotProductInput4x8BitPackedKHR capability used by the dp4a MMVQ
+// shaders (dotPacked4x8AccSatEXT).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceShaderIntegerDotProductFeatures
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint shaderIntegerDotProduct; // VkBool32
+}
+
+// VkPhysicalDeviceSubgroupSizeControlProperties — VK_EXT_subgroup_size_control
+// (Vulkan 1.3 core). Chained off VkPhysicalDeviceProperties2.pNext.
+// `minSubgroupSize`/`maxSubgroupSize` bracket the legal required-size range
+// (gfx1151 reports 32/64). `requiredSubgroupSizeStages` is the VkShaderStageFlags
+// bitmask of stages that accept a VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
+// — we require the COMPUTE bit before pinning a compute pipeline's wave width.
+// `maxComputeWorkgroupSubgroups` is read for completeness.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceSubgroupSizeControlProperties
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint minSubgroupSize;
+    internal uint maxSubgroupSize;
+    internal uint maxComputeWorkgroupSubgroups;
+    internal uint requiredSubgroupSizeStages; // VkShaderStageFlags bitmask
+}
+
+// VkPhysicalDeviceSubgroupSizeControlFeatures — VK_EXT_subgroup_size_control
+// (Vulkan 1.3 core). Chained off VkPhysicalDeviceFeatures2.pNext at device
+// creation. `subgroupSizeControl` enables pinning a pipeline's subgroup size;
+// `computeFullSubgroups` enables the REQUIRE_FULL_SUBGROUPS stage flag.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceSubgroupSizeControlFeatures
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint subgroupSizeControl;  // VkBool32
+    internal uint computeFullSubgroups; // VkBool32
+}
+
+// VkPipelineShaderStageRequiredSubgroupSizeCreateInfo — VK_EXT_subgroup_size_control
+// (Vulkan 1.3 core). Chained off VkPipelineShaderStageCreateInfo.pNext to pin
+// the stage to a specific wave width. `requiredSubgroupSize` must be a power of
+// two within [minSubgroupSize, maxSubgroupSize] and the stage must be in
+// `requiredSubgroupSizeStages`. Used to force the K-quant decode GEMV onto
+// wave32 on RDNA3.5 (whose driver otherwise defaults compute to wave64).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint requiredSubgroupSize;
+}
+
+// VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR — chained off
+// VkPhysicalDeviceFeatures2.pNext at device create. `pipelineExecutableInfo` must
+// be VK_TRUE before vkGetPipelineExecutablePropertiesKHR may be called.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDevicePipelineExecutablePropertiesFeaturesKhr
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint pipelineExecutableInfo; // VkBool32
+}
+
+// VkPipelineInfoKHR — argument to vkGetPipelineExecutablePropertiesKHR naming the
+// pipeline whose compiled executables are to be enumerated.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPipelineInfoKhr
+{
+    internal int sType;
+    internal nint pNext;
+    internal nint pipeline; // VkPipeline
+}
+
+// VkPipelineExecutablePropertiesKHR — one entry per compiled executable in a
+// pipeline. `subgroupSize` is the wave width the driver actually compiled the
+// stage for — the only API in this codebase that reports it (issue #241).
+// `name`/`description` are fixed VK_MAX_DESCRIPTION_SIZE (256) char arrays.
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkPipelineExecutablePropertiesKhr
+{
+    internal const int MaxDescriptionSize = 256;
+
+    internal int sType;
+    internal nint pNext;
+    internal uint stages; // VkShaderStageFlags
+    internal fixed byte name[MaxDescriptionSize];
+    internal fixed byte description[MaxDescriptionSize];
+    internal uint subgroupSize;
+}
+
+// VkCooperativeMatrixPropertiesKHR — one entry per driver-supported tile shape
+// returned by vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR. Values are
+// used to pick the (MSize, NSize, KSize) baked into the compiled coopmat shader.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkCooperativeMatrixPropertiesKhr
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint MSize;
+    internal uint NSize;
+    internal uint KSize;
+    internal int AType;                    // VkComponentTypeKHR
+    internal int BType;                    // VkComponentTypeKHR
+    internal int CType;                    // VkComponentTypeKHR
+    internal int ResultType;               // VkComponentTypeKHR
+    internal uint saturatingAccumulation;  // VkBool32
+    internal int scope;                    // VkScopeKHR
+}
+
+// VkExternalMemoryHandleTypeFlagBits — for the host-pointer import path we
+// only ever use HOST_ALLOCATION_BIT_EXT. HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT is
+// also defined by the extension for importing memory the application did not
+// allocate itself; not used here because MemoryMappedFile pages are owned by
+// our process via the OS mmap.
+internal static class VkExternalMemoryHandleTypeFlags
+{
+    internal const uint HostAllocationBitExt = 0x00000080;
+    internal const uint HostMappedForeignMemoryBitExt = 0x00000100;
+}
+
+// VkPhysicalDeviceExternalMemoryHostPropertiesEXT — chained off
+// VkPhysicalDeviceProperties2.pNext to fetch the minimum alignment a host
+// pointer must satisfy before VK_EXT_external_memory_host will import it.
+// On x86-64 amdvlk / radv this is typically 4096 (page size). We use it to
+// decide whether a given mmap'd GGUF tensor offset can be imported directly
+// or whether we must fall back to the staging-copy path.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceExternalMemoryHostPropertiesExt
+{
+    internal int sType;
+    internal nint pNext;
+    internal ulong minImportedHostPointerAlignment;
+}
+
+// VkImportMemoryHostPointerInfoEXT — chained off VkMemoryAllocateInfo.pNext to
+// declare that the allocation should be backed by an existing host pointer
+// rather than by driver-managed device memory. The pointer must be aligned to
+// at least `minImportedHostPointerAlignment` (see the Properties struct above);
+// otherwise vkAllocateMemory returns VK_ERROR_INVALID_EXTERNAL_HANDLE.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkImportMemoryHostPointerInfoExt
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint handleType;   // VkExternalMemoryHandleTypeFlagBits
+    internal nint pHostPointer;
+}
+
+// VkMemoryHostPointerPropertiesEXT — returned by
+// vkGetMemoryHostPointerPropertiesEXT. `memoryTypeBits` is a bitmask of the
+// physical-device memory type indices that can host an import of this
+// specific pointer/handleType combination. We AND it with the buffer's
+// vkGetBufferMemoryRequirements bits to pick a compatible memory type.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkMemoryHostPointerPropertiesExt
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint memoryTypeBits;
+}
+
+// VkExternalMemoryBufferCreateInfo — chained off VkBufferCreateInfo.pNext to
+// declare that the buffer will be bound to imported external memory rather
+// than driver-managed memory. `handleTypes` must include the same bit used
+// in VkImportMemoryHostPointerInfoEXT.handleType.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkExternalMemoryBufferCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint handleTypes;
+}
+
+// VK_AMD_shader_info — vkGetShaderInfoAMD's VkShaderInfoTypeAMD parameter.
+// Only Statistics is used (post-compile VGPR/SGPR/LDS usage); Binary and
+// Disassembly return driver-internal blobs we have no use for here.
+internal static class VkShaderInfoTypeAmd
+{
+    internal const int Statistics = 0;
+    internal const int Binary = 1;
+    internal const int Disassembly = 2;
+}
+
+// VkShaderResourceUsageAMD — nested inside VkShaderStatisticsInfoAMD. `size_t`
+// fields map to `nuint` (this project only targets 64-bit Windows/Linux, where
+// nuint is 8 bytes, matching the native ABI).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkShaderResourceUsageAmd
+{
+    internal uint numUsedVgprs;
+    internal uint numUsedSgprs;
+    internal uint ldsSizePerLocalWorkGroup;
+    internal nuint ldsUsageSizeInBytes;
+    internal nuint scratchMemUsageInBytes;
+}
+
+// VkShaderStatisticsInfoAMD — returned by vkGetShaderInfoAMD with infoType =
+// VK_SHADER_INFO_TYPE_STATISTICS_AMD. Reports the driver's actual post-compile
+// register/LDS allocation for a given pipeline stage — ground truth for the
+// "is the MMQ kernel register-spilling / LDS-limited on occupancy" question
+// that black-box timing (#384-#390) could not answer.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkShaderStatisticsInfoAmd
+{
+    internal uint shaderStageMask; // VkShaderStageFlags bitmask
+    internal VkShaderResourceUsageAmd resourceUsage;
+    internal uint numPhysicalVgprs;
+    internal uint numPhysicalSgprs;
+    internal uint numAvailableVgprs;
+    internal uint numAvailableSgprs;
+    internal uint computeWorkGroupSizeX;
+    internal uint computeWorkGroupSizeY;
+    internal uint computeWorkGroupSizeZ;
+}

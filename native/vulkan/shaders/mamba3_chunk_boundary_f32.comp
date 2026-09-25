@@ -1,0 +1,75 @@
+#version 450
+// Mamba-3 streaming-chunk boundary state adjustment.
+//
+// Mirrors Mamba3Block.ApplyChunkBoundaryAdjustment (SISO) and the rank-summed
+// boundary in Mamba3CanonicalSsd.ExecuteMimoStreaming (MIMO). Applied at the
+// START of a chunk that carries a non-empty (k_state, v_state) pair from the
+// previous chunk — restores the canonical shifted_γ[T_prev-1] term that a
+// one-shot forward would have folded in at the previous chunk's last token.
+//
+//   ssm_state[h, p, n] += v_state[h, p] · (Σ_r k_state[r, h, n]) · coef[h]
+//
+// where coef[h] = dt[0, h] · (1 - trap[0, h]).
+//
+// Layout (row-major F32):
+//   ssm_state : [nHead, headDim, dState]   — read + write
+//   v_state   : [nHead, headDim]           — read
+//   k_state   : [nRank, nHead, dState]     — read   (nRank = 1 collapses to [H, N])
+//   coef      : [nHead]                    — read
+//
+// SISO: nRank = 1 → the rank loop runs once per (h, p, n).
+// MIMO: nRank ≥ 2 → each thread sums kSum across ranks once and reuses it.
+//
+// Dispatch: 2D grid (n, p) per workgroup; one workgroup per head.
+//   local_size_x = WG_X (along n)
+//   local_size_y = WG_Y (along p)
+//   groupCount.x = ceil(dState / WG_X)
+//   groupCount.y = ceil(headDim / WG_Y)
+//   groupCount.z = nHead
+//
+// Each thread owns one (h, p, n) cell of ssm_state. It reads k_state across
+// all ranks for its (h, n) lane, summing the rank slice, then issues one FMA.
+//
+// Pre-condition: caller must skip dispatch (or pass coef = 0) when no boundary
+// adjustment is needed (first chunk of a sequence).
+
+#define WG_X 16
+#define WG_Y 16
+
+layout(local_size_x = WG_X, local_size_y = WG_Y, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)          buffer BufState  { float state[]; };  // [H, P, N]
+layout(set = 0, binding = 1, std430) readonly buffer BufV      { float vState[]; }; // [H, P]
+layout(set = 0, binding = 2, std430) readonly buffer BufK      { float kState[]; }; // [R, H, N]
+layout(set = 0, binding = 3, std430) readonly buffer BufCoef   { float coef[]; };   // [H]
+
+layout(push_constant) uniform PushConstants {
+    uint nHead;
+    uint headDim;
+    uint dState;
+    uint nRank;
+} pc;
+
+void main() {
+    uint h = gl_WorkGroupID.z;
+    uint p = gl_GlobalInvocationID.y;
+    uint n = gl_GlobalInvocationID.x;
+
+    if (h >= pc.nHead || p >= pc.headDim || n >= pc.dState) return;
+
+    float c = coef[h];
+    if (c == 0.0) return;                      // trap≈1 at t=0 → pure self-term, no carry.
+
+    // kSum = Σ_r k_state[r, h, n]
+    uint kRankStride = pc.nHead * pc.dState;
+    uint kHeadOff    = h * pc.dState + n;
+    float kSum = 0.0;
+    for (uint r = 0u; r < pc.nRank; r++) {
+        kSum += kState[r * kRankStride + kHeadOff];
+    }
+
+    float v = vState[h * pc.headDim + p];
+
+    uint stateIdx = h * pc.headDim * pc.dState + p * pc.dState + n;
+    state[stateIdx] += v * kSum * c;
+}

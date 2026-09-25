@@ -1,0 +1,477 @@
+using DotLLM.Core.Attention;
+using DotLLM.Cpu.Kernels;
+using DotLLM.Core.PositionEncoding;
+using DotLLM.Vulkan;
+using DotLLM.Vulkan.Kernels;
+using Xunit;
+
+namespace DotLLM.Tests.Unit.Vulkan;
+
+/// <summary>
+/// Numerical-parity tests for the Vulkan Flash-Attention F32 kernel.
+/// Validates against the scalar CPU reference <see cref="Attention.ExecuteScalar"/>
+/// across MHA / GQA / sliding-window / soft-cap / ALiBi configurations and
+/// prompt lengths up to 2048 tokens.
+/// </summary>
+[Trait("Category", "GPU")]
+[Collection("VulkanKernels")]
+public class VulkanFlashAttentionF32KernelTests
+{
+    private const float AbsTol = 1e-4f;
+    private const float RelTol = 1e-3f;
+
+    [SkippableFact]
+    public void Launch_Mha_ShortPrefill()
+    {
+        // 4 queries × 4 keys, single head — exercises the partial-Q-tile
+        // branch (rowsInTile == 4 < BR).
+        RunOne(seqQ: 4, seqKv: 4, numHeads: 1, numKvHeads: 1, headDim: 64, positionOffset: 0);
+    }
+
+    [SkippableFact]
+    public void Launch_Gqa8_SmallHead_Debug()
+    {
+        // EXACT shape of the diverging gemma4 global/grp8 case: 16 Q heads / 2 KV
+        // heads (groupSize 8), tiny head_dim 16, short prefill (seq 6).
+        RunOne(seqQ: 6, seqKv: 6, numHeads: 16, numKvHeads: 2, headDim: 16, positionOffset: 0);
+    }
+
+    [SkippableFact]
+    public void Launch_Mha_HeadDim128()
+    {
+        // Llama-style head dim 128 — exercises the wider qTile / outAccum
+        // shared-memory footprint.
+        RunOne(seqQ: 16, seqKv: 16, numHeads: 8, numKvHeads: 8, headDim: 128, positionOffset: 0);
+    }
+
+    [SkippableFact]
+    public void Launch_Gqa4_Prefill_128()
+    {
+        // GQA-4 (numHeads / numKvHeads == 4), prompt length 128 — exercises
+        // the GQA broadcast (hkv = hq / 4) for multiple Q-tiles.
+        RunOne(seqQ: 128, seqKv: 128, numHeads: 8, numKvHeads: 2, headDim: 64, positionOffset: 0);
+    }
+
+    [SkippableFact]
+    public void Launch_Gqa8_Prefill_512()
+    {
+        // GQA-8, Llama-3.2-1B-ish shape (32 heads / 8 kv heads on a head_dim
+        // of 64 to keep MAX_HEAD_DIM=128 happy; production Llama-3 has
+        // head_dim 64 too). 512 queries × 512 keys — exercises the multi-KV-tile
+        // outer loop.
+        RunOne(seqQ: 512, seqKv: 512, numHeads: 32, numKvHeads: 4, headDim: 64, positionOffset: 0);
+    }
+
+    [SkippableFact]
+    public void Launch_Gqa8_Prefill_2048()
+    {
+        // Long-context prefill — 2048 queries × 2048 keys. Exercises 32
+        // KV tiles per Q-tile and 128 Q-tiles per head.
+        RunOne(seqQ: 2048, seqKv: 2048, numHeads: 8, numKvHeads: 2, headDim: 64, positionOffset: 0);
+    }
+
+    [SkippableFact]
+    public void Launch_SlidingWindow_4()
+    {
+        // Mistral-style sliding window: each query attends only to the most
+        // recent 4 keys.
+        RunOne(seqQ: 16, seqKv: 32, numHeads: 4, numKvHeads: 2, headDim: 64,
+            positionOffset: 0, slidingWindow: 4);
+    }
+
+    [SkippableFact]
+    public void Launch_SoftCap_50()
+    {
+        // Gemma-2 style attention soft-cap. Choose a scenario where raw
+        // scores comfortably exceed the cap so the tanh squashing exercises.
+        RunOne(seqQ: 32, seqKv: 32, numHeads: 4, numKvHeads: 2, headDim: 64,
+            positionOffset: 0, softCap: 50.0f);
+    }
+
+    [SkippableFact]
+    public void Launch_Alibi_Mha()
+    {
+        RunOne(seqQ: 16, seqKv: 16, numHeads: 6, numKvHeads: 2, headDim: 64,
+            positionOffset: 0, useAlibi: true);
+    }
+
+    [SkippableFact]
+    public void Launch_PartialKvTile()
+    {
+        // seqKv = 33 → final KV tile is partial (33 mod 64 = 33). Validates
+        // the tileLen clamp inside the KV loop.
+        RunOne(seqQ: 16, seqKv: 33, numHeads: 4, numKvHeads: 2, headDim: 64, positionOffset: 0);
+    }
+
+    [SkippableFact]
+    public void Launch_PartialQTile()
+    {
+        // seqQ = 33 → final Q-tile rows = 33 - 16*2 = 1. Validates the
+        // partial-row branch (rowsInTile == 1).
+        RunOne(seqQ: 33, seqKv: 64, numHeads: 4, numKvHeads: 2, headDim: 64, positionOffset: 0);
+    }
+
+    // ── Non-causal mask modes (issue #41 item 2) ─────────────────
+    //
+    // DISCRIMINATING tests: early query rows must attend to future keys, which
+    // the causal mask (tkv > posQ) would zero. The CPU reference runs the same
+    // mode, so parity holds only if the FA shader honours maskMode/prefixLen.
+
+    [SkippableFact]
+    public void Launch_Bidirectional_Prefill()
+    {
+        // 16 queries × 16 keys, positionOffset=0. Query 0 attends to all 16 keys
+        // under Bidirectional (causal would give it only key 0).
+        RunOne(seqQ: 16, seqKv: 16, numHeads: 4, numKvHeads: 2, headDim: 64, positionOffset: 0,
+            maskMode: AttentionMaskMode.Bidirectional);
+    }
+
+    [SkippableFact]
+    public void Launch_Bidirectional_MultiQTile_MultiKvTile()
+    {
+        // 128 queries × 128 keys: multiple Q-tiles (BR=16) and KV tiles (BC=64),
+        // fully bidirectional. Stresses the online-softmax rescale with no causal
+        // upper bound across tile boundaries.
+        RunOne(seqQ: 128, seqKv: 128, numHeads: 8, numKvHeads: 2, headDim: 64, positionOffset: 0,
+            maskMode: AttentionMaskMode.Bidirectional);
+    }
+
+    [SkippableFact]
+    public void Launch_Hybrid_PrefixCausal_CanvasBidirectional()
+    {
+        // prefixLen=8: query rows 0..7 stay causal, rows 8..31 are bidirectional
+        // (attend to the full 32-key range). Spans two BR=16 Q-tiles so the
+        // prefix/canvas split crosses a tile boundary.
+        RunOne(seqQ: 32, seqKv: 32, numHeads: 4, numKvHeads: 2, headDim: 64, positionOffset: 0,
+            maskMode: AttentionMaskMode.Hybrid, prefixLen: 8);
+    }
+
+    [SkippableFact]
+    public void Launch_Hybrid_PrefixLenZero_EqualsBidirectional()
+    {
+        // prefixLen=0 → every row is a canvas (bidirectional) query.
+        RunOne(seqQ: 16, seqKv: 16, numHeads: 4, numKvHeads: 2, headDim: 64, positionOffset: 0,
+            maskMode: AttentionMaskMode.Hybrid, prefixLen: 0);
+    }
+
+    // ── issue #441: headDim > 128 (Bonsai 2 declares key_length = value_length = 256) ──
+    //
+    // Before #441 these shapes had no flash path at all: the base shader's MAX_HEAD_DIM is 128,
+    // so every headDim-256 model silently ran the per-token kernel for its whole prefill. Both
+    // wide variants are asserted against the SAME CPU reference as the 128-dim cases, at the
+    // same tolerance - a wider qTile must not buy accuracy drift.
+
+    [SkippableFact]
+    public void Launch_Hd256_Br16_Bonsai2Shape()
+    {
+        // Bonsai 2's real full-attention shape: 24 Q heads / 4 KV heads (GQA-6), head_dim 256.
+        // seq 128 keeps the test quick while still spanning 8 Q-tiles and 2 KV tiles.
+        RunOne(seqQ: 128, seqKv: 128, numHeads: 24, numKvHeads: 4, headDim: 256, positionOffset: 0,
+               wideVariant: FlashAttentionWideVariant.Hd256Br16);
+    }
+
+    [SkippableFact]
+    public void Launch_Hd256_Br8_Bonsai2Shape()
+    {
+        // Same shape on the 8-row tile. BR is a dispatch-geometry constant, so this also checks
+        // the host side computed the workgroup count from the VARIANT's BR and not the base 16 -
+        // getting that wrong drops or duplicates whole query tiles.
+        RunOne(seqQ: 128, seqKv: 128, numHeads: 24, numKvHeads: 4, headDim: 256, positionOffset: 0,
+               wideVariant: FlashAttentionWideVariant.Hd256Br8);
+    }
+
+    [SkippableFact]
+    public void Launch_Hd256_Br4_Bonsai2Shape()
+    {
+        RunOne(seqQ: 128, seqKv: 128, numHeads: 24, numKvHeads: 4, headDim: 256, positionOffset: 0,
+               wideVariant: FlashAttentionWideVariant.Hd256Br4);
+    }
+
+    [SkippableFact]
+    public void Launch_Hd256_Br4_PartialQTile()
+    {
+        RunOne(seqQ: 13, seqKv: 13, numHeads: 2, numKvHeads: 1, headDim: 256, positionOffset: 0,
+               wideVariant: FlashAttentionWideVariant.Hd256Br4);
+    }
+
+    [SkippableFact]
+    public void Launch_Hd256_Br16_PartialQTile()
+    {
+        // seqQ 13 is neither a multiple of 16 nor of 8: exercises rowsInTile < BR on the wide
+        // shader, where the qTile/outAccum declarations are 2x the base shader's.
+        RunOne(seqQ: 13, seqKv: 13, numHeads: 2, numKvHeads: 1, headDim: 256, positionOffset: 0,
+               wideVariant: FlashAttentionWideVariant.Hd256Br16);
+    }
+
+    [SkippableFact]
+    public void Launch_Hd256_Br8_PartialQTile()
+    {
+        RunOne(seqQ: 13, seqKv: 13, numHeads: 2, numKvHeads: 1, headDim: 256, positionOffset: 0,
+               wideVariant: FlashAttentionWideVariant.Hd256Br8);
+    }
+
+    [SkippableFact]
+    public void Launch_Hd256_Br16_MultiKvTile_PositionOffset()
+    {
+        // Continuation prefill: 32 new queries against a 512-deep KV range, so the causal
+        // early-exit clamp and the positionOffset arithmetic both run on the wide shader.
+        RunOne(seqQ: 32, seqKv: 512, numHeads: 8, numKvHeads: 2, headDim: 256, positionOffset: 480,
+               wideVariant: FlashAttentionWideVariant.Hd256Br16);
+    }
+
+    [SkippableFact]
+    public void Launch_Hd256_Br8_MultiKvTile_PositionOffset()
+    {
+        RunOne(seqQ: 32, seqKv: 512, numHeads: 8, numKvHeads: 2, headDim: 256, positionOffset: 480,
+               wideVariant: FlashAttentionWideVariant.Hd256Br8);
+    }
+
+    [SkippableFact]
+    public void Hd256Variant_ReportsSupportedMaxHeadDim()
+    {
+        // The regression this guards: a dispatch gate that reads the MaxHeadDim CONSTANT (128)
+        // instead of the instance property sends a 256-dim head to the per-token kernel even
+        // though the wide pipeline is loaded and ready - i.e. reintroduces #441 silently.
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+
+        using var wide = VulkanFlashAttentionF32Kernel.Create(
+            device, spvDir, FlashAttentionWideVariant.Hd256Br16);
+        Assert.Equal(FlashAttentionWideVariant.Hd256Br16, wide.WideVariant);
+        Assert.Equal(VulkanFlashAttentionF32Kernel.WideMaxHeadDim, wide.SupportedMaxHeadDim);
+        Assert.Equal(VulkanFlashAttentionF32Kernel.QueryTileRows, wide.QueryTileRowsFor(256));
+
+        using var br8 = VulkanFlashAttentionF32Kernel.Create(
+            device, spvDir, FlashAttentionWideVariant.Hd256Br8);
+        Assert.Equal(8, br8.QueryTileRowsFor(256));
+        Assert.Equal(VulkanFlashAttentionF32Kernel.QueryTileRows, br8.QueryTileRowsFor(128));
+
+        using var br4 = VulkanFlashAttentionF32Kernel.Create(
+            device, spvDir, FlashAttentionWideVariant.Hd256Br4);
+        Assert.Equal(4, br4.QueryTileRowsFor(256));
+
+        using var none = VulkanFlashAttentionF32Kernel.Create(
+            device, spvDir, FlashAttentionWideVariant.None);
+        Assert.Equal(FlashAttentionWideVariant.None, none.WideVariant);
+        Assert.Equal(VulkanFlashAttentionF32Kernel.MaxHeadDim, none.SupportedMaxHeadDim);
+    }
+
+    [SkippableFact]
+    public void CreatePrefillFlashAttention_WideHeadWithNoWideVariant_ReportsAndReturnsNull()
+    {
+        // The exact configuration that produced #441: a 256-dim head with only the 128-dim base
+        // shader available. The factory must return null AND say so - a null return on its own is
+        // what made the bug invisible for a whole profiling campaign.
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+
+        VulkanAttentionFallbackDiagnostics.Reset();
+        VulkanFlashAttentionF32Kernel? kernel = VulkanAttentionFallbackDiagnostics
+            .CreatePrefillFlashAttention(device, spvDir, headDim: 256, modelKind: "TestModel",
+                wideVariantOverride: FlashAttentionWideVariant.None);
+
+        Assert.Null(kernel);
+        string message = Assert.Single(VulkanAttentionFallbackDiagnostics.Reported);
+        Assert.Contains("TestModel", message, StringComparison.Ordinal);
+        Assert.Contains("256 > shader MAX_HEAD_DIM 128", message, StringComparison.Ordinal);
+    }
+
+    [SkippableFact]
+    public void CreatePrefillFlashAttention_WideHeadWithWideVariant_SucceedsSilently()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+
+        VulkanAttentionFallbackDiagnostics.Reset();
+        using VulkanFlashAttentionF32Kernel? kernel = VulkanAttentionFallbackDiagnostics
+            .CreatePrefillFlashAttention(device, spvDir, headDim: 256, modelKind: "TestModel",
+                wideVariantOverride: FlashAttentionWideVariant.Hd256Br4);
+
+        Assert.NotNull(kernel);
+        Assert.Equal(256, kernel!.SupportedMaxHeadDim);
+        Assert.Empty(VulkanAttentionFallbackDiagnostics.Reported);
+    }
+
+    [SkippableFact]
+    public void CreatePrefillFlashAttention_NarrowHead_LoadsNoWidePipeline()
+    {
+        // A headDim-128 model must not pay for a 256-dim pipeline it can never dispatch - the
+        // resource property the old two-part gate existed to protect.
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+
+        VulkanAttentionFallbackDiagnostics.Reset();
+        using VulkanFlashAttentionF32Kernel? kernel = VulkanAttentionFallbackDiagnostics
+            .CreatePrefillFlashAttention(device, spvDir, headDim: 128, modelKind: "TestModel",
+                wideVariantOverride: FlashAttentionWideVariant.Hd256Br4);
+
+        Assert.NotNull(kernel);
+        Assert.Equal(FlashAttentionWideVariant.None, kernel!.WideVariant);
+        Assert.Empty(VulkanAttentionFallbackDiagnostics.Reported);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+
+    private static void RunOne(int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
+        int positionOffset, int slidingWindow = 0, float softCap = 0.0f, bool useAlibi = false,
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0,
+        FlashAttentionWideVariant wideVariant = FlashAttentionWideVariant.Hd256Br16)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        var rng = new Random(0xF1A54 + seqQ * 41 + seqKv * 17 + numHeads * 7 + headDim);
+        float[] qh = RandomFloats(rng, seqQ * numHeads * headDim);
+        float[] kh = RandomFloats(rng, seqKv * numKvHeads * headDim);
+        float[] vh = RandomFloats(rng, seqKv * numKvHeads * headDim);
+        float[] expected = new float[seqQ * numHeads * headDim];
+
+        ComputeExpected(qh, kh, vh, expected,
+            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
+            slidingWindow, softCap, useAlibi, maskMode, prefixLen);
+
+        using var device = VulkanDevice.Create();
+        using var kernel = VulkanFlashAttentionF32Kernel.Create(device, spvDir, wideVariant);
+        // A headDim the loaded variants cannot take would otherwise throw from Record() with a
+        // message the reader has to decode; skip explicitly instead.
+        Skip.If(headDim > kernel.SupportedMaxHeadDim,
+            $"headDim {headDim} needs the {wideVariant} SPV, which this build does not have.");
+
+        using var bufQ   = device.Allocate((long)qh.Length * sizeof(float));
+        using var bufK   = device.Allocate((long)kh.Length * sizeof(float));
+        using var bufV   = device.Allocate((long)vh.Length * sizeof(float));
+        using var bufOut = device.Allocate((long)expected.Length * sizeof(float));
+
+        device.Upload(qh.AsSpan(), bufQ);
+        device.Upload(kh.AsSpan(), bufK);
+        device.Upload(vh.AsSpan(), bufV);
+
+        kernel.Launch(bufQ, bufK, bufV, bufOut,
+            seqQ, seqKv, numHeads, numKvHeads, headDim,
+            positionOffset: positionOffset, slidingWindow: slidingWindow,
+            useAlibi: useAlibi, softCap: softCap,
+            maskMode: maskMode, prefixLen: prefixLen);
+
+        float[] actual = new float[expected.Length];
+        device.Download(bufOut, actual);
+
+        AssertClose(expected, actual, seqQ, seqKv, numHeads, numKvHeads, headDim);
+    }
+
+    /// <summary>
+    /// CPU reference. Uses <see cref="Attention.ExecuteScalar"/> when no
+    /// soft-cap is present (the public scalar path matches the shader's
+    /// pre-cap math exactly); when soft-cap is non-zero, applies the
+    /// tanh squash in-line — there is no soft-cap overload on the CPU
+    /// kernel today.
+    /// </summary>
+    private static void ComputeExpected(
+        float[] q, float[] k, float[] v, float[] output,
+        int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
+        int positionOffset, int slidingWindow, float softCap, bool useAlibi,
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
+    {
+        if (softCap <= 0f)
+        {
+            int? swArg = slidingWindow > 0 ? slidingWindow : null;
+            float scale = 1.0f / MathF.Sqrt(headDim);
+            ReadOnlySpan<float> slopes = useAlibi
+                ? AlibiPositionEncoding.CreateSlopes(numHeads)
+                : default;
+            Attention.ExecuteScalar(q, k, v, output,
+                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
+                scale, slopes, swArg, softCap: 0f, maskMode, prefixLen);
+            return;
+        }
+
+        // Soft-cap reference: replicate the scalar path with tanh-capped
+        // scores. Matches the shader's `softCap * tanh(s / softCap)` step.
+        SoftCapReference(q, k, v, output,
+            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
+            slidingWindow, softCap, useAlibi);
+    }
+
+    private static void SoftCapReference(
+        float[] q, float[] k, float[] v, float[] output,
+        int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
+        int positionOffset, int slidingWindow, float softCap, bool useAlibi)
+    {
+        int groupSize = numHeads / numKvHeads;
+        int qStride = numHeads * headDim;
+        int kvStride = numKvHeads * headDim;
+        float scale = 1.0f / MathF.Sqrt(headDim);
+        float[] slopes = useAlibi ? AlibiPositionEncoding.CreateSlopes(numHeads) : Array.Empty<float>();
+
+        for (int h = 0; h < numHeads; h++)
+        {
+            int kvH = h / groupSize;
+            float slope = slopes.Length > 0 ? slopes[h] : 0f;
+
+            for (int i = 0; i < seqQ; i++)
+            {
+                int posQ = positionOffset + i;
+                float[] scores = new float[seqKv];
+                for (int j = 0; j < seqKv; j++)
+                {
+                    bool masked =
+                        j > posQ ||
+                        (slidingWindow > 0 && posQ - j >= slidingWindow);
+                    if (masked) { scores[j] = float.NegativeInfinity; continue; }
+
+                    float dot = 0;
+                    for (int d = 0; d < headDim; d++)
+                        dot += q[i * qStride + h * headDim + d] * k[j * kvStride + kvH * headDim + d];
+                    float s = dot * scale - slope * (posQ - j);
+                    scores[j] = softCap * MathF.Tanh(s / softCap);
+                }
+
+                float maxS = float.NegativeInfinity;
+                for (int j = 0; j < seqKv; j++) if (scores[j] > maxS) maxS = scores[j];
+                float sum = 0;
+                for (int j = 0; j < seqKv; j++)
+                {
+                    scores[j] = (scores[j] > float.NegativeInfinity * 0.5f) ? MathF.Exp(scores[j] - maxS) : 0f;
+                    sum += scores[j];
+                }
+                float inv = sum > 0 ? 1f / sum : 0f;
+
+                for (int d = 0; d < headDim; d++)
+                {
+                    float acc = 0;
+                    for (int j = 0; j < seqKv; j++)
+                        acc += scores[j] * v[j * kvStride + kvH * headDim + d];
+                    output[i * qStride + h * headDim + d] = acc * inv;
+                }
+            }
+        }
+    }
+
+    private static float[] RandomFloats(Random rng, int count)
+    {
+        var arr = new float[count];
+        for (int i = 0; i < count; i++)
+            arr[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+        return arr;
+    }
+
+    private static void AssertClose(float[] expected, float[] actual,
+        int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        int errors = 0;
+        float maxAbs = 0, maxRel = 0;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            float e = expected[i];
+            float a = actual[i];
+            float diff = MathF.Abs(e - a);
+            float rel = diff / MathF.Max(MathF.Abs(e), 1e-7f);
+            if (diff > maxAbs) maxAbs = diff;
+            if (rel > maxRel) maxRel = rel;
+            if (diff > AbsTol && rel > RelTol) errors++;
+        }
+        Assert.True(errors == 0,
+            $"FlashAttention drift exceeded tolerance " +
+            $"(seqQ={seqQ},seqKv={seqKv},nh={numHeads},nkv={numKvHeads},hd={headDim}): " +
+            $"errors={errors}/{expected.Length}, maxAbs={maxAbs:G9}, maxRel={maxRel:G9}");
+    }
+}

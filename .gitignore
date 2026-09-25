@@ -3,9 +3,13 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/main/VisualStudio.gitignore
 
-# Claude Code local config (machine-specific paths, agent memory)
+# Claude Code local config (machine-specific paths, agent memory, session lock)
 .claude/local-paths.md
 .claude/agent-memory/
+.claude/scheduled_tasks.lock
+
+# Local agent handoff/progress notes (machine-specific, not shared)
+.docs/
 
 # User-specific files
 *.rsuser
@@ -425,3 +429,48 @@ FodyWeavers.xsd
 
 # dotLLM test model cache
 tests/.models/
+
+# Scratch files used during nemotron_h research (do not commit)
+_*.cpp
+_*.txt
+.mamba3-reference/
+.mamba3-reference-canonical/
+.mamba3-python-venv/
+.venv-pyref/
+.gpu-lock/
+
+# Scratch / tensor-dump files used during qwen3.6 / qwen35moe parity work.
+# Small parity-comparison stdouts (dotllm_parity_out.txt / llama_parity_out.txt)
+# are tracked as references — the larger multi-stream dumps and the binary
+# TensorDump directories are excluded.
+dotllm_multi_out.txt
+llama_eval_callback_out.txt
+llama_raw_out.txt
+moe_debug.txt
+parity_dotllm/
+parity_dotllm_multi/
+.claude/worktrees/
+.claude/strix/
+
+# ── Model weights NEVER belong in the repo ───────────────────────────────────
+# Models live in the shared cache (~/.dotllm/models, ~/.dotllm/test-cache); if a
+# path inside the tree needs one, symlink to the cache rather than copying it in.
+# Rationale: a single GGUF is 0.1-50 GB, git stores it forever even after deletion,
+# and the OS page cache lets every process/worktree share ONE on-disk copy.
+# This is an extension-level backstop — the directory rules above (tests/.models/,
+# .docs/) only cover the paths people remembered to use.
+#
+# NOTE: *.spv and *.ptx are deliberately NOT ignored — 216 compiled Vulkan/CUDA
+# shaders are tracked on purpose as build artifacts. Do not add broad binary globs.
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.h5
+*.msgpack
+# Activation/tensor dumps (these escaped into C:\dotllm_qwen35_* once already)
+*_result_output.bin
+TensorDump/
+tensor_dumps/

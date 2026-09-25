@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
@@ -11,7 +12,7 @@ namespace DotLLM.Engine.KvCache;
 /// Attention kernel compatibility is maintained via staging buffers that gather blocks into
 /// contiguous views for <see cref="GetKeysRef"/>/<see cref="GetValuesRef"/>.
 /// </summary>
-public sealed unsafe class PagedKvCache : IKvCache
+public sealed unsafe class PagedKvCache : IKvCache, IHostStagedKvCache
 {
     private readonly KvBlockPool _pool;
     private readonly KvBlockTable _blockTable;
@@ -32,8 +33,31 @@ public sealed unsafe class PagedKvCache : IKvCache
     /// <inheritdoc/>
     public int MaxLength => _maxSeqLen;
 
+    /// <summary>
+    /// Unmanaged bytes reserved for this cache's contiguous K/V staging buffers.
+    /// Shared block-pool bytes are reported separately by <see cref="KvBlockPool.AllocatedBytes"/>.
+    /// </summary>
+    public long AllocatedBytes => 2 * _stagingBytes;
+
     /// <summary>The block table mapping logical positions to physical blocks.</summary>
     internal KvBlockTable BlockTable => _blockTable;
+
+    /// <summary>The block pool backing this cache.</summary>
+    internal KvBlockPool Pool => _pool;
+
+    /// <summary>
+    /// Seeds the cache with shared prefix blocks whose refcounts have already been
+    /// incremented. Bumps the visible length to <paramref name="tokenCount"/>.
+    /// </summary>
+    internal void SeedSharedPrefix(IReadOnlyList<int> blockIds, int tokenCount) =>
+        _blockTable.SeedSharedBlocks(blockIds, tokenCount);
+
+    /// <summary>
+    /// Snapshots block IDs covering the first <paramref name="tokenCount"/> tokens
+    /// (full blocks only). Caller appends to <paramref name="blockIds"/>.
+    /// </summary>
+    internal void SnapshotFullBlocks(int tokenCount, List<int> blockIds) =>
+        _blockTable.SnapshotFullBlocks(tokenCount, blockIds);
 
     /// <summary>
     /// Creates a new paged KV-cache backed by the given block pool.
@@ -44,6 +68,15 @@ public sealed unsafe class PagedKvCache : IKvCache
     /// <param name="maxSeqLen">Maximum sequence length this cache can hold.</param>
     public PagedKvCache(KvBlockPool pool, int numLayers, int kvStride, int maxSeqLen)
     {
+        ArgumentNullException.ThrowIfNull(pool);
+        if (numLayers <= 0) throw new ArgumentOutOfRangeException(nameof(numLayers));
+        if (kvStride <= 0) throw new ArgumentOutOfRangeException(nameof(kvStride));
+        if (maxSeqLen <= 0) throw new ArgumentOutOfRangeException(nameof(maxSeqLen));
+        if (numLayers != pool.NumLayers)
+            throw new ArgumentException("Pool layer count does not match cache layer count.", nameof(pool));
+        if (kvStride != pool.KvStride)
+            throw new ArgumentException("Pool KV stride does not match cache KV stride.", nameof(pool));
+
         _pool = pool;
         _numLayers = numLayers;
         _kvStride = kvStride;
@@ -153,6 +186,59 @@ public sealed unsafe class PagedKvCache : IKvCache
         GatherIntoStaging(_valueStagingPtr, layerIndex, isKey: false);
         var shape = new TensorShape(_blockTable.CurrentLength, _kvStride);
         return new TensorView(shape, DType.Float32, -1, _valueStagingPtr);
+    }
+
+    // ── IHostStagedKvCache: host-staging surface for cross-pool / cross-device KV handoff ──
+
+    /// <inheritdoc/>
+    public int StagedLayerElementCount(int layerIndex)
+    {
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        return _blockTable.CurrentLength * _kvStride;
+    }
+
+    /// <inheritdoc/>
+    public void DownloadLayer(int layerIndex, Span<float> keys, Span<float> values)
+    {
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        int count = _blockTable.CurrentLength * _kvStride;
+        if (count == 0) return;
+        // Gather the paged blocks into the contiguous (host) staging buffers, then copy out. The
+        // staging buffers are reused across layers, so each layer is consumed before the next gather.
+        GatherIntoStaging(_keyStagingPtr, layerIndex, isKey: true);
+        new ReadOnlySpan<float>((void*)_keyStagingPtr, count).CopyTo(keys);
+        GatherIntoStaging(_valueStagingPtr, layerIndex, isKey: false);
+        new ReadOnlySpan<float>((void*)_valueStagingPtr, count).CopyTo(values);
+    }
+
+    /// <inheritdoc/>
+    public void UploadLayer(int layerIndex, int length, ReadOnlySpan<float> keys, ReadOnlySpan<float> values)
+    {
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        if (length <= 0) return;
+        long expected = (long)length * _kvStride;
+        if (keys.Length < expected || values.Length < expected)
+            throw new ArgumentException($"keys/values must contain at least length × kvStride = {expected} floats.");
+
+        int[] positions = ArrayPool<int>.Shared.Rent(length);
+        try
+        {
+            for (int p = 0; p < length; p++) positions[p] = p;
+            fixed (float* kp = keys)
+            fixed (float* vp = values)
+            {
+                var kRef = new TensorRef(length, _kvStride, DType.Float32, -1, (nint)kp);
+                var vRef = new TensorRef(length, _kvStride, DType.Float32, -1, (nint)vp);
+                Update(kRef, vRef, positions.AsSpan(0, length), layerIndex);
+            }
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(positions);
+        }
     }
 
     /// <summary>

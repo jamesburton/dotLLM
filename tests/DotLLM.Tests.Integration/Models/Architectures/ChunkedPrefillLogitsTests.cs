@@ -32,7 +32,7 @@ public static class ChunkedPrefillLogits
     /// <summary>
     /// Returns the max absolute logit delta against the single-pass prefill, per chunk size.
     /// </summary>
-    public static Dictionary<int, float> MeasureChunkDeltas(string ggufPath)
+    public static IReadOnlyDictionary<int, float> MeasureChunkDeltas(string ggufPath)
     {
         using var gguf = GgufFile.Open(ggufPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);

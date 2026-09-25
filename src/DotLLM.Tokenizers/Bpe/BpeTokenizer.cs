@@ -83,15 +83,66 @@ public sealed class BpeTokenizer : ITokenizer
     /// <param name="tokenTypes">Per-token type flags. Null = all normal.</param>
     /// <param name="bosId">Beginning-of-sequence token ID.</param>
     /// <param name="eosId">End-of-sequence token ID.</param>
-    /// <param name="preTokenizerType">GGUF <c>tokenizer.ggml.pre</c> value (e.g., "llama3", "gpt2"). Null = no pre-tokenization.</param>
+    /// <param name="preTokenizerType">GGUF <c>tokenizer.ggml.pre</c> value (e.g., "llama3", "gpt2").
+    /// Null/absent = the GPT-2 default pipeline (llama.cpp's "missing pre-tokenizer type" fallback);
+    /// an unknown value throws <see cref="System.IO.InvalidDataException"/> unless
+    /// <c>DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER=1</c> (issue #373).</param>
     public static BpeTokenizer CreateTiktoken(
         string[] tokens, string[] merges, int[]? tokenTypes,
         int bosId, int eosId, string? preTokenizerType = null)
     {
         var specialTokens = BuildSpecialTokenTable(tokens, tokenTypes);
-        var preRegex = TiktokenPreTokenizer.GetRegex(preTokenizerType);
+        var preRegexes = TiktokenPreTokenizer.GetRegexes(preTokenizerType);
         return new BpeTokenizer(
-            new Gpt2TiktokenEncoding(tokens, merges, tokenTypes, preRegex),
+            new Gpt2TiktokenEncoding(tokens, merges, tokenTypes, preRegexes),
+            specialTokens, bosId, eosId, tokens.Length);
+    }
+
+    /// <summary>
+    /// Creates a Gemma-4 SPM-style merge-ranked BPE tokenizer
+    /// (GGUF <c>tokenizer.ggml.model = "gemma4"</c>).
+    /// Spaces are escaped to <c>▁</c> before merge-ranked BPE runs over raw UTF-8 text;
+    /// pre-tokenization only splits newline runs (llama.cpp <c>LLAMA_VOCAB_PRE_TYPE_GEMMA4</c>).
+    /// </summary>
+    /// <param name="tokens">Vocabulary strings indexed by token ID.</param>
+    /// <param name="merges">Merge table entries in "A B" format; index = rank (lower = applied first).</param>
+    /// <param name="tokenTypes">Per-token type flags. Null = all normal.</param>
+    /// <param name="bosId">Beginning-of-sequence token ID.</param>
+    /// <param name="eosId">End-of-sequence token ID.</param>
+    public static BpeTokenizer CreateGemma4(
+        string[] tokens, string[] merges, int[]? tokenTypes, int bosId, int eosId)
+    {
+        var specialTokens = BuildSpecialTokenTable(tokens, tokenTypes);
+        return new BpeTokenizer(
+            new Gemma4SpmBpeEncoding(tokens, merges, tokenTypes),
+            specialTokens, bosId, eosId, tokens.Length);
+    }
+
+    /// <summary>
+    /// Creates a tiktoken BPE tokenizer with an explicit, pre-compiled
+    /// pre-tokenization regex. Used by the HuggingFace <c>tokenizer.json</c>
+    /// adapter when the model declares a <c>Split</c> regex that is not
+    /// one of the built-in GGUF presets (e.g., Qwen2's custom
+    /// <c>(?i:'s|'t|...)|\p{N}|...</c> pattern).
+    /// </summary>
+    /// <param name="tokens">Vocabulary strings indexed by token ID.</param>
+    /// <param name="merges">Merge table entries in "A B" format; index = rank (lower = applied first).</param>
+    /// <param name="tokenTypes">Per-token type flags. Null = all normal.</param>
+    /// <param name="bosId">Beginning-of-sequence token ID.</param>
+    /// <param name="eosId">End-of-sequence token ID.</param>
+    /// <param name="preRegex">
+    /// Compiled pre-tokenization regex. <see langword="null"/> means no
+    /// pre-splitting — the whole input is fed to BPE as one segment.
+    /// </param>
+    public static BpeTokenizer CreateTiktokenWithRegex(
+        string[] tokens, string[] merges, int[]? tokenTypes,
+        int bosId, int eosId, System.Text.RegularExpressions.Regex? preRegex)
+    {
+        var specialTokens = BuildSpecialTokenTable(tokens, tokenTypes);
+        // A single expression is a one-stage pipeline. Pre-types whose reference definition has
+        // several stages (the StarCoder/SmolLM family) must go through CreateTiktoken instead.
+        return new BpeTokenizer(
+            new Gpt2TiktokenEncoding(tokens, merges, tokenTypes, preRegex is null ? null : [preRegex]),
             specialTokens, bosId, eosId, tokens.Length);
     }
 

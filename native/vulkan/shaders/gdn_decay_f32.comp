@@ -1,0 +1,54 @@
+#version 450
+// Fused per-(token, head) decay computation for Qwen3MoeHybrid GDN token mixing.
+//
+//   for t in [0, seq_len), vh in [0, n_v_head):
+//     a    = alpha_buf[t, vh] + dt_bias[vh]
+//     sp   = log(1 + exp(a))                       // softplus, NO x>20 guard
+//     alpha_buf[t, vh] = exp(sp * a_vec[vh])
+//
+// Bit-parity notes (vs the CPU reference at
+//   src/DotLLM.Vulkan/VulkanQwen3MoeHybridTransformerModel.cs:ComputeDecayAndBetaOnHost
+// and the CUDA port at native/kernels/gated_delta_net_scan.cu:gdn_decay_f32):
+//
+//   - The CPU reference uses MathF.Log(1 + MathF.Exp(a)) directly — no
+//     numerical guard for large a. We replicate this exactly: GLSL's
+//     exp() will overflow to +inf for a > ~88, and log(1 + inf) → +inf.
+//     The downstream multiply `sp * A[vh]` with A typically in [-0.5, -0.05]
+//     then yields -inf, and exp(-inf) → 0 — which is the desired vanishing
+//     decay for saturating inputs.
+//
+//   - GLSL exp/log are not strictly IEEE-correct on all drivers, but
+//     within ≤4 ULP across the supported range for any well-conditioned
+//     input. Tolerance ≤4 ULP in unit tests.
+//
+// Dispatch: flat grid, one thread per (t, vh) cell.
+//   local_size_x  = 256
+//   groupCount.x  = ceil(seq_len * n_v_head / 256)
+//
+// At qwen35moe scale n_v_head=16, seq_len bounded by maxSequenceLength
+// (typically <= 32K); a 256-thread block scaling linearly with the
+// element count is the smallest sensible workgroup that hides launch
+// overhead while still saturating Strix Halo's 4-CU compute frontend.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)          buffer  BufAlpha { float alpha[]; };  // [seq_len * n_v_head] (RW)
+layout(set = 0, binding = 1, std430) readonly buffer  BufDtBias { float dt_bias[]; }; // [n_v_head]
+layout(set = 0, binding = 2, std430) readonly buffer  BufA      { float a_vec[]; };   // [n_v_head]
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint n_v_head;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.seq_len * pc.n_v_head;
+    if (idx >= total) return;
+
+    uint vh = idx % pc.n_v_head;
+
+    float a  = alpha[idx] + dt_bias[vh];
+    float sp = log(1.0 + exp(a));            // softplus, no guard — matches CPU reference
+    alpha[idx] = exp(sp * a_vec[vh]);
+}

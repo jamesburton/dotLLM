@@ -1,0 +1,52 @@
+{
+  "benchmark": "throughput_openai",
+  "run_started_at": "2026-04-24T16:48:01.079631+00:00",
+  "run_finished_at": "2026-04-24T16:48:09.358730+00:00",
+  "output_path": "C:\\Development\\dotLLM-mamba3\\.perf-runs\\cross-lib-20260424-expA\\dotllm-throughput.json",
+  "base_url": "http://127.0.0.1:8000",
+  "host_details": {
+    "captured_at": "2026-04-24T16:48:02.358822+00:00",
+    "hostname": "Strix",
+    "host_slug": "strix",
+    "os": {
+      "system": "Windows",
+      "release": "11",
+      "version": "10.0.26200",
+      "machine": "AMD64"
+    },
+    "manufacturer": "Bosgame",
+    "model": "BeyondMax Series",
+    "processor": "AMD64 Family 26 Model 112 Stepping 0, AuthenticAMD",
+    "logical_cpu_count": 32,
+    "total_memory_gb": 63.65,
+    "python_version": "3.12.10",
+    "ollama_version": "Warning: could not connect to a running Ollama instance",
+    "gpus": [
+      {
+        "Name": "AMD Radeon(TM) 8060S Graphics",
+        "AdapterRAM": 4293918720,
+        "DriverVersion": "32.0.12064.27",
+        "VideoProcessor": "AMD Radeon Graphics Processor (0x1586)",
+        "Status": "OK"
+      }
+    ]
+  },
+  "models": [
+    "SmolLM-135M"
+  ],
+  "results": [
+    {
+      "model": "SmolLM-135M",
+      "completion_tokens": 192,
+      "toks_per_s": 33.76,
+      "total_s": 5.686,
+      "cpu_avg_pct": 0,
+      "cpu_peak_pct": 0,
+      "ram_peak_gb": 0.7,
+      "gpu_util_avg": 27.9,
+      "gpu_util_peak": 27.9,
+      "gpu_mem_peak_gb": 3.33,
+      "response_preview": "Write a concise explanation of dependency injection with one short Python example.\n\n## 1.1.1. Introduction\n\nDependency injection is a technique that allows you to write a single unit of code that can "
+    }
+  ]
+}

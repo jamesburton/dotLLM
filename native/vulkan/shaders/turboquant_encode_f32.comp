@@ -1,0 +1,116 @@
+#version 450
+// TurboQuant (MSE stage) KV encode from FP32 — the GPU port of
+// DotLLM.Engine.KvCache.Codecs.TurboQuantCodec.Encode (useQjl = false).
+//
+// Per fresh K/V head-vector x (dimension headDim, a power of two <= 256):
+//   norm   = ||x||
+//   unit   = x / norm                              (zero vector -> zeros, norm 0)
+//   s      = (1/sqrt(d)) * H * (D * unit)          // forward RHT: sign-flip, WHT, normalize
+//   code_i = argmin_j |s_i - centroids[j]|         // nearest Lloyd-Max centroid
+// then pack code_i (mseBits each, LSB-first) into the vector's uint-aligned code slot and
+// store norm. NOTE: norm/rotation use fp32 here vs the CPU codec's fp64 norm accumulation, so
+// a code may flip by one level at a quantization-cell boundary; reconstruction stays within the
+// codec's MSE bound and matches the CPU codes away from boundaries.
+//
+// Dispatch: one workgroup per head-vector (gl_WorkGroupID.x = wg), local_size_x = 256, one
+// thread per coordinate. Source rows are contiguous activation K/V [seqLen, numKvHeads*headDim];
+// wg -> srcRow = wg/numKvHeads, h = wg%numKvHeads; destination head-vector index is
+// (startPos + srcRow)*numKvHeads + h. Each workgroup writes its own (disjoint, uint-aligned)
+// code uints, so output uints are single-writer — no atomics, no pre-zeroing required.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufSrc  { float src[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufCent { float centroids[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufSign { float signs[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer BufCode { uint  codes[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer BufNorm { float norms[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint headDim;          // power of two, <= 256
+    uint numKvHeads;
+    uint mseBits;          // 1..8
+    uint codeUintsPerVec;  // ceil(codeBytes/4) — uint stride between head-vectors' codes
+    uint levelCount;       // 1 << mseBits
+    uint startPos;         // position of srcRow 0 (contiguous append)
+    float invSqrtD;        // 1/sqrt(headDim)
+} pc;
+
+shared float sh[256];   // working buffer: x^2 reduction, then rotated coords
+shared uint  idx[256];  // per-coordinate centroid index
+
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint t  = gl_LocalInvocationID.x;
+    uint d  = pc.headDim;
+    bool live = t < d;
+
+    uint srcRow = wg / pc.numKvHeads;
+    uint h      = wg - srcRow * pc.numKvHeads;
+    uint stride = pc.numKvHeads * d;
+    uint srcOff = srcRow * stride + h * d;
+
+    // --- norm = ||x|| via shared tree reduction ---
+    float xt = live ? src[srcOff + t] : 0.0;
+    sh[t] = xt * xt;
+    barrier();
+    for (uint s = d >> 1u; s > 0u; s >>= 1u) {
+        if (t < s) sh[t] += sh[t + s];
+        barrier();
+    }
+    float norm = sqrt(sh[0]);
+    barrier(); // sh[0] read complete before sh is reused
+
+    // --- unit direction → forward RHT (sign-flip, WHT, normalize) ---
+    float unit = (norm > 0.0 && live) ? (xt / norm) : 0.0;
+    sh[t] = live ? unit * signs[t] : 0.0;
+    barrier();
+    for (uint len = 1u; len < d; len <<= 1u) {
+        if (live && (t & len) == 0u) {
+            float u = sh[t];
+            float v = sh[t + len];
+            sh[t]       = u + v;
+            sh[t + len] = u - v;
+        }
+        barrier();
+    }
+
+    // --- nearest centroid (ascending centroids; argmin |s - c|) ---
+    if (live) {
+        float val = sh[t] * pc.invSqrtD;
+        uint best = 0u;
+        float bestD = abs(val - centroids[0]);
+        for (uint j = 1u; j < pc.levelCount; j++) {
+            float dist = abs(val - centroids[j]);
+            if (dist < bestD) { bestD = dist; best = j; }
+        }
+        idx[t] = best;
+    }
+    barrier();
+
+    // --- assemble code uints (one writer per uint: this workgroup owns them) ---
+    uint vecHv      = (pc.startPos + srcRow) * pc.numKvHeads + h;
+    uint vecBaseUint = vecHv * pc.codeUintsPerVec;
+    if (t < pc.codeUintsPerVec) {
+        uint word = 0u;
+        uint wordLoBit = t * 32u;          // global bit range [wordLoBit, wordLoBit+32) within the vector
+        uint wordHiBit = wordLoBit + 32u;
+        // Each coordinate c contributes mseBits at bit offset c*mseBits within the vector.
+        uint cStart = wordLoBit / pc.mseBits;                      // first coord that can touch this word
+        for (uint c = cStart; c < d; c++) {
+            uint cBit = c * pc.mseBits;
+            if (cBit >= wordHiBit) break;                          // past this word
+            uint code = idx[c];
+            // bits of `code` that land in this word
+            if (cBit >= wordLoBit) {
+                word |= code << (cBit - wordLoBit);
+            } else {
+                // straddle: low part went to the previous word; high part lands here
+                word |= code >> (wordLoBit - cBit);
+            }
+        }
+        codes[vecBaseUint + t] = word;
+    }
+
+    if (t == 0u) norms[vecHv] = norm;
+}

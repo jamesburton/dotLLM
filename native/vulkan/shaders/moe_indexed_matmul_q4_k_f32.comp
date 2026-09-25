@@ -1,0 +1,134 @@
+#version 450
+// MoE indexed expert matmul over a packed Q4_K expert bank.
+//
+//   y[n, m] = sum_k dequant_q4k(bank[indices[n], m, k]) * x[n, k]
+//
+// Layout of `bank` is [numExperts, M, K] row-major. Each row holds (K / 256)
+// Q4_K super-blocks of 144 bytes:
+//     bytes [0,1]    = fp16 d     (per-super-block delta scale)
+//     bytes [2,3]    = fp16 dmin  (per-super-block delta min)
+//     bytes [4..15]  = scales[12] (8 x 6-bit scales + 8 x 6-bit mins, packed
+//                                  per llama.cpp get_scale_min_k4)
+//     bytes [16..143]= qs[128]    (128 bytes, two 4-bit values per byte)
+// Row stride = (K / 256) * 144 bytes. 144 is a multiple of 4 so super-blocks
+// are word-aligned, but `d`/`dmin` straddle handling is kept for symmetry.
+//
+// Sibling of moe_indexed_matmul_q6_k_f32.comp — same dispatch shape (one
+// thread per output cell, 16x16 workgroup tile, per-row expert lookup) and
+// same interface (BufBank / BufX / BufIdx / BufY). Only the per-row dequant
+// kernel differs. Used for the Gemma-4 fused gate_up experts (W1 gate / W3 up
+// banks; K = hidden).
+//
+// Per-row dequant mirrors matmul_q4_k_gemv_f32.comp / DotLLM.Cpu.Kernels
+// .Dequantize.DequantizeQ4_KScalar byte-for-byte:
+//   8 sub-blocks of 32 elements per super-block; sub-block j uses (scale[j],
+//   min[j]); w_i = d*scale[j]*nibble_i - dmin*min[j].
+//
+// Dispatch: 2D grid, one thread per output cell (n, m). Workgroup (16, 16).
+//   groupCount = (ceil(M/16), ceil(N/16)).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  bank[]; };  // Q4_K blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufX    { float x[]; };     // [N * K]
+layout(set = 0, binding = 2, std430) readonly  buffer BufIdx  { int   indices[]; };// [N]
+layout(set = 0, binding = 3, std430) writeonly buffer BufY    { float y[]; };     // [N * M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim   (per-expert weight row count)
+    uint K;             // input dim    (per-expert weight col count, multiple of 256)
+    uint N;             // total rows   (typically seqLen * topK)
+    uint numExperts;    // bank's first axis size — bounds-check only
+    uint blocksPerRow;  // = K / 256
+} pc;
+
+const uint Q4K_BLOCK_BYTES = 144u;
+const uint Q4K_GROUP_SIZE  = 256u;
+
+uint readByte(uint absByteOff) {
+    uint u = bank[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = bank[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = bank[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// Unpack the j-th (0..7) (scale, min) pair from the 12-byte scales[] region.
+// Mirrors get_scale_min_k4 / DequantizeKQuants.UnpackQ4Q5Scales.
+uvec2 unpackScaleMin(uint scalesByteBase, uint j) {
+    uint sc, mn;
+    if (j < 4u) {
+        sc = readByte(scalesByteBase + j) & 63u;
+        mn = readByte(scalesByteBase + j + 4u) & 63u;
+    } else {
+        uint jm4 = j - 4u;
+        uint jp4 = j + 4u;
+        uint scLow  = readByte(scalesByteBase + jp4) & 0xFu;
+        uint scHigh = (readByte(scalesByteBase + jm4) >> 6u) & 0x3u;
+        sc = scLow | (scHigh << 4u);
+        uint mnLow  = (readByte(scalesByteBase + jp4) >> 4u) & 0xFu;
+        uint mnHigh = (readByte(scalesByteBase + j) >> 6u) & 0x3u;
+        mn = mnLow | (mnHigh << 4u);
+    }
+    return uvec2(sc, mn);
+}
+
+void main() {
+    uint m = gl_GlobalInvocationID.x; // 0..M
+    uint n = gl_GlobalInvocationID.y; // 0..N
+    if (m >= pc.M || n >= pc.N) return;
+
+    int rawIdx = indices[n];
+    uint expertIdx = uint(clamp(rawIdx, 0, int(pc.numExperts) - 1));
+
+    uint rowByteStride    = pc.blocksPerRow * Q4K_BLOCK_BYTES;
+    uint matrixByteStride = pc.M * rowByteStride;
+    uint rowByteBase      = expertIdx * matrixByteStride + m * rowByteStride;
+    uint xRowBase         = n * pc.K;
+
+    float acc = 0.0;
+
+    for (uint b = 0u; b < pc.blocksPerRow; b++) {
+        uint blockByteBase = rowByteBase + b * Q4K_BLOCK_BYTES;
+        float d    = readHalf(blockByteBase);
+        float dmin = readHalf(blockByteBase + 2u);
+        uint scalesBase = blockByteBase + 4u;
+        uint qsBase     = blockByteBase + 16u;
+
+        uint xBase = xRowBase + b * Q4K_GROUP_SIZE;
+
+        for (uint j = 0u; j < 8u; j++) {
+            uvec2 sm = unpackScaleMin(scalesBase, j);
+            float sc = d * float(sm.x);
+            float mn = dmin * float(sm.y);
+
+            uint pairIdx    = j >> 1u;       // 0..3
+            uint nibbleHalf = j & 1u;        // 0 or 1
+            uint qsByteBase = qsBase + pairIdx * 32u;
+            uint outBase    = xBase + j * 32u;
+
+            float subSum = 0.0;
+            for (uint i = 0u; i < 32u; i++) {
+                uint byteVal = readByte(qsByteBase + i);
+                uint nibble  = (nibbleHalf == 0u) ? (byteVal & 0xFu) : (byteVal >> 4u);
+                float xi = x[outBase + i];
+                subSum += xi * (sc * float(nibble) - mn);
+            }
+            acc += subSum;
+        }
+    }
+
+    y[n * pc.M + m] = acc;
+}

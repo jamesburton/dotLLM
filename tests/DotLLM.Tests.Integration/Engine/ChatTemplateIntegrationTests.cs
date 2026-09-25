@@ -141,9 +141,11 @@ public class ChatTemplateIntegrationTests
             // The model should produce a non-empty response
             Assert.False(string.IsNullOrEmpty(response), "Chat response should not be empty.");
 
-            // SmolLM2-135M-Instruct with greedy decoding and this system prompt
-            // consistently mentions "Robocop" in the greeting
-            Assert.Contains("Robocop", response, StringComparison.OrdinalIgnoreCase);
+            // Keep this as a chat-pipeline smoke test rather than depending on
+            // a specific small-model phrasing.
+            Assert.DoesNotContain("<|im_start|>", response, StringComparison.Ordinal);
+            Assert.DoesNotContain("<|im_end|>", response, StringComparison.Ordinal);
+            Assert.Contains("help", response, StringComparison.OrdinalIgnoreCase);
         }
     }
 

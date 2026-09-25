@@ -1,6 +1,18 @@
 // ─────────────────────────────────────────────────────────────────────
 //  KV-cache quantization kernels: FP16 → Q8_0 and FP16 → Q4_0
 //  Used for quantize-on-evict in CudaQuantizedKvCache.
+//
+//  Two flavours per quant type:
+//    quant_f16_to_q{8_0,4_0}        — eager path. Host computes src/dst
+//                                     and how many blocks to write.
+//    quant_f16_to_q{8_0,4_0}_dyn    — graph-capture path. Reads the decode
+//                                     position from a device-resident int and
+//                                     decides per launch whether to quantize
+//                                     the just-evicted FP16 row, derives
+//                                     src/dst addresses device-side. Predicated:
+//                                     until the FP16 window fills, the kernel
+//                                     no-ops. This keeps the graph topology
+//                                     constant across decode steps.
 // ─────────────────────────────────────────────────────────────────────
 
 #include <cuda_fp16.h>
@@ -94,6 +106,135 @@ extern "C" __global__ void __launch_bounds__(256) quant_f16_to_q4_0(
         #pragma unroll 8
         for (int j = 0; j < 16; j++)
             qs[j] = 0x88; // (8 << 4) | 8
+    }
+    else
+    {
+        float inv_d = 1.0f / d;
+        #pragma unroll 8
+        for (int j = 0; j < 16; j++)
+        {
+            int lo = max(0, min(15, __float2int_rn(vals[2 * j] * inv_d) + 8));
+            int hi = max(0, min(15, __float2int_rn(vals[2 * j + 1] * inv_d) + 8));
+            qs[j] = (uint8_t)((hi << 4) | lo);
+        }
+    }
+}
+
+// ── Dynamic (graph-capture) variants ────────────────────────────────
+//
+// On every decode step we launch one of these per layer per K/V. The
+// kernel reads the absolute decode position from `pos_ptr` and decides:
+//   evict_pos = pos - window_size;     // FP16 row that just fell out
+//   if (evict_pos < 0) return;         // window not full yet → no-op
+// Source row sits in the FP16 ring buffer at slot `evict_pos % window_size`
+// (kv_stride FP16 elements). Destination is the quantized row at row index
+// `evict_pos` in the per-layer Q-cache.
+//
+// Launch geometry: one CUDA block of `kv_stride / 32` threads (caller
+// rounds the block size up to a multiple of warp size). The grid is fixed
+// at (1, 1, 1) — all blocks-of-32 for a single row fit in one CUDA block
+// for typical kv_stride values (≤ 8192 ≡ 256 quant blocks ≡ 256 threads).
+//
+// `kv_stride` is the row width in FP16 elements ( = num_kv_heads * head_dim ).
+// `total_blocks_per_row` = `kv_stride / 32`.
+
+extern "C" __global__ void quant_f16_to_q8_0_dyn(
+    const half* __restrict__ window_base,     // [window_size, kv_stride] FP16 ring
+    uint8_t* __restrict__ quant_base,         // [maxSeqLen, kv_stride/32 * 34] Q8_0
+    const int kv_stride,                      // row width (FP16 elements)
+    const int window_size,                    // ring slots
+    const int* __restrict__ pos_ptr)          // device-resident decode position
+{
+    int pos = pos_ptr[0];
+    int evict_pos = pos - window_size;
+    if (evict_pos < 0) return;                // predicated no-op
+
+    int block_idx_in_row = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_blocks_per_row = kv_stride / Q8_0_BLOCK_SIZE;
+    if (block_idx_in_row >= total_blocks_per_row) return;
+
+    int ring_slot = evict_pos % window_size;
+    const half* in = window_base
+        + (size_t)ring_slot * kv_stride
+        + (size_t)block_idx_in_row * Q8_0_BLOCK_SIZE;
+    uint8_t* out = quant_base
+        + (size_t)evict_pos * total_blocks_per_row * Q8_0_BLOCK_BYTES
+        + (size_t)block_idx_in_row * Q8_0_BLOCK_BYTES;
+
+    float max_abs = 0.0f;
+    float vals[Q8_0_BLOCK_SIZE];
+    #pragma unroll 8
+    for (int j = 0; j < Q8_0_BLOCK_SIZE; j++)
+    {
+        vals[j] = __half2float(in[j]);
+        float a = fabsf(vals[j]);
+        if (a > max_abs) max_abs = a;
+    }
+
+    float d = max_abs / 127.0f;
+    *reinterpret_cast<half*>(out) = __float2half(d);
+
+    int8_t* qs = reinterpret_cast<int8_t*>(out + 2);
+    if (d == 0.0f)
+    {
+        #pragma unroll 8
+        for (int j = 0; j < Q8_0_BLOCK_SIZE; j++)
+            qs[j] = 0;
+    }
+    else
+    {
+        float inv_d = 1.0f / d;
+        #pragma unroll 8
+        for (int j = 0; j < Q8_0_BLOCK_SIZE; j++)
+        {
+            int v = __float2int_rn(vals[j] * inv_d);
+            qs[j] = (int8_t)max(-127, min(127, v));
+        }
+    }
+}
+
+extern "C" __global__ void quant_f16_to_q4_0_dyn(
+    const half* __restrict__ window_base,
+    uint8_t* __restrict__ quant_base,
+    const int kv_stride,
+    const int window_size,
+    const int* __restrict__ pos_ptr)
+{
+    int pos = pos_ptr[0];
+    int evict_pos = pos - window_size;
+    if (evict_pos < 0) return;
+
+    int block_idx_in_row = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_blocks_per_row = kv_stride / Q4_0_BLOCK_SIZE;
+    if (block_idx_in_row >= total_blocks_per_row) return;
+
+    int ring_slot = evict_pos % window_size;
+    const half* in = window_base
+        + (size_t)ring_slot * kv_stride
+        + (size_t)block_idx_in_row * Q4_0_BLOCK_SIZE;
+    uint8_t* out = quant_base
+        + (size_t)evict_pos * total_blocks_per_row * Q4_0_BLOCK_BYTES
+        + (size_t)block_idx_in_row * Q4_0_BLOCK_BYTES;
+
+    float max_abs = 0.0f;
+    float vals[Q4_0_BLOCK_SIZE];
+    #pragma unroll 8
+    for (int j = 0; j < Q4_0_BLOCK_SIZE; j++)
+    {
+        vals[j] = __half2float(in[j]);
+        float a = fabsf(vals[j]);
+        if (a > max_abs) max_abs = a;
+    }
+
+    float d = max_abs / 7.0f;
+    *reinterpret_cast<half*>(out) = __float2half(d);
+
+    uint8_t* qs = out + 2;
+    if (d == 0.0f)
+    {
+        #pragma unroll 8
+        for (int j = 0; j < 16; j++)
+            qs[j] = 0x88;
     }
     else
     {

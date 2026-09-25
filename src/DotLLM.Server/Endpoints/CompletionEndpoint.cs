@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using DotLLM.Engine;
 using DotLLM.Server.Models;
+using DotLLM.Server.RateLimiting;
 
 namespace DotLLM.Server.Endpoints;
 
@@ -19,11 +20,24 @@ public static class CompletionEndpoint
         ServerState state,
         HttpContext httpContext)
     {
+        // (#369) Activate the requested model — see ChatCompletionEndpoint for the same pattern.
+        var activationError = await state.EnsureActiveAsync(request.Model, request.KeepAlive, httpContext.RequestAborted);
+        if (activationError is not null)
+        {
+            httpContext.Response.StatusCode = 400;
+            await httpContext.Response.WriteAsJsonAsync(
+                ErrorResponse.InvalidRequest(activationError, param: "model", code: "model_not_found"),
+                ServerJsonContext.Default.ErrorResponse,
+                contentType: null,
+                httpContext.RequestAborted);
+            return;
+        }
+
         if (!state.IsReady || state.Generator is null)
         {
             httpContext.Response.StatusCode = 503;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = "No model loaded" },
+                ErrorResponse.Internal("No model loaded", code: "model_not_loaded"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -36,7 +50,7 @@ public static class CompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = validationError },
+                ErrorResponse.InvalidRequest(validationError),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -48,6 +62,39 @@ public static class CompletionEndpoint
         var modelId = state.Options.ModelId;
         var generator = state.Generator;
 
+        // Validate prefix_id reference (Step 37).
+        if (!string.IsNullOrWhiteSpace(request.PrefixId))
+        {
+            var mgr = state.PrefixTrieManager;
+            if (mgr is null || mgr.InspectNamedPrefix(request.PrefixId) is null)
+            {
+                httpContext.Response.StatusCode = 400;
+                await httpContext.Response.WriteAsJsonAsync(
+                    ErrorResponse.InvalidRequest($"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first.", param: "prefix_id"),
+                    ServerJsonContext.Default.ErrorResponse,
+                    contentType: null,
+                    httpContext.RequestAborted);
+                return;
+            }
+        }
+
+        // Resolve LoRA adapter (if requested) — bad name → 400 with available list
+        DotLLM.Core.Lora.ILoraAdapter? adapter;
+        try
+        {
+            adapter = LoraEndpoints.Resolve(request.LoraAdapter, state);
+        }
+        catch (LoraAdapterNotFoundException ex)
+        {
+            httpContext.Response.StatusCode = 400;
+            await httpContext.Response.WriteAsJsonAsync(
+                ErrorResponse.InvalidRequest(ex.Message, param: "lora_adapter"),
+                ServerJsonContext.Default.ErrorResponse,
+                contentType: null,
+                httpContext.RequestAborted);
+            return;
+        }
+
         // Validate prompt length against model context
         int maxTokens = request.MaxTokens ?? state.SamplingDefaults.MaxTokens;
         var promptError = RequestValidator.ValidatePromptLength(
@@ -57,7 +104,7 @@ public static class CompletionEndpoint
         {
             httpContext.Response.StatusCode = 400;
             await httpContext.Response.WriteAsJsonAsync(
-                new ErrorResponse { Error = promptError },
+                ErrorResponse.InvalidRequest(promptError, param: "prompt", code: "context_length_exceeded"),
                 ServerJsonContext.Default.ErrorResponse,
                 contentType: null,
                 httpContext.RequestAborted);
@@ -72,22 +119,46 @@ public static class CompletionEndpoint
 
         if (request.Stream)
             await HandleStreamingAsync(generator, state, httpContext, request.Prompt, options,
-                requestId, modelId, ct);
+                requestId, modelId, adapter, request.WantsUsageChunk, ct);
         else
             await HandleNonStreamingAsync(generator, state, httpContext, request.Prompt, options,
-                requestId, modelId, ct);
+                requestId, modelId, adapter, ct);
     }
 
     private static async Task HandleNonStreamingAsync(
         TextGenerator generator, ServerState state, HttpContext httpContext,
         string prompt, DotLLM.Core.Configuration.InferenceOptions options,
-        string requestId, string modelId, CancellationToken ct)
+        string requestId, string modelId,
+        DotLLM.Core.Lora.ILoraAdapter? adapter,
+        CancellationToken ct)
     {
         InferenceResponse? result = null;
-        await state.ExecuteAsync(async () =>
+
+        // Route through the continuous-batch scheduler when it's the right shape for it: no LoRA
+        // adapter, no logprobs capture (scheduler doesn't surface per-token logprobs yet). Multiple
+        // concurrent requests pipeline through one model dispatch per scheduler iteration.
+        if (state.Scheduler is { } scheduler && adapter is null && !options.Logprobs)
         {
-            result = generator.Generate(prompt, options);
-        }, ct);
+            int[] promptIds = state.Tokenizer!.Encode(prompt);
+            var inferenceRequest = new InferenceRequest
+            {
+                TokenIds = promptIds,
+                Options = options,
+                // Carry the resolved API key (stashed by RateLimitMiddleware) for the scheduler's
+                // per-key admission fairness; null when rate limiting / key resolution is off.
+                ApiKey = httpContext.Items.TryGetValue(RateLimitMiddleware.ApiKeyItemKey, out var k)
+                    ? k as string
+                    : null,
+            };
+            result = await scheduler.EnqueueAsync(inferenceRequest, ct);
+        }
+        else
+        {
+            await state.ExecuteAsync(async () =>
+            {
+                result = generator.Generate(prompt, options, adapter: adapter);
+            }, ct);
+        }
 
         var logprobsDto = result!.Logprobs is { Length: > 0 }
             ? RequestConverter.ToLogprobsDto(result.Logprobs)
@@ -112,6 +183,10 @@ public static class CompletionEndpoint
             },
         };
 
+        // Report actuals to the rate-limit lease so unused token budget is refunded.
+        RateLimitMiddleware.GetLease(httpContext)
+            ?.ReportActualTokens(result.PromptTokenCount + result.GeneratedTokenCount);
+
         httpContext.Response.ContentType = "application/json";
         await JsonSerializer.SerializeAsync(httpContext.Response.Body, response, ServerJsonContext.Default.CompletionResponse, ct);
     }
@@ -119,16 +194,24 @@ public static class CompletionEndpoint
     private static async Task HandleStreamingAsync(
         TextGenerator generator, ServerState state, HttpContext httpContext,
         string prompt, DotLLM.Core.Configuration.InferenceOptions options,
-        string requestId, string modelId, CancellationToken ct)
+        string requestId, string modelId,
+        DotLLM.Core.Lora.ILoraAdapter? adapter,
+        bool includeUsageChunk,
+        CancellationToken ct)
     {
-        httpContext.Response.ContentType = "text/event-stream";
-        httpContext.Response.Headers.CacheControl = "no-cache";
-        httpContext.Response.Headers.Connection = "keep-alive";
+        // No Connection header: it is connection-specific and illegal over HTTP/2+. See SseResponse.
+        SseResponse.ApplyHeaders(httpContext);
+
+        int completionTokens = 0;
+        int promptTokens = 0;
 
         await state.ExecuteAsync(async () =>
         {
-            await foreach (var token in generator.GenerateStreamingTokensAsync(prompt, options, ct))
+            await foreach (var token in generator.GenerateStreamingTokensAsync(prompt, options, ct, adapter))
             {
+                if (token.Text.Length > 0) completionTokens++;
+                if (token.Timings.HasValue) promptTokens = token.Timings.Value.PrefillTokenCount;
+
                 var tokenLogprobs = token.Logprobs.HasValue
                     ? RequestConverter.ToLogprobsDto(token.Logprobs.Value)
                     : null;
@@ -151,6 +234,31 @@ public static class CompletionEndpoint
                 await httpContext.Response.Body.FlushAsync(ct);
             }
         }, ct);
+
+        // Report actuals to the rate-limit lease so unused token budget is refunded.
+        RateLimitMiddleware.GetLease(httpContext)
+            ?.ReportActualTokens(promptTokens + completionTokens);
+
+        // stream_options.include_usage (#450): usage-only chunk with an empty choices array,
+        // which is the shape the SDKs match on to close out their token accounting.
+        if (includeUsageChunk)
+        {
+            var usageChunk = new CompletionChunk
+            {
+                Id = requestId,
+                Model = modelId,
+                Choices = [],
+                Usage = new UsageDto
+                {
+                    PromptTokens = promptTokens,
+                    CompletionTokens = completionTokens,
+                    TotalTokens = promptTokens + completionTokens,
+                },
+            };
+            await httpContext.Response.WriteAsync("data: ", ct);
+            await JsonSerializer.SerializeAsync(httpContext.Response.Body, usageChunk, ServerJsonContext.Default.CompletionChunk, ct);
+            await httpContext.Response.WriteAsync("\n\n", ct);
+        }
 
         await httpContext.Response.WriteAsync("data: [DONE]\n\n", ct);
         await httpContext.Response.Body.FlushAsync(ct);

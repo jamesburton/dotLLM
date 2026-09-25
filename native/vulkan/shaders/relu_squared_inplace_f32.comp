@@ -1,0 +1,28 @@
+#version 450
+// In-place squared-ReLU activation: x[i] = max(0, x[i])^2
+//
+// Mirrors DotLLM.Cpu.Kernels.ReluSquared.Execute. Used by NVIDIA Nemotron-H
+// MLP layers as a non-gated replacement for SwiGLU — the post-up-projection
+// activation buffer is rewritten in place.
+//
+// Pointwise, no reduction — one thread per element.
+// Dispatch:
+//   local_size_x = 256
+//   groupCount.x = ceil(n / 256)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer BufX { float x[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+
+    float v = x[i];
+    float r = max(v, 0.0);
+    x[i] = r * r;
+}

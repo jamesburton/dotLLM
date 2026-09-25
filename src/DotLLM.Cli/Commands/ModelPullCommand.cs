@@ -66,6 +66,9 @@ internal sealed class ModelPullCommand : AsyncCommand<ModelPullCommand.Settings>
                 var task = ctx.AddTask($"[green]{filename.EscapeMarkup()}[/]", maxValue: 100);
                 long? lastTotal = null;
 
+                // Ticks are posted to the thread pool, so a stale one can land after the download
+                // returns and leave the bar short — cosmetic only here, unlike the server job state
+                // this same pattern corrupted (#521); the bar is torn down on return either way.
                 var progress = new Progress<(long bytesDownloaded, long? totalBytes)>(p =>
                 {
                     if (p.totalBytes.HasValue)

@@ -163,28 +163,28 @@ public class RegexParserTests
     public void Parse_Backreference_Throws()
     {
         var ex = Assert.Throws<ArgumentException>(() => RegexParser.Parse("(a)\\1"));
-        Assert.Contains("Backreferences", ex.Message);
+        Assert.Contains("Backreferences", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
     public void Parse_Lookahead_Throws()
     {
         var ex = Assert.Throws<ArgumentException>(() => RegexParser.Parse("(?=a)b"));
-        Assert.Contains("Lookahead", ex.Message);
+        Assert.Contains("Lookahead", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
     public void Parse_LazyQuantifier_Throws()
     {
         var ex = Assert.Throws<ArgumentException>(() => RegexParser.Parse("a*?"));
-        Assert.Contains("Lazy quantifiers", ex.Message);
+        Assert.Contains("Lazy quantifiers", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
     public void Parse_Anchor_Throws()
     {
         var ex = Assert.Throws<ArgumentException>(() => RegexParser.Parse("^abc$"));
-        Assert.Contains("Anchors", ex.Message);
+        Assert.Contains("Anchors", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# GPU access mutex — single-holder file-based lock.
+#
+# Why: concurrent CUDA contexts on the same device trip CUDA_ERROR_ILLEGAL_ADDRESS
+# (error 700) in cuCtxCreate_v2. dotLLM's GPU tests + benchmarks each create their
+# own context. Only one such process at a time is safe. Non-GPU work (code editing,
+# doc writes, design) is fully parallelisable and should NOT take this lock.
+#
+# Lock primitive: a directory at $LOCK_DIR. mkdir is atomic on every filesystem
+# we care about (NTFS via MSYS2, ext4, APFS). Holder metadata lives in
+# $LOCK_DIR/holder as a single line: PID|NAME|EPOCH|REASON.
+#
+# Staleness: timestamp-only. If the holder file's recorded epoch is older than
+# stale-sec (default 5400 = 90 min), the lock is considered abandoned and any
+# acquire will force-release it.
+#
+# WHY 90 MINUTES AND NOT 30: the default must exceed the longest LEGITIMATE single
+# operation, or it force-releases a live holder. A full Vulkan suite takes ~46 min on
+# this box, so the old 1800s default force-released real work at the 30-minute mark —
+# observed 2026-09-21, where one agent took the lock out from under another whose
+# testhost was demonstrably still running, mid-measurement. Staleness recovery is a
+# safety net for crashed holders, not a scheduling mechanism; err long. Anything
+# expected to run past this MUST call `refresh` periodically. Agents must call `release` promptly when their
+# GPU operation finishes; PIDs are not used for liveness because a bash one-shot
+# script's $$ doesn't outlive the operation it protects.
+#
+# Usage:
+#   gpu-lock.sh acquire <name> <reason> [timeout-sec=900] [stale-sec=5400]
+#   gpu-lock.sh refresh <name>           # bump timestamp during long operations
+#   gpu-lock.sh release <name>           # idempotent; only releases if you own it
+#   gpu-lock.sh status                   # prints holder or "FREE"
+#   gpu-lock.sh force-clear              # admin override (overseer only)
+#
+# Exit codes:
+#   0  success (acquire took the lock; release / status / force-clear ran cleanly)
+#   1  acquire timed out, OR release was a no-op because we don't own the lock
+#   2  bad arguments
+
+set -u
+
+# ── WSL guard ───────────────────────────────────────────────────────────────────
+# This lock exists to serialise access to ONE physical GPU across every process on
+# this Windows box. Under WSL's bash the script would resolve a DIFFERENT lock
+# directory (a /mnt/c path, or a Linux-side one), so two holders could each "acquire"
+# and both run on the GPU — mutual exclusion silently absent while every command
+# reports success. That is strictly worse than failing.
+#
+# This is not hypothetical. On 2026-09-21 an agent invoked `bash scripts/gpu-lock.sh
+# refresh <name>` from PowerShell, where `bash` on PATH is C:\WINDOWS\system32ash.exe
+# — WSL's bash. It could not see the Windows path at all, exited 127 on every call,
+# and the output was piped away, so the refreshes failed SILENTLY for 30 minutes and
+# the holder was force-released mid-measurement.
+#
+# From PowerShell, call Git bash by its full path:
+#   & "C:\Program Files\Gitinash.exe" scripts/gpu-lock.sh refresh <name>
+# or use the Bash tool, where `bash` is already Git bash.
+if [ -r /proc/version ] && grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
+    echo "[gpu-lock] REFUSING TO RUN UNDER WSL BASH." >&2
+    echo "[gpu-lock] The lock dir would differ from the Windows one, so this would provide" >&2
+    echo "[gpu-lock] NO mutual exclusion while appearing to succeed. Use Git bash:" >&2
+    echo "[gpu-lock]   & \"C:\Program Files\Git\bin\bash.exe\" scripts/gpu-lock.sh ..." >&2
+    exit 3
+fi
+
+# Default: <PRIMARY worktree>/.gpu-lock. Resolving to the *primary* worktree rather than
+# "the checkout this script lives in" is load-bearing: the lock exists to serialise access to
+# ONE physical GPU, so every worktree on the box must converge on the SAME directory.
+#
+# The old default (`dirname $0/..`) gave each worktree a PRIVATE lock, so parallel agents each
+# acquired "the" lock and ran on the GPU simultaneously — every acquire succeeded and the
+# contention was invisible. Any measurement taken from a worktree while another agent was
+# running is therefore suspect.
+#
+# `git rev-parse --git-common-dir` yields the primary checkout's .git even from a linked
+# worktree (where --git-dir points at .git/worktrees/<name>), so its parent is the primary
+# worktree. Falls back to the old behaviour outside a git repo. Override with
+# DOTLLM_GPU_LOCK_DIR to share a lock across unrelated clones on the same box.
+_gpu_lock_default_dir() {
+    local common
+    if common=$(git -C "$(dirname "$0")" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+       && [ -n "$common" ]; then
+        (cd "$common/.." && pwd)
+    else
+        (cd "$(dirname "$0")/.." && pwd)
+    fi
+}
+LOCK_DIR="${DOTLLM_GPU_LOCK_DIR:-$(_gpu_lock_default_dir)/.gpu-lock}"
+HOLDER_FILE="$LOCK_DIR/holder"
+
+cmd="${1:-}"
+
+case "$cmd" in
+  acquire)
+    name="${2:-}"
+    reason="${3:-}"
+    timeout_sec="${4:-900}"
+    stale_sec="${5:-5400}"
+    if [ -z "$name" ] || [ -z "$reason" ]; then
+      echo "[gpu-lock] acquire requires <name> and <reason>" >&2
+      exit 2
+    fi
+
+    start=$(date +%s)
+    while true; do
+      # Try to take the lock atomically.
+      if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s|%s|%s|%s\n' "$$" "$name" "$(date +%s)" "$reason" > "$HOLDER_FILE"
+        echo "[gpu-lock] acquired by '$name' (pid $$): $reason"
+        exit 0
+      fi
+
+      # Lock held — inspect holder to see if it's stale by timestamp.
+      if [ -f "$HOLDER_FILE" ]; then
+        IFS='|' read -r holder_pid holder_name holder_epoch holder_reason < "$HOLDER_FILE" 2>/dev/null
+        now=$(date +%s)
+        age=$((now - ${holder_epoch:-0}))
+        if [ "$age" -gt "$stale_sec" ]; then
+          echo "[gpu-lock] forcing release of stale lock ('$holder_name', age ${age}s > ${stale_sec}s)" >&2
+          rm -rf "$LOCK_DIR"
+          continue
+        fi
+      else
+        # Directory exists but no holder file — racy state. Wait briefly.
+        :
+      fi
+
+      now=$(date +%s)
+      elapsed=$((now - start))
+      if [ "$elapsed" -ge "$timeout_sec" ]; then
+        echo "[gpu-lock] timed out after ${elapsed}s waiting for lock (held by '${holder_name:-?}', $((now - ${holder_epoch:-now}))s old: ${holder_reason:-?})" >&2
+        exit 1
+      fi
+      sleep 3
+    done
+    ;;
+
+  release)
+    name="${2:-}"
+    if [ -z "$name" ]; then
+      echo "[gpu-lock] release requires <name>" >&2
+      exit 2
+    fi
+    if [ ! -d "$LOCK_DIR" ]; then
+      echo "[gpu-lock] release: no lock held (no-op)"
+      exit 0
+    fi
+    if [ -f "$HOLDER_FILE" ]; then
+      IFS='|' read -r holder_pid holder_name holder_epoch holder_reason < "$HOLDER_FILE" 2>/dev/null
+      if [ "$holder_name" != "$name" ]; then
+        echo "[gpu-lock] release refused: lock held by '$holder_name' (pid $holder_pid), not '$name'" >&2
+        exit 1
+      fi
+    fi
+    rm -rf "$LOCK_DIR"
+    echo "[gpu-lock] released by '$name'"
+    exit 0
+    ;;
+
+  refresh)
+    name="${2:-}"
+    if [ -z "$name" ]; then
+      echo "[gpu-lock] refresh requires <name>" >&2
+      exit 2
+    fi
+    if [ ! -f "$HOLDER_FILE" ]; then
+      echo "[gpu-lock] refresh: no lock currently held" >&2
+      exit 1
+    fi
+    IFS='|' read -r holder_pid holder_name holder_epoch holder_reason < "$HOLDER_FILE" 2>/dev/null
+    if [ "$holder_name" != "$name" ]; then
+      echo "[gpu-lock] refresh refused: lock held by '$holder_name', not '$name'" >&2
+      exit 1
+    fi
+    printf '%s|%s|%s|%s\n' "$holder_pid" "$name" "$(date +%s)" "$holder_reason" > "$HOLDER_FILE"
+    echo "[gpu-lock] refreshed by '$name'"
+    exit 0
+    ;;
+
+  status)
+    if [ ! -d "$LOCK_DIR" ]; then
+      echo "FREE"
+      exit 0
+    fi
+    if [ -f "$HOLDER_FILE" ]; then
+      IFS='|' read -r holder_pid holder_name holder_epoch holder_reason < "$HOLDER_FILE" 2>/dev/null
+      now=$(date +%s)
+      age=$((now - ${holder_epoch:-0}))
+      echo "HELD name='$holder_name' pid=$holder_pid age=${age}s reason='$holder_reason'"
+      exit 0
+    fi
+    echo "HELD (no metadata)"
+    exit 0
+    ;;
+
+  force-clear)
+    rm -rf "$LOCK_DIR"
+    echo "[gpu-lock] force-cleared"
+    exit 0
+    ;;
+
+  *)
+    echo "Usage: $0 {acquire <name> <reason> [timeout-sec] [stale-sec] | refresh <name> | release <name> | status | force-clear}" >&2
+    exit 2
+    ;;
+esac
