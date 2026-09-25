@@ -66,6 +66,59 @@ useful as a deliberate discriminator, but do not run cross-backend parity with i
 CPU↔CPU and CPU↔CUDA attention tolerances were calibrated against the approximation and are now
 looser than they need to be; each says so in place.
 
+### KV-cache-length invariance (#525) — CPU
+
+A query position's attention output depends **only on the keys that position can see**. The CPU
+kernel computes, softmaxes and accumulates over `[visibleStart, visibleEnd)` — bounds derived from
+the query's own position, the mask mode and the sliding window — and never touches the rest of the
+KV cache. The dense/tiled choice is made **per row on that visible length**, not per call on
+`seqQ * seqKv`.
+
+This is a correctness property, not a tidiness one. The previous implementation materialised the
+full padded `seqKv` row, wrote `-inf` into the invisible entries, and reduced the *whole* row.
+`-inf` padding contributes exactly `0.0` to the sum, so the result is mathematically identical —
+but changing the span length changes SIMD lane assignment and the remainder tail, so the real
+elements accumulate in a different order and the last ULP of the softmax denominator moves with the
+cache length. Measured directly on the kernel: a 3-row causal chunk changed in 757 of 1728 outputs
+when the declared cache grew, worst `1.19E-07`; the dense→tiled dispatch flip at `seqKv` 682→683
+changed 855 of 1728, worst `1.27E-07`. Shorter visible prefixes are worse (98% of rows at 3 visible
+keys vs 8% at 17).
+
+On a quantized model that ULP is not absorbed. On SmolLM-135M Q8_0 it digitised at layer 21 into
+exactly **one int8 value of 576, by one step**, which `o_proj` amplified ~14,600× and which by layer
+29 changed the emitted token — so the same prompt produced different text depending only on how
+prefill happened to be batched (chunked prefill, and by extension continuous batching, prefix-cache
+hits and speculative verify widths). The F32-decoded control carried the same seed and never
+crossed a threshold, which is why this was invisible outside quantized runs.
+
+Guarded by `AttentionKvLengthInvarianceTests` (bit-exact, kernel level, incl. the head-parallel
+worker, sliding window, soft-cap, ALiBi and sinks) and `ChunkedPrefillInvarianceTests` (logits, not
+sampled tokens — argmax insensitivity is what hid this — swept over prompt length × chunk size on
+Q8_0 with an F32-decoded sensitivity control).
+
+Reduction order was not the whole mechanism. `FastMath.ExpSumAndStore` clamps its shifted input at
+`MinClamp = -87.3` in **both** the precise and the approximate exp paths, so a masked `-inf` entry
+did not become exactly `0` — it became `exp(-87.3) ≈ 1.3e-38`. Every padding column therefore added
+a term to the softmax denominator, and the number of those terms was the KV-cache length. It also
+makes the `w == 0f` short-circuit comment in `WeightedValues` ("exp(-inf) is exactly 0f") wrong on
+the padded path. The visible-prefix form removes both: invisible keys are never scored, so nothing
+is clamped and nothing is accumulated.
+
+The work saved is confined to the dense path: prompts short enough to take it (`seqQ * seqKv * 4 <=
+8192`, so ≈45 tokens single-pass, or any chunk of a chunked prefill) now score a triangle instead of
+a square. The tiled path already walked only the visible range, so long-prompt prefill and decode
+are neutral. Treat the change as correctness-motivated, not a perf win.
+
+> The `#501` fast-exp figures above were measured against the padded reduction. They compare
+> fast-exp on vs off, and both arms shifted by the same ULPs, so the comparison stands; the absolute
+> attention outputs on either arm have changed by ~1e-7. A re-measurement (#531) will run against
+> the new reduction.
+
+Decode numerics are unchanged **without** a sliding window: a decode row's visible length equals the
+declared `seqKv`, and the one-shot threshold is the same 8 KiB budget in floats. With a sliding
+window, decode previously softmaxed over `seqKv` with the out-of-window entries masked and now
+softmaxes over `window` entries — a genuine (ULP-scale) change on Gemma-2/3 and Mistral-style models.
+
 ### Sliding Window
 
 Mask modifier, not separate mechanism. Limits attention to `[pos - window_size, pos]`. KV-cache evicts older entries. Configured via `ModelConfig.SlidingWindowSize`.
