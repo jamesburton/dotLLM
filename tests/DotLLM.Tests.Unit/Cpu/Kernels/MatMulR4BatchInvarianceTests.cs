@@ -155,7 +155,7 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
             // Measured worst case 4.304E-006 relative (max over all outputs; the small-magnitude
             // ones dominate the ratio). 1e-5 is ~2.3x headroom — tight enough to notice growth.
             Assert.True(f.MaxRelativeDifference() < 1e-5f,
-                $"Q8_0 R4-vs-row-major divergence grew beyond the recorded bound: {f.MaxRelativeDifference():E3}");
+                $"Q8_0 R4-vs-row-major divergence grew beyond the recorded bound: {f.WorstPair()}");
         }
         finally
         {
@@ -342,6 +342,22 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
             return false;
         }
 
+        public string WorstPair()
+        {
+            int worstIdx = 0;
+            float worst = -1;
+            float worstAbs = 0;
+            for (int i = 0; i < _n * M; i++)
+            {
+                float denom = MathF.Max(MathF.Abs(Expected[i]), 1e-6f);
+                float rel = MathF.Abs(Expected[i] - Actual[i]) / denom;
+                worstAbs = MathF.Max(worstAbs, MathF.Abs(Expected[i] - Actual[i]));
+                if (rel > worst) { worst = rel; worstIdx = i; }
+            }
+
+            return $"worst rel {worst:E3} at [{worstIdx}] expected={Expected[worstIdx]:R} actual={Actual[worstIdx]:R}; max abs {worstAbs:E3}";
+        }
+
         public float MaxRelativeDifference()
         {
             float worst = 0;
@@ -431,7 +447,16 @@ public sealed unsafe class MatMulR4BatchInvarianceTests
                     Unsafe.WriteUnaligned(block, (Half)(rng.NextSingle() * 0.1f));
                     Unsafe.WriteUnaligned(block + 2, (Half)(rng.NextSingle() * 0.1f));
                     break;
-                default: // Q5_0, Q8_0: Half scale at offset 0
+                case Q8_0BlockBytes:
+                    Unsafe.WriteUnaligned(block, (Half)(rng.NextSingle() * 0.1f));
+                    // Q8_0 payload is sbyte. Real quantizers emit [-127, 127]; -128 (0x80) is
+                    // out of domain and the VNNI tier's abs/sign emulation does not handle it
+                    // (|-128| is still -128 in int8), so random bytes would compare two kernels
+                    // on input neither is specified for.
+                    for (int i = 2; i < Q8_0BlockBytes; i++)
+                        if (block[i] == 0x80) block[i] = 0x81;
+                    break;
+                default: // Q5_0: Half scale at offset 0, then unsigned nibbles
                     Unsafe.WriteUnaligned(block, (Half)(rng.NextSingle() * 0.1f));
                     break;
             }
