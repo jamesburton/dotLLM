@@ -52,6 +52,7 @@ public sealed class Probe533FixCandidateTests
         "attention_flash_f32_coopmat_v1scalarqk",
         "attention_flash_f32_coopmat_v2scalarpv",
         "attention_flash_f32_coopmat_v3duppad",
+        "attention_flash_f32_coopmat_v5safetile",
     ];
 
     private readonly ITestOutputHelper _out;
@@ -242,6 +243,40 @@ public sealed class Probe533FixCandidateTests
                         (cb, b) => { for (int i = 0; i < b; i++) baseline.Record(cb, bufQ, bufK, bufV, bufO, seqQ, seqKv, nh, nkv, hd); },
                         (cb, b) => { for (int i = 0; i < b; i++) cand.Record(cb, bufQ, bufK, bufV, bufO, seqQ, seqKv, nh, nkv, hd); });
 
+                    double ratio = c.Median > 0 ? r.Median / c.Median : 0;
+                    sb.AppendLine(string.Create(CultureInfo.InvariantCulture,
+                        $"| {tag} | {r.Median:F2} ({r.Min:F2}-{r.Max:F2}) | {c.Median:F2} ({c.Min:F2}-{c.Max:F2}) | {ratio:F3}x |"));
+                }
+            }
+        }
+
+        // Candidate 4 (gate coopmat FA off on AMD) costs exactly "the scalar FA
+        // kernel instead of the coopmat one", at EVERY shape — measure it the
+        // same way.
+        using (var scalarFa = VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir))
+        {
+            if (scalarFa is not null)
+            {
+                sb.AppendLine();
+                sb.AppendLine("### baseline -> scalar FA kernel (candidate 4: coopmat gated off)");
+                sb.AppendLine("| shape | baseline us (min-max) | scalar FA us (min-max) | speedup (median) |");
+                sb.AppendLine("|---|---:|---:|---:|");
+                var rng2 = new Random(0x534);
+                foreach (var (tag, seqQ, seqKv, nh, nkv, hd) in Shapes)
+                {
+                    long qBytes = (long)seqQ * nh * hd * sizeof(float);
+                    long kvBytes = (long)seqKv * nkv * hd * sizeof(float);
+                    using var bufQ = device.Allocate(qBytes);
+                    using var bufK = device.Allocate(kvBytes);
+                    using var bufV = device.Allocate(kvBytes);
+                    using var bufO = device.Allocate(qBytes);
+                    device.Upload(RandomFloats(rng2, (int)(qBytes / sizeof(float))), bufQ);
+                    device.Upload(RandomFloats(rng2, (int)(kvBytes / sizeof(float))), bufK);
+                    device.Upload(RandomFloats(rng2, (int)(kvBytes / sizeof(float))), bufV);
+
+                    var (r, c) = MeasurePaired(device,
+                        (cb, b) => { for (int i = 0; i < b; i++) baseline.Record(cb, bufQ, bufK, bufV, bufO, seqQ, seqKv, nh, nkv, hd); },
+                        (cb, b) => { for (int i = 0; i < b; i++) scalarFa.Record(cb, bufQ, bufK, bufV, bufO, seqQ, seqKv, nh, nkv, hd); });
                     double ratio = c.Median > 0 ? r.Median / c.Median : 0;
                     sb.AppendLine(string.Create(CultureInfo.InvariantCulture,
                         $"| {tag} | {r.Median:F2} ({r.Min:F2}-{r.Max:F2}) | {c.Median:F2} ({c.Min:F2}-{c.Max:F2}) | {ratio:F3}x |"));
