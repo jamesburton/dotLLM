@@ -211,11 +211,28 @@ public sealed class Probe533FixCandidateTests
         // not discriminating anything (it passed for months while REPORTING
         // the defect — that is the landmine this assert removes).
         Assert.Equal(0L, differingByCandidate["attention_flash_f32_coopmat"]);
-        if (differingByCandidate.TryGetValue("attention_flash_f32_coopmat_pre533", out long pre))
-            Assert.True(pre > 0,
-                "The pre-#533-fix control shader came back invariant too — either the driver " +
-                "changed or the control is no longer the pre-fix code. This test no longer " +
+
+        // The control must fire — but ONLY on hardware that actually has the
+        // defect. #533 is an AMD implementation property: the same committed
+        // SPIR-V is exactly 0-differing at every length on an RTX 3060, which is
+        // how the issue was decided in the first place. So a clean control on a
+        // non-AMD device is the EXPECTED cross-vendor result, not a broken
+        // control, and failing there would make every NVIDIA/Intel run red for a
+        // bug that vendor does not have. On AMD a clean control is exactly the
+        // landmine this assert exists to catch (the sweep passed for months while
+        // merely REPORTING the defect), so there it still fails.
+        const uint VendorAmd = 0x1002;
+        if (differingByCandidate.TryGetValue("attention_flash_f32_coopmat_pre533", out long pre) && pre == 0)
+        {
+            Skip.IfNot(device.VendorId == VendorAmd,
+                $"pre-#533 control is invariant on this device (VendorId 0x{device.VendorId:X4}), " +
+                "which is the expected non-AMD result — the fix arm above is clean but this run " +
+                "cannot demonstrate that the test discriminates. Run it on AMD for that.");
+            Assert.Fail(
+                "The pre-#533-fix control shader came back invariant on an AMD device — either the " +
+                "driver changed or the control is no longer the pre-fix code. This test no longer " +
                 "discriminates the fix; re-derive the control before trusting it.");
+        }
     }
 
     // ─────────────────────────────────────────────────────────────
