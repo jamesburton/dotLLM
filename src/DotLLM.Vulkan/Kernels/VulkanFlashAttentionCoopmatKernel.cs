@@ -156,7 +156,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     /// <summary>KV tile columns per workgroup iteration (Bc).</summary>
     public const int KvTileCols = 64;
 
-    private const int PushConstantBytes = 13 * sizeof(uint);
+    private const int PushConstantBytes = 12 * sizeof(uint);
 
     /// <summary>PCI vendor ID of AMD, whose coopmat P.V needs the #533 safe-tile gate.</summary>
     private const uint VendorAmd = 0x1002;
@@ -165,10 +165,11 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     private const uint VendorNvidia = 0x10DE;
 
     /// <summary>
-    /// #533: whether this device needs the KV-length-invariant P.V path (1) or can
-    /// run coopmat over every tile (0).
+    /// #533: whether this kernel's pipelines were specialized to the
+    /// KV-length-invariant P.V path (1) or to plain all-coopmat (0). Test-visible
+    /// so a probe can print which variant it actually built.
     /// </summary>
-    private readonly uint _requireInvariantPv;
+    internal uint RequireInvariantPv { get; }
 
     /// <summary>
     /// #533 vendor policy. The defect — coopmat P.V not reproducing the same
@@ -217,7 +218,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         uint requireInvariantPv)
     {
         _device = device;
-        _requireInvariantPv = requireInvariantPv;
+        RequireInvariantPv = requireInvariantPv;
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
@@ -306,6 +307,13 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
 
         uint requiredSubgroupSize = (uint)variant.RequiredSubgroupSize;
 
+        // #533: resolved ONCE here and given to BOTH pipelines. A pipeline that
+        // misses the specialization silently defaults to 1 (the gate), which on
+        // the hd64 pipeline would look like "the fix did not recover its cost"
+        // rather than like a wiring bug — so both call sites pass `spec`.
+        uint gate = requireInvariantPv ?? RequiresInvariantPv(device.VendorId);
+        ReadOnlySpan<uint> spec = stackalloc uint[1] { gate };
+
         VulkanModule module = VulkanModule.LoadFromFile(device, path);
         ComputePipeline pipeline;
         try
@@ -319,7 +327,8 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
                 entryPoint: "main",
                 bindings: bindings,
                 pushConstantBytes: PushConstantBytes,
-                requiredSubgroupSize: requiredSubgroupSize);
+                requiredSubgroupSize: requiredSubgroupSize,
+                specConstants: spec);
         }
         catch
         {
@@ -345,7 +354,8 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
                     entryPoint: "main",
                     bindings: bindings,
                     pushConstantBytes: PushConstantBytes,
-                    requiredSubgroupSize: requiredSubgroupSize);
+                    requiredSubgroupSize: requiredSubgroupSize,
+                    specConstants: spec);
                 // Separate pool per pipeline: DescriptorSetCache.Reset() calls
                 // vkResetDescriptorPool on its whole pool, which would silently
                 // invalidate the OTHER pipeline's still-referenced sets
@@ -363,8 +373,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
         return new VulkanFlashAttentionCoopmatKernel(
-            device, module, pipeline, pool, hd64Module, hd64Pipeline, hd64Pool,
-            requireInvariantPv ?? RequiresInvariantPv(device.VendorId));
+            device, module, pipeline, pool, hd64Module, hd64Pipeline, hd64Pool, gate);
     }
 
     /// <summary>
@@ -471,7 +480,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
             cmdBuf, VkPipelineBindPoint.Compute, pipeline.Layout,
             0, 1, descriptorSet, 0, 0);
 
-        Span<uint> pc = stackalloc uint[13];
+        Span<uint> pc = stackalloc uint[12];
         pc[0]  = (uint)seqQ;
         pc[1]  = (uint)seqKv;
         pc[2]  = (uint)numHeads;
@@ -484,7 +493,6 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         pc[9]  = BitConverter.SingleToUInt32Bits(scaleOverride);
         pc[10] = (uint)maskMode;
         pc[11] = (uint)prefixLen;
-        pc[12] = _requireInvariantPv;
         fixed (uint* pcPtr = pc)
         {
             VulkanApi.vkCmdPushConstants(

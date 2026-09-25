@@ -111,8 +111,17 @@ layout(push_constant) uniform PushConstants {
     float scaleOverride;   // 0.0 = use 1/sqrt(headDim), >0 = use this scale (Gemma 3 QPAS)
     uint  maskMode;        // 0 = Causal, 1 = Bidirectional, 2 = Hybrid (diffusion canvas)
     uint  prefixLen;       // Hybrid only: positions < prefixLen stay causal, >= are bidirectional
-    uint  requireInvariantPv; // #533: 0 = coopmat P.V for every tile (pre-fix path), 1 = safe-tile gate
 } pc;
+
+// #533 — SPECIALIZATION constant, deliberately not a push constant. It must be
+// substituted BEFORE the driver's backend compiler runs, so that with the gate
+// off the scalar tail below is dead code and costs no registers. A uniform push
+// constant was tried first and MEASURED: on an RTX 3060 it recovered nothing at
+// the seqKv >= 640 hd64 shape (0.82x either way), because the scalar path's
+// register pressure is paid at compile time whether or not it executes.
+// Defaults to 1: a pipeline created without specialization data must fail SAFE,
+// toward the invariant path.
+layout(constant_id = 0) const uint REQUIRE_INVARIANT_PV = 1u;
 
 // Causal-component mask — byte-identical semantics to attention_flash_f32.comp
 // and the CPU reference (DotLLM.Cpu.Kernels.Attention.ApplyMask).
@@ -377,7 +386,7 @@ void main() {
         // 0-differing at every length on this same SPIR-V, so NVIDIA does not
         // pay the scalar tail for a bug it does not have. Anything not measured
         // clean gets the gate.
-        bool tileSafe = (pc.requireInvariantPv == 0u)
+        bool tileSafe = (REQUIRE_INVARIANT_PV == 0u)
             || ((tileLen == uint(BC))
                 && (pc.maskMode == 1u || (tStart + uint(BC)) <= firstPosQ + 1u));
         if (!tileSafe) {

@@ -962,3 +962,31 @@ internal struct VkShaderStatisticsInfoAmd
     internal uint computeWorkGroupSizeY;
     internal uint computeWorkGroupSizeZ;
 }
+
+/// <summary>
+/// One entry of a <see cref="VkSpecializationInfo"/> map: which
+/// <c>constant_id</c> in the SPIR-V takes its value from which offset of the
+/// supplied data blob.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkSpecializationMapEntry
+{
+    internal uint constantID;
+    internal uint offset;
+    internal nuint size;
+}
+
+/// <summary>
+/// Specialization constants for a shader stage. Unlike a push constant, these
+/// are substituted BEFORE the driver's backend compiler runs, so branches on
+/// them fold away and the dead side costs no registers — which is the whole
+/// point of using one here (see #533).
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkSpecializationInfo
+{
+    internal uint mapEntryCount;
+    internal nint pMapEntries;
+    internal nuint dataSize;
+    internal nint pData;
+}

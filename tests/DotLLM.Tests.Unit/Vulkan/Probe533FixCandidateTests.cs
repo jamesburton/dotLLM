@@ -145,7 +145,7 @@ public sealed class Probe533FixCandidateTests
                 bool hd64 = File.Exists(Path.Combine(
                     spvDir, (name == GateOffCandidate ? "attention_flash_f32_coopmat" : name) + "_hd64.spv"));
                 sb.AppendLine();
-                sb.AppendLine($"### {name}  (hd64 spv present: {hd64})");
+                sb.AppendLine($"### {name}  (hd64 spv present: {hd64}, REQUIRE_INVARIANT_PV={kernel.RequireInvariantPv})");
 
                 long totalDiff = 0;
 
