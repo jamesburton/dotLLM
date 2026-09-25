@@ -260,42 +260,62 @@ public class Probe532CudaAttentionKvLengthTests
         using var kernels = new CudaKernels(ptxDir!);
         Skip.IfNot(kernels.HasAttentionF32SplitKv, "attention_f32_split_kv not present in PTX (stale build)");
 
-        const int numHeads = 24, numKvHeads = 4, headDim = 256;
-        Skip.IfNot(kernels.IsAttentionSplitKvSafe(numHeads, headDim),
-            $"split-KV cooperative launch not safe for numHeads={numHeads}, headDim={headDim}");
-
         int split = CudaKernels.AttentionKvSplit;
         var sb = new StringBuilder();
-        sb.AppendLine($"=== CUDA SPLIT-KV attention_f32_split_kv — ATTN_KV_SPLIT={split} ===");
+        sb.AppendLine($"=== CUDA SPLIT-KV attention_f32_split_kv — ATTN_KV_SPLIT={split} (compile-time) ===");
+        sb.AppendLine("NOTE: ATTN_KV_SPLIT is a COMPILE-TIME constant here, so the Vulkan 'change the");
+        sb.AppendLine("      split COUNT while splitLen holds' arm is not constructible on CUDA. The");
+        sb.AppendLine("      only available axis is chunk LENGTH = ceil(seqKv/4). Pairs below include");
+        sb.AppendLine("      NEGATIVE CONTROLS where padding grows but ceil(seqKv/4) is unchanged —");
+        sb.AppendLine("      those must read 0 if the mechanism really is boundary movement.");
         long worst = 0;
+        int shapesRun = 0;
 
-        foreach (var (baseKv, padKv) in new[]
-                 {
-                     (1024, 1025), (1024, 1028), (1024, 1052), (1024, 1100),
-                     (600, 601), (600, 604), (600, 628),
-                     (1300, 1304), (1300, 1400),
-                 })
+        foreach (var (numHeads, numKvHeads, headDim) in new[] { (24, 4, 256), (8, 2, 128) })
         {
-            int c0 = (baseKv + split - 1) / split;
-            int c1 = (padKv + split - 1) / split;
-            bool moves = c0 != c1;
+            if (!kernels.IsAttentionSplitKvSafe(numHeads, headDim))
+            {
+                sb.AppendLine($"  [SHAPE SKIPPED] nh={numHeads} nkv={numKvHeads} hd={headDim}: " +
+                              "cooperative launch not safe on this device");
+                continue;
+            }
+            shapesRun++;
+            sb.AppendLine($"  -- shape nh={numHeads} nkv={numKvHeads} hd={headDim} --");
 
-            int posOff = baseKv - 1;
-            var rng = new Random(0x532 + baseKv * 31 + padKv * 7 + 2000);
-            float[] q = Rand(rng, numHeads * headDim);
-            float[] k = Rand(rng, padKv * numKvHeads * headDim);
-            float[] v = Rand(rng, padKv * numKvHeads * headDim);
-            int outLen = numHeads * headDim;
-            float[] a = new float[outLen], b = new float[outLen];
+            foreach (var (baseKv, padKv) in new[]
+                     {
+                         // NEGATIVE CONTROLS: padding grows, ceil(seqKv/4) does NOT change.
+                         (1021, 1022), (1021, 1023), (1021, 1024),
+                         (597, 600), (1297, 1300),
+                         // POSITIVE: ceil(seqKv/4) changes, so a chunk boundary moves.
+                         (1024, 1025), (1024, 1028), (1024, 1052), (1024, 1100),
+                         (600, 601), (600, 604), (600, 628),
+                         (1300, 1304), (1300, 1400),
+                     })
+            {
+                int c0 = (baseKv + split - 1) / split;
+                int c1 = (padKv + split - 1) / split;
+                bool moves = c0 != c1;
 
-            RunSplitPair(kernels, stream, q, k, v, a, b,
-                baseKv, padKv, numHeads, numKvHeads, headDim, posOff);
+                int posOff = baseKv - 1;
+                var rng = new Random(0x532 + baseKv * 31 + padKv * 7 + 2000 + numHeads);
+                float[] q = Rand(rng, numHeads * headDim);
+                float[] k = Rand(rng, padKv * numKvHeads * headDim);
+                float[] v = Rand(rng, padKv * numKvHeads * headDim);
+                int outLen = numHeads * headDim;
+                float[] a = new float[outLen], b = new float[outLen];
 
-            var (d, maxAbs) = CompareBitwise(a, b);
-            worst = Math.Max(worst, d);
-            sb.AppendLine($"  posQ={baseKv - 1,5} seqKv {baseKv,5}->{padKv,5} (chunk {c0}->{c1}, " +
-                          $"boundariesMove={moves,-5}): differing={d,5}/{outLen,-5} maxAbs={maxAbs:E3}");
+                RunSplitPair(kernels, stream, q, k, v, a, b,
+                    baseKv, padKv, numHeads, numKvHeads, headDim, posOff);
+
+                var (d, maxAbs) = CompareBitwise(a, b);
+                worst = Math.Max(worst, d);
+                sb.AppendLine($"    posQ={baseKv - 1,5} seqKv {baseKv,5}->{padKv,5} (chunkLen {c0}->{c1}, " +
+                              $"boundariesMove={moves,-5}): differing={d,5}/{outLen,-5} maxAbs={maxAbs:E3}");
+            }
         }
+
+        Skip.If(shapesRun == 0, "split-KV cooperative launch not safe for any probed shape");
 
         sb.AppendLine();
         sb.AppendLine(worst == 0
