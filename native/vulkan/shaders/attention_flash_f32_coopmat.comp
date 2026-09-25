@@ -321,7 +321,49 @@ void main() {
         //     d-block per round (round layout: d = round*64 + slice*16). The
         //     coopmat result is staged through oStage and folded into the
         //     register accumulator by the owning threads.
-        for (uint round = 0u; round < pvRounds; round++) {
+        //
+        // #533: the P·V cooperative-matrix multiply is used ONLY for KV tiles
+        // whose staged (P, V) contents are INDEPENDENT of this dispatch's KV
+        // length — a tile that is completely full (tileLen == BC) and carries
+        // no masked cell for ANY row of this query tile.
+        //
+        // Every other tile has exact zeros in P exactly where a LONGER
+        // dispatch of the same prompt has real V data in the same columns
+        // (masked cells, the short final tile, and the fully-masked tiles a
+        // longer dispatch adds past a row's causal limit). On AMD the coopmat
+        // P·V does not return the same value for those columns' `0 * v`
+        // contributions, so the LAST causally visible query row came out ~1
+        // f32 ULP different whenever the effective KV length was odd — which
+        // amplified into a demonstrated token flip through 16 layers (#533;
+        // measured 0-differing on NVIDIA at every length, so it is an AMD
+        // implementation property, not our arithmetic). Those tiles take a
+        // flat scalar loop over the same f16 LDS tiles instead; measured at
+        // 0.97-1.07x of the all-coopmat path across 4 same-session,
+        // order-reversed A/B runs (see Probe533FixCandidateTests).
+        uint firstPosQ = pc.positionOffset + qStartRow;
+        bool tileSafe = (tileLen == uint(BC))
+            && (pc.slidingWindow == 0u)
+            && (pc.maskMode == 1u || (tStart + uint(BC)) <= firstPosQ + 1u);
+        if (!tileSafe) {
+            if (d0 < hdCeil) {
+                for (uint i = 0u; i < uint(O_CELLS); i++) {
+                    uint r = (i << 1u) + rHi;
+                    // `precise` pins the multiply-add sequence: without it the
+                    // compiler is free to contract this loop differently in the
+                    // 128-dim and the hd64 shader (different live-register
+                    // pressure), and the #378 seqKv>=640 gate would then switch
+                    // between two 1-ULP-different results mid-prompt — exactly
+                    // the invariance class #533 is about.
+                    precise float acc = 0.0;
+                    for (uint c = 0u; c < uint(BC); c++) {
+                        acc += float(pTile[r * uint(P_STRIDE) + c]) * float(kvTile[c * uint(MAX_HEAD_DIM) + d0]);
+                    }
+                    oReg[i] += acc;
+                }
+            }
+            barrier();
+        }
+        for (uint round = 0u; tileSafe && round < pvRounds; round++) {
             uint dBlock = round * uint(16 * NUM_SLICES) + slice * 16u;
             if (dBlock < hdCeil) {
                 coopmat<float, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseAccumulator> accO =

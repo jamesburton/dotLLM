@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Linq;
 using System.Globalization;
 using System.Text;
 using DotLLM.Vulkan;
@@ -48,11 +49,11 @@ public sealed class Probe533FixCandidateTests
 
     private static readonly string[] Candidates =
     [
-        "attention_flash_f32_coopmat",              // baseline (production)
+        "attention_flash_f32_coopmat",              // PRODUCTION (carries the #533 fix)
+        "attention_flash_f32_coopmat_pre533",       // the pre-fix control: MUST still fail
         "attention_flash_f32_coopmat_v1scalarqk",
         "attention_flash_f32_coopmat_v2scalarpv",
         "attention_flash_f32_coopmat_v3duppad",
-        "attention_flash_f32_coopmat_v5safetile",
     ];
 
     private readonly ITestOutputHelper _out;
@@ -88,6 +89,7 @@ public sealed class Probe533FixCandidateTests
         device.Upload(vv, bufV);
 
         var sb = new StringBuilder();
+        var differingByCandidate = new Dictionary<string, long>(StringComparer.Ordinal);
         sb.AppendLine($"Device: {device.DeviceName} (VendorId 0x{device.VendorId:X4}) SubgroupSize {device.SubgroupSize}");
 
         // The f16-class control: a candidate that silently routed to the scalar
@@ -114,6 +116,8 @@ public sealed class Probe533FixCandidateTests
                 bool hd64 = File.Exists(Path.Combine(spvDir, name + "_hd64.spv"));
                 sb.AppendLine();
                 sb.AppendLine($"### {name}  (hd64 spv present: {hd64})");
+
+                long totalDiff = 0;
 
                 float[] Run(int seqQ, int seqKv, int posOff)
                 {
@@ -143,7 +147,11 @@ public sealed class Probe533FixCandidateTests
                     float[] reference = Run(160, 160, 0);
                     sb.AppendLine("  A. square prefill (base shader), reference L=160:");
                     foreach (int L in new[] { 61, 62, 63, 64, 65, 66, 67, 127, 128, 129 })
-                        sb.AppendLine("     " + CompareRows(reference, Run(L, L, 0), L, L));
+                    {
+                        (string line, long d) = CompareRows(reference, Run(L, L, 0), L, L);
+                        totalDiff += d;
+                        sb.AppendLine("     " + line);
+                    }
                 }
 
                 // --- B. square prefill, long (hd64 path when its spv exists): vs L=800 ---
@@ -151,7 +159,11 @@ public sealed class Probe533FixCandidateTests
                     float[] reference = Run(refN, refN, 0);
                     sb.AppendLine($"  B. square prefill (seqKv>={VulkanFlashAttentionCoopmatKernel.SeqKvThreshold} -> hd64 gate), reference L={refN}:");
                     foreach (int L in new[] { 641, 642, 703, 704, 767, 768 })
-                        sb.AppendLine("     " + CompareRows(reference, Run(L, L, 0), L, L));
+                    {
+                        (string line, long d) = CompareRows(reference, Run(L, L, 0), L, L);
+                        totalDiff += d;
+                        sb.AppendLine("     " + line);
+                    }
                 }
 
                 // --- C. odd positionOffset (the chunk-continuation shape) ---
@@ -162,13 +174,28 @@ public sealed class Probe533FixCandidateTests
                     {
                         float[] reference = Run(32, 760, P);
                         float[] got = Run(32, P + 32, P);
-                        sb.AppendLine($"     posOff={P,3} ({(P % 2 == 0 ? "even" : "odd ")}) " + CompareRows(reference, got, 32, P + 32));
+                        (string line, long d) = CompareRows(reference, got, 32, P + 32);
+                        totalDiff += d;
+                        sb.AppendLine($"     posOff={P,3} ({(P % 2 == 0 ? "even" : "odd ")}) " + line);
                     }
                 }
+
+                differingByCandidate[name] = totalDiff;
             }
         }
 
         _out.WriteLine(sb.ToString());
+
+        // REGRESSION GATE. The production shader must be exactly row-count
+        // invariant; the retained pre-fix control must NOT be, or this test is
+        // not discriminating anything (it passed for months while REPORTING
+        // the defect — that is the landmine this assert removes).
+        Assert.Equal(0L, differingByCandidate["attention_flash_f32_coopmat"]);
+        if (differingByCandidate.TryGetValue("attention_flash_f32_coopmat_pre533", out long pre))
+            Assert.True(pre > 0,
+                "The pre-#533-fix control shader came back invariant too — either the driver " +
+                "changed or the control is no longer the pre-fix code. This test no longer " +
+                "discriminates the fix; re-derive the control before trusting it.");
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -199,14 +226,16 @@ public sealed class Probe533FixCandidateTests
         using var device = VulkanDevice.Create();
         Skip.IfNot(VulkanFlashAttentionCoopmatKernel.SupportsDevice(device), "No coopmat tile.");
 
+        // Reference arm = the PRE-FIX shader, challenger arm = everything else
+        // (including the production shader, which now carries the fix).
         using var baseline = VulkanFlashAttentionCoopmatKernel.Create(
-            device, spvDir, FlashAttentionCoopmatVariant.Default, Candidates[0]);
+            device, spvDir, FlashAttentionCoopmatVariant.Default, "attention_flash_f32_coopmat_pre533");
 
         var sb = new StringBuilder();
         sb.AppendLine($"Device: {device.DeviceName} SubgroupSize {device.SubgroupSize}");
         sb.AppendLine($"Passes={Passes} (median, min-max reported) Batch={Batch} dispatches/pass, order reversed per pass.");
 
-        foreach (string name in Candidates.Skip(1))
+        foreach (string name in Candidates.Where(n => !string.Equals(n, "attention_flash_f32_coopmat_pre533", StringComparison.Ordinal)))
         {
             VulkanFlashAttentionCoopmatKernel cand;
             try
@@ -291,7 +320,7 @@ public sealed class Probe533FixCandidateTests
     // Helpers
     // ─────────────────────────────────────────────────────────────
 
-    private static string CompareRows(float[] reference, float[] got, int rows, int label)
+    private static (string Line, long Differing) CompareRows(float[] reference, float[] got, int rows, int label)
     {
         long diff = 0; float maxAbs = 0; int firstRow = -1, lastRow = -1;
         for (int r = 0; r < rows; r++)
@@ -306,8 +335,8 @@ public sealed class Probe533FixCandidateTests
                     lastRow = r;
                 }
             }
-        return string.Create(CultureInfo.InvariantCulture,
-            $"L={label,4} ({(label % 2 == 0 ? "even" : "odd ")}) differing={diff,7}/{(long)rows * QRow,-8} maxAbs={maxAbs:E3} rows[{firstRow}..{lastRow}]");
+        return (string.Create(CultureInfo.InvariantCulture,
+            $"L={label,4} ({(label % 2 == 0 ? "even" : "odd ")}) differing={diff,7}/{(long)rows * QRow,-8} maxAbs={maxAbs:E3} rows[{firstRow}..{lastRow}]"), diff);
     }
 
     private readonly record struct Stat(double Median, double Min, double Max);
