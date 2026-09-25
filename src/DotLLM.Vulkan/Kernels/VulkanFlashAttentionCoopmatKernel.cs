@@ -176,9 +176,13 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     /// accumulator for the <c>0 * v</c> contributions of masked / padding columns —
     /// is an AMD implementation property: an RTX 3060 is exactly 0-differing at
     /// every KV length on the SAME committed SPIR-V, which is how #533 was decided.
-    /// The gate costs AMD ~10-19% at short prefill and NVIDIA ~19% at the
-    /// <c>seqKv &gt;= 640</c> hd64 gate, so it is applied only where it buys
-    /// correctness.
+    /// Measured against the pre-fix module, same-session and order-reversed: with
+    /// the gate ON, AMD gfx1151 is 0.809x at <c>p128_even</c> and at or above
+    /// parity everywhere else (p512 0.975x, p2048 hd64 1.032-1.045x, p512 hd128
+    /// 0.985-0.998x). With it OFF, NVIDIA pays nothing (0.994-1.046x on every
+    /// row) — but only because this is a SPECIALIZATION constant. The same gate
+    /// as a push constant recovered nothing there (0.81x either way at the hd64
+    /// shape): the cost is the scalar path being compiled in, not executed.
     /// <para>
     /// NVIDIA is the ONLY vendor exempted, and only because it was measured.
     /// Everything else — Intel, Qualcomm, Mesa/RADV, anything new — gets the gate:
