@@ -132,6 +132,15 @@ public sealed class VulkanTransformerModelMoeKQuantRoutedForwardTests : IDisposa
     [InlineData(QuantizationType.Q5_K, 8)]
     [InlineData(QuantizationType.Q6_K, 101)]
     [InlineData(QuantizationType.Q6_K, 102)]
+    // #407: the routed legacy/i-quant pair. End-to-end reachability — the CPU side
+    // decodes these via MoeQuantSwiGluMlp's GemvDequantRows fallback (the trusted scalar
+    // dequant oracle), the Vulkan side via the new moe_indexed kernels. Bit-level layout
+    // correctness is proven separately on real GGUF bytes in
+    // RealGgufMoeIndexedRoutedBankParityTests; this asserts the dispatch is wired.
+    [InlineData(QuantizationType.Q5_0, 407)]
+    [InlineData(QuantizationType.Q5_0, 408)]
+    [InlineData(QuantizationType.IQ4_NL, 409)]
+    [InlineData(QuantizationType.IQ4_NL, 410)]
     public void Forward_RoutedKQuant_MatchesCpuReference(QuantizationType routedQuantType, int seed)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -256,16 +265,17 @@ public sealed class VulkanTransformerModelMoeKQuantRoutedForwardTests : IDisposa
     /// (<see cref="VulkanWeights.ResolveMoeBankResidency"/>) from the OLD model-global
     /// behavior (<c>if (w1Qt==F32 || w2Qt==F32 || w3Qt==F32) return false</c> collapsed
     /// onto every bank). This fixture mixes quant types on ONE layer — gate/up Q4_K
-    /// (resident-capable), down Q5_0 (no MoE-indexed Vulkan kernel in this worktree yet) — so gate/up
-    /// staying independently resident is only observable if the per-bank aggregation is
-    /// real. Reverting <c>ResolveMoeBankResidency</c> to AND across all three banks makes
+    /// (resident-capable), down Q4_1 (no MoE-indexed Vulkan kernel in this worktree yet) — so
+    /// gate/up staying independently resident is only observable if the per-bank aggregation
+    /// is real. Reverting <c>ResolveMoeBankResidency</c> to AND across all three banks makes
     /// this test FAIL (verified manually — see task-2-report.md fix-round-1 section).
     /// </summary>
     /// <remarks>
-    /// "No Vulkan kernel" below means no MoE-INDEXED Q5_0 kernel. #344 added a dense
-    /// (non-routed) Vulkan Q5_0 GEMM/GEMV kernel — <see cref="MoeRoutedRawDeviceQuantType"/>
-    /// deliberately does not extend to it, since MoE-indexed dispatch is a distinct kernel
-    /// family from dense matmul (see <see cref="VulkanWeights.CanKeepBankResident"/>'s XML).
+    /// The blocking bank was Q5_0 until #407 gave Q5_0 (and IQ4_NL) a MoE-indexed kernel
+    /// plus resolver wiring; it is now Q4_1, which is still #344 Unit 4 and therefore
+    /// still has no routed kernel. Swapping the type — rather than weakening the assertion
+    /// — is what keeps this test discriminating: it must always name a type the resolver
+    /// genuinely cannot keep resident.
     /// </remarks>
     [SkippableFact]
     public void ResolveMoeBankResidency_IsPerBank_PartiallyResidentLayerKeepsGateUpResident()
@@ -283,7 +293,7 @@ public sealed class VulkanTransformerModelMoeKQuantRoutedForwardTests : IDisposa
         Assert.True(residency.TryGetValue(DsLeadingDenseBlocks, out var bank));
         Assert.True(bank.Gate, "ffn_gate_exps (Q4_K, 256-aligned) must resolve resident.");
         Assert.True(bank.Up, "ffn_up_exps (Q4_K, 256-aligned) must resolve resident.");
-        Assert.False(bank.Down, "ffn_down_exps (Q5_0) has no MoE-indexed Vulkan kernel yet — must NOT resolve resident.");
+        Assert.False(bank.Down, "ffn_down_exps (Q4_1) has no MoE-indexed Vulkan kernel yet — must NOT resolve resident.");
 
         // The model-wide preflight still correctly reports false overall (down blocks the
         // full-skip decision) — the per-bank signal above is what #327 adds beyond this.
@@ -323,10 +333,67 @@ public sealed class VulkanTransformerModelMoeKQuantRoutedForwardTests : IDisposa
         Assert.Equal(3, plan.TotalBanks);
         var fallback = Assert.Single(plan.Fallbacks);
         Assert.Equal("ffn_down_exps.weight", fallback.Bank);
-        Assert.Equal(QuantizationType.Q5_0, fallback.Quant);
+        Assert.Equal(QuantizationType.Q4_1, fallback.Quant);
 
         Assert.Equal(OneBankF32Bytes, plan.HostF32Bytes);
         Assert.NotEqual(3 * OneBankF32Bytes, plan.HostF32Bytes); // the pre-#327 all-or-nothing answer
+    }
+
+    /// <summary>
+    /// #407 reachability gate: a Q5_0 or IQ4_NL routed expert bank must now resolve
+    /// DEVICE-RESIDENT rather than falling back to the host F32 dequant.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the "prove routing by observation, not capability flags" requirement
+    /// (#344 rule 7) at the resolver level: <c>ResolveMoeBankResidency</c> is the SAME
+    /// predicate <c>UploadMoeLayer</c> uses to choose the upload form, so a true here
+    /// means the packed bytes go to the device and <c>RecordMoeIndexedMatmul</c>
+    /// dispatches the new kernel. Bit-level correctness of that kernel is proven
+    /// separately, against real llama.cpp GGUF bytes, in
+    /// <c>RealGgufMoeIndexedRoutedBankParityTests</c> — a shipped kernel that is never
+    /// routed to and a routed kernel that decodes wrongly are different failures and
+    /// need different tests.
+    /// </para>
+    /// <para>
+    /// Bytes here are random-but-correctly-sized: the resolver inspects only the GGUF
+    /// descriptor's quant type and shape and never dereferences them, and no
+    /// <c>.Forward()</c> is called.
+    /// </para>
+    /// </remarks>
+    /// <param name="downQuantType">Routed down-bank quant type under test.</param>
+    [SkippableTheory]
+    [InlineData(QuantizationType.Q5_0)]
+    [InlineData(QuantizationType.IQ4_NL)]
+    public void ResolveMoeBankResidency_KeepsQ5_0AndIq4NlRoutedBanksResident(QuantizationType downQuantType)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+
+        string path = WriteDeepSeekV2MixedResidencyFixture(downQuantType);
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+
+        // Guard against the fixture silently not carrying the type under test (#344 rule 4).
+        var downDescriptor = Assert.Single(gguf.Tensors,
+            t => t.Name == $"blk.{DsLeadingDenseBlocks}.ffn_down_exps.weight");
+        Assert.Equal(downQuantType, downDescriptor.QuantizationType);
+
+        var residency = VulkanWeights.ResolveMoeBankResidency(device, gguf, config);
+        Assert.True(residency.TryGetValue(DsLeadingDenseBlocks, out var bank));
+        Assert.True(bank.Gate, "ffn_gate_exps (Q4_K, 256-aligned) must resolve resident.");
+        Assert.True(bank.Up, "ffn_up_exps (Q4_K, 256-aligned) must resolve resident.");
+        Assert.True(bank.Down,
+            $"ffn_down_exps ({downQuantType}) must resolve resident after #407 — without the "
+            + "MoeRoutedRawDeviceQuantType wiring the new kernel is unreachable and every "
+            + "expert bank expands to F32.");
+
+        // With all three banks resident the whole-model preflight can skip the host
+        // F32 dequant entirely — the memory outcome #407 exists for.
+        var plan = VulkanWeights.PlanMoeF32HostDequant(device, gguf, config);
+        Assert.True(plan.CanSkip);
+        Assert.Empty(plan.Fallbacks);
+        Assert.Equal(0, plan.HostF32Bytes);
     }
 
     /// <summary>
@@ -508,7 +575,13 @@ public sealed class VulkanTransformerModelMoeKQuantRoutedForwardTests : IDisposa
     /// fixture (preflight-only, no <c>.Forward()</c>), so they are random-but-correctly-sized
     /// rather than a faithful Q5_0 quantization.
     /// </summary>
-    private string WriteDeepSeekV2MixedResidencyFixture()
+    /// <param name="downQuantType">
+    /// Quant type for the routed <c>ffn_down_exps</c> bank. Defaults to Q4_1, the type
+    /// the per-bank-residency tests need (still no routed kernel); the #407 tests pass
+    /// Q5_0 / IQ4_NL to assert the opposite outcome on the same fixture shape.
+    /// </param>
+    private string WriteDeepSeekV2MixedResidencyFixture(
+        QuantizationType downQuantType = QuantizationType.Q4_1)
     {
         var b = new GgufTestData(version: 3);
         var rng = new Random(0x327);
@@ -572,8 +645,8 @@ public sealed class VulkanTransformerModelMoeKQuantRoutedForwardTests : IDisposa
                     k: DsHiddenSize, m: DsMoeIntermediate, numExperts: DsNumExperts, QuantizationType.Q4_K, rng);
                 AddExpertBankQuant(b, $"{p}.ffn_up_exps.weight",
                     k: DsHiddenSize, m: DsMoeIntermediate, numExperts: DsNumExperts, QuantizationType.Q4_K, rng);
-                AddExpertBankRawQ5_0(b, $"{p}.ffn_down_exps.weight",
-                    k: DsMoeIntermediate, m: DsHiddenSize, numExperts: DsNumExperts, rng);
+                AddExpertBankRawLegacy(b, $"{p}.ffn_down_exps.weight",
+                    k: DsMoeIntermediate, m: DsHiddenSize, numExperts: DsNumExperts, downQuantType, rng);
             }
         }
 
@@ -583,23 +656,36 @@ public sealed class VulkanTransformerModelMoeKQuantRoutedForwardTests : IDisposa
     }
 
     /// <summary>
-    /// Writes one fused-experts tensor as Q5_0-tagged bytes of the CORRECT size (22 bytes
-    /// per 32-element block) but random content — sufficient for
-    /// <see cref="VulkanWeights.ResolveMoeBankResidency"/>/<c>MoeRoutedRawDeviceQuantType</c>,
-    /// which only inspect the descriptor's quant type and shape, never dereference the raw
-    /// bytes. Not a faithful Q5_0 quantization — do not use with a <c>.Forward()</c> test.
+    /// Writes one fused-experts tensor as <paramref name="qt"/>-tagged bytes of the
+    /// CORRECT size for that 32-element legacy/i-quant block format, but with random
+    /// content — sufficient for <see cref="VulkanWeights.ResolveMoeBankResidency"/> /
+    /// <c>MoeRoutedRawDeviceQuantType</c>, which only inspect the descriptor's quant type
+    /// and shape and never dereference the raw bytes. Not a faithful quantization — do
+    /// not use with a <c>.Forward()</c> test.
+    /// <para>
+    /// The mixed-residency fixture used Q5_0 here until #407 gave Q5_0 a routed
+    /// (MoE-indexed) kernel and resolver wiring; the default is now Q4_1, which is #344
+    /// Unit 4 and still has none — the property that fixture actually needs.
+    /// </para>
     /// </summary>
-    private static void AddExpertBankRawQ5_0(GgufTestData b, string name, int k, int m, int numExperts, Random rng)
+    private static void AddExpertBankRawLegacy(
+        GgufTestData b, string name, int k, int m, int numExperts, QuantizationType qt, Random rng)
     {
-        const int q5_0GroupSize = 32;
-        const int q5_0BlockBytes = 22;
-        if (k % q5_0GroupSize != 0)
-            throw new ArgumentException($"k={k} must be a multiple of {q5_0GroupSize} for Q5_0.", nameof(k));
+        const int groupSize = 32;
+        int blockBytes = qt switch
+        {
+            QuantizationType.Q4_1 => 20,
+            QuantizationType.Q5_0 => 22,
+            QuantizationType.IQ4_NL => 18,
+            _ => throw new NotSupportedException($"Unsupported legacy routed quant type: {qt}"),
+        };
+        if (k % groupSize != 0)
+            throw new ArgumentException($"k={k} must be a multiple of {groupSize} for {qt}.", nameof(k));
 
-        int rowBytes = (k / q5_0GroupSize) * q5_0BlockBytes;
+        int rowBytes = (k / groupSize) * blockBytes;
         var all = new byte[(long)numExperts * m * rowBytes];
         rng.NextBytes(all);
-        b.AddTensor(name, [k, m, numExperts], (uint)QuantizationType.Q5_0, all);
+        b.AddTensor(name, [k, m, numExperts], (uint)qt, all);
     }
 
     /// <summary>
@@ -618,6 +704,9 @@ public sealed class VulkanTransformerModelMoeKQuantRoutedForwardTests : IDisposa
             QuantizationType.Q4_K => (k / Q4KFixture.Q4KGroupSize) * Q4KFixture.Q4KBlockBytes,
             QuantizationType.Q5_K => (k / Q5KFixture.Q5KGroupSize) * Q5KFixture.Q5KBlockBytes,
             QuantizationType.Q6_K => (k / Q6KFixture.Q6KGroupSize) * Q6KFixture.Q6KBlockBytes,
+            // #407: 32-element legacy / non-linear formats.
+            QuantizationType.Q5_0 => (k / 32) * 22,
+            QuantizationType.IQ4_NL => (k / 32) * 18,
             _ => throw new NotSupportedException($"Unsupported routed quant type for this fixture: {qt}"),
         };
         var all = new byte[(long)numExperts * m * rowBytes];
@@ -629,11 +718,33 @@ public sealed class VulkanTransformerModelMoeKQuantRoutedForwardTests : IDisposa
                 QuantizationType.Q4_K => Q4KFixture.QuantizeRows(f32, m, k),
                 QuantizationType.Q5_K => Q5KFixture.QuantizeRows(f32, m, k),
                 QuantizationType.Q6_K => Q6KFixture.QuantizeRows(f32, m, k),
+                // Q5_0 goes through the PRODUCTION encoder (DotLLM.Cpu.Kernels.Quantize)
+                // rather than a test-local one, so the fixture cannot silently share a
+                // layout bug with a hand-written encoder the way Q3_K's did (#311).
+                QuantizationType.Q5_0 => QuantizeRowsWithCpu(f32, m, k, QuantizationType.Q5_0, rowBytes),
+                QuantizationType.IQ4_NL => Iq4Fixture.QuantizeRowsIq4Nl(f32, m, k),
                 _ => throw new NotSupportedException(),
             };
             Buffer.BlockCopy(q, 0, all, e * m * rowBytes, q.Length);
         }
         b.AddTensor(name, [k, m, numExperts], (uint)qt, all);
+    }
+
+    /// <summary>
+    /// Row-wise quantization through the production CPU encoder
+    /// (<c>DotLLM.Cpu.Kernels.Quantize.FromFloat32</c>), used for the formats that have
+    /// no dedicated test fixture quantizer.
+    /// </summary>
+    private static byte[] QuantizeRowsWithCpu(float[] src, int m, int k, QuantizationType qt, int rowBytes)
+    {
+        var dest = new byte[(long)m * rowBytes];
+        for (int row = 0; row < m; row++)
+        {
+            DotLLM.Cpu.Kernels.Quantize.FromFloat32(
+                src.AsSpan(row * k, k), k, qt,
+                dest.AsSpan(row * rowBytes, rowBytes));
+        }
+        return dest;
     }
 
     private static void AddF32Tensor(GgufTestData b, string name, int[] shape, Random rng,
