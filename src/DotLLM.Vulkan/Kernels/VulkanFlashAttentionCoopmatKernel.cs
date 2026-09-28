@@ -205,6 +205,17 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         return vendorId == VendorNvidia ? 0u : 1u;
     }
 
+    /// <summary>
+    /// The base (MAX_HEAD_DIM=128) pipeline handle, for
+    /// <c>VK_AMD_shader_info</c> queries — the driver's own post-compile VGPR /
+    /// LDS / scratch numbers, which is how #545 turned "probably occupancy"
+    /// into a number instead of inferring it from timings.
+    /// </summary>
+    internal nint PipelineHandle => _pipeline.Pipeline;
+
+    /// <summary>The <c>seqKv &gt;= 640</c> hd64 pipeline handle, or 0 when its SPIR-V is absent.</summary>
+    internal nint Hd64PipelineHandle => _hd64Pipeline?.Pipeline ?? 0;
+
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;

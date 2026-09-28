@@ -24,16 +24,28 @@
 // WG = 4 subgroups; flash_attn_cm1.comp / get_fa_tuning_params_coopmat1).
 //
 // Numerics (deliberate, matching llama.cpp's flash-attention class):
-//   - Q, K, V are converted F32 -> F16 in the LDS tiles (llama.cpp's KV cache
+//   - Q and K are converted F32 -> F16 in the LDS tiles (llama.cpp's KV cache
 //     is F16 to begin with, so this is the same rounding class it ships).
 //   - QK^T accumulates in F32 (coopmat accumulator), scale/mask/softcap are
 //     applied to the F32 scores, and the online-softmax state (running max /
 //     sum / correction) is all F32 — llama.cpp cm1 keeps Mf/Lf in float too.
-//   - P = exp(s - max) is fed to the P·V multiply as F16 (llama.cpp: Psh is
-//     f16vec4). The softmax denominator sums float(f16(P)) so numerator and
-//     denominator round P identically.
-//   - P·V accumulates in F32 (stricter than llama.cpp cm1's default f16
-//     accumulator).
+//   - On a COOPMAT tile: V is staged F16, P = exp(s - max) is fed to the P·V
+//     multiply as F16 (llama.cpp: Psh is f16vec4), the softmax denominator sums
+//     float(f16(P)) so numerator and denominator round P identically, and P·V
+//     accumulates in F32 (stricter than llama.cpp cm1's default f16 accumulator).
+//   - On a SCALAR-TAIL tile (#533's KV-length-dependent tiles — see 2f) both
+//     operands are FULL F32: P from sTile, V staged into oStage, denominator
+//     summing the same f32 (#543). That path measures 1.45E-04 from the scalar
+//     f32 FA kernel where the all-f16 form measured 3.30E-04, and it makes a
+//     1-token chunk write BIT-IDENTICAL KV to a single-pass prefill of the same
+//     tokens, which is what #543 was filed for. It is also FASTER: +6.5% at
+//     p512, +4% at hd128, neutral at p2048 (two 61-pass order-reversed rounds on
+//     gfx1151; see .docs/ISSUE_543_MEASUREMENTS.md and the retained
+//     attention_flash_f32_coopmat_pre543 control).
+//   - What is NOT fixed: QK^T stays f16-in on every tile, so the residual
+//     1.45E-04 at rows 0-63 is the score matmul alone, and the gain decays with
+//     position (at most ~2 of a row's ceil((p+1)/64) tiles are scalar-tail ones
+//     — 1.02x by row 64, ~1.0x past row 256).
 // Expected drift vs the all-F32 scalar shader / CPU oracle is therefore
 // f16-input-class (rel ~2^-11 per operand), NOT bit-exact — the parity
 // tolerance and the end-to-end greedy-token gate live in
@@ -239,6 +251,16 @@ void main() {
     for (uint tStart = 0u; tStart < kvEnd; tStart += uint(BC)) {
         uint tileLen = min(uint(BC), kvEnd - tStart);
 
+        // #533's safe-tile classification, hoisted here because #543's f32 tail
+        // needs it BEFORE the V staging pass in 2d (which it replaces) and before
+        // the row-owner softmax in 2d (which feeds it P). It depends only on
+        // tileLen / maskMode / this query tile's first position, all known now.
+        // The reasoning for the predicate itself is at 2f, unchanged.
+        uint firstPosQ = pc.positionOffset + qStartRow;
+        bool tileSafe = (REQUIRE_INVARIANT_PV == 0u)
+            || ((tileLen == uint(BC))
+                && (pc.maskMode == 1u || (tStart + uint(BC)) <= firstPosQ + 1u));
+
         // 2a. Stage the K tile in f16 (zero-padded past tileLen / headDim).
         for (uint idx = tid; idx < uint(BC) * hdCeil; idx += uint(WG_SIZE)) {
             uint c = idx / hdCeil;
@@ -279,7 +301,20 @@ void main() {
             uint c = idx - r * uint(BC);
             uint sIdx = r * uint(S_STRIDE) + c;
             uint tkv = tStart + c;
-            if (r >= rowsInTile || c >= tileLen) {
+            if (r >= rowsInTile) {
+                // #543: 0.0, not NEG_INF. These rows are DEAD for every consumer
+                // — the row-owner softmax scans r < rowsInTile, the coopmat P·V
+                // is fed from pTile (whose padding rows step 1 zeroes), and step 3
+                // discards them — so zeroing them lets the f32 tail accumulate
+                // all BR rows branch-free. That branch WAS the whole residual
+                // cost of the f32 tail: with it the tail measured 0.98x at p512,
+                // without it 1.07x. This mask-pass change is not itself the source
+                // of that delta — the control arm carrying only this change reads
+                // 1.005-1.007x at p512.
+                sTile[sIdx] = 0.0;
+                continue;
+            }
+            if (c >= tileLen) {
                 sTile[sIdx] = NEG_INF;
                 continue;
             }
@@ -323,23 +358,39 @@ void main() {
                     float val = sTile[sBase + c2];
                     w = (val > NEG_INF * 0.5) ? exp(val - newMax) : 0.0;
                 }
-                float16_t w16 = float16_t(w);
-                pTile[pBase + c2] = w16;
-                tileSum += float(w16);
+                pTile[pBase + c2] = float16_t(w);
+                if (tileSafe) {
+                    // Coopmat path: the denominator must round P exactly the way
+                    // the numerator does, and the numerator consumes the f16 P.
+                    tileSum += float(pTile[pBase + c2]);
+                } else {
+                    // #543: the f32 tail's P. Written back OVER the score it was
+                    // computed from — sTile is fully consumed by now — so f32 P
+                    // reaches the tail at no extra LDS, and the denominator sums
+                    // the same f32 the numerator will. Only on an unsafe tile:
+                    // from p512 up most tiles are coopmat and an unconditional
+                    // writeback is pure cost there.
+                    sTile[sBase + c2] = w;
+                    tileSum += w;
+                }
             }
             runningSum[r] = runningSum[r] * correction + tileSum;
             runningMax[r] = newMax;
             corrShared[r] = correction;
         }
-        for (uint idx = tid; idx < uint(BC) * hdCeil; idx += uint(WG_SIZE)) {
-            uint c = idx / hdCeil;
-            uint d = idx - c * hdCeil;
-            uint tkv = tStart + c;
-            float val = 0.0;
-            if (c < tileLen && d < pc.headDim) {
-                val = v[tkv * kvStride + hkv * pc.headDim + d];
+        // #543: the f16 V tile is staged only for the coopmat path. An unsafe
+        // tile stages V as f32 into oStage inside the tail instead (2f).
+        if (tileSafe) {
+            for (uint idx = tid; idx < uint(BC) * hdCeil; idx += uint(WG_SIZE)) {
+                uint c = idx / hdCeil;
+                uint d = idx - c * hdCeil;
+                uint tkv = tStart + c;
+                float val = 0.0;
+                if (c < tileLen && d < pc.headDim) {
+                    val = v[tkv * kvStride + hkv * pc.headDim + d];
+                }
+                kvTile[c * uint(MAX_HEAD_DIM) + d] = float16_t(val);
             }
-            kvTile[c * uint(MAX_HEAD_DIM) + d] = float16_t(val);
         }
         barrier();
 
@@ -370,12 +421,15 @@ void main() {
         // amplified into a demonstrated token flip through 16 layers (#533;
         // measured 0-differing on NVIDIA at every length, so it is an AMD
         // implementation property, not our arithmetic). Those tiles take a
-        // flat scalar loop over the same f16 LDS tiles instead. Final measured
-        // cost vs the pre-fix module, same-session and order-reversed: 0.809x at
-        // p128_even and at or above parity everywhere else on gfx1151, with the
-        // p2048 hd64 rows a 3-5% GAIN because the scalar tail skips the oStage
-        // round-trip and two barriers (see Probe533FixCandidateTests).
-        uint firstPosQ = pc.positionOffset + qStartRow;
+        // flat scalar loop instead.
+        //
+        // #543 SUPERSEDES that loop's operands and its cost. It read the same f16
+        // LDS tiles, which made it the LESS accurate path; it now reads f32 (see
+        // 2d and below). The cost figures #533 shipped with — 0.809x at
+        // p128_even, at or above parity elsewhere, 3-5% GAIN at p2048 hd64 —
+        // described the f16 form and no longer describe this code: measured
+        // against the pre-#543 control the f32 tail is 1.066-1.073x at p512,
+        // 1.037-1.041x at hd128 and neutral at p2048.
         // A sliding window does NOT need to force the scalar path: its masked
         // cells sit at columns that carry the SAME real V data in a longer
         // dispatch, so the staged tile is identical either way. Only columns a
@@ -388,31 +442,77 @@ void main() {
         // 0-differing at every length on this same SPIR-V, so NVIDIA does not
         // pay the scalar tail for a bug it does not have. Anything not measured
         // clean gets the gate.
-        bool tileSafe = (REQUIRE_INVARIANT_PV == 0u)
-            || ((tileLen == uint(BC))
-                && (pc.maskMode == 1u || (tStart + uint(BC)) <= firstPosQ + 1u));
+        // (tileSafe was computed at the top of the KV loop, because 2d needs it.)
         if (!tileSafe) {
-            if (d0 < hdCeil) {
-                for (uint i = 0u; i < uint(O_CELLS); i++) {
-                    uint r = (i << uint(ROW_LANE_SHIFT)) + rHi;
-                    // `precise` pins the whole reduction: left to itself the
-                    // compiler reassociates/unrolls this loop differently in the
-                    // 128-dim and the hd64 shader (different live-register
-                    // pressure), and the #378 seqKv>=640 gate would then switch
-                    // between two 1-ULP-different results mid-prompt — exactly
-                    // the invariance class #533 is about. An explicit fma() with
-                    // no `precise` was MEASURED and is NOT enough (the split
-                    // reappears at posOff=100, arm C): it pins the multiply-add
-                    // but not the accumulation order. `precise` costs ~15-19% at
-                    // the short-prefill shapes where this scalar tail dominates.
-                    precise float acc = 0.0;
-                    for (uint c = 0u; c < uint(BC); c++) {
-                        acc += float(pTile[r * uint(P_STRIDE) + c]) * float(kvTile[c * uint(MAX_HEAD_DIM) + d0]);
+            // #543: the f32 P·V tail. V is staged as F32 through oStage, which
+            // the coopmat rounds below own but which is IDLE on exactly the tiles
+            // that reach here — so this costs NO extra LDS and fetches each V
+            // element ONCE. Reading v[] directly inside the accumulate loop was
+            // measured first and fetches it once per ROW LANE (2x here, 4x in the
+            // hd64 shader), which cost 4% at p512; the 2x2 factorial that
+            // attributed that cost to the V source, and the VK_AMD_shader_info
+            // numbers that ruled occupancy out (117 -> 129 VGPRs, zero scratch,
+            // LDS-bound at 31744 B either way), are in
+            // .docs/ISSUE_543_MEASUREMENTS.md.
+            //
+            // `precise` pins the whole reduction: left to itself the compiler
+            // reassociates/unrolls this loop differently in the 128-dim and the
+            // hd64 shader (different live-register pressure), and the #378
+            // seqKv>=640 gate would then switch between two 1-ULP-different
+            // results mid-prompt — exactly the invariance class #533 is about.
+            // An explicit fma() with no `precise` was MEASURED and is NOT enough
+            // (the split reappears at posOff=100): it pins the multiply-add but
+            // not the accumulation order. The order here is c-major per row, the
+            // same order the f16 tail used, and chunking does not change it.
+            //
+            // oStage holds V_CHUNK columns at stride MAX_HEAD_DIM — 8 columns in
+            // this shader, 16 in the hd64 one. Packing at the model's hdCeil
+            // instead, to halve the barrier count, was measured and changed
+            // NOTHING, so barriers are not this path's binding resource.
+            const uint V_CHUNK = uint(NUM_SLICES * 16 * 16) / uint(MAX_HEAD_DIM);
+            precise float acc[O_CELLS];
+            for (uint i = 0u; i < uint(O_CELLS); i++) {
+                acc[i] = 0.0;
+            }
+            for (uint cBase = 0u; cBase < tileLen; cBase += V_CHUNK) {
+                uint cols = min(V_CHUNK, tileLen - cBase);
+                // One coalesced f32 fetch per element — d contiguous across
+                // threads, exactly like the f16 staging pass this replaces.
+                for (uint idx = tid; idx < cols * hdCeil; idx += uint(WG_SIZE)) {
+                    uint c = idx / hdCeil;
+                    uint d = idx - c * hdCeil;
+                    oStage[c * uint(MAX_HEAD_DIM) + d] =
+                        (d < pc.headDim) ? v[(tStart + cBase + c) * kvStride + hkv * pc.headDim + d] : 0.0;
+                }
+                barrier();
+                if (d0 < pc.headDim) {
+                    for (uint c = 0u; c < cols; c++) {
+                        float vv = oStage[c * uint(MAX_HEAD_DIM) + d0];
+                        // Branch-free over all BR rows: the mask pass put exact
+                        // 0.0 in sTile's padding rows (2c), so rows past
+                        // rowsInTile contribute exact zeros.
+                        for (uint i = 0u; i < uint(O_CELLS); i++) {
+                            acc[i] += sTile[((i << uint(ROW_LANE_SHIFT)) + rHi) * uint(S_STRIDE) + cBase + c] * vv;
+                        }
                     }
-                    oReg[i] += acc;
+                }
+                // Both barriers are needed and both are workgroup-uniform:
+                // tileSafe, tileLen and V_CHUNK are all uniform. The trailing one
+                // also separates the last read of sTile from the next KV tile's
+                // coopMatStore into it.
+                barrier();
+            }
+            if (d0 < pc.headDim) {
+                for (uint i = 0u; i < uint(O_CELLS); i++) {
+                    // Rows >= rowsInTile accumulated exact 0.0, so folding them in
+                    // unconditionally is a no-op. Their oReg cells are then
+                    // multiplied by an unwritten corrShared[r] at 2e and may go
+                    // NaN; step 3 discards every row >= rowsInTile, and the
+                    // L=61/63/65/67 arms of Probe533FixCandidateTests (rowsInTile
+                    // < BR) are what make that measured rather than argued.
+                    oReg[i] += acc[i];
                 }
             }
-            barrier();
         }
         for (uint round = 0u; tileSafe && round < pvRounds; round++) {
             uint dBlock = round * uint(16 * NUM_SLICES) + slice * 16u;
