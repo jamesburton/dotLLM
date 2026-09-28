@@ -221,10 +221,22 @@ public sealed class Probe545KQuantMmqTests
             // RED this measurement exists to show — so record it instead of failing.
             if (PreFixArm)
             {
-                sb.AppendLine($"     [pre-fix arm] bound {MmqRelBound(family):E3} "
-                            + (relQ < MmqRelBound(family)
-                                ? "NOT violated — this family's gate does not discriminate, which is a finding"
-                                : "violated as expected"));
+                // Shape-aware, because a non-violation at the SHALLOW shape is expected
+                // for most families rather than alarming: the per-family bound is sized
+                // to the deep-K case (see MmqRelBound's remarks), and several families'
+                // k=2048 pre-fix figures sit below any bound their k=8192 post-fix figure
+                // permits. Reporting both the same way would cry wolf — and the margins
+                // are thin enough to matter: Q5_K's k=2048 pre-fix cleared its bound by
+                // 6.8% while its k=8192 pre-fix reading moved 7.6% between sessions on a
+                // different seed, so that row can flip without anything being wrong.
+                bool deepest = k == Shapes[^1].k;
+                string verdict = relQ >= MmqRelBound(family)
+                    ? "violated as expected"
+                    : deepest
+                        ? "NOT violated at the DEEPEST shape — this family's gate does not "
+                          + "discriminate the fix it is supposed to hold, which is a finding"
+                        : "not violated (shallow shape; this bound guards deep-K only)";
+                sb.AppendLine($"     [pre-fix arm] bound {MmqRelBound(family):E3} {verdict}");
             }
             else
             {
