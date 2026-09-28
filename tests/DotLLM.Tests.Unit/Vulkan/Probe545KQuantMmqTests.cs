@@ -39,6 +39,11 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// The cause is occupancy and it is specific to this shader: it is by far the
 /// lightest of the four — 68 VGPRs, 5120 B LDS, 32 SGPRs — so 16 extra live
 /// floats are proportionally large, and 68 -> 83 VGPRs loses a wave slot, which
+/// Q3_K is the largest gain in the family (2.71x at k=8192) and the cheapest per unit
+/// of it: it has the deepest sequential run — 2 halves x 8 sub-blocks = 16 accumulates
+/// per super-block, against Q6_K's 2 — and its VGPRs go 99 -> 93, so it is not paying
+/// occupancy either. ~1.5-3% cost across two 41-pass rounds.
+///
 /// matches the measured loss almost exactly. Q6_K and IQ4_XS end up using FEWER
 /// registers after the change and cost 2-5%, so their residual is the fold work
 /// itself rather than occupancy; Q5_K is unchanged at 144 and is at parity.
@@ -59,11 +64,44 @@ public sealed class Probe545KQuantMmqTests
     /// <summary>MMVQ must agree with the oracle this closely, or the oracle is wrong for this family.</summary>
     private const double OracleValidationRel = 1e-5;
 
+    /// <summary>
+    /// <c>DOTLLM_545_PRE_FIX=1</c> dispatches <c>{family}_mmq_pre545.spv</c> — the
+    /// retained pre-two-level-accumulation shader — instead of the shipping module,
+    /// so the RED half of this measurement is one command rather than a manual
+    /// SPIR-V swap in <c>bin/</c>. The gate assertions are skipped in that mode:
+    /// the point of the arm is to show the bound FAILS without the fix.
+    /// <para>
+    /// Worth having because the alternative is a swap that has to be undone, and a
+    /// forgotten one leaves a stale module running the next measurement — which is
+    /// exactly how a fixed-GPU-vs-stale-CPU comparison once produced a convincing
+    /// fictitious bug in this repo.
+    /// </para>
+    /// </summary>
+    private static bool PreFixArm =>
+        string.Equals(Environment.GetEnvironmentVariable("DOTLLM_545_PRE_FIX"), "1", StringComparison.Ordinal);
+
+    private static string MmqShader(QuantFamily f)
+    {
+        string baseName = f switch
+        {
+            QuantFamily.Q3_K => "matmul_q3_k_mmq",
+            QuantFamily.Q5_K => "matmul_q5_k_mmq",
+            QuantFamily.Q6_K => "matmul_q6_k_mmq",
+            QuantFamily.IQ4_NL => "matmul_iq4_nl_mmq",
+            QuantFamily.IQ4_XS => "matmul_iq4_xs_mmq",
+            _ => throw new ArgumentOutOfRangeException(nameof(f)),
+        };
+        return PreFixArm ? baseName + "_pre545" : baseName;
+    }
+
     private readonly ITestOutputHelper _out;
     public Probe545KQuantMmqTests(ITestOutputHelper output) => _out = output;
 
     public static TheoryData<QuantFamily> Families => new()
     {
+        QuantFamily.Q3_K,     // Q3_K_M / Q3_K_S; also the family whose quant error is the
+                              // project's known weak spot (2.9x llama.cpp's on #519/#520),
+                              // so its prefill GEMM is the last place it should lose more
         QuantFamily.Q6_K,     // on the Q4_K_M shipping path (attn_v / ffn_down / output)
         QuantFamily.Q5_K,     // Q5_K_M
         QuantFamily.IQ4_NL,
@@ -90,6 +128,12 @@ public sealed class Probe545KQuantMmqTests
     /// </summary>
     private static double MmqRelBound(QuantFamily f) => f switch
     {
+        // Q3_K is the only family whose bound discriminates at BOTH shapes: pre-fix
+        // 2.015E-07 (k=2048) and 4.093E-07 (k=8192) are both above it, where the other
+        // families' k=2048 pre-fix figures sit below any bound their k=8192 post-fix
+        // number permits. That follows from Q3_K having the deepest sequential run in
+        // the family — 2 halves x 8 sub-blocks = 16 accumulates per super-block.
+        QuantFamily.Q3_K => 1.70e-7,    // fixed: post 1.493E-07 / 1.512E-07, pre 2.015E-07 / 4.093E-07
         QuantFamily.Q6_K => 1.35e-7,    // fixed: post 1.181E-07, pre 2.881E-07
         QuantFamily.Q5_K => 1.80e-7,    // fixed: post 1.587E-07, pre 3.276E-07
         QuantFamily.IQ4_XS => 1.40e-7,  // fixed: post 1.220E-07, pre 2.948E-07
@@ -119,7 +163,7 @@ public sealed class Probe545KQuantMmqTests
             ?? throw new Xunit.Sdk.XunitException("quantize_q8_1_rows.spv missing.");
 
         var sb = new StringBuilder();
-        sb.AppendLine($"{family} on {device.DeviceName}");
+        sb.AppendLine($"{family} on {device.DeviceName}  [{MmqShader(family)}]");
 
         foreach ((int m, int k) in Shapes)
         {
@@ -173,9 +217,33 @@ public sealed class Probe545KQuantMmqTests
                 + $"(relative rms {relV:E3}). The ORACLE is the suspect, not the kernel — check the "
                 + "dequant path for this family." + Environment.NewLine + sb);
 
-            Assert.True(relQ < MmqRelBound(family),
-                $"{family} MMQ (prefill) accuracy has regressed at m={m} k={k}: relative rms "
-                + $"{relQ:E3} >= {MmqRelBound(family):E3}." + Environment.NewLine + sb);
+            // In the pre-fix arm the bound is EXPECTED to be violated — that is the
+            // RED this measurement exists to show — so record it instead of failing.
+            if (PreFixArm)
+            {
+                // Shape-aware, because a non-violation at the SHALLOW shape is expected
+                // for most families rather than alarming: the per-family bound is sized
+                // to the deep-K case (see MmqRelBound's remarks), and several families'
+                // k=2048 pre-fix figures sit below any bound their k=8192 post-fix figure
+                // permits. Reporting both the same way would cry wolf — and the margins
+                // are thin enough to matter: Q5_K's k=2048 pre-fix cleared its bound by
+                // 6.8% while its k=8192 pre-fix reading moved 7.6% between sessions on a
+                // different seed, so that row can flip without anything being wrong.
+                bool deepest = k == Shapes[^1].k;
+                string verdict = relQ >= MmqRelBound(family)
+                    ? "violated as expected"
+                    : deepest
+                        ? "NOT violated at the DEEPEST shape — this family's gate does not "
+                          + "discriminate the fix it is supposed to hold, which is a finding"
+                        : "not violated (shallow shape; this bound guards deep-K only)";
+                sb.AppendLine($"     [pre-fix arm] bound {MmqRelBound(family):E3} {verdict}");
+            }
+            else
+            {
+                Assert.True(relQ < MmqRelBound(family),
+                    $"{family} MMQ (prefill) accuracy has regressed at m={m} k={k}: relative rms "
+                    + $"{relQ:E3} >= {MmqRelBound(family):E3}." + Environment.NewLine + sb);
+            }
         }
 
         _out.WriteLine(sb.ToString());
@@ -191,6 +259,7 @@ public sealed class Probe545KQuantMmqTests
 
     private static float[] RandomFloats(QuantFamily f, Random rng, int count) => f switch
     {
+        QuantFamily.Q3_K => Q3KFixture.RandomFloats(rng, count, 1.0f),
         QuantFamily.Q5_K => Q5KFixture.RandomFloats(rng, count, 1.0f),
         QuantFamily.Q6_K => Q6KFixture.RandomFloats(rng, count, 1.0f),
         QuantFamily.IQ4_NL or QuantFamily.IQ4_XS => Iq4Fixture.RandomFloats(rng, count, 1.0f),
@@ -202,6 +271,7 @@ public sealed class Probe545KQuantMmqTests
         float[] src = RandomFloats(f, rng, m * k);
         return f switch
         {
+            QuantFamily.Q3_K => Q3KFixture.QuantizeRows(src, m, k),
             QuantFamily.Q5_K => Q5KFixture.QuantizeRows(src, m, k),
             QuantFamily.Q6_K => Q6KFixture.QuantizeRows(src, m, k),
             QuantFamily.IQ4_NL => Iq4Fixture.QuantizeRowsIq4Nl(src, m, k),
@@ -218,10 +288,22 @@ public sealed class Probe545KQuantMmqTests
     {
         switch (f)
         {
+            case QuantFamily.Q3_K:
+            {
+                using var v = MatMulQ3KMmvqKernel.TryCreate(device, spvDir);
+                using var q = MatMulQ3KMmqKernel.TryCreate(device, spvDir, MmqShader(f));
+                if (v is null || q is null) return false;
+                using var ctx = device.CreateSubmitContext();
+                ctx.Begin();
+                v.Record(ctx.CommandBuffer, w, xq, xds, outV, m, k);
+                q.Record(ctx.CommandBuffer, w, xq, xds, outQ, m, k, 1);
+                ctx.SubmitAndWait();
+                return true;
+            }
             case QuantFamily.Q5_K:
             {
                 using var v = MatMulQ5KMmvqKernel.TryCreate(device, spvDir);
-                using var q = MatMulQ5KMmqKernel.TryCreate(device, spvDir);
+                using var q = MatMulQ5KMmqKernel.TryCreate(device, spvDir, MmqShader(f));
                 if (v is null || q is null) return false;
                 using var ctx = device.CreateSubmitContext();
                 ctx.Begin();
@@ -233,7 +315,7 @@ public sealed class Probe545KQuantMmqTests
             case QuantFamily.Q6_K:
             {
                 using var v = MatMulQ6KMmvqKernel.TryCreate(device, spvDir);
-                using var q = MatMulQ6KMmqKernel.TryCreate(device, spvDir);
+                using var q = MatMulQ6KMmqKernel.TryCreate(device, spvDir, MmqShader(f));
                 if (v is null || q is null) return false;
                 using var ctx = device.CreateSubmitContext();
                 ctx.Begin();
@@ -245,7 +327,7 @@ public sealed class Probe545KQuantMmqTests
             case QuantFamily.IQ4_NL:
             {
                 using var v = MatMulIq4NlMmvqKernel.TryCreate(device, spvDir);
-                using var q = MatMulIq4NlMmqKernel.TryCreate(device, spvDir);
+                using var q = MatMulIq4NlMmqKernel.TryCreate(device, spvDir, MmqShader(f));
                 if (v is null || q is null) return false;
                 using var ctx = device.CreateSubmitContext();
                 ctx.Begin();
@@ -257,7 +339,7 @@ public sealed class Probe545KQuantMmqTests
             case QuantFamily.IQ4_XS:
             {
                 using var v = MatMulIq4XsMmvqKernel.TryCreate(device, spvDir);
-                using var q = MatMulIq4XsMmqKernel.TryCreate(device, spvDir);
+                using var q = MatMulIq4XsMmqKernel.TryCreate(device, spvDir, MmqShader(f));
                 if (v is null || q is null) return false;
                 using var ctx = device.CreateSubmitContext();
                 ctx.Begin();

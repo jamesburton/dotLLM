@@ -161,6 +161,7 @@ public sealed class Bench545KQuantMmqTests
         {
             nint pipeline = family switch
             {
+                QuantFamily.Q3_K => Cache<MatMulQ3KMmqKernel>.Get(name, () => MatMulQ3KMmqKernel.TryCreate(device, spvDir, name)!).PipelineHandle,
                 QuantFamily.Q5_K => Cache<MatMulQ5KMmqKernel>.Get(name, () => MatMulQ5KMmqKernel.TryCreate(device, spvDir, name)!).PipelineHandle,
                 QuantFamily.Q6_K => Cache<MatMulQ6KMmqKernel>.Get(name, () => MatMulQ6KMmqKernel.TryCreate(device, spvDir, name)!).PipelineHandle,
                 QuantFamily.IQ4_NL => Cache<MatMulIq4NlMmqKernel>.Get(name, () => MatMulIq4NlMmqKernel.TryCreate(device, spvDir, name)!).PipelineHandle,
@@ -176,6 +177,7 @@ public sealed class Bench545KQuantMmqTests
 
     private static string BaseName(QuantFamily f) => f switch
     {
+        QuantFamily.Q3_K => "matmul_q3_k_mmq",
         QuantFamily.Q5_K => "matmul_q5_k_mmq",
         QuantFamily.Q6_K => "matmul_q6_k_mmq",
         QuantFamily.IQ4_NL => "matmul_iq4_nl_mmq",
@@ -197,6 +199,11 @@ public sealed class Bench545KQuantMmqTests
         string name = BaseName(f) + (baseline ? "_pre545" : "");
         switch (f)
         {
+            case QuantFamily.Q3_K:
+            {
+                var kern = Cache<MatMulQ3KMmqKernel>.Get(name, () => MatMulQ3KMmqKernel.TryCreate(device, spvDir, name)!);
+                kern.Record(cmd, w, xq, xds, c, m, k, n); break;
+            }
             case QuantFamily.Q5_K:
             {
                 var kern = Cache<MatMulQ5KMmqKernel>.Get(name, () => MatMulQ5KMmqKernel.TryCreate(device, spvDir, name)!);

@@ -1,4 +1,9 @@
 #version 450
+// BENCH BASELINE ONLY - retained copy of matmul_q3_k_mmq.comp as it stood before
+// #545's two-level accumulation. Not dispatched by the model; it exists so the cost
+// of that change can be measured same-session and order-reversed against the kernel
+// users actually had, in ONE process. Retired once #545's numbers are no longer being
+// re-derived; restore from history and verify byte-identical before trusting it.
 #extension GL_EXT_integer_dot_product : require
 // Q3_K MMQ prefill GEMM: integer-dot (dp4a) batched matrix multiply.
 //
@@ -46,14 +51,6 @@ const uint TM = 4u;              // weight rows per thread (strided by 16)
 const uint TN = 4u;              // token rows per thread (strided by 16)
 const uint SB_BYTES     = 110u;
 const uint SUBS_PER_HALF = 8u;   // 16-element sub-blocks per half-super-block chunk
-// #545: fold the partial into the running total every FLUSH_ITERS OUTER (kSB)
-// iterations. Counted in outer iterations deliberately - a per-half fold was tried
-// on another family in this campaign and changed NOTHING, bit for bit, because that
-// shader did exactly one accumulate per chunk and the fold had granularity 1. Here
-// each kSB does 2 halves x SUBS_PER_HALF = 16 accumulates, the deepest sequential
-// run in the K-quant MMQ family, so a window of 4 outer iterations is 64 products
-// per partial against the whole K/256 row before.
-const uint FLUSH_ITERS = 4u;
 const uint CHUNK_UINTS  = 32u;   // 128 int8 / 4 per row per half
 const uint CHUNK_STRIDE = 33u;   // +1 uint pad → LDS bank-conflict-free strided reads
 const uint CHUNKS_PER_HALF = 4u; // 32-element Q8_1 blocks per half-super-block
@@ -134,26 +131,11 @@ void main() {
     uint rowByteStride = pc.blocksPerRow * SB_BYTES;
 
     float acc[TM][TN];
-    float accPart[TM][TN];   // #545: partial over FLUSH_ITERS outer iterations
     for (uint i = 0u; i < TM; i++)
-        for (uint j = 0u; j < TN; j++) {
+        for (uint j = 0u; j < TN; j++)
             acc[i][j] = 0.0;
-            accPart[i][j] = 0.0;
-        }
 
     for (uint kSB = 0u; kSB < pc.blocksPerRow; kSB++) {
-        // #545: fold the PREVIOUS window's partial HERE, at the top of the body,
-        // not at the bottom. Same arithmetic; the point is liveness - at the bottom
-        // the partial overlaps dotI[TM][TN] and the staged tiles, which on Q6_K
-        // measured 120 -> 132 VGPRs, across the 128 line.
-        if ((kSB % FLUSH_ITERS) == 0u && kSB > 0u) {
-            for (uint i = 0u; i < TM; i++)
-                for (uint j = 0u; j < TN; j++) {
-                    acc[i][j] += accPart[i][j];
-                    accPart[i][j] = 0.0;
-                }
-        }
-
         for (uint h = 0u; h < 2u; h++) {
             // ---- 1. Stage weights: 64 rows × 32 element-order uints (decode qs+hmask). ----
             for (uint s = 0u; s < 8u; s++) {
@@ -241,7 +223,7 @@ void main() {
                     float dsc = sharedWdsc[(tx + 16u * i) * SUBS_PER_HALF + subL];
                     for (uint j = 0u; j < TN; j++) {
                         float dX = sharedXd[(ty + 16u * j) * CHUNKS_PER_HALF + (subL >> 1u)];
-                        accPart[i][j] += dsc * (dX * float(dotI[i][j]));
+                        acc[i][j] += dsc * (dX * float(dotI[i][j]));
                     }
                 }
             }
@@ -249,11 +231,6 @@ void main() {
             barrier();
         }
     }
-
-    // #545: the last, possibly short, window.
-    for (uint i = 0u; i < TM; i++)
-        for (uint j = 0u; j < TN; j++)
-            acc[i][j] += accPart[i][j];
 
     for (uint j = 0u; j < TN; j++) {
         uint t = tBase + ty + 16u * j;
