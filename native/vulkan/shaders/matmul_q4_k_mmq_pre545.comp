@@ -1,4 +1,10 @@
 #version 450
+// BENCH BASELINE ONLY - retained copy of matmul_q4_k_mmq.comp as it stood before
+// #545's two-level accumulation. Not dispatched by the model; it exists so the cost
+// of that change can be measured same-session and order-reversed against the kernel
+// users actually had, in ONE process (this box's cold-vs-warm process launches have
+// produced 2-3x phantom deltas). Delete it when #545's numbers are no longer being
+// re-derived.
 #extension GL_EXT_integer_dot_product : require
 // Q4_K MMQ prefill GEMM: integer-dot (dp4a) batched matrix multiply.
 //
@@ -107,12 +113,9 @@ void main() {
     uint rowByteStride = pc.blocksPerRow * SB_BYTES;
 
     float acc[TM][TN];
-    float accPart[TM][TN];   // EXPERIMENT #545: partial over one super-block
     for (uint i = 0u; i < TM; i++)
-        for (uint j = 0u; j < TN; j++) {
+        for (uint j = 0u; j < TN; j++)
             acc[i][j] = 0.0;
-            accPart[i][j] = 0.0;
-        }
 
     for (uint kSB = 0u; kSB < pc.blocksPerRow; kSB++) {
         for (uint h = 0u; h < 2u; h++) {
@@ -217,21 +220,13 @@ void main() {
                     for (uint j = 0u; j < TN; j++) {
                         float dx = sharedXd[(ty + 16u * j) * SUBS_PER_CHUNK + jl];
                         float sx = sharedXs[(ty + 16u * j) * SUBS_PER_CHUNK + jl];
-                        accPart[i][j] += dsc * (dx * float(dotI[i][j])) - dmn * sx;
+                        acc[i][j] += dsc * (dx * float(dotI[i][j])) - dmn * sx;
                     }
                 }
             }
 
             barrier();
         }
-
-        // EXPERIMENT #545: one super-block == 2 chunks x SUBS_PER_CHUNK = 8
-        // accumulations, exactly Q8_0's FLUSH_BLOCKS, so no counter is needed.
-        for (uint i = 0u; i < TM; i++)
-            for (uint j = 0u; j < TN; j++) {
-                acc[i][j] += accPart[i][j];
-                accPart[i][j] = 0.0;
-            }
     }
 
     for (uint j = 0u; j < TN; j++) {
