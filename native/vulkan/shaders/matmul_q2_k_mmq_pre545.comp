@@ -1,4 +1,10 @@
 #version 450
+// BENCH BASELINE ONLY - retained copy of matmul_q2_k_mmq.comp as it stood before
+// #545's two-level accumulation. Not dispatched by the model; it exists so the cost
+// of that change can be measured same-session and order-reversed against the kernel
+// users actually had, in ONE process, and so DOTLLM_545_PRE_FIX=1 can re-derive the
+// pre-fix accuracy. Retired once #545's numbers are no longer being re-derived;
+// restore from history and verify byte-identical before trusting it.
 #extension GL_EXT_integer_dot_product : require
 // Q2_K MMQ prefill GEMM: integer-dot (dp4a) batched matrix multiply.
 //
@@ -42,17 +48,6 @@ const uint TILE_M = 16u;
 const uint TILE_N = 16u;
 const uint SB_BYTES     = 84u;
 const uint SUBS         = 16u;   // 16-element sub-blocks per super-block
-// #545: fold the partial into the running total every FLUSH_ITERS OUTER (kSB)
-// iterations. Counted in outer iterations deliberately - a per-sub-block fold was
-// tried on another family in this campaign and changed NOTHING, bit for bit, because
-// the fold had granularity 1 there. Q2_K does SUBS = 16 sub-blocks per super-block
-// and TWO additions each (the dsc term and the dmin correction), so a window of 4
-// outer iterations is 128 additions per partial against the whole K/256 row before.
-//
-// Unlike the acc[TM][TN] families (Q3_K/Q4_K/Q5_K/Q6_K/IQ4_XS/Q8_0) this shader owns
-// ONE output cell per thread, so the partial is a single float rather than sixteen -
-// the register-pressure risk that gated IQ4_NL out does not arise here.
-const uint FLUSH_ITERS  = 4u;
 const uint CHUNKS       = 8u;    // 32-element Q8_1 blocks per super-block
 const uint UINTS_PER_SB = 64u;   // 256 int8 / 4
 
@@ -100,17 +95,8 @@ void main() {
 
     uint rowByteStride = pc.blocksPerRow * SB_BYTES;
     float acc = 0.0;
-    float accPart = 0.0;    // #545: partial over FLUSH_ITERS outer iterations
 
     for (uint kSB = 0u; kSB < pc.blocksPerRow; kSB++) {
-        // #545: fold the PREVIOUS window's partial HERE, at the top of the body, not
-        // at the bottom. Same arithmetic; the point is liveness - at the bottom the
-        // partial overlaps the staged tiles, which on Q6_K measured 120 -> 132 VGPRs.
-        if ((kSB % FLUSH_ITERS) == 0u && kSB > 0u) {
-            acc += accPart;
-            accPart = 0.0;
-        }
-
         // ---- 1. Stage weights: 16 rows × 64 element-order uints (decode 2-bit). ----
         for (uint s = 0u; s < 4u; s++) {
             uint idx = tid + s * 256u;       // 0..1023
@@ -184,15 +170,13 @@ void main() {
                     sumXq = dotPacked4x8AccSatEXT(0x01010101, xv, sumXq);
                 }
                 float dX = sharedXd[tRow * CHUNKS + (sub >> 1u)]; // 2 sub-16 share a 32-block d_x
-                accPart += sharedWdsc[wRow * SUBS + sub] * (dX * float(dotI))
-                         - sharedWdmn[wRow * SUBS + sub] * (dX * float(sumXq));
+                acc += sharedWdsc[wRow * SUBS + sub] * (dX * float(dotI))
+                     - sharedWdmn[wRow * SUBS + sub] * (dX * float(sumXq));
             }
         }
 
         barrier();
     }
-
-    acc += accPart;   // #545: the last, possibly short, window.
 
     if (m < pc.M && t < pc.N) {
         c[t * pc.M + m] = acc;
