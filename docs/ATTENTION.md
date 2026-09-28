@@ -200,6 +200,55 @@ Gate on the **instance** property `SupportedMaxHeadDim`, never on the `MaxHeadDi
 
 Env-var opt-out: `DOTLLM_VULKAN_DISABLE_FLASH_ATTENTION=1` forces every dispatch onto the legacy per-token kernel. The FA path is null when the SPV is missing (older builds) or when head_dim exceeds every loaded shader bound — both gates fall back automatically.
 
+### Coopmat prefill numerics — what is f16, and the position-dependent bound (#543)
+
+`attention_flash_f32_coopmat{,_hd64}.comp` stages its operands as f16 for the matrix cores.
+That makes **multi-token prefill less accurate than a 1-token chunk**, which takes the dense
+f32 path — so incremental and single-pass prefill of the same tokens wrote different KV
+(#543, the same reachability class as #533: prefix-cache reuse and multi-turn continuation).
+
+Two things worth knowing before touching this:
+
+- **The P·V accumulator was always f32** (`coopmat<float, ...>`, stricter than llama.cpp cm1's
+  f16 default). The error is from f16 **inputs**, so "accumulate in f32" is not an available
+  fix — it is already done.
+- **There is no f32 cooperative-matrix type on gfx1151.** The driver reports 11 tile shapes,
+  all 16x16x16, every one f16 or 8-bit integer
+  (`VulkanSubgroupProbeTests` prints the table). An f32-input coopmat attention is unavailable
+  at any price on this hardware; do not plan around one.
+
+What #543 changed: with #533's gate on (every non-NVIDIA device) the KV-length-**dependent**
+tiles already bypass `coopMatMulAdd` and take a scalar tail, so their accuracy was set by
+staging precision. That tail now reads full f32 — P from `sTile` (written back over the score
+it came from, so no extra LDS), V staged f32 through `oStage` (idle on exactly those tiles),
+and the mask pass writes 0.0 into `sTile`'s dead padding rows so the tail is branch-free.
+It is both more accurate **and faster** (+6.5% p512, +4% hd128, neutral p2048).
+
+**The bound is position-dependent and that matters more than the headline number.** A query row
+at position p spans `ceil((p+1)/64)` KV tiles of which at most ~2 are scalar-tail tiles, so
+the gain decays; maxAbs against the scalar f32 FA kernel, per 64-row block of a p512 prefill:
+
+| rows | 0+ | 64+ | 128+ | 256+ | 448+ |
+|---|---|---|---|---|---|
+| before #543 | 3.296E-04 | 8.597E-05 | 6.918E-05 | 4.536E-05 | 3.520E-05 |
+| after | 1.446E-04 | 8.469E-05 | 6.208E-05 | 4.402E-05 | 3.863E-05 |
+
+At rows 0-63 (where every tile is a tail tile) that is 2.28x and the #543 acceptance
+measurement — the per-layer KV bisect of a 1-token first chunk against a single-pass prefill,
+F32-decoded Llama-3.2-1B — goes to **bit-identical across all 16 layers**. Past row ~256 it is
+level: **QK^T is still f16-in on every tile and is the whole residual.**
+
+Raising the coopmat tiles too (split-f16 V: `V_hi`, `V_lo = f16(v - V_hi)`, two `coopMatMulAdd`s)
+was built and measured: 1.22-1.47x on the rows above for 2.7%, but only where `V_lo`'s storage
+is free — `headDim <= 64` in the 128-dim shader, i.e. `seqKv < 640` before the #378 gate takes
+over. Both routes out of that window cost 15-24%; see the hd64 shader's occupancy header for
+the LDS reason and `.docs/ISSUE_543_MEASUREMENTS.md` for every arm.
+
+**Gates.** `Probe533FixCandidateTests` holds an *absolute* accuracy bound (2.0E-04 at
+seqQ=seqKv=64) plus `attention_flash_f32_coopmat_pre543`, a retained pre-fix shader that must
+**exceed** it — a bound nothing in the tree can violate is not a gate. It also prints the
+per-64-row-block decay, so the coverage ceiling stays measured rather than argued.
+
 ### Wide heads (head_dim > 128) and the silent-fallback diagnostic — issue #441
 
 `attention_flash_f32.comp` bakes `MAX_HEAD_DIM = 128` into its `qTile` / `outAccum` shared-memory **declarations**, so it is a hard dispatch gate, not a slow path. Bonsai 2 (`qwen35`) declares `attention.key_length = value_length = 256`, so all 16 of its full-attention layers ran the per-token kernel on every prefill — **~20 % of the whole pass**, with nothing warning about it. It took a per-op profiling campaign to notice, which is the real defect.
