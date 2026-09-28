@@ -51,8 +51,21 @@
 // tolerance and the end-to-end greedy-token gate live in
 // VulkanFlashAttentionCoopmatKernelTests.
 //
-// Occupancy: LDS ≈ 30 KB (q 4 KB + kv 16 KB shared between K and V phases +
-// scores 4.1 KB + P 2.1 KB + O-stage 4 KB) -> 2 workgroups per RDNA3.5 WGP.
+// Occupancy: this variant's LDS is 21504 B (driver-reported), NOT the base
+// shader's 31744 B — halving MAX_HEAD_DIM halves qTile and kvTile. 65536 / 21504
+// = 3.05, so this shader gets **3 workgroups per RDNA3.5 WGP** where the 128-dim
+// one gets 2.
+//
+// THE BUDGET TO STAY AT 3 IS 65536 / 3 = 21845 B, i.e. 341 BYTES OF HEADROOM.
+// Do not add a shared array here without re-measuring. MEASURED (#543): 2 KB of
+// dead shared memory, written under a runtime-false condition so the compiler
+// cannot strip it, costs **21% at p2048** — and 8 KB costs no more than 2 KB,
+// because it is one occupancy step (3 -> 2 workgroups), not a gradient. That is
+// what refuted extending #543's split-f16 V arm into this shader: an 8 KB V_lo
+// tile lands at 29696 B, which looks safe against the 32768 B the 128-dim shader
+// lives beneath, and is not, because the relevant divisor was never 2.
+//
+// (The 128-dim shader's note below describes ITS 31744 B -> 2 workgroups.)
 // The 2026-04 opt-in attention_f32_coopmat.comp kept ~40 KB resident at WG=64
 // (one wave) — one of the two reasons it measured 1.27-1.56x SLOWER than the
 // scalar kernels (the other: it was benchmarked at decode shapes, where

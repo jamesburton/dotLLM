@@ -39,12 +39,6 @@ public sealed class Probe543AttentionShaderInfoTests
     private static readonly string[] Arms =
     [
         "attention_flash_f32_coopmat",
-        "attention_flash_f32_coopmat_v4f32tail",
-        "attention_flash_f32_coopmat_v4af32v",
-        "attention_flash_f32_coopmat_v4bf32p",
-        "attention_flash_f32_coopmat_v4cstagev",
-        "attention_flash_f32_coopmat_v4dpackv",
-        "attention_flash_f32_coopmat_v4enobranch",
     ];
 
     [SkippableFact]
