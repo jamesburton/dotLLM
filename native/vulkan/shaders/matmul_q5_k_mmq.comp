@@ -139,6 +139,19 @@ void main() {
         }
 
     for (uint kSB = 0u; kSB < pc.blocksPerRow; kSB++) {
+        // #545: fold the PREVIOUS window's partial here, at the TOP of the body,
+        // not at the bottom. Same arithmetic; the point is liveness. At the bottom
+        // the partial overlaps dotI[TM][TN] and the staged tiles, which measured
+        // 120 -> 132 VGPRs on Q6_K — across the 128 line, halving waves per SIMD
+        // and costing 10-30% throughput. At the top it measures 117.
+        if ((kSB % FLUSH_ITERS) == 0u && kSB > 0u) {
+            for (uint i = 0u; i < TM; i++)
+                for (uint j = 0u; j < TN; j++) {
+                    acc[i][j] += accPart[i][j];
+                    accPart[i][j] = 0.0;
+                }
+        }
+
         for (uint h = 0u; h < 2u; h++) {
             // ---- 1. Stage weights: decode 64 rows × 16 qs-uints → 64 × 32 int8-uints. ----
             // Chunk h uses qs words u = 16h..16h+15 (pairs p = 2h, 2h+1 → local
@@ -247,15 +260,6 @@ void main() {
             barrier();
         }
     
-        // #545: fold the partial into the running total every FLUSH_ITERS
-        // iterations. The branch is workgroup-uniform (kSB is the loop counter).
-        if ((kSB % FLUSH_ITERS) == FLUSH_ITERS - 1u) {
-            for (uint i = 0u; i < TM; i++)
-                for (uint j = 0u; j < TN; j++) {
-                    acc[i][j] += accPart[i][j];
-                    accPart[i][j] = 0.0;
-                }
-        }
 }
 
     // Tail: the iteration count need not be a multiple of FLUSH_ITERS.
