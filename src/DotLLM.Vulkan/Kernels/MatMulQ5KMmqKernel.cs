@@ -38,6 +38,9 @@ public sealed class MatMulQ5KMmqKernel : IDisposable
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
+    /// <summary>Test-visible pipeline handle for VK_AMD_shader_info diagnostics (#545).</summary>
+    internal nint PipelineHandle => _pipeline.Pipeline;
+
     private bool _disposed;
 
     private MatMulQ5KMmqKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)

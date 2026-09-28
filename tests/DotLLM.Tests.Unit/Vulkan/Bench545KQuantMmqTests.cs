@@ -37,7 +37,15 @@ namespace DotLLM.Tests.Unit.Vulkan;
 [Collection("VulkanKernels")]
 public sealed class Bench545KQuantMmqTests
 {
-    private const int Passes = 9;
+    /// <summary>
+    /// Pass count, overridable with <c>DOTLLM_545_BENCH_PASSES</c>. The default of
+    /// 9 is enough to see a large effect; settling a few-percent difference on
+    /// this box needs considerably more, because UMA contention and clock ramp
+    /// give per-pass spans of ~1.7x on a quiet machine and worse on a busy one.
+    /// </summary>
+    private static int Passes =>
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_545_BENCH_PASSES"), out int p) && p > 0 ? p : 9;
+
     private const int Batch = 4;
     private const int WarmupPasses = 2;
 
@@ -71,7 +79,7 @@ public sealed class Bench545KQuantMmqTests
         var sb = new StringBuilder();
         sb.AppendLine($"{family} on {device.DeviceName}");
         sb.AppendLine($"Passes={Passes} (median, min-max), Batch={Batch} dispatches/pass, order reversed per pass.");
-        sb.AppendLine("| shape (n,m,k) | baseline us (min-max) | #545 us (min-max) | speedup (median) |");
+        sb.AppendLine("| shape (n,m,k) | baseline us med [IQR] (min-max) | #545 us med [IQR] (min-max) | speedup (median) |");
         sb.AppendLine("|---|---:|---:|---:|");
 
         foreach ((int n, int m, int k) in Shapes)
@@ -117,9 +125,15 @@ public sealed class Bench545KQuantMmqTests
                 else { newUs.Add(Time(false)); baseUs.Add(Time(true)); }
             }
             baseUs.Sort(); newUs.Sort();
-            double bMed = baseUs[Passes / 2], nMed = newUs[Passes / 2];
-            sb.AppendLine($"| ({n},{m},{k}) | {bMed:F2} ({baseUs[0]:F2}-{baseUs[^1]:F2}) "
-                        + $"| {nMed:F2} ({newUs[0]:F2}-{newUs[^1]:F2}) | {bMed / nMed:F3}x |");
+            int passes = baseUs.Count;
+            double bMed = baseUs[passes / 2], nMed = newUs[passes / 2];
+            // Quartiles as well as the full span: a ratio of medians is only
+            // meaningful if the middle of each distribution is tight, and the full
+            // min-max is dominated by one-off stalls.
+            double bQ1 = baseUs[passes / 4], bQ3 = baseUs[passes * 3 / 4];
+            double nQ1 = newUs[passes / 4], nQ3 = newUs[passes * 3 / 4];
+            sb.AppendLine($"| ({n},{m},{k}) | {bMed:F1} [{bQ1:F1}-{bQ3:F1}] ({baseUs[0]:F1}-{baseUs[^1]:F1}) "
+                        + $"| {nMed:F1} [{nQ1:F1}-{nQ3:F1}] ({newUs[0]:F1}-{newUs[^1]:F1}) | {bMed / nMed:F3}x |");
         }
 
         _out.WriteLine(sb.ToString());
@@ -131,22 +145,29 @@ public sealed class Bench545KQuantMmqTests
     /// shaders already carry heavier unpack state. This asks the driver directly
     /// (VK_AMD_shader_info) rather than inferring occupancy from timings.
     /// </summary>
-    [SkippableFact]
-    public void Q6K_Mmq_RegisterCost_PreVsPost()
+    [SkippableTheory]
+    [MemberData(nameof(Probe545KQuantMmqTests.Families), MemberType = typeof(Probe545KQuantMmqTests))]
+    public void KQuant_Mmq_RegisterCost_PreVsPost(QuantFamily family)
     {
         Skip.IfNot(Enabled, "DOTLLM_545_BENCH=1 to enable.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
         Skip.IfNot(device.HasIntegerDotProduct, "No integer dot product.");
         Skip.IfNot(device.HasShaderInfoAmd, "Device/driver does not advertise VK_AMD_shader_info.");
-        Skip.IfNot(File.Exists(Path.Combine(spvDir, "matmul_q6_k_mmq_pre545.spv")),
-            "matmul_q6_k_mmq_pre545.spv absent — baseline retired.");
+        Skip.IfNot(File.Exists(Path.Combine(spvDir, BaseName(family) + "_pre545.spv")),
+            $"{BaseName(family)}_pre545.spv absent — baseline retired.");
 
-        foreach (string name in new[] { "matmul_q6_k_mmq_pre545", "matmul_q6_k_mmq" })
+        foreach (string name in new[] { BaseName(family) + "_pre545", BaseName(family) })
         {
-            using var kern = MatMulQ6KMmqKernel.TryCreate(device, spvDir, name)
-                ?? throw new Xunit.Sdk.XunitException($"{name}.spv missing or unsupported.");
-            var st = device.GetShaderStatisticsAmd(kern.PipelineHandle);
+            nint pipeline = family switch
+            {
+                QuantFamily.Q5_K => Cache<MatMulQ5KMmqKernel>.Get(name, () => MatMulQ5KMmqKernel.TryCreate(device, spvDir, name)!).PipelineHandle,
+                QuantFamily.Q6_K => Cache<MatMulQ6KMmqKernel>.Get(name, () => MatMulQ6KMmqKernel.TryCreate(device, spvDir, name)!).PipelineHandle,
+                QuantFamily.IQ4_NL => Cache<MatMulIq4NlMmqKernel>.Get(name, () => MatMulIq4NlMmqKernel.TryCreate(device, spvDir, name)!).PipelineHandle,
+                QuantFamily.IQ4_XS => Cache<MatMulIq4XsMmqKernel>.Get(name, () => MatMulIq4XsMmqKernel.TryCreate(device, spvDir, name)!).PipelineHandle,
+                _ => throw new ArgumentOutOfRangeException(nameof(family)),
+            };
+            var st = device.GetShaderStatisticsAmd(pipeline);
             _out.WriteLine($"{name}: VGPRs {st.resourceUsage.numUsedVgprs}/{st.numAvailableVgprs}  "
                          + $"SGPRs {st.resourceUsage.numUsedSgprs}  LDS {st.resourceUsage.ldsUsageSizeInBytes}B  "
                          + $"scratch {st.resourceUsage.scratchMemUsageInBytes}B");
