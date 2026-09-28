@@ -342,10 +342,28 @@ public sealed class Probe533FixCandidateTests
         }
         if (scalarErrorByCandidate.TryGetValue(Pre543Candidate, out float preErr))
         {
-            Assert.True(preErr > Pre543Bound,
-                $"The retained pre-#543 control measured {preErr:E3}, inside the bound this gate " +
-                $"asserts production stays under ({Pre543Bound:E3}). The gate is no longer " +
-                "discriminating: re-derive the control (it must keep the f16-staged tail).");
+            // The control has to be skipped on the SAME condition as production, and
+            // for a sharper reason than symmetry. Where requireInvariantPv resolves to
+            // 0, BOTH arms compile their tail out and run the identical all-coopmat
+            // path, so the control's 3.3E-04 clears the bound because it is measuring
+            // the same thing production is — not because it is the pre-fix numerics.
+            // Asserting it there passes while discriminating nothing, which reads as
+            // "control validated" when the control was never exercised.
+            if (gateByCandidate[Pre543Candidate] == 0u)
+            {
+                sb.AppendLine($"#543 control NOT EXERCISED: pre543 also resolves " +
+                              $"requireInvariantPv to 0 here, so it is the same all-coopmat path as " +
+                              $"production ({preErr:E3}). Neither half of the bound discriminates on " +
+                              $"this vendor; run it on one the #533 gate applies to.");
+                _out.WriteLine(sb.ToString());
+            }
+            else
+            {
+                Assert.True(preErr > Pre543Bound,
+                    $"The retained pre-#543 control measured {preErr:E3}, inside the bound this gate " +
+                    $"asserts production stays under ({Pre543Bound:E3}). The gate is no longer " +
+                    "discriminating: re-derive the control (it must keep the f16-staged tail).");
+            }
         }
 
         // The control must fire — but ONLY on hardware that actually has the
