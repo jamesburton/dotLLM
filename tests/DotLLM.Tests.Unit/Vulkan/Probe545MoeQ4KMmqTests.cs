@@ -71,6 +71,15 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// still guarded against drifting worse.
 /// </para>
 /// <para>
+/// <b>This bound cannot be shown to discriminate, by construction, and that is the
+/// one place this probe departs from the campaign's rule that a gate must have
+/// something in the tree that violates it.</b> It is sized above the UNFIXED
+/// accuracy, so every arm — unfixed, form A, form B — reads "within" it. It is a
+/// drift guard, not a fix gate; the same is true of IQ4_NL's bound for the same
+/// reason. If the fix is ever taken here, tighten it to 1.85e-7 and the retained
+/// pre-fix shader then becomes a real discriminating control.
+/// </para>
+/// <para>
 /// To re-derive any of it: restore <c>moe_indexed_matmul_q4_k_q8_1_pre545.comp</c> (and
 /// the A/B/ballast variants) from this branch's history, and select one with
 /// <c>DOTLLM_545_MOE_ARM=&lt;spv base name&gt;</c>. The cost test skips itself when the
