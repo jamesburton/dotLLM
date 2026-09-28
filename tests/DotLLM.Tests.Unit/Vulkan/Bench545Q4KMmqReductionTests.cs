@@ -9,13 +9,13 @@ using Xunit.Abstractions;
 namespace DotLLM.Tests.Unit.Vulkan;
 
 /// <summary>
-/// Cost side of issue #544 — what the two-level accumulation in
-/// <c>matmul_q8_0_mmq.comp</c> costs the prefill GEMM.
+/// Cost side of issue #545 — what the two-level accumulation in
+/// <c>matmul_q4_k_mmq.comp</c> costs the prefill GEMM.
 /// </summary>
 /// <remarks>
 /// <para>
 /// The accuracy side lives in <see cref="Probe538Q8SplitTests"/>. This measures
-/// the shipping kernel against <c>matmul_q8_0_mmq_pre544</c> — a retained copy of
+/// the shipping kernel against <c>matmul_q4_k_mmq_pre545</c> — a retained copy of
 /// the shader as it stood before the change, which compiles byte-identical to the
 /// SPIR-V on <c>dev</c> — so the comparison is against what users actually had.
 /// </para>
@@ -27,14 +27,14 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// order-reversed ratio is trustworthy. Medians and min-max are reported rather
 /// than single numbers.
 /// </para>
-/// <para>Opt-in: <c>DOTLLM_544_BENCH=1</c>. It is a benchmark, not a gate.</para>
+/// <para>Opt-in: <c>DOTLLM_545_BENCH=1</c>. It is a benchmark, not a gate.</para>
 /// <para>
-/// Skips when <c>matmul_q8_0_mmq_pre544.spv</c> is absent, which is the normal state once the
+/// Skips when <c>matmul_q4_k_mmq_pre545.spv</c> is absent, which is the normal state once the
 /// issue has landed — the baseline is retired rather than carried forever. To
 /// re-derive the numbers, restore it from history and recompile:
 /// <code>
-/// git show &lt;pre-544-rev&gt;:native/vulkan/shaders/matmul_q8_0_mmq.comp \n///   &gt; native/vulkan/shaders/matmul_q8_0_mmq_pre544.comp
-/// glslc --target-env=vulkan1.2 -o native/vulkan/spv/matmul_q8_0_mmq_pre544.spv \n///   native/vulkan/shaders/matmul_q8_0_mmq_pre544.comp
+/// git show &lt;pre-545-rev&gt;:native/vulkan/shaders/matmul_q4_k_mmq.comp \n///   &gt; native/vulkan/shaders/matmul_q4_k_mmq_pre545.comp
+/// glslc --target-env=vulkan1.2 -o native/vulkan/spv/matmul_q4_k_mmq_pre545.spv \n///   native/vulkan/shaders/matmul_q4_k_mmq_pre545.comp
 /// </code>
 /// Verify the result is byte-identical to the shipped spv at that revision
 /// before trusting it as a baseline.
@@ -42,19 +42,17 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// </remarks>
 [Trait("Category", "GPU")]
 [Collection("VulkanKernels")]
-public sealed class Bench544MmqReductionTests
+public sealed class Bench545Q4KMmqReductionTests
 {
-    private const int Q8_0BlockBytes = 34;
-    private const int Q8_0GroupSize = 32;
     private const int Passes = 9;
     private const int Batch = 4;
     private const int WarmupPasses = 2;
 
     private readonly ITestOutputHelper _out;
-    public Bench544MmqReductionTests(ITestOutputHelper output) => _out = output;
+    public Bench545Q4KMmqReductionTests(ITestOutputHelper output) => _out = output;
 
     private static bool Enabled =>
-        string.Equals(Environment.GetEnvironmentVariable("DOTLLM_544_BENCH"), "1", StringComparison.Ordinal);
+        string.Equals(Environment.GetEnvironmentVariable("DOTLLM_545_BENCH"), "1", StringComparison.Ordinal);
 
     /// <summary>(n, m, k) — real prefill shapes, and the K sweep that shows the depth effect.</summary>
     private static readonly (int n, int m, int k)[] Shapes =
@@ -68,34 +66,34 @@ public sealed class Bench544MmqReductionTests
     [SkippableFact]
     public void Mmq_TwoLevelAccumulation_PrefillCost()
     {
-        Skip.IfNot(Enabled, "DOTLLM_544_BENCH=1 to enable.");
+        Skip.IfNot(Enabled, "DOTLLM_545_BENCH=1 to enable.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
         Skip.IfNot(device.HasIntegerDotProduct, "No VK_KHR_shader_integer_dot_product.");
 
         using var quant = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir)
             ?? throw new Xunit.Sdk.XunitException("quantize_q8_1_rows.spv missing.");
-        using var shipped = MatMulQ8_0MmqKernel.TryCreate(device, spvDir)
-            ?? throw new Xunit.Sdk.XunitException("matmul_q8_0_mmq.spv missing.");
-        MatMulQ8_0MmqKernel? baseline =
-            MatMulQ8_0MmqKernel.TryCreate(device, spvDir, 0u, "matmul_q8_0_mmq_pre544");
-        Skip.If(baseline is null, "matmul_q8_0_mmq_pre544.spv missing — nothing to compare against.");
+        using var shipped = MatMulQ4KMmqKernel.TryCreate(device, spvDir)
+            ?? throw new Xunit.Sdk.XunitException("matmul_q4_k_mmq.spv missing.");
+        MatMulQ4KMmqKernel? baseline =
+            MatMulQ4KMmqKernel.TryCreate(device, spvDir, "matmul_q4_k_mmq_pre545");
+        Skip.If(baseline is null, "matmul_q4_k_mmq_pre545.spv missing — nothing to compare against.");
 
         var sb = new StringBuilder();
         sb.AppendLine($"Device: {device.DeviceName} (VendorId 0x{device.VendorId:X4})");
         sb.AppendLine($"Passes={Passes} (median, min-max), Batch={Batch} dispatches/pass, order reversed per pass.");
-        sb.AppendLine("baseline = matmul_q8_0_mmq_pre544 (byte-identical to dev's shipped spv).");
+        sb.AppendLine("baseline = matmul_q4_k_mmq_pre545 (byte-identical to dev's shipped spv).");
         sb.AppendLine();
-        sb.AppendLine("| shape (n,m,k) | baseline us (min-max) | #544 us (min-max) | speedup (median) |");
+        sb.AppendLine("| shape (n,m,k) | baseline us (min-max) | #545 us (min-max) | speedup (median) |");
         sb.AppendLine("|---|---:|---:|---:|");
 
         using (baseline)
         {
             foreach ((int n, int m, int k) in Shapes)
             {
-                var rng = new Random(0x544 + n + m * 7 + k * 13);
-                byte[] weightsQ8 = QuantizeRows(RandomFloats(rng, m * k, 0.1f), m, k);
-                float[] b = RandomFloats(rng, n * k, 1.0f);
+                var rng = new Random(0x545 + n + m * 7 + k * 13);
+                byte[] weightsQ8 = Q4KFixture.QuantizeRows(Q4KFixture.RandomFloats(rng, m * k, 0.1f), m, k);
+                float[] b = Q4KFixture.RandomFloats(rng, n * k, 1.0f);
 
                 using var bufW = device.Allocate(((long)weightsQ8.Length + 3) & ~3L);
                 using var bufB = device.Allocate((long)n * k * sizeof(float));
@@ -114,7 +112,7 @@ public sealed class Bench544MmqReductionTests
                     ctx.SubmitAndWait();
                 }
 
-                double Time(MatMulQ8_0MmqKernel kernel)
+                double Time(MatMulQ4KMmqKernel kernel)
                 {
                     var sw = Stopwatch.StartNew();
                     using var ctx = device.CreateSubmitContext();
@@ -150,24 +148,4 @@ public sealed class Bench544MmqReductionTests
 
     // ─────────────────────────────────────────────────────────────
 
-    private static float[] RandomFloats(Random rng, int count, float range)
-    {
-        var arr = new float[count];
-        for (int i = 0; i < count; i++)
-            arr[i] = (float)((rng.NextDouble() * 2.0 - 1.0) * range);
-        return arr;
-    }
-
-    private static unsafe byte[] QuantizeRows(float[] src, int m, int k)
-    {
-        int rowBytes = (k / Q8_0GroupSize) * Q8_0BlockBytes;
-        var dst = new byte[m * rowBytes];
-        fixed (float* srcPtr = src)
-        fixed (byte* dstPtr = dst)
-        {
-            for (int row = 0; row < m; row++)
-                MatMul.QuantizeF32ToQ8_0(srcPtr + (long)row * k, dstPtr + (long)row * rowBytes, k);
-        }
-        return dst;
-    }
 }
