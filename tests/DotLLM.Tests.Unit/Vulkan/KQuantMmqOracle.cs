@@ -91,6 +91,7 @@ internal static unsafe class KQuantMmqOracle
             long n = (long)m * k;
             switch (family)
             {
+                case QuantFamily.Q2_K: Dequantize.DequantizeQ2_K(p, n, dest); break;
                 case QuantFamily.Q3_K: Dequantize.DequantizeQ3_KScalar(p, n, dest); break;
                 case QuantFamily.Q4_K: Dequantize.DequantizeQ4_KScalar(p, n, dest); break;
                 case QuantFamily.Q5_K: Dequantize.DequantizeQ5_KScalar(p, n, dest); break;
@@ -122,6 +123,7 @@ internal static unsafe class KQuantMmqOracle
 /// <summary>Quant families whose MMQ prefill GEMM #545 covers. Public so it can be a xUnit theory parameter.</summary>
 public enum QuantFamily
 {
+    Q2_K,
     Q3_K,
     Q4_K,
     Q5_K,

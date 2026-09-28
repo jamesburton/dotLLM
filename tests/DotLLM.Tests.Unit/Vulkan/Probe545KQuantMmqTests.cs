@@ -39,6 +39,11 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// The cause is occupancy and it is specific to this shader: it is by far the
 /// lightest of the four — 68 VGPRs, 5120 B LDS, 32 SGPRs — so 16 extra live
 /// floats are proportionally large, and 68 -> 83 VGPRs loses a wave slot, which
+/// Q2_K is the best trade of the lot: 2.46x for parity (two 41-pass rounds, IQRs fully
+/// overlapping), because it owns ONE output cell per thread so its partial is a single
+/// float — VGPRs 71 -> 72. Its depth is the family's greatest, SUBS=16 sub-blocks x 2
+/// additions each.
+///
 /// Q3_K is the largest gain in the family (2.71x at k=8192) and the cheapest per unit
 /// of it: it has the deepest sequential run — 2 halves x 8 sub-blocks = 16 accumulates
 /// per super-block, against Q6_K's 2 — and its VGPRs go 99 -> 93, so it is not paying
@@ -84,6 +89,7 @@ public sealed class Probe545KQuantMmqTests
     {
         string baseName = f switch
         {
+            QuantFamily.Q2_K => "matmul_q2_k_mmq",
             QuantFamily.Q3_K => "matmul_q3_k_mmq",
             QuantFamily.Q5_K => "matmul_q5_k_mmq",
             QuantFamily.Q6_K => "matmul_q6_k_mmq",
@@ -99,6 +105,8 @@ public sealed class Probe545KQuantMmqTests
 
     public static TheoryData<QuantFamily> Families => new()
     {
+        QuantFamily.Q2_K,     // Q2_K / Q2_K_S — the deepest sequential run of all: SUBS=16
+                              // sub-blocks x 2 additions each (dsc term + dmin correction)
         QuantFamily.Q3_K,     // Q3_K_M / Q3_K_S; also the family whose quant error is the
                               // project's known weak spot (2.9x llama.cpp's on #519/#520),
                               // so its prefill GEMM is the last place it should lose more
@@ -133,6 +141,10 @@ public sealed class Probe545KQuantMmqTests
         // families' k=2048 pre-fix figures sit below any bound their k=8192 post-fix
         // number permits. That follows from Q3_K having the deepest sequential run in
         // the family — 2 halves x 8 sub-blocks = 16 accumulates per super-block.
+        // Like Q3_K, discriminates at BOTH shapes (pre-fix 2.033E-07 and 3.867E-07 are
+        // both above it). Q2_K owns ONE output cell per thread, so its partial is a
+        // single float rather than the acc[TM][TN] families' sixteen.
+        QuantFamily.Q2_K => 1.75e-7,    // fixed: post 1.497E-07 / 1.572E-07, pre 2.033E-07 / 3.867E-07
         QuantFamily.Q3_K => 1.70e-7,    // fixed: post 1.493E-07 / 1.512E-07, pre 2.015E-07 / 4.093E-07
         QuantFamily.Q6_K => 1.35e-7,    // fixed: post 1.181E-07, pre 2.881E-07
         QuantFamily.Q5_K => 1.80e-7,    // fixed: post 1.587E-07, pre 3.276E-07
@@ -259,6 +271,7 @@ public sealed class Probe545KQuantMmqTests
 
     private static float[] RandomFloats(QuantFamily f, Random rng, int count) => f switch
     {
+        QuantFamily.Q2_K => Q2KFixture.RandomFloats(rng, count, 1.0f),
         QuantFamily.Q3_K => Q3KFixture.RandomFloats(rng, count, 1.0f),
         QuantFamily.Q5_K => Q5KFixture.RandomFloats(rng, count, 1.0f),
         QuantFamily.Q6_K => Q6KFixture.RandomFloats(rng, count, 1.0f),
@@ -271,6 +284,7 @@ public sealed class Probe545KQuantMmqTests
         float[] src = RandomFloats(f, rng, m * k);
         return f switch
         {
+            QuantFamily.Q2_K => Q2KFixture.QuantizeRows(src, m, k),
             QuantFamily.Q3_K => Q3KFixture.QuantizeRows(src, m, k),
             QuantFamily.Q5_K => Q5KFixture.QuantizeRows(src, m, k),
             QuantFamily.Q6_K => Q6KFixture.QuantizeRows(src, m, k),
@@ -288,6 +302,18 @@ public sealed class Probe545KQuantMmqTests
     {
         switch (f)
         {
+            case QuantFamily.Q2_K:
+            {
+                using var v = MatMulQ2KMmvqKernel.TryCreate(device, spvDir);
+                using var q = MatMulQ2KMmqKernel.TryCreate(device, spvDir, MmqShader(f));
+                if (v is null || q is null) return false;
+                using var ctx = device.CreateSubmitContext();
+                ctx.Begin();
+                v.Record(ctx.CommandBuffer, w, xq, xds, outV, m, k);
+                q.Record(ctx.CommandBuffer, w, xq, xds, outQ, m, k, 1);
+                ctx.SubmitAndWait();
+                return true;
+            }
             case QuantFamily.Q3_K:
             {
                 using var v = MatMulQ3KMmvqKernel.TryCreate(device, spvDir);
