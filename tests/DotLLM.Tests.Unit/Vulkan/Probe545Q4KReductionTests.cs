@@ -206,6 +206,14 @@ public sealed class Probe545Q4KReductionTests
     /// GPU quantizer produced, so the only difference from either kernel is the
     /// order and precision of the summation.
     /// </summary>
+    /// <summary>
+    /// Exposed so <see cref="Probe545GenericOracleAgreementTests"/> can anchor the
+    /// family-agnostic oracle to this one, which is the only one validated against
+    /// a GPU kernel directly.
+    /// </summary>
+    internal static double[] OracleF64ForCrossCheck(byte[] weightsQ4K, float[] xqWords, float[] xds, int m, int k)
+        => OracleF64(weightsQ4K, xqWords, xds, m, k);
+
     private static unsafe double[] OracleF64(byte[] weightsQ4K, float[] xqWords, float[] xds, int m, int k)
     {
         // Unpack the Q8_1 activation: 4 int8 per 32-bit word, (d, s) per 32 elements.

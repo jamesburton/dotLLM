@@ -1,19 +1,9 @@
 #version 450
-// #545: two-level (pairwise) accumulation over the K dimension.
-//
-// Summing every block product into a single float grows rounding error with
-// O(n). The decode GEMV for this family splits the work across a subgroup and
-// finishes with subgroupAdd, which is O(log n) — which is why the prefill GEMM
-// measured less accurate than decode, and why the gap widened with K (see
-// Probe545KQuantMmqTests, and #544/#549 for the same finding in Q8_0/Q4_K).
-//
-// The fold is driven by a counter on the OUTER K loop, not by the end of an
-// inner chunk. A first attempt folded at the end of each half-super-block and
-// was measured to change NOTHING, bit for bit: some of these shaders perform
-// exactly one accumulate per chunk, so folding there has granularity 1 and is
-// algebraically the same as accumulating straight into acc. Depth is what
-// matters, so the flush interval must be counted in outer iterations.
-const uint FLUSH_ITERS = 4u;
+// BENCH BASELINE ONLY - retained copy of matmul_q6_k_mmq.comp as it stood before
+// #545's two-level accumulation. Not dispatched by the model; it exists so the cost
+// of that change can be measured same-session and order-reversed against the kernel
+// users actually had, in ONE process. Retired once #545's numbers are no longer being
+// re-derived; restore from history and verify byte-identical before trusting it.
 #extension GL_EXT_integer_dot_product : require
 // Q6_K MMQ prefill GEMM: integer-dot (dp4a) batched matrix multiply.
 //
@@ -125,12 +115,9 @@ void main() {
     uint rowByteStride = pc.blocksPerRow * SB_BYTES;
 
     float acc[TM][TN];
-    float accPart[TM][TN];   // #545: partial over FLUSH_ITERS outer iterations
     for (uint i = 0u; i < TM; i++)
-        for (uint j = 0u; j < TN; j++) {
+        for (uint j = 0u; j < TN; j++)
             acc[i][j] = 0.0;
-            accPart[i][j] = 0.0;
-        }
 
     for (uint kSB = 0u; kSB < pc.blocksPerRow; kSB++) {
         for (uint h = 0u; h < 2u; h++) {
@@ -240,29 +227,14 @@ void main() {
                     float scB = sharedWsc[(tx + 16u * i) * SCALES_PER_HALF + 2u * ccl + 1u];
                     for (uint j = 0u; j < TN; j++) {
                         float dX = sharedXd[(ty + 16u * j) * CHUNKS_PER_HALF + ccl];
-                        accPart[i][j] += dX * (scA * float(dotA[i][j]) + scB * float(dotB[i][j]));
+                        acc[i][j] += dX * (scA * float(dotA[i][j]) + scB * float(dotB[i][j]));
                     }
                 }
             }
 
             barrier();
         }
-    
-        // #545: fold the partial into the running total every FLUSH_ITERS
-        // iterations. The branch is workgroup-uniform (kSB is the loop counter).
-        if ((kSB % FLUSH_ITERS) == FLUSH_ITERS - 1u) {
-            for (uint i = 0u; i < TM; i++)
-                for (uint j = 0u; j < TN; j++) {
-                    acc[i][j] += accPart[i][j];
-                    accPart[i][j] = 0.0;
-                }
-        }
-}
-
-    // Tail: the iteration count need not be a multiple of FLUSH_ITERS.
-    for (uint i = 0u; i < TM; i++)
-        for (uint j = 0u; j < TN; j++)
-            acc[i][j] += accPart[i][j];
+    }
 
     for (uint j = 0u; j < TN; j++) {
         uint t = tBase + ty + 16u * j;
