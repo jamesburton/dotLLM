@@ -12,20 +12,26 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// </summary>
 /// <remarks>
 /// <para>
-/// #543 arm A ("f32-input scalar tail", <c>_v4f32tail</c>) costs a settled
-/// 3.5-4% at p512 and the user asked whether that can be recovered. Two
-/// hypotheses: the tail's serialized global V reads replacing one coalesced
-/// staging pass, or occupancy lost to the extra <c>precise float acc[O_CELLS]</c>
-/// accumulator array. This answers the second one with a number instead of
-/// inferring it from timings — the move that settled #545's residual, where
-/// <c>VK_AMD_shader_info</c> showed occupancy was NOT the cause.
+/// Written for #543 and kept because it answered two questions no amount of
+/// A/B timing could, and will answer the next one:
 /// </para>
+/// <list type="bullet">
+///   <item>Is the f32 scalar tail's cost occupancy? <b>No.</b> It takes the base
+///   shader from 117 to 129 VGPRs with zero scratch, and the kernel is LDS-bound
+///   at 31744 B (2 workgroups/WGP) either way, so the VGPRs are nowhere near
+///   binding. That redirected the hunt to the V read path, where the cost was.</item>
+///   <item>How much LDS can the hd64 variant afford? <b>341 bytes.</b> It sits at
+///   21504 B and 65536 / 21504 = 3.05, so it runs <b>3</b> workgroups per WGP, not
+///   the 2 its header had claimed by inheritance from the 128-dim shader. The
+///   budget to stay at 3 is 65536 / 3 = 21845 B. That is what refuted extending
+///   #543's split-f16 V arm into this shader: an 8 KB V_lo tile lands at 29696 B,
+///   safe against 32768 B and not against 21845 B.</item>
+/// </list>
 /// <para>
-/// Note what this can and cannot see: the spec-constant gate is substituted
-/// before the driver's backend compiler runs, so the <c>REQUIRE_INVARIANT_PV=0</c>
-/// row is the real compiled cost of the NVIDIA-exempt path, not a runtime
-/// branch — that is exactly why #533's gate is a specialization constant and not
-/// a push constant.
+/// Note what the <c>gate = 0</c> rows mean: #533's gate is a SPECIALIZATION
+/// constant, substituted before the driver's backend compiler runs, so those rows
+/// are the real compiled cost of the vendor-exempt path rather than a runtime
+/// branch — which is the whole reason it is not a push constant.
 /// </para>
 /// <para>Enable with <c>DOTLLM_543_SHADER_INFO=1</c>.</para>
 /// </remarks>
@@ -39,6 +45,9 @@ public sealed class Probe543AttentionShaderInfoTests
     private static readonly string[] Arms =
     [
         "attention_flash_f32_coopmat",
+        // The retained pre-#543 control, so the table shows what the f32 tail cost
+        // in registers against the f16 one it replaced.
+        "attention_flash_f32_coopmat_pre543",
     ];
 
     [SkippableFact]

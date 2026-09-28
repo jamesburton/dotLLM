@@ -136,6 +136,7 @@ public sealed class Probe533FixCandidateTests
         var sb = new StringBuilder();
         var differingByCandidate = new Dictionary<string, long>(StringComparer.Ordinal);
         var scalarErrorByCandidate = new Dictionary<string, float>(StringComparer.Ordinal);
+        var gateByCandidate = new Dictionary<string, uint>(StringComparer.Ordinal);
         sb.AppendLine($"Device: {device.DeviceName} (VendorId 0x{device.VendorId:X4}) SubgroupSize {device.SubgroupSize}");
 
         // The f16-class control: a candidate that silently routed to the scalar
@@ -191,6 +192,7 @@ public sealed class Probe533FixCandidateTests
                     }
                     sb.AppendLine($"  vs scalar FA @64: differing={d}/{64 * QRow} maxAbs={mx:E3}  (must be f16-class ~1E-03)");
                     scalarErrorByCandidate[name] = mx;
+                    gateByCandidate[name] = kernel.RequireInvariantPv;
                 }
 
                 // --- #543 coverage decay: the same error, bucketed by query-row
@@ -308,14 +310,35 @@ public sealed class Probe533FixCandidateTests
         // row that deep spans 8 KV tiles of which at most ~2 are tail ones. The
         // per-64-row-block line above is the record of that decay — read it
         // before claiming this number describes a whole prefill.
+        //
+        // The bound applies only where the tail EXISTS. On a vendor #533 exempts
+        // (NVIDIA) the production kernel is created with requireInvariantPv = 0,
+        // the specialization constant dead-strips the tail before the backend
+        // compiler runs, and every tile goes to the all-coopmat path — which is
+        // the 3.3E-04 this gate asserts production stays under. Asserting it
+        // there would fail on exactly the box the NVIDIA cross-check runs on, for
+        // a path that is correct by design.
         const float Pre543Bound = 2.0E-04f;
         if (scalarErrorByCandidate.TryGetValue("attention_flash_f32_coopmat", out float prodErr))
         {
-            Assert.True(prodErr < Pre543Bound,
-                $"Production coopmat FA is {prodErr:E3} from the scalar f32 FA kernel at " +
-                $"seqQ=seqKv=64, above #543's bound of {Pre543Bound:E3}. Either the f32 scalar " +
-                "tail stopped running (check the #533 safe-tile gate and the sTile writeback) " +
-                "or its operands went back to the f16 staging tiles.");
+            uint prodGate = gateByCandidate["attention_flash_f32_coopmat"];
+            if (prodGate == 0u)
+            {
+                sb.AppendLine();
+                sb.AppendLine($"#543 accuracy bound NOT APPLIED: this device (VendorId " +
+                              $"0x{device.VendorId:X4}) resolves requireInvariantPv to 0, so the f32 " +
+                              $"scalar tail is compiled out and every tile is all-coopmat " +
+                              $"({prodErr:E3}). The bound describes the gated path only.");
+                _out.WriteLine(sb.ToString());
+            }
+            else
+            {
+                Assert.True(prodErr < Pre543Bound,
+                    $"Production coopmat FA is {prodErr:E3} from the scalar f32 FA kernel at " +
+                    $"seqQ=seqKv=64, above #543's bound of {Pre543Bound:E3}. Either the f32 scalar " +
+                    "tail stopped running (check the #533 safe-tile gate and the sTile writeback) " +
+                    "or its operands went back to the f16 staging tiles.");
+            }
         }
         if (scalarErrorByCandidate.TryGetValue(Pre543Candidate, out float preErr))
         {
