@@ -1,19 +1,4 @@
 #version 450
-// #545: two-level (pairwise) accumulation over the K dimension.
-//
-// Summing every block product into a single float grows rounding error with
-// O(n). The decode GEMV for this family splits the work across a subgroup and
-// finishes with subgroupAdd, which is O(log n) — which is why the prefill GEMM
-// measured less accurate than decode, and why the gap widened with K (see
-// Probe545KQuantMmqTests, and #544/#549 for the same finding in Q8_0/Q4_K).
-//
-// The fold is driven by a counter on the OUTER K loop, not by the end of an
-// inner chunk. A first attempt folded at the end of each half-super-block and
-// was measured to change NOTHING, bit for bit: some of these shaders perform
-// exactly one accumulate per chunk, so folding there has granularity 1 and is
-// algebraically the same as accumulating straight into acc. Depth is what
-// matters, so the flush interval must be counted in outer iterations.
-const uint FLUSH_ITERS = 4u;
 #extension GL_EXT_integer_dot_product : require
 // IQ4_NL MMQ prefill GEMM: integer-dot (dp4a) batched matrix multiply.
 //
@@ -112,27 +97,11 @@ void main() {
     uint rowByteStride = pc.blocksPerRow * BLOCK_BYTES;
 
     float acc[TM][TN];
-    float accPart[TM][TN];   // #545: partial over FLUSH_ITERS outer iterations
     for (uint i = 0u; i < TM; i++)
-        for (uint j = 0u; j < TN; j++) {
+        for (uint j = 0u; j < TN; j++)
             acc[i][j] = 0.0;
-            accPart[i][j] = 0.0;
-        }
 
     for (uint kBlock = 0u; kBlock < pc.blocksPerRow; kBlock++) {
-        // #545: fold the PREVIOUS window's partial here, at the TOP of the body,
-        // not at the bottom. Same arithmetic; the point is liveness. At the bottom
-        // the partial overlaps dotI[TM][TN] and the staged tiles, which measured
-        // 120 -> 132 VGPRs on Q6_K — across the 128 line, halving waves per SIMD
-        // and costing 10-30% throughput. At the top it measures 117.
-        if ((kBlock % FLUSH_ITERS) == 0u && kBlock > 0u) {
-            for (uint i = 0u; i < TM; i++)
-                for (uint j = 0u; j < TN; j++) {
-                    acc[i][j] += accPart[i][j];
-                    accPart[i][j] = 0.0;
-                }
-        }
-
         // ---- 1. Stage sharedXq[64][8] + sharedDx[64]. ----
         // 256 threads, 64*8=512 uints -> two passes of 256 threads each.
         for (uint s = 0u; s < 2u; s++) {
@@ -192,19 +161,13 @@ void main() {
                 float dw = sharedDw[tx + 16u * i];
                 for (uint j = 0u; j < TN; j++) {
                     float dx = sharedDx[ty + 16u * j];
-                    accPart[i][j] += dw * dx * float(dotI[i][j]);
+                    acc[i][j] += dw * dx * float(dotI[i][j]);
                 }
             }
         }
 
         barrier();
-    
-}
-
-    // Tail: the iteration count need not be a multiple of FLUSH_ITERS.
-    for (uint i = 0u; i < TM; i++)
-        for (uint j = 0u; j < TN; j++)
-            acc[i][j] += accPart[i][j];
+    }
 
     // ---- 4. Store output tile if within [N, M] bounds. ----
     for (uint j = 0u; j < TN; j++) {

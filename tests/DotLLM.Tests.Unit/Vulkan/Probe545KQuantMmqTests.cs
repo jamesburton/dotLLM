@@ -33,6 +33,19 @@ namespace DotLLM.Tests.Unit.Vulkan;
 ///     through whenever both kernels regressed together.</item>
 /// </list>
 /// <para>
+/// <b>IQ4_NL is measured here but deliberately left unfixed.</b> The two-level
+/// accumulation buys it 1.92x accuracy but costs <b>13%</b> prefill throughput
+/// (0.870 / 0.864 at (512,2048,2048) across two 41-pass runs on a quiet box).
+/// The cause is occupancy and it is specific to this shader: it is by far the
+/// lightest of the four — 68 VGPRs, 5120 B LDS, 32 SGPRs — so 16 extra live
+/// floats are proportionally large, and 68 -> 83 VGPRs loses a wave slot, which
+/// matches the measured loss almost exactly. Q6_K and IQ4_XS end up using FEWER
+/// registers after the change and cost 2-5%, so their residual is the fold work
+/// itself rather than occupancy; Q5_K is unchanged at 144 and is at parity.
+/// Do not "finish the set" by applying the change to IQ4_NL without re-measuring
+/// — the trade is genuinely worse there.
+/// </para>
+/// <para>
 /// The oracle is <see cref="KQuantMmqOracle"/>, anchored to #549's bespoke Q4_K
 /// oracle by <see cref="Probe545GenericOracleAgreementTests"/> — they agree
 /// exactly, 0.000E+000 relative. Each family additionally validates it against
@@ -77,10 +90,14 @@ public sealed class Probe545KQuantMmqTests
     /// </summary>
     private static double MmqRelBound(QuantFamily f) => f switch
     {
-        QuantFamily.Q6_K => 1.35e-7,    // post-fix max 1.181E-07, pre-fix 2.881E-07
-        QuantFamily.Q5_K => 1.80e-7,    // post-fix max 1.587E-07, pre-fix 3.276E-07
-        QuantFamily.IQ4_NL => 1.75e-7,  // post-fix max 1.542E-07, pre-fix 2.956E-07
-        QuantFamily.IQ4_XS => 1.40e-7,  // post-fix max 1.220E-07, pre-fix 2.948E-07
+        QuantFamily.Q6_K => 1.35e-7,    // fixed: post 1.181E-07, pre 2.881E-07
+        QuantFamily.Q5_K => 1.80e-7,    // fixed: post 1.587E-07, pre 3.276E-07
+        QuantFamily.IQ4_XS => 1.40e-7,  // fixed: post 1.220E-07, pre 2.948E-07
+
+        // IQ4_NL is deliberately NOT fixed — see the class remarks. This bound
+        // holds it at its CURRENT (unfixed) accuracy, 1.452E-07 / 2.956E-07, so
+        // the family is still guarded against drifting worse.
+        QuantFamily.IQ4_NL => 3.10e-7,
         _ => throw new ArgumentOutOfRangeException(nameof(f)),
     };
 
