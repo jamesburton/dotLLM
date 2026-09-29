@@ -473,3 +473,18 @@ adding one cost 1.1% -- the same size of phantom divergence the BOS trap produce
 pass (ETA 1 h 48 min for 16), so the run was stopped and the 4 already-scored chunks used. 4
 chunks is a smoke-level agreement (sd ~0.7), not a tight bound. dotLLM ran on CPU (see Nemotron
 limits above), so the Vulkan Bonsai forward pass is not covered.
+
+### Nemotron offset resolved: it is llama.cpp Vulkan vs CPU, not dotLLM (issue #514, 2026-09-29)
+
+Q8_0, 32 chunks, same ids, per-chunk dNLL (paired):
+
+| pair | mean dNLL | se | sd | z |
+|---|---|---|---|---|
+| dotLLM CPU - llama.cpp **CPU** (`-dev none -ngl 0`, PPL 7.4459) | -0.0003 | 0.0004 | 0.0023 | -0.75 |
+| dotLLM CPU - llama.cpp Vulkan (PPL 7.4772) | -0.0045 | 0.0015 | 0.0085 | -3.0 |
+| llama.cpp CPU - llama.cpp Vulkan | -0.0042 | 0.0014 | 0.0079 | -3.0 |
+
+dotLLM CPU (7.4436) agrees with llama.cpp CPU (7.4459) to 0.03%, with a 4x tighter paired sd. The
+"-0.45%" in the table above is the difference between llama.cpp's own Vulkan and CPU backends
+(24/32 chunks lower on CPU), which dotLLM merely sits on the CPU side of. The earlier
+"unresolved whether real" caveat is closed for the CPU path.
