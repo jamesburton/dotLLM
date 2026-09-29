@@ -238,6 +238,94 @@ public class JinjaEvaluatorTests
         Assert.Equal("", result);
     }
 
+    // ── loop.previtem / loop.nextitem (#399) ──
+
+    [Fact]
+    public void ForLoop_PrevItem_ReflectsActualNeighbour()
+    {
+        // Discriminates against a broken implementation that always echoes the current item
+        // (would render "abc") or always renders undefined (would render "").
+        var result = Eval(
+            "{% for x in items %}{{ loop.previtem }}{% endfor %}",
+            new Dictionary<string, object?>(StringComparer.Ordinal) { ["items"] = new List<object?> { "a", "b", "c" } });
+        Assert.Equal("ab", result);
+    }
+
+    [Fact]
+    public void ForLoop_NextItem_ReflectsActualNeighbour()
+    {
+        // Discriminates the same way as ForLoop_PrevItem_ReflectsActualNeighbour, from the other end.
+        var result = Eval(
+            "{% for x in items %}{{ loop.nextitem }}{% endfor %}",
+            new Dictionary<string, object?>(StringComparer.Ordinal) { ["items"] = new List<object?> { "a", "b", "c" } });
+        Assert.Equal("bc", result);
+    }
+
+    [Fact]
+    public void ForLoop_PrevItem_UndefinedOnFirstIteration_IsFalsyAndRendersEmpty()
+    {
+        // Jinja2: loop.previtem on the first iteration is Undefined — falsy, prints as "", never throws.
+        var result = Eval(
+            "{% for x in items %}{% if not loop.previtem %}U{% endif %}[{{ loop.previtem }}]{% endfor %}",
+            new Dictionary<string, object?>(StringComparer.Ordinal) { ["items"] = new List<object?> { "a", "b" } });
+        Assert.Equal("U[][a]", result);
+    }
+
+    [Fact]
+    public void ForLoop_NextItem_UndefinedOnLastIteration_IsFalsyAndRendersEmpty()
+    {
+        // Jinja2: loop.nextitem on the last iteration is Undefined — falsy, prints as "", never throws.
+        var result = Eval(
+            "{% for x in items %}[{{ loop.nextitem }}]{% if not loop.nextitem %}U{% endif %}{% endfor %}",
+            new Dictionary<string, object?>(StringComparer.Ordinal) { ["items"] = new List<object?> { "a", "b" } });
+        Assert.Equal("[b][]U", result);
+    }
+
+    [Fact]
+    public void ForLoop_PrevItem_IsDefinedTest_TracksBoundary()
+    {
+        var result = Eval(
+            "{% for x in items %}{{ loop.previtem is defined }}{% endfor %}",
+            new Dictionary<string, object?>(StringComparer.Ordinal) { ["items"] = new List<object?> { "a", "b", "c" } });
+        Assert.Equal("FalseTrueTrue", result);
+    }
+
+    [Fact]
+    public void ForLoop_NextItem_IsDefinedTest_TracksBoundary()
+    {
+        var result = Eval(
+            "{% for x in items %}{{ loop.nextitem is defined }}{% endfor %}",
+            new Dictionary<string, object?>(StringComparer.Ordinal) { ["items"] = new List<object?> { "a", "b", "c" } });
+        Assert.Equal("TrueTrueFalse", result);
+    }
+
+    [Fact]
+    public void ForLoop_SingleItem_BothPrevAndNextAreUndefined()
+    {
+        var result = Eval(
+            "{% for x in items %}[{{ loop.previtem }}|{{ loop.nextitem }}]{% endfor %}",
+            new Dictionary<string, object?>(StringComparer.Ordinal) { ["items"] = new List<object?> { "only" } });
+        Assert.Equal("[|]", result);
+    }
+
+    [Fact]
+    public void ForLoop_NestedLoop_DoesNotLeakIntoOuterLoopPrevNextItem()
+    {
+        // The inner for-loop's own "loop" variable (with its own previtem/nextitem) must not
+        // clobber the outer loop's "loop" variable once the inner loop finishes and control
+        // returns to the outer iteration body. Each outer iteration renders the inner loop's
+        // output, then reads the OUTER loop's previtem/nextitem afterward.
+        var vars = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["outer"] = new List<object?> { "o1", "o2", "o3" },
+            ["inner"] = new List<object?> { "i1", "i2" },
+        };
+        var result = Eval(
+            "{% for o in outer %}{{ o }}:{% for x in inner %}{{ x }}{% endfor %}:prev={{ loop.previtem }}:next={{ loop.nextitem }};{% endfor %}",
+            vars);
+        Assert.Equal("o1:i1i2:prev=:next=o2;o2:i1i2:prev=o1:next=o3;o3:i1i2:prev=o2:next=;", result);
+    }
+
     // ── Scoping ──
 
     [Fact]
@@ -355,6 +443,43 @@ public class JinjaEvaluatorTests
     public void IsNotDefined_False()
     {
         Assert.Equal("False", Eval("{{ x is not defined }}", new Dictionary<string, object?>(StringComparer.Ordinal) { ["x"] = "val" }));
+    }
+
+    // ── Is undefined / is not undefined (#399: required by Qwen3.8-27B's
+    // "preserve_thinking is undefined" check on the path to every tool message) ──
+
+    [Fact]
+    public void IsUndefined_True_WhenVariableAbsent()
+    {
+        Assert.Equal("True", Eval("{{ x is undefined }}"));
+    }
+
+    [Fact]
+    public void IsUndefined_False_WhenVariableIsNull()
+    {
+        // A key present with value null is DEFINED (Jinja2: is defined == True, is undefined ==
+        // False), distinct from an absent key. This is what keeps a legitimately-null
+        // loop.previtem/nextitem distinguishable from an omitted (undefined) one — the whole
+        // basis of the omission-instead-of-sentinel design for those two fields.
+        Assert.Equal("False", Eval("{{ x is undefined }}", new Dictionary<string, object?>(StringComparer.Ordinal) { ["x"] = null }));
+    }
+
+    [Fact]
+    public void IsUndefined_False_WhenVariableDefined()
+    {
+        Assert.Equal("False", Eval("{{ x is undefined }}", new Dictionary<string, object?>(StringComparer.Ordinal) { ["x"] = "val" }));
+    }
+
+    [Fact]
+    public void IsNotUndefined_True_WhenVariableDefined()
+    {
+        Assert.Equal("True", Eval("{{ x is not undefined }}", new Dictionary<string, object?>(StringComparer.Ordinal) { ["x"] = "val" }));
+    }
+
+    [Fact]
+    public void IsNotUndefined_False_WhenVariableAbsent()
+    {
+        Assert.Equal("False", Eval("{{ x is not undefined }}"));
     }
 
     // ── raise_exception ──
