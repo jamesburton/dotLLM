@@ -488,3 +488,29 @@ dotLLM CPU (7.4436) agrees with llama.cpp CPU (7.4459) to 0.03%, with a 4x tight
 "-0.45%" in the table above is the difference between llama.cpp's own Vulkan and CPU backends
 (24/32 chunks lower on CPU), which dotLLM merely sits on the CPU side of. The earlier
 "unresolved whether real" caveat is closed for the CPU path.
+
+### Vulkan sliding-window perplexity (issue #564, 2026-09-29)
+
+`dotllm perplexity --device vulkan` now runs the full llama.cpp-comparable protocol for
+**Nemotron-H** and the **hybrid-dense (Bonsai)** family. The CLI calls
+`IModel.TrySetAllRowLogitsLimit(context + 1)`; the model then runs its LM head over every row of a
+window (opt-in, so normal prefill still pays for one row) and `BackendPerplexityModel.Probe` is told
+how many rows it must declare. Nothing else changes. The dense `VulkanTransformerModel` (Llama-style)
+is still last-row-only.
+
+Nemotron-Nano-9B-v2 Q8_0, same ids + `--bos`, 32 chunks (paired per-chunk dNLL, nats):
+
+| pair | mean | se | sd |
+|---|---|---|---|
+| dotLLM **Vulkan** - dotLLM CPU | -0.0002 | 0.0006 | 0.0032 |
+| dotLLM **Vulkan** - llama.cpp CPU | -0.0005 | 0.0005 | 0.0026 |
+| dotLLM Vulkan - llama.cpp Vulkan | -0.0047 | 0.0013 | 0.0071 |
+
+PPL: dotLLM Vulkan **7.4422**, dotLLM CPU 7.4436, llama.cpp CPU 7.4459, llama.cpp Vulkan 7.4772.
+The dotLLM Vulkan forward pass agrees with both CPU implementations to within noise; llama.cpp's own
+Vulkan backend is the outlier (see above). Elapsed 146 s versus 927 s on CPU.
+
+Bonsai-2 27B PQ2_0 (no `--bos`, 16 chunks): dotLLM Vulkan **10.2348 +/- 0.435** in 47 s. Windows 0-3
+match the dotLLM CPU arm to ~1e-4 relative (6.31994 / 11.90538 / 7.41143 / 7.59850 vs 6.31976 /
+11.90547 / 7.41158 / 7.59837) and prism llama.cpp's running estimate. No 16-chunk llama.cpp reference
+exists: the fork's Vulkan and CPU backends both failed to finish it in a practical time.
