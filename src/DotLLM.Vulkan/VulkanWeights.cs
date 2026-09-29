@@ -1744,9 +1744,9 @@ internal sealed class VulkanWeights : IDisposable
         // exactly the bank's per-expert stride, so the whole bank is one contiguous
         // region: zero-copy import it in place when the driver allows, otherwise one
         // streamed copy. F32 banks pack per-expert host pointers (non-contiguous).
-        var w1Bank = UploadRoutedBankWhole(device, stage, routedW1Qt, moe.GateExpsRaw, moe.W1, perExpertW1Bytes, numE);
-        var w2Bank = UploadRoutedBankWhole(device, stage, routedW2Qt, moe.DownExpsRaw, moe.W2, perExpertW2Bytes, numE);
-        var w3Bank = UploadRoutedBankWhole(device, stage, routedW3Qt, moe.UpExpsRaw, moe.W3, perExpertW3Bytes, numE);
+        var w1Bank = UploadRoutedBankWhole(device, stage, routedW1Qt, moe.GateExpsRaw, moe.W1, perExpertW1Bytes, numE, $"{namePrefix}.ffn_gate_exps.weight");
+        var w2Bank = UploadRoutedBankWhole(device, stage, routedW2Qt, moe.DownExpsRaw, moe.W2, perExpertW2Bytes, numE, $"{namePrefix}.ffn_down_exps.weight");
+        var w3Bank = UploadRoutedBankWhole(device, stage, routedW3Qt, moe.UpExpsRaw, moe.W3, perExpertW3Bytes, numE, $"{namePrefix}.ffn_up_exps.weight");
         uploadedBytes += (perExpertW1Bytes + perExpertW2Bytes + perExpertW3Bytes) * numE;
 
         // #327: routed-expert banks bypass UploadMatrix (the only path that otherwise
@@ -2092,11 +2092,79 @@ internal sealed class VulkanWeights : IDisposable
     /// per-expert host matrices (separate allocations — never contiguous, never
     /// importable) slot by slot.
     /// </summary>
+    /// <summary>
+    /// Fails loudly when the routed-expert <b>F32 upload fallback</b> has no host source (#427).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The F32 branch of <see cref="UploadRoutedBankWhole"/> reads <c>f32Experts[e]</c> per
+    /// expert. Two loaders deliberately leave those pointers null and treat the raw GGUF mmap as
+    /// the only valid weight source: <c>LoadDeepSeekMoeLayer</c> under <c>skipRoutedDequant</c>,
+    /// and <c>LoadQuantExpertMoeLayer</c> (Mixtral / Qwen-MoE / gpt-oss / nemotron_h_moe), which
+    /// never allocates host F32 at all. If a bank on such a model resolves to
+    /// <see cref="QuantizationType.F32"/> — which happens when its on-disk type has no Vulkan
+    /// kernel (MXFP4 / Q4_0 / Q4_1, #344 units 2-4) — the fallback reads a zero pointer.
+    /// </para>
+    /// <para>
+    /// <b>That does not crash.</b> It uploads a null/garbage matrix which is then silently
+    /// multiplied into the forward pass, so the model produces plausible-looking wrong output.
+    /// Throwing here converts a silent-corruption path into a diagnosable one.
+    /// </para>
+    /// <para>
+    /// <see cref="CanSkipMoeF32HostDequant"/> already prevents this for the DeepSeek/MLA family,
+    /// but it — like <c>ResolveMoeBankResidency</c> — early-returns unless
+    /// <c>config.MlaConfig is not null</c>, so it cannot speak for non-MLA MoE models. This
+    /// guard is the backstop for everything that preflight structurally cannot see.
+    /// </para>
+    /// </remarks>
+    /// <param name="routedQt">The bank's resolved device type. Only <c>F32</c> reads the host array.</param>
+    /// <param name="f32Experts">Per-expert host F32 matrices; null for raw-quant loaders.</param>
+    /// <param name="numE">Expert count the upload will index up to.</param>
+    /// <param name="bankName">Tensor name for the message, e.g. <c>blk.3.ffn_gate_exps.weight</c>.</param>
+    /// <exception cref="NotSupportedException">
+    /// The bank needs the F32 fallback but its host source is absent or incomplete.
+    /// </exception>
+    internal static void ValidateRoutedBankF32Source(
+        QuantizationType routedQt, nint[]? f32Experts, int numE, string bankName)
+    {
+        // Every non-F32 bank uploads the contiguous raw GGUF range and never touches the host
+        // array, so a null there is legitimate and must stay cheap — this is the common path.
+        if (routedQt != QuantizationType.F32)
+            return;
+
+        if (f32Experts is null)
+            throw new NotSupportedException(
+                $"Routed MoE bank '{bankName}' resolved to the F32 upload fallback, but this model's " +
+                $"loader allocated no host F32 experts (the raw GGUF mmap is its only weight source). " +
+                $"Uploading would read a null pointer per expert and silently corrupt the forward pass. " +
+                $"This bank's on-disk quantization has no Vulkan routed-expert kernel — see #344 " +
+                $"(MXFP4 / Q4_0 / Q4_1) and #427.");
+
+        if (f32Experts.Length < numE)
+            throw new NotSupportedException(
+                $"Routed MoE bank '{bankName}' needs {numE} host F32 expert matrices for the upload " +
+                $"fallback but only {f32Experts.Length} were provided; uploading would read past the " +
+                $"end of the array. See #344 and #427.");
+
+        for (int e = 0; e < numE; e++)
+        {
+            if (f32Experts[e] == 0)
+                throw new NotSupportedException(
+                    $"Routed MoE bank '{bankName}' resolved to the F32 upload fallback but expert {e} " +
+                    $"has a null host matrix, so that expert alone would be silently corrupted. " +
+                    $"See #344 and #427.");
+        }
+    }
+
     private static VulkanDevice.Buffer UploadRoutedBankWhole(
         VulkanDevice device, VulkanStagingBuffer stage,
         QuantizationType routedQt, nint raw, nint[] f32Experts,
-        long perExpertBytes, int numE)
+        long perExpertBytes, int numE, string bankName)
     {
+        // #427: refuse the F32 fallback when its host source is absent, rather than
+        // reading a zero pointer and silently uploading garbage weights.
+        ValidateRoutedBankF32Source(routedQt, f32Experts, numE, bankName);
+
         long bankBytes = perExpertBytes * numE;
         if (routedQt != QuantizationType.F32)
         {
