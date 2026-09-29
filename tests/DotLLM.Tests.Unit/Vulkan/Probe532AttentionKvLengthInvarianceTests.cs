@@ -88,7 +88,11 @@ public class Probe532AttentionKvLengthInvarianceTests
         float[] padded = RunSinglePass(device, kernel, fx, posQ, paddedKv);
 
         int diff = CountDiffering(tight, padded, out float worst);
-        _out.WriteLine($"single-pass posQ={posQ} kv {tightKv} vs {paddedKv}: differing={diff}/{tight.Length} worst={worst:E3}");
+        // Record WHICH shader produced this. AttentionF32Kernel picks one of three variants at
+        // construction (attention_f32 / _sg / _coopmat), so "the single-pass kernel is
+        // invariant" is meaningless without naming the dispatched path — and a mutant applied
+        // to the wrong variant silently changes nothing, which reads as a passing gate.
+        _out.WriteLine($"single-pass [{kernel.Mode}] posQ={posQ} kv {tightKv} vs {paddedKv}: differing={diff}/{tight.Length} worst={worst:E3}");
 
         Assert.Equal(0, diff);
     }
