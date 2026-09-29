@@ -519,3 +519,20 @@ Bonsai-2 27B PQ2_0 (no `--bos`, 16 chunks): dotLLM Vulkan **10.2348 +/- 0.435** 
 match the dotLLM CPU arm to ~1e-4 relative (6.31994 / 11.90538 / 7.41143 / 7.59850 vs 6.31976 /
 11.90547 / 7.41158 / 7.59837) and prism llama.cpp's running estimate. No 16-chunk llama.cpp reference
 exists: the fork's Vulkan and CPU backends both failed to finish it in a practical time.
+
+### #514 closing table (2026-09-29)
+
+Nemotron-Nano-9B-v2, LF corpus, shared llama.cpp token ids, `--bos`, 32 chunks of 512:
+
+| quant | llama.cpp CPU | llama.cpp Vulkan | dotLLM CPU | dotLLM Vulkan |
+|---|---|---|---|---|
+| Q8_0 (control) | 7.4459 | 7.4772 | 7.4436 | 7.4422 |
+| Q4_K_M | not run | 7.5464 | 7.5209 | 7.5090 |
+
+Q8_0: all three of dotLLM CPU / dotLLM Vulkan / llama.cpp CPU agree to <= 0.05%; only llama.cpp's
+Vulkan backend departs (+0.42%). Q4_K_M: dotLLM Vulkan sits 0.16% below dotLLM CPU, a larger split
+than the control shows; it was not investigated (single-figure, 32 chunks, se ~0.2 unpaired) and
+llama.cpp's own CPU Q4_K_M was not run, so it is not established whether that is quant-path
+numerics (Q4_K MMQ activation quantisation) or noise. Bonsai PQ2_0 (no Q8_0 control exists):
+dotLLM Vulkan 10.2348 +/- 0.435 over 16 chunks; the fork's running estimate over its first 4 chunks
+(8.0693) matches dotLLM CPU/Vulkan on those chunks (8.0681) to 0.015%.
