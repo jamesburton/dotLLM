@@ -2132,28 +2132,7 @@ internal sealed class VulkanWeights : IDisposable
         if (routedQt != QuantizationType.F32)
             return;
 
-        if (f32Experts is null)
-            throw new NotSupportedException(
-                $"Routed MoE bank '{bankName}' resolved to the F32 upload fallback, but this model's " +
-                $"loader allocated no host F32 experts (the raw GGUF mmap is its only weight source). " +
-                $"Uploading would read a null pointer per expert and silently corrupt the forward pass. " +
-                $"This bank's on-disk quantization has no Vulkan routed-expert kernel — see #344 " +
-                $"(MXFP4 / Q4_0 / Q4_1) and #427.");
-
-        if (f32Experts.Length < numE)
-            throw new NotSupportedException(
-                $"Routed MoE bank '{bankName}' needs {numE} host F32 expert matrices for the upload " +
-                $"fallback but only {f32Experts.Length} were provided; uploading would read past the " +
-                $"end of the array. See #344 and #427.");
-
-        for (int e = 0; e < numE; e++)
-        {
-            if (f32Experts[e] == 0)
-                throw new NotSupportedException(
-                    $"Routed MoE bank '{bankName}' resolved to the F32 upload fallback but expert {e} " +
-                    $"has a null host matrix, so that expert alone would be silently corrupted. " +
-                    $"See #344 and #427.");
-        }
+        MoeLayerWeights.ValidateF32ExpertSource(f32Experts, numE, bankName);
     }
 
     private static VulkanDevice.Buffer UploadRoutedBankWhole(

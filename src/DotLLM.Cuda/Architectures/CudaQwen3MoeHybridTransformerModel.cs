@@ -1321,6 +1321,13 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
                 $"MoeLayerWeights expert pointer arrays must each have NumExperts={E} entries " +
                 $"(W1={moe.W1.Length}, W2={moe.W2.Length}, W3={moe.W3.Length}).", nameof(moe));
 
+        // #427 (cross-backend): the length check above passes for an array of NULL pointers,
+        // which a quant-expert loader produces. This path is F32-only, so those would be
+        // copied verbatim — silent corruption, not a crash.
+        MoeLayerWeights.ValidateF32ExpertSource(moe.W1, E, "ffn_gate_exps.weight");
+        MoeLayerWeights.ValidateF32ExpertSource(moe.W3, E, "ffn_up_exps.weight");
+        MoeLayerWeights.ValidateF32ExpertSource(moe.W2, E, "ffn_down_exps.weight");
+
         // Router gate — F32 [E, hidden] managed array.
         nint gateRouterDevice = UploadF32Array(moe.Gate, allocs);
 

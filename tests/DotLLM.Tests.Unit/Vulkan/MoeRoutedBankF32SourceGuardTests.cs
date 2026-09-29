@@ -1,5 +1,6 @@
 using System;
 using DotLLM.Core.Configuration;
+using DotLLM.Models.Architectures;
 using DotLLM.Vulkan;
 using Xunit;
 
@@ -70,7 +71,11 @@ public sealed class MoeRoutedBankF32SourceGuardTests
                 QuantizationType.F32, experts, numE: 4, bankName: Bank));
 
         Assert.Contains(Bank, ex.Message, StringComparison.Ordinal);
-        Assert.Contains("2", ex.Message, StringComparison.Ordinal);
+        // "expert 2", not "2" — the message ends "See #344 and #427", so a bare "2" would
+        // match even if the guard named the wrong expert. (Same defect class as #423's
+        // single-element anchors: an assertion that cannot fail proves nothing.)
+        Assert.Contains("expert 2", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("expert 3", ex.Message, StringComparison.Ordinal);
     }
 
     /// <summary>An array shorter than the expert count would read out of bounds.</summary>
@@ -112,5 +117,27 @@ public sealed class MoeRoutedBankF32SourceGuardTests
     public void NonF32Bank_WithNullExpertArray_DoesNotThrow(QuantizationType qt)
     {
         VulkanWeights.ValidateRoutedBankF32Source(qt, f32Experts: null, numE: 8, bankName: Bank);
+    }
+
+    /// <summary>
+    /// The guard is shared, not Vulkan-local (CLAUDE.md, "Cross-Backend Critical Bugs"). CUDA
+    /// has the same dereference in two F32-only upload paths —
+    /// <c>CudaMoeWeightsLoader.LoadLayer</c> and
+    /// <c>CudaQwen3MoeHybridTransformerModel.UploadMoeLayerFromHost</c> — and the latter's
+    /// existing length check passes for an array of null pointers, so it did not cover this.
+    /// Both now call <see cref="MoeLayerWeights.ValidateF32ExpertSource"/> directly; this pins
+    /// the shared entry point so a backend cannot quietly stop using it.
+    /// </summary>
+    [Fact]
+    public void SharedGuard_IsBackendAgnostic_AndRejectsTheNullSource()
+    {
+        var ex = Assert.Throws<NotSupportedException>(
+            () => MoeLayerWeights.ValidateF32ExpertSource(null, numE: 8, bankName: "ffn_up_exps.weight"));
+        Assert.Contains("ffn_up_exps.weight", ex.Message, StringComparison.Ordinal);
+
+        // And still accepts a valid source, so it is not a blanket refusal.
+        var experts = new nint[8];
+        for (int e = 0; e < experts.Length; e++) experts[e] = 0x2000 + e;
+        MoeLayerWeights.ValidateF32ExpertSource(experts, numE: 8, bankName: "ffn_up_exps.weight");
     }
 }
