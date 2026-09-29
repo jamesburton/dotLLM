@@ -2493,6 +2493,8 @@ public sealed unsafe class CudaKernels : IDisposable
                                      int positionOffset, int slidingWindow, nint stream,
                                      nint sinks = 0)
     {
+        DotLLM.Core.Attention.AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "CUDA");
+
         nint qArg = q, kArg = k, vArg = v, outArg = output;
         int sqArg = seqQ, skvArg = seqKv;
         int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
@@ -2623,6 +2625,9 @@ public sealed unsafe class CudaKernels : IDisposable
                                      nint partialMax, nint partialSum, nint partialOut, nint stream,
                                      nint sinks = 0)
     {
+        // split-KV is decode-only, so seqQ is 1 by construction.
+        DotLLM.Core.Attention.AttentionSpanInvariant.AssertTight(seqKv, positionOffset, 1, "CUDA split-KV");
+
         nint qArg = q, kArg = k, vArg = v, outArg = output;
         int skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
         int poArg = positionOffset, swArg = slidingWindow;

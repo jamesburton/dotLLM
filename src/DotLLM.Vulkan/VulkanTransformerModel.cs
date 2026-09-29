@@ -2077,6 +2077,8 @@ public sealed class VulkanTransformerModel : IModel
         float softCap = 0.0f, float scaleOverride = 0.0f,
         AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
+        AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "Vulkan");
+
         // Decode (seqQ == 1): split the KV range across many workgroups
         // (Flash-Decoding) when the shape is worth splitting — which, with the
         // shipping heuristic, means seqKv >= 17 on any model with <= 128 heads,
