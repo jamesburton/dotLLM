@@ -802,6 +802,21 @@ public sealed class VulkanTransformerModel : IModel
     // diffusion forward (the AR Forward returns only the last row; diffusion needs
     // every canvas row). Grows monotonically; null until the first diffusion forward.
     private VulkanDevice.Buffer? _diffusionLogits;
+
+    // Batch length up to which Forward returns a logit row per position. Default 1 = last row only;
+    // widened on request by TrySetAllRowLogitsLimit for perplexity scoring (#564).
+    private int _allRowLogitsLimit = 1;
+
+    /// <inheritdoc/>
+    public int MaxAllRowLogitsLength => _allRowLogitsLimit;
+
+    /// <inheritdoc/>
+    public bool TrySetAllRowLogitsLimit(int maxSeqLen)
+    {
+        if (maxSeqLen > _allRowLogitsLimit)
+            _allRowLogitsLimit = maxSeqLen;
+        return _allRowLogitsLimit >= maxSeqLen;
+    }
     private int _diffusionLogitsCapacityRows;
     // Host-visible scratch holding the host-computed self-conditioning signal
     // [canvasLen × hidden] (uploaded then device-added into the canvas embedding).
@@ -3113,6 +3128,13 @@ public sealed class VulkanTransformerModel : IModel
         if (scratchResized)
             InvalidateKernelCaches();
 
+        // All-row logits (#564), opt-in: reuse the diffusion all-position head. Its logits buffer is
+        // allocated HERE, before any recording, because growing it invalidates the kernel descriptor
+        // caches, which must never happen against an open command buffer.
+        bool allRowHead = seqLen > 1 && seqLen <= _allRowLogitsLimit;
+        if (allRowHead)
+            EnsureDiffusionLogits(seqLen, vocabSize);
+
         // Pipeline stage resume (layer-spanning): seed HiddenState from the handed-off hidden rows of a
         // previous stage instead of gathering token embeddings. Synchronous host→device upload into the
         // (now correctly-sized) HiddenState slot 0; made visible to the forward submit the same way
@@ -3762,7 +3784,7 @@ public sealed class VulkanTransformerModel : IModel
         // 3b. DiffusionGemma: final RMSNorm + LM head over ALL positions (the
         //     diffusion generator gathers logit rows for the masked canvas
         //     positions, not just the last token). Returns [seqLen, vocab].
-        if (_diffusionMaskMode != AttentionMaskMode.Causal && Config.DiffusionConfig is not null)
+        if (allRowHead || (_diffusionMaskMode != AttentionMaskMode.Causal && Config.DiffusionConfig is not null))
             return FinishDiffusionForward(cmdBuf, seqLen, hiddenSize, vocabSize, eps, deviceId);
 
         // 3. Final RMSNorm on the last token only, then LM head.
@@ -3827,6 +3849,11 @@ public sealed class VulkanTransformerModel : IModel
     /// </summary>
     private ITensor FinishDiffusionForward(nint cmdBuf, int seqLen, int hiddenSize, int vocabSize, float eps, int deviceId)
     {
+        // The last layer's residual add wrote HiddenState in a compute dispatch; the norm below reads
+        // it. The per-layer loop only barriers BETWEEN layers, so without this the norm races the
+        // add (all-row scoring, #564, was off by ~1e-2 on every row before this).
+        BarrierComputeToCompute(cmdBuf);
+
         // Final RMSNorm over every row, in place on HiddenState → NormOutput.
         _rmsnorm.Record(cmdBuf, _state.HiddenState, _weights.OutputNormWeight, _state.NormOutput,
             rowCount: seqLen, n: hiddenSize, eps: eps);

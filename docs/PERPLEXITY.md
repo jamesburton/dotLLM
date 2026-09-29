@@ -496,7 +496,12 @@ dotLLM CPU (7.4436) agrees with llama.cpp CPU (7.4459) to 0.03%, with a 4x tight
 `IModel.TrySetAllRowLogitsLimit(context + 1)`; the model then runs its LM head over every row of a
 window (opt-in, so normal prefill still pays for one row) and `BackendPerplexityModel.Probe` is told
 how many rows it must declare. Nothing else changes. The dense `VulkanTransformerModel` (Llama-style)
-is still last-row-only.
+now has it too (same opt-in, via the
+all-position head the DiffusionGemma path already used). Adopting that head exposed a **missing
+compute barrier** between the last layer's residual add and the final RMSNorm: before the fix every
+row was off by ~1e-2 against the CPU oracle, after it 1e-8..1e-7. The barrier is now in
+`FinishDiffusionForward`, so the DiffusionGemma Vulkan path gets it as well. Llama-3.2-1B-Instruct
+Q8_0, 16 chunks of the LF corpus: Vulkan **15.8620** vs CPU 15.8663 (-0.03%), 4 s vs 50 s.
 
 Nemotron-Nano-9B-v2 Q8_0, same ids + `--bos`, 32 chunks (paired per-chunk dNLL, nats):
 
