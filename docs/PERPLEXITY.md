@@ -422,3 +422,30 @@ perplexity without the corpus's line endings is not comparable to a llama.cpp nu
 
 Compare error bars before calling a difference real: a 3% "residual" once turned out to sit inside
 llama.cpp's own ±6.5% on a small corpus.
+
+## Nemotron-Nano-9B-v2 re-measure on the LF corpus (issue #514, 2026-09-29)
+
+Supersedes any pre-#372 Nemotron-H quality figure (RoPE was wrongly applied then) and any figure
+where each engine tokenized the corpus itself (#506).
+
+**Method.** llama.cpp b9672 Vulkan (`-ngl 99`, `-c 512 --chunks 32`, `--kl-divergence-base`) on
+`wiki.test.lf.raw`; the token ids it recorded (identical for Q8_0 and Q4_K_M) were fed to
+`dotllm perplexity --tokens-file ... --context 512 --bos` on **CPU**. 32 chunks, 8,160 scored
+tokens, bartowski GGUFs.
+
+| quant | llama.cpp (Vulkan) | dotLLM (CPU) | dotLLM vs llama.cpp |
+|---|---|---|---|
+| Q8_0 (control) | 7.4772 +/- 0.215 | 7.4436 +/- 0.214 | -0.45% |
+| Q4_K_M | 7.5464 +/- 0.217 | 7.5209 +/- 0.217 | -0.34% |
+
+**Reading.** The offset has the same sign and size on the control and the quant under test, so it
+is not a quant-path problem. Paired per chunk (Q4_K_M, 32 windows) the mean dNLL is -0.0034 nats
+(se 0.0015, z = -2.3; dotLLM lower on 19/32 windows), with paired sd 0.008 nats versus ~0.2
+unpaired: the engines track each other closely and the residual is small. It is not resolved
+whether -0.3..-0.45% is a real systematic difference or noise at this sample size; 32 chunks
+cannot settle it.
+
+**Limits.** (1) The dotLLM arm is **CPU**: `--device vulkan` cannot run sliding-window because the
+Vulkan model returns only the last row, and teacher-forced scores one window, so this does not
+validate the Vulkan forward pass. (2) Q8_0 was not run with `--per-window`, so only Q4_K_M is
+paired. (3) Bonsai is not yet re-measured (tracked on #514).
