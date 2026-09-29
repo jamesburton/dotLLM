@@ -449,3 +449,27 @@ cannot settle it.
 Vulkan model returns only the last row, and teacher-forced scores one window, so this does not
 validate the Vulkan forward pass. (2) Q8_0 was not run with `--per-window`, so only Q4_K_M is
 paired. (3) Bonsai is not yet re-measured (tracked on #514).
+
+### Ternary-Bonsai-2-27B PQ2_0 (issue #514, 2026-09-29)
+
+prism-ml `llama.cpp` fork (Vulkan, `-ngl 99`, `-c 512`, `--kl-divergence-base`) is the only
+reference that reads PQ2_0. **No Q8_0 control exists for this model**, so a disagreement could not
+be split into quant-path versus harness; the agreement below is the only evidence available.
+
+| arm | chunks | PPL |
+|---|---|---|
+| prism llama.cpp (Vulkan), running estimate after chunk 4 | 4 | 8.0693 |
+| dotLLM CPU, shared ids, **no `--bos`** | 4 | 8.0681 +/- 0.683 (-0.015%) |
+| dotLLM CPU, shared ids, `--bos` (wrong for this model) | 4 | 8.1603 (+1.1%) |
+
+Chunk 0: 6.3198 (dotLLM) vs 6.3201 (llama.cpp).
+
+**Do not pass `--bos` blindly with `--tokens-file`.** The rule above (BOS at index 0 of the file)
+applies to `add_bos_token` models. Bonsai's recorded stream starts `198, 16, ...` (no BOS), and
+adding one cost 1.1% -- the same size of phantom divergence the BOS trap produced on Llama. Check
+`ids[0]`/`ids[n_ctx]` in the kld header first.
+
+**Limits.** Only 4 of the 16 requested chunks: prism's Vulkan prefill ran ~27 min per 4-chunk
+pass (ETA 1 h 48 min for 16), so the run was stopped and the 4 already-scored chunks used. 4
+chunks is a smoke-level agreement (sd ~0.7), not a tight bound. dotLLM ran on CPU (see Nemotron
+limits above), so the Vulkan Bonsai forward pass is not covered.
