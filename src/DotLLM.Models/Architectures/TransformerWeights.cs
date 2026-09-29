@@ -32,6 +32,60 @@ namespace DotLLM.Models.Architectures;
 /// </remarks>
 internal sealed class MoeLayerWeights
 {
+    /// <summary>
+    /// Throws when a routed-expert bank is about to be uploaded from host F32 matrices that do
+    /// not exist (#427). Shared by every backend that reads <see cref="W1"/>/<see cref="W2"/>/
+    /// <see cref="W3"/> as an F32 source.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Two loaders deliberately leave those arrays as null placeholders and treat the raw GGUF
+    /// mmap as the only valid weight source: <c>LoadDeepSeekMoeLayer</c> under
+    /// <c>skipRoutedDequant</c>, and <c>LoadQuantExpertMoeLayer</c> (Mixtral / Qwen-MoE /
+    /// gpt-oss / nemotron_h_moe), which never allocates host F32 at all. A backend that then
+    /// falls back to an F32 upload reads a zero pointer per expert.
+    /// </para>
+    /// <para>
+    /// <b>That does not crash</b> — it uploads a null/garbage matrix which is silently multiplied
+    /// into the forward pass, so the model returns plausible-looking wrong output. This converts
+    /// it into a diagnosable failure.
+    /// </para>
+    /// <para>
+    /// <b>It lives here, not in a backend</b>, because the same dereference exists on Vulkan
+    /// (<c>UploadRoutedBankWhole</c>) and CUDA (<c>CudaMoeWeightsLoader.LoadLayer</c>,
+    /// <c>CudaQwen3MoeHybridTransformerModel.UploadMoeLayerFromHost</c>) — per CLAUDE.md's
+    /// cross-backend rule, one fix has to cover all of them.
+    /// </para>
+    /// </remarks>
+    /// <param name="f32Experts">Per-expert host F32 matrices; null for raw-quant loaders.</param>
+    /// <param name="numE">Expert count the upload will index up to.</param>
+    /// <param name="bankName">Tensor name for the message, e.g. <c>blk.3.ffn_gate_exps.weight</c>.</param>
+    /// <exception cref="NotSupportedException">The host F32 source is absent or incomplete.</exception>
+    public static void ValidateF32ExpertSource(nint[]? f32Experts, int numE, string bankName)
+    {
+        if (f32Experts is null)
+            throw new NotSupportedException(
+                $"Routed MoE bank '{bankName}' needs host F32 expert matrices, but this model's " +
+                $"loader allocated none (the raw GGUF mmap is its only weight source). Uploading " +
+                $"would read a null pointer per expert and silently corrupt the forward pass. " +
+                $"This bank's on-disk quantization has no routed-expert kernel on this backend — " +
+                $"see #344 (MXFP4 / Q4_0 / Q4_1) and #427.");
+
+        if (f32Experts.Length < numE)
+            throw new NotSupportedException(
+                $"Routed MoE bank '{bankName}' needs {numE} host F32 expert matrices but only " +
+                $"{f32Experts.Length} were provided; uploading would read past the end of the " +
+                $"array. See #344 and #427.");
+
+        for (int e = 0; e < numE; e++)
+        {
+            if (f32Experts[e] == 0)
+                throw new NotSupportedException(
+                    $"Routed MoE bank '{bankName}' has a null host matrix for expert {e}, so that " +
+                    $"expert alone would be silently corrupted. See #344 and #427.");
+        }
+    }
+
     /// <summary>Router gate.weight as F32 [numExperts, hiddenSize] row-major.</summary>
     public readonly float[] Gate;
 
