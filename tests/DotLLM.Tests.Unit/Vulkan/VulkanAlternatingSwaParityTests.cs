@@ -139,6 +139,39 @@ public sealed unsafe class VulkanAlternatingSwaParityTests
         AssertLogitsMatch(cpu, LastRow(logits), "prefill");
     }
 
+    /// <summary>
+    /// #564: all-row logits are opt-in (default stays last-row-only) and, once requested, every row
+    /// matches the CPU oracle. Every row of a 24-token window is compared, so a head that normalised
+    /// or projected the wrong slice cannot hide behind a correct last row.
+    /// </summary>
+    [SkippableFact]
+    public unsafe void VulkanForward_AllRowLogits_OptIn_MatchCpuEveryRow()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        var (ids, pos) = Tokens(SeqLen, seed: 7);
+        using var fx = SwaFixture.Build(seed: 23);
+
+        float[] cpuAll;
+        using (var cpu = TransformerModel.BuildFromPrebuiltWeights(fx.Weights, fx.Config))
+        using (ITensor l = cpu.Forward(ids, pos, deviceId: -1))
+            cpuAll = new ReadOnlySpan<float>((void*)l.DataPointer, ids.Length * VocabSize).ToArray();
+
+        using var device = VulkanDevice.Create();
+        using var model = VulkanTransformerModel.BuildFromPrebuiltWeights(device, fx.Config, fx.Weights, spvDir);
+
+        Assert.Equal(1, model.MaxAllRowLogitsLength);
+        using (ITensor def = model.Forward(ids, pos, deviceId: -1))
+            Assert.Equal((long)VocabSize, def.ElementCount);
+
+        Assert.True(model.TrySetAllRowLogitsLimit(SeqLen));
+        using ITensor all = model.Forward(ids, pos, deviceId: -1);
+        Assert.Equal((long)SeqLen * VocabSize, all.ElementCount);
+        var vk = new ReadOnlySpan<float>((void*)all.DataPointer, SeqLen * VocabSize);
+        for (int i = 0; i < vk.Length; i++)
+            Assert.True(MathF.Abs(cpuAll[i] - vk[i]) <= AbsTol + 1e-3f * MathF.Abs(cpuAll[i]),
+                $"row={i / VocabSize} col={i % VocabSize}: cpu={cpuAll[i]:F6} vs vulkan={vk[i]:F6}");
+    }
+
     [SkippableFact]
     public void VulkanForward_AlternatingSwa_KvPrefillThenDecodeVsCpu_LogitsMatch()
     {
