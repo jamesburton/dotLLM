@@ -459,6 +459,19 @@ public interface IModel : IDisposable
     int MaxAllRowLogitsLength => int.MaxValue;
 
     /// <summary>
+    /// Asks the model to return a logit row per input position for batches of up to
+    /// <paramref name="maxSeqLen"/> tokens, at the cost of running the LM head over every row.
+    /// Returns <see langword="true"/> when the model now honours that
+    /// (<see cref="MaxAllRowLogitsLength"/> &gt;= <paramref name="maxSeqLen"/>).
+    /// </summary>
+    /// <remarks>
+    /// Opt-in and off by default: perplexity scoring needs <c>[seq, vocab]</c> logits for a whole
+    /// window, whereas normal prefill reads only the last row and must not pay a multi-hundred-MB
+    /// LM head (#564). Models that cannot or need not widen return <see langword="false"/>.
+    /// </remarks>
+    bool TrySetAllRowLogitsLimit(int maxSeqLen) => false;
+
+    /// <summary>
     /// Allocates a fresh <see cref="IMtpState"/> — the MTP head's own tiny KV-cache plus pending
     /// hidden-state handoff — or <see langword="null"/> when <see cref="SupportsMtp"/> is
     /// <see langword="false"/>. The caller owns the returned state's lifetime (one per in-flight

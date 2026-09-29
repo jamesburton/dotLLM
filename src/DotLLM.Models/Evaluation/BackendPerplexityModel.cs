@@ -59,6 +59,8 @@ public sealed class BackendPerplexityModel : IPerplexityModel
     /// </summary>
     /// <param name="model">Model to probe.</param>
     /// <param name="deviceId">Device for the probe forward; <c>-1</c> is CPU.</param>
+    /// <param name="requiredRows">Longest batch the caller will score in one forward; the model must
+    /// declare all-row logits at least that far. Default: any length.</param>
     /// <returns><see langword="true"/> when the forward returned at least two rows of logits.</returns>
     /// <remarks>
     /// Measuring beats assuming here. The alternative — branching on the concrete model type — bakes
@@ -80,7 +82,7 @@ public sealed class BackendPerplexityModel : IPerplexityModel
     /// <c>finally</c>: a probe that throws part-way through a forward has still dirtied the state,
     /// and leaving it dirty would corrupt whatever the caller does next.</para>
     /// </remarks>
-    public static bool Probe(IModel model, int deviceId)
+    public static bool Probe(IModel model, int deviceId, int requiredRows = int.MaxValue)
     {
         ArgumentNullException.ThrowIfNull(model);
 
@@ -90,7 +92,7 @@ public sealed class BackendPerplexityModel : IPerplexityModel
             ReadOnlySpan<int> positions = stackalloc int[2] { 0, 1 };
             using ITensor logits = model.Forward(tokens, positions, deviceId);
             return logits.ElementCount >= 2L * model.Config.VocabSize
-                && model.MaxAllRowLogitsLength == int.MaxValue;
+                && model.MaxAllRowLogitsLength >= requiredRows;
         }
         finally
         {

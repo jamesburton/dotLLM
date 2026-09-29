@@ -275,7 +275,10 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         // Probed, not assumed: the CPU transformer returns [seqLen, vocab] but the CUDA model
         // returns only the final row, and that difference silently changes the perplexity rather
         // than raising. See BackendPerplexityModel.Probe.
-        bool returnsAllRows = BackendPerplexityModel.Probe(model, forwardDeviceId);
+        // A model that returns the last row only by default may widen on request (#564): a whole
+        // scoring window (+1 for a prepended BOS) is the longest batch this run will submit.
+        model.TrySetAllRowLogitsLimit(effectiveContext + 1);
+        bool returnsAllRows = BackendPerplexityModel.Probe(model, forwardDeviceId, effectiveContext + 1);
         var perplexityModel = new BackendPerplexityModel(model, forwardDeviceId, returnsAllRows);
         AnsiConsole.MarkupLine(
             $"[grey]device: {Markup.Escape(deviceLabel)}  all-rows logits: {returnsAllRows} "

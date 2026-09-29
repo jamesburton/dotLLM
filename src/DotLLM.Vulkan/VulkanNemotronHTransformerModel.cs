@@ -571,30 +571,67 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         // into _state.NormOutput offset 0, then dispatch the lm_head + alloc + download
         // the per-seq logits tensor. ForwardBatch reuses RunForwardCore with a stacked
         // capture buffer (one slot per simple seq) instead of running per-seq lm_head.
-        RunForwardCore(tokenIds, positions, kvCache,
-            captureLastNormedRowTo: null, captureSlot: 0);
-
         int vocabSize = Config.VocabSize;
+
+        // Rows the LM head covers: 1 (last row) unless all-row logits were requested (#564) and
+        // the batch fits. Resolved BEFORE any recording: growing the logits buffer invalidates the
+        // kernels' descriptor caches, which must never happen against an open command buffer.
+        int headRows = tokenIds.Length <= _allRowLogitsLimit ? tokenIds.Length : 1;
+        var logitsBuf = headRows == 1 ? _state.Logits : EnsureMultiRowLogits(headRows, vocabSize);
+
+        RunForwardCore(tokenIds, positions, kvCache,
+            captureLastNormedRowTo: null, captureSlot: 0, headRows: headRows);
 
         _submit.Begin();
         nint cmdBuf = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(cmdBuf);
 
         RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
-            _state.NormOutput, _state.Logits,
-            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: 1);
+            _state.NormOutput, logitsBuf,
+            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: headRows);
 
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         _submit.SubmitAndWait();
 
-        var shape = new TensorShape(1, vocabSize);
+        var shape = new TensorShape(headRows, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
         unsafe
         {
-            var dest = new Span<float>((void*)result.DataPointer, vocabSize);
-            _device.Download(_state.Logits, dest);
+            var dest = new Span<float>((void*)result.DataPointer, headRows * vocabSize);
+            _device.Download(logitsBuf, dest);
         }
         return result;
+    }
+
+    // Batch length up to which Forward returns a logit row per position. Default 1 = last row only,
+    // the historical behaviour; widened on request by TrySetAllRowLogitsLimit (#564).
+    private int _allRowLogitsLimit = 1;
+    private VulkanDevice.Buffer? _multiRowLogits;
+    private int _multiRowLogitsRows;
+
+    /// <inheritdoc/>
+    public int MaxAllRowLogitsLength => _allRowLogitsLimit;
+
+    /// <inheritdoc/>
+    public bool TrySetAllRowLogitsLimit(int maxSeqLen)
+    {
+        if (maxSeqLen > _allRowLogitsLimit)
+            _allRowLogitsLimit = maxSeqLen;
+        return _allRowLogitsLimit >= maxSeqLen;
+    }
+
+    private VulkanDevice.Buffer EnsureMultiRowLogits(int rows, int vocab)
+    {
+        if (_multiRowLogits is not null && _multiRowLogitsRows >= rows)
+            return _multiRowLogits;
+
+        _multiRowLogits?.Dispose();
+        _multiRowLogits = _device.AllocateHostReadback((long)rows * vocab * sizeof(float));
+        _multiRowLogitsRows = rows;
+        // A freed handle can be recycled into this allocation and the kernels key descriptor sets
+        // on the handle; see VulkanQwen3HybridDenseTransformerModel.EnsureMultiRowLogits.
+        InvalidateKernelCaches();
+        return _multiRowLogits;
     }
 
     /// <summary>
@@ -665,7 +702,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// </remarks>
     private void RunForwardCore(
         ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, IKvCache? kvCache,
-        VulkanDevice.Buffer? captureLastNormedRowTo, int captureSlot)
+        VulkanDevice.Buffer? captureLastNormedRowTo, int captureSlot, int headRows = 1)
     {
         if (tokenIds.Length != positions.Length)
             throw new ArgumentException("tokenIds and positions must have the same length.");
@@ -732,16 +769,16 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
         }
 
-        // Final RMSNorm on the last token only.
+        // Final RMSNorm on the last headRows tokens (1 unless all-row logits were requested).
         long rowBytes = (long)hiddenSize * sizeof(float);
-        long lastRowOffset = (long)(seqLen - 1) * rowBytes;
+        long headSrcOffset = (long)(seqLen - headRows) * rowBytes;
         KernelSupport.ComputeToTransferBarrier(cmdBuf);
         RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
-            srcOffset: (ulong)lastRowOffset, dstOffset: 0, size: (ulong)rowBytes);
+            srcOffset: (ulong)headSrcOffset, dstOffset: 0, size: (ulong)(headRows * rowBytes));
         KernelSupport.TransferToComputeBarrier(cmdBuf);
 
         _rmsnorm.Record(cmdBuf, _state.NormOutput, _weights.OutputNormWeight, _state.NormOutput,
-            rowCount: 1, n: hiddenSize, eps: eps);
+            rowCount: headRows, n: hiddenSize, eps: eps);
 
         // Optionally snapshot the normed last row into a caller-owned scratch buffer at
         // the given slot. Used by ForwardBatch to gather every simple seq's last hidden
@@ -1511,6 +1548,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     {
         // Phase 5f mirror — ForwardBatch lm_head scratch (null when never invoked).
         _batchScratch?.Dispose();
+        _multiRowLogits?.Dispose();
         _submit.Dispose();
         _state.Dispose();
         _weights.Dispose();

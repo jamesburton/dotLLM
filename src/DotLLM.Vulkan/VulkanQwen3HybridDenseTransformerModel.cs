@@ -459,7 +459,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         // kernel's descriptor cache. That path calls vkResetDescriptorPool, which frees sets an
         // already-recorded dispatch still references (DescriptorSetCache's own remarks document
         // exactly this hazard), so it must never run against an open command buffer.
-        int headRows = seqLen <= MaxAllRowLogitsSeqLen ? seqLen : 1;
+        int headRows = seqLen <= _allRowLogitsLimit ? seqLen : 1;
 
         bool resized = _state.EnsureCapacity(seqLen);
         if (resized)
@@ -912,7 +912,18 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     /// forward gets <see langword="true"/> here and then indexes rows that do not exist at real
     /// context lengths.
     /// </remarks>
-    public int MaxAllRowLogitsLength => MaxAllRowLogitsSeqLen;
+    public int MaxAllRowLogitsLength => _allRowLogitsLimit;
+
+    // Instance bound; defaults to the MTP verify-batch length and is widened on request (#564).
+    private int _allRowLogitsLimit = MaxAllRowLogitsSeqLen;
+
+    /// <inheritdoc/>
+    public bool TrySetAllRowLogitsLimit(int maxSeqLen)
+    {
+        if (maxSeqLen > _allRowLogitsLimit)
+            _allRowLogitsLimit = maxSeqLen;
+        return _allRowLogitsLimit >= maxSeqLen;
+    }
 
     /// <summary>
     /// Test hook for a same-process A/B (#471): when <see langword="true"/>, single-row logits
