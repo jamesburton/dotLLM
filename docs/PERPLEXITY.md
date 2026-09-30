@@ -618,3 +618,10 @@ checked by greedy prefill + 24 decode steps on the real model: identical token i
 difference at the chosen tokens 2.4e-6. Random-block parity tests against the CPU dequantiser cover
 both variants of each kernel (`DOTLLM_VK_Q5_0_GEMV_LEGACY=1`, `DOTLLM_VK_Q4_K_GEMV_LEGACY=1` restore
 the old ones).
+
+Q6_K followed (#576): `matmul_q6_k_gemv_f32_coalesced` (a lane owns 4 consecutive `l` and produces 16
+outputs; every field is read as uint16 because the 210-byte super-block alternates word alignment).
+Nemotron-3-Nano-4B Q4_K_M decode **25.6 -> 65.4 tok/s (2.55x)**, ~183 GB/s, i.e. bandwidth-bound; the
+4B's 0.35 G Q6_K elements were the bulk of the excess. Greedy decode identical over 24 steps (max logit
+difference 4.8e-6) with all three coalesced GEMVs on versus all three legacy. `DOTLLM_VK_Q6_K_GEMV_LEGACY=1`
+restores the old one. Q5_K / Q2_K / Q3_K and the IQ* F32 GEMVs have not been ported.
