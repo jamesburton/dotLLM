@@ -36,7 +36,7 @@ layout(push_constant) uniform PushConstants {
 
 #include "gemm_coopmat_blocked_decl.glsl"
 
-const uint BLOCK_BYTES = 144u;  // Q4_K super-block
+const uint Q4K_BLOCK_BYTES = 144u;  // Q4_K super-block
 
 const uint A_LANES_PER_ROW = BLOCK_SIZE / BM;        // 2 threads cooperate on one weight row
 const uint A_COLS_PER_THR  = BK / A_LANES_PER_ROW;   // 16 codes per thread
@@ -71,7 +71,7 @@ void gemmStageA(uint ch) {
     float sc = 0.0, mn = 0.0;
     uint qsBase = 0u;
     if (rowValid) {
-        uint blockBase = mGlobal * (pc.blocksPerRow * BLOCK_BYTES) + kBlock * BLOCK_BYTES;
+        uint blockBase = mGlobal * (pc.blocksPerRow * Q4K_BLOCK_BYTES) + kBlock * Q4K_BLOCK_BYTES;
         float d    = readHalf(blockBase);
         float dmin = readHalf(blockBase + 2u);
         uvec2 sm = unpackScaleMin(blockBase + 4u, subIdx);
