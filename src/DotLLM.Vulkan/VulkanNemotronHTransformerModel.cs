@@ -72,6 +72,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private readonly MatMulQ4KGemmF32Kernel _matmulQ4KGemm;
     private readonly MatMulQ5_0GemvF32Kernel _matmulQ5_0;
     private readonly MatMulQ5_0GemmF32Kernel _matmulQ5_0Gemm;
+    private readonly MatMulQ5_0GemmCoopmatKernel? _matmulQ5_0GemmCoopmat;
     // Q5_K_M matmul kernels — Phase 1 sibling of Q4_K. Always created.
     private readonly MatMulQ5KGemvF32Kernel _matmulQ5K;
     private readonly MatMulQ5KGemmF32Kernel _matmulQ5KGemm;
@@ -204,6 +205,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         MatMulQ3KGemvF32Kernel matmulQ3K, MatMulQ3KGemmF32Kernel matmulQ3KGemm,
         MatMulQ4KGemvF32Kernel matmulQ4K, MatMulQ4KGemmF32Kernel matmulQ4KGemm,
         MatMulQ5_0GemvF32Kernel matmulQ5_0, MatMulQ5_0GemmF32Kernel matmulQ5_0Gemm,
+        MatMulQ5_0GemmCoopmatKernel? matmulQ5_0GemmCoopmat,
         MatMulQ5KGemvF32Kernel matmulQ5K, MatMulQ5KGemmF32Kernel matmulQ5KGemm,
         MatMulQ6KGemvF32Kernel matmulQ6K, MatMulQ6KGemmF32Kernel matmulQ6KGemm,
         MatMulIq4NlGemvF32Kernel matmulIq4Nl, MatMulIq4NlGemmF32Kernel matmulIq4NlGemm,
@@ -253,6 +255,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ4KGemm = matmulQ4KGemm;
         _matmulQ5_0 = matmulQ5_0;
         _matmulQ5_0Gemm = matmulQ5_0Gemm;
+        _matmulQ5_0GemmCoopmat = matmulQ5_0GemmCoopmat;
         _matmulQ5K = matmulQ5K;
         _matmulQ5KGemm = matmulQ5KGemm;
         _matmulQ6K = matmulQ6K;
@@ -477,6 +480,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         var matmulQ4KGemm = MatMulQ4KGemmF32Kernel.Create(device, spvDir);
         var matmulQ5_0 = MatMulQ5_0GemvF32Kernel.Create(device, spvDir);
         var matmulQ5_0Gemm = MatMulQ5_0GemmF32Kernel.Create(device, spvDir);
+        var matmulQ5_0GemmCoopmat = MatMulQ5_0GemmCoopmatKernel.IsSupportedOn(device, spvDir)
+            ? MatMulQ5_0GemmCoopmatKernel.Create(device, spvDir) : null;
         // Q5_K_M GEMV + GEMM — Phase 1 sibling of Q4_K. Always created.
         var matmulQ5K = MatMulQ5KGemvF32Kernel.Create(device, spvDir);
         var matmulQ5KGemm = MatMulQ5KGemmF32Kernel.Create(device, spvDir);
@@ -547,7 +552,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             matmulQ2K, matmulQ2KGemm,
             matmulQ3K, matmulQ3KGemm,
             matmulQ4K, matmulQ4KGemm,
-            matmulQ5_0, matmulQ5_0Gemm,
+            matmulQ5_0, matmulQ5_0Gemm, matmulQ5_0GemmCoopmat,
             matmulQ5K, matmulQ5KGemm,
             matmulQ6K, matmulQ6KGemm,
             matmulIq4Nl, matmulIq4NlGemm,
@@ -1246,6 +1251,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ4KGemm.InvalidateDescriptorCache();
         _matmulQ5_0.InvalidateDescriptorCache();
         _matmulQ5_0Gemm.InvalidateDescriptorCache();
+        _matmulQ5_0GemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ5K.InvalidateDescriptorCache();
         _matmulQ5KGemm.InvalidateDescriptorCache();
         _matmulQ6K.InvalidateDescriptorCache();
@@ -1373,6 +1379,12 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             {
                 _matmulQ5_0.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim);
+            }
+            else if (_matmulQ5_0GemmCoopmat is not null && seqLen >= 32)
+            {
+                // 128x128 blocked coopmat tile (#568): the 128-wide token tile wastes work below ~32 rows.
+                _matmulQ5_0GemmCoopmat.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
             }
             else
             {
@@ -1627,6 +1639,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ4KGemm.Dispose();
         _matmulQ5_0.Dispose();
         _matmulQ5_0Gemm.Dispose();
+        _matmulQ5_0GemmCoopmat?.Dispose();
         _matmulQ4K.Dispose();
         _matmulQ3KGemm.Dispose();
         _matmulQ3K.Dispose();
