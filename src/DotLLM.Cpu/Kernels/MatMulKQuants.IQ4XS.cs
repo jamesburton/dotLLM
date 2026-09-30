@@ -210,26 +210,173 @@ public static unsafe partial class MatMul
         GemvKQuantParallel(weights, x, result, m, k, IQ4_XS_BlockBytes, &ComputeRowsIQ4_XS, pool);
     }
 
+    /// <summary>
+    /// 4-column AVX2 IQ4_XS × Q8_K: the nibble decode (PSHUFB + ABS) is done once per sub-block and
+    /// reused for four activation columns, which is what the dequantize-once F32 GEMM used to buy
+    /// at prefill. Column <c>t</c> starts at <c>q8k + t * q8RowBytes</c>; results land in
+    /// <c>out[0..3]</c>.
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void VecDotIQ4_XS_Q8_KAvx2x4(byte* qk, byte* q8k, int q8RowBytes, int superBlockCount, float* result4)
+    {
+        Vector128<sbyte> table = Vector128.Create(Dequantize.KValuesIq4Nl);
+        Vector256<sbyte> table2 = Vector256.Create(table, table);
+        Vector128<byte> mask0F = Vector128.Create((byte)0x0F);
+
+        Vector256<float> acc0 = Vector256<float>.Zero, acc1 = acc0, acc2 = acc0, acc3 = acc0;
+        byte* x1 = q8k + q8RowBytes, x2 = q8k + 2L * q8RowBytes, x3 = q8k + 3L * q8RowBytes;
+
+        for (int sb = 0; sb < superBlockCount; sb++)
+        {
+            float d = (float)Unsafe.ReadUnaligned<Half>(qk);
+            byte* qs = qk + 8;
+            Vector256<int> s0 = Vector256<int>.Zero, s1 = s0, s2 = s0, s3 = s0;
+
+            for (int ib = 0; ib < 8; ib++)
+            {
+                Vector128<byte> raw = Unsafe.ReadUnaligned<Vector128<byte>>(qs + ib * 16);
+                Vector128<byte> lo = Sse2.And(raw, mask0F);
+                Vector128<byte> hi = Sse2.And(Sse2.ShiftRightLogical(raw.AsUInt16(), 4).AsByte(), mask0F);
+                Vector256<sbyte> w = Avx2.Shuffle(table2, Vector256.Create(lo, hi).AsSByte());
+                Vector256<byte> aw = Avx2.Abs(w);
+                Vector256<short> scale = Vector256.Create((short)IQ4XsSubScale(qk, ib));
+                int off = 4 + ib * 32;
+
+                s0 = Avx2.Add(s0, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(aw,
+                    Avx2.Sign(Unsafe.ReadUnaligned<Vector256<sbyte>>(q8k + off), w)), scale));
+                s1 = Avx2.Add(s1, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(aw,
+                    Avx2.Sign(Unsafe.ReadUnaligned<Vector256<sbyte>>(x1 + off), w)), scale));
+                s2 = Avx2.Add(s2, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(aw,
+                    Avx2.Sign(Unsafe.ReadUnaligned<Vector256<sbyte>>(x2 + off), w)), scale));
+                s3 = Avx2.Add(s3, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(aw,
+                    Avx2.Sign(Unsafe.ReadUnaligned<Vector256<sbyte>>(x3 + off), w)), scale));
+            }
+
+            acc0 = Avx.Add(acc0, Avx.Multiply(Vector256.Create(d * Unsafe.ReadUnaligned<float>(q8k)), Avx.ConvertToVector256Single(s0)));
+            acc1 = Avx.Add(acc1, Avx.Multiply(Vector256.Create(d * Unsafe.ReadUnaligned<float>(x1)), Avx.ConvertToVector256Single(s1)));
+            acc2 = Avx.Add(acc2, Avx.Multiply(Vector256.Create(d * Unsafe.ReadUnaligned<float>(x2)), Avx.ConvertToVector256Single(s2)));
+            acc3 = Avx.Add(acc3, Avx.Multiply(Vector256.Create(d * Unsafe.ReadUnaligned<float>(x3)), Avx.ConvertToVector256Single(s3)));
+
+            qk += IQ4_XS_BlockBytes;
+            q8k += Q8_K_BlockBytes; x1 += Q8_K_BlockBytes; x2 += Q8_K_BlockBytes; x3 += Q8_K_BlockBytes;
+        }
+
+        result4[0] = HorizontalSumAvx2Float(acc0);
+        result4[1] = HorizontalSumAvx2Float(acc1);
+        result4[2] = HorizontalSumAvx2Float(acc2);
+        result4[3] = HorizontalSumAvx2Float(acc3);
+    }
+
+    /// <summary>
+    /// Computes rows <c>[rowStart, rowStart+rowCount)</c> for all <paramref name="n"/> activation
+    /// columns: <c>c[t*m + row]</c>. AVX2 processes columns four at a time against a single weight
+    /// decode; remaining columns and non-AVX2 tiers use the single-column dot.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void ComputeRowRangeIQ4_XS(byte* weights, byte* inputQ8, int q8RowBytes, float* c,
+                                               int m, int n, int superBlockCount, int rowStart, int rowCount)
+    {
+        int rowBytes = superBlockCount * IQ4_XS_BlockBytes;
+        float* tmp = stackalloc float[4];
+        for (int row = rowStart; row < rowStart + rowCount; row++)
+        {
+            byte* w = weights + (long)row * rowBytes;
+            int t = 0;
+            if (Avx2.IsSupported)
+            {
+                for (; t + 4 <= n; t += 4)
+                {
+                    VecDotIQ4_XS_Q8_KAvx2x4(w, inputQ8 + (long)t * q8RowBytes, q8RowBytes, superBlockCount, tmp);
+                    c[(long)t * m + row] = tmp[0];
+                    c[(long)(t + 1) * m + row] = tmp[1];
+                    c[(long)(t + 2) * m + row] = tmp[2];
+                    c[(long)(t + 3) * m + row] = tmp[3];
+                }
+            }
+            for (; t < n; t++)
+                c[(long)t * m + row] = Avx2.IsSupported
+                    ? VecDotIQ4_XS_Q8_KAvx2(w, inputQ8 + (long)t * q8RowBytes, superBlockCount)
+                    : VecDotIQ4_XS_Q8_KPortable(w, inputQ8 + (long)t * q8RowBytes, superBlockCount);
+        }
+    }
+
+    private struct IQ4XsGemmCtx
+    {
+        public byte* Weights;
+        public byte* InputQ8;
+        public float* C;
+        public int M, N, SuperBlockCount, Q8RowBytes;
+    }
+
+    private static void IQ4XsGemmWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var ctx = ref Unsafe.AsRef<IQ4XsGemmCtx>((void*)ctxPtr);
+        PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
+        if (count == 0) return;
+        ComputeRowRangeIQ4_XS(ctx.Weights, ctx.InputQ8, ctx.Q8RowBytes, ctx.C, ctx.M, ctx.N,
+            ctx.SuperBlockCount, start, count);
+    }
+
     /// <summary>IQ4_XS GEMM: C[N,M] = B[N,K] × A[M,K]^T where A is IQ4_XS weights.</summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void GemmIQ4_XS(byte* weights, float* b, float* c, int m, int k, int n,
                                   byte* preQuantizedInput = null)
-        => GemmKQuant(weights, b, c, m, k, n, IQ4_XS_BlockBytes, &ComputeRowsIQ4_XS, preQuantizedInput);
+        => GemmIQ4_XS(weights, b, c, m, k, n, null, preQuantizedInput);
 
-    /// <summary>IQ4_XS GEMM with optional parallelism.</summary>
+    /// <summary>IQ4_XS GEMM with optional parallelism (row-partitioned, 4-column register blocking).</summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void GemmIQ4_XS(byte* weights, float* b, float* c, int m, int k, int n,
                                   ComputeThreadPool? pool, byte* preQuantizedInput = null)
     {
-        if (pool is null)
+        if (n == 1)
         {
-            GemmIQ4_XS(weights, b, c, m, k, n, preQuantizedInput);
+            if (pool is null)
+                GemmKQuant(weights, b, c, m, k, n, IQ4_XS_BlockBytes, &ComputeRowsIQ4_XS, preQuantizedInput);
+            else
+                GemmKQuantParallel(weights, b, c, m, k, n, IQ4_XS_BlockBytes,
+                    &ComputeRowsIQ4_XS, pool, preQuantizedInput);
             return;
         }
 
-        GemmKQuantParallel(weights, b, c, m, k, n, IQ4_XS_BlockBytes,
-            &ComputeRowsIQ4_XS, pool, preQuantizedInput);
+        if (k % KQuantGroupSize != 0)
+            throw new ArgumentException(
+                $"k must be a multiple of {KQuantGroupSize}, got {k}", nameof(k));
+
+        int sbc = k / KQuantGroupSize;
+        int q8RowBytes = (k / Q8_K_GroupSize) * Q8_K_BlockBytes;
+        byte[]? rented = preQuantizedInput is null ? ArrayPool<byte>.Shared.Rent(n * q8RowBytes) : null;
+        try
+        {
+            fixed (byte* rentedPtr = rented)
+            {
+                byte* inputQ8 = preQuantizedInput;
+                if (inputQ8 is null)
+                {
+                    inputQ8 = rentedPtr;
+                    for (int t = 0; t < n; t++)
+                        QuantizeF32ToQ8_K(b + (long)t * k, inputQ8 + (long)t * q8RowBytes, k);
+                }
+
+                if (pool is null || m < ParallelMinRows)
+                {
+                    ComputeRowRangeIQ4_XS(weights, inputQ8, q8RowBytes, c, m, n, sbc, 0, m);
+                    return;
+                }
+
+                var ctx = new IQ4XsGemmCtx
+                {
+                    Weights = weights, InputQ8 = inputQ8, C = c,
+                    M = m, N = n, SuperBlockCount = sbc, Q8RowBytes = q8RowBytes,
+                };
+                pool.Dispatch((nint)(&ctx), &IQ4XsGemmWorker);
+            }
+        }
+        finally
+        {
+            if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 }

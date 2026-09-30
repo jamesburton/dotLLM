@@ -107,13 +107,15 @@ public sealed unsafe class IQ4XSDotTests
     /// Q8_K activation quantisation.
     /// </summary>
     [Theory]
-    [InlineData(7, 3)]
-    [InlineData(39, 8)]
-    public void GemvGemm_MatchDequantizeAndDot(int m, int n)
+    [InlineData(7, 3, 3)]
+    [InlineData(39, 8, 3)]
+    [InlineData(39, 8, 4)]   // exactly one 4-column block
+    [InlineData(39, 8, 7)]   // 4-column block + ragged 3-column tail
+    [InlineData(23, 5, 16)]  // several blocks
+    public void GemvGemm_MatchDequantizeAndDot(int m, int n, int cols)
     {
         var rng = new Random(6070 + m * 10 + n);
         int rowBytes = n * BlockBytes, k = n * 256;
-        const int cols = 3;
         byte* w = (byte*)NativeMemory.AlignedAlloc((nuint)(m * rowBytes), 64);
         float* b = (float*)NativeMemory.AlignedAlloc((nuint)(cols * k * sizeof(float)), 64);
         float* got = (float*)NativeMemory.Alloc((nuint)(cols * m * sizeof(float)));
@@ -162,6 +164,34 @@ public sealed unsafe class IQ4XSDotTests
             NativeMemory.AlignedFree(w); NativeMemory.AlignedFree(b);
             NativeMemory.Free(got); NativeMemory.Free(want);
         }
+    }
+
+    /// <summary>The 4-column kernel must equal four independent single-column dots (same tier, tight).</summary>
+    [SkippableFact]
+    public void FourColumnKernel_EqualsFourSingleColumnDots()
+    {
+        Skip.IfNot(Avx2.IsSupported, "needs AVX2");
+        const int n = 5;
+        var rng = new Random(6080);
+        byte* w = RandomRow(rng, n);
+        byte* x = (byte*)NativeMemory.Alloc((nuint)(4 * n * Q8KBytes));
+        try
+        {
+            for (int t = 0; t < 4; t++)
+            {
+                byte* col = RandomQ8K(rng, n);
+                Buffer.MemoryCopy(col, x + t * n * Q8KBytes, n * Q8KBytes, n * Q8KBytes);
+                NativeMemory.Free(col);
+            }
+            float* got = stackalloc float[4];
+            MatMul.VecDotIQ4_XS_Q8_KAvx2x4(w, x, n * Q8KBytes, n, got);
+            for (int t = 0; t < 4; t++)
+            {
+                float want = MatMul.VecDotIQ4_XS_Q8_KAvx2(w, x + t * n * Q8KBytes, n);
+                Assert.True(Math.Abs(got[t] - want) <= 1e-5 * Math.Max(1, Math.Abs(want)), $"col {t}: {got[t]} vs {want}");
+            }
+        }
+        finally { NativeMemory.Free(w); NativeMemory.Free(x); }
     }
 
     [Fact]
