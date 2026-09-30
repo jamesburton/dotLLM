@@ -1267,15 +1267,25 @@ public sealed class TextGenerator
     private (Core.Attention.IKvCache KvCache, int CachedTokenCount, bool OwnsKvCache) ResolveKvCache(
         int[] promptIds, int promptLen, int maxTokens)
     {
+        // A recurrent (Gated DeltaNet / SSM) model carries per-sequence state that has no position
+        // addressing: reusing only the KV half of a cached prefix would leave that state at the END of
+        // the previous request. So recurrent models never take a KV-only prefix hit, and every
+        // generation starts from zeroed state (the model-owned state is otherwise inherited from
+        // whichever request ran last — silently wrong logits, measured on Tev1-0.8B: the same prompt
+        // scored logprob -0.111 alone and -0.234 after an unrelated request).
+        bool recurrent = _model.RequiresPerSequenceState;
+        if (recurrent)
+            _model.ResetSequenceState();
+
         // Cross-request prefix trie (Step 37) takes priority — multiple sessions share blocks.
-        if (_prefixTrieManager != null)
+        if (_prefixTrieManager != null && !recurrent)
         {
             int cacheSize = Math.Min(promptLen + maxTokens, _model.Config.MaxSequenceLength);
             var admission = _prefixTrieManager.Admit(promptIds, cacheSize);
             return (admission.Cache, admission.CachedTokens, true);
         }
 
-        if (_prefixCache != null)
+        if (_prefixCache != null && !recurrent)
         {
             var (entry, matchedTokens) = _prefixCache.FindMatch(promptIds);
 
@@ -1342,6 +1352,10 @@ public sealed class TextGenerator
     private void StoreInPrefixCache(Core.Attention.IKvCache kvCache, int[] promptIds,
         List<int> generatedIds, ref bool ownsKvCache)
     {
+        // Recurrent models never reuse a KV-only prefix (see ResolveKvCache): nothing to store.
+        if (_model.RequiresPerSequenceState)
+            return;
+
         // Cross-request trie (Step 37): record completion so freshly-computed
         // blocks become available to future sequences, then let Dispose run.
         if (_prefixTrieManager != null && kvCache is KvCache.PagedKvCache paged)
