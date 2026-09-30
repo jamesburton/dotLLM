@@ -266,6 +266,8 @@ public sealed class VulkanTransformerModel : IModel
     private MatMulQ5KGemmCoopmatKernel? _matmulQ5KGemmCoopmat;
     // Same for Q5_0 (issue #592).
     private MatMulQ5_0GemmCoopmatKernel? _matmulQ5_0GemmCoopmat;
+    // Same for Q3_K (issue #598).
+    private MatMulQ3KGemmCoopmatKernel? _matmulQ3KGemmCoopmat;
     private readonly MatMulQ6KMmqKernel? _matmulQ6KMmq;
     private readonly MatMulQ5KMmqKernel? _matmulQ5KMmq;
     private readonly MatMulIq4XsMmqKernel? _matmulIq4XsMmq;
@@ -1922,6 +1924,9 @@ public sealed class VulkanTransformerModel : IModel
         if (Environment.GetEnvironmentVariable(DisableQ5_0CoopmatEnvVar) != "1"
             && MatMulQ5_0GemmCoopmatKernel.IsSupportedOn(device, spvDir))
             model._matmulQ5_0GemmCoopmat = MatMulQ5_0GemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(DisableQ3KCoopmatEnvVar) != "1"
+            && MatMulQ3KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            model._matmulQ3KGemmCoopmat = MatMulQ3KGemmCoopmatKernel.Create(device, spvDir);
         model._firstLayer = firstLayer;
         model._headless = headless;
         model._noTokenEmbed = skipTokenEmbed;
@@ -2118,6 +2123,10 @@ public sealed class VulkanTransformerModel : IModel
     internal const string DisableQ5_0CoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_Q5_0_COOPMAT";
 
     private bool PreferQ5_0Coopmat(int seqLen) => _matmulQ5_0GemmCoopmat is not null && seqLen > 1; // the tiled F32 GEMM is 4-33x slower even at p=16 (#592)
+
+    internal const string DisableQ3KCoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_Q3K_COOPMAT";
+
+    private bool PreferQ3KCoopmat(int seqLen) => _matmulQ3KGemmCoopmat is not null && seqLen >= Q4KCoopmatPreferSeqLen;
 
     private bool PreferQ5KCoopmat(int seqLen) => _matmulQ5KGemmCoopmat is not null && seqLen >= Q4KCoopmatPreferSeqLen;
 
@@ -4159,6 +4168,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ2KGemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ5KGemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ5_0GemmCoopmat?.InvalidateDescriptorCache();
+        _matmulQ3KGemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ6KMmq?.InvalidateDescriptorCache();
         _matmulQ5KMmq?.InvalidateDescriptorCache();
         _matmulIq4XsMmq?.InvalidateDescriptorCache();
@@ -5961,6 +5971,7 @@ public sealed class VulkanTransformerModel : IModel
             if (p.WeightQt == QuantType.Q6_K && PreferQ6KCoopmat(seqLen)) return false;
             if (p.WeightQt == QuantType.Q2_K && PreferQ2KCoopmat(seqLen)) return false;
             if (p.WeightQt == QuantType.Q5_K && PreferQ5KCoopmat(seqLen)) return false;
+            if (p.WeightQt == QuantType.Q3_K && PreferQ3KCoopmat(seqLen)) return false;
             if (!HasMmqPrefillKernel(p.WeightQt, inputDim)) return false;
         }
         return true;
@@ -6298,6 +6309,12 @@ public sealed class VulkanTransformerModel : IModel
                     _matmulQ3K.Record(cmdBuf, weights, input, output,
                         m: outputDim, k: inputDim);
                 }
+            }
+            else if (PreferQ3KCoopmat(seqLen) && (inputDim % 256) == 0)
+            {
+                _matmulQ3KGemmCoopmat!.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q3_k_coopmat", outputDim, inputDim, seqLen);
             }
             else if (_matmulQ3KMmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
@@ -7044,6 +7061,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ2KGemmCoopmat?.Dispose();
         _matmulQ5KGemmCoopmat?.Dispose();
         _matmulQ5_0GemmCoopmat?.Dispose();
+        _matmulQ3KGemmCoopmat?.Dispose();
         _matmulQ6KMmq?.Dispose();
         _matmulQ5KMmq?.Dispose();
         _matmulIq4XsMmq?.Dispose();
