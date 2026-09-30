@@ -172,7 +172,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         public bool PCoreOnly { get; set; }
 
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1'.")]
+        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1' (CUDA), or 'vulkan'.")]
         [DefaultValue("cpu")]
         public string Device { get; set; } = "cpu";
 
@@ -316,6 +316,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         ModelConfig config = null!;
         ITokenizer tokenizer = null!;
         IModel model = null!;
+        Func<int, DotLLM.Core.Attention.IKvCache>? vulkanKv = null;
 
         void LoadModel()
         {
@@ -341,8 +342,15 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             config = GgufModelConfigExtractor.ApplyRoPEOverride(config, BuildRoPEOverride(settings));
             tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
-            int gpuLayers = ResolveGpuLayers(settings, config);
-            if (gpuLayers <= 0)
+            bool useVulkan = DotLLM.Vulkan.VulkanModelLoader.IsVulkanDeviceString(settings.Device);
+            int gpuLayers = useVulkan ? 0 : ResolveGpuLayers(settings, config);
+            if (useVulkan)
+            {
+                // Shared per-architecture Vulkan dispatch (#259). Without this branch --device vulkan
+                // fell through to the CPU path silently.
+                (model, vulkanKv) = DotLLM.Vulkan.VulkanModelLoader.CreateSharedFromGguf(gguf, config);
+            }
+            else if (gpuLayers <= 0)
             {
                 // Shared per-architecture CPU dispatch — routes hybrid architectures
                 // (Nemotron-H, Qwen3MoeHybrid) to their dedicated loaders.
@@ -535,6 +543,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 DotLLM.Cuda.CudaTransformerModel => DotLLM.Cuda.CudaDevice.GetDevice(ParseGpuId(settings.Device)).ToString(),
                 DotLLM.Cuda.HybridTransformerModel h => $"hybrid {h.NumGpuLayers}gpu/{config.NumLayers - h.NumGpuLayers}cpu",
                 DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel h => $"hybrid {h.NumGpuLayers}gpu/{config.NumLayers - h.NumGpuLayers}cpu",
+                _ when vulkanKv is not null => $"vulkan {DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName}",
                 _ => $"{threadingInfo.EffectiveThreadCount} threads"
             };
             var segments = $"{config.Architecture} {config.NumLayers}L/{config.HiddenSize}H | {quantLabel} | {deviceLabel} | {samplingLabel}";
@@ -568,7 +577,12 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 settings.CacheWindow);
 
             Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? kvFactory = null;
-            if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
+            if (vulkanKv is not null)
+            {
+                var vkFactory = vulkanKv;
+                kvFactory = (cfg, size) => vkFactory(size);
+            }
+            else if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
             {
                 if (settings.Paged && kvConfig.IsQuantized)
                 {

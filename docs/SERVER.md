@@ -288,6 +288,16 @@ When `tools` are provided in the request:
 4. **Response**: If tool calls detected, return with `finish_reason: "tool_calls"` and structured `tool_calls` array.
 5. **Continuation**: Client sends tool results as `tool` role messages. Server applies chat template again and generates final response.
 
+## Vulkan device (`--device vulkan`)
+
+`dotllm serve --device vulkan` (and `dotllm run --device vulkan`) load the model through
+`VulkanModelLoader.CreateSharedFromGguf`, the same per-architecture dispatch `bench`/`perplexity` use, on a
+process-wide Vulkan device. Requests run one at a time through `TextGenerator` with the model's own device-resident
+KV-cache: no `ForwardBatch` scheduler, no paged/quantized KV, no cross-request prefix cache yet. Before this,
+`--device vulkan` silently fell back to the CPU (the string does not start with `gpu`); `chat` now rejects it
+explicitly. Measured on Strix Halo with Tev1-4B Q4_K_M (108-token decision prompt, 1 answer token):
+~0.3 s/request on Vulkan vs ~5.7-9 s on CPU (#613).
+
 ## Prompt Caching
 
 Multi-turn conversations benefit from prompt caching — reusing KV-cache state from previous turns to skip redundant prefill.
@@ -536,7 +546,7 @@ These are designed for the local Chat UI workflow and must not be internet-expos
 The server has two execution paths and picks per-request:
 
 1. **Continuous-batch scheduler path (default for paged-KV serving)**. When `--paged` is on (the default for `serve`) and no speculative-decoding draft model is loaded, `ServerStartup` constructs a `ContinuousBatchSchedulerService` per loaded model and starts its `RunLoopAsync` on a background task tied to `IHostApplicationLifetime.ApplicationStopping`. `/v1/chat/completions` and `/v1/completions` route non-streaming requests through `EnqueueAsync` — multiple concurrent requests pipeline through a single `IModel.ForwardBatch` dispatch per scheduler iteration. The startup log prints `Continuous-batch scheduler active` when this path is engaged.
-2. **Single-request gate path (fallback)**. Streaming requests, LoRA-adapter requests, logprob-capturing requests, and any backend without a paged KV-cache factory (CUDA, hybrid GPU, quantized KV) keep using the original `SemaphoreSlim(1, 1)` gate via `ServerState.ExecuteAsync`. Requests serialize FIFO. The startup log prints `Single-request mode — requests processed sequentially` when this is the only path.
+2. **Single-request gate path (fallback)**. Streaming requests, LoRA-adapter requests, logprob-capturing requests, and any backend without a paged KV-cache factory (CUDA, Vulkan, hybrid GPU, quantized KV) keep using the original `SemaphoreSlim(1, 1)` gate via `ServerState.ExecuteAsync`. Requests serialize FIFO. The startup log prints `Single-request mode — requests processed sequentially` when this is the only path.
 
 ### Scheduler tuning
 
