@@ -69,6 +69,8 @@ public sealed class CudaWeightUploadStagingWiringTests
     [SkippableFact]
     public void PinnedStagedUpload_IsReachedByARealModelLoad_AndOnlyWhenOptedIn()
     {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+
         FixtureLocation fixture = TestFixtureResolver.ResolveFile(
             "DOTLLM_LLAMA32_1B_Q8_0_GGUF", "bartowski", "Llama-3.2-1B-Instruct-GGUF",
             "Llama-3.2-1B-Instruct-Q8_0.gguf");
