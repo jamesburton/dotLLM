@@ -92,15 +92,15 @@ public class VulkanMatMulI2SGemvF32KernelTests
         => RunParity("matmul_i2_s_f32_gemv_mr8.spv", m, k);
 
     /// <summary>
-    /// The multi-row GEMV variants must be <b>bit-identical</b> to the production kernel, not merely
-    /// within tolerance: each output element accumulates over the same k in the same per-thread
+    /// The multi-row GEMV variants must match the production kernel to <b>reduction-order noise</b>
+    /// (1e-6 of the row's L1 mass): each output element accumulates over the same k in the same per-thread
     /// stride order and through the same tree reduce, so only the row-to-workgroup mapping changes.
     /// </summary>
     /// <remarks>
     /// This is the sharp gate for a multi-row mapping. A row-indexing slip would put a correct-looking
     /// value in the wrong output row, which a tolerance check against a scalar reference can mask when
-    /// neighbouring rows have similar magnitudes, but bitwise comparison against the production kernel
-    /// cannot.
+    /// neighbouring rows have similar magnitudes, but a comparison against the production kernel at a
+    /// tolerance 6 orders below the value scale cannot.
     /// </remarks>
     /// <param name="spv">Variant SPIR-V to compare.</param>
     /// <param name="m">Output rows.</param>
@@ -112,7 +112,7 @@ public class VulkanMatMulI2SGemvF32KernelTests
     [InlineData("matmul_i2_s_f32_gemv_mr8.spv", 2560, 2560)]
     [InlineData("matmul_i2_s_f32_gemv_mr8.spv", 577, 1024)]
     [InlineData("matmul_i2_s_f32_gemv_mr8.spv", 2049, 256)]
-    public void MultiRow_IsBitIdenticalToProduction(string spv, int m, int k)
+    public void MultiRow_MatchesProductionWithinReductionNoise(string spv, int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -128,11 +128,20 @@ public class VulkanMatMulI2SGemvF32KernelTests
         float[] baseline = RunVariantRaw(device, spvDir, "matmul_i2_s_f32_gemv.spv", weightsI2S, x, m, k);
         float[] candidate = RunVariantRaw(device, spvDir, spv, weightsI2S, x, m, k);
 
-        for (int i = 0; i < baseline.Length; i++)
+        // Bit-identity held on the Arc iGPU the variants were written on, but FP contraction and
+        // reassociation are compiler decisions: on gfx1151 (RADV/AMD) ~30-70% of rows differ in the last
+        // bits while BOTH kernels sit at ~1e-8 of the row's L1 mass from a double-precision reference
+        // (measured 2026-09-30). So the contract is "same value up to reduction-order noise", scaled by
+        // sum|term| because a near-cancelling row has a tiny result but full-size rounding error. A wrong
+        // row / element / sign is O(1) of that scale, 6 orders above the tolerance.
+        for (int r = 0; r < m; r++)
         {
+            double l1 = 0;
+            for (int q = 0; q < k; q++) l1 += Math.Abs(ternary[(long)r * k + q] * (double)x[q]);
+            l1 *= scale;
             Assert.True(
-                BitConverter.SingleToInt32Bits(baseline[i]) == BitConverter.SingleToInt32Bits(candidate[i]),
-                $"{spv} row {i} (m={m}, k={k}) differs: production {baseline[i]:G9} vs variant {candidate[i]:G9}");
+                Math.Abs((double)baseline[r] - candidate[r]) <= 1e-6 * l1,
+                $"{spv} row {r} (m={m}, k={k}) differs: production {baseline[r]:G9} vs variant {candidate[r]:G9} (L1 {l1:G4})");
         }
     }
 
