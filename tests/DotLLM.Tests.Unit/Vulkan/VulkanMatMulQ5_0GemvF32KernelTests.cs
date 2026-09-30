@@ -8,44 +8,44 @@ using Xunit;
 namespace DotLLM.Tests.Unit.Vulkan;
 
 /// <summary>
-/// #574: the Q4_K decode GEMV (coalesced default and block-per-lane legacy) against a
+/// #574: the Q5_0 decode GEMV (coalesced default and block-per-lane legacy) against a
 /// double-precision reference built from the CPU dequantiser over the exact bytes the GPU sees.
-/// Weights are RANDOM Q4_K blocks (random d/dmin, random 6-bit scales and mins, random nibbles), so both
-/// scale/min unpack paths (j < 4 and j >= 4) and both nibble halves are exercised. Both variants are F32-in, so the bar is float rounding, not the F16
+/// Weights are RANDOM Q5_0 blocks (random scale, random qh, random nibbles), so every qh bit and both
+/// nibble halves are exercised. Both variants are F32-in, so the bar is float rounding, not the F16
 /// operand floor of the coopmat GEMM.
 /// </summary>
 [Trait("Category", "GPU")]
 [Collection("VulkanKernels")]
-public class VulkanMatMulQ4KGemvF32KernelTests
+public class VulkanMatMulQ5_0GemvF32KernelTests
 {
-    private const int BlockBytes = 144;
-    private const int Group = 256;
+    private const int BlockBytes = 22;
+    private const int Group = 32;
     private const double AbsTol = 2e-3;
     private const double RelTol = 1e-3;
 
     [SkippableTheory]
-    [InlineData(1, 256, false)]
-    [InlineData(7, 512, false)]
-    [InlineData(33, 768, false)]        // odd super-block count: a partial window
-    [InlineData(300, 10240, false)]     // Nemotron-H ssm_out contraction width
-    [InlineData(64, 5120, false)]       // attn_output contraction width
-    [InlineData(1, 256, true)]
-    [InlineData(300, 10240, true)]
-    [InlineData(64, 5120, true)]
+    [InlineData(1, 32, false)]
+    [InlineData(7, 64, false)]
+    [InlineData(33, 96, false)]         // odd block count: a partial window of blocks
+    [InlineData(300, 4480, false)]      // Nemotron-H hidden width
+    [InlineData(64, 15680, false)]      // ffn_down contraction width
+    [InlineData(1, 32, true)]
+    [InlineData(300, 4480, true)]
+    [InlineData(64, 15680, true)]
     public void Launch_MatchesCpuReference(int m, int k, bool legacy)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
 
-        string? saved = Environment.GetEnvironmentVariable(MatMulQ4KGemvF32Kernel.LegacyEnvVar);
+        string? saved = Environment.GetEnvironmentVariable(MatMulQ5_0GemvF32Kernel.LegacyEnvVar);
         try
         {
-            Environment.SetEnvironmentVariable(MatMulQ4KGemvF32Kernel.LegacyEnvVar, legacy ? "1" : null);
+            Environment.SetEnvironmentVariable(MatMulQ5_0GemvF32Kernel.LegacyEnvVar, legacy ? "1" : null);
             RunAndAssert(device, spvDir, m, k);
         }
         finally
         {
-            Environment.SetEnvironmentVariable(MatMulQ4KGemvF32Kernel.LegacyEnvVar, saved);
+            Environment.SetEnvironmentVariable(MatMulQ5_0GemvF32Kernel.LegacyEnvVar, saved);
         }
     }
 
@@ -57,9 +57,8 @@ public class VulkanMatMulQ4KGemvF32KernelTests
         for (long b = 0; b < (long)m * blocksPerRow; b++)
         {
             int o = (int)(b * BlockBytes);
-            BitConverter.TryWriteBytes(w.AsSpan(o, 2), (Half)(0.0001f + rng.NextSingle() * 0.0003f));       // d
-            BitConverter.TryWriteBytes(w.AsSpan(o + 2, 2), (Half)(0.0001f + rng.NextSingle() * 0.0003f));   // dmin
-            rng.NextBytes(w.AsSpan(o + 4, BlockBytes - 4));   // scales[12] + qs[128], fully random
+            BitConverter.TryWriteBytes(w.AsSpan(o, 2), (Half)(0.001f + rng.NextSingle() * 0.01f));
+            rng.NextBytes(w.AsSpan(o + 2, BlockBytes - 2));
         }
 
         float[] x = new float[k];
@@ -71,7 +70,7 @@ public class VulkanMatMulQ4KGemvF32KernelTests
         {
             for (int r = 0; r < m; r++)
                 Dequantize.ToFloat32(pin.AddrOfPinnedObject() + r * blocksPerRow * BlockBytes, k,
-                    QuantizationType.Q4_K, wf.AsSpan(r * k, k));
+                    QuantizationType.Q5_0, wf.AsSpan(r * k, k));
         }
         finally { pin.Free(); }
 
@@ -83,7 +82,7 @@ public class VulkanMatMulQ4KGemvF32KernelTests
             expected[r] = acc;
         }
 
-        using var kernel = MatMulQ4KGemvF32Kernel.Create(device, spvDir);
+        using var kernel = MatMulQ5_0GemvF32Kernel.Create(device, spvDir);
         using var bufW = device.Allocate(((long)w.Length + 3) & ~3L);
         using var bufX = device.Allocate((long)k * sizeof(float));
         using var bufY = device.Allocate((long)m * sizeof(float));
