@@ -1,0 +1,99 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Q5_0 decode GEMV with an FP32 activation, COALESCED lane=K-position layout (issue #574).
+//
+//   y[m] = sum_k W_q5_0[m,k] * x[k]
+//
+// Same contract and bindings as matmul_q5_0_f32_gemv.comp (FP32 x, no activation quantisation, so the
+// result stays within float rounding of that kernel), with the memory layout of
+// matmul_q8_0_coalesced.comp (#471). The block-per-lane original makes lane -> whole 22-byte block, so
+// a wave's lanes read words ~22 bytes apart and each memory transaction serves about one lane. Here
+// four lanes cover one block and consecutive lanes read consecutive words.
+//
+// Block layout (22 bytes = 11 uint16, every field 2-byte aligned):
+//   uint16 [0]      = fp16 scale d
+//   uint16 [1..2]   = qh (uint32: the 5th bit of every element)
+//   uint16 [3..10]  = qs[16]  (two 4-bit nibbles per byte)
+//   element j      (0..15) = (qs[j] & 0xF) | ((qh >>  j      ) & 1) << 4
+//   element j + 16 (0..15) = (qs[j] >> 4)  | ((qh >> (j + 16)) & 1) << 4
+//   value = d * (q - 16)
+// Lane s (0..3) of a block owns qs bytes 4s..4s+3, i.e. elements {4s..4s+3} and {16+4s..16+4s+3}.
+//
+// Dispatch: one workgroup of WG_SIZE threads per output row. Reduction: subgroupAdd, then a
+// shared-memory pass over the subgroups when the workgroup spans more than one.
+
+#define WG_SIZE 64u
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint weight[]; };  // Q5_0 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { vec4 x4[]; };      // [K/4]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };      // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow;
+    uint rowUints;     // unused; kept for binding/push-constant parity with matmul_q5_0_f32_gemv
+} pc;
+
+const uint UINT16_PER_BLOCK = 11u;
+const uint WINDOW_BLOCKS    = WG_SIZE / 4u;
+
+uint readU16(uint idx16) {
+    uint w = weight[idx16 >> 1u];
+    return ((idx16 & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+}
+
+shared float partials[WG_SIZE];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint blockInWindow = lane >> 2u;
+    uint s             = lane & 3u;          // which 4 qs bytes of the block this lane owns
+
+    uint rowBase16 = m * pc.blocksPerRow * UINT16_PER_BLOCK;
+
+    float acc = 0.0;
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + blockInWindow;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        uint b16 = rowBase16 + blk * UINT16_PER_BLOCK;
+        float d = unpackHalf2x16(readU16(b16)).x;
+        uint qh = readU16(b16 + 1u) | (readU16(b16 + 2u) << 16u);
+        uint qsw = readU16(b16 + 3u + 2u * s) | (readU16(b16 + 4u + 2u * s) << 16u);   // qs[4s..4s+3]
+
+        uvec4 lo = uvec4(qsw & 0xFu, (qsw >> 8) & 0xFu, (qsw >> 16) & 0xFu, (qsw >> 24) & 0xFu);
+        uvec4 hi = uvec4((qsw >> 4) & 0xFu, (qsw >> 12) & 0xFu, (qsw >> 20) & 0xFu, (qsw >> 28) & 0xFu);
+        uint j0 = 4u * s;
+        uvec4 bitLo = uvec4((qh >> j0) & 1u, (qh >> (j0 + 1u)) & 1u, (qh >> (j0 + 2u)) & 1u, (qh >> (j0 + 3u)) & 1u);
+        uvec4 bitHi = uvec4((qh >> (j0 + 16u)) & 1u, (qh >> (j0 + 17u)) & 1u, (qh >> (j0 + 18u)) & 1u, (qh >> (j0 + 19u)) & 1u);
+        vec4 qLo = vec4(lo | (bitLo << 4u)) - vec4(16.0);
+        vec4 qHi = vec4(hi | (bitHi << 4u)) - vec4(16.0);
+
+        uint xi = blk * 8u;                       // vec4 index of the block's first 4 activations
+        acc += d * (dot(qLo, x4[xi + s]) + dot(qHi, x4[xi + 4u + s]));
+    }
+
+    float sum = subgroupAdd(acc);
+    if (gl_NumSubgroups == 1u) {
+        if (subgroupElect())
+            y[m] = sum;
+        return;
+    }
+    if (subgroupElect())
+        partials[gl_SubgroupID] = sum;
+    barrier();
+    if (lane == 0u) {
+        float total = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; i++)
+            total += partials[i];
+        y[m] = total;
+    }
+}
