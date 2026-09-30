@@ -34,7 +34,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; }; // Q8_0 blob
-layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; };      // [N*K]
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { vec4 b4[]; };      // [N*K]
 layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };      // [N*M]
 
 layout(push_constant) uniform PushConstants {
@@ -53,48 +53,43 @@ const uint BLOCK_BYTES = 34u;   // 2 (fp16 scale) + 32 (int8 codes)
 const uint A_LANES_PER_ROW = BLOCK_SIZE / BM;        // threads cooperating on one weight row
 const uint A_COLS_PER_THR  = BK / A_LANES_PER_ROW;   // codes per thread
 
-int readQsByte(uint absByteOff) {
-    uint u = weight[absByteOff >> 2u];
-    uint shift = (absByteOff & 3u) * 8u;
-    int bv = int((u >> shift) & 0xFFu);
-    return (bv ^ 0x80) - 0x80;
-}
-
-// Little-endian fp16 at an arbitrary byte offset. 34-byte blocks straddle uint-word boundaries
-// after the first, so this cannot assume alignment.
-float readHalf(uint absByteOff) {
-    uint alignedIdx = absByteOff >> 2u;
-    uint byteInWord = absByteOff & 3u;
-    uint u = weight[alignedIdx];
-    uint half16;
-    if (byteInWord <= 2u) {
-        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
-    } else {
-        uint uNext = weight[alignedIdx + 1u];
-        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
-    }
-    return unpackHalf2x16(half16).x;
-}
-
+// A-staging (#580): one thread stages 16 consecutive codes of one weight row, and reads them as
+// whole u32 words rather than byte-by-byte. The old form issued one 32-bit load + shift + sign
+// extend PER CODE (16 loads/thread/chunk) and made the weight stage ~54% of the GEMM (measured
+// by skipping it, on the real Nemotron-9B shapes); the word form is 5 loads and 1.4x the kernel.
+//
+// Every offset here is EVEN — the 34-byte block stride and the 2-byte scale keep 2-byte alignment
+// — so a 16-byte span starts either on a word boundary or exactly 2 bytes into one, and is one
+// funnel-shift away from aligned. The 5th word is needed ONLY in the 2-byte-misaligned case; it is
+// not loaded otherwise, because there it would lie past the block (and, for the last row, the blob).
 void gemmStageA(uint ch) {
     uint rowLocal  = g_tid / A_LANES_PER_ROW;
     uint laneOfRow = g_tid % A_LANES_PER_ROW;
     uint mGlobal   = g_mBase + rowLocal;
-    uint sBase     = rowLocal * STRIDE;
-    uint col0      = laneOfRow * A_COLS_PER_THR;
+    uint sBase     = rowLocal * STRIDE + laneOfRow * A_COLS_PER_THR;
 
-    bool rowValid = mGlobal < pc.M;
-    float d = 0.0;
-    uint blockBase = 0u;
-    if (rowValid) {
-        blockBase = mGlobal * (pc.blocksPerRow * BLOCK_BYTES) + ch * BLOCK_BYTES;
-        d = readHalf(blockBase);
+    if (mGlobal >= pc.M) {
+        for (uint j = 0u; j < A_COLS_PER_THR; j++) sharedA[sBase + j] = float16_t(0.0);
+        return;
     }
 
-    for (uint j = 0u; j < A_COLS_PER_THR; j++) {
-        uint col = col0 + j;
-        float q = rowValid ? (d * float(readQsByte(blockBase + 2u + col))) : 0.0;
-        sharedA[sBase + col] = float16_t(q);
+    uint blockBase = mGlobal * (pc.blocksPerRow * BLOCK_BYTES) + ch * BLOCK_BYTES;
+    uint dw = weight[blockBase >> 2u];
+    float d = unpackHalf2x16((dw >> ((blockBase & 2u) * 8u)) & 0xFFFFu).x;
+
+    uint off = blockBase + 2u + laneOfRow * A_COLS_PER_THR;
+    uint wi = off >> 2u;
+    bool hi = (off & 2u) != 0u;
+    uint w[5];
+    [[unroll]] for (uint i = 0u; i < 4u; i++) w[i] = weight[wi + i];
+    w[4] = hi ? weight[wi + 4u] : 0u;
+
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        uint s = hi ? ((w[i] >> 16) | (w[i + 1u] << 16)) : w[i];
+        [[unroll]] for (uint jb = 0u; jb < 4u; jb++) {
+            int q = bitfieldExtract(int(s), int(jb * 8u), 8);
+            sharedA[sBase + i * 4u + jb] = float16_t(d * float(q));
+        }
     }
 }
 
@@ -103,7 +98,8 @@ void gemmStageA(uint ch) {
 #define GEMM_CHUNKS     pc.blocksPerRow
 #define GEMM_ROW_BASE   0u
 #define GEMM_ROW_LIMIT  pc.N
-#define GEMM_B_BUF      b
+#define GEMM_B_BUF      b4
+#define GEMM_B_VEC4
 #define GEMM_C_BUF      c
 
 #include "gemm_coopmat_blocked_main.glsl"

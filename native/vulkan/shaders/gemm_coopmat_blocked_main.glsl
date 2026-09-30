@@ -64,6 +64,25 @@ void main() {
 
         // ---- 1. Stage sharedB[BN, BK] as F16. ----
         // Strided by BLOCK_SIZE so consecutive lanes read consecutive activations (coalesced).
+#ifdef GEMM_B_VEC4
+        // GEMM_B_BUF is a vec4 array: one 16-byte load per four activations. Measured 1.5-1.9x on
+        // the whole Q8_0 GEMM (#580) — scalar 4-byte loads left the activation stage
+        // load-issue bound. Needs GEMM_K % 4 == 0 and a 16-byte-aligned GEMM_ROW_BASE * GEMM_K.
+        for (uint i = 0u; i < B_PER_THR / 4u; i++) {
+            uint idx = i * BLOCK_SIZE + g_tid;          // vec4 index within the BN x BK tile
+            uint row = idx / (BK / 4u);
+            uint col = (idx % (BK / 4u)) * 4u;
+            uint tLocal = g_tBase + row;
+            vec4 v = (tLocal < uint(GEMM_ROW_LIMIT))
+                ? GEMM_B_BUF[((GEMM_ROW_BASE + tLocal) * GEMM_K + kBase + col) >> 2u]
+                : vec4(0.0);
+            uint so = row * STRIDE + col;
+            sharedB[so]      = float16_t(v.x);
+            sharedB[so + 1u] = float16_t(v.y);
+            sharedB[so + 2u] = float16_t(v.z);
+            sharedB[so + 3u] = float16_t(v.w);
+        }
+#else
         for (uint i = 0u; i < B_PER_THR; i++) {
             uint idx = i * BLOCK_SIZE + g_tid;
             uint row = idx / BK;
@@ -74,6 +93,7 @@ void main() {
                 : 0.0;
             sharedB[row * STRIDE + col] = float16_t(v);
         }
+#endif
 
         // ---- 2. Stage sharedA[BM, BK] â€” the one per-quant hook. ----
         gemmStageA(ch);
