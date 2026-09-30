@@ -33,7 +33,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>Compute device.</summary>
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1'.")]
+        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1' (CUDA), or 'vulkan' (single-request path).")]
         [DefaultValue("cpu")]
         public string Device { get; set; } = "cpu";
 

@@ -105,7 +105,15 @@ public static class ServerStartup
             : options.Device.StartsWith("gpu", StringComparison.OrdinalIgnoreCase) ? config.NumLayers : 0;
 
         IModel model;
-        if (gpuLayers <= 0)
+        Func<int, IKvCache>? vulkanKvFactory = null;
+        if (DotLLM.Vulkan.VulkanModelLoader.IsVulkanDeviceString(options.Device))
+        {
+            // Shared per-architecture Vulkan dispatch (#259). Before this branch `--device vulkan` fell
+            // through to the CPU path silently (the string does not start with "gpu").
+            Console.WriteLine($"[dotllm] Vulkan inference ({DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName})");
+            (model, vulkanKvFactory) = DotLLM.Vulkan.VulkanModelLoader.CreateSharedFromGguf(gguf, config);
+        }
+        else if (gpuLayers <= 0)
         {
             Console.WriteLine($"[dotllm] CPU inference ({threading.EffectiveThreadCount} threads)");
             // Shared per-architecture CPU dispatch — routes hybrid architectures
@@ -166,7 +174,17 @@ public static class ServerStartup
         PagedKvCacheFactory? pagedFactory = null;
         DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
         PrefixTrieManager? prefixTrieManager = null;
-        if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
+        if (vulkanKvFactory is not null)
+        {
+            // Vulkan models own their device-resident KV storage. Like the CUDA paths, requests run
+            // one at a time through the per-request TextGenerator (no ForwardBatch scheduler, no
+            // paged/quantized KV, no cross-request prefix reuse yet).
+            if (options.UsePaged)
+                Console.WriteLine("[dotllm] Paged KV-cache not supported on Vulkan; using the model's own KV-cache.");
+            var vkFactory = vulkanKvFactory;
+            kvFactory = (cfg, size) => vkFactory(size);
+        }
+        else if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
         {
             if (options.UsePaged && kvConfig.IsQuantized)
             {
@@ -262,7 +280,7 @@ public static class ServerStartup
                 kvConfig.TurboQuantBits, kvConfig.TurboQuantSeed, kvConfig.TurboQuantUseQjl);
         }
 
-        PrefixCache? prefixCache = options.PromptCacheEnabled
+        PrefixCache? prefixCache = options.PromptCacheEnabled && vulkanKvFactory is null
             ? new PrefixCache(options.PromptCacheSize)
             : null;
 

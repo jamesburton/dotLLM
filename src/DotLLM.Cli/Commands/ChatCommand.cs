@@ -117,7 +117,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         /// <summary>Compute device.</summary>
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1'.")]
+        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1' (CUDA). 'vulkan' is not supported by chat yet; use 'run' or 'serve'.")]
         [DefaultValue("cpu")]
         public string Device { get; set; } = "cpu";
 
@@ -228,6 +228,13 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
     /// <inheritdoc/>
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
+        // Fail loudly: "vulkan" does not start with "gpu", so it would otherwise run on the CPU silently.
+        if (DotLLM.Vulkan.VulkanModelLoader.IsVulkanDeviceString(settings.Device))
+        {
+            AnsiConsole.MarkupLine("[red]--device vulkan is not supported by 'chat' yet; use 'run' or 'serve'.[/]");
+            return 1;
+        }
+
         // Resolve before loading the model so a bad path fails fast.
         if (!TextArgument.TryResolve(settings.SystemPrompt, settings.SystemPromptFile,
                 "--system|-s", "--system-file", required: false,
