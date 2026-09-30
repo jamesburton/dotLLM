@@ -150,6 +150,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private readonly Conv1dCausalF32Kernel _conv1dCausal;
     private readonly SiluInplaceF32Kernel _siluInplace;
     private readonly Mamba2SelectiveScanF32Kernel _mamba2Scan;
+    private readonly Mamba2SelectiveScanRegsF32Kernel? _mamba2ScanRegs;
     private readonly SsmDSkipF32Kernel _ssmDSkip;
     private readonly GroupRmsNormF32Kernel _groupRmsNorm;
     private readonly ReluSquaredInplaceF32Kernel _reluSquared;
@@ -228,7 +229,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         VulkanSplitKvAttentionKernel? splitKvAttention,
         SwiGluF32Kernel swiglu, AddKernel add, BiasAddF32Kernel biasAdd,
         Conv1dCausalF32Kernel conv1dCausal, SiluInplaceF32Kernel siluInplace,
-        Mamba2SelectiveScanF32Kernel mamba2Scan, SsmDSkipF32Kernel ssmDSkip,
+        Mamba2SelectiveScanF32Kernel mamba2Scan, Mamba2SelectiveScanRegsF32Kernel? mamba2ScanRegs, SsmDSkipF32Kernel ssmDSkip,
         GroupRmsNormF32Kernel groupRmsNorm, ReluSquaredInplaceF32Kernel reluSquared,
         SsmSplitXbcF32Kernel ssmSplitXbc,
         VulkanDevice.SubmitContext submit)
@@ -296,6 +297,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _conv1dCausal = conv1dCausal;
         _siluInplace = siluInplace;
         _mamba2Scan = mamba2Scan;
+        _mamba2ScanRegs = mamba2ScanRegs;
         _ssmDSkip = ssmDSkip;
         _groupRmsNorm = groupRmsNorm;
         _reluSquared = reluSquared;
@@ -542,6 +544,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         var conv1dCausal = Conv1dCausalF32Kernel.Create(device, spvDir);
         var siluInplace = SiluInplaceF32Kernel.Create(device, spvDir);
         var mamba2Scan = Mamba2SelectiveScanF32Kernel.Create(device, spvDir);
+        var mamba2ScanRegs = File.Exists(Path.Combine(spvDir, "mamba2_selective_scan_f32_regs.spv"))
+            ? Mamba2SelectiveScanRegsF32Kernel.Create(device, spvDir) : null;
         var ssmDSkip = SsmDSkipF32Kernel.Create(device, spvDir);
         var groupRmsNorm = GroupRmsNormF32Kernel.Create(device, spvDir);
         var reluSquared = ReluSquaredInplaceF32Kernel.Create(device, spvDir);
@@ -573,7 +577,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
             rmsnorm, attention, flashAttention, splitKvAttention, swiglu, add, biasAdd,
-            conv1dCausal, siluInplace, mamba2Scan, ssmDSkip, groupRmsNorm, reluSquared,
+            conv1dCausal, siluInplace, mamba2Scan, mamba2ScanRegs, ssmDSkip, groupRmsNorm, reluSquared,
             ssmSplitXbc,
             submit);
     }
@@ -1099,9 +1103,20 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 8. Mamba2 selective scan: state, SsmX, DtBuf, A, SsmB, SsmC -> SsmY.
-        _mamba2Scan.Record(cmdBuf, ssmStateBuf, _state.SsmX, _state.DtBuf, ssmW.A,
-            _state.SsmB, _state.SsmC, _state.SsmY,
-            nHead: nHead, headDim: headDim, dState: dState, nGroup: nGroup, seqLen: seqLen);
+        if (_mamba2ScanRegs is not null && Mamba2SelectiveScanRegsF32Kernel.IsEligible(headDim, dState))
+        {
+            // Register-resident state, 4 lanes per row (#572): 3-4x on prefill, and it removes the
+            // per-token global state round trip that dominated Nemotron-H prefill AND decode.
+            _mamba2ScanRegs.Record(cmdBuf, ssmStateBuf, _state.SsmX, _state.DtBuf, ssmW.A,
+                _state.SsmB, _state.SsmC, _state.SsmY,
+                nHead: nHead, headDim: headDim, dState: dState, nGroup: nGroup, seqLen: seqLen);
+        }
+        else
+        {
+            _mamba2Scan.Record(cmdBuf, ssmStateBuf, _state.SsmX, _state.DtBuf, ssmW.A,
+                _state.SsmB, _state.SsmC, _state.SsmY,
+                nHead: nHead, headDim: headDim, dState: dState, nGroup: nGroup, seqLen: seqLen);
+        }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 9. SsmY += SsmX * D
@@ -1293,6 +1308,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _conv1dCausal.InvalidateDescriptorCache();
         _siluInplace.InvalidateDescriptorCache();
         _mamba2Scan.InvalidateDescriptorCache();
+        _mamba2ScanRegs?.InvalidateDescriptorCache();
         _ssmDSkip.InvalidateDescriptorCache();
         _groupRmsNorm.InvalidateDescriptorCache();
         _reluSquared.InvalidateDescriptorCache();
@@ -1612,6 +1628,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _groupRmsNorm.Dispose();
         _ssmDSkip.Dispose();
         _mamba2Scan.Dispose();
+        _mamba2ScanRegs?.Dispose();
         _siluInplace.Dispose();
         _conv1dCausal.Dispose();
         _biasAdd.Dispose();
