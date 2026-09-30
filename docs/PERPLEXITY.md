@@ -568,3 +568,32 @@ pp512 (Q8_0, already coopmat, is 120), decode unchanged at 14.2 tok/s. Perplexit
 (7.5090; per-window max |dNLL| 1.6e-4) and the 32-chunk run is now 152 s (474 s before #568).
 `DOTLLM_VK_Q4_K_GEMM_LEGACY=1` restores the tiled GEMM. Q5_K/Q6_K/Q2_K/Q3_K prefill GEMMs are the same
 shape of opportunity and are not done.
+
+### Nemotron-H Mamba2 scan: the real prefill/decode bottleneck (issue #572, 2026-09-30)
+
+Attribution by perturbation, not guesswork: skipping the `mamba2_selective_scan` dispatch (garbage
+output, valid timing) took Nemotron-Nano-9B Q8_0 pp512 from **4289 ms to 1047 ms** and decode from
+17.4 to 22.7 tok/s. The scan was ~75% of prefill. It is not the GEMMs (Q8_0 was already coopmat) and not
+the 3 x seqLen per-token `vkCmdCopyBuffer` loops in the SSM layer (batching them into one call each was
+measured and changed nothing: 4263 -> 4273 ms; reverted).
+
+Cause: the reference kernel runs one 64-thread workgroup per head and, for every token, reads and
+writes all `dState` floats of every state row to global memory; at headDim 80 it also idles 16 of 64
+lanes. The new `mamba2_selective_scan_f32_regs` keeps each row's state in registers for the whole
+sequence (global memory touched at entry and exit only), splits the 128-wide state across 4 lanes with
+a two-step `subgroupShuffleXor` reduction, and runs `nHead * headDim / 16` workgroups so every lane is
+busy. Eligible when `dState == 128` and `headDim % 16 == 0`; otherwise the reference kernel runs.
+`DOTLLM_VK_MAMBA2_SCAN_LEGACY=1` forces the reference.
+
+`bench -p 512 -n 16`, same session, A/B via the env var:
+
+| model | pp512 tok/s before -> after | tg tok/s |
+|---|---|---|
+| Nemotron-Nano-9B Q8_0 | 119 -> **480** (4.0x) | 17.4 -> 21.6 |
+| Nemotron-3-Nano-4B Q4_K_M | 159 -> **363** (2.3x) | 17.3 -> 19.6 |
+| Nemotron-Nano-9B Q4_K_M (with #568 and #570) | 34.5 at session start -> **419** | 4.8 -> 17.0 |
+
+Correctness: 32-chunk perplexity on the 9B Q8_0 control is 7.4423 (7.4422 before), per-window max
+|dNLL| 2.1e-4 versus the previous Vulkan run, and the arm now takes 43 s instead of 146 s. Six kernel
+parity tests against the CPU reference, including the 128-head/80-dim/8-group shape of the real model;
+dropping the second shuffle-reduction step makes 6 of 7 fail.
