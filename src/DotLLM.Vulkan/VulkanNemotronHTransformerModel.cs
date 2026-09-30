@@ -81,6 +81,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     // K-quant matmul kernel coverage. Always created.
     private readonly MatMulQ6KGemvF32Kernel _matmulQ6K;
     private readonly MatMulQ6KGemmF32Kernel _matmulQ6KGemm;
+    private readonly MatMulQ6KGemmCoopmatKernel? _matmulQ6KGemmCoopmat;
     // IQ4_NL / IQ4_XS matmul kernels — IQ-family follow-up to the K-quant
     // Phase 1 work. Always created; dispatcher routes per device-side
     // QuantizationType.
@@ -210,7 +211,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         MatMulQ5_0GemvF32Kernel matmulQ5_0, MatMulQ5_0GemmF32Kernel matmulQ5_0Gemm,
         MatMulQ5_0GemmCoopmatKernel? matmulQ5_0GemmCoopmat,
         MatMulQ5KGemvF32Kernel matmulQ5K, MatMulQ5KGemmF32Kernel matmulQ5KGemm,
-        MatMulQ6KGemvF32Kernel matmulQ6K, MatMulQ6KGemmF32Kernel matmulQ6KGemm,
+        MatMulQ6KGemvF32Kernel matmulQ6K, MatMulQ6KGemmF32Kernel matmulQ6KGemm, MatMulQ6KGemmCoopmatKernel? matmulQ6KGemmCoopmat,
         MatMulIq4NlGemvF32Kernel matmulIq4Nl, MatMulIq4NlGemmF32Kernel matmulIq4NlGemm,
         MatMulIq4XsGemvF32Kernel matmulIq4Xs, MatMulIq4XsGemmF32Kernel matmulIq4XsGemm,
         Iq2Codebooks iq2Codebooks,
@@ -264,6 +265,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ5KGemm = matmulQ5KGemm;
         _matmulQ6K = matmulQ6K;
         _matmulQ6KGemm = matmulQ6KGemm;
+        _matmulQ6KGemmCoopmat = matmulQ6KGemmCoopmat;
         _matmulIq4Nl = matmulIq4Nl;
         _matmulIq4NlGemm = matmulIq4NlGemm;
         _matmulIq4Xs = matmulIq4Xs;
@@ -495,6 +497,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         // Q6_K_M GEMV + GEMM — Phase 1 sibling of Q4_K / Q5_K. Always created.
         var matmulQ6K = MatMulQ6KGemvF32Kernel.Create(device, spvDir);
         var matmulQ6KGemm = MatMulQ6KGemmF32Kernel.Create(device, spvDir);
+        var matmulQ6KGemmCoopmat = MatMulQ6KGemmCoopmatKernel.IsSupportedOn(device, spvDir)
+            ? MatMulQ6KGemmCoopmatKernel.Create(device, spvDir) : null;
         // IQ4_NL / IQ4_XS GEMV + GEMM — IQ-family follow-up. Always created.
         var matmulIq4Nl = MatMulIq4NlGemvF32Kernel.Create(device, spvDir);
         var matmulIq4NlGemm = MatMulIq4NlGemmF32Kernel.Create(device, spvDir);
@@ -563,7 +567,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             matmulQ4K, matmulQ4KGemm, matmulQ4KGemmCoopmat,
             matmulQ5_0, matmulQ5_0Gemm, matmulQ5_0GemmCoopmat,
             matmulQ5K, matmulQ5KGemm,
-            matmulQ6K, matmulQ6KGemm,
+            matmulQ6K, matmulQ6KGemm, matmulQ6KGemmCoopmat,
             matmulIq4Nl, matmulIq4NlGemm,
             matmulIq4Xs, matmulIq4XsGemm,
             iq2Codebooks,
@@ -1277,6 +1281,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ5KGemm.InvalidateDescriptorCache();
         _matmulQ6K.InvalidateDescriptorCache();
         _matmulQ6KGemm.InvalidateDescriptorCache();
+        _matmulQ6KGemmCoopmat?.InvalidateDescriptorCache();
         _matmulIq4Nl.InvalidateDescriptorCache();
         _matmulIq4NlGemm.InvalidateDescriptorCache();
         _matmulIq4Xs.InvalidateDescriptorCache();
@@ -1443,6 +1448,12 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             {
                 _matmulQ6K.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim);
+            }
+            else if (_matmulQ6KGemmCoopmat is not null && seqLen >= 32)
+            {
+                // 128x128 blocked coopmat tile (#578).
+                _matmulQ6KGemmCoopmat.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
             }
             else
             {
@@ -1662,6 +1673,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulIq2Xxs.Dispose();
         _iq2Codebooks.Dispose();
         _matmulQ6KGemm.Dispose();
+        _matmulQ6KGemmCoopmat?.Dispose();
         _matmulQ6K.Dispose();
         _matmulQ5KGemm.Dispose();
         _matmulQ5K.Dispose();

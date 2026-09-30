@@ -625,3 +625,30 @@ Nemotron-3-Nano-4B Q4_K_M decode **25.6 -> 65.4 tok/s (2.55x)**, ~183 GB/s, i.e.
 4B's 0.35 G Q6_K elements were the bulk of the excess. Greedy decode identical over 24 steps (max logit
 difference 4.8e-6) with all three coalesced GEMVs on versus all three legacy. `DOTLLM_VK_Q6_K_GEMV_LEGACY=1`
 restores the old one. Q5_K / Q2_K / Q3_K and the IQ* F32 GEMVs have not been ported.
+
+### Q6_K prefill GEMM (issue #578, 2026-09-30)
+
+After the scan fix the 4B model's prefill (Nemotron-3-Nano-4B Q4_K_M, 360 tok/s vs llama.cpp's 1759) no
+longer depended on the scan (skip: 1392 -> 1396 ms). Perturbing each matmul type instead: skipping Q6_K
+took pp512 from 1396 ms to **489 ms**, i.e. Q6_K was **65%** of prefill while holding 9% of the
+parameters (Q5_0 280 ms, Q4_K 125 ms). Q6_K was the last quant on Nemotron-H's prefill path still using
+the 16x16 tiled F32 GEMM. `matmul_q6_k_gemm_coopmat_128x128x4` (a 32-element chunk is one
+(half, group) of a super-block; two lanes per row, one scale each):
+
+| | pp512 tok/s | wall for 16 ppl chunks |
+|---|---|---|
+| tiled F32 GEMM (`DOTLLM_VK_Q6_K_GEMM_LEGACY=1`) | 363 | 52.9 s |
+| blocked coopmat | **930** (2.56x) | 24.6 s |
+
+Perplexity 11.6145 vs 11.6143 (identical to F16 operand rounding). Random-block parity tests; swapping
+the nibble half makes 7 of 8 fail.
+
+Current Nemotron-H standing against llama.cpp (Vulkan, b9672), pp512 / tg64, tok/s:
+
+| model | dotLLM | llama.cpp |
+|---|---|---|
+| Nano-9B Q8_0 | 476 / 21.6 | 764 / 21.8 |
+| Nano-9B Q4_K_M | 419 / 29.5 | 789 / 29.9 |
+| Nemotron-3-Nano-4B Q4_K_M | 930 / 65.2 | 1759 / 66.9 |
+
+Decode is at parity on all three; prefill is at 53-62%.
