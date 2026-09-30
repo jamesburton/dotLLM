@@ -3568,6 +3568,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             MatMul.GemvQ3_K((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.IQ4_XS)
             MatMul.GemvIQ4_XS((byte*)weights, x, y, m, k, _threadPool);
+        else if (MatMul.IsCodebookIq(qt))
+            MatMul.GemvIQCodebook(qt, (byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.Q4_K)
             MatMul.GemvQ4_K((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.Q5_K)
@@ -3609,6 +3611,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             MatMul.GemmQ3_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
         else if (qt == QuantizationType.IQ4_XS)
             MatMul.GemmIQ4_XS((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+        else if (MatMul.IsCodebookIq(qt))
+            MatMul.GemmIQCodebook(qt, (byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
         else if (qt == QuantizationType.Q4_K)
             MatMul.GemmQ4_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
         else if (qt == QuantizationType.Q5_K)
