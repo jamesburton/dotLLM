@@ -597,3 +597,24 @@ Correctness: 32-chunk perplexity on the 9B Q8_0 control is 7.4423 (7.4422 before
 |dNLL| 2.1e-4 versus the previous Vulkan run, and the arm now takes 43 s instead of 146 s. Six kernel
 parity tests against the CPU reference, including the 128-head/80-dim/8-group shape of the real model;
 dropping the second shuffle-reduction step makes 6 of 7 fail.
+
+### Decode GEMVs: Q5_0 and Q4_K were still uncoalesced (issue #574, 2026-09-30)
+
+Q8_0 got the coalesced lane = K-position GEMV in #471; Q5_0 and Q4_K kept the block-per-lane layout,
+where the lanes of a wave read words 22 / 144 bytes apart. Nemotron-Nano-9B Q4_K_M therefore decoded at
+17.0 tok/s although it moves fewer bytes than Q8_0 (21.6 tok/s at ~205 GB/s, i.e. bandwidth-bound).
+Porting the layout to both (`matmul_q5_0_f32_gemv_coalesced`, `matmul_q4_k_gemv_f32_coalesced`; F32
+activations, same bindings and push constants, chosen when the device has subgroup arithmetic):
+
+| Q5_0 GEMV | Q4_K GEMV | decode tok/s (`bench -p 128 -n 48`) |
+|---|---|---|
+| legacy | legacy | 16.97 |
+| coalesced | legacy | 19.21 |
+| legacy | coalesced | 24.54 |
+| coalesced | coalesced | **29.62** (+75%) |
+
+Prefill is unchanged (it uses the GEMMs). Perplexity cannot see a decode-path change, so it was
+checked by greedy prefill + 24 decode steps on the real model: identical token ids, max logit
+difference at the chosen tokens 2.4e-6. Random-block parity tests against the CPU dequantiser cover
+both variants of each kernel (`DOTLLM_VK_Q5_0_GEMV_LEGACY=1`, `DOTLLM_VK_Q4_K_GEMV_LEGACY=1` restore
+the old ones).
