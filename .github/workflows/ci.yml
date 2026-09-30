@@ -61,6 +61,16 @@ jobs:
       - name: Unit Tests
         run: dotnet test tests/DotLLM.Tests.Unit/ -c Release --filter "Category!=GPU&Category!=Benchmark" --blame-hang-timeout 5m
 
+      # The SSE-only tiers (e.g. KQuantSseTierTests) are gated on `Ssse3 && !Avx2`, so on AVX2 runners they
+      # never execute. Re-run the CPU kernel tests with the wide ISAs disabled so those tiers are exercised
+      # (found via a Westmere box with no AVX, #602).
+      - name: CPU kernel tests (AVX/AVX2/AVX-512 disabled)
+        env:
+          DOTNET_EnableAVX: "0"
+          DOTNET_EnableAVX2: "0"
+          DOTNET_EnableAVX512F: "0"
+        run: dotnet test tests/DotLLM.Tests.Unit/ -c Release --no-build --filter "FullyQualifiedName~DotLLM.Tests.Unit.Cpu&Category!=GPU&Category!=Benchmark" --blame-hang-timeout 5m
+
   integration-tests:
     name: Integration Tests
     needs: build

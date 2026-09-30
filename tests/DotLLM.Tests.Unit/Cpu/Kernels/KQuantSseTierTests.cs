@@ -195,15 +195,19 @@ public sealed unsafe class KQuantSseTierTests
                 {
                     Near(expected[r], mag[r], actual[r], $"{f} {what} [{r}]");
                     if (!SseTierDispatched) continue;
-                    float want;
                     if (r < rw.FullGroupCount * 4)
                     {
-                        want = 0;
+                        // Since #530 the interleaved kernel makes ONE strided 4-row call over the whole K, so its
+                        // float summation order differs from adding per-super-block Sse() results (1 ulp apart).
+                        // Same terms, different association: compare at 1e-6 of the L1 mass (~8 ulp), which a wrong
+                        // scale/min/code (O(1) of the mass) cannot hide behind. Tail rows below stay bit-exact.
+                        float want = 0;
                         byte* row = w + r * rowBytes;
                         for (int sb = 0; sb < n; sb++) want += Sse(f, row + sb * bb, x + sb * Q8KBytes, 1);
+                        Assert.True(Math.Abs(want - actual[r]) <= 1e-6 * mag[r] + 1e-30,
+                            $"{f} {what} [{r}]: per-block sum {want:R} vs strided kernel {actual[r]:R} (mass {mag[r]:G4})");
                     }
-                    else want = Sse(f, w + r * rowBytes, x, n);
-                    BitEq(want, actual[r], $"{f} {what} [{r}]");
+                    else BitEq(Sse(f, w + r * rowBytes, x, n), actual[r], $"{f} {what} [{r}]");
                 }
             }
         }
