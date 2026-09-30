@@ -41,52 +41,52 @@ const uint Q4K_BLOCK_BYTES = 144u;  // Q4_K super-block
 const uint A_LANES_PER_ROW = BLOCK_SIZE / BM;        // 2 threads cooperate on one weight row
 const uint A_COLS_PER_THR  = BK / A_LANES_PER_ROW;   // 16 codes per thread
 
-uint readByte(uint absByteOff) {
-    return (weight[absByteOff >> 2u] >> ((absByteOff & 3u) * 8u)) & 0xFFu;
-}
-
-float readHalf(uint absByteOff) {
-    return unpackHalf2x16(readByte(absByteOff) | (readByte(absByteOff + 1u) << 8)).x;
-}
-
-// (scale, min) pair j (0..7) from the 12-byte scales region; mirrors llama.cpp get_scale_min_k4.
-uvec2 unpackScaleMin(uint base, uint j) {
-    if (j < 4u)
-        return uvec2(readByte(base + j) & 63u, readByte(base + j + 4u) & 63u);
-    uint sc = (readByte(base + j + 4u) & 0xFu) | (((readByte(base + j - 4u) >> 6u) & 0x3u) << 4u);
-    uint mn = ((readByte(base + j + 4u) >> 4u) & 0xFu) | (((readByte(base + j) >> 6u) & 0x3u) << 4u);
-    return uvec2(sc, mn);
-}
-
+// A-staging (#582): every field read here is 4-byte aligned (144-byte super-blocks, 16-byte header),
+// so the header is one word, the 12 scale bytes are three words, and a thread's 16 codes are four
+// words -- 8 loads per chunk instead of ~30 byte-granular ones (the Q8_0 A-staging cost, #580).
 void gemmStageA(uint ch) {
     uint rowLocal  = g_tid / A_LANES_PER_ROW;
     uint laneOfRow = g_tid % A_LANES_PER_ROW;
     uint mGlobal   = g_mBase + rowLocal;
-    uint sBase     = rowLocal * STRIDE;
-    uint col0      = laneOfRow * A_COLS_PER_THR;
+    uint sBase     = rowLocal * STRIDE + laneOfRow * A_COLS_PER_THR;
+
+    if (mGlobal >= pc.M) {
+        for (uint j = 0u; j < A_COLS_PER_THR; j++) sharedA[sBase + j] = float16_t(0.0);
+        return;
+    }
 
     uint kBlock = ch >> 3u;
     uint subIdx = ch & 7u;
-    bool rowValid = mGlobal < pc.M;
-    float sc = 0.0, mn = 0.0;
-    uint qsBase = 0u;
-    if (rowValid) {
-        uint blockBase = mGlobal * (pc.blocksPerRow * Q4K_BLOCK_BYTES) + kBlock * Q4K_BLOCK_BYTES;
-        float d    = readHalf(blockBase);
-        float dmin = readHalf(blockBase + 2u);
-        uvec2 sm = unpackScaleMin(blockBase + 4u, subIdx);
-        sc = d * float(sm.x);
-        mn = dmin * float(sm.y);
-        qsBase = blockBase + 16u + (subIdx >> 1u) * 32u;
-    }
+    uint bw = (mGlobal * (pc.blocksPerRow * Q4K_BLOCK_BYTES) + kBlock * Q4K_BLOCK_BYTES) >> 2u;
 
+    vec2 dd = unpackHalf2x16(weight[bw]);          // (d, dmin)
+    uint s0 = weight[bw + 1u];                     // scales bytes 0..3
+    uint s1 = weight[bw + 2u];                     // 4..7
+    uint s2 = weight[bw + 3u];                     // 8..11
+
+    // (scale, min) pair subIdx; mirrors llama.cpp get_scale_min_k4.
+    uint sc, mnv;
+    if (subIdx < 4u) {
+        uint sh = subIdx * 8u;
+        sc  = (s0 >> sh) & 63u;
+        mnv = (s1 >> sh) & 63u;
+    } else {
+        uint sh = (subIdx - 4u) * 8u;
+        uint lo = s2 >> sh;
+        sc  = (lo & 0xFu)        | (((s0 >> sh) >> 6u & 0x3u) << 4u);
+        mnv = ((lo >> 4u) & 0xFu) | (((s1 >> sh) >> 6u & 0x3u) << 4u);
+    }
+    float scl = dd.x * float(sc);
+    float mn  = dd.y * float(mnv);
+
+    uint qw = bw + 4u + (subIdx >> 1u) * 8u + laneOfRow * 4u;
     uint shiftN = (subIdx & 1u) * 4u;
-    for (uint j = 0u; j < A_COLS_PER_THR; j++) {
-        uint col = col0 + j;
-        float w = 0.0;
-        if (rowValid)
-            w = sc * float((readByte(qsBase + col) >> shiftN) & 0xFu) - mn;
-        sharedA[sBase + col] = float16_t(w);
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        uint w = weight[qw + i] >> shiftN;
+        [[unroll]] for (uint jb = 0u; jb < 4u; jb++) {
+            uint code = (w >> (jb * 8u)) & 0xFu;
+            sharedA[sBase + i * 4u + jb] = float16_t(scl * float(code) - mn);
+        }
     }
 }
 
