@@ -51,7 +51,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; }; // I2_S blob
-layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; };      // [N*K]
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { vec4 b4[]; };      // [N*K]
 layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };      // [N*M]
 
 layout(push_constant) uniform PushConstants {
@@ -109,7 +109,8 @@ void gemmStageA(uint ch) {
 #define GEMM_CHUNKS     (pc.blocksPerRow * 4u)
 #define GEMM_ROW_BASE   0u
 #define GEMM_ROW_LIMIT  pc.N
-#define GEMM_B_BUF      b
+#define GEMM_B_BUF      b4
+#define GEMM_B_VEC4
 #define GEMM_C_BUF      c
 // Per-tensor f32 scale at the weight-buffer tail, word-aligned because K is a multiple of 128.
 #define GEMM_EPILOGUE_SCALE  uintBitsToFloat(weight[(pc.M * (pc.K >> 2u)) >> 2u])

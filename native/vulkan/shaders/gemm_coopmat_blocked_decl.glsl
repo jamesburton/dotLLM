@@ -35,6 +35,8 @@
 //   #define GEMM_ROW_BASE    uint expr: global token row of local token row 0
 //   #define GEMM_ROW_LIMIT   uint expr: number of valid LOCAL token rows
 //   #define GEMM_B_BUF       name of the activation array (row-major [rows, GEMM_K])
+//   optionally #define GEMM_B_VEC4   GEMM_B_BUF is then a `vec4[]` (same bytes) and is staged with
+//                                 16-byte loads; needs GEMM_K % 4 == 0 and a 16-byte-aligned base.
 //   #define GEMM_C_BUF       name of the output array (row-major [rows, GEMM_M])
 //   void gemmStageA(uint ch);   writes sharedA[BM * STRIDE] for K chunk `ch`
 //   optionally #define GEMM_EPILOGUE_SCALE <float expr>  (a per-tensor tail scale)
