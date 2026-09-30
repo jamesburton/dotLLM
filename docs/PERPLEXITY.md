@@ -561,3 +561,10 @@ Nemotron-Nano-9B Q4_K_M, `bench -p 512`, same session:
 Perplexity is unchanged (7.5091 vs 7.5090; per-window max |dNLL| 1.4e-4, the F16 operand floor) and
 the 32-chunk run drops from 474 s to 268 s. `DOTLLM_VK_NEMOTRONH_Q5_0_F32=1` restores the F32
 expansion and `DOTLLM_VK_Q5_0_GEMM_LEGACY=1` the tiled GEMM, for A/B.
+
+Follow-up (#570): the same blocked coopmat template for **Q4_K** (`matmul_q4_k_gemm_coopmat_128x128x4`,
+wired into Nemotron-H prefill for >= 32 rows) takes Nemotron-Nano-9B Q4_K_M from 67 to **115 tok/s**
+pp512 (Q8_0, already coopmat, is 120), decode unchanged at 14.2 tok/s. Perplexity is unchanged
+(7.5090; per-window max |dNLL| 1.6e-4) and the 32-chunk run is now 152 s (474 s before #568).
+`DOTLLM_VK_Q4_K_GEMM_LEGACY=1` restores the tiled GEMM. Q5_K/Q6_K/Q2_K/Q3_K prefill GEMMs are the same
+shape of opportunity and are not done.

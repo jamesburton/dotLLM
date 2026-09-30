@@ -70,6 +70,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     // in RecordMatmul branches on the device-side QuantizationType per call.
     private readonly MatMulQ4KGemvF32Kernel _matmulQ4K;
     private readonly MatMulQ4KGemmF32Kernel _matmulQ4KGemm;
+    private readonly MatMulQ4KGemmCoopmatKernel? _matmulQ4KGemmCoopmat;
     private readonly MatMulQ5_0GemvF32Kernel _matmulQ5_0;
     private readonly MatMulQ5_0GemmF32Kernel _matmulQ5_0Gemm;
     private readonly MatMulQ5_0GemmCoopmatKernel? _matmulQ5_0GemmCoopmat;
@@ -204,6 +205,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         MatMulQ2KGemvF32Kernel matmulQ2K, MatMulQ2KGemmF32Kernel matmulQ2KGemm,
         MatMulQ3KGemvF32Kernel matmulQ3K, MatMulQ3KGemmF32Kernel matmulQ3KGemm,
         MatMulQ4KGemvF32Kernel matmulQ4K, MatMulQ4KGemmF32Kernel matmulQ4KGemm,
+        MatMulQ4KGemmCoopmatKernel? matmulQ4KGemmCoopmat,
         MatMulQ5_0GemvF32Kernel matmulQ5_0, MatMulQ5_0GemmF32Kernel matmulQ5_0Gemm,
         MatMulQ5_0GemmCoopmatKernel? matmulQ5_0GemmCoopmat,
         MatMulQ5KGemvF32Kernel matmulQ5K, MatMulQ5KGemmF32Kernel matmulQ5KGemm,
@@ -253,6 +255,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ3KGemm = matmulQ3KGemm;
         _matmulQ4K = matmulQ4K;
         _matmulQ4KGemm = matmulQ4KGemm;
+        _matmulQ4KGemmCoopmat = matmulQ4KGemmCoopmat;
         _matmulQ5_0 = matmulQ5_0;
         _matmulQ5_0Gemm = matmulQ5_0Gemm;
         _matmulQ5_0GemmCoopmat = matmulQ5_0GemmCoopmat;
@@ -478,6 +481,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         // Q4_K_M GEMV + GEMM — Phase 1 of K-quant work. Always created.
         var matmulQ4K = MatMulQ4KGemvF32Kernel.Create(device, spvDir);
         var matmulQ4KGemm = MatMulQ4KGemmF32Kernel.Create(device, spvDir);
+        var matmulQ4KGemmCoopmat = MatMulQ4KGemmCoopmatKernel.IsSupportedOn(device, spvDir)
+            ? MatMulQ4KGemmCoopmatKernel.Create(device, spvDir) : null;
         var matmulQ5_0 = MatMulQ5_0GemvF32Kernel.Create(device, spvDir);
         var matmulQ5_0Gemm = MatMulQ5_0GemmF32Kernel.Create(device, spvDir);
         var matmulQ5_0GemmCoopmat = MatMulQ5_0GemmCoopmatKernel.IsSupportedOn(device, spvDir)
@@ -551,7 +556,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
             matmulQ2K, matmulQ2KGemm,
             matmulQ3K, matmulQ3KGemm,
-            matmulQ4K, matmulQ4KGemm,
+            matmulQ4K, matmulQ4KGemm, matmulQ4KGemmCoopmat,
             matmulQ5_0, matmulQ5_0Gemm, matmulQ5_0GemmCoopmat,
             matmulQ5K, matmulQ5KGemm,
             matmulQ6K, matmulQ6KGemm,
@@ -1249,6 +1254,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ3KGemm.InvalidateDescriptorCache();
         _matmulQ4K.InvalidateDescriptorCache();
         _matmulQ4KGemm.InvalidateDescriptorCache();
+        _matmulQ4KGemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ5_0.InvalidateDescriptorCache();
         _matmulQ5_0Gemm.InvalidateDescriptorCache();
         _matmulQ5_0GemmCoopmat?.InvalidateDescriptorCache();
@@ -1363,6 +1369,12 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             {
                 _matmulQ4K.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim);
+            }
+            else if (_matmulQ4KGemmCoopmat is not null && seqLen >= 32)
+            {
+                // 128x128 blocked coopmat tile (#570); below ~32 rows the token tile is mostly padding.
+                _matmulQ4KGemmCoopmat.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
             }
             else
             {
@@ -1637,6 +1649,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ5KGemm.Dispose();
         _matmulQ5K.Dispose();
         _matmulQ4KGemm.Dispose();
+        _matmulQ4KGemmCoopmat?.Dispose();
         _matmulQ5_0.Dispose();
         _matmulQ5_0Gemm.Dispose();
         _matmulQ5_0GemmCoopmat?.Dispose();
