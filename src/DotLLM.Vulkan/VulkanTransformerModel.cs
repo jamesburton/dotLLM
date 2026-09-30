@@ -255,6 +255,9 @@ public sealed class VulkanTransformerModel : IModel
     // _matmulQ8Mmq + AddKernel.
     private readonly MatMulQ8_0MmqResidualKernel? _matmulQ8MmqResidual;
     private readonly MatMulQ4KMmqKernel? _matmulQ4KMmq;
+    // Blocked 128x128 coopmat Q4_K prefill GEMM (issue #582 follow-up). Attached after construction in
+    // BuildModel; preferred over MMQ from Q4KCoopmatPreferSeqLen tokens (env opt-out DisableQ4KCoopmatEnvVar).
+    private MatMulQ4KGemmCoopmatKernel? _matmulQ4KGemmCoopmat;
     private readonly MatMulQ6KMmqKernel? _matmulQ6KMmq;
     private readonly MatMulQ5KMmqKernel? _matmulQ5KMmq;
     private readonly MatMulIq4XsMmqKernel? _matmulIq4XsMmq;
@@ -1896,6 +1899,9 @@ public sealed class VulkanTransformerModel : IModel
             ropeTheta, ropeDim, ropeVariant, slidingWindow,
             mlaNumHeads, mlaQkNope, mlaQkRope, mlaVHead,
             mlaScale, mlaRopeTheta);
+        if (Environment.GetEnvironmentVariable(DisableQ4KCoopmatEnvVar) != "1"
+            && MatMulQ4KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            model._matmulQ4KGemmCoopmat = MatMulQ4KGemmCoopmatKernel.Create(device, spvDir);
         model._firstLayer = firstLayer;
         model._headless = headless;
         model._noTokenEmbed = skipTokenEmbed;
@@ -2054,6 +2060,14 @@ public sealed class VulkanTransformerModel : IModel
     /// for prefill Q8_0 whenever the device advertises integer-dot support and
     /// the SPVs exist.
     /// </summary>
+    internal const string DisableQ4KCoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_Q4K_COOPMAT";
+
+    /// <summary>Prefill length from which the blocked coopmat Q4_K GEMM replaces dp4a MMQ (to be tuned by A/B).</summary>
+    internal static readonly int Q4KCoopmatPreferSeqLen =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_Q4K_COOPMAT_MIN_TOKENS"), out int t) ? t : 128;
+
+    private bool PreferQ4KCoopmat(int seqLen) => _matmulQ4KGemmCoopmat is not null && seqLen >= Q4KCoopmatPreferSeqLen;
+
     internal const string DisableMmqEnvVar = "DOTLLM_VULKAN_DISABLE_MMQ";
 
     internal static bool IsMmqDisabled() =>
@@ -4080,6 +4094,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8Mmq?.InvalidateDescriptorCache();
         _matmulQ8MmqResidual?.InvalidateDescriptorCache();
         _matmulQ4KMmq?.InvalidateDescriptorCache();
+        _matmulQ4KGemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ6KMmq?.InvalidateDescriptorCache();
         _matmulQ5KMmq?.InvalidateDescriptorCache();
         _matmulIq4XsMmq?.InvalidateDescriptorCache();
@@ -5877,7 +5892,10 @@ public sealed class VulkanTransformerModel : IModel
         if (QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) > _state.Q8_1XqRows.Size) return false;
         if (QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) > _state.Q8_1XdsRows.Size) return false;
         foreach (var p in projections)
+        {
+            if (p.WeightQt == QuantType.Q4_K && PreferQ4KCoopmat(seqLen)) return false;
             if (!HasMmqPrefillKernel(p.WeightQt, inputDim)) return false;
+        }
         return true;
     }
 
@@ -6250,6 +6268,12 @@ public sealed class VulkanTransformerModel : IModel
                     _matmulQ4K.Record(cmdBuf, weights, input, output,
                         m: outputDim, k: inputDim);
                 }
+            }
+            else if (PreferQ4KCoopmat(seqLen) && (inputDim % 256) == 0)
+            {
+                _matmulQ4KGemmCoopmat!.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q4_k_coopmat", outputDim, inputDim, seqLen);
             }
             else if (_matmulQ4KMmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
@@ -6924,6 +6948,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8Mmq?.Dispose();
         _matmulQ8MmqResidual?.Dispose();
         _matmulQ4KMmq?.Dispose();
+        _matmulQ4KGemmCoopmat?.Dispose();
         _matmulQ6KMmq?.Dispose();
         _matmulQ5KMmq?.Dispose();
         _matmulIq4XsMmq?.Dispose();
