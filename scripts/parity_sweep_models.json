@@ -26,9 +26,7 @@
     "Derived from the actual fixture resolution in tests/DotLLM.Tests.Integration/ —",
     "grep for `envVar:` / `conventional:` there if a test's fixture contract changes."
   ],
-
   "test_project": "tests/DotLLM.Tests.Integration/DotLLM.Tests.Integration.csproj",
-
   "models": [
     {
       "id": "bielik-1.5b-q3_k_m",
@@ -163,6 +161,26 @@
       "available": false,
       "skip_reason": "PrismML/Ternary-Bonsai-27B-GGUF returns HTTP 404 on the HF API (verified 2026-08-10) — the repo is not publicly reachable, with or without a token. Flip `available` to true and fix `repo`/`file` once a source exists.",
       "size_bytes": 7000000000
+    },
+    {
+      "id": "tev1-4b-q4_k_m",
+      "repo": "bartowski/togethercomputer_Tev1-4B-experimental-GGUF",
+      "file": "togethercomputer_Tev1-4B-experimental-Q4_K_M.gguf",
+      "env": "DOTLLM_TEV1_4B_GGUF",
+      "filter": "FullyQualifiedName~VulkanTev1DecisionModelTests.Tev1_4B",
+      "size_bytes": 2797527072,
+      "timeout_sec": 1800,
+      "notes": "Together AI Tev1 decision/classifier model (Qwen3.5-4B fine-tune). Asserts CPU==Vulkan answer + logit cosine and that all 4 decisions are answered correctly."
+    },
+    {
+      "id": "tev1-0.8b-q8_0",
+      "repo": "DreamBlooms/Tev1-0.8B-experimental-GGUF",
+      "file": "tev1-Q8_0.gguf",
+      "env": "DOTLLM_TEV1_08B_GGUF",
+      "filter": "FullyQualifiedName~VulkanTev1DecisionModelTests.Tev1_08B",
+      "size_bytes": 811843360,
+      "timeout_sec": 900,
+      "notes": "Third-party GGUF conversion of Tev1-0.8B. Only backend agreement is asserted: the model answers 'A' to everything (llama.cpp does too)."
     }
   ]
 }
