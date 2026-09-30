@@ -51,7 +51,7 @@ public static unsafe partial class MatMul
     public static bool UsesQ8KDot(QuantizationType qt) =>
         qt is QuantizationType.Q2_K or QuantizationType.Q3_K or QuantizationType.Q4_K
             or QuantizationType.Q5_K or QuantizationType.Q6_K
-            or QuantizationType.IQ4_XS;
+            or QuantizationType.IQ4_XS || IsCodebookIq(qt);
 
     // ──────────────────── Q2_K × Q8_K scalar ────────────────────
 
