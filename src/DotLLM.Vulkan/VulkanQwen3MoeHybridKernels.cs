@@ -16,6 +16,15 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulQ8_0Kernel MatMulQ8 { get; }
     public MatMulQ8_0GemmKernel MatMulQ8Gemm { get; }
     public MatMulQ8_0GemmCoopmatKernel? MatMulQ8GemmCoopmat { get; }
+
+    // Blocked 128x128 coopmat K-quant / IQ4_XS prefill GEMMs (issue #607): attached after construction in Create so the
+    // (already huge) constructor is untouched. Null when the device lacks wave64 cooperative matrix or the SPIR-V is absent.
+    public MatMulQ2KGemmCoopmatKernel? MatMulQ2KGemmCoopmat { get; private set; }
+    public MatMulQ3KGemmCoopmatKernel? MatMulQ3KGemmCoopmat { get; private set; }
+    public MatMulQ4KGemmCoopmatKernel? MatMulQ4KGemmCoopmat { get; private set; }
+    public MatMulQ5KGemmCoopmatKernel? MatMulQ5KGemmCoopmat { get; private set; }
+    public MatMulQ6KGemmCoopmatKernel? MatMulQ6KGemmCoopmat { get; private set; }
+    public MatMulIq4XsGemmCoopmatKernel? MatMulIq4XsGemmCoopmat { get; private set; }
     public MatMulQ2KGemvF32Kernel MatMulQ2K { get; }
     public MatMulQ2KGemmF32Kernel MatMulQ2KGemm { get; }
     public MatMulQ3KGemvF32Kernel MatMulQ3K { get; }
@@ -350,7 +359,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         var moeScatter = MoeWeightedScatterF32Kernel.Create(device, spvDir);
         var moeSigmoidGatedAdd = MoeSigmoidGatedAddF32Kernel.Create(device, spvDir);
 
-        return new VulkanQwen3MoeHybridKernels(
+        var kernels = new VulkanQwen3MoeHybridKernels(
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
             matmulQ2K, matmulQ2KGemm,
             matmulQ3K, matmulQ3KGemm,
@@ -376,6 +385,21 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             sigGateMul,
             moeTopk, moeBroadcast, moeIndexed, moeIndexedQ6K, moeIndexedQ4K, moeIndexedQ5K,
             moeIndexedQ4KMmq, quantizeQ8_1Rows, moeIndexedQ5KMmq, moeScatter, moeSigmoidGatedAdd);
+
+        // Opt-outs are the same env vars the dense VulkanTransformerModel honours (kernel-level LEGACY vars are inside IsSupportedOn).
+        if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableQ2KCoopmatEnvVar) != "1" && MatMulQ2KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            kernels.MatMulQ2KGemmCoopmat = MatMulQ2KGemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableQ3KCoopmatEnvVar) != "1" && MatMulQ3KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            kernels.MatMulQ3KGemmCoopmat = MatMulQ3KGemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableQ4KCoopmatEnvVar) != "1" && MatMulQ4KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            kernels.MatMulQ4KGemmCoopmat = MatMulQ4KGemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableQ5KCoopmatEnvVar) != "1" && MatMulQ5KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            kernels.MatMulQ5KGemmCoopmat = MatMulQ5KGemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableQ6KCoopmatEnvVar) != "1" && MatMulQ6KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            kernels.MatMulQ6KGemmCoopmat = MatMulQ6KGemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableIq4XsCoopmatEnvVar) != "1" && MatMulIq4XsGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            kernels.MatMulIq4XsGemmCoopmat = MatMulIq4XsGemmCoopmatKernel.Create(device, spvDir);
+        return kernels;
     }
 
     /// <summary>Invalidates every kernel's cached descriptor sets. Call after scratch buffers re-allocate.</summary>
@@ -385,6 +409,12 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ8.InvalidateDescriptorCache();
         MatMulQ8Gemm.InvalidateDescriptorCache();
         MatMulQ8GemmCoopmat?.InvalidateDescriptorCache();
+        MatMulQ2KGemmCoopmat?.InvalidateDescriptorCache();
+        MatMulQ3KGemmCoopmat?.InvalidateDescriptorCache();
+        MatMulQ4KGemmCoopmat?.InvalidateDescriptorCache();
+        MatMulQ5KGemmCoopmat?.InvalidateDescriptorCache();
+        MatMulQ6KGemmCoopmat?.InvalidateDescriptorCache();
+        MatMulIq4XsGemmCoopmat?.InvalidateDescriptorCache();
         MatMulQ2K.InvalidateDescriptorCache();
         MatMulQ2KGemm.InvalidateDescriptorCache();
         MatMulQ3K.InvalidateDescriptorCache();
@@ -512,6 +542,12 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ2KGemm.Dispose();
         MatMulQ2K.Dispose();
         MatMulQ8GemmCoopmat?.Dispose();
+        MatMulQ2KGemmCoopmat?.Dispose();
+        MatMulQ3KGemmCoopmat?.Dispose();
+        MatMulQ4KGemmCoopmat?.Dispose();
+        MatMulQ5KGemmCoopmat?.Dispose();
+        MatMulQ6KGemmCoopmat?.Dispose();
+        MatMulIq4XsGemmCoopmat?.Dispose();
         MatMulQ8Gemm.Dispose();
         MatMulQ8.Dispose();
         MatMul.Dispose();

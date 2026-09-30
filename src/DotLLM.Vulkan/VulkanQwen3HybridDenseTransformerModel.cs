@@ -2058,30 +2058,40 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             case QuantizationType.Q2_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ2K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulQ2KGemmCoopmat is not null && (inputDim % 256) == 0)
+                    _kernels.MatMulQ2KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
                     _kernels.MatMulQ2KGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             case QuantizationType.Q3_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ3K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulQ3KGemmCoopmat is not null && (inputDim % 256) == 0)
+                    _kernels.MatMulQ3KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
                     _kernels.MatMulQ3KGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             case QuantizationType.Q4_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ4K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulQ4KGemmCoopmat is not null && (inputDim % 256) == 0)
+                    _kernels.MatMulQ4KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
                     _kernels.MatMulQ4KGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             case QuantizationType.Q5_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ5K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulQ5KGemmCoopmat is not null && (inputDim % 256) == 0)
+                    _kernels.MatMulQ5KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
                     _kernels.MatMulQ5KGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             case QuantizationType.Q6_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ6K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulQ6KGemmCoopmat is not null && (inputDim % 256) == 0)
+                    _kernels.MatMulQ6KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
                     _kernels.MatMulQ6KGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
@@ -2094,6 +2104,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             case QuantizationType.IQ4_XS:
                 if (seqLen == 1)
                     _kernels.MatMulIq4Xs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulIq4XsGemmCoopmat is not null && (inputDim % 256) == 0)
+                    _kernels.MatMulIq4XsGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
                     _kernels.MatMulIq4XsGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
