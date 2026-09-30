@@ -69,9 +69,8 @@ public sealed unsafe class MatMulFusedDecodeFallbackTests : IDisposable
     [Theory]
     [InlineData(QuantizationType.BF16)]
     [InlineData(QuantizationType.MXFP4)]
-    // Q2_K and Q3_K left this list in #497: they now have packed x Q8_K ComputeRows kernels,
+    // Q2_K/Q3_K (#497) and IQ4_XS (#605) left this list: they now have packed x Q8_K ComputeRows kernels,
     // so SupportsFusedDecode is true for them and the fused path is the right route.
-    [InlineData(QuantizationType.IQ4_XS)]
     [InlineData(QuantizationType.IQ3_S)]
     [InlineData(QuantizationType.IQ3_XXS)]
     [InlineData(QuantizationType.IQ2_S)]

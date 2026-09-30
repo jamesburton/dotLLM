@@ -883,6 +883,7 @@ public static unsafe partial class MoeSwiGluMlp
                 return batch * (k / 32) * 36;
             case QuantizationType.Q2_K:
             case QuantizationType.Q3_K:
+            case QuantizationType.IQ4_XS:
             case QuantizationType.Q4_K:
             case QuantizationType.Q5_K:
             case QuantizationType.Q6_K:
@@ -920,6 +921,7 @@ public static unsafe partial class MoeSwiGluMlp
                 }
             case QuantizationType.Q2_K:
             case QuantizationType.Q3_K:
+            case QuantizationType.IQ4_XS:
             case QuantizationType.Q4_K:
             case QuantizationType.Q5_K:
             case QuantizationType.Q6_K:
@@ -976,6 +978,12 @@ public static unsafe partial class MoeSwiGluMlp
                     MatMul.GemmQ3_K((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
                 else
                     MatMul.GemmQ3_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                return;
+            case QuantizationType.IQ4_XS:
+                if (pool is not null)
+                    MatMul.GemmIQ4_XS((byte*)weights, b, c, m, k, n, pool, preQuantizedInput);
+                else
+                    MatMul.GemmIQ4_XS((byte*)weights, b, c, m, k, n, preQuantizedInput);
                 return;
             case QuantizationType.Q4_K:
                 if (pool is not null)
