@@ -21,8 +21,8 @@ namespace DotLLM.Vulkan;
 /// <see cref="DotLLM.Vulkan.Kernels.MatMulQ8_0GemmKernel"/>, mirroring the
 /// <see cref="VulkanWeights"/> path. Q4_K / Q5_K / Q6_K source projections are kept
 /// on device when the contraction dim is a multiple of 256 (their super-block size)
-/// and dispatched via the matching K-quant kernels. F16 and Q5_0 are still dequantised
-/// to F32 at upload (no kernel in tree); F32 sources are uploaded verbatim. Norm weights
+/// and dispatched via the matching K-quant kernels. Q5_0 is kept packed (#568); F16 is still dequantised
+/// to F32 at upload; F32 sources are uploaded verbatim. Norm weights
 /// and the small per-head SSM vectors (<c>ssm_a</c>, <c>ssm_d</c>, <c>ssm_dt.bias</c>,
 /// <c>ssm_norm.weight</c>, <c>ssm_conv1d.weight</c>, <c>ssm_conv1d.bias</c>) are always
 /// uploaded as F32 device buffers — they are already dequantised to <c>float[]</c> on
@@ -314,6 +314,16 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     private static bool KeepQ3KOnDevice(QuantizationType qt, int inputDim)
         => qt == QuantizationType.Q3_K && (inputDim % 256) == 0;
 
+    /// <summary>True iff a Q5_0 source projection can be kept on device as raw 22-byte Q5_0
+    /// blocks — gated on the contraction dim being a multiple of the legacy group size (32).
+    /// Uses the same F32-in GEMV/GEMM kernels as the dense path (#344, #568).</summary>
+    private static bool KeepQ5_0OnDevice(QuantizationType qt, int inputDim)
+        => qt == QuantizationType.Q5_0 && (inputDim % 32) == 0 && !ExpandQ5_0ToF32;
+
+    // DOTLLM_VK_NEMOTRONH_Q5_0_F32=1 restores the pre-#568 behaviour (expand Q5_0 to F32 at upload) for A/B.
+    private static readonly bool ExpandQ5_0ToF32 =
+        Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRONH_Q5_0_F32") == "1";
+
     /// <summary>True iff a Q4_K source projection can be kept on device as raw Q4_K
     /// super-blocks — gated on the input dim being a multiple of the Q4_K super-block
     /// size (256). Phase 1 of K-quant work.</summary>
@@ -387,9 +397,10 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     /// BF16) AND the contraction axis is aligned to that format's group size — i.e. the raw
     /// bytes can stay on device verbatim. The disjunction below is the authority; keep this
     /// list in step with it. Narrower than the dense path's
-    /// <c>VulkanWeights.DeviceQuantTypeFor</c>, which also keeps Q5_0, I2_S and PQ2_0.</summary>
+    /// <c>VulkanWeights.DeviceQuantTypeFor</c>, which also keeps I2_S and PQ2_0.</summary>
     private static bool KeepQuantOnDevice(QuantizationType qt, int inputDim)
         => KeepQ8OnDevice(qt, inputDim)
+        || KeepQ5_0OnDevice(qt, inputDim)
         || KeepQ2KOnDevice(qt, inputDim)
         || KeepQ3KOnDevice(qt, inputDim)
         || KeepQ4KOnDevice(qt, inputDim)
@@ -412,6 +423,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     private static QuantizationType DeviceQuantTypeFor(QuantizationType qt, int inputDim)
     {
         if (KeepQ8OnDevice(qt, inputDim)) return QuantizationType.Q8_0;
+        if (KeepQ5_0OnDevice(qt, inputDim)) return QuantizationType.Q5_0;
         if (KeepQ2KOnDevice(qt, inputDim)) return QuantizationType.Q2_K;
         if (KeepQ3KOnDevice(qt, inputDim)) return QuantizationType.Q3_K;
         if (KeepQ4KOnDevice(qt, inputDim)) return QuantizationType.Q4_K;
@@ -437,6 +449,8 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     {
         if (KeepQ8OnDevice(qt, inputDim))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0) * outputDim;
+        if (KeepQ5_0OnDevice(qt, inputDim))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.Q5_0) * outputDim;
         if (KeepQ2KOnDevice(qt, inputDim))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q2_K) * outputDim;
         if (KeepQ3KOnDevice(qt, inputDim))

@@ -536,3 +536,28 @@ llama.cpp's own CPU Q4_K_M was not run, so it is not established whether that is
 numerics (Q4_K MMQ activation quantisation) or noise. Bonsai PQ2_0 (no Q8_0 control exists):
 dotLLM Vulkan 10.2348 +/- 0.435 over 16 chunks; the fork's running estimate over its first 4 chunks
 (8.0693) matches dotLLM CPU/Vulkan on those chunks (8.0681) to 0.015%.
+
+### The Nemotron Q4_K_M Vulkan offset, explained (issue #568, 2026-09-30)
+
+llama.cpp's own CPU scores Q4_K_M at 7.5217, dotLLM CPU 7.5209 (paired dNLL -0.0001, sd 0.0024:
+identical), dotLLM Vulkan 7.5090 (paired -0.0016 vs both CPUs, z = -3.1, sd 0.003). The Vulkan split
+is real and systematic, and the mechanism is visible in the weights: this "Q4_K_M" is mostly **Q5_0**
+(`ffn_up`, `ssm_in`, `attn_q/k/v`), with Q4_K only on `attn_output`/`ssm_out`. The CPU multiplies Q5_0
+by activations **quantised to Q8_1**; Vulkan multiplied F32-expanded weights by F32 activations, so it
+carries less activation-quantisation noise and reads slightly lower. That is consistent with the data
+but was **not isolated** (no F32-activation CPU reference was run).
+
+Side finding, fixed in #568: `VulkanNemotronHWeights` expanded every Q5_0 tensor to F32 at upload
+("no kernel in tree") although the Q5_0 kernels have existed since #344. Q5_0 is now kept packed and
+a new 128x128 blocked coopmat Q5_0 GEMM (`matmul_q5_0_f32_gemm_coopmat_128x128x4`) serves prefill.
+Nemotron-Nano-9B Q4_K_M, `bench -p 512`, same session:
+
+| | prefill tok/s | decode tok/s |
+|---|---|---|
+| F32-expanded Q5_0 (before) | 34.5 | 4.8 |
+| packed Q5_0, tiled F32 GEMM | 24 | 14.0 |
+| packed Q5_0, **coopmat GEMM** | **66** | **14.1** |
+
+Perplexity is unchanged (7.5091 vs 7.5090; per-window max |dNLL| 1.4e-4, the F16 operand floor) and
+the 32-chunk run drops from 474 s to 268 s. `DOTLLM_VK_NEMOTRONH_Q5_0_F32=1` restores the F32
+expansion and `DOTLLM_VK_Q5_0_GEMM_LEGACY=1` the tiled GEMM, for A/B.
