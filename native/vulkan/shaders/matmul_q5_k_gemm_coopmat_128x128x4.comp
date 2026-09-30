@@ -1,0 +1,102 @@
+#version 450
+// Q5_K batched GEMM on the shared 128x128 blocked coopmat template (issue #590).
+//
+//   C[N, M] = B[N, K] @ W_q5k[M, K]^T,  W dequantised on the fly.
+//
+// Weight layout (matches matmul_q5_k_gemm_f32.comp): rows of (K / 256) super-blocks of 176 bytes --
+// fp16 d [0..1], fp16 dmin [2..3], scales[12] [4..15] (as Q4_K), qh[32] [16..47] (bit s of qh[l] is the
+// 5th bit of element l of sub-block s), qs[128] [48..175] (256 4-bit codes, as Q4_K). Sub-block s (0..7)
+// of 32 elements: nibbles of qs[(s/2)*32 + l] (low if s even, high if s odd) | qh bit << 4;
+// value = d*scale[s]*code - dmin*min[s]. Every field is 4-byte aligned. A BK=32 K-chunk is one sub-block
+// (chunk ch -> super-block ch/8, sub-block ch%8); with two lanes per row, lane l stages columns l*16..+15.
+//
+// PRECISION: as for Q8_0/Q5_0, d*scale*code - dmin*min is folded into the F16 A operand (~2^-11).
+
+#define BM  128
+#define BN  128
+#define WM  64
+#define WN  64
+#define NSG 4
+#define WAVE 64
+
+#extension GL_GOOGLE_include_directive : require
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; }; // Q5_K blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { vec4 b4[]; };      // [N*K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };      // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim (number of weight rows)
+    uint K;             // contraction dim (must be a multiple of 256)
+    uint N;             // batch size (number of input rows)
+    uint blocksPerRow;  // = K / 256 (super-blocks)
+    uint rowUints;      // per-row uint stride
+} pc;
+
+#include "gemm_coopmat_blocked_decl.glsl"
+
+const uint Q5K_BLOCK_BYTES = 176u;  // Q5_K super-block
+
+const uint A_LANES_PER_ROW = BLOCK_SIZE / BM;        // 2 threads cooperate on one weight row
+const uint A_COLS_PER_THR  = BK / A_LANES_PER_ROW;   // 16 codes per thread
+
+// A-staging (#582): every field is 4-byte aligned (176-byte super-blocks), so the header is one word, the 12
+// scale bytes three words, and a thread's 16 codes (and 16 qh bytes) four words each.
+void gemmStageA(uint ch) {
+    uint rowLocal  = g_tid / A_LANES_PER_ROW;
+    uint laneOfRow = g_tid % A_LANES_PER_ROW;
+    uint mGlobal   = g_mBase + rowLocal;
+    uint sBase     = rowLocal * STRIDE + laneOfRow * A_COLS_PER_THR;
+
+    if (mGlobal >= pc.M) {
+        for (uint j = 0u; j < A_COLS_PER_THR; j++) sharedA[sBase + j] = float16_t(0.0);
+        return;
+    }
+
+    uint kBlock = ch >> 3u;
+    uint subIdx = ch & 7u;
+    uint bw = (mGlobal * (pc.blocksPerRow * Q5K_BLOCK_BYTES) + kBlock * Q5K_BLOCK_BYTES) >> 2u;
+
+    vec2 dd = unpackHalf2x16(weight[bw]);          // (d, dmin)
+    uint s0 = weight[bw + 1u];                     // scales bytes 0..3
+    uint s1 = weight[bw + 2u];                     // 4..7
+    uint s2 = weight[bw + 3u];                     // 8..11
+
+    // (scale, min) pair subIdx; mirrors llama.cpp get_scale_min_k4.
+    uint sc, mnv;
+    if (subIdx < 4u) {
+        uint sh = subIdx * 8u;
+        sc  = (s0 >> sh) & 63u;
+        mnv = (s1 >> sh) & 63u;
+    } else {
+        uint sh = (subIdx - 4u) * 8u;
+        uint lo = s2 >> sh;
+        sc  = (lo & 0xFu)        | (((s0 >> sh) >> 6u & 0x3u) << 4u);
+        mnv = ((lo >> 4u) & 0xFu) | (((s1 >> sh) >> 6u & 0x3u) << 4u);
+    }
+    float scl = dd.x * float(sc);
+    float mn  = dd.y * float(mnv);
+
+    uint qw = bw + 12u + (subIdx >> 1u) * 8u + laneOfRow * 4u;
+    uint hw = bw + 4u + laneOfRow * 4u;
+    uint shiftN = (subIdx & 1u) * 4u;
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        uint w = weight[qw + i] >> shiftN;
+        uint h = weight[hw + i] >> subIdx;
+        [[unroll]] for (uint jb = 0u; jb < 4u; jb++) {
+            uint code = ((w >> (jb * 8u)) & 0xFu) | (((h >> (jb * 8u)) & 1u) << 4u);
+            sharedA[sBase + i * 4u + jb] = float16_t(scl * float(code) - mn);
+        }
+    }
+}
+
+#define GEMM_M          pc.M
+#define GEMM_K          pc.K
+#define GEMM_CHUNKS     (pc.blocksPerRow * 8u)
+#define GEMM_ROW_BASE   0u
+#define GEMM_ROW_LIMIT  pc.N
+#define GEMM_B_BUF      b4
+#define GEMM_B_VEC4
+#define GEMM_C_BUF      c
+
+#include "gemm_coopmat_blocked_main.glsl"
