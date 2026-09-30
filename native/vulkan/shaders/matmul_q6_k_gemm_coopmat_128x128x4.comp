@@ -52,41 +52,53 @@ float readHalf(uint absByteOff) {
     return unpackHalf2x16(readByte(absByteOff) | (readByte(absByteOff + 1u) << 8)).x;
 }
 
+// 16 bytes at EVEN byte offset `o` as four aligned words (funnel shift; the 5th word is loaded only
+// when the span is 2 bytes into a word, so nothing past the span -- and never past the blob -- is read).
+void load16(uint o, out uint r[4]) {
+    uint wi = o >> 2u;
+    bool hi = (o & 2u) != 0u;
+    uint w[5];
+    [[unroll]] for (uint i = 0u; i < 4u; i++) w[i] = weight[wi + i];
+    w[4] = hi ? weight[wi + 4u] : 0u;
+    [[unroll]] for (uint i = 0u; i < 4u; i++) r[i] = hi ? ((w[i] >> 16) | (w[i + 1u] << 16)) : w[i];
+}
+
+// A-staging (#582): ql and qh spans are 16 bytes each, read as words instead of 32 byte loads.
 void gemmStageA(uint ch) {
     uint rowLocal  = g_tid / A_LANES_PER_ROW;
     uint laneOfRow = g_tid % A_LANES_PER_ROW;
     uint mGlobal   = g_mBase + rowLocal;
-    uint sBase     = rowLocal * STRIDE;
-    uint col0      = laneOfRow * A_COLS_PER_THR;
+    uint sBase     = rowLocal * STRIDE + laneOfRow * A_COLS_PER_THR;
+
+    if (mGlobal >= pc.M) {
+        for (uint j = 0u; j < A_COLS_PER_THR; j++) sharedA[sBase + j] = float16_t(0.0);
+        return;
+    }
 
     uint kBlock = ch >> 3u;
     uint sub    = ch & 7u;
     uint hf     = sub >> 2u;
     uint g      = sub & 3u;
-    bool rowValid = mGlobal < pc.M;
 
-    float scale = 0.0;
-    uint qlBase = 0u, qhBase = 0u;
-    if (rowValid) {
-        uint blockBase = mGlobal * (pc.blocksPerRow * Q6K_BLOCK_BYTES) + kBlock * Q6K_BLOCK_BYTES;
-        float d = readHalf(blockBase + 208u);
-        uint sb = readByte(blockBase + 192u + 8u * hf + laneOfRow + 2u * g);
-        scale = d * float(int(sb ^ 0x80u) - 128);
-        qlBase = blockBase + 64u * hf + 32u * (g & 1u);
-        qhBase = blockBase + 128u + 32u * hf;
-    }
+    uint blockBase = mGlobal * (pc.blocksPerRow * Q6K_BLOCK_BYTES) + kBlock * Q6K_BLOCK_BYTES;
+    float d = readHalf(blockBase + 208u);
+    uint sb = readByte(blockBase + 192u + 8u * hf + laneOfRow + 2u * g);
+    float scale = d * float(int(sb ^ 0x80u) - 128);
+
+    uint qlw[4], qhw[4];
+    load16(blockBase + 64u * hf + 32u * (g & 1u) + laneOfRow * A_COLS_PER_THR, qlw);
+    load16(blockBase + 128u + 32u * hf + laneOfRow * A_COLS_PER_THR, qhw);
 
     uint nibShift = (g >> 1u) * 4u;
     uint qhShift  = 2u * g;
-    for (uint j = 0u; j < A_COLS_PER_THR; j++) {
-        uint l = col0 + j;
-        float w = 0.0;
-        if (rowValid) {
-            uint lo = (readByte(qlBase + l) >> nibShift) & 0xFu;
-            uint hi = (readByte(qhBase + l) >> qhShift) & 3u;
-            w = scale * float(int(lo | (hi << 4u)) - 32);
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        uint lw = qlw[i] >> nibShift;
+        uint hw = qhw[i] >> qhShift;
+        [[unroll]] for (uint jb = 0u; jb < 4u; jb++) {
+            uint lo = (lw >> (jb * 8u)) & 0xFu;
+            uint h2 = (hw >> (jb * 8u)) & 3u;
+            sharedA[sBase + i * 4u + jb] = float16_t(scale * float(int(lo | (h2 << 4u)) - 32));
         }
-        sharedA[sBase + l] = float16_t(w);
     }
 }
 

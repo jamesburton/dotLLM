@@ -46,7 +46,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 layout(set = 0, binding = 0, std430) readonly  buffer BufW       { uint weight[]; }; // [E,M,K] F16
-layout(set = 0, binding = 1, std430) readonly  buffer BufX       { float x[]; };      // [rows,K] F32
+layout(set = 0, binding = 1, std430) readonly  buffer BufX       { vec4 x4[]; };      // [rows,K] F32 (K % 4 == 0; K % 32 == 0 here)
 layout(set = 0, binding = 2, std430) readonly  buffer BufOffsets { uint offsets[]; }; // [E+1]
 layout(set = 0, binding = 3, std430) writeonly buffer BufY       { float y[]; };      // [rows,M] F32
 
@@ -118,7 +118,8 @@ void gemmStageA(uint ch) {
 #define GEMM_CHUNKS     (pc.K / BK)
 #define GEMM_ROW_BASE   g_expertStart
 #define GEMM_ROW_LIMIT  g_expertRows
-#define GEMM_B_BUF      x
+#define GEMM_B_BUF      x4
+#define GEMM_B_VEC4
 #define GEMM_C_BUF      y
 
 #include "gemm_coopmat_blocked_main.glsl"

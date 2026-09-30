@@ -52,33 +52,41 @@ float readHalf(uint absByteOff) {
     return unpackHalf2x16(readByte(absByteOff) | (readByte(absByteOff + 1u) << 8)).x;
 }
 
+// A-staging (#582): 22-byte blocks are only 2-byte aligned. Six raw words always cover the block
+// (the last one holds bytes 20..21 and is the word containing the block's final byte, so it never
+// reads past the blob); d / qh / qs are re-aligned with funnel shifts.
 void gemmStageA(uint ch) {
     uint rowLocal  = g_tid / A_LANES_PER_ROW;
     uint laneOfRow = g_tid % A_LANES_PER_ROW;
     uint mGlobal   = g_mBase + rowLocal;
-    uint sBase     = rowLocal * STRIDE;
-    uint col0      = laneOfRow * A_COLS_PER_THR;
+    uint sBase     = rowLocal * STRIDE + laneOfRow * A_COLS_PER_THR;
 
-    bool rowValid = mGlobal < pc.M;
-    float d = 0.0;
-    uint blockBase = 0u;
-    uint qh = 0u;
-    if (rowValid) {
-        blockBase = mGlobal * (pc.blocksPerRow * BLOCK_BYTES) + ch * BLOCK_BYTES;
-        d = readHalf(blockBase);
-        qh = readByte(blockBase + 2u) | (readByte(blockBase + 3u) << 8)
-           | (readByte(blockBase + 4u) << 16) | (readByte(blockBase + 5u) << 24);
+    if (mGlobal >= pc.M) {
+        for (uint j = 0u; j < A_COLS_PER_THR; j++) sharedA[sBase + j] = float16_t(0.0);
+        return;
     }
 
-    for (uint j = 0u; j < A_COLS_PER_THR; j++) {
-        float q = 0.0;
-        if (rowValid) {
-            uint byteV = readByte(blockBase + 6u + j);
-            uint nib = (laneOfRow == 0u) ? (byteV & 0xFu) : (byteV >> 4);
-            uint hi = (qh >> (j + laneOfRow * 16u)) & 1u;
-            q = d * float(int(nib | (hi << 4)) - 16);
+    uint blockBase = mGlobal * (pc.blocksPerRow * BLOCK_BYTES) + ch * BLOCK_BYTES;
+    uint wi = blockBase >> 2u;
+    bool hi = (blockBase & 2u) != 0u;
+    uint w[6];
+    [[unroll]] for (uint i = 0u; i < 6u; i++) w[i] = weight[wi + i];
+
+    float d = unpackHalf2x16(hi ? (w[0] >> 16) : (w[0] & 0xFFFFu)).x;
+    uint qh = hi ? w[1] : ((w[0] >> 16) | (w[1] << 16));
+    uint qs[4];
+    [[unroll]] for (uint m = 0u; m < 4u; m++)
+        qs[m] = hi ? w[2u + m] : ((w[1u + m] >> 16) | (w[2u + m] << 16));
+
+    uint qhSh = laneOfRow * 16u;
+    uint nibSh = laneOfRow * 4u;
+    [[unroll]] for (uint m = 0u; m < 4u; m++) {
+        [[unroll]] for (uint jb = 0u; jb < 4u; jb++) {
+            uint j = m * 4u + jb;
+            uint nib = (qs[m] >> (jb * 8u + nibSh)) & 0xFu;
+            uint h5 = (qh >> (j + qhSh)) & 1u;
+            sharedA[sBase + j] = float16_t(d * float(int(nib | (h5 << 4u)) - 16));
         }
-        sharedA[sBase + col0 + j] = float16_t(q);
     }
 }
 

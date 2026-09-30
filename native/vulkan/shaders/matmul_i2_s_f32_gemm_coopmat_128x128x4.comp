@@ -76,6 +76,8 @@ uint readByte(uint absByteOff) {
     return (u >> shift) & 0xFFu;
 }
 
+// A-staging (#582): byteBase and gp0 are multiples of 16, so the lane's 16 packed bytes are four
+// aligned words.
 void gemmStageA(uint ch) {
     uint rowLocal  = g_tid / A_LANES_PER_ROW;
     uint laneOfRow = g_tid % A_LANES_PER_ROW;
@@ -87,20 +89,18 @@ void gemmStageA(uint ch) {
     uint slice = ch & 3u;           // 32-element K-slice within it
     uint shift = 6u - 2u * slice;   // DESCENDING bit offsets {6,4,2,0}
 
-    bool rowValid = mGlobal < pc.M;
-    uint byteBase = rowValid
-        ? (mGlobal * (pc.K >> 2u) + blk * I2S_BLOCK_BYTES)
-        : 0u;
-
-    for (uint i = 0u; i < A_BYTES_PER_THR; i++) {
-        uint gp = gp0 + i;
-        float v = 0.0;
-        if (rowValid) {
-            uint pk = readByte(byteBase + gp);
-            v = float(int((pk >> shift) & 3u) - 1);
+    if (mGlobal >= pc.M) {
+        for (uint i = 0u; i < A_BYTES_PER_THR; i++) sharedA[sBase + gp0 + i] = float16_t(0.0);
+        return;
+    }
+    uint wBase = (mGlobal * (pc.K >> 2u) + blk * I2S_BLOCK_BYTES + gp0) >> 2u;
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        uint w = weight[wBase + i] >> shift;
+        [[unroll]] for (uint jb = 0u; jb < 4u; jb++) {
+            float v = float(int((w >> (jb * 8u)) & 3u) - 1);
+            // Slice `s` maps element (gp + 32s) of the block to K-chunk position `gp`.
+            sharedA[sBase + gp0 + i * 4u + jb] = float16_t(v);
         }
-        // Slice `s` maps element (gp + 32s) of the block to K-chunk position `gp`.
-        sharedA[sBase + gp] = float16_t(v);
     }
 }
 
