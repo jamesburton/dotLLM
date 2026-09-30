@@ -2065,6 +2065,28 @@ public sealed class VulkanTransformerModel : IModel
     /// for prefill Q8_0 whenever the device advertises integer-dot support and
     /// the SPVs exist.
     /// </summary>
+    /// <summary>
+    /// Qwen3-style optional per-head RMSNorm on Q and K (after projection/bias/LoRA, before RoPE);
+    /// mirrors CPU <c>TransformerModel.ApplyPerHeadNorm</c> and CUDA <c>LaunchPerHeadRmsNorm</c> (issue #594).
+    /// No-op when the layer has no Q/K norm weights. Caller owns the trailing barrier decision via the return value.
+    /// </summary>
+    private bool RecordQkNorm(nint cmdBuf, in VulkanWeights.LayerBuffers lw, int rows, int numHeads, int numKvHeads, int headDim, float eps)
+    {
+        bool any = false;
+        if (lw.QNormWeight is not null)
+        {
+            _rmsnorm.Record(cmdBuf, _state.Q, lw.QNormWeight, _state.Q, rowCount: rows * numHeads, n: headDim, eps: eps);
+            any = true;
+        }
+        if (lw.KNormWeight is not null)
+        {
+            _rmsnorm.Record(cmdBuf, _state.K, lw.KNormWeight, _state.K, rowCount: rows * numKvHeads, n: headDim, eps: eps);
+            any = true;
+        }
+        if (any) BarrierComputeToCompute(cmdBuf);
+        return any;
+    }
+
     internal const string DisableQ4KCoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_Q4K_COOPMAT";
 
     /// <summary>Prefill length from which the blocked coopmat Q4_K GEMM replaces dp4a MMQ (to be tuned by A/B).</summary>
@@ -2850,6 +2872,8 @@ public sealed class VulkanTransformerModel : IModel
             if (lw.QBias is not null || lw.KBias is not null || lw.VBias is not null)
                 BarrierComputeToCompute(cmdBuf);
 
+            RecordQkNorm(cmdBuf, lw, totalTokens, numHeads, numKvHeads, headDim, eps);
+
             // Batched RoPE — reads packed positions [totalTokens] and rotates each
             // row independently. Per-seq position semantics are preserved by the
             // packed positions array.
@@ -3400,6 +3424,7 @@ public sealed class VulkanTransformerModel : IModel
                 MaybeApplyLoraDelta(cmdBuf, layer, "v_proj", _state.NormOutput, _state.V,
                     seqLen, lw.VInputDim, lw.VOutputDim);
             }
+            RecordQkNorm(cmdBuf, lw, seqLen, numHeads, numKvHeads, headDim, eps);
             ProfSample("qkv_proj");
             DpStamp(cmdBuf, DpCatQkv);
 
