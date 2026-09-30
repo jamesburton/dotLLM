@@ -70,6 +70,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     // in RecordMatmul branches on the device-side QuantizationType per call.
     private readonly MatMulQ4KGemvF32Kernel _matmulQ4K;
     private readonly MatMulQ4KGemmF32Kernel _matmulQ4KGemm;
+    private readonly MatMulQ5_0GemvF32Kernel _matmulQ5_0;
+    private readonly MatMulQ5_0GemmF32Kernel _matmulQ5_0Gemm;
     // Q5_K_M matmul kernels — Phase 1 sibling of Q4_K. Always created.
     private readonly MatMulQ5KGemvF32Kernel _matmulQ5K;
     private readonly MatMulQ5KGemmF32Kernel _matmulQ5KGemm;
@@ -201,6 +203,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         MatMulQ2KGemvF32Kernel matmulQ2K, MatMulQ2KGemmF32Kernel matmulQ2KGemm,
         MatMulQ3KGemvF32Kernel matmulQ3K, MatMulQ3KGemmF32Kernel matmulQ3KGemm,
         MatMulQ4KGemvF32Kernel matmulQ4K, MatMulQ4KGemmF32Kernel matmulQ4KGemm,
+        MatMulQ5_0GemvF32Kernel matmulQ5_0, MatMulQ5_0GemmF32Kernel matmulQ5_0Gemm,
         MatMulQ5KGemvF32Kernel matmulQ5K, MatMulQ5KGemmF32Kernel matmulQ5KGemm,
         MatMulQ6KGemvF32Kernel matmulQ6K, MatMulQ6KGemmF32Kernel matmulQ6KGemm,
         MatMulIq4NlGemvF32Kernel matmulIq4Nl, MatMulIq4NlGemmF32Kernel matmulIq4NlGemm,
@@ -248,6 +251,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ3KGemm = matmulQ3KGemm;
         _matmulQ4K = matmulQ4K;
         _matmulQ4KGemm = matmulQ4KGemm;
+        _matmulQ5_0 = matmulQ5_0;
+        _matmulQ5_0Gemm = matmulQ5_0Gemm;
         _matmulQ5K = matmulQ5K;
         _matmulQ5KGemm = matmulQ5KGemm;
         _matmulQ6K = matmulQ6K;
@@ -470,6 +475,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         // Q4_K_M GEMV + GEMM — Phase 1 of K-quant work. Always created.
         var matmulQ4K = MatMulQ4KGemvF32Kernel.Create(device, spvDir);
         var matmulQ4KGemm = MatMulQ4KGemmF32Kernel.Create(device, spvDir);
+        var matmulQ5_0 = MatMulQ5_0GemvF32Kernel.Create(device, spvDir);
+        var matmulQ5_0Gemm = MatMulQ5_0GemmF32Kernel.Create(device, spvDir);
         // Q5_K_M GEMV + GEMM — Phase 1 sibling of Q4_K. Always created.
         var matmulQ5K = MatMulQ5KGemvF32Kernel.Create(device, spvDir);
         var matmulQ5KGemm = MatMulQ5KGemmF32Kernel.Create(device, spvDir);
@@ -540,6 +547,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             matmulQ2K, matmulQ2KGemm,
             matmulQ3K, matmulQ3KGemm,
             matmulQ4K, matmulQ4KGemm,
+            matmulQ5_0, matmulQ5_0Gemm,
             matmulQ5K, matmulQ5KGemm,
             matmulQ6K, matmulQ6KGemm,
             matmulIq4Nl, matmulIq4NlGemm,
@@ -1236,6 +1244,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ3KGemm.InvalidateDescriptorCache();
         _matmulQ4K.InvalidateDescriptorCache();
         _matmulQ4KGemm.InvalidateDescriptorCache();
+        _matmulQ5_0.InvalidateDescriptorCache();
+        _matmulQ5_0Gemm.InvalidateDescriptorCache();
         _matmulQ5K.InvalidateDescriptorCache();
         _matmulQ5KGemm.InvalidateDescriptorCache();
         _matmulQ6K.InvalidateDescriptorCache();
@@ -1351,6 +1361,22 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             else
             {
                 _matmulQ4KGemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
+        else if (weightQt == QuantizationType.Q5_0)
+        {
+            // Q5_0 (#568): 32-element, 22-byte blocks; F32-in GEMV (decode) / tiled GEMM (prefill).
+            // Reaching the trailing F32 arm would reinterpret packed blocks as floats: silently
+            // wrong logits, not a crash.
+            if (seqLen == 1)
+            {
+                _matmulQ5_0.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulQ5_0Gemm.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim, n: seqLen);
             }
         }
@@ -1599,6 +1625,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ5KGemm.Dispose();
         _matmulQ5K.Dispose();
         _matmulQ4KGemm.Dispose();
+        _matmulQ5_0.Dispose();
+        _matmulQ5_0Gemm.Dispose();
         _matmulQ4K.Dispose();
         _matmulQ3KGemm.Dispose();
         _matmulQ3K.Dispose();
