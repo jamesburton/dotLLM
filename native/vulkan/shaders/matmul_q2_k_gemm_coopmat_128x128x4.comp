@@ -1,0 +1,87 @@
+#version 450
+// Q2_K batched GEMM on the shared 128x128 blocked coopmat template (issue #596).
+//
+//   C[N, M] = B[N, K] @ W_q2k[M, K]^T,  W dequantised on the fly.
+//
+// Weight layout (matches matmul_q2_k_gemm_f32.comp / llama.cpp dequantize_row_q2_K): rows of (K / 256)
+// super-blocks of 84 bytes -- scales[16] [0..15] (low nibble = scale, high nibble = min, one per
+// 16 elements), qs[64] [16..79] (2-bit codes), fp16 d [80..81], fp16 dmin [82..83]. All 4-byte aligned.
+// Element (half h, shift-group j, part p, l) = h*128 + j*32 + p*16 + l lives in byte qs[h*32 + p*16 + l]
+// at bit offset 2j and uses scale index h*8 + j*2 + p; value = d*(sc&15)*code - dmin*(sc>>4).
+// A BK=32 K-chunk is one (h, j) pair -- chunk ch -> super-block ch/8, sub = ch%8, h = sub/4, j = sub%4 --
+// and lane p of the two lanes per row stages its 16 columns (p*16 .. p*16+15).
+//
+// PRECISION: as for Q8_0/Q5_0, d*scale*code - dmin*min is folded into the F16 A operand (~2^-11).
+
+#define BM  128
+#define BN  128
+#define WM  64
+#define WN  64
+#define NSG 4
+#define WAVE 64
+
+#extension GL_GOOGLE_include_directive : require
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; }; // Q2_K blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { vec4 b4[]; };      // [N*K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };      // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim (number of weight rows)
+    uint K;             // contraction dim (must be a multiple of 256)
+    uint N;             // batch size (number of input rows)
+    uint blocksPerRow;  // = K / 256 (super-blocks)
+    uint rowUints;      // per-row uint stride
+} pc;
+
+#include "gemm_coopmat_blocked_decl.glsl"
+
+const uint Q2K_BLOCK_BYTES = 84u;  // Q2_K super-block
+
+const uint A_LANES_PER_ROW = BLOCK_SIZE / BM;        // 2 threads cooperate on one weight row
+const uint A_COLS_PER_THR  = BK / A_LANES_PER_ROW;   // 16 codes per thread
+
+void gemmStageA(uint ch) {
+    uint rowLocal  = g_tid / A_LANES_PER_ROW;
+    uint laneOfRow = g_tid % A_LANES_PER_ROW;      // part p
+    uint mGlobal   = g_mBase + rowLocal;
+    uint sBase     = rowLocal * STRIDE + laneOfRow * A_COLS_PER_THR;
+
+    if (mGlobal >= pc.M) {
+        for (uint j = 0u; j < A_COLS_PER_THR; j++) sharedA[sBase + j] = float16_t(0.0);
+        return;
+    }
+
+    uint kBlock = ch >> 3u;
+    uint sub    = ch & 7u;
+    uint h      = sub >> 2u;
+    uint jj     = sub & 3u;
+    uint bw = (mGlobal * (pc.blocksPerRow * Q2K_BLOCK_BYTES) + kBlock * Q2K_BLOCK_BYTES) >> 2u;
+
+    vec2 dd = unpackHalf2x16(weight[bw + 20u]);    // bytes 80..83: (d, dmin)
+    uint scIdx = h * 8u + jj * 2u + laneOfRow;
+    uint scb = (weight[bw + (scIdx >> 2u)] >> ((scIdx & 3u) * 8u)) & 0xFFu;
+    float scl = dd.x * float(scb & 0xFu);
+    float mn  = dd.y * float(scb >> 4u);
+
+    uint qw = bw + 4u + h * 8u + laneOfRow * 4u;   // qs starts at byte 16
+    uint shiftN = jj * 2u;
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        uint w = weight[qw + i] >> shiftN;
+        [[unroll]] for (uint jb = 0u; jb < 4u; jb++) {
+            uint code = (w >> (jb * 8u)) & 3u;
+            sharedA[sBase + i * 4u + jb] = float16_t(scl * float(code) - mn);
+        }
+    }
+}
+
+#define GEMM_M          pc.M
+#define GEMM_K          pc.K
+#define GEMM_CHUNKS     (pc.blocksPerRow * 8u)
+#define GEMM_ROW_BASE   0u
+#define GEMM_ROW_LIMIT  pc.N
+#define GEMM_B_BUF      b4
+#define GEMM_B_VEC4
+#define GEMM_C_BUF      c
+
+#include "gemm_coopmat_blocked_main.glsl"
