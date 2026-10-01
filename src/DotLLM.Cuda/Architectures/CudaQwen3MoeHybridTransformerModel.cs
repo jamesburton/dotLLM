@@ -170,17 +170,24 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// <inheritdoc/>
     /// <remarks>
     /// Re-zeroes the model-owned Gated-DeltaNet cache used by every forward that does not carry a
-    /// caller-supplied <see cref="IGdnState"/>. This model does not report
-    /// <see cref="IModel.RequiresPerSequenceState"/>, so it would inherit the no-op default — but its
-    /// GDN cache does persist across uncached forwards, so callers that score independent sequences
-    /// (perplexity windows) would leak state exactly as the CPU host did. Overridden for parity with
-    /// the CPU / Vulkan hosts — see issue #261.
+    /// caller-supplied <see cref="IGdnState"/>. The GDN cache persists across uncached forwards, so
+    /// callers that treat each forward as an independent sequence (perplexity windows, and
+    /// <c>TextGenerator</c> requests) must reset it — see issues #261 and #615.
     /// </remarks>
     public void ResetSequenceState()
     {
         _context.MakeCurrent();
         _gdnCache.Reset();
     }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// True: the model-owned <see cref="_gdnCache"/> is per-sequence state with no position addressing.
+    /// This used to be left undeclared, which made <c>TextGenerator</c> skip
+    /// <see cref="ResetSequenceState"/> and let each request inherit the previous one's state (measured on
+    /// Tev1-4B, T5500: a repeated greedy prompt flipped its answer from A to B) — issue #615.
+    /// </remarks>
+    public bool RequiresPerSequenceState => true;
 
     /// <summary>Number of full-attention layers — matches the sparse KV-cache slot count.</summary>
     public int AttentionLayerCount => _attentionLayerCount;
