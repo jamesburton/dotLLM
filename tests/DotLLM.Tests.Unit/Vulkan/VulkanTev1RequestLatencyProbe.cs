@@ -199,4 +199,40 @@ public sealed class VulkanTev1RequestLatencyProbe
             _out.WriteLine($"short{i}: wall={sw.Elapsed.TotalMilliseconds,6:F1} ms text='{r.Text}' drafted={r.Timings.SpeculativeDraftTokens}");
         }
     }
+
+    /// <summary>One-letter constrained answer: prefill / decode / sampling / outside, vs the unconstrained request.</summary>
+    [SkippableFact]
+    public void Tev1_4B_ConstrainedChoice_Breakdown()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_TEV1_LATENCY_PROBE") == "1", "opt-in probe");
+        string? path = FindGguf();
+        Skip.If(path is null, "Tev1-4B GGUF not found.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        var (model, kvFactory) = VulkanModelLoader.CreateFromGguf(device, gguf, config, spvDir);
+        using var _ = model as IDisposable;
+
+        var gen = new TextGenerator(model, tokenizer, (cfg, size) => kvFactory(size), mtpEnabled: false);
+        foreach (bool constrained in new[] { false, true, false, true })
+        {
+            var opts = new InferenceOptions
+            {
+                Temperature = 0, MaxTokens = 8,
+                ResponseFormat = constrained ? new ResponseFormat.Regex { Pattern = "(A|B)" } : null,
+            };
+            for (int i = 0; i < 4; i++)
+            {
+                var sw = Stopwatch.StartNew();
+                var r = gen.Generate(Prompt(new[] { 12, 45, 3, 90 }[i]), opts);
+                sw.Stop();
+                var t = r.Timings;
+                _out.WriteLine($"constrained={constrained,-5} req{i}: wall={sw.Elapsed.TotalMilliseconds,6:F1}  prefill={t.PrefillTimeMs,6:F1}  decode={t.DecodeTimeMs,5:F1}  " +
+                    $"sampling={t.SamplingTimeMs,5:F1}  outside={sw.Elapsed.TotalMilliseconds - t.PrefillTimeMs - t.DecodeTimeMs - t.SamplingTimeMs,6:F1}  text='{r.Text}' tokens={r.GeneratedTokenCount}");
+            }
+        }
+    }
 }
