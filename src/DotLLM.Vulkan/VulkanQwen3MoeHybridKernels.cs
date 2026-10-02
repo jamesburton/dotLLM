@@ -32,6 +32,10 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ4K { get; private set; }
     public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ5K { get; private set; }
     public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ6K { get; private set; }
+    // Decode-path (small expanded-row count) indexed dp4a MMVQ GEMVs: coalesced subgroup-per-cell, replacing the one-thread-per-cell MMQ/scalar kernels.
+    public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ4K { get; private set; }
+    public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ5K { get; private set; }
+    public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ6K { get; private set; }
     public MatMulQ2KGemvF32Kernel MatMulQ2K { get; }
     public MatMulQ2KGemmF32Kernel MatMulQ2KGemm { get; }
     public MatMulQ3KGemvF32Kernel MatMulQ3K { get; }
@@ -418,6 +422,12 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             if (MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q6_K))
                 kernels.MoeGroupedQ6K = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q6_K);
         }
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MMVQ") != "0")
+        {
+            kernels.MoeMmvqQ4K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q4_K);
+            kernels.MoeMmvqQ5K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q5_K);
+            kernels.MoeMmvqQ6K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q6_K);
+        }
         return kernels;
     }
 
@@ -500,10 +510,14 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeGroupedQ4K?.InvalidateDescriptorCache();
         MoeGroupedQ5K?.InvalidateDescriptorCache();
         MoeGroupedQ6K?.InvalidateDescriptorCache();
+        MoeMmvqQ4K?.InvalidateDescriptorCache();
+        MoeMmvqQ5K?.InvalidateDescriptorCache();
+        MoeMmvqQ6K?.InvalidateDescriptorCache();
     }
 
     public void Dispose()
     {
+        MoeMmvqQ6K?.Dispose(); MoeMmvqQ5K?.Dispose(); MoeMmvqQ4K?.Dispose();
         MoeGroupedQ6K?.Dispose(); MoeGroupedQ5K?.Dispose(); MoeGroupedQ4K?.Dispose(); MoeUngroupScatter?.Dispose();
         MoeExpandGroupByExpert?.Dispose(); MoeExpertOffsets?.Dispose();
         MoeSigmoidGatedAdd.Dispose();
