@@ -17,7 +17,16 @@ public sealed class VulkanMoeGroupedMatmulKQuantCoopmatTests
     [InlineData(MoeGroupedKQuant.Q5_K, 64, 768, "16,15,17,1")]
     [InlineData(MoeGroupedKQuant.Q6_K, 48, 256, "3,0,17,40")]
     [InlineData(MoeGroupedKQuant.Q6_K, 64, 512, "16,15,17,1,0,9")]
-    public void MatchesCpuReference(MoeGroupedKQuant quant, int m, int k, string counts)
+    public void MatchesCpuReference(MoeGroupedKQuant quant, int m, int k, string counts) => Verify(quant, m, k, counts, tile: 64);
+
+    /// <summary>The single-subgroup 16-row tile shape stays selectable (<c>DOTLLM_VK_MOE_GROUPED_TILE=16</c>) and must stay correct.</summary>
+    [SkippableTheory]
+    [InlineData(MoeGroupedKQuant.Q4_K, 48, 256, "3,0,17,40")]
+    [InlineData(MoeGroupedKQuant.Q5_K, 64, 768, "16,15,17,1")]
+    [InlineData(MoeGroupedKQuant.Q6_K, 64, 512, "16,15,17,1,0,9")]
+    public void SingleSubgroupTile_MatchesCpuReference(MoeGroupedKQuant quant, int m, int k, string counts) => Verify(quant, m, k, counts, tile: 16);
+
+    private static void Verify(MoeGroupedKQuant quant, int m, int k, string counts, int tile)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
@@ -60,7 +69,7 @@ public sealed class VulkanMoeGroupedMatmulKQuantCoopmatTests
             ye.CopyTo(expected, (long)offsets[e] * m);
         }
 
-        using var kernel = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, quant);
+        using var kernel = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, quant, tile);
         using var bufW = device.Allocate(bank.Length);
         using var bufX = device.Allocate((long)rows * k * sizeof(float));
         using var bufOff = device.Allocate(offsets.Length * sizeof(uint));
