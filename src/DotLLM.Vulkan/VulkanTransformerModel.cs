@@ -165,6 +165,9 @@ public sealed class VulkanTransformerModel : IModel
     private readonly MatMulF16GemvF32Kernel _matmulF16;
     private readonly MatMulF16GemmF32Kernel _matmulF16Gemm;
     private readonly MatMulF16GemmCoopmatKernel? _matmulF16GemmCoopmat;
+
+    /// <summary>IQ1/IQ2/IQ3 prefill: dequantise to F16 scratch + F16 coopmat GEMM (#621). Null when disabled or unsupported.</summary>
+    private IqF16PrefillMatmul? _iqF16Prefill;
     private readonly MatMulBf16GemvF32Kernel _matmulBf16;
     private readonly MatMulBf16GemmF32Kernel _matmulBf16Gemm;
     // Optional decode-path fusion of rmsnorm + Q8_0 GEMV. Eliminates one
@@ -1933,6 +1936,12 @@ public sealed class VulkanTransformerModel : IModel
             && MatMulIq4XsGemmCoopmatKernel.IsSupportedOn(device, spvDir))
             model._matmulIq4XsGemmCoopmat = MatMulIq4XsGemmCoopmatKernel.Create(device, spvDir);
         model._firstLayer = firstLayer;
+        {
+            long hidden = config.HiddenSize;
+            long qkvOut = (long)(config.NumAttentionHeads + 2 * config.NumKvHeads) * config.HeadDim;
+            long maxLayerElements = Math.Max(Math.Max((long)config.IntermediateSize * hidden, hidden * hidden), qkvOut * hidden);
+            model._iqF16Prefill = IqF16PrefillMatmul.TryCreate(device, spvDir, matmulF16GemmCoopmat, maxLayerElements);
+        }
         model._headless = headless;
         model._noTokenEmbed = skipTokenEmbed;
         return model;
@@ -4146,6 +4155,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulF16.InvalidateDescriptorCache();
         _matmulF16Gemm.InvalidateDescriptorCache();
         _matmulF16GemmCoopmat?.InvalidateDescriptorCache();
+        _iqF16Prefill?.InvalidateDescriptorCache();
         _matmulBf16.InvalidateDescriptorCache();
         _matmulBf16Gemm.InvalidateDescriptorCache();
         _rmsnormMatmulQ8Fused?.InvalidateDescriptorCache();
@@ -6163,6 +6173,11 @@ public sealed class VulkanTransformerModel : IModel
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
         int outputDim, int inputDim, int seqLen)
     {
+        // IQ1/IQ2/IQ3 prefill: dequant to F16 scratch + coopmat GEMM instead of the scalar tiled GEMM (#621).
+        if (seqLen > 1 && _iqF16Prefill is not null
+            && _iqF16Prefill.TryRecord(cmdBuf, weightQt, weights, input, output, outputDim, inputDim, seqLen))
+            return;
+
         if (weightQt == QuantType.Q8_0)
         {
             if (seqLen == 1)
@@ -7034,6 +7049,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulBf16Gemm.Dispose();
         _matmulBf16.Dispose();
         _matmulF16GemmCoopmat?.Dispose();
+        _iqF16Prefill?.Dispose();
         _matmulF16Gemm.Dispose();
         _matmulF16.Dispose();
         _matmulIq1SGemm.Dispose();
