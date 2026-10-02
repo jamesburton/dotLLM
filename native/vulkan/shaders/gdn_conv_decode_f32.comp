@@ -1,0 +1,43 @@
+#version 450
+// Single-token (decode) fused GDN causal conv: conv1d (+bias) + SiLU + conv-state shift in one dispatch.
+//
+// The multi-token path builds ConvInput = [convState | qkv] with two vkCmdCopyBuffer calls, runs conv1d_causal_f32, silu_inplace_f32, then copies
+// the trailing dConv-1 rows back into convState: 2 copies, 3 transfer<->compute barrier pairs and 3 dispatches per GDN layer. For seqLen == 1 every
+// channel is independent, so one thread owns channel c: it reads its dConv-1 state taps, applies the current x (= qkv[c]), writes silu(conv) back over
+// qkv[c] and shifts its own state column. In-place is safe because no other thread touches channel c.
+//
+//   y[c] = silu(bias[c] + sum_{k=0..dConv-2} state[k, c] * w[c*dConv + k] + x[c] * w[c*dConv + dConv-1])
+//   state'[k, c] = state[k+1, c] (k < dConv-2),  state'[dConv-2, c] = x[c]
+//
+// Requires dConv >= 2. Dispatch: ceil(channels / 256) workgroups of 256.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)          buffer BufState  { float state[]; };  // [(dConv-1) * channels], updated in place
+layout(set = 0, binding = 1, std430) readonly buffer BufWeight { float weight[]; }; // [channels * dConv] channel-major
+layout(set = 0, binding = 2, std430) readonly buffer BufBias   { float bias[];   }; // [channels]
+layout(set = 0, binding = 3, std430)          buffer BufX      { float x[];      };  // [channels]: in = qkv row, out = silu(conv)
+
+layout(push_constant) uniform PushConstants {
+    uint dConv;
+    uint channels;
+} pc;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.channels) return;
+
+    uint wBase = c * pc.dConv;
+    float acc = bias[c];
+    float prev = state[c];
+    acc += prev * weight[wBase];
+    for (uint k = 1u; k + 1u < pc.dConv; k++) {
+        float cur = state[k * pc.channels + c];
+        acc += cur * weight[wBase + k];
+        state[(k - 1u) * pc.channels + c] = cur;
+    }
+    float xv = x[c];
+    acc += xv * weight[wBase + pc.dConv - 1u];
+    state[(pc.dConv - 2u) * pc.channels + c] = xv;
+    x[c] = acc / (1.0 + exp(-acc));
+}

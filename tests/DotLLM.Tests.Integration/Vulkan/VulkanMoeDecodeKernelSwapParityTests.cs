@@ -61,7 +61,7 @@ public sealed class VulkanMoeDecodeKernelSwapParityTests
 
     private static (int[] tokens, float[] lastLogits) Run(string modelPath, bool legacy, int[] prompt, int vocabSize)
     {
-        string[] vars = { "DOTLLM_VK_F32_GEMV", "DOTLLM_VK_MOE_MMVQ", "DOTLLM_VK_MOE_SHARED_F16", "DOTLLM_VK_MOE_SHARED_Q8", "DOTLLM_VK_MOE_Q8_MMVQ", "DOTLLM_VK_MOE_DECODE_FUSED" };
+        string[] vars = { "DOTLLM_VK_F32_GEMV", "DOTLLM_VK_MOE_MMVQ", "DOTLLM_VK_MOE_SHARED_F16", "DOTLLM_VK_MOE_SHARED_Q8", "DOTLLM_VK_GDN_CONV_DECODE", "DOTLLM_VK_MOE_Q8_MMVQ", "DOTLLM_VK_MOE_DECODE_FUSED" };
         string?[] prev = vars.Select(Environment.GetEnvironmentVariable).ToArray();
         foreach (string v in vars) Environment.SetEnvironmentVariable(v, legacy ? "0" : null);
         try

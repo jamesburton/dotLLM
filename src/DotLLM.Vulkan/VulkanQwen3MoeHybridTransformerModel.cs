@@ -849,6 +849,15 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // ── 3. Build conv input + Conv1d + SiLU ───────────────────────────────
+        long convDimBytes = (long)convDim * sizeof(float);
+        // Decode (seqLen == 1): one fused dispatch does conv1d + SiLU + state shift in place (no copies, no transfer barriers).
+        if (seqLen == 1 && dConv >= 2 && _kernels.GdnConvDecode is { } convDecode)
+        {
+            convDecode.Record(cmdBuf, convStateBuf, gdnW.Conv1dWeight, gdnW.Conv1dBias, _state.GdnQkvBuf, dConv: dConv, channels: convDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+        else
+        {
         // ConvInput = [convState (DConv-1 rows) | qkvBuf (seqLen rows)]
         KernelSupport.ComputeToTransferBarrier(cmdBuf);
         long convStateBytes = (long)(dConv - 1) * convDim * sizeof(float);
@@ -857,7 +866,6 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             RecordCopyBufferRange(cmdBuf, convStateBuf, _state.GdnConvInput,
                 srcOffset: 0, dstOffset: 0, size: (ulong)convStateBytes);
         }
-        long convDimBytes = (long)convDim * sizeof(float);
         // The qkv rows are contiguous in both buffers, so the whole [seqLen, convDim] block is one copy (was seqLen copies).
         RecordCopyBufferRange(cmdBuf, _state.GdnQkvBuf, _state.GdnConvInput,
             srcOffset: 0, dstOffset: (ulong)((long)(dConv - 1) * convDimBytes), size: (ulong)((long)seqLen * convDimBytes));
@@ -881,6 +889,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             RecordCopyBufferRange(cmdBuf, _state.GdnConvInput, convStateBuf,
                 srcOffset: saveSrc, dstOffset: 0, size: (ulong)convStateBytes);
             KernelSupport.TransferToComputeBarrier(cmdBuf);
+        }
         }
 
         // ── 4. De-interleave Q/K/V and L2-normalise Q and K ──────────────────

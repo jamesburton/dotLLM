@@ -38,6 +38,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulQ8_0MmvqKernel? MatMulQ8Mmvq { get; private set; }
     // One-dispatch replacements for the per-token vkCmdCopyBuffer fan-out loops (GDN [Q|K|V] split, attention Q+gate de-interleave).
     public DeinterleaveF32Kernel? GdnQkvSplit { get; private set; }
+    /// <summary>Fused single-token conv1d + SiLU + conv-state shift (decode). Null when the SPIR-V is missing or <c>DOTLLM_VK_GDN_CONV_DECODE=0</c>.</summary>
+    public GdnConvDecodeF32Kernel? GdnConvDecode { get; private set; }
     public DeinterleaveF32Kernel? QGateDeinterleave { get; private set; }
     // Decode-only fused ops for the MoE layer (issue #647): RMSNorm + Q8_1 quantize, and SwiGLU + Q8_1 quantize.
     public RmsNormQuantizeQ8_1FusedKernel? RmsNormQuantizeFused { get; private set; }
@@ -430,6 +432,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             if (MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q6_K))
                 kernels.MoeGroupedQ6K = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q6_K);
         }
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_GDN_CONV_DECODE") != "0"
+            && File.Exists(Path.Combine(spvDir, "gdn_conv_decode_f32.spv")))
+            kernels.GdnConvDecode = GdnConvDecodeF32Kernel.Create(device, spvDir);
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_DEINTERLEAVE") != "0")
         {
             kernels.GdnQkvSplit = DeinterleaveF32Kernel.TryCreate(device, spvDir, DeinterleaveF32Kernel.Kind.GdnQkvSplit);
@@ -533,6 +538,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeMmvqQ4K?.InvalidateDescriptorCache();
         MatMulQ8Mmvq?.InvalidateDescriptorCache();
         GdnQkvSplit?.InvalidateDescriptorCache();
+        GdnConvDecode?.InvalidateDescriptorCache();
         QGateDeinterleave?.InvalidateDescriptorCache();
         RmsNormQuantizeFused?.InvalidateDescriptorCache();
         SwiGluQuantizeFused?.InvalidateDescriptorCache();
@@ -542,7 +548,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
 
     public void Dispose()
     {
-        QGateDeinterleave?.Dispose(); GdnQkvSplit?.Dispose(); SwiGluQuantizeFused?.Dispose(); RmsNormQuantizeFused?.Dispose(); MatMulQ8Mmvq?.Dispose(); MoeMmvqQ6K?.Dispose(); MoeMmvqQ5K?.Dispose(); MoeMmvqQ4K?.Dispose();
+        QGateDeinterleave?.Dispose(); GdnQkvSplit?.Dispose(); GdnConvDecode?.Dispose(); SwiGluQuantizeFused?.Dispose(); RmsNormQuantizeFused?.Dispose(); MatMulQ8Mmvq?.Dispose(); MoeMmvqQ6K?.Dispose(); MoeMmvqQ5K?.Dispose(); MoeMmvqQ4K?.Dispose();
         MoeGroupedQ6K?.Dispose(); MoeGroupedQ5K?.Dispose(); MoeGroupedQ4K?.Dispose(); MoeUngroupScatter?.Dispose();
         MoeExpandGroupByExpert?.Dispose(); MoeExpertOffsets?.Dispose();
         MoeSigmoidGatedAdd.Dispose();
