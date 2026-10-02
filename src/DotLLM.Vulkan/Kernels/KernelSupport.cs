@@ -223,6 +223,29 @@ internal static class KernelSupport
     }
 
     /// <summary>
+    /// Inserts a <c>(COMPUTE_SHADER | TRANSFER) → COMPUTE_SHADER</c> barrier: a compute kernel and a <c>vkCmdCopyBuffer</c> recorded
+    /// back to back are both made visible to the compute work that follows.
+    /// </summary>
+    internal static unsafe void ComputeAndTransferToComputeBarrier(nint cmdBuf)
+    {
+        var barrier = new VkMemoryBarrier
+        {
+            sType = VkStructureType.MemoryBarrier,
+            srcAccessMask = VkAccessFlags.ShaderWrite | VkAccessFlags.TransferWrite,
+            dstAccessMask = VkAccessFlags.ShaderRead | VkAccessFlags.ShaderWrite,
+        };
+        Interop.ProfileCounters.Barriers++;
+        VulkanApi.vkCmdPipelineBarrier(
+            cmdBuf,
+            srcStageMask: VkPipelineStageFlags.ComputeShader | VkPipelineStageFlags.Transfer,
+            dstStageMask: VkPipelineStageFlags.ComputeShader,
+            dependencyFlags: 0,
+            memoryBarrierCount: 1, pMemoryBarriers: barrier,
+            bufferMemoryBarrierCount: 0, pBufferMemoryBarriers: 0,
+            imageMemoryBarrierCount: 0, pImageMemoryBarriers: 0);
+    }
+
+    /// <summary>
     /// Inserts a <c>HOST → COMPUTE_SHADER</c> barrier so compute kernels see
     /// host writes to host-visible host-coherent buffers that were made
     /// before the submit. Vulkan's host-coherent guarantee covers visibility

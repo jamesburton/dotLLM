@@ -2,11 +2,11 @@
 #extension GL_EXT_integer_dot_product        : require
 #extension GL_KHR_shader_subgroup_basic      : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
-// MoE INDEXED Q5_K MMVQ decode GEMV: integer-dot (dp4a) matrix-vector multiply over a packed expert bank.
+// MoE INDEXED Q4_K MMVQ decode GEMV: integer-dot (dp4a) matrix-vector multiply over a packed expert bank.
 //
 //   y[n, m] = sum_k dequant(bank[indices[n], m, k]) * x[n, k]
 //
-// The gathered/indexed variant of matmul_q5_k_mmvq.comp, generated from it by gen_idx_mmvq.py (same recipe as the existing
+// The gathered/indexed variant of matmul_q4_k_mmvq.comp, generated from it by gen_idx_mmvq.py (same recipe as the existing
 // moe_indexed_matmul_q4_k_mmvq.comp): the weight row is looked up through the per-row expert index and the activation row n comes
 // from the Q8_1-quantized expanded MoE input (quantize_q8_1_rows.comp). The lane layout, per-sub-block math and subgroupAdd are
 // unchanged. The scalar one-thread-per-cell moe_indexed_matmul_*_q8_1/_f32 kernels read adjacent rows a whole row apart
@@ -16,7 +16,7 @@
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  bank[]; }; // Q5_K blob
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  bank[]; }; // Q4_K blob
 layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };      // [N * K/4] packed int8 activations
 layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };     // [N * K/32] (d_x, s)
 layout(set = 0, binding = 3, std430) readonly  buffer BufIdx  { int   indices[]; };// [N]
@@ -31,7 +31,7 @@ layout(push_constant) uniform PushConstants {
     uint xDiv;          // activation row = n / xDiv (1 = per-row input; topK = one row broadcast to its topK expert slots)
 } pc;
 
-const uint Q5K_BLOCK_BYTES = 176u;
+const uint Q4K_BLOCK_BYTES = 144u;
 
 uint readByte(uint absByteOff) {
     uint u = bank[absByteOff >> 2u];
@@ -52,7 +52,7 @@ float readHalf(uint absByteOff) {
     return unpackHalf2x16(half16).x;
 }
 
-// j-th (0..7) (scale, min) pair from the 12-byte scales[] — get_scale_min_k4 (same as Q4_K).
+// j-th (0..7) (scale, min) pair from the 12-byte scales[] — get_scale_min_k4.
 uvec2 unpackScaleMin(uint scalesByteBase, uint j) {
     uint sc, mn;
     if (j < 4u) {
@@ -67,21 +67,6 @@ uvec2 unpackScaleMin(uint scalesByteBase, uint j) {
         mn = mnLow | (mnHigh << 4u);
     }
     return uvec2(sc, mn);
-}
-
-// Build 4 packed 5-bit weights (q5 = nibble | (qh_bit << 4), 0..31) ready for dp4a.
-// useHigh selects the high nibble of each qs byte; j is the sub-block index whose
-// bit in each qh byte is the 5th bit.
-uint packQ5(uint qs4, uint qh4, bool useHigh, uint j) {
-    uint res = 0u;
-    for (uint e = 0u; e < 4u; e++) {
-        uint qsb = (qs4 >> (e * 8u)) & 0xFFu;
-        uint nib = useHigh ? ((qsb >> 4u) & 0xFu) : (qsb & 0xFu);
-        uint hb  = (qh4 >> (e * 8u + j)) & 1u;
-        uint q5  = nib | (hb << 4u);          // 0..31
-        res |= (q5 & 0xFFu) << (e * 8u);
-    }
-    return res;
 }
 
 void main() {
@@ -101,36 +86,43 @@ void main() {
     uint j0 = p * 2u;                     // low-nibble sub-block
     uint j1 = j0 + 1u;                    // high-nibble sub-block
 
-    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * Q5K_BLOCK_BYTES;
+    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * Q4K_BLOCK_BYTES;
     float acc = 0.0;
 
     for (uint b = 0u; b < pc.blocksPerRow; b++) {
-        uint blockByteBase = rowByteBase + b * Q5K_BLOCK_BYTES;
+        uint blockByteBase = rowByteBase + b * Q4K_BLOCK_BYTES;
         float d    = readHalf(blockByteBase);
         float dmin = readHalf(blockByteBase + 2u);
         uint scalesBase = blockByteBase + 4u;
         uvec2 sm0 = unpackScaleMin(scalesBase, j0);
         uvec2 sm1 = unpackScaleMin(scalesBase, j1);
 
-        // This lane's qs uint (lane = p*8+g over the 32-uint qs region) + the qh
-        // uint for its 4 positions (g of the 8-uint qh region).
-        uint qs4 = bank[((blockByteBase + 48u) >> 2u) + lane];
-        uint qh4 = bank[((blockByteBase + 16u) >> 2u) + g];
-        uint w0 = packQ5(qs4, qh4, false, j0);
-        uint w1 = packQ5(qs4, qh4, true,  j1);
+        // This lane's qs uint: qs starts at +16 bytes (word-aligned). Lane L owns
+        // uint (p*8 + g) = lane, so the 32 lanes read 32 consecutive uints.
+        uint cur = bank[((blockByteBase + 16u) >> 2u) + lane];
+        uint lo = ( cur        & 0x0Fu)
+                | ((cur >>  8u) & 0x0Fu) << 8u
+                | ((cur >> 16u) & 0x0Fu) << 16u
+                | ((cur >> 24u) & 0x0Fu) << 24u;
+        uint hi = ((cur >>  4u) & 0x0Fu)
+                | ((cur >> 12u) & 0x0Fu) << 8u
+                | ((cur >> 20u) & 0x0Fu) << 16u
+                | ((cur >> 28u) & 0x0Fu) << 24u;
 
-        uint xqBlockBase = xqRowBase + b * 64u;
-        uint xdsBase     = xdsRowBase + b * 8u;
-        vec2 ds0 = xds[xdsBase + j0];
+        uint xqBlockBase = xqRowBase + b * 64u;       // (b*256)/4 = first activation uint of this super-block
+        uint xdsBase     = xdsRowBase + b * 8u;        // first Q8_1 block of this super-block
+        vec2 ds0 = xds[xdsBase + j0];     // (d_x, s) for sub-block j0
         vec2 ds1 = xds[xdsBase + j1];
 
-        int dot0 = dotPacked4x8AccSatEXT(int(w0), int(xq[xqBlockBase + j0 * 8u + g]), 0);
-        int dot1 = dotPacked4x8AccSatEXT(int(w1), int(xq[xqBlockBase + j1 * 8u + g]), 0);
+        int dot0 = dotPacked4x8AccSatEXT(int(lo), int(xq[xqBlockBase + j0 * 8u + g]), 0);
+        int dot1 = dotPacked4x8AccSatEXT(int(hi), int(xq[xqBlockBase + j1 * 8u + g]), 0);
 
+        // d·sc·(d_x·dot)  minus  1/8 of the per-sub-block min term (8 lanes share it).
         acc += (d * float(sm0.x)) * (ds0.x * float(dot0)) - (dmin * float(sm0.y)) * ds0.y * 0.125;
         acc += (d * float(sm1.x)) * (ds1.x * float(dot1)) - (dmin * float(sm1.y)) * ds1.y * 0.125;
     }
 
+    // The subgroup IS the row: one reduction yields y[m] (no shared mem, no barrier).
     float total = subgroupAdd(acc);
     if (subgroupElect())
         y[n * pc.M + m] = total;

@@ -77,13 +77,51 @@ public sealed class VulkanMoeIndexedMatmulKQuantMmvqKernelTests
         }
     }
 
-    private static float[] Launch(VulkanDevice device, QuantizeQ8_1RowsKernel quant, MoeIndexedMatmulKQuantMmvqKernel kernel,
-        byte[] bank, float[] x, int[] indices, int m, int k, int n, int numExperts)
+    /// <summary>
+    /// The decode MoE path quantizes ONE activation row and has every topK slot read it (<c>xDiv = topK</c>): bit-exact against replicating that
+    /// row topK times and launching with <c>xDiv = 1</c>.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(MoeGroupedKQuant.Q4_K, 8, 16, 48, 512)]
+    [InlineData(MoeGroupedKQuant.Q5_K, 8, 16, 96, 512)]
+    [InlineData(MoeGroupedKQuant.Q6_K, 8, 16, 96, 1024)]
+    public void BroadcastActivationRow_MatchesReplicatedRows(MoeGroupedKQuant quantType, int topK, int numExperts, int m, int k)
     {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasIntegerDotProduct, "integer-dot-product unavailable.");
+        using var quant = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir) ?? throw new Xunit.Sdk.XunitException("quantize_q8_1_rows.spv missing.");
+        using var kernel = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, quantType) ?? throw new Xunit.Sdk.XunitException("spv missing.");
+
+        var rng = new Random(0x647 + (int)quantType);
+        byte[] bank = Enumerable.Range(0, numExperts).SelectMany(_ =>
+        {
+            float[] w = Q4KFixture.RandomFloats(rng, m * k, 0.1f);
+            return quantType switch
+            {
+                MoeGroupedKQuant.Q4_K => Q4KFixture.QuantizeRows(w, m, k),
+                MoeGroupedKQuant.Q5_K => Q5KFixture.QuantizeRows(w, m, k),
+                _ => Q6KFixture.QuantizeRows(w, m, k),
+            };
+        }).ToArray();
+        float[] row = Q4KFixture.RandomFloats(rng, k, 1f);
+        float[] replicated = Enumerable.Range(0, topK).SelectMany(_ => row).ToArray();
+        int[] indices = Enumerable.Range(0, topK).Select(i => (i * 5 + 2) % numExperts).ToArray();
+
+        float[] viaBroadcast = Launch(device, quant, kernel, bank, row, indices, m, k, topK, numExperts, xDiv: topK);
+        float[] viaReplicated = Launch(device, quant, kernel, bank, replicated, indices, m, k, topK, numExperts, xDiv: 1);
+        for (int i = 0; i < viaBroadcast.Length; i++)
+            Assert.True(viaBroadcast[i].Equals(viaReplicated[i]), $"{quantType} cell {i}: broadcast {viaBroadcast[i]:G9} != replicated {viaReplicated[i]:G9}.");
+    }
+
+    private static float[] Launch(VulkanDevice device, QuantizeQ8_1RowsKernel quant, MoeIndexedMatmulKQuantMmvqKernel kernel,
+        byte[] bank, float[] x, int[] indices, int m, int k, int n, int numExperts, int xDiv = 1)
+    {
+        int xRows = (n + xDiv - 1) / xDiv;
         using var bankBuf = device.Allocate(((long)bank.Length + 3) & ~3L);
         using var xBuf = device.Allocate((long)x.Length * sizeof(float));
-        using var xqBuf = device.Allocate(QuantizeQ8_1RowsKernel.PackedBytes(n, k));
-        using var xdsBuf = device.Allocate(QuantizeQ8_1RowsKernel.ScaleBytes(n, k));
+        using var xqBuf = device.Allocate(QuantizeQ8_1RowsKernel.PackedBytes(xRows, k));
+        using var xdsBuf = device.Allocate(QuantizeQ8_1RowsKernel.ScaleBytes(xRows, k));
         using var idxBuf = device.Allocate((long)indices.Length * sizeof(int));
         using var yBuf = device.Allocate((long)n * m * sizeof(float));
         device.Upload(new ReadOnlySpan<byte>(bank), bankBuf);
@@ -92,9 +130,9 @@ public sealed class VulkanMoeIndexedMatmulKQuantMmvqKernelTests
         using (var ctx = device.CreateSubmitContext())
         {
             ctx.Begin();
-            quant.Record(ctx.CommandBuffer, xBuf, xqBuf, xdsBuf, n, k);
+            quant.Record(ctx.CommandBuffer, xBuf, xqBuf, xdsBuf, xRows, k);
             KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
-            kernel.Record(ctx.CommandBuffer, bankBuf, xqBuf, xdsBuf, idxBuf, yBuf, m, k, n, numExperts);
+            kernel.Record(ctx.CommandBuffer, bankBuf, xqBuf, xdsBuf, idxBuf, yBuf, m, k, n, numExperts, xDiv);
             ctx.SubmitAndWait();
         }
         float[] y = new float[(long)n * m];

@@ -630,11 +630,8 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             // First residual add: HiddenState = Residual + NormOutput (token-mixing output).
             //   AddScratch is reused later as MoE intermediates; here it just receives the sum
             //   so we can copy it back into HiddenState in one transfer.
-            _kernels.Add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch,
+            _kernels.Add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.HiddenState,
                 seqLen * hiddenSize);
-            KernelSupport.ComputeToTransferBarrier(cmdBuf);
-            RecordCopyBufferRange(cmdBuf, _state.AddScratch, _state.HiddenState,
-                0, 0, (ulong)((long)seqLen * hiddenSize * sizeof(float)));
             KernelSupport.ComputeToHostBarrier(cmdBuf);
             _submit.SubmitAndWait();
             if (profActive) { _profAttnMs += ProfElapsedMs(ref profT0); }
@@ -1129,6 +1126,15 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         nint cmdBuf = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(cmdBuf);
 
+        if (CanRecordMoeDecodeFast(moeBuf, seqLen, hiddenSize))
+        {
+            RecordMoeDecodeFast(cmdBuf, moeBuf, layerBuf, hiddenSize, eps);
+            KernelSupport.ComputeToHostBarrier(cmdBuf);
+            _submit.SubmitAndWait();
+            if (disposeAfterLayer) moeBuf.Dispose();
+            return;
+        }
+
         // Second residual snapshot (HiddenState now holds the updated activations).
         RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.Residual,
             0, 0, (ulong)((long)seqLen * hiddenSize * sizeof(float)));
@@ -1141,12 +1147,9 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         RecordMoeLayer(cmdBuf, moeBuf, layerBuf.PostAttnNormWeight, seqLen, hiddenSize, eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        // Second residual add.
-        _kernels.Add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch,
+        // Second residual add (straight into HiddenState: it is not an input of the add).
+        _kernels.Add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.HiddenState,
             seqLen * hiddenSize);
-        KernelSupport.ComputeToTransferBarrier(cmdBuf);
-        RecordCopyBufferRange(cmdBuf, _state.AddScratch, _state.HiddenState,
-            0, 0, (ulong)((long)seqLen * hiddenSize * sizeof(float)));
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         _submit.SubmitAndWait();
 
@@ -1154,6 +1157,92 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         // moving to the next layer. In resident mode the bundle is kept
         // alive on _residentMoeBundles and only disposed at model Dispose.
         if (disposeAfterLayer) moeBuf.Dispose();
+    }
+
+    private static readonly bool MoeDecodeFastEnabled =
+        !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_DECODE_FUSED"), "0", StringComparison.Ordinal);
+
+    /// <summary>
+    /// True when the single-token MoE layer can take <see cref="RecordMoeDecodeFast"/>: resident Q4_K gate/up + Q5_K/Q6_K down with the
+    /// indexed MMVQ kernels, a sigmoid-gated shared expert, and the fused norm/SwiGLU + quantize kernels.
+    /// </summary>
+    private bool CanRecordMoeDecodeFast(VulkanQwen3MoeMoeUpload.LayerBundle moeW, int seqLen, int hidden)
+        => MoeDecodeFastEnabled && seqLen == 1
+            && _kernels.RmsNormQuantizeFused is not null && _kernels.SwiGluQuantizeFused is not null
+            && _kernels.MoeMmvqQ4K is not null
+            && moeW.W1QuantType == QuantizationType.Q4_K && moeW.W3QuantType == QuantizationType.Q4_K
+            && (moeW.W2QuantType == QuantizationType.Q5_K ? _kernels.MoeMmvqQ5K is not null
+                : moeW.W2QuantType == QuantizationType.Q6_K && _kernels.MoeMmvqQ6K is not null)
+            && moeW.HasSharedExpert && moeW.SharedExpertGate is not null
+            && (hidden % 256) == 0 && (moeW.IntermediateSize % 256) == 0;
+
+    /// <summary>
+    /// Single-token MoE layer with the dependent chain compressed (issue #647): the shared expert is independent of the routed experts, so its
+    /// matmuls ride the same barrier phases (no re-derived RMSNorm: the routed scatter lands in NormOutput only after every NormOutput reader
+    /// is done); the broadcast + Q8_1 quantize collapse into the norm (one row, indexed MMVQ reads it for all topK slots); SwiGLU is fused with
+    /// the down-projection quantize; the final add writes HiddenState directly. 7 barriers / 16 dispatches instead of ~17 / 22, ~13 us each on gfx1151.
+    /// </summary>
+    private void RecordMoeDecodeFast(
+        nint cmdBuf, VulkanQwen3MoeMoeUpload.LayerBundle moeW,
+        in VulkanQwen3MoeHybridWeights.LayerBuffers layerBuf, int hidden, float eps)
+    {
+        int interm = moeW.IntermediateSize;
+        int numE = moeW.NumExperts;
+        int topK = moeW.NumExpertsPerTok;
+        int sharedI = moeW.SharedIntermediateSize;
+        var downMmvq = (moeW.W2QuantType == QuantizationType.Q5_K ? _kernels.MoeMmvqQ5K : _kernels.MoeMmvqQ6K)!;
+
+        // Phase 0: residual snapshot (transfer) alongside norm + quantize of the single row (compute).
+        RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.Residual, 0, 0, (ulong)((long)hidden * sizeof(float)));
+        _kernels.RmsNormQuantizeFused!.Record(cmdBuf, _state.HiddenState, layerBuf.PostAttnNormWeight, _state.NormOutput,
+            _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, n: hidden, eps: eps);
+        KernelSupport.ComputeAndTransferToComputeBarrier(cmdBuf);
+
+        // Phase 1: router + the three shared-expert matmuls that read NormOutput.
+        RecordMatmul(cmdBuf, moeW.Gate, QuantizationType.F32, _state.NormOutput, _state.MoeRouterLogits,
+            outputDim: numE, inputDim: hidden, seqLen: 1);
+        RecordMatmul(cmdBuf, moeW.SharedGate!, moeW.SharedQuantType, _state.NormOutput, _state.MoeSharedGate,
+            outputDim: sharedI, inputDim: hidden, seqLen: 1);
+        RecordMatmul(cmdBuf, moeW.SharedUp!, moeW.SharedQuantType, _state.NormOutput, _state.MoeSharedUp,
+            outputDim: sharedI, inputDim: hidden, seqLen: 1);
+        RecordMatmul(cmdBuf, moeW.SharedExpertGate!, QuantizationType.F32, _state.NormOutput, _state.MoeSharedGateLogits,
+            outputDim: 1, inputDim: hidden, seqLen: 1);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // Phase 2: top-k routing + shared SwiGLU.
+        _kernels.MoeTopkSoftmax.Record(cmdBuf, _state.MoeRouterLogits, _state.MoeTopkIndices, _state.MoeTopkWeights,
+            seqLen: 1, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
+        _kernels.SwiGlu.Record(cmdBuf, _state.MoeSharedGate, _state.MoeSharedUp, _state.MoeSharedSilu, n: sharedI);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // Phase 3: routed gate/up (one activation row broadcast to the topK slots) + shared down.
+        _kernels.MoeMmvqQ4K!.Record(cmdBuf, moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+            _state.MoeTopkIndices, _state.MoeGateInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
+        _kernels.MoeMmvqQ4K.Record(cmdBuf, moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+            _state.MoeTopkIndices, _state.MoeUpInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
+        RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType, _state.MoeSharedSilu, _state.MoeSharedSumA,
+            outputDim: hidden, inputDim: sharedI, seqLen: 1);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // Phase 4: SwiGLU fused with the Q8_1 quantize feeding the down projection (topK rows of interm are one contiguous run of 32-blocks).
+        _kernels.SwiGluQuantizeFused!.Record(cmdBuf, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter,
+            _state.MoeSiluInterXq, _state.MoeSiluInterXds, n: topK * interm);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // Phase 5: routed down.
+        downMmvq.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
+            _state.MoeTopkIndices, _state.MoeDownRows, m: hidden, k: interm, n: topK, numExperts: numE);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // Phase 6: weighted scatter into NormOutput (all its readers finished in phases 1-2), shared sigmoid-gated add, residual add.
+        _kernels.MoeWeightedScatter.Record(cmdBuf, _state.MoeDownRows, _state.MoeTopkWeights, _state.NormOutput,
+            seqLen: 1, topK: topK, hiddenSize: hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        _kernels.MoeSigmoidGatedAdd.Record(cmdBuf,
+            output: _state.NormOutput, b: _state.MoeSharedSumA, gateLogits: _state.MoeSharedGateLogits,
+            seqLen: 1, hiddenSize: hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        _kernels.Add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.HiddenState, hidden);
     }
 
     /// <summary>

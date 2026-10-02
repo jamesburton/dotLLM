@@ -10,7 +10,7 @@
 // moe_indexed_matmul_q4_k_mmvq.comp): the weight row is looked up through the per-row expert index and the activation row n comes
 // from the Q8_1-quantized expanded MoE input (quantize_q8_1_rows.comp). The lane layout, per-sub-block math and subgroupAdd are
 // unchanged. The scalar one-thread-per-cell moe_indexed_matmul_*_q8_1/_f32 kernels read adjacent rows a whole row apart
-// (uncoalesced) and were ~1.5 ms/layer for Q6_K on Qwen3.6-35B-A3B decode.
+// (uncoalesced) and were ~1.5 ms/layer for Q6_K on Qwen3.6-35B-A3B decode. xDiv lets decode broadcast one quantized activation row to its topK slots.
 //
 // Dispatch: gl_WorkGroupID.x = m, gl_WorkGroupID.y = n; one wave32 subgroup per output cell.
 
@@ -28,6 +28,7 @@ layout(push_constant) uniform PushConstants {
     uint N;             // total rows   (typically seqLen * topK)
     uint numExperts;    // bank's first axis size - bounds-check only
     uint blocksPerRow;  // = K / 256
+    uint xDiv;          // activation row = n / xDiv (1 = per-row input; topK = one row broadcast to its topK expert slots)
 } pc;
 
 const uint Q6K_BLOCK_BYTES = 210u;
@@ -86,8 +87,9 @@ void main() {
 
     uint expert = uint(indices[n]);
     if (expert >= pc.numExperts) return; // defensive: bad index leaves y untouched
-    uint xqRowBase  = n * (pc.K >> 2u);  // uint index of row n's packed activations
-    uint xdsRowBase = n * (pc.K >> 5u);  // vec2 index of row n's (d_x, s)
+    uint xRow = n / pc.xDiv;
+    uint xqRowBase  = xRow * (pc.K >> 2u);  // uint index of the packed activations row
+    uint xdsRowBase = xRow * (pc.K >> 5u);  // vec2 index of that row's (d_x, s)
 
     uint lane  = gl_LocalInvocationID.x;   // 0..31 (one subgroup per workgroup)
     uint c     = lane >> 2u;               // chunk 0..7
