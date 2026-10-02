@@ -172,6 +172,20 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     public VulkanGdnStateCache CreateGdnStateCache()
         => new(_device, _gdn, _gdnCache.NumGdnLayers);
 
+    /// <summary>
+    /// Resident (device-local, packed-quant) MoE banks versus per-layer transient upload. The transient path measured 0.09 tok/s
+    /// decode on Qwen3.6-35B-A3B Q4_K_M (3.25 tok/s prefill) against 13-18 / 23-75 tok/s resident (#635), so resident is the default
+    /// whenever the GGUF payload (+15% headroom for KV, scratch and bank re-packing) fits the device-local heap. <c>DOTLLM_VK_MOE_RESIDENT</c>
+    /// =1 forces it on, =0 forces it off. Synthetic fixtures (no GGUF) keep the transient path.
+    /// </summary>
+    private static bool ResolveResidentMoe(VulkanDevice device, GgufFile? gguf)
+    {
+        string? env = Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_RESIDENT");
+        if (env == "1") return true;
+        if (env == "0" || gguf is null) return false;
+        return gguf.DataSectionLength * 1.15 < device.DeviceLocalHeapBytes();
+    }
+
     private VulkanQwen3MoeHybridTransformerModel(
         VulkanDevice device, bool ownsDevice,
         ModelConfig config,
@@ -207,8 +221,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
 
         _submit = device.CreateSubmitContext();
 
-        _residentMoeEnabled =
-            string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_RESIDENT"), "1", StringComparison.Ordinal);
+        _residentMoeEnabled = ResolveResidentMoe(device, gguf);
         _residentMoeBundles = new VulkanQwen3MoeMoeUpload.LayerBundle?[cpuLayers.Length];
         // #383/#633: dp4a indexed-matmul MMQ for Q4_K-resident gate/up (+ Q5_K down) banks. Default-on after real-model validation
         // (Qwen3.6-35B-A3B Q4_K_M, Strix Halo: pp128 23 -> 75, tg 13.3 -> 18.1 tok/s, PPL within noise); DOTLLM_VK_MOE_INDEXED_MMQ=0 opts out.
