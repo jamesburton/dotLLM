@@ -1418,6 +1418,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         // intermediate, a different activation buffer) isn't covered by this pass
         // — it stays on its own resolved-bank kernel (Q5_K for the cached
         // UD-Q4_K_XL checkpoint, no MMQ variant wired for that bank yet).
+        bool decodeMmvq = seqLen < GroupedMinTokens;
         bool useGateUpMmq = _moeIndexedMmqEnabled
             && _kernels.MoeIndexedMatmulQ4KMmq is not null
             && moeW.W1QuantType == QuantizationType.Q4_K
@@ -1429,6 +1430,21 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 _state.MoeExpandedInput, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
                 n: expandedRows, k: hidden);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            // Decode-sized batches: the coalesced subgroup-per-cell MMVQ GEMV instead of the one-thread-per-cell MMQ.
+            var gateUpMmvq = decodeMmvq ? _kernels.MoeMmvqQ4K : null;
+            if (gateUpMmvq is not null)
+            {
+                gateUpMmvq.Record(cmdBuf,
+                    moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                    _state.MoeTopkIndices, _state.MoeGateInter,
+                    m: interm, k: hidden, n: expandedRows, numExperts: numE);
+                gateUpMmvq.Record(cmdBuf,
+                    moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                    _state.MoeTopkIndices, _state.MoeUpInter,
+                    m: interm, k: hidden, n: expandedRows, numExperts: numE);
+            }
+            else
+            {
             _kernels.MoeIndexedMatmulQ4KMmq!.Record(cmdBuf,
                 moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
                 _state.MoeTopkIndices, _state.MoeGateInter,
@@ -1437,6 +1453,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
                 _state.MoeTopkIndices, _state.MoeUpInter,
                 m: interm, k: hidden, n: expandedRows, numExperts: numE);
+            }
         }
         else
         {
@@ -1457,11 +1474,30 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         // 6. Indexed down matmul. #383 follow-up: same dp4a swap as gate/up, for the
         // Q5_K-resident down bank (K=intermediate, MoeSiluInter as input — a
         // different activation buffer than gate/up's, so its own quantize pass).
+        var downMmvq = decodeMmvq && (interm % 256) == 0 && _kernels.QuantizeQ8_1RowsActivations is not null
+            ? moeW.W2QuantType switch
+            {
+                QuantizationType.Q5_K => _kernels.MoeMmvqQ5K,
+                QuantizationType.Q6_K => _kernels.MoeMmvqQ6K,
+                _ => null,
+            }
+            : null;
         bool useDownMmq = _moeIndexedMmqEnabled
             && _kernels.MoeIndexedMatmulQ5KMmq is not null
             && moeW.W2QuantType == QuantizationType.Q5_K
             && (interm % MoeIndexedMatmulQ5KMmqKernel.Q5_KGroupSize) == 0;
-        if (useDownMmq)
+        if (downMmvq is not null)
+        {
+            _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf,
+                _state.MoeSiluInter, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
+                n: expandedRows, k: interm);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            downMmvq.Record(cmdBuf,
+                moeW.W2Bank, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
+                _state.MoeTopkIndices, _state.MoeDownRows,
+                m: hidden, k: interm, n: expandedRows, numExperts: numE);
+        }
+        else if (useDownMmq)
         {
             _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf,
                 _state.MoeSiluInter, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
