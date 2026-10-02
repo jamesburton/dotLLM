@@ -100,7 +100,12 @@ void main() {
 
     float acc = 0.0;
 
-    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+    // One work item = one (super-block, 16-element sub-block) pair. The old mapping gave a thread a whole
+    // super-block, so a K = 2560 row (10 super-blocks) kept 10 of 128 threads busy.
+    uint workItems = pc.blocksPerRow * 16u;
+    for (uint work = tid; work < workItems; work += threads) {
+        uint b = work >> 4u;
+        uint sub = work & 15u;
         uint blockByteBase = rowByteBase + b * Q2K_BLOCK_BYTES;
         uint scalesBase    = blockByteBase;
         uint qsBase        = blockByteBase + 16u;
@@ -110,7 +115,7 @@ void main() {
         uint xBase = b * Q2K_GROUP_SIZE;
 
         uint qsUintBase = qsBase >> 2u;   // 84-byte block ⇒ word-aligned
-        for (uint sub = 0u; sub < 16u; sub++) {
+        {   // sub-block `sub` of super-block b
             uint scByte = readByte(scalesBase + sub);
             float sc = d * float(scByte & 0xFu);
             float mn = dmin * float((scByte >> 4u) & 0xFu);
