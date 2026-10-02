@@ -33,6 +33,9 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
+    // RowSplit handles d_state == 128 only; any other head size is routed to this lazily-built LdsFused kernel.
+    private string _spvDir = string.Empty;
+    private GdnScanMultiTokenF32Kernel? _fallback;
 
     private GdnScanMultiTokenF32Kernel(
         VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, Variant variant)
@@ -102,6 +105,13 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
 
         /// <summary>Arm 11 at COLS=64 — wave-count-matched, both factors.</summary>
         Lds64Fused,
+
+        /// <summary>
+        /// Row-split: 16 columns x 4 row groups per 64-lane workgroup, state in registers, 4x the lanes, 32-deep reduction chains.
+        /// NOT bit-exact (re-associated sums, ~1e-6 relative); d_state == 128 only (other sizes fall back to <see cref="LdsFused"/>).
+        /// <b>Default</b> since 2026-10-02: Tev1-4B pp512 1443 -> 1818 tok/s, 35B-A3B p512 833 -> 948, scan kernel 3.1-3.7x. <c>DOTLLM_VK_GDN_SCAN_VARIANT=ldsfused</c> opts out.
+        /// </summary>
+        RowSplit,
     }
 
     /// <summary>Lanes per workgroup, and therefore state columns per workgroup, in the LDS arms.</summary>
@@ -127,12 +137,13 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
         {
             "fused" => Variant.Fused,
             "lds" => Variant.Lds,
-            "ldsfused" => Variant.LdsFused,
             "lds64" => Variant.Lds64,
             "lds64fused" => Variant.Lds64Fused,
+            "rs" or "rowsplit" => Variant.RowSplit,
             // Explicit opt-OUT now that LdsFused is the default (see the enum's doc comment).
             "base" or "baseline" => Variant.Baseline,
-            _ => Variant.LdsFused,
+            "ldsfused" => Variant.LdsFused,
+            _ => Variant.RowSplit,
         };
 
     private static string SpvFor(Variant v) => v switch
@@ -142,6 +153,7 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
         Variant.LdsFused => "gdn_scan_multi_token_lds_fused_f32.spv",
         Variant.Lds64 => "gdn_scan_multi_token_lds64_f32.spv",
         Variant.Lds64Fused => "gdn_scan_multi_token_lds64_fused_f32.spv",
+        Variant.RowSplit => "gdn_scan_multi_token_rs_f32.spv",
         _ => "gdn_scan_multi_token_f32.spv",
     };
 
@@ -178,11 +190,15 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 7);
-        return new GdnScanMultiTokenF32Kernel(device, module, pipeline, pool, variant);
+        return new GdnScanMultiTokenF32Kernel(device, module, pipeline, pool, variant) { _spvDir = spvDir };
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
-    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
+    internal void InvalidateDescriptorCache()
+    {
+        _descriptorCache.Reset();
+        _fallback?.InvalidateDescriptorCache();
+    }
 
     /// <summary>Synchronous launch — wraps <see cref="Record"/>; used by unit tests.</summary>
     public void Launch(
@@ -215,6 +231,13 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
         if (nVHead % nKHead != 0)
             throw new ArgumentException(
                 $"nVHead ({nVHead}) must be a multiple of nKHead ({nKHead}).");
+
+        if (_variant == Variant.RowSplit && dState != 128)
+        {
+            (_fallback ??= Create(_device, _spvDir, Variant.LdsFused))
+                .Record(cmdBuf, state, q, k, v, g, beta, output, seqLen, nVHead, nKHead, dState);
+            return;
+        }
 
         int vHeadsPerKHead = nVHead / nKHead;
 
@@ -250,6 +273,7 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
         {
             Variant.Lds or Variant.LdsFused => LdsColsPerGroup,
             Variant.Lds64 or Variant.Lds64Fused => LdsColsPerGroupWave64,
+            Variant.RowSplit => 16,
             _ => 0,
         };
         uint groupsY = cols == 0 ? 1u : (uint)((dState + cols - 1) / cols);
@@ -261,6 +285,7 @@ public sealed class GdnScanMultiTokenF32Kernel : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        _fallback?.Dispose();
         if (_descriptorPool != 0)
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);
         _pipeline.Dispose();
