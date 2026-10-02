@@ -36,6 +36,7 @@ public sealed class TextGenerator
     private readonly bool _mtpEnabled;
     private readonly HybridPrefillDecodeStrategy? _hybridStrategy;
     private readonly int _prefillChunkSize;
+    private readonly MtpAdaptiveGate? _mtpGate;
 
     /// <summary>
     /// Default draft tokens per speculative round (K), for MTP self-speculation and for a
@@ -80,6 +81,9 @@ public sealed class TextGenerator
     /// <param name="prefixTrieManager">Optional cross-request prefix trie manager (Step 37).
     /// Takes precedence over <paramref name="prefixCache"/> when supplied — multiple sessions
     /// share KV blocks via the trie.</param>
+    /// <param name="mtpAdaptive">When true (and <paramref name="mtpEnabled"/>), MTP self-speculation engages only when
+    /// measured faster than plain decode for this model and the request is long enough to benefit (see
+    /// <see cref="MtpAdaptiveGate"/>). Default false: MTP engages whenever enabled and supported, as before.</param>
     /// <param name="prefillChunkSize">Maximum prompt tokens per prefill forward pass (llama.cpp
     /// <c>-ub</c> / micro-batch analog). When &gt; 0 the prompt is prefilled in chunks of at most
     /// this many tokens (bounding peak activation memory per forward); 0 (default) runs the whole
@@ -95,7 +99,8 @@ public sealed class TextGenerator
                           bool mtpEnabled = true,
                           HybridPrefillDecodeStrategy? hybridStrategy = null,
                           PrefixTrieManager? prefixTrieManager = null,
-                          int prefillChunkSize = 0)
+                          int prefillChunkSize = 0,
+                          bool mtpAdaptive = false)
     {
         _model = model;
         _tokenizer = tokenizer;
@@ -108,6 +113,7 @@ public sealed class TextGenerator
         _mtpEnabled = mtpEnabled;
         _hybridStrategy = hybridStrategy;
         _prefillChunkSize = prefillChunkSize;
+        _mtpGate = mtpAdaptive && MtpAdaptiveGate.EnabledByEnvironment ? new MtpAdaptiveGate(model.ComputeMemoryBytes) : null;
 
         if (hybridStrategy is not null
             && !ReferenceEquals(hybridStrategy.DecodeModel, model))
@@ -241,7 +247,8 @@ public sealed class TextGenerator
         // and we have a clean cache (no prefix-cache reuse, no speculative draft model, no MTP).
         // MTP needs the whole sequence absorbed into its head from position 0 (issue #469), so a
         // prefix-cache hit — which skips the cached prefix's forward — runs without it.
-        bool useMtp = ShouldUseMtp(captureLogprobs, options) && cachedTokenCount == 0;
+        bool useMtp = ShouldUseMtp(captureLogprobs, options) && cachedTokenCount == 0
+            && (_mtpGate?.ShouldUseMtp(maxTokens) ?? true);
         bool useHybrid = _hybridStrategy is not null
             && _hybridStrategy.ShouldRunHybrid(promptLen)
             && cachedTokenCount == 0
@@ -695,6 +702,7 @@ public sealed class TextGenerator
                 prefillTicks * 1000.0 / Stopwatch.Frequency,
                 decodeTicks * 1000.0 / Stopwatch.Frequency,
                 finishReason);
+            _mtpGate?.Record(useMtp, generatedIds.Count, decodeTicks * 1000.0 / Stopwatch.Frequency);
             return BuildResponse(promptLen, generatedIds, finishReason,
                 prefillTicks, decodeTicks, samplerTicks, GetKvCacheBytes(kvCache), cachedTokenCount,
                 specDrafted, specAccepted, logprobsList?.ToArray(),
@@ -788,7 +796,8 @@ public sealed class TextGenerator
         // Hybrid mode: same gating as the non-streaming path.
         // MTP needs the whole sequence absorbed into its head from position 0 (issue #469), so a
         // prefix-cache hit — which skips the cached prefix's forward — runs without it.
-        bool useMtp = ShouldUseMtp(captureLogprobs, options) && cachedTokenCount == 0;
+        bool useMtp = ShouldUseMtp(captureLogprobs, options) && cachedTokenCount == 0
+            && (_mtpGate?.ShouldUseMtp(maxTokens) ?? true);
         bool useHybrid = _hybridStrategy is not null
             && _hybridStrategy.ShouldRunHybrid(promptLen)
             && cachedTokenCount == 0
@@ -1234,6 +1243,7 @@ public sealed class TextGenerator
                 prefillTicks * 1000.0 / Stopwatch.Frequency,
                 decodeTicks * 1000.0 / Stopwatch.Frequency,
                 FinishReason.Length);
+            _mtpGate?.Record(useMtp, generatedIds.Count, decodeTicks * 1000.0 / Stopwatch.Frequency);
             ArrayPool<char>.Shared.Return(stopScratch);
             mtpState?.Dispose();
             if (ownsKvCache)
@@ -1450,6 +1460,9 @@ public sealed class TextGenerator
         => _model.CreateMtpState(kvCache.MaxLength)
            ?? throw new InvalidOperationException(
                $"{_model.GetType().Name}.SupportsMtp is true but CreateMtpState() returned null.");
+
+    /// <summary>The adaptive MTP gate, or null when <c>mtpAdaptive</c> was not requested (or disabled by environment).</summary>
+    public MtpAdaptiveGate? MtpGate => _mtpGate;
 
     private bool ShouldUseMtp(bool captureLogprobs, DotLLM.Core.Configuration.InferenceOptions options)
         => _mtpEnabled && _draftModel is null && _model.SupportsMtp
