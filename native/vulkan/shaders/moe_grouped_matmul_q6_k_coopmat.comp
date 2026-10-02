@@ -1,12 +1,12 @@
 #version 450
-// Grouped Q5_K MoE expert matmul via VK_KHR_cooperative_matrix, 16x16 tiles, one SUPER-BLOCK (256 K) per staging round (issue #637).
+// Grouped Q6_K MoE expert matmul via VK_KHR_cooperative_matrix, 16x16 tiles, one SUPER-BLOCK (256 K) per staging round (issue #637).
 //
-//   Y[packedRow, m] = X[packedRow, :] @ W_q5k[expert, m, :]^T      (W dequantised into the F16 A operand on the fly)
+//   Y[packedRow, m] = X[packedRow, :] @ W_q6k[expert, m, :]^T      (W dequantised into the F16 A operand on the fly)
 //
 // Rows are grouped by expert (offsets[expert]..offsets[expert+1]). Dispatch grid = (M tiles, row tiles, experts); row tiles past an expert's
 // count early-out. With ~4-16 rows per expert at serving prompt sizes a 16-row tile is the right shape: each expert's weights are dequantised
 // ONCE per row tile instead of once per routed row (the indexed MMQ kernels re-read them per row).
-// Bank layout: [E, M, K/256 super-blocks of 176 bytes]. Staging a whole super-block per round (not one 32-wide sub-block) cuts the
+// Bank layout: [E, M, K/256 super-blocks of 210 bytes]. Staging a whole super-block per round (not one 32-wide sub-block) cuts the
 // barrier pairs 8x and lets each lane issue its 32-byte code load once for TWO sub-blocks (low / high nibbles of the same bytes).
 // PRECISION: d*scale*code - dmin*min is folded into the F16 A operand (~2^-11), as in the dense K-quant coopmat GEMMs.
 
@@ -18,7 +18,7 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, std430) readonly  buffer BufW       { uint weight[]; };  // [E,M,K/256 x 176 B] Q5_K
+layout(set = 0, binding = 0, std430) readonly  buffer BufW       { uint weight[]; };  // [E,M,K/256 x 210 B] Q6_K
 layout(set = 0, binding = 1, std430) readonly  buffer BufX       { vec4 x4[]; };      // [rows,K] F32 (K % 4 == 0)
 layout(set = 0, binding = 2, std430) readonly  buffer BufOffsets { uint offsets[]; }; // [E+1]
 layout(set = 0, binding = 3, std430) writeonly buffer BufY       { float y[]; };      // [rows,M] F32
@@ -38,26 +38,27 @@ const uint TK = 16u;
 const uint SB = 256u;               // K per staging round (one super-block)
 const uint STRIDE = SB + 8u;        // padded LDS row stride (halves) to spread banks
 const uint WG_SIZE = 64u;
-const uint BLOCK_UINTS = 176u / 4u;
 
 shared float16_t sharedA[TM * STRIDE];
 shared float16_t sharedB[TN * STRIDE];
 shared float storeStage[TM * TN];
 
-void scaleMin(uint s0, uint s1, uint s2, uint subIdx, out float sc, out float mnv) {   // mirrors llama.cpp get_scale_min_k4
-    uint a, b;
-    if (subIdx < 4u) {
-        uint sh = subIdx * 8u;
-        a = (s0 >> sh) & 63u;
-        b = (s1 >> sh) & 63u;
-    } else {
-        uint sh = (subIdx - 4u) * 8u;
-        uint lo = s2 >> sh;
-        a = (lo & 0xFu)         | (((s0 >> sh) >> 6u & 0x3u) << 4u);
-        b = ((lo >> 4u) & 0xFu) | (((s1 >> sh) >> 6u & 0x3u) << 4u);
-    }
-    sc = float(a);
-    mnv = float(b);
+uint readByte(uint absByteOff) {
+    return (weight[absByteOff >> 2u] >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    return unpackHalf2x16(readByte(absByteOff) | (readByte(absByteOff + 1u) << 8)).x;
+}
+
+// 16 bytes at EVEN byte offset `o` as four aligned words (funnel shift; the 5th word is loaded only when the span is 2 bytes into a word).
+void load16(uint o, out uint r[4]) {
+    uint wi = o >> 2u;
+    bool hi = (o & 2u) != 0u;
+    uint w[5];
+    for (uint i = 0u; i < 4u; i++) w[i] = weight[wi + i];
+    w[4] = hi ? weight[wi + 4u] : 0u;
+    for (uint i = 0u; i < 4u; i++) r[i] = hi ? ((w[i] >> 16) | (w[i + 1u] << 16)) : w[i];
 }
 
 void main() {
@@ -79,7 +80,7 @@ void main() {
     uint lane = tid - mLocal * 4u;      // handles sub-blocks 2*lane (low nibbles) and 2*lane+1 (high nibbles)
     uint mGlobal = mBase + mLocal;
     bool rowValid = mGlobal < pc.M;
-    uint rowBase = expert * pc.M * pc.rowUints + mGlobal * pc.rowUints;
+    uint rowByteBase = (expert * pc.M + mGlobal) * (pc.blocksPerRow * 210u);
     uint localRow = localRowBase + mLocal;
     bool bValid = localRow < expertRows;
     uint xRow4 = (expertStart + localRow) * (pc.K / 4u);
@@ -96,36 +97,33 @@ void main() {
             sharedB[o + 3u] = float16_t(f.w);
         }
 
-        // ---- A: dequantise sub-blocks 2*lane and 2*lane+1 of this row's super-block
-        uint aBase = mLocal * STRIDE + (2u * lane) * 32u;
+        // ---- A: dequantise this lane's 64 values (half hf = lane>>1, l = l0 .. l0+15, four 32-wide groups g) of the super-block
+        uint hf = lane >> 1u;
+        uint l0 = (lane & 1u) * 16u;
+        uint aBase = mLocal * STRIDE + hf * 128u + l0;
         if (!rowValid) {
-            for (uint j = 0u; j < 64u; j++) sharedA[aBase + j] = float16_t(0.0);
+            for (uint g = 0u; g < 4u; g++)
+                for (uint j = 0u; j < 16u; j++) sharedA[aBase + g * 32u + j] = float16_t(0.0);
         } else {
-            uint bw = rowBase + sb * BLOCK_UINTS;
-            vec2 dd = unpackHalf2x16(weight[bw]);          // (d, dmin)
-            uint s0 = weight[bw + 1u];
-            uint s1 = weight[bw + 2u];
-            uint s2 = weight[bw + 3u];
-            float scA, mnA, scB, mnB;
-            scaleMin(s0, s1, s2, 2u * lane, scA, mnA);
-            scaleMin(s0, s1, s2, 2u * lane + 1u, scB, mnB);
-            float sclA = dd.x * scA, mnLo = dd.y * mnA;
-            float sclB = dd.x * scB, mnHi = dd.y * mnB;
-
-            uint qw = bw + 12u + lane * 8u;
-            uint hw = bw + 4u;
-            for (uint i = 0u; i < 8u; i++) {
-                uint w = weight[qw + i];
-                uint h = weight[hw + i];
-                for (uint jb = 0u; jb < 4u; jb++) {
-                    uint byt = (w >> (jb * 8u)) & 0xFFu;
-                    uint cLo = byt & 0xFu;
-                    uint cHi = byt >> 4u;
-                    cLo |= ((h >> (jb * 8u + 2u * lane)) & 1u) << 4u;
-                    cHi |= ((h >> (jb * 8u + 2u * lane + 1u)) & 1u) << 4u;
-                    uint col = i * 4u + jb;
-                    sharedA[aBase + col]       = float16_t(sclA * float(cLo) - mnLo);
-                    sharedA[aBase + 32u + col] = float16_t(sclB * float(cHi) - mnHi);
+            uint blockBase = rowByteBase + sb * 210u;
+            float d = readHalf(blockBase + 208u);
+            uint qlw0[4], qlw1[4], qhw[4];
+            load16(blockBase + 64u * hf + l0, qlw0);
+            load16(blockBase + 64u * hf + 32u + l0, qlw1);
+            load16(blockBase + 128u + 32u * hf + l0, qhw);
+            for (uint g = 0u; g < 4u; g++) {
+                uint sbyte = readByte(blockBase + 192u + 8u * hf + (l0 >> 4u) + 2u * g);
+                float scale = d * float(int(sbyte ^ 0x80u) - 128);
+                uint nibShift = (g >> 1u) * 4u;
+                uint qhShift = 2u * g;
+                for (uint i = 0u; i < 4u; i++) {
+                    uint lw = ((g & 1u) == 0u ? qlw0[i] : qlw1[i]) >> nibShift;
+                    uint hw = qhw[i] >> qhShift;
+                    for (uint jb = 0u; jb < 4u; jb++) {
+                        uint lo = (lw >> (jb * 8u)) & 0xFu;
+                        uint h2 = (hw >> (jb * 8u)) & 3u;
+                        sharedA[aBase + g * 32u + i * 4u + jb] = float16_t(scale * float(int(lo | (h2 << 4u)) - 32));
+                    }
                 }
             }
         }

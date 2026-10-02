@@ -5,7 +5,7 @@ using Xunit;
 namespace DotLLM.Tests.Unit.Vulkan;
 
 /// <summary>
-/// Issue #637: parity of the grouped Q4_K / Q5_K MoE coopmat kernels against a CPU GEMM over the same packed bytes. Ragged expert counts
+/// Issue #637: parity of the grouped Q4_K / Q5_K / Q6_K MoE coopmat kernels against a CPU GEMM over the same packed bytes. Ragged expert counts
 /// (empty, smaller and larger than the 16-row tile) are the point: the row bound and the per-expert weight slab are what can go wrong.
 /// </summary>
 public sealed class VulkanMoeGroupedMatmulKQuantCoopmatTests
@@ -15,6 +15,8 @@ public sealed class VulkanMoeGroupedMatmulKQuantCoopmatTests
     [InlineData(MoeGroupedKQuant.Q4_K, 33, 512, "5,7,1,0,20")]
     [InlineData(MoeGroupedKQuant.Q5_K, 48, 256, "3,0,17,40")]
     [InlineData(MoeGroupedKQuant.Q5_K, 64, 768, "16,15,17,1")]
+    [InlineData(MoeGroupedKQuant.Q6_K, 48, 256, "3,0,17,40")]
+    [InlineData(MoeGroupedKQuant.Q6_K, 64, 512, "16,15,17,1,0,9")]
     public void MatchesCpuReference(MoeGroupedKQuant quant, int m, int k, string counts)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -33,7 +35,12 @@ public sealed class VulkanMoeGroupedMatmulKQuantCoopmatTests
         for (int e = 0; e < numExperts; e++)
         {
             float[] w = Q4KFixture.RandomFloats(rng, m * k, 0.5f);
-            expertBytes[e] = quant == MoeGroupedKQuant.Q4_K ? Q4KFixture.QuantizeRows(w, m, k) : Q5KFixture.QuantizeRows(w, m, k);
+            expertBytes[e] = quant switch
+            {
+                MoeGroupedKQuant.Q4_K => Q4KFixture.QuantizeRows(w, m, k),
+                MoeGroupedKQuant.Q5_K => Q5KFixture.QuantizeRows(w, m, k),
+                _ => Q6KFixture.QuantizeRows(w, m, k),
+            };
         }
         byte[] bank = expertBytes.SelectMany(b => b).ToArray();
         float[] x = Q4KFixture.RandomFloats(rng, rows * k, 1f);
@@ -44,9 +51,12 @@ public sealed class VulkanMoeGroupedMatmulKQuantCoopmatTests
             int n = expertRows[e];
             if (n == 0) continue;
             float[] xe = x.AsSpan((int)offsets[e] * k, n * k).ToArray();
-            float[] ye = quant == MoeGroupedKQuant.Q4_K
-                ? Q4KFixture.CpuGemmQ4K(expertBytes[e], xe, m, k, n)
-                : Q5KFixture.CpuGemmQ5K(expertBytes[e], xe, m, k, n);
+            float[] ye = quant switch
+            {
+                MoeGroupedKQuant.Q4_K => Q4KFixture.CpuGemmQ4K(expertBytes[e], xe, m, k, n),
+                MoeGroupedKQuant.Q5_K => Q5KFixture.CpuGemmQ5K(expertBytes[e], xe, m, k, n),
+                _ => Q6KFixture.CpuGemmQ6K(expertBytes[e], xe, m, k, n),
+            };
             ye.CopyTo(expected, (long)offsets[e] * m);
         }
 

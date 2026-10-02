@@ -31,6 +31,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MoeUngroupScatterF32Kernel? MoeUngroupScatter { get; private set; }
     public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ4K { get; private set; }
     public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ5K { get; private set; }
+    public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ6K { get; private set; }
     public MatMulQ2KGemvF32Kernel MatMulQ2K { get; }
     public MatMulQ2KGemmF32Kernel MatMulQ2KGemm { get; }
     public MatMulQ3KGemvF32Kernel MatMulQ3K { get; }
@@ -414,6 +415,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             kernels.MoeUngroupScatter = MoeUngroupScatterF32Kernel.Create(device, spvDir);
             kernels.MoeGroupedQ4K = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K);
             kernels.MoeGroupedQ5K = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q5_K);
+            if (MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q6_K))
+                kernels.MoeGroupedQ6K = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q6_K);
         }
         return kernels;
     }
@@ -496,11 +499,12 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeUngroupScatter?.InvalidateDescriptorCache();
         MoeGroupedQ4K?.InvalidateDescriptorCache();
         MoeGroupedQ5K?.InvalidateDescriptorCache();
+        MoeGroupedQ6K?.InvalidateDescriptorCache();
     }
 
     public void Dispose()
     {
-        MoeGroupedQ5K?.Dispose(); MoeGroupedQ4K?.Dispose(); MoeUngroupScatter?.Dispose();
+        MoeGroupedQ6K?.Dispose(); MoeGroupedQ5K?.Dispose(); MoeGroupedQ4K?.Dispose(); MoeUngroupScatter?.Dispose();
         MoeExpandGroupByExpert?.Dispose(); MoeExpertOffsets?.Dispose();
         MoeSigmoidGatedAdd.Dispose();
         MoeWeightedScatter.Dispose();

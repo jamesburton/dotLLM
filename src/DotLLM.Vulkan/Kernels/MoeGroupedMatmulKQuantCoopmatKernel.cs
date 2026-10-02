@@ -9,10 +9,12 @@ public enum MoeGroupedKQuant
     Q4_K,
     /// <summary>Q5_K, 176-byte super-blocks.</summary>
     Q5_K,
+    /// <summary>Q6_K, 210-byte super-blocks.</summary>
+    Q6_K,
 }
 
 /// <summary>
-/// Grouped MoE expert projection over PACKED Q4_K / Q5_K expert banks using cooperative matrices (issue #637). Rows are grouped by expert
+/// Grouped MoE expert projection over PACKED Q4_K / Q5_K / Q6_K expert banks using cooperative matrices (issue #637). Rows are grouped by expert
 /// (see <see cref="MoeExpertOffsetsKernel"/> / <see cref="MoeExpandGroupByExpertF32Kernel"/>); each 16-row tile dequantises its expert's weight
 /// sub-blocks into the F16 A operand once, instead of the indexed MMQ kernel re-reading the weights per routed row.
 /// </summary>
@@ -41,8 +43,14 @@ public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
     }
 
-    private static string SpvName(MoeGroupedKQuant q) => q == MoeGroupedKQuant.Q4_K
-        ? "moe_grouped_matmul_q4_k_coopmat.spv" : "moe_grouped_matmul_q5_k_coopmat.spv";
+    private static string SpvName(MoeGroupedKQuant q) => q switch
+    {
+        MoeGroupedKQuant.Q4_K => "moe_grouped_matmul_q4_k_coopmat.spv",
+        MoeGroupedKQuant.Q5_K => "moe_grouped_matmul_q5_k_coopmat.spv",
+        _ => "moe_grouped_matmul_q6_k_coopmat.spv",
+    };
+
+    private static int BlockBytesOf(MoeGroupedKQuant q) => q switch { MoeGroupedKQuant.Q4_K => 144, MoeGroupedKQuant.Q5_K => 176, _ => 210 };
 
     /// <summary>Whether <paramref name="device"/> has cooperative matrices and the SPIR-V is present.</summary>
     public static bool IsSupportedOn(VulkanDevice device, string spvDir, MoeGroupedKQuant quant)
@@ -70,7 +78,7 @@ public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
             throw;
         }
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-        return new MoeGroupedMatmulKQuantCoopmatKernel(device, module, pipeline, pool, quant == MoeGroupedKQuant.Q4_K ? 144 : 176);
+        return new MoeGroupedMatmulKQuantCoopmatKernel(device, module, pipeline, pool, BlockBytesOf(quant));
     }
 
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
