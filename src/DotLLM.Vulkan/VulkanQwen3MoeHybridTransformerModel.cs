@@ -210,12 +210,10 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         _residentMoeEnabled =
             string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_RESIDENT"), "1", StringComparison.Ordinal);
         _residentMoeBundles = new VulkanQwen3MoeMoeUpload.LayerBundle?[cpuLayers.Length];
-        // #383: dp4a indexed-matmul MMQ for Q4_K-resident gate/up banks, opt-in
-        // pending real-model perf validation (same cautious rollout as prior new
-        // MMQ kernels, e.g. #344's gated IQ2_XXS path) -- flip the default once
-        // measured safe/fast on real hardware.
+        // #383/#633: dp4a indexed-matmul MMQ for Q4_K-resident gate/up (+ Q5_K down) banks. Default-on after real-model validation
+        // (Qwen3.6-35B-A3B Q4_K_M, Strix Halo: pp128 23 -> 75, tg 13.3 -> 18.1 tok/s, PPL within noise); DOTLLM_VK_MOE_INDEXED_MMQ=0 opts out.
         _moeIndexedMmqEnabled =
-            string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_INDEXED_MMQ"), "1", StringComparison.Ordinal);
+            !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_INDEXED_MMQ"), "0", StringComparison.Ordinal);   // default-on (#633); =0 opts out
 
         int n = Math.Clamp(nCpuMoeLayers, 0, cpuLayers.Length);
         NCpuMoeLayers = n;
