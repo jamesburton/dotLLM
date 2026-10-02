@@ -1551,11 +1551,14 @@ public sealed class TextGenerator
             : promptIds.AsSpan().CommonPrefixLength(_recurrentPrefixLastPrompt);
         _recurrentPrefixLastPrompt = promptIds;
 
-        bool snapshot = shared >= RecurrentPrefixMinTokens && shared < promptLen;
+        // Leave at least one suffix token to run (it produces the logits), so an exact repeat of the previous prompt
+        // snapshots one token short of its end.
+        int boundary = Math.Min(shared, promptLen - 1);
+        bool snapshot = boundary >= RecurrentPrefixMinTokens;
         int cacheSize = Math.Min(_model.Config.MaxSequenceLength, needed + (snapshot ? RecurrentPrefixKvHeadroom : 0));
         var kv = AllocateKvCache(cacheSize);
         if (snapshot)
-            snapshotAt = shared;
+            snapshotAt = boundary;
         return (kv, 0, true);
     }
 
