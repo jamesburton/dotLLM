@@ -1176,13 +1176,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
                 srcOffset: 0, dstOffset: 0, size: (ulong)convStateBytes);
         }
         long convDimBytes = (long)convDim * sizeof(float);
-        for (int t = 0; t < seqLen; t++)
-        {
-            ulong srcOff = (ulong)((long)t * convDimBytes);
-            ulong dstOff = (ulong)(((long)(dConv - 1) + t) * convDimBytes);
-            RecordCopyBufferRange(cmdBuf, _state.GdnQkvBuf, _state.GdnConvInput,
-                srcOffset: srcOff, dstOffset: dstOff, size: (ulong)convDimBytes);
-        }
+        // The qkv rows are contiguous in both buffers, so the whole [seqLen, convDim] block is one copy (was seqLen copies).
+        RecordCopyBufferRange(cmdBuf, _state.GdnQkvBuf, _state.GdnConvInput,
+            srcOffset: 0, dstOffset: (ulong)((long)(dConv - 1) * convDimBytes), size: (ulong)((long)seqLen * convDimBytes));
         KernelSupport.TransferToComputeBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.CopyFanout);
         ProfNote("copy_gdn_conv_input", m: convDim, k: dConv, n: seqLen);
@@ -1216,6 +1212,13 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
 
         // ── 4. De-interleave Q/K/V and L2-normalise Q and K ──────────────────
         // GdnQkvBuf layout per token: [Q(kDim) | K(kDim) | V(vDim)]
+        if (_kernels.GdnQkvSplit is { } qkvSplit)
+        {
+            qkvSplit.RecordGdnQkvSplit(cmdBuf, _state.GdnQkvBuf, _state.GdnQBuf, _state.GdnKBuf, _state.GdnVBuf, seqLen, kDim, vDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+        else
+        {
         KernelSupport.ComputeToTransferBarrier(cmdBuf);
         long kDimBytes = (long)kDim * sizeof(float);
         long vDimBytes = (long)vDim * sizeof(float);
@@ -1230,6 +1233,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
                 srcOffset: rowBase + (ulong)(2 * kDimBytes), dstOffset: (ulong)((long)t * vDimBytes), size: (ulong)vDimBytes);
         }
         KernelSupport.TransferToComputeBarrier(cmdBuf);
+        }
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.CopyFanout);
         ProfNote("copy_gdn_qkv_split", m: kDim, k: vDim, n: seqLen);
 
@@ -1323,6 +1327,13 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
 
         // 2. De-interleave per head into Q and Gate scratch buffers.
         //    Per token row: [Q_h0, Gate_h0, Q_h1, Gate_h1, ...] each headDim wide.
+        if (_kernels.QGateDeinterleave is { } qgSplit)
+        {
+            qgSplit.RecordQGateDeinterleave(cmdBuf, _state.QGateScratch, _state.Q, _state.GateScratch, seqLen, numHeads, headDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+        else
+        {
         KernelSupport.ComputeToTransferBarrier(cmdBuf);
         long headBytes = (long)headDim * sizeof(float);
         long qRowBytes = (long)qElems * sizeof(float);
@@ -1342,6 +1353,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             }
         }
         KernelSupport.TransferToComputeBarrier(cmdBuf);
+        }
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.CopyFanout);
         ProfNote("copy_qgate_deinterleave", m: numHeads, k: headDim, n: seqLen);
 
