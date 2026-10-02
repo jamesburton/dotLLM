@@ -1596,10 +1596,10 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // Shared expert gate/up matmuls share the input.
-        RecordMatmul(cmdBuf, moeW.SharedGate!, QuantizationType.F32,
+        RecordMatmul(cmdBuf, moeW.SharedGate!, moeW.SharedQuantType,
             _state.MoeSharedInput, _state.MoeSharedGate,
             outputDim: sharedI, inputDim: hidden, seqLen: seqLen);
-        RecordMatmul(cmdBuf, moeW.SharedUp!, QuantizationType.F32,
+        RecordMatmul(cmdBuf, moeW.SharedUp!, moeW.SharedQuantType,
             _state.MoeSharedInput, _state.MoeSharedUp,
             outputDim: sharedI, inputDim: hidden, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -1608,7 +1608,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             n: sharedInterElems);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        RecordMatmul(cmdBuf, moeW.SharedDown!, QuantizationType.F32,
+        RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType,
             _state.MoeSharedSilu, _state.MoeSharedSumA,
             outputDim: hidden, inputDim: sharedI, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
