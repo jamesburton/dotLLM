@@ -823,12 +823,14 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         var gdnStateBuf = gdnCache.GetGdnStateBuffer(gdnOrdinal);
 
         // ── 1. Projections ───────────────────────────────────────────────────
+        bool gdnXq = seqLen == 1 && gdnW.QkvDeviceQuantType == QuantizationType.Q8_0 && gdnW.GateDeviceQuantType == QuantizationType.Q8_0
+            && gdnW.QkvInputDim == gdnW.GateInputDim && TryPrepareQ8Activations(cmdBuf, _state.NormOutput, gdnW.QkvInputDim);
         RecordMatmul(cmdBuf, gdnW.QkvWeight, gdnW.QkvDeviceQuantType,
             _state.NormOutput, _state.GdnQkvBuf,
-            outputDim: gdnW.QkvOutputDim, inputDim: gdnW.QkvInputDim, seqLen: seqLen);
+            outputDim: gdnW.QkvOutputDim, inputDim: gdnW.QkvInputDim, seqLen: seqLen, xqReady: gdnXq);
         RecordMatmul(cmdBuf, gdnW.GateWeight, gdnW.GateDeviceQuantType,
             _state.NormOutput, _state.GdnZBuf,
-            outputDim: gdnW.GateOutputDim, inputDim: gdnW.GateInputDim, seqLen: seqLen);
+            outputDim: gdnW.GateOutputDim, inputDim: gdnW.GateInputDim, seqLen: seqLen, xqReady: gdnXq);
         RecordMatmul(cmdBuf, gdnW.AlphaWeight, gdnW.AlphaDeviceQuantType,
             _state.NormOutput, _state.GdnAlphaBuf,
             outputDim: gdnW.AlphaOutputDim, inputDim: gdnW.AlphaInputDim, seqLen: seqLen);
@@ -952,9 +954,12 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         int kvStride = numKvHeads * headDim;
 
         // 1. Fused Q+Gate projection.
+        bool attnXq = seqLen == 1 && attnW.QDeviceQuantType == QuantizationType.Q8_0 && attnW.KDeviceQuantType == QuantizationType.Q8_0
+            && attnW.VDeviceQuantType == QuantizationType.Q8_0 && attnW.QInputDim == attnW.KInputDim && attnW.QInputDim == attnW.VInputDim
+            && TryPrepareQ8Activations(cmdBuf, _state.NormOutput, attnW.QInputDim);
         RecordMatmul(cmdBuf, attnW.QWeight, attnW.QDeviceQuantType,
             _state.NormOutput, _state.QGateScratch,
-            outputDim: attnW.QOutputDim, inputDim: attnW.QInputDim, seqLen: seqLen);
+            outputDim: attnW.QOutputDim, inputDim: attnW.QInputDim, seqLen: seqLen, xqReady: attnXq);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 2. De-interleave per head into Q and Gate scratch buffers.
@@ -982,10 +987,10 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         // 3. K and V projections.
         RecordMatmul(cmdBuf, attnW.KWeight, attnW.KDeviceQuantType,
             _state.NormOutput, _state.K,
-            outputDim: attnW.KOutputDim, inputDim: attnW.KInputDim, seqLen: seqLen);
+            outputDim: attnW.KOutputDim, inputDim: attnW.KInputDim, seqLen: seqLen, xqReady: attnXq);
         RecordMatmul(cmdBuf, attnW.VWeight, attnW.VDeviceQuantType,
             _state.NormOutput, _state.V,
-            outputDim: attnW.VOutputDim, inputDim: attnW.VInputDim, seqLen: seqLen);
+            outputDim: attnW.VOutputDim, inputDim: attnW.VInputDim, seqLen: seqLen, xqReady: attnXq);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 4. QK-norm — per-head RMSNorm with attn_q_norm / attn_k_norm weights.
@@ -1654,11 +1659,26 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         return IqF16PrefillMatmul.TryCreate(device, spvDir, kernels.MatMulF16GemmCoopmat, 4L * hidden * hidden);
     }
 
+    /// <summary>
+    /// Quantizes the single decode row <paramref name="input"/> to Q8_1 into the MoE expanded-input scratch (idle outside the routed
+    /// gate/up section) so the dp4a Q8_0 MMVQ GEMV can read it; one quantize serves every Q8_0 projection that shares the input
+    /// (pass <c>xqReady</c> to <see cref="RecordMatmul"/>). False when the kernels are unavailable or the row does not fit the scratch.
+    /// </summary>
+    private bool TryPrepareQ8Activations(nint cmdBuf, VulkanDevice.Buffer input, int k)
+    {
+        if (_kernels.MatMulQ8Mmvq is null || _kernels.QuantizeQ8_1RowsActivations is null || (k & 31) != 0) return false;
+        if (QuantizeQ8_1RowsKernel.PackedBytes(1, k) > _state.MoeExpandedInputXq.Size
+            || QuantizeQ8_1RowsKernel.ScaleBytes(1, k) > _state.MoeExpandedInputXds.Size) return false;
+        _kernels.QuantizeQ8_1RowsActivations.Record(cmdBuf, input, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, n: 1, k: k);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        return true;
+    }
+
     private void RecordMatmul(
         nint cmdBuf,
         VulkanDevice.Buffer weights, QuantizationType weightQt,
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
-        int outputDim, int inputDim, int seqLen)
+        int outputDim, int inputDim, int seqLen, bool xqReady = false)
     {
         // IQ1/IQ2/IQ3 prefill: dequant to F16 scratch + coopmat GEMM instead of the scalar tiled GEMM (#621).
         if (seqLen > 1 && _iqF16Prefill is not null
@@ -1668,7 +1688,9 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         switch (weightQt)
         {
             case QuantizationType.Q8_0:
-                if (seqLen == 1)
+                if (seqLen == 1 && _kernels.MatMulQ8Mmvq is not null && (xqReady || TryPrepareQ8Activations(cmdBuf, input, inputDim)))
+                    _kernels.MatMulQ8Mmvq.Record(cmdBuf, weights, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, output, m: outputDim, k: inputDim);
+                else if (seqLen == 1)
                     _kernels.MatMulQ8.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 else if (_kernels.MatMulQ8GemmCoopmat is not null)
                     _kernels.MatMulQ8GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
