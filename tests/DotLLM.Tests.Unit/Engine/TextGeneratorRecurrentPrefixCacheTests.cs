@@ -52,6 +52,7 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
             var got = cached.Generate(prompt, Opts);
 
             Assert.Equal(want.GeneratedTokenIds, got.GeneratedTokenIds);
+            Assert.Empty(model.KvLengthMismatches);
 
             int prefilled = model.Calls[0];
             if (i >= 2)
@@ -149,6 +150,9 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         /// <summary>Token count of every Forward call, in order.</summary>
         public List<int> Calls { get; } = [];
 
+        /// <summary>Forwards whose KV cache length differed from their first position (a stale or un-rolled-back KV).</summary>
+        public List<string> KvLengthMismatches { get; } = [];
+
         public ModelConfig Config => new()
         {
             VocabSize = Vocab, NumLayers = 1, NumAttentionHeads = NumKvHeads, NumKvHeads = NumKvHeads,
@@ -176,6 +180,8 @@ public sealed class TextGeneratorRecurrentPrefixCacheTests
         {
             int seqLen = tokenIds.Length;
             Calls.Add(seqLen);
+            if (kvCache is not null && kvCache.CurrentLength != positions[0])
+                KvLengthMismatches.Add($"kv length {kvCache.CurrentLength} but forward starts at position {positions[0]}");
 
             nint ptr = (nint)NativeMemory.AlignedAlloc((nuint)((long)seqLen * Vocab * sizeof(float)), 64);
             float* dst = (float*)ptr;
