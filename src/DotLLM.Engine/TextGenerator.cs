@@ -468,6 +468,22 @@ public sealed class TextGenerator
             onTokenGenerated?.Invoke(firstTokenId);
             EmitText();
 
+            // A complete constraint that only permits EOS (e.g. a one-letter answer) has nothing left to say:
+            // stop now instead of spending a forward pass to sample the forced EOS (~23 ms on Tev1-4B/Vulkan).
+            if (ConstraintIsTerminal(constraint))
+            {
+                textEmitter.Flush();
+                StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
+                telemetry.Complete(promptLen, cachedTokenCount, generatedIds.Count,
+                    prefillTicks * 1000.0 / Stopwatch.Frequency,
+                    decodeTicks * 1000.0 / Stopwatch.Frequency,
+                    FinishReason.Stop);
+                return BuildResponse(promptLen, generatedIds, FinishReason.Stop,
+                    prefillTicks, decodeTicks, samplerTicks, GetKvCacheBytes(kvCache), cachedTokenCount,
+                    logprobs: logprobsList?.ToArray(),
+                    stopConditionsForSuffixTrim: stopConditions);
+            }
+
             int specDrafted = 0, specAccepted = 0;
 
             // Decode loop (speculative decode disabled when logprobs requested — no per-position logit access;
@@ -689,6 +705,12 @@ public sealed class TextGenerator
 
                     onTokenGenerated?.Invoke(nextTokenId);
                     EmitText();
+
+                    if (ConstraintIsTerminal(constraint))
+                    {
+                        finishReason = FinishReason.Stop;
+                        break;
+                    }
                 }
             }
 
@@ -1463,6 +1485,27 @@ public sealed class TextGenerator
 
     /// <summary>The adaptive MTP gate, or null when <c>mtpAdaptive</c> was not requested (or disabled by environment).</summary>
     public MtpAdaptiveGate? MtpGate => _mtpGate;
+
+    /// <summary>
+    /// True when <paramref name="constraint"/> is satisfied and permits no token except EOS, i.e. the next forward pass
+    /// could only sample EOS. Cheap (a popcount over the cached mask) and only evaluated once the constraint reports
+    /// completion.
+    /// </summary>
+    private bool ConstraintIsTerminal(DotLLM.Core.Constraints.IDecodingConstraint? constraint)
+    {
+        if (constraint is null || !constraint.IsComplete())
+            return false;
+
+        var mask = constraint.GetAllowedTokens();
+        int allowed = 0;
+        foreach (long word in mask.AsSpan())
+            allowed += System.Numerics.BitOperations.PopCount((ulong)word);
+
+        int eos = _tokenizer.EosTokenId;
+        if (eos >= 0 && eos < _model.Config.VocabSize && mask.IsAllowed(eos))
+            allowed--;
+        return allowed <= 0;
+    }
 
     private bool ShouldUseMtp(bool captureLogprobs, DotLLM.Core.Configuration.InferenceOptions options)
         => _mtpEnabled && _draftModel is null && _model.SupportsMtp
