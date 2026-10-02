@@ -33,6 +33,10 @@ public class VulkanMatMulF32KernelTests
     [InlineData(7, 30, 1)]               // K % 4 != 0 falls back to the per-cell kernel
     [InlineData(128, 64, 8)]             // batched matmul
     [InlineData(576, 576, 4)]            // prefill-ish
+    [InlineData(256, 2048, 512)]         // MoE router at prefill (tiled kernel)
+    [InlineData(37, 45, 33)]             // tiled: tails in M, N and K (K % 16 != 0)
+    [InlineData(32, 16, 32)]             // tiled: exactly one tile
+    [InlineData(65, 17, 2)]              // tiled: N = 2 (second tile row mostly empty)
     public void Launch_MatchesCpuReference(int m, int k, int n)
     {
         SkipIfUnavailable(out string spvDir);
