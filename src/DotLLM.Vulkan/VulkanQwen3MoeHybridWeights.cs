@@ -341,6 +341,14 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
     private static bool KeepQ4K(QuantizationType qt, int k) => qt == QuantizationType.Q4_K && (k % 256) == 0;
     private static bool KeepQ5K(QuantizationType qt, int k) => qt == QuantizationType.Q5_K && (k % 256) == 0;
     private static bool KeepQ6K(QuantizationType qt, int k) => qt == QuantizationType.Q6_K && (k % 256) == 0;
+    // Q2_K / Q3_K / IQ4_XS / IQ1_S / IQ4_NL: the hybrid-dense and MoE-hybrid RecordMatmul dispatch tables have GEMV + GEMM cases for
+    // all of these, but without an entry here the weights were silently widened to F32 at load (IQ4_XS Tev1-4B decoded at 6 tok/s
+    // streaming 17 GB per token instead of ~2.2 GB packed, and needed ~7x the device memory). Issue #627.
+    private static bool KeepQ2K(QuantizationType qt, int k) => qt == QuantizationType.Q2_K && (k % 256) == 0;
+    private static bool KeepQ3K(QuantizationType qt, int k) => qt == QuantizationType.Q3_K && (k % 256) == 0;
+    private static bool KeepIq4Xs(QuantizationType qt, int k) => qt == QuantizationType.IQ4_XS && (k % 256) == 0;
+    private static bool KeepIq1S(QuantizationType qt, int k) => qt == QuantizationType.IQ1_S && (k % 256) == 0;
+    private static bool KeepIq4Nl(QuantizationType qt, int k) => qt == QuantizationType.IQ4_NL && (k % 32) == 0;
     private static bool KeepIq2Xxs(QuantizationType qt, int k) => qt == QuantizationType.IQ2_XXS && (k % 256) == 0;
     private static bool KeepIq2Xs(QuantizationType qt, int k) => qt == QuantizationType.IQ2_XS && (k % 256) == 0;
     private static bool KeepIq2S(QuantizationType qt, int k) => qt == QuantizationType.IQ2_S && (k % 256) == 0;
@@ -359,6 +367,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
 
     private static bool KeepNative(QuantizationType qt, int k)
         => KeepQ8(qt, k) || KeepQ4K(qt, k) || KeepQ5K(qt, k) || KeepQ6K(qt, k)
+        || KeepQ2K(qt, k) || KeepQ3K(qt, k) || KeepIq4Xs(qt, k) || KeepIq1S(qt, k) || KeepIq4Nl(qt, k)
         || KeepIq2Xxs(qt, k) || KeepIq2Xs(qt, k) || KeepIq2S(qt, k)
         || KeepIq3Xxs(qt, k) || KeepIq3S(qt, k)
         || KeepF16(qt, k) || KeepBf16(qt, k) || KeepPQ2_0(qt, k);
@@ -369,6 +378,11 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         if (KeepQ4K(qt, k)) return QuantizationType.Q4_K;
         if (KeepQ5K(qt, k)) return QuantizationType.Q5_K;
         if (KeepQ6K(qt, k)) return QuantizationType.Q6_K;
+        if (KeepQ2K(qt, k)) return QuantizationType.Q2_K;
+        if (KeepQ3K(qt, k)) return QuantizationType.Q3_K;
+        if (KeepIq4Xs(qt, k)) return QuantizationType.IQ4_XS;
+        if (KeepIq1S(qt, k)) return QuantizationType.IQ1_S;
+        if (KeepIq4Nl(qt, k)) return QuantizationType.IQ4_NL;
         if (KeepIq2Xxs(qt, k)) return QuantizationType.IQ2_XXS;
         if (KeepIq2Xs(qt, k)) return QuantizationType.IQ2_XS;
         if (KeepIq2S(qt, k)) return QuantizationType.IQ2_S;
