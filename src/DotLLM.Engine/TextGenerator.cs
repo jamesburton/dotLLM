@@ -38,6 +38,31 @@ public sealed class TextGenerator
     private readonly int _prefillChunkSize;
     private readonly MtpAdaptiveGate? _mtpGate;
 
+    // Single-slot prefix cache for recurrent (GDN/SSM) models: tokens + the KV cache holding them + the recurrent state
+    // checkpointed right after them. See ResolveRecurrentPrefix.
+    private readonly bool _recurrentPrefixEnabled;
+    private RecurrentPrefixEntry? _recurrentPrefix;
+    private int[]? _recurrentPrefixLastPrompt;
+
+    /// <summary>Shortest shared prefix worth snapshotting (tokens).</summary>
+    public const int RecurrentPrefixMinTokens = 16;
+
+    /// <summary>Extra KV positions allocated beyond the request when a prefix snapshot is taken, so a slightly longer later prompt can still reuse it.</summary>
+    private const int RecurrentPrefixKvHeadroom = 256;
+
+    private sealed class RecurrentPrefixEntry(int[] tokens, Core.Attention.IKvCache kv, object? checkpoint)
+    {
+        public readonly int[] Tokens = tokens;
+        public readonly Core.Attention.IKvCache Kv = kv;
+        public readonly object? Checkpoint = checkpoint;
+
+        public void Dispose()
+        {
+            (Checkpoint as IDisposable)?.Dispose();
+            Kv.Dispose();
+        }
+    }
+
     /// <summary>
     /// Default draft tokens per speculative round (K), for MTP self-speculation and for a
     /// separate draft model. Issue #466: Bonsai 2 27B MTP peaks at K=3 on both CPU and Vulkan
@@ -81,6 +106,9 @@ public sealed class TextGenerator
     /// <param name="prefixTrieManager">Optional cross-request prefix trie manager (Step 37).
     /// Takes precedence over <paramref name="prefixCache"/> when supplied — multiple sessions
     /// share KV blocks via the trie.</param>
+    /// <param name="recurrentPrefixCache">When true and the model is recurrent with checkpoint support (Gated DeltaNet hybrids),
+    /// the longest prefix a request shares with the previous one is snapshotted (KV + recurrent state) so later requests that
+    /// start with it prefill only their suffix. Single slot; see <see cref="ClearRecurrentPrefixCache"/>.</param>
     /// <param name="mtpAdaptive">When true (and <paramref name="mtpEnabled"/>), MTP self-speculation engages only when
     /// measured faster than plain decode for this model and the request is long enough to benefit (see
     /// <see cref="MtpAdaptiveGate"/>). Default false: MTP engages whenever enabled and supported, as before.</param>
@@ -100,7 +128,8 @@ public sealed class TextGenerator
                           HybridPrefillDecodeStrategy? hybridStrategy = null,
                           PrefixTrieManager? prefixTrieManager = null,
                           int prefillChunkSize = 0,
-                          bool mtpAdaptive = false)
+                          bool mtpAdaptive = false,
+                          bool recurrentPrefixCache = false)
     {
         _model = model;
         _tokenizer = tokenizer;
@@ -113,6 +142,8 @@ public sealed class TextGenerator
         _mtpEnabled = mtpEnabled;
         _hybridStrategy = hybridStrategy;
         _prefillChunkSize = prefillChunkSize;
+        _recurrentPrefixEnabled = recurrentPrefixCache && draftModel is null
+            && model.RequiresPerSequenceState && model.SupportsRecurrentStateCheckpoint;
         _mtpGate = mtpAdaptive && MtpAdaptiveGate.EnabledByEnvironment ? new MtpAdaptiveGate(model.ComputeMemoryBytes) : null;
 
         if (hybridStrategy is not null
@@ -241,7 +272,7 @@ public sealed class TextGenerator
         }
 
         // Resolve KV-cache: reuse from prefix cache or allocate fresh
-        var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens);
+        var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens, out int snapshotAt);
 
         // Hybrid mode is enabled when a strategy is wired up, the prompt is short enough,
         // and we have a clean cache (no prefix-cache reuse, no speculative draft model, no MTP).
@@ -371,7 +402,8 @@ public sealed class TextGenerator
                 {
                     // Prefill suffix tokens — chunked when a prefill chunk size is configured
                     // (llama.cpp -ub analog); otherwise a single forward pass, as before.
-                    using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter, mtpState))
+                    using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter, mtpState,
+                        snapshotAt, () => { TakeRecurrentSnapshot(promptIds, snapshotAt, kvCache); ownsKvCache = false; }))
                     {
                         long ts1 = Stopwatch.GetTimestamp();
                         prefillTicks = ts1 - ts0;
@@ -812,7 +844,7 @@ public sealed class TextGenerator
         }
 
         // Resolve KV-cache: reuse from prefix cache or allocate fresh
-        var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens);
+        var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens, out int snapshotAt);
         long kvBytes = GetKvCacheBytes(kvCache);
 
         // Hybrid mode: same gating as the non-streaming path.
@@ -896,7 +928,8 @@ public sealed class TextGenerator
                 {
                     // Prefill suffix tokens — chunked when a prefill chunk size is configured
                     // (llama.cpp -ub analog); otherwise a single forward pass, as before.
-                    using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter, mtpState))
+                    using (ITensor prefillLogits = ForwardPrefill(promptIds, prefillStart, prefillLen, kvCache, adapter, mtpState,
+                        snapshotAt, () => { TakeRecurrentSnapshot(promptIds, snapshotAt, kvCache); ownsKvCache = false; }))
                     {
                         long ts1 = Stopwatch.GetTimestamp();
                         prefillTicks = ts1 - ts0;
@@ -1297,8 +1330,9 @@ public sealed class TextGenerator
     /// Returns the cache, number of cached tokens, and whether the caller owns (should dispose) the cache.
     /// </summary>
     private (Core.Attention.IKvCache KvCache, int CachedTokenCount, bool OwnsKvCache) ResolveKvCache(
-        int[] promptIds, int promptLen, int maxTokens)
+        int[] promptIds, int promptLen, int maxTokens, out int snapshotAt)
     {
+        snapshotAt = -1;
         // A recurrent (Gated DeltaNet / SSM) model carries per-sequence state that has no position
         // addressing: reusing only the KV half of a cached prefix would leave that state at the END of
         // the previous request. So recurrent models never take a KV-only prefix hit, and every
@@ -1307,7 +1341,11 @@ public sealed class TextGenerator
         // scored logprob -0.111 alone and -0.234 after an unrelated request).
         bool recurrent = _model.RequiresPerSequenceState;
         if (recurrent)
+        {
+            if (_recurrentPrefixEnabled)
+                return ResolveRecurrentPrefix(promptIds, promptLen, maxTokens, out snapshotAt);
             _model.ResetSequenceState();
+        }
 
         // Cross-request prefix trie (Step 37) takes priority — multiple sessions share blocks.
         if (_prefixTrieManager != null && !recurrent)
@@ -1483,6 +1521,61 @@ public sealed class TextGenerator
            ?? throw new InvalidOperationException(
                $"{_model.GetType().Name}.SupportsMtp is true but CreateMtpState() returned null.");
 
+    /// <summary>
+    /// Recurrent-model prefix reuse. HIT: the new prompt starts with the snapshotted prefix, so restore the recurrent
+    /// state, roll the KV back to the prefix and prefill only the suffix. MISS: reset, allocate a KV with headroom, and
+    /// (when the prompt shares at least <see cref="RecurrentPrefixMinTokens"/> tokens with the previous one) ask the
+    /// prefill to snapshot at that boundary. The shared prefix of two consecutive requests is, for a classifier, the
+    /// fixed system prompt, so the cost is one extra checkpoint and the saving is that prefix's prefill on every later request.
+    /// </summary>
+    private (Core.Attention.IKvCache KvCache, int CachedTokenCount, bool OwnsKvCache) ResolveRecurrentPrefix(
+        int[] promptIds, int promptLen, int maxTokens, out int snapshotAt)
+    {
+        snapshotAt = -1;
+        int needed = promptLen + maxTokens;
+        var entry = _recurrentPrefix;
+        if (entry is not null
+            && promptLen > entry.Tokens.Length                      // at least one suffix token must run to produce logits
+            && entry.Kv.MaxLength >= needed
+            && promptIds.AsSpan(0, entry.Tokens.Length).SequenceEqual(entry.Tokens))
+        {
+            entry.Kv.Rollback(entry.Tokens.Length);
+            _model.RestoreRecurrentState(entry.Checkpoint);
+            _recurrentPrefixLastPrompt = promptIds;
+            return (entry.Kv, entry.Tokens.Length, false);
+        }
+
+        _model.ResetSequenceState();
+        int shared = _recurrentPrefixLastPrompt is null
+            ? 0
+            : promptIds.AsSpan().CommonPrefixLength(_recurrentPrefixLastPrompt);
+        _recurrentPrefixLastPrompt = promptIds;
+
+        bool snapshot = shared >= RecurrentPrefixMinTokens && shared < promptLen;
+        int cacheSize = Math.Min(_model.Config.MaxSequenceLength, needed + (snapshot ? RecurrentPrefixKvHeadroom : 0));
+        var kv = AllocateKvCache(cacheSize);
+        if (snapshot)
+            snapshotAt = shared;
+        return (kv, 0, true);
+    }
+
+    private void TakeRecurrentSnapshot(int[] promptIds, int boundary, Core.Attention.IKvCache kvCache)
+    {
+        object? checkpoint = _model.CheckpointRecurrentState();
+        var old = _recurrentPrefix;
+        _recurrentPrefix = new RecurrentPrefixEntry(promptIds.AsSpan(0, boundary).ToArray(), kvCache, checkpoint);
+        old?.Dispose();
+    }
+
+    /// <summary>Releases the recurrent prefix snapshot (its KV cache and state checkpoint). Call when the model is unloaded.</summary>
+    public void ClearRecurrentPrefixCache()
+    {
+        var entry = _recurrentPrefix;
+        _recurrentPrefix = null;
+        _recurrentPrefixLastPrompt = null;
+        entry?.Dispose();
+    }
+
     /// <summary>The adaptive MTP gate, or null when <c>mtpAdaptive</c> was not requested (or disabled by environment).</summary>
     public MtpAdaptiveGate? MtpGate => _mtpGate;
 
@@ -1523,7 +1616,8 @@ public sealed class TextGenerator
     /// by shape and never assume one row per input token.
     /// </summary>
     private ITensor ForwardPrefill(int[] promptIds, int prefillStart, int prefillLen,
-        Core.Attention.IKvCache kvCache, ILoraAdapter? adapter, DotLLM.Core.Models.IMtpState? mtpState = null)
+        Core.Attention.IKvCache kvCache, ILoraAdapter? adapter, DotLLM.Core.Models.IMtpState? mtpState = null,
+        int snapshotAt = -1, Action? onSnapshotPoint = null)
     {
         int chunkSize = _prefillChunkSize > 0 ? Math.Min(_prefillChunkSize, prefillLen) : prefillLen;
         int[] positionsArray = ArrayPool<int>.Shared.Rent(chunkSize);
@@ -1534,6 +1628,10 @@ public sealed class TextGenerator
             while (offset < prefillLen)
             {
                 int len = Math.Min(chunkSize, prefillLen - offset);
+                // A recurrent-prefix snapshot needs a forward boundary exactly at snapshotAt.
+                int absolute = prefillStart + offset;
+                if (snapshotAt > absolute && snapshotAt < prefillStart + prefillLen)
+                    len = Math.Min(len, snapshotAt - absolute);
                 Span<int> positions = positionsArray.AsSpan(0, len);
                 for (int i = 0; i < len; i++)
                     positions[i] = prefillStart + offset + i;
@@ -1547,6 +1645,8 @@ public sealed class TextGenerator
                 logits = _model.Forward(promptIds.AsSpan(prefillStart + offset, len), positions,
                     deviceId: -1, kvCache, adapter, mtpState, lastTokenLogitsOnly: true);
                 offset += len;
+                if (onSnapshotPoint is not null && prefillStart + offset == snapshotAt)
+                    onSnapshotPoint();
             }
             return logits!;
         }

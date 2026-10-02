@@ -706,6 +706,7 @@ public sealed class ServerState : IDisposable
     /// lazily reload it. Used by the idle-unload sweep (#369).</summary>
     private void DisposeActiveLiveFieldsKeepPathAndOptions()
     {
+        Generator?.ClearRecurrentPrefixCache();   // releases the snapshot's KV cache + state checkpoint
         PrefixCache?.Dispose();
         PrefixTrieManager?.Dispose();
         PagedFactory?.Dispose();

@@ -235,4 +235,43 @@ public sealed class VulkanTev1RequestLatencyProbe
             }
         }
     }
+
+    /// <summary>Recurrent prefix cache on vs off: identical logprobs, and what the reuse saves.</summary>
+    [SkippableFact]
+    public void Tev1_4B_RecurrentPrefixCache_MatchesAndSaves()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_TEV1_LATENCY_PROBE") == "1", "opt-in probe");
+        string? path = FindGguf();
+        Skip.If(path is null, "Tev1-4B GGUF not found.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        var (model, kvFactory) = VulkanModelLoader.CreateFromGguf(device, gguf, config, spvDir);
+        using var _ = model as IDisposable;
+
+        var plain = new TextGenerator(model, tokenizer, (cfg, size) => kvFactory(size), mtpEnabled: false);
+        var cached = new TextGenerator(model, tokenizer, (cfg, size) => kvFactory(size), mtpEnabled: false, recurrentPrefixCache: true);
+        var opts = new InferenceOptions { Temperature = 0, MaxTokens = 8, Logprobs = true };
+
+        int[] days = [12, 45, 3, 90, 12, 45, 7, 60, 12, 100];
+        for (int i = 0; i < days.Length; i++)
+        {
+            var sw = Stopwatch.StartNew();
+            var want = plain.Generate(Prompt(days[i]), opts);
+            double plainMs = sw.Elapsed.TotalMilliseconds;
+            sw.Restart();
+            var got = cached.Generate(Prompt(days[i]), opts);
+            double cachedMs = sw.Elapsed.TotalMilliseconds;
+
+            float wantLp = want.Logprobs![0].Logprob, gotLp = got.Logprobs![0].Logprob;
+            _out.WriteLine($"req{i} days={days[i],3}: plain {plainMs,6:F1} ms  cached {cachedMs,6:F1} ms  cachedTokens={got.Timings.CachedTokenCount,3} " +
+                $"prefill={got.Timings.PrefillTimeMs,6:F1}  lp plain={wantLp:F5} cached={gotLp:F5}  text '{want.Text}'/'{got.Text}'");
+            Assert.Equal(want.GeneratedTokenIds, got.GeneratedTokenIds);
+            Assert.True(Math.Abs(wantLp - gotLp) < 2e-3f, $"req{i}: logprob {gotLp} vs {wantLp}");
+        }
+        cached.ClearRecurrentPrefixCache();
+    }
 }

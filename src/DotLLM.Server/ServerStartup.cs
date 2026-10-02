@@ -325,7 +325,7 @@ public static class ServerStartup
 
         var generator = new TextGenerator(model, tokenizer, kvFactory, prefixCache,
             draftModel: draftModel, speculativeCandidates: options.SpeculativeCandidates,
-            mtpEnabled: options.MtpEnabled, mtpAdaptive: true,
+            mtpEnabled: options.MtpEnabled, mtpAdaptive: true, recurrentPrefixCache: true,
             prefixTrieManager: prefixTrieManager,
             prefillChunkSize: options.PrefillChunkSize);
         if (options.PrefillChunkSize > 0)
