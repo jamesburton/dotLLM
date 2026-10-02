@@ -323,6 +323,11 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         // the model reports SupportsRecurrentRowSnapshots=false and MTP keeps checkpoint + replay.
         if (gdnOrdinal > 0 && gdn.DState <= 128 && GdnScanMultiTokenSnapshotF32Kernel.IsAvailable(spvDir))
             model._gdnSnapScan = GdnScanMultiTokenSnapshotF32Kernel.Create(device, spvDir);
+        {
+            long hidden = config.HiddenSize;
+            long maxLayerElements = Math.Max((long)config.IntermediateSize * hidden, 4L * hidden * hidden);
+            model._iqF16Prefill = IqF16PrefillMatmul.TryCreate(device, spvDir, kernels.MatMulF16GemmCoopmat, maxLayerElements);
+        }
         return model;
     }
 
@@ -470,6 +475,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             _hadamard?.InvalidateDescriptorCache();
             _embedGather?.InvalidateDescriptorCache();
             _gdnSnapScan?.InvalidateDescriptorCache();
+            _iqF16Prefill?.InvalidateDescriptorCache();
         }
 
         var logitsBuf = headRows == 1 ? SingleRowLogits : EnsureMultiRowLogits(headRows, vocabSize);
@@ -1518,6 +1524,9 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     // ── Per-row recurrent snapshots (issue #473) ─────────────────────────────
 
     private GdnScanMultiTokenSnapshotF32Kernel? _gdnSnapScan;
+
+    /// <summary>IQ1/IQ2/IQ3 prefill: dequantise to F16 scratch + F16 coopmat GEMM (#621). Null when disabled or unsupported.</summary>
+    private IqF16PrefillMatmul? _iqF16Prefill;
     // Per GDN layer: [row][NVHead*DState^2] matrix-state snapshots and [row][conv] windows.
     private VulkanDevice.Buffer[]? _rowSnapGdn;
     private VulkanDevice.Buffer[]? _rowSnapConv;
@@ -2045,6 +2054,11 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     {
         if (_prof is not null) ProfNoteMatmul(weightQt, outputDim, inputDim, seqLen);
 
+        // IQ1/IQ2/IQ3 prefill: dequant to F16 scratch + coopmat GEMM instead of the scalar tiled GEMM (#621).
+        if (seqLen > 1 && _iqF16Prefill is not null
+            && _iqF16Prefill.TryRecord(cmdBuf, weightQt, weights, input, output, outputDim, inputDim, seqLen))
+            return;
+
         switch (weightQt)
         {
             case QuantizationType.Q8_0:
@@ -2258,6 +2272,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         Interlocked.Exchange(ref _spareGdnCheckpoint, null)?.Dispose();
         FreeRowSnapshots();
         _gdnSnapScan?.Dispose();
+        _iqF16Prefill?.Dispose();
         // Before _device: the profiler owns a query pool on it.
         _profiler?.Dispose();
         _profiler = null;
