@@ -539,6 +539,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         var generator = new TextGenerator(model!, tokenizer!, kvFactory, prefixCache,
             draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
+            mtpAdaptive: true, recurrentPrefixCache: true,
             prefillChunkSize: settings.PrefillChunkSize);
 
         try

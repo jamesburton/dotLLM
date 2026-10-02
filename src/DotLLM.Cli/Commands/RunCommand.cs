@@ -683,7 +683,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
             var generator = new TextGenerator(model, tokenizer, kvFactory,
                 draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
-                mtpEnabled: !settings.NoMtp,
+                mtpEnabled: !settings.NoMtp, mtpAdaptive: true,
                 prefillChunkSize: settings.PrefillChunkSize);
             var totalSw = Stopwatch.StartNew();
             int generated = 0;
