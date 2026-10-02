@@ -25,6 +25,12 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulQ5KGemmCoopmatKernel? MatMulQ5KGemmCoopmat { get; private set; }
     public MatMulQ6KGemmCoopmatKernel? MatMulQ6KGemmCoopmat { get; private set; }
     public MatMulIq4XsGemmCoopmatKernel? MatMulIq4XsGemmCoopmat { get; private set; }
+    // Grouped-by-expert prefill path for resident Q4_K gate/up + Q5_K down banks (issue #637). All null/absent together unless every piece loads.
+    public MoeExpertOffsetsKernel? MoeExpertOffsets { get; private set; }
+    public MoeExpandGroupByExpertF32Kernel? MoeExpandGroupByExpert { get; private set; }
+    public MoeUngroupScatterF32Kernel? MoeUngroupScatter { get; private set; }
+    public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ4K { get; private set; }
+    public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ5K { get; private set; }
     public MatMulQ2KGemvF32Kernel MatMulQ2K { get; }
     public MatMulQ2KGemmF32Kernel MatMulQ2KGemm { get; }
     public MatMulQ3KGemvF32Kernel MatMulQ3K { get; }
@@ -399,6 +405,16 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             kernels.MatMulQ6KGemmCoopmat = MatMulQ6KGemmCoopmatKernel.Create(device, spvDir);
         if (Environment.GetEnvironmentVariable(VulkanTransformerModel.DisableIq4XsCoopmatEnvVar) != "1" && MatMulIq4XsGemmCoopmatKernel.IsSupportedOn(device, spvDir))
             kernels.MatMulIq4XsGemmCoopmat = MatMulIq4XsGemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_GROUPED") != "0"
+            && MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q4_K)
+            && MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q5_K))
+        {
+            kernels.MoeExpertOffsets = MoeExpertOffsetsKernel.Create(device, spvDir);
+            kernels.MoeExpandGroupByExpert = MoeExpandGroupByExpertF32Kernel.Create(device, spvDir);
+            kernels.MoeUngroupScatter = MoeUngroupScatterF32Kernel.Create(device, spvDir);
+            kernels.MoeGroupedQ4K = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K);
+            kernels.MoeGroupedQ5K = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q5_K);
+        }
         return kernels;
     }
 
@@ -475,10 +491,17 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeIndexedMatmulQ5KMmq?.InvalidateDescriptorCache();
         MoeWeightedScatter.InvalidateDescriptorCache();
         MoeSigmoidGatedAdd.InvalidateDescriptorCache();
+        MoeExpertOffsets?.InvalidateDescriptorCache();
+        MoeExpandGroupByExpert?.InvalidateDescriptorCache();
+        MoeUngroupScatter?.InvalidateDescriptorCache();
+        MoeGroupedQ4K?.InvalidateDescriptorCache();
+        MoeGroupedQ5K?.InvalidateDescriptorCache();
     }
 
     public void Dispose()
     {
+        MoeGroupedQ5K?.Dispose(); MoeGroupedQ4K?.Dispose(); MoeUngroupScatter?.Dispose();
+        MoeExpandGroupByExpert?.Dispose(); MoeExpertOffsets?.Dispose();
         MoeSigmoidGatedAdd.Dispose();
         MoeWeightedScatter.Dispose();
         MoeIndexedMatmulQ4KMmq?.Dispose();
