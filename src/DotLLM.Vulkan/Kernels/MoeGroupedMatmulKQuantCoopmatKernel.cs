@@ -22,7 +22,10 @@ public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
 {
     /// <summary>K must be a multiple of this (one super-block).</summary>
     public const int KGroup = 256;
-    private const int TileM = 16, TileN = 16;
+    private const int TileN = 16;
+    // Output rows per workgroup: 16 for the one-subgroup shader; 64 for the _m64 shaders (4 wave64 subgroups, each one
+    // 16-row M tile, sharing one staged B tile).
+    private readonly int _tileM;
     private const int PushConstantBytes = 6 * sizeof(uint);
 
     private readonly VulkanDevice _device;
@@ -33,8 +36,9 @@ public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
     private readonly int _blockBytes;
     private bool _disposed;
 
-    private MoeGroupedMatmulKQuantCoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, int blockBytes)
+    private MoeGroupedMatmulKQuantCoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, int blockBytes, int tileM)
     {
+        _tileM = tileM;
         _device = device;
         _module = module;
         _pipeline = pipeline;
@@ -50,18 +54,33 @@ public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
         _ => "moe_grouped_matmul_q6_k_coopmat.spv",
     };
 
+    /// <summary>
+    /// Output rows per workgroup. The multi-subgroup shaders assume wave64 (subgroup = 64 threads = one 16-row M tile), so they are chosen only
+    /// on a wave64 device. Default 64; <c>DOTLLM_VK_MOE_GROUPED_TILE</c> = 16 | 64 overrides (16 = the single-subgroup shader).
+    /// </summary>
+    private static int ResolveTileM(VulkanDevice device, string spvDir, MoeGroupedKQuant q)
+    {
+        int tile = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_GROUPED_TILE"), out int t) ? t : 64;
+        if (tile == 16 || device.SubgroupSize != 64) return 16;
+        return File.Exists(Path.Combine(spvDir, SpvNameTile(q, tile))) ? tile : 16;
+    }
+
+    private static string SpvNameTile(MoeGroupedKQuant q, int tile)
+        => tile == 16 ? SpvName(q) : SpvName(q).Replace("_coopmat.spv", $"_coopmat_m{tile}.spv", StringComparison.Ordinal);
+
     private static int BlockBytesOf(MoeGroupedKQuant q) => q switch { MoeGroupedKQuant.Q4_K => 144, MoeGroupedKQuant.Q5_K => 176, _ => 210 };
 
     /// <summary>Whether <paramref name="device"/> has cooperative matrices and the SPIR-V is present.</summary>
     public static bool IsSupportedOn(VulkanDevice device, string spvDir, MoeGroupedKQuant quant)
         => device.HasCooperativeMatrix && File.Exists(Path.Combine(spvDir, SpvName(quant)));
 
-    /// <summary>Creates the kernel for <paramref name="quant"/>.</summary>
-    public static MoeGroupedMatmulKQuantCoopmatKernel Create(VulkanDevice device, string spvDir, MoeGroupedKQuant quant)
+    /// <summary>Creates the kernel for <paramref name="quant"/>; <paramref name="tileMOverride"/> (16 or 64) pins the tile shape for tests.</summary>
+    public static MoeGroupedMatmulKQuantCoopmatKernel Create(VulkanDevice device, string spvDir, MoeGroupedKQuant quant, int tileMOverride = 0)
     {
         if (!device.HasCooperativeMatrix)
             throw new InvalidOperationException("MoeGroupedMatmulKQuantCoopmatKernel requires VK_KHR_cooperative_matrix support.");
-        string path = Path.Combine(spvDir, SpvName(quant));
+        int tileM = tileMOverride > 0 && File.Exists(Path.Combine(spvDir, SpvNameTile(quant, tileMOverride))) ? tileMOverride : ResolveTileM(device, spvDir, quant);
+        string path = Path.Combine(spvDir, SpvNameTile(quant, tileM));
         if (!File.Exists(path)) throw new FileNotFoundException($"Vulkan SPIR-V not found: {path}.");
 
         var module = VulkanModule.LoadFromFile(device, path);
@@ -78,7 +97,7 @@ public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
             throw;
         }
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-        return new MoeGroupedMatmulKQuantCoopmatKernel(device, module, pipeline, pool, BlockBytesOf(quant));
+        return new MoeGroupedMatmulKQuantCoopmatKernel(device, module, pipeline, pool, BlockBytesOf(quant), tileM);
     }
 
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
@@ -120,7 +139,7 @@ public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
 
         int rowTiles = maxRowsPerExpert > 0 ? Math.Min(maxRowsPerExpert, rows) : rows;
         // Row tiles are pessimistic (all rows could land on one expert); tiles past an expert's count early-out.
-        VulkanApi.vkCmdDispatch(cmdBuf, (uint)((m + TileM - 1) / TileM), (uint)((rowTiles + TileN - 1) / TileN), (uint)numExperts);
+        VulkanApi.vkCmdDispatch(cmdBuf, (uint)((m + _tileM - 1) / _tileM), (uint)((rowTiles + TileN - 1) / TileN), (uint)numExperts);
     }
 
     /// <inheritdoc/>
