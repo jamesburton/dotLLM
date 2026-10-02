@@ -1213,10 +1213,21 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         // Phase 1: router + the three shared-expert matmuls that read NormOutput.
         RecordMatmul(cmdBuf, moeW.Gate, QuantizationType.F32, _state.NormOutput, _state.MoeRouterLogits,
             outputDim: numE, inputDim: hidden, seqLen: 1);
-        RecordMatmul(cmdBuf, moeW.SharedGate!, moeW.SharedQuantType, _state.NormOutput, _state.MoeSharedGate,
-            outputDim: sharedI, inputDim: hidden, seqLen: 1);
-        RecordMatmul(cmdBuf, moeW.SharedUp!, moeW.SharedQuantType, _state.NormOutput, _state.MoeSharedUp,
-            outputDim: sharedI, inputDim: hidden, seqLen: 1);
+        // Q8_0 raw gate/up (decode only) read the row the fused norm already quantized into MoeExpandedInputXq/Xds.
+        if (moeW.SharedGateQ8 is not null && moeW.SharedUpQ8 is not null && _kernels.MatMulQ8Mmvq is not null)
+        {
+            RecordMatmul(cmdBuf, moeW.SharedGateQ8, QuantizationType.Q8_0, _state.NormOutput, _state.MoeSharedGate,
+                outputDim: sharedI, inputDim: hidden, seqLen: 1, xqReady: true);
+            RecordMatmul(cmdBuf, moeW.SharedUpQ8, QuantizationType.Q8_0, _state.NormOutput, _state.MoeSharedUp,
+                outputDim: sharedI, inputDim: hidden, seqLen: 1, xqReady: true);
+        }
+        else
+        {
+            RecordMatmul(cmdBuf, moeW.SharedGate!, moeW.SharedQuantType, _state.NormOutput, _state.MoeSharedGate,
+                outputDim: sharedI, inputDim: hidden, seqLen: 1);
+            RecordMatmul(cmdBuf, moeW.SharedUp!, moeW.SharedQuantType, _state.NormOutput, _state.MoeSharedUp,
+                outputDim: sharedI, inputDim: hidden, seqLen: 1);
+        }
         RecordMatmul(cmdBuf, moeW.SharedExpertGate!, QuantizationType.F32, _state.NormOutput, _state.MoeSharedGateLogits,
             outputDim: 1, inputDim: hidden, seqLen: 1);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);

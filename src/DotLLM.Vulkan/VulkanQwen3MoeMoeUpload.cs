@@ -129,6 +129,12 @@ internal static class VulkanQwen3MoeMoeUpload
         /// bytes of F32, and the F16 GEMV / coopmat paths), F32 with <c>DOTLLM_VK_MOE_SHARED_F16=0</c>.</summary>
         public QuantizationType SharedQuantType { get; }
 
+        /// <summary>Decode-only raw Q8_0 copies of the shared gate / up projections (half the bytes of F16; aliases the mmap'd GGUF pages on UMA, so
+        /// no extra residency). Null unless the source tensors are Q8_0 with K % 32 == 0 (<c>DOTLLM_VK_MOE_SHARED_Q8=0</c> disables).</summary>
+        public VulkanDevice.Buffer? SharedGateQ8 { get; init; }
+        /// <inheritdoc cref="SharedGateQ8"/>
+        public VulkanDevice.Buffer? SharedUpQ8 { get; init; }
+
         public LayerBundle(
             VulkanDevice.Buffer gate, VulkanDevice.Buffer w1Bank, VulkanDevice.Buffer w2Bank, VulkanDevice.Buffer w3Bank,
             QuantizationType w1QuantType, QuantizationType w2QuantType, QuantizationType w3QuantType,
@@ -154,6 +160,7 @@ internal static class VulkanQwen3MoeMoeUpload
             Gate.Dispose();
             W1Bank.Dispose(); W2Bank.Dispose(); W3Bank.Dispose();
             SharedGate?.Dispose(); SharedUp?.Dispose(); SharedDown?.Dispose();
+            SharedGateQ8?.Dispose(); SharedUpQ8?.Dispose();
             SharedExpertGate?.Dispose();
         }
     }
@@ -259,6 +266,19 @@ internal static class VulkanQwen3MoeMoeUpload
         if (moe.SharedExpertGate is not null)
             sharedExpertGate = UploadFloatArray(device, staging, moe.SharedExpertGate);
 
+        VulkanDevice.Buffer? sharedGateQ8 = null, sharedUpQ8 = null;
+        if (hasShared && numShared == 1 && SharedAsQ8 && (hiddenSize & 31) == 0
+            && moe.SharedGateRawQt == QuantizationType.Q8_0 && moe.SharedUpRawQt == QuantizationType.Q8_0
+            && moe.SharedGateRaw.Length == 1 && moe.SharedUpRaw.Length == 1)
+        {
+            sharedGateQ8 = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging, moe.SharedGateRaw[0], QuantizationType.Q8_0,
+                sharedI, hiddenSize, forceF32: false, out var gq, out _);
+            sharedUpQ8 = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging, moe.SharedUpRaw[0], QuantizationType.Q8_0,
+                sharedI, hiddenSize, forceF32: false, out var uq, out _);
+            if (gq != QuantizationType.Q8_0 || uq != QuantizationType.Q8_0)
+                throw new InvalidOperationException("Shared-expert Q8_0 upload widened unexpectedly.");
+        }
+
         // Post-attn norm weight is owned by VulkanQwen3MoeHybridWeights (uploaded
         // once at load time). The shared-expert branch needs it to re-derive
         // the RMSNormed hidden state, so the model passes it directly into
@@ -271,7 +291,11 @@ internal static class VulkanQwen3MoeMoeUpload
             intermediate: interm, normTopKProb: moe.NormTopKProb,
             hasShared: hasShared, numSharedExperts: numShared, sharedIntermediate: sharedI,
             sharedGate: sharedGate, sharedUp: sharedUp, sharedDown: sharedDown,
-            sharedExpertGate: sharedExpertGate, sharedQuantType: sharedQt);
+            sharedExpertGate: sharedExpertGate, sharedQuantType: sharedQt)
+        {
+            SharedGateQ8 = sharedGateQ8,
+            SharedUpQ8 = sharedUpQ8,
+        };
     }
 
     /// <summary>
@@ -430,6 +454,9 @@ internal static class VulkanQwen3MoeMoeUpload
     /// </summary>
     private static readonly bool SharedAsF16 =
         !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_SHARED_F16"), "0", StringComparison.Ordinal);
+
+    private static readonly bool SharedAsQ8 =
+        !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_SHARED_Q8"), "0", StringComparison.Ordinal);
 
     /// <summary>Uploads an F32 host matrix as F16 (round-to-nearest) - the shared-expert matmuls are ~3 of 28 ms/token of decode at F32.</summary>
     private static unsafe VulkanDevice.Buffer UploadF32AsF16FromPointer(
