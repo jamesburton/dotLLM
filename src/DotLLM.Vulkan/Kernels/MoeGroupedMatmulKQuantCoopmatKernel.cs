@@ -100,6 +100,9 @@ public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
         return new MoeGroupedMatmulKQuantCoopmatKernel(device, module, pipeline, pool, BlockBytesOf(quant), tileM);
     }
 
+    /// <summary>Raw pipeline handle, for driver shader-statistics diagnostics.</summary>
+    internal nint PipelineHandle => _pipeline.Pipeline;
+
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
     /// <summary>Synchronous launch; used by unit tests.</summary>
