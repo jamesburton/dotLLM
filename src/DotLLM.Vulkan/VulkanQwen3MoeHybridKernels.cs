@@ -34,6 +34,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ6K { get; private set; }
     // Decode-path (small expanded-row count) indexed dp4a MMVQ GEMVs: coalesced subgroup-per-cell, replacing the one-thread-per-cell MMQ/scalar kernels.
     public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ4K { get; private set; }
+    /// <summary>Dense Q8_0 decode MMVQ GEMV (dp4a, coalesced) for the GDN / attention / shared-expert projections (all Q8_0 in the UD-Q4_K_M GGUF).</summary>
+    public MatMulQ8_0MmvqKernel? MatMulQ8Mmvq { get; private set; }
     public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ5K { get; private set; }
     public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ6K { get; private set; }
     public MatMulQ2KGemvF32Kernel MatMulQ2K { get; }
@@ -425,6 +427,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MMVQ") != "0")
         {
             kernels.MoeMmvqQ4K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q4_K);
+            if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_Q8_MMVQ") != "0")
+                kernels.MatMulQ8Mmvq = MatMulQ8_0MmvqKernel.TryCreate(device, spvDir);
             kernels.MoeMmvqQ5K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q5_K);
             kernels.MoeMmvqQ6K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q6_K);
         }
@@ -511,13 +515,14 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeGroupedQ5K?.InvalidateDescriptorCache();
         MoeGroupedQ6K?.InvalidateDescriptorCache();
         MoeMmvqQ4K?.InvalidateDescriptorCache();
+        MatMulQ8Mmvq?.InvalidateDescriptorCache();
         MoeMmvqQ5K?.InvalidateDescriptorCache();
         MoeMmvqQ6K?.InvalidateDescriptorCache();
     }
 
     public void Dispose()
     {
-        MoeMmvqQ6K?.Dispose(); MoeMmvqQ5K?.Dispose(); MoeMmvqQ4K?.Dispose();
+        MatMulQ8Mmvq?.Dispose(); MoeMmvqQ6K?.Dispose(); MoeMmvqQ5K?.Dispose(); MoeMmvqQ4K?.Dispose();
         MoeGroupedQ6K?.Dispose(); MoeGroupedQ5K?.Dispose(); MoeGroupedQ4K?.Dispose(); MoeUngroupScatter?.Dispose();
         MoeExpandGroupByExpert?.Dispose(); MoeExpertOffsets?.Dispose();
         MoeSigmoidGatedAdd.Dispose();
