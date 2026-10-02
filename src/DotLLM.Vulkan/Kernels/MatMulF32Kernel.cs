@@ -29,13 +29,19 @@ public sealed class MatMulF32Kernel : IDisposable
     // push constants as _pipeline, so the descriptor cache is shared. Null when the SPIR-V is absent.
     private readonly VulkanModule? _gemvModule;
     private readonly ComputePipeline? _gemvPipeline;
+    // Multi-row (prefill) variant: 32x32 output tile per workgroup, shared-memory staged. Same layout/push constants. Null when absent.
+    private readonly VulkanModule? _tiledModule;
+    private readonly ComputePipeline? _tiledPipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
 
     private MatMulF32Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
-                            VulkanModule? gemvModule, ComputePipeline? gemvPipeline)
+                            VulkanModule? gemvModule, ComputePipeline? gemvPipeline,
+                            VulkanModule? tiledModule, ComputePipeline? tiledPipeline)
     {
+        _tiledModule = tiledModule;
+        _tiledPipeline = tiledPipeline;
         _device = device;
         _module = module;
         _pipeline = pipeline;
@@ -87,8 +93,23 @@ public sealed class MatMulF32Kernel : IDisposable
                 entryPoint: "main", bindings: gb, pushConstantBytes: PushConstantBytes);
         }
 
+        VulkanModule? tiledModule = null;
+        ComputePipeline? tiledPipeline = null;
+        string tiledPath = Path.Combine(spvDir, "matmul_f32_tiled.spv");
+        if (File.Exists(tiledPath)
+            && !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_F32_TILED"), "0", StringComparison.Ordinal))
+        {
+            tiledModule = VulkanModule.LoadFromFile(device, tiledPath);
+            Span<VkDescriptorBinding> tb = stackalloc VkDescriptorBinding[3];
+            tb[0] = new VkDescriptorBinding(0);
+            tb[1] = new VkDescriptorBinding(1);
+            tb[2] = new VkDescriptorBinding(2);
+            tiledPipeline = tiledModule.CreateComputePipeline(
+                entryPoint: "main", bindings: tb, pushConstantBytes: PushConstantBytes);
+        }
+
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
-        return new MatMulF32Kernel(device, module, pipeline, pool, gemvModule, gemvPipeline);
+        return new MatMulF32Kernel(device, module, pipeline, pool, gemvModule, gemvPipeline, tiledModule, tiledPipeline);
     }
 
     /// <summary>
@@ -150,7 +171,8 @@ public sealed class MatMulF32Kernel : IDisposable
         nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
 
         bool gemv = n == 1 && (k & 3) == 0 && _gemvPipeline is not null;
-        var pipe = gemv ? _gemvPipeline! : _pipeline;
+        bool tiled = !gemv && n > 1 && _tiledPipeline is not null;
+        var pipe = gemv ? _gemvPipeline! : tiled ? _tiledPipeline! : _pipeline;
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipe.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(
             cmdBuf, VkPipelineBindPoint.Compute, pipe.Layout,
@@ -170,8 +192,9 @@ public sealed class MatMulF32Kernel : IDisposable
             return;
         }
 
-        uint groupsX = (uint)((m + WorkgroupX - 1) / WorkgroupX);
-        uint groupsY = (uint)((n + WorkgroupY - 1) / WorkgroupY);
+        int tileX = tiled ? 32 : WorkgroupX, tileY = tiled ? 32 : WorkgroupY;
+        uint groupsX = (uint)((m + tileX - 1) / tileX);
+        uint groupsY = (uint)((n + tileY - 1) / tileY);
         VulkanApi.vkCmdDispatch(cmdBuf, groupsX, groupsY, 1);
     }
 
@@ -183,6 +206,8 @@ public sealed class MatMulF32Kernel : IDisposable
 
         if (_descriptorPool != 0)
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);
+        _tiledPipeline?.Dispose();
+        _tiledModule?.Dispose();
         _gemvPipeline?.Dispose();
         _gemvModule?.Dispose();
         _pipeline.Dispose();
