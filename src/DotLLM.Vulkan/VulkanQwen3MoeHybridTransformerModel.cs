@@ -1315,6 +1315,47 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         }
     }
 
+    private MoeGroupedMatmulKQuantCoopmatKernel? GroupedDownKernel(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q5_K => _kernels.MoeGroupedQ5K,
+        QuantizationType.Q6_K => _kernels.MoeGroupedQ6K,
+        _ => null,
+    };
+
+    private static readonly int GroupedMinTokens =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_GROUPED_MIN_TOKENS"), out int g) && g > 0 ? g : 16;
+
+    /// <summary>
+    /// Grouped-by-expert routed FFN (issue #637). Buffer reuse: MoeExpandedInput (broadcast rows) -> packed rows in MoeDownRows ->
+    /// gate/up into MoeGateInter/MoeUpInter (packed order) -> SwiGLU -> grouped down into MoeExpandedInput (dead by now) -> ungroup into
+    /// MoeDownRows in the original row order, which the weighted scatter then consumes unchanged.
+    /// </summary>
+    private void RecordGroupedExperts(nint cmdBuf, VulkanQwen3MoeMoeUpload.LayerBundle moeW, int seqLen, int hidden, int interm, int numE, int expandedRows)
+    {
+        _kernels.MoeExpertOffsets!.Record(cmdBuf, _state.MoeTopkIndices, _state.MoeGroupCounts, _state.MoeGroupOffsets, _state.MoeGroupCounters,
+            rows: expandedRows, numExperts: numE);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        _kernels.MoeExpandGroupByExpert!.Record(cmdBuf, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeGroupOffsets,
+            _state.MoeGroupCounters, _state.MoeDownRows, _state.MoeGroupPerm, rows: expandedRows, hidden: hidden, numExperts: numE);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // A token routes to an expert at most once, so no expert owns more than seqLen rows.
+        _kernels.MoeGroupedQ4K!.Record(cmdBuf, moeW.W1Bank, _state.MoeDownRows, _state.MoeGroupOffsets, _state.MoeGateInter,
+            m: interm, k: hidden, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+        _kernels.MoeGroupedQ4K!.Record(cmdBuf, moeW.W3Bank, _state.MoeDownRows, _state.MoeGroupOffsets, _state.MoeUpInter,
+            m: interm, k: hidden, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        _kernels.SwiGlu.Record(cmdBuf, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter, n: expandedRows * interm);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        GroupedDownKernel(moeW.W2QuantType)!.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInter, _state.MoeGroupOffsets, _state.MoeExpandedInput,
+            m: hidden, k: interm, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        _kernels.MoeUngroupScatter!.Record(cmdBuf, _state.MoeExpandedInput, _state.MoeGroupPerm, _state.MoeDownRows, rows: expandedRows, hidden: hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+    }
+
     /// <summary>
     /// Records the routed-MoE SwiGLU FFN dispatch using the per-layer banks
     /// uploaded by <see cref="VulkanQwen3MoeMoeUpload.UploadLayer"/>. Mirrors
@@ -1349,6 +1390,19 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             seqLen: seqLen, topK: topK, hidden: hidden);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
+        // Issue #637: prefill batches group the routed rows by expert and run each expert's weights through a coopmat GEMM once per
+        // 16-row tile (the indexed kernels below re-read an expert's weights for every routed row). Resident Q4_K gate/up + Q5_K/Q6_K down only (UD-Q4_K_M mixes both down types).
+        bool grouped = seqLen >= GroupedMinTokens
+            && _kernels.MoeGroupedQ4K is not null && GroupedDownKernel(moeW.W2QuantType) is not null
+            && _kernels.MoeExpertOffsets is not null && _kernels.MoeExpandGroupByExpert is not null && _kernels.MoeUngroupScatter is not null
+            && moeW.W1QuantType == QuantizationType.Q4_K && moeW.W3QuantType == QuantizationType.Q4_K
+            && (hidden % 256) == 0 && (interm % 256) == 0;
+        if (grouped)
+        {
+            RecordGroupedExperts(cmdBuf, moeW, seqLen, hidden, interm, numE, expandedRows);
+        }
+        else
+        {
         // 4. Indexed expert matmuls. All paths share the same buffer contract
         //    (bank/x/indices/y) and the same shape (m, k, n, numExperts) —
         //    only the dequant differs, and each bank picks its OWN kernel
@@ -1425,6 +1479,8 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 m: hidden, k: interm, n: expandedRows, numExperts: numE);
         }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        }
 
         // 7. Weighted scatter into NormOutput.
         _kernels.MoeWeightedScatter.Record(cmdBuf,
