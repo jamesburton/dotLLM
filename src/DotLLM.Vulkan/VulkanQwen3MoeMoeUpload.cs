@@ -125,6 +125,9 @@ internal static class VulkanQwen3MoeMoeUpload
         public VulkanDevice.Buffer? SharedUp { get; }
         public VulkanDevice.Buffer? SharedDown { get; }
         public VulkanDevice.Buffer? SharedExpertGate { get; }   // Qwen1.5-MoE per-token sigmoid gate
+        /// <summary>Storage type of <see cref="SharedGate"/> / <see cref="SharedUp"/> / <see cref="SharedDown"/>: F16 by default (half the decode
+        /// bytes of F32, and the F16 GEMV / coopmat paths), F32 with <c>DOTLLM_VK_MOE_SHARED_F16=0</c>.</summary>
+        public QuantizationType SharedQuantType { get; }
 
         public LayerBundle(
             VulkanDevice.Buffer gate, VulkanDevice.Buffer w1Bank, VulkanDevice.Buffer w2Bank, VulkanDevice.Buffer w3Bank,
@@ -132,8 +135,10 @@ internal static class VulkanQwen3MoeMoeUpload
             int numExperts, int numExpertsPerTok, int intermediate, bool normTopKProb,
             bool hasShared, int numSharedExperts, int sharedIntermediate,
             VulkanDevice.Buffer? sharedGate, VulkanDevice.Buffer? sharedUp, VulkanDevice.Buffer? sharedDown,
-            VulkanDevice.Buffer? sharedExpertGate)
+            VulkanDevice.Buffer? sharedExpertGate,
+            QuantizationType sharedQuantType = QuantizationType.F32)
         {
+            SharedQuantType = sharedQuantType;
             Gate = gate; W1Bank = w1Bank; W2Bank = w2Bank; W3Bank = w3Bank;
             W1QuantType = w1QuantType; W2QuantType = w2QuantType; W3QuantType = w3QuantType;
             NumExperts = numExperts; NumExpertsPerTok = numExpertsPerTok;
@@ -225,6 +230,7 @@ internal static class VulkanQwen3MoeMoeUpload
         // ── Shared expert (optional) ─────────────────────────────────────────
         VulkanDevice.Buffer? sharedGate = null, sharedUp = null, sharedDown = null;
         VulkanDevice.Buffer? sharedExpertGate = null;
+        QuantizationType sharedQt = QuantizationType.F32;
         int numShared = moe.NumSharedExperts;
         int sharedI = moe.SharedIntermediateSize;
         bool hasShared = moe.HasSharedExpert;
@@ -235,9 +241,20 @@ internal static class VulkanQwen3MoeMoeUpload
             // need an outer-loop sum; deliberately not implemented here.
             long sharedGateUpElems = (long)sharedI * hiddenSize;
             long sharedDownElems = (long)hiddenSize * sharedI;
-            sharedGate = UploadF32FromPointer(device, staging, moe.SharedGateProj[0], sharedGateUpElems);
-            sharedUp = UploadF32FromPointer(device, staging, moe.SharedUpProj[0], sharedGateUpElems);
-            sharedDown = UploadF32FromPointer(device, staging, moe.SharedDownProj[0], sharedDownElems);
+            // K must be a multiple of 32 for the F16 coopmat prefill GEMM (tiny synthetic fixtures keep F32).
+            if (SharedAsF16 && hiddenSize % 32 == 0 && sharedI % 32 == 0)
+            {
+                sharedQt = QuantizationType.F16;
+                sharedGate = UploadF32AsF16FromPointer(device, staging, moe.SharedGateProj[0], sharedGateUpElems);
+                sharedUp = UploadF32AsF16FromPointer(device, staging, moe.SharedUpProj[0], sharedGateUpElems);
+                sharedDown = UploadF32AsF16FromPointer(device, staging, moe.SharedDownProj[0], sharedDownElems);
+            }
+            else
+            {
+                sharedGate = UploadF32FromPointer(device, staging, moe.SharedGateProj[0], sharedGateUpElems);
+                sharedUp = UploadF32FromPointer(device, staging, moe.SharedUpProj[0], sharedGateUpElems);
+                sharedDown = UploadF32FromPointer(device, staging, moe.SharedDownProj[0], sharedDownElems);
+            }
         }
         if (moe.SharedExpertGate is not null)
             sharedExpertGate = UploadFloatArray(device, staging, moe.SharedExpertGate);
@@ -254,7 +271,7 @@ internal static class VulkanQwen3MoeMoeUpload
             intermediate: interm, normTopKProb: moe.NormTopKProb,
             hasShared: hasShared, numSharedExperts: numShared, sharedIntermediate: sharedI,
             sharedGate: sharedGate, sharedUp: sharedUp, sharedDown: sharedDown,
-            sharedExpertGate: sharedExpertGate);
+            sharedExpertGate: sharedExpertGate, sharedQuantType: sharedQt);
     }
 
     /// <summary>
@@ -411,6 +428,29 @@ internal static class VulkanQwen3MoeMoeUpload
     /// Uploads an F32 matrix from an unmanaged pointer (the shared-expert
     /// projections live as <c>nint</c> in <see cref="MoeLayerWeights"/>).
     /// </summary>
+    private static readonly bool SharedAsF16 =
+        !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_SHARED_F16"), "0", StringComparison.Ordinal);
+
+    /// <summary>Uploads an F32 host matrix as F16 (round-to-nearest) - the shared-expert matmuls are ~3 of 28 ms/token of decode at F32.</summary>
+    private static unsafe VulkanDevice.Buffer UploadF32AsF16FromPointer(
+        VulkanDevice device, VulkanStagingBuffer staging, nint src, long elems)
+    {
+        long bytes = elems * sizeof(ushort);
+        var buf = device.AllocateDeviceLocal(bytes);
+        Half[] tmp = System.Buffers.ArrayPool<Half>.Shared.Rent((int)elems);
+        try
+        {
+            System.Numerics.Tensors.TensorPrimitives.ConvertToHalf(
+                new ReadOnlySpan<float>((void*)src, (int)elems), tmp.AsSpan(0, (int)elems));
+            fixed (Half* p = tmp) staging.UploadBytes((nint)p, bytes, buf);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<Half>.Shared.Return(tmp);
+        }
+        return buf;
+    }
+
     private static VulkanDevice.Buffer UploadF32FromPointer(
         VulkanDevice device, VulkanStagingBuffer staging, nint src, long elems)
     {
