@@ -1,0 +1,30 @@
+#version 450
+// De-interleave the post-conv GDN rows: qkv[t, :] = [Q(kDim) | K(kDim) | V(vDim)] -> q[t, kDim], k[t, kDim], v[t, vDim].
+// Replaces 3 x seqLen vkCmdCopyBuffer commands per GDN layer (46k commands per p512 forward on Qwen3.6-35B-A3B, ~22 ms) with one dispatch.
+// Pure F32 moves: bit-exact with the copy loop.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufQkv { float qkv[]; }; // [seqLen, 2*kDim + vDim]
+layout(set = 0, binding = 1, std430) writeonly buffer BufQ   { float q[]; };   // [seqLen, kDim]
+layout(set = 0, binding = 2, std430) writeonly buffer BufK   { float k[]; };   // [seqLen, kDim]
+layout(set = 0, binding = 3, std430) writeonly buffer BufV   { float v[]; };   // [seqLen, vDim]
+
+layout(push_constant) uniform PushConstants {
+    uint seqLen;
+    uint kDim;
+    uint vDim;
+} pc;
+
+void main() {
+    uint convDim = 2u * pc.kDim + pc.vDim;
+    uint idx = (gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x) * 256u + gl_LocalInvocationID.x;
+    if (idx >= pc.seqLen * convDim) return;
+
+    uint t = idx / convDim;
+    uint c = idx - t * convDim;
+    float x = qkv[idx];
+    if (c < pc.kDim)             q[t * pc.kDim + c] = x;
+    else if (c < 2u * pc.kDim)   k[t * pc.kDim + (c - pc.kDim)] = x;
+    else                         v[t * pc.vDim + (c - 2u * pc.kDim)] = x;
+}
