@@ -22,7 +22,7 @@ public sealed class MoeIndexedMatmulKQuantMmvqKernel : IDisposable
     private readonly int _blockBytes;
 
     private const int BuffersPerSet = 5;
-    private const int PushConstantBytes = 5 * sizeof(uint); // M, K, N, numExperts, blocksPerRow
+    private const int PushConstantBytes = 6 * sizeof(uint); // M, K, N, numExperts, blocksPerRow, xDiv
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
@@ -42,7 +42,7 @@ public sealed class MoeIndexedMatmulKQuantMmvqKernel : IDisposable
     }
 
     /// <summary>
-    /// Loads <c>moe_indexed_matmul_{q4_k,q5_k,q6_k}_mmvq.spv</c> from <paramref name="spvDir"/> and builds the pipeline. Returns
+    /// Loads <c>moe_indexed_matmul_{q4_k_xdiv,q5_k,q6_k}_mmvq.spv</c> from <paramref name="spvDir"/> and builds the pipeline. Returns
     /// <c>null</c> when the SPV is missing or the device lacks integer-dot-product support (callers keep their scalar/MMQ fallback).
     /// </summary>
     public static MoeIndexedMatmulKQuantMmvqKernel? TryCreate(VulkanDevice device, string spvDir, MoeGroupedKQuant quant)
@@ -52,7 +52,7 @@ public sealed class MoeIndexedMatmulKQuantMmvqKernel : IDisposable
 
         (string name, int blockBytes) = quant switch
         {
-            MoeGroupedKQuant.Q4_K => ("moe_indexed_matmul_q4_k_mmvq.spv", QuantFormat.Q4_KBlockBytes),
+            MoeGroupedKQuant.Q4_K => ("moe_indexed_matmul_q4_k_mmvq_xdiv.spv", QuantFormat.Q4_KBlockBytes),
             MoeGroupedKQuant.Q5_K => ("moe_indexed_matmul_q5_k_mmvq.spv", 176),
             _ => ("moe_indexed_matmul_q6_k_mmvq.spv", 210),
         };
@@ -98,17 +98,21 @@ public sealed class MoeIndexedMatmulKQuantMmvqKernel : IDisposable
     /// <param name="m">Per-expert weight row count (output dim).</param>
     /// <param name="k">Per-expert weight column count (must be a multiple of 256).</param>
     /// <param name="n">Number of output rows (typically <c>seqLen * topK</c>).</param>
+    /// <param name="xDiv">Activation row for output row <c>r</c> is <c>r / xDiv</c>: 1 = one quantized row per output row; <c>topK</c> = a
+    /// single decode row broadcast to its topK expert slots (skips the expand and the topK-fold quantize).</param>
     /// <param name="numExperts">Bank's first axis size — bounds-checks the index lookup.</param>
     public unsafe void Record(
         nint cmdBuf,
         VulkanDevice.Buffer bank, VulkanDevice.Buffer xq, VulkanDevice.Buffer xds,
         VulkanDevice.Buffer indices, VulkanDevice.Buffer y,
-        int m, int k, int n, int numExperts)
+        int m, int k, int n, int numExperts, int xDiv = 1)
     {
         if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n));
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
+        if (xDiv <= 0) throw new ArgumentOutOfRangeException(nameof(xDiv));
+        int xRows = (n + xDiv - 1) / xDiv;
         if ((k % GroupSize) != 0)
             throw new ArgumentException($"k must be a multiple of {GroupSize}, got {k}", nameof(k));
 
@@ -116,9 +120,9 @@ public sealed class MoeIndexedMatmulKQuantMmvqKernel : IDisposable
         long rowBytes = (long)blocksPerRow * _blockBytes;
         long bankBytes = (long)numExperts * m * rowBytes;
         if (bank.Size < bankBytes) throw new ArgumentException("bank buffer too small.", nameof(bank));
-        if (xq.Size < QuantizeQ8_1RowsKernel.PackedBytes(n, k))
+        if (xq.Size < QuantizeQ8_1RowsKernel.PackedBytes(xRows, k))
             throw new ArgumentException("Packed activation buffer too small.", nameof(xq));
-        if (xds.Size < QuantizeQ8_1RowsKernel.ScaleBytes(n, k))
+        if (xds.Size < QuantizeQ8_1RowsKernel.ScaleBytes(xRows, k))
             throw new ArgumentException("Activation scale buffer too small.", nameof(xds));
         if (indices.Size < (long)n * sizeof(int)) throw new ArgumentException("indices buffer too small.", nameof(indices));
         if (y.Size < (long)n * m * sizeof(float)) throw new ArgumentException("y buffer too small.", nameof(y));
@@ -134,9 +138,9 @@ public sealed class MoeIndexedMatmulKQuantMmvqKernel : IDisposable
             cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
             0, 1, descriptorSet, 0, 0);
 
-        Span<uint> pc = stackalloc uint[5]
+        Span<uint> pc = stackalloc uint[6]
         {
-            (uint)m, (uint)k, (uint)n, (uint)numExperts, (uint)blocksPerRow,
+            (uint)m, (uint)k, (uint)n, (uint)numExperts, (uint)blocksPerRow, (uint)xDiv,
         };
         fixed (uint* pcPtr = pc)
         {
