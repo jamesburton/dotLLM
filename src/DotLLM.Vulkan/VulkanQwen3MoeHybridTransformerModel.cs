@@ -327,11 +327,13 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
 
         var kernels = VulkanQwen3MoeHybridKernels.Create(device, spvDir, config.HeadDim);
 
-        return new VulkanQwen3MoeHybridTransformerModel(
+        var model = new VulkanQwen3MoeHybridTransformerModel(
             device, ownsDevice: false,
             config, gguf, cpuModel, cpuLayers, weights, state, gdnCache, kernels,
             kvSlotForLayer, attentionLayerCount, gdnLayerOrdinal,
             ropeDim, ropeTheta, ResolveNCpuMoeLayers(nCpuMoeLayers));
+        model._iqF16Prefill = CreateIqF16Prefill(device, spvDir, config, kernels);
+        return model;
     }
 
     /// <summary>
@@ -423,11 +425,13 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
 
         var kernels = VulkanQwen3MoeHybridKernels.Create(device, spvDir, config.HeadDim);
 
-        return new VulkanQwen3MoeHybridTransformerModel(
+        var model = new VulkanQwen3MoeHybridTransformerModel(
             device, ownsDevice: false,
             config, gguf: null, cpuModel: null, cpuLayers, weights, state, gdnCache, kernels,
             kvSlotForLayer, attentionLayerCount, gdnLayerOrdinal,
             ropeDim, ropeTheta, ResolveNCpuMoeLayers(nCpuMoeLayers));
+        model._iqF16Prefill = CreateIqF16Prefill(device, spvDir, config, kernels);
+        return model;
     }
 
     // ── CPU-model accessors (we share the CPU loader; reach into its layers) ─
@@ -558,7 +562,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         }
 
         bool resized = _state.EnsureCapacity(seqLen);
-        if (resized) _kernels.InvalidateAll();
+        if (resized) { _kernels.InvalidateAll(); _iqF16Prefill?.InvalidateDescriptorCache(); }
 
         UploadPositions(positions);
 
@@ -1538,12 +1542,26 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     /// / Q6_K / F16 / BF16 / F32 weights through the matching kernel selected by
     /// the device storage type recorded at upload time.
     /// </summary>
+    /// <summary>IQ1/IQ2/IQ3 prefill: dequantise to F16 scratch + F16 coopmat GEMM (#621). Null when disabled or unsupported.</summary>
+    private IqF16PrefillMatmul? _iqF16Prefill;
+
+    private static IqF16PrefillMatmul? CreateIqF16Prefill(VulkanDevice device, string spvDir, ModelConfig config, VulkanQwen3MoeHybridKernels kernels)
+    {
+        long hidden = config.HiddenSize;
+        return IqF16PrefillMatmul.TryCreate(device, spvDir, kernels.MatMulF16GemmCoopmat, 4L * hidden * hidden);
+    }
+
     private void RecordMatmul(
         nint cmdBuf,
         VulkanDevice.Buffer weights, QuantizationType weightQt,
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
         int outputDim, int inputDim, int seqLen)
     {
+        // IQ1/IQ2/IQ3 prefill: dequant to F16 scratch + coopmat GEMM instead of the scalar tiled GEMM (#621).
+        if (seqLen > 1 && _iqF16Prefill is not null
+            && _iqF16Prefill.TryRecord(cmdBuf, weightQt, weights, input, output, outputDim, inputDim, seqLen))
+            return;
+
         switch (weightQt)
         {
             case QuantizationType.Q8_0:
@@ -1557,30 +1575,40 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.Q2_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ2K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulQ2KGemmCoopmat is not null && (inputDim % 256) == 0)
+                    _kernels.MatMulQ2KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
                     _kernels.MatMulQ2KGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             case QuantizationType.Q3_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ3K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulQ3KGemmCoopmat is not null && (inputDim % 256) == 0)
+                    _kernels.MatMulQ3KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
                     _kernels.MatMulQ3KGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             case QuantizationType.Q4_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ4K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulQ4KGemmCoopmat is not null && (inputDim % 256) == 0)
+                    _kernels.MatMulQ4KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
                     _kernels.MatMulQ4KGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             case QuantizationType.Q5_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ5K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulQ5KGemmCoopmat is not null && (inputDim % 256) == 0)
+                    _kernels.MatMulQ5KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
                     _kernels.MatMulQ5KGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             case QuantizationType.Q6_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ6K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulQ6KGemmCoopmat is not null && (inputDim % 256) == 0)
+                    _kernels.MatMulQ6KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
                     _kernels.MatMulQ6KGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
@@ -1593,6 +1621,8 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.IQ4_XS:
                 if (seqLen == 1)
                     _kernels.MatMulIq4Xs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (_kernels.MatMulIq4XsGemmCoopmat is not null && (inputDim % 256) == 0)
+                    _kernels.MatMulIq4XsGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
                     _kernels.MatMulIq4XsGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
@@ -1728,6 +1758,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         _state.Dispose();
         _weights.Dispose();
         _gdnCache.Dispose();
+        _iqF16Prefill?.Dispose();
         _kernels.Dispose();
         // Disposing the CPU model frees its NormWeight / DequantizeF32 native
         // allocations and detaches it from the GgufFile. The GgufFile itself
