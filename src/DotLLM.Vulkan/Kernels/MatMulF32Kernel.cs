@@ -25,15 +25,22 @@ public sealed class MatMulF32Kernel : IDisposable
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
+    // Single-row (decode) variant: one workgroup per output row, vec4 loads, shared reduction. Same descriptor-set layout and
+    // push constants as _pipeline, so the descriptor cache is shared. Null when the SPIR-V is absent.
+    private readonly VulkanModule? _gemvModule;
+    private readonly ComputePipeline? _gemvPipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
 
-    private MatMulF32Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
+    private MatMulF32Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
+                            VulkanModule? gemvModule, ComputePipeline? gemvPipeline)
     {
         _device = device;
         _module = module;
         _pipeline = pipeline;
+        _gemvModule = gemvModule;
+        _gemvPipeline = gemvPipeline;
         _descriptorPool = pool;
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 3);
     }
@@ -65,8 +72,23 @@ public sealed class MatMulF32Kernel : IDisposable
             throw;
         }
 
+        VulkanModule? gemvModule = null;
+        ComputePipeline? gemvPipeline = null;
+        string gemvPath = Path.Combine(spvDir, "matmul_f32_gemv.spv");
+        if (File.Exists(gemvPath)
+            && !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_F32_GEMV"), "0", StringComparison.Ordinal))
+        {
+            gemvModule = VulkanModule.LoadFromFile(device, gemvPath);
+            Span<VkDescriptorBinding> gb = stackalloc VkDescriptorBinding[3];
+            gb[0] = new VkDescriptorBinding(0);
+            gb[1] = new VkDescriptorBinding(1);
+            gb[2] = new VkDescriptorBinding(2);
+            gemvPipeline = gemvModule.CreateComputePipeline(
+                entryPoint: "main", bindings: gb, pushConstantBytes: PushConstantBytes);
+        }
+
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
-        return new MatMulF32Kernel(device, module, pipeline, pool);
+        return new MatMulF32Kernel(device, module, pipeline, pool, gemvModule, gemvPipeline);
     }
 
     /// <summary>
@@ -127,17 +149,25 @@ public sealed class MatMulF32Kernel : IDisposable
         Span<nint> buffers = stackalloc nint[3] { weightsA.Handle, inputB.Handle, outputC.Handle };
         nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
 
-        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
+        bool gemv = n == 1 && (k & 3) == 0 && _gemvPipeline is not null;
+        var pipe = gemv ? _gemvPipeline! : _pipeline;
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipe.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(
-            cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
+            cmdBuf, VkPipelineBindPoint.Compute, pipe.Layout,
             0, 1, descriptorSet, 0, 0);
 
         Span<uint> pc = stackalloc uint[3] { (uint)m, (uint)k, (uint)n };
         fixed (uint* pcPtr = pc)
         {
             VulkanApi.vkCmdPushConstants(
-                cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute,
+                cmdBuf, pipe.Layout, VkShaderStageFlags.Compute,
                 0, PushConstantBytes, (nint)pcPtr);
+        }
+
+        if (gemv)
+        {
+            VulkanApi.vkCmdDispatch(cmdBuf, (uint)m, 1, 1);
+            return;
         }
 
         uint groupsX = (uint)((m + WorkgroupX - 1) / WorkgroupX);
@@ -153,6 +183,8 @@ public sealed class MatMulF32Kernel : IDisposable
 
         if (_descriptorPool != 0)
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);
+        _gemvPipeline?.Dispose();
+        _gemvModule?.Dispose();
         _pipeline.Dispose();
         _module.Dispose();
     }
