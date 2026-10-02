@@ -87,7 +87,12 @@ void main() {
 
     float acc = 0.0;
 
-    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+    // One work item = one (super-block, sub-block) pair. The old mapping gave a thread a whole super-block,
+    // so a K = 2560 row (10 super-blocks) kept 10 of 128 threads busy (decode at ~60 GB/s on hybrid-dense).
+    uint workItems = pc.blocksPerRow * NUM_SUBBLOCKS;
+    for (uint work = tid; work < workItems; work += threads) {
+        uint b = work / NUM_SUBBLOCKS;
+        uint ib32 = work % NUM_SUBBLOCKS;
         uint blockByteBase = rowByteBase + b * IQ3_S_BLOCK_BYTES;
         float d = readHalf(blockByteBase);
         uint qsBase     = blockByteBase + 2u;
@@ -103,7 +108,7 @@ void main() {
         uint qh0     = read4Bytes(qhBase);
         uint qh1     = read4Bytes(qhBase + 4u);
 
-        for (uint ib32 = 0u; ib32 < NUM_SUBBLOCKS; ib32++) {
+        {   // sub-block ib32 of super-block b
             uint scaleByte = (scalesW >> ((ib32 >> 1u) * 8u)) & 0xFFu;
             uint subScale  = ((ib32 & 1u) == 0u) ? (scaleByte & 0xFu) : (scaleByte >> 4u);
             float db = d * float(1u + 2u * subScale);
