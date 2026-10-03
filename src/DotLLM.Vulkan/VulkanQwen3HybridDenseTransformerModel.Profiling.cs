@@ -32,6 +32,12 @@ namespace DotLLM.Vulkan;
 /// </remarks>
 public sealed partial class VulkanQwen3HybridDenseTransformerModel
 {
+    /// <summary>Longest forward (tokens) recorded into a single command buffer. <c>DOTLLM_VK_FUSE_FORWARD=0</c> restores one submission per layer.</summary>
+    private const int FuseMaxSeqLen = 32;
+
+    private static readonly bool FuseForwardEnabled =
+        Environment.GetEnvironmentVariable("DOTLLM_VK_FUSE_FORWARD") != "0";
+
     private static readonly bool ProfileEnabledFromEnv =
         Environment.GetEnvironmentVariable("DOTLLM_VULKAN_HYBRID_PROFILE") == "1";
 

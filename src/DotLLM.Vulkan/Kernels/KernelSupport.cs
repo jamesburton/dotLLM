@@ -175,6 +175,30 @@ internal static class KernelSupport
     /// <c>vkCmdCopyBuffer</c>, which is in the TRANSFER stage, but the
     /// attention kernel reads them in COMPUTE_SHADER).
     /// </summary>
+    /// <summary>
+    /// Conservative <c>(COMPUTE | TRANSFER) → (COMPUTE | TRANSFER)</c> read/write barrier. Used between layers when a whole short forward is
+    /// recorded into ONE command buffer instead of one submission per layer, so every cross-layer RAW/WAR/WAW edge (compute or transfer on
+    /// either side) is covered without enumerating them.
+    /// </summary>
+    internal static unsafe void ComputeTransferFullBarrier(nint cmdBuf)
+    {
+        var barrier = new VkMemoryBarrier
+        {
+            sType = VkStructureType.MemoryBarrier,
+            srcAccessMask = VkAccessFlags.ShaderWrite | VkAccessFlags.TransferWrite,
+            dstAccessMask = VkAccessFlags.ShaderRead | VkAccessFlags.ShaderWrite | VkAccessFlags.TransferRead | VkAccessFlags.TransferWrite,
+        };
+        Interop.ProfileCounters.Barriers++;
+        VulkanApi.vkCmdPipelineBarrier(
+            cmdBuf,
+            srcStageMask: VkPipelineStageFlags.Transfer | VkPipelineStageFlags.ComputeShader,
+            dstStageMask: VkPipelineStageFlags.Transfer | VkPipelineStageFlags.ComputeShader,
+            dependencyFlags: 0,
+            memoryBarrierCount: 1, pMemoryBarriers: barrier,
+            bufferMemoryBarrierCount: 0, pBufferMemoryBarriers: 0,
+            imageMemoryBarrierCount: 0, pImageMemoryBarriers: 0);
+    }
+
     internal static unsafe void TransferToComputeBarrier(nint cmdBuf)
     {
         var barrier = new VkMemoryBarrier

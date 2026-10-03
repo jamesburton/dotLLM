@@ -491,6 +491,13 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
 
         ProfBeginForward(seqLen);
 
+        // Short forwards (decode, MTP verify) record the WHOLE pass into one command buffer: one submit per layer cost a host round trip
+        // (fence wait + re-record + submit) with the GPU idle in between, ~3 of ~18 ms per Tev1-4B decode token. Long prefills keep one
+        // submission per layer (the round trip is noise there, and one multi-hundred-ms buffer would risk the GPU watchdog). The profiler
+        // needs per-layer submissions for its per-submit stamps, so it also takes the old path.
+        bool fuse = FuseForwardEnabled && _prof is null && seqLen <= FuseMaxSeqLen;
+        VulkanMtpState? mtpCapture = _mtpHead is not null ? mtpState as VulkanMtpState : null;
+
         // ── 1. Token embedding (single submission) ────────────────────────────
         _submit.Begin();
         nint cmdBuf = _submit.CommandBuffer;
@@ -498,9 +505,12 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         ProfBeginSubmit(cmdBuf);
         RecordEmbeddingGather(cmdBuf, tokenIds);
         KernelSupport.TransferToComputeBarrier(cmdBuf);
-        ProfBeforeSubmit(cmdBuf);
-        _submit.SubmitAndWait();
-        ProfAfterSubmit();
+        if (!fuse)
+        {
+            ProfBeforeSubmit(cmdBuf);
+            _submit.SubmitAndWait();
+            ProfAfterSubmit();
+        }
 
         // ── 2. Per-layer body — ONE submission per layer. Unlike the MoE hybrid
         //      there is no host round-trip between token mixing and the FFN, so
@@ -510,10 +520,17 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         {
             ref readonly var layerBuf = ref _weights.Layers[layer];
 
-            _submit.Begin();
-            cmdBuf = _submit.CommandBuffer;
-            KernelSupport.HostToComputeBarrier(cmdBuf);
-            ProfBeginSubmit(cmdBuf);
+            if (fuse)
+            {
+                KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+            }
+            else
+            {
+                _submit.Begin();
+                cmdBuf = _submit.CommandBuffer;
+                KernelSupport.HostToComputeBarrier(cmdBuf);
+                ProfBeginSubmit(cmdBuf);
+            }
 
             // ── 2a. Token mixing ────────────────────────────────────────────
             RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.Residual,
@@ -578,9 +595,20 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
                 0, 0, (ulong)((long)seqLen * hiddenRowBytes));
             KernelSupport.ComputeToHostBarrier(cmdBuf);
             ProfMark(cmdBuf, VulkanOpProfiler.Cat.Resid);
-            ProfBeforeSubmit(cmdBuf);
+            if (!fuse)
+            {
+                ProfBeforeSubmit(cmdBuf);
+                _submit.SubmitAndWait();
+                ProfAfterSubmit();
+            }
+        }
+
+        // The MTP capture below reads HiddenState on the host, so a fused buffer must complete first.
+        bool cmdOpen = fuse;
+        if (cmdOpen && mtpCapture is not null)
+        {
             _submit.SubmitAndWait();
-            ProfAfterSubmit();
+            cmdOpen = false;
         }
 
         // ── 2c. MTP hidden capture (issues #435, #469) ───────────────────────
@@ -588,7 +616,6 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         // position. The device final norm below only covers the rows that get logits (the last
         // row of a long prefill), so the rows are normalised on the host with the same RMSNorm
         // the CPU reference uses. A pure side effect on the MTP state.
-        VulkanMtpState? mtpCapture = _mtpHead is not null ? mtpState as VulkanMtpState : null;
         if (mtpCapture is not null)
         {
             int captureElems = checked(seqLen * hiddenSize);
@@ -617,10 +644,17 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         // row-by-row — and stays last-row-only above that. See MaxAllRowLogitsSeqLen.
         long headSrcOffset = (long)(seqLen - headRows) * hiddenRowBytes;
 
-        _submit.Begin();
-        cmdBuf = _submit.CommandBuffer;
-        KernelSupport.HostToComputeBarrier(cmdBuf);
-        ProfBeginSubmit(cmdBuf);
+        if (cmdOpen)
+        {
+            KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+        }
+        else
+        {
+            _submit.Begin();
+            cmdBuf = _submit.CommandBuffer;
+            KernelSupport.HostToComputeBarrier(cmdBuf);
+            ProfBeginSubmit(cmdBuf);
+        }
 
         RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
             srcOffset: (ulong)headSrcOffset, dstOffset: 0, size: (ulong)((long)headRows * hiddenRowBytes));
