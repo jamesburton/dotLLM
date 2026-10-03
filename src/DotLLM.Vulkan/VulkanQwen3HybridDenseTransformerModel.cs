@@ -495,11 +495,17 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         // (fence wait + re-record + submit) with the GPU idle in between, ~3 of ~18 ms per Tev1-4B decode token. Long prefills keep one
         // submission per layer (the round trip is noise there, and one multi-hundred-ms buffer would risk the GPU watchdog). The profiler
         // needs per-layer submissions for its per-submit stamps, so it also takes the old path.
-        bool fuse = FuseForwardEnabled && _prof is null && seqLen <= FuseMaxSeqLen;
+        // Longer prefills submit every `layersPerSubmit` layers (still bounded GPU time per submission, fewer idle gaps).
+        int layersPerSubmit = !FuseForwardEnabled || _prof is not null ? 1
+            : seqLen <= FuseMaxSeqLen ? int.MaxValue
+            : PrefillLayersPerSubmit(seqLen);
+        bool fuse = layersPerSubmit > 1;
+        bool open = false;   // a command buffer is currently being recorded (not yet submitted)
         VulkanMtpState? mtpCapture = _mtpHead is not null ? mtpState as VulkanMtpState : null;
 
         // ── 1. Token embedding (single submission) ────────────────────────────
         _submit.Begin();
+        open = true;
         nint cmdBuf = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(cmdBuf);
         ProfBeginSubmit(cmdBuf);
@@ -510,6 +516,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             ProfBeforeSubmit(cmdBuf);
             _submit.SubmitAndWait();
             ProfAfterSubmit();
+            open = false;
         }
 
         // ── 2. Per-layer body — ONE submission per layer. Unlike the MoE hybrid
@@ -520,13 +527,14 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         {
             ref readonly var layerBuf = ref _weights.Layers[layer];
 
-            if (fuse)
+            if (open)
             {
                 KernelSupport.ComputeTransferFullBarrier(cmdBuf);
             }
             else
             {
                 _submit.Begin();
+                open = true;
                 cmdBuf = _submit.CommandBuffer;
                 KernelSupport.HostToComputeBarrier(cmdBuf);
                 ProfBeginSubmit(cmdBuf);
@@ -595,20 +603,20 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
                 0, 0, (ulong)((long)seqLen * hiddenRowBytes));
             KernelSupport.ComputeToHostBarrier(cmdBuf);
             ProfMark(cmdBuf, VulkanOpProfiler.Cat.Resid);
-            if (!fuse)
+            if (!fuse || (layersPerSubmit != int.MaxValue && (layer + 1) % layersPerSubmit == 0))
             {
                 ProfBeforeSubmit(cmdBuf);
                 _submit.SubmitAndWait();
                 ProfAfterSubmit();
+                open = false;
             }
         }
 
-        // The MTP capture below reads HiddenState on the host, so a fused buffer must complete first.
-        bool cmdOpen = fuse;
-        if (cmdOpen && mtpCapture is not null)
+        // The MTP capture below reads HiddenState on the host, so an open buffer must complete first.
+        if (open && mtpCapture is not null)
         {
             _submit.SubmitAndWait();
-            cmdOpen = false;
+            open = false;
         }
 
         // ── 2c. MTP hidden capture (issues #435, #469) ───────────────────────
@@ -644,13 +652,14 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         // row-by-row — and stays last-row-only above that. See MaxAllRowLogitsSeqLen.
         long headSrcOffset = (long)(seqLen - headRows) * hiddenRowBytes;
 
-        if (cmdOpen)
+        if (open)
         {
             KernelSupport.ComputeTransferFullBarrier(cmdBuf);
         }
         else
         {
             _submit.Begin();
+            open = true;
             cmdBuf = _submit.CommandBuffer;
             KernelSupport.HostToComputeBarrier(cmdBuf);
             ProfBeginSubmit(cmdBuf);
