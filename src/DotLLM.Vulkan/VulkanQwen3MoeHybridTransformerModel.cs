@@ -582,6 +582,10 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         if (profActive) { _profAttnMs = _profMoeMs = _profEmbedMs = _profHeadMs = 0; }
         long profT0 = profActive ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
+        // Single-token decode with resident fast-path banks in every layer: the whole forward is ONE command buffer (see ForwardDecodeFused).
+        if (seqLen == 1 && FuseDecodeEnabled && CanFuseMoeDecode(hiddenSize))
+            return ForwardDecodeFused(tokenIds, positions, gdnCache, kvCache, kinds, hiddenSize, vocabSize, numHeads, numKvHeads, headDim, eps);
+
         // ── 1. Token embedding (single submission) ────────────────────────────
         _submit.Begin();
         nint cmdBuf = _submit.CommandBuffer;
@@ -603,35 +607,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             _submit.Begin();
             cmdBuf = _submit.CommandBuffer;
             KernelSupport.HostToComputeBarrier(cmdBuf);
-
-            // Snapshot hidden → residual (HiddenState aliases the residual slot
-            // in the ping-pong; we use a dedicated explicit copy for clarity at
-            // the cost of one extra device copy per layer — bit-identical and
-            // simpler than the rotate-slot trick in NemotronH).
-            RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.Residual,
-                0, 0, (ulong)((long)seqLen * hiddenSize * sizeof(float)));
-            KernelSupport.TransferToComputeBarrier(cmdBuf);
-
-            _kernels.RmsNorm.Record(cmdBuf, _state.HiddenState, layerBuf.AttnNormWeight, _state.NormOutput,
-                rowCount: seqLen, n: hiddenSize, eps: eps);
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
-
-            if (kinds[layer] == HybridLayerKind.GatedDeltaNet)
-            {
-                RecordGdnLayer(cmdBuf, layer, layerBuf.Gdn!.Value, seqLen, eps, gdnCache);
-            }
-            else
-            {
-                RecordFullAttnLayer(cmdBuf, layer, layerBuf.Attention!.Value, seqLen, positions,
-                    numHeads, numKvHeads, headDim, kvCache);
-            }
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
-
-            // First residual add: HiddenState = Residual + NormOutput (token-mixing output).
-            //   AddScratch is reused later as MoE intermediates; here it just receives the sum
-            //   so we can copy it back into HiddenState in one transfer.
-            _kernels.Add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.HiddenState,
-                seqLen * hiddenSize);
+            RecordMoeHybridTokenMixing(cmdBuf, layer, layerBuf, kinds, seqLen, hiddenSize, eps, positions, gdnCache, kvCache, numHeads, numKvHeads, headDim);
             KernelSupport.ComputeToHostBarrier(cmdBuf);
             _submit.SubmitAndWait();
             if (profActive) { _profAttnMs += ProfElapsedMs(ref profT0); }
@@ -1086,6 +1062,109 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     }
 
     // ── MoE FFN ──────────────────────────────────────────────────────────────
+
+    private static readonly bool FuseDecodeEnabled =
+        !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_FUSE_FORWARD"), "0", StringComparison.Ordinal);
+
+    // Latched once every layer's resident bundle exists and takes RecordMoeDecodeFast (the bundles are uploaded lazily by the first
+    // forwards, which therefore take the per-layer-submission path); false/unset re-checks until all bundles are present.
+    private bool _fuseDecodeOk;
+
+    private bool CanFuseMoeDecode(int hiddenSize)
+    {
+        if (_fuseDecodeOk) return true;
+        if (!_residentMoeEnabled) return false;
+        for (int l = 0; l < _cpuLayers.Length; l++)
+        {
+            if (_cpuMoeLayer[l]) return false;
+            var b = _residentMoeBundles[l];
+            if (b is null || !CanRecordMoeDecodeFast(b, 1, hiddenSize)) return false;
+        }
+        return _fuseDecodeOk = true;
+    }
+
+    /// <summary>
+    /// Single-token forward recorded into ONE command buffer. The per-layer path submits twice per layer (~80 fence round trips per token) and
+    /// the GPU idles during each host turnaround (the dense hybrid model measured 3 of 18 ms/token from exactly this: Tev1-4B 55 -> 63 tok/s).
+    /// Everything here is device-resident (resident expert banks, GPU top-k), so no host work is needed between layers.
+    /// </summary>
+    private ITensor ForwardDecodeFused(
+        ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, VulkanGdnStateCache gdnCache, IKvCache? kvCache,
+        HybridLayerKind[] kinds, int hiddenSize, int vocabSize, int numHeads, int numKvHeads, int headDim, float eps)
+    {
+        _submit.Begin();
+        nint cmdBuf = _submit.CommandBuffer;
+        KernelSupport.HostToComputeBarrier(cmdBuf);
+        RecordEmbeddingGather(cmdBuf, tokenIds);
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+        for (int layer = 0; layer < _cpuLayers.Length; layer++)
+        {
+            ref readonly var layerBuf = ref _weights.Layers[layer];
+            KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+            RecordMoeHybridTokenMixing(cmdBuf, layer, layerBuf, kinds, 1, hiddenSize, eps, positions, gdnCache, kvCache, numHeads, numKvHeads, headDim);
+            KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+            RecordMoeDecodeFast(cmdBuf, _residentMoeBundles[layer]!, layerBuf, hiddenSize, eps);
+        }
+
+        KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+        long rowBytes = (long)hiddenSize * sizeof(float);
+        RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput, srcOffset: 0, dstOffset: 0, size: (ulong)rowBytes);
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+        _kernels.RmsNorm.Record(cmdBuf, _state.NormOutput, _weights.OutputNormWeight, _state.NormOutput, rowCount: 1, n: hiddenSize, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType, _state.NormOutput, _state.Logits,
+            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: 1);
+        KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _submit.SubmitAndWait();
+
+        var result = UnmanagedTensor.Allocate(new TensorShape(1, vocabSize), DType.Float32, deviceId: -1);
+        unsafe
+        {
+            _device.Download(_state.Logits, new Span<float>((void*)result.DataPointer, vocabSize));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Records one layer's token-mixing half (residual snapshot, attn-norm, GDN or full attention, first residual add into HiddenState)
+    /// into <paramref name="cmdBuf"/>. Shared by the per-layer-submission path and the fused single-token decode path.
+    /// </summary>
+    private void RecordMoeHybridTokenMixing(
+        nint cmdBuf, int layer, in VulkanQwen3MoeHybridWeights.LayerBuffers layerBuf, HybridLayerKind[] kinds,
+        int seqLen, int hiddenSize, float eps, ReadOnlySpan<int> positions, VulkanGdnStateCache gdnCache, IKvCache? kvCache,
+        int numHeads, int numKvHeads, int headDim)
+    {
+
+        // Snapshot hidden → residual (HiddenState aliases the residual slot
+        // in the ping-pong; we use a dedicated explicit copy for clarity at
+        // the cost of one extra device copy per layer — bit-identical and
+        // simpler than the rotate-slot trick in NemotronH).
+        RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.Residual,
+            0, 0, (ulong)((long)seqLen * hiddenSize * sizeof(float)));
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+        _kernels.RmsNorm.Record(cmdBuf, _state.HiddenState, layerBuf.AttnNormWeight, _state.NormOutput,
+            rowCount: seqLen, n: hiddenSize, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        if (kinds[layer] == HybridLayerKind.GatedDeltaNet)
+        {
+            RecordGdnLayer(cmdBuf, layer, layerBuf.Gdn!.Value, seqLen, eps, gdnCache);
+        }
+        else
+        {
+            RecordFullAttnLayer(cmdBuf, layer, layerBuf.Attention!.Value, seqLen, positions,
+                numHeads, numKvHeads, headDim, kvCache);
+        }
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // First residual add: HiddenState = Residual + NormOutput (token-mixing output).
+        //   AddScratch is reused later as MoE intermediates; here it just receives the sum
+        //   so we can copy it back into HiddenState in one transfer.
+        _kernels.Add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.HiddenState,
+            seqLen * hiddenSize);
+    }
 
     /// <summary>
     /// Runs one GPU-placed layer's MoE FFN: the existing resident/streaming
