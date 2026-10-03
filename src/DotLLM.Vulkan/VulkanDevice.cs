@@ -3078,9 +3078,45 @@ public sealed class VulkanDevice : IDisposable
             VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence).ThrowOnError("vkQueueSubmit SubmitContext");
 
             nint fenceLocal = _fence;
-            VulkanApi.vkWaitForFences(_device._device, 1, fenceLocal, waitAll: 1, ulong.MaxValue)
-                .ThrowOnError("vkWaitForFences SubmitContext");
+            WaitForFenceAdaptive(fenceLocal);
             VulkanApi.vkResetFences(_device._device, 1, fenceLocal).ThrowOnError("vkResetFences SubmitContext");
+        }
+
+        // Fence wait policy. A blocking vkWaitForFences sleeps the host thread, and on this class of machine (Strix Halo UMA, Windows/WDDM) the
+        // wake-up costs ~1.3 ms per forward: with a spin on vkGetFenceStatus instead, Tev1-4B decode went 48.7 -> 55.1 tok/s and
+        // Qwen3.6-35B-A3B decode 39.7 -> ~44 (prefill unchanged: its single long wait hides the latency). Blocking for part of the wait and
+        // spinning the tail did NOT recover it (0.3-0.9 block fractions all ~49-50 tok/s), so the policy is all-or-nothing per forward.
+        // Spinning burns a core, so by default ("auto") it is used only when recent waits were short (EMA < SpinMaxMs: decode-sized forwards);
+        // long prefill waits block as before. DOTLLM_VK_SPIN_WAIT = 0 (always block) | full (always spin) | auto (default).
+        private static readonly string SpinMode = Environment.GetEnvironmentVariable("DOTLLM_VK_SPIN_WAIT") ?? "auto";
+        private const double SpinMaxMs = 40.0;
+        private double _emaWaitMs;
+
+        private unsafe void WaitForFenceAdaptive(nint fence)
+        {
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            bool spin = SpinMode switch
+            {
+                "0" => false,
+                "full" => true,
+                _ => _emaWaitMs > 0 && _emaWaitMs < SpinMaxMs,
+            };
+            if (spin)
+            {
+                while (true)
+                {
+                    int s = VulkanApi.vkGetFenceStatus(_device._device, fence);
+                    if (s == 0) break;
+                    if (s != 1) s.ThrowOnError("vkGetFenceStatus");
+                }
+            }
+            else
+            {
+                VulkanApi.vkWaitForFences(_device._device, 1, fence, waitAll: 1, ulong.MaxValue)
+                    .ThrowOnError("vkWaitForFences SubmitContext");
+            }
+            double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            _emaWaitMs = _emaWaitMs == 0 ? ms : _emaWaitMs * 0.7 + ms * 0.3;
         }
 
         // Lazily-allocated second command buffer for SplitSubmit. At most ONE
