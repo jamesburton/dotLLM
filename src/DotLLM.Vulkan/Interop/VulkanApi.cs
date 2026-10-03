@@ -344,6 +344,9 @@ internal static partial class VulkanApi
         [MarshalAs(UnmanagedType.U4)] uint waitAll, ulong timeout);
 
     [LibraryImport(LibName)]
+    internal static partial int vkGetFenceStatus(nint device, nint fence);
+
+    [LibraryImport(LibName)]
     internal static partial int vkResetFences(
         nint device, uint fenceCount, in nint pFences);
 
