@@ -200,6 +200,53 @@ public sealed class VulkanNemotronHKvCache : IKvCache
         _currentLength = length;
     }
 
+    /// <summary>
+    /// Device-to-device copy of the first <paramref name="length"/> positions into a new, independent cache sized exactly
+    /// <paramref name="length"/> (one submission for every layer). Layout is <c>[position][kvStride]</c> F32, so each layer's
+    /// prefix is one contiguous byte range.
+    /// </summary>
+    internal VulkanNemotronHKvCache SnapshotPrefix(int length)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if ((uint)length > (uint)_currentLength || length == 0) throw new ArgumentOutOfRangeException(nameof(length));
+        var copy = new VulkanNemotronHKvCache(_device, _kvSlotForLayer, _attentionLayerCount, _numKvHeads, _headDim, length);
+        copy.CopyPrefixFrom(this, length);
+        copy._currentLength = length;
+        return copy;
+    }
+
+    /// <summary>
+    /// Overwrites this cache's first <paramref name="length"/> positions with <paramref name="source"/>'s and sets the visible
+    /// length to <paramref name="length"/> (the restore half of <see cref="SnapshotPrefix"/>).
+    /// </summary>
+    internal void RestorePrefixFrom(VulkanNemotronHKvCache source, int length)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (length > _maxSeqLen) throw new ArgumentOutOfRangeException(nameof(length));
+        CopyPrefixFrom(source, length);
+        _currentLength = length;
+    }
+
+    private void CopyPrefixFrom(VulkanNemotronHKvCache source, int length)
+    {
+        if (source._attentionLayerCount != _attentionLayerCount || source._kvStride != _kvStride)
+            throw new ArgumentException("KV cache geometry mismatch.", nameof(source));
+        if (_attentionLayerCount == 0 || length == 0) return;
+        ulong bytes = (ulong)length * (ulong)_kvStride * sizeof(float);
+        using var ctx = _device.CreateSubmitContext();
+        ctx.Begin();
+        nint cmdBuf = ctx.CommandBuffer;
+        Kernels.KernelSupport.ComputeToTransferBarrier(cmdBuf);
+        var region = new Interop.VkBufferCopy { srcOffset = 0, dstOffset = 0, size = bytes };
+        for (int i = 0; i < _attentionLayerCount; i++)
+        {
+            Interop.VulkanApi.vkCmdCopyBuffer(cmdBuf, source._keys[i].Handle, _keys[i].Handle, 1, region);
+            Interop.VulkanApi.vkCmdCopyBuffer(cmdBuf, source._values[i].Handle, _values[i].Handle, 1, region);
+        }
+        Kernels.KernelSupport.TransferToComputeBarrier(cmdBuf);
+        ctx.SubmitAndWait();
+    }
+
     /// <summary>Resets the visible length. Used when starting a new sequence.</summary>
     public void Reset() => _currentLength = 0;
 

@@ -1045,6 +1045,35 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     /// <inheritdoc/>
     public IRecurrentSequenceState? CreateSequenceState() => CreateGdnStateCache();
 
+    /// <inheritdoc/>
+    public bool SupportsSequencePrefixSnapshot => true;
+
+    /// <summary>KV prefix + GDN state copy captured by <see cref="SnapshotSequencePrefix"/>.</summary>
+    private sealed class SequencePrefixSnapshot(VulkanNemotronHKvCache kv, VulkanGdnStateCache gdn, int length) : IDisposable
+    {
+        public VulkanNemotronHKvCache Kv { get; } = kv;
+        public VulkanGdnStateCache Gdn { get; } = gdn;
+        public int Length { get; } = length;
+        public void Dispose() { Kv.Dispose(); Gdn.Dispose(); }
+    }
+
+    /// <inheritdoc/>
+    public IDisposable? SnapshotSequencePrefix(IKvCache kvCache, IRecurrentSequenceState? state, int prefixLen)
+    {
+        if (kvCache is not VulkanNemotronHKvCache kv || state is not VulkanGdnStateCache gdn) return null;
+        var kvCopy = kv.SnapshotPrefix(prefixLen);
+        return new SequencePrefixSnapshot(kvCopy, gdn.Clone(), prefixLen);
+    }
+
+    /// <inheritdoc/>
+    public void RestoreSequencePrefix(IDisposable snapshot, IKvCache kvCache, IRecurrentSequenceState? state)
+    {
+        if (snapshot is not SequencePrefixSnapshot snap || kvCache is not VulkanNemotronHKvCache kv || state is not VulkanGdnStateCache gdn)
+            throw new ArgumentException("Snapshot / KV cache / state are not this model's types.");
+        kv.RestorePrefixFrom(snap.Kv, snap.Length);
+        snap.Gdn.CopyTo(gdn);
+    }
+
     /// <summary>
     /// Per-sequence <c>ForwardBatch</c>. Mirrors
     /// <see cref="VulkanQwen3MoeHybridTransformerModel.ForwardBatch"/>: the GDN scan

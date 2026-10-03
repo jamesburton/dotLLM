@@ -339,6 +339,28 @@ public interface IModel : IDisposable
     object? CheckpointRecurrentState() => null;
 
     /// <summary>
+    /// True when <see cref="SnapshotSequencePrefix"/> / <see cref="RestoreSequencePrefix"/> are implemented: a PER-SEQUENCE
+    /// (threaded-state) prefix, i.e. the first N tokens' KV rows plus that sequence's recurrent state, can be captured
+    /// into an independent snapshot and later restored into a DIFFERENT sequence's KV cache + state container. This is what a
+    /// batching scheduler needs for recurrent prefix reuse (unlike <see cref="CheckpointRecurrentState"/>, which only
+    /// targets the single model-owned state).
+    /// </summary>
+    bool SupportsSequencePrefixSnapshot => false;
+
+    /// <summary>
+    /// Captures the first <paramref name="prefixLen"/> positions of <paramref name="kvCache"/> and the recurrent
+    /// <paramref name="state"/> as it stands NOW (the caller guarantees the state has consumed exactly those
+    /// <paramref name="prefixLen"/> tokens). The snapshot is independent of both inputs and owned by the caller.
+    /// </summary>
+    IDisposable? SnapshotSequencePrefix(IKvCache kvCache, IRecurrentSequenceState? state, int prefixLen) => null;
+
+    /// <summary>
+    /// Restores a snapshot from <see cref="SnapshotSequencePrefix"/> into a (typically fresh) sequence's KV cache and state
+    /// container, leaving the KV cache at the snapshot's length so only the suffix needs prefilling.
+    /// </summary>
+    void RestoreSequencePrefix(IDisposable snapshot, IKvCache kvCache, IRecurrentSequenceState? state) { }
+
+    /// <summary>
     /// Restores model-owned recurrent state from a snapshot previously returned by
     /// <see cref="CheckpointRecurrentState"/>, undoing every <c>Forward</c> call issued against
     /// this model's model-owned state since that snapshot was captured.
