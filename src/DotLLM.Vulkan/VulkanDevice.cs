@@ -1714,6 +1714,17 @@ public sealed class VulkanDevice : IDisposable
     /// Indexed by heapIndex; VK_MAX_MEMORY_HEAPS is 16.
     /// </remarks>
     private readonly long[] _liveBytesByHeap = new long[16];
+
+    /// <summary>Number of live device allocations this device made (all heaps). Test hook for leak checks.</summary>
+    internal long LiveAllocationCount
+    {
+        get
+        {
+            long n = 0;
+            for (int h = 0; h < _liveCountByHeap.Length; h++) n += Interlocked.Read(ref _liveCountByHeap[h]);
+            return n;
+        }
+    }
     private readonly long[] _liveCountByHeap = new long[16];
 
     /// <summary>

@@ -351,19 +351,37 @@ public static class ServerStartup
         // decoding, same restriction) in this iteration, and GPU/hybrid models keep their existing
         // single-request path until the IModel.ForwardBatch override lands in those backends.
         ContinuousBatchSchedulerService? scheduler = null;
-        if (pagedFactory is not null && kvFactory is not null && draftModel is null && !mtpActive)
+        // Vulkan hybrid models (per-sequence GDN state + serial ForwardBatch) can run through the scheduler, but the
+        // serial TextGenerator path is faster until recurrent prefix restore + fused batching land, so this is opt-in:
+        // DOTLLM_VK_SCHEDULER=1. No paged pool and no prefix trie (KV-only, paged-only) on this path.
+        bool vulkanScheduler = vulkanKvFactory is not null && model.SupportsThreadedSequenceState
+            && string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_SCHEDULER"), "1", StringComparison.Ordinal);
+        if ((pagedFactory is not null || vulkanScheduler) && kvFactory is not null && draftModel is null && !mtpActive)
         {
             var schedulerOptions = ResolveSchedulerOptions(options);
+            if (vulkanScheduler)
+            {
+                // Every active sequence owns a device KV cache + a GDN state slot on a (usually unified) GPU heap, and there is
+                // no byte-budget admission without a paged pool, so bound concurrency conservatively. Override with
+                // DOTLLM_VK_SCHEDULER_MAX_SEQS.
+                int maxSeqs = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_SCHEDULER_MAX_SEQS"), out int m) && m > 0 ? m : 8;
+                schedulerOptions = (schedulerOptions ?? new ContinuousBatchSchedulerOptions()) with
+                {
+                    MaxActiveSequences = Math.Min(schedulerOptions?.MaxActiveSequences ?? maxSeqs, maxSeqs),
+                };
+            }
 
             scheduler = new ContinuousBatchSchedulerService(
                 model,
                 tokenizer,
                 kvFactory,
                 options: schedulerOptions,
-                pagedPool: pagedFactory.Pool);
+                pagedPool: pagedFactory?.Pool);
             Console.WriteLine(options.Scheduler?.EnableFairness == true
                 ? "[dotllm] Continuous-batch scheduler active (per-API-key fairness on)"
-                : "[dotllm] Continuous-batch scheduler active");
+                : vulkanScheduler
+                    ? "[dotllm] Continuous-batch scheduler active (Vulkan, opt-in DOTLLM_VK_SCHEDULER=1)"
+                    : "[dotllm] Continuous-batch scheduler active");
         }
 
         long estimatedBytes = SafeFileLength(resolvedPath);
