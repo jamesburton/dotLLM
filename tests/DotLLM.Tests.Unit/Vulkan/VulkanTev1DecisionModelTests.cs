@@ -71,6 +71,47 @@ public sealed class VulkanTev1DecisionModelTests
         Run(path!, expectCorrect: false);
     }
 
+    /// <summary>
+    /// Decode-path guard: prefill a long prompt (split-KV attention engages past ctx ~17), then greedy-decode single tokens
+    /// through the fused single-command-buffer + spin-wait defaults and require the CPU oracle's token stream.
+    /// </summary>
+    [SkippableFact]
+    public void Tev1_4B_Vulkan_LongContextGreedyDecode_MatchesCpu()
+    {
+        string? path = Find("DOTLLM_TEV1_4B_GGUF", "models--bartowski--togethercomputer_Tev1-4B-experimental-GGUF", "*Q4_K_M.gguf");
+        Skip.If(path is null, "Tev1-4B GGUF not found.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        string filler = string.Join(" ", Enumerable.Range(0, 60).Select(i => $"Order {i} shipped on day {i * 3 % 29}."));
+        // Free-form answer (not the one-letter decision prompt): after the letter the model emits an end-of-turn token and
+        // everything past it is ill-conditioned noise, which makes CPU/Vulkan stream comparison meaningless.
+        int[] prompt = tokenizer.Encode(
+            "<|im_start|>user\n" + filler + " Describe these orders in a few sentences.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
+        Assert.True(prompt.Length > 300, $"prompt too short: {prompt.Length}");
+        const int Steps = 24;
+
+        int[] cpuTokens;
+        using (var cpu = Qwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config))
+            cpuTokens = GreedyDecode((ids, pos) => cpu.Forward(ids, pos, deviceId: -1), prompt, config.VocabSize, Steps);
+
+        int[] vkTokens;
+        using (var device = VulkanDevice.Create())
+        using (var vk = VulkanQwen3HybridDenseTransformerModel.BuildFromGguf(device, gguf, config, spvDir))
+            vkTokens = GreedyDecode((ids, pos) => vk.Forward(ids, pos, deviceId: -1), prompt, config.VocabSize, Steps);
+
+        _out.WriteLine($"cpu: {string.Join(',', cpuTokens)}");
+        _out.WriteLine($"vk : {string.Join(',', vkTokens)}");
+        // Exact equality over-claims: CPU and Vulkan reduce in different orders, and a near-tie argmax can flip late in the
+        // stream (measured: first divergence at step 21 of 24, identical with the fused/spin/row-split defaults on or off,
+        // so it is backend numerics, not the decode path). Require a long agreeing prefix instead.
+        int agree = 0;
+        while (agree < Steps && cpuTokens[agree] == vkTokens[agree]) agree++;
+        Assert.True(agree >= 16, $"CPU/Vulkan greedy streams diverge at step {agree}");
+    }
+
     private void Run(string path, bool expectCorrect)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -113,6 +154,21 @@ public sealed class VulkanTev1DecisionModelTests
             if (expectCorrect)
                 Assert.Equal(cases[i].Letter, vkText);
         }
+    }
+
+    private static unsafe int[] GreedyDecode(Func<int[], int[], ITensor> forward, int[] prompt, int vocab, int steps)
+    {
+        var result = new int[steps];
+        int[] ids = prompt;
+        int[] pos = Enumerable.Range(0, prompt.Length).ToArray();
+        for (int i = 0; i < steps; i++)
+        {
+            using ITensor logits = forward(ids, pos);
+            result[i] = LastRow(logits, vocab).Token;
+            ids = [result[i]];
+            pos = [prompt.Length + i];
+        }
+        return result;
     }
 
     private static unsafe (int Token, float[] Row) Forward(Qwen3HybridDenseTransformerModel m, int[] ids, int vocab)

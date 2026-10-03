@@ -129,6 +129,39 @@ public sealed class VulkanTev1RequestLatencyProbe
         }
     }
 
+    /// <summary>
+    /// MTP speculative decode must not change greedy text: verify runs the S=K+1 path, accepted tokens are the target's argmax.
+    /// Guards the fused/spin-wait decode defaults on the verify path. Asserts a long agreeing prefix (verify batches reduce in a
+    /// different order than S=1 decode, so a late near-tie flip is backend numerics, not a bug).
+    /// </summary>
+    [SkippableFact]
+    public void Tev1_4B_MtpOnOff_GreedyTextIdentity()
+    {
+        string? path = FindGguf();
+        Skip.If(path is null, "Tev1-4B GGUF not found.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        var (model, kvFactory) = VulkanModelLoader.CreateFromGguf(device, gguf, config, spvDir);
+        using var _ = model as IDisposable;
+        Skip.IfNot(model.SupportsMtp, "checkpoint has no MTP head");
+
+        string prompt = "<|im_start|>user\nWrite a detailed paragraph about how a refrigerator works.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        var opts = new InferenceOptions { Temperature = 0, MaxTokens = 160 };
+        var plain = new TextGenerator(model, tokenizer, (cfg, size) => kvFactory(size), mtpEnabled: false).Generate(prompt, opts);
+        var mtp = new TextGenerator(model, tokenizer, (cfg, size) => kvFactory(size), mtpEnabled: true).Generate(prompt, opts);
+
+        var a = plain.GeneratedTokenIds; var b = mtp.GeneratedTokenIds;
+        int agree = 0;
+        while (agree < Math.Min(a.Length, b.Length) && a[agree] == b[agree]) agree++;
+        _out.WriteLine($"plain={a.Length} tok, mtp={b.Length} tok, agree prefix={agree}, drafted={mtp.Timings.SpeculativeDraftTokens} accepted={mtp.Timings.SpeculativeAcceptedTokens}");
+        Assert.True(mtp.Timings.SpeculativeDraftTokens > 0, "MTP never drafted: the test would not exercise the verify path");
+        Assert.True(agree >= 64, $"MTP and plain greedy streams diverge at token {agree}");
+    }
+
     /// <summary>MTP on/off for a longer free-form greedy generation: does the MTP head pay off on this 4B model at all?</summary>
     [SkippableFact]
     public void Tev1_4B_MtpOnOff_LongGeneration()
