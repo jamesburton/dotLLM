@@ -46,6 +46,9 @@ internal sealed class SchedulerRequest : ISchedulerRequest
     /// </summary>
     public IRecurrentSequenceState? RecurrentState { get; set; }
 
+    /// <summary>True when <see cref="RecurrentState"/> came from the scheduler's slot pool and may hold a previous sequence's data.</summary>
+    public bool RecurrentStateDirty { get; set; }
+
     /// <summary>True when the cache was minted by the prefix trie manager; its completion
     /// must be routed through <c>PrefixTrieManager.RecordCompletion</c> before disposal.</summary>
     public bool IsPrefixCached { get; set; }

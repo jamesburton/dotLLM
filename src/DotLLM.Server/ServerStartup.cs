@@ -368,6 +368,9 @@ public static class ServerStartup
                 schedulerOptions = (schedulerOptions ?? new ContinuousBatchSchedulerOptions()) with
                 {
                     MaxActiveSequences = Math.Min(schedulerOptions?.MaxActiveSequences ?? maxSeqs, maxSeqs),
+                    // Recurrent prefix snapshots (KV prefix + GDN state copies; ~tens of MB each on a 4B hybrid). Opt out with
+                    // DOTLLM_SCHED_RECURRENT_PREFIX=0.
+                    RecurrentPrefixCacheEntries = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_SCHED_RECURRENT_PREFIX"), out int rp) && rp >= 0 ? rp : 4,
                 };
             }
 
