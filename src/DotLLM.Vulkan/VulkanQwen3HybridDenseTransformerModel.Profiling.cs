@@ -35,6 +35,15 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel
     /// <summary>Longest forward (tokens) recorded into a single command buffer. <c>DOTLLM_VK_FUSE_FORWARD=0</c> restores one submission per layer.</summary>
     private const int FuseMaxSeqLen = 32;
 
+    /// <summary>Layers recorded per submission for a prefill longer than <see cref="FuseMaxSeqLen"/>. <c>DOTLLM_VK_PREFILL_LAYERS_PER_SUBMIT</c> overrides (1 = one per layer).</summary>
+    private static int PrefillLayersPerSubmit(int seqLen)
+    {
+        if (int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_PREFILL_LAYERS_PER_SUBMIT"), out int n) && n >= 1) return n;
+        // Bounded GPU time per submission (watchdog): ~3 ms/layer at 128 tokens, ~25 ms/layer at 2k; 8 layers up to 1k tokens, 4 up to 2k, else per layer.
+        // Measured on Tev1-4B: pp64 +2.7%, pp128 +1.5%, pp512 +1.3% over one submission per layer.
+        return seqLen <= 1024 ? 8 : seqLen <= 2048 ? 4 : 1;
+    }
+
     private static readonly bool FuseForwardEnabled =
         Environment.GetEnvironmentVariable("DOTLLM_VK_FUSE_FORWARD") != "0";
 
