@@ -26,6 +26,7 @@ public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
     // Output rows per workgroup: 16 for the one-subgroup shader; 64 for the _m64 shaders (4 wave64 subgroups, each one
     // 16-row M tile, sharing one staged B tile).
     private readonly int _tileM;
+    private readonly bool _rowPair;
     private const int PushConstantBytes = 7 * sizeof(uint);   // + tileList
 
     private readonly VulkanDevice _device;
@@ -36,9 +37,10 @@ public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
     private readonly int _blockBytes;
     private bool _disposed;
 
-    private MoeGroupedMatmulKQuantCoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, int blockBytes, int tileM)
+    private MoeGroupedMatmulKQuantCoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, int blockBytes, int tileM, bool rowPair)
     {
         _tileM = tileM;
+        _rowPair = rowPair;
         _device = device;
         _module = module;
         _pipeline = pipeline;
@@ -75,12 +77,15 @@ public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
         => device.HasCooperativeMatrix && File.Exists(Path.Combine(spvDir, SpvName(quant)));
 
     /// <summary>Creates the kernel for <paramref name="quant"/>; <paramref name="tileMOverride"/> (16 or 64) pins the tile shape for tests.</summary>
-    public static MoeGroupedMatmulKQuantCoopmatKernel Create(VulkanDevice device, string spvDir, MoeGroupedKQuant quant, int tileMOverride = 0)
+    public static MoeGroupedMatmulKQuantCoopmatKernel Create(VulkanDevice device, string spvDir, MoeGroupedKQuant quant, int tileMOverride = 0, bool rowPair = false)
     {
         if (!device.HasCooperativeMatrix)
             throw new InvalidOperationException("MoeGroupedMatmulKQuantCoopmatKernel requires VK_KHR_cooperative_matrix support.");
         int tileM = tileMOverride > 0 && File.Exists(Path.Combine(spvDir, SpvNameTile(quant, tileMOverride))) ? tileMOverride : ResolveTileM(device, spvDir, quant);
         string path = Path.Combine(spvDir, SpvNameTile(quant, tileM));
+        // Row-pair shaders exist only for the 4-subgroup (64-row) form and need an INDIRECT launch built with 32-row tiles; anything else keeps the 16-row shader.
+        if (rowPair && tileM == 64 && File.Exists(path.Replace("_m64.spv", "_m64r2.spv", StringComparison.Ordinal))) path = path.Replace("_m64.spv", "_m64r2.spv", StringComparison.Ordinal);
+        else rowPair = false;
         if (!File.Exists(path)) throw new FileNotFoundException($"Vulkan SPIR-V not found: {path}.");
 
         var module = VulkanModule.LoadFromFile(device, path);
@@ -97,7 +102,7 @@ public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
             throw;
         }
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-        return new MoeGroupedMatmulKQuantCoopmatKernel(device, module, pipeline, pool, BlockBytesOf(quant), tileM);
+        return new MoeGroupedMatmulKQuantCoopmatKernel(device, module, pipeline, pool, BlockBytesOf(quant), tileM, rowPair);
     }
 
     /// <summary>Raw pipeline handle, for driver shader-statistics diagnostics.</summary>
@@ -179,6 +184,9 @@ public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
             VulkanApi.vkCmdPushConstants(cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)pcPtr);
         VulkanApi.vkCmdDispatchIndirect(cmdBuf, dispatchArgs.Handle, (ulong)dispatchArgsOffset);
     }
+
+    /// <summary>Token rows per workgroup: 32 for the row-pair shaders (build the tile list with this), else 16.</summary>
+    public int RowTile => _rowPair ? 2 * TileN : TileN;
 
     /// <summary>Weight-row tiles per workgroup column (the x extent of the grid): <c>ceil(m / tileM)</c>.</summary>
     public int MTiles(int m) => (m + _tileM - 1) / _tileM;

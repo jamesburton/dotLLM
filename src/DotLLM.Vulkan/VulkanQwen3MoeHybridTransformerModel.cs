@@ -1614,7 +1614,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         if (tileBuild is not null)
         {
             tileBuild.Record(cmdBuf, _state.MoeGroupOffsets, _state.MoeGroupDispatchArgs, numE,
-                gateUpKernel.MTiles(interm), downKernel.MTiles(hidden));
+                gateUpKernel.MTiles(interm), downKernel.MTiles(hidden), tileRows: gateUpKernel.RowTile);
             KernelSupport.ComputeToIndirectAndComputeBarrier(cmdBuf);
             if (MoeStageProfileEnabled)
             {

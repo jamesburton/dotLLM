@@ -9,7 +9,7 @@ namespace DotLLM.Vulkan.Kernels;
 /// </summary>
 public sealed class MoeBuildTileListKernel : IDisposable
 {
-    private const int PushConstantBytes = 3 * sizeof(uint);   // numExperts, mTiles0, mTiles1
+    private const int PushConstantBytes = 4 * sizeof(uint);   // numExperts, mTiles0, mTiles1, tileRows
 
     /// <summary>Byte distance between the two dispatch-argument triples the build writes.</summary>
     public const int ArgsStrideBytes = 3 * sizeof(uint);
@@ -73,7 +73,7 @@ public sealed class MoeBuildTileListKernel : IDisposable
     /// <see cref="ArgsStrideBytes"/> (gate/up and down projections have different weight-row extents).
     /// A <see cref="KernelSupport.ComputeToIndirectAndComputeBarrier"/> must separate this from the dispatches that consume them.
     /// </summary>
-    public unsafe void Record(nint cmdBuf, VulkanDevice.Buffer offsetsAndTiles, VulkanDevice.Buffer args, int numExperts, int mTiles0, int mTiles1)
+    public unsafe void Record(nint cmdBuf, VulkanDevice.Buffer offsetsAndTiles, VulkanDevice.Buffer args, int numExperts, int mTiles0, int mTiles1, int tileRows = TileRows)
     {
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (mTiles0 <= 0) throw new ArgumentOutOfRangeException(nameof(mTiles0));
@@ -84,7 +84,7 @@ public sealed class MoeBuildTileListKernel : IDisposable
         nint set = _descriptorCache.GetOrCreate(buffers);
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout, 0, 1, set, 0, 0);
-        Span<uint> pc = stackalloc uint[3] { (uint)numExperts, (uint)mTiles0, (uint)mTiles1 };
+        Span<uint> pc = stackalloc uint[4] { (uint)numExperts, (uint)mTiles0, (uint)mTiles1, (uint)tileRows };
         fixed (uint* p = pc)
             VulkanApi.vkCmdPushConstants(cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)p);
         VulkanApi.vkCmdDispatch(cmdBuf, 1, 1, 1);

@@ -23,15 +23,15 @@ layout(push_constant) uniform PushConstants {
     uint numExperts;
     uint mTiles0;    // weight-row tiles of the first grouped dispatch kind (x dimension of its grid)
     uint mTiles1;    // ... and of the second
+    uint tileRows;   // rows per tile: 16 (one token tile per workgroup) or 32 (row-pair shaders)
 } pc;
 
-const uint TILE_ROWS = 16u;
 
 shared uint partial[256];
 
 uint tilesOf(uint e) {
     uint cnt = data[e + 1u] - data[e];
-    return (cnt + TILE_ROWS - 1u) / TILE_ROWS;
+    return (cnt + pc.tileRows - 1u) / pc.tileRows;
 }
 
 void main() {
@@ -58,7 +58,7 @@ void main() {
     uint listBase = E + 1u;
     for (uint e = e0; e < e1; e++) {
         uint cnt = data[e + 1u] - data[e];
-        for (uint r = 0u; r < cnt; r += TILE_ROWS) {
+        for (uint r = 0u; r < cnt; r += pc.tileRows) {
             data[listBase + 2u * t] = e;
             data[listBase + 2u * t + 1u] = r;
             t++;

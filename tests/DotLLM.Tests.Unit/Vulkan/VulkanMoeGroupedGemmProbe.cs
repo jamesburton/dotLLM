@@ -48,6 +48,8 @@ public sealed class VulkanMoeGroupedGemmProbe
         for (int i = 0; i < E; i++) skew[i] = (int)Math.Round(w[i] / ws * 4096);
         scenarios.Add(("skewed", skew));
         scenarios.Add(("sparse64", Enumerable.Range(0, E).Select(i => i < 64 ? 64 : 0).ToArray()));
+        scenarios.Add(("uniform64", Enumerable.Repeat(64, E).ToArray()));   // pp2048-like: 4 row tiles per expert
+        scenarios.Add(("uniform24", Enumerable.Repeat(24, E).ToArray()));
 
         foreach (var (name, counts) in scenarios)
         {
@@ -58,13 +60,14 @@ public sealed class VulkanMoeGroupedGemmProbe
             using var args = device.AllocateDeviceLocal(2 * MoeBuildTileListKernel.ArgsStrideBytes);
             device.Upload(new ReadOnlySpan<byte>(System.Runtime.InteropServices.MemoryMarshal.AsBytes(Offsets(counts).AsSpan()).ToArray()), offs);
             int tiles = counts.Sum(c => (c + 15) / 16);
+            int tiles32 = counts.Sum(c => (c + 31) / 32);
 
             using var build = MoeBuildTileListKernel.Create(device, spvDir);
 
-            string line = $"{name,-10} rows={rows,5} tiles={tiles,4}: ";
-            foreach (var (mode, tileM) in new[] { ("indirect", 64), ("indirect", 16), ("indirect", 64), ("indirect", 16) })
+            string line = $"{name,-10} rows={rows,5} tiles16={tiles,4} tiles32={tiles32,4}: ";
+            foreach (var (mode, tileM, pair) in new[] { ("indirect", 64, false), ("indirect", 64, true), ("indirect", 64, false), ("indirect", 64, true) })
             {
-                using var kern = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K, tileM);
+                using var kern = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K, tileM, pair);
                 double best = double.MaxValue;
                 for (int trial = 0; trial < 5; trial++)
                 {
@@ -72,7 +75,7 @@ public sealed class VulkanMoeGroupedGemmProbe
                     ctx.Begin();
                     if (mode == "indirect")
                     {
-                        build.Record(ctx.CommandBuffer, offs, args, E, kern.MTiles(M), kern.MTiles(M));
+                        build.Record(ctx.CommandBuffer, offs, args, E, kern.MTiles(M), kern.MTiles(M), kern.RowTile);
                         KernelSupport.ComputeToIndirectAndComputeBarrier(ctx.CommandBuffer);
                     }
                     for (int r = 0; r < 20; r++)
@@ -86,7 +89,7 @@ public sealed class VulkanMoeGroupedGemmProbe
                     best = Math.Min(best, sw.Elapsed.TotalMilliseconds / 20);
                 }
                 double gbps = bankBytes / (best * 1e-3) / 1e9;
-                line += $" m{tileM}={best:F3}ms({gbps:F0}GB/s)";
+                line += $" m{tileM}{(pair ? "r2" : "")}={best:F3}ms({gbps:F0}GB/s)";
             }
             _out.WriteLine(line);
         }
