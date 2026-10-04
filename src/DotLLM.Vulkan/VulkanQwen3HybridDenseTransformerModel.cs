@@ -1126,6 +1126,21 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
 
     // ── Dense SwiGLU FFN ─────────────────────────────────────────────────────
 
+    /// <summary>Smallest prefill length that takes the F16-activation ffn-down path (the activation matrix must outgrow the cache).</summary>
+    private static readonly int F16ActMinSeqLen =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_F16_ACT_MIN_N"), out int v) && v > 0 ? v : 384;
+
+    /// <summary>The F16-activation GEMM for a down-projection quant, or null when that quant has none (or it needs a non-coopmat path).</summary>
+    private CoopmatF16Gemm? F16ActivationGemmFor(QuantizationType qt, int inputDim)
+        => qt switch
+        {
+            QuantizationType.Q4_K when (inputDim % 256) == 0 => _kernels.MatMulQ4KGemmCoopmat?.F16Activation,
+            QuantizationType.Q5_K when (inputDim % 256) == 0 => _kernels.MatMulQ5KGemmCoopmat?.F16Activation,
+            QuantizationType.Q6_K when (inputDim % 256) == 0 => _kernels.MatMulQ6KGemmCoopmat?.F16Activation,
+            QuantizationType.Q8_0 when (inputDim % 32) == 0 => _kernels.MatMulQ8GemmCoopmat?.F16Activation,
+            _ => null,
+        };
+
     /// <summary>
     /// Records the dense FFN for one layer, reading the post-FFN-norm activations
     /// from <c>NormOutput</c> and writing the down-projection back into it — the
@@ -1153,6 +1168,23 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             outputDim: ffn.UpOutputDim, inputDim: ffn.UpInputDim, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjFfn);
+
+        // Wide-K down projection with large n: produce the SwiGLU result as F16 (half the activation traffic; numerically equivalent: the
+        // GEMM stages B as F16 anyway) and run the F16-activation GEMM. See CoopmatF16Gemm for the measurements.
+        int actElems = checked(seqLen * intermediateSize);
+        if (_hadamard is null && seqLen >= F16ActMinSeqLen && ffn.DownInputDim >= CoopmatF16Gemm.MinK
+            && (ffn.DownInputDim & 3) == 0 && _kernels.SwiGlu.HasF16Out
+            && F16ActivationGemmFor(ffn.DownDeviceQuantType, ffn.DownInputDim) is { } downF16)
+        {
+            _kernels.SwiGlu.RecordF16Out(cmdBuf, _state.FfnGate, _state.FfnUp, _state.FfnSilu, actElems);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.FfnAct);
+            if (_prof is not null) ProfNoteMatmul(ffn.DownDeviceQuantType, ffn.DownOutputDim, ffn.DownInputDim, seqLen);
+            downF16.Record(cmdBuf, ffn.DownWeight, _state.FfnSilu, _state.NormOutput,
+                m: ffn.DownOutputDim, k: ffn.DownInputDim, n: seqLen);
+            ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjFfn);
+            return;
+        }
 
         _kernels.SwiGlu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.FfnSilu,
             n: checked(seqLen * intermediateSize));

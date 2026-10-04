@@ -200,7 +200,8 @@ public sealed class MatMulQ8_0GemmCoopmatKernel : IDisposable
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
-    private CoopmatSplitK? _splitK;   // blocked 128x128 variant only
+    private CoopmatSplitK? _splitK;
+    private CoopmatF16Gemm? _f16Act;   // blocked 128x128 variant only
     private bool _disposed;
 
     private MatMulQ8_0GemmCoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
@@ -267,16 +268,27 @@ public sealed class MatMulQ8_0GemmCoopmatKernel : IDisposable
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
         var kernel = new MatMulQ8_0GemmCoopmatKernel(device, module, pipeline, pool, variant.TileM, variant.TileN);
         if (variant.SpvFileName == Q8_0GemmCoopmatVariant.Blocked128x128x4.SpvFileName)
+        {
             kernel._splitK = CoopmatSplitK.TryCreate(device, spvDir, "matmul_q8_0_gemm_coopmat_128x128x4_splitk.spv",
                 QuantFormat.Q8_0BlockBytes, QuantFormat.LegacyGroupSize);
+            kernel._f16Act = CoopmatF16Gemm.TryCreate(device, spvDir, "matmul_q8_0_gemm_coopmat_128x128x4_bh.spv",
+                "matmul_q8_0_gemm_coopmat_128x128x4_bh_splitk.spv", QuantFormat.Q8_0BlockBytes, QuantFormat.LegacyGroupSize);
+        }
         return kernel;
     }
+
+    /// <summary>
+    /// F16-activation sibling (null when disabled or unsupported): same GEMM with B as packed halves, for large-k shapes whose F32
+    /// activations would overflow the Infinity Cache. See <see cref="CoopmatF16Gemm"/>.
+    /// </summary>
+    internal CoopmatF16Gemm? F16Activation => _f16Act;
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
     internal void InvalidateDescriptorCache()
     {
         _descriptorCache.Reset();
         _splitK?.InvalidateDescriptorCache();
+        _f16Act?.InvalidateDescriptorCache();
     }
 
     /// <summary>
@@ -372,6 +384,7 @@ public sealed class MatMulQ8_0GemmCoopmatKernel : IDisposable
         if (_disposed) return;
         _disposed = true;
         _splitK?.Dispose();
+        _f16Act?.Dispose();
 
         if (_descriptorPool != 0)
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);
