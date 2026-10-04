@@ -25,6 +25,8 @@ public sealed class VulkanQwen3HybridDenseForwardBatchTests
         [760, 3766, 1414, 7701, 310, 381, 264, 47739, 466, 47739],
         [33, 1049, 369, 4222, 421, 279, 2144, 13, 999, 11, 430, 7701],
         [1, 100, 200, 300, 400],
+        // Longer than MaxAllRowLogitsSeqLen: only the LAST row is returned, so the fused path's head-row selection is exercised.
+        [..Enumerable.Range(0, 40).Select(i => 1000 + i * 37 % 5000)],
     ];
 
     private static string? FindGguf()
@@ -189,7 +191,7 @@ public sealed class VulkanQwen3HybridDenseForwardBatchTests
     {
         using var f = Open();
         var serial = RunSerial(f);
-        var batched = RunBatched(f, shareGdn: false);
+        var batched = WithSerialBatch(() => RunBatched(f, shareGdn: false));
 
         double worst = 0;
         for (int s = 0; s < Prompts.Length; s++)
@@ -215,7 +217,7 @@ public sealed class VulkanQwen3HybridDenseForwardBatchTests
     {
         using var f = Open();
         var serial = RunSerial(f);
-        var mutant = RunBatched(f, shareGdn: true);
+        var mutant = WithSerialBatch(() => RunBatched(f, shareGdn: true));
 
         double worst = 0;
         for (int s = 0; s < Prompts.Length; s++)
@@ -223,5 +225,60 @@ public sealed class VulkanQwen3HybridDenseForwardBatchTests
                 for (int i = 0; i < serial[s][step].Length; i++)
                     worst = Math.Max(worst, Math.Abs(serial[s][step][i] - mutant[s][step][i]));
         Assert.True(worst > 1e-3, $"shared-slot mutant did not diverge (max |diff| = {worst:E3}): the identity test is insensitive");
+    }
+
+    private static T WithEnv<T>(string name, string value, Func<T> body)
+    {
+        string? saved = Environment.GetEnvironmentVariable(name);
+        Environment.SetEnvironmentVariable(name, value);
+        try { return body(); }
+        finally { Environment.SetEnvironmentVariable(name, saved); }
+    }
+
+    // Engage the stacked path even for these short batches.
+    private static T WithFusedBatch<T>(Func<T> body) => WithEnv("DOTLLM_VK_BATCH_FUSE_MIN_ROWS", "1", body);
+
+    // The serial loop: the bit-identity oracle for the tests that pin it.
+    private static T WithSerialBatch<T>(Func<T> body) => WithEnv("DOTLLM_VK_BATCH_FUSE", "0", body);
+
+    /// <summary>
+    /// #687: the stacked forward (FFN GEMMs over the rows of every sequence, token mixing per sequence) must stay on the serial
+    /// oracle. Not bit-identical: the FFN GEMMs run at a different n. Same greedy tokens and logits close.
+    /// </summary>
+    [SkippableFact]
+    public void ForwardBatchFused_MatchesSerialOracle()
+    {
+        using var f = Open();
+        var serial = RunSerial(f);
+        var fused = WithFusedBatch(() => RunBatched(f, shareGdn: false));
+
+        double worst = 0;
+        for (int s = 0; s < Prompts.Length; s++)
+        {
+            Assert.Equal(serial[s].Count, fused[s].Count);
+            for (int step = 0; step < serial[s].Count; step++)
+            {
+                Assert.Equal(Argmax(serial[s][step]), Argmax(fused[s][step]));
+                for (int i = 0; i < serial[s][step].Length; i++)
+                    worst = Math.Max(worst, Math.Abs(serial[s][step][i] - fused[s][step][i]));
+            }
+        }
+        Assert.True(worst < 0.05, $"fused vs serial logits differ: max |diff| = {worst:E3}");
+    }
+
+    /// <summary>Sensitivity control for the stacked path: one shared GDN slot must corrupt it just like the serial loop.</summary>
+    [SkippableFact]
+    public void ForwardBatchFused_SharedGdnSlot_Mutant_Diverges()
+    {
+        using var f = Open();
+        var serial = RunSerial(f);
+        var mutant = WithFusedBatch(() => RunBatched(f, shareGdn: true));
+
+        double worst = 0;
+        for (int s = 0; s < Prompts.Length; s++)
+            for (int step = 0; step < serial[s].Count; step++)
+                for (int i = 0; i < serial[s][step].Length; i++)
+                    worst = Math.Max(worst, Math.Abs(serial[s][step][i] - mutant[s][step][i]));
+        Assert.True(worst > 1e-3, $"fused shared-slot mutant did not diverge (max |diff| = {worst:E3})");
     }
 }
