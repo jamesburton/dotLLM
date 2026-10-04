@@ -145,6 +145,29 @@ internal static class KernelSupport
     }
 
     /// <summary>
+    /// <c>COMPUTE_SHADER write -&gt; DISPATCH_INDIRECT read + COMPUTE_SHADER read/write</c>: a kernel wrote dispatch arguments (and
+    /// possibly data the next dispatch reads); the next dispatch consumes both.
+    /// </summary>
+    internal static unsafe void ComputeToIndirectAndComputeBarrier(nint cmdBuf)
+    {
+        var barrier = new VkMemoryBarrier
+        {
+            sType = VkStructureType.MemoryBarrier,
+            srcAccessMask = VkAccessFlags.ShaderWrite,
+            dstAccessMask = VkAccessFlags.IndirectCommandRead | VkAccessFlags.ShaderRead | VkAccessFlags.ShaderWrite,
+        };
+        Interop.ProfileCounters.Barriers++;
+        VulkanApi.vkCmdPipelineBarrier(
+            cmdBuf,
+            srcStageMask: VkPipelineStageFlags.ComputeShader,
+            dstStageMask: VkPipelineStageFlags.ComputeShader | VkPipelineStageFlags.DrawIndirect,
+            dependencyFlags: 0,
+            memoryBarrierCount: 1, pMemoryBarriers: barrier,
+            bufferMemoryBarrierCount: 0, pBufferMemoryBarriers: 0,
+            imageMemoryBarrierCount: 0, pImageMemoryBarriers: 0);
+    }
+
+    /// <summary>
     /// Inserts a <c>COMPUTE_SHADER → COMPUTE_SHADER</c> pipeline barrier with
     /// a <c>SHADER_WRITE → SHADER_READ</c> memory dependency. Used between
     /// every pair of kernels that share a command buffer to ensure the

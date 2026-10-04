@@ -27,6 +27,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulIq4XsGemmCoopmatKernel? MatMulIq4XsGemmCoopmat { get; private set; }
     // Grouped-by-expert prefill path for resident Q4_K gate/up + Q5_K down banks (issue #637). All null/absent together unless every piece loads.
     public MoeExpertOffsetsKernel? MoeExpertOffsets { get; private set; }
+    public MoeBuildTileListKernel? MoeBuildTileList { get; private set; }
     public MoeExpandGroupByExpertF32Kernel? MoeExpandGroupByExpert { get; private set; }
     public MoeUngroupScatterF32Kernel? MoeUngroupScatter { get; private set; }
     public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ4K { get; private set; }
@@ -423,6 +424,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             && MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q5_K))
         {
             kernels.MoeExpertOffsets = MoeExpertOffsetsKernel.Create(device, spvDir);
+            if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_INDIRECT_TILES") != "0" && MoeBuildTileListKernel.IsSupportedOn(spvDir))
+                kernels.MoeBuildTileList = MoeBuildTileListKernel.Create(device, spvDir);
             kernels.MoeExpandGroupByExpert = MoeExpandGroupByExpertF32Kernel.Create(device, spvDir);
             kernels.MoeUngroupScatter = MoeUngroupScatterF32Kernel.Create(device, spvDir);
             kernels.MoeGroupedQ4K = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K);
@@ -525,6 +528,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeWeightedScatter.InvalidateDescriptorCache();
         MoeSigmoidGatedAdd.InvalidateDescriptorCache();
         MoeExpertOffsets?.InvalidateDescriptorCache();
+        MoeBuildTileList?.InvalidateDescriptorCache();
         MoeExpandGroupByExpert?.InvalidateDescriptorCache();
         MoeUngroupScatter?.InvalidateDescriptorCache();
         MoeGroupedQ4K?.InvalidateDescriptorCache();
@@ -544,7 +548,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     {
         QGateDeinterleave?.Dispose(); GdnQkvSplit?.Dispose(); SwiGluQuantizeFused?.Dispose(); RmsNormQuantizeFused?.Dispose(); MatMulQ8Mmvq?.Dispose(); MoeMmvqQ6K?.Dispose(); MoeMmvqQ5K?.Dispose(); MoeMmvqQ4K?.Dispose();
         MoeGroupedQ6K?.Dispose(); MoeGroupedQ5K?.Dispose(); MoeGroupedQ4K?.Dispose(); MoeUngroupScatter?.Dispose();
-        MoeExpandGroupByExpert?.Dispose(); MoeExpertOffsets?.Dispose();
+        MoeExpandGroupByExpert?.Dispose(); MoeExpertOffsets?.Dispose(); MoeBuildTileList?.Dispose();
         MoeSigmoidGatedAdd.Dispose();
         MoeWeightedScatter.Dispose();
         MoeIndexedMatmulQ4KMmq?.Dispose();
