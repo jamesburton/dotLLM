@@ -320,7 +320,7 @@ public sealed class VulkanHybridSchedulerIdentityTests
             }
         }
 
-        for (int round = 0; round < 4; round++)
+        for (int round = 0; round < (int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_PROBE_ROUNDS"), out int pr) && pr > 0 ? pr : 4); round++)
         {
             double a = Serial(false);
             double c0 = await SchedWith("0", null);       // serial ForwardBatch loop

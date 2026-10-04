@@ -1131,9 +1131,13 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     private static bool BatchFuseEnabled =>
         !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_BATCH_FUSE"), "0", StringComparison.Ordinal);
 
-    /// <summary>Smallest total row count worth stacking (below it a batch is decode-sized and the serial GEMVs win).</summary>
+    /// <summary>
+    /// Smallest total row count worth stacking. Measured on Tev1-4B decode (one row per sequence, same-window interleaved, reference-checked):
+    /// stacked vs the serial loop = 0.56x at 2 sequences, 0.79x at 3, 1.00x at 4, 1.18x at 5, 1.35x at 6, 1.71x at 8 -- below 5 rows the serial
+    /// GEMVs win. Prefill rows always favour stacking (GEMM).
+    /// </summary>
     private static int BatchFuseMinRows =>
-        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_BATCH_FUSE_MIN_ROWS"), out int mr) && mr > 0 ? mr : 32;
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_BATCH_FUSE_MIN_ROWS"), out int mr) && mr > 0 ? mr : 5;
 
     private static int TotalRows(IReadOnlyList<SequenceForwardRequest> requests)
     {
