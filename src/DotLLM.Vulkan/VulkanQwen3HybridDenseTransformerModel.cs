@@ -1115,11 +1115,270 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             }
         }
 
+        if (requests.Count >= 2 && BatchFuseEnabled && _prof is null && TotalRows(requests) >= BatchFuseMinRows)
+            return ForwardBatchFused(requests);
+
         var results = new ITensor[requests.Count];
         for (int i = 0; i < requests.Count; i++)
         {
             var r = requests[i];
             results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState);
+        }
+        return results;
+    }
+
+    /// <summary>Opt-out for the fused batched forward (<c>DOTLLM_VK_BATCH_FUSE=0</c>): falls back to the serial per-sequence loop, which is the bit-identity oracle.</summary>
+    private static bool BatchFuseEnabled =>
+        !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_BATCH_FUSE"), "0", StringComparison.Ordinal);
+
+    /// <summary>Smallest total row count worth stacking (below it a batch is decode-sized and the serial GEMVs win).</summary>
+    private static int BatchFuseMinRows =>
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_BATCH_FUSE_MIN_ROWS"), out int mr) && mr > 0 ? mr : 32;
+
+    private static int TotalRows(IReadOnlyList<SequenceForwardRequest> requests)
+    {
+        int n = 0;
+        for (int i = 0; i < requests.Count; i++) n += requests[i].TokenIds.Length;
+        return n;
+    }
+
+    // Stacked activations of the fused batch forward: the post-norm / token-mixing rows of every sequence (rows = sum of lengths).
+    private VulkanDevice.Buffer? _batchNorm;
+    private int _batchNormRows;
+    private VulkanDevice.Buffer? _batchPositions;
+    private int _batchPositionsRows;
+
+    /// <summary>
+    /// Fused batched forward (#687): the rows of every sequence are stacked so each dense-FFN GEMM streams its weights once for the whole
+    /// batch instead of once per sequence (the Tev1-4B FFN is ~half of a prefill, and its GEMMs run at n = 61 when serial vs n = 488
+    /// stacked). Token mixing stays per sequence: each GDN / attention layer copies its sequence's rows into the model's working
+    /// <c>NormOutput</c>, runs the unchanged single-sequence recording against that sequence's own KV cache / GDN state, and copies the
+    /// result back. Row-wise ops (norms, residual adds, FFN) run once over all rows. Every output row is computed by the same kernels as
+    /// the serial path except the FFN GEMMs, whose n differs, so the result is equivalent rather than bit-identical.
+    /// </summary>
+    private IReadOnlyList<ITensor> ForwardBatchFused(IReadOnlyList<SequenceForwardRequest> requests)
+    {
+        int n = requests.Count;
+        int hiddenSize = Config.HiddenSize;
+        int intermediateSize = Config.IntermediateSize;
+        int vocabSize = Config.VocabSize;
+        int numHeads = Config.NumAttentionHeads;
+        int numKvHeads = Config.NumKvHeads;
+        int headDim = Config.HeadDim;
+        float eps = Config.NormEpsilon;
+        int maxSeq = Config.MaxSequenceLength;
+
+        var offsets = new int[n + 1];
+        var gdnCaches = new VulkanGdnStateCache[n];
+        for (int i = 0; i < n; i++)
+        {
+            var r = requests[i];
+            int len = r.TokenIds.Length;
+            if (len == 0 || r.Positions.Length != len)
+                throw new ArgumentException($"Request {i}: tokenIds must be non-empty and match positions.", nameof(requests));
+            for (int j = 0; j < len; j++)
+            {
+                if ((uint)r.Positions.Span[j] >= (uint)maxSeq)
+                    throw new ArgumentOutOfRangeException(nameof(requests), $"Position {r.Positions.Span[j]} exceeds max sequence length {maxSeq}.");
+            }
+            if (r.GdnState is not VulkanGdnStateCache vk || vk.NumGdnLayers != _gdnCache.NumGdnLayers)
+                throw new ArgumentException($"Request {i}: GdnState must be a VulkanGdnStateCache of this model.", nameof(requests));
+            gdnCaches[i] = vk;
+            offsets[i + 1] = offsets[i] + len;
+        }
+        int sumN = offsets[n];
+
+        // Head rows per sequence, exactly as the serial forward decides them.
+        var headRowsOf = new int[n];
+        int headTotal = 0;
+        for (int i = 0; i < n; i++)
+        {
+            int len = offsets[i + 1] - offsets[i];
+            headRowsOf[i] = len <= _allRowLogitsLimit ? len : 1;
+            headTotal += headRowsOf[i];
+        }
+
+        // Every (re)allocation happens BEFORE recording: a grow invalidates the handle-keyed descriptor caches (resets pools an open
+        // command buffer may still reference).
+        bool resized = _state.EnsureCapacity(sumN);
+        if (_batchNorm is null || _batchNormRows < sumN)
+        {
+            _batchNorm?.Dispose();
+            _batchNorm = _device.AllocateDeviceLocal((long)sumN * hiddenSize * sizeof(float));
+            _batchNormRows = sumN;
+            resized = true;
+        }
+        if (_batchPositions is null || _batchPositionsRows < sumN)
+        {
+            _batchPositions?.Dispose();
+            _batchPositions = _device.Allocate((long)sumN * sizeof(int));
+            _batchPositionsRows = sumN;
+            resized = true;
+        }
+        if (resized)
+        {
+            _kernels.InvalidateAll();
+            _hadamard?.InvalidateDescriptorCache();
+            _embedGather?.InvalidateDescriptorCache();
+            _gdnSnapScan?.InvalidateDescriptorCache();
+            _iqF16Prefill?.InvalidateDescriptorCache();
+        }
+        var logitsBuf = headTotal == 1 ? SingleRowLogits : EnsureMultiRowLogits(headTotal, vocabSize);
+        var batchNorm = _batchNorm!;
+
+        // Stacked token ids and positions.
+        var tokens = new int[sumN];
+        var positionsAll = new int[sumN];
+        for (int i = 0; i < n; i++)
+        {
+            requests[i].TokenIds.Span.CopyTo(tokens.AsSpan(offsets[i]));
+            requests[i].Positions.Span.CopyTo(positionsAll.AsSpan(offsets[i]));
+        }
+        _device.Upload(MemoryMarshal.AsBytes(positionsAll.AsSpan()), _batchPositions!);
+
+        var kinds = _layout.LayerKind;
+        int layersPerSubmit = !FuseForwardEnabled ? 1
+            : sumN <= FuseMaxSeqLen ? int.MaxValue
+            : PrefillLayersPerSubmit(sumN);
+        bool fuse = layersPerSubmit > 1;
+        bool open;
+        long hiddenRowBytes = (long)hiddenSize * sizeof(float);
+
+        // ── 1. Embedding of every row ─────────────────────────────────────────
+        _submit.Begin();
+        open = true;
+        nint cmdBuf = _submit.CommandBuffer;
+        KernelSupport.HostToComputeBarrier(cmdBuf);
+        RecordEmbeddingGather(cmdBuf, tokens);
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+        if (!fuse) { _submit.SubmitAndWait(); open = false; }
+
+        // ── 2. Layers ─────────────────────────────────────────────────────────
+        for (int layer = 0; layer < kinds.Length; layer++)
+        {
+            ref readonly var layerBuf = ref _weights.Layers[layer];
+            if (open)
+            {
+                KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+            }
+            else
+            {
+                _submit.Begin();
+                open = true;
+                cmdBuf = _submit.CommandBuffer;
+                KernelSupport.HostToComputeBarrier(cmdBuf);
+            }
+
+            // 2a. Stacked residual snapshot + attention-norm.
+            RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.Residual, 0, 0, (ulong)((long)sumN * hiddenRowBytes));
+            KernelSupport.TransferToComputeBarrier(cmdBuf);
+            _kernels.RmsNorm.Record(cmdBuf, _state.HiddenState, layerBuf.AttnNormWeight, batchNorm,
+                rowCount: sumN, n: hiddenSize, eps: eps);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            // 2b. Token mixing, one sequence at a time against the model's working NormOutput.
+            for (int i = 0; i < n; i++)
+            {
+                var r = requests[i];
+                int len = offsets[i + 1] - offsets[i];
+                ulong rowOff = (ulong)((long)offsets[i] * hiddenRowBytes);
+                ulong bytes = (ulong)((long)len * hiddenRowBytes);
+
+                KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+                RecordCopyBufferRange(cmdBuf, batchNorm, _state.NormOutput, rowOff, 0, bytes);
+                if (kinds[layer] != HybridLayerKind.GatedDeltaNet)
+                {
+                    // Rope reads the working PositionsBuffer; take this sequence's slice of the stacked positions.
+                    RecordCopyBufferRange(cmdBuf, _batchPositions!, _state.PositionsBuffer,
+                        (ulong)((long)offsets[i] * sizeof(int)), 0, (ulong)((long)len * sizeof(int)));
+                }
+                KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+                if (kinds[layer] == HybridLayerKind.GatedDeltaNet)
+                    RecordGdnLayer(cmdBuf, layer, layerBuf.Gdn!.Value, len, eps, gdnCaches[i]);
+                else
+                    RecordFullAttnLayer(cmdBuf, layer, layerBuf.Attention!.Value, len, r.Positions.Span,
+                        numHeads, numKvHeads, headDim, r.KvCache);
+
+                KernelSupport.ComputeToTransferBarrier(cmdBuf);
+                RecordCopyBufferRange(cmdBuf, _state.NormOutput, batchNorm, 0, rowOff, bytes);
+            }
+            KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+            // First residual add, then fan out to HiddenState and the FFN residual snapshot (same shape as the serial path).
+            _kernels.Add.Record(cmdBuf, _state.Residual, batchNorm, _state.AddScratch, sumN * hiddenSize);
+            KernelSupport.ComputeToTransferBarrier(cmdBuf);
+            RecordCopyBufferRange(cmdBuf, _state.AddScratch, _state.HiddenState, 0, 0, (ulong)((long)sumN * hiddenRowBytes));
+            RecordCopyBufferRange(cmdBuf, _state.AddScratch, _state.Residual, 0, 0, (ulong)((long)sumN * hiddenRowBytes));
+            KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+            // 2c. Stacked dense FFN.
+            _kernels.RmsNorm.Record(cmdBuf, _state.HiddenState, layerBuf.PostAttnNormWeight, batchNorm,
+                rowCount: sumN, n: hiddenSize, eps: eps);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            RecordDenseFfn(cmdBuf, layerBuf.Ffn, sumN, intermediateSize, batchNorm);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _kernels.Add.Record(cmdBuf, _state.Residual, batchNorm, _state.AddScratch, sumN * hiddenSize);
+            KernelSupport.ComputeToTransferBarrier(cmdBuf);
+            RecordCopyBufferRange(cmdBuf, _state.AddScratch, _state.HiddenState, 0, 0, (ulong)((long)sumN * hiddenRowBytes));
+            KernelSupport.ComputeToHostBarrier(cmdBuf);
+            if (!fuse || (layersPerSubmit != int.MaxValue && (layer + 1) % layersPerSubmit == 0))
+            {
+                _submit.SubmitAndWait();
+                open = false;
+            }
+        }
+
+        // ── 3. Final norm + LM head over each sequence's head rows ────────────
+        if (open)
+        {
+            KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+        }
+        else
+        {
+            _submit.Begin();
+            cmdBuf = _submit.CommandBuffer;
+            KernelSupport.HostToComputeBarrier(cmdBuf);
+        }
+        int dstRow = 0;
+        for (int i = 0; i < n; i++)
+        {
+            int srcRow = offsets[i + 1] - headRowsOf[i];
+            RecordCopyBufferRange(cmdBuf, _state.HiddenState, batchNorm,
+                (ulong)((long)srcRow * hiddenRowBytes), (ulong)((long)dstRow * hiddenRowBytes), (ulong)((long)headRowsOf[i] * hiddenRowBytes));
+            dstRow += headRowsOf[i];
+        }
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+        _kernels.RmsNorm.Record(cmdBuf, batchNorm, _weights.OutputNormWeight, batchNorm,
+            rowCount: headTotal, n: hiddenSize, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        var headIn = batchNorm;
+        if (_hadamard is { } headRot)
+        {
+            headIn = _state.HadamardScratch!;
+            headRot.RecordForward(cmdBuf, batchNorm, headIn, headTotal, _weights.OutputInputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+        RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType, headIn, logitsBuf,
+            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: headTotal);
+        KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _submit.SubmitAndWait();
+
+        // ── 4. Download and split the logits ──────────────────────────────────
+        var all = new float[checked(headTotal * vocabSize)];
+        _device.Download(logitsBuf, all);
+        var results = new ITensor[n];
+        int row = 0;
+        for (int i = 0; i < n; i++)
+        {
+            var t = UnmanagedTensor.Allocate(new TensorShape(headRowsOf[i], vocabSize), DType.Float32, deviceId: -1);
+            unsafe
+            {
+                var dest = new Span<float>((void*)t.DataPointer, headRowsOf[i] * vocabSize);
+                all.AsSpan(row * vocabSize, headRowsOf[i] * vocabSize).CopyTo(dest);
+            }
+            row += headRowsOf[i];
+            results[i] = t;
         }
         return results;
     }
@@ -1148,14 +1407,16 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     /// </summary>
     private void RecordDenseFfn(
         nint cmdBuf, in VulkanQwen3HybridDenseWeights.DenseFfnLayerBuffers ffn,
-        int seqLen, int intermediateSize)
+        int seqLen, int intermediateSize, VulkanDevice.Buffer? normIo = null)
     {
+        // normIo: the stacked activation buffer of a fused batch forward (#687); null = the model's NormOutput.
+        var nio = normIo ?? _state.NormOutput;
         // ffn_gate and ffn_up are both folded and share this input — one rotation serves both.
-        var ffnIn = _state.NormOutput;
+        var ffnIn = nio;
         if (_hadamard is { } ffnRot)
         {
             ffnIn = _state.HadamardScratch!;
-            ffnRot.RecordForward(cmdBuf, _state.NormOutput, ffnIn, seqLen, ffn.GateInputDim);
+            ffnRot.RecordForward(cmdBuf, nio, ffnIn, seqLen, ffn.GateInputDim);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             ProfMark(cmdBuf, VulkanOpProfiler.Cat.Hadamard);
         }
@@ -1180,7 +1441,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             ProfMark(cmdBuf, VulkanOpProfiler.Cat.FfnAct);
             if (_prof is not null) ProfNoteMatmul(ffn.DownDeviceQuantType, ffn.DownOutputDim, ffn.DownInputDim, seqLen);
-            downF16.Record(cmdBuf, ffn.DownWeight, _state.FfnSilu, _state.NormOutput,
+            downF16.Record(cmdBuf, ffn.DownWeight, _state.FfnSilu, nio,
                 m: ffn.DownOutputDim, k: ffn.DownInputDim, n: seqLen);
             ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjFfn);
             return;
@@ -1202,7 +1463,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         }
 
         RecordMatmul(cmdBuf, ffn.DownWeight, ffn.DownDeviceQuantType,
-            downIn, _state.NormOutput,
+            downIn, nio,
             outputDim: ffn.DownOutputDim, inputDim: ffn.DownInputDim, seqLen: seqLen);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjFfn);
     }
