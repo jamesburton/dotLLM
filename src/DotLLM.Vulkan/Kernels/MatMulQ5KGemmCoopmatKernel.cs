@@ -38,6 +38,7 @@ public sealed class MatMulQ5KGemmCoopmatKernel : IDisposable
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
     private CoopmatSplitK? _splitK;
+    private CoopmatF16Gemm? _f16Act;
     private bool _disposed;
 
     private MatMulQ5KGemmCoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
@@ -89,14 +90,23 @@ public sealed class MatMulQ5KGemmCoopmatKernel : IDisposable
         var kernel = new MatMulQ5KGemmCoopmatKernel(device, module, pipeline, pool);
         kernel._splitK = CoopmatSplitK.TryCreate(device, spvDir, "matmul_q5_k_gemm_coopmat_128x128x4_splitk.spv",
             QuantFormat.Q5_KBlockBytes, QuantFormat.KQuantGroupSize);
+        kernel._f16Act = CoopmatF16Gemm.TryCreate(device, spvDir, "matmul_q5_k_gemm_coopmat_128x128x4_bh.spv",
+            "matmul_q5_k_gemm_coopmat_128x128x4_bh_splitk.spv", QuantFormat.Q5_KBlockBytes, QuantFormat.KQuantGroupSize);
         return kernel;
     }
+
+    /// <summary>
+    /// F16-activation sibling (null when disabled or unsupported): same GEMM with B as packed halves, for large-k shapes whose F32
+    /// activations would overflow the Infinity Cache. See <see cref="CoopmatF16Gemm"/>.
+    /// </summary>
+    internal CoopmatF16Gemm? F16Activation => _f16Act;
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
     internal void InvalidateDescriptorCache()
     {
         _descriptorCache.Reset();
         _splitK?.InvalidateDescriptorCache();
+        _f16Act?.InvalidateDescriptorCache();
     }
 
     /// <summary>Dispatches synchronously (one-shot submit + fence wait); production uses <see cref="Record"/>.</summary>
@@ -172,6 +182,7 @@ public sealed class MatMulQ5KGemmCoopmatKernel : IDisposable
         if (_disposed) return;
         _disposed = true;
         _splitK?.Dispose();
+        _f16Act?.Dispose();
         if (_descriptorPool != 0)
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);
         _pipeline.Dispose();

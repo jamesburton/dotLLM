@@ -38,6 +38,11 @@
 // The pin also has a known-broken LDS-staged boundary path at NSG=4 whose cause was never
 // isolated. Unpinned wave64 passes every gate; do not spend time re-testing the pin.
 
+// B element fetch for the vec4 path. A shader whose activation buffer is F16 (f16vec4[]) defines its own GEMM_B_FETCH that widens to vec4.
+#ifndef GEMM_B_FETCH
+#define GEMM_B_FETCH(i) GEMM_B_BUF[i]
+#endif
+
 void main() {
     g_mBase = gl_WorkGroupID.x * BM;   // weight rows (C columns)
     g_tBase = gl_WorkGroupID.y * BN;   // LOCAL token rows (C rows)
@@ -84,7 +89,7 @@ void main() {
             uint col = (idx % (BK / 4u)) * 4u;
             uint tLocal = g_tBase + row;
             vec4 v = (tLocal < uint(GEMM_ROW_LIMIT))
-                ? GEMM_B_BUF[((GEMM_ROW_BASE + tLocal) * GEMM_K + kBase + col) >> 2u]
+                ? GEMM_B_FETCH(((GEMM_ROW_BASE + tLocal) * GEMM_K + kBase + col) >> 2u)
                 : vec4(0.0);
             uint so = row * STRIDE + col;
             sharedB[so]      = float16_t(v.x);
