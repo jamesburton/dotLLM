@@ -97,6 +97,8 @@ internal sealed class VulkanQwen3MoeHybridForwardState : IDisposable
     public VulkanDevice.Buffer MoeGroupCounters { get; private set; } = null!;
     /// <summary>Indirect dispatch arguments (two (x, y, z) triples) written by the grouped-MoE tile-list build.</summary>
     public VulkanDevice.Buffer MoeGroupDispatchArgs { get; private set; } = null!;
+    /// <summary>Routed row -> expert-grouped row (inverse of <c>MoeGroupPerm</c>), written by the fused expand-gather kernel.</summary>
+    public VulkanDevice.Buffer MoeGroupInvPerm { get; private set; } = null!;
     public VulkanDevice.Buffer MoeGroupPerm { get; private set; } = null!;
 
     public VulkanDevice.Buffer MoeSharedInput { get; private set; } = null!;
@@ -226,6 +228,7 @@ internal sealed class VulkanQwen3MoeHybridForwardState : IDisposable
         MoeGroupDispatchArgs = _device.AllocateDeviceLocal(2 * MoeBuildTileListKernel.ArgsStrideBytes);
         MoeGroupCounters = _device.AllocateDeviceLocal((long)_moeNumExperts * sizeof(uint));
         MoeGroupPerm = _device.AllocateDeviceLocal(Math.Max(4L, expandedRows * sizeof(uint)));
+        MoeGroupInvPerm = _device.AllocateDeviceLocal(Math.Max(4L, expandedRows * sizeof(uint)));
 
         MoeSharedInput = _device.AllocateDeviceLocal(hiddenBytes);
         MoeSharedGate = _device.AllocateDeviceLocal(sharedInterBytes);
@@ -260,7 +263,7 @@ internal sealed class VulkanQwen3MoeHybridForwardState : IDisposable
         MoeExpandedInput?.Dispose();
         MoeExpandedInputXq?.Dispose(); MoeExpandedInputXds?.Dispose();
         MoeGateInter?.Dispose(); MoeUpInter?.Dispose(); MoeSiluInter?.Dispose(); MoeDownRows?.Dispose();
-        MoeGroupCounts?.Dispose(); MoeGroupOffsets?.Dispose(); MoeGroupCounters?.Dispose(); MoeGroupDispatchArgs?.Dispose(); MoeGroupPerm?.Dispose();
+        MoeGroupCounts?.Dispose(); MoeGroupOffsets?.Dispose(); MoeGroupCounters?.Dispose(); MoeGroupDispatchArgs?.Dispose(); MoeGroupInvPerm?.Dispose(); MoeGroupPerm?.Dispose();
         MoeSiluInterXq?.Dispose(); MoeSiluInterXds?.Dispose();
         MoeSharedInput?.Dispose(); MoeSharedGate?.Dispose(); MoeSharedUp?.Dispose();
         MoeSharedSilu?.Dispose(); MoeSharedSumA?.Dispose(); MoeSharedSumB?.Dispose();

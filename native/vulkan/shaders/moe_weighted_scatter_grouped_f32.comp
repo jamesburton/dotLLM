@@ -1,0 +1,37 @@
+#version 450
+// MoE weighted combine reading the expert-GROUPED down-projection output directly:
+//
+//   out[t, h] = sum_{slot=0..topK-1} weights[t * topK + slot] * grouped[invPermutation[t * topK + slot], h]
+//
+// This is moe_ungroup_scatter_f32 (grouped -> original routed-row order, one full pass over a 32 MB matrix) fused into
+// moe_weighted_scatter_f32: the same per-token slot order and the same multiply-add chain, so the result is bit-identical to running
+// the two kernels back to back. invPermutation is written by moe_expand_gather_group_f32.
+//
+// Dispatch: 2D grid, one thread per output cell (t, h), workgroup (16, 16).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX   { float grouped[]; };      // [rows, hidden] expert-grouped
+layout(set = 0, binding = 1, std430) readonly  buffer BufInv { uint invPermutation[]; }; // [rows] routed row -> grouped row
+layout(set = 0, binding = 2, std430) readonly  buffer BufW   { float weights[]; };      // [rows]
+layout(set = 0, binding = 3, std430) writeonly buffer BufOut { float outBuf[]; };       // [seqLen, hidden]
+
+layout(push_constant) uniform PushConstants {
+    uint seqLen;
+    uint topK;
+    uint hiddenSize;
+} pc;
+
+void main() {
+    uint h = gl_GlobalInvocationID.x;
+    uint t = gl_GlobalInvocationID.y;
+    if (h >= pc.hiddenSize || t >= pc.seqLen) return;
+
+    uint rowBase = t * pc.topK;
+    float acc = 0.0;
+    for (uint slot = 0u; slot < pc.topK; slot++) {
+        float w = weights[rowBase + slot];
+        acc += w * grouped[invPermutation[rowBase + slot] * pc.hiddenSize + h];
+    }
+    outBuf[t * pc.hiddenSize + h] = acc;
+}

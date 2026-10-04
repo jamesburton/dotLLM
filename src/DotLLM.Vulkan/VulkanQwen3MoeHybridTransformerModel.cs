@@ -1559,14 +1559,20 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     /// gate/up into MoeGateInter/MoeUpInter (packed order) -> SwiGLU -> grouped down into MoeExpandedInput (dead by now) -> ungroup into
     /// MoeDownRows in the original row order, which the weighted scatter then consumes unchanged.
     /// </summary>
-    private void RecordGroupedExperts(nint cmdBuf, VulkanQwen3MoeMoeUpload.LayerBundle moeW, int seqLen, int hidden, int interm, int numE, int expandedRows)
+    private void RecordGroupedExperts(nint cmdBuf, VulkanQwen3MoeMoeUpload.LayerBundle moeW, int seqLen, int hidden, int interm, int numE, int expandedRows,
+        bool fusedGlue, int topK)
     {
         _kernels.MoeExpertOffsets!.Record(cmdBuf, _state.MoeTopkIndices, _state.MoeGroupCounts, _state.MoeGroupOffsets, _state.MoeGroupCounters,
             rows: expandedRows, numExperts: numE);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("expert_offsets");
-        _kernels.MoeExpandGroupByExpert!.Record(cmdBuf, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeGroupOffsets,
-            _state.MoeGroupCounters, _state.MoeDownRows, _state.MoeGroupPerm, rows: expandedRows, hidden: hidden, numExperts: numE);
+        if (fusedGlue)
+            _kernels.MoeExpandGatherGroup!.Record(cmdBuf, _state.NormOutput, _state.MoeTopkIndices, _state.MoeGroupOffsets,
+                _state.MoeGroupCounters, _state.MoeDownRows, _state.MoeGroupPerm, _state.MoeGroupInvPerm,
+                rows: expandedRows, hidden: hidden, numExperts: numE, topK: topK);
+        else
+            _kernels.MoeExpandGroupByExpert!.Record(cmdBuf, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeGroupOffsets,
+                _state.MoeGroupCounters, _state.MoeDownRows, _state.MoeGroupPerm, rows: expandedRows, hidden: hidden, numExperts: numE);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("expand_group");
 
@@ -1616,9 +1622,12 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 m: hidden, k: interm, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("grouped_down");
-        _kernels.MoeUngroupScatter!.Record(cmdBuf, _state.MoeExpandedInput, _state.MoeGroupPerm, _state.MoeDownRows, rows: expandedRows, hidden: hidden);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
-        MoeStage("ungroup");
+        if (!fusedGlue)
+        {
+            _kernels.MoeUngroupScatter!.Record(cmdBuf, _state.MoeExpandedInput, _state.MoeGroupPerm, _state.MoeDownRows, rows: expandedRows, hidden: hidden);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MoeStage("ungroup");
+        }
     }
 
     /// <summary>
@@ -1652,13 +1661,6 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("topk");
 
-        // 3. Broadcast NormOutput[seqLen, hidden] → MoeExpandedInput[seqLen*topK, hidden].
-        _kernels.MoeBroadcast.Record(cmdBuf,
-            _state.NormOutput, _state.MoeExpandedInput,
-            seqLen: seqLen, topK: topK, hidden: hidden);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
-        MoeStage("broadcast");
-
         // Issue #637: prefill batches group the routed rows by expert and run each expert's weights through a coopmat GEMM once per
         // 16-row tile (the indexed kernels below re-read an expert's weights for every routed row). Resident Q4_K gate/up + Q5_K/Q6_K down only (UD-Q4_K_M mixes both down types).
         bool grouped = seqLen >= GroupedMinTokens
@@ -1666,9 +1668,22 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             && _kernels.MoeExpertOffsets is not null && _kernels.MoeExpandGroupByExpert is not null && _kernels.MoeUngroupScatter is not null
             && moeW.W1QuantType == QuantizationType.Q4_K && moeW.W3QuantType == QuantizationType.Q4_K
             && (hidden % 256) == 0 && (interm % 256) == 0;
+        // Fused glue: gather the token rows straight into expert order (no broadcast pass) and combine straight from the grouped down
+        // output (no ungroup pass). DOTLLM_VK_MOE_FUSED_GLUE=0 restores broadcast + expand + ungroup + scatter.
+        bool fusedGlue = grouped && _kernels.MoeExpandGatherGroup is not null && _kernels.MoeWeightedScatterGrouped is not null
+            && (hidden & 3) == 0;
+        if (!fusedGlue)
+        {
+            // 3. Broadcast NormOutput[seqLen, hidden] → MoeExpandedInput[seqLen*topK, hidden].
+            _kernels.MoeBroadcast.Record(cmdBuf,
+                _state.NormOutput, _state.MoeExpandedInput,
+                seqLen: seqLen, topK: topK, hidden: hidden);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MoeStage("broadcast");
+        }
         if (grouped)
         {
-            RecordGroupedExperts(cmdBuf, moeW, seqLen, hidden, interm, numE, expandedRows);
+            RecordGroupedExperts(cmdBuf, moeW, seqLen, hidden, interm, numE, expandedRows, fusedGlue, topK);
         }
         else
         {
@@ -1788,9 +1803,14 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         }
 
         // 7. Weighted scatter into NormOutput.
-        _kernels.MoeWeightedScatter.Record(cmdBuf,
-            _state.MoeDownRows, _state.MoeTopkWeights, _state.NormOutput,
-            seqLen: seqLen, topK: topK, hiddenSize: hidden);
+        if (fusedGlue)
+            _kernels.MoeWeightedScatterGrouped!.Record(cmdBuf,
+                _state.MoeExpandedInput, _state.MoeGroupInvPerm, _state.MoeTopkWeights, _state.NormOutput,
+                seqLen: seqLen, topK: topK, hiddenSize: hidden);
+        else
+            _kernels.MoeWeightedScatter.Record(cmdBuf,
+                _state.MoeDownRows, _state.MoeTopkWeights, _state.NormOutput,
+                seqLen: seqLen, topK: topK, hiddenSize: hidden);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("weighted_scatter");
 
