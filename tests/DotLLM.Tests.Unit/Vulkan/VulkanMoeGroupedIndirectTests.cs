@@ -131,4 +131,57 @@ public sealed class VulkanMoeGroupedIndirectTests
         for (int i = 0; i < a.Length; i++)
             Assert.True(a[i] == b[i], $"{quant} tile{tile} idx {i} (row {i / m}, col {i % m}) counts={countsCsv}: legacy {a[i]:G9} != indirect {b[i]:G9}");
     }
+
+    /// <summary>
+    /// The m64 shaders keep each super-block's raw weight words and activation vec4s in registers across the previous super-block's
+    /// MMAs (register prefetch); the single-subgroup 16-row shaders keep the original load-convert-MMA order. The dequant arithmetic
+    /// is identical, so the two must agree EXACTLY.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(MoeGroupedKQuant.Q4_K, 128, 1024, "0,3,0,17,40,16,15,1,33")]
+    [InlineData(MoeGroupedKQuant.Q5_K, 128, 768, "0,16,15,17,1,33,0,2")]
+    [InlineData(MoeGroupedKQuant.Q6_K, 192, 512, "0,16,15,17,1,0,9,48")]
+    [InlineData(MoeGroupedKQuant.Q4_K, 100, 256, "5,0,1")]       // m not a multiple of 64: invalid-row path
+    public void PrefetchedM64_EqualsSingleSubgroupShader(MoeGroupedKQuant quant, int m, int k, string countsCsv)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, quant), "coopmat or SPIR-V unavailable.");
+
+        int[] counts = Array.ConvertAll(countsCsv.Split(','), int.Parse);
+        int E = counts.Length, rows = counts.Sum();
+        uint[] offsets = OffsetsOf(counts);
+        var rng = new Random(0x675 + m * 31 + k + rows);
+        byte[] bank = Enumerable.Range(0, E).SelectMany(_ =>
+        {
+            float[] w = Q4KFixture.RandomFloats(rng, m * k, 0.5f);
+            return quant switch
+            {
+                MoeGroupedKQuant.Q4_K => Q4KFixture.QuantizeRows(w, m, k),
+                MoeGroupedKQuant.Q5_K => Q5KFixture.QuantizeRows(w, m, k),
+                _ => Q6KFixture.QuantizeRows(w, m, k),
+            };
+        }).ToArray();
+        float[] x = Q4KFixture.RandomFloats(rng, rows * k, 1f);
+
+        using var bufW = device.Allocate(bank.Length);
+        using var bufX = device.Allocate((long)rows * k * sizeof(float));
+        using var bufOff = device.Allocate(offsets.Length * sizeof(uint));
+        device.Upload(bank, bufW);
+        device.Upload(x, bufX);
+        device.Upload(MemoryMarshal.AsBytes<uint>(offsets), bufOff);
+
+        float[][] results = new float[2][];
+        int[] tiles = [16, 64];
+        for (int v = 0; v < 2; v++)
+        {
+            using var kernel = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, quant, tiles[v]);
+            using var y = device.Allocate((long)rows * m * sizeof(float));
+            kernel.Launch(bufW, bufX, bufOff, y, m, k, rows, E, maxRowsPerExpert: counts.Max());
+            results[v] = new float[(long)rows * m];
+            device.Download(y, results[v]);
+        }
+        for (int i = 0; i < results[0].Length; i++)
+            Assert.True(results[0][i] == results[1][i], $"{quant} idx {i} (row {i / m}, col {i % m}) counts={countsCsv}: m16 {results[0][i]:G9} != m64 {results[1][i]:G9}");
+    }
 }

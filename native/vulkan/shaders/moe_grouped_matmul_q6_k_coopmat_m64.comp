@@ -15,6 +15,7 @@
 #extension GL_KHR_shader_subgroup_basic   : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage    : require
+#extension GL_EXT_control_flow_attributes : require
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -64,6 +65,68 @@ void load16(uint o, out uint r[4]) {
     for (uint i = 0u; i < 4u; i++) r[i] = hi ? ((w[i] >> 16) | (w[i + 1u] << 16)) : w[i];
 }
 
+struct Stage { float d; uint ql0[4]; uint ql1[4]; uint qh[4]; uint sc[4]; vec4 bv[4]; };   // d, low-nibble words (2 x 16 B), high-bit words, 4 scale bytes
+
+void loadStage(uint sb, uint tid, uint lane, bool rowValid, uint rowBase, uint xRowBase4, uint localRowBase, uint expertRows, inout Stage st) {
+    st.d = 0.0;
+    for (uint i = 0u; i < 4u; i++) { st.ql0[i] = 0u; st.ql1[i] = 0u; st.qh[i] = 0u; st.sc[i] = 0u; }
+
+    if (rowValid) {
+        uint blockBase = rowBase + sb * 210u;   // rowBase = byte offset of this row's first block
+        uint hf = lane >> 1u;
+        uint l0 = (lane & 1u) * 16u;
+        st.d = readHalf(blockBase + 208u);
+        load16(blockBase + 64u * hf + l0, st.ql0);
+        load16(blockBase + 64u * hf + 32u + l0, st.ql1);
+        load16(blockBase + 128u + 32u * hf + l0, st.qh);
+        for (uint g = 0u; g < 4u; g++)
+            st.sc[g] = readByte(blockBase + 192u + 8u * hf + (l0 >> 4u) + 2u * g);
+    }
+
+    // activation vec4s of this thread (1024 per super-block, idx = tid + 256 * j; consecutive threads read consecutive vec4s)
+    for (uint j = 0u; j < 4u; j++) {
+        uint idx = tid + j * WG_THREADS;
+        uint bRow = idx >> 6u;
+        uint c4 = idx & 63u;
+        st.bv[j] = (localRowBase + bRow) < expertRows ? x4[xRowBase4 + bRow * (pc.K / 4u) + sb * (SB / 4u) + c4] : vec4(0.0);
+    }
+}
+
+void commitStage(in Stage st, uint tid, uint sg, uint mLocal, uint lane, bool rowValid) {
+    uint hf = lane >> 1u;
+    uint l0 = (lane & 1u) * 16u;
+    uint aBase = sg * TM * STRIDE + mLocal * STRIDE + hf * 128u + l0;
+    if (!rowValid) {
+        for (uint g = 0u; g < 4u; g++)
+            for (uint j = 0u; j < 16u; j++) sharedA[aBase + g * 32u + j] = float16_t(0.0);
+    } else {
+        for (uint g = 0u; g < 4u; g++) {
+            float scale = st.d * float(int(st.sc[g] ^ 0x80u) - 128);
+            uint nibShift = (g >> 1u) * 4u;
+            uint qhShift = 2u * g;
+            for (uint i = 0u; i < 4u; i++) {
+                uint lw = ((g & 1u) == 0u ? st.ql0[i] : st.ql1[i]) >> nibShift;
+                uint hw = st.qh[i] >> qhShift;
+                for (uint jb = 0u; jb < 4u; jb++) {
+                    uint lo = (lw >> (jb * 8u)) & 0xFu;
+                    uint h2 = (hw >> (jb * 8u)) & 3u;
+                    sharedA[aBase + g * 32u + i * 4u + jb] = float16_t(scale * float(int(lo | (h2 << 4u)) - 32));
+                }
+            }
+        }
+    }
+    for (uint j = 0u; j < 4u; j++) {
+        uint idx = tid + j * WG_THREADS;
+        uint bRow = idx >> 6u;
+        uint c4 = idx & 63u;
+        uint o = bRow * STRIDE + c4 * 4u;
+        sharedB[o]      = float16_t(st.bv[j].x);
+        sharedB[o + 1u] = float16_t(st.bv[j].y);
+        sharedB[o + 2u] = float16_t(st.bv[j].z);
+        sharedB[o + 3u] = float16_t(st.bv[j].w);
+    }
+}
+
 void main() {
     uint mBase = gl_WorkGroupID.x * (TM * NSG);
     uint localRowBase;
@@ -98,52 +161,22 @@ void main() {
     uint rowByteBase = (expert * pc.M + mGlobal) * (pc.blocksPerRow * 210u);
     uint xRowBase4 = (expertStart + localRowBase) * (pc.K / 4u);
 
-    for (uint sb = 0u; sb < pc.blocksPerRow; sb++) {
-        // ---- B: cooperative over the whole workgroup: 16 rows x 64 vec4 per super-block (consecutive threads read consecutive vec4s)
-        for (uint idx = tid; idx < 1024u; idx += WG_THREADS) {
-            uint bRow = idx >> 6u;
-            uint c4 = idx & 63u;
-            vec4 f = (localRowBase + bRow) < expertRows ? x4[xRowBase4 + bRow * (pc.K / 4u) + sb * (SB / 4u) + c4] : vec4(0.0);
-            uint o = bRow * STRIDE + c4 * 4u;
-            sharedB[o]      = float16_t(f.x);
-            sharedB[o + 1u] = float16_t(f.y);
-            sharedB[o + 2u] = float16_t(f.z);
-            sharedB[o + 3u] = float16_t(f.w);
-        }
+    // Register-prefetched K loop: super-block sb+1's raw weight words and activation vec4s are loaded right after the staging barrier
+    // and only converted / stored to LDS after sb's MMAs, so their DRAM latency hides behind the matrix work and every load of a
+    // super-block is in flight together. Measured on gfx1151 (256 experts, m=512, k=2048, 16 rows/expert): 1.75 -> 1.09 ms per GEMM
+    // (86 -> 139 GB/s); skewed routing 2.25 -> 1.50 ms. The dequant arithmetic is unchanged, so results equal the single-subgroup
+    // (_coopmat, 16-row) shader's exactly.
+    Stage st;
+    loadStage(0u, tid, lane, rowValid, rowByteBase, xRowBase4, localRowBase, expertRows, st);
 
-        // ---- A: dequantise this lane's 64 values (half hf = lane>>1, l = l0 .. l0+15, four 32-wide groups g) of the super-block
-        uint hf = lane >> 1u;
-        uint l0 = (lane & 1u) * 16u;
-        uint aBase = sg * TM * STRIDE + mLocal * STRIDE + hf * 128u + l0;
-        if (!rowValid) {
-            for (uint g = 0u; g < 4u; g++)
-                for (uint j = 0u; j < 16u; j++) sharedA[aBase + g * 32u + j] = float16_t(0.0);
-        } else {
-            uint blockBase = rowByteBase + sb * 210u;
-            float d = readHalf(blockBase + 208u);
-            uint qlw0[4], qlw1[4], qhw[4];
-            load16(blockBase + 64u * hf + l0, qlw0);
-            load16(blockBase + 64u * hf + 32u + l0, qlw1);
-            load16(blockBase + 128u + 32u * hf + l0, qhw);
-            for (uint g = 0u; g < 4u; g++) {
-                uint sbyte = readByte(blockBase + 192u + 8u * hf + (l0 >> 4u) + 2u * g);
-                float scale = d * float(int(sbyte ^ 0x80u) - 128);
-                uint nibShift = (g >> 1u) * 4u;
-                uint qhShift = 2u * g;
-                for (uint i = 0u; i < 4u; i++) {
-                    uint lw = ((g & 1u) == 0u ? qlw0[i] : qlw1[i]) >> nibShift;
-                    uint hw = qhw[i] >> qhShift;
-                    for (uint jb = 0u; jb < 4u; jb++) {
-                        uint lo = (lw >> (jb * 8u)) & 0xFu;
-                        uint h2 = (hw >> (jb * 8u)) & 3u;
-                        sharedA[aBase + g * 32u + i * 4u + jb] = float16_t(scale * float(int(lo | (h2 << 4u)) - 32));
-                    }
-                }
-            }
-        }
+    for (uint sb = 0u; sb < pc.blocksPerRow; sb++) {
+        commitStage(st, tid, sg, mLocal, lane, rowValid);
 
         barrier();
         memoryBarrierShared();
+
+        if ((sb + 1u) < pc.blocksPerRow)
+            loadStage(sb + 1u, tid, lane, rowValid, rowByteBase, xRowBase4, localRowBase, expertRows, st);
 
         for (uint kSlice = 0u; kSlice < SB; kSlice += TK) {
             coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> aTile;
