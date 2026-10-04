@@ -1148,6 +1148,14 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     private VulkanDevice.Buffer? _batchPositions;
     private int _batchPositionsRows;
 
+    // Stacked GDN projection results (#689): [rows, convDim] qkv, [rows, vDim] z / scan output, [rows, nVHead] alpha / beta.
+    private VulkanDevice.Buffer? _batchGdnQkv, _batchGdnZ, _batchGdnAlpha, _batchGdnBeta, _batchGdnOut;
+    private int _batchGdnRows;
+
+    /// <summary>Opt-out for stacking the GDN projections (<c>DOTLLM_VK_BATCH_FUSE_GDN=0</c>); the stacked FFN stays on.</summary>
+    private static bool BatchFuseGdnEnabled =>
+        !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_BATCH_FUSE_GDN"), "0", StringComparison.Ordinal);
+
     /// <summary>
     /// Fused batched forward (#687): the rows of every sequence are stacked so each dense-FFN GEMM streams its weights once for the whole
     /// batch instead of once per sequence (the Tev1-4B FFN is ~half of a prefill, and its GEMMs run at n = 61 when serial vs n = 488
@@ -1215,6 +1223,20 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             _batchPositionsRows = sumN;
             resized = true;
         }
+        bool stackGdn = _hadamard is null && BatchFuseGdnEnabled;
+        if (stackGdn && (_batchGdnQkv is null || _batchGdnRows < sumN))
+        {
+            _batchGdnQkv?.Dispose(); _batchGdnZ?.Dispose(); _batchGdnAlpha?.Dispose(); _batchGdnBeta?.Dispose(); _batchGdnOut?.Dispose();
+            int convDimAll = (2 * _gdn.NKHead + _gdn.NVHead) * _gdn.DState;
+            int vDimAll = _gdn.NVHead * _gdn.DState;
+            _batchGdnQkv = _device.AllocateDeviceLocal((long)sumN * convDimAll * sizeof(float));
+            _batchGdnZ = _device.AllocateDeviceLocal((long)sumN * vDimAll * sizeof(float));
+            _batchGdnAlpha = _device.AllocateDeviceLocal((long)sumN * _gdn.NVHead * sizeof(float));
+            _batchGdnBeta = _device.AllocateDeviceLocal((long)sumN * _gdn.NVHead * sizeof(float));
+            _batchGdnOut = _device.AllocateDeviceLocal((long)sumN * vDimAll * sizeof(float));
+            _batchGdnRows = sumN;
+            resized = true;
+        }
         if (resized)
         {
             _kernels.InvalidateAll();
@@ -1276,6 +1298,22 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
                 rowCount: sumN, n: hiddenSize, eps: eps);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
+            // 2b-pre. Stacked GDN projections: the four input GEMMs run once over every sequence's rows.
+            bool gdnStacked = stackGdn && kinds[layer] == HybridLayerKind.GatedDeltaNet;
+            if (gdnStacked)
+            {
+                var gw = layerBuf.Gdn!.Value;
+                RecordMatmul(cmdBuf, gw.QkvWeight, gw.QkvDeviceQuantType, batchNorm, _batchGdnQkv!,
+                    outputDim: gw.QkvOutputDim, inputDim: gw.QkvInputDim, seqLen: sumN);
+                RecordMatmul(cmdBuf, gw.GateWeight, gw.GateDeviceQuantType, batchNorm, _batchGdnZ!,
+                    outputDim: gw.GateOutputDim, inputDim: gw.GateInputDim, seqLen: sumN);
+                RecordMatmul(cmdBuf, gw.AlphaWeight, gw.AlphaDeviceQuantType, batchNorm, _batchGdnAlpha!,
+                    outputDim: gw.AlphaOutputDim, inputDim: gw.AlphaInputDim, seqLen: sumN);
+                RecordMatmul(cmdBuf, gw.BetaWeight, gw.BetaDeviceQuantType, batchNorm, _batchGdnBeta!,
+                    outputDim: gw.BetaOutputDim, inputDim: gw.BetaInputDim, seqLen: sumN);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
+
             // 2b. Token mixing, one sequence at a time against the model's working NormOutput.
             for (int i = 0; i < n; i++)
             {
@@ -1285,7 +1323,24 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
                 ulong bytes = (ulong)((long)len * hiddenRowBytes);
 
                 KernelSupport.ComputeTransferFullBarrier(cmdBuf);
-                RecordCopyBufferRange(cmdBuf, batchNorm, _state.NormOutput, rowOff, 0, bytes);
+                if (gdnStacked)
+                {
+                    // This sequence's slices of the stacked projections become the single-sequence working buffers.
+                    int convDimB = (2 * _gdn.NKHead + _gdn.NVHead) * _gdn.DState, vDimB = _gdn.NVHead * _gdn.DState;
+                    int nvB = _gdn.NVHead, o = offsets[i];
+                    RecordCopyBufferRange(cmdBuf, _batchGdnQkv!, _state.GdnQkvBuf,
+                        (ulong)((long)o * convDimB * sizeof(float)), 0, (ulong)((long)len * convDimB * sizeof(float)));
+                    RecordCopyBufferRange(cmdBuf, _batchGdnZ!, _state.GdnZBuf,
+                        (ulong)((long)o * vDimB * sizeof(float)), 0, (ulong)((long)len * vDimB * sizeof(float)));
+                    RecordCopyBufferRange(cmdBuf, _batchGdnAlpha!, _state.GdnAlphaBuf,
+                        (ulong)((long)o * nvB * sizeof(float)), 0, (ulong)((long)len * nvB * sizeof(float)));
+                    RecordCopyBufferRange(cmdBuf, _batchGdnBeta!, _state.GdnBetaBuf,
+                        (ulong)((long)o * nvB * sizeof(float)), 0, (ulong)((long)len * nvB * sizeof(float)));
+                }
+                else
+                {
+                    RecordCopyBufferRange(cmdBuf, batchNorm, _state.NormOutput, rowOff, 0, bytes);
+                }
                 if (kinds[layer] != HybridLayerKind.GatedDeltaNet)
                 {
                     // Rope reads the working PositionsBuffer; take this sequence's slice of the stacked positions.
@@ -1295,15 +1350,33 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
                 KernelSupport.TransferToComputeBarrier(cmdBuf);
 
                 if (kinds[layer] == HybridLayerKind.GatedDeltaNet)
-                    RecordGdnLayer(cmdBuf, layer, layerBuf.Gdn!.Value, len, eps, gdnCaches[i]);
+                    RecordGdnLayer(cmdBuf, layer, layerBuf.Gdn!.Value, len, eps, gdnCaches[i],
+                        projectionsDone: gdnStacked, skipOutProj: gdnStacked);
                 else
                     RecordFullAttnLayer(cmdBuf, layer, layerBuf.Attention!.Value, len, r.Positions.Span,
                         numHeads, numKvHeads, headDim, r.KvCache);
 
                 KernelSupport.ComputeToTransferBarrier(cmdBuf);
-                RecordCopyBufferRange(cmdBuf, _state.NormOutput, batchNorm, 0, rowOff, bytes);
+                if (gdnStacked)
+                {
+                    int vDimB = _gdn.NVHead * _gdn.DState;
+                    RecordCopyBufferRange(cmdBuf, _state.GdnOut, _batchGdnOut!, 0,
+                        (ulong)((long)offsets[i] * vDimB * sizeof(float)), (ulong)((long)len * vDimB * sizeof(float)));
+                }
+                else
+                {
+                    RecordCopyBufferRange(cmdBuf, _state.NormOutput, batchNorm, 0, rowOff, bytes);
+                }
             }
             KernelSupport.TransferToComputeBarrier(cmdBuf);
+            if (gdnStacked)
+            {
+                // Stacked ssm_out projection back into the stacked token-mixing result.
+                var gw = layerBuf.Gdn!.Value;
+                RecordMatmul(cmdBuf, gw.OutWeight, gw.OutDeviceQuantType, _batchGdnOut!, batchNorm,
+                    outputDim: gw.OutOutputDim, inputDim: gw.OutInputDim, seqLen: sumN);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
 
             // First residual add, then fan out to HiddenState and the FFN residual snapshot (same shape as the serial path).
             _kernels.Add.Record(cmdBuf, _state.Residual, batchNorm, _state.AddScratch, sumN * hiddenSize);
@@ -1478,8 +1551,11 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
     /// </summary>
     private void RecordGdnLayer(
         nint cmdBuf, int absoluteLayerIdx, VulkanQwen3MoeHybridWeights.GdnLayerBuffers gdnW,
-        int seqLen, float eps, VulkanGdnStateCache gdnCache)
+        int seqLen, float eps, VulkanGdnStateCache gdnCache, bool projectionsDone = false, bool skipOutProj = false)
     {
+        // projectionsDone / skipOutProj (#689): the fused batch forward runs the four input projections and the output projection ONCE over
+        // the stacked rows of every sequence, and copies this sequence's slices into GdnQkvBuf / GdnZBuf / GdnAlphaBuf / GdnBetaBuf before
+        // the call; with skipOutProj the gated scan output is left in GdnOut for the caller to stack.
         int nVHead = _gdn.NVHead;
         int nKHead = _gdn.NKHead;
         int dState = _gdn.DState;
@@ -1497,31 +1573,34 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             ? Math.Min(_rowSnapshotRequestRows, seqLen - 1)
             : 0;
 
-        // ── 1. Projections ───────────────────────────────────────────────────
-        // Only attn_qkv and attn_gate are folded; ssm_alpha and ssm_beta below deliberately keep
-        // reading the UNROTATED NormOutput, which is why the rotation goes to a separate buffer.
-        var gdnProjIn = _state.NormOutput;
-        if (_hadamard is { } gdnRot)
+        if (!projectionsDone)
         {
-            gdnProjIn = _state.HadamardScratch!;
-            gdnRot.RecordForward(cmdBuf, _state.NormOutput, gdnProjIn, seqLen, gdnW.QkvInputDim);
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            ProfMark(cmdBuf, VulkanOpProfiler.Cat.Hadamard);
-        }
+            // ── 1. Projections ───────────────────────────────────────────────────
+            // Only attn_qkv and attn_gate are folded; ssm_alpha and ssm_beta below deliberately keep
+            // reading the UNROTATED NormOutput, which is why the rotation goes to a separate buffer.
+            var gdnProjIn = _state.NormOutput;
+            if (_hadamard is { } gdnRot)
+            {
+                gdnProjIn = _state.HadamardScratch!;
+                gdnRot.RecordForward(cmdBuf, _state.NormOutput, gdnProjIn, seqLen, gdnW.QkvInputDim);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                ProfMark(cmdBuf, VulkanOpProfiler.Cat.Hadamard);
+            }
 
-        RecordMatmul(cmdBuf, gdnW.QkvWeight, gdnW.QkvDeviceQuantType,
-            gdnProjIn, _state.GdnQkvBuf,
-            outputDim: gdnW.QkvOutputDim, inputDim: gdnW.QkvInputDim, seqLen: seqLen);
-        RecordMatmul(cmdBuf, gdnW.GateWeight, gdnW.GateDeviceQuantType,
-            gdnProjIn, _state.GdnZBuf,
-            outputDim: gdnW.GateOutputDim, inputDim: gdnW.GateInputDim, seqLen: seqLen);
-        RecordMatmul(cmdBuf, gdnW.AlphaWeight, gdnW.AlphaDeviceQuantType,
-            _state.NormOutput, _state.GdnAlphaBuf,
-            outputDim: gdnW.AlphaOutputDim, inputDim: gdnW.AlphaInputDim, seqLen: seqLen);
-        RecordMatmul(cmdBuf, gdnW.BetaWeight, gdnW.BetaDeviceQuantType,
-            _state.NormOutput, _state.GdnBetaBuf,
-            outputDim: gdnW.BetaOutputDim, inputDim: gdnW.BetaInputDim, seqLen: seqLen);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            RecordMatmul(cmdBuf, gdnW.QkvWeight, gdnW.QkvDeviceQuantType,
+                gdnProjIn, _state.GdnQkvBuf,
+                outputDim: gdnW.QkvOutputDim, inputDim: gdnW.QkvInputDim, seqLen: seqLen);
+            RecordMatmul(cmdBuf, gdnW.GateWeight, gdnW.GateDeviceQuantType,
+                gdnProjIn, _state.GdnZBuf,
+                outputDim: gdnW.GateOutputDim, inputDim: gdnW.GateInputDim, seqLen: seqLen);
+            RecordMatmul(cmdBuf, gdnW.AlphaWeight, gdnW.AlphaDeviceQuantType,
+                _state.NormOutput, _state.GdnAlphaBuf,
+                outputDim: gdnW.AlphaOutputDim, inputDim: gdnW.AlphaInputDim, seqLen: seqLen);
+            RecordMatmul(cmdBuf, gdnW.BetaWeight, gdnW.BetaDeviceQuantType,
+                _state.NormOutput, _state.GdnBetaBuf,
+                outputDim: gdnW.BetaOutputDim, inputDim: gdnW.BetaInputDim, seqLen: seqLen);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.ProjGdn);
 
         // ── 2. Fused on-device decay g and sigmoid(β) ─────────────────────────
@@ -1637,6 +1716,8 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
             seqLen: seqLen, nVHead: nVHead, dState: dState, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.GdnPostGate);   // #445 sub-bucket
+
+        if (skipOutProj) return;
 
         // ── 7. ssm_out projection back into NormOutput ───────────────────────
         // The one site taking the value-head permutation: the fold was computed in grouped
