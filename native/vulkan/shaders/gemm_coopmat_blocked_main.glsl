@@ -58,8 +58,18 @@ void main() {
         sums[i] = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
 
     uint chunks = GEMM_CHUNKS;
+    uint chBegin = 0u;
+#ifdef GEMM_SPLITK
+    // Split-K (underfilled grids): workgroup z owns the chunk range [z*GEMM_CHUNKS_PER_SPLIT, ...) and writes its partial
+    // sums to its own [GEMM_ROW_LIMIT, GEMM_M] slab of C; a separate reduce pass adds the slabs.
+    chBegin = gl_WorkGroupID.z * GEMM_CHUNKS_PER_SPLIT;
+    chunks = min(chunks, chBegin + GEMM_CHUNKS_PER_SPLIT);
+    uint cSlab = gl_WorkGroupID.z * (uint(GEMM_ROW_LIMIT) * uint(GEMM_M));
+#else
+    const uint cSlab = 0u;
+#endif
 
-    for (uint ch = 0u; ch < chunks; ch++) {
+    for (uint ch = chBegin; ch < chunks; ch++) {
         uint kBase = ch * BK;
 
         // ---- 1. Stage sharedB[BN, BK] as F16. ----
@@ -151,7 +161,7 @@ void main() {
         [[unroll]] for (uint cm_row = 0u; cm_row < CMS_PER_ROW; cm_row++) {
             [[unroll]] for (uint cm_col = 0u; cm_col < CMS_PER_COL; cm_col++) {
                 coopMatStore(sums[cm_col * CMS_PER_ROW + cm_row], GEMM_C_BUF,
-                             (GEMM_ROW_BASE + dc + cm_col * TN) * GEMM_M + dr + cm_row * TM,
+                             cSlab + (GEMM_ROW_BASE + dc + cm_col * TN) * GEMM_M + dr + cm_row * TM,
                              GEMM_M, gl_CooperativeMatrixLayoutColumnMajor);
             }
         }
@@ -176,7 +186,7 @@ void main() {
                     uint mG = g_mBase + (sg % SG_ROWS) * WM + cm_row * TM + (zz % TM);
                     uint tL = g_tBase + (sg / SG_ROWS) * WN + cm_col * TN + (zz / TM);
                     if (tL < uint(GEMM_ROW_LIMIT) && mG < uint(GEMM_M))
-                        GEMM_C_BUF[(GEMM_ROW_BASE + tL) * GEMM_M + mG] = storeStage[z];
+                        GEMM_C_BUF[cSlab + (GEMM_ROW_BASE + tL) * GEMM_M + mG] = storeStage[z];
                 }
                 barrier();
             }
