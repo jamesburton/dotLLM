@@ -866,48 +866,67 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         TmStage("gdn_decay", seqLen);
 
-        // ── 3. Build conv input + Conv1d + SiLU ───────────────────────────────
-        // ConvInput = [convState (DConv-1 rows) | qkvBuf (seqLen rows)]
-        KernelSupport.ComputeToTransferBarrier(cmdBuf);
+        // ── 3. Conv1d + SiLU ────────────────────────────────────────────────────
         long convStateBytes = (long)(dConv - 1) * convDim * sizeof(float);
-        if (convStateBytes > 0)
-        {
-            RecordCopyBufferRange(cmdBuf, convStateBuf, _state.GdnConvInput,
-                srcOffset: 0, dstOffset: 0, size: (ulong)convStateBytes);
-        }
         long convDimBytes = (long)convDim * sizeof(float);
-        // The qkv rows are contiguous in both buffers, so the whole [seqLen, convDim] block is one copy (was seqLen copies).
-        RecordCopyBufferRange(cmdBuf, _state.GdnQkvBuf, _state.GdnConvInput,
-            srcOffset: 0, dstOffset: (ulong)((long)(dConv - 1) * convDimBytes), size: (ulong)((long)seqLen * convDimBytes));
-        KernelSupport.TransferToComputeBarrier(cmdBuf);
-
-        _kernels.Conv1dCausal.Record(cmdBuf, _state.GdnConvInput, gdnW.Conv1dWeight, gdnW.Conv1dBias,
-            _state.GdnQkvBuf, dConv: dConv, channels: convDim, seqLen: seqLen);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
-        TmStage("gdn_conv", seqLen);
-
-        _kernels.SiluInplace.Record(cmdBuf, _state.GdnQkvBuf, n: seqLen * convDim);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
-        TmStage("gdn_silu", seqLen);
-
-        // Save the trailing (dConv-1) rows of ConvInput back to convState.
-        // The CPU reference reads from rows seqLen..(seqLen+dConv-2) of the
-        // pre-SiLU ConvInput (NOT the convolved output). Same offset pattern
-        // as VulkanNemotronH SSM forward.
-        if (convStateBytes > 0)
+        // Issue #695: for real prefills (>= 8 rows) one fused pass reads the conv state and the qkv rows directly (no [state | qkv]
+        // concatenation copy), applies SiLU, and writes GdnConvInput; the new conv state is the last (dConv-1) qkv rows. Bit-identical to the
+        // copy + conv + SiLU chain below, which short forwards (decode, verify) and DOTLLM_VK_GDN_CONV_FUSED=0 keep.
+        var convOut = _state.GdnQkvBuf;
+        if (_kernels.GdnConvSilu is { } fusedConv && seqLen >= 8 && dConv >= 2 && dConv <= GdnConvSiluF32Kernel.MaxConvWidth)
         {
+            fusedConv.Record(cmdBuf, convStateBuf, _state.GdnQkvBuf, gdnW.Conv1dWeight, gdnW.Conv1dBias, _state.GdnConvInput,
+                dConv: dConv, channels: convDim, seqLen: seqLen);
             KernelSupport.ComputeToTransferBarrier(cmdBuf);
-            ulong saveSrc = (ulong)((long)seqLen * convDimBytes);
-            RecordCopyBufferRange(cmdBuf, _state.GdnConvInput, convStateBuf,
-                srcOffset: saveSrc, dstOffset: 0, size: (ulong)convStateBytes);
+            RecordCopyBufferRange(cmdBuf, _state.GdnQkvBuf, convStateBuf,
+                srcOffset: (ulong)((long)(seqLen - (dConv - 1)) * convDimBytes), dstOffset: 0, size: (ulong)convStateBytes);
             KernelSupport.TransferToComputeBarrier(cmdBuf);
+            convOut = _state.GdnConvInput;
+            TmStage("gdn_conv_fused", seqLen);
+        }
+        else
+        {
+            // ConvInput = [convState (DConv-1 rows) | qkvBuf (seqLen rows)]
+            KernelSupport.ComputeToTransferBarrier(cmdBuf);
+            if (convStateBytes > 0)
+            {
+                RecordCopyBufferRange(cmdBuf, convStateBuf, _state.GdnConvInput,
+                    srcOffset: 0, dstOffset: 0, size: (ulong)convStateBytes);
+            }
+            // The qkv rows are contiguous in both buffers, so the whole [seqLen, convDim] block is one copy (was seqLen copies).
+            RecordCopyBufferRange(cmdBuf, _state.GdnQkvBuf, _state.GdnConvInput,
+                srcOffset: 0, dstOffset: (ulong)((long)(dConv - 1) * convDimBytes), size: (ulong)((long)seqLen * convDimBytes));
+            KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+            _kernels.Conv1dCausal.Record(cmdBuf, _state.GdnConvInput, gdnW.Conv1dWeight, gdnW.Conv1dBias,
+                _state.GdnQkvBuf, dConv: dConv, channels: convDim, seqLen: seqLen);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            TmStage("gdn_conv", seqLen);
+
+            _kernels.SiluInplace.Record(cmdBuf, _state.GdnQkvBuf, n: seqLen * convDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            TmStage("gdn_silu", seqLen);
+
+            // Save the trailing (dConv-1) rows of ConvInput back to convState.
+            // The CPU reference reads from rows seqLen..(seqLen+dConv-2) of the
+            // pre-SiLU ConvInput (NOT the convolved output). Same offset pattern
+            // as VulkanNemotronH SSM forward.
+            if (convStateBytes > 0)
+            {
+                KernelSupport.ComputeToTransferBarrier(cmdBuf);
+                ulong saveSrc = (ulong)((long)seqLen * convDimBytes);
+                RecordCopyBufferRange(cmdBuf, _state.GdnConvInput, convStateBuf,
+                    srcOffset: saveSrc, dstOffset: 0, size: (ulong)convStateBytes);
+                KernelSupport.TransferToComputeBarrier(cmdBuf);
+            }
+
         }
 
         // ── 4. De-interleave Q/K/V and L2-normalise Q and K ──────────────────
         // GdnQkvBuf layout per token: [Q(kDim) | K(kDim) | V(vDim)]
         if (_kernels.GdnQkvSplit is { } qkvSplit)
         {
-            qkvSplit.RecordGdnQkvSplit(cmdBuf, _state.GdnQkvBuf, _state.GdnQBuf, _state.GdnKBuf, _state.GdnVBuf, seqLen, kDim, vDim);
+            qkvSplit.RecordGdnQkvSplit(cmdBuf, convOut, _state.GdnQBuf, _state.GdnKBuf, _state.GdnVBuf, seqLen, kDim, vDim);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
         }
         else
@@ -918,11 +937,11 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         for (int t = 0; t < seqLen; t++)
         {
             ulong rowBase = (ulong)((long)t * convDimBytes);
-            RecordCopyBufferRange(cmdBuf, _state.GdnQkvBuf, _state.GdnQBuf,
+            RecordCopyBufferRange(cmdBuf, convOut, _state.GdnQBuf,
                 srcOffset: rowBase, dstOffset: (ulong)((long)t * kDimBytes), size: (ulong)kDimBytes);
-            RecordCopyBufferRange(cmdBuf, _state.GdnQkvBuf, _state.GdnKBuf,
+            RecordCopyBufferRange(cmdBuf, convOut, _state.GdnKBuf,
                 srcOffset: rowBase + (ulong)kDimBytes, dstOffset: (ulong)((long)t * kDimBytes), size: (ulong)kDimBytes);
-            RecordCopyBufferRange(cmdBuf, _state.GdnQkvBuf, _state.GdnVBuf,
+            RecordCopyBufferRange(cmdBuf, convOut, _state.GdnVBuf,
                 srcOffset: rowBase + (ulong)(2 * kDimBytes), dstOffset: (ulong)((long)t * vDimBytes), size: (ulong)vDimBytes);
         }
         KernelSupport.TransferToComputeBarrier(cmdBuf);
