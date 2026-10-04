@@ -1085,6 +1085,13 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: 0);
         }
+        else if (_kernels.FlashAttentionCoopmat is not null && seqLen > 1 && headDim <= _kernels.FlashAttentionCoopmat.SupportedMaxHeadDim)
+        {
+            _kernels.FlashAttentionCoopmat.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+                seqQ: seqLen, seqKv: seqKv,
+                numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                positionOffset: positionOffset, slidingWindow: 0);
+        }
         else if (_kernels.FlashAttention is not null && seqLen > 1 && headDim <= _kernels.FlashAttention.SupportedMaxHeadDim)
         {
             _kernels.FlashAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,

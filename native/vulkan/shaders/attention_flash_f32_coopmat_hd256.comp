@@ -1,0 +1,570 @@
+#version 450
+
+// HEAD_DIM-256 VARIANT of attention_flash_f32_coopmat.comp (issue #685) -- see that file for the numerics / #533 / #543 contract,
+// which is carried over verbatim EXCEPT for QK^T (below). Differences:
+//   - MAX_HEAD_DIM 256, the 16 x 256 O tile is 16 register cells per thread (thread tid owns column tid of all BR rows).
+//   - BC = 32 and K / V are staged in 64-wide d-chunks, so LDS is ~32 KB (2 workgroups per WGP).
+//   - QK^T is computed with a HI/LO f16 SPLIT: Q = Qh + Ql and K = Kh + Kl (each rounded to f16), S = Qh.Kh + Qh.Kl + Ql.Kh (three
+//     MMAs into one f32 accumulator). A plain f16 QK^T is NOT good enough for the head_dim-256 Qwen3.5 / Qwen3.6 hybrids: their
+//     scores are large (QK-normed with big weights), the f16 rounding error of the score scales with |score|, and Tev1-4B teacher-
+//     forced NLL went 2.272 -> 3.509 (measured). With the split it is 2.27185 against 2.27188 for the f32 scalar kernel. P and V
+//     stay plain f16 (their error is relative and averages out; the 128-dim shaders ship that).
+//   - Only subgroups 0 and 1 run QK^T (BC / 16 = 2 KV-column slices); all four run P.V (one 16-wide d-block each per round).
+// KHR_cooperative_matrix variant of attention_flash_f32.comp (issue #149).
+//
+// Same Flash-Attention-v2 tiling as the scalar prefill shader — one workgroup
+// per (query-head, BR-row query tile), KV consumed in BC-column tiles — but
+// the two matmuls (QK^T and P·V) run on the WMMA/matrix cores via 16x16x16
+// f16 x f16 -> f32 cooperative-matrix tiles instead of scalar F32 loops.
+// This is llama.cpp's FA_COOPMAT1 shape (Br=16, Bc=16*4 subgroup slices,
+// WG = 4 subgroups; flash_attn_cm1.comp / get_fa_tuning_params_coopmat1).
+//
+// Numerics (deliberate, matching llama.cpp's flash-attention class):
+//   - Q and K are converted F32 -> F16 in the LDS tiles (llama.cpp's KV cache
+//     is F16 to begin with, so this is the same rounding class it ships).
+//   - QK^T accumulates in F32 (coopmat accumulator), scale/mask/softcap are
+//     applied to the F32 scores, and the online-softmax state (running max /
+//     sum / correction) is all F32 — llama.cpp cm1 keeps Mf/Lf in float too.
+//   - On a COOPMAT tile: V is staged F16, P = exp(s - max) is fed to the P·V
+//     multiply as F16 (llama.cpp: Psh is f16vec4), the softmax denominator sums
+//     float(f16(P)) so numerator and denominator round P identically, and P·V
+//     accumulates in F32 (stricter than llama.cpp cm1's default f16 accumulator).
+//   - On a SCALAR-TAIL tile (#533's KV-length-dependent tiles — see 2f) both
+//     operands are FULL F32: P from sTile, V staged into oStage, denominator
+//     summing the same f32 (#543). That path measures 1.45E-04 from the scalar
+//     f32 FA kernel where the all-f16 form measured 3.30E-04, and it makes a
+//     1-token chunk write BIT-IDENTICAL KV to a single-pass prefill of the same
+//     tokens, which is what #543 was filed for. It is also FASTER: +6.5% at
+//     p512, +4% at hd128, neutral at p2048 (two 61-pass order-reversed rounds on
+//     gfx1151; see .docs/ISSUE_543_MEASUREMENTS.md and the retained
+//     attention_flash_f32_coopmat_pre543 control).
+//   - What is NOT fixed: QK^T stays f16-in on every tile, so the residual
+//     1.45E-04 at rows 0-63 is the score matmul alone, and the gain decays with
+//     position (at most ~2 of a row's ceil((p+1)/64) tiles are scalar-tail ones
+//     — 1.02x by row 64, ~1.0x past row 256).
+// Expected drift vs the all-F32 scalar shader / CPU oracle is therefore
+// f16-input-class (rel ~2^-11 per operand), NOT bit-exact — the parity
+// tolerance and the end-to-end greedy-token gate live in
+// VulkanFlashAttentionCoopmatKernelTests.
+//
+// Occupancy: LDS ≈ 30 KB (q 4 KB + kv 16 KB shared between K and V phases +
+// scores 4.1 KB + P 2.1 KB + O-stage 4 KB) -> 2 workgroups per RDNA3.5 WGP.
+// The 2026-04 opt-in attention_f32_coopmat.comp kept ~40 KB resident at WG=64
+// (one wave) — one of the two reasons it measured 1.27-1.56x SLOWER than the
+// scalar kernels (the other: it was benchmarked at decode shapes, where
+// llama.cpp itself routes to FA_SCALAR).
+//
+// Subgroup safety: cooperative-matrix ops are subgroup-scope. Each of the 4
+// KV-column slices is owned by `gl_SubgroupID % 4`; at subgroupSize 64
+// (RDNA3.5 default) that is exactly one subgroup per slice, and at
+// subgroupSize 32 two subgroups redundantly compute the same slice and store
+// identical values — wasteful but correct. All scalar phases (tile loads,
+// masking, row-owner softmax) are flat tid loops with no subgroup ops.
+//
+// Dispatch (identical to attention_flash_f32.comp):
+//   local_size_x  = WG_SIZE (256)
+//   workgroups.x  = ceil(seq_q / BR) * num_heads
+// Push constants and bindings are byte-identical to the scalar FA shader.
+
+#extension GL_KHR_cooperative_matrix          : require
+#extension GL_KHR_memory_scope_semantics      : require
+#extension GL_KHR_shader_subgroup_basic       : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage        : require
+
+#define BR              16
+#define BC              32
+#define WG_SIZE         256
+#define MAX_HEAD_DIM    256
+#define KV_D            64                  // d-chunk width of the K / V staging tile
+#define MAT_K           16                  // coopmat inner-dim chunk
+#define NUM_SLICES      4                   // d-block slices of the P.V round (one per subgroup)
+#define KV_SLICES       (BC / 16)           // 2 KV-column slices of 16 for QK^T
+#define PV_ROUNDS_MAX   (MAX_HEAD_DIM / (16 * NUM_SLICES))  // 4
+#define O_CELLS         (BR * MAX_HEAD_DIM / WG_SIZE)       // 8 f32 regs/thread
+#define NEG_INF         (-3.4e38)
+
+// Score-tile row stride: +4 floats keeps coopMatStore rows 16-byte aligned
+// (a hard requirement for cooperative-matrix loads/stores) while still
+// staggering the BR concurrent row-owner scans across LDS banks.
+#define S_STRIDE        (BC + 4)
+// P-tile row stride in f16: +8 keeps rows 16-byte aligned for coopMatLoad
+// with the same bank stagger.
+#define P_STRIDE        (BC + 8)
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufQ   { float q[]; };    // [seq_q,  num_heads    * head_dim]
+layout(set = 0, binding = 1, std430) readonly  buffer BufK   { float k[]; };    // [seq_kv, num_kv_heads * head_dim]
+layout(set = 0, binding = 2, std430) readonly  buffer BufV   { float v[]; };    // [seq_kv, num_kv_heads * head_dim]
+layout(set = 0, binding = 3, std430) writeonly buffer BufOut { float outp[]; }; // [seq_q,  num_heads    * head_dim]
+
+layout(push_constant) uniform PushConstants {
+    uint  seqQ;
+    uint  seqKv;
+    uint  numHeads;
+    uint  numKvHeads;
+    uint  headDim;
+    uint  positionOffset;
+    uint  slidingWindow;   // 0 = disabled
+    uint  useAlibi;        // 0 = disabled, 1 = standard fixed ALiBi slopes
+    float softCap;         // 0.0 = disabled, >0 = tanh-capped scores
+    float scaleOverride;   // 0.0 = use 1/sqrt(headDim), >0 = use this scale (Gemma 3 QPAS)
+    uint  maskMode;        // 0 = Causal, 1 = Bidirectional, 2 = Hybrid (diffusion canvas)
+    uint  prefixLen;       // Hybrid only: positions < prefixLen stay causal, >= are bidirectional
+} pc;
+
+// #533 — SPECIALIZATION constant, deliberately not a push constant. It must be
+// substituted BEFORE the driver's backend compiler runs, so that with the gate
+// off the scalar tail below is dead code and costs no registers. A uniform push
+// constant was tried first and MEASURED: on an RTX 3060 it recovered nothing at
+// the seqKv >= 640 hd64 shape (0.82x either way), because the scalar path's
+// register pressure is paid at compile time whether or not it executes.
+// Defaults to 1: a pipeline created without specialization data must fail SAFE,
+// toward the invariant path.
+layout(constant_id = 0) const uint REQUIRE_INVARIANT_PV = 1u;
+
+// Causal-component mask — byte-identical semantics to attention_flash_f32.comp
+// and the CPU reference (DotLLM.Cpu.Kernels.Attention.ApplyMask).
+bool isMasked(uint tkv, uint posQ, uint maskMode, uint prefixLen) {
+    if (maskMode == 1u) return false;
+    if (maskMode == 2u && posQ >= prefixLen) return false;
+    return tkv > posQ;
+}
+
+shared float16_t qTile [BR * MAX_HEAD_DIM];
+shared float16_t qTileLo[BR * MAX_HEAD_DIM];
+shared float16_t kvTileLo[BC * KV_D];       // Q rows, f16, stride MAX_HEAD_DIM
+shared float16_t kvTile[BC * KV_D];              // K d-chunk, then V d-chunk
+shared float     sTile [BR * S_STRIDE];           // QK^T scores (f32)
+shared float16_t pTile [BR * P_STRIDE];           // exp(s - max) fed to P·V
+shared float     oStage[NUM_SLICES * 16 * 16];    // per-slice P·V coopmat output
+shared float     runningMax[BR];
+shared float     runningSum[BR];
+shared float     corrShared[BR];
+
+uint previousPowerOfTwo(uint value) {
+    uint power = 1u;
+    while ((power << 1u) <= value) {
+        power <<= 1u;
+    }
+    return power;
+}
+
+float alibiSlopePowerOfTwo(uint head, uint numHeads) {
+    float start = exp2(-exp2(-(log2(float(numHeads)) - 3.0)));
+    return pow(start, float(head + 1u));
+}
+
+float alibiSlope(uint head, uint numHeads) {
+    uint power = previousPowerOfTwo(numHeads);
+    if (power == numHeads || head < power) {
+        return alibiSlopePowerOfTwo(head, power);
+    }
+    uint expanded = power << 1u;
+    uint extraHead = (head - power) << 1u;
+    return alibiSlopePowerOfTwo(extraHead, expanded);
+}
+
+// Stages V columns [roundBase, roundBase + KV_D) of this KV tile into kvTile (f16, stride KV_D), zero-padded past
+// tileLen / headDim / hdCeil.
+void stageV(uint tStart, uint tileLen, uint roundBase, uint hdCeil, uint kvStride, uint hkv, uint tid) {
+    uint dLen = min(uint(KV_D), hdCeil - roundBase);
+    for (uint idx = tid; idx < uint(BC) * dLen; idx += uint(WG_SIZE)) {
+        uint c = idx / dLen;
+        uint dl = idx - c * dLen;
+        uint d = roundBase + dl;
+        float val = 0.0;
+        if (c < tileLen && d < pc.headDim) {
+            val = v[(tStart + c) * kvStride + hkv * pc.headDim + d];
+        }
+        kvTile[c * uint(KV_D) + dl] = float16_t(val);
+    }
+}
+
+void main() {
+    uint blockId = gl_WorkGroupID.x;
+    uint qTilesPerHead = (pc.seqQ + uint(BR) - 1u) / uint(BR);
+    uint totalBlocks = qTilesPerHead * pc.numHeads;
+    if (blockId >= totalBlocks) return;
+
+    uint qTileIdx = blockId / pc.numHeads;
+    uint hq       = blockId - qTileIdx * pc.numHeads;
+    uint qStartRow = qTileIdx * uint(BR);
+
+    uint groupSize = pc.numHeads / pc.numKvHeads;
+    uint hkv = hq / groupSize;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint qStride  = pc.numHeads   * pc.headDim;
+    uint kvStride = pc.numKvHeads * pc.headDim;
+
+    float scale = (pc.scaleOverride > 0.0) ? pc.scaleOverride : inversesqrt(float(pc.headDim));
+    float slope = (pc.useAlibi != 0u) ? alibiSlope(hq, pc.numHeads) : 0.0;
+
+    uint rowsInTile = min(uint(BR), pc.seqQ - qStartRow);
+
+    // head_dim rounded up to the coopmat chunk. Tiles are zero-padded in
+    // [headDim, hdCeil) so the 16-wide inner-dim multiplies never read
+    // garbage; loads/stores never touch [hdCeil, MAX_HEAD_DIM).
+    uint hdCeil = (pc.headDim + uint(MAT_K) - 1u) & ~(uint(MAT_K) - 1u);
+    uint headChunks = hdCeil / uint(MAT_K);
+    uint pvRounds = (hdCeil + uint(16 * NUM_SLICES) - 1u) / uint(16 * NUM_SLICES);
+
+    // The subgroup-uniform KV-column / d-block slice this thread's subgroup
+    // owns for the cooperative-matrix phases (see header re: wave32).
+    uint slice = gl_SubgroupID % uint(NUM_SLICES);
+    uint kslice = gl_SubgroupID & 1u;               // QK^T KV-column slice (subgroups 0/1 only)
+
+    // 1. Load the Q tile in f16 (rows past seqQ and dims past headDim -> 0),
+    //    zero the padding rows of the P tile once (row-owner softmax never
+    //    writes rows >= rowsInTile; P·V consumes all BR rows), and reset the
+    //    online-softmax state. O lives in registers: cell i = tid + 256*i
+    //    over the BR x MAX_HEAD_DIM grid, i.e. this thread owns column
+    //    d0 = tid & 127 of rows (tid >> 7) + 2*i.
+    for (uint idx = tid; idx < uint(BR) * hdCeil; idx += uint(WG_SIZE)) {
+        uint r = idx / hdCeil;
+        uint d = idx - r * hdCeil;
+        uint tq = qStartRow + r;
+        float val = 0.0;
+        if (tq < pc.seqQ && d < pc.headDim) {
+            val = q[tq * qStride + hq * pc.headDim + d];
+        }
+        float16_t hiq = float16_t(val);
+        qTile[r * uint(MAX_HEAD_DIM) + d] = hiq;
+        qTileLo[r * uint(MAX_HEAD_DIM) + d] = float16_t(val - float(hiq));
+    }
+    for (uint r = rowsInTile + tid; r < uint(BR); r += uint(WG_SIZE)) {
+        for (uint c = 0u; c < uint(BC); c++) {
+            pTile[r * uint(P_STRIDE) + c] = float16_t(0.0);
+        }
+    }
+    if (tid < uint(BR)) {
+        runningMax[tid] = NEG_INF;
+        runningSum[tid] = 0.0;
+    }
+    float oReg[O_CELLS];
+    for (uint i = 0u; i < uint(O_CELLS); i++) {
+        oReg[i] = 0.0;
+    }
+    uint d0   = tid;                             // MAX_HEAD_DIM == WG_SIZE: column d0 of every row
+    barrier();
+
+    // 2. KV tile loop. Causal early-exit identical to the scalar FA shader.
+    uint kvEnd = pc.seqKv;
+    if (pc.maskMode == 0u) {
+        uint lastPosQ = pc.positionOffset + qStartRow + rowsInTile - 1u;
+        kvEnd = min(pc.seqKv, lastPosQ + 1u);
+    }
+
+    for (uint tStart = 0u; tStart < kvEnd; tStart += uint(BC)) {
+        uint tileLen = min(uint(BC), kvEnd - tStart);
+
+        // #533's safe-tile classification, hoisted here because #543's f32 tail
+        // needs it BEFORE the V staging pass in 2d (which it replaces) and before
+        // the row-owner softmax in 2d (which feeds it P). It depends only on
+        // tileLen / maskMode / this query tile's first position, all known now.
+        // The reasoning for the predicate itself is at 2f, unchanged.
+        uint firstPosQ = pc.positionOffset + qStartRow;
+        bool tileSafe = (REQUIRE_INVARIANT_PV == 0u)
+            || ((tileLen == uint(BC))
+                && (pc.maskMode == 1u || (tStart + uint(BC)) <= firstPosQ + 1u));
+
+        // 2a/2b. S = Q x K^T on the matrix cores, K staged in KV_D-wide d-chunks (the full 64 x 256 f16 tile would
+        //     cost 32 KB of LDS). The F32 accumulator is carried across chunks, so each output still reduces d in
+        //     ascending 16-wide steps -- the same order as the 128-dim shader. Each slice owns 16 KV columns.
+        coopmat<float, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseAccumulator> accS =
+            coopmat<float, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseAccumulator>(0.0);
+        for (uint dBase = 0u; dBase < hdCeil; dBase += uint(KV_D)) {
+            uint dLen = min(uint(KV_D), hdCeil - dBase);
+            for (uint idx = tid; idx < uint(BC) * dLen; idx += uint(WG_SIZE)) {
+                uint c = idx / dLen;
+                uint dl = idx - c * dLen;
+                uint d = dBase + dl;
+                uint tkv = tStart + c;
+                float val = 0.0;
+                if (c < tileLen && d < pc.headDim) {
+                    val = k[tkv * kvStride + hkv * pc.headDim + d];
+                }
+                float16_t hik = float16_t(val);
+                kvTile[c * uint(KV_D) + dl] = hik;
+                kvTileLo[c * uint(KV_D) + dl] = float16_t(val - float(hik));
+            }
+            barrier();
+            for (uint ck = 0u; gl_SubgroupID < uint(KV_SLICES) && ck < dLen / uint(MAT_K); ck++) {
+                coopmat<float16_t, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseA> matQ;
+                coopmat<float16_t, gl_ScopeSubgroup, MAT_K, MAT_K, gl_MatrixUseB> matKt;
+                uint dl = ck * uint(MAT_K);
+                coopMatLoad(matQ,  qTile,  dBase + dl,                            uint(MAX_HEAD_DIM), gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(matKt, kvTile, kslice * 16u * uint(KV_D) + dl,         uint(KV_D),         gl_CooperativeMatrixLayoutColumnMajor);
+                accS = coopMatMulAdd(matQ, matKt, accS);
+                coopmat<float16_t, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseA> matQl;
+                coopmat<float16_t, gl_ScopeSubgroup, MAT_K, MAT_K, gl_MatrixUseB> matKl;
+                coopMatLoad(matQl, qTileLo, dBase + dl, uint(MAX_HEAD_DIM), gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(matKl, kvTileLo, kslice * 16u * uint(KV_D) + dl, uint(KV_D), gl_CooperativeMatrixLayoutColumnMajor);
+                accS = coopMatMulAdd(matQ, matKl, accS);
+                accS = coopMatMulAdd(matQl, matKt, accS);
+            }
+            barrier();   // the next chunk (or V round 0) restages kvTile
+        }
+        if (gl_SubgroupID < uint(KV_SLICES)) {
+            coopMatStore(accS, sTile, kslice * 16u, uint(S_STRIDE), gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+
+        // 2c. Scale + mask + soft-cap on the F32 scores — same math and
+        //     order as the scalar FA shader (dot * scale - slope * dist,
+        //     then softcap; masked / out-of-range cells -> NEG_INF).
+        for (uint idx = tid; idx < uint(BR) * uint(BC); idx += uint(WG_SIZE)) {
+            uint r = idx / uint(BC);
+            uint c = idx - r * uint(BC);
+            uint sIdx = r * uint(S_STRIDE) + c;
+            uint tkv = tStart + c;
+            if (r >= rowsInTile) {
+                // #543: 0.0, not NEG_INF. These rows are DEAD for every consumer
+                // — the row-owner softmax scans r < rowsInTile, the coopmat P·V
+                // is fed from pTile (whose padding rows step 1 zeroes), and step 3
+                // discards them — so zeroing them lets the f32 tail accumulate
+                // all BR rows branch-free. That branch WAS the whole residual
+                // cost of the f32 tail: with it the tail measured 0.98x at p512,
+                // without it 1.07x. This mask-pass change is not itself the source
+                // of that delta — the control arm carrying only this change reads
+                // 1.005-1.007x at p512.
+                sTile[sIdx] = 0.0;
+                continue;
+            }
+            if (c >= tileLen) {
+                sTile[sIdx] = NEG_INF;
+                continue;
+            }
+            uint posQ = pc.positionOffset + qStartRow + r;
+            bool masked =
+                isMasked(tkv, posQ, pc.maskMode, pc.prefixLen) ||
+                (pc.slidingWindow > 0u && posQ >= tkv && (posQ - tkv) >= pc.slidingWindow);
+            if (masked) {
+                sTile[sIdx] = NEG_INF;
+            } else {
+                float s = sTile[sIdx] * scale - slope * float(posQ - tkv);
+                if (pc.softCap > 0.0) {
+                    s = pc.softCap * tanh(s / pc.softCap);
+                }
+                sTile[sIdx] = s;
+            }
+        }
+        barrier();
+
+        // 2d. Row-owner online softmax (threads 0..rowsInTile-1) — identical
+        //     structure to the scalar FA shader, except the exp weights are
+        //     rounded to f16 for the P·V matrix multiply and the running sum
+        //     accumulates the f16-rounded values so numerator and denominator
+        //     agree. Concurrently, ALL threads stage the V tile into kvTile
+        //     (the K data was fully consumed in 2b): disjoint memory, one
+        //     barrier pair covers both.
+        if (tid < rowsInTile) {
+            uint r = tid;
+            uint sBase = r * uint(S_STRIDE);
+            uint pBase = r * uint(P_STRIDE);
+            float oldMax = runningMax[r];
+            float newMax = oldMax;
+            for (uint c2 = 0u; c2 < tileLen; c2++) {
+                newMax = max(newMax, sTile[sBase + c2]);
+            }
+            float correction = (oldMax > NEG_INF * 0.5) ? exp(oldMax - newMax) : 0.0;
+            float tileSum = 0.0;
+            for (uint c2 = 0u; c2 < uint(BC); c2++) {
+                float w = 0.0;
+                if (c2 < tileLen) {
+                    float val = sTile[sBase + c2];
+                    w = (val > NEG_INF * 0.5) ? exp(val - newMax) : 0.0;
+                }
+                pTile[pBase + c2] = float16_t(w);
+                if (tileSafe) {
+                    // Coopmat path: the denominator must round P exactly the way
+                    // the numerator does, and the numerator consumes the f16 P.
+                    tileSum += float(pTile[pBase + c2]);
+                } else {
+                    // #543: the f32 tail's P. Written back OVER the score it was
+                    // computed from — sTile is fully consumed by now — so f32 P
+                    // reaches the tail at no extra LDS, and the denominator sums
+                    // the same f32 the numerator will. Only on an unsafe tile:
+                    // from p512 up most tiles are coopmat and an unconditional
+                    // writeback is pure cost there.
+                    sTile[sBase + c2] = w;
+                    tileSum += w;
+                }
+            }
+            runningSum[r] = runningSum[r] * correction + tileSum;
+            runningMax[r] = newMax;
+            corrShared[r] = correction;
+        }
+        // #543: the f16 V tile is staged only for the coopmat path. An unsafe
+        // tile stages V as f32 into oStage inside the tail instead (2f).
+        if (tileSafe) {
+            stageV(tStart, tileLen, 0u, hdCeil, kvStride, hkv, tid);   // round 0; later rounds restage inside the P.V loop
+        }
+        barrier();
+
+        // 2e. Rescale the register O accumulator by this tile's per-row
+        //     correction (register cells have fixed rows, see step 1).
+        for (uint i = 0u; i < uint(O_CELLS); i++) {
+            uint r = i;
+            oReg[i] *= corrShared[r];
+        }
+
+        // 2f. O += P x V on the matrix cores. Each slice owns a 16-wide
+        //     d-block per round (round layout: d = round*64 + slice*16). The
+        //     coopmat result is staged through oStage and folded into the
+        //     register accumulator by the owning threads.
+        //
+        // #533: the P·V cooperative-matrix multiply is used ONLY for KV tiles
+        // whose staged (P, V) contents are INDEPENDENT of this dispatch's KV
+        // length — a tile that is completely full (tileLen == BC) and carries
+        // no masked cell for ANY row of this query tile.
+        //
+        // Every other tile has exact zeros in P exactly where a LONGER
+        // dispatch of the same prompt has real V data in the same columns
+        // (masked cells, the short final tile, and the fully-masked tiles a
+        // longer dispatch adds past a row's causal limit). On AMD the coopmat
+        // P·V does not return the same value for those columns' `0 * v`
+        // contributions, so the LAST causally visible query row came out ~1
+        // f32 ULP different whenever the effective KV length was odd — which
+        // amplified into a demonstrated token flip through 16 layers (#533;
+        // measured 0-differing on NVIDIA at every length, so it is an AMD
+        // implementation property, not our arithmetic). Those tiles take a
+        // flat scalar loop instead.
+        //
+        // #543 SUPERSEDES that loop's operands and its cost. It read the same f16
+        // LDS tiles, which made it the LESS accurate path; it now reads f32 (see
+        // 2d and below). The cost figures #533 shipped with — 0.809x at
+        // p128_even, at or above parity elsewhere, 3-5% GAIN at p2048 hd64 —
+        // described the f16 form and no longer describe this code: measured
+        // against the pre-#543 control the f32 tail is 1.066-1.073x at p512,
+        // 1.037-1.041x at hd128 and neutral at p2048.
+        // A sliding window does NOT need to force the scalar path: its masked
+        // cells sit at columns that carry the SAME real V data in a longer
+        // dispatch, so the staged tile is identical either way. Only columns a
+        // longer dispatch fills past this dispatch's kvEnd differ, and the
+        // causal clause below already excludes those tiles.
+        //
+        // requireInvariantPv == 0 makes EVERY tile safe, which restores the
+        // pre-fix all-coopmat path exactly. The host sets it per vendor: the
+        // defect is an AMD implementation property, and an RTX 3060 is
+        // 0-differing at every length on this same SPIR-V, so NVIDIA does not
+        // pay the scalar tail for a bug it does not have. Anything not measured
+        // clean gets the gate.
+        // (tileSafe was computed at the top of the KV loop, because 2d needs it.)
+        if (!tileSafe) {
+            // #543: the f32 P·V tail. V is staged as F32 through oStage, which
+            // the coopmat rounds below own but which is IDLE on exactly the tiles
+            // that reach here — so this costs NO extra LDS and fetches each V
+            // element ONCE. Reading v[] directly inside the accumulate loop was
+            // measured first and fetches it once per ROW LANE (2x here, 4x in the
+            // hd64 shader), which cost 4% at p512; the 2x2 factorial that
+            // attributed that cost to the V source, and the VK_AMD_shader_info
+            // numbers that ruled occupancy out (117 -> 129 VGPRs, zero scratch,
+            // LDS-bound at 31744 B either way), are in
+            // .docs/ISSUE_543_MEASUREMENTS.md.
+            //
+            // `precise` pins the whole reduction: left to itself the compiler
+            // reassociates/unrolls this loop differently in the 128-dim and the
+            // hd64 shader (different live-register pressure), and the #378
+            // seqKv>=640 gate would then switch between two 1-ULP-different
+            // results mid-prompt — exactly the invariance class #533 is about.
+            // An explicit fma() with no `precise` was MEASURED and is NOT enough
+            // (the split reappears at posOff=100): it pins the multiply-add but
+            // not the accumulation order. The order here is c-major per row, the
+            // same order the f16 tail used, and chunking does not change it.
+            //
+            // oStage holds V_CHUNK columns at stride MAX_HEAD_DIM — 8 columns in
+            // this shader, 16 in the hd64 one. Packing at the model's hdCeil
+            // instead, to halve the barrier count, was measured and changed
+            // NOTHING, so barriers are not this path's binding resource.
+            const uint V_CHUNK = uint(NUM_SLICES * 16 * 16) / uint(MAX_HEAD_DIM);
+            precise float acc[O_CELLS];
+            for (uint i = 0u; i < uint(O_CELLS); i++) {
+                acc[i] = 0.0;
+            }
+            for (uint cBase = 0u; cBase < tileLen; cBase += V_CHUNK) {
+                uint cols = min(V_CHUNK, tileLen - cBase);
+                // One coalesced f32 fetch per element — d contiguous across
+                // threads, exactly like the f16 staging pass this replaces.
+                for (uint idx = tid; idx < cols * hdCeil; idx += uint(WG_SIZE)) {
+                    uint c = idx / hdCeil;
+                    uint d = idx - c * hdCeil;
+                    oStage[c * uint(MAX_HEAD_DIM) + d] =
+                        (d < pc.headDim) ? v[(tStart + cBase + c) * kvStride + hkv * pc.headDim + d] : 0.0;
+                }
+                barrier();
+                if (d0 < pc.headDim) {
+                    for (uint c = 0u; c < cols; c++) {
+                        float vv = oStage[c * uint(MAX_HEAD_DIM) + d0];
+                        // Branch-free over all BR rows: the mask pass put exact
+                        // 0.0 in sTile's padding rows (2c), so rows past
+                        // rowsInTile contribute exact zeros.
+                        for (uint i = 0u; i < uint(O_CELLS); i++) {
+                            acc[i] += sTile[(i) * uint(S_STRIDE) + cBase + c] * vv;
+                        }
+                    }
+                }
+                // Both barriers are needed and both are workgroup-uniform:
+                // tileSafe, tileLen and V_CHUNK are all uniform. The trailing one
+                // also separates the last read of sTile from the next KV tile's
+                // coopMatStore into it.
+                barrier();
+            }
+            if (d0 < pc.headDim) {
+                for (uint i = 0u; i < uint(O_CELLS); i++) {
+                    // Rows >= rowsInTile accumulated exact 0.0, so folding them in
+                    // unconditionally is a no-op. Their oReg cells are then
+                    // multiplied by an unwritten corrShared[r] at 2e and may go
+                    // NaN; step 3 discards every row >= rowsInTile, and the
+                    // L=61/63/65/67 arms of Probe533FixCandidateTests (rowsInTile
+                    // < BR) are what make that measured rather than argued.
+                    oReg[i] += acc[i];
+                }
+            }
+        }
+        for (uint round = 0u; tileSafe && round < pvRounds; round++) {
+            uint roundBase = round * uint(16 * NUM_SLICES);
+            if (round > 0u) {
+                // kvTile was last read before the previous round's oStage barrier, so restaging here is race-free.
+                stageV(tStart, tileLen, roundBase, hdCeil, kvStride, hkv, tid);
+                barrier();
+            }
+            uint dBlock = roundBase + slice * 16u;
+            if (dBlock < hdCeil) {
+                coopmat<float, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseAccumulator> accO =
+                    coopmat<float, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseAccumulator>(0.0);
+                for (uint cChunk = 0u; cChunk < uint(BC) / 16u; cChunk++) {
+                    coopmat<float16_t, gl_ScopeSubgroup, BR, MAT_K, gl_MatrixUseA> matP;
+                    coopmat<float16_t, gl_ScopeSubgroup, MAT_K, MAT_K, gl_MatrixUseB> matV;
+                    coopMatLoad(matP, pTile,  cChunk * 16u,                                       uint(P_STRIDE), gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(matV, kvTile, cChunk * 16u * uint(KV_D) + slice * 16u,            uint(KV_D),     gl_CooperativeMatrixLayoutRowMajor);
+                    accO = coopMatMulAdd(matP, matV, accO);
+                }
+                coopMatStore(accO, oStage, slice * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            }
+            barrier();
+
+            if (d0 >= roundBase && d0 < roundBase + uint(16 * NUM_SLICES) && d0 < hdCeil) {
+                uint sl = (d0 - roundBase) >> 4u;
+                uint dd = d0 & 15u;
+                for (uint i = 0u; i < uint(O_CELLS); i++) {
+                    oReg[i] += oStage[sl * 256u + i * 16u + dd];
+                }
+            }
+            barrier();
+        }
+    }
+
+    // 3. Normalize and write this thread's register cells.
+    if (d0 < pc.headDim) {
+        for (uint i = 0u; i < uint(O_CELLS); i++) {
+            uint r = i;
+            if (r >= rowsInTile) continue;
+            float sum = runningSum[r];
+            float inv = (sum > 1e-10) ? (1.0 / sum) : 0.0;
+            outp[(qStartRow + r) * qStride + hq * pc.headDim + d0] = oReg[i] * inv;
+        }
+    }
+}

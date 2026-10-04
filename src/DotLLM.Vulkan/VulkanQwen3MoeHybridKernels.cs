@@ -109,6 +109,12 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     /// </summary>
     public VulkanFlashAttentionF32Kernel? FlashAttention { get; }
     /// <summary>
+    /// Optional cooperative-matrix Flash-Attention prefill kernel with the hd256 pipeline (issue #685): preferred over
+    /// <see cref="FlashAttention"/> for <c>seqQ &gt; 1</c> when it can dispatch the model's head_dim. Null when coopmat attention is
+    /// disabled/unsupported, or when the hd256 SPIR-V is missing for a wide-head model.
+    /// </summary>
+    public VulkanFlashAttentionCoopmatKernel? FlashAttentionCoopmat { get; }
+    /// <summary>
     /// Optional split-KV (Flash-Decoding) kernel for the decode path
     /// (seqQ == 1). Null when the SPVs are missing or the env-var opt-out
     /// is set; only used for shapes that actually split — which with the shipping
@@ -195,6 +201,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope, AttentionF32Kernel attention,
         VulkanFlashAttentionF32Kernel? flashAttention,
+        VulkanFlashAttentionCoopmatKernel? flashAttentionCoopmat,
         VulkanSplitKvAttentionKernel? splitKvAttention,
         SwiGluF32Kernel swiglu, AddKernel add, SiluInplaceF32Kernel silu, Conv1dCausalF32Kernel conv1d,
         GdnL2NormalizeHeadsF32Kernel gdnL2,
@@ -233,6 +240,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulBf16 = matmulBf16; MatMulBf16Gemm = matmulBf16Gemm;
         RmsNorm = rmsnorm; Rope = rope; Attention = attention;
         FlashAttention = flashAttention;
+        FlashAttentionCoopmat = flashAttentionCoopmat;
         SplitKvAttention = splitKvAttention;
         SwiGlu = swiglu; Add = add; SiluInplace = silu; Conv1dCausal = conv1d;
         GdnL2Normalize = gdnL2;
@@ -333,6 +341,18 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         VulkanFlashAttentionF32Kernel? flashAttention =
             VulkanAttentionFallbackDiagnostics.CreatePrefillFlashAttention(
                 device, spvDir, headDim, "Qwen3Hybrid");
+        // #685: coopmat FA for the wide-head (hd256) hybrids. Only kept when this instance can dispatch the model's head_dim
+        // (an older SPV cache without the hd256 shader leaves SupportedMaxHeadDim at 128: keep the scalar kernel then).
+        VulkanFlashAttentionCoopmatKernel? flashAttentionCoopmat =
+            VulkanTransformerModel.IsFlashAttentionDisabled() || VulkanTransformerModel.IsCoopmatAttentionDisabled()
+                || headDim > VulkanFlashAttentionCoopmatKernel.WideMaxHeadDim
+                ? null
+                : VulkanFlashAttentionCoopmatKernel.TryCreate(device, spvDir);
+        if (flashAttentionCoopmat is not null && headDim > flashAttentionCoopmat.SupportedMaxHeadDim)
+        {
+            flashAttentionCoopmat.Dispose();
+            flashAttentionCoopmat = null;
+        }
         VulkanSplitKvAttentionKernel? splitKvAttention =
             VulkanTransformerModel.IsSplitDecodeDisabled() || headDim > VulkanSplitKvAttentionKernel.MaxHeadDim
                 ? null
@@ -401,7 +421,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             matmulPQ2_0, matmulPQ2_0Gemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
-            rmsnorm, rope, attention, flashAttention, splitKvAttention, swiglu, add, silu, conv1d,
+            rmsnorm, rope, attention, flashAttention, flashAttentionCoopmat, splitKvAttention, swiglu, add, silu, conv1d,
             gdnL2, gdnScan, gdnScanMulti, gdnPost,
             gdnDecay, sigmoidInplace,
             sigGateMul,
@@ -512,6 +532,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         Rope.InvalidateDescriptorCache();
         Attention.InvalidateDescriptorCache();
         FlashAttention?.InvalidateDescriptorCache();
+        FlashAttentionCoopmat?.InvalidateDescriptorCache();
         SplitKvAttention?.InvalidateDescriptorCache();
         SwiGlu.InvalidateDescriptorCache();
         Add.InvalidateDescriptorCache();
@@ -583,6 +604,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         SwiGlu.Dispose();
         SplitKvAttention?.Dispose();
         FlashAttention?.Dispose();
+        FlashAttentionCoopmat?.Dispose();
         Attention.Dispose();
         Rope.Dispose();
         RmsNorm.Dispose();
