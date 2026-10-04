@@ -255,4 +255,35 @@ public sealed class VulkanHybridSchedulerIdentityTests
             _out.WriteLine($"round {round}: ms/request serial+prefix={a:F1}  scheduler/no-restore={b:F1}  scheduler/restore={c:F1}  scheduler/restore/one-at-a-time={d:F1}");
         }
     }
+
+    /// <summary>
+    /// Opt-in (DOTLLM_MOE35B_STREAM_PROBE=1): prints a long-context greedy token stream for Qwen3.6-35B-A3B on Vulkan. Run it twice
+    /// (default vs DOTLLM_VK_FUSE_FORWARD=0) and diff the printed ids: the CPU oracle is infeasible at 35B, so the legacy
+    /// per-layer path is the reference for the fused single-command-buffer MoE decode.
+    /// </summary>
+    [SkippableFact]
+    public void Probe_Moe35B_LongContextGreedyStream()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_MOE35B_STREAM_PROBE") == "1", "opt-in probe");
+        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        string snaps = Path.Combine(home, ".cache", "huggingface", "hub", "models--unsloth--Qwen3.6-35B-A3B-GGUF", "snapshots");
+        string? path = Directory.Exists(snaps) ? Directory.EnumerateDirectories(snaps).SelectMany(d => Directory.GetFiles(d, "*UD-Q4_K_M.gguf")).FirstOrDefault() : null;
+        Skip.If(path is null, "35B GGUF not found.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        var (model, kvFactory) = VulkanModelLoader.CreateFromGguf(device, gguf, config, spvDir);
+        using var _ = model as IDisposable;
+
+        string filler = string.Join(" ", Enumerable.Range(0, 60).Select(i => $"Order {i} shipped on day {i * 3 % 29}."));
+        string prompt = "<|im_start|>user" + (char)10 + filler + " Describe these orders in a few sentences.<|im_end|>" + (char)10 +
+                        "<|im_start|>assistant" + (char)10 + "<think>" + (char)10 + (char)10 + "</think>" + (char)10 + (char)10;
+        var gen = new TextGenerator(model, tokenizer, (cfg, size) => kvFactory(size), mtpEnabled: false);
+        var opts = new InferenceOptions { Temperature = 0, MaxTokens = 48 };
+        gen.Generate(prompt, opts); // warm: lets the resident-bank fast path engage
+        var r = gen.Generate(prompt, opts);
+        _out.WriteLine("STREAM35B: " + string.Join(',', r.GeneratedTokenIds));
+    }
 }
