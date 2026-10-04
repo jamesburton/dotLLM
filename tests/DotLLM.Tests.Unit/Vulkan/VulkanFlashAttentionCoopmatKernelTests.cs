@@ -126,6 +126,43 @@ public class VulkanFlashAttentionCoopmatKernelTests
         => RunOne(seqQ: 64, seqKv: 704, numHeads: 6, numKvHeads: 2, headDim: 64,
             positionOffset: 0, useAlibi: true);
 
+    // Issue #685: head_dim > 128 routes to the hd256 pipeline (K/V staged in 64-wide d-chunks, 16 register O cells per thread).
+    [SkippableFact]
+    public void Launch_Hd256_Mha_ShortPrefill()
+        => RunOne(seqQ: 4, seqKv: 4, numHeads: 1, numKvHeads: 1, headDim: 256, positionOffset: 0);
+
+    [SkippableFact]
+    public void Launch_Hd256_Gqa8_Prefill_512()
+        // Qwen3.6-35B-A3B attention shape: 16 heads / 2 kv heads (group 8, discriminates hq/group vs hq%group).
+        => RunOne(seqQ: 512, seqKv: 512, numHeads: 16, numKvHeads: 2, headDim: 256, positionOffset: 0);
+
+    [SkippableFact]
+    public void Launch_Hd256_PartialTiles()
+        // Ragged Q and KV tiles (rowsInTile < BR, tileLen < BC) across several KV tiles.
+        => RunOne(seqQ: 301, seqKv: 333, numHeads: 4, numKvHeads: 2, headDim: 256, positionOffset: 0);
+
+    [SkippableFact]
+    public void Launch_Hd256_ChunkedPrefill_PositionOffset()
+        => RunOne(seqQ: 100, seqKv: 612, numHeads: 8, numKvHeads: 2, headDim: 256, positionOffset: 512);
+
+    [SkippableFact]
+    public void Launch_Hd256_LongPrefill_2048()
+        => RunOne(seqQ: 2048, seqKv: 2048, numHeads: 4, numKvHeads: 2, headDim: 256, positionOffset: 0);
+
+    [SkippableFact]
+    public void Launch_Hd256_SlidingWindow()
+        => RunOne(seqQ: 96, seqKv: 700, numHeads: 4, numKvHeads: 2, headDim: 256, positionOffset: 0, slidingWindow: 100);
+
+    [SkippableFact]
+    public void Launch_Hd192_PaddedDChunks()
+        // head_dim 192 = three full 64-wide d-chunks of a 256 tile, whole pvRounds 3 of 4 skipped.
+        => RunOne(seqQ: 70, seqKv: 150, numHeads: 4, numKvHeads: 2, headDim: 192, positionOffset: 0);
+
+    [SkippableFact]
+    public void Launch_Hd144_HalfPaddedLastDChunk()
+        // head_dim 144: the last d-chunk is only 16 wide, the P.V round 2 owns one live 16-block.
+        => RunOne(seqQ: 70, seqKv: 150, numHeads: 4, numKvHeads: 2, headDim: 144, positionOffset: 0);
+
     [SkippableFact]
     public void Launch_Hd64_HeadDim32_SmallerThanTile()
         // headDim (32) strictly less than the hd64 shader's own MAX_HEAD_DIM
@@ -255,6 +292,110 @@ public class VulkanFlashAttentionCoopmatKernelTests
             variant: FlashAttentionCoopmatVariant.Pinned64);
 
     // ─────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// #533/#543 invariance at head_dim 256: the rows a chunk writes must be BIT-identical to the same rows of a single-pass
+    /// prefill, for odd and even KV lengths (the partial-tile / masked-tile path takes the f32 tail, the full tiles the coopmat).
+    /// (A chunk boundary that is not a multiple of BR re-tiles the rows, which changes which KV tiles are coopmat vs tail for a given
+    /// row; that is inherent to the 128-dim shader too and is not asserted here.) A 1-token chunk is the discriminating case: without the tail gate the coopmat P.V returns different 0*v contributions.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(61, 60)]
+    [InlineData(63, 62)]
+    [InlineData(65, 64)]
+    [InlineData(67, 66)]
+    public void Hd256_ChunkedPrefill_IsBitInvariant(int total, int firstChunk)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(VulkanFlashAttentionCoopmatKernel.SupportsDevice(device), "no coopmat tile");
+        const int nh = 4, nkv = 2, hd = 256;
+        var rng = new Random(685 + total);
+        float[] q = RandomFloats(rng, total * nh * hd);
+        float[] k = RandomFloats(rng, total * nkv * hd);
+        float[] v = RandomFloats(rng, total * nkv * hd);
+        using var kernel = VulkanFlashAttentionCoopmatKernel.Create(device, spvDir);
+
+        using var bq = device.Allocate((long)q.Length * sizeof(float));
+        using var bk = device.Allocate((long)k.Length * sizeof(float));
+        using var bv = device.Allocate((long)v.Length * sizeof(float));
+        device.Upload(q.AsSpan(), bq);
+        device.Upload(k.AsSpan(), bk);
+        device.Upload(v.AsSpan(), bv);
+
+        float[] full = new float[q.Length];
+        using (var bo = device.Allocate((long)full.Length * sizeof(float)))
+        {
+            kernel.Launch(bq, bk, bv, bo, total, total, nh, nkv, hd);
+            device.Download(bo, full);
+        }
+
+        // Chunk 1: rows [0, firstChunk) against KV [0, firstChunk).
+        float[] c1 = new float[firstChunk * nh * hd];
+        using (var bo = device.Allocate((long)c1.Length * sizeof(float)))
+        {
+            kernel.Launch(bq, bk, bv, bo, firstChunk, firstChunk, nh, nkv, hd);
+            device.Download(bo, c1);
+        }
+        for (int i = 0; i < c1.Length; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(c1[i]) == BitConverter.SingleToInt32Bits(full[i]),
+                $"chunk 1 differs from single pass at element {i}: {c1[i]} vs {full[i]}");
+
+        // Chunk 2: the remaining rows against the whole KV, positionOffset = firstChunk. Q rows are offset in the Q buffer, so
+        // re-upload just that slice.
+        int rest = total - firstChunk;
+        float[] q2 = q.AsSpan(firstChunk * nh * hd).ToArray();
+        using var bq2 = device.Allocate((long)q2.Length * sizeof(float));
+        device.Upload(q2.AsSpan(), bq2);
+        float[] c2 = new float[rest * nh * hd];
+        using (var bo = device.Allocate((long)c2.Length * sizeof(float)))
+        {
+            kernel.Launch(bq2, bk, bv, bo, rest, total, nh, nkv, hd, positionOffset: firstChunk);
+            device.Download(bo, c2);
+        }
+        for (int i = 0; i < c2.Length; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(c2[i]) == BitConverter.SingleToInt32Bits(full[firstChunk * nh * hd + i]),
+                $"chunk 2 differs from single pass at element {i}: {c2[i]} vs {full[firstChunk * nh * hd + i]}");
+    }
+
+    /// <summary>
+    /// #685: the head_dim-256 hybrids have LARGE attention scores, and a plain f16 QK^T has an error proportional to |score|
+    /// (Tev1-4B NLL 2.27 -> 3.51 in situ). The hi/lo split must keep the error near f32 as the score scale grows: at amp 16 a
+    /// plain-f16 kernel is off by 4e-2 (measured), the split by 4e-4.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(1f)]
+    [InlineData(4f)]
+    [InlineData(16f)]
+    public void Hd256_LargeScores_StayNearF32(float amp)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(VulkanFlashAttentionCoopmatKernel.SupportsDevice(device), "no coopmat tile");
+        const int seqQ = 256, seqKv = 256, nh = 16, nkv = 4, hd = 256;
+        var rng = new Random(7);
+        float[] q = RandomFloats(rng, seqQ * nh * hd);
+        for (int i = 0; i < q.Length; i++) q[i] *= amp;
+        float[] k = RandomFloats(rng, seqKv * nkv * hd);
+        for (int i = 0; i < k.Length; i++) k[i] *= amp;
+        float[] v = RandomFloats(rng, seqKv * nkv * hd);
+        float[] exp = new float[q.Length];
+        ComputeExpected(q, k, v, exp, seqQ, seqKv, nh, nkv, hd, 0, 0, 0f, false, 0f, AttentionMaskMode.Causal, 0);
+        using var kernel = VulkanFlashAttentionCoopmatKernel.Create(device, spvDir);
+        using var bq = device.Allocate((long)q.Length * sizeof(float));
+        using var bk = device.Allocate((long)k.Length * sizeof(float));
+        using var bv = device.Allocate((long)v.Length * sizeof(float));
+        using var bo = device.Allocate((long)q.Length * sizeof(float));
+        device.Upload(q.AsSpan(), bq);
+        device.Upload(k.AsSpan(), bk);
+        device.Upload(v.AsSpan(), bv);
+        kernel.Launch(bq, bk, bv, bo, seqQ, seqKv, nh, nkv, hd);
+        float[] act = new float[q.Length];
+        device.Download(bo, act);
+        double maxAbs = 0;
+        for (int i = 0; i < act.Length; i++) maxAbs = Math.Max(maxAbs, Math.Abs(act[i] - exp[i]));
+        Assert.True(maxAbs < 2e-3, $"amp {amp}: max abs error {maxAbs} (plain-f16 QK^T gives ~4e-2 at amp 16)");
+    }
 
     private static void RunOne(int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset, int slidingWindow = 0, float softCap = 0.0f, bool useAlibi = false,
