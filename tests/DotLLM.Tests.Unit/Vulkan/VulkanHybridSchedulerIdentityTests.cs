@@ -206,7 +206,7 @@ public sealed class VulkanHybridSchedulerIdentityTests
             return sw.Elapsed.TotalMilliseconds / prompts.Length;
         }
 
-        async Task<double> Sched(int prefixEntries)
+        async Task<double> Sched(int prefixEntries, bool sequential = false)
         {
             using var svc = new ContinuousBatchSchedulerService(model, tokenizer, (cfg, size) => kvFactory(size),
                 options: new ContinuousBatchSchedulerOptions { RecurrentPrefixCacheEntries = prefixEntries }, registerTelemetryProviders: false);
@@ -216,8 +216,10 @@ public sealed class VulkanHybridSchedulerIdentityTests
             {
                 Task<InferenceResponse> One(string pr) => svc.EnqueueAsync(new InferenceRequest { TokenIds = tokenizer.Encode(pr), Options = opts });
                 foreach (var pr in prompts.Take(2)) await One(pr);   // warm + snapshot
+                await Task.WhenAll(prompts.Select(One));              // warm the slot pool to full concurrency
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                await Task.WhenAll(prompts.Select(One));
+                if (sequential) foreach (var pr in prompts) await One(pr);
+                else await Task.WhenAll(prompts.Select(One));
                 return sw.Elapsed.TotalMilliseconds / prompts.Length;
             }
             finally { cts.Cancel(); try { await loop; } catch (OperationCanceledException) { } }
@@ -249,7 +251,8 @@ public sealed class VulkanHybridSchedulerIdentityTests
             double a = Serial();
             double b = await Sched(0);
             double c = await Sched(4);
-            _out.WriteLine($"round {round}: ms/request serial+prefix={a:F1}  scheduler/no-restore={b:F1}  scheduler/restore={c:F1}");
+            double d = await Sched(4, sequential: true);
+            _out.WriteLine($"round {round}: ms/request serial+prefix={a:F1}  scheduler/no-restore={b:F1}  scheduler/restore={c:F1}  scheduler/restore/one-at-a-time={d:F1}");
         }
     }
 }

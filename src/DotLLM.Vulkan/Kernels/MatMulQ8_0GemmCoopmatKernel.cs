@@ -200,6 +200,7 @@ public sealed class MatMulQ8_0GemmCoopmatKernel : IDisposable
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
+    private CoopmatSplitK? _splitK;   // blocked 128x128 variant only
     private bool _disposed;
 
     private MatMulQ8_0GemmCoopmatKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
@@ -264,11 +265,19 @@ public sealed class MatMulQ8_0GemmCoopmatKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
-        return new MatMulQ8_0GemmCoopmatKernel(device, module, pipeline, pool, variant.TileM, variant.TileN);
+        var kernel = new MatMulQ8_0GemmCoopmatKernel(device, module, pipeline, pool, variant.TileM, variant.TileN);
+        if (variant.SpvFileName == Q8_0GemmCoopmatVariant.Blocked128x128x4.SpvFileName)
+            kernel._splitK = CoopmatSplitK.TryCreate(device, spvDir, "matmul_q8_0_gemm_coopmat_128x128x4_splitk.spv",
+                QuantFormat.Q8_0BlockBytes, QuantFormat.LegacyGroupSize);
+        return kernel;
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
-    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
+    internal void InvalidateDescriptorCache()
+    {
+        _descriptorCache.Reset();
+        _splitK?.InvalidateDescriptorCache();
+    }
 
     /// <summary>
     /// Dispatches the coopmat GEMM synchronously (wraps <see cref="Record"/>
@@ -318,6 +327,17 @@ public sealed class MatMulQ8_0GemmCoopmatKernel : IDisposable
         if (inputB.Size < bMin) throw new ArgumentException("Input buffer too small.", nameof(inputB));
         if (outputC.Size < cMin) throw new ArgumentException("Output buffer too small.", nameof(outputC));
 
+        // Underfilled grids (small m at small n) run split-K: see CoopmatSplitK.
+        if (_splitK is not null)
+        {
+            int splits = CoopmatSplitK.ChooseSplits(m, n, blocksPerRow);
+            if (splits > 1)
+            {
+                _splitK.Record(cmdBuf, weightsQ8, inputB, outputC, m, k, n, splits);
+                return;
+            }
+        }
+
         Span<nint> buffers = stackalloc nint[3] { weightsQ8.Handle, inputB.Handle, outputC.Handle };
         nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
 
@@ -351,6 +371,7 @@ public sealed class MatMulQ8_0GemmCoopmatKernel : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        _splitK?.Dispose();
 
         if (_descriptorPool != 0)
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);

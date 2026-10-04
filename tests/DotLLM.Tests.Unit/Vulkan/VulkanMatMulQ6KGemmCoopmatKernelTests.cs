@@ -33,6 +33,9 @@ public class VulkanMatMulQ6KGemmCoopmatKernelTests
     [InlineData(129, 129, 512)]     // one past a full blocked tile in both dims
     [InlineData(128, 128, 512)]     // exactly one blocked tile
     [InlineData(64, 300, 10240)]    // Nemotron-H ssm_out contraction width
+    [InlineData(128, 2560, 4608)]   // 20 tiles -> split-K x4 (Tev1 ffn-down shape class)
+    [InlineData(128, 4096, 2560)]   // 32 tiles -> split-K x2
+    [InlineData(100, 1000, 2560)]   // 8 tiles, ragged n and m, k=80 chunks -> split-K x4
     public void Launch_MatchesCpuReference(int n, int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

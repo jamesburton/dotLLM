@@ -133,6 +133,8 @@ public class VulkanMatMulQ8_0GemmCoopmatKernelTests
     /// <param name="k">Contraction dim; must be a multiple of 32.</param>
     [SkippableTheory]
     [InlineData(128, 128, 256)]      // exactly one blocked tile in both dims
+    [InlineData(128, 2560, 4096)]    // 20 tiles -> split-K x4 on the blocked variant
+    [InlineData(100, 1000, 2560)]    // 8 tiles ragged -> split-K
     [InlineData(256, 256, 512)]      // 2x2 blocked tiles
     [InlineData(1, 1, 32)]           // single-cell output
     [InlineData(17, 33, 64)]         // ragged in both dims
