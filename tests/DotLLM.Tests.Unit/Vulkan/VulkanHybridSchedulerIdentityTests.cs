@@ -257,6 +257,80 @@ public sealed class VulkanHybridSchedulerIdentityTests
     }
 
     /// <summary>
+    /// Opt-in (DOTLLM_TEV1_LATENCY_PROBE=1): aggregate DECODE throughput with 8 requests in flight (64 greedy tokens each, short
+    /// distinct prompts). Arms: serial TextGenerator one request at a time (MTP off / on), and the scheduler with all 8 concurrent.
+    /// Run it under different DOTLLM_VK_BATCH_FUSE* settings to see whether a decode-sized stacked batch pays.
+    /// </summary>
+    [SkippableFact]
+    public async Task Probe_DecodeThroughput_SchedulerVsSerial()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_TEV1_LATENCY_PROBE") == "1", "opt-in probe");
+        string? path = FindGguf();
+        Skip.If(path is null, "Tev1-4B GGUF not found.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        var (model, kvFactory) = VulkanModelLoader.CreateFromGguf(device, gguf, config, spvDir);
+        using var _ = model as IDisposable;
+
+        string[] prompts = Enumerable.Range(0, int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_PROBE_CONC"), out int pc) && pc > 0 ? pc : 8).Select(i =>
+            "<|im_start|>user" + (char)10 + $"Write a short story about the number {i + 3} and a lighthouse." + "<|im_end|>" + (char)10 +
+            "<|im_start|>assistant" + (char)10 + "<think>" + (char)10 + (char)10 + "</think>" + (char)10 + (char)10).ToArray();
+        var opts = new InferenceOptions { Temperature = 0, MaxTokens = 64 };
+
+        double Serial(bool mtp)
+        {
+            var gen = new TextGenerator(model, tokenizer, (cfg, size) => kvFactory(size), mtpEnabled: mtp);
+            gen.Generate(prompts[0], opts); // warm
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            int toks = 0;
+            foreach (var pr in prompts) toks += gen.Generate(pr, opts).GeneratedTokenIds.Length;
+            return toks / sw.Elapsed.TotalSeconds;
+        }
+
+        async Task<double> Sched()
+        {
+            using var svc = new ContinuousBatchSchedulerService(model, tokenizer, (cfg, size) => kvFactory(size),
+                options: new ContinuousBatchSchedulerOptions { RecurrentPrefixCacheEntries = 0 }, registerTelemetryProviders: false);
+            using var cts = new CancellationTokenSource();
+            Task loop = svc.RunLoopAsync(cts.Token);
+            try
+            {
+                Task<InferenceResponse> One(string pr) => svc.EnqueueAsync(new InferenceRequest { TokenIds = tokenizer.Encode(pr), Options = opts });
+                await Task.WhenAll(prompts.Select(One));   // warm the slot pool to full concurrency
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var rs = await Task.WhenAll(prompts.Select(One));
+                return rs.Sum(r => r.GeneratedTokenIds.Length) / sw.Elapsed.TotalSeconds;
+            }
+            finally { cts.Cancel(); try { await loop; } catch (OperationCanceledException) { } }
+        }
+
+        async Task<double> SchedWith(string? fuse, string? minRows)
+        {
+            string? sf = Environment.GetEnvironmentVariable("DOTLLM_VK_BATCH_FUSE"), sm = Environment.GetEnvironmentVariable("DOTLLM_VK_BATCH_FUSE_MIN_ROWS");
+            Environment.SetEnvironmentVariable("DOTLLM_VK_BATCH_FUSE", fuse);
+            Environment.SetEnvironmentVariable("DOTLLM_VK_BATCH_FUSE_MIN_ROWS", minRows);
+            try { return await Sched(); }
+            finally
+            {
+                Environment.SetEnvironmentVariable("DOTLLM_VK_BATCH_FUSE", sf);
+                Environment.SetEnvironmentVariable("DOTLLM_VK_BATCH_FUSE_MIN_ROWS", sm);
+            }
+        }
+
+        for (int round = 0; round < 4; round++)
+        {
+            double a = Serial(false);
+            double c0 = await SchedWith("0", null);       // serial ForwardBatch loop
+            double c32 = await SchedWith(null, null);      // shipped: stack only >= 32 rows
+            double c1 = await SchedWith(null, "1");        // stack every batch of >= 2 sequences
+            _out.WriteLine($"conc={prompts.Length} round {round}: tok/s serial-1-at-a-time={a:F1}  sched/loop={c0:F1}  sched/min32={c32:F1}  sched/min1={c1:F1}");
+        }
+    }
+
+    /// <summary>
     /// Opt-in (DOTLLM_MOE35B_STREAM_PROBE=1): prints a long-context greedy token stream for Qwen3.6-35B-A3B on Vulkan. Run it twice
     /// (default vs DOTLLM_VK_FUSE_FORWARD=0) and diff the printed ids: the CPU oracle is infeasible at 35B, so the legacy
     /// per-layer path is the reference for the fused single-command-buffer MoE decode.
