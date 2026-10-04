@@ -503,6 +503,12 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         _moeStageLast = System.Diagnostics.Stopwatch.GetTimestamp();
     }
 
+    /// <summary>Token-mixing stage marker: only meaningful on the per-layer-submit prefill path (never inside the fused decode buffer).</summary>
+    private void TmStage(string name, int seqLen)
+    {
+        if (MoeStageProfileEnabled && seqLen > 1) MoeStage(name);
+    }
+
     private void MoeStage(string name)
     {
         if (!MoeStageProfileEnabled) return;
@@ -633,6 +639,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             // ── 2a. Token-mixing submission ─────────────────────────────────
             _submit.Begin();
             cmdBuf = _submit.CommandBuffer;
+            MoeStageBegin();
             KernelSupport.HostToComputeBarrier(cmdBuf);
             RecordMoeHybridTokenMixing(cmdBuf, layer, layerBuf, kinds, seqLen, hiddenSize, eps, positions, gdnCache, kvCache, numHeads, numKvHeads, headDim);
             KernelSupport.ComputeToHostBarrier(cmdBuf);
@@ -844,6 +851,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             _state.NormOutput, _state.GdnBetaBuf,
             outputDim: gdnW.BetaOutputDim, inputDim: gdnW.BetaInputDim, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        TmStage("gdn_proj", seqLen);
 
         // ── 2. Fused on-device decay g and sigmoid(β) ─────────────────────────
         // gdn_decay_f32 fuses (alpha + dt_bias) → softplus → * A → exp into one
@@ -856,6 +864,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             seqLen: seqLen, nVHead: nVHead);
         _kernels.SigmoidInplace.Record(cmdBuf, _state.GdnBetaBuf, n: seqLen * nVHead);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        TmStage("gdn_decay", seqLen);
 
         // ── 3. Build conv input + Conv1d + SiLU ───────────────────────────────
         // ConvInput = [convState (DConv-1 rows) | qkvBuf (seqLen rows)]
@@ -875,9 +884,11 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         _kernels.Conv1dCausal.Record(cmdBuf, _state.GdnConvInput, gdnW.Conv1dWeight, gdnW.Conv1dBias,
             _state.GdnQkvBuf, dConv: dConv, channels: convDim, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        TmStage("gdn_conv", seqLen);
 
         _kernels.SiluInplace.Record(cmdBuf, _state.GdnQkvBuf, n: seqLen * convDim);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        TmStage("gdn_silu", seqLen);
 
         // Save the trailing (dConv-1) rows of ConvInput back to convState.
         // The CPU reference reads from rows seqLen..(seqLen+dConv-2) of the
@@ -920,6 +931,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         _kernels.GdnL2Normalize.Record(cmdBuf, _state.GdnQBuf, totalHeads: seqLen * nKHead, dState: dState, eps: 1e-6f);
         _kernels.GdnL2Normalize.Record(cmdBuf, _state.GdnKBuf, totalHeads: seqLen * nKHead, dState: dState, eps: 1e-6f);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        TmStage("gdn_split_l2", seqLen);
 
         // ── 5. GDN scan — single multi-token dispatch ────────────────────────
         // GdnScanMultiToken walks the seqLen loop INSIDE the shader, mutating
@@ -933,17 +945,20 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             output: _state.GdnOut,
             seqLen: seqLen, nVHead: nVHead, nKHead: nKHead, dState: dState);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        TmStage("gdn_scan", seqLen);
 
         // ── 6. Per-head RMSNorm × silu(z) gate (fused) ───────────────────────
         _kernels.GdnPostScanGate.Record(cmdBuf,
             gdnOut: _state.GdnOut, z: _state.GdnZBuf, ssmNormWeight: gdnW.SsmNormWeight,
             seqLen: seqLen, nVHead: nVHead, dState: dState, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        TmStage("gdn_postgate", seqLen);
 
         // ── 7. ssm_out projection back into NormOutput ───────────────────────
         RecordMatmul(cmdBuf, gdnW.OutWeight, gdnW.OutDeviceQuantType,
             _state.GdnOut, _state.NormOutput,
             outputDim: gdnW.OutOutputDim, inputDim: gdnW.OutInputDim, seqLen: seqLen);
+        TmStage("gdn_outproj", seqLen);
     }
 
     // ── Token-mixing path: full GQA attention ────────────────────────────────
@@ -971,6 +986,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             _state.NormOutput, _state.QGateScratch,
             outputDim: attnW.QOutputDim, inputDim: attnW.QInputDim, seqLen: seqLen, xqReady: attnXq);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        TmStage("attn_qproj", seqLen);
 
         // 2. De-interleave per head into Q and Gate scratch buffers.
         //    Per token row: [Q_h0, Gate_h0, Q_h1, Gate_h1, ...] each headDim wide.
@@ -1010,6 +1026,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             _state.NormOutput, _state.V,
             outputDim: attnW.VOutputDim, inputDim: attnW.VInputDim, seqLen: seqLen, xqReady: attnXq);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        TmStage("attn_kvproj_deint", seqLen);
 
         // 4. QK-norm — per-head RMSNorm with attn_q_norm / attn_k_norm weights.
         //    Reshape as [seqLen * numHeads, headDim] rows for the RMSNorm kernel.
@@ -1018,6 +1035,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         _kernels.RmsNorm.Record(cmdBuf, _state.K, attnW.KNormWeight, _state.K,
             rowCount: seqLen * numKvHeads, n: headDim, eps: Config.NormEpsilon);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        TmStage("attn_qknorm", seqLen);
 
         // 5. RoPE — NeoX pair pattern over the first ropeDim of each head.
         //    NOTE: the CPU reference flags this as UNVERIFIED for qwen35moe;
@@ -1082,11 +1100,13 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 positionOffset: positionOffset, slidingWindow: 0);
         }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        TmStage("attn_rope_core", seqLen);
 
         // 7. Apply sigmoid(gate) element-wise to attention output.
         _kernels.SigmoidGateMul.Record(cmdBuf, _state.AttnOutput, _state.GateScratch,
             nTotal: seqLen * qElems);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        TmStage("attn_sigmul", seqLen);
 
         // 8. Output projection.
         RecordMatmul(cmdBuf, attnW.OWeight, attnW.ODeviceQuantType,
@@ -1180,6 +1200,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         _kernels.RmsNorm.Record(cmdBuf, _state.HiddenState, layerBuf.AttnNormWeight, _state.NormOutput,
             rowCount: seqLen, n: hiddenSize, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        TmStage("tm_copy_norm", seqLen);
 
         if (kinds[layer] == HybridLayerKind.GatedDeltaNet)
         {
@@ -1191,6 +1212,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 numHeads, numKvHeads, headDim, kvCache);
         }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        TmStage(kinds[layer] == HybridLayerKind.GatedDeltaNet ? "tm_gdn_total" : "tm_attn_total", seqLen);
 
         // First residual add: HiddenState = Residual + NormOutput (token-mixing output).
         //   AddScratch is reused later as MoE intermediates; here it just receives the sum
