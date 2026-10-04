@@ -294,6 +294,16 @@ internal static partial class VulkanApi
         vkCmdDispatchNative(commandBuffer, groupCountX, groupCountY, groupCountZ);
     }
 
+    [LibraryImport(LibName, EntryPoint = "vkCmdDispatchIndirect")]
+    private static partial void vkCmdDispatchIndirectNative(nint commandBuffer, nint buffer, ulong offset);
+
+    /// <summary>Counted wrapper over <c>vkCmdDispatchIndirect</c>: the group counts are read from <paramref name="buffer"/> at <paramref name="offset"/> (3 x uint).</summary>
+    internal static void vkCmdDispatchIndirect(nint commandBuffer, nint buffer, ulong offset)
+    {
+        ProfileCounters.Dispatches++;
+        vkCmdDispatchIndirectNative(commandBuffer, buffer, offset);
+    }
+
     [LibraryImport(LibName, EntryPoint = "vkCmdCopyBuffer")]
     private static partial void vkCmdCopyBufferNative(
         nint commandBuffer, nint srcBuffer, nint dstBuffer,

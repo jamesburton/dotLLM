@@ -30,6 +30,7 @@ layout(push_constant) uniform PushConstants {
     uint numExperts;
     uint blocksPerRow;  // K / 256
     uint rowUints;      // per-row uint stride
+    uint tileList;      // 0 = legacy 3-D grid (y = row tile, z = expert); else index in `offsets` of the tile work list (indirect mode)
 } pc;
 
 const uint TM = 16u;
@@ -62,9 +63,19 @@ void scaleMin(uint s0, uint s1, uint s2, uint subIdx, out float sc, out float mn
 
 void main() {
     uint mBase = gl_WorkGroupID.x * TM;
-    uint localRowBase = gl_WorkGroupID.y * TN;
-    uint expert = gl_WorkGroupID.z;
-    if (expert >= pc.numExperts) return;
+    uint localRowBase;
+    uint expert;
+    if (pc.tileList != 0u) {
+        // Indirect mode (moe_build_tile_list.comp): workgroup y is a tile index into the work list stored in `offsets` from
+        // pc.tileList on; only real (expert, row tile) pairs are launched.
+        uint listIdx = pc.tileList + 2u * gl_WorkGroupID.y;
+        expert = offsets[listIdx];
+        localRowBase = offsets[listIdx + 1u];
+    } else {
+        localRowBase = gl_WorkGroupID.y * TN;
+        expert = gl_WorkGroupID.z;
+        if (expert >= pc.numExperts) return;
+    }
 
     uint expertStart = offsets[expert];
     uint expertRows = offsets[expert + 1u] - expertStart;

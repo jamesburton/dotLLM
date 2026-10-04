@@ -1890,7 +1890,8 @@ public sealed class VulkanDevice : IDisposable
             size = (ulong)bytes,
             usage = VkBufferUsageFlags.StorageBuffer
                   | VkBufferUsageFlags.TransferSrc
-                  | VkBufferUsageFlags.TransferDst,
+                  | VkBufferUsageFlags.TransferDst
+                  | VkBufferUsageFlags.IndirectBuffer,   // GPU-written dispatch arguments (grouped-MoE tile lists)
             sharingMode = VkSharingMode.Exclusive,
         };
         VulkanApi.vkCreateBuffer(_device, bci, 0, out nint buffer)

@@ -26,7 +26,7 @@ public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
     // Output rows per workgroup: 16 for the one-subgroup shader; 64 for the _m64 shaders (4 wave64 subgroups, each one
     // 16-row M tile, sharing one staged B tile).
     private readonly int _tileM;
-    private const int PushConstantBytes = 6 * sizeof(uint);
+    private const int PushConstantBytes = 7 * sizeof(uint);   // + tileList
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
@@ -136,7 +136,7 @@ public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout, 0, 1, descriptorSet, 0, 0);
 
-        Span<uint> pc = stackalloc uint[6] { (uint)m, (uint)k, (uint)rows, (uint)numExperts, (uint)blocksPerRow, (uint)(rowBytes / 4) };
+        Span<uint> pc = stackalloc uint[7] { (uint)m, (uint)k, (uint)rows, (uint)numExperts, (uint)blocksPerRow, (uint)(rowBytes / 4), 0u };
         fixed (uint* pcPtr = pc)
             VulkanApi.vkCmdPushConstants(cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)pcPtr);
 
@@ -144,6 +144,44 @@ public sealed class MoeGroupedMatmulKQuantCoopmatKernel : IDisposable
         // Row tiles are pessimistic (all rows could land on one expert); tiles past an expert's count early-out.
         VulkanApi.vkCmdDispatch(cmdBuf, (uint)((m + _tileM - 1) / _tileM), (uint)((rowTiles + TileN - 1) / TileN), (uint)numExperts);
     }
+
+    /// <summary>
+    /// Indirect variant: launches ONLY the real (expert, 16-row tile) pairs. <paramref name="offsetsAndTiles"/> carries the group offsets
+    /// in <c>[0, numExperts]</c> and the work list written by <see cref="MoeBuildTileListKernel"/> from <c>numExperts + 1</c> on;
+    /// <paramref name="dispatchArgs"/> holds its <c>(mTiles, tileCount, 1)</c> at <paramref name="dispatchArgsOffset"/> (0 or <see cref="MoeBuildTileListKernel.ArgsStrideBytes"/>). A
+    /// <see cref="KernelSupport.ComputeToIndirectAndComputeBarrier"/> must separate the build from this call. The legacy
+    /// <see cref="Record"/> grid launches every expert x every possible row tile (~30x the work at serving prompt sizes).
+    /// </summary>
+    public unsafe void RecordIndirect(nint cmdBuf, VulkanDevice.Buffer bank, VulkanDevice.Buffer packedInput, VulkanDevice.Buffer offsetsAndTiles,
+        VulkanDevice.Buffer output, VulkanDevice.Buffer dispatchArgs, int dispatchArgsOffset, int m, int k, int rows, int numExperts)
+    {
+        if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
+        if (rows <= 0) throw new ArgumentOutOfRangeException(nameof(rows));
+        if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
+        if (k <= 0 || (k % KGroup) != 0) throw new ArgumentException($"k must be a positive multiple of {KGroup}, got {k}", nameof(k));
+        if (dispatchArgs.Size < dispatchArgsOffset + 3 * sizeof(uint)) throw new ArgumentException("dispatchArgs buffer too small.", nameof(dispatchArgs));
+
+        int blocksPerRow = k / KGroup;
+        long rowBytes = (long)blocksPerRow * _blockBytes;
+        if (bank.Size < (long)numExperts * m * rowBytes) throw new ArgumentException("bank buffer too small.", nameof(bank));
+        if (packedInput.Size < (long)rows * k * sizeof(float)) throw new ArgumentException("packedInput buffer too small.", nameof(packedInput));
+        if (offsetsAndTiles.Size < MoeBuildTileListKernel.OffsetsBufferUints(numExperts, rows) * sizeof(uint))
+            throw new ArgumentException("offsets/tile-list buffer too small.", nameof(offsetsAndTiles));
+        if (output.Size < (long)rows * m * sizeof(float)) throw new ArgumentException("output buffer too small.", nameof(output));
+
+        Span<nint> buffers = stackalloc nint[4] { bank.Handle, packedInput.Handle, offsetsAndTiles.Handle, output.Handle };
+        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
+        VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout, 0, 1, descriptorSet, 0, 0);
+
+        Span<uint> pc = stackalloc uint[7] { (uint)m, (uint)k, (uint)rows, (uint)numExperts, (uint)blocksPerRow, (uint)(rowBytes / 4), (uint)(numExperts + 1) };
+        fixed (uint* pcPtr = pc)
+            VulkanApi.vkCmdPushConstants(cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)pcPtr);
+        VulkanApi.vkCmdDispatchIndirect(cmdBuf, dispatchArgs.Handle, (ulong)dispatchArgsOffset);
+    }
+
+    /// <summary>Weight-row tiles per workgroup column (the x extent of the grid): <c>ceil(m / tileM)</c>.</summary>
+    public int MTiles(int m) => (m + _tileM - 1) / _tileM;
 
     /// <inheritdoc/>
     public void Dispose()

@@ -489,6 +489,33 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     // SubmitAndWait per phase per layer -- no extra mid-command-buffer splits needed.
     private static readonly bool MoePrefillProfileEnabled =
         Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MOE_PREFILL_PROFILE") == "1";
+    // Per-STAGE split-submit timing inside the routed-MoE prefill layer (DOTLLM_VULKAN_MOE_STAGE_PROFILE=1): after each stage the
+    // command buffer is submitted and waited, so the stage's wall time is attributed to it (sync cost ~50 us per stage is included).
+    // Diagnostic only; the totals are printed next to the coarse profile.
+    private static readonly bool MoeStageProfileEnabled =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MOE_STAGE_PROFILE") == "1";
+    private readonly Dictionary<string, double> _moeStageMs = new();
+    private long _moeStageLast;
+
+    private void MoeStageBegin()
+    {
+        if (!MoeStageProfileEnabled) return;
+        _moeStageLast = System.Diagnostics.Stopwatch.GetTimestamp();
+    }
+
+    private void MoeStage(string name)
+    {
+        if (!MoeStageProfileEnabled) return;
+        KernelSupport.ComputeToHostBarrier(_submit.CommandBuffer);
+        _submit.SubmitAndWait();
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        double ms = (now - _moeStageLast) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        _moeStageMs[name] = _moeStageMs.GetValueOrDefault(name) + ms;
+        _submit.Begin();
+        KernelSupport.HostToComputeBarrier(_submit.CommandBuffer);
+        _moeStageLast = System.Diagnostics.Stopwatch.GetTimestamp();
+    }
+
     private double _profAttnMs;
     private double _profMoeMs;
     private double _profEmbedMs;
@@ -659,6 +686,12 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 $"attn(2a)={_profAttnMs:F1}ms({_profAttnMs / total * 100:F1}%)  " +
                 $"moe(2b)={_profMoeMs:F1}ms({_profMoeMs / total * 100:F1}%)  " +
                 $"head={_profHeadMs:F1}ms({_profHeadMs / total * 100:F1}%)");
+            if (MoeStageProfileEnabled && _moeStageMs.Count > 0)
+            {
+                Console.Error.WriteLine("[moe-stage-profile] " + string.Join("  ",
+                    _moeStageMs.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key}={kv.Value:F1}ms")));
+                _moeStageMs.Clear();
+            }
         }
 
         // ── 4. Download logits ─────────────────────────────────────────────────
@@ -1531,25 +1564,61 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         _kernels.MoeExpertOffsets!.Record(cmdBuf, _state.MoeTopkIndices, _state.MoeGroupCounts, _state.MoeGroupOffsets, _state.MoeGroupCounters,
             rows: expandedRows, numExperts: numE);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("expert_offsets");
         _kernels.MoeExpandGroupByExpert!.Record(cmdBuf, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeGroupOffsets,
             _state.MoeGroupCounters, _state.MoeDownRows, _state.MoeGroupPerm, rows: expandedRows, hidden: hidden, numExperts: numE);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("expand_group");
 
-        // A token routes to an expert at most once, so no expert owns more than seqLen rows.
-        _kernels.MoeGroupedQ4K!.Record(cmdBuf, moeW.W1Bank, _state.MoeDownRows, _state.MoeGroupOffsets, _state.MoeGateInter,
-            m: interm, k: hidden, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
-        _kernels.MoeGroupedQ4K!.Record(cmdBuf, moeW.W3Bank, _state.MoeDownRows, _state.MoeGroupOffsets, _state.MoeUpInter,
-            m: interm, k: hidden, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+        // Launch only the (expert, 16-row tile) pairs that exist. The legacy grid (every expert x every possible row tile; a token routes
+        // to an expert at most once, so no expert owns more than seqLen rows) launched ~30x more workgroups than there was work and the
+        // early-out workgroups alone cost ~100 ms of a 512-token prefill. DOTLLM_VK_MOE_INDIRECT_TILES=0 restores it.
+        var gateUpKernel = _kernels.MoeGroupedQ4K!;
+        var downKernel = GroupedDownKernel(moeW.W2QuantType)!;
+        var tileBuild = _kernels.MoeBuildTileList;
+        if (tileBuild is not null)
+        {
+            tileBuild.Record(cmdBuf, _state.MoeGroupOffsets, _state.MoeGroupDispatchArgs, numE,
+                gateUpKernel.MTiles(interm), downKernel.MTiles(hidden));
+            KernelSupport.ComputeToIndirectAndComputeBarrier(cmdBuf);
+            if (MoeStageProfileEnabled)
+            {
+                MoeStage("tile_list_build");
+                Span<float> raw = stackalloc float[6];
+                _device.Download(_state.MoeGroupDispatchArgs, raw);   // uint triples reinterpreted as float bits
+                _moeStageMs["tiles(count,not ms)"] = _moeStageMs.GetValueOrDefault("tiles(count,not ms)") + BitConverter.SingleToUInt32Bits(raw[1]);
+                _moeStageLast = System.Diagnostics.Stopwatch.GetTimestamp();
+            }
+            gateUpKernel.RecordIndirect(cmdBuf, moeW.W1Bank, _state.MoeDownRows, _state.MoeGroupOffsets, _state.MoeGateInter,
+                _state.MoeGroupDispatchArgs, 0, m: interm, k: hidden, rows: expandedRows, numExperts: numE);
+            gateUpKernel.RecordIndirect(cmdBuf, moeW.W3Bank, _state.MoeDownRows, _state.MoeGroupOffsets, _state.MoeUpInter,
+                _state.MoeGroupDispatchArgs, 0, m: interm, k: hidden, rows: expandedRows, numExperts: numE);
+        }
+        else
+        {
+            gateUpKernel.Record(cmdBuf, moeW.W1Bank, _state.MoeDownRows, _state.MoeGroupOffsets, _state.MoeGateInter,
+                m: interm, k: hidden, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+            gateUpKernel.Record(cmdBuf, moeW.W3Bank, _state.MoeDownRows, _state.MoeGroupOffsets, _state.MoeUpInter,
+                m: interm, k: hidden, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+        }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("grouped_gate_up");
 
         _kernels.SwiGlu.Record(cmdBuf, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter, n: expandedRows * interm);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("swiglu");
 
-        GroupedDownKernel(moeW.W2QuantType)!.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInter, _state.MoeGroupOffsets, _state.MoeExpandedInput,
-            m: hidden, k: interm, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
+        if (tileBuild is not null)
+            downKernel.RecordIndirect(cmdBuf, moeW.W2Bank, _state.MoeSiluInter, _state.MoeGroupOffsets, _state.MoeExpandedInput,
+                _state.MoeGroupDispatchArgs, MoeBuildTileListKernel.ArgsStrideBytes, m: hidden, k: interm, rows: expandedRows, numExperts: numE);
+        else
+            downKernel.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInter, _state.MoeGroupOffsets, _state.MoeExpandedInput,
+                m: hidden, k: interm, rows: expandedRows, numExperts: numE, maxRowsPerExpert: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("grouped_down");
         _kernels.MoeUngroupScatter!.Record(cmdBuf, _state.MoeExpandedInput, _state.MoeGroupPerm, _state.MoeDownRows, rows: expandedRows, hidden: hidden);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("ungroup");
     }
 
     /// <summary>
@@ -1567,24 +1636,28 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         int numE = moeW.NumExperts;
         int topK = moeW.NumExpertsPerTok;
         int expandedRows = seqLen * topK;
+        MoeStageBegin();
 
         // 1. Router gate logits.
         RecordMatmul(cmdBuf, moeW.Gate, QuantizationType.F32,
             _state.NormOutput, _state.MoeRouterLogits,
             outputDim: numE, inputDim: hidden, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("router");
 
         // 2. Top-k softmax.
         _kernels.MoeTopkSoftmax.Record(cmdBuf,
             _state.MoeRouterLogits, _state.MoeTopkIndices, _state.MoeTopkWeights,
             seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("topk");
 
         // 3. Broadcast NormOutput[seqLen, hidden] → MoeExpandedInput[seqLen*topK, hidden].
         _kernels.MoeBroadcast.Record(cmdBuf,
             _state.NormOutput, _state.MoeExpandedInput,
             seqLen: seqLen, topK: topK, hidden: hidden);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("broadcast");
 
         // Issue #637: prefill batches group the routed rows by expert and run each expert's weights through a coopmat GEMM once per
         // 16-row tile (the indexed kernels below re-read an expert's weights for every routed row). Resident Q4_K gate/up + Q5_K/Q6_K down only (UD-Q4_K_M mixes both down types).
@@ -1719,11 +1792,13 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             _state.MoeDownRows, _state.MoeTopkWeights, _state.NormOutput,
             seqLen: seqLen, topK: topK, hiddenSize: hidden);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("weighted_scatter");
 
         // 8. Shared-expert branch (Qwen1.5-MoE sigmoid-gated convention).
         if (moeW.HasSharedExpert)
         {
             RecordSharedExpert(cmdBuf, moeW, postAttnNormWeight, seqLen, hidden, eps);
+            MoeStage("shared_expert");
         }
     }
 

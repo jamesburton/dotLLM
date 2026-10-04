@@ -1,0 +1,76 @@
+#version 450
+// Builds the work list of the grouped-by-expert MoE GEMMs from the group offsets, and the matching indirect dispatch arguments.
+//
+// An expert owning c routed rows needs ceil(c / 16) row tiles; with ~16 rows per expert at serving prompt sizes almost every
+// expert needs exactly one. A launch grid of (mTiles, maxRowsPerExpert/16, numExperts) is therefore ~30x larger than the work (a
+// 512-token prefill launched 65 536 workgroups for ~2 000 tiles) and the early-out workgroups alone cost ~100 ms per prefill on
+// gfx1151. This kernel enumerates only the real tiles:
+//
+//   data[0 .. numExperts]                         group offsets (read; written by moe_expert_offsets)
+//   data[numExperts + 1 + 2t], [... + 2t + 1]     tile t = (expert, first local row of the tile)   (written here)
+//   args[0..2], args[3..5]                        (mTiles, tileCount, 1) for vkCmdDispatchIndirect, once per weight-row extent   (written here):
+//                                                 set 0 for gate/up (m = intermediate), set 1 for down (m = hidden)
+//
+// One workgroup. Experts are split into 256 contiguous chunks (one per thread), a shared-memory scan turns per-chunk tile counts
+// into chunk base indices, and each thread then emits its chunk's tiles in expert order.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) coherent buffer BufData { uint data[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer BufArgs { uint args[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint numExperts;
+    uint mTiles0;    // weight-row tiles of the first grouped dispatch kind (x dimension of its grid)
+    uint mTiles1;    // ... and of the second
+} pc;
+
+const uint TILE_ROWS = 16u;
+
+shared uint partial[256];
+
+uint tilesOf(uint e) {
+    uint cnt = data[e + 1u] - data[e];
+    return (cnt + TILE_ROWS - 1u) / TILE_ROWS;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint E = pc.numExperts;
+    uint chunk = (E + 255u) / 256u;
+    uint e0 = min(tid * chunk, E);
+    uint e1 = min(e0 + chunk, E);
+
+    uint local = 0u;
+    for (uint e = e0; e < e1; e++) local += tilesOf(e);
+
+    partial[tid] = local;
+    barrier();
+    for (uint off = 1u; off < 256u; off <<= 1u) {
+        uint v = tid >= off ? partial[tid - off] : 0u;
+        barrier();
+        partial[tid] += v;
+        barrier();
+    }
+
+    uint total = partial[255];
+    uint t = partial[tid] - local;      // exclusive prefix: first tile index of this chunk
+    uint listBase = E + 1u;
+    for (uint e = e0; e < e1; e++) {
+        uint cnt = data[e + 1u] - data[e];
+        for (uint r = 0u; r < cnt; r += TILE_ROWS) {
+            data[listBase + 2u * t] = e;
+            data[listBase + 2u * t + 1u] = r;
+            t++;
+        }
+    }
+
+    if (tid == 0u) {
+        args[0] = pc.mTiles0;
+        args[1] = total;
+        args[2] = 1u;
+        args[3] = pc.mTiles1;
+        args[4] = total;
+        args[5] = 1u;
+    }
+}
