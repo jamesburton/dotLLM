@@ -1914,6 +1914,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         _kernels.RmsNorm.Record(cmdBuf, _state.HiddenState, postAttnNormWeight, _state.MoeSharedInput,
             rowCount: seqLen, n: hidden, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("shx_norm");
 
         // Shared expert gate/up matmuls share the input.
         RecordMatmul(cmdBuf, moeW.SharedGate!, moeW.SharedQuantType,
@@ -1923,23 +1924,37 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             _state.MoeSharedInput, _state.MoeSharedUp,
             outputDim: sharedI, inputDim: hidden, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("shx_gateup");
 
         _kernels.SwiGlu.Record(cmdBuf, _state.MoeSharedGate, _state.MoeSharedUp, _state.MoeSharedSilu,
             n: sharedInterElems);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("shx_swiglu");
 
         RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType,
             _state.MoeSharedSilu, _state.MoeSharedSumA,
             outputDim: hidden, inputDim: sharedI, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("shx_down");
 
         if (moeW.SharedExpertGate is not null)
         {
+            if (seqLen > 1 && (hidden & 3) == 0 && _kernels.MoeSharedGateAdd is { } fusedGate)
+            {
+                // Issue #693: gate logit (a 1 x hidden dot per token) + sigmoid + gated add in ONE pass. The M = 1 F32 GEMM below launched a
+                // 64-workgroup grid (~0.5 ms/layer at 2048 tokens) and the scalar gated add another ~1 ms/layer.
+                fusedGate.Record(cmdBuf, output: _state.NormOutput, b: _state.MoeSharedSumA, x: _state.MoeSharedInput,
+                    gateWeight: moeW.SharedExpertGate, seqLen: seqLen, hiddenSize: hidden);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                return;
+            }
+
             // gateLogits[t] = SharedExpertGate[1, hidden] @ MoeSharedInput[t, :].
             RecordMatmul(cmdBuf, moeW.SharedExpertGate, QuantizationType.F32,
                 _state.MoeSharedInput, _state.MoeSharedGateLogits,
                 outputDim: 1, inputDim: hidden, seqLen: seqLen);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("shx_gatelogit");
 
             _kernels.MoeSigmoidGatedAdd.Record(cmdBuf,
                 output: _state.NormOutput, b: _state.MoeSharedSumA, gateLogits: _state.MoeSharedGateLogits,

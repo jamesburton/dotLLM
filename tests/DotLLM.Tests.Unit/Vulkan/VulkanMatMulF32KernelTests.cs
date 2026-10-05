@@ -37,6 +37,9 @@ public class VulkanMatMulF32KernelTests
     [InlineData(37, 45, 33)]             // tiled: tails in M, N and K (K % 16 != 0)
     [InlineData(32, 16, 32)]             // tiled: exactly one tile
     [InlineData(65, 17, 2)]              // tiled: N = 2 (second tile row mostly empty)
+    [InlineData(256, 2048, 2048)]        // MoE router at 2048 tokens: 256 groups -> the plain (non-pipelined) 64x32 shader
+    [InlineData(301, 77, 1030)]          // plain 64x32 shader, ragged M / N / K
+    [InlineData(70, 50, 60)]             // 64x32 tails: M = 70 (second M tile 6 wide), N = 60
     public void Launch_MatchesCpuReference(int m, int k, int n)
     {
         SkipIfUnavailable(out string spvDir);
