@@ -1,0 +1,140 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+// Chunked Gated-DeltaNet scan, stage 2 of 2 (issue #703): the sequential pass over 64-token chunks. See gdn_chunk_prep_f32.comp for the math.
+//
+// One workgroup per (v-head, 16-column slice of the state); the slice S[128 k-rows, 16 v-cols] lives in LDS. Per chunk:
+//   X = W S_0, QS = Q S_0                 (64 x 16 each; 128-deep dots)
+//   D = U - X                             (the chunk's corrected delta values)
+//   out_i = (gamma_i QS_i + sum_{j<=i} P_ij D_j) / sqrt(d_state)
+//   S_0 <- gamma_C S_0 + sum_j (gamma_C/gamma_j) k_j D_j^T
+// 3 barriers per CHUNK (64 tokens) instead of 3 per token. d_state must be 128. Not bit-exact vs the sequential scan (different summation
+// order and a WY-form solve): relative drift is F32-rounding level.
+//
+// Dispatch: groupCount = (n_v_head, 8, 1), local_size_x = 256.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)           buffer BufState { float st[];    };
+layout(set = 0, binding = 1, std430) readonly  buffer BufQ     { float q_buf[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufK     { float k_buf[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer BufU     { float u_buf[]; };
+layout(set = 0, binding = 4, std430) readonly  buffer BufW     { float w_buf[]; };
+layout(set = 0, binding = 5, std430) readonly  buffer BufP     { float p_buf[]; };
+layout(set = 0, binding = 6, std430) readonly  buffer BufLg    { float lg_buf[]; };
+layout(set = 0, binding = 7, std430) writeonly buffer BufOut   { float out_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    int n_v_head;
+    int n_k_head;
+    int seq_len;
+    int n_chunks;
+} pc;
+
+const uint C = 64u;
+const uint D = 128u;
+const uint CS = 16u;     // state columns per workgroup
+
+shared float Ssl[D * CS];      // [row][col]
+shared float Dsl[C * CS];
+shared float QSsl[C * CS];
+shared float lgS[C];
+shared float Kch[C * D];      // this chunk's k rows for the head, staged once per chunk
+
+void main() {
+    uint vh = gl_WorkGroupID.x;
+    uint cblk = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint kh = vh % uint(pc.n_k_head);
+    uint qkPerToken = uint(pc.n_k_head) * D;
+    uint vPerToken = uint(pc.n_v_head) * D;
+    uint stateBase = vh * D * D;
+    float invSqrtD = 1.0 / sqrt(float(D));
+
+    // phase-a / phase-c mapping: row i = tid >> 2, columns cg*4 .. cg*4+3
+    uint ia = tid >> 2u;
+    uint cg = tid & 3u;
+    // phase-d mapping: column cd, rows rb + 16 m
+    uint cd = tid & 15u;
+    uint rb = tid >> 4u;
+
+    for (uint e = tid; e < D * CS; e += 256u) {
+        uint r = e / CS, c = e % CS;
+        Ssl[e] = st[stateBase + r * D + cblk * CS + c];
+    }
+    barrier();
+
+    for (int chunk = 0; chunk < pc.n_chunks; chunk++) {
+        uint slot = vh * uint(pc.n_chunks) + uint(chunk);
+        uint tok0 = uint(chunk) * C;
+        if (tid < C) lgS[tid] = lg_buf[slot * C + tid];
+        for (uint e = tid; e < C * D; e += 256u) {
+            uint j = e / D, r = e % D;
+            uint t = tok0 + j;
+            Kch[e] = (int(t) < pc.seq_len) ? k_buf[t * qkPerToken + kh * D + r] : 0.0;
+        }
+
+        // ---- phase a: X = W S_0, QS = Q S_0 --------------------------------------------------------------------------------------
+        uint tokA = tok0 + ia;
+        bool validA = int(tokA) < pc.seq_len;
+        float accX0 = 0.0, accX1 = 0.0, accX2 = 0.0, accX3 = 0.0;
+        float accQ0 = 0.0, accQ1 = 0.0, accQ2 = 0.0, accQ3 = 0.0;
+        uint wRow = slot * (C * D) + ia * D;
+        uint qRow = tokA * qkPerToken + kh * D;
+        [[unroll]] for (uint r = 0u; r < D; r++) {
+            float w = w_buf[wRow + r];
+            float qv = validA ? q_buf[qRow + r] : 0.0;
+            uint sb = r * CS + cg * 4u;
+            float s0 = Ssl[sb], s1 = Ssl[sb + 1u], s2 = Ssl[sb + 2u], s3 = Ssl[sb + 3u];
+            accX0 += w * s0; accX1 += w * s1; accX2 += w * s2; accX3 += w * s3;
+            accQ0 += qv * s0; accQ1 += qv * s1; accQ2 += qv * s2; accQ3 += qv * s3;
+        }
+        uint uRow = slot * (C * D) + ia * D + cblk * CS + cg * 4u;
+        uint dI = ia * CS + cg * 4u;
+        Dsl[dI]      = u_buf[uRow]      - accX0;
+        Dsl[dI + 1u] = u_buf[uRow + 1u] - accX1;
+        Dsl[dI + 2u] = u_buf[uRow + 2u] - accX2;
+        Dsl[dI + 3u] = u_buf[uRow + 3u] - accX3;
+        QSsl[dI] = accQ0; QSsl[dI + 1u] = accQ1; QSsl[dI + 2u] = accQ2; QSsl[dI + 3u] = accQ3;
+        barrier();
+
+        // ---- phase c: outputs -----------------------------------------------------------------------------------------------------
+        if (validA) {
+            float gam = exp(lgS[ia]);
+            float o0 = gam * QSsl[dI], o1 = gam * QSsl[dI + 1u], o2 = gam * QSsl[dI + 2u], o3 = gam * QSsl[dI + 3u];
+            uint pRow = slot * (C * C) + ia * C;
+            [[dont_unroll]] for (uint j = 0u; j <= ia; j++) {
+                float p = p_buf[pRow + j];
+                o0 += p * Dsl[j * CS + cg * 4u];
+                o1 += p * Dsl[j * CS + cg * 4u + 1u];
+                o2 += p * Dsl[j * CS + cg * 4u + 2u];
+                o3 += p * Dsl[j * CS + cg * 4u + 3u];
+            }
+            uint oi = tokA * vPerToken + vh * D + cblk * CS + cg * 4u;
+            out_buf[oi]      = o0 * invSqrtD;
+            out_buf[oi + 1u] = o1 * invSqrtD;
+            out_buf[oi + 2u] = o2 * invSqrtD;
+            out_buf[oi + 3u] = o3 * invSqrtD;
+        }
+
+        // ---- phase d: state update (each element depends only on itself; D is complete) -------------------------------------------
+        float lgEnd = lgS[C - 1u];
+        float gamC = exp(lgEnd);
+        float sacc[8];
+        for (uint m = 0u; m < 8u; m++) sacc[m] = gamC * Ssl[(rb + 16u * m) * CS + cd];
+        for (uint j = 0u; j < C; j++) {
+            uint t = tok0 + j;
+            if (int(t) >= pc.seq_len) break;
+            float kappa = exp(lgEnd - lgS[j]);
+            float dj = kappa * Dsl[j * CS + cd];
+            for (uint m = 0u; m < 8u; m++) sacc[m] += Kch[j * D + rb + 16u * m] * dj;
+        }
+        barrier();      // everyone finished reading the OLD S in phase a? (S writes below only touch elements read above by the same pass)
+        for (uint m = 0u; m < 8u; m++) Ssl[(rb + 16u * m) * CS + cd] = sacc[m];
+        barrier();
+    }
+
+    for (uint e = tid; e < D * CS; e += 256u) {
+        uint r = e / CS, c = e % CS;
+        st[stateBase + r * D + cblk * CS + c] = Ssl[e];
+    }
+}

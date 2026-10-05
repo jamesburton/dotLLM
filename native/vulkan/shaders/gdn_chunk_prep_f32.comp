@@ -1,0 +1,124 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+// Chunked Gated-DeltaNet scan, stage 1 of 2 (issue #703): per (v-head, 64-token chunk) preparation, fully parallel across chunks.
+//
+// Recurrence (per v-head; S is [d_state k-rows, d_state v-cols]):  S_i = g_i S_{i-1} + k_i d_i^T,  d_i = beta_i (v_i - g_i S_{i-1}^T k_i),
+// out_i = S_i^T q_i / sqrt(d_state).   With gamma_i = prod_{m<=i} g_m (within the chunk) the chunk solves (I + A) D = beta V - (beta gamma k) S_0
+// as a WY representation, A_ij = beta_i (gamma_i/gamma_j) k_i.k_j (j < i). This kernel computes everything that does NOT depend on the
+// chunk's incoming state S_0:
+//     U = (I + A)^-1 (beta v)            [64 x d_state]     W = (I + A)^-1 (beta gamma k)   [64 x d_state]
+//     P_ij = (gamma_i/gamma_j) q_i.k_j   for j <= i         [64 x 64]
+//     lg_i = log gamma_i                                     [64]
+// so that stage 2 only needs  D = U - W S_0,  out_i = gamma_i q_i.S_0 + sum_{j<=i} P_ij D_j,  S_C = gamma_C S_0 + sum_j (gamma_C/gamma_j) k_j D_j^T.
+// Tokens past seq_len (ragged last chunk) are identity steps (g = 1, beta = 0, k = 0, v = 0). d_state must be 128.
+//
+// Dispatch: groupCount = (n_chunks, n_v_head, 1), local_size_x = 256.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufQ    { float q_buf[];    };
+layout(set = 0, binding = 1, std430) readonly  buffer BufK    { float k_buf[];    };
+layout(set = 0, binding = 2, std430) readonly  buffer BufV    { float v_buf[];    };
+layout(set = 0, binding = 3, std430) readonly  buffer BufG    { float g_buf[];    };
+layout(set = 0, binding = 4, std430) readonly  buffer BufBeta { float beta_buf[]; };
+layout(set = 0, binding = 5, std430) writeonly buffer BufU    { float u_buf[];    }; // [(head * nChunks + chunk) * 64 * 128]
+layout(set = 0, binding = 6, std430) writeonly buffer BufW    { float w_buf[];    };
+layout(set = 0, binding = 7, std430) writeonly buffer BufP    { float p_buf[];    }; // [(head * nChunks + chunk) * 64 * 64]
+layout(set = 0, binding = 8, std430) writeonly buffer BufLg   { float lg_buf[];   }; // [(head * nChunks + chunk) * 64]
+
+layout(push_constant) uniform PushConstants {
+    int n_v_head;
+    int n_k_head;
+    int seq_len;
+    int n_chunks;
+} pc;
+
+const uint C = 64u;
+const uint D = 128u;
+
+shared float Ks[C][65];
+shared float Qs[C][65];
+shared float As[C][65];
+shared float lgS[C];
+shared float betaS[C];
+
+void main() {
+    uint chunk = gl_WorkGroupID.x;
+    uint vh = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint kh = vh % uint(pc.n_k_head);
+    uint tok0 = chunk * C;
+    uint qkPerToken = uint(pc.n_k_head) * D;
+    uint vPerToken = uint(pc.n_v_head) * D;
+    uint slot = vh * uint(pc.n_chunks) + chunk;
+
+    if (tid == 0u) {
+        float run = 0.0;
+        for (uint i = 0u; i < C; i++) {
+            uint t = tok0 + i;
+            bool valid = int(t) < pc.seq_len;
+            float g = valid ? g_buf[t * uint(pc.n_v_head) + vh] : 1.0;
+            run += log(max(g, 1e-37));
+            lgS[i] = run;
+            betaS[i] = valid ? beta_buf[t * uint(pc.n_v_head) + vh] : 0.0;
+        }
+    }
+    barrier();
+
+    float kk[16], qk[16];
+    for (uint m = 0u; m < 16u; m++) { kk[m] = 0.0; qk[m] = 0.0; }
+
+    for (uint dh = 0u; dh < 2u; dh++) {
+        for (uint e = tid; e < C * 64u; e += 256u) {
+            uint i = e >> 6u, dd = e & 63u;
+            uint t = tok0 + i;
+            bool valid = int(t) < pc.seq_len;
+            uint idx = t * qkPerToken + kh * D + dh * 64u + dd;
+            Ks[i][dd] = valid ? k_buf[idx] : 0.0;
+            Qs[i][dd] = valid ? q_buf[idx] : 0.0;
+        }
+        barrier();
+        for (uint m = 0u; m < 16u; m++) {
+            uint p = tid + 256u * m;
+            uint i = p >> 6u, j = p & 63u;
+            float a = 0.0, b = 0.0;
+            for (uint d = 0u; d < 64u; d++) {
+                float kj = Ks[j][d];
+                a += Ks[i][d] * kj;
+                b += Qs[i][d] * kj;
+            }
+            kk[m] += a;
+            qk[m] += b;
+        }
+        barrier();
+    }
+
+    for (uint m = 0u; m < 16u; m++) {
+        uint p = tid + 256u * m;
+        uint i = p >> 6u, j = p & 63u;
+        float ratio = exp(lgS[i] - lgS[j]);
+        As[i][j] = (j < i) ? betaS[i] * ratio * kk[m] : 0.0;
+        p_buf[slot * (C * C) + p] = (j <= i) ? ratio * qk[m] : 0.0;
+    }
+    if (tid < C) lg_buf[slot * C + tid] = lgS[tid];
+    barrier();
+
+    // Forward substitution (I + A) X = R, one column per thread: columns 0..127 -> U (R = beta v), 128..255 -> W (R = beta gamma k).
+    uint col = tid;
+    bool isV = col < D;
+    uint cc = isV ? col : col - D;
+    float x[64];
+    [[unroll]] for (uint i = 0u; i < C; i++) {
+        uint t = tok0 + i;
+        float r = 0.0;
+        if (int(t) < pc.seq_len) {
+            if (isV) r = betaS[i] * v_buf[t * vPerToken + vh * D + cc];
+            else     r = betaS[i] * exp(lgS[i]) * k_buf[t * qkPerToken + kh * D + cc];
+        }
+        float acc = r;
+        [[unroll]] for (uint j = 0u; j < i; j++) acc -= As[i][j] * x[j];
+        x[i] = acc;
+        if (isV) u_buf[slot * (C * D) + i * D + cc] = acc;
+        else     w_buf[slot * (C * D) + i * D + cc] = acc;
+    }
+}
