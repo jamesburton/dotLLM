@@ -31,13 +31,27 @@ internal sealed class ModelPullCommand : AsyncCommand<ModelPullCommand.Settings>
         using var downloader = new HuggingFaceDownloader();
 
         var filename = settings.Filename;
+        var reference = ModelResolver.Parse(settings.RepoId);
+        string repoId = reference.RepoId ?? settings.RepoId;
+        if (filename is null && reference.Filename is not null) filename = reference.Filename;
+        // "owner/repo:Q4_K_M" picks the matching file without a prompt.
+        if (string.IsNullOrEmpty(filename) && reference.Tag is not null)
+        {
+            var listing = await client.ListGgufFilesAsync(repoId);
+            filename = ModelResolver.ChooseRemoteFile(listing.Select(f => (f.Path, f.Size)), reference.Tag);
+            if (filename is null)
+            {
+                AnsiConsole.MarkupLine($"[red]No GGUF matching '{reference.Tag.EscapeMarkup()}' in {repoId.EscapeMarkup()}.[/]");
+                return 1;
+            }
+        }
 
         // If no filename specified, list GGUF files and let user pick
         if (string.IsNullOrEmpty(filename))
         {
             var ggufFiles = await AnsiConsole.Status()
                 .StartAsync("Fetching file list...", async _ =>
-                    await client.ListGgufFilesAsync(settings.RepoId));
+                    await client.ListGgufFilesAsync(repoId));
 
             if (ggufFiles.Count == 0)
             {
@@ -51,7 +65,7 @@ internal sealed class ModelPullCommand : AsyncCommand<ModelPullCommand.Settings>
                     .AddChoices(ggufFiles.Select(f => f.Path)));
         }
 
-        AnsiConsole.MarkupLine($"Downloading [bold]{filename.EscapeMarkup()}[/] from [bold]{settings.RepoId.EscapeMarkup()}[/]...");
+        AnsiConsole.MarkupLine($"Downloading [bold]{filename.EscapeMarkup()}[/] from [bold]{repoId.EscapeMarkup()}[/]...");
 
         var path = await AnsiConsole.Progress()
             .AutoClear(false)
@@ -82,8 +96,11 @@ internal sealed class ModelPullCommand : AsyncCommand<ModelPullCommand.Settings>
                     }
                 });
 
-                return await downloader.DownloadFileAsync(
-                    settings.RepoId, filename, settings.Directory, progress);
+                // Hub cache (shared with huggingface_hub / hf download) + a mirror link; --dir keeps the old flat-directory behaviour.
+                if (settings.Directory is not null)
+                    return await downloader.DownloadFileAsync(repoId, filename, settings.Directory, progress);
+                var r = await downloader.DownloadToHubCacheAsync(repoId, filename, progress: progress);
+                return r.ModelPath;
             });
 
         AnsiConsole.MarkupLine($"[green]Saved to:[/] {path.EscapeMarkup()}");

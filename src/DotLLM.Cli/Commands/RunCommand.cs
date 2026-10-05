@@ -305,7 +305,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         }
         else
         {
-            var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
+            var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
             if (ggufPath is null)
                 return 1;
             resolvedPath = ggufPath;
