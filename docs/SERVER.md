@@ -589,3 +589,10 @@ Both `/v1/chat/completions` and `/v1/completions` validate inputs before inferen
 | `max_tokens` | &le; 0 | 400 `"max_tokens must be a positive integer"` |
 | Prompt token count | &ge; `MaxSequenceLength` | 400 `"prompt (N tokens) exceeds model context length (M)"` |
 | `prompt_tokens + max_tokens` | > `MaxSequenceLength` | `max_tokens` silently clamped to remaining context |
+
+### Vulkan continuous-batch scheduler (hybrid GDN models)
+
+Vulkan hybrid models (Qwen3.5 / Tev1, Qwen3.6) serve through the serial per-request generator by default. Pass `--expected-concurrency N`
+(N >= 5) to serve them through the continuous-batch scheduler instead: measured on Tev1-4B, aggregate decode throughput at 8 concurrent
+streams is +73% (102 vs 59 tok/s), parity at 4 or fewer and for a single stream. It is off when `--mtp` or a draft model is active, and a
+repeated identical prompt is slower than on the serial path (which has the whole-prompt cache). `DOTLLM_VK_SCHEDULER=0|1` overrides the hint.

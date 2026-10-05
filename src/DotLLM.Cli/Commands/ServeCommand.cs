@@ -134,6 +134,14 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [DefaultValue(false)]
         public bool Mtp { get; set; }
 
+        /// <summary>Expected number of concurrent decode streams; 5 or more enables the Vulkan continuous-batch scheduler.</summary>
+        [CommandOption("--expected-concurrency")]
+        [Description("Expected number of concurrently decoding requests. At 5 or more, Vulkan hybrid models serve through the continuous-batch " +
+                     "scheduler (measured +73% aggregate decode throughput at 8 concurrent on Tev1-4B; parity at 4 or fewer, off with --mtp). " +
+                     "0 (default) keeps the serial per-request path. DOTLLM_VK_SCHEDULER=0|1 overrides.")]
+        [DefaultValue(0)]
+        public int ExpectedConcurrency { get; set; }
+
         /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
         [CommandOption("--prefill-chunk-size|--ubatch-size")]
         [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default). With the continuous-batch scheduler this caps prefill tokens admitted per step instead.")]
@@ -250,6 +258,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         var serverOptions = new ServerOptions
         {
             Model = settings.Model ?? "",
+            ExpectedConcurrency = settings.ExpectedConcurrency,
             Quant = settings.Quant,
             Device = settings.Device,
             GpuLayers = settings.GpuLayers,

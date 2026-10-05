@@ -354,8 +354,10 @@ public static class ServerStartup
         // Vulkan hybrid models (per-sequence GDN state + serial ForwardBatch) can run through the scheduler, but the
         // serial TextGenerator path is faster until recurrent prefix restore + fused batching land, so this is opt-in:
         // DOTLLM_VK_SCHEDULER=1. No paged pool and no prefix trie (KV-only, paged-only) on this path.
+        string? vkSchedEnv = Environment.GetEnvironmentVariable("DOTLLM_VK_SCHEDULER");
         bool vulkanScheduler = vulkanKvFactory is not null && model.SupportsThreadedSequenceState
-            && string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_SCHEDULER"), "1", StringComparison.Ordinal);
+            && (string.Equals(vkSchedEnv, "1", StringComparison.Ordinal)
+                || (options.ExpectedConcurrency >= 5 && !string.Equals(vkSchedEnv, "0", StringComparison.Ordinal)));
         if ((pagedFactory is not null || vulkanScheduler) && kvFactory is not null && draftModel is null && !mtpActive)
         {
             var schedulerOptions = ResolveSchedulerOptions(options);
@@ -383,7 +385,7 @@ public static class ServerStartup
             Console.WriteLine(options.Scheduler?.EnableFairness == true
                 ? "[dotllm] Continuous-batch scheduler active (per-API-key fairness on)"
                 : vulkanScheduler
-                    ? "[dotllm] Continuous-batch scheduler active (Vulkan, opt-in DOTLLM_VK_SCHEDULER=1)"
+                    ? "[dotllm] Continuous-batch scheduler active (Vulkan; DOTLLM_VK_SCHEDULER=1 or --expected-concurrency >= 5)"
                     : "[dotllm] Continuous-batch scheduler active");
         }
 
