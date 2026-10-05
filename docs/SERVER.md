@@ -325,6 +325,25 @@ dotLLM reads an existing ollama installation **in place** and can pull from the 
 converted with; a model that only works through a custom ollama `TEMPLATE` may need a hand-written template. Only GGUF model layers are handled (vision
 projector layers are ignored). dotLLM never writes into the ollama store.
 
+## Ollama-compatible API: `/api/*` (#720)
+
+Ollama clients (Open WebUI, Continue, Enchanted, ollama-python/js, LangChain's `ChatOllama`) can point at a dotLLM server unchanged
+(`OLLAMA_HOST=http://localhost:8080`). Verified with the official `ollama` Python client against a live Vulkan server: `list`, `show`, `chat` and
+`generate` (streaming and not, including `format: "json"` constrained decoding), `ps`, `pull` with progress, `delete`, `keep_alive: 0` unload, and
+ollama's 404 error shape.
+
+| route | notes |
+|---|---|
+| `POST /api/chat`, `POST /api/generate` | NDJSON streaming by default (`stream:false` for one object); `options` (temperature, top_p, top_k, min_p, repeat_penalty, seed, num_predict, stop), `format` (`"json"` or a JSON schema), `system`, `raw`, `keep_alive` (`5m`, `30s`, seconds, `-1`, `0`); final chunk carries `done_reason`, `total_duration`, `load_duration`, `prompt_eval_*`, `eval_*`. `/api/generate` with no prompt is the "load this model" call, and `keep_alive: 0` unloads it. Metered by the rate limiter like `/v1/*` |
+| `GET /api/tags`, `GET /api/ps`, `POST /api/show`, `GET /api/version` | names are profiles, local models (stem) and ollama-store models (`name:tag`); `show` synthesises a Modelfile (`FROM`, `SYSTEM`, `PARAMETER`) from the profile; `version` reports the emulated API level (`0.6.0`) |
+| `POST /api/pull` | `owner/repo[:tag]` (Hugging Face) or an ollama name; streams `pulling manifest` / `downloading` (`completed`/`total`) / `success` |
+| `DELETE /api/delete` | removes a profile, a local model, or a model dotLLM pulled from the ollama registry (its file goes with its last profile); ollama-store models are never touched |
+| `/api/embed`, `/api/embeddings`, `/api/create`, `/api/copy`, `/api/push` | `501` with a pointer (`/v1/embeddings`, `dotllm model create` / `cp`) |
+
+`pull` and `delete` need `--allow-model-admin`, like `/v1/models/*`. Not supported inside chat: `tools`, images and thinking (use `/v1/chat/completions`;
+a request with `tools` gets a `501`). Digests in `tags`/`ps` are stable placeholders, and `details` carries format and quantisation only (no family or
+parameter size).
+
 ## Model Keep-Alive / Idle-Unload / Multi-Model Residency (#369)
 
 Ollama-parity daemon lifecycle: idle models unload automatically, and — when configured — more than

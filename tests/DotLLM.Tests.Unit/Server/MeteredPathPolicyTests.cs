@@ -33,6 +33,8 @@ public sealed class MeteredPathPolicyTests
     [Theory]
     [InlineData("/v1/chat/completions")]
     [InlineData("/v1/systemone")]
+    [InlineData("/api/chat")]
+    [InlineData("/api/generate")]
     [InlineData("/v1/completions")]
     [InlineData("/v1/embeddings")]
     [InlineData("/v1/messages")]
@@ -58,6 +60,11 @@ public sealed class MeteredPathPolicyTests
     [InlineData("/v1/detokenize")]
     [InlineData("/v1/prompt-cache")]
     [InlineData("/v1/cache/clear")]
+    [InlineData("/api/tags")]
+    [InlineData("/api/show")]
+    [InlineData("/api/ps")]
+    [InlineData("/api/pull")]
+    [InlineData("/api/version")]
     public void ControlPlaneRoutesAreNotMetered(string path) =>
         Assert.False(RateLimitMiddleware.IsMeteredPath(path), $"{path} is a control-plane route and must stay free.");
 
@@ -95,6 +102,8 @@ public sealed class MeteredPathPolicyTests
             "/v1/embeddings",
             "/v1/messages",
             "/v1/systemone",
+            "/api/chat",
+            "/api/generate",
         ];
 
         foreach (var path in registered)

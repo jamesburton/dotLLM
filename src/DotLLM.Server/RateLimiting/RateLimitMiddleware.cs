@@ -182,6 +182,10 @@ public sealed class RateLimitMiddleware
     {
         if (!path.HasValue) return false;
         var p = path.Value!;
+        // Ollama-compatible generative routes (#720) sit outside /v1/ but run the model, so they are metered too. The rest of /api/*
+        // (tags, show, ps, version, pull, delete) is control plane and stays free.
+        if (p.Equals("/api/chat", StringComparison.OrdinalIgnoreCase) || p.Equals("/api/generate", StringComparison.OrdinalIgnoreCase))
+            return true;
         if (!p.StartsWith("/v1/", StringComparison.OrdinalIgnoreCase))
             return false;
 
