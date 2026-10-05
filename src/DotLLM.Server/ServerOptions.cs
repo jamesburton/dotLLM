@@ -131,6 +131,14 @@ public sealed record ServerOptions
     public ContinuousBatchSchedulerOptions? Scheduler { get; init; }
 
     /// <summary>
+    /// Expected number of concurrently decoding requests (<c>--expected-concurrency</c>). Vulkan hybrid models serve through the serial
+    /// per-request generator by default; at <c>&gt;= 5</c> concurrent decode streams the continuous-batch scheduler measured +73% aggregate
+    /// decode throughput on Tev1-4B (parity at &lt;= 4, slower for a repeated identical prompt, and it is off when MTP is active), so a hint of
+    /// 5 or more enables it automatically. <c>DOTLLM_VK_SCHEDULER=0</c>/<c>1</c> overrides the hint.
+    /// </summary>
+    public int ExpectedConcurrency { get; init; }
+
+    /// <summary>
     /// Server-wide default idle-unload duration in seconds (#369, ollama parity — ollama's own
     /// default is 5 min). Per-model/per-request <c>keep_alive</c> overrides take precedence when
     /// present. 0 = unload immediately after each use. Negative = never auto-unload.
