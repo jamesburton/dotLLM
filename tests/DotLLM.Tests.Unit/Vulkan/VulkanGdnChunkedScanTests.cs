@@ -134,4 +134,38 @@ public sealed class VulkanGdnChunkedScanTests
             _out.WriteLine($"seqLen {seqLen}: rowsplit {a:F3} ms, chunked {b:F3} ms ({a / b:F2}x); prep-only {b1:F3} ms, scan-only {b2:F3} ms");
         }
     }
+
+    /// <summary>Opt-in RGP capture target: holds, then issues one prep dispatch followed by many scan-only (or prep-only) dispatches.</summary>
+    [SkippableFact]
+    public void Probe_Capture()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_GDN_CHUNK_CAPTURE") is "scan" or "prep", "opt-in capture target");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        const int nVHead = 48, nKHead = 16, dState = 128; int seqLen = int.Parse(Environment.GetEnvironmentVariable("DOTLLM_GDN_CHUNK_SEQ") ?? "2048");
+        var rng = new Random(7);
+        float[] q = Normalised(rng, seqLen * nKHead, dState), k = Normalised(rng, seqLen * nKHead, dState);
+        float[] v = new float[seqLen * nVHead * dState];
+        for (int i = 0; i < v.Length; i++) v[i] = (float)(rng.NextDouble() * 2 - 1);
+        float[] g = new float[seqLen * nVHead], beta = new float[seqLen * nVHead];
+        for (int i = 0; i < g.Length; i++) { g[i] = 0.9f + 0.1f * (float)rng.NextDouble(); beta[i] = (float)rng.NextDouble(); }
+        using var device = VulkanDevice.Create();
+        using var bs = device.Allocate((long)nVHead * dState * dState * 4);
+        using var bq = device.Allocate((long)q.Length * 4); using var bk = device.Allocate((long)k.Length * 4);
+        using var bv = device.Allocate((long)v.Length * 4); using var bg = device.Allocate((long)g.Length * 4);
+        using var bb = device.Allocate((long)beta.Length * 4); using var bo = device.Allocate((long)v.Length * 4);
+        device.Upload(new float[nVHead * dState * dState], bs); device.Upload(q, bq); device.Upload(k, bk); device.Upload(v, bv); device.Upload(g, bg); device.Upload(beta, bb);
+        using var ch = GdnChunkedScanF32Kernel.Create(device, spvDir);
+        ch.Reserve(seqLen, nVHead);
+        bool scan = Environment.GetEnvironmentVariable("DOTLLM_GDN_CHUNK_CAPTURE") == "scan";
+        System.Threading.Thread.Sleep(int.Parse(Environment.GetEnvironmentVariable("DOTLLM_GDN_CHUNK_HOLD_MS") ?? "4000"));
+        // one dispatch per submit-and-wait so dispatch index == submit index (RGP dispatch capture needs this)
+        for (int r = 0; r < 41; r++)
+        {
+            using var ctx = device.CreateSubmitContext();
+            ctx.Begin();
+            ch.StageMask = (r == 0 || !scan) ? 1 : 2;
+            ch.Record(ctx.CommandBuffer, bs, bq, bk, bv, bg, bb, bo, seqLen, nVHead, nKHead);
+            ctx.SubmitAndWait();
+        }
+    }
 }
