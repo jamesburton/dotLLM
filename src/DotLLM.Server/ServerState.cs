@@ -334,9 +334,9 @@ public sealed class ServerState : IDisposable
             }
             else
             {
-                var resolvedPath = ServerStartup.ResolveModelPath(targetKey, quant: null);
+                var resolvedPath = await ServerStartup.ResolveOrPullAsync(targetKey, quant: null, Options.AutoPull, ct).ConfigureAwait(false);
                 if (resolvedPath is null)
-                    return $"Model not found: {targetKey}";
+                    return ServerStartup.NotFoundMessage(targetKey);
 
                 // (#454) Re-check the catalog against the key this load would actually produce.
                 // The check above only saw the raw request string, so a request naming a repo id

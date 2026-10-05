@@ -6,6 +6,7 @@ using DotLLM.Engine;
 using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
 using DotLLM.Engine.Scheduler;
+using DotLLM.HuggingFace;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
@@ -25,35 +26,30 @@ public static class ServerStartup
     /// <summary>
     /// Resolves a model argument (file path or HuggingFace repo ID) to a local GGUF path.
     /// </summary>
-    public static string? ResolveModelPath(string modelArg, string? quant)
+    public static string? ResolveModelPath(string modelArg, string? quant) =>
+        ModelResolver.ResolveLocal(modelArg, quant);
+
+    /// <summary>
+    /// <see cref="ResolveModelPath"/>, falling back to a Hub download when <paramref name="autoPull"/> is on and the reference names a Hub repo
+    /// (<c>--auto-pull</c>, issue #714). Off by default: a remote client must not be able to start multi-gigabyte downloads by naming a repo.
+    /// </summary>
+    public static async Task<string?> ResolveOrPullAsync(string modelArg, string? quant, bool autoPull, CancellationToken ct)
     {
-        // Direct .gguf file path
-        if (modelArg.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase) && File.Exists(modelArg))
-            return modelArg;
+        string? path = ResolveModelPath(modelArg, quant);
+        if (path is not null || !autoPull) return path;
 
-        // HuggingFace repo ID — check cached models directory
-        var modelsDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models");
-
-        var repoDir = Path.Combine(modelsDir, modelArg.Replace('/', Path.DirectorySeparatorChar));
-        if (!Directory.Exists(repoDir))
-            return null;
-
-        var ggufFiles = Directory.GetFiles(repoDir, "*.gguf");
-        if (quant is not null)
-        {
-            ggufFiles = ggufFiles.Where(f =>
-                Path.GetFileName(f).Contains(quant, StringComparison.OrdinalIgnoreCase)).ToArray();
-        }
-
-        return ggufFiles.Length switch
-        {
-            1 => ggufFiles[0],
-            > 1 => ggufFiles.OrderByDescending(f => new FileInfo(f).Length).First(),
-            _ => null,
-        };
+        var reference = ModelResolver.Parse(modelArg);
+        if (!reference.IsRepo) return null;
+        using var client = new HuggingFaceClient();
+        using var downloader = new HuggingFaceDownloader();
+        Console.WriteLine($"[dotllm] --auto-pull: downloading {modelArg}");
+        return await ModelResolver.PullAsync(reference, quant, client, downloader, progress: null, ct).ConfigureAwait(false);
     }
+
+    /// <summary>The message for an unresolvable model name, with the way out.</summary>
+    public static string NotFoundMessage(string modelArg) =>
+        $"Model not found: {modelArg}. Download it with `dotllm model pull {modelArg}` or POST /v1/models/pull" +
+        (ModelResolver.Parse(modelArg).IsRepo ? ", or start the server with --auto-pull." : ".");
 
     /// <summary>
     /// Creates a bare <see cref="ServerState"/> with no model loaded.

@@ -23,7 +23,7 @@ public static class ModelManagementEndpoint
     {
         app.MapGet("/v1/models/available", (ServerState state) =>
         {
-            var models = HuggingFaceDownloader.ListLocalModels();
+            var models = ModelResolver.EnumerateLocal();
             return new AvailableModelsResponse
             {
                 Models = models.Select(m =>
@@ -46,9 +46,9 @@ public static class ModelManagementEndpoint
 
         app.MapPost("/v1/models/load", async (ModelLoadRequest request, ServerState state, CancellationToken ct) =>
         {
-            var resolvedPath = ServerStartup.ResolveModelPath(request.Model, request.Quant);
+            var resolvedPath = await ServerStartup.ResolveOrPullAsync(request.Model, request.Quant, state.Options.AutoPull, ct);
             if (resolvedPath is null)
-                return Results.BadRequest(ErrorResponse.InvalidRequest($"Model not found: {request.Model}", param: "model", code: "model_not_found"));
+                return Results.BadRequest(ErrorResponse.InvalidRequest(ServerStartup.NotFoundMessage(request.Model), param: "model", code: "model_not_found"));
 
             // (#454) Honour the operator's enable/disable curation. Checked against both the
             // requested argument and the model id this load would produce, since a client may

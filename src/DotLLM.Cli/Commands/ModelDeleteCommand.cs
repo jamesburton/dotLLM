@@ -29,7 +29,7 @@ internal sealed class ModelDeleteCommand : Command<ModelDeleteCommand.Settings>
 
     public override int Execute(CommandContext context, Settings settings)
     {
-        var models = HuggingFaceDownloader.ListLocalModels();
+        var models = ModelResolver.EnumerateLocal();
 
         // Find matches by repo ID or filename
         var matches = models.Where(m =>
@@ -77,29 +77,15 @@ internal sealed class ModelDeleteCommand : Command<ModelDeleteCommand.Settings>
             }
         }
 
-        // Delete files and clean up empty directories
+        // Remove every link (mirror + hub-cache snapshot) and the blob when unambiguous.
         foreach (var m in matches)
         {
             try
             {
-                File.Delete(m.FullPath);
-                AnsiConsole.MarkupLine($"[red]Deleted[/] {m.Filename.EscapeMarkup()} ({FormatHelpers.FormatSize(m.SizeBytes)})");
-
-                // Remove repo directory if empty
-                var repoDir = Path.GetDirectoryName(m.FullPath);
-                if (repoDir is not null && Directory.Exists(repoDir) &&
-                    !Directory.EnumerateFileSystemEntries(repoDir).Any())
-                {
-                    Directory.Delete(repoDir);
-
-                    // Remove owner directory if empty
-                    var ownerDir = Path.GetDirectoryName(repoDir);
-                    if (ownerDir is not null && Directory.Exists(ownerDir) &&
-                        !Directory.EnumerateFileSystemEntries(ownerDir).Any())
-                    {
-                        Directory.Delete(ownerDir);
-                    }
-                }
+                long freed = ModelResolver.DeleteLocal(m);
+                AnsiConsole.MarkupLine(freed > 0
+                    ? $"[red]Deleted[/] {m.Filename.EscapeMarkup()} ({FormatHelpers.FormatSize(freed)})"
+                    : $"[yellow]Nothing removed for[/] {m.Filename.EscapeMarkup()}");
             }
             catch (Exception ex)
             {

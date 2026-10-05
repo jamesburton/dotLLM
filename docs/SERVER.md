@@ -254,6 +254,32 @@ disagree with list — including on a bare server, where the configured-but-unlo
 retrieves rather than 404s. An unknown id returns `404` with
 `{"error": {"type": "not_found_error", "code": "model_not_found", "param": "model", ...}}`.
 
+## Model names, the hub cache and pulling (#714)
+
+One resolver (`DotLLM.HuggingFace.ModelResolver`) turns a model name into a GGUF everywhere - `dotllm run|chat|serve|bench`, a request's `model`
+field, and `POST /v1/models/load`:
+
+| you write | resolves to |
+|---|---|
+| `C:\models\x.gguf` | that file |
+| `owner/repo` | the repo's best local GGUF: **Q4_K_M first** (then Q4_K_S, Q4_0, Q5_K_M, Q8_0, ...), not the largest file |
+| `owner/repo:Q8_0` | the file whose name contains the tag (`:latest` = the default); the legacy `--quant` is the same thing |
+| `owner/repo/file.gguf` | that file |
+| `hf.co/owner/repo:tag`, `hf://owner/repo` | same as `owner/repo[:tag]` |
+| `Tev1-4B-experimental-Q4_K_M` | a local file by stem or filename - the key `GET /v1/models` reports |
+
+Local models are found in **both** the flat mirror (`~/.dotllm/models/{owner}/{repo}`) and the Hugging Face hub cache
+(`HF_HUB_CACHE` / `HF_HOME/hub` / `~/.cache/huggingface/hub`, symlinked or hard-linked snapshots), so files fetched by `hf download` or another
+tool need no re-pull; the same file seen through both is listed once (`GET /v1/models/available`, `dotllm model list`). Multimodal projectors
+(`mmproj*`) and later shards of a split GGUF are never chosen as the model.
+
+**Pull on a miss.** `dotllm run|chat|serve owner/repo[:tag]` downloads a missing Hub model with progress (resumable, into the hub cache, like
+`ollama run`). The **server** does not download on a request unless started with `--auto-pull`: a remote client must not be able to start
+multi-gigabyte transfers by naming a repo. Without it a miss answers `model_not_found` with the `dotllm model pull ...` / `POST /v1/models/pull`
+hint. `dotllm model pull owner/repo:Q4_K_M` selects the file by tag without a prompt and now also writes to the hub cache. `dotllm model delete`
+removes every link (mirror, snapshot) and the blob when it is unambiguous (same length and first MiB, exactly one candidate); it matches every
+file of a repo unless you narrow it with `--quant`.
+
 ## Model Keep-Alive / Idle-Unload / Multi-Model Residency (#369)
 
 Ollama-parity daemon lifecycle: idle models unload automatically, and — when configured — more than

@@ -14,7 +14,7 @@ internal sealed class ModelListCommand : Command<ModelListCommand.Settings>
 
     public override int Execute(CommandContext context, Settings settings)
     {
-        var models = HuggingFaceDownloader.ListLocalModels();
+        var models = ModelResolver.EnumerateLocal();
 
         if (models.Count == 0)
         {

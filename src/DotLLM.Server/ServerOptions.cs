@@ -139,6 +139,12 @@ public sealed record ServerOptions
     public int ExpectedConcurrency { get; init; }
 
     /// <summary>
+    /// Download a missing Hugging Face model when a request or load names one (<c>--auto-pull</c>, issue #714). Off by default so a remote client
+    /// cannot start large downloads; the CLI's own <c>run/chat/serve</c> always pull their main model.
+    /// </summary>
+    public bool AutoPull { get; init; }
+
+    /// <summary>
     /// Logit temperature for <c>/v1/systemone</c> probabilities (<c>--decision-temperature</c>); 0 or 1 = the raw restricted softmax. See
     /// <c>DecisionEvaluator.Temperature</c> for the measured effect on Tev1-4B.
     /// </summary>

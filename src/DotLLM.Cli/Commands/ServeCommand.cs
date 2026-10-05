@@ -142,6 +142,13 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [DefaultValue(0)]
         public int ExpectedConcurrency { get; set; }
 
+        /// <summary>Download a missing Hugging Face model when a request or load names one.</summary>
+        [CommandOption("--auto-pull")]
+        [Description("Download a missing Hugging Face model when a request names one (e.g. model \"owner/repo:Q4_K_M\"), like 'ollama run' does. " +
+                     "Off by default: remote clients should not be able to start multi-gigabyte downloads.")]
+        [DefaultValue(false)]
+        public bool AutoPull { get; set; }
+
         /// <summary>Logit temperature for POST /v1/systemone probabilities.</summary>
         [CommandOption("--decision-temperature")]
         [Description("Logit temperature for POST /v1/systemone probabilities (softmax(logits / T)). 0 or 1 (default) = the model's raw restricted softmax. " +
@@ -274,6 +281,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         {
             Model = settings.Model ?? "",
             ExpectedConcurrency = settings.ExpectedConcurrency,
+            AutoPull = settings.AutoPull,
             DecisionTemperature = settings.DecisionTemperature,
             DecisionOrderings = Math.Clamp(settings.DecisionOrderings, 1, 2),
             Quant = settings.Quant,
@@ -318,7 +326,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         if (!string.IsNullOrEmpty(settings.Model))
         {
             // Resolve and load model
-            var resolvedPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
+            var resolvedPath = GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
             if (resolvedPath is null)
                 return 1;
 
