@@ -139,6 +139,15 @@ public sealed record ServerOptions
     public int ExpectedConcurrency { get; init; }
 
     /// <summary>
+    /// Logit temperature for <c>/v1/systemone</c> probabilities (<c>--decision-temperature</c>); 0 or 1 = the raw restricted softmax. See
+    /// <c>DecisionEvaluator.Temperature</c> for the measured effect on Tev1-4B.
+    /// </summary>
+    public double DecisionTemperature { get; init; }
+
+    /// <summary>Option orderings averaged per noul/choice question (<c>--decision-orderings</c>): 1 (default) or 2 (forward + reversed).</summary>
+    public int DecisionOrderings { get; init; } = 1;
+
+    /// <summary>
     /// Server-wide default idle-unload duration in seconds (#369, ollama parity — ollama's own
     /// default is 5 min). Per-model/per-request <c>keep_alive</c> overrides take precedence when
     /// present. 0 = unload immediately after each use. Negative = never auto-unload.

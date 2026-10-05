@@ -64,8 +64,10 @@ public sealed class SystemOneEndpointTests
     private static SystemOneRequest Parse(string json) =>
         JsonSerializer.Deserialize(json, ServerJsonContext.Default.SystemOneRequest)!;
 
-    private static Task<SystemOneResponse> Answer(Script s, string json) =>
-        SystemOneEndpoint.AnswerAsync(Parse(json), new DecisionEvaluator(new CharTokenizer(), new ChatMlTemplate(), s.Run), "test-model", 100_000, default);
+    private static Task<SystemOneResponse> Answer(Script s, string json, double temperature = 1.0, int orderings = 1) =>
+        SystemOneEndpoint.AnswerAsync(Parse(json),
+            new DecisionEvaluator(new CharTokenizer(), new ChatMlTemplate(), s.Run) { Temperature = temperature, Orderings = orderings },
+            "test-model", 100_000, default);
 
     [Fact]
     public void Math_Softmax_Confidence_ExpectedIndex()
@@ -223,6 +225,53 @@ public sealed class SystemOneEndpointTests
         Assert.Equal(JsonValueKind.Number, usage.GetProperty("input_tokens").ValueKind);
         Assert.Equal(JsonValueKind.Number, usage.GetProperty("output_tokens").ValueKind);
         Assert.DoesNotContain("null", wire);   // unset fields are omitted, not written as null
+    }
+
+
+    [Fact]
+    public async Task Temperature_ScalesLogits_AndPreservesArgmax()
+    {
+        var s = new Script();
+        s.Logits['A'] = 2f; s.Logits['B'] = 0f;
+        const string q = """{"state":"s","questions":{"ok":{"type":"noul","instructions":"Is it ok?"}}}""";
+        double raw = (await Answer(s, q)).Answers!["ok"].Noul!.Value;
+        double sharp = (await Answer(s, q, temperature: 0.5)).Answers!["ok"].Noul!.Value;
+        double soft = (await Answer(s, q, temperature: 2.0)).Answers!["ok"].Noul!.Value;
+        Assert.Equal(1 / (1 + Math.Exp(-2.0)), raw, 9);
+        Assert.Equal(1 / (1 + Math.Exp(-4.0)), sharp, 9);   // logits / 0.5
+        Assert.Equal(1 / (1 + Math.Exp(-1.0)), soft, 9);    // logits / 2
+        Assert.True(sharp > raw && raw > soft && soft > 0.5);
+    }
+
+    [Fact]
+    public async Task Orderings2_CancelsAPositionBias_AndRunsTwoForwardPasses()
+    {
+        // A model that always prefers label "A": with one ordering the first option wins; averaged over forward + reversed it is a tie.
+        var s = new Script();
+        s.Logits['A'] = 2f; s.Logits['B'] = 0f;
+        const string q = """{"state":"s","questions":{"c":{"type":"choice","instructions":"Pick","criteria":{"x":"X","y":"Y"}}}}""";
+        var single = await Answer(s, q);
+        Assert.Equal("x", single.Answers!["c"].Choice);
+        Assert.True(single.Answers["c"].Probabilities!["x"] > 0.85);
+
+        s.Prompts.Clear();
+        var both = await Answer(s, q, orderings: 2);
+        Assert.Equal(2, s.Prompts.Count);
+        Assert.Equal(0.5, both.Answers!["c"].Probabilities!["x"], 9);
+        Assert.Equal(0.5, both.Answers["c"].Probabilities!["y"], 9);
+        // The reversed prompt lists y first, labelled A again, with each option's own key/description kept.
+        Assert.Contains("\"options\":[{\"label\":\"A\",\"key\":\"y\",\"description\":\"Y\"},{\"label\":\"B\",\"key\":\"x\"", s.Prompts[1]);
+        Assert.Equal(s.Prompts.Sum(p => (long)p.Length), both.Usage!.InputTokens);
+    }
+
+    [Fact]
+    public async Task Orderings2_AveragesOptionLogitsInOriginalOrder_AndSkipsScore()
+    {
+        var s = new Script();
+        s.Logits['A'] = 0f; s.Logits['B'] = 0f; s.Logits['C'] = 4f;
+        // Score levels are ordinal: reversing them would change their meaning, so only one pass runs.
+        await Answer(s, """{"state":"s","questions":{"sev":{"type":"score","instructions":"Severity?","criteria":["low","mid","high"]}}}""", orderings: 2);
+        Assert.Single(s.Prompts);
     }
 
     [Fact]
