@@ -192,15 +192,15 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
         menu.Items.Add(Item("&Start server", !status.IsRunning, async () => await StartServerAsync().ConfigureAwait(true)));
 
-        // Stop/Restart are enabled only for a server the tray owns. #454 has no shutdown route,
-        // and the tray will not go hunting for someone else's pid — see ServerSupervisor.StopAsync.
-        var owned = status.State == ServerState.RunningOwned;
-        var stop = Item("Sto&p server", owned, async () => await _supervisor.StopAsync().ConfigureAwait(true));
-        var restart = Item("&Restart server", owned, async () => await _supervisor.RestartAsync().ConfigureAwait(true));
+        // Stop/Restart work for any running server (#722): they ask it to shut down through its admin API. A server the tray did not
+        // start only agrees when it was started with --allow-model-admin; otherwise the status explains. The tray never kills a pid it does not own.
+        var running = status.State is ServerState.RunningOwned or ServerState.RunningAttached;
+        var stop = Item("Sto&p server", running, async () => await _supervisor.StopAsync().ConfigureAwait(true));
+        var restart = Item("&Restart server", running, async () => await _supervisor.RestartAsync().ConfigureAwait(true));
         if (status.State == ServerState.RunningAttached)
         {
             stop.ToolTipText = restart.ToolTipText =
-                "This server was started outside the tray. Stop it where it was started.";
+                "This server was started outside the tray: it is stopped through its admin API, which needs --allow-model-admin.";
         }
 
         menu.Items.Add(stop);
@@ -437,5 +437,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         public Task<bool> IsHealthyAsync(CancellationToken ct) => api.IsHealthyAsync(ct);
 
         public Task<bool> IsReadyAsync(CancellationToken ct) => api.IsReadyAsync(ct);
+
+        public Task<bool> RequestShutdownAsync(CancellationToken ct) => api.RequestShutdownAsync(ct);
     }
 }

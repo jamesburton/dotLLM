@@ -143,6 +143,7 @@ public sealed class RateLimitMiddleware
     private static readonly string[] UnmeteredV1Prefixes =
     [
         "/v1/models",
+        "/v1/admin",
         "/v1/lora",
         "/v1/prompt-cache",
         "/v1/cache",

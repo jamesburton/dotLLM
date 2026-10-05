@@ -33,9 +33,9 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>Compute device.</summary>
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1' (CUDA), or 'vulkan' (single-request path).")]
-        [DefaultValue("cpu")]
-        public string Device { get; set; } = "cpu";
+        [Description("Compute device: 'auto' (default: CUDA if the model fits, else Vulkan, else CPU - a failed GPU load falls back), 'cpu', 'gpu', 'gpu:0', 'gpu:1' (CUDA), or 'vulkan'.")]
+        [DefaultValue("auto")]
+        public string Device { get; set; } = "auto";
 
         /// <summary>Number of GPU layers for hybrid offloading.</summary>
         [CommandOption("--gpu-layers")]

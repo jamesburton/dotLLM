@@ -102,4 +102,20 @@ internal sealed class FakeHealthProbe : IServerHealthProbe
     }
 
     public Task<bool> IsReadyAsync(CancellationToken ct) => Task.FromResult(Ready);
+
+    /// <summary>What <see cref="RequestShutdownAsync"/> answers (a server that accepts, or refuses / has no route).</summary>
+    internal bool ShutdownAccepted { get; set; }
+
+    /// <summary>Number of shutdown requests received.</summary>
+    internal int ShutdownRequests { get; private set; }
+
+    /// <summary>Invoked when a shutdown request is accepted, so a test can make the server "exit".</summary>
+    internal Action? OnShutdownAccepted { get; set; }
+
+    public Task<bool> RequestShutdownAsync(CancellationToken ct)
+    {
+        ShutdownRequests++;
+        if (ShutdownAccepted) OnShutdownAccepted?.Invoke();
+        return Task.FromResult(ShutdownAccepted);
+    }
 }

@@ -156,7 +156,7 @@ public static class OllamaApiEndpoint
 
     private static void Ps(Utf8JsonWriter w, ServerState state)
     {
-        bool gpu = !string.Equals(state.Options.Device, "cpu", StringComparison.OrdinalIgnoreCase);
+        bool gpu = !string.Equals(state.Options.ResolvedDevice ?? state.Options.Device, "cpu", StringComparison.OrdinalIgnoreCase);
         w.WriteStartArray("models");
         foreach (var m in state.ListResidentModels())
         {

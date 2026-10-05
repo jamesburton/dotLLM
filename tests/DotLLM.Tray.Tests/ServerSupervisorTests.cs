@@ -148,10 +148,10 @@ public sealed class ServerSupervisorTests
     }
 
     [Fact]
-    public async Task Stop_RefusesToKillAnAttachedServerItDoesNotOwn()
+    public async Task Stop_OfAnAttachedServerThatRefuses_LeavesItRunningAndSaysWhy()
     {
-        // #454 exposes no shutdown route, and the tray will NOT go looking for the listening pid.
-        // The honest outcome is to leave it running and say why.
+        // The server refuses (no --allow-model-admin) and the tray will NOT go looking for the listening pid:
+        // the honest outcome is to leave it running and say why.
         var runner = new FakeProcessRunner();
         var probe = new FakeHealthProbe { Healthy = true, Ready = true };
         using var supervisor = Create(runner, probe);
@@ -161,7 +161,55 @@ public sealed class ServerSupervisorTests
 
         Assert.Equal(ServerState.RunningAttached, status.State);
         Assert.Empty(runner.Handles);
-        Assert.Contains("will not", status.Detail!, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, probe.ShutdownRequests);
+        Assert.Contains("--allow-model-admin", status.Detail!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Stop_OfAnAttachedServerThatAccepts_StopsItThroughTheAdminApi_WithoutKillingAnything()
+    {
+        var runner = new FakeProcessRunner();
+        var probe = new FakeHealthProbe { Healthy = true, Ready = true, ShutdownAccepted = true };
+        probe.OnShutdownAccepted = () => { probe.Healthy = false; probe.Ready = false; };   // the server goes down after the request
+        using var supervisor = Create(runner, probe);
+        await supervisor.StartAsync(CancellationToken.None);
+        Assert.Equal(ServerState.RunningAttached, supervisor.Status.State);
+
+        var status = await supervisor.StopAsync(CancellationToken.None);
+
+        Assert.Equal(ServerState.Stopped, status.State);
+        Assert.Equal(1, probe.ShutdownRequests);
+        Assert.Empty(runner.Handles);   // nothing of ours was spawned, so nothing could be killed
+    }
+
+    [Fact]
+    public async Task Stop_OfAnOwnedChild_IsGracefulWhenTheServerAcceptsAndExits()
+    {
+        var runner = new FakeProcessRunner();
+        var probe = new FakeHealthProbe { Healthy = false, BecomeHealthyAfter = 1, ShutdownAccepted = true };
+        using var supervisor = Create(runner, probe);
+        await supervisor.StartAsync(CancellationToken.None);
+        probe.OnShutdownAccepted = () => runner.Handles[0].SimulateExit(0);   // the server exits on its own after the request
+
+        var status = await supervisor.StopAsync(CancellationToken.None);
+
+        Assert.Equal(ServerState.Stopped, status.State);
+        Assert.Equal(1, probe.ShutdownRequests);
+        Assert.Equal(0, Assert.Single(runner.Handles).ExitCode);   // it exited by itself (exit code 0); a kill would have recorded 1
+    }
+
+    [Fact]
+    public async Task Stop_OfAnOwnedChild_FallsBackToAKillWhenItDoesNotExit()
+    {
+        var runner = new FakeProcessRunner();
+        var probe = new FakeHealthProbe { Healthy = false, BecomeHealthyAfter = 1, ShutdownAccepted = false };   // an older server: no such route
+        using var supervisor = Create(runner, probe);
+        await supervisor.StartAsync(CancellationToken.None);
+
+        var status = await supervisor.StopAsync(CancellationToken.None);
+
+        Assert.Equal(ServerState.Stopped, status.State);
+        Assert.True(Assert.Single(runner.Handles).WasKilled);
     }
 
     [Fact]
@@ -271,7 +319,7 @@ public sealed class ServerSupervisorTests
     }
 
     [Fact]
-    public async Task Restart_OfAnAttachedServer_ChangesNothing()
+    public async Task Restart_OfAnAttachedServerThatRefuses_ChangesNothing()
     {
         var runner = new FakeProcessRunner();
         var probe = new FakeHealthProbe { Healthy = true };

@@ -344,6 +344,14 @@ ollama's 404 error shape.
 a request with `tools` gets a `501`). Digests in `tags`/`ps` are stable placeholders, and `details` carries format and quantisation only (no family or
 parameter size).
 
+## Device selection: `--device auto` (#722)
+
+`dotllm serve` defaults to `--device auto`: for each model it tries **CUDA** (when a GPU is present and the model file fits in 85% of its memory),
+then **Vulkan** (when a device and the shader blobs exist), then the **CPU**, and a load that fails on one device falls through to the next with a log
+line. The server keeps `auto` as its configured device, so each on-demand load chooses again for its own size; the device actually used is
+`ResolvedDevice` (what `GET /api/ps` reports as `size_vram`). Pass `cpu`, `gpu:N` or `vulkan` to force one. `dotllm stop --server` and
+`POST /v1/admin/shutdown` stop a running server gracefully (`--allow-model-admin`).
+
 ## Model Keep-Alive / Idle-Unload / Multi-Model Residency (#369)
 
 Ollama-parity daemon lifecycle: idle models unload automatically, and — when configured — more than
