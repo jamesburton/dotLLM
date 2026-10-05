@@ -27,6 +27,7 @@ public static class EndpointExtensions
         ModelManagementEndpoint.Map(app);
         ModelInspectEndpoint.Map(app);
         EmbeddingsEndpoint.Map(app);
+        SystemOneEndpoint.Map(app);
         LoraEndpoints.Map(app);
         SettingsEndpoint.Map(app);
         DeviceEndpoint.Map(app);

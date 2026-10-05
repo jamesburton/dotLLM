@@ -32,6 +32,7 @@ public sealed class MeteredPathPolicyTests
     /// </summary>
     [Theory]
     [InlineData("/v1/chat/completions")]
+    [InlineData("/v1/systemone")]
     [InlineData("/v1/completions")]
     [InlineData("/v1/embeddings")]
     [InlineData("/v1/messages")]
@@ -93,6 +94,7 @@ public sealed class MeteredPathPolicyTests
             "/v1/completions",
             "/v1/embeddings",
             "/v1/messages",
+            "/v1/systemone",
         ];
 
         foreach (var path in registered)

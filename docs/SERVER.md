@@ -190,6 +190,40 @@ committed with full provenance) and compared by cosine similarity in
 `EmbeddingLlamaCppParityTests`. See that test's remarks for the measured correct-vs-broken
 separation the tolerance is derived from.
 
+### `POST /v1/systemone` (Jev-compatible decisions, fork-only - #708)
+
+A decision endpoint with the **wire shape of TypeSafe's Jev System One API**, so Jev SDKs, the OpenJev servers and the Microsoft Agent Framework
+`Microsoft.Agents.AI.TypeSafe` provider (`TypeSafeDecisionClientOptions.Endpoint = http://host:port/v1/systemone`) can point at a dotLLM server.
+
+**Background.** Jev (TypeSafe AI) is a non-autoregressive "System One" model: a state plus typed questions in, typed answers with probabilities out, in one
+forward pass. Together AI's Tev1 only imitates the *contract* (`{state, question, options[label,key,description]}` -> one letter) on an ordinary language-model
+head. dotLLM answers every question with ONE prefill and **no decode loop**: the question is rendered as the Tev1 contract (system prompt, thinking block
+closed), and the logits of the option letters at the first generated position are renormalised into per-option probabilities.
+
+```json
+POST /v1/systemone
+{"model":"jev-latest",
+ "state":"Returns are allowed within 30 days. Purchase was 12 days ago.",
+ "questions":{
+   "in_window":{"type":"noul","instructions":"Is the return within the window?"},
+   "route":{"type":"choice","instructions":"Which action?","criteria":{"approve":"Approve","deny":"Deny","escalate":"Escalate"}},
+   "urgency":{"type":"score","instructions":"How urgent?","criteria":["not urgent","low","medium","high"]}}}
+```
+
+| question `type` | `criteria` | answer fields |
+|---|---|---|
+| `noul` | optional `{"true": "...", "false": "..."}` | `noul` = P(true) |
+| `choice` | `{name: description}` (2..52) | `choice` (argmax name), `probabilities` (by name), `confidence` = `1 - H(p)/ln K` |
+| `score` | array of 2..10 level descriptions | `score` = probability-weighted level index in `[0, n-1]`, `probabilities` keyed `"0".."n-1"`, `confidence`, `legend` |
+
+The response is `{model, answers{id:{type, ...}}, usage{input_tokens, output_tokens:0}}`. Validation failures return `422` with the standard error envelope.
+
+Notes: `state` may be a string or any JSON value (embedded verbatim). `model` is informational (the loaded model answers). Questions run sequentially in request
+order and the state is the prompt prefix, so the prefix caches reuse it across questions; concurrent requests are batched when the scheduler is on
+(`--expected-concurrency`). Works on every backend with any instruction-tuned model; **Tev1-4B is the model the prompt contract was trained for**
+(~65 ms per question on Strix Halo Vulkan). Probabilities are the model's own restricted softmax, **not calibrated** like Jev's, and `score` is an
+expected level index, not a Jev-trained ordinal head. Option-label tokens must be single tokens in the tokenizer (A-Z, a-z).
+
 ### `GET /v1/models`
 Lists every **resident** model — the active one plus any stashed-but-loaded models (#369):
 ```json
