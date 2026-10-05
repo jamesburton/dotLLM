@@ -142,6 +142,21 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [DefaultValue(0)]
         public int ExpectedConcurrency { get; set; }
 
+        /// <summary>Logit temperature for POST /v1/systemone probabilities.</summary>
+        [CommandOption("--decision-temperature")]
+        [Description("Logit temperature for POST /v1/systemone probabilities (softmax(logits / T)). 0 or 1 (default) = the model's raw restricted softmax. " +
+                     "Tev1-4B is slightly under-confident: T=0.58 cut held-out NLL 0.0546 -> 0.0428 on a 480-item labelled set (scripts/decision-calibration.py); " +
+                     "fit your own on your task before relying on it.")]
+        [DefaultValue(0.0)]
+        public double DecisionTemperature { get; set; }
+
+        /// <summary>Option orderings averaged per noul/choice question on POST /v1/systemone.</summary>
+        [CommandOption("--decision-orderings")]
+        [Description("Option orderings averaged per noul/choice question on POST /v1/systemone: 1 (default) or 2 (forward + reversed, logits averaged; " +
+                     "reversal flipped 2.2% of Tev1-4B choice answers and averaging lifted choice accuracy 98.2 -> 98.9%, at twice the forward passes).")]
+        [DefaultValue(1)]
+        public int DecisionOrderings { get; set; }
+
         /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
         [CommandOption("--prefill-chunk-size|--ubatch-size")]
         [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default). With the continuous-batch scheduler this caps prefill tokens admitted per step instead.")]
@@ -259,6 +274,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         {
             Model = settings.Model ?? "",
             ExpectedConcurrency = settings.ExpectedConcurrency,
+            DecisionTemperature = settings.DecisionTemperature,
+            DecisionOrderings = Math.Clamp(settings.DecisionOrderings, 1, 2),
             Quant = settings.Quant,
             Device = settings.Device,
             GpuLayers = settings.GpuLayers,

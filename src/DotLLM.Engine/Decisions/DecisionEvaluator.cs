@@ -55,6 +55,20 @@ public sealed class DecisionEvaluator
     private readonly DecisionPromptRunner _run;
     private readonly int[] _labelTokens;
 
+    /// <summary>
+    /// Logit temperature: probabilities are <c>softmax(logits / T)</c>. 1 (default) is the model's raw restricted softmax. On Tev1-4B a T of
+    /// 0.58 fitted on half of a 480-item labelled set cut held-out NLL 0.0546 -> 0.0428 and ECE 0.027 -> 0.010 (the model is slightly
+    /// under-confident); it is a fit to that set, so it is opt-in. See <c>scripts/decision-calibration.py</c>.
+    /// </summary>
+    public double Temperature { get; init; } = 1.0;
+
+    /// <summary>
+    /// Option orderings averaged per question: 1 (default) or 2 (forward + reversed, logits averaged per option). Reversing flipped 2.2% of
+    /// choice answers on Tev1-4B and averaging lifted choice accuracy 98.2 -> 98.9% at twice the forward passes. Applies to noul and choice
+    /// questions only; score levels are ordinal, so reversing them would change their meaning.
+    /// </summary>
+    public int Orderings { get; init; } = 1;
+
     /// <summary>Creates an evaluator. Throws when a label does not encode to exactly one token in this tokenizer.</summary>
     public DecisionEvaluator(ITokenizer tokenizer, IChatTemplate template, DecisionPromptRunner run)
     {
@@ -134,8 +148,33 @@ public sealed class DecisionEvaluator
         return prompt.EndsWith(open, StringComparison.Ordinal) ? prompt + "\n</think>\n\n" : prompt;
     }
 
-    /// <summary>Runs one forward pass and returns the distribution over <paramref name="options"/>.</summary>
+    /// <summary>
+    /// Returns the distribution over <paramref name="options"/>: one forward pass, or two (forward + reversed option order) when
+    /// <see cref="Orderings"/> is 2 and <paramref name="orderable"/> is true.
+    /// </summary>
     public async Task<OptionDistribution> ScoreAsync(
+        JsonElement? state, string question, IReadOnlyList<DecisionOption> options, CancellationToken ct, bool orderable = false)
+    {
+        var (logits, tokens) = await ForwardLogitsAsync(state, question, options, ct).ConfigureAwait(false);
+        if (Orderings >= 2 && orderable)
+        {
+            // Same options, reversed presentation: relabel A.. in the new order, keep each option's key/description.
+            int n = options.Count;
+            var reversed = new DecisionOption[n];
+            for (int i = 0; i < n; i++)
+                reversed[i] = options[n - 1 - i] with { Label = Labels[i].ToString() };
+            var (rl, rt) = await ForwardLogitsAsync(state, question, reversed, ct).ConfigureAwait(false);
+            for (int i = 0; i < n; i++)
+                logits[i] = (logits[i] + rl[n - 1 - i]) * 0.5f;
+            tokens += rt;
+        }
+
+        if (Temperature != 1.0)
+            for (int i = 0; i < logits.Length; i++) logits[i] = (float)(logits[i] / Temperature);
+        return new OptionDistribution(DecisionMath.Softmax(logits), tokens);
+    }
+
+    private async Task<(float[] Logits, int PromptTokens)> ForwardLogitsAsync(
         JsonElement? state, string question, IReadOnlyList<DecisionOption> options, CancellationToken ct)
     {
         if (options.Count < 2) throw new ArgumentException("A decision question needs at least two options.", nameof(options));
@@ -157,7 +196,7 @@ public sealed class DecisionEvaluator
 
         float[] logits = capture.Captured
             ?? throw new InvalidOperationException("The decision forward pass produced no logits (the host path did not run the logit processor).");
-        return new OptionDistribution(DecisionMath.Softmax(logits), response.PromptTokenCount);
+        return (logits, response.PromptTokenCount);
     }
 }
 

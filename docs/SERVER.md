@@ -224,6 +224,17 @@ order and the state is the prompt prefix, so the prefix caches reuse it across q
 (~65 ms per question on Strix Halo Vulkan). Probabilities are the model's own restricted softmax, **not calibrated** like Jev's, and `score` is an
 expected level index, not a Jev-trained ordinal head. Option-label tokens must be single tokens in the tokenizer (A-Z, a-z).
 
+**Calibration and option order (opt-in, #710).** Measured with `scripts/decision-calibration.py` on 480 programmatic labelled items (easy and
+deliberately hard multi-rule cases) against Tev1-4B Q4_K_M on Vulkan: raw accuracy 97.9%, NLL 0.0625, ECE 0.027, and the model is slightly *under*-confident.
+
+| setting | what it does | measured effect |
+|---|---|---|
+| `--decision-temperature T` | probabilities = softmax(logits / T); 0 or 1 = raw | T=0.58 fitted on half the set: held-out NLL 0.0546 -> 0.0428, ECE 0.0271 -> 0.0102 (the live server reproduces this exactly) |
+| `--decision-orderings 2` | each noul/choice question is also asked with the options reversed; per-option logits are averaged | reversal flips 2.2% of choice argmaxes; choice accuracy 98.2 -> 98.9%, overall NLL 0.0480 -> 0.0452 (with T=0.58), at 2x the forward passes; score questions are never reversed (ordinal) |
+
+Both default to off: the temperature is a fit to a synthetic set, not a guarantee for another task or model (fit yours with the script - it writes
+accuracy / NLL / ECE, the fitted T and the order-flip rate), and ordering averaging doubles the cost for a small gain.
+
 ### `GET /v1/models`
 Lists every **resident** model — the active one plus any stashed-but-loaded models (#369):
 ```json

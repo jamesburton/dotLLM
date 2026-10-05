@@ -58,7 +58,11 @@ public static class SystemOneEndpoint
         DecisionEvaluator evaluator;
         try
         {
-            evaluator = new DecisionEvaluator(state.Tokenizer, state.ChatTemplate, (prompt, options, token) => RunAsync(state, httpContext, prompt, options, token));
+            evaluator = new DecisionEvaluator(state.Tokenizer, state.ChatTemplate, (prompt, options, token) => RunAsync(state, httpContext, prompt, options, token))
+            {
+                Temperature = state.Options.DecisionTemperature > 0 ? state.Options.DecisionTemperature : 1.0,
+                Orderings = state.Options.DecisionOrderings,
+            };
         }
         catch (NotSupportedException ex)
         {
@@ -96,7 +100,7 @@ public static class SystemOneEndpoint
 
         foreach (var (id, type, instructions, options, keys) in plans)
         {
-            var dist = await evaluator.ScoreAsync(state, instructions, options, ct).ConfigureAwait(false);
+            var dist = await evaluator.ScoreAsync(state, instructions, options, ct, orderable: type != "score").ConfigureAwait(false);
             if (dist.PromptTokens > maxSequenceLength)
                 throw new SystemOneException(422, $"The prompt for question '{id}' is {dist.PromptTokens} tokens, over the model's context of {maxSequenceLength}.", "state");
             inputTokens += dist.PromptTokens;
