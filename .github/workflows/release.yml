@@ -145,6 +145,15 @@ jobs:
           if [ -d "publish/${{ matrix.rid }}/ptx" ]; then
             cp -r "publish/${{ matrix.rid }}/ptx" "$stage/"
           fi
+          # (#712) Vulkan SPIR-V blobs are loaded from spv/ beside the executable (VulkanModelLoader.ResolveSpvDir); without them the
+          # Vulkan backend cannot start from a release archive. The publish step emits them; fail the release if they did not ship.
+          if [ -d "publish/${{ matrix.rid }}/spv" ]; then
+            cp -r "publish/${{ matrix.rid }}/spv" "$stage/"
+          fi
+          if ! ls "$stage/spv/"*.spv >/dev/null 2>&1; then
+            echo "::error::release payload has no spv/*.spv - the Vulkan backend would be broken"
+            exit 1
+          fi
           cp README.md "$stage/"
           cp LICENSE "$stage/"
           ls -lh "$stage/"
