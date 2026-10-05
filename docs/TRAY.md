@@ -106,8 +106,17 @@ What would change it, in order:
 2. Publishing SHA-256 digests with the release assets, and verifying them before any swap.
 3. Only then an updater that stages beside the running exe and renames on next start.
 
+Step 2 now exists: every release carries `SHA256SUMS` and a build-provenance attestation
+([PACKAGING.md](PACKAGING.md)), which is the integrity story available without a certificate.
+
 The update check is also **opt-in** (`check_for_updates`, default `false`): the tray makes no
 request to GitHub until the user turns it on.
+
+**Which releases it reads (#724).** This fork's (`jamesburton/dotLLM`), not upstream's - upstream has been dark since
+2026-07-30 and holds none of the fork's builds. Override with `update_repo` in the settings file (`owner/repo`) or the
+`DOTLLM_UPDATE_REPO` environment variable (which wins); a malformed value falls back to the default rather than building a URL
+from it. A dev build (`0.3.0-dev.N`) is itself a prerelease, so it follows the dev channel automatically; a stable build
+ignores `-dev` releases unless `include_prereleases` is on.
 
 ## The three tiers of setting
 

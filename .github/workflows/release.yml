@@ -1,8 +1,22 @@
 name: Release
 
+# Two entry points, one pipeline:
+#   - a pushed tag `v*` (a deliberate stable/preview release), and
+#   - workflow_call from ci.yml, which publishes a `0.x.y-dev.<n>` prerelease for every green push to `dev`.
+# Dev tags are excluded from the tag trigger so a manually pushed dev tag cannot start a second, competing run.
 on:
   push:
-    tags: ['v*']
+    tags: ['v*', '!v*-dev.*']
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Tag to create/publish, e.g. v0.3.0-dev.2250'
+        type: string
+        required: true
+      skip-aot:
+        description: 'Skip the experimental Native AOT archives (dev builds do)'
+        type: boolean
+        default: false
 
 env:
   DOTNET_VERSION: '10.x'
@@ -11,20 +25,26 @@ env:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   version:
     name: Resolve version
     runs-on: ubuntu-latest
     outputs:
+      tag: ${{ steps.set.outputs.tag }}
       version: ${{ steps.set.outputs.version }}
       prerelease: ${{ steps.set.outputs.prerelease }}
     steps:
       - id: set
         shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          tag="${GITHUB_REF#refs/tags/}"
+          tag="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
           version="${tag#v}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           if [[ "$version" == *-* ]]; then
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
@@ -53,7 +73,8 @@ jobs:
         run: dotnet restore
 
       - name: Pack
-        run: dotnet pack -c Release --no-restore -o artifacts/nuget
+        # DOTLLM_TOOL_PACKAGE_ID (repo variable) renames the dotnet-tool package - upstream owns the DotLLM.* ids on nuget.org (docs/PACKAGING.md).
+        run: dotnet pack -c Release --no-restore -o artifacts/nuget -p:MinVerVersionOverride=${{ needs.version.outputs.version }} -p:DotLlmToolPackageId=${{ vars.DOTLLM_TOOL_PACKAGE_ID }}
 
       - name: List packages
         run: ls -lh artifacts/nuget/
@@ -111,6 +132,7 @@ jobs:
             -p:EnableCompressionInSingleFile=true \
             -p:DebugType=none \
             -p:DebugSymbols=false \
+            -p:MinVerVersionOverride=${{ needs.version.outputs.version }} \
             -o publish/${{ matrix.rid }}
 
       # (#455) The Windows system tray. Self-contained single-file, matching the CLI above, and
@@ -130,6 +152,7 @@ jobs:
             -p:EnableCompressionInSingleFile=true \
             -p:DebugType=none \
             -p:DebugSymbols=false \
+            -p:MinVerVersionOverride=${{ needs.version.outputs.version }} \
             -o publish-tray/win-x64
 
       - name: Stage release payload
@@ -189,6 +212,7 @@ jobs:
   publish-aot:
     name: Publish AOT (${{ matrix.rid }}, experimental)
     needs: version
+    if: ${{ !inputs.skip-aot }}
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -227,6 +251,7 @@ jobs:
             -c Release \
             -r ${{ matrix.rid }} \
             -p:PublishAot=true \
+            -p:MinVerVersionOverride=${{ needs.version.outputs.version }} \
             -o publish-aot/${{ matrix.rid }}
 
       - name: Stage release payload
@@ -272,7 +297,7 @@ jobs:
           if-no-files-found: error
 
   push-nuget:
-    name: Push to NuGet.org
+    name: Push dotnet tool to NuGet.org
     needs: [version, pack-nuget, publish-single-file]
     runs-on: ubuntu-latest
     steps:
@@ -285,23 +310,42 @@ jobs:
           name: nuget-packages
           path: artifacts/nuget
 
-      - name: Push packages
+      # The fork cannot push the upstream-owned DotLLM.* ids, so nothing is published until the repo variable
+      # DOTLLM_TOOL_PACKAGE_ID names a package id this account owns (docs/PACKAGING.md lists the options).
+      # Only that one package ships - it is what `dnx <id>` / `dotnet tool install -g <id>` runs.
+      - name: Push tool package
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          TOOL_ID: ${{ vars.DOTLLM_TOOL_PACKAGE_ID }}
         run: |
-          if [ -z "$NUGET_API_KEY" ]; then
-            echo "::warning::NUGET_API_KEY secret is not set — skipping NuGet.org push. Add the secret in repo Settings to enable publishing."
+          if [ -z "$TOOL_ID" ]; then
+            echo "::notice::DOTLLM_TOOL_PACKAGE_ID is not set - skipping the NuGet push (see docs/PACKAGING.md)."
             exit 0
           fi
-          dotnet nuget push "artifacts/nuget/*.nupkg" \
-            --api-key "$NUGET_API_KEY" \
-            --source https://api.nuget.org/v3/index.json \
-            --skip-duplicate
+          if [ -z "$NUGET_API_KEY" ]; then
+            echo "::warning::NUGET_API_KEY secret is not set - skipping the NuGet push of $TOOL_ID."
+            exit 0
+          fi
+          shopt -s nullglob
+          pkgs=(artifacts/nuget/"$TOOL_ID".*.nupkg)
+          if [ "${#pkgs[@]}" -eq 0 ]; then
+            echo "::error::no $TOOL_ID.*.nupkg was packed"
+            exit 1
+          fi
+          for p in "${pkgs[@]}"; do
+            dotnet nuget push "$p" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+          done
 
   create-release:
     name: Create GitHub Release
     needs: [version, pack-nuget, publish-single-file, publish-aot]
+    # AOT is optional (experimental, and skipped for dev builds); everything else must have succeeded.
+    if: ${{ !cancelled() && needs.pack-nuget.result == 'success' && needs.publish-single-file.result == 'success' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
@@ -316,29 +360,50 @@ jobs:
           find downloaded -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.nupkg' -o -name '*.snupkg' \) -exec cp {} release-assets/ \;
           ls -lh release-assets/
 
-      - name: Compose release notes preamble
+      # Integrity for anything downloaded from this release: a checksum file, and a signed build-provenance attestation that ties
+      # each asset to this repository, workflow and commit (verify with `gh attestation verify <file> --repo <owner>/<repo>`).
+      # That is the trust signal available without an Authenticode certificate - see docs/PACKAGING.md.
+      - name: Checksums
         shell: bash
         run: |
+          cd release-assets
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release-assets/*
+
+      - name: Compose release notes preamble
+        shell: bash
+        env:
+          TOOL_ID: ${{ vars.DOTLLM_TOOL_PACKAGE_ID }}
+        run: |
           version="${{ needs.version.outputs.version }}"
-          cat > release-notes-preamble.md <<EOF
-          **dotLLM $version** — high-performance LLM inference engine for .NET.
-
-          - Website: https://dotllm.dev/
-          - Install as a global tool: \`dotnet tool install -g DotLLM.Cli --version $version\`
-          - Or add a library reference: \`dotnet add package DotLLM.Engine --version $version\`
-
-          Download the self-contained archive for your platform below, unpack it, and run \`dotllm run QuantFactory/SmolLM-135M-GGUF -p "Hello" -n 64\`. No .NET runtime required.
-
-          Experimental Native AOT builds (Linux / Windows) are also attached — smaller binaries and faster startup, but please report any crashes.
-
-          ---
-          EOF
+          repo="${{ github.repository }}"
+          {
+            echo "**dotLLM $version** (\`$repo\`, commit \`${GITHUB_SHA::9}\`) - high-performance LLM inference engine for .NET."
+            echo
+            echo "Download the self-contained archive for your platform below, unpack it, and run \`dotllm run QuantFactory/SmolLM-135M-GGUF -p \"Hello\" -n 64\`. No .NET runtime required. The Windows archive also holds \`dotllm-tray.exe\`."
+            echo
+            echo "**Verify a download** (these builds are not Authenticode-signed): compare against \`SHA256SUMS\`, or check the provenance attestation: \`gh attestation verify <file> --repo $repo\`"
+            echo
+            echo "Experimental Native AOT builds (Linux / Windows) are attached to tagged releases only."
+            if [ -n "$TOOL_ID" ]; then
+              echo
+              echo "Run without installing: \`dnx $TOOL_ID --version $version\` - or install as a tool: \`dotnet tool install -g $TOOL_ID --version $version\`"
+            fi
+            echo
+            echo "---"
+          } > release-notes-preamble.md
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           name: dotLLM ${{ needs.version.outputs.version }}
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
           generate_release_notes: true
           body_path: release-notes-preamble.md

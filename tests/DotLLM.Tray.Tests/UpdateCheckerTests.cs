@@ -201,6 +201,32 @@ public sealed class UpdateCheckerTests
     }
 
     [Fact]
+    public void DefaultFeed_IsThisFork_NeverDarkUpstream()
+    {
+        Assert.DoesNotContain("kkokosa", UpdateChecker.DefaultReleasesUrl, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("https://api.github.com/repos/jamesburton/dotLLM/releases", UpdateChecker.ReleasesUrlFor(null, _ => null));
+    }
+
+    [Theory]
+    [InlineData("someone/fork", null, "https://api.github.com/repos/someone/fork/releases")]
+    [InlineData("someone/fork", "env/wins", "https://api.github.com/repos/env/wins/releases")]
+    [InlineData("not a repo", null, "https://api.github.com/repos/jamesburton/dotLLM/releases")]
+    [InlineData("a/b/c", null, "https://api.github.com/repos/jamesburton/dotLLM/releases")]
+    [InlineData("../../x", null, "https://api.github.com/repos/jamesburton/dotLLM/releases")]
+    [InlineData("", "bad value", "https://api.github.com/repos/jamesburton/dotLLM/releases")]
+    public void ReleasesUrlFor_PrefersEnvironment_ThenSetting_AndRejectsMalformedRepos(string setting, string? env, string expected) =>
+        Assert.Equal(expected, UpdateChecker.ReleasesUrlFor(setting, _ => env));
+
+    [Fact]
+    public void ForkDevBuilds_OrderByCommitCount_AndBeatUpstreamAlphas()
+    {
+        // 0.3.0-dev.<n> is what the dev channel publishes: numeric n compares numerically (9999 < 12000), and it outranks upstream's 0.2.0-alpha tags.
+        Assert.True(ReleaseVersion.Parse("0.3.0-dev.9999")!.CompareTo(ReleaseVersion.Parse("0.3.0-dev.12000")) < 0);
+        Assert.True(ReleaseVersion.Parse("0.3.0-dev.1")!.CompareTo(ReleaseVersion.Parse("0.2.0-alpha.3")) > 0);
+        Assert.True(ReleaseVersion.Parse("0.3.0-dev.12000+abc1234")!.CompareTo(ReleaseVersion.Parse("0.3.0")) < 0);
+    }
+
+    [Fact]
     public void CurrentVersion_ReadsTheInformationalVersion()
     {
         // MinVer stamps AssemblyInformationalVersion; the assembly version is truncated to

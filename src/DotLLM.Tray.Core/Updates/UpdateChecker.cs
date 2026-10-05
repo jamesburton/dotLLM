@@ -74,8 +74,40 @@ public sealed class UpdateChecker
     private readonly HttpClient _http;
     private readonly string _releasesUrl;
 
-    /// <summary>The default releases endpoint for the dotLLM repository.</summary>
-    public const string DefaultReleasesUrl = "https://api.github.com/repos/kkokosa/dotLLM/releases";
+    /// <summary>
+    /// The repository the tray checks by default (<c>owner/repo</c>): this fork, which publishes the builds the tray ships with.
+    /// Upstream (kkokosa/dotLLM) has been dark since 2026-07-30 and carries none of the fork's features, so checking it would
+    /// compare a fork build against releases it can never receive. Override with <see cref="Config.TraySettings.UpdateRepo"/>
+    /// or the <c>DOTLLM_UPDATE_REPO</c> environment variable.
+    /// </summary>
+    public const string DefaultRepository = "jamesburton/dotLLM";
+
+    /// <summary>The default releases endpoint (<see cref="DefaultRepository"/>).</summary>
+    public const string DefaultReleasesUrl = "https://api.github.com/repos/" + DefaultRepository + "/releases";
+
+    /// <summary>Environment variable that overrides the repository checked (<c>owner/repo</c>).</summary>
+    public const string RepositoryEnvironmentVariable = "DOTLLM_UPDATE_REPO";
+
+    /// <summary>
+    /// The releases endpoint for <paramref name="repository"/> (<c>owner/repo</c>), after the environment override. A blank or
+    /// malformed value falls back to <see cref="DefaultRepository"/> rather than building a URL from arbitrary text.
+    /// </summary>
+    /// <param name="repository">The configured repository, or null for the default.</param>
+    /// <param name="environment">Environment lookup (injectable for tests); defaults to the process environment.</param>
+    public static string ReleasesUrlFor(string? repository, Func<string, string?>? environment = null)
+    {
+        string? chosen = (environment ?? Environment.GetEnvironmentVariable)(RepositoryEnvironmentVariable);
+        if (!IsRepository(chosen)) chosen = repository;
+        if (!IsRepository(chosen)) chosen = DefaultRepository;
+        return $"https://api.github.com/repos/{chosen!.Trim()}/releases";
+    }
+
+    private static bool IsRepository(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return false;
+        string[] parts = value.Trim().Split('/');
+        return parts.Length == 2 && parts.All(p => p.Length > 0 && p.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.'));
+    }
 
     /// <summary>Creates a checker.</summary>
     /// <param name="http">Transport. GitHub requires a User-Agent; the caller sets it.</param>
