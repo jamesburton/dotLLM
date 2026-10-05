@@ -184,4 +184,67 @@ public sealed class VulkanMoeGroupedIndirectTests
         for (int i = 0; i < results[0].Length; i++)
             Assert.True(results[0][i] == results[1][i], $"{quant} idx {i} (row {i / m}, col {i % m}) counts={countsCsv}: m16 {results[0][i]:G9} != m64 {results[1][i]:G9}");
     }
+
+    /// <summary>
+    /// #691 row-pair shaders: one workgroup covers 32 token rows (two 16-row tiles) and dequantises the weights once for both. The dequant
+    /// and MMA arithmetic per output element is unchanged, so with a 32-row tile list the result must EQUAL the single-subgroup 16-row
+    /// shader's exactly, incl. experts of 0, 1, 15, 16, 17, 31, 32, 33 and 64 rows (half-empty second tile, ragged tail).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(MoeGroupedKQuant.Q4_K, 128, 1024, "0,3,0,17,40,16,15,1,33,31,32,64")]
+    [InlineData(MoeGroupedKQuant.Q5_K, 128, 768, "0,16,15,17,1,33,0,2,32,31")]
+    [InlineData(MoeGroupedKQuant.Q6_K, 192, 512, "0,16,15,17,1,0,9,48,65")]
+    [InlineData(MoeGroupedKQuant.Q4_K, 100, 256, "5,0,1,40")]       // m not a multiple of 64: invalid-row path
+    public void RowPair_EqualsSingleSubgroupShader(MoeGroupedKQuant quant, int m, int k, string countsCsv)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, quant) && MoeBuildTileListKernel.IsSupportedOn(spvDir), "coopmat or SPIR-V unavailable.");
+        using var pairKernel = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, quant, 64, rowPair: true);
+        Skip.If(pairKernel.RowTile != 32, "row-pair shader not available on this device.");
+
+        int[] counts = Array.ConvertAll(countsCsv.Split(','), int.Parse);
+        int E = counts.Length, rows = counts.Sum();
+        uint[] offsets = OffsetsOf(counts);
+        var rng = new Random(0x693 + m * 31 + k + rows);
+        byte[] bank = Enumerable.Range(0, E).SelectMany(_ =>
+        {
+            float[] w = Q4KFixture.RandomFloats(rng, m * k, 0.5f);
+            return quant switch
+            {
+                MoeGroupedKQuant.Q4_K => Q4KFixture.QuantizeRows(w, m, k),
+                MoeGroupedKQuant.Q5_K => Q5KFixture.QuantizeRows(w, m, k),
+                _ => Q6KFixture.QuantizeRows(w, m, k),
+            };
+        }).ToArray();
+        float[] x = Q4KFixture.RandomFloats(rng, rows * k, 1f);
+
+        using var refKernel = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, quant, 16);
+        using var build = MoeBuildTileListKernel.Create(device, spvDir);
+        using var bufW = device.Allocate(bank.Length);
+        using var bufX = device.Allocate((long)rows * k * sizeof(float));
+        using var bufOff = device.Allocate(MoeBuildTileListKernel.OffsetsBufferUints(E, rows) * sizeof(uint));
+        using var bufArgs = device.Allocate(2 * MoeBuildTileListKernel.ArgsStrideBytes);
+        using var yRef = device.Allocate((long)rows * m * sizeof(float));
+        using var yPair = device.Allocate((long)rows * m * sizeof(float));
+        device.Upload(bank, bufW);
+        device.Upload(x, bufX);
+        device.Upload(MemoryMarshal.AsBytes<uint>(offsets), bufOff);
+
+        refKernel.Launch(bufW, bufX, bufOff, yRef, m, k, rows, E, maxRowsPerExpert: counts.Max());
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            build.Record(ctx.CommandBuffer, bufOff, bufArgs, E, pairKernel.MTiles(m), pairKernel.MTiles(m), pairKernel.RowTile);
+            KernelSupport.ComputeToIndirectAndComputeBarrier(ctx.CommandBuffer);
+            pairKernel.RecordIndirect(ctx.CommandBuffer, bufW, bufX, bufOff, yPair, bufArgs, 0, m, k, rows, E);
+            ctx.SubmitAndWait();
+        }
+
+        float[] a = new float[(long)rows * m], b = new float[(long)rows * m];
+        device.Download(yRef, a);
+        device.Download(yPair, b);
+        for (int i = 0; i < a.Length; i++)
+            Assert.True(a[i] == b[i], $"{quant} idx {i} (row {i / m}, col {i % m}) counts={countsCsv}: m16 {a[i]:G9} != row-pair {b[i]:G9}");
+    }
 }

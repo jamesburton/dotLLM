@@ -456,10 +456,30 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             }
             kernels.MoeExpandGroupByExpert = MoeExpandGroupByExpertF32Kernel.Create(device, spvDir);
             kernels.MoeUngroupScatter = MoeUngroupScatterF32Kernel.Create(device, spvDir);
-            kernels.MoeGroupedQ4K = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K);
-            kernels.MoeGroupedQ5K = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q5_K);
-            if (MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q6_K))
-                kernels.MoeGroupedQ6K = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q6_K);
+            // Row-pair shaders (issue #691): one workgroup covers 32 token rows of an expert and dequantises each weight super-block once
+            // for both 16-row tiles. They need the indirect tile list (built with 32-row tiles) and ONE tile list serves gate/up (Q4_K) and
+            // down (Q5_K/Q6_K), so it is all-or-nothing. DOTLLM_VK_MOE_ROWPAIR=0 opts out.
+            bool rowPair = kernels.MoeBuildTileList is not null
+                && Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_ROWPAIR") != "0"
+                && File.Exists(Path.Combine(spvDir, "moe_grouped_matmul_q4_k_coopmat_m64r2.spv"))
+                && File.Exists(Path.Combine(spvDir, "moe_grouped_matmul_q5_k_coopmat_m64r2.spv"))
+                && File.Exists(Path.Combine(spvDir, "moe_grouped_matmul_q6_k_coopmat_m64r2.spv"));
+            var q4 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K, rowPair: rowPair);
+            var q5 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q5_K, rowPair: rowPair);
+            MoeGroupedMatmulKQuantCoopmatKernel? q6 = MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q6_K)
+                ? MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q6_K, rowPair: rowPair) : null;
+            if (rowPair && (q4.RowTile != q5.RowTile || (q6 is not null && q6.RowTile != q4.RowTile)))
+            {
+                // A kernel fell back to the 16-row shader (e.g. wave32): rebuild everything on the 16-row form so one tile list fits all.
+                q4.Dispose(); q5.Dispose(); q6?.Dispose();
+                q4 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K);
+                q5 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q5_K);
+                q6 = MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q6_K)
+                    ? MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q6_K) : null;
+            }
+            kernels.MoeGroupedQ4K = q4;
+            kernels.MoeGroupedQ5K = q5;
+            kernels.MoeGroupedQ6K = q6;
         }
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_DEINTERLEAVE") != "0")
         {
