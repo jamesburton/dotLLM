@@ -30,6 +30,8 @@ namespace DotLLM.Server;
 [JsonSerializable(typeof(ModelInspectResponse))]
 [JsonSerializable(typeof(EmbeddingRequest))]
 [JsonSerializable(typeof(EmbeddingResponse))]
+[JsonSerializable(typeof(SystemOneRequest))]
+[JsonSerializable(typeof(SystemOneResponse))]
 [JsonSerializable(typeof(float[]))]
 [JsonSerializable(typeof(string))]
 [JsonSerializable(typeof(ErrorResponse))]
