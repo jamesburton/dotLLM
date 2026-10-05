@@ -63,16 +63,44 @@ void main() {
     for (uint i = 0u; i < uint(ROWS_PER); i++)
         s[i] = st[stateBase + (row0 + i) * dState + col];
 
-    for (int t = 0; t < pc.seq_len; t++) {
-        uint qkBase = uint(t) * qkPerToken + kh * dState;
-        uint vBase  = uint(t) * vPerToken + vh * dState;
-        uint gbIdx  = uint(t) * kvScale + vh;
-        float gVh    = g_buf[gbIdx];
-        float betaVh = beta_buf[gbIdx];
+    // Software prefetch (issue #697): this step's g / beta / k / q / v are independent of the recurrence, so step t + 1's loads are issued at the
+    // top of step t and consumed one step later. The per-token cost was dominated by the exposed global-load latency in front of two
+    // dependent 32-term chains (2.3 us per token per layer = ~1.4 TFLOPS); data movement only, the arithmetic is unchanged.
+    float gCur = 0.0, betaCur = 0.0, vCur = 0.0;
+    float kCur0 = 0.0, kCur1 = 0.0, qCur0 = 0.0, qCur1 = 0.0;
+    if (pc.seq_len > 0) {
+        uint gb0 = vh;
+        gCur = g_buf[gb0];
+        betaCur = beta_buf[gb0];
+        uint qk0 = kh * dState;
+        kCur0 = k_buf[qk0 + tid];
+        qCur0 = q_buf[qk0 + tid];
+        kCur1 = k_buf[qk0 + tid + 64u];
+        qCur1 = q_buf[qk0 + tid + 64u];
+        vCur = v_buf[vh * dState + col];
+    }
 
-        for (uint i = tid; i < dState; i += 64u) {
-            k_shared[i] = k_buf[qkBase + i];
-            q_shared[i] = q_buf[qkBase + i];
+    for (int t = 0; t < pc.seq_len; t++) {
+        uint vBase  = uint(t) * vPerToken + vh * dState;
+        float gVh    = gCur;
+        float betaVh = betaCur;
+        float vNow   = vCur;
+        k_shared[tid] = kCur0;
+        q_shared[tid] = qCur0;
+        k_shared[tid + 64u] = kCur1;
+        q_shared[tid + 64u] = qCur1;
+
+        if (t + 1 < pc.seq_len) {
+            uint tn = uint(t + 1);
+            uint gbn = tn * kvScale + vh;
+            gCur = g_buf[gbn];
+            betaCur = beta_buf[gbn];
+            uint qkn = tn * qkPerToken + kh * dState;
+            kCur0 = k_buf[qkn + tid];
+            qCur0 = q_buf[qkn + tid];
+            kCur1 = k_buf[qkn + tid + 64u];
+            qCur1 = q_buf[qkn + tid + 64u];
+            vCur = v_buf[tn * vPerToken + vh * dState + col];
         }
         barrier();
 
@@ -90,7 +118,7 @@ void main() {
         retr = retr + partRetr[2u * uint(COLS) + c];
         retr = retr + partRetr[3u * uint(COLS) + c];
 
-        precise float diff = v_buf[vBase + col] - retr;
+        precise float diff = vNow - retr;
         precise float delta = betaVh * diff;
 
         // rank-1 update + partial read-out
