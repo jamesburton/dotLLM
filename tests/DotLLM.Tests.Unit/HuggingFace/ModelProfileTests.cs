@@ -23,7 +23,7 @@ public sealed class ModelProfileTests : IDisposable
     [Theory]
     [InlineData("coder", "coder")]
     [InlineData("coder:latest", "coder")]
-    [InlineData("Coder:7b", "Coder:7b")]
+    [InlineData("Coder:7b", "coder:7b")]
     [InlineData("my-model_1.5", "my-model_1.5")]
     [InlineData("a/b", null)]
     [InlineData("a\\b", null)]
@@ -46,7 +46,7 @@ public sealed class ModelProfileTests : IDisposable
         Assert.Equal(0.2f, p.Temperature);
         Assert.Equal(["###"], p.Stop!);
         Assert.Equal(-1, p.KeepAlive);
-        Assert.Equal(["Coder:7b", "helper"], ModelProfileStore.List().Select(x => x.Name));
+        Assert.Equal(["coder:7b", "helper"], ModelProfileStore.List().Select(x => x.Name));   // canonical lower-case names
         Assert.NotNull(ModelProfileStore.TryGet("helper:latest"));
 
         Assert.True(ModelProfileStore.Delete("HELPER"));

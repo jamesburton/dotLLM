@@ -60,7 +60,7 @@ public sealed record ModelProfile
 [JsonSerializable(typeof(ModelProfile))]
 internal partial class ModelProfileJsonContext : JsonSerializerContext;
 
-/// <summary>Reads and writes <see cref="ModelProfile"/> files. Names are case-insensitive; <c>name:latest</c> is the same as <c>name</c>.</summary>
+/// <summary>Reads and writes <see cref="ModelProfile"/> files. Names are case-insensitive (stored lower-case); <c>name:latest</c> is the same as <c>name</c>.</summary>
 public static class ModelProfileStore
 {
     /// <summary>Profiles directory: <c>DOTLLM_PROFILES_DIR</c>, else <c>~/.dotllm/profiles</c>.</summary>
@@ -85,7 +85,8 @@ public static class ModelProfileStore
         foreach (char c in n)
             if (!(char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or '-' or ':')) return null;
         if (n.Count(c => c == ':') > 1 || n[0] is '.' or ':' or '-' || n[^1] is '.' or ':') return null;
-        return n;
+        // Canonical form is lower-case: names are case-insensitive, and a file name must be too on case-sensitive file systems.
+        return n.ToLowerInvariant();
     }
 
     private static string FilePath(string name, string? dir) =>
