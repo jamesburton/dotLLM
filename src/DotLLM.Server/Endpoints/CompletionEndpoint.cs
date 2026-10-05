@@ -96,7 +96,7 @@ public static class CompletionEndpoint
         }
 
         // Validate prompt length against model context
-        int maxTokens = request.MaxTokens ?? state.SamplingDefaults.MaxTokens;
+        int maxTokens = request.MaxTokens ?? state.EffectiveSamplingDefaults.MaxTokens;
         var promptError = RequestValidator.ValidatePromptLength(
             request.Prompt, state.Tokenizer!, state.Config!.MaxSequenceLength,
             maxTokens, out int effectiveMaxTokens, out _);
@@ -112,7 +112,7 @@ public static class CompletionEndpoint
         }
 
         var options = RequestConverter.ToInferenceOptions(request,
-            state.SamplingDefaults,
+            state.EffectiveSamplingDefaults,
             new DotLLM.Core.Configuration.ThreadingConfig(
                 state.Options.Threads, state.Options.DecodeThreads));
         options = options with { MaxTokens = effectiveMaxTokens };

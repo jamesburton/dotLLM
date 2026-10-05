@@ -280,6 +280,35 @@ hint. `dotllm model pull owner/repo:Q4_K_M` selects the file by tag without a pr
 removes every link (mirror, snapshot) and the blob when it is unambiguous (same length and first MiB, exactly one candidate); it matches every
 file of a repo unless you narrow it with `--quant`.
 
+## Custom models: `model add`, profiles (Modelfile equivalent), `ps` / `stop` (#716)
+
+**Add your own GGUF.** `dotllm model add C:\models\my-finetune.gguf [--name my-finetune]` links the file (hard link, no extra disk) into the model store as
+`local/<name>`; `dotllm model add https://host/x.gguf` downloads a direct URL there. The file's `GGUF` magic is checked, so an HTML error page is
+rejected. It is then found by name everywhere (`dotllm run my-finetune`, a request's `model`, `model list`).
+
+**Profiles.** `dotllm model create <name> --from <base> [options]` saves `~/.dotllm/profiles/<name>.json` (`DOTLLM_PROFILES_DIR` overrides):
+
+```
+dotllm model create terse --from bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M ^
+    --system "Answer in one sentence." --temperature 0.2 --max-tokens 128 --stop "###" --device vulkan --keep-alive 600
+```
+
+| field | effect when a request for `<name>` arrives |
+|---|---|
+| `from` | the base model: path, `owner/repo[:quant]`, local name, or another profile (chains of up to 8; the outer profile's values win) |
+| `system` | prepended as the system message **only if the request has none** (chat completions and `/v1/messages`) |
+| `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty`, `max_tokens`, `seed` | defaults for a request that omits them; a request value always wins; the global `/v1/config` defaults are never modified |
+| `stop` | always added to the request's stop sequences |
+| `device`, `gpu_layers`, `keep_alive` | used when the server loads the model on demand (an explicit `POST /v1/models/load` field still wins) |
+
+The profile name is the model id: `GET /v1/models` lists it, residency and keep-alive key by it, and `model: "terse"` (or `terse:latest`) on any
+endpoint loads the base model with these settings. A profile shadows a model that happens to share its name. `model show <name>` prints the merged
+settings and where the base resolves, `model cp <src> <dst>` copies a profile (or aliases a model), and `model delete <name>` removes a profile without
+touching its base model. `dotllm run|chat` resolve a profile to its base model but do not yet apply the profile's system prompt or sampling.
+
+**`dotllm ps` / `dotllm stop [model|--all]`** are thin clients of a running server (`--url` or `DOTLLM_URL`, default `http://localhost:8080`):
+`ps` lists the resident models with size, idle time and the auto-unload countdown; `stop` unloads (needs the server's `--allow-model-admin`).
+
 ## Model Keep-Alive / Idle-Unload / Multi-Model Residency (#369)
 
 Ollama-parity daemon lifecycle: idle models unload automatically, and — when configured — more than

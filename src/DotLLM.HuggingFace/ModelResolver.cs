@@ -33,6 +33,16 @@ public static class ModelResolver
         "Q4_K_M", "Q4_K_S", "Q4_K_XL", "Q4_0", "IQ4_XS", "Q5_K_M", "Q5_K_S", "Q6_K", "Q8_0", "Q3_K_M", "Q2_K", "BF16", "F16", "F32",
     ];
 
+    /// <summary>The real file behind a path: follows symlinks (hf_hub snapshots on many setups) to the final target; the path itself otherwise.</summary>
+    public static string ResolveLinks(string path)
+    {
+        try { return new FileInfo(path).ResolveLinkTarget(returnFinalTarget: true)?.FullName ?? path; }
+        catch (IOException) { return path; }
+    }
+
+    /// <summary>File length that sees through symlinks (a link's own <see cref="FileInfo.Length"/> is not the target's).</summary>
+    public static long FileLength(string path) => new FileInfo(ResolveLinks(path)).Length;
+
     /// <summary>Parses a reference. Never touches the file system or the network.</summary>
     public static ModelReference Parse(string arg)
     {

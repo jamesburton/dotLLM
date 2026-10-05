@@ -53,7 +53,7 @@ public static class ModelManagementEndpoint
             // (#454) Honour the operator's enable/disable curation. Checked against both the
             // requested argument and the model id this load would produce, since a client may
             // legitimately name either.
-            var loadKey = Path.GetFileNameWithoutExtension(resolvedPath);
+            var loadKey = ServerStartup.ModelIdFor(request.Model, resolvedPath);
             if (!state.Catalog.IsEnabled(request.Model) || !state.Catalog.IsEnabled(loadKey))
                 return Results.BadRequest(ErrorResponse.InvalidRequest($"Model is disabled: {request.Model}", param: "model", code: "model_disabled"));
 
@@ -61,19 +61,20 @@ public static class ModelManagementEndpoint
             {
                 await state.SwapModelAsync(async () =>
                 {
+                    var loadProfile = ModelProfileStore.Resolve(request.Model) is { } lp ? ModelProfileStore.Merge(lp.Chain) : null;
                     var newOptions = state.Options with
                     {
                         Model = request.Model,
                         Quant = request.Quant,
-                        Device = request.Device ?? state.Options.Device,
-                        GpuLayers = request.GpuLayers ?? state.Options.GpuLayers,
+                        Device = request.Device ?? loadProfile?.Device ?? state.Options.Device,
+                        GpuLayers = request.GpuLayers ?? loadProfile?.GpuLayers ?? state.Options.GpuLayers,
                         CacheTypeK = request.CacheTypeK ?? state.Options.CacheTypeK,
                         CacheTypeV = request.CacheTypeV ?? state.Options.CacheTypeV,
                         Threads = request.Threads ?? state.Options.Threads,
                         DecodeThreads = request.DecodeThreads ?? state.Options.DecodeThreads,
                         SpeculativeModel = request.SpeculativeModel,
                         SpeculativeCandidates = request.SpeculativeK ?? state.Options.SpeculativeCandidates,
-                        ModelId = Path.GetFileNameWithoutExtension(resolvedPath),
+                        ModelId = ServerStartup.ModelIdFor(request.Model, resolvedPath),
                         RopeOverride = ServerOptions.BuildRopeOverride(
                             request.RopeScaling, request.RopeFreqBase, request.RopeScale,
                             request.YarnOrigCtx, request.YarnAttnFactor,
@@ -104,7 +105,7 @@ public static class ModelManagementEndpoint
                     // (previously dropped on every explicit /v1/models/load swap — the server
                     // silently fell back to the single-request gate after the first swap).
                     state.EstimatedBytes = SafeFileLength(resolvedPath);
-                    state.KeepAliveSecondsOverride = request.KeepAlive;
+                    state.KeepAliveSecondsOverride = request.KeepAlive ?? (ModelProfileStore.Resolve(request.Model) is { } kp ? ModelProfileStore.Merge(kp.Chain).KeepAlive : null);
                     state.Scheduler = newState.Scheduler;
                     state.StartSchedulerLoop();
                     // Preserve the existing LoRA registry across model swap so loaded

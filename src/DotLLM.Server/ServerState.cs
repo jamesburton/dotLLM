@@ -3,6 +3,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Engine;
+using DotLLM.HuggingFace;
 using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
 using DotLLM.Engine.Scheduler;
@@ -110,6 +111,16 @@ public sealed class ServerState : IDisposable
 
     /// <summary>Mutable sampling parameter defaults (changeable from the UI).</summary>
     public SamplingDefaults SamplingDefaults { get; set; } = new();
+
+    /// <summary>The active model's profile (#716), looked up by its model id, or null when it was not loaded through a profile name.</summary>
+    public ModelProfile? ActiveProfile =>
+        ModelProfileStore.Resolve(Options.ModelId) is { } r ? ModelProfileStore.Merge(r.Chain) : null;
+
+    /// <summary>
+    /// <see cref="SamplingDefaults"/> overlaid with the active profile's values: what a request that omits a parameter gets. The global defaults
+    /// (<c>/v1/config</c>) are never modified by a profile.
+    /// </summary>
+    public SamplingDefaults EffectiveSamplingDefaults => ActiveProfile is { } p ? SamplingDefaults.OverlayProfile(p) : SamplingDefaults;
 
     /// <summary>Path of the currently loaded GGUF file.</summary>
     public string LoadedModelPath { get; set; } = "";
@@ -343,17 +354,21 @@ public sealed class ServerState : IDisposable
                 // or a file path ("org/Repo-GGUF", "C:/models/foo.gguf") would otherwise load a
                 // model whose catalog key ("foo") is disabled. Deliberately before LoadModel, so a
                 // disabled model is never parsed, let alone mapped into memory.
-                var resolvedKey = Path.GetFileNameWithoutExtension(resolvedPath);
+                var resolvedKey = ServerStartup.ModelIdFor(targetKey, resolvedPath);
                 if (!Catalog.IsEnabled(resolvedKey))
                     return $"Model is disabled: {resolvedKey}";
 
                 reloadPath = resolvedPath;
+                var profile = ModelProfileStore.Resolve(targetKey) is { } rp ? ModelProfileStore.Merge(rp.Chain) : null;
                 loadOptions = Options with
                 {
                     Model = targetKey,
                     Quant = null,
-                    ModelId = Path.GetFileNameWithoutExtension(resolvedPath),
+                    ModelId = ServerStartup.ModelIdFor(targetKey, resolvedPath),
+                    Device = profile?.Device ?? Options.Device,
+                    GpuLayers = profile?.GpuLayers ?? Options.GpuLayers,
                 };
+                if (profile?.KeepAlive is { } profileKeepAlive) keepAliveOverride ??= profileKeepAlive;
                 incomingBytes = SafeFileLength(resolvedPath);
             }
 
@@ -781,4 +796,20 @@ public sealed record SamplingDefaults
 
     /// <summary>Random seed for reproducibility. Null = non-deterministic.</summary>
     public int? Seed { get; init; }
+
+    /// <summary>Stop sequences always applied in addition to the request's (from a model profile). Null = none.</summary>
+    public IReadOnlyList<string>? StopSequences { get; init; }
+
+    /// <summary>Returns these defaults with every value the <paramref name="profile"/> sets replacing the global one.</summary>
+    public SamplingDefaults OverlayProfile(ModelProfile profile) => this with
+    {
+        Temperature = profile.Temperature ?? Temperature,
+        TopP = profile.TopP ?? TopP,
+        TopK = profile.TopK ?? TopK,
+        MinP = profile.MinP ?? MinP,
+        RepetitionPenalty = profile.RepeatPenalty ?? RepetitionPenalty,
+        MaxTokens = profile.MaxTokens ?? MaxTokens,
+        Seed = profile.Seed ?? Seed,
+        StopSequences = profile.Stop is { Length: > 0 } ? profile.Stop : StopSequences,
+    };
 }
