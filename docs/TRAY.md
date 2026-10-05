@@ -146,20 +146,18 @@ the user has a way out that does not involve the tray.
 - The manifest is `asInvoker`. The `Run` key does not launch elevated entries, and the tray needs
   nothing beyond `HKCU` and `%APPDATA%`.
 
-## Known gap — needs a change in #454
+## Stopping a server (#722)
 
-**There is no shutdown endpoint.** Two consequences:
+The server has a gated `POST /v1/admin/shutdown` (needs `--allow-model-admin`): it answers `202` and then stops gracefully - the host drains
+in-flight requests and `serve` disposes the models, like a Ctrl+C. `ServerSupervisor.StopAsync` uses it:
 
-1. **An attached server cannot be stopped or restarted from the tray at all.** Those commands are
-   greyed out with the reason.
-2. **Stopping an owned child is a hard `Process.Kill`.** In-flight generations are cut. In-flight
-   *downloads* are not lost — they resume from their `.incomplete` file.
+- **An owned child** is asked first and killed only if it does not exit within the grace period (8 s; an older server without the route also
+  falls through to the kill). In-flight generations are no longer cut on a normal stop.
+- **An attached server** is stopped only if it accepts the request. A server started without `--allow-model-admin` refuses, and the status says
+  so; the tray still never looks up a pid and kills a process it does not own.
+- Restart of an attached server therefore works when it accepts, and does nothing (no second server on top) when it refuses.
 
-The fix belongs in #454, not here: a gated `POST /v1/admin/shutdown` that drains behind the request
-gate using the same stop-scheduler-then-dispose sequence `ServerState.UnloadAsync` already has.
-The tray would call it, wait for `/health` to stop answering, and only then fall back to a kill.
-**The tray deliberately does not work around this** by finding the listening PID — that would be
-exactly the reach-around its client-only contract forbids.
+CLI: `dotllm stop --server [--url ...]`.
 
 ## Testing
 

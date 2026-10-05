@@ -53,6 +53,13 @@ public interface IServerHealthProbe
     /// <summary>True when <c>GET /ready</c> succeeds — the server has a model loaded.</summary>
     /// <param name="ct">Cancellation token.</param>
     Task<bool> IsReadyAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Asks the server to stop gracefully (<c>POST /v1/admin/shutdown</c>, #722). True when it accepted; false when it refused (no
+    /// <c>--allow-model-admin</c>), has no such route (an older server), or is unreachable.
+    /// </summary>
+    /// <param name="ct">Cancellation token.</param>
+    Task<bool> RequestShutdownAsync(CancellationToken ct);
 }
 
 /// <summary>
@@ -83,6 +90,7 @@ public sealed class ServerSupervisor : IDisposable
     private readonly Func<ServerLaunchSpec> _specFactory;
     private readonly TimeSpan _startTimeout;
     private readonly TimeSpan _pollInterval;
+    private readonly TimeSpan _gracefulStopTimeout;
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
     private readonly SemaphoreSlim _gate = new(1, 1);
 
@@ -97,19 +105,22 @@ public sealed class ServerSupervisor : IDisposable
     /// <param name="startTimeout">How long to wait for a spawned child to answer <c>/health</c>.</param>
     /// <param name="pollInterval">Gap between health polls while starting.</param>
     /// <param name="delay">Delay function, injectable so tests do not sleep in real time.</param>
+    /// <param name="gracefulStopTimeout">How long a graceful stop (shutdown request) may take before an owned child is killed. Default 8 s.</param>
     public ServerSupervisor(
         IServerProcessRunner runner,
         IServerHealthProbe probe,
         Func<ServerLaunchSpec> specFactory,
         TimeSpan? startTimeout = null,
         TimeSpan? pollInterval = null,
-        Func<TimeSpan, CancellationToken, Task>? delay = null)
+        Func<TimeSpan, CancellationToken, Task>? delay = null,
+        TimeSpan? gracefulStopTimeout = null)
     {
         _runner = runner ?? throw new ArgumentNullException(nameof(runner));
         _probe = probe ?? throw new ArgumentNullException(nameof(probe));
         _specFactory = specFactory ?? throw new ArgumentNullException(nameof(specFactory));
         _startTimeout = startTimeout ?? TimeSpan.FromSeconds(60);
         _pollInterval = pollInterval ?? TimeSpan.FromMilliseconds(250);
+        _gracefulStopTimeout = gracefulStopTimeout ?? TimeSpan.FromSeconds(8);
         _delay = delay ?? Task.Delay;
     }
 
@@ -224,20 +235,15 @@ public sealed class ServerSupervisor : IDisposable
     }
 
     /// <summary>
-    /// Stops the server, but only when the tray owns it.
+    /// Stops the server gracefully through its admin API, falling back to a kill only for a server the tray owns.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// For an attached server this returns the current status unchanged with a <see cref="ServerStatus.Detail"/>
-    /// explaining why. The tray deliberately does <b>not</b> find the listening pid and kill it:
-    /// that process may be a developer's <c>dotnet run</c>, and the tray has no mandate over it.
-    /// </para>
-    /// <para>
-    /// <b>Known gap.</b> Even for an owned child, "stop" is a hard kill, because #454 exposes no
-    /// shutdown route. In-flight generations are cut; in-flight <i>downloads</i> are not lost
-    /// (they resume from their <c>.incomplete</c> file). A gated <c>POST /v1/admin/shutdown</c>
-    /// that drains behind the request gate — the same sequence <c>UnloadAsync</c> already uses —
-    /// would close this, and is reported as the change needed in #454.
+    /// Since #722 the server has <c>POST /v1/admin/shutdown</c>, so the tray no longer reaches around anything: it asks, and the server drains
+    /// in-flight requests and disposes its models like a Ctrl+C. An <b>owned</b> child gets a grace period to exit and is killed only if it
+    /// does not (an older server without the route, or one that is wedged). An <b>attached</b> server is stopped only if it accepts the request;
+    /// when it refuses (started without <c>--allow-model-admin</c>) the status is returned unchanged with an explanation - the tray still never
+    /// looks up a pid and kills someone else's process.
     /// </para>
     /// </remarks>
     /// <param name="ct">Cancellation token.</param>
@@ -251,18 +257,37 @@ public sealed class ServerSupervisor : IDisposable
             {
                 ReleaseChild();
                 var status = await RefreshAsync(ct).ConfigureAwait(false);
-                return status.State == ServerState.RunningAttached
-                    ? Publish(status with
+                if (status.State != ServerState.RunningAttached)
+                    return status;
+
+                // Attached: only the server itself can say yes.
+                if (!await _probe.RequestShutdownAsync(ct).ConfigureAwait(false))
+                    return Publish(status with
                     {
-                        Detail = "This server was started outside the tray, so the tray will not "
-                               + "stop it. Stop it where it was started.",
-                    })
-                    : status;
+                        Detail = "This server was started outside the tray and refused to be stopped from it. Start it with --allow-model-admin "
+                               + "to allow that, or stop it where it was started.",
+                    });
+
+                Publish(new ServerStatus(ServerState.Stopping));
+                var until = DateTime.UtcNow + _gracefulStopTimeout;
+                while (DateTime.UtcNow < until && await _probe.IsHealthyAsync(ct).ConfigureAwait(false))
+                    await _delay(_pollInterval, ct).ConfigureAwait(false);
+                // Stopping is sticky in RefreshAsync, so settle the state here instead of refreshing.
+                if (!await _probe.IsHealthyAsync(ct).ConfigureAwait(false))
+                    return Publish(new ServerStatus(ServerState.Stopped));
+                return Publish(new ServerStatus(
+                    ServerState.RunningAttached, await _probe.IsReadyAsync(ct).ConfigureAwait(false),
+                    Detail: "The server accepted the shutdown request but is still answering; it may be finishing a request."));
             }
 
             Publish(new ServerStatus(ServerState.Stopping, ProcessId: child.Id));
-            child.Kill();
-            await child.WaitForExitAsync(TimeSpan.FromSeconds(10), ct).ConfigureAwait(false);
+            if (await _probe.RequestShutdownAsync(ct).ConfigureAwait(false))
+                await child.WaitForExitAsync(_gracefulStopTimeout, ct).ConfigureAwait(false);
+            if (!child.HasExited)
+            {
+                child.Kill();
+                await child.WaitForExitAsync(TimeSpan.FromSeconds(10), ct).ConfigureAwait(false);
+            }
             ReleaseChild();
             return Publish(new ServerStatus(ServerState.Stopped));
         }
@@ -279,8 +304,8 @@ public sealed class ServerSupervisor : IDisposable
     public async Task<ServerStatus> RestartAsync(CancellationToken ct = default)
     {
         var stopped = await StopAsync(ct).ConfigureAwait(false);
-        if (stopped.State == ServerState.RunningAttached)
-            return stopped;
+        if (stopped.State is ServerState.RunningAttached or ServerState.Stopping)
+            return stopped;   // the server refused (or has not gone yet): do not start a second one on top of it
         return await StartAsync(ct).ConfigureAwait(false);
     }
 

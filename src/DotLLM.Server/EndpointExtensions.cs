@@ -29,6 +29,7 @@ public static class EndpointExtensions
         EmbeddingsEndpoint.Map(app);
         SystemOneEndpoint.Map(app);
         OllamaApiEndpoint.Map(app);
+        AdminEndpoint.Map(app);
         LoraEndpoints.Map(app);
         SettingsEndpoint.Map(app);
         DeviceEndpoint.Map(app);

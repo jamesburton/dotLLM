@@ -68,18 +68,36 @@ internal sealed class StopCommand : AsyncCommand<StopCommand.Settings>
         [Description("Unload every resident model.")]
         [DefaultValue(false)]
         public bool All { get; set; }
+
+        [CommandOption("--server")]
+        [Description("Stop the whole server process gracefully (POST /v1/admin/shutdown).")]
+        [DefaultValue(false)]
+        public bool Server { get; set; }
     }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings s)
     {
-        if (string.IsNullOrWhiteSpace(s.Model) && !s.All)
+        if (string.IsNullOrWhiteSpace(s.Model) && !s.All && !s.Server)
         {
-            AnsiConsole.MarkupLine("[red]Name a model to stop, or pass --all.[/]");
+            AnsiConsole.MarkupLine("[red]Name a model to stop, or pass --all (every model) or --server (the whole server).[/]");
             return 1;
         }
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
         try
         {
+            if (s.Server)
+            {
+                using var empty = new StringContent(string.Empty, System.Text.Encoding.UTF8, "application/json");
+                using var shut = await http.PostAsync($"{s.BaseUrl}/v1/admin/shutdown", empty);
+                if (shut.StatusCode == System.Net.HttpStatusCode.Forbidden)
+                {
+                    AnsiConsole.MarkupLine("[red]The server refused: model administration is off.[/] Restart it with [bold]--allow-model-admin[/].");
+                    return 1;
+                }
+                AnsiConsole.MarkupLine(shut.IsSuccessStatusCode ? "[green]Server is shutting down.[/]" : $"[red]Shutdown failed:[/] HTTP {(int)shut.StatusCode}");
+                return shut.IsSuccessStatusCode ? 0 : 1;
+            }
+
             // Hand-built body: this assembly is trim-analysed, so no reflection-based serialisation.
             string json = s.All ? "{\"all\":true}" : $"{{\"model\":{JsonSerializer.Serialize(s.Model, JsonStringContext.Default.String)},\"all\":false}}";
             using var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");

@@ -60,6 +60,7 @@ public sealed class MeteredPathPolicyTests
     [InlineData("/v1/detokenize")]
     [InlineData("/v1/prompt-cache")]
     [InlineData("/v1/cache/clear")]
+    [InlineData("/v1/admin/shutdown")]
     [InlineData("/api/tags")]
     [InlineData("/api/show")]
     [InlineData("/api/ps")]

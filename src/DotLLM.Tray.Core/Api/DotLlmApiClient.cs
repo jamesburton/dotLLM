@@ -89,6 +89,22 @@ public sealed class DotLlmApiClient
 
     // ───────────────────────────────── models ─────────────────────────────────
 
+    /// <summary>
+    /// Asks the server to stop gracefully (<c>POST /v1/admin/shutdown</c>, gated by <c>--allow-model-admin</c>). True when accepted; false on a
+    /// refusal (403), a server without the route (404/405) or an unreachable one - none of those are errors for the caller to handle.
+    /// </summary>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task<bool> RequestShutdownAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            using var content = new StringContent(string.Empty, System.Text.Encoding.UTF8, "application/json");
+            using var response = await _http.PostAsync("/v1/admin/shutdown", content, ct).ConfigureAwait(false);
+            return response.IsSuccessStatusCode;
+        }
+        catch (HttpRequestException) { return false; }
+    }
+
     /// <summary>Lists resident models with keep-alive/expiry state (<c>GET /v1/models</c>, ungated).</summary>
     /// <param name="ct">Cancellation token.</param>
     public Task<TrayModelList> GetResidentModelsAsync(CancellationToken ct = default) =>

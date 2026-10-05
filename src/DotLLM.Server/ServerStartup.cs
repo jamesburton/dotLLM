@@ -116,6 +116,32 @@ public static class ServerStartup
     /// </summary>
     public static ServerState LoadModel(string resolvedPath, ServerOptions options)
     {
+        if (!DeviceSelector.IsAuto(options.Device))
+            return LoadModelCore(resolvedPath, options);
+
+        // --device auto (#722): try the best device first and fall through on a failed load. The server keeps "auto" as its configured device
+        // (so later on-demand loads choose again, per model size); the device actually used is recorded in ResolvedDevice.
+        Exception? last = null;
+        foreach (string device in DeviceSelector.Candidates(new FileInfo(resolvedPath).Length))
+        {
+            try
+            {
+                Console.WriteLine($"[dotllm] --device auto: trying {device}");
+                var loaded = LoadModelCore(resolvedPath, options with { Device = device });
+                loaded.Options = loaded.Options with { Device = options.Device, ResolvedDevice = device };
+                return loaded;
+            }
+            catch (Exception ex) when (device != "cpu")
+            {
+                last = ex;
+                Console.WriteLine($"[dotllm] {device} could not load this model ({ex.Message}); falling back");
+            }
+        }
+        throw last ?? new InvalidOperationException("No device could load the model.");
+    }
+
+    private static ServerState LoadModelCore(string resolvedPath, ServerOptions options)
+    {
         Console.WriteLine($"[dotllm] Loading model from {resolvedPath}...");
         var gguf = GgufFile.Open(resolvedPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
