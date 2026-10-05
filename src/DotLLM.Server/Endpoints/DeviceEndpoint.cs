@@ -14,9 +14,8 @@ namespace DotLLM.Server.Endpoints;
 /// per-request path while a model is live on that device.
 /// </para>
 /// <para>
-/// <b>No device-local heap usage is reported.</b> The Vulkan allocator's per-heap live-bytes
-/// ledger does not exist on this branch (it lives on <c>feature/bonsai-2-amd</c>), and the server
-/// has no Vulkan load path anyway. The field is omitted rather than reported as a fabricated zero.
+/// <b>No device-local heap usage is reported.</b> The field is omitted rather than reported as a
+/// fabricated zero.
 /// </para>
 /// <para>
 /// <b>Vulkan is reported as available-but-not-servable.</b> <c>ServerStartup.LoadModel</c>
@@ -130,17 +129,27 @@ public static class DeviceEndpoint
         try { count = DotLLM.Vulkan.VulkanDevice.PhysicalDeviceCount(); }
         catch { count = 0; }
 
+        // Servable needs the SPIR-V blobs as well as a device: the loader reads them from spv/ beside the binary (#712).
+        bool shaders = false;
+        if (count > 0)
+        {
+            try { DotLLM.Vulkan.VulkanModelLoader.ResolveSpvDir(); shaders = true; }
+            catch { shaders = false; }
+        }
+
         return new BackendInfoDto
         {
             Name = "vulkan",
             Available = count > 0,
             DeviceCount = count,
-            Servable = false,
-            Note = count > 0
-                ? "Vulkan devices are present, but the server's model-load path dispatches to the "
-                  + "CPU or CUDA loader only — there is no Vulkan device string for POST /v1/models/load."
-                : "No Vulkan loader / no Vulkan-capable device detected.",
-            Devices = [],
+            Servable = count > 0 && shaders,
+            Note = count == 0
+                ? "No Vulkan loader / no Vulkan-capable device detected."
+                : shaders ? null : "Vulkan devices are present, but the SPIR-V shader blobs (spv/ beside the binary) were not found.",
+            // The shared Vulkan device is selected by the plain string "vulkan" (--device vulkan / POST /v1/models/load).
+            Devices = count > 0 && shaders
+                ? [new DeviceInfoDto { Index = 0, Name = count == 1 ? "Vulkan GPU" : $"Vulkan GPU (first of {count})", DeviceString = "vulkan" }]
+                : [],
         };
     }
 

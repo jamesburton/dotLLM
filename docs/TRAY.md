@@ -126,7 +126,7 @@ started itself. An *attached* server's flags are not the tray's to choose, so wh
 without the flag the live settings group goes read-only and shows the server's own explanation.
 
 The device picker is populated from `GET /v1/devices` gated on **`servable`**, not `available`.
-Vulkan reports available-but-not-servable (the server's load path dispatches to CPU or CUDA only),
+A backend can be present yet not servable (Vulkan without its `spv/` shader blobs, or no CUDA driver);
 and offering it would produce a load that silently lands on the CPU.
 
 ## Autostart
@@ -239,7 +239,7 @@ are not reachable from a unit test.
 7. **Settings.** Change keep-alive and press Apply; the status line names the applied field. Change
    the port, press OK, and confirm the tray re-points and stops the old owned child. Against a
    server started without `--allow-model-admin`, confirm the live group is read-only with the
-   server's message. Confirm Vulkan does not appear in the device list on a machine that has it.
+   server's message. Confirm Vulkan appears in the device list on a machine with a Vulkan GPU and its shader blobs (and loads a model on it).
 8. **Exit.** Exit from the menu. Icon disappears; the owned `dotllm` process is gone.
 9. **Orphan, by hand.** Start a server from the tray, note its PID, then `taskkill /F /IM
    dotllm-tray.exe`. The server PID must be gone within a few seconds. (Automated equivalent

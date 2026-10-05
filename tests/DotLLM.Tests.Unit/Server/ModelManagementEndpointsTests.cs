@@ -356,16 +356,24 @@ public sealed class ModelManagementEndpointsTests
     }
 
     /// <summary>
-    /// The server's load path dispatches to the CPU or CUDA loader only, so a tray must not be
-    /// told it can place a model on Vulkan even where Vulkan devices exist.
+    /// #712: Vulkan is servable exactly when a device AND the shader blobs exist, and then offers the one device string the loader accepts
+    /// (<c>vulkan</c>); otherwise it offers none.
     /// </summary>
     [Fact]
-    public void Devices_VulkanIsNeverReportedServable()
+    public void Devices_VulkanServableIffDevicePresentAndShadersFound()
     {
         var vulkan = Assert.Single(DeviceEndpoint.Describe().Backends, b => b.Name == "vulkan");
-        Assert.False(vulkan.Servable);
-        Assert.NotNull(vulkan.Note);
-        Assert.All(vulkan.Devices, d => Assert.Null(d.DeviceString));
+        if (vulkan.Servable)
+        {
+            Assert.True(vulkan.Available);
+            Assert.Equal("vulkan", Assert.Single(vulkan.Devices).DeviceString);
+            Assert.True(DotLLM.Vulkan.VulkanModelLoader.IsVulkanDeviceString(vulkan.Devices[0].DeviceString));
+        }
+        else
+        {
+            Assert.Empty(vulkan.Devices);
+            if (vulkan.Available) Assert.NotNull(vulkan.Note);   // present but unusable: say why
+        }
     }
 
     [Fact]

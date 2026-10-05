@@ -254,8 +254,8 @@ internal sealed class SettingsForm : Form
 
         foreach (var backend in devices.Backends ?? [])
         {
-            // Gated on Servable, not Available. Vulkan reports available-but-not-servable, and
-            // offering it would produce a load that silently lands on the CPU.
+            // Gated on Servable, not Available: a backend can be present yet unusable (e.g. Vulkan without its shader blobs),
+            // and offering it would produce a load that fails or silently lands on the CPU.
             if (!backend.Servable)
                 continue;
             foreach (var device in backend.Devices ?? [])
