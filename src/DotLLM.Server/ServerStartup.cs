@@ -317,8 +317,14 @@ public static class ServerStartup
         // auto-detect default), since engaging it also takes the continuous-batch scheduler
         // offline for this model (see below). Only actually engages requests when the loaded
         // checkpoint carries an MTP head; otherwise this is a no-op even with --mtp set.
-        bool mtpActive = options.MtpEnabled && draftModel is null && model.SupportsMtp;
-        if (options.MtpEnabled && draftModel is null && model.SupportsMtp)
+        // An explicit concurrency hint (>= 5, Vulkan) wins over --mtp: the continuous-batch scheduler measured +73% aggregate decode at 8
+        // concurrent streams and cannot run speculative decoding, so MTP is dropped for this model with a log line.
+        bool concurrencyOverMtp = options.MtpEnabled && options.ExpectedConcurrency >= 5 && vulkanKvFactory is not null
+            && !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_SCHEDULER"), "0", StringComparison.Ordinal);
+        if (concurrencyOverMtp && model.SupportsMtp)
+            Console.WriteLine("[dotllm] --expected-concurrency >= 5: serving through the continuous-batch scheduler; MTP self-speculation is disabled for this model.");
+        bool mtpActive = options.MtpEnabled && draftModel is null && model.SupportsMtp && !concurrencyOverMtp;
+        if (options.MtpEnabled && draftModel is null && model.SupportsMtp && !concurrencyOverMtp)
             Console.WriteLine($"[dotllm] MTP self-speculative decoding: K={options.SpeculativeCandidates} (model carries an MTP head)");
         else if (options.MtpEnabled && draftModel is null && !model.SupportsMtp)
             Console.WriteLine("[dotllm] --mtp was set but this checkpoint has no MTP head (nextn.* tensors) — ignoring.");
