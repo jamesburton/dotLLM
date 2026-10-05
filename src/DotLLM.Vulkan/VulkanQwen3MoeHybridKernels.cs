@@ -100,6 +100,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulF16GemmCoopmatKernel? MatMulF16GemmCoopmat { get; }
     public MatMulBf16GemvF32Kernel MatMulBf16 { get; }
     public MatMulBf16GemmF32Kernel MatMulBf16Gemm { get; }
+    /// <summary>Multi-column BF16 GEMV for 2..8-row batches (MTP verify, small stacked decode; issue #706). Null when its SPIR-V is absent.</summary>
+    public MatMulBf16GemvMultiF32Kernel? MatMulBf16Multi { get; private set; }
 
     // ── Shared norms / attention / SwiGLU / Add ─────────────────────────────
     public RmsNormF32Kernel RmsNorm { get; }
@@ -407,6 +409,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeSharedGateAddF32Kernel? moeSharedGateAdd = Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_SHARED_GATE_FUSED") != "0"
             && File.Exists(Path.Combine(spvDir, "moe_shared_gate_add_f32.spv")) ? MoeSharedGateAddF32Kernel.Create(device, spvDir) : null;
 
+        var matmulBf16Multi = File.Exists(Path.Combine(spvDir, "matmul_bf16_gemv_multi_f32.spv"))
+            ? MatMulBf16GemvMultiF32Kernel.Create(device, spvDir) : null;
+
         var kernels = new VulkanQwen3MoeHybridKernels(
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
             matmulQ2K, matmulQ2KGemm,
@@ -434,6 +439,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             moeTopk, moeBroadcast, moeIndexed, moeIndexedQ6K, moeIndexedQ4K, moeIndexedQ5K,
             moeIndexedQ4KMmq, quantizeQ8_1Rows, moeIndexedQ5KMmq, moeScatter, moeSigmoidGatedAdd);
         kernels.MoeSharedGateAdd = moeSharedGateAdd;
+        kernels.MatMulBf16Multi = matmulBf16Multi;
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_GDN_CONV_FUSED") != "0" && GdnConvSiluF32Kernel.IsSupportedOn(spvDir))
             kernels.GdnConvSilu = GdnConvSiluF32Kernel.Create(device, spvDir);
 
@@ -557,6 +563,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulF16GemmCoopmat?.InvalidateDescriptorCache();
         MatMulBf16.InvalidateDescriptorCache();
         MatMulBf16Gemm.InvalidateDescriptorCache();
+        MatMulBf16Multi?.InvalidateDescriptorCache();
         RmsNorm.InvalidateDescriptorCache();
         Rope.InvalidateDescriptorCache();
         Attention.InvalidateDescriptorCache();
@@ -642,6 +649,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         Rope.Dispose();
         RmsNorm.Dispose();
         MatMulBf16Gemm.Dispose();
+        MatMulBf16Multi?.Dispose();
         MatMulBf16.Dispose();
         MatMulF16GemmCoopmat?.Dispose();
         MatMulF16Gemm.Dispose();
