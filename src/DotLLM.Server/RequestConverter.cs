@@ -68,6 +68,7 @@ public static class RequestConverter
     {
         var allStops = new List<string>(stopSequences);
         AddRequestStopSequences(allStops, request.Stop);
+        if (defaults.StopSequences is { Count: > 0 } profileStops) allStops.AddRange(profileStops.Where(x => !allStops.Contains(x)));
 
         var options = new InferenceOptions
         {
@@ -100,6 +101,7 @@ public static class RequestConverter
     {
         var stops = new List<string>();
         AddRequestStopSequences(stops, request.Stop);
+        if (defaults.StopSequences is { Count: > 0 } profileStops) stops.AddRange(profileStops.Where(x => !stops.Contains(x)));
 
         var options = new InferenceOptions
         {

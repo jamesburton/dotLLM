@@ -119,7 +119,7 @@ public static class ChatCompletionEndpoint
         }
 
         // Convert DTOs to engine types
-        var messages = RequestConverter.ToMessages(request.Messages);
+        var messages = ProfileSystemPrompt.Apply(state.ActiveProfile?.System, RequestConverter.ToMessages(request.Messages).ToArray());
         var tools = RequestConverter.ToTools(request.Tools);
         var toolChoice = RequestConverter.ParseToolChoice(request.ToolChoice);
 
@@ -132,7 +132,7 @@ public static class ChatCompletionEndpoint
         string prompt = state.ChatTemplate.Apply(messages, templateOptions);
 
         // Validate prompt length against model context
-        int maxTokens = request.MaxTokens ?? state.SamplingDefaults.MaxTokens;
+        int maxTokens = request.MaxTokens ?? state.EffectiveSamplingDefaults.MaxTokens;
         var promptError = RequestValidator.ValidatePromptLength(
             prompt, state.Tokenizer!, state.Config!.MaxSequenceLength,
             maxTokens, out int effectiveMaxTokens, out _);
@@ -150,7 +150,7 @@ public static class ChatCompletionEndpoint
         // Build inference options with clamped max_tokens
         var stopSequences = CommonStopSequences;
         var options = RequestConverter.ToInferenceOptions(request, stopSequences,
-            state.SamplingDefaults,
+            state.EffectiveSamplingDefaults,
             new DotLLM.Core.Configuration.ThreadingConfig(
                 state.Options.Threads, state.Options.DecodeThreads));
         options = options with { MaxTokens = effectiveMaxTokens };

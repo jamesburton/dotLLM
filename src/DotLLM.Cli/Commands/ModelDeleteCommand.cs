@@ -29,6 +29,19 @@ internal sealed class ModelDeleteCommand : Command<ModelDeleteCommand.Settings>
 
     public override int Execute(CommandContext context, Settings settings)
     {
+        // An exact profile name removes the profile (never the base model it points at).
+        if (ModelProfileStore.TryGet(settings.Model) is { } profile)
+        {
+            if (!settings.Yes && !AnsiConsole.Confirm($"Delete model profile '{settings.Model.EscapeMarkup()}' (base model '{(profile.From ?? "").EscapeMarkup()}' is kept)?", defaultValue: false))
+            {
+                AnsiConsole.MarkupLine("[dim]Cancelled.[/]");
+                return 0;
+            }
+            ModelProfileStore.Delete(settings.Model);
+            AnsiConsole.MarkupLine($"[red]Deleted profile[/] {settings.Model.EscapeMarkup()}");
+            return 0;
+        }
+
         var models = ModelResolver.EnumerateLocal();
 
         // Find matches by repo ID or filename

@@ -102,7 +102,7 @@ public static class MessagesEndpoint
 
         string prompt = BuildPrompt(request, state, out var tools);
 
-        int maxTokens = request.MaxTokens ?? state.SamplingDefaults.MaxTokens;
+        int maxTokens = request.MaxTokens ?? state.EffectiveSamplingDefaults.MaxTokens;
         var promptError = RequestValidator.ValidatePromptLength(
             prompt, state.Tokenizer!, state.Config!.MaxSequenceLength,
             maxTokens, out int effectiveMaxTokens, out int promptTokenCount);
@@ -113,7 +113,7 @@ public static class MessagesEndpoint
         }
 
         var options = AnthropicConverter.ToInferenceOptions(request, CommonStopSequences,
-            state.SamplingDefaults,
+            state.EffectiveSamplingDefaults,
             new DotLLM.Core.Configuration.ThreadingConfig(state.Options.Threads, state.Options.DecodeThreads));
         options = options with { MaxTokens = effectiveMaxTokens };
 
@@ -555,7 +555,7 @@ public static class MessagesEndpoint
     private static string BuildPrompt(
         AnthropicMessagesRequest request, ServerState state, out ToolDefinition[]? tools)
     {
-        var messages = AnthropicConverter.ToMessages(request);
+        var messages = ProfileSystemPrompt.Apply(state.ActiveProfile?.System, AnthropicConverter.ToMessages(request));
         tools = AnthropicConverter.ToTools(request.Tools);
         return state.ChatTemplate!.Apply(messages, new ChatTemplateOptions
         {

@@ -26,8 +26,22 @@ public static class ServerStartup
     /// <summary>
     /// Resolves a model argument (file path or HuggingFace repo ID) to a local GGUF path.
     /// </summary>
-    public static string? ResolveModelPath(string modelArg, string? quant) =>
-        ModelResolver.ResolveLocal(modelArg, quant);
+    public static string? ResolveModelPath(string modelArg, string? quant)
+    {
+        // A profile name resolves to its base model (#716); profiles shadow a model that happens to share the name.
+        if (ModelProfileStore.Resolve(modelArg) is { } resolved)
+            return ModelResolver.ResolveLocal(resolved.BaseReference, quant);
+        return ModelResolver.ResolveLocal(modelArg, quant);
+    }
+
+    /// <summary>
+    /// The id a loaded model is known by: the profile name when <paramref name="requested"/> names a profile (so a request for that alias
+    /// matches the active model and residency keys by it), otherwise the file stem.
+    /// </summary>
+    public static string ModelIdFor(string requested, string resolvedPath) =>
+        ModelProfileStore.NormalizeName(requested) is { } n && ModelProfileStore.TryGet(n) is not null
+            ? n
+            : Path.GetFileNameWithoutExtension(resolvedPath);
 
     /// <summary>
     /// <see cref="ResolveModelPath"/>, falling back to a Hub download when <paramref name="autoPull"/> is on and the reference names a Hub repo
@@ -38,7 +52,7 @@ public static class ServerStartup
         string? path = ResolveModelPath(modelArg, quant);
         if (path is not null || !autoPull) return path;
 
-        var reference = ModelResolver.Parse(modelArg);
+        var reference = ModelResolver.Parse(ModelProfileStore.Resolve(modelArg)?.BaseReference ?? modelArg);
         if (!reference.IsRepo) return null;
         using var client = new HuggingFaceClient();
         using var downloader = new HuggingFaceDownloader();
@@ -49,7 +63,7 @@ public static class ServerStartup
     /// <summary>The message for an unresolvable model name, with the way out.</summary>
     public static string NotFoundMessage(string modelArg) =>
         $"Model not found: {modelArg}. Download it with `dotllm model pull {modelArg}` or POST /v1/models/pull" +
-        (ModelResolver.Parse(modelArg).IsRepo ? ", or start the server with --auto-pull." : ".");
+        (ModelResolver.Parse(ModelProfileStore.Resolve(modelArg)?.BaseReference ?? modelArg).IsRepo ? ", or start the server with --auto-pull." : ".");
 
     /// <summary>
     /// Creates a bare <see cref="ServerState"/> with no model loaded.
