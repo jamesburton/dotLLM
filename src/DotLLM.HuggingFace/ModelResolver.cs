@@ -329,6 +329,9 @@ public static class ModelResolver
         catch (IOException) { return false; }
     }
 
+    /// <summary>Removes <paramref name="dir"/> and its empty parents, stopping before <paramref name="stopAt"/>.</summary>
+    public static void PruneEmptyDirectories(string? dir, string stopAt) => PruneEmpty(dir, stopAt);
+
     private static void PruneEmpty(string? dir, string stopAt)
     {
         string stop = Path.GetFullPath(stopAt);
