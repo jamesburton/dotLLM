@@ -271,3 +271,48 @@ internal sealed class ModelAddCommand : AsyncCommand<ModelAddCommand.Settings>
         return 0;
     }
 }
+
+/// <summary><c>dotllm model import-ollama</c>: turns the models of an existing ollama installation into dotLLM profiles (the blobs are used in place).</summary>
+internal sealed class ModelImportOllamaCommand : Command<ModelImportOllamaCommand.Settings>
+{
+    public sealed class Settings : CommandSettings
+    {
+        [CommandArgument(0, "[model]")]
+        [Description("One ollama model (e.g. 'llama3.2:3b'). Omit to import every model in the store.")]
+        public string? Model { get; set; }
+
+        [CommandOption("--force")]
+        [Description("Overwrite an existing profile of the same name.")]
+        [DefaultValue(false)]
+        public bool Force { get; set; }
+    }
+
+    public override int Execute(CommandContext context, Settings s)
+    {
+        var all = OllamaStore.ListAll();
+        if (all.Count == 0)
+        {
+            AnsiConsole.MarkupLine($"[yellow]No ollama models found in[/] {OllamaStore.DefaultRoot.EscapeMarkup()} [grey](set OLLAMA_MODELS if it lives elsewhere)[/]");
+            return 0;
+        }
+        if (s.Model is not null)
+        {
+            var want = OllamaRef.TryParse(s.Model);
+            all = all.Where(m => want is { } w && m.Ref.Name == w.Name && m.Ref.Tag == w.Tag).ToList();
+            if (all.Count == 0) { AnsiConsole.MarkupLine($"[red]'{s.Model.EscapeMarkup()}' is not in the ollama store.[/]"); return 1; }
+        }
+
+        int made = 0, skipped = 0;
+        foreach (var m in all)
+        {
+            string name = m.Ref.ToString();
+            if (ModelProfileStore.NormalizeName(name) is null) { skipped++; continue; }
+            if (!s.Force && ModelProfileStore.TryGet(name) is not null) { skipped++; continue; }
+            ModelProfileStore.Save(name, OllamaStore.ToProfile(m, m.BlobPath));
+            made++;
+            AnsiConsole.MarkupLine($"[green]Imported[/] {name.EscapeMarkup()} [grey]({FormatHelpers.FormatSize(m.SizeBytes)}, blob used in place)[/]");
+        }
+        AnsiConsole.MarkupLine($"{made} imported, {skipped} skipped (already a profile)." );
+        return 0;
+    }
+}

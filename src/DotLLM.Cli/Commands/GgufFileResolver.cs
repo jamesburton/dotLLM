@@ -24,7 +24,7 @@ internal static class GgufFileResolver
         if (File.Exists(fileArg))
             return Path.GetFullPath(fileArg);
 
-        string? local = ModelResolver.ResolveLocal(fileArg, quant);
+        string? local = ModelResolver.ResolveLocal(fileArg, quant, includeOllama: true);
         if (local is not null)
             return local;
 
@@ -42,11 +42,42 @@ internal static class GgufFileResolver
             }
         }
 
+        if (!reference.IsRepo && allowPull && OllamaRef.TryParse(fileArg) is { } ollamaRef)
+        {
+            try { return PullOllamaWithProgress(ollamaRef); }
+            catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException or IOException)
+            {
+                AnsiConsole.MarkupLine($"[red]Could not pull {fileArg.EscapeMarkup()}:[/] {ex.Message.EscapeMarkup()}");
+                return null;
+            }
+        }
+
         AnsiConsole.MarkupLine($"[red]Model not found locally:[/] {fileArg.EscapeMarkup()}");
         AnsiConsole.MarkupLine(reference.IsRepo
             ? $"[grey]Download it with:[/] dotllm model pull {fileArg.EscapeMarkup()}"
             : "[grey]Pass a .gguf path, an 'owner/repo[:quant]' Hugging Face reference, or the name of a model from 'dotllm model list'.[/]");
         return null;
+    }
+
+    internal static string PullOllamaWithProgress(OllamaRef reference)
+    {
+        using var registry = new OllamaRegistry();
+        AnsiConsole.MarkupLine($"[grey]Not found locally - pulling[/] [bold]{reference.ToString().EscapeMarkup()}[/] [grey]from the ollama registry[/]");
+        return AnsiConsole.Progress()
+            .AutoClear(false)
+            .Columns(new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new TransferSpeedColumn(), new RemainingTimeColumn())
+            .Start(ctx =>
+            {
+                var task = ctx.AddTask("[green]downloading[/]", maxValue: 100);
+                long? lastTotal = null;
+                var progress = new Progress<(long bytesDownloaded, long? totalBytes)>(p =>
+                {
+                    if (!p.totalBytes.HasValue) return;
+                    if (lastTotal != p.totalBytes.Value) { task.MaxValue = p.totalBytes.Value; lastTotal = p.totalBytes.Value; }
+                    task.Value = p.bytesDownloaded;
+                });
+                return ModelResolver.PullOllamaAsync(reference, registry, progress, CancellationToken.None).GetAwaiter().GetResult();
+            });
     }
 
     private static string PullWithProgress(ModelReference reference, string? quant)

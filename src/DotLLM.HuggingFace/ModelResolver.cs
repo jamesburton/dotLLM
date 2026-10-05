@@ -69,7 +69,7 @@ public static class ModelResolver
     }
 
     /// <summary>Every local GGUF (mirror + hub cache), de-duplicated by repo and filename. Never throws.</summary>
-    public static List<LocalModel> EnumerateLocal(string? modelsDir = null, string? cacheRoot = null)
+    public static List<LocalModel> EnumerateLocal(string? modelsDir = null, string? cacheRoot = null, bool includeOllama = false, string? ollamaRoot = null)
     {
         var byKey = new Dictionary<string, LocalModel>(StringComparer.OrdinalIgnoreCase);
         void Add(LocalModel m)
@@ -110,6 +110,16 @@ public static class ModelResolver
         }
         catch { /* unreadable cache: skip */ }
 
+        if (includeOllama)
+        {
+            // Models of an existing ollama installation, read in place (no copy): repo "ollama/{name}", file "{name}-{tag}.gguf".
+            foreach (var om in OllamaStore.ListAll(ollamaRoot))
+            {
+                string safe = om.Ref.Name.Replace('/', '_');
+                Add(new LocalModel("ollama/" + safe, $"{safe}-{om.Ref.Tag}.gguf", om.BlobPath, om.SizeBytes, om.ModifiedAt));
+            }
+        }
+
         return byKey.Values.OrderBy(m => m.RepoId, StringComparer.OrdinalIgnoreCase).ThenBy(m => m.Filename, StringComparer.OrdinalIgnoreCase).ToList();
     }
 
@@ -117,14 +127,31 @@ public static class ModelResolver
     /// Resolves a reference to a local GGUF path, or null when nothing local matches (the caller may then pull).
     /// <paramref name="quant"/> (the legacy <c>--quant</c> option) is equivalent to a <c>:tag</c>.
     /// </summary>
-    public static string? ResolveLocal(string arg, string? quant = null, string? modelsDir = null, string? cacheRoot = null)
+    public static string? ResolveLocal(string arg, string? quant = null, string? modelsDir = null, string? cacheRoot = null,
+        bool includeOllama = false, string? ollamaRoot = null)
+    {
+        string? found = ResolveLocalCore(arg, quant, modelsDir, cacheRoot, includeOllama, ollamaRoot);
+        if (found is not null || !includeOllama) return found;
+
+        // An ollama reference ("llama3.2:3b", "ollama:user/model:tag"): our own pulled copy first, then the ollama store in place.
+        if (OllamaRef.TryParse(arg) is { } o)
+        {
+            string pulled = OllamaRegistry.TargetPath(o, modelsDir);
+            if (File.Exists(pulled)) return pulled;
+            return OllamaStore.TryFind(o, ollamaRoot)?.BlobPath;
+        }
+        return null;
+    }
+
+    private static string? ResolveLocalCore(string arg, string? quant, string? modelsDir, string? cacheRoot, bool includeOllama, string? ollamaRoot)
     {
         if (string.IsNullOrWhiteSpace(arg)) return null;
-        if (arg.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase) && File.Exists(arg)) return Path.GetFullPath(arg);
+        // An absolute path to an existing GGUF is accepted whatever its extension: ollama blobs are named sha256-<hex>.
+        if (File.Exists(arg) && (arg.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase) || (Path.IsPathRooted(arg) && HasGgufMagic(arg)))) return Path.GetFullPath(arg);
 
         var r = Parse(arg);
         string? tag = quant ?? r.Tag;
-        var all = EnumerateLocal(modelsDir, cacheRoot);
+        var all = EnumerateLocal(modelsDir, cacheRoot, includeOllama, ollamaRoot);
 
         if (r.IsRepo)
         {
@@ -143,6 +170,32 @@ public static class ModelResolver
             Path.GetFileNameWithoutExtension(m.Filename).Equals(name, StringComparison.OrdinalIgnoreCase)
             || Path.GetFileName(m.Filename).Equals(name, StringComparison.OrdinalIgnoreCase)).ToList();
         return ChooseFile(named, tag)?.FullPath;
+    }
+
+    private static bool HasGgufMagic(string path)
+    {
+        try
+        {
+            using var fs = File.OpenRead(path);
+            Span<byte> m = stackalloc byte[4];
+            return fs.Read(m) == 4 && m[0] == (byte)'G' && m[1] == (byte)'G' && m[2] == (byte)'U' && m[3] == (byte)'F';
+        }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
+    }
+
+    /// <summary>
+    /// Pulls an ollama reference from the registry into the model store and saves a profile named <c>name:tag</c> carrying its system prompt and
+    /// parameters (an existing profile of that name is left alone). Returns the GGUF path.
+    /// </summary>
+    public static async Task<string> PullOllamaAsync(
+        OllamaRef reference, OllamaRegistry registry, IProgress<(long bytesDownloaded, long? totalBytes)>? progress, CancellationToken ct,
+        string? modelsDir = null, string? profilesDir = null)
+    {
+        var (path, profile) = await registry.PullAsync(reference, progress, ct, modelsDir).ConfigureAwait(false);
+        if (ModelProfileStore.TryGet(reference.ToString(), profilesDir) is null)
+            ModelProfileStore.Save(reference.ToString(), profile, profilesDir);
+        return path;
     }
 
     /// <summary>

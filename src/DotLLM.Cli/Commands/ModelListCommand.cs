@@ -14,7 +14,7 @@ internal sealed class ModelListCommand : Command<ModelListCommand.Settings>
 
     public override int Execute(CommandContext context, Settings settings)
     {
-        var models = ModelResolver.EnumerateLocal();
+        var models = ModelResolver.EnumerateLocal(includeOllama: true);
         var profiles = ModelProfileStore.List();
 
         if (models.Count == 0 && profiles.Count == 0)

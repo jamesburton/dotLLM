@@ -27,6 +27,22 @@ internal sealed class ModelPullCommand : AsyncCommand<ModelPullCommand.Settings>
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
+        // "ollama:llama3.2:3b" pulls from the ollama registry instead of the Hugging Face Hub.
+        if (OllamaRef.TryParse(settings.RepoId) is { Explicit: true } ollamaRef)
+        {
+            try
+            {
+                string pulled = GgufFileResolver.PullOllamaWithProgress(ollamaRef);
+                AnsiConsole.MarkupLine($"[green]Saved to:[/] {pulled.EscapeMarkup()}  [grey](model '{ollamaRef.ToString().EscapeMarkup()}' - run it with: dotllm run {ollamaRef.ToString().EscapeMarkup()})[/]");
+                return 0;
+            }
+            catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException or IOException)
+            {
+                AnsiConsole.MarkupLine($"[red]Could not pull {settings.RepoId.EscapeMarkup()}:[/] {ex.Message.EscapeMarkup()}");
+                return 1;
+            }
+        }
+
         using var client = new HuggingFaceClient();
         using var downloader = new HuggingFaceDownloader();
 
