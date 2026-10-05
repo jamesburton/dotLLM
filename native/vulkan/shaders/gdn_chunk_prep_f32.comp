@@ -36,9 +36,7 @@ layout(push_constant) uniform PushConstants {
 const uint C = 64u;
 const uint D = 128u;
 
-shared float Ks[C][65];
-shared float Qs[C][65];
-shared float As[C][65];
+shared float pool[12480];   // Ks | As | Qs (4160 floats each, stride 65); Rs (stride 129) overlays Ks+As once both are dead
 shared float lgS[C];
 shared float betaS[C];
 
@@ -74,8 +72,8 @@ void main() {
             uint t = tok0 + i;
             bool valid = int(t) < pc.seq_len;
             uint idx = t * qkPerToken + kh * D + dh * 64u + dd;
-            Ks[i][dd] = valid ? k_buf[idx] : 0.0;
-            Qs[i][dd] = valid ? q_buf[idx] : 0.0;
+            pool[0 + (i) * 65 + (dd)] = valid ? k_buf[idx] : 0.0;
+            pool[8320 + (i) * 65 + (dd)] = valid ? q_buf[idx] : 0.0;
         }
         barrier();
         for (uint m = 0u; m < 16u; m++) {
@@ -83,9 +81,9 @@ void main() {
             uint i = p >> 6u, j = p & 63u;
             float a = 0.0, b = 0.0;
             for (uint d = 0u; d < 64u; d++) {
-                float kj = Ks[j][d];
-                a += Ks[i][d] * kj;
-                b += Qs[i][d] * kj;
+                float kj = pool[0 + (j) * 65 + (d)];
+                a += pool[0 + (i) * 65 + (d)] * kj;
+                b += pool[8320 + (i) * 65 + (d)] * kj;
             }
             kk[m] += a;
             qk[m] += b;
@@ -97,28 +95,46 @@ void main() {
         uint p = tid + 256u * m;
         uint i = p >> 6u, j = p & 63u;
         float ratio = exp(lgS[i] - lgS[j]);
-        As[i][j] = (j < i) ? betaS[i] * ratio * kk[m] : 0.0;
+        pool[4160 + (i) * 65 + (j)] = (j < i) ? betaS[i] * ratio * kk[m] : 0.0;
         p_buf[slot * (C * C) + p] = (j <= i) ? ratio * qk[m] : 0.0;
     }
     if (tid < C) lg_buf[slot * C + tid] = lgS[tid];
     barrier();
 
-    // Forward substitution (I + A) X = R, one column per thread: columns 0..127 -> U (R = beta v), 128..255 -> W (R = beta gamma k).
-    uint col = tid;
-    bool isV = col < D;
-    uint cc = isV ? col : col - D;
-    float x[64];
-    [[unroll]] for (uint i = 0u; i < C; i++) {
-        uint t = tok0 + i;
-        float r = 0.0;
-        if (int(t) < pc.seq_len) {
-            if (isV) r = betaS[i] * v_buf[t * vPerToken + vh * D + cc];
-            else     r = betaS[i] * exp(lgS[i]) * k_buf[t * qkPerToken + kh * D + cc];
+    // T = (I + A)^-1 (unit lower-triangular), computed column-parallel from forward substitution on the identity. LDS-resident: Tl aliases
+    // the (now dead) Qs tile.  Then U = T (beta v) and W = T (beta gamma k) as dense lower-triangular products over two 128-column passes
+    // whose right-hand sides are staged in LDS (Rs aliases the dead Ks tile + a dedicated extension).
+    if (tid < C) {
+        uint c = tid;
+        for (uint i = 0u; i < C; i++) {
+            float t = (i == c) ? 1.0 : 0.0;
+            for (uint j = 0u; j < i; j++) t -= pool[4160 + (i) * 65 + (j)] * pool[8320 + (j) * 65 + (c)];
+            pool[8320 + (i) * 65 + (c)] = t;
         }
-        float acc = r;
-        [[unroll]] for (uint j = 0u; j < i; j++) acc -= As[i][j] * x[j];
-        x[i] = acc;
-        if (isV) u_buf[slot * (C * D) + i * D + cc] = acc;
-        else     w_buf[slot * (C * D) + i * D + cc] = acc;
+    }
+    barrier();
+    for (uint pass = 0u; pass < 2u; pass++) {
+        // stage R (64 x 128) for this pass
+        for (uint e = tid; e < C * D; e += 256u) {
+            uint i = e >> 7u, cc = e & 127u;
+            uint t = tok0 + i;
+            float r = 0.0;
+            if (int(t) < pc.seq_len) {
+                if (pass == 0u) r = betaS[i] * v_buf[t * vPerToken + vh * D + cc];
+                else            r = betaS[i] * exp(lgS[i]) * k_buf[t * qkPerToken + kh * D + cc];
+            }
+            pool[0 + (i) * 129 + (cc)] = r;
+        }
+        barrier();
+        uint cc = tid & 127u;
+        uint i0 = (tid >> 7u) * 32u;
+        for (uint ii = 0u; ii < 32u; ii++) {
+            uint i = i0 + ii;
+            float acc = 0.0;
+            for (uint j = 0u; j <= i; j++) acc += pool[8320 + (i) * 65 + (j)] * pool[0 + (j) * 129 + (cc)];
+            if (pass == 0u) u_buf[slot * (C * D) + i * D + cc] = acc;
+            else            w_buf[slot * (C * D) + i * D + cc] = acc;
+        }
+        barrier();
     }
 }

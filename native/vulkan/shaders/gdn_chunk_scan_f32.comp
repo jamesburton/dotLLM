@@ -80,7 +80,7 @@ void main() {
         float accQ0 = 0.0, accQ1 = 0.0, accQ2 = 0.0, accQ3 = 0.0;
         uint wRow = slot * (C * D) + ia * D;
         uint qRow = tokA * qkPerToken + kh * D;
-        [[unroll]] for (uint r = 0u; r < D; r++) {
+        [[dont_unroll]] for (uint r = 0u; r < D; r++) {
             float w = w_buf[wRow + r];
             float qv = validA ? q_buf[qRow + r] : 0.0;
             uint sb = r * CS + cg * 4u;
