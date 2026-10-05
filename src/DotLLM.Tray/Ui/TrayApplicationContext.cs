@@ -340,7 +340,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private async Task CheckForUpdatesAsync(bool announceWhenCurrent)
     {
         var current = UpdateChecker.CurrentVersion(typeof(TrayApplicationContext).Assembly);
-        var result = await new UpdateChecker(_updateHttp)
+        var result = await new UpdateChecker(_updateHttp, UpdateChecker.ReleasesUrlFor(_settings.UpdateRepo))
             .CheckAsync(current, _settings.IncludePrereleases)
             .ConfigureAwait(true);
 

@@ -70,6 +70,14 @@ public sealed record TraySettings
     public bool IncludePrereleases { get; init; }
 
     /// <summary>
+    /// GitHub repository (<c>owner/repo</c>) whose releases the update check reads; null means
+    /// <see cref="Updates.UpdateChecker.DefaultRepository"/>. Nullable on purpose: an <c>init</c> default would be dropped by the
+    /// source-generated deserializer.
+    /// </summary>
+    [JsonPropertyName("update_repo")]
+    public string? UpdateRepo { get; init; }
+
+    /// <summary>
     /// Mirror of the autostart state, for display only. <see cref="Autostart.AutostartManager"/>
     /// reads the registry, which is authoritative; this field is never trusted for a decision.
     /// </summary>
