@@ -309,6 +309,22 @@ touching its base model. `dotllm run|chat` resolve a profile to its base model b
 **`dotllm ps` / `dotllm stop [model|--all]`** are thin clients of a running server (`--url` or `DOTLLM_URL`, default `http://localhost:8080`):
 `ps` lists the resident models with size, idle time and the auto-unload countdown; `stop` unloads (needs the server's `--allow-model-admin`).
 
+## Using ollama's models (#718)
+
+dotLLM reads an existing ollama installation **in place** and can pull from the same registry, so ollama names work everywhere a model is named:
+
+| you write | what happens |
+|---|---|
+| `dotllm run llama3.2:3b` (also `serve`, `chat`, or `"model": "llama3.2:3b"` in a request) | found in your ollama store (`OLLAMA_MODELS` or `~/.ollama/models`): the GGUF blob is loaded in place - nothing is copied. A miss is pulled from `registry.ollama.ai` (CLI always; the server only with `--auto-pull`) |
+| `dotllm model pull ollama:llama3.2:3b` | download from the ollama registry into `~/.dotllm/models/ollama/` (resumable, **sha256-verified**, a corrupt partial is discarded) and save a profile `llama3.2:3b` carrying the manifest's system prompt and parameters (temperature, top_p, top_k, repeat_penalty, stop, num_predict, seed; `num_ctx` is not mapped) |
+| `ollama:user/model:tag` | a namespaced ollama model (a plain `owner/repo` always means Hugging Face) |
+| `dotllm model import-ollama [name] [--force]` | turn the models of your ollama store into profiles (system prompt and parameters applied, blobs still used in place) |
+
+`dotllm model list` and `GET /v1/models/available` list ollama-store models as `ollama/<name>`; a loaded one is keyed `name:tag`. Limits: the ollama
+**prompt template** (a Go template) is not carried over - dotLLM renders the chat template embedded in the GGUF, which is what the model was
+converted with; a model that only works through a custom ollama `TEMPLATE` may need a hand-written template. Only GGUF model layers are handled (vision
+projector layers are ignored). dotLLM never writes into the ollama store.
+
 ## Model Keep-Alive / Idle-Unload / Multi-Model Residency (#369)
 
 Ollama-parity daemon lifecycle: idle models unload automatically, and — when configured — more than

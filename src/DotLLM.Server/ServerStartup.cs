@@ -30,8 +30,8 @@ public static class ServerStartup
     {
         // A profile name resolves to its base model (#716); profiles shadow a model that happens to share the name.
         if (ModelProfileStore.Resolve(modelArg) is { } resolved)
-            return ModelResolver.ResolveLocal(resolved.BaseReference, quant);
-        return ModelResolver.ResolveLocal(modelArg, quant);
+            return ModelResolver.ResolveLocal(resolved.BaseReference, quant, includeOllama: true);
+        return ModelResolver.ResolveLocal(modelArg, quant, includeOllama: true);
     }
 
     /// <summary>
@@ -41,6 +41,8 @@ public static class ServerStartup
     public static string ModelIdFor(string requested, string resolvedPath) =>
         ModelProfileStore.NormalizeName(requested) is { } n && ModelProfileStore.TryGet(n) is not null
             ? n
+            // An ollama blob is named sha256-<hex>: key the model by the ollama name it was requested under.
+            : OllamaStore.IsBlobPath(resolvedPath) && OllamaRef.TryParse(requested) is { } o ? o.ToString()
             : Path.GetFileNameWithoutExtension(resolvedPath);
 
     /// <summary>
@@ -52,7 +54,14 @@ public static class ServerStartup
         string? path = ResolveModelPath(modelArg, quant);
         if (path is not null || !autoPull) return path;
 
-        var reference = ModelResolver.Parse(ModelProfileStore.Resolve(modelArg)?.BaseReference ?? modelArg);
+        string baseRef = ModelProfileStore.Resolve(modelArg)?.BaseReference ?? modelArg;
+        if (OllamaRef.TryParse(baseRef) is { } ollamaRef && !ModelResolver.Parse(baseRef).IsRepo)
+        {
+            using var registry = new OllamaRegistry();
+            Console.WriteLine($"[dotllm] --auto-pull: downloading {ollamaRef} from the ollama registry");
+            return await ModelResolver.PullOllamaAsync(ollamaRef, registry, progress: null, ct).ConfigureAwait(false);
+        }
+        var reference = ModelResolver.Parse(baseRef);
         if (!reference.IsRepo) return null;
         using var client = new HuggingFaceClient();
         using var downloader = new HuggingFaceDownloader();
@@ -61,9 +70,14 @@ public static class ServerStartup
     }
 
     /// <summary>The message for an unresolvable model name, with the way out.</summary>
-    public static string NotFoundMessage(string modelArg) =>
-        $"Model not found: {modelArg}. Download it with `dotllm model pull {modelArg}` or POST /v1/models/pull" +
-        (ModelResolver.Parse(ModelProfileStore.Resolve(modelArg)?.BaseReference ?? modelArg).IsRepo ? ", or start the server with --auto-pull." : ".");
+    public static string NotFoundMessage(string modelArg)
+    {
+        string baseRef = ModelProfileStore.Resolve(modelArg)?.BaseReference ?? modelArg;
+        bool hf = ModelResolver.Parse(baseRef).IsRepo;
+        string pull = !hf && OllamaRef.TryParse(baseRef) is { } o ? $"dotllm model pull ollama:{o}" : $"dotllm model pull {modelArg}";
+        return $"Model not found: {modelArg}. Download it with `{pull}` or POST /v1/models/pull" +
+               (hf || OllamaRef.TryParse(baseRef) is not null ? ", or start the server with --auto-pull." : ".");
+    }
 
     /// <summary>
     /// Creates a bare <see cref="ServerState"/> with no model loaded.

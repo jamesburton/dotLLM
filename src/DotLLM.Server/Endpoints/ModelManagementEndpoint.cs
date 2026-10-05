@@ -23,7 +23,7 @@ public static class ModelManagementEndpoint
     {
         app.MapGet("/v1/models/available", (ServerState state) =>
         {
-            var models = ModelResolver.EnumerateLocal();
+            var models = ModelResolver.EnumerateLocal(includeOllama: true);
             return new AvailableModelsResponse
             {
                 Models = models.Select(m =>

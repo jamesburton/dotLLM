@@ -55,6 +55,10 @@ app.Configure(config =>
             .WithDescription("Create a named model profile: a base model plus system prompt, sampling defaults, device and keep-alive.")
             .WithExample("model", "create", "terse", "--from", "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M", "--system", "Answer in one sentence.", "--temperature", "0.2");
 
+        model.AddCommand<ModelImportOllamaCommand>("import-ollama")
+            .WithDescription("Import models from an existing ollama installation as profiles (blobs are used in place, nothing is copied).")
+            .WithExample("model", "import-ollama");
+
         model.AddCommand<ModelShowCommand>("show")
             .WithDescription("Show a profile's settings and where its model resolves.")
             .WithExample("model", "show", "terse");
