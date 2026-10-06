@@ -471,7 +471,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         // The gemma4 forward runs the F32 path and uses the host LM head (the tied
         // vocab x hidden table is too large to expand to F32 device scratch), so it
         // also needs the CPU weights retained.
-        _isGemmaFamily = IsGemmaDenseFamily(config);
+        _isGemmaFamily = UsesF32DenseForward(config);
         if (_useHighPrecisionForward || _isGemma4 || _isGemmaFamily)
         {
             _cpuWeights = cpuWeights;
@@ -623,6 +623,8 @@ public sealed unsafe class CudaTransformerModel : IModel
         TransformerWeights cpuWeights, ModelConfig config, GgufFile? gguf,
         int deviceId, string? ptxDir, long estimatedWeightBytes)
     {
+        RejectUnsupportedArchitecture(config);
+
         // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
         // incomplete ptxDir is by far the most common way this factory throws, and doing the
         // check up front means it can no longer orphan a context/stream/cuBLAS handle,
@@ -2709,7 +2711,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             return true;
 
         // Gemma 1/2/3 keep the host norm gains for the F32 forward's device upload.
-        if (IsGemmaDenseFamily(config))
+        if (UsesF32DenseForward(config))
             return true;
 
         // High-precision I-quant forward retains host weights for the dequant→F32→dot CPU
@@ -3389,11 +3391,33 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// </summary>
     internal static void RejectGemmaForCompositeHost(ModelConfig config, string host)
     {
-        if (IsGemmaDenseFamily(config))
+        if (UsesF32DenseForward(config) || config.HasGraniteScalars)
             throw new NotSupportedException(
-                $"{config.Architecture} (GGUF 'gemma'/'gemma2'/'gemma3') is not supported by {host}: its layer loop has no "
-                + "GeGLU / embedding scale / post-norms / QK-norm / dual RoPE / soft-capping. Use CudaTransformerModel "
-                + "(single GPU, FP32 Gemma forward), the CPU backend, or Vulkan.");
+                $"{config.Architecture} (GGUF 'gemma'/'gemma2'/'gemma3'/'granite') is not supported by {host}: its layer loop has no "
+                + "GeGLU / embedding scale / post-norms / QK-norm / dual RoPE / soft-capping / Granite residual, attention "
+                + "and logit scalars. Use CudaTransformerModel (single GPU, FP32 dense forward), the CPU backend, or Vulkan.");
+    }
+
+    /// <summary>
+    /// Models served by the dedicated FP32-activation dense forward (<c>ForwardGemmaF32</c>): the Gemma family and
+    /// dense Granite. The generic FP16 layer loop (fused add+RMSNorm kernels, CUDA-graph capture) implements none of
+    /// their extra ops (Granite residual / attention / logit scalars) and Gemma residual stream overflows FP16.
+    /// </summary>
+    internal static bool UsesF32DenseForward(ModelConfig config)
+        => IsGemmaDenseFamily(config) || config.Architecture == Architecture.Granite;
+
+    /// <summary>
+    /// Architectures CUDA cannot honour: refuse at load with an actionable message instead of silently running a
+    /// path that lacks the model ops. GraniteMoe: the generic CUDA MoE layer loop has no Granite scalars.
+    /// </summary>
+    internal static void RejectUnsupportedArchitecture(ModelConfig config)
+    {
+        if (config.Architecture == Architecture.GraniteMoe)
+            throw new NotSupportedException(
+                "Architecture GraniteMoe (Granite-3.x MoE, GGUF granitemoe) is not supported on the CUDA backend: the "
+                + "routed-MoE layer loop does not implement the Granite embedding / attention / residual / logit scalars, so "
+                + "it would silently produce wrong logits. Dense Granite (granite) is supported on CUDA; use the Vulkan or "
+                + "CPU backend for granitemoe. Tracked in https://github.com/jamesburton/dotLLM/issues/764.");
     }
 
     /// <summary>
@@ -3510,7 +3534,12 @@ public sealed unsafe class CudaTransformerModel : IModel
         float eps = Config.NormEpsilon;
         nint s = _stream.Handle;
 
-        float scoreScale = Config.QueryPreAttnScalar is float qpas && qpas > 0f ? 1.0f / MathF.Sqrt(qpas) : 0f;
+        // Granite attention_multiplier / Gemma query_pre_attn_scalar; 0 keeps the kernel default 1/sqrt(head_dim).
+        float scoreScale = Config.AttentionScale is not null || Config.QueryPreAttnScalar is not null
+            ? Config.AttentionScoreScale(headDim) : 0f;
+        float residualScale = Config.ResidualScale ?? 1.0f;
+        float logitScale = Config.LogitScale ?? 1.0f;
+        bool geglu = Config.ActivationFunction == ActivationFunction.GELUTanh;
         float attnSoftcap = Config.AttnLogitSoftcap ?? 0f;
         float finalSoftcap = Config.FinalLogitSoftcap ?? 0f;
 
@@ -3590,6 +3619,9 @@ public sealed unsafe class CudaTransformerModel : IModel
             if (gemma2)
                 _kernels.LaunchRmsNormF32(_state.NormOutputF32, norms.PostAttnNorm, _state.NormOutputF32,
                     hiddenSize, eps, seqLen, s);
+            // Granite residual multiplier: h = h + residual_scale * sublayer(h).
+            if (residualScale != 1.0f)
+                _kernels.LaunchScaleInplaceF32(_state.NormOutputF32, seqLen * hiddenSize, residualScale, s);
             _kernels.LaunchAddF32(_state.ResidualF32, _state.NormOutputF32, _state.ResidualF32,
                 seqLen * hiddenSize, s);
 
@@ -3600,13 +3632,19 @@ public sealed unsafe class CudaTransformerModel : IModel
                 lw.GateOutputDim, lw.GateInputDim, seqLen);
             ProjectF32(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutputF32, _state.FfnUpF32,
                 lw.UpOutputDim, lw.UpInputDim, seqLen);
-            _kernels.LaunchGeGLUTanhF32(_state.FfnGateF32, _state.FfnUpF32, _state.SiluOutputF32,
-                intermediate, seqLen, s);
+            if (geglu)
+                _kernels.LaunchGeGLUTanhF32(_state.FfnGateF32, _state.FfnUpF32, _state.SiluOutputF32,
+                    intermediate, seqLen, s);
+            else
+                _kernels.LaunchSwiGLUF32(_state.FfnGateF32, _state.FfnUpF32, _state.SiluOutputF32,
+                    intermediate, seqLen, s);
             ProjectF32(lw.DownQuant, lw.DownQuantType, lw.Down, _state.SiluOutputF32, _state.NormOutputF32,
                 lw.DownOutputDim, lw.DownInputDim, seqLen);
             if (gemma2)
                 _kernels.LaunchRmsNormF32(_state.NormOutputF32, norms.PostFfnNorm, _state.NormOutputF32,
                     hiddenSize, eps, seqLen, s);
+            if (residualScale != 1.0f)
+                _kernels.LaunchScaleInplaceF32(_state.NormOutputF32, seqLen * hiddenSize, residualScale, s);
             _kernels.LaunchAddF32(_state.ResidualF32, _state.NormOutputF32, _state.ResidualF32,
                 seqLen * hiddenSize, s);
         }
@@ -3620,6 +3658,9 @@ public sealed unsafe class CudaTransformerModel : IModel
             _state.NormOutput, _state.LogitsF16,
             _weights.OutputOutputDim, _weights.OutputInputDim, 1);
         _kernels.LaunchConvertF16ToF32(_state.LogitsF16, _state.LogitsF32, vocabSize, s);
+        // Granite logit scale: logits are divided by logits_scaling (before any soft-cap; Granite has none).
+        if (logitScale != 1.0f)
+            _kernels.LaunchScaleInplaceF32(_state.LogitsF32, vocabSize, 1.0f / logitScale, s);
         if (finalSoftcap > 0f)
             _kernels.LaunchSoftcapInplaceF32(_state.LogitsF32, vocabSize, finalSoftcap, s);
         _stream.Synchronize();

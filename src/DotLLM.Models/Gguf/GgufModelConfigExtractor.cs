@@ -199,6 +199,26 @@ public static partial class GgufModelConfigExtractor
         {
             moeConfig = ExtractNemotronHMoeConfig(metadata, arch, intermediateSize);
         }
+        else if (architecture == Architecture.GraniteMoe)
+        {
+            moeConfig = ExtractGraniteMoeConfig(metadata, arch, intermediateSize);
+        }
+
+        // Granite scalars (llama.cpp granite.cpp / granite-moe.cpp; conversion/granite.py writes the HF
+        // *_multiplier / logits_scaling values under these keys). 0 / absent = off for embedding, residual and
+        // attention; logit_scale is REQUIRED by llama.cpp for both granite arches.
+        bool isGranite = architecture is Architecture.Granite or Architecture.GraniteMoe;
+        float graniteEmbedding = 0f, graniteResidual = 0f, graniteAttention = 0f, graniteLogit = 0f;
+        if (isGranite)
+        {
+            graniteEmbedding = metadata.GetFloat32OrDefault($"{arch}.embedding_scale", 0f);
+            graniteResidual = metadata.GetFloat32OrDefault($"{arch}.residual_scale", 0f);
+            graniteAttention = metadata.GetFloat32OrDefault($"{arch}.attention.scale", 0f);
+            if (!metadata.ContainsKey($"{arch}.logit_scale"))
+                throw new InvalidDataException(
+                    $"GGUF architecture '{arch}' requires '{arch}.logit_scale' (llama.cpp reads it as required); the file does not carry it.");
+            graniteLogit = metadata.GetFloat32($"{arch}.logit_scale");
+        }
 
         bool isGemma2 = architecture == Architecture.Gemma2;
         bool isGemma3 = architecture == Architecture.Gemma3;
@@ -224,7 +244,11 @@ public static partial class GgufModelConfigExtractor
                 ? ActivationFunction.ReluSquared
                 : isGemmaFamily ? ActivationFunction.GELUTanh : ActivationFunction.SiLU,
             // Gemma scales the token embeddings by sqrt(hidden_size); ties the LM head to them.
-            EmbeddingScale = isGemmaFamily ? MathF.Sqrt(hiddenSize) : null,
+            EmbeddingScale = isGemmaFamily ? MathF.Sqrt(hiddenSize)
+                : graniteEmbedding > 0f ? graniteEmbedding : null,
+            ResidualScale = graniteResidual > 0f ? graniteResidual : null,
+            AttentionScale = graniteAttention > 0f ? graniteAttention : null,
+            LogitScale = graniteLogit > 0f ? graniteLogit : null,
             TiedEmbeddings = isGemmaFamily,
             AttnLogitSoftcap = isGemma2 ? metadata.GetFloat32OrDefault($"{arch}.attn_logit_softcapping", 50.0f) : null,
             FinalLogitSoftcap = isGemma2 ? metadata.GetFloat32OrDefault($"{arch}.final_logit_softcapping", 30.0f)
@@ -686,6 +710,33 @@ public static partial class GgufModelConfigExtractor
         };
     }
 
+    /// <summary>
+    /// Granite-3.x MoE (llama.cpp <c>granite-moe.cpp</c>): every layer routed-MoE, softmax over all experts then
+    /// top-k renormalised (<c>norm_w = true</c>), stacked <c>ffn_{gate,up,down}_exps</c>, no shared expert.
+    /// A non-zero <c>expert_shared_feed_forward_length</c> (Granite MoE-shared) is NOT implemented and is
+    /// rejected rather than silently dropped.
+    /// </summary>
+    private static MoeConfig ExtractGraniteMoeConfig(GgufMetadata metadata, string arch, int denseIntermediate)
+    {
+        uint shared = metadata.GetUInt32OrDefault($"{arch}.expert_shared_feed_forward_length", 0);
+        if (shared > 0)
+            throw new NotSupportedException(
+                $"Granite MoE with a shared expert ('{arch}.expert_shared_feed_forward_length' = {shared}) is not implemented: "
+                + "its ungated shared FFN branch would be silently dropped. Tracked in https://github.com/jamesburton/dotLLM/issues/764.");
+        int expertCount = (int)metadata.GetUInt32($"{arch}.expert_count");
+        int expertUsed = (int)metadata.GetUInt32($"{arch}.expert_used_count");
+        int moeIntermediate = (int)metadata.GetUInt32OrDefault(
+            $"{arch}.expert_feed_forward_length", (uint)denseIntermediate);
+        return new MoeConfig
+        {
+            NumExperts = expertCount,
+            NumExpertsPerTok = expertUsed,
+            MoeIntermediateSize = moeIntermediate,
+            NormTopKProb = true,
+            DecoderSparseStep = 1,
+        };
+    }
+
     private static HybridLayerLayout? TryExtractHybridLayout(
         GgufMetadata metadata, string arch, int numLayers, int trailingMtpLayers)
     {
@@ -891,6 +942,9 @@ public static partial class GgufModelConfigExtractor
             "gemma2" => Architecture.Gemma2,
             // Gemma 3 text tower (llama.cpp LLM_ARCH_GEMMA3): QK-norm, dual RoPE, 5:1 local/global.
             "gemma3" => Architecture.Gemma3,
+            // IBM Granite (llama.cpp LLM_ARCH_GRANITE / LLM_ARCH_GRANITE_MOE): Llama/Mixtral shape + 4 scalars.
+            "granite" => Architecture.Granite,
+            "granitemoe" => Architecture.GraniteMoe,
             // BERT-class embedding encoders (#739).
             "bert" => Architecture.Bert,
             "nomic-bert" => Architecture.NomicBert,
