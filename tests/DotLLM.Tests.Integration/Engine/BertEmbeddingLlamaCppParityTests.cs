@@ -27,11 +27,34 @@ public sealed class BertEmbeddingLlamaCppParityTests(ITestOutputHelper output)
     /// <summary>Per-vector cosine gate. See the per-model measurements in the PR / docs.</summary>
     private const double CosineGate = 0.9999;
 
-    /// <summary>Quantized weights add activation-quantization noise vs llama.cpp (attributed by
-    /// <c>BertEmbeddingDiagnosticArmsTests</c>: F32-activation arm is no closer), so gates are per tier.
-    /// Measured worst: Q8_0 0.99965-0.99988, Q4_K_M 0.9805 worst over inputs.</summary>
-    private static double GateFor(string key)
-        => key.EndsWith("q4km") ? 0.975 : key.EndsWith("q8") ? 0.999 : CosineGate;
+    /// <summary>
+    /// Per-quantization gates, set from the measured variance BETWEEN independent providers rather than
+    /// guessed (#739). Worst-case cosine over the 9 test inputs, same GGUF, same texts, token ids identical
+    /// across every provider (llama.cpp /tokenize; ollama prompt_eval_count = 191 for all):
+    /// <code>
+    ///                          llama.cpp CPU vs   dotLLM vs        dotLLM vs     inter-provider
+    ///                          llama.cpp Vulkan   llama.cpp CPU    unquantised   floor (gate basis)
+    /// minilm-l6-v2 Q8_0        0.999564           0.999668         0.999132 (f16 ref; llama 0.999019)
+    /// mxbai-large  Q8_0        0.999750           0.999880         0.999710 (f32 ref; llama 0.999718)
+    /// nomic-v1.5   Q8_0        0.998983           0.999392         0.997502 (f32 ref; llama 0.997484)
+    /// nomic-v1.5   Q4_K_M      0.982358*          0.982278         0.912007 (f32 ref; llama 0.909099)
+    /// </code>
+    /// * llama.cpp b8683 CPU vs b9016 CPU is 0.985683 and b9016 CPU vs Vulkan 0.982358 on Q4_K_M, so the
+    /// independent providers themselves disagree by as much as dotLLM does. llama.cpp builds b8683 / b9016 /
+    /// b9672 / b9747 (CPU, --device none), b9016 and b9747 (Vulkan, -ngl 99) and ollama 0.33.1 (CPU) were run;
+    /// ollama and the b9016+ CPU builds are bit-identical (same ggml CPU kernels) so they count once. dotLLM's
+    /// error against the UNQUANTISED reference equals llama.cpp's to 5 digits, i.e. it is the same quantization
+    /// noise, not an extra defect. Gates sit just under each floor. The f32/f16 gate (0.9999) is the control
+    /// that could have disagreed: it is tight and passes, so a real forward-pass bug cannot hide here.
+    /// </summary>
+    private static double GateFor(string key) => key switch
+    {
+        "minilm-q8" => 0.9995,
+        "mxbai-q8" => 0.9997,
+        "nomic-q8" => 0.998,
+        "nomic-q4km" => 0.98,
+        _ => CosineGate,
+    };
 
     public sealed record Spec(string Fixture, string Env, string Org, string Repo, string File, string Description);
 
