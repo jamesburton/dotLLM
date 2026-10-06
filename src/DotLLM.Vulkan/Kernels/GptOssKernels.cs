@@ -114,10 +114,17 @@ internal sealed class VulkanGptOssKernels : IDisposable
     private readonly SimpleComputeKernel _expertBias;
     private readonly SimpleComputeKernel _topkRaw;
     private readonly MoeIndexedMatmulMxfp4F32Kernel _mxfp4;
+    private readonly SimpleComputeKernel _ropeYarn;
+
+    /// <summary>Dispatch counters (debug/perturbation proof that each path actually ran, #737).</summary>
+    public long SinkAttentionDispatches, SwiGluOaiDispatches, ExpertBiasDispatches,
+        RawTopKDispatches, Mxfp4MatmulDispatches, RopeYarnDispatches;
 
     private VulkanGptOssKernels(SimpleComputeKernel attnSinks, SimpleComputeKernel swigluOai,
-        SimpleComputeKernel expertBias, SimpleComputeKernel topkRaw, MoeIndexedMatmulMxfp4F32Kernel mxfp4)
+        SimpleComputeKernel expertBias, SimpleComputeKernel topkRaw, MoeIndexedMatmulMxfp4F32Kernel mxfp4,
+        SimpleComputeKernel ropeYarn)
     {
+        _ropeYarn = ropeYarn;
         _attnSinks = attnSinks;
         _swigluOai = swigluOai;
         _expertBias = expertBias;
@@ -135,7 +142,8 @@ internal sealed class VulkanGptOssKernels : IDisposable
         var bias = SimpleComputeKernel.Create(device, spvDir, "moe_expert_bias_add_f32", buffers: 3, pushWords: 3);
         var topk = SimpleComputeKernel.Create(device, spvDir, "moe_topk_rawsoftmax_f32", buffers: 3, pushWords: 3);
         var mx = MoeIndexedMatmulMxfp4F32Kernel.Create(device, spvDir);
-        return new VulkanGptOssKernels(attn, swi, bias, topk, mx);
+        var yarn = SimpleComputeKernel.Create(device, spvDir, "rope_yarn_f32", buffers: 4, pushWords: 8);
+        return new VulkanGptOssKernels(attn, swi, bias, topk, mx, yarn);
     }
 
     internal void InvalidateDescriptorCaches()
@@ -145,6 +153,7 @@ internal sealed class VulkanGptOssKernels : IDisposable
         _expertBias.InvalidateDescriptorCache();
         _topkRaw.InvalidateDescriptorCache();
         _mxfp4.InvalidateDescriptorCache();
+        _ropeYarn.InvalidateDescriptorCache();
     }
 
     /// <summary>
@@ -174,6 +183,7 @@ internal sealed class VulkanGptOssKernels : IDisposable
             BitConverter.SingleToUInt32Bits(0.0f) /*softCap*/, BitConverter.SingleToUInt32Bits(scaleOverride),
             0u /*causal*/, 0u,
         ];
+        SinkAttentionDispatches++;
         _attnSinks.Record(cmdBuf, bufs, pc, (uint)seqQ * (uint)numHeads);
     }
 
@@ -186,6 +196,7 @@ internal sealed class VulkanGptOssKernels : IDisposable
         [
             (uint)n, BitConverter.SingleToUInt32Bits(SwiGluOaiAlpha), BitConverter.SingleToUInt32Bits(SwiGluOaiLimit),
         ];
+        SwiGluOaiDispatches++;
         _swigluOai.Record(cmdBuf, bufs, pc, (uint)((n + Wg256 - 1) / Wg256));
     }
 
@@ -196,6 +207,7 @@ internal sealed class VulkanGptOssKernels : IDisposable
         ReadOnlySpan<nint> bufs = [y.Handle, bias.Handle, indices.Handle];
         ReadOnlySpan<uint> pc = [(uint)rows, (uint)dim, (uint)numExperts];
         long total = (long)rows * dim;
+        ExpertBiasDispatches++;
         _expertBias.Record(cmdBuf, bufs, pc, (uint)((total + Wg256 - 1) / Wg256));
     }
 
@@ -209,7 +221,37 @@ internal sealed class VulkanGptOssKernels : IDisposable
         if (k <= 0 || k > 16) throw new ArgumentException("k must be in [1, 16].", nameof(k));
         ReadOnlySpan<nint> bufs = [logits.Handle, indices.Handle, weights.Handle];
         ReadOnlySpan<uint> pc = [(uint)seqLen, (uint)numExperts, (uint)k];
+        RawTopKDispatches++;
         _topkRaw.Record(cmdBuf, bufs, pc, (uint)seqLen);
+    }
+
+    /// <summary>
+    /// Dense-YaRN RoPE: rotates Q/K in place using the host-built inverse-frequency table
+    /// <paramref name="invFreq"/> <c>[ropeDim/2]</c> and scales cos/sin by <paramref name="mscale"/>.
+    /// </summary>
+    public void RecordRopeYarn(nint cmdBuf, VulkanDevice.Buffer q, VulkanDevice.Buffer k,
+        VulkanDevice.Buffer positions, VulkanDevice.Buffer invFreq,
+        int seqLen, int numHeads, int numKvHeads, int headDim, int ropeDim, bool neox, float mscale)
+    {
+        if (ropeDim <= 0 || (ropeDim & 1) != 0 || ropeDim > headDim)
+            throw new ArgumentException($"ropeDim {ropeDim} invalid for headDim {headDim}.", nameof(ropeDim));
+        ReadOnlySpan<nint> bufs = [q.Handle, k.Handle, positions.Handle, invFreq.Handle];
+        ReadOnlySpan<uint> pc =
+        [
+            (uint)seqLen, (uint)numHeads, (uint)numKvHeads, (uint)headDim, (uint)ropeDim,
+            neox ? 1u : 0u, BitConverter.SingleToUInt32Bits(mscale), (uint)(ropeDim / 2),
+        ];
+        long maxPairs = (long)seqLen * Math.Max(numHeads, numKvHeads) * (ropeDim / 2);
+        RopeYarnDispatches++;
+        _ropeYarn.Record(cmdBuf, bufs, pc, (uint)((maxPairs + Wg256 - 1) / Wg256));
+    }
+
+    /// <summary>Counted wrapper over the MXFP4 indexed matmul.</summary>
+    public void RecordIndexedMxfp4(nint cmdBuf, VulkanDevice.Buffer bank, VulkanDevice.Buffer x,
+        VulkanDevice.Buffer indices, VulkanDevice.Buffer y, int m, int k, int n, int numExperts)
+    {
+        Mxfp4MatmulDispatches++;
+        _mxfp4.Record(cmdBuf, bank, x, indices, y, m, k, n, numExperts);
     }
 
     public void Dispose()
@@ -219,5 +261,6 @@ internal sealed class VulkanGptOssKernels : IDisposable
         _expertBias.Dispose();
         _topkRaw.Dispose();
         _mxfp4.Dispose();
+        _ropeYarn.Dispose();
     }
 }

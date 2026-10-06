@@ -46,6 +46,17 @@ public sealed class VulkanUnsupportedArchitectureGuardTests
         Assert.DoesNotContain("attn_output.weight", ex.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Since #737 the single-device model implements gpt-oss; a flipped-architecture config with NO MoE
+    /// section (the fixture is a dense llama) must still be refused loudly, not loaded.
+    /// </summary>
+    private static void AssertGptOssNeedsMoe(NotSupportedException ex)
+    {
+        Assert.Contains(nameof(Architecture.GptOss), ex.Message, StringComparison.Ordinal);
+        Assert.Contains("MoE", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("attn_output.weight", ex.Message, StringComparison.Ordinal);
+    }
+
     private static (GgufFile Gguf, ModelConfig GptOssConfig) OpenAsGptOss(FixtureLocation fixture)
     {
         var gguf = GgufFile.Open(fixture.Path!);
@@ -60,7 +71,7 @@ public sealed class VulkanUnsupportedArchitectureGuardTests
     }
 
     [SkippableFact]
-    public void CreateFromGguf_GptOss_ThrowsNotSupportedNamingMissingFeatures()
+    public void CreateFromGguf_GptOssWithoutMoeConfig_ThrowsNotSupported()
     {
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device available.");
         var fixture = ResolveAnyGguf();
@@ -72,7 +83,7 @@ public sealed class VulkanUnsupportedArchitectureGuardTests
 
         var ex = Assert.Throws<NotSupportedException>(
             () => VulkanModelLoader.CreateFromGguf(device, gguf, config, spvDir: AppContext.BaseDirectory));
-        AssertGptOssRefusal(ex);
+        AssertGptOssNeedsMoe(ex);
     }
 
     /// <summary>Control: the identical GGUF + config minus the architecture flip loads fine.</summary>
@@ -94,14 +105,14 @@ public sealed class VulkanUnsupportedArchitectureGuardTests
     }
 
     [SkippableFact]
-    public void DirectVulkanTransformerModelLoadFromGguf_GptOss_Throws()
+    public void DirectVulkanTransformerModelLoadFromGguf_GptOssWithoutMoeConfig_Throws()
     {
         var fixture = ResolveAnyGguf();
         Skip.If(!fixture.Found, fixture.SkipMessage("any real GGUF (content unused by this test)"));
         var (gguf, config) = OpenAsGptOss(fixture);
         using var _ = gguf;
 
-        AssertGptOssRefusal(Assert.Throws<NotSupportedException>(
+        AssertGptOssNeedsMoe(Assert.Throws<NotSupportedException>(
             () => VulkanTransformerModel.LoadFromGguf(gguf, config)));
     }
 
