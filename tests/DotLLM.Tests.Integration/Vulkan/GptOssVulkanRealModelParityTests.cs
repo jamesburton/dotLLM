@@ -186,24 +186,43 @@ public sealed class GptOssVulkanRealModelParityTests
         foreach (int promptIdx in new[] { 0, 2 })
         {
             int[] ids = Encode(tokenizer, Prompts[promptIdx]);
-            foreach (int depth in new[] { 1, 2, 3, 4, 8, 12, 24 })
+            foreach (int depth in new[] { 1, 4, 24 })
             {
                 var config = fullConfig with { NumLayers = depth };
-                float[] c, v;
+                float[] c, v, vF32;
                 using (var cpu = DotLLM.Models.Architectures.TransformerModel.LoadFromGguf(gguf, config))
                     c = CpuPrefillRow(cpu, config, ids);
                 using (var vk = VulkanTransformerModel.LoadFromGguf(gguf, config, spv))
                     v = PrefillRow(vk, config.VocabSize, ids);
-                double num = 0, den = 0, dot = 0, nc = 0, nv = 0;
-                for (int i = 0; i < c.Length; i++)
+                // Control arm: same Vulkan model with the integer-dot (Q8_1 activation-quantised) matmul paths off, i.e.
+                // Q8_0 weights x F32 activations. |v - vF32| is the Vulkan activation-quantisation noise floor.
+                Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_MMVQ", "1");
+                Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_MMQ", "1");
+                try
                 {
-                    double d = c[i] - v[i];
-                    num += d * d; den += (double)c[i] * c[i];
-                    dot += (double)c[i] * v[i]; nc += (double)c[i] * c[i]; nv += (double)v[i] * v[i];
+                    using var vk32 = VulkanTransformerModel.LoadFromGguf(gguf, config, spv);
+                    vF32 = PrefillRow(vk32, config.VocabSize, ids);
                 }
-                _output.WriteLine($"prompt {promptIdx} depth {depth,2}: relL2={Math.Sqrt(num / den):E3} cos={dot / Math.Sqrt(nc * nv):F6}");
+                finally
+                {
+                    Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_MMVQ", null);
+                    Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_MMQ", null);
+                }
+                _output.WriteLine($"prompt {promptIdx} depth {depth,2}: cpu~vk {Rel(c, v)} | cpu~vkF32act {Rel(c, vF32)} | vk~vkF32act {Rel(v, vF32)}");
             }
         }
+    }
+
+    private static string Rel(float[] a, float[] b)
+    {
+        double num = 0, den = 0, dot = 0, na = 0, nb = 0;
+        for (int i = 0; i < a.Length; i++)
+        {
+            double d = a[i] - b[i];
+            num += d * d; den += (double)a[i] * a[i];
+            dot += (double)a[i] * b[i]; na += (double)a[i] * a[i]; nb += (double)b[i] * b[i];
+        }
+        return $"relL2={Math.Sqrt(num / den):E2} cos={dot / Math.Sqrt(na * nb):F6}";
     }
 
     private static unsafe float[] CpuPrefillRow(DotLLM.Core.Models.IModel m, DotLLM.Core.Models.ModelConfig config, int[] ids)

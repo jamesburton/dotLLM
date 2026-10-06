@@ -29,14 +29,21 @@ layout(push_constant) uniform PushConstants {
 
 const int KVALUES[16] = int[16](0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
 
-uint readByte(uint absByteOff) {
-    uint u = bank[absByteOff >> 2u];
-    return (u >> ((absByteOff & 3u) * 8u)) & 0xFFu;
-}
-
 float e8m0Half(uint e) {
     uint bits = (e < 2u) ? (0x00200000u << e) : ((e - 1u) << 23);
     return uintBitsToFloat(bits);
+}
+
+// Dot of one packed nibble word (4 bytes = 4 low nibbles -> elements j..j+3, 4 high nibbles -> elements
+// j+16..j+19) against the matching x slices.
+float nibbleWordDot(uint w, uint xBase, uint j) {
+    float acc = 0.0;
+    for (uint t = 0u; t < 4u; t++) {
+        uint q = (w >> (8u * t)) & 0xFFu;
+        acc += float(KVALUES[q & 0xFu]) * x[xBase + j + t]
+             + float(KVALUES[q >> 4u]) * x[xBase + j + t + 16u];
+    }
+    return acc;
 }
 
 void main() {
@@ -54,15 +61,32 @@ void main() {
 
     float acc = 0.0;
     for (uint b = 0u; b < pc.blocksPerRow; b++) {
-        uint blockByteBase = rowByteBase + b * 17u;
-        float d = e8m0Half(readByte(blockByteBase));
-        uint xBase = xRowBase + b * 32u;
-        float blockSum = 0.0;
-        for (uint j = 0u; j < 16u; j++) {
-            uint q = readByte(blockByteBase + 1u + j);
-            blockSum += float(KVALUES[q & 0xFu]) * x[xBase + j]
-                      + float(KVALUES[q >> 4u]) * x[xBase + j + 16u];
+        // A 17-byte block starts at an arbitrary byte offset: load the 5 dwords that cover it (bytes 0..16 end in
+        // dword wi+4 for every alignment) and realign with a funnel shift, instead of 17 single-byte extracts.
+        uint off = rowByteBase + b * 17u;
+        uint wi = off >> 2u;
+        uint sh = (off & 3u) * 8u;
+        uint w0 = bank[wi], w1 = bank[wi + 1u], w2 = bank[wi + 2u], w3 = bank[wi + 3u], w4 = bank[wi + 4u];
+        uint c0, c1, c2, c3, c4;
+        if (sh == 0u) {
+            c0 = w0; c1 = w1; c2 = w2; c3 = w3; c4 = w4;
+        } else {
+            uint rs = 32u - sh;
+            c0 = (w0 >> sh) | (w1 << rs);
+            c1 = (w1 >> sh) | (w2 << rs);
+            c2 = (w2 >> sh) | (w3 << rs);
+            c3 = (w3 >> sh) | (w4 << rs);
+            c4 = w4 >> sh;   // only block byte 16 is used; it lives in w4
         }
+        float d = e8m0Half(c0 & 0xFFu);
+        // Nibble bytes are block bytes 1..16 (byte 0 is the scale).
+        uint n0 = (c0 >> 8u) | (c1 << 24u);   // bytes 1..4
+        uint n1 = (c1 >> 8u) | (c2 << 24u);   // bytes 5..8
+        uint n2 = (c2 >> 8u) | (c3 << 24u);   // bytes 9..12
+        uint n3 = (c3 >> 8u) | (c4 << 24u);   // bytes 13..16
+        uint xBase = xRowBase + b * 32u;
+        float blockSum = nibbleWordDot(n0, xBase, 0u) + nibbleWordDot(n1, xBase, 4u)
+                       + nibbleWordDot(n2, xBase, 8u) + nibbleWordDot(n3, xBase, 12u);
         acc += d * blockSum;
     }
 
