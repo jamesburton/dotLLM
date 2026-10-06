@@ -17,13 +17,14 @@ public sealed class CudaModelLoaderPartialOffloadTests : IDisposable
 
     /// <summary>
     /// Qwen3MoeHybrid (Gated-DeltaNet layers, no attn_output) stands in for Nemotron-H: same
-    /// "dedicated loader only" category. Before the fix a partial request threw NotSupportedException
-    /// from HybridTransformerModel; now it warns and falls back (all-GPU, else CPU).
+    /// "dedicated loader only" category. Before #729 a partial request threw an opaque NotSupportedException
+    /// from HybridTransformerModel; a first fix fell back to CPU silently. Policy now: all-GPU if it fits,
+    /// otherwise a clear error -- NEVER a CPU model.
     /// </summary>
     [SkippableFact]
-    public void PartialRequest_OnUnsupportedArchitecture_WarnsAndFallsBack_InsteadOfThrowing()
+    public void PartialRequest_OnUnsupportedArchitecture_WhenGpuCannotLoad_FailsActionably_NoCpuFallback()
     {
-        Skip.If(CudaDevice.IsAvailable(), "CUDA present: the fallback would load on the GPU; this test is CPU-only (no GPU work without gpu-lock).");
+        Skip.If(CudaDevice.IsAvailable(), "CUDA present: the all-GPU load could succeed; this test needs a CPU-only host (no GPU work without gpu-lock).");
 
         string path = SyntheticQwen35MoeGguf.Write(Path.Combine(_scratch, "tiny.gguf"));
         using var gguf = GgufFile.Open(path);
@@ -32,14 +33,15 @@ public sealed class CudaModelLoaderPartialOffloadTests : IDisposable
         Assert.True(config.NumLayers >= 2, "fixture must have >=2 layers so 1 is a genuine partial request");
 
         var warnings = new List<string>();
-        var (model, kv) = CudaModelLoader.CreateForGpuLayers(
-            gguf, config, requestedGpuLayers: 1, deviceId: 0, new ThreadingConfig(1, 1), warnings.Add);
-        using var _m = model;
+        var ex = Assert.Throws<InvalidOperationException>(() => CudaModelLoader.CreateForGpuLayers(
+            gguf, config, requestedGpuLayers: 1, deviceId: 0, new ThreadingConfig(1, 1), warnings.Add));
 
-        Assert.IsNotType<HybridTransformerModel>(model);
-        Assert.Null(kv); // CPU fallback model
+        Assert.Contains($"1/{config.NumLayers}", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("--device cpu", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("/issues/735", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Nothing was run on the CPU", ex.Message, StringComparison.Ordinal);
+        Assert.NotNull(ex.InnerException);
         Assert.Contains(warnings, w => w.Contains("not supported", StringComparison.Ordinal));
-        Assert.Contains(warnings, w => w.Contains("using the CPU", StringComparison.Ordinal));
     }
 
     [Fact]

@@ -370,7 +370,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 var hybridThreading = new ThreadingConfig(
                     settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
                 // Partial offload (#729 / #291): one dispatch decides per architecture. Architectures that
-                // cannot split (Nemotron-H, Qwen3MoeHybrid, Mamba-3) fall back to all-GPU, else CPU, with a
+                // cannot split (Nemotron-H, Qwen3MoeHybrid, Mamba-3) load all-GPU or fail with an actionable error (never a silent CPU fallback); a
                 // warning; Qwen3HybridDense uses its own split loader; the rest use HybridTransformerModel.
                 (model, _) = DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(
                     gguf, config, gpuLayers, gpuId, hybridThreading,

@@ -121,7 +121,10 @@ public static class ServerStartup
 
         // --device auto (#722): try the best device first and fall through on a failed load. The server keeps "auto" as its configured device
         // (so later on-demand loads choose again, per model size); the device actually used is recorded in ResolvedDevice.
+        // CPU is only reached here by the user's own choice of "auto"; when a GPU candidate failed first, that is surfaced as a prominent
+        // WARNING (console + ServerState.DeviceFallbackWarning -> /props) rather than a quiet log line (#733).
         Exception? last = null;
+        var gpuFailures = new List<string>();
         foreach (string device in DeviceSelector.Candidates(new FileInfo(resolvedPath).Length))
         {
             try
@@ -129,12 +132,18 @@ public static class ServerStartup
                 Console.WriteLine($"[dotllm] --device auto: trying {device}");
                 var loaded = LoadModelCore(resolvedPath, options with { Device = device });
                 loaded.Options = loaded.Options with { Device = options.Device, ResolvedDevice = device };
+                if (device == "cpu" && gpuFailures.Count > 0)
+                {
+                    loaded.DeviceFallbackWarning = DeviceSelector.FallbackWarning(ModelIdFor(options.Model, resolvedPath), gpuFailures);
+                    Console.WriteLine($"[dotllm] WARNING: {loaded.DeviceFallbackWarning}");
+                }
                 return loaded;
             }
             catch (Exception ex) when (device != "cpu")
             {
                 last = ex;
-                Console.WriteLine($"[dotllm] {device} could not load this model ({ex.Message}); falling back");
+                gpuFailures.Add($"{device}: {ex.Message}");
+                Console.WriteLine($"[dotllm] {device} could not load this model ({ex.Message}); trying the next device");
             }
         }
         throw last ?? new InvalidOperationException("No device could load the model.");
@@ -166,7 +175,7 @@ public static class ServerStartup
         else
         {
             // One dispatch for CPU / all-GPU / partial (#729). Architectures that cannot split layers
-            // (Nemotron-H, Qwen3MoeHybrid, Mamba-3) are loaded all-GPU, else CPU, with a warning —
+            // (Nemotron-H, Qwen3MoeHybrid, Mamba-3) are loaded all-GPU, or the load FAILS with an actionable error (never a silent CPU fallback) —
             // they must never reach HybridTransformerModel (dense Llama-style tensor naming only).
             int gpuId = ParseGpuId(options.Device);
             var plan = GpuOffloadPlanner.Plan(config.Architecture, gpuLayers, config.NumLayers);
@@ -175,7 +184,7 @@ public static class ServerStartup
                 GpuOffloadMode.Cpu => $"[dotllm] CPU inference ({threading.EffectiveThreadCount} threads)",
                 GpuOffloadMode.FullGpu => $"[dotllm] GPU {gpuId} inference",
                 GpuOffloadMode.Partial => $"[dotllm] Hybrid inference ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)",
-                _ => $"[dotllm] GPU {gpuId} inference (partial offload unsupported for {config.Architecture})",
+                _ => $"[dotllm] GPU {gpuId} inference (partial offload unsupported for {config.Architecture}; all layers must fit)",
             });
             (model, _) = DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(
                 gguf, config, gpuLayers, gpuId, threading,

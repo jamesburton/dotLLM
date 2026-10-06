@@ -323,7 +323,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                         : 0;
                     var threading = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
                     ctx.Status($"Loading {config.Architecture} model ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)...");
-                    // #729: per-architecture dispatch; unsupported archs fall back to all-GPU, else CPU.
+                    // #729: per-architecture dispatch; unsupported archs load all-GPU or fail with an actionable error (never a silent CPU fallback).
                     (model, _) = DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(
                         gguf, config, gpuLayers, gpuId, threading,
                         w => Console.Error.WriteLine($"WARNING: {w}"));

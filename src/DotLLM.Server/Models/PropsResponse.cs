@@ -57,6 +57,11 @@ public sealed record PropsResponse
     [JsonPropertyName("mtp_active")]
     public bool MtpActive { get; init; }
 
+    /// <summary>Non-null when <c>--device auto</c> fell back to the CPU after a GPU load failed (#733).</summary>
+    [JsonPropertyName("device_fallback_warning")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DeviceFallbackWarning { get; init; }
+
     [JsonPropertyName("is_ready")]
     public bool IsReady { get; init; }
 }

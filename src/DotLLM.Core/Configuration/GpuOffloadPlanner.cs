@@ -13,10 +13,10 @@ public enum GpuOffloadMode
     Partial,
 
     /// <summary>
-    /// A partial split was requested but the architecture cannot do one. Try all-on-GPU; if
-    /// that fails (no device, out of VRAM) run on the CPU. A warning is attached.
+    /// A partial split was requested but the architecture cannot do one. Load ALL layers on the GPU if
+    /// they fit; otherwise FAIL with an actionable error. Never fall back to the CPU silently.
     /// </summary>
-    FullGpuElseCpu,
+    FullGpuOrFail,
 }
 
 /// <summary>The outcome of <see cref="GpuOffloadPlanner.Plan"/>.</summary>
@@ -55,8 +55,35 @@ public static class GpuOffloadPlanner
         if (n >= numLayers) return new(GpuOffloadMode.FullGpu, numLayers, null);
         if (SupportsPartialOffload(architecture)) return new(GpuOffloadMode.Partial, n, null);
 
-        return new(GpuOffloadMode.FullGpuElseCpu, numLayers,
-            $"Partial GPU offload ({n}/{numLayers} layers) is not supported for architecture {architecture}; "
-            + "loading it entirely on the GPU instead, or on the CPU if it does not fit.");
+        return new(GpuOffloadMode.FullGpuOrFail, numLayers,
+            $"Partial GPU offload ({n}/{numLayers} layers) is not supported for architecture {architecture} "
+            + $"(tracked in {PriorityIssueUrl}); loading all {numLayers} layers on the GPU, and failing if they do not fit.");
+    }
+
+    /// <summary>Tracking issue for true split offload of the hybrid SSM architectures.</summary>
+    public const string PriorityIssueUrl = "https://github.com/jamesburton/dotLLM/issues/735";
+
+    /// <summary>
+    /// The error for a partial request that cannot be met: names what was asked, why it cannot be
+    /// honoured, how much VRAM is needed versus available, and the explicit opt-in to run on the CPU.
+    /// </summary>
+    /// <param name="architecture">Model architecture.</param>
+    /// <param name="requestedGpuLayers">Layers the user asked to offload.</param>
+    /// <param name="numLayers">Total layers.</param>
+    /// <param name="modelBytes">Approximate weight bytes that must be resident (GGUF size).</param>
+    /// <param name="gpuTotalBytes">Total VRAM of the requested device, or null if unknown.</param>
+    /// <param name="gpuFreeBytes">Free VRAM, or null if unknown.</param>
+    /// <param name="cause">Message of the underlying load failure.</param>
+    public static string BuildUnsatisfiableMessage(Architecture architecture, int requestedGpuLayers, int numLayers,
+        long modelBytes, long? gpuTotalBytes, long? gpuFreeBytes, string cause)
+    {
+        static string Gib(long b) => $"{b / (1024.0 * 1024 * 1024):F1} GiB";
+        string vram = gpuFreeBytes is { } f
+            ? $"{Gib(modelBytes)} needed, {Gib(f)} free" + (gpuTotalBytes is { } t ? $" of {Gib(t)}" : "")
+            : gpuTotalBytes is { } t2 ? $"{Gib(modelBytes)} needed, {Gib(t2)} total (free unknown)" : $"{Gib(modelBytes)} needed, device memory unknown";
+        return $"Cannot honour the GPU request for this {architecture} model: you asked for {requestedGpuLayers}/{numLayers} layers on the GPU, "
+            + $"but {architecture} cannot be split between GPU and CPU, so all {numLayers} layers must fit on the GPU and loading them failed "
+            + $"({vram}; cause: {cause}). Nothing was run on the CPU. To run it on the CPU anyway, pass `--device cpu` (it will be much slower). "
+            + $"Split offload for this architecture is tracked in {PriorityIssueUrl}.";
     }
 }

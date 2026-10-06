@@ -36,4 +36,10 @@ public static class DeviceSelector
         order.Add("cpu");
         return order;
     }
+
+    /// <summary>The prominent warning for <c>--device auto</c> ending up on the CPU after a GPU load failed (#733).</summary>
+    public static string FallbackWarning(string modelName, IReadOnlyList<string> gpuFailures) =>
+        $"Model '{modelName}' is running on the CPU because every GPU device failed to load it under --device auto "
+        + $"({string.Join("; ", gpuFailures)}). Expect much lower throughput (typically several times slower). "
+        + "Pass an explicit --device (cpu to silence this, or gpu/vulkan to get the real error).";
 }

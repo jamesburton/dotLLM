@@ -439,6 +439,7 @@ function buildModelBadgeText(config) {
     } else {
         parts.push('GPU');
     }
+    if (config.device_fallback_warning) parts.push('CPU FALLBACK (slow): ' + config.device_fallback_warning);
 
     // Draft model indicator
     if (config.draft_model_path) {

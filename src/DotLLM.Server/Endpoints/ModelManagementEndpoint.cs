@@ -86,6 +86,7 @@ public static class ModelManagementEndpoint
                     // Transfer new state fields into the existing ServerState
                     state.Options = newOptions;
                     state.Config = newState.Config;
+                    state.DeviceFallbackWarning = newState.DeviceFallbackWarning;
                     state.Model = newState.Model;
                     state.Tokenizer = newState.Tokenizer;
                     state.ChatTemplate = newState.ChatTemplate;

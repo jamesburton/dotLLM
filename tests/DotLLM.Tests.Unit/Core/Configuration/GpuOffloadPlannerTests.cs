@@ -28,7 +28,7 @@ public sealed class GpuOffloadPlannerTests
         var plan = GpuOffloadPlanner.Plan(arch, requestedGpuLayers: 10, numLayers: 52);
 
         Assert.False(GpuOffloadPlanner.SupportsPartialOffload(arch));
-        Assert.Equal(GpuOffloadMode.FullGpuElseCpu, plan.Mode);   // never Partial
+        Assert.Equal(GpuOffloadMode.FullGpuOrFail, plan.Mode);   // never Partial
         Assert.Equal(52, plan.GpuLayers);
         Assert.NotNull(plan.Warning);
         Assert.Contains(arch.ToString(), plan.Warning, StringComparison.Ordinal);
@@ -80,5 +80,27 @@ public sealed class GpuOffloadPlannerTests
                 GpuOffloadPlanner.SupportsPartialOffload(arch) == (!needsDedicated || hasOwnSplitLoader),
                 $"{arch}: needsDedicatedLoader={needsDedicated}, planner says {GpuOffloadPlanner.SupportsPartialOffload(arch)}");
         }
+    }
+
+    [Fact]
+    public void UnsatisfiableMessage_IsActionable_AndNeverOffersASilentCpuRun()
+    {
+        string m = GpuOffloadPlanner.BuildUnsatisfiableMessage(Architecture.NemotronH, 10, 52,
+            modelBytes: 24L << 30, gpuTotalBytes: 12L << 30, gpuFreeBytes: 11L << 30, cause: "out of memory");
+
+        Assert.Contains("10/52", m, StringComparison.Ordinal);                 // what was requested
+        Assert.Contains("cannot be split", m, StringComparison.Ordinal);        // why
+        Assert.Contains("24.0 GiB needed, 11.0 GiB free of 12.0 GiB", m, StringComparison.Ordinal); // needed vs free
+        Assert.Contains("--device cpu", m, StringComparison.Ordinal);           // explicit opt-in
+        Assert.Contains("Nothing was run on the CPU", m, StringComparison.Ordinal);
+        Assert.Contains(GpuOffloadPlanner.PriorityIssueUrl, m, StringComparison.Ordinal);
+        Assert.EndsWith("/issues/735.", GpuOffloadPlanner.PriorityIssueUrl + ".", StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void UnsatisfiableMessage_StatesWhenFreeVramIsUnknown()
+    {
+        string m = GpuOffloadPlanner.BuildUnsatisfiableMessage(Architecture.NemotronH, 1, 2, 1L << 30, null, null, "no CUDA");
+        Assert.Contains("device memory unknown", m, StringComparison.Ordinal);
     }
 }

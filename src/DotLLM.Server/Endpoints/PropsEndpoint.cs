@@ -27,6 +27,7 @@ public static class PropsEndpoint
                 SamplingDefaults = ToDto(state.SamplingDefaults),
                 DraftModelPath = string.IsNullOrEmpty(state.DraftModelPath) ? null : state.DraftModelPath,
                 MtpActive = state.Options.MtpEnabled && (state.Model?.SupportsMtp ?? false),
+                DeviceFallbackWarning = state.IsReady ? state.DeviceFallbackWarning : null,
                 IsReady = state.IsReady,
             };
         });
