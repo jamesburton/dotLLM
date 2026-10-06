@@ -12,8 +12,10 @@ namespace DotLLM.Tests.Unit.Tokenizers.ChatTemplates;
 /// <c>{% if message.content is mapping or message.content is iterable %}{{ message.content | tojson }}</c>:
 /// in Jinja2 a string IS iterable, so the result is rendered as a quoted, escaped JSON string. dotLLM used to
 /// answer "not iterable" for strings and rendered it raw, AND kept the template source's trailing newline
-/// (jinja2 keep_trailing_newline=False drops it), so every Llama-3.x prompt ended in "\n\n\n". With both fixed the
-/// 8B Q4_K_M round trip answers "...17 degrees Celsius and there is light rain" (it used to ignore the result).
+/// (jinja2 keep_trailing_newline=False drops it), so every Llama-3.x prompt ended in "\n\n\n". Both are real rendering
+/// bugs, now pinned. With both fixed dotLLM's 8B Q4_K_M round trip answers "...17 degrees Celsius and there is light
+/// rain" (it used to ignore the result), but the individual fixes were not toggled separately and llama.cpp on the
+/// identical prompt did not use the result either: do not read this as "the cause", only as "the render is correct".
 /// </summary>
 public class JinjaLlama31ToolRoundTripTests
 {

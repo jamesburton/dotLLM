@@ -21,7 +21,7 @@ public class EndOfGenerationTokensTests
         }
         public string Decode(ReadOnlySpan<int> tokenIds) => string.Concat(tokenIds.ToArray().Select(DecodeToken));
         public string DecodeToken(int id) => specials.FirstOrDefault(s => s.Id == id).Text ?? ((char)(id - 1000)).ToString();
-        public int VocabSize => 2000;
+        public int VocabSize => 130000;
         public int BosTokenId => 2;
         public int EosTokenId => eos;
         public int CountTokens(string text) => Encode(text).Length;
@@ -62,7 +62,8 @@ public class EndOfGenerationTokensTests
     {
         var tok = new FakeTokenizer(128009, ("<|eot_id|>", 128009), ("<|eom_id|>", 128008), ("<|im_end|>", 5));
         int[] ids = EndOfGenerationTokens.Resolve(tok);
-        Assert.Equal([128009, 128008, 5], ids.OrderByDescending(x => x == 128009).ThenByDescending(x => x).ToArray());
+        Assert.Equal(128009, ids[0]);
+        Assert.Equal([5, 128008], ids[1..].OrderBy(x => x).ToArray());
     }
 
     [Fact]
