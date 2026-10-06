@@ -152,6 +152,8 @@ async function inspectModel(fullPath) {
 
 async function loadModel(model, quant, opts) {
     const body = { model };
+    // Exact file the user picked/inspected; repo+quant resolution can choose a different GGUF in the same repo.
+    if (opts?.path) body.path = opts.path;
     if (quant) body.quant = quant;
     if (opts?.device) body.device = opts.device;
     if (opts?.device === 'gpu' && opts?.gpuLayers != null) body.gpu_layers = opts.gpuLayers;
@@ -439,6 +441,7 @@ function buildModelBadgeText(config) {
     } else {
         parts.push('GPU');
     }
+    if (config.device_fallback_warning) parts.push('CPU FALLBACK (slow): ' + config.device_fallback_warning);
 
     // Draft model indicator
     if (config.draft_model_path) {
@@ -994,7 +997,9 @@ async function onModalModelChange() {
     modalModelInfo.textContent = 'Inspecting model...';
 
     // Inspect the selected model to get layer count
-    modalInspect = await inspectModel(fullPath);
+    const inspected = await inspectModel(fullPath);
+    if (modalSelectedFullPath !== fullPath) return;   // a newer selection superseded this (out-of-order response)
+    modalInspect = inspected;
     if (modalInspect) {
         const size = formatFileSize(modalInspect.file_size_bytes);
         modalModelInfo.textContent = `${modalInspect.architecture} | ${modalInspect.num_layers} layers | ${modalInspect.hidden_size}H | ctx ${modalInspect.max_sequence_length?.toLocaleString() ?? '?'} | ${size}`;
@@ -1004,8 +1009,14 @@ async function onModalModelChange() {
         modalGpuLayers.value = modalInspect.num_layers;
         modalGpuLayersMax.textContent = modalInspect.num_layers;
         updateGpuLayersDisplay();
+        // (#729) Architectures that cannot split layers (e.g. Nemotron-H): all-or-nothing on GPU.
+        const canSplit = modalInspect.supports_partial_offload !== false;
+        modalGpuLayers.disabled = !canSplit;
+        modalGpuLayers.title = canSplit ? '' : 'Partial GPU offload is not supported for this architecture';
     } else {
-        modalModelInfo.textContent = 'Could not read model metadata';
+        modalModelInfo.textContent = 'Could not read model metadata (layer count unknown; "All" will load every layer)';
+        modalGpuLayersMax.textContent = '?';
+        updateGpuLayersDisplay();
     }
 
     modalOptions.classList.remove('hidden');
@@ -1032,6 +1043,11 @@ function updateGpuVisibility() {
 function updateGpuLayersDisplay() {
     const layers = parseInt(modalGpuLayers.value) || 0;
     const maxLayers = parseInt(modalGpuLayers.max) || 32;
+    if (!modalInspect) {
+        // Inspect failed or not run: the slider range is a placeholder, so don't claim a layer count.
+        modalGpuLayersVal.textContent = layers === 0 ? 'CPU only (no offloading)' : 'All layers on GPU';
+        return;
+    }
 
     if (layers === 0) {
         modalGpuLayersVal.textContent = 'CPU only (no offloading)';
@@ -1062,7 +1078,13 @@ async function handleModalLoad() {
     const filename = opt?.dataset.filename;
     const quant = extractQuantFromPath(filename);
     const device = getModalDevice();
-    const gpuLayers = device === 'gpu' ? parseInt(modalGpuLayers.value) : undefined;
+    // "All" is a sentinel (-1), not the slider's number: the server resolves it against the layer count the loader sees.
+    // Also covers a failed inspect, where the slider still shows its HTML default.
+    const sliderLayers = parseInt(modalGpuLayers.value);
+    const sliderMax = parseInt(modalGpuLayers.max);
+    const gpuLayers = device !== 'gpu' ? undefined
+        : (!modalInspect || !(sliderLayers < sliderMax)) ? -1
+        : sliderLayers;
     const threads = parseInt(modalThreads.value) || 0;
     const decodeThreads = parseInt(modalDecodeThreads.value) || 0;
 
@@ -1077,6 +1099,7 @@ async function handleModalLoad() {
 
     try {
         const res = await loadModel(repo, quant, {
+            path: modalSelectedFullPath,
             device,
             gpuLayers,
             cacheTypeK: modalCacheK.value,

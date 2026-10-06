@@ -30,4 +30,11 @@ public sealed record ModelInspectResponse
 
     [JsonPropertyName("file_size_bytes")]
     public long FileSizeBytes { get; init; }
+
+    /// <summary>
+    /// False when a partial <c>gpu_layers</c> split is unsupported for this architecture (the server
+    /// then loads it all-on-GPU or on the CPU). No property initializer: STJ source-gen drops them on <c>init</c>.
+    /// </summary>
+    [JsonPropertyName("supports_partial_offload")]
+    public bool SupportsPartialOffload { get; init; }
 }
