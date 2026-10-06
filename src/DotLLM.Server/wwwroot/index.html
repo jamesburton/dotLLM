@@ -240,10 +240,21 @@
                     <div id="modal-model-info" class="mt-1.5 text-[10px] text-zinc-600 hidden"></div>
                 </div>
 
-                <!-- Speculative Decoding (optional, shown after selecting a main model) -->
+                <!-- Embedded MTP (shown when the inspected GGUF carries an MTP head) -->
+                <div id="modal-mtp-section" class="hidden">
+                    <label class="text-[10px] uppercase tracking-wider text-zinc-500 block mb-1">MTP (Multi-Token Prediction)</label>
+                    <p class="text-xs text-emerald-400 mb-1">MTP: built into this model - enabled automatically</p>
+                    <p class="text-[10px] text-zinc-600 mb-1.5">This checkpoint carries its own MTP head, so decoding is sped up by self-speculation with no second model. It adapts and backs off when drafts stop paying. Tradeoff: continuous batching is off for this model while MTP is active (the server also skips MTP when started with <code>--expected-concurrency 5</code> or more).</p>
+                    <label class="flex items-center gap-1.5 text-xs text-zinc-400 cursor-pointer">
+                        <input id="modal-mtp-enabled" type="checkbox" class="accent-cyan-500" checked>
+                        <span>Use built-in MTP (uncheck to opt out)</span>
+                    </label>
+                </div>
+
+                <!-- External draft model (optional; only for models WITHOUT an embedded MTP head) -->
                 <div id="modal-speculative-section" class="hidden">
-                    <label class="text-[10px] uppercase tracking-wider text-zinc-500 block mb-1">Draft Model (Speculative Decoding)</label>
-                    <p class="text-[10px] text-zinc-600 mb-1.5">Optional: select a smaller model to speed up decoding via speculative decoding. Must share vocabulary with the main model.</p>
+                    <label class="text-[10px] uppercase tracking-wider text-zinc-500 block mb-1">External Draft Model (Speculative Decoding)</label>
+                    <p class="text-[10px] text-zinc-600 mb-1.5">Optional. Pick a second, smaller model that proposes tokens which the main model then verifies in one pass, which can speed up decoding. It <b>must share the main model's tokenizer/vocabulary</b>; a smaller model of the same family works best (e.g. a 1B draft for an 8B target). Choose a local GGUF here, or start the server with <code>--speculative-model &lt;path or repo:quant&gt;</code>. Tradeoffs: it uses extra memory and disables continuous batching for this model. Expect roughly 1.3-2x faster decoding when the draft agrees often, and no gain (or a slowdown) when it does not. Left unselected by default.</p>
                     <select id="modal-speculative-select" class="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1.5 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500">
                         <option value="">None (disabled)</option>
                     </select>
@@ -263,15 +274,15 @@
                     <!-- Compute device -->
                     <div>
                         <label class="text-[10px] uppercase tracking-wider text-zinc-500 block mb-1">Compute Device</label>
-                        <p class="text-[10px] text-zinc-600 mb-1.5">CPU is universal. GPU requires an NVIDIA GPU with enough VRAM.</p>
+                        <p id="modal-device-hint" class="text-[10px] text-zinc-600 mb-1.5">Detecting devices...</p>
                         <div class="flex items-center gap-4">
                             <label class="flex items-center gap-1.5 text-xs text-zinc-400 cursor-pointer">
-                                <input type="radio" name="modal-device" value="cpu" class="accent-cyan-500" checked>
+                                <input type="radio" name="modal-device" value="cpu" class="accent-cyan-500">
                                 <span>CPU</span>
                             </label>
                             <label class="flex items-center gap-1.5 text-xs text-zinc-400 cursor-pointer">
                                 <input type="radio" name="modal-device" value="gpu" class="accent-cyan-500">
-                                <span>GPU</span>
+                                <span id="modal-device-gpu-label">GPU</span>
                             </label>
                         </div>
                     </div>

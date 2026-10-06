@@ -146,6 +146,14 @@ public sealed record DeviceListResponse
 {
     [JsonPropertyName("backends")]
     public required BackendInfoDto[] Backends { get; init; }
+
+    /// <summary>
+    /// (#757) The device string a UI should preselect: the best servable GPU (<c>gpu:N</c> / <c>vulkan</c>, same ordering as
+    /// <c>--device auto</c>), or <c>cpu</c> only when no GPU is servable. Optionally sized to a model via <c>?model_bytes=</c>.
+    /// </summary>
+    [JsonPropertyName("recommended_device")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? RecommendedDevice { get; init; }
 }
 
 /// <summary>One compute backend and the devices it can enumerate.</summary>

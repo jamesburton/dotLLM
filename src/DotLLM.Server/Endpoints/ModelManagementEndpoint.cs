@@ -98,6 +98,7 @@ public static class ModelManagementEndpoint
                         Threads = request.Threads ?? state.Options.Threads,
                         DecodeThreads = request.DecodeThreads ?? state.Options.DecodeThreads,
                         SpeculativeModel = request.SpeculativeModel,
+                        MtpEnabled = request.Mtp ?? state.Options.MtpEnabled,
                         SpeculativeCandidates = request.SpeculativeK ?? state.Options.SpeculativeCandidates,
                         ModelId = ServerStartup.ModelIdFor(request.Model, resolvedPath),
                         RopeOverride = ServerOptions.BuildRopeOverride(
@@ -127,6 +128,8 @@ public static class ModelManagementEndpoint
                     state.DraftModel = newState.DraftModel;
                     state.DraftModelPath = newState.DraftModelPath;
                     state.DraftGguf = newState.DraftGguf;
+                    state.MtpActive = newState.MtpActive;
+                    state.MtpStatus = newState.MtpStatus;
                     // (#369) Multi-model residency bookkeeping and the continuous-batch scheduler
                     // (previously dropped on every explicit /v1/models/load swap — the server
                     // silently fell back to the single-request gate after the first swap).
