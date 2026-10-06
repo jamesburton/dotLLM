@@ -126,6 +126,10 @@ const modalDecodeThreads = $('#modal-decode-threads');
 const modalStatus = $('#modal-status');
 const modalCancelBtn = $('#modal-cancel-btn');
 const modalLoadBtn = $('#modal-load-btn');
+const modalMtpSection = $('#modal-mtp-section');
+const modalMtpEnabled = $('#modal-mtp-enabled');
+const modalDeviceHint = $('#modal-device-hint');
+const modalDeviceGpuLabel = $('#modal-device-gpu-label');
 const modalSpeculativeSection = $('#modal-speculative-section');
 const modalSpeculativeSelect = $('#modal-speculative-select');
 const modalSpeculativeInfo = $('#modal-speculative-info');
@@ -145,6 +149,14 @@ async function fetchAvailableModels() {
     return res.json();
 }
 
+// (#757) Devices the server can actually serve; recommended_device uses the same ordering as `--device auto`.
+async function fetchDevices(modelBytes) {
+    try {
+        const res = await fetch('/v1/devices' + (modelBytes ? `?model_bytes=${modelBytes}` : ''));
+        return res.ok ? res.json() : null;
+    } catch { return null; }
+}
+
 async function inspectModel(fullPath) {
     const res = await fetch(`/v1/models/inspect?path=${encodeURIComponent(fullPath)}`);
     return res.ok ? res.json() : null;
@@ -156,13 +168,14 @@ async function loadModel(model, quant, opts) {
     if (opts?.path) body.path = opts.path;
     if (quant) body.quant = quant;
     if (opts?.device) body.device = opts.device;
-    if (opts?.device === 'gpu' && opts?.gpuLayers != null) body.gpu_layers = opts.gpuLayers;
+    if (opts?.isGpu && opts?.gpuLayers != null) body.gpu_layers = opts.gpuLayers;
     if (opts?.cacheTypeK && opts.cacheTypeK !== 'f32') body.cache_type_k = opts.cacheTypeK;
     if (opts?.cacheTypeV && opts.cacheTypeV !== 'f32') body.cache_type_v = opts.cacheTypeV;
     if (opts?.threads) body.threads = opts.threads;
     if (opts?.decodeThreads) body.decode_threads = opts.decodeThreads;
     if (opts?.speculativeModel) body.speculative_model = opts.speculativeModel;
     if (opts?.speculativeK) body.speculative_k = opts.speculativeK;
+    if (opts?.mtp != null) body.mtp = opts.mtp;
     const res = await fetch('/v1/models/load', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -442,6 +455,8 @@ function buildModelBadgeText(config) {
         parts.push('GPU');
     }
     if (config.device_fallback_warning) parts.push('CPU FALLBACK (slow): ' + config.device_fallback_warning);
+
+    if (config.mtp_active) parts.push('MTP');
 
     // Draft model indicator
     if (config.draft_model_path) {
@@ -876,6 +891,47 @@ function resetToolsJson() {
 let modalModels = [];      // flat list from /v1/models/available
 let modalInspect = null;   // inspect result for selected model
 let modalSelectedFullPath = null;
+let modalGpuDevice = null;      // device string to send for "GPU" (e.g. "vulkan", "gpu:0"); null when no GPU is servable
+let modalDeviceTouched = false; // the user picked a device by hand: never override it
+
+/** Picks the GPU device string for the GPU radio from a /v1/devices payload (recommended first, else any servable non-CPU device). */
+function pickGpuDevice(devices) {
+    if (!devices) return null;
+    if (devices.recommended_device && devices.recommended_device !== 'cpu') return devices.recommended_device;
+    for (const b of devices.backends || []) {
+        if (b.name === 'cpu' || !b.servable) continue;
+        const d = (b.devices || []).find(x => x.device_string);
+        if (d) return d.device_string;
+    }
+    return null;
+}
+
+function applyModalDevices(devices) {
+    modalGpuDevice = pickGpuDevice(devices);
+    const gpuRadio = document.querySelector('input[name="modal-device"][value="gpu"]');
+    const cpuRadio = document.querySelector('input[name="modal-device"][value="cpu"]');
+    if (!devices) {
+        modalDeviceHint.textContent = 'Detecting devices...';
+        gpuRadio.disabled = false;
+        modalDeviceGpuLabel.textContent = 'GPU';
+        return;
+    }
+    gpuRadio.disabled = !modalGpuDevice;
+    if (modalGpuDevice) {
+        modalDeviceGpuLabel.textContent = `GPU (${modalGpuDevice})`;
+        modalDeviceHint.textContent = 'GPU is selected by default because a servable GPU was found. CPU is universal but several times slower. An explicit GPU load that fails reports an error; it never falls back to the CPU silently.';
+        if (!modalDeviceTouched) gpuRadio.checked = true;
+    } else {
+        modalDeviceGpuLabel.textContent = 'GPU (none detected)';
+        modalDeviceHint.textContent = 'No servable GPU (CUDA or Vulkan) was detected, so the CPU is used.';
+        cpuRadio.checked = true;
+    }
+    updateGpuVisibility();
+}
+
+async function refreshModalDevices(modelBytes) {
+    applyModalDevices(await fetchDevices(modelBytes));
+}
 
 function openModelModal() {
     modalSelectedFullPath = null;
@@ -884,6 +940,8 @@ function openModelModal() {
     modalGpuSection.classList.add('hidden');
     modalModelInfo.classList.add('hidden');
     modalSpeculativeSection.classList.add('hidden');
+    modalMtpSection.classList.add('hidden');
+    modalMtpEnabled.checked = true;
     modalSpeculativeSelect.innerHTML = '<option value="">None (disabled)</option>';
     modalSpeculativeInfo.classList.add('hidden');
     modalSpeculativeInfo.textContent = '';
@@ -893,7 +951,12 @@ function openModelModal() {
     modalStatus.innerHTML = '';
     modalCacheK.value = 'f32';
     modalCacheV.value = 'f32';
+    // (#757) Device defaults to the best servable GPU, CPU only when none is servable (resolved asynchronously).
+    modalDeviceTouched = false;
+    modalGpuDevice = null;
     document.querySelector('input[name="modal-device"][value="cpu"]').checked = true;
+    applyModalDevices(null);
+    refreshModalDevices();
     modelModalOverlay.classList.remove('hidden');
     modelModalOverlay.style.display = 'flex';
     populateModalDropdown();
@@ -985,6 +1048,7 @@ async function onModalModelChange() {
         modalOptions.classList.add('hidden');
         modalModelInfo.classList.add('hidden');
         modalSpeculativeSection.classList.add('hidden');
+        modalMtpSection.classList.add('hidden');
         modalLoadBtn.disabled = true;
         modalInspect = null;
         modalSelectedFullPath = null;
@@ -992,6 +1056,7 @@ async function onModalModelChange() {
     }
 
     modalSelectedFullPath = fullPath;
+    modalMtpSection.classList.add('hidden');
     modalLoadBtn.disabled = false;
     modalModelInfo.classList.remove('hidden');
     modalModelInfo.textContent = 'Inspecting model...';
@@ -1022,9 +1087,19 @@ async function onModalModelChange() {
     modalOptions.classList.remove('hidden');
     updateGpuVisibility();
 
-    // Show speculative section and populate draft model dropdown
-    modalSpeculativeSection.classList.remove('hidden');
-    populateSpeculativeDropdown(fullPath);
+    // (#757) Embedded MTP head: automatic, with an opt-out. Otherwise offer an optional external draft model.
+    if (modalInspect?.has_mtp) {
+        modalMtpSection.classList.remove('hidden');
+        modalSpeculativeSection.classList.add('hidden');
+        modalSpeculativeSelect.value = '';
+    } else {
+        modalMtpSection.classList.add('hidden');
+        modalSpeculativeSection.classList.remove('hidden');
+        populateSpeculativeDropdown(fullPath);
+    }
+
+    // Re-pick the GPU device for this model's size (CUDA is skipped when the file will not fit).
+    refreshModalDevices(modalInspect?.file_size_bytes);
 }
 
 function getModalDevice() {
@@ -1077,12 +1152,14 @@ async function handleModalLoad() {
     const repo = opt?.dataset.repo;
     const filename = opt?.dataset.filename;
     const quant = extractQuantFromPath(filename);
-    const device = getModalDevice();
+    const deviceChoice = getModalDevice();
+    const isGpu = deviceChoice === 'gpu' && !!modalGpuDevice;
+    const device = isGpu ? modalGpuDevice : 'cpu';
     // "All" is a sentinel (-1), not the slider's number: the server resolves it against the layer count the loader sees.
     // Also covers a failed inspect, where the slider still shows its HTML default.
     const sliderLayers = parseInt(modalGpuLayers.value);
     const sliderMax = parseInt(modalGpuLayers.max);
-    const gpuLayers = device !== 'gpu' ? undefined
+    const gpuLayers = !isGpu ? undefined
         : (!modalInspect || !(sliderLayers < sliderMax)) ? -1
         : sliderLayers;
     const threads = parseInt(modalThreads.value) || 0;
@@ -1094,14 +1171,17 @@ async function handleModalLoad() {
     setStatus('Loading and warming up model...', 'text-yellow-500');
 
     // Get speculative model selection
-    const specPath = modalSpeculativeSelect.value || undefined;
+    const embeddedMtp = !modalMtpSection.classList.contains('hidden');
+    const specPath = embeddedMtp ? undefined : (modalSpeculativeSelect.value || undefined);
     const specK = parseInt(modalSpeculativeK.value) || 3;
 
     try {
         const res = await loadModel(repo, quant, {
             path: modalSelectedFullPath,
             device,
+            isGpu,
             gpuLayers,
+            mtp: embeddedMtp ? modalMtpEnabled.checked : undefined,
             cacheTypeK: modalCacheK.value,
             cacheTypeV: modalCacheV.value,
             threads: threads || undefined,
@@ -1845,7 +1925,7 @@ modalModelSelect.addEventListener('change', onModalModelChange);
 
 // Device radio toggle → show/hide GPU section
 document.querySelectorAll('input[name="modal-device"]').forEach(radio => {
-    radio.addEventListener('change', updateGpuVisibility);
+    radio.addEventListener('change', () => { modalDeviceTouched = true; updateGpuVisibility(); });
 });
 
 // GPU layers slider live update
