@@ -42,8 +42,9 @@ public static class GgufModelConfigExtractor
         // nemotron_h_moe ships the same key (Nemotron 3.5 Lightning: 1 MTP layer
         // appended as the final block, carrying BOTH head_count_kv and
         // feed_forward_length — the trunk-exclusive kinds rule does not apply to it).
+        // deepseek2 (GLM-4.7-Flash, DeepSeek-V3/R1 conversions) ships it too (#742).
         int nextnPredictLayers = architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense
-                or Architecture.NemotronHMoe
+                or Architecture.NemotronHMoe or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
             ? (int)metadata.GetUInt32OrDefault($"{arch}.nextn_predict_layers", 0)
             : 0;
         int numTrunkLayers = numLayers - nextnPredictLayers;
@@ -126,7 +127,7 @@ public static class GgufModelConfigExtractor
         else if (architecture is Architecture.DeepSeekV2 or Architecture.DeepSeekV3)
         {
             mlaConfig = ExtractMlaConfig(metadata, arch, ropeConfig);
-            moeConfig = TryExtractDeepseekMoeConfig(metadata, arch, intermediateSize, numLayers);
+            moeConfig = TryExtractDeepseekMoeConfig(metadata, arch, intermediateSize, numTrunkLayers, vocabSize);
             attentionType = AttentionType.MLA;
             // GGUF's attention.key_length is qk_nope only. Total per-head dim
             // for MLA attention is qk_nope + qk_rope — patch HeadDim so the
@@ -291,8 +292,14 @@ public static class GgufModelConfigExtractor
         // q_lora_rank may be absent or zero on V2-Lite (monolithic-Q variant).
         int qLoraRank = (int)metadata.GetUInt32OrDefault($"{arch}.attention.q_lora_rank", 0);
         int kvLoraRank = (int)metadata.GetUInt32($"{arch}.attention.kv_lora_rank");
-        int qkTotal = (int)metadata.GetUInt32($"{arch}.attention.key_length");
-        int vHead = (int)metadata.GetUInt32($"{arch}.attention.value_length");
+        // llama.cpp's "MLA" GGUFs (GLM-4.7-Flash, current DeepSeek conversions, #742) store the
+        // ABSORBED sizes in attention.key_length / value_length (kv_lora_rank + rope, kv_lora_rank)
+        // and the real per-head sizes in key_length_mla / value_length_mla. Legacy GGUFs
+        // (DeepSeek-V2-Lite) only carry key_length / value_length with the real sizes.
+        int qkTotal = (int)metadata.GetUInt32OrDefault($"{arch}.attention.key_length_mla",
+            metadata.GetUInt32($"{arch}.attention.key_length"));
+        int vHead = (int)metadata.GetUInt32OrDefault($"{arch}.attention.value_length_mla",
+            metadata.GetUInt32($"{arch}.attention.value_length"));
         int qkRope = (int)metadata.GetUInt32($"{arch}.rope.dimension_count");
         int qkNope = qkTotal - qkRope;
 
@@ -414,7 +421,8 @@ public static class GgufModelConfigExtractor
     }
 
     private static MoeConfig? TryExtractDeepseekMoeConfig(GgufMetadata metadata, string arch,
-                                                           int denseIntermediate, int numLayers)
+                                                           int denseIntermediate, int numTrunkLayers,
+                                                           int vocabSize)
     {
         uint expertCount = metadata.GetUInt32OrDefault($"{arch}.expert_count", 0);
         if (expertCount == 0) return null;
@@ -445,12 +453,39 @@ public static class GgufModelConfigExtractor
         if (expertShared > 0)
             sharedIntermediate = moeIntermediate * expertShared;
 
+        // Routing semantics, mirroring llama.cpp llama_model_deepseek2::load_arch_hparams (#742):
+        //   expert_gating_func: 1 = softmax, 2 = sigmoid. When ABSENT: GLM-4.7-Flash
+        //   (47/48 layers, 154880-token vocab) is sigmoid, everything else softmax.
+        //   expert_weights_norm (default false) renormalises the selected top-k weights;
+        //   expert_weights_scale (default 1) scales them afterwards. The pre-#742 code
+        //   hard-coded "renormalise" for every DeepSeek GGUF, which is wrong for V2-Lite
+        //   (HF norm_topk_prob=false, the GGUF carries no expert_weights_norm key).
+        uint gatingFunc = metadata.GetUInt32OrDefault($"{arch}.expert_gating_func", 0);
+        if (gatingFunc == 0)
+        {
+            int nl = numTrunkLayers + (int)metadata.GetUInt32OrDefault($"{arch}.nextn_predict_layers", 0);
+            gatingFunc = (nl == 47 || nl == 48) && vocabSize == 154880 ? 2u : 1u;
+        }
+        if (gatingFunc != 1 && gatingFunc != 2)
+            throw new InvalidDataException(
+                $"{arch}.expert_gating_func={gatingFunc} is not supported (only 1=softmax, 2=sigmoid).");
+        bool sigmoid = gatingFunc == 2;
+        bool weightsNorm = metadata.GetBoolOrDefault($"{arch}.expert_weights_norm", false);
+        float weightsScale = metadata.GetFloat32OrDefault($"{arch}.expert_weights_scale", 1.0f);
+        if (weightsScale == 0.0f) weightsScale = 1.0f; // llama.cpp: scale applied only if != 0 && != 1
+
         return new MoeConfig
         {
             NumExperts = (int)expertCount,
             NumExpertsPerTok = expertUsed,
             MoeIntermediateSize = moeIntermediate,
-            NormTopKProb = true,   // V2 + V3 both renormalize
+            // Softmax path: NormTopKProb == expert_weights_norm. Sigmoid path keeps the
+            // Nemotron-H convention (NormTopKProb=false, NormalizeExpertWeights carries it).
+            NormTopKProb = !sigmoid && weightsNorm,
+            SigmoidGating = sigmoid,
+            HasSelectionBias = sigmoid, // blk.N.exp_probs_b.bias; a missing tensor loads as zeros
+            NormalizeExpertWeights = sigmoid && weightsNorm,
+            ExpertWeightsScale = weightsScale,
             SharedExpertIntermediateSize = sharedIntermediate,
             NumSharedExperts = expertShared,
             HasSharedExpertGate = false,  // DeepSeek convention: no per-token sigmoid gate

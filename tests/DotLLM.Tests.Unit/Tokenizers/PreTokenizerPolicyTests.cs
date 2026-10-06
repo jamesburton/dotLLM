@@ -97,6 +97,26 @@ public class PreTokenizerPolicyTests
     }
 
     /// <summary>
+    /// Issue #742 - GLM-4.7-Flash ships <c>tokenizer.ggml.pre = "glm4"</c> (llama.cpp
+    /// LLAMA_VOCAB_PRE_TYPE_CHATGLM4). It groups digits in runs of up to three, so with a "3 4"
+    /// merge "1234" is "123"|"4" (4 tokens) and "34" merges to one token. Discriminates against
+    /// gpt2 (digit RUN: "1234" merges to 3 tokens) and the Qwen pipelines (one digit per
+    /// segment: "34" stays 2 tokens), the two wrong routings a missing entry could fall into.
+    /// </summary>
+    [Theory]
+    [InlineData("glm4")]
+    [InlineData("glm5")]
+    [InlineData("chatglm-bpe")]
+    public void Glm4_GroupsDigitsInThrees_UnlikeGpt2AndQwen(string preType)
+    {
+        Assert.Equal(4, Build(preType).Encode("1234").Length);        // 123|4: merge blocked
+        Assert.Equal(3, Build("gpt2").Encode("1234").Length);         // 1234 run: merge fires
+        Assert.Single(Build(preType).Encode("34"));                   // {1,3} group keeps "34" whole
+        Assert.Equal(2, Build("qwen2").Encode("34").Length);          // per-digit split blocks it
+        Assert.Equal(Build("llama3").Encode("1234"), Build(preType).Encode("1234"));
+    }
+
+    /// <summary>
     /// Issue #397 — <c>qwen2</c> is the value on <b>every</b> Qwen2/Qwen3 GGUF, and it
     /// differs from llama3 in exactly one place: the digit alternative is a bare
     /// <c>\p{N}</c>, not <c>\p{N}{1,3}</c>. With a "3 4" merge in the vocab, "34"

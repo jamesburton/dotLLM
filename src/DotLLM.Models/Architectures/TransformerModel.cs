@@ -158,7 +158,13 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     /// </summary>
     public static TransformerModel LoadFromGguf(GgufFile gguf, ModelConfig config, ThreadingConfig threading)
     {
-        var weights = TransformerWeights.LoadFromGguf(gguf, config);
+        // MLA + routed-MoE GGUFs (DeepSeek-V2/V3, GLM-4.7-Flash): keep the routed experts in the
+        // raw quant view and run them through the grouped quantised kernels (ForwardMoeGrouped).
+        // The F32 host dequant is ~57 GB at V2-Lite and ~120 GB at GLM-4.7-Flash scale (#742).
+        Func<int, (bool, bool, bool)>? skipRoutedF32 = config.MlaConfig is not null && config.Moe is not null
+            ? static _ => (true, true, true)
+            : null;
+        var weights = TransformerWeights.LoadFromGguf(gguf, config, moeBankSkipSelector: skipRoutedF32);
         // Route through the shared state builder so the GGUF path gets the same
         // per-attention-type RoPE tables, partial-rotary handling, and distinct
         // per-layer head-dim scratch sizing as the safetensors path (Gemma 4 needs
@@ -770,6 +776,87 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         if (Config.NumGlobalKvHeads is int g && Config.IsFullAttentionLayer(layer))
             return g;
         return Config.NumKvHeads;
+    }
+
+    /// <summary>
+    /// Grouped MoE FFN for DeepSeek-family layers whose routed experts stay in the raw GGUF quant
+    /// view and/or use sigmoid + selection-bias routing (#742). Reads the FFN-normed activations
+    /// from <paramref name="normOut"/> and writes routed + shared expert output back to it.
+    /// </summary>
+    private unsafe void ForwardMoeGrouped(MoeLayerWeights moe, int layer, int seqLen, int hiddenSize, float* normOut)
+    {
+        int numExperts = moe.NumExperts;
+        int k = moe.NumExpertsPerTok;
+        int intermediate = moe.IntermediateSize;
+        int total = seqLen * k;
+
+        int[] assignExpertBuf = System.Buffers.ArrayPool<int>.Shared.Rent(total);
+        float[] assignWeightBuf = System.Buffers.ArrayPool<float>.Shared.Rent(total);
+        int[] bucketCursorsBuf = System.Buffers.ArrayPool<int>.Shared.Rent(numExperts + 1);
+        int[] bucketTokensBuf = System.Buffers.ArrayPool<int>.Shared.Rent(total);
+        int[] bucketSlotsBuf = System.Buffers.ArrayPool<int>.Shared.Rent(total);
+        int[] uniqueBuf = System.Buffers.ArrayPool<int>.Shared.Rent(numExperts);
+        try
+        {
+            Span<int> assignExpert = assignExpertBuf.AsSpan(0, total);
+            Span<float> assignWeight = assignWeightBuf.AsSpan(0, total);
+            Span<int> bucketCursors = bucketCursorsBuf.AsSpan(0, numExperts + 1);
+            Span<int> bucketTokens = bucketTokensBuf.AsSpan(0, total);
+            Span<int> bucketSlots = bucketSlotsBuf.AsSpan(0, total);
+            Span<int> unique = uniqueBuf.AsSpan(0, numExperts);
+
+            int uniqueCount = MoeSwiGluMlp.Route(
+                hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
+                gateWeights: moe.Gate,
+                assignExpert: assignExpert, assignWeight: assignWeight,
+                bucketCursors: bucketCursors, bucketTokens: bucketTokens, bucketSlots: bucketSlots,
+                uniqueExperts: unique,
+                numExperts: numExperts, numExpertsPerTok: k,
+                hiddenSize: hiddenSize, seqLen: seqLen,
+                normTopKProb: moe.NormTopKProb,
+                sigmoidGating: moe.SigmoidGating,
+                selectionBias: moe.SelectionBias is null ? default : moe.SelectionBias.AsSpan(),
+                weightsScale: moe.WeightsScale);
+
+            bool raw = moe.HasRawQuantView;
+            QuantizationType gateQt = raw ? moe.GateExpsRawQt : QuantizationType.F32;
+            QuantizationType upQt = raw ? moe.UpExpsRawQt : QuantizationType.F32;
+            QuantizationType downQt = raw ? moe.DownExpsRawQt : QuantizationType.F32;
+            long gateRowBytes = raw ? Dequantize.RowByteSize((long)intermediate * hiddenSize, gateQt) : 0;
+            long upRowBytes = raw ? Dequantize.RowByteSize((long)intermediate * hiddenSize, upQt) : 0;
+            long downRowBytes = raw ? Dequantize.RowByteSize((long)hiddenSize * intermediate, downQt) : 0;
+
+            MoeSwiGluMlp.ExecuteRoutedFromAssignments(
+                hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
+                gateExpsRawBase: raw ? moe.GateExpsRaw : 0, gateExpsQt: gateQt, gateExpsRowBytes: gateRowBytes,
+                gateExpsF32Ptrs: raw ? ReadOnlySpan<nint>.Empty : moe.W1,
+                upExpsRawBase: raw ? moe.UpExpsRaw : 0, upExpsQt: upQt, upExpsRowBytes: upRowBytes,
+                upExpsF32Ptrs: raw ? ReadOnlySpan<nint>.Empty : moe.W3,
+                downExpsRawBase: raw ? moe.DownExpsRaw : 0, downExpsQt: downQt, downExpsRowBytes: downRowBytes,
+                downExpsF32Ptrs: raw ? ReadOnlySpan<nint>.Empty : moe.W2,
+                assignExpert: assignExpert, assignWeight: assignWeight,
+                bucketCursors: bucketCursors, bucketTokens: bucketTokens, bucketSlots: bucketSlots,
+                uniqueExperts: unique, uniqueExpertCount: uniqueCount,
+                output: new Span<float>(normOut, seqLen * hiddenSize),
+                numExperts: numExperts, numExpertsPerTok: k,
+                hiddenSize: hiddenSize, intermediateSize: intermediate, seqLen: seqLen,
+                sharedGateProj: moe.SharedGateProj, sharedUpProj: moe.SharedUpProj,
+                sharedDownProj: moe.SharedDownProj,
+                sharedIntermediateSize: moe.SharedIntermediateSize,
+                sharedExpertGate: moe.SharedExpertGate is not null
+                    ? moe.SharedExpertGate.AsSpan() : ReadOnlySpan<float>.Empty,
+                loraAdapter: _currentAdapter, loraLayer: layer,
+                threadPool: _threadPool);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<int>.Shared.Return(assignExpertBuf);
+            System.Buffers.ArrayPool<float>.Shared.Return(assignWeightBuf);
+            System.Buffers.ArrayPool<int>.Shared.Return(bucketCursorsBuf);
+            System.Buffers.ArrayPool<int>.Shared.Return(bucketTokensBuf);
+            System.Buffers.ArrayPool<int>.Shared.Return(bucketSlotsBuf);
+            System.Buffers.ArrayPool<int>.Shared.Return(uniqueBuf);
+        }
     }
 
     /// <summary>
@@ -1555,6 +1642,15 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                         softmaxAfterTopK: moe.SoftmaxAfterTopK,
                         useSwiGluOai: moe.UseSwiGluOai,
                         pool: _threadPool);
+                }
+                // DeepSeek-V3 / GLM-4.7-Flash routing (sigmoid + selection bias + scale, #742) and
+                // any MoE layer whose routed experts were left in the raw GGUF quant view (the F32
+                // host dequant is ~120 GB at GLM-4.7-Flash scale): grouped Route + per-expert
+                // quantised GEMM, exactly as the Qwen3.5-MoE CPU path does.
+                else if (moe.SigmoidGating || moe.WeightsScale != 1.0f
+                         || (moe.HasRawQuantView && (moe.W1.Length == 0 || moe.W1[0] == 0)))
+                {
+                    ForwardMoeGrouped(moe, layer, seqLen, hiddenSize, normOut);
                 }
                 // Route through the shared-expert-aware overload iff we need
                 // shared-expert addition OR the raw-softmax (non-renormalised)
