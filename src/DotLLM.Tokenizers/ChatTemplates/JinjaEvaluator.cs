@@ -43,6 +43,7 @@ internal sealed class JinjaEvaluator
         ["string"] = (input, _) => Stringify(input),
         ["list"] = (input, _) => input is IList list ? list : input is IEnumerable e ? ToList(e) : new List<object?> { input },
         ["items"] = (input, _) => GetDictItems(input),
+        ["dictsort"] = (input, _) => DictSort(input),
         ["join"] = (input, args) => JoinFilter(input, args),
         ["replace"] = (input, args) => ReplaceFilter(input, args),
         ["selectattr"] = (input, args) => SelectAttrFilter(input, args),
@@ -88,6 +89,10 @@ internal sealed class JinjaEvaluator
 
             case SetNode setNode:
                 SetVariable(setNode.Name, EvalExpr(setNode.Value));
+                break;
+
+            case SetBlockNode setBlock:
+                SetVariable(setBlock.Name, RenderNodes(setBlock.Body));
                 break;
 
             case SetAttributeNode setAttr:
@@ -1024,6 +1029,15 @@ internal sealed class JinjaEvaluator
     {
         if (input is Dictionary<string, object?> dict)
             return dict.Select(kvp => (object?)new List<object?> { kvp.Key, kvp.Value }).ToList();
+        return new List<object?>();
+    }
+
+    /// <summary>Jinja2 <c>dictsort</c>: (key, value) pairs ordered by key, case-insensitive (default).</summary>
+    private static object? DictSort(object? input)
+    {
+        if (input is Dictionary<string, object?> dict)
+            return dict.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase)
+                       .Select(kvp => (object?)new List<object?> { kvp.Key, kvp.Value }).ToList();
         return new List<object?>();
     }
 

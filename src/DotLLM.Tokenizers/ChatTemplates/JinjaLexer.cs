@@ -31,7 +31,12 @@ internal sealed class JinjaLexer
             // Check for comment {# ... #}
             if (Match("{#"))
             {
-                SkipComment();
+                // Whitespace control on comments: {#- trims the preceding text, -#} the following.
+                if (_pos < _source.Length && _source[_pos] == '-')
+                    StripTrailingWhitespace(tokens);
+                bool stripRight = SkipComment();
+                if (stripRight)
+                    StripLeadingWhitespace(tokens);
                 continue;
             }
 
@@ -302,6 +307,7 @@ internal sealed class JinjaLexer
             "set" => JinjaTokenType.Set,
             "macro" => JinjaTokenType.Macro,
             "endmacro" => JinjaTokenType.EndMacro,
+            "endset" => JinjaTokenType.EndSet,
             "not" => JinjaTokenType.Not,
             "and" => JinjaTokenType.And,
             "or" => JinjaTokenType.Or,
@@ -324,16 +330,18 @@ internal sealed class JinjaLexer
         return new JinjaToken(type, value, startLine, startCol);
     }
 
-    private void SkipComment()
+    /// <returns>True when the comment closed with <c>-#}</c> (strip following whitespace).</returns>
+    private bool SkipComment()
     {
         // Already consumed {#, now scan for #}
         while (_pos < _source.Length)
         {
             if (_source[_pos] == '#' && _pos + 1 < _source.Length && _source[_pos + 1] == '}')
             {
+                bool strip = _pos > 0 && _source[_pos - 1] == '-';
                 Advance();
                 Advance();
-                return;
+                return strip;
             }
             Advance();
         }

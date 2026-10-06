@@ -184,6 +184,17 @@ internal sealed class JinjaParser
             return new SetAttributeNode(name, attr, value);
         }
 
+        // Block set: {% set x %} ... {% endset %} (Gemma-4 template uses this).
+        if (CurrentIs(JinjaTokenType.StmtEnd))
+        {
+            Advance();
+            var blockBody = ParseBody(JinjaTokenType.EndSet);
+            Expect(JinjaTokenType.StmtStart);
+            Expect(JinjaTokenType.EndSet);
+            Expect(JinjaTokenType.StmtEnd);
+            return new SetBlockNode(name, blockBody);
+        }
+
         Expect(JinjaTokenType.Assign);
         var expr = ParseExpression();
         Expect(JinjaTokenType.StmtEnd);
@@ -249,7 +260,7 @@ internal sealed class JinjaParser
     private IExpression ParseExpression() => ParseConditional();
 
     /// <summary>
-    /// conditional → or_expr (IF or_expr ELSE conditional)?
+    /// conditional → or_expr (IF or_expr (ELSE conditional)?)?
     /// Jinja2 ternary: value_if_true if condition else value_if_false
     /// </summary>
     private IExpression ParseConditional()
@@ -260,8 +271,19 @@ internal sealed class JinjaParser
         {
             Advance();
             var condition = ParseOr();
-            Expect(JinjaTokenType.Else);
-            var falseValue = ParseConditional();
+            // Jinja2: the else branch is optional; when absent and the condition is false the
+            // result is undefined (renders empty). The Gemma-4 template relies on this
+            // ({{- ',' if not loop.last -}}).
+            IExpression falseValue;
+            if (CurrentIs(JinjaTokenType.Else))
+            {
+                Advance();
+                falseValue = ParseConditional();
+            }
+            else
+            {
+                falseValue = new LiteralExpr(JinjaEvaluator.Undefined);
+            }
             return new ConditionalExpr(expr, condition, falseValue);
         }
 
