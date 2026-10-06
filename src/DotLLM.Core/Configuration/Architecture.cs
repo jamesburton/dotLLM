@@ -425,5 +425,15 @@ public enum Architecture
     /// nomic-embed encoder (llama.cpp <c>nomic-bert</c>): BERT layout with RoPE (NeoX) instead of
     /// absolute positions, fused QKV, SwiGLU FFN, no biases (issue #739).
     /// </summary>
-    NomicBert
+    NomicBert,
+
+    /// <summary>
+    /// IBM Granite dense decoder (llama.cpp <c>granite</c>, HF <c>GraniteForCausalLM</c>; Granite-3.x / 4.x). A
+    /// Llama-shaped GQA + SwiGLU transformer plus the four Granite scalars: embedding multiplier,
+    /// attention multiplier (replaces <c>1/sqrt(head_dim)</c>), residual multiplier (on both sublayer
+    /// outputs) and logit scale (logits divided). See <see cref="DotLLM.Core.Models.ModelConfig.ResidualScale"/>,
+    /// <see cref="DotLLM.Core.Models.ModelConfig.AttentionScale"/>, <see cref="DotLLM.Core.Models.ModelConfig.LogitScale"/>
+    /// and <see cref="DotLLM.Core.Models.ModelConfig.EmbeddingScale"/> (issue #313, #764).
+    /// </summary>
+    Granite
 }
