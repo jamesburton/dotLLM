@@ -36,7 +36,9 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32(
     const int seq_q, const int seq_kv,
     const int num_heads, const int num_kv_heads, const int head_dim,
     const int position_offset, const int sliding_window,
-    const float* __restrict__ sinks)   // gpt-oss per-head sink logits [num_heads]; nullptr = disabled
+    const float* __restrict__ sinks,   // gpt-oss per-head sink logits [num_heads]; nullptr = disabled
+    const float score_scale,           // Gemma query_pre_attn_scalar: > 0 replaces 1/sqrt(head_dim); 0 = default
+    const float attn_softcap)          // Gemma-2 attention-logit soft-cap: > 0 => score = cap*tanh(score/cap); 0 = off
 {
     int block_id = blockIdx.x;
     if (block_id >= seq_q * num_heads) return;
@@ -44,7 +46,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32(
     int tq = block_id / num_heads;
     int hq = block_id % num_heads;
     int hkv = hq / (num_heads / num_kv_heads);
-    float scale = rsqrtf((float)head_dim);
+    float scale = score_scale > 0.0f ? score_scale : rsqrtf((float)head_dim);
     int pos_q = position_offset + tq;
 
     int q_stride = num_heads * head_dim;
@@ -88,7 +90,12 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32(
             float score = 0.0f;
             for (int d = 0; d < head_dim; d++)
                 score += q_shared[d] * k_vec[d];
-            score_tile[t] = score * scale;
+            score *= scale;
+            // Gemma-2: soft-cap applied AFTER the scale and BEFORE masking/softmax. Masked
+            // positions took the -FLT_MAX branch above, so the cap never touches them.
+            if (attn_softcap > 0.0f)
+                score = attn_softcap * tanhf(score / attn_softcap);
+            score_tile[t] = score;
         }
         __syncthreads();
 

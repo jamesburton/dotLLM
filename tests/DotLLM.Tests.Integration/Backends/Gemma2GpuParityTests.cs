@@ -1,6 +1,7 @@
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
+using DotLLM.Cuda;
 using DotLLM.Models;
 using DotLLM.Models.Gguf;
 using DotLLM.Vulkan;
@@ -140,6 +141,105 @@ public sealed class Gemma2GpuParityTests
                 Compare($"{name} cacheless", cpu[Tokens.Length - 1], all.AsSpan(all.Length - vocab, vocab).ToArray(), 0.02, ref worst);
             }
             _output.WriteLine($"{name}: Vulkan vs CPU worst |diff| = {worst:E3} over prefill + 6 decode steps + cacheless.");
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { /* best-effort */ }
+        }
+    }
+
+    /// <summary>
+    /// CUDA parity: the dedicated FP32 Gemma forward (<c>CudaTransformerModel.ForwardGemmaF32</c>)
+    /// over the FP16 <c>CudaKvCache</c>, through prefill, KV-cache single-token decode, the cacheless
+    /// scoring path, and the scheduler's <c>ForwardBatch</c> entry point. Skips cleanly without an
+    /// NVIDIA device (this AMD dev box); runs on the T5500.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Fixtures))]
+    public void Cuda_MatchesCpu_PrefillDecodeCachelessAndBatch(string name, SyntheticGemma2Config cfg)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA device/driver on this host.");
+
+        string path = WriteFixture(cfg);
+        try
+        {
+            int[] seqB = Tokens.Select((t, i) => i == 0 ? 2 : (t * 7 + 3) % 90 + 4).ToArray();
+            float[][] cpuA = CpuRows(path, Tokens, out int vocab);
+            float[][] cpuB = CpuRows(path, seqB, out _);
+
+            var (model, gguf, config) = CudaModelLoader.LoadFromGguf(path, deviceId: 0);
+            using (gguf)
+            using (model)
+            {
+                Assert.Equal(cfg.Arch == "gemma2" ? Architecture.Gemma2 : Architecture.Gemma, config.Architecture);
+                double worst = 0;
+                const double abs = 0.05;   // FP16 weights + FP16 logits head + FP16 KV store
+
+                using (var cache = model.CreateKvCache(maxSeqLen: Tokens.Length + 1))
+                {
+                    using (ITensor l = model.Forward(Tokens.AsSpan(0, PrefillLen).ToArray(),
+                               Enumerable.Range(0, PrefillLen).ToArray(), -1, cache))
+                        Compare($"{name} prefill", cpuA[PrefillLen - 1], Last(l, vocab), abs, ref worst);
+                    for (int t = PrefillLen; t < Tokens.Length; t++)
+                    {
+                        using ITensor l = model.Forward([Tokens[t]], [t], -1, cache);
+                        Compare($"{name} decode@{t}", cpuA[t], Last(l, vocab), abs, ref worst);
+                    }
+                }
+
+                using (ITensor l = model.Forward(Tokens, Enumerable.Range(0, Tokens.Length).ToArray(), -1, kvCache: null))
+                    Compare($"{name} cacheless", cpuA[Tokens.Length - 1], Last(l, vocab), abs, ref worst);
+
+                // Two sequences through the scheduler's batched entry point (per-sequence fallback for Gemma).
+                using var cacheA = model.CreateKvCache(maxSeqLen: Tokens.Length + 1);
+                using var cacheB = model.CreateKvCache(maxSeqLen: seqB.Length + 1);
+                foreach (var (seq, cache) in new[] { (Tokens, cacheA), (seqB, cacheB) })
+                {
+                    using ITensor l = model.Forward(seq.AsSpan(0, PrefillLen).ToArray(),
+                        Enumerable.Range(0, PrefillLen).ToArray(), -1, cache);
+                }
+                for (int t = PrefillLen; t < Tokens.Length; t++)
+                {
+                    var requests = new[]
+                    {
+                        new SequenceForwardRequest { TokenIds = new[] { Tokens[t] }, Positions = new[] { t }, KvCache = cacheA },
+                        new SequenceForwardRequest { TokenIds = new[] { seqB[t] }, Positions = new[] { t }, KvCache = cacheB },
+                    };
+                    IReadOnlyList<ITensor> results = model.ForwardBatch(requests, deviceId: -1);
+                    Compare($"{name} batch A@{t}", cpuA[t], Last(results[0], vocab), abs, ref worst);
+                    Compare($"{name} batch B@{t}", cpuB[t], Last(results[1], vocab), abs, ref worst);
+                    foreach (var r in results) r.Dispose();
+                }
+                _output.WriteLine($"{name}: CUDA vs CPU worst |diff| = {worst:E3} (prefill + 6 decode + cacheless + batch).");
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { /* best-effort */ }
+        }
+    }
+
+    private static float[] Last(ITensor logits, int vocab)
+    {
+        float[] all = Rows(logits);
+        return all.AsSpan(all.Length - vocab, vocab).ToArray();
+    }
+
+    /// <summary>
+    /// Composite CUDA hosts have no Gemma ops in their layer loops, so loading Gemma through them must
+    /// throw (never silently produce wrong logits). Needs no GPU: the guard runs before any CUDA resource.
+    /// </summary>
+    [Fact]
+    public void Cuda_CompositeHosts_RejectGemma()
+    {
+        string path = WriteFixture(new SyntheticGemma2Config { Layers = 4 });
+        try
+        {
+            using var gguf = GgufFile.Open(path);
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            Assert.Throws<NotSupportedException>(() => DotLLM.Cuda.CudaPipelineTransformerModel.LoadFromGguf(gguf, config, 2, 0, 1));
+            Assert.Throws<NotSupportedException>(() => DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(gguf, config, 2, 0, ThreadingConfig.SingleThreaded));
+            Assert.Throws<NotSupportedException>(() => DotLLM.Cuda.HybridVulkanCudaTransformerModel.LoadFromGguf(gguf, config, 2));
         }
         finally
         {
