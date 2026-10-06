@@ -24,7 +24,7 @@ public sealed record EmbeddingRequest
     [JsonPropertyName("encoding_format")]
     public string? EncodingFormat { get; init; }
 
-    /// <summary>Ignored — dotLLM does not support Matryoshka truncation. Rejected when set.</summary>
+    /// <summary>Matryoshka-style truncation: keep the leading N components, then renormalise. Must be 1..hidden size.</summary>
     [JsonPropertyName("dimensions")]
     public int? Dimensions { get; init; }
 

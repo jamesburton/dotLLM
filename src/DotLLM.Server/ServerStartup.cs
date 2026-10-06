@@ -162,13 +162,52 @@ public static class ServerStartup
     /// <summary>Sentinel <c>gpu_layers</c> value meaning "every layer, as the loader counts them".</summary>
     public const int AllGpuLayers = -1;
 
+    /// <summary>
+    /// Embedding-only encoder checkpoints (BERT / nomic-bert, #739): no generator, KV-cache, chat template
+    /// or scheduler; only <c>/v1/embeddings</c> (and the ollama embed routes) serve them. CPU only -- a GPU
+    /// device request fails loudly rather than silently running on the CPU.
+    /// </summary>
+    private static ServerState LoadEncoderModel(
+        string resolvedPath, ServerOptions options, GgufFile gguf, ModelConfig config, ITokenizer tokenizer)
+    {
+        if (!string.Equals(options.Device, "cpu", StringComparison.OrdinalIgnoreCase))
+        {
+            gguf.Dispose();
+            throw new NotSupportedException(
+                $"{config.Architecture} embedding models are CPU-only for now (requested device '{options.Device}'). "
+                + "Use --device cpu; GPU encoder backends are not implemented and there is no silent CPU fallback.");
+        }
+        var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);
+        Console.WriteLine($"[dotllm] CPU inference, {config.Architecture} encoder ({threading.EffectiveThreadCount} threads); embeddings only");
+        var model = BertEncoderModel.LoadFromGguf(gguf, config, threading);
+        return new ServerState
+        {
+            Options = options,
+            Config = config,
+            KvCacheConfig = new KvCacheConfig(KvCacheConfig.ParseDType(options.CacheTypeK), KvCacheConfig.ParseDType(options.CacheTypeV)),
+            IsReady = true,
+            Model = model,
+            Tokenizer = tokenizer,
+            LoadedModelPath = resolvedPath,
+            CurrentGguf = gguf,
+            LoraRegistry = CreateLoraRegistry(),
+            Residency = CreateResidencyManager(options),
+            EstimatedBytes = SafeFileLength(resolvedPath),
+            LastUsedUtc = DateTimeOffset.UtcNow,
+        };
+    }
+
     private static ServerState LoadModelCore(string resolvedPath, ServerOptions options)
     {
         Console.WriteLine($"[dotllm] Loading model from {resolvedPath}...");
         var gguf = GgufFile.Open(resolvedPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         config = GgufModelConfigExtractor.ApplyRoPEOverride(config, options.RopeOverride);
-        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        bool isEncoder = config.Architecture is Architecture.Bert or Architecture.NomicBert;
+        var tokenizer = isEncoder ? GgufTokenizerFactory.Load(gguf.Metadata) : GgufBpeTokenizerFactory.Load(gguf.Metadata);
+
+        if (isEncoder)
+            return LoadEncoderModel(resolvedPath, options, gguf, config, tokenizer);
 
         var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);
 
