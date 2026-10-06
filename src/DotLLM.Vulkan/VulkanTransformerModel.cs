@@ -7218,6 +7218,19 @@ public sealed class VulkanTransformerModel : IModel
         }
 
         long rowBytes = (long)hiddenSize * sizeof(float);
+        if (_weights.TokenEmbeddingRows is { } chunkedRows)
+        {
+            // #778: widened table over maxStorageBufferRange, held as row chunks.
+            chunkedRows.NoteTransfers(_device.ActiveHazards, _state.HiddenState.Handle);
+            for (int t = 0; t < tokenIds.Length; t++)
+            {
+                int id = tokenIds[t];
+                if ((uint)id >= (uint)Config.VocabSize)
+                    throw new ArgumentOutOfRangeException(nameof(tokenIds), $"Token id {id} is out of range");
+                chunkedRows.RecordRowCopy(cmdBuf, id, _state.HiddenState, (long)t * rowBytes);
+            }
+            return;
+        }
         var srcBuf = _weights.TokenEmbedding.Handle;
         var dstBuf = _state.HiddenState.Handle;
         // One hazard declaration covers the whole gather: every copy reads the

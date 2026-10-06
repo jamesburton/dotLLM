@@ -833,15 +833,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         {
             // Head-local table: plain F32 row copies, NOT Hadamard-latent.
             for (int i = 0; i < s; i++)
-            {
-                var region = new VkBufferCopy
-                {
-                    srcOffset = (ulong)((long)tokenIds[i] * hiddenRowBytes),
-                    dstOffset = (ulong)((long)i * hiddenRowBytes),
-                    size = (ulong)hiddenRowBytes,
-                };
-                VulkanApi.vkCmdCopyBuffer(cmdBuf, headEmbed.Handle, _state.HiddenState.Handle, 1, region);
-            }
+                headEmbed.RecordRowCopy(cmdBuf, tokenIds[i], _state.HiddenState, (long)i * hiddenRowBytes);
         }
         else
         {
@@ -2302,13 +2294,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         if (mtpHead.EmbedTokensWeight is { } headEmbed)
         {
             // Head-local table: plain F32 row copy, and NOT Hadamard-latent.
-            var region = new VkBufferCopy
-            {
-                srcOffset = (ulong)((long)tokenId * hiddenRowBytes),
-                dstOffset = 0,
-                size = (ulong)hiddenRowBytes,
-            };
-            VulkanApi.vkCmdCopyBuffer(cmdBuf, headEmbed.Handle, _state.HiddenState.Handle, 1, region);
+            headEmbed.RecordRowCopy(cmdBuf, tokenId, _state.HiddenState, 0);
             KernelSupport.TransferToComputeBarrier(cmdBuf);
         }
         else

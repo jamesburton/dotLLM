@@ -54,7 +54,7 @@ internal sealed class VulkanQwen3HybridDenseMtpWeights : IDisposable
     public required VulkanDevice.Buffer HnormWeight { get; init; }
 
     /// <summary>Optional head-local <c>nextn.embed_tokens.weight</c>, widened to F32. Null ⇒ use the trunk table.</summary>
-    public VulkanDevice.Buffer? EmbedTokensWeight { get; init; }
+    public VulkanChunkedRowTable? EmbedTokensWeight { get; init; }
 
     /// <summary>Optional head-local <c>nextn.shared_head_head.weight</c>. Null ⇒ use the trunk LM head.</summary>
     public VulkanDevice.Buffer? SharedHeadHeadWeight { get; init; }
@@ -119,13 +119,12 @@ internal sealed class VulkanQwen3HybridDenseMtpWeights : IDisposable
         // is the same vkCmdCopyBuffer row copy the trunk's unpacked path uses; a head-local table
         // at Bonsai's vocabulary would be far too large for that, but no released checkpoint ships
         // one — Bonsai 2 MTP falls back to the trunk table, which stays packed.
-        VulkanDevice.Buffer? embedTokens = null;
+        VulkanChunkedRowTable? embedTokens = null;
         if (cpuHead.EmbedTokensWeight is { } embedPtr)
         {
-            embedTokens = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging,
-                embedPtr, cpuHead.EmbedTokensQuantType, config.VocabSize, config.HiddenSize,
-                forceF32: true, out _, out long embedBytes);
-            total += embedBytes;
+            embedTokens = VulkanChunkedRowTable.Create(device, staging,
+                embedPtr, cpuHead.EmbedTokensQuantType, config.VocabSize, config.HiddenSize, tag: "mtp.embed_tokens");
+            total += embedTokens.TotalBytes;
         }
 
         VulkanDevice.Buffer? sharedHead = null;

@@ -478,7 +478,14 @@ internal sealed class VulkanWeights : IDisposable
     private readonly LayerBuffers[] _layers;
 
     public LayerBuffers[] Layers => _layers;
+    /// <summary>
+    /// Device token-embedding table. When the widened F32 table would exceed the device's
+    /// <c>maxStorageBufferRange</c> (#778) this is a 64-byte stub and <see cref="TokenEmbeddingRows"/> holds the rows.
+    /// </summary>
     public VulkanDevice.Buffer TokenEmbedding { get; }
+
+    /// <summary>Row-chunked F32 table, or <c>null</c> when <see cref="TokenEmbedding"/> is the real table.</summary>
+    public VulkanChunkedRowTable? TokenEmbeddingRows { get; private set; }
 
     /// <summary>
     /// Byte layout the token-embedding table actually holds on the device:
@@ -608,6 +615,7 @@ internal sealed class VulkanWeights : IDisposable
         // A non-first pipeline stage never gathers (seeded from hidden state),
         // so it stubs the slot — same contract as the MoE/MLA stub buffers.
         VulkanDevice.Buffer tokenEmbed;
+        VulkanChunkedRowTable? tokenEmbedRows = null;
         QuantizationType tokenEmbedDeviceQt = QuantizationType.F32;
         if (skipTokenEmbed)
         {
@@ -616,9 +624,22 @@ internal sealed class VulkanWeights : IDisposable
         }
         else
         {
-            tokenEmbed = UploadTokenEmbedding(device, staging, weights, spvDir,
-                out long tokenEmbedBytes, out tokenEmbedDeviceQt);
-            totalBytes += tokenEmbedBytes;
+            if (!KeepEmbedQ8_0OnDevice(weights.TokenEmbedQuantType, weights.HiddenSize, spvDir)
+                && VulkanChunkedRowTable.NeedsChunking(device, weights.VocabSize, (long)weights.HiddenSize * sizeof(float)))
+            {
+                // #778: widened table over maxStorageBufferRange -> row chunks (CPU-widened per chunk).
+                tokenEmbedRows = VulkanChunkedRowTable.Create(device, staging,
+                    weights.TokenEmbedWeight, weights.TokenEmbedQuantType, weights.VocabSize, weights.HiddenSize);
+                LastTokenEmbedDequantPath = "cpu-chunked";
+                tokenEmbed = device.AllocateDeviceLocal(64);
+                totalBytes += tokenEmbedRows.TotalBytes;
+            }
+            else
+            {
+                tokenEmbed = UploadTokenEmbedding(device, staging, weights, spvDir,
+                    out long tokenEmbedBytes, out tokenEmbedDeviceQt);
+                totalBytes += tokenEmbedBytes;
+            }
         }
 
         // Upload an arbitrary layer window [firstLayer .. firstLayer+numLayers): the local LayerBuffers
@@ -900,12 +921,14 @@ internal sealed class VulkanWeights : IDisposable
 
         LastResidencyReport = _residencyReport;
 
-        return new VulkanWeights(
+        var built = new VulkanWeights(
             device, tokenEmbed, tokenEmbedDeviceQt, weights.VocabSize, weights.HiddenSize,
             layerBuffers,
             outputNorm, outputWeight, outputDeviceQt,
             weights.OutputOutputDim, weights.OutputInputDim,
             totalBytes);
+        built.TokenEmbeddingRows = tokenEmbedRows;
+        return built;
     }
 
     /// <summary>
@@ -2823,6 +2846,7 @@ internal sealed class VulkanWeights : IDisposable
     public void Dispose()
     {
         TokenEmbedding.Dispose();
+        TokenEmbeddingRows?.Dispose();
         OutputNormWeight.Dispose();
         OutputWeight.Dispose();
         for (int i = 0; i < _layers.Length; i++)

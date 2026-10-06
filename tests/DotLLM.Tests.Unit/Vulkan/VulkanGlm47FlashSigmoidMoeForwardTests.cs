@@ -117,6 +117,38 @@ public sealed class VulkanGlm47FlashSigmoidMoeForwardTests
         return a;
     }
 
+    /// <summary>
+    /// #778: the standard <c>VulkanWeights</c> embedding, forced over a tiny limit (2 rows per chunk of the
+    /// 8-row table = 4 chunks, ids in chunks 0..2). CPU is the oracle.
+    /// </summary>
+    [SkippableFact]
+    public void Forward_EmbeddingOverLimit_IsChunked_AndMatchesCpu()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        string path = Write(reverseBias: false);
+        long before = VulkanChunkedRowTable.NonFirstChunkCopies("token_embd");
+        VulkanChunkedRowTable.LimitOverrideBytes = 2UL * Hidden * sizeof(float);
+        try
+        {
+            int[] tokens = [1, 3, 5];
+            int[] pos = [0, 1, 2];
+            float[] cpu = Cpu(path, tokens, pos);
+            float[] vk = Vk(path, spvDir, tokens, pos);
+            Assert.True(VulkanChunkedRowTable.NonFirstChunkCopies("token_embd") > before,
+                "No row was gathered from a non-first chunk: the chunk path did not run.");
+            for (int c = 0; c < Vocab; c++)
+            {
+                float diff = MathF.Abs(cpu[c] - vk[c]);
+                Assert.True(diff <= 5e-3f + 1e-3f * MathF.Abs(cpu[c]), $"col={c}: cpu={cpu[c]:F6} vk={vk[c]:F6}");
+            }
+        }
+        finally
+        {
+            VulkanChunkedRowTable.LimitOverrideBytes = null;
+            File.Delete(path);
+        }
+    }
+
     private static float[] Cpu(string path, int[] tokens, int[] pos)
     {
         using var gguf = GgufFile.Open(path);
