@@ -231,7 +231,7 @@ public sealed class EmbeddingsEndpointHttpTests(EmbeddingsServerFixture fixture,
     [InlineData("{\"input\": [1, 2, 99999999]}")]
     [InlineData("{\"input\": \"hi\", \"encoding_format\": \"utf8\"}")]
     [InlineData("{\"input\": \"hi\", \"pooling\": \"sum\"}")]
-    [InlineData("{\"input\": \"hi\", \"dimensions\": 64}")]
+    [InlineData("{\"input\": \"hi\", \"dimensions\": 0}")]
     public async Task Malformed_requests_return_400_with_a_message(string json)
     {
         SkipIfNoModel();

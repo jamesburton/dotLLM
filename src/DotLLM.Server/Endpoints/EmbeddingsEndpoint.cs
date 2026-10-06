@@ -57,12 +57,16 @@ public static class EmbeddingsEndpoint
             return;
         }
 
-        if (request.Dimensions is not null)
+        int outDims = state.Config.HiddenSize;
+        if (request.Dimensions is { } dims)
         {
-            await WriteErrorAsync(httpContext, 400,
-                "'dimensions' is not supported: dotLLM returns the model's full hidden size and does not "
-                + "perform Matryoshka truncation.");
-            return;
+            if (dims < 1 || dims > state.Config.HiddenSize)
+            {
+                await WriteErrorAsync(httpContext, 400,
+                    $"'dimensions' must be between 1 and the model's hidden size ({state.Config.HiddenSize}), got {dims}.");
+                return;
+            }
+            outDims = dims;
         }
 
         bool base64;
@@ -156,6 +160,10 @@ public static class EmbeddingsEndpoint
                         var hiddenSpan = AsSpan(hidden, tokens.Length * hiddenSize);
                         EmbeddingPooler.Pool(hiddenSpan, tokens.Length, hiddenSize, pooling, vector);
                     }
+
+                    // Matryoshka-style truncation: keep the leading outDims components, then renormalise.
+                    if (outDims < hiddenSize)
+                        vector = vector.AsSpan(0, outDims).ToArray();
 
                     if (normalize)
                         EmbeddingPooler.L2Normalize(vector);
