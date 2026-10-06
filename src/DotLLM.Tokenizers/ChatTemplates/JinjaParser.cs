@@ -591,10 +591,41 @@ internal sealed class JinjaParser
 
             case JinjaTokenType.LeftParen:
             {
+                // Grouping `(expr)` vs. tuple literal `(a, b, ...)` / `(a,)` / `()`.
+                //
+                // Jinja2/Python semantics: a comma inside the parens — including a lone
+                // trailing comma after a single item — makes this a tuple; a bare `(expr)`
+                // with no comma is plain grouping and evaluates to `expr` itself. Tuples are
+                // represented with the same <see cref="ListExpr"/> node used for `[...]`
+                // literals since the evaluator treats both as ordered sequences.
                 Advance();
-                var expr = ParseExpression();
+
+                if (CurrentIs(JinjaTokenType.RightParen))
+                {
+                    // `()` — empty tuple.
+                    Advance();
+                    return new ListExpr([]);
+                }
+
+                var first = ParseExpression();
+
+                if (CurrentIs(JinjaTokenType.Comma))
+                {
+                    var items = new List<IExpression> { first };
+                    while (CurrentIs(JinjaTokenType.Comma))
+                    {
+                        Advance();
+                        if (CurrentIs(JinjaTokenType.RightParen))
+                            break; // trailing comma
+                        items.Add(ParseExpression());
+                    }
+
+                    Expect(JinjaTokenType.RightParen);
+                    return new ListExpr(items);
+                }
+
                 Expect(JinjaTokenType.RightParen);
-                return expr;
+                return first;
             }
 
             case JinjaTokenType.LeftBracket:
