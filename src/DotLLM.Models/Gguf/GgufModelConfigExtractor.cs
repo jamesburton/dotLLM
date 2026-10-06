@@ -146,6 +146,26 @@ public static partial class GgufModelConfigExtractor
             }
         }
 
+        // OLMo 3 (arch olmo2 + sliding window): local layers use plain RoPE and global layers YaRN-scaled RoPE with a
+        // 3:1 pattern. The per-layer local/global rope pair with YaRN on the global table is not implemented: refuse
+        // rather than silently run one table on every layer.
+        if (architecture == Architecture.Olmo2 && slidingWindowSize is not null)
+            throw new NotSupportedException(
+                "OLMo 3 (GGUF arch 'olmo2' with attention.sliding_window) is not implemented: it needs per-layer local/global RoPE "
+                + "with YaRN on the global layers. Plain OLMo 2 (no sliding window) is supported. "
+                + "Tracked in https://github.com/jamesburton/dotLLM/issues/765.");
+
+        // SmolLM3 NoPE (llama.cpp smollm3.cpp: n_no_rope_layer_step = 4, use_rope = (il+1) % 4 != 0): every 4th layer
+        // skips RoPE. ModelConfig.NoRopeLayers lists the layer indices that SKIP it.
+        IReadOnlyList<int>? noRopeLayers = null;
+        if (architecture == Architecture.SmolLM3)
+        {
+            var skip = new List<int>();
+            for (int il = 0; il < numTrunkLayers; il++)
+                if ((il + 1) % 4 == 0) skip.Add(il);
+            noRopeLayers = skip;
+        }
+
         // GDN models reuse the same {arch}.ssm.* key names as Mamba-2 but with
         // different semantics — skip Mamba-2 SSM config extraction for them.
         MambaSsmConfig? ssmConfig = architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense
@@ -160,7 +180,9 @@ public static partial class GgufModelConfigExtractor
         AttentionType attentionType = AttentionType.GQA;
         if (architecture is Architecture.QwenMoe or Architecture.Mixtral)
         {
-            moeConfig = TryExtractQwenMoeConfig(metadata, arch, numLayers);
+            moeConfig = string.Equals(archString, "olmoe", StringComparison.OrdinalIgnoreCase)
+                ? ExtractOlmoeMoeConfig(metadata, arch, intermediateSize)
+                : TryExtractQwenMoeConfig(metadata, arch, numLayers);
         }
         else if (architecture is Architecture.DeepSeekV2 or Architecture.DeepSeekV3)
         {
@@ -258,6 +280,9 @@ public static partial class GgufModelConfigExtractor
                 : isGemma3 ? ResolveGemma3QueryPreAttnScalar(numTrunkLayers, hiddenSize, numAttentionHeads, headDim)
                 : null,
             RoPEConfig = ropeConfig,
+            NoRopeLayers = noRopeLayers,
+            QkNormWholeProjection = architecture == Architecture.Olmo2
+                || string.Equals(archString, "olmoe", StringComparison.OrdinalIgnoreCase),
             GlobalRoPEConfig = globalRopeConfig,
             PerLayerSlidingWindow = perLayerSlidingWindow,
             AttnTemperatureScale = attnTempScale,
@@ -702,6 +727,26 @@ public static partial class GgufModelConfigExtractor
         };
     }
 
+    /// <summary>
+    /// OLMoE (llama.cpp <c>olmoe.cpp</c>): every layer routed-MoE (64 experts, top-8), softmax over ALL experts then
+    /// top-k WITHOUT renormalisation (<c>norm_w = false</c>), no shared expert; <c>feed_forward_length</c> is per expert.
+    /// </summary>
+    private static MoeConfig ExtractOlmoeMoeConfig(GgufMetadata metadata, string arch, int denseIntermediate)
+    {
+        int expertCount = (int)metadata.GetUInt32($"{arch}.expert_count");
+        int expertUsed = (int)metadata.GetUInt32($"{arch}.expert_used_count");
+        int moeIntermediate = (int)metadata.GetUInt32OrDefault(
+            $"{arch}.expert_feed_forward_length", (uint)denseIntermediate);
+        return new MoeConfig
+        {
+            NumExperts = expertCount,
+            NumExpertsPerTok = expertUsed,
+            MoeIntermediateSize = moeIntermediate,
+            NormTopKProb = false,
+            DecoderSparseStep = 1,
+        };
+    }
+
     private static HybridLayerLayout? TryExtractHybridLayout(
         GgufMetadata metadata, string arch, int numLayers, int trailingMtpLayers)
     {
@@ -910,6 +955,13 @@ public static partial class GgufModelConfigExtractor
             // IBM Granite (llama.cpp LLM_ARCH_GRANITE / LLM_ARCH_GRANITE_MOE): Llama/Mixtral shape + 4 scalars.
             "granite" => Architecture.Granite,
             "granitemoe" => Architecture.GraniteMoe,
+            // SmolLM3 (llama.cpp LLM_ARCH_SMOLLM3): Llama graph + NoPE every 4th layer.
+            "smollm3" => Architecture.SmolLM3,
+            // OLMoE (LLM_ARCH_OLMOE) reuses the Qwen-MoE tensor layout; mapped to QwenMoe exactly as the HF path does
+            // (full-width QK-norm, softmax gating WITHOUT top-k renormalisation).
+            "olmoe" => Architecture.QwenMoe,
+            // OLMo 2 (LLM_ARCH_OLMO2): post-norm-only residual layout. OLMo 3 shares the arch string.
+            "olmo2" => Architecture.Olmo2,
             // BERT-class embedding encoders (#739).
             "bert" => Architecture.Bert,
             "nomic-bert" => Architecture.NomicBert,
@@ -1245,7 +1297,9 @@ public static partial class GgufModelConfigExtractor
                 or Architecture.GptOss or Architecture.BitNet
                 // llama.cpp llama_model_rope_type: gemma / gemma2 / gemma3 are NEOX, and their
                 // converter does not permute Q/K (HF rotate_half layout).
-                or Architecture.Gemma or Architecture.Gemma2 or Architecture.Gemma3 => RoPEType.NeoX,
+                or Architecture.Gemma or Architecture.Gemma2 or Architecture.Gemma3
+                // llama.cpp llama_model_rope_type: olmo2 / olmoe are NEOX (HF layout, no permute); smollm3 stays NORM.
+                or Architecture.Olmo2 => RoPEType.NeoX,
             _ => RoPEType.Norm,
         };
 

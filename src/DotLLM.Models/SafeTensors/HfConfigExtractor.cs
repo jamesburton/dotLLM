@@ -308,6 +308,12 @@ public static class HfConfigExtractor
             PerLayerEmbedding = perLayerEmbedding,
             ChatTemplate = null,
             NoRopeLayers = noRopeLayers,
+            // OLMoE: one RMSNorm over the whole Q/K projection (see ModelConfig.QkNormWholeProjection).
+            QkNormWholeProjection = architecture == Architecture.QwenMoe
+                && (string.Equals(GetStringOrDefault(root, "model_type", null), "olmoe", StringComparison.OrdinalIgnoreCase)
+                    || (root.TryGetProperty("architectures", out var olmoeArchs) && olmoeArchs.ValueKind == JsonValueKind.Array
+                        && olmoeArchs.GetArrayLength() > 0
+                        && (olmoeArchs[0].GetString() ?? "").Contains("olmoe", StringComparison.OrdinalIgnoreCase))),
         };
     }
 

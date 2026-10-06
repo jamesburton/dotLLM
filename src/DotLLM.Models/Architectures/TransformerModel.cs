@@ -90,6 +90,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     // sqrt(hidden_size) immediately after the lookup. 1.0f (a no-op) for every
     // architecture that leaves ModelConfig.EmbeddingScale null.
     private readonly float _embeddingScale;
+    private readonly bool _postNormOnly;    // OLMo 2: no pre-attention / pre-FFN norm
     private readonly float _residualScale;   // Granite residual multiplier (1 = none)
     private readonly float _logitScale;      // Granite logit divisor (1 = none)
     // True when the dense FFN must use the GeGLU (tanh-approximate GELU) gate
@@ -143,6 +144,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         _threadPool = threadPool;
         _ownsThreadPool = ownsPool;
         _embeddingScale = config.EmbeddingScale ?? 1.0f;
+        _postNormOnly = config.Architecture == DotLLM.Core.Configuration.Architecture.Olmo2;
         _residualScale = config.ResidualScale ?? 1.0f;
         _logitScale = config.LogitScale ?? 1.0f;
         _useGeGLU = config.ActivationFunction == ActivationFunction.GELUTanh;
@@ -1288,7 +1290,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             // below, which has a complete dispatch table plus a dequantize fallback. Asking the
             // kernel via SupportsFusedDecode keeps this in step with the kernel's own tables
             // rather than duplicating a type list that goes stale.
-            if (seqLen == 1 && _threadPool != null && !adapterActive
+            if (seqLen == 1 && _threadPool != null && !adapterActive && !_postNormOnly
                 && MatMul.SupportsFusedDecode(lw.QQuantType)
                 && MatMul.SupportsFusedDecode(lw.KQuantType)
                 && MatMul.SupportsFusedDecode(lw.VQuantType))
@@ -1305,7 +1307,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 if (preQuantNorm == null)
                 {
                     // Fallback: unfused (F32/F16 weights or cross-family projections)
-                    RmsNorm.Execute(
+                    PreNorm(
                         new ReadOnlySpan<float>(hidden, hiddenSize),
                         lw.AttnNormWeight, eps,
                         new Span<float>(normOut, hiddenSize));
@@ -1320,7 +1322,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 // Prefill path: unfused RmsNorm + Quantize + individual projections
                 for (int t = 0; t < seqLen; t++)
                 {
-                    RmsNorm.Execute(
+                    PreNorm(
                         new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
                         lw.AttnNormWeight, eps,
                         new Span<float>(normOut + t * hiddenSize, hiddenSize));
@@ -1581,7 +1583,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                         intermediateSize: moe.IntermediateSize,
                         softmaxAfterTopK: moe.SoftmaxAfterTopK,
                         useSwiGluOai: moe.UseSwiGluOai,
-                        pool: _threadPool);
+                        pool: _threadPool,
+                        normTopKProb: moe.NormTopKProb);
                 }
                 // Route through the shared-expert-aware overload iff we need
                 // shared-expert addition OR the raw-softmax (non-renormalised)
@@ -1655,7 +1658,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             byte* preQuantFfnHoisted = null;
             // Same capability gate as Q/K/V: formats without a fused decode kernel take the
             // standard unfused projection path instead of failing.
-            if (seqLen == 1 && _threadPool != null && !ffnAdapterActive
+            if (seqLen == 1 && _threadPool != null && !ffnAdapterActive && !_postNormOnly
                 && MatMul.SupportsFusedDecode(lw.GateQuantType)
                 && MatMul.SupportsFusedDecode(lw.UpQuantType))
             {
@@ -1670,7 +1673,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 if (preQuantFfn == null)
                 {
                     // Fallback: unfused (F32/F16 weights or cross-family projections)
-                    RmsNorm.Execute(
+                    PreNorm(
                         new ReadOnlySpan<float>(hidden, hiddenSize),
                         lw.FfnNormWeight, eps,
                         new Span<float>(normOut, hiddenSize));
@@ -1685,7 +1688,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 // Prefill path: unfused RmsNorm + Quantize + individual projections
                 for (int t = 0; t < seqLen; t++)
                 {
-                    RmsNorm.Execute(
+                    PreNorm(
                         new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
                         lw.FfnNormWeight, eps,
                         new Span<float>(normOut + t * hiddenSize, hiddenSize));
@@ -3217,7 +3220,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             // identical to RunLayersAndFinalNormCore's prefill RMSNorm.
             for (int t = 0; t < total; t++)
             {
-                RmsNorm.Execute(
+                PreNorm(
                     new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
                     lw.AttnNormWeight, eps,
                     new Span<float>(normOut + t * hiddenSize, hiddenSize));
@@ -3341,7 +3344,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             // i. Batched FFN RMSNorm + Gate/Up + SwiGLU + Down.
             for (int t = 0; t < total; t++)
             {
-                RmsNorm.Execute(
+                PreNorm(
                     new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
                     lw.FfnNormWeight, eps,
                     new Span<float>(normOut + t * hiddenSize, hiddenSize));
@@ -3532,6 +3535,17 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         LoraProjection.Apply(_currentAdapter, LoraAdapter.SelfConditioningLayerIndex, projName, x, y,
                              canvasLen, inputDim, outputDim, _threadPool,
                              region: LoraRegion.Any);
+    }
+
+    /// <summary>
+    /// The pre-attention / pre-FFN RMSNorm. OLMo 2 has none (post-norm-only layout): the sublayer then reads the raw
+    /// residual stream, so this is a plain copy; every other architecture runs the RMSNorm.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void PreNorm(ReadOnlySpan<float> x, float[] weight, float eps, Span<float> y)
+    {
+        if (_postNormOnly) x.CopyTo(y);
+        else RmsNorm.Execute(x, weight, eps, y);
     }
 
     /// <summary>

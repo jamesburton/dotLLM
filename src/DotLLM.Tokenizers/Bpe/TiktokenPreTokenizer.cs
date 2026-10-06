@@ -134,11 +134,14 @@ internal static class TiktokenPreTokenizer
     /// </exception>
     internal static Regex[] GetRegexes(string? preType) => preType switch
     {
-        null or "" or "default" or "gpt2" => Gpt2Pipeline,
+        // llama.cpp: GPT2 / MPT / OLMO / JAIS / TRILLION / GRANITE_DOCLING share one block (OLMoE ships "olmo").
+        null or "" or "default" or "gpt2" or "olmo" => Gpt2Pipeline,
         // llama.cpp routes all of these through LLAMA_VOCAB_PRE_TYPE_LLAMA3
         // (llama-vocab.cpp, the "llama3" case block).
         "llama3" or "llama-v3" or "llama-bpe" or "falcon3" or "falcon-h1"
-            or "pixtral" or "midm-2.0" or "lfm2" or "jina-v5-nano" => Llama3Pipeline,
+            or "pixtral" or "midm-2.0" or "lfm2" or "jina-v5-nano"
+            // DBRX / SMAUG blocks are "same as llama3" (OLMo 2 1B ships "dbrx", SmolLM3 ships "smaug-bpe").
+            or "dbrx" or "smaug-bpe" => Llama3Pipeline,
         // "minerva-7b" is llama.cpp's actual spelling; "minerva" is kept because
         // earlier dotLLM releases accepted it and no GGUF is known to carry it.
         "starcoder" or "refact" or "command-r" or "smollm"
