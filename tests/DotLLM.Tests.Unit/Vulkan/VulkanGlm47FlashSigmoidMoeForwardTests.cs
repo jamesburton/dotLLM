@@ -1,3 +1,4 @@
+using DotLLM.Core.Attention;
 using DotLLM.Core.Tensors;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
@@ -45,6 +46,67 @@ public sealed class VulkanGlm47FlashSigmoidMoeForwardTests
             }
         }
         finally { File.Delete(biased); File.Delete(unbiased); }
+    }
+
+    /// <summary>
+    /// #742 regression: the loader factory must hand an MLA model an MlaVulkanKvCache. With a plain GQA
+    /// cache the forward takes its cacheless branch, so prefill is exact but every decode step after it
+    /// attends only to itself. Prefill-only parity (and PPL) cannot see that; this does a prefill then
+    /// several single-token decode steps through <c>VulkanModelLoader.CreateFromGguf</c> + its own
+    /// KV-cache factory, against a CPU oracle that recomputes the full prefix each step (no cache).
+    /// </summary>
+    [SkippableFact]
+    public void LoaderFactoryKvCache_GreedyDecodeAfterPrefill_MatchesCpuFullRecompute()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        string path = Write(reverseBias: false);
+        try
+        {
+            using var gguf = GgufFile.Open(path);
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            using var cpu = TransformerModel.LoadFromGguf(gguf, config);
+            using var device = VulkanDevice.Create();
+            var (vk, kvFactory) = VulkanModelLoader.CreateFromGguf(device, gguf, config, spvDir);
+            using var _ = (IDisposable)vk;
+            using IKvCache kv = kvFactory(16);
+
+            List<int> seq = [1, 3, 5];
+            float[] vkLast;
+            using (ITensor l = vk.Forward(seq.ToArray(), [0, 1, 2], -1, kv))
+                vkLast = Copy(l);
+
+            for (int step = 0; step < 6; step++)
+            {
+                // CPU oracle: full recompute of the whole prefix, no cache.
+                float[] cpuAll;
+                using (ITensor cl = cpu.Forward(seq.ToArray(), Enumerable.Range(0, seq.Count).ToArray(), deviceId: -1))
+                    cpuAll = Copy(cl);
+                float[] cpuLast = cpuAll[((seq.Count - 1) * Vocab)..];
+                AssertClose(cpuLast, vkLast, step);
+
+                int next = ArgMax(cpuLast);
+                seq.Add(next);
+                // Vulkan: ONE-token decode step against the cache the loader factory produced.
+                using ITensor dl = vk.Forward([next], [seq.Count - 1], -1, kv);
+                vkLast = Copy(dl);
+            }
+        }
+        finally { File.Delete(path); }
+    }
+
+    private static int ArgMax(float[] v)
+    {
+        int b = 0;
+        for (int i = 1; i < v.Length; i++) if (v[i] > v[b]) b = i;
+        return b;
+    }
+
+    private static void AssertClose(float[] cpu, float[] vk, int step)
+    {
+        Assert.Equal(ArgMax(cpu), ArgMax(vk));
+        for (int c = 0; c < Vocab; c++)
+            Assert.True(MathF.Abs(cpu[c] - vk[c]) <= 5e-3f + 1e-3f * MathF.Abs(cpu[c]),
+                $"step={step} col={c}: cpu={cpu[c]:F6} vk={vk[c]:F6}");
     }
 
     private static unsafe float[] Copy(ITensor t)
