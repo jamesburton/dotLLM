@@ -43,10 +43,13 @@ signing is a separate, later decision (see below).
 build). **The blocker is naming**: upstream owns `DotLLM.Cli`, `DotLLM.Engine`, ... on nuget.org (versions `0.1.0-preview.1-3`), so this
 fork cannot publish under those ids.
 
-Until a name is chosen, nothing is pushed. The package id is one repository variable, so choosing is a settings change, not a code change:
+The id is `dotllm` (repo variable `DOTLLM_TOOL_PACKAGE_ID`; unset = skip the push). Credentials, in order of preference:
 
-- repo variable `DOTLLM_TOOL_PACKAGE_ID` = the id to publish the tool under (unset = skip the push),
-- repo secret `NUGET_API_KEY` = a key scoped to that id.
+- **Trusted publishing** (no stored secret): repo variable `NUGET_USER` = the nuget.org profile name, plus a policy on nuget.org
+  (Account -> Trusted Publishing: Repository Owner `jamesburton`, Repository `dotLLM`, Workflow File `release.yml`, Environment empty;
+  a second policy with `ci.yml` covers the dev channel, which calls `release.yml` as a reusable workflow). The job exchanges its OIDC
+  token for a one-hour API key via `NuGet/login@v1`. The policy applies to all packages the chosen owner holds.
+- **API key**: repo secret `NUGET_API_KEY`, scoped to the glob `dotllm`. Used only when `NUGET_USER` is unset.
 
 Only the tool package is pushed; the `DotLLM.*` libraries are still packed (so a build proves they pack) but not published.
 

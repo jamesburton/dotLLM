@@ -300,6 +300,8 @@ jobs:
     name: Push dotnet tool to NuGet.org
     needs: [version, pack-nuget, publish-single-file]
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # NuGet trusted publishing: the job's OIDC token is exchanged for a 1-hour API key
     steps:
       - uses: actions/setup-dotnet@v4
         with:
@@ -313,9 +315,18 @@ jobs:
       # The fork cannot push the upstream-owned DotLLM.* ids, so nothing is published until the repo variable
       # DOTLLM_TOOL_PACKAGE_ID names a package id this account owns (docs/PACKAGING.md lists the options).
       # Only that one package ships - it is what `dnx <id>` / `dotnet tool install -g <id>` runs.
+      # Preferred: trusted publishing (no stored secret). Enabled by the repo variable NUGET_USER (the nuget.org profile name, not an
+      # email); the policy lives on nuget.org (docs/PACKAGING.md). Falls back to a NUGET_API_KEY secret when NUGET_USER is unset.
+      - name: NuGet login (OIDC -> temporary API key)
+        id: login
+        if: ${{ vars.NUGET_USER != '' && vars.DOTLLM_TOOL_PACKAGE_ID != '' }}
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+
       - name: Push tool package
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY || secrets.NUGET_API_KEY }}
           TOOL_ID: ${{ vars.DOTLLM_TOOL_PACKAGE_ID }}
         run: |
           if [ -z "$TOOL_ID" ]; then
@@ -323,7 +334,7 @@ jobs:
             exit 0
           fi
           if [ -z "$NUGET_API_KEY" ]; then
-            echo "::warning::NUGET_API_KEY secret is not set - skipping the NuGet push of $TOOL_ID."
+            echo "::warning::neither NUGET_USER (trusted publishing) nor NUGET_API_KEY is set - skipping the NuGet push of $TOOL_ID."
             exit 0
           fi
           shopt -s nullglob
