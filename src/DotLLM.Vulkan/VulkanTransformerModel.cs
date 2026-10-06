@@ -749,6 +749,8 @@ public sealed class VulkanTransformerModel : IModel
     private readonly float _mlaRopeTheta;
     // MoE (Mixtral / Qwen-MoE) — null when the model carries no MoE layer.
     private readonly MoeTopKSoftmaxF32Kernel? _moeTopkSoftmax;
+    // DeepSeek-V3 / GLM-4.7-Flash sigmoid + selection-bias router (#742). Null unless config.Moe.SigmoidGating.
+    private MoeTopKSigmoidBiasF32Kernel? _moeTopkSigmoid;
     private readonly MoeIndexedMatmulF32Kernel? _moeIndexedMatmul;
     private readonly MoeIndexedMatmulQ8_0F32Kernel? _moeIndexedMatmulQ8;
     // Gemma-4 quantized experts: Q4_K (fused gate_up → split W1/W3) and Q5_1
@@ -1914,6 +1916,8 @@ public sealed class VulkanTransformerModel : IModel
             ropeTheta, ropeDim, ropeVariant, slidingWindow,
             mlaNumHeads, mlaQkNope, mlaQkRope, mlaVHead,
             mlaScale, mlaRopeTheta);
+        if (hasMoe && config.Moe is { SigmoidGating: true })
+            model._moeTopkSigmoid = MoeTopKSigmoidBiasF32Kernel.Create(device, spvDir);
         if (Environment.GetEnvironmentVariable(DisableQ4KCoopmatEnvVar) != "1"
             && MatMulQ4KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
             model._matmulQ4KGemmCoopmat = MatMulQ4KGemmCoopmatKernel.Create(device, spvDir);
@@ -2380,12 +2384,6 @@ public sealed class VulkanTransformerModel : IModel
         + "silently produce wrong output rather than fail. Use the CPU backend, or CUDA (which "
         + "implements both since #365/#366), for gpt-oss checkpoints. Tracked in issue #480.";
 
-    internal const string SigmoidRoutedMoeUnsupportedMessage =
-        "This model uses DeepSeek-V3-style sigmoid MoE routing with an expert-score correction bias "
-        + "(GLM-4.7-Flash, DeepSeek-V3/R1 family), which the Vulkan backend does not implement: its "
-        + "router is softmax-only, so loading would silently choose and weight the wrong experts. "
-        + "Use the CPU backend. Tracked in issue #742.";
-
     internal static void RejectUnsupportedArchitecture(ModelConfig config)
     {
         // Architectures with a dedicated Vulkan model class must say so BEFORE the generic
@@ -2404,12 +2402,6 @@ public sealed class VulkanTransformerModel : IModel
         // model's stages, and HybridVulkanCudaTransformerModel's Vulkan half.
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
             throw new NotSupportedException(GptOssUnsupportedMessage);
-
-        // DeepSeek-V3 / GLM-4.7-Flash routing (#742): sigmoid scores + selection bias + weight scale.
-        // The Vulkan router (moe_topk_softmax_f32) is softmax-only, so loading would silently pick
-        // and weight the wrong experts. Fail loudly instead; never fall back to CPU silently.
-        if (config.Moe is { SigmoidGating: true } && config.MlaConfig is not null)
-            throw new NotSupportedException(SigmoidRoutedMoeUnsupportedMessage);
 
         if (config.HybridLayout is not null || config.SsmConfig is not null || config.Mamba3Config is not null)
             throw new NotSupportedException("Hybrid SSM / Mamba architectures are not supported on the Vulkan backend yet.");
@@ -4226,6 +4218,7 @@ public sealed class VulkanTransformerModel : IModel
         _mlaRope?.InvalidateDescriptorCache();
         _mlaKvSplit?.InvalidateDescriptorCache();
         _moeTopkSoftmax?.InvalidateDescriptorCache();
+        _moeTopkSigmoid?.InvalidateDescriptorCache();
         _moeIndexedMatmul?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ8?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ4K?.InvalidateDescriptorCache();
@@ -5209,9 +5202,20 @@ public sealed class VulkanTransformerModel : IModel
         BarrierComputeToCompute(cmdBuf);
 
         // 3. Top-k softmax: writes MoeTopkIndices (int) and MoeTopkWeights.
-        _moeTopkSoftmax!.Record(cmdBuf,
-            _state.MoeRouterLogits!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
-            seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
+        if (moeW.SigmoidGating)
+        {
+            // DeepSeek-V3 / GLM-4.7-Flash: sigmoid scores, selection bias, renorm + scale (#742).
+            _moeTopkSigmoid!.Record(cmdBuf,
+                _state.MoeRouterLogits!, moeW.SelectionBias!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
+                seqLen: seqLen, numExperts: numE, k: topK,
+                normTopKProb: moeW.NormTopKProb, weightsScale: moeW.WeightsScale);
+        }
+        else
+        {
+            _moeTopkSoftmax!.Record(cmdBuf,
+                _state.MoeRouterLogits!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
+                seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
+        }
         // Broadcast (compute) reads NormOutput, writes MoeExpandedInput; the
         // indexed matmul downstream reads MoeExpandedInput plus topk
         // indices/weights. A single compute→compute barrier covers both
@@ -7037,6 +7041,7 @@ public sealed class VulkanTransformerModel : IModel
         _moeIndexedMatmulQ8?.Dispose();
         _moeIndexedMatmul?.Dispose();
         _moeTopkSoftmax?.Dispose();
+        _moeTopkSigmoid?.Dispose();
         _mlaKvSplit?.Dispose();
         _mlaRope?.Dispose();
         _mlaAttention?.Dispose();

@@ -91,6 +91,15 @@ internal sealed class VulkanWeights : IDisposable
         public readonly VulkanDevice.Buffer? SharedExpertGate;
         public readonly QuantizationType SharedExpertGateDeviceQuantType;
 
+        /// <summary>DeepSeek-V3 / GLM-4.7-Flash sigmoid router (#742); false = softmax.</summary>
+        public bool SigmoidGating { get; init; }
+
+        /// <summary>Per-expert selection bias <c>[numExperts]</c> F32 (sigmoid router only, #742).</summary>
+        public VulkanDevice.Buffer? SelectionBias { get; init; }
+
+        /// <summary>Scale applied to the final top-k weights (<c>expert_weights_scale</c>), #742.</summary>
+        public float WeightsScale { get; init; } = 1.0f;
+
         public readonly int NumExperts;
         public readonly int NumExpertsPerTok;
         public readonly int HiddenSize;
@@ -1844,7 +1853,14 @@ internal sealed class VulkanWeights : IDisposable
             sharedIntermediateSize: hasShared ? sharedI : 0,
             numSharedExperts: hasShared ? numShared : 0,
             sharedExpertGate: sharedExpertGate,
-            sharedExpertGateDeviceQt: sharedExpertGateDeviceQt);
+            sharedExpertGateDeviceQt: sharedExpertGateDeviceQt)
+        {
+            SigmoidGating = moe.SigmoidGating,
+            SelectionBias = moe.SigmoidGating
+                ? UploadNormVec(device, vecStage, moe.SelectionBias ?? new float[numE])
+                : null,
+            WeightsScale = moe.WeightsScale,
+        };
     }
 
     /// <summary>
