@@ -133,6 +133,70 @@ public static class CudaModelLoader
     }
 
     /// <summary>
+    /// THE per-architecture dispatch for a <c>--gpu-layers N</c> request (#729): CPU, all-GPU, or a
+    /// partial split, chosen by <see cref="GpuOffloadPlanner"/>. Architectures that cannot split
+    /// (Nemotron-H, Qwen3MoeHybrid, Mamba-3) never reach <see cref="HybridTransformerModel"/>, which
+    /// only understands dense Llama-style tensor naming; they are loaded all-on-GPU, or the call throws an actionable
+    /// <see cref="InvalidOperationException"/> (never a silent CPU fallback), and <paramref name="warn"/> is told why.
+    /// </summary>
+    /// <param name="gguf">An opened GGUF file; must outlive the model.</param>
+    /// <param name="config">Model configuration extracted from <paramref name="gguf"/>.</param>
+    /// <param name="requestedGpuLayers">Requested GPU layer count (clamped to [0, NumLayers]).</param>
+    /// <param name="deviceId">GPU device ordinal.</param>
+    /// <param name="threading">CPU threading for the CPU layers (and the explicit CPU request).</param>
+    /// <param name="warn">Receives user-facing warnings. May be <see langword="null"/>.</param>
+    /// <returns>The model and, for GPU-resident models, the KV-cache factory it needs
+    /// (<see langword="null"/> for the CPU model).</returns>
+    public static (IModel Model, Func<int, IKvCache>? KvCacheFactory) CreateForGpuLayers(
+        GgufFile gguf, ModelConfig config, int requestedGpuLayers, int deviceId,
+        ThreadingConfig threading, Action<string>? warn = null)
+    {
+        ArgumentNullException.ThrowIfNull(gguf);
+        ArgumentNullException.ThrowIfNull(config);
+
+        var plan = GpuOffloadPlanner.Plan(config.Architecture, requestedGpuLayers, config.NumLayers);
+        if (plan.Warning is not null) warn?.Invoke(plan.Warning);
+
+        switch (plan.Mode)
+        {
+            case GpuOffloadMode.Cpu:
+                return (ModelLoader.CreateCpuModelFromGguf(gguf, config, threading), null);
+
+            case GpuOffloadMode.FullGpu:
+                return CreateFromGguf(gguf, config, deviceId);
+
+            case GpuOffloadMode.Partial:
+                if (config.Architecture == Architecture.Qwen3HybridDense)
+                {
+                    // Issue #291: architecture-aware GPU-head/CPU-tail split (GDN layers have no attn_output).
+                    var q = Architectures.HybridQwen3HybridDenseTransformerModel.LoadFromGguf(
+                        gguf, config, plan.GpuLayers, deviceId, threading);
+                    return (q, size => q.CreateKvCache(size));
+                }
+                else
+                {
+                    var h = HybridTransformerModel.LoadFromGguf(gguf, config, plan.GpuLayers, deviceId, threading);
+                    return (h, size => h.CreateKvCache(size));
+                }
+
+            default: // FullGpuOrFail
+                try
+                {
+                    return CreateFromGguf(gguf, config, deviceId);
+                }
+                catch (Exception ex)
+                {
+                    // Policy (#729/#733): never run on the CPU behind the user's back when they asked for a GPU.
+                    long? total = null;
+                    try { total = CudaDevice.GetDevice(deviceId).TotalMemoryBytes; } catch { /* no CUDA device */ }
+                    throw new InvalidOperationException(
+                        GpuOffloadPlanner.BuildUnsatisfiableMessage(config.Architecture, requestedGpuLayers, config.NumLayers,
+                            gguf.DataSectionLength, total, gpuFreeBytes: null, ex.Message), ex);
+                }
+        }
+    }
+
+    /// <summary>
     /// Loads a transformer model from an HF safetensors checkpoint onto the
     /// specified GPU. Delegates to
     /// <see cref="ModelLoader.OpenSafetensorsAndConfig"/> for source+config

@@ -23,12 +23,12 @@ public static class PropsEndpoint
                 MaxSequenceLength = state.Config?.MaxSequenceLength ?? 0,
                 Device = state.Options.Device,
                 ResolvedDevice = state.Options.ResolvedDevice,
-                DeviceFallbackWarning = state.Options.DeviceFallbackWarning,
                 GpuLayers = state.Options.GpuLayers,
                 Threads = threading.EffectiveThreadCount,
                 SamplingDefaults = ToDto(state.SamplingDefaults),
                 DraftModelPath = string.IsNullOrEmpty(state.DraftModelPath) ? null : state.DraftModelPath,
                 MtpActive = state.Options.MtpEnabled && (state.Model?.SupportsMtp ?? false),
+                DeviceFallbackWarning = state.IsReady ? state.DeviceFallbackWarning : null,
                 IsReady = state.IsReady,
             };
         });

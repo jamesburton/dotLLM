@@ -39,11 +39,6 @@ public sealed record PropsResponse
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? ResolvedDevice { get; init; }
 
-    /// <summary>Set when <c>--device auto</c> had to fall back from a faster device (reason + perf consequence).</summary>
-    [JsonPropertyName("device_fallback_warning")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? DeviceFallbackWarning { get; init; }
-
     [JsonPropertyName("gpu_layers")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? GpuLayers { get; init; }
@@ -66,6 +61,11 @@ public sealed record PropsResponse
     /// </summary>
     [JsonPropertyName("mtp_active")]
     public bool MtpActive { get; init; }
+
+    /// <summary>Non-null when <c>--device auto</c> fell back to the CPU after a GPU load failed (#733).</summary>
+    [JsonPropertyName("device_fallback_warning")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DeviceFallbackWarning { get; init; }
 
     [JsonPropertyName("is_ready")]
     public bool IsReady { get; init; }

@@ -59,4 +59,28 @@ public sealed class DeviceSelectorTests
     [InlineData("vulkan", false)]
     [InlineData(null, false)]
     public void IsAuto_IsExactlyTheAutoPseudoDevice(string? device, bool expected) => Assert.Equal(expected, DeviceSelector.IsAuto(device));
+
+    [Fact]
+    public void FallbackWarning_NamesModelReasonAndPerfConsequence()
+    {
+        string w = DeviceSelector.FallbackWarning("nemotron-h-nano", ["gpu:0: out of memory", "vulkan: device lost"]);
+
+        Assert.Contains("nemotron-h-nano", w, StringComparison.Ordinal);
+        Assert.Contains("out of memory", w, StringComparison.Ordinal);
+        Assert.Contains("vulkan: device lost", w, StringComparison.Ordinal);
+        Assert.Contains("slower", w, StringComparison.Ordinal);
+        Assert.Contains("CPU", w, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void PropsResponse_SurfacesDeviceFallbackWarning_OnlyWhenSet()
+    {
+        var set = new DotLLM.Server.Models.PropsResponse { SamplingDefaults = new() , DeviceFallbackWarning = "slow" };
+        var unset = new DotLLM.Server.Models.PropsResponse { SamplingDefaults = new() };
+
+        string a = System.Text.Json.JsonSerializer.Serialize(set, DotLLM.Server.ServerJsonContext.Default.PropsResponse);
+        string b = System.Text.Json.JsonSerializer.Serialize(unset, DotLLM.Server.ServerJsonContext.Default.PropsResponse);
+        Assert.Contains("\"device_fallback_warning\":\"slow\"", a, StringComparison.Ordinal);
+        Assert.DoesNotContain("device_fallback_warning", b, StringComparison.Ordinal);
+    }
 }
