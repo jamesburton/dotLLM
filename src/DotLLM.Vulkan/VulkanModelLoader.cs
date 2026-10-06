@@ -147,6 +147,12 @@ public static class VulkanModelLoader
             default:
             {
                 var model = VulkanTransformerModel.LoadFromGguf(device, gguf, config, spvDir);
+                // MLA (DeepSeek-V2/V3, GLM-4.7-Flash) layers read K_nope/V/K_pe from a per-layer
+                // MlaVulkanKvCache. A plain GQA VulkanKvCache makes the forward fall back to its
+                // cacheless branch (attention sees only the current step's rows): prefill is exact
+                // but every decode step after it is garbage (#742 real-weights validation).
+                if (model.Config.MlaConfig is not null)
+                    return (model, size => model.CreateMlaKvCache(size));
                 return (model, size => model.CreateKvCache(size));
             }
         }

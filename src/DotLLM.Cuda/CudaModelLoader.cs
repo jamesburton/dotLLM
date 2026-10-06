@@ -88,6 +88,16 @@ public static class CudaModelLoader
                     + "ModelLoader.LoadFromSafetensors (CPU), or VulkanMamba3TransformerModel.LoadFromSafetensors "
                     + "(Vulkan) instead.");
 
+            // DeepSeek-V3 / GLM-4.7-Flash routing (#742): sigmoid scores + selection bias + weight
+            // scale. The CUDA MoE router is softmax-only; loading through `default` would silently
+            // choose and weight the wrong experts.
+            case Architecture.DeepSeekV2 or Architecture.DeepSeekV3 when config.Moe is { SigmoidGating: true }:
+                throw new NotSupportedException(
+                    "This model uses DeepSeek-V3-style sigmoid MoE routing with an expert-score "
+                    + "correction bias (GLM-4.7-Flash, DeepSeek-V3/R1 family), which the CUDA backend "
+                    + "does not implement: its router is softmax-only, so loading would silently choose "
+                    + "and weight the wrong experts. Use the CPU backend. Tracked in issue #742.");
+
             case Architecture.NemotronHMoe:
                 throw new NotSupportedException(
                     "nemotron_h_moe (Nemotron 3.5 Lightning) is recognized but not yet runnable on "

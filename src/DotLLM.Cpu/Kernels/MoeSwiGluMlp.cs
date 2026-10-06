@@ -224,6 +224,9 @@ public static unsafe partial class MoeSwiGluMlp
     /// (identity-MoTE / Qwen3 aux-loss-free routing). Empty span ⇒ no bias. Shifts the top-k
     /// selection; cannot be folded into <paramref name="gateWeights"/>.
     /// </param>
+    /// <param name="sigmoidGating">When true, router scores are <c>sigmoid(logit)</c> instead of softmax (DeepSeek-V3 / GLM-4.7-Flash).</param>
+    /// <param name="selectionBias">Optional per-expert bias added to the sigmoid scores for top-k SELECTION only (<c>exp_probs_b</c>); gating weights stay unbiased.</param>
+    /// <param name="weightsScale">Multiplier applied to the final (optionally renormalised) top-k weights (<c>expert_weights_scale</c>).</param>
     /// <returns>Number of unique experts actually used (the valid prefix length of <paramref name="uniqueExperts"/>).</returns>
     public static int Route(
         ReadOnlySpan<float> hidden,
@@ -237,7 +240,10 @@ public static unsafe partial class MoeSwiGluMlp
         int numExperts, int numExpertsPerTok,
         int hiddenSize, int seqLen,
         bool normTopKProb,
-        ReadOnlySpan<float> gateBias = default)
+        ReadOnlySpan<float> gateBias = default,
+        bool sigmoidGating = false,
+        ReadOnlySpan<float> selectionBias = default,
+        float weightsScale = 1.0f)
     {
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (numExpertsPerTok <= 0 || numExpertsPerTok > numExperts)
@@ -294,17 +300,47 @@ public static unsafe partial class MoeSwiGluMlp
                         logitsSpan[e] += gateBias[e];
                 }
 
-                Softmax.Execute(logitsSpan, routingSpan);
-
-                SelectTopK(routingSpan, topkIdx, topkProb);
+                if (sigmoidGating)
+                {
+                    // DeepSeek-V3 / GLM-4.7-Flash routing (llama.cpp build_moe_ffn, SIGMOID):
+                    // probs = sigmoid(logits); top-k is chosen on probs + selection_bias, but the
+                    // gating weights are the UNBIASED probs of the chosen experts. Renormalise
+                    // (expert_weights_norm, sum clamped at 6.1035e-5) then scale.
+                    for (int e = 0; e < numExperts; e++)
+                        routingSpan[e] = 1.0f / (1.0f + MathF.Exp(-logitsSpan[e]));
+                    if (selectionBias.IsEmpty)
+                    {
+                        SelectTopK(routingSpan, topkIdx, topkProb);
+                    }
+                    else
+                    {
+                        float[] scoreBuf = ArrayPool<float>.Shared.Rent(numExperts);
+                        try
+                        {
+                            for (int e = 0; e < numExperts; e++)
+                                scoreBuf[e] = routingSpan[e] + selectionBias[e];
+                            SelectTopK(scoreBuf.AsSpan(0, numExperts), topkIdx, topkProb);
+                        }
+                        finally { ArrayPool<float>.Shared.Return(scoreBuf); }
+                        for (int i = 0; i < numExpertsPerTok; i++) topkProb[i] = routingSpan[topkIdx[i]];
+                    }
+                }
+                else
+                {
+                    Softmax.Execute(logitsSpan, routingSpan);
+                    SelectTopK(routingSpan, topkIdx, topkProb);
+                }
 
                 if (normTopKProb)
                 {
                     float sum = 0f;
                     for (int i = 0; i < numExpertsPerTok; i++) sum += topkProb[i];
+                    if (sigmoidGating) sum = MathF.Max(sum, 6.103515625e-5f);
                     float invSum = sum > 0f ? 1.0f / sum : 0f;
                     for (int i = 0; i < numExpertsPerTok; i++) topkProb[i] *= invSum;
                 }
+                if (weightsScale != 1.0f)
+                    for (int i = 0; i < numExpertsPerTok; i++) topkProb[i] *= weightsScale;
 
                 for (int slot = 0; slot < numExpertsPerTok; slot++)
                 {

@@ -99,6 +99,17 @@ internal static class TiktokenPreTokenizer
             RegexOptions.Compiled),
     ];
 
+    // ── GLM-4 / GLM-4.5+ / GLM-4.7 / GLM-5 (llama.cpp LLAMA_VOCAB_PRE_TYPE_CHATGLM4) ──
+    // Verbatim from llama-vocab.cpp: the Llama-3 expression with the contractions spelled out per
+    // character. Digits group in runs of up to three (NOT one at a time like Qwen). llama.cpp
+    // additionally drops the BOS token (special_bos_id = NULL) and, for glm4/glm5, sets
+    // ignore_merges; the add_bos half is handled by GgufAddBosResolver (no key => false).
+    private static readonly Regex[] ChatGlm4Pipeline =
+    [
+        new(@"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+            RegexOptions.Compiled),
+    ];
+
     // ── Tekken (Mistral NeMo / Pixtral-12B tokenizer family; also NVIDIA
     // Nemotron-Nano-9B-v2). llama.cpp LLAMA_VOCAB_PRE_TYPE_TEKKEN. This is the
     // ORIGINAL tokenizer.json pattern (quoted verbatim in llama-vocab.cpp:408);
@@ -153,6 +164,7 @@ internal static class TiktokenPreTokenizer
         "qwen35" => Qwen35Pipeline,
         "gpt-4o" or "llama4" => Gpt4oPipeline,
         "tekken" => TekkenPipeline,
+        "glm4" or "glm5" or "chatglm-bpe" => ChatGlm4Pipeline,
         _ => Environment.GetEnvironmentVariable("DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER") == "1"
             ? Gpt2Pipeline
             : throw new InvalidDataException(

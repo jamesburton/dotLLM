@@ -767,6 +767,8 @@ public sealed class VulkanTransformerModel : IModel
     private readonly float _mlaRopeTheta;
     // MoE (Mixtral / Qwen-MoE) — null when the model carries no MoE layer.
     private readonly MoeTopKSoftmaxF32Kernel? _moeTopkSoftmax;
+    // DeepSeek-V3 / GLM-4.7-Flash sigmoid + selection-bias router (#742). Null unless config.Moe.SigmoidGating.
+    private MoeTopKSigmoidBiasF32Kernel? _moeTopkSigmoid;
     private readonly MoeIndexedMatmulF32Kernel? _moeIndexedMatmul;
     private readonly MoeIndexedMatmulQ8_0F32Kernel? _moeIndexedMatmulQ8;
     // Gemma-4 quantized experts: Q4_K (fused gate_up → split W1/W3) and Q5_1
@@ -1219,6 +1221,8 @@ public sealed class VulkanTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
 
+        config = VulkanTransformerModel.NormalizeMlaCacheForVulkan(config);
+
         RejectUnsupportedArchitecture(config);
 
         var device = VulkanDevice.Create();
@@ -1268,6 +1272,8 @@ public sealed class VulkanTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
 
+        config = VulkanTransformerModel.NormalizeMlaCacheForVulkan(config);
+
         RejectUnsupportedArchitecture(config);
 
         spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
@@ -1294,6 +1300,8 @@ public sealed class VulkanTransformerModel : IModel
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
+
+        config = VulkanTransformerModel.NormalizeMlaCacheForVulkan(config);
 
         RejectUnsupportedArchitecture(config);
 
@@ -1327,6 +1335,8 @@ public sealed class VulkanTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(cpuWeights);
         ArgumentNullException.ThrowIfNull(spvDir);
+
+        config = VulkanTransformerModel.NormalizeMlaCacheForVulkan(config);
 
         RejectUnsupportedArchitecture(config);
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf: null,
@@ -1949,6 +1959,8 @@ public sealed class VulkanTransformerModel : IModel
             ropeTheta, ropeDim, ropeVariant, slidingWindow,
             mlaNumHeads, mlaQkNope, mlaQkRope, mlaVHead,
             mlaScale, mlaRopeTheta);
+        if (hasMoe && config.Moe is { SigmoidGating: true })
+            model._moeTopkSigmoid = MoeTopKSigmoidBiasF32Kernel.Create(device, spvDir);
         if (Environment.GetEnvironmentVariable(DisableQ4KCoopmatEnvVar) != "1"
             && MatMulQ4KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
             model._matmulQ4KGemmCoopmat = MatMulQ4KGemmCoopmatKernel.Create(device, spvDir);
@@ -2454,6 +2466,16 @@ public sealed class VulkanTransformerModel : IModel
         + "neither its per-head attention sinks nor its dense YaRN RoPE scaling, so loading it would "
         + "silently produce wrong output rather than fail. Use the CPU backend, or CUDA (which "
         + "implements both since #365/#366), for gpt-oss checkpoints. Tracked in issue #480.";
+
+    /// <summary>
+    /// The GGUF/HF extractors default DeepSeek-style MLA to the CPU-only hybrid latent cache. The
+    /// Vulkan path runs the mathematically equivalent expanded cache, so loaders strip the flags
+    /// instead of rejecting a config the user never chose explicitly (#742: GLM-4.7-Flash).
+    /// </summary>
+    internal static ModelConfig NormalizeMlaCacheForVulkan(ModelConfig config)
+        => config.MlaConfig is { UseLatentCache: true } or { UseHybridMlaCache: true }
+            ? config with { MlaConfig = config.MlaConfig with { UseLatentCache = false, UseHybridMlaCache = false } }
+            : config;
 
     internal static void RejectUnsupportedArchitecture(ModelConfig config)
     {
@@ -4316,6 +4338,7 @@ public sealed class VulkanTransformerModel : IModel
         _mlaRope?.InvalidateDescriptorCache();
         _mlaKvSplit?.InvalidateDescriptorCache();
         _moeTopkSoftmax?.InvalidateDescriptorCache();
+        _moeTopkSigmoid?.InvalidateDescriptorCache();
         _moeIndexedMatmul?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ8?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ4K?.InvalidateDescriptorCache();
@@ -5425,9 +5448,20 @@ public sealed class VulkanTransformerModel : IModel
         BarrierComputeToCompute(cmdBuf);
 
         // 3. Top-k softmax: writes MoeTopkIndices (int) and MoeTopkWeights.
-        _moeTopkSoftmax!.Record(cmdBuf,
-            _state.MoeRouterLogits!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
-            seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
+        if (moeW.SigmoidGating)
+        {
+            // DeepSeek-V3 / GLM-4.7-Flash: sigmoid scores, selection bias, renorm + scale (#742).
+            _moeTopkSigmoid!.Record(cmdBuf,
+                _state.MoeRouterLogits!, moeW.SelectionBias!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
+                seqLen: seqLen, numExperts: numE, k: topK,
+                normTopKProb: moeW.NormTopKProb, weightsScale: moeW.WeightsScale);
+        }
+        else
+        {
+            _moeTopkSoftmax!.Record(cmdBuf,
+                _state.MoeRouterLogits!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
+                seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
+        }
         // Broadcast (compute) reads NormOutput, writes MoeExpandedInput; the
         // indexed matmul downstream reads MoeExpandedInput plus topk
         // indices/weights. A single compute→compute barrier covers both
@@ -7253,6 +7287,7 @@ public sealed class VulkanTransformerModel : IModel
         _moeIndexedMatmulQ8?.Dispose();
         _moeIndexedMatmul?.Dispose();
         _moeTopkSoftmax?.Dispose();
+        _moeTopkSigmoid?.Dispose();
         _mlaKvSplit?.Dispose();
         _mlaRope?.Dispose();
         _mlaAttention?.Dispose();
