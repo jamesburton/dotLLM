@@ -472,6 +472,10 @@ public sealed unsafe class CudaTransformerModel : IModel
     public static CudaTransformerModel LoadFromGguf(GgufFile gguf, ModelConfig config,
                                                        int deviceId = 0, string? ptxDir = null)
     {
+        // Dense Gemma-4 (E2B/E4B) is CPU-only: fail before any weight load / device work (#730).
+        if (config.IsGemma4DensePle)
+            throw new NotSupportedException(ModelConfig.Gemma4DensePleUnsupportedMessage("CUDA"));
+
         // Load CPU weights (mmap references only, no heavy allocation)
         // GPU-only path: skip the F32 host dequant of the per-expert MoE 3D
         // tensors. Saves ~2.2 GB host RAM per V2-Lite Q4_K_M MoE layer

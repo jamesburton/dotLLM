@@ -1112,3 +1112,7 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
 - **NCCL integration** (Step 51): multi-GPU tensor parallelism. NCCL is another system library — same P/Invoke pattern, no shared library needed.
 - **Fatbin distribution**: ship pre-compiled SASS for common architectures to eliminate JIT overhead.
 - **NVRTC runtime compilation**: compile `.cu` source to PTX at application startup using NVIDIA's Runtime Compilation library, eliminating the nvcc build step entirely. NVRTC is available as `libnvrtc.so` / `nvrtc64_*.dll`.
+
+## Gemma-4 dense variant (E2B/E4B) is CPU-only
+
+The CUDA Gemma-4 path models the dual-FFN MoE (26B-A4B). The dense PLE variants (per-layer embeddings, trailing shared-KV layers, no MoE block) are implemented on CPU only; `ModelConfig.IsGemma4DensePle` makes CUDA and Vulkan throw `NotSupportedException` before any device work (#730), and `--device auto` falls through to CPU.

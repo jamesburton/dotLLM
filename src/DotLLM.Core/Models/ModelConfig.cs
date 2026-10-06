@@ -379,6 +379,21 @@ public record ModelConfig
     public int NumSharedKvLayers { get; init; }
 
     /// <summary>
+    /// True for the dense Gemma-4 variants (E2B/E4B): a Gemma-4 graph with no routed-MoE
+    /// block and/or per-layer embeddings (PLE) and trailing shared-KV layers. Implemented
+    /// on the CPU backend only; the CUDA and Vulkan backends model Gemma-4 as the dual-FFN
+    /// MoE (26B-A4B) and must reject this shape up front (issue #730).
+    /// </summary>
+    public bool IsGemma4DensePle
+        => Gemma4DualFfn && (Moe is null || PerLayerEmbedding is not null || NumSharedKvLayers > 0);
+
+    /// <summary>Actionable message for backends that cannot run <see cref="IsGemma4DensePle"/> models.</summary>
+    public static string Gemma4DensePleUnsupportedMessage(string backend)
+        => $"The Gemma-4 dense variant (E2B/E4B: per-layer embeddings, shared-KV layers, no MoE block) "
+         + $"is not supported on the {backend} backend; only the CPU backend implements it "
+         + "(issue #730). Use --device cpu, or --device auto to fall back automatically.";
+
+    /// <summary>
     /// Returns true when <paramref name="layerIdx"/> projects and stores its own
     /// K/V. False only for the trailing <see cref="NumSharedKvLayers"/> shared-KV
     /// layers (Gemma-4 E2B/E4B); always true when sharing is off.

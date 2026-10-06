@@ -2399,6 +2399,10 @@ public sealed class VulkanTransformerModel : IModel
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
             throw new NotSupportedException(GptOssUnsupportedMessage);
 
+        // Dense Gemma-4 (E2B/E4B, PLE + shared KV): reject before VulkanDevice.Create / any upload (#730).
+        if (config.IsGemma4DensePle)
+            throw new NotSupportedException(ModelConfig.Gemma4DensePleUnsupportedMessage("Vulkan"));
+
         if (config.HybridLayout is not null || config.SsmConfig is not null || config.Mamba3Config is not null)
             throw new NotSupportedException("Hybrid SSM / Mamba architectures are not supported on the Vulkan backend yet.");
         // MLA: latent / hybrid cache modes are CPU-only for now; the Vulkan

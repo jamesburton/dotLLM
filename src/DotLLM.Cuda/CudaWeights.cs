@@ -256,6 +256,9 @@ internal sealed class CudaWeights : IDisposable
                                               Action<nint>? onHostTensorUploaded = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(firstLayer);
+        // Backstop for the hybrid / pipeline / safetensors callers that bypass CudaTransformerModel.LoadFromGguf (#730).
+        if (config.IsGemma4DensePle)
+            throw new NotSupportedException(ModelConfig.Gemma4DensePleUnsupportedMessage("CUDA"));
         int layerCount = numGpuLayers < 0
             ? config.NumLayers - firstLayer
             : Math.Min(numGpuLayers, config.NumLayers - firstLayer);
