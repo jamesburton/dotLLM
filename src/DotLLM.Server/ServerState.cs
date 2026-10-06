@@ -37,6 +37,9 @@ public sealed class ServerState : IDisposable
     /// <summary>Server startup options (updated on model swap).</summary>
     public required ServerOptions Options { get; set; }
 
+    /// <summary>Set when <c>--device auto</c> had to fall back to the CPU after a GPU load failed (#733); surfaced via /props.</summary>
+    public string? DeviceFallbackWarning { get; set; }
+
     /// <summary>Model configuration (null when no model loaded).</summary>
     public ModelConfig? Config { get; set; }
 

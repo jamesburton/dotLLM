@@ -19,6 +19,26 @@ namespace DotLLM.Server.Endpoints;
 /// </summary>
 public static class ModelManagementEndpoint
 {
+    /// <summary>
+    /// Validates an explicit GGUF path from a load request: it must be a <c>.gguf</c> file that exists and is inside an allowed model location
+    /// (<see cref="ModelInspectEndpoint.IsAllowedModelPath"/>). Returns the normalised path, or null.
+    /// </summary>
+    internal static string? ResolveExactPath(string path, ServerState state)
+    {
+        string full;
+        try { full = Path.GetFullPath(path); } catch { return null; }
+        return (full.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase) || OllamaStore.IsBlobPath(full))
+            && ModelInspectEndpoint.IsAllowedModelPath(full, state)
+            && File.Exists(full) ? full : null;
+    }
+
+    /// <summary>
+    /// Precedence request > profile > startup, except that the "all layers" sentinel (negative) is returned as null
+    /// (unset: a GPU device then loads every layer as the loader counts them) so no profile/startup count can leak in.
+    /// </summary>
+    internal static int? ResolveRequestedGpuLayers(int? request, int? profile, int? startup) =>
+        request is < 0 ? null : request ?? profile ?? startup;
+
     public static void Map(WebApplication app)
     {
         app.MapGet("/v1/models/available", (ServerState state) =>
@@ -46,7 +66,12 @@ public static class ModelManagementEndpoint
 
         app.MapPost("/v1/models/load", async (ModelLoadRequest request, ServerState state, CancellationToken ct) =>
         {
-            var resolvedPath = await ServerStartup.ResolveOrPullAsync(request.Model, request.Quant, state.Options.AutoPull, ct);
+            // An explicit file wins: resolving by repo+quant can pick a different GGUF from the same repo directory than the one the UI inspected.
+            if (!string.IsNullOrEmpty(request.ModelPath) && ResolveExactPath(request.ModelPath, state) is null)
+                return Results.BadRequest(ErrorResponse.InvalidRequest($"Model file not found or not allowed: {request.ModelPath}", param: "path", code: "model_not_found"));
+            var resolvedPath = !string.IsNullOrEmpty(request.ModelPath)
+                ? ResolveExactPath(request.ModelPath, state)
+                : await ServerStartup.ResolveOrPullAsync(request.Model, request.Quant, state.Options.AutoPull, ct);
             if (resolvedPath is null)
                 return Results.BadRequest(ErrorResponse.InvalidRequest(ServerStartup.NotFoundMessage(request.Model), param: "model", code: "model_not_found"));
 
@@ -67,7 +92,7 @@ public static class ModelManagementEndpoint
                         Model = request.Model,
                         Quant = request.Quant,
                         Device = request.Device ?? loadProfile?.Device ?? state.Options.Device,
-                        GpuLayers = request.GpuLayers ?? loadProfile?.GpuLayers ?? state.Options.GpuLayers,
+                        GpuLayers = ResolveRequestedGpuLayers(request.GpuLayers, loadProfile?.GpuLayers, state.Options.GpuLayers),
                         CacheTypeK = request.CacheTypeK ?? state.Options.CacheTypeK,
                         CacheTypeV = request.CacheTypeV ?? state.Options.CacheTypeV,
                         Threads = request.Threads ?? state.Options.Threads,
@@ -86,6 +111,7 @@ public static class ModelManagementEndpoint
                     // Transfer new state fields into the existing ServerState
                     state.Options = newOptions;
                     state.Config = newState.Config;
+                    state.DeviceFallbackWarning = newState.DeviceFallbackWarning;
                     state.Model = newState.Model;
                     state.Tokenizer = newState.Tokenizer;
                     state.ChatTemplate = newState.ChatTemplate;
