@@ -37,23 +37,28 @@ public static class ModelInspectEndpoint
                 var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
                 var fileSize = new FileInfo(fullPath).Length;
 
-                return Results.Ok(new ModelInspectResponse
-                {
-                    Architecture = config.Architecture.ToString(),
-                    NumLayers = config.NumLayers,
-                    HiddenSize = config.HiddenSize,
-                    NumKvHeads = config.NumKvHeads,
-                    HeadDim = config.HeadDim,
-                    VocabSize = config.VocabSize,
-                    MaxSequenceLength = config.MaxSequenceLength,
-                    FileSizeBytes = fileSize,
-                });
+                return Results.Ok(BuildResponse(config, fileSize));
             }
             catch
             {
                 return Results.BadRequest(ErrorResponse.InvalidRequest("Failed to read GGUF metadata", param: "path"));
             }
         });
+
+    /// <summary>Builds the inspect payload from an extracted config.</summary>
+    internal static ModelInspectResponse BuildResponse(DotLLM.Core.Models.ModelConfig config, long fileSize) => new()
+    {
+        Architecture = config.Architecture.ToString(),
+        NumLayers = config.NumLayers,
+        HiddenSize = config.HiddenSize,
+        NumKvHeads = config.NumKvHeads,
+        HeadDim = config.HeadDim,
+        VocabSize = config.VocabSize,
+        MaxSequenceLength = config.MaxSequenceLength,
+        FileSizeBytes = fileSize,
+        // (#729) Lets the UI disable the GPU-layers slider for architectures that cannot split.
+        SupportsPartialOffload = DotLLM.Core.Configuration.GpuOffloadPlanner.SupportsPartialOffload(config.Architecture),
+    };
 
     /// <summary>
     /// Checks whether the given normalized path is within an allowed model directory.

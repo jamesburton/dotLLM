@@ -323,7 +323,10 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                         : 0;
                     var threading = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
                     ctx.Status($"Loading {config.Architecture} model ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)...");
-                    model = DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(gguf, config, gpuLayers, gpuId, threading);
+                    // #729: per-architecture dispatch; unsupported archs fall back to all-GPU, else CPU.
+                    (model, _) = DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(
+                        gguf, config, gpuLayers, gpuId, threading,
+                        w => Console.Error.WriteLine($"WARNING: {w}"));
                 }
             });
 
@@ -477,6 +480,15 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             if (settings.Paged)
                 AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache not supported with hybrid GPU, using hybrid cache.[/]");
             kvFactory = (cfg, size) => hybridModel.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel qwen3Split)
+        {
+            kvFactory = (cfg, size) => qwen3Split.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.CudaNemotronHTransformerModel nemotronHGpu)
+        {
+            // #729: all-GPU fallback for a partial request on Nemotron-H (sparse attention-only KV).
+            kvFactory = (cfg, size) => nemotronHGpu.CreateKvCache(size);
         }
         else if (settings.Paged && !kvConfig.IsQuantized)
         {

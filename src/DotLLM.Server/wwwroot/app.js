@@ -1004,6 +1004,10 @@ async function onModalModelChange() {
         modalGpuLayers.value = modalInspect.num_layers;
         modalGpuLayersMax.textContent = modalInspect.num_layers;
         updateGpuLayersDisplay();
+        // (#729) Architectures that cannot split layers (e.g. Nemotron-H): all-or-nothing on GPU.
+        const canSplit = modalInspect.supports_partial_offload !== false;
+        modalGpuLayers.disabled = !canSplit;
+        modalGpuLayers.title = canSplit ? '' : 'Partial GPU offload is not supported for this architecture';
     } else {
         modalModelInfo.textContent = 'Could not read model metadata';
     }

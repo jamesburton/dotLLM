@@ -163,26 +163,23 @@ public static class ServerStartup
             Console.WriteLine($"[dotllm] Vulkan inference ({DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName})");
             (model, vulkanKvFactory) = DotLLM.Vulkan.VulkanModelLoader.CreateSharedFromGguf(gguf, config);
         }
-        else if (gpuLayers <= 0)
-        {
-            Console.WriteLine($"[dotllm] CPU inference ({threading.EffectiveThreadCount} threads)");
-            // Shared per-architecture CPU dispatch — routes hybrid architectures
-            // (Nemotron-H, Qwen3MoeHybrid) to their dedicated loaders.
-            model = ModelLoader.CreateCpuModelFromGguf(gguf, config, threading);
-        }
-        else if (gpuLayers >= config.NumLayers)
-        {
-            int gpuId = ParseGpuId(options.Device);
-            Console.WriteLine($"[dotllm] GPU {gpuId} inference");
-            // Shared per-architecture CUDA dispatch — routes hybrid architectures
-            // (Qwen3MoeHybrid, Qwen3HybridDense) to their dedicated loaders (#259).
-            (model, _) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId);
-        }
         else
         {
+            // One dispatch for CPU / all-GPU / partial (#729). Architectures that cannot split layers
+            // (Nemotron-H, Qwen3MoeHybrid, Mamba-3) are loaded all-GPU, else CPU, with a warning —
+            // they must never reach HybridTransformerModel (dense Llama-style tensor naming only).
             int gpuId = ParseGpuId(options.Device);
-            Console.WriteLine($"[dotllm] Hybrid inference ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)");
-            model = DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(gguf, config, gpuLayers, gpuId, threading);
+            var plan = GpuOffloadPlanner.Plan(config.Architecture, gpuLayers, config.NumLayers);
+            Console.WriteLine(plan.Mode switch
+            {
+                GpuOffloadMode.Cpu => $"[dotllm] CPU inference ({threading.EffectiveThreadCount} threads)",
+                GpuOffloadMode.FullGpu => $"[dotllm] GPU {gpuId} inference",
+                GpuOffloadMode.Partial => $"[dotllm] Hybrid inference ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)",
+                _ => $"[dotllm] GPU {gpuId} inference (partial offload unsupported for {config.Architecture})",
+            });
+            (model, _) = DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(
+                gguf, config, gpuLayers, gpuId, threading,
+                w => Console.WriteLine($"[dotllm] WARNING: {w}"));
         }
 
         // Create chat template. The declared template is untrusted input from the GGUF's
@@ -267,6 +264,20 @@ public static class ServerStartup
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported with hybrid GPU, using hybrid cache.");
             kvFactory = (cfg, size) => hybridModel.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel qwen3SplitModel)
+        {
+            // #729: partial-offload Qwen3HybridDense owns a split (GPU head / CPU tail) cache.
+            if (options.UsePaged)
+                Console.WriteLine("[dotllm] Paged KV-cache not supported with hybrid GPU, using the model's split cache.");
+            kvFactory = (cfg, size) => qwen3SplitModel.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.CudaNemotronHTransformerModel nemotronHModel)
+        {
+            // #729: the all-GPU fallback for a partial request on Nemotron-H; sparse attention-only KV.
+            if (options.UsePaged)
+                Console.WriteLine("[dotllm] Paged KV-cache not supported for Nemotron-H on GPU; using the model's own cache.");
+            kvFactory = (cfg, size) => nemotronHModel.CreateKvCache(size);
         }
         else if (model is DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel qwen3HybridDenseModel)
         {

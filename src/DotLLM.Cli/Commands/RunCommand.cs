@@ -369,17 +369,12 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 int gpuId = ParseGpuId(settings.Device);
                 var hybridThreading = new ThreadingConfig(
                     settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
-                // Issue #291: the generic (Llama-style) HybridTransformerModel partial-offload
-                // splitter assumes every layer shares one uniform tensor-name set, which throws
-                // KeyNotFoundException on Qwen3HybridDense's interleaved GDN/full-attention
-                // layers (a GDN layer has no attn_output.weight at all). Route this architecture
-                // to its own architecture-aware GPU-head/CPU-tail split instead — mirrors the
-                // CPU-only and full-GPU-offload dispatch's existing per-architecture routing
-                // above (see the "#259" comments on this same method).
-                model = config.Architecture == DotLLM.Core.Configuration.Architecture.Qwen3HybridDense
-                    ? DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel.LoadFromGguf(
-                        gguf, config, gpuLayers, gpuId, hybridThreading)
-                    : DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(gguf, config, gpuLayers, gpuId, hybridThreading);
+                // Partial offload (#729 / #291): one dispatch decides per architecture. Architectures that
+                // cannot split (Nemotron-H, Qwen3MoeHybrid, Mamba-3) fall back to all-GPU, else CPU, with a
+                // warning; Qwen3HybridDense uses its own split loader; the rest use HybridTransformerModel.
+                (model, _) = DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(
+                    gguf, config, gpuLayers, gpuId, hybridThreading,
+                    w => Console.Error.WriteLine($"WARNING: {w}"));
             }
         }
 
@@ -616,6 +611,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 if (settings.Paged)
                     Console.Error.WriteLine("WARNING: Paged KV-cache not supported with hybrid GPU, using hybrid cache.");
                 kvFactory = (cfg, size) => qwen35HybridModel.CreateKvCache(size);
+            }
+            else if (model is DotLLM.Cuda.Architectures.CudaNemotronHTransformerModel nemotronHGpu)
+            {
+                // #729: all-GPU fallback for a partial request on Nemotron-H (sparse attention-only KV).
+                kvFactory = (cfg, size) => nemotronHGpu.CreateKvCache(size);
             }
             else if (settings.Paged && !kvConfig.IsQuantized)
             {
