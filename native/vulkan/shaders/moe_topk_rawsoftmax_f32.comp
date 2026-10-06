@@ -1,0 +1,104 @@
+#version 450
+// gpt-oss MoE router: top-k on the RAW logits (lower index wins ties), then a
+// softmax over the k selected logits only (llama.cpp
+// LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT). The router bias must already
+// have been added to the logits. Mirrors DotLLM.Cpu.Kernels.MoeQuantSwiGluMlp
+// (softmaxAfterTopK = true):
+//   idx = topk(logits, k);  w = softmax(logits[idx])
+//
+// Dispatch:
+//   local_size_x = 64                  (numExperts up to 256 fits in 4 strides)
+//   groupCount.x = seqLen
+//
+// Buffer layout:
+//   logits  : [seqLen, numExperts]  F32 row-major
+//   indices : [seqLen, k]           int32 row-major
+//   weights : [seqLen, k]           F32 row-major
+
+#define MAX_EXPERTS    256u
+#define WG_SIZE        64u
+#define MAX_K          16u
+#define NEG_INF        (-3.4e38)
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufLogits  { float logits[];  };
+layout(set = 0, binding = 1, std430) writeonly buffer BufIdx     { int   indices[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufWeights { float weights[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seqLen;
+    uint numExperts;
+    uint k;
+} pc;
+
+shared float vals[MAX_EXPERTS];
+shared float reduceScratch[WG_SIZE];
+shared int   sharedIdx[MAX_K];
+shared int   reduceIdx[WG_SIZE];
+shared float sharedWeight[MAX_K];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    if (t >= pc.seqLen) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint logitBase = t * pc.numExperts;
+
+    for (uint e = tid; e < pc.numExperts; e += WG_SIZE) {
+        vals[e] = logits[logitBase + e];
+    }
+    barrier();
+
+    // Top-k: k rounds of a workgroup argmax (lower index wins ties).
+    for (uint slot = 0u; slot < pc.k; slot++) {
+        float bv = NEG_INF;
+        int   bi = -1;
+        for (uint e = tid; e < pc.numExperts; e += WG_SIZE) {
+            float v = vals[e];
+            if (v > bv) { bv = v; bi = int(e); }
+        }
+        reduceScratch[tid] = bv;
+        reduceIdx[tid] = bi;
+        barrier();
+        for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                float ov = reduceScratch[tid + stride];
+                int   oi = reduceIdx[tid + stride];
+                float mv = reduceScratch[tid];
+                int   mi = reduceIdx[tid];
+                if (ov > mv || (ov == mv && oi >= 0 && (mi < 0 || oi < mi))) {
+                    reduceScratch[tid] = ov;
+                    reduceIdx[tid] = oi;
+                }
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            int bestIdx = reduceIdx[0];
+            sharedIdx[slot] = bestIdx;
+            sharedWeight[slot] = reduceScratch[0];
+            if (bestIdx >= 0) vals[uint(bestIdx)] = NEG_INF;  // mark claimed
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        // Softmax over the selected raw logits (slot 0 holds the maximum).
+        float m = sharedWeight[0];
+        float sw = 0.0;
+        for (uint slot = 0u; slot < pc.k; slot++) {
+            float ex = exp(sharedWeight[slot] - m);
+            sharedWeight[slot] = ex;
+            sw += ex;
+        }
+        float invSw = 1.0 / sw;
+        for (uint slot = 0u; slot < pc.k; slot++) sharedWeight[slot] *= invSw;
+    }
+    barrier();
+
+    if (tid < pc.k) {
+        indices[t * pc.k + tid] = sharedIdx[tid];
+        weights[t * pc.k + tid] = sharedWeight[tid];
+    }
+}

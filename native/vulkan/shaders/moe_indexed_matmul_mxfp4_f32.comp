@@ -1,0 +1,70 @@
+#version 450
+// MoE indexed expert matmul over a packed MXFP4 expert bank (gpt-oss).
+//
+//   y[n, m] = sum_k dequant_mxfp4(bank[indices[n], m, k]) * x[n, k]
+//
+// Weight layout is [numExperts, M, K] row-major, each row stored as MXFP4
+// blocks of 17 bytes / 32 elements: 1 byte E8M0 scale, then 16 bytes of packed
+// nibbles (low nibble -> element j, high nibble -> element j + 16). Value =
+// kvalues[nibble] * e8m0_to_fp32_half(e), mirroring DotLLM.Cpu
+// Dequantize.DequantizeMxfp4Scalar / llama.cpp dequantize_row_mxfp4.
+//
+// The 17-byte block is NOT 4-byte aligned (blocks straddle dword boundaries),
+// so every access is a byte extract from the uint view of the bank.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint bank[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX    { float x[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufIdx  { int indices[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer BufY    { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint numExperts;
+    uint blocksPerRow;
+} pc;
+
+const int KVALUES[16] = int[16](0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+
+uint readByte(uint absByteOff) {
+    uint u = bank[absByteOff >> 2u];
+    return (u >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+}
+
+float e8m0Half(uint e) {
+    uint bits = (e < 2u) ? (0x00200000u << e) : ((e - 1u) << 23);
+    return uintBitsToFloat(bits);
+}
+
+void main() {
+    uint m = gl_GlobalInvocationID.x;
+    uint n = gl_GlobalInvocationID.y;
+    if (m >= pc.M || n >= pc.N) return;
+
+    int rawIdx = indices[n];
+    uint expertIdx = uint(clamp(rawIdx, 0, int(pc.numExperts) - 1));
+
+    uint rowByteStride = pc.blocksPerRow * 17u;
+    uint matrixByteStride = pc.M * rowByteStride;
+    uint rowByteBase = expertIdx * matrixByteStride + m * rowByteStride;
+    uint xRowBase = n * pc.K;
+
+    float acc = 0.0;
+    for (uint b = 0u; b < pc.blocksPerRow; b++) {
+        uint blockByteBase = rowByteBase + b * 17u;
+        float d = e8m0Half(readByte(blockByteBase));
+        uint xBase = xRowBase + b * 32u;
+        float blockSum = 0.0;
+        for (uint j = 0u; j < 16u; j++) {
+            uint q = readByte(blockByteBase + 1u + j);
+            blockSum += float(KVALUES[q & 0xFu]) * x[xBase + j]
+                      + float(KVALUES[q >> 4u]) * x[xBase + j + 16u];
+        }
+        acc += d * blockSum;
+    }
+
+    y[n * pc.M + m] = acc;
+}
