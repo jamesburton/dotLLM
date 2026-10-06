@@ -1,7 +1,6 @@
 using DotLLM.Core.Models;
 using DotLLM.Cuda;
 using DotLLM.Models.Gguf;
-using DotLLM.Vulkan;
 using Xunit;
 
 namespace DotLLM.Tests.Unit.Models.Architectures;
@@ -57,14 +56,9 @@ public sealed class Gemma4DensePleGpuRejectionTests : IDisposable
     }
 
     [Fact]
-    public void Vulkan_RejectsDensePle_EarlyWithActionableMessage()
+    public void Message_LinksPriorityIssue()
     {
-        var (gguf, cfg) = Open(SyntheticGemma4Gguf.E4BLike);
-        using (gguf)
-        {
-            var ex = Assert.Throws<NotSupportedException>(() => VulkanTransformerModel.LoadFromGguf(gguf, cfg));
-            Assert.Contains("Vulkan", ex.Message);
-            Assert.Contains("--device cpu", ex.Message);
-        }
+        string msg = ModelConfig.Gemma4DensePleUnsupportedMessage("CUDA");
+        Assert.Contains("issues/734", msg);
     }
 }
