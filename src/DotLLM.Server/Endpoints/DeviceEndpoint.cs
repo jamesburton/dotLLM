@@ -29,7 +29,11 @@ public static class DeviceEndpoint
     private static readonly object s_lock = new();
 
     public static void Map(WebApplication app) =>
-        app.MapGet("/v1/devices", () => Results.Ok(Describe()));
+        app.MapGet("/v1/devices", (long? model_bytes) =>
+        {
+            var d = Describe();
+            return Results.Ok(d with { RecommendedDevice = DeviceSelector.Candidates(Math.Max(0, model_bytes ?? 0), d)[0] });
+        });
 
     /// <summary>Cached backend/device description. Separated from the route so tests can call it.</summary>
     public static DeviceListResponse Describe()

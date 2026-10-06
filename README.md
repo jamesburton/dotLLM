@@ -66,7 +66,7 @@ dotLLM is organized as a layered architecture where each layer depends only on t
 └─────────────────────────────────────────┘
 ```
 
-Each project ships as a separate NuGet package, so users pull in only what they need. `DotLLM.Core` defines all abstractions (`ITensor`, `IBackend`, `IModel`, `ISamplerStep`, etc.) while concrete implementations live in their respective projects.
+Each layer is its own project/package (the `.nupkg`s are attached to every GitHub release; see [NuGet Packages](#nuget-packages) for what is on nuget.org). `DotLLM.Core` defines all abstractions (`ITensor`, `IBackend`, `IModel`, `ISamplerStep`, etc.) while concrete implementations live in their respective projects.
 
 ## Getting Started
 
@@ -74,27 +74,42 @@ There are two paths: grab a pre-built release and run it, or clone the repo and 
 
 ### Use a pre-built release
 
-Pick one of three install options.
+Pick one of three install options. Builds are published from the `dev` branch as GitHub **prereleases** (`0.3.0-dev.<n>`); there is no stable release yet, so the NuGet and `dnx` options need `--prerelease`. See [docs/PACKAGING.md](docs/PACKAGING.md) for the release channels.
 
-**Option A — install as a global .NET tool** (requires .NET 10 runtime):
+**Option A — run or install as a .NET tool** (needs the **.NET 10 SDK**, not just the runtime: `dnx` and `dotnet tool` are SDK commands):
 
 ```bash
-dotnet tool install -g DotLLM.Cli --prerelease
+# Run without installing (downloads and caches the NuGet package `dotllm`)
+dnx dotllm --prerelease -- run QuantFactory/SmolLM-135M-GGUF -p "The capital of France is" -n 64
+dnx dotllm --prerelease -- serve QuantFactory/SmolLM-135M-GGUF   # OpenAI-compatible API + chat UI
 
-# Download a model once, then use it anywhere
-dotllm model pull QuantFactory/SmolLM-135M-GGUF
-
+# ...or install the `dotllm` command globally
+dotnet tool install -g dotllm --prerelease
 dotllm run QuantFactory/SmolLM-135M-GGUF -p "The capital of France is" -n 64
-dotllm serve QuantFactory/SmolLM-135M-GGUF               # OpenAI-compatible API + chat UI
+dotllm serve QuantFactory/SmolLM-135M-GGUF
 ```
+
+Notes on `dnx` (checked against the .NET 10 SDK):
+
+- Arguments after the package id are forwarded to the tool, but `dnx` claims `--help`/`-h` and `--version` for itself: `dnx dotllm --prerelease serve --help` prints `dnx`'s help, while `dnx dotllm --prerelease -- serve --help` prints `dotllm serve`'s. Put `--` before the tool's arguments whenever they include those flags (it is harmless otherwise).
+- `--yes` (`-y`) is accepted and skips the confirmation `dnx` may ask for before running a package for the first time; use it in scripts. No prompt appeared when run from a non-interactive shell.
+- Pin a version with `dnx dotllm@0.3.0-dev.2470 -- ...` for reproducibility.
+- The package id is **`dotllm`** (lower case; the tool command is also `dotllm`). Do not install `DotLLM.Cli`: that id belongs to the upstream project and is frozen at `0.1.0-preview.3`.
 
 **Option B — download a self-contained binary** (no .NET install needed — the runtime is bundled):
 
-Grab the archive for your platform from the [latest release](https://github.com/kkokosa/dotLLM/releases/latest):
+Grab the archive for your platform from the fork's [releases page](https://github.com/jamesburton/dotLLM/releases) (pick the newest `dotLLM 0.3.0-dev.<n>`; prereleases are never marked "latest", so `releases/latest` will not find them):
 
-- Windows x64: `dotllm-<version>-win-x64.zip`
+- Windows x64: `dotllm-<version>-win-x64.zip` (also contains `dotllm-tray.exe`, the [system tray](docs/TRAY.md))
 - Linux x64: `dotllm-<version>-linux-x64.tar.gz`
 - macOS (Apple Silicon): `dotllm-<version>-osx-arm64.tar.gz`
+
+Every release also carries a `SHA256SUMS` file and a build-provenance attestation. The builds are **not Authenticode-signed**, so Windows SmartScreen will warn; verify the download instead:
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify dotllm-<version>-linux-x64.tar.gz --repo jamesburton/dotLLM
+```
 
 Unpack and run:
 
@@ -102,7 +117,6 @@ Unpack and run:
 # Linux / macOS
 tar -xzf dotllm-<version>-linux-x64.tar.gz
 cd dotllm-<version>-linux-x64
-./dotllm model pull QuantFactory/SmolLM-135M-GGUF
 ./dotllm run QuantFactory/SmolLM-135M-GGUF -p "The capital of France is" -n 64
 ./dotllm serve QuantFactory/SmolLM-135M-GGUF             # OpenAI-compatible API + chat UI
 ```
@@ -111,11 +125,10 @@ cd dotllm-<version>-linux-x64
 # Windows
 Expand-Archive dotllm-<version>-win-x64.zip -DestinationPath .
 cd dotllm-<version>-win-x64
-.\dotllm.exe model pull QuantFactory/SmolLM-135M-GGUF
 .\dotllm.exe run QuantFactory/SmolLM-135M-GGUF -p "The capital of France is" -n 64
 ```
 
-*Experimental:* Native AOT builds for Linux and Windows are also attached to each release (`dotllm-<version>-aot-<rid>.{zip,tar.gz}`) — smaller and faster to start, but please [file an issue](https://github.com/kkokosa/dotLLM/issues/new) if you hit a crash.
+Tagged (`v*`) releases additionally attach *experimental* Native AOT builds (`dotllm-<version>-aot-<rid>.{zip,tar.gz}`) — smaller and faster to start, but please [file an issue](https://github.com/jamesburton/dotLLM/issues/new) if you hit a crash.
 
 **Option C — reference the libraries from your .NET app** — see [NuGet Packages](#nuget-packages) below.
 
@@ -139,14 +152,28 @@ When built from source, replace `dotllm <subcommand>` in the [Usage](#usage) exa
 
 ## Usage
 
-dotLLM ships a single CLI tool with four command groups:
+The `dotllm` CLI has these commands:
 
-- **`dotllm model`** — download, list, search, and inspect GGUF models
+- **`dotllm model`** — pull, add, list, search, inspect and delete GGUF models; create and manage named model profiles; import ollama models
 - **`dotllm run`** — single-shot text generation with a performance summary
 - **`dotllm chat`** — interactive multi-turn REPL with chat template formatting
-- **`dotllm serve`** — OpenAI-compatible HTTP API with a built-in web chat UI
+- **`dotllm serve`** — OpenAI-compatible HTTP API (plus Anthropic- and ollama-compatible routes) with a built-in web chat UI
+- **`dotllm ps`** / **`dotllm stop`** — list / unload the models of a running server
+- **`dotllm bench`** / **`dotllm perplexity`** — throughput and quality measurement
 
-Models are identified by a local `.gguf` path or a HuggingFace repo ID (e.g., `QuantFactory/SmolLM-135M-GGUF`). **Models must be downloaded explicitly with `dotllm model pull` before they can be used** — `run`, `chat`, and `serve` read from `~/.dotllm/models/` and do not auto-fetch.
+### Naming and fetching models
+
+One resolver turns a model name into a GGUF in `run`, `chat`, `serve`, `bench`, and in a request's `model` field:
+
+| you write | resolves to |
+|---|---|
+| `C:\models\x.gguf` | that file |
+| `owner/repo` | the repo's best local GGUF (Q4_K_M first, not the largest file) |
+| `owner/repo:Q8_0` | the file whose name contains the tag (same as `--quant Q8_0`) |
+| `llama3.2:3b` | a model in your local ollama store, loaded in place (see [ollama](#use-your-ollama-models)) |
+| `my-profile` | a [model profile](#custom-models-and-profiles) |
+
+**Missing models are downloaded for you** by `dotllm run|chat|serve owner/repo[:tag]` (resumable, with progress, into the Hugging Face hub cache). The **server** only downloads on demand if started with `--auto-pull` — otherwise a remote client could trigger multi-gigabyte downloads just by naming a repo. `dotllm model pull` fetches ahead of time. Models already in `~/.dotllm/models/` or the Hugging Face hub cache (`HF_HUB_CACHE`, `~/.cache/huggingface/hub`) are found without re-downloading. Details: [docs/SERVER.md](docs/SERVER.md#model-names-the-hub-cache-and-pulling-714).
 
 ### Manage models
 
@@ -154,18 +181,48 @@ Models are identified by a local `.gguf` path or a HuggingFace repo ID (e.g., `Q
 # Search HuggingFace for GGUF repos
 dotllm model search llama --limit 5
 
-# Download a repo (streams the .gguf files + tokenizer metadata into ~/.dotllm/models/)
+# Download ahead of time (a tag picks the file: owner/repo:Q4_K_M)
 dotllm model pull QuantFactory/SmolLM-135M-GGUF
 
-# List everything cached locally
+# Multi-GGUF repo: name the file. Without --file (or a :tag) pull lists the files
+# and needs an interactive terminal to choose one, so scripts/CI must pass it.
+dotllm model pull TheBloke/Llama-2-7B-GGUF --file llama-2-7b.Q4_K_M.gguf
+
+# List everything available locally
 dotllm model list
 
-# Show architecture, quantizations, and tokenizer info for a cached repo
+# Show architecture, quantizations, and tokenizer info for a repo
 dotllm model info QuantFactory/SmolLM-135M-GGUF
 
-# Remove a cached repo
+# Remove a downloaded repo (--quant narrows to one file) or a profile
 dotllm model delete QuantFactory/SmolLM-135M-GGUF
 ```
+
+#### Custom models and profiles
+
+```bash
+# Register your own GGUF (hard-linked, not copied) or download one from a URL; listed as local/<name>
+dotllm model add C:\models\my-finetune.gguf --name my-finetune
+
+# A profile (Modelfile equivalent): base model + system prompt + sampling defaults + device + keep-alive
+dotllm model create terse --from bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M \
+    --system "Answer in one sentence." --temperature 0.2 --device vulkan --keep-alive 600
+
+dotllm model show terse            # merged settings and where the base model resolves
+dotllm model cp terse terse-hot    # copy a profile, or alias a model under a new name
+```
+
+Profiles live in `~/.dotllm/profiles/` (`DOTLLM_PROFILES_DIR` overrides). A profile's name is a model id for the server (`"model": "terse"`), which applies its system prompt and defaults to requests that omit them. `dotllm run|chat` resolve a profile to its base model but do not yet apply its system prompt or sampling. `model create` options: `--from`/`-f`, `--system`, `--system-file`, `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--repeat-penalty`, `--max-tokens`, `--seed`, `--stop` (repeatable), `--device`/`-d`, `--gpu-layers`, `--keep-alive`, `--description`, `--force`.
+
+#### Use your ollama models
+
+```bash
+dotllm run llama3.2:3b -p "Hello"            # loaded in place from your ollama store, nothing copied
+dotllm model import-ollama                   # turn the whole store into profiles (system prompt + parameters)
+dotllm model pull ollama:llama3.2:3b         # or pull from registry.ollama.ai (sha256-verified)
+```
+
+dotLLM only reads the ollama store, never writes to it; ollama's Go prompt templates are not carried over (the chat template embedded in the GGUF is used). See [docs/SERVER.md](docs/SERVER.md#using-ollamas-models-718).
 
 ### Run — single-shot generation
 
@@ -187,8 +244,11 @@ dotllm run QuantFactory/SmolLM-135M-GGUF --prompt-file prompt.txt -n 256
 # Select a specific quantization when a repo has multiple .gguf files
 dotllm run QuantFactory/SmolLM-135M-GGUF -p "Test" -q Q8_0
 
-# GPU inference (requires NVIDIA GPU + CUDA Toolkit)
+# GPU inference: CUDA (NVIDIA GPU) ...
 dotllm run QuantFactory/SmolLM-135M-GGUF -p "The capital of France is" --device gpu
+
+# ... or Vulkan (AMD / Intel / NVIDIA; the GPU path on AMD iGPUs such as Strix Halo)
+dotllm run QuantFactory/SmolLM-135M-GGUF -p "The capital of France is" --device vulkan
 
 # NUMA / P-core aware CPU threading
 dotllm run QuantFactory/SmolLM-135M-GGUF -p "Test" --threads 8 --decode-threads 4 --numa-pin
@@ -253,6 +313,8 @@ dotllm chat QuantFactory/SmolLM-135M-GGUF --system "You are a helpful assistant.
 dotllm chat bartowski/Llama-3.2-3B-Instruct-GGUF --device gpu --cache-type-k q8_0 --cache-type-v q8_0
 ```
 
+`chat` supports `--device cpu|gpu` (CUDA) only; `--device vulkan` is rejected there — use `run` or `serve`.
+
 In-session commands: `/exit` or `/quit` to leave, `/clear` to reset history (keeps the system prompt), `/system <text>` to change the system prompt.
 
 Sample session:
@@ -278,6 +340,8 @@ History cleared.
 
 Starts a local HTTP server exposing an OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/tokenize`, streaming SSE, tool calling) plus a built-in single-page web chat UI. Paged KV-cache, prompt caching, and startup warm-up are on by default. The browser opens automatically unless `--no-browser` is set.
 
+`--device` defaults to **`auto`** for `serve`: for each model it tries CUDA (if a GPU is present and the model fits), then Vulkan, then the CPU, and a load that fails on one device falls through to the next. Pass `cpu`, `gpu:N` (CUDA) or `vulkan` to force one. Idle models unload after `--keep-alive` seconds (default 300).
+
 ```bash
 # Start the server with a loaded model and open the chat UI
 dotllm serve QuantFactory/SmolLM-135M-GGUF
@@ -288,7 +352,10 @@ dotllm serve QuantFactory/SmolLM-135M-GGUF --host 0.0.0.0 --port 9000 --no-ui --
 # Start without a model — pick one from the chat UI
 dotllm serve
 
-# GPU with partial hybrid offload and more warm-up iterations
+# Force Vulkan, and let clients name a not-yet-downloaded model ("owner/repo:Q4_K_M") to fetch it
+dotllm serve --device vulkan --auto-pull
+
+# CUDA with partial hybrid offload and more warm-up iterations
 dotllm serve bartowski/Llama-3.2-3B-Instruct-GGUF --device gpu --gpu-layers 24 --warmup-iterations 5
 
 # Speculative decoding — draft must share the target's vocabulary
@@ -308,6 +375,18 @@ curl -N http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+#### Other API surfaces
+
+| Route(s) | What |
+|---|---|
+| `POST /v1/messages`, `/v1/messages/count_tokens` | Anthropic Messages API ([docs/ANTHROPIC_API.md](docs/ANTHROPIC_API.md)) |
+| `POST /v1/embeddings` | embeddings ([docs/SERVER.md](docs/SERVER.md)) |
+| `/api/chat`, `/api/generate`, `/api/tags`, `/api/ps`, `/api/show`, `/api/version`, `/api/pull`, `/api/delete` | **ollama-compatible API** — point Open WebUI, Continue, ollama-python/js etc. at the server (`OLLAMA_HOST=http://localhost:8080`). `/api/embed`, `/api/embeddings`, `/api/create`, `/api/copy`, `/api/push` answer `501` with a pointer to the dotLLM equivalent; `tools` in `/api/chat` is `501` (use `/v1/chat/completions`) |
+| `POST /v1/systemone` | Jev-compatible decision endpoint: typed questions in, per-option probabilities out, one prefill and no decode loop (built for Tev1-style decision models; tune with `--decision-temperature` / `--decision-orderings`) |
+| `POST /v1/models/{unload,pull,enable,disable}`, `PUT /v1/settings`, `POST /v1/admin/shutdown` | management API, **off by default**; enabled by `--allow-model-admin`. `dotllm ps`, `dotllm stop [model\|--all\|--server]` and the [Windows tray](docs/TRAY.md) are clients of it. `--allow-lora-admin` separately gates runtime LoRA load/unload |
+
+Reference: [docs/SERVER.md](docs/SERVER.md). The Windows system tray app (starts/attaches to a server, autostart, update check) is documented in [docs/TRAY.md](docs/TRAY.md).
+
 To embed the same endpoints inside your own ASP.NET Core app, see [Host the OpenAI API in your ASP.NET app](#host-the-openai-api-in-your-aspnet-app) below.
 
 ### CLI option reference
@@ -316,8 +395,10 @@ To embed the same endpoints inside your own ASP.NET Core app, see [Host the Open
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
-| `--device` | `-d` | `cpu` | Compute device: `cpu`, `gpu`, `gpu:0`, `gpu:1` |
+| `--device` | `-d` | `cpu` (`run`, `chat`); `auto` (`serve`) | `cpu`; `gpu`, `gpu:0`, `gpu:1` (CUDA); `vulkan` (`run`, `serve`; not `chat`); `auto` (`serve` only: CUDA if the model fits, else Vulkan, else CPU) |
 | `--gpu-layers` | | *(all if `gpu`, 0 if `cpu`)* | Transformer layers on GPU (hybrid offload) |
+| `--rope-scaling`, `--rope-freq-base`, `--rope-scale`, `--yarn-*` | | *(from GGUF)* | RoPE / YaRN overrides (`run`, `serve`) |
+| `--prefill-chunk-size` | | 0 | Max prompt tokens per prefill forward pass (0 = whole prompt) |
 | `--threads` | | 0 (auto) | CPU threads for inference |
 | `--decode-threads` | | 0 (auto) | Decode threads (capped at memory channels) |
 | `--numa-pin` | | false | Pin workers to NUMA-local cores (multi-socket) |
@@ -327,6 +408,7 @@ To embed the same endpoints inside your own ASP.NET Core app, see [Host the Open
 | `--cache-type-v` | | `f32` | KV-cache value quant: `f32`, `q8_0`, `q4_0` |
 | `--speculative-model` | | *(none)* | Draft model for speculative decoding (must share vocab) |
 | `--speculative-k` | | 3 | Draft tokens per speculative step |
+| `--no-mtp` | | off | `serve`: opt out of default-on MTP self-speculation (models with an embedded MTP head, expected concurrency < 5, no `--speculative-model`). `--mtp` is accepted for back-compat. See [docs/SERVER.md](docs/SERVER.md) |
 
 **Sampling & constraints** (shared by `run` and `chat`):
 
@@ -376,6 +458,20 @@ To embed the same endpoints inside your own ASP.NET Core app, see [Host the Open
 | `--prompt-cache-size` | | `4` | Max cached sessions |
 | `--no-warmup` | | false | Disable startup warm-up passes |
 | `--warmup-iterations` | | `3` | Warm-up iteration count |
+| `--auto-pull` | | false | Download a missing Hugging Face / ollama model when a request names one (off by default so remote clients cannot start downloads) |
+| `--keep-alive` | | `300` | Idle-unload after N seconds (0 = unload after each request, negative = never) |
+| `--max-resident-models` | | `1` | Models resident at once (>1 keeps several loaded) |
+| `--resident-memory-budget` | | `0` (unlimited) | Total byte budget across resident models |
+| `--allow-model-admin` | | false | Enable the management API (`/v1/models/*`, `/v1/settings`, `/v1/admin/shutdown`, ollama `/api/pull` + `/api/delete`) |
+| `--allow-lora-admin` | | false | Enable `POST /v1/lora/load` and `DELETE /v1/lora/{name}` |
+| `--mtp` | | *(default on)* | Accepted for back-compat. `serve` auto-enables MTP self-speculation for models with an embedded MTP head when expected concurrency is < 5 and no `--speculative-model` is set; `--no-mtp` opts out |
+| `--expected-concurrency` | | `0` | At 5+ concurrent requests Vulkan hybrid models serve through the continuous-batch scheduler |
+| `--decision-temperature`, `--decision-orderings` | | `0`, `1` | Calibration of `POST /v1/systemone` probabilities |
+| `--rate-limit-rpm`, `--rate-limit-tpm`, `--rate-limit-concurrency` | | `0` (off) | Per-API-key rate limits; setting any enables limiting |
+
+**`bench`**, **`perplexity`**: `dotllm bench <model> [-d cpu|vulkan|cuda] [-p 512] [-n 128] [-r 5] [--depth N] [--json]` times prefill/decode (llama-bench equivalent); `dotllm perplexity <model> --corpus wiki.test.raw [--context 512] [--stride N] [-d ...]` scores a corpus ([docs/PERPLEXITY.md](docs/PERPLEXITY.md)). Both default to `--device cpu`.
+
+**`ps`**, **`stop`**: clients of a running server (`--url`, or `DOTLLM_URL`; default `http://localhost:8080`). `dotllm ps` lists resident models; `dotllm stop <model>` / `--all` unloads, `--server` stops the whole server gracefully. Both need `--allow-model-admin` on the server for the write actions.
 
 > **Short-flag gotcha:** `-p` is **prompt** under `run` but **port** under `serve`. `-s` is **seed** under `run` but **system** under `chat`. When in doubt, use the long form.
 
@@ -621,38 +717,24 @@ Each requested framework needs an SDK able to target it -- benchmarking `net11.0
 
 ## NuGet Packages
 
-dotLLM ships as a set of NuGet packages so you can reference only what you need from your own .NET app:
+The fork publishes **one** package to nuget.org:
 
 | Package | Description |
 |---------|-------------|
-| [`DotLLM.Core`](https://www.nuget.org/packages/DotLLM.Core) | Core abstractions — tensor types, backend interfaces, model config, sampling, attention strategies, diagnostics hooks |
-| [`DotLLM.Cpu`](https://www.nuget.org/packages/DotLLM.Cpu) | CPU backend — SIMD-optimized quantized matmul, RMSNorm, RoPE, softmax, attention |
-| [`DotLLM.Cuda`](https://www.nuget.org/packages/DotLLM.Cuda) | CUDA GPU backend — PTX kernels via CUDA Driver API, cuBLAS prefill, CPU/GPU hybrid offload |
-| [`DotLLM.Models`](https://www.nuget.org/packages/DotLLM.Models) | Memory-mapped GGUF/SafeTensors loaders, parameterized model loaders for dense transformer, MLA/MoE, and Mamba-3 families |
-| [`DotLLM.Tokenizers`](https://www.nuget.org/packages/DotLLM.Tokenizers) | BPE, SentencePiece, HuggingFace tokenizer.json, Jinja2-subset chat templates |
-| [`DotLLM.Engine`](https://www.nuget.org/packages/DotLLM.Engine) | Inference engine — KV-cache, scheduler, samplers, constrained decoding, speculative decoding |
-| [`DotLLM.Server`](https://www.nuget.org/packages/DotLLM.Server) | OpenAI-compatible HTTP server, tool calling, built-in chat UI |
-| [`DotLLM.HuggingFace`](https://www.nuget.org/packages/DotLLM.HuggingFace) | HuggingFace Hub search and GGUF download/caching |
-| [`DotLLM.Diagnostics`](https://www.nuget.org/packages/DotLLM.Diagnostics) | Interpretability hooks — activation capture, logit lens, logprobs |
-| [`DotLLM.Telemetry`](https://www.nuget.org/packages/DotLLM.Telemetry) | Telemetry package for metrics/tracing integration as observability work lands |
-| [`DotLLM.Cli`](https://www.nuget.org/packages/DotLLM.Cli) | `dotnet tool` — the `dotllm` command (run / chat / serve / model management) |
+| [`dotllm`](https://www.nuget.org/packages/dotllm) | `dotnet tool` — the `dotllm` command (model / run / chat / serve / bench / ...). Use `dnx dotllm --prerelease` or `dotnet tool install -g dotllm --prerelease` (see [Getting Started](#use-a-pre-built-release)) |
 
-Install the engine plus CPU backend for a minimal setup:
+The library projects (`DotLLM.Core`, `DotLLM.Cpu`, `DotLLM.Cuda`, `DotLLM.Vulkan`, `DotLLM.Hip`, `DotLLM.Models`, `DotLLM.Tokenizers`, `DotLLM.Engine`, `DotLLM.Server`, `DotLLM.HuggingFace`, `DotLLM.Diagnostics`, `DotLLM.Telemetry`) are packed on every build and attached as `.nupkg` files to each [GitHub release](https://github.com/jamesburton/dotLLM/releases), but are **not published to nuget.org** by this fork. The `DotLLM.*` ids on nuget.org belong to the upstream project and hold only its frozen `0.1.0-preview.*` builds, which do not contain this fork's work — do not use them. To consume the libraries, download the `.nupkg` files from a release into a local feed:
 
 ```bash
-dotnet add package DotLLM.Engine
-dotnet add package DotLLM.Cpu
-dotnet add package DotLLM.Models
-dotnet add package DotLLM.Tokenizers
+# after downloading the DotLLM.*.nupkg assets of one release into ./feed
+dotnet nuget add source ./feed --name dotllm-local
+dotnet add package DotLLM.Engine --version 0.3.0-dev.<n>
+dotnet add package DotLLM.Cpu --version 0.3.0-dev.<n>
+dotnet add package DotLLM.Models --version 0.3.0-dev.<n>
+dotnet add package DotLLM.Tokenizers --version 0.3.0-dev.<n>
 ```
 
-Or install the CLI as a global tool:
-
-```bash
-dotnet tool install -g DotLLM.Cli
-```
-
-> All packages track the same version and are published together on each release.
+> All packages in a release carry the same version. See [docs/PACKAGING.md](docs/PACKAGING.md).
 
 ### Host the OpenAI API in your ASP.NET app
 
@@ -819,6 +901,10 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for detailed steps, dependencies, and mil
 - [GPU inference](docs/GPU.md)
 - [CUDA backend architecture](docs/CUDA.md)
 - [Batch scheduling](docs/SCHEDULING.md)
+- [Server & API (OpenAI / Anthropic / ollama routes, model naming, profiles)](docs/SERVER.md)
+- [Vulkan backend](docs/VULKAN.md)
+- [Windows system tray](docs/TRAY.md)
+- [Releases, dev channel, NuGet / `dnx`](docs/PACKAGING.md)
 - [Native AOT deployment](docs/AOT.md)
 - [Full roadmap](docs/ROADMAP.md)
 

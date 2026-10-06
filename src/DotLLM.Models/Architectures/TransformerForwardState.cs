@@ -151,7 +151,8 @@ internal sealed unsafe class TransformerForwardState : IDisposable
         int qBlockElems = 0, int kvBlockElems = 0,
         int attnOutBlockElems = 0,
         int globalFullHeadDim = 0,
-        float[]? globalFreqFactors = null)
+        float[]? globalFreqFactors = null,
+        float[]? ropeFreqFactors = null)
     {
         _hiddenSize = hiddenSize;
         _numHeads = numHeads;
@@ -173,7 +174,13 @@ internal sealed unsafe class TransformerForwardState : IDisposable
         RopeDim = ropeDim;
         CosTable = new float[maxSeqLen * halfDim];
         SinTable = new float[maxSeqLen * halfDim];
-        DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTable(maxSeqLen, ropeDim, ropeTheta, CosTable, SinTable);
+        // Dense llama3-style rope_freqs.weight (Llama-3.1/3.2/3.3, Ministral): llama.cpp divides
+        // each pair's inverse frequency by factor[i] on EVERY layer, from position 0 (issue #743).
+        if (ropeFreqFactors is not null)
+            DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTableWithFactors(
+                maxSeqLen, ropeDim, ropeTheta, ropeFreqFactors, CosTable, SinTable);
+        else
+            DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTable(maxSeqLen, ropeDim, ropeTheta, CosTable, SinTable);
 
         // Optional secondary table for the full-attention layers (Gemma 4):
         // different base theta and (via globalRopeDim < ropeDim) partial rotary.

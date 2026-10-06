@@ -20,7 +20,7 @@ namespace DotLLM.Server.Endpoints;
 /// <para>
 /// A shim over the existing paths: model names are profiles / local models / ollama names (<see cref="ServerState.EnsureActiveAsync"/>), requests
 /// run through the same generator (streaming) or scheduler (non-streaming) as <c>/v1/*</c>, and the profile's system prompt and sampling defaults apply.
-/// Not covered, and answered with a clear 501: <c>embed</c>/<c>embeddings</c>, <c>create</c>, <c>copy</c>, <c>push</c>, and tools / images / thinking
+/// Not covered, and answered with a clear 501: <c>create</c>, <c>copy</c>, <c>push</c>, and tools / images / thinking
 /// inside chat (use <c>/v1/chat/completions</c>). <c>pull</c> and <c>delete</c> need <c>--allow-model-admin</c> like <c>/v1/models/*</c>.
 /// </para>
 /// <para>Responses are written with <see cref="Utf8JsonWriter"/> directly: ollama's shapes are small and this keeps the surface reflection-free.</para>
@@ -42,12 +42,76 @@ public static class OllamaApiEndpoint
         app.MapPost("/api/generate", (ServerState s, HttpContext c) => GenerateAsync(s, c, chat: false));
         app.MapPost("/api/pull", PullAsync);
         app.MapDelete("/api/delete", DeleteAsync);
-        foreach (string path in new[] { "/api/embed", "/api/embeddings", "/api/create", "/api/copy", "/api/push" })
+        app.MapPost("/api/embed", (ServerState s, HttpContext c) => EmbedAsync(s, c, legacy: false));
+        app.MapPost("/api/embeddings", (ServerState s, HttpContext c) => EmbedAsync(s, c, legacy: true));
+        foreach (string path in new[] { "/api/create", "/api/copy", "/api/push" })
             app.MapPost(path, (HttpContext c) => Error(c, 501,
-                $"{c.Request.Path} is not implemented by dotLLM's ollama compatibility layer. Use /v1/embeddings, `dotllm model create` / `dotllm model cp`, or the OpenAI-compatible /v1 API."));
+                $"{c.Request.Path} is not implemented by dotLLM's ollama compatibility layer. Use `dotllm model create` / `dotllm model cp`, or the OpenAI-compatible /v1 API."));
     }
 
     // ───────────────────────────────────── helpers ─────────────────────────────────────
+
+    /// <summary>
+    /// <c>POST /api/embed</c> (<c>input</c> string or array, optional <c>dimensions</c>) and the legacy
+    /// <c>POST /api/embeddings</c> (<c>prompt</c> string -> single un-normalised <c>embedding</c>), over the
+    /// same core as <c>/v1/embeddings</c> (#740). The ollama <c>truncate</c> option is accepted; over-length
+    /// inputs are rejected rather than truncated.
+    /// </summary>
+    private static async Task EmbedAsync(ServerState state, HttpContext c, bool legacy)
+    {
+        using var doc = await ReadBodyAsync(c);
+        if (doc is null) return;
+        var root = doc.RootElement;
+        var ct = c.RequestAborted;
+
+        string? name = ModelName(root);
+        if (string.IsNullOrWhiteSpace(name)) { await Error(c, 400, "model is required"); return; }
+
+        JsonElement input;
+        if (legacy)
+        {
+            string? prompt = Str(root, "prompt");
+            if (string.IsNullOrEmpty(prompt)) { await Error(c, 400, "prompt is required"); return; }
+            input = JsonSerializer.SerializeToElement(prompt);
+        }
+        else if (!root.TryGetProperty("input", out input)) { await Error(c, 400, "input is required"); return; }
+
+        int? dims = root.TryGetProperty("dimensions", out var d) && d.ValueKind == JsonValueKind.Number ? d.GetInt32() : null;
+        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        var request = new DotLLM.Server.Models.EmbeddingRequest
+        {
+            Input = input, Model = name, Dimensions = dims, Normalize = legacy ? false : null,
+        };
+        var result = await EmbeddingsEndpoint.ComputeAsync(state, request, ct);
+        if (result.Error is not null)
+        {
+            await Error(c, result.Status == 400 && result.Error.Contains("not found", StringComparison.OrdinalIgnoreCase) ? 404 : result.Status, result.Error);
+            return;
+        }
+        double totalNs = System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds * 1e6;
+
+        await WriteJson(c, 200, w =>
+        {
+            if (legacy)
+            {
+                w.WriteStartArray("embedding");
+                foreach (float f in result.Vectors![0]) w.WriteNumberValue(f);
+                w.WriteEndArray();
+                return;
+            }
+            w.WriteString("model", name);
+            w.WriteStartArray("embeddings");
+            foreach (var v in result.Vectors!)
+            {
+                w.WriteStartArray();
+                foreach (float f in v) w.WriteNumberValue(f);
+                w.WriteEndArray();
+            }
+            w.WriteEndArray();
+            w.WriteNumber("total_duration", (long)totalNs);
+            w.WriteNumber("prompt_eval_count", result.PromptTokens);
+        });
+    }
 
     private static Task WriteJson(HttpContext c, int status, Action<Utf8JsonWriter> body)
     {

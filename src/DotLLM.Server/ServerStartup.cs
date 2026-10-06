@@ -162,13 +162,52 @@ public static class ServerStartup
     /// <summary>Sentinel <c>gpu_layers</c> value meaning "every layer, as the loader counts them".</summary>
     public const int AllGpuLayers = -1;
 
+    /// <summary>
+    /// Embedding-only encoder checkpoints (BERT / nomic-bert, #739): no generator, KV-cache, chat template
+    /// or scheduler; only <c>/v1/embeddings</c> (and the ollama embed routes) serve them. CPU only -- a GPU
+    /// device request fails loudly rather than silently running on the CPU.
+    /// </summary>
+    private static ServerState LoadEncoderModel(
+        string resolvedPath, ServerOptions options, GgufFile gguf, ModelConfig config, ITokenizer tokenizer)
+    {
+        if (!string.Equals(options.Device, "cpu", StringComparison.OrdinalIgnoreCase))
+        {
+            gguf.Dispose();
+            throw new NotSupportedException(
+                $"{config.Architecture} embedding models are CPU-only for now (requested device '{options.Device}'). "
+                + "Use --device cpu; GPU encoder backends are not implemented and there is no silent CPU fallback.");
+        }
+        var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);
+        Console.WriteLine($"[dotllm] CPU inference, {config.Architecture} encoder ({threading.EffectiveThreadCount} threads); embeddings only");
+        var model = BertEncoderModel.LoadFromGguf(gguf, config, threading);
+        return new ServerState
+        {
+            Options = options,
+            Config = config,
+            KvCacheConfig = new KvCacheConfig(KvCacheConfig.ParseDType(options.CacheTypeK), KvCacheConfig.ParseDType(options.CacheTypeV)),
+            IsReady = true,
+            Model = model,
+            Tokenizer = tokenizer,
+            LoadedModelPath = resolvedPath,
+            CurrentGguf = gguf,
+            LoraRegistry = CreateLoraRegistry(),
+            Residency = CreateResidencyManager(options),
+            EstimatedBytes = SafeFileLength(resolvedPath),
+            LastUsedUtc = DateTimeOffset.UtcNow,
+        };
+    }
+
     private static ServerState LoadModelCore(string resolvedPath, ServerOptions options)
     {
         Console.WriteLine($"[dotllm] Loading model from {resolvedPath}...");
         var gguf = GgufFile.Open(resolvedPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         config = GgufModelConfigExtractor.ApplyRoPEOverride(config, options.RopeOverride);
-        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        bool isEncoder = config.Architecture is Architecture.Bert or Architecture.NomicBert;
+        var tokenizer = isEncoder ? GgufTokenizerFactory.Load(gguf.Metadata) : GgufBpeTokenizerFactory.Load(gguf.Metadata);
+
+        if (isEncoder)
+            return LoadEncoderModel(resolvedPath, options, gguf, config, tokenizer);
 
         var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);
 
@@ -396,21 +435,18 @@ public static class ServerStartup
             Console.WriteLine($"[dotllm] Speculative decoding: draft={Path.GetFileName(draftPath)}, K={options.SpeculativeCandidates}");
         }
 
-        // MTP self-speculative decoding (issue #253) — opt-in for serve (unlike run/chat's
-        // auto-detect default), since engaging it also takes the continuous-batch scheduler
-        // offline for this model (see below). Only actually engages requests when the loaded
-        // checkpoint carries an MTP head; otherwise this is a no-op even with --mtp set.
-        // An explicit concurrency hint (>= 5, Vulkan) wins over --mtp: the continuous-batch scheduler measured +73% aggregate decode at 8
-        // concurrent streams and cannot run speculative decoding, so MTP is dropped for this model with a log line.
-        bool concurrencyOverMtp = options.MtpEnabled && options.ExpectedConcurrency >= 5 && vulkanKvFactory is not null
-            && !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_SCHEDULER"), "0", StringComparison.Ordinal);
-        if (concurrencyOverMtp && model.SupportsMtp)
-            Console.WriteLine("[dotllm] --expected-concurrency >= 5: serving through the continuous-batch scheduler; MTP self-speculation is disabled for this model.");
-        bool mtpActive = options.MtpEnabled && draftModel is null && model.SupportsMtp && !concurrencyOverMtp;
-        if (options.MtpEnabled && draftModel is null && model.SupportsMtp && !concurrencyOverMtp)
-            Console.WriteLine($"[dotllm] MTP self-speculative decoding: K={options.SpeculativeCandidates} (model carries an MTP head)");
-        else if (options.MtpEnabled && draftModel is null && !model.SupportsMtp)
-            Console.WriteLine("[dotllm] --mtp was set but this checkpoint has no MTP head (nextn.* tensors) — ignoring.");
+        // MTP self-speculative decoding (issue #253) - DEFAULT ON for serve when the checkpoint carries an embedded head
+        // (--no-mtp opts out). Engaging it takes the continuous-batch scheduler offline for this model, so an explicit
+        // concurrency hint (>= 5) wins and drops MTP (the scheduler measured +73% aggregate decode at 8 streams on Vulkan);
+        // an external draft model also wins (the two speculation modes are mutually exclusive).
+        string? vkSchedEnvForMtp = Environment.GetEnvironmentVariable("DOTLLM_VK_SCHEDULER");
+        bool schedulerAvailable = (vulkanKvFactory is not null && !string.Equals(vkSchedEnvForMtp, "0", StringComparison.Ordinal))
+            || pagedFactory is not null;
+        bool concurrencyOverMtp = options.MtpEnabled && options.ExpectedConcurrency >= 5 && schedulerAvailable;
+        var mtpDecision = DecideMtp(options, model.SupportsMtp, draftModel is not null, concurrencyOverMtp, schedulerAvailable);
+        bool mtpActive = mtpDecision.Active;
+        if (mtpDecision.Message is { } mtpMsg)
+            Console.WriteLine(mtpMsg);
 
         var generator = new TextGenerator(model, tokenizer, kvFactory, prefixCache,
             draftModel: draftModel, speculativeCandidates: options.SpeculativeCandidates,
@@ -503,11 +539,44 @@ public static class ServerStartup
             DraftModel = draftModel,
             DraftModelPath = draftModelPath,
             DraftGguf = draftGguf,
+            MtpActive = mtpActive,
+            MtpStatus = mtpDecision.Status,
             LoraRegistry = CreateLoraRegistry(),
             Residency = CreateResidencyManager(options),
             EstimatedBytes = estimatedBytes,
             LastUsedUtc = DateTimeOffset.UtcNow,
         };
+    }
+
+    /// <summary>Outcome of the serve-time MTP policy: whether it engages, the startup log line (null = stay quiet), and a short /props status.</summary>
+    internal readonly record struct MtpDecision(bool Active, string? Message, string Status);
+
+    /// <summary>
+    /// Pure MTP policy (#757). Active only when enabled, the model has an embedded head, no external draft model is given, and the
+    /// expected concurrency does not route to the continuous-batch scheduler. Always explains why when MTP is not engaged for a model
+    /// that has a head (or when the user explicitly asked with <c>--mtp</c>).
+    /// </summary>
+    internal static MtpDecision DecideMtp(ServerOptions options, bool supportsMtp, bool hasDraftModel, bool concurrencyOverMtp, bool schedulerAvailable = true)
+    {
+        if (!options.MtpEnabled)
+            return new(false, supportsMtp ? "[dotllm] MTP: skipped - disabled by --no-mtp (this model carries an MTP head)." : null,
+                "off (--no-mtp)");
+        if (!supportsMtp)
+            return new(false,
+                options.MtpExplicit ? "[dotllm] MTP: --mtp was set but this checkpoint has no MTP head (nextn.* tensors) - ignoring." : null,
+                "unavailable (no MTP head)");
+        if (hasDraftModel)
+            return new(false, "[dotllm] MTP: skipped - an external draft model (--speculative-model) was given; it takes precedence over the built-in MTP head.",
+                "skipped (external draft model)");
+        if (concurrencyOverMtp)
+            return new(false,
+                $"[dotllm] MTP: skipped - --expected-concurrency {options.ExpectedConcurrency} >= 5: serving through the continuous-batch scheduler, which cannot run MTP self-speculation.",
+                "skipped (expected concurrency >= 5)");
+        string how = options.MtpExplicit ? "enabled (--mtp)" : "enabled automatically (model carries an MTP head)";
+        string tradeoff = schedulerAvailable
+            ? " Tradeoff: continuous batching is off for this model; for many concurrent clients pass --no-mtp or --expected-concurrency 5."
+            : "";
+        return new(true, $"[dotllm] MTP: {how}, K={options.SpeculativeCandidates}, adaptive gate on.{tradeoff}", "active");
     }
 
     /// <summary>

@@ -177,6 +177,8 @@ public sealed unsafe class GgufFile : IDisposable
                     $"data section size {dataSectionLength}).");
         }
 
+        GgufReader.ValidatePq2_0Layout(tensors, alignment, dataSectionLength);
+
         var tensorsByName = new Dictionary<string, GgufTensorDescriptor>(tensors.Count);
         foreach (var tensor in tensors)
             tensorsByName[tensor.Name] = tensor;

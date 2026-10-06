@@ -70,7 +70,7 @@ public static class CorpusReader
             carry.Clear();
             carry.Append(pending[cut..]);
 
-            foreach (int id in tokenizer.Encode(ready))
+            foreach (int id in tokenizer.EncodeRaw(ready))
             {
                 yield return id;
                 if (maxTokens > 0 && ++emitted >= maxTokens) yield break;
@@ -79,7 +79,7 @@ public static class CorpusReader
 
         if (carry.Length > 0)
         {
-            foreach (int id in tokenizer.Encode(carry.ToString()))
+            foreach (int id in tokenizer.EncodeRaw(carry.ToString()))
             {
                 yield return id;
                 if (maxTokens > 0 && ++emitted >= maxTokens) yield break;

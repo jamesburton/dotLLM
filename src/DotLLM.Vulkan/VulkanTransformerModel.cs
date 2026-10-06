@@ -736,6 +736,14 @@ public sealed class VulkanTransformerModel : IModel
     // Number of leading rotated PAIRS on full-attention layers when the checkpoint carries proportional-rope
     // factors (rope_freqs.weight); 0 = no factors. See Gemma4PerLayerInputs.ResolveProportionalRopePairs.
     private int _proportionalRopePairs;
+
+    // Dense rope_freqs.weight factors and/or Mistral-3 attention temperature (#743). When non-null the dense
+    // forward paths use _ropeInvFreq (per-pair inverse-frequency table, factors folded in) instead of the
+    // theta-driven _rope, and the fused rope+KV-write shortcut is bypassed (it only knows theta).
+    private RopeInvFreqF32Kernel? _ropeInvFreq;
+    private VulkanDevice.Buffer? _ropeInvFreqBuf;
+    private float _attnTempScale;
+    private int _attnTempFloor;
     private readonly AddKernel _add;
     // Per-feature bias add. Replaces the host-mapped fallback that used to
     // split the forward into multiple submits whenever Phi-3 / Qwen3 /
@@ -1976,6 +1984,7 @@ public sealed class VulkanTransformerModel : IModel
             model._matmulIq4XsGemmCoopmat = MatMulIq4XsGemmCoopmatKernel.Create(device, spvDir);
         model._firstLayer = firstLayer;
         model._proportionalRopePairs = proportionalRopePairs;
+        model.ConfigureDenseRopeFactorsAndAttnTemperature(device, spvDir, config, cpuWeights.RopeFreqFactors, ropeDim, ropeTheta);
         {
             long hidden = config.HiddenSize;
             long qkvOut = (long)(config.NumAttentionHeads + 2 * config.NumKvHeads) * config.HeadDim;
@@ -2368,6 +2377,44 @@ public sealed class VulkanTransformerModel : IModel
         }
         var s = Config.RoPEConfig!.Value;
         return (s.Theta, s.DimensionCount > 0 ? s.DimensionCount : Config.HeadDim);
+    }
+
+    /// <summary>
+    /// Wires llama.cpp <c>rope_freqs.weight</c> factors (Llama-3.x) and Mistral-3 attention temperature
+    /// into the dense forward (issue #743). No-op for every model that carries neither.
+    /// </summary>
+    private void ConfigureDenseRopeFactorsAndAttnTemperature(
+        VulkanDevice device, string spvDir, ModelConfig config, float[]? factorsRaw, int ropeDim, float ropeTheta)
+    {
+        if (config.MlaConfig is not null) return;
+        float[]? factors = DotLLM.Models.Architectures.DenseRopeFreqFactors.Select(config, factorsRaw, ropeDim);
+        bool temp = config.AttnTemperatureScale != 0f;
+        if (factors is null && !temp) return;
+        int half = ropeDim / 2;
+        var inv = new float[half];
+        for (int i = 0; i < half; i++)
+            inv[i] = 1.0f / (MathF.Pow(ropeTheta, 2.0f * i / ropeDim) * (factors is null ? 1.0f : factors[i]));
+        var buf = device.Allocate((long)half * sizeof(float));
+        device.Upload(inv.AsSpan(), buf);
+        _ropeInvFreqBuf = buf;
+        _ropeInvFreq = RopeInvFreqF32Kernel.Create(device, spvDir);
+        _attnTempScale = config.AttnTemperatureScale;
+        _attnTempFloor = temp ? config.AttnTemperatureFloorScale : 0;
+    }
+
+    /// <summary>Records the dense Q/K RoPE: the inverse-frequency kernel when #743 features are active, else the theta kernel.</summary>
+    private void RecordDenseRope(nint cmdBuf, int seqLen, int numHeads, int numKvHeads, int headDim)
+    {
+        if (_ropeInvFreq is not null)
+            _ropeInvFreq.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer, _ropeInvFreqBuf!,
+                seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
+                headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
+                variant: _ropeVariant, tempScale: _attnTempScale, tempFloor: _attnTempFloor);
+        else
+            _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
+                seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
+                headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
+                variant: _ropeVariant);
     }
 
     /// <summary>
@@ -2793,11 +2840,22 @@ public sealed class VulkanTransformerModel : IModel
         // carries no MLA / MoE layer (dense VulkanTransformerModel does not support
         // MoE — that's VulkanQwen3MoeHybridTransformerModel — but MLA can appear
         // in DeepSeek-V2/V3 dense hosts and falls through to per-seq for now).
-        bool modelHasMlaOrMoe = Config.IsGemma4DensePle;
+        // Gemma-family ops (GeGLU, sqrt(hidden) embedding scale, post-attn/post-FFN norms,
+        // attention/final soft-caps, query_pre_attn_scalar) are implemented ONLY in the
+        // per-sequence Forward; the fused batched layer loop below is plain SwiGLU/Llama and would
+        // silently produce wrong logits for them. Route those models through the per-seq path.
+        bool modelHasMlaOrMoe = _geglu is not null
+            || _embedScale is not null
+            || Config.AttnLogitSoftcap is not null
+            || Config.FinalLogitSoftcap is not null
+            || Config.QueryPreAttnScalar is not null
+            || Config.IsGemma4DensePle;
         for (int layer = 0; layer < Config.NumLayers && !modelHasMlaOrMoe; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
-            if (lw.Mla is not null || lw.Moe is not null) modelHasMlaOrMoe = true;
+            if (lw.Mla is not null || lw.Moe is not null
+                || lw.PostAttnNormWeight is not null || lw.PostFfnNormWeight is not null)
+                modelHasMlaOrMoe = true;
         }
 
         // Build the simple / complex index lists. Preserve input order in the result.
@@ -2980,10 +3038,7 @@ public sealed class VulkanTransformerModel : IModel
             // Batched RoPE — reads packed positions [totalTokens] and rotates each
             // row independently. Per-seq position semantics are preserved by the
             // packed positions array.
-            _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
-                seqLen: totalTokens, numHeads: numHeads, numKvHeads: numKvHeads,
-                headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
-                variant: _ropeVariant);
+            RecordDenseRope(cmdBuf, totalTokens, numHeads, numKvHeads, headDim);
             BarrierComputeToCompute(cmdBuf);
 
             // Per-seq attention sub-loop. Each seq:
@@ -3558,6 +3613,7 @@ public sealed class VulkanTransformerModel : IModel
             // TurboQuant / non-contiguous-batched paths below are unaffected and keep using their
             // existing unfused sequences).
             bool useFusedRopeKv = _ropeKvWrite is not null
+                && _ropeInvFreq is null
                 && kvCache is VulkanKvCache
                 && IsContiguousAscending(positions);
 
@@ -3587,10 +3643,7 @@ public sealed class VulkanTransformerModel : IModel
             else
             {
                 // RoPE on Q and K
-                _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
-                    seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
-                    headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
-                    variant: _ropeVariant);
+                RecordDenseRope(cmdBuf, seqLen, numHeads, numKvHeads, headDim);
                 ProfSample("rope");
                 DpStamp(cmdBuf, DpCatRope);
 
@@ -4268,6 +4321,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq2XxsMmq?.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
         _rope.InvalidateDescriptorCache();
+        _ropeInvFreq?.InvalidateDescriptorCache();
         _ropeKvWrite?.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
         _flashAttention?.InvalidateDescriptorCache();
@@ -7252,6 +7306,8 @@ public sealed class VulkanTransformerModel : IModel
         _flashAttentionCoopmat?.Dispose();
         _attention.Dispose();
         _rope.Dispose();
+        _ropeInvFreq?.Dispose();
+        _ropeInvFreqBuf?.Dispose();
         _ropeKvWrite?.Dispose();
         _rmsnorm.Dispose();
         _rmsnormMatmulQ8Fused?.Dispose();

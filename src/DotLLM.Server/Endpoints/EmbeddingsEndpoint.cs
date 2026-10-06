@@ -34,35 +34,73 @@ public static class EmbeddingsEndpoint
         HttpContext httpContext)
     {
         var ct = httpContext.RequestAborted;
+        var result = await ComputeAsync(state, request, ct);
+        if (result.Error is not null)
+        {
+            await WriteErrorAsync(httpContext, result.Status, result.Error);
+            return;
+        }
 
+        bool base64 = result.Base64;
+        var data = new EmbeddingData[result.Vectors!.Length];
+        for (int i = 0; i < data.Length; i++)
+            data[i] = new EmbeddingData
+            {
+                Index = i,
+                Embedding = base64 ? EncodeBase64(result.Vectors[i]) : EncodeFloats(result.Vectors[i]),
+            };
+        int promptTokens = result.PromptTokens;
+        var response = new EmbeddingResponse
+        {
+            Data = data,
+            Model = state.Options.ModelId,
+            Usage = new EmbeddingUsage { PromptTokens = promptTokens, TotalTokens = promptTokens },
+        };
+
+        await httpContext.Response.WriteAsJsonAsync(
+            response, ServerJsonContext.Default.EmbeddingResponse, contentType: null, ct);
+    }
+
+
+    /// <summary>Outcome of <see cref="ComputeAsync"/>: either an HTTP error or the embedding vectors.</summary>
+    internal sealed record EmbedResult(int Status, string? Error, float[][]? Vectors, int PromptTokens, bool Base64)
+    {
+        public static EmbedResult Fail(int status, string message) => new(status, message, null, 0, false);
+    }
+
+    /// <summary>
+    /// Shared embedding core for <c>/v1/embeddings</c> and ollama's <c>/api/embed</c>: model activation,
+    /// validation, pooling, truncation and normalisation. Returns errors rather than writing them so
+    /// each surface can use its own error envelope.
+    /// </summary>
+    internal static async Task<EmbedResult> ComputeAsync(ServerState state, EmbeddingRequest request, CancellationToken ct)
+    {
         var activationError = await state.EnsureActiveAsync(request.Model, keepAliveOverride: null, ct);
         if (activationError is not null)
         {
-            await WriteErrorAsync(httpContext, 400, activationError);
-            return;
+            return EmbedResult.Fail(400, activationError);
         }
 
         if (!state.IsReady || state.Model is null || state.Tokenizer is null || state.Config is null)
         {
-            await WriteErrorAsync(httpContext, 503, "No model loaded");
-            return;
+            return EmbedResult.Fail(503, "No model loaded");
         }
 
         if (state.Model is not IEmbeddingModel embeddingModel)
         {
-            await WriteErrorAsync(httpContext, 501,
-                $"The loaded model ({state.Model.GetType().Name}) does not support embedding extraction. "
+            return EmbedResult.Fail(501, $"The loaded model ({state.Model.GetType().Name}) does not support embedding extraction. "
                 + "POST /v1/embeddings is implemented for the CPU backend only; run the server without "
                 + "a GPU backend to use it.");
-            return;
         }
 
-        if (request.Dimensions is not null)
+        int outDims = state.Config.HiddenSize;
+        if (request.Dimensions is { } dims)
         {
-            await WriteErrorAsync(httpContext, 400,
-                "'dimensions' is not supported: dotLLM returns the model's full hidden size and does not "
-                + "perform Matryoshka truncation.");
-            return;
+            if (dims < 1 || dims > state.Config.HiddenSize)
+            {
+                return EmbedResult.Fail(400, $"'dimensions' must be between 1 and the model's hidden size ({state.Config.HiddenSize}), got {dims}.");
+            }
+            outDims = dims;
         }
 
         bool base64;
@@ -75,9 +113,7 @@ public static class EmbeddingsEndpoint
                 base64 = true;
                 break;
             default:
-                await WriteErrorAsync(httpContext, 400,
-                    $"'encoding_format' must be 'float' or 'base64', got '{request.EncodingFormat}'.");
-                return;
+                return EmbedResult.Fail(400, $"'encoding_format' must be 'float' or 'base64', got '{request.EncodingFormat}'.");
         }
 
         PoolingType? requestedPooling = null;
@@ -92,9 +128,7 @@ public static class EmbeddingsEndpoint
             };
             if (requestedPooling is null)
             {
-                await WriteErrorAsync(httpContext, 400,
-                    $"'pooling' must be 'last', 'mean' or 'cls', got '{request.Pooling}'.");
-                return;
+                return EmbedResult.Fail(400, $"'pooling' must be 'last', 'mean' or 'cls', got '{request.Pooling}'.");
             }
         }
 
@@ -102,8 +136,7 @@ public static class EmbeddingsEndpoint
         var parsed = EmbeddingInputParser.Parse(request.Input, tokenizer.Encode, state.Config.VocabSize);
         if (!parsed.Ok)
         {
-            await WriteErrorAsync(httpContext, 400, parsed.Error!);
-            return;
+            return EmbedResult.Fail(400, parsed.Error!);
         }
 
         var sequences = parsed.Sequences!;
@@ -112,25 +145,21 @@ public static class EmbeddingsEndpoint
         {
             if (sequences[i].Length > maxSeq)
             {
-                await WriteErrorAsync(httpContext, 400,
-                    $"'input[{i}]' is {sequences[i].Length} tokens, which exceeds the model's context length of {maxSeq}.");
-                return;
+                return EmbedResult.Fail(400, $"'input[{i}]' is {sequences[i].Length} tokens, which exceeds the model's context length of {maxSeq}.");
             }
         }
 
         var pooling = EmbeddingPooler.Resolve(requestedPooling, embeddingModel.DeclaredPoolingType);
         if (pooling is PoolingType.None or PoolingType.Rank)
         {
-            await WriteErrorAsync(httpContext, 400,
-                $"The loaded checkpoint declares pooling type '{pooling}', which this endpoint cannot represent. "
+            return EmbedResult.Fail(400, $"The loaded checkpoint declares pooling type '{pooling}', which this endpoint cannot represent. "
                 + "Pass \"pooling\": \"last\" (or \"mean\"/\"cls\") explicitly.");
-            return;
         }
 
         bool normalize = request.Normalize ?? true;
         int hiddenSize = state.Config.HiddenSize;
 
-        var data = new EmbeddingData[sequences.Count];
+        var vectors = new float[sequences.Count][];
         int promptTokens = 0;
 
         try
@@ -157,33 +186,24 @@ public static class EmbeddingsEndpoint
                         EmbeddingPooler.Pool(hiddenSpan, tokens.Length, hiddenSize, pooling, vector);
                     }
 
+                    // Matryoshka-style truncation: keep the leading outDims components, then renormalise.
+                    if (outDims < hiddenSize)
+                        vector = vector.AsSpan(0, outDims).ToArray();
+
                     if (normalize)
                         EmbeddingPooler.L2Normalize(vector);
 
-                    data[i] = new EmbeddingData
-                    {
-                        Index = i,
-                        Embedding = base64 ? EncodeBase64(vector) : EncodeFloats(vector),
-                    };
+                    vectors[i] = vector;
                     promptTokens += tokens.Length;
                 }
             }, ct);
         }
         catch (NotSupportedException ex)
         {
-            await WriteErrorAsync(httpContext, 400, ex.Message);
-            return;
+            return EmbedResult.Fail(400, ex.Message);
         }
 
-        var response = new EmbeddingResponse
-        {
-            Data = data,
-            Model = state.Options.ModelId,
-            Usage = new EmbeddingUsage { PromptTokens = promptTokens, TotalTokens = promptTokens },
-        };
-
-        await httpContext.Response.WriteAsJsonAsync(
-            response, ServerJsonContext.Default.EmbeddingResponse, contentType: null, ct);
+        return new EmbedResult(200, null, vectors, promptTokens, base64);
     }
 
     /// <summary>Views an f32 CPU tensor's payload as a span. The tensor stays alive for the call.</summary>
