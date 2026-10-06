@@ -90,8 +90,9 @@ returns `[CLS] ... [SEP]`; literal `[CLS]`/`[SEP]`/`[MASK]`/... in the text map 
   `BertNormalizer` / `Lowercase` / `StripAccents`).
 - Validated: exact id parity with HF `tokenizers` on 18 sentences (accents, CJK, Korean, symbols,
   control characters, over-long word, literal specials) through both paths
-  (`BertWordPieceParityTests`). Known deviation: llama.cpp's own `llm_tokenizer_wpm` does not strip
-  accents; dotLLM follows HF, which is what the models were trained with.
+  (`BertWordPieceParityTests`). llama.cpp b9016's `/tokenize` on the same GGUF was also measured on 9
+  sentences (incl. accents and CJK) and is id-identical to HF, so there is no known deviation from
+  llama.cpp either.
 
 ### HuggingFace tokenizer.json
 
