@@ -7,7 +7,7 @@ namespace DotLLM.Models.Gguf;
 /// <summary>
 /// Extracts a <see cref="ModelConfig"/> from GGUF metadata following standard GGUF key conventions.
 /// </summary>
-public static class GgufModelConfigExtractor
+public static partial class GgufModelConfigExtractor
 {
     /// <summary>
     /// Builds a <see cref="ModelConfig"/> from the given GGUF metadata.
@@ -20,6 +20,9 @@ public static class GgufModelConfigExtractor
         string archString = metadata.GetString("general.architecture");
         Architecture architecture = ParseArchitecture(archString);
         string arch = archString.ToLowerInvariant();
+
+        if (architecture is Architecture.Bert or Architecture.NomicBert)
+            return BuildBertConfig(metadata, arch, architecture);
 
         // Gemma 4 / DiffusionGemma have a fundamentally different per-layer shape
         // (dual head_dim, dual KV-head count stored as a per-layer array, dual
@@ -766,6 +769,9 @@ public static class GgufModelConfigExtractor
             "bitnet" or "bitnet-b1.58" or "bitnet-25" => Architecture.BitNet,
             // OpenAI gpt-oss (llama.cpp LLM_ARCH_OPENAI_MOE).
             "gpt-oss" => Architecture.GptOss,
+            // BERT-class embedding encoders (#739).
+            "bert" => Architecture.Bert,
+            "nomic-bert" => Architecture.NomicBert,
             _ => throw new InvalidDataException($"Unsupported GGUF architecture: '{archString}'.")
         };
     }

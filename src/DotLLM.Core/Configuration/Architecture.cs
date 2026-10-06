@@ -391,5 +391,18 @@ public enum Architecture
     /// description for the exact boundary.
     /// </para>
     /// </summary>
-    Gemma3n
+    Gemma3n,
+
+    /// <summary>
+    /// BERT-class bidirectional encoder (llama.cpp <c>bert</c>): post-LayerNorm, learned absolute
+    /// positions + token-type embedding, biased projections, GELU FFN. Embedding-only (no LM head);
+    /// served via <see cref="DotLLM.Core.Models.IEmbeddingModel"/> (issue #739).
+    /// </summary>
+    Bert,
+
+    /// <summary>
+    /// nomic-embed encoder (llama.cpp <c>nomic-bert</c>): BERT layout with RoPE (NeoX) instead of
+    /// absolute positions, fused QKV, SwiGLU FFN, no biases (issue #739).
+    /// </summary>
+    NomicBert
 }
