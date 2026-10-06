@@ -256,6 +256,11 @@ internal sealed class CudaWeights : IDisposable
                                               Action<nint>? onHostTensorUploaded = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(firstLayer);
+        // Dense Gemma-4 (E2B/E4B, #734) runs only on the whole-model CudaTransformerModel Gemma-4 forward; a layer
+        // window (hybrid / pipeline split) cannot host PLE inputs or cross-window shared-KV donors.
+        if (config.IsGemma4DensePle && (firstLayer != 0 || (numGpuLayers >= 0 && numGpuLayers < config.NumLayers)))
+            throw new NotSupportedException(
+                "The Gemma-4 dense variant (PLE + shared KV) cannot be split across devices/pipeline stages on CUDA.");
         int layerCount = numGpuLayers < 0
             ? config.NumLayers - firstLayer
             : Math.Min(numGpuLayers, config.NumLayers - firstLayer);
@@ -377,6 +382,8 @@ internal sealed class CudaWeights : IDisposable
             // V-from-K (gemma4 global layers): no attn_v.weight — the V slot is 0
             // on the CPU side and the forward copies the raw K projection into V.
             bool vFromK = isGemma4Layer && lw.Gemma4!.VFromK;
+            // Gemma-4 dense shared-KV layer (E2B/E4B trailing layers): the CPU loader leaves K/V unloaded.
+            bool sharedKv = isGemma4Layer && lw.KWeight == 0;
 
             nint q = 0, k = 0, v = 0, o = 0;
             nint qQuant = 0, kQuant = 0, vQuant = 0, oQuant = 0;
@@ -386,10 +393,10 @@ internal sealed class CudaWeights : IDisposable
             if (!isMlaLayer)
             {
                 q = SkipFp16(lw.QQuantType, kernels) ? 0 : UploadAndDequant(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim, allocs, kernels, stream, $"layer {globalLayer} Q projection");
-                k = SkipFp16(lw.KQuantType, kernels) ? 0 : UploadAndDequant(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs, kernels, stream, $"layer {globalLayer} K projection");
+                k = (sharedKv || SkipFp16(lw.KQuantType, kernels)) ? 0 : UploadAndDequant(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs, kernels, stream, $"layer {globalLayer} K projection");
                 // V-from-K (gemma4 global layers): no attn_v.weight — leave V slots 0;
                 // the gemma4 forward copies the raw K projection into V.
-                v = (vFromK || SkipFp16(lw.VQuantType, kernels)) ? 0 : UploadAndDequant(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs, kernels, stream, $"layer {globalLayer} V projection");
+                v = (vFromK || sharedKv || SkipFp16(lw.VQuantType, kernels)) ? 0 : UploadAndDequant(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs, kernels, stream, $"layer {globalLayer} V projection");
                 o = SkipFp16(lw.OQuantType, kernels) ? 0 : UploadAndDequant(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim, allocs, kernels, stream, $"layer {globalLayer} O projection");
 
                 // ── Upload raw quantized Q/K/V weights ──
@@ -402,7 +409,7 @@ internal sealed class CudaWeights : IDisposable
                 // given pointer. Saves ~`(qOut+kOut+vOut)*rowBytes` per layer of VRAM that
                 // was previously double-stored. Only the packed allocation is in `allocs`.
                 // Skip packing on V-from-K layers — there is no V tensor to pack.
-                if (!CudaKernels.DisablePackedQkv && !vFromK)
+                if (!CudaKernels.DisablePackedQkv && !vFromK && !sharedKv)
                 {
                     (qkvPacked, qkvPackedQt, qkvPackedOut,
                      qQuant, kQuant, vQuant) = TryUploadPackedThree(
@@ -415,8 +422,8 @@ internal sealed class CudaWeights : IDisposable
                 {
                     // Fusion not possible — fall back to per-tensor uploads (separate allocations).
                     qQuant = UploadQuantized(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim, allocs);
-                    kQuant = UploadQuantized(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs);
-                    vQuant = vFromK ? 0 : UploadQuantized(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs);
+                    kQuant = sharedKv ? 0 : UploadQuantized(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs);
+                    vQuant = (vFromK || sharedKv) ? 0 : UploadQuantized(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs);
                 }
 
                 oQuant = UploadQuantized(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim, allocs);
@@ -546,9 +553,17 @@ internal sealed class CudaWeights : IDisposable
                 // (five F32 norms, router scale with 1/√H folded, layer_output_scale,
                 // V-from-K flag). The experts reuse the F32 CudaMoeFfn routed path
                 // (GeGLU substituted for SwiGLU by the gemma4 FFN helper).
-                var (extras, g4Moe) = CudaGemma4WeightsLoader.LoadLayer(lw, config, allocs);
-                gemma4Layers![i] = extras;
-                moeLayers![i] = g4Moe;
+                if (!isMoeLayer)
+                {
+                    // Dense variant (E2B/E4B, #734): no experts; norms + PLE injection weights only.
+                    gemma4Layers![i] = CudaGemma4WeightsLoader.LoadDenseLayer(lw, config, allocs);
+                }
+                else
+                {
+                    var (extras, g4Moe) = CudaGemma4WeightsLoader.LoadLayer(lw, config, allocs);
+                    gemma4Layers![i] = extras;
+                    moeLayers![i] = g4Moe;
+                }
             }
             else if (isMoeLayer)
             {

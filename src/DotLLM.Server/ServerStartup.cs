@@ -121,7 +121,10 @@ public static class ServerStartup
 
         // --device auto (#722): try the best device first and fall through on a failed load. The server keeps "auto" as its configured device
         // (so later on-demand loads choose again, per model size); the device actually used is recorded in ResolvedDevice.
+        // CPU is only reached here by the user's own choice of "auto"; when a GPU candidate failed first, that is surfaced as a prominent
+        // WARNING (console + ServerState.DeviceFallbackWarning -> /props) rather than a quiet log line (#733).
         Exception? last = null;
+        var gpuFailures = new List<string>();
         foreach (string device in DeviceSelector.Candidates(new FileInfo(resolvedPath).Length))
         {
             try
@@ -129,16 +132,35 @@ public static class ServerStartup
                 Console.WriteLine($"[dotllm] --device auto: trying {device}");
                 var loaded = LoadModelCore(resolvedPath, options with { Device = device });
                 loaded.Options = loaded.Options with { Device = options.Device, ResolvedDevice = device };
+                if (device == "cpu" && gpuFailures.Count > 0)
+                {
+                    loaded.DeviceFallbackWarning = DeviceSelector.FallbackWarning(ModelIdFor(options.Model, resolvedPath), gpuFailures);
+                    Console.WriteLine($"[dotllm] WARNING: {loaded.DeviceFallbackWarning}");
+                }
                 return loaded;
             }
             catch (Exception ex) when (device != "cpu")
             {
                 last = ex;
-                Console.WriteLine($"[dotllm] {device} could not load this model ({ex.Message}); falling back");
+                gpuFailures.Add($"{device}: {ex.Message}");
+                Console.WriteLine($"[dotllm] {device} could not load this model ({ex.Message}); trying the next device");
             }
         }
         throw last ?? new InvalidOperationException("No device could load the model.");
     }
+
+    /// <summary>
+    /// Resolves the requested GPU layer count against the layer count the loader actually sees (<paramref name="numLayers"/>).
+    /// A negative request (<see cref="AllGpuLayers"/>) or an unset request on a <c>gpu</c> device means "all layers"; otherwise the
+    /// request is clamped to <c>[0, numLayers]</c>; unset on a non-GPU device is 0.
+    /// </summary>
+    public static int ResolveGpuLayers(int? requested, string device, int numLayers) =>
+        requested is < 0 ? numLayers
+        : requested.HasValue ? Math.Clamp(requested.Value, 0, numLayers)
+        : device.StartsWith("gpu", StringComparison.OrdinalIgnoreCase) ? numLayers : 0;
+
+    /// <summary>Sentinel <c>gpu_layers</c> value meaning "every layer, as the loader counts them".</summary>
+    public const int AllGpuLayers = -1;
 
     private static ServerState LoadModelCore(string resolvedPath, ServerOptions options)
     {
@@ -150,9 +172,9 @@ public static class ServerStartup
 
         var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);
 
-        int gpuLayers = options.GpuLayers.HasValue
-            ? Math.Clamp(options.GpuLayers.Value, 0, config.NumLayers)
-            : options.Device.StartsWith("gpu", StringComparison.OrdinalIgnoreCase) ? config.NumLayers : 0;
+        int gpuLayers = ResolveGpuLayers(options.GpuLayers, options.Device, config.NumLayers);
+        if (options.GpuLayers is { } requestedLayers && requestedLayers > config.NumLayers)
+            Console.WriteLine($"[dotllm] Requested {requestedLayers} GPU layers but {Path.GetFileName(resolvedPath)} has {config.NumLayers}; using all {config.NumLayers}.");
 
         IModel model;
         Func<int, IKvCache>? vulkanKvFactory = null;
@@ -163,26 +185,23 @@ public static class ServerStartup
             Console.WriteLine($"[dotllm] Vulkan inference ({DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName})");
             (model, vulkanKvFactory) = DotLLM.Vulkan.VulkanModelLoader.CreateSharedFromGguf(gguf, config);
         }
-        else if (gpuLayers <= 0)
-        {
-            Console.WriteLine($"[dotllm] CPU inference ({threading.EffectiveThreadCount} threads)");
-            // Shared per-architecture CPU dispatch — routes hybrid architectures
-            // (Nemotron-H, Qwen3MoeHybrid) to their dedicated loaders.
-            model = ModelLoader.CreateCpuModelFromGguf(gguf, config, threading);
-        }
-        else if (gpuLayers >= config.NumLayers)
-        {
-            int gpuId = ParseGpuId(options.Device);
-            Console.WriteLine($"[dotllm] GPU {gpuId} inference");
-            // Shared per-architecture CUDA dispatch — routes hybrid architectures
-            // (Qwen3MoeHybrid, Qwen3HybridDense) to their dedicated loaders (#259).
-            (model, _) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId);
-        }
         else
         {
+            // One dispatch for CPU / all-GPU / partial (#729). Architectures that cannot split layers
+            // (Nemotron-H, Qwen3MoeHybrid, Mamba-3) are loaded all-GPU, or the load FAILS with an actionable error (never a silent CPU fallback) —
+            // they must never reach HybridTransformerModel (dense Llama-style tensor naming only).
             int gpuId = ParseGpuId(options.Device);
-            Console.WriteLine($"[dotllm] Hybrid inference ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)");
-            model = DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(gguf, config, gpuLayers, gpuId, threading);
+            var plan = GpuOffloadPlanner.Plan(config.Architecture, gpuLayers, config.NumLayers);
+            Console.WriteLine(plan.Mode switch
+            {
+                GpuOffloadMode.Cpu => $"[dotllm] CPU inference ({threading.EffectiveThreadCount} threads)",
+                GpuOffloadMode.FullGpu => $"[dotllm] GPU {gpuId} inference",
+                GpuOffloadMode.Partial => $"[dotllm] Hybrid inference ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)",
+                _ => $"[dotllm] GPU {gpuId} inference (partial offload unsupported for {config.Architecture}; all layers must fit)",
+            });
+            (model, _) = DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(
+                gguf, config, gpuLayers, gpuId, threading,
+                w => Console.WriteLine($"[dotllm] WARNING: {w}"));
         }
 
         // Create chat template. The declared template is untrusted input from the GGUF's
@@ -267,6 +286,20 @@ public static class ServerStartup
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported with hybrid GPU, using hybrid cache.");
             kvFactory = (cfg, size) => hybridModel.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel qwen3SplitModel)
+        {
+            // #729: partial-offload Qwen3HybridDense owns a split (GPU head / CPU tail) cache.
+            if (options.UsePaged)
+                Console.WriteLine("[dotllm] Paged KV-cache not supported with hybrid GPU, using the model's split cache.");
+            kvFactory = (cfg, size) => qwen3SplitModel.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.CudaNemotronHTransformerModel nemotronHModel)
+        {
+            // #729: the all-GPU fallback for a partial request on Nemotron-H; sparse attention-only KV.
+            if (options.UsePaged)
+                Console.WriteLine("[dotllm] Paged KV-cache not supported for Nemotron-H on GPU; using the model's own cache.");
+            kvFactory = (cfg, size) => nemotronHModel.CreateKvCache(size);
         }
         else if (model is DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel qwen3HybridDenseModel)
         {

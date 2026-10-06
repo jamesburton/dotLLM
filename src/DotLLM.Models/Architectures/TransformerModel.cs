@@ -3930,36 +3930,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     private void GatherPerLayerIdentity(
         ReadOnlySpan<int> tokenIds, float* dest, int rowWidth, float scale,
         nint tablePtr, QuantizationType qt)
-    {
-        int pleVocab = _weights.PerLayerEmbedding!.VocabSize;
-        for (int t = 0; t < tokenIds.Length; t++)
-        {
-            int tokenId = tokenIds[t];
-            if ((uint)tokenId >= (uint)pleVocab)
-                throw new ArgumentOutOfRangeException(nameof(tokenIds),
-                    $"PLE token ID {tokenId} at position {t} is out of range [0, {pleVocab}).");
-
-            var destSpan = new Span<float>(dest + t * rowWidth, rowWidth);
-            if (qt == QuantizationType.F32)
-            {
-                float* src = (float*)tablePtr + (long)tokenId * rowWidth;
-                new ReadOnlySpan<float>(src, rowWidth).CopyTo(destSpan);
-            }
-            else if (qt == QuantizationType.F16)
-            {
-                Half* src = (Half*)tablePtr + (long)tokenId * rowWidth;
-                TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(src, rowWidth), destSpan);
-            }
-            else
-            {
-                long rowBytes = Dequantize.RowByteSize(rowWidth, qt);
-                nint rowPtr = tablePtr + (nint)((long)tokenId * rowBytes);
-                Dequantize.ToFloat32(rowPtr, rowWidth, qt, destSpan);
-            }
-
-            TensorPrimitives.Multiply(destSpan, scale, destSpan);
-        }
-    }
+        => Gemma4PerLayerInputs.GatherIdentity(_weights.PerLayerEmbedding!, tokenIds, dest, rowWidth, scale);
 
     /// <summary>
     /// Dequantizes one token-embedding row (token id <paramref name="tokenId"/>) into

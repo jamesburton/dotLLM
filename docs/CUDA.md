@@ -1112,3 +1112,16 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
 - **NCCL integration** (Step 51): multi-GPU tensor parallelism. NCCL is another system library — same P/Invoke pattern, no shared library needed.
 - **Fatbin distribution**: ship pre-compiled SASS for common architectures to eliminate JIT overhead.
 - **NVRTC runtime compilation**: compile `.cu` source to PTX at application startup using NVIDIA's Runtime Compilation library, eliminating the nvcc build step entirely. NVRTC is available as `libnvrtc.so` / `nvrtc64_*.dll`.
+
+## Gemma-4 dense variant (E2B/E4B) on CUDA (issue #734)
+
+The dense Gemma-4 variants (per-layer embeddings, 18 trailing shared-KV layers, proportional `rope_freqs`, dual head dim 256/512, no MoE block; `ModelConfig.IsGemma4DensePle`) run on the F32 `ForwardGemma4` path:
+
+- **PLE inputs** are built on the host by the exact CPU-oracle code (`Gemma4PerLayerInputs.ComputeLayerMajor`) and uploaded layer-major; only the per-layer gated injection (gate matmul, GeGLU with the layer slice, proj matmul, post-norm, add) runs on the device. The 1.9 GB `per_layer_token_embd` table never goes to VRAM.
+- **Shared KV**: shared layers skip K/V and read the donor layer (same attention kind). Cacheless uses a 2-slot donor stash; cached uses the donor's lines in the `CudaKvCache`.
+- **rope_freqs** is mapped onto partial rotary (leading-1.0 factors rotate, the 1e30 tail is identity); other factor tables are rejected at load with `NotSupportedException` rather than silently mis-rotated.
+- **KV cache**: the FP16 per-layer-strided `CudaKvCache` (new rows converted F32->F16 on write, cache rows expanded to F32 for the F32 attention kernel). The MoE (26B) forward remains cacheless.
+- **LM head**: chunked F32 device GEMV over the Q4_K tied table (the host LM head would cost about 1 s/token).
+- Layer-split (pipeline / hybrid) loading of this variant is rejected: PLE inputs and cross-window shared-KV donors cannot be split.
+
+Performance caveat: this path dequantises each projection to F32 per forward (the validated 26B design), so decode throughput is far below the quantised-GEMV paths; a quantised-GEMV Gemma-4 path is the perf follow-up.

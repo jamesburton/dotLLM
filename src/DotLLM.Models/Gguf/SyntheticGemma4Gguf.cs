@@ -235,7 +235,10 @@ public static class SyntheticGemma4Gguf
         {
             // Proportional-rope factors ≥ 1 (divisors), like Llama-3.1/E4B tables.
             var ff = new float[cfg.GlobalHeadDim / 2];
-            for (int i = 0; i < ff.Length; i++) ff[i] = 1.0f + 0.5f * i / ff.Length;
+            for (int i = 0; i < ff.Length; i++)
+                ff[i] = cfg.RopeFreqsProportionalPairs > 0
+                    ? (i < cfg.RopeFreqsProportionalPairs ? 1.0f : 1e30f)
+                    : 1.0f + 0.5f * i / ff.Length;
             byte[] data = System.Runtime.InteropServices.MemoryMarshal.AsBytes(ff.AsSpan()).ToArray();
             w.AddTensor("rope_freqs.weight", new[] { ff.Length }, (uint)QuantizationType.F32, data);
         }

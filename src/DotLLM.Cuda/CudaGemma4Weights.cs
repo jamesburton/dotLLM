@@ -44,12 +44,12 @@ internal sealed class CudaGemma4LayerWeights
     public required nint QNorm;
     /// <summary>Per-head K-norm <c>attn_k_norm</c> [headDim] (F32 device).</summary>
     public required nint KNorm;
-    /// <summary>MoE-branch pre-norm <c>pre_ffw_norm_2</c> [hidden] (F32 device).</summary>
-    public required nint PreFfwNorm2;
-    /// <summary>Dense-branch post-norm <c>post_ffw_norm_1</c> [hidden] (F32 device).</summary>
-    public required nint PostFfwNorm1;
-    /// <summary>MoE-branch post-norm <c>post_ffw_norm_2</c> [hidden] (F32 device).</summary>
-    public required nint PostFfwNorm2;
+    /// <summary>MoE-branch pre-norm <c>pre_ffw_norm_2</c> [hidden] (F32 device). 0 on a dense (E2B/E4B) layer.</summary>
+    public nint PreFfwNorm2;
+    /// <summary>Dense-branch post-norm <c>post_ffw_norm_1</c> [hidden] (F32 device). 0 on a dense (E2B/E4B) layer.</summary>
+    public nint PostFfwNorm1;
+    /// <summary>MoE-branch post-norm <c>post_ffw_norm_2</c> [hidden] (F32 device). 0 on a dense (E2B/E4B) layer.</summary>
+    public nint PostFfwNorm2;
     /// <summary>Combined post-norm <c>post_ffw_norm</c> [hidden] (F32 device) — wraps (dense + MoE).</summary>
     public required nint PostFfwNorm;
     /// <summary>
@@ -57,11 +57,21 @@ internal sealed class CudaGemma4LayerWeights
     /// with <c>1/sqrt(hidden)</c> pre-folded. Used as the gamma for the router-input
     /// RMSNorm so the router logits read <c>ffn_gate_inp · rms(attn_out)·RouterScale·(1/√H)</c>.
     /// </summary>
-    public required nint RouterScaleDevice;
+    public nint RouterScaleDevice;
     /// <summary>Per-layer output scale <c>layer_output_scale</c> — scalar, LAST per-layer op.</summary>
     public required float LayerOutputScale;
     /// <summary>True on a V-less (global / full-attention) layer where V branches off the raw K projection.</summary>
     public required bool VFromK;
+
+    // ── Dense-PLE (E2B/E4B) per-layer injection weights, issue #734. 0 on MoE gemma4 layers. ──
+    /// <summary><c>inp_gate.weight</c> [pleDim, hidden] F32 device matrix.</summary>
+    public nint PleGate;
+    /// <summary><c>proj.weight</c> [hidden, pleDim] F32 device matrix.</summary>
+    public nint PleProj;
+    /// <summary><c>post_norm.weight</c> [hidden] F32 device.</summary>
+    public nint PlePostNorm;
+    /// <summary>Per-layer embedding width (pleDim); 0 when this layer has no PLE.</summary>
+    public int PleDim;
 }
 
 /// <summary>
@@ -168,6 +178,43 @@ internal static unsafe class CudaGemma4WeightsLoader
             sharedExpertGate: 0);
 
         return (extras, moeWeights);
+    }
+
+    /// <summary>
+    /// Dense Gemma-4 (E2B/E4B, issue #734) per-layer extras: the attention/FFN F32 norms, layer output scale and
+    /// the PLE injection weights (F32 matrices). No experts / router.
+    /// </summary>
+    public static CudaGemma4LayerWeights LoadDenseLayer(
+        in TransformerLayerWeights cpuLayer, ModelConfig config, List<nint> allocs)
+    {
+        var g4 = cpuLayer.Gemma4
+            ?? throw new InvalidOperationException("CudaGemma4WeightsLoader.LoadDenseLayer called without Gemma4 extras.");
+        var extras = new CudaGemma4LayerWeights
+        {
+            AttnNorm = UploadF32Array(cpuLayer.AttnNormWeight, allocs),
+            FfnNorm = UploadF32Array(cpuLayer.FfnNormWeight, allocs),
+            PostAttnNorm = UploadF32Array(
+                cpuLayer.PostAttnNormWeight
+                    ?? throw new InvalidOperationException("Gemma4 layer missing post_attention_norm."),
+                allocs),
+            QNorm = cpuLayer.QNormWeight is { } qn ? UploadF32Array(qn, allocs)
+                : throw new InvalidOperationException("Gemma4 layer missing attn_q_norm."),
+            KNorm = cpuLayer.KNormWeight is { } kn ? UploadF32Array(kn, allocs)
+                : throw new InvalidOperationException("Gemma4 layer missing attn_k_norm."),
+            PostFfwNorm = UploadF32Array(g4.PostFfwNorm, allocs),
+            LayerOutputScale = g4.LayerOutputScale,
+            VFromK = g4.VFromK,
+        };
+        if (config.PerLayerEmbedding is { } ple && cpuLayer.PleGateWeight != 0)
+        {
+            int hidden = config.HiddenSize;
+            int pleDim = ple.PerLayerDim;
+            extras.PleDim = pleDim;
+            extras.PleGate = UploadF32Span(new ReadOnlySpan<float>((void*)cpuLayer.PleGateWeight, pleDim * hidden), allocs);
+            extras.PleProj = UploadF32Span(new ReadOnlySpan<float>((void*)cpuLayer.PleProjWeight, hidden * pleDim), allocs);
+            extras.PlePostNorm = UploadF32Array(cpuLayer.PlePostNormWeight!, allocs);
+        }
+        return extras;
     }
 
     private static nint UploadF32Array(float[] data, List<nint> allocs)
