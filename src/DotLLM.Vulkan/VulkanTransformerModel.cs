@@ -720,6 +720,7 @@ public sealed class VulkanTransformerModel : IModel
     // reused for the Gemma-4 per-layer output scale (layer_output_scale).
     private readonly ScaleInplaceF32Kernel? _embedScale;
     // Granite residual multiplier (sublayer output scaled before the residual add; 1 = none) and logit divisor (1 = none).
+    private readonly bool _postNormOnly;   // OLMo 2: no pre-attention / pre-FFN norm
     private readonly float _residualScale;
     private readonly float _logitScale;
     // Device-resident Q8_0 token-embedding gather (issue #352). Non-null only when
@@ -1183,6 +1184,7 @@ public sealed class VulkanTransformerModel : IModel
         _geglu = geglu;
         _relu2glu = relu2glu;
         _embedScale = embedScale;
+        _postNormOnly = config.Architecture == DotLLM.Core.Configuration.Architecture.Olmo2;
         _residualScale = config.ResidualScale ?? 1.0f;
         _logitScale = config.LogitScale ?? 1.0f;
         _embedGatherQ8 = embedGatherQ8;
@@ -2194,14 +2196,19 @@ public sealed class VulkanTransformerModel : IModel
     private bool RecordQkNorm(nint cmdBuf, in VulkanWeights.LayerBuffers lw, int rows, int numHeads, int numKvHeads, int headDim, float eps)
     {
         bool any = false;
+        // OLMo 2 / OLMoE: ONE RMSNorm over the whole Q (K) projection, applied before the head reshape. The same kernel,
+        // viewed as `rows` rows of n_heads*head_dim (n_kv_heads*head_dim) elements.
+        bool whole = Config.QkNormWholeProjection;
         if (lw.QNormWeight is not null)
         {
-            _rmsnorm.Record(cmdBuf, _state.Q, lw.QNormWeight, _state.Q, rowCount: rows * numHeads, n: headDim, eps: eps);
+            _rmsnorm.Record(cmdBuf, _state.Q, lw.QNormWeight, _state.Q,
+                rowCount: whole ? rows : rows * numHeads, n: whole ? numHeads * headDim : headDim, eps: eps);
             any = true;
         }
         if (lw.KNormWeight is not null)
         {
-            _rmsnorm.Record(cmdBuf, _state.K, lw.KNormWeight, _state.K, rowCount: rows * numKvHeads, n: headDim, eps: eps);
+            _rmsnorm.Record(cmdBuf, _state.K, lw.KNormWeight, _state.K,
+                rowCount: whole ? rows : rows * numKvHeads, n: whole ? numKvHeads * headDim : headDim, eps: eps);
             any = true;
         }
         if (any) BarrierComputeToCompute(cmdBuf);
@@ -2461,6 +2468,18 @@ public sealed class VulkanTransformerModel : IModel
     }
 
     /// <summary>Records the dense Q/K RoPE: the inverse-frequency kernel when #743 features are active, else the theta kernel.</summary>
+    /// <summary>
+    /// OLMo 2 (no pre-norm): materialises the raw residual stream in <c>NormOutput</c> (the buffer the projections read
+    /// everywhere else) with a device copy, barrier-ordered against the surrounding compute dispatches.
+    /// </summary>
+    private void RecordCopyHiddenToNormOutput(nint cmdBuf, int elements)
+    {
+        BarrierComputeToTransfer(cmdBuf);
+        RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
+            srcOffset: 0, dstOffset: 0, size: (ulong)elements * sizeof(float));
+        BarrierTransferToCompute(cmdBuf);
+    }
+
     private void RecordDenseRope(nint cmdBuf, int layer, int seqLen, int numHeads, int numKvHeads, int headDim)
     {
         if (_ropeInvFreq is not null)
@@ -3099,7 +3118,8 @@ public sealed class VulkanTransformerModel : IModel
             // Batched RoPE — reads packed positions [totalTokens] and rotates each
             // row independently. Per-seq position semantics are preserved by the
             // packed positions array.
-            RecordDenseRope(cmdBuf, layer, totalTokens, numHeads, numKvHeads, headDim);
+            if (!Config.IsNoRopeLayer(_firstLayer + layer))
+                RecordDenseRope(cmdBuf, layer, totalTokens, numHeads, numKvHeads, headDim);
             BarrierComputeToCompute(cmdBuf);
 
             // Per-seq attention sub-loop. Each seq:
@@ -3600,7 +3620,18 @@ public sealed class VulkanTransformerModel : IModel
             // shader writes BOTH the normalised hidden state (for K/V to
             // read) AND the Q matmul output. Falls back to the standalone
             // pair on prefill, non-Q8_0 weights, or oversized hidden.
-            if (TryRecordFusedRmsNormMatmul(cmdBuf,
+            if (_postNormOnly)
+            {
+                // OLMo 2: NO pre-attention norm — the projections read the raw residual stream.
+                RecordCopyHiddenToNormOutput(cmdBuf, seqLen * hiddenSize);
+                RecordMatmul(cmdBuf, lw.Q, lw.QDeviceQuantType, _state.NormOutput, _state.Q,
+                    lw.QOutputDim, lw.QInputDim, seqLen);
+                RecordMatmul(cmdBuf, lw.K, lw.KDeviceQuantType, _state.NormOutput, _state.K,
+                    lw.KOutputDim, lw.KInputDim, seqLen);
+                RecordMatmul(cmdBuf, lw.V, lw.VDeviceQuantType, _state.NormOutput, _state.V,
+                    lw.VOutputDim, lw.VInputDim, seqLen);
+            }
+            else if (TryRecordFusedRmsNormMatmul(cmdBuf,
                     _state.HiddenState, lw.AttnNormWeight,
                     lw.Q, lw.QDeviceQuantType,
                     _state.NormOutput, _state.Q,
@@ -3673,8 +3704,11 @@ public sealed class VulkanTransformerModel : IModel
             // the fused shader only knows startPos + t, not a per-token position lookup; the
             // TurboQuant / non-contiguous-batched paths below are unaffected and keep using their
             // existing unfused sequences).
+            // SmolLM3 NoPE layers skip RoPE entirely (ModelConfig.NoRopeLayers); the fused shader always rotates.
+            bool noRopeLayer = Config.IsNoRopeLayer(_firstLayer + layer);
             bool useFusedRopeKv = _ropeKvWrite is not null
                 && _ropeInvFreq is null
+                && !noRopeLayer
                 && kvCache is VulkanKvCache
                 && IsContiguousAscending(positions);
 
@@ -3703,8 +3737,9 @@ public sealed class VulkanTransformerModel : IModel
             }
             else
             {
-                // RoPE on Q and K
-                RecordDenseRope(cmdBuf, layer, seqLen, numHeads, numKvHeads, headDim);
+                // RoPE on Q and K (skipped on NoPE layers)
+                if (!noRopeLayer)
+                    RecordDenseRope(cmdBuf, layer, seqLen, numHeads, numKvHeads, headDim);
                 ProfSample("rope");
                 DpStamp(cmdBuf, DpCatRope);
 
@@ -3882,7 +3917,16 @@ public sealed class VulkanTransformerModel : IModel
             // FFN RMSNorm + Gate projection — fused when available
             // (mirrors the attn-norm + Q fusion above). Up reads the
             // normalised hidden state written by the fused dispatch.
-            if (TryRecordFusedRmsNormMatmul(cmdBuf,
+            if (_postNormOnly)
+            {
+                // OLMo 2: NO pre-FFN norm — gate/up read the raw post-attention residual stream.
+                RecordCopyHiddenToNormOutput(cmdBuf, seqLen * hiddenSize);
+                RecordMatmul(cmdBuf, lw.Gate, lw.GateDeviceQuantType, _state.NormOutput, _state.FfnGate,
+                    lw.GateOutputDim, lw.GateInputDim, seqLen);
+                RecordMatmul(cmdBuf, lw.Up, lw.UpDeviceQuantType, _state.NormOutput, _state.FfnUp,
+                    lw.UpOutputDim, lw.UpInputDim, seqLen);
+            }
+            else if (TryRecordFusedRmsNormMatmul(cmdBuf,
                     _state.HiddenState, lw.FfnNormWeight,
                     lw.Gate, lw.GateDeviceQuantType,
                     _state.NormOutput, _state.FfnGate,

@@ -15,6 +15,16 @@ internal static class GraniteGgufReference
         public bool AttentionScale { get; init; } = true;
         public bool ResidualScale { get; init; } = true;
         public bool LogitScale { get; init; } = true;
+        /// <summary>SmolLM3: every 4th layer skips RoPE.</summary>
+        public bool NoPe { get; init; } = true;
+        /// <summary>OLMo 2 / OLMoE: whole-projection Q/K RMSNorm before RoPE.</summary>
+        public bool QkNorm { get; init; } = true;
+        /// <summary>OLMo 2: post-norm-only layout (no pre-norms, post-attention/post-FFN norms); false = ordinary pre-norm layout.</summary>
+        public bool Olmo2Layout { get; init; } = true;
+        /// <summary>OLMoE: do NOT renormalise the selected top-k probabilities (llama.cpp norm_w=false).</summary>
+        public bool OlmoeNoRenorm { get; init; } = true;
+        /// <summary>Whole-projection (true) vs per-head (false) Q/K norm.</summary>
+        public bool QkNormWhole { get; init; } = true;
     }
 
     /// <summary>Last-token logits for <paramref name="tokens"/> (positions 0..n-1).</summary>
@@ -39,14 +49,29 @@ internal static class GraniteGgufReference
         {
             var L = wts.Layers[l];
             var q = new double[T][]; var k = new double[T][]; var v = new double[T][];
+            bool olmo2 = c.IsOlmo2 && opt.Olmo2Layout;
+            bool noPe = c.NoPeEvery4th && opt.NoPe && (l + 1) % 4 == 0;
             for (int t = 0; t < T; t++)
             {
-                var h = Rms(x[t], L.AttnNorm, c.NormEps);
+                var h = olmo2 ? (double[])x[t].Clone() : Rms(x[t], L.AttnNorm, c.NormEps);
                 q[t] = MatVec(L.Q, h, nh * hd);
                 k[t] = MatVec(L.K, h, nkv * hd);
                 v[t] = MatVec(L.V, h, nkv * hd);
-                for (int hh = 0; hh < nh; hh++) RopeNorm(q[t], hh * hd, hd, t, c.RopeBase);
-                for (int hh = 0; hh < nkv; hh++) RopeNorm(k[t], hh * hd, hd, t, c.RopeBase);
+                if (c.HasQkNorm && opt.QkNorm)
+                {
+                    if (opt.QkNormWhole) { q[t] = Rms(q[t], L.QNorm!, c.NormEps); k[t] = Rms(k[t], L.KNorm!, c.NormEps); }
+                    else
+                    {
+                        // per-head norm using the first head_dim weights (the wrong semantics, for the ablation arm)
+                        for (int hh = 0; hh < nh; hh++) NormHead(q[t], hh * hd, hd, L.QNorm!, c.NormEps);
+                        for (int hh = 0; hh < nkv; hh++) NormHead(k[t], hh * hd, hd, L.KNorm!, c.NormEps);
+                    }
+                }
+                if (!noPe)
+                {
+                    for (int hh = 0; hh < nh; hh++) Rope(q[t], hh * hd, hd, t, c.RopeBase, c.NeoXRope);
+                    for (int hh = 0; hh < nkv; hh++) Rope(k[t], hh * hd, hd, t, c.RopeBase, c.NeoXRope);
+                }
             }
             for (int t = 0; t < T; t++)
             {
@@ -68,12 +93,14 @@ internal static class GraniteGgufReference
                             attn[hh * hd + d] += sc[j] / sum * v[j][kvh * hd + d];
                 }
                 var o = MatVec(L.O, attn, H);
+                if (olmo2) o = Rms(o, L.PostAttnNorm!, c.NormEps);
                 for (int i = 0; i < H; i++) x[t][i] += resScale * o[i];
             }
             for (int t = 0; t < T; t++)
             {
-                var h = Rms(x[t], L.FfnNorm, c.NormEps);
-                double[] ffn = c.IsMoe ? Moe(L, c, h) : Dense(L.Gate!, L.Up!, L.Down!, h, c.FeedForward, H);
+                var h = olmo2 ? (double[])x[t].Clone() : Rms(x[t], L.FfnNorm, c.NormEps);
+                double[] ffn = c.IsMoe ? Moe(L, c, h, !(c.Arch == "olmoe" && opt.OlmoeNoRenorm)) : Dense(L.Gate!, L.Up!, L.Down!, h, c.FeedForward, H);
+                if (olmo2) ffn = Rms(ffn, L.PostFfnNorm!, c.NormEps);
                 for (int i = 0; i < H; i++) x[t][i] += resScale * ffn[i];
             }
         }
@@ -98,7 +125,7 @@ internal static class GraniteGgufReference
     }
 
     /// <summary>llama.cpp granite-moe: softmax over ALL experts, top-k, renormalise, SwiGLU experts, weighted sum.</summary>
-    private static double[] Moe(SyntheticGraniteGguf.Layer L, SyntheticGraniteConfig c, double[] h)
+    private static double[] Moe(SyntheticGraniteGguf.Layer L, SyntheticGraniteConfig c, double[] h, bool renorm)
     {
         int E = c.Experts, ff = c.FeedForward, H = c.Hidden;
         var logits = MatVec(L.Router!, h, E);
@@ -107,7 +134,7 @@ internal static class GraniteGgufReference
         for (int e = 0; e < E; e++) { p[e] = Math.Exp(logits[e] - mx); sum += p[e]; }
         for (int e = 0; e < E; e++) p[e] /= sum;
         var order = Enumerable.Range(0, E).OrderByDescending(e => p[e]).Take(c.ExpertsUsed).ToArray();
-        double norm = order.Sum(e => p[e]);
+        double norm = renorm ? order.Sum(e => p[e]) : 1.0;
         var acc = new double[H];
         foreach (int e in order)
         {
@@ -141,6 +168,33 @@ internal static class GraniteGgufReference
             r[i] = s;
         }
         return r;
+    }
+
+    private static void NormHead(double[] v, int off, int hd, float[] w, float eps)
+    {
+        double ss = 0;
+        for (int i = 0; i < hd; i++) ss += v[off + i] * v[off + i];
+        double inv = 1.0 / Math.Sqrt(ss / hd + eps);
+        for (int i = 0; i < hd; i++) v[off + i] = v[off + i] * inv * w[i];
+    }
+
+    /// <summary>NeoX (rotate_half) RoPE over the full head.</summary>
+    private static void RopeNeoX(double[] v, int off, int hd, int pos, double theta)
+    {
+        int half = hd / 2;
+        for (int i = 0; i < half; i++)
+        {
+            double ang = pos * Math.Pow(theta, -2.0 * i / hd);
+            double cs = Math.Cos(ang), sn = Math.Sin(ang);
+            double a = v[off + i], b = v[off + i + half];
+            v[off + i] = a * cs - b * sn;
+            v[off + i + half] = b * cs + a * sn;
+        }
+    }
+
+    private static void Rope(double[] v, int off, int hd, int pos, double theta, bool neox)
+    {
+        if (neox) RopeNeoX(v, off, hd, pos, theta); else RopeNorm(v, off, hd, pos, theta);
     }
 
     /// <summary>Adjacent-pair ("Norm") RoPE: the layout llama.cpp's converter produces for granite (it permutes Q/K).</summary>

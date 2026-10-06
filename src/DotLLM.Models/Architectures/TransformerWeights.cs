@@ -1509,9 +1509,21 @@ internal sealed class TransformerWeights : IDisposable
             ? gkv
             : config.NumKvHeads;
 
-        // Attention norm — dequantize to float[]
-        var attnNormDesc = tensors[$"{prefix}.attn_norm.weight"];
-        float[] attnNorm = DequantizeNorm(dataBase, attnNormDesc, hiddenSize);
+        // Attention norm — dequantize to float[]. OLMo 2 has NO pre-attention / pre-FFN norm tensors (post-norm-only
+        // layout): a unit-gain placeholder keeps the layer record uniform; the forward paths never apply it
+        // (ModelConfig.Architecture == Olmo2 selects the post-norm-only layer).
+        bool postNormOnly = config.Architecture == DotLLM.Core.Configuration.Architecture.Olmo2;
+        float[] attnNorm;
+        if (postNormOnly && !tensors.ContainsKey($"{prefix}.attn_norm.weight"))
+        {
+            attnNorm = new float[hiddenSize];
+            Array.Fill(attnNorm, 1.0f);
+        }
+        else
+        {
+            var attnNormDesc = tensors[$"{prefix}.attn_norm.weight"];
+            attnNorm = DequantizeNorm(dataBase, attnNormDesc, hiddenSize);
+        }
 
         // Q/K/V projections — check for fused attn_qkv.weight (Phi-3 style)
         nint qPtr, kPtr, vPtr;
@@ -1568,8 +1580,12 @@ internal sealed class TransformerWeights : IDisposable
         float[]? oBias = LoadOptionalBias(dataBase, tensors, $"{prefix}.attn_output.bias");
 
         // Optional QK-norms (Qwen3-style): per-head RMSNorm applied to Q/K after projection, before RoPE
-        float[]? qNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_q_norm.weight", layerHeadDim);
-        float[]? kNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_k_norm.weight", layerHeadDim);
+        // Two layouts, told apart by the tensor length (as on the HF path): per-head [head_dim] (Qwen3 / Gemma) or ONE
+        // RMSNorm over the whole projection [n_heads*head_dim] / [n_kv_heads*head_dim] (OLMo 2 / OLMoE).
+        float[]? qNormWeight = LoadOptionalQkNorm(dataBase, tensors, $"{prefix}.attn_q_norm.weight",
+            layerHeadDim, config.NumAttentionHeads * layerHeadDim);
+        float[]? kNormWeight = LoadOptionalQkNorm(dataBase, tensors, $"{prefix}.attn_k_norm.weight",
+            layerHeadDim, layerKvHeads * layerHeadDim);
 
         // Optional attention sub-norm (BitNet Sub-LN): RMSNorm over the attention output [hiddenSize] before o_proj.
         float[]? attnSubNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_sub_norm.weight", hiddenSize);
@@ -1580,10 +1596,19 @@ internal sealed class TransformerWeights : IDisposable
         // FFN norm — gpt-oss names its pre-FFN norm "post_attention_norm"
         // (llama.cpp LLM_TENSOR_ATTN_POST_NORM); it plays the same role as
         // ffn_norm (applied to the post-attention residual before the FFN/MoE).
-        var ffnNormDesc = tensors.TryGetValue($"{prefix}.ffn_norm.weight", out var ffnNormD)
-            ? ffnNormD
-            : tensors[$"{prefix}.post_attention_norm.weight"];
-        float[] ffnNorm = DequantizeNorm(dataBase, ffnNormDesc, hiddenSize);
+        float[] ffnNorm;
+        if (postNormOnly && !tensors.ContainsKey($"{prefix}.ffn_norm.weight"))
+        {
+            ffnNorm = new float[hiddenSize];
+            Array.Fill(ffnNorm, 1.0f);   // OLMo 2: no pre-FFN norm (placeholder, never applied)
+        }
+        else
+        {
+            var ffnNormDesc = tensors.TryGetValue($"{prefix}.ffn_norm.weight", out var ffnNormD)
+                ? ffnNormD
+                : tensors[$"{prefix}.post_attention_norm.weight"];
+            ffnNorm = DequantizeNorm(dataBase, ffnNormDesc, hiddenSize);
+        }
 
         // Gemma 2 four-norm layout (llama.cpp LLM_TENSOR_ATTN_POST_NORM / FFN_POST_NORM):
         // post_attention_norm runs on the attention sublayer output and post_ffw_norm on the
@@ -1594,7 +1619,8 @@ internal sealed class TransformerWeights : IDisposable
         float[]? postAttnNorm = null;
         float[]? postFfnNorm = null;
         if (config.Architecture is DotLLM.Core.Configuration.Architecture.Gemma2
-                                or DotLLM.Core.Configuration.Architecture.Gemma3)
+                                or DotLLM.Core.Configuration.Architecture.Gemma3
+                                or DotLLM.Core.Configuration.Architecture.Olmo2)
         {
             postAttnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.post_attention_norm.weight"], hiddenSize);
             postFfnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.post_ffw_norm.weight"], hiddenSize);
@@ -2573,6 +2599,22 @@ internal sealed class TransformerWeights : IDisposable
         float[] result = new float[expectedSize];
         Dequantize.ToFloat32(ptr, expectedSize, desc.QuantizationType, result);
         return result;
+    }
+
+    /// <summary>
+    /// Loads an optional Q/K RMSNorm weight stored either per head (<paramref name="perHeadDim"/>) or over the whole
+    /// projection (<paramref name="fullDim"/>). The on-disk length decides; any other length is an error (the plain
+    /// <see cref="LoadOptionalNorm"/> would silently read just the first <c>perHeadDim</c> elements of a wider tensor).
+    /// </summary>
+    private static float[]? LoadOptionalQkNorm(nint dataBase,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, string name, int perHeadDim, int fullDim)
+    {
+        if (!tensors.TryGetValue(name, out var desc)) return null;
+        long n = desc.Shape.ElementCount;
+        if (n != perHeadDim && n != fullDim)
+            throw new InvalidDataException(
+                $"Q/K norm tensor '{name}' has {n} elements; expected {perHeadDim} (per head) or {fullDim} (whole projection).");
+        return DequantizeNorm(dataBase, desc, (int)n);
     }
 
     /// <summary>

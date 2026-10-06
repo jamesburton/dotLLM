@@ -1250,9 +1250,15 @@ public sealed unsafe class CudaTransformerModel : IModel
 
             // Optional QK-norms (FP16)
             if (lw.QNormWeight != 0)
-                _kernels.LaunchPerHeadRmsNorm(qPtr, lw.QNormWeight, eps, numHeads, headDim, seqLen, s);
+                if (Config.QkNormWholeProjection)
+                    _kernels.LaunchPerHeadRmsNorm(qPtr, lw.QNormWeight, eps, 1, numHeads * headDim, seqLen, s);
+                else
+                    _kernels.LaunchPerHeadRmsNorm(qPtr, lw.QNormWeight, eps, numHeads, headDim, seqLen, s);
             if (lw.KNormWeight != 0)
-                _kernels.LaunchPerHeadRmsNorm(kPtr, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
+                if (Config.QkNormWholeProjection)
+                    _kernels.LaunchPerHeadRmsNorm(kPtr, lw.KNormWeight, eps, 1, numKvHeads * headDim, seqLen, s);
+                else
+                    _kernels.LaunchPerHeadRmsNorm(kPtr, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
 
             // RoPE + KV-cache write. For decode (seqLen=1) against a standard
             // CudaKvCache with the fused kernel available, fold both into a single
@@ -2168,9 +2174,15 @@ public sealed unsafe class CudaTransformerModel : IModel
                 if (lw.VBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(vPtr, lw.VBias, lw.VOutputDim, seqLen, s);
 
                 if (lw.QNormWeight != 0)
-                    _kernels.LaunchPerHeadRmsNorm(qPtr, lw.QNormWeight, eps, numHeads, headDim, seqLen, s);
+                    if (Config.QkNormWholeProjection)
+                        _kernels.LaunchPerHeadRmsNorm(qPtr, lw.QNormWeight, eps, 1, numHeads * headDim, seqLen, s);
+                    else
+                        _kernels.LaunchPerHeadRmsNorm(qPtr, lw.QNormWeight, eps, numHeads, headDim, seqLen, s);
                 if (lw.KNormWeight != 0)
-                    _kernels.LaunchPerHeadRmsNorm(kPtr, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
+                    if (Config.QkNormWholeProjection)
+                        _kernels.LaunchPerHeadRmsNorm(kPtr, lw.KNormWeight, eps, 1, numKvHeads * headDim, seqLen, s);
+                    else
+                        _kernels.LaunchPerHeadRmsNorm(kPtr, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
 
                 int effectiveRopeType = DebugRopeTypeOverride >= 0 ? DebugRopeTypeOverride : _ropeType;
 
@@ -2475,9 +2487,15 @@ public sealed unsafe class CudaTransformerModel : IModel
                 if (lw.VBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(vPtr, lw.VBias, lw.VOutputDim, seqLen, s);
 
                 if (lw.QNormWeight != 0)
-                    _kernels.LaunchPerHeadRmsNorm(qPtr, lw.QNormWeight, eps, numHeads, headDim, seqLen, s);
+                    if (Config.QkNormWholeProjection)
+                        _kernels.LaunchPerHeadRmsNorm(qPtr, lw.QNormWeight, eps, 1, numHeads * headDim, seqLen, s);
+                    else
+                        _kernels.LaunchPerHeadRmsNorm(qPtr, lw.QNormWeight, eps, numHeads, headDim, seqLen, s);
                 if (lw.KNormWeight != 0)
-                    _kernels.LaunchPerHeadRmsNorm(kPtr, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
+                    if (Config.QkNormWholeProjection)
+                        _kernels.LaunchPerHeadRmsNorm(kPtr, lw.KNormWeight, eps, 1, numKvHeads * headDim, seqLen, s);
+                    else
+                        _kernels.LaunchPerHeadRmsNorm(kPtr, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
 
                 int effectiveRopeType = DebugRopeTypeOverride >= 0 ? DebugRopeTypeOverride : _ropeType;
                 _kernels.LaunchRoPE(qPtr, kPtr, _state.PositionsDevice,
@@ -3391,10 +3409,11 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// </summary>
     internal static void RejectGemmaForCompositeHost(ModelConfig config, string host)
     {
-        if (UsesF32DenseForward(config) || config.HasGraniteScalars)
+        if (UsesF32DenseForward(config) || config.HasGraniteScalars || config.QkNormWholeProjection
+            || config.NoRopeLayers is { Count: > 0 })
             throw new NotSupportedException(
-                $"{config.Architecture} (GGUF 'gemma'/'gemma2'/'gemma3'/'granite') is not supported by {host}: its layer loop has no "
-                + "GeGLU / embedding scale / post-norms / QK-norm / dual RoPE / soft-capping / Granite residual, attention "
+                $"{config.Architecture} (GGUF 'gemma'/'gemma2'/'gemma3'/'granite'/'smollm3'/'olmo2'/'olmoe') is not supported by {host}: its layer loop has no "
+                + "GeGLU / embedding scale / post-norms / QK-norm / whole-projection QK-norm / NoPE layers / dual RoPE / soft-capping / Granite residual, attention "
                 + "and logit scalars. Use CudaTransformerModel (single GPU, FP32 dense forward), the CPU backend, or Vulkan.");
     }
 
@@ -3404,7 +3423,9 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// their extra ops (Granite residual / attention / logit scalars) and Gemma residual stream overflows FP16.
     /// </summary>
     internal static bool UsesF32DenseForward(ModelConfig config)
-        => IsGemmaDenseFamily(config) || config.Architecture == Architecture.Granite;
+        => IsGemmaDenseFamily(config) || config.Architecture is Architecture.Granite or Architecture.Olmo2
+           // SmolLM3 NoPE layers (skipped RoPE) are only implemented in this forward.
+           || config.Architecture == Architecture.SmolLM3;
 
     /// <summary>
     /// Architectures CUDA cannot honour: refuse at load with an actionable message instead of silently running a
@@ -3523,7 +3544,10 @@ public sealed unsafe class CudaTransformerModel : IModel
 
         _context.MakeCurrent();
         // Gemma 2 and Gemma 3 share the four-norm layout (post-attn / post-FFN norms before each residual add).
-        bool gemma2 = Config.Architecture is Architecture.Gemma2 or Architecture.Gemma3;
+        bool gemma2 = Config.Architecture is Architecture.Gemma2 or Architecture.Gemma3 or Architecture.Olmo2;
+        // OLMo 2: NO pre-attention / pre-FFN norm (the sublayers read the raw residual stream); whole-projection QK-norm.
+        bool postNormOnly = Config.Architecture == Architecture.Olmo2;
+        bool qkWhole = Config.QkNormWholeProjection;
         int hiddenSize = Config.HiddenSize;
         int numHeads = Config.NumAttentionHeads;
         int numKvHeads = Config.NumKvHeads;
@@ -3569,8 +3593,12 @@ public sealed unsafe class CudaTransformerModel : IModel
             var norms = _gemmaNorms[layer];
 
             // ── attention ──
-            _kernels.LaunchRmsNormF32(_state.ResidualF32, norms.AttnNorm, _state.NormOutputF32,
-                hiddenSize, eps, seqLen, s);
+            if (postNormOnly)
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.NormOutputF32, _state.ResidualF32,
+                    (nuint)((long)seqLen * hiddenSize * sizeof(float)), s).ThrowOnError();
+            else
+                _kernels.LaunchRmsNormF32(_state.ResidualF32, norms.AttnNorm, _state.NormOutputF32,
+                    hiddenSize, eps, seqLen, s);
             ProjectF32(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutputF32, _state.QF32,
                 lw.QOutputDim, lw.QInputDim, seqLen);
             ProjectF32(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutputF32, _state.KF32,
@@ -3579,13 +3607,21 @@ public sealed unsafe class CudaTransformerModel : IModel
                 lw.VOutputDim, lw.VInputDim, seqLen);
 
             // Gemma 3 per-head Q/K RMSNorm (gain [headDim], (1+w) baked) before RoPE; norms.QNorm is 0 otherwise.
+            // qkWhole (OLMo 2): one norm over the whole [n_heads*head_dim] / [n_kv_heads*head_dim] projection row.
             if (norms.QNorm != 0)
-                _kernels.LaunchRmsNormF32(_state.QF32, norms.QNorm, _state.QF32, headDim, eps, seqLen * numHeads, s);
+                _kernels.LaunchRmsNormF32(_state.QF32, norms.QNorm, _state.QF32,
+                    qkWhole ? numHeads * headDim : headDim, eps, qkWhole ? seqLen : seqLen * numHeads, s);
             if (norms.KNorm != 0)
-                _kernels.LaunchRmsNormF32(_state.KF32, norms.KNorm, _state.KF32, headDim, eps, seqLen * numKvHeads, s);
+                _kernels.LaunchRmsNormF32(_state.KF32, norms.KNorm, _state.KF32,
+                    qkWhole ? numKvHeads * headDim : headDim, eps, qkWhole ? seqLen : seqLen * numKvHeads, s);
 
+            // SmolLM3 NoPE layers skip RoPE entirely.
+            if (Config.IsNoRopeLayer(layer))
+            {
+                // no rotation
+            }
             // Gemma 3 dual RoPE: global (full-attention) layers use the pre-folded inverse-frequency table.
-            if (_gemma3GlobalInvFreq != 0 && Config.IsFullAttentionLayer(layer))
+            else if (_gemma3GlobalInvFreq != 0 && Config.IsFullAttentionLayer(layer))
                 _kernels.LaunchRoPEF32(_state.QF32, _state.KF32, _state.PositionsDevice,
                     seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _ropeType, s,
                     ropeInvFreq: _gemma3GlobalInvFreq);
@@ -3625,9 +3661,13 @@ public sealed unsafe class CudaTransformerModel : IModel
             _kernels.LaunchAddF32(_state.ResidualF32, _state.NormOutputF32, _state.ResidualF32,
                 seqLen * hiddenSize, s);
 
-            // ── FFN (GeGLU) ──
-            _kernels.LaunchRmsNormF32(_state.ResidualF32, norms.FfnNorm, _state.NormOutputF32,
-                hiddenSize, eps, seqLen, s);
+            // ── FFN (GeGLU / SwiGLU) ──
+            if (postNormOnly)
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.NormOutputF32, _state.ResidualF32,
+                    (nuint)((long)seqLen * hiddenSize * sizeof(float)), s).ThrowOnError();
+            else
+                _kernels.LaunchRmsNormF32(_state.ResidualF32, norms.FfnNorm, _state.NormOutputF32,
+                    hiddenSize, eps, seqLen, s);
             ProjectF32(lw.GateQuant, lw.GateQuantType, lw.Gate, _state.NormOutputF32, _state.FfnGateF32,
                 lw.GateOutputDim, lw.GateInputDim, seqLen);
             ProjectF32(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutputF32, _state.FfnUpF32,

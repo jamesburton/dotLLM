@@ -11,7 +11,12 @@ namespace DotLLM.Models.Gguf;
 /// </summary>
 public sealed record SyntheticGraniteConfig
 {
-    /// <summary><c>granite</c> (dense) or <c>granitemoe</c> (stacked-expert MoE).</summary>
+    /// <summary>
+    /// <c>granite</c> (dense), <c>granitemoe</c> (stacked-expert MoE), or the other Llama-family arms sharing this fixture:
+    /// <c>smollm3</c> (Llama + NoPE every 4th layer), <c>olmo2</c> (post-norm-only layout, whole-projection QK-norm, NeoX)
+    /// and <c>olmoe</c> (QK-norm whole projection, softmax-no-renorm MoE, NeoX). Granite scalars are meaningful only for
+    /// the granite arches (set them to 0 for the others).
+    /// </summary>
     public string Arch { get; init; } = "granite";
     /// <summary>Layer count.</summary>
     public int Layers { get; init; } = 3;
@@ -50,13 +55,23 @@ public sealed record SyntheticGraniteConfig
     public bool ExpertsQ8_0 { get; init; }
     /// <summary>Non-zero writes <c>expert_shared_feed_forward_length</c> (MoE-shared; the loader must reject it).</summary>
     public int SharedFeedForward { get; init; }
+    /// <summary>Writes <c>attention.sliding_window</c> (OLMo 3 style; the olmo2 loader must refuse it). 0 = key omitted.</summary>
+    public int SlidingWindow { get; init; }
     /// <summary>RMSNorm epsilon.</summary>
     public float NormEps { get; init; } = 1e-5f;
     /// <summary>PRNG seed.</summary>
     public uint Seed { get; init; } = 0x6A41u;
 
     /// <summary>True for the MoE variant.</summary>
-    public bool IsMoe => Arch == "granitemoe";
+    public bool IsMoe => Arch is "granitemoe" or "olmoe" or "qwen2moe";
+    /// <summary>True for OLMo 2 (no pre-norms, post-attention/post-FFN norms).</summary>
+    public bool IsOlmo2 => Arch == "olmo2";
+    /// <summary>True for the archs with a whole-projection Q/K RMSNorm (OLMo 2, OLMoE).</summary>
+    public bool HasQkNorm => Arch is "olmo2" or "olmoe";
+    /// <summary>NeoX (rotate-half) RoPE pairing (OLMo 2 / OLMoE); the others use adjacent-pair "Norm" pairing.</summary>
+    public bool NeoXRope => Arch is "olmo2" or "olmoe";
+    /// <summary>True for SmolLM3: every 4th layer ((il+1) % 4 == 0) skips RoPE.</summary>
+    public bool NoPeEvery4th => Arch == "smollm3";
     /// <summary>Per-head dimension (hidden / heads).</summary>
     public int HeadDim => Hidden / Heads;
 }
@@ -88,6 +103,14 @@ public static class SyntheticGraniteGguf
         public float[]? Up { get; init; }
         /// <summary>ffn_down (dense) [hidden, ff].</summary>
         public float[]? Down { get; init; }
+        /// <summary>attn_q_norm over the whole Q projection [heads*head_dim] (OLMo 2 / OLMoE).</summary>
+        public float[]? QNorm { get; init; }
+        /// <summary>attn_k_norm over the whole K projection [kv_heads*head_dim] (OLMo 2 / OLMoE).</summary>
+        public float[]? KNorm { get; init; }
+        /// <summary>post_attention_norm [hidden] (OLMo 2).</summary>
+        public float[]? PostAttnNorm { get; init; }
+        /// <summary>post_ffw_norm [hidden] (OLMo 2).</summary>
+        public float[]? PostFfnNorm { get; init; }
         /// <summary>ffn_gate_inp (MoE) [E, hidden].</summary>
         public float[]? Router { get; init; }
         /// <summary>ffn_gate_exps (MoE) [E, ff, hidden].</summary>
@@ -146,6 +169,10 @@ public static class SyntheticGraniteGguf
                 Gate = cfg.IsMoe ? null : Mat((long)cfg.FeedForward * cfg.Hidden, 0.3f),
                 Up = cfg.IsMoe ? null : Mat((long)cfg.FeedForward * cfg.Hidden, 0.3f),
                 Down = cfg.IsMoe ? null : Mat((long)cfg.Hidden * cfg.FeedForward, 0.3f),
+                QNorm = cfg.HasQkNorm ? Norm(qDim) : null,
+                KNorm = cfg.HasQkNorm ? Norm(kvDim) : null,
+                PostAttnNorm = cfg.IsOlmo2 ? Norm(cfg.Hidden) : null,
+                PostFfnNorm = cfg.IsOlmo2 ? Norm(cfg.Hidden) : null,
                 Router = cfg.IsMoe ? Mat((long)cfg.Experts * cfg.Hidden, 1.0f) : null,
                 GateExps = cfg.IsMoe ? Mat((long)cfg.Experts * cfg.FeedForward * cfg.Hidden, 0.3f) : null,
                 UpExps = cfg.IsMoe ? Mat((long)cfg.Experts * cfg.FeedForward * cfg.Hidden, 0.3f) : null,
@@ -190,10 +217,12 @@ public static class SyntheticGraniteGguf
         w.AddFloat32($"{arch}.attention.layer_norm_rms_epsilon", cfg.NormEps);
         w.AddFloat32($"{arch}.rope.freq_base", cfg.RopeBase);
         w.AddUInt32($"{arch}.rope.dimension_count", (uint)cfg.HeadDim);
+        if (cfg.SlidingWindow > 0) w.AddUInt32($"{arch}.attention.sliding_window", (uint)cfg.SlidingWindow);
         if (cfg.IsMoe)
         {
             w.AddUInt32($"{arch}.expert_count", (uint)cfg.Experts);
             w.AddUInt32($"{arch}.expert_used_count", (uint)cfg.ExpertsUsed);
+            w.AddUInt32($"{arch}.expert_feed_forward_length", (uint)cfg.FeedForward);
             if (cfg.SharedFeedForward > 0)
                 w.AddUInt32($"{arch}.expert_shared_feed_forward_length", (uint)cfg.SharedFeedForward);
         }
@@ -234,12 +263,16 @@ public static class SyntheticGraniteGguf
         {
             var L = wts.Layers[l];
             string p = $"blk.{l}";
-            Mat($"{p}.attn_norm.weight", L.AttnNorm, cfg.Hidden);
+            if (!cfg.IsOlmo2) Mat($"{p}.attn_norm.weight", L.AttnNorm, cfg.Hidden);   // OLMo 2 has no pre-norm tensors
             Mat($"{p}.attn_q.weight", L.Q, cfg.Hidden, qDim);
             Mat($"{p}.attn_k.weight", L.K, cfg.Hidden, kvDim);
             Mat($"{p}.attn_v.weight", L.V, cfg.Hidden, kvDim);
             Mat($"{p}.attn_output.weight", L.O, qDim, cfg.Hidden);
-            Mat($"{p}.ffn_norm.weight", L.FfnNorm, cfg.Hidden);
+            if (L.QNorm is not null) Mat($"{p}.attn_q_norm.weight", L.QNorm, qDim);
+            if (L.KNorm is not null) Mat($"{p}.attn_k_norm.weight", L.KNorm, kvDim);
+            if (L.PostAttnNorm is not null) Mat($"{p}.post_attention_norm.weight", L.PostAttnNorm, cfg.Hidden);
+            if (L.PostFfnNorm is not null) Mat($"{p}.post_ffw_norm.weight", L.PostFfnNorm, cfg.Hidden);
+            if (!cfg.IsOlmo2) Mat($"{p}.ffn_norm.weight", L.FfnNorm, cfg.Hidden);
             if (cfg.IsMoe)
             {
                 Mat($"{p}.ffn_gate_inp.weight", L.Router!, cfg.Hidden, cfg.Experts);

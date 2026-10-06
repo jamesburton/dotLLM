@@ -107,6 +107,15 @@ public record ModelConfig
     public float? QueryPreAttnScalar { get; init; }
 
     /// <summary>
+    /// True when the optional Q/K RMSNorm is ONE norm over the whole projection (weight length
+    /// <c>n_heads*head_dim</c> for Q, <c>n_kv_heads*head_dim</c> for K, applied before the head reshape: OLMo 2, OLMoE)
+    /// instead of the per-head norm (<c>head_dim</c> weights, applied per head: Qwen3, Gemma 3). The CPU backend
+    /// discriminates by weight length; the GPU backends must read this flag (a per-head norm over whole-projection
+    /// weights is silently wrong).
+    /// </summary>
+    public bool QkNormWholeProjection { get; init; }
+
+    /// <summary>
     /// Granite attention multiplier (HF <c>attention_multiplier</c>, GGUF <c>{arch}.attention.scale</c>): the
     /// score scale <b>itself</b> (not a divisor operand), replacing <c>1/sqrt(head_dim)</c>. Null = default.
     /// Takes precedence over <see cref="QueryPreAttnScalar"/>. Resolve through <see cref="AttentionScoreScale"/>.

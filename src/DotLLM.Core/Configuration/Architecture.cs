@@ -435,5 +435,12 @@ public enum Architecture
     /// <see cref="DotLLM.Core.Models.ModelConfig.AttentionScale"/>, <see cref="DotLLM.Core.Models.ModelConfig.LogitScale"/>
     /// and <see cref="DotLLM.Core.Models.ModelConfig.EmbeddingScale"/> (issue #313, #764).
     /// </summary>
-    Granite
+    Granite,
+
+    /// <summary>
+    /// AllenAI OLMo 2 (llama.cpp <c>olmo2</c>): post-norm-only residual layout (NO attention / FFN pre-norms;
+    /// <c>h = x + post_attn_norm(attn(x))</c>, <c>h = h + post_ffn_norm(ffn(h))</c>), full-width Q/K RMSNorm before the
+    /// head reshape, NeoX RoPE, SwiGLU. GGUF only; OLMo 3 (sliding window + YaRN) is refused (issue #765).
+    /// </summary>
+    Olmo2
 }
