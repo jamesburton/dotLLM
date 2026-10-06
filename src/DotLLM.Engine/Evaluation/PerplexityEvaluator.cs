@@ -178,6 +178,11 @@ public static class PerplexityEvaluator
         // The substituted slot sits inside the unscored prefix, so no scored target is altered.
         int[]? windowBuffer = bosTokenId >= 0 ? new int[context] : null;
 
+        // Debug aid (#737): DOTLLM_PPL_NLL_DUMP=<path> writes one "window pos token nll" line per scored
+        // token, for per-token diffing against llama.cpp's --kl-divergence-base log-probs.
+        string? nllDumpPath = Environment.GetEnvironmentVariable("DOTLLM_PPL_NLL_DUMP");
+        using StreamWriter? nllDump = string.IsNullOrEmpty(nllDumpPath) ? null : new StreamWriter(nllDumpPath);
+
         for (int start = 0; start + context <= tokens.Length; start += stride)
         {
             ReadOnlySpan<int> window;
@@ -211,6 +216,8 @@ public static class PerplexityEvaluator
                 windowNll += nll;
                 windowScored++;
                 accumulator.Add(nll);
+                if (nllDump is not null)
+                    nllDump.WriteLine(FormattableString.Invariant($"{windows - 1} {t - start} {tokens[t]} {nll:R}"));
             }
 
             onWindow?.Invoke(windows - 1, Math.Exp(windowNll / windowScored), windowScored);
