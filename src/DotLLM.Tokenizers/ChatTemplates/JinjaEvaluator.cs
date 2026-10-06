@@ -90,6 +90,10 @@ internal sealed class JinjaEvaluator
                 SetVariable(setNode.Name, EvalExpr(setNode.Value));
                 break;
 
+            case SetBlockNode setBlock:
+                SetVariable(setBlock.Name, RenderNodes(setBlock.Body));
+                break;
+
             case SetAttributeNode setAttr:
                 EvaluateSetAttribute(setAttr);
                 break;

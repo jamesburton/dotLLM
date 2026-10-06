@@ -21,6 +21,9 @@ internal sealed record IfNode(
 
 internal sealed record SetNode(string Name, IExpression Value) : ITemplateNode;
 
+/// <summary>Block set: <c>{% set x %}...{% endset %}</c> captures the rendered body as a string (#770).</summary>
+internal sealed record SetBlockNode(string Name, IReadOnlyList<ITemplateNode> Body) : ITemplateNode;
+
 internal sealed record SetAttributeNode(
     string ObjectName, string AttributeName, IExpression Value) : ITemplateNode;
 
