@@ -68,6 +68,7 @@ public static class RequestConverter
     {
         var allStops = new List<string>(stopSequences);
         AddRequestStopSequences(allStops, request.Stop);
+        if (defaults.StopSequences is { Count: > 0 } profileStops) allStops.AddRange(profileStops.Where(x => !allStops.Contains(x)));
 
         var options = new InferenceOptions
         {
@@ -100,6 +101,7 @@ public static class RequestConverter
     {
         var stops = new List<string>();
         AddRequestStopSequences(stops, request.Stop);
+        if (defaults.StopSequences is { Count: > 0 } profileStops) stops.AddRange(profileStops.Where(x => !stops.Contains(x)));
 
         var options = new InferenceOptions
         {
@@ -215,8 +217,44 @@ public static class RequestConverter
                         : schemaProp.GetRawText(),
                     Name = schemaProp.TryGetProperty("name", out var n) ? n.GetString() : null,
                 },
+            // Extensions for classifier-style callers (vLLM guided_regex / guided_choice analogues). The output is
+            // exactly the matched text (no JSON quoting), and generation stops as soon as it is complete.
+            "regex" when element.Value.TryGetProperty("pattern", out var patternProp)
+                         && patternProp.ValueKind == JsonValueKind.String =>
+                new ResponseFormat.Regex { Pattern = patternProp.GetString()! },
+            "choice" when element.Value.TryGetProperty("choices", out var choicesProp)
+                          && choicesProp.ValueKind == JsonValueKind.Array && choicesProp.GetArrayLength() > 0 =>
+                new ResponseFormat.Regex { Pattern = BuildChoicePattern(choicesProp) },
             _ => null,
         };
+    }
+
+    /// <summary>Compiles <c>["A","B"]</c> to the alternation <c>(A|B)</c>, escaping regex metacharacters in each choice.</summary>
+    internal static string BuildChoicePattern(JsonElement choices)
+    {
+        var alternatives = new List<string>();
+        foreach (JsonElement c in choices.EnumerateArray())
+        {
+            string? text = c.ValueKind == JsonValueKind.String ? c.GetString() : c.GetRawText();
+            if (string.IsNullOrEmpty(text))
+                continue;
+            alternatives.Add(EscapeRegexLiteral(text));
+        }
+        return "(" + string.Join("|", alternatives) + ")";
+    }
+
+    private const string RegexMetaCharacters = @"\.^$|?*+()[]{}";
+
+    private static string EscapeRegexLiteral(string text)
+    {
+        var sb = new System.Text.StringBuilder(text.Length + 4);
+        foreach (char ch in text)
+        {
+            if (RegexMetaCharacters.IndexOf(ch) >= 0)
+                sb.Append('\\');
+            sb.Append(ch);
+        }
+        return sb.ToString();
     }
 
     /// <summary>

@@ -220,6 +220,27 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     /// <summary>True when <see cref="ComputeSplits"/> yields &gt;= 2 splits for this shape.</summary>
     public static bool WouldSplit(int seqKv, int numHeads) => ComputeSplits(seqKv, numHeads) >= 2;
 
+    /// <summary>
+    /// The <b>seqKv-independent</b> upper bound on <see cref="ComputeSplits"/> for a given head
+    /// count — the scratch sizing bound (#465).
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ComputeSplits"/> is <c>min(byOccupancy, byKv)</c>, and only <c>byKv</c> depends
+    /// on the cache length. So <c>byOccupancy</c> alone bounds every split count this kernel can
+    /// request for <paramref name="numHeads"/>, at any context length. Sizing the partial scratch
+    /// on it means a varying <c>seqKv</c> never grows the buffer — which is what makes
+    /// <see cref="EnsureScratch"/> safe to call while a command buffer is open.
+    /// </remarks>
+    internal static int MaxSplitsFor(int numHeads)
+        => numHeads <= 0 ? 1 : Math.Max(1, TargetWorkgroups / numHeads);
+
+    /// <summary>
+    /// Count of partial-scratch (re)allocations. Test-only observability for #465: the invariant
+    /// is that this reaches 1 for a given head count and never increments again, however
+    /// <c>seqKv</c> varies.
+    /// </summary>
+    internal int ScratchAllocationCount { get; private set; }
+
     /// <summary>Drops every cached descriptor set; call when the partial scratch was re-allocated.</summary>
     internal void InvalidateDescriptorCache()
     {
@@ -288,7 +309,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
 
         int numSplits = ComputeSplits(seqKv, numHeads);
 
-        EnsureScratch(numHeads, numSplits);
+        EnsureScratch(numHeads);
 
         // Order this layer's split write after any prior compute reads of the
         // shared partial scratch (the previous layer's merge pass) and after any
@@ -361,18 +382,26 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         VulkanApi.vkCmdDispatch(cmdBuf, (uint)numHeads, 1, 1);
     }
 
-    private void EnsureScratch(int numHeads, int numSplits)
+    private void EnsureScratch(int numHeads)
     {
-        // Size partOut by MaxHeadDim, NOT the call's headDim. Within one forward
-        // seqKv (hence numSplits) is constant and numHeads is constant for every
-        // known architecture, but headDim can vary per layer (e.g. Gemma global vs
-        // sliding). Sizing on the compile-time bound means per-layer headDim
-        // variation never grows the buffer, so EnsureScratch never reallocates
-        // (and resets the descriptor pool) MID command-buffer — which would free
-        // descriptor sets already recorded for earlier layers of this forward.
-        // The shaders index with the actual headDim, staying within the buffer.
-        long needOut = (long)numHeads * numSplits * MaxHeadDim;
-        long needMS  = (long)numHeads * numSplits * 2;
+        // Size on BOUNDS, never on this call's values — the buffer must not grow while a
+        // command buffer is open, because InvalidateDescriptorCache() below resets the
+        // descriptor pool and would free sets already recorded for earlier layers.
+        //
+        //   headDim  -> MaxHeadDim       (headDim varies per layer, e.g. Gemma global vs sliding)
+        //   numSplits-> MaxSplitsFor(n)  (#465: numSplits varies per SEQUENCE under ForwardBatch)
+        //
+        // The previous version sized on the call's numSplits and justified it with "within one
+        // forward seqKv (hence numSplits) is constant". That holds for single-sequence Forward
+        // and is FALSE for ForwardBatch, which reads seqKv from each sequence's own cache inside
+        // the per-sequence loop (VulkanTransformerModel.cs) — so a batch with ascending KV
+        // lengths grew the scratch mid-recording. MaxSplitsFor() is seqKv-independent, so the
+        // invariant now holds by construction rather than by assumption.
+        //
+        // The shaders index with the actual headDim/numSplits, staying within the buffer.
+        int maxSplits = MaxSplitsFor(numHeads);
+        long needOut = (long)numHeads * maxSplits * MaxHeadDim;
+        long needMS  = (long)numHeads * maxSplits * 2;
         if (_partOut is not null && needOut <= _partOutFloats && _partMS is not null && needMS <= _partMSFloats)
             return;
 
@@ -382,6 +411,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         _partMS  = _device.AllocateDeviceLocal(needMS  * sizeof(float));
         _partOutFloats = needOut;
         _partMSFloats  = needMS;
+        ScratchAllocationCount++;
         // Cached descriptor sets reference the old scratch handles — drop them.
         InvalidateDescriptorCache();
     }

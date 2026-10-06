@@ -42,6 +42,9 @@
          / ~/.dotllm/test-cache root), so it comes along. -->
     <Compile Include="..\DotLLM.Tests.Integration\Fixtures\TestModelDownloader.cs"
              Link="Fixtures\TestModelDownloader.cs" />
+    <!-- #384: shared checkpoint-load-to-skip helper (partial/locked download tolerance). -->
+    <Compile Include="..\DotLLM.Tests.Integration\Fixtures\CheckpointGuard.cs"
+             Link="Fixtures\CheckpointGuard.cs" />
   </ItemGroup>
 
   <ItemGroup>

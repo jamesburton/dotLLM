@@ -141,6 +141,82 @@ public sealed class VulkanNemotronHGgufLoaderTests
     }
 
     /// <summary>
+    /// #564: all-row logits are opt-in and, once requested, match the CPU row for row. Discriminates
+    /// three ways: the default is a single row (so normal prefill pays nothing), the requested limit
+    /// is honoured up to its bound, and a batch beyond the bound falls back to the last row alone.
+    /// A row-0 mismatch would show a head that normalised or projected the wrong slice.
+    /// </summary>
+    [SkippableFact]
+    public void AllRowLogits_AreOptIn_AndMatchCpuRowForRow()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        string path = WriteSyntheticNemotronHGguf();
+        try
+        {
+            int[] tokenIds = [1, 2, 3];
+            int[] positions = [0, 1, 2];
+
+            float[] cpuAll;
+            using (var gguf = GgufFile.Open(path))
+            {
+                var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+                using var cpu = ModelLoader.CreateCpuModelFromGguf(gguf, config);
+                using ITensor logits = cpu.Forward(tokenIds, positions, deviceId: -1);
+                Assert.Equal(3L * VocabSize, logits.ElementCount);
+                cpuAll = AllRows(logits, 3 * VocabSize);
+            }
+
+            using (var gguf = GgufFile.Open(path))
+            {
+                var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+                using var device = VulkanDevice.Create();
+                var (model, _) = VulkanModelLoader.CreateFromGguf(device, gguf, config, spvDir);
+                using (model)
+                {
+                    // Default: last row only, and honestly declared.
+                    Assert.Equal(1, model.MaxAllRowLogitsLength);
+                    using (ITensor def = model.Forward(tokenIds, positions, deviceId: -1))
+                        Assert.Equal((long)VocabSize, def.ElementCount);
+                    model.ResetSequenceState();
+
+                    Assert.True(model.TrySetAllRowLogitsLimit(3));
+                    Assert.True(model.MaxAllRowLogitsLength >= 3);
+                    using (ITensor all = model.Forward(tokenIds, positions, deviceId: -1))
+                    {
+                        Assert.Equal(3L * VocabSize, all.ElementCount);
+                        float[] vk = AllRows(all, 3 * VocabSize);
+                        for (int i = 0; i < vk.Length; i++)
+                        {
+                            float bar = AbsTol + RelTol * MathF.Abs(cpuAll[i]);
+                            Assert.True(MathF.Abs(cpuAll[i] - vk[i]) <= bar,
+                                $"row={i / VocabSize} col={i % VocabSize}: cpu={cpuAll[i]:F6} vs vulkan={vk[i]:F6}");
+                        }
+                    }
+                    model.ResetSequenceState();
+
+                    // A longer batch than the bound falls back to the last row.
+                    int[] four = [1, 2, 3, 4];
+                    int[] fourPos = [0, 1, 2, 3];
+                    using ITensor beyond = model.Forward(four, fourPos, deviceId: -1);
+                    Assert.Equal((long)VocabSize, beyond.ElementCount);
+                }
+            }
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    private static unsafe float[] AllRows(ITensor logits, int count)
+    {
+        var all = new float[count];
+        new ReadOnlySpan<float>((void*)logits.DataPointer, count).CopyTo(all);
+        return all;
+    }
+
+    /// <summary>
     /// Mamba-3 has no GGUF representation at all (no <c>general.architecture</c> value, no tensor
     /// naming convention) — it is safetensors-first on every backend. Pin that this is reported as
     /// such rather than by falling into the dense-transformer default and failing on a missing

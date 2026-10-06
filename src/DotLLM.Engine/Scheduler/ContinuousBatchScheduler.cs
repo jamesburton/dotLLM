@@ -107,6 +107,33 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     // contiguous position range (forwardStart .. forwardStart+forwardLen-1) so each request can hand
     // ForwardBatch a stable slice without per-sequence allocation.
     private readonly List<PendingPrefill> _prefillReady = new();
+
+    // Recurrent prefix reuse (scheduler-level counterpart of TextGenerator's single-slot cache). Entries are independent
+    // snapshots (KV prefix copy + recurrent state copy), so any number of concurrent sequences can restore from one.
+    // Touched only from Step (single thread). Most-recently-used first.
+    private readonly List<RecurrentPrefixEntry> _recurrentPrefixes = new();
+    private int[]? _recurrentPrefixLastPrompt;
+
+    // Slot recycling for the recurrent-prefix path: a hybrid model's per-sequence state + KV are device allocations that cost
+    // ~25 ms per request on Vulkan (more than the prefill they enable reuse of). Released slots are kept (dirty) and handed
+    // to the next admission; a restore overwrites the state, a miss re-zeroes it. Touched only from Step.
+    private const int SlotPoolCapacity = 8;
+    private const int KvSizeGranularity = 128;
+    private readonly Stack<IRecurrentSequenceState> _statePool = new();
+    private readonly List<IKvCache> _kvPool = new();
+
+    private bool RecyclesSlots =>
+        _prefixCache is null && _options.RecurrentPrefixCacheEntries > 0 && _supportsThreadedState && _model.SupportsSequencePrefixSnapshot;
+
+    /// <summary>Shortest shared prefix worth a snapshot; matches <c>TextGenerator.RecurrentPrefixMinTokens</c>.</summary>
+    public const int RecurrentPrefixMinTokens = 16;
+
+    private sealed class RecurrentPrefixEntry(int[] tokens, IDisposable snapshot) : IDisposable
+    {
+        public int[] Tokens { get; } = tokens;
+        public IDisposable Snapshot { get; } = snapshot;
+        public void Dispose() => Snapshot.Dispose();
+    }
     private readonly List<SequenceForwardRequest> _prefillBatch = new();
     private int[] _prefillPositions = Array.Empty<int>();
 
@@ -251,6 +278,17 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             constraint: constraint,
             submissionOrder: Interlocked.Increment(ref _submissionCounter),
             tcs: tcs);
+
+        // Stop strings match on decoded text, so give this sequence a detokenizer to produce one
+        // (#459). Only when a stop string is actually registered — token-level conditions (EOS,
+        // max-tokens) need no text, and most requests carry nothing else.
+        int stopTailSize = StopSuffixTrimmer.TailWindowSize(stops);
+        if (stopTailSize > 0)
+        {
+            seq.StopTailSize = stopTailSize;
+            seq.StopScratch = new char[stopTailSize];
+            seq.Detokenizer = new IncrementalDetokenizer(_tokenizer, initialCapacity: Math.Max(64, maxTokens * 4));
+        }
 
         if (cancellationToken.CanBeCanceled)
         {
@@ -772,6 +810,10 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             seq.IsPrefixCached = true;
             cachedTokens = admission.CachedTokens;
         }
+        else if (RecyclesSlots)
+        {
+            seq.KvCache = AcquireKvCache(cacheSize);
+        }
         else
         {
             seq.KvCache = _kvCacheFactory(_model.Config, cacheSize);
@@ -785,17 +827,132 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         // runs against an isolated container — both the batched-throughput enabler and the fix for
         // concurrent sequences otherwise sharing the model-owned default state.
         if (_supportsThreadedState)
-            seq.RecurrentState = _model.CreateSequenceState();
+        {
+            if (RecyclesSlots && _statePool.TryPop(out var pooled))
+            {
+                seq.RecurrentState = pooled;
+                seq.RecurrentStateDirty = true;
+            }
+            else
+            {
+                seq.RecurrentState = _model.CreateSequenceState();
+                seq.RecurrentStateDirty = false;
+            }
+        }
 
         seq.State = SequenceState.Prefilling;
 
         int prefillStart = cachedTokens;
+        if (_prefixCache is null && seq.RecurrentState is not null && _options.RecurrentPrefixCacheEntries > 0
+            && _model.SupportsSequencePrefixSnapshot)
+        {
+            int restored = ResolveRecurrentPrefix(seq, promptIds);
+            if (restored > 0)
+            {
+                // Restored rows are skipped work, exactly like a trie hit: account them as cached, not prefilled.
+                seq.PrefixCachedTokens = restored;
+                Interlocked.Add(ref _cachedPromptTokens, restored);
+                Interlocked.Add(ref _prefilledPromptTokens, -restored);
+                prefillStart = restored;
+            }
+            else
+            {
+                // A miss may have run a snapshot prefix forward; those rows are already in the KV + state.
+                prefillStart = seq.KvCache!.CurrentLength;
+            }
+        }
         int prefillLen = promptLen - prefillStart;
 
         // 100% cache hit (prefillLen == 0): re-forward the last prompt token to obtain its logits.
         return prefillLen > 0
             ? new PendingPrefill(seq, prefillStart, prefillLen)
             : new PendingPrefill(seq, promptLen - 1, 1);
+    }
+
+    private IKvCache AcquireKvCache(int cacheSize)
+    {
+        int rounded = Math.Min(_model.Config.MaxSequenceLength, (cacheSize + KvSizeGranularity - 1) / KvSizeGranularity * KvSizeGranularity);
+        rounded = Math.Max(rounded, cacheSize);
+        for (int i = 0; i < _kvPool.Count; i++)
+        {
+            if (_kvPool[i].MaxLength >= cacheSize)
+            {
+                var kv = _kvPool[i];
+                _kvPool.RemoveAt(i);
+                kv.Rollback(0);
+                return kv;
+            }
+        }
+        return _kvCacheFactory(_model.Config, rounded);
+    }
+
+    /// <summary>
+    /// Recurrent prefix reuse for one newly admitted sequence. HIT: restore the longest snapshotted prefix that the prompt
+    /// starts with (and that leaves at least one suffix token to produce logits) and return its length. MISS: when the prompt
+    /// shares at least <see cref="RecurrentPrefixMinTokens"/> tokens with the previous admitted prompt, synchronously prefill
+    /// just that shared prefix (the same total work, split in two forwards), snapshot it, and return 0 — the KV cache then
+    /// already holds the prefix and the caller continues from <c>KvCache.CurrentLength</c>.
+    /// </summary>
+    private int ResolveRecurrentPrefix(SchedulerRequest seq, int[] promptIds)
+    {
+        int promptLen = promptIds.Length;
+        RecurrentPrefixEntry? best = null;
+        foreach (var e in _recurrentPrefixes)
+        {
+            if (e.Tokens.Length < promptLen
+                && (best is null || e.Tokens.Length > best.Tokens.Length)
+                && promptIds.AsSpan(0, e.Tokens.Length).SequenceEqual(e.Tokens)
+                && e.Tokens.Length <= seq.KvCache!.MaxLength)
+                best = e;
+        }
+
+        int shared = _recurrentPrefixLastPrompt is null
+            ? 0
+            : promptIds.AsSpan().CommonPrefixLength(_recurrentPrefixLastPrompt);
+        _recurrentPrefixLastPrompt = promptIds;
+
+        if (best is not null)
+        {
+            _model.RestoreSequencePrefix(best.Snapshot, seq.KvCache!, seq.RecurrentState);
+            seq.RecurrentStateDirty = false;   // fully overwritten by the snapshot
+            _recurrentPrefixes.Remove(best);
+            _recurrentPrefixes.Insert(0, best);   // MRU
+            return best.Tokens.Length;
+        }
+
+        // Miss: the state must start from zero (a pooled slot still holds its previous sequence).
+        if (seq.RecurrentStateDirty)
+        {
+            seq.RecurrentState!.Reset();
+            seq.RecurrentStateDirty = false;
+        }
+
+        int boundary = Math.Min(shared, promptLen - 1);
+        if (boundary < RecurrentPrefixMinTokens || boundary > seq.KvCache!.MaxLength) return 0;
+
+        var request = new SequenceForwardRequest
+        {
+            TokenIds = promptIds.AsMemory(0, boundary),
+            Positions = Enumerable.Range(0, boundary).ToArray().AsMemory(),
+            KvCache = seq.KvCache!,
+            MambaState = seq.RecurrentState as IMambaState,
+            GdnState = seq.RecurrentState as IGdnState,
+            SsmState = seq.RecurrentState as ISsmState,
+        };
+        var results = _model.ForwardBatch(new[] { request }, deviceId: -1);
+        foreach (var r in results) r.Dispose();
+
+        var snapshot = _model.SnapshotSequencePrefix(seq.KvCache!, seq.RecurrentState, boundary);
+        if (snapshot is not null)
+        {
+            _recurrentPrefixes.Insert(0, new RecurrentPrefixEntry(promptIds.AsSpan(0, boundary).ToArray(), snapshot));
+            while (_recurrentPrefixes.Count > _options.RecurrentPrefixCacheEntries)
+            {
+                _recurrentPrefixes[^1].Dispose();
+                _recurrentPrefixes.RemoveAt(_recurrentPrefixes.Count - 1);
+            }
+        }
+        return 0;
     }
 
     /// <summary>
@@ -896,10 +1053,14 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 ITensor logits;
                 try
                 {
+                    // Issue #493: FinishPrefill below samples row Shape[0]-1 only, and a
+                    // PendingPrefill always covers the prompt suffix through its final token
+                    // (MaxPrefillTokensPerStep gates ADMISSION of a whole prompt, it does not
+                    // split one across steps), so the last-row hint is safe on every path here.
                     logits = _model.Forward(
                         seq.PromptTokenIds.AsSpan(p.ForwardStart, p.ForwardLen),
                         _prefillPositions.AsSpan(posOff, p.ForwardLen),
-                        deviceId: -1, seq.KvCache);
+                        deviceId: -1, seq.KvCache, lastTokenLogitsOnly: true);
                 }
                 catch (OperationCanceledException)
                 {
@@ -1069,7 +1230,9 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             }
             else
             {
-                using ITensor _ = _model.Forward(ctx.AsSpan(0, rebuildLen), positions, deviceId: -1, seq.KvCache);
+                // Logits discarded — this forward only rebuilds the recurrent/KV state (issue #493).
+                using ITensor _ = _model.Forward(ctx.AsSpan(0, rebuildLen), positions, deviceId: -1,
+                    seq.KvCache, lastTokenLogitsOnly: true);
             }
             seq.PrefillTicks += Stopwatch.GetTimestamp() - ts0;
         }
@@ -1162,7 +1325,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     /// Disposes a sequence's KV-cache and frees its blocks, <em>without</em> routing a completion
     /// back to the prefix trie (used for preemption, where the sequence is not finished).
     /// </summary>
-    private static void FreeKvCacheOnly(SchedulerRequest seq)
+    private void FreeKvCacheOnly(SchedulerRequest seq)
     {
         // Recurrent state is freed alongside the KV — a resumed sequence recomputes both from scratch.
         DisposeRecurrentState(seq);
@@ -1178,11 +1341,16 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
 
     /// <summary>Disposes and clears a sequence's per-seq recurrent state, if any. Safe to call
     /// repeatedly and on dense sequences (no-op when the state is already null).</summary>
-    private static void DisposeRecurrentState(SchedulerRequest seq)
+    private void DisposeRecurrentState(SchedulerRequest seq)
     {
         var state = seq.RecurrentState;
         if (state is null) return;
         seq.RecurrentState = null;
+        if (RecyclesSlots && !_disposed && _statePool.Count < SlotPoolCapacity)
+        {
+            _statePool.Push(state);
+            return;
+        }
         try { state.Dispose(); }
         catch
         {
@@ -1278,22 +1446,32 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         result = StopResult.Continue;
         int last = seq.GeneratedTokens[^1];
 
-        // MVP: we do not pass a decoded-text tail. Stop-string conditions therefore won't fire.
-        // EOS and MaxTokens both work on tokenId / count alone, which covers the contract
-        // documented in CLAUDE.md. Tail-aware stop strings are a near-term enhancement —
-        // we'd need a per-sequence IncrementalDetokenizer (see DEFERRED note in the test class).
-        ReadOnlySpan<char> emptyTail = ReadOnlySpan<char>.Empty;
+        // Decoded tail for stop-string conditions (#459). Empty when this request registered none,
+        // in which case no condition reads it: EOS and max-tokens work on tokenId / count alone.
+        ReadOnlySpan<char> tail = ReadOnlySpan<char>.Empty;
+        if (seq.Detokenizer is { } detok)
+        {
+            detok.Append(last);
+            tail = detok.GetTailView(seq.StopTailSize, seq.StopScratch);
+        }
 
         for (int i = 0; i < seq.StopConditions.Count; i++)
         {
-            var r = seq.StopConditions[i].ShouldStop(last, seq.GeneratedTokens, emptyTail);
+            var r = seq.StopConditions[i].ShouldStop(last, seq.GeneratedTokens, tail);
             if (r != StopResult.Continue)
             {
                 result = r;
                 if (r == StopResult.Stop)
                 {
-                    // Stop semantics exclude the triggering token from output.
-                    seq.GeneratedTokens.RemoveAt(seq.GeneratedTokens.Count - 1);
+                    // A stop STRING may match only a suffix of the last token — dropping the whole
+                    // token would eat real output ("ld<|im_end|>" losing "ld"). Keep it and trim the
+                    // matched suffix off the decoded text in CompleteSequence. Token-level stops
+                    // (EOS) keep the original exclude-the-token semantics.
+                    string? matched = StopSuffixTrimmer.MatchedSuffix(tail, seq.StopConditions);
+                    if (matched is not null)
+                        seq.MatchedStopSequence = matched;
+                    else
+                        seq.GeneratedTokens.RemoveAt(seq.GeneratedTokens.Count - 1);
                 }
                 return true;
             }
@@ -1310,6 +1488,11 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             ? _tokenizer.Decode(CollectionsMarshal.AsSpan(seq.GeneratedTokens), stripBosSpace: false)
             : string.Empty;
 
+        // The stop string itself is not part of the output (#459). Trimmed at the character
+        // boundary so a token whose text only ends with the stop string keeps its prefix.
+        if (seq.MatchedStopSequence is not null)
+            text = StopSuffixTrimmer.TrimMatchedSuffix(text, seq.StopConditions);
+
         long kvBytes = seq.KvCache is not null ? TextGenerator.GetKvCacheBytes(seq.KvCache) : 0;
 
         var timings = BuildTimings(
@@ -1318,7 +1501,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             seq.PrefillTicks,
             seq.DecodeTicks,
             seq.SamplerTicks,
-            kvBytes);
+            kvBytes) with { CachedTokenCount = seq.PrefixCachedTokens };
 
         var response = new InferenceResponse
         {
@@ -1328,6 +1511,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             PromptTokenCount = seq.PromptLength,
             GeneratedTokenCount = seq.GeneratedTokens.Count,
             Timings = timings,
+            MatchedStopSequence = seq.MatchedStopSequence,
         };
 
         RecordPerKeyTokens(seq.Request.ApiKey, seq.GeneratedTokens.Count);
@@ -1429,6 +1613,12 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             }
         }
 
+        if (RecyclesSlots && !_disposed && _kvPool.Count < SlotPoolCapacity && !seq.IsPrefixCached)
+        {
+            _kvPool.Add(cache);
+            return;
+        }
+
         try { cache.Dispose(); }
         catch
         {
@@ -1450,6 +1640,11 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             active.CancellationRegistration.Dispose();
         }
         _active.Clear();
+        foreach (var e in _recurrentPrefixes) e.Dispose();
+        _recurrentPrefixes.Clear();
+        while (_statePool.TryPop(out var st)) st.Dispose();
+        foreach (var kv in _kvPool) kv.Dispose();
+        _kvPool.Clear();
 
         lock (_queueLock)
         {

@@ -8,6 +8,7 @@ using Xunit.Abstractions;
 namespace DotLLM.Tests.Unit.Cuda;
 
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaRealGgufIQuantSmokeTests
 {
     private const string ModelPathEnvVar = "DOTLLM_CUDA_IQ4_GGUF";

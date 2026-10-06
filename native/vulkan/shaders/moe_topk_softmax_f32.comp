@@ -42,6 +42,7 @@ layout(push_constant) uniform PushConstants {
 shared float probs[MAX_EXPERTS];
 shared float reduceScratch[WG_SIZE];
 shared int   sharedIdx[MAX_K];
+shared int   reduceIdx[WG_SIZE];
 shared float sharedWeight[MAX_K];
 
 float workgroupMax(float val) {
@@ -114,23 +115,41 @@ void main() {
     //    sequential argmax preserves lower-index-wins-on-tie which the
     //    parallel reduction would not). Marks each picked expert with
     //    NEG_INF so subsequent slots skip it.
-    if (tid == 0u) {
-        for (uint slot = 0u; slot < pc.k; slot++) {
-            int bestIdx = -1;
-            float bestVal = NEG_INF;
-            for (uint e = 0u; e < pc.numExperts; e++) {
-                float v = probs[e];
-                // Strict > ensures lower index wins on ties.
-                if (v > bestVal) {
-                    bestVal = v;
-                    bestIdx = int(e);
+    // 5. Top-k: k rounds of a workgroup argmax (lower index wins ties, as the serial scan did). The single-thread scan was
+    // k * numExperts sequential steps -- ~37 us/layer, ~1.5 ms of a 28 ms decode token on Qwen3.6-35B-A3B.
+    for (uint slot = 0u; slot < pc.k; slot++) {
+        float bv = NEG_INF;
+        int   bi = -1;
+        for (uint e = tid; e < pc.numExperts; e += WG_SIZE) {
+            float v = probs[e];
+            if (v > bv) { bv = v; bi = int(e); }
+        }
+        reduceScratch[tid] = bv;
+        reduceIdx[tid] = bi;
+        barrier();
+        for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                float ov = reduceScratch[tid + stride];
+                int   oi = reduceIdx[tid + stride];
+                float mv = reduceScratch[tid];
+                int   mi = reduceIdx[tid];
+                if (ov > mv || (ov == mv && oi >= 0 && (mi < 0 || oi < mi))) {
+                    reduceScratch[tid] = ov;
+                    reduceIdx[tid] = oi;
                 }
             }
-            sharedIdx[slot] = bestIdx;
-            sharedWeight[slot] = bestVal;
-            probs[uint(bestIdx)] = NEG_INF;  // mark claimed
+            barrier();
         }
+        if (tid == 0u) {
+            int bestIdx = reduceIdx[0];
+            sharedIdx[slot] = bestIdx;
+            sharedWeight[slot] = reduceScratch[0];
+            if (bestIdx >= 0) probs[uint(bestIdx)] = NEG_INF;  // mark claimed
+        }
+        barrier();
+    }
 
+    if (tid == 0u) {
         // 6. Optional renormalisation of top-k weights to sum to 1.0.
         if (pc.normTopKProb != 0u) {
             float sw = 0.0;

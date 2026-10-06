@@ -179,6 +179,7 @@ internal enum VkBufferUsageFlags : uint
     TransferSrc = 0x00000001,
     TransferDst = 0x00000002,
     StorageBuffer = 0x00000020,
+    IndirectBuffer = 0x00000100,
 }
 
 // VkMemoryPropertyFlagBits (bitflags)
@@ -658,6 +659,7 @@ internal struct VkQueryPoolCreateInfo
 internal static class VkPipelineStageFlags
 {
     internal const uint TopOfPipe = 0x00000001;
+    internal const uint DrawIndirect = 0x00000002;   // also the stage that reads vkCmdDispatchIndirect arguments
     internal const uint Transfer = 0x00001000;
     internal const uint ComputeShader = 0x00000800;
     internal const uint BottomOfPipe = 0x00002000;
@@ -667,6 +669,7 @@ internal static class VkPipelineStageFlags
 // VkAccessFlagBits — memory access masks for vkCmdPipelineBarrier.
 internal static class VkAccessFlags
 {
+    internal const uint IndirectCommandRead = 0x00000001;
     internal const uint ShaderRead = 0x00000020;
     internal const uint ShaderWrite = 0x00000040;
     internal const uint TransferRead = 0x00000800;
@@ -961,4 +964,32 @@ internal struct VkShaderStatisticsInfoAmd
     internal uint computeWorkGroupSizeX;
     internal uint computeWorkGroupSizeY;
     internal uint computeWorkGroupSizeZ;
+}
+
+/// <summary>
+/// One entry of a <see cref="VkSpecializationInfo"/> map: which
+/// <c>constant_id</c> in the SPIR-V takes its value from which offset of the
+/// supplied data blob.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkSpecializationMapEntry
+{
+    internal uint constantID;
+    internal uint offset;
+    internal nuint size;
+}
+
+/// <summary>
+/// Specialization constants for a shader stage. Unlike a push constant, these
+/// are substituted BEFORE the driver's backend compiler runs, so branches on
+/// them fold away and the dead side costs no registers — which is the whole
+/// point of using one here (see #533).
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkSpecializationInfo
+{
+    internal uint mapEntryCount;
+    internal nint pMapEntries;
+    internal nuint dataSize;
+    internal nint pData;
 }

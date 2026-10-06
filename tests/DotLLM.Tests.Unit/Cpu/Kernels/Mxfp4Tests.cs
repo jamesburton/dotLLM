@@ -141,6 +141,38 @@ public sealed unsafe class Mxfp4Tests
         }
     }
 
+    [Theory]
+    [InlineData(32, 1)]
+    [InlineData(256, 42)]
+    [InlineData(1056, 7)]     // odd block count (33) exercises the accumulator swap parity
+    [InlineData(4096, 99)]
+    public void VecDotMxfp4F32_Sse_MatchesScalar(int k, int seed)
+    {
+        if (!Ssse3.IsSupported) return;
+
+        var rng = new Random(seed);
+        byte[] w = BuildRandomMxfp4(k, rng);
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Tolerance scaled to the L1 mass: same terms as the scalar reference, only the float
+        // association differs; a wrong table entry / nibble order / scale is O(1) of the mass.
+        double mass = 0;
+        fixed (float* xp = x)
+        fixed (byte* wp = w)
+        {
+            float scalar = MatMul.VecDotMxfp4F32Scalar(wp, xp, k / 32);
+            float sse = MatMul.VecDotMxfp4F32Sse(wp, xp, k / 32);
+            for (int b = 0; b < k / 32; b++)
+            {
+                float d = Dequantize.E8M0ToFloatHalf(wp[b * 17]);
+                for (int j = 0; j < 32; j++) mass += Math.Abs(d * 12.0 * xp[b * 32 + j]);
+            }
+            Assert.True(Math.Abs(scalar - sse) <= 1e-5 * mass,
+                $"k={k}: scalar={scalar:R} sse={sse:R} (mass {mass:G4})");
+        }
+    }
+
     /// <summary>
     /// Issue #275 regression: on <c>main</c> before the fix, <c>GemvMxfp4</c> quantized the
     /// activation to Q8_0 before dotting (mirroring llama.cpp's

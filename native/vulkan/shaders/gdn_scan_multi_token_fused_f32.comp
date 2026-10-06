@@ -1,0 +1,129 @@
+#version 450
+// GDN multi-token scan — FACTOR A ONLY: phase fusion, state still in global memory.
+// Issue #445, factorial arm "10". Compare against gdn_scan_multi_token_f32.comp (arm 00).
+//
+// WHAT CHANGES vs the shipping shader, and nothing else changes:
+//
+//   1. The four phases become TWO passes over the state column. The shipping shader
+//      touches each state element SIX times per token:
+//          decay     read + write
+//          retrieve  read
+//          rank-1    read + write
+//          read-out  read
+//      Decay and retrieve address the SAME element from the SAME thread, as do rank-1
+//      and read-out, so each pair collapses into one read-modify-write that also
+//      accumulates. Six accesses become four.
+//
+//   2. `tmp[]` was shared memory that only ever crossed from thread `tid` to thread
+//      `tid` — it is a register here.
+//
+//   3. Barriers per token fall from five to two (the cooperative k/q load, and the
+//      end-of-token guard that stops the next token overwriting k_shared/q_shared
+//      while this token still reads them). Every barrier that vanished separated
+//      operations with no cross-thread dependency at all.
+//
+// BIT-EXACTNESS. This is a value-preserving transform, not an approximation:
+//   - `st[idx] = st[idx] * g` then a later read of `st[idx]` yields exactly the f32
+//     that the multiply rounded to. Holding that f32 in a register and using it
+//     directly gives the identical value.
+//   - Likewise `st[idx] = st[idx] + k*delta` followed by a read.
+//   - Every reduction keeps its original order and its `precise` qualifier, so the
+//     driver still may not fuse `a + b*c` into an FMA. See the shipping shader's
+//     header for why that matters against the CPU oracle
+//     (DotLLM.Cpu.Kernels.GatedDeltaNetScan.Execute).
+// VulkanGdnScanMultiTokenF32KernelTests must pass unchanged against this variant.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)           buffer BufState  { float st[];     }; // [n_v_head, d_state, d_state] (RW)
+layout(set = 0, binding = 1, std430) readonly  buffer BufQ      { float q_buf[];  }; // [seq_len, n_k_head, d_state]
+layout(set = 0, binding = 2, std430) readonly  buffer BufK      { float k_buf[];  }; // [seq_len, n_k_head, d_state]
+layout(set = 0, binding = 3, std430) readonly  buffer BufV      { float v_buf[];  }; // [seq_len, n_v_head, d_state]
+layout(set = 0, binding = 4, std430) readonly  buffer BufG      { float g_buf[];  }; // [seq_len, n_v_head]
+layout(set = 0, binding = 5, std430) readonly  buffer BufBeta   { float beta_buf[]; }; // [seq_len, n_v_head]
+layout(set = 0, binding = 6, std430) writeonly buffer BufOut    { float out_buf[]; }; // [seq_len, n_v_head, d_state]
+
+layout(push_constant) uniform PushConstants {
+    int n_v_head;
+    int n_k_head;
+    int d_state;
+    int v_heads_per_k_head;
+    int seq_len;
+} pc;
+
+shared float k_shared[128];
+shared float q_shared[128];
+
+void main() {
+    uint vh  = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (int(vh) >= pc.n_v_head) return;       // workgroup-uniform: safe
+
+    uint dState = uint(pc.d_state);
+    bool laneActive = tid < dState;
+    uint kh           = vh % uint(pc.n_k_head);
+    uint stateBase    = vh * dState * dState;
+    uint qkPerToken   = uint(pc.n_k_head) * dState;
+    uint vPerToken    = uint(pc.n_v_head) * dState;
+    uint kvScale      = uint(pc.n_v_head);
+
+    float invSqrtD = 1.0 / sqrt(float(pc.d_state));
+
+    for (int t = 0; t < pc.seq_len; t++) {
+        uint qkBase = uint(t) * qkPerToken + kh * dState;
+        uint vBase  = uint(t) * vPerToken + vh * dState;
+        uint gbIdx  = uint(t) * kvScale + vh;
+
+        float gVh    = g_buf[gbIdx];
+        float betaVh = beta_buf[gbIdx];
+
+        // ── Stage 0: cooperative load of k_kh and q_kh for this token ──────
+        if (laneActive) {
+            k_shared[tid] = k_buf[qkBase + tid];
+            q_shared[tid] = q_buf[qkBase + tid];
+        }
+        barrier();
+
+        // ── Pass A: decay + retrieve, fused ────────────────────────────────
+        // Was: `st *= g` over the column, barrier, then a second full read of the
+        // column to reduce against k. The decayed value is reused from a register.
+        precise float retr = 0.0;
+        if (laneActive) {
+            for (uint row = 0u; row < dState; row++) {
+                uint idx = stateBase + row * dState + tid;
+                float decayed = st[idx] * gVh;
+                st[idx] = decayed;
+                precise float prod = decayed * k_shared[row];
+                retr = retr + prod;
+            }
+        }
+
+        // ── Delta rule (thread-local; `tmp[]` was never cross-thread) ──────
+        precise float delta = 0.0;
+        if (laneActive) {
+            float vVh = v_buf[vBase + tid];
+            precise float diff = vVh - retr;
+            delta = betaVh * diff;
+        }
+
+        // ── Pass B: rank-1 update + read-out, fused ────────────────────────
+        // Was: `st += k*delta` over the column, barrier, then a third full read of
+        // the column to reduce against q. The updated value is reused from a register.
+        if (laneActive) {
+            precise float acc = 0.0;
+            for (uint row = 0u; row < dState; row++) {
+                uint idx = stateBase + row * dState + tid;
+                precise float prod = k_shared[row] * delta;
+                precise float updated = st[idx] + prod;
+                st[idx] = updated;
+                precise float rprod = updated * q_shared[row];
+                acc = acc + rprod;
+            }
+            out_buf[vBase + tid] = acc * invSqrtD;
+        }
+
+        // Guards k_shared / q_shared against the next token's cooperative load.
+        barrier();
+    }
+}

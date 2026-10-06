@@ -34,9 +34,28 @@ Primary chat endpoint. Accepts OpenAI-compatible request format.
   "dry_allowed_length": 2,
   "dry_penalty_last_n": 0,
   "dry_sequence_breakers": ["\n", ":", "\"", "*"],
-  "n": 1
+  "n": 1,
+  "stream_options": {"include_usage": true},
+  "parallel_tool_calls": false
 }
 ```
+
+**`stream_options.include_usage`** (#450) — when true, the stream emits one extra chunk before
+`data: [DONE]` carrying `usage` with an **empty `choices` array**. SDKs match on exactly that
+shape to close out their token accounting, so it is load-bearing rather than cosmetic. The
+pre-existing `finish_reason` chunk keeps its own `usage`/`timings` (a dotLLM extension the web UI
+reads) — `include_usage` adds a chunk, it does not change one. Supported on all three streaming
+paths: chat, diffusion chat, and `POST /v1/completions`.
+
+**`parallel_tool_calls`** (#450) — `false` means the assistant emits at most one tool call per
+turn. Nothing constrains the model during decode, so the cap is applied to the detected calls on
+the way out, on both the streaming and non-streaming paths. Absent/`true` is OpenAI's default
+(parallel calls allowed).
+
+**Accepted and ignored**: `user`, `store`, `service_tier`, `reasoning_effort`, `metadata`. These
+name concepts this server has no equivalent for, and a client that always sends them must never
+get a 400. Genuinely unknown fields are tolerated too (STJ source-gen skips unmapped members) —
+declaring these makes the intent explicit and guards against a future strict-DTO pass.
 
 Also accepted (not shown above): `top_k`, `min_p`, `repetition_penalty` — see [SAMPLING.md](SAMPLING.md)
 for the full parameter reference, including the DRY/top-nσ/logit-bias/frequency/presence-penalty
@@ -75,13 +94,146 @@ data: [DONE]
 ### `POST /v1/completions`
 Raw completion (no chat template). Same sampling parameters. Input is `prompt` (string) instead of `messages`.
 
+### `POST /v1/messages`, `POST /v1/messages/count_tokens` (Anthropic-compatible, fork-only — #448/#449)
+
+Anthropic Messages API endpoint, served alongside the OpenAI surface so that
+`anthropic` SDK clients can talk to dotLLM unchanged. Top-level `system`,
+string-or-block message `content`, `max_tokens` (required), `stop_sequences`,
+`tools`/`tool_choice`, and event-based streaming SSE (`message_start`,
+`content_block_*`, `message_delta`, `message_stop`). Reuses the same model
+residency, chat template, scheduler, sampler and tool-call parser as
+`/v1/chat/completions`; only the wire format differs.
+
+Errors use the Anthropic envelope, not this surface's `{"error": "..."}`:
+`{"type":"error","error":{"type":"invalid_request_error","message":"..."}}`.
+
+Two caveats worth knowing here rather than in the detail doc:
+- `/v1/messages` is **not** in `RateLimitMiddleware`'s metered-path allowlist,
+  so it currently bypasses per-API-key rate limiting (see [Rate Limiting](#rate-limiting)).
+- A masked text-diffusion model is refused on this route with a `400`; use
+  `/v1/chat/completions` for those.
+
+`POST /v1/messages/count_tokens` returns `{"input_tokens": N}` for the same body
+without generating, computed from the same templated prompt `/v1/messages` bills.
+`anthropic-version` is honoured (unknown value → `400`), `anthropic-beta` is
+accepted and ignored, and `x-api-key` is accepted — dotLLM performs no
+authentication (see [Security](#security)).
+
+Full reference: **[ANTHROPIC_API.md](ANTHROPIC_API.md)**.
+
 ### `POST /v1/embeddings`
-Extract embedding vectors from text.
+Extract embedding vectors from text (#451).
 
-**Request**: `{"input": "text to embed", "model": "..."}`
-**Response**: `{"data": [{"embedding": [0.1, -0.2, ...], "index": 0}]}`
+> **Backend coverage: CPU only.** The pooled hidden state comes from
+> `IEmbeddingModel.ForwardHidden`, which only the CPU `TransformerModel` implements. When a
+> Vulkan or CUDA model is loaded the endpoint returns **501 Not Implemented** with a message
+> naming the model type, rather than silently returning an unvalidated vector. A GPU path is a
+> follow-on, not a blocker.
 
-Implementation: Run input through the model, capture hidden state at `PreLmHead` hook point, apply pooling (mean pool over tokens by default, configurable), L2 normalize. Minimal additional code given the hook system.
+**Request**
+
+| field | type | notes |
+|---|---|---|
+| `input` | string \| string[] \| int[] \| int[][] | Required. A flat int array is **one** pre-tokenised sequence; a nested one is many. Pre-tokenised ids are range-checked against the vocabulary. |
+| `model` | string | Optional. Activates that model (same semantics as `/v1/chat/completions`). |
+| `encoding_format` | `"float"` (default) \| `"base64"` | `base64` is the raw little-endian float32 payload, base64-encoded — what the OpenAI SDK's numpy path decodes. |
+| `pooling` | `"last"` \| `"mean"` \| `"cls"` | dotLLM extension, mirrors llama.cpp's `--pooling`. Omit to use the model default. |
+| `normalize` | bool, default `true` | dotLLM extension. `true` is L2 / Euclidean, matching llama.cpp's `--embd-normalize 2` default and OpenAI's unit-norm vectors. |
+| `dimensions` | — | **Rejected with 400.** dotLLM returns the model's full hidden size; there is no Matryoshka truncation. |
+
+**Response**
+
+```json
+{"object": "list",
+ "data": [{"object": "embedding", "index": 0, "embedding": [0.1, -0.2, "..."]}],
+ "model": "smollm2-135m-instruct",
+ "usage": {"prompt_tokens": 21, "total_tokens": 21}}
+```
+
+`data[i]` corresponds to `input[i]`. `usage.prompt_tokens` is the sum of the per-item token counts.
+
+**Implementation.** Each input item is its own forward pass with positions `0..n-1` (the CPU
+forward has no per-sequence attention mask, so sequences are not packed), stopping after the final
+output norm and before the LM head — the tensor llama.cpp names `result_norm` and assigns to
+`res->t_embd`, which is what its own pooling operates on.
+
+**Concurrency.** The request holds *both* locks that guard the model: the server request gate
+(`ServerState.ExecuteAsync`, against the direct-generator path) and, when a continuous-batch
+scheduler is active, `ContinuousBatchSchedulerService.AcquireModelAsync` — the scheduler drives
+forward passes on the same model from its own run loop, deliberately outside the request gate,
+because batching rather than serialising is the point of it. The gate alone is not enough: the
+model's scratch buffers *and its compute thread pool* are shared mutable state, and an embedding
+taken alongside a generation without the lease crashes the process
+(`CountdownEvent … below zero` from `ComputeThreadPool`). `AcquireModelAsync` makes the run loop
+finish the step it is on and block before the next, so the embedding interleaves *between* steps.
+Cost to the scheduler is one uncontended semaphore per forward pass.
+
+**Pooling default.** Precedence is: explicit `pooling` → the checkpoint's GGUF
+`{arch}.pooling_type` → `last`. The GGUF value is llama.cpp's raw `llama_pooling_type` enum
+(`0=none, 1=mean, 2=cls, 3=last, 4=rank`) and is mapped value-for-value. The final fallback is a
+**deliberate deviation** from llama.cpp, whose `hparams.pooling_type` defaults to `NONE` when the
+key is absent: `NONE` means one vector per token and is not representable in an OpenAI embeddings
+response. `last` is the right default for a causal decoder — the last token is the only position
+that has attended to the whole sequence — and is what llama.cpp's own tooling makes you pass
+(`--pooling last`) to embed a generative model. A checkpoint that *declares* `none` or `rank` is
+honoured rather than rewritten: the request fails with a 400 telling the caller to pass `pooling`
+explicitly.
+
+**Known gaps.** There is no cap on the number of input items (OpenAI's is 2048) — a large batch
+holds the model lock for the whole request and stalls generation meanwhile. Batched embedding
+forwards, a GPU path, and `pooling: none` (one vector per token, via a non-OpenAI response shape)
+are all follow-ons.
+
+**Correctness.** Anchored against llama.cpp, not against itself: reference vectors are captured
+from `llama-server --embeddings` on the same GGUF (`tests/scripts/capture-llamacpp-embeddings.ps1`,
+committed with full provenance) and compared by cosine similarity in
+`EmbeddingLlamaCppParityTests`. See that test's remarks for the measured correct-vs-broken
+separation the tolerance is derived from.
+
+### `POST /v1/systemone` (Jev-compatible decisions, fork-only - #708)
+
+A decision endpoint with the **wire shape of TypeSafe's Jev System One API**, so Jev SDKs, the OpenJev servers and the Microsoft Agent Framework
+`Microsoft.Agents.AI.TypeSafe` provider (`TypeSafeDecisionClientOptions.Endpoint = http://host:port/v1/systemone`) can point at a dotLLM server.
+
+**Background.** Jev (TypeSafe AI) is a non-autoregressive "System One" model: a state plus typed questions in, typed answers with probabilities out, in one
+forward pass. Together AI's Tev1 only imitates the *contract* (`{state, question, options[label,key,description]}` -> one letter) on an ordinary language-model
+head. dotLLM answers every question with ONE prefill and **no decode loop**: the question is rendered as the Tev1 contract (system prompt, thinking block
+closed), and the logits of the option letters at the first generated position are renormalised into per-option probabilities.
+
+```json
+POST /v1/systemone
+{"model":"jev-latest",
+ "state":"Returns are allowed within 30 days. Purchase was 12 days ago.",
+ "questions":{
+   "in_window":{"type":"noul","instructions":"Is the return within the window?"},
+   "route":{"type":"choice","instructions":"Which action?","criteria":{"approve":"Approve","deny":"Deny","escalate":"Escalate"}},
+   "urgency":{"type":"score","instructions":"How urgent?","criteria":["not urgent","low","medium","high"]}}}
+```
+
+| question `type` | `criteria` | answer fields |
+|---|---|---|
+| `noul` | optional `{"true": "...", "false": "..."}` | `noul` = P(true) |
+| `choice` | `{name: description}` (2..52) | `choice` (argmax name), `probabilities` (by name), `confidence` = `1 - H(p)/ln K` |
+| `score` | array of 2..10 level descriptions | `score` = probability-weighted level index in `[0, n-1]`, `probabilities` keyed `"0".."n-1"`, `confidence`, `legend` |
+
+The response is `{model, answers{id:{type, ...}}, usage{input_tokens, output_tokens:0}}`. Validation failures return `422` with the standard error envelope.
+
+Notes: `state` may be a string or any JSON value (embedded verbatim). `model` is informational (the loaded model answers). Questions run sequentially in request
+order and the state is the prompt prefix, so the prefix caches reuse it across questions; concurrent requests are batched when the scheduler is on
+(`--expected-concurrency`). Works on every backend with any instruction-tuned model; **Tev1-4B is the model the prompt contract was trained for**
+(~65 ms per question on Strix Halo Vulkan). Probabilities are the model's own restricted softmax, **not calibrated** like Jev's, and `score` is an
+expected level index, not a Jev-trained ordinal head. Option-label tokens must be single tokens in the tokenizer (A-Z, a-z).
+
+**Calibration and option order (opt-in, #710).** Measured with `scripts/decision-calibration.py` on 480 programmatic labelled items (easy and
+deliberately hard multi-rule cases) against Tev1-4B Q4_K_M on Vulkan: raw accuracy 97.9%, NLL 0.0625, ECE 0.027, and the model is slightly *under*-confident.
+
+| setting | what it does | measured effect |
+|---|---|---|
+| `--decision-temperature T` | probabilities = softmax(logits / T); 0 or 1 = raw | T=0.58 fitted on half the set: held-out NLL 0.0546 -> 0.0428, ECE 0.0271 -> 0.0102 (the live server reproduces this exactly) |
+| `--decision-orderings 2` | each noul/choice question is also asked with the options reversed; per-option logits are averaged | reversal flips 2.2% of choice argmaxes; choice accuracy 98.2 -> 98.9%, overall NLL 0.0480 -> 0.0452 (with T=0.58), at 2x the forward passes; score questions are never reversed (ordinal) |
+
+Both default to off: the temperature is a fit to a synthetic set, not a guarantee for another task or model (fit yours with the script - it writes
+accuracy / NLL / ECE, the fitted T and the order-flip rate), and ordering averaging doubles the cost for a small gain.
 
 ### `GET /v1/models`
 Lists every **resident** model — the active one plus any stashed-but-loaded models (#369):
@@ -92,6 +244,113 @@ Lists every **resident** model — the active one plus any stashed-but-loaded mo
 ]}
 ```
 `expires_in_seconds` is omitted when the model's keep-alive is negative (pinned, never auto-unloads).
+
+### `GET /v1/models/{id}`
+Retrieves one model object — what the OpenAI SDK's `client.models.retrieve()` calls (#450). The
+route is a catch-all (`/v1/models/{**id}`) because ids are HuggingFace repo ids and contain `/`;
+the literal `/v1/models/{available,load,inspect}` routes are more specific and still win.
+Resolution goes through the same list the collection endpoint returns, so retrieve can never
+disagree with list — including on a bare server, where the configured-but-unloaded model id
+retrieves rather than 404s. An unknown id returns `404` with
+`{"error": {"type": "not_found_error", "code": "model_not_found", "param": "model", ...}}`.
+
+## Model names, the hub cache and pulling (#714)
+
+One resolver (`DotLLM.HuggingFace.ModelResolver`) turns a model name into a GGUF everywhere - `dotllm run|chat|serve|bench`, a request's `model`
+field, and `POST /v1/models/load`:
+
+| you write | resolves to |
+|---|---|
+| `C:\models\x.gguf` | that file |
+| `owner/repo` | the repo's best local GGUF: **Q4_K_M first** (then Q4_K_S, Q4_0, Q5_K_M, Q8_0, ...), not the largest file |
+| `owner/repo:Q8_0` | the file whose name contains the tag (`:latest` = the default); the legacy `--quant` is the same thing |
+| `owner/repo/file.gguf` | that file |
+| `hf.co/owner/repo:tag`, `hf://owner/repo` | same as `owner/repo[:tag]` |
+| `Tev1-4B-experimental-Q4_K_M` | a local file by stem or filename - the key `GET /v1/models` reports |
+
+Local models are found in **both** the flat mirror (`~/.dotllm/models/{owner}/{repo}`) and the Hugging Face hub cache
+(`HF_HUB_CACHE` / `HF_HOME/hub` / `~/.cache/huggingface/hub`, symlinked or hard-linked snapshots), so files fetched by `hf download` or another
+tool need no re-pull; the same file seen through both is listed once (`GET /v1/models/available`, `dotllm model list`). Multimodal projectors
+(`mmproj*`) and later shards of a split GGUF are never chosen as the model.
+
+**Pull on a miss.** `dotllm run|chat|serve owner/repo[:tag]` downloads a missing Hub model with progress (resumable, into the hub cache, like
+`ollama run`). The **server** does not download on a request unless started with `--auto-pull`: a remote client must not be able to start
+multi-gigabyte transfers by naming a repo. Without it a miss answers `model_not_found` with the `dotllm model pull ...` / `POST /v1/models/pull`
+hint. `dotllm model pull owner/repo:Q4_K_M` selects the file by tag without a prompt and now also writes to the hub cache. `dotllm model delete`
+removes every link (mirror, snapshot) and the blob when it is unambiguous (same length and first MiB, exactly one candidate); it matches every
+file of a repo unless you narrow it with `--quant`.
+
+## Custom models: `model add`, profiles (Modelfile equivalent), `ps` / `stop` (#716)
+
+**Add your own GGUF.** `dotllm model add C:\models\my-finetune.gguf [--name my-finetune]` links the file (hard link, no extra disk) into the model store as
+`local/<name>`; `dotllm model add https://host/x.gguf` downloads a direct URL there. The file's `GGUF` magic is checked, so an HTML error page is
+rejected. It is then found by name everywhere (`dotllm run my-finetune`, a request's `model`, `model list`).
+
+**Profiles.** `dotllm model create <name> --from <base> [options]` saves `~/.dotllm/profiles/<name>.json` (`DOTLLM_PROFILES_DIR` overrides):
+
+```
+dotllm model create terse --from bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M ^
+    --system "Answer in one sentence." --temperature 0.2 --max-tokens 128 --stop "###" --device vulkan --keep-alive 600
+```
+
+| field | effect when a request for `<name>` arrives |
+|---|---|
+| `from` | the base model: path, `owner/repo[:quant]`, local name, or another profile (chains of up to 8; the outer profile's values win) |
+| `system` | prepended as the system message **only if the request has none** (chat completions and `/v1/messages`) |
+| `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty`, `max_tokens`, `seed` | defaults for a request that omits them; a request value always wins; the global `/v1/config` defaults are never modified |
+| `stop` | always added to the request's stop sequences |
+| `device`, `gpu_layers`, `keep_alive` | used when the server loads the model on demand (an explicit `POST /v1/models/load` field still wins) |
+
+The profile name is the model id: `GET /v1/models` lists it, residency and keep-alive key by it, and `model: "terse"` (or `terse:latest`) on any
+endpoint loads the base model with these settings. A profile shadows a model that happens to share its name. `model show <name>` prints the merged
+settings and where the base resolves, `model cp <src> <dst>` copies a profile (or aliases a model), and `model delete <name>` removes a profile without
+touching its base model. `dotllm run|chat` resolve a profile to its base model but do not yet apply the profile's system prompt or sampling.
+
+**`dotllm ps` / `dotllm stop [model|--all]`** are thin clients of a running server (`--url` or `DOTLLM_URL`, default `http://localhost:8080`):
+`ps` lists the resident models with size, idle time and the auto-unload countdown; `stop` unloads (needs the server's `--allow-model-admin`).
+
+## Using ollama's models (#718)
+
+dotLLM reads an existing ollama installation **in place** and can pull from the same registry, so ollama names work everywhere a model is named:
+
+| you write | what happens |
+|---|---|
+| `dotllm run llama3.2:3b` (also `serve`, `chat`, or `"model": "llama3.2:3b"` in a request) | found in your ollama store (`OLLAMA_MODELS` or `~/.ollama/models`): the GGUF blob is loaded in place - nothing is copied. A miss is pulled from `registry.ollama.ai` (CLI always; the server only with `--auto-pull`) |
+| `dotllm model pull ollama:llama3.2:3b` | download from the ollama registry into `~/.dotllm/models/ollama/` (resumable, **sha256-verified**, a corrupt partial is discarded) and save a profile `llama3.2:3b` carrying the manifest's system prompt and parameters (temperature, top_p, top_k, repeat_penalty, stop, num_predict, seed; `num_ctx` is not mapped) |
+| `ollama:user/model:tag` | a namespaced ollama model (a plain `owner/repo` always means Hugging Face) |
+| `dotllm model import-ollama [name] [--force]` | turn the models of your ollama store into profiles (system prompt and parameters applied, blobs still used in place) |
+
+`dotllm model list` and `GET /v1/models/available` list ollama-store models as `ollama/<name>`; a loaded one is keyed `name:tag`. Limits: the ollama
+**prompt template** (a Go template) is not carried over - dotLLM renders the chat template embedded in the GGUF, which is what the model was
+converted with; a model that only works through a custom ollama `TEMPLATE` may need a hand-written template. Only GGUF model layers are handled (vision
+projector layers are ignored). dotLLM never writes into the ollama store.
+
+## Ollama-compatible API: `/api/*` (#720)
+
+Ollama clients (Open WebUI, Continue, Enchanted, ollama-python/js, LangChain's `ChatOllama`) can point at a dotLLM server unchanged
+(`OLLAMA_HOST=http://localhost:8080`). Verified with the official `ollama` Python client against a live Vulkan server: `list`, `show`, `chat` and
+`generate` (streaming and not, including `format: "json"` constrained decoding), `ps`, `pull` with progress, `delete`, `keep_alive: 0` unload, and
+ollama's 404 error shape.
+
+| route | notes |
+|---|---|
+| `POST /api/chat`, `POST /api/generate` | NDJSON streaming by default (`stream:false` for one object); `options` (temperature, top_p, top_k, min_p, repeat_penalty, seed, num_predict, stop), `format` (`"json"` or a JSON schema), `system`, `raw`, `keep_alive` (`5m`, `30s`, seconds, `-1`, `0`); final chunk carries `done_reason`, `total_duration`, `load_duration`, `prompt_eval_*`, `eval_*`. `/api/generate` with no prompt is the "load this model" call, and `keep_alive: 0` unloads it. Metered by the rate limiter like `/v1/*` |
+| `GET /api/tags`, `GET /api/ps`, `POST /api/show`, `GET /api/version` | names are profiles, local models (stem) and ollama-store models (`name:tag`); `show` synthesises a Modelfile (`FROM`, `SYSTEM`, `PARAMETER`) from the profile; `version` reports the emulated API level (`0.6.0`) |
+| `POST /api/pull` | `owner/repo[:tag]` (Hugging Face) or an ollama name; streams `pulling manifest` / `downloading` (`completed`/`total`) / `success` |
+| `DELETE /api/delete` | removes a profile, a local model, or a model dotLLM pulled from the ollama registry (its file goes with its last profile); ollama-store models are never touched |
+| `/api/embed`, `/api/embeddings`, `/api/create`, `/api/copy`, `/api/push` | `501` with a pointer (`/v1/embeddings`, `dotllm model create` / `cp`) |
+
+`pull` and `delete` need `--allow-model-admin`, like `/v1/models/*`. Not supported inside chat: `tools`, images and thinking (use `/v1/chat/completions`;
+a request with `tools` gets a `501`). Digests in `tags`/`ps` are stable placeholders, and `details` carries format and quantisation only (no family or
+parameter size).
+
+## Device selection: `--device auto` (#722)
+
+`dotllm serve` defaults to `--device auto`: for each model it tries **CUDA** (when a GPU is present and the model file fits in 85% of its memory),
+then **Vulkan** (when a device and the shader blobs exist), then the **CPU**, and a load that fails on one device falls through to the next with a log
+line. The server keeps `auto` as its configured device, so each on-demand load chooses again for its own size; the device actually used is
+`ResolvedDevice` (what `GET /api/ps` reports as `size_vram`). Pass `cpu`, `gpu:N` or `vulkan` to force one. `dotllm stop --server` and
+`POST /v1/admin/shutdown` stop a running server gracefully (`--allow-model-admin`).
 
 ## Model Keep-Alive / Idle-Unload / Multi-Model Residency (#369)
 
@@ -172,6 +431,16 @@ When `tools` are provided in the request:
 4. **Response**: If tool calls detected, return with `finish_reason: "tool_calls"` and structured `tool_calls` array.
 5. **Continuation**: Client sends tool results as `tool` role messages. Server applies chat template again and generates final response.
 
+## Vulkan device (`--device vulkan`)
+
+`dotllm serve --device vulkan` (and `dotllm run --device vulkan`) load the model through
+`VulkanModelLoader.CreateSharedFromGguf`, the same per-architecture dispatch `bench`/`perplexity` use, on a
+process-wide Vulkan device. Requests run one at a time through `TextGenerator` with the model's own device-resident
+KV-cache: no `ForwardBatch` scheduler, no paged/quantized KV, no cross-request prefix cache yet. Before this,
+`--device vulkan` silently fell back to the CPU (the string does not start with `gpu`); `chat` now rejects it
+explicitly. Measured on Strix Halo with Tev1-4B Q4_K_M (108-token decision prompt, 1 answer token):
+~0.3 s/request on Vulkan vs ~5.7-9 s on CPU (#613).
+
 ## Prompt Caching
 
 Multi-turn conversations benefit from prompt caching — reusing KV-cache state from previous turns to skip redundant prefill.
@@ -222,7 +491,7 @@ Clears all cached KV-cache sessions. Called automatically by the Chat UI when th
 
 ## Rate Limiting
 
-Per-API-key admission controls built on `System.Threading.RateLimiting`. Off by default — when no `RateLimit` configuration is present (or `Enabled: false`) the middleware short-circuits and adds zero overhead. When configured, the middleware sits between CORS and endpoint mapping and inspects every request to `/v1/chat/completions`, `/v1/completions`, and `/v1/embeddings`.
+Per-API-key admission controls built on `System.Threading.RateLimiting`. Off by default — when no `RateLimit` configuration is present (or `Enabled: false`) the middleware short-circuits and adds zero overhead. When configured, the middleware sits between CORS and endpoint mapping and inspects every request to a metered path (see § What gets metered — everything under `/v1/` except an explicit exemption list).
 
 Code lives in `src/DotLLM.Server/RateLimiting/`:
 
@@ -295,9 +564,13 @@ The tokens-per-minute limiter charges `prompt_estimate + max_tokens` upfront so 
 HTTP/1.1 429 Too Many Requests
 Retry-After: 12
 X-RateLimit-Limiter: Tokens
+x-request-id: 0HN7...
+x-ratelimit-limit-tokens: 6000
+x-ratelimit-remaining-tokens: 0
+x-ratelimit-reset-tokens: 60
 Content-Type: application/json
 
-{"error":"Rate limit exceeded (tokens-per-minute). Retry in 12s."}
+{"type":"error","error":{"message":"Rate limit exceeded (tokens-per-minute). Retry in 12s.","type":"rate_limit_error","param":null,"code":"tokens-per-minute"}}
 ```
 
 | Header | Meaning |
@@ -305,13 +578,62 @@ Content-Type: application/json
 | `Retry-After` | Seconds until the limiter can admit. Driven by the BCL limiter metadata where available. |
 | `X-RateLimit-Limiter` | Which of the three limiters rejected (`Requests`, `Tokens`, `Concurrency`). Useful for client backoff decisions. |
 
+## SDK-facing error envelope and observability headers (#452)
+
+Every error response is `{"type": "error", "error": {"message", "type", "param", "code"}}`. The
+official OpenAI and Anthropic SDKs parse this envelope to classify a failure; the flat
+`{"error": "<string>"}` this server used to emit left `.type`, `.code` and `.param` unreachable, so
+a 429 was indistinguishable from a 400 to anything reading the body. `param` and `code` are always
+present, as explicit `null`s when unknown, matching OpenAI. The top-level `"type": "error"`
+discriminator is what Anthropic's envelope requires and is inert for OpenAI clients, so one type
+serves both surfaces. Error types in use: `invalid_request_error`, `rate_limit_error`,
+`not_found_error`, `api_error`.
+
+`ResponseHeadersMiddleware` (registered unconditionally, and *outside* the limiter so the headers
+also land on its 429 short-circuit) emits:
+
+| Header | Meaning |
+|--------|---------|
+| `x-request-id` | Correlation id. A sane inbound value is echoed; otherwise the connection's trace identifier is used. Values over 128 chars, or containing control characters, are replaced rather than reflected. |
+| `openai-processing-ms` | Wall-clock milliseconds in the pipeline. Written from `Response.OnStarting`, so it is absent on a stream that started before generation finished. |
+| `x-ratelimit-limit-requests` / `-remaining-requests` / `-reset-requests` | Requests-per-minute budget. Omitted entirely when that limiter is not configured — advertising a limit of 0 would make a well-behaved SDK back off against a server that is not limiting it. |
+| `x-ratelimit-limit-tokens` / `-remaining-tokens` / `-reset-tokens` | Tokens-per-minute budget, same omission rule. `reset` is seconds until the bucket refills to its ceiling. |
+
+The budget is partitioned with the **same `IApiKeyResolver` the limiter uses** — a host that
+registers its own (see § Authentication note) gets headers for the right bucket. The limiter
+re-stamps the `x-ratelimit-*` values after it acquires, so a success response reports the budget
+including its own request rather than the state one request ago.
+
+Inbound `OpenAI-Organization`, `OpenAI-Project`, `OpenAI-Beta` and `anthropic-beta` name concepts
+this server has no equivalent for. Nothing inspects them: they are accepted and ignored, never a
+400.
+
+The deterministic headers are written *before* the inner pipeline runs. That is deliberate — the
+SSE endpoints start the response on their first flush, and headers cannot be added after that.
+
 ### Authentication note
 
 `HeaderApiKeyResolver` exists only so rate-limit buckets can be partitioned per caller. dotLLM still has no built-in authentication — see § Security. Host applications wiring real auth (OAuth, JWT, mTLS) should register their own `IApiKeyResolver` implementation that returns the authenticated principal's stable ID. The rate-limit machinery is transport-independent and will bucket on whatever opaque string you return.
 
-### Unmetered endpoints
+### What gets metered
 
-`/health`, `/ready`, `/v1/models`, `/v1/tokenize`, `/v1/detokenize`, `/v1/lora`, `/v1/cache/clear`, `/props`, `/config`, and the chat UI are deliberately unmetered — they're either probes, control-plane operations, or static asset serving.
+**Everything under `/v1/` is metered unless it is explicitly exempt.** The exemptions are
+`/v1/models`, `/v1/lora`, `/v1/prompt-cache`, `/v1/cache`, `/v1/config`, `/v1/tokenize` and
+`/v1/detokenize` (matched on segment boundaries, so `/v1/models/{id}` is covered by
+`/v1/models`). One known inexactness: `POST /v1/prompt-cache/{id}` *does* prefill through the
+model, but is exempt because it was unmetered before the list was inverted — exempting it
+preserves behaviour rather than asserting it is free. Non-`/v1/` paths — `/health`, `/ready`, `/props`, the chat UI and its assets —
+are never metered. These are probes, control-plane operations, or static asset serving, and
+consume no inference budget.
+
+This is deliberately an **exemption list, not an allowlist**. It used to name the three paths that
+*were* metered, which meant every new generative endpoint shipped unmetered by omission with
+nothing failing when someone forgot — and the list had already drifted, naming `/v1/embeddings`
+(not yet built) while `/v1/messages` would have bypassed the limiter entirely. An unmetered path
+can never return 429, so its configured limits are simply unenforceable. Inverted, the failure mode
+is safe: forgetting to classify a new route over-meters a control-plane endpoint (visible,
+harmless) instead of silently leaving a hole in the limiter. Add a route to the exemption list only
+when it genuinely does not run the model.
 
 ## Warm-up
 
@@ -367,7 +689,7 @@ These are designed for the local Chat UI workflow and must not be internet-expos
 The server has two execution paths and picks per-request:
 
 1. **Continuous-batch scheduler path (default for paged-KV serving)**. When `--paged` is on (the default for `serve`) and no speculative-decoding draft model is loaded, `ServerStartup` constructs a `ContinuousBatchSchedulerService` per loaded model and starts its `RunLoopAsync` on a background task tied to `IHostApplicationLifetime.ApplicationStopping`. `/v1/chat/completions` and `/v1/completions` route non-streaming requests through `EnqueueAsync` — multiple concurrent requests pipeline through a single `IModel.ForwardBatch` dispatch per scheduler iteration. The startup log prints `Continuous-batch scheduler active` when this path is engaged.
-2. **Single-request gate path (fallback)**. Streaming requests, LoRA-adapter requests, logprob-capturing requests, and any backend without a paged KV-cache factory (CUDA, hybrid GPU, quantized KV) keep using the original `SemaphoreSlim(1, 1)` gate via `ServerState.ExecuteAsync`. Requests serialize FIFO. The startup log prints `Single-request mode — requests processed sequentially` when this is the only path.
+2. **Single-request gate path (fallback)**. Streaming requests, LoRA-adapter requests, logprob-capturing requests, and any backend without a paged KV-cache factory (CUDA, Vulkan, hybrid GPU, quantized KV) keep using the original `SemaphoreSlim(1, 1)` gate via `ServerState.ExecuteAsync`. Requests serialize FIFO. The startup log prints `Single-request mode — requests processed sequentially` when this is the only path.
 
 ### Scheduler tuning
 
@@ -410,3 +732,10 @@ Both `/v1/chat/completions` and `/v1/completions` validate inputs before inferen
 | `max_tokens` | &le; 0 | 400 `"max_tokens must be a positive integer"` |
 | Prompt token count | &ge; `MaxSequenceLength` | 400 `"prompt (N tokens) exceeds model context length (M)"` |
 | `prompt_tokens + max_tokens` | > `MaxSequenceLength` | `max_tokens` silently clamped to remaining context |
+
+### Vulkan continuous-batch scheduler (hybrid GDN models)
+
+Vulkan hybrid models (Qwen3.5 / Tev1, Qwen3.6) serve through the serial per-request generator by default. Pass `--expected-concurrency N`
+(N >= 5) to serve them through the continuous-batch scheduler instead: measured on Tev1-4B, aggregate decode throughput at 8 concurrent
+streams is +73% (102 vs 59 tok/s), parity at 4 or fewer and for a single stream. It is off when `--mtp` or a draft model is active, and a
+repeated identical prompt is slower than on the serial path (which has the whole-prompt cache). `DOTLLM_VK_SCHEDULER=0|1` overrides the hint.

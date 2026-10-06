@@ -102,26 +102,97 @@ public static class CudaModelLoader
                 return (nemotronH, size => nemotronH.CreateKvCache(size));
             }
 
-            // gpt-oss's MoE per-expert bias and OAI-clamped-SwiGLU activation are now
-            // implemented (issue #348) and CudaMoeFfn/CudaMoeWeightsLoader handle them
-            // correctly. However, gpt-oss ALSO requires per-head attention sinks (a learned
-            // scalar per head joining the softmax denominator) and an alternating
-            // sliding-window/dense attention pattern (window on even layers, dense on odd) —
-            // neither exists anywhere in src/DotLLM.Cuda/ or native/kernels/. CUDA attention
-            // would silently run standard GQA with a uniform window, producing wrong output
-            // rather than failing. Fail loudly until both are implemented.
-            case Architecture.GptOss:
-                throw new NotSupportedException(
-                    "CUDA implements GptOss's MoE bias/activation (#348) but not its per-head "
-                    + "attention sinks or its alternating sliding-window/dense attention "
-                    + "pattern — loading would silently produce wrong output rather than fail. "
-                    + "Use the CPU backend for gpt-oss checkpoints.");
+            // gpt-oss (llama.cpp LLM_ARCH_OPENAI_MOE) routes to the plain
+            // CudaTransformerModel via `default` — it is Llama-shaped (GQA attention +
+            // routed-MoE FFN, standard blk.N tensor naming), differing only in three
+            // features that are now all implemented on CUDA rather than in model
+            // structure, so it needs no dedicated model class. This mirrors the CPU
+            // side, where ModelLoader.CreateCpuModelFromGguf's `_` arm sends GptOss to
+            // the plain TransformerModel. The three deltas and where each landed:
+            //   • Per-expert MoE bias + clamped `swiglu_oai` activation — issue #348
+            //     (CudaMoeWeightsLoader.LoadLayerQuant uploads the biases,
+            //     CudaMoeFfn.Forward runs LaunchSwiGLUOaiF32).
+            //   • Alternating sliding-window/dense attention (window on even layers,
+            //     dense on odd; SlidingWindowPattern=2) — issue #366
+            //     (CudaSlidingWindowResolver, plumbed into every per-layer attention
+            //     dispatch), plus that issue's dense-YaRN RoPE mscale fix, which
+            //     gpt-oss's factor=32 scaling depends on.
+            //   • Per-head attention sinks — issue #365 (attn_sinks.weight uploaded in
+            //     CudaWeights as TransformerLayerWeights.AttnSinksDevice, consumed by
+            //     the sink epilogue in the attention_f32 and attention_f16 kernels).
+            // Composition of all three is gated by CudaGptOssParitySyntheticTests, which
+            // runs a synthetic four-feature gpt-oss GGUF through both this dispatch and
+            // the CPU oracle and compares last-token logits.
 
             default:
             {
                 var model = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId, ptxDir);
                 return (model, size => model.CreateKvCache(size));
             }
+        }
+    }
+
+    /// <summary>
+    /// THE per-architecture dispatch for a <c>--gpu-layers N</c> request (#729): CPU, all-GPU, or a
+    /// partial split, chosen by <see cref="GpuOffloadPlanner"/>. Architectures that cannot split
+    /// (Nemotron-H, Qwen3MoeHybrid, Mamba-3) never reach <see cref="HybridTransformerModel"/>, which
+    /// only understands dense Llama-style tensor naming; they are loaded all-on-GPU, or the call throws an actionable
+    /// <see cref="InvalidOperationException"/> (never a silent CPU fallback), and <paramref name="warn"/> is told why.
+    /// </summary>
+    /// <param name="gguf">An opened GGUF file; must outlive the model.</param>
+    /// <param name="config">Model configuration extracted from <paramref name="gguf"/>.</param>
+    /// <param name="requestedGpuLayers">Requested GPU layer count (clamped to [0, NumLayers]).</param>
+    /// <param name="deviceId">GPU device ordinal.</param>
+    /// <param name="threading">CPU threading for the CPU layers (and the explicit CPU request).</param>
+    /// <param name="warn">Receives user-facing warnings. May be <see langword="null"/>.</param>
+    /// <returns>The model and, for GPU-resident models, the KV-cache factory it needs
+    /// (<see langword="null"/> for the CPU model).</returns>
+    public static (IModel Model, Func<int, IKvCache>? KvCacheFactory) CreateForGpuLayers(
+        GgufFile gguf, ModelConfig config, int requestedGpuLayers, int deviceId,
+        ThreadingConfig threading, Action<string>? warn = null)
+    {
+        ArgumentNullException.ThrowIfNull(gguf);
+        ArgumentNullException.ThrowIfNull(config);
+
+        var plan = GpuOffloadPlanner.Plan(config.Architecture, requestedGpuLayers, config.NumLayers);
+        if (plan.Warning is not null) warn?.Invoke(plan.Warning);
+
+        switch (plan.Mode)
+        {
+            case GpuOffloadMode.Cpu:
+                return (ModelLoader.CreateCpuModelFromGguf(gguf, config, threading), null);
+
+            case GpuOffloadMode.FullGpu:
+                return CreateFromGguf(gguf, config, deviceId);
+
+            case GpuOffloadMode.Partial:
+                if (config.Architecture == Architecture.Qwen3HybridDense)
+                {
+                    // Issue #291: architecture-aware GPU-head/CPU-tail split (GDN layers have no attn_output).
+                    var q = Architectures.HybridQwen3HybridDenseTransformerModel.LoadFromGguf(
+                        gguf, config, plan.GpuLayers, deviceId, threading);
+                    return (q, size => q.CreateKvCache(size));
+                }
+                else
+                {
+                    var h = HybridTransformerModel.LoadFromGguf(gguf, config, plan.GpuLayers, deviceId, threading);
+                    return (h, size => h.CreateKvCache(size));
+                }
+
+            default: // FullGpuOrFail
+                try
+                {
+                    return CreateFromGguf(gguf, config, deviceId);
+                }
+                catch (Exception ex)
+                {
+                    // Policy (#729/#733): never run on the CPU behind the user's back when they asked for a GPU.
+                    long? total = null;
+                    try { total = CudaDevice.GetDevice(deviceId).TotalMemoryBytes; } catch { /* no CUDA device */ }
+                    throw new InvalidOperationException(
+                        GpuOffloadPlanner.BuildUnsatisfiableMessage(config.Architecture, requestedGpuLayers, config.NumLayers,
+                            gguf.DataSectionLength, total, gpuFreeBytes: null, ex.Message), ex);
+                }
         }
     }
 

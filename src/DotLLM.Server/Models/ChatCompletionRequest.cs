@@ -26,6 +26,66 @@ public sealed record ChatCompletionRequest
     [JsonPropertyName("stream")]
     public bool Stream { get; init; }
 
+    /// <summary>
+    /// Streaming options (#450). Today only <c>include_usage</c> is meaningful: it asks for a
+    /// final usage-only chunk, which SDKs rely on for token accounting over a stream.
+    /// </summary>
+    [JsonPropertyName("stream_options")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public StreamOptionsDto? StreamOptions { get; init; }
+
+    /// <summary>
+    /// True when this request asked for the final <c>choices: []</c> usage chunk.
+    /// </summary>
+    [JsonIgnore]
+    public bool WantsUsageChunk => StreamOptions?.IncludeUsage == true;
+
+    /// <summary>
+    /// When <c>false</c>, the assistant may emit at most one tool call per turn (#450). Null =
+    /// OpenAI's default, i.e. parallel calls are allowed. The model is not constrained during
+    /// decode, so this is enforced on the response.
+    /// </summary>
+    [JsonPropertyName("parallel_tool_calls")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? ParallelToolCalls { get; init; }
+
+    /// <summary>
+    /// End-user identifier for abuse tracking. Accepted and ignored — this server has no
+    /// per-end-user concept, and a client that always sends it must not get a 400 (#450).
+    /// </summary>
+    [JsonPropertyName("user")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? User { get; init; }
+
+    /// <summary>
+    /// Whether to persist the completion for OpenAI's dashboard. Accepted and ignored — nothing
+    /// is stored server-side here (#450).
+    /// </summary>
+    [JsonPropertyName("store")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Store { get; init; }
+
+    /// <summary>
+    /// Latency tier hint. Accepted and ignored — there is one tier (#450).
+    /// </summary>
+    [JsonPropertyName("service_tier")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ServiceTier { get; init; }
+
+    /// <summary>
+    /// Reasoning-budget hint for o-series models. Accepted and ignored (#450).
+    /// </summary>
+    [JsonPropertyName("reasoning_effort")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReasoningEffort { get; init; }
+
+    /// <summary>
+    /// Opaque client key/value tags. Accepted and ignored (#450).
+    /// </summary>
+    [JsonPropertyName("metadata")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? Metadata { get; init; }
+
     [JsonPropertyName("stop")]
     public JsonElement? Stop { get; init; }
 
@@ -95,8 +155,19 @@ public sealed record ChatCompletionRequest
     [JsonPropertyName("top_logprobs")]
     public int? TopLogprobs { get; init; }
 
+    /// <summary>
+    /// Number of choices to generate. Nullable rather than <c>= 1</c>: source-generated
+    /// deserialization drops an initializer on a type with a <c>required</c> member (#462), so
+    /// the old form arrived as <b>0</b>. Resolve the default through <see cref="ChoiceCount"/>,
+    /// never by reading <c>N</c> directly.
+    /// </summary>
+    /// <remarks><c>n</c> is currently accepted and ignored — see #460.</remarks>
     [JsonPropertyName("n")]
-    public int N { get; init; } = 1;
+    public int? N { get; init; }
+
+    /// <summary>The effective number of choices: <see cref="N"/> when given, else 1.</summary>
+    [JsonIgnore]
+    public int ChoiceCount => N ?? 1;
 
     /// <summary>
     /// Optional LoRA adapter name (must already be registered with the server's
@@ -136,6 +207,19 @@ public sealed record ChatCompletionRequest
     [JsonPropertyName("keep_alive")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public double? KeepAlive { get; init; }
+}
+
+/// <summary>
+/// OpenAI <c>stream_options</c> (#450). Shared by the chat and raw-completion requests.
+/// </summary>
+public sealed record StreamOptionsDto
+{
+    /// <summary>
+    /// When true, the stream emits one extra chunk before <c>[DONE]</c> carrying <c>usage</c>
+    /// and an empty <c>choices</c> array. SDKs use it to report token counts for a stream.
+    /// </summary>
+    [JsonPropertyName("include_usage")]
+    public bool IncludeUsage { get; init; }
 }
 
 /// <summary>
@@ -186,8 +270,14 @@ public sealed record ChatMessageDto
 /// </summary>
 public sealed record ToolDefinitionDto
 {
+    /// <summary>
+    /// Constant discriminator. Read-only on purpose: an initialized settable property is
+    /// silently dropped by source-generated deserialization on a type with a <c>required</c>
+    /// member (#462), which made this arrive as <c>null</c> instead of <c>"function"</c>.
+    /// Nothing may set it, so nothing can lose it.
+    /// </summary>
     [JsonPropertyName("type")]
-    public string Type { get; init; } = "function";
+    public string Type => "function";
 
     [JsonPropertyName("function")]
     public required ToolFunctionDto Function { get; init; }
@@ -216,8 +306,9 @@ public sealed record ToolCallDto
     [JsonPropertyName("id")]
     public required string Id { get; init; }
 
+    /// <inheritdoc cref="ToolDefinitionDto.Type"/>
     [JsonPropertyName("type")]
-    public string Type { get; init; } = "function";
+    public string Type => "function";
 
     [JsonPropertyName("function")]
     public required ToolCallFunctionDto Function { get; init; }

@@ -22,12 +22,16 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <c>kvSplit==1</c> the kernel is expected to be BIT-EXACT per query head vs
 /// <see cref="CudaKernels.LaunchAttentionF32"/> -- the GQA regrid changes which block computes
 /// which head, never the order of floating-point operations within any one head's accumulation,
-/// and the kv_split==1 combine path explicitly skips the reassociating <c>fast_exp_neg</c>
-/// reweighting since there is nothing to combine. At <c>kvSplit&gt;1</c> the kernel inherits
+/// and the kv_split==1 combine path explicitly skips the reassociating exponential reweighting
+/// since there is nothing to combine (the kernel's own comment: "skip expf(0) entirely").
+/// That exponential was the Schraudolph <c>fast_exp_neg</c> when this was written; #501
+/// replaced it with precise <c>expf</c> throughout <c>attention_f32.cu</c>, which changes the
+/// name but not this expectation. At <c>kvSplit&gt;1</c> the kernel inherits
 /// EXACTLY <see cref="CudaAttentionF32SplitKvTests"/>'s already-characterized reassociation
 /// tolerance (same combine formula, same partial-buffer layout) -- no new tolerance category.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaAttentionF32GqaSplitTests
 {
     private readonly ITestOutputHelper _out;

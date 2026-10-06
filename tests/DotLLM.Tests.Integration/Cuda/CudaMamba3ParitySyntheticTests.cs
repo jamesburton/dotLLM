@@ -46,6 +46,7 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class CudaMamba3ParitySyntheticTests : IDisposable
 {
     private const int HiddenSize = 8;

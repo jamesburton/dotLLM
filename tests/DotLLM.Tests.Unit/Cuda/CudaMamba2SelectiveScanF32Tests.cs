@@ -19,6 +19,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <see cref="CudaGdnScanStepF32Tests"/>'s CUDA device-buffer idiom.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaMamba2SelectiveScanF32Tests
 {
     private const float AbsTol = 1e-3f;

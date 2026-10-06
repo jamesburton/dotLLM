@@ -59,21 +59,29 @@ public sealed class VulkanMamba3TransformerModelQ8_0ForwardTests : IDisposable
     // contract along hidden); DInner = NumHeads * HeadDim must also be a multiple of 32
     // (out_proj contracts along d_inner). The F32 fixture (HiddenSize=8, DInner=16) is
     // too small — bump to 32 / 32 here. Other dims are unconstrained.
+    //
+    // Issue #385: found during the MIMO synthetic-fixture widening audit — this class's
+    // MIMO case (Forward_Q8_0_Prefill_SingleLayer_Mimo_MatchesCpuReference) had the same
+    // degenerate HeadDim==StateSize (8==8) collision as the fixtures issue #385 names.
+    // Widened NumHeads/HeadDim/StateSize/MimoRank to be pairwise distinct while keeping
+    // HiddenSize/DInner fixed at 32 (the Q8_0 block-size-32 constraint above; this file's
+    // own comment already notes "other dims are unconstrained").
     private const int HiddenSize = 32;
     private const int VocabSize = 16;
-    private const int NumHeads = 4;
-    private const int HeadDim = 8;             // d_inner = 32
-    private const int Expand = 2;
-    private const int StateSize = 8;
+    private const int NumHeads = 2;
+    private const int HeadDim = 16;            // d_inner = 32
+    private const int Expand = 1;              // expand*hidden(32) == d_inner(32)
+    private const int StateSize = 10;
     private const int DInner = NumHeads * HeadDim;
     private const int NumBcHeads = 1;          // SISO; G = 1
     private const int BcDim = StateSize * NumBcHeads;
-    // num_rope_angles = (state_size * rope_fraction) / 2 with rope_fraction=0.5 → 2.
+    // num_rope_angles = int(state_size * rope_fraction) / 2 with rope_fraction=0.5,
+    // state_size=10 → int(5)/2 = 2. Guard: 2*2=4 <= StateSize=10.
     private const int NumRopeAngles = 2;
     private const int DInProj = 2 * DInner + 2 * BcDim + 3 * NumHeads + NumRopeAngles;
 
     // MIMO fixture dimensions — same model dims as SISO but with rank > 1 B/C expansion.
-    private const int MimoRank = 2;
+    private const int MimoRank = 3;
     private const int MimoBcDim = StateSize * NumBcHeads * MimoRank;
     private const int MimoDInProj = 2 * DInner + 2 * MimoBcDim + 3 * NumHeads + NumRopeAngles;
 

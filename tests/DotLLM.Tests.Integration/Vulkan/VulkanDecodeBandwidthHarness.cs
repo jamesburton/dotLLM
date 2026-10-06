@@ -29,6 +29,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 ///   DOTLLM_VULKAN_WARMUP=8               — warm-up decode steps (reported separately)
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class VulkanDecodeBandwidthHarness
 {
     private const ulong Seed = 0xC0FFEE_4B2CUL;

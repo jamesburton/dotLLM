@@ -33,9 +33,9 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>Compute device.</summary>
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1'.")]
-        [DefaultValue("cpu")]
-        public string Device { get; set; } = "cpu";
+        [Description("Compute device: 'auto' (default: CUDA if the model fits, else Vulkan, else CPU - a failed GPU load falls back), 'cpu', 'gpu', 'gpu:0', 'gpu:1' (CUDA), or 'vulkan'.")]
+        [DefaultValue("auto")]
+        public string Device { get; set; } = "auto";
 
         /// <summary>Number of GPU layers for hybrid offloading.</summary>
         [CommandOption("--gpu-layers")]
@@ -120,9 +120,9 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>Number of draft candidates per speculative step.</summary>
         [CommandOption("--speculative-k|--draft-tokens")]
-        [Description("Number of draft tokens per speculative step (K). Default 5. Also used as K for --mtp.")]
-        [DefaultValue(5)]
-        public int SpeculativeK { get; set; } = 5;
+        [Description("Number of draft tokens per speculative step (K). Default 3. Also used as K for --mtp.")]
+        [DefaultValue(DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates)]
+        public int SpeculativeK { get; set; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
 
         /// <summary>Opt-in to MTP self-speculative decoding when the loaded GGUF carries an MTP head.</summary>
         [CommandOption("--mtp")]
@@ -133,6 +133,36 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
                      "concurrent server traffic to make silently.")]
         [DefaultValue(false)]
         public bool Mtp { get; set; }
+
+        /// <summary>Expected number of concurrent decode streams; 5 or more enables the Vulkan continuous-batch scheduler.</summary>
+        [CommandOption("--expected-concurrency")]
+        [Description("Expected number of concurrently decoding requests. At 5 or more, Vulkan hybrid models serve through the continuous-batch " +
+                     "scheduler (measured +73% aggregate decode throughput at 8 concurrent on Tev1-4B; parity at 4 or fewer, off with --mtp). " +
+                     "0 (default) keeps the serial per-request path. DOTLLM_VK_SCHEDULER=0|1 overrides.")]
+        [DefaultValue(0)]
+        public int ExpectedConcurrency { get; set; }
+
+        /// <summary>Download a missing Hugging Face model when a request or load names one.</summary>
+        [CommandOption("--auto-pull")]
+        [Description("Download a missing Hugging Face model when a request names one (e.g. model \"owner/repo:Q4_K_M\"), like 'ollama run' does. " +
+                     "Off by default: remote clients should not be able to start multi-gigabyte downloads.")]
+        [DefaultValue(false)]
+        public bool AutoPull { get; set; }
+
+        /// <summary>Logit temperature for POST /v1/systemone probabilities.</summary>
+        [CommandOption("--decision-temperature")]
+        [Description("Logit temperature for POST /v1/systemone probabilities (softmax(logits / T)). 0 or 1 (default) = the model's raw restricted softmax. " +
+                     "Tev1-4B is slightly under-confident: T=0.58 cut held-out NLL 0.0546 -> 0.0428 on a 480-item labelled set (scripts/decision-calibration.py); " +
+                     "fit your own on your task before relying on it.")]
+        [DefaultValue(0.0)]
+        public double DecisionTemperature { get; set; }
+
+        /// <summary>Option orderings averaged per noul/choice question on POST /v1/systemone.</summary>
+        [CommandOption("--decision-orderings")]
+        [Description("Option orderings averaged per noul/choice question on POST /v1/systemone: 1 (default) or 2 (forward + reversed, logits averaged; " +
+                     "reversal flipped 2.2% of Tev1-4B choice answers and averaging lifted choice accuracy 98.2 -> 98.9%, at twice the forward passes).")]
+        [DefaultValue(1)]
+        public int DecisionOrderings { get; set; }
 
         /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
         [CommandOption("--prefill-chunk-size|--ubatch-size")]
@@ -185,6 +215,63 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [Description("Total byte budget across all resident models. 0 (default) = unlimited, only --max-resident-models bounds residency.")]
         [DefaultValue(0L)]
         public long ResidentMemoryBudgetBytes { get; set; }
+
+        /// <summary>Enables the #454 model-administration write endpoints (off by default).</summary>
+        [CommandOption("--allow-model-admin")]
+        [Description("Enable the model-administration API (#454): POST /v1/models/unload, /pull, /enable, /disable and PUT /v1/settings. Off by default.")]
+        public bool AllowModelAdmin { get; set; }
+
+        /// <summary>Enables the LoRA admin write endpoints (off by default).</summary>
+        [CommandOption("--allow-lora-admin")]
+        [Description("Enable the LoRA admin API: POST /v1/lora/load and DELETE /v1/lora/{name}. Off by default.")]
+        public bool AllowLoraAdmin { get; set; }
+
+        /// <summary>
+        /// Per-API-key request cap (#457). 0 = no per-request cap. Any of the three rate-limit
+        /// options being set turns the limiter on; it is off by default.
+        /// </summary>
+        [CommandOption("--rate-limit-rpm")]
+        [Description("Rate limit: max requests per minute per API key. 0 = unlimited. Setting any --rate-limit-* option enables rate limiting (off by default).")]
+        public int RateLimitRequestsPerMinute { get; set; }
+
+        /// <summary>Per-API-key token cap (#457). 0 = no per-token cap.</summary>
+        [CommandOption("--rate-limit-tpm")]
+        [Description("Rate limit: max tokens per minute per API key (prompt + completion). 0 = unlimited.")]
+        public int RateLimitTokensPerMinute { get; set; }
+
+        /// <summary>Per-API-key concurrency cap (#457). 0 = no concurrency cap.</summary>
+        [CommandOption("--rate-limit-concurrency")]
+        [Description("Rate limit: max concurrent in-flight requests per API key. 0 = unlimited.")]
+        public int RateLimitConcurrency { get; set; }
+    }
+
+    /// <summary>
+    /// Builds the rate-limit config from the CLI options (#457), or <see langword="null"/> when
+    /// no cap was requested.
+    /// </summary>
+    /// <remarks>
+    /// Returning null (rather than a disabled config) keeps <c>RateLimitMiddleware</c> on its
+    /// pass-through path, so an unconfigured server pays nothing.
+    /// </remarks>
+    private static DotLLM.Server.RateLimiting.RateLimitConfig? BuildRateLimit(Settings settings)
+    {
+        if (settings.RateLimitRequestsPerMinute <= 0
+            && settings.RateLimitTokensPerMinute <= 0
+            && settings.RateLimitConcurrency <= 0)
+        {
+            return null;
+        }
+
+        return new DotLLM.Server.RateLimiting.RateLimitConfig
+        {
+            Enabled = true,
+            DefaultPolicy = new DotLLM.Server.RateLimiting.RateLimitPolicy
+            {
+                RequestsPerMinute = settings.RateLimitRequestsPerMinute,
+                TokensPerMinute = settings.RateLimitTokensPerMinute,
+                MaxConcurrent = settings.RateLimitConcurrency,
+            },
+        };
     }
 
     /// <inheritdoc/>
@@ -193,6 +280,10 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         var serverOptions = new ServerOptions
         {
             Model = settings.Model ?? "",
+            ExpectedConcurrency = settings.ExpectedConcurrency,
+            AutoPull = settings.AutoPull,
+            DecisionTemperature = settings.DecisionTemperature,
+            DecisionOrderings = Math.Clamp(settings.DecisionOrderings, 1, 2),
             Quant = settings.Quant,
             Device = settings.Device,
             GpuLayers = settings.GpuLayers,
@@ -217,6 +308,13 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             KeepAliveSeconds = settings.KeepAlive,
             MaxResidentModels = settings.MaxResidentModels,
             ResidentMemoryBudgetBytes = settings.ResidentMemoryBudgetBytes,
+            AllowModelAdminApi = settings.AllowModelAdmin,
+            AllowLoraAdminApi = settings.AllowLoraAdmin,
+            // #457: nothing in src/ ever assigned RateLimit, so the entire RateLimiting
+            // subsystem was unreachable — no invocation of `dotllm serve` could produce a 429,
+            // and the limiter was exercised only by unit tests constructing the config directly.
+            // Off unless a cap is given, so the default behaviour is unchanged.
+            RateLimit = BuildRateLimit(settings),
             ModelId = "none",
             RopeOverride = ServerOptions.BuildRopeOverride(settings.RopeScaling, settings.RopeFreqBase,
                 settings.RopeScale, settings.YarnOrigCtx, settings.YarnAttnFactor,
@@ -228,7 +326,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         if (!string.IsNullOrEmpty(settings.Model))
         {
             // Resolve and load model
-            var resolvedPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
+            var resolvedPath = GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
             if (resolvedPath is null)
                 return 1;
 

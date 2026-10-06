@@ -14,10 +14,16 @@
 // Block layout (matches DotLLM.Cpu.Kernels.DequantizeKQuants.DequantizeQ2_K):
 //   Each row holds (K / 256) Q2_K super-blocks of 84 bytes each:
 //       bytes [ 0.. 15] = scales[16] — sub_lo nibble = scale, sub_hi = dmCoef
-//       bytes [16.. 79] = qs[64]     — 256 × 2-bit values, 4 per byte
+//       bytes [16.. 79] = qs[64]     — 256 × 2-bit values, 4 per byte, TRANSPOSED:
+//                                      element t is at byte 32*(t>>7) + (t&31),
+//                                      shift 2*((t>>5)&3) (issue #498 — this was
+//                                      previously decoded as qs[t/4] >> ((t%4)*2),
+//                                      i.e. four consecutive elements per byte).
+//                                      Authority: ggml-quants.c dequantize_row_q2_K.
 //       bytes [80, 81]  = fp16 d
 //       bytes [82, 83]  = fp16 dmin
 //   Row stride = (K / 256) * 84 bytes.
+//   Scale (sub-block) indexing t>>4 is NOT transposed and is unchanged.
 //
 // Tiling:
 //   Output tile  = 16 rows of C (TILE_N) × 16 cols of C (TILE_M) = 256 cells.
@@ -116,10 +122,11 @@ void main() {
                 float sc = d * float(scByte & 0xFu);
                 float mn = dmin * float((scByte >> 4u) & 0xFu);
 
-                // Element index within the super-block:
+                // Element index within the super-block, transposed 2-bit fetch (#498):
                 uint elem   = subIdx * SUBBLOCK + col; // 0..255
-                uint qByte  = readByte(blockByteBase + 16u + (elem >> 2u));
-                uint bitOff = (elem & 3u) << 1u;
+                uint qByte  = readByte(blockByteBase + 16u
+                                       + 32u * (elem >> 7u) + (elem & 31u));
+                uint bitOff = ((elem >> 5u) & 3u) << 1u;
                 uint q2     = (qByte >> bitOff) & 0x3u;
                 w = sc * float(q2) - mn;
             }

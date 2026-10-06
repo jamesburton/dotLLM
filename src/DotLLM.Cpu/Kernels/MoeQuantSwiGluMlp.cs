@@ -240,6 +240,23 @@ public static unsafe class MoeQuantSwiGluMlp
             case QuantizationType.Q8_0:
                 MatMul.GemvQ8_0((byte*)weights, x, y, m, k, pool);
                 break;
+            case QuantizationType.Q2_K:
+                MatMul.GemvQ2_K((byte*)weights, x, y, m, k, pool);
+                break;
+            case QuantizationType.Q3_K:
+                MatMul.GemvQ3_K((byte*)weights, x, y, m, k, pool);
+                break;
+            case QuantizationType.IQ4_XS:
+                MatMul.GemvIQ4_XS((byte*)weights, x, y, m, k, pool);
+                break;
+            case QuantizationType.IQ2_XXS:
+            case QuantizationType.IQ2_XS:
+            case QuantizationType.IQ2_S:
+            case QuantizationType.IQ3_XXS:
+            case QuantizationType.IQ3_S:
+            case QuantizationType.IQ1_S:
+                MatMul.GemvIQCodebook(qt, (byte*)weights, x, y, m, k, pool);
+                break;
             case QuantizationType.Q4_K:
                 MatMul.GemvQ4_K((byte*)weights, x, y, m, k, pool);
                 break;
@@ -254,6 +271,13 @@ public static unsafe class MoeQuantSwiGluMlp
                 break;
             case QuantizationType.F16:
                 MatMul.GemvF16(weights, x, y, m, k, pool);
+                break;
+            case QuantizationType.Q4_0:
+            case QuantizationType.Q4_1:
+            case QuantizationType.Q5_1:
+            case QuantizationType.IQ4_NL:
+                // Packed × Q8_1 dot instead of dequantize-to-F32 (#489).
+                MatMul.GemvLegacyQuant((byte*)weights, qt, x, y, m, k, pool);
                 break;
             default:
                 GemvDequantRows(weights, qt, x, y, m, k, pool);

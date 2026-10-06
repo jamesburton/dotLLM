@@ -52,6 +52,13 @@ internal static unsafe class CudaMoeWeightsLoader
         nint router = UploadF32Array(moe.Gate, allocs);
 
         // Per-routed-expert projections.
+        // #427 (cross-backend): this path is F32-only — it reads W1/W2/W3 as host matrices.
+        // A quant-expert loader leaves them null, which would upload zero pointers and
+        // silently corrupt the forward pass rather than failing.
+        MoeLayerWeights.ValidateF32ExpertSource(moe.W1, numExperts, "ffn_gate_exps.weight");
+        MoeLayerWeights.ValidateF32ExpertSource(moe.W3, numExperts, "ffn_up_exps.weight");
+        MoeLayerWeights.ValidateF32ExpertSource(moe.W2, numExperts, "ffn_down_exps.weight");
+
         var gateProj = new nint[numExperts];
         var upProj = new nint[numExperts];
         var downProj = new nint[numExperts];

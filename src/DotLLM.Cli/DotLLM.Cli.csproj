@@ -4,6 +4,9 @@
     <OutputType>Exe</OutputType>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>dotllm</ToolCommandName>
+    <!-- The fork cannot publish under the upstream-owned DotLLM.Cli id. The release workflow passes the repo variable
+         DOTLLM_TOOL_PACKAGE_ID here; unset keeps the default id. The command stays `dotllm` whatever the package is called. See docs/PACKAGING.md. -->
+    <PackageId Condition="'$(DotLlmToolPackageId)' != ''">$(DotLlmToolPackageId)</PackageId>
     <Description>Command-line tool for dotLLM — run, chat, serve, and manage GGUF models. Install with: dotnet tool install -g DotLLM.Cli</Description>
     <PackageTags>llm;inference;cli;dotnet-tool;llama;mistral;phi;qwen;gguf;cuda</PackageTags>
   </PropertyGroup>

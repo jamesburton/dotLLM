@@ -124,6 +124,38 @@ checkpoint/restore/re-batch cycles back-to-back leaves a benign float32-ULP-scal
 addition is not associative across differently-shaped batched re-computation), four orders of
 magnitude below what either real bug produced.
 
+### Per-row recurrent snapshots (issue #473)
+
+Checkpoint + replay costs a second trunk forward on every partially rejected round, plus a full
+state copy before every verify. A model that reports `SupportsRecurrentRowSnapshots` instead offers
+`ForwardWithRecurrentSnapshots` (a normal forward that also records the recurrent state after each
+row `0..S-2`; the state after the last row is the live state) and `RestoreRecurrentStateToRow(n)`.
+This is llama.cpp's `n_rs_seq` snapshot ring. `MtpSpeculativeDecoder` uses it when available: it
+verifies `[lastToken, d1..dK]` through the snapshot forward, skips the checkpoint, and on a
+rejection at `accepted` restores row `accepted`. There is no replay. Both the GDN matrix state and
+the conv1d window are captured, the latter as `ConvInput` rows `t+1 .. t+dConv-1`.
+
+- **Implemented:** CPU `Qwen3HybridDenseTransformerModel` (`GatedDeltaNetScan.Execute` copies
+  the state out after each row) and `VulkanQwen3HybridDenseTransformerModel` (the
+  `gdn_scan_multi_token_lds_fused_snap_f32` twin of the shipping scan writes each row's state from
+  LDS), and since #478 `CudaQwen3HybridDenseTransformerModel` (no new kernel: the CUDA scan is
+  already one launch per token, so each row's state is a D2D copy right after its launch; the
+  scratch is laid out `[row][layer]` so a restore is two copies). The CUDA checkpoint is pooled
+  (one spare) like the CPU and Vulkan ones (#469).
+- **Opt-out:** `DOTLLM_MTP_GDN_SNAPSHOTS=0`, or `MtpSpeculativeDecoder.UseRecurrentRowSnapshots`
+  in-process. `Replays` and `ReplaysAvoided` count each path.
+- **Memory:** `K x GDN layers x (NVHead*DState^2 + conv)` floats, grown to the largest K seen and
+  kept. That is about 150 MiB per row on Bonsai 2 27B (449 MiB at K=3).
+- **Numerics:** a snapshot comes from inside the K+1-row batch, and a replay is a shorter batch, so
+  the two differ at ULP scale (CPU GEMM tiles by n, Vulkan picks its matmul pipeline by width).
+  Greedy output is identical. `MtpSpeculativeDecoderGdnStateTests`' byte-exact serial comparison
+  is pinned to the replay path for that reason, and `MtpRecurrentRowSnapshotTests` compares the
+  two paths within tolerance.
+- **Measured (Bonsai 2 27B, Vulkan, gfx1151, same-session order-reversed A/B):** vs plain decode,
+  K=2 runs at 1.168x with snapshots and 1.013x with replay; K=3 runs at 1.117x and 0.930x. Round
+  time falls from 180 to 156 ms at K=2 and from 232 to 193 ms at K=3. The snapshot writes add about
+  4 ms to each verify.
+
 ## Constraint Interaction
 
 When constrained decoding is active:
@@ -173,7 +205,7 @@ dotllm run qwen3.6-27b-mtp.gguf -p "Hello"
 dotllm run qwen3.6-27b-mtp.gguf --no-mtp -p "Hello"
 
 # Serve: MTP is opt-in (default off) — takes the continuous-batch scheduler offline when enabled
-dotllm serve qwen3.6-27b-mtp.gguf --mtp --speculative-k 5
+dotllm serve qwen3.6-27b-mtp.gguf --mtp
 ```
 
 `--draft-model` and `--draft-tokens` are accepted as aliases of `--speculative-model` and
@@ -303,6 +335,11 @@ contents) but costs one extra single-token trunk forward per round versus a maxi
 implementation that reuses the catchup call's own logits as the verify batch's row-0 comparison
 basis — documented here as a known, correctness-first simplification.
 
+> Superseded by #469: there is no catchup forward. One verify forward runs over
+> `[lastToken, d1..dK]` with the reference pairing `(h_{p-1}, x_p)`, so the MTP decoder now
+> behaves like `SpeculativeDecoder` in the rollback asymmetry described under
+> "Recurrent (GDN) Trunk State Rollback": `lastToken` is row 0 of the verify batch.
+
 ### MTP head's own KV-cache lifetime — a second documented simplification
 
 llama.cpp's MTP draft context keeps a KV-cache that persists across speculation rounds with
@@ -311,6 +348,23 @@ at the start of every round instead: each round's first draft step re-seeds enti
 target model's own just-verified hidden state, so the MTP head only ever needs causal
 self-attention over the *current* round's own K draft steps, never across rounds. Simpler to
 reason about for a first CPU implementation; does not affect correctness.
+
+> Superseded by #469: the head's KV-cache is now persistent and position-indexed, and every trunk
+> `Forward` of an MTP sequence (prefill and verify) *absorbs* its tokens into it — see below.
+
+### Absorbing trunk batches into the head (#469, #472)
+
+Slot `p` of the head's KV-cache holds the pair `(h_{p-1}, x_p)`: token `i` of a trunk batch pairs
+with the carried row for `i == 0` and captured row `i - 1` otherwise. An absorbed step's output
+hidden is never used (the next draft seeds from a trunk row), so the absorb only needs the K/V
+rows. Since #472 every backend absorbs a contiguous batch in ONE KV-only pass — embed,
+`enorm`/`hnorm`, `eh_proj`, `attn_norm`, K/V projections (n = S), K-norm, RoPE, one slab write — and
+skips attention, the O-projection and the FFN entirely. `DOTLLM_MTP_ABSORB_PER_TOKEN=1` restores the
+per-token loop. CUDA (#478) batches the per-row kernels but keeps the three projections as S
+single-row GEMVs: its `Gemm` routes n > 1 through dequant-to-F16 + HGEMM, which would change the
+head's K/V bits on quantized weights, so the CUDA batched absorb stays bit-identical to its
+per-token loop (one stream sync per 64-row chunk instead of one per token). Bonsai 2 27B, Vulkan: S=3 (a K=2 verify) 12.9 → 1.7 ms; S=256
+prefill 1171 → 5 ms. CPU: S=3 178 → 15 ms.
 
 ### Correctness (demonstrated, not asserted)
 

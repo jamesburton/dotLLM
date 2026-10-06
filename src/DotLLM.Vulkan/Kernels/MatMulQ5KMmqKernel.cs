@@ -38,6 +38,9 @@ public sealed class MatMulQ5KMmqKernel : IDisposable
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
+    /// <summary>Test-visible pipeline handle for VK_AMD_shader_info diagnostics (#545).</summary>
+    internal nint PipelineHandle => _pipeline.Pipeline;
+
     private bool _disposed;
 
     private MatMulQ5KMmqKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
@@ -56,11 +59,19 @@ public sealed class MatMulQ5KMmqKernel : IDisposable
     /// <see cref="MatMulQ5KGemmF32Kernel"/>.
     /// </summary>
     public static MatMulQ5KMmqKernel? TryCreate(VulkanDevice device, string spvDir)
+        => TryCreate(device, spvDir, "matmul_q5_k_mmq");
+
+    /// <summary>
+    /// Issue #545 measurement hook: loads <c>{shaderBaseName}.spv</c> instead of the
+    /// production module, so a bench can hold the shipping kernel and a baseline open
+    /// in ONE process and A/B them same-session. Production callers never pass this.
+    /// </summary>
+    internal static MatMulQ5KMmqKernel? TryCreate(VulkanDevice device, string spvDir, string shaderBaseName)
     {
         if (!device.HasIntegerDotProduct)
             return null;
 
-        string path = Path.Combine(spvDir, "matmul_q5_k_mmq.spv");
+        string path = Path.Combine(spvDir, shaderBaseName + ".spv");
         if (!File.Exists(path))
             return null;
 

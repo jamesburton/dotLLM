@@ -28,6 +28,7 @@ internal sealed unsafe class Qwen3HybridDenseForwardState : IDisposable
     private readonly int _gdnKDim;        // NKHead * DState
     private readonly int _gdnHeads;       // NVHead
     private readonly int _intermediateSize;
+    private readonly int _hadamardWidth;
     private readonly int _inputScratchRowBytes;
 
     private int _currentSeqLen;
@@ -122,6 +123,18 @@ internal sealed unsafe class Qwen3HybridDenseForwardState : IDisposable
     /// <summary><c>silu(FfnGate) * FfnUp</c>, the Down-projection input: <c>[seqLen, intermediateSize]</c>.</summary>
     public nint SiluOutput;
 
+    /// <summary>
+    /// Destination for the PrismML Hadamard activation transform (<c>prism.hadamard.*</c>):
+    /// <c>[seqLen, maxFoldedWidth]</c>. Zero for checkpoints without a fold.
+    /// </summary>
+    /// <remarks>
+    /// One buffer serves every folded matmul because each rotation is consumed immediately by the
+    /// weights that share that activation, before the next rotation overwrites it. It must be
+    /// separate from the activation itself: <c>ssm_alpha</c>/<c>ssm_beta</c> and the residual stream
+    /// read the <b>unrotated</b> value of the very same buffer the folded projections rotate.
+    /// </remarks>
+    public nint HadamardScratch;
+
     // ── Computed properties ────────────────────────────────────────────────────
 
     public long AllocatedBytes
@@ -142,6 +155,7 @@ internal sealed unsafe class Qwen3HybridDenseForwardState : IDisposable
             floats += s * _qElems * 4;                             // QGateScratch (2x), QScratch, GateScratch, AttnOutput
             floats += s * _kvElems * 2;                            // KScratch, VScratch
             floats += s * _intermediateSize * 3;                   // FfnGate, FfnUp, SiluOutput
+            floats += s * _hadamardWidth;                          // HadamardScratch (0 without a fold)
             long bytes = floats * sizeof(float);
             bytes += s * _inputScratchRowBytes;                    // InputQ8Scratch (byte-sized)
             return bytes;
@@ -158,7 +172,8 @@ internal sealed unsafe class Qwen3HybridDenseForwardState : IDisposable
         int nVHead,
         int nKHead,
         int dState,
-        int intermediateSize)
+        int intermediateSize,
+        bool hasHadamardFold = false)
     {
         _hiddenSize = hiddenSize;
         _vocabSize = vocabSize;
@@ -175,6 +190,9 @@ internal sealed unsafe class Qwen3HybridDenseForwardState : IDisposable
         // Base dim is the max of hidden, qElems (for attn output proj), gdnVDim (ssm_out
         // input), and intermediateSize (Down-projection input).
         int scratchBase = Math.Max(Math.Max(Math.Max(hiddenSize, qElems), nVHead * dState), intermediateSize);
+        // The Hadamard scratch must cover the widest folded activation: hidden (attn/ffn inputs and
+        // lm_head), the attention output and ssm_out inputs, and the SwiGLU result feeding ffn_down.
+        _hadamardWidth = hasHadamardFold ? scratchBase : 0;
         int q8_0RowBytes = (scratchBase / 32) * 34;
         int q8_1RowBytes = (scratchBase / 32) * 36;
         int q8_kRowBytes = (scratchBase / 256) * 292;
@@ -222,6 +240,9 @@ internal sealed unsafe class Qwen3HybridDenseForwardState : IDisposable
         FfnUp = AllocFloats((long)cap * _intermediateSize);
         SiluOutput = AllocFloats((long)cap * _intermediateSize);
 
+        if (_hadamardWidth > 0)
+            HadamardScratch = AllocFloats((long)cap * _hadamardWidth);
+
         _currentSeqLen = cap;
     }
 
@@ -256,6 +277,7 @@ internal sealed unsafe class Qwen3HybridDenseForwardState : IDisposable
         FreeIfNonZero(ref FfnGate);
         FreeIfNonZero(ref FfnUp);
         FreeIfNonZero(ref SiluOutput);
+        FreeIfNonZero(ref HadamardScratch);
     }
 
     private static void FreeIfNonZero(ref nint ptr)

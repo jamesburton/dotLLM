@@ -326,7 +326,7 @@ To embed the same endpoints inside your own ASP.NET Core app, see [Host the Open
 | `--cache-type-k` | | `f32` | KV-cache key quant: `f32`, `q8_0`, `q4_0` |
 | `--cache-type-v` | | `f32` | KV-cache value quant: `f32`, `q8_0`, `q4_0` |
 | `--speculative-model` | | *(none)* | Draft model for speculative decoding (must share vocab) |
-| `--speculative-k` | | 5 | Draft tokens per speculative step |
+| `--speculative-k` | | 3 | Draft tokens per speculative step |
 
 **Sampling & constraints** (shared by `run` and `chat`):
 

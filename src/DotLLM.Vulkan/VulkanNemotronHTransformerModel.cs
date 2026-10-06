@@ -70,6 +70,10 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     // in RecordMatmul branches on the device-side QuantizationType per call.
     private readonly MatMulQ4KGemvF32Kernel _matmulQ4K;
     private readonly MatMulQ4KGemmF32Kernel _matmulQ4KGemm;
+    private readonly MatMulQ4KGemmCoopmatKernel? _matmulQ4KGemmCoopmat;
+    private readonly MatMulQ5_0GemvF32Kernel _matmulQ5_0;
+    private readonly MatMulQ5_0GemmF32Kernel _matmulQ5_0Gemm;
+    private readonly MatMulQ5_0GemmCoopmatKernel? _matmulQ5_0GemmCoopmat;
     // Q5_K_M matmul kernels — Phase 1 sibling of Q4_K. Always created.
     private readonly MatMulQ5KGemvF32Kernel _matmulQ5K;
     private readonly MatMulQ5KGemmF32Kernel _matmulQ5KGemm;
@@ -77,6 +81,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     // K-quant matmul kernel coverage. Always created.
     private readonly MatMulQ6KGemvF32Kernel _matmulQ6K;
     private readonly MatMulQ6KGemmF32Kernel _matmulQ6KGemm;
+    private readonly MatMulQ6KGemmCoopmatKernel? _matmulQ6KGemmCoopmat;
     // IQ4_NL / IQ4_XS matmul kernels — IQ-family follow-up to the K-quant
     // Phase 1 work. Always created; dispatcher routes per device-side
     // QuantizationType.
@@ -146,6 +151,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private readonly Conv1dCausalF32Kernel _conv1dCausal;
     private readonly SiluInplaceF32Kernel _siluInplace;
     private readonly Mamba2SelectiveScanF32Kernel _mamba2Scan;
+    private readonly Mamba2SelectiveScanRegsF32Kernel? _mamba2ScanRegs;
     private readonly SsmDSkipF32Kernel _ssmDSkip;
     private readonly GroupRmsNormF32Kernel _groupRmsNorm;
     private readonly ReluSquaredInplaceF32Kernel _reluSquared;
@@ -201,8 +207,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         MatMulQ2KGemvF32Kernel matmulQ2K, MatMulQ2KGemmF32Kernel matmulQ2KGemm,
         MatMulQ3KGemvF32Kernel matmulQ3K, MatMulQ3KGemmF32Kernel matmulQ3KGemm,
         MatMulQ4KGemvF32Kernel matmulQ4K, MatMulQ4KGemmF32Kernel matmulQ4KGemm,
+        MatMulQ4KGemmCoopmatKernel? matmulQ4KGemmCoopmat,
+        MatMulQ5_0GemvF32Kernel matmulQ5_0, MatMulQ5_0GemmF32Kernel matmulQ5_0Gemm,
+        MatMulQ5_0GemmCoopmatKernel? matmulQ5_0GemmCoopmat,
         MatMulQ5KGemvF32Kernel matmulQ5K, MatMulQ5KGemmF32Kernel matmulQ5KGemm,
-        MatMulQ6KGemvF32Kernel matmulQ6K, MatMulQ6KGemmF32Kernel matmulQ6KGemm,
+        MatMulQ6KGemvF32Kernel matmulQ6K, MatMulQ6KGemmF32Kernel matmulQ6KGemm, MatMulQ6KGemmCoopmatKernel? matmulQ6KGemmCoopmat,
         MatMulIq4NlGemvF32Kernel matmulIq4Nl, MatMulIq4NlGemmF32Kernel matmulIq4NlGemm,
         MatMulIq4XsGemvF32Kernel matmulIq4Xs, MatMulIq4XsGemmF32Kernel matmulIq4XsGemm,
         Iq2Codebooks iq2Codebooks,
@@ -221,7 +230,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         VulkanSplitKvAttentionKernel? splitKvAttention,
         SwiGluF32Kernel swiglu, AddKernel add, BiasAddF32Kernel biasAdd,
         Conv1dCausalF32Kernel conv1dCausal, SiluInplaceF32Kernel siluInplace,
-        Mamba2SelectiveScanF32Kernel mamba2Scan, SsmDSkipF32Kernel ssmDSkip,
+        Mamba2SelectiveScanF32Kernel mamba2Scan, Mamba2SelectiveScanRegsF32Kernel? mamba2ScanRegs, SsmDSkipF32Kernel ssmDSkip,
         GroupRmsNormF32Kernel groupRmsNorm, ReluSquaredInplaceF32Kernel reluSquared,
         SsmSplitXbcF32Kernel ssmSplitXbc,
         VulkanDevice.SubmitContext submit)
@@ -248,10 +257,15 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ3KGemm = matmulQ3KGemm;
         _matmulQ4K = matmulQ4K;
         _matmulQ4KGemm = matmulQ4KGemm;
+        _matmulQ4KGemmCoopmat = matmulQ4KGemmCoopmat;
+        _matmulQ5_0 = matmulQ5_0;
+        _matmulQ5_0Gemm = matmulQ5_0Gemm;
+        _matmulQ5_0GemmCoopmat = matmulQ5_0GemmCoopmat;
         _matmulQ5K = matmulQ5K;
         _matmulQ5KGemm = matmulQ5KGemm;
         _matmulQ6K = matmulQ6K;
         _matmulQ6KGemm = matmulQ6KGemm;
+        _matmulQ6KGemmCoopmat = matmulQ6KGemmCoopmat;
         _matmulIq4Nl = matmulIq4Nl;
         _matmulIq4NlGemm = matmulIq4NlGemm;
         _matmulIq4Xs = matmulIq4Xs;
@@ -285,6 +299,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _conv1dCausal = conv1dCausal;
         _siluInplace = siluInplace;
         _mamba2Scan = mamba2Scan;
+        _mamba2ScanRegs = mamba2ScanRegs;
         _ssmDSkip = ssmDSkip;
         _groupRmsNorm = groupRmsNorm;
         _reluSquared = reluSquared;
@@ -470,12 +485,20 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         // Q4_K_M GEMV + GEMM — Phase 1 of K-quant work. Always created.
         var matmulQ4K = MatMulQ4KGemvF32Kernel.Create(device, spvDir);
         var matmulQ4KGemm = MatMulQ4KGemmF32Kernel.Create(device, spvDir);
+        var matmulQ4KGemmCoopmat = MatMulQ4KGemmCoopmatKernel.IsSupportedOn(device, spvDir)
+            ? MatMulQ4KGemmCoopmatKernel.Create(device, spvDir) : null;
+        var matmulQ5_0 = MatMulQ5_0GemvF32Kernel.Create(device, spvDir);
+        var matmulQ5_0Gemm = MatMulQ5_0GemmF32Kernel.Create(device, spvDir);
+        var matmulQ5_0GemmCoopmat = MatMulQ5_0GemmCoopmatKernel.IsSupportedOn(device, spvDir)
+            ? MatMulQ5_0GemmCoopmatKernel.Create(device, spvDir) : null;
         // Q5_K_M GEMV + GEMM — Phase 1 sibling of Q4_K. Always created.
         var matmulQ5K = MatMulQ5KGemvF32Kernel.Create(device, spvDir);
         var matmulQ5KGemm = MatMulQ5KGemmF32Kernel.Create(device, spvDir);
         // Q6_K_M GEMV + GEMM — Phase 1 sibling of Q4_K / Q5_K. Always created.
         var matmulQ6K = MatMulQ6KGemvF32Kernel.Create(device, spvDir);
         var matmulQ6KGemm = MatMulQ6KGemmF32Kernel.Create(device, spvDir);
+        var matmulQ6KGemmCoopmat = MatMulQ6KGemmCoopmatKernel.IsSupportedOn(device, spvDir)
+            ? MatMulQ6KGemmCoopmatKernel.Create(device, spvDir) : null;
         // IQ4_NL / IQ4_XS GEMV + GEMM — IQ-family follow-up. Always created.
         var matmulIq4Nl = MatMulIq4NlGemvF32Kernel.Create(device, spvDir);
         var matmulIq4NlGemm = MatMulIq4NlGemmF32Kernel.Create(device, spvDir);
@@ -513,9 +536,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var attention = AttentionF32Kernel.Create(device, spvDir);
         VulkanFlashAttentionF32Kernel? flashAttention =
-            VulkanTransformerModel.IsFlashAttentionDisabled() || config.HeadDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
-                ? null
-                : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
+            VulkanAttentionFallbackDiagnostics.CreatePrefillFlashAttention(
+                device, spvDir, config.HeadDim, "NemotronH");
         VulkanSplitKvAttentionKernel? splitKvAttention =
             VulkanTransformerModel.IsSplitDecodeDisabled() || config.HeadDim > VulkanSplitKvAttentionKernel.MaxHeadDim
                 ? null
@@ -526,6 +548,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         var conv1dCausal = Conv1dCausalF32Kernel.Create(device, spvDir);
         var siluInplace = SiluInplaceF32Kernel.Create(device, spvDir);
         var mamba2Scan = Mamba2SelectiveScanF32Kernel.Create(device, spvDir);
+        var mamba2ScanRegs = File.Exists(Path.Combine(spvDir, "mamba2_selective_scan_f32_regs.spv"))
+            ? Mamba2SelectiveScanRegsF32Kernel.Create(device, spvDir) : null;
         var ssmDSkip = SsmDSkipF32Kernel.Create(device, spvDir);
         var groupRmsNorm = GroupRmsNormF32Kernel.Create(device, spvDir);
         var reluSquared = ReluSquaredInplaceF32Kernel.Create(device, spvDir);
@@ -540,9 +564,10 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
             matmulQ2K, matmulQ2KGemm,
             matmulQ3K, matmulQ3KGemm,
-            matmulQ4K, matmulQ4KGemm,
+            matmulQ4K, matmulQ4KGemm, matmulQ4KGemmCoopmat,
+            matmulQ5_0, matmulQ5_0Gemm, matmulQ5_0GemmCoopmat,
             matmulQ5K, matmulQ5KGemm,
-            matmulQ6K, matmulQ6KGemm,
+            matmulQ6K, matmulQ6KGemm, matmulQ6KGemmCoopmat,
             matmulIq4Nl, matmulIq4NlGemm,
             matmulIq4Xs, matmulIq4XsGemm,
             iq2Codebooks,
@@ -556,7 +581,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
             rmsnorm, attention, flashAttention, splitKvAttention, swiglu, add, biasAdd,
-            conv1dCausal, siluInplace, mamba2Scan, ssmDSkip, groupRmsNorm, reluSquared,
+            conv1dCausal, siluInplace, mamba2Scan, mamba2ScanRegs, ssmDSkip, groupRmsNorm, reluSquared,
             ssmSplitXbc,
             submit);
     }
@@ -572,30 +597,67 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         // into _state.NormOutput offset 0, then dispatch the lm_head + alloc + download
         // the per-seq logits tensor. ForwardBatch reuses RunForwardCore with a stacked
         // capture buffer (one slot per simple seq) instead of running per-seq lm_head.
-        RunForwardCore(tokenIds, positions, kvCache,
-            captureLastNormedRowTo: null, captureSlot: 0);
-
         int vocabSize = Config.VocabSize;
+
+        // Rows the LM head covers: 1 (last row) unless all-row logits were requested (#564) and
+        // the batch fits. Resolved BEFORE any recording: growing the logits buffer invalidates the
+        // kernels' descriptor caches, which must never happen against an open command buffer.
+        int headRows = tokenIds.Length <= _allRowLogitsLimit ? tokenIds.Length : 1;
+        var logitsBuf = headRows == 1 ? _state.Logits : EnsureMultiRowLogits(headRows, vocabSize);
+
+        RunForwardCore(tokenIds, positions, kvCache,
+            captureLastNormedRowTo: null, captureSlot: 0, headRows: headRows);
 
         _submit.Begin();
         nint cmdBuf = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(cmdBuf);
 
         RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
-            _state.NormOutput, _state.Logits,
-            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: 1);
+            _state.NormOutput, logitsBuf,
+            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: headRows);
 
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         _submit.SubmitAndWait();
 
-        var shape = new TensorShape(1, vocabSize);
+        var shape = new TensorShape(headRows, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
         unsafe
         {
-            var dest = new Span<float>((void*)result.DataPointer, vocabSize);
-            _device.Download(_state.Logits, dest);
+            var dest = new Span<float>((void*)result.DataPointer, headRows * vocabSize);
+            _device.Download(logitsBuf, dest);
         }
         return result;
+    }
+
+    // Batch length up to which Forward returns a logit row per position. Default 1 = last row only,
+    // the historical behaviour; widened on request by TrySetAllRowLogitsLimit (#564).
+    private int _allRowLogitsLimit = 1;
+    private VulkanDevice.Buffer? _multiRowLogits;
+    private int _multiRowLogitsRows;
+
+    /// <inheritdoc/>
+    public int MaxAllRowLogitsLength => _allRowLogitsLimit;
+
+    /// <inheritdoc/>
+    public bool TrySetAllRowLogitsLimit(int maxSeqLen)
+    {
+        if (maxSeqLen > _allRowLogitsLimit)
+            _allRowLogitsLimit = maxSeqLen;
+        return _allRowLogitsLimit >= maxSeqLen;
+    }
+
+    private VulkanDevice.Buffer EnsureMultiRowLogits(int rows, int vocab)
+    {
+        if (_multiRowLogits is not null && _multiRowLogitsRows >= rows)
+            return _multiRowLogits;
+
+        _multiRowLogits?.Dispose();
+        _multiRowLogits = _device.AllocateHostReadback((long)rows * vocab * sizeof(float));
+        _multiRowLogitsRows = rows;
+        // A freed handle can be recycled into this allocation and the kernels key descriptor sets
+        // on the handle; see VulkanQwen3HybridDenseTransformerModel.EnsureMultiRowLogits.
+        InvalidateKernelCaches();
+        return _multiRowLogits;
     }
 
     /// <summary>
@@ -666,7 +728,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// </remarks>
     private void RunForwardCore(
         ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, IKvCache? kvCache,
-        VulkanDevice.Buffer? captureLastNormedRowTo, int captureSlot)
+        VulkanDevice.Buffer? captureLastNormedRowTo, int captureSlot, int headRows = 1)
     {
         if (tokenIds.Length != positions.Length)
             throw new ArgumentException("tokenIds and positions must have the same length.");
@@ -733,16 +795,16 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
         }
 
-        // Final RMSNorm on the last token only.
+        // Final RMSNorm on the last headRows tokens (1 unless all-row logits were requested).
         long rowBytes = (long)hiddenSize * sizeof(float);
-        long lastRowOffset = (long)(seqLen - 1) * rowBytes;
+        long headSrcOffset = (long)(seqLen - headRows) * rowBytes;
         KernelSupport.ComputeToTransferBarrier(cmdBuf);
         RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
-            srcOffset: (ulong)lastRowOffset, dstOffset: 0, size: (ulong)rowBytes);
+            srcOffset: (ulong)headSrcOffset, dstOffset: 0, size: (ulong)(headRows * rowBytes));
         KernelSupport.TransferToComputeBarrier(cmdBuf);
 
         _rmsnorm.Record(cmdBuf, _state.NormOutput, _weights.OutputNormWeight, _state.NormOutput,
-            rowCount: 1, n: hiddenSize, eps: eps);
+            rowCount: headRows, n: hiddenSize, eps: eps);
 
         // Optionally snapshot the normed last row into a caller-owned scratch buffer at
         // the given slot. Used by ForwardBatch to gather every simple seq's last hidden
@@ -1045,9 +1107,20 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 8. Mamba2 selective scan: state, SsmX, DtBuf, A, SsmB, SsmC -> SsmY.
-        _mamba2Scan.Record(cmdBuf, ssmStateBuf, _state.SsmX, _state.DtBuf, ssmW.A,
-            _state.SsmB, _state.SsmC, _state.SsmY,
-            nHead: nHead, headDim: headDim, dState: dState, nGroup: nGroup, seqLen: seqLen);
+        if (_mamba2ScanRegs is not null && Mamba2SelectiveScanRegsF32Kernel.IsEligible(headDim, dState))
+        {
+            // Register-resident state, 4 lanes per row (#572): 3-4x on prefill, and it removes the
+            // per-token global state round trip that dominated Nemotron-H prefill AND decode.
+            _mamba2ScanRegs.Record(cmdBuf, ssmStateBuf, _state.SsmX, _state.DtBuf, ssmW.A,
+                _state.SsmB, _state.SsmC, _state.SsmY,
+                nHead: nHead, headDim: headDim, dState: dState, nGroup: nGroup, seqLen: seqLen);
+        }
+        else
+        {
+            _mamba2Scan.Record(cmdBuf, ssmStateBuf, _state.SsmX, _state.DtBuf, ssmW.A,
+                _state.SsmB, _state.SsmC, _state.SsmY,
+                nHead: nHead, headDim: headDim, dState: dState, nGroup: nGroup, seqLen: seqLen);
+        }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 9. SsmY += SsmX * D
@@ -1147,7 +1220,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: 0);
         }
-        else if (_flashAttention is not null && seqLen > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
+        else if (_flashAttention is not null && seqLen > 1 && headDim <= _flashAttention.SupportedMaxHeadDim)
         {
             _flashAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
@@ -1200,10 +1273,15 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ3KGemm.InvalidateDescriptorCache();
         _matmulQ4K.InvalidateDescriptorCache();
         _matmulQ4KGemm.InvalidateDescriptorCache();
+        _matmulQ4KGemmCoopmat?.InvalidateDescriptorCache();
+        _matmulQ5_0.InvalidateDescriptorCache();
+        _matmulQ5_0Gemm.InvalidateDescriptorCache();
+        _matmulQ5_0GemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ5K.InvalidateDescriptorCache();
         _matmulQ5KGemm.InvalidateDescriptorCache();
         _matmulQ6K.InvalidateDescriptorCache();
         _matmulQ6KGemm.InvalidateDescriptorCache();
+        _matmulQ6KGemmCoopmat?.InvalidateDescriptorCache();
         _matmulIq4Nl.InvalidateDescriptorCache();
         _matmulIq4NlGemm.InvalidateDescriptorCache();
         _matmulIq4Xs.InvalidateDescriptorCache();
@@ -1235,6 +1313,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _conv1dCausal.InvalidateDescriptorCache();
         _siluInplace.InvalidateDescriptorCache();
         _mamba2Scan.InvalidateDescriptorCache();
+        _mamba2ScanRegs?.InvalidateDescriptorCache();
         _ssmDSkip.InvalidateDescriptorCache();
         _groupRmsNorm.InvalidateDescriptorCache();
         _reluSquared.InvalidateDescriptorCache();
@@ -1312,9 +1391,37 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 _matmulQ4K.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim);
             }
+            else if (_matmulQ4KGemmCoopmat is not null && seqLen >= 32)
+            {
+                // 128x128 blocked coopmat tile (#570); below ~32 rows the token tile is mostly padding.
+                _matmulQ4KGemmCoopmat.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
             else
             {
                 _matmulQ4KGemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
+        else if (weightQt == QuantizationType.Q5_0)
+        {
+            // Q5_0 (#568): 32-element, 22-byte blocks; F32-in GEMV (decode) / tiled GEMM (prefill).
+            // Reaching the trailing F32 arm would reinterpret packed blocks as floats: silently
+            // wrong logits, not a crash.
+            if (seqLen == 1)
+            {
+                _matmulQ5_0.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else if (_matmulQ5_0GemmCoopmat is not null && seqLen >= 32)
+            {
+                // 128x128 blocked coopmat tile (#568): the 128-wide token tile wastes work below ~32 rows.
+                _matmulQ5_0GemmCoopmat.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+            else
+            {
+                _matmulQ5_0Gemm.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim, n: seqLen);
             }
         }
@@ -1341,6 +1448,12 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             {
                 _matmulQ6K.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim);
+            }
+            else if (_matmulQ6KGemmCoopmat is not null && seqLen >= 32)
+            {
+                // 128x128 blocked coopmat tile (#578).
+                _matmulQ6KGemmCoopmat.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
             }
             else
             {
@@ -1512,6 +1625,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     {
         // Phase 5f mirror — ForwardBatch lm_head scratch (null when never invoked).
         _batchScratch?.Dispose();
+        _multiRowLogits?.Dispose();
         _submit.Dispose();
         _state.Dispose();
         _weights.Dispose();
@@ -1525,6 +1639,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _groupRmsNorm.Dispose();
         _ssmDSkip.Dispose();
         _mamba2Scan.Dispose();
+        _mamba2ScanRegs?.Dispose();
         _siluInplace.Dispose();
         _conv1dCausal.Dispose();
         _biasAdd.Dispose();
@@ -1558,10 +1673,15 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulIq2Xxs.Dispose();
         _iq2Codebooks.Dispose();
         _matmulQ6KGemm.Dispose();
+        _matmulQ6KGemmCoopmat?.Dispose();
         _matmulQ6K.Dispose();
         _matmulQ5KGemm.Dispose();
         _matmulQ5K.Dispose();
         _matmulQ4KGemm.Dispose();
+        _matmulQ4KGemmCoopmat?.Dispose();
+        _matmulQ5_0.Dispose();
+        _matmulQ5_0Gemm.Dispose();
+        _matmulQ5_0GemmCoopmat?.Dispose();
         _matmulQ4K.Dispose();
         _matmulQ3KGemm.Dispose();
         _matmulQ3K.Dispose();

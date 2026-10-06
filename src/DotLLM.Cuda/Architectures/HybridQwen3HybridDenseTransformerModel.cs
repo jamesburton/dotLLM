@@ -42,6 +42,17 @@ namespace DotLLM.Cuda.Architectures;
 /// <c>--gpu-layers</c> count is supposed to deliver.
 /// </para>
 /// <para>
+/// <b>Hadamard-folded checkpoints (PrismML <c>prism.hadamard.*</c>, Bonsai 2 — issue #481).</b>
+/// Both halves apply the activation rotations for the blocks they own: the GPU head through
+/// <see cref="CudaHadamardRotation"/> (plus the <c>token_embd</c> inverse, since it does the
+/// embedding lookup), the CPU tail through the CPU <see cref="HadamardActivationRotator"/> (plus
+/// the folded lm_head). Each half validates the declaration against the FULL trunk: it requires
+/// every name it rotates to be declared and refuses any declared name that no block of the whole
+/// model rotates (a folded MTP block, a folded <c>ssm_alpha</c>, ...). <see cref="LoadFromGguf"/>
+/// also runs the whole-model check up front, so an unusable declaration is refused before any
+/// device memory is touched.
+/// </para>
+/// <para>
 /// <b>Not yet supported through this split:</b> LoRA adapters and Multi-Token Prediction (MTP) —
 /// both out of scope for #291. A model with an MTP head loads fine (the tail simply never resolves
 /// the trailing MTP block), but <see cref="IModel.SupportsMtp"/> reports <see langword="false"/>
@@ -101,8 +112,27 @@ public sealed class HybridQwen3HybridDenseTransformerModel : IModel
                 $"numGpuLayers must be between 1 and {config.NumLayers - 1} for hybrid mode. " +
                 $"Use Qwen3HybridDenseTransformerModel for pure CPU or CudaQwen3HybridDenseTransformerModel for pure GPU.");
 
+        // Hadamard fold (#481): each half validates the blocks it owns, and both refuse a declared
+        // name no block rotates — but the union of what they cover is the whole-model set, so check
+        // that once here, host-only, before creating a CUDA context or uploading any weight.
+        if (config.HadamardFold is { } fold)
+        {
+            var gdn = config.GdnConfig
+                ?? throw new ArgumentException("Qwen3HybridDense config must have GdnConfig populated.", nameof(config));
+            new HadamardActivationRotator(fold, gdn).ValidateQwen35FoldSet(config.NumLayers, gdn.FullAttnInterval);
+        }
+
         var headModel = CudaQwen3HybridDenseTransformerModel.LoadHeadFromGguf(gguf, config, numGpuLayers, deviceId);
-        var tailModel = Qwen3HybridDenseTransformerModel.LoadTailFromGguf(gguf, config, numGpuLayers, threading);
+        Qwen3HybridDenseTransformerModel tailModel;
+        try
+        {
+            tailModel = Qwen3HybridDenseTransformerModel.LoadTailFromGguf(gguf, config, numGpuLayers, threading);
+        }
+        catch
+        {
+            headModel.Dispose();
+            throw;
+        }
 
         // VRAM estimation and warning — mirrors HybridTransformerModel.LoadFromGguf's identical check.
         string? vramWarning = null;

@@ -31,6 +31,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <see cref="ITestOutputHelper"/> in the test output.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaMamba3SsdScanMimoF32Tests
 {
     private const float Tolerance = 1e-4f;

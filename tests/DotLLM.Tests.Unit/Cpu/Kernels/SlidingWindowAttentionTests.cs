@@ -136,7 +136,9 @@ public class SlidingWindowAttentionTests
         Attention.Execute(q, k, v, outExec, seqQ, seqKv, numHeads, numKvHeads, headDim, 0, slidingWindowSize: 2);
         Attention.ExecuteScalar(q, k, v, outScalar, seqQ, seqKv, numHeads, numKvHeads, headDim, 0, slidingWindowSize: 2);
 
-        // Tolerance widened from precision: 5 to account for fast approximate exp in attention.
+        // Tolerance widened from precision: 5 when attention used the approximate exp. #501 made
+        // it precise by default, so this is now looser than the SIMD reassociation it covers;
+        // left wide rather than retightened, and still correct under DOTLLM_FAST_EXP=1.
         for (int i = 0; i < outExec.Length; i++)
             Assert.Equal(outScalar[i], outExec[i], 5e-2f);
     }

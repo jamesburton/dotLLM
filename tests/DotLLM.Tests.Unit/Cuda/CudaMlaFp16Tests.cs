@@ -16,6 +16,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// F32 tests do at scale.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaMlaFp16Tests : IDisposable
 {
     private const float KernelTolerance = 1e-2f;

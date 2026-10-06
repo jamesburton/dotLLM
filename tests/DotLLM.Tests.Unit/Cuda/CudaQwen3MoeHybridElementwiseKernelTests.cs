@@ -27,6 +27,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </para>
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaQwen3MoeHybridElementwiseKernelTests
 {
     private readonly ITestOutputHelper _out;

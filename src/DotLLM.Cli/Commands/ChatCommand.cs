@@ -117,7 +117,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         /// <summary>Compute device.</summary>
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1'.")]
+        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1' (CUDA). 'vulkan' is not supported by chat yet; use 'run' or 'serve'.")]
         [DefaultValue("cpu")]
         public string Device { get; set; } = "cpu";
 
@@ -208,9 +208,9 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         /// <summary>Number of draft candidates per speculative step.</summary>
         [CommandOption("--speculative-k|--draft-tokens")]
-        [Description("Number of draft tokens per speculative step (K). Default 5.")]
-        [DefaultValue(5)]
-        public int SpeculativeK { get; set; } = 5;
+        [Description("Number of draft tokens per speculative step (K). Default 3.")]
+        [DefaultValue(DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates)]
+        public int SpeculativeK { get; set; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
 
         /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
         [CommandOption("--prefill-chunk-size|--ubatch-size")]
@@ -228,6 +228,13 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
     /// <inheritdoc/>
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
+        // Fail loudly: "vulkan" does not start with "gpu", so it would otherwise run on the CPU silently.
+        if (DotLLM.Vulkan.VulkanModelLoader.IsVulkanDeviceString(settings.Device))
+        {
+            AnsiConsole.MarkupLine("[red]--device vulkan is not supported by 'chat' yet; use 'run' or 'serve'.[/]");
+            return 1;
+        }
+
         // Resolve before loading the model so a bad path fails fast.
         if (!TextArgument.TryResolve(settings.SystemPrompt, settings.SystemPromptFile,
                 "--system|-s", "--system-file", required: false,
@@ -249,7 +256,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         }
         else
         {
-            var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
+            var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
             if (ggufPath is null)
                 return 1;
             resolvedPath = ggufPath;
@@ -316,7 +323,10 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                         : 0;
                     var threading = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
                     ctx.Status($"Loading {config.Architecture} model ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)...");
-                    model = DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(gguf, config, gpuLayers, gpuId, threading);
+                    // #729: per-architecture dispatch; unsupported archs load all-GPU or fail with an actionable error (never a silent CPU fallback).
+                    (model, _) = DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(
+                        gguf, config, gpuLayers, gpuId, threading,
+                        w => Console.Error.WriteLine($"WARNING: {w}"));
                 }
             });
 
@@ -471,6 +481,15 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 AnsiConsole.MarkupLine("[yellow]WARNING: Paged KV-cache not supported with hybrid GPU, using hybrid cache.[/]");
             kvFactory = (cfg, size) => hybridModel.CreateKvCache(size);
         }
+        else if (model is DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel qwen3Split)
+        {
+            kvFactory = (cfg, size) => qwen3Split.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.CudaNemotronHTransformerModel nemotronHGpu)
+        {
+            // #729: all-GPU fallback for a partial request on Nemotron-H (sparse attention-only KV).
+            kvFactory = (cfg, size) => nemotronHGpu.CreateKvCache(size);
+        }
         else if (settings.Paged && !kvConfig.IsQuantized)
         {
             pagedFactory = new DotLLM.Engine.KvCache.PagedKvCacheFactory(
@@ -532,6 +551,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         var generator = new TextGenerator(model!, tokenizer!, kvFactory, prefixCache,
             draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
+            mtpAdaptive: true, recurrentPrefixCache: true,
             prefillChunkSize: settings.PrefillChunkSize);
 
         try

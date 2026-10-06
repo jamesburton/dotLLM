@@ -34,6 +34,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// unless it happened to flip an argmax. Every step's logits are now bounded.</para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaGraphCaptureEquivalenceTest
 {
     private readonly ITestOutputHelper _out;

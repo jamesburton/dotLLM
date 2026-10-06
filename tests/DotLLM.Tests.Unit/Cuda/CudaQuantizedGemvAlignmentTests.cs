@@ -23,6 +23,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// block-32, 256 for K-quants), unlocking the fast path for down_proj.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaQuantizedGemvAlignmentTests
 {
     private readonly ITestOutputHelper _out;

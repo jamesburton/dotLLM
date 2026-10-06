@@ -50,6 +50,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class VulkanSplitDecodeMoeParityTests
 {
     private const int PromptLen = 8;

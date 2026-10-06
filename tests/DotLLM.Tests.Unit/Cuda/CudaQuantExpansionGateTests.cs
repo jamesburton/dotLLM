@@ -9,6 +9,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// the CUDA backend from silently expanding a quant type it has no native kernel for into a
 /// full, model-lifetime-resident FP16/F32 copy. Pure logic test — no CUDA device required.
 /// </summary>
+[Collection(CudaCollection.Name)]
 public sealed class CudaQuantExpansionGateTests
 {
     /// <summary>

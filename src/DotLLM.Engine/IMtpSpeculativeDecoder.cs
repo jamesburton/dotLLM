@@ -34,21 +34,19 @@ namespace DotLLM.Engine;
 public interface IMtpSpeculativeDecoder
 {
     /// <summary>
-    /// Drafts candidate tokens with the target model's own MTP head and verifies them with the
-    /// target model's normal forward pass. On rejection, rolls back the KV-cache and constraint
-    /// state to the last accepted position. Every call starts by re-seeding
-    /// <paramref name="mtpState"/> from a fresh single-token "catchup" forward of the current
-    /// <c>lastToken</c> — see the implementation's remarks for why that is necessary (neither a
-    /// corrected nor a bonus token from the previous round has ever been forwarded through the
-    /// trunk as an input, so its hidden state must be (re)computed before drafting can start).
+    /// Drafts candidate tokens with the target model's own MTP head and verifies them, together
+    /// with <c>lastToken</c>, in a single forward of the target model. On rejection, rolls back the
+    /// KV-cache, the MTP state and the constraint to the last accepted position. Requires that every
+    /// earlier trunk forward of the sequence (the prefill included) passed <paramref name="mtpState"/>,
+    /// so the head's KV-cache covers every position before <paramref name="position"/>.
     /// </summary>
     /// <param name="targetModel">The model — must have <see cref="IModel.SupportsMtp"/> true.</param>
     /// <param name="kvCacheTarget">KV-cache for the target model's normal (trunk) forward pass.</param>
-    /// <param name="mtpState">The MTP head's own state (tiny KV-cache + pending hidden handoff), from <see cref="IModel.CreateMtpState"/>.</param>
+    /// <param name="mtpState">The MTP head's own state (position-indexed KV-cache + pending hidden hand-off), from <see cref="IModel.CreateMtpState(int)"/>.</param>
     /// <param name="pipeline">Sampling pipeline for token selection.</param>
     /// <param name="generatedIds">All previously generated token IDs (for repetition penalty).</param>
     /// <param name="constraint">Optional decoding constraint (cloned before drafting, rolled back on rejection).</param>
-    /// <param name="position">Current sequence position (prompt length + decoded so far).</param>
+    /// <param name="position">Position of <c>generatedIds[^1]</c>, the last token, which has not yet been forwarded through the trunk.</param>
     /// <param name="vocabSize">Vocabulary size of the target model.</param>
     /// <param name="numCandidates">Number of draft tokens to propose (K).</param>
     /// <param name="outputBuffer">Caller-owned buffer for accepted token IDs (must be at least K+1 elements).</param>

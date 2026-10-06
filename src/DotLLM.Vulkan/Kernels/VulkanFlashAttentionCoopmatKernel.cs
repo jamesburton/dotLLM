@@ -123,6 +123,19 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     public const int MaxHeadDim = 128;
 
     /// <summary>
+    /// Issue #685: head_dim bound of the optional <c>_hd256</c> pipeline (Qwen3.5 / Qwen3.6 hybrids). Ask the INSTANCE
+    /// (<see cref="SupportedMaxHeadDim"/>) what it can dispatch: the SPIR-V may be absent from an older build.
+    /// </summary>
+    public const int WideMaxHeadDim = 256;
+
+    /// <summary>Env kill switch for the hd256 pipeline (<c>DOTLLM_VULKAN_FA_COOPMAT_HD256=0</c>).</summary>
+    private static readonly bool Hd256Enabled =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_FA_COOPMAT_HD256") != "0";
+
+    /// <summary>Largest head_dim this instance can dispatch: 256 when the hd256 pipeline loaded, else 128.</summary>
+    public int SupportedMaxHeadDim => _hd256Pipeline is not null ? WideMaxHeadDim : MaxHeadDim;
+
+    /// <summary>
     /// Issue #378: models with <c>headDim &lt;= this</c> are ELIGIBLE for the
     /// LDS-halved <c>attention_flash_f32_coopmat_hd64.spv</c> variant instead
     /// of the base 128-dim shader (also gated on <see cref="SeqKvThreshold"/>).
@@ -158,11 +171,73 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
 
     private const int PushConstantBytes = 12 * sizeof(uint);
 
+    /// <summary>PCI vendor ID of AMD, whose coopmat P.V needs the #533 safe-tile gate.</summary>
+    private const uint VendorAmd = 0x1002;
+
+    /// <summary>PCI vendor ID of NVIDIA — measured clean for #533 at every KV length.</summary>
+    private const uint VendorNvidia = 0x10DE;
+
+    /// <summary>
+    /// #533: whether this kernel's pipelines were specialized to the
+    /// KV-length-invariant P.V path (1) or to plain all-coopmat (0). Test-visible
+    /// so a probe can print which variant it actually built.
+    /// </summary>
+    internal uint RequireInvariantPv { get; }
+
+    /// <summary>
+    /// #533 vendor policy. The defect — coopmat P.V not reproducing the same
+    /// accumulator for the <c>0 * v</c> contributions of masked / padding columns —
+    /// is an AMD implementation property: an RTX 3060 is exactly 0-differing at
+    /// every KV length on the SAME committed SPIR-V, which is how #533 was decided.
+    /// Measured against the pre-fix module, same-session and order-reversed: with
+    /// the gate ON, AMD gfx1151 is 0.809x at <c>p128_even</c> and at or above
+    /// parity everywhere else (p512 0.975x, p2048 hd64 1.032-1.045x, p512 hd128
+    /// 0.985-0.998x). With it OFF, NVIDIA pays nothing (0.994-1.046x on every
+    /// row) — but only because this is a SPECIALIZATION constant. The same gate
+    /// as a push constant recovered nothing there (0.81x either way at the hd64
+    /// shape): the cost is the scalar path being compiled in, not executed.
+    /// <para>
+    /// NVIDIA is the ONLY vendor exempted, and only because it was measured.
+    /// Everything else — Intel, Qualcomm, Mesa/RADV, anything new — gets the gate:
+    /// an unmeasured device is assumed affected, because the failure mode is
+    /// silently different generated text, not a crash.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// <c>DOTLLM_VULKAN_533_GATE=0|1</c> overrides the vendor policy. This exists so
+    /// the defect can be REPRODUCED on demand: with the gate off, this shader is
+    /// bitwise identical to the pre-fix one on every measured arm, which is what
+    /// lets a regression test demonstrate RED without keeping a second copy of the
+    /// shader around to drift out of date. Setting it to 0 on AMD re-enables a
+    /// known wrong-output path — it is a diagnostic, not a tuning knob.
+    /// </remarks>
+    internal static uint RequiresInvariantPv(uint vendorId)
+    {
+        string? o = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_533_GATE");
+        if (o is not null) return string.Equals(o, "0", StringComparison.Ordinal) ? 0u : 1u;
+        return vendorId == VendorNvidia ? 0u : 1u;
+    }
+
+    /// <summary>
+    /// The base (MAX_HEAD_DIM=128) pipeline handle, for
+    /// <c>VK_AMD_shader_info</c> queries — the driver's own post-compile VGPR /
+    /// LDS / scratch numbers, which is how #545 turned "probably occupancy"
+    /// into a number instead of inferring it from timings.
+    /// </summary>
+    internal nint PipelineHandle => _pipeline.Pipeline;
+
+    /// <summary>The <c>seqKv &gt;= 640</c> hd64 pipeline handle, or 0 when its SPIR-V is absent.</summary>
+    internal nint Hd64PipelineHandle => _hd64Pipeline?.Pipeline ?? 0;
+
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
     private readonly VulkanModule? _hd64Module;
     private readonly ComputePipeline? _hd64Pipeline;
+    private readonly VulkanModule? _hd256Module;
+    private readonly ComputePipeline? _hd256Pipeline;
+    private readonly nint _hd256DescriptorPool;
+    private readonly DescriptorSetCache? _hd256DescriptorCache;
     private readonly nint _descriptorPool;
     private readonly nint _hd64DescriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
@@ -171,9 +246,17 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
 
     private VulkanFlashAttentionCoopmatKernel(
         VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
-        VulkanModule? hd64Module, ComputePipeline? hd64Pipeline, nint hd64Pool)
+        VulkanModule? hd64Module, ComputePipeline? hd64Pipeline, nint hd64Pool,
+        VulkanModule? hd256Module, ComputePipeline? hd256Pipeline, nint hd256Pool,
+        uint requireInvariantPv)
     {
+        _hd256Module = hd256Module;
+        _hd256Pipeline = hd256Pipeline;
+        _hd256DescriptorPool = hd256Pool;
+        if (hd256Pipeline is not null)
+            _hd256DescriptorCache = new DescriptorSetCache(device, hd256Pool, hd256Pipeline, buffersPerSet: 4);
         _device = device;
+        RequireInvariantPv = requireInvariantPv;
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
@@ -229,6 +312,21 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     /// or validate independently of the existing correctness tests.
     /// </summary>
     public static VulkanFlashAttentionCoopmatKernel Create(VulkanDevice device, string spvDir, FlashAttentionCoopmatVariant variant)
+        => Create(device, spvDir, variant, DefaultShaderBaseName);
+
+    /// <summary>The production SPV base name (<c>attention_flash_f32_coopmat</c>).</summary>
+    internal const string DefaultShaderBaseName = "attention_flash_f32_coopmat";
+
+    /// <summary>
+    /// Issue #533 measurement hook: loads <c>{shaderBaseName}.spv</c> (and
+    /// <c>{shaderBaseName}_hd64.spv</c> when present) instead of the production
+    /// pair, so a probe/bench can hold the shipping kernel and a candidate-fix
+    /// shader open in ONE process and A/B them same-session. Production callers
+    /// never pass this.
+    /// </summary>
+    internal static VulkanFlashAttentionCoopmatKernel Create(
+        VulkanDevice device, string spvDir, FlashAttentionCoopmatVariant variant, string shaderBaseName,
+        uint? requireInvariantPv = null)
     {
         if (!SupportsDevice(device))
             throw new InvalidOperationException(
@@ -240,12 +338,19 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
                 $"Device cannot pin the compute stage to requiredSubgroupSize={variant.RequiredSubgroupSize}. " +
                 "Check FlashAttentionCoopmatVariant.IsSupportedOn(device) before calling Create() with an explicit variant.");
 
-        string path = Path.Combine(spvDir, "attention_flash_f32_coopmat.spv");
+        string path = Path.Combine(spvDir, shaderBaseName + ".spv");
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
 
         uint requiredSubgroupSize = (uint)variant.RequiredSubgroupSize;
+
+        // #533: resolved ONCE here and given to BOTH pipelines. A pipeline that
+        // misses the specialization silently defaults to 1 (the gate), which on
+        // the hd64 pipeline would look like "the fix did not recover its cost"
+        // rather than like a wiring bug — so both call sites pass `spec`.
+        uint gate = requireInvariantPv ?? RequiresInvariantPv(device.VendorId);
+        ReadOnlySpan<uint> spec = stackalloc uint[1] { gate };
 
         VulkanModule module = VulkanModule.LoadFromFile(device, path);
         ComputePipeline pipeline;
@@ -260,7 +365,8 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
                 entryPoint: "main",
                 bindings: bindings,
                 pushConstantBytes: PushConstantBytes,
-                requiredSubgroupSize: requiredSubgroupSize);
+                requiredSubgroupSize: requiredSubgroupSize,
+                specConstants: spec);
         }
         catch
         {
@@ -271,7 +377,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         VulkanModule? hd64Module = null;
         ComputePipeline? hd64Pipeline = null;
         nint hd64Pool = 0;
-        string hd64Path = Path.Combine(spvDir, "attention_flash_f32_coopmat_hd64.spv");
+        string hd64Path = Path.Combine(spvDir, shaderBaseName + "_hd64.spv");
         if (File.Exists(hd64Path))
         {
             hd64Module = VulkanModule.LoadFromFile(device, hd64Path);
@@ -286,7 +392,8 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
                     entryPoint: "main",
                     bindings: bindings,
                     pushConstantBytes: PushConstantBytes,
-                    requiredSubgroupSize: requiredSubgroupSize);
+                    requiredSubgroupSize: requiredSubgroupSize,
+                    specConstants: spec);
                 // Separate pool per pipeline: DescriptorSetCache.Reset() calls
                 // vkResetDescriptorPool on its whole pool, which would silently
                 // invalidate the OTHER pipeline's still-referenced sets
@@ -302,8 +409,40 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
             }
         }
 
+        // #685: the hd256 pipeline is optional and a failure to build it degrades to "no wide support", never to a throw.
+        VulkanModule? hd256Module = null;
+        ComputePipeline? hd256Pipeline = null;
+        nint hd256Pool = 0;
+        string hd256Path = Path.Combine(spvDir, shaderBaseName + "_hd256.spv");
+        if (Hd256Enabled && File.Exists(hd256Path))
+        {
+            try
+            {
+                hd256Module = VulkanModule.LoadFromFile(device, hd256Path);
+                Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[4];
+                for (int i = 0; i < 4; i++) bindings[i] = new VkDescriptorBinding((uint)i);
+                hd256Pipeline = hd256Module.CreateComputePipeline(
+                    entryPoint: "main",
+                    bindings: bindings,
+                    pushConstantBytes: PushConstantBytes,
+                    requiredSubgroupSize: requiredSubgroupSize,
+                    specConstants: spec);
+                hd256Pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
+            }
+            catch
+            {
+                hd256Pipeline?.Dispose();
+                hd256Module?.Dispose();
+                hd256Module = null;
+                hd256Pipeline = null;
+                hd256Pool = 0;
+            }
+        }
+
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-        return new VulkanFlashAttentionCoopmatKernel(device, module, pipeline, pool, hd64Module, hd64Pipeline, hd64Pool);
+        return new VulkanFlashAttentionCoopmatKernel(
+            device, module, pipeline, pool, hd64Module, hd64Pipeline, hd64Pool,
+            hd256Module, hd256Pipeline, hd256Pool, gate);
     }
 
     /// <summary>
@@ -333,6 +472,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     {
         _descriptorCache.Reset();
         _hd64DescriptorCache?.Reset();
+        _hd256DescriptorCache?.Reset();
     }
 
     /// <summary>
@@ -374,9 +514,9 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
             throw new ArgumentException(
                 $"numHeads ({numHeads}) must be divisible by numKvHeads ({numKvHeads})", nameof(numKvHeads));
         if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
-        if (headDim > MaxHeadDim)
+        if (headDim > SupportedMaxHeadDim)
             throw new ArgumentException(
-                $"headDim ({headDim}) exceeds shader MAX_HEAD_DIM ({MaxHeadDim}). " +
+                $"headDim ({headDim}) exceeds shader MAX_HEAD_DIM ({SupportedMaxHeadDim}). " +
                 $"Route to {nameof(VulkanFlashAttentionF32Kernel)} / {nameof(AttentionF32Kernel)}.",
                 nameof(headDim));
         if (positionOffset < 0) throw new ArgumentOutOfRangeException(nameof(positionOffset));
@@ -399,8 +539,9 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         // to amortize the occupancy gain to the LDS-halved hd64 shader.
         bool useHd64 = _hd64Pipeline is not null && HeadDim64Enabled
             && headDim <= HeadDim64Threshold && seqKv >= SeqKvThreshold;
-        ComputePipeline pipeline = useHd64 ? _hd64Pipeline! : _pipeline;
-        DescriptorSetCache descriptorCache = useHd64 ? _hd64DescriptorCache! : _descriptorCache;
+        bool useHd256 = headDim > MaxHeadDim;   // SupportedMaxHeadDim above guarantees the pipeline exists
+        ComputePipeline pipeline = useHd256 ? _hd256Pipeline! : useHd64 ? _hd64Pipeline! : _pipeline;
+        DescriptorSetCache descriptorCache = useHd256 ? _hd256DescriptorCache! : useHd64 ? _hd64DescriptorCache! : _descriptorCache;
 
         Span<nint> buffers = stackalloc nint[4] { q.Handle, k.Handle, v.Handle, output.Handle };
         nint descriptorSet = descriptorCache.GetOrCreate(buffers);
@@ -450,5 +591,10 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _hd64DescriptorPool, 0);
         _hd64Pipeline?.Dispose();
         _hd64Module?.Dispose();
+
+        if (_hd256DescriptorPool != 0)
+            VulkanApi.vkDestroyDescriptorPool(_device.Handle, _hd256DescriptorPool, 0);
+        _hd256Pipeline?.Dispose();
+        _hd256Module?.Dispose();
     }
 }

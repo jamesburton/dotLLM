@@ -27,12 +27,15 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <b>Tolerance: 5e-3 abs OR rel, same bar v1 established</b> (matching
 /// <c>CudaTensorCoreAttentionParityTests</c>'s existing FP16-tensor-core precedent). v1's
 /// bring-up found and fixed a real precision bug at this tolerance (Schraudolph fast-exp vs
-/// precise expf for the cross-KV-tile online-softmax correction — see the .cu file's header);
+/// precise expf for the cross-KV-tile online-softmax correction — see the .cu file's header;
+/// #501 has since removed the approximation from the per-key weights too, so the kernel now has
+/// one exp flavour and this tolerance covers only FP16 storage and reassociation);
 /// this test suite re-verifies that fix still holds under v2's new multi-warp PV split and
 /// packed-M-dimension layout rather than assuming it carries over unchanged.
 /// </para>
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed unsafe class CudaAttentionMmaDecodeGqaSplitTests
 {
     private const float AbsTol = 5e-3f;

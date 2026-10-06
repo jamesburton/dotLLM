@@ -1,0 +1,9 @@
+# Pinned official vendor SDKs for the dotLLM server conformance matrix (#453).
+#
+# These pins are the contract: the matrix is only comparable across runs if the
+# clients are identical. Bump deliberately, re-run the matrix, and record the new
+# baseline in the same commit.
+#
+# Pinned 2026-09-21 (latest releases on PyPI at that date).
+openai==3.16.2
+anthropic==1.7.0

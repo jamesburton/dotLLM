@@ -33,6 +33,13 @@ public sealed unsafe class CudaTransformerModel : IModel
     private readonly float _ropeTheta;
     private readonly int _ropeDim;
     private readonly int _ropeType;
+    // Dense-YaRN scaling (#366). _ropeYarnInvFreq is CudaWeights' [_ropeDim/2] device
+    // buffer of ramped inverse frequencies (0 when the model has no dense YaRN), and
+    // _ropeYarnMscale the companion cos/sin multiplier (1.0f when inactive). Every RoPE
+    // launch on this model's paths threads both through; the (0, 1.0f) pair is the
+    // kernels' bit-identical no-scaling sentinel. Owned by CudaWeights — do NOT free here.
+    private readonly nint _ropeYarnInvFreq;
+    private readonly float _ropeYarnMscale;
     private readonly bool _useHighPrecisionForward;
 
     /// <summary>
@@ -342,6 +349,19 @@ public sealed unsafe class CudaTransformerModel : IModel
     // oracle's on-the-fly activation quantization). Sized to the largest projection
     // input the gemma4 forward feeds (hidden or the attn-output width).
     private nint _gemma4ActScratchF32;
+
+    // ── Gemma-4 dense-PLE (E2B/E4B), issue #734 ──
+    // Host-built per-layer inputs, layer-major [numLayers, seqLen, pleDim] F32, re-uploaded every forward.
+    private nint _gemma4PleDevice;
+    private long _gemma4PleCapacityBytes;
+    // Cacheless shared-KV donor stash: slot 0 = sliding donor, slot 1 = full-attention donor (F32 K / V).
+    private readonly nint[] _gemma4StashK = new nint[2];
+    private readonly nint[] _gemma4StashV = new nint[2];
+    private long _gemma4StashCapacityBytes;
+    // KV-cache round-trip scratch for the cached dense-Gemma-4 forward: F16 staging of the new rows (write) and F32
+    // expansion of the cached rows (read) - the F32 attention kernel consumes F32 K/V.
+    private nint _gemma4KvTmpK16, _gemma4KvTmpV16, _gemma4KvReadK, _gemma4KvReadV;
+    private long _gemma4KvTmpCapacityBytes, _gemma4KvReadCapacityBytes;
     private int _gemma4ActScratchElems;
 
     // #251: grow-only pool of pinned ("page-locked") host buffers for ForwardBatch's
@@ -391,6 +411,8 @@ public sealed unsafe class CudaTransformerModel : IModel
         _deviceId = deviceId;
         _ropeTheta = ropeTheta;
         _ropeDim = ropeDim;
+        _ropeYarnInvFreq = weights.RopeYarnInvFreqDevice;
+        _ropeYarnMscale = weights.RopeYarnMscale;
         VramWarning = vramWarning;
         _ropeType = ropeType;
 
@@ -408,6 +430,17 @@ public sealed unsafe class CudaTransformerModel : IModel
             rotated = Math.Min(rotated, config.GlobalHeadDim ?? config.HeadDim);
             _gemma4GlobalRotatedPairs = rotated / 2;
             _gemma4GlobalRopeTheta = gcfg.Theta;
+
+            // Proportional rope (rope_freqs.weight, E2B/E4B): factors {1.0 x n, huge x rest} = rotate only the
+            // leading n pairs over the FULL head dim (validated; see Gemma4PerLayerInputs).
+            if (config.IsGemma4DensePle && cpuWeights?.RopeFreqFactors is { } rff && config.GlobalHeadDim is int ghd)
+            {
+                if (rff.Length != ghd / 2)
+                    throw new NotSupportedException(
+                        $"rope_freqs.weight length {rff.Length} != global head dim / 2 ({ghd / 2}).");
+                _gemma4GlobalRotatedPairs =
+                    DotLLM.Models.Architectures.Gemma4PerLayerInputs.ResolveProportionalRopePairs(rff, ghd);
+            }
         }
         _gemma4FinalSoftcap = config.FinalLogitSoftcap ?? 0f;
 
@@ -463,6 +496,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     public static CudaTransformerModel LoadFromGguf(GgufFile gguf, ModelConfig config,
                                                        int deviceId = 0, string? ptxDir = null)
     {
+        // Dense Gemma-4 (E2B/E4B) is CPU-only: fail before any weight load / device work (#730).
         // Load CPU weights (mmap references only, no heavy allocation)
         // GPU-only path: skip the F32 host dequant of the per-expert MoE 3D
         // tensors. Saves ~2.2 GB host RAM per V2-Lite Q4_K_M MoE layer
@@ -562,13 +596,28 @@ public sealed unsafe class CudaTransformerModel : IModel
         TransformerWeights cpuWeights, ModelConfig config, GgufFile? gguf,
         int deviceId, string? ptxDir, long estimatedWeightBytes)
     {
+        // #484: validate the PTX deployment BEFORE any CUDA resource exists. A bad or
+        // incomplete ptxDir is by far the most common way this factory throws, and doing the
+        // check up front means it can no longer orphan a context/stream/cuBLAS handle,
+        // whatever the unwind path does (see CudaKernels.ResolveAndValidatePtxDirectory).
+        ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);
+
+        // #383: context creation cannot leak on its own throw (nothing allocated yet), so it
+        // stays outside the try/catch — everything created from here on (stream/cublas/kernels/
+        // weights/state) is disposed on any failure before rethrowing.
         var context = CudaContext.Create(deviceId);
-        var stream = CudaStream.Create();
-        var cublas = CudaCublasHandle.Create();
+        CudaStream? stream = null;
+        CudaCublasHandle? cublas = null;
+        CudaKernels? kernels = null;
+        CudaWeights? weights = null;
+        CudaForwardState? state = null;
+        try
+        {
+        stream = CudaStream.Create();
+        cublas = CudaCublasHandle.Create();
         cublas.SetStream(stream);
 
-        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
-        var kernels = new CudaKernels(ptxDir);
+        kernels = new CudaKernels(ptxDir);
 
         string? vramWarning = null;
         if (estimatedWeightBytes > 0
@@ -606,7 +655,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             };
         }
 
-        var weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
+        weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
             onHostTensorUploaded: onHostTensorUploaded);
         LastLoadStreamedHostFreeCount = streamedFreeCount;
 
@@ -656,7 +705,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         // DOTLLM_CUDA_FLASH_ATTN_MINSEQ. Per-call gating in CudaFlashAttention.CanUse.
         CudaFlashAttention.ConfigureDefault(geForceAmpere);
 
-        var state = new CudaForwardState(
+        state = new CudaForwardState(
             config.HiddenSize, config.NumAttentionHeads, stateKvHeads,
             stateHeadDim, config.IntermediateSize, config.VocabSize, useFp32Residual);
 
@@ -671,6 +720,21 @@ public sealed unsafe class CudaTransformerModel : IModel
 
         return new CudaTransformerModel(config, weights, state, stream, cublas, context,
             kernels, gguf, cpuWeights, deviceId, ropeTheta, ropeDim, ropeType, vramWarning);
+        }
+        catch
+        {
+            state?.Dispose();
+            weights?.Dispose();
+            kernels?.Dispose();
+            cublas?.Dispose();
+            stream?.Dispose();
+            // CudaContext.Create (above) makes the context current on THIS thread, and this
+            // catch runs synchronously on the same thread — no MakeCurrent() call is needed
+            // here (matches #368's convention: only cross-thread entry points need an explicit
+            // rebind before touching CUDA state).
+            context.Dispose();
+            throw;
+        }
     }
 
     /// <inheritdoc/>
@@ -850,11 +914,14 @@ public sealed unsafe class CudaTransformerModel : IModel
         // on CUDA yet; the cacheless path covers single-shot / short-context decode).
         if (_isGemma4)
         {
-            if (kvCache is not null)
+            // The dense variant (E2B/E4B, #734) supports the FP16 CudaKvCache (per-layer strides); the MoE (26B)
+            // forward remains cacheless.
+            if (kvCache is not null && !(Config.IsGemma4DensePle && kvCache is CudaKvCache))
                 throw new NotSupportedException(
                     "CUDA gemma4 forward is cacheless (autoregressive, no KV cache yet). "
-                    + "Pass kvCache: null. KV-cache support is a follow-up.");
-            return ForwardGemma4(tokenIds, positions, deviceId);
+                    + "Pass kvCache: null. KV-cache support is a follow-up"
+                    + (Config.IsGemma4DensePle ? " (the dense E2B/E4B variant accepts a CudaKvCache only)." : "."));
+            return ForwardGemma4(tokenIds, positions, deviceId, kvCache as CudaKvCache);
         }
 
         if (_useHighPrecisionForward && kvCache is null && !isMla && !isMoe)
@@ -921,7 +988,6 @@ public sealed unsafe class CudaTransformerModel : IModel
         int intermediateSize = Config.IntermediateSize;
         int vocabSize = Config.VocabSize;
         float eps = Config.NormEpsilon;
-        int slidingWindow = Config.SlidingWindowSize ?? 0;
         int h = sizeof(ushort); // FP16 element size
 
         nint s = _stream.Handle;
@@ -1010,6 +1076,13 @@ public sealed unsafe class CudaTransformerModel : IModel
         for (int layer = 0; layer < numLayers; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
+
+            // Per-layer window: gpt-oss alternates window/dense (pattern=2), Gemma-3 uses
+            // pattern=6; uniform-window and no-window models resolve identically to the old
+            // hoisted value. 0 = dense (kernel convention). Mirrors CPU GetLayerSlidingWindow.
+            int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                Config.SlidingWindowSize, Config.SlidingWindowPattern,
+                Config.PerLayerSlidingWindow, layer);
 
             // When a LoRA adapter is active, every fused decode kernel below is bypassed.
             // Declared at the top of the loop (before the MLA `goto FfnBlock`) so it is
@@ -1161,7 +1234,7 @@ public sealed unsafe class CudaTransformerModel : IModel
                     layer,
                     numHeads, numKvHeads, headDim,
                     _ropeDim, _ropeTheta, effectiveRopeType,
-                    s, _kernels);
+                    s, _kernels, _ropeYarnInvFreq, _ropeYarnMscale);
                 MarkProfile(ProfileCategory.RopeAndExtras);
                 int seqKv = cudaKvCache.CurrentLength;
                 MarkProfile(ProfileCategory.KvUpdate);
@@ -1169,15 +1242,22 @@ public sealed unsafe class CudaTransformerModel : IModel
                 _kernels.LaunchAttention(qPtr, cudaKvCache.GetKeysPtr(layer),
                     cudaKvCache.GetValuesPtr(layer), _state.AttnOutput,
                     seqLen, seqKv, numHeads, numKvHeads, headDim,
-                    positions[0], slidingWindow, s);
+                    positions[0], slidingWindow, s, lw.AttnSinksDevice);
             }
             else
             {
                 // Eager fallback path (prefill seqLen>1, quantized KV, or no fused kernel).
                 _kernels.LaunchRoPE(qPtr, kPtr, _state.PositionsDevice,
                     seqLen, numHeads, numKvHeads, headDim,
-                    _ropeDim, _ropeTheta, effectiveRopeType, s);
+                    _ropeDim, _ropeTheta, effectiveRopeType, s,
+                    _ropeYarnInvFreq, _ropeYarnMscale);
                 MarkProfile(ProfileCategory.RopeAndExtras);
+
+                // gpt-oss per-head attention sinks (#365). Hoisted out of `lw` because `lw` is a
+                // `ref readonly` local and so cannot be captured by the local function below.
+                // 0 for every model without `attn_sinks.weight` ⇒ every gate below is a no-op
+                // and every kernel launch is bit-identical to its pre-#365 form.
+                nint layerSinks = lw.AttnSinksDevice;
 
                 // Dispatch G3 (cuBLAS tensor-core prefill attention) when the call is a
                 // pure square-causal global-attention prefill on an eligible device;
@@ -1189,17 +1269,24 @@ public sealed unsafe class CudaTransformerModel : IModel
                     // FLOPs + no score round-trip). Shorter prefill on Ampere → G3 (cuBLAS+
                     // softmax). Everything else (decode, prefix reuse, sliding window, non-64
                     // headDim, non-Ampere) → attention_f16.
-                    if (_flashAttention.CanUse(seqLen, seqKv, positionOffset, slidingWindow,
+                    //
+                    // `layerSinks == 0` guards: neither G-flash nor G3 implements the sink
+                    // epilogue, so a sink-bearing layer must fall through to attention_f16,
+                    // which does (#365). Teaching flash/G3 about sinks is a follow-up perf
+                    // issue (Task 6); correctness first.
+                    if (layerSinks == 0
+                        && _flashAttention.CanUse(seqLen, seqKv, positionOffset, slidingWindow,
                             numHeads, numKvHeads, headDim))
                         _flashAttention.Run(qPtr, kBuf, vBuf, _state.AttnOutput,
                             seqLen, numHeads, numKvHeads, headDim, s);
-                    else if (_g3Attention.CanUse(seqLen, seqKv, positionOffset, slidingWindow, numHeads, numKvHeads))
+                    else if (layerSinks == 0
+                        && _g3Attention.CanUse(seqLen, seqKv, positionOffset, slidingWindow, numHeads, numKvHeads))
                         _g3Attention.Run(_cublas.Handle, qPtr, kBuf, vBuf, _state.AttnOutput,
                             seqLen, numHeads, numKvHeads, headDim, s);
                     else
                         _kernels.LaunchAttention(qPtr, kBuf, vBuf, _state.AttnOutput,
                             seqLen, seqKv, numHeads, numKvHeads, headDim,
-                            positionOffset, slidingWindow, s);
+                            positionOffset, slidingWindow, s, layerSinks);
                 }
 
                 if (kvCache is CudaQuantizedKvCache cudaQKvCache)
@@ -1222,7 +1309,7 @@ public sealed unsafe class CudaTransformerModel : IModel
                     MarkProfile(ProfileCategory.KvUpdate);
                     _kernels.LaunchAttention(qPtr, kCachePtr, vCachePtr, _state.AttnOutput,
                         seqLen, seqKv, numHeads, numKvHeads, headDim,
-                        positions[0], slidingWindow, s);
+                        positions[0], slidingWindow, s, layerSinks);
                 }
                 else if (kvCache is CudaKvCache cudaKvCache)
                 {
@@ -1247,7 +1334,14 @@ public sealed unsafe class CudaTransformerModel : IModel
                     // which need a contiguous buffer regardless — extending the paged-native
                     // path to prefill is a separate, later decision (see
                     // docs/perf/CUDA_PAGED_ATTENTION_DESIGN.md).
-                    if (seqLen == 1 && CudaKernels.EnableNativePagedAttention && _kernels.HasAttentionF16Paged)
+                    // `layerSinks == 0`: attention_f16_paged is a deliberately separate entry
+                    // point that did NOT receive the #365 sink epilogue, so a sink-bearing layer
+                    // must fall through to the gather + DispatchAttention path below (which
+                    // reaches sink-aware attention_f16). Safe to route away from unconditionally:
+                    // this kernel is opt-in and default-OFF. Sink support in the paged kernel is
+                    // a follow-up perf issue (Task 6); correctness first.
+                    if (seqLen == 1 && layerSinks == 0
+                        && CudaKernels.EnableNativePagedAttention && _kernels.HasAttentionF16Paged)
                     {
                         var (kBlockPtrs, vBlockPtrs, _) = cudaPagedKvCache.PrepareNativeBlockPtrs(layer, s);
                         MarkProfile(ProfileCategory.KvUpdate);
@@ -1684,6 +1778,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     {
         ArgumentNullException.ThrowIfNull(requests);
         if (requests.Count == 0) return Array.Empty<ITensor>();
+        _context.MakeCurrent();
         if (requests.Count == 1)
         {
             var r0 = requests[0];
@@ -1752,6 +1847,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         if (adapter is null)
             return Forward(tokenIds, positions, deviceId, kvCache);
 
+        _context.MakeCurrent();
         if (!ReferenceEquals(_cudaLora?.Source, adapter))
         {
             _cudaLora?.Dispose();
@@ -1932,7 +2028,6 @@ public sealed unsafe class CudaTransformerModel : IModel
         int intermediateSize = Config.IntermediateSize;
         int vocabSize = Config.VocabSize;
         float eps = Config.NormEpsilon;
-        int slidingWindow = Config.SlidingWindowSize ?? 0;
         const int seqLen = 1;
         const int h = sizeof(ushort);
 
@@ -1971,6 +2066,14 @@ public sealed unsafe class CudaTransformerModel : IModel
             for (int layer = 0; layer < numLayers; layer++)
             {
                 ref readonly var lw = ref _weights.Layers[layer];
+
+                // Per-layer window: see the comment on the eager Forward() body's identical
+                // computation. Baking the resolved per-layer value into the captured graph is
+                // correct because the window is a static per-layer architectural property that
+                // never changes across replays of this graph.
+                int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                    Config.SlidingWindowSize, Config.SlidingWindowPattern,
+                    Config.PerLayerSlidingWindow, layer);
 
                 // BitNet (I2_S) decode: fuse the Q/K/V projections into ONE GEMV launch
                 // when eligible (same condition as the eager path — no adapter is ever
@@ -2049,13 +2152,15 @@ public sealed unsafe class CudaTransformerModel : IModel
                         kvCache.GetKeysPtr(layer), kvCache.GetValuesPtr(layer),
                         _state.PositionsDevice, _decodePosDevice,
                         numHeads, numKvHeads, headDim,
-                        _ropeDim, kvCache.KvStrideOf(layer), _ropeTheta, effectiveRopeType, s);
+                        _ropeDim, kvCache.KvStrideOf(layer), _ropeTheta, effectiveRopeType, s,
+                        _ropeYarnInvFreq, _ropeYarnMscale);
                 }
                 else
                 {
                     _kernels.LaunchRoPE(qPtr, kPtr, _state.PositionsDevice,
                         seqLen, numHeads, numKvHeads, headDim,
-                        _ropeDim, _ropeTheta, effectiveRopeType, s);
+                        _ropeDim, _ropeTheta, effectiveRopeType, s,
+                        _ropeYarnInvFreq, _ropeYarnMscale);
 
                     // KV-cache update via device-resident position; replaces the eager
                     // path's cuMemcpyDtoDAsync (which would bake the dst address).
@@ -2063,10 +2168,13 @@ public sealed unsafe class CudaTransformerModel : IModel
                 }
 
                 // Attention with device-resident seq_kv / position_offset.
+                // lw.AttnSinksDevice (#365) is graph-safe as a baked argument: it is a fixed
+                // per-layer allocation whose CONTENTS never change between decode steps — unlike
+                // seqKv / positionOffset, which is why only those two are passed indirectly.
                 _kernels.LaunchAttentionDyn(qPtr, kvCache.GetKeysPtr(layer),
                     kvCache.GetValuesPtr(layer), _state.AttnOutput,
                     seqLen, _decodeSeqKvDevice, numHeads, numKvHeads, headDim,
-                    _decodePosDevice, slidingWindow, s);
+                    _decodePosDevice, slidingWindow, s, lw.AttnSinksDevice);
 
                 // Optional attention Sub-LN (BitNet), fused into the O-projection GEMV when
                 // eligible — mirrors the eager path's fusedAttnSubNormO branch (issue #212).
@@ -2237,7 +2345,6 @@ public sealed unsafe class CudaTransformerModel : IModel
         int intermediateSize = Config.IntermediateSize;
         int vocabSize = Config.VocabSize;
         float eps = Config.NormEpsilon;
-        int slidingWindow = Config.SlidingWindowSize ?? 0;
         const int seqLen = 1;
         const int h = sizeof(ushort);
 
@@ -2271,6 +2378,14 @@ public sealed unsafe class CudaTransformerModel : IModel
             for (int layer = 0; layer < numLayers; layer++)
             {
                 ref readonly var lw = ref _weights.Layers[layer];
+
+                // Per-layer window: see the comment on the eager Forward() body's identical
+                // computation. Baking the resolved per-layer value into the captured graph is
+                // correct because the window is a static per-layer architectural property that
+                // never changes across replays of this graph.
+                int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                    Config.SlidingWindowSize, Config.SlidingWindowPattern,
+                    Config.PerLayerSlidingWindow, layer);
 
                 // BitNet (I2_S) decode: fuse the Q/K/V projections into ONE GEMV launch
                 // when eligible — mirrors the eager path's fusedI2SQkv branch (#212).
@@ -2330,7 +2445,8 @@ public sealed unsafe class CudaTransformerModel : IModel
                 int effectiveRopeType = DebugRopeTypeOverride >= 0 ? DebugRopeTypeOverride : _ropeType;
                 _kernels.LaunchRoPE(qPtr, kPtr, _state.PositionsDevice,
                     seqLen, numHeads, numKvHeads, headDim,
-                    _ropeDim, _ropeTheta, effectiveRopeType, s);
+                    _ropeDim, _ropeTheta, effectiveRopeType, s,
+                    _ropeYarnInvFreq, _ropeYarnMscale);
 
                 // KV-cache update (FP16 ring write + predicated quantize-on-evict),
                 // device-side eviction state.
@@ -2342,9 +2458,11 @@ public sealed unsafe class CudaTransformerModel : IModel
                     kvCache.PrepareAttentionScratchForGraph(layer, _decodePosDevice, s, _kernels);
 
                 // Attention with device-resident seq_kv / position_offset.
+                // lw.AttnSinksDevice (#365): graph-safe baked argument — see the sibling
+                // LaunchAttentionDyn call in the FP16-cache graph body above.
                 _kernels.LaunchAttentionDyn(qPtr, kCachePtr, vCachePtr, _state.AttnOutput,
                     seqLen, _decodeSeqKvDevice, numHeads, numKvHeads, headDim,
-                    _decodePosDevice, slidingWindow, s);
+                    _decodePosDevice, slidingWindow, s, lw.AttnSinksDevice);
 
                 // Optional attention Sub-LN (BitNet), fused into the O-projection GEMV when
                 // eligible — mirrors the eager path's fusedAttnSubNormO branch (issue #212).
@@ -2616,7 +2734,6 @@ public sealed unsafe class CudaTransformerModel : IModel
         int intermediateSize = Config.IntermediateSize;
         int vocabSize = Config.VocabSize;
         float eps = Config.NormEpsilon;
-        int slidingWindow = Config.SlidingWindowSize ?? 0;
         nint s = _stream.Handle;
 
         _state.EnsureCapacity(seqLen);
@@ -2653,6 +2770,12 @@ public sealed unsafe class CudaTransformerModel : IModel
         {
             ref readonly var lw = ref _weights.Layers[layer];
 
+            // Per-layer window: see the comment on the eager Forward() body's identical
+            // computation. Mirrors CPU GetLayerSlidingWindow.
+            int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                Config.SlidingWindowSize, Config.SlidingWindowPattern,
+                Config.PerLayerSlidingWindow, layer);
+
             ProjectF32(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutputF32, _state.QF32,
                 lw.QOutputDim, lw.QInputDim, seqLen);
             ProjectF32(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutputF32, _state.KF32,
@@ -2671,10 +2794,16 @@ public sealed unsafe class CudaTransformerModel : IModel
 
             int effectiveRopeType = DebugRopeTypeOverride >= 0 ? DebugRopeTypeOverride : _ropeType;
             _kernels.LaunchRoPEF32(_state.QF32, _state.KF32, _state.PositionsDevice,
-                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, effectiveRopeType, s);
+                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, effectiveRopeType, s,
+                ropeInvFreq: _ropeYarnInvFreq, ropeMscale: _ropeYarnMscale);
 
+            // lw.AttnSinksDevice (#365) is 0 for every model that reaches this high-precision
+            // path today (it is gated on IQ-family quantization; gpt-oss ships MXFP4, which is
+            // not IQ). Passed anyway so a future sinks model routed here cannot silently drop
+            // them — the F32 kernel has implemented the sink epilogue since Task 1.
             _kernels.LaunchAttentionF32(_state.QF32, _state.KF32, _state.VF32, _state.AttnOutputF32,
-                seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s);
+                seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s,
+                lw.AttnSinksDevice);
 
             ProjectF32(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutputF32, _state.NormOutputF32,
                 lw.OOutputDim, lw.OInputDim, seqLen);
@@ -2768,13 +2897,14 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// custom router (1/√H folded into RouterScale), per-expert down scale (folded into
     /// the F32 down bank at load), layer_output_scale, and the final-logit softcap.
     /// </summary>
-    private ITensor ForwardGemma4(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
+    private ITensor ForwardGemma4(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+        CudaKvCache? kv = null)
     {
         if (!_kernels.HasGemma4Kernels)
             throw new InvalidOperationException(
                 "Gemma4 F32 helper kernels not available. Compile native/kernels/gemma4_f32.cu to "
                 + "PTX (native/build.{sh,ps1}) and ensure gemma4_f32.ptx ships under runtimes/.../ptx.");
-        if (!_kernels.HasMoeKernels)
+        if (Config.Moe is not null && !_kernels.HasMoeKernels)
             throw new InvalidOperationException(
                 "MoE kernels not available (required for the gemma4 expert path). Compile "
                 + "native/kernels/moe_ffn.cu to PTX.");
@@ -2809,6 +2939,12 @@ public sealed unsafe class CudaTransformerModel : IModel
         if (embedScale != 1.0f)
             _kernels.LaunchScaleInplaceF32(_state.HiddenStateF32, seqLen * hiddenSize, embedScale, s);
 
+        // Dense-PLE (#734): per-layer inputs built on the host with the exact CPU-oracle code, uploaded layer-major.
+        if (Config.PerLayerEmbedding is not null)
+            UploadGemma4PleInputs(tokenIds);
+        if (Config.NumSharedKvLayers > 0)
+            EnsureGemma4SharedKvStash(seqLen);
+
         int numLayers = DebugMaxLayers switch
         {
             < 0 => 0,
@@ -2820,20 +2956,23 @@ public sealed unsafe class CudaTransformerModel : IModel
         {
             ref readonly var lw = ref _weights.Layers[layer];
             var g4 = _weights.Gemma4Layers![layer]!;
-            var moeW = _weights.MoeLayers![layer]!;
+            var moeW = _weights.MoeLayers?[layer];
 
             // ResidualF32 holds the layer input (== HiddenStateF32 at entry).
             CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.ResidualF32, _state.HiddenStateF32,
                 (nuint)((long)seqLen * hiddenSize * sizeof(float)), s).ThrowOnError();
 
-            RunGemma4AttentionF32(layer, in lw, g4, seqLen, eps, s);
+            RunGemma4AttentionF32(layer, in lw, g4, seqLen, eps, s, kv, positions);
             // attn_out = post_attention_norm(O) + residual ; leaves attn_out in HiddenStateF32.
             _kernels.LaunchRmsNormF32(_state.NormOutputF32, g4.PostAttnNorm, _state.NormOutputF32,
                 hiddenSize, eps, seqLen, s);
             _kernels.LaunchAddF32(_state.ResidualF32, _state.NormOutputF32, _state.HiddenStateF32,
                 seqLen * hiddenSize, s);
 
-            RunGemma4FfnF32(layer, in lw, g4, moeW, seqLen, eps, s);
+            if (moeW is null)
+                RunGemma4DenseFfnF32(layer, in lw, g4, seqLen, eps, s);
+            else
+                RunGemma4FfnF32(layer, in lw, g4, moeW, seqLen, eps, s);
         }
 
         // Final RMSNorm (last token only) + LM head + softcap.
@@ -2847,7 +2986,26 @@ public sealed unsafe class CudaTransformerModel : IModel
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
         float softcap = _gemma4FinalSoftcap;
 
-        if (_cpuWeights is not null)
+        if (Config.IsGemma4DensePle && _weights.OutputWeightQuant != 0)
+        {
+            // Dense variant (#734): F32 LM head on the device, chunked by rows so the dequant scratch (sized for the
+            // largest projection) is reused. The tied 262144 x 2560 table on the host would cost ~1 s/token.
+            int inDim = _weights.OutputInputDim, outDim = _weights.OutputOutputDim;
+            long rowBytes = DotLLM.Cpu.Kernels.Dequantize.RowByteSize(inDim, _weights.OutputQuantType);
+            int chunkRows = Math.Max(1, (int)Math.Min((long)Config.IntermediateSize * hiddenSize / inDim, outDim));
+            for (int r0 = 0; r0 < outDim; r0 += chunkRows)
+            {
+                int rows = Math.Min(chunkRows, outDim - r0);
+                ProjectF32(_weights.OutputWeightQuant + (nint)(r0 * rowBytes), _weights.OutputQuantType, 0,
+                    _state.NormOutputF32, _state.LogitsF32 + (nint)((long)r0 * sizeof(float)), rows, inDim, 1);
+            }
+            if (softcap > 0f)
+                _kernels.LaunchSoftcapInplaceF32(_state.LogitsF32, vocabSize, softcap, s);
+            _stream.Synchronize();
+            CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.LogitsF32,
+                (nuint)(vocabSize * sizeof(float))).ThrowOnError();
+        }
+        else if (_cpuWeights is not null)
         {
             float[] normHost = ArrayPool<float>.Shared.Rent(hiddenSize);
             try
@@ -2898,13 +3056,20 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// KV / rope, V-from-K, per-head QK-norm, weight-less V-norm, scale 1.0.
     /// </summary>
     private void RunGemma4AttentionF32(int layer, in CudaLayerWeights lw,
-        CudaGemma4LayerWeights g4, int seqLen, float eps, nint s)
+        CudaGemma4LayerWeights g4, int seqLen, float eps, nint s,
+        CudaKvCache? kv = null, ReadOnlySpan<int> positions = default)
     {
         int hiddenSize = Config.HiddenSize;
         int numHeads = Config.NumAttentionHeads;
         int headDim = Config.GetLayerHeadDim(layer);
         int numKvHeads = Config.NumGlobalKvHeads is int gk && Config.IsFullAttentionLayer(layer)
             ? gk : Config.NumKvHeads;
+        // Shared-KV (E2B/E4B, #734): trailing layers skip K/V and attend over the donor layer's K/V
+        // (same attention kind); the donor stashes its post-rope K / post-norm V for them.
+        bool ownKv = Config.LayerHasOwnKv(layer);
+        int sharedSlot = Config.IsFullAttentionLayer(layer) ? 1 : 0;
+        bool isSharedDonor = Config.NumSharedKvLayers > 0
+            && layer == Config.NumLayers - Config.NumSharedKvLayers - (Config.IsFullAttentionLayer(layer) ? 1 : 2);
 
         // attn_norm(input) → NormOutputF32
         _kernels.LaunchRmsNormF32(_state.ResidualF32, g4.AttnNorm, _state.NormOutputF32,
@@ -2913,12 +3078,17 @@ public sealed unsafe class CudaTransformerModel : IModel
         // Q, K projections (raw — K captured before k-norm/rope for V-from-K).
         ProjectF32Gemma4(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutputF32, _state.QF32,
             lw.QOutputDim, lw.QInputDim, seqLen);
-        ProjectF32Gemma4(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutputF32, _state.KF32,
-            lw.KOutputDim, lw.KInputDim, seqLen);
+        if (ownKv)
+            ProjectF32Gemma4(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutputF32, _state.KF32,
+                lw.KOutputDim, lw.KInputDim, seqLen);
 
         // V branch: V-from-K (global, V-less) copies the raw K projection into V;
         // else V = wv · normIn.
-        if (g4.VFromK)
+        if (!ownKv)
+        {
+            // No K/V projections on a shared-KV layer.
+        }
+        else if (g4.VFromK)
         {
             long kvBytes = (long)seqLen * numKvHeads * headDim * sizeof(float);
             CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.VF32, _state.KF32, (nuint)kvBytes, s).ThrowOnError();
@@ -2931,25 +3101,37 @@ public sealed unsafe class CudaTransformerModel : IModel
 
         // Per-head Q/K RMSNorm (× learned weight); weight-less V RMSNorm (unit gamma).
         _kernels.LaunchPerHeadRmsNormF32(_state.QF32, g4.QNorm, eps, numHeads, headDim, seqLen, s);
-        _kernels.LaunchPerHeadRmsNormF32(_state.KF32, g4.KNorm, eps, numKvHeads, headDim, seqLen, s);
-        _kernels.LaunchRmsNormWeightlessF32(_state.VF32, _state.VF32, headDim, eps,
-            seqLen * numKvHeads, s);
+        if (ownKv)
+        {
+            _kernels.LaunchPerHeadRmsNormF32(_state.KF32, g4.KNorm, eps, numKvHeads, headDim, seqLen, s);
+            _kernels.LaunchRmsNormWeightlessF32(_state.VF32, _state.VF32, headDim, eps,
+                seqLen * numKvHeads, s);
+        }
 
         // RoPE on Q and K (V not roped). Global layers: partial NeoX (pair (i, i+headDim/2),
         // freq base over the full head dim). Sliding layers: full NeoX rotation.
         if (Config.IsFullAttentionLayer(layer) && _gemma4GlobalRotatedPairs > 0
             && Config.GlobalHeadDim is int)
         {
+            // Shared-KV layers rotate Q only; rotate one (stale, never read) K head to keep the kernel contract.
             _kernels.LaunchRoPEF32PartialNeoX(_state.QF32, _state.KF32, _state.PositionsDevice,
-                seqLen, numHeads, numKvHeads, headDim, _gemma4GlobalRotatedPairs,
+                seqLen, numHeads, ownKv ? numKvHeads : 1, headDim, _gemma4GlobalRotatedPairs,
                 _gemma4GlobalRopeTheta, s);
         }
         else
         {
             // Sliding layers use the primary (sliding) rope schedule, full NeoX.
             _kernels.LaunchRoPEF32(_state.QF32, _state.KF32, _state.PositionsDevice,
-                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta,
+                seqLen, numHeads, ownKv ? numKvHeads : 1, headDim, _ropeDim, _ropeTheta,
                 CudaKernels.ToCudaRopeType(RoPEType.NeoX), s);
+        }
+
+        // Cacheless shared-KV donor stash: capture this donor layer's post-rope K / post-norm V.
+        if (ownKv && isSharedDonor)
+        {
+            long stashBytes = (long)seqLen * numKvHeads * headDim * sizeof(float);
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_gemma4StashK[sharedSlot], _state.KF32, (nuint)stashBytes, s).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_gemma4StashV[sharedSlot], _state.VF32, (nuint)stashBytes, s).ThrowOnError();
         }
 
         // Attention scale = 1.0 (q/k-norm make Q,K unit). The F32 attention kernel
@@ -2958,12 +3140,146 @@ public sealed unsafe class CudaTransformerModel : IModel
             MathF.Sqrt((float)headDim), s);
 
         int slidingWindow = GetGemmaLayerSlidingWindow(layer);
-        _kernels.LaunchAttentionF32(_state.QF32, _state.KF32, _state.VF32, _state.AttnOutputF32,
-            seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s);
+        // lw.AttnSinksDevice (#365) is 0 for Gemma-4 (no attn_sinks.weight tensor); passed for
+        // the same defensive reason as the high-precision path's sibling call.
+        nint attnK = ownKv ? _state.KF32 : _gemma4StashK[sharedSlot];
+        nint attnV = ownKv ? _state.VF32 : _gemma4StashV[sharedSlot];
+        int seqKv = seqLen, posOffset = 0;
+        if (kv is not null)
+        {
+            // Cached path (dense variant): write this layer's new rows (F32 -> F16) into the per-layer-strided
+            // CudaKvCache, then expand the cached rows of the K/V SOURCE layer (own layer, or the donor for a
+            // shared-KV layer) back to F32 for the F32 attention kernel.
+            int kvStride = numKvHeads * headDim;
+            if (ownKv)
+            {
+                EnsureGemma4KvTmp((long)seqLen * kvStride * sizeof(ushort));
+                _kernels.LaunchConvertF32ToF16(_state.KF32, _gemma4KvTmpK16, seqLen * kvStride, s);
+                _kernels.LaunchConvertF32ToF16(_state.VF32, _gemma4KvTmpV16, seqLen * kvStride, s);
+                kv.UpdateDevice(_gemma4KvTmpK16, _gemma4KvTmpV16, positions, seqLen, layer, s);
+            }
+            int srcLayer = ownKv ? layer : Config.SharedKvDonorLayer(layer);
+            seqKv = kv.CurrentLength;
+            posOffset = positions[0];
+            EnsureGemma4KvRead((long)seqKv * kvStride * sizeof(float));
+            _kernels.LaunchConvertF16ToF32(kv.GetKeysPtr(srcLayer), _gemma4KvReadK, seqKv * kvStride, s);
+            _kernels.LaunchConvertF16ToF32(kv.GetValuesPtr(srcLayer), _gemma4KvReadV, seqKv * kvStride, s);
+            attnK = _gemma4KvReadK;
+            attnV = _gemma4KvReadV;
+        }
+        _kernels.LaunchAttentionF32(_state.QF32, attnK, attnV, _state.AttnOutputF32,
+            seqLen, seqKv, numHeads, numKvHeads, headDim, posOffset, slidingWindow, s,
+            lw.AttnSinksDevice);
 
         // o_proj → NormOutputF32.
         ProjectF32Gemma4(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutputF32, _state.NormOutputF32,
             lw.OOutputDim, lw.OInputDim, seqLen);
+    }
+
+    private void EnsureGemma4KvTmp(long bytes)
+    {
+        if (_gemma4KvTmpCapacityBytes >= bytes) return;
+        if (_gemma4KvTmpK16 != 0) CudaDriverApi.cuMemFree_v2(_gemma4KvTmpK16);
+        if (_gemma4KvTmpV16 != 0) CudaDriverApi.cuMemFree_v2(_gemma4KvTmpV16);
+        CudaDriverApi.cuMemAlloc_v2(out _gemma4KvTmpK16, (nuint)bytes).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out _gemma4KvTmpV16, (nuint)bytes).ThrowOnError();
+        _gemma4KvTmpCapacityBytes = bytes;
+    }
+
+    private void EnsureGemma4KvRead(long bytes)
+    {
+        if (_gemma4KvReadCapacityBytes >= bytes) return;
+        long grown = Math.Max(bytes, _gemma4KvReadCapacityBytes * 2);
+        if (_gemma4KvReadK != 0) CudaDriverApi.cuMemFree_v2(_gemma4KvReadK);
+        if (_gemma4KvReadV != 0) CudaDriverApi.cuMemFree_v2(_gemma4KvReadV);
+        CudaDriverApi.cuMemAlloc_v2(out _gemma4KvReadK, (nuint)grown).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out _gemma4KvReadV, (nuint)grown).ThrowOnError();
+        _gemma4KvReadCapacityBytes = grown;
+    }
+
+    /// <summary>Builds the Gemma-4 PLE per-layer inputs on the host and uploads them layer-major to the device.</summary>
+    private void UploadGemma4PleInputs(ReadOnlySpan<int> tokenIds)
+    {
+        if (_cpuWeights is null)
+            throw new InvalidOperationException("Gemma-4 PLE needs the retained host weights.");
+        float[] data = DotLLM.Models.Architectures.Gemma4PerLayerInputs.ComputeLayerMajor(_cpuWeights, Config, tokenIds);
+        long bytes = (long)data.Length * sizeof(float);
+        if (_gemma4PleCapacityBytes < bytes)
+        {
+            if (_gemma4PleDevice != 0) CudaDriverApi.cuMemFree_v2(_gemma4PleDevice);
+            CudaDriverApi.cuMemAlloc_v2(out _gemma4PleDevice, (nuint)bytes).ThrowOnError();
+            _gemma4PleCapacityBytes = bytes;
+        }
+        fixed (float* p = data)
+            CudaDriverApi.cuMemcpyHtoD_v2(_gemma4PleDevice, (nint)p, (nuint)bytes).ThrowOnError();
+    }
+
+    /// <summary>Lazily (re)allocates the cacheless shared-KV donor stash for <paramref name="seqLen"/> rows.</summary>
+    private void EnsureGemma4SharedKvStash(int seqLen)
+    {
+        int maxKvStride = Math.Max(
+            Config.NumKvHeads * Config.HeadDim,
+            (Config.NumGlobalKvHeads ?? Config.NumKvHeads) * (Config.GlobalHeadDim ?? Config.HeadDim));
+        long bytes = (long)seqLen * maxKvStride * sizeof(float);
+        if (_gemma4StashCapacityBytes >= bytes) return;
+        for (int i = 0; i < 2; i++)
+        {
+            if (_gemma4StashK[i] != 0) CudaDriverApi.cuMemFree_v2(_gemma4StashK[i]);
+            if (_gemma4StashV[i] != 0) CudaDriverApi.cuMemFree_v2(_gemma4StashV[i]);
+            CudaDriverApi.cuMemAlloc_v2(out _gemma4StashK[i], (nuint)bytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out _gemma4StashV[i], (nuint)bytes).ThrowOnError();
+        }
+        _gemma4StashCapacityBytes = bytes;
+    }
+
+    /// <summary>
+    /// Gemma-4 DENSE-only FFN (E2B/E4B, issue #734). Reads attn_out from <c>HiddenStateF32</c>:
+    /// cur = rms(down(geglu(gate·n, up·n)))·post_ffw_norm + attn_out, then the PLE gated injection, then
+    /// layer_output_scale. Mirrors CPU <c>RunGemma4Layer</c> (dense-only else branch + InjectLayer).
+    /// </summary>
+    private void RunGemma4DenseFfnF32(int layer, in CudaLayerWeights lw,
+        CudaGemma4LayerWeights g4, int seqLen, float eps, nint s)
+    {
+        int hiddenSize = Config.HiddenSize;
+        int denseInterm = lw.GateOutputDim;
+
+        _kernels.LaunchRmsNormF32(_state.HiddenStateF32, g4.FfnNorm, _state.NormOutputF32,
+            hiddenSize, eps, seqLen, s);
+        ProjectF32Gemma4(lw.GateQuant, lw.GateQuantType, lw.Gate, _state.NormOutputF32, _state.FfnGateF32,
+            lw.GateOutputDim, lw.GateInputDim, seqLen);
+        ProjectF32Gemma4(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutputF32, _state.FfnUpF32,
+            lw.UpOutputDim, lw.UpInputDim, seqLen);
+        _kernels.LaunchGeGLUTanhF32(_state.FfnGateF32, _state.FfnUpF32, _state.SiluOutputF32,
+            denseInterm, seqLen, s);
+        ProjectF32Gemma4(lw.DownQuant, lw.DownQuantType, lw.Down, _state.SiluOutputF32, _gemma4DenseF32,
+            lw.DownOutputDim, lw.DownInputDim, seqLen);
+        _kernels.LaunchRmsNormF32(_gemma4DenseF32, g4.PostFfwNorm, _gemma4DenseF32,
+            hiddenSize, eps, seqLen, s);
+        _kernels.LaunchAddF32(_state.HiddenStateF32, _gemma4DenseF32, _state.HiddenStateF32,
+            seqLen * hiddenSize, s);
+
+        // ── PLE injection (after the FFN residual, before layer_output_scale) ──
+        if (g4.PleGate != 0)
+        {
+            int pleDim = g4.PleDim;
+            // gate = inp_gate · hidden  → FfnGateF32 [seq, pleDim]
+            CudaGemm.LinearF32(_cublas.Handle, _state.HiddenStateF32, g4.PleGate, _state.FfnGateF32,
+                seqLen, hiddenSize, pleDim, s);
+            // g = gelu_tanh(gate) * perLayerInput[layer]  → SiluOutputF32
+            nint slice = _gemma4PleDevice + (nint)((long)layer * seqLen * pleDim * sizeof(float));
+            _kernels.LaunchGeGLUTanhF32(_state.FfnGateF32, slice, _state.SiluOutputF32, pleDim, seqLen, s);
+            // p = post_norm(proj · g); hidden += p
+            CudaGemm.LinearF32(_cublas.Handle, _state.SiluOutputF32, g4.PleProj, _state.NormOutputF32,
+                seqLen, pleDim, hiddenSize, s);
+            _kernels.LaunchRmsNormF32(_state.NormOutputF32, g4.PlePostNorm, _state.NormOutputF32,
+                hiddenSize, eps, seqLen, s);
+            _kernels.LaunchAddF32(_state.HiddenStateF32, _state.NormOutputF32, _state.HiddenStateF32,
+                seqLen * hiddenSize, s);
+        }
+
+        if (g4.LayerOutputScale != 1.0f)
+            _kernels.LaunchScaleInplaceF32(_state.HiddenStateF32, seqLen * hiddenSize,
+                g4.LayerOutputScale, s);
     }
 
     /// <summary>
@@ -3449,6 +3765,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        _context.MakeCurrent();
         ReportLaunchProfile();
         _cudaLora?.Dispose();
         DisposeDecodeGraph();
@@ -3469,6 +3786,16 @@ public sealed unsafe class CudaTransformerModel : IModel
         if (_gemma4MoeF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4MoeF32); _gemma4MoeF32 = 0; }
         if (_gemma4RouterInF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4RouterInF32); _gemma4RouterInF32 = 0; }
         if (_gemma4ActScratchF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4ActScratchF32); _gemma4ActScratchF32 = 0; }
+        if (_gemma4PleDevice != 0) { CudaDriverApi.cuMemFree_v2(_gemma4PleDevice); _gemma4PleDevice = 0; }
+        if (_gemma4KvTmpK16 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4KvTmpK16); _gemma4KvTmpK16 = 0; }
+        if (_gemma4KvTmpV16 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4KvTmpV16); _gemma4KvTmpV16 = 0; }
+        if (_gemma4KvReadK != 0) { CudaDriverApi.cuMemFree_v2(_gemma4KvReadK); _gemma4KvReadK = 0; }
+        if (_gemma4KvReadV != 0) { CudaDriverApi.cuMemFree_v2(_gemma4KvReadV); _gemma4KvReadV = 0; }
+        for (int i = 0; i < 2; i++)
+        {
+            if (_gemma4StashK[i] != 0) { CudaDriverApi.cuMemFree_v2(_gemma4StashK[i]); _gemma4StashK[i] = 0; }
+            if (_gemma4StashV[i] != 0) { CudaDriverApi.cuMemFree_v2(_gemma4StashV[i]); _gemma4StashV[i] = 0; }
+        }
         if (_batchPinnedHostBuffers != null)
         {
             foreach (var p in _batchPinnedHostBuffers)

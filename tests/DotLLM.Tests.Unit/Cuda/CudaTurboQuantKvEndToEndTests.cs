@@ -17,6 +17,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// cache. Mirrors the Vulkan end-to-end test. Gated on a CUDA GPU + turboquant.ptx (runs on T5500).
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed unsafe class CudaTurboQuantKvEndToEndTests
 {
     private const ulong Seed = 0xC0FFEE_4B2CUL;

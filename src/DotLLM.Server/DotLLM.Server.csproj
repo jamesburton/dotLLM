@@ -18,6 +18,10 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="DotLLM.Tests.Unit" />
+    <!-- (#455) The tray's contract suite round-trips every management DTO through the real
+         source-generated ServerJsonContext, which is internal. Test-only visibility: the tray
+         application itself does not reference this assembly at all, by design. -->
+    <InternalsVisibleTo Include="DotLLM.Tray.Tests" />
   </ItemGroup>
 
   <ItemGroup>

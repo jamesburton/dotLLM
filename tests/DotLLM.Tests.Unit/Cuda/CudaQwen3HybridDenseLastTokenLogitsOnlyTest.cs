@@ -89,6 +89,14 @@ public class CudaQwen3HybridDenseLastTokenLogitsOnlyTest
         // IKvCache is passed, making the two calls' outputs incomparable. Fresh model instances
         // give each call its own zero-initialized recurrent state, isolating the comparison to
         // exactly what lastTokenLogitsOnly changes: the LM-head row count.
+        // #500: the hinted call runs the LM head at one row and the full call runs it at seqLen, and
+        // the row count decides which PQ2_0 path each takes (dp4a int8 for small S, dequant+cuBLAS F16
+        // above). That is #485's deliberate numeric trade, an order of magnitude larger than the
+        // GEMV-vs-general-path drift this test bounds, so pin one path across both arms.
+        bool? dp4aWas = CudaSmallSGemvDispatch.Dp4aOverride;
+        CudaSmallSGemvDispatch.Dp4aOverride = false;
+        try
+        {
         _out.WriteLine("Running full (lastTokenLogitsOnly: false) on a fresh model instance...");
         float[] fullLastRow;
         using (var gguf1 = GgufFile.Open(path!))
@@ -127,6 +135,11 @@ public class CudaQwen3HybridDenseLastTokenLogitsOnlyTest
                 $"logits[{i}]: full-call last row={a}, lastTokenLogitsOnly row={b}, diff={diff} " +
                 $"exceeds tolerance {tol} -- shrinking the LM-head to one row changed the computed " +
                 "value by more than the expected GEMV-vs-general-path kernel drift.");
+        }
+        }
+        finally
+        {
+            CudaSmallSGemvDispatch.Dp4aOverride = dp4aWas;
         }
 
         _out.WriteLine($"{SliceLen} logits compared -- full-call last row vs. lastTokenLogitsOnly row: within tolerance.");

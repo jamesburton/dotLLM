@@ -19,6 +19,51 @@ namespace DotLLM.Vulkan;
 /// </remarks>
 public static class VulkanModelLoader
 {
+    private static readonly Lazy<VulkanDevice> SharedDeviceLazy = new(VulkanDevice.Create);
+
+    /// <summary>
+    /// Process-wide Vulkan device for long-lived hosts (<c>serve</c>, <c>run</c>). Created on first use and
+    /// intentionally never disposed: the model does not own its device, and one device per process is
+    /// what the serving paths want across model reloads. Short-lived commands that want deterministic
+    /// teardown (<c>bench</c>) create and dispose their own.
+    /// </summary>
+    public static VulkanDevice SharedDevice => SharedDeviceLazy.Value;
+
+    /// <summary>
+    /// Resolves the SPIR-V blob directory: <c>spv/</c> beside the running assembly (the MSBuild
+    /// content-copy layout), falling back to the in-repo <c>native/vulkan/spv</c> for <c>dotnet run</c>
+    /// from the source tree.
+    /// </summary>
+    public static string ResolveSpvDir()
+    {
+        string[] candidates =
+        {
+            Path.Combine(AppContext.BaseDirectory, "spv"),
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "native", "vulkan", "spv"),
+        };
+        foreach (string c in candidates)
+        {
+            string full = Path.GetFullPath(c);
+            if (Directory.Exists(full) && Directory.GetFiles(full, "*.spv").Length > 0)
+                return full;
+        }
+        throw new InvalidOperationException(
+            "SPIR-V blobs not found (looked for spv/ beside the binary and native/vulkan/spv). " +
+            "Build them with native/vulkan/build.ps1 (requires the Vulkan SDK).");
+    }
+
+    /// <summary>True when a <c>--device</c> string selects the Vulkan backend (<c>vulkan</c>).</summary>
+    public static bool IsVulkanDeviceString(string? device) =>
+        device is not null && device.StartsWith("vulkan", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// <see cref="CreateFromGguf"/> on the <see cref="SharedDevice"/> with the standard SPIR-V directory —
+    /// the one call the serving entry points make.
+    /// </summary>
+    public static (IModel Model, Func<int, IKvCache> KvCacheFactory) CreateSharedFromGguf(
+        GgufFile gguf, ModelConfig config, int nCpuMoeLayers = -1)
+        => CreateFromGguf(SharedDevice, gguf, config, ResolveSpvDir(), nCpuMoeLayers);
+
     /// <summary>
     /// Creates the architecture-appropriate Vulkan model for <paramref name="gguf"/>.
     /// </summary>
@@ -36,7 +81,9 @@ public static class VulkanModelLoader
     /// cache type and there is no common <c>CreateKvCache</c> interface.
     /// </returns>
     /// <exception cref="NotSupportedException">
-    /// The architecture has no GGUF representation at all (Mamba-3).
+    /// The architecture has no GGUF representation at all (Mamba-3), is recognized but not
+    /// runnable on Vulkan yet (nemotron_h_moe), or needs attention features Vulkan lacks
+    /// (gpt-oss: attention sinks, dense YaRN; #480).
     /// </exception>
     public static (IModel Model, Func<int, IKvCache> KvCacheFactory) CreateFromGguf(
         VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir,
@@ -88,6 +135,14 @@ public static class VulkanModelLoader
                     "general.architecture and no GGUF tensor-naming convention, so GgufModelConfigExtractor " +
                     "cannot produce Architecture.Mamba3 in the first place. Mamba-3 is safetensors-first on " +
                     "every backend — load it via VulkanMamba3TransformerModel.LoadFromSafetensors.");
+
+            // gpt-oss (#480): no attention sinks and no dense YaRN on Vulkan. Without this arm it
+            // falls into `default` and the generic model loads it happily and emits wrong logits.
+            // VulkanTransformerModel.RejectUnsupportedArchitecture throws the same message, which is
+            // what keeps the direct-LoadFromGguf / pipeline / hybrid side doors shut too; this arm
+            // exists so the dispatch point documents the refusal (as CUDA's did before #365).
+            case Architecture.GptOss:
+                throw new NotSupportedException(VulkanTransformerModel.GptOssUnsupportedMessage);
 
             default:
             {

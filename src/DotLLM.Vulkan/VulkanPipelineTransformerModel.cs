@@ -94,6 +94,9 @@ public sealed unsafe class VulkanPipelineTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
         ValidateSplit(splitLayer, config.NumLayers);
+        // Refuse unsupported architectures (e.g. gpt-oss, #480) before creating devices and reading
+        // every host weight; each stage's BuildFromPrebuiltWeights would refuse too, but only after that.
+        VulkanTransformerModel.RejectUnsupportedArchitecture(config);
         spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
 
         VulkanDevice? device0 = null, device1 = null;

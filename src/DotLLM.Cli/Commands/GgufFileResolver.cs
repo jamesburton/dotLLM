@@ -11,80 +11,96 @@ namespace DotLLM.Cli.Commands;
 internal static class GgufFileResolver
 {
     /// <summary>
-    /// Resolves the argument to a local .gguf file path.
+    /// Resolves the argument to a local .gguf file path via <see cref="ModelResolver"/>: a path, <c>owner/repo[:tag]</c>,
+    /// <c>owner/repo/file.gguf</c>, <c>hf.co/...</c> or a bare local name; models in the Hugging Face hub cache are found too.
+    /// When nothing local matches and <paramref name="allowPull"/> is set, a Hub reference is downloaded (resumable, with progress).
     /// Returns null and prints an error if resolution fails.
     /// </summary>
-    /// <param name="fileArg">File path, repo ID, or repo ID with filename.</param>
-    /// <param name="quant">Optional quantization filter (e.g., "Q8_0") for disambiguation.</param>
-    public static string? Resolve(string fileArg, string? quant = null)
+    /// <param name="fileArg">File path, repo ID (optionally with :tag or /filename), or local model name.</param>
+    /// <param name="quant">Optional quantization filter (e.g., "Q8_0"); equivalent to a <c>:tag</c>.</param>
+    /// <param name="allowPull">Download a missing Hub model instead of failing (ollama-style <c>run</c> behaviour).</param>
+    public static string? Resolve(string fileArg, string? quant = null, bool allowPull = false)
     {
-        // Direct file path — use as-is.
         if (File.Exists(fileArg))
             return Path.GetFullPath(fileArg);
 
-        // Check if it looks like a repo ID (contains /).
-        if (fileArg.Contains('/'))
+        string? local = ModelResolver.ResolveLocal(fileArg, quant, includeOllama: true);
+        if (local is not null)
+            return local;
+
+        var reference = ModelResolver.Parse(fileArg);
+        if (reference.IsRepo && allowPull)
         {
-            string modelsDir = HuggingFaceDownloader.DefaultModelsDirectory;
-
-            // Try owner/repo/file.gguf form: split into repo ID + filename.
-            var resolved = TryResolveRepoFile(modelsDir, fileArg);
-            if (resolved is not null)
-                return resolved;
-
-            // Standard owner/repo form — look up downloaded models.
-            string repoDir = Path.Combine(modelsDir, fileArg.Replace('/', Path.DirectorySeparatorChar));
-
-            if (!Directory.Exists(repoDir))
+            try
             {
-                AnsiConsole.MarkupLine($"[red]Not found as file or downloaded model:[/] {fileArg.EscapeMarkup()}");
-                AnsiConsole.MarkupLine($"[grey]Checked: {repoDir.EscapeMarkup()}[/]");
+                return PullWithProgress(reference, quant);
+            }
+            catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException or IOException)
+            {
+                AnsiConsole.MarkupLine($"[red]Could not pull {fileArg.EscapeMarkup()}:[/] {ex.Message.EscapeMarkup()}");
                 return null;
             }
-
-            var ggufFiles = Directory.GetFiles(repoDir, "*.gguf");
-
-            if (ggufFiles.Length == 0)
-            {
-                AnsiConsole.MarkupLine($"[red]No .gguf files found in:[/] {repoDir.EscapeMarkup()}");
-                return null;
-            }
-
-            if (ggufFiles.Length == 1)
-                return ggufFiles[0];
-
-            // Multiple files — apply --quant filter if provided.
-            if (!string.IsNullOrEmpty(quant))
-            {
-                var filtered = ggufFiles
-                    .Where(f => Path.GetFileName(f).Contains(quant, StringComparison.OrdinalIgnoreCase))
-                    .ToArray();
-
-                if (filtered.Length == 1)
-                    return filtered[0];
-
-                if (filtered.Length == 0)
-                {
-                    AnsiConsole.MarkupLine($"[red]No .gguf files matching '--quant {quant.EscapeMarkup()}' in {fileArg.EscapeMarkup()}:[/]");
-                    foreach (var f in ggufFiles)
-                        AnsiConsole.MarkupLine($"  {Path.GetFileName(f).EscapeMarkup()}");
-                    return null;
-                }
-
-                // Still ambiguous after filter — fall through to disambiguation error with filtered list.
-                ggufFiles = filtered;
-            }
-
-            // Disambiguation error.
-            AnsiConsole.MarkupLine($"[yellow]Multiple .gguf files in {fileArg.EscapeMarkup()}:[/]");
-            foreach (var f in ggufFiles)
-                AnsiConsole.MarkupLine($"  {Path.GetFileName(f).EscapeMarkup()}");
-            AnsiConsole.MarkupLine("[grey]Use --quant <type> to select (e.g., --quant Q8_0).[/]");
-            return null;
         }
 
-        AnsiConsole.MarkupLine($"[red]File not found:[/] {fileArg.EscapeMarkup()}");
+        if (!reference.IsRepo && allowPull && OllamaRef.TryParse(fileArg) is { } ollamaRef)
+        {
+            try { return PullOllamaWithProgress(ollamaRef); }
+            catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException or IOException)
+            {
+                AnsiConsole.MarkupLine($"[red]Could not pull {fileArg.EscapeMarkup()}:[/] {ex.Message.EscapeMarkup()}");
+                return null;
+            }
+        }
+
+        AnsiConsole.MarkupLine($"[red]Model not found locally:[/] {fileArg.EscapeMarkup()}");
+        AnsiConsole.MarkupLine(reference.IsRepo
+            ? $"[grey]Download it with:[/] dotllm model pull {fileArg.EscapeMarkup()}"
+            : "[grey]Pass a .gguf path, an 'owner/repo[:quant]' Hugging Face reference, or the name of a model from 'dotllm model list'.[/]");
         return null;
+    }
+
+    internal static string PullOllamaWithProgress(OllamaRef reference)
+    {
+        using var registry = new OllamaRegistry();
+        AnsiConsole.MarkupLine($"[grey]Not found locally - pulling[/] [bold]{reference.ToString().EscapeMarkup()}[/] [grey]from the ollama registry[/]");
+        return AnsiConsole.Progress()
+            .AutoClear(false)
+            .Columns(new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new TransferSpeedColumn(), new RemainingTimeColumn())
+            .Start(ctx =>
+            {
+                var task = ctx.AddTask("[green]downloading[/]", maxValue: 100);
+                long? lastTotal = null;
+                var progress = new Progress<(long bytesDownloaded, long? totalBytes)>(p =>
+                {
+                    if (!p.totalBytes.HasValue) return;
+                    if (lastTotal != p.totalBytes.Value) { task.MaxValue = p.totalBytes.Value; lastTotal = p.totalBytes.Value; }
+                    task.Value = p.bytesDownloaded;
+                });
+                return ModelResolver.PullOllamaAsync(reference, registry, progress, CancellationToken.None).GetAwaiter().GetResult();
+            });
+    }
+
+    private static string PullWithProgress(ModelReference reference, string? quant)
+    {
+        using var client = new HuggingFaceClient();
+        using var downloader = new HuggingFaceDownloader();
+        string tag = (quant ?? reference.Tag) is { } t ? ":" + t : "";
+        AnsiConsole.MarkupLine($"[grey]Not found locally - pulling[/] [bold]{(reference.RepoId + tag).EscapeMarkup()}[/]");
+        return AnsiConsole.Progress()
+            .AutoClear(false)
+            .Columns(new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new TransferSpeedColumn(), new RemainingTimeColumn())
+            .Start(ctx =>
+            {
+                var task = ctx.AddTask("[green]downloading[/]", maxValue: 100);
+                long? lastTotal = null;
+                var progress = new Progress<(long bytesDownloaded, long? totalBytes)>(p =>
+                {
+                    if (!p.totalBytes.HasValue) return;
+                    if (lastTotal != p.totalBytes.Value) { task.MaxValue = p.totalBytes.Value; lastTotal = p.totalBytes.Value; }
+                    task.Value = p.bytesDownloaded;
+                });
+                return ModelResolver.PullAsync(reference, quant, client, downloader, progress, CancellationToken.None).GetAwaiter().GetResult();
+            });
     }
 
     /// <summary>

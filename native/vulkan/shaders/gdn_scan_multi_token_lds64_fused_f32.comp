@@ -1,0 +1,133 @@
+#version 450
+// GDN multi-token scan — BOTH FACTORS: column-split + LDS-resident state AND phase
+// fusion. Issue #445, factorial arm "11-w64" (COLS=64).
+//
+// This is arm "01" (gdn_scan_multi_token_lds_f32.comp — read its header for the
+// decomposition argument and the LDS budget) with arm "10"'s fusion applied on top:
+// the four phases collapse into two passes over the LDS column, so each state element
+// is touched four times per token instead of six.
+//
+// The 2x2 exists because two different stories fit the same measurement, and a ladder
+// cannot tell them apart:
+//     A (fusion)  — "the kernel does its memory work redundantly"
+//     B (LDS)     — "the kernel does its memory work at the wrong level of the hierarchy"
+// If B dominates, A should be nearly free on top of it (LDS round trips are cheap).
+// If A dominates, the redundancy was the cost and the medium was secondary.
+//
+// COLS=64 makes this the WAVE-COUNT-MATCHED arm: subgroupSize is 64 on this part, so a 64-lane
+// workgroup is one full wave64 and the dispatch launches the same 96 wavefronts as the shipping
+// kernel. The COLS=32 arms double the wavefront count at half lane occupancy, which confounds the
+// memory-level hypothesis with plain extra latency hiding.
+//
+// BIT-EXACTNESS as in both parents: reduction order and every `precise` qualifier are
+// unchanged, and the fusion only reuses, from a register, the exact f32 that the
+// preceding store rounded to.
+
+#define COLS 64
+
+layout(local_size_x = COLS, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)           buffer BufState  { float st[];     };
+layout(set = 0, binding = 1, std430) readonly  buffer BufQ      { float q_buf[];  };
+layout(set = 0, binding = 2, std430) readonly  buffer BufK      { float k_buf[];  };
+layout(set = 0, binding = 3, std430) readonly  buffer BufV      { float v_buf[];  };
+layout(set = 0, binding = 4, std430) readonly  buffer BufG      { float g_buf[];  };
+layout(set = 0, binding = 5, std430) readonly  buffer BufBeta   { float beta_buf[]; };
+layout(set = 0, binding = 6, std430) writeonly buffer BufOut    { float out_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    int n_v_head;
+    int n_k_head;
+    int d_state;
+    int v_heads_per_k_head;
+    int seq_len;
+} pc;
+
+shared float k_shared[128];
+shared float q_shared[128];
+shared float sLds[128 * COLS];     // [row][lane] -> row * COLS + lane. 32 KiB at d_state=128.
+
+void main() {
+    uint vh   = gl_WorkGroupID.x;
+    uint cblk = gl_WorkGroupID.y;
+    uint lane = gl_LocalInvocationID.x;
+
+    if (int(vh) >= pc.n_v_head) return;       // workgroup-uniform: safe
+
+    uint dState = uint(pc.d_state);
+    uint col    = cblk * uint(COLS) + lane;
+    bool laneActive = col < dState;           // per-lane; never guards a barrier
+
+    uint kh         = vh % uint(pc.n_k_head);
+    uint stateBase  = vh * dState * dState;
+    uint qkPerToken = uint(pc.n_k_head) * dState;
+    uint vPerToken  = uint(pc.n_v_head) * dState;
+    uint kvScale    = uint(pc.n_v_head);
+
+    float invSqrtD = 1.0 / sqrt(float(pc.d_state));
+
+    // Stage in: one global read of this workgroup's column slab. Lane-private.
+    if (laneActive) {
+        for (uint row = 0u; row < dState; row++)
+            sLds[row * uint(COLS) + lane] = st[stateBase + row * dState + col];
+    }
+
+    for (int t = 0; t < pc.seq_len; t++) {
+        uint qkBase = uint(t) * qkPerToken + kh * dState;
+        uint vBase  = uint(t) * vPerToken + vh * dState;
+        uint gbIdx  = uint(t) * kvScale + vh;
+
+        float gVh    = g_buf[gbIdx];
+        float betaVh = beta_buf[gbIdx];
+
+        // Stage 0: cooperative load of k_kh and q_kh (d_state entries by COLS lanes).
+        for (uint i = lane; i < dState; i += uint(COLS)) {
+            k_shared[i] = k_buf[qkBase + i];
+            q_shared[i] = q_buf[qkBase + i];
+        }
+        barrier();
+
+        // Pass A: decay + retrieve, fused.
+        precise float retr = 0.0;
+        if (laneActive) {
+            for (uint row = 0u; row < dState; row++) {
+                uint idx = row * uint(COLS) + lane;
+                float decayed = sLds[idx] * gVh;
+                sLds[idx] = decayed;
+                precise float prod = decayed * k_shared[row];
+                retr = retr + prod;
+            }
+        }
+
+        // Delta rule (thread-local).
+        precise float delta = 0.0;
+        if (laneActive) {
+            float vVh = v_buf[vBase + col];
+            precise float diff = vVh - retr;
+            delta = betaVh * diff;
+        }
+
+        // Pass B: rank-1 update + read-out, fused.
+        if (laneActive) {
+            precise float acc = 0.0;
+            for (uint row = 0u; row < dState; row++) {
+                uint idx = row * uint(COLS) + lane;
+                precise float prod = k_shared[row] * delta;
+                precise float updated = sLds[idx] + prod;
+                sLds[idx] = updated;
+                precise float rprod = updated * q_shared[row];
+                acc = acc + rprod;
+            }
+            out_buf[vBase + col] = acc * invSqrtD;
+        }
+
+        // Guards k_shared / q_shared against the next token's cooperative load.
+        barrier();
+    }
+
+    // Stage out: one global write of the slab.
+    if (laneActive) {
+        for (uint row = 0u; row < dState; row++)
+            st[stateBase + row * dState + col] = sLds[row * uint(COLS) + lane];
+    }
+}

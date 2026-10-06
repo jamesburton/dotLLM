@@ -33,6 +33,7 @@ namespace DotLLM.Tests.Integration.Models.Architectures;
 /// <c>E:\.dotllm\test-cache\microsoft\bitnet-b1.58-2B-4T-gguf\ggml-model-i2_s.gguf</c>).
 /// Kept in its own class to avoid cross-class GPU parallelism.
 /// </remarks>
+[Collection(GpuCollection.Name)]
 public sealed class BitNetAccuracyTests
 {
     private readonly ITestOutputHelper _output;

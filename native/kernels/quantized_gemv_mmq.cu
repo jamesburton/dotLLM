@@ -377,8 +377,16 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q4_k_mmq(
 //
 // Block layout:
 //   scales[16] at offset 0  — one byte per sub-block: low nibble = sc, high nibble = dm
-//   qs[64]     at offset 16 — 2 bits/element, 4 elements/byte; sub_block s spans
-//                             qs[s*4 + 0..3] (16 elements as 4 bytes)
+//   qs[64]     at offset 16 — 2 bits/element, 4 elements/byte, TRANSPOSED
+//                             (issue #498): element t sits at byte
+//                             32*(t>>7) + (t&31), shift 2*((t>>5)&3). Each byte
+//                             supplies four elements 32 apart, NOT four
+//                             consecutive ones. Authority: ggml-quants.c
+//                             dequantize_row_q2_K.
+//                             Consequence: sub-block s spans the 16 CONTIGUOUS
+//                             bytes qs[32*(s>>3) + 16*(s&1) + 0..15], all read
+//                             at the single shift 2*((s>>1)&3) — it does NOT
+//                             span qs[s*4 + 0..3] as previously assumed.
 //   d          at offset 80 — half super-block delta
 //   dmin       at offset 82 — half super-block min delta
 //
@@ -488,7 +496,6 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q2_k_mmq(
         for (int q_quad = 0; q_quad < 8; q_quad++)
         {
             int chunk_idx = sb * 8 + q_quad;
-            const uint8_t* chunk_qs = qs + q_quad * 8;   // 8 bytes = 2 sub-blocks of 4 bytes
 
             #pragma unroll
             for (int isc = 0; isc < 2; isc++)
@@ -497,21 +504,23 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q2_k_mmq(
                 int sc  = scales[sub] & 0x0F;            // 4-bit scale
                 int dm  = (scales[sub] >> 4) & 0x0F;     // 4-bit dmin coef
 
-                const uint8_t* sub_qs = chunk_qs + isc * 4;   // 4 bytes for this sub-block
+                // Transposed 2-bit layout (#498): the sub-block's 16 elements are
+                // 16 CONTIGUOUS bytes, every one read at the same shift.
+                const uint8_t* sub_qs = qs + 32 * (sub >> 3) + 16 * (sub & 1);
+                const int sh = ((sub >> 1) & 0x3) << 1;
                 int l_base = isc * 16;
                 const int8_t* xq = s_xq + chunk_idx * 32 + l_base;
 
                 int dot = 0;
-                // 16 elements / 4 per dp4a = 4 dp4a calls. Each byte qs[g] holds 4
-                // consecutive 2-bit values at bit offsets 0,2,4,6.
+                // 16 elements / 4 per dp4a = 4 dp4a calls. Element sub*16 + 4g+j
+                // is bit-pair `sh` of byte sub_qs[4g + j].
                 #pragma unroll
                 for (int g = 0; g < 4; g++)
                 {
-                    uint32_t qbyte = sub_qs[g];
-                    int q0 = (int)((qbyte >> 0) & 0x3);
-                    int q1 = (int)((qbyte >> 2) & 0x3);
-                    int q2v = (int)((qbyte >> 4) & 0x3);
-                    int q3 = (int)((qbyte >> 6) & 0x3);
+                    int q0  = (int)((sub_qs[4 * g + 0] >> sh) & 0x3);
+                    int q1  = (int)((sub_qs[4 * g + 1] >> sh) & 0x3);
+                    int q2v = (int)((sub_qs[4 * g + 2] >> sh) & 0x3);
+                    int q3  = (int)((sub_qs[4 * g + 3] >> sh) & 0x3);
                     int wpack = (q0 & 0xFF)
                               | ((q1 & 0xFF) << 8)
                               | ((q2v & 0xFF) << 16)
@@ -1613,23 +1622,24 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
         int sc  = scales[sub] & 0x0F;            // 4-bit scale
         int dm  = (scales[sub] >> 4) & 0x0F;     // 4-bit dmin coef
 
-        const uint8_t* chunk_qs = qs + q_quad * 8;       // 8 bytes = 2 sub-blocks
-        const uint8_t* sub_qs   = chunk_qs + isc * 4;    // 4 bytes for this sub-block
+        // Transposed 2-bit layout (#498): the sub-block's 16 elements are 16
+        // CONTIGUOUS bytes, every one read at the same shift.
+        const uint8_t* sub_qs = qs + 32 * (sub >> 3) + 16 * (sub & 1);
+        const int sh = ((sub >> 1) & 0x3) << 1;
         int chunk_idx = sb * 8 + q_quad;
         int l_base = isc * 16;
         const int8_t* xq = s_xq + chunk_idx * 32 + l_base;
 
         int dot = 0;
-        // 16 elements / 4 per dp4a = 4 dp4a calls. Each byte qs[g] holds 4
-        // consecutive 2-bit values at bit offsets 0,2,4,6.
+        // 16 elements / 4 per dp4a = 4 dp4a calls. Element sub*16 + 4g+j is
+        // bit-pair `sh` of byte sub_qs[4g + j].
         #pragma unroll
         for (int g = 0; g < 4; g++)
         {
-            uint32_t qbyte = sub_qs[g];
-            int q0  = (int)((qbyte >> 0) & 0x3);
-            int q1  = (int)((qbyte >> 2) & 0x3);
-            int q2v = (int)((qbyte >> 4) & 0x3);
-            int q3  = (int)((qbyte >> 6) & 0x3);
+            int q0  = (int)((sub_qs[4 * g + 0] >> sh) & 0x3);
+            int q1  = (int)((sub_qs[4 * g + 1] >> sh) & 0x3);
+            int q2v = (int)((sub_qs[4 * g + 2] >> sh) & 0x3);
+            int q3  = (int)((sub_qs[4 * g + 3] >> sh) & 0x3);
             int wpack = (q0 & 0xFF)
                       | ((q1 & 0xFF) << 8)
                       | ((q2v & 0xFF) << 16)
@@ -2221,7 +2231,6 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q2_k_mmq_pre
         for (int q_quad = 0; q_quad < 8; q_quad++)
         {
             int chunk_idx = sb * 8 + q_quad;
-            const uint8_t* chunk_qs = qs + q_quad * 8;   // 8 bytes = 2 sub-blocks of 4 bytes
 
             #pragma unroll
             for (int isc = 0; isc < 2; isc++)
@@ -2230,21 +2239,23 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q2_k_mmq_pre
                 int sc  = scales[sub] & 0x0F;            // 4-bit scale
                 int dm  = (scales[sub] >> 4) & 0x0F;     // 4-bit dmin coef
 
-                const uint8_t* sub_qs = chunk_qs + isc * 4;   // 4 bytes for this sub-block
+                // Transposed 2-bit layout (#498): the sub-block's 16 elements are
+                // 16 CONTIGUOUS bytes, every one read at the same shift.
+                const uint8_t* sub_qs = qs + 32 * (sub >> 3) + 16 * (sub & 1);
+                const int sh = ((sub >> 1) & 0x3) << 1;
                 int l_base = isc * 16;
                 const int8_t* xq = xq_in + chunk_idx * 32 + l_base;
 
                 int dot = 0;
-                // 16 elements / 4 per dp4a = 4 dp4a calls. Each byte qs[g] holds 4
-                // consecutive 2-bit values at bit offsets 0,2,4,6.
+                // 16 elements / 4 per dp4a = 4 dp4a calls. Element sub*16 + 4g+j
+                // is bit-pair `sh` of byte sub_qs[4g + j].
                 #pragma unroll
                 for (int g = 0; g < 4; g++)
                 {
-                    uint32_t qbyte = sub_qs[g];
-                    int q0 = (int)((qbyte >> 0) & 0x3);
-                    int q1 = (int)((qbyte >> 2) & 0x3);
-                    int q2v = (int)((qbyte >> 4) & 0x3);
-                    int q3 = (int)((qbyte >> 6) & 0x3);
+                    int q0  = (int)((sub_qs[4 * g + 0] >> sh) & 0x3);
+                    int q1  = (int)((sub_qs[4 * g + 1] >> sh) & 0x3);
+                    int q2v = (int)((sub_qs[4 * g + 2] >> sh) & 0x3);
+                    int q3  = (int)((sub_qs[4 * g + 3] >> sh) & 0x3);
                     int wpack = (q0 & 0xFF)
                               | ((q1 & 0xFF) << 8)
                               | ((q2v & 0xFF) << 16)
@@ -2819,8 +2830,10 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
         int sc  = scales[sub] & 0x0F;
         int dm  = (scales[sub] >> 4) & 0x0F;
 
-        const uint8_t* chunk_qs = qs + q_quad * 8;
-        const uint8_t* sub_qs   = chunk_qs + isc * 4;
+        // Transposed 2-bit layout (#498): the sub-block's 16 elements are 16
+        // CONTIGUOUS bytes, every one read at the same shift.
+        const uint8_t* sub_qs = qs + 32 * (sub >> 3) + 16 * (sub & 1);
+        const int sh = ((sub >> 1) & 0x3) << 1;
         int chunk_idx = sb * 8 + q_quad;
         int l_base = isc * 16;
         const int8_t* xq = xq_in + chunk_idx * 32 + l_base;
@@ -2829,11 +2842,10 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
         #pragma unroll
         for (int g = 0; g < 4; g++)
         {
-            uint32_t qbyte = sub_qs[g];
-            int q0  = (int)((qbyte >> 0) & 0x3);
-            int q1  = (int)((qbyte >> 2) & 0x3);
-            int q2v = (int)((qbyte >> 4) & 0x3);
-            int q3  = (int)((qbyte >> 6) & 0x3);
+            int q0  = (int)((sub_qs[4 * g + 0] >> sh) & 0x3);
+            int q1  = (int)((sub_qs[4 * g + 1] >> sh) & 0x3);
+            int q2v = (int)((sub_qs[4 * g + 2] >> sh) & 0x3);
+            int q3  = (int)((sub_qs[4 * g + 3] >> sh) & 0x3);
             int wpack = (q0 & 0xFF)
                       | ((q1 & 0xFF) << 8)
                       | ((q2v & 0xFF) << 16)

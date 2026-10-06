@@ -211,6 +211,52 @@ public static class RoPE
 
         int halfDim = headDim / 2;
 
+        Span<float> invFreq = halfDim * sizeof(float) <= StackAllocThreshold
+            ? stackalloc float[halfDim]
+            : new float[halfDim];
+        ComputeYarnInverseFrequencies(headDim, theta, scalingFactor,
+            originalMaxPositionEmbeddings, betaFast, betaSlow, invFreq);
+
+        // Fill cos/sin with optional mscale pre-multiply.
+        for (int pos = 0; pos < maxSeqLen; pos++)
+        {
+            int tableBase = pos * halfDim;
+            for (int i = 0; i < halfDim; i++)
+            {
+                float angle = pos * invFreq[i];
+                cosTable[tableBase + i] = MathF.Cos(angle) * mscaleMultiplier;
+                sinTable[tableBase + i] = MathF.Sin(angle) * mscaleMultiplier;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds the YaRN ramped per-pair inverse-frequency vector — the frequency half of
+    /// <see cref="PrecomputeFrequencyTableYarn"/>, factored out so GPU backends can upload
+    /// the same <c>headDim / 2</c> floats and evaluate <c>cos/sin(pos * invFreq[i]) * mscale</c>
+    /// in-kernel at arbitrary positions, instead of either re-deriving the ramp (drift) or
+    /// uploading a position-indexed table bounded by some assumed max sequence length.
+    /// This is the single source of truth for the ramp math: <see cref="PrecomputeFrequencyTableYarn"/>
+    /// calls it too, so CPU and GPU cannot diverge.
+    /// </summary>
+    /// <param name="headDim">Dimension per attention head (must be even).</param>
+    /// <param name="theta">Base frequency (e.g. 10000.0).</param>
+    /// <param name="scalingFactor">YaRN context-length scaling factor (HF <c>rope_scaling.factor</c>).</param>
+    /// <param name="originalMaxPositionEmbeddings">Baseline context length YaRN ramps around.</param>
+    /// <param name="betaFast">Rotation threshold above which dims extrapolate at the original base (HF default 32).</param>
+    /// <param name="betaSlow">Rotation threshold below which dims interpolate at the scaled base (HF default 1).</param>
+    /// <param name="invFreq">Destination, length &gt;= <c>headDim / 2</c>.</param>
+    public static void ComputeYarnInverseFrequencies(
+        int headDim, float theta, float scalingFactor, int originalMaxPositionEmbeddings,
+        float betaFast, float betaSlow, Span<float> invFreq)
+    {
+        if (headDim <= 0 || headDim % 2 != 0)
+            throw new ArgumentException($"headDim must be a positive even number, got {headDim}", nameof(headDim));
+        int halfDim = headDim / 2;
+        if (invFreq.Length < halfDim)
+            throw new ArgumentException(
+                $"invFreq length {invFreq.Length} must be >= headDim/2 ({halfDim}).", nameof(invFreq));
+
         // yarn_find_correction_range in HF returns clamped integer bounds in the
         // FULL-dim space [0, headDim-1], but the linear ramp is applied over
         // dim // 2 entries (i.e. halfDim). That matches the mixing formula
@@ -221,10 +267,6 @@ public static class RoPE
         high = MathF.Min(high, headDim - 1.0f);
         if (low == high) high += 0.001f; // prevent divide-by-zero per HF yarn_linear_ramp_mask
 
-        // Build per-halfDim inv_freq[i].
-        Span<float> invFreq = halfDim * sizeof(float) <= StackAllocThreshold
-            ? stackalloc float[halfDim]
-            : new float[halfDim];
         for (int i = 0; i < halfDim; i++)
         {
             float exponent = 2.0f * i / headDim;
@@ -237,18 +279,6 @@ public static class RoPE
             // where inv_freq_mask = 1 - linear_ramp_mask. Expanding:
             //   inv_freq = freq_inter * linear_ramp + freq_extra * (1 - linear_ramp)
             invFreq[i] = freqInter * mask + freqExtra * (1.0f - mask);
-        }
-
-        // Fill cos/sin with optional mscale pre-multiply.
-        for (int pos = 0; pos < maxSeqLen; pos++)
-        {
-            int tableBase = pos * halfDim;
-            for (int i = 0; i < halfDim; i++)
-            {
-                float angle = pos * invFreq[i];
-                cosTable[tableBase + i] = MathF.Cos(angle) * mscaleMultiplier;
-                sinTable[tableBase + i] = MathF.Sin(angle) * mscaleMultiplier;
-            }
         }
     }
 

@@ -44,6 +44,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class Qwen3MoeHybridQ6KResidentSmokeTests
 {
     private readonly ITestOutputHelper _output;

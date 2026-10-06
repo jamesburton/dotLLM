@@ -74,7 +74,8 @@ public sealed class RealHfSafetensorsEndToEndTests
         _output.WriteLine($"Root: {root}");
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
         loadWatch.Stop();
 
         try
@@ -129,7 +130,8 @@ public sealed class RealHfSafetensorsEndToEndTests
         _output.WriteLine($"Root: {root}");
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
         loadWatch.Stop();
 
         try
@@ -195,7 +197,8 @@ public sealed class RealHfSafetensorsEndToEndTests
         _output.WriteLine($"Root: {root}");
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
         loadWatch.Stop();
 
         try
@@ -240,7 +243,7 @@ public sealed class RealHfSafetensorsEndToEndTests
     // Phase 5 gated real-weight coverage for previously tiny-random-only archs
     // ────────────────────────────────────────────────────────────────────
 
-    [Fact]
+    [SkippableFact]
     public void Mistral7B_LoadsAndForwardsEndToEnd_WhenCheckpointPresent()
         => RunGatedSafetensorsSmoke(
             envVar: "DOTLLM_MISTRAL_7B_CHECKPOINT_PATH",
@@ -254,7 +257,7 @@ public sealed class RealHfSafetensorsEndToEndTests
                 Assert.True(config.NumLayers >= 32);
             });
 
-    [Fact]
+    [SkippableFact]
     public void Mixtral8x7B_LoadsAndForwardsEndToEnd_WhenCheckpointPresent()
         => RunGatedSafetensorsSmoke(
             envVar: "DOTLLM_MIXTRAL_8X7B_CHECKPOINT_PATH",
@@ -269,7 +272,7 @@ public sealed class RealHfSafetensorsEndToEndTests
                 Assert.True(config.Moe.NumExpertsPerTok >= 2);
             });
 
-    [Fact]
+    [SkippableFact]
     public void Qwen15MoeA27B_LoadsAndForwardsEndToEnd_WhenCheckpointPresent()
         => RunGatedSafetensorsSmoke(
             envVar: "DOTLLM_QWEN15_MOE_A27B_CHECKPOINT_PATH",
@@ -302,7 +305,8 @@ public sealed class RealHfSafetensorsEndToEndTests
         _output.WriteLine($"Root: {root}");
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
         loadWatch.Stop();
 
         try
@@ -352,7 +356,8 @@ public sealed class RealHfSafetensorsEndToEndTests
         _output.WriteLine($"Root: {root}");
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
         loadWatch.Stop();
 
         try
@@ -528,7 +533,8 @@ public sealed class RealHfSafetensorsEndToEndTests
             + "the HF ByteLevel factory path (P0.1) requires tokenizer.json.");
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
         loadWatch.Stop();
 
         try
@@ -735,7 +741,8 @@ public sealed class RealHfSafetensorsEndToEndTests
             $"Reference logits shape: [{reference.LogitsShape[0]}, {reference.LogitsShape[1]}] "
             + $"input_ids=[{string.Join(", ", reference.InputIds)}]");
 
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
 
         try
         {
@@ -958,7 +965,8 @@ public sealed class RealHfSafetensorsEndToEndTests
             $"Reference logits shape: [{reference.LogitsShape[0]}, {reference.LogitsShape[1]}] "
             + $"input_ids=[{string.Join(", ", reference.InputIds)}]");
 
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
 
         try
         {
@@ -1271,7 +1279,8 @@ public sealed class RealHfSafetensorsEndToEndTests
         _output.WriteLine($"Root: {root}");
 
         var loadWatch = Stopwatch.StartNew();
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            root, "HF safetensors checkpoint", () => ModelLoader.LoadFromSafetensors(root));
         loadWatch.Stop();
 
         try

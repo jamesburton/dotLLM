@@ -22,6 +22,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <c>DOTLLM_CUDA_PERF=1</c> to run.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaBatchedDecodePerfHarness
 {
     private readonly ITestOutputHelper _output;

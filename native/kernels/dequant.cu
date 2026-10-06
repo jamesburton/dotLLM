@@ -183,7 +183,12 @@ extern "C" __global__ void __launch_bounds__(256) dequant_q5_1_f16(
 // ── Q2_K: 84 bytes per 256 values ──────────────────────────────────
 // struct block_q2_K { uint8_t scales[16]; uint8_t qs[64]; half d; half dmin; };
 //   - scales[i]: low nibble = sub-block i scale, high nibble = sub-block i dmin coef
-//   - qs[i]: 2-bit elements packed 4 per byte (low-to-high)
+//   - qs[i]: 2-bit elements packed 4 per byte, TRANSPOSED (issue #498). Each
+//     128-element half of the super-block consumes 32 qs bytes and each byte
+//     supplies four elements 32 apart — NOT four consecutive elements:
+//         element t -> byte 32*(t>>7) + (t & 31), shift 2*((t>>5) & 3)
+//     Authority: ggml/src/ggml-quants.c dequantize_row_q2_K. Sub-block (scale)
+//     indexing t>>4 is NOT transposed and is unchanged.
 //
 // 256 threads/block, one element per thread, FP16 store.
 
@@ -205,9 +210,9 @@ extern "C" __global__ void __launch_bounds__(256) dequant_q2_k_f16(
         float d = __half2float(*reinterpret_cast<const half*>(block + 80));
         float dmin = __half2float(*reinterpret_cast<const half*>(block + 82));
 
-        int sub = t >> 4;            // t / 16
-        int byte_idx = t >> 2;       // t / 4
-        int bit_off = (t & 0x3) << 1; // (t % 4) * 2
+        int sub = t >> 4;                        // t / 16 (scale sub-block, not transposed)
+        int byte_idx = 32 * (t >> 7) + (t & 31); // transposed 2-bit layout (#498)
+        int bit_off = ((t >> 5) & 0x3) << 1;
         int q2 = (qs[byte_idx] >> bit_off) & 0x3;
         int scale = scales[sub] & 0xF;
         int dm_coef = (scales[sub] >> 4) & 0xF;

@@ -25,6 +25,7 @@ namespace DotLLM.Tests.Integration.Engine;
 /// so this test asserts the strides differ before relying on the parity check.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class Gemma4VulkanKvCacheTests
 {
     private readonly ITestOutputHelper _output;

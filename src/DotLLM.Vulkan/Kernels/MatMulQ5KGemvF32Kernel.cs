@@ -48,6 +48,9 @@ public sealed class MatMulQ5KGemvF32Kernel : IDisposable
     private const int WorkgroupSize = 128;
     private const int PushConstantBytes = 4 * sizeof(uint); // M, K, blocksPerRow, rowUints
 
+    /// <summary>Environment variable that selects the block-per-lane GEMV instead of the coalesced one (A/B).</summary>
+    public const string LegacyEnvVar = "DOTLLM_VK_Q5_K_GEMV_LEGACY";
+
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
@@ -67,7 +70,14 @@ public sealed class MatMulQ5KGemvF32Kernel : IDisposable
     /// <summary>Loads <c>matmul_q5_k_gemv_f32.spv</c> from the given directory and creates the pipeline.</summary>
     public static MatMulQ5KGemvF32Kernel Create(VulkanDevice device, string spvDir)
     {
+        // Coalesced lane=K-position layout when the device can reduce with subgroup ops (the block-per-lane original
+        // kept only 10 of 128 threads busy on a K = 2560 row: the 248k-row Qwen3.5 lm_head ran at ~90 GB/s); the
+        // original otherwise, or with DOTLLM_VK_Q5_K_GEMV_LEGACY=1 for A/B.
         string path = Path.Combine(spvDir, "matmul_q5_k_gemv_f32.spv");
+        string coalescedPath = Path.Combine(spvDir, "matmul_q5_k_gemv_f32_coalesced.spv");
+        if (device.HasSubgroupArithmetic && File.Exists(coalescedPath)
+            && Environment.GetEnvironmentVariable(LegacyEnvVar) != "1")
+            path = coalescedPath;
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");

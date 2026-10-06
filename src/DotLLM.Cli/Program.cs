@@ -43,8 +43,29 @@ app.Configure(config =>
             .WithExample("model", "info", "TheBloke/Llama-2-7B-GGUF");
 
         model.AddCommand<ModelDeleteCommand>("delete")
-            .WithDescription("Delete a locally downloaded model.")
+            .WithAlias("rm")
+            .WithDescription("Delete a locally downloaded model, or a model profile.")
             .WithExample("model", "delete", "Qwen/Qwen2.5-0.5B-Instruct-GGUF");
+
+        model.AddCommand<ModelAddCommand>("add")
+            .WithDescription("Add a local .gguf file (linked, not copied) or download one from a URL.")
+            .WithExample("model", "add", "C:\\models\\my-finetune.gguf", "--name", "my-finetune");
+
+        model.AddCommand<ModelCreateCommand>("create")
+            .WithDescription("Create a named model profile: a base model plus system prompt, sampling defaults, device and keep-alive.")
+            .WithExample("model", "create", "terse", "--from", "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M", "--system", "Answer in one sentence.", "--temperature", "0.2");
+
+        model.AddCommand<ModelImportOllamaCommand>("import-ollama")
+            .WithDescription("Import models from an existing ollama installation as profiles (blobs are used in place, nothing is copied).")
+            .WithExample("model", "import-ollama");
+
+        model.AddCommand<ModelShowCommand>("show")
+            .WithDescription("Show a profile's settings and where its model resolves.")
+            .WithExample("model", "show", "terse");
+
+        model.AddCommand<ModelCopyCommand>("cp")
+            .WithDescription("Copy a profile, or alias a model under a new profile name.")
+            .WithExample("model", "cp", "terse", "terse-hot");
     });
 
     config.AddCommand<RunCommand>("run")
@@ -62,6 +83,14 @@ app.Configure(config =>
     config.AddCommand<PerplexityCommand>("perplexity")
         .WithDescription("Compute perplexity over a text corpus.")
         .WithExample("perplexity", "QuantFactory/SmolLM-135M-GGUF", "--corpus", "wiki.test.raw", "--context", "512", "--stride", "256");
+
+    config.AddCommand<PsCommand>("ps")
+        .WithDescription("List the models a running server has loaded.")
+        .WithExample("ps");
+
+    config.AddCommand<StopCommand>("stop")
+        .WithDescription("Unload a model (or all) from a running server (needs --allow-model-admin).")
+        .WithExample("stop", "--all");
 
     config.AddCommand<ServeCommand>("serve")
         .WithDescription("Launch API server with built-in web chat UI.")

@@ -14,6 +14,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// prefill, warm-up decode, and steady-state decode timings.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaForwardPerfHarness
 {
     private readonly ITestOutputHelper _output;

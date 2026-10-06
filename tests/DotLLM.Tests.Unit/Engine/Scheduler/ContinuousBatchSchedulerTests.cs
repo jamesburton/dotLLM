@@ -18,7 +18,7 @@ namespace DotLLM.Tests.Unit.Engine.Scheduler;
 /// emits a scripted token sequence per (prompt-last-token, step) so the test can verify
 /// admission, decode iteration, eviction, and KV-cache release in isolation from any real model.
 /// </summary>
-public sealed class ContinuousBatchSchedulerTests
+public sealed partial class ContinuousBatchSchedulerTests
 {
     private const int VocabSize = 32;
     private const int NumLayers = 2;
@@ -1080,7 +1080,8 @@ public sealed class ContinuousBatchSchedulerTests
 
     private static InferenceRequest MakeRequest(int promptLen, int maxTokens,
                                                  RequestPriority priority = RequestPriority.Normal,
-                                                 string? apiKey = null)
+                                                 string? apiKey = null,
+                                                 IReadOnlyList<string>? stopSequences = null)
     {
         // Build prompt: avoid 0 (EOS) to keep things clean. Tokens 1..promptLen.
         var tokens = new int[promptLen];
@@ -1089,7 +1090,12 @@ public sealed class ContinuousBatchSchedulerTests
         return new InferenceRequest
         {
             TokenIds = tokens,
-            Options = new InferenceOptions { Temperature = 0f, MaxTokens = maxTokens },
+            Options = new InferenceOptions
+            {
+                Temperature = 0f,
+                MaxTokens = maxTokens,
+                StopSequences = stopSequences ?? [],
+            },
             Priority = priority,
             ApiKey = apiKey,
         };
@@ -1104,6 +1110,11 @@ public sealed class ContinuousBatchSchedulerTests
 
         /// <summary>Emit <paramref name="tokenId"/> on every step.</summary>
         public static TokenScript Constant(int tokenId) => new(_ => tokenId);
+
+        /// <summary>Emit <paramref name="tokens"/> in order (step 0 is the prefill's first token),
+        /// repeating the last entry once the script runs out.</summary>
+        public static TokenScript Sequence(params int[] tokens)
+            => new(step => tokens[Math.Min(step, tokens.Length - 1)]);
 
         /// <summary>Emit <paramref name="afterToken"/> on the first <paramref name="afterNTokens"/> steps,
         /// then emit <paramref name="tokenId"/>.</summary>
@@ -1124,7 +1135,8 @@ public sealed class ContinuousBatchSchedulerTests
             ContinuousBatchSchedulerOptions? options = null,
             int totalBlocks = 64,
             Func<int, int>? inputEmitter = null,
-            bool requiresPerSequenceState = false)
+            bool requiresPerSequenceState = false,
+            ITokenizer? tokenizer = null)
         {
             tokenScript ??= TokenScript.Constant(EosTokenId, afterNTokens: 1);
             PagedFactory = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize,
@@ -1133,7 +1145,7 @@ public sealed class ContinuousBatchSchedulerTests
             Tokenizer = new MockTokenizer();
             Scheduler = new ContinuousBatchScheduler(
                 Model,
-                Tokenizer,
+                tokenizer ?? Tokenizer,
                 (_, maxSeq) => PagedFactory.Create(maxSeq),
                 options,
                 pagedPool: PagedFactory.Pool);

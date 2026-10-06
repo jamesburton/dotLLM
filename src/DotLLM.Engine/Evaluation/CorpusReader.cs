@@ -24,8 +24,15 @@ public static class CorpusReader
     /// <param name="tokenizer">Tokenizer whose vocabulary the ids belong to.</param>
     /// <param name="maxTokens">Upper bound on emitted tokens; <c>0</c> for unbounded.</param>
     /// <param name="charChunkSize">Characters read per chunk.</param>
+    /// <param name="bosTokenId">
+    /// BOS id to prepend to the stream, or <c>-1</c> for none. Derived from the vocab via
+    /// <c>GgufAddBosResolver</c> rather than chosen by the caller: llama.cpp prepends BOS when the
+    /// vocab asks for it, and a stream that omits it is offset by one token against llama.cpp's
+    /// at every chunk boundary (issue #515).
+    /// </param>
     public static IEnumerable<int> StreamTokens(
-        TextReader reader, ITokenizer tokenizer, int maxTokens = 0, int charChunkSize = 65536)
+        TextReader reader, ITokenizer tokenizer, int maxTokens = 0, int charChunkSize = 65536,
+        int bosTokenId = -1)
     {
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentNullException.ThrowIfNull(tokenizer);
@@ -34,6 +41,15 @@ public static class CorpusReader
         var buffer = new char[charChunkSize];
         var carry = new StringBuilder();
         int emitted = 0;
+
+        // Prepended to the stream BEFORE chunking, which is what llama.cpp does and therefore
+        // what makes chunk N cover the same text on both sides (issue #515/#516). It counts
+        // toward maxTokens for the same reason: it is simply the stream's first token.
+        if (bosTokenId >= 0)
+        {
+            yield return bosTokenId;
+            if (maxTokens > 0 && ++emitted >= maxTokens) yield break;
+        }
 
         while (true)
         {

@@ -1,16 +1,28 @@
 // Tiled attention with FP32 Q/K/V/output and online softmax.
 //
-// Softmax uses Schraudolph's IEEE-754 bit-trick approximation of expf, matching the
-// CPU oracle's DotLLM.Cpu.Kernels.FastMath.ExpSumAndStore. The CPU side has used the
-// fast-exp path since the kernel's inception; switching CUDA to precise expf made the
-// two backends disagree by ~1% (5e-3 abs on attention output) on synthetic-fixture
-// parity. The bit-trick keeps both backends bit-near-equivalent without a CPU-side
-// accuracy regression. Constants C0/C1 must stay in sync with FastMath.cs.
+// Softmax uses precise `expf` throughout (#501).
 //
-//   exp(x) ≈ bitcast_int_to_float((int)(x * C0 + C1)),   x ≤ 0 only (no overflow guard)
+// History, because the previous rationale here was wrong and is worth recording: this file
+// used to implement softmax's exponential with Schraudolph's IEEE-754 bit trick
+// (`fast_exp_neg`, ~1-2% relative error), deliberately mirroring the CPU oracle's
+// DotLLM.Cpu.Kernels.FastMath — the argument being that CUDA had to keep the trick because
+// switching it alone to `expf` made the two backends disagree by ~1% (5e-3 abs on attention
+// output) on synthetic-fixture parity. That disagreement was real, but it was CUDA being
+// *right* and the CPU being wrong, not a CUDA regression: the premise both sides rested on
+// ("errors in exp get normalized away when dividing by the sum") only holds for the *mean*
+// of the attention weights. The error is relative and per-element, so it survives
+// normalization as a reweighting of the mixture each head computes. Free on a full-precision
+// model, and only full-precision models were ever checked — measured on Q3_K Llama-3.2-1B it
+// costs +1.71% perplexity (-0.01724 +/- 0.00185 nats, t = -9.3), while Q8_0 is unmoved.
 //
-// C0 = 2^23 / ln(2), C1 = (127 - 0.0579) * 2^23. Applied only to softmax `expf` calls
-// where the argument is always ≤ 0 by construction (max-subtracted scores).
+// #501 removed the trick from the CPU softmax, so there is no longer anything for CUDA to
+// mirror and no constants to keep in sync with FastMath.cs. Both backends now use precise
+// exp, which should make CPU<->CUDA attention parity *tighter*, not looser; tolerances that
+// were chosen around the shared approximation may be re-baselined downward.
+//
+// Note `DOTLLM_FAST_EXP=1` restores the bit trick on the CPU as a benchmarking lever. There
+// is no CUDA equivalent (the PTX is precompiled), so that env var makes the backends diverge
+// by design; do not run cross-backend parity with it set.
 
 #include <float.h>
 #include <math.h>
@@ -18,29 +30,13 @@
 
 #define TILE_KV 256
 
-// Schraudolph fast-exp constants (mirror FastMath.cs).
-#define FASTEXP_C0 12102203.0f
-#define FASTEXP_C1 1064866805.0f
-#define FASTEXP_MIN_CLAMP -87.3f
-
-__device__ __forceinline__ float fast_exp_neg(float x)
-{
-    // Caller contract: x ≤ 0 (max-subtracted softmax scores). Clamp the lower bound
-    // to keep the integer cast inside the IEEE-754 normal range. Use float-to-int
-    // truncation (toward zero) to match the C# scalar `(int)x` and the SIMD
-    // ConvertToVector*Int32WithTruncation paths in FastMath.cs — round-to-nearest
-    // would introduce a sub-ULP bias.
-    x = fmaxf(x, FASTEXP_MIN_CLAMP);
-    int bits = __float2int_rz(fmaf(x, FASTEXP_C0, FASTEXP_C1));
-    return __int_as_float(bits);
-}
-
 extern "C" __global__ void __launch_bounds__(256) attention_f32(
     const float* __restrict__ q, const float* __restrict__ k,
     const float* __restrict__ v, float* __restrict__ output,
     const int seq_q, const int seq_kv,
     const int num_heads, const int num_kv_heads, const int head_dim,
-    const int position_offset, const int sliding_window)
+    const int position_offset, const int sliding_window,
+    const float* __restrict__ sinks)   // gpt-oss per-head sink logits [num_heads]; nullptr = disabled
 {
     int block_id = blockIdx.x;
     if (block_id >= seq_q * num_heads) return;
@@ -118,7 +114,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32(
         // Online softmax rescale
         float new_max = fmaxf(running_max, tile_max);
         float correction = (running_max > -FLT_MAX + 1.0f)
-                           ? fast_exp_neg(running_max - new_max) : 0.0f;
+                           ? expf(running_max - new_max) : 0.0f;
         running_sum *= correction;
         for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
             out_accum[d] *= correction;
@@ -129,7 +125,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32(
         float tile_sum = 0.0f;
         for (int t = threadIdx.x; t < tile_len; t += blockDim.x) {
             float w = (score_tile[t] > -FLT_MAX + 1.0f)
-                      ? fast_exp_neg(score_tile[t] - running_max) : 0.0f;
+                      ? expf(score_tile[t] - running_max) : 0.0f;
             score_tile[t] = w;
             tile_sum += w;
         }
@@ -156,6 +152,41 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32(
             out_accum[d] += v_acc;
         }
         __syncthreads();
+    }
+
+    // gpt-oss attention sinks (#365): the per-head sink logit joins the softmax
+    // denominator as a final "virtual tile" with no V contribution. Matches CPU
+    // Attention.SoftmaxRowWithSink / llama.cpp ggml_soft_max_add_sinks:
+    //   m' = max(running_max, sink)
+    //   running_sum = running_sum * exp(running_max - m') + exp(sink - m')
+    //   out_accum  *= exp(running_max - m')
+    // i.e. exactly the same online-softmax rescale the tile loop above performs per
+    // tile, run once more against a tile whose only "score" is the sink and whose V
+    // row is zero — so the sink absorbs probability mass but moves no value vector.
+    // nullptr => bit-identical to the pre-#365 kernel (no rescale, no added term).
+    if (sinks != nullptr)
+    {
+        float sink = sinks[hq];
+        float new_max = fmaxf(running_max, sink);
+        float correction = (running_max > -FLT_MAX + 1.0f)
+                           ? expf(running_max - new_max) : 0.0f;
+        running_sum = running_sum * correction + expf(sink - new_max);
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+            out_accum[d] *= correction;
+        running_max = new_max;
+        // No __syncthreads() needed: each thread rescales and later reads only its
+        // own strided d-elements of out_accum; running_sum/running_max are
+        // per-thread registers already uniform across the block at this point.
+        // VERIFIED against the tile loop above, not assumed: both start from uniform
+        // initializers, and every update is a function of block-uniform values only —
+        // `running_max` from `tile_max = warp_scratch[0]` read after the barrier that
+        // follows thread 0's write, and `running_sum` from `*= correction` (uniform
+        // inputs) plus `+= warp_scratch[0]` read after its own barrier. The
+        // `running_max == -FLT_MAX` case (seq_kv == 0, or every score masked by the
+        // causal/sliding-window predicate) is handled by the same `correction = 0`
+        // guard the tile loop uses: out_accum is zeroed, the denominator becomes the
+        // sink term alone, and the row writes out exactly 0 — the correct limit of a
+        // row whose entire probability mass sits on the sink.
     }
 
     // Normalize and write
@@ -229,12 +260,14 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32(
 // weighted-V accumulation loop — not worth 4x the blocks + a grid-wide barrier) — see
 // `CudaKernels.AttentionSplitKvMinSeqKv` / the `ForwardFullAttnBody` call site.
 //
-// ─── Precision: reuses fast_exp_neg exactly, no precise expf anywhere in the merge ─────────
-// The combine step's `exp(m_i - m)` always has a non-positive argument (m = max over splits), so
-// it satisfies `fast_exp_neg`'s caller contract exactly like every other softmax exponential in
-// this file. Introducing precise `expf` here would reintroduce the ~1% CPU/GPU divergence this
-// file's header already documents fixing — independent of whatever NEW tolerance the cross-block
-// reassociation itself requires (see below).
+// ─── Precision: one exp flavour, precise `expf`, everywhere in this file ───────────────────
+// The combine step's `exp(m_i - m)` always has a non-positive argument (m = max over splits), the
+// same contract every other softmax exponential in this file satisfies. This block used to argue
+// for the Schraudolph `fast_exp_neg` here on the grounds that precise `expf` would "reintroduce
+// the ~1% CPU/GPU divergence" — #501 established that divergence was the CPU being wrong, and the
+// approximation is gone from both backends. What matters for this kernel is unchanged: the merge
+// uses the SAME exp as the per-tile path, so the combine introduces no precision category of its
+// own — only the cross-block reassociation tolerance does (see below).
 //
 // ─── Correctness: reassociation, NOT the same "recurrent state" story as GDN's split4 ──────
 // Splitting KV necessarily reassociates the float accumulation (independent partial sums combined
@@ -303,7 +336,8 @@ extern "C" __global__ void attention_f32_split_kv(
     const int position_offset, const int sliding_window,
     float* __restrict__ partial_max,   // [num_heads, ATTN_KV_SPLIT]
     float* __restrict__ partial_sum,   // [num_heads, ATTN_KV_SPLIT]
-    float* __restrict__ partial_out)   // [num_heads, ATTN_KV_SPLIT, head_dim]
+    float* __restrict__ partial_out,   // [num_heads, ATTN_KV_SPLIT, head_dim]
+    const float* __restrict__ sinks)   // gpt-oss per-head sink logits [num_heads]; nullptr = disabled
 {
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
@@ -342,6 +376,10 @@ extern "C" __global__ void attention_f32_split_kv(
     float running_max = -FLT_MAX;
     float running_sum = 0.0f;
 
+    // NOTE (#365): NO sink epilogue in this per-split body. Each block here owns only a
+    // KV SUB-RANGE, so applying the sink once per split would count it ATTN_KV_SPLIT
+    // times in the row's denominator. The sink is injected exactly once, in the
+    // cross-split combine below — see the comment there.
     for (int t_start = kv_lo; t_start < kv_hi; t_start += TILE_KV)
     {
         int t_end = t_start + TILE_KV;
@@ -382,7 +420,7 @@ extern "C" __global__ void attention_f32_split_kv(
 
         float new_max = fmaxf(running_max, tile_max);
         float correction = (running_max > -FLT_MAX + 1.0f)
-                           ? fast_exp_neg(running_max - new_max) : 0.0f;
+                           ? expf(running_max - new_max) : 0.0f;
         running_sum *= correction;
         for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
             out_accum[d] *= correction;
@@ -392,7 +430,7 @@ extern "C" __global__ void attention_f32_split_kv(
         float tile_sum = 0.0f;
         for (int t = threadIdx.x; t < tile_len; t += blockDim.x) {
             float w = (score_tile[t] > -FLT_MAX + 1.0f)
-                      ? fast_exp_neg(score_tile[t] - running_max) : 0.0f;
+                      ? expf(score_tile[t] - running_max) : 0.0f;
             score_tile[t] = w;
             tile_sum += w;
         }
@@ -442,12 +480,36 @@ extern "C" __global__ void attention_f32_split_kv(
         for (int i = 0; i < ATTN_KV_SPLIT; i++)
             m = fmaxf(m, partial_max[(size_t)hq * ATTN_KV_SPLIT + i]);
 
-        float l = 0.0f;
+        // gpt-oss attention sinks (#365) — THE single injection point for this kernel.
+        // The row's softmax denominator is assembled exactly once here (the per-split
+        // bodies above publish UNNORMALIZED partials), so this is the only place the
+        // sink can join it without being counted once per split.
+        //
+        // Algebraically the sink is a virtual (ATTN_KV_SPLIT+1)-th partial with
+        // (m_sink = sink, l_sink = 1, o_sink = 0). Folding it into the cross-split max
+        // makes m' = max(max_i m_i, sink); every existing exp(m_i - m') weight — in
+        // BOTH the `l` sum below and the `o` sum in the per-d loop — then rescales
+        // correctly with no other change, while the sink itself adds exp(sink - m') to
+        // `l` and contributes nothing to `o` (its "value vector" is zero). That is
+        // identical to attention_f32's post-loop epilogue, and to the CPU reference
+        // Attention.SoftmaxRowWithSink / llama.cpp ggml_soft_max_add_sinks.
+        //
+        // `sink_term` stays 0 when sinks == nullptr, and seeding `l` with an exact
+        // +0.0f leaves the pre-#365 accumulation bit-identical.
+        float sink_term = 0.0f;
+        if (sinks != nullptr)
+        {
+            float sink = sinks[hq];
+            m = fmaxf(m, sink);                 // m is now m' = max(max_i m_i, sink)
+            sink_term = expf(sink - m); // argument <= 0 by construction
+        }
+
+        float l = sink_term;
         for (int i = 0; i < ATTN_KV_SPLIT; i++)
         {
             float mi = partial_max[(size_t)hq * ATTN_KV_SPLIT + i];
             float li = partial_sum[(size_t)hq * ATTN_KV_SPLIT + i];
-            float w = (mi > -FLT_MAX + 1.0f) ? fast_exp_neg(mi - m) : 0.0f;
+            float w = (mi > -FLT_MAX + 1.0f) ? expf(mi - m) : 0.0f;
             l += li * w;
         }
         s_combined_max = m;
@@ -464,7 +526,7 @@ extern "C" __global__ void attention_f32_split_kv(
         for (int i = 0; i < ATTN_KV_SPLIT; i++)
         {
             float mi = partial_max[(size_t)hq * ATTN_KV_SPLIT + i];
-            float w = (mi > -FLT_MAX + 1.0f) ? fast_exp_neg(mi - m) : 0.0f;
+            float w = (mi > -FLT_MAX + 1.0f) ? expf(mi - m) : 0.0f;
             float oi = partial_out[((size_t)hq * ATTN_KV_SPLIT + i) * head_dim + d];
             o += oi * w;
         }
@@ -472,7 +534,7 @@ extern "C" __global__ void attention_f32_split_kv(
     }
 }
 
-// ─── Issue #226 spike: fp64 cross-split COMBINE only, fast_exp_neg untouched ───────────────────────
+// ─── Issue #226 spike: fp64 cross-split COMBINE only, the exp itself untouched ─────────────────────
 //
 // #222 found attention_f32_split_kv's real-generation divergence from baseline (#183's known,
 // accepted "not bit-exact" reassociation tradeoff, quantified at generation scale): a genuine
@@ -480,12 +542,14 @@ extern "C" __global__ void attention_f32_split_kv(
 // there (774/775 subsequent tokens differ), plus a +0.30% post-gate perplexity regression.
 // attention_f32.cu's own header (see above) already documents the root cause as the COMBINE step's
 // cross-split reassociation (independent partial sums merged, not one sequential accumulation) --
-// NOT the per-tile fast_exp_neg approximation, which is identical, in the identical accumulation
-// order, in both the baseline attention_f32 and every split-KV variant.
+// NOT the per-tile exponential, which is identical, in the identical accumulation order, in both
+// the baseline attention_f32 and every split-KV variant. (At the time this was written that
+// exponential was the Schraudolph `fast_exp_neg`; #501 replaced it with precise `expf` in every
+// one of those kernels at once, so the "identical in both" premise still holds unchanged.)
 //
 // This is a byte-for-byte copy of attention_f32_split_kv EXCEPT the combine block (after
 // grid.sync(), guarded by `if (s != 0) return`) accumulates the cross-split partial_sum ("l") and
-// partial_out ("o") merges in double precision instead of float -- fast_exp_neg itself still
+// partial_out ("o") merges in double precision instead of float -- the exp itself still
 // computes and returns a float (untouched, per issue #226's explicit scope), only the SUMMATION of
 // its already-computed float outputs across the (up to) ATTN_KV_SPLIT=4 terms happens in double.
 // This isolates the one specific hypothesis #226 asks about: does the reassociation error in this
@@ -496,6 +560,18 @@ extern "C" __global__ void attention_f32_split_kv(
 // both can be A/B'd directly without a rebuild-swap dance -- opt-in via DOTLLM_ATTN_SPLIT_KV_HP=1,
 // mutually exclusive with (and takes priority over, when both would apply) plain split-KV. See
 // issue #226 for the correctness/precision/perf verdict once measured.
+//
+// ─── #365 NOTE: NO attention-sink support here (deliberate) ────────────────────────────────
+// The "byte-for-byte copy of attention_f32_split_kv except the combine block" claim above is now
+// true only of the ORIGINAL kernel body: attention_f32_split_kv gained a trailing
+// `const float* __restrict__ sinks` parameter and a sink term in its combine (issue #365,
+// gpt-oss); this spike kernel deliberately did NOT, because nothing in this plan dispatches
+// gpt-oss to it (it is env-var opt-in, default OFF, and reachable only from the Qwen3-hybrid
+// decode path) and adding it would silently change this spike's isolated-variable A/B.
+// CONSEQUENCE: a sink-bearing layer routed here would silently drop its sinks -- wrong numerics,
+// no error. Any future dispatch change MUST keep sink-bearing layers off this kernel (and off
+// attention_f32_gqa_split_kv below, same reasoning), or add the sink term to its combine first
+// using attention_f32_split_kv's injection as the template.
 extern "C" __global__ void attention_f32_split_kv_hp(
     const float* __restrict__ q, const float* __restrict__ k,
     const float* __restrict__ v, float* __restrict__ output,
@@ -583,7 +659,7 @@ extern "C" __global__ void attention_f32_split_kv_hp(
 
         float new_max = fmaxf(running_max, tile_max);
         float correction = (running_max > -FLT_MAX + 1.0f)
-                           ? fast_exp_neg(running_max - new_max) : 0.0f;
+                           ? expf(running_max - new_max) : 0.0f;
         running_sum *= correction;
         for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
             out_accum[d] *= correction;
@@ -593,7 +669,7 @@ extern "C" __global__ void attention_f32_split_kv_hp(
         float tile_sum = 0.0f;
         for (int t = threadIdx.x; t < tile_len; t += blockDim.x) {
             float w = (score_tile[t] > -FLT_MAX + 1.0f)
-                      ? fast_exp_neg(score_tile[t] - running_max) : 0.0f;
+                      ? expf(score_tile[t] - running_max) : 0.0f;
             score_tile[t] = w;
             tile_sum += w;
         }
@@ -649,7 +725,7 @@ extern "C" __global__ void attention_f32_split_kv_hp(
         {
             float mi = partial_max[(size_t)hq * ATTN_KV_SPLIT + i];
             float li = partial_sum[(size_t)hq * ATTN_KV_SPLIT + i];
-            float w = (mi > -FLT_MAX + 1.0f) ? fast_exp_neg(mi - m) : 0.0f;
+            float w = (mi > -FLT_MAX + 1.0f) ? expf(mi - m) : 0.0f;
             l += (double)li * (double)w;
         }
         s_combined_max = m;
@@ -667,7 +743,7 @@ extern "C" __global__ void attention_f32_split_kv_hp(
         for (int i = 0; i < ATTN_KV_SPLIT; i++)
         {
             float mi = partial_max[(size_t)hq * ATTN_KV_SPLIT + i];
-            float w = (mi > -FLT_MAX + 1.0f) ? fast_exp_neg(mi - m) : 0.0f;
+            float w = (mi > -FLT_MAX + 1.0f) ? expf(mi - m) : 0.0f;
             float oi = partial_out[((size_t)hq * ATTN_KV_SPLIT + i) * head_dim + d];
             o += (double)oi * (double)w;
         }
@@ -714,7 +790,7 @@ extern "C" __global__ void attention_f32_split_kv_hp(
 // the register-blocked PV loop visits t=0..tileLen-1 in the same order; the max/sum reductions
 // reuse the identical shuffle-tree code. Grouping changes WHICH iterations share a K/V global
 // read, never the order of operations within any one head's accumulation -- so at `kv_split==1`
-// this kernel special-cases the trivial one-way combine (skips the `fast_exp_neg` reweighting
+// this kernel special-cases the trivial one-way combine (skips the `expf` reweighting
 // entirely, since with exactly one partial there is nothing to reassociate) and is expected to be
 // BIT-EXACT vs `attention_f32` for that case (validated directly, not just asserted -- see
 // `CudaAttentionF32GqaSplitTests.cs`). At `kv_split>1` this kernel inherits EXACTLY
@@ -732,6 +808,15 @@ extern "C" __global__ void attention_f32_split_kv_hp(
 // `MaxSafeAttentionGqaSplit`'s result (queried via `cuOccupancyMaxActiveBlocksPerMultiprocessor`,
 // same mechanism `IsAttentionSplitKvSafe` already uses) before launch -- exceeding the
 // cooperative-launch co-residency ceiling is a hard CUDA error, not a soft perf regression.
+//
+// ─── #365 NOTE: NO attention-sink support here (deliberate) ────────────────────────────────
+// Like attention_f32_split_kv_hp above, this kernel did NOT gain issue #365's per-head sink
+// parameter: it is env-var opt-in, default OFF, and reached only from the Qwen3-hybrid decode
+// path, which has no sink weights. Its combine block (after grid.sync()) has the same clean
+// single-injection shape as attention_f32_split_kv's, so adding sinks later is mechanical --
+// fold `sink` into the per-head `m` scan and seed `l` with `expf(sink - m)` -- with the
+// one extra wrinkle that the `kv_split == 1` bit-exact fast path would need the same epilogue
+// attention_f32 uses. UNTIL THEN: a sink-bearing layer routed here silently drops its sinks.
 #define MAX_GQA_GROUP 8
 
 extern "C" __global__ void __launch_bounds__(256) attention_f32_gqa_split_kv(
@@ -846,7 +931,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32_gqa_split_kv(
             float running_max = running_max_s[g];
             float new_max = fmaxf(running_max, tile_max);
             float correction = (running_max > -FLT_MAX + 1.0f)
-                               ? fast_exp_neg(running_max - new_max) : 0.0f;
+                               ? expf(running_max - new_max) : 0.0f;
             float running_sum = running_sum_s[g] * correction;
             for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
                 out_accum[g * head_dim + d] *= correction;
@@ -855,7 +940,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32_gqa_split_kv(
             float tile_sum = 0.0f;
             for (int t = threadIdx.x; t < tile_len; t += blockDim.x) {
                 float w = (score_tile[g * TILE_KV + t] > -FLT_MAX + 1.0f)
-                          ? fast_exp_neg(score_tile[g * TILE_KV + t] - new_max) : 0.0f;
+                          ? expf(score_tile[g * TILE_KV + t] - new_max) : 0.0f;
                 score_tile[g * TILE_KV + t] = w;
                 tile_sum += w;
             }
@@ -955,7 +1040,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32_gqa_split_kv(
 
         if (kv_split == 1)
         {
-            // Trivial one-way combine: nothing to reassociate, skip fast_exp_neg(0) entirely so
+            // Trivial one-way combine: nothing to reassociate, skip expf(0) entirely so
             // this path is bit-exact vs the un-split accumulation (see header "Correctness").
             if (threadIdx.x == 0)
             {
@@ -982,7 +1067,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32_gqa_split_kv(
             {
                 float mi = partial_max[(size_t)hq * kv_split + i];
                 float li = partial_sum[(size_t)hq * kv_split + i];
-                float w = (mi > -FLT_MAX + 1.0f) ? fast_exp_neg(mi - m) : 0.0f;
+                float w = (mi > -FLT_MAX + 1.0f) ? expf(mi - m) : 0.0f;
                 l += li * w;
             }
             s_combined_max = m;
@@ -999,7 +1084,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32_gqa_split_kv(
             for (int i = 0; i < kv_split; i++)
             {
                 float mi = partial_max[(size_t)hq * kv_split + i];
-                float w = (mi > -FLT_MAX + 1.0f) ? fast_exp_neg(mi - m) : 0.0f;
+                float w = (mi > -FLT_MAX + 1.0f) ? expf(mi - m) : 0.0f;
                 float oi = partial_out[((size_t)hq * kv_split + i) * head_dim + d];
                 o += oi * w;
             }

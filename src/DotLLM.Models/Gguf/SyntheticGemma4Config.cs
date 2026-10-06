@@ -100,6 +100,11 @@ public sealed record SyntheticGemma4Config
     /// [GlobalHeadDim/2] (E4B full-attention layers). Default false.</summary>
     public bool EmitRopeFreqs { get; init; }
 
+    /// <summary>When &gt; 0 (with <see cref="EmitRopeFreqs"/>) the factors take the released E2B/E4B
+    /// proportional form: exactly 1.0 for the leading N pairs and 1e30 (identity) for the rest. 0 (default)
+    /// emits general factors in [1, 1.5).</summary>
+    public int RopeFreqsProportionalPairs { get; init; }
+
     /// <summary>Emit ALL-ZERO K/V projection weights on the shared-KV layers
     /// (which never use them). Discriminates "donor KV used" from "own KV used":
     /// output must be identical to the same fixture with random shared-layer K/V.</summary>

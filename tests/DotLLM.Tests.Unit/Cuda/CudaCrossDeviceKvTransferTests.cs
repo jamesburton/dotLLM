@@ -16,6 +16,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// compare is byte-exact despite the FP16 device storage.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaCrossDeviceKvTransferTests
 {
     private const int NumLayers = 2;

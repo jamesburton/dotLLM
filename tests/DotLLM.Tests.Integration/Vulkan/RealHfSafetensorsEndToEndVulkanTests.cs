@@ -57,6 +57,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class RealHfSafetensorsEndToEndVulkanTests
 {
     // Tolerances mirrored from VulkanTransformerModelTests.
@@ -241,8 +242,9 @@ public sealed class RealHfSafetensorsEndToEndVulkanTests
         // Phase C); HF's DeepSeek extractor defaults UseHybridMlaCache=true,
         // so we strip those flags for the Vulkan-side config. The no-cache
         // forward-pass parity below is bit-equivalent across cache modes.
-        (ISafetensorsTensorSource vkSource, ModelConfig vkProbeConfig) =
-            ModelLoader.OpenSafetensorsAndConfig(root);
+        (ISafetensorsTensorSource vkSource, ModelConfig vkProbeConfig) = CheckpointGuard.LoadOrSkip(
+            root, $"{label} HF safetensors checkpoint (Vulkan)",
+            () => ModelLoader.OpenSafetensorsAndConfig(root));
         ModelConfig vkConfig = NormalizeForVulkan(vkProbeConfig);
 
         var vkLoadWatch = Stopwatch.StartNew();
@@ -269,8 +271,9 @@ public sealed class RealHfSafetensorsEndToEndVulkanTests
 
         // ── CPU model ──────────────────────────────────────────────────
         var cpuLoadWatch = Stopwatch.StartNew();
-        (IModel cpuModel, ISafetensorsTensorSource cpuSource, ModelConfig cpuConfig)
-            = ModelLoader.LoadFromSafetensors(root);
+        (IModel cpuModel, ISafetensorsTensorSource cpuSource, ModelConfig cpuConfig) = CheckpointGuard.LoadOrSkip(
+            root, $"{label} HF safetensors checkpoint (CPU)",
+            () => ModelLoader.LoadFromSafetensors(root));
         cpuLoadWatch.Stop();
         Assert.Equal(expectedArch, cpuConfig.Architecture);
         _output.WriteLine(

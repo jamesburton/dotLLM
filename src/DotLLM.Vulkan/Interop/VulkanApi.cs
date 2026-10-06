@@ -41,6 +41,15 @@ internal static partial class VulkanApi
     internal static partial void vkGetPhysicalDeviceMemoryProperties(
         nint physicalDevice, out VkPhysicalDeviceMemoryProperties pMemoryProperties);
 
+    // Vulkan 1.1 core: chain-aware memory-property query. Used only for
+    // diagnostics, to chain VkPhysicalDeviceMemoryBudgetPropertiesEXT and read
+    // the driver's PER-PROCESS heap usage/budget at an allocation failure.
+    // Takes a raw blob because the chained struct is written by hand at the
+    // call site (see VulkanDevice.MemorySnapshot).
+    [LibraryImport(LibName)]
+    internal static unsafe partial void vkGetPhysicalDeviceMemoryProperties2(
+        nint physicalDevice, byte* pMemoryProperties);
+
     [LibraryImport(LibName)]
     internal static partial void vkGetPhysicalDeviceQueueFamilyProperties(
         nint physicalDevice, ref uint pQueueFamilyPropertyCount,
@@ -285,6 +294,16 @@ internal static partial class VulkanApi
         vkCmdDispatchNative(commandBuffer, groupCountX, groupCountY, groupCountZ);
     }
 
+    [LibraryImport(LibName, EntryPoint = "vkCmdDispatchIndirect")]
+    private static partial void vkCmdDispatchIndirectNative(nint commandBuffer, nint buffer, ulong offset);
+
+    /// <summary>Counted wrapper over <c>vkCmdDispatchIndirect</c>: the group counts are read from <paramref name="buffer"/> at <paramref name="offset"/> (3 x uint).</summary>
+    internal static void vkCmdDispatchIndirect(nint commandBuffer, nint buffer, ulong offset)
+    {
+        ProfileCounters.Dispatches++;
+        vkCmdDispatchIndirectNative(commandBuffer, buffer, offset);
+    }
+
     [LibraryImport(LibName, EntryPoint = "vkCmdCopyBuffer")]
     private static partial void vkCmdCopyBufferNative(
         nint commandBuffer, nint srcBuffer, nint dstBuffer,
@@ -333,6 +352,9 @@ internal static partial class VulkanApi
     internal static partial int vkWaitForFences(
         nint device, uint fenceCount, in nint pFences,
         [MarshalAs(UnmanagedType.U4)] uint waitAll, ulong timeout);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkGetFenceStatus(nint device, nint fence);
 
     [LibraryImport(LibName)]
     internal static partial int vkResetFences(

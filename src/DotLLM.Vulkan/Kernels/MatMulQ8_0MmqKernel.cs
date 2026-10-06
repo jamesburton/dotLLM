@@ -84,11 +84,21 @@ public sealed class MatMulQ8_0MmqKernel : IDisposable
     /// kernel contains no subgroup ops, so wave width only changes scheduling.
     /// </param>
     public static MatMulQ8_0MmqKernel? TryCreate(VulkanDevice device, string spvDir, uint requiredSubgroupSize = 0)
+        => TryCreate(device, spvDir, requiredSubgroupSize, "matmul_q8_0_mmq");
+
+    /// <summary>
+    /// Issue #544 measurement hook: loads <c>{shaderBaseName}.spv</c> instead of
+    /// the production module, so a bench can hold the shipping kernel and a
+    /// baseline open in ONE process and A/B them same-session, order-reversed.
+    /// Production callers never pass this.
+    /// </summary>
+    internal static MatMulQ8_0MmqKernel? TryCreate(
+        VulkanDevice device, string spvDir, uint requiredSubgroupSize, string shaderBaseName)
     {
         if (!device.HasIntegerDotProduct)
             return null;
 
-        string path = Path.Combine(spvDir, "matmul_q8_0_mmq.spv");
+        string path = Path.Combine(spvDir, shaderBaseName + ".spv");
         if (!File.Exists(path))
             return null;
 

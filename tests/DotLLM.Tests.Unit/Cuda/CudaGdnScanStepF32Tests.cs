@@ -16,6 +16,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// regression coverage against the CPU reference it claims bit-perfect parity with.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaGdnScanStepF32Tests
 {
     private readonly ITestOutputHelper _out;

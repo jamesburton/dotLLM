@@ -59,20 +59,30 @@ public sealed class BackendPerplexityModel : IPerplexityModel
     /// </summary>
     /// <param name="model">Model to probe.</param>
     /// <param name="deviceId">Device for the probe forward; <c>-1</c> is CPU.</param>
+    /// <param name="requiredRows">Longest batch the caller will score in one forward; the model must
+    /// declare all-row logits at least that far. Default: any length.</param>
     /// <returns><see langword="true"/> when the forward returned at least two rows of logits.</returns>
     /// <remarks>
     /// Measuring beats assuming here. The alternative — branching on the concrete model type — bakes
     /// in a fact that lives in each backend's forward implementation and can change without this
     /// adapter noticing, and the failure mode is a silently wrong perplexity rather than an
     /// exception. A two-token probe costs one trivial forward and cannot be wrong about the backend
-    /// it just ran.
+    /// it just ran <i>at two tokens</i>.
+    /// <para><b>Which is exactly the limit of what measuring can tell you</b>, so the measurement is
+    /// combined with <see cref="IModel.MaxAllRowLogitsLength"/>. A backend may return every row up to
+    /// some bound and the last row only beyond it (the Vulkan hybrid-dense host does, so that a
+    /// speculative verify batch gets the per-position logits it indexes, without paying a
+    /// 248320-row head on a 2048-token prefill). Such a model answers the two-token probe with two
+    /// rows and would be scored single-pass, whereupon the evaluator would index rows 1..n-1 of a
+    /// buffer holding one — reading past the end of the allocation and reporting a fabricated
+    /// perplexity. Only a model that returns all rows for <em>any</em> length is eligible.</para>
     /// <para><b>The probe leaves no trace.</b> On a recurrent architecture the probe's forward
     /// advances model-owned recurrent state, so without the reset below the two throwaway tokens
     /// would have been prepended to the very first scored window (issue #261). The reset runs in a
     /// <c>finally</c>: a probe that throws part-way through a forward has still dirtied the state,
     /// and leaving it dirty would corrupt whatever the caller does next.</para>
     /// </remarks>
-    public static bool Probe(IModel model, int deviceId)
+    public static bool Probe(IModel model, int deviceId, int requiredRows = int.MaxValue)
     {
         ArgumentNullException.ThrowIfNull(model);
 
@@ -81,7 +91,8 @@ public sealed class BackendPerplexityModel : IPerplexityModel
             ReadOnlySpan<int> tokens = stackalloc int[2] { 0, 0 };
             ReadOnlySpan<int> positions = stackalloc int[2] { 0, 1 };
             using ITensor logits = model.Forward(tokens, positions, deviceId);
-            return logits.ElementCount >= 2L * model.Config.VocabSize;
+            return logits.ElementCount >= 2L * model.Config.VocabSize
+                && model.MaxAllRowLogitsLength >= requiredRows;
         }
         finally
         {

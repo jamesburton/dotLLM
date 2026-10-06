@@ -68,11 +68,20 @@ public sealed class MatMulQ4KMmqKernel : IDisposable
     /// <see cref="MatMulQ4KGemmF32Kernel"/>.
     /// </summary>
     public static MatMulQ4KMmqKernel? TryCreate(VulkanDevice device, string spvDir)
+        => TryCreate(device, spvDir, "matmul_q4_k_mmq");
+
+    /// <summary>
+    /// Issue #545 measurement hook: loads <c>{shaderBaseName}.spv</c> instead of the
+    /// production module, so a bench can hold the shipping kernel and a baseline
+    /// open in ONE process and A/B them same-session. Production callers never
+    /// pass this.
+    /// </summary>
+    internal static MatMulQ4KMmqKernel? TryCreate(VulkanDevice device, string spvDir, string shaderBaseName)
     {
         if (!device.HasIntegerDotProduct)
             return null;
 
-        string path = Path.Combine(spvDir, "matmul_q4_k_mmq.spv");
+        string path = Path.Combine(spvDir, shaderBaseName + ".spv");
         if (!File.Exists(path))
             return null;
 

@@ -64,6 +64,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed unsafe class CudaQwen3MoeHybridRealGgufLayerParityTests
 {
     private const string GgufPathEnvVar = "DOTLLM_QWEN3MOEHYBRID_GGUF_PATH";

@@ -18,11 +18,25 @@ pipeline is selected in `TiktokenPreTokenizer.GetRegexes`.
 - **Unknown value** → `InvalidDataException` at load (llama.cpp throws here too). Escape hatch:
   `DOTLLM_ALLOW_UNKNOWN_PRETOKENIZER=1` proceeds with the GPT-2 default pipeline — never with
   "no pre-tokenization", which silently mis-tokenizes.
-- Supported `pre` values: `default`/`gpt2`; `llama3`/`llama-v3`/`llama-bpe`/`falcon3`/`falcon-h1`/
-  `pixtral`/`midm-2.0`/`lfm2`/`jina-v5-nano` (one shared Llama-3 pipeline, as in llama.cpp);
-  `starcoder`/`refact`/`command-r`/`smollm`/`codeshell`/`exaone`/`minerva`/`mellum2`;
-  `deepseek-llm`; `deepseek-coder`; `gpt-4o`/`llama4`. New values are sourced from llama.cpp
-  `llama-vocab.cpp` (authoritative), never invented.
+- Supported `pre` values (one row per pipeline; aliases share a pipeline exactly as they share
+  a `case` block in llama.cpp):
+
+  | Pipeline | `tokenizer.ggml.pre` values |
+  |---|---|
+  | GPT-2 default | `default`, `gpt2` (also the absent/empty and opt-out fallback) |
+  | Llama 3 | `llama3`, `llama-v3`, `llama-bpe`, `falcon3`, `falcon-h1`, `pixtral`, `midm-2.0`, `lfm2`, `jina-v5-nano` |
+  | StarCoder/SmolLM | `starcoder`, `refact`, `command-r`, `smollm`, `codeshell`, `exaone`, `minerva`, `minerva-7b`, `mellum2` |
+  | DeepSeek LLM | `deepseek-llm` |
+  | DeepSeek Coder | `deepseek-coder` |
+  | Qwen 2 | `qwen2`, `deepseek-r1-qwen`, `kormo`, `f2llmv2`, `megrez`, `stablelm2`, `hunyuan`, `solar-open` |
+  | Qwen 3.5 | `qwen35` |
+  | GPT-4o | `gpt-4o`, `llama4` |
+  | Tekken | `tekken` |
+
+  New values are sourced from llama.cpp `llama-vocab.cpp` (authoritative), never invented.
+  The Qwen pipelines differ from Llama 3 only in the digit alternative — a bare `\p{N}`
+  splits every digit — and Qwen 3.5 additionally folds combining marks into the letter run
+  (`[\p{L}\p{M}]+`). Any `pre` value not in this table throws; see the policy above.
 
 ### SentencePiece BPE (Llama 2)
 
@@ -57,6 +71,28 @@ Implemented in `Gemma4SpmBpeEncoding` (`BpeTokenizer.CreateGemma4`); routed by
 are present (files without merges keep the SentencePiece longest-match fallback).
 Oracle-pinned parity tests: `Gemma4TokenizerParityTests` (integration, vs
 `llama-tokenize --ids`) and `Gemma4BpeTokenizerTests` (unit, synthetic vocab).
+
+### WordPiece (BERT, `tokenizer.ggml.model = "bert"`)
+
+`DotLLM.Tokenizers.WordPiece.WordPieceTokenizer` (issue #738) implements HF `BertTokenizer`
+semantics for embedding encoders: NFC, clean (drop NUL/U+FFFD/control, whitespace to space), CJK
+ideographs padded with spaces, optional lower-casing + accent stripping (NFD, drop `Mn`),
+punctuation split (all ASCII non-alphanumerics + Unicode `P*`), greedy longest-match with `##`
+continuation, whole word to `[UNK]` when unsegmentable or longer than 100 code points. `Encode`
+returns `[CLS] ... [SEP]`; literal `[CLS]`/`[SEP]`/`[MASK]`/... in the text map to their ids.
+
+- **GGUF**: llama.cpp stores the vocabulary in "WPM" form: word-initial pieces prefixed `▁`,
+  continuations bare (`##` stripped), bracketed specials untouched. `FromGgufTokens` converts to the
+  canonical form. CLS/SEP ids come from `cls_token_id`/`seperator_token_id` (sic) or, in older files,
+  `bos_token_id`/`eos_token_id`; anything missing is resolved by string. `GgufTokenizerFactory.Load`
+  dispatches `bert` to this tokenizer and everything else to the BPE factory.
+- **tokenizer.json**: `HfWordPieceLoader.Parse` (`model.type == "WordPiece"`; honours
+  `BertNormalizer` / `Lowercase` / `StripAccents`).
+- Validated: exact id parity with HF `tokenizers` on 18 sentences (accents, CJK, Korean, symbols,
+  control characters, over-long word, literal specials) through both paths
+  (`BertWordPieceParityTests`). llama.cpp b9016's `/tokenize` on the same GGUF was also measured on 9
+  sentences (incl. accents and CJK) and is id-identical to HF, so there is no known deviation from
+  llama.cpp either.
 
 ### HuggingFace tokenizer.json
 

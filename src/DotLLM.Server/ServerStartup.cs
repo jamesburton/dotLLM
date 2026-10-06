@@ -6,6 +6,7 @@ using DotLLM.Engine;
 using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
 using DotLLM.Engine.Scheduler;
+using DotLLM.HuggingFace;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
@@ -27,32 +28,55 @@ public static class ServerStartup
     /// </summary>
     public static string? ResolveModelPath(string modelArg, string? quant)
     {
-        // Direct .gguf file path
-        if (modelArg.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase) && File.Exists(modelArg))
-            return modelArg;
+        // A profile name resolves to its base model (#716); profiles shadow a model that happens to share the name.
+        if (ModelProfileStore.Resolve(modelArg) is { } resolved)
+            return ModelResolver.ResolveLocal(resolved.BaseReference, quant, includeOllama: true);
+        return ModelResolver.ResolveLocal(modelArg, quant, includeOllama: true);
+    }
 
-        // HuggingFace repo ID — check cached models directory
-        var modelsDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models");
+    /// <summary>
+    /// The id a loaded model is known by: the profile name when <paramref name="requested"/> names a profile (so a request for that alias
+    /// matches the active model and residency keys by it), otherwise the file stem.
+    /// </summary>
+    public static string ModelIdFor(string requested, string resolvedPath) =>
+        ModelProfileStore.NormalizeName(requested) is { } n && ModelProfileStore.TryGet(n) is not null
+            ? n
+            // An ollama blob is named sha256-<hex>: key the model by the ollama name it was requested under.
+            : OllamaStore.IsBlobPath(resolvedPath) && OllamaRef.TryParse(requested) is { } o ? o.ToString()
+            : Path.GetFileNameWithoutExtension(resolvedPath);
 
-        var repoDir = Path.Combine(modelsDir, modelArg.Replace('/', Path.DirectorySeparatorChar));
-        if (!Directory.Exists(repoDir))
-            return null;
+    /// <summary>
+    /// <see cref="ResolveModelPath"/>, falling back to a Hub download when <paramref name="autoPull"/> is on and the reference names a Hub repo
+    /// (<c>--auto-pull</c>, issue #714). Off by default: a remote client must not be able to start multi-gigabyte downloads by naming a repo.
+    /// </summary>
+    public static async Task<string?> ResolveOrPullAsync(string modelArg, string? quant, bool autoPull, CancellationToken ct)
+    {
+        string? path = ResolveModelPath(modelArg, quant);
+        if (path is not null || !autoPull) return path;
 
-        var ggufFiles = Directory.GetFiles(repoDir, "*.gguf");
-        if (quant is not null)
+        string baseRef = ModelProfileStore.Resolve(modelArg)?.BaseReference ?? modelArg;
+        if (OllamaRef.TryParse(baseRef) is { } ollamaRef && !ModelResolver.Parse(baseRef).IsRepo)
         {
-            ggufFiles = ggufFiles.Where(f =>
-                Path.GetFileName(f).Contains(quant, StringComparison.OrdinalIgnoreCase)).ToArray();
+            using var registry = new OllamaRegistry();
+            Console.WriteLine($"[dotllm] --auto-pull: downloading {ollamaRef} from the ollama registry");
+            return await ModelResolver.PullOllamaAsync(ollamaRef, registry, progress: null, ct).ConfigureAwait(false);
         }
+        var reference = ModelResolver.Parse(baseRef);
+        if (!reference.IsRepo) return null;
+        using var client = new HuggingFaceClient();
+        using var downloader = new HuggingFaceDownloader();
+        Console.WriteLine($"[dotllm] --auto-pull: downloading {modelArg}");
+        return await ModelResolver.PullAsync(reference, quant, client, downloader, progress: null, ct).ConfigureAwait(false);
+    }
 
-        return ggufFiles.Length switch
-        {
-            1 => ggufFiles[0],
-            > 1 => ggufFiles.OrderByDescending(f => new FileInfo(f).Length).First(),
-            _ => null,
-        };
+    /// <summary>The message for an unresolvable model name, with the way out.</summary>
+    public static string NotFoundMessage(string modelArg)
+    {
+        string baseRef = ModelProfileStore.Resolve(modelArg)?.BaseReference ?? modelArg;
+        bool hf = ModelResolver.Parse(baseRef).IsRepo;
+        string pull = !hf && OllamaRef.TryParse(baseRef) is { } o ? $"dotllm model pull ollama:{o}" : $"dotllm model pull {modelArg}";
+        return $"Model not found: {modelArg}. Download it with `{pull}` or POST /v1/models/pull" +
+               (hf || OllamaRef.TryParse(baseRef) is not null ? ", or start the server with --auto-pull." : ".");
     }
 
     /// <summary>
@@ -92,6 +116,54 @@ public static class ServerStartup
     /// </summary>
     public static ServerState LoadModel(string resolvedPath, ServerOptions options)
     {
+        if (!DeviceSelector.IsAuto(options.Device))
+            return LoadModelCore(resolvedPath, options);
+
+        // --device auto (#722): try the best device first and fall through on a failed load. The server keeps "auto" as its configured device
+        // (so later on-demand loads choose again, per model size); the device actually used is recorded in ResolvedDevice.
+        // CPU is only reached here by the user's own choice of "auto"; when a GPU candidate failed first, that is surfaced as a prominent
+        // WARNING (console + ServerState.DeviceFallbackWarning -> /props) rather than a quiet log line (#733).
+        Exception? last = null;
+        var gpuFailures = new List<string>();
+        foreach (string device in DeviceSelector.Candidates(new FileInfo(resolvedPath).Length))
+        {
+            try
+            {
+                Console.WriteLine($"[dotllm] --device auto: trying {device}");
+                var loaded = LoadModelCore(resolvedPath, options with { Device = device });
+                loaded.Options = loaded.Options with { Device = options.Device, ResolvedDevice = device };
+                if (device == "cpu" && gpuFailures.Count > 0)
+                {
+                    loaded.DeviceFallbackWarning = DeviceSelector.FallbackWarning(ModelIdFor(options.Model, resolvedPath), gpuFailures);
+                    Console.WriteLine($"[dotllm] WARNING: {loaded.DeviceFallbackWarning}");
+                }
+                return loaded;
+            }
+            catch (Exception ex) when (device != "cpu")
+            {
+                last = ex;
+                gpuFailures.Add($"{device}: {ex.Message}");
+                Console.WriteLine($"[dotllm] {device} could not load this model ({ex.Message}); trying the next device");
+            }
+        }
+        throw last ?? new InvalidOperationException("No device could load the model.");
+    }
+
+    /// <summary>
+    /// Resolves the requested GPU layer count against the layer count the loader actually sees (<paramref name="numLayers"/>).
+    /// A negative request (<see cref="AllGpuLayers"/>) or an unset request on a <c>gpu</c> device means "all layers"; otherwise the
+    /// request is clamped to <c>[0, numLayers]</c>; unset on a non-GPU device is 0.
+    /// </summary>
+    public static int ResolveGpuLayers(int? requested, string device, int numLayers) =>
+        requested is < 0 ? numLayers
+        : requested.HasValue ? Math.Clamp(requested.Value, 0, numLayers)
+        : device.StartsWith("gpu", StringComparison.OrdinalIgnoreCase) ? numLayers : 0;
+
+    /// <summary>Sentinel <c>gpu_layers</c> value meaning "every layer, as the loader counts them".</summary>
+    public const int AllGpuLayers = -1;
+
+    private static ServerState LoadModelCore(string resolvedPath, ServerOptions options)
+    {
         Console.WriteLine($"[dotllm] Loading model from {resolvedPath}...");
         var gguf = GgufFile.Open(resolvedPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -100,31 +172,36 @@ public static class ServerStartup
 
         var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);
 
-        int gpuLayers = options.GpuLayers.HasValue
-            ? Math.Clamp(options.GpuLayers.Value, 0, config.NumLayers)
-            : options.Device.StartsWith("gpu", StringComparison.OrdinalIgnoreCase) ? config.NumLayers : 0;
+        int gpuLayers = ResolveGpuLayers(options.GpuLayers, options.Device, config.NumLayers);
+        if (options.GpuLayers is { } requestedLayers && requestedLayers > config.NumLayers)
+            Console.WriteLine($"[dotllm] Requested {requestedLayers} GPU layers but {Path.GetFileName(resolvedPath)} has {config.NumLayers}; using all {config.NumLayers}.");
 
         IModel model;
-        if (gpuLayers <= 0)
+        Func<int, IKvCache>? vulkanKvFactory = null;
+        if (DotLLM.Vulkan.VulkanModelLoader.IsVulkanDeviceString(options.Device))
         {
-            Console.WriteLine($"[dotllm] CPU inference ({threading.EffectiveThreadCount} threads)");
-            // Shared per-architecture CPU dispatch — routes hybrid architectures
-            // (Nemotron-H, Qwen3MoeHybrid) to their dedicated loaders.
-            model = ModelLoader.CreateCpuModelFromGguf(gguf, config, threading);
-        }
-        else if (gpuLayers >= config.NumLayers)
-        {
-            int gpuId = ParseGpuId(options.Device);
-            Console.WriteLine($"[dotllm] GPU {gpuId} inference");
-            // Shared per-architecture CUDA dispatch — routes hybrid architectures
-            // (Qwen3MoeHybrid, Qwen3HybridDense) to their dedicated loaders (#259).
-            (model, _) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId);
+            // Shared per-architecture Vulkan dispatch (#259). Before this branch `--device vulkan` fell
+            // through to the CPU path silently (the string does not start with "gpu").
+            Console.WriteLine($"[dotllm] Vulkan inference ({DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName})");
+            (model, vulkanKvFactory) = DotLLM.Vulkan.VulkanModelLoader.CreateSharedFromGguf(gguf, config);
         }
         else
         {
+            // One dispatch for CPU / all-GPU / partial (#729). Architectures that cannot split layers
+            // (Nemotron-H, Qwen3MoeHybrid, Mamba-3) are loaded all-GPU, or the load FAILS with an actionable error (never a silent CPU fallback) —
+            // they must never reach HybridTransformerModel (dense Llama-style tensor naming only).
             int gpuId = ParseGpuId(options.Device);
-            Console.WriteLine($"[dotllm] Hybrid inference ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)");
-            model = DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(gguf, config, gpuLayers, gpuId, threading);
+            var plan = GpuOffloadPlanner.Plan(config.Architecture, gpuLayers, config.NumLayers);
+            Console.WriteLine(plan.Mode switch
+            {
+                GpuOffloadMode.Cpu => $"[dotllm] CPU inference ({threading.EffectiveThreadCount} threads)",
+                GpuOffloadMode.FullGpu => $"[dotllm] GPU {gpuId} inference",
+                GpuOffloadMode.Partial => $"[dotllm] Hybrid inference ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)",
+                _ => $"[dotllm] GPU {gpuId} inference (partial offload unsupported for {config.Architecture}; all layers must fit)",
+            });
+            (model, _) = DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(
+                gguf, config, gpuLayers, gpuId, threading,
+                w => Console.WriteLine($"[dotllm] WARNING: {w}"));
         }
 
         // Create chat template. The declared template is untrusted input from the GGUF's
@@ -166,7 +243,17 @@ public static class ServerStartup
         PagedKvCacheFactory? pagedFactory = null;
         DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
         PrefixTrieManager? prefixTrieManager = null;
-        if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
+        if (vulkanKvFactory is not null)
+        {
+            // Vulkan models own their device-resident KV storage. Like the CUDA paths, requests run
+            // one at a time through the per-request TextGenerator (no ForwardBatch scheduler, no
+            // paged/quantized KV, no cross-request prefix reuse yet).
+            if (options.UsePaged)
+                Console.WriteLine("[dotllm] Paged KV-cache not supported on Vulkan; using the model's own KV-cache.");
+            var vkFactory = vulkanKvFactory;
+            kvFactory = (cfg, size) => vkFactory(size);
+        }
+        else if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
         {
             if (options.UsePaged && kvConfig.IsQuantized)
             {
@@ -199,6 +286,20 @@ public static class ServerStartup
             if (options.UsePaged)
                 Console.WriteLine("[dotllm] Paged KV-cache not supported with hybrid GPU, using hybrid cache.");
             kvFactory = (cfg, size) => hybridModel.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel qwen3SplitModel)
+        {
+            // #729: partial-offload Qwen3HybridDense owns a split (GPU head / CPU tail) cache.
+            if (options.UsePaged)
+                Console.WriteLine("[dotllm] Paged KV-cache not supported with hybrid GPU, using the model's split cache.");
+            kvFactory = (cfg, size) => qwen3SplitModel.CreateKvCache(size);
+        }
+        else if (model is DotLLM.Cuda.Architectures.CudaNemotronHTransformerModel nemotronHModel)
+        {
+            // #729: the all-GPU fallback for a partial request on Nemotron-H; sparse attention-only KV.
+            if (options.UsePaged)
+                Console.WriteLine("[dotllm] Paged KV-cache not supported for Nemotron-H on GPU; using the model's own cache.");
+            kvFactory = (cfg, size) => nemotronHModel.CreateKvCache(size);
         }
         else if (model is DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel qwen3HybridDenseModel)
         {
@@ -262,7 +363,7 @@ public static class ServerStartup
                 kvConfig.TurboQuantBits, kvConfig.TurboQuantSeed, kvConfig.TurboQuantUseQjl);
         }
 
-        PrefixCache? prefixCache = options.PromptCacheEnabled
+        PrefixCache? prefixCache = options.PromptCacheEnabled && vulkanKvFactory is null
             ? new PrefixCache(options.PromptCacheSize)
             : null;
 
@@ -299,15 +400,21 @@ public static class ServerStartup
         // auto-detect default), since engaging it also takes the continuous-batch scheduler
         // offline for this model (see below). Only actually engages requests when the loaded
         // checkpoint carries an MTP head; otherwise this is a no-op even with --mtp set.
-        bool mtpActive = options.MtpEnabled && draftModel is null && model.SupportsMtp;
-        if (options.MtpEnabled && draftModel is null && model.SupportsMtp)
+        // An explicit concurrency hint (>= 5, Vulkan) wins over --mtp: the continuous-batch scheduler measured +73% aggregate decode at 8
+        // concurrent streams and cannot run speculative decoding, so MTP is dropped for this model with a log line.
+        bool concurrencyOverMtp = options.MtpEnabled && options.ExpectedConcurrency >= 5 && vulkanKvFactory is not null
+            && !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_SCHEDULER"), "0", StringComparison.Ordinal);
+        if (concurrencyOverMtp && model.SupportsMtp)
+            Console.WriteLine("[dotllm] --expected-concurrency >= 5: serving through the continuous-batch scheduler; MTP self-speculation is disabled for this model.");
+        bool mtpActive = options.MtpEnabled && draftModel is null && model.SupportsMtp && !concurrencyOverMtp;
+        if (options.MtpEnabled && draftModel is null && model.SupportsMtp && !concurrencyOverMtp)
             Console.WriteLine($"[dotllm] MTP self-speculative decoding: K={options.SpeculativeCandidates} (model carries an MTP head)");
         else if (options.MtpEnabled && draftModel is null && !model.SupportsMtp)
             Console.WriteLine("[dotllm] --mtp was set but this checkpoint has no MTP head (nextn.* tensors) — ignoring.");
 
         var generator = new TextGenerator(model, tokenizer, kvFactory, prefixCache,
             draftModel: draftModel, speculativeCandidates: options.SpeculativeCandidates,
-            mtpEnabled: options.MtpEnabled,
+            mtpEnabled: options.MtpEnabled, mtpAdaptive: true, recurrentPrefixCache: true,
             prefixTrieManager: prefixTrieManager,
             prefillChunkSize: options.PrefillChunkSize);
         if (options.PrefillChunkSize > 0)
@@ -333,19 +440,42 @@ public static class ServerStartup
         // decoding, same restriction) in this iteration, and GPU/hybrid models keep their existing
         // single-request path until the IModel.ForwardBatch override lands in those backends.
         ContinuousBatchSchedulerService? scheduler = null;
-        if (pagedFactory is not null && kvFactory is not null && draftModel is null && !mtpActive)
+        // Vulkan hybrid models (per-sequence GDN state + serial ForwardBatch) can run through the scheduler, but the
+        // serial TextGenerator path is faster until recurrent prefix restore + fused batching land, so this is opt-in:
+        // DOTLLM_VK_SCHEDULER=1. No paged pool and no prefix trie (KV-only, paged-only) on this path.
+        string? vkSchedEnv = Environment.GetEnvironmentVariable("DOTLLM_VK_SCHEDULER");
+        bool vulkanScheduler = vulkanKvFactory is not null && model.SupportsThreadedSequenceState
+            && (string.Equals(vkSchedEnv, "1", StringComparison.Ordinal)
+                || (options.ExpectedConcurrency >= 5 && !string.Equals(vkSchedEnv, "0", StringComparison.Ordinal)));
+        if ((pagedFactory is not null || vulkanScheduler) && kvFactory is not null && draftModel is null && !mtpActive)
         {
             var schedulerOptions = ResolveSchedulerOptions(options);
+            if (vulkanScheduler)
+            {
+                // Every active sequence owns a device KV cache + a GDN state slot on a (usually unified) GPU heap, and there is
+                // no byte-budget admission without a paged pool, so bound concurrency conservatively. Override with
+                // DOTLLM_VK_SCHEDULER_MAX_SEQS.
+                int maxSeqs = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_SCHEDULER_MAX_SEQS"), out int m) && m > 0 ? m : 8;
+                schedulerOptions = (schedulerOptions ?? new ContinuousBatchSchedulerOptions()) with
+                {
+                    MaxActiveSequences = Math.Min(schedulerOptions?.MaxActiveSequences ?? maxSeqs, maxSeqs),
+                    // Recurrent prefix snapshots (KV prefix + GDN state copies; ~tens of MB each on a 4B hybrid). Opt out with
+                    // DOTLLM_SCHED_RECURRENT_PREFIX=0.
+                    RecurrentPrefixCacheEntries = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_SCHED_RECURRENT_PREFIX"), out int rp) && rp >= 0 ? rp : 4,
+                };
+            }
 
             scheduler = new ContinuousBatchSchedulerService(
                 model,
                 tokenizer,
                 kvFactory,
                 options: schedulerOptions,
-                pagedPool: pagedFactory.Pool);
+                pagedPool: pagedFactory?.Pool);
             Console.WriteLine(options.Scheduler?.EnableFairness == true
                 ? "[dotllm] Continuous-batch scheduler active (per-API-key fairness on)"
-                : "[dotllm] Continuous-batch scheduler active");
+                : vulkanScheduler
+                    ? "[dotllm] Continuous-batch scheduler active (Vulkan; DOTLLM_VK_SCHEDULER=1 or --expected-concurrency >= 5)"
+                    : "[dotllm] Continuous-batch scheduler active");
         }
 
         long estimatedBytes = SafeFileLength(resolvedPath);
@@ -483,11 +613,21 @@ public static class ServerStartup
         app.UseDeveloperExceptionPage();
         app.UseCors();
 
+        // SDK observability headers (#452) — x-request-id, openai-processing-ms and the
+        // x-ratelimit-* trio. Registered unconditionally and OUTSIDE the limiter so the headers
+        // also land on its 429 short-circuit; the manager is null when limiting is off, in which
+        // case only the id/timing headers are emitted.
+        // The headers middleware must partition on the SAME resolver as the limiter, or the
+        // x-ratelimit-* values it reports come from a different bucket under a host-supplied
+        // IApiKeyResolver.
+        var apiKeyResolver = state.RateLimitManager is null
+            ? null
+            : app.Services.GetRequiredService<IApiKeyResolver>();
+
+        app.UseDotLLMResponseHeaders(state.RateLimitManager, apiKeyResolver);
+
         if (state.RateLimitManager is { } rlm)
-        {
-            var resolver = app.Services.GetRequiredService<IApiKeyResolver>();
-            app.UseDotLLMRateLimiting(rlm, resolver);
-        }
+            app.UseDotLLMRateLimiting(rlm, apiKeyResolver!);
 
         app.MapDotLLMEndpoints(serveUi);
 

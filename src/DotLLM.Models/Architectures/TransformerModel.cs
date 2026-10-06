@@ -19,7 +19,7 @@ namespace DotLLM.Models.Architectures;
 /// Transformer forward pass: embedding lookup → N × transformer blocks → final norm → LM head → logits.
 /// Operates entirely on the CPU using pre-allocated scratch buffers for zero-allocation inference.
 /// </summary>
-public sealed unsafe class TransformerModel : IModel
+public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
 {
     /// <summary>Q8_0 block: 2 bytes (Half scale) + 32 bytes (sbyte values).</summary>
     private const int Q8_0BlockBytes = QuantFormat.Q8_0BlockBytes;
@@ -366,18 +366,17 @@ public sealed unsafe class TransformerModel : IModel
         // factor==1) is byte-identical to the non-YaRN path).
         else if (config.MlaConfig is null
                  && config.RoPEConfig is RoPEConfig rcfg
-                 && rcfg.ScalingType == RoPEScalingType.YaRN
-                 && rcfg.ScalingFactor > 1.0f
-                 && rcfg.OrigMaxSeqLen > 0)
+                 && rcfg.IsDenseYarnActive)
         {
             // gpt-oss (llama.cpp ggml_rope_ext yarn, ext_factor=1) additionally
             // applies the attention-magnitude concentration
             // mscale = attn_factor * (1 + 0.1 * ln(factor)) to cos/sin. Other
             // dense-YaRN archs (SmolLM3, Llama 3.1+) keep the plain AttnFactor
-            // convention established when they were wired.
-            float mscaleMultiplier = config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss
-                ? rcfg.AttnFactor * (1.0f + 0.1f * MathF.Log(rcfg.ScalingFactor))
-                : rcfg.AttnFactor;
+            // convention established when they were wired. Both the predicate and
+            // the mscale convention live on RoPEConfig so the CUDA backend's
+            // inverse-frequency upload (CudaWeights.RopeYarnInvFreqDevice) gates and
+            // scales identically — see #366.
+            float mscaleMultiplier = rcfg.ComputeYarnMscaleMultiplier(config.Architecture);
             DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTableYarn(
                 config.MaxSequenceLength, ropeDim, ropeTheta,
                 rcfg.ScalingFactor, rcfg.OrigMaxSeqLen,
@@ -689,6 +688,31 @@ public sealed unsafe class TransformerModel : IModel
         RunLayersAndFinalNormCore(tokenIds, positions, kvCache);
         return RunLmHead(tokenIds.Length, deviceId);
     }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Runs exactly the same graph as <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
+    /// up to and including the final output norm, then stops: the LM head is not evaluated.
+    /// This is the tensor llama.cpp names <c>result_norm</c> and assigns to <c>res-&gt;t_embd</c>
+    /// (<c>src/models/llama.cpp</c>), i.e. the tensor its pooling operates on
+    /// (<c>llm_graph_context::build_pooling</c>).
+    /// </remarks>
+    public ITensor ForwardHidden(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
+    {
+        RunLayersAndFinalNormCore(tokenIds, positions, kvCache: null);
+
+        int seqLen = tokenIds.Length;
+        int hiddenSize = Config.HiddenSize;
+        float* hidden = (float*)_state.HiddenState;
+
+        var result = UnmanagedTensor.Allocate(new TensorShape(seqLen, hiddenSize), DType.Float32, deviceId);
+        new ReadOnlySpan<float>(hidden, seqLen * hiddenSize)
+            .CopyTo(new Span<float>((void*)result.DataPointer, seqLen * hiddenSize));
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public PoolingType? DeclaredPoolingType => Config.PoolingType;
 
     /// <summary>
     /// Returns the effective sliding-window size for <paramref name="layer"/>.
@@ -3538,6 +3562,14 @@ public sealed unsafe class TransformerModel : IModel
             MatMul.GemvQ8_0((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.Q5_0)
             MatMul.GemvQ5_0((byte*)weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.Q2_K)
+            MatMul.GemvQ2_K((byte*)weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.Q3_K)
+            MatMul.GemvQ3_K((byte*)weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.IQ4_XS)
+            MatMul.GemvIQ4_XS((byte*)weights, x, y, m, k, _threadPool);
+        else if (MatMul.IsCodebookIq(qt))
+            MatMul.GemvIQCodebook(qt, (byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.Q4_K)
             MatMul.GemvQ4_K((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.Q5_K)
@@ -3554,6 +3586,9 @@ public sealed unsafe class TransformerModel : IModel
             MatMul.GemvI2_S((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.PQ2_0)
             MatMul.GemvPQ2_0((byte*)weights, x, y, m, k, _threadPool);
+        else if (MatMul.HasPackedLegacyDot(qt))
+            // Q4_0/Q4_1/Q5_1/IQ4_NL — packed × Q8_1 dot instead of dequantize-to-F32 (#489).
+            MatMul.GemvLegacyQuant((byte*)weights, qt, x, y, m, k, _threadPool);
         else
             MatMul.GemvDequantRows((byte*)weights, qt, x, y, m, k, _threadPool);
     }
@@ -3570,6 +3605,14 @@ public sealed unsafe class TransformerModel : IModel
             MatMul.GemmQ8_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
         else if (qt == QuantizationType.Q5_0)
             MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+        else if (qt == QuantizationType.Q2_K)
+            MatMul.GemmQ2_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+        else if (qt == QuantizationType.Q3_K)
+            MatMul.GemmQ3_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+        else if (qt == QuantizationType.IQ4_XS)
+            MatMul.GemmIQ4_XS((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+        else if (MatMul.IsCodebookIq(qt))
+            MatMul.GemmIQCodebook(qt, (byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
         else if (qt == QuantizationType.Q4_K)
             MatMul.GemmQ4_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
         else if (qt == QuantizationType.Q5_K)
@@ -3586,6 +3629,9 @@ public sealed unsafe class TransformerModel : IModel
             MatMul.GemmI2_S((byte*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.PQ2_0)
             MatMul.GemmPQ2_0((byte*)weights, b, c, m, k, n, _threadPool);
+        else if (MatMul.HasPackedLegacyDot(qt))
+            // Q4_0/Q4_1/Q5_1/IQ4_NL — packed × Q8_1 dot instead of dequantize-to-F32 (#489).
+            MatMul.GemmLegacyQuantOrDequant((byte*)weights, qt, b, c, m, k, n, _threadPool, preQuantizedInput);
         else
             // Formats with no dedicated vec_dot kernel (BF16, Q4_0/Q4_1/Q5_1, Q2_K/Q3_K, the IQ
             // family). MatMul.GemmDequantRows decodes each weight row once and reuses it across
@@ -3655,10 +3701,18 @@ public sealed unsafe class TransformerModel : IModel
     }
 
     /// <summary>
-    /// GEMM using R4-interleaved repacked weights. For single-token (n=1) uses interleaved ComputeRows.
-    /// Multi-token (n&gt;1) falls back to original Gemm — outer-product microkernels don't win on AVX2
-    /// due to RyuJIT register pressure (12 YMM accumulators spill with only 16 registers available).
+    /// GEMM using R4-interleaved repacked weights, for every batch size.
     /// </summary>
+    /// <remarks>
+    /// Issue #530: this used to dispatch on batch size — <c>n == 1</c> through the repacked
+    /// <c>ComputeRows*Interleaved</c> kernels, <c>n &gt; 1</c> through <see cref="Gemm"/> over the
+    /// original row-major weights for every non-Q8_0 quant. That made a token's logits depend on
+    /// how many tokens shared its forward pass. Both arms now run the repacked kernels, so a row's
+    /// output is bit-identical regardless of <paramref name="n"/>.
+    /// The multi-token form tiles over 4-row groups (the L2-tiled shape that already won for Q8_0),
+    /// not the outer-product microkernels, which don't win on AVX2 due to RyuJIT register pressure
+    /// (12 YMM accumulators spill with only 16 registers available).
+    /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void GemmInterleaved(nint origWeights, QuantizationType qt, float* b, float* c,
                                  int m, int k, int n, byte* preQuantizedInput,
@@ -3681,6 +3735,33 @@ public sealed unsafe class TransformerModel : IModel
                 MatMul.GemmR4TiledQ8_0((byte*)rw.Ptr, preQuantizedInput, c,
                     rw.FullGroupCount, rw.TailRows, k / 32, m, n, _threadPool);
                 return;
+            }
+
+            // Every other repackable quant takes the same R4 kernels the n == 1 arm uses, so the
+            // result does not depend on batch size (#530). Self-quantizes when the caller had no
+            // compatible pre-quantized buffer.
+            switch (qt)
+            {
+                case QuantizationType.Q8_0:
+                    MatMul.GemmR4TiledQ8_0((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 32, m, k, n, _threadPool);
+                    return;
+                case QuantizationType.Q5_0:
+                    MatMul.GemmR4TiledQ5_0((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 32, m, k, n, _threadPool);
+                    return;
+                case QuantizationType.Q4_K:
+                    MatMul.GemmR4TiledQ4_K((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 256, m, k, n, _threadPool);
+                    return;
+                case QuantizationType.Q5_K:
+                    MatMul.GemmR4TiledQ5_K((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 256, m, k, n, _threadPool);
+                    return;
+                case QuantizationType.Q6_K:
+                    MatMul.GemmR4TiledQ6_K((byte*)rw.Ptr, b, preQuantizedInput, c,
+                        rw.FullGroupCount, rw.TailRows, k / 256, m, k, n, _threadPool);
+                    return;
             }
 
             Gemm(origWeights, qt, b, c, m, k, n, preQuantizedInput);
@@ -3734,8 +3815,8 @@ public sealed unsafe class TransformerModel : IModel
     {
         if (preQuantSource == target) return true;
 
-        bool sourceIsKQuant = preQuantSource is QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K;
-        bool targetIsKQuant = target is QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K;
+        bool sourceIsKQuant = MatMul.UsesQ8KDot(preQuantSource);
+        bool targetIsKQuant = MatMul.UsesQ8KDot(target);
         if (sourceIsKQuant && targetIsKQuant) return true;
 
         // Q8_0 and Q5_0 no longer share input format — Q8_0 uses Q8_0, Q5_0 uses Q8_1.
@@ -3753,7 +3834,7 @@ public sealed unsafe class TransformerModel : IModel
     private static byte* QuantizeInput(float* input, byte* scratch, int dim, int seqLen,
                                        QuantizationType qt)
     {
-        if (qt == QuantizationType.Q4_K || qt == QuantizationType.Q5_K || qt == QuantizationType.Q6_K)
+        if (MatMul.UsesQ8KDot(qt))
         {
             int blockCount = dim / 256; // Q8_K_GroupSize
             int q8kRowBytes = blockCount * MatMul.Q8_K_BlockBytes;
@@ -3762,7 +3843,8 @@ public sealed unsafe class TransformerModel : IModel
             return scratch;
         }
 
-        if (qt == QuantizationType.Q5_0)
+        // Q5_0 and the packed legacy quants (Q4_0/Q4_1/Q5_1/IQ4_NL, #489) all dot against Q8_1.
+        if (qt == QuantizationType.Q5_0 || MatMul.UsesPackedLegacyDot(qt, seqLen))
         {
             int blockCount = dim / Q8_1GroupSize;
             int q8_1RowBytes = blockCount * MatMul.Q8_1BlockBytes;
@@ -3848,36 +3930,7 @@ public sealed unsafe class TransformerModel : IModel
     private void GatherPerLayerIdentity(
         ReadOnlySpan<int> tokenIds, float* dest, int rowWidth, float scale,
         nint tablePtr, QuantizationType qt)
-    {
-        int pleVocab = _weights.PerLayerEmbedding!.VocabSize;
-        for (int t = 0; t < tokenIds.Length; t++)
-        {
-            int tokenId = tokenIds[t];
-            if ((uint)tokenId >= (uint)pleVocab)
-                throw new ArgumentOutOfRangeException(nameof(tokenIds),
-                    $"PLE token ID {tokenId} at position {t} is out of range [0, {pleVocab}).");
-
-            var destSpan = new Span<float>(dest + t * rowWidth, rowWidth);
-            if (qt == QuantizationType.F32)
-            {
-                float* src = (float*)tablePtr + (long)tokenId * rowWidth;
-                new ReadOnlySpan<float>(src, rowWidth).CopyTo(destSpan);
-            }
-            else if (qt == QuantizationType.F16)
-            {
-                Half* src = (Half*)tablePtr + (long)tokenId * rowWidth;
-                TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(src, rowWidth), destSpan);
-            }
-            else
-            {
-                long rowBytes = Dequantize.RowByteSize(rowWidth, qt);
-                nint rowPtr = tablePtr + (nint)((long)tokenId * rowBytes);
-                Dequantize.ToFloat32(rowPtr, rowWidth, qt, destSpan);
-            }
-
-            TensorPrimitives.Multiply(destSpan, scale, destSpan);
-        }
-    }
+        => Gemma4PerLayerInputs.GatherIdentity(_weights.PerLayerEmbedding!, tokenIds, dest, rowWidth, scale);
 
     /// <summary>
     /// Dequantizes one token-embedding row (token id <paramref name="tokenId"/>) into

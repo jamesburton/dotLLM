@@ -60,6 +60,13 @@ public static class GatedDeltaNetScan
     /// <param name="nKHead">Number of key heads. Must divide <paramref name="nVHead"/> evenly.</param>
     /// <param name="dState">Per-head state dimension (key and value share the same DState).</param>
     /// <param name="seqLen">Number of tokens to process.</param>
+    /// <param name="rowSnapshots">
+    /// Optional (issue #473): receives a copy of the whole <paramref name="state"/> after each of
+    /// the first <paramref name="snapshotRows"/> tokens, token <c>t</c> at offset
+    /// <c>t × NVHead × DState²</c>. Lets a speculative verify roll the recurrence back to any row
+    /// without recomputing it.
+    /// </param>
+    /// <param name="snapshotRows">Rows to snapshot; 0 (default) records nothing.</param>
     [SkipLocalsInit]
     public static void Execute(
         Span<float> state,
@@ -72,7 +79,9 @@ public static class GatedDeltaNetScan
         int nVHead,
         int nKHead,
         int dState,
-        int seqLen)
+        int seqLen,
+        Span<float> rowSnapshots = default,
+        int snapshotRows = 0)
     {
         if (nVHead <= 0) throw new ArgumentOutOfRangeException(nameof(nVHead));
         if (nKHead <= 0) throw new ArgumentOutOfRangeException(nameof(nKHead));
@@ -106,6 +115,12 @@ public static class GatedDeltaNetScan
             throw new ArgumentException("beta buffer too small.", nameof(beta));
         if (output.Length < (long)seqLen * vPerToken)
             throw new ArgumentException("output buffer too small.", nameof(output));
+
+        if ((uint)snapshotRows > (uint)seqLen)
+            throw new ArgumentOutOfRangeException(nameof(snapshotRows));
+        int stateLen = nVHead * statePerHead;
+        if (rowSnapshots.Length < (long)snapshotRows * stateLen)
+            throw new ArgumentException("rowSnapshots buffer too small.", nameof(rowSnapshots));
 
         if (seqLen == 0) return;
 
@@ -177,6 +192,9 @@ public static class GatedDeltaNetScan
                     for (int col = 0; col < dState; col++)
                         outHead[col] *= scale;
                 }
+
+                if (t < snapshotRows)
+                    state.Slice(0, stateLen).CopyTo(rowSnapshots.Slice(t * stateLen, stateLen));
             }
         }
         finally

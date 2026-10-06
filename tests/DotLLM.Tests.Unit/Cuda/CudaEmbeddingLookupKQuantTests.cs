@@ -15,6 +15,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// identical — only the iteration order changes.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed class CudaEmbeddingLookupKQuantTests : IDisposable
 {
     private readonly CudaContext? _ctx;

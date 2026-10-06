@@ -60,6 +60,7 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class CudaGemm16FPerplexityTests
 {
     private readonly ITestOutputHelper _output;

@@ -301,7 +301,9 @@ public static unsafe class FusedOps
             RmsNormQuantizeQ8_1(input, weight, eps, dest, dim);
             return dest;
         }
-        if (qt is QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K)
+        if (qt is QuantizationType.Q2_K or QuantizationType.Q3_K or QuantizationType.IQ4_XS or QuantizationType.IQ2_XXS
+                or QuantizationType.IQ2_XS or QuantizationType.IQ2_S or QuantizationType.IQ3_XXS or QuantizationType.IQ3_S or QuantizationType.IQ1_S
+                or QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K)
         {
             RmsNormQuantizeQ8_K(input, weight, eps, dest, dim);
             return dest;
@@ -563,7 +565,7 @@ public static unsafe class FusedOps
     /// <summary>
     /// Fused RMSNorm + Q8_K quantization. Reads input once, applies normalization,
     /// and quantizes directly to Q8_K format (float32 scale, 256-element blocks with 16 bsums).
-    /// Used for K-quant weight types (Q4_K, Q5_K, Q6_K).
+    /// Used for K-quant weight types (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K).
     /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]

@@ -36,6 +36,7 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class RealGgufQ3KCudaDequantParityTests
 {
     private const int Q3KGroupSize = 256;

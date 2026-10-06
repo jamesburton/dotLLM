@@ -209,8 +209,9 @@ public sealed unsafe class I2STests
             // 5e-7·√k ≈ 2.5e-5). Anything above this is a different algorithm, not rounding.
             const float floatTierEnvelope = 1e-4f;
 
-            // Mirror MatMul's own gate: AVX2 support AND the DOTLLM_I2S_W2A8 override.
-            bool w2a8Active = Avx2.IsSupported
+            // Mirror MatMul's own gate: SSSE3 support (issue #477 added a 128-bit tier) AND the
+            // DOTLLM_I2S_W2A8 override.
+            bool w2a8Active = System.Runtime.Intrinsics.X86.Ssse3.IsSupported
                 && Environment.GetEnvironmentVariable("DOTLLM_I2S_W2A8") is not ("0" or "false" or "off");
 
             if (w2a8Active)

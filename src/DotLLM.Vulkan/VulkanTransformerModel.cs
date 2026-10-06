@@ -62,6 +62,14 @@ public sealed class VulkanTransformerModel : IModel
     private readonly VulkanWeights _weights;
     private readonly VulkanForwardState _state;
 
+    /// <summary>
+    /// The device this model's buffers live on. Test-visible only — probes that
+    /// read back device memory MUST use the model's own <see cref="VulkanDevice"/>
+    /// (a second device sees different buffer handles; see the descriptor-cache
+    /// handle-aliasing note in #467).
+    /// </summary>
+    internal VulkanDevice Device => _device;
+
     // Kernels — one instance each, pipelines are reused across all launches.
     private readonly MatMulF32Kernel _matmul;
     private readonly MatMulQ8_0Kernel _matmulQ8;
@@ -157,6 +165,9 @@ public sealed class VulkanTransformerModel : IModel
     private readonly MatMulF16GemvF32Kernel _matmulF16;
     private readonly MatMulF16GemmF32Kernel _matmulF16Gemm;
     private readonly MatMulF16GemmCoopmatKernel? _matmulF16GemmCoopmat;
+
+    /// <summary>IQ1/IQ2/IQ3 prefill: dequantise to F16 scratch + F16 coopmat GEMM (#621). Null when disabled or unsupported.</summary>
+    private IqF16PrefillMatmul? _iqF16Prefill;
     private readonly MatMulBf16GemvF32Kernel _matmulBf16;
     private readonly MatMulBf16GemmF32Kernel _matmulBf16Gemm;
     // Optional decode-path fusion of rmsnorm + Q8_0 GEMV. Eliminates one
@@ -247,6 +258,21 @@ public sealed class VulkanTransformerModel : IModel
     // _matmulQ8Mmq + AddKernel.
     private readonly MatMulQ8_0MmqResidualKernel? _matmulQ8MmqResidual;
     private readonly MatMulQ4KMmqKernel? _matmulQ4KMmq;
+    // Blocked 128x128 coopmat Q4_K prefill GEMM (issue #582 follow-up). Attached after construction in
+    // BuildModel; preferred over MMQ from Q4KCoopmatPreferSeqLen tokens (env opt-out DisableQ4KCoopmatEnvVar).
+    private MatMulQ4KGemmCoopmatKernel? _matmulQ4KGemmCoopmat;
+    // Same for Q6_K (issue #588): Q4_K_M models carry Q6_K ffn_down/attn_v.
+    private MatMulQ6KGemmCoopmatKernel? _matmulQ6KGemmCoopmat;
+    // Same for Q2_K (issue #596).
+    private MatMulQ2KGemmCoopmatKernel? _matmulQ2KGemmCoopmat;
+    // Same for Q5_K (issue #590).
+    private MatMulQ5KGemmCoopmatKernel? _matmulQ5KGemmCoopmat;
+    // Same for Q5_0 (issue #592).
+    private MatMulQ5_0GemmCoopmatKernel? _matmulQ5_0GemmCoopmat;
+    // Same for Q3_K (issue #598).
+    private MatMulQ3KGemmCoopmatKernel? _matmulQ3KGemmCoopmat;
+    // Same for IQ4_XS (issue #600).
+    private MatMulIq4XsGemmCoopmatKernel? _matmulIq4XsGemmCoopmat;
     private readonly MatMulQ6KMmqKernel? _matmulQ6KMmq;
     private readonly MatMulQ5KMmqKernel? _matmulQ5KMmq;
     private readonly MatMulIq4XsMmqKernel? _matmulIq4XsMmq;
@@ -700,6 +726,16 @@ public sealed class VulkanTransformerModel : IModel
     // Unit-gamma (all-ones) [maxHeadDim] vector for Gemma-4's weight-less V-norm
     // (per-kv-head RMSNorm with no scale). Lazily allocated on first use.
     private VulkanDevice.Buffer? _gemma4OnesVec;
+    // ── Gemma-4 dense-PLE (E2B/E4B) state, issue #734 ──
+    // Host-built per-layer inputs, layer-major [numLayers, seqLen, pleDim], re-uploaded every forward.
+    private VulkanDevice.Buffer? _pleInputs;
+    // Cacheless shared-KV donor stash: slot 0 = sliding donor, slot 1 = full-attention donor.
+    private readonly VulkanDevice.Buffer?[] _g4StashK = new VulkanDevice.Buffer?[2];
+    private readonly VulkanDevice.Buffer?[] _g4StashV = new VulkanDevice.Buffer?[2];
+    private long _g4StashCapacityBytes;
+    // Number of leading rotated PAIRS on full-attention layers when the checkpoint carries proportional-rope
+    // factors (rope_freqs.weight); 0 = no factors. See Gemma4PerLayerInputs.ResolveProportionalRopePairs.
+    private int _proportionalRopePairs;
     private readonly AddKernel _add;
     // Per-feature bias add. Replaces the host-mapped fallback that used to
     // split the forward into multiple submits whenever Phi-3 / Qwen3 /
@@ -794,6 +830,21 @@ public sealed class VulkanTransformerModel : IModel
     // diffusion forward (the AR Forward returns only the last row; diffusion needs
     // every canvas row). Grows monotonically; null until the first diffusion forward.
     private VulkanDevice.Buffer? _diffusionLogits;
+
+    // Batch length up to which Forward returns a logit row per position. Default 1 = last row only;
+    // widened on request by TrySetAllRowLogitsLimit for perplexity scoring (#564).
+    private int _allRowLogitsLimit = 1;
+
+    /// <inheritdoc/>
+    public int MaxAllRowLogitsLength => _allRowLogitsLimit;
+
+    /// <inheritdoc/>
+    public bool TrySetAllRowLogitsLimit(int maxSeqLen)
+    {
+        if (maxSeqLen > _allRowLogitsLimit)
+            _allRowLogitsLimit = maxSeqLen;
+        return _allRowLogitsLimit >= maxSeqLen;
+    }
     private int _diffusionLogitsCapacityRows;
     // Host-visible scratch holding the host-computed self-conditioning signal
     // [canvasLen × hidden] (uploaded then device-added into the canvas embedding).
@@ -1286,6 +1337,23 @@ public sealed class VulkanTransformerModel : IModel
         if ((headless || skipTokenEmbed) && config.DiffusionConfig is not null)
             throw new NotSupportedException("A trimmed pipeline stage is causal-only (no diffusion).");
 
+        // Dense Gemma-4 (E2B/E4B, #734): PLE inputs are built from token ids for the whole model and shared-KV
+        // donors can sit on the other side of a stage boundary, so a layer-split pipeline stage is unsupported.
+        int proportionalRopePairs = 0;
+        if (config.IsGemma4DensePle)
+        {
+            if (headless || skipTokenEmbed || firstLayer != 0 || config.NumLayers != cpuWeights.Layers.Length)
+                throw new NotSupportedException(
+                    "The Gemma-4 dense variant (PLE + shared KV) cannot be split across pipeline stages on Vulkan.");
+            if (cpuWeights.RopeFreqFactors is { } rff && config.GlobalHeadDim is int ghd)
+            {
+                if (rff.Length != ghd / 2)
+                    throw new NotSupportedException(
+                        $"rope_freqs.weight length {rff.Length} != global head dim / 2 ({ghd / 2}).");
+                proportionalRopePairs = DotLLM.Models.Architectures.Gemma4PerLayerInputs.ResolveProportionalRopePairs(rff, ghd);
+            }
+        }
+
         // Pipeline parallelism (layer-spanning): this model covers global layers
         // [firstLayer .. firstLayer+config.NumLayers). config.NumLayers is the WINDOW size, so the
         // device weights, the layer loop and the KV cache are all window-local (0-indexed); only the
@@ -1657,10 +1725,12 @@ public sealed class VulkanTransformerModel : IModel
         // env-var opt-out, by missing SPV (older builds), or when the model's
         // head_dim exceeds the shader bound — every gate falls back to the
         // legacy per-token attention kernel.
+        // Issue #441: every gate below now reports itself. The head-dim gate used to be silent,
+        // which is how a headDim-256 model spent ~20 % of its prefill on the per-token kernel
+        // without anything saying so.
         VulkanFlashAttentionF32Kernel? flashAttention =
-            IsFlashAttentionDisabled() || config.HeadDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
-                ? null
-                : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
+            VulkanAttentionFallbackDiagnostics.CreatePrefillFlashAttention(
+                device, spvDir, config.HeadDim, "VulkanTransformerModel");
         // Cooperative-matrix FA prefill kernel (issue #149) — preferred over the
         // scalar FA shader when the device has the 16x16x16 f16->f32 subgroup
         // tile (llama.cpp's FA_COOPMAT1 path). Kill-switch:
@@ -1871,7 +1941,35 @@ public sealed class VulkanTransformerModel : IModel
             ropeTheta, ropeDim, ropeVariant, slidingWindow,
             mlaNumHeads, mlaQkNope, mlaQkRope, mlaVHead,
             mlaScale, mlaRopeTheta);
+        if (Environment.GetEnvironmentVariable(DisableQ4KCoopmatEnvVar) != "1"
+            && MatMulQ4KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            model._matmulQ4KGemmCoopmat = MatMulQ4KGemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(DisableQ6KCoopmatEnvVar) != "1"
+            && MatMulQ6KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            model._matmulQ6KGemmCoopmat = MatMulQ6KGemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(DisableQ2KCoopmatEnvVar) != "1"
+            && MatMulQ2KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            model._matmulQ2KGemmCoopmat = MatMulQ2KGemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(DisableQ5KCoopmatEnvVar) != "1"
+            && MatMulQ5KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            model._matmulQ5KGemmCoopmat = MatMulQ5KGemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(DisableQ5_0CoopmatEnvVar) != "1"
+            && MatMulQ5_0GemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            model._matmulQ5_0GemmCoopmat = MatMulQ5_0GemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(DisableQ3KCoopmatEnvVar) != "1"
+            && MatMulQ3KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            model._matmulQ3KGemmCoopmat = MatMulQ3KGemmCoopmatKernel.Create(device, spvDir);
+        if (Environment.GetEnvironmentVariable(DisableIq4XsCoopmatEnvVar) != "1"
+            && MatMulIq4XsGemmCoopmatKernel.IsSupportedOn(device, spvDir))
+            model._matmulIq4XsGemmCoopmat = MatMulIq4XsGemmCoopmatKernel.Create(device, spvDir);
         model._firstLayer = firstLayer;
+        model._proportionalRopePairs = proportionalRopePairs;
+        {
+            long hidden = config.HiddenSize;
+            long qkvOut = (long)(config.NumAttentionHeads + 2 * config.NumKvHeads) * config.HeadDim;
+            long maxLayerElements = Math.Max(Math.Max((long)config.IntermediateSize * hidden, hidden * hidden), qkvOut * hidden);
+            model._iqF16Prefill = IqF16PrefillMatmul.TryCreate(device, spvDir, matmulF16GemmCoopmat, maxLayerElements);
+        }
         model._headless = headless;
         model._noTokenEmbed = skipTokenEmbed;
         return model;
@@ -2029,6 +2127,59 @@ public sealed class VulkanTransformerModel : IModel
     /// for prefill Q8_0 whenever the device advertises integer-dot support and
     /// the SPVs exist.
     /// </summary>
+    /// <summary>
+    /// Qwen3-style optional per-head RMSNorm on Q and K (after projection/bias/LoRA, before RoPE);
+    /// mirrors CPU <c>TransformerModel.ApplyPerHeadNorm</c> and CUDA <c>LaunchPerHeadRmsNorm</c> (issue #594).
+    /// No-op when the layer has no Q/K norm weights. Caller owns the trailing barrier decision via the return value.
+    /// </summary>
+    private bool RecordQkNorm(nint cmdBuf, in VulkanWeights.LayerBuffers lw, int rows, int numHeads, int numKvHeads, int headDim, float eps)
+    {
+        bool any = false;
+        if (lw.QNormWeight is not null)
+        {
+            _rmsnorm.Record(cmdBuf, _state.Q, lw.QNormWeight, _state.Q, rowCount: rows * numHeads, n: headDim, eps: eps);
+            any = true;
+        }
+        if (lw.KNormWeight is not null)
+        {
+            _rmsnorm.Record(cmdBuf, _state.K, lw.KNormWeight, _state.K, rowCount: rows * numKvHeads, n: headDim, eps: eps);
+            any = true;
+        }
+        if (any) BarrierComputeToCompute(cmdBuf);
+        return any;
+    }
+
+    internal const string DisableQ4KCoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_Q4K_COOPMAT";
+
+    /// <summary>Prefill length from which the blocked coopmat Q4_K GEMM replaces dp4a MMQ (to be tuned by A/B).</summary>
+    internal static readonly int Q4KCoopmatPreferSeqLen =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_Q4K_COOPMAT_MIN_TOKENS"), out int t) ? t : 128;
+
+    internal const string DisableQ6KCoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_Q6K_COOPMAT";
+
+    internal const string DisableQ2KCoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_Q2K_COOPMAT";
+
+    private bool PreferQ2KCoopmat(int seqLen) => _matmulQ2KGemmCoopmat is not null && seqLen > 1; // wins from 4 tokens (#596)
+    internal const string DisableQ5KCoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_Q5K_COOPMAT";
+
+    internal const string DisableQ5_0CoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_Q5_0_COOPMAT";
+
+    private bool PreferQ5_0Coopmat(int seqLen) => _matmulQ5_0GemmCoopmat is not null && seqLen > 1; // the tiled F32 GEMM is 4-33x slower even at p=16 (#592)
+
+    internal const string DisableQ3KCoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_Q3K_COOPMAT";
+
+    internal const string DisableIq4XsCoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_IQ4XS_COOPMAT";
+
+    private bool PreferIq4XsCoopmat(int seqLen) => _matmulIq4XsGemmCoopmat is not null && seqLen >= Math.Max(Q4KCoopmatPreferSeqLen, 256); // MMQ wins <=128 for IQ4_XS (#600)
+
+    private bool PreferQ3KCoopmat(int seqLen) => _matmulQ3KGemmCoopmat is not null && seqLen >= Q4KCoopmatPreferSeqLen;
+
+    private bool PreferQ5KCoopmat(int seqLen) => _matmulQ5KGemmCoopmat is not null && seqLen >= Q4KCoopmatPreferSeqLen;
+
+    private bool PreferQ6KCoopmat(int seqLen) => _matmulQ6KGemmCoopmat is not null && seqLen >= Q4KCoopmatPreferSeqLen;
+
+    private bool PreferQ4KCoopmat(int seqLen) => _matmulQ4KGemmCoopmat is not null && seqLen >= Q4KCoopmatPreferSeqLen;
+
     internal const string DisableMmqEnvVar = "DOTLLM_VULKAN_DISABLE_MMQ";
 
     internal static bool IsMmqDisabled() =>
@@ -2067,6 +2218,8 @@ public sealed class VulkanTransformerModel : IModel
         float softCap = 0.0f, float scaleOverride = 0.0f,
         AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
+        AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "Vulkan");
+
         // Decode (seqQ == 1): split the KV range across many workgroups
         // (Flash-Decoding) when the shape is worth splitting — which, with the
         // shipping heuristic, means seqKv >= 17 on any model with <= 128 heads,
@@ -2100,7 +2253,7 @@ public sealed class VulkanTransformerModel : IModel
                 maskMode: maskMode, prefixLen: prefixLen);
             return;
         }
-        if (_flashAttention is not null && seqQ > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
+        if (_flashAttention is not null && seqQ > 1 && headDim <= _flashAttention.SupportedMaxHeadDim)
         {
             ProfNote("attn_flash", seqQ, seqKv, numHeads);
             _flashAttention.Record(cmdBuf, q, k, v, output,
@@ -2124,20 +2277,46 @@ public sealed class VulkanTransformerModel : IModel
     /// Returns the effective sliding-window size for <paramref name="layer"/>.
     /// Honours <see cref="ModelConfig.PerLayerSlidingWindow"/> when set (each
     /// entry may be null for full attention or a positive int for sliding);
-    /// otherwise falls back to the model-wide <see cref="_slidingWindow"/>.
-    /// Used for Gemma 3's interleaved local/global pattern. Mirrors the CPU
-    /// <c>TransformerModel.GetLayerSlidingWindow</c> helper.
+    /// otherwise falls back to the model-wide <see cref="_slidingWindow"/>,
+    /// modulated by <see cref="ModelConfig.SlidingWindowPattern"/> (see
+    /// <see cref="ResolveLayerSlidingWindow"/>). Used for Gemma 3's interleaved
+    /// local/global list and gpt-oss's alternating sliding/dense pattern.
+    /// Mirrors the CPU <c>TransformerModel.GetLayerSlidingWindow</c> helper and
+    /// CUDA's <c>CudaSlidingWindowResolver</c> (#366).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int GetLayerSlidingWindow(int layer)
+        // PerLayerSlidingWindow and the pattern are both defined over the FULL model's layer index;
+        // offset the window-local layer to its global index for a pipeline stage (_firstLayer == 0 on a
+        // single-device model, so this is a no-op there). Using the local index would flip every
+        // layer's windowed/dense role on a stage that starts at an odd layer (pattern = 2).
+        => ResolveLayerSlidingWindow(
+            _slidingWindow, Config.SlidingWindowPattern, Config.PerLayerSlidingWindow, _firstLayer + layer);
+
+    /// <summary>
+    /// Per-layer sliding-window resolution in the Vulkan attention-kernel convention
+    /// (<c>0</c> = dense / full attention, positive = window length). Semantics are
+    /// exactly the CPU reference <c>TransformerModel.GetLayerSlidingWindow</c>:
+    /// an explicit <paramref name="perLayer"/> entry wins (null = dense); otherwise
+    /// with no window the layer is dense; with <paramref name="pattern"/> &lt;= 0 the
+    /// window applies uniformly; with pattern N &gt; 0 it applies only where
+    /// <c>layer % N &lt; N - 1</c> (llama.cpp <c>set_swa_pattern(N, dense_first=false)</c>;
+    /// gpt-oss N = 2: even layers windowed, odd dense). Before #480 the pattern was
+    /// ignored and the window landed on every layer.
+    /// </summary>
+    /// <param name="slidingWindow">Model-wide window, <c>0</c> = none.</param>
+    /// <param name="pattern"><see cref="ModelConfig.SlidingWindowPattern"/>.</param>
+    /// <param name="perLayer"><see cref="ModelConfig.PerLayerSlidingWindow"/>, full-model length.</param>
+    /// <param name="globalLayer">Layer index in the FULL model (not stage-local).</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static int ResolveLayerSlidingWindow(
+        int slidingWindow, int pattern, IReadOnlyList<int?>? perLayer, int globalLayer)
     {
-        // PerLayerSlidingWindow is full-model length; offset the window-local layer to its global index
-        // for a pipeline stage (_firstLayer == 0 on a single-device model, so this is a no-op there).
-        int globalLayer = _firstLayer + layer;
-        var perLayer = Config.PerLayerSlidingWindow;
         if (perLayer is not null && (uint)globalLayer < (uint)perLayer.Count)
             return perLayer[globalLayer] ?? 0;
-        return _slidingWindow;
+        if (slidingWindow <= 0) return 0;
+        if (pattern <= 0) return slidingWindow;
+        return (globalLayer % pattern) < pattern - 1 ? slidingWindow : 0;
     }
 
     /// <summary>
@@ -2217,7 +2396,19 @@ public sealed class VulkanTransformerModel : IModel
         return p;
     }
 
-    private static void RejectUnsupportedArchitecture(ModelConfig config)
+    /// <summary>
+    /// Refusal text for gpt-oss on Vulkan (#480). One definition, shared by
+    /// <see cref="RejectUnsupportedArchitecture"/> and <see cref="VulkanModelLoader.CreateFromGguf"/>,
+    /// so the two cannot drift. Names the missing features so the caller knows what would have
+    /// silently gone wrong.
+    /// </summary>
+    internal const string GptOssUnsupportedMessage =
+        "Architecture GptOss (gpt-oss) is not supported on the Vulkan backend: Vulkan implements "
+        + "neither its per-head attention sinks nor its dense YaRN RoPE scaling, so loading it would "
+        + "silently produce wrong output rather than fail. Use the CPU backend, or CUDA (which "
+        + "implements both since #365/#366), for gpt-oss checkpoints. Tracked in issue #480.";
+
+    internal static void RejectUnsupportedArchitecture(ModelConfig config)
     {
         // Architectures with a dedicated Vulkan model class must say so BEFORE the generic
         // "hybrid unsupported" message below — Qwen3MoeHybrid / Qwen3HybridDense / NemotronH
@@ -2227,6 +2418,14 @@ public sealed class VulkanTransformerModel : IModel
         // on the Vulkan backend yet" is simply untrue and sends the caller down a dead end
         // (issue #324).
         TransformerWeights.ThrowIfArchitectureNeedsDedicatedLoader(config);
+
+        // gpt-oss (#480): the dense VulkanTransformerModel would load it and produce wrong output
+        // with no error — see GptOssUnsupportedMessage. Checked here (not only in
+        // VulkanModelLoader.CreateFromGguf) because every factory on this class calls this first,
+        // which closes the side doors: direct LoadFromGguf callers (benchmarks), the Vulkan pipeline
+        // model's stages, and HybridVulkanCudaTransformerModel's Vulkan half.
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
+            throw new NotSupportedException(GptOssUnsupportedMessage);
 
         if (config.HybridLayout is not null || config.SsmConfig is not null || config.Mamba3Config is not null)
             throw new NotSupportedException("Hybrid SSM / Mamba architectures are not supported on the Vulkan backend yet.");
@@ -2572,7 +2771,7 @@ public sealed class VulkanTransformerModel : IModel
         // carries no MLA / MoE layer (dense VulkanTransformerModel does not support
         // MoE — that's VulkanQwen3MoeHybridTransformerModel — but MLA can appear
         // in DeepSeek-V2/V3 dense hosts and falls through to per-seq for now).
-        bool modelHasMlaOrMoe = false;
+        bool modelHasMlaOrMoe = Config.IsGemma4DensePle;
         for (int layer = 0; layer < Config.NumLayers && !modelHasMlaOrMoe; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
@@ -2753,6 +2952,8 @@ public sealed class VulkanTransformerModel : IModel
             if (lw.VBias is not null) _biasAdd.Record(cmdBuf, _state.V, lw.VBias, totalTokens, lw.VOutputDim);
             if (lw.QBias is not null || lw.KBias is not null || lw.VBias is not null)
                 BarrierComputeToCompute(cmdBuf);
+
+            RecordQkNorm(cmdBuf, lw, totalTokens, numHeads, numKvHeads, headDim, eps);
 
             // Batched RoPE — reads packed positions [totalTokens] and rotates each
             // row independently. Per-seq position semantics are preserved by the
@@ -3055,6 +3256,13 @@ public sealed class VulkanTransformerModel : IModel
         if (scratchResized)
             InvalidateKernelCaches();
 
+        // All-row logits (#564), opt-in: reuse the diffusion all-position head. Its logits buffer is
+        // allocated HERE, before any recording, because growing it invalidates the kernel descriptor
+        // caches, which must never happen against an open command buffer.
+        bool allRowHead = seqLen > 1 && seqLen <= _allRowLogitsLimit;
+        if (allRowHead)
+            EnsureDiffusionLogits(seqLen, vocabSize);
+
         // Pipeline stage resume (layer-spanning): seed HiddenState from the handed-off hidden rows of a
         // previous stage instead of gathering token embeddings. Synchronous host→device upload into the
         // (now correctly-sized) HiddenState slot 0; made visible to the forward submit the same way
@@ -3098,6 +3306,18 @@ public sealed class VulkanTransformerModel : IModel
         //    buffer (see RecordEmbeddingGather below).
         ValidateTokenIds(tokenIds);
         UploadPositions(positions);
+
+        // Gemma-4 dense-PLE (#734): build the per-layer input tensor on the host (exact CPU-oracle code) and
+        // upload it BEFORE recording. Also size the cacheless shared-KV donor stash here (growth invalidates the
+        // descriptor caches, which must never happen against an open command buffer).
+        if (Config.PerLayerEmbedding is not null)
+        {
+            if (seedFromHidden)
+                throw new NotSupportedException("Gemma-4 PLE cannot be resumed from a seeded hidden state.");
+            UploadGemma4PleInputs(tokenIds);
+        }
+        if (Config.NumSharedKvLayers > 0 && kvCache is not VulkanKvCache)
+            EnsureGemma4SharedKvStash(seqLen);
 
         // 2. Begin the single per-forward command buffer and record the
         //    whole transformer. Bias-add host steps split the forward into
@@ -3297,6 +3517,7 @@ public sealed class VulkanTransformerModel : IModel
                 MaybeApplyLoraDelta(cmdBuf, layer, "v_proj", _state.NormOutput, _state.V,
                     seqLen, lw.VInputDim, lw.VOutputDim);
             }
+            RecordQkNorm(cmdBuf, lw, seqLen, numHeads, numKvHeads, headDim, eps);
             ProfSample("qkv_proj");
             DpStamp(cmdBuf, DpCatQkv);
 
@@ -3649,6 +3870,14 @@ public sealed class VulkanTransformerModel : IModel
             ProfSample("norm_resid");
             DpStamp(cmdBuf, DpCatResid);
 
+            // Gemma-4 dense-PLE per-layer injection (#734): gated residual added AFTER the FFN residual and
+            // BEFORE layer_output_scale (llama.cpp gemma4.cpp / CPU RunGemma4Layer).
+            if (lw.Gemma4 is { PleGate: not null } g4ple)
+            {
+                BarrierComputeToCompute(cmdBuf);
+                RecordGemma4PleInject(cmdBuf, layer, g4ple, seqLen, eps);
+            }
+
             // Gemma-4 per-layer output scale (layer_output_scale) — the LAST
             // per-layer op, an in-place scalar multiply on the post-residual
             // hidden state. Reuses the embedding-scale kernel (a generic scalar
@@ -3704,7 +3933,7 @@ public sealed class VulkanTransformerModel : IModel
         // 3b. DiffusionGemma: final RMSNorm + LM head over ALL positions (the
         //     diffusion generator gathers logit rows for the masked canvas
         //     positions, not just the last token). Returns [seqLen, vocab].
-        if (_diffusionMaskMode != AttentionMaskMode.Causal && Config.DiffusionConfig is not null)
+        if (allRowHead || (_diffusionMaskMode != AttentionMaskMode.Causal && Config.DiffusionConfig is not null))
             return FinishDiffusionForward(cmdBuf, seqLen, hiddenSize, vocabSize, eps, deviceId);
 
         // 3. Final RMSNorm on the last token only, then LM head.
@@ -3769,6 +3998,11 @@ public sealed class VulkanTransformerModel : IModel
     /// </summary>
     private ITensor FinishDiffusionForward(nint cmdBuf, int seqLen, int hiddenSize, int vocabSize, float eps, int deviceId)
     {
+        // The last layer's residual add wrote HiddenState in a compute dispatch; the norm below reads
+        // it. The per-layer loop only barriers BETWEEN layers, so without this the norm races the
+        // add (all-row scoring, #564, was off by ~1e-2 on every row before this).
+        BarrierComputeToCompute(cmdBuf);
+
         // Final RMSNorm over every row, in place on HiddenState → NormOutput.
         _rmsnorm.Record(cmdBuf, _state.HiddenState, _weights.OutputNormWeight, _state.NormOutput,
             rowCount: seqLen, n: hiddenSize, eps: eps);
@@ -3802,7 +4036,7 @@ public sealed class VulkanTransformerModel : IModel
         if (_diffusionLogits is null || _diffusionLogitsCapacityRows < rows)
         {
             _diffusionLogits?.Dispose();
-            _diffusionLogits = _device.Allocate((long)rows * vocab * sizeof(float));
+            _diffusionLogits = _device.AllocateHostReadback((long)rows * vocab * sizeof(float));
             _diffusionLogitsCapacityRows = rows;
             // The new handle invalidates any cached lm-head matmul descriptor set.
             InvalidateKernelCaches();
@@ -3969,6 +4203,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulF16.InvalidateDescriptorCache();
         _matmulF16Gemm.InvalidateDescriptorCache();
         _matmulF16GemmCoopmat?.InvalidateDescriptorCache();
+        _iqF16Prefill?.InvalidateDescriptorCache();
         _matmulBf16.InvalidateDescriptorCache();
         _matmulBf16Gemm.InvalidateDescriptorCache();
         _rmsnormMatmulQ8Fused?.InvalidateDescriptorCache();
@@ -3995,6 +4230,13 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8Mmq?.InvalidateDescriptorCache();
         _matmulQ8MmqResidual?.InvalidateDescriptorCache();
         _matmulQ4KMmq?.InvalidateDescriptorCache();
+        _matmulQ4KGemmCoopmat?.InvalidateDescriptorCache();
+        _matmulQ6KGemmCoopmat?.InvalidateDescriptorCache();
+        _matmulQ2KGemmCoopmat?.InvalidateDescriptorCache();
+        _matmulQ5KGemmCoopmat?.InvalidateDescriptorCache();
+        _matmulQ5_0GemmCoopmat?.InvalidateDescriptorCache();
+        _matmulQ3KGemmCoopmat?.InvalidateDescriptorCache();
+        _matmulIq4XsGemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ6KMmq?.InvalidateDescriptorCache();
         _matmulQ5KMmq?.InvalidateDescriptorCache();
         _matmulIq4XsMmq?.InvalidateDescriptorCache();
@@ -4430,6 +4672,73 @@ public sealed class VulkanTransformerModel : IModel
         return logits;
     }
 
+    /// <summary>Builds and uploads the Gemma-4 PLE per-layer inputs (layer-major) for <paramref name="tokenIds"/>.</summary>
+    private void UploadGemma4PleInputs(ReadOnlySpan<int> tokenIds)
+    {
+        float[] data = DotLLM.Models.Architectures.Gemma4PerLayerInputs.ComputeLayerMajor(_cpuWeights, Config, tokenIds);
+        long bytes = (long)data.Length * sizeof(float);
+        if (_pleInputs is null || _pleInputs.Size < bytes)
+        {
+            _pleInputs?.Dispose();
+            _pleInputs = _device.Allocate(bytes);
+        }
+        _device.Upload(data.AsSpan(), _pleInputs);
+    }
+
+    /// <summary>Lazily (re)allocates the cacheless shared-KV donor stash for <paramref name="seqLen"/> rows.</summary>
+    private void EnsureGemma4SharedKvStash(int seqLen)
+    {
+        int maxKvStride = Math.Max(
+            Config.NumKvHeads * Config.HeadDim,
+            (Config.NumGlobalKvHeads ?? Config.NumKvHeads) * (Config.GlobalHeadDim ?? Config.HeadDim));
+        long bytes = (long)seqLen * maxKvStride * sizeof(float);
+        if (_g4StashK[0] is not null && _g4StashCapacityBytes >= bytes) return;
+        for (int i = 0; i < 2; i++)
+        {
+            _g4StashK[i]?.Dispose();
+            _g4StashV[i]?.Dispose();
+            _g4StashK[i] = _device.AllocateDeviceLocal(bytes);
+            _g4StashV[i] = _device.AllocateDeviceLocal(bytes);
+        }
+        _g4StashCapacityBytes = bytes;
+        InvalidateKernelCaches();
+    }
+
+    /// <summary>
+    /// Records the Gemma-4 PLE per-layer injection on the current hidden state, mirroring CPU
+    /// <c>PerLayerEmbeddings.InjectLayer</c>: gate = inp_gate·h; g = gelu_tanh(gate) * perLayerInput[layer];
+    /// p = post_norm(proj·g); h += p. Scratch: FfnGate (gate), FfnUp (layer slice), SiluOutput (g), NormOutput (p).
+    /// </summary>
+    private void RecordGemma4PleInject(nint cmdBuf, int layer, in VulkanWeights.Gemma4LayerBuffers g4, int seqLen, float eps)
+    {
+        int hidden = Config.HiddenSize;
+        int pleDim = Config.PerLayerEmbedding!.PerLayerDim;
+
+        RecordMatmul(cmdBuf, g4.PleGate!, g4.PleQuantType, _state.HiddenState, _state.FfnGate,
+            pleDim, hidden, seqLen);
+        BarrierComputeToCompute(cmdBuf);
+
+        long sliceBytes = (long)seqLen * pleDim * sizeof(float);
+        BarrierComputeToTransfer(cmdBuf);
+        RecordCopyBufferRange(cmdBuf, _pleInputs!, _state.FfnUp, (ulong)((long)layer * sliceBytes), 0, (ulong)sliceBytes);
+        BarrierTransferToCompute(cmdBuf);
+
+        _geglu!.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * pleDim);
+        BarrierComputeToCompute(cmdBuf);
+
+        RecordMatmul(cmdBuf, g4.PleProj!, g4.PleQuantType, _state.SiluOutput, _state.NormOutput,
+            hidden, pleDim, seqLen);
+        BarrierComputeToCompute(cmdBuf);
+
+        _rmsnorm.Record(cmdBuf, _state.NormOutput, g4.PlePostNorm!, _state.NormOutput,
+            rowCount: seqLen, n: hidden, eps: eps);
+        BarrierComputeToCompute(cmdBuf);
+
+        _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hidden);
+        _state.RotateHiddenSlot();
+        BarrierComputeToCompute(cmdBuf);
+    }
+
     /// <summary>
     /// Records the Gemma-4 attention block for one layer (cacheless / single
     /// forward — the AR validation + diffusion paths are cacheless). Mirrors the
@@ -4449,6 +4758,13 @@ public sealed class VulkanTransformerModel : IModel
         int numKvHeads = GemmaLayerKvHeads(layer);
         var g4 = lw.Gemma4!.Value;
         var (ropeTheta, ropeDim) = GemmaLayerRope(layer);
+        // Shared-KV (Gemma-4 E2B/E4B, #734): trailing layers skip K/V entirely and attend over the donor
+        // layer's KV (same attention kind); the donor itself also stashes its post-rope K / post-norm V for
+        // the cacheless path.
+        bool ownKv = Config.LayerHasOwnKv(layer);
+        int sharedSlot = Config.IsFullAttentionLayer(layer) ? 1 : 0;
+        bool isSharedDonor = Config.NumSharedKvLayers > 0
+            && layer == Config.NumLayers - Config.NumSharedKvLayers - (Config.IsFullAttentionLayer(layer) ? 1 : 2);
 
         // attn_norm → NormOutput
         _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.AttnNormWeight, _state.NormOutput,
@@ -4458,11 +4774,16 @@ public sealed class VulkanTransformerModel : IModel
         // Q, K projections (raw — K is captured before k-norm/rope for V-from-K).
         RecordMatmul(cmdBuf, lw.Q, lw.QDeviceQuantType, _state.NormOutput, _state.Q,
             lw.QOutputDim, lw.QInputDim, seqLen);
-        RecordMatmul(cmdBuf, lw.K, lw.KDeviceQuantType, _state.NormOutput, _state.K,
-            lw.KOutputDim, lw.KInputDim, seqLen);
+        if (ownKv)
+            RecordMatmul(cmdBuf, lw.K, lw.KDeviceQuantType, _state.NormOutput, _state.K,
+                lw.KOutputDim, lw.KInputDim, seqLen);
         BarrierComputeToCompute(cmdBuf);
 
-        if (g4.VFromK)
+        if (!ownKv)
+        {
+            // No K/V projections on a shared-KV layer.
+        }
+        else if (g4.VFromK)
         {
             // V-less global layer: V = raw K projection (no attn_v weight).
             long kvBytes = (long)seqLen * numKvHeads * headDim * sizeof(float);
@@ -4480,10 +4801,13 @@ public sealed class VulkanTransformerModel : IModel
         // Per-head Q/K RMSNorm (× learned weight); weight-less V RMSNorm (unit gamma).
         _rmsnorm.Record(cmdBuf, _state.Q, lw.QNormWeight!, _state.Q,
             rowCount: seqLen * numHeads, n: headDim, eps: eps);
-        _rmsnorm.Record(cmdBuf, _state.K, lw.KNormWeight!, _state.K,
-            rowCount: seqLen * numKvHeads, n: headDim, eps: eps);
-        _rmsnorm.Record(cmdBuf, _state.V, Gemma4OnesVec(), _state.V,
-            rowCount: seqLen * numKvHeads, n: headDim, eps: eps);
+        if (ownKv)
+        {
+            _rmsnorm.Record(cmdBuf, _state.K, lw.KNormWeight!, _state.K,
+                rowCount: seqLen * numKvHeads, n: headDim, eps: eps);
+            _rmsnorm.Record(cmdBuf, _state.V, Gemma4OnesVec(), _state.V,
+                rowCount: seqLen * numKvHeads, n: headDim, eps: eps);
+        }
         BarrierComputeToCompute(cmdBuf);
 
         // RoPE(Q, K) — per-layer theta / rotated dims, NeoX. V is NOT roped.
@@ -4501,13 +4825,31 @@ public sealed class VulkanTransformerModel : IModel
         bool partialGlobal = Config.IsFullAttentionLayer(layer)
             && Config.PartialRotaryFactor is float prf && prf > 0f && prf < 1f
             && ropeDim < headDim;
+        if (_proportionalRopePairs > 0 && Config.IsFullAttentionLayer(layer))
+        {
+            // Proportional rope (rope_freqs.weight, E2B/E4B): factors are {1.0 x n, huge x rest} = rotate only the
+            // leading n pairs with the freq denominator / pairing over the FULL head dim (validated at load).
+            ropeDim = 2 * _proportionalRopePairs;
+            partialGlobal = ropeDim < headDim;
+        }
+        // Shared-KV layers rotate Q only; rotate one (stale, never read) K head to keep the kernel's contract.
         _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
-            seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
+            seqLen: seqLen, numHeads: numHeads, numKvHeads: ownKv ? numKvHeads : 1,
             headDim: headDim, ropeDim: ropeDim, theta: ropeTheta,
             variant: RopeF32Kernel.Variant.NeoX,
             freqDim: partialGlobal ? headDim : 0,
             neoxPairOffset: partialGlobal ? headDim / 2 : (int?)null);
         BarrierComputeToCompute(cmdBuf);
+
+        // Cacheless shared-KV donor stash: capture this donor layer's post-rope K / post-norm V.
+        if (ownKv && isSharedDonor && kvCache is not VulkanKvCache)
+        {
+            long stashBytes = (long)seqLen * numKvHeads * headDim * sizeof(float);
+            BarrierComputeToTransfer(cmdBuf);
+            RecordCopyBufferRange(cmdBuf, _state.K, _g4StashK[sharedSlot]!, 0, 0, (ulong)stashBytes);
+            RecordCopyBufferRange(cmdBuf, _state.V, _g4StashV[sharedSlot]!, 0, 0, (ulong)stashBytes);
+            BarrierTransferToCompute(cmdBuf);
+        }
 
         // Attention K/V source: either this forward's freshly-projected window
         // (cacheless — diffusion / single-shot) or the per-layer-strided KV cache
@@ -4521,7 +4863,33 @@ public sealed class VulkanTransformerModel : IModel
         int positionOffset;
         AttentionMaskMode maskMode;
         int prefixLen;
-        if (kvCache is VulkanKvCache vkCache)
+        if (!ownKv)
+        {
+            if (kvCache is VulkanKvCache donorCache)
+            {
+                int donor = Config.SharedKvDonorLayer(layer);
+                kSrc = donorCache.GetKeysBuffer(donor);
+                vSrc = donorCache.GetValuesBuffer(donor);
+                seqKv = donorCache.CurrentLength;
+                positionOffset = positions[0];
+                maskMode = AttentionMaskMode.Causal;
+                prefixLen = 0;
+            }
+            else if (kvCache is null)
+            {
+                kSrc = _g4StashK[sharedSlot]!;
+                vSrc = _g4StashV[sharedSlot]!;
+                seqKv = seqLen;
+                positionOffset = 0;
+                maskMode = _diffusionMaskMode;
+                prefixLen = _diffusionPrefixLen;
+            }
+            else
+                throw new NotSupportedException(
+                    "Gemma-4 shared-KV layers require a VulkanKvCache (or no cache); "
+                    + $"{kvCache.GetType().Name} is not supported (issue #734).");
+        }
+        else if (kvCache is VulkanKvCache vkCache)
         {
             vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer);
             BarrierTransferToCompute(cmdBuf);
@@ -4657,13 +5025,13 @@ public sealed class VulkanTransformerModel : IModel
         RecordMatmul(cmdBuf, lw.Down, lw.DownDeviceQuantType, _state.SiluOutput, _state.Gemma4DenseResult!,
             lw.DownOutputDim, lw.DownInputDim, seqLen);
         BarrierComputeToCompute(cmdBuf);
-        _rmsnorm.Record(cmdBuf, _state.Gemma4DenseResult!, g4.PostFfwNorm1, _state.Gemma4DenseResult!,
+        _rmsnorm.Record(cmdBuf, _state.Gemma4DenseResult!, g4.PostFfwNorm1!, _state.Gemma4DenseResult!,
             rowCount: seqLen, n: hidden, eps: eps);
         BarrierComputeToCompute(cmdBuf);
 
         // ── MoE branch ──
         // Custom router: logits = ffn_gate_inp · (rms(attn_out) · RouterScale·1/√H).
-        _rmsnorm.Record(cmdBuf, _state.HiddenState, g4.RouterScale, _state.NormOutput,
+        _rmsnorm.Record(cmdBuf, _state.HiddenState, g4.RouterScale!, _state.NormOutput,
             rowCount: seqLen, n: hidden, eps: eps);
         BarrierComputeToCompute(cmdBuf);
         RecordMatmul(cmdBuf, moeW.Gate, moeW.GateDeviceQuantType, _state.NormOutput, _state.MoeRouterLogits!,
@@ -4673,7 +5041,7 @@ public sealed class VulkanTransformerModel : IModel
             seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
         BarrierComputeToCompute(cmdBuf);
         // Expert input = rms(attn_out) * pre_ffw_norm_2 (overwrites the router-input temp).
-        _rmsnorm.Record(cmdBuf, _state.HiddenState, g4.PreFfwNorm2, _state.NormOutput,
+        _rmsnorm.Record(cmdBuf, _state.HiddenState, g4.PreFfwNorm2!, _state.NormOutput,
             rowCount: seqLen, n: hidden, eps: eps);
         BarrierComputeToCompute(cmdBuf);
         _moeBroadcast!.Record(cmdBuf, _state.NormOutput, _state.MoeExpandedInput!,
@@ -4769,7 +5137,7 @@ public sealed class VulkanTransformerModel : IModel
         _moeWeightedScatter!.Record(cmdBuf, _state.MoeDownRows!, _state.MoeTopkWeights!, _state.Gemma4MoeResult!,
             seqLen: seqLen, topK: topK, hiddenSize: hidden);
         BarrierComputeToCompute(cmdBuf);
-        _rmsnorm.Record(cmdBuf, _state.Gemma4MoeResult!, g4.PostFfwNorm2, _state.Gemma4MoeResult!,
+        _rmsnorm.Record(cmdBuf, _state.Gemma4MoeResult!, g4.PostFfwNorm2!, _state.Gemma4MoeResult!,
             rowCount: seqLen, n: hidden, eps: eps);
         BarrierComputeToCompute(cmdBuf);
 
@@ -5792,7 +6160,15 @@ public sealed class VulkanTransformerModel : IModel
         if (QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) > _state.Q8_1XqRows.Size) return false;
         if (QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) > _state.Q8_1XdsRows.Size) return false;
         foreach (var p in projections)
+        {
+            if (p.WeightQt == QuantType.Q4_K && PreferQ4KCoopmat(seqLen)) return false;
+            if (p.WeightQt == QuantType.Q6_K && PreferQ6KCoopmat(seqLen)) return false;
+            if (p.WeightQt == QuantType.Q2_K && PreferQ2KCoopmat(seqLen)) return false;
+            if (p.WeightQt == QuantType.Q5_K && PreferQ5KCoopmat(seqLen)) return false;
+            if (p.WeightQt == QuantType.Q3_K && PreferQ3KCoopmat(seqLen)) return false;
+            if (p.WeightQt == QuantType.IQ4_XS && PreferIq4XsCoopmat(seqLen)) return false;
             if (!HasMmqPrefillKernel(p.WeightQt, inputDim)) return false;
+        }
         return true;
     }
 
@@ -5971,6 +6347,11 @@ public sealed class VulkanTransformerModel : IModel
         VulkanDevice.Buffer input, VulkanDevice.Buffer output,
         int outputDim, int inputDim, int seqLen)
     {
+        // IQ1/IQ2/IQ3 prefill: dequant to F16 scratch + coopmat GEMM instead of the scalar tiled GEMM (#621).
+        if (seqLen > 1 && _iqF16Prefill is not null
+            && _iqF16Prefill.TryRecord(cmdBuf, weightQt, weights, input, output, outputDim, inputDim, seqLen))
+            return;
+
         if (weightQt == QuantType.Q8_0)
         {
             if (seqLen == 1)
@@ -6047,6 +6428,12 @@ public sealed class VulkanTransformerModel : IModel
                     m: outputDim, k: inputDim);
                 ProfNote("q5_0_f32gemv", outputDim, inputDim, seqLen);
             }
+            else if (PreferQ5_0Coopmat(seqLen) && (inputDim % 32) == 0)
+            {
+                _matmulQ5_0GemmCoopmat!.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q5_0_coopmat", outputDim, inputDim, seqLen);
+            }
             else
             {
                 _matmulQ5_0Gemm.Record(cmdBuf, weights, input, output,
@@ -6075,6 +6462,12 @@ public sealed class VulkanTransformerModel : IModel
                     _matmulQ2K.Record(cmdBuf, weights, input, output,
                         m: outputDim, k: inputDim);
                 }
+            }
+            else if (PreferQ2KCoopmat(seqLen) && (inputDim % 256) == 0)
+            {
+                _matmulQ2KGemmCoopmat!.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q2_k_coopmat", outputDim, inputDim, seqLen);
             }
             else if (_matmulQ2KMmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
@@ -6116,6 +6509,12 @@ public sealed class VulkanTransformerModel : IModel
                     _matmulQ3K.Record(cmdBuf, weights, input, output,
                         m: outputDim, k: inputDim);
                 }
+            }
+            else if (PreferQ3KCoopmat(seqLen) && (inputDim % 256) == 0)
+            {
+                _matmulQ3KGemmCoopmat!.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q3_k_coopmat", outputDim, inputDim, seqLen);
             }
             else if (_matmulQ3KMmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
@@ -6165,6 +6564,12 @@ public sealed class VulkanTransformerModel : IModel
                     _matmulQ4K.Record(cmdBuf, weights, input, output,
                         m: outputDim, k: inputDim);
                 }
+            }
+            else if (PreferQ4KCoopmat(seqLen) && (inputDim % 256) == 0)
+            {
+                _matmulQ4KGemmCoopmat!.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q4_k_coopmat", outputDim, inputDim, seqLen);
             }
             else if (_matmulQ4KMmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
@@ -6217,6 +6622,12 @@ public sealed class VulkanTransformerModel : IModel
                         m: outputDim, k: inputDim);
                 }
             }
+            else if (PreferQ5KCoopmat(seqLen) && (inputDim % 256) == 0)
+            {
+                _matmulQ5KGemmCoopmat!.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q5_k_coopmat", outputDim, inputDim, seqLen);
+            }
             else if (_matmulQ5KMmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
                 && (inputDim % MatMulQ5KMmqKernel.Q5KGroupSize) == 0
@@ -6268,6 +6679,12 @@ public sealed class VulkanTransformerModel : IModel
                     _matmulQ6K.Record(cmdBuf, weights, input, output,
                         m: outputDim, k: inputDim);
                 }
+            }
+            else if (PreferQ6KCoopmat(seqLen) && (inputDim % 256) == 0)
+            {
+                _matmulQ6KGemmCoopmat!.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q6_k_coopmat", outputDim, inputDim, seqLen);
             }
             else if (_matmulQ6KMmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
@@ -6358,6 +6775,12 @@ public sealed class VulkanTransformerModel : IModel
                     _matmulIq4Xs.Record(cmdBuf, weights, input, output,
                         m: outputDim, k: inputDim);
                 }
+            }
+            else if (PreferIq4XsCoopmat(seqLen) && (inputDim % 256) == 0)
+            {
+                _matmulIq4XsGemmCoopmat!.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("iq4_xs_coopmat", outputDim, inputDim, seqLen);
             }
             else if (_matmulIq4XsMmq is not null && _quantizeQ8_1Rows is not null
                 && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
@@ -6539,16 +6962,11 @@ public sealed class VulkanTransformerModel : IModel
             // GEMV, prefill via the 32x32 register-blocked GEMM (#233) — the port of the
             // shipped I2_S prefill kernel, which folds each group's scale into the staged
             // weight tile rather than applying one tensor scale to the finished accumulator.
-            if (seqLen == 1)
-            {
-                _matmulPQ2_0.Record(cmdBuf, weights, input, output,
-                    m: outputDim, k: inputDim);
-            }
-            else
-            {
-                _matmulPQ2_0Gemm.Record(cmdBuf, weights, input, output,
-                    m: outputDim, k: inputDim, n: seqLen);
-            }
+            // #446/#470: small batches (2-8 tokens) go to the multi-column GEMV, not the
+            // 128x128 GEMM tile; the policy lives in PQ2_0SmallNDispatch and is shared with
+            // the two hybrid models.
+            PQ2_0SmallNDispatch.Record(cmdBuf, _matmulPQ2_0, _matmulPQ2_0Gemm,
+                weights, input, output, m: outputDim, k: inputDim, n: seqLen);
         }
         else if (weightQt == QuantType.IQ1_S)
         {
@@ -6792,6 +7210,8 @@ public sealed class VulkanTransformerModel : IModel
         _embedScale?.Dispose();
         _embedGatherQ8?.Dispose();
         _gemma4OnesVec?.Dispose();
+        _pleInputs?.Dispose();
+        for (int i = 0; i < 2; i++) { _g4StashK[i]?.Dispose(); _g4StashV[i]?.Dispose(); }
         _splitKvAttention?.Dispose();
         _flashAttention?.Dispose();
         _flashAttentionCoopmat?.Dispose();
@@ -6805,6 +7225,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulBf16Gemm.Dispose();
         _matmulBf16.Dispose();
         _matmulF16GemmCoopmat?.Dispose();
+        _iqF16Prefill?.Dispose();
         _matmulF16Gemm.Dispose();
         _matmulF16.Dispose();
         _matmulIq1SGemm.Dispose();
@@ -6844,6 +7265,13 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8Mmq?.Dispose();
         _matmulQ8MmqResidual?.Dispose();
         _matmulQ4KMmq?.Dispose();
+        _matmulQ4KGemmCoopmat?.Dispose();
+        _matmulQ6KGemmCoopmat?.Dispose();
+        _matmulQ2KGemmCoopmat?.Dispose();
+        _matmulQ5KGemmCoopmat?.Dispose();
+        _matmulQ5_0GemmCoopmat?.Dispose();
+        _matmulQ3KGemmCoopmat?.Dispose();
+        _matmulIq4XsGemmCoopmat?.Dispose();
         _matmulQ6KMmq?.Dispose();
         _matmulQ5KMmq?.Dispose();
         _matmulIq4XsMmq?.Dispose();

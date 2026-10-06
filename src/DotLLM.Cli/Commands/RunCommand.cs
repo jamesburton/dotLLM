@@ -172,7 +172,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         public bool PCoreOnly { get; set; }
 
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1'.")]
+        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1' (CUDA), or 'vulkan'.")]
         [DefaultValue("cpu")]
         public string Device { get; set; } = "cpu";
 
@@ -249,9 +249,9 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
         /// <summary>Number of draft candidates per speculative step.</summary>
         [CommandOption("--speculative-k|--draft-tokens")]
-        [Description("Number of draft tokens per speculative step (K). Default 5. Also used as K for --no-mtp/MTP self-speculative decoding.")]
-        [DefaultValue(5)]
-        public int SpeculativeK { get; set; } = 5;
+        [Description("Number of draft tokens per speculative step (K). Default 3. Also used as K for --no-mtp/MTP self-speculative decoding.")]
+        [DefaultValue(DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates)]
+        public int SpeculativeK { get; set; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
 
         /// <summary>Opt-out of MTP self-speculative decoding when the loaded GGUF carries an MTP head.</summary>
         [CommandOption("--no-mtp")]
@@ -305,7 +305,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         }
         else
         {
-            var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
+            var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant, allowPull: true);
             if (ggufPath is null)
                 return 1;
             resolvedPath = ggufPath;
@@ -316,6 +316,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         ModelConfig config = null!;
         ITokenizer tokenizer = null!;
         IModel model = null!;
+        Func<int, DotLLM.Core.Attention.IKvCache>? vulkanKv = null;
 
         void LoadModel()
         {
@@ -341,8 +342,15 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             config = GgufModelConfigExtractor.ApplyRoPEOverride(config, BuildRoPEOverride(settings));
             tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
-            int gpuLayers = ResolveGpuLayers(settings, config);
-            if (gpuLayers <= 0)
+            bool useVulkan = DotLLM.Vulkan.VulkanModelLoader.IsVulkanDeviceString(settings.Device);
+            int gpuLayers = useVulkan ? 0 : ResolveGpuLayers(settings, config);
+            if (useVulkan)
+            {
+                // Shared per-architecture Vulkan dispatch (#259). Without this branch --device vulkan
+                // fell through to the CPU path silently.
+                (model, vulkanKv) = DotLLM.Vulkan.VulkanModelLoader.CreateSharedFromGguf(gguf, config);
+            }
+            else if (gpuLayers <= 0)
             {
                 // Shared per-architecture CPU dispatch — routes hybrid architectures
                 // (Nemotron-H, Qwen3MoeHybrid) to their dedicated loaders.
@@ -361,17 +369,12 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 int gpuId = ParseGpuId(settings.Device);
                 var hybridThreading = new ThreadingConfig(
                     settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
-                // Issue #291: the generic (Llama-style) HybridTransformerModel partial-offload
-                // splitter assumes every layer shares one uniform tensor-name set, which throws
-                // KeyNotFoundException on Qwen3HybridDense's interleaved GDN/full-attention
-                // layers (a GDN layer has no attn_output.weight at all). Route this architecture
-                // to its own architecture-aware GPU-head/CPU-tail split instead — mirrors the
-                // CPU-only and full-GPU-offload dispatch's existing per-architecture routing
-                // above (see the "#259" comments on this same method).
-                model = config.Architecture == DotLLM.Core.Configuration.Architecture.Qwen3HybridDense
-                    ? DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel.LoadFromGguf(
-                        gguf, config, gpuLayers, gpuId, hybridThreading)
-                    : DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(gguf, config, gpuLayers, gpuId, hybridThreading);
+                // Partial offload (#729 / #291): one dispatch decides per architecture. Architectures that
+                // cannot split (Nemotron-H, Qwen3MoeHybrid, Mamba-3) load all-GPU or fail with an actionable error (never a silent CPU fallback); a
+                // warning; Qwen3HybridDense uses its own split loader; the rest use HybridTransformerModel.
+                (model, _) = DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(
+                    gguf, config, gpuLayers, gpuId, hybridThreading,
+                    w => Console.Error.WriteLine($"WARNING: {w}"));
             }
         }
 
@@ -535,6 +538,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 DotLLM.Cuda.CudaTransformerModel => DotLLM.Cuda.CudaDevice.GetDevice(ParseGpuId(settings.Device)).ToString(),
                 DotLLM.Cuda.HybridTransformerModel h => $"hybrid {h.NumGpuLayers}gpu/{config.NumLayers - h.NumGpuLayers}cpu",
                 DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel h => $"hybrid {h.NumGpuLayers}gpu/{config.NumLayers - h.NumGpuLayers}cpu",
+                _ when vulkanKv is not null => $"vulkan {DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName}",
                 _ => $"{threadingInfo.EffectiveThreadCount} threads"
             };
             var segments = $"{config.Architecture} {config.NumLayers}L/{config.HiddenSize}H | {quantLabel} | {deviceLabel} | {samplingLabel}";
@@ -568,7 +572,12 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 settings.CacheWindow);
 
             Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? kvFactory = null;
-            if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
+            if (vulkanKv is not null)
+            {
+                var vkFactory = vulkanKv;
+                kvFactory = (cfg, size) => vkFactory(size);
+            }
+            else if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
             {
                 if (settings.Paged && kvConfig.IsQuantized)
                 {
@@ -602,6 +611,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 if (settings.Paged)
                     Console.Error.WriteLine("WARNING: Paged KV-cache not supported with hybrid GPU, using hybrid cache.");
                 kvFactory = (cfg, size) => qwen35HybridModel.CreateKvCache(size);
+            }
+            else if (model is DotLLM.Cuda.Architectures.CudaNemotronHTransformerModel nemotronHGpu)
+            {
+                // #729: all-GPU fallback for a partial request on Nemotron-H (sparse attention-only KV).
+                kvFactory = (cfg, size) => nemotronHGpu.CreateKvCache(size);
             }
             else if (settings.Paged && !kvConfig.IsQuantized)
             {
@@ -669,7 +683,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
             var generator = new TextGenerator(model, tokenizer, kvFactory,
                 draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
-                mtpEnabled: !settings.NoMtp,
+                mtpEnabled: !settings.NoMtp, mtpAdaptive: true,
                 prefillChunkSize: settings.PrefillChunkSize);
             var totalSw = Stopwatch.StartNew();
             int generated = 0;

@@ -757,4 +757,54 @@ public class GgufModelConfigExtractorTests
         });
         Assert.Throws<InvalidDataException>(() => GgufModelConfigExtractor.Extract(metadata));
     }
+
+    // ── {arch}.pooling_type → ModelConfig.PoolingType (issue #451) ──────────────
+    //
+    // The GGUF key stores llama.cpp's raw `llama_pooling_type` enum value
+    // (src/llama-model.cpp: ml.get_key(LLM_KV_POOLING_TYPE, hparams.pooling_type, false)),
+    // so the mapping must be value-for-value. Each enum member is asserted separately —
+    // a test that only checked "non-null" would pass with every value mapped to the same
+    // member, which is exactly the kind of pooling bug that is hardest to see downstream.
+
+    [Theory]
+    [InlineData(0u, PoolingType.None)]
+    [InlineData(1u, PoolingType.Mean)]
+    [InlineData(2u, PoolingType.Cls)]
+    [InlineData(3u, PoolingType.Last)]
+    [InlineData(4u, PoolingType.Rank)]
+    public void Extract_PoolingType_MapsLlamaCppEnumValues(uint raw, PoolingType expected)
+    {
+        var metadata = BuildLlamaMetadata(d => d.AddUInt32("llama.pooling_type", raw));
+        Assert.Equal(expected, GgufModelConfigExtractor.Extract(metadata).PoolingType);
+    }
+
+    [Fact]
+    public void Extract_PoolingType_IsNullWhenTheKeyIsAbsent()
+    {
+        // Every ordinary generative checkpoint omits the key; the embeddings path then
+        // falls back to `last` rather than to llama.cpp's unrepresentable NONE default.
+        Assert.Null(GgufModelConfigExtractor.Extract(BuildLlamaMetadata()).PoolingType);
+    }
+
+    [Fact]
+    public void Extract_PoolingType_AcceptsASignedValue()
+    {
+        var metadata = BuildLlamaMetadata(d => d.AddInt32("llama.pooling_type", 3));
+        Assert.Equal(PoolingType.Last, GgufModelConfigExtractor.Extract(metadata).PoolingType);
+    }
+
+    [Fact]
+    public void Extract_PoolingType_TreatsUnspecifiedAsAbsent()
+    {
+        // LLAMA_POOLING_TYPE_UNSPECIFIED = -1.
+        var metadata = BuildLlamaMetadata(d => d.AddInt32("llama.pooling_type", -1));
+        Assert.Null(GgufModelConfigExtractor.Extract(metadata).PoolingType);
+    }
+
+    [Fact]
+    public void Extract_PoolingType_IsNullForAnUnknownValue()
+    {
+        var metadata = BuildLlamaMetadata(d => d.AddUInt32("llama.pooling_type", 99));
+        Assert.Null(GgufModelConfigExtractor.Extract(metadata).PoolingType);
+    }
 }

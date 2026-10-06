@@ -158,6 +158,17 @@ public record ModelConfig
     public GatedDeltaNetConfig? GdnConfig { get; init; }
 
     /// <summary>
+    /// PrismML blockwise-Hadamard weight fold (GGUF <c>prism.hadamard.*</c>). Non-null only for
+    /// checkpoints stored in a rotated basis — currently the Bonsai 2 ternary family.
+    /// </summary>
+    /// <remarks>
+    /// When present, every folded weight's input activation must be transformed before the matmul
+    /// (and rotated lookup tables un-transformed after the lookup). Ignoring it does not fail: the
+    /// weights are well-formed values in the wrong basis, so the model generates fluent nonsense.
+    /// </remarks>
+    public HadamardFoldConfig? HadamardFold { get; init; }
+
+    /// <summary>
     /// Number of trailing Multi-Token Prediction (MTP / "NextN") head layers present in the
     /// checkpoint, beyond <see cref="NumLayers"/> trunk layers. 0 (default) means the GGUF has
     /// no MTP head — self-speculative decoding is unavailable and every other code path is
@@ -194,6 +205,13 @@ public record ModelConfig
 
     /// <summary>Jinja2 chat template from model metadata. Null if not present.</summary>
     public string? ChatTemplate { get; init; }
+
+    /// <summary>
+    /// Sequence-pooling strategy declared by the checkpoint (GGUF <c>{arch}.pooling_type</c>).
+    /// Null when the checkpoint does not declare one — which is the case for every ordinary
+    /// generative decoder. Consumed by the embeddings path (issue #451); ignored elsewhere.
+    /// </summary>
+    public PoolingType? PoolingType { get; init; }
 
     /// <summary>
     /// Layer indices that skip RoPE entirely (NoPE — "no positional encoding").
@@ -359,6 +377,22 @@ public record ModelConfig
     /// full-attention layers the last own-KV full layer).
     /// </summary>
     public int NumSharedKvLayers { get; init; }
+
+    /// <summary>
+    /// True for the dense Gemma-4 variants (E2B/E4B): a Gemma-4 graph with no routed-MoE
+    /// block and/or per-layer embeddings (PLE) and trailing shared-KV layers. Implemented
+    /// on the CPU backend only; the CUDA and Vulkan backends model Gemma-4 as the dual-FFN
+    /// MoE (26B-A4B) and must reject this shape up front (issue #730).
+    /// </summary>
+    public bool IsGemma4DensePle
+        => Gemma4DualFfn && (Moe is null || PerLayerEmbedding is not null || NumSharedKvLayers > 0);
+
+    /// <summary>Actionable message for backends that cannot run <see cref="IsGemma4DensePle"/> models.</summary>
+    public static string Gemma4DensePleUnsupportedMessage(string backend)
+        => $"The Gemma-4 dense variant (E2B/E4B: per-layer embeddings, shared-KV layers, no MoE block) "
+         + $"is not supported on the {backend} backend; only the CPU backend implements it. Support is "
+         + "tracked as a priority in https://github.com/jamesburton/dotLLM/issues/734 (dense Gemma-4 E4B on Vulkan and CUDA). "
+         + "Use --device cpu (much slower), or --device auto, which falls back to CPU with a warning.";
 
     /// <summary>
     /// Returns true when <paramref name="layerIdx"/> projects and stores its own

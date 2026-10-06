@@ -19,6 +19,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// argmax (and near-identical logits) match at every step.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaBatchedDecodeTests
 {
     private readonly ITestOutputHelper _out;

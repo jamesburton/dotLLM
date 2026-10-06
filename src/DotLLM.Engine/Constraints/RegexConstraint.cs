@@ -1,4 +1,6 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using DotLLM.Core.Constraints;
 using DotLLM.Engine.Constraints.Regex;
 using DotLLM.Tokenizers;
@@ -18,8 +20,34 @@ public sealed class RegexConstraint : IDecodingConstraint
     private readonly int _vocabSize;
     private readonly int _eosTokenId;
 
-    // Shared across clones. Not thread-safe — single-sequence use only.
-    private readonly Dictionary<int, TokenMask> _maskCache;
+    // Shared across clones AND (via Create) across requests with the same tokenizer and pattern. Masks are
+    // immutable once built, so a concurrent dictionary is all the synchronisation needed.
+    private readonly ConcurrentDictionary<int, TokenMask> _maskCache;
+
+    /// <summary>Compiled DFA plus the per-state token masks, shared by every constraint made for one (tokenizer, pattern).</summary>
+    private sealed class SharedState(CompiledDfa dfa)
+    {
+        public readonly CompiledDfa Dfa = dfa;
+        public readonly ConcurrentDictionary<int, TokenMask> Masks = new();
+    }
+
+    private const int MaxCachedPatternsPerTokenizer = 64;
+    private static readonly ConditionalWeakTable<ITokenizer, ConcurrentDictionary<string, SharedState>> Shared = new();
+
+    /// <summary>
+    /// Creates a constraint for <paramref name="pattern"/>, reusing the compiled DFA and — more importantly — the
+    /// per-state token masks of earlier constraints for the same tokenizer and pattern. A mask build decodes and
+    /// DFA-steps every token in the vocabulary (~10 ms on a 248k vocab), so rebuilding it per request cost more than
+    /// the forward pass a one-letter classifier answer is trying to save.
+    /// </summary>
+    public static RegexConstraint Create(ITokenizer tokenizer, string pattern)
+    {
+        var perTokenizer = Shared.GetValue(tokenizer, _ => new ConcurrentDictionary<string, SharedState>());
+        if (perTokenizer.Count >= MaxCachedPatternsPerTokenizer && !perTokenizer.ContainsKey(pattern))
+            perTokenizer.Clear();   // unbounded distinct patterns must not grow memory without limit
+        var shared = perTokenizer.GetOrAdd(pattern, p => new SharedState(CompilePattern(p)));
+        return new RegexConstraint(tokenizer, shared.Dfa, shared.Masks);
+    }
 
     /// <summary>
     /// Creates a regex constraint from a pattern string.
@@ -36,13 +64,18 @@ public sealed class RegexConstraint : IDecodingConstraint
     /// Creates a regex constraint from a pre-compiled DFA (for reuse across requests).
     /// </summary>
     internal RegexConstraint(ITokenizer tokenizer, CompiledDfa dfa)
+        : this(tokenizer, dfa, new ConcurrentDictionary<int, TokenMask>())
+    {
+    }
+
+    private RegexConstraint(ITokenizer tokenizer, CompiledDfa dfa, ConcurrentDictionary<int, TokenMask> maskCache)
     {
         _dfa = dfa;
         _simulator = new DfaSimulator(dfa);
         _tokenizer = tokenizer;
         _vocabSize = tokenizer.VocabSize;
         _eosTokenId = tokenizer.EosTokenId;
-        _maskCache = new Dictionary<int, TokenMask>();
+        _maskCache = maskCache;
     }
 
     /// <summary>Copy constructor for <see cref="Clone"/>.</summary>

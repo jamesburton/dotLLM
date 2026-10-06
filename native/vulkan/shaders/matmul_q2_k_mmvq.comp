@@ -18,19 +18,28 @@
 //
 // NOT bit-exact (x is int8-quantized); validated argmax + tolerance vs CPU F32.
 //
-// ── COALESCED lane=K-position layout (issue #339, mirrors #338) ───────────────
+// ── lane=K-position layout (issue #339, mirrors #338; re-derived for #498) ────
 // One wave32 subgroup computes one output row; the 32 lanes consume one 256-elem
-// super-block per iteration. A super-block's qs is 16 uints (one per 16-element
-// sub-block, 16×2-bit = 32 bits). 2 lanes share a sub-block: lane L → sub=L/2,
-// hlf=L%2, owning elements [hlf*8 .. hlf*8+8) (= 2 dp4a). Consecutive lane
-// pairs read consecutive qs uints → coalesced 64-byte region. The per-sub-block
+// super-block per iteration. 2 lanes share a sub-block: lane L → sub=L/2,
+// hlf=L%2, owning elements [hlf*8 .. hlf*8+8) (= 2 dp4a). The per-sub-block
 // min term is split across the sub-block's 2 lanes. Reduction: single subgroupAdd.
 //
 // Q2_K super-block layout (84 bytes / 256 elements; matches matmul_q2_k_f32_gemv.comp):
 //   [0..15]  = scales[16] (low nibble = 4-bit scale, high nibble = 4-bit dmCoef)
-//   [16..79] = qs[64] (256 × 2-bit, 4 per byte; sub-block sub's 16 = qs uint sub)
+//   [16..79] = qs[64] — 256 × 2-bit, 4 per byte, TRANSPOSED (issue #498):
+//              element t lives at byte 32*(t>>7) + (t&31), shift 2*((t>>5)&3).
+//              Authority: ggml-quants.c dequantize_row_q2_K.
 //   [80,81]  = fp16 d   [82,83] = fp16 dmin
 //   Row stride = (K/256) * 84 bytes (84 % 4 == 0 ⇒ word-aligned).
+//
+// NOTE (#498): this kernel previously assumed a sub-block's 16 two-bit values
+// occupied ONE qs uint (uint index == sub). That is false — under the real
+// layout a sub-block's 16 elements are 16 *contiguous bytes* (4 contiguous
+// uints) at one shared shift. Each lane therefore loads 2 uints instead of 1,
+// and lanes no longer read strictly consecutive words: the 4 distinct word
+// bases across the 16 sub-blocks are qsUint + {0, 4, 8, 12}, so a wave still
+// touches exactly the same one 64-byte qs region per super-block, but with
+// each word served to 4 lanes rather than 2.
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
@@ -67,14 +76,17 @@ float readHalf(uint absByteOff) {
     return unpackHalf2x16(half16).x;
 }
 
-// Extract 4 2-bit values from `qw` starting at bit `bit0` and pack them as 4
-// int8 lanes (0..3 each) ready for dp4a.
-uint packQ2(uint qw, uint bit0) {
-    uint v0 = (qw >> bit0)        & 3u;
-    uint v1 = (qw >> (bit0 + 2u)) & 3u;
-    uint v2 = (qw >> (bit0 + 4u)) & 3u;
-    uint v3 = (qw >> (bit0 + 6u)) & 3u;
-    return v0 | (v1 << 8u) | (v2 << 16u) | (v3 << 24u);
+// Load the element-order quartet `u` (elements 4u..4u+3 of the super-block)
+// from the transposed Q2_K qs blob and pack it as 4 int8 lanes (0..3 each)
+// ready for dp4a (issue #498).
+//
+// Derivation: element t = 4u+j (j<4) sits at byte 32*(t>>7) + (t&31) =
+// 4*(8*(u>>5) + (u&7)) + j, shift 2*((t>>5)&3) = 2*((u>>3)&3) — j-invariant.
+// So the quartet is exactly the 4 bytes of uint word 8*(u>>5) + (u&7), each
+// contributing its 2 bits at the same shift: (w >> shift) & 0x03030303.
+uint loadQ2Quartet(uint qsUintBase, uint u) {
+    uint w = weight[qsUintBase + 8u * (u >> 5u) + (u & 7u)];
+    return (w >> (((u >> 3u) & 3u) << 1u)) & 0x03030303u;
 }
 
 void main() {
@@ -84,7 +96,8 @@ void main() {
     uint lane = gl_LocalInvocationID.x;   // 0..31
     uint sub  = lane >> 1u;               // sub-block 0..15
     uint hlf = lane & 1u;                // which 8-element hlf of the sub-block
-    uint bitBase = hlf * 16u;            // first 2-bit value's bit in qw
+    // This lane's 8 elements are element-order quartets u = 4*sub + 2*hlf + {0,1}.
+    uint uBase = sub * 4u + hlf * 2u;
 
     uint rowByteBase = m * pc.blocksPerRow * Q2K_BLOCK_BYTES;
     float acc = 0.0;
@@ -97,10 +110,10 @@ void main() {
         float sc = float(scByte & 0xFu);
         float dmCoef = float((scByte >> 4u) & 0xFu);
 
-        // This sub-block's 16 two-bit values are one uint; this lane owns 8.
-        uint qw = weight[((blockByteBase + 16u) >> 2u) + sub];
-        uint w0 = packQ2(qw, bitBase);
-        uint w1 = packQ2(qw, bitBase + 8u);
+        // This lane's 8 elements = 2 element-order quartets (#498).
+        uint qsUintBase = (blockByteBase + 16u) >> 2u;
+        uint w0 = loadQ2Quartet(qsUintBase, uBase);
+        uint w1 = loadQ2Quartet(qsUintBase, uBase + 1u);
 
         // Activations: element b*256 + sub*16 + hlf*8 → xq uint b*64 + sub*4 + hlf*2.
         uint xqi = b * 64u + sub * 4u + hlf * 2u;

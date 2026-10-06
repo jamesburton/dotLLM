@@ -26,6 +26,7 @@ namespace DotLLM.Tests.Integration.Backends;
 /// correctness run (small canvas) and the full-canvas throughput measurement.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection(GpuCollection.Name)]
 public sealed class DiffusionGemmaVulkanRealGenerationTests
 {
     private const string ModelPathEnvVar = "DOTLLM_DIFFUSIONGEMMA_GGUF";

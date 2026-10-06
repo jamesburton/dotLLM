@@ -58,7 +58,7 @@ public sealed record ServerOptions
     /// <summary>Number of draft candidates per speculative step (K). Also used as K for MTP
     /// self-speculative decoding (<see cref="MtpEnabled"/>) — both are the same "candidates per
     /// round" concept.</summary>
-    public int SpeculativeCandidates { get; init; } = 5;
+    public int SpeculativeCandidates { get; init; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
 
     /// <summary>
     /// Enables Multi-Token Prediction (MTP) self-speculative decoding (issue #253) when the loaded
@@ -102,6 +102,18 @@ public sealed record ServerOptions
     public bool AllowLoraAdminApi { get; init; }
 
     /// <summary>
+    /// Whether the model-administration write endpoints introduced in #454 are enabled:
+    /// <c>POST /v1/models/unload</c>, <c>POST /v1/models/pull</c> (+ its cancel route),
+    /// <c>POST /v1/models/enable</c>, <c>POST /v1/models/disable</c> and
+    /// <c>PUT /v1/settings</c>. The matching read-only routes (<c>GET /v1/settings</c>,
+    /// <c>GET /v1/devices</c>, <c>GET /v1/models/pull</c>) are always available.
+    /// Defaults to <c>false</c> — opt in via <c>--allow-model-admin</c>, mirroring
+    /// <see cref="AllowLoraAdminApi"/>. Deliberately a separate flag: unloading models and
+    /// rewriting residency settings is a different trust boundary from registering a LoRA adapter.
+    /// </summary>
+    public bool AllowModelAdminApi { get; init; }
+
+    /// <summary>
     /// Per-API-key rate-limit configuration. When <see cref="RateLimitConfig.Enabled"/>
     /// is <c>false</c> (or this property is <c>null</c>) the rate-limit middleware
     /// is not wired and the server has no per-caller limits. See <see cref="RateLimitConfig"/>
@@ -117,6 +129,35 @@ public sealed record ServerOptions
     /// preemption, the prefill-token cap, and the active-sequence/reserve limits.
     /// </summary>
     public ContinuousBatchSchedulerOptions? Scheduler { get; init; }
+
+    /// <summary>
+    /// Expected number of concurrently decoding requests (<c>--expected-concurrency</c>). Vulkan hybrid models serve through the serial
+    /// per-request generator by default; at <c>&gt;= 5</c> concurrent decode streams the continuous-batch scheduler measured +73% aggregate
+    /// decode throughput on Tev1-4B (parity at &lt;= 4, slower for a repeated identical prompt, and it is off when MTP is active), so a hint of
+    /// 5 or more enables it automatically. <c>DOTLLM_VK_SCHEDULER=0</c>/<c>1</c> overrides the hint.
+    /// </summary>
+    public int ExpectedConcurrency { get; init; }
+
+    /// <summary>
+    /// Download a missing Hugging Face model when a request or load names one (<c>--auto-pull</c>, issue #714). Off by default so a remote client
+    /// cannot start large downloads; the CLI's own <c>run/chat/serve</c> always pull their main model.
+    /// </summary>
+    public bool AutoPull { get; init; }
+
+    /// <summary>The device a model actually loaded on when <see cref="Device"/> is <c>auto</c> (<c>cpu</c>, <c>vulkan</c>, <c>gpu:0</c>); null otherwise.</summary>
+    public string? ResolvedDevice { get; init; }
+
+    /// <summary>Non-null when <c>--device auto</c> fell back from a faster device because the model is unsupported there (reason + perf consequence); surfaced in <c>/props</c>.</summary>
+    public string? DeviceFallbackWarning { get; init; }
+
+    /// <summary>
+    /// Logit temperature for <c>/v1/systemone</c> probabilities (<c>--decision-temperature</c>); 0 or 1 = the raw restricted softmax. See
+    /// <c>DecisionEvaluator.Temperature</c> for the measured effect on Tev1-4B.
+    /// </summary>
+    public double DecisionTemperature { get; init; }
+
+    /// <summary>Option orderings averaged per noul/choice question (<c>--decision-orderings</c>): 1 (default) or 2 (forward + reversed).</summary>
+    public int DecisionOrderings { get; init; } = 1;
 
     /// <summary>
     /// Server-wide default idle-unload duration in seconds (#369, ollama parity — ollama's own
@@ -171,7 +212,7 @@ public sealed record ServerOptions
         int warmupIterations = 3;
         bool schedulerFairness = false;
         string? speculativeModel = null;
-        int speculativeCandidates = 5;
+        int speculativeCandidates = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
         bool mtpEnabled = false;
         int prefillChunkSize = 0;
         string? ropeScaling = null;
@@ -184,6 +225,8 @@ public sealed record ServerOptions
         double keepAliveSeconds = 300;
         int maxResidentModels = 1;
         long residentMemoryBudgetBytes = 0;
+        bool allowModelAdmin = false;
+        bool allowLoraAdmin = false;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -254,6 +297,10 @@ public sealed record ServerOptions
                     maxResidentModels = int.Parse(next!); i++; break;
                 case "--resident-memory-budget":
                     residentMemoryBudgetBytes = long.Parse(next!); i++; break;
+                case "--allow-model-admin":
+                    allowModelAdmin = true; break;
+                case "--allow-lora-admin":
+                    allowLoraAdmin = true; break;
                 default:
                     // Positional: treat as model if not set
                     if (model is null && !arg.StartsWith('-'))
@@ -302,6 +349,8 @@ public sealed record ServerOptions
             KeepAliveSeconds = keepAliveSeconds,
             MaxResidentModels = maxResidentModels,
             ResidentMemoryBudgetBytes = residentMemoryBudgetBytes,
+            AllowModelAdminApi = allowModelAdmin,
+            AllowLoraAdminApi = allowLoraAdmin,
             ModelId = modelId,
             RopeOverride = BuildRopeOverride(ropeScaling, ropeFreqBase, ropeScale,
                 yarnOrigCtx, yarnAttnFactor, yarnBetaFast, yarnBetaSlow),

@@ -8,6 +8,7 @@ using Xunit;
 namespace DotLLM.Tests.Unit.Cuda;
 
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaNemotronHSsmStateCacheTests
 {
     private static bool IsCudaDriverPresent()

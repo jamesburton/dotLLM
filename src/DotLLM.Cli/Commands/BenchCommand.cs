@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Text.Json;
 using DotLLM.Cli.Benchmarking;
+using DotLLM.Cli.Diagnostics;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
@@ -198,6 +199,17 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
             }
         }
 
+        // Issue #438 — opt-in residency probe. The mapped tensor-data region is
+        // [DataBasePointer, EOF); its pages are the ones every device upload reads from.
+        nint mapBase = gguf.DataBasePointer;
+        // The mapped length comes from the already-open GgufFile, never from a second handle:
+        // FileInfo.Length on a symlink reports the reparse point (every HF-cache model is reached
+        // through one), and File.OpenRead throws a sharing violation once DOTLLM_GGUF_MAP_COW=1,
+        // because a copy-on-write mapping needs write access and so holds the file FileShare.None.
+        long mapLength = HostResidencyProbe.Enabled ? gguf.DataSectionLength : 0;
+        if (HostResidencyProbe.Enabled)
+            HostResidencyProbe.Report("before-load", mapBase, mapLength, deviceSnapshot: null);
+
         var loadSw = Stopwatch.StartNew();
         try
         {
@@ -219,6 +231,26 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         }
         loadSw.Stop();
 
+        if (HostResidencyProbe.Enabled)
+            HostResidencyProbe.Report("after-load", mapBase, mapLength, vulkanDevice?.MemorySnapshot());
+
+        // Issue #438 experiment arm — DOTLLM_BENCH_RELEASE_GGUF=1 unmaps the GGUF right
+        // after upload. Every device-resident weight was copied into a device buffer by
+        // then; nothing in the Vulkan forward path reads a host pointer. If that premise
+        // is wrong this faults, which is itself the answer.
+        if (Environment.GetEnvironmentVariable("DOTLLM_BENCH_RELEASE_GGUF") == "1")
+        {
+            gguf.Dispose();
+            if (HostResidencyProbe.Enabled)
+            {
+                // mapBase is dangling now — pass 0 so the page census is skipped rather
+                // than querying an unmapped range.
+                HostResidencyProbe.Report("after-gguf-dispose", 0, 0, vulkanDevice?.MemorySnapshot());
+            }
+            mapBase = 0;
+            mapLength = 0;
+        }
+
         try
         {
             var result = BenchRunner.Run(
@@ -227,6 +259,9 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
                 reps: settings.Reps,
                 depth: settings.Depth,
                 loadMs: loadSw.Elapsed.TotalMilliseconds);
+
+            if (HostResidencyProbe.Enabled)
+                HostResidencyProbe.Report("after-decode", mapBase, mapLength, vulkanDevice?.MemorySnapshot());
 
             string quant = BenchEnvironment.InferQuantLabel(ggufPath, settings.Quant);
             string modelName = BenchEnvironment.InferModelName(ggufPath, quant);

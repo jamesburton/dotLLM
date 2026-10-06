@@ -3,6 +3,15 @@
 // Computes cos/sin from theta in-kernel (no precomputed table upload needed).
 // Q and K are processed independently — reuse attempts hurt GQA models due to
 // num_heads != num_kv_heads causing different (t, head) decompositions.
+//
+// YaRN scaling (#366): when `inv_freq` is non-null it supplies the ramped per-pair
+// inverse frequencies (rope_dim/2 floats, uploaded once at load from the CPU
+// reference RoPE.ComputeYarnInverseFrequencies) and replaces the in-kernel
+// powf(theta, ...). `mscale` is YaRN's attention-magnitude concentration factor,
+// multiplied into BOTH cos and sin at EVERY position — including position 0, where
+// it scales Q/K by mscale rather than leaving them untouched. Non-YaRN callers pass
+// inv_freq = nullptr and mscale = 1.0f, which is bit-identical to the previous
+// behaviour (IEEE multiply by exactly 1.0f is the identity).
 
 #include <cuda_fp16.h>
 
@@ -16,7 +25,9 @@ extern "C" __global__ void __launch_bounds__(256) rope_f16(
     const int head_dim,
     const int rope_dim,
     const float theta,
-    const int rope_type)  // 0 = standard, 1 = neox interleaved
+    const int rope_type,  // 0 = standard, 1 = neox interleaved
+    const float* __restrict__ inv_freq,  // [rope_dim/2] YaRN inverse freqs, or nullptr
+    const float mscale)                  // YaRN cos/sin multiplier; 1.0f when inactive
 {
     // Grid: (seq_len * max(num_heads, num_kv_heads)), one thread per dimension pair
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -33,10 +44,12 @@ extern "C" __global__ void __launch_bounds__(256) rope_f16(
         int t = remainder / num_heads;
 
         int pos = positions[t];
-        float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
+        float freq = (inv_freq != nullptr)
+            ? inv_freq[pair]
+            : 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
         float angle = (float)pos * freq;
-        float cos_val = cosf(angle);
-        float sin_val = sinf(angle);
+        float cos_val = cosf(angle) * mscale;
+        float sin_val = sinf(angle) * mscale;
 
         int q_stride = num_heads * head_dim;
         int base_idx = t * q_stride + head * head_dim;
@@ -68,10 +81,12 @@ extern "C" __global__ void __launch_bounds__(256) rope_f16(
         int t = remainder / num_kv_heads;
 
         int pos = positions[t];
-        float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
+        float freq = (inv_freq != nullptr)
+            ? inv_freq[pair]
+            : 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
         float angle = (float)pos * freq;
-        float cos_val = cosf(angle);
-        float sin_val = sinf(angle);
+        float cos_val = cosf(angle) * mscale;
+        float sin_val = sinf(angle) * mscale;
 
         int k_stride = num_kv_heads * head_dim;
         int base_idx = t * k_stride + head * head_dim;

@@ -33,7 +33,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 // RealGgufVulkanParityTests' Q8_0 fixture report exactly 1 expanded tensor, so a
 // swapped report still satisfies that class's Assert.Equal(1, ExpandedTensorCount)).
 // Sharing a collection name is what serializes them; verified empirically (#344).
-[Collection("VulkanResidencyReport")]
+[Collection(VulkanResidencyReportCollection.Name)]
 public sealed class RealGgufQ5_0ParityTests
 {
     private readonly ITestOutputHelper _output;

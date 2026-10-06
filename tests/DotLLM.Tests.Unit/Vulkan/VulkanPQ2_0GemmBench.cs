@@ -329,6 +329,299 @@ public sealed class VulkanPQ2_0GemmBench
         return sw.Elapsed.TotalMicroseconds / batch;
     }
 
+    /// <summary>
+    /// Issue #446 — the small-n dispatch crossover. Sweeps <c>n = 1..64</c> with the
+    /// <b>current default</b> GEMM variant (and <see cref="PQ2_0GemmVariant.Coopmat32"/> as the
+    /// tie-back to #435's numbers) against a looped GEMV, to locate the <c>n</c> at which
+    /// <c>RecordMatmul</c>'s <c>seqLen == 1 ? GEMV : GEMM</c> dispatch should actually switch.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>The GEMV arm is a lower bound on a real looped GEMV, so its verdict is one-sided.</b>
+    /// <see cref="RunGemvPass"/> re-dispatches over the same buffer offsets with no barriers, so
+    /// the dispatches overlap and every repeat after the first hits whatever the previous one
+    /// left in cache. A shippable loop would bind per-token sub-ranges; since the three buffer
+    /// handles are unchanged that costs only two extra push-constant words (the
+    /// <c>DescriptorSetCache</c> is handle-keyed and would still hit), and the disjoint
+    /// <c>y[t·M..]</c> writes still need no barriers — so the only real optimism left is cache
+    /// residency, which cannot apply to <c>lm_head</c> at 337 MB packed. <b>Therefore: wherever
+    /// the GEMM beats this arm, it also beats a real looped GEMV, and no crossover exists
+    /// there.</b> The converse is not safe to assert on the sub-32 MB projections.
+    /// </para>
+    /// <para>
+    /// <c>speedup</c> is GEMM-relative: <c>&gt; 1.00x</c> means the GEMM wins and the current
+    /// dispatch is right; <c>&lt; 1.00x</c> means a looped GEMV would be faster at that n.
+    /// Enable with <c>DOTLLM_PQ2_0_GEMM_BENCH=1</c>; override the ladder with
+    /// <c>DOTLLM_PQ2_0_CROSSOVER_N</c> (comma-separated).
+    /// </para>
+    /// </remarks>
+    [SkippableFact]
+    public void Bench_PQ2_0SmallNCrossover()
+    {
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_GEMM_BENCH"), "1", StringComparison.Ordinal),
+            "DOTLLM_PQ2_0_GEMM_BENCH=1 to enable this benchmark.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        PinToPCores();
+        int baseBatch = EnvInt("DOTLLM_PQ2_0_GEMM_BENCH_BATCH", 8);
+        int[] ns = ParseNs(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_CROSSOVER_N"))
+            ?? [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64];
+        var shapes = ParseShapes(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_GEMM_BENCH_SHAPES"))
+            ?? [DefaultShapes[2], DefaultShapes[4]];   // ffn_gate/up (fits MALL) + lm_head (does not)
+
+        using var device = VulkanDevice.Create();
+        using var gemv = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
+
+        var selected = PQ2_0GemmVariant.SelectFor(device);
+        _output.WriteLine($"Device: {device.DeviceName}  SubgroupSize: {device.SubgroupSize}  Coopmat: {device.HasCooperativeMatrix}");
+        _output.WriteLine($"SelectFor(device) => {selected.SpvFileName}   (THE CURRENT DEFAULT)");
+        _output.WriteLine($"baseBatch={baseBatch}  schedule: {WarmupPasses} warmup + {Passes} interleaved order-reversed passes (median of per-pass ratios)");
+        _output.WriteLine("speedup is GEMM-relative: >1.00x = GEMM wins (current dispatch correct); <1.00x = a looped GEMV would win.");
+
+        var arms = new List<(string Label, PQ2_0GemmVariant Variant)> { ($"DEFAULT {selected.SpvFileName}", selected) };
+        if (PQ2_0GemmVariant.Coopmat32.IsSupportedOn(device) && selected != PQ2_0GemmVariant.Coopmat32)
+            arms.Add(("#435 tie-back: coopmat32", PQ2_0GemmVariant.Coopmat32));
+
+        foreach (var (label, variant) in arms)
+        {
+            using var gemm = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir, variant);
+            foreach (var (tag, m, k) in shapes)
+            {
+                _output.WriteLine("");
+                _output.WriteLine($"### {label} — {tag}");
+                _output.WriteLine("| n | batch | looped-GEMV µs | GEMM µs | speedup |");
+                _output.WriteLine("|---:|---:|---:|---:|---:|");
+
+                long rowBytes = (long)(k / GroupSize) * GroupBytes;
+                long wBytes = m * rowBytes;
+                int maxN = ns.Max();
+                using var bufW = device.Allocate((wBytes + 3) & ~3L);
+                using var bufB = device.Allocate((long)maxN * k * sizeof(float));
+                using var bufC = device.Allocate((long)maxN * m * sizeof(float));
+
+                var rng = new Random(0x2A_53);
+                byte[] w = new byte[wBytes];
+                rng.NextBytes(w);              // random packed codes; timing is data-independent
+                float[] b = new float[(long)maxN * k];
+                for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
+                device.Upload(new ReadOnlySpan<byte>(w), bufW);
+                device.Upload(b, bufB);
+
+                foreach (int n in ns)
+                {
+                    // The GEMV arm costs O(n) dispatches, so hold total work roughly constant as
+                    // n grows or lm_head at n=64 takes ~a minute per pass and burns the lock.
+                    int batch = Math.Max(1, baseBatch / Math.Max(1, (n + 7) / 8));
+                    (double gemvUs, double gemmUs, double ratio) =
+                        MeasurePaired(device, gemv, gemm, bufW, bufB, bufC, m, k, n, batch);
+                    _output.WriteLine($"| {n} | {batch} | {gemvUs:F2} | {gemmUs:F2} | {ratio:F2}x |");
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Issue #470 — the multi-column GEMV against the two kernels it sits between: the real
+    /// per-token GEMV loop it replaces (per-token offsets, as <see cref="PQ2_0SmallNDispatch"/>
+    /// records it) and the default GEMM. Three arms, and the order rotates every pass.
+    /// </summary>
+    /// <remarks>
+    /// Every column is reported against <b>one single-column GEMV</b> (<c>n = 1</c> of the loop
+    /// arm), which is the ratio #470's targets are stated in (S=2 at 1.2x or less, S=4 at 1.4x
+    /// or less). Read <c>lm_head</c> as the honest row. It is 337 MB packed, so each repetition is
+    /// a DRAM read, as in a real forward. The projections fit the 32 MB MALL, so their repetitions
+    /// are cache hits and flatter both GEMV arms. Enable with <c>DOTLLM_PQ2_0_GEMM_BENCH=1</c>;
+    /// <c>DOTLLM_PQ2_0_CROSSOVER_N</c> overrides the column ladder (max 8).
+    /// </remarks>
+    [SkippableFact]
+    public void Bench_PQ2_0MultiColumnGemv()
+    {
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_GEMM_BENCH"), "1", StringComparison.Ordinal),
+            "DOTLLM_PQ2_0_GEMM_BENCH=1 to enable this benchmark.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        PinToPCores();
+        int batch = EnvInt("DOTLLM_PQ2_0_GEMM_BENCH_BATCH", 8);
+        int[] ns = (ParseNs(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_CROSSOVER_N")) ?? [1, 2, 3, 4, 5, 6, 7, 8])
+            .Where(n => n <= MatMulPQ2_0GemvF32Kernel.MaxColumns).ToArray();
+        var shapes = ParseShapes(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_GEMM_BENCH_SHAPES")) ?? DefaultShapes;
+
+        using var device = VulkanDevice.Create();
+        using var gemv = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
+        var variant = PQ2_0GemmVariant.SelectFor(device);
+        using var gemm = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir, variant);
+
+        _output.WriteLine($"Device: {device.DeviceName}  SubgroupSize: {device.SubgroupSize}  GEMM: {variant.SpvFileName}");
+        _output.WriteLine($"batch={batch}  schedule: {WarmupPasses} warmup + {Passes} passes, 3 arms, order rotated every pass (medians)");
+
+        foreach (var (tag, m, k) in shapes)
+        {
+            _output.WriteLine("");
+            _output.WriteLine($"### {tag}");
+            _output.WriteLine("| n | loop µs | multi-col µs | GEMM µs | loop / 1-col | multi-col / 1-col | GEMM / 1-col |");
+            _output.WriteLine("|---:|---:|---:|---:|---:|---:|---:|");
+
+            long wBytes = (long)m * (k / GroupSize) * GroupBytes;
+            int maxN = ns.Max();
+            using var bufW = device.Allocate((wBytes + 3) & ~3L);
+            using var bufB = device.Allocate((long)maxN * k * sizeof(float));
+            using var bufC = device.Allocate((long)maxN * m * sizeof(float));
+
+            var rng = new Random(0x2A_70);
+            byte[] w = new byte[wBytes];
+            rng.NextBytes(w);
+            float[] b = new float[(long)maxN * k];
+            for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
+            device.Upload(new ReadOnlySpan<byte>(w), bufW);
+            device.Upload(b, bufB);
+
+            double oneColUs = 0;
+            foreach (int n in ns)
+            {
+                Func<double>[] arms =
+                [
+                    () => Time(device, batch, cb => { for (int t = 0; t < n; t++) gemv.Record(cb, bufW, bufB, bufC, m, k, t * k, t * m); }),
+                    () => Time(device, batch, cb => gemv.RecordColumns(cb, bufW, bufB, bufC, m, k, n)),
+                    () => Time(device, batch, cb => gemm.Record(cb, bufW, bufB, bufC, m, k, n)),
+                ];
+                for (int i = 0; i < WarmupPasses; i++)
+                    foreach (var arm in arms) arm();
+
+                var us = new double[arms.Length][];
+                for (int a = 0; a < arms.Length; a++) us[a] = new double[Passes];
+                for (int p = 0; p < Passes; p++)
+                    for (int j = 0; j < arms.Length; j++)
+                    {
+                        int a = (p + j) % arms.Length;   // rotate which arm goes first
+                        us[a][p] = arms[a]();
+                    }
+
+                double[] med = us.Select(v => { Array.Sort(v); return v[Passes / 2]; }).ToArray();
+                if (n == 1 || oneColUs == 0) oneColUs = med[0];
+                _output.WriteLine($"| {n} | {med[0]:F1} | {med[1]:F1} | {med[2]:F1} | "
+                    + $"{med[0] / oneColUs:F2}x | {med[1] / oneColUs:F2}x | {med[2] / oneColUs:F2}x |");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Issue #474 — every compiled <c>matmul_pq2_0_f32_gemv_mr_r{R}_c{C}_b{B}_w{W}.spv</c> variant
+    /// against the shipping dispatch for the same column count (<c>Record</c> at n = 1,
+    /// <c>RecordColumns</c> above), same session, arm order rotated every pass, medians.
+    /// </summary>
+    /// <remarks>
+    /// Enable with <c>DOTLLM_PQ2_0_GEMM_BENCH=1</c>. <c>DOTLLM_PQ2_0_MR_FILTER</c> is a comma list
+    /// of substrings a variant name must contain one of; <c>DOTLLM_PQ2_0_CROSSOVER_N</c> the column
+    /// ladder. A variant runs at n when its compiled capacity C is n (exact width) or, with
+    /// <c>DOTLLM_PQ2_0_MR_ALLOW_WIDER=1</c>, any C &gt;= n.
+    /// </remarks>
+    [SkippableFact]
+    public void Bench_PQ2_0MultiRowGemv()
+    {
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_GEMM_BENCH"), "1", StringComparison.Ordinal),
+            "DOTLLM_PQ2_0_GEMM_BENCH=1 to enable this benchmark.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        PinToPCores();
+        int batch = EnvInt("DOTLLM_PQ2_0_GEMM_BENCH_BATCH", 8);
+        int[] ns = (ParseNs(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_CROSSOVER_N")) ?? [1, 2, 4, 8])
+            .Where(n => n <= MatMulPQ2_0GemvF32Kernel.MaxColumns).ToArray();
+        var shapes = ParseShapes(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_GEMM_BENCH_SHAPES")) ?? DefaultShapes;
+        string[] filter = (Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_MR_FILTER") ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        bool allowWider = Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_MR_ALLOW_WIDER") == "1";
+
+        using var device = VulkanDevice.Create();
+        using var gemv = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
+        gemv.MultiRowOverride = false;                  // "current" = the #470 kernels
+        var variants = VulkanMatMulPQ2_0GemvF32KernelTests.EnumerateMultiRowVariants(spvDir)
+            .Where(v => filter.Length == 0 || filter.Any(f => v.Spv.Contains(f, StringComparison.Ordinal)))
+            .Select(v => PQ2_0GemvMultiRowPipeline.Create(device, spvDir, v.Spv, v.Rows, v.Cols))
+            .ToList();
+        try
+        {
+            _output.WriteLine($"Device: {device.DeviceName}  SubgroupSize: {device.SubgroupSize}  variants: {variants.Count}");
+            _output.WriteLine($"batch={batch}  schedule: {WarmupPasses} warmup + {Passes} passes, order rotated every pass (medians)");
+
+            foreach (var (tag, m, k) in shapes)
+            {
+                long wBytes = (long)m * (k / GroupSize) * GroupBytes;
+                int maxN = ns.Max();
+                using var bufW = device.Allocate((wBytes + 3) & ~3L);
+                using var bufB = device.Allocate((long)maxN * k * sizeof(float));
+                using var bufC = device.Allocate((long)maxN * m * sizeof(float));
+
+                var rng = new Random(0x2A_74);
+                byte[] w = new byte[wBytes];
+                rng.NextBytes(w);
+                float[] b = new float[(long)maxN * k];
+                for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
+                device.Upload(new ReadOnlySpan<byte>(w), bufW);
+                device.Upload(b, bufB);
+
+                foreach (int n in ns)
+                {
+                    var eligible = variants.Where(v => v.Columns == n || (allowWider && v.Columns > n)).ToList();
+                    var labels = new List<string> { n == 1 ? "#470 Record" : "#470 RecordColumns" };
+                    var arms = new List<Func<double>>
+                    {
+                        () => Time(device, batch, cb => gemv.RecordColumns(cb, bufW, bufB, bufC, m, k, n)),
+                    };
+                    foreach (var v in eligible)
+                    {
+                        labels.Add(v.SpvFileName.Replace("matmul_pq2_0_f32_gemv_mr_", "").Replace(".spv", ""));
+                        arms.Add(() => Time(device, batch, cb => v.Record(cb, bufW, bufB, bufC, m, k, n, 0, 0)));
+                    }
+
+                    for (int i = 0; i < WarmupPasses; i++)
+                        foreach (var arm in arms) arm();
+                    var us = new double[arms.Count][];
+                    for (int a = 0; a < arms.Count; a++) us[a] = new double[Passes];
+                    for (int p = 0; p < Passes; p++)
+                        for (int j = 0; j < arms.Count; j++)
+                        {
+                            int a = (p + j) % arms.Count;
+                            us[a][p] = arms[a]();
+                        }
+                    double[] med = us.Select(v => { Array.Sort(v); return v[Passes / 2]; }).ToArray();
+
+                    _output.WriteLine("");
+                    _output.WriteLine($"### {tag}  n={n}");
+                    _output.WriteLine("| arm | µs | vs current | weight GB/s |");
+                    _output.WriteLine("|---|---:|---:|---:|");
+                    var order = Enumerable.Range(0, arms.Count).OrderBy(i => i == 0 ? double.MinValue : med[i]);
+                    foreach (int i in order)
+                        _output.WriteLine($"| {labels[i]} | {med[i]:F1} | {med[i] / med[0]:F3}x | {wBytes / (med[i] * 1e3):F1} |");
+                }
+            }
+        }
+        finally
+        {
+            foreach (var v in variants) v.Dispose();
+        }
+    }
+
+    private static double Time(VulkanDevice device, int batch, Action<nint> record)
+    {
+        using var ctx = device.CreateSubmitContext();
+        var sw = Stopwatch.StartNew();
+        ctx.Begin();
+        for (int i = 0; i < batch; i++) record(ctx.CommandBuffer);
+        ctx.SubmitAndWait();
+        sw.Stop();
+        return sw.Elapsed.TotalMicroseconds / batch;
+    }
+
+    private static int[]? ParseNs(string? spec)
+    {
+        if (string.IsNullOrWhiteSpace(spec)) return null;
+        var list = new List<int>();
+        foreach (string entry in spec.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            if (int.TryParse(entry, NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) && v > 0)
+                list.Add(v);
+        return list.Count > 0 ? [.. list] : null;
+    }
+
     private static (string Tag, int M, int K)[]? ParseShapes(string? spec)
     {
         if (string.IsNullOrWhiteSpace(spec)) return null;

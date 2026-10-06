@@ -8,6 +8,7 @@ using Xunit;
 namespace DotLLM.Tests.Unit.Cuda;
 
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaMamba3StateCacheTests
 {
     private static bool IsCudaDriverPresent()

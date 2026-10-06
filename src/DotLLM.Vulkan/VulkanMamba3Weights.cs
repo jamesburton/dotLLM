@@ -213,6 +213,7 @@ internal sealed class VulkanMamba3Weights : IDisposable
         // staging buffer once and reuse it across every device-local copy.
         long maxBytes = ComputeMaxStagingBytes(
             numLayers, hidden, vocab, dInner, dState, nHead, dInProj, bcBiasElems, mimoElems);
+        VulkanWeightImportPolicy.Reset();
         using var staging = VulkanStagingBuffer.Create(device, maxBytes);
 
         long totalBytes = 0;
@@ -240,8 +241,7 @@ internal sealed class VulkanMamba3Weights : IDisposable
         if (lmKeepQuant)
         {
             lmBytes = Dequantize.RowByteSize(hidden, weights.LmHeadQuantTypeOverlay) * vocab;
-            lmHead = device.AllocateDeviceLocal(lmBytes);
-            UploadRawBytes(device, staging, weights.LmHeadQ8Ptr, lmBytes, lmHead);
+            lmHead = AllocateRawBytes(device, staging, weights.LmHeadQ8Ptr, lmBytes);
             lmHeadDeviceQt = weights.LmHeadQuantTypeOverlay;
         }
         else
@@ -280,8 +280,7 @@ internal sealed class VulkanMamba3Weights : IDisposable
             if (inProjKeepQuant)
             {
                 inProjBytes = Dequantize.RowByteSize(hidden, layerOv!.InProjQuantTypeOverlay) * dInProj;
-                inProj = device.AllocateDeviceLocal(inProjBytes);
-                UploadRawBytes(device, staging, layerOv.InProjQ8Ptr, inProjBytes, inProj);
+                inProj = AllocateRawBytes(device, staging, layerOv.InProjQ8Ptr, inProjBytes);
                 inProjDeviceQt = layerOv.InProjQuantTypeOverlay;
             }
             else
@@ -301,8 +300,7 @@ internal sealed class VulkanMamba3Weights : IDisposable
             if (outProjKeepQuant)
             {
                 outProjBytes = Dequantize.RowByteSize(dInner, layerOv!.OutProjQuantTypeOverlay) * hidden;
-                outProj = device.AllocateDeviceLocal(outProjBytes);
-                UploadRawBytes(device, staging, layerOv.OutProjQ8Ptr, outProjBytes, outProj);
+                outProj = AllocateRawBytes(device, staging, layerOv.OutProjQ8Ptr, outProjBytes);
                 outProjDeviceQt = layerOv.OutProjQuantTypeOverlay;
             }
             else
@@ -448,9 +446,12 @@ internal sealed class VulkanMamba3Weights : IDisposable
     private static bool KeepBf16OnDevice(QuantizationType qt, int contractionDim)
         => qt == QuantizationType.BF16 && (contractionDim & 1) == 0;
 
-    /// <summary>True iff the overlay declares a supported on-device dtype (Q8_0 /
-    /// Q4_K / Q5_K / Q6_K / F16 / BF16) AND the contraction axis is aligned to that
-    /// format's group size.</summary>
+    /// <summary>True iff the overlay declares a supported on-device dtype (Q8_0, the
+    /// K-quants Q2_K/Q3_K/Q4_K/Q5_K/Q6_K, the IQ family IQ1_S/IQ2_*/IQ3_*/IQ4_*, F16 or
+    /// BF16) AND the contraction axis is aligned to that format's group size. The
+    /// disjunction below is the authority; keep this list in step with it. Narrower than the
+    /// dense path's <c>VulkanWeights.DeviceQuantTypeFor</c>, which also keeps Q5_0, I2_S and
+    /// PQ2_0.</summary>
     private static bool KeepQuantOnDevice(QuantizationType qt, int contractionDim)
         => KeepQ8OnDevice(qt, contractionDim)
         || KeepQ2KOnDevice(qt, contractionDim)
@@ -469,14 +470,38 @@ internal sealed class VulkanMamba3Weights : IDisposable
         || KeepF16OnDevice(qt, contractionDim)
         || KeepBf16OnDevice(qt, contractionDim);
 
-    /// <summary>Copies <paramref name="bytes"/> raw bytes from <paramref name="srcPtr"/>
-    /// through <paramref name="staging"/> into the device-local <paramref name="dst"/>.
-    /// Same on-device byte layout as <see cref="VulkanWeights"/> so the existing
-    /// <c>matmul_q8_0</c> / <c>matmul_q8_0_gemm</c> kernels can read it directly.</summary>
-    private static void UploadRawBytes(
-        VulkanDevice device, VulkanStagingBuffer staging,
-        nint srcPtr, long bytes, VulkanDevice.Buffer dst)
-        => staging.UploadBytes(srcPtr, bytes, dst);
+    /// <summary>Makes <paramref name="bytes"/> raw quant-block bytes at
+    /// <paramref name="srcPtr"/> visible to the device. Same on-device byte layout as
+    /// <see cref="VulkanWeights"/> so the existing <c>matmul_q8_0</c> /
+    /// <c>matmul_q8_0_gemm</c> kernels can read it directly.
+    /// <para>
+    /// #508: the device image is the source bytes verbatim, so the mapped pages are
+    /// aliased through <see cref="VulkanWeightImportPolicy"/> when the device accepts it
+    /// (a UMA APU) and copied through <paramref name="staging"/> into a fresh
+    /// device-local allocation otherwise.
+    /// </para></summary>
+    private static VulkanDevice.Buffer AllocateRawBytes(
+        VulkanDevice device, VulkanStagingBuffer staging, nint srcPtr, long bytes)
+    {
+        // Deliberately NOT an import site. These pointers come from the optional Q8_0 /
+        // K-quant overlay on Mamba3Weights, which production safetensors loaders never
+        // attach — only mixed-quant test configs do, and those own the buffer themselves
+        // with no contract that it outlives the Vulkan model. An import would alias it
+        // for the model's lifetime. Staging keeps the copy semantics the overlay assumes.
+        VulkanWeightImportPolicy.NoteStaged(srcPtr, bytes, "not_lifetime_owned");
+
+        var dst = device.AllocateDeviceLocal(bytes);
+        try
+        {
+            staging.UploadBytes(srcPtr, bytes, dst);
+        }
+        catch
+        {
+            dst.Dispose();
+            throw;
+        }
+        return dst;
+    }
 
     private static long ComputeMaxStagingBytes(
         int numLayers, int hidden, int vocab, int dInner, int dState, int nHead, int dInProj,
@@ -523,9 +548,30 @@ internal sealed class VulkanMamba3Weights : IDisposable
                 $"Mamba-3 tensor dtype {handle.SourceDType} is not yet supported (expected F32).");
 
         long bytes = expectedElements * sizeof(float);
-        var buf = device.AllocateDeviceLocal(bytes);
-        staging.UploadBytes(handle.Pointer, bytes, buf);
         uploadedBytes = bytes;
+
+        // #508: an F32 safetensors tensor goes to the device byte-for-byte, so the mapped
+        // pages can be aliased rather than copied — but ONLY when the handle points into
+        // the caller's mmap (OwnsMemory == false). An OwnsMemory == true handle is a
+        // conversion buffer that Mamba3Weights.Dispose frees, and BuildOnDevice's contract
+        // explicitly leaves that disposal to the caller, who may do it the moment the
+        // model is built. Aliasing it would be a use-after-free on the GPU.
+        if (!handle.OwnsMemory
+            && VulkanWeightImportPolicy.TryImport(device, handle.Pointer, bytes, out var imported))
+            return imported!;
+
+        var buf = device.AllocateDeviceLocal(bytes);
+        try
+        {
+            staging.UploadBytes(handle.Pointer, bytes, buf);
+            VulkanWeightImportPolicy.NoteStaged(
+                handle.Pointer, bytes, handle.OwnsMemory ? "not_lifetime_owned" : null);
+        }
+        catch
+        {
+            buf.Dispose();
+            throw;
+        }
         return buf;
     }
 

@@ -6,6 +6,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.HuggingFace;
 using DotLLM.Models;
 using DotLLM.Models.Architectures;
+using DotLLM.Tests.Integration.Fixtures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -68,7 +69,9 @@ public sealed class TinyLlamaLoraForwardBenchmarkTests
         int prefillTokens = ReadPositiveInt(PrefillTokensEnvVar, 64);
         int samples = ReadPositiveInt(SamplesEnvVar, 3);
 
-        var (model, source, config) = ModelLoader.LoadFromSafetensors(checkpointRoot!);
+        var (model, source, config) = CheckpointGuard.LoadOrSkip(
+            checkpointRoot!, "TinyLlama checkpoint",
+            () => ModelLoader.LoadFromSafetensors(checkpointRoot!));
         try
         {
             Skip.If(

@@ -57,6 +57,9 @@ public class VulkanPackedSsboRoundUpTests
             using var buf = VulkanWeights.AllocateAndUploadPacked(
                 device, staging, (nint)sp, bytes);
 
+            // #510: staging submits are deferred; drain before reading the destination.
+            staging.WaitAll();
+
             Assert.Equal(expectedSize, buf.Size);
             Assert.Equal(0L, buf.Size % 4);
 
@@ -129,6 +132,9 @@ public class VulkanPackedSsboRoundUpTests
             using var bufX = device.Allocate((long)k * sizeof(float));
             using var bufY = device.Allocate((long)m * sizeof(float));
             device.Upload(x, bufX);
+
+            // #510: staging submits are deferred; drain before the kernel reads bufW.
+            staging.WaitAll();
 
             kernel.Launch(bufW, bufX, bufY, m, k);
 

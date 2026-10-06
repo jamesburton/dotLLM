@@ -17,6 +17,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// CPU codec. Gated on a CUDA GPU + turboquant.ptx (runs on T5500, not the Strix Halo box).
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public sealed unsafe class CudaTurboQuantKernelTests
 {
     private readonly ITestOutputHelper _out;
