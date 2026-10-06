@@ -2743,11 +2743,21 @@ public sealed class VulkanTransformerModel : IModel
         // carries no MLA / MoE layer (dense VulkanTransformerModel does not support
         // MoE — that's VulkanQwen3MoeHybridTransformerModel — but MLA can appear
         // in DeepSeek-V2/V3 dense hosts and falls through to per-seq for now).
-        bool modelHasMlaOrMoe = false;
+        // Gemma-family ops (GeGLU, sqrt(hidden) embedding scale, post-attn/post-FFN norms,
+        // attention/final soft-caps, query_pre_attn_scalar) are implemented ONLY in the
+        // per-sequence Forward; the fused batched layer loop below is plain SwiGLU/Llama and would
+        // silently produce wrong logits for them. Route those models through the per-seq path.
+        bool modelHasMlaOrMoe = _geglu is not null
+            || _embedScale is not null
+            || Config.AttnLogitSoftcap is not null
+            || Config.FinalLogitSoftcap is not null
+            || Config.QueryPreAttnScalar is not null;
         for (int layer = 0; layer < Config.NumLayers && !modelHasMlaOrMoe; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
-            if (lw.Mla is not null || lw.Moe is not null) modelHasMlaOrMoe = true;
+            if (lw.Mla is not null || lw.Moe is not null
+                || lw.PostAttnNormWeight is not null || lw.PostFfnNormWeight is not null)
+                modelHasMlaOrMoe = true;
         }
 
         // Build the simple / complex index lists. Preserve input order in the result.

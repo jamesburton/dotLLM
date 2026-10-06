@@ -65,18 +65,20 @@ public sealed class Gemma2GpuParityTests
     }
 
     /// <summary>CPU oracle: one cacheless forward returns logits for every position.</summary>
-    private static float[][] CpuRows(string path, out int vocab)
+    private static float[][] CpuRows(string path, out int vocab) => CpuRows(path, Tokens, out vocab);
+
+    private static float[][] CpuRows(string path, int[] tokens, out int vocab)
     {
         var (model, gguf, cfg) = ModelLoader.LoadFromGguf(path, ThreadingConfig.SingleThreaded);
         using (gguf)
         using (model)
         {
             vocab = cfg.VocabSize;
-            int[] pos = Enumerable.Range(0, Tokens.Length).ToArray();
-            using ITensor logits = model.Forward(Tokens, pos, -1, kvCache: null);
+            int[] pos = Enumerable.Range(0, tokens.Length).ToArray();
+            using ITensor logits = model.Forward(tokens, pos, -1, kvCache: null);
             float[] all = Rows(logits);
-            Assert.Equal(Tokens.Length * vocab, all.Length);
-            var rows = new float[Tokens.Length][];
+            Assert.Equal(tokens.Length * vocab, all.Length);
+            var rows = new float[tokens.Length][];
             for (int t = 0; t < rows.Length; t++) rows[t] = all.AsSpan(t * vocab, vocab).ToArray();
             return rows;
         }
@@ -89,7 +91,8 @@ public sealed class Gemma2GpuParityTests
         {
             double d = Math.Abs(cpu[i] - gpu[i]);
             worst = Math.Max(worst, d);
-            Assert.True(d <= absTol, $"{label}: col {i}: cpu={cpu[i]:F5} gpu={gpu[i]:F5} |diff|={d:E3} > {absTol:E3}");
+            double bar = absTol + 5e-3 * Math.Abs(cpu[i]);
+            Assert.True(d <= bar, $"{label}: col {i}: cpu={cpu[i]:F5} gpu={gpu[i]:F5} |diff|={d:E3} > {bar:E3}");
         }
     }
 
@@ -119,14 +122,14 @@ public sealed class Gemma2GpuParityTests
                 using (ITensor logits = model.Forward(ids, pos, -1, cache))
                 {
                     float[] all = Rows(logits);
-                    Compare($"{name} prefill", cpu[PrefillLen - 1], all.AsSpan(all.Length - vocab, vocab).ToArray(), 0.03, ref worst);
+                    Compare($"{name} prefill", cpu[PrefillLen - 1], all.AsSpan(all.Length - vocab, vocab).ToArray(), 0.02, ref worst);
                 }
                 // Single-token decode steps — the S==1 path (split-KV from ~17 ctx, sliding window per layer).
                 for (int t = PrefillLen; t < Tokens.Length; t++)
                 {
                     using ITensor logits = model.Forward([Tokens[t]], [t], -1, cache);
                     float[] all = Rows(logits);
-                    Compare($"{name} decode@{t}", cpu[t], all.AsSpan(all.Length - vocab, vocab).ToArray(), 0.03, ref worst);
+                    Compare($"{name} decode@{t}", cpu[t], all.AsSpan(all.Length - vocab, vocab).ToArray(), 0.02, ref worst);
                 }
             }
 
@@ -134,9 +137,67 @@ public sealed class Gemma2GpuParityTests
             using (ITensor logits = model.Forward(Tokens, Enumerable.Range(0, Tokens.Length).ToArray(), -1, kvCache: null))
             {
                 float[] all = Rows(logits);
-                Compare($"{name} cacheless", cpu[Tokens.Length - 1], all.AsSpan(all.Length - vocab, vocab).ToArray(), 0.03, ref worst);
+                Compare($"{name} cacheless", cpu[Tokens.Length - 1], all.AsSpan(all.Length - vocab, vocab).ToArray(), 0.02, ref worst);
             }
             _output.WriteLine($"{name}: Vulkan vs CPU worst |diff| = {worst:E3} over prefill + 6 decode steps + cacheless.");
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { /* best-effort */ }
+        }
+    }
+
+    /// <summary>
+    /// The scheduler's fused batched decode (<c>ForwardBatch</c>, at least 2 "simple" sequences) runs a
+    /// dense Llama-style layer loop with no GeGLU / embedding scale / post-norms / soft-caps, and was
+    /// reachable by Gemma because its "simple" classification never looked at the architecture.
+    /// Gemma sequences must take the per-sequence path (or a path that implements those ops).
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Fixtures))]
+    public void Vulkan_ForwardBatch_MatchesCpu(string name, SyntheticGemma2Config cfg)
+    {
+        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device available on this host.");
+
+        int[] seqA = Tokens;
+        int[] seqB = Tokens.Select((t, i) => i == 0 ? 2 : (t * 7 + 3) % 90 + 4).ToArray();
+        string path = WriteFixture(cfg);
+        try
+        {
+            float[][] cpuA = CpuRows(path, seqA, out int vocab);
+            float[][] cpuB = CpuRows(path, seqB, out _);
+
+            using var gguf = GgufFile.Open(path);
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            using var model = VulkanTransformerModel.LoadFromGguf(gguf, config, ResolveSpvDir());
+            using var cacheA = model.CreateKvCache(maxSeqLen: seqA.Length + 1);
+            using var cacheB = model.CreateKvCache(maxSeqLen: seqB.Length + 1);
+
+            // Prefill both sequences up to PrefillLen via the ordinary per-sequence path...
+            foreach (var (seq, cache) in new[] { (seqA, cacheA), (seqB, cacheB) })
+            {
+                using ITensor l = model.Forward(seq.AsSpan(0, PrefillLen).ToArray(),
+                    Enumerable.Range(0, PrefillLen).ToArray(), -1, cache);
+            }
+
+            // ...then decode both together through the fused batched entry point.
+            double worst = 0;
+            for (int t = PrefillLen; t < seqA.Length; t++)
+            {
+                var requests = new[]
+                {
+                    new SequenceForwardRequest { TokenIds = new[] { seqA[t] }, Positions = new[] { t }, KvCache = cacheA },
+                    new SequenceForwardRequest { TokenIds = new[] { seqB[t] }, Positions = new[] { t }, KvCache = cacheB },
+                };
+                IReadOnlyList<ITensor> results = model.ForwardBatch(requests, deviceId: -1);
+                Assert.Equal(2, results.Count);
+                float[] a = Rows(results[0]), b = Rows(results[1]);
+                Compare($"{name} batch A@{t}", cpuA[t], a.AsSpan(a.Length - vocab, vocab).ToArray(), 0.02, ref worst);
+                Compare($"{name} batch B@{t}", cpuB[t], b.AsSpan(b.Length - vocab, vocab).ToArray(), 0.02, ref worst);
+                foreach (var r in results) r.Dispose();
+            }
+            _output.WriteLine($"{name}: Vulkan ForwardBatch vs CPU worst |diff| = {worst:E3}.");
         }
         finally
         {
