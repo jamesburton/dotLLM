@@ -22,6 +22,7 @@ public static class PropsEndpoint
                 VocabSize = state.Config?.VocabSize ?? 0,
                 MaxSequenceLength = state.Config?.MaxSequenceLength ?? 0,
                 Device = state.Options.Device,
+                ResolvedDevice = state.Options.ResolvedDevice,
                 GpuLayers = state.Options.GpuLayers,
                 Threads = threading.EffectiveThreadCount,
                 SamplingDefaults = ToDto(state.SamplingDefaults),

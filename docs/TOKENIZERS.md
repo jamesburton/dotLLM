@@ -72,6 +72,28 @@ are present (files without merges keep the SentencePiece longest-match fallback)
 Oracle-pinned parity tests: `Gemma4TokenizerParityTests` (integration, vs
 `llama-tokenize --ids`) and `Gemma4BpeTokenizerTests` (unit, synthetic vocab).
 
+### WordPiece (BERT, `tokenizer.ggml.model = "bert"`)
+
+`DotLLM.Tokenizers.WordPiece.WordPieceTokenizer` (issue #738) implements HF `BertTokenizer`
+semantics for embedding encoders: NFC, clean (drop NUL/U+FFFD/control, whitespace to space), CJK
+ideographs padded with spaces, optional lower-casing + accent stripping (NFD, drop `Mn`),
+punctuation split (all ASCII non-alphanumerics + Unicode `P*`), greedy longest-match with `##`
+continuation, whole word to `[UNK]` when unsegmentable or longer than 100 code points. `Encode`
+returns `[CLS] ... [SEP]`; literal `[CLS]`/`[SEP]`/`[MASK]`/... in the text map to their ids.
+
+- **GGUF**: llama.cpp stores the vocabulary in "WPM" form: word-initial pieces prefixed `▁`,
+  continuations bare (`##` stripped), bracketed specials untouched. `FromGgufTokens` converts to the
+  canonical form. CLS/SEP ids come from `cls_token_id`/`seperator_token_id` (sic) or, in older files,
+  `bos_token_id`/`eos_token_id`; anything missing is resolved by string. `GgufTokenizerFactory.Load`
+  dispatches `bert` to this tokenizer and everything else to the BPE factory.
+- **tokenizer.json**: `HfWordPieceLoader.Parse` (`model.type == "WordPiece"`; honours
+  `BertNormalizer` / `Lowercase` / `StripAccents`).
+- Validated: exact id parity with HF `tokenizers` on 18 sentences (accents, CJK, Korean, symbols,
+  control characters, over-long word, literal specials) through both paths
+  (`BertWordPieceParityTests`). llama.cpp b9016's `/tokenize` on the same GGUF was also measured on 9
+  sentences (incl. accents and CJK) and is id-identical to HF, so there is no known deviation from
+  llama.cpp either.
+
 ### HuggingFace tokenizer.json
 
 JSON format containing: model type, vocabulary, merges, pre-tokenizer config, normalizer, post-processor, added tokens. Full specification of the tokenization pipeline.

@@ -223,3 +223,13 @@ dotnet test tests/DotLLM.Tests.Unit --filter FullyQualifiedName~Vulkan
 ```
 
 Opt out on CI without a usable driver: `DOTLLM_SKIP_VULKAN=1`.
+
+## Gemma-4 dense variant (E2B/E4B) (issue #734)
+
+Supported: per-layer embeddings (PLE), trailing shared-KV layers, proportional `rope_freqs`, mixed head dim 256/512, dense GeGLU FFN, layer output scale, final logit soft-cap.
+
+- PLE inputs are computed on the host with the CPU-oracle code (`Gemma4PerLayerInputs`) and uploaded layer-major; each layer copies its `[seq, pleDim]` slice and runs gate matmul -> GeGLU -> proj matmul -> post-norm -> add on the device.
+- Shared layers read the donor layer's `VulkanKvCache` lines (cacheless: a 2-slot donor stash).
+- `rope_freqs` is accepted only in the released `{1.0 x n, 1e30 x rest}` form (mapped onto partial rotary); any other table throws at load.
+- Not supported: layer-split pipeline stages, TurboQuant KV, and the fused `ForwardBatch` path (falls back to per-sequence forwards).
+- Measured on Strix Halo (gfx1151), Q4_K_M: decode 36.5 tok/s, prefill 381 tok/s at 128 tokens; wikitext PPL within 0.04% of CPU (see PR).

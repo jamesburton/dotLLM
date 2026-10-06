@@ -34,6 +34,11 @@ public sealed record PropsResponse
     [JsonPropertyName("device")]
     public string Device { get; init; } = "cpu";
 
+    /// <summary>Device actually used when <c>device</c> is <c>auto</c> (null otherwise).</summary>
+    [JsonPropertyName("resolved_device")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ResolvedDevice { get; init; }
+
     [JsonPropertyName("gpu_layers")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? GpuLayers { get; init; }
