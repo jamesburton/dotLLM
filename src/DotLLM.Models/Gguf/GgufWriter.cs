@@ -39,6 +39,15 @@ public sealed class GgufWriter
     public GgufWriter AddBool(string key, bool value) =>
         AddMetadata(key, GgufValueType.Bool, w => w.Write((byte)(value ? 1 : 0)));
 
+    /// <summary>Adds a Bool array metadata entry.</summary>
+    public GgufWriter AddBoolArray(string key, bool[] values) =>
+        AddMetadata(key, GgufValueType.Array, w =>
+        {
+            w.Write((uint)GgufValueType.Bool);
+            w.Write((ulong)values.Length);
+            foreach (bool v in values) w.Write((byte)(v ? 1 : 0));
+        });
+
     /// <summary>Adds an Int32 array metadata entry.</summary>
     public GgufWriter AddInt32Array(string key, int[] values) =>
         AddMetadata(key, GgufValueType.Array, w =>

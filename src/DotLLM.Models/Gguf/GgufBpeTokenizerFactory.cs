@@ -40,7 +40,7 @@ public static class GgufBpeTokenizerFactory
         // BOS-less stream and get garbage. Scoped to those architectures on purpose — the other
         // SPM/BPE models keep the historical BOS-agnostic Encode (their chat templates carry BOS).
         string arch = metadata.GetStringOrDefault("general.architecture", "");
-        if (arch is "gemma" or "gemma2")
+        if (arch is "gemma" or "gemma2" or "gemma3")
             tokenizer.AddBosToken = GgufAddBosResolver.Resolve(metadata);
 
         return tokenizer;

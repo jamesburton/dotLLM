@@ -11,7 +11,7 @@ using Xunit.Abstractions;
 namespace DotLLM.Tests.Integration.Backends;
 
 /// <summary>
-/// GGUF <c>gemma</c> / <c>gemma2</c> GPU parity (#736): each GPU backend must reproduce the CPU
+/// GGUF <c>gemma</c> / <c>gemma2</c> / <c>gemma3</c> GPU parity (#736, #763): each GPU backend must reproduce the CPU
 /// backend's per-position logits on the synthetic fixtures — through BOTH the prefill path and
 /// the single-token KV-cache decode path (split-KV flash-decoding engages from ~17 tokens of
 /// context, so the sequence is deliberately longer than that).
@@ -44,10 +44,23 @@ public sealed class Gemma2GpuParityTests
         // Real Gemma-2 head dim (256) — the size at which f16 attention inputs broke Qwen3.5 (#NLL regression).
         yield return new object[] { "gemma2-8L-hd256-win5", new SyntheticGemma2Config
             { Layers = 8, HeadDim = 256, SlidingWindow = 5, AttnSoftcap = 4.0f, FinalSoftcap = 3.0f } };
+        // Gemma 3 (#763): QK-norm + dual RoPE (7000 local / 50000 global with linear x8 on the global layers only) +
+        // 1-in-3 global pattern with a window of 3 against 24 tokens. Distinct bases so a single-table bug diverges.
+        yield return new object[] { "gemma3-12L-hd8-win3-pat3", new SyntheticGemma2Config { Arch = "gemma3", Layers = 12 } };
+        // Real Gemma-3 head dim (256), GQA, odd pattern/window.
+        yield return new object[] { "gemma3-8L-hd256-win5-pat4", new SyntheticGemma2Config
+            { Arch = "gemma3", Layers = 8, HeadDim = 256, SlidingWindow = 5, SlidingPattern = 4 } };
         // Gemma 1 / CodeGemma shape: two-norm, MQA (1 KV head), no caps, no window.
         yield return new object[] { "gemma1-4L-mqa", new SyntheticGemma2Config
             { Arch = "gemma", Layers = 4, KvHeads = 1, HeadDim = 32 } };
     }
+
+    private static Architecture ExpectedArch(SyntheticGemma2Config cfg) => cfg.Arch switch
+    {
+        "gemma2" => Architecture.Gemma2,
+        "gemma3" => Architecture.Gemma3,
+        _ => Architecture.Gemma,
+    };
 
     private static string WriteFixture(SyntheticGemma2Config cfg)
     {
@@ -111,7 +124,7 @@ public sealed class Gemma2GpuParityTests
 
             using var gguf = GgufFile.Open(path);
             var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
-            Assert.Equal(cfg.Arch == "gemma2" ? Architecture.Gemma2 : Architecture.Gemma, config.Architecture);
+            Assert.Equal(ExpectedArch(cfg), config.Architecture);
             using var model = VulkanTransformerModel.LoadFromGguf(gguf, config, ResolveSpvDir());
 
             double worst = 0;
@@ -171,7 +184,7 @@ public sealed class Gemma2GpuParityTests
             using (gguf)
             using (model)
             {
-                Assert.Equal(cfg.Arch == "gemma2" ? Architecture.Gemma2 : Architecture.Gemma, config.Architecture);
+                Assert.Equal(ExpectedArch(cfg), config.Architecture);
                 double worst = 0;
                 const double abs = 0.05;   // FP16 weights + FP16 logits head + FP16 KV store
 
