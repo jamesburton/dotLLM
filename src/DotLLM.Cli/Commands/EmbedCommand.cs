@@ -51,6 +51,7 @@ internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
 
     public override unsafe int Execute(CommandContext context, Settings s)
     {
+        Console.OutputEncoding = new UTF8Encoding(false);
         string? path = GgufFileResolver.Resolve(s.Model, s.Quant);
         if (path is null) { Console.Error.WriteLine($"Model not found: {s.Model}"); return 1; }
 
@@ -119,8 +120,10 @@ internal sealed class EmbedCommand : Command<EmbedCommand.Settings>
     {
         var list = new List<string>();
         if (!Console.IsInputRedirected) return list;
+        // Console.In decodes with the OEM code page on Windows, which mangles non-ASCII text; read raw UTF-8.
+        using var reader = new StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false));
         string? line;
-        while ((line = Console.In.ReadLine()) is not null)
+        while ((line = reader.ReadLine()) is not null)
             if (line.Length > 0) list.Add(line);
         return list;
     }
