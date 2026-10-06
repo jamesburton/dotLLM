@@ -194,7 +194,7 @@ public static class ChatCompletionEndpoint
 
         if (request.Stream)
             await HandleStreamingAsync(request, generator, state, httpContext, prompt, options,
-                requestId, modelId, tools, effectiveToolParser, adapter, ct);
+                requestId, modelId, tools, effectiveToolParser, adapter, ct, forcedToolCall);
         else
             await HandleNonStreamingAsync(request, generator, state, httpContext, prompt, options,
                 requestId, modelId, tools, effectiveToolParser, adapter, ct);
@@ -290,7 +290,7 @@ public static class ChatCompletionEndpoint
         // the constrained output.
         if (toolParser is not null && tools is { Length: > 0 })
         {
-            var enriched = ToolCallDetector.DetectToolCalls(result, toolParser);
+            var enriched = ToolCallDetector.DetectToolCalls(result, toolParser, tools);
             text = enriched.Text;
             toolCalls = ApplyParallelToolCalls(enriched.ToolCalls, request.ParallelToolCalls);
             finishReason = enriched.FinishReason;
@@ -367,7 +367,7 @@ public static class ChatCompletionEndpoint
             ? options
             : options with { Seed = unchecked(options.Seed.Value + index) };
 
-    private static async Task HandleStreamingAsync(
+    private static Task HandleStreamingAsync(
         ChatCompletionRequest request,
         TextGenerator generator,
         ServerState state,
@@ -378,7 +378,28 @@ public static class ChatCompletionEndpoint
         ToolDefinition[]? tools,
         IToolCallParser? toolParser,
         DotLLM.Core.Lora.ILoraAdapter? adapter,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool forcedToolCall = false)
+        => WriteChatStreamAsync(
+            httpContext, request,
+            innerCt => generator.GenerateStreamingTokensAsync(prompt, options, innerCt, adapter),
+            state.ExecuteAsync, requestId, modelId, tools, toolParser, ct, forcedToolCall);
+
+    /// <summary>
+    /// Emits the OpenAI SSE chunk sequence for one streaming chat completion. The token source and the
+    /// model gate are injected so the wire behaviour (tool-call suppression, final <c>tool_calls</c>
+    /// chunk, usage chunk) is testable without a model.
+    /// </summary>
+    internal static async Task WriteChatStreamAsync(
+        HttpContext httpContext,
+        ChatCompletionRequest request,
+        Func<CancellationToken, IAsyncEnumerable<GenerationToken>> tokenSource,
+        Func<Func<Task>, CancellationToken, Task> execute,
+        string requestId, string modelId,
+        ToolDefinition[]? tools,
+        IToolCallParser? toolParser,
+        CancellationToken ct,
+        bool forcedToolCall = false)
     {
         // No Connection header: it is connection-specific and illegal over HTTP/2+. See SseResponse.
         SseResponse.ApplyHeaders(httpContext);
@@ -400,14 +421,38 @@ public static class ChatCompletionEndpoint
         InferenceTimings? timings = null;
         int completionTokens = 0;
 
-        await state.ExecuteAsync(async () =>
+        // Tool-call markup must not ALSO go out as delta.content: the same payload would be reported
+        // twice (as text, then as the final chunk's tool_calls) and a client would print raw
+        // `<tool_call>...` / `<|tool_call>call:...` at the user. Mirrors the Messages endpoint: prose
+        // before the call still streams; from the moment the model-family parser recognises a call
+        // the rest is held back. Under a forced tool_choice (generic parser, bare JSON) the whole
+        // completion is the call, so everything is held back.
+        // A GenericToolCallParser as the MODEL's own parser (unknown architecture) is heuristic and
+        // would swallow JSON-ish prose, so only a forced choice or a marker-based parser suppresses.
+        bool hasTools = toolParser is not null && tools is { Length: > 0 };
+        bool forcedCall = hasTools && forcedToolCall;
+        var suppressor = hasTools && !forcedCall && toolParser is not DotLLM.Tokenizers.ToolCallParsers.GenericToolCallParser
+            ? new StreamingToolCallAccumulator(toolParser!)
+            : null;
+        int emittedLength = 0;
+
+        await execute(async () =>
         {
-            await foreach (var token in generator.GenerateStreamingTokensAsync(prompt, options, ct, adapter))
+            await foreach (var token in tokenSource(ct))
             {
                 if (token.Text.Length > 0)
                 {
                     completionTokens++;
                     sb.Append(token.Text);
+                    if (forcedCall || (suppressor?.Append(token.Text) ?? false))
+                    {
+                        if (token.FinishReason.HasValue)
+                        {
+                            finishReason = token.FinishReason.Value;
+                            timings = token.Timings;
+                        }
+                        continue;
+                    }
                     var tokenLogprobs = token.Logprobs.HasValue
                         ? RequestConverter.ToLogprobsDto(token.Logprobs.Value)
                         : null;
@@ -422,6 +467,7 @@ public static class ChatCompletionEndpoint
                         }],
                     };
                     await WriteSseChunk(httpContext, contentChunk, ct);
+                    emittedLength += token.Text.Length;
                 }
 
                 if (token.FinishReason.HasValue)
@@ -438,9 +484,21 @@ public static class ChatCompletionEndpoint
         // #456: see the non-streaming path — the effective parser honours tool_choice.
         if (toolParser is not null && tools is { Length: > 0 })
         {
-            toolCalls = ApplyParallelToolCalls(toolParser.TryParse(text), request.ParallelToolCalls);
+            toolCalls = ApplyParallelToolCalls(toolParser.TryParse(text, tools), request.ParallelToolCalls);
             if (toolCalls is { Length: > 0 })
                 finishReason = FinishReason.ToolCalls;
+        }
+
+        // Text held back as "probably a tool call" that did not parse into one (a truncated call,
+        // a forced choice that ran out of tokens) is still the model's answer: deliver it.
+        if (toolCalls is not { Length: > 0 } && emittedLength < text.Length)
+        {
+            await WriteSseChunk(httpContext, new ChatCompletionChunk
+            {
+                Id = requestId,
+                Model = modelId,
+                Choices = [new ChatChunkChoiceDto { Delta = new ChatDeltaDto { Content = text[emittedLength..] } }],
+            }, ct);
         }
 
         // Final chunk with finish_reason

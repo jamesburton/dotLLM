@@ -13,17 +13,18 @@ public static class ToolCallDetector
     /// </summary>
     /// <param name="response">The original inference response.</param>
     /// <param name="parser">The model-specific tool call parser.</param>
+    /// <param name="tools">The request's tool definitions, used to coerce argument types; may be null.</param>
     /// <returns>
     /// A new response with <see cref="InferenceResponse.ToolCalls"/> populated
     /// and <see cref="InferenceResponse.FinishReason"/> set to <see cref="FinishReason.ToolCalls"/>
     /// if tool calls were detected. Otherwise, the original response unchanged.
     /// </returns>
-    public static InferenceResponse DetectToolCalls(InferenceResponse response, IToolCallParser parser)
+    public static InferenceResponse DetectToolCalls(InferenceResponse response, IToolCallParser parser, IReadOnlyList<ToolDefinition>? tools = null)
     {
         if (string.IsNullOrEmpty(response.Text))
             return response;
 
-        var toolCalls = parser.TryParse(response.Text);
+        var toolCalls = parser.TryParse(response.Text, tools);
         if (toolCalls is not { Length: > 0 })
             return response;
 

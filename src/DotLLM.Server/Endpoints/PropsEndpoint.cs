@@ -31,6 +31,7 @@ public static class PropsEndpoint
                 MtpStatus = state.IsReady ? state.MtpStatus : null,
                 DeviceFallbackWarning = state.IsReady ? state.DeviceFallbackWarning : null,
                 IsReady = state.IsReady,
+                Version = DotLLM.Core.BuildInfo.Version,
             };
         });
 

@@ -17,7 +17,9 @@ app.Configure(config =>
     // exception (type, message, stack) with DOTLLM_DEBUG_ERRORS=1.
     if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_DEBUG_ERRORS"), "1", StringComparison.Ordinal))
         config.PropagateExceptions();
-    config.SetApplicationVersion("0.1.0");
+    // The assembly informational version (0.3.0-dev.N+sha), not a literal: a harness must be able to
+    // tell which build it is talking to (#774).
+    config.SetApplicationVersion(DotLLM.Core.BuildInfo.Version);
     // Spectre.Console.Cli's example validation uses reflection that doesn't work under Native AOT
     if (RuntimeFeature.IsDynamicCodeSupported)
         config.ValidateExamples();

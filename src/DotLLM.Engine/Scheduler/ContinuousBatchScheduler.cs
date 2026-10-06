@@ -247,7 +247,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         {
             var list = new List<IStopCondition>(capacity: 2 + options.StopSequences.Count)
             {
-                new EosStopCondition(_tokenizer.EosTokenId),
+                EndOfGenerationTokens.CreateStopCondition(_tokenizer),
                 new MaxTokensStopCondition(maxTokens),
             };
             foreach (var stopSeq in options.StopSequences)

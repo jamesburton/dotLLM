@@ -100,6 +100,57 @@ internal static class ToolCallJsonHelper
         return null;
     }
 
+    /// <summary>
+    /// Collects every top-level JSON tool call in <paramref name="text"/> — one or several objects/arrays
+    /// separated by whitespace, <c>;</c> or <c>,</c> (Llama 3.x emits parallel calls as
+    /// <c>{...}; {...}</c> as well as a JSON array). Call ids are renumbered sequentially.
+    /// </summary>
+    /// <param name="text">Text following the tool-call marker.</param>
+    /// <param name="requireWholeText">When true, anything other than separators between/after the values
+    /// makes the result null (used when there is no marker, so prose that quotes JSON is not a call).</param>
+    public static ToolCall[]? ParseAll(string text, bool requireWholeText)
+    {
+        var calls = new List<ToolCall>();
+        int i = 0;
+        while (i < text.Length)
+        {
+            char c = text[i];
+            if (c is '{' or '[')
+            {
+                string candidate = ExtractBalancedJson(text, i);
+                if (candidate.Length == 0)
+                {
+                    if (requireWholeText) return null;
+                    i++;
+                    continue;
+                }
+
+                var parsed = ParseToolCallJson(candidate, "call");
+                if (parsed is { Length: > 0 })
+                    calls.AddRange(parsed);
+                else if (requireWholeText)
+                    return null;
+                i += candidate.Length;
+            }
+            else if (char.IsWhiteSpace(c) || c is ';' or ',')
+            {
+                i++;
+            }
+            else
+            {
+                if (requireWholeText) return null;
+                i++;
+            }
+        }
+
+        if (calls.Count == 0)
+            return null;
+        for (int k = 0; k < calls.Count; k++)
+            if (calls[k].Id.StartsWith("call_", StringComparison.Ordinal))
+                calls[k] = calls[k] with { Id = $"call_{k}" };
+        return calls.ToArray();
+    }
+
     private static ToolCall[]? ParseArray(JsonElement array, string idPrefix)
     {
         var calls = new List<ToolCall>();
@@ -123,19 +174,41 @@ internal static class ToolCallJsonHelper
 
     private static ToolCall? ParseSingle(JsonElement obj, string idPrefix, int index)
     {
-        // Extract function name
-        if (!obj.TryGetProperty("name", out var nameProp) || nameProp.ValueKind != JsonValueKind.String)
-            return null;
+        // Extract function name. Canonical: {"name": "f", ...}. Seen from small Llama models:
+        //   {"type":"function","function":"f","parameters":{...}}          (function = the name)
+        //   {"type":"function","function":{"name":"f","arguments":{...}}}  (OpenAI envelope)
+        JsonElement argsHolder = obj;
+        string? functionName = null;
+        if (obj.TryGetProperty("name", out var nameProp) && nameProp.ValueKind == JsonValueKind.String)
+        {
+            functionName = nameProp.GetString();
+        }
+        else if (obj.TryGetProperty("function", out var fnProp))
+        {
+            if (fnProp.ValueKind == JsonValueKind.String)
+            {
+                functionName = fnProp.GetString();
+            }
+            else if (fnProp.ValueKind == JsonValueKind.Object
+                     && fnProp.TryGetProperty("name", out var innerName) && innerName.ValueKind == JsonValueKind.String)
+            {
+                functionName = innerName.GetString();
+                // Arguments live inside the envelope unless the outer object carries them.
+                if (!obj.TryGetProperty("arguments", out _) && !obj.TryGetProperty("parameters", out _))
+                    argsHolder = fnProp;
+            }
+        }
 
-        string functionName = nameProp.GetString()!;
+        if (string.IsNullOrEmpty(functionName))
+            return null;
 
         // Extract arguments — try "arguments" first, fall back to "parameters" (Llama convention)
         string arguments = "{}";
-        if (obj.TryGetProperty("arguments", out var argsProp))
+        if (argsHolder.TryGetProperty("arguments", out var argsProp))
         {
             arguments = SerializeValue(argsProp);
         }
-        else if (obj.TryGetProperty("parameters", out var paramsProp))
+        else if (argsHolder.TryGetProperty("parameters", out var paramsProp))
         {
             arguments = SerializeValue(paramsProp);
         }

@@ -744,7 +744,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         }
 
         // Check for tool calls
-        ToolCall[]? detectedCalls = toolCallParser?.TryParse(assistantText);
+        ToolCall[]? detectedCalls = toolCallParser?.TryParse(assistantText, tools);
 
         if (detectedCalls is { Length: > 0 })
         {
