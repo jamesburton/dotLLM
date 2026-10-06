@@ -105,6 +105,13 @@ public static partial class GgufModelConfigExtractor
         if (architecture == Architecture.Gemma2 && slidingWindowSize is not null)
             slidingWindowPattern = 2;
 
+        // Gemma 3: window pattern is per-layer (llama.cpp load_swa_pattern(ml, 6)); modelled as an
+        // explicit per-layer list so every backend resolves it identically (CPU/Vulkan/CUDA all
+        // consult PerLayerSlidingWindow before the scalar pattern).
+        IReadOnlyList<int?>? perLayerSlidingWindow = architecture == Architecture.Gemma3 && slidingWindowSize is not null
+            ? BuildGemma3PerLayerSlidingWindow(metadata, arch, numTrunkLayers, slidingWindowSize.Value)
+            : null;
+
         int vocabSize = ResolveVocabSize(metadata, arch);
 
         string? chatTemplate = metadata.GetStringOrDefault("tokenizer.chat_template", null!);
@@ -112,6 +119,18 @@ public static partial class GgufModelConfigExtractor
             chatTemplate = null;
 
         RoPEConfig? ropeConfig = ExtractRoPEConfig(metadata, arch, headDim, architecture);
+
+        // Gemma 3 dual RoPE (llama.cpp gemma3.cpp: get_rope_freq_base/scale per layer): windowed layers
+        // use rope.freq_base_swa (default 10000, scale 1); global layers use rope.freq_base (1e6) and the
+        // GGUF linear scaling (4B+: factor 8). RoPEConfig carries the LOCAL table, GlobalRoPEConfig the
+        // global one (selected per layer via IsFullAttentionLayer).
+        RoPEConfig? globalRopeConfig = null;
+        if (architecture == Architecture.Gemma3 && ropeConfig is { } gr)
+        {
+            globalRopeConfig = gr;
+            float localTheta = metadata.GetFloat32OrDefault($"{arch}.rope.freq_base_swa", 10000.0f);
+            ropeConfig = new RoPEConfig(Theta: localTheta, DimensionCount: gr.DimensionCount, Type: gr.Type);
+        }
 
         // Mistral-3 / Ministral-3 attention temperature (llama.cpp mistral3.cpp): Q *= log(floor(pos/n_ctx_orig_yarn)+1)*scale+1.
         float attnTempScale = 0f;
@@ -181,7 +200,10 @@ public static partial class GgufModelConfigExtractor
         }
 
         bool isGemma2 = architecture == Architecture.Gemma2;
-        bool isGemmaFamily = architecture is Architecture.Gemma or Architecture.Gemma2;
+        bool isGemma3 = architecture == Architecture.Gemma3;
+        // Gemma 3 removed the soft-caps (final_logit_softcapping is only written when non-zero).
+        float g3FinalCap = isGemma3 ? metadata.GetFloat32OrDefault($"{arch}.final_logit_softcapping", 0.0f) : 0f;
+        bool isGemmaFamily = architecture is Architecture.Gemma or Architecture.Gemma2 or Architecture.Gemma3;
 
         return new ModelConfig
         {
@@ -204,9 +226,16 @@ public static partial class GgufModelConfigExtractor
             EmbeddingScale = isGemmaFamily ? MathF.Sqrt(hiddenSize) : null,
             TiedEmbeddings = isGemmaFamily,
             AttnLogitSoftcap = isGemma2 ? metadata.GetFloat32OrDefault($"{arch}.attn_logit_softcapping", 50.0f) : null,
-            FinalLogitSoftcap = isGemma2 ? metadata.GetFloat32OrDefault($"{arch}.final_logit_softcapping", 30.0f) : null,
-            QueryPreAttnScalar = isGemma2 ? ResolveGemma2QueryPreAttnScalar(numTrunkLayers, hiddenSize, numAttentionHeads, headDim) : null,
+            FinalLogitSoftcap = isGemma2 ? metadata.GetFloat32OrDefault($"{arch}.final_logit_softcapping", 30.0f)
+                : g3FinalCap > 0f ? g3FinalCap : null,
+            // Gemma 3 uses the same size rule as Gemma 2 (llama.cpp gemma3.cpp: only the 62-layer 27B
+            // scales by n_embd/n_head, everything else by n_embd_head_k).
+            QueryPreAttnScalar = isGemma2 ? ResolveGemma2QueryPreAttnScalar(numTrunkLayers, hiddenSize, numAttentionHeads, headDim)
+                : isGemma3 ? ResolveGemma3QueryPreAttnScalar(numTrunkLayers, hiddenSize, numAttentionHeads, headDim)
+                : null,
             RoPEConfig = ropeConfig,
+            GlobalRoPEConfig = globalRopeConfig,
+            PerLayerSlidingWindow = perLayerSlidingWindow,
             AttnTemperatureScale = attnTempScale,
             AttnTemperatureFloorScale = attnTempFloor,
             PositionEncodingType = ropeConfig.HasValue ? PositionEncodingType.RoPE : PositionEncodingType.None,
@@ -231,6 +260,38 @@ public static partial class GgufModelConfigExtractor
     /// </summary>
     internal static float ResolveGemma2QueryPreAttnScalar(int numLayers, int hiddenSize, int numHeads, int headDim)
         => numLayers == 46 ? (float)(hiddenSize / numHeads) : headDim;
+
+    /// <summary>
+    /// Gemma 3 attention-score scale operand. llama.cpp <c>gemma3.cpp</c>: <c>f_attention_scale</c> is
+    /// <c>1/sqrt(n_embd / n_head)</c> for the 62-layer 27B and <c>1/sqrt(n_embd_head_k)</c> otherwise
+    /// (the 270M/1B/4B/12B all have <c>query_pre_attn_scalar == head_dim == 256</c>).
+    /// </summary>
+    internal static float ResolveGemma3QueryPreAttnScalar(int numLayers, int hiddenSize, int numHeads, int headDim)
+        => numLayers == 62 ? (float)(hiddenSize / numHeads) : headDim;
+
+    /// <summary>
+    /// Gemma 3 per-layer sliding-window list (llama.cpp <c>load_swa_pattern(ml, 6)</c>): an explicit
+    /// <c>{arch}.attention.sliding_window_pattern</c> array wins (true = windowed), else the scalar
+    /// pattern N (default 6) marks layers with <c>il % N &lt; N-1</c> windowed and every Nth layer global.
+    /// </summary>
+    internal static int?[] BuildGemma3PerLayerSlidingWindow(GgufMetadata metadata, string arch, int numLayers, int window)
+    {
+        string key = $"{arch}.attention.sliding_window_pattern";
+        int[] flags = GetIntArrayOrEmpty(metadata, key);
+        var result = new int?[numLayers];
+        if (flags.Length > 0)
+        {
+            for (int i = 0; i < numLayers; i++)
+                result[i] = i < flags.Length && flags[i] != 0 ? window : null;
+            return result;
+        }
+        int pattern = metadata.TryGetValue(key, out var e) && e.Type != GgufValueType.Array
+            ? (int)metadata.GetUInt32OrDefault(key, 6u) : 6;
+        if (pattern <= 0) pattern = 1;
+        for (int i = 0; i < numLayers; i++)
+            result[i] = (i % pattern) < pattern - 1 ? window : null;
+        return result;
+    }
 
     /// <summary>
     /// Reads the GGUF <c>{arch}.pooling_type</c> key. llama.cpp stores the raw
@@ -793,6 +854,8 @@ public static partial class GgufModelConfigExtractor
             // Gemma 1 / CodeGemma (llama.cpp LLM_ARCH_GEMMA) and Gemma 2 (LLM_ARCH_GEMMA2).
             "gemma" => Architecture.Gemma,
             "gemma2" => Architecture.Gemma2,
+            // Gemma 3 text tower (llama.cpp LLM_ARCH_GEMMA3): QK-norm, dual RoPE, 5:1 local/global.
+            "gemma3" => Architecture.Gemma3,
             // BERT-class embedding encoders (#739).
             "bert" => Architecture.Bert,
             "nomic-bert" => Architecture.NomicBert,
@@ -1095,7 +1158,7 @@ public static partial class GgufModelConfigExtractor
         // gemma / gemma2 GGUFs carry NEITHER rope key (llama.cpp falls back to its default
         // freq_base 10000 and rotates the full head); returning null here would silently
         // disable RoPE for them.
-        bool gemmaImplicitRope = architecture is Architecture.Gemma or Architecture.Gemma2;
+        bool gemmaImplicitRope = architecture is Architecture.Gemma or Architecture.Gemma2 or Architecture.Gemma3;
         if (!gemmaImplicitRope && !metadata.ContainsKey(freqBaseKey) && !metadata.ContainsKey(dimCountKey))
             return null;
 
@@ -1128,7 +1191,7 @@ public static partial class GgufModelConfigExtractor
                 or Architecture.GptOss or Architecture.BitNet
                 // llama.cpp llama_model_rope_type: gemma / gemma2 / gemma3 are NEOX, and their
                 // converter does not permute Q/K (HF rotate_half layout).
-                or Architecture.Gemma or Architecture.Gemma2 => RoPEType.NeoX,
+                or Architecture.Gemma or Architecture.Gemma2 or Architecture.Gemma3 => RoPEType.NeoX,
             _ => RoPEType.Norm,
         };
 

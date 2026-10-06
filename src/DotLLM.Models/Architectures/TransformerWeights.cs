@@ -1581,7 +1581,8 @@ internal sealed class TransformerWeights : IDisposable
         // one of these, so they are consumed as plain RMSNorm weights.
         float[]? postAttnNorm = null;
         float[]? postFfnNorm = null;
-        if (config.Architecture == DotLLM.Core.Configuration.Architecture.Gemma2)
+        if (config.Architecture is DotLLM.Core.Configuration.Architecture.Gemma2
+                                or DotLLM.Core.Configuration.Architecture.Gemma3)
         {
             postAttnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.post_attention_norm.weight"], hiddenSize);
             postFfnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.post_ffw_norm.weight"], hiddenSize);

@@ -251,6 +251,18 @@ public static class HfConfigExtractor
             BetaFast: ropeScalingBetaFast,
             BetaSlow: ropeScalingBetaSlow);
 
+        // Gemma 3 dual RoPE (HF Gemma3TextModel: rotary_emb for full-attention layers at rope_theta
+        // (+ linear rope_scaling), rotary_emb_local for sliding layers at rope_local_base_freq, default
+        // 10000, unscaled). RoPEConfig carries the LOCAL table; GlobalRoPEConfig the global one, selected
+        // per layer by IsFullAttentionLayer. Before this the model ran every layer on the global theta.
+        RoPEConfig? globalRopeConfig = null;
+        if (architecture == Architecture.Gemma3)
+        {
+            globalRopeConfig = ropeConfig;
+            float localTheta = GetFloatOrDefault(root, "rope_local_base_freq", 10000.0f);
+            ropeConfig = new RoPEConfig(Theta: localTheta, DimensionCount: headDim, Type: ropeType);
+        }
+
         return new ModelConfig
         {
             Architecture = architecture,
@@ -265,6 +277,7 @@ public static class HfConfigExtractor
             AttentionType = isMla ? AttentionType.MLA : AttentionType.GQA,
             PositionEncodingType = PositionEncodingType.RoPE,
             RoPEConfig = ropeConfig,
+            GlobalRoPEConfig = globalRopeConfig,
             ActivationFunction = activation,
             NormType = NormType.RMSNorm,
             NormEpsilon = normEps,

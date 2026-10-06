@@ -20,6 +20,14 @@ internal static class Gemma2GgufReference
         public bool PostNorms { get; init; } = true;
         public bool QueryPreAttnScalarFromHidden { get; init; } = true;
         public bool EmbedScale { get; init; } = true;
+        /// <summary>Gemma-3: per-head Q/K RMSNorm before RoPE.</summary>
+        public bool QkNorm { get; init; } = true;
+        /// <summary>Gemma-3: windowed layers use rope.freq_base_swa; false = every layer uses the global base.</summary>
+        public bool DualRope { get; init; } = true;
+        /// <summary>Gemma-3: linear RoPE scaling on the global layers only; false = unscaled.</summary>
+        public bool LinearScale { get; init; } = true;
+        /// <summary>Gemma-3: window pattern N (every Nth layer global); false = treat as Gemma-2's even/odd alternation.</summary>
+        public bool Pattern6 { get; init; } = true;
     }
 
     /// <summary>Last-token logits for <paramref name="tokens"/> (positions 0..n-1).</summary>
@@ -27,11 +35,13 @@ internal static class Gemma2GgufReference
     {
         opt ??= new Options();
         var c = wts.Config;
-        bool g2 = c.Arch == "gemma2";
+        bool g3 = c.Arch == "gemma3";
+        bool g2 = c.Arch == "gemma2" || g3;           // four-norm layout
+        bool caps = c.Arch == "gemma2";                // soft-caps are Gemma-2 only
         int H = c.Hidden, hd = c.HeadDim, nh = c.Heads, nkv = c.KvHeads, ff = c.FeedForward, T = tokens.Length;
 
         // llama.cpp: 27B (46 layers) scales by 1/sqrt(n_embd/n_head), everything else by 1/sqrt(head_dim).
-        double qpas = g2 && opt.QueryPreAttnScalarFromHidden && c.Layers == 46 ? (double)(H / nh) : hd;
+        double qpas = g2 && opt.QueryPreAttnScalarFromHidden && c.Layers == (g3 ? 62 : 46) ? (double)(H / nh) : hd;
         double scale = 1.0 / Math.Sqrt(qpas);
 
         var x = new double[T][];
@@ -53,11 +63,26 @@ internal static class Gemma2GgufReference
                 q[t] = MatVec(L.Q, h, nh * hd);
                 k[t] = MatVec(L.K, h, nkv * hd);
                 v[t] = MatVec(L.V, h, nkv * hd);
-                for (int hh = 0; hh < nh; hh++) Rope(q[t], hh * hd, hd, t);
-                for (int hh = 0; hh < nkv; hh++) Rope(k[t], hh * hd, hd, t);
+                if (g3 && opt.QkNorm)
+                {
+                    for (int hh = 0; hh < nh; hh++) NormHead(q[t], hh * hd, hd, L.QNorm!, c.NormEps);
+                    for (int hh = 0; hh < nkv; hh++) NormHead(k[t], hh * hd, hd, L.KNorm!, c.NormEps);
+                }
+                // Gemma-3: global layers (every Nth) use rope.freq_base with linear scale 1/factor; windowed layers
+                // use rope.freq_base_swa at scale 1. Gemma 1/2 use theta 10000 everywhere.
+                int pat = c.SlidingPattern > 0 ? c.SlidingPattern : 6;
+                bool globalLayer = g3 && (opt.Pattern6 ? (l % pat) == pat - 1 : l % 2 != 0);
+                double theta = !g3 ? 10000.0
+                    : (globalLayer || !opt.DualRope) ? c.RopeBase : (c.RopeBaseSwa > 0 ? c.RopeBaseSwa : 10000.0);
+                double lin = g3 && globalLayer && opt.LinearScale && c.RopeLinearFactor > 0 ? 1.0 / c.RopeLinearFactor : 1.0;
+                for (int hh = 0; hh < nh; hh++) Rope(q[t], hh * hd, hd, t, theta, lin);
+                for (int hh = 0; hh < nkv; hh++) Rope(k[t], hh * hd, hd, t, theta, lin);
             }
-            // even layers are sliding on gemma2 (llama.cpp set_swa_pattern(2))
-            bool windowed = g2 && opt.SlidingWindow && c.SlidingWindow > 0 && l % 2 == 0;
+            // gemma2: even layers sliding (llama.cpp set_swa_pattern(2)); gemma3: il % N < N-1 sliding
+            int npat = c.SlidingPattern > 0 ? c.SlidingPattern : 6;
+            bool windowed = g3
+                ? opt.SlidingWindow && c.SlidingWindow > 0 && (opt.Pattern6 ? (l % npat) < npat - 1 : l % 2 == 0)
+                : g2 && opt.SlidingWindow && c.SlidingWindow > 0 && l % 2 == 0;
             for (int t = 0; t < T; t++)
             {
                 var attn = new double[nh * hd];
@@ -71,7 +96,7 @@ internal static class Gemma2GgufReference
                         double s = 0;
                         for (int d = 0; d < hd; d++) s += q[t][hh * hd + d] * k[j][kvh * hd + d];
                         s *= scale;
-                        if (g2 && opt.AttnSoftcap && c.AttnSoftcap > 0) s = c.AttnSoftcap * Math.Tanh(s / c.AttnSoftcap);
+                        if (caps && opt.AttnSoftcap && c.AttnSoftcap > 0) s = c.AttnSoftcap * Math.Tanh(s / c.AttnSoftcap);
                         sc[j - lo] = s;
                     }
                     double mx = sc.Max(), sum = 0;
@@ -103,7 +128,7 @@ internal static class Gemma2GgufReference
         {
             double s = 0;
             for (int i = 0; i < H; i++) s += wts.TokenEmbd[vtok * H + i] * fin[i];
-            if (g2 && opt.FinalSoftcap && c.FinalSoftcap > 0) s = c.FinalSoftcap * Math.Tanh(s / c.FinalSoftcap);
+            if (caps && opt.FinalSoftcap && c.FinalSoftcap > 0) s = c.FinalSoftcap * Math.Tanh(s / c.FinalSoftcap);
             logits[vtok] = s;
         }
         return logits;
@@ -132,13 +157,22 @@ internal static class Gemma2GgufReference
         return r;
     }
 
-    /// <summary>NeoX (rotate_half) RoPE over the full head, theta 10000, in place.</summary>
-    private static void Rope(double[] v, int off, int hd, int pos)
+    /// <summary>Per-head RMSNorm (gain baked as 1+w), in place.</summary>
+    private static void NormHead(double[] v, int off, int hd, float[] w, float eps)
+    {
+        double ss = 0;
+        for (int i = 0; i < hd; i++) ss += v[off + i] * v[off + i];
+        double inv = 1.0 / Math.Sqrt(ss / hd + eps);
+        for (int i = 0; i < hd; i++) v[off + i] = v[off + i] * inv * w[i];
+    }
+
+    /// <summary>NeoX (rotate_half) RoPE over the full head, in place. angle = pos * linScale * theta^(-2i/hd).</summary>
+    private static void Rope(double[] v, int off, int hd, int pos, double theta = 10000.0, double linScale = 1.0)
     {
         int half = hd / 2;
         for (int i = 0; i < half; i++)
         {
-            double ang = pos * Math.Pow(10000.0, -2.0 * i / hd);
+            double ang = pos * linScale * Math.Pow(theta, -2.0 * i / hd);
             double cs = Math.Cos(ang), sn = Math.Sin(ang);
             double a = v[off + i], b = v[off + i + half];
             v[off + i] = a * cs - b * sn;

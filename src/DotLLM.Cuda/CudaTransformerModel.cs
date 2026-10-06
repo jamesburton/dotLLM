@@ -78,7 +78,12 @@ public sealed unsafe class CudaTransformerModel : IModel
     private long _gemmaKvScratchElems;
 
     /// <summary>Per-layer F32 device norm gains for the Gemma forward (post norms are 0 on Gemma 1).</summary>
-    private readonly record struct GemmaNormSet(nint AttnNorm, nint PostAttnNorm, nint FfnNorm, nint PostFfnNorm);
+    private readonly record struct GemmaNormSet(nint AttnNorm, nint PostAttnNorm, nint FfnNorm, nint PostFfnNorm,
+        nint QNorm, nint KNorm);
+
+    // Gemma 3 dual RoPE: [ropeDim/2] F32 device inverse frequencies for the FULL-attention (global) layers
+    // (theta_global with the linear scale folded in). The local table is the model's _ropeTheta/_ropeDim.
+    private nint _gemma3GlobalInvFreq;
 
     // Launch-ceiling profiling (env DOTLLM_PROFILE_LAUNCH=1).
     // Measures CPU-side kernel-dispatch time (queue all launches, no GPU wait) vs the full
@@ -466,12 +471,15 @@ public sealed unsafe class CudaTransformerModel : IModel
         // The gemma4 forward runs the F32 path and uses the host LM head (the tied
         // vocab x hidden table is too large to expand to F32 device scratch), so it
         // also needs the CPU weights retained.
-        _isGemmaFamily = config.Architecture is Architecture.Gemma or Architecture.Gemma2;
+        _isGemmaFamily = IsGemmaDenseFamily(config);
         if (_useHighPrecisionForward || _isGemma4 || _isGemmaFamily)
         {
             _cpuWeights = cpuWeights;
             if (_isGemmaFamily)
+            {
                 UploadGemmaNorms(cpuWeights!);
+                UploadGemma3GlobalRope(config);
+            }
         }
         else
         {
@@ -2700,8 +2708,8 @@ public sealed unsafe class CudaTransformerModel : IModel
         if (config.Gemma4DualFfn)
             return true;
 
-        // Gemma 1/2 keep the host norm gains for the F32 forward's device upload.
-        if (config.Architecture is Architecture.Gemma or Architecture.Gemma2)
+        // Gemma 1/2/3 keep the host norm gains for the F32 forward's device upload.
+        if (IsGemmaDenseFamily(config))
             return true;
 
         // High-precision I-quant forward retains host weights for the dequant→F32→dot CPU
@@ -3381,11 +3389,41 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// </summary>
     internal static void RejectGemmaForCompositeHost(ModelConfig config, string host)
     {
-        if (config.Architecture is Architecture.Gemma or Architecture.Gemma2)
+        if (IsGemmaDenseFamily(config))
             throw new NotSupportedException(
-                $"{config.Architecture} (GGUF 'gemma'/'gemma2') is not supported by {host}: its layer loop has no "
-                + "GeGLU / embedding scale / post-norms / soft-capping. Use CudaTransformerModel (single GPU, "
-                + "FP32 Gemma forward), the CPU backend, or Vulkan.");
+                $"{config.Architecture} (GGUF 'gemma'/'gemma2'/'gemma3') is not supported by {host}: its layer loop has no "
+                + "GeGLU / embedding scale / post-norms / QK-norm / dual RoPE / soft-capping. Use CudaTransformerModel "
+                + "(single GPU, FP32 Gemma forward), the CPU backend, or Vulkan.");
+    }
+
+    /// <summary>
+    /// Gemma 1 / CodeGemma, Gemma 2 and Gemma 3 — the dense Gemma family served by the dedicated
+    /// <c>ForwardGemmaF32</c> path (Gemma 4 / DiffusionGemma have their own MoE forward).
+    /// </summary>
+    internal static bool IsGemmaDenseFamily(ModelConfig config)
+        => config.Architecture is Architecture.Gemma or Architecture.Gemma2 or Architecture.Gemma3;
+
+    /// <summary>
+    /// Builds the Gemma-3 global-layer inverse-frequency table (<c>1/(theta_g^(2i/d) * linearScale)</c>), the
+    /// device-side equivalent of the CPU global cos/sin table (llama.cpp: global layers use freq_base and
+    /// freq_scale = 1/factor, windowed layers freq_base_swa and scale 1). No-op for Gemma 1/2.
+    /// </summary>
+    private void UploadGemma3GlobalRope(ModelConfig config)
+    {
+        if (config.Architecture != Architecture.Gemma3 || config.GlobalRoPEConfig is not RoPEConfig g)
+            return;
+        int dim = g.DimensionCount > 0 ? g.DimensionCount : config.HeadDim;
+        if (dim != _ropeDim)
+            throw new NotSupportedException(
+                $"Gemma-3 local/global RoPE rotate different dim counts ({_ropeDim} vs {dim}); not implemented on CUDA.");
+        float lin = g.ScalingType == RoPEScalingType.Linear && g.ScalingFactor > 1f ? g.ScalingFactor : 1f;
+        var inv = new float[dim / 2];
+        for (int i = 0; i < inv.Length; i++)
+            inv[i] = 1.0f / (MathF.Pow(g.Theta, 2.0f * i / dim) * lin);
+        _context.MakeCurrent();
+        CudaDriverApi.cuMemAlloc_v2(out _gemma3GlobalInvFreq, (nuint)((long)inv.Length * sizeof(float))).ThrowOnError();
+        fixed (float* src = inv)
+            CudaDriverApi.cuMemcpyHtoD_v2(_gemma3GlobalInvFreq, (nint)src, (nuint)((long)inv.Length * sizeof(float))).ThrowOnError();
     }
 
     /// <summary>Uploads the per-layer and output norm gains as F32 device vectors (Gemma family).</summary>
@@ -3406,7 +3444,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         {
             ref readonly var lw = ref cpuWeights.Layers[l];
             sets[l] = new GemmaNormSet(Up(lw.AttnNormWeight), Up(lw.PostAttnNormWeight),
-                Up(lw.FfnNormWeight), Up(lw.PostFfnNormWeight));
+                Up(lw.FfnNormWeight), Up(lw.PostFfnNormWeight), Up(lw.QNormWeight), Up(lw.KNormWeight));
         }
         _gemmaNorms = sets;
         _gemmaOutputNormF32 = Up(cpuWeights.OutputNormWeight);
@@ -3460,7 +3498,8 @@ public sealed unsafe class CudaTransformerModel : IModel
         int kvLen = startPos + seqLen;
 
         _context.MakeCurrent();
-        bool gemma2 = Config.Architecture == Architecture.Gemma2;
+        // Gemma 2 and Gemma 3 share the four-norm layout (post-attn / post-FFN norms before each residual add).
+        bool gemma2 = Config.Architecture is Architecture.Gemma2 or Architecture.Gemma3;
         int hiddenSize = Config.HiddenSize;
         int numHeads = Config.NumAttentionHeads;
         int numKvHeads = Config.NumKvHeads;
@@ -3510,8 +3549,20 @@ public sealed unsafe class CudaTransformerModel : IModel
             ProjectF32(lw.VQuant, lw.VQuantType, lw.V, _state.NormOutputF32, _state.VF32,
                 lw.VOutputDim, lw.VInputDim, seqLen);
 
-            _kernels.LaunchRoPEF32(_state.QF32, _state.KF32, _state.PositionsDevice,
-                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _ropeType, s);
+            // Gemma 3 per-head Q/K RMSNorm (gain [headDim], (1+w) baked) before RoPE; norms.QNorm is 0 otherwise.
+            if (norms.QNorm != 0)
+                _kernels.LaunchRmsNormF32(_state.QF32, norms.QNorm, _state.QF32, headDim, eps, seqLen * numHeads, s);
+            if (norms.KNorm != 0)
+                _kernels.LaunchRmsNormF32(_state.KF32, norms.KNorm, _state.KF32, headDim, eps, seqLen * numKvHeads, s);
+
+            // Gemma 3 dual RoPE: global (full-attention) layers use the pre-folded inverse-frequency table.
+            if (_gemma3GlobalInvFreq != 0 && Config.IsFullAttentionLayer(layer))
+                _kernels.LaunchRoPEF32(_state.QF32, _state.KF32, _state.PositionsDevice,
+                    seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _ropeType, s,
+                    ropeInvFreq: _gemma3GlobalInvFreq);
+            else
+                _kernels.LaunchRoPEF32(_state.QF32, _state.KF32, _state.PositionsDevice,
+                    seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _ropeType, s);
 
             nint kAttn = _state.KF32, vAttn = _state.VF32;
             if (cache is not null)
@@ -4038,6 +4089,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         if (_gemmaKvScratchK != 0) { CudaDriverApi.cuMemFree_v2(_gemmaKvScratchK); _gemmaKvScratchK = 0; }
         if (_gemmaKvScratchV != 0) { CudaDriverApi.cuMemFree_v2(_gemmaKvScratchV); _gemmaKvScratchV = 0; }
         if (_gemmaOutputNormF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemmaOutputNormF32); _gemmaOutputNormF32 = 0; }
+        if (_gemma3GlobalInvFreq != 0) { CudaDriverApi.cuMemFree_v2(_gemma3GlobalInvFreq); _gemma3GlobalInvFreq = 0; }
         if (_gemmaNorms is not null)
         {
             foreach (var n in _gemmaNorms)
@@ -4046,6 +4098,8 @@ public sealed unsafe class CudaTransformerModel : IModel
                 if (n.PostAttnNorm != 0) CudaDriverApi.cuMemFree_v2(n.PostAttnNorm);
                 if (n.FfnNorm != 0) CudaDriverApi.cuMemFree_v2(n.FfnNorm);
                 if (n.PostFfnNorm != 0) CudaDriverApi.cuMemFree_v2(n.PostFfnNorm);
+                if (n.QNorm != 0) CudaDriverApi.cuMemFree_v2(n.QNorm);
+                if (n.KNorm != 0) CudaDriverApi.cuMemFree_v2(n.KNorm);
             }
             _gemmaNorms = null;
         }

@@ -742,6 +742,9 @@ public sealed class VulkanTransformerModel : IModel
     // theta-driven _rope, and the fused rope+KV-write shortcut is bypassed (it only knows theta).
     private RopeInvFreqF32Kernel? _ropeInvFreq;
     private VulkanDevice.Buffer? _ropeInvFreqBuf;
+    // Gemma-3 dual RoPE (local theta / global theta + linear scale): inverse-frequency table for the
+    // FULL-attention (global) layers; _ropeInvFreqBuf then holds the LOCAL table. Null for every other model.
+    private VulkanDevice.Buffer? _globalRopeInvFreqBuf;
     private float _attnTempScale;
     private int _attnTempFloor;
     private readonly AddKernel _add;
@@ -2377,7 +2380,11 @@ public sealed class VulkanTransformerModel : IModel
         if (config.MlaConfig is not null) return;
         float[]? factors = DotLLM.Models.Architectures.DenseRopeFreqFactors.Select(config, factorsRaw, ropeDim);
         bool temp = config.AttnTemperatureScale != 0f;
-        if (factors is null && !temp) return;
+        // Gemma-3 dual RoPE: dense (non-Gemma-4) models carrying a GlobalRoPEConfig rotate their full-attention
+        // layers with a separate theta (+ optional linear scale), which the theta-driven kernels cannot express.
+        bool dual = config.Architecture == DotLLM.Core.Configuration.Architecture.Gemma3
+            && config.GlobalRoPEConfig is not null;
+        if (factors is null && !temp && !dual) return;
         int half = ropeDim / 2;
         var inv = new float[half];
         for (int i = 0; i < half; i++)
@@ -2388,13 +2395,29 @@ public sealed class VulkanTransformerModel : IModel
         _ropeInvFreq = RopeInvFreqF32Kernel.Create(device, spvDir);
         _attnTempScale = config.AttnTemperatureScale;
         _attnTempFloor = temp ? config.AttnTemperatureFloorScale : 0;
+        if (dual)
+        {
+            var g = config.GlobalRoPEConfig!.Value;
+            int gDim = g.DimensionCount > 0 ? g.DimensionCount : config.HeadDim;
+            if (gDim != ropeDim)
+                throw new NotSupportedException(
+                    $"Gemma-3 local/global RoPE rotate different dim counts ({ropeDim} vs {gDim}); not implemented on Vulkan.");
+            float lin = g.ScalingType == RoPEScalingType.Linear && g.ScalingFactor > 1f ? g.ScalingFactor : 1f;
+            var ginv = new float[half];
+            for (int i = 0; i < half; i++)
+                ginv[i] = 1.0f / (MathF.Pow(g.Theta, 2.0f * i / gDim) * lin);
+            _globalRopeInvFreqBuf = device.Allocate((long)half * sizeof(float));
+            device.Upload(ginv.AsSpan(), _globalRopeInvFreqBuf);
+        }
     }
 
     /// <summary>Records the dense Q/K RoPE: the inverse-frequency kernel when #743 features are active, else the theta kernel.</summary>
-    private void RecordDenseRope(nint cmdBuf, int seqLen, int numHeads, int numKvHeads, int headDim)
+    private void RecordDenseRope(nint cmdBuf, int layer, int seqLen, int numHeads, int numKvHeads, int headDim)
     {
         if (_ropeInvFreq is not null)
-            _ropeInvFreq.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer, _ropeInvFreqBuf!,
+            _ropeInvFreq.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
+                _globalRopeInvFreqBuf is not null && Config.IsFullAttentionLayer(_firstLayer + layer)
+                    ? _globalRopeInvFreqBuf : _ropeInvFreqBuf!,
                 seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
                 headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
                 variant: _ropeVariant, tempScale: _attnTempScale, tempFloor: _attnTempFloor);
@@ -3016,7 +3039,7 @@ public sealed class VulkanTransformerModel : IModel
             // Batched RoPE — reads packed positions [totalTokens] and rotates each
             // row independently. Per-seq position semantics are preserved by the
             // packed positions array.
-            RecordDenseRope(cmdBuf, totalTokens, numHeads, numKvHeads, headDim);
+            RecordDenseRope(cmdBuf, layer, totalTokens, numHeads, numKvHeads, headDim);
             BarrierComputeToCompute(cmdBuf);
 
             // Per-seq attention sub-loop. Each seq:
@@ -3621,7 +3644,7 @@ public sealed class VulkanTransformerModel : IModel
             else
             {
                 // RoPE on Q and K
-                RecordDenseRope(cmdBuf, seqLen, numHeads, numKvHeads, headDim);
+                RecordDenseRope(cmdBuf, layer, seqLen, numHeads, numKvHeads, headDim);
                 ProfSample("rope");
                 DpStamp(cmdBuf, DpCatRope);
 
@@ -7273,6 +7296,7 @@ public sealed class VulkanTransformerModel : IModel
         _rope.Dispose();
         _ropeInvFreq?.Dispose();
         _ropeInvFreqBuf?.Dispose();
+        _globalRopeInvFreqBuf?.Dispose();
         _ropeKvWrite?.Dispose();
         _rmsnorm.Dispose();
         _rmsnormMatmulQ8Fused?.Dispose();

@@ -327,7 +327,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             // full-attention layers): folded into the global cos/sin table
             // (angle = pos * θ^(-2i/dim) / factor[i], ggml theta/ff). Null for
             // every model without the tensor.
-            globalFreqFactors: globalRopeDim > 0 ? weights.RopeFreqFactors : null,
+            globalFreqFactors: globalRopeDim > 0
+                ? weights.RopeFreqFactors ?? LinearGlobalRopeFactors(config.GlobalRoPEConfig, globalRopeDim)
+                : null,
             // Dense models (no global table): rope_freqs.weight applies to every layer (#743).
             ropeFreqFactors: DenseRopeFreqFactors.Select(config, weights.RopeFreqFactors, ropeDim));
 
@@ -738,6 +740,21 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         int pattern = Config.SlidingWindowPattern;
         if (pattern <= 0) return _slidingWindowSize;
         return (layer % pattern) < pattern - 1 ? _slidingWindowSize : null;
+    }
+
+    /// <summary>
+    /// Per-pair frequency divisors realising GGUF/HF <c>linear</c> RoPE scaling on the GLOBAL (full-attention)
+    /// table — Gemma-3 4B+ (factor 8, llama.cpp <c>freq_scale = 1/8</c> on global layers only). Linear
+    /// scaling is exactly "angle = pos * theta^(-2i/d) / factor", i.e. the proportional-rope factor table
+    /// with a constant factor. Returns null when the table is unscaled.
+    /// </summary>
+    internal static float[]? LinearGlobalRopeFactors(RoPEConfig? global, int ropeDim)
+    {
+        if (global is not { ScalingType: RoPEScalingType.Linear } g || g.ScalingFactor <= 1.0f)
+            return null;
+        var f = new float[ropeDim / 2];
+        Array.Fill(f, g.ScalingFactor);
+        return f;
     }
 
     /// <summary>
