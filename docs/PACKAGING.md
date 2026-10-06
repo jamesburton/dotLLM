@@ -36,14 +36,16 @@ These builds are **not Authenticode-signed**, so Windows SmartScreen will show "
 This proves *where a file was built*, not *who vouches for it*; it adds no signing identity and keeps no secret in CI. Authenticode
 signing is a separate, later decision (see below).
 
-## NuGet and `dnx` - decision deferred
+## NuGet and `dnx`
 
 `dnx <package>` (.NET 10) runs a dotnet-tool package without installing it, so the CLI is already shaped for it: `DotLLM.Cli` is a
 `PackAsTool` project with command `dotllm`, and its package carries the Vulkan `spv/` shaders (verified: `dnx` ran a locally packed
 build). **The blocker is naming**: upstream owns `DotLLM.Cli`, `DotLLM.Engine`, ... on nuget.org (versions `0.1.0-preview.1-3`), so this
 fork cannot publish under those ids.
 
-The id is `dotllm` (repo variable `DOTLLM_TOOL_PACKAGE_ID`; unset = skip the push). Credentials, in order of preference:
+**Live (2026-10-06):** the tool is published as `dotllm` by trusted publishing from every dev release, and
+`dnx dotllm --prerelease` runs it (a stable version would not need `--prerelease`). nuget.org's registration index lags the push by a few
+minutes, so a brand-new version can be downloadable before `dnx` resolves it. The id is `dotllm` (repo variable `DOTLLM_TOOL_PACKAGE_ID`; unset = skip the push). Credentials, in order of preference:
 
 - **Trusted publishing** (no stored secret): repo variable `NUGET_USER` = the nuget.org profile name, plus a policy on nuget.org
   (Account -> Trusted Publishing: Repository Owner `jamesburton`, Repository `dotLLM`, Workflow File `release.yml`, Environment empty;
