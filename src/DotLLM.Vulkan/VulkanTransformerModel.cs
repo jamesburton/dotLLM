@@ -719,6 +719,9 @@ public sealed class VulkanTransformerModel : IModel
     // created only when Config.EmbeddingScale is set. Null otherwise. Also
     // reused for the Gemma-4 per-layer output scale (layer_output_scale).
     private readonly ScaleInplaceF32Kernel? _embedScale;
+    // Granite residual multiplier (sublayer output scaled before the residual add; 1 = none) and logit divisor (1 = none).
+    private readonly float _residualScale;
+    private readonly float _logitScale;
     // Device-resident Q8_0 token-embedding gather (issue #352). Non-null only when
     // VulkanWeights kept the embedding table in its raw Q8_0 layout instead of
     // widening it to F32; null => the legacy vkCmdCopyBuffer F32 row gather.
@@ -1164,6 +1167,8 @@ public sealed class VulkanTransformerModel : IModel
         _geglu = geglu;
         _relu2glu = relu2glu;
         _embedScale = embedScale;
+        _residualScale = config.ResidualScale ?? 1.0f;
+        _logitScale = config.LogitScale ?? 1.0f;
         _embedGatherQ8 = embedGatherQ8;
         _add = add;
         _biasAdd = biasAdd;
@@ -1775,8 +1780,10 @@ public sealed class VulkanTransformerModel : IModel
             config.ActivationFunction == ActivationFunction.ReluSquared
                 ? ReLU2GluF32Kernel.Create(device, spvDir)
                 : null;
+        // Also created for the Granite residual multiplier (scales each sublayer output in place before the
+        // residual add) — same generic scalar-multiply kernel.
         ScaleInplaceF32Kernel? embedScale =
-            config.EmbeddingScale is float es && es != 1.0f
+            (config.EmbeddingScale is float es && es != 1.0f) || (config.ResidualScale is float rs && rs != 1.0f)
                 ? ScaleInplaceF32Kernel.Create(device, spvDir)
                 : null;
         // Device-resident Q8_0 embedding gather (issue #352) — created only when
@@ -2340,6 +2347,8 @@ public sealed class VulkanTransformerModel : IModel
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private float GetAttentionScaleOverride()
     {
+        // Granite attention_multiplier is the scale itself; Gemma query_pre_attn_scalar is 1/sqrt(value).
+        if (Config.AttentionScale is float granite && granite > 0.0f) return granite;
         return Config.QueryPreAttnScalar is float qpas && qpas > 0.0f
             ? 1.0f / MathF.Sqrt(qpas)
             : 0.0f;
@@ -2850,6 +2859,7 @@ public sealed class VulkanTransformerModel : IModel
             || Config.AttnLogitSoftcap is not null
             || Config.FinalLogitSoftcap is not null
             || Config.QueryPreAttnScalar is not null
+            || Config.HasGraniteScalars
             || Config.IsGemma4DensePle;
         for (int layer = 0; layer < Config.NumLayers && !modelHasMlaOrMoe; layer++)
         {
@@ -3441,10 +3451,10 @@ public sealed class VulkanTransformerModel : IModel
         // architecture that leaves Config.EmbeddingScale null (_embedScale is
         // null), so non-Gemma output is byte-identical. Skipped when seeding
         // from hidden (the first stage already applied it).
-        if (_embedScale is not null && !seedFromHidden)
+        if (_embedScale is not null && Config.EmbeddingScale is float embScaleValue && embScaleValue != 1.0f && !seedFromHidden)
         {
             _embedScale.Record(cmdBuf, _state.HiddenState, seqLen * hiddenSize,
-                Config.EmbeddingScale!.Value);
+                embScaleValue);
             BarrierComputeToCompute(cmdBuf);
         }
 
@@ -3730,6 +3740,7 @@ public sealed class VulkanTransformerModel : IModel
             // barrier) otherwise; the residual add itself happens in the
             // shared code below either way.
             oProjFused = lw.OBias is null && _currentLora is null && lw.PostAttnNormWeight is null
+                && _residualScale == 1.0f
                 && TryRecordMatmulWithResidualQ8_0(cmdBuf, lw.O, lw.ODeviceQuantType,
                     _state.AttnOutput, _state.Residual, _state.AddScratch,
                     lw.OOutputDim, lw.OInputDim, seqLen);
@@ -3765,6 +3776,14 @@ public sealed class VulkanTransformerModel : IModel
             {
                 _rmsnorm.Record(cmdBuf, _state.NormOutput, postAttnNorm1, _state.NormOutput,
                     rowCount: seqLen, n: hiddenSize, eps: eps);
+                BarrierComputeToCompute(cmdBuf);
+            }
+
+            // Granite residual multiplier: scale the attention sublayer output in place BEFORE the residual add
+            // (the fused o_proj+residual shortcut above is disabled when it is set).
+            if (_residualScale != 1.0f)
+            {
+                _embedScale!.Record(cmdBuf, _state.NormOutput, seqLen * hiddenSize, _residualScale);
                 BarrierComputeToCompute(cmdBuf);
             }
 
@@ -3863,7 +3882,8 @@ public sealed class VulkanTransformerModel : IModel
             // residual add collapse from 3 dispatches / 2 barriers into 2
             // dispatches / 1 barrier (activation+quantize fused; the GEMV
             // still needs its own barrier to see the just-quantized scratch).
-            downProjFused = TryRecordFusedSwiGluQuantizeDownResidual(cmdBuf, lw, seqLen, intermediateSize);
+            downProjFused = _residualScale == 1.0f
+                && TryRecordFusedSwiGluQuantizeDownResidual(cmdBuf, lw, seqLen, intermediateSize);
 
             if (!downProjFused)
             {
@@ -3895,6 +3915,7 @@ public sealed class VulkanTransformerModel : IModel
                 // rules as the o_proj site above (Q8_0, no bias / LoRA / Gemma
                 // post-ffn-norm in between).
                 downProjFused = lw.DownBias is null && _currentLora is null && lw.PostFfnNormWeight is null
+                    && _residualScale == 1.0f
                     && TryRecordMatmulWithResidualQ8_0(cmdBuf, lw.Down, lw.DownDeviceQuantType,
                         _state.SiluOutput, _state.Residual, _state.AddScratch,
                         lw.DownOutputDim, lw.DownInputDim, seqLen);
@@ -3932,6 +3953,13 @@ public sealed class VulkanTransformerModel : IModel
             {
                 _rmsnorm.Record(cmdBuf, _state.NormOutput, postFfnNorm1, _state.NormOutput,
                     rowCount: seqLen, n: hiddenSize, eps: eps);
+                BarrierComputeToCompute(cmdBuf);
+            }
+
+            // Granite residual multiplier on the FFN / MoE sublayer output (fused down+residual is gated off).
+            if (_residualScale != 1.0f)
+            {
+                _embedScale!.Record(cmdBuf, _state.NormOutput, seqLen * hiddenSize, _residualScale);
                 BarrierComputeToCompute(cmdBuf);
             }
 
@@ -4099,7 +4127,7 @@ public sealed class VulkanTransformerModel : IModel
             var dest = new Span<float>((void*)result.DataPointer, seqLen * vocabSize);
             _device.Download(logitsBuf, dest);
             // Per-row Gemma final-logit soft-cap (no-op when FinalLogitSoftcap is null).
-            if (Config.FinalLogitSoftcap is float cap && cap > 0f)
+            if ((Config.FinalLogitSoftcap is float cap && cap > 0f) || _logitScale != 1.0f)
                 for (int r = 0; r < seqLen; r++)
                     ApplyFinalLogitSoftcapHost(dest.Slice(r * vocabSize, vocabSize));
         }
@@ -4231,6 +4259,9 @@ public sealed class VulkanTransformerModel : IModel
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void ApplyFinalLogitSoftcapHost(Span<float> logits)
     {
+        // Granite logit scale: logits are DIVIDED by logits_scaling (applied before any soft-cap; Granite has none).
+        if (_logitScale != 1.0f)
+            TensorPrimitives.Multiply(logits, 1.0f / _logitScale, logits);
         if (Config.FinalLogitSoftcap is not float cap || cap <= 0.0f) return;
         float inv = 1.0f / cap;
         TensorPrimitives.Multiply(logits, inv, logits);

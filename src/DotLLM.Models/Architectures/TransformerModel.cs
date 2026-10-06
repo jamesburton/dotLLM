@@ -90,6 +90,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     // sqrt(hidden_size) immediately after the lookup. 1.0f (a no-op) for every
     // architecture that leaves ModelConfig.EmbeddingScale null.
     private readonly float _embeddingScale;
+    private readonly float _residualScale;   // Granite residual multiplier (1 = none)
+    private readonly float _logitScale;      // Granite logit divisor (1 = none)
     // True when the dense FFN must use the GeGLU (tanh-approximate GELU) gate
     // activation instead of SwiGLU (SiLU). Gemma sets ActivationFunction =
     // GELUTanh; every other dense architecture keeps SwiGLU.
@@ -141,6 +143,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         _threadPool = threadPool;
         _ownsThreadPool = ownsPool;
         _embeddingScale = config.EmbeddingScale ?? 1.0f;
+        _residualScale = config.ResidualScale ?? 1.0f;
+        _logitScale = config.LogitScale ?? 1.0f;
         _useGeGLU = config.ActivationFunction == ActivationFunction.GELUTanh;
     }
 
@@ -1406,9 +1410,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             // gpt-oss extras: lw.AttnSinks — per-head sink logits joining each
             // head's softmax denominator (null for every other architecture).
             int? layerSlidingWindow = GetLayerSlidingWindow(layer);
-            float attnScale = Config.QueryPreAttnScalar is float qpas && qpas > 0
-                ? 1.0f / MathF.Sqrt(qpas)
-                : 1.0f / MathF.Sqrt(headDimLayer);
+            float attnScale = Config.AttentionScoreScale(headDimLayer);
             float attnSoftCap = Config.AttnLogitSoftcap ?? 0f;
 
             if (kvCache is not null)
@@ -1426,6 +1428,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
 
                 if (kvCache is IQuantizedKvCache qkvCache)
                 {
+                    // The quantized-KV kernel hard-codes 1/sqrt(headDim); realise a non-default score scale
+                    // (Gemma query_pre_attn_scalar, Granite attention_multiplier) by pre-scaling Q.
+                    PrescaleQForKernelDefault(q, seqLen * qStrideLayer, attnScale, headDimLayer);
                     // Quantized path: dequantize KV tiles on-the-fly during attention
                     Attention.Execute(q, qkvCache, layer, attnOut,
                         seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], _threadPool,
@@ -1495,6 +1500,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             }
 
             // g. Residual add (per token)
+            ScaleSublayerOutput(normOut, seqLen * hiddenSize);   // Granite residual multiplier (no-op otherwise)
             for (int t = 0; t < seqLen; t++)
             {
                 Add.Execute(
@@ -1628,6 +1634,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                 }
 
                 // Residual add (per token) → hidden. Same as dense path.
+                ScaleSublayerOutput(normOut, seqLen * hiddenSize);   // Granite residual multiplier (no-op otherwise)
                 for (int t = 0; t < seqLen; t++)
                 {
                     Add.Execute(
@@ -1775,6 +1782,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             }
 
             // k. Residual add (per token)
+            ScaleSublayerOutput(normOut, seqLen * hiddenSize);   // Granite residual multiplier (no-op otherwise)
             for (int t = 0; t < seqLen; t++)
             {
                 Add.Execute(
@@ -2005,9 +2013,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
 
         // Attention: softmax(Qᵀ·K * 1.0 + causal mask) · V, GQA broadcast. Scale is
         // 1.0 (q_norm/k_norm make Q,K unit) — QueryPreAttnScalar=1.0 → 1/sqrt(1)=1.
-        float attnScale = Config.QueryPreAttnScalar is float qpas && qpas > 0
-            ? 1.0f / MathF.Sqrt(qpas)
-            : 1.0f / MathF.Sqrt(headDimLayer);
+        float attnScale = Config.AttentionScoreScale(headDimLayer);
         int? layerSlidingWindow = GetLayerSlidingWindow(layer);
 
         // ── PKV phase split ─────────────────────────────────────────────────
@@ -2414,9 +2420,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                         .CopyTo(new Span<float>(sharedKvV + sharedSlot * sharedKvSlotStride, kvElemsStash));
                 }
 
-                float attnScale = Config.QueryPreAttnScalar is float qpas && qpas > 0
-                    ? 1.0f / MathF.Sqrt(qpas)
-                    : 1.0f / MathF.Sqrt(headDimLayer);
+                float attnScale = Config.AttentionScoreScale(headDimLayer);
                 int? layerSlidingWindow = GetLayerSlidingWindow(layer);
                 float attnSoftcap = Config.AttnLogitSoftcap ?? 0f;
 
@@ -2853,7 +2857,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     }
 
     /// <summary>
-    /// Applies <c>z' = cap * tanh(z / cap)</c> in-place over <paramref name="count"/> floats
+    /// Applies the Granite logit divisor (when configured) and then <c>z' = cap * tanh(z / cap)</c> in-place over <paramref name="count"/> floats
     /// at <paramref name="logits"/> when <see cref="ModelConfig.FinalLogitSoftcap"/> is set
     /// (Gemma 2 / Gemma 3). No-op when the field is null or non-positive. Uses
     /// <see cref="TensorPrimitives"/> for SIMD-accelerated multiply/tanh.
@@ -2861,6 +2865,17 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private unsafe void ApplyFinalLogitSoftcap(float* logits, long count)
     {
+        // Granite logit scale: logits are DIVIDED by logits_scaling (llama.cpp ggml_scale(cur, 1/f_logit_scale)).
+        if (_logitScale != 1.0f)
+        {
+            for (long o = 0; o < count; )
+            {
+                int c = (int)Math.Min(count - o, int.MaxValue);
+                var sp = new Span<float>(logits + o, c);
+                TensorPrimitives.Multiply(sp, 1.0f / _logitScale, sp);
+                o += c;
+            }
+        }
         if (Config.FinalLogitSoftcap is not float cap || cap <= 0f) return;
         // Process in <= int.MaxValue chunks (the span constructor is int-bounded).
         long offset = 0;
@@ -3273,12 +3288,11 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
 
                 int seqKv = kvCache.CurrentLength;
                 int? layerSlidingWindow = GetLayerSlidingWindow(layer);
-                float attnScale = Config.QueryPreAttnScalar is float qpas && qpas > 0
-                    ? 1.0f / MathF.Sqrt(qpas)
-                    : 1.0f / MathF.Sqrt(headDim);
+                float attnScale = Config.AttentionScoreScale(headDim);
                 float attnSoftCap = Config.AttnLogitSoftcap ?? 0f;
                 if (kvCache is IQuantizedKvCache qkvCache)
                 {
+                    PrescaleQForKernelDefault(qSlice, n * qStride, attnScale, headDim);
                     Attention.Execute(qSlice, qkvCache, layer, aSlice,
                         n, seqKv, numHeads, numKvHeadsLayer, headDim, positions[0], _threadPool,
                         layerSlidingWindow, attnSoftCap);
@@ -3312,6 +3326,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             }
 
             // g. Residual add: hidden ← residual + normOut (all batched rows).
+            ScaleSublayerOutput(normOut, total * hiddenSize);   // Granite residual multiplier (no-op otherwise)
             for (int t = 0; t < total; t++)
             {
                 Add.Execute(
@@ -3378,6 +3393,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             }
 
             // k. Final residual add.
+            ScaleSublayerOutput(normOut, total * hiddenSize);   // Granite residual multiplier (no-op otherwise)
             for (int t = 0; t < total; t++)
             {
                 Add.Execute(
@@ -3516,6 +3532,29 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         LoraProjection.Apply(_currentAdapter, LoraAdapter.SelfConditioningLayerIndex, projName, x, y,
                              canvasLen, inputDim, outputDim, _threadPool,
                              region: LoraRegion.Any);
+    }
+
+    /// <summary>
+    /// Granite residual multiplier: scales a sublayer output in place BEFORE it is added back to the residual
+    /// stream (<c>h = h + residual_scale * sublayer(h)</c>). No-op (one comparison) when the model has none.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ScaleSublayerOutput(float* buf, int count)
+    {
+        if (_residualScale != 1.0f)
+            TensorPrimitives.Multiply(new Span<float>(buf, count), _residualScale, new Span<float>(buf, count));
+    }
+
+    /// <summary>
+    /// The quantized-KV attention kernel has no score-scale parameter (it hard-codes <c>1/sqrt(headDim)</c>).
+    /// Multiplying Q by <c>scale * sqrt(headDim)</c> first realises any other scale exactly
+    /// (<c>(q*c)·k/sqrt(d) = scale * q·k</c>), including under the soft-cap (applied after the scale).
+    /// </summary>
+    private static void PrescaleQForKernelDefault(float* q, int count, float scale, int headDim)
+    {
+        float fix = scale * MathF.Sqrt(headDim);
+        if (MathF.Abs(fix - 1.0f) > 1e-6f)
+            TensorPrimitives.Multiply(new Span<float>(q, count), fix, new Span<float>(q, count));
     }
 
     /// <summary>

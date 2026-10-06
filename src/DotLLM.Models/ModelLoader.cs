@@ -151,7 +151,7 @@ public static class ModelLoader
             IModel model = config.Architecture switch
             {
                 Architecture.Llama or Architecture.Mistral or Architecture.Phi or Architecture.Qwen
-                    or Architecture.Mixtral or Architecture.QwenMoe or Architecture.GraniteMoe
+                    or Architecture.Mixtral or Architecture.QwenMoe or Architecture.GraniteMoe or Architecture.Granite
                     or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
                     or Architecture.SmolLM3
                     or Architecture.Gemma3 or Architecture.Gemma4
@@ -175,7 +175,7 @@ public static class ModelLoader
                     => Mamba3TransformerModel.LoadFromSafetensors(source, config),
                 _ => throw new NotSupportedException(
                     $"Safetensors loader does not yet dispatch architecture {config.Architecture}. "
-                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, DeepSeekV2, DeepSeekV3, SmolLM3, Gemma3, Gemma4, Gemma3n, DiffusionGemma, BitNet, Mamba3."),
+                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, Granite, DeepSeekV2, DeepSeekV3, SmolLM3, Gemma3, Gemma4, Gemma3n, DiffusionGemma, BitNet, Mamba3."),
             };
 
             return (model, source, config);
