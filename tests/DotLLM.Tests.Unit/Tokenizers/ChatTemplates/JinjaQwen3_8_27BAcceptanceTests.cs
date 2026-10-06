@@ -1,4 +1,3 @@
-using System.Runtime.CompilerServices;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ChatTemplates;
 using Xunit;
@@ -13,10 +12,10 @@ namespace DotLLM.Tests.Unit.Tokenizers.ChatTemplates;
 /// </summary>
 public class JinjaQwen3_8_27BAcceptanceTests
 {
-    private static string LoadFixture([CallerFilePath] string callerFilePath = "")
+    private static string LoadFixture()
     {
-        var dir = Path.GetDirectoryName(callerFilePath)!;
-        var path = Path.Combine(dir, "Fixtures", "qwen3.8-27b-chat-template.jinja");
+        // Copied to the output dir by the csproj (CallerFilePath is path-mapped to "/_/" in CI).
+        var path = Path.Combine(AppContext.BaseDirectory, "Tokenizers", "ChatTemplates", "Fixtures", "qwen3.8-27b-chat-template.jinja");
         return File.ReadAllText(path);
     }
 
@@ -44,46 +43,16 @@ public class JinjaQwen3_8_27BAcceptanceTests
     }
 
     [Fact]
-    public void FullTemplate_Render_KnownRemainingGapIsTracked()
+    public void FullTemplate_Renders_ToolLessChat()
     {
-        // Rendering (as opposed to parsing) additionally requires #399's loop.previtem /
-        // loop.nextitem support and `is undefined` handling — both used unconditionally in this
-        // template (the reasoning-effort prelude at line 46: `enable_thinking is undefined or ...`,
-        // and the tool-response run detection at lines 148/154: `loop.previtem` / `loop.nextitem`).
-        // #399 is tracked separately by PR #411, which is NOT merged as of this branch.
-        //
-        // This test documents the current end-to-end state rather than silently skipping:
-        //   - If #411 has NOT landed: rendering must fail, and it must fail for the KNOWN #399
-        //     reason (an unsupported `is undefined`/`is defined`-style test name), not for a
-        //     tuple/comma parsing reason — proving #409's fix is not masking a different bug.
-        //   - If #411 HAS landed (merge this branch onto a newer `dev` and re-run): rendering
-        //     should succeed outright; this test's `catch` branch will no longer be reached and
-        //     the success path below is asserted instead.
-        var source = LoadFixture();
-        var template = new JinjaChatTemplate(source, bosToken: "<|endoftext|>", eosToken: "<|im_end|>");
+        // Full render (not just parse): needs `is undefined`, loop.previtem/nextitem (#399/#411),
+        // macros, namespace, slicing and `not in (tuple)` (#409). Golden comparison against
+        // reference Jinja2 lives in JinjaQwen3_8_27BReferenceRenderTests.
+        var template = new JinjaChatTemplate(LoadFixture(), bosToken: "<|endoftext|>", eosToken: "<|im_end|>");
+        var messages = new[] { new ChatMessage { Role = "user", Content = "What is 2 + 2?" } };
+        var result = template.Apply(messages, new ChatTemplateOptions { AddGenerationPrompt = true });
 
-        var messages = new[]
-        {
-            new ChatMessage { Role = "user", Content = "What is 2 + 2?" },
-        };
-        var options = new ChatTemplateOptions { AddGenerationPrompt = true };
-
-        try
-        {
-            var result = template.Apply(messages, options);
-
-            // #411 has landed (or the gap has otherwise closed) — full end-to-end render works.
-            Assert.Contains("What is 2 + 2?", result);
-        }
-        catch (JinjaException ex)
-        {
-            // Must NOT be a tuple/grouping parse failure (that would mean #409 regressed).
-            Assert.DoesNotContain("RightParen", ex.Message);
-            Assert.DoesNotContain("got Comma", ex.Message);
-
-            // Must be the known, tracked #399 gap: an "is undefined"-style test name the
-            // evaluator doesn't recognize yet (see JinjaEvaluator.EvalIsTest).
-            Assert.Contains("Unknown test", ex.Message);
-        }
+        Assert.Contains("<|im_start|>user\nWhat is 2 + 2?<|im_end|>", result, StringComparison.Ordinal);
+        Assert.EndsWith("<|im_start|>assistant\n<think>\n", result, StringComparison.Ordinal);
     }
 }

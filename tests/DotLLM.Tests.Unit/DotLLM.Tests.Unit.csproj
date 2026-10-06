@@ -48,6 +48,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- #409: chat-template fixtures are read at runtime from the output dir. [CallerFilePath] is
+         deterministic-path-mapped to "/_/..." in CI, so it cannot locate source files. -->
+    <None Include="Tokenizers\ChatTemplates\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="xunit" />
     <PackageReference Include="xunit.runner.visualstudio" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
