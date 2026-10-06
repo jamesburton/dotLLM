@@ -327,7 +327,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             // full-attention layers): folded into the global cos/sin table
             // (angle = pos * θ^(-2i/dim) / factor[i], ggml theta/ff). Null for
             // every model without the tensor.
-            globalFreqFactors: globalRopeDim > 0 ? weights.RopeFreqFactors : null);
+            globalFreqFactors: globalRopeDim > 0 ? weights.RopeFreqFactors : null,
+            // Dense models (no global table): rope_freqs.weight applies to every layer (#743).
+            ropeFreqFactors: DenseRopeFreqFactors.Select(config, weights.RopeFreqFactors, ropeDim));
 
         // For MLA + YaRN (DeepSeek-V2/V3 long-context), rebuild cos/sin tables
         // using per-dim ramped inverse frequencies. Plain precompute above is a
