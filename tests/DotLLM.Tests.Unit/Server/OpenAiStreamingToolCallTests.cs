@@ -2,7 +2,9 @@ using System.Text;
 using System.Text.Json;
 using DotLLM.Core.Configuration;
 using DotLLM.Engine;
+using DotLLM.Server;
 using DotLLM.Server.Endpoints;
+using DotLLM.Tokenizers.Reasoning;
 using DotLLM.Server.Models;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ToolCallParsers;
@@ -36,7 +38,7 @@ public sealed class OpenAiStreamingToolCallTests
 
     private sealed record Result(string Content, JsonElement? FinalToolCalls, string? FinishReason, string Raw);
 
-    private static async Task<Result> RunAsync(string[] pieces, IToolCallParser parser, bool forced = false, ToolDefinition[]? tools = null)
+    private static async Task<Result> RunAsync(string[] pieces, IToolCallParser parser, bool forced = false, ToolDefinition[]? tools = null, ReasoningPlan? plan = null)
     {
         var ctx = new DefaultHttpContext();
         var body = new MemoryStream();
@@ -44,8 +46,8 @@ public sealed class OpenAiStreamingToolCallTests
         var request = new ChatCompletionRequest { Messages = [], Stream = true };
 
         await ChatCompletionEndpoint.WriteChatStreamAsync(
-            ctx, request, _ => Script(pieces), NoGate, "req_1", "m", tools ?? Tools, parser,
-            CancellationToken.None, forced);
+            request, ctx, _ => Script(pieces), NoGate, "req_1", "m", tools ?? Tools, parser,
+            plan ?? ReasoningPlan.Disabled, CancellationToken.None, forced);
 
         string raw = Encoding.UTF8.GetString(body.ToArray());
         var content = new StringBuilder();
@@ -142,6 +144,23 @@ public sealed class OpenAiStreamingToolCallTests
 
         Assert.Null(r.FinalToolCalls);
         Assert.Equal("<tool_call>\n<function=get_weather>\n<parameter=city>\nPar", r.Content);
+    }
+
+    [Fact]
+    public async Task ReasoningThenToolCall_ReasoningStreamsSeparately_ToolMarkupSuppressed_AndOnlyAnswerIsParsed()
+    {
+        var plan = new ReasoningPlan(ReasoningFormat.Auto, promptOpened: true);
+        var r = await RunAsync(
+            ["I could call <tool_call> maybe", "</think>\n\n", "<tool_call>",
+             "\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n"],
+            new QwenXmlToolCallParser(), plan: plan);
+
+        Assert.Equal("tool_calls", r.FinishReason);
+        Assert.DoesNotContain("<function", r.Content);
+        Assert.DoesNotContain("<tool_call>", r.Content);
+        Assert.Contains("reasoning_content", r.Raw, StringComparison.Ordinal);
+        Assert.Contains("maybe", r.Raw, StringComparison.Ordinal);
+        Assert.Single(r.FinalToolCalls!.Value.EnumerateArray().ToArray());
     }
 
     [Fact]

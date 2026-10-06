@@ -247,11 +247,32 @@ ChatMessage:
   Content: string
   ToolCalls: ToolCall[]?     (for assistant messages with tool calls)
   ToolCallId: string?        (for tool result messages)
+  ReasoningContent: string?  (assistant reasoning; exposed as message.reasoning_content, #767)
 
 ChatTemplateOptions:
   AddGenerationPrompt: bool  (append assistant turn prefix)
   Tools: ToolDefinition[]?   (for tool-calling models)
+  EnableThinking: bool?      (-> enable_thinking; null = left undefined, the template default applies)
+  ReasoningEffort: string?   (-> reasoning_effort)
+  PreserveThinking: bool?    (-> preserve_thinking)
+  TemplateKwargs: IReadOnlyDictionary<string, JsonElement>?  (chat_template_kwargs; merged first, so the
+                             typed members above and the structural variables messages / tools /
+                             add_generation_prompt / bos_token / eos_token always win)
 ```
+
+The reasoning members are **only inserted into the Jinja context when set**: Qwen3.x tests
+`enable_thinking is undefined`, and a null-valued key is *defined*, so inserting nulls would silently turn thinking off.
+`JinjaQwen3_8_27BReasoningOptionsTests` renders the real Qwen3.x template through `JinjaChatTemplate.Apply` with these
+options (typed and as kwargs) and compares against the Python Jinja2 goldens in `Fixtures/qwen3.8-27b-render-cases.json`.
+
+### Reasoning split (`DotLLM.Tokenizers.Reasoning`, #767)
+
+Models that think emit `<think>…</think>` before the answer; many templates open the block in the generation prompt.
+`ReasoningFormats.PromptOpensThinking(prompt)` decides from the **rendered prompt** (last `<think>` after the last `</think>`, only
+whitespace after it) whether generation starts inside a block, and `ReasoningSplitter` is the incremental splitter the server drives
+(`Feed(text)` per token, `Finish()` at the end; non-streaming is the same machine fed once). It never emits part of a tag, drops the
+whitespace around the tags, treats an unclosed block as all reasoning, and recognises a model-emitted `<think>` only at the start of the output
+(`ReasoningFormat.Auto`) or anywhere (`Deepseek`). See [SERVER.md](SERVER.md#reasoning--thinking-models-767) for the wire behaviour.
 
 ### Known Template Formats
 

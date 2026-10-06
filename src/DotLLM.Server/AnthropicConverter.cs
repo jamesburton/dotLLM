@@ -57,6 +57,7 @@ public static class AnthropicConverter
         }
 
         var textBuilder = new StringBuilder();
+        var reasoningBuilder = new StringBuilder();
         List<ToolCall>? toolCalls = null;
 
         foreach (var block in content.EnumerateArray())
@@ -75,6 +76,17 @@ public static class AnthropicConverter
                     }
                     break;
 
+                case "thinking":
+                    // #767: replayed thinking reaches the template as reasoning_content (Qwen3.x renders it
+                    // back into the history unless preserve_thinking is false). redacted_thinking has no text.
+                    if (block.TryGetProperty("thinking", out var th) && th.ValueKind == JsonValueKind.String
+                        && msg.Role == "assistant")
+                    {
+                        if (reasoningBuilder.Length > 0) reasoningBuilder.Append('\n');
+                        reasoningBuilder.Append(th.GetString());
+                    }
+                    break;
+
                 case "tool_use":
                     string tuId = block.TryGetProperty("id", out var idp) ? idp.GetString() ?? "" : "";
                     string tuName = block.TryGetProperty("name", out var np) ? np.GetString() ?? "" : "";
@@ -84,7 +96,7 @@ public static class AnthropicConverter
 
                 case "tool_result":
                     // Emit any pending text/tool_use for this message, then the tool result.
-                    FlushPending(target, msg.Role, textBuilder, ref toolCalls);
+                    FlushPending(target, msg.Role, textBuilder, reasoningBuilder, ref toolCalls);
                     string trId = block.TryGetProperty("tool_use_id", out var tup) ? tup.GetString() ?? "" : "";
                     target.Add(new ChatMessage
                     {
@@ -96,13 +108,14 @@ public static class AnthropicConverter
             }
         }
 
-        FlushPending(target, msg.Role, textBuilder, ref toolCalls);
+        FlushPending(target, msg.Role, textBuilder, reasoningBuilder, ref toolCalls);
     }
 
     private static void FlushPending(
-        List<ChatMessage> target, string role, StringBuilder textBuilder, ref List<ToolCall>? toolCalls)
+        List<ChatMessage> target, string role, StringBuilder textBuilder, StringBuilder reasoningBuilder,
+        ref List<ToolCall>? toolCalls)
     {
-        if (textBuilder.Length == 0 && toolCalls is null)
+        if (textBuilder.Length == 0 && toolCalls is null && reasoningBuilder.Length == 0)
             return;
 
         target.Add(new ChatMessage
@@ -110,8 +123,10 @@ public static class AnthropicConverter
             Role = role,
             Content = textBuilder.ToString(),
             ToolCalls = toolCalls?.ToArray(),
+            ReasoningContent = reasoningBuilder.Length > 0 ? reasoningBuilder.ToString() : null,
         });
         textBuilder.Clear();
+        reasoningBuilder.Clear();
         toolCalls = null;
     }
 

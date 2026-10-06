@@ -67,11 +67,39 @@ public sealed record AnthropicMessagesRequest
 
     /// <summary>
     /// Extended-thinking configuration (<c>{"type":"enabled","budget_tokens":N}</c> or
-    /// <c>{"type":"disabled"}</c>). Accepted so SDK callers are not rejected; dotLLM
-    /// emits no <c>thinking</c> content blocks today (#449).
+    /// <c>{"type":"disabled"}</c>). <c>enabled</c>/<c>disabled</c> set the chat template's
+    /// <c>enable_thinking</c> (#767); absent leaves the template default. <c>budget_tokens</c> is accepted
+    /// but not enforced - the model's thinking counts toward <c>max_tokens</c>. When the model thinks, the
+    /// response carries <c>thinking</c> content blocks before the text.
     /// </summary>
     [JsonPropertyName("thinking")]
     public JsonElement? Thinking { get; init; }
+
+    /// <summary>
+    /// dotLLM extension (llama.cpp / vLLM convention): extra variables for the chat template's Jinja
+    /// context, e.g. <c>{"preserve_thinking": false}</c>. Cannot replace <c>messages</c>, <c>tools</c>,
+    /// <c>add_generation_prompt</c>, <c>bos_token</c> or <c>eos_token</c>.
+    /// </summary>
+    [JsonPropertyName("chat_template_kwargs")]
+    public Dictionary<string, JsonElement>? ChatTemplateKwargs { get; init; }
+
+    /// <summary>
+    /// dotLLM extension: per-request override of the server's <c>--reasoning-format</c>
+    /// (<c>none</c>, <c>auto</c>, <c>deepseek</c>). Null = the server setting.
+    /// </summary>
+    [JsonPropertyName("reasoning_format")]
+    public string? ReasoningFormat { get; init; }
+
+    /// <summary>
+    /// <c>true</c> when the request enabled extended thinking, <c>false</c> when it disabled it, null when
+    /// it said nothing (the template default applies).
+    /// </summary>
+    [JsonIgnore]
+    public bool? ThinkingEnabled
+        => Thinking is { ValueKind: JsonValueKind.Object } t
+           && t.TryGetProperty("type", out var type) && type.ValueKind == JsonValueKind.String
+            ? type.GetString() switch { "enabled" or "adaptive" => true, "disabled" => false, _ => null }
+            : null;
 }
 
 /// <summary>
@@ -168,6 +196,19 @@ public sealed record AnthropicContentBlockDto
     [JsonPropertyName("input")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? Input { get; init; }
+
+    /// <summary>The model's reasoning, on a <c>thinking</c> block (#767).</summary>
+    [JsonPropertyName("thinking")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Thinking { get; init; }
+
+    /// <summary>
+    /// Signature of a <c>thinking</c> block. dotLLM has nothing to sign with, so it is always the empty
+    /// string; the field exists because SDKs require it on the block.
+    /// </summary>
+    [JsonPropertyName("signature")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Signature { get; init; }
 }
 
 /// <summary>Anthropic token usage (<c>input_tokens</c>/<c>output_tokens</c>).</summary>
@@ -259,6 +300,16 @@ public sealed record AnthropicStreamDeltaDto
     [JsonPropertyName("partial_json")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? PartialJson { get; init; }
+
+    /// <summary>Reasoning text of a <c>thinking_delta</c> (#767).</summary>
+    [JsonPropertyName("thinking")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Thinking { get; init; }
+
+    /// <summary>Signature of a <c>signature_delta</c> (always empty, see <see cref="AnthropicContentBlockDto.Signature"/>).</summary>
+    [JsonPropertyName("signature")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Signature { get; init; }
 }
 
 /// <summary><c>content_block_stop</c> streaming event.</summary>

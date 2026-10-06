@@ -250,8 +250,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 EndOfGenerationTokens.CreateStopCondition(_tokenizer),
                 new MaxTokensStopCondition(maxTokens),
             };
-            foreach (var stopSeq in options.StopSequences)
-                list.Add(new StopStringCondition(stopSeq));
+            list.AddRange(StopStringCondition.CreateAll(options));
             stops = list;
         }
 

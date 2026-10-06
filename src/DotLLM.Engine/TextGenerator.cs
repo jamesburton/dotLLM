@@ -267,8 +267,7 @@ public sealed class TextGenerator
             // StopStringCondition excludes the triggering token. Partial-token
             // suffix trimming would require text-level stop metadata alongside
             // token-level finish semantics.
-            foreach (string seq in options.StopSequences)
-                stopConditions.Add(new StopStringCondition(seq));
+            stopConditions.AddRange(StopStringCondition.CreateAll(options));
         }
 
         // Resolve KV-cache: reuse from prefix cache or allocate fresh
@@ -839,8 +838,7 @@ public sealed class TextGenerator
                 EndOfGenerationTokens.CreateStopCondition(_tokenizer),
                 new MaxTokensStopCondition(maxTokens)
             };
-            foreach (string seq in options.StopSequences)
-                stopConditions.Add(new StopStringCondition(seq));
+            stopConditions.AddRange(StopStringCondition.CreateAll(options));
         }
 
         // Resolve KV-cache: reuse from prefix cache or allocate fresh

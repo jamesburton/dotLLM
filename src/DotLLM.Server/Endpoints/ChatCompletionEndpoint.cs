@@ -4,6 +4,7 @@ using DotLLM.Engine;
 using DotLLM.Server.Models;
 using DotLLM.Server.RateLimiting;
 using DotLLM.Tokenizers;
+using DotLLM.Tokenizers.Reasoning;
 
 namespace DotLLM.Server.Endpoints;
 
@@ -123,13 +124,36 @@ public static class ChatCompletionEndpoint
         var tools = RequestConverter.ToTools(request.Tools);
         var toolChoice = RequestConverter.ParseToolChoice(request.ToolChoice);
 
-        // Apply chat template
-        var templateOptions = new ChatTemplateOptions
+        // (#767) Reasoning switches go into the template render. Whether decoding will be constrained
+        // (response_format / grammar / forced tool_choice) is decided BEFORE rendering: a constraint cannot
+        // coexist with an open <think> block, so such requests default thinking off.
+        var parsedResponseFormat = RequestConverter.ParseResponseFormat(request.ResponseFormat);
+        bool constrained = parsedResponseFormat is not (null or DotLLM.Core.Configuration.ResponseFormat.Text)
+            || ReasoningSupport.ToolChoiceConstrains(toolChoice, tools, state.ToolCallParser);
+        var templateOptions = ReasoningSupport.BuildTemplateOptions(
+            tools, request.EnableThinking, request.ReasoningEffort, request.ChatTemplateKwargs, constrained);
+        if (!ReasoningSupport.TryApply(state.ChatTemplate, messages, templateOptions,
+                out string prompt, out string? templateError, out string? templateParam))
         {
-            AddGenerationPrompt = true,
-            Tools = tools,
-        };
-        string prompt = state.ChatTemplate.Apply(messages, templateOptions);
+            httpContext.Response.StatusCode = 400;
+            await httpContext.Response.WriteAsJsonAsync(
+                ErrorResponse.InvalidRequest(templateError!, param: templateParam),
+                ServerJsonContext.Default.ErrorResponse,
+                contentType: null,
+                httpContext.RequestAborted);
+            return;
+        }
+        var plan = ReasoningSupport.Plan(state.Options.ReasoningFormat, request.ReasoningFormat, constrained, prompt, out string? planError);
+        if (planError is not null)
+        {
+            httpContext.Response.StatusCode = 400;
+            await httpContext.Response.WriteAsJsonAsync(
+                ErrorResponse.InvalidRequest(planError, param: "reasoning_format"),
+                ServerJsonContext.Default.ErrorResponse,
+                contentType: null,
+                httpContext.RequestAborted);
+            return;
+        }
 
         // Validate prompt length against model context
         int maxTokens = request.MaxTokens ?? state.EffectiveSamplingDefaults.MaxTokens;
@@ -153,7 +177,7 @@ public static class ChatCompletionEndpoint
             state.EffectiveSamplingDefaults,
             new DotLLM.Core.Configuration.ThreadingConfig(
                 state.Options.Threads, state.Options.DecodeThreads));
-        options = options with { MaxTokens = effectiveMaxTokens };
+        options = plan.Gate(options with { MaxTokens = effectiveMaxTokens }, ReasoningSupport.UngatedStops);
 
         // #456: tool_choice was parsed at the top of this method and then DISCARDED — the local
         // had exactly one reference, its own assignment — so required/none/named-function had no
@@ -194,10 +218,10 @@ public static class ChatCompletionEndpoint
 
         if (request.Stream)
             await HandleStreamingAsync(request, generator, state, httpContext, prompt, options,
-                requestId, modelId, tools, effectiveToolParser, adapter, ct, forcedToolCall);
+                requestId, modelId, tools, effectiveToolParser, adapter, plan, ct, forcedToolCall);
         else
             await HandleNonStreamingAsync(request, generator, state, httpContext, prompt, options,
-                requestId, modelId, tools, effectiveToolParser, adapter, ct);
+                requestId, modelId, tools, effectiveToolParser, adapter, plan, ct);
     }
 
     private static async Task HandleNonStreamingAsync(
@@ -211,6 +235,7 @@ public static class ChatCompletionEndpoint
         ToolDefinition[]? tools,
         IToolCallParser? toolParser,
         DotLLM.Core.Lora.ILoraAdapter? adapter,
+        ReasoningPlan plan,
         CancellationToken ct)
     {
         int choiceCount = request.ChoiceCount;
@@ -251,10 +276,17 @@ public static class ChatCompletionEndpoint
         }
 
         var choices = new ChatChoiceDto[choiceCount];
+        int reasoningTokens = 0;
         for (int i = 0; i < choiceCount; i++)
-            choices[i] = BuildChoice(results[i], i);
+        {
+            choices[i] = BuildChoice(request, options, tools, toolParser, plan, state.Tokenizer, results[i], i, out int rt);
+            reasoningTokens += rt;
+        }
 
-        var usage = BuildMultiChoiceUsage(results);
+        var usage = BuildMultiChoiceUsage(results) with
+        {
+            CompletionTokensDetails = ReasoningSupport.Details(reasoningTokens),
+        };
 
         var response = new ChatCompletionResponse
         {
@@ -274,14 +306,31 @@ public static class ChatCompletionEndpoint
 
         httpContext.Response.ContentType = "application/json";
         await JsonSerializer.SerializeAsync(httpContext.Response.Body, response, ServerJsonContext.Default.ChatCompletionResponse, ct);
-        return;
+    }
 
-        // Local: turn one engine response into one choice. Identical to the single-choice path it
-        // replaces; the index is the only thing that varies.
-        ChatChoiceDto BuildChoice(InferenceResponse result, int index)
-        {
+    /// <summary>
+    /// Turns one engine response into one choice: splits reasoning from the answer, detects tool calls and
+    /// strips stop suffixes on the <b>answer only</b>, and reports the reasoning token count.
+    /// </summary>
+    internal static ChatChoiceDto BuildChoice(
+        ChatCompletionRequest request,
+        DotLLM.Core.Configuration.InferenceOptions options,
+        ToolDefinition[]? tools,
+        IToolCallParser? toolParser,
+        ReasoningPlan plan,
+        ITokenizer? tokenizer,
+        InferenceResponse result,
+        int index,
+        out int reasoningTokens)
+    {
+        // (#767) Split reasoning from the answer FIRST: tool-call parsing and stop-suffix stripping
+        // must see the answer only, never the thinking (a <tool_call> quoted while reasoning is not a call).
+        var (reasoning, answer, reasoningTokenCount) = plan.SplitComplete(result.Text, tokenizer);
+        reasoningTokens = reasoningTokenCount;
+        result = result with { Text = answer };
+
         // Detect tool calls
-        string text = result!.Text;
+        string text = result.Text;
         ToolCall[]? toolCalls = null;
         var finishReason = result.FinishReason;
 
@@ -315,6 +364,7 @@ public static class ChatCompletionEndpoint
         {
             Role = "assistant",
             Content = toolCalls is { Length: > 0 } ? null : text,
+            ReasoningContent = reasoning,
             ToolCalls = toolCalls is { Length: > 0 }
                 ? RequestConverter.ToToolCallDtos(toolCalls)
                 : null,
@@ -331,7 +381,6 @@ public static class ChatCompletionEndpoint
             Logprobs = logprobsDto,
             FinishReason = RequestConverter.ToFinishReasonString(finishReason),
         };
-        }
     }
 
     /// <summary>
@@ -378,26 +427,28 @@ public static class ChatCompletionEndpoint
         ToolDefinition[]? tools,
         IToolCallParser? toolParser,
         DotLLM.Core.Lora.ILoraAdapter? adapter,
+        ReasoningPlan plan,
         CancellationToken ct,
         bool forcedToolCall = false)
         => WriteChatStreamAsync(
-            httpContext, request,
+            request, httpContext,
             innerCt => generator.GenerateStreamingTokensAsync(prompt, options, innerCt, adapter),
-            state.ExecuteAsync, requestId, modelId, tools, toolParser, ct, forcedToolCall);
+            state.ExecuteAsync, requestId, modelId, tools, toolParser, plan, ct, forcedToolCall);
 
     /// <summary>
-    /// Emits the OpenAI SSE chunk sequence for one streaming chat completion. The token source and the
-    /// model gate are injected so the wire behaviour (tool-call suppression, final <c>tool_calls</c>
-    /// chunk, usage chunk) is testable without a model.
+    /// Emits the OpenAI SSE stream for one request. The token source and the model gate are injected
+    /// (as in <see cref="MessagesEndpoint.WriteMessageStreamAsync"/>) so the emitted chunks, including
+    /// the reasoning/content split and tool-call suppression, can be asserted without a loaded model.
     /// </summary>
     internal static async Task WriteChatStreamAsync(
-        HttpContext httpContext,
         ChatCompletionRequest request,
+        HttpContext httpContext,
         Func<CancellationToken, IAsyncEnumerable<GenerationToken>> tokenSource,
         Func<Func<Task>, CancellationToken, Task> execute,
         string requestId, string modelId,
         ToolDefinition[]? tools,
         IToolCallParser? toolParser,
+        ReasoningPlan plan,
         CancellationToken ct,
         bool forcedToolCall = false)
     {
@@ -416,10 +467,13 @@ public static class ChatCompletionEndpoint
         };
         await WriteSseChunk(httpContext, roleChunk, ct);
 
+        // `sb` accumulates the ANSWER only (#767): tool-call detection below must not see reasoning.
         var sb = new StringBuilder();
         FinishReason finishReason = FinishReason.Length;
         InferenceTimings? timings = null;
         int completionTokens = 0;
+        int reasoningTokens = 0;
+        var splitter = plan.NewSplitter();
 
         // Tool-call markup must not ALSO go out as delta.content: the same payload would be reported
         // twice (as text, then as the final chunk's tool_calls) and a client would print raw
@@ -436,6 +490,43 @@ public static class ChatCompletionEndpoint
             : null;
         int emittedLength = 0;
 
+        async Task EmitAsync(ReasoningChunk chunk, LogprobsDto? logprobs)
+        {
+            // Reasoning and answer text go out as separate deltas, reasoning first. A token that only fed
+            // the splitter's holdback (a partial tag) produces nothing, unless it carries logprobs.
+            if (chunk.Reasoning.Length > 0)
+            {
+                await WriteSseChunk(httpContext, new ChatCompletionChunk
+                {
+                    Id = requestId,
+                    Model = modelId,
+                    Choices = [new ChatChunkChoiceDto
+                    {
+                        Delta = new ChatDeltaDto { ReasoningContent = chunk.Reasoning },
+                        Logprobs = chunk.Content.Length == 0 ? logprobs : null,
+                    }],
+                }, ct);
+            }
+            if (chunk.Content.Length > 0 || (chunk.Reasoning.Length == 0 && logprobs is not null))
+            {
+                sb.Append(chunk.Content);
+                // Tool-call markup (answer text only: reasoning never reaches the suppressor) is held back.
+                if (chunk.Content.Length > 0 && (forcedCall || (suppressor?.Append(chunk.Content) ?? false)))
+                    return;
+                emittedLength += chunk.Content.Length;
+                await WriteSseChunk(httpContext, new ChatCompletionChunk
+                {
+                    Id = requestId,
+                    Model = modelId,
+                    Choices = [new ChatChunkChoiceDto
+                    {
+                        Delta = new ChatDeltaDto { Content = chunk.Content.Length > 0 ? chunk.Content : null },
+                        Logprobs = logprobs,
+                    }],
+                }, ct);
+            }
+        }
+
         await execute(async () =>
         {
             await foreach (var token in tokenSource(ct))
@@ -443,31 +534,21 @@ public static class ChatCompletionEndpoint
                 if (token.Text.Length > 0)
                 {
                     completionTokens++;
-                    sb.Append(token.Text);
-                    if (forcedCall || (suppressor?.Append(token.Text) ?? false))
-                    {
-                        if (token.FinishReason.HasValue)
-                        {
-                            finishReason = token.FinishReason.Value;
-                            timings = token.Timings;
-                        }
-                        continue;
-                    }
                     var tokenLogprobs = token.Logprobs.HasValue
                         ? RequestConverter.ToLogprobsDto(token.Logprobs.Value)
                         : null;
-                    var contentChunk = new ChatCompletionChunk
+                    if (splitter is null)
                     {
-                        Id = requestId,
-                        Model = modelId,
-                        Choices = [new ChatChunkChoiceDto
-                        {
-                            Delta = new ChatDeltaDto { Content = token.Text },
-                            Logprobs = tokenLogprobs,
-                        }],
-                    };
-                    await WriteSseChunk(httpContext, contentChunk, ct);
-                    emittedLength += token.Text.Length;
+                        await EmitAsync(new ReasoningChunk("", token.Text), tokenLogprobs);
+                    }
+                    else
+                    {
+                        bool was = splitter.InReasoning;
+                        var chunk = splitter.Feed(token.Text);
+                        if (ReasoningSupport.IsReasoningToken(was, splitter))
+                            reasoningTokens++;
+                        await EmitAsync(chunk, tokenLogprobs);
+                    }
                 }
 
                 if (token.FinishReason.HasValue)
@@ -476,9 +557,13 @@ public static class ChatCompletionEndpoint
                     timings = token.Timings;
                 }
             }
+
+            // Release whatever the splitter held back (a partial tag that never completed).
+            if (splitter is not null)
+                await EmitAsync(splitter.Finish(), logprobs: null);
         }, ct);
 
-        // Detect tool calls in accumulated text
+        // Detect tool calls in the accumulated answer
         string text = sb.ToString();
         ToolCall[]? toolCalls = null;
         // #456: see the non-streaming path — the effective parser honours tool_choice.
@@ -547,7 +632,7 @@ public static class ChatCompletionEndpoint
         // (choices: []). The finish_reason chunk above also carries usage as a long-standing
         // dotLLM extension; this adds the shape the SDKs actually look for, without removing it.
         if (request.WantsUsageChunk)
-            await WriteSseChunk(httpContext, BuildUsageChunk(requestId, modelId, promptTokens, completionTokens), ct);
+            await WriteSseChunk(httpContext, BuildUsageChunk(requestId, modelId, promptTokens, completionTokens, reasoningTokens), ct);
 
         // [DONE] sentinel
         await httpContext.Response.WriteAsync("data: [DONE]\n\n", ct);
@@ -560,7 +645,7 @@ public static class ChatCompletionEndpoint
     /// load-bearing and not merely cosmetic.
     /// </summary>
     internal static ChatCompletionChunk BuildUsageChunk(
-        string requestId, string modelId, int promptTokens, int completionTokens) =>
+        string requestId, string modelId, int promptTokens, int completionTokens, int reasoningTokens = 0) =>
         new()
         {
             Id = requestId,
@@ -571,6 +656,7 @@ public static class ChatCompletionEndpoint
                 PromptTokens = promptTokens,
                 CompletionTokens = completionTokens,
                 TotalTokens = promptTokens + completionTokens,
+                CompletionTokensDetails = ReasoningSupport.Details(reasoningTokens),
             },
         };
 

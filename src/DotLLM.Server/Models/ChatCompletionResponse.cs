@@ -58,4 +58,20 @@ public sealed record UsageDto
 
     [JsonPropertyName("total_tokens")]
     public int TotalTokens { get; init; }
+
+    /// <summary>
+    /// Breakdown of <see cref="CompletionTokens"/> (#767). Present only when reasoning was split from
+    /// the answer; <c>reasoning_tokens</c> is part of, not in addition to, <c>completion_tokens</c>.
+    /// </summary>
+    [JsonPropertyName("completion_tokens_details")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public CompletionTokensDetailsDto? CompletionTokensDetails { get; init; }
+}
+
+/// <summary>OpenAI <c>usage.completion_tokens_details</c>.</summary>
+public sealed record CompletionTokensDetailsDto
+{
+    /// <summary>Tokens spent on reasoning (everything up to and including <c>&lt;/think&gt;</c>).</summary>
+    [JsonPropertyName("reasoning_tokens")]
+    public int ReasoningTokens { get; init; }
 }

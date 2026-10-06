@@ -76,6 +76,19 @@ public record InferenceOptions
     public IReadOnlyList<string> StopSequences { get; init; } = [];
 
     /// <summary>
+    /// When non-null, <see cref="StopSequences"/> are suspended while the model is inside a reasoning block
+    /// (#767) and only match answer text after it. Null = stop strings are active from the first token.
+    /// EOS and max-tokens are never gated.
+    /// </summary>
+    public StopGate? ReasoningStopGate { get; init; }
+
+    /// <summary>
+    /// Entries of <see cref="StopSequences"/> exempt from <see cref="ReasoningStopGate"/> (template control
+    /// tokens such as <c>&lt;|im_end|&gt;</c> that must end the turn wherever they appear).
+    /// </summary>
+    public IReadOnlyList<string>? StopSequencesUngated { get; init; }
+
+    /// <summary>
     /// Explicit sampler steps composing the sampling pipeline.
     /// When set, these steps are used instead of building from the flat properties
     /// (Temperature, TopK, TopP, MinP). Steps are applied in order.

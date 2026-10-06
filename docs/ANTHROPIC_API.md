@@ -16,8 +16,9 @@ Reference: <https://docs.anthropic.com/en/api/messages>
 > fork only; it is not part of upstream `kkokosa/dotLLM`. #449 added
 > `POST /v1/messages/count_tokens`, the `anthropic-version` / `anthropic-beta`
 > request headers, `tool_choice` enforcement, a mid-stream `error` event and
-> input-side `thinking` / `redacted_thinking` blocks. dotLLM does not *emit*
-> extended-thinking blocks — see [Extended thinking](#extended-thinking).
+> input-side `thinking` / `redacted_thinking` blocks. Since #767 dotLLM also
+> *emits* `thinking` blocks when the model reasons — see
+> [Extended thinking](#extended-thinking).
 
 ## Request headers
 
@@ -78,9 +79,15 @@ non-streaming (JSON) and streaming (named SSE events).
 - Unsupported / unknown content block types (`image`, `document`,
   `server_tool_use`, a typo) are **rejected with a `400`** rather than silently
   dropped: a dropped `image` block would have the model answer about a picture it
-  never received. `thinking` and `redacted_thinking` blocks are accepted and
-  dropped, so an extended-thinking transcript can be replayed unchanged.
-- `thinking` (the request field) is accepted and ignored.
+  never received. `redacted_thinking` blocks are accepted and dropped; `thinking`
+  blocks on an assistant message are replayed to the chat template as that turn's
+  reasoning (#767), so an extended-thinking transcript can be replayed unchanged.
+- `thinking` (the request field): `{"type":"enabled"}` / `{"type":"disabled"}` set the
+  template's `enable_thinking`; absent leaves the template default. `budget_tokens` is
+  accepted and not enforced (thinking counts toward `max_tokens`).
+- `chat_template_kwargs` and `reasoning_format` (dotLLM extensions) pass extra
+  variables to the chat template and override the server's `--reasoning-format`
+  for the request; see [SERVER.md](SERVER.md#reasoning--thinking-models-767).
 - `model` selects the resident model, exactly as on the OpenAI surface: it is
   passed to `ServerState.EnsureActiveAsync`, which activates an already-resident
   model, lazily reloads one that idled out, or loads a new one by path / HF repo
@@ -266,15 +273,34 @@ bare `400` with no Anthropic envelope. Same as the OpenAI surface.
 
 ### Extended thinking
 
-`thinking` and `redacted_thinking` blocks are accepted on input and **dropped**
-when the prompt is built: they carry no content dotLLM can replay, and the real
-API treats them as opaque. The `thinking` request field is accepted and ignored.
+When the model reasons (its template opens a `<think>` block, or it emits one),
+the response carries a leading `thinking` content block:
 
-dotLLM never *emits* `thinking` content blocks or `thinking_delta` /
-`signature_delta` stream deltas. Doing so would require splitting a model's
-`<think>` span out of the token stream (the close tag straddles token
-boundaries), which no dotLLM surface does today — it is a separate piece of
-work, not a wire-format detail.
+```json
+{"content": [
+  {"type": "thinking", "thinking": "We need to add 2 and 3…", "signature": ""},
+  {"type": "text", "text": "Five."}
+], "stop_reason": "end_turn"}
+```
+
+Streaming opens blocks lazily, in order: `content_block_start` (`thinking`),
+`thinking_delta`s, a closing `signature_delta`, `content_block_stop`, then the
+`text` block (index 1) and any `tool_use` blocks after it. A stream with no
+reasoning keeps the original event sequence (`text` block 0 opens eagerly),
+except that with the default `auto` format the block opens at the first answer
+text rather than before it.
+
+- The `signature` is always the empty string: dotLLM has nothing to sign with
+  and never verifies one on input.
+- `usage.output_tokens` includes the thinking tokens; a `max_tokens` that ends
+  mid-thought yields a response containing only the `thinking` block and
+  `stop_reason: "max_tokens"`.
+- Tool-call detection, `stop_sequences` and the `text` block see the **answer
+  only**; a `<tool_call>` quoted inside the thinking is not a call.
+- A forced `tool_choice` (`any` / `tool`) constrains decoding from the first
+  token, so thinking defaults off and the output is not split. See
+  [SERVER.md](SERVER.md#reasoning--thinking-models-767).
+- `redacted_thinking` is never emitted and is dropped on input.
 - **Masked text-diffusion models** are refused on this route with a `400`. The
   diffusion decode path is only wired into `/v1/chat/completions`; refusing is
   deliberate, so a diffusion checkpoint cannot silently produce autoregressive
