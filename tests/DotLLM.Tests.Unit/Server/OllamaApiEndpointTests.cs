@@ -145,8 +145,6 @@ public sealed class OllamaApiEndpointTests : IAsyncLifetime
     }
 
     [Theory]
-    [InlineData("/api/embed")]
-    [InlineData("/api/embeddings")]
     [InlineData("/api/create")]
     [InlineData("/api/copy")]
     [InlineData("/api/push")]

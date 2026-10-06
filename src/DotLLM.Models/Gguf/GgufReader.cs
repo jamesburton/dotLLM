@@ -105,6 +105,54 @@ public static class GgufReader
     }
 
     /// <summary>
+    /// Guards the GGUF type-id 42 collision. Upstream ggml's <c>Q2_0</c> is also type 42 but uses
+    /// 64-element groups, whereas <see cref="QuantizationType.PQ2_0"/> uses 128-element groups
+    /// (34 B/group); an upstream Q2_0 file would otherwise load and silently mis-decode. The tensor
+    /// info carries no layout tag, so this checks what is observable: the element count must be a
+    /// multiple of 128, and the on-disk extent (distance to the next tensor's offset, or to the end
+    /// of the data section for the last one) must equal the PQ2_0 byte count plus at most
+    /// <paramref name="alignment"/> bytes of padding. Pristine PrismML files use id 142 and always
+    /// pass. All backend loaders (CPU/CUDA/Vulkan) consume tensors via <c>GgufFile.Open</c>, so this
+    /// is the single choke point.
+    /// </summary>
+    /// <param name="tensors">Parsed tensor descriptors.</param>
+    /// <param name="alignment">Data-section alignment (<c>general.alignment</c>).</param>
+    /// <param name="dataSectionLength">Bytes from the data-section start to end of file.</param>
+    /// <exception cref="NotSupportedException">A PQ2_0-typed tensor is not laid out as PQ2_0.</exception>
+    public static void ValidatePq2_0Layout(IReadOnlyList<GgufTensorDescriptor> tensors, uint alignment, long dataSectionLength)
+    {
+        List<ulong>? offsets = null;
+        foreach (var t in tensors)
+        {
+            if (t.QuantizationType != QuantizationType.PQ2_0) continue;
+
+            long n = t.Shape.ElementCount;
+            long pq = QuantizationType.PQ2_0.ComputeByteCount(n);
+            string? why = null;
+            if (n % 128 != 0)
+            {
+                why = $"element count {n} is not a multiple of 128";
+            }
+            else
+            {
+                offsets ??= tensors.Select(x => x.DataOffset).Distinct().Order().ToList();
+                int idx = offsets.BinarySearch(t.DataOffset);
+                long end = idx + 1 < offsets.Count ? (long)offsets[idx + 1] : dataSectionLength;
+                long span = end - (long)t.DataOffset;
+                if (span < pq || span >= pq + alignment)
+                    why = $"on-disk extent is {span} bytes but PQ2_0 needs {pq} (+<{alignment} padding)";
+            }
+
+            if (why != null)
+                throw new NotSupportedException(
+                    $"Tensor '{t.Name}' has GGUF type id 42, which is ambiguous: dotLLM reads it as PQ2_0 " +
+                    "(PrismML ternary, 128-element groups) but upstream ggml uses 42 for Q2_0 (64-element " +
+                    $"groups), and this tensor does not fit the PQ2_0 layout ({why}). " +
+                    "Upstream Q2_0 is not supported; PQ2_0 models should declare type 142.");
+        }
+    }
+
+    /// <summary>
     /// Reads all tensor info entries from the current reader position.
     /// </summary>
     /// <param name="reader">A <see cref="BinaryReader"/> positioned after the metadata section.</param>

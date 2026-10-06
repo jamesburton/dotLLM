@@ -48,6 +48,8 @@ public sealed class ResidentModelSnapshot : IDisposable
     public IModel? DraftModel { get; init; }
     public string DraftModelPath { get; init; } = "";
     public GgufFile? DraftGguf { get; init; }
+    public bool MtpActive { get; init; }
+    public string? MtpStatus { get; init; }
 
     /// <summary>Approximate resident footprint (GGUF file size) used for eviction budget accounting.</summary>
     public long EstimatedBytes { get; init; }

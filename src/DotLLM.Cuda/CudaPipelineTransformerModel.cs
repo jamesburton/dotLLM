@@ -95,6 +95,7 @@ public sealed unsafe class CudaPipelineTransformerModel : IModel
     {
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
+        CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(CudaPipelineTransformerModel));
         ValidateSplit(splitLayer, config.NumLayers);
         ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);   // #484: before any CUDA resource exists
 
@@ -130,6 +131,7 @@ public sealed unsafe class CudaPipelineTransformerModel : IModel
     {
         ArgumentNullException.ThrowIfNull(cpuWeights);
         ArgumentNullException.ThrowIfNull(config);
+        CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(CudaPipelineTransformerModel));
         ValidateSplit(splitLayer, config.NumLayers);
         ptxDir = CudaKernels.ResolveAndValidatePtxDirectory(ptxDir);   // #484: before any CUDA resource exists
 

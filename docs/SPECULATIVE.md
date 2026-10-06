@@ -204,8 +204,10 @@ dotllm run qwen3.6-27b-mtp.gguf -p "Hello"
 # CLI: opt out of auto-detected MTP (e.g. for exact-timing comparisons or debugging)
 dotllm run qwen3.6-27b-mtp.gguf --no-mtp -p "Hello"
 
-# Serve: MTP is opt-in (default off) — takes the continuous-batch scheduler offline when enabled
-dotllm serve qwen3.6-27b-mtp.gguf --mtp
+# Serve: MTP is ON by default for models with an embedded head (#757) — adaptive gate, concurrency < 5, no external draft.
+# It takes the continuous-batch scheduler offline for that model; opt out with --no-mtp (--mtp is accepted but redundant)
+dotllm serve qwen3.6-27b-mtp.gguf
+dotllm serve qwen3.6-27b-mtp.gguf --no-mtp
 ```
 
 `--draft-model` and `--draft-tokens` are accepted as aliases of `--speculative-model` and

@@ -98,6 +98,14 @@ public sealed record ModelLoadRequest
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? SpeculativeK { get; init; }
 
+    /// <summary>
+    /// (#757) Embedded-MTP opt-out/in for this load. Null = keep the server setting (MTP is on by default for models that carry an MTP head);
+    /// <c>false</c> disables it (like <c>--no-mtp</c>). Nullable on purpose: an <c>init</c> initializer would be dropped by STJ source-gen.
+    /// </summary>
+    [JsonPropertyName("mtp")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Mtp { get; init; }
+
     /// <summary>RoPE scaling override: "none", "linear", "yarn", "ntk", "dynamic". Overrides the GGUF-derived value.</summary>
     [JsonPropertyName("rope_scaling")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
