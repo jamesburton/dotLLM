@@ -262,6 +262,33 @@ public record ModelConfig
     public RoPEConfig? GlobalRoPEConfig { get; init; }
 
     /// <summary>
+    /// Mistral-3 / Ministral-3 (Llama-4-style) attention temperature tuning, GGUF
+    /// <c>mistral3.attention.temperature_scale</c>. 0 = disabled (every other model). When non-zero
+    /// the post-RoPE query of the token at position <c>p</c> is multiplied by
+    /// <see cref="AttnTemperatureAt"/> on every layer — llama.cpp <c>llm_graph_input_attn_temp</c> /
+    /// <c>mistral3.cpp</c> (issue #743).
+    /// </summary>
+    public float AttnTemperatureScale { get; init; }
+
+    /// <summary>
+    /// Position bucket width for <see cref="AttnTemperatureScale"/> (llama.cpp
+    /// <c>n_attn_temp_floor_scale</c> = the YaRN original context length). Ignored when the scale is 0.
+    /// </summary>
+    public int AttnTemperatureFloorScale { get; init; }
+
+    /// <summary>
+    /// Per-position query multiplier <c>log(floor(pos / floorScale) + 1) * scale + 1</c>
+    /// (llama.cpp <c>llm_graph_input_attn_temp::set_input</c>, offset 0, double-precision log).
+    /// Returns exactly 1 when the feature is disabled.
+    /// </summary>
+    /// <param name="position">Absolute token position.</param>
+    public float AttnTemperatureAt(int position)
+    {
+        if (AttnTemperatureScale == 0f || AttnTemperatureFloorScale <= 0) return 1.0f;
+        return (float)(Math.Log(Math.Floor((double)position / AttnTemperatureFloorScale) + 1.0) * AttnTemperatureScale + 1.0);
+    }
+
+    /// <summary>
     /// Optional partial-rotary factor applied to the FULL-attention layers
     /// (Gemma 4 <c>partial_rotary_factor</c>, e.g. 0.25). When non-null, only the
     /// leading <c>round(PartialRotaryFactor * head_dim)</c> (rounded down to an

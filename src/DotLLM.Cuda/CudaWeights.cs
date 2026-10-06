@@ -605,7 +605,7 @@ internal sealed class CudaWeights : IDisposable
         // mscale multiplies cos AND sin at every position. Mirrors the CPU gate in
         // TransformerModel.BuildFromPrebuiltWeightsInternal: dense path only (MLA models
         // carry their own YaRN cos/sin tables through CudaTransformerModel's MLA state).
-        var (ropeYarnInvFreq, ropeYarnMscale) = UploadDenseYarnInvFreq(config, allocs);
+        var (ropeYarnInvFreq, ropeYarnMscale) = UploadDenseYarnInvFreq(config, cpuWeights.RopeFreqFactors, allocs);
 
         return new CudaWeights(layers, tokenEmbed, tokenEmbedQt,
             outputNorm, outputWeight, cpuWeights.OutputOutputDim, cpuWeights.OutputInputDim,
@@ -647,8 +647,40 @@ internal sealed class CudaWeights : IDisposable
     /// released both by the mid-load failure unwind and by <see cref="Dispose"/>.
     /// </remarks>
     private static unsafe (nint InvFreqDevice, float Mscale) UploadDenseYarnInvFreq(
-        ModelConfig config, List<nint> allocs)
+        ModelConfig config, float[]? ropeFreqFactors, List<nint> allocs)
     {
+        // Mistral-3 / Ministral-3 attention temperature (#743) scales Q after RoPE per position; no CUDA
+        // kernel implements it yet (needs a PTX rebuild on the CUDA box). Refuse loudly rather than run
+        // with silently wrong attention at long context. CPU and Vulkan implement it.
+        if (config.AttnTemperatureScale != 0f)
+            throw new NotSupportedException(
+                "Mistral-3 attention temperature scaling (attention.temperature_scale) is not implemented on the "
+                + "CUDA backend yet (issue #743: CPU and Vulkan honour it). Use --device cpu or vulkan for this model.");
+
+        // Dense llama3-style rope_freqs.weight (#743): the same per-pair inverse-frequency
+        // device buffer carries it (angle = pos * theta^(-2i/d) / factor[i], mscale 1), so every
+        // RoPE kernel call site that already forwards this pointer picks it up with no kernel
+        // change. Gemma-3/4 (separate global table) and MLA are excluded by Select.
+        if (config.MlaConfig is null && config.RoPEConfig is DotLLM.Core.PositionEncoding.RoPEConfig frope)
+        {
+            int fDim = frope.DimensionCount != 0 ? frope.DimensionCount : config.HeadDim;
+            if (fDim > 0 && fDim % 2 == 0
+                && DotLLM.Models.Architectures.DenseRopeFreqFactors.Select(config, ropeFreqFactors, fDim) is { } factors)
+            {
+                int fHalf = fDim / 2;
+                float[] inv = new float[fHalf];
+                for (int i = 0; i < fHalf; i++)
+                    inv[i] = 1.0f / (MathF.Pow(frope.Theta, 2.0f * i / fDim) * factors[i]);
+                nint fDev;
+                unsafe
+                {
+                    fixed (float* fp = inv)
+                        fDev = AllocAndUpload((nint)fp, (long)fHalf * sizeof(float), allocs);
+                }
+                return (fDev, 1.0f);
+            }
+        }
+
         // MLA is excluded because it never consumes the kernels this buffer feeds — it runs
         // a separate, table-driven RoPE path whose cos/sin tables CudaTransformerModel
         // uploads itself. NOT because MLA's YaRN is already handled: that path calls the

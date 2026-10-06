@@ -342,6 +342,15 @@ The three contributing issues:
     host-precomputed inverse-frequency + mscale upload sharing the CPU math as
     the single source of truth.
 
+**Llama-3.x `rope_freqs.weight` and Mistral-3 attention temperature (#743).** GGUF Llama-3.1/3.2/3.3 carry
+the llama3 NTK scaling as a per-pair `rope_freqs.weight` divisor table (llama.cpp `freq_factors`); it is now
+folded into the dense RoPE table on **CPU, Vulkan and CUDA** (angle = pos * theta^(-2i/d) / factor[i], every layer;
+`DenseRopeFreqFactors.Select` is the single gate). Combining the tensor with dense YaRN is refused at load.
+Llama-3.2-1B Q8_0, ctx 4096, 3 chunks wikitext-2 LF: PPL 11.1899 (was 11.2205) vs llama.cpp CPU 11.1840.
+`mistral3.attention.temperature_scale` (Ministral-3) multiplies each post-RoPE query by
+`log(floor(pos / n_ctx_orig_yarn) + 1) * scale + 1` (`ModelConfig.AttnTemperatureAt`); implemented on CPU and
+Vulkan, **refused at load on CUDA** (needs a PTX rebuild on the CUDA box). Dense YaRN itself is still not applied on Vulkan.
+
 **No real-weight CUDA run yet.** All CUDA verification above is against
 synthetic fixtures. No `gpt-oss-20b-mxfp4.gguf` is present in
 `~/.dotllm/test-cache/`, `E:\dotllm-test-cache\`, or the HF hub cache
