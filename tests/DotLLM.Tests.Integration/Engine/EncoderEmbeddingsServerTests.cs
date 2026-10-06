@@ -62,6 +62,32 @@ public sealed class EncoderEmbeddingsServerTests
     }
 
     [SkippableFact]
+    public async Task Ollama_api_embed_matches_v1_embeddings()
+    {
+        var (client, app) = (await Boot())!.Value;
+        try
+        {
+            var v1 = await Embed(client, "{\"input\":\"hello world\",\"dimensions\":64}");
+            var r = await client.PostAsync("/api/embed",
+                new StringContent("{\"model\":\"minilm\",\"input\":[\"hello world\",\"second\"],\"dimensions\":64}", Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.OK, r.StatusCode);
+            using var doc = JsonDocument.Parse(await r.Content.ReadAsStringAsync());
+            var embs = doc.RootElement.GetProperty("embeddings");
+            Assert.Equal(2, embs.GetArrayLength());
+            var first = embs[0].EnumerateArray().Select(x => x.GetSingle()).ToArray();
+            Assert.Equal(v1, first);
+            Assert.True(doc.RootElement.GetProperty("prompt_eval_count").GetInt32() > 0);
+
+            var legacy = await client.PostAsync("/api/embeddings",
+                new StringContent("{\"model\":\"minilm\",\"prompt\":\"hello world\"}", Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.OK, legacy.StatusCode);
+            using var ld = JsonDocument.Parse(await legacy.Content.ReadAsStringAsync());
+            Assert.Equal(384, ld.RootElement.GetProperty("embedding").GetArrayLength());
+        }
+        finally { client.Dispose(); await app.StopAsync(); await app.DisposeAsync(); }
+    }
+
+    [SkippableFact]
     public void Encoder_on_gpu_device_fails_loudly_instead_of_falling_back()
     {
         var loc = TestFixtureResolver.ResolveFile("DOTLLM_MINILM_GGUF", "second-state",
