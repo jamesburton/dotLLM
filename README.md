@@ -379,7 +379,7 @@ curl -N http://localhost:8080/v1/chat/completions \
 | `POST /v1/embeddings` | embeddings ([docs/SERVER.md](docs/SERVER.md)) |
 | `/api/chat`, `/api/generate`, `/api/tags`, `/api/ps`, `/api/show`, `/api/version`, `/api/pull`, `/api/delete` | **ollama-compatible API** — point Open WebUI, Continue, ollama-python/js etc. at the server (`OLLAMA_HOST=http://localhost:8080`). `/api/embed`, `/api/embeddings`, `/api/create`, `/api/copy`, `/api/push` answer `501` with a pointer to the dotLLM equivalent; `tools` in `/api/chat` is `501` (use `/v1/chat/completions`) |
 | `POST /v1/systemone` | Jev-compatible decision endpoint: typed questions in, per-option probabilities out, one prefill and no decode loop (built for Tev1-style decision models; tune with `--decision-temperature` / `--decision-orderings`) |
-| `POST /v1/models/{load,unload,pull,enable,disable}`, `PUT /v1/settings`, `POST /v1/admin/shutdown` | management API, **off by default**; enabled by `--allow-model-admin`. `dotllm ps`, `dotllm stop [model\|--all\|--server]` and the [Windows tray](docs/TRAY.md) are clients of it. `--allow-lora-admin` separately gates runtime LoRA load/unload |
+| `POST /v1/models/{unload,pull,enable,disable}`, `PUT /v1/settings`, `POST /v1/admin/shutdown` | management API, **off by default**; enabled by `--allow-model-admin`. `dotllm ps`, `dotllm stop [model\|--all\|--server]` and the [Windows tray](docs/TRAY.md) are clients of it. `--allow-lora-admin` separately gates runtime LoRA load/unload |
 
 Reference: [docs/SERVER.md](docs/SERVER.md). The Windows system tray app (starts/attaches to a server, autostart, update check) is documented in [docs/TRAY.md](docs/TRAY.md).
 
