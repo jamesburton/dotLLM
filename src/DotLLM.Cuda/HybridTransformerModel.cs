@@ -210,7 +210,8 @@ public sealed unsafe class HybridTransformerModel : IModel
                 cpuState = new TransformerForwardState(
                     config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
                     config.HeadDim, config.IntermediateSize, config.VocabSize,
-                    config.MaxSequenceLength, ropeDim, ropeTheta);
+                    config.MaxSequenceLength, ropeDim, ropeTheta,
+                    ropeFreqFactors: DotLLM.Models.Architectures.DenseRopeFreqFactors.Select(config, cpuWeights.RopeFreqFactors, ropeDim));
 
                 // 7. ComputeThreadPool for CPU layers
                 if (threading.IsParallel)
@@ -367,7 +368,8 @@ public sealed unsafe class HybridTransformerModel : IModel
             cpuState = new TransformerForwardState(
                 config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
                 config.HeadDim, config.IntermediateSize, config.VocabSize,
-                config.MaxSequenceLength, ropeDim, ropeTheta);
+                config.MaxSequenceLength, ropeDim, ropeTheta,
+                    ropeFreqFactors: DotLLM.Models.Architectures.DenseRopeFreqFactors.Select(config, cpuWeights.RopeFreqFactors, ropeDim));
 
             // 7. ComputeThreadPool for CPU layers — mirror the LoadFromGguf branch
             if (effectiveThreading.IsParallel)

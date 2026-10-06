@@ -80,6 +80,10 @@ app.Configure(config =>
         .WithDescription("Interactive multi-turn chat with a GGUF model.")
         .WithExample("chat", "QuantFactory/SmolLM-135M-GGUF", "--system", "You are a helpful assistant.");
 
+    config.AddCommand<EmbedCommand>("embed")
+        .WithDescription("Print embeddings (JSON Lines) for text using a GGUF embedding model (CPU).")
+        .WithExample("embed", "nomic-ai/nomic-embed-text-v1.5-GGUF", "hello world", "--dimensions", "256");
+
     config.AddCommand<PerplexityCommand>("perplexity")
         .WithDescription("Compute perplexity over a text corpus.")
         .WithExample("perplexity", "QuantFactory/SmolLM-135M-GGUF", "--corpus", "wiki.test.raw", "--context", "512", "--stride", "256");

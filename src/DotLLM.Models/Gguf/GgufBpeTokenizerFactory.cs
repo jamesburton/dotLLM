@@ -20,6 +20,10 @@ public static class GgufBpeTokenizerFactory
     public static BpeTokenizer Load(GgufMetadata metadata)
     {
         string model = metadata.GetStringOrDefault("tokenizer.ggml.model", "llama");
+        if (model == "bert")
+            throw new NotSupportedException(
+                "This GGUF carries a BERT WordPiece vocabulary (tokenizer.ggml.model = \"bert\"), which is "
+                + "not a BpeTokenizer. Load it with GgufTokenizerFactory.Load (returns an ITokenizer).");
         string[] tokens = metadata.GetStringArray("tokenizer.ggml.tokens");
 
         int[]? tokenTypes = metadata.ContainsKey("tokenizer.ggml.token_type")

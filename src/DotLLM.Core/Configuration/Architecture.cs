@@ -412,5 +412,18 @@ public enum Architecture
     /// <c>set_swa_pattern(2)</c>) and the <c>query_pre_attn_scalar</c> score scale
     /// (<c>head_dim</c> for 2B/9B, <c>hidden/heads</c> for the 46-layer 27B). GGUF only.
     /// </summary>
-    Gemma2
+    Gemma2,
+
+    /// <summary>
+    /// BERT-class bidirectional encoder (llama.cpp <c>bert</c>): post-LayerNorm, learned absolute
+    /// positions + token-type embedding, biased projections, GELU FFN. Embedding-only (no LM head);
+    /// served via <see cref="DotLLM.Core.Models.IEmbeddingModel"/> (issue #739).
+    /// </summary>
+    Bert,
+
+    /// <summary>
+    /// nomic-embed encoder (llama.cpp <c>nomic-bert</c>): BERT layout with RoPE (NeoX) instead of
+    /// absolute positions, fused QKV, SwiGLU FFN, no biases (issue #739).
+    /// </summary>
+    NomicBert
 }

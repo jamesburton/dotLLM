@@ -316,7 +316,7 @@ To embed the same endpoints inside your own ASP.NET Core app, see [Host the Open
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
-| `--device` | `-d` | `cpu` | Compute device: `cpu`, `gpu`, `gpu:0`, `gpu:1` |
+| `--device` | `-d` | `cpu` (`serve`: `auto`) | Compute device: `auto` (serve default: CUDA, else Vulkan, else CPU), `cpu`, `gpu`, `gpu:0`, `gpu:1`, `vulkan` |
 | `--gpu-layers` | | *(all if `gpu`, 0 if `cpu`)* | Transformer layers on GPU (hybrid offload) |
 | `--threads` | | 0 (auto) | CPU threads for inference |
 | `--decode-threads` | | 0 (auto) | Decode threads (capped at memory channels) |
@@ -327,6 +327,7 @@ To embed the same endpoints inside your own ASP.NET Core app, see [Host the Open
 | `--cache-type-v` | | `f32` | KV-cache value quant: `f32`, `q8_0`, `q4_0` |
 | `--speculative-model` | | *(none)* | Draft model for speculative decoding (must share vocab) |
 | `--speculative-k` | | 3 | Draft tokens per speculative step |
+| `--no-mtp` | | off | `serve`: opt out of default-on MTP self-speculation (models with an embedded MTP head, expected concurrency < 5, no `--speculative-model`). `--mtp` is accepted for back-compat. See [docs/SERVER.md](docs/SERVER.md) |
 
 **Sampling & constraints** (shared by `run` and `chat`):
 

@@ -256,6 +256,11 @@ internal sealed class CudaWeights : IDisposable
                                               Action<nint>? onHostTensorUploaded = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(firstLayer);
+        // Dense Gemma-4 (E2B/E4B, #734) runs only on the whole-model CudaTransformerModel Gemma-4 forward; a layer
+        // window (hybrid / pipeline split) cannot host PLE inputs or cross-window shared-KV donors.
+        if (config.IsGemma4DensePle && (firstLayer != 0 || (numGpuLayers >= 0 && numGpuLayers < config.NumLayers)))
+            throw new NotSupportedException(
+                "The Gemma-4 dense variant (PLE + shared KV) cannot be split across devices/pipeline stages on CUDA.");
         int layerCount = numGpuLayers < 0
             ? config.NumLayers - firstLayer
             : Math.Min(numGpuLayers, config.NumLayers - firstLayer);
@@ -377,6 +382,8 @@ internal sealed class CudaWeights : IDisposable
             // V-from-K (gemma4 global layers): no attn_v.weight — the V slot is 0
             // on the CPU side and the forward copies the raw K projection into V.
             bool vFromK = isGemma4Layer && lw.Gemma4!.VFromK;
+            // Gemma-4 dense shared-KV layer (E2B/E4B trailing layers): the CPU loader leaves K/V unloaded.
+            bool sharedKv = isGemma4Layer && lw.KWeight == 0;
 
             nint q = 0, k = 0, v = 0, o = 0;
             nint qQuant = 0, kQuant = 0, vQuant = 0, oQuant = 0;
@@ -386,10 +393,10 @@ internal sealed class CudaWeights : IDisposable
             if (!isMlaLayer)
             {
                 q = SkipFp16(lw.QQuantType, kernels) ? 0 : UploadAndDequant(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim, allocs, kernels, stream, $"layer {globalLayer} Q projection");
-                k = SkipFp16(lw.KQuantType, kernels) ? 0 : UploadAndDequant(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs, kernels, stream, $"layer {globalLayer} K projection");
+                k = (sharedKv || SkipFp16(lw.KQuantType, kernels)) ? 0 : UploadAndDequant(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs, kernels, stream, $"layer {globalLayer} K projection");
                 // V-from-K (gemma4 global layers): no attn_v.weight — leave V slots 0;
                 // the gemma4 forward copies the raw K projection into V.
-                v = (vFromK || SkipFp16(lw.VQuantType, kernels)) ? 0 : UploadAndDequant(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs, kernels, stream, $"layer {globalLayer} V projection");
+                v = (vFromK || sharedKv || SkipFp16(lw.VQuantType, kernels)) ? 0 : UploadAndDequant(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs, kernels, stream, $"layer {globalLayer} V projection");
                 o = SkipFp16(lw.OQuantType, kernels) ? 0 : UploadAndDequant(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim, allocs, kernels, stream, $"layer {globalLayer} O projection");
 
                 // ── Upload raw quantized Q/K/V weights ──
@@ -402,7 +409,7 @@ internal sealed class CudaWeights : IDisposable
                 // given pointer. Saves ~`(qOut+kOut+vOut)*rowBytes` per layer of VRAM that
                 // was previously double-stored. Only the packed allocation is in `allocs`.
                 // Skip packing on V-from-K layers — there is no V tensor to pack.
-                if (!CudaKernels.DisablePackedQkv && !vFromK)
+                if (!CudaKernels.DisablePackedQkv && !vFromK && !sharedKv)
                 {
                     (qkvPacked, qkvPackedQt, qkvPackedOut,
                      qQuant, kQuant, vQuant) = TryUploadPackedThree(
@@ -415,8 +422,8 @@ internal sealed class CudaWeights : IDisposable
                 {
                     // Fusion not possible — fall back to per-tensor uploads (separate allocations).
                     qQuant = UploadQuantized(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim, allocs);
-                    kQuant = UploadQuantized(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs);
-                    vQuant = vFromK ? 0 : UploadQuantized(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs);
+                    kQuant = sharedKv ? 0 : UploadQuantized(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs);
+                    vQuant = (vFromK || sharedKv) ? 0 : UploadQuantized(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs);
                 }
 
                 oQuant = UploadQuantized(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim, allocs);
@@ -546,9 +553,17 @@ internal sealed class CudaWeights : IDisposable
                 // (five F32 norms, router scale with 1/√H folded, layer_output_scale,
                 // V-from-K flag). The experts reuse the F32 CudaMoeFfn routed path
                 // (GeGLU substituted for SwiGLU by the gemma4 FFN helper).
-                var (extras, g4Moe) = CudaGemma4WeightsLoader.LoadLayer(lw, config, allocs);
-                gemma4Layers![i] = extras;
-                moeLayers![i] = g4Moe;
+                if (!isMoeLayer)
+                {
+                    // Dense variant (E2B/E4B, #734): no experts; norms + PLE injection weights only.
+                    gemma4Layers![i] = CudaGemma4WeightsLoader.LoadDenseLayer(lw, config, allocs);
+                }
+                else
+                {
+                    var (extras, g4Moe) = CudaGemma4WeightsLoader.LoadLayer(lw, config, allocs);
+                    gemma4Layers![i] = extras;
+                    moeLayers![i] = g4Moe;
+                }
             }
             else if (isMoeLayer)
             {
@@ -590,7 +605,7 @@ internal sealed class CudaWeights : IDisposable
         // mscale multiplies cos AND sin at every position. Mirrors the CPU gate in
         // TransformerModel.BuildFromPrebuiltWeightsInternal: dense path only (MLA models
         // carry their own YaRN cos/sin tables through CudaTransformerModel's MLA state).
-        var (ropeYarnInvFreq, ropeYarnMscale) = UploadDenseYarnInvFreq(config, allocs);
+        var (ropeYarnInvFreq, ropeYarnMscale) = UploadDenseYarnInvFreq(config, cpuWeights.RopeFreqFactors, allocs);
 
         return new CudaWeights(layers, tokenEmbed, tokenEmbedQt,
             outputNorm, outputWeight, cpuWeights.OutputOutputDim, cpuWeights.OutputInputDim,
@@ -632,8 +647,40 @@ internal sealed class CudaWeights : IDisposable
     /// released both by the mid-load failure unwind and by <see cref="Dispose"/>.
     /// </remarks>
     private static unsafe (nint InvFreqDevice, float Mscale) UploadDenseYarnInvFreq(
-        ModelConfig config, List<nint> allocs)
+        ModelConfig config, float[]? ropeFreqFactors, List<nint> allocs)
     {
+        // Mistral-3 / Ministral-3 attention temperature (#743) scales Q after RoPE per position; no CUDA
+        // kernel implements it yet (needs a PTX rebuild on the CUDA box). Refuse loudly rather than run
+        // with silently wrong attention at long context. CPU and Vulkan implement it.
+        if (config.AttnTemperatureScale != 0f)
+            throw new NotSupportedException(
+                "Mistral-3 attention temperature scaling (attention.temperature_scale) is not implemented on the "
+                + "CUDA backend yet (issue #743: CPU and Vulkan honour it). Use --device cpu or vulkan for this model.");
+
+        // Dense llama3-style rope_freqs.weight (#743): the same per-pair inverse-frequency
+        // device buffer carries it (angle = pos * theta^(-2i/d) / factor[i], mscale 1), so every
+        // RoPE kernel call site that already forwards this pointer picks it up with no kernel
+        // change. Gemma-3/4 (separate global table) and MLA are excluded by Select.
+        if (config.MlaConfig is null && config.RoPEConfig is DotLLM.Core.PositionEncoding.RoPEConfig frope)
+        {
+            int fDim = frope.DimensionCount != 0 ? frope.DimensionCount : config.HeadDim;
+            if (fDim > 0 && fDim % 2 == 0
+                && DotLLM.Models.Architectures.DenseRopeFreqFactors.Select(config, ropeFreqFactors, fDim) is { } factors)
+            {
+                int fHalf = fDim / 2;
+                float[] inv = new float[fHalf];
+                for (int i = 0; i < fHalf; i++)
+                    inv[i] = 1.0f / (MathF.Pow(frope.Theta, 2.0f * i / fDim) * factors[i]);
+                nint fDev;
+                unsafe
+                {
+                    fixed (float* fp = inv)
+                        fDev = AllocAndUpload((nint)fp, (long)fHalf * sizeof(float), allocs);
+                }
+                return (fDev, 1.0f);
+            }
+        }
+
         // MLA is excluded because it never consumes the kernels this buffer feeds — it runs
         // a separate, table-driven RoPE path whose cos/sin tables CudaTransformerModel
         // uploads itself. NOT because MLA's YaRN is already handled: that path calls the

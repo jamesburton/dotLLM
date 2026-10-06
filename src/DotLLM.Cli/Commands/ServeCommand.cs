@@ -120,24 +120,31 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
 
         /// <summary>Number of draft candidates per speculative step.</summary>
         [CommandOption("--speculative-k|--draft-tokens")]
-        [Description("Number of draft tokens per speculative step (K). Default 3. Also used as K for --mtp.")]
+        [Description("Number of draft tokens per speculative step (K). Default 3. Also used as K for MTP.")]
         [DefaultValue(DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates)]
         public int SpeculativeK { get; set; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
 
-        /// <summary>Opt-in to MTP self-speculative decoding when the loaded GGUF carries an MTP head.</summary>
+        /// <summary>Accepted for back-compat: MTP is already on by default for models with an embedded head.</summary>
         [CommandOption("--mtp")]
-        [Description("Enable Multi-Token Prediction (MTP) self-speculative decoding when the loaded GGUF carries " +
-                     "an MTP head (nextn.* tensors); no-op otherwise. Off by default for serve (unlike run/chat, " +
-                     "which auto-detect): enabling it disables the continuous-batch scheduler for this model, " +
-                     "same restriction as --speculative-model, which would be a surprising throughput trade for " +
-                     "concurrent server traffic to make silently.")]
+        [Description("Multi-Token Prediction (MTP) self-speculative decoding is ON by default for serve when the loaded GGUF carries an " +
+                     "embedded MTP head (nextn.* tensors) and no --speculative-model is given and --expected-concurrency is below 5 " +
+                     "(adaptive: it backs off when drafts stop paying). --mtp is accepted for back-compat and only changes the startup log; " +
+                     "it does not override those rules. Use --no-mtp to opt out. Tradeoff: while MTP is active the continuous-batch " +
+                     "scheduler is off for this model.")]
         [DefaultValue(false)]
         public bool Mtp { get; set; }
+
+        /// <summary>Opt out of the default-on MTP self-speculative decoding.</summary>
+        [CommandOption("--no-mtp")]
+        [Description("Disable the default-on MTP self-speculative decoding for models with an embedded MTP head (keeps the continuous-batch " +
+                     "scheduler available for concurrent clients).")]
+        [DefaultValue(false)]
+        public bool NoMtp { get; set; }
 
         /// <summary>Expected number of concurrent decode streams; 5 or more enables the Vulkan continuous-batch scheduler.</summary>
         [CommandOption("--expected-concurrency")]
         [Description("Expected number of concurrently decoding requests. At 5 or more, Vulkan hybrid models serve through the continuous-batch " +
-                     "scheduler (measured +73% aggregate decode throughput at 8 concurrent on Tev1-4B; parity at 4 or fewer, off with --mtp). " +
+                     "scheduler (measured +73% aggregate decode throughput at 8 concurrent on Tev1-4B; parity at 4 or fewer). At 5 or more, default-on MTP is dropped for the model. " +
                      "0 (default) keeps the serial per-request path. DOTLLM_VK_SCHEDULER=0|1 overrides.")]
         [DefaultValue(0)]
         public int ExpectedConcurrency { get; set; }
@@ -303,7 +310,8 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             UsePaged = !settings.NoPaged,
             SpeculativeModel = settings.SpeculativeModel,
             SpeculativeCandidates = settings.SpeculativeK,
-            MtpEnabled = settings.Mtp,
+            MtpEnabled = !settings.NoMtp,
+            MtpExplicit = settings.Mtp && !settings.NoMtp,
             PrefillChunkSize = settings.PrefillChunkSize,
             KeepAliveSeconds = settings.KeepAlive,
             MaxResidentModels = settings.MaxResidentModels,

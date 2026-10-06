@@ -7,7 +7,7 @@ namespace DotLLM.Models.Gguf;
 /// <summary>
 /// Extracts a <see cref="ModelConfig"/> from GGUF metadata following standard GGUF key conventions.
 /// </summary>
-public static class GgufModelConfigExtractor
+public static partial class GgufModelConfigExtractor
 {
     /// <summary>
     /// Builds a <see cref="ModelConfig"/> from the given GGUF metadata.
@@ -20,6 +20,9 @@ public static class GgufModelConfigExtractor
         string archString = metadata.GetString("general.architecture");
         Architecture architecture = ParseArchitecture(archString);
         string arch = archString.ToLowerInvariant();
+
+        if (architecture is Architecture.Bert or Architecture.NomicBert)
+            return BuildBertConfig(metadata, arch, architecture);
 
         // Gemma 4 / DiffusionGemma have a fundamentally different per-layer shape
         // (dual head_dim, dual KV-head count stored as a per-layer array, dual
@@ -110,6 +113,20 @@ public static class GgufModelConfigExtractor
 
         RoPEConfig? ropeConfig = ExtractRoPEConfig(metadata, arch, headDim, architecture);
 
+        // Mistral-3 / Ministral-3 attention temperature (llama.cpp mistral3.cpp): Q *= log(floor(pos/n_ctx_orig_yarn)+1)*scale+1.
+        float attnTempScale = 0f;
+        int attnTempFloor = 0;
+        if (string.Equals(archString, "mistral3", StringComparison.OrdinalIgnoreCase))
+        {
+            attnTempScale = metadata.GetFloat32OrDefault($"{arch}.attention.temperature_scale", 0.0f);
+            if (attnTempScale != 0f)
+            {
+                attnTempFloor = ropeConfig?.OrigMaxSeqLen > 0 ? ropeConfig!.Value.OrigMaxSeqLen : maxSeqLen;
+                if (attnTempFloor <= 0)
+                    throw new InvalidDataException("mistral3 attention.temperature_scale requires a positive original context length.");
+            }
+        }
+
         // GDN models reuse the same {arch}.ssm.* key names as Mamba-2 but with
         // different semantics — skip Mamba-2 SSM config extraction for them.
         MambaSsmConfig? ssmConfig = architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense
@@ -190,6 +207,8 @@ public static class GgufModelConfigExtractor
             FinalLogitSoftcap = isGemma2 ? metadata.GetFloat32OrDefault($"{arch}.final_logit_softcapping", 30.0f) : null,
             QueryPreAttnScalar = isGemma2 ? ResolveGemma2QueryPreAttnScalar(numTrunkLayers, hiddenSize, numAttentionHeads, headDim) : null,
             RoPEConfig = ropeConfig,
+            AttnTemperatureScale = attnTempScale,
+            AttnTemperatureFloorScale = attnTempFloor,
             PositionEncodingType = ropeConfig.HasValue ? PositionEncodingType.RoPE : PositionEncodingType.None,
             SlidingWindowSize = slidingWindowSize,
             SlidingWindowPattern = slidingWindowPattern,
@@ -774,6 +793,9 @@ public static class GgufModelConfigExtractor
             // Gemma 1 / CodeGemma (llama.cpp LLM_ARCH_GEMMA) and Gemma 2 (LLM_ARCH_GEMMA2).
             "gemma" => Architecture.Gemma,
             "gemma2" => Architecture.Gemma2,
+            // BERT-class embedding encoders (#739).
+            "bert" => Architecture.Bert,
+            "nomic-bert" => Architecture.NomicBert,
             _ => throw new InvalidDataException($"Unsupported GGUF architecture: '{archString}'.")
         };
     }

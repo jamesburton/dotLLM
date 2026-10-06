@@ -327,7 +327,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             // full-attention layers): folded into the global cos/sin table
             // (angle = pos * θ^(-2i/dim) / factor[i], ggml theta/ff). Null for
             // every model without the tensor.
-            globalFreqFactors: globalRopeDim > 0 ? weights.RopeFreqFactors : null);
+            globalFreqFactors: globalRopeDim > 0 ? weights.RopeFreqFactors : null,
+            // Dense models (no global table): rope_freqs.weight applies to every layer (#743).
+            ropeFreqFactors: DenseRopeFreqFactors.Select(config, weights.RopeFreqFactors, ropeDim));
 
         // For MLA + YaRN (DeepSeek-V2/V3 long-context), rebuild cos/sin tables
         // using per-dim ramped inverse frequencies. Plain precompute above is a
@@ -1373,6 +1375,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                     numHeads, numKvHeadsLayer, headDimLayer, ropeDimLayer,
                     ropeCos, ropeSin, ropeTypeLayer);
             }
+            // Mistral-3 attention temperature (no-op when disabled): Q *= f(pos) after RoPE (#743).
+            ApplyAttnTemperature(q, positions, seqLen, qStrideLayer);
 
             // e. Attention — with or without KV-cache
             // Gemma 3 family extras (no-op on every other architecture):
@@ -3241,6 +3245,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                         numHeads, numKvHeadsLayer, headDim, ropeDimLayer,
                         ropeCos, ropeSin, ropeTypeLayer);
                 }
+                ApplyAttnTemperature(qSlice, positions, n, qStride);
 
                 IKvCache kvCache = r.KvCache;
                 // KV cache is required on the request — write new K/V then attend
@@ -3494,6 +3499,21 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         LoraProjection.Apply(_currentAdapter, LoraAdapter.SelfConditioningLayerIndex, projName, x, y,
                              canvasLen, inputDim, outputDim, _threadPool,
                              region: LoraRegion.Any);
+    }
+
+    /// <summary>
+    /// Mistral-3 / Ministral-3 attention temperature (llama.cpp <c>llm_graph_input_attn_temp</c>):
+    /// multiplies every post-RoPE query row by <see cref="ModelConfig.AttnTemperatureAt"/> of its
+    /// position. No-op (single branch) for every other model (#743).
+    /// </summary>
+    private void ApplyAttnTemperature(float* q, ReadOnlySpan<int> positions, int seqLen, int qStride)
+    {
+        if (Config.AttnTemperatureScale == 0f) return;
+        for (int t = 0; t < seqLen; t++)
+        {
+            float f = Config.AttnTemperatureAt(positions[t]);
+            System.Numerics.Tensors.TensorPrimitives.Multiply(new Span<float>(q + (long)t * qStride, qStride), f, new Span<float>(q + (long)t * qStride, qStride));
+        }
     }
 
     /// <summary>
@@ -3930,36 +3950,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     private void GatherPerLayerIdentity(
         ReadOnlySpan<int> tokenIds, float* dest, int rowWidth, float scale,
         nint tablePtr, QuantizationType qt)
-    {
-        int pleVocab = _weights.PerLayerEmbedding!.VocabSize;
-        for (int t = 0; t < tokenIds.Length; t++)
-        {
-            int tokenId = tokenIds[t];
-            if ((uint)tokenId >= (uint)pleVocab)
-                throw new ArgumentOutOfRangeException(nameof(tokenIds),
-                    $"PLE token ID {tokenId} at position {t} is out of range [0, {pleVocab}).");
-
-            var destSpan = new Span<float>(dest + t * rowWidth, rowWidth);
-            if (qt == QuantizationType.F32)
-            {
-                float* src = (float*)tablePtr + (long)tokenId * rowWidth;
-                new ReadOnlySpan<float>(src, rowWidth).CopyTo(destSpan);
-            }
-            else if (qt == QuantizationType.F16)
-            {
-                Half* src = (Half*)tablePtr + (long)tokenId * rowWidth;
-                TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(src, rowWidth), destSpan);
-            }
-            else
-            {
-                long rowBytes = Dequantize.RowByteSize(rowWidth, qt);
-                nint rowPtr = tablePtr + (nint)((long)tokenId * rowBytes);
-                Dequantize.ToFloat32(rowPtr, rowWidth, qt, destSpan);
-            }
-
-            TensorPrimitives.Multiply(destSpan, scale, destSpan);
-        }
-    }
+        => Gemma4PerLayerInputs.GatherIdentity(_weights.PerLayerEmbedding!, tokenIds, dest, rowWidth, scale);
 
     /// <summary>
     /// Dequantizes one token-embedding row (token id <paramref name="tokenId"/>) into

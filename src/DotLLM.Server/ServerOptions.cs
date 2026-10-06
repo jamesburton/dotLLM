@@ -16,7 +16,7 @@ public sealed record ServerOptions
     /// <summary>Quantization filter (e.g., Q8_0, Q4_K_M).</summary>
     public string? Quant { get; init; }
 
-    /// <summary>Compute device: "cpu", "gpu", "gpu:0".</summary>
+    /// <summary>Compute device: "auto", "cpu", "gpu", "gpu:0", "vulkan". The <c>serve</c> CLI and <see cref="Parse"/> default to "auto" (GPU when servable; an explicit device never silently falls back to CPU).</summary>
     public string Device { get; init; } = "cpu";
 
     /// <summary>Number of GPU layers for hybrid offloading.</summary>
@@ -61,17 +61,23 @@ public sealed record ServerOptions
     public int SpeculativeCandidates { get; init; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
 
     /// <summary>
-    /// Enables Multi-Token Prediction (MTP) self-speculative decoding (issue #253) when the loaded
-    /// checkpoint carries an MTP head. Unlike <see cref="SpeculativeModel"/> this needs no second
-    /// model — it's a no-op for any GGUF without an MTP head. Defaults to <c>false</c> (opt-in via
-    /// <c>--mtp</c>) for <c>serve</c>, unlike the CLI's <c>run</c>/<c>chat</c> commands where MTP
-    /// auto-detects and defaults on: enabling it here also disables the continuous-batch scheduler
-    /// for this model (mirrors the existing <see cref="SpeculativeModel"/> restriction — MTP's
-    /// single-sequence self-speculative loop doesn't support multi-request batching in this
-    /// iteration), which would be a surprising throughput regression for concurrent server traffic
-    /// to trigger purely from which GGUF happened to load.
+    /// Multi-Token Prediction (MTP) self-speculative decoding (issue #253). <b>Defaults to <c>true</c></b>:
+    /// when the loaded GGUF carries an embedded MTP head (<c>IModel.SupportsMtp</c>), no external draft model
+    /// (<see cref="SpeculativeModel"/>) is given, and <see cref="ExpectedConcurrency"/> is below 5, <c>serve</c>
+    /// enables it automatically with the adaptive gate (it backs off to plain decode when drafts stop paying).
+    /// It is a no-op for any GGUF without a head. Opt out with <c>--no-mtp</c>; <c>--mtp</c> is still accepted
+    /// (back-compat) and only changes the startup log wording - it does not override the concurrency or
+    /// draft-model rules below.
+    /// <para>
+    /// Tradeoff: while MTP is active the continuous-batch scheduler is off for that model (MTP's single-sequence
+    /// self-speculative loop does not batch requests), so many concurrent clients are better served with
+    /// <c>--no-mtp</c> or <c>--expected-concurrency 5</c> (or more), which drops MTP for the model.
+    /// </para>
     /// </summary>
-    public bool MtpEnabled { get; init; }
+    public bool MtpEnabled { get; init; } = true;
+
+    /// <summary>True when <c>--mtp</c> was passed explicitly (back-compat); only affects log wording.</summary>
+    public bool MtpExplicit { get; init; }
 
     /// <summary>
     /// Maximum prompt tokens per prefill forward pass (llama.cpp <c>-ub</c> / micro-batch analog).
@@ -134,7 +140,7 @@ public sealed record ServerOptions
     /// Expected number of concurrently decoding requests (<c>--expected-concurrency</c>). Vulkan hybrid models serve through the serial
     /// per-request generator by default; at <c>&gt;= 5</c> concurrent decode streams the continuous-batch scheduler measured +73% aggregate
     /// decode throughput on Tev1-4B (parity at &lt;= 4, slower for a repeated identical prompt, and it is off when MTP is active), so a hint of
-    /// 5 or more enables it automatically. <c>DOTLLM_VK_SCHEDULER=0</c>/<c>1</c> overrides the hint.
+    /// 5 or more enables it automatically and also drops default-on MTP for the model (see <see cref="MtpEnabled"/>). <c>DOTLLM_VK_SCHEDULER=0</c>/<c>1</c> overrides the hint.
     /// </summary>
     public int ExpectedConcurrency { get; init; }
 
@@ -146,6 +152,9 @@ public sealed record ServerOptions
 
     /// <summary>The device a model actually loaded on when <see cref="Device"/> is <c>auto</c> (<c>cpu</c>, <c>vulkan</c>, <c>gpu:0</c>); null otherwise.</summary>
     public string? ResolvedDevice { get; init; }
+
+    /// <summary>Non-null when <c>--device auto</c> fell back from a faster device because the model is unsupported there (reason + perf consequence); surfaced in <c>/props</c>.</summary>
+    public string? DeviceFallbackWarning { get; init; }
 
     /// <summary>
     /// Logit temperature for <c>/v1/systemone</c> probabilities (<c>--decision-temperature</c>); 0 or 1 = the raw restricted softmax. See
@@ -194,7 +203,7 @@ public sealed record ServerOptions
     {
         string? model = null;
         string? quant = null;
-        string device = "cpu";
+        string device = "auto";
         int? gpuLayers = null;
         int threads = 0;
         int decodeThreads = 0;
@@ -210,7 +219,8 @@ public sealed record ServerOptions
         bool schedulerFairness = false;
         string? speculativeModel = null;
         int speculativeCandidates = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
-        bool mtpEnabled = false;
+        bool mtpEnabled = true;
+        bool mtpExplicit = false;
         int prefillChunkSize = 0;
         string? ropeScaling = null;
         float? ropeFreqBase = null;
@@ -271,7 +281,9 @@ public sealed record ServerOptions
                 case "--speculative-k" or "--draft-tokens":
                     speculativeCandidates = int.Parse(next!); i++; break;
                 case "--mtp":
-                    mtpEnabled = true; break;
+                    mtpEnabled = true; mtpExplicit = true; break;
+                case "--no-mtp":
+                    mtpEnabled = false; mtpExplicit = false; break;
                 case "--prefill-chunk-size" or "--ubatch-size":
                     prefillChunkSize = int.Parse(next!); i++; break;
                 case "--rope-scaling":
@@ -342,6 +354,7 @@ public sealed record ServerOptions
             SpeculativeModel = speculativeModel,
             SpeculativeCandidates = speculativeCandidates,
             MtpEnabled = mtpEnabled,
+            MtpExplicit = mtpExplicit,
             PrefillChunkSize = prefillChunkSize,
             KeepAliveSeconds = keepAliveSeconds,
             MaxResidentModels = maxResidentModels,

@@ -262,6 +262,33 @@ public record ModelConfig
     public RoPEConfig? GlobalRoPEConfig { get; init; }
 
     /// <summary>
+    /// Mistral-3 / Ministral-3 (Llama-4-style) attention temperature tuning, GGUF
+    /// <c>mistral3.attention.temperature_scale</c>. 0 = disabled (every other model). When non-zero
+    /// the post-RoPE query of the token at position <c>p</c> is multiplied by
+    /// <see cref="AttnTemperatureAt"/> on every layer — llama.cpp <c>llm_graph_input_attn_temp</c> /
+    /// <c>mistral3.cpp</c> (issue #743).
+    /// </summary>
+    public float AttnTemperatureScale { get; init; }
+
+    /// <summary>
+    /// Position bucket width for <see cref="AttnTemperatureScale"/> (llama.cpp
+    /// <c>n_attn_temp_floor_scale</c> = the YaRN original context length). Ignored when the scale is 0.
+    /// </summary>
+    public int AttnTemperatureFloorScale { get; init; }
+
+    /// <summary>
+    /// Per-position query multiplier <c>log(floor(pos / floorScale) + 1) * scale + 1</c>
+    /// (llama.cpp <c>llm_graph_input_attn_temp::set_input</c>, offset 0, double-precision log).
+    /// Returns exactly 1 when the feature is disabled.
+    /// </summary>
+    /// <param name="position">Absolute token position.</param>
+    public float AttnTemperatureAt(int position)
+    {
+        if (AttnTemperatureScale == 0f || AttnTemperatureFloorScale <= 0) return 1.0f;
+        return (float)(Math.Log(Math.Floor((double)position / AttnTemperatureFloorScale) + 1.0) * AttnTemperatureScale + 1.0);
+    }
+
+    /// <summary>
     /// Optional partial-rotary factor applied to the FULL-attention layers
     /// (Gemma 4 <c>partial_rotary_factor</c>, e.g. 0.25). When non-null, only the
     /// leading <c>round(PartialRotaryFactor * head_dim)</c> (rounded down to an
@@ -377,6 +404,22 @@ public record ModelConfig
     /// full-attention layers the last own-KV full layer).
     /// </summary>
     public int NumSharedKvLayers { get; init; }
+
+    /// <summary>
+    /// True for the dense Gemma-4 variants (E2B/E4B): a Gemma-4 graph with no routed-MoE
+    /// block and/or per-layer embeddings (PLE) and trailing shared-KV layers. Implemented
+    /// on the CPU backend only; the CUDA and Vulkan backends model Gemma-4 as the dual-FFN
+    /// MoE (26B-A4B) and must reject this shape up front (issue #730).
+    /// </summary>
+    public bool IsGemma4DensePle
+        => Gemma4DualFfn && (Moe is null || PerLayerEmbedding is not null || NumSharedKvLayers > 0);
+
+    /// <summary>Actionable message for backends that cannot run <see cref="IsGemma4DensePle"/> models.</summary>
+    public static string Gemma4DensePleUnsupportedMessage(string backend)
+        => $"The Gemma-4 dense variant (E2B/E4B: per-layer embeddings, shared-KV layers, no MoE block) "
+         + $"is not supported on the {backend} backend; only the CPU backend implements it. Support is "
+         + "tracked as a priority in https://github.com/jamesburton/dotLLM/issues/734 (dense Gemma-4 E4B on Vulkan and CUDA). "
+         + "Use --device cpu (much slower), or --device auto, which falls back to CPU with a warning.";
 
     /// <summary>
     /// Returns true when <paramref name="layerIdx"/> projects and stores its own

@@ -37,6 +37,9 @@ public sealed class ServerState : IDisposable
     /// <summary>Server startup options (updated on model swap).</summary>
     public required ServerOptions Options { get; set; }
 
+    /// <summary>Set when <c>--device auto</c> had to fall back to the CPU after a GPU load failed (#733); surfaced via /props.</summary>
+    public string? DeviceFallbackWarning { get; set; }
+
     /// <summary>Model configuration (null when no model loaded).</summary>
     public ModelConfig? Config { get; set; }
 
@@ -127,6 +130,12 @@ public sealed class ServerState : IDisposable
 
     /// <summary>Open GGUF file handle (disposed on model swap).</summary>
     public GgufFile? CurrentGguf { get; set; }
+
+    /// <summary>True when MTP self-speculative decoding is actually engaging requests for the loaded model (#757).</summary>
+    public bool MtpActive { get; set; }
+
+    /// <summary>Short reason for <see cref="MtpActive"/> (<c>active</c>, <c>off (--no-mtp)</c>, <c>skipped (...)</c>, ...), surfaced in /props.</summary>
+    public string? MtpStatus { get; set; }
 
     /// <summary>Draft model for speculative decoding (null when disabled).</summary>
     public IModel? DraftModel { get; set; }
@@ -586,6 +595,8 @@ public sealed class ServerState : IDisposable
             DraftModel = DraftModel,
             DraftModelPath = DraftModelPath,
             DraftGguf = DraftGguf,
+            MtpActive = MtpActive,
+            MtpStatus = MtpStatus,
             EstimatedBytes = EstimatedBytes,
             KeepAliveSecondsOverride = KeepAliveSecondsOverride,
             LastUsedUtc = LastUsedUtc,
@@ -634,6 +645,8 @@ public sealed class ServerState : IDisposable
         DraftModel = snapshot.DraftModel;
         DraftModelPath = snapshot.DraftModelPath;
         DraftGguf = snapshot.DraftGguf;
+        MtpActive = snapshot.MtpActive;
+        MtpStatus = snapshot.MtpStatus;
         EstimatedBytes = snapshot.EstimatedBytes;
         KeepAliveSecondsOverride = keepAliveOverride ?? snapshot.KeepAliveSecondsOverride;
         IsReady = true;
@@ -666,6 +679,8 @@ public sealed class ServerState : IDisposable
         DraftModel = loaded.DraftModel;
         DraftModelPath = loaded.DraftModelPath;
         DraftGguf = loaded.DraftGguf;
+        MtpActive = loaded.MtpActive;
+        MtpStatus = loaded.MtpStatus;
         EstimatedBytes = estimatedBytes;
         KeepAliveSecondsOverride = keepAliveOverride;
         IsReady = true;

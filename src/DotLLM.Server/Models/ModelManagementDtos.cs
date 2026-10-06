@@ -49,6 +49,14 @@ public sealed record ModelLoadRequest
     [JsonPropertyName("model")]
     public required string Model { get; init; }
 
+    /// <summary>
+    /// Exact GGUF file to load (as listed by <c>/v1/models/available</c>). When set it wins over <c>model</c>/<c>quant</c> resolution,
+    /// which can pick a different file from the same repo directory than the one the UI inspected.
+    /// </summary>
+    [JsonPropertyName("path")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ModelPath { get; init; }
+
     [JsonPropertyName("quant")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Quant { get; init; }
@@ -57,6 +65,7 @@ public sealed record ModelLoadRequest
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Device { get; init; }
 
+    /// <summary>Layers on GPU; a negative value (-1) means "all layers" and overrides profile/startup defaults.</summary>
     [JsonPropertyName("gpu_layers")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? GpuLayers { get; init; }
@@ -88,6 +97,14 @@ public sealed record ModelLoadRequest
     [JsonPropertyName("speculative_k")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? SpeculativeK { get; init; }
+
+    /// <summary>
+    /// (#757) Embedded-MTP opt-out/in for this load. Null = keep the server setting (MTP is on by default for models that carry an MTP head);
+    /// <c>false</c> disables it (like <c>--no-mtp</c>). Nullable on purpose: an <c>init</c> initializer would be dropped by STJ source-gen.
+    /// </summary>
+    [JsonPropertyName("mtp")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Mtp { get; init; }
 
     /// <summary>RoPE scaling override: "none", "linear", "yarn", "ntk", "dynamic". Overrides the GGUF-derived value.</summary>
     [JsonPropertyName("rope_scaling")]

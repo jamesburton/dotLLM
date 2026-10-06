@@ -34,6 +34,11 @@ public sealed record PropsResponse
     [JsonPropertyName("device")]
     public string Device { get; init; } = "cpu";
 
+    /// <summary>Device actually used when <c>device</c> is <c>auto</c> (null otherwise).</summary>
+    [JsonPropertyName("resolved_device")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ResolvedDevice { get; init; }
+
     [JsonPropertyName("gpu_layers")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? GpuLayers { get; init; }
@@ -49,13 +54,23 @@ public sealed record PropsResponse
     public string? DraftModelPath { get; init; }
 
     /// <summary>
-    /// True when MTP (Multi-Token Prediction) self-speculative decoding (issue #253) is actually
-    /// engaging requests: <c>--mtp</c> was passed at startup <em>and</em> the loaded checkpoint
-    /// carries an MTP head. False when either condition doesn't hold — including the common case
-    /// of a normal (non-MTP) GGUF, where this is always false regardless of the <c>--mtp</c> flag.
+    /// True when MTP (Multi-Token Prediction) self-speculative decoding (issue #253) is actually engaging requests for the loaded
+    /// model. Since #757 it is on by default for any checkpoint with an embedded MTP head; it is false for a model without a head,
+    /// with <c>--no-mtp</c>, with an external draft model, or when <c>--expected-concurrency</c> routes to the batch scheduler.
+    /// See <see cref="MtpStatus"/> for the reason.
     /// </summary>
     [JsonPropertyName("mtp_active")]
     public bool MtpActive { get; init; }
+
+    /// <summary>Why MTP is or is not active: <c>active</c>, <c>off (--no-mtp)</c>, <c>unavailable (no MTP head)</c>, <c>skipped (...)</c>.</summary>
+    [JsonPropertyName("mtp_status")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? MtpStatus { get; init; }
+
+    /// <summary>Non-null when <c>--device auto</c> fell back to the CPU after a GPU load failed (#733).</summary>
+    [JsonPropertyName("device_fallback_warning")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DeviceFallbackWarning { get; init; }
 
     [JsonPropertyName("is_ready")]
     public bool IsReady { get; init; }
