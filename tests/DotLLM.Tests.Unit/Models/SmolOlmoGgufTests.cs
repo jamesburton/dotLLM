@@ -91,6 +91,16 @@ public sealed class SmolOlmoGgufTests : IDisposable
     }
 
     [Fact]
+    public void Extract_Qwen2Moe_DoesNotRenormaliseTopK_Qwen3MoeDoes()
+    {
+        // llama.cpp: qwen2moe build_moe_ffn(norm_w=false); qwen3moe norm_w=true. The extractor used to say true for both.
+        string p = Path.Combine(_scratch, "q2.gguf");
+        File.WriteAllBytes(p, SyntheticGraniteGguf.Serialize(SyntheticGraniteGguf.BuildWeights(Cfg("qwen2moe"))));
+        using (var g = GgufFile.Open(p))
+            Assert.False(GgufModelConfigExtractor.Extract(g.Metadata).Moe!.NormTopKProb);
+    }
+
+    [Fact]
     public void Olmo3SlidingWindow_IsRefusedNotSilentlyRunAsOlmo2()
     {
         var wts = SyntheticGraniteGguf.BuildWeights(Cfg("olmo2") with { SlidingWindow = 3 });

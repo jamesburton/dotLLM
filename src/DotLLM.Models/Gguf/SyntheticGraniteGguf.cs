@@ -63,7 +63,7 @@ public sealed record SyntheticGraniteConfig
     public uint Seed { get; init; } = 0x6A41u;
 
     /// <summary>True for the MoE variant.</summary>
-    public bool IsMoe => Arch is "granitemoe" or "olmoe";
+    public bool IsMoe => Arch is "granitemoe" or "olmoe" or "qwen2moe";
     /// <summary>True for OLMo 2 (no pre-norms, post-attention/post-FFN norms).</summary>
     public bool IsOlmo2 => Arch == "olmo2";
     /// <summary>True for the archs with a whole-projection Q/K RMSNorm (OLMo 2, OLMoE).</summary>
@@ -222,6 +222,7 @@ public static class SyntheticGraniteGguf
         {
             w.AddUInt32($"{arch}.expert_count", (uint)cfg.Experts);
             w.AddUInt32($"{arch}.expert_used_count", (uint)cfg.ExpertsUsed);
+            w.AddUInt32($"{arch}.expert_feed_forward_length", (uint)cfg.FeedForward);
             if (cfg.SharedFeedForward > 0)
                 w.AddUInt32($"{arch}.expert_shared_feed_forward_length", (uint)cfg.SharedFeedForward);
         }

@@ -664,7 +664,9 @@ public static partial class GgufModelConfigExtractor
             NumExperts = (int)expertCount,
             NumExpertsPerTok = expertUsed,
             MoeIntermediateSize = moeIntermediate,
-            NormTopKProb = true,   // Qwen-MoE and Mixtral always renormalize top-k weights
+            // llama.cpp: qwen2moe build_moe_ffn(norm_w=false) keeps the raw softmax probabilities; qwen3moe / qwen35moe /
+            // mixtral renormalise. (This used to be a hard-coded true for every arch, silently wrong for Qwen1.5/2-MoE.)
+            NormTopKProb = !string.Equals(arch, "qwen2moe", StringComparison.OrdinalIgnoreCase),
             SharedExpertIntermediateSize = sharedIntermediate,
             NumSharedExperts = expertShared,
             HasSharedExpertGate = hasSharedExpertGate,
