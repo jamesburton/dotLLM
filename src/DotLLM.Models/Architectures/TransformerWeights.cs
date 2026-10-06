@@ -1573,6 +1573,20 @@ internal sealed class TransformerWeights : IDisposable
             : tensors[$"{prefix}.post_attention_norm.weight"];
         float[] ffnNorm = DequantizeNorm(dataBase, ffnNormDesc, hiddenSize);
 
+        // Gemma 2 four-norm layout (llama.cpp LLM_TENSOR_ATTN_POST_NORM / FFN_POST_NORM):
+        // post_attention_norm runs on the attention sublayer output and post_ffw_norm on the
+        // FFN sublayer output, each BEFORE its residual add. ffn_norm is the pre-FFN norm
+        // (unlike gpt-oss, where post_attention_norm doubles as the pre-FFN norm — handled
+        // above, and gated off here by architecture). The GGUF converter bakes (1+w) into every
+        // one of these, so they are consumed as plain RMSNorm weights.
+        float[]? postAttnNorm = null;
+        float[]? postFfnNorm = null;
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.Gemma2)
+        {
+            postAttnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.post_attention_norm.weight"], hiddenSize);
+            postFfnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.post_ffw_norm.weight"], hiddenSize);
+        }
+
         // Optional FFN sub-norm (BitNet Sub-LN): RMSNorm over the gated intermediate [intermediateSize] before ffn_down.
         float[]? ffnSubNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.ffn_sub_norm.weight", config.IntermediateSize);
 
@@ -1662,6 +1676,7 @@ internal sealed class TransformerWeights : IDisposable
             qBias, kBias, vBias, oBias,
             gateBias, upBias, downBias,
             qNormWeight, kNormWeight,
+            postAttnNormWeight: postAttnNorm, postFfnNormWeight: postFfnNorm,
             attnSubNormWeight: attnSubNormWeight, ffnSubNormWeight: ffnSubNormWeight,
             attnSinks: attnSinks);
     }

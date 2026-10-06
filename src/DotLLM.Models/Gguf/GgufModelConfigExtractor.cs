@@ -101,6 +101,9 @@ public static partial class GgufModelConfigExtractor
         if (architecture == Architecture.GptOss && slidingWindowSize is not null)
             slidingWindowPattern = (int)metadata.GetUInt32OrDefault(
                 $"{arch}.attention.sliding_window_pattern", 2);
+        // Gemma 2: window on even layers, full attention on odd (llama.cpp set_swa_pattern(2)).
+        if (architecture == Architecture.Gemma2 && slidingWindowSize is not null)
+            slidingWindowPattern = 2;
 
         int vocabSize = ResolveVocabSize(metadata, arch);
 
@@ -177,6 +180,9 @@ public static partial class GgufModelConfigExtractor
             moeConfig = ExtractNemotronHMoeConfig(metadata, arch, intermediateSize);
         }
 
+        bool isGemma2 = architecture == Architecture.Gemma2;
+        bool isGemmaFamily = architecture is Architecture.Gemma or Architecture.Gemma2;
+
         return new ModelConfig
         {
             Architecture = architecture,
@@ -193,7 +199,13 @@ public static partial class GgufModelConfigExtractor
             AttentionType = attentionType,
             ActivationFunction = architecture is Architecture.NemotronH or Architecture.NemotronHMoe or Architecture.BitNet
                 ? ActivationFunction.ReluSquared
-                : ActivationFunction.SiLU,
+                : isGemmaFamily ? ActivationFunction.GELUTanh : ActivationFunction.SiLU,
+            // Gemma scales the token embeddings by sqrt(hidden_size); ties the LM head to them.
+            EmbeddingScale = isGemmaFamily ? MathF.Sqrt(hiddenSize) : null,
+            TiedEmbeddings = isGemmaFamily,
+            AttnLogitSoftcap = isGemma2 ? metadata.GetFloat32OrDefault($"{arch}.attn_logit_softcapping", 50.0f) : null,
+            FinalLogitSoftcap = isGemma2 ? metadata.GetFloat32OrDefault($"{arch}.final_logit_softcapping", 30.0f) : null,
+            QueryPreAttnScalar = isGemma2 ? ResolveGemma2QueryPreAttnScalar(numTrunkLayers, hiddenSize, numAttentionHeads, headDim) : null,
             RoPEConfig = ropeConfig,
             AttnTemperatureScale = attnTempScale,
             AttnTemperatureFloorScale = attnTempFloor,
@@ -210,6 +222,15 @@ public static partial class GgufModelConfigExtractor
             PoolingType = ExtractPoolingType(metadata, arch),
         };
     }
+
+    /// <summary>
+    /// Gemma 2 attention-score scale operand (<c>query_pre_attn_scalar</c>; the kernels apply
+    /// <c>1/sqrt(value)</c>). The GGUF does not store it — llama.cpp derives it from the model
+    /// size (<c>llama-model.cpp</c> LLM_ARCH_GEMMA2: the 46-layer 27B uses
+    /// <c>n_embd / n_head</c>, i.e. 144 not head_dim 128; 2B / 9B use <c>n_embd_head_k</c>).
+    /// </summary>
+    internal static float ResolveGemma2QueryPreAttnScalar(int numLayers, int hiddenSize, int numHeads, int headDim)
+        => numLayers == 46 ? (float)(hiddenSize / numHeads) : headDim;
 
     /// <summary>
     /// Reads the GGUF <c>{arch}.pooling_type</c> key. llama.cpp stores the raw
@@ -769,6 +790,9 @@ public static partial class GgufModelConfigExtractor
             "bitnet" or "bitnet-b1.58" or "bitnet-25" => Architecture.BitNet,
             // OpenAI gpt-oss (llama.cpp LLM_ARCH_OPENAI_MOE).
             "gpt-oss" => Architecture.GptOss,
+            // Gemma 1 / CodeGemma (llama.cpp LLM_ARCH_GEMMA) and Gemma 2 (LLM_ARCH_GEMMA2).
+            "gemma" => Architecture.Gemma,
+            "gemma2" => Architecture.Gemma2,
             // BERT-class embedding encoders (#739).
             "bert" => Architecture.Bert,
             "nomic-bert" => Architecture.NomicBert,
@@ -1068,7 +1092,11 @@ public static partial class GgufModelConfigExtractor
         // If no rope keys exist at all, this model may not use RoPE.
         string freqBaseKey = $"{arch}.rope.freq_base";
         string dimCountKey = $"{arch}.rope.dimension_count";
-        if (!metadata.ContainsKey(freqBaseKey) && !metadata.ContainsKey(dimCountKey))
+        // gemma / gemma2 GGUFs carry NEITHER rope key (llama.cpp falls back to its default
+        // freq_base 10000 and rotates the full head); returning null here would silently
+        // disable RoPE for them.
+        bool gemmaImplicitRope = architecture is Architecture.Gemma or Architecture.Gemma2;
+        if (!gemmaImplicitRope && !metadata.ContainsKey(freqBaseKey) && !metadata.ContainsKey(dimCountKey))
             return null;
 
         float theta = metadata.GetFloat32OrDefault(freqBaseKey, 10000.0f);
@@ -1097,7 +1125,10 @@ public static partial class GgufModelConfigExtractor
         {
             Architecture.Qwen or Architecture.QwenMoe
                 or Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense or Architecture.Phi
-                or Architecture.GptOss or Architecture.BitNet => RoPEType.NeoX,
+                or Architecture.GptOss or Architecture.BitNet
+                // llama.cpp llama_model_rope_type: gemma / gemma2 / gemma3 are NEOX, and their
+                // converter does not permute Q/K (HF rotate_half layout).
+                or Architecture.Gemma or Architecture.Gemma2 => RoPEType.NeoX,
             _ => RoPEType.Norm,
         };
 

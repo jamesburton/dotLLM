@@ -119,6 +119,7 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
     {
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
+        CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridVulkanCudaTransformerModel));
         if (numVulkanLayers <= 0 || numVulkanLayers >= config.NumLayers)
             throw new ArgumentOutOfRangeException(nameof(numVulkanLayers),
                 $"numVulkanLayers must be between 1 and {config.NumLayers - 1}. " +

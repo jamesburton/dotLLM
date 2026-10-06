@@ -394,6 +394,27 @@ public enum Architecture
     Gemma3n,
 
     /// <summary>
+    /// Google Gemma 1 / CodeGemma (llama.cpp GGUF arch <c>gemma</c>). A Llama-shaped
+    /// two-norm decoder with GeGLU (tanh-approximate GELU) FFN, <c>sqrt(hidden)</c>
+    /// embedding scaling, tied embeddings, NeoX RoPE and head_dim independent of
+    /// <c>hidden/heads</c> (2B: MQA, 1 KV head; 7B: MHA). No QK-norm, no post-norms,
+    /// no soft-capping, no sliding window. The GGUF converter bakes the <c>(1+w)</c>
+    /// RMSNorm convention into the stored weights, so plain-weight RMSNorm kernels apply.
+    /// GGUF only (no safetensors mapping yet).
+    /// </summary>
+    Gemma,
+
+    /// <summary>
+    /// Google Gemma 2 (llama.cpp GGUF arch <c>gemma2</c>). The <see cref="Gemma"/> backbone plus
+    /// four RMSNorms per layer (post-attention and post-FFN norms before each residual add),
+    /// attention-logit soft-capping (50.0), final-logit soft-capping (30.0), alternating
+    /// sliding-window / full attention (even layers windowed — llama.cpp
+    /// <c>set_swa_pattern(2)</c>) and the <c>query_pre_attn_scalar</c> score scale
+    /// (<c>head_dim</c> for 2B/9B, <c>hidden/heads</c> for the 46-layer 27B). GGUF only.
+    /// </summary>
+    Gemma2,
+
+    /// <summary>
     /// BERT-class bidirectional encoder (llama.cpp <c>bert</c>): post-LayerNorm, learned absolute
     /// positions + token-type embedding, biased projections, GELU FFN. Embedding-only (no LM head);
     /// served via <see cref="DotLLM.Core.Models.IEmbeddingModel"/> (issue #739).

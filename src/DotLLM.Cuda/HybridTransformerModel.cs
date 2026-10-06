@@ -130,6 +130,7 @@ public sealed unsafe class HybridTransformerModel : IModel
         GgufFile gguf, ModelConfig config, int numGpuLayers,
         int deviceId, ThreadingConfig threading)
     {
+        CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridTransformerModel));
         if (numGpuLayers <= 0 || numGpuLayers >= config.NumLayers)
             throw new ArgumentOutOfRangeException(nameof(numGpuLayers),
                 $"numGpuLayers must be between 1 and {config.NumLayers - 1} for hybrid mode. " +
@@ -299,6 +300,7 @@ public sealed unsafe class HybridTransformerModel : IModel
     {
         ArgumentNullException.ThrowIfNull(cpuWeights);
         ArgumentNullException.ThrowIfNull(config);
+        CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridTransformerModel));
         if (numGpuLayers <= 0 || numGpuLayers >= config.NumLayers)
             throw new ArgumentOutOfRangeException(nameof(numGpuLayers),
                 $"numGpuLayers must be between 1 and {config.NumLayers - 1} for hybrid mode. " +

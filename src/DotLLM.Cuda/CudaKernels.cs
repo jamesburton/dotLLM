@@ -2487,11 +2487,19 @@ public sealed unsafe class CudaKernels : IDisposable
     /// contributes no value vector), matching the CPU reference's
     /// <see cref="DotLLM.Cpu.Kernels.Attention.SoftmaxRowWithSink"/> convention.
     /// </param>
+    /// <param name="scoreScale">
+    /// Gemma <c>query_pre_attn_scalar</c> support: when &gt; 0 the kernel multiplies Q·K by this value
+    /// instead of <c>1/sqrt(headDim)</c>. <c>0</c> (default) keeps the historical scale.
+    /// </param>
+    /// <param name="attnSoftcap">
+    /// Gemma-2 attention-logit soft-cap: when &gt; 0 each (scaled) score becomes
+    /// <c>cap * tanh(score / cap)</c> before masking/softmax. <c>0</c> (default) = off.
+    /// </param>
     public void LaunchAttentionF32(nint q, nint k, nint v, nint output,
                                      int seqQ, int seqKv,
                                      int numHeads, int numKvHeads, int headDim,
                                      int positionOffset, int slidingWindow, nint stream,
-                                     nint sinks = 0)
+                                     nint sinks = 0, float scoreScale = 0f, float attnSoftcap = 0f)
     {
         DotLLM.Core.Attention.AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "CUDA");
 
@@ -2500,10 +2508,11 @@ public sealed unsafe class CudaKernels : IDisposable
         int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
         int poArg = positionOffset, swArg = slidingWindow;
         nint sinksArg = sinks; // 0 ⇒ nullptr ⇒ sink disabled (pre-#365 behaviour)
+        float scaleArg = scoreScale, capArg = attnSoftcap;
 
         void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
                         &sqArg, &skvArg, &nhArg, &nkvArg, &hdArg,
-                        &poArg, &swArg, &sinksArg};
+                        &poArg, &swArg, &sinksArg, &scaleArg, &capArg};
 
         int numBlocks = seqQ * numHeads;
         // Tiled online softmax: q_shared[headDim] + score_tile[256] + out_accum[headDim] + warp_scratch[32]
