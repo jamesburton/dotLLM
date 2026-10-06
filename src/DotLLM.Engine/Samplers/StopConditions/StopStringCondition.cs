@@ -1,3 +1,4 @@
+using DotLLM.Core.Configuration;
 using DotLLM.Core.Sampling;
 
 namespace DotLLM.Engine.Samplers.StopConditions;
@@ -9,8 +10,9 @@ namespace DotLLM.Engine.Samplers.StopConditions;
 public sealed class StopStringCondition : IStopCondition
 {
     private readonly string _stopString;
-    private readonly string? _armedAfter;
-    private bool _armed;
+    private readonly StopGate? _gate;
+    private bool _inside;
+    private bool _startDecided;
 
     /// <summary>
     /// Creates a new stop string condition.
@@ -22,16 +24,16 @@ public sealed class StopStringCondition : IStopCondition
     }
 
     /// <summary>
-    /// Creates a stop string condition that only fires on text produced after
-    /// <paramref name="armedAfter"/> has been generated (#767: a reasoning block's closing tag).
-    /// The armed flag is per-instance state, so build one condition set per generated sequence.
+    /// Creates a stop string condition that is suspended while the model is inside a reasoning block
+    /// (#767). The "inside" state is per-instance, so build one condition set per generated sequence.
     /// </summary>
     /// <param name="stopString">The string that triggers generation stop.</param>
-    /// <param name="armedAfter">Marker that arms the condition; null = always armed.</param>
-    public StopStringCondition(string stopString, string? armedAfter)
+    /// <param name="gate">The reasoning gate; null = always active.</param>
+    public StopStringCondition(string stopString, StopGate? gate)
     {
         _stopString = stopString;
-        _armedAfter = string.IsNullOrEmpty(armedAfter) ? null : armedAfter;
+        _gate = gate;
+        _inside = gate?.StartsInside ?? false;
     }
 
     /// <summary>The stop string this condition matches against. Caller ensures the decoded tail
@@ -45,47 +47,61 @@ public sealed class StopStringCondition : IStopCondition
     /// <inheritdoc/>
     public StopResult ShouldStop(int tokenId, IReadOnlyList<int> generatedTokens, ReadOnlySpan<char> decodedTail)
     {
-        if (!decodedTail.EndsWith(_stopString.AsSpan(), StringComparison.Ordinal))
-        {
-            // Still watch for the arming marker so a later tail that no longer contains it is armed.
-            if (_armedAfter is not null && !_armed && decodedTail.IndexOf(_armedAfter.AsSpan(), StringComparison.Ordinal) >= 0)
-                _armed = true;
-            return StopResult.Continue;
-        }
-
-        if (_armedAfter is null)
-            return StopResult.Stop;
-
-        // The match must lie entirely after the marker and the whitespace that follows it (the template's
-        // "\n\n" separator is not answer text a stop string should be able to hit).
-        int idx = decodedTail.LastIndexOf(_armedAfter.AsSpan(), StringComparison.Ordinal);
         int contentStart = 0;
-        if (idx >= 0)
+        if (_gate is { } g)
         {
-            _armed = true;
-            contentStart = idx + _armedAfter.Length;
-            while (contentStart < decodedTail.Length && char.IsWhiteSpace(decodedTail[contentStart]))
-                contentStart++;
+            // Track whether the model is inside a reasoning block from the decoded tail. The tail holds at
+            // least the last 64 characters, so a tag completed by the newest token is always visible; the
+            // flag persists once the tag has scrolled out of the window.
+            int open = decodedTail.LastIndexOf(g.OpenTag.AsSpan(), StringComparison.Ordinal);
+            int close = decodedTail.LastIndexOf(g.CloseTag.AsSpan(), StringComparison.Ordinal);
+
+            if (!_startDecided)
+            {
+                // Output start: did the model open a block itself? Wait while the text could still become
+                // the open tag ("<thi"), decide at the first text that cannot.
+                var first = decodedTail.TrimStart();
+                if (first.Length > 0
+                    && !(first.Length < g.OpenTag.Length && g.OpenTag.AsSpan().StartsWith(first, StringComparison.Ordinal)))
+                {
+                    _startDecided = true;
+                    if (first.StartsWith(g.OpenTag.AsSpan(), StringComparison.Ordinal))
+                        _inside = true;
+                }
+            }
+            if (!g.OpenOnlyAtStart && open >= 0 && open > close)
+                _inside = true;
+            if (close >= 0 && close > open)
+            {
+                _inside = false;
+                contentStart = close + g.CloseTag.Length;
+                while (contentStart < decodedTail.Length && char.IsWhiteSpace(decodedTail[contentStart]))
+                    contentStart++;
+            }
+
+            if (_inside)
+                return StopResult.Continue;
         }
-        if (!_armed)
+
+        if (!decodedTail.EndsWith(_stopString.AsSpan(), StringComparison.Ordinal))
             return StopResult.Continue;
         return decodedTail.Length - _stopString.Length >= contentStart ? StopResult.Stop : StopResult.Continue;
     }
 
     /// <summary>
     /// Builds the per-sequence stop-string conditions for <paramref name="options"/>, honouring
-    /// <see cref="DotLLM.Core.Configuration.InferenceOptions.StopSequencesArmedAfter"/>. Call once per
+    /// <see cref="DotLLM.Core.Configuration.InferenceOptions.ReasoningStopGate"/>. Call once per
     /// generated sequence: the armed state lives in the returned instances.
     /// </summary>
     public static List<StopStringCondition> CreateAll(DotLLM.Core.Configuration.InferenceOptions options)
     {
         var list = new List<StopStringCondition>(options.StopSequences.Count);
-        string? marker = options.StopSequencesArmedAfter;
+        var gate = options.ReasoningStopGate;
         foreach (string seq in options.StopSequences)
         {
-            bool gated = !string.IsNullOrEmpty(marker)
+            bool gated = gate is not null
                 && (options.StopSequencesUngated is null || !options.StopSequencesUngated.Contains(seq));
-            list.Add(new StopStringCondition(seq, gated ? marker : null));
+            list.Add(new StopStringCondition(seq, gated ? gate : null));
         }
         return list;
     }

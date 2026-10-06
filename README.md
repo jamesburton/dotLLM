@@ -363,6 +363,11 @@ dotllm serve bartowski/Llama-3.2-3B-Instruct-GGUF -q Q8_0 \
     --speculative-model bartowski/Llama-3.2-1B-Instruct-GGUF --speculative-k 5
 ```
 
+Thinking models (Qwen3.x, Bonsai, DeepSeek-R1 style) are handled for you: the `<think>` span is split into `message.reasoning_content` (OpenAI), a
+`thinking` content block (`/v1/messages`) or `message.thinking` (`/api/chat`), and `enable_thinking`, `chat_template_kwargs` and `reasoning_effort`
+(Anthropic `thinking`, ollama `think`) reach the chat template. `--reasoning-format none|auto|deepseek` (default `auto`) picks the behaviour —
+`none` returns the raw output as before; details in [docs/SERVER.md](docs/SERVER.md#reasoning--thinking-models-767).
+
 Any OpenAI-compatible client works against the running server:
 
 ```bash

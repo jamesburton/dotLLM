@@ -385,7 +385,7 @@ public static class MessagesEndpoint
         int completionTokens = 0;
 
         // Tool-call markup must not ALSO go out as text_delta: the same payload would be
-        // reported twice — once as text, once as the tool_use block emitted below — and an SDK's
+        // reported twice â€” once as text, once as the tool_use block emitted below â€” and an SDK's
         // text_stream would print raw JSON at the user. The accumulator holds text back from the
         // moment the parser recognises a tool call; prose emitted before that is genuine and
         // still streams. Under a forced tool_choice the whole completion is the call, so

@@ -52,7 +52,11 @@ turn. Nothing constrains the model during decode, so the cap is applied to the d
 the way out, on both the streaming and non-streaming paths. Absent/`true` is OpenAI's default
 (parallel calls allowed).
 
-**Accepted and ignored**: `user`, `store`, `service_tier`, `reasoning_effort`, `metadata`. These
+**Reasoning** (#767): `enable_thinking`, `chat_template_kwargs`, `reasoning_effort` and `reasoning_format` steer the chat template and the
+reasoning/answer split, and the response carries `message.reasoning_content` — see [Reasoning / thinking models](#reasoning--thinking-models-767).
+Messages may carry `reasoning_content` back on later turns.
+
+**Accepted and ignored**: `user`, `store`, `service_tier`, `metadata`. These
 name concepts this server has no equivalent for, and a client that always sends them must never
 get a 400. Genuinely unknown fields are tolerated too (STJ source-gen skips unmapped members) —
 declaring these makes the intent explicit and guards against a future strict-DTO pass.
@@ -340,9 +344,64 @@ ollama's 404 error shape.
 | `DELETE /api/delete` | removes a profile, a local model, or a model dotLLM pulled from the ollama registry (its file goes with its last profile); ollama-store models are never touched |
 | `/api/embed`, `/api/embeddings`, `/api/create`, `/api/copy`, `/api/push` | `501` with a pointer (`/v1/embeddings`, `dotllm model create` / `cp`) |
 
-`pull` and `delete` need `--allow-model-admin`, like `/v1/models/*`. Not supported inside chat: `tools`, images and thinking (use `/v1/chat/completions`;
+`pull` and `delete` need `--allow-model-admin`, like `/v1/models/*`. `think` (`true` / `false` / `"low"` / `"medium"` / `"high"`) is honoured and the
+model's reasoning comes back in `message.thinking` (`thinking` on `/api/generate`), streamed as its own chunks — see
+[Reasoning / thinking models](#reasoning--thinking-models-767). Not supported inside chat: `tools` and images (use `/v1/chat/completions`;
 a request with `tools` gets a `501`). Digests in `tags`/`ps` are stable placeholders, and `details` carries format and quantisation only (no family or
 parameter size).
+
+## Reasoning / thinking models (#767)
+
+Qwen3.x, Bonsai, DeepSeek-R1-style and similar models think inside `<think>…</think>` before answering, and many chat templates **end the
+generation prompt with an open `<think>`** — so the model's first tokens are its reasoning. dotLLM separates the two, the way llama.cpp's server,
+vLLM and ollama do:
+
+| surface | reasoning | answer |
+|---|---|---|
+| `POST /v1/chat/completions` | `message.reasoning_content` (stream: `delta.reasoning_content`, sent as separate deltas, before any `content`) | `message.content` |
+| `POST /v1/messages` | a `thinking` content block (`thinking_delta` events, then an empty `signature_delta`) before the `text` block | `text` block |
+| `POST /api/chat`, `/api/generate` | `message.thinking` / `thinking` (own NDJSON chunks) | `message.content` / `response` |
+
+**Controlling it.** `enable_thinking` (bool) and `chat_template_kwargs` (any JSON object) on `/v1/chat/completions` are passed into the chat
+template's Jinja context; `reasoning_effort` becomes the template's `reasoning_effort` (Qwen3.x accepts `low` / `medium` / `xhigh`; a template that
+rejects a value yields a `400` naming `reasoning_effort`, and `none` means `enable_thinking=false`). Anthropic's `thinking: {"type": "enabled" |
+"disabled"}` and ollama's `think` (`true` / `false` / a level string) map to the same switches; `/v1/messages` also takes `chat_template_kwargs`.
+Anything left unset stays *undefined* in the template, so the template's own default applies. `chat_template_kwargs` can never override `messages`,
+`tools`, `add_generation_prompt`, `bos_token` or `eos_token`, and the typed fields win over a same-named kwarg.
+
+**`--reasoning-format none|auto|deepseek`** (default `auto`; a request may override it with `reasoning_format`):
+
+| value | behaviour |
+|---|---|
+| `auto` | split when the rendered prompt ends in an unclosed `<think>`, or the model starts its output with `<think>` itself (original Qwen3 templates). A `<think>` later in the answer is left alone |
+| `deepseek` | as `auto`, and `<think>…</think>` blocks are recognised anywhere in the output |
+| `none` | no splitting; `content` is the raw output, `</think>` included (the pre-#767 behaviour) |
+
+The splitter is incremental: a tag split across tokens (`</th` + `ink>`) never leaks into either stream, whitespace around the tags is dropped
+(streamed text concatenates to the non-streamed result), and a generation that hits `max_tokens` mid-thought returns `content: ""` with the whole
+text as reasoning and `finish_reason: "length"`.
+
+**Everything downstream sees the answer only.** Tool-call parsing (a `<tool_call>` quoted in the thinking is not a call), stop-suffix stripping and
+the Anthropic `text` block work on the answer. **Stop sequences** (other than template control tokens such as `<|im_end|>`) are suspended while the
+model is inside a think block — whether the template opened it or the model did — and, after `</think>`, only match text that follows the closing tag
+and the whitespace after it; EOS and `max_tokens` are never gated (`InferenceOptions.ReasoningStopGate`).
+
+**Budget and usage.** Reasoning tokens are generated tokens: they count toward `max_tokens` and `completion_tokens`. When reasoning was produced,
+`usage.completion_tokens_details.reasoning_tokens` reports the part spent thinking (exact when streaming, re-tokenised from the raw text when not),
+and `completion_tokens` still includes it. A small `max_tokens` on a thinking model therefore ends mid-thought — raise it or send
+`enable_thinking: false`.
+
+**Constrained decoding.** `response_format` (`json_object`, `json_schema`, regex/grammar) and a forced `tool_choice` constrain decoding from the first
+generated token, which cannot coexist with an open think block. So for such a request thinking defaults **off** (the template is rendered with
+`enable_thinking=false` unless you set it explicitly) and the output is *not* split: the constrained output is the whole `content`. Pass
+`enable_thinking: true` together with a constraint only if the model's template really expects it — the constraint will then apply to the reasoning
+too.
+
+**Multi-turn.** An earlier assistant turn's reasoning goes back in as `reasoning_content` (OpenAI surface; `reasoning` is accepted as an alias),
+as a `thinking` block (Anthropic) or `thinking` (ollama messages), and reaches the template as `message.reasoning_content`. Whether it is rendered into
+the history is the template's call — Qwen3.x keeps it unless `chat_template_kwargs.preserve_thinking` is `false`. The web UI replays reasoning the same
+way and shows it in a collapsible "Thinking" block above each answer (open while streaming, collapsed once the answer starts), with a Thinking
+selector (model default / on / off) in the settings panel.
 
 ## Device selection: `--device auto` (#722)
 
@@ -437,7 +496,8 @@ Not in OpenAI spec but widely expected for prompt engineering and billing estima
 
 ## response_format Processing
 
-The `response_format` field maps to constrained decoding:
+The `response_format` field maps to constrained decoding (on a thinking model it also turns thinking off by default and disables the
+reasoning split for that request — see [Reasoning / thinking models](#reasoning--thinking-models-767)):
 
 | `response_format.type` | Action |
 |------------------------|--------|

@@ -130,13 +130,20 @@ public sealed class ReasoningOpenAiTests
     }
 
     [Fact]
-    public void Plan_Gate_ArmsStopsOnlyWhenPromptOpenedThinking()
+    public void Plan_Gate_DescribesTheBlock_AndIsAbsentWhenSplittingIsOff()
     {
         var opts = new InferenceOptions { StopSequences = ["\n\n", "<|im_end|>"] };
-        var gated = Open().Gate(opts, ReasoningSupport.UngatedStops);
-        Assert.Equal("</think>", gated.StopSequencesArmedAfter);
-        Assert.Null(Closed().Gate(opts, ReasoningSupport.UngatedStops).StopSequencesArmedAfter);
-        Assert.Null(ReasoningPlan.Disabled.Gate(opts, ReasoningSupport.UngatedStops).StopSequencesArmedAfter);
+
+        var opened = Open().Gate(opts, ReasoningSupport.UngatedStops).ReasoningStopGate!;
+        Assert.True(opened.StartsInside);
+        Assert.True(opened.OpenOnlyAtStart);
+        Assert.Equal("</think>", opened.CloseTag);
+
+        // Template did not open a block: the model may still open its own, so the gate is present but starts outside.
+        Assert.False(Closed().Gate(opts, ReasoningSupport.UngatedStops).ReasoningStopGate!.StartsInside);
+
+        Assert.False(Open(ReasoningFormat.Deepseek).Gate(opts, ReasoningSupport.UngatedStops).ReasoningStopGate!.OpenOnlyAtStart);
+        Assert.Null(ReasoningPlan.Disabled.Gate(opts, ReasoningSupport.UngatedStops).ReasoningStopGate);
     }
 
     // ---------------------------------------------------------------- non-streaming
@@ -393,10 +400,13 @@ public sealed class ReasoningOpenAiTests
 
     private static StopResult Run(StopStringCondition c, string tail) => c.ShouldStop(0, [], tail.AsSpan());
 
+    private static readonly StopGate Inside = new("<think>", "</think>", StartsInside: true, OpenOnlyAtStart: true);
+    private static readonly StopGate Outside = new("<think>", "</think>", StartsInside: false, OpenOnlyAtStart: true);
+
     [Fact]
-    public void StopGate_StopInsideReasoning_DoesNotFire_AfterCloseItDoes()
+    public void StopGate_PromptOpenedBlock_StopInsideReasoningDoesNotFire_AfterCloseItDoes()
     {
-        var gate = new StopStringCondition("\n\n", "</think>");
+        var gate = new StopStringCondition("\n\n", Inside);
         Assert.Equal(StopResult.Continue, Run(gate, "first paragraph\n\n"));          // inside the thinking
         Assert.Equal(StopResult.Continue, Run(gate, "more thinking</think>"));
         Assert.Equal(StopResult.Continue, Run(gate, "king</think>\n\n"));             // the template separator is not answer text
@@ -405,15 +415,40 @@ public sealed class ReasoningOpenAiTests
     }
 
     [Fact]
-    public void StopGate_MarkerLeftTheTailWindow_StaysArmed()
+    public void StopGate_ModelOpensBlockItself_Suspends_ThenResumesAfterClose()
     {
-        var gate = new StopStringCondition("END", "</think>");
-        Assert.Equal(StopResult.Continue, Run(gate, "x</think>y"));
-        Assert.Equal(StopResult.Stop, Run(gate, "yyyyyyyyyyyyyyyyyyyyEND"));
+        // Original Qwen3 template: the prompt does NOT open <think>, the model emits it first.
+        var gate = new StopStringCondition("\n\n", Outside);
+        Assert.Equal(StopResult.Continue, Run(gate, "<th"));                          // could still be the open tag
+        Assert.Equal(StopResult.Continue, Run(gate, "<think>"));
+        Assert.Equal(StopResult.Continue, Run(gate, "<think>\nOkay.\n\n"));          // stop string inside the thinking
+        Assert.Equal(StopResult.Continue, Run(gate, "a long thought that scrolled the open tag away\n\n"));
+        Assert.Equal(StopResult.Continue, Run(gate, "</think>"));
+        Assert.Equal(StopResult.Stop, Run(gate, "</think>\n\nFive\n\n"));
     }
 
     [Fact]
-    public void StopGate_NoMarker_BehavesExactlyLikeTheOriginal()
+    public void StopGate_NoThinkingAtAll_StopsBehaveAsBefore()
+    {
+        var gate = new StopStringCondition("END", Outside);
+        Assert.Equal(StopResult.Continue, Run(gate, "Hello"));
+        Assert.Equal(StopResult.Stop, Run(gate, "Hello END"));
+    }
+
+    [Fact]
+    public void StopGate_AutoIgnoresALiteralThinkLaterInTheAnswer_DeepseekHonoursIt()
+    {
+        var auto = new StopStringCondition("END", Outside);
+        Assert.Equal(StopResult.Continue, Run(auto, "Use "));
+        Assert.Equal(StopResult.Stop, Run(auto, "Use <think> tags END"));   // not at the start: not a block
+
+        var anywhere = new StopStringCondition("END", new StopGate("<think>", "</think>", false, OpenOnlyAtStart: false));
+        Assert.Equal(StopResult.Continue, Run(anywhere, "Use "));
+        Assert.Equal(StopResult.Continue, Run(anywhere, "Use <think> inner END"));
+    }
+
+    [Fact]
+    public void StopGate_NoGate_BehavesExactlyLikeTheOriginal()
     {
         var plain = new StopStringCondition("END");
         Assert.Equal(StopResult.Stop, Run(plain, "abcEND"));
@@ -426,14 +461,14 @@ public sealed class ReasoningOpenAiTests
         var options = new InferenceOptions
         {
             StopSequences = ["STOP", "<|im_end|>"],
-            StopSequencesArmedAfter = "</think>",
+            ReasoningStopGate = Inside,
             StopSequencesUngated = ["<|im_end|>"],
         };
         var a = StopStringCondition.CreateAll(options);
         var b = StopStringCondition.CreateAll(options);
         Assert.Equal(StopResult.Continue, Run(a[0], "thinking STOP"));           // gated
         Assert.Equal(StopResult.Stop, Run(a[1], "thinking <|im_end|>"));         // ungated control token
-        Run(a[0], "x</think>");                                                   // arms a[0] only
+        Run(a[0], "x</think>");                                                   // leaves the block in a[0] only
         Assert.Equal(StopResult.Stop, Run(a[0], "ans STOP"));
         Assert.Equal(StopResult.Continue, Run(b[0], "ans STOP"));                 // sibling sequence unaffected
     }

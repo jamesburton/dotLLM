@@ -34,12 +34,19 @@ internal sealed class ReasoningPlan
         => Enabled ? new ReasoningSplitter(PromptOpened, detectAnywhere: _format == ReasoningFormat.Deepseek) : null;
 
     /// <summary>
-    /// Applies the stop-sequence gate: when the prompt opened a think block, stop strings (other than the
-    /// template's control tokens) arm only after <c>&lt;/think&gt;</c>, so they cannot cut the thinking short.
+    /// Applies the stop-sequence gate: stop strings (other than the template's control tokens) are suspended
+    /// while the model is inside a think block, so a stop string in its thinking cannot cut the turn short
+    /// before it has answered. Covers both a block the template opened and one the model opens itself.
     /// </summary>
     public InferenceOptions Gate(InferenceOptions options, IReadOnlyList<string> ungatedStops)
-        => Enabled && PromptOpened
-            ? options with { StopSequencesArmedAfter = ReasoningFormats.CloseTag, StopSequencesUngated = ungatedStops }
+        => Enabled
+            ? options with
+            {
+                ReasoningStopGate = new StopGate(
+                    ReasoningFormats.OpenTag, ReasoningFormats.CloseTag, PromptOpened,
+                    OpenOnlyAtStart: _format != ReasoningFormat.Deepseek),
+                StopSequencesUngated = ungatedStops,
+            }
             : options;
 
     /// <summary>
