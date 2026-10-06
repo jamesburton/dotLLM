@@ -27,7 +27,7 @@ public static class ModelManagementEndpoint
     {
         string full;
         try { full = Path.GetFullPath(path); } catch { return null; }
-        return full.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase)
+        return (full.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase) || OllamaStore.IsBlobPath(full))
             && ModelInspectEndpoint.IsAllowedModelPath(full, state)
             && File.Exists(full) ? full : null;
     }

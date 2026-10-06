@@ -1,4 +1,5 @@
 using System.Text.Json;
+using DotLLM.HuggingFace;
 using DotLLM.Server;
 using DotLLM.Server.Endpoints;
 using DotLLM.Server.Models;
@@ -80,5 +81,25 @@ public sealed class ModelLoadSelectionTests : IDisposable
             ServerJsonContext.Default.ModelLoadRequest)!;
         Assert.Equal("C:\\m\\gemma-e4b.gguf", req.ModelPath);
         Assert.Equal(-1, req.GpuLayers);
+    }
+
+    [Fact]
+    public void Inspect_AcceptsEveryListedModel_SoSliderTracksSelection()
+    {
+        // Models the picker lists from the HF hub cache / ollama store live outside ~/.dotllm/models. If inspect refuses them the slider
+        // never updates (stays at its HTML default 32) whichever model is selected.
+        string a = Path.Combine(_dir, "hub", "a-32layers.gguf");
+        string b = Path.Combine(_dir, "ollama", "sha256-b42layers");
+        var listed = new[]
+        {
+            new LocalModel("o/a", "a-32layers.gguf", a, 1, DateTime.UtcNow),
+            new LocalModel("o/b", "sha256-b42layers", b, 1, DateTime.UtcNow),
+        };
+        var state = StateWithLoaded("");
+
+        Assert.False(ModelInspectEndpoint.IsAllowedModelPath(Path.GetFullPath(a), state)); // refused by the directory rules alone
+        Assert.True(ModelInspectEndpoint.IsListedModelPath(Path.GetFullPath(a), listed));
+        Assert.True(ModelInspectEndpoint.IsListedModelPath(Path.GetFullPath(b), listed));
+        Assert.False(ModelInspectEndpoint.IsListedModelPath(Path.GetFullPath(Path.Combine(_dir, "other.gguf")), listed));
     }
 }

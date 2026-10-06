@@ -996,7 +996,9 @@ async function onModalModelChange() {
     modalModelInfo.textContent = 'Inspecting model...';
 
     // Inspect the selected model to get layer count
-    modalInspect = await inspectModel(fullPath);
+    const inspected = await inspectModel(fullPath);
+    if (modalSelectedFullPath !== fullPath) return;   // a newer selection superseded this (out-of-order response)
+    modalInspect = inspected;
     if (modalInspect) {
         const size = formatFileSize(modalInspect.file_size_bytes);
         modalModelInfo.textContent = `${modalInspect.architecture} | ${modalInspect.num_layers} layers | ${modalInspect.hidden_size}H | ctx ${modalInspect.max_sequence_length?.toLocaleString() ?? '?'} | ${size}`;
@@ -1007,7 +1009,9 @@ async function onModalModelChange() {
         modalGpuLayersMax.textContent = modalInspect.num_layers;
         updateGpuLayersDisplay();
     } else {
-        modalModelInfo.textContent = 'Could not read model metadata';
+        modalModelInfo.textContent = 'Could not read model metadata (layer count unknown; "All" will load every layer)';
+        modalGpuLayersMax.textContent = '?';
+        updateGpuLayersDisplay();
     }
 
     modalOptions.classList.remove('hidden');
