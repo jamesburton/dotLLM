@@ -649,6 +649,14 @@ internal sealed class CudaWeights : IDisposable
     private static unsafe (nint InvFreqDevice, float Mscale) UploadDenseYarnInvFreq(
         ModelConfig config, float[]? ropeFreqFactors, List<nint> allocs)
     {
+        // Mistral-3 / Ministral-3 attention temperature (#743) scales Q after RoPE per position; no CUDA
+        // kernel implements it yet (needs a PTX rebuild on the CUDA box). Refuse loudly rather than run
+        // with silently wrong attention at long context. CPU and Vulkan implement it.
+        if (config.AttnTemperatureScale != 0f)
+            throw new NotSupportedException(
+                "Mistral-3 attention temperature scaling (attention.temperature_scale) is not implemented on the "
+                + "CUDA backend yet (issue #743: CPU and Vulkan honour it). Use --device cpu or vulkan for this model.");
+
         // Dense llama3-style rope_freqs.weight (#743): the same per-pair inverse-frequency
         // device buffer carries it (angle = pos * theta^(-2i/d) / factor[i], mscale 1), so every
         // RoPE kernel call site that already forwards this pointer picks it up with no kernel

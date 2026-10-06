@@ -1375,6 +1375,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                     numHeads, numKvHeadsLayer, headDimLayer, ropeDimLayer,
                     ropeCos, ropeSin, ropeTypeLayer);
             }
+            // Mistral-3 attention temperature (no-op when disabled): Q *= f(pos) after RoPE (#743).
+            ApplyAttnTemperature(q, positions, seqLen, qStrideLayer);
 
             // e. Attention — with or without KV-cache
             // Gemma 3 family extras (no-op on every other architecture):
@@ -3243,6 +3245,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
                         numHeads, numKvHeadsLayer, headDim, ropeDimLayer,
                         ropeCos, ropeSin, ropeTypeLayer);
                 }
+                ApplyAttnTemperature(qSlice, positions, n, qStride);
 
                 IKvCache kvCache = r.KvCache;
                 // KV cache is required on the request — write new K/V then attend
@@ -3496,6 +3499,21 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         LoraProjection.Apply(_currentAdapter, LoraAdapter.SelfConditioningLayerIndex, projName, x, y,
                              canvasLen, inputDim, outputDim, _threadPool,
                              region: LoraRegion.Any);
+    }
+
+    /// <summary>
+    /// Mistral-3 / Ministral-3 attention temperature (llama.cpp <c>llm_graph_input_attn_temp</c>):
+    /// multiplies every post-RoPE query row by <see cref="ModelConfig.AttnTemperatureAt"/> of its
+    /// position. No-op (single branch) for every other model (#743).
+    /// </summary>
+    private void ApplyAttnTemperature(float* q, ReadOnlySpan<int> positions, int seqLen, int qStride)
+    {
+        if (Config.AttnTemperatureScale == 0f) return;
+        for (int t = 0; t < seqLen; t++)
+        {
+            float f = Config.AttnTemperatureAt(positions[t]);
+            System.Numerics.Tensors.TensorPrimitives.Multiply(new Span<float>(q + (long)t * qStride, qStride), f, new Span<float>(q + (long)t * qStride, qStride));
+        }
     }
 
     /// <summary>

@@ -107,6 +107,20 @@ public static class GgufModelConfigExtractor
 
         RoPEConfig? ropeConfig = ExtractRoPEConfig(metadata, arch, headDim, architecture);
 
+        // Mistral-3 / Ministral-3 attention temperature (llama.cpp mistral3.cpp): Q *= log(floor(pos/n_ctx_orig_yarn)+1)*scale+1.
+        float attnTempScale = 0f;
+        int attnTempFloor = 0;
+        if (string.Equals(archString, "mistral3", StringComparison.OrdinalIgnoreCase))
+        {
+            attnTempScale = metadata.GetFloat32OrDefault($"{arch}.attention.temperature_scale", 0.0f);
+            if (attnTempScale != 0f)
+            {
+                attnTempFloor = ropeConfig?.OrigMaxSeqLen > 0 ? ropeConfig!.Value.OrigMaxSeqLen : maxSeqLen;
+                if (attnTempFloor <= 0)
+                    throw new InvalidDataException("mistral3 attention.temperature_scale requires a positive original context length.");
+            }
+        }
+
         // GDN models reuse the same {arch}.ssm.* key names as Mamba-2 but with
         // different semantics — skip Mamba-2 SSM config extraction for them.
         MambaSsmConfig? ssmConfig = architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense
@@ -178,6 +192,8 @@ public static class GgufModelConfigExtractor
                 ? ActivationFunction.ReluSquared
                 : ActivationFunction.SiLU,
             RoPEConfig = ropeConfig,
+            AttnTemperatureScale = attnTempScale,
+            AttnTemperatureFloorScale = attnTempFloor,
             PositionEncodingType = ropeConfig.HasValue ? PositionEncodingType.RoPE : PositionEncodingType.None,
             SlidingWindowSize = slidingWindowSize,
             SlidingWindowPattern = slidingWindowPattern,

@@ -1041,7 +1041,7 @@ internal sealed class TransformerWeights : IDisposable
     /// layers and every other architecture leave this null. Folded into the
     /// global cos/sin table at model construction.
     /// </summary>
-    public float[]? RopeFreqFactors { get; private set; }
+    public float[]? RopeFreqFactors { get; internal set; }
 
     /// <summary>Per-layer R4-interleaved weights. Null until <see cref="RepackWeights"/> is called.</summary>
     public RepackedLayerWeights[]? RepackedLayers { get; private set; }
