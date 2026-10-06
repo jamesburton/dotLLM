@@ -1,0 +1,179 @@
+#version 450
+// Grouped Q8_0 MoE expert matmul via VK_KHR_cooperative_matrix, 16x16 tiles x 4 subgroups (64 output rows per workgroup, one shared B tile),
+// 64 K (two 32-element Q5_1 blocks) per staging round (issue #773: Gemma-4 ffn_down_exps layers kept as Q8_0).
+//
+//   Y[packedRow, m] = X[packedRow, :] @ W_q8_0[expert, m, :]^T      (W dequantised into the F16 A operand on the fly)
+//
+// Same dispatch / tile-list contract as the Q5_1 sibling. Bank layout: [E, M, K/32 blocks of 34 bytes]: fp16 d, int8 qs[32].
+// Blocks are only 2-byte aligned (34 B), so every read goes through the straddle-safe word reader. The Gemma-4 per-expert down scale is
+// PRE-FOLDED into d at upload for Q8_0 banks, so applyScale is 0 for this shader (the binding stays so both share one kernel class).
+// PRECISION: d*q is folded into the F16 A operand (~2^-11). K must be a multiple of 64.
+
+#extension GL_KHR_cooperative_matrix      : require
+#extension GL_KHR_memory_scope_semantics  : require
+#extension GL_KHR_shader_subgroup_basic   : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage    : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW       { uint weight[]; };  // [E,M,K/32 x 34 B] Q8_0
+layout(set = 0, binding = 1, std430) readonly  buffer BufX       { vec4 x4[]; };      // [rows,K] F32 (K % 4 == 0)
+layout(set = 0, binding = 2, std430) readonly  buffer BufOffsets { uint offsets[]; }; // [E+1] (+ tile list)
+layout(set = 0, binding = 3, std430) writeonly buffer BufY       { float y[]; };      // [rows,M] F32
+layout(set = 0, binding = 4, std430) readonly  buffer BufScale   { float expertScale[]; }; // [E] (read only when pc.applyScale != 0)
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint rows;
+    uint numExperts;
+    uint blocksPerRow;  // K / 32
+    uint rowUints;      // per-row BYTE stride (blocksPerRow * 34)
+    uint tileList;      // 0 = legacy 3-D grid; else index in `offsets` of the tile work list (indirect mode)
+    uint applyScale;    // 1 = multiply the accumulator by expertScale[expert]
+} pc;
+
+const uint TM = 16u;
+const uint TN = 16u;
+const uint TK = 16u;
+const uint SB = 64u;                // K per staging round (two blocks)
+const uint STRIDE = SB + 8u;        // padded LDS row stride (halves)
+const uint NSG = 4u;
+const uint WAVE = 64u;
+const uint WG_THREADS = 256u;
+const uint BLOCK_BYTES = 34u;
+
+uint readWord(uint byteOff) {
+    uint idx = byteOff >> 2u;
+    uint sh = (byteOff & 3u) * 8u;
+    uint lo = weight[idx];
+    if (sh == 0u) return lo;
+    return (lo >> sh) | (weight[idx + 1u] << (32u - sh));
+}
+
+shared float16_t sharedA[NSG * TM * STRIDE];
+shared float16_t sharedB[TN * STRIDE];
+shared float storeStage[NSG * TM * TN];
+
+struct Stage { uint aw[5]; vec4 bv; };   // aw: d (low half), then this thread's 16 quant bytes as 4 words
+
+void loadStage(uint sb, uint tid, uint blk, uint half_, bool rowValid, uint rowBase, uint xRowBase4, uint localRowBase, uint expertRows, inout Stage st) {
+    for (uint i = 0u; i < 5u; i++) st.aw[i] = 0u;
+    if (rowValid) {
+        uint bb = rowBase + (sb * 2u + blk) * BLOCK_BYTES;
+        st.aw[0] = readWord(bb) & 0xFFFFu;
+        uint qb = bb + 2u + half_ * 16u;
+        for (uint i = 0u; i < 4u; i++) st.aw[1u + i] = readWord(qb + i * 4u);
+    }
+    uint bRow = tid >> 4u;
+    uint c4 = tid & 15u;
+    st.bv = (localRowBase + bRow) < expertRows ? x4[xRowBase4 + bRow * (pc.K / 4u) + sb * (SB / 4u) + c4] : vec4(0.0);
+}
+
+void commitStage(in Stage st, uint tid, uint sg, uint mLocal, uint blk, uint half_, bool rowValid) {
+    uint aBase = sg * TM * STRIDE + mLocal * STRIDE + blk * 32u + half_ * 16u;
+    if (!rowValid) {
+        for (uint j = 0u; j < 16u; j++) sharedA[aBase + j] = float16_t(0.0);
+    } else {
+        float d = unpackHalf2x16(st.aw[0]).x;
+        for (uint w = 0u; w < 4u; w++) {
+            uint qw = st.aw[1u + w];
+            for (uint jb = 0u; jb < 4u; jb++) {
+                int qv = int(qw << (24u - jb * 8u)) >> 24;   // sign-extended int8
+                sharedA[aBase + w * 4u + jb] = float16_t(d * float(qv));
+            }
+        }
+    }
+    uint bRow = tid >> 4u;
+    uint c4 = tid & 15u;
+    uint o = bRow * STRIDE + c4 * 4u;
+    sharedB[o]      = float16_t(st.bv.x);
+    sharedB[o + 1u] = float16_t(st.bv.y);
+    sharedB[o + 2u] = float16_t(st.bv.z);
+    sharedB[o + 3u] = float16_t(st.bv.w);
+}
+
+void main() {
+    uint mBase = gl_WorkGroupID.x * (TM * NSG);
+    uint localRowBase;
+    uint expert;
+    if (pc.tileList != 0u) {
+        // Indirect mode (moe_build_tile_list.comp): workgroup y is a tile index into the work list stored in `offsets` from
+        // pc.tileList on; only real (expert, row tile) pairs are launched.
+        uint listIdx = pc.tileList + 2u * gl_WorkGroupID.y;
+        expert = offsets[listIdx];
+        localRowBase = offsets[listIdx + 1u];
+    } else {
+        localRowBase = gl_WorkGroupID.y * TN;
+        expert = gl_WorkGroupID.z;
+        if (expert >= pc.numExperts) return;
+    }
+
+    uint expertStart = offsets[expert];
+    uint expertRows = offsets[expert + 1u] - expertStart;
+    if (localRowBase >= expertRows) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint sg = tid >> 6u;                // which subgroup / M tile
+    uint lane64 = tid & 63u;
+
+    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums =
+        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+
+    uint mLocal = lane64 / 4u;          // weight row of this thread within its subgroup tile
+    uint lane = lane64 - mLocal * 4u;   // 0..3: block (lane >> 1) of the round, half (lane & 1) of that block
+    uint blk = lane >> 1u;
+    uint half_ = lane & 1u;
+    uint mGlobal = mBase + sg * TM + mLocal;
+    bool rowValid = mGlobal < pc.M;
+    uint rowBase = expert * pc.M * pc.rowUints + mGlobal * pc.rowUints;
+    uint xRowBase4 = (expertStart + localRowBase) * (pc.K / 4u);
+
+    // Register-prefetched K loop: super-block sb+1's raw weight words and activation vec4s are loaded right after the staging barrier
+    // and only converted / stored to LDS after sb's MMAs, so their DRAM latency hides behind the matrix work and every load of a
+    // super-block is in flight together. Measured on gfx1151 (256 experts, m=512, k=2048, 16 rows/expert): 1.75 -> 1.09 ms per GEMM
+    // (86 -> 139 GB/s); skewed routing 2.25 -> 1.50 ms. The dequant arithmetic is unchanged, so results equal the single-subgroup
+    // (_coopmat, 16-row) shader's exactly.
+    Stage st;
+    loadStage(0u, tid, blk, half_, rowValid, rowBase, xRowBase4, localRowBase, expertRows, st);
+
+    for (uint sb = 0u; sb < pc.K / SB; sb++) {
+        commitStage(st, tid, sg, mLocal, blk, half_, rowValid);
+
+        barrier();
+        memoryBarrierShared();
+
+        if ((sb + 1u) < pc.K / SB)
+            loadStage(sb + 1u, tid, blk, half_, rowValid, rowBase, xRowBase4, localRowBase, expertRows, st);
+
+        for (uint kSlice = 0u; kSlice < SB; kSlice += TK) {
+            coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> aTile;
+            coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> bTile;
+
+            coopMatLoad(aTile, sharedA, sg * TM * STRIDE + kSlice, STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(bTile, sharedB, kSlice, STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            sums = coopMatMulAdd(aTile, bTile, sums);
+        }
+
+        barrier();
+    }
+
+    float scl = pc.applyScale != 0u ? expertScale[expert] : 1.0;
+    coopMatStore(sums, storeStage, sg * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
+    barrier();
+
+    for (uint i = 0u; i < 4u; i++) {
+        uint idx = lane64 + i * WAVE;
+        if (idx >= TM * TN) break;
+        uint localRowInTile = idx / TM;
+        uint m = idx - localRowInTile * TM;
+        uint lr = localRowBase + localRowInTile;
+        uint mG = mBase + sg * TM + m;
+        if (lr < expertRows && mG < pc.M) {
+            uint packedRow = expertStart + lr;
+            y[packedRow * pc.M + mG] = storeStage[sg * TM * TN + localRowInTile * TM + m] * scl;
+        }
+    }
+}
