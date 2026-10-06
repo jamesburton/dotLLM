@@ -223,6 +223,10 @@ async function* streamChat(messages, params) {
         body.logprobs = true;
         body.top_logprobs = params.top_logprobs || 5;
     }
+    // Thinking switch (#767): null = the model's default; true/false -> the chat template's enable_thinking.
+    if (params.enable_thinking === true || params.enable_thinking === false) {
+        body.enable_thinking = params.enable_thinking;
+    }
 
     const response = await fetch('/v1/chat/completions', {
         method: 'POST',
@@ -254,6 +258,9 @@ async function* streamChat(messages, params) {
                     const chunk = JSON.parse(data);
                     const choice = chunk.choices?.[0];
 
+                    if (choice?.delta?.reasoning_content) {
+                        yield { type: 'reasoning', content: choice.delta.reasoning_content };
+                    }
                     if (choice?.delta?.content) {
                         yield { type: 'delta', content: choice.delta.content, logprobs: choice?.logprobs?.content };
                     }
@@ -495,7 +502,23 @@ function hideWelcome() {
     welcomeEl.classList.add('hidden');
 }
 
-function addMessageToDOM(role, content, stats, rawPrompt, rawResponse) {
+// Collapsible "thinking" block (#767). Open while the model is still reasoning, collapsed once the answer starts.
+function createReasoningBlock(text, open) {
+    const details = document.createElement('details');
+    details.className = 'reasoning-block';
+    details.open = !!open;
+    const summary = document.createElement('summary');
+    summary.className = 'reasoning-summary';
+    summary.textContent = open ? 'Thinking\u2026' : 'Thought process';
+    details.appendChild(summary);
+    const body = document.createElement('div');
+    body.className = 'reasoning-body';
+    body.textContent = text || '';
+    details.appendChild(body);
+    return details;
+}
+
+function addMessageToDOM(role, content, stats, rawPrompt, rawResponse, reasoning) {
     hideWelcome();
 
     const wrapper = document.createElement('div');
@@ -514,6 +537,10 @@ function addMessageToDOM(role, content, stats, rawPrompt, rawResponse) {
         (role === 'user' ? 'text-zinc-500' : 'text-accent/60');
     label.textContent = role;
     bubble.appendChild(label);
+
+    if (role === 'assistant' && reasoning) {
+        bubble.appendChild(createReasoningBlock(reasoning, false));
+    }
 
     // Content
     const contentEl = document.createElement('div');
@@ -799,6 +826,7 @@ function getSettingsFromUI() {
         repetition_penalty: parseFloat($('#opt-rep-penalty').value),
         max_tokens: parseInt($('#opt-max-tokens').value) || 2048,
         seed: $('#opt-seed').value ? parseInt($('#opt-seed').value) : null,
+        enable_thinking: ({ on: true, off: false })[$('#opt-thinking')?.value] ?? null,
         logprobs: logprobs,
         top_logprobs: logprobs ? (parseInt($('#opt-top-logprobs')?.value) || 5) : 0,
     };
@@ -1225,6 +1253,8 @@ function buildApiMessages() {
         const msg = { role: m.role, content: m.content };
         if (m.tool_calls) msg.tool_calls = m.tool_calls;
         if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+        // Replay earlier reasoning; the chat template decides whether to render it (preserve_thinking).
+        if (m.role === 'assistant' && m.reasoning) msg.reasoning_content = m.reasoning;
         // Assistant tool-call messages have null content per OpenAI spec
         if (m.role === 'assistant' && m.tool_calls) msg.content = null;
         apiMessages.push(msg);
@@ -1272,6 +1302,15 @@ async function runGeneration(round) {
     let finishReason = null;
     const startTime = performance.now();
     let firstTokenTime = null;
+    let reasoningText = '';
+    let reasoningEl = null;
+    let reasoningStart = null;
+    const collapseReasoning = () => {
+        if (!reasoningEl || !reasoningEl.open) return;
+        reasoningEl.open = false;
+        const secs = ((performance.now() - reasoningStart) / 1000).toFixed(1);
+        reasoningEl.querySelector('.reasoning-summary').textContent = `Thought for ${secs}s`;
+    };
 
     // Show live timer immediately (before first token)
     placeholder.liveStats.classList.remove('hidden');
@@ -1295,10 +1334,24 @@ async function runGeneration(round) {
 
     try {
         for await (const event of streamChat(apiMessages, params)) {
-            if (event.type === 'delta') {
+            if (event.type === 'reasoning') {
                 if (firstTokenTime === null) {
                     firstTokenTime = performance.now();
                 }
+                tokenCount++;
+                if (!reasoningEl) {
+                    reasoningStart = performance.now();
+                    reasoningEl = createReasoningBlock('', true);
+                    placeholder.bubble.insertBefore(reasoningEl, placeholder.contentEl);
+                }
+                reasoningText += event.content;
+                reasoningEl.querySelector('.reasoning-body').textContent = reasoningText;
+                scrollToBottom();
+            } else if (event.type === 'delta') {
+                if (firstTokenTime === null) {
+                    firstTokenTime = performance.now();
+                }
+                collapseReasoning();
                 tokenCount++;
                 fullText += event.content;
                 if (useLogprobs && event.logprobs) {
@@ -1330,6 +1383,7 @@ async function runGeneration(round) {
 
     // Finalize
     clearInterval(liveTimer);
+    collapseReasoning();
     placeholder.contentEl.classList.remove('cursor-blink');
     placeholder.liveStats.remove();
 
@@ -1352,6 +1406,7 @@ async function runGeneration(round) {
         state.messages.push({
             role: 'assistant',
             content: fullText,
+            reasoning: reasoningText || undefined,
             tool_calls: detectedToolCalls,
             stats: statsInfo,
             rawPrompt,
@@ -1419,6 +1474,7 @@ async function runGeneration(round) {
     placeholder.bubble.setAttribute('data-msg-idx', msgIdx);
     state.messages.push({
         role: 'assistant', content: fullText, stats: statsInfo, rawPrompt, rawResponse: fullText,
+        reasoning: reasoningText || undefined,
         logprobs: useLogprobs ? logprobEntries : null,
     });
 
@@ -1729,6 +1785,7 @@ function saveConversation() {
                 const msg = { role: m.role, content: m.content };
                 if (m.tool_calls) msg.tool_calls = m.tool_calls;
                 if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+                if (m.reasoning) msg.reasoning = m.reasoning;
                 return msg;
             })
         ));
@@ -1763,6 +1820,7 @@ function loadConversation() {
             const stateMsg = { role: m.role, content: m.content };
             if (m.tool_calls) stateMsg.tool_calls = m.tool_calls;
             if (m.tool_call_id) stateMsg.tool_call_id = m.tool_call_id;
+            if (m.reasoning) stateMsg.reasoning = m.reasoning;
             state.messages.push(stateMsg);
 
             if (m.role === 'tool') {
@@ -1783,7 +1841,7 @@ function loadConversation() {
                 messagesEl.appendChild(wrapper);
                 hideWelcome();
             } else {
-                addMessageToDOM(m.role, m.content);
+                addMessageToDOM(m.role, m.content, undefined, undefined, undefined, m.reasoning);
             }
         }
     } catch { /* corrupted data, ignore */ }

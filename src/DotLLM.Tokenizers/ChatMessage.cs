@@ -16,4 +16,11 @@ public record ChatMessage
 
     /// <summary>ID of the tool call this message is responding to. Null if not a tool result.</summary>
     public string? ToolCallId { get; init; }
+
+    /// <summary>
+    /// Reasoning ("thinking") the assistant produced before <see cref="Content"/>. Exposed to the chat
+    /// template as <c>message.reasoning_content</c>; templates that render history reasoning
+    /// (Qwen3.x <c>preserve_thinking</c>) use it. Null when the turn carried none.
+    /// </summary>
+    public string? ReasoningContent { get; init; }
 }

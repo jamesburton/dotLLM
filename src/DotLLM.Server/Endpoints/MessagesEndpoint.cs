@@ -6,6 +6,7 @@ using DotLLM.Engine.Constraints;
 using DotLLM.Server.Models;
 using DotLLM.Server.RateLimiting;
 using DotLLM.Tokenizers;
+using DotLLM.Tokenizers.Reasoning;
 using DotLLM.Tokenizers.ToolCallParsers;
 
 namespace DotLLM.Server.Endpoints;
@@ -100,7 +101,19 @@ public static class MessagesEndpoint
         var modelId = state.Options.ModelId;
         var generator = state.Generator;
 
-        string prompt = BuildPrompt(request, state, out var tools);
+        string? prompt = BuildPrompt(request, state, out var tools, out bool constrained, out string? templateError);
+        if (prompt is null)
+        {
+            await WriteErrorAsync(httpContext, 400, "invalid_request_error", templateError!);
+            return;
+        }
+
+        var plan = ReasoningSupport.Plan(state.Options.ReasoningFormat, request.ReasoningFormat, constrained, prompt, out string? planError);
+        if (planError is not null)
+        {
+            await WriteErrorAsync(httpContext, 400, "invalid_request_error", planError);
+            return;
+        }
 
         int maxTokens = request.MaxTokens ?? state.EffectiveSamplingDefaults.MaxTokens;
         var promptError = RequestValidator.ValidatePromptLength(
@@ -115,7 +128,7 @@ public static class MessagesEndpoint
         var options = AnthropicConverter.ToInferenceOptions(request, CommonStopSequences,
             state.EffectiveSamplingDefaults,
             new DotLLM.Core.Configuration.ThreadingConfig(state.Options.Threads, state.Options.DecodeThreads));
-        options = options with { MaxTokens = effectiveMaxTokens };
+        options = plan.Gate(options with { MaxTokens = effectiveMaxTokens }, ReasoningSupport.UngatedStops);
 
         // tool_choice was parsed and then dropped on the floor (#449): the prompt was built with
         // the tools but nothing constrained or suppressed the model, so `{"type":"tool"}` was
@@ -126,10 +139,10 @@ public static class MessagesEndpoint
 
         if (request.Stream)
             await HandleStreamingAsync(request, generator, state, httpContext, prompt, options,
-                messageId, modelId, effectiveParser, forcedToolCall, promptTokenCount, ct);
+                messageId, modelId, effectiveParser, forcedToolCall, promptTokenCount, plan, ct);
         else
             await HandleNonStreamingAsync(request, generator, state, httpContext, prompt, options,
-                messageId, modelId, effectiveParser, ct);
+                messageId, modelId, effectiveParser, plan, ct);
     }
 
     /// <summary>
@@ -153,6 +166,7 @@ public static class MessagesEndpoint
         DotLLM.Core.Configuration.InferenceOptions options,
         string messageId, string modelId,
         IToolCallParser? toolCallParser,
+        ReasoningPlan plan,
         CancellationToken ct)
     {
         InferenceResponse? result = null;
@@ -174,7 +188,12 @@ public static class MessagesEndpoint
             }, ct);
         }
 
-        string text = result!.Text;
+        // (#767) Split reasoning from the answer first: tool-call detection, stop-sequence handling and the
+        // text block all work on the answer only.
+        var (reasoning, answer, _) = plan.SplitComplete(result!.Text, state.Tokenizer);
+        result = result with { Text = answer };
+
+        string text = result.Text;
         ToolCall[]? toolCalls = null;
         var finishReason = result.FinishReason;
 
@@ -204,6 +223,16 @@ public static class MessagesEndpoint
         {
             content = [new AnthropicContentBlockDto { Type = "text", Text = text }];
             stopReason = AnthropicConverter.ToStopReason(finishReason, matchedStopSequence);
+        }
+
+        // The thinking block leads the content, as on the real API.
+        if (reasoning is not null)
+        {
+            content =
+            [
+                new AnthropicContentBlockDto { Type = "thinking", Thinking = reasoning, Signature = "" },
+                .. content,
+            ];
         }
 
         // Prefer what the engine reported; fall back to matching the raw text for callers that
@@ -247,6 +276,7 @@ public static class MessagesEndpoint
         IToolCallParser? toolCallParser,
         bool forcedToolCall,
         int promptTokenCount,
+        ReasoningPlan plan,
         CancellationToken ct)
         => await WriteMessageStreamAsync(
             httpContext,
@@ -254,7 +284,7 @@ public static class MessagesEndpoint
             state.ExecuteAsync,
             toolCallParser,
             request.StopSequences,
-            messageId, modelId, promptTokenCount, ct, forcedToolCall);
+            messageId, modelId, promptTokenCount, ct, forcedToolCall, plan);
 
     /// <summary>
     /// Emits the Anthropic SSE event sequence for one streaming request:
@@ -280,7 +310,8 @@ public static class MessagesEndpoint
         string modelId,
         int promptTokenCount,
         CancellationToken ct,
-        bool forcedToolCall = false)
+        bool forcedToolCall = false,
+        ReasoningPlan? plan = null)
     {
         // No `Connection: keep-alive` — it is connection-specific and illegal over HTTP/2+.
         SseResponse.ApplyHeaders(httpContext);
@@ -299,17 +330,56 @@ public static class MessagesEndpoint
             new AnthropicMessageStartEvent { Message = startMessage },
             ServerJsonContext.Default.AnthropicMessageStartEvent, ct);
 
-        // Text content block opens at index 0.
-        await WriteEventAsync(httpContext, "content_block_start",
-            new AnthropicContentBlockStartEvent
+        // Blocks. Without a reasoning plan, text block 0 opens eagerly (the original event sequence). With one
+        // (#767) the block type - thinking or text - is only known once output arrives, so blocks open
+        // lazily and a stream can carry thinking -> text (-> tool_use).
+        var splitter = plan?.NewSplitter();
+        int nextIndex = 0;
+        int openIndex = -1;
+        string? openKind = null;
+
+        async Task OpenBlockAsync(string kind)
+        {
+            openIndex = nextIndex++;
+            openKind = kind;
+            await WriteEventAsync(httpContext, "content_block_start",
+                new AnthropicContentBlockStartEvent
+                {
+                    Index = openIndex,
+                    ContentBlock = kind == "thinking"
+                        ? new AnthropicContentBlockDto { Type = "thinking", Thinking = "", Signature = "" }
+                        : new AnthropicContentBlockDto { Type = "text", Text = "" },
+                },
+                ServerJsonContext.Default.AnthropicContentBlockStartEvent, ct);
+        }
+
+        async Task CloseBlockAsync()
+        {
+            if (openKind is null)
+                return;
+            if (openKind == "thinking")
             {
-                Index = 0,
-                ContentBlock = new AnthropicContentBlockDto { Type = "text", Text = "" },
-            },
-            ServerJsonContext.Default.AnthropicContentBlockStartEvent, ct);
+                // Real thinking blocks end with a signature_delta; ours is empty (nothing to sign with).
+                await WriteEventAsync(httpContext, "content_block_delta",
+                    new AnthropicContentBlockDeltaEvent
+                    {
+                        Index = openIndex,
+                        Delta = new AnthropicStreamDeltaDto { Type = "signature_delta", Signature = "" },
+                    },
+                    ServerJsonContext.Default.AnthropicContentBlockDeltaEvent, ct);
+            }
+            await WriteEventAsync(httpContext, "content_block_stop",
+                new AnthropicContentBlockStopEvent { Index = openIndex },
+                ServerJsonContext.Default.AnthropicContentBlockStopEvent, ct);
+            openKind = null;
+        }
+
+        if (splitter is null)
+            await OpenBlockAsync("text");
         await WriteEventAsync(httpContext, "ping", new AnthropicPingEvent(),
             ServerJsonContext.Default.AnthropicPingEvent, ct);
 
+        // `sb` accumulates the ANSWER only: tool-call detection and stop matching below never see reasoning.
         var sb = new StringBuilder();
         FinishReason finishReason = FinishReason.Length;
         int completionTokens = 0;
@@ -326,6 +396,46 @@ public static class MessagesEndpoint
             ? new StreamingToolCallAccumulator(toolCallParser)
             : null;
 
+        async Task EmitAsync(ReasoningChunk chunk)
+        {
+            if (chunk.Reasoning.Length > 0)
+            {
+                if (openKind != "thinking")
+                {
+                    await CloseBlockAsync();
+                    await OpenBlockAsync("thinking");
+                }
+                await WriteEventAsync(httpContext, "content_block_delta",
+                    new AnthropicContentBlockDeltaEvent
+                    {
+                        Index = openIndex,
+                        Delta = new AnthropicStreamDeltaDto { Type = "thinking_delta", Thinking = chunk.Reasoning },
+                    },
+                    ServerJsonContext.Default.AnthropicContentBlockDeltaEvent, ct);
+            }
+
+            if (chunk.Content.Length > 0)
+            {
+                sb.Append(chunk.Content);
+                bool suppress = forcedToolCall || (suppressor?.Append(chunk.Content) ?? false);
+                if (!suppress)
+                {
+                    if (openKind != "text")
+                    {
+                        await CloseBlockAsync();
+                        await OpenBlockAsync("text");
+                    }
+                    await WriteEventAsync(httpContext, "content_block_delta",
+                        new AnthropicContentBlockDeltaEvent
+                        {
+                            Index = openIndex,
+                            Delta = new AnthropicStreamDeltaDto { Type = "text_delta", Text = chunk.Content },
+                        },
+                        ServerJsonContext.Default.AnthropicContentBlockDeltaEvent, ct);
+                }
+            }
+        }
+
         try
         {
             await execute(async () =>
@@ -335,23 +445,18 @@ public static class MessagesEndpoint
                     if (token.Text.Length > 0)
                     {
                         completionTokens++;
-                        sb.Append(token.Text);
-                        bool suppress = forcedToolCall || (suppressor?.Append(token.Text) ?? false);
-                        if (!suppress)
-                        {
-                            await WriteEventAsync(httpContext, "content_block_delta",
-                                new AnthropicContentBlockDeltaEvent
-                                {
-                                    Index = 0,
-                                    Delta = new AnthropicStreamDeltaDto { Type = "text_delta", Text = token.Text },
-                                },
-                                ServerJsonContext.Default.AnthropicContentBlockDeltaEvent, ct);
-                        }
+                        await EmitAsync(splitter is null
+                            ? new ReasoningChunk("", token.Text)
+                            : splitter.Feed(token.Text));
                     }
 
                     if (token.FinishReason.HasValue)
                         finishReason = token.FinishReason.Value;
                 }
+
+                // Release whatever the splitter held back (a partial tag that never completed).
+                if (splitter is not null)
+                    await EmitAsync(splitter.Finish());
             }, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -371,10 +476,11 @@ public static class MessagesEndpoint
             return;
         }
 
-        // Close the text block.
-        await WriteEventAsync(httpContext, "content_block_stop",
-            new AnthropicContentBlockStopEvent { Index = 0 },
-            ServerJsonContext.Default.AnthropicContentBlockStopEvent, ct);
+        // Close the open block (the text block in the eager mode). A lazy stream that produced nothing at
+        // all still reports one (empty) text block, as the eager one always has.
+        if (openKind is null && nextIndex == 0)
+            await OpenBlockAsync("text");
+        await CloseBlockAsync();
 
         // Post-generation tool-call detection (mirrors the OpenAI streaming endpoint).
         string text = sb.ToString();
@@ -392,7 +498,7 @@ public static class MessagesEndpoint
             var blocks = AnthropicConverter.ToToolUseBlocks(toolCalls);
             for (int i = 0; i < blocks.Length; i++)
             {
-                int index = i + 1;
+                int index = nextIndex + i;
                 var block = blocks[i];
                 await WriteEventAsync(httpContext, "content_block_start",
                     new AnthropicContentBlockStartEvent
@@ -552,16 +658,23 @@ public static class MessagesEndpoint
     /// chat template. Shared by <c>/v1/messages</c> and <c>/v1/messages/count_tokens</c> so the
     /// count the latter reports cannot drift from the prompt the former actually runs.
     /// </summary>
-    private static string BuildPrompt(
-        AnthropicMessagesRequest request, ServerState state, out ToolDefinition[]? tools)
+    private static string? BuildPrompt(
+        AnthropicMessagesRequest request, ServerState state, out ToolDefinition[]? tools,
+        out bool constrained, out string? error)
     {
         var messages = ProfileSystemPrompt.Apply(state.ActiveProfile?.System, AnthropicConverter.ToMessages(request));
         tools = AnthropicConverter.ToTools(request.Tools);
-        return state.ChatTemplate!.Apply(messages, new ChatTemplateOptions
-        {
-            AddGenerationPrompt = true,
-            Tools = tools,
-        });
+
+        // A forced tool_choice constrains decoding from the first token, which cannot coexist with an
+        // open reasoning block: such requests default thinking off unless the client enabled it (#767).
+        constrained = ReasoningSupport.ToolChoiceConstrains(
+            AnthropicConverter.ParseToolChoice(request.ToolChoice), tools, state.ToolCallParser);
+
+        var options = ReasoningSupport.BuildTemplateOptions(
+            tools, request.ThinkingEnabled, reasoningEffort: null, request.ChatTemplateKwargs, constrained);
+        if (!ReasoningSupport.TryApply(state.ChatTemplate!, messages, options, out string prompt, out error, out _))
+            return null;
+        return prompt;
     }
 
     /// <summary>
@@ -608,7 +721,12 @@ public static class MessagesEndpoint
             return;
         }
 
-        string prompt = BuildPrompt(request, state, out _);
+        string? prompt = BuildPrompt(request, state, out _, out _, out string? templateError);
+        if (prompt is null)
+        {
+            await WriteErrorAsync(httpContext, 400, "invalid_request_error", templateError!);
+            return;
+        }
         var response = new AnthropicCountTokensResponse { InputTokens = state.Tokenizer.CountTokens(prompt) };
 
         httpContext.Response.ContentType = "application/json";

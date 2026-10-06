@@ -80,6 +80,15 @@ public sealed record ServerOptions
     public bool MtpExplicit { get; init; }
 
     /// <summary>
+    /// How reasoning ("thinking") output is separated from the answer (#767): <c>--reasoning-format
+    /// none|auto|deepseek</c>. <see cref="DotLLM.Tokenizers.Reasoning.ReasoningFormat.Auto"/> (default) splits
+    /// into <c>reasoning_content</c> + <c>content</c> when the chat template opened a think block or the model
+    /// emits <c>&lt;think&gt;</c> itself; <c>none</c> returns the raw output in <c>content</c> as before.
+    /// A request may override it with its own <c>reasoning_format</c> field.
+    /// </summary>
+    public DotLLM.Tokenizers.Reasoning.ReasoningFormat ReasoningFormat { get; init; } = DotLLM.Tokenizers.Reasoning.ReasoningFormat.Auto;
+
+    /// <summary>
     /// Maximum prompt tokens per prefill forward pass (llama.cpp <c>-ub</c> / micro-batch analog).
     /// 0 (default) = whole prompt in one forward pass. On the single-request
     /// <see cref="DotLLM.Engine.TextGenerator"/> path this chunks the prompt-suffix prefill; when
@@ -221,6 +230,7 @@ public sealed record ServerOptions
         int speculativeCandidates = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
         bool mtpEnabled = true;
         bool mtpExplicit = false;
+        var reasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormat.Auto;
         int prefillChunkSize = 0;
         string? ropeScaling = null;
         float? ropeFreqBase = null;
@@ -284,6 +294,8 @@ public sealed record ServerOptions
                     mtpEnabled = true; mtpExplicit = true; break;
                 case "--no-mtp":
                     mtpEnabled = false; mtpExplicit = false; break;
+                case "--reasoning-format":
+                    reasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormats.Parse(next ?? ""); i++; break;
                 case "--prefill-chunk-size" or "--ubatch-size":
                     prefillChunkSize = int.Parse(next!); i++; break;
                 case "--rope-scaling":
@@ -355,6 +367,7 @@ public sealed record ServerOptions
             SpeculativeCandidates = speculativeCandidates,
             MtpEnabled = mtpEnabled,
             MtpExplicit = mtpExplicit,
+            ReasoningFormat = reasoningFormat,
             PrefillChunkSize = prefillChunkSize,
             KeepAliveSeconds = keepAliveSeconds,
             MaxResidentModels = maxResidentModels,
