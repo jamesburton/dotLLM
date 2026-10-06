@@ -163,7 +163,8 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
     private readonly LayerBuffers[] _layers;
     public LayerBuffers[] Layers => _layers;
 
-    public VulkanDevice.Buffer TokenEmbedding { get; }
+    /// <summary>Widened F32 token-embedding table as row chunks (#778; one chunk when it fits).</summary>
+    public VulkanChunkedRowTable TokenEmbeddingRows { get; }
     public VulkanDevice.Buffer OutputNormWeight { get; }
     public VulkanDevice.Buffer OutputWeight { get; }
     public QuantizationType OutputDeviceQuantType { get; }
@@ -174,14 +175,14 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
 
     private VulkanQwen3MoeHybridWeights(
         LayerBuffers[] layers,
-        VulkanDevice.Buffer tokenEmbedding,
+        VulkanChunkedRowTable tokenEmbedding,
         VulkanDevice.Buffer outputNormWeight,
         VulkanDevice.Buffer outputWeight, QuantizationType outputQt,
         int outputOutputDim, int outputInputDim,
         long allocatedBytes)
     {
         _layers = layers;
-        TokenEmbedding = tokenEmbedding;
+        TokenEmbeddingRows = tokenEmbedding;
         OutputNormWeight = outputNormWeight;
         OutputWeight = outputWeight;
         OutputDeviceQuantType = outputQt;
@@ -221,10 +222,9 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
 
         // Token embedding always dequantises to F32 — the embedding gather uses
         // vkCmdCopyBuffer byte offsets and needs a contiguous F32 layout.
-        var tokenEmbed = UploadProjectionMatrix(device, staging,
-            tokenEmbedWeight, tokenEmbedQt, config.VocabSize, config.HiddenSize,
-            forceF32: true, out _, out long tokenEmbedBytes);
-        totalBytes += tokenEmbedBytes;
+        var tokenEmbed = VulkanChunkedRowTable.Create(device, staging,
+            tokenEmbedWeight, tokenEmbedQt, config.VocabSize, config.HiddenSize);
+        totalBytes += tokenEmbed.TotalBytes;
 
         var layers = new LayerBuffers[config.NumLayers];
         for (int i = 0; i < config.NumLayers; i++)
@@ -555,7 +555,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
 
     public void Dispose()
     {
-        TokenEmbedding.Dispose();
+        TokenEmbeddingRows.Dispose();
         OutputNormWeight.Dispose();
         OutputWeight.Dispose();
         for (int i = 0; i < _layers.Length; i++)

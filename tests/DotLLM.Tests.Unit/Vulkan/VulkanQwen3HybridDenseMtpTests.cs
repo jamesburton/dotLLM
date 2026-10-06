@@ -247,6 +247,35 @@ public sealed class VulkanQwen3HybridDenseMtpTests : IDisposable
             AssertClose(cpuLogits[i], vkLogits[i], $"draft step {i}");
     }
 
+    /// <summary>
+    /// #778: the MTP head-LOCAL embedding table (<c>nextn.embed_tokens</c>) forced over a tiny limit
+    /// (4 rows per chunk of the 12-row table). Draft tokens must match the CPU oracle exactly, and the
+    /// head table's own counter must show rows gathered from non-first chunks.
+    /// </summary>
+    [SkippableFact]
+    public void ForwardMtp_HeadLocalEmbeddingOverLimit_IsChunked_AndMatchesCpu()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        string path = WriteFixture(withMtp: true, mtpHasOwnHeadTensors: true, name: "qwen35-mtp-chunked.gguf");
+        int[] tokenIds = [1, 2, 3];
+        int[] positions = [0, 1, 2];
+        const int DraftSteps = 4;
+        var (cpuTokens, cpuLogits) = RunCpuDraft(path, tokenIds, positions, DraftSteps);
+
+        long before = VulkanChunkedRowTable.NonFirstChunkCopies("mtp.embed_tokens");
+        VulkanChunkedRowTable.LimitOverrideBytes = 4UL * SyntheticQwen35HybridDenseMtpGguf.HiddenSize * sizeof(float);
+        try
+        {
+            var (vkTokens, vkLogits) = RunVulkanDraft(path, spvDir, tokenIds, positions, DraftSteps);
+            Assert.Equal(cpuTokens, vkTokens);
+            for (int i = 0; i < DraftSteps; i++)
+                AssertClose(cpuLogits[i], vkLogits[i], $"draft step {i}");
+            Assert.True(VulkanChunkedRowTable.NonFirstChunkCopies("mtp.embed_tokens") > before,
+                "The MTP head table never gathered from a non-first chunk.");
+        }
+        finally { VulkanChunkedRowTable.LimitOverrideBytes = null; }
+    }
+
     private static (int[] tokens, float[][] logits) RunCpuDraft(
         string path, int[] tokenIds, int[] positions, int draftSteps)
     {

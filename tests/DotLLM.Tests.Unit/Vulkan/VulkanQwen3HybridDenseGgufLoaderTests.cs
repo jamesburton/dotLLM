@@ -152,14 +152,14 @@ public sealed class VulkanQwen3HybridDenseGgufLoaderTests
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
         string path = WriteFixture(withMtp: false);
-        long before = VulkanChunkedRowTable.NonFirstChunkCopies;
+        long before = VulkanChunkedRowTable.NonFirstChunkCopies("token_embd");
         VulkanChunkedRowTable.LimitOverrideBytes = 4UL * SyntheticQwen35HybridDenseMtpGguf.HiddenSize * sizeof(float);
         try
         {
             int[] positions = Enumerable.Range(0, tokenIds.Length).ToArray();
             AssertVulkanMatchesCpu(path, spvDir, tokenIds, positions);
             // Perturbation evidence: rows really were read from chunks other than the first.
-            Assert.True(VulkanChunkedRowTable.NonFirstChunkCopies > before,
+            Assert.True(VulkanChunkedRowTable.NonFirstChunkCopies("token_embd") > before,
                 "No row was gathered from a non-first chunk: the chunk path did not run.");
         }
         finally

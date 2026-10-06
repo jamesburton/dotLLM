@@ -170,6 +170,46 @@ public sealed class VulkanQwen3MoeHybridCpuMoeOffloadTests
         }
     }
 
+    /// <summary>
+    /// #778: the Qwen3-MoE-hybrid embedding table forced over a tiny limit (2 rows per chunk of the 8-row table).
+    /// Row chunking is a pure relocation of the same F32 rows, so logits must equal the single-buffer run
+    /// (Vulkan-vs-Vulkan, same weights) to within F32 noise; ids span chunks 0..3.
+    /// </summary>
+    [SkippableFact]
+    public void EmbeddingOverLimit_IsChunked_AndMatchesSingleBuffer()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var fixture = MoeOffloadFixtureBuilder.Build(seed: 2024);
+        var config = fixture.Config;
+        int[] tokenIds = [2, 4, 6, 1];
+        int[] positions = [0, 1, 2, 3];
+
+        float[] Run()
+        {
+            using var device = VulkanDevice.Create();
+            using var model = VulkanQwen3MoeHybridTransformerModel.BuildFromPrebuiltWeights(
+                device, config, fixture.Layers, fixture.OutputNormWeight,
+                fixture.OutputWeightPtr, QuantizationType.F32, config.VocabSize, config.HiddenSize,
+                fixture.TokenEmbedPtr, QuantizationType.F32, spvDir, 0);
+            using var kv = model.CreateKvCache(MaxSeqLen);
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1, kv);
+            return CopyLogits(logits);
+        }
+
+        float[] single = Run();
+        long before = VulkanChunkedRowTable.NonFirstChunkCopies("token_embd");
+        VulkanChunkedRowTable.LimitOverrideBytes = 2UL * HiddenSize * sizeof(float);
+        float[] chunked;
+        try { chunked = Run(); }
+        finally { VulkanChunkedRowTable.LimitOverrideBytes = null; }
+
+        Assert.True(VulkanChunkedRowTable.NonFirstChunkCopies("token_embd") > before,
+            "No row was gathered from a non-first chunk: the chunk path did not run.");
+        for (int c = 0; c < config.VocabSize; c++)
+            Assert.True(MathF.Abs(single[c] - chunked[c]) <= 1e-5f + 1e-5f * MathF.Abs(single[c]),
+                $"col={c}: single={single[c]:F6} chunked={chunked[c]:F6}");
+    }
+
     [SkippableFact]
     public void CpuOffload_NCpuMoeLayers_ClampedToLayerCount()
     {
