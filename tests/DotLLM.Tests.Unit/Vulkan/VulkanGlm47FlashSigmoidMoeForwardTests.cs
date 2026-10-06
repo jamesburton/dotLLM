@@ -24,19 +24,19 @@ public sealed class VulkanGlm47FlashSigmoidMoeForwardTests
     public void Forward_SigmoidBiasMoe_MatchesCpu_AndBiasMatters()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
-        string biased = Write(strongBias: true);
-        string unbiased = Write(strongBias: false);
+        string biased = Write(reverseBias: false);
+        string unbiased = Write(reverseBias: true);
         try
         {
             int[] tokens = [1, 3, 5];
             int[] pos = [0, 1, 2];
             float[] cpu = Cpu(biased, tokens, pos);
-            float[] cpuNoBias = Cpu(unbiased, tokens, pos);
+            float[] cpuOtherBias = Cpu(unbiased, tokens, pos);
             float[] vk = Vk(biased, spvDir, tokens, pos);
 
             float maxControl = 0;
-            for (int c = 0; c < Vocab; c++) maxControl = MathF.Max(maxControl, MathF.Abs(cpu[c] - cpuNoBias[c]));
-            Assert.True(maxControl > 5e-3f, $"control insensitive: bias moved CPU logits by only {maxControl:E3}");
+            for (int c = 0; c < Vocab; c++) maxControl = MathF.Max(maxControl, MathF.Abs(cpu[c] - cpuOtherBias[c]));
+            Assert.True(maxControl > 5e-3f, $"control insensitive: a different bias moved CPU logits by only {maxControl:E3}");
 
             for (int c = 0; c < Vocab; c++)
             {
@@ -74,7 +74,7 @@ public sealed class VulkanGlm47FlashSigmoidMoeForwardTests
         return Copy(l);
     }
 
-    private static string Write(bool strongBias)
+    private static string Write(bool reverseBias)
     {
         var b = new GgufTestData(version: 3);
         b.AddString("general.architecture", "deepseek2");
@@ -128,7 +128,7 @@ public sealed class VulkanGlm47FlashSigmoidMoeForwardTests
             {
                 F32(b, p + "ffn_gate_inp.weight", [Hidden, E], s + 12, scale: 0.6f);
                 float[] bias = new float[E];
-                if (strongBias) for (int e = 0; e < E; e++) bias[e] = (e * 5 % E) * 0.12f;
+                for (int e = 0; e < E; e++) { int v = e * 5 % E; bias[e] = (reverseBias ? E - 1 - v : v) * 0.5f; }  // dominates sigmoid spread (<1)
                 Raw(b, p + "exp_probs_b.bias", [E], bias);
                 F32(b, p + "ffn_gate_exps.weight", [Hidden, MoeI, E], s + 13);
                 F32(b, p + "ffn_up_exps.weight", [Hidden, MoeI, E], s + 14);

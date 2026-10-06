@@ -29,7 +29,8 @@ public class VulkanMoeTopKSigmoidBiasF32KernelTests
         float[] logits = new float[seqLen * numExperts];
         for (int i = 0; i < logits.Length; i++) logits[i] = (float)(rng.NextDouble() * 6 - 3);
         float[] bias = new float[numExperts];
-        for (int i = 0; i < bias.Length; i++) bias[i] = (float)(rng.NextDouble() * 1.5 - 0.5);
+        // Order-reversing bias (sel = 1.5 - 0.5p for token 0): guarantees the biased top-k differs from the plain one.
+        for (int i = 0; i < bias.Length; i++) bias[i] = 1.5f * (1f - Sig(logits[i]));
 
         var (expIdx, expW) = Reference(logits, bias, seqLen, numExperts, k, norm, scale);
         var (zeroIdx, _) = Reference(logits, new float[numExperts], seqLen, numExperts, k, norm, scale);

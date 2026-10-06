@@ -1213,6 +1213,8 @@ public sealed class VulkanTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
 
+        config = VulkanTransformerModel.NormalizeMlaCacheForVulkan(config);
+
         RejectUnsupportedArchitecture(config);
 
         var device = VulkanDevice.Create();
@@ -1262,6 +1264,8 @@ public sealed class VulkanTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
 
+        config = VulkanTransformerModel.NormalizeMlaCacheForVulkan(config);
+
         RejectUnsupportedArchitecture(config);
 
         spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
@@ -1288,6 +1292,8 @@ public sealed class VulkanTransformerModel : IModel
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
+
+        config = VulkanTransformerModel.NormalizeMlaCacheForVulkan(config);
 
         RejectUnsupportedArchitecture(config);
 
@@ -1321,6 +1327,8 @@ public sealed class VulkanTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(cpuWeights);
         ArgumentNullException.ThrowIfNull(spvDir);
+
+        config = VulkanTransformerModel.NormalizeMlaCacheForVulkan(config);
 
         RejectUnsupportedArchitecture(config);
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf: null,
@@ -2411,6 +2419,16 @@ public sealed class VulkanTransformerModel : IModel
         + "neither its per-head attention sinks nor its dense YaRN RoPE scaling, so loading it would "
         + "silently produce wrong output rather than fail. Use the CPU backend, or CUDA (which "
         + "implements both since #365/#366), for gpt-oss checkpoints. Tracked in issue #480.";
+
+    /// <summary>
+    /// The GGUF/HF extractors default DeepSeek-style MLA to the CPU-only hybrid latent cache. The
+    /// Vulkan path runs the mathematically equivalent expanded cache, so loaders strip the flags
+    /// instead of rejecting a config the user never chose explicitly (#742: GLM-4.7-Flash).
+    /// </summary>
+    internal static ModelConfig NormalizeMlaCacheForVulkan(ModelConfig config)
+        => config.MlaConfig is { UseLatentCache: true } or { UseHybridMlaCache: true }
+            ? config with { MlaConfig = config.MlaConfig with { UseLatentCache = false, UseHybridMlaCache = false } }
+            : config;
 
     internal static void RejectUnsupportedArchitecture(ModelConfig config)
     {
