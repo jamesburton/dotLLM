@@ -26,4 +26,19 @@ public class JinjaGemma4TemplateTests
         var result = template.Apply(messages, new ChatTemplateOptions { AddGenerationPrompt = true });
         Assert.Equal("<bos><|turn>system\nBe brief.<turn|>\n<|turn>user\nWhat is 2+2?<turn|>\n<|turn>model\n", result);
     }
+
+    [Fact]
+    public void FullTemplate_Renders_ToolDeclaration_LikeReferenceJinja2()
+    {
+        // Needs the dictsort filter (#770): serve answered tool requests with HTTP 500 before.
+        var template = new JinjaChatTemplate(LoadFixture(), bosToken: "<bos>", eosToken: "<eos>");
+        var messages = new[] { new ChatMessage { Role = "user", Content = "Weather in Paris?" } };
+        var tools = new[]
+        {
+            new ToolDefinition("get_weather", "Get the current weather for a city.",
+                "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"City name\"}},\"required\":[\"city\"]}"),
+        };
+        var result = template.Apply(messages, new ChatTemplateOptions { AddGenerationPrompt = true, Tools = tools });
+        Assert.Equal("<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Paris?<turn|>\n<|turn>model\n", result);
+    }
 }
