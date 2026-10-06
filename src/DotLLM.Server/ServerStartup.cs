@@ -122,19 +122,29 @@ public static class ServerStartup
         // --device auto (#722): try the best device first and fall through on a failed load. The server keeps "auto" as its configured device
         // (so later on-demand loads choose again, per model size); the device actually used is recorded in ResolvedDevice.
         Exception? last = null;
+        string? fallbackWarning = null;
         foreach (string device in DeviceSelector.Candidates(new FileInfo(resolvedPath).Length))
         {
             try
             {
                 Console.WriteLine($"[dotllm] --device auto: trying {device}");
                 var loaded = LoadModelCore(resolvedPath, options with { Device = device });
-                loaded.Options = loaded.Options with { Device = options.Device, ResolvedDevice = device };
+                loaded.Options = loaded.Options with { Device = options.Device, ResolvedDevice = device, DeviceFallbackWarning = fallbackWarning };
                 return loaded;
             }
             catch (Exception ex) when (device != "cpu")
             {
                 last = ex;
                 Console.WriteLine($"[dotllm] {device} could not load this model ({ex.Message}); falling back");
+                if (ex is NotSupportedException)
+                {
+                    // Never a silent downgrade: an UNSUPPORTED model (as opposed to e.g. an OOM) means the user gets CPU speed.
+                    fallbackWarning = $"model {Path.GetFileName(resolvedPath)} is not supported on {device}: {ex.Message} Falling back to a slower device; expect much lower throughput.";
+                    var prev = Console.ForegroundColor;
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine($"[dotllm] WARNING: {fallbackWarning}");
+                    Console.ForegroundColor = prev;
+                }
             }
         }
         throw last ?? new InvalidOperationException("No device could load the model.");

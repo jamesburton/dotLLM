@@ -390,8 +390,9 @@ public record ModelConfig
     /// <summary>Actionable message for backends that cannot run <see cref="IsGemma4DensePle"/> models.</summary>
     public static string Gemma4DensePleUnsupportedMessage(string backend)
         => $"The Gemma-4 dense variant (E2B/E4B: per-layer embeddings, shared-KV layers, no MoE block) "
-         + $"is not supported on the {backend} backend; only the CPU backend implements it "
-         + "(issue #730). Use --device cpu, or --device auto to fall back automatically.";
+         + $"is not supported on the {backend} backend; only the CPU backend implements it. Support is "
+         + "tracked as a priority in https://github.com/jamesburton/dotLLM/issues/734 (dense Gemma-4 E4B on Vulkan and CUDA). "
+         + "Use --device cpu (much slower), or --device auto, which falls back to CPU with a warning.";
 
     /// <summary>
     /// Returns true when <paramref name="layerIdx"/> projects and stores its own

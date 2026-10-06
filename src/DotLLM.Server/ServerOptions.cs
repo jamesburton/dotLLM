@@ -147,6 +147,9 @@ public sealed record ServerOptions
     /// <summary>The device a model actually loaded on when <see cref="Device"/> is <c>auto</c> (<c>cpu</c>, <c>vulkan</c>, <c>gpu:0</c>); null otherwise.</summary>
     public string? ResolvedDevice { get; init; }
 
+    /// <summary>Non-null when <c>--device auto</c> fell back from a faster device because the model is unsupported there (reason + perf consequence); surfaced in <c>/props</c>.</summary>
+    public string? DeviceFallbackWarning { get; init; }
+
     /// <summary>
     /// Logit temperature for <c>/v1/systemone</c> probabilities (<c>--decision-temperature</c>); 0 or 1 = the raw restricted softmax. See
     /// <c>DecisionEvaluator.Temperature</c> for the measured effect on Tev1-4B.
