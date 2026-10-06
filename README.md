@@ -184,6 +184,10 @@ dotllm model search llama --limit 5
 # Download ahead of time (a tag picks the file: owner/repo:Q4_K_M)
 dotllm model pull QuantFactory/SmolLM-135M-GGUF
 
+# Multi-GGUF repo: name the file. Without --file (or a :tag) pull lists the files
+# and needs an interactive terminal to choose one, so scripts/CI must pass it.
+dotllm model pull TheBloke/Llama-2-7B-GGUF --file llama-2-7b.Q4_K_M.gguf
+
 # List everything available locally
 dotllm model list
 
@@ -404,6 +408,7 @@ To embed the same endpoints inside your own ASP.NET Core app, see [Host the Open
 | `--cache-type-v` | | `f32` | KV-cache value quant: `f32`, `q8_0`, `q4_0` |
 | `--speculative-model` | | *(none)* | Draft model for speculative decoding (must share vocab) |
 | `--speculative-k` | | 3 | Draft tokens per speculative step |
+| `--no-mtp` | | off | `serve`: opt out of default-on MTP self-speculation (models with an embedded MTP head, expected concurrency < 5, no `--speculative-model`). `--mtp` is accepted for back-compat. See [docs/SERVER.md](docs/SERVER.md) |
 
 **Sampling & constraints** (shared by `run` and `chat`):
 
@@ -459,7 +464,7 @@ To embed the same endpoints inside your own ASP.NET Core app, see [Host the Open
 | `--resident-memory-budget` | | `0` (unlimited) | Total byte budget across resident models |
 | `--allow-model-admin` | | false | Enable the management API (`/v1/models/*`, `/v1/settings`, `/v1/admin/shutdown`, ollama `/api/pull` + `/api/delete`) |
 | `--allow-lora-admin` | | false | Enable `POST /v1/lora/load` and `DELETE /v1/lora/{name}` |
-| `--mtp` | | false | Multi-token-prediction self-speculation when the GGUF has an MTP head (disables the continuous-batch scheduler for that model) |
+| `--mtp` | | *(default on)* | Accepted for back-compat. `serve` auto-enables MTP self-speculation for models with an embedded MTP head when expected concurrency is < 5 and no `--speculative-model` is set; `--no-mtp` opts out |
 | `--expected-concurrency` | | `0` | At 5+ concurrent requests Vulkan hybrid models serve through the continuous-batch scheduler |
 | `--decision-temperature`, `--decision-orderings` | | `0`, `1` | Calibration of `POST /v1/systemone` probabilities |
 | `--rate-limit-rpm`, `--rate-limit-tpm`, `--rate-limit-concurrency` | | `0` (off) | Per-API-key rate limits; setting any enables limiting |
