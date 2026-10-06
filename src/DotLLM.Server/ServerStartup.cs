@@ -332,6 +332,16 @@ public static class ServerStartup
                 Console.WriteLine("[dotllm] KV-cache quantization not supported for Qwen3MoeHybrid hybrid GPU model (#274); using the model's own internal KV-cache.");
             kvFactory = (cfg, size) => qwen3MoeHybridModel.CreateKvCache(size);
         }
+        else if (options.UsePaged && !kvConfig.IsQuantized
+                 && model is Qwen3HybridDenseTransformerModel or Qwen3MoeHybridTransformerModel
+                    or NemotronHTransformerModel or Mamba3TransformerModel)
+        {
+            // CPU hybrid/recurrent models: the paged pool is sized for config.NumLayers x MaxSequenceLength
+            // (e.g. Bonsai-2-27B: 64 layers x 262144 ctx, though only 16 layers hold KV), which dies at startup
+            // with "Insufficient memory to continue the execution of the program" under default flags. They also
+            // carry recurrent state the paged scheduler does not manage, so use the simple cache.
+            Console.WriteLine("[dotllm] Paged KV-cache not supported for hybrid/recurrent CPU models; using the simple KV-cache.");
+        }
         else if (options.UsePaged && !kvConfig.IsQuantized)
         {
             pagedFactory = new PagedKvCacheFactory(
