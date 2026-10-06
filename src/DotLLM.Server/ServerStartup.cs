@@ -24,6 +24,16 @@ namespace DotLLM.Server;
 public static class ServerStartup
 {
     /// <summary>
+    /// True for CPU hybrid/recurrent models (GDN, SSM or hybrid layer layout, or one of the known hybrid model classes) that must
+    /// NOT get the generic paged KV pool: it is sized for <c>NumLayers x MaxSequenceLength</c> although only the attention layers
+    /// hold KV, so e.g. Bonsai-2-27B (64 layers, 16 KV layers, 262144 ctx) died at startup with "Insufficient memory" (#760).
+    /// </summary>
+    internal static bool IsHybridOrRecurrentCpuModel(ModelConfig config, IModel? model)
+        => config.HybridLayout is not null || config.SsmConfig is not null || config.GdnConfig is not null
+           || model is Qwen3HybridDenseTransformerModel or Qwen3MoeHybridTransformerModel
+                or NemotronHTransformerModel or Mamba3TransformerModel;
+
+    /// <summary>
     /// Resolves a model argument (file path or HuggingFace repo ID) to a local GGUF path.
     /// </summary>
     public static string? ResolveModelPath(string modelArg, string? quant)
@@ -332,9 +342,7 @@ public static class ServerStartup
                 Console.WriteLine("[dotllm] KV-cache quantization not supported for Qwen3MoeHybrid hybrid GPU model (#274); using the model's own internal KV-cache.");
             kvFactory = (cfg, size) => qwen3MoeHybridModel.CreateKvCache(size);
         }
-        else if (options.UsePaged && !kvConfig.IsQuantized
-                 && model is Qwen3HybridDenseTransformerModel or Qwen3MoeHybridTransformerModel
-                    or NemotronHTransformerModel or Mamba3TransformerModel)
+        else if (options.UsePaged && !kvConfig.IsQuantized && IsHybridOrRecurrentCpuModel(config, model))
         {
             // CPU hybrid/recurrent models: the paged pool is sized for config.NumLayers x MaxSequenceLength
             // (e.g. Bonsai-2-27B: 64 layers x 262144 ctx, though only 16 layers hold KV), which dies at startup
