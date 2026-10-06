@@ -67,7 +67,11 @@ internal sealed class VulkanChunkedRowTable : IDisposable
 
     /// <summary>The limit chunk planning uses for <paramref name="device"/> (override, else queried).</summary>
     internal static ulong EffectiveLimit(VulkanDevice device)
-        => LimitOverrideBytes ?? device.MaxStorageBufferRange;
+        => LimitOverrideBytes ?? s_envLimit ?? device.MaxStorageBufferRange;
+
+    /// <summary>Diagnostic: <c>DOTLLM_VULKAN_EMBED_CHUNK_LIMIT_BYTES</c> forces a smaller chunk limit on a real model.</summary>
+    private static readonly ulong? s_envLimit =
+        ulong.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_EMBED_CHUNK_LIMIT_BYTES"), out ulong v) && v > 0 ? v : null;
 
     /// <summary>
     /// Rows per chunk for a table of <paramref name="rows"/> rows of <paramref name="rowBytes"/>
