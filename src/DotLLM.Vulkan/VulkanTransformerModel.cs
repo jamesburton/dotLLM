@@ -806,6 +806,20 @@ public sealed class VulkanTransformerModel : IModel
     private readonly MoeUngroupScatterF32Kernel? _moeUngroupScatter;
     private readonly MoeWeightedScatterF32Kernel? _moeWeightedScatter;
     private readonly MoeBroadcastF32Kernel? _moeBroadcast;
+    // Gemma-4 grouped-by-expert coopmat prefill path (#773): Q4_K gate/up + Q5_1/Q8_0 down GEMMs and the indirect tile-list builder.
+    // All null unless the device is wave64 + coopmat and every SPIR-V is present (then the indexed kernels above run as before).
+    private MoeGroupedMatmulKQuantCoopmatKernel? _gemma4GroupedQ4K;
+    private MoeGroupedMatmulLegacyQuantCoopmatKernel? _gemma4GroupedQ5_1;
+    private MoeGroupedMatmulLegacyQuantCoopmatKernel? _gemma4GroupedQ8_0;
+    private MoeBuildTileListKernel? _gemma4MoeBuildTileList;
+    /// <summary>Count of Gemma-4 MoE layers that took the grouped-by-expert prefill path (test/diagnostic).</summary>
+    public int Gemma4GroupedMoeDispatchCount { get; private set; }
+
+    /// <summary>
+    /// Runtime A/B switch for the Gemma-4 grouped-by-expert prefill path (default on; the load-time env opt-out is
+    /// <c>DOTLLM_VK_MOE_GROUPED=0</c>). Off = the scalar indexed kernels, so a single loaded model can compare both paths in-process.
+    /// </summary>
+    public bool Gemma4GroupedMoeEnabled { get; set; } = true;
     // Optional Qwen1.5-MoE per-token sigmoid gate fold for the shared-expert
     // branch. Null when no MoE layer exists OR when no MoE layer carries a
     // SharedExpertGate weight (DeepSeek-V2/V3, Mixtral). Allocated alongside
@@ -1982,6 +1996,20 @@ public sealed class VulkanTransformerModel : IModel
         if (Environment.GetEnvironmentVariable(DisableIq4XsCoopmatEnvVar) != "1"
             && MatMulIq4XsGemmCoopmatKernel.IsSupportedOn(device, spvDir))
             model._matmulIq4XsGemmCoopmat = MatMulIq4XsGemmCoopmatKernel.Create(device, spvDir);
+        if (hasMoe && config.Gemma4DualFfn && Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_GROUPED") != "0"
+            && MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q4_K)
+            && device.SubgroupSize == 64
+            && MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q5_1)
+            && MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q8_0)
+            && MoeBuildTileListKernel.IsSupportedOn(spvDir)
+            && File.Exists(Path.Combine(spvDir, "moe_grouped_matmul_q4_k_coopmat_m64.spv")))
+        {
+            // 64-row tile (4 x wave64 subgroups) Q4_K; no row-pair variant, so every kernel shares one 16-row tile list.
+            model._gemma4GroupedQ4K = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K, tileMOverride: 64);
+            model._gemma4GroupedQ5_1 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Q5_1);
+            model._gemma4GroupedQ8_0 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Q8_0);
+            model._gemma4MoeBuildTileList = MoeBuildTileListKernel.Create(device, spvDir);
+        }
         model._firstLayer = firstLayer;
         model._proportionalRopePairs = proportionalRopePairs;
         model.ConfigureDenseRopeFactorsAndAttnTemperature(device, spvDir, config, cpuWeights.RopeFreqFactors, ropeDim, ropeTheta);
@@ -4353,6 +4381,10 @@ public sealed class VulkanTransformerModel : IModel
         _moeExpandGroupByExpert?.InvalidateDescriptorCache();
         _moeGroupedMatmulF16Coopmat?.InvalidateDescriptorCache();
         _moeUngroupScatter?.InvalidateDescriptorCache();
+        _gemma4GroupedQ4K?.InvalidateDescriptorCache();
+        _gemma4GroupedQ5_1?.InvalidateDescriptorCache();
+        _gemma4GroupedQ8_0?.InvalidateDescriptorCache();
+        _gemma4MoeBuildTileList?.InvalidateDescriptorCache();
         _moeWeightedScatter?.InvalidateDescriptorCache();
         _moeBroadcast?.InvalidateDescriptorCache();
         _moeIndexedLoraDelta?.InvalidateDescriptorCache();
@@ -5105,6 +5137,7 @@ public sealed class VulkanTransformerModel : IModel
         _rmsnorm.Record(cmdBuf, _state.Gemma4DenseResult!, g4.PostFfwNorm1!, _state.Gemma4DenseResult!,
             rowCount: seqLen, n: hidden, eps: eps);
         BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_dense");
 
         // ── MoE branch ──
         // Custom router: logits = ffn_gate_inp · (rms(attn_out) · RouterScale·1/√H).
@@ -5124,7 +5157,20 @@ public sealed class VulkanTransformerModel : IModel
         _moeBroadcast!.Record(cmdBuf, _state.NormOutput, _state.MoeExpandedInput!,
             seqLen: seqLen, topK: topK, hidden: hidden);
         BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_route");
 
+        // ── Grouped-by-expert coopmat prefill (issue #773) ───────────────────
+        // seqLen >= Gemma4GroupedMoeMinTokens: sort the routed rows by expert once and run each expert's weights through a cooperative-matrix
+        // GEMM per 16-row tile, instead of the indexed kernels re-reading an expert's weights for every routed row (the real 26B-A4B
+        // prefill ran ~20 tok/s, 94% of it in those two stages). Result lands in MoeDownRows in the original (token, slot) order, so
+        // the weighted scatter below is unchanged. Decode (S == 1) never takes this path.
+        if (CanUseGemma4GroupedMoe(moeW, g4, seqLen, hidden, interm))
+        {
+            Gemma4GroupedMoeDispatchCount++;
+            RecordGemma4GroupedExperts(cmdBuf, moeW, g4, hidden, interm, numE, expandedRows);
+        }
+        else
+        {
         // ── Indexed MMVQ decode fast path (issue #137) ──────────────────────
         // S==1 only: the dense decode GEMVs already run coalesced dp4a (mmvq);
         // the scalar per-cell indexed kernels left the expert GEMVs far below
@@ -5166,8 +5212,10 @@ public sealed class VulkanTransformerModel : IModel
                 moeW.W3DeviceQuantType, m: interm, k: hidden, n: expandedRows, numExperts: numE);
         }
         BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_gateup");
         _geglu!.Record(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeSiluInter!, expandedRows * interm);
         BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_geglu");
         if (useMoeMmvq)
         {
             // Re-quantize the GeGLU output rows (K = interm) into the same
@@ -5209,6 +5257,8 @@ public sealed class VulkanTransformerModel : IModel
                 moeW.W2DeviceQuantType, m: hidden, k: interm, n: expandedRows, numExperts: numE);
         }
         BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_down");
+        }
         // Weighted scatter (routing weights; per-expert down scale folded by the Q5_1 shader
         // or pre-folded into the F32 W2) → Gemma4MoeResult.
         _moeWeightedScatter!.Record(cmdBuf, _state.MoeDownRows!, _state.MoeTopkWeights!, _state.Gemma4MoeResult!,
@@ -5218,11 +5268,74 @@ public sealed class VulkanTransformerModel : IModel
             rowCount: seqLen, n: hidden, eps: eps);
         BarrierComputeToCompute(cmdBuf);
 
+        ProfSample("g4ffn_scatter_norm");
         // ── Combine: cur = rms(dense + moe) * post_ffw_norm → NormOutput ──
         _add.Record(cmdBuf, _state.Gemma4DenseResult!, _state.Gemma4MoeResult!, _state.NormOutput, seqLen * hidden);
         BarrierComputeToCompute(cmdBuf);
         _rmsnorm.Record(cmdBuf, _state.NormOutput, g4.PostFfwNorm, _state.NormOutput,
             rowCount: seqLen, n: hidden, eps: eps);
+        BarrierComputeToCompute(cmdBuf);
+    }
+
+    private static readonly int Gemma4GroupedMoeMinTokens =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_GROUPED_MIN_TOKENS"), out int g) && g > 0 ? g : 16;
+
+    private bool CanUseGemma4GroupedMoe(in VulkanWeights.MoeLayerBuffers moeW, in VulkanWeights.Gemma4LayerBuffers g4, int seqLen, int hidden, int interm)
+        => Gemma4GroupedMoeEnabled && seqLen >= Gemma4GroupedMoeMinTokens
+        && _gemma4GroupedQ4K is not null && _gemma4GroupedQ5_1 is not null && _gemma4GroupedQ8_0 is not null && _gemma4MoeBuildTileList is not null
+        && _moeExpertOffsets is not null && _moeExpandGroupByExpert is not null && _moeUngroupScatter is not null
+        && _state.MoeGroupDispatchArgs is not null && _state.MoeGroupedHidden is not null && _state.MoePermutation is not null
+        && moeW.W1DeviceQuantType == QuantType.Q4_K && moeW.W3DeviceQuantType == QuantType.Q4_K
+        && (moeW.W2DeviceQuantType == QuantType.Q8_0 || (moeW.W2DeviceQuantType == QuantType.Q5_1 && g4.DownExpertScale is not null))
+        && (hidden % MoeGroupedMatmulKQuantCoopmatKernel.KGroup) == 0
+        && (interm % MoeGroupedMatmulLegacyQuantCoopmatKernel.KGroup) == 0;
+
+    /// <summary>
+    /// Grouped-by-expert routed experts for a Gemma-4 layer (#773). On entry <c>MoeExpandedInput</c> holds the broadcast
+    /// (token, slot) rows; on exit <c>MoeDownRows</c> holds the per-routed-row down outputs (per-expert down scale applied) in the original
+    /// row order. Buffer reuse: expanded input -> packed rows (<c>MoeGroupedHidden</c>) -> grouped gate/up
+    /// (<c>MoeGrouped{Gate,Up}Inter</c>) -> GeGLU in packed order (<c>MoeSiluInter</c>) -> grouped down into <c>MoeGroupedHidden</c> (the packed
+    /// input is dead by then) -> ungroup into <c>MoeDownRows</c>.
+    /// </summary>
+    private void RecordGemma4GroupedExperts(nint cmdBuf, in VulkanWeights.MoeLayerBuffers moeW, in VulkanWeights.Gemma4LayerBuffers g4,
+        int hidden, int interm, int numE, int expandedRows)
+    {
+        _moeExpertOffsets!.Record(cmdBuf, _state.MoeTopkIndices!, _state.MoeExpertCounts!, _state.MoeExpertOffsets!, _state.MoeExpertCounters!,
+            rows: expandedRows, numExperts: numE);
+        BarrierComputeToCompute(cmdBuf);
+        _moeExpandGroupByExpert!.Record(cmdBuf, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeExpertOffsets!,
+            _state.MoeExpertCounters!, _state.MoeGroupedHidden!, _state.MoePermutation!, rows: expandedRows, hidden: hidden, numExperts: numE);
+        BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_group");
+
+        var q4k = _gemma4GroupedQ4K!;
+        var down = moeW.W2DeviceQuantType == QuantType.Q5_1 ? _gemma4GroupedQ5_1! : _gemma4GroupedQ8_0!;
+        // Launch only the (expert, 16-row tile) pairs that exist (the legacy grid is ~10-30x larger than the work).
+        _gemma4MoeBuildTileList!.Record(cmdBuf, _state.MoeExpertOffsets!, _state.MoeGroupDispatchArgs!, numE,
+            q4k.MTiles(interm), down.MTiles(hidden), tileRows: q4k.RowTile);
+        KernelSupport.ComputeToIndirectAndComputeBarrier(cmdBuf);
+
+        q4k.RecordIndirect(cmdBuf, moeW.W1Bank, _state.MoeGroupedHidden!, _state.MoeExpertOffsets!, _state.MoeGroupedGateInter!,
+            _state.MoeGroupDispatchArgs!, 0, m: interm, k: hidden, rows: expandedRows, numExperts: numE);
+        q4k.RecordIndirect(cmdBuf, moeW.W3Bank, _state.MoeGroupedHidden!, _state.MoeExpertOffsets!, _state.MoeGroupedUpInter!,
+            _state.MoeGroupDispatchArgs!, 0, m: interm, k: hidden, rows: expandedRows, numExperts: numE);
+        BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_gateup");
+
+        _geglu!.Record(cmdBuf, _state.MoeGroupedGateInter!, _state.MoeGroupedUpInter!, _state.MoeSiluInter!, expandedRows * interm);
+        BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_geglu");
+
+        // Q5_1 banks fold ffn_down_exps.scale[e] into the accumulator (matches the scalar kernel's fold order); Q8_0 banks were pre-folded at upload.
+        bool applyScale = moeW.W2DeviceQuantType == QuantType.Q5_1;
+        down.RecordIndirect(cmdBuf, moeW.W2Bank, _state.MoeSiluInter!, _state.MoeExpertOffsets!, _state.MoeGroupedHidden!,
+            g4.DownExpertScale ?? _state.MoeTopkWeights!, applyScale, _state.MoeGroupDispatchArgs!, MoeBuildTileListKernel.ArgsStrideBytes,
+            m: hidden, k: interm, rows: expandedRows, numExperts: numE);
+        BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_down");
+
+        _moeUngroupScatter!.Record(cmdBuf, _state.MoeGroupedHidden!, _state.MoePermutation!, _state.MoeDownRows!,
+            rows: expandedRows, hidden: hidden);
         BarrierComputeToCompute(cmdBuf);
     }
 
@@ -7285,6 +7398,10 @@ public sealed class VulkanTransformerModel : IModel
         _moeBroadcast?.Dispose();
         _moeWeightedScatter?.Dispose();
         _moeUngroupScatter?.Dispose();
+        _gemma4GroupedQ4K?.Dispose();
+        _gemma4GroupedQ5_1?.Dispose();
+        _gemma4GroupedQ8_0?.Dispose();
+        _gemma4MoeBuildTileList?.Dispose();
         _moeGroupedMatmulF16Coopmat?.Dispose();
         _moeExpandGroupByExpert?.Dispose();
         _moeExpertOffsets?.Dispose();
