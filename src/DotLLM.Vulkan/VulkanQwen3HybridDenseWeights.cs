@@ -95,11 +95,20 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
     private readonly LayerBuffers[] _layers;
     public LayerBuffers[] Layers => _layers;
 
-    public VulkanDevice.Buffer TokenEmbedding { get; }
+    /// <summary>The packed (PQ2_0) token-embedding buffer; <c>null</c> when the table is the widened F32 one.</summary>
+    public VulkanDevice.Buffer? TokenEmbedding { get; }
 
     /// <summary>
-    /// On-device layout of <see cref="TokenEmbedding"/>: <c>F32</c> for the ordinary widened table,
-    /// or <c>PQ2_0</c> when it is kept packed and gathered by a compute dispatch.
+    /// The widened F32 token-embedding table as one or more row chunks (#772): a single chunk
+    /// when it fits <c>maxStorageBufferRange</c>, several when it does not. <c>null</c> when the
+    /// table is kept packed (<see cref="TokenEmbedding"/>).
+    /// </summary>
+    public VulkanChunkedRowTable? TokenEmbeddingRows { get; }
+
+    /// <summary>
+    /// On-device layout of the token embedding: <c>F32</c> (<see cref="TokenEmbeddingRows"/>) for the
+    /// ordinary widened table, or <c>PQ2_0</c> (<see cref="TokenEmbedding"/>) when it is kept packed
+    /// and gathered by a compute dispatch.
     /// </summary>
     public QuantizationType TokenEmbeddingQuantType { get; }
     public VulkanDevice.Buffer OutputNormWeight { get; }
@@ -112,7 +121,8 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
 
     private VulkanQwen3HybridDenseWeights(
         LayerBuffers[] layers,
-        VulkanDevice.Buffer tokenEmbedding,
+        VulkanDevice.Buffer? tokenEmbedding,
+        VulkanChunkedRowTable? tokenEmbeddingRows,
         QuantizationType tokenEmbeddingQuantType,
         VulkanDevice.Buffer outputNormWeight,
         VulkanDevice.Buffer outputWeight, QuantizationType outputQt,
@@ -121,6 +131,7 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
     {
         _layers = layers;
         TokenEmbedding = tokenEmbedding;
+        TokenEmbeddingRows = tokenEmbeddingRows;
         TokenEmbeddingQuantType = tokenEmbeddingQuantType;
         OutputNormWeight = outputNormWeight;
         OutputWeight = outputWeight;
@@ -162,7 +173,8 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
         // maxStorageBufferRange — the model simply cannot load widened. Kept packed it is ~339 MB
         // and the gather runs as a compute dispatch (pq2_0_embed_gather_f32.comp) instead.
         bool packedEmbed = tokenEmbedQt == QuantizationType.PQ2_0;
-        VulkanDevice.Buffer tokenEmbed;
+        VulkanDevice.Buffer? tokenEmbed = null;
+        VulkanChunkedRowTable? tokenEmbedRows = null;
         QuantizationType tokenEmbedDeviceQt;
         long tokenEmbedBytes;
 
@@ -189,9 +201,11 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
         }
         else
         {
-            tokenEmbed = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging,
-                tokenEmbedWeight, tokenEmbedQt, config.VocabSize, config.HiddenSize,
-                forceF32: true, out tokenEmbedDeviceQt, out tokenEmbedBytes);
+            // Widened F32, split on row boundaries when it would exceed the device's
+            // maxStorageBufferRange (#772: Qwen3.8-27B's 248320 x 5120 table is 5.08 GB).
+            tokenEmbedRows = VulkanChunkedRowTable.Create(device, staging,
+                tokenEmbedWeight, tokenEmbedQt, config.VocabSize, config.HiddenSize);
+            tokenEmbedBytes = tokenEmbedRows.TotalBytes;
             tokenEmbedDeviceQt = QuantizationType.F32;
         }
         totalBytes += tokenEmbedBytes;
@@ -229,7 +243,7 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
             forceF32: false, out var outputDeviceQt, out long outputBytes);
         totalBytes += outputBytes;
 
-        return new VulkanQwen3HybridDenseWeights(layers, tokenEmbed, tokenEmbedDeviceQt, outputNorm,
+        return new VulkanQwen3HybridDenseWeights(layers, tokenEmbed, tokenEmbedRows, tokenEmbedDeviceQt, outputNorm,
             outputW, outputDeviceQt, outputOutputDim, outputInputDim, totalBytes);
     }
 
@@ -300,7 +314,8 @@ internal sealed class VulkanQwen3HybridDenseWeights : IDisposable
 
     public void Dispose()
     {
-        TokenEmbedding.Dispose();
+        TokenEmbedding?.Dispose();
+        TokenEmbeddingRows?.Dispose();
         OutputNormWeight.Dispose();
         OutputWeight.Dispose();
         for (int i = 0; i < _layers.Length; i++)

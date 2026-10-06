@@ -760,3 +760,7 @@ immediately.
   `Gemma4DualFfn`, so a non-Gemma4 model's K-quant routed banks always fell back to F32 upload).
 
 See [ROADMAP.md](ROADMAP.md) Phase 4 for the full plan.
+
+### Vulkan: token-embedding table larger than maxStorageBufferRange (#772)
+
+The widened F32 token-embedding table of `Qwen3HybridDense` (`VulkanQwen3HybridDenseWeights`) is held as row-chunk buffers (`VulkanChunkedRowTable`), each at most the device's queried `maxStorageBufferRange` (4 GiB - 1 on RADV/AMD). Qwen3.8-27B (248320 x 5120 x 4 B = 5.08 GB) loads as 2 chunks; a table that fits is a single chunk (unchanged path). The gather is the same per-token `vkCmdCopyBuffer`, source chunk = `id / rowsPerChunk`. The LM head stays packed (Q6_K ~1 GB) and is bound whole. Not yet chunked: the standard `VulkanWeights` embedding (e.g. Gemma-4-31B, 262k x 5376), the Qwen3-MoE-hybrid table and an MTP head-local table - same fix applies. CUDA/CPU have no 32-bit range limit (64-bit pointers). Test hook: `VulkanChunkedRowTable.LimitOverrideBytes`.

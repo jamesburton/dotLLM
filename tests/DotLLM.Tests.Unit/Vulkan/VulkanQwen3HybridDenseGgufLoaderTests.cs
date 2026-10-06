@@ -135,6 +135,56 @@ public sealed class VulkanQwen3HybridDenseGgufLoaderTests
         }
     }
 
+    /// <summary>
+    /// Issue #772: a token-embedding table larger than <c>maxStorageBufferRange</c> must be split on row
+    /// boundaries and still gather bit-for-bit the same rows. A tiny artificial limit (4 rows per chunk
+    /// of the 12-row fixture table = 3 chunks, the last one full, ids spanning every chunk) forces the
+    /// chunk path; the CPU model is the oracle. Prefill AND single-token, because a chunk-index bug
+    /// that only bites row 0 of a later chunk would otherwise hide.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(new[] { 1, 5, 9, 11 })]
+    [InlineData(new[] { 4 })]    // first row of chunk 1
+    [InlineData(new[] { 8 })]    // first row of chunk 2
+    [InlineData(new[] { 11 })]   // last row of the table
+    public void EmbeddingTableOverLimit_IsChunked_AndMatchesCpu(int[] tokenIds)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        string path = WriteFixture(withMtp: false);
+        long before = VulkanChunkedRowTable.NonFirstChunkCopies;
+        VulkanChunkedRowTable.LimitOverrideBytes = 4UL * SyntheticQwen35HybridDenseMtpGguf.HiddenSize * sizeof(float);
+        try
+        {
+            int[] positions = Enumerable.Range(0, tokenIds.Length).ToArray();
+            AssertVulkanMatchesCpu(path, spvDir, tokenIds, positions);
+            // Perturbation evidence: rows really were read from chunks other than the first.
+            Assert.True(VulkanChunkedRowTable.NonFirstChunkCopies > before,
+                "No row was gathered from a non-first chunk: the chunk path did not run.");
+        }
+        finally
+        {
+            VulkanChunkedRowTable.LimitOverrideBytes = null;
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void PlanRowsPerChunk_SplitsOnRowBoundaries_AndRespectsLimit()
+    {
+        // Fits: one chunk of every row.
+        Assert.Equal(248320, VulkanChunkedRowTable.PlanRowsPerChunk(248320, 20480, 8UL << 30));
+        // Qwen3.8-27B: 248320 x 5120 F32 = 5,085,593,600 B over a 4 GiB - 1 limit.
+        long per = VulkanChunkedRowTable.PlanRowsPerChunk(248320, 20480, uint.MaxValue);
+        Assert.InRange(per, 1, 248319);
+        Assert.True((ulong)(per * 20480) <= uint.MaxValue);
+        Assert.True((ulong)((per + 1) * 20480) > uint.MaxValue);   // maximal, not just valid
+        // Unreadable limit (0): do not split.
+        Assert.Equal(248320, VulkanChunkedRowTable.PlanRowsPerChunk(248320, 20480, 0));
+        // A row bigger than the limit cannot be represented.
+        Assert.Throws<NotSupportedException>(() => VulkanChunkedRowTable.PlanRowsPerChunk(10, 4096, 1024));
+    }
+
     private static void AssertVulkanMatchesCpu(
         string path, string spvDir, int[] tokenIds, int[] positions)
     {
