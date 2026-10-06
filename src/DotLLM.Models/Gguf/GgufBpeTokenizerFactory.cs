@@ -29,6 +29,22 @@ public static class GgufBpeTokenizerFactory
         int bosId = (int)metadata.GetUInt32OrDefault("tokenizer.ggml.bos_token_id", 1u);
         int eosId = (int)metadata.GetUInt32OrDefault("tokenizer.ggml.eos_token_id", 2u);
 
+        var tokenizer = LoadByModel(metadata, model, tokens, tokenTypes, bosId, eosId);
+
+        // Gemma 1 / CodeGemma / Gemma 2 are untrained-without-BOS: every consumer that calls
+        // Encode() on a plain prompt (run, bench, server completions) would otherwise feed a
+        // BOS-less stream and get garbage. Scoped to those architectures on purpose — the other
+        // SPM/BPE models keep the historical BOS-agnostic Encode (their chat templates carry BOS).
+        string arch = metadata.GetStringOrDefault("general.architecture", "");
+        if (arch is "gemma" or "gemma2")
+            tokenizer.AddBosToken = GgufAddBosResolver.Resolve(metadata);
+
+        return tokenizer;
+    }
+
+    private static BpeTokenizer LoadByModel(
+        GgufMetadata metadata, string model, string[] tokens, int[]? tokenTypes, int bosId, int eosId)
+    {
         return model switch
         {
             "gpt2" or "llama3" => LoadTiktoken(metadata, tokens, tokenTypes, bosId, eosId),

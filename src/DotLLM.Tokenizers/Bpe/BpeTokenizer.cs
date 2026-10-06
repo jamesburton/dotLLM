@@ -147,17 +147,42 @@ public sealed class BpeTokenizer : ITokenizer
     }
 
     /// <inheritdoc/>
-    public int[] Encode(string text)
+    public int[] EncodeRaw(string text)
     {
         if (text.Length == 0)
             return [];
 
         // Fast path: no special tokens to split on
-        if (_specialTokens.Length == 0)
-            return _encoding.Encode(text);
-
-        return EncodeWithSpecialTokens(text);
+        return _specialTokens.Length == 0
+            ? _encoding.Encode(text)
+            : EncodeWithSpecialTokens(text);
     }
+
+    /// <inheritdoc/>
+    public int[] Encode(string text)
+    {
+        if (text.Length == 0)
+            return [];
+
+        int[] ids = EncodeRaw(text);
+
+        if (AddBosToken && (ids.Length == 0 || ids[0] != BosTokenId))
+        {
+            var withBos = new int[ids.Length + 1];
+            withBos[0] = BosTokenId;
+            ids.CopyTo(withBos, 1);
+            return withBos;
+        }
+        return ids;
+    }
+
+    /// <summary>
+    /// When true, <see cref="Encode"/> prepends <see cref="BosTokenId"/> unless the encoded text
+    /// already starts with it (e.g. a chat-template-rendered prompt that begins with the literal
+    /// <c>&lt;bos&gt;</c> special token). llama.cpp's <c>add_bos</c> behaviour. Off by default —
+    /// the GGUF factory switches it on only for Gemma 1/2, which produce garbage without BOS.
+    /// </summary>
+    public bool AddBosToken { get; set; }
 
     /// <inheritdoc/>
     public string Decode(ReadOnlySpan<int> tokenIds) =>
