@@ -76,6 +76,21 @@ public record InferenceOptions
     public IReadOnlyList<string> StopSequences { get; init; } = [];
 
     /// <summary>
+    /// When non-null (e.g. <c>"&lt;/think&gt;"</c>), <see cref="StopSequences"/> are <b>armed</b> only after
+    /// this marker has appeared in the generated text, and only match text that follows it (and its trailing
+    /// whitespace). Used when the prompt opened a reasoning block, so a stop string that occurs inside the
+    /// model's thinking cannot end the turn before it has answered (#767). Null = stop strings are active from
+    /// the first token. EOS and max-tokens are never gated.
+    /// </summary>
+    public string? StopSequencesArmedAfter { get; init; }
+
+    /// <summary>
+    /// Entries of <see cref="StopSequences"/> exempt from <see cref="StopSequencesArmedAfter"/> gating
+    /// (template control tokens such as <c>&lt;|im_end|&gt;</c> that must end the turn wherever they appear).
+    /// </summary>
+    public IReadOnlyList<string>? StopSequencesUngated { get; init; }
+
+    /// <summary>
     /// Explicit sampler steps composing the sampling pipeline.
     /// When set, these steps are used instead of building from the flat properties
     /// (Temperature, TopK, TopP, MinP). Steps are applied in order.
