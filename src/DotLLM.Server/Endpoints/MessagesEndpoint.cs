@@ -139,10 +139,10 @@ public static class MessagesEndpoint
 
         if (request.Stream)
             await HandleStreamingAsync(request, generator, state, httpContext, prompt, options,
-                messageId, modelId, effectiveParser, forcedToolCall, promptTokenCount, plan, ct);
+                messageId, modelId, effectiveParser, forcedToolCall, promptTokenCount, plan, ct, tools);
         else
             await HandleNonStreamingAsync(request, generator, state, httpContext, prompt, options,
-                messageId, modelId, effectiveParser, plan, ct);
+                messageId, modelId, effectiveParser, plan, ct, tools);
     }
 
     /// <summary>
@@ -167,7 +167,8 @@ public static class MessagesEndpoint
         string messageId, string modelId,
         IToolCallParser? toolCallParser,
         ReasoningPlan plan,
-        CancellationToken ct)
+        CancellationToken ct,
+        ToolDefinition[]? tools = null)
     {
         InferenceResponse? result = null;
 
@@ -199,7 +200,7 @@ public static class MessagesEndpoint
 
         if (toolCallParser is not null)
         {
-            var enriched = ToolCallDetector.DetectToolCalls(result, toolCallParser);
+            var enriched = ToolCallDetector.DetectToolCalls(result, toolCallParser, tools);
             text = enriched.Text;
             toolCalls = enriched.ToolCalls;
             finishReason = enriched.FinishReason;
@@ -277,14 +278,15 @@ public static class MessagesEndpoint
         bool forcedToolCall,
         int promptTokenCount,
         ReasoningPlan plan,
-        CancellationToken ct)
+        CancellationToken ct,
+        ToolDefinition[]? tools = null)
         => await WriteMessageStreamAsync(
             httpContext,
             innerCt => generator.GenerateStreamingTokensAsync(prompt, options, innerCt),
             state.ExecuteAsync,
             toolCallParser,
             request.StopSequences,
-            messageId, modelId, promptTokenCount, ct, forcedToolCall, plan);
+            messageId, modelId, promptTokenCount, ct, forcedToolCall, plan, tools);
 
     /// <summary>
     /// Emits the Anthropic SSE event sequence for one streaming request:
@@ -311,7 +313,8 @@ public static class MessagesEndpoint
         int promptTokenCount,
         CancellationToken ct,
         bool forcedToolCall = false,
-        ReasoningPlan? plan = null)
+        ReasoningPlan? plan = null,
+        IReadOnlyList<ToolDefinition>? tools = null)
     {
         // No `Connection: keep-alive` — it is connection-specific and illegal over HTTP/2+.
         SseResponse.ApplyHeaders(httpContext);
@@ -487,7 +490,7 @@ public static class MessagesEndpoint
         ToolCall[]? toolCalls = null;
         if (toolCallParser is not null)
         {
-            toolCalls = toolCallParser.TryParse(text);
+            toolCalls = toolCallParser.TryParse(text, tools);
             if (toolCalls is { Length: > 0 })
                 finishReason = FinishReason.ToolCalls;
         }

@@ -74,6 +74,11 @@ public sealed record PropsResponse
 
     [JsonPropertyName("is_ready")]
     public bool IsReady { get; init; }
+
+    /// <summary>The server build's informational version (<c>0.3.0-dev.N+sha</c>) (#774). Nullable: no initializer on an init-only DTO property (STJ source-gen drops it).</summary>
+    [JsonPropertyName("version")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Version { get; init; }
 }
 
 /// <summary>

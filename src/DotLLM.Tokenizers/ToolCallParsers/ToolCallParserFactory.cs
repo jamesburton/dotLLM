@@ -19,6 +19,19 @@ public static class ToolCallParserFactory
         // 1. Template content heuristics (highest priority — template is the source of truth)
         if (!string.IsNullOrEmpty(chatTemplate))
         {
+            // Gemma-4: the template renders tool calls as <|tool_call>call:NAME{...}<tool_call|>.
+            // Checked first — its own token pair, no overlap with the formats below.
+            if (chatTemplate.Contains("<|tool_call>", StringComparison.Ordinal))
+                return new Gemma4ToolCallParser();
+
+            // Qwen3-Coder XML (Qwen3.5/3.6/3.8, Ornith, Qwen3-Coder, Nemotron-3): the template shows
+            // <tool_call><function=NAME><parameter=KEY>. It ALSO contains the bare "<tool_call>" the
+            // Hermes check below keys on, so it must be tested before it. The parser is a superset
+            // that falls back to Hermes JSON inside <tool_call>.
+            if (chatTemplate.Contains("<function=", StringComparison.Ordinal)
+                && chatTemplate.Contains("<parameter=", StringComparison.Ordinal))
+                return new QwenXmlToolCallParser();
+
             // SmolLM3 ships TWO tool-calling branches in a single template
             // (chosen at render time by a `xml_tools` vs `python_tools`
             // variable). When the template has only the Pythonic branch
@@ -45,6 +58,9 @@ public static class ToolCallParserFactory
             Architecture.Llama => new LlamaToolCallParser(),
             Architecture.Mistral => new MistralToolCallParser(),
             Architecture.Qwen or Architecture.QwenMoe => new HermesToolCallParser(),
+            // Qwen3.5+ hybrids speak the Qwen3-Coder XML form; the parser also accepts Hermes JSON.
+            Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense => new QwenXmlToolCallParser(),
+            Architecture.Gemma4 => new Gemma4ToolCallParser(),
             // SmolLM3 defaults to the XML (Hermes-compatible) format; the
             // Pythonic variant is template-gated above.
             Architecture.SmolLM3 => new XmlToolCallParser(),

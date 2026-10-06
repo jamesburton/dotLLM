@@ -604,7 +604,10 @@ internal sealed class JinjaEvaluator
             "string" => value is string,
             "sequence" => value is IList,
             "number" or "integer" => value is int or double or long,
-            "iterable" => value is IEnumerable and not string,
+            // Jinja2 `iterable` is `iter(value)` succeeding: strings ARE iterable. Llama-3.1's template relies on it
+            // (`message.content is mapping or message.content is iterable` -> tojson), and both reference
+            // Jinja2 and llama.cpp render a string tool result as a quoted/escaped JSON string.
+            "iterable" => value is IEnumerable,
             "true" => value is true,
             "false" => value is false,
             "callable" => false, // we don't support callable test

@@ -261,7 +261,7 @@ public sealed class TextGenerator
         {
             stopConditions = new List<IStopCondition>
             {
-                new EosStopCondition(_tokenizer.EosTokenId),
+                EndOfGenerationTokens.CreateStopCondition(_tokenizer),
                 new MaxTokensStopCondition(maxTokens)
             };
             // StopStringCondition excludes the triggering token. Partial-token
@@ -835,7 +835,7 @@ public sealed class TextGenerator
         {
             stopConditions = new List<IStopCondition>
             {
-                new EosStopCondition(_tokenizer.EosTokenId),
+                EndOfGenerationTokens.CreateStopCondition(_tokenizer),
                 new MaxTokensStopCondition(maxTokens)
             };
             stopConditions.AddRange(StopStringCondition.CreateAll(options));

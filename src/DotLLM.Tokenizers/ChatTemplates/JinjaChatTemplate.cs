@@ -23,6 +23,15 @@ public sealed class JinjaChatTemplate : IChatTemplate
         _bosToken = bosToken;
         _eosToken = eosToken;
 
+        // Jinja2's default is keep_trailing_newline=False: ONE trailing newline of the template source is
+        // dropped (HF transformers and llama.cpp's minja both do this). Llama-3.x's template ends
+        // "{%- endif %}\n", so without this every prompt ended "<|start_header_id|>assistant<|end_header_id|>\n\n\n"
+        // — an extra blank line the model never saw in training (found while diagnosing #771).
+        if (templateSource.EndsWith("\r\n", StringComparison.Ordinal))
+            templateSource = templateSource[..^2];
+        else if (templateSource.EndsWith('\n'))
+            templateSource = templateSource[..^1];
+
         var lexer = new JinjaLexer(templateSource);
         var tokens = lexer.Tokenize();
         var parser = new JinjaParser(tokens);
