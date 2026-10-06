@@ -34,6 +34,16 @@ public sealed record PropsResponse
     [JsonPropertyName("device")]
     public string Device { get; init; } = "cpu";
 
+    /// <summary>Device actually used when <c>device</c> is <c>auto</c> (null otherwise).</summary>
+    [JsonPropertyName("resolved_device")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ResolvedDevice { get; init; }
+
+    /// <summary>Set when <c>--device auto</c> had to fall back from a faster device (reason + perf consequence).</summary>
+    [JsonPropertyName("device_fallback_warning")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DeviceFallbackWarning { get; init; }
+
     [JsonPropertyName("gpu_layers")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? GpuLayers { get; init; }

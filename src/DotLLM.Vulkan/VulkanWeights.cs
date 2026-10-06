@@ -240,15 +240,15 @@ internal sealed class VulkanWeights : IDisposable
     internal readonly struct Gemma4LayerBuffers
     {
         /// <summary>MoE branch pre-norm <c>pre_ffw_norm_2</c> [hidden] — RMSNorm'd attn_out fed to the experts.</summary>
-        public readonly VulkanDevice.Buffer PreFfwNorm2;
+        public readonly VulkanDevice.Buffer? PreFfwNorm2;
         /// <summary>Dense branch post-norm <c>post_ffw_norm_1</c> [hidden] — applied to the dense MLP output.</summary>
-        public readonly VulkanDevice.Buffer PostFfwNorm1;
+        public readonly VulkanDevice.Buffer? PostFfwNorm1;
         /// <summary>MoE branch post-norm <c>post_ffw_norm_2</c> [hidden] — applied to the MoE output.</summary>
-        public readonly VulkanDevice.Buffer PostFfwNorm2;
+        public readonly VulkanDevice.Buffer? PostFfwNorm2;
         /// <summary>Combined post-norm <c>post_ffw_norm</c> [hidden] — wraps (dense + MoE) before the residual add.</summary>
         public readonly VulkanDevice.Buffer PostFfwNorm;
         /// <summary>Custom-router channel scale <c>ffn_gate_inp.scale</c> [hidden] — multiplies the scaled-RMS router input.</summary>
-        public readonly VulkanDevice.Buffer RouterScale;
+        public readonly VulkanDevice.Buffer? RouterScale;
         /// <summary>Per-layer output scale <c>layer_output_scale</c> — single scalar applied as the LAST per-layer op.</summary>
         public readonly float LayerOutputScale;
         /// <summary>True on a V-less (global/full-attention) layer where V branches off the RAW K projection — the forward copies K→V and the V projection slot is unused.</summary>
@@ -262,12 +262,28 @@ internal sealed class VulkanWeights : IDisposable
         /// </summary>
         public readonly VulkanDevice.Buffer? DownExpertScale;
 
+        // ── Dense-PLE (E2B/E4B) per-layer injection weights, issue #734. Null on MoE gemma4 / diffusion layers. ──
+        /// <summary><c>inp_gate.weight</c> [pleDim, hidden] F32 matrix.</summary>
+        public readonly VulkanDevice.Buffer? PleGate;
+        /// <summary><c>proj.weight</c> [hidden, pleDim] F32 matrix.</summary>
+        public readonly VulkanDevice.Buffer? PleProj;
+        /// <summary><c>post_norm.weight</c> [hidden].</summary>
+        public readonly VulkanDevice.Buffer? PlePostNorm;
+        /// <summary>Device quant type of <see cref="PleGate"/> / <see cref="PleProj"/>.</summary>
+        public readonly QuantizationType PleQuantType;
+
         public Gemma4LayerBuffers(
-            VulkanDevice.Buffer preFfwNorm2, VulkanDevice.Buffer postFfwNorm1,
-            VulkanDevice.Buffer postFfwNorm2, VulkanDevice.Buffer postFfwNorm,
-            VulkanDevice.Buffer routerScale, float layerOutputScale, bool vFromK,
-            VulkanDevice.Buffer? downExpertScale = null)
+            VulkanDevice.Buffer? preFfwNorm2, VulkanDevice.Buffer? postFfwNorm1,
+            VulkanDevice.Buffer? postFfwNorm2, VulkanDevice.Buffer postFfwNorm,
+            VulkanDevice.Buffer? routerScale, float layerOutputScale, bool vFromK,
+            VulkanDevice.Buffer? downExpertScale = null,
+            VulkanDevice.Buffer? pleGate = null, VulkanDevice.Buffer? pleProj = null,
+            VulkanDevice.Buffer? plePostNorm = null, QuantizationType pleQuantType = QuantizationType.F32)
         {
+            PleGate = pleGate;
+            PleProj = pleProj;
+            PlePostNorm = plePostNorm;
+            PleQuantType = pleQuantType;
             PreFfwNorm2 = preFfwNorm2;
             PostFfwNorm1 = postFfwNorm1;
             PostFfwNorm2 = postFfwNorm2;
@@ -280,12 +296,15 @@ internal sealed class VulkanWeights : IDisposable
 
         public void Dispose()
         {
-            PreFfwNorm2.Dispose();
-            PostFfwNorm1.Dispose();
-            PostFfwNorm2.Dispose();
+            PreFfwNorm2?.Dispose();
+            PostFfwNorm1?.Dispose();
+            PostFfwNorm2?.Dispose();
             PostFfwNorm.Dispose();
-            RouterScale.Dispose();
+            RouterScale?.Dispose();
             DownExpertScale?.Dispose();
+            PleGate?.Dispose();
+            PleProj?.Dispose();
+            PlePostNorm?.Dispose();
         }
     }
 
@@ -608,6 +627,10 @@ internal sealed class VulkanWeights : IDisposable
             // output scale apply. Detected by the loader-resolved Gemma4 extras.
             bool isGemma4 = lw.Gemma4 is not null;
             bool vFromK = lw.Gemma4?.VFromK ?? false;
+            // Gemma-4 dense-PLE shared-KV layer: the CPU loader leaves K (and V) unloaded (null pointer).
+            bool sharedKvLayer = isGemma4 && lw.KWeight == 0;
+            // Gemma-4 dense variant (E2B/E4B): no routed-MoE block; the dense FFN is the only FFN (issue #734).
+            bool gemma4Dense = isGemma4 && lw.Moe is null;
 
             var attnNorm = UploadNormVec(device, vecStaging, lw.AttnNormWeight);
             totalBytes += (long)lw.AttnNormWeight.Length * sizeof(float);
@@ -647,9 +670,18 @@ internal sealed class VulkanWeights : IDisposable
             {
                 q = UploadMatrix(device, staging, lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim,
                     dequantToFp32, $"blk.{firstLayer + i}.attn_q.weight", out qDeviceQt, out qBytes);
-                k = UploadMatrix(device, staging, lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim,
-                    dequantToFp32, $"blk.{firstLayer + i}.attn_k.weight", out kDeviceQt, out kBytes);
-                if (vFromK)
+                if (sharedKvLayer)
+                {
+                    // Shared-KV layer (Gemma-4 E2B/E4B trailing layers): no K/V projection exists on the
+                    // CPU side (kPtr == 0); the forward reads the donor layer's KV. Stub the slots.
+                    k = device.AllocateDeviceLocal(64);
+                    kDeviceQt = QuantizationType.F32;
+                    kBytes = 0;
+                }
+                else
+                    k = UploadMatrix(device, staging, lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim,
+                        dequantToFp32, $"blk.{firstLayer + i}.attn_k.weight", out kDeviceQt, out kBytes);
+                if (sharedKvLayer || vFromK)
                 {
                     // V-less global layer: no attn_v weight; the forward copies
                     // the raw K projection into V. Stub the slot (never matmul'd).
@@ -685,8 +717,14 @@ internal sealed class VulkanWeights : IDisposable
             // For Gemma-4 this is forced null — the combined post_ffw_norm is
             // applied INSIDE RecordGemma4Ffn (g4.PostFfwNorm), so the shared
             // residual-#2 post-FFN norm must NOT also fire (double-norm).
-            var postFfnNorm = isGemma4 ? null : UploadOptionalVec(device, vecStaging, lw.PostFfnNormWeight);
-            if (!isGemma4 && lw.PostFfnNormWeight is not null)
+            // Dense Gemma-4 (E2B/E4B) has no inner FFN norm, so its post_ffw_norm runs as the SHARED post-FFN
+            // norm (generic dense-FFN branch) instead.
+            var postFfnNorm = gemma4Dense
+                ? UploadNormVec(device, vecStaging, lw.Gemma4!.PostFfwNorm)
+                : isGemma4 ? null : UploadOptionalVec(device, vecStaging, lw.PostFfnNormWeight);
+            if (gemma4Dense)
+                totalBytes += (long)lw.Gemma4!.PostFfwNorm.Length * sizeof(float);
+            else if (!isGemma4 && lw.PostFfnNormWeight is not null)
                 totalBytes += (long)lw.PostFfnNormWeight.Length * sizeof(float);
 
             // BitNet b1.58 Sub-LN: optional RMSNorm weights applied to the attention
@@ -731,16 +769,27 @@ internal sealed class VulkanWeights : IDisposable
 
             MoeLayerBuffers? moe = null;
             Gemma4LayerBuffers? gemma4 = null;
-            if (isGemma4 && lw.Moe is null)
+            if (gemma4Dense)
             {
-                // Dense-PLE gemma4 (E2B/E4B, issue #136): CPU-only for now — the
-                // Vulkan graph has no PLE injection / shared-KV donor reads yet.
-                // Fail fast with a clear message instead of NRE-ing on the
-                // MoE-only Gemma4LayerWeights fields below.
-                throw new NotSupportedException(
-                    "The Gemma-4 dense-PLE variant (E2B/E4B: per-layer embeddings, shared KV "
-                    + "layers, rope_freqs) is not yet supported on the Vulkan backend. "
-                    + "Use the CPU backend for this model.");
+                // Dense-PLE gemma4 (E2B/E4B, #734): no experts. The dense FFN's post-norm rides on the shared
+                // PostFfnNormWeight above; here only the layer scale, V-from-K flag and the per-layer PLE
+                // injection weights (inp_gate / proj / post_norm).
+                var g4d = lw.Gemma4!;
+                VulkanDevice.Buffer? pleGate = null, pleProj = null, plePostNorm = null;
+                if (lw.PleGateWeight != 0)
+                {
+                    int pleDim = weights.PerLayerEmbedding!.PerLayerDim;
+                    pleGate = UploadMatrix(device, staging, lw.PleGateWeight, QuantizationType.F32, pleDim, weights.HiddenSize,
+                        dequantToFp32, $"blk.{firstLayer + i}.inp_gate.weight", out _, out long pgBytes);
+                    pleProj = UploadMatrix(device, staging, lw.PleProjWeight, QuantizationType.F32, weights.HiddenSize, pleDim,
+                        dequantToFp32, $"blk.{firstLayer + i}.proj.weight", out _, out long ppBytes);
+                    plePostNorm = UploadNormVec(device, vecStaging, lw.PlePostNormWeight!);
+                    totalBytes += pgBytes + ppBytes + (long)lw.PlePostNormWeight!.Length * sizeof(float);
+                }
+                gemma4 = new Gemma4LayerBuffers(
+                    null, null, null, UploadNormVec(device, vecStaging, g4d.PostFfwNorm), null,
+                    g4d.LayerOutputScale, g4d.VFromK, null,
+                    pleGate, pleProj, plePostNorm);
             }
             if (lw.Moe is not null)
             {
