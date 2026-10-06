@@ -7,7 +7,7 @@ namespace DotLLM.Models.Gguf;
 /// <summary>
 /// Extracts a <see cref="ModelConfig"/> from GGUF metadata following standard GGUF key conventions.
 /// </summary>
-public static class GgufModelConfigExtractor
+public static partial class GgufModelConfigExtractor
 {
     /// <summary>
     /// Builds a <see cref="ModelConfig"/> from the given GGUF metadata.
@@ -20,6 +20,9 @@ public static class GgufModelConfigExtractor
         string archString = metadata.GetString("general.architecture");
         Architecture architecture = ParseArchitecture(archString);
         string arch = archString.ToLowerInvariant();
+
+        if (architecture is Architecture.Bert or Architecture.NomicBert)
+            return BuildBertConfig(metadata, arch, architecture);
 
         // Gemma 4 / DiffusionGemma have a fundamentally different per-layer shape
         // (dual head_dim, dual KV-head count stored as a per-layer array, dual
@@ -42,8 +45,9 @@ public static class GgufModelConfigExtractor
         // nemotron_h_moe ships the same key (Nemotron 3.5 Lightning: 1 MTP layer
         // appended as the final block, carrying BOTH head_count_kv and
         // feed_forward_length — the trunk-exclusive kinds rule does not apply to it).
+        // deepseek2 (GLM-4.7-Flash, DeepSeek-V3/R1 conversions) ships it too (#742).
         int nextnPredictLayers = architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense
-                or Architecture.NemotronHMoe
+                or Architecture.NemotronHMoe or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
             ? (int)metadata.GetUInt32OrDefault($"{arch}.nextn_predict_layers", 0)
             : 0;
         int numTrunkLayers = numLayers - nextnPredictLayers;
@@ -98,6 +102,9 @@ public static class GgufModelConfigExtractor
         if (architecture == Architecture.GptOss && slidingWindowSize is not null)
             slidingWindowPattern = (int)metadata.GetUInt32OrDefault(
                 $"{arch}.attention.sliding_window_pattern", 2);
+        // Gemma 2: window on even layers, full attention on odd (llama.cpp set_swa_pattern(2)).
+        if (architecture == Architecture.Gemma2 && slidingWindowSize is not null)
+            slidingWindowPattern = 2;
 
         int vocabSize = ResolveVocabSize(metadata, arch);
 
@@ -106,6 +113,20 @@ public static class GgufModelConfigExtractor
             chatTemplate = null;
 
         RoPEConfig? ropeConfig = ExtractRoPEConfig(metadata, arch, headDim, architecture);
+
+        // Mistral-3 / Ministral-3 attention temperature (llama.cpp mistral3.cpp): Q *= log(floor(pos/n_ctx_orig_yarn)+1)*scale+1.
+        float attnTempScale = 0f;
+        int attnTempFloor = 0;
+        if (string.Equals(archString, "mistral3", StringComparison.OrdinalIgnoreCase))
+        {
+            attnTempScale = metadata.GetFloat32OrDefault($"{arch}.attention.temperature_scale", 0.0f);
+            if (attnTempScale != 0f)
+            {
+                attnTempFloor = ropeConfig?.OrigMaxSeqLen > 0 ? ropeConfig!.Value.OrigMaxSeqLen : maxSeqLen;
+                if (attnTempFloor <= 0)
+                    throw new InvalidDataException("mistral3 attention.temperature_scale requires a positive original context length.");
+            }
+        }
 
         // GDN models reuse the same {arch}.ssm.* key names as Mamba-2 but with
         // different semantics — skip Mamba-2 SSM config extraction for them.
@@ -126,7 +147,7 @@ public static class GgufModelConfigExtractor
         else if (architecture is Architecture.DeepSeekV2 or Architecture.DeepSeekV3)
         {
             mlaConfig = ExtractMlaConfig(metadata, arch, ropeConfig);
-            moeConfig = TryExtractDeepseekMoeConfig(metadata, arch, intermediateSize, numLayers);
+            moeConfig = TryExtractDeepseekMoeConfig(metadata, arch, intermediateSize, numTrunkLayers, vocabSize);
             attentionType = AttentionType.MLA;
             // GGUF's attention.key_length is qk_nope only. Total per-head dim
             // for MLA attention is qk_nope + qk_rope — patch HeadDim so the
@@ -160,6 +181,9 @@ public static class GgufModelConfigExtractor
             moeConfig = ExtractNemotronHMoeConfig(metadata, arch, intermediateSize);
         }
 
+        bool isGemma2 = architecture == Architecture.Gemma2;
+        bool isGemmaFamily = architecture is Architecture.Gemma or Architecture.Gemma2;
+
         return new ModelConfig
         {
             Architecture = architecture,
@@ -176,8 +200,16 @@ public static class GgufModelConfigExtractor
             AttentionType = attentionType,
             ActivationFunction = architecture is Architecture.NemotronH or Architecture.NemotronHMoe or Architecture.BitNet
                 ? ActivationFunction.ReluSquared
-                : ActivationFunction.SiLU,
+                : isGemmaFamily ? ActivationFunction.GELUTanh : ActivationFunction.SiLU,
+            // Gemma scales the token embeddings by sqrt(hidden_size); ties the LM head to them.
+            EmbeddingScale = isGemmaFamily ? MathF.Sqrt(hiddenSize) : null,
+            TiedEmbeddings = isGemmaFamily,
+            AttnLogitSoftcap = isGemma2 ? metadata.GetFloat32OrDefault($"{arch}.attn_logit_softcapping", 50.0f) : null,
+            FinalLogitSoftcap = isGemma2 ? metadata.GetFloat32OrDefault($"{arch}.final_logit_softcapping", 30.0f) : null,
+            QueryPreAttnScalar = isGemma2 ? ResolveGemma2QueryPreAttnScalar(numTrunkLayers, hiddenSize, numAttentionHeads, headDim) : null,
             RoPEConfig = ropeConfig,
+            AttnTemperatureScale = attnTempScale,
+            AttnTemperatureFloorScale = attnTempFloor,
             PositionEncodingType = ropeConfig.HasValue ? PositionEncodingType.RoPE : PositionEncodingType.None,
             SlidingWindowSize = slidingWindowSize,
             SlidingWindowPattern = slidingWindowPattern,
@@ -191,6 +223,15 @@ public static class GgufModelConfigExtractor
             PoolingType = ExtractPoolingType(metadata, arch),
         };
     }
+
+    /// <summary>
+    /// Gemma 2 attention-score scale operand (<c>query_pre_attn_scalar</c>; the kernels apply
+    /// <c>1/sqrt(value)</c>). The GGUF does not store it — llama.cpp derives it from the model
+    /// size (<c>llama-model.cpp</c> LLM_ARCH_GEMMA2: the 46-layer 27B uses
+    /// <c>n_embd / n_head</c>, i.e. 144 not head_dim 128; 2B / 9B use <c>n_embd_head_k</c>).
+    /// </summary>
+    internal static float ResolveGemma2QueryPreAttnScalar(int numLayers, int hiddenSize, int numHeads, int headDim)
+        => numLayers == 46 ? (float)(hiddenSize / numHeads) : headDim;
 
     /// <summary>
     /// Reads the GGUF <c>{arch}.pooling_type</c> key. llama.cpp stores the raw
@@ -291,8 +332,14 @@ public static class GgufModelConfigExtractor
         // q_lora_rank may be absent or zero on V2-Lite (monolithic-Q variant).
         int qLoraRank = (int)metadata.GetUInt32OrDefault($"{arch}.attention.q_lora_rank", 0);
         int kvLoraRank = (int)metadata.GetUInt32($"{arch}.attention.kv_lora_rank");
-        int qkTotal = (int)metadata.GetUInt32($"{arch}.attention.key_length");
-        int vHead = (int)metadata.GetUInt32($"{arch}.attention.value_length");
+        // llama.cpp's "MLA" GGUFs (GLM-4.7-Flash, current DeepSeek conversions, #742) store the
+        // ABSORBED sizes in attention.key_length / value_length (kv_lora_rank + rope, kv_lora_rank)
+        // and the real per-head sizes in key_length_mla / value_length_mla. Legacy GGUFs
+        // (DeepSeek-V2-Lite) only carry key_length / value_length with the real sizes.
+        int qkTotal = (int)metadata.GetUInt32OrDefault($"{arch}.attention.key_length_mla",
+            metadata.GetUInt32($"{arch}.attention.key_length"));
+        int vHead = (int)metadata.GetUInt32OrDefault($"{arch}.attention.value_length_mla",
+            metadata.GetUInt32($"{arch}.attention.value_length"));
         int qkRope = (int)metadata.GetUInt32($"{arch}.rope.dimension_count");
         int qkNope = qkTotal - qkRope;
 
@@ -414,7 +461,8 @@ public static class GgufModelConfigExtractor
     }
 
     private static MoeConfig? TryExtractDeepseekMoeConfig(GgufMetadata metadata, string arch,
-                                                           int denseIntermediate, int numLayers)
+                                                           int denseIntermediate, int numTrunkLayers,
+                                                           int vocabSize)
     {
         uint expertCount = metadata.GetUInt32OrDefault($"{arch}.expert_count", 0);
         if (expertCount == 0) return null;
@@ -445,12 +493,39 @@ public static class GgufModelConfigExtractor
         if (expertShared > 0)
             sharedIntermediate = moeIntermediate * expertShared;
 
+        // Routing semantics, mirroring llama.cpp llama_model_deepseek2::load_arch_hparams (#742):
+        //   expert_gating_func: 1 = softmax, 2 = sigmoid. When ABSENT: GLM-4.7-Flash
+        //   (47/48 layers, 154880-token vocab) is sigmoid, everything else softmax.
+        //   expert_weights_norm (default false) renormalises the selected top-k weights;
+        //   expert_weights_scale (default 1) scales them afterwards. The pre-#742 code
+        //   hard-coded "renormalise" for every DeepSeek GGUF, which is wrong for V2-Lite
+        //   (HF norm_topk_prob=false, the GGUF carries no expert_weights_norm key).
+        uint gatingFunc = metadata.GetUInt32OrDefault($"{arch}.expert_gating_func", 0);
+        if (gatingFunc == 0)
+        {
+            int nl = numTrunkLayers + (int)metadata.GetUInt32OrDefault($"{arch}.nextn_predict_layers", 0);
+            gatingFunc = (nl == 47 || nl == 48) && vocabSize == 154880 ? 2u : 1u;
+        }
+        if (gatingFunc != 1 && gatingFunc != 2)
+            throw new InvalidDataException(
+                $"{arch}.expert_gating_func={gatingFunc} is not supported (only 1=softmax, 2=sigmoid).");
+        bool sigmoid = gatingFunc == 2;
+        bool weightsNorm = metadata.GetBoolOrDefault($"{arch}.expert_weights_norm", false);
+        float weightsScale = metadata.GetFloat32OrDefault($"{arch}.expert_weights_scale", 1.0f);
+        if (weightsScale == 0.0f) weightsScale = 1.0f; // llama.cpp: scale applied only if != 0 && != 1
+
         return new MoeConfig
         {
             NumExperts = (int)expertCount,
             NumExpertsPerTok = expertUsed,
             MoeIntermediateSize = moeIntermediate,
-            NormTopKProb = true,   // V2 + V3 both renormalize
+            // Softmax path: NormTopKProb == expert_weights_norm. Sigmoid path keeps the
+            // Nemotron-H convention (NormTopKProb=false, NormalizeExpertWeights carries it).
+            NormTopKProb = !sigmoid && weightsNorm,
+            SigmoidGating = sigmoid,
+            HasSelectionBias = sigmoid, // blk.N.exp_probs_b.bias; a missing tensor loads as zeros
+            NormalizeExpertWeights = sigmoid && weightsNorm,
+            ExpertWeightsScale = weightsScale,
             SharedExpertIntermediateSize = sharedIntermediate,
             NumSharedExperts = expertShared,
             HasSharedExpertGate = false,  // DeepSeek convention: no per-token sigmoid gate
@@ -750,6 +825,12 @@ public static class GgufModelConfigExtractor
             "bitnet" or "bitnet-b1.58" or "bitnet-25" => Architecture.BitNet,
             // OpenAI gpt-oss (llama.cpp LLM_ARCH_OPENAI_MOE).
             "gpt-oss" => Architecture.GptOss,
+            // Gemma 1 / CodeGemma (llama.cpp LLM_ARCH_GEMMA) and Gemma 2 (LLM_ARCH_GEMMA2).
+            "gemma" => Architecture.Gemma,
+            "gemma2" => Architecture.Gemma2,
+            // BERT-class embedding encoders (#739).
+            "bert" => Architecture.Bert,
+            "nomic-bert" => Architecture.NomicBert,
             _ => throw new InvalidDataException($"Unsupported GGUF architecture: '{archString}'.")
         };
     }
@@ -1046,7 +1127,11 @@ public static class GgufModelConfigExtractor
         // If no rope keys exist at all, this model may not use RoPE.
         string freqBaseKey = $"{arch}.rope.freq_base";
         string dimCountKey = $"{arch}.rope.dimension_count";
-        if (!metadata.ContainsKey(freqBaseKey) && !metadata.ContainsKey(dimCountKey))
+        // gemma / gemma2 GGUFs carry NEITHER rope key (llama.cpp falls back to its default
+        // freq_base 10000 and rotates the full head); returning null here would silently
+        // disable RoPE for them.
+        bool gemmaImplicitRope = architecture is Architecture.Gemma or Architecture.Gemma2;
+        if (!gemmaImplicitRope && !metadata.ContainsKey(freqBaseKey) && !metadata.ContainsKey(dimCountKey))
             return null;
 
         float theta = metadata.GetFloat32OrDefault(freqBaseKey, 10000.0f);
@@ -1075,7 +1160,10 @@ public static class GgufModelConfigExtractor
         {
             Architecture.Qwen or Architecture.QwenMoe
                 or Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense or Architecture.Phi
-                or Architecture.GptOss or Architecture.BitNet => RoPEType.NeoX,
+                or Architecture.GptOss or Architecture.BitNet
+                // llama.cpp llama_model_rope_type: gemma / gemma2 / gemma3 are NEOX, and their
+                // converter does not permute Q/K (HF rotate_half layout).
+                or Architecture.Gemma or Architecture.Gemma2 => RoPEType.NeoX,
             _ => RoPEType.Norm,
         };
 

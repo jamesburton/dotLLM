@@ -345,6 +345,18 @@ internal sealed class MoeLayerWeights
     /// false = Mixtral softmax-then-topk gating.</summary>
     public bool SoftmaxAfterTopK;
 
+    /// <summary>True = sigmoid router scores (DeepSeek-V3 / GLM-4.7-Flash, llama.cpp
+    /// <c>LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID</c>); false = softmax. #742.</summary>
+    public bool SigmoidGating;
+
+    /// <summary>Optional per-expert selection bias (<c>blk.N.exp_probs_b.bias</c>) added to the
+    /// sigmoid probabilities for top-k SELECTION only; the gating weights stay unbiased. #742.</summary>
+    public float[]? SelectionBias;
+
+    /// <summary>Scale applied to the gathered (and optionally renormalised) top-k weights
+    /// (<c>expert_weights_scale</c>). 1 = no-op. #742.</summary>
+    public float WeightsScale = 1.0f;
+
     /// <summary>Mixtral-convention ctor (no shared expert, always renormalise top-k).</summary>
     public MoeLayerWeights(
         float[] gate,
@@ -1041,7 +1053,7 @@ internal sealed class TransformerWeights : IDisposable
     /// layers and every other architecture leave this null. Folded into the
     /// global cos/sin table at model construction.
     /// </summary>
-    public float[]? RopeFreqFactors { get; private set; }
+    public float[]? RopeFreqFactors { get; internal set; }
 
     /// <summary>Per-layer R4-interleaved weights. Null until <see cref="RepackWeights"/> is called.</summary>
     public RepackedLayerWeights[]? RepackedLayers { get; private set; }
@@ -1573,6 +1585,20 @@ internal sealed class TransformerWeights : IDisposable
             : tensors[$"{prefix}.post_attention_norm.weight"];
         float[] ffnNorm = DequantizeNorm(dataBase, ffnNormDesc, hiddenSize);
 
+        // Gemma 2 four-norm layout (llama.cpp LLM_TENSOR_ATTN_POST_NORM / FFN_POST_NORM):
+        // post_attention_norm runs on the attention sublayer output and post_ffw_norm on the
+        // FFN sublayer output, each BEFORE its residual add. ffn_norm is the pre-FFN norm
+        // (unlike gpt-oss, where post_attention_norm doubles as the pre-FFN norm — handled
+        // above, and gated off here by architecture). The GGUF converter bakes (1+w) into every
+        // one of these, so they are consumed as plain RMSNorm weights.
+        float[]? postAttnNorm = null;
+        float[]? postFfnNorm = null;
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.Gemma2)
+        {
+            postAttnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.post_attention_norm.weight"], hiddenSize);
+            postFfnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.post_ffw_norm.weight"], hiddenSize);
+        }
+
         // Optional FFN sub-norm (BitNet Sub-LN): RMSNorm over the gated intermediate [intermediateSize] before ffn_down.
         float[]? ffnSubNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.ffn_sub_norm.weight", config.IntermediateSize);
 
@@ -1662,6 +1688,7 @@ internal sealed class TransformerWeights : IDisposable
             qBias, kBias, vBias, oBias,
             gateBias, upBias, downBias,
             qNormWeight, kNormWeight,
+            postAttnNormWeight: postAttnNorm, postFfnNormWeight: postFfnNorm,
             attnSubNormWeight: attnSubNormWeight, ffnSubNormWeight: ffnSubNormWeight,
             attnSinks: attnSinks);
     }
@@ -2112,10 +2139,53 @@ internal sealed class TransformerWeights : IDisposable
         nint kvAProj = DequantToF32(dataBase, kvaDesc, (long)kvAOut * hiddenSize, owned);
         float[] kvANorm = DequantizeNorm(dataBase, tensors[$"{prefix}.attn_kv_a_norm.weight"], kvLora);
 
-        var kvbDesc = tensors[$"{prefix}.attn_kv_b.weight"];
-        nint kvBProjRaw = dataBase + (nint)kvbDesc.DataOffset;
-        QuantizationType kvBProjRawQt = kvbDesc.QuantizationType;
-        nint kvBProj = DequantToF32(dataBase, kvbDesc, (long)kvBOut * kvLora, owned);
+        nint kvBProjRaw;
+        QuantizationType kvBProjRawQt;
+        nint kvBProj;
+        if (tensors.TryGetValue($"{prefix}.attn_kv_b.weight", out var kvbDesc))
+        {
+            kvBProjRaw = dataBase + (nint)kvbDesc.DataOffset;
+            kvBProjRawQt = kvbDesc.QuantizationType;
+            kvBProj = DequantToF32(dataBase, kvbDesc, (long)kvBOut * kvLora, owned);
+        }
+        else
+        {
+            // Current llama.cpp "MLA" conversions (GLM-4.7-Flash, #742) ship the up-projection
+            // pre-split for the absorbed-attention path: attn_k_b [nope, kvLora, nHead] and
+            // attn_v_b [kvLora, v, nHead]. Re-assemble the legacy fused kv_b matrix
+            // [nHead*(nope+v), kvLora] (per head: nope K rows then v V rows) so every backend's
+            // existing expanded-MLA path consumes it unchanged. k_b is stored transposed
+            // (element (n,l,h) at n + nope*(l + kvLora*h)); v_b already is [h][v][l].
+            if (!tensors.TryGetValue($"{prefix}.attn_k_b.weight", out var kbDesc)
+                || !tensors.TryGetValue($"{prefix}.attn_v_b.weight", out var vbDesc))
+                throw new InvalidDataException(
+                    $"{prefix}: MLA layer has neither attn_kv_b.weight nor the split attn_k_b/attn_v_b pair.");
+            long kbCount = (long)numHeads * kvLora * qkNope;
+            long vbCount = (long)numHeads * vHead * kvLora;
+            nint kbF32 = DequantToF32(dataBase, kbDesc, kbCount, owned);
+            nint vbF32 = DequantToF32(dataBase, vbDesc, vbCount, owned);
+            kvBProj = (nint)NativeMemory.AlignedAlloc((nuint)((long)kvBOut * kvLora * sizeof(float)), 64);
+            owned.Add(kvBProj);
+            var dstF = new Span<float>((void*)kvBProj, kvBOut * kvLora);
+            var kbF = new ReadOnlySpan<float>((void*)kbF32, (int)kbCount);
+            var vbF = new ReadOnlySpan<float>((void*)vbF32, (int)vbCount);
+            for (int h = 0; h < numHeads; h++)
+            {
+                for (int n = 0; n < qkNope; n++)
+                {
+                    int row = h * (qkNope + vHead) + n;
+                    for (int l = 0; l < kvLora; l++)
+                        dstF[row * kvLora + l] = kbF[n + qkNope * (l + kvLora * h)];
+                }
+                for (int vi = 0; vi < vHead; vi++)
+                {
+                    int row = h * (qkNope + vHead) + qkNope + vi;
+                    vbF.Slice(kvLora * (vi + vHead * h), kvLora).CopyTo(dstF.Slice(row * kvLora, kvLora));
+                }
+            }
+            kvBProjRaw = kvBProj;
+            kvBProjRawQt = QuantizationType.F32;
+        }
 
         // ── O projection (same tensor name as GQA: attn_output) ──────
         // O lives in TransformerLayerWeights.OWeight + OQuantType (the existing
@@ -2388,7 +2458,18 @@ internal sealed class TransformerWeights : IDisposable
                 sharedExpertGate);
         }
 
-        return new MoeLayerWeights(
+        // DeepSeek-V3 / GLM-4.7-Flash routing extras (#742). A missing exp_probs_b tensor loads as
+        // "no bias" (llama.cpp marks it TENSOR_NOT_REQUIRED).
+        float[]? selectionBias = null;
+        if (moe.SigmoidGating && moe.HasSelectionBias
+            && tensors.TryGetValue($"{prefix}.exp_probs_b.bias", out var probsBDesc))
+        {
+            selectionBias = new float[numExperts];
+            Dequantize.ToFloat32(dataBase + (nint)probsBDesc.DataOffset, numExperts,
+                probsBDesc.QuantizationType, selectionBias);
+        }
+
+        var moeLayer = new MoeLayerWeights(
             gate: router,
             w1: w1,
             w2: w2,
@@ -2397,7 +2478,7 @@ internal sealed class TransformerWeights : IDisposable
             numExpertsPerTok: moe.NumExpertsPerTok,
             hiddenSize: hiddenSize,
             intermediateSize: moeIntermediate,
-            normTopKProb: moe.NormTopKProb,
+            normTopKProb: moe.SigmoidGating ? moe.NormalizeExpertWeights : moe.NormTopKProb,
             sharedGateProj: sharedGate,
             sharedUpProj: sharedUp,
             sharedDownProj: sharedDown,
@@ -2412,6 +2493,10 @@ internal sealed class TransformerWeights : IDisposable
             sharedGateRaw: sharedGateRaw, sharedGateRawQt: sharedGateRawQt,
             sharedUpRaw: sharedUpRaw, sharedUpRawQt: sharedUpRawQt,
             sharedDownRaw: sharedDownRaw, sharedDownRawQt: sharedDownRawQt);
+        moeLayer.SigmoidGating = moe.SigmoidGating;
+        moeLayer.SelectionBias = selectionBias;
+        moeLayer.WeightsScale = moe.ExpertWeightsScale;
+        return moeLayer;
     }
 
     /// <summary>

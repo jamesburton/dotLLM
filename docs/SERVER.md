@@ -352,6 +352,32 @@ line. The server keeps `auto` as its configured device, so each on-demand load c
 `ResolvedDevice` (what `GET /api/ps` reports as `size_vram`). Pass `cpu`, `gpu:N` or `vulkan` to force one. `dotllm stop --server` and
 `POST /v1/admin/shutdown` stop a running server gracefully (`--allow-model-admin`).
 
+## MTP self-speculation is on by default (#757)
+
+When the loaded GGUF carries an embedded MTP head (`SupportsMtp`; e.g. Qwen3.6-MTP builds), `dotllm serve` enables MTP self-speculative decoding
+automatically with the adaptive gate (it backs off to plain decode when drafts stop paying) - no flag needed. It engages only when **all** hold:
+
+| Condition | If not met |
+|-----------|-----------|
+| the GGUF has an MTP head | silently not applicable (a model without a head logs nothing; `--mtp` on such a model logs that it is ignored) |
+| no `--speculative-model` (external draft) | the draft model wins; startup log says MTP was skipped |
+| `--expected-concurrency` < 5 | the continuous-batch scheduler wins (+73% aggregate decode at 8 streams); startup log says MTP was skipped |
+| `--no-mtp` not given | MTP off; startup log says it was disabled |
+
+The startup log always says whether MTP was enabled automatically or skipped, and why. **Tradeoff:** while MTP is active the continuous-batch
+scheduler is off for that model (MTP's single-sequence speculative loop does not batch requests), so for many concurrent clients pass `--no-mtp`
+or `--expected-concurrency 5` (or more). `--mtp` is still accepted for back-compat; it only changes the log wording and does **not** override the
+rules above. `GET /props` reports `mtp_active` and `mtp_status` (`active`, `off (--no-mtp)`, `unavailable (no MTP head)`, `skipped (...)`); the
+web UI shows the same on the model badge. `POST /v1/models/load` accepts `"mtp": false` to opt out for one load.
+
+`GET /v1/models/inspect` returns `has_mtp` (true for a qwen35 checkpoint whose trailing block really carries the `nextn.*` tensors). The web UI's
+Load Model modal uses it: for such models the draft-model picker is hidden and replaced with "MTP: built into this model - enabled automatically"
+plus an opt-out checkbox; for models without a head the picker is offered as an optional **external draft (speculative) model** (unselected by default).
+
+The modal also defaults the compute device to the best servable GPU (`GET /v1/devices` -> `recommended_device`, same ordering as `--device auto`;
+optionally `?model_bytes=N`), and to CPU only when no GPU is servable. An explicit GPU device that fails to load returns an error - there is no
+silent CPU fallback (only `--device auto` falls back, with a prominent `device_fallback_warning` in `/props`).
+
 ## Model Keep-Alive / Idle-Unload / Multi-Model Residency (#369)
 
 Ollama-parity daemon lifecycle: idle models unload automatically, and — when configured — more than
@@ -737,5 +763,5 @@ Both `/v1/chat/completions` and `/v1/completions` validate inputs before inferen
 
 Vulkan hybrid models (Qwen3.5 / Tev1, Qwen3.6) serve through the serial per-request generator by default. Pass `--expected-concurrency N`
 (N >= 5) to serve them through the continuous-batch scheduler instead: measured on Tev1-4B, aggregate decode throughput at 8 concurrent
-streams is +73% (102 vs 59 tok/s), parity at 4 or fewer and for a single stream. It is off when `--mtp` or a draft model is active, and a
+streams is +73% (102 vs 59 tok/s), parity at 4 or fewer and for a single stream. It is off when MTP (default-on for embedded-head models) or a draft model is active, and a
 repeated identical prompt is slower than on the serial path (which has the whole-prompt cache). `DOTLLM_VK_SCHEDULER=0|1` overrides the hint.

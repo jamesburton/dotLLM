@@ -64,6 +64,22 @@ public sealed unsafe class CudaTransformerModel : IModel
     private readonly int _gemma4GlobalRotatedPairs;
     private readonly float _gemma4FinalSoftcap;
 
+    // ── Gemma 1 / CodeGemma / Gemma 2 (GGUF `gemma` / `gemma2`) ──
+    // The generic FP16 forward has no GeGLU, embedding scale, post-attn/post-FFN norms, attention
+    // or final soft-capping, nor the query_pre_attn_scalar score scale — and Gemma's residual
+    // stream overflows FP16. These models therefore run a dedicated FP32 forward
+    // (ForwardGemmaF32) over the standard FP16 CudaKvCache. Norm gains are kept as F32 device
+    // vectors (the generic loader only uploads F16 copies).
+    private readonly bool _isGemmaFamily;
+    private GemmaNormSet[]? _gemmaNorms;
+    private nint _gemmaOutputNormF32;
+    private nint _gemmaKvScratchK;
+    private nint _gemmaKvScratchV;
+    private long _gemmaKvScratchElems;
+
+    /// <summary>Per-layer F32 device norm gains for the Gemma forward (post norms are 0 on Gemma 1).</summary>
+    private readonly record struct GemmaNormSet(nint AttnNorm, nint PostAttnNorm, nint FfnNorm, nint PostFfnNorm);
+
     // Launch-ceiling profiling (env DOTLLM_PROFILE_LAUNCH=1).
     // Measures CPU-side kernel-dispatch time (queue all launches, no GPU wait) vs the full
     // forward including the single _stream.Synchronize(). Zero-cost when the env var is unset.
@@ -450,9 +466,12 @@ public sealed unsafe class CudaTransformerModel : IModel
         // The gemma4 forward runs the F32 path and uses the host LM head (the tied
         // vocab x hidden table is too large to expand to F32 device scratch), so it
         // also needs the CPU weights retained.
-        if (_useHighPrecisionForward || _isGemma4)
+        _isGemmaFamily = config.Architecture is Architecture.Gemma or Architecture.Gemma2;
+        if (_useHighPrecisionForward || _isGemma4 || _isGemmaFamily)
         {
             _cpuWeights = cpuWeights;
+            if (_isGemmaFamily)
+                UploadGemmaNorms(cpuWeights!);
         }
         else
         {
@@ -922,6 +941,14 @@ public sealed unsafe class CudaTransformerModel : IModel
                     + "Pass kvCache: null. KV-cache support is a follow-up"
                     + (Config.IsGemma4DensePle ? " (the dense E2B/E4B variant accepts a CudaKvCache only)." : "."));
             return ForwardGemma4(tokenIds, positions, deviceId, kvCache as CudaKvCache);
+        }
+
+        // Gemma 1 / CodeGemma / Gemma 2 — dedicated F32 forward with FP16 KV cache support.
+        if (_isGemmaFamily)
+        {
+            if (deferredHostDest != 0)
+                throw new NotSupportedException("The CUDA Gemma forward does not support deferred pinned-host logits.");
+            return ForwardGemmaF32(tokenIds, positions, deviceId, kvCache);
         }
 
         if (_useHighPrecisionForward && kvCache is null && !isMla && !isMoe)
@@ -1785,7 +1812,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span, deviceId, r0.KvCache, r0.Adapter) };
         }
 
-        if (_isGemma4)
+        if (_isGemma4 || _isGemmaFamily)
         {
             var fallback = new ITensor[requests.Count];
             for (int i = 0; i < requests.Count; i++)
@@ -2673,6 +2700,10 @@ public sealed unsafe class CudaTransformerModel : IModel
         if (config.Gemma4DualFfn)
             return true;
 
+        // Gemma 1/2 keep the host norm gains for the F32 forward's device upload.
+        if (config.Architecture is Architecture.Gemma or Architecture.Gemma2)
+            return true;
+
         // High-precision I-quant forward retains host weights for the dequant→F32→dot CPU
         // fallback. Mirror ShouldUseHighPrecisionForward's IQ detector, but read the quant
         // types off the CPU weights (identical to the device-side types) and ignore the env
@@ -3343,6 +3374,224 @@ public sealed unsafe class CudaTransformerModel : IModel
                 g4.LayerOutputScale, s);
     }
 
+    /// <summary>
+    /// Composite hosts (multi-GPU pipeline, CPU+CUDA hybrid, Vulkan+CUDA hybrid) drive their own
+    /// generic FP16 layer loops, which have no Gemma ops; loading Gemma 1/2 through them would
+    /// silently produce wrong logits. Refuse loudly instead.
+    /// </summary>
+    internal static void RejectGemmaForCompositeHost(ModelConfig config, string host)
+    {
+        if (config.Architecture is Architecture.Gemma or Architecture.Gemma2)
+            throw new NotSupportedException(
+                $"{config.Architecture} (GGUF 'gemma'/'gemma2') is not supported by {host}: its layer loop has no "
+                + "GeGLU / embedding scale / post-norms / soft-capping. Use CudaTransformerModel (single GPU, "
+                + "FP32 Gemma forward), the CPU backend, or Vulkan.");
+    }
+
+    /// <summary>Uploads the per-layer and output norm gains as F32 device vectors (Gemma family).</summary>
+    private void UploadGemmaNorms(TransformerWeights cpuWeights)
+    {
+        _context.MakeCurrent();
+        nint Up(float[]? v)
+        {
+            if (v is null) return 0;
+            CudaDriverApi.cuMemAlloc_v2(out nint p, (nuint)((long)v.Length * sizeof(float))).ThrowOnError();
+            fixed (float* src = v)
+                CudaDriverApi.cuMemcpyHtoD_v2(p, (nint)src, (nuint)((long)v.Length * sizeof(float))).ThrowOnError();
+            return p;
+        }
+
+        var sets = new GemmaNormSet[Config.NumLayers];
+        for (int l = 0; l < sets.Length; l++)
+        {
+            ref readonly var lw = ref cpuWeights.Layers[l];
+            sets[l] = new GemmaNormSet(Up(lw.AttnNormWeight), Up(lw.PostAttnNormWeight),
+                Up(lw.FfnNormWeight), Up(lw.PostFfnNormWeight));
+        }
+        _gemmaNorms = sets;
+        _gemmaOutputNormF32 = Up(cpuWeights.OutputNormWeight);
+    }
+
+    /// <summary>
+    /// Gemma 1 / CodeGemma / Gemma 2 forward (llama.cpp <c>gemma</c> / <c>gemma2</c> graph), FP32
+    /// activations with an FP16 KV cache. Mirrors <c>TransformerModel</c>'s Gemma handling:
+    /// <c>sqrt(hidden)</c> embedding scale, plain-gain RMSNorm (the GGUF bakes <c>1+w</c>), NeoX RoPE,
+    /// per-layer sliding window, <c>query_pre_attn_scalar</c> score scale + attention soft-cap (both
+    /// folded into <c>attention_f32</c>), GeGLU FFN, post-attention / post-FFN norms before each
+    /// residual add (Gemma 2), tied LM head and the final-logit soft-cap.
+    /// </summary>
+    /// <remarks>
+    /// <b>Attention reads F32.</b> The cache stores FP16 (shared <see cref="CudaKvCache"/>), so each
+    /// layer converts the live <c>[kvLen, kvStride]</c> region to F32 scratch before the F32 kernel —
+    /// a bandwidth cost of <c>kvLen * kvStride * 6</c> bytes/layer/step, deliberately accepted over a
+    /// second cache type so rollback / prefix / host-staging machinery keeps working unchanged.
+    /// <b>Logits</b> are produced by the shared FP16 LM-head projection, as for every other CUDA model.
+    /// </remarks>
+    private ITensor ForwardGemmaF32(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                                    int deviceId, IKvCache? kvCache)
+    {
+        if (!_kernels.HasGemma4Kernels)
+            throw new InvalidOperationException(
+                "Gemma F32 helper kernels not available. Compile native/kernels/gemma4_f32.cu to "
+                + "PTX (native/build.{sh,ps1}) and ensure gemma4_f32.ptx ships under runtimes/.../ptx.");
+        if (_currentAdapter is not null)
+            throw new NotSupportedException("LoRA adapters are not supported on the CUDA Gemma forward.");
+        if (_gemmaNorms is null)
+            throw new InvalidOperationException("CUDA Gemma norm gains were not uploaded.");
+
+        CudaKvCache? cache = null;
+        if (kvCache is not null)
+        {
+            cache = kvCache as CudaKvCache
+                ?? throw new NotSupportedException(
+                    $"The CUDA Gemma forward supports only the standard {nameof(CudaKvCache)} (got {kvCache.GetType().Name}); "
+                    + "quantized / paged KV caches are not wired for Gemma on CUDA.");
+        }
+
+        int seqLen = tokenIds.Length;
+        if (seqLen == 0 || positions.Length != seqLen)
+            throw new ArgumentException("tokenIds and positions must be non-empty and equal length.");
+        int startPos = positions[0];
+        for (int i = 1; i < seqLen; i++)
+            if (positions[i] != startPos + i)
+                throw new NotSupportedException("The CUDA Gemma forward requires contiguous ascending positions.");
+        if (cache is null && startPos != 0)
+            throw new NotSupportedException("Cacheless CUDA Gemma forward must start at position 0.");
+        int kvLen = startPos + seqLen;
+
+        _context.MakeCurrent();
+        bool gemma2 = Config.Architecture == Architecture.Gemma2;
+        int hiddenSize = Config.HiddenSize;
+        int numHeads = Config.NumAttentionHeads;
+        int numKvHeads = Config.NumKvHeads;
+        int headDim = Config.HeadDim;
+        int intermediate = Config.IntermediateSize;
+        int vocabSize = Config.VocabSize;
+        int kvStride = numKvHeads * headDim;
+        float eps = Config.NormEpsilon;
+        nint s = _stream.Handle;
+
+        float scoreScale = Config.QueryPreAttnScalar is float qpas && qpas > 0f ? 1.0f / MathF.Sqrt(qpas) : 0f;
+        float attnSoftcap = Config.AttnLogitSoftcap ?? 0f;
+        float finalSoftcap = Config.FinalLogitSoftcap ?? 0f;
+
+        _state.EnsureCapacity(seqLen);
+        if (cache is not null)
+            EnsureGemmaKvScratch((long)kvLen * kvStride);
+
+        fixed (int* tokenPtr = tokenIds)
+            CudaDriverApi.cuMemcpyHtoD_v2(_state.TokenIdsDevice, (nint)tokenPtr,
+                (nuint)(seqLen * sizeof(int))).ThrowOnError();
+        fixed (int* posPtr = positions)
+            CudaDriverApi.cuMemcpyHtoD_v2(_state.PositionsDevice, (nint)posPtr,
+                (nuint)(seqLen * sizeof(int))).ThrowOnError();
+
+        // Embedding lookup → F32, then × sqrt(hidden). ResidualF32 is the residual stream.
+        _kernels.LaunchEmbeddingLookupF32(
+            _weights.TokenEmbedDevice, _weights.TokenEmbedQuantType,
+            _state.TokenIdsDevice, _state.ResidualF32,
+            seqLen, hiddenSize, s);
+        float embedScale = Config.EmbeddingScale ?? 1.0f;
+        if (embedScale != 1.0f)
+            _kernels.LaunchScaleInplaceF32(_state.ResidualF32, seqLen * hiddenSize, embedScale, s);
+
+        for (int layer = 0; layer < Config.NumLayers; layer++)
+        {
+            ref readonly var lw = ref _weights.Layers[layer];
+            var norms = _gemmaNorms[layer];
+
+            // ── attention ──
+            _kernels.LaunchRmsNormF32(_state.ResidualF32, norms.AttnNorm, _state.NormOutputF32,
+                hiddenSize, eps, seqLen, s);
+            ProjectF32(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutputF32, _state.QF32,
+                lw.QOutputDim, lw.QInputDim, seqLen);
+            ProjectF32(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutputF32, _state.KF32,
+                lw.KOutputDim, lw.KInputDim, seqLen);
+            ProjectF32(lw.VQuant, lw.VQuantType, lw.V, _state.NormOutputF32, _state.VF32,
+                lw.VOutputDim, lw.VInputDim, seqLen);
+
+            _kernels.LaunchRoPEF32(_state.QF32, _state.KF32, _state.PositionsDevice,
+                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _ropeType, s);
+
+            nint kAttn = _state.KF32, vAttn = _state.VF32;
+            if (cache is not null)
+            {
+                // Store the new rows (FP16), then expand the live region back to F32 for the kernel.
+                int newElems = seqLen * kvStride;
+                _kernels.LaunchConvertF32ToF16(_state.KF32, _state.K, newElems, s);
+                _kernels.LaunchConvertF32ToF16(_state.VF32, _state.V, newElems, s);
+                cache.UpdateDevice(_state.K, _state.V, positions, seqLen, layer, s);
+                int liveElems = kvLen * kvStride;
+                _kernels.LaunchConvertF16ToF32(cache.GetKeysPtr(layer), _gemmaKvScratchK, liveElems, s);
+                _kernels.LaunchConvertF16ToF32(cache.GetValuesPtr(layer), _gemmaKvScratchV, liveElems, s);
+                kAttn = _gemmaKvScratchK;
+                vAttn = _gemmaKvScratchV;
+            }
+
+            int slidingWindow = CudaSlidingWindowResolver.Resolve(
+                Config.SlidingWindowSize, Config.SlidingWindowPattern, Config.PerLayerSlidingWindow, layer);
+            _kernels.LaunchAttentionF32(_state.QF32, kAttn, vAttn, _state.AttnOutputF32,
+                seqLen, kvLen, numHeads, numKvHeads, headDim, startPos, slidingWindow, s,
+                sinks: 0, scoreScale: scoreScale, attnSoftcap: attnSoftcap);
+
+            ProjectF32(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutputF32, _state.NormOutputF32,
+                lw.OOutputDim, lw.OInputDim, seqLen);
+            if (gemma2)
+                _kernels.LaunchRmsNormF32(_state.NormOutputF32, norms.PostAttnNorm, _state.NormOutputF32,
+                    hiddenSize, eps, seqLen, s);
+            _kernels.LaunchAddF32(_state.ResidualF32, _state.NormOutputF32, _state.ResidualF32,
+                seqLen * hiddenSize, s);
+
+            // ── FFN (GeGLU) ──
+            _kernels.LaunchRmsNormF32(_state.ResidualF32, norms.FfnNorm, _state.NormOutputF32,
+                hiddenSize, eps, seqLen, s);
+            ProjectF32(lw.GateQuant, lw.GateQuantType, lw.Gate, _state.NormOutputF32, _state.FfnGateF32,
+                lw.GateOutputDim, lw.GateInputDim, seqLen);
+            ProjectF32(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutputF32, _state.FfnUpF32,
+                lw.UpOutputDim, lw.UpInputDim, seqLen);
+            _kernels.LaunchGeGLUTanhF32(_state.FfnGateF32, _state.FfnUpF32, _state.SiluOutputF32,
+                intermediate, seqLen, s);
+            ProjectF32(lw.DownQuant, lw.DownQuantType, lw.Down, _state.SiluOutputF32, _state.NormOutputF32,
+                lw.DownOutputDim, lw.DownInputDim, seqLen);
+            if (gemma2)
+                _kernels.LaunchRmsNormF32(_state.NormOutputF32, norms.PostFfnNorm, _state.NormOutputF32,
+                    hiddenSize, eps, seqLen, s);
+            _kernels.LaunchAddF32(_state.ResidualF32, _state.NormOutputF32, _state.ResidualF32,
+                seqLen * hiddenSize, s);
+        }
+
+        // Final RMSNorm (last token only) → LM head (tied, shared FP16 projection) → final soft-cap.
+        nint lastHidden = _state.ResidualF32 + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
+        _kernels.LaunchRmsNormF32(lastHidden, _gemmaOutputNormF32, _state.NormOutputF32,
+            hiddenSize, eps, 1, s);
+        _kernels.LaunchConvertF32ToF16(_state.NormOutputF32, _state.NormOutput, hiddenSize, s);
+        Project(_weights.OutputWeightQuant, _weights.OutputQuantType, _weights.OutputWeight,
+            _state.NormOutput, _state.LogitsF16,
+            _weights.OutputOutputDim, _weights.OutputInputDim, 1);
+        _kernels.LaunchConvertF16ToF32(_state.LogitsF16, _state.LogitsF32, vocabSize, s);
+        if (finalSoftcap > 0f)
+            _kernels.LaunchSoftcapInplaceF32(_state.LogitsF32, vocabSize, finalSoftcap, s);
+        _stream.Synchronize();
+
+        var result = UnmanagedTensor.Allocate(new TensorShape(1, vocabSize), DType.Float32, deviceId: -1);
+        CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.LogitsF32,
+            (nuint)(vocabSize * sizeof(float))).ThrowOnError();
+        return result;
+    }
+
+    /// <summary>Grows the F32 KV expansion scratch (K and V) to at least <paramref name="elems"/> floats each.</summary>
+    private void EnsureGemmaKvScratch(long elems)
+    {
+        if (_gemmaKvScratchElems >= elems) return;
+        // Grow geometrically so a long generation does not realloc every few tokens.
+        long target = Math.Max(elems, Math.Min(elems * 2, 1L << 28));
+        if (_gemmaKvScratchK != 0) CudaDriverApi.cuMemFree_v2(_gemmaKvScratchK);
+        if (_gemmaKvScratchV != 0) CudaDriverApi.cuMemFree_v2(_gemmaKvScratchV);
+        CudaDriverApi.cuMemAlloc_v2(out _gemmaKvScratchK, (nuint)(target * sizeof(float))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out _gemmaKvScratchV, (nuint)(target * sizeof(float))).ThrowOnError();
+        _gemmaKvScratchElems = target;
+    }
+
     private int GetGemmaLayerSlidingWindow(int layer)
     {
         var perLayer = Config.PerLayerSlidingWindow;
@@ -3786,6 +4035,20 @@ public sealed unsafe class CudaTransformerModel : IModel
         if (_gemma4MoeF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4MoeF32); _gemma4MoeF32 = 0; }
         if (_gemma4RouterInF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4RouterInF32); _gemma4RouterInF32 = 0; }
         if (_gemma4ActScratchF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4ActScratchF32); _gemma4ActScratchF32 = 0; }
+        if (_gemmaKvScratchK != 0) { CudaDriverApi.cuMemFree_v2(_gemmaKvScratchK); _gemmaKvScratchK = 0; }
+        if (_gemmaKvScratchV != 0) { CudaDriverApi.cuMemFree_v2(_gemmaKvScratchV); _gemmaKvScratchV = 0; }
+        if (_gemmaOutputNormF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemmaOutputNormF32); _gemmaOutputNormF32 = 0; }
+        if (_gemmaNorms is not null)
+        {
+            foreach (var n in _gemmaNorms)
+            {
+                if (n.AttnNorm != 0) CudaDriverApi.cuMemFree_v2(n.AttnNorm);
+                if (n.PostAttnNorm != 0) CudaDriverApi.cuMemFree_v2(n.PostAttnNorm);
+                if (n.FfnNorm != 0) CudaDriverApi.cuMemFree_v2(n.FfnNorm);
+                if (n.PostFfnNorm != 0) CudaDriverApi.cuMemFree_v2(n.PostFfnNorm);
+            }
+            _gemmaNorms = null;
+        }
         if (_gemma4PleDevice != 0) { CudaDriverApi.cuMemFree_v2(_gemma4PleDevice); _gemma4PleDevice = 0; }
         if (_gemma4KvTmpK16 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4KvTmpK16); _gemma4KvTmpK16 = 0; }
         if (_gemma4KvTmpV16 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4KvTmpV16); _gemma4KvTmpV16 = 0; }

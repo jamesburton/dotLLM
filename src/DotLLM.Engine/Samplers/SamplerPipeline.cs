@@ -177,7 +177,7 @@ public sealed class SamplerPipeline
         {
             if (string.IsNullOrEmpty(breaker))
                 continue;
-            foreach (var id in tokenizer.Encode(breaker))
+            foreach (var id in tokenizer.EncodeRaw(breaker))
                 tokenIds.Add(id);
         }
         return tokenIds.Count > 0 ? tokenIds : null;

@@ -96,7 +96,14 @@ public sealed unsafe class VulkanPipelineTransformerModel : IModel
         ValidateSplit(splitLayer, config.NumLayers);
         // Refuse unsupported architectures (e.g. gpt-oss, #480) before creating devices and reading
         // every host weight; each stage's BuildFromPrebuiltWeights would refuse too, but only after that.
+        config = VulkanTransformerModel.NormalizeMlaCacheForVulkan(config);
         VulkanTransformerModel.RejectUnsupportedArchitecture(config);
+        // CreateKvCache below builds per-stage plain GQA caches; an MLA model needs MlaVulkanKvCache and
+        // would silently run its cacheless branch (decode after prefill is garbage, #742).
+        if (config.MlaConfig is not null)
+            throw new NotSupportedException(
+                "MLA models (DeepSeek-V2/V3, GLM-4.7-Flash) are not supported by the Vulkan dual-device pipeline: "
+                + "it has no pipelined MLA KV cache. Use a single Vulkan device or the CPU backend.");
         spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
 
         VulkanDevice? device0 = null, device1 = null;

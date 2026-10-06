@@ -37,4 +37,11 @@ public sealed record ModelInspectResponse
     /// </summary>
     [JsonPropertyName("supports_partial_offload")]
     public bool SupportsPartialOffload { get; init; }
+
+    /// <summary>
+    /// True when the GGUF carries an embedded MTP (Multi-Token Prediction) head that the engine can drive, so <c>serve</c>
+    /// enables MTP self-speculation automatically (#757). No property initializer: STJ source-gen drops them on <c>init</c>.
+    /// </summary>
+    [JsonPropertyName("has_mtp")]
+    public bool HasMtp { get; init; }
 }
