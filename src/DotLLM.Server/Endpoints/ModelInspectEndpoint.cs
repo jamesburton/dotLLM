@@ -78,6 +78,16 @@ public static class ModelInspectEndpoint
                 return true;
         }
 
+        // Anything the model list itself offers (HF hub cache, ollama store, ...) must be inspectable, otherwise the UI's layer slider
+        // silently keeps its default when inspect is refused.
+        try
+        {
+            foreach (var m in ModelResolver.EnumerateLocal(includeOllama: true))
+                if (string.Equals(Path.GetFullPath(m.FullPath), fullPath, StringComparison.OrdinalIgnoreCase))
+                    return true;
+        }
+        catch { /* unreadable store: not allowed */ }
+
         return false;
     }
 }

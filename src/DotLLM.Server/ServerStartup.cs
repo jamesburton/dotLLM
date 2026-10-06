@@ -140,6 +140,19 @@ public static class ServerStartup
         throw last ?? new InvalidOperationException("No device could load the model.");
     }
 
+    /// <summary>
+    /// Resolves the requested GPU layer count against the layer count the loader actually sees (<paramref name="numLayers"/>).
+    /// A negative request (<see cref="AllGpuLayers"/>) or an unset request on a <c>gpu</c> device means "all layers"; otherwise the
+    /// request is clamped to <c>[0, numLayers]</c>; unset on a non-GPU device is 0.
+    /// </summary>
+    public static int ResolveGpuLayers(int? requested, string device, int numLayers) =>
+        requested is < 0 ? numLayers
+        : requested.HasValue ? Math.Clamp(requested.Value, 0, numLayers)
+        : device.StartsWith("gpu", StringComparison.OrdinalIgnoreCase) ? numLayers : 0;
+
+    /// <summary>Sentinel <c>gpu_layers</c> value meaning "every layer, as the loader counts them".</summary>
+    public const int AllGpuLayers = -1;
+
     private static ServerState LoadModelCore(string resolvedPath, ServerOptions options)
     {
         Console.WriteLine($"[dotllm] Loading model from {resolvedPath}...");
@@ -150,9 +163,9 @@ public static class ServerStartup
 
         var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);
 
-        int gpuLayers = options.GpuLayers.HasValue
-            ? Math.Clamp(options.GpuLayers.Value, 0, config.NumLayers)
-            : options.Device.StartsWith("gpu", StringComparison.OrdinalIgnoreCase) ? config.NumLayers : 0;
+        int gpuLayers = ResolveGpuLayers(options.GpuLayers, options.Device, config.NumLayers);
+        if (options.GpuLayers is { } requestedLayers && requestedLayers > config.NumLayers)
+            Console.WriteLine($"[dotllm] Requested {requestedLayers} GPU layers but {Path.GetFileName(resolvedPath)} has {config.NumLayers}; using all {config.NumLayers}.");
 
         IModel model;
         Func<int, IKvCache>? vulkanKvFactory = null;
@@ -173,7 +186,7 @@ public static class ServerStartup
         else if (gpuLayers >= config.NumLayers)
         {
             int gpuId = ParseGpuId(options.Device);
-            Console.WriteLine($"[dotllm] GPU {gpuId} inference");
+            Console.WriteLine($"[dotllm] GPU {gpuId} inference of {Path.GetFileName(resolvedPath)} (all {config.NumLayers} layers)");
             // Shared per-architecture CUDA dispatch — routes hybrid architectures
             // (Qwen3MoeHybrid, Qwen3HybridDense) to their dedicated loaders (#259).
             (model, _) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId);
@@ -181,7 +194,7 @@ public static class ServerStartup
         else
         {
             int gpuId = ParseGpuId(options.Device);
-            Console.WriteLine($"[dotllm] Hybrid inference ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)");
+            Console.WriteLine($"[dotllm] Hybrid inference of {Path.GetFileName(resolvedPath)}: {gpuLayers} of {config.NumLayers} layers on GPU + {config.NumLayers - gpuLayers} on CPU (requested: {(options.GpuLayers?.ToString() ?? "unset")})");
             model = DotLLM.Cuda.HybridTransformerModel.LoadFromGguf(gguf, config, gpuLayers, gpuId, threading);
         }
 
