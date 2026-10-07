@@ -117,6 +117,7 @@ public sealed class DeviceResolutionTests
         Assert.NotNull(plan.Error);
         Assert.Empty(plan.Candidates);              // no candidate list at all - in particular no "cpu"
         Assert.Contains("--device vulkan", plan.Error);   // points at the GPU path that does work
+        if (requested != "gpu:1") Assert.Contains("no NVIDIA/CUDA device is available", plan.Error);   // "no CUDA here", not "CUDA load failed"
     }
 
     [Fact]

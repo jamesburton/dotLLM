@@ -66,9 +66,12 @@ public static class DeviceSelector
                 string want = $"gpu:{spec.Ordinal}";
                 if (cuda is { Servable: true } && (cuda.Devices ?? []).Any(d => d.DeviceString == want))
                     return new DevicePlan(spec, [want], null, null);
+                // Distinguish "no CUDA here" (this branch: nothing was attempted) from "CUDA present but the load failed" (a load-time error
+                // with real numbers, produced by the loader - see DeviceModelLoader.LoadWith).
                 string why = cuda is null || !cuda.Servable
-                    ? "no CUDA device is available on this machine" + (cuda?.Note is { } n ? $" ({n})" : "")
-                    : $"CUDA device {spec.Ordinal} does not exist (found {cuda.DeviceCount})";
+                    ? "CUDA requested but no NVIDIA/CUDA device is available on this machine" + (cuda?.Note is { } n ? $" ({n})" : "")
+                      + "; use --device vulkan on AMD/Intel GPUs, or run on a CUDA host"
+                    : $"CUDA device {spec.Ordinal} does not exist (this machine has {cuda.DeviceCount} CUDA device(s): gpu:0..gpu:{cuda.DeviceCount - 1})";
                 return new DevicePlan(spec, [], why + AlternativeHint(backends, except: "cuda"), null);
             }
 
