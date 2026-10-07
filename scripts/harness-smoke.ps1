@@ -206,10 +206,11 @@ function Cut([string]$t, [int]$n) { if ($null -eq $t) { return '' }; $t = $t -re
 # and no think-off switch). Return what a harness would treat as the visible answer.
 function Split-Think([string]$text) {
     if ($null -eq $text) { $text = '' }
-    $hasThink = ($text -match '<think>') -or ($text -match '</think>')
+    $hasThink = ($text -match '<think>') -or ($text -match '</think>') -or ($text -match '<\|channel>')
     $visible = $text; $open = $false
     if ($text -match '</think>') { $visible = $text.Substring($text.LastIndexOf('</think>') + 8) }
-    elseif ($text -match '<think>') { $visible = ''; $open = $true }
+    elseif ($text -match '<channel\|>') { $visible = $text.Substring($text.LastIndexOf('<channel|>') + 10) }   # Gemma-4 `<|channel>thought ... <channel|>`
+    elseif ($text -match '<think>' -or $text -match '<\|channel>') { $visible = ''; $open = $true }
     [pscustomobject]@{ HasThink = $hasThink; Visible = $visible.Trim(); Open = $open }
 }
 
@@ -349,7 +350,10 @@ try {
         $raw = [string]$msg.content
         $hit = $sp.Visible -match '(?i)paris'
         $status = if ($hit -and -not $sp.HasThink) { 'PASS' } elseif ($hit) { 'WARN' } else { 'FAIL' }
+        # channel/Harmony control markup in the visible answer (gpt-oss `<|channel|>analysis<|message|>`, Gemma-4 `<|channel>thought`)
+        if ($raw -match '<\|channel\|?>') { if ($status -eq 'PASS') { $status = 'WARN' }; $meta.channelMarkupInContent = $true }
         $note = if ($sp.HasThink) { ' [<think> text INLINE in content: reasoning not split (#767)]' } else { '' }
+        if ($meta.channelMarkupInContent) { $note += ' [channel markup <|channel..> leaked into content: reasoning not split]' }
         if ($rc) { $note += ' [model still thinking with enable_thinking=false: reasoning_content populated]' }
         if (-not $hit -and $sp.Open) { $note += ' [think block never closed: out of tokens]' }
         if (-not $hit -and -not ([string]$msg.content).Trim()) { $note += ' [EMPTY content: budget spent on reasoning?]' }
@@ -359,12 +363,16 @@ try {
     $toolBudget = if ($thinkingSeen) { $ThinkingMaxTokens } else { 384 }
 
     # --- streamed chat
+    # a model that still thinks with enable_thinking=false (Nemotron: its template wants /no_think) needs the big budget
+    if ($meta.reasoningSplit -or $meta.reasoningInline) { $budget = $ThinkingMaxTokens }
     $s = Invoke-Stream (Plain @{ model = $modelName; temperature = 0; max_tokens = $budget
         messages = @(@{ role = 'user'; content = 'Count from 1 to 10 in words, separated by commas.' }) })
     if ($s.Ok) {
-        $okS = ($s.Chunks -gt 1) -and $s.DoneSeen -and $s.Content -and $s.Finish
+        $okS = ($s.Chunks -gt 1) -and $s.DoneSeen -and $s.Finish -and ($s.Content.Trim() -or $s.Reasoning)
         $usageNote = if ($s.Usage) { '' } else { ' (no usage chunk)' }
-        Add-Result 'chat-stream' $(if ($okS -and $s.Usage) { 'PASS' } elseif ($okS) { 'WARN' } else { 'FAIL' }) `
+        if (-not $s.Content.Trim() -and $s.Reasoning) { $usageNote += ' [content EMPTY: only reasoning_content arrived]' }
+        $stStream = if ($okS -and $s.Usage -and $s.Content.Trim()) { 'PASS' } elseif ($okS) { 'WARN' } else { 'FAIL' }
+        Add-Result 'chat-stream' $stStream `
             ("chunks={0} ttft={1:N0}ms finish={2}{3}" -f $s.Chunks, $s.TtftMs, $s.Finish, $usageNote)
     } else { Add-Result 'chat-stream' 'FAIL' $s.Error }
 
@@ -392,7 +400,7 @@ try {
         } else {
             $mk = Find-ToolMarkup $rawTool
             if ($mk) { Add-Result 'tool-call' 'GAP' ("model emitted tool markup '{0}' but no tool_calls were parsed :: {1}" -f $mk, (Cut $rawTool 120)) @{ raw = $rawTool } }
-            else { Add-Result 'tool-call' 'FAIL' ("no tool_call and no tool markup; content='{0}'" -f (Cut $rawTool 100)) @{ raw = $rawTool } }
+            else { Add-Result 'tool-call' 'WARN' ("no tool_call and no tool markup (model/template without tool support, or it ignored the tools); content='{0}'" -f (Cut $rawTool 100)) @{ raw = $rawTool } }
         }
     } else { Add-Result 'tool-call' 'FAIL' "HTTP $($t.Code): $(Cut $t.Text 200)" }
 
