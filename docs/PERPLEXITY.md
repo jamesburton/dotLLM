@@ -652,3 +652,23 @@ Current Nemotron-H standing against llama.cpp (Vulkan, b9672), pp512 / tg64, tok
 | Nemotron-3-Nano-4B Q4_K_M | 930 / 65.2 | 1759 / 66.9 |
 
 Decode is at parity on all three; prefill is at 53-62%.
+
+### Last-row-only backends: growing-prefix sliding window (issue #793, 2026-10-07)
+
+Vulkan hybrids (`qwen35moe` etc.) return only the final logits row, so sliding-window mode used to refuse
+`--device vulkan`. It now scores each window's targets `[unscored-prefix, context)` by re-prefilling the growing
+prefix (positions from 0, state reset per target, same BOS/geometry rules as the all-rows path). Cost is O(n^2)
+forwards, but only the scored half of each window is replayed. Use a small `-c` (e.g. `-c 256 --stride 256
+--unscored-prefix 129`, which is exactly llama.cpp's `n_ctx/2 - 1 = 127` scored targets per chunk).
+
+Qwen3.5-122B-A10B Q4_K_M (unsloth, 71.3 GiB), `wiki.test.lf.raw`, first 1,536 tokens, 6 chunks x 127 scored tokens
+(762 total; +/- ~0.58 = the sample is small, compare per chunk):
+
+| arm | PPL | per-chunk PPL |
+|---|---|---|
+| dotLLM Vulkan (this change) | 6.0445 +/- 0.584 | 6.901 7.040 9.519 7.961 8.124 1.631 |
+| llama.cpp b9016 **CPU** (`-dev none -ngl 0`, shards direct) | 6.0470 +/- 0.585 | 6.905 7.019 9.560 7.970 8.083 1.638 |
+| llama.cpp b9016 Vulkan (`-ngl 99`) | 6.0570 +/- 0.585 | 6.993 7.039 9.567 7.944 8.115 1.627 |
+
+dotLLM Vulkan is within -0.44..+0.50 % of the llama.cpp CPU oracle on every chunk (aggregate -0.04 %); llama.cpp's own
+Vulkan sits +0.16 % off its CPU and -1.3 % off on chunk 0 (cf. #568). The very low chunk 5 is real text (all three agree).
