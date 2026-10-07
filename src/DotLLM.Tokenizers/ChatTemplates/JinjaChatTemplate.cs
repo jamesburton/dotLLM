@@ -32,11 +32,20 @@ public sealed class JinjaChatTemplate : IChatTemplate
         else if (templateSource.EndsWith('\n'))
             templateSource = templateSource[..^1];
 
+        TemplateSource = templateSource;
+        ReasoningMarkup = Reasoning.ReasoningMarkups.Detect(templateSource);
+
         var lexer = new JinjaLexer(templateSource);
         var tokens = lexer.Tokenize();
         var parser = new JinjaParser(tokens);
         _ast = parser.Parse();
     }
+
+    /// <summary>The (trailing-newline-normalised) Jinja source this template was built from.</summary>
+    public string TemplateSource { get; }
+
+    /// <summary>The reasoning markup this template's model uses, detected from the source (#798).</summary>
+    public Reasoning.ReasoningMarkup ReasoningMarkup { get; }
 
     /// <inheritdoc/>
     public string Apply(IReadOnlyList<ChatMessage> messages, ChatTemplateOptions options)

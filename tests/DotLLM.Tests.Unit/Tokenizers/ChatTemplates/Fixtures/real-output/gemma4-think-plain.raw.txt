@@ -1,0 +1,25 @@
+<|channel>thought
+Let $B$ be the cost of the bat and $L$ be the cost of the ball.
+
+We are given two pieces of information:
+1. The total cost is $1.10: B + L = 1.10$
+2. The bat costs $1.00 more than the ball: $B = L + 1.00$
+
+We need to find the cost of the ball, $L$.
+
+Substitute the second equation into the first equation:
+$(L + 1.00) + L = 1.10$
+$2L + 1.00 = 1.10$
+$2L = 1.10 - 1.00$
+$2L = 0.10$
+$L = 0.10 / 2$
+$L = 0.05$
+
+The cost of the ball is $0.05.
+
+Check the answer:
+If $L = 0.05$, then $B = 0.05 + 1.00 = 1.05$.
+Total cost: $B + L = 1.05 + 0.05 = 1.10$.
+This matches the given information.
+
+The question asks for the number only.<channel|>0.05
