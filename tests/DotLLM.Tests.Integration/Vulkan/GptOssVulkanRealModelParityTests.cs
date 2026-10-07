@@ -166,6 +166,103 @@ public sealed class GptOssVulkanRealModelParityTests
     }
 
     /// <summary>
+    /// Issue #789: the expert-grouped coopmat MoE prefill (MXFP4 gate/up/down, per-expert bias in the shader epilogue, OAI SwiGLU in packed order) vs the scalar
+    /// indexed path, IN-PROCESS on one loaded model (<see cref="VulkanTransformerModel.GroupedMoeEnabled"/>), plus both vs the CPU reference. The grouped path must be
+    /// provably live (dispatch counter == MoE layers per prefill; zero when switched off) and must reproduce the scalar prefill logits to within the F16-operand noise.
+    /// </summary>
+    [SkippableFact]
+    public void Vulkan_GptOss20b_GroupedMoePrefill_MatchesScalarPath_AndCpu()
+    {
+        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device.");
+        string? path = ModelPath();
+        Skip.If(path is null, "Set DOTLLM_GPTOSS_GGUF to gpt-oss-20b-mxfp4.gguf.");
+        string spv = Path.Combine(AppContext.BaseDirectory, "spv");
+        string refFile = Environment.GetEnvironmentVariable("DOTLLM_GPTOSS_REF")
+            ?? Path.Combine(Path.GetTempPath(), "dotllm-gptoss20b-cpu-ref.json");
+
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        var promptIds = Prompts.Select(pr => Encode(tokenizer, pr)).ToArray();
+        Ref[]? cpuRefs = File.Exists(refFile) && JsonSerializer.Deserialize<Ref[]>(File.ReadAllText(refFile)) is { } cached
+            && cached.Length == Prompts.Length && cached.Select((r, i) => r.PromptIds.SequenceEqual(promptIds[i])).All(x => x) ? cached : null;
+
+        using var vk = VulkanTransformerModel.LoadFromGguf(gguf, config, spv);
+        Skip.IfNot(vk.GroupedMoeKernelsBuilt, "device lacks wave64 coopmat (or DOTLLM_VK_MOE_GROUPED=0): grouped path not built.");
+        for (int p = 0; p < Prompts.Length; p++)
+        {
+            vk.GroupedMoeEnabled = true;
+            int before = vk.GroupedMoeDispatchCount, beforeMx = vk.GroupedMoeMxfp4DispatchCount;
+            float[] grouped = PrefillRow(vk, config.VocabSize, promptIds[p]);
+            int groupedLayers = vk.GroupedMoeDispatchCount - before;
+            // every gpt-oss layer is MoE; prompts shorter than the 16-token gate (prompt 0) keep the scalar path by design.
+            int expectLayers = promptIds[p].Length >= 16 ? config.NumLayers : 0;
+            Assert.Equal(expectLayers, groupedLayers);
+            Assert.Equal(groupedLayers, vk.GroupedMoeMxfp4DispatchCount - beforeMx);
+
+            vk.GroupedMoeEnabled = false;
+            before = vk.GroupedMoeDispatchCount;
+            float[] scalar = PrefillRow(vk, config.VocabSize, promptIds[p]);
+            Assert.Equal(before, vk.GroupedMoeDispatchCount);                    // off really is off
+            vk.GroupedMoeEnabled = true;
+
+            double rmsGS = Rms(grouped, scalar);
+            string cpuNote = "";
+            if (cpuRefs is not null)
+                cpuNote = $" | rms(grouped-cpu)={Rms(grouped, cpuRefs[p].PrefillLogits):F4} rms(scalar-cpu)={Rms(scalar, cpuRefs[p].PrefillLogits):F4}";
+            _output.WriteLine($"prompt {p} ({promptIds[p].Length} tok): grouped layers={groupedLayers}; rms(grouped-scalar)={rmsGS:F4} (logit rms {Rms(scalar, new float[scalar.Length]):F3}); "
+                + $"argmax grouped={ArgMax(grouped)} scalar={ArgMax(scalar)}{cpuNote}");
+            Assert.Equal(ArgMax(scalar), ArgMax(grouped));
+            if (expectLayers == 0) Assert.Equal(0.0, rmsGS);                    // scalar path both times: bit-identical
+            Assert.True(rmsGS < 0.05 * Rms(scalar, new float[scalar.Length]) + 0.05, $"grouped vs scalar logit rms {rmsGS} exceeds the F16-operand envelope");
+            if (cpuRefs is not null)
+                Assert.True(Rms(grouped, cpuRefs[p].PrefillLogits) < Rms(scalar, cpuRefs[p].PrefillLogits) * 1.5 + 0.05, "grouped path is further from CPU than the scalar path by more than noise");
+        }
+
+        // Greedy grouped-vs-scalar over a full generation (prefill via the grouped path, decode unchanged). F16 operands perturb the logits by ~1% of
+        // their rms, so exact text identity is only guaranteed where the top-1 margin exceeds that noise: a divergence is accepted ONLY at a step where the
+        // scalar path's own top-1/top-2 margin is below 0.5 logits (a near-tie), and the step is reported.
+        vk.GroupedMoeEnabled = true;
+        var (gTok, _) = GreedyWithMargins(vk, config, promptIds[2]);
+        vk.GroupedMoeEnabled = false;
+        var (sTok, sMargin) = GreedyWithMargins(vk, config, promptIds[2]);
+        vk.GroupedMoeEnabled = true;
+        _output.WriteLine($"greedy grouped: '{tokenizer.Decode(gTok)}' | greedy scalar : '{tokenizer.Decode(sTok)}'");
+        int firstDiv = -1;
+        for (int i = 0; i < MaxNew; i++) if (gTok[i] != sTok[i]) { firstDiv = i; break; }
+        _output.WriteLine($"greedy first divergence step: {firstDiv}" + (firstDiv >= 0 ? $" (scalar top1-top2 margin there = {sMargin[firstDiv]:F3} logits)" : ""));
+        Assert.True(firstDiv < 0 || sMargin[firstDiv] < 0.5f, $"greedy text diverged at step {firstDiv} where the scalar margin is {(firstDiv >= 0 ? sMargin[firstDiv] : 0f)} (not a near-tie)");
+    }
+
+    private static unsafe (int[] Tokens, float[] Margins) GreedyWithMargins(VulkanTransformerModel vk, DotLLM.Core.Models.ModelConfig config, int[] promptIds)
+    {
+        int vocab = config.VocabSize;
+        var toks = new List<int>(); var margins = new List<float>();
+        using var kv = vk.CreateKvCache(promptIds.Length + MaxNew + 2);
+        for (int step = 0; step < MaxNew; step++)
+        {
+            int[] ids = step == 0 ? promptIds : [toks[^1]];
+            int[] pos = step == 0 ? Enumerable.Range(0, promptIds.Length).ToArray() : [promptIds.Length + step - 1];
+            using ITensor logits = vk.Forward(ids, pos, -1, kv);
+            var row = new ReadOnlySpan<float>((float*)logits.DataPointer + (long)(logits.Shape[0] - 1) * vocab, vocab);
+            int best = 0;
+            for (int i = 1; i < vocab; i++) if (row[i] > row[best]) best = i;
+            float second = float.NegativeInfinity;
+            for (int i = 0; i < vocab; i++) if (i != best && row[i] > second) second = row[i];
+            toks.Add(best); margins.Add(row[best] - second);
+        }
+        return (toks.ToArray(), margins.ToArray());
+    }
+
+    private static double Rms(float[] a, float[] b)
+    {
+        double s = 0;
+        for (int i = 0; i < a.Length; i++) { double d = a[i] - b[i]; s += d * d; }
+        return Math.Sqrt(s / a.Length);
+    }
+
+    /// <summary>
     /// Depth sweep: truncate the model to N layers on BOTH backends and compare last-position logits. A real bug in one
     /// op shows up as a jump at the first layer that exercises it (layer 0 = sliding window, layer 1 = dense; the long
     /// prompt crosses the 128-token window); backend noise instead grows smoothly with depth.
