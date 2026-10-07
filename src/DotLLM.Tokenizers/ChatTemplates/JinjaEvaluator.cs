@@ -43,6 +43,7 @@ internal sealed class JinjaEvaluator
         ["string"] = (input, _) => Stringify(input),
         ["list"] = (input, _) => input is IList list ? list : input is IEnumerable e ? ToList(e) : new List<object?> { input },
         ["items"] = (input, _) => GetDictItems(input),
+        ["dictsort"] = (input, _) => DictSort(input),
         ["join"] = (input, args) => JoinFilter(input, args),
         ["replace"] = (input, args) => ReplaceFilter(input, args),
         ["selectattr"] = (input, args) => SelectAttrFilter(input, args),
@@ -88,6 +89,10 @@ internal sealed class JinjaEvaluator
 
             case SetNode setNode:
                 SetVariable(setNode.Name, EvalExpr(setNode.Value));
+                break;
+
+            case SetBlockNode setBlock:
+                SetVariable(setBlock.Name, RenderNodes(setBlock.Body));
                 break;
 
             case SetAttributeNode setAttr:
@@ -599,7 +604,10 @@ internal sealed class JinjaEvaluator
             "string" => value is string,
             "sequence" => value is IList,
             "number" or "integer" => value is int or double or long,
-            "iterable" => value is IEnumerable and not string,
+            // Jinja2 `iterable` is `iter(value)` succeeding: strings ARE iterable. Llama-3.1's template relies on it
+            // (`message.content is mapping or message.content is iterable` -> tojson), and both reference
+            // Jinja2 and llama.cpp render a string tool result as a quoted/escaped JSON string.
+            "iterable" => value is IEnumerable,
             "true" => value is true,
             "false" => value is false,
             "callable" => false, // we don't support callable test
@@ -1024,6 +1032,15 @@ internal sealed class JinjaEvaluator
     {
         if (input is Dictionary<string, object?> dict)
             return dict.Select(kvp => (object?)new List<object?> { kvp.Key, kvp.Value }).ToList();
+        return new List<object?>();
+    }
+
+    /// <summary>Jinja2 <c>dictsort</c>: (key, value) pairs ordered by key, case-insensitive (default).</summary>
+    private static object? DictSort(object? input)
+    {
+        if (input is Dictionary<string, object?> dict)
+            return dict.OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase)
+                       .Select(kvp => (object?)new List<object?> { kvp.Key, kvp.Value }).ToList();
         return new List<object?>();
     }
 

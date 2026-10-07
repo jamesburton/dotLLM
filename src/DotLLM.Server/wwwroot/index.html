@@ -162,6 +162,14 @@
                         <label class="text-xs text-zinc-400 mb-1 block">Seed <span class="text-zinc-600">(empty = random)</span></label>
                         <input id="opt-seed" type="number" min="0" placeholder="random" class="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500">
                     </div>
+                    <div>
+                        <label class="text-xs text-zinc-400 mb-1 block">Thinking <span class="text-zinc-600">(reasoning models)</span></label>
+                        <select id="opt-thinking" class="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500">
+                            <option value="default">Model default</option>
+                            <option value="on">On</option>
+                            <option value="off">Off</option>
+                        </select>
+                    </div>
                     <button id="apply-config-btn" class="w-full mt-1 py-1.5 rounded text-xs bg-accent/20 text-accent border border-accent/30 hover:bg-accent/30 transition">Apply Defaults</button>
                 </div>
             </section>

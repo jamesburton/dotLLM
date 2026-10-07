@@ -215,12 +215,103 @@ public class GgufModelConfigExtractorTests
         Assert.Equal(2, config.Moe.NumSharedExperts);
         Assert.Equal(1408 * 2, config.Moe.SharedExpertIntermediateSize);  // moe_intermediate × n_shared
         Assert.Equal(1408, config.Moe.MoeIntermediateSize);
-        Assert.True(config.Moe.NormTopKProb);
+        // The real V2-Lite GGUF carries NO expert_weights_norm key; llama.cpp then does NOT
+        // renormalise the top-k weights (HF norm_topk_prob=false). Pre-#742 this was hard-coded true.
+        Assert.False(config.Moe.NormTopKProb);
+        Assert.False(config.Moe.SigmoidGating);
+        Assert.Equal(1.0f, config.Moe.ExpertWeightsScale);
         Assert.False(config.Moe.HasSharedExpertGate);
         // leading_dense_block_count=1 → layer 0 is dense; IsMoeLayer(0)==false, IsMoeLayer(1+)==true
         Assert.False(config.Moe.IsMoeLayer(0));
         Assert.True(config.Moe.IsMoeLayer(1));
         Assert.True(config.Moe.IsMoeLayer(26));
+    }
+
+    /// <summary>
+    /// #742: GLM-4.7-Flash is arch=deepseek2 with the "absorbed" MLA key convention
+    /// (key_length = kv_lora_rank + rope, real head sizes in key_length_mla/value_length_mla), a
+    /// sigmoid router with norm + scale, and a trailing NextN/MTP block counted in block_count.
+    /// Each assertion is chosen so the legacy reading (key_length as the real qk size, softmax,
+    /// renormalise-always, all block_count layers) would FAIL it.
+    /// </summary>
+    [Fact]
+    public void Extract_Glm47Flash_MlaKeysSigmoidRoutingAndNextn()
+    {
+        var metadata = BuildMetadata(d =>
+        {
+            d.AddString("general.architecture", "deepseek2");
+            d.AddUInt32("deepseek2.embedding_length", 2048);
+            d.AddUInt32("deepseek2.block_count", 48);
+            d.AddUInt32("deepseek2.nextn_predict_layers", 1);
+            d.AddUInt32("deepseek2.feed_forward_length", 10240);
+            d.AddUInt32("deepseek2.attention.head_count", 20);
+            d.AddUInt32("deepseek2.attention.head_count_kv", 1);
+            d.AddUInt32("deepseek2.context_length", 202752);
+            d.AddFloat32("deepseek2.attention.layer_norm_rms_epsilon", 1e-5f);
+            d.AddUInt32("deepseek2.vocab_size", 154880);
+            d.AddFloat32("deepseek2.rope.freq_base", 1000000.0f);
+            d.AddUInt32("deepseek2.rope.dimension_count", 64);
+            d.AddUInt32("deepseek2.attention.q_lora_rank", 768);
+            d.AddUInt32("deepseek2.attention.kv_lora_rank", 512);
+            d.AddUInt32("deepseek2.attention.key_length", 576);        // 512 + 64: ABSORBED size
+            d.AddUInt32("deepseek2.attention.value_length", 512);
+            d.AddUInt32("deepseek2.attention.key_length_mla", 256);    // real per-head qk size
+            d.AddUInt32("deepseek2.attention.value_length_mla", 256);
+            d.AddUInt32("deepseek2.expert_count", 64);
+            d.AddUInt32("deepseek2.expert_used_count", 4);
+            d.AddUInt32("deepseek2.expert_shared_count", 1);
+            d.AddUInt32("deepseek2.expert_feed_forward_length", 1536);
+            d.AddUInt32("deepseek2.leading_dense_block_count", 1);
+            d.AddUInt32("deepseek2.expert_gating_func", 2);
+            d.AddBool("deepseek2.expert_weights_norm", true);
+            d.AddFloat32("deepseek2.expert_weights_scale", 1.8f);
+        });
+
+        var config = GgufModelConfigExtractor.Extract(metadata);
+
+        Assert.Equal(47, config.NumLayers);                 // trunk only; block 47 is NextN
+        Assert.Equal(1, config.NextnPredictLayers);
+        Assert.NotNull(config.MlaConfig);
+        Assert.Equal(192, config.MlaConfig.QkNopeHeadDim);  // 256 - 64, NOT 576 - 64
+        Assert.Equal(64, config.MlaConfig.QkRopeHeadDim);
+        Assert.Equal(256, config.MlaConfig.VHeadDim);       // NOT 512
+        Assert.Equal(768, config.MlaConfig.QLoraRank);
+        Assert.NotNull(config.Moe);
+        Assert.True(config.Moe.SigmoidGating);
+        Assert.True(config.Moe.HasSelectionBias);
+        Assert.True(config.Moe.NormalizeExpertWeights);
+        Assert.False(config.Moe.NormTopKProb);              // sigmoid path carries it in NormalizeExpertWeights
+        Assert.Equal(1.8f, config.Moe.ExpertWeightsScale);
+    }
+
+    /// <summary>
+    /// #742: llama.cpp defaults expert_gating_func to sigmoid for GLM-4.7-Flash even when the
+    /// key is absent (47/48 layers, 154880-token vocab); any other deepseek2 stays softmax.
+    /// </summary>
+    [Theory]
+    [InlineData(48, 154880, true)]
+    [InlineData(47, 154880, true)]
+    [InlineData(48, 102400, false)]
+    [InlineData(27, 102400, false)]
+    public void Extract_DeepSeek2_AbsentGatingFunc_DefaultsPerLlamaCpp(int layers, int vocab, bool sigmoid)
+    {
+        var metadata = BuildMetadata(d =>
+        {
+            d.AddString("general.architecture", "deepseek2");
+            d.AddUInt32("deepseek2.embedding_length", 2048);
+            d.AddUInt32("deepseek2.block_count", (uint)layers);
+            d.AddUInt32("deepseek2.feed_forward_length", 10240);
+            d.AddUInt32("deepseek2.attention.head_count", 16);
+            d.AddUInt32("deepseek2.vocab_size", (uint)vocab);
+            d.AddUInt32("deepseek2.rope.dimension_count", 64);
+            d.AddUInt32("deepseek2.attention.kv_lora_rank", 512);
+            d.AddUInt32("deepseek2.attention.key_length", 192);
+            d.AddUInt32("deepseek2.attention.value_length", 128);
+            d.AddUInt32("deepseek2.expert_count", 64);
+            d.AddUInt32("deepseek2.expert_used_count", 6);
+            d.AddUInt32("deepseek2.expert_feed_forward_length", 1408);
+        });
+        Assert.Equal(sigmoid, GgufModelConfigExtractor.Extract(metadata).Moe!.SigmoidGating);
     }
 
     [Fact]

@@ -833,15 +833,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         {
             // Head-local table: plain F32 row copies, NOT Hadamard-latent.
             for (int i = 0; i < s; i++)
-            {
-                var region = new VkBufferCopy
-                {
-                    srcOffset = (ulong)((long)tokenIds[i] * hiddenRowBytes),
-                    dstOffset = (ulong)((long)i * hiddenRowBytes),
-                    size = (ulong)hiddenRowBytes,
-                };
-                VulkanApi.vkCmdCopyBuffer(cmdBuf, headEmbed.Handle, _state.HiddenState.Handle, 1, region);
-            }
+                headEmbed.RecordRowCopy(cmdBuf, tokenIds[i], _state.HiddenState, (long)i * hiddenRowBytes);
         }
         else
         {
@@ -2302,13 +2294,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         if (mtpHead.EmbedTokensWeight is { } headEmbed)
         {
             // Head-local table: plain F32 row copy, and NOT Hadamard-latent.
-            var region = new VkBufferCopy
-            {
-                srcOffset = (ulong)((long)tokenId * hiddenRowBytes),
-                dstOffset = 0,
-                size = (ulong)hiddenRowBytes,
-            };
-            VulkanApi.vkCmdCopyBuffer(cmdBuf, headEmbed.Handle, _state.HiddenState.Handle, 1, region);
+            headEmbed.RecordRowCopy(cmdBuf, tokenId, _state.HiddenState, 0);
             KernelSupport.TransferToComputeBarrier(cmdBuf);
         }
         else
@@ -2701,7 +2687,7 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         {
             _device.Upload(System.Runtime.InteropServices.MemoryMarshal.AsBytes(tokenIds), _state.TokenIdsBuffer!);
             KernelSupport.HostToComputeBarrier(cmdBuf);
-            gather.Record(cmdBuf, _weights.TokenEmbedding, _state.TokenIdsBuffer!, _state.HiddenState,
+            gather.Record(cmdBuf, _weights.TokenEmbedding!, _state.TokenIdsBuffer!, _state.HiddenState,
                 nTokens: tokenIds.Length, hidden: hiddenSize, vocabSize: Config.VocabSize);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             ProfMark(cmdBuf, VulkanOpProfiler.Cat.Embed);
@@ -2716,20 +2702,13 @@ public sealed partial class VulkanQwen3HybridDenseTransformerModel : IModel
         }
 
         long rowBytes = (long)hiddenSize * sizeof(float);
-        var srcBuf = _weights.TokenEmbedding.Handle;
-        var dstBuf = _state.HiddenState.Handle;
+        var rows = _weights.TokenEmbeddingRows!;
         for (int t = 0; t < tokenIds.Length; t++)
         {
             int id = tokenIds[t];
             if ((uint)id >= (uint)Config.VocabSize)
                 throw new ArgumentOutOfRangeException(nameof(tokenIds), $"Token id {id} is out of range");
-            var region = new VkBufferCopy
-            {
-                srcOffset = (ulong)((long)id * rowBytes),
-                dstOffset = (ulong)((long)t * rowBytes),
-                size = (ulong)rowBytes,
-            };
-            VulkanApi.vkCmdCopyBuffer(cmdBuf, srcBuf, dstBuf, 1, region);
+            rows.RecordRowCopy(cmdBuf, id, _state.HiddenState, (long)t * rowBytes);
         }
 
         ProfMark(cmdBuf, VulkanOpProfiler.Cat.Embed);

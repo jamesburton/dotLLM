@@ -425,5 +425,22 @@ public enum Architecture
     /// nomic-embed encoder (llama.cpp <c>nomic-bert</c>): BERT layout with RoPE (NeoX) instead of
     /// absolute positions, fused QKV, SwiGLU FFN, no biases (issue #739).
     /// </summary>
-    NomicBert
+    NomicBert,
+
+    /// <summary>
+    /// IBM Granite dense decoder (llama.cpp <c>granite</c>, HF <c>GraniteForCausalLM</c>; Granite-3.x / 4.x). A
+    /// Llama-shaped GQA + SwiGLU transformer plus the four Granite scalars: embedding multiplier,
+    /// attention multiplier (replaces <c>1/sqrt(head_dim)</c>), residual multiplier (on both sublayer
+    /// outputs) and logit scale (logits divided). See <see cref="DotLLM.Core.Models.ModelConfig.ResidualScale"/>,
+    /// <see cref="DotLLM.Core.Models.ModelConfig.AttentionScale"/>, <see cref="DotLLM.Core.Models.ModelConfig.LogitScale"/>
+    /// and <see cref="DotLLM.Core.Models.ModelConfig.EmbeddingScale"/> (issue #313, #764).
+    /// </summary>
+    Granite,
+
+    /// <summary>
+    /// AllenAI OLMo 2 (llama.cpp <c>olmo2</c>): post-norm-only residual layout (NO attention / FFN pre-norms;
+    /// <c>h = x + post_attn_norm(attn(x))</c>, <c>h = h + post_ffn_norm(ffn(h))</c>), full-width Q/K RMSNorm before the
+    /// head reshape, NeoX RoPE, SwiGLU. GGUF only; OLMo 3 (sliding window + YaRN) is refused (issue #765).
+    /// </summary>
+    Olmo2
 }

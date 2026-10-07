@@ -66,6 +66,7 @@ public static unsafe class MoeQuantSwiGluMlp
     /// <param name="softmaxAfterTopK">True = gpt-oss gating (top-k on raw logits, softmax over selected). False = Mixtral gating (softmax first, renormalised top-k).</param>
     /// <param name="useSwiGluOai">True = clamped swiglu_oai activation; false = plain SwiGLU.</param>
     /// <param name="pool">Optional thread pool for row-parallel expert GEMVs.</param>
+    /// <param name="normTopKProb">Mixtral gating only: renormalise the selected top-k probabilities to sum to 1 (default). False = keep the raw softmax-over-all-experts probabilities (OLMoE, Qwen1.5-MoE).</param>
     [SkipLocalsInit]
     public static void Execute(
         float* hidden, float* output, int seqLen,
@@ -77,7 +78,7 @@ public static unsafe class MoeQuantSwiGluMlp
         int numExperts, int numExpertsPerTok,
         int hiddenSize, int intermediateSize,
         bool softmaxAfterTopK, bool useSwiGluOai,
-        ComputeThreadPool? pool)
+        ComputeThreadPool? pool, bool normTopKProb = true)
     {
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (numExpertsPerTok <= 0 || numExpertsPerTok > numExperts)
@@ -144,10 +145,13 @@ public static unsafe class MoeQuantSwiGluMlp
                         var l = logitsBuf.AsSpan(0, numExperts);
                         Softmax.Execute(l, l);
                         MoeSwiGluMlp.SelectTopK(l, topkIdx, topkVal);
-                        float sum = 0f;
-                        for (int i = 0; i < numExpertsPerTok; i++) sum += topkVal[i];
-                        float inv = sum > 0f ? 1f / sum : 0f;
-                        for (int i = 0; i < numExpertsPerTok; i++) topkVal[i] *= inv;
+                        if (normTopKProb)
+                        {
+                            float sum = 0f;
+                            for (int i = 0; i < numExpertsPerTok; i++) sum += topkVal[i];
+                            float inv = sum > 0f ? 1f / sum : 0f;
+                            for (int i = 0; i < numExpertsPerTok; i++) topkVal[i] *= inv;
+                        }
                     }
 
                     // ── 3) Per-expert quantized SwiGLU MLP ───────────────

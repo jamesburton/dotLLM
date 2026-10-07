@@ -2197,20 +2197,13 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     {
         int hiddenSize = Config.HiddenSize;
         long rowBytes = (long)hiddenSize * sizeof(float);
-        var srcBuf = _weights.TokenEmbedding.Handle;
-        var dstBuf = _state.HiddenState.Handle;
+        var rows = _weights.TokenEmbeddingRows;
         for (int t = 0; t < tokenIds.Length; t++)
         {
             int id = tokenIds[t];
             if ((uint)id >= (uint)Config.VocabSize)
                 throw new ArgumentOutOfRangeException(nameof(tokenIds), $"Token id {id} is out of range");
-            var region = new VkBufferCopy
-            {
-                srcOffset = (ulong)((long)id * rowBytes),
-                dstOffset = (ulong)((long)t * rowBytes),
-                size = (ulong)rowBytes,
-            };
-            VulkanApi.vkCmdCopyBuffer(cmdBuf, srcBuf, dstBuf, 1, region);
+            rows.RecordRowCopy(cmdBuf, id, _state.HiddenState, (long)t * rowBytes);
         }
     }
 

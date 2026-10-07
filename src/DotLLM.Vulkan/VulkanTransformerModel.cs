@@ -719,6 +719,10 @@ public sealed class VulkanTransformerModel : IModel
     // created only when Config.EmbeddingScale is set. Null otherwise. Also
     // reused for the Gemma-4 per-layer output scale (layer_output_scale).
     private readonly ScaleInplaceF32Kernel? _embedScale;
+    // Granite residual multiplier (sublayer output scaled before the residual add; 1 = none) and logit divisor (1 = none).
+    private readonly bool _postNormOnly;   // OLMo 2: no pre-attention / pre-FFN norm
+    private readonly float _residualScale;
+    private readonly float _logitScale;
     // Device-resident Q8_0 token-embedding gather (issue #352). Non-null only when
     // VulkanWeights kept the embedding table in its raw Q8_0 layout instead of
     // widening it to F32; null => the legacy vkCmdCopyBuffer F32 row gather.
@@ -742,6 +746,9 @@ public sealed class VulkanTransformerModel : IModel
     // theta-driven _rope, and the fused rope+KV-write shortcut is bypassed (it only knows theta).
     private RopeInvFreqF32Kernel? _ropeInvFreq;
     private VulkanDevice.Buffer? _ropeInvFreqBuf;
+    // Gemma-3 dual RoPE (local theta / global theta + linear scale): inverse-frequency table for the
+    // FULL-attention (global) layers; _ropeInvFreqBuf then holds the LOCAL table. Null for every other model.
+    private VulkanDevice.Buffer? _globalRopeInvFreqBuf;
     private float _attnTempScale;
     private int _attnTempFloor;
     private readonly AddKernel _add;
@@ -767,6 +774,8 @@ public sealed class VulkanTransformerModel : IModel
     private readonly float _mlaRopeTheta;
     // MoE (Mixtral / Qwen-MoE) — null when the model carries no MoE layer.
     private readonly MoeTopKSoftmaxF32Kernel? _moeTopkSoftmax;
+    // DeepSeek-V3 / GLM-4.7-Flash sigmoid + selection-bias router (#742). Null unless config.Moe.SigmoidGating.
+    private MoeTopKSigmoidBiasF32Kernel? _moeTopkSigmoid;
     private readonly MoeIndexedMatmulF32Kernel? _moeIndexedMatmul;
     private readonly MoeIndexedMatmulQ8_0F32Kernel? _moeIndexedMatmulQ8;
     // Gemma-4 quantized experts: Q4_K (fused gate_up → split W1/W3) and Q5_1
@@ -804,6 +813,20 @@ public sealed class VulkanTransformerModel : IModel
     private readonly MoeUngroupScatterF32Kernel? _moeUngroupScatter;
     private readonly MoeWeightedScatterF32Kernel? _moeWeightedScatter;
     private readonly MoeBroadcastF32Kernel? _moeBroadcast;
+    // Gemma-4 grouped-by-expert coopmat prefill path (#773): Q4_K gate/up + Q5_1/Q8_0 down GEMMs and the indirect tile-list builder.
+    // All null unless the device is wave64 + coopmat and every SPIR-V is present (then the indexed kernels above run as before).
+    private MoeGroupedMatmulKQuantCoopmatKernel? _gemma4GroupedQ4K;
+    private MoeGroupedMatmulLegacyQuantCoopmatKernel? _gemma4GroupedQ5_1;
+    private MoeGroupedMatmulLegacyQuantCoopmatKernel? _gemma4GroupedQ8_0;
+    private MoeBuildTileListKernel? _gemma4MoeBuildTileList;
+    /// <summary>Count of Gemma-4 MoE layers that took the grouped-by-expert prefill path (test/diagnostic).</summary>
+    public int Gemma4GroupedMoeDispatchCount { get; private set; }
+
+    /// <summary>
+    /// Runtime A/B switch for the Gemma-4 grouped-by-expert prefill path (default on; the load-time env opt-out is
+    /// <c>DOTLLM_VK_MOE_GROUPED=0</c>). Off = the scalar indexed kernels, so a single loaded model can compare both paths in-process.
+    /// </summary>
+    public bool Gemma4GroupedMoeEnabled { get; set; } = true;
     // Optional Qwen1.5-MoE per-token sigmoid gate fold for the shared-expert
     // branch. Null when no MoE layer exists OR when no MoE layer carries a
     // SharedExpertGate weight (DeepSeek-V2/V3, Mixtral). Allocated alongside
@@ -958,7 +981,7 @@ public sealed class VulkanTransformerModel : IModel
     }
 
     /// <summary>RoPE on Q/K: dense-YaRN kernel for gpt-oss, the theta-derived kernel otherwise.</summary>
-    private void RecordRopeQk(nint cmdBuf, int seqLen, int numHeads, int numKvHeads, int headDim)
+    private void RecordRopeQk(nint cmdBuf, int layer, int seqLen, int numHeads, int numKvHeads, int headDim)
     {
         if (_gptOss is not null && _ropeYarnInvFreq is not null && !_gptOssDbg.NoYarn)
         {
@@ -967,7 +990,7 @@ public sealed class VulkanTransformerModel : IModel
                 _gptOssDbg.NoYarnMscale ? 1.0f : _ropeYarnMscale);
             return;
         }
-        RecordDenseRope(cmdBuf, seqLen, numHeads, numKvHeads, headDim);
+        RecordDenseRope(cmdBuf, layer, seqLen, numHeads, numKvHeads, headDim);
     }
     private bool _noTokenEmbed;
     // When non-null, the next Forward seeds HiddenState from these host rows (a previous pipeline
@@ -1242,6 +1265,9 @@ public sealed class VulkanTransformerModel : IModel
         _geglu = geglu;
         _relu2glu = relu2glu;
         _embedScale = embedScale;
+        _postNormOnly = config.Architecture == DotLLM.Core.Configuration.Architecture.Olmo2;
+        _residualScale = config.ResidualScale ?? 1.0f;
+        _logitScale = config.LogitScale ?? 1.0f;
         _embedGatherQ8 = embedGatherQ8;
         _add = add;
         _biasAdd = biasAdd;
@@ -1300,6 +1326,8 @@ public sealed class VulkanTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
 
+        config = VulkanTransformerModel.NormalizeMlaCacheForVulkan(config);
+
         RejectUnsupportedArchitecture(config, allowGptOss: true);
 
         var device = VulkanDevice.Create();
@@ -1349,6 +1377,8 @@ public sealed class VulkanTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
 
+        config = VulkanTransformerModel.NormalizeMlaCacheForVulkan(config);
+
         RejectUnsupportedArchitecture(config, allowGptOss: true);
 
         spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
@@ -1375,6 +1405,8 @@ public sealed class VulkanTransformerModel : IModel
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
+
+        config = VulkanTransformerModel.NormalizeMlaCacheForVulkan(config);
 
         RejectUnsupportedArchitecture(config);
 
@@ -1408,6 +1440,8 @@ public sealed class VulkanTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(cpuWeights);
         ArgumentNullException.ThrowIfNull(spvDir);
+
+        config = VulkanTransformerModel.NormalizeMlaCacheForVulkan(config);
 
         RejectUnsupportedArchitecture(config);
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf: null,
@@ -1853,8 +1887,10 @@ public sealed class VulkanTransformerModel : IModel
             config.ActivationFunction == ActivationFunction.ReluSquared
                 ? ReLU2GluF32Kernel.Create(device, spvDir)
                 : null;
+        // Also created for the Granite residual multiplier (scales each sublayer output in place before the
+        // residual add) — same generic scalar-multiply kernel.
         ScaleInplaceF32Kernel? embedScale =
-            config.EmbeddingScale is float es && es != 1.0f
+            (config.EmbeddingScale is float es && es != 1.0f) || (config.ResidualScale is float rs && rs != 1.0f)
                 ? ScaleInplaceF32Kernel.Create(device, spvDir)
                 : null;
         // Device-resident Q8_0 embedding gather (issue #352) — created only when
@@ -2030,6 +2066,8 @@ public sealed class VulkanTransformerModel : IModel
             ropeTheta, ropeDim, ropeVariant, slidingWindow,
             mlaNumHeads, mlaQkNope, mlaQkRope, mlaVHead,
             mlaScale, mlaRopeTheta);
+        if (hasMoe && config.Moe is { SigmoidGating: true })
+            model._moeTopkSigmoid = MoeTopKSigmoidBiasF32Kernel.Create(device, spvDir);
         if (Environment.GetEnvironmentVariable(DisableQ4KCoopmatEnvVar) != "1"
             && MatMulQ4KGemmCoopmatKernel.IsSupportedOn(device, spvDir))
             model._matmulQ4KGemmCoopmat = MatMulQ4KGemmCoopmatKernel.Create(device, spvDir);
@@ -2051,6 +2089,20 @@ public sealed class VulkanTransformerModel : IModel
         if (Environment.GetEnvironmentVariable(DisableIq4XsCoopmatEnvVar) != "1"
             && MatMulIq4XsGemmCoopmatKernel.IsSupportedOn(device, spvDir))
             model._matmulIq4XsGemmCoopmat = MatMulIq4XsGemmCoopmatKernel.Create(device, spvDir);
+        if (hasMoe && config.Gemma4DualFfn && Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_GROUPED") != "0"
+            && MoeGroupedMatmulKQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedKQuant.Q4_K)
+            && device.SubgroupSize == 64
+            && MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q5_1)
+            && MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q8_0)
+            && MoeBuildTileListKernel.IsSupportedOn(spvDir)
+            && File.Exists(Path.Combine(spvDir, "moe_grouped_matmul_q4_k_coopmat_m64.spv")))
+        {
+            // 64-row tile (4 x wave64 subgroups) Q4_K; no row-pair variant, so every kernel shares one 16-row tile list.
+            model._gemma4GroupedQ4K = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K, tileMOverride: 64);
+            model._gemma4GroupedQ5_1 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Q5_1);
+            model._gemma4GroupedQ8_0 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Q8_0);
+            model._gemma4MoeBuildTileList = MoeBuildTileListKernel.Create(device, spvDir);
+        }
         model._firstLayer = firstLayer;
         model._proportionalRopePairs = proportionalRopePairs;
         model.ConfigureDenseRopeFactorsAndAttnTemperature(device, spvDir, config, cpuWeights.RopeFreqFactors, ropeDim, ropeTheta);
@@ -2227,14 +2279,19 @@ public sealed class VulkanTransformerModel : IModel
     private bool RecordQkNorm(nint cmdBuf, in VulkanWeights.LayerBuffers lw, int rows, int numHeads, int numKvHeads, int headDim, float eps)
     {
         bool any = false;
+        // OLMo 2 / OLMoE: ONE RMSNorm over the whole Q (K) projection, applied before the head reshape. The same kernel,
+        // viewed as `rows` rows of n_heads*head_dim (n_kv_heads*head_dim) elements.
+        bool whole = Config.QkNormWholeProjection;
         if (lw.QNormWeight is not null)
         {
-            _rmsnorm.Record(cmdBuf, _state.Q, lw.QNormWeight, _state.Q, rowCount: rows * numHeads, n: headDim, eps: eps);
+            _rmsnorm.Record(cmdBuf, _state.Q, lw.QNormWeight, _state.Q,
+                rowCount: whole ? rows : rows * numHeads, n: whole ? numHeads * headDim : headDim, eps: eps);
             any = true;
         }
         if (lw.KNormWeight is not null)
         {
-            _rmsnorm.Record(cmdBuf, _state.K, lw.KNormWeight, _state.K, rowCount: rows * numKvHeads, n: headDim, eps: eps);
+            _rmsnorm.Record(cmdBuf, _state.K, lw.KNormWeight, _state.K,
+                rowCount: whole ? rows : rows * numKvHeads, n: whole ? numKvHeads * headDim : headDim, eps: eps);
             any = true;
         }
         if (any) BarrierComputeToCompute(cmdBuf);
@@ -2432,6 +2489,8 @@ public sealed class VulkanTransformerModel : IModel
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private float GetAttentionScaleOverride()
     {
+        // Granite attention_multiplier is the scale itself; Gemma query_pre_attn_scalar is 1/sqrt(value).
+        if (Config.AttentionScale is float granite && granite > 0.0f) return granite;
         return Config.QueryPreAttnScalar is float qpas && qpas > 0.0f
             ? 1.0f / MathF.Sqrt(qpas)
             : 0.0f;
@@ -2472,7 +2531,11 @@ public sealed class VulkanTransformerModel : IModel
         if (config.MlaConfig is not null) return;
         float[]? factors = DotLLM.Models.Architectures.DenseRopeFreqFactors.Select(config, factorsRaw, ropeDim);
         bool temp = config.AttnTemperatureScale != 0f;
-        if (factors is null && !temp) return;
+        // Gemma-3 dual RoPE: dense (non-Gemma-4) models carrying a GlobalRoPEConfig rotate their full-attention
+        // layers with a separate theta (+ optional linear scale), which the theta-driven kernels cannot express.
+        bool dual = config.Architecture == DotLLM.Core.Configuration.Architecture.Gemma3
+            && config.GlobalRoPEConfig is not null;
+        if (factors is null && !temp && !dual) return;
         int half = ropeDim / 2;
         var inv = new float[half];
         for (int i = 0; i < half; i++)
@@ -2483,13 +2546,41 @@ public sealed class VulkanTransformerModel : IModel
         _ropeInvFreq = RopeInvFreqF32Kernel.Create(device, spvDir);
         _attnTempScale = config.AttnTemperatureScale;
         _attnTempFloor = temp ? config.AttnTemperatureFloorScale : 0;
+        if (dual)
+        {
+            var g = config.GlobalRoPEConfig!.Value;
+            int gDim = g.DimensionCount > 0 ? g.DimensionCount : config.HeadDim;
+            if (gDim != ropeDim)
+                throw new NotSupportedException(
+                    $"Gemma-3 local/global RoPE rotate different dim counts ({ropeDim} vs {gDim}); not implemented on Vulkan.");
+            float lin = g.ScalingType == RoPEScalingType.Linear && g.ScalingFactor > 1f ? g.ScalingFactor : 1f;
+            var ginv = new float[half];
+            for (int i = 0; i < half; i++)
+                ginv[i] = 1.0f / (MathF.Pow(g.Theta, 2.0f * i / gDim) * lin);
+            _globalRopeInvFreqBuf = device.Allocate((long)half * sizeof(float));
+            device.Upload(ginv.AsSpan(), _globalRopeInvFreqBuf);
+        }
     }
 
     /// <summary>Records the dense Q/K RoPE: the inverse-frequency kernel when #743 features are active, else the theta kernel.</summary>
-    private void RecordDenseRope(nint cmdBuf, int seqLen, int numHeads, int numKvHeads, int headDim)
+    /// <summary>
+    /// OLMo 2 (no pre-norm): materialises the raw residual stream in <c>NormOutput</c> (the buffer the projections read
+    /// everywhere else) with a device copy, barrier-ordered against the surrounding compute dispatches.
+    /// </summary>
+    private void RecordCopyHiddenToNormOutput(nint cmdBuf, int elements)
+    {
+        BarrierComputeToTransfer(cmdBuf);
+        RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
+            srcOffset: 0, dstOffset: 0, size: (ulong)elements * sizeof(float));
+        BarrierTransferToCompute(cmdBuf);
+    }
+
+    private void RecordDenseRope(nint cmdBuf, int layer, int seqLen, int numHeads, int numKvHeads, int headDim)
     {
         if (_ropeInvFreq is not null)
-            _ropeInvFreq.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer, _ropeInvFreqBuf!,
+            _ropeInvFreq.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
+                _globalRopeInvFreqBuf is not null && Config.IsFullAttentionLayer(_firstLayer + layer)
+                    ? _globalRopeInvFreqBuf : _ropeInvFreqBuf!,
                 seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
                 headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
                 variant: _ropeVariant, tempScale: _attnTempScale, tempFloor: _attnTempFloor);
@@ -2549,6 +2640,16 @@ public sealed class VulkanTransformerModel : IModel
         + "the Vulkan pipeline-parallel and hybrid Vulkan+CUDA models do not wire its per-head attention sinks "
         + "nor its dense YaRN RoPE scaling, so loading it there would silently produce wrong output rather "
         + "than fail. Use a single Vulkan device, the CPU backend, or CUDA for gpt-oss checkpoints.";
+
+    /// <summary>
+    /// The GGUF/HF extractors default DeepSeek-style MLA to the CPU-only hybrid latent cache. The
+    /// Vulkan path runs the mathematically equivalent expanded cache, so loaders strip the flags
+    /// instead of rejecting a config the user never chose explicitly (#742: GLM-4.7-Flash).
+    /// </summary>
+    internal static ModelConfig NormalizeMlaCacheForVulkan(ModelConfig config)
+        => config.MlaConfig is { UseLatentCache: true } or { UseHybridMlaCache: true }
+            ? config with { MlaConfig = config.MlaConfig with { UseLatentCache = false, UseHybridMlaCache = false } }
+            : config;
 
     internal static void RejectUnsupportedArchitecture(ModelConfig config, bool allowGptOss = false)
     {
@@ -2931,6 +3032,7 @@ public sealed class VulkanTransformerModel : IModel
             || Config.AttnLogitSoftcap is not null
             || Config.FinalLogitSoftcap is not null
             || Config.QueryPreAttnScalar is not null
+            || Config.HasGraniteScalars
             || Config.IsGemma4DensePle;
         for (int layer = 0; layer < Config.NumLayers && !modelHasMlaOrMoe; layer++)
         {
@@ -3120,7 +3222,8 @@ public sealed class VulkanTransformerModel : IModel
             // Batched RoPE — reads packed positions [totalTokens] and rotates each
             // row independently. Per-seq position semantics are preserved by the
             // packed positions array.
-            RecordDenseRope(cmdBuf, totalTokens, numHeads, numKvHeads, headDim);
+            if (!Config.IsNoRopeLayer(_firstLayer + layer))
+                RecordDenseRope(cmdBuf, layer, totalTokens, numHeads, numKvHeads, headDim);
             BarrierComputeToCompute(cmdBuf);
 
             // Per-seq attention sub-loop. Each seq:
@@ -3522,10 +3625,10 @@ public sealed class VulkanTransformerModel : IModel
         // architecture that leaves Config.EmbeddingScale null (_embedScale is
         // null), so non-Gemma output is byte-identical. Skipped when seeding
         // from hidden (the first stage already applied it).
-        if (_embedScale is not null && !seedFromHidden)
+        if (_embedScale is not null && Config.EmbeddingScale is float embScaleValue && embScaleValue != 1.0f && !seedFromHidden)
         {
             _embedScale.Record(cmdBuf, _state.HiddenState, seqLen * hiddenSize,
-                Config.EmbeddingScale!.Value);
+                embScaleValue);
             BarrierComputeToCompute(cmdBuf);
         }
 
@@ -3621,7 +3724,18 @@ public sealed class VulkanTransformerModel : IModel
             // shader writes BOTH the normalised hidden state (for K/V to
             // read) AND the Q matmul output. Falls back to the standalone
             // pair on prefill, non-Q8_0 weights, or oversized hidden.
-            if (TryRecordFusedRmsNormMatmul(cmdBuf,
+            if (_postNormOnly)
+            {
+                // OLMo 2: NO pre-attention norm — the projections read the raw residual stream.
+                RecordCopyHiddenToNormOutput(cmdBuf, seqLen * hiddenSize);
+                RecordMatmul(cmdBuf, lw.Q, lw.QDeviceQuantType, _state.NormOutput, _state.Q,
+                    lw.QOutputDim, lw.QInputDim, seqLen);
+                RecordMatmul(cmdBuf, lw.K, lw.KDeviceQuantType, _state.NormOutput, _state.K,
+                    lw.KOutputDim, lw.KInputDim, seqLen);
+                RecordMatmul(cmdBuf, lw.V, lw.VDeviceQuantType, _state.NormOutput, _state.V,
+                    lw.VOutputDim, lw.VInputDim, seqLen);
+            }
+            else if (TryRecordFusedRmsNormMatmul(cmdBuf,
                     _state.HiddenState, lw.AttnNormWeight,
                     lw.Q, lw.QDeviceQuantType,
                     _state.NormOutput, _state.Q,
@@ -3694,9 +3808,12 @@ public sealed class VulkanTransformerModel : IModel
             // the fused shader only knows startPos + t, not a per-token position lookup; the
             // TurboQuant / non-contiguous-batched paths below are unaffected and keep using their
             // existing unfused sequences).
+            // SmolLM3 NoPE layers skip RoPE entirely (ModelConfig.NoRopeLayers); the fused shader always rotates.
+            bool noRopeLayer = Config.IsNoRopeLayer(_firstLayer + layer);
             bool useFusedRopeKv = _ropeKvWrite is not null
                 && _gptOss is null   // gpt-oss: YaRN table + mscale live in RecordRopeQk, not the fused shader
                 && _ropeInvFreq is null
+                && !noRopeLayer
                 && kvCache is VulkanKvCache
                 && IsContiguousAscending(positions);
 
@@ -3725,8 +3842,9 @@ public sealed class VulkanTransformerModel : IModel
             }
             else
             {
-                // RoPE on Q and K
-                RecordRopeQk(cmdBuf, seqLen, numHeads, numKvHeads, headDim);
+                // RoPE on Q and K (skipped on NoPE layers)
+                if (!noRopeLayer)
+                    RecordRopeQk(cmdBuf, layer, seqLen, numHeads, numKvHeads, headDim);
                 ProfSample("rope");
                 DpStamp(cmdBuf, DpCatRope);
 
@@ -3813,6 +3931,7 @@ public sealed class VulkanTransformerModel : IModel
             // barrier) otherwise; the residual add itself happens in the
             // shared code below either way.
             oProjFused = lw.OBias is null && _currentLora is null && lw.PostAttnNormWeight is null
+                && _residualScale == 1.0f
                 && TryRecordMatmulWithResidualQ8_0(cmdBuf, lw.O, lw.ODeviceQuantType,
                     _state.AttnOutput, _state.Residual, _state.AddScratch,
                     lw.OOutputDim, lw.OInputDim, seqLen);
@@ -3848,6 +3967,14 @@ public sealed class VulkanTransformerModel : IModel
             {
                 _rmsnorm.Record(cmdBuf, _state.NormOutput, postAttnNorm1, _state.NormOutput,
                     rowCount: seqLen, n: hiddenSize, eps: eps);
+                BarrierComputeToCompute(cmdBuf);
+            }
+
+            // Granite residual multiplier: scale the attention sublayer output in place BEFORE the residual add
+            // (the fused o_proj+residual shortcut above is disabled when it is set).
+            if (_residualScale != 1.0f)
+            {
+                _embedScale!.Record(cmdBuf, _state.NormOutput, seqLen * hiddenSize, _residualScale);
                 BarrierComputeToCompute(cmdBuf);
             }
 
@@ -3896,7 +4023,16 @@ public sealed class VulkanTransformerModel : IModel
             // FFN RMSNorm + Gate projection — fused when available
             // (mirrors the attn-norm + Q fusion above). Up reads the
             // normalised hidden state written by the fused dispatch.
-            if (TryRecordFusedRmsNormMatmul(cmdBuf,
+            if (_postNormOnly)
+            {
+                // OLMo 2: NO pre-FFN norm — gate/up read the raw post-attention residual stream.
+                RecordCopyHiddenToNormOutput(cmdBuf, seqLen * hiddenSize);
+                RecordMatmul(cmdBuf, lw.Gate, lw.GateDeviceQuantType, _state.NormOutput, _state.FfnGate,
+                    lw.GateOutputDim, lw.GateInputDim, seqLen);
+                RecordMatmul(cmdBuf, lw.Up, lw.UpDeviceQuantType, _state.NormOutput, _state.FfnUp,
+                    lw.UpOutputDim, lw.UpInputDim, seqLen);
+            }
+            else if (TryRecordFusedRmsNormMatmul(cmdBuf,
                     _state.HiddenState, lw.FfnNormWeight,
                     lw.Gate, lw.GateDeviceQuantType,
                     _state.NormOutput, _state.FfnGate,
@@ -3946,7 +4082,8 @@ public sealed class VulkanTransformerModel : IModel
             // residual add collapse from 3 dispatches / 2 barriers into 2
             // dispatches / 1 barrier (activation+quantize fused; the GEMV
             // still needs its own barrier to see the just-quantized scratch).
-            downProjFused = TryRecordFusedSwiGluQuantizeDownResidual(cmdBuf, lw, seqLen, intermediateSize);
+            downProjFused = _residualScale == 1.0f
+                && TryRecordFusedSwiGluQuantizeDownResidual(cmdBuf, lw, seqLen, intermediateSize);
 
             if (!downProjFused)
             {
@@ -3978,6 +4115,7 @@ public sealed class VulkanTransformerModel : IModel
                 // rules as the o_proj site above (Q8_0, no bias / LoRA / Gemma
                 // post-ffn-norm in between).
                 downProjFused = lw.DownBias is null && _currentLora is null && lw.PostFfnNormWeight is null
+                    && _residualScale == 1.0f
                     && TryRecordMatmulWithResidualQ8_0(cmdBuf, lw.Down, lw.DownDeviceQuantType,
                         _state.SiluOutput, _state.Residual, _state.AddScratch,
                         lw.DownOutputDim, lw.DownInputDim, seqLen);
@@ -4015,6 +4153,13 @@ public sealed class VulkanTransformerModel : IModel
             {
                 _rmsnorm.Record(cmdBuf, _state.NormOutput, postFfnNorm1, _state.NormOutput,
                     rowCount: seqLen, n: hiddenSize, eps: eps);
+                BarrierComputeToCompute(cmdBuf);
+            }
+
+            // Granite residual multiplier on the FFN / MoE sublayer output (fused down+residual is gated off).
+            if (_residualScale != 1.0f)
+            {
+                _embedScale!.Record(cmdBuf, _state.NormOutput, seqLen * hiddenSize, _residualScale);
                 BarrierComputeToCompute(cmdBuf);
             }
 
@@ -4182,7 +4327,7 @@ public sealed class VulkanTransformerModel : IModel
             var dest = new Span<float>((void*)result.DataPointer, seqLen * vocabSize);
             _device.Download(logitsBuf, dest);
             // Per-row Gemma final-logit soft-cap (no-op when FinalLogitSoftcap is null).
-            if (Config.FinalLogitSoftcap is float cap && cap > 0f)
+            if ((Config.FinalLogitSoftcap is float cap && cap > 0f) || _logitScale != 1.0f)
                 for (int r = 0; r < seqLen; r++)
                     ApplyFinalLogitSoftcapHost(dest.Slice(r * vocabSize, vocabSize));
         }
@@ -4314,6 +4459,9 @@ public sealed class VulkanTransformerModel : IModel
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void ApplyFinalLogitSoftcapHost(Span<float> logits)
     {
+        // Granite logit scale: logits are DIVIDED by logits_scaling (applied before any soft-cap; Granite has none).
+        if (_logitScale != 1.0f)
+            TensorPrimitives.Multiply(logits, 1.0f / _logitScale, logits);
         if (Config.FinalLogitSoftcap is not float cap || cap <= 0.0f) return;
         float inv = 1.0f / cap;
         TensorPrimitives.Multiply(logits, inv, logits);
@@ -4423,6 +4571,7 @@ public sealed class VulkanTransformerModel : IModel
         _mlaRope?.InvalidateDescriptorCache();
         _mlaKvSplit?.InvalidateDescriptorCache();
         _moeTopkSoftmax?.InvalidateDescriptorCache();
+        _moeTopkSigmoid?.InvalidateDescriptorCache();
         _moeIndexedMatmul?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ8?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ4K?.InvalidateDescriptorCache();
@@ -4437,6 +4586,10 @@ public sealed class VulkanTransformerModel : IModel
         _moeExpandGroupByExpert?.InvalidateDescriptorCache();
         _moeGroupedMatmulF16Coopmat?.InvalidateDescriptorCache();
         _moeUngroupScatter?.InvalidateDescriptorCache();
+        _gemma4GroupedQ4K?.InvalidateDescriptorCache();
+        _gemma4GroupedQ5_1?.InvalidateDescriptorCache();
+        _gemma4GroupedQ8_0?.InvalidateDescriptorCache();
+        _gemma4MoeBuildTileList?.InvalidateDescriptorCache();
         _moeWeightedScatter?.InvalidateDescriptorCache();
         _moeBroadcast?.InvalidateDescriptorCache();
         _moeIndexedLoraDelta?.InvalidateDescriptorCache();
@@ -5189,6 +5342,7 @@ public sealed class VulkanTransformerModel : IModel
         _rmsnorm.Record(cmdBuf, _state.Gemma4DenseResult!, g4.PostFfwNorm1!, _state.Gemma4DenseResult!,
             rowCount: seqLen, n: hidden, eps: eps);
         BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_dense");
 
         // ── MoE branch ──
         // Custom router: logits = ffn_gate_inp · (rms(attn_out) · RouterScale·1/√H).
@@ -5208,7 +5362,20 @@ public sealed class VulkanTransformerModel : IModel
         _moeBroadcast!.Record(cmdBuf, _state.NormOutput, _state.MoeExpandedInput!,
             seqLen: seqLen, topK: topK, hidden: hidden);
         BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_route");
 
+        // ── Grouped-by-expert coopmat prefill (issue #773) ───────────────────
+        // seqLen >= Gemma4GroupedMoeMinTokens: sort the routed rows by expert once and run each expert's weights through a cooperative-matrix
+        // GEMM per 16-row tile, instead of the indexed kernels re-reading an expert's weights for every routed row (the real 26B-A4B
+        // prefill ran ~20 tok/s, 94% of it in those two stages). Result lands in MoeDownRows in the original (token, slot) order, so
+        // the weighted scatter below is unchanged. Decode (S == 1) never takes this path.
+        if (CanUseGemma4GroupedMoe(moeW, g4, seqLen, hidden, interm))
+        {
+            Gemma4GroupedMoeDispatchCount++;
+            RecordGemma4GroupedExperts(cmdBuf, moeW, g4, hidden, interm, numE, expandedRows);
+        }
+        else
+        {
         // ── Indexed MMVQ decode fast path (issue #137) ──────────────────────
         // S==1 only: the dense decode GEMVs already run coalesced dp4a (mmvq);
         // the scalar per-cell indexed kernels left the expert GEMVs far below
@@ -5250,8 +5417,10 @@ public sealed class VulkanTransformerModel : IModel
                 moeW.W3DeviceQuantType, m: interm, k: hidden, n: expandedRows, numExperts: numE);
         }
         BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_gateup");
         _geglu!.Record(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeSiluInter!, expandedRows * interm);
         BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_geglu");
         if (useMoeMmvq)
         {
             // Re-quantize the GeGLU output rows (K = interm) into the same
@@ -5293,6 +5462,8 @@ public sealed class VulkanTransformerModel : IModel
                 moeW.W2DeviceQuantType, m: hidden, k: interm, n: expandedRows, numExperts: numE);
         }
         BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_down");
+        }
         // Weighted scatter (routing weights; per-expert down scale folded by the Q5_1 shader
         // or pre-folded into the F32 W2) → Gemma4MoeResult.
         _moeWeightedScatter!.Record(cmdBuf, _state.MoeDownRows!, _state.MoeTopkWeights!, _state.Gemma4MoeResult!,
@@ -5302,11 +5473,74 @@ public sealed class VulkanTransformerModel : IModel
             rowCount: seqLen, n: hidden, eps: eps);
         BarrierComputeToCompute(cmdBuf);
 
+        ProfSample("g4ffn_scatter_norm");
         // ── Combine: cur = rms(dense + moe) * post_ffw_norm → NormOutput ──
         _add.Record(cmdBuf, _state.Gemma4DenseResult!, _state.Gemma4MoeResult!, _state.NormOutput, seqLen * hidden);
         BarrierComputeToCompute(cmdBuf);
         _rmsnorm.Record(cmdBuf, _state.NormOutput, g4.PostFfwNorm, _state.NormOutput,
             rowCount: seqLen, n: hidden, eps: eps);
+        BarrierComputeToCompute(cmdBuf);
+    }
+
+    private static readonly int Gemma4GroupedMoeMinTokens =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_GROUPED_MIN_TOKENS"), out int g) && g > 0 ? g : 16;
+
+    private bool CanUseGemma4GroupedMoe(in VulkanWeights.MoeLayerBuffers moeW, in VulkanWeights.Gemma4LayerBuffers g4, int seqLen, int hidden, int interm)
+        => Gemma4GroupedMoeEnabled && seqLen >= Gemma4GroupedMoeMinTokens
+        && _gemma4GroupedQ4K is not null && _gemma4GroupedQ5_1 is not null && _gemma4GroupedQ8_0 is not null && _gemma4MoeBuildTileList is not null
+        && _moeExpertOffsets is not null && _moeExpandGroupByExpert is not null && _moeUngroupScatter is not null
+        && _state.MoeGroupDispatchArgs is not null && _state.MoeGroupedHidden is not null && _state.MoePermutation is not null
+        && moeW.W1DeviceQuantType == QuantType.Q4_K && moeW.W3DeviceQuantType == QuantType.Q4_K
+        && (moeW.W2DeviceQuantType == QuantType.Q8_0 || (moeW.W2DeviceQuantType == QuantType.Q5_1 && g4.DownExpertScale is not null))
+        && (hidden % MoeGroupedMatmulKQuantCoopmatKernel.KGroup) == 0
+        && (interm % MoeGroupedMatmulLegacyQuantCoopmatKernel.KGroup) == 0;
+
+    /// <summary>
+    /// Grouped-by-expert routed experts for a Gemma-4 layer (#773). On entry <c>MoeExpandedInput</c> holds the broadcast
+    /// (token, slot) rows; on exit <c>MoeDownRows</c> holds the per-routed-row down outputs (per-expert down scale applied) in the original
+    /// row order. Buffer reuse: expanded input -> packed rows (<c>MoeGroupedHidden</c>) -> grouped gate/up
+    /// (<c>MoeGrouped{Gate,Up}Inter</c>) -> GeGLU in packed order (<c>MoeSiluInter</c>) -> grouped down into <c>MoeGroupedHidden</c> (the packed
+    /// input is dead by then) -> ungroup into <c>MoeDownRows</c>.
+    /// </summary>
+    private void RecordGemma4GroupedExperts(nint cmdBuf, in VulkanWeights.MoeLayerBuffers moeW, in VulkanWeights.Gemma4LayerBuffers g4,
+        int hidden, int interm, int numE, int expandedRows)
+    {
+        _moeExpertOffsets!.Record(cmdBuf, _state.MoeTopkIndices!, _state.MoeExpertCounts!, _state.MoeExpertOffsets!, _state.MoeExpertCounters!,
+            rows: expandedRows, numExperts: numE);
+        BarrierComputeToCompute(cmdBuf);
+        _moeExpandGroupByExpert!.Record(cmdBuf, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeExpertOffsets!,
+            _state.MoeExpertCounters!, _state.MoeGroupedHidden!, _state.MoePermutation!, rows: expandedRows, hidden: hidden, numExperts: numE);
+        BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_group");
+
+        var q4k = _gemma4GroupedQ4K!;
+        var down = moeW.W2DeviceQuantType == QuantType.Q5_1 ? _gemma4GroupedQ5_1! : _gemma4GroupedQ8_0!;
+        // Launch only the (expert, 16-row tile) pairs that exist (the legacy grid is ~10-30x larger than the work).
+        _gemma4MoeBuildTileList!.Record(cmdBuf, _state.MoeExpertOffsets!, _state.MoeGroupDispatchArgs!, numE,
+            q4k.MTiles(interm), down.MTiles(hidden), tileRows: q4k.RowTile);
+        KernelSupport.ComputeToIndirectAndComputeBarrier(cmdBuf);
+
+        q4k.RecordIndirect(cmdBuf, moeW.W1Bank, _state.MoeGroupedHidden!, _state.MoeExpertOffsets!, _state.MoeGroupedGateInter!,
+            _state.MoeGroupDispatchArgs!, 0, m: interm, k: hidden, rows: expandedRows, numExperts: numE);
+        q4k.RecordIndirect(cmdBuf, moeW.W3Bank, _state.MoeGroupedHidden!, _state.MoeExpertOffsets!, _state.MoeGroupedUpInter!,
+            _state.MoeGroupDispatchArgs!, 0, m: interm, k: hidden, rows: expandedRows, numExperts: numE);
+        BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_gateup");
+
+        _geglu!.Record(cmdBuf, _state.MoeGroupedGateInter!, _state.MoeGroupedUpInter!, _state.MoeSiluInter!, expandedRows * interm);
+        BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_geglu");
+
+        // Q5_1 banks fold ffn_down_exps.scale[e] into the accumulator (matches the scalar kernel's fold order); Q8_0 banks were pre-folded at upload.
+        bool applyScale = moeW.W2DeviceQuantType == QuantType.Q5_1;
+        down.RecordIndirect(cmdBuf, moeW.W2Bank, _state.MoeSiluInter!, _state.MoeExpertOffsets!, _state.MoeGroupedHidden!,
+            g4.DownExpertScale ?? _state.MoeTopkWeights!, applyScale, _state.MoeGroupDispatchArgs!, MoeBuildTileListKernel.ArgsStrideBytes,
+            m: hidden, k: interm, rows: expandedRows, numExperts: numE);
+        BarrierComputeToCompute(cmdBuf);
+        ProfSample("g4ffn_down");
+
+        _moeUngroupScatter!.Record(cmdBuf, _state.MoeGroupedHidden!, _state.MoePermutation!, _state.MoeDownRows!,
+            rows: expandedRows, hidden: hidden);
         BarrierComputeToCompute(cmdBuf);
     }
 
@@ -5541,12 +5775,24 @@ public sealed class VulkanTransformerModel : IModel
 
         // 3. Top-k softmax: writes MoeTopkIndices (int) and MoeTopkWeights.
         if (gptOssMoe is { SoftmaxAfterTopK: true })
+        {
             _gptOss!.RecordTopKRawSoftmax(cmdBuf, _state.MoeRouterLogits!, _state.MoeTopkIndices!,
                 _state.MoeTopkWeights!, seqLen, numE, topK);
+        }
+        else if (moeW.SigmoidGating)
+        {
+            // DeepSeek-V3 / GLM-4.7-Flash: sigmoid scores, selection bias, renorm + scale (#742).
+            _moeTopkSigmoid!.Record(cmdBuf,
+                _state.MoeRouterLogits!, moeW.SelectionBias!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
+                seqLen: seqLen, numExperts: numE, k: topK,
+                normTopKProb: moeW.NormTopKProb, weightsScale: moeW.WeightsScale);
+        }
         else
-        _moeTopkSoftmax!.Record(cmdBuf,
-            _state.MoeRouterLogits!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
-            seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
+        {
+            _moeTopkSoftmax!.Record(cmdBuf,
+                _state.MoeRouterLogits!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
+                seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
+        }
         // Broadcast (compute) reads NormOutput, writes MoeExpandedInput; the
         // indexed matmul downstream reads MoeExpandedInput plus topk
         // indices/weights. A single compute→compute barrier covers both
@@ -7330,6 +7576,19 @@ public sealed class VulkanTransformerModel : IModel
         }
 
         long rowBytes = (long)hiddenSize * sizeof(float);
+        if (_weights.TokenEmbeddingRows is { } chunkedRows)
+        {
+            // #778: widened table over maxStorageBufferRange, held as row chunks.
+            chunkedRows.NoteTransfers(_device.ActiveHazards, _state.HiddenState.Handle);
+            for (int t = 0; t < tokenIds.Length; t++)
+            {
+                int id = tokenIds[t];
+                if ((uint)id >= (uint)Config.VocabSize)
+                    throw new ArgumentOutOfRangeException(nameof(tokenIds), $"Token id {id} is out of range");
+                chunkedRows.RecordRowCopy(cmdBuf, id, _state.HiddenState, (long)t * rowBytes);
+            }
+            return;
+        }
         var srcBuf = _weights.TokenEmbedding.Handle;
         var dstBuf = _state.HiddenState.Handle;
         // One hazard declaration covers the whole gather: every copy reads the
@@ -7384,6 +7643,10 @@ public sealed class VulkanTransformerModel : IModel
         _moeBroadcast?.Dispose();
         _moeWeightedScatter?.Dispose();
         _moeUngroupScatter?.Dispose();
+        _gemma4GroupedQ4K?.Dispose();
+        _gemma4GroupedQ5_1?.Dispose();
+        _gemma4GroupedQ8_0?.Dispose();
+        _gemma4MoeBuildTileList?.Dispose();
         _moeGroupedMatmulF16Coopmat?.Dispose();
         _moeExpandGroupByExpert?.Dispose();
         _moeExpertOffsets?.Dispose();
@@ -7399,6 +7662,7 @@ public sealed class VulkanTransformerModel : IModel
         _moeIndexedMatmulQ8?.Dispose();
         _moeIndexedMatmul?.Dispose();
         _moeTopkSoftmax?.Dispose();
+        _moeTopkSigmoid?.Dispose();
         _mlaKvSplit?.Dispose();
         _mlaRope?.Dispose();
         _mlaAttention?.Dispose();
@@ -7421,6 +7685,7 @@ public sealed class VulkanTransformerModel : IModel
         _rope.Dispose();
         _ropeInvFreq?.Dispose();
         _ropeInvFreqBuf?.Dispose();
+        _globalRopeInvFreqBuf?.Dispose();
         _ropeKvWrite?.Dispose();
         _rmsnorm.Dispose();
         _rmsnormMatmulQ8Fused?.Dispose();

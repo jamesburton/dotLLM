@@ -251,6 +251,18 @@ public static class HfConfigExtractor
             BetaFast: ropeScalingBetaFast,
             BetaSlow: ropeScalingBetaSlow);
 
+        // Gemma 3 dual RoPE (HF Gemma3TextModel: rotary_emb for full-attention layers at rope_theta
+        // (+ linear rope_scaling), rotary_emb_local for sliding layers at rope_local_base_freq, default
+        // 10000, unscaled). RoPEConfig carries the LOCAL table; GlobalRoPEConfig the global one, selected
+        // per layer by IsFullAttentionLayer. Before this the model ran every layer on the global theta.
+        RoPEConfig? globalRopeConfig = null;
+        if (architecture == Architecture.Gemma3)
+        {
+            globalRopeConfig = ropeConfig;
+            float localTheta = GetFloatOrDefault(root, "rope_local_base_freq", 10000.0f);
+            ropeConfig = new RoPEConfig(Theta: localTheta, DimensionCount: headDim, Type: ropeType);
+        }
+
         return new ModelConfig
         {
             Architecture = architecture,
@@ -265,6 +277,7 @@ public static class HfConfigExtractor
             AttentionType = isMla ? AttentionType.MLA : AttentionType.GQA,
             PositionEncodingType = PositionEncodingType.RoPE,
             RoPEConfig = ropeConfig,
+            GlobalRoPEConfig = globalRopeConfig,
             ActivationFunction = activation,
             NormType = NormType.RMSNorm,
             NormEpsilon = normEps,
@@ -279,12 +292,28 @@ public static class HfConfigExtractor
             // so the forward-path multiply is a no-op there.
             EmbeddingScale = architecture is Architecture.Gemma3 or Architecture.Gemma4
                 ? MathF.Sqrt(hiddenSize)
-                : null,
+                : architecture is Architecture.Granite or Architecture.GraniteMoe && GetFloatOrDefault(root, "embedding_multiplier", 1.0f) is var gEmb && gEmb != 1.0f
+                    ? gEmb : null,
+            // Granite scalars (#313). HF GraniteConfig defaults every multiplier to 1.0 (including
+            // attention_multiplier, i.e. a literal score scale of 1, NOT 1/sqrt(head_dim)); real checkpoints
+            // always set them. residual/logits of 1.0 collapse to "none".
+            AttentionScale = architecture is Architecture.Granite or Architecture.GraniteMoe
+                ? GetFloatOrDefault(root, "attention_multiplier", 1.0f) : null,
+            ResidualScale = architecture is Architecture.Granite or Architecture.GraniteMoe
+                && GetFloatOrDefault(root, "residual_multiplier", 1.0f) is var gRes && gRes != 1.0f ? gRes : null,
+            LogitScale = architecture is Architecture.Granite or Architecture.GraniteMoe
+                && GetFloatOrDefault(root, "logits_scaling", 1.0f) is var gLog && gLog != 1.0f ? gLog : null,
             MlaConfig = mla,
             Moe = moe,
             PerLayerEmbedding = perLayerEmbedding,
             ChatTemplate = null,
             NoRopeLayers = noRopeLayers,
+            // OLMoE: one RMSNorm over the whole Q/K projection (see ModelConfig.QkNormWholeProjection).
+            QkNormWholeProjection = architecture == Architecture.QwenMoe
+                && (string.Equals(GetStringOrDefault(root, "model_type", null), "olmoe", StringComparison.OrdinalIgnoreCase)
+                    || (root.TryGetProperty("architectures", out var olmoeArchs) && olmoeArchs.ValueKind == JsonValueKind.Array
+                        && olmoeArchs.GetArrayLength() > 0
+                        && (olmoeArchs[0].GetString() ?? "").Contains("olmoe", StringComparison.OrdinalIgnoreCase))),
         };
     }
 
@@ -676,8 +705,20 @@ public static class HfConfigExtractor
             // Must be checked before `Llama` / `Mistral` fall-throughs because the
             // base "Granite" name doesn't collide but the MoE-specific tensor
             // layout requires its own loader path.
+            // GraniteMoeShared / GraniteMoeHybrid add an ungated shared-expert branch (and Mamba layers) the
+            // fused-expert loader does not implement: refuse instead of silently mapping them to GraniteMoe.
+            (var a, _) when a is not null && (a.Contains("granitemoeshared") || a.Contains("granitemoehybrid")) =>
+                throw new NotSupportedException(
+                    $"HF architecture '{archName}' (Granite MoE with a shared-expert / hybrid Mamba branch) is not implemented; "
+                    + "loading it as plain GraniteMoe would silently drop the shared branch. See https://github.com/jamesburton/dotLLM/issues/764."),
+            (_, "granitemoeshared" or "granitemoehybrid" or "granite_moe_shared" or "granite_moe_hybrid") =>
+                throw new NotSupportedException(
+                    $"HF model_type '{modelType}' (Granite MoE shared / hybrid) is not implemented. See https://github.com/jamesburton/dotLLM/issues/764."),
             (var a, _) when a is not null && a.Contains("granitemoe") => Architecture.GraniteMoe,
             (_, "granitemoe" or "granite_moe") => Architecture.GraniteMoe,
+            // Granite-3.x / 4.x dense — `GraniteForCausalLM` / `model_type=granite`: Llama tensors + 4 scalars.
+            (var a, _) when a is not null && a.Contains("graniteforcausallm") => Architecture.Granite,
+            (_, "granite") => Architecture.Granite,
             // SmolLM3 — `SmolLM3ForCausalLM` / `model_type=smollm3`. Llama-shaped
             // tensors but carries `no_rope_layers` mask + (optional) YaRN scaling.
             (var a, _) when a is not null && a.Contains("smollm3") => Architecture.SmolLM3,

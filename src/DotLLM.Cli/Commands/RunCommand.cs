@@ -774,7 +774,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                         break;
                     }
                 }
-                detectedToolCalls = toolCallParser.TryParse(outputText);
+                detectedToolCalls = toolCallParser.TryParse(outputText, tools);
                 if (detectedToolCalls is { Length: > 0 })
                     finishReason = FinishReason.ToolCalls;
             }

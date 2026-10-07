@@ -37,6 +37,7 @@ public static class RequestConverter
                 Content = d.Content ?? "",
                 ToolCalls = toolCalls,
                 ToolCallId = d.ToolCallId,
+                ReasoningContent = d.ReasoningContent ?? d.Reasoning,
             };
         }
         return result;

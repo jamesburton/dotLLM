@@ -73,11 +73,41 @@ public sealed record ChatCompletionRequest
     public string? ServiceTier { get; init; }
 
     /// <summary>
-    /// Reasoning-budget hint for o-series models. Accepted and ignored (#450).
+    /// Reasoning-effort hint (#767). Passed to the chat template as <c>reasoning_effort</c>, so a
+    /// template that understands it (Qwen3.x: <c>low</c>/<c>medium</c>/<c>xhigh</c>) honours it and one
+    /// that rejects the value yields a 400. <c>none</c> is OpenAI's "do not reason" and maps to
+    /// <c>enable_thinking=false</c> unless that was given explicitly. Templates with no such variable ignore it.
     /// </summary>
     [JsonPropertyName("reasoning_effort")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? ReasoningEffort { get; init; }
+
+    /// <summary>
+    /// Turns the model's thinking on or off by setting the template's <c>enable_thinking</c> variable
+    /// (vLLM / llama.cpp convention; Qwen3.x, Bonsai, GLM). Null = the template's default. Equivalent to
+    /// <c>chat_template_kwargs.enable_thinking</c>, which it overrides.
+    /// </summary>
+    [JsonPropertyName("enable_thinking")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? EnableThinking { get; init; }
+
+    /// <summary>
+    /// Arbitrary extra variables for the chat template's Jinja context (vLLM / llama.cpp
+    /// <c>chat_template_kwargs</c>), e.g. <c>{"enable_thinking": false, "preserve_thinking": true}</c>.
+    /// They cannot replace <c>messages</c>, <c>tools</c>, <c>add_generation_prompt</c>, <c>bos_token</c>
+    /// or <c>eos_token</c>.
+    /// </summary>
+    [JsonPropertyName("chat_template_kwargs")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, JsonElement>? ChatTemplateKwargs { get; init; }
+
+    /// <summary>
+    /// Per-request override of the server's <c>--reasoning-format</c>: <c>none</c>, <c>auto</c> or
+    /// <c>deepseek</c> (#767). Null = the server setting.
+    /// </summary>
+    [JsonPropertyName("reasoning_format")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReasoningFormat { get; init; }
 
     /// <summary>
     /// Opaque client key/value tags. Accepted and ignored (#450).
@@ -263,6 +293,20 @@ public sealed record ChatMessageDto
 
     [JsonPropertyName("tool_call_id")]
     public string? ToolCallId { get; init; }
+
+    /// <summary>
+    /// The assistant's reasoning, split from <see cref="Content"/> (#767). On a response it is the
+    /// model's thinking; on a request it is replayed to the chat template (Qwen3.x renders it back into
+    /// the history unless <c>preserve_thinking</c> is false). <c>reasoning</c> is accepted as an alias.
+    /// </summary>
+    [JsonPropertyName("reasoning_content")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReasoningContent { get; init; }
+
+    /// <summary>Request-side alias of <see cref="ReasoningContent"/> (OpenRouter / some clients).</summary>
+    [JsonPropertyName("reasoning")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Reasoning { get; init; }
 }
 
 /// <summary>

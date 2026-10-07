@@ -104,6 +104,11 @@ public sealed record ChatDeltaDto
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Content { get; init; }
 
+    /// <summary>Incremental reasoning text (#767), streamed separately from <see cref="Content"/>.</summary>
+    [JsonPropertyName("reasoning_content")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReasoningContent { get; init; }
+
     [JsonPropertyName("tool_calls")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public ToolCallDto[]? ToolCalls { get; init; }

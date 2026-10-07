@@ -1,0 +1,110 @@
+#version 450
+// MoE router top-k with SIGMOID scoring and a selection bias — DeepSeek-V3 / GLM-4.7-Flash
+// (llama.cpp LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID in build_moe_ffn):
+//   p[e]   = sigmoid(logit[e])
+//   sel[e] = p[e] + bias[e]            (bias = exp_probs_b; selection ONLY)
+//   top-k  = argmax over sel (lower index wins ties)
+//   w[slot] = p[idx]                   (the UNBIASED probability)
+//   if normTopKProb: w /= max(sum(w), 6.103515625e-5)
+//   w *= weightsScale
+// Mirrors DotLLM.Cpu.Kernels.MoeSwiGluMlp.Route(sigmoidGating: true, ...).
+//
+// Dispatch: local_size_x = 64, groupCount.x = seqLen. numExperts <= 256, k <= 16.
+//
+// Buffers:
+//   logits  : [seqLen, numExperts] F32
+//   bias    : [numExperts]         F32
+//   indices : [seqLen, k]          int32
+//   weights : [seqLen, k]          F32
+
+#define MAX_EXPERTS    256u
+#define WG_SIZE        64u
+#define MAX_K          16u
+#define NEG_INF        (-3.4e38)
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufLogits  { float logits[];  };
+layout(set = 0, binding = 1, std430) readonly  buffer BufBias    { float biasv[];   };
+layout(set = 0, binding = 2, std430) writeonly buffer BufIdx     { int   indices[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer BufWeights { float weights[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint  seqLen;
+    uint  numExperts;
+    uint  k;
+    uint  normTopKProb;   // 0 = no, 1 = yes
+    float weightsScale;
+} pc;
+
+shared float sel[MAX_EXPERTS];     // selection score (consumed by the argmax rounds)
+shared float rawp[MAX_EXPERTS];    // unbiased sigmoid probabilities
+shared float reduceScratch[WG_SIZE];
+shared int   reduceIdx[WG_SIZE];
+shared int   sharedIdx[MAX_K];
+shared float sharedWeight[MAX_K];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    if (t >= pc.seqLen) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint logitBase = t * pc.numExperts;
+
+    for (uint e = tid; e < pc.numExperts; e += WG_SIZE) {
+        float p = 1.0 / (1.0 + exp(-logits[logitBase + e]));
+        rawp[e] = p;
+        sel[e]  = p + biasv[e];
+    }
+    barrier();
+
+    for (uint slot = 0u; slot < pc.k; slot++) {
+        float bv = NEG_INF;
+        int   bi = -1;
+        for (uint e = tid; e < pc.numExperts; e += WG_SIZE) {
+            float v = sel[e];
+            if (v > bv) { bv = v; bi = int(e); }
+        }
+        reduceScratch[tid] = bv;
+        reduceIdx[tid] = bi;
+        barrier();
+        for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                float ov = reduceScratch[tid + stride];
+                int   oi = reduceIdx[tid + stride];
+                float mv = reduceScratch[tid];
+                int   mi = reduceIdx[tid];
+                if (ov > mv || (ov == mv && oi >= 0 && (mi < 0 || oi < mi))) {
+                    reduceScratch[tid] = ov;
+                    reduceIdx[tid] = oi;
+                }
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            int bestIdx = reduceIdx[0];
+            sharedIdx[slot] = bestIdx;
+            sharedWeight[slot] = (bestIdx >= 0) ? rawp[uint(bestIdx)] : 0.0;
+            if (bestIdx >= 0) sel[uint(bestIdx)] = NEG_INF;  // mark claimed
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        if (pc.normTopKProb != 0u) {
+            float sw = 0.0;
+            for (uint slot = 0u; slot < pc.k; slot++) sw += sharedWeight[slot];
+            float invSw = 1.0 / max(sw, 6.103515625e-5);
+            for (uint slot = 0u; slot < pc.k; slot++) sharedWeight[slot] *= invSw;
+        }
+        if (pc.weightsScale != 1.0) {
+            for (uint slot = 0u; slot < pc.k; slot++) sharedWeight[slot] *= pc.weightsScale;
+        }
+    }
+    barrier();
+
+    if (tid < pc.k) {
+        indices[t * pc.k + tid] = sharedIdx[tid];
+        weights[t * pc.k + tid] = sharedWeight[tid];
+    }
+}

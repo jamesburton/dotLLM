@@ -8,6 +8,7 @@ using DotLLM.Engine.Scheduler;
 using DotLLM.HuggingFace;
 using DotLLM.Server.RateLimiting;
 using DotLLM.Tokenizers;
+using DotLLM.Tokenizers.Reasoning;
 
 namespace DotLLM.Server.Endpoints;
 
@@ -20,8 +21,10 @@ namespace DotLLM.Server.Endpoints;
 /// <para>
 /// A shim over the existing paths: model names are profiles / local models / ollama names (<see cref="ServerState.EnsureActiveAsync"/>), requests
 /// run through the same generator (streaming) or scheduler (non-streaming) as <c>/v1/*</c>, and the profile's system prompt and sampling defaults apply.
-/// Not covered, and answered with a clear 501: <c>create</c>, <c>copy</c>, <c>push</c>, and tools / images / thinking
-/// inside chat (use <c>/v1/chat/completions</c>). <c>pull</c> and <c>delete</c> need <c>--allow-model-admin</c> like <c>/v1/models/*</c>.
+/// Not covered, and answered with a clear 501: <c>create</c>, <c>copy</c>, <c>push</c>, and tools / images
+/// inside chat (use <c>/v1/chat/completions</c>). Thinking is supported (#767): <c>think</c> (bool, or a
+/// <c>low</c>/<c>medium</c>/<c>high</c> level) goes to the chat template, and the model's reasoning comes back in
+/// <c>message.thinking</c> (<c>thinking</c> on <c>/api/generate</c>), streamed as separate chunks. <c>pull</c> and <c>delete</c> need <c>--allow-model-admin</c> like <c>/v1/models/*</c>.
 /// </para>
 /// <para>Responses are written with <see cref="Utf8JsonWriter"/> directly: ollama's shapes are small and this keeps the surface reflection-free.</para>
 /// </remarks>
@@ -133,6 +136,21 @@ public static class OllamaApiEndpoint
 
     private static string? Str(JsonElement e, string name) =>
         e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+    /// <summary>
+    /// ollama's <c>think</c>: <c>true</c>/<c>false</c>, or a level string (<c>low</c>/<c>medium</c>/<c>high</c>), which
+    /// means "think" and is handed to the template as <c>reasoning_effort</c>. Absent leaves the template default.
+    /// </summary>
+    internal static void ParseThink(JsonElement root, out bool? think, out string? level)
+    {
+        think = null;
+        level = null;
+        if (!root.TryGetProperty("think", out var p))
+            return;
+        if (p.ValueKind == JsonValueKind.True) think = true;
+        else if (p.ValueKind == JsonValueKind.False) think = false;
+        else if (p.ValueKind == JsonValueKind.String) { think = true; level = p.GetString(); }
+    }
 
     private static string? ModelName(JsonElement root) => Str(root, "model") ?? Str(root, "name");
 
@@ -351,16 +369,31 @@ public static class OllamaApiEndpoint
             return;
         }
 
+        // (#767) `think` -> the template's enable_thinking (and a level string -> reasoning_effort). A `format`
+        // (JSON / schema) constrains decoding from the first token and cannot coexist with an open think block,
+        // so it defaults thinking off unless `think: true` was asked for.
+        var options = BuildOptions(root, state.EffectiveSamplingDefaults, new ThreadingConfig(state.Options.Threads, state.Options.DecodeThreads));
+        bool constrained = options.ResponseFormat is not (null or ResponseFormat.Text);
+        ParseThink(root, out bool? think, out string? thinkLevel);
+        var templateOptions = ReasoningSupport.BuildTemplateOptions(null, think, thinkLevel, null, constrained);
+
         string finalPrompt;
         if (chat)
         {
             if (!root.TryGetProperty("messages", out var ms) || ms.ValueKind != JsonValueKind.Array) { await Error(c, 400, "messages is required"); return; }
             var messages = new List<ChatMessage>();
             foreach (var m in ms.EnumerateArray())
-                messages.Add(new ChatMessage { Role = Str(m, "role") ?? "user", Content = Str(m, "content") ?? "" });
+                messages.Add(new ChatMessage
+                {
+                    Role = Str(m, "role") ?? "user",
+                    Content = Str(m, "content") ?? "",
+                    // ollama replays an earlier turn's reasoning in `thinking`; the template decides whether to render it.
+                    ReasoningContent = Str(m, "thinking"),
+                });
             if (messages.Count == 0) { await Error(c, 400, "messages must not be empty"); return; }
-            finalPrompt = state.ChatTemplate.Apply(ProfileSystemPrompt.Apply(state.ActiveProfile?.System, messages.ToArray()),
-                new ChatTemplateOptions { AddGenerationPrompt = true });
+            if (!ReasoningSupport.TryApply(state.ChatTemplate, ProfileSystemPrompt.Apply(state.ActiveProfile?.System, messages.ToArray()),
+                    templateOptions, out finalPrompt, out string? chatErr, out _))
+            { await Error(c, 400, chatErr!); return; }
         }
         else if (root.TryGetProperty("raw", out var raw) && raw.ValueKind == JsonValueKind.True)
             finalPrompt = prompt!;
@@ -369,22 +402,33 @@ public static class OllamaApiEndpoint
             var messages = new List<ChatMessage>();
             if (Str(root, "system") is { Length: > 0 } sys) messages.Add(new ChatMessage { Role = "system", Content = sys });
             messages.Add(new ChatMessage { Role = "user", Content = prompt! });
-            finalPrompt = state.ChatTemplate.Apply(ProfileSystemPrompt.Apply(state.ActiveProfile?.System, messages.ToArray()),
-                new ChatTemplateOptions { AddGenerationPrompt = true });
+            if (!ReasoningSupport.TryApply(state.ChatTemplate, ProfileSystemPrompt.Apply(state.ActiveProfile?.System, messages.ToArray()),
+                    templateOptions, out finalPrompt, out string? genErr, out _))
+            { await Error(c, 400, genErr!); return; }
         }
 
-        var options = BuildOptions(root, state.EffectiveSamplingDefaults, new ThreadingConfig(state.Options.Threads, state.Options.DecodeThreads));
+        var plan = ReasoningSupport.Plan(state.Options.ReasoningFormat, null, constrained, finalPrompt, out _);
+        options = plan.Gate(options, ReasoningSupport.UngatedStops);
         bool stream = !(root.TryGetProperty("stream", out var sv) && sv.ValueKind == JsonValueKind.False);
         string modelId = state.Options.ModelId;
         var generator = state.Generator;
         string created() => DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture);
 
-        void Chunk(Utf8JsonWriter w, string text, bool done, string? doneReason, InferenceTimings? t, int evalCount, double totalMs)
+        void Chunk(Utf8JsonWriter w, string text, bool done, string? doneReason, InferenceTimings? t, int evalCount, double totalMs, string? thinking = null)
         {
             w.WriteStartObject();
             w.WriteString("model", modelId); w.WriteString("created_at", created());
-            if (chat) { w.WriteStartObject("message"); w.WriteString("role", "assistant"); w.WriteString("content", text); w.WriteEndObject(); }
-            else w.WriteString("response", text);
+            if (chat)
+            {
+                w.WriteStartObject("message"); w.WriteString("role", "assistant"); w.WriteString("content", text);
+                if (thinking is not null) w.WriteString("thinking", thinking);
+                w.WriteEndObject();
+            }
+            else
+            {
+                w.WriteString("response", text);
+                if (thinking is not null) w.WriteString("thinking", thinking);
+            }
             w.WriteBoolean("done", done);
             if (done)
             {
@@ -414,9 +458,10 @@ public static class OllamaApiEndpoint
             RateLimitMiddleware.GetLease(c)?.ReportActualTokens(result!.PromptTokenCount + result.GeneratedTokenCount);
             c.Response.ContentType = "application/json; charset=utf-8";
             using var ms2 = new MemoryStream();
+            var (reasoning, answer, _) = plan.SplitComplete(result!.Text, state.Tokenizer);
             using (var w = new Utf8JsonWriter(ms2))
-                Chunk(w, result!.Text, true, result.FinishReason == FinishReason.Length ? "length" : "stop", result.Timings, result.GeneratedTokenCount,
-                    System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds);
+                Chunk(w, answer, true, result.FinishReason == FinishReason.Length ? "length" : "stop", result.Timings, result.GeneratedTokenCount,
+                    System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds, reasoning);
             await c.Response.Body.WriteAsync(ms2.ToArray(), ct);
             return;
         }
@@ -426,6 +471,21 @@ public static class OllamaApiEndpoint
         int generated = 0;
         FinishReason? finish = null;
         InferenceTimings? timings = null;
+        var splitter = plan.NewSplitter();
+        async Task Send(string text, string? thinking)
+        {
+            using var ms3 = new MemoryStream();
+            using (var w = new Utf8JsonWriter(ms3)) Chunk(w, text, false, null, null, 0, 0, thinking);
+            ms3.WriteByte((byte)'\n');
+            await c.Response.Body.WriteAsync(ms3.ToArray(), ct);
+            await c.Response.Body.FlushAsync(ct);
+        }
+        async Task Emit(ReasoningChunk chunk)
+        {
+            // Reasoning and answer go out as separate chunks (reasoning first), as ollama does.
+            if (chunk.Reasoning.Length > 0) await Send("", chunk.Reasoning);
+            if (chunk.Content.Length > 0) await Send(chunk.Content, null);
+        }
         await state.ExecuteAsync(async () =>
         {
             await foreach (var token in generator.GenerateStreamingTokensAsync(finalPrompt, options, ct))
@@ -433,15 +493,12 @@ public static class OllamaApiEndpoint
                 if (token.Text.Length > 0)
                 {
                     generated++;
-                    using var ms3 = new MemoryStream();
-                    using (var w = new Utf8JsonWriter(ms3)) Chunk(w, token.Text, false, null, null, 0, 0);
-                    ms3.WriteByte((byte)'\n');
-                    await c.Response.Body.WriteAsync(ms3.ToArray(), ct);
-                    await c.Response.Body.FlushAsync(ct);
+                    await Emit(splitter is null ? new ReasoningChunk("", token.Text) : splitter.Feed(token.Text));
                 }
                 if (token.FinishReason.HasValue) finish = token.FinishReason;
                 if (token.Timings.HasValue) timings = token.Timings;
             }
+            if (splitter is not null) await Emit(splitter.Finish());
         }, ct);
 
         RateLimitMiddleware.GetLease(c)?.ReportActualTokens((timings?.PrefillTokenCount ?? 0) + generated);

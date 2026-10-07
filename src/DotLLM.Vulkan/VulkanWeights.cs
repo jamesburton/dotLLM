@@ -113,6 +113,15 @@ internal sealed class VulkanWeights : IDisposable
         public readonly VulkanDevice.Buffer? SharedExpertGate;
         public readonly QuantizationType SharedExpertGateDeviceQuantType;
 
+        /// <summary>DeepSeek-V3 / GLM-4.7-Flash sigmoid router (#742); false = softmax.</summary>
+        public bool SigmoidGating { get; init; }
+
+        /// <summary>Per-expert selection bias <c>[numExperts]</c> F32 (sigmoid router only, #742).</summary>
+        public VulkanDevice.Buffer? SelectionBias { get; init; }
+
+        /// <summary>Scale applied to the final top-k weights (<c>expert_weights_scale</c>), #742.</summary>
+        public float WeightsScale { get; init; } = 1.0f;
+
         public readonly int NumExperts;
         public readonly int NumExpertsPerTok;
         public readonly int HiddenSize;
@@ -500,7 +509,14 @@ internal sealed class VulkanWeights : IDisposable
     private readonly LayerBuffers[] _layers;
 
     public LayerBuffers[] Layers => _layers;
+    /// <summary>
+    /// Device token-embedding table. When the widened F32 table would exceed the device's
+    /// <c>maxStorageBufferRange</c> (#778) this is a 64-byte stub and <see cref="TokenEmbeddingRows"/> holds the rows.
+    /// </summary>
     public VulkanDevice.Buffer TokenEmbedding { get; }
+
+    /// <summary>Row-chunked F32 table, or <c>null</c> when <see cref="TokenEmbedding"/> is the real table.</summary>
+    public VulkanChunkedRowTable? TokenEmbeddingRows { get; private set; }
 
     /// <summary>
     /// Byte layout the token-embedding table actually holds on the device:
@@ -630,6 +646,7 @@ internal sealed class VulkanWeights : IDisposable
         // A non-first pipeline stage never gathers (seeded from hidden state),
         // so it stubs the slot — same contract as the MoE/MLA stub buffers.
         VulkanDevice.Buffer tokenEmbed;
+        VulkanChunkedRowTable? tokenEmbedRows = null;
         QuantizationType tokenEmbedDeviceQt = QuantizationType.F32;
         if (skipTokenEmbed)
         {
@@ -638,9 +655,22 @@ internal sealed class VulkanWeights : IDisposable
         }
         else
         {
-            tokenEmbed = UploadTokenEmbedding(device, staging, weights, spvDir,
-                out long tokenEmbedBytes, out tokenEmbedDeviceQt);
-            totalBytes += tokenEmbedBytes;
+            if (!KeepEmbedQ8_0OnDevice(weights.TokenEmbedQuantType, weights.HiddenSize, spvDir)
+                && VulkanChunkedRowTable.NeedsChunking(device, weights.VocabSize, (long)weights.HiddenSize * sizeof(float)))
+            {
+                // #778: widened table over maxStorageBufferRange -> row chunks (CPU-widened per chunk).
+                tokenEmbedRows = VulkanChunkedRowTable.Create(device, staging,
+                    weights.TokenEmbedWeight, weights.TokenEmbedQuantType, weights.VocabSize, weights.HiddenSize);
+                LastTokenEmbedDequantPath = "cpu-chunked";
+                tokenEmbed = device.AllocateDeviceLocal(64);
+                totalBytes += tokenEmbedRows.TotalBytes;
+            }
+            else
+            {
+                tokenEmbed = UploadTokenEmbedding(device, staging, weights, spvDir,
+                    out long tokenEmbedBytes, out tokenEmbedDeviceQt);
+                totalBytes += tokenEmbedBytes;
+            }
         }
 
         // Upload an arbitrary layer window [firstLayer .. firstLayer+numLayers): the local LayerBuffers
@@ -924,12 +954,14 @@ internal sealed class VulkanWeights : IDisposable
 
         LastResidencyReport = _residencyReport;
 
-        return new VulkanWeights(
+        var built = new VulkanWeights(
             device, tokenEmbed, tokenEmbedDeviceQt, weights.VocabSize, weights.HiddenSize,
             layerBuffers,
             outputNorm, outputWeight, outputDeviceQt,
             weights.OutputOutputDim, weights.OutputInputDim,
             totalBytes);
+        built.TokenEmbeddingRows = tokenEmbedRows;
+        return built;
     }
 
     /// <summary>
@@ -1943,7 +1975,14 @@ internal sealed class VulkanWeights : IDisposable
             numSharedExperts: hasShared ? numShared : 0,
             sharedExpertGate: sharedExpertGate,
             sharedExpertGateDeviceQt: sharedExpertGateDeviceQt,
-            gptOss: gptOssExtras);
+            gptOss: gptOssExtras)
+        {
+            SigmoidGating = moe.SigmoidGating,
+            SelectionBias = moe.SigmoidGating
+                ? UploadNormVec(device, vecStage, moe.SelectionBias ?? new float[numE])
+                : null,
+            WeightsScale = moe.WeightsScale,
+        };
     }
 
     /// <summary>
@@ -2866,6 +2905,7 @@ internal sealed class VulkanWeights : IDisposable
     public void Dispose()
     {
         TokenEmbedding.Dispose();
+        TokenEmbeddingRows?.Dispose();
         OutputNormWeight.Dispose();
         OutputWeight.Dispose();
         for (int i = 0; i < _layers.Length; i++)

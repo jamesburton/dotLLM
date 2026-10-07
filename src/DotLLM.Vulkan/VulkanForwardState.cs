@@ -113,7 +113,10 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanDevice.Buffer? MoeSiluInter { get; private set; }      // [seqLen * topK, intermediate]
     public VulkanDevice.Buffer? MoeDownRows { get; private set; }       // [seqLen * topK, hidden]
     public VulkanDevice.Buffer? MoeExpertCounts { get; private set; }   // [numExperts] uint32
-    public VulkanDevice.Buffer? MoeExpertOffsets { get; private set; }  // [numExperts + 1] uint32
+    // [numExperts + 1] uint32 group offsets, followed by the (expert, row-tile) work list of the indirect grouped GEMMs (#773);
+    // sized with MoeBuildTileListKernel.OffsetsBufferUints, a superset of the plain offsets array.
+    public VulkanDevice.Buffer? MoeExpertOffsets { get; private set; }
+    public VulkanDevice.Buffer? MoeGroupDispatchArgs { get; private set; }  // 2 x (x, y, z) uint32 indirect-dispatch triples
     public VulkanDevice.Buffer? MoeExpertCounters { get; private set; } // [numExperts] uint32
     public VulkanDevice.Buffer? MoePermutation { get; private set; }    // [seqLen * topK] uint32
     public VulkanDevice.Buffer? MoeGroupedHidden { get; private set; }  // [seqLen * topK, hidden]
@@ -451,7 +454,9 @@ internal sealed class VulkanForwardState : IDisposable
         MoeSiluInter = _device.AllocateDeviceLocal(interBytes);
         MoeDownRows = _device.AllocateDeviceLocal(downBytes);
         MoeExpertCounts = _device.AllocateDeviceLocal(expertCountsBytes);
-        MoeExpertOffsets = _device.AllocateDeviceLocal(expertOffsetsBytes);
+        MoeExpertOffsets = _device.AllocateDeviceLocal(
+            Math.Max(expertOffsetsBytes, Kernels.MoeBuildTileListKernel.OffsetsBufferUints(_moeNumExperts, seqLen * _moeTopK) * sizeof(uint)));
+        MoeGroupDispatchArgs = _device.AllocateDeviceLocal(2 * Kernels.MoeBuildTileListKernel.ArgsStrideBytes);
         MoeExpertCounters = _device.AllocateDeviceLocal(expertCountsBytes);
         MoePermutation = _device.AllocateDeviceLocal(routedRowsBytes);
         MoeGroupedHidden = _device.AllocateDeviceLocal(expandedBytes);
@@ -571,6 +576,7 @@ internal sealed class VulkanForwardState : IDisposable
         MoeDownRows?.Dispose(); MoeDownRows = null;
         MoeExpertCounts?.Dispose(); MoeExpertCounts = null;
         MoeExpertOffsets?.Dispose(); MoeExpertOffsets = null;
+        MoeGroupDispatchArgs?.Dispose(); MoeGroupDispatchArgs = null;
         MoeExpertCounters?.Dispose(); MoeExpertCounters = null;
         MoePermutation?.Dispose(); MoePermutation = null;
         MoeGroupedHidden?.Dispose(); MoeGroupedHidden = null;

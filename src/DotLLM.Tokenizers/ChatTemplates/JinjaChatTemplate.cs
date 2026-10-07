@@ -23,6 +23,15 @@ public sealed class JinjaChatTemplate : IChatTemplate
         _bosToken = bosToken;
         _eosToken = eosToken;
 
+        // Jinja2's default is keep_trailing_newline=False: ONE trailing newline of the template source is
+        // dropped (HF transformers and llama.cpp's minja both do this). Llama-3.x's template ends
+        // "{%- endif %}\n", so without this every prompt ended "<|start_header_id|>assistant<|end_header_id|>\n\n\n"
+        // — an extra blank line the model never saw in training (found while diagnosing #771).
+        if (templateSource.EndsWith("\r\n", StringComparison.Ordinal))
+            templateSource = templateSource[..^2];
+        else if (templateSource.EndsWith('\n'))
+            templateSource = templateSource[..^1];
+
         var lexer = new JinjaLexer(templateSource);
         var tokens = lexer.Tokenize();
         var parser = new JinjaParser(tokens);
@@ -74,16 +83,36 @@ public sealed class JinjaChatTemplate : IChatTemplate
             if (msg.ToolCallId is not null)
                 dict["tool_call_id"] = msg.ToolCallId;
 
+            // Only when present: templates test `message.reasoning_content is string`.
+            if (msg.ReasoningContent is not null)
+                dict["reasoning_content"] = msg.ReasoningContent;
+
             messageList.Add(dict);
         }
 
-        var context = new Dictionary<string, object?>
+        var context = new Dictionary<string, object?>();
+
+        // chat_template_kwargs first so every explicit field below, and the structural variables,
+        // take precedence over a same-named kwarg.
+        if (options.TemplateKwargs is { Count: > 0 })
         {
-            ["messages"] = messageList,
-            ["add_generation_prompt"] = options.AddGenerationPrompt,
-            ["bos_token"] = _bosToken,
-            ["eos_token"] = _eosToken,
-        };
+            foreach (var (key, value) in options.TemplateKwargs)
+                context[key] = ConvertJsonElement(value);
+        }
+
+        // Reasoning switches: inserted only when the client set them, so an unset value stays
+        // *undefined* in the template (a null-valued key is not undefined).
+        if (options.EnableThinking is { } enableThinking)
+            context["enable_thinking"] = enableThinking;
+        if (options.ReasoningEffort is { Length: > 0 } effort)
+            context["reasoning_effort"] = effort;
+        if (options.PreserveThinking is { } preserve)
+            context["preserve_thinking"] = preserve;
+
+        context["messages"] = messageList;
+        context["add_generation_prompt"] = options.AddGenerationPrompt;
+        context["bos_token"] = _bosToken;
+        context["eos_token"] = _eosToken;
 
         // Add tool definitions if present
         if (options.Tools is { Length: > 0 })

@@ -107,6 +107,54 @@ public record ModelConfig
     public float? QueryPreAttnScalar { get; init; }
 
     /// <summary>
+    /// True when the optional Q/K RMSNorm is ONE norm over the whole projection (weight length
+    /// <c>n_heads*head_dim</c> for Q, <c>n_kv_heads*head_dim</c> for K, applied before the head reshape: OLMo 2, OLMoE)
+    /// instead of the per-head norm (<c>head_dim</c> weights, applied per head: Qwen3, Gemma 3). The CPU backend
+    /// discriminates by weight length; the GPU backends must read this flag (a per-head norm over whole-projection
+    /// weights is silently wrong).
+    /// </summary>
+    public bool QkNormWholeProjection { get; init; }
+
+    /// <summary>
+    /// Granite attention multiplier (HF <c>attention_multiplier</c>, GGUF <c>{arch}.attention.scale</c>): the
+    /// score scale <b>itself</b> (not a divisor operand), replacing <c>1/sqrt(head_dim)</c>. Null = default.
+    /// Takes precedence over <see cref="QueryPreAttnScalar"/>. Resolve through <see cref="AttentionScoreScale"/>.
+    /// </summary>
+    public float? AttentionScale { get; init; }
+
+    /// <summary>
+    /// Granite residual multiplier (HF <c>residual_multiplier</c>, GGUF <c>{arch}.residual_scale</c>): every
+    /// sublayer output is scaled by this value BEFORE the residual add (<c>h = h + scale * sublayer(h)</c>),
+    /// for both the attention and the FFN/MoE sublayer. Null = 1 (no scaling).
+    /// </summary>
+    public float? ResidualScale { get; init; }
+
+    /// <summary>
+    /// Granite logit scale (HF <c>logits_scaling</c>, GGUF <c>{arch}.logit_scale</c>): the LM-head logits are
+    /// DIVIDED by this value (llama.cpp <c>ggml_scale(cur, 1/f_logit_scale)</c>). Null = no scaling.
+    /// </summary>
+    public float? LogitScale { get; init; }
+
+    /// <summary>
+    /// True when any Granite-style scalar (<see cref="ResidualScale"/>, <see cref="LogitScale"/>,
+    /// <see cref="AttentionScale"/>) is configured. Backends whose layer loop does not implement them must
+    /// reject such a model rather than produce silently wrong logits (#313).
+    /// </summary>
+    public bool HasGraniteScalars => ResidualScale.HasValue || LogitScale.HasValue || AttentionScale.HasValue;
+
+    /// <summary>
+    /// The attention score multiplier for a layer whose per-head dim is <paramref name="headDim"/>:
+    /// <see cref="AttentionScale"/> if set, else <c>1/sqrt(<see cref="QueryPreAttnScalar"/>)</c> if set,
+    /// else <c>1/sqrt(headDim)</c>. Single source of truth for every backend's score scale.
+    /// </summary>
+    public float AttentionScoreScale(int headDim)
+    {
+        if (AttentionScale is float a && a > 0f) return a;
+        if (QueryPreAttnScalar is float q && q > 0f) return 1.0f / MathF.Sqrt(q);
+        return 1.0f / MathF.Sqrt(headDim);
+    }
+
+    /// <summary>
     /// Interleaved sliding-window pattern period. 0 (default) = the sliding
     /// window (when set) applies to every layer (Mistral convention). N &gt; 0 =
     /// layer <c>il</c> uses the sliding window iff <c>il % N &lt; N - 1</c>

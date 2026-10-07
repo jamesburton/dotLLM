@@ -141,6 +141,14 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [DefaultValue(false)]
         public bool NoMtp { get; set; }
 
+        /// <summary>How reasoning output is split from the answer (#767).</summary>
+        [CommandOption("--reasoning-format")]
+        [Description("How thinking output is separated from the answer: auto (default; split into reasoning_content + content when the chat " +
+                     "template opens a <think> block or the model emits one), deepseek (as auto, and <think> blocks are recognised anywhere in the " +
+                     "output), none (raw output in content, </think> included). Requests may override with reasoning_format.")]
+        [DefaultValue("auto")]
+        public string ReasoningFormat { get; set; } = "auto";
+
         /// <summary>Expected number of concurrent decode streams; 5 or more enables the Vulkan continuous-batch scheduler.</summary>
         [CommandOption("--expected-concurrency")]
         [Description("Expected number of concurrently decoding requests. At 5 or more, Vulkan hybrid models serve through the continuous-batch " +
@@ -312,6 +320,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             SpeculativeCandidates = settings.SpeculativeK,
             MtpEnabled = !settings.NoMtp,
             MtpExplicit = settings.Mtp && !settings.NoMtp,
+            ReasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormats.Parse(settings.ReasoningFormat),
             PrefillChunkSize = settings.PrefillChunkSize,
             KeepAliveSeconds = settings.KeepAlive,
             MaxResidentModels = settings.MaxResidentModels,
