@@ -292,6 +292,13 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
     /// <inheritdoc/>
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
+        // Reject an unrecognised --device up front instead of serving on the CPU (#468/#790).
+        if (DeviceSpec.TryParse(settings.Device, out _, out string? deviceError) is false)
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(deviceError!)}[/]");
+            return 1;
+        }
+
         var serverOptions = new ServerOptions
         {
             Model = settings.Model ?? "",
@@ -352,12 +359,21 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
                 modelId = settings.Model.Split('/')[^1];
             serverOptions = serverOptions with { ModelId = modelId };
 
-            AnsiConsole.Status()
-                .Spinner(Spinner.Known.Dots)
-                .Start("Loading and warming up model...", _ =>
-                {
-                    state = ServerStartup.LoadModel(resolvedPath, serverOptions);
-                });
+            try
+            {
+                AnsiConsole.Status()
+                    .Spinner(Spinner.Known.Dots)
+                    .Start("Loading and warming up model...", _ =>
+                    {
+                        state = ServerStartup.LoadModel(resolvedPath, serverOptions);
+                    });
+            }
+            catch (DeviceUnavailableException ex)
+            {
+                // An explicit GPU that cannot be honoured: clean what/why/opt-in message, failing exit code, never a CPU server (#790).
+                AnsiConsole.MarkupLine($"[red]{Markup.Escape(ex.Message)}[/]");
+                return 1;
+            }
         }
         else
         {
@@ -377,6 +393,11 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             AnsiConsole.MarkupLine(
                 $"  [bold]{state.Config!.Architecture}[/] {state.Config.NumLayers}L/{state.Config.HiddenSize}H | " +
                 $"{Markup.Escape(Path.GetFileName(state.LoadedModelPath))}");
+            // Same device report as run/chat and /props (#790).
+            string reqDev = state.Options.Device, resDev = state.Options.ResolvedDevice ?? state.Options.Device;
+            AnsiConsole.MarkupLine($"  device: {Markup.Escape(string.Equals(reqDev, resDev, StringComparison.OrdinalIgnoreCase) ? resDev : reqDev + " -> " + resDev)}");
+            if (state.DeviceFallbackWarning is { } devWarn)
+                AnsiConsole.MarkupLine($"  [bold yellow]WARNING: {Markup.Escape(devWarn)}[/]");
         }
         else
         {

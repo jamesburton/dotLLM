@@ -376,8 +376,13 @@ architecture.
 ## CLI Usage
 
 ```bash
-# Run on GPU (default: gpu:0)
+# Default is --device auto: CUDA if the model fits, else Vulkan, else CPU (with a warning).
+# The line "device: auto -> vulkan (<GPU name>)" names what was actually used (#790).
+dotllm run SmolLM-135M --prompt "Hello"
+
+# Force CUDA (default ordinal 0) or Vulkan; an unsatisfiable explicit GPU is an error, never a CPU run
 dotllm run SmolLM-135M --prompt "Hello" --device gpu
+dotllm run SmolLM-135M --prompt "Hello" --device vulkan
 
 # Run on specific GPU
 dotllm run model.gguf --prompt "Hello" --device gpu:1
@@ -385,7 +390,7 @@ dotllm run model.gguf --prompt "Hello" --device gpu:1
 # Chat mode on GPU
 dotllm chat model.gguf --device gpu
 
-# CPU (default)
+# CPU only when you ask for it
 dotllm run model.gguf --prompt "Hello" --device cpu
 ```
 

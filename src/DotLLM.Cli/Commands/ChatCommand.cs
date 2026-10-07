@@ -117,14 +117,14 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         /// <summary>Compute device.</summary>
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1' (CUDA). 'vulkan' is not supported by chat yet; use 'run' or 'serve'.")]
-        [DefaultValue("cpu")]
-        public string Device { get; set; } = "cpu";
+        [Description(DeviceCli.OptionHelp)]
+        [DefaultValue(DeviceCli.DefaultDevice)]
+        public string Device { get; set; } = DeviceCli.DefaultDevice;
 
         /// <summary>Number of GPU layers for hybrid offloading.</summary>
         [CommandOption("--gpu-layers")]
-        [Description("Number of transformer layers to offload to GPU. 0 = CPU only. " +
-                     "Omit for default (0 with --device cpu, all with --device gpu).")]
+        [Description("Number of transformer layers to offload to GPU (CUDA). 0 = CPU only. " +
+                     "Omit for default (all layers on a GPU device, 0 with --device cpu). Ignored on vulkan (whole model is device-resident).")]
         public int? GpuLayers { get; set; }
 
         /// <summary>Quantization filter.</summary>
@@ -228,10 +228,10 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
     /// <inheritdoc/>
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
-        // Fail loudly: "vulkan" does not start with "gpu", so it would otherwise run on the CPU silently.
-        if (DotLLM.Vulkan.VulkanModelLoader.IsVulkanDeviceString(settings.Device))
+        // Reject an unrecognised --device up front: it used to fall through to the CPU silently (#468/#790).
+        if (DeviceCli.Validate(settings.Device) is { } deviceError)
         {
-            AnsiConsole.MarkupLine("[red]--device vulkan is not supported by 'chat' yet; use 'run' or 'serve'.[/]");
+            DeviceCli.PrintError(deviceError, json: false);
             return 1;
         }
 
@@ -267,13 +267,19 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         ModelConfig? config = null;
         ITokenizer? tokenizer = null;
         IModel? model = null;
+        Func<int, DotLLM.Core.Attention.IKvCache>? vulkanKv = null;
+        DeviceCli.Outcome deviceOutcome = null!;
 
+        try
+        {
         AnsiConsole.Status()
             .Spinner(Spinner.Known.Dots)
             .Start("Loading model...", ctx =>
             {
                 if (hfDir is not null)
                 {
+                    // Explicit GPU -> error before loading anything; auto -> CPU with a warning (#790).
+                    deviceOutcome = DeviceCli.ResolveCpuOnly(settings.Device, "HuggingFace safetensors checkpoints", Path.GetFileName(hfDir));
                     ctx.Status("Opening HuggingFace safetensors checkpoint...");
                     var threadingCfg = new ThreadingConfig(
                         settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
@@ -297,38 +303,29 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 ctx.Status("Loading tokenizer...");
                 tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
-                int gpuLayers = ResolveGpuLayers(settings, config);
-                if (gpuLayers <= 0)
-                {
-                    var threading = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
-                    ctx.Status($"Loading {config.Architecture} model ({config.NumLayers} layers, {threading.EffectiveThreadCount} threads)...");
-                    // Shared per-architecture CPU dispatch — routes hybrid architectures
-                    // (Nemotron-H, Qwen3MoeHybrid) to their dedicated loaders.
-                    model = ModelLoader.CreateCpuModelFromGguf(gguf, config, threading);
-                }
-                else if (gpuLayers >= config.NumLayers)
-                {
-                    int gpuId = settings.Device.IndexOf(':') is int ci and > 0
-                        ? int.Parse(settings.Device.AsSpan(ci + 1))
-                        : 0;
-                    ctx.Status($"Loading {config.Architecture} model on GPU {gpuId}...");
-                    // Shared per-architecture CUDA dispatch — routes hybrid architectures
-                    // (Qwen3MoeHybrid, Qwen3HybridDense) to their dedicated loaders (#259).
-                    (model, _) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId);
-                }
-                else
-                {
-                    int gpuId = settings.Device.IndexOf(':') is int ci2 and > 0
-                        ? int.Parse(settings.Device.AsSpan(ci2 + 1))
-                        : 0;
-                    var threading = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
-                    ctx.Status($"Loading {config.Architecture} model ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)...");
-                    // #729: per-architecture dispatch; unsupported archs load all-GPU or fail with an actionable error (never a silent CPU fallback).
-                    (model, _) = DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(
-                        gguf, config, gpuLayers, gpuId, threading,
-                        w => Console.Error.WriteLine($"WARNING: {w}"));
-                }
+                ctx.Status($"Loading {config.Architecture} model on {settings.Device} ({config.NumLayers} layers)...");
+                // THE shared dispatch (#790) behind serve/run/chat: resolves --device (auto = CUDA, then Vulkan, then CPU with a
+                // warning), loads per architecture (Vulkan #259, CUDA full/partial #729/#291, CPU hybrids), and refuses to turn an
+                // explicit GPU request into a CPU run.
+                DotLLM.Server.DeviceLoadResult loaded;
+                (loaded, deviceOutcome) = DeviceCli.Load(gguf, config, settings.Device, settings.GpuLayers,
+                    new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly),
+                    resolvedPath);
+                model = loaded.Model;
+                vulkanKv = loaded.IsVulkan ? loaded.KvCacheFactory : null;   // CUDA/hybrid models build their caches from the model type below
             });
+        }
+        catch (DotLLM.Server.DeviceUnavailableException ex)
+        {
+            // An explicit device that cannot be honoured: a clean what/why/opt-in message and a failing exit code, never a CPU run.
+            DeviceCli.PrintError(ex.Message, json: false);
+            gguf?.Dispose();
+            safetensorsSource?.Dispose();
+            return 1;
+        }
+
+        // Resolved device line + (for auto on the CPU) the prominent warning, printed after the spinner so it stays visible.
+        DeviceCli.Report(deviceOutcome, json: false);
 
         // Display VRAM warning after spinner completes (so it stays visible)
         string? vramWarning = (model as DotLLM.Cuda.CudaTransformerModel)?.VramWarning
@@ -430,9 +427,10 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         var quantLabel = InferQuantLabel(resolvedPath, settings.Quant);
         var samplingLabel = BuildSamplingLabel(settings);
         var deviceLabel = model is DotLLM.Cuda.CudaTransformerModel
-            ? DotLLM.Cuda.CudaDevice.GetDevice(settings.Device.IndexOf(':') is int ci and > 0
-                ? int.Parse(settings.Device.AsSpan(ci + 1)) : 0).ToString()
-            : $"{threadingInfo.EffectiveThreadCount} threads";
+            ? DotLLM.Cuda.CudaDevice.GetDevice(DeviceCli.CudaOrdinal(deviceOutcome.Resolved)).ToString()
+            : vulkanKv is not null
+                ? $"vulkan {DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName}"
+                : $"{threadingInfo.EffectiveThreadCount} threads";
         var toolsLabel = tools is { Length: > 0 } ? $" | {tools.Length} tool(s)" : "";
         var segments = $"{config!.Architecture} {config.NumLayers}L/{config.HiddenSize}H | {quantLabel} | {deviceLabel} | {samplingLabel}{toolsLabel}";
         AnsiConsole.Write(new Rule($"[grey]dotllm chat | {Markup.Escape(segments)}[/]").LeftJustified());
@@ -452,7 +450,16 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         Func<ModelConfig, int, DotLLM.Core.Attention.IKvCache>? kvFactory = null;
         DotLLM.Engine.KvCache.PagedKvCacheFactory? pagedFactory = null;
         DotLLM.Cuda.CudaPagedKvCacheFactory? cudaPagedFactory = null;
-        if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
+        if (vulkanKv is not null)
+        {
+            // Vulkan models own their device-resident KV storage (the factory is the one the shared loader returned). Like serve,
+            // paged / quantized KV are not available on Vulkan and the prefix cache is off (no snapshot/restore of device KV).
+            if (settings.Paged || kvConfig.IsQuantized)
+                AnsiConsole.MarkupLine("[yellow]WARNING: paged / quantized KV-cache is not supported on Vulkan; using the model's own device KV-cache.[/]");
+            var vkFactory = vulkanKv;
+            kvFactory = (cfg, size) => vkFactory(size);
+        }
+        else if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
         {
             if (settings.Paged && kvConfig.IsQuantized)
             {
@@ -510,7 +517,8 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
         }
 
-        PrefixCache? prefixCache = !settings.NoPromptCache
+        // Prefix reuse is CPU-KV only: serve does no cross-request prefix reuse on Vulkan, and chat must not either (#790).
+        PrefixCache? prefixCache = !settings.NoPromptCache && vulkanKv is null
             ? new PrefixCache(settings.PromptCacheSize)
             : null;
 
@@ -835,14 +843,6 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             $"[dim][[{promptTokenCount} prompt tokens{cacheInfo}, {tokenCount} generated tokens, " +
             $"{ttftMs:F0} ms TTFT, {prefillTokSec:F1} prefill tok/s, {decodeTokSec:F1} decode tok/s]][/]");
         Console.WriteLine();
-    }
-
-    private static int ResolveGpuLayers(Settings settings, ModelConfig config)
-    {
-        if (settings.GpuLayers.HasValue)
-            return Math.Clamp(settings.GpuLayers.Value, 0, config.NumLayers);
-        return settings.Device.StartsWith("gpu", StringComparison.OrdinalIgnoreCase)
-            ? config.NumLayers : 0;
     }
 
     private static string InferQuantLabel(string resolvedPath, string? quantFlag)

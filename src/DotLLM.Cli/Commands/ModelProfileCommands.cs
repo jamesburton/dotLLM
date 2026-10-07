@@ -40,7 +40,7 @@ internal sealed class ModelCreateCommand : Command<ModelCreateCommand.Settings>
         public string[]? Stop { get; set; }
 
         [CommandOption("--device|-d")]
-        [Description("Device this model loads on: cpu, vulkan, gpu:0.")]
+        [Description("Device this model loads on: auto, cpu, vulkan, gpu[:N] / cuda[:N].")]
         public string? Device { get; set; }
 
         [CommandOption("--gpu-layers")] public int? GpuLayers { get; set; }
@@ -62,6 +62,13 @@ internal sealed class ModelCreateCommand : Command<ModelCreateCommand.Settings>
         if (string.IsNullOrWhiteSpace(s.From))
         {
             AnsiConsole.MarkupLine("[red]--from <base model> is required.[/]");
+            return 1;
+        }
+
+        // A profile's device is replayed at load time; a typo must not be saved and later mean the CPU (#790).
+        if (s.Device is not null && DeviceCli.Validate(s.Device) is { } deviceError)
+        {
+            AnsiConsole.MarkupLine($"[red]{deviceError.EscapeMarkup()}[/]");
             return 1;
         }
 

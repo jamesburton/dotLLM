@@ -411,6 +411,12 @@ line. The server keeps `auto` as its configured device, so each on-demand load c
 `ResolvedDevice` (what `GET /api/ps` reports as `size_vram`). Pass `cpu`, `gpu:N` or `vulkan` to force one. `dotllm stop --server` and
 `POST /v1/admin/shutdown` stop a running server gracefully (`--allow-model-admin`).
 
+**No silent CPU (#790).** One parser (`DeviceSpec`: `auto`, `cpu`, `vulkan`, `gpu[:N]`/`cuda[:N]`) and one load dispatch (`DeviceModelLoader`) back
+`serve`, `run`, `chat` and `bench`. An unknown value is rejected with the accepted list. An explicit GPU that cannot be honoured (no such device,
+SPIR-V missing, load failure) fails with what/why/model-vs-device-memory and the `--device cpu` opt-in - the server does not start on the CPU.
+`auto` ending on the CPU always sets `device_fallback_warning` in `/props` (no GPU servable, or the GPU load failed and why) and prints it at startup.
+`/props` reports `device` (as requested) and `resolved_device` (as loaded) for every load path, explicit or `auto`; `dotllm ps` shows the same.
+
 ## MTP self-speculation is on by default (#757)
 
 When the loaded GGUF carries an embedded MTP head (`SupportsMtp`; e.g. Qwen3.6-MTP builds), `dotllm serve` enables MTP self-speculative decoding

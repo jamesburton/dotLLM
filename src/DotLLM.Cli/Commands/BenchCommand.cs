@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Text.Json;
 using DotLLM.Cli.Benchmarking;
 using DotLLM.Cli.Diagnostics;
+using DotLLM.Cli.Helpers;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
@@ -34,9 +35,9 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         public string Model { get; set; } = string.Empty;
 
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default), 'vulkan', 'cuda' / 'cuda:1' ('gpu' is an alias for cuda).")]
-        [DefaultValue("cpu")]
-        public string Device { get; set; } = "cpu";
+        [Description(DeviceCli.OptionHelp)]
+        [DefaultValue(DeviceCli.DefaultDevice)]
+        public string Device { get; set; } = DeviceCli.DefaultDevice;
 
         [CommandOption("--prompt-tokens|-p")]
         [Description("Synthetic prompt length in tokens (tiled from the seed prompt).")]
@@ -99,9 +100,8 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
             if (Reps <= 0) return ValidationResult.Error("--reps|-r must be positive.");
             if (Depth < 0) return ValidationResult.Error("--depth must be >= 0.");
             if (NCpuMoeLayers < 0) return ValidationResult.Error("--n-cpu-moe must be >= 0.");
-            string dev = Device.Split(':')[0].ToLowerInvariant();
-            if (dev is not ("cpu" or "vulkan" or "cuda" or "gpu"))
-                return ValidationResult.Error($"Unknown --device '{Device}'. Expected cpu, vulkan, or cuda[:N].");
+            if (DeviceCli.Validate(Device) is { } deviceError)
+                return ValidationResult.Error(deviceError);
             return ValidationResult.Success();
         }
     }
@@ -112,9 +112,10 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         if (ggufPath is null)
             return 1;
 
-        string backend = settings.Device.Split(':')[0].ToLowerInvariant();
-        if (backend == "gpu") backend = "cuda";
-        int gpuId = ParseDeviceOrdinal(settings.Device);
+        // One shared resolution (#790): auto -> CUDA / Vulkan / CPU with a visible line (and a warning on CPU); an explicit GPU that
+        // cannot be honoured is an error, never a CPU measurement.
+        if (!DeviceCli.TryResolveForTool(settings.Device, ggufPath, settings.Json, out string backend, out int gpuId))
+            return 1;
 
         using var gguf = GgufFile.Open(ggufPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
@@ -391,13 +392,6 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
     /// <summary>Replaces whitespace with '-' so device names stay single CSV tokens.</summary>
     private static string SanitizeLabel(string label) =>
         string.Join("-", label.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
-
-    private static int ParseDeviceOrdinal(string device)
-    {
-        int colonIdx = device.IndexOf(':');
-        if (colonIdx < 0) return 0;
-        return int.TryParse(device.AsSpan(colonIdx + 1), out int id) ? id : 0;
-    }
 
     /// <summary>
     /// Resolves the SPIR-V blob directory for Vulkan: <c>spv/</c> next to the running
