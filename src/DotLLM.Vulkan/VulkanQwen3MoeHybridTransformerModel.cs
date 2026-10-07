@@ -175,7 +175,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     /// <summary>
     /// Resident (device-local, packed-quant) MoE banks versus per-layer transient upload. The transient path measured 0.09 tok/s
     /// decode on Qwen3.6-35B-A3B Q4_K_M (3.25 tok/s prefill) against 13-18 / 23-75 tok/s resident (#635), so resident is the default
-    /// whenever the GGUF payload (+15% headroom for KV, scratch and bank re-packing) fits the device-local heap. <c>DOTLLM_VK_MOE_RESIDENT</c>
+    /// whenever the GGUF payload (+15% headroom for KV, scratch and bank re-packing) fits the device's resident capacity (device-local heap, plus the GTT heaps on a UMA iGPU - #812: on the 512 MB BIOS split the 68 GiB device-local heap alone made 122B fall to the 0.01 tok/s transient path). <c>DOTLLM_VK_MOE_RESIDENT</c>
     /// =1 forces it on, =0 forces it off. Synthetic fixtures (no GGUF) keep the transient path.
     /// </summary>
     private static bool ResolveResidentMoe(VulkanDevice device, GgufFile? gguf)
@@ -183,7 +183,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         string? env = Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_RESIDENT");
         if (env == "1") return true;
         if (env == "0" || gguf is null) return false;
-        return gguf.DataSectionLength * 1.15 < device.DeviceLocalHeapBytes();
+        return gguf.DataSectionLength * 1.15 < device.ResidentCapacityBytes();
     }
 
     private VulkanQwen3MoeHybridTransformerModel(
