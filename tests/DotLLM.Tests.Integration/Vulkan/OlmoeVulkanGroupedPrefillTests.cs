@@ -140,7 +140,7 @@ public sealed class OlmoeVulkanGroupedPrefillTests
         int firstDiv = -1;
         for (int i = 0; i < gTok.Length; i++) if (gTok[i] != sTok[i]) { firstDiv = i; break; }
         _output.WriteLine($"greedy 16 tokens from p320: first divergence = {firstDiv}" + (firstDiv >= 0 ? $" (scalar margin {sMargin[firstDiv]:F3})" : " (identical)"));
-        Assert.True(firstDiv < 0 || sMargin[firstDiv] < 0.5f, $"greedy diverged at step {firstDiv} with scalar margin {sMargin[firstDiv]}");
+        Assert.True(firstDiv < 0 || sMargin[firstDiv] < 0.5f, $"greedy diverged at step {firstDiv} with scalar margin {(firstDiv >= 0 ? sMargin[firstDiv] : 0f)}");
 
         // 520 tokens (the #787 repro): grouped only - the scalar path would lose the device here.
         vk.GroupedMoeEnabled = true;

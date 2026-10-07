@@ -232,7 +232,7 @@ public sealed class GptOssVulkanRealModelParityTests
         int firstDiv = -1;
         for (int i = 0; i < MaxNew; i++) if (gTok[i] != sTok[i]) { firstDiv = i; break; }
         _output.WriteLine($"greedy first divergence step: {firstDiv}" + (firstDiv >= 0 ? $" (scalar top1-top2 margin there = {sMargin[firstDiv]:F3} logits)" : ""));
-        Assert.True(firstDiv < 0 || sMargin[firstDiv] < 0.5f, $"greedy text diverged at step {firstDiv} where the scalar margin is {sMargin[firstDiv]} (not a near-tie)");
+        Assert.True(firstDiv < 0 || sMargin[firstDiv] < 0.5f, $"greedy text diverged at step {firstDiv} where the scalar margin is {(firstDiv >= 0 ? sMargin[firstDiv] : 0f)} (not a near-tie)");
     }
 
     private static unsafe (int[] Tokens, float[] Margins) GreedyWithMargins(VulkanTransformerModel vk, DotLLM.Core.Models.ModelConfig config, int[] promptIds)
