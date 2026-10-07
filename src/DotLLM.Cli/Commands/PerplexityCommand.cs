@@ -100,7 +100,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         public string? Quant { get; set; }
 
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default), 'vulkan', 'cuda' / 'cuda:1' ('gpu' is an alias for cuda).")]
+        [Description("Compute device: 'cpu' (default here, so perplexity numbers stay comparable across machines), 'auto', 'vulkan', 'gpu'/'cuda', 'gpu:1'/'cuda:1'. An explicit GPU that cannot be honoured is an error, never a silent CPU run.")]
         [DefaultValue("cpu")]
         public string Device { get; set; } = "cpu";
 
@@ -170,12 +170,9 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         // preference, so it is derived here and --bos only overrides it.
         bool addBos = settings.Bos ?? GgufAddBosResolver.Resolve(gguf.Metadata);
 
-        if (!TryParseDevice(settings.Device, out string backend, out int gpuId))
-        {
-            AnsiConsole.MarkupLine(
-                $"[red]Unknown --device '{Markup.Escape(settings.Device)}'. Expected 'cpu', 'vulkan', 'cuda' or 'cuda:N'.[/]");
+        // One shared parser/resolution (#790): unknown value -> error, explicit GPU that cannot be honoured -> error (never CPU), auto -> best device.
+        if (!Helpers.DeviceCli.TryResolveForTool(settings.Device, resolvedPath, json: false, out string backend, out int gpuId))
             return 1;
-        }
 
         // Both are owned here and released in the finally below. The previous CPU-only code got
         // this from `using TransformerModel`; with a backend switch the model's static type is
@@ -341,28 +338,6 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         }
     }
 
-    /// <summary>
-    /// Parses <c>--device</c> into a backend name and GPU ordinal, mirroring <c>bench</c>'s syntax so
-    /// the two commands accept the same strings (<c>cpu</c>, <c>vulkan</c>, <c>cuda</c>, <c>cuda:1</c>,
-    /// and <c>gpu</c> as an alias for cuda).
-    /// </summary>
-    /// <param name="device">Raw option value.</param>
-    /// <param name="backend">Normalized backend name.</param>
-    /// <param name="gpuId">Device ordinal; 0 unless an explicit <c>:N</c> suffix is given.</param>
-    /// <returns><see langword="true"/> when the value names a supported backend.</returns>
-    private static bool TryParseDevice(string device, out string backend, out int gpuId)
-    {
-        backend = (device ?? "cpu").Split(':')[0].ToLowerInvariant();
-        if (backend.Length == 0) backend = "cpu";
-        if (backend == "gpu") backend = "cuda";
-
-        gpuId = 0;
-        string[] parts = (device ?? string.Empty).Split(':');
-        if (parts.Length > 1 && int.TryParse(parts[1], out int ordinal) && ordinal >= 0)
-            gpuId = ordinal;
-
-        return backend is "cpu" or "cuda" or "vulkan";
-    }
 
     /// <summary>
     /// Resolves the SPIR-V blob directory for Vulkan: <c>spv/</c> next to the running assembly,

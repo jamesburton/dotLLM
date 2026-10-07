@@ -126,8 +126,36 @@ public static class ServerStartup
     /// </summary>
     public static ServerState LoadModel(string resolvedPath, ServerOptions options)
     {
-        if (!DeviceSelector.IsAuto(options.Device))
-            return LoadModelCore(resolvedPath, options);
+        // One parser for every entry point (#790): "cuda", a typo or "vulkan:1" must never silently mean the CPU.
+        if (!DeviceSpec.TryParse(options.Device, out var spec, out string? deviceError))
+            throw new ArgumentException(deviceError);
+
+        if (spec.Kind != DeviceKind.Auto)
+        {
+            // Explicit device: preflight against the machine, then load on exactly that device. An explicit GPU that
+            // cannot be honoured is an error (what/why/opt-in), never a CPU run. ResolvedDevice is always recorded so
+            // /props and `model ps` report the same thing as an auto load does.
+            string canonical = spec.Canonical;
+            long bytes = new FileInfo(resolvedPath).Length;
+            string name = ModelIdFor(options.Model, resolvedPath);
+            if (spec.IsGpu)
+            {
+                var plan = DeviceSelector.Plan(spec, bytes, Endpoints.DeviceEndpoint.Describe());
+                if (plan.Error is not null)
+                    throw new DeviceUnavailableException(DeviceSelector.ExplicitFailureMessage(options.Device, name, bytes, plan.Error));
+            }
+            try
+            {
+                var explicitState = LoadModelCore(resolvedPath, options with { Device = canonical });
+                explicitState.Options = explicitState.Options with { ResolvedDevice = canonical };
+                return explicitState;
+            }
+            catch (Exception ex) when (spec.IsGpu && ex is not DeviceUnavailableException)
+            {
+                throw new DeviceUnavailableException(
+                    DeviceSelector.ExplicitFailureMessage(options.Device, name, bytes, $"loading the model failed: {ex.Message}"), ex);
+            }
+        }
 
         // --device auto (#722): try the best device first and fall through on a failed load. The server keeps "auto" as its configured device
         // (so later on-demand loads choose again, per model size); the device actually used is recorded in ResolvedDevice.
@@ -135,16 +163,20 @@ public static class ServerStartup
         // WARNING (console + ServerState.DeviceFallbackWarning -> /props) rather than a quiet log line (#733).
         Exception? last = null;
         var gpuFailures = new List<string>();
-        foreach (string device in DeviceSelector.Candidates(new FileInfo(resolvedPath).Length))
+        var autoPlan = DeviceSelector.Plan(spec, new FileInfo(resolvedPath).Length, Endpoints.DeviceEndpoint.Describe());
+        foreach (string device in autoPlan.Candidates)
         {
             try
             {
                 Console.WriteLine($"[dotllm] --device auto: trying {device}");
                 var loaded = LoadModelCore(resolvedPath, options with { Device = device });
                 loaded.Options = loaded.Options with { Device = options.Device, ResolvedDevice = device };
-                if (device == "cpu" && gpuFailures.Count > 0)
+                if (device == "cpu" && (gpuFailures.Count > 0 || autoPlan.CpuWarning is not null))
                 {
-                    loaded.DeviceFallbackWarning = DeviceSelector.FallbackWarning(ModelIdFor(options.Model, resolvedPath), gpuFailures);
+                    // Auto on the CPU always warns: after a failed GPU load (reason + consequence), or because no GPU was servable at all.
+                    loaded.DeviceFallbackWarning = gpuFailures.Count > 0
+                        ? DeviceSelector.FallbackWarning(ModelIdFor(options.Model, resolvedPath), gpuFailures)
+                        : autoPlan.CpuWarning;
                     Console.WriteLine($"[dotllm] WARNING: {loaded.DeviceFallbackWarning}");
                 }
                 return loaded;
@@ -167,7 +199,7 @@ public static class ServerStartup
     public static int ResolveGpuLayers(int? requested, string device, int numLayers) =>
         requested is < 0 ? numLayers
         : requested.HasValue ? Math.Clamp(requested.Value, 0, numLayers)
-        : device.StartsWith("gpu", StringComparison.OrdinalIgnoreCase) ? numLayers : 0;
+        : DeviceSpec.TryParse(device, out var spec, out _) && spec.Kind == DeviceKind.Cuda ? numLayers : 0;
 
     /// <summary>Sentinel <c>gpu_layers</c> value meaning "every layer, as the loader counts them".</summary>
     public const int AllGpuLayers = -1;
@@ -221,37 +253,17 @@ public static class ServerStartup
 
         var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);
 
-        int gpuLayers = ResolveGpuLayers(options.GpuLayers, options.Device, config.NumLayers);
         if (options.GpuLayers is { } requestedLayers && requestedLayers > config.NumLayers)
             Console.WriteLine($"[dotllm] Requested {requestedLayers} GPU layers but {Path.GetFileName(resolvedPath)} has {config.NumLayers}; using all {config.NumLayers}.");
 
-        IModel model;
-        Func<int, IKvCache>? vulkanKvFactory = null;
-        if (DotLLM.Vulkan.VulkanModelLoader.IsVulkanDeviceString(options.Device))
-        {
-            // Shared per-architecture Vulkan dispatch (#259). Before this branch `--device vulkan` fell
-            // through to the CPU path silently (the string does not start with "gpu").
-            Console.WriteLine($"[dotllm] Vulkan inference ({DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName})");
-            (model, vulkanKvFactory) = DotLLM.Vulkan.VulkanModelLoader.CreateSharedFromGguf(gguf, config);
-        }
-        else
-        {
-            // One dispatch for CPU / all-GPU / partial (#729). Architectures that cannot split layers
-            // (Nemotron-H, Qwen3MoeHybrid, Mamba-3) are loaded all-GPU, or the load FAILS with an actionable error (never a silent CPU fallback) —
-            // they must never reach HybridTransformerModel (dense Llama-style tensor naming only).
-            int gpuId = ParseGpuId(options.Device);
-            var plan = GpuOffloadPlanner.Plan(config.Architecture, gpuLayers, config.NumLayers);
-            Console.WriteLine(plan.Mode switch
-            {
-                GpuOffloadMode.Cpu => $"[dotllm] CPU inference ({threading.EffectiveThreadCount} threads)",
-                GpuOffloadMode.FullGpu => $"[dotllm] GPU {gpuId} inference",
-                GpuOffloadMode.Partial => $"[dotllm] Hybrid inference ({gpuLayers} GPU + {config.NumLayers - gpuLayers} CPU layers)",
-                _ => $"[dotllm] GPU {gpuId} inference (partial offload unsupported for {config.Architecture}; all layers must fit)",
-            });
-            (model, _) = DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(
-                gguf, config, gpuLayers, gpuId, threading,
-                w => Console.WriteLine($"[dotllm] WARNING: {w}"));
-        }
+        // One shared dispatch for CPU / all-GPU / partial CUDA / Vulkan (#259, #729, #790) - the same call run and chat make.
+        // Architectures that cannot split layers load all-GPU or FAIL with an actionable error (never a silent CPU fallback).
+        var (model, deviceKvFactory) = DeviceModelLoader.LoadExact(
+            gguf, config, options.Device, options.GpuLayers, threading,
+            msg => Console.WriteLine($"[dotllm] {msg}"),
+            w => Console.WriteLine($"[dotllm] WARNING: {w}"));
+        // Only the Vulkan models' KV factory is wired here (CUDA/hybrid models keep their own per-request caches).
+        Func<int, IKvCache>? vulkanKvFactory = DeviceSpec.Parse(options.Device).Kind == DeviceKind.Vulkan ? deviceKvFactory : null;
 
         // Create chat template. The declared template is untrusted input from the GGUF's
         // tokenizer.chat_template metadata — a parse failure (unsupported Jinja construct,
@@ -734,9 +746,4 @@ public static class ServerStartup
 
         return app;
     }
-
-    private static int ParseGpuId(string device) =>
-        device.IndexOf(':') is int ci and > 0
-            ? int.Parse(device.AsSpan(ci + 1))
-            : 0;
 }

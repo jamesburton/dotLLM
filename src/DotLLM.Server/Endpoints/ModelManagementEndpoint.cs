@@ -110,7 +110,7 @@ public static class ModelManagementEndpoint
                     var newState = await Task.Run(() => ServerStartup.LoadModel(resolvedPath, newOptions), ct);
 
                     // Transfer new state fields into the existing ServerState
-                    state.Options = newOptions;
+                    state.Options = newOptions with { ResolvedDevice = newState.Options.ResolvedDevice };   // #790: keep the device actually used
                     state.Config = newState.Config;
                     state.DeviceFallbackWarning = newState.DeviceFallbackWarning;
                     state.Model = newState.Model;
