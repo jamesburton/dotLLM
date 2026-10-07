@@ -65,6 +65,27 @@ public sealed class OlmoeVulkanGroupedPrefillTests
         return b;
     }
 
+    private static unsafe (int[] Tokens, float[] Margins) GreedyWithMargins(VulkanTransformerModel vk, DotLLM.Core.Models.ModelConfig config, int[] promptIds)
+    {
+        const int steps = 16;
+        int vocab = config.VocabSize;
+        var toks = new List<int>(); var margins = new List<float>();
+        using var kv = vk.CreateKvCache(promptIds.Length + steps + 2);
+        for (int step = 0; step < steps; step++)
+        {
+            int[] ids = step == 0 ? promptIds : [toks[^1]];
+            int[] pos = step == 0 ? Enumerable.Range(0, promptIds.Length).ToArray() : [promptIds.Length + step - 1];
+            using ITensor logits = vk.Forward(ids, pos, -1, kv);
+            var row = new ReadOnlySpan<float>((float*)logits.DataPointer + (long)(logits.Shape[0] - 1) * vocab, vocab);
+            int best = 0;
+            for (int i = 1; i < vocab; i++) if (row[i] > row[best]) best = i;
+            float second = float.NegativeInfinity;
+            for (int i = 0; i < vocab; i++) if (i != best && row[i] > second) second = row[i];
+            toks.Add(best); margins.Add(row[best] - second);
+        }
+        return (toks.ToArray(), margins.ToArray());
+    }
+
     [SkippableFact]
     public void Vulkan_Olmoe_GroupedPrefill_Completes512_AndMatchesScalarAndCpu()
     {
@@ -109,6 +130,17 @@ public sealed class OlmoeVulkanGroupedPrefillTests
             + $"argmax grouped={ArgMax(gShort)} scalar={ArgMax(sShort)} cpu={ArgMax(cpuShort)}");
         Assert.Equal(ArgMax(sShort), ArgMax(gShort));
         Assert.True(rmsGs < 0.05 * rmsScale + 0.05, $"grouped vs scalar logit rms {rmsGs}");
+
+        // Greedy continuation from the 320-token prompt, grouped prefill vs scalar prefill (decode kernels identical). A divergence is accepted only at a
+        // near-tie of the scalar path (top1-top2 margin < 0.5 logits), since F16 operands move the logits by ~1% of their rms.
+        vk.GroupedMoeEnabled = true;
+        var (gTok, _) = GreedyWithMargins(vk, config, shortIds);
+        vk.GroupedMoeEnabled = false;
+        var (sTok, sMargin) = GreedyWithMargins(vk, config, shortIds);
+        int firstDiv = -1;
+        for (int i = 0; i < gTok.Length; i++) if (gTok[i] != sTok[i]) { firstDiv = i; break; }
+        _output.WriteLine($"greedy 16 tokens from p320: first divergence = {firstDiv}" + (firstDiv >= 0 ? $" (scalar margin {sMargin[firstDiv]:F3})" : " (identical)"));
+        Assert.True(firstDiv < 0 || sMargin[firstDiv] < 0.5f, $"greedy diverged at step {firstDiv} with scalar margin {sMargin[firstDiv]}");
 
         // 520 tokens (the #787 repro): grouped only - the scalar path would lose the device here.
         vk.GroupedMoeEnabled = true;
