@@ -1566,6 +1566,8 @@ public sealed class VulkanTransformerModel : IModel
         if (!IsMmvqDisabled() && device.HasIntegerDotProduct)
         {
             quantizeQ8_1 = QuantizeQ8_1Kernel.TryCreate(device, spvDir);
+            // K-quant (Q4_K/Q5_K/Q6_K) decode: the dp4a MMVQ kernels lose to the coalesced F32-in GEMVs on AMD (#801).
+            bool kQuantMmvq = UseKQuantMmvq(device);
             matmulQ8Mmvq = MatMulQ8_0MmvqKernel.TryCreate(device, spvDir);
             // Residual-fused Q8_0 MMVQ (issue #379) — independent SPV load;
             // missing it just disables the fusion, not the base MMVQ path.
@@ -1585,11 +1587,11 @@ public sealed class VulkanTransformerModel : IModel
             // Q4_K MMVQ (issue #52) reuses quantizeQ8_1; it is an independent
             // weight-format path, so a missing Q4_K SPV must not disable Q8_0
             // MMVQ (and vice versa).
-            matmulQ4KMmvq = IsMmvqQuantOff("q4_k") ? null : MatMulQ4KMmvqKernel.TryCreate(device, spvDir);
+            matmulQ4KMmvq = kQuantMmvq ? MatMulQ4KMmvqKernel.TryCreate(device, spvDir) : null;
             // Q6_K / Q5_K MMVQ (issue #338), Q2_K / Q3_K MMVQ (issue #339) — same
             // independent-path policy.
-            matmulQ6KMmvq = IsMmvqQuantOff("q6_k") ? null : MatMulQ6KMmvqKernel.TryCreate(device, spvDir);
-            matmulQ5KMmvq = IsMmvqQuantOff("q5_k") ? null : MatMulQ5KMmvqKernel.TryCreate(device, spvDir);
+            matmulQ6KMmvq = kQuantMmvq ? MatMulQ6KMmvqKernel.TryCreate(device, spvDir) : null;
+            matmulQ5KMmvq = kQuantMmvq ? MatMulQ5KMmvqKernel.TryCreate(device, spvDir) : null;
             matmulQ2KMmvq = MatMulQ2KMmvqKernel.TryCreate(device, spvDir);
             matmulQ3KMmvq = MatMulQ3KMmvqKernel.TryCreate(device, spvDir);
             // IQ4_NL / IQ4_XS MMVQ (issue #339) — codebook-lookup quants.
@@ -2247,17 +2249,37 @@ public sealed class VulkanTransformerModel : IModel
     internal static bool IsMmvqDisabled() =>
         Environment.GetEnvironmentVariable(DisableMmvqEnvVar) == "1";
 
-    /// <summary>EXPERIMENT (#801): comma list of quants whose dp4a MMVQ decode kernel is skipped (q4_k,q5_k,q6_k).</summary>
-    internal const string MmvqOffEnvVar = "DOTLLM_VULKAN_MMVQ_OFF";
+    /// <summary>
+    /// Env override for the K-quant (Q4_K/Q5_K/Q6_K) dp4a MMVQ decode kernels (#801): <c>1</c> forces them on, <c>0</c> forces
+    /// them off, unset = <see cref="UseKQuantMmvq"/>'s device default.
+    /// </summary>
+    internal const string KQuantMmvqEnvVar = "DOTLLM_VULKAN_KQUANT_MMVQ";
 
-    internal static bool IsMmvqQuantOff(string quant)
-    {
-        string? v = Environment.GetEnvironmentVariable(MmvqOffEnvVar);
-        if (string.IsNullOrEmpty(v)) return false;
-        foreach (var part in v.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
-            if (string.Equals(part, quant, StringComparison.OrdinalIgnoreCase)) return true;
-        return false;
-    }
+    /// <summary>AMD PCI vendor id.</summary>
+    private const uint AmdVendorId = 0x1002;
+
+    /// <summary>
+    /// Whether decode GEMVs for Q4_K/Q5_K/Q6_K weights take the dp4a MMVQ kernels (<c>true</c>) or the coalesced F32-in GEMVs (#574/#576).
+    /// On AMD (gfx1151 measured) the MMVQ kernels are 28-37% SLOWER end to end (Gemma-4-31B Q4_K_M 7.0 vs 9.8 tok/s, Llama-3.1-8B 28.2 vs
+    /// 38.6, Devstral-24B 10.2 vs 13.5): one 32-lane workgroup per row issuing a single 4-byte weight load per lane per super-block cannot
+    /// keep enough memory requests in flight on a wave64 part. Other vendors keep MMVQ (unmeasured; validate on that hardware first).
+    /// Q8_0 MMVQ is unaffected.
+    /// </summary>
+    internal static bool UseKQuantMmvq(VulkanDevice device) =>
+        ResolveKQuantMmvq(device.VendorId, Environment.GetEnvironmentVariable(KQuantMmvqEnvVar));
+
+    /// <summary>Pure form of <see cref="UseKQuantMmvq"/> (vendor id + raw env value) so the policy table is testable without a device.</summary>
+    internal static bool ResolveKQuantMmvq(uint vendorId, string? envValue) =>
+        envValue switch
+        {
+            "1" => true,
+            "0" => false,
+            _ => vendorId != AmdVendorId,
+        };
+
+    /// <summary>True when any K-quant (Q4_K/Q5_K/Q6_K) dp4a MMVQ decode kernel is wired, i.e. RecordMatmul can take it at seqLen==1.</summary>
+    internal bool KQuantMmvqDecodeActive =>
+        _matmulQ4KMmvq is not null || _matmulQ5KMmvq is not null || _matmulQ6KMmvq is not null;
 
     /// <summary>
     /// Env-var opt-out for the indexed MoE MMVQ decode path (issue #137). Set
