@@ -1703,6 +1703,21 @@ public sealed class VulkanDevice : IDisposable
     private long _deviceLocalFallbacks;
 
     /// <summary>
+    /// <c>DOTLLM_VULKAN_DEVICE_LOCAL_LIMIT_MIB=N</c> (test/A-B knob, issue #810): treat strict
+    /// DEVICE_LOCAL allocations as out of memory once this device holds N MiB on the preferred
+    /// device-local heap, forcing the heap-0 fallback path with a smaller model.
+    /// </summary>
+    private static readonly long s_deviceLocalLimitBytes =
+        long.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DEVICE_LOCAL_LIMIT_MIB"), out long mib) && mib >= 0
+            ? mib * 1024 * 1024 : -1;
+
+    private readonly long[] _fallbackBytesByHeap = new long[16];
+    private int _fallbackLogged;
+
+    /// <summary>Bytes that landed on each heap via the device-local fallback (not the preferred type).</summary>
+    public long FallbackBytesOnHeap(int heap) => Interlocked.Read(ref _fallbackBytesByHeap[heap]);
+
+    /// <summary>
     /// Live allocated bytes and allocation count per memory heap, maintained by
     /// <see cref="AllocateInternal"/> and <see cref="Buffer.Dispose"/>.
     /// </summary>
@@ -1857,7 +1872,8 @@ public sealed class VulkanDevice : IDisposable
             sb.Append($"heap{h} ours={Interlocked.Read(ref _liveBytesByHeap[h]) / (1024 * 1024)} MiB "
                     + $"in {Interlocked.Read(ref _liveCountByHeap[h])} allocs, "
                     + $"driver usage={usage / (1024 * 1024)} MiB, budget={budget / (1024 * 1024)} MiB, "
-                    + $"size={size / (1024 * 1024)} MiB");
+                    + $"size={size / (1024 * 1024)} MiB"
+                    + (_fallbackBytesByHeap[h] > 0 ? $", of-which-fallback={Interlocked.Read(ref _fallbackBytesByHeap[h]) / (1024 * 1024)} MiB" : ""));
         }
         return sb.ToString();
     }
@@ -1946,7 +1962,13 @@ public sealed class VulkanDevice : IDisposable
         {
             typeIndex = preferredTypeIndex;
             mai.memoryTypeIndex = typeIndex;
-            allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out memory);
+            if (deviceLocal && s_deviceLocalLimitBytes >= 0
+                && Interlocked.Read(ref _liveBytesByHeap[HeapOfType(typeIndex)]) + (long)req.size > s_deviceLocalLimitBytes)
+            {
+                allocResult = VkErrorOutOfDeviceMemory; memory = 0; // synthetic exhaustion (#810 knob)
+            }
+            else
+                allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out memory);
 
             // The strict device-local heap (discrete VRAM, or the UMA carve-out — e.g. a
             // 16 GB heap[0] on Strix Halo while heap[1] exposes 96 GB of DEVICE_LOCAL +
@@ -1971,6 +1993,13 @@ public sealed class VulkanDevice : IDisposable
                     {
                         typeIndex = fbIndex;
                         Interlocked.Increment(ref _deviceLocalFallbacks);
+                        uint fbHeap = HeapOfType(fbIndex);
+                        Interlocked.Add(ref _fallbackBytesByHeap[fbHeap], (long)req.size);
+                        if (Interlocked.Exchange(ref _fallbackLogged, 1) == 0)
+                            Console.Error.WriteLine(
+                                $"[vulkan-mem] device-local heap {HeapOfType(preferredTypeIndex)} exhausted; " +
+                                $"allocations now fall back to type {fbIndex} on heap {fbHeap} " +
+                                $"(first fallback: {req.size} B). {MemorySnapshot()}");
                         break;
                     }
                 }
@@ -2160,37 +2189,11 @@ public sealed class VulkanDevice : IDisposable
         VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
         uint* types = (uint*)mem.memoryTypes;   // 8-byte entries: u32 propertyFlags, u32 heapIndex
         byte* heaps = (byte*)mem.memoryHeaps;   // 16-byte entries: u64 size, u32 flags, padding
-        uint failedHeap = types[failedTypeIndex * 2 + 1];
-
-        var ordered = new List<uint>(8);
-        Span<VkMemoryPropertyFlags> rungs =
-        [
-            VkMemoryPropertyFlags.DeviceLocal | VkMemoryPropertyFlags.HostVisible,
-            VkMemoryPropertyFlags.HostVisible | VkMemoryPropertyFlags.HostCoherent,
-        ];
-        foreach (var required in rungs)
-        {
-            // Two passes per rung: other-heap types first, failed-heap types last.
-            for (int pass = 0; pass < 2; pass++)
-            {
-                var passList = new List<(uint Index, ulong HeapSize)>(4);
-                for (uint i = 0; i < mem.memoryTypeCount; i++)
-                {
-                    if ((typeBits & (1u << (int)i)) == 0 || i == failedTypeIndex) continue;
-                    var flags = (VkMemoryPropertyFlags)types[i * 2];
-                    if ((flags & required) != required) continue;
-                    uint heapIdx = types[i * 2 + 1];
-                    bool otherHeap = heapIdx != failedHeap;
-                    if (otherHeap != (pass == 0)) continue;
-                    passList.Add((i, *(ulong*)(heaps + heapIdx * 16)));
-                }
-                passList.Sort(static (a, b) => b.HeapSize.CompareTo(a.HeapSize));
-                foreach (var (idx, _) in passList)
-                    if (!ordered.Contains(idx))
-                        ordered.Add(idx);
-            }
-        }
-        return ordered;
+        var t = new VkMemTypeInfo[mem.memoryTypeCount];
+        for (int i = 0; i < t.Length; i++) t[i] = new((VkMemoryPropertyFlags)types[i * 2], types[i * 2 + 1]);
+        var h = new ulong[mem.memoryHeapCount];
+        for (int i = 0; i < h.Length; i++) h[i] = *(ulong*)(heaps + i * 16);
+        return VulkanMemoryPlacement.RankDeviceLocalFallback(t, h, typeBits, failedTypeIndex);
     }
 
     /// <summary>
