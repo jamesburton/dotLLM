@@ -236,7 +236,7 @@ internal static class ToolCallJsonHelper
         return element.GetRawText();
     }
 
-    private static string ExtractBalancedJson(string text, int start)
+    internal static string ExtractBalancedJson(string text, int start)
     {
         char open = text[start];
         char close = open == '{' ? '}' : ']';

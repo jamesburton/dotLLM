@@ -97,16 +97,14 @@ public class GraniteToolCallParserTests
         }
     }
 
-    [Fact]
-    public async Task Streaming_MarkerAndJson_DoNotLeakIntoContent_CallArrivesInFinalChunk()
+    private static async Task<(string Content, JsonElement? Calls, string? Finish)> StreamAsync(string[] pieces, ToolDefinition[] tools)
     {
-        string[] pieces = ["<|tool_call|>", "[{\"name\": ", "\"get_weather\", ", "\"arguments\": {\"city\": ", "\"Paris\"}}]"];
         var ctx = new DefaultHttpContext();
         var body = new MemoryStream();
         ctx.Response.Body = body;
         await ChatCompletionEndpoint.WriteChatStreamAsync(
             new ChatCompletionRequest { Messages = [], Stream = true }, ctx, _ => Script(pieces), (work, _) => work(),
-            "req", "m", Tools, new GraniteToolCallParser(), ReasoningPlanFor(), CancellationToken.None);
+            "req", "m", tools, new GraniteToolCallParser(), ReasoningPlan.Disabled, CancellationToken.None);
 
         var content = new StringBuilder();
         JsonElement? calls = null;
@@ -123,12 +121,91 @@ public class GraniteToolCallParserTests
                 if (choice.TryGetProperty("finish_reason", out var fr) && fr.ValueKind == JsonValueKind.String) finish = fr.GetString();
             }
         }
+        return (content.ToString(), calls, finish);
+    }
 
-        Assert.DoesNotContain("<|tool_call", content.ToString(), StringComparison.Ordinal);
-        Assert.Equal("", content.ToString());
+    [Fact]
+    public async Task Streaming_MarkerAndJson_DoNotLeakIntoContent_CallArrivesInFinalChunk()
+    {
+        string[] pieces = ["<|tool_call|>", "[{\"name\": ", "\"get_weather\", ", "\"arguments\": {\"city\": ", "\"Paris\"}}]"];
+        var (content, calls, finish) = await StreamAsync(pieces, Tools);
+
+        Assert.DoesNotContain("<|tool_call", content, StringComparison.Ordinal);
+        Assert.Equal("", content);
         Assert.Equal("tool_calls", finish);
         Assert.Equal("get_weather", calls!.Value[0].GetProperty("function").GetProperty("name").GetString());
     }
 
-    private static ReasoningPlan ReasoningPlanFor() => ReasoningPlan.Disabled;
+    // ---------------------------------------------------------------- real output (granite-3.3-2b-instruct Q8_0, greedy, 2026-10-07)
+
+    private static string Raw(string name)
+        => File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Tokenizers", "ChatTemplates", "Fixtures", "real-output", name + ".raw.txt"))
+            .Replace("\r\n", "\n", StringComparison.Ordinal);
+
+    /// <summary>Realistic tokenisation: the special token is one piece, the JSON arrives in small pieces.</summary>
+    private static string[] Tokens(string raw)
+    {
+        var parts = new List<string> { "<|tool_call|>" };
+        string rest = raw["<|tool_call|>".Length..];
+        for (int i = 0; i < rest.Length; i += 6)
+            parts.Add(rest.Substring(i, Math.Min(6, rest.Length - i)));
+        return [.. parts];
+    }
+
+    private static readonly ToolDefinition[] Alarm =
+        [new("set_alarm", "a", """{"type":"object","properties":{"hour":{"type":"integer"},"label":{"type":"string"},"repeat":{"type":"boolean"},"days":{"type":"array","items":{"type":"string"}}},"required":["hour","label"]}""")];
+
+    [Fact]
+    public void RealOutput_NamedCall()
+    {
+        var c = Assert.Single(_p.TryParse(Raw("granite-toolcall"))!);
+        Assert.Equal("get_weather", c.FunctionName);
+        Assert.Equal("{\"city\": \"Paris\"}", c.Arguments);
+    }
+
+    [Fact]
+    public void RealOutput_ParallelCallsInOneList()
+    {
+        var calls = _p.TryParse(Raw("granite-toolcall-parallel"))!;
+        Assert.Equal(2, calls.Length);
+        Assert.Contains("Paris", calls[0].Arguments, StringComparison.Ordinal);
+        Assert.Contains("Tokyo", calls[1].Arguments, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RealOutput_NamelessCall_IsAttributedToTheOnlyDeclaredTool_WithTypedArguments()
+    {
+        // The model really answered {"arguments": {...}} with no name, deterministically at temperature 0.
+        string raw = Raw("granite-toolcall-typed");
+        Assert.Null(_p.TryParse(raw));                                              // no tools known: nothing to attribute it to
+        var c = Assert.Single(((IToolCallParser)_p).TryParse(raw, Alarm)!);
+        Assert.Equal("set_alarm", c.FunctionName);
+        using var doc = JsonDocument.Parse(c.Arguments);
+        Assert.Equal(7, doc.RootElement.GetProperty("hour").GetInt32());
+        Assert.True(doc.RootElement.GetProperty("repeat").GetBoolean());
+        Assert.Equal(["Monday", "Friday"], doc.RootElement.GetProperty("days").EnumerateArray().Select(e => e.GetString()));
+
+        // Two declared tools: ambiguous, so not reported.
+        var two = new[] { Alarm[0], new ToolDefinition("other", "o", "{}") };
+        Assert.Null(((IToolCallParser)_p).TryParse(raw, two));
+    }
+
+    [Fact]
+    public void NamelessCall_Truncated_IsNotReported()
+    {
+        Assert.Null(((IToolCallParser)_p).TryParse("<|tool_call|>[{\"arguments\": {\"hour\": 7, \"lab", Alarm));
+    }
+
+    [Theory]
+    [InlineData("granite-toolcall")]
+    [InlineData("granite-toolcall-typed")]
+    [InlineData("granite-toolcall-parallel")]
+    public async Task RealOutput_Streamed_NoMarkerOrJsonInContent_CallsInFinalChunk(string fixture)
+    {
+        var tools = fixture.EndsWith("typed", StringComparison.Ordinal) ? Alarm : Tools;
+        var (content, calls, finish) = await StreamAsync(Tokens(Raw(fixture)), tools);
+        Assert.Equal("", content);
+        Assert.Equal("tool_calls", finish);
+        Assert.Equal(fixture.EndsWith("parallel", StringComparison.Ordinal) ? 2 : 1, calls!.Value.GetArrayLength());
+    }
 }
