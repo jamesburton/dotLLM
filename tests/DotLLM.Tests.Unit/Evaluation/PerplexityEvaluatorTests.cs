@@ -181,7 +181,7 @@ public sealed class PerplexityEvaluatorTests
 
         Assert.Equal(a.Perplexity, b.Perplexity, 9);
         Assert.Equal(a.ScoredTokens, b.ScoredTokens);
-        Assert.Equal(a.Windows, b.Windows);
+        Assert.Equal(a.WindowCount, b.WindowCount);
         // 3 windows x targets 9..15 (7 each), prefixes of length 9..15.
         Assert.Equal(21, lastRow.ForwardCalls.Count);
         Assert.Equal(9, lastRow.ForwardCalls[0].Length);
