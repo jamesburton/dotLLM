@@ -201,7 +201,8 @@ internal sealed unsafe class TransformerForwardState : IDisposable
             // exclusive with the 26B partial-rotary path in practice.
             if (globalFreqFactors is not null)
                 DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTableWithFactors(
-                    maxSeqLen, globalRopeDim, globalRopeTheta, globalFreqFactors, GlobalCosTable, GlobalSinTable);
+                    maxSeqLen, globalRopeDim, globalRopeTheta, globalFreqFactors, GlobalCosTable, GlobalSinTable,
+                    frequencyDenominatorDim: globalFullHeadDim);
             else if (globalFullHeadDim > globalRopeDim)
                 DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTablePartial(
                     maxSeqLen, globalRopeDim, globalFullHeadDim, globalRopeTheta, GlobalCosTable, GlobalSinTable);

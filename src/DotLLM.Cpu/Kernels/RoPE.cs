@@ -116,13 +116,19 @@ public static class RoPE
     /// <param name="factors">Per-pair divisors, length <c>headDim / 2</c>.</param>
     /// <param name="cosTable">Destination cosine table; length ≥ maxSeqLen * headDim / 2.</param>
     /// <param name="sinTable">Destination sine table; length ≥ maxSeqLen * headDim / 2.</param>
+    /// <param name="frequencyDenominatorDim">
+    /// Dimension used in the <c>θ^(-2i/dim)</c> exponent. 0 (default) = <paramref name="headDim"/>. Must be the
+    /// FULL head dim when only the leading <paramref name="headDim"/> dims rotate (Gemma-4 26B/31B global layers:
+    /// 128 rotated of 512) — ggml's <c>n_rot</c> there is the full 512, so the exponent denominator is 512 (#784).
+    /// </param>
     public static void PrecomputeFrequencyTableWithFactors(
         int maxSeqLen, int headDim, float theta, ReadOnlySpan<float> factors,
-        Span<float> cosTable, Span<float> sinTable)
+        Span<float> cosTable, Span<float> sinTable, int frequencyDenominatorDim = 0)
     {
         if (headDim <= 0 || headDim % 2 != 0)
             throw new ArgumentException($"headDim must be a positive even number, got {headDim}", nameof(headDim));
         int halfDim = headDim / 2;
+        int expDim = frequencyDenominatorDim > headDim ? frequencyDenominatorDim : headDim;
         if (factors.Length < halfDim)
             throw new ArgumentException(
                 $"factors length {factors.Length} must be >= headDim/2 ({halfDim}).", nameof(factors));
@@ -130,7 +136,7 @@ public static class RoPE
         float[] rented = ArrayPool<float>.Shared.Rent(halfDim);
         Span<float> freqs = rented.AsSpan(0, halfDim);
         for (int i = 0; i < halfDim; i++)
-            freqs[i] = 1.0f / (MathF.Pow(theta, 2.0f * i / headDim) * factors[i]);
+            freqs[i] = 1.0f / (MathF.Pow(theta, 2.0f * i / expDim) * factors[i]);
 
         for (int pos = 0; pos < maxSeqLen; pos++)
         {

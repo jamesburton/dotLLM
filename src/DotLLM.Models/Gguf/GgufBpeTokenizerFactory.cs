@@ -37,10 +37,10 @@ public static class GgufBpeTokenizerFactory
 
         // Gemma 1 / CodeGemma / Gemma 2 are untrained-without-BOS: every consumer that calls
         // Encode() on a plain prompt (run, bench, server completions) would otherwise feed a
-        // BOS-less stream and get garbage. Scoped to those architectures on purpose — the other
+        // BOS-less stream and get garbage (Gemma 4 included: #784). Scoped to those architectures on purpose — the other
         // SPM/BPE models keep the historical BOS-agnostic Encode (their chat templates carry BOS).
         string arch = metadata.GetStringOrDefault("general.architecture", "");
-        if (arch is "gemma" or "gemma2" or "gemma3")
+        if (arch is "gemma" or "gemma2" or "gemma3" or "gemma4")
             tokenizer.AddBosToken = GgufAddBosResolver.Resolve(metadata);
 
         return tokenizer;
