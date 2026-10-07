@@ -46,7 +46,8 @@
   Unsloth `UD-Q4_K_M` file may not match). Pass -AllowPull to permit the download.
 
 .PARAMETER Device
-  Passed to `serve --device`. Default: do not pass it (the server default, `auto`).
+  Passed to `serve --device`. Default: do not pass it (the server default, `auto`). An explicit cuda/gpu on a host with no
+  NVIDIA driver reports SKIP ("not measured here") and exits 0.
 
 .PARAMETER ServeArgs
   Extra serve args, e.g. -ServeArgs '--mtp'. Default: none (the point is that defaults work).
@@ -251,9 +252,20 @@ function Get-ServerBuild {
 }
 
 # ---------------------------------------------------------------- main
-$proc = $null
+$proc = $null; $skipRun = $false
 $meta = [ordered]@{ model = $Model; cli = $Cli; device = $(if ($Device) { $Device } else { '(default)' }); serveArgs = $ServeArgs; started = (Get-Date).ToString('o'); host = $env:COMPUTERNAME }
 try {
+    # Guard: an explicit CUDA request on a host with no NVIDIA driver is "not measured here", not a failure.
+    if ($Device -match '^(cuda|gpu)') {
+        $hasCuda = (Test-Path (Join-Path $env:windir 'System32\nvcuda.dll')) -or [bool](Get-Command nvidia-smi -ErrorAction SilentlyContinue)
+        if (-not $hasCuda) {
+            $meta.skipped = 'no CUDA on this host'
+            Add-Result 'harness' 'SKIP' "--device $Device requested but no NVIDIA driver (nvcuda.dll / nvidia-smi) on $($env:COMPUTERNAME): not measured here"
+            $skipRun = $true
+        }
+    }
+    if ($skipRun) { return }
+
     # Guard: refuse to start if the port is taken (a stale server would answer our checks).
     if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) {
         throw "Port $Port already in use; pick another with -Port."
