@@ -164,6 +164,20 @@ public class GlmToolCallParserTests
     }
 
     [Fact]
+    public void EndOfGeneration_HarmonyVocabulary_NeverStopsOnEnd_EvenIfTheFileDeclaresItAsEot()
+    {
+        // #798 guard (llama.cpp llama-vocab.cpp): <|end|> closes the analysis message; the turn continues.
+        var harmony = new EogTokenizer(102, [107], ("<|return|>", 102), ("<|end|>", 107), ("<|call|>", 112));
+        int[] ids = EndOfGenerationTokens.Resolve(harmony);
+        Assert.DoesNotContain(107, ids);
+        Assert.Contains(102, ids);
+
+        // A vocabulary without the Harmony pair (Phi-3 style: eot = <|end|>) keeps it.
+        var phi = new EogTokenizer(32000, [32007], ("<|endoftext|>", 32000), ("<|end|>", 32007));
+        Assert.Contains(32007, EndOfGenerationTokens.Resolve(phi));
+    }
+
+    [Fact]
     public void EndOfGeneration_ExtraIdsAreDeduplicated_AndAbsentMeansNone()
     {
         var dup = new EogTokenizer(5, [5, 7, 7]);
