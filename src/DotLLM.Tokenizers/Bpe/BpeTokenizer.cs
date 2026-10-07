@@ -31,6 +31,11 @@ public sealed class BpeTokenizer : ITokenizer
     /// <inheritdoc/>
     public int EosTokenId { get; }
 
+    /// <summary>Extra end-of-generation ids from the model file (eot / eom); set by the GGUF loader.</summary>
+    public int[] ExtraEndOfGenerationTokenIds { get; set; } = [];
+
+    IReadOnlyList<int> ITokenizer.ExtraEndOfGenerationTokenIds => ExtraEndOfGenerationTokenIds;
+
     /// <inheritdoc/>
     public int VocabSize { get; }
 

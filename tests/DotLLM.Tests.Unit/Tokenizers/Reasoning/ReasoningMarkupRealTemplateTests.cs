@@ -19,6 +19,8 @@ public class ReasoningMarkupRealTemplateTests
     [InlineData("nemotron-nano-9b-v2-chat-template.jinja", ReasoningMarkup.Think)]
     [InlineData("llama-3.1-chat-template.jinja", ReasoningMarkup.Think)]
     [InlineData("llama-3.2-chat-template.jinja", ReasoningMarkup.Think)]
+    [InlineData("smollm3-chat-template.jinja", ReasoningMarkup.Think)]
+    [InlineData("glm-4.7-flash-chat-template.jinja", ReasoningMarkup.Think)]
     public void RealTemplates_DetectTheirMarkup(string fixture, ReasoningMarkup expected)
     {
         string src = Fixture(fixture);

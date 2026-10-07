@@ -49,6 +49,14 @@ public interface ITokenizer
     int EosTokenId { get; }
 
     /// <summary>
+    /// Additional end-of-generation token ids declared by the model file beyond <see cref="EosTokenId"/>
+    /// (GGUF <c>tokenizer.ggml.eot_token_id</c> / <c>eom_token_id</c>: GLM-4.x declares <c>&lt;|endoftext|&gt;</c> as
+    /// EOS but ends its turns with <c>&lt;|user|&gt;</c> (eot) or <c>&lt;|observation|&gt;</c> after a tool call (eom), #797).
+    /// Empty when the model declares none.
+    /// </summary>
+    IReadOnlyList<int> ExtraEndOfGenerationTokenIds => [];
+
+    /// <summary>
     /// Counts the number of tokens without performing a full encode.
     /// May be approximate for some tokenizer implementations.
     /// </summary>

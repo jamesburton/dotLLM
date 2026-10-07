@@ -336,6 +336,7 @@ internal sealed class NormalizingTokenizer(ITokenizer inner, NormalizationForm f
     public int VocabSize => _inner.VocabSize;
     public int BosTokenId => _inner.BosTokenId;
     public int EosTokenId => _inner.EosTokenId;
+    public IReadOnlyList<int> ExtraEndOfGenerationTokenIds => _inner.ExtraEndOfGenerationTokenIds;
 
     public int[] Encode(string text) =>
         text.Length == 0 || text.IsNormalized(form)

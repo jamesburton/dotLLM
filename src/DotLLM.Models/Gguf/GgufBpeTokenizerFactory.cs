@@ -35,6 +35,20 @@ public static class GgufBpeTokenizerFactory
 
         var tokenizer = LoadByModel(metadata, model, tokens, tokenTypes, bosId, eosId);
 
+        // llama.cpp stops on eot / eom as well as eos (#797): GLM-4.x ends a turn with <|user|> (eot) and a
+        // tool call with <|observation|> (eom), neither of which is the declared eos (<|endoftext|>).
+        var extra = new List<int>(2);
+        foreach (string key in new[] { "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id" })
+        {
+            if (metadata.ContainsKey(key))
+            {
+                int id = (int)metadata.GetUInt32OrDefault(key, uint.MaxValue);
+                if (id >= 0 && id < tokens.Length && id != eosId && !extra.Contains(id))
+                    extra.Add(id);
+            }
+        }
+        tokenizer.ExtraEndOfGenerationTokenIds = extra.ToArray();
+
         // Gemma 1 / CodeGemma / Gemma 2 are untrained-without-BOS: every consumer that calls
         // Encode() on a plain prompt (run, bench, server completions) would otherwise feed a
         // BOS-less stream and get garbage (Gemma 4 included: #784). Scoped to those architectures on purpose — the other

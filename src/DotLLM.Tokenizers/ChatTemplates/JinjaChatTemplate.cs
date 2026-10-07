@@ -11,6 +11,10 @@ public sealed class JinjaChatTemplate : IChatTemplate
     private readonly JinjaTemplate _ast;
     private readonly string _bosToken;
     private readonly string _eosToken;
+    private readonly bool _aliasXmlTools;
+
+    private static readonly System.Text.RegularExpressions.Regex GenerationTag = new(
+        @"\{%(-?)\s*(?:end)?generation\s*(-?)%\}", System.Text.RegularExpressions.RegexOptions.Compiled);
 
     /// <summary>
     /// Creates a new Jinja2 chat template.
@@ -32,6 +36,18 @@ public sealed class JinjaChatTemplate : IChatTemplate
         else if (templateSource.EndsWith('\n'))
             templateSource = templateSource[..^1];
 
+        // HF's `{% generation %}` / `{% endgeneration %}` mark the span an assistant-token mask covers (training
+        // only); at render time they emit nothing. SmolLM3's template wraps every assistant turn in them, the
+        // parser rejected the unknown statement keyword, and the server then fell back to the plain transcript
+        // template: no tools, no /think switch, the wrong chat format (#797). Rewritten as comments, which keep
+        // the `-` whitespace-control markers and emit nothing, exactly like minja's no-op treatment.
+        templateSource = GenerationTag.Replace(templateSource, m => "{#" + m.Groups[1].Value + " generation " + m.Groups[2].Value + "#}");
+
+        // SmolLM3 reads its tool list from `xml_tools` / `python_tools` and never from `tools`.
+        _aliasXmlTools = templateSource.Contains("xml_tools", StringComparison.Ordinal)
+            && !templateSource.Contains("tools is defined", StringComparison.Ordinal)
+            && !templateSource.Contains("if tools", StringComparison.Ordinal);
+
         TemplateSource = templateSource;
         ReasoningMarkup = Reasoning.ReasoningMarkups.Detect(templateSource);
 
@@ -41,7 +57,7 @@ public sealed class JinjaChatTemplate : IChatTemplate
         _ast = parser.Parse();
     }
 
-    /// <summary>The (trailing-newline-normalised) Jinja source this template was built from.</summary>
+    /// <summary>The Jinja source this template was built from (trailing newline normalised, <c>{% generation %}</c> markers rewritten).</summary>
     public string TemplateSource { get; }
 
     /// <summary>The reasoning markup this template's model uses, detected from the source (#798).</summary>
@@ -142,6 +158,12 @@ public sealed class JinjaChatTemplate : IChatTemplate
                 tools.Add(toolDict);
             }
             context["tools"] = tools;
+
+            // SmolLM3 (#797): the template's tool section is gated on `xml_tools or python_tools` (HF callers
+            // pass xml_tools=...), so an OpenAI-style `tools` request rendered NO tool declarations and the model
+            // answered that it had no tools. Alias `tools` to `xml_tools` unless the client chose a branch itself.
+            if (_aliasXmlTools && !context.ContainsKey("xml_tools") && !context.ContainsKey("python_tools"))
+                context["xml_tools"] = tools;
         }
 
         return context;

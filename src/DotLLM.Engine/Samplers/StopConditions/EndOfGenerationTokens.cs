@@ -37,10 +37,16 @@ public static class EndOfGenerationTokens
     {
         var ids = new List<int> { tokenizer.EosTokenId };
 
+        // Ids the model file itself declares as end-of-turn / end-of-message (GGUF eot / eom).
+        foreach (int extra in tokenizer.ExtraEndOfGenerationTokenIds)
+            if (extra >= 0 && !ids.Contains(extra))
+                ids.Add(extra);
+
         // Scan the vocabulary by token TEXT rather than encoding the candidates: Gemma-4's "<eos>" (id 1) is
         // not pre-split as a special token, so Encode("<eos>") yields the literal characters, not [1].
         // One pass per tokenizer (cached), ~262k string compares for a 256k vocabulary.
         int vocab = tokenizer.VocabSize;
+        int endId = -1, returnId = -1, callId = -1;     // OpenAI Harmony markers, for the <|end|> rule below
         for (int id = 0; id < vocab; id++)
         {
             string text;
@@ -55,10 +61,24 @@ public static class EndOfGenerationTokens
                 continue;
             }
 
+            switch (text)
+            {
+                case "<|end|>": endId = id; break;
+                case "<|return|>": returnId = id; break;
+                case "<|call|>": callId = id; break;
+            }
+
             if (text.Length is >= 5 and <= 14 && text[0] == '<' && Array.IndexOf(Candidates, text) >= 0
                 && !ids.Contains(id))
                 ids.Add(id);
         }
+
+        // llama.cpp (llama-vocab.cpp): when a vocabulary has BOTH <|return|> and <|call|> it is a Harmony (gpt-oss)
+        // vocabulary, where <|end|> closes the analysis message and the turn continues with the final / commentary
+        // channel. A model file that declared <|end|> as eot/eom would end the turn after the thinking (#798), so it
+        // is never end-of-generation there, whatever the file says.
+        if (endId >= 0 && returnId >= 0 && callId >= 0 && endId != tokenizer.EosTokenId)
+            ids.Remove(endId);
 
         return ids.ToArray();
     }
