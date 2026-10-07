@@ -157,12 +157,6 @@ public static class PerplexityEvaluator
                 "each scored token needs at least one token of context, and at least one token must be scored.",
                 nameof(unscoredPrefix));
 
-        if (!model.ReturnsAllRows)
-            throw new NotSupportedException(
-                "Sliding-window mode requires a backend that returns all rows. Use PerplexityMode.TeacherForced " +
-                "for last-row-only backends — re-prefilling per target inside a window would be O(n^2) and is " +
-                "already what the growing-prefix path does.");
-
         int vocab = model.VocabSize;
         var positions = new int[context];
         var accumulator = new NllAccumulator();
@@ -199,6 +193,31 @@ public static class PerplexityEvaluator
 
             // Every window is an independent sequence (positions restart at 0), so the previous
             // window's recurrent state must not carry into this one — see #261.
+            if (!model.ReturnsAllRows)
+            {
+                // Last-row-only backend (#793): each scored target t gets its own prefill over window[..t-start]
+                // (positions 0..), whose final row predicts it. Same targets, geometry and BOS substitution as the
+                // all-rows path, so per-window PPL stays pairable with llama-perplexity. O(n^2) forwards, but only
+                // the scored half of the window is replayed.
+                windows++;
+                double gpNll = 0;
+                int gpScored = 0;
+                for (int t = start + prefix; t < start + context; t++)
+                {
+                    model.ResetState();
+                    using ITensor lastRow = model.Forward(window[..(t - start)], positions.AsSpan(0, t - start));
+                    var rowSpan = new ReadOnlySpan<float>((void*)lastRow.DataPointer, vocab);
+                    double nll = -LogProb.OfTarget(rowSpan, tokens[t]);
+                    gpNll += nll;
+                    gpScored++;
+                    accumulator.Add(nll);
+                    if (nllDump is not null)
+                        nllDump.WriteLine(FormattableString.Invariant($"{windows - 1} {t - start} {tokens[t]} {nll:R}"));
+                }
+                onWindow?.Invoke(windows - 1, Math.Exp(gpNll / gpScored), gpScored);
+                continue;
+            }
+
             model.ResetState();
             using ITensor logits = model.Forward(window, positions);
             windows++;

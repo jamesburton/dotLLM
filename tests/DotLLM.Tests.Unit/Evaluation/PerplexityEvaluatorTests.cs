@@ -160,6 +160,36 @@ public sealed class PerplexityEvaluatorTests
     }
 
     [Fact]
+    public void SlidingWindow_LastRowOnlyBackend_MatchesAllRowsBackendAndReplaysOnlyScoredHalf()
+    {
+        // #793: last-row-only backends (Vulkan hybrids) score a window by re-prefilling the growing prefix.
+        static float[] Rows(int position, int vocab)
+        {
+            var row = new float[vocab];
+            for (int j = 0; j < vocab; j++) row[j] = (float)Math.Sin((position + 1) * (j + 1) * 0.37);
+            return row;
+        }
+
+        var tokens = new int[48];
+        for (int i = 0; i < tokens.Length; i++) tokens[i] = (i * 7 + 3) % Vocab;
+        var options = new PerplexityOptions(PerplexityMode.SlidingWindow, 16, Stride: 16, UnscoredPrefix: 9);
+
+        using var allRows = new FakePerplexityModel(Vocab, 16, returnsAllRows: true, Rows);
+        using var lastRow = new FakePerplexityModel(Vocab, 16, returnsAllRows: false, Rows);
+        var a = PerplexityEvaluator.Evaluate(allRows, tokens, options);
+        var b = PerplexityEvaluator.Evaluate(lastRow, tokens, options);
+
+        Assert.Equal(a.Perplexity, b.Perplexity, 9);
+        Assert.Equal(a.ScoredTokens, b.ScoredTokens);
+        Assert.Equal(a.Windows, b.Windows);
+        // 3 windows x targets 9..15 (7 each), prefixes of length 9..15.
+        Assert.Equal(21, lastRow.ForwardCalls.Count);
+        Assert.Equal(9, lastRow.ForwardCalls[0].Length);
+        Assert.Equal(15, lastRow.ForwardCalls[6].Length);
+        Assert.Equal(9, lastRow.ForwardCalls[7].Length);
+    }
+
+    [Fact]
     public void SlidingWindow_RejectsUnscoredPrefixLeavingNothingToScore()
     {
         using var model = new FakePerplexityModel(Vocab, 64, returnsAllRows: true, FakePerplexityModel.Uniform);
