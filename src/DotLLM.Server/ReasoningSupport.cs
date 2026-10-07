@@ -17,11 +17,21 @@ internal sealed class ReasoningPlan
 
     private readonly ReasoningFormat _format;
 
-    internal ReasoningPlan(ReasoningFormat format, bool promptOpened)
+    internal ReasoningPlan(ReasoningFormat format, bool promptOpened, ReasoningMarkup markup = ReasoningMarkup.Think)
     {
         _format = format;
         PromptOpened = promptOpened;
+        Markup = markup;
     }
+
+    /// <summary>The model's reasoning markup (<c>&lt;think&gt;</c>, Gemma-4 channel, Harmony). Set even when splitting is off.</summary>
+    public ReasoningMarkup Markup { get; }
+
+    /// <summary>
+    /// Drops the stop strings this model's markup forbids (Harmony's <c>&lt;|end|&gt;</c> closes the analysis
+    /// message, it does not end the turn). Applies even when reasoning splitting is disabled.
+    /// </summary>
+    public IReadOnlyList<string> FilterStops(IReadOnlyList<string> stops) => Markup.FilterStops(stops);
 
     /// <summary>True when output is split.</summary>
     public bool Enabled => _format != ReasoningFormat.None;
@@ -30,8 +40,11 @@ internal sealed class ReasoningPlan
     public bool PromptOpened { get; }
 
     /// <summary>A fresh splitter for one generated sequence, or null when <see cref="Enabled"/> is false.</summary>
-    public ReasoningSplitter? NewSplitter()
-        => Enabled ? new ReasoningSplitter(PromptOpened, detectAnywhere: _format == ReasoningFormat.Deepseek) : null;
+    public IReasoningSplitter? NewSplitter()
+        => !Enabled ? null
+            : Markup == ReasoningMarkup.Harmony
+                ? new HarmonySplitter()
+                : new ReasoningSplitter(PromptOpened, _format == ReasoningFormat.Deepseek, Markup.OpenTag(), Markup.CloseTag());
 
     /// <summary>
     /// Applies the stop-sequence gate: stop strings (other than the template's control tokens) are suspended
@@ -43,9 +56,9 @@ internal sealed class ReasoningPlan
             ? options with
             {
                 ReasoningStopGate = new StopGate(
-                    ReasoningFormats.OpenTag, ReasoningFormats.CloseTag, PromptOpened,
+                    Markup.OpenTag(), Markup.CloseTag(), PromptOpened,
                     OpenOnlyAtStart: _format != ReasoningFormat.Deepseek),
-                StopSequencesUngated = ungatedStops,
+                StopSequencesUngated = Markup.FilterStops(ungatedStops),
             }
             : options;
 
@@ -57,7 +70,18 @@ internal sealed class ReasoningPlan
         if (!Enabled)
             return (null, text, 0);
 
-        var (reasoning, content, state) = ReasoningSplitter.Split(text, PromptOpened, _format == ReasoningFormat.Deepseek);
+        string reasoning, content;
+        IReasoningSplitter state;
+        if (Markup == ReasoningMarkup.Harmony)
+        {
+            var h = HarmonySplitter.Split(text);
+            (reasoning, content, state) = (h.Reasoning, h.Content, h.State);
+        }
+        else
+        {
+            var t = ReasoningSplitter.Split(text, PromptOpened, _format == ReasoningFormat.Deepseek, Markup.OpenTag(), Markup.CloseTag());
+            (reasoning, content, state) = (t.Reasoning, t.Content, t.State);
+        }
         if (!state.SawReasoning)
             return (null, content, 0);
 
@@ -158,29 +182,33 @@ internal static class ReasoningSupport
     /// one whose template did not actually open a block, still splits a model-emitted <c>&lt;think&gt;</c>
     /// only when not constrained: constrained output is the answer from its first token.
     /// </summary>
-    internal static ReasoningPlan Plan(ReasoningFormat serverFormat, string? requestFormat, bool constrained, string prompt, out string? error)
+    internal static ReasoningPlan Plan(ReasoningFormat serverFormat, string? requestFormat, bool constrained, string prompt, out string? error,
+        IChatTemplate? template = null)
     {
         error = null;
+        var markup = (template as JinjaChatTemplate)?.ReasoningMarkup ?? ReasoningMarkup.Think;
         var format = serverFormat;
         if (requestFormat is not null)
         {
             if (!ReasoningFormats.TryParse(requestFormat, out format))
             {
                 error = $"reasoning_format: unknown value '{requestFormat}'. Expected: none, auto, deepseek.";
-                return ReasoningPlan.Disabled;
+                return new ReasoningPlan(ReasoningFormat.None, false, markup);
             }
         }
 
         if (constrained || format == ReasoningFormat.None)
-            return ReasoningPlan.Disabled;
-        return new ReasoningPlan(format, ReasoningFormats.PromptOpensThinking(prompt));
+            return markup == ReasoningMarkup.Think ? ReasoningPlan.Disabled : new ReasoningPlan(ReasoningFormat.None, false, markup);
+        bool opened = markup != ReasoningMarkup.Harmony
+            && ReasoningFormats.PromptOpensThinking(prompt, markup.OpenTag(), markup.CloseTag());
+        return new ReasoningPlan(format, opened, markup);
     }
 
     /// <summary>
     /// Counts one streamed token toward reasoning: true when the splitter was inside a block before the
     /// token or is inside one after it (so both the opening and the closing tag tokens count).
     /// </summary>
-    internal static bool IsReasoningToken(bool wasInReasoning, ReasoningSplitter splitter)
+    internal static bool IsReasoningToken(bool wasInReasoning, IReasoningSplitter splitter)
         => wasInReasoning || splitter.InReasoning;
 
     /// <summary>Usage details, or null when no reasoning was produced.</summary>

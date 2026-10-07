@@ -397,6 +397,28 @@ generated token, which cannot coexist with an open think block. So for such a re
 `enable_thinking: true` together with a constraint only if the model's template really expects it — the constraint will then apply to the reasoning
 too.
 
+**Other markups: Gemma-4 and gpt-oss (#798).** The wire markup is a property of the *model*, detected from its chat template at load
+(`ReasoningMarkups.Detect`, stored on `JinjaChatTemplate.ReasoningMarkup`); `--reasoning-format` stays the user-facing policy and applies to all of them.
+
+| family | markup the model emits | `reasoning_content` | `content` / `tool_calls` |
+|---|---|---|---|
+| Qwen3.x, GLM, Nemotron, DeepSeek-R1, ... | `<think>…</think>` | the think block | after `</think>` |
+| Gemma-4 | `<|channel>thought\n…<channel|>` (the same incremental splitter, different tag pair, mirroring llama.cpp's `thinking_start_tag`/`thinking_end_tag`) | the thought | after `<channel|>`; a `<|tool_call>call:…<tool_call|>` there is parsed as a tool call |
+| gpt-oss (Harmony) | channel messages: `<|channel|>analysis<|message|>…<|end|>`, `<|start|>assistant<|channel|>final<|message|>…`, `<|start|>assistant<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{…}<|call|>` | every `analysis` message | `final` (and a commentary *preamble* with no recipient) is `content`; a commentary message **with a recipient** is a tool call |
+
+Harmony is a *sequence* of messages rather than one block, so it has its own splitter (`HarmonySplitter`, behind the same `IReasoningSplitter`
+interface). It buffers each header until `<|message|>` (so no marker is ever split across chunks), accepts the recipient either after the channel or in the
+role header (`<|start|>assistant to=functions.x<|channel|>commentary json<|message|>`), joins consecutive messages of one stream with a blank line, and passes a
+recipient message through *raw* into the answer stream so the Harmony tool parser and the streaming tool-call suppressor see what they would on unsplit output.
+Streamed and non-streamed results are identical under any chunking (tests feed one character at a time).
+
+Two stop-set facts are specific to Harmony. `<|end|>` closes the *analysis* message and is followed by the final / commentary channel, so it is **not** a stop
+string for a Harmony model (every other family's template wants it as one; it used to end the turn right after the thinking, so a gpt-oss request returned only
+the analysis); it is dropped from the server's default stop list and from the list of control tokens that end a turn even inside reasoning, on `/v1/chat/completions` and `/v1/messages` (`ReasoningPlan.FilterStops`; the ollama surface adds no `<|end|>` stop of its own).
+Generation ends on `<|return|>` (the declared EOS) or `<|call|>` (added to the end-of-generation set; llama.cpp treats both as EOG). The reasoning stop gate for Harmony
+suspends user stop strings between `<|channel|>analysis<|message|>` and `<|end|>`. `reasoning_effort` (`low`/`medium`/`high`) is a real template variable on gpt-oss
+and is passed through; there is no thinking *off* for it.
+
 **Multi-turn.** An earlier assistant turn's reasoning goes back in as `reasoning_content` (OpenAI surface; `reasoning` is accepted as an alias),
 as a `thinking` block (Anthropic) or `thinking` (ollama messages), and reaches the template as `message.reasoning_content`. Whether it is rendered into
 the history is the template's call — Qwen3.x keeps it unless `chat_template_kwargs.preserve_thinking` is `false`. The web UI replays reasoning the same

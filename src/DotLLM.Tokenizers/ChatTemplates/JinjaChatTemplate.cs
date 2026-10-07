@@ -48,11 +48,20 @@ public sealed class JinjaChatTemplate : IChatTemplate
             && !templateSource.Contains("tools is defined", StringComparison.Ordinal)
             && !templateSource.Contains("if tools", StringComparison.Ordinal);
 
+        TemplateSource = templateSource;
+        ReasoningMarkup = Reasoning.ReasoningMarkups.Detect(templateSource);
+
         var lexer = new JinjaLexer(templateSource);
         var tokens = lexer.Tokenize();
         var parser = new JinjaParser(tokens);
         _ast = parser.Parse();
     }
+
+    /// <summary>The Jinja source this template was built from (trailing newline normalised, <c>{% generation %}</c> markers rewritten).</summary>
+    public string TemplateSource { get; }
+
+    /// <summary>The reasoning markup this template's model uses, detected from the source (#798).</summary>
+    public Reasoning.ReasoningMarkup ReasoningMarkup { get; }
 
     /// <inheritdoc/>
     public string Apply(IReadOnlyList<ChatMessage> messages, ChatTemplateOptions options)

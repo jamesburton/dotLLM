@@ -68,15 +68,21 @@ public static class ReasoningFormats
     /// generation prompt of Qwen3.x-style templates (<c>&lt;think&gt;\n</c>); the whitespace-only tail
     /// keeps a literal <c>&lt;think&gt;</c> in an earlier user message from being mistaken for it.
     /// </summary>
-    public static bool PromptOpensThinking(string prompt)
+    public static bool PromptOpensThinking(string prompt) => PromptOpensThinking(prompt, OpenTag, CloseTag);
+
+    /// <summary>
+    /// <see cref="PromptOpensThinking(string)"/> for an arbitrary tag pair (Gemma-4: <c>&lt;|channel&gt;thought</c> /
+    /// <c>&lt;channel|&gt;</c>, whose generation prompt ends in an open channel after a tool response).
+    /// </summary>
+    public static bool PromptOpensThinking(string prompt, string openTag, string closeTag)
     {
-        int open = prompt.LastIndexOf(OpenTag, StringComparison.Ordinal);
+        int open = prompt.LastIndexOf(openTag, StringComparison.Ordinal);
         if (open < 0)
             return false;
-        int close = prompt.LastIndexOf(CloseTag, StringComparison.Ordinal);
+        int close = prompt.LastIndexOf(closeTag, StringComparison.Ordinal);
         if (close > open)
             return false;
-        return prompt.AsSpan(open + OpenTag.Length).IsWhiteSpace();
+        return prompt.AsSpan(open + openTag.Length).IsWhiteSpace();
     }
 
     /// <summary>
@@ -85,8 +91,14 @@ public static class ReasoningFormats
     /// </summary>
     /// <param name="format">Server reasoning format.</param>
     /// <param name="prompt">The rendered prompt the model is about to continue.</param>
-    public static ReasoningSplitter? CreateSplitter(ReasoningFormat format, string prompt)
+    /// <param name="markup">The model's reasoning markup.</param>
+    public static IReasoningSplitter? CreateSplitter(ReasoningFormat format, string prompt, ReasoningMarkup markup = ReasoningMarkup.Think)
         => format == ReasoningFormat.None
             ? null
-            : new ReasoningSplitter(PromptOpensThinking(prompt), detectAnywhere: format == ReasoningFormat.Deepseek);
+            : markup == ReasoningMarkup.Harmony
+                ? new HarmonySplitter()
+                : new ReasoningSplitter(
+                    PromptOpensThinking(prompt, markup.OpenTag(), markup.CloseTag()),
+                    detectAnywhere: format == ReasoningFormat.Deepseek,
+                    markup.OpenTag(), markup.CloseTag());
 }
