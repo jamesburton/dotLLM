@@ -1711,6 +1711,14 @@ public sealed class VulkanDevice : IDisposable
         long.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DEVICE_LOCAL_LIMIT_MIB"), out long mib) && mib >= 0
             ? mib * 1024 * 1024 : -1;
 
+    private long _deviceLocalLimitBytes = s_deviceLocalLimitBytes;
+
+    /// <summary>Per-instance override of the synthetic device-local limit (test hook, issue #810); &lt; 0 disables.</summary>
+    internal void SetDeviceLocalLimitBytes(long bytes) => _deviceLocalLimitBytes = bytes;
+
+    /// <summary>Live bytes this device holds on <paramref name="heap"/> (test hook).</summary>
+    internal long LiveBytesOnHeap(int heap) => Interlocked.Read(ref _liveBytesByHeap[heap]);
+
     private readonly long[] _fallbackBytesByHeap = new long[16];
     private int _fallbackLogged;
 
@@ -1962,8 +1970,8 @@ public sealed class VulkanDevice : IDisposable
         {
             typeIndex = preferredTypeIndex;
             mai.memoryTypeIndex = typeIndex;
-            if (deviceLocal && s_deviceLocalLimitBytes >= 0
-                && Interlocked.Read(ref _liveBytesByHeap[HeapOfType(typeIndex)]) + (long)req.size > s_deviceLocalLimitBytes)
+            if (deviceLocal && _deviceLocalLimitBytes >= 0
+                && Interlocked.Read(ref _liveBytesByHeap[HeapOfType(typeIndex)]) + (long)req.size > _deviceLocalLimitBytes)
             {
                 allocResult = VkErrorOutOfDeviceMemory; memory = 0; // synthetic exhaustion (#810 knob)
             }
