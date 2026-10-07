@@ -108,7 +108,7 @@ public static class MessagesEndpoint
             return;
         }
 
-        var plan = ReasoningSupport.Plan(state.Options.ReasoningFormat, request.ReasoningFormat, constrained, prompt, out string? planError);
+        var plan = ReasoningSupport.Plan(state.Options.ReasoningFormat, request.ReasoningFormat, constrained, prompt, out string? planError, state.ChatTemplate);
         if (planError is not null)
         {
             await WriteErrorAsync(httpContext, 400, "invalid_request_error", planError);
@@ -125,7 +125,7 @@ public static class MessagesEndpoint
             return;
         }
 
-        var options = AnthropicConverter.ToInferenceOptions(request, CommonStopSequences,
+        var options = AnthropicConverter.ToInferenceOptions(request, plan.FilterStops(CommonStopSequences),
             state.EffectiveSamplingDefaults,
             new DotLLM.Core.Configuration.ThreadingConfig(state.Options.Threads, state.Options.DecodeThreads));
         options = plan.Gate(options with { MaxTokens = effectiveMaxTokens }, ReasoningSupport.UngatedStops);

@@ -27,13 +27,12 @@ public readonly record struct ReasoningChunk(string Reasoning, string Content)
 /// <para>An unclosed block (generation hit <c>max_tokens</c> mid-thought) leaves everything as
 /// reasoning and <c>content</c> empty.</para>
 /// </remarks>
-public sealed class ReasoningSplitter
+public sealed class ReasoningSplitter : IReasoningSplitter
 {
     private enum Mode { Detect, Reasoning, Content }
 
-    private const string Open = ReasoningFormats.OpenTag;
-    private const string Close = ReasoningFormats.CloseTag;
-
+    private readonly string _open;
+    private readonly string _close;
     private readonly bool _detectAnywhere;
     private readonly StringBuilder _buf = new();
     private readonly StringBuilder _reasoningOut = new();
@@ -48,8 +47,13 @@ public sealed class ReasoningSplitter
     /// <summary>Creates a splitter.</summary>
     /// <param name="startInReasoning">The prompt already opened a think block, so output starts as reasoning.</param>
     /// <param name="detectAnywhere">Recognise <c>&lt;think&gt;</c> at any position, not only the start of the output.</param>
-    public ReasoningSplitter(bool startInReasoning, bool detectAnywhere = false)
+    /// <param name="openTag">Opening tag; default <c>&lt;think&gt;</c> (Gemma-4 passes <c>&lt;|channel&gt;thought</c>).</param>
+    /// <param name="closeTag">Closing tag; default <c>&lt;/think&gt;</c> (Gemma-4 passes <c>&lt;channel|&gt;</c>).</param>
+    public ReasoningSplitter(bool startInReasoning, bool detectAnywhere = false,
+        string openTag = ReasoningFormats.OpenTag, string closeTag = ReasoningFormats.CloseTag)
     {
+        _open = openTag;
+        _close = closeTag;
         _detectAnywhere = detectAnywhere;
         _mode = startInReasoning ? Mode.Reasoning : Mode.Detect;
         _skipReasoningWs = startInReasoning;
@@ -89,9 +93,10 @@ public sealed class ReasoningSplitter
 
     /// <summary>One-shot split of a complete output.</summary>
     public static (string Reasoning, string Content, ReasoningSplitter State) Split(
-        string text, bool startInReasoning, bool detectAnywhere = false)
+        string text, bool startInReasoning, bool detectAnywhere = false,
+        string openTag = ReasoningFormats.OpenTag, string closeTag = ReasoningFormats.CloseTag)
     {
-        var s = new ReasoningSplitter(startInReasoning, detectAnywhere);
+        var s = new ReasoningSplitter(startInReasoning, detectAnywhere, openTag, closeTag);
         var a = s.Feed(text);
         var b = s.Finish();
         return (a.Reasoning + b.Reasoning, a.Content + b.Content, s);
@@ -135,13 +140,13 @@ public sealed class ReasoningSplitter
             _mode = Mode.Content;
             return false;
         }
-        if (t.StartsWith(Open, StringComparison.Ordinal))
+        if (t.StartsWith(_open, StringComparison.Ordinal))
         {
-            _buf.Clear().Append(t, Open.Length, t.Length - Open.Length);
+            _buf.Clear().Append(t, _open.Length, t.Length - _open.Length);
             EnterReasoning();
             return true;
         }
-        if (!final && t.Length < Open.Length && Open.StartsWith(t, StringComparison.Ordinal))
+        if (!final && t.Length < _open.Length && _open.StartsWith(t, StringComparison.Ordinal))
             return false;                      // could still become "<think>"
         _mode = Mode.Content;                  // not thinking: whitespace and all belongs to the answer
         return true;
@@ -164,12 +169,12 @@ public sealed class ReasoningSplitter
         }
 
         string s = _buf.ToString();
-        int idx = s.IndexOf(Close, StringComparison.Ordinal);
+        int idx = s.IndexOf(_close, StringComparison.Ordinal);
         if (idx >= 0)
         {
             _reasoningOut.Append(s, 0, idx);
             TrimEnd(_reasoningOut);
-            _buf.Clear().Append(s, idx + Close.Length, s.Length - idx - Close.Length);
+            _buf.Clear().Append(s, idx + _close.Length, s.Length - idx - _close.Length);
             _reasoningRawEnd = _fed - _buf.Length;
             _mode = Mode.Content;
             _skipContentWs = true;
@@ -187,7 +192,7 @@ public sealed class ReasoningSplitter
         }
 
         // Emit everything that is neither a possible partial closing tag nor trailing whitespace.
-        int safe = s.Length - PartialTagSuffix(s, Close);
+        int safe = s.Length - PartialTagSuffix(s, _close);
         int emit = s.AsSpan(0, safe).TrimEnd().Length;
         if (emit > 0)
         {
@@ -217,15 +222,15 @@ public sealed class ReasoningSplitter
         }
 
         string s = _buf.ToString();
-        int idx = s.IndexOf(Open, StringComparison.Ordinal);
+        int idx = s.IndexOf(_open, StringComparison.Ordinal);
         if (idx >= 0)
         {
             _contentOut.Append(s, 0, idx);
-            _buf.Clear().Append(s, idx + Open.Length, s.Length - idx - Open.Length);
+            _buf.Clear().Append(s, idx + _open.Length, s.Length - idx - _open.Length);
             EnterReasoning();
             return true;
         }
-        int hold = final ? 0 : PartialTagSuffix(s, Open);
+        int hold = final ? 0 : PartialTagSuffix(s, _open);
         _contentOut.Append(s, 0, s.Length - hold);
         _buf.Remove(0, s.Length - hold);
         return false;
