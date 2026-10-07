@@ -1585,11 +1585,11 @@ public sealed class VulkanTransformerModel : IModel
             // Q4_K MMVQ (issue #52) reuses quantizeQ8_1; it is an independent
             // weight-format path, so a missing Q4_K SPV must not disable Q8_0
             // MMVQ (and vice versa).
-            matmulQ4KMmvq = MatMulQ4KMmvqKernel.TryCreate(device, spvDir);
+            matmulQ4KMmvq = IsMmvqQuantOff("q4_k") ? null : MatMulQ4KMmvqKernel.TryCreate(device, spvDir);
             // Q6_K / Q5_K MMVQ (issue #338), Q2_K / Q3_K MMVQ (issue #339) — same
             // independent-path policy.
-            matmulQ6KMmvq = MatMulQ6KMmvqKernel.TryCreate(device, spvDir);
-            matmulQ5KMmvq = MatMulQ5KMmvqKernel.TryCreate(device, spvDir);
+            matmulQ6KMmvq = IsMmvqQuantOff("q6_k") ? null : MatMulQ6KMmvqKernel.TryCreate(device, spvDir);
+            matmulQ5KMmvq = IsMmvqQuantOff("q5_k") ? null : MatMulQ5KMmvqKernel.TryCreate(device, spvDir);
             matmulQ2KMmvq = MatMulQ2KMmvqKernel.TryCreate(device, spvDir);
             matmulQ3KMmvq = MatMulQ3KMmvqKernel.TryCreate(device, spvDir);
             // IQ4_NL / IQ4_XS MMVQ (issue #339) — codebook-lookup quants.
@@ -2246,6 +2246,18 @@ public sealed class VulkanTransformerModel : IModel
 
     internal static bool IsMmvqDisabled() =>
         Environment.GetEnvironmentVariable(DisableMmvqEnvVar) == "1";
+
+    /// <summary>EXPERIMENT (#801): comma list of quants whose dp4a MMVQ decode kernel is skipped (q4_k,q5_k,q6_k).</summary>
+    internal const string MmvqOffEnvVar = "DOTLLM_VULKAN_MMVQ_OFF";
+
+    internal static bool IsMmvqQuantOff(string quant)
+    {
+        string? v = Environment.GetEnvironmentVariable(MmvqOffEnvVar);
+        if (string.IsNullOrEmpty(v)) return false;
+        foreach (var part in v.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+            if (string.Equals(part, quant, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
 
     /// <summary>
     /// Env-var opt-out for the indexed MoE MMVQ decode path (issue #137). Set
