@@ -33,6 +33,27 @@ public class EndOfGenerationRealTokenizerTests
     }
 
     [SkippableFact]
+    public void Glm47Flash_StopsOnUserEot_AndObservationEom()
+    {
+        // #797: eos is <|endoftext|>, but the model ends a turn with <|user|> (eot) and a tool call with
+        // <|observation|> (eom); both are declared in the GGUF and were ignored, so generation ran on.
+        var loc = TestFixtureResolver.ResolveFile(
+            "DOTLLM_GLM47_FLASH_GGUF", "unsloth", "GLM-4.7-Flash-GGUF", "GLM-4.7-Flash-Q4_K_M.gguf");
+        Skip.If(!loc.Found, loc.SkipMessage("GLM-4.7-Flash Q4_K_M"));
+
+        using var gguf = GgufFile.Open(loc.Path!);
+        var tokenizer = GgufTokenizerFactory.Load(gguf.Metadata);
+
+        int[] ids = EndOfGenerationTokens.Resolve(tokenizer);
+
+        Assert.Equal("<|endoftext|>", tokenizer.DecodeToken(tokenizer.EosTokenId));
+        Assert.Contains(154827, ids);
+        Assert.Equal("<|user|>", tokenizer.DecodeToken(154827));
+        Assert.Contains(154829, ids);
+        Assert.Equal("<|observation|>", tokenizer.DecodeToken(154829));
+    }
+
+    [SkippableFact]
     public void Llama32_1B_StopsOnEotAndEom()
     {
         var loc = TestFixtureResolver.ResolveFile(

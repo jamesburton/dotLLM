@@ -37,6 +37,11 @@ public static class EndOfGenerationTokens
     {
         var ids = new List<int> { tokenizer.EosTokenId };
 
+        // Ids the model file itself declares as end-of-turn / end-of-message (GGUF eot / eom).
+        foreach (int extra in tokenizer.ExtraEndOfGenerationTokenIds)
+            if (extra >= 0 && !ids.Contains(extra))
+                ids.Add(extra);
+
         // Scan the vocabulary by token TEXT rather than encoding the candidates: Gemma-4's "<eos>" (id 1) is
         // not pre-split as a special token, so Encode("<eos>") yields the literal characters, not [1].
         // One pass per tokenizer (cached), ~262k string compares for a 256k vocabulary.

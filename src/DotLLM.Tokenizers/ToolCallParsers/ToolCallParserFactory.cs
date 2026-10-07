@@ -24,6 +24,13 @@ public static class ToolCallParserFactory
             if (chatTemplate.Contains("<|tool_call>", StringComparison.Ordinal))
                 return new Gemma4ToolCallParser();
 
+            // GLM-4.5/4.6/4.7: `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`. It ALSO
+            // contains the bare "<tool_call>" the Hermes check below keys on, so it must come first. Keyed on
+            // `<arg_key>`, which no other family's template carries. (GLM-4.7-Flash's architecture is deepseek2,
+            // so there is no architecture fallback: the template is the only signal.)
+            if (chatTemplate.Contains("<arg_key>", StringComparison.Ordinal))
+                return new GlmToolCallParser();
+
             // Qwen3-Coder XML (Qwen3.5/3.6/3.8, Ornith, Qwen3-Coder, Nemotron-3): the template shows
             // <tool_call><function=NAME><parameter=KEY>. It ALSO contains the bare "<tool_call>" the
             // Hermes check below keys on, so it must be tested before it. The parser is a superset

@@ -73,10 +73,10 @@ internal static class ToolChoiceBinder
         };
         if (schema is null)
         {
-            // The endpoints stop on "</tool_call>" so Hermes-style output ends cleanly. For the Qwen XML
-            // family that would cut a parallel-call completion after the FIRST call (the second
+            // The endpoints stop on "</tool_call>" so Hermes-style output ends cleanly. For the Qwen XML and GLM
+            // families that would cut a parallel-call completion after the FIRST call (the second
             // <tool_call> block is never generated), and the model ends its turn with <|im_end|> anyway.
-            if (modelParser is QwenXmlToolCallParser && options.StopSequences.Contains("</tool_call>"))
+            if (modelParser is QwenXmlToolCallParser or GlmToolCallParser && options.StopSequences.Contains("</tool_call>"))
                 options = options with { StopSequences = options.StopSequences.Where(s => s != "</tool_call>").ToList() };
             return modelParser;
         }
