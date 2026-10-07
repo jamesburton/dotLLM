@@ -1,0 +1,12 @@
+1.  **Analyze the Request:**
+    *   Question: "What is the capital of France?"
+    *   Constraint: "Answer in one word."
+
+2.  **Identify the Fact:**
+    *   The capital of France is Paris.
+
+3.  **Check Constraints:**
+    *   The answer "Paris" is a single word.
+
+4.  **Formulate Output:**
+    *   Output: Paris.</think>Paris
