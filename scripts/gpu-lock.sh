@@ -28,7 +28,7 @@
 #   gpu-lock.sh acquire <name> <reason> [timeout-sec=900] [stale-sec=5400]
 #   gpu-lock.sh refresh <name>           # bump timestamp during long operations
 #   gpu-lock.sh release <name>           # idempotent; only releases if you own it
-#   gpu-lock.sh status                   # prints holder or "FREE"
+#   gpu-lock.sh status                   # prints queue (if any) and holder or "FREE"
 #   gpu-lock.sh force-clear              # admin override (overseer only)
 #
 # Exit codes:
@@ -87,6 +87,48 @@ _gpu_lock_default_dir() {
 LOCK_DIR="${DOTLLM_GPU_LOCK_DIR:-$(_gpu_lock_default_dir)/.gpu-lock}"
 HOLDER_FILE="$LOCK_DIR/holder"
 
+# ── FIFO queue (fairness) ───────────────────────────────────────────────────────
+# A plain mkdir race starves waiters: whoever polls at the instant of release wins, and a
+# holder that immediately re-acquires beats every sleeper (observed 2026-10-07: one agent made
+# seven 10-minute attempts and never got the lock). Waiters therefore take a ticket in
+# "$LOCK_DIR.queue/<name>" holding their FIRST-SEEN epoch; only the oldest live ticket may try
+# mkdir. A ticket is "live" while it was touched within QUEUE_GRACE seconds, so a waiter whose
+# acquire timed out and who retries promptly keeps its place, and a dead waiter drops out.
+# DOTLLM_GPU_LOCK_NOQUEUE=1 restores the old unfair behaviour.
+QUEUE_DIR="$LOCK_DIR.queue"
+QUEUE_GRACE="${DOTLLM_GPU_LOCK_QUEUE_GRACE:-300}"
+
+_ticket_name() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+# Prints the name of the oldest live ticket (expired tickets are removed), or nothing.
+_queue_head() {
+  local now f last t best="" bestt=0 b
+  now=$(date +%s)
+  for f in "$QUEUE_DIR"/*; do
+    [ -f "$f" ] || continue
+    last=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+    if [ $((now - last)) -gt "$QUEUE_GRACE" ]; then rm -f "$f"; continue; fi
+    t=$(cat "$f" 2>/dev/null | tr -d '\r'); t=${t:-0}
+    b=$(basename "$f")
+    if [ -z "$best" ] || [ "$t" -lt "$bestt" ] || { [ "$t" -eq "$bestt" ] && [[ "$b" < "$best" ]]; }; then
+      best="$b"; bestt="$t"
+    fi
+  done
+  printf '%s' "$best"
+}
+
+# Registers/refreshes the caller's ticket; keeps the original first-seen time if still live.
+_queue_touch() {
+  local ticket="$QUEUE_DIR/$1" now last
+  mkdir -p "$QUEUE_DIR" 2>/dev/null
+  now=$(date +%s)
+  if [ -f "$ticket" ]; then
+    last=$(stat -c %Y "$ticket" 2>/dev/null || echo 0)
+    if [ $((now - last)) -le "$QUEUE_GRACE" ]; then touch "$ticket"; return; fi
+  fi
+  printf '%s\n' "$now" > "$ticket"
+}
+
 cmd="${1:-}"
 
 case "$cmd" in
@@ -102,9 +144,20 @@ case "$cmd" in
 
     start=$(date +%s)
     while true; do
+      # Fair queue: only the oldest live ticket may try to take the lock.
+      my_turn=1
+      if [ -z "${DOTLLM_GPU_LOCK_NOQUEUE:-}" ]; then
+        ticket=$(_ticket_name "$name")
+        _queue_touch "$ticket"
+        head=$(_queue_head)
+        if [ -n "$head" ] && [ "$head" != "$ticket" ]; then my_turn=0; fi
+      fi
+
       # Try to take the lock atomically.
-      if mkdir "$LOCK_DIR" 2>/dev/null; then
-        printf '%s|%s|%s|%s\n' "$$" "$name" "$(date +%s)" "$reason" > "$HOLDER_FILE"
+      if [ "$my_turn" = 1 ] && mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s|%s|%s|%s
+' "$$" "$name" "$(date +%s)" "$reason" > "$HOLDER_FILE"
+        [ -z "${DOTLLM_GPU_LOCK_NOQUEUE:-}" ] && rm -f "$QUEUE_DIR/$ticket"
         echo "[gpu-lock] acquired by '$name' (pid $$): $reason"
         exit 0
       fi
@@ -177,6 +230,16 @@ case "$cmd" in
     ;;
 
   status)
+    q=""
+    if [ -d "$QUEUE_DIR" ]; then
+      now=$(date +%s)
+      for f in "$QUEUE_DIR"/*; do
+        [ -f "$f" ] || continue
+        last=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+        [ $((now - last)) -le "$QUEUE_GRACE" ] && q="$q $(basename "$f")($(cat "$f" 2>/dev/null | tr -d ''))"
+      done
+    fi
+    [ -n "$q" ] && echo "QUEUE (name(first-seen epoch)):$q"
     if [ ! -d "$LOCK_DIR" ]; then
       echo "FREE"
       exit 0
