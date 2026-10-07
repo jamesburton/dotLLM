@@ -51,8 +51,30 @@ internal sealed class VulkanWeights : IDisposable
     /// and consumed by the fused sigmoid-gated add kernel when present.
     /// </para>
     /// </remarks>
+    /// <summary>
+    /// gpt-oss (#737) MoE extras: router bias, per-expert gate/up/down biases (device F32), and
+    /// the activation / gating flags. Null on every other architecture.
+    /// </summary>
+    internal sealed class GptOssMoeBuffers : IDisposable
+    {
+        public VulkanDevice.Buffer? RouterBias;
+        public VulkanDevice.Buffer? GateBias;   // [numExperts, intermediate]
+        public VulkanDevice.Buffer? UpBias;     // [numExperts, intermediate]
+        public VulkanDevice.Buffer? DownBias;   // [numExperts, hidden]
+        public bool UseSwiGluOai;
+        public bool SoftmaxAfterTopK;
+
+        public void Dispose()
+        {
+            RouterBias?.Dispose(); GateBias?.Dispose(); UpBias?.Dispose(); DownBias?.Dispose();
+        }
+    }
+
     internal readonly struct MoeLayerBuffers
     {
+        /// <summary>gpt-oss extras (biases, OAI SwiGLU, raw-top-k gating); null elsewhere.</summary>
+        public readonly GptOssMoeBuffers? GptOss;
+
         public readonly VulkanDevice.Buffer Gate;       // [numExperts, hidden]
         public readonly VulkanDevice.Buffer W1Bank;     // [numExperts, intermediate, hidden]
         public readonly VulkanDevice.Buffer W2Bank;     // [numExperts, hidden, intermediate]
@@ -117,8 +139,10 @@ internal sealed class VulkanWeights : IDisposable
             VulkanDevice.Buffer[]? sharedW1, VulkanDevice.Buffer[]? sharedW2, VulkanDevice.Buffer[]? sharedW3,
             QuantizationType sharedW1DeviceQt, QuantizationType sharedW2DeviceQt, QuantizationType sharedW3DeviceQt,
             int sharedIntermediateSize, int numSharedExperts,
-            VulkanDevice.Buffer? sharedExpertGate, QuantizationType sharedExpertGateDeviceQt)
+            VulkanDevice.Buffer? sharedExpertGate, QuantizationType sharedExpertGateDeviceQt,
+            GptOssMoeBuffers? gptOss = null)
         {
+            GptOss = gptOss;
             Gate = gate;
             GateDeviceQuantType = gateDeviceQt;
             W1Bank = w1;
@@ -157,6 +181,7 @@ internal sealed class VulkanWeights : IDisposable
             if (SharedW3 is not null)
                 for (int i = 0; i < SharedW3.Length; i++) SharedW3[i].Dispose();
             SharedExpertGate?.Dispose();
+            GptOss?.Dispose();
         }
     }
 
@@ -397,6 +422,9 @@ internal sealed class VulkanWeights : IDisposable
         /// </summary>
         public readonly Gemma4LayerBuffers? Gemma4;
 
+        /// <summary>gpt-oss per-head attention-sink logits <c>[numHeads]</c> (F32); null elsewhere (#737).</summary>
+        public readonly VulkanDevice.Buffer? AttnSinks;
+
         public readonly VulkanDevice.Buffer FfnNormWeight;
 
         public readonly VulkanDevice.Buffer Gate;
@@ -431,8 +459,10 @@ internal sealed class VulkanWeights : IDisposable
             MoeLayerBuffers? moe = null,
             Gemma4LayerBuffers? gemma4 = null,
             VulkanDevice.Buffer? qNorm = null,
-            VulkanDevice.Buffer? kNorm = null)
+            VulkanDevice.Buffer? kNorm = null,
+            VulkanDevice.Buffer? attnSinks = null)
         {
+            AttnSinks = attnSinks;
             AttnNormWeight = attnNorm;
             QNormWeight = qNorm;
             KNormWeight = kNorm;
@@ -461,6 +491,7 @@ internal sealed class VulkanWeights : IDisposable
             Q.Dispose(); K.Dispose(); V.Dispose(); O.Dispose();
             QBias?.Dispose(); KBias?.Dispose(); VBias?.Dispose(); OBias?.Dispose();
             QNormWeight?.Dispose(); KNormWeight?.Dispose();
+            AttnSinks?.Dispose();
             PostAttnNormWeight?.Dispose();
             PostFfnNormWeight?.Dispose();
             AttnSubNormWeight?.Dispose();
@@ -669,6 +700,8 @@ internal sealed class VulkanWeights : IDisposable
             // the architecture has no QK-norm (UploadOptionalVec returns null).
             var qNorm = UploadOptionalVec(device, vecStaging, lw.QNormWeight);
             var kNorm = UploadOptionalVec(device, vecStaging, lw.KNormWeight);
+            var attnSinks = UploadOptionalVec(device, vecStaging, lw.AttnSinks);
+            if (lw.AttnSinks is not null) totalBytes += (long)lw.AttnSinks.Length * sizeof(float);
             if (lw.QNormWeight is not null) totalBytes += (long)lw.QNormWeight.Length * sizeof(float);
             if (lw.KNormWeight is not null) totalBytes += (long)lw.KNormWeight.Length * sizeof(float);
 
@@ -888,7 +921,7 @@ internal sealed class VulkanWeights : IDisposable
                 postAttnNorm, postFfnNorm,
                 attnSubNorm, ffnSubNorm,
                 mla, moe, gemma4,
-                qNorm, kNorm);
+                qNorm, kNorm, attnSinks);
 
             totalBytes += qBytes + kBytes + vBytes + oBytes
                 + gateBytes + upBytes + downBytes;
@@ -1914,6 +1947,22 @@ internal sealed class VulkanWeights : IDisposable
             }
         }
 
+        GptOssMoeBuffers? gptOssExtras = null;
+        if (moe.UseQuantExperts)
+        {
+            gptOssExtras = new GptOssMoeBuffers
+            {
+                RouterBias = UploadOptionalVec(device, vecStage, moe.RouterBias),
+                GateBias = UploadOptionalVec(device, vecStage, moe.GateExpsBias),
+                UpBias = UploadOptionalVec(device, vecStage, moe.UpExpsBias),
+                DownBias = UploadOptionalVec(device, vecStage, moe.DownExpsBias),
+                UseSwiGluOai = moe.UseSwiGluOai,
+                SoftmaxAfterTopK = moe.SoftmaxAfterTopK,
+            };
+            uploadedBytes += (long)((moe.RouterBias?.Length ?? 0) + (moe.GateExpsBias?.Length ?? 0)
+                + (moe.UpExpsBias?.Length ?? 0) + (moe.DownExpsBias?.Length ?? 0)) * sizeof(float);
+        }
+
         return new MoeLayerBuffers(gate, gateDeviceQt, w1Bank, w2Bank, w3Bank,
             routedW1Qt,
             routedW2Qt,
@@ -1925,7 +1974,8 @@ internal sealed class VulkanWeights : IDisposable
             sharedIntermediateSize: hasShared ? sharedI : 0,
             numSharedExperts: hasShared ? numShared : 0,
             sharedExpertGate: sharedExpertGate,
-            sharedExpertGateDeviceQt: sharedExpertGateDeviceQt)
+            sharedExpertGateDeviceQt: sharedExpertGateDeviceQt,
+            gptOss: gptOssExtras)
         {
             SigmoidGating = moe.SigmoidGating,
             SelectionBias = moe.SigmoidGating
@@ -2311,6 +2361,13 @@ internal sealed class VulkanWeights : IDisposable
             if (MoeOverlayKeepsQ5K(qt, expectedK)) return QuantizationType.Q5_K;
             if (MoeOverlayKeepsQ6K(qt, expectedK)) return QuantizationType.Q6_K;
         }
+
+        // gpt-oss (#737): MXFP4 routed banks stay packed (17 B / 32 elements) and are read by
+        // moe_indexed_matmul_mxfp4. Without this arm the bank would fall to the F32 host path, whose
+        // per-expert pointers are zero placeholders in quant-expert mode (loud, never silent).
+        if (raw != 0 && qt == QuantizationType.MXFP4
+            && rawM == expectedM && rawK == expectedK && (expectedK % 32) == 0)
+            return QuantizationType.MXFP4;
 
         // Strategy C path: keep routed F16 expert banks raw only when the
         // coopmat grouped matmul can consume them. Otherwise upload F32 so
@@ -2720,6 +2777,8 @@ internal sealed class VulkanWeights : IDisposable
             return Dequantize.RowByteSize(contractionDim, QuantizationType.Q5_K) * outputDim;
         if (MoeOverlayKeepsQ6K(qt, contractionDim))
             return Dequantize.RowByteSize(contractionDim, QuantizationType.Q6_K) * outputDim;
+        if (qt == QuantizationType.MXFP4 && (contractionDim % 32) == 0)
+            return Dequantize.RowByteSize(contractionDim, QuantizationType.MXFP4) * outputDim;
         if (MoeOverlayKeepsF16(qt, contractionDim))
             return Dequantize.RowByteSize(contractionDim, QuantizationType.F16) * outputDim;
         if (MoeOverlayKeepsBf16(qt, contractionDim))

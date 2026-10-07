@@ -911,6 +911,87 @@ public sealed class VulkanTransformerModel : IModel
     // _noTokenEmbed: non-first stage — the embedding table is a 64-byte stub; Forward must always be
     // seeded via ForwardFromHidden (a token-gather would read the stub).
     private bool _headless;
+
+    // gpt-oss (#737): sink attention, OAI SwiGLU, expert bias, raw-top-k router, MXFP4 experts and
+    // dense-YaRN RoPE. Null on every other architecture (zero overhead).
+    private VulkanGptOssKernels? _gptOss;
+    private VulkanDevice.Buffer? _ropeYarnInvFreq;   // [ropeDim/2] F32, null when YaRN inactive
+    private float _ropeYarnMscale = 1.0f;
+    private GptOssDebugToggles _gptOssDbg;
+
+    /// <summary>gpt-oss kernel dispatch counters (null for non-gpt-oss models).</summary>
+    internal VulkanGptOssKernels? GptOssKernels => _gptOss;
+
+    /// <summary>
+    /// Perturbation toggles for proving each gpt-oss feature is live (#737). Parsed once from
+    /// <c>DOTLLM_GPTOSS_DEBUG_OFF</c> (comma list: sinks, yarn_mscale, yarn, router_bias, expert_bias,
+    /// swiglu_oai). Each toggle must move PPL / greedy text; production never sets it.
+    /// </summary>
+    internal readonly struct GptOssDebugToggles
+    {
+        public readonly bool NoSinks, NoYarnMscale, NoYarn, NoRouterBias, NoExpertBias, PlainSwiGlu;
+        public GptOssDebugToggles(string? spec)
+        {
+            if (string.IsNullOrWhiteSpace(spec)) return;
+            foreach (var raw in spec.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                switch (raw)
+                {
+                    case "sinks": NoSinks = true; break;
+                    case "yarn_mscale": NoYarnMscale = true; break;
+                    case "yarn": NoYarn = true; break;
+                    case "router_bias": NoRouterBias = true; break;
+                    case "expert_bias": NoExpertBias = true; break;
+                    case "swiglu_oai": PlainSwiGlu = true; break;
+                    default: throw new ArgumentException($"Unknown DOTLLM_GPTOSS_DEBUG_OFF toggle '{raw}'.");
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Creates the gpt-oss kernels and the dense-YaRN inverse-frequency table (single source of
+    /// truth: <c>RoPE.ComputeYarnInverseFrequencies</c>, shared with the CPU table builder and CUDA).
+    /// </summary>
+    private void InitGptOss(string spvDir)
+    {
+        _gptOssDbg = new GptOssDebugToggles(Environment.GetEnvironmentVariable("DOTLLM_GPTOSS_DEBUG_OFF"));
+        for (int l = 0; l < _weights.Layers.Length; l++)
+        {
+            ref readonly var lw = ref _weights.Layers[l];
+            if (lw.Moe is null || lw.Moe.Value.GptOss is null || lw.AttnSinks is null)
+                throw new NotSupportedException(
+                    $"gpt-oss layer {_firstLayer + l} is missing its MoE extras or attention sinks; refusing to run "
+                    + "(this would silently produce wrong logits).");
+        }
+        _gptOss = VulkanGptOssKernels.Create(_device, spvDir);
+
+        if (Config.RoPEConfig is { IsDenseYarnActive: true } rcfg)
+        {
+            int ropeDim = _ropeDim;
+            float[] invFreq = new float[ropeDim / 2];
+            DotLLM.Cpu.Kernels.RoPE.ComputeYarnInverseFrequencies(
+                ropeDim, rcfg.Theta, rcfg.ScalingFactor, rcfg.OrigMaxSeqLen,
+                rcfg.BetaFast, rcfg.BetaSlow, invFreq);
+            var buf = _device.Allocate((long)invFreq.Length * sizeof(float));
+            _device.Upload(invFreq.AsSpan(), buf);
+            _ropeYarnInvFreq = buf;
+            _ropeYarnMscale = rcfg.ComputeYarnMscaleMultiplier(Config.Architecture);
+        }
+    }
+
+    /// <summary>RoPE on Q/K: dense-YaRN kernel for gpt-oss, the theta-derived kernel otherwise.</summary>
+    private void RecordRopeQk(nint cmdBuf, int layer, int seqLen, int numHeads, int numKvHeads, int headDim)
+    {
+        if (_gptOss is not null && _ropeYarnInvFreq is not null && !_gptOssDbg.NoYarn)
+        {
+            _gptOss.RecordRopeYarn(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer, _ropeYarnInvFreq,
+                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeVariant == RopeF32Kernel.Variant.NeoX,
+                _gptOssDbg.NoYarnMscale ? 1.0f : _ropeYarnMscale);
+            return;
+        }
+        RecordDenseRope(cmdBuf, layer, seqLen, numHeads, numKvHeads, headDim);
+    }
     private bool _noTokenEmbed;
     // When non-null, the next Forward seeds HiddenState from these host rows (a previous pipeline
     // stage's output) instead of gathering token embeddings — the resume-from-hidden entry. Set/cleared
@@ -1247,7 +1328,7 @@ public sealed class VulkanTransformerModel : IModel
 
         config = VulkanTransformerModel.NormalizeMlaCacheForVulkan(config);
 
-        RejectUnsupportedArchitecture(config);
+        RejectUnsupportedArchitecture(config, allowGptOss: true);
 
         var device = VulkanDevice.Create();
         try
@@ -1298,7 +1379,7 @@ public sealed class VulkanTransformerModel : IModel
 
         config = VulkanTransformerModel.NormalizeMlaCacheForVulkan(config);
 
-        RejectUnsupportedArchitecture(config);
+        RejectUnsupportedArchitecture(config, allowGptOss: true);
 
         spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
         // #191/#327/#326: see the other LoadFromGguf overload's comment.
@@ -2033,6 +2114,8 @@ public sealed class VulkanTransformerModel : IModel
         }
         model._headless = headless;
         model._noTokenEmbed = skipTokenEmbed;
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
+            model.InitGptOss(spvDir);
         return model;
     }
 
@@ -2282,9 +2365,21 @@ public sealed class VulkanTransformerModel : IModel
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset, int slidingWindow,
         float softCap = 0.0f, float scaleOverride = 0.0f,
-        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0,
+        VulkanDevice.Buffer? sinks = null)
     {
         AttentionSpanInvariant.AssertTight(seqKv, positionOffset, seqQ, "Vulkan");
+
+        // gpt-oss attention sinks (#737): ALWAYS the sink kernel (prefill + decode), never the
+        // split-KV / coopmat / flash variants - none of them carry the sink term.
+        if (sinks is not null && _gptOss is not null && !_gptOssDbg.NoSinks)
+        {
+            if (softCap != 0.0f || maskMode != AttentionMaskMode.Causal)
+                throw new NotSupportedException("gpt-oss sink attention supports only plain causal attention (no soft-cap / non-causal mask).");
+            _gptOss.RecordAttentionSinks(cmdBuf, q, k, v, output, sinks,
+                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow, scaleOverride);
+            return;
+        }
 
         // Decode (seqQ == 1): split the KV range across many workgroups
         // (Flash-Decoding) when the shape is worth splitting — which, with the
@@ -2541,10 +2636,10 @@ public sealed class VulkanTransformerModel : IModel
     /// silently gone wrong.
     /// </summary>
     internal const string GptOssUnsupportedMessage =
-        "Architecture GptOss (gpt-oss) is not supported on the Vulkan backend: Vulkan implements "
-        + "neither its per-head attention sinks nor its dense YaRN RoPE scaling, so loading it would "
-        + "silently produce wrong output rather than fail. Use the CPU backend, or CUDA (which "
-        + "implements both since #365/#366), for gpt-oss checkpoints. Tracked in issue #480.";
+        "Architecture GptOss (gpt-oss) is only supported on the single-device Vulkan model (VulkanTransformerModel): "
+        + "the Vulkan pipeline-parallel and hybrid Vulkan+CUDA models do not wire its per-head attention sinks "
+        + "nor its dense YaRN RoPE scaling, so loading it there would silently produce wrong output rather "
+        + "than fail. Use a single Vulkan device, the CPU backend, or CUDA for gpt-oss checkpoints.";
 
     /// <summary>
     /// The GGUF/HF extractors default DeepSeek-style MLA to the CPU-only hybrid latent cache. The
@@ -2556,7 +2651,7 @@ public sealed class VulkanTransformerModel : IModel
             ? config with { MlaConfig = config.MlaConfig with { UseLatentCache = false, UseHybridMlaCache = false } }
             : config;
 
-    internal static void RejectUnsupportedArchitecture(ModelConfig config)
+    internal static void RejectUnsupportedArchitecture(ModelConfig config, bool allowGptOss = false)
     {
         // Architectures with a dedicated Vulkan model class must say so BEFORE the generic
         // "hybrid unsupported" message below — Qwen3MoeHybrid / Qwen3HybridDense / NemotronH
@@ -2573,7 +2668,16 @@ public sealed class VulkanTransformerModel : IModel
         // which closes the side doors: direct LoadFromGguf callers (benchmarks), the Vulkan pipeline
         // model's stages, and HybridVulkanCudaTransformerModel's Vulkan half.
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
-            throw new NotSupportedException(GptOssUnsupportedMessage);
+        {
+            // #737: the single-device dense model implements gpt-oss (sinks, YaRN, OAI SwiGLU, MXFP4
+            // experts). Every other entry point (pipeline stages, hybrid Vulkan+CUDA, prebuilt-weights
+            // stage builds) still refuses: none of them wire the gpt-oss kernels.
+            if (!allowGptOss)
+                throw new NotSupportedException(GptOssUnsupportedMessage);
+            if (config.Moe is null)
+                throw new NotSupportedException(
+                    "Architecture GptOss on Vulkan requires a MoE config (routed MXFP4 experts); this config has none.");
+        }
 
         if (config.HybridLayout is not null || config.SsmConfig is not null || config.Mamba3Config is not null)
             throw new NotSupportedException("Hybrid SSM / Mamba architectures are not supported on the Vulkan backend yet.");
@@ -3707,6 +3811,7 @@ public sealed class VulkanTransformerModel : IModel
             // SmolLM3 NoPE layers skip RoPE entirely (ModelConfig.NoRopeLayers); the fused shader always rotates.
             bool noRopeLayer = Config.IsNoRopeLayer(_firstLayer + layer);
             bool useFusedRopeKv = _ropeKvWrite is not null
+                && _gptOss is null   // gpt-oss: YaRN table + mscale live in RecordRopeQk, not the fused shader
                 && _ropeInvFreq is null
                 && !noRopeLayer
                 && kvCache is VulkanKvCache
@@ -3739,7 +3844,7 @@ public sealed class VulkanTransformerModel : IModel
             {
                 // RoPE on Q and K (skipped on NoPE layers)
                 if (!noRopeLayer)
-                    RecordDenseRope(cmdBuf, layer, seqLen, numHeads, numKvHeads, headDim);
+                    RecordRopeQk(cmdBuf, layer, seqLen, numHeads, numKvHeads, headDim);
                 ProfSample("rope");
                 DpStamp(cmdBuf, DpCatRope);
 
@@ -3801,7 +3906,8 @@ public sealed class VulkanTransformerModel : IModel
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: layerSlidingWindow,
-                softCap: attnSoftCap, scaleOverride: attnScaleOverride);
+                softCap: attnSoftCap, scaleOverride: attnScaleOverride,
+                sinks: lw.AttnSinks);
             BarrierComputeToCompute(cmdBuf);
             ProfSample("attention");
             DpStamp(cmdBuf, DpCatAttn);
@@ -4427,6 +4533,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq3XxsMmvq?.InvalidateDescriptorCache();
         _matmulIq3SMmvq?.InvalidateDescriptorCache();
         _matmulIq1SMmvq?.InvalidateDescriptorCache();
+        _gptOss?.InvalidateDescriptorCaches();
         _quantizeQ8_1Rows?.InvalidateDescriptorCache();
         _matmulQ8Mmq?.InvalidateDescriptorCache();
         _matmulQ8MmqResidual?.InvalidateDescriptorCache();
@@ -5658,8 +5765,21 @@ public sealed class VulkanTransformerModel : IModel
             outputDim: numE, inputDim: hidden, seqLen: seqLen);
         BarrierComputeToCompute(cmdBuf);
 
+        var gptOssMoe = moeW.GptOss;
+        // gpt-oss router bias (ffn_gate_inp.bias) joins the logits BEFORE top-k.
+        if (gptOssMoe?.RouterBias is { } routerBias && !_gptOssDbg.NoRouterBias)
+        {
+            _biasAdd.Record(cmdBuf, _state.MoeRouterLogits!, routerBias, seqLen, numE);
+            BarrierComputeToCompute(cmdBuf);
+        }
+
         // 3. Top-k softmax: writes MoeTopkIndices (int) and MoeTopkWeights.
-        if (moeW.SigmoidGating)
+        if (gptOssMoe is { SoftmaxAfterTopK: true })
+        {
+            _gptOss!.RecordTopKRawSoftmax(cmdBuf, _state.MoeRouterLogits!, _state.MoeTopkIndices!,
+                _state.MoeTopkWeights!, seqLen, numE, topK);
+        }
+        else if (moeW.SigmoidGating)
         {
             // DeepSeek-V3 / GLM-4.7-Flash: sigmoid scores, selection bias, renorm + scale (#742).
             _moeTopkSigmoid!.Record(cmdBuf,
@@ -5709,6 +5829,14 @@ public sealed class VulkanTransformerModel : IModel
                 moeW.W3DeviceQuantType,
                 m: interm, k: hidden, n: expandedRows, numExperts: numE);
             BarrierComputeToCompute(cmdBuf);
+            if (gptOssMoe is not null && !_gptOssDbg.NoExpertBias)
+            {
+                if (gptOssMoe.GateBias is { } gb)
+                    _gptOss!.RecordExpertBiasAdd(cmdBuf, _state.MoeGateInter!, gb, _state.MoeTopkIndices!, expandedRows, interm, numE);
+                if (gptOssMoe.UpBias is { } ub)
+                    _gptOss!.RecordExpertBiasAdd(cmdBuf, _state.MoeUpInter!, ub, _state.MoeTopkIndices!, expandedRows, interm, numE);
+                BarrierComputeToCompute(cmdBuf);
+            }
             MaybeApplyMoeIndexedLoraDeltas(cmdBuf, layer, "gate_proj",
                 _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeGateInter!,
                 rows: expandedRows, inputDim: hidden, outputDim: interm, numExperts: numE);
@@ -5718,9 +5846,13 @@ public sealed class VulkanTransformerModel : IModel
             if (_currentLora is not null)
                 BarrierComputeToCompute(cmdBuf);
 
-            // 6. SwiGLU pointwise: silu(gate) * up.
-            _swiglu.Record(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeSiluInter!,
-                n: expandedRows * interm);
+            // 6. SwiGLU pointwise: silu(gate) * up (gpt-oss: clamped swiglu_oai).
+            if (gptOssMoe is { UseSwiGluOai: true } && !_gptOssDbg.PlainSwiGlu)
+                _gptOss!.RecordSwiGluOai(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeSiluInter!,
+                    expandedRows * interm);
+            else
+                _swiglu.Record(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeSiluInter!,
+                    n: expandedRows * interm);
             BarrierComputeToCompute(cmdBuf);
 
             // 7. Indexed down matmul (W2): silu_intermediate → MoeDownRows.
@@ -5729,6 +5861,12 @@ public sealed class VulkanTransformerModel : IModel
                 moeW.W2DeviceQuantType,
                 m: hidden, k: interm, n: expandedRows, numExperts: numE);
             BarrierComputeToCompute(cmdBuf);
+            if (gptOssMoe?.DownBias is { } db && !_gptOssDbg.NoExpertBias)
+            {
+                // Per-expert down bias joins each (token, slot) row BEFORE the routing-weight scatter.
+                _gptOss!.RecordExpertBiasAdd(cmdBuf, _state.MoeDownRows!, db, _state.MoeTopkIndices!, expandedRows, hidden, numE);
+                BarrierComputeToCompute(cmdBuf);
+            }
             MaybeApplyMoeIndexedLoraDeltas(cmdBuf, layer, "down_proj",
                 _state.MoeSiluInter!, _state.MoeTopkIndices!, _state.MoeDownRows!,
                 rows: expandedRows, inputDim: interm, outputDim: hidden, numExperts: numE);
@@ -6029,6 +6167,15 @@ public sealed class VulkanTransformerModel : IModel
                 throw new InvalidOperationException("Q6_K MoE indexed matmul kernel was not created.");
             _moeIndexedMatmulQ6K.Record(cmdBuf,
                 bank, x, indices, y,
+                m: m, k: k, n: n, numExperts: numExperts);
+            return;
+        }
+
+        if (weightQt == QuantizationType.MXFP4)
+        {
+            if (_gptOss is null)
+                throw new InvalidOperationException("MXFP4 MoE indexed matmul kernel was not created (non-gpt-oss model).");
+            _gptOss.RecordIndexedMxfp4(cmdBuf, bank, x, indices, y,
                 m: m, k: k, n: n, numExperts: numExperts);
             return;
         }
@@ -7533,6 +7680,8 @@ public sealed class VulkanTransformerModel : IModel
         _flashAttention?.Dispose();
         _flashAttentionCoopmat?.Dispose();
         _attention.Dispose();
+        _gptOss?.Dispose();
+        _ropeYarnInvFreq?.Dispose();
         _rope.Dispose();
         _ropeInvFreq?.Dispose();
         _ropeInvFreqBuf?.Dispose();

@@ -120,6 +120,10 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(gguf);
         ArgumentNullException.ThrowIfNull(config);
         CudaTransformerModel.RejectGemmaForCompositeHost(config, nameof(HybridVulkanCudaTransformerModel));
+        // #737: VulkanTransformerModel.LoadFromGguf now accepts gpt-oss (single-device only); the hybrid
+        // split does not wire its sinks/YaRN across the Vulkan|CUDA boundary, so refuse here explicitly.
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
+            throw new NotSupportedException(VulkanTransformerModel.GptOssUnsupportedMessage);
         if (numVulkanLayers <= 0 || numVulkanLayers >= config.NumLayers)
             throw new ArgumentOutOfRangeException(nameof(numVulkanLayers),
                 $"numVulkanLayers must be between 1 and {config.NumLayers - 1}. " +
@@ -186,6 +190,8 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(cpuWeights);
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(vulkanDevice);
+        if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
+            throw new NotSupportedException(VulkanTransformerModel.GptOssUnsupportedMessage);
         if (numVulkanLayers <= 0 || numVulkanLayers >= config.NumLayers)
             throw new ArgumentOutOfRangeException(nameof(numVulkanLayers),
                 $"numVulkanLayers must be between 1 and {config.NumLayers - 1}.");

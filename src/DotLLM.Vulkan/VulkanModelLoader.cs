@@ -82,8 +82,8 @@ public static class VulkanModelLoader
     /// </returns>
     /// <exception cref="NotSupportedException">
     /// The architecture has no GGUF representation at all (Mamba-3), is recognized but not
-    /// runnable on Vulkan yet (nemotron_h_moe), or needs attention features Vulkan lacks
-    /// (gpt-oss: attention sinks, dense YaRN; #480).
+    /// runnable on Vulkan yet (nemotron_h_moe), or is only wired on the single-device model
+    /// (gpt-oss on the pipeline/hybrid models; #737).
     /// </exception>
     public static (IModel Model, Func<int, IKvCache> KvCacheFactory) CreateFromGguf(
         VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir,
@@ -136,13 +136,9 @@ public static class VulkanModelLoader
                     "cannot produce Architecture.Mamba3 in the first place. Mamba-3 is safetensors-first on " +
                     "every backend — load it via VulkanMamba3TransformerModel.LoadFromSafetensors.");
 
-            // gpt-oss (#480): no attention sinks and no dense YaRN on Vulkan. Without this arm it
-            // falls into `default` and the generic model loads it happily and emits wrong logits.
-            // VulkanTransformerModel.RejectUnsupportedArchitecture throws the same message, which is
-            // what keeps the direct-LoadFromGguf / pipeline / hybrid side doors shut too; this arm
-            // exists so the dispatch point documents the refusal (as CUDA's did before #365).
-            case Architecture.GptOss:
-                throw new NotSupportedException(VulkanTransformerModel.GptOssUnsupportedMessage);
+            // gpt-oss (#737) falls through to `default`: VulkanTransformerModel implements its attention
+            // sinks, dense YaRN RoPE, OAI SwiGLU and MXFP4 experts. RejectUnsupportedArchitecture still
+            // refuses it on the pipeline / hybrid / prebuilt-stage side doors.
 
             default:
             {

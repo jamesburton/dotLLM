@@ -1,0 +1,75 @@
+#version 450
+// Dense-YaRN RoPE with FP32 Q / K (gpt-oss, #737).
+//
+// Same pairing/dispatch as rope_f32.comp, but the per-pair frequency comes from a host-supplied
+// inverse-frequency table (RoPE.ComputeYarnInverseFrequencies - the single source of truth shared
+// with the CPU table builder and CUDA's RopeYarnInvFreqDevice) and BOTH cos and sin are scaled by
+// `mscale` (ggml_rope_ext YaRN attn_factor convention). mscale != 1 changes even position 0
+// (cos,sin) = (mscale, 0), so a backend that omits it is wrong from the first token.
+//
+//   ropeType: 0 = Norm (2i, 2i+1), 1 = NeoX (i, i + neoxPairOffset)
+// Dispatch: local_size_x = 256, groupCount.x = ceil(max(totalQpairs, totalKpairs) / 256).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)          buffer BufQ    { float q[]; };
+layout(set = 0, binding = 1, std430)          buffer BufK    { float k[]; };
+layout(set = 0, binding = 2, std430) readonly buffer BufPos  { int positions[]; };
+layout(set = 0, binding = 3, std430) readonly buffer BufFreq { float invFreq[]; };   // [ropeDim / 2]
+
+layout(push_constant) uniform PushConstants {
+    uint  seqLen;
+    uint  numHeads;
+    uint  numKvHeads;
+    uint  headDim;
+    uint  ropeDim;
+    uint  ropeType;
+    float mscale;
+    uint  neoxPairOffset;
+} pc;
+
+void rotate(inout float a, inout float b, float c, float s) {
+    float v0 = a, v1 = b;
+    a = v0 * c - v1 * s;
+    b = v0 * s + v1 * c;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint halfRope = pc.ropeDim >> 1u;
+    if (halfRope == 0u) return;
+
+    uint totalQ = pc.seqLen * pc.numHeads * halfRope;
+    uint totalK = pc.seqLen * pc.numKvHeads * halfRope;
+
+    if (idx < totalQ) {
+        uint pair = idx % halfRope;
+        uint rem  = idx / halfRope;
+        uint head = rem % pc.numHeads;
+        uint t    = rem / pc.numHeads;
+        float angle = float(positions[t]) * invFreq[pair];
+        float c = cos(angle) * pc.mscale;
+        float s = sin(angle) * pc.mscale;
+        uint baseIdx = t * pc.numHeads * pc.headDim + head * pc.headDim;
+        uint i0 = (pc.ropeType == 1u) ? baseIdx + pair : baseIdx + 2u * pair;
+        uint i1 = (pc.ropeType == 1u) ? baseIdx + pair + pc.neoxPairOffset : baseIdx + 2u * pair + 1u;
+        float a = q[i0], b = q[i1];
+        rotate(a, b, c, s);
+        q[i0] = a; q[i1] = b;
+    }
+    if (idx < totalK) {
+        uint pair = idx % halfRope;
+        uint rem  = idx / halfRope;
+        uint head = rem % pc.numKvHeads;
+        uint t    = rem / pc.numKvHeads;
+        float angle = float(positions[t]) * invFreq[pair];
+        float c = cos(angle) * pc.mscale;
+        float s = sin(angle) * pc.mscale;
+        uint baseIdx = t * pc.numKvHeads * pc.headDim + head * pc.headDim;
+        uint i0 = (pc.ropeType == 1u) ? baseIdx + pair : baseIdx + 2u * pair;
+        uint i1 = (pc.ropeType == 1u) ? baseIdx + pair + pc.neoxPairOffset : baseIdx + 2u * pair + 1u;
+        float a = k[i0], b = k[i1];
+        rotate(a, b, c, s);
+        k[i0] = a; k[i1] = b;
+    }
+}
