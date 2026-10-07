@@ -231,10 +231,34 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         return BuildFromPrebuiltWeightsInternal(weights, config, threading ?? ThreadingConfig.SingleThreaded, anchorSource: null);
     }
 
+    /// <summary>
+    /// R4 repack with a memory guard (#792): the repack is a second committed copy of the projections, so
+    /// when <c>weights + repack</c> would not fit in the OS-reported available physical RAM it is skipped or
+    /// applied to as many leading layers as fit, the rest staying on the mmap weights. One log line says what
+    /// happened; <c>DOTLLM_CPU_REPACK=always|never</c> overrides.
+    /// </summary>
+    private static void ApplyRepackBudget(TransformerWeights weights, object? anchorSource)
+    {
+        var mode = RepackBudget.ParseMode(Environment.GetEnvironmentVariable(RepackBudget.EnvVar));
+        long candidate = weights.RepackCandidateBytes();
+        long available = mode == RepackBudget.RepackMode.Auto ? RepackBudget.QueryAvailablePhysicalBytes() : 0;
+        // Resident weight set: the GGUF data section when we have it, else the repackable bytes (a lower
+        // bound; safetensors paths upcast to owned F32 and are not budgeted by file size).
+        long weightBytes = anchorSource is GgufFile g ? g.DataSectionLength : candidate;
+        long allowed = RepackBudget.Resolve(weightBytes, candidate, mode, available);
+
+        weights.RepackWeights(allowed);
+
+        string? msg = RepackBudget.Describe(mode, weightBytes, candidate, allowed, weights.RepackedBytes,
+            weights.RepackedLayerCount, weights.Layers.Length, available);
+        if (msg is not null)
+            Console.Error.WriteLine("[dotllm] " + msg);
+    }
+
     private static TransformerModel BuildFromPrebuiltWeightsInternal(
         TransformerWeights weights, ModelConfig config, ThreadingConfig threading, object? anchorSource)
     {
-        weights.RepackWeights();
+        ApplyRepackBudget(weights, anchorSource);
 
         // For MLA (DeepSeek-V2/V3) RoPE applies only to the decoupled
         // qk_rope_head_dim sub-dimension — NOT the full qk_head_dim carried
