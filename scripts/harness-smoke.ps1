@@ -28,13 +28,26 @@
   reproducible runs: `--version` prints 0.1.0 for every build, so the result JSON records the DLL
   ProductVersion (which embeds the git SHA) of the process that actually served.
 
+.PARAMETER PlainThinking
+  `off` (default): the plain-chat checks (chat, stream, tool call, throughput) send `enable_thinking=false`
+  so a thinking model answers in `content` within a small token budget (since #767/#778 a thinking model
+  otherwise spends the budget on `reasoning_content` and returns an EMPTY `content`). Templates with no
+  such variable ignore it. `default`: do not send it (the model's own default; budgets fall back to
+  -ThinkingMaxTokens when the model reasons). The dedicated `reasoning` / `reasoning-stream` checks always
+  turn thinking ON (`enable_thinking=true`) and assert `reasoning_content` is populated, `content` holds the
+  answer, and no `<think>` text leaks into `content`. A non-reasoning model reports SKIP there.
+
+.PARAMETER ThinkingMaxTokens
+  max_tokens for the thinking-on checks (default 2048).
+
 .PARAMETER AllowPull
   By default the script REFUSES to start `serve` when the model ref is not already in the HF hub cache
   (the CLI would otherwise silently download several GB; `owner/repo` defaults to Q4_K_M and an
   Unsloth `UD-Q4_K_M` file may not match). Pass -AllowPull to permit the download.
 
 .PARAMETER Device
-  Passed to `serve --device`. Default: do not pass it (the server default, `auto`).
+  Passed to `serve --device`. Default: do not pass it (the server default, `auto`). An explicit cuda/gpu on a host with no
+  NVIDIA driver reports SKIP ("not measured here") and exits 0.
 
 .PARAMETER ServeArgs
   Extra serve args, e.g. -ServeArgs '--mtp'. Default: none (the point is that defaults work).
@@ -56,9 +69,10 @@ param(
     [int]$MaxTokens = 128,
     [int]$PrefillWords = 700,
     [int]$ReadyTimeoutSec = 1800,
-    [int]$ThinkingMaxTokens = 1536,
+    [int]$ThinkingMaxTokens = 2048,
+    [ValidateSet('off', 'default')][string]$PlainThinking = 'off',
     [switch]$AllowPull,
-        [string]$OutDir = ''
+    [string]$OutDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -87,7 +101,7 @@ $base = "http://127.0.0.1:$Port"
 $results = [System.Collections.Generic.List[object]]::new()
 function Add-Result([string]$Name, [string]$Status, [string]$Detail, $Data = $null) {
     $results.Add([pscustomobject]@{ check = $Name; status = $Status; detail = $Detail; data = $Data })
-    $color = switch ($Status) { 'PASS' { 'Green' } 'WARN' { 'Yellow' } 'GAP' { 'Magenta' } default { 'Red' } }
+    $color = switch ($Status) { 'PASS' { 'Green' } 'WARN' { 'Yellow' } 'GAP' { 'Magenta' } 'SKIP' { 'DarkGray' } default { 'Red' } }
     Write-Host ('{0,-5} {1,-22} {2}' -f $Status, $Name, $Detail) -ForegroundColor $color
 }
 
@@ -159,6 +173,12 @@ function Invoke-Stream($Body) {
     }
 }
 
+# Plain-chat arm: thinking OFF so a thinking model answers in `content` inside a small budget (#767/#778).
+function Plain($body) {
+    if ($PlainThinking -eq 'off') { $body.enable_thinking = $false }
+    $body
+}
+
 function Prop($o, [string]$n) { if ($null -ne $o -and $o.PSObject.Properties[$n]) { $o.$n } else { $null } }
 
 function Get-Median([double[]]$xs) {
@@ -186,10 +206,11 @@ function Cut([string]$t, [int]$n) { if ($null -eq $t) { return '' }; $t = $t -re
 # and no think-off switch). Return what a harness would treat as the visible answer.
 function Split-Think([string]$text) {
     if ($null -eq $text) { $text = '' }
-    $hasThink = ($text -match '<think>') -or ($text -match '</think>')
+    $hasThink = ($text -match '<think>') -or ($text -match '</think>') -or ($text -match '<\|channel>')
     $visible = $text; $open = $false
     if ($text -match '</think>') { $visible = $text.Substring($text.LastIndexOf('</think>') + 8) }
-    elseif ($text -match '<think>') { $visible = ''; $open = $true }
+    elseif ($text -match '<channel\|>') { $visible = $text.Substring($text.LastIndexOf('<channel|>') + 10) }   # Gemma-4 `<|channel>thought ... <channel|>`
+    elseif ($text -match '<think>' -or $text -match '<\|channel>') { $visible = ''; $open = $true }
     [pscustomobject]@{ HasThink = $hasThink; Visible = $visible.Trim(); Open = $open }
 }
 
@@ -232,9 +253,20 @@ function Get-ServerBuild {
 }
 
 # ---------------------------------------------------------------- main
-$proc = $null
+$proc = $null; $skipRun = $false
 $meta = [ordered]@{ model = $Model; cli = $Cli; device = $(if ($Device) { $Device } else { '(default)' }); serveArgs = $ServeArgs; started = (Get-Date).ToString('o'); host = $env:COMPUTERNAME }
 try {
+    # Guard: an explicit CUDA request on a host with no NVIDIA driver is "not measured here", not a failure.
+    if ($Device -match '^(cuda|gpu)') {
+        $hasCuda = (Test-Path (Join-Path $env:windir 'System32\nvcuda.dll')) -or [bool](Get-Command nvidia-smi -ErrorAction SilentlyContinue)
+        if (-not $hasCuda) {
+            $meta.skipped = 'no CUDA on this host'
+            Add-Result 'harness' 'SKIP' "--device $Device requested but no NVIDIA driver (nvcuda.dll / nvidia-smi) on $($env:COMPUTERNAME): not measured here"
+            $skipRun = $true
+        }
+    }
+    if ($skipRun) { return }
+
     # Guard: refuse to start if the port is taken (a stale server would answer our checks).
     if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) {
         throw "Port $Port already in use; pick another with -Port."
@@ -284,7 +316,7 @@ try {
     if ($props) {
         $pa = Prop $props 'architecture'; $pd = Prop $props 'resolved_device'; $pm = Prop $props 'mtp_active'; $pw = Prop $props 'device_fallback_warning'
         $meta.architecture = $pa; $meta.resolvedDevice = $pd; $meta.mtpActive = $pm; $meta.mtpStatus = Prop $props 'mtp_status'
-        $meta.deviceFallbackWarning = $pw; $meta.modelId = Prop $props 'model_id'; $meta.maxSeq = Prop $props 'max_sequence_length'
+        $meta.deviceFallbackWarning = $pw; $meta.serverVersion = Prop $props 'version'; $meta.modelId = Prop $props 'model_id'; $meta.maxSeq = Prop $props 'max_sequence_length'
         $warn = if ($pw) { " FALLBACK: $pw" } else { '' }
         Add-Result 'props' $(if ($pw) { 'WARN' } else { 'PASS' }) ("arch={0} device={1} mtp={2}{3}" -f $pa, $pd, $pm, $warn) $props
     } else { Add-Result 'props' 'FAIL' '/props unreadable' }
@@ -296,37 +328,51 @@ try {
     if (-not $modelName) { $modelName = $Model }
 
     # --- non-stream chat (retried with a larger budget when the model reasons inline)
-    $meta.reasoningInline = $false
+    $meta.reasoningInline = $false; $meta.reasoningSplit = $false
     $budget = $MaxTokens
     $chatMsgs = @(@{ role = 'user'; content = 'What is the capital of France? Answer in one short sentence.' })
     for ($attempt = 0; $attempt -lt 2; $attempt++) {
         $sw = [Diagnostics.Stopwatch]::StartNew()
-        $r = Invoke-Json POST '/v1/chat/completions' @{ model = $modelName; temperature = 0; max_tokens = $budget; messages = $chatMsgs }
+        $r = Invoke-Json POST '/v1/chat/completions' (Plain @{ model = $modelName; temperature = 0; max_tokens = $budget; messages = $chatMsgs })
         $ms = $sw.Elapsed.TotalMilliseconds
         if ($r.Code -ne 200 -or -not $r.Json) { break }
         $msg = $r.Json.choices[0].message
         $sp = Split-Think ([string]$msg.content)
+        $rc = [string](Prop $msg 'reasoning_content')
         if ($sp.HasThink) { $meta.reasoningInline = $true }
-        if ($sp.HasThink -and -not $sp.Visible -and $attempt -eq 0) { $budget = $ThinkingMaxTokens; continue }
+        if ($rc) { $meta.reasoningSplit = $true }
+        # empty `content` because the model spent the budget thinking (split or inline): retry bigger once
+        $spent = (($sp.HasThink -and -not $sp.Visible) -or ($rc -and -not ([string]$msg.content).Trim()))
+        if ($spent -and $attempt -eq 0) { $budget = $ThinkingMaxTokens; continue }
         break
     }
     if ($r.Code -eq 200 -and $r.Json) {
         $raw = [string]$msg.content
         $hit = $sp.Visible -match '(?i)paris'
         $status = if ($hit -and -not $sp.HasThink) { 'PASS' } elseif ($hit) { 'WARN' } else { 'FAIL' }
-        $note = if ($sp.HasThink) { ' [reasoning inline in content - harness must strip <think>]' } else { '' }
+        # channel/Harmony control markup in the visible answer (gpt-oss `<|channel|>analysis<|message|>`, Gemma-4 `<|channel>thought`)
+        if ($raw -match '<\|channel\|?>') { if ($status -eq 'PASS') { $status = 'WARN' }; $meta.channelMarkupInContent = $true }
+        $note = if ($sp.HasThink) { ' [<think> text INLINE in content: reasoning not split (#767)]' } else { '' }
+        if ($meta.channelMarkupInContent) { $note += ' [channel markup <|channel..> leaked into content: reasoning not split]' }
+        if ($rc) { $note += ' [model still thinking with enable_thinking=false: reasoning_content populated]' }
         if (-not $hit -and $sp.Open) { $note += ' [think block never closed: out of tokens]' }
+        if (-not $hit -and -not ([string]$msg.content).Trim()) { $note += ' [EMPTY content: budget spent on reasoning?]' }
         Add-Result 'chat-nonstream' $status ("{0:N0} ms finish={1} tokens={2}{3} :: {4}" -f $ms, $r.Json.choices[0].finish_reason, $r.Json.usage.completion_tokens, $note, (Cut $(if ($sp.Visible) { $sp.Visible } else { $raw }) 80)) @{ raw = $raw }
     } else { Add-Result 'chat-nonstream' 'FAIL' "HTTP $($r.Code): $(Cut $r.Text 200)" }
-    $toolBudget = if ($meta.reasoningInline) { $ThinkingMaxTokens } else { 384 }
+    $thinkingSeen = [bool]($meta.reasoningInline -or $meta.reasoningSplit)
+    $toolBudget = if ($thinkingSeen) { $ThinkingMaxTokens } else { 384 }
 
     # --- streamed chat
-    $s = Invoke-Stream @{ model = $modelName; temperature = 0; max_tokens = $budget
-        messages = @(@{ role = 'user'; content = 'Count from 1 to 10 in words, separated by commas.' }) }
+    # a model that still thinks with enable_thinking=false (Nemotron: its template wants /no_think) needs the big budget
+    if ($meta.reasoningSplit -or $meta.reasoningInline) { $budget = $ThinkingMaxTokens }
+    $s = Invoke-Stream (Plain @{ model = $modelName; temperature = 0; max_tokens = $budget
+        messages = @(@{ role = 'user'; content = 'Count from 1 to 10 in words, separated by commas.' }) })
     if ($s.Ok) {
-        $okS = ($s.Chunks -gt 1) -and $s.DoneSeen -and ($s.Content -or $s.Reasoning) -and $s.Finish
+        $okS = ($s.Chunks -gt 1) -and $s.DoneSeen -and $s.Finish -and ($s.Content.Trim() -or $s.Reasoning)
         $usageNote = if ($s.Usage) { '' } else { ' (no usage chunk)' }
-        Add-Result 'chat-stream' $(if ($okS -and $s.Usage) { 'PASS' } elseif ($okS) { 'WARN' } else { 'FAIL' }) `
+        if (-not $s.Content.Trim() -and $s.Reasoning) { $usageNote += ' [content EMPTY: only reasoning_content arrived]' }
+        $stStream = if ($okS -and $s.Usage -and $s.Content.Trim()) { 'PASS' } elseif ($okS) { 'WARN' } else { 'FAIL' }
+        Add-Result 'chat-stream' $stStream `
             ("chunks={0} ttft={1:N0}ms finish={2}{3}" -f $s.Chunks, $s.TtftMs, $s.Finish, $usageNote)
     } else { Add-Result 'chat-stream' 'FAIL' $s.Error }
 
@@ -335,7 +381,7 @@ try {
         name = 'get_weather'; description = 'Get the current weather for a city.'
         parameters = @{ type = 'object'; properties = @{ city = @{ type = 'string'; description = 'City name' } }; required = @('city') } } }
     $toolMsgs = @(@{ role = 'user'; content = 'What is the weather in Paris right now? Use the tool.' })
-    $t = Invoke-Json POST '/v1/chat/completions' @{ model = $modelName; temperature = 0; max_tokens = $toolBudget; tools = @($weatherTool); messages = $toolMsgs }
+    $t = Invoke-Json POST '/v1/chat/completions' (Plain @{ model = $modelName; temperature = 0; max_tokens = $toolBudget; tools = @($weatherTool); messages = $toolMsgs })
     if ($t.Code -eq 200 -and $t.Json) {
         $m = $t.Json.choices[0].message
         $rawTool = [string]$m.content
@@ -346,7 +392,7 @@ try {
             if ($argsOk) {
                 $m2 = @($toolMsgs) + @(@{ role = 'assistant'; content = $null; tool_calls = @($tcs) }) +
                       @(@{ role = 'tool'; tool_call_id = $tcs[0].id; content = '{"temp_c": 17, "conditions": "light rain"}' })
-                $t2 = Invoke-Json POST '/v1/chat/completions' @{ model = $modelName; temperature = 0; max_tokens = $toolBudget; tools = @($weatherTool); messages = $m2 }
+                $t2 = Invoke-Json POST '/v1/chat/completions' (Plain @{ model = $modelName; temperature = 0; max_tokens = $toolBudget; tools = @($weatherTool); messages = $m2 })
                 $final = if ($t2.Code -eq 200 -and $t2.Json) { (Split-Think ([string]$t2.Json.choices[0].message.content)).Visible } else { '' }
                 $toolOk = $final -match '17|rain'
                 Add-Result 'tool-call' $(if ($toolOk) { 'PASS' } else { 'WARN' }) ("call ok ({0}); round-trip answer {1}" -f $tcs[0].function.arguments, $(if ($toolOk) { 'uses result' } else { "missing result: '$(Cut $final 80)'" })) @{ raw = $rawTool; final = $final }
@@ -354,7 +400,7 @@ try {
         } else {
             $mk = Find-ToolMarkup $rawTool
             if ($mk) { Add-Result 'tool-call' 'GAP' ("model emitted tool markup '{0}' but no tool_calls were parsed :: {1}" -f $mk, (Cut $rawTool 120)) @{ raw = $rawTool } }
-            else { Add-Result 'tool-call' 'FAIL' ("no tool_call and no tool markup; content='{0}'" -f (Cut $rawTool 100)) @{ raw = $rawTool } }
+            else { Add-Result 'tool-call' 'WARN' ("no tool_call and no tool markup (model/template without tool support, or it ignored the tools); content='{0}'" -f (Cut $rawTool 100)) @{ raw = $rawTool } }
         }
     } else { Add-Result 'tool-call' 'FAIL' "HTTP $($t.Code): $(Cut $t.Text 200)" }
 
@@ -375,6 +421,97 @@ try {
         } catch { Add-Result 'structured-output' 'FAIL' "not valid JSON: $(Cut $txt 160)" @{ raw = $txt } }
     } else { Add-Result 'structured-output' 'FAIL' "HTTP $($j.Code): $(Cut $j.Text 200)" }
 
+    # --- typed arguments + parallel calls (#782 parsers: Qwen XML, Gemma-4, hardened Llama/Hermes).
+    # A strict, multi-typed schema: strings must stay strings, ints/bools/arrays must be typed (ToolArgumentCoercer).
+    $alarmTool = @{ type = 'function'; function = @{
+        name = 'set_alarm'; description = 'Set an alarm.'
+        parameters = @{ type = 'object'; properties = @{
+            hour = @{ type = 'integer'; description = 'Hour 0-23' }; label = @{ type = 'string' }
+            repeat = @{ type = 'boolean' }; days = @{ type = 'array'; items = @{ type = 'string' } } }
+          required = @('hour', 'label') } } }
+    $ta = Invoke-Json POST '/v1/chat/completions' (Plain @{ model = $modelName; temperature = 0; max_tokens = $toolBudget; tools = @($alarmTool)
+        messages = @(@{ role = 'user'; content = 'Set an alarm for 7 o''clock labelled "gym", repeating on monday and friday. Use the tool.' }) })
+    if ($ta.Code -eq 200 -and $ta.Json) {
+        $am = $ta.Json.choices[0].message; $araw = [string]$am.content
+        $atc = if ($am.PSObject.Properties['tool_calls'] -and $am.tool_calls) { @($am.tool_calls) } else { @() }
+        if ($atc.Count -gt 0 -and $atc[0].function.name -eq 'set_alarm') {
+            try {
+                $aa = $atc[0].function.arguments | ConvertFrom-Json
+                $typed = ($aa.hour -is [int] -or $aa.hour -is [long]) -and ([int]$aa.hour -eq 7) -and ($aa.label -is [string])
+                $extra = ''
+                if ($aa.PSObject.Properties['repeat']) { if ($aa.repeat -isnot [bool]) { $typed = $false; $extra += ' repeat!=bool' } }
+                if ($aa.PSObject.Properties['days']) { if (@($aa.days).Count -eq 0 -or (@($aa.days) | Where-Object { $_ -isnot [string] })) { $typed = $false; $extra += ' days!=string[]' } }
+                Add-Result 'tool-call-typed' $(if ($typed) { 'PASS' } else { 'FAIL' }) ("args {0}{1}" -f (Cut $atc[0].function.arguments 120), $extra) @{ raw = $araw }
+            } catch { Add-Result 'tool-call-typed' 'FAIL' "arguments not JSON: $(Cut $atc[0].function.arguments 120)" }
+        } else {
+            $mk = Find-ToolMarkup $araw
+            if ($mk) { Add-Result 'tool-call-typed' 'GAP' ("markup '{0}' not parsed :: {1}" -f $mk, (Cut $araw 120)) @{ raw = $araw } }
+            else { Add-Result 'tool-call-typed' 'WARN' ("model made no call; content='{0}'" -f (Cut $araw 100)) @{ raw = $araw } }
+        }
+    } else { Add-Result 'tool-call-typed' 'FAIL' "HTTP $($ta.Code): $(Cut $ta.Text 200)" }
+
+    $tp = Invoke-Json POST '/v1/chat/completions' (Plain @{ model = $modelName; temperature = 0; max_tokens = $toolBudget; tools = @($weatherTool); parallel_tool_calls = $true
+        messages = @(@{ role = 'user'; content = 'What is the weather in Paris and in Tokyo? Call the tool once for each city.' }) })
+    if ($tp.Code -eq 200 -and $tp.Json) {
+        $pm = $tp.Json.choices[0].message; $praw = [string]$pm.content
+        $ptc = if ($pm.PSObject.Properties['tool_calls'] -and $pm.tool_calls) { @($pm.tool_calls) } else { @() }
+        $cities = @($ptc | ForEach-Object { try { [string](($_.function.arguments | ConvertFrom-Json).city) } catch { '' } } | Where-Object { $_ })
+        if ($ptc.Count -ge 2 -and ($cities -join ',') -match '(?i)paris' -and ($cities -join ',') -match '(?i)tokyo') {
+            Add-Result 'tool-call-parallel' 'PASS' ("{0} calls: {1}" -f $ptc.Count, ($cities -join ', '))
+        } elseif ($ptc.Count -eq 1) {
+            # one call is a legal (if lazy) model answer, but a parser that drops the second block looks the same: say so.
+            Add-Result 'tool-call-parallel' 'WARN' ("only 1 call parsed ({0}); model laziness OR parser dropped a block - raw: {1}" -f ($cities -join ', '), (Cut $praw 80)) @{ raw = $praw }
+        } else {
+            $mk = Find-ToolMarkup $praw
+            if ($mk) { Add-Result 'tool-call-parallel' 'GAP' ("markup '{0}' not parsed :: {1}" -f $mk, (Cut $praw 120)) @{ raw = $praw } }
+            else { Add-Result 'tool-call-parallel' 'WARN' ("no calls; content='{0}'" -f (Cut $praw 100)) @{ raw = $praw } }
+        }
+    } else { Add-Result 'tool-call-parallel' 'FAIL' "HTTP $($tp.Code): $(Cut $tp.Text 200)" }
+
+    # streamed tool call: tool_calls deltas must carry the call and raw markup must NOT leak as delta.content (#782)
+    $ts = Invoke-Stream (Plain @{ model = $modelName; temperature = 0; max_tokens = $toolBudget; tools = @($weatherTool); messages = $toolMsgs })
+    if ($ts.Ok) {
+        $leak = Find-ToolMarkup $ts.Content
+        if ($ts.ToolCalls.Count -gt 0 -and $ts.ToolCalls[0].name -eq 'get_weather') {
+            $argOk = $false; try { $argOk = ([string](($ts.ToolCalls[0].arguments | ConvertFrom-Json).city) -match '(?i)paris') } catch { }
+            $st = if ($argOk -and -not $leak -and $ts.Finish -eq 'tool_calls') { 'PASS' } elseif ($argOk -and -not $leak) { 'WARN' } else { 'FAIL' }
+            Add-Result 'tool-call-stream' $st ("finish={0} args={1}{2}" -f $ts.Finish, (Cut $ts.ToolCalls[0].arguments 60), $(if ($leak) { " LEAK '$leak' in delta.content" } else { '' }))
+        } elseif ($leak) { Add-Result 'tool-call-stream' 'GAP' ("markup '{0}' leaked as delta.content, no tool_calls delta :: {1}" -f $leak, (Cut $ts.Content 100)) }
+        else { Add-Result 'tool-call-stream' 'WARN' ("no tool call streamed; content='{0}'" -f (Cut $ts.Content 100)) }
+    } else { Add-Result 'tool-call-stream' 'FAIL' $ts.Error }
+
+    # --- reasoning (#767/#778): thinking ON with an adequate budget. A reasoning model must put its thinking in
+    # `reasoning_content` and the answer in `content` with NO <think> text in `content`. A non-reasoning model -> SKIP.
+    $rq = @(@{ role = 'user'; content = 'A bat and a ball cost 1.10 dollars in total. The bat costs 1.00 dollar more than the ball. How many cents is the ball? Answer with just the number.' })
+    $rr = Invoke-Json POST '/v1/chat/completions' @{ model = $modelName; temperature = 0; max_tokens = $ThinkingMaxTokens; enable_thinking = $true; messages = $rq }
+    if ($rr.Code -eq 200 -and $rr.Json) {
+        $rm = $rr.Json.choices[0].message; $rcontent = [string]$rm.content; $rreason = [string](Prop $rm 'reasoning_content')
+        $inline = Split-Think $rcontent
+        $rtoks = $null; $dets = Prop $rr.Json.usage 'completion_tokens_details'; if ($dets) { $rtoks = Prop $dets 'reasoning_tokens' }
+        $fin = $rr.Json.choices[0].finish_reason
+        $meta.reasoningTokens = $rtoks
+        if ($rreason) {
+            $has5 = $rcontent -match '(?<!\d)5(?!\d)'
+            $st = if ($inline.HasThink) { 'FAIL' } elseif (-not $rcontent.Trim()) { 'WARN' } elseif ($has5) { 'PASS' } else { 'WARN' }
+            $why = if ($inline.HasThink) { ' <think> leaked into content' } elseif (-not $rcontent.Trim()) { " EMPTY content (finish=${fin}: budget $ThinkingMaxTokens spent thinking)" } elseif (-not $has5) { ' answer not 5' } else { '' }
+            Add-Result 'reasoning' $st ("reasoning_content {0} chars, reasoning_tokens={1}, content='{2}'{3}" -f $rreason.Length, $rtoks, (Cut $rcontent 40), $why) @{ reasoning = (Cut $rreason 300); content = $rcontent }
+        } elseif ($inline.HasThink) {
+            Add-Result 'reasoning' 'FAIL' ("<think> text INLINE in content and reasoning_content empty: the split did not engage :: {0}" -f (Cut $rcontent 80)) @{ content = $rcontent }
+        } else {
+            Add-Result 'reasoning' 'SKIP' ("no reasoning emitted with enable_thinking=true (non-reasoning template); content='{0}'" -f (Cut $rcontent 60))
+        }
+        $meta.reasoningCapable = [bool]($rreason -or $inline.HasThink)
+    } else { Add-Result 'reasoning' 'FAIL' "HTTP $($rr.Code): $(Cut $rr.Text 200)" }
+
+    if ($meta.reasoningCapable) {
+        $rs = Invoke-Stream @{ model = $modelName; temperature = 0; max_tokens = $ThinkingMaxTokens; enable_thinking = $true; messages = $rq }
+        if ($rs.Ok) {
+            $inl = Split-Think $rs.Content
+            $st = if ($inl.HasThink) { 'FAIL' } elseif (-not $rs.Reasoning) { 'FAIL' } elseif (-not $rs.Content.Trim()) { 'WARN' } else { 'PASS' }
+            Add-Result 'reasoning-stream' $st ("reasoning_content deltas {0} chars; content='{1}' finish={2}{3}" -f $rs.Reasoning.Length, (Cut $rs.Content 40), $rs.Finish, $(if ($inl.HasThink) { ' <think> leaked into delta.content' } else { '' }))
+        } else { Add-Result 'reasoning-stream' 'FAIL' $rs.Error }
+    }
+
     # --- throughput (steady state): 1 warm-up discarded, then N measured, median + per-run values.
     # MTP models: the adaptive gate probes both arms over the first requests, so use >= 6 runs and
     # re-read /props mtp_status afterwards.
@@ -383,7 +520,7 @@ try {
     $decode = [System.Collections.Generic.List[double]]::new(); $wall = [System.Collections.Generic.List[double]]::new()
     $genPrompt = @(@{ role = 'user'; content = 'Write a long, detailed story about a lighthouse keeper. Do not stop early.' })
     for ($i = 0; $i -le $effRuns; $i++) {
-        $s = Invoke-Stream @{ model = $modelName; temperature = 0; max_tokens = $MaxTokens; messages = $genPrompt }
+        $s = Invoke-Stream (Plain @{ model = $modelName; temperature = 0; max_tokens = $MaxTokens; messages = $genPrompt })
         if (-not $s.Ok) { Add-Result 'decode-tps' 'FAIL' $s.Error; break }
         if ($i -eq 0) { continue }   # warm-up
         if ($s.Timings -and $s.Timings.decode_tokens_per_sec) { $decode.Add([double]$s.Timings.decode_tokens_per_sec) }
@@ -403,8 +540,8 @@ try {
     $pf = [System.Collections.Generic.List[double]]::new(); $pTok = 0
     for ($i = 0; $i -le [math]::Min($Runs, 2); $i++) {
         # vary the first words so the prompt cache cannot hide prefill
-        $s = Invoke-Stream @{ model = $modelName; temperature = 0; max_tokens = 1
-            messages = @(@{ role = 'user'; content = "[$i-$stamp] $long`nSummarise the above in five words." }) }
+        $s = Invoke-Stream (Plain @{ model = $modelName; temperature = 0; max_tokens = 1
+            messages = @(@{ role = 'user'; content = "[$i-$stamp] $long`nSummarise the above in five words." }) })
         if (-not $s.Ok) { Add-Result 'prefill-tps' 'FAIL' $s.Error; break }
         if ($i -eq 0) { continue }
         if ($s.Timings -and $s.Timings.prefill_tokens_per_sec) { $pf.Add([double]$s.Timings.prefill_tokens_per_sec); $pTok = $s.Timings.prompt_tokens }

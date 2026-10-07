@@ -313,7 +313,7 @@ dotllm chat QuantFactory/SmolLM-135M-GGUF --system "You are a helpful assistant.
 dotllm chat bartowski/Llama-3.2-3B-Instruct-GGUF --device gpu --cache-type-k q8_0 --cache-type-v q8_0
 ```
 
-`chat` supports `--device cpu|gpu` (CUDA) only; `--device vulkan` is rejected there — use `run` or `serve`.
+`chat` takes the same `--device` values as `run` (`auto` default, `cpu`, `vulkan`, `gpu`/`cuda`); on Vulkan it uses the model's own device KV-cache (paged/quantized KV and the prompt prefix cache are off there, as in `serve`).
 
 In-session commands: `/exit` or `/quit` to leave, `/clear` to reset history (keeps the system prompt), `/system <text>` to change the system prompt.
 
@@ -340,7 +340,7 @@ History cleared.
 
 Starts a local HTTP server exposing an OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/tokenize`, streaming SSE, tool calling) plus a built-in single-page web chat UI. Paged KV-cache, prompt caching, and startup warm-up are on by default. The browser opens automatically unless `--no-browser` is set.
 
-`--device` defaults to **`auto`** for `serve`: for each model it tries CUDA (if a GPU is present and the model fits), then Vulkan, then the CPU, and a load that fails on one device falls through to the next. Pass `cpu`, `gpu:N` (CUDA) or `vulkan` to force one. Idle models unload after `--keep-alive` seconds (default 300).
+`--device` defaults to **`auto`** for `serve`: for each model it tries CUDA (if a GPU is present and the model fits), then Vulkan, then the CPU, and a load that fails on one device falls through to the next. Pass `cpu`, `gpu:N`/`cuda:N` (CUDA) or `vulkan` to force one (an explicit GPU that cannot load the model is an error, not a CPU server). `dotllm run`/`chat`/`bench` use the same `auto` default and the same loader. Idle models unload after `--keep-alive` seconds (default 300).
 
 ```bash
 # Start the server with a loaded model and open the chat UI
@@ -400,7 +400,7 @@ To embed the same endpoints inside your own ASP.NET Core app, see [Host the Open
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
-| `--device` | `-d` | `cpu` (`run`, `chat`); `auto` (`serve`) | `cpu`; `gpu`, `gpu:0`, `gpu:1` (CUDA); `vulkan` (`run`, `serve`; not `chat`); `auto` (`serve` only: CUDA if the model fits, else Vulkan, else CPU) |
+| `--device` | `-d` | `auto` (`run`, `chat`, `bench`, `serve`); `cpu` (`perplexity`, so scores stay comparable) | `auto` (CUDA if the model fits, else Vulkan, else CPU - a CPU result always prints a warning); `cpu`; `vulkan`; `gpu`/`cuda`, `gpu:1`/`cuda:1` (CUDA). An explicit GPU that cannot be honoured is an **error** (what/why/model vs device memory, and `--device cpu` to opt in) - never a silent CPU run. Every command prints `device: requested -> resolved`. |
 | `--gpu-layers` | | *(all if `gpu`, 0 if `cpu`)* | Transformer layers on GPU (hybrid offload) |
 | `--rope-scaling`, `--rope-freq-base`, `--rope-scale`, `--yarn-*` | | *(from GGUF)* | RoPE / YaRN overrides (`run`, `serve`) |
 | `--prefill-chunk-size` | | 0 | Max prompt tokens per prefill forward pass (0 = whole prompt) |
@@ -474,7 +474,7 @@ To embed the same endpoints inside your own ASP.NET Core app, see [Host the Open
 | `--decision-temperature`, `--decision-orderings` | | `0`, `1` | Calibration of `POST /v1/systemone` probabilities |
 | `--rate-limit-rpm`, `--rate-limit-tpm`, `--rate-limit-concurrency` | | `0` (off) | Per-API-key rate limits; setting any enables limiting |
 
-**`bench`**, **`perplexity`**: `dotllm bench <model> [-d cpu|vulkan|cuda] [-p 512] [-n 128] [-r 5] [--depth N] [--json]` times prefill/decode (llama-bench equivalent); `dotllm perplexity <model> --corpus wiki.test.raw [--context 512] [--stride N] [-d ...]` scores a corpus ([docs/PERPLEXITY.md](docs/PERPLEXITY.md)). Both default to `--device cpu`.
+**`bench`**, **`perplexity`**: `dotllm bench <model> [-d cpu|vulkan|cuda] [-p 512] [-n 128] [-r 5] [--depth N] [--json]` times prefill/decode (llama-bench equivalent); `dotllm perplexity <model> --corpus wiki.test.raw [--context 512] [--stride N] [-d ...]` scores a corpus ([docs/PERPLEXITY.md](docs/PERPLEXITY.md)). `bench` defaults to `--device auto`; `perplexity` defaults to `--device cpu` (pass `-d auto|vulkan|cuda` to score on a GPU).
 
 **`ps`**, **`stop`**: clients of a running server (`--url`, or `DOTLLM_URL`; default `http://localhost:8080`). `dotllm ps` lists resident models; `dotllm stop <model>` / `--all` unloads, `--server` stops the whole server gracefully. Both need `--allow-model-admin` on the server for the write actions.
 

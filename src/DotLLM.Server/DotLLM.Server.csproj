@@ -18,6 +18,8 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="DotLLM.Tests.Unit" />
+    <!-- (#790) The Vulkan device-selection smoke drives DeviceModelLoader.LoadWith with the real inventory and a perturbed loader. -->
+    <InternalsVisibleTo Include="DotLLM.Tests.Integration" />
     <!-- (#455) The tray's contract suite round-trips every management DTO through the real
          source-generated ServerJsonContext, which is internal. Test-only visibility: the tray
          application itself does not reference this assembly at all, by design. -->

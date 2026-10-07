@@ -172,13 +172,13 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         public bool PCoreOnly { get; set; }
 
         [CommandOption("--device|-d")]
-        [Description("Compute device: 'cpu' (default), 'gpu', 'gpu:0', 'gpu:1' (CUDA), or 'vulkan'.")]
-        [DefaultValue("cpu")]
-        public string Device { get; set; } = "cpu";
+        [Description(DeviceCli.OptionHelp)]
+        [DefaultValue(DeviceCli.DefaultDevice)]
+        public string Device { get; set; } = DeviceCli.DefaultDevice;
 
         [CommandOption("--gpu-layers")]
-        [Description("Number of transformer layers to offload to GPU. 0 = CPU only. " +
-                     "Omit for default (0 with --device cpu, all with --device gpu).")]
+        [Description("Number of transformer layers to offload to GPU (CUDA). 0 = CPU only. " +
+                     "Omit for default (all layers on a GPU device, 0 with --device cpu). Ignored on vulkan (whole model is device-resident).")]
         public int? GpuLayers { get; set; }
 
         [CommandOption("--quant|-q")]
@@ -293,6 +293,13 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
         string prompt = resolvedPrompt!;
 
+        // Reject an unrecognised --device before doing any work: it used to fall through to the CPU silently (#468/#790).
+        if (DeviceCli.Validate(settings.Device) is { } deviceError)
+        {
+            DeviceCli.PrintError(deviceError, settings.Json);
+            return 1;
+        }
+
         // HuggingFace safetensors directory? (config.json + *.safetensors /
         // model.safetensors.index.json). Auto-detected; loads via the
         // safetensors path instead of GGUF. The GGUF path is unchanged.
@@ -317,6 +324,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         ITokenizer tokenizer = null!;
         IModel model = null!;
         Func<int, DotLLM.Core.Attention.IKvCache>? vulkanKv = null;
+        DeviceCli.Outcome deviceOutcome = null!;
 
         void LoadModel()
         {
@@ -325,6 +333,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 // HuggingFace safetensors checkpoint (e.g. BitNet b1.58 bf16).
                 // CPU load via the shared safetensors loader; GPU offload for
                 // this path is not wired through the CLI yet.
+                // Explicit GPU -> error before loading anything; auto -> CPU with a warning (#790).
+                deviceOutcome = DeviceCli.ResolveCpuOnly(settings.Device, "HuggingFace safetensors checkpoints", Path.GetFileName(hfDir));
                 var threadingCfg = new ThreadingConfig(
                     settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
                 var (m, src, cfg) = ModelLoader.LoadFromSafetensors(hfDir, threadingCfg);
@@ -342,54 +352,43 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             config = GgufModelConfigExtractor.ApplyRoPEOverride(config, BuildRoPEOverride(settings));
             tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
-            bool useVulkan = DotLLM.Vulkan.VulkanModelLoader.IsVulkanDeviceString(settings.Device);
-            int gpuLayers = useVulkan ? 0 : ResolveGpuLayers(settings, config);
-            if (useVulkan)
-            {
-                // Shared per-architecture Vulkan dispatch (#259). Without this branch --device vulkan
-                // fell through to the CPU path silently.
-                (model, vulkanKv) = DotLLM.Vulkan.VulkanModelLoader.CreateSharedFromGguf(gguf, config);
-            }
-            else if (gpuLayers <= 0)
-            {
-                // Shared per-architecture CPU dispatch — routes hybrid architectures
-                // (Nemotron-H, Qwen3MoeHybrid) to their dedicated loaders.
-                model = ModelLoader.CreateCpuModelFromGguf(gguf, config,
-                    new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly));
-            }
-            else if (gpuLayers >= config.NumLayers)
-            {
-                int gpuId = ParseGpuId(settings.Device);
-                // Shared per-architecture CUDA dispatch — routes hybrid architectures
-                // (Qwen3MoeHybrid, Qwen3HybridDense) to their dedicated loaders (#259).
-                (model, _) = DotLLM.Cuda.CudaModelLoader.CreateFromGguf(gguf, config, gpuId);
-            }
-            else
-            {
-                int gpuId = ParseGpuId(settings.Device);
-                var hybridThreading = new ThreadingConfig(
-                    settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
-                // Partial offload (#729 / #291): one dispatch decides per architecture. Architectures that
-                // cannot split (Nemotron-H, Qwen3MoeHybrid, Mamba-3) load all-GPU or fail with an actionable error (never a silent CPU fallback); a
-                // warning; Qwen3HybridDense uses its own split loader; the rest use HybridTransformerModel.
-                (model, _) = DotLLM.Cuda.CudaModelLoader.CreateForGpuLayers(
-                    gguf, config, gpuLayers, gpuId, hybridThreading,
-                    w => Console.Error.WriteLine($"WARNING: {w}"));
-            }
+            // THE shared dispatch (#790) behind serve/run/chat: resolves --device (auto = CUDA, then Vulkan, then CPU with a
+            // warning), loads per architecture (Vulkan #259, CUDA full/partial #729/#291, CPU hybrids), and refuses to turn an
+            // explicit GPU request into a CPU run.
+            DotLLM.Server.DeviceLoadResult loaded;
+            (loaded, deviceOutcome) = DeviceCli.Load(gguf, config, settings.Device, settings.GpuLayers,
+                new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly),
+                resolvedPath);
+            model = loaded.Model;
+            vulkanKv = loaded.IsVulkan ? loaded.KvCacheFactory : null;   // CUDA/hybrid models build their caches from the model type below
         }
 
         var loadSw = Stopwatch.StartNew();
-        if (settings.Json)
+        try
         {
-            LoadModel();
+            if (settings.Json)
+            {
+                LoadModel();
+            }
+            else
+            {
+                AnsiConsole.Status()
+                    .Spinner(Spinner.Known.Dots)
+                    .Start("Loading model...", _ => LoadModel());
+            }
         }
-        else
+        catch (DotLLM.Server.DeviceUnavailableException ex)
         {
-            AnsiConsole.Status()
-                .Spinner(Spinner.Known.Dots)
-                .Start("Loading model...", _ => LoadModel());
+            // An explicit device that cannot be honoured: a clean what/why/opt-in message and a failing exit code, never a CPU run.
+            DeviceCli.PrintError(ex.Message, settings.Json);
+            gguf?.Dispose();
+            safetensorsSource?.Dispose();
+            return 1;
         }
         loadSw.Stop();
+
+        // Resolved device line + (for auto on the CPU) the prominent warning, printed after the spinner so it stays visible.
+        DeviceCli.Report(deviceOutcome, settings.Json);
 
         // Display VRAM warning after spinner completes (so it stays visible).
         // In JSON mode, write to stderr so it doesn't corrupt the JSON output.
@@ -535,7 +534,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             var samplingLabel = BuildSamplingLabel(settings);
             var deviceLabel = model switch
             {
-                DotLLM.Cuda.CudaTransformerModel => DotLLM.Cuda.CudaDevice.GetDevice(ParseGpuId(settings.Device)).ToString(),
+                DotLLM.Cuda.CudaTransformerModel => DotLLM.Cuda.CudaDevice.GetDevice(DeviceCli.CudaOrdinal(deviceOutcome.Resolved)).ToString(),
                 DotLLM.Cuda.HybridTransformerModel h => $"hybrid {h.NumGpuLayers}gpu/{config.NumLayers - h.NumGpuLayers}cpu",
                 DotLLM.Cuda.Architectures.HybridQwen3HybridDenseTransformerModel h => $"hybrid {h.NumGpuLayers}gpu/{config.NumLayers - h.NumGpuLayers}cpu",
                 _ when vulkanKv is not null => $"vulkan {DotLLM.Vulkan.VulkanModelLoader.SharedDevice.DeviceName}",
@@ -833,6 +832,9 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                     {
                         SamplerPath = samplerPath,
                         DecodeGraph = decodeGraph,
+                        RequestedDevice = settings.Device,
+                        ResolvedDevice = deviceOutcome.Resolved,
+                        DeviceWarning = deviceOutcome.Warning,
                     },
                 };
                 Console.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.RunJsonResult));
@@ -992,23 +994,6 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             || Directory.EnumerateFiles(modelArg, "*.safetensors", SearchOption.TopDirectoryOnly).Any();
 
         return hasWeights ? Path.GetFullPath(modelArg) : null;
-    }
-
-    private static int ResolveGpuLayers(Settings settings, ModelConfig config)
-    {
-        if (settings.GpuLayers.HasValue)
-            return Math.Clamp(settings.GpuLayers.Value, 0, config.NumLayers);
-        // Default: 0 for cpu device, all layers for gpu device
-        return settings.Device.StartsWith("gpu", StringComparison.OrdinalIgnoreCase)
-            ? config.NumLayers : 0;
-    }
-
-    private static int ParseGpuId(string device)
-    {
-        // "gpu" → 0, "gpu:0" → 0, "gpu:1" → 1
-        int colonIdx = device.IndexOf(':');
-        if (colonIdx < 0) return 0;
-        return int.Parse(device.AsSpan(colonIdx + 1));
     }
 
     /// <summary>
