@@ -19,6 +19,15 @@ public static class ToolCallParserFactory
         // 1. Template content heuristics (highest priority — template is the source of truth)
         if (!string.IsNullOrEmpty(chatTemplate))
         {
+            // IBM Granite 3.x: `<|tool_call|>` + a JSON list. Its own special token; note it contains
+            // neither `<|tool_call>` (Gemma-4) nor `<tool_call>` (Hermes), so order is not load-bearing.
+            if (chatTemplate.Contains("<|tool_call|>", StringComparison.Ordinal))
+                return new GraniteToolCallParser();
+            // gpt-oss / OpenAI Harmony: channel messages; a tool call is a commentary message with a
+            // `to=functions.NAME` recipient. Its own token set (<|channel|>/<|message|>/<|call|>).
+            if (Reasoning.ReasoningMarkups.Detect(chatTemplate) == Reasoning.ReasoningMarkup.Harmony)
+                return new HarmonyToolCallParser();
+
             // Gemma-4: the template renders tool calls as <|tool_call>call:NAME{...}<tool_call|>.
             // Checked first — its own token pair, no overlap with the formats below.
             if (chatTemplate.Contains("<|tool_call>", StringComparison.Ordinal))
@@ -61,6 +70,8 @@ public static class ToolCallParserFactory
             // Qwen3.5+ hybrids speak the Qwen3-Coder XML form; the parser also accepts Hermes JSON.
             Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense => new QwenXmlToolCallParser(),
             Architecture.Gemma4 => new Gemma4ToolCallParser(),
+            Architecture.Granite or Architecture.GraniteMoe => new GraniteToolCallParser(),
+            Architecture.GptOss => new HarmonyToolCallParser(),
             // SmolLM3 defaults to the XML (Hermes-compatible) format; the
             // Pythonic variant is template-gated above.
             Architecture.SmolLM3 => new XmlToolCallParser(),

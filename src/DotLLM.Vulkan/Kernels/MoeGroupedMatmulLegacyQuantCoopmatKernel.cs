@@ -9,6 +9,8 @@ public enum MoeGroupedLegacyQuant
     Q5_1,
     /// <summary>Q8_0, 34-byte blocks (fp16 d, 32 x int8).</summary>
     Q8_0,
+    /// <summary>MXFP4, 17-byte blocks (u8 E8M0 scale, 16 bytes of packed nibbles) - gpt-oss expert banks (#789). Supports a per-expert bias epilogue.</summary>
+    Mxfp4,
 }
 
 /// <summary>
@@ -44,10 +46,19 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 5);
     }
 
-    private static string SpvName(MoeGroupedLegacyQuant q)
-        => q == MoeGroupedLegacyQuant.Q5_1 ? "moe_grouped_matmul_q5_1_coopmat_m64.spv" : "moe_grouped_matmul_q8_0_coopmat_m64.spv";
+    private static string SpvName(MoeGroupedLegacyQuant q) => q switch
+    {
+        MoeGroupedLegacyQuant.Q5_1 => "moe_grouped_matmul_q5_1_coopmat_m64.spv",
+        MoeGroupedLegacyQuant.Mxfp4 => "moe_grouped_matmul_mxfp4_coopmat_m64.spv",
+        _ => "moe_grouped_matmul_q8_0_coopmat_m64.spv",
+    };
 
-    private static int BlockBytesOf(MoeGroupedLegacyQuant q) => q == MoeGroupedLegacyQuant.Q5_1 ? 24 : 34;
+    private static int BlockBytesOf(MoeGroupedLegacyQuant q) => q switch
+    {
+        MoeGroupedLegacyQuant.Q5_1 => 24,
+        MoeGroupedLegacyQuant.Mxfp4 => 17,
+        _ => 34,
+    };
 
     /// <summary>Whether <paramref name="device"/> has cooperative matrices, wave64 (the shader assumes 4 x 64-thread subgroups) and the SPIR-V is present.</summary>
     public static bool IsSupportedOn(VulkanDevice device, string spvDir, MoeGroupedLegacyQuant quant)
@@ -85,11 +96,11 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
 
     /// <summary>Synchronous launch on the legacy 3-D grid; used by unit tests.</summary>
     public void Launch(VulkanDevice.Buffer bank, VulkanDevice.Buffer packedInput, VulkanDevice.Buffer offsets, VulkanDevice.Buffer output,
-        VulkanDevice.Buffer scale, bool applyScale, int m, int k, int rows, int numExperts, int maxRowsPerExpert = 0)
+        VulkanDevice.Buffer scale, bool applyScale, int m, int k, int rows, int numExperts, int maxRowsPerExpert = 0, bool applyBias = false)
     {
         using var ctx = _device.CreateSubmitContext();
         ctx.Begin();
-        Record(ctx.CommandBuffer, bank, packedInput, offsets, output, scale, applyScale, m, k, rows, numExperts, maxRowsPerExpert);
+        Record(ctx.CommandBuffer, bank, packedInput, offsets, output, scale, applyScale, m, k, rows, numExperts, maxRowsPerExpert, applyBias);
         ctx.SubmitAndWait();
     }
 
@@ -107,11 +118,11 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
 
     /// <summary>Records the grouped matmul on the legacy grid (<paramref name="maxRowsPerExpert"/> bounds the row-tile grid; 0 = <paramref name="rows"/>): <c>output[packedRow, m] = scale? . packedInput[packedRow, :] . bank[expert(packedRow), m, :]</c>.</summary>
     public unsafe void Record(nint cmdBuf, VulkanDevice.Buffer bank, VulkanDevice.Buffer packedInput, VulkanDevice.Buffer offsets,
-        VulkanDevice.Buffer output, VulkanDevice.Buffer scale, bool applyScale, int m, int k, int rows, int numExperts, int maxRowsPerExpert = 0)
+        VulkanDevice.Buffer output, VulkanDevice.Buffer scale, bool applyScale, int m, int k, int rows, int numExperts, int maxRowsPerExpert = 0, bool applyBias = false)
     {
         Validate(bank, packedInput, output, m, k, rows, numExperts, out long rowBytes);
         if (offsets.Size < (long)(numExperts + 1) * sizeof(uint)) throw new ArgumentException("offsets buffer too small.", nameof(offsets));
-        Bind(cmdBuf, bank, packedInput, offsets, output, scale, applyScale, m, k, rows, numExperts, rowBytes, tileList: 0);
+        Bind(cmdBuf, bank, packedInput, offsets, output, scale, applyScale, applyBias, m, k, rows, numExperts, rowBytes, tileList: 0);
         int rowTiles = maxRowsPerExpert > 0 ? Math.Min(maxRowsPerExpert, rows) : rows;
         VulkanApi.vkCmdDispatch(cmdBuf, (uint)MTiles(m), (uint)((rowTiles + TileN - 1) / TileN), (uint)numExperts);
     }
@@ -122,27 +133,30 @@ public sealed class MoeGroupedMatmulLegacyQuantCoopmatKernel : IDisposable
     /// </summary>
     public unsafe void RecordIndirect(nint cmdBuf, VulkanDevice.Buffer bank, VulkanDevice.Buffer packedInput, VulkanDevice.Buffer offsetsAndTiles,
         VulkanDevice.Buffer output, VulkanDevice.Buffer scale, bool applyScale, VulkanDevice.Buffer dispatchArgs, int dispatchArgsOffset,
-        int m, int k, int rows, int numExperts)
+        int m, int k, int rows, int numExperts, bool applyBias = false)
     {
         Validate(bank, packedInput, output, m, k, rows, numExperts, out long rowBytes);
         if (dispatchArgs.Size < dispatchArgsOffset + 3 * sizeof(uint)) throw new ArgumentException("dispatchArgs buffer too small.", nameof(dispatchArgs));
         if (offsetsAndTiles.Size < MoeBuildTileListKernel.OffsetsBufferUints(numExperts, rows) * sizeof(uint))
             throw new ArgumentException("offsets/tile-list buffer too small.", nameof(offsetsAndTiles));
-        Bind(cmdBuf, bank, packedInput, offsetsAndTiles, output, scale, applyScale, m, k, rows, numExperts, rowBytes, tileList: (uint)(numExperts + 1));
+        Bind(cmdBuf, bank, packedInput, offsetsAndTiles, output, scale, applyScale, applyBias, m, k, rows, numExperts, rowBytes, tileList: (uint)(numExperts + 1));
         VulkanApi.vkCmdDispatchIndirect(cmdBuf, dispatchArgs.Handle, (ulong)dispatchArgsOffset);
     }
 
     private unsafe void Bind(nint cmdBuf, VulkanDevice.Buffer bank, VulkanDevice.Buffer packedInput, VulkanDevice.Buffer offsets, VulkanDevice.Buffer output,
-        VulkanDevice.Buffer scale, bool applyScale, int m, int k, int rows, int numExperts, long rowBytes, uint tileList)
+        VulkanDevice.Buffer scale, bool applyScale, bool applyBias, int m, int k, int rows, int numExperts, long rowBytes, uint tileList)
     {
+        if (applyScale && applyBias) throw new ArgumentException("applyScale and applyBias are mutually exclusive.");
+        if (applyBias && _quant != MoeGroupedLegacyQuant.Mxfp4) throw new NotSupportedException("The bias epilogue exists only in the MXFP4 grouped shader.");
+        if (applyBias && scale.Size < (long)numExperts * m * sizeof(float)) throw new ArgumentException("bias buffer too small ([numExperts, m] floats).", nameof(scale));
         if (applyScale && scale.Size < (long)numExperts * sizeof(float)) throw new ArgumentException("scale buffer too small.", nameof(scale));
         Span<nint> buffers = stackalloc nint[5] { bank.Handle, packedInput.Handle, offsets.Handle, output.Handle, scale.Handle };
         nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout, 0, 1, descriptorSet, 0, 0);
         // The Q5_1 shader strides rows in uints, the Q8_0 shader (34-byte blocks, not word aligned) in bytes.
-        uint rowStride = _quant == MoeGroupedLegacyQuant.Q5_1 ? (uint)(rowBytes / 4) : (uint)rowBytes;
-        Span<uint> pc = stackalloc uint[8] { (uint)m, (uint)k, (uint)rows, (uint)numExperts, (uint)(k / 32), rowStride, tileList, applyScale ? 1u : 0u };
+        uint rowStride = _quant == MoeGroupedLegacyQuant.Q5_1 ? (uint)(rowBytes / 4) : (uint)rowBytes;   // Q8_0 / MXFP4 blocks are not word aligned: byte stride
+        Span<uint> pc = stackalloc uint[8] { (uint)m, (uint)k, (uint)rows, (uint)numExperts, (uint)(k / 32), rowStride, tileList, applyBias ? 2u : applyScale ? 1u : 0u };
         fixed (uint* pcPtr = pc)
             VulkanApi.vkCmdPushConstants(cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)pcPtr);
     }

@@ -233,3 +233,17 @@ Supported: per-layer embeddings (PLE), trailing shared-KV layers, proportional `
 - `rope_freqs` is accepted only in the released `{1.0 x n, 1e30 x rest}` form (mapped onto partial rotary); any other table throws at load.
 - Not supported: layer-split pipeline stages, TurboQuant KV, and the fused `ForwardBatch` path (falls back to per-sequence forwards).
 - Measured on Strix Halo (gfx1151), Q4_K_M: decode 36.5 tok/s, prefill 381 tok/s at 128 tokens; wikitext PPL within 0.04% of CPU (see PR).
+
+## Expert-grouped coopmat MoE prefill (issue #789, builds on #773/#785)
+
+For prefill (S >= 16 tokens; `DOTLLM_VK_MOE_GROUPED_MIN_TOKENS`) the generic MoE layer (`VulkanTransformerModel.RecordMoeLayer`) no longer runs the
+scalar indexed expert matmuls when every routed bank is a packed Q4_K / Q5_K / Q6_K / Q8_0 / MXFP4 tensor: it sorts the (token, slot) rows by expert once,
+builds an indirect tile list (`moe_build_tile_list`) and runs one cooperative-matrix GEMM per (expert, 16-row tile) with a 64-row weight tile
+(`moe_grouped_matmul_{q4_k,q5_k,q6_k,q8_0,mxfp4}_coopmat_m64`). The activation (SiLU, or gpt-oss's clamped OAI SwiGLU) is pointwise so it runs in packed
+order; the down GEMM reads that packed activation directly; one ungroup restores the (token, slot) order for the unchanged weighted scatter. gpt-oss's
+per-expert gate/up/down bias is added in the MXFP4 shader epilogue (`applyScale == 2`), the same single F32 add the scalar path does as a separate pass.
+Operands are F16 (dequantised weights and activations), so logits differ from the scalar path by ~1% of their rms; see the tests for the measured envelopes.
+
+* Opt-out: `DOTLLM_VK_MOE_GROUPED=0` (load time) or `VulkanTransformerModel.GroupedMoeEnabled = false` (runtime, in-process A/B).
+* Decode (S < gate) and LoRA keep the indexed MMVQ kernels. Wave64 + cooperative matrix devices only; others fall back to the scalar path.
+* Measured on gfx1151 (same session, split-submit profile): gpt-oss-20b pp512 74-82 -> 730-780 tok/s, OLMoE Q4_K_M pp512 `VK_ERROR_DEVICE_LOST` (#787) -> ~2900.

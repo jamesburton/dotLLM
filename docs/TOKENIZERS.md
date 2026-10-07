@@ -274,6 +274,12 @@ whitespace after it) whether generation starts inside a block, and `ReasoningSpl
 whitespace around the tags, treats an unclosed block as all reasoning, and recognises a model-emitted `<think>` only at the start of the output
 (`ReasoningFormat.Auto`) or anywhere (`Deepseek`). See [SERVER.md](SERVER.md#reasoning--thinking-models-767) for the wire behaviour.
 
+**Markups (#798).** The tag pair is per model: `ReasoningMarkups.Detect(templateSource)` returns `Think` (default), `Gemma4Channel`
+(`<|channel>thought` … `<channel|>`; `PromptOpensThinking(prompt, open, close)` handles the case where a tool-response generation prompt ends in an
+open channel) or `Harmony` (gpt-oss). `ReasoningSplitter` takes the tag pair as constructor arguments; `HarmonySplitter` is a separate state machine
+(Idle / Header / Body over channel messages) and both implement `IReasoningSplitter` (`Feed`, `Finish`, `InReasoning`, `SawReasoning`,
+`ReasoningRawLength`). The server asks `ReasoningPlan` for a splitter and never branches on the family itself.
+
 ### Known Template Formats
 
 **Llama 3**:

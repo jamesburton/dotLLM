@@ -21,7 +21,7 @@ namespace DotLLM.Engine.Samplers.StopConditions;
 public static class EndOfGenerationTokens
 {
     private static readonly string[] Candidates =
-        ["<eos>", "<end_of_turn>", "<|eot_id|>", "<|eom_id|>", "<|im_end|>", "<turn|>"];
+        ["<eos>", "<end_of_turn>", "<|eot_id|>", "<|eom_id|>", "<|im_end|>", "<turn|>", "<|call|>", "<|return|>"];
 
     private static readonly ConditionalWeakTable<ITokenizer, int[]> Cache = new();
 

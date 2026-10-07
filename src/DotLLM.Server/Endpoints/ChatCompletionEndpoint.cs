@@ -143,7 +143,7 @@ public static class ChatCompletionEndpoint
                 httpContext.RequestAborted);
             return;
         }
-        var plan = ReasoningSupport.Plan(state.Options.ReasoningFormat, request.ReasoningFormat, constrained, prompt, out string? planError);
+        var plan = ReasoningSupport.Plan(state.Options.ReasoningFormat, request.ReasoningFormat, constrained, prompt, out string? planError, state.ChatTemplate);
         if (planError is not null)
         {
             httpContext.Response.StatusCode = 400;
@@ -172,7 +172,7 @@ public static class ChatCompletionEndpoint
         }
 
         // Build inference options with clamped max_tokens
-        var stopSequences = CommonStopSequences;
+        var stopSequences = plan.FilterStops(CommonStopSequences);
         var options = RequestConverter.ToInferenceOptions(request, stopSequences,
             state.EffectiveSamplingDefaults,
             new DotLLM.Core.Configuration.ThreadingConfig(
