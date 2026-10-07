@@ -153,6 +153,10 @@ public static class BenchRunner
         // changes (issue #143): diff the dump between two builds/env configs.
         string? dumpPath = Environment.GetEnvironmentVariable("DOTLLM_BENCH_DUMP_TOKENS");
         List<int>? dumped = dumpPath is { Length: > 0 } ? new List<int>(decodeTokens) : null;
+        // DOTLLM_BENCH_STEP_LOG=<path> (#801): append one line per rep holding that rep's per-step decode ms so a
+        // run's tok/s can be windowed (drift tracking) without changing the timed region.
+        string? stepLogPath = Environment.GetEnvironmentVariable("DOTLLM_BENCH_STEP_LOG");
+        List<double>? stepMs = stepLogPath is { Length: > 0 } ? new List<double>(decodeTokens) : null;
         double decodeMs = 0;
         int[] single = new int[1];
         int[] singlePos = new int[1];
@@ -164,10 +168,17 @@ public static class BenchRunner
             ITensor logits = model.Forward(single, singlePos, deviceId: -1, cache);
             sw.Stop();
             decodeMs += sw.Elapsed.TotalMilliseconds;
+            stepMs?.Add(sw.Elapsed.TotalMilliseconds);
             using (logits)
                 nextToken = ArgmaxLastRow(logits);
             dumped?.Add(nextToken);
             nextPos++;
+        }
+
+        if (stepMs is not null)
+        {
+            try { File.AppendAllText(stepLogPath!, string.Join(' ', stepMs.Select(m => m.ToString("F2", System.Globalization.CultureInfo.InvariantCulture))) + Environment.NewLine); }
+            catch { /* diagnostics only */ }
         }
 
         if (dumped is not null)
