@@ -407,7 +407,7 @@ public static class OllamaApiEndpoint
             { await Error(c, 400, genErr!); return; }
         }
 
-        var plan = ReasoningSupport.Plan(state.Options.ReasoningFormat, null, constrained, finalPrompt, out _);
+        var plan = ReasoningSupport.Plan(state.Options.ReasoningFormat, null, constrained, finalPrompt, out _, state.ChatTemplate);
         options = plan.Gate(options, ReasoningSupport.UngatedStops);
         bool stream = !(root.TryGetProperty("stream", out var sv) && sv.ValueKind == JsonValueKind.False);
         string modelId = state.Options.ModelId;
