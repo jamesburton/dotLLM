@@ -49,6 +49,17 @@ public sealed class SmallModelGpuCollection : ICollectionFixture<SmallModelFixtu
 }
 
 /// <summary>
+/// GPU-only twin of the <c>Q4KModel</c> collection: shares <see cref="Q4KModelFixture"/> (a cached download path) but runs
+/// non-parallel, like <see cref="GpuCollection"/>. CPU-only <c>Q4KModel</c> classes stay in the parallel collection.
+/// </summary>
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class Q4KModelGpuCollection : ICollectionFixture<Q4KModelFixture>
+{
+    /// <summary>Collection name referenced by <c>[Collection(Q4KModelGpuCollection.Name)]</c>.</summary>
+    public const string Name = "Q4KModelGpu";
+}
+
+/// <summary>
 /// Serializes the Vulkan classes that read the mutable static
 /// <c>VulkanWeights.LastResidencyReport</c> after a load (a concurrent load would overwrite
 /// the report and can produce a false pass). Previously an implicit (undefined) collection,

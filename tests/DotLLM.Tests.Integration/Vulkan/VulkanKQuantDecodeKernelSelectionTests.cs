@@ -12,7 +12,7 @@ namespace DotLLM.Tests.Integration.Vulkan;
 /// there. The policy table is pure and always runs; the wiring test builds a real Q4_K_M/Q6_K model and asserts the decision reached
 /// the dispatch fields (<c>RecordMatmul</c> routes on exactly those), for both the default and the <c>=1</c> / <c>=0</c> overrides.
 /// </summary>
-[Collection("Q4KModel")]
+[Collection(Q4KModelGpuCollection.Name)]
 [Trait("Category", "GPU")]
 public sealed class VulkanKQuantDecodeKernelSelectionTests(Q4KModelFixture fixture)
 {
