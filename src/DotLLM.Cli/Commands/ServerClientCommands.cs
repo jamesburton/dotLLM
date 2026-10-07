@@ -30,10 +30,24 @@ internal sealed class PsCommand : AsyncCommand<ServerClientSettings>
             return 1;
         }
 
+        // Device of the active model, from /props - the same fields the server reports there (#790): requested -> resolved + any CPU warning.
+        string? activeDevice = null, deviceWarning = null;
+        try
+        {
+            using var props = JsonDocument.Parse(await http.GetStringAsync($"{s.BaseUrl}/props"));
+            var root = props.RootElement;
+            string? requested = root.TryGetProperty("device", out var rq) && rq.ValueKind == JsonValueKind.String ? rq.GetString() : null;
+            string? resolved = root.TryGetProperty("resolved_device", out var rs) && rs.ValueKind == JsonValueKind.String ? rs.GetString() : null;
+            activeDevice = resolved is null ? requested
+                : string.Equals(requested, resolved, StringComparison.OrdinalIgnoreCase) || requested is null ? resolved : $"{requested} -> {resolved}";
+            deviceWarning = root.TryGetProperty("device_fallback_warning", out var dw) && dw.ValueKind == JsonValueKind.String ? dw.GetString() : null;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException) { /* /props is optional for ps */ }
+
         using (doc)
         {
             var table = new Table().Border(TableBorder.Rounded);
-            table.AddColumn("Model"); table.AddColumn("Active"); table.AddColumn(new TableColumn("Size").RightAligned());
+            table.AddColumn("Model"); table.AddColumn("Active"); table.AddColumn("Device"); table.AddColumn(new TableColumn("Size").RightAligned());
             table.AddColumn(new TableColumn("Idle").RightAligned()); table.AddColumn(new TableColumn("Unloads in").RightAligned());
             int rows = 0;
             foreach (var m in doc.RootElement.GetProperty("data").EnumerateArray())
@@ -45,11 +59,13 @@ internal sealed class PsCommand : AsyncCommand<ServerClientSettings>
                 if (!active && size == 0) continue;   // known but not resident (unloaded): not part of ps
                 string idle = m.TryGetProperty("idle_seconds", out var i) && i.ValueKind == JsonValueKind.Number ? $"{i.GetDouble():F0}s" : "-";
                 string expires = m.TryGetProperty("expires_in_seconds", out var e) && e.ValueKind == JsonValueKind.Number ? $"{e.GetDouble():F0}s" : "never";
-                table.AddRow(id.EscapeMarkup(), active ? "[green]yes[/]" : "-", size > 0 ? FormatHelpers.FormatSize(size) : "-", idle, expires);
+                table.AddRow(id.EscapeMarkup(), active ? "[green]yes[/]" : "-", active && activeDevice is not null ? activeDevice.EscapeMarkup() : "-", size > 0 ? FormatHelpers.FormatSize(size) : "-", idle, expires);
                 rows++;
             }
             if (rows == 0) { AnsiConsole.MarkupLine("[yellow]No models are loaded.[/]"); return 0; }
             AnsiConsole.Write(table);
+            if (deviceWarning is not null)
+                AnsiConsole.MarkupLine($"[bold yellow]WARNING: {deviceWarning.EscapeMarkup()}[/]");
         }
         return 0;
     }
