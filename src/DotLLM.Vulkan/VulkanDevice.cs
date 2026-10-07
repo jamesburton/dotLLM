@@ -2227,6 +2227,24 @@ public sealed class VulkanDevice : IDisposable
     }
 
     /// <summary>
+    /// Bytes of weights this device can hold resident: <see cref="DeviceLocalHeapBytes"/> on a discrete GPU; on an
+    /// integrated GPU also the non-device-local heaps (the 512 MB-BIOS-split GTT heap, issue #812).
+    /// </summary>
+    public unsafe long ResidentCapacityBytes()
+    {
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        byte* heaps = (byte*)mem.memoryHeaps; // 16-byte entries: u64 size, u32 flags, padding
+        var sizes = new ulong[mem.memoryHeapCount];
+        var flags = new VkMemoryHeapFlags[mem.memoryHeapCount];
+        for (int i = 0; i < sizes.Length; i++)
+        {
+            sizes[i] = *(ulong*)(heaps + i * 16);
+            flags[i] = (VkMemoryHeapFlags)(*(uint*)(heaps + i * 16 + 8));
+        }
+        return VulkanMemoryCapacity.ResidentCapacityBytes(sizes, flags, PhysicalDeviceTypeValue);
+    }
+
+    /// <summary>
     /// Copies <paramref name="source"/> bytes from host memory into
     /// <paramref name="dst"/> (which may be device-local, i.e. not
     /// host-mappable) via an intermediate <paramref name="staging"/> buffer.
