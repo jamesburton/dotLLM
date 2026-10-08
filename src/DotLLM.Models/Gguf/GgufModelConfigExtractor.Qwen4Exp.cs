@@ -98,16 +98,18 @@ public static partial class GgufModelConfigExtractor
         if (layers.Length == 0)
             return null;
 
-        // hparams holds one set of hash constants, so llama.cpp cannot represent several PLE modules.
-        if (layers.Length != 1)
-            throw new NotSupportedException(
-                $"'{arch}.ple.layers' lists {layers.Length} layers, but only one PLE layer is supported (llama.cpp shares one set of hash constants).");
-        int layer = layers[0];
-        if (layer < 0 || layer >= numLayers)
-            throw new InvalidDataException($"PLE layer {layer} is out of range (the model has {numLayers} blocks).");
-        // The PLE conv history lives in the recurrent state, which only linear-attention layers have.
-        if (layer >= numTrunkLayers || trunkLayout.LayerKind[layer] == HybridLayerKind.Attention)
-            throw new InvalidDataException($"PLE layer {layer} is not a linear-attention (Gated-DeltaNet) layer.");
+        // HF numbers a PLE module by its position in the SORTED, de-duplicated layer list (ple_layer_index): the list must be strictly ascending.
+        for (int i = 1; i < layers.Length; i++)
+            if (layers[i] <= layers[i - 1])
+                throw new InvalidDataException($"'{arch}.ple.layers' must be strictly ascending, got {string.Join(",", layers)}.");
+        foreach (int layer in layers)
+        {
+            if (layer < 0 || layer >= numLayers)
+                throw new InvalidDataException($"PLE layer {layer} is out of range (the model has {numLayers} blocks).");
+            // The PLE conv history lives in the recurrent state, which only linear-attention layers have.
+            if (layer >= numTrunkLayers || trunkLayout.LayerKind[layer] == HybridLayerKind.Attention)
+                throw new InvalidDataException($"PLE layer {layer} is not a linear-attention (Gated-DeltaNet) layer.");
+        }
 
         int ngram = RequiredInt(metadata, $"{arch}.ple.ngram_size");
         int headsPerNgram = RequiredInt(metadata, $"{arch}.ple.heads_per_ngram");
@@ -124,10 +126,23 @@ public static partial class GgufModelConfigExtractor
         if (numHeads <= 0 || numHeads > 1024)
             throw new InvalidDataException($"PLE head count {numHeads} is out of range.");
 
-        ulong[] multipliers = RequireUInt64Array(metadata, $"{arch}.ple.layer_multipliers", ngram);
-        ulong[] offsets = RequireUInt64Array(metadata, $"{arch}.ple.head_offsets", (int)numHeads);
-        ulong[] vocabs = RequireUInt64Array(metadata, $"{arch}.ple.head_vocab_sizes", (int)numHeads);
-        for (int h = 0; h < numHeads; h++)
+        // Several modules carry one set of constants each, layer-major (HF derives different multipliers and primes per ple_layer_index).
+        // llama.cpp's hparams hold ONE set, so a file written for it cannot describe a second module: refuse with that explanation.
+        int modules = layers.Length;
+        ulong[] multipliers, offsets, vocabs;
+        try
+        {
+            multipliers = RequireUInt64Array(metadata, $"{arch}.ple.layer_multipliers", ngram * modules);
+            offsets = RequireUInt64Array(metadata, $"{arch}.ple.head_offsets", (int)numHeads * modules);
+            vocabs = RequireUInt64Array(metadata, $"{arch}.ple.head_vocab_sizes", (int)numHeads * modules);
+        }
+        catch (InvalidDataException e) when (modules > 1)
+        {
+            throw new NotSupportedException(
+                $"'{arch}.ple.layers' lists {modules} layers, so '{arch}.ple.layer_multipliers' / 'head_offsets' / 'head_vocab_sizes' must hold one set per layer, " +
+                $"layer-major ({ngram} multipliers and {numHeads} heads each); llama.cpp's single-set layout cannot describe several PLE modules. ({e.Message})");
+        }
+        for (int h = 0; h < numHeads * modules; h++)
         {
             if (vocabs[h] == 0)
                 throw new InvalidDataException($"PLE head {h} has a zero vocab size.");

@@ -82,7 +82,11 @@ public sealed record Qwen4ExpConfig
 /// </summary>
 public sealed record Qwen4ExpPleConfig
 {
-    /// <summary>Zero-based block indices that carry a PLE module (<c>{arch}.ple.layers</c>; <c>[1]</c>). Always linear-attention layers.</summary>
+    /// <summary>
+    /// Zero-based block indices that carry a PLE module (<c>{arch}.ple.layers</c>; <c>[1]</c>), strictly ascending. Always linear-attention
+    /// layers. HF numbers a module by its position in this (sorted) list, <c>ple_layer_index</c>: it selects the module's hash multipliers
+    /// and its slice of the head primes, and every module owns its own table, projections, norms and conv.
+    /// </summary>
     public required IReadOnlyList<int> Layers { get; init; }
 
     /// <summary>N-gram order (<c>{arch}.ple.ngram_size</c>; 3).</summary>
@@ -106,25 +110,49 @@ public sealed record Qwen4ExpPleConfig
     /// <summary>Width of one hash-table row (<c>{arch}.embedding_length_per_layer_input</c>; 160).</summary>
     public required int RowDim { get; init; }
 
-    /// <summary>Per-order hash multipliers (<c>{arch}.ple.layer_multipliers</c>), exact uint64; at least <see cref="NgramSize"/> entries.</summary>
+    /// <summary>
+    /// Per-order hash multipliers (<c>{arch}.ple.layer_multipliers</c>), exact uint64. Module <c>j</c> (position in <see cref="Layers"/>)
+    /// uses entries <c>[j * NgramSize, (j + 1) * NgramSize)</c>; a single-module file carries exactly one set.
+    /// </summary>
     public required IReadOnlyList<ulong> LayerMultipliers { get; init; }
 
-    /// <summary>First table row of each head's range (<c>{arch}.ple.head_offsets</c>), exact uint64; at least <see cref="NumHeads"/> entries.</summary>
+    /// <summary>
+    /// First table row of each head's range (<c>{arch}.ple.head_offsets</c>), exact uint64. Module <c>j</c> uses entries
+    /// <c>[j * NumHeads, (j + 1) * NumHeads)</c>. With several modules all tables live concatenated in the one
+    /// <c>per_layer_token_embd.weight</c>, so module <c>j</c>'s offsets already include the row count of the tables before it.
+    /// </summary>
     public required IReadOnlyList<ulong> HeadOffsets { get; init; }
 
-    /// <summary>Row count (hash modulus) of each head's range (<c>{arch}.ple.head_vocab_sizes</c>), exact uint64; at least <see cref="NumHeads"/> entries.</summary>
+    /// <summary>Row count (hash modulus) of each head's range (<c>{arch}.ple.head_vocab_sizes</c>), exact uint64; module <c>j</c> uses <c>[j * NumHeads, (j + 1) * NumHeads)</c>.</summary>
     public required IReadOnlyList<ulong> HeadVocabSizes { get; init; }
+
+    /// <summary>The <see cref="NgramSize"/> hash multipliers of module <paramref name="module"/> (position in <see cref="Layers"/>).</summary>
+    public ulong[] MultipliersOf(int module) => Slice(LayerMultipliers, module, NgramSize);
+
+    /// <summary>The <see cref="NumHeads"/> head row offsets of module <paramref name="module"/>.</summary>
+    public ulong[] HeadOffsetsOf(int module) => Slice(HeadOffsets, module, NumHeads);
+
+    /// <summary>The <see cref="NumHeads"/> head moduli of module <paramref name="module"/>.</summary>
+    public ulong[] HeadVocabSizesOf(int module) => Slice(HeadVocabSizes, module, NumHeads);
+
+    private ulong[] Slice(IReadOnlyList<ulong> all, int module, int width)
+    {
+        if ((uint)module >= (uint)Layers.Count) throw new ArgumentOutOfRangeException(nameof(module));
+        var r = new ulong[width];
+        for (int i = 0; i < width; i++) r[i] = all[module * width + i];
+        return r;
+    }
 
     /// <summary>Total hash heads: <c>(NgramSize - 1) * HeadsPerNgram</c> (order 1 is the plain token embedding; 16 on the released model).</summary>
     public int NumHeads => (NgramSize - 1) * HeadsPerNgram;
 
-    /// <summary>Minimum row count the <c>per_layer_token_embd.weight</c> table must have: <c>max(offset + vocab)</c> over the heads.</summary>
+    /// <summary>Minimum row count the <c>per_layer_token_embd.weight</c> table must have: <c>max(offset + vocab)</c> over the heads of every module.</summary>
     public ulong MinTableRows
     {
         get
         {
             ulong rows = 0;
-            for (int h = 0; h < NumHeads; h++)
+            for (int h = 0; h < NumHeads * Layers.Count; h++)
                 rows = Math.Max(rows, checked(HeadOffsets[h] + HeadVocabSizes[h]));
             return rows;
         }
