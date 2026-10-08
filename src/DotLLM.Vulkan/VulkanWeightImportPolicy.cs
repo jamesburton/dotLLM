@@ -63,6 +63,46 @@ internal static class VulkanWeightImportPolicy
 
     private static readonly List<(nint Pointer, long Bytes)> s_stagedRanges = [];
 
+    // Host-only ranges (#818): source tensors that must NEVER reach the device. The Qwen4-Exp n-gram table is one 28.8 GB tensor in
+    // the same mapping as the weights; importing or staging it would flip a ~80 GB model past the resident capacity (the 122B
+    // WDDM-thrash class). Survives Reset() (that clears the per-load ledger, not a model-lifetime policy); guarded in TryImport,
+    // NoteStaged and VulkanStagingBuffer.UploadBytes so a future caller cannot route the table through any of them by accident.
+    private static readonly List<(nint Pointer, long Bytes)> s_hostOnly = [];
+    private static readonly object s_hostOnlyLock = new();
+
+    /// <summary>Registers a source range that must never be imported, staged or uploaded. Undo with <see cref="UnregisterHostOnly"/>.</summary>
+    public static void RegisterHostOnly(nint pointer, long bytes)
+    {
+        if (pointer == 0 || bytes <= 0) return;
+        lock (s_hostOnlyLock) s_hostOnly.Add((pointer, bytes));
+    }
+
+    /// <summary>Removes a range registered with <see cref="RegisterHostOnly"/>.</summary>
+    public static void UnregisterHostOnly(nint pointer)
+    {
+        lock (s_hostOnlyLock) s_hostOnly.RemoveAll(r => r.Pointer == pointer);
+    }
+
+    /// <summary>The currently registered host-only ranges.</summary>
+    public static IReadOnlyList<(nint Pointer, long Bytes)> HostOnlyRanges
+    {
+        get { lock (s_hostOnlyLock) return s_hostOnly.ToArray(); }
+    }
+
+    /// <summary>Throws when <c>[srcPtr, srcPtr + bytes)</c> overlaps a registered host-only range.</summary>
+    public static void ThrowIfHostOnly(nint srcPtr, long bytes)
+    {
+        if (srcPtr == 0 || bytes <= 0) return;
+        lock (s_hostOnlyLock)
+        {
+            foreach (var (p, n) in s_hostOnly)
+                if (srcPtr < p + (nint)n && p < srcPtr + (nint)bytes)
+                    throw new InvalidOperationException(
+                        $"Refusing to upload {bytes:N0} source bytes at 0x{srcPtr:X}: the range overlaps a host-only tensor " +
+                        $"({n:N0} bytes at 0x{p:X}, e.g. the qwen4exp n-gram table), which must stay on the host (#818).");
+        }
+    }
+
     /// <summary>Tensors that took the zero-copy import on the current load.</summary>
     public static int ImportedTensorCount { get; private set; }
 
@@ -120,6 +160,7 @@ internal static class VulkanWeightImportPolicy
     {
         ArgumentNullException.ThrowIfNull(device);
         buf = null;
+        ThrowIfHostOnly(srcPtr, bytes);
 
         // HasExternalMemoryHost also covers the #507 UMA gate indirectly: on a discrete
         // GPU the extension may be present but TrySelectHostImportMemoryType refuses, and
@@ -189,6 +230,7 @@ internal static class VulkanWeightImportPolicy
     /// </summary>
     public static void NoteStaged(nint srcPtr, long sourceBytes, string? reason = null)
     {
+        ThrowIfHostOnly(srcPtr, sourceBytes);
         StagedTensorCount++;
         if (sourceBytes > 0) StagedBytes += sourceBytes;
         if (reason is not null) LastFallbackReason = reason;

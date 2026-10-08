@@ -1,0 +1,66 @@
+#version 450
+// Qwen4-Exp (Qwen3.8-Flash-Next) gated-residual ("hyper-connection", GR) element-wise ops, one shader selected by a push
+// constant. Mirrors DotLLM.Cpu.Kernels.Qwen4ExpGatedResidual (the CPU oracle) op for op. The residual R is
+// [seqLen, S, H] row-major (S parallel streams of H channels per token).
+//
+//   op 0  BROADCAST   R[t,s,i]  = emb[t,i]                                   A = R (out), B = emb
+//   op 1  ACTIVATE    v        <- silu(v / S)                                A = v (in place), n elements
+//   op 2  MIXMEAN     h[t,i]    = (sum_s sigmoid(mix[t,s,i]) * xn[t,s,i]) / S    A = h (out), B = mix, C = xn
+//   op 3  INJECT      g        <- 2 * sigmoid(g / S)                         A = g (in place), n elements
+//   op 4  WRITE       R[t,s,i] += gains[t,s] * y[t,i]                        A = R (rw), B = y, C = gains
+//
+// The mean is "sum over streams, then multiply by 1/S" (the CPU accumulation order), not a per-term divide.
+//
+// Dispatch: groupCount.x = ceil(n / 256) where n is the pc.n element count of the op; local_size_x = 256.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)          buffer BufA { float a[]; };
+layout(set = 0, binding = 1, std430) readonly buffer BufB { float b[]; };
+layout(set = 0, binding = 2, std430) readonly buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint  op;
+    uint  n;       // elements this dispatch covers (the loop bound of the op's thread index space)
+    uint  S;
+    uint  H;
+    float invS;    // 1 / S
+} pc;
+
+float sigmoidf(float x) { return 1.0 / (1.0 + exp(-x)); }
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.n) return;
+    uint S = pc.S;
+    uint H = pc.H;
+
+    if (pc.op == 0u) {                       // BROADCAST: idx over T*S*H
+        uint i = idx % H;
+        uint t = idx / (S * H);
+        a[idx] = b[t * H + i];
+    } else if (pc.op == 1u) {                // ACTIVATE: silu(v / S)
+        float v = a[idx] * pc.invS;
+        a[idx] = v / (1.0 + exp(-v));
+    } else if (pc.op == 2u) {                // MIXMEAN: idx over T*H
+        uint t = idx / H;
+        uint i = idx % H;
+        uint base = t * S * H + i;
+        float acc = 0.0;
+        for (uint s = 0u; s < S; s++) {
+            uint k = base + s * H;
+            float m = sigmoidf(b[k]);
+            float p = m * c[k];
+            acc += p;
+        }
+        a[idx] = acc * pc.invS;
+    } else if (pc.op == 3u) {                // INJECT: 2 * sigmoid(g / S)
+        float v = a[idx] * pc.invS;
+        a[idx] = 2.0 * sigmoidf(v);
+    } else if (pc.op == 4u) {                // WRITE: idx over T*S*H
+        uint i = idx % H;
+        uint ts = idx / H;                   // t * S + s
+        uint t = ts / S;
+        a[idx] += c[ts] * b[t * H + i];
+    }
+}
