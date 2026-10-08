@@ -442,5 +442,14 @@ public enum Architecture
     /// <c>h = x + post_attn_norm(attn(x))</c>, <c>h = h + post_ffn_norm(ffn(h))</c>), full-width Q/K RMSNorm before the
     /// head reshape, NeoX RoPE, SwiGLU. GGUF only; OLMo 3 (sliding window + YaRN) is refused (issue #765).
     /// </summary>
-    Olmo2
+    Olmo2,
+
+    /// <summary>
+    /// Qwen4-Exp / Qwen3.8-Flash-Next (llama.cpp <c>qwen4exp</c>, HF <c>qwen4_exp</c>): a 3:1 Gated-DeltaNet / QSA (block-pooled sparse
+    /// attention with an indexer) hybrid with a 512-expert softmax MoE + sigmoid-gated shared expert in every layer, a 4-stream gated
+    /// residual ("hyper-connection") replacing the pre-norms and final norm, an n-gram hash embedding ("PLE") on one layer and an
+    /// optional MTP block. GGUF only (multi-shard). Recognition and config/metadata parsing are implemented; the forward pass is NOT
+    /// (every backend refuses it explicitly) — see <see cref="DotLLM.Core.Models.Qwen4ExpConfig"/> and issues #814 / #815.
+    /// </summary>
+    Qwen4Exp
 }

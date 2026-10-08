@@ -296,6 +296,12 @@ public record ModelConfig
     public Gemma3nConfig? Gemma3n { get; init; }
 
     /// <summary>
+    /// Qwen4-Exp hyper-connection / QSA-indexer / n-gram-embedding parameters. Non-null iff <see cref="Architecture"/> is
+    /// <see cref="DotLLM.Core.Configuration.Architecture.Qwen4Exp"/>; null for every other architecture. See <see cref="Qwen4ExpConfig"/>.
+    /// </summary>
+    public Qwen4ExpConfig? Qwen4Exp { get; init; }
+
+    /// <summary>
     /// Optional per-attention-type RoPE override for the FULL-attention layers
     /// (Gemma 4 / DiffusionGemma). When non-null, every layer flagged as a
     /// full-attention layer by <see cref="IsFullAttentionLayer(int)"/> applies

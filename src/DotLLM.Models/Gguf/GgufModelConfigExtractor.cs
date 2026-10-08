@@ -46,7 +46,7 @@ public static partial class GgufModelConfigExtractor
         // appended as the final block, carrying BOTH head_count_kv and
         // feed_forward_length — the trunk-exclusive kinds rule does not apply to it).
         // deepseek2 (GLM-4.7-Flash, DeepSeek-V3/R1 conversions) ships it too (#742).
-        int nextnPredictLayers = architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense
+        int nextnPredictLayers = architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense or Architecture.Qwen4Exp
                 or Architecture.NemotronHMoe or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
             ? (int)metadata.GetUInt32OrDefault($"{arch}.nextn_predict_layers", 0)
             : 0;
@@ -169,7 +169,7 @@ public static partial class GgufModelConfigExtractor
 
         // GDN models reuse the same {arch}.ssm.* key names as Mamba-2 but with
         // different semantics — skip Mamba-2 SSM config extraction for them.
-        MambaSsmConfig? ssmConfig = architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense
+        MambaSsmConfig? ssmConfig = architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense or Architecture.Qwen4Exp
             ? null
             : TryExtractSsmConfig(metadata, arch);
 
@@ -196,15 +196,19 @@ public static partial class GgufModelConfigExtractor
             // value.
             headDim = mlaConfig.QkNopeHeadDim + mlaConfig.QkRopeHeadDim;
         }
-        else if (architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense)
+        else if (architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense or Architecture.Qwen4Exp)
         {
             gdnConfig = TryExtractGdnConfig(metadata, arch);
+            if (architecture == Architecture.Qwen4Exp && gdnConfig is null)
+                throw new InvalidDataException("GGUF architecture 'qwen4exp' requires the Gated-DeltaNet keys ('qwen4exp.ssm.*'); the file does not carry them.");
             // Dense hybrid (Qwen3HybridDense, e.g. Bonsai) has no MoE sublayer at all —
             // don't call TryExtractQwenMoeConfig for it. It would return null anyway
             // (no {arch}.expert_count key), but calling it only for the MoE variant
             // keeps the intent explicit rather than relying on that null-return.
-            if (architecture is Architecture.Qwen3MoeHybrid)
+            if (architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen4Exp)
                 moeConfig = TryExtractQwenMoeConfig(metadata, arch, numLayers);
+            if (architecture == Architecture.Qwen4Exp && moeConfig is null)
+                throw new InvalidDataException("GGUF architecture 'qwen4exp' requires 'qwen4exp.expert_count' (every block is a routed MoE).");
             // Build per-layer layout from full_attention_interval (not stored as
             // per-layer arrays like Nemotron-H, so TryExtractHybridLayout returned null).
             // Use numTrunkLayers, not raw numLayers: an MTP checkpoint's block_count
@@ -241,6 +245,11 @@ public static partial class GgufModelConfigExtractor
                     $"GGUF architecture '{arch}' requires '{arch}.logit_scale' (llama.cpp reads it as required); the file does not carry it.");
             graniteLogit = metadata.GetFloat32($"{arch}.logit_scale");
         }
+
+        // Qwen4-Exp: hyper-connection / QSA indexer / n-gram embedding parameters (llama.cpp qwen4exp.cpp load_arch_hparams).
+        Qwen4ExpConfig? qwen4Exp = architecture == Architecture.Qwen4Exp
+            ? ExtractQwen4ExpConfig(metadata, arch, numLayers, numTrunkLayers, hybridLayout!)
+            : null;
 
         bool isGemma2 = architecture == Architecture.Gemma2;
         bool isGemma3 = architecture == Architecture.Gemma3;
@@ -296,6 +305,7 @@ public static partial class GgufModelConfigExtractor
             MlaConfig = mlaConfig,
             Moe = moeConfig,
             GdnConfig = gdnConfig,
+            Qwen4Exp = qwen4Exp,
             HadamardFold = GgufHadamardFoldExtractor.TryExtract(metadata),
             ChatTemplate = chatTemplate,
             PoolingType = ExtractPoolingType(metadata, arch),
@@ -954,6 +964,9 @@ public static partial class GgufModelConfigExtractor
             "qwen2moe" or "qwen3moe" or "qwenmoe" => Architecture.QwenMoe,
             // Qwen3.6-35B-A3B: Gated DeltaNet hybrid — NOT a plain Qwen-MoE transformer.
             "qwen35moe" => Architecture.Qwen3MoeHybrid,
+            // Qwen3.8-Flash-Next (llama.cpp LLM_ARCH_QWEN4EXP): GDN/QSA hybrid + 512-expert MoE + 4-stream gated residual +
+            // n-gram embedding + optional MTP block. Config/metadata only; no forward pass yet (#814 / #815).
+            "qwen4exp" => Architecture.Qwen4Exp,
             // Dense Qwen3.5 hybrid (no MoE suffix) — same GDN/attention alternation as
             // qwen35moe, dense SwiGLU FFN instead of sparse MoE. First seen in PrismML's
             // Bonsai-27B (distilled from Qwen/Qwen3.6-27B).
@@ -1330,7 +1343,7 @@ public static partial class GgufModelConfigExtractor
         RoPEType ropeType = architecture switch
         {
             Architecture.Qwen or Architecture.QwenMoe
-                or Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense or Architecture.Phi
+                or Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense or Architecture.Qwen4Exp or Architecture.Phi
                 or Architecture.GptOss or Architecture.BitNet
                 // llama.cpp llama_model_rope_type: gemma / gemma2 / gemma3 are NEOX, and their
                 // converter does not permute Q/K (HF rotate_half layout).

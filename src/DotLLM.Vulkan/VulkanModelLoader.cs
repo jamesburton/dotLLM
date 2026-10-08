@@ -129,6 +129,9 @@ public static class VulkanModelLoader
                     "tensors ship in quantizations (Q5_0/IQ4_NL/Q4_0) the expert-indexed MoE kernel " +
                     "family does not cover yet. Tracked in issue #375.");
 
+            case Architecture.Qwen4Exp:
+                throw new NotSupportedException(Qwen4ExpConfig.UnsupportedMessage("Vulkan"));
+
             case Architecture.Mamba3:
                 throw new NotSupportedException(
                     "Mamba-3 has no GGUF representation: no upstream 'mamba3' value for " +
