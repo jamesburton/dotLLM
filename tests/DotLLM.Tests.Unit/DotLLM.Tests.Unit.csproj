@@ -53,6 +53,8 @@
     <None Include="Tokenizers\ChatTemplates\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
     <!-- #815: header-only dump (metadata + tensor tables) of the real Qwen3.8-Flash-Next GGUFs; the contract test reads it at runtime. -->
     <None Include="Models\Gguf\TestData\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- #816: HF-generated Qwen4-Exp reference fixtures (generators in Models\Qwen4Exp\Reference; CI has no torch). -->
+    <None Include="Models\Qwen4Exp\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
