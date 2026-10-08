@@ -31,6 +31,23 @@ public sealed class GgufWriter
     public GgufWriter AddUInt32(string key, uint value) =>
         AddMetadata(key, GgufValueType.UInt32, w => w.Write(value));
 
+    /// <summary>Adds a UInt16 metadata entry (e.g. <c>split.no</c> / <c>split.count</c>).</summary>
+    public GgufWriter AddUInt16(string key, ushort value) =>
+        AddMetadata(key, GgufValueType.UInt16, w => w.Write(value));
+
+    /// <summary>Adds an Int32 metadata entry (e.g. <c>split.tensors.count</c>).</summary>
+    public GgufWriter AddInt32(string key, int value) =>
+        AddMetadata(key, GgufValueType.Int32, w => w.Write(value));
+
+    /// <summary>Adds a UInt64 array metadata entry (exact 64-bit values, e.g. qwen4exp n-gram hash constants).</summary>
+    public GgufWriter AddUInt64Array(string key, ulong[] values) =>
+        AddMetadata(key, GgufValueType.Array, w =>
+        {
+            w.Write((uint)GgufValueType.UInt64);
+            w.Write((ulong)values.Length);
+            foreach (ulong v in values) w.Write(v);
+        });
+
     /// <summary>Adds a Float32 metadata entry.</summary>
     public GgufWriter AddFloat32(string key, float value) =>
         AddMetadata(key, GgufValueType.Float32, w => w.Write(value));
