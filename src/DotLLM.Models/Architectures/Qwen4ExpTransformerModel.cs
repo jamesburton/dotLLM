@@ -628,12 +628,18 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
             }
             GatedDeltaNetScan.L2NormalizeHeads(q.AsSpan(0, T * kDim), dS);
             GatedDeltaNetScan.L2NormalizeHeads(k.AsSpan(0, T * kDim), dS);
+            if (rowsToSnap > 0)
+            {
+                // what Replay needs to rebuild the state after any of the first rowsToSnap tokens (the scan records the deltas)
+                k.AsSpan(0, rowsToSnap * kDim).CopyTo(RowRecKLayer(ordinal));
+                alpha.AsSpan(0, rowsToSnap * nV).CopyTo(RowRecGLayer(ordinal));
+            }
 
             GatedDeltaNetScan.Execute(cache.GetGdnStateForUpdate(ordinal), q.AsSpan(0, T * kDim), k.AsSpan(0, T * kDim),
                                       v.AsSpan(0, T * vDim), alpha.AsSpan(0, T * nV), beta.AsSpan(0, T * nV),
                                       core.AsSpan(0, T * vDim), nV, nK, dS, T,
-                                      rowSnapshots: rowsToSnap > 0 ? RowSnapshotGdnLayer(ordinal) : default, snapshotRows: rowsToSnap,
-                                      stateSource: srcGdn);
+                                      snapshotRows: rowsToSnap, stateSource: srcGdn,
+                                      deltaRecord: rowsToSnap > 0 ? RowRecDLayer(ordinal) : default);
 
             // per-head RMSNorm(core, ssm_norm) * sigmoid(z)
             for (int t = 0; t < T; t++)
@@ -803,18 +809,26 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
 
     // ── per-row recurrent snapshots (speculative verify without replay) ──
 
-    private readonly Qwen4ExpNativeBuffer _rowSnapGdn = new(), _rowSnapConv = new();
+    // Row snapshots (#842): NOT a full GDN state per row. The state before the chunk is kept once (_rowBase, obtained by exchanging
+    // buffers with the live state: no copy), and per row and GDN layer only what rebuilds it by replay: the L2-normalised keys, the decays
+    // and the scan's deltas (nV * (1 + 2 * dS) floats vs nV * dS^2 for a full state: ~64x less at the released size).
+    private GdnStateCache? _rowBase;
+    private readonly Qwen4ExpNativeBuffer _rowRecK = new(), _rowRecG = new(), _rowRecD = new(), _rowSnapConv = new();
     private int _snapStrideRows;      // rows per layer region in the scratch (this recording)
     private int _snapRowsRecorded;    // rows 0 .. _snapRowsRecorded-1 recorded (state after the last row is the live state)
     private int _snapBase;            // state.Length before the recorded chunk
     private bool _snapValid;
+
+    /// <summary>The GDN part of <see cref="RecurrentRowSnapshotBytes"/>: the pre-chunk state, the per-row keys / decays / deltas and the conv windows.</summary>
+    public long RecurrentRowSnapshotGdnBytes
+        => (_rowBase?.AllocatedBytes ?? 0) + _rowRecK.Bytes + _rowRecG.Bytes + _rowRecD.Bytes + _rowSnapConv.Bytes;
 
     /// <summary>Bytes currently held by the per-row recurrent snapshot scratch (all components).</summary>
     public long RecurrentRowSnapshotBytes
     {
         get
         {
-            long b = _rowSnapGdn.Bytes + _rowSnapConv.Bytes;
+            long b = RecurrentRowSnapshotGdnBytes;
             foreach (var p in _defaultState.Ple) b += p is null ? 0 : p.Bytes - p.StateBytes;
             foreach (var q in _defaultState.Qsa) b += q?.Indexer.SnapshotScratchBytes ?? 0;
             return b;
@@ -823,8 +837,10 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
 
     /// <inheritdoc/>
     /// <remarks>
-    /// Costs <c>rows x (36 GDN layers x (NVHead x DState^2 + conv))</c> floats of scratch (~113 MiB per row at the released
-    /// size), kept for the model's lifetime; every snapshot is bit-identical to the state a forward of only that prefix leaves.
+    /// Scratch is ONE pre-chunk GDN state (~113 MiB at the released size, kept for the model's lifetime, captured without a copy) plus
+    /// about 1.8 MiB per row (keys, decays, deltas and the conv window of the 36 GDN layers), instead of ~113 MiB per row. A restore
+    /// to row r replays r + 1 rank-1 updates from the pre-chunk state; the result is bit-identical to the state the scan itself leaves
+    /// after that row (and to the full-state snapshots this replaced).
     /// </remarks>
     public bool SupportsRecurrentRowSnapshots => true;
 
@@ -855,7 +871,8 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         for (int l = 0; l < _numGdn; l++)
         {
             st.Gdn.DiscardPending(l);   // fully overwritten below: no point materialising a lazy copy first
-            RowSnapshotGdn(l, row).CopyTo(st.Gdn.GetGdnStateForUpdate(l));
+            GatedDeltaNetScan.Replay(st.Gdn.GetGdnStateForUpdate(l), _rowBase!.GetGdnState(l), RowRecKLayer(l), RowRecGLayer(l), RowRecDLayer(l),
+                                     _gdn.NVHead, _gdn.NKHead, _gdn.DState, row + 1);
             RowSnapshotConv(l, row).CopyTo(st.Gdn.GetConvStateForUpdate(l));
         }
         foreach (var p in st.Ple) p?.RestoreRow(row);
@@ -870,27 +887,46 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         _snapStrideRows = Math.Max(recorded, 1);
         if (_numGdn > 0)
         {
-            _rowSnapGdn.EnsureExact((long)_numGdn * _snapStrideRows * state.Gdn.GdnStateElements);
+            int kDim = _gdn.NKHead * _gdn.DState;
+            _rowRecK.EnsureExact((long)_numGdn * _snapStrideRows * kDim);
+            _rowRecG.EnsureExact((long)_numGdn * _snapStrideRows * _gdn.NVHead);
+            _rowRecD.EnsureExact((long)_numGdn * _snapStrideRows * _gdn.NVHead * _gdn.DState);
             _rowSnapConv.EnsureExact((long)_numGdn * _snapStrideRows * state.Gdn.ConvStateElements);
+            if (recorded > 0)
+            {
+                // Keep the pre-chunk state without copying it: the base takes the live buffers, the live state lazily reads the base in its
+                // first scan step (fused). After the forward the base holds exactly the state before the chunk.
+                _rowBase ??= new GdnStateCache(_gdn, _numGdn);
+                state.Gdn.MaterializePending();
+                _rowBase.SwapBuffersWith(state.Gdn);
+                state.Gdn.DeferCopyFrom(_rowBase);
+            }
         }
         foreach (var p in state.Ple) if (p is not null) p.RecordRowCount = recorded;
         foreach (var q in state.Qsa) if (q is not null) q.Indexer.RecordRowCount = recorded;
     }
 
-    private static void EndRowRecording(Qwen4ExpSequenceState state)
+    private void EndRowRecording(Qwen4ExpSequenceState state)
     {
+        if (_rowBase is not null && state.Gdn.IsPendingOn(_rowBase)) state.Gdn.MaterializePending();   // the forward did not reach every layer
         foreach (var p in state.Ple) if (p is not null) p.RecordRowCount = 0;
         foreach (var q in state.Qsa) if (q is not null) q.Indexer.RecordRowCount = 0;
     }
 
-    private Span<float> RowSnapshotGdnLayer(int ordinal)
+    private Span<float> RowRecKLayer(int ordinal)
     {
-        int e = _defaultState.Gdn.GdnStateElements;
-        return _rowSnapGdn.Slice((long)ordinal * _snapStrideRows * e, _snapStrideRows * e);
+        int e = _gdn.NKHead * _gdn.DState;
+        return _rowRecK.Slice((long)ordinal * _snapStrideRows * e, _snapStrideRows * e);
     }
 
-    private Span<float> RowSnapshotGdn(int ordinal, int row)
-        => RowSnapshotGdnLayer(ordinal).Slice(row * _defaultState.Gdn.GdnStateElements, _defaultState.Gdn.GdnStateElements);
+    private Span<float> RowRecGLayer(int ordinal)
+        => _rowRecG.Slice((long)ordinal * _snapStrideRows * _gdn.NVHead, _snapStrideRows * _gdn.NVHead);
+
+    private Span<float> RowRecDLayer(int ordinal)
+    {
+        int e = _gdn.NVHead * _gdn.DState;
+        return _rowRecD.Slice((long)ordinal * _snapStrideRows * e, _snapStrideRows * e);
+    }
 
     private Span<float> RowSnapshotConv(int ordinal, int row)
     {
@@ -1017,7 +1053,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         if (_ownsPool) _threadPool?.Dispose();
         _defaultState.Dispose();
         _spareCheckpoint?.Dispose();
-        _rowSnapGdn.Dispose(); _rowSnapConv.Dispose();
+        _rowBase?.Dispose(); _rowRecK.Dispose(); _rowRecG.Dispose(); _rowRecD.Dispose(); _rowSnapConv.Dispose();
         foreach (nint p in _owned) NativeMemory.AlignedFree((void*)p);
         _owned.Clear();
         GC.SuppressFinalize(this);
