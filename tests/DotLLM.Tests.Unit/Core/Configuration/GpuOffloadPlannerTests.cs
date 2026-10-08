@@ -22,6 +22,7 @@ public sealed class GpuOffloadPlannerTests
     [InlineData(Architecture.NemotronH)]
     [InlineData(Architecture.NemotronHMoe)]
     [InlineData(Architecture.Qwen3MoeHybrid)]
+    [InlineData(Architecture.Qwen4Exp)]
     [InlineData(Architecture.Mamba3)]
     public void UnsupportedArchitecture_PartialRequest_IsNotRoutedToTheSplitPath(Architecture arch)
     {

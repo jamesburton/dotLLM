@@ -1229,6 +1229,10 @@ internal sealed class TransformerWeights : IDisposable
             DotLLM.Core.Configuration.Architecture.Qwen3MoeHybrid or DotLLM.Core.Configuration.Architecture.Qwen3HybridDense =>
                 "its Gated-DeltaNet layers carry ssm_in/ssm_out/ssm_conv1d tensors instead of "
                 + "attn_q/attn_k/attn_v/attn_output",
+            DotLLM.Core.Configuration.Architecture.Qwen4Exp =>
+                "it is a Gated-DeltaNet / QSA hybrid with a 4-stream gated residual (hc_* tensors instead of "
+                + "attn_norm/ffn_norm/output_norm), an n-gram embedding and no dense attention projections on "
+                + "its linear-attention layers; its forward pass is not implemented yet (issues #814 / #815)",
             DotLLM.Core.Configuration.Architecture.Mamba3 =>
                 "Mamba-3 has no GGUF representation at all (no upstream 'mamba3' value for "
                 + "general.architecture and no GGUF tensor-naming convention) — it is "

@@ -51,6 +51,8 @@
     <!-- #409: chat-template fixtures are read at runtime from the output dir. [CallerFilePath] is
          deterministic-path-mapped to "/_/..." in CI, so it cannot locate source files. -->
     <None Include="Tokenizers\ChatTemplates\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- #815: header-only dump (metadata + tensor tables) of the real Qwen3.8-Flash-Next GGUFs; the contract test reads it at runtime. -->
+    <None Include="Models\Gguf\TestData\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

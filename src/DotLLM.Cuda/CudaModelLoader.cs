@@ -98,6 +98,9 @@ public static class CudaModelLoader
                     + "does not implement: its router is softmax-only, so loading would silently choose "
                     + "and weight the wrong experts. Use the CPU backend. Tracked in issue #742.");
 
+            case Architecture.Qwen4Exp:
+                throw new NotSupportedException(Qwen4ExpConfig.UnsupportedMessage("CUDA"));
+
             case Architecture.NemotronHMoe:
                 throw new NotSupportedException(
                     "nemotron_h_moe (Nemotron 3.5 Lightning) is recognized but not yet runnable on "

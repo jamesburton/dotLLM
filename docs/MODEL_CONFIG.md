@@ -94,6 +94,32 @@ Differences between architectures are captured entirely in ModelConfig.
   `MoeQuantSwiGluMlp`); attention/embeddings/LM head: Q8_0
 - Tokenizer: gpt2-model BPE with `gpt-4o` (o200k) pre-tokenizer
 
+### Qwen4-Exp / Qwen3.8-Flash-Next (`qwen4exp`) — config + metadata only (#815, epic #814)
+- GGUF arch string: `qwen4exp` (llama.cpp `LLM_ARCH_QWEN4EXP`) -> `Architecture.Qwen4Exp`. **No forward pass yet**: the CPU, Vulkan and
+  CUDA loaders refuse it with `Qwen4ExpConfig.UnsupportedMessage(...)` (CPU oracle is issue I2 of the epic).
+- 48 layers = `(GDN, GDN, GDN, QSA) x 12` (`full_attention_interval` 4, reuses `GdnConfig` + `HybridLayout`), every block a
+  512-expert top-10 **softmax** MoE (`NormTopKProb`) with one sigmoid-gated shared expert (reuses `MoeConfig`). Optional trailing MTP
+  block: `block_count` 49 + `nextn_predict_layers` 1 (the Unsloth trunk files have neither; MTP ships as a separate GGUF).
+- Model-specific parameters live in `ModelConfig.Qwen4Exp` (`Qwen4ExpConfig` / `Qwen4ExpPleConfig`), read under the exact keys llama.cpp's
+  `load_arch_hparams` reads (verified against the real UD-Q4_K_XL header):
+
+| GGUF key | field | notes |
+|---|---|---|
+| `hyper_connection.count` / `.low_rank` | `HyperConnectionCount` / `HyperConnectionLowRank` | 4 / 320; count must be > 1 |
+| `attention.indexer.head_count` / `.key_length` / `.top_k` | `IndexerHeadCount` / `IndexerKeyLength` / `IndexerTopK` | 4 / 128 / 2048 (a TOKEN budget) |
+| `attention.compress_ratios` | `CompressRatios`, `IndexerBlockSize` | per-block i32 (0 = GDN, 4 = QSA); one shared ratio > 1 dividing `top_k` |
+| `rope.dimension_sections` | `RopeSections` | `[11, 11, 10, 0]`, required |
+| `ple.layers` | `Ple.Layers` | **zero-based** (`[1]`); must be a GDN layer; one layer supported |
+| `ple.ngram_size`, `.heads_per_ngram`, `.conv_kernel`, `.eos_token_id`, `.image_token_id` | `Ple.*` | image id optional (null -> EOS) |
+| `embedding_length_per_layer_input` | `Ple.RowDim` | 160 (not under `ple.*`) |
+| `ple.layer_multipliers`, `.head_offsets`, `.head_vocab_sizes` | `Ple.*` as `ulong` | exact uint64 (never via float/double/signed); lengths >= ngram_size / heads |
+
+- Tensor contract: `Qwen4ExpTensors` (names + shapes, `FindProblems` diff) — asserted equal to the real 1224-tensor trunk table and the 34-tensor
+  MTP table. Differences from the early design notes: indexer tensors are **dotted** (`blk.N.indexer.q_proj`), the head mixer is
+  `output_hc_{norm,down,up}`, experts ship **split** (`ffn_gate_exps` + `ffn_up_exps`), `ssm_a` has no `.weight`, the 51.2 B-param
+  n-gram table is the single tensor `per_layer_token_embd.weight` `[160, 320001536]` (IQ4_NL) and sits in its own shard.
+- Test fixture: `SyntheticQwen4ExpGguf` (4 blocks, 8 experts, optional MTP block, optional `-0000N-of-0000M` split output).
+
 ## GGUF → ModelConfig Mapping
 
 ```csharp

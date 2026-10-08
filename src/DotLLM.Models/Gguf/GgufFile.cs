@@ -1,6 +1,7 @@
 using System.IO.MemoryMappedFiles;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Text.RegularExpressions;
 using DotLLM.Core.Configuration;
 
 namespace DotLLM.Models.Gguf;
@@ -9,7 +10,7 @@ namespace DotLLM.Models.Gguf;
 /// Represents an opened GGUF file with parsed metadata, tensor descriptors, and memory-mapped tensor data.
 /// Owns the memory-mapped file resources and must be disposed when no longer needed.
 /// </summary>
-public sealed unsafe class GgufFile : IDisposable
+public sealed class GgufFile : IDisposable
 {
     /// <summary>
     /// How the tensor data section is mapped. <see cref="MemoryMappedFileAccess.Read"/> by
@@ -62,36 +63,76 @@ public sealed unsafe class GgufFile : IDisposable
             ? MemoryMappedFileAccess.CopyOnWrite
             : MemoryMappedFileAccess.Read;
 
-    private MemoryMappedFile? _mmf;
-    private MemoryMappedViewAccessor? _accessor;
-    private byte* _basePointer;
+
+    private readonly Shard[] _shards;
+    private readonly Dictionary<string, int>? _shardByTensor;
+    private readonly nint _dataBasePointer;
     private bool _disposed;
 
-    /// <summary>Parsed GGUF header.</summary>
+    /// <summary>Parsed GGUF header (of the first shard when the file is a split set).</summary>
     public GgufHeader Header { get; }
 
-    /// <summary>Typed metadata accessor.</summary>
+    /// <summary>
+    /// Typed metadata accessor. For a split set this is the first shard's metadata, which holds
+    /// every key except the per-shard <c>split.*</c> bookkeeping (llama.cpp's
+    /// <c>llama-gguf-split</c> writes the model KVs to shard 1 only).
+    /// </summary>
     public GgufMetadata Metadata { get; }
 
-    /// <summary>Ordered list of tensor descriptors as they appear in the file.</summary>
+    /// <summary>
+    /// Ordered list of tensor descriptors: file order for a single file, shard order then file
+    /// order for a split set. <see cref="GgufTensorDescriptor.DataOffset"/> is always relative to
+    /// the data section of the shard that owns the tensor — never to a unified address space; use
+    /// <see cref="TensorDataPointer(in GgufTensorDescriptor)"/> to resolve a pointer.
+    /// </summary>
     public IReadOnlyList<GgufTensorDescriptor> Tensors { get; }
 
-    /// <summary>Tensor descriptors indexed by name for fast lookup.</summary>
+    /// <summary>Tensor descriptors indexed by name for fast lookup (unified across all shards).</summary>
     public IReadOnlyDictionary<string, GgufTensorDescriptor> TensorsByName { get; }
 
     /// <summary>
-    /// Pointer to the start of the tensor data section. Individual tensor data is at
-    /// <c>DataBasePointer + tensor.DataOffset</c>.
-    /// Returns <see cref="nint.Zero"/> if the file contains no tensors.
+    /// True when this file is a multi-shard (<c>-0000N-of-0000M.gguf</c>) set opened through its
+    /// first shard (issue #756).
     /// </summary>
-    public nint DataBasePointer { get; }
+    public bool IsSplit => _shards.Length > 1;
 
-    /// <summary>Byte offset of the tensor data section from the start of the file.</summary>
+    /// <summary>Number of shard files backing this logical GGUF (1 for an ordinary file).</summary>
+    public int ShardCount => _shards.Length;
+
+    /// <summary>Paths of the shard files in shard order (a single entry for an ordinary file).</summary>
+    public IReadOnlyList<string> ShardPaths { get; }
+
+    /// <summary>
+    /// Pointer to the start of the tensor data section. Individual tensor data is at
+    /// <c>DataBasePointer + tensor.DataOffset</c>. Returns <see cref="nint.Zero"/> if the file
+    /// contains no tensors.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// The file is a split set (<see cref="IsSplit"/>): the shards are separate mappings, so there is no
+    /// single base pointer and returning one would make every <c>DataBasePointer + DataOffset</c> read the
+    /// wrong bytes without any error. Resolve pointers with
+    /// <see cref="TensorDataPointer(in GgufTensorDescriptor)"/> instead.
+    /// </exception>
+    public nint DataBasePointer
+    {
+        get
+        {
+            if (_shards.Length > 1)
+                throw new InvalidOperationException(
+                    $"This GGUF is a {_shards.Length}-shard split set whose tensor data lives in separate mappings, so it has no " +
+                    "single DataBasePointer (DataBasePointer + DataOffset would address the wrong bytes). Resolve each tensor with " +
+                    "GgufFile.TensorDataPointer(...). Loader support for split GGUFs is tracked in issue #756.");
+            return _dataBasePointer;
+        }
+    }
+
+    /// <summary>Byte offset of the (first shard's) tensor data section from the start of its file.</summary>
     public long DataSectionOffset { get; }
 
     /// <summary>
     /// Byte length of the tensor data section — exactly the range <see cref="DataBasePointer"/>
-    /// maps, and so the length a page-residency census of the mapping must use.
+    /// maps, and so the length a page-residency census of the mapping must use. For a split set it is the
+    /// SUM of every shard's data section (the model's total weight bytes), which no single mapping covers.
     /// </summary>
     /// <remarks>
     /// Exposed because the alternative, reopening the file to ask its length, does not work:
@@ -102,42 +143,157 @@ public sealed unsafe class GgufFile : IDisposable
     /// </remarks>
     public long DataSectionLength { get; }
 
+    /// <summary>
+    /// Resolves the in-memory address of a tensor's data, for single files and split sets alike.
+    /// </summary>
+    /// <param name="tensor">A descriptor taken from <see cref="Tensors"/> / <see cref="TensorsByName"/>.</param>
+    /// <returns>Address of the first byte of the tensor's data inside its shard's mapping.</returns>
+    /// <exception cref="KeyNotFoundException">No tensor of that name exists.</exception>
+    public nint TensorDataPointer(in GgufTensorDescriptor tensor)
+    {
+        if (_shardByTensor is null)
+            return _dataBasePointer + (nint)tensor.DataOffset;
+
+        if (!_shardByTensor.TryGetValue(tensor.Name, out int shard))
+            throw new KeyNotFoundException($"GGUF tensor '{tensor.Name}' not found in any shard.");
+        return _shards[shard].DataBase + (nint)tensor.DataOffset;
+    }
+
+    /// <summary>Resolves the in-memory address of the named tensor's data.</summary>
+    /// <exception cref="KeyNotFoundException">No tensor of that name exists.</exception>
+    public nint TensorDataPointer(string tensorName)
+    {
+        if (!TensorsByName.TryGetValue(tensorName, out var tensor))
+            throw new KeyNotFoundException($"GGUF tensor '{tensorName}' not found.");
+        return TensorDataPointer(in tensor);
+    }
+
+    /// <summary>Zero-based index of the shard that stores the named tensor (always 0 for an ordinary file).</summary>
+    /// <exception cref="KeyNotFoundException">No tensor of that name exists.</exception>
+    public int GetTensorShardIndex(string tensorName)
+    {
+        if (!TensorsByName.ContainsKey(tensorName))
+            throw new KeyNotFoundException($"GGUF tensor '{tensorName}' not found.");
+        return _shardByTensor is null ? 0 : _shardByTensor[tensorName];
+    }
+
     private GgufFile(
         GgufHeader header,
         GgufMetadata metadata,
         IReadOnlyList<GgufTensorDescriptor> tensors,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensorsByName,
-        long dataSectionOffset,
-        long dataSectionLength,
-        nint dataBasePointer,
-        MemoryMappedFile? mmf,
-        MemoryMappedViewAccessor? accessor,
-        byte* basePointer)
+        Dictionary<string, int>? shardByTensor,
+        Shard[] shards)
     {
         Header = header;
         Metadata = metadata;
         Tensors = tensors;
         TensorsByName = tensorsByName;
-        DataSectionOffset = dataSectionOffset;
-        DataSectionLength = dataSectionLength;
-        DataBasePointer = dataBasePointer;
-        _mmf = mmf;
-        _accessor = accessor;
-        _basePointer = basePointer;
+        _shardByTensor = shardByTensor;
+        _shards = shards;
+        ShardPaths = Array.ConvertAll(shards, static s => s.Path);
+        DataSectionOffset = shards[0].DataSectionOffset;
+        long total = 0;
+        foreach (var s in shards) total += s.DataSectionLength;
+        DataSectionLength = total;
+        _dataBasePointer = shards[0].DataBase;
     }
 
     /// <summary>
     /// Opens and parses a GGUF file. The tensor data section is memory-mapped for zero-copy access.
+    /// A split set (<c>name-00001-of-0000M.gguf</c>, as written by <c>llama-gguf-split</c> and shipped for
+    /// every model over ~50 GB) is opened through its FIRST shard: the sibling shards are discovered by the
+    /// naming convention, validated against <c>split.no</c> / <c>split.count</c> / <c>split.tensors.count</c>,
+    /// and exposed as one logical tensor table (issue #756).
     /// </summary>
-    /// <param name="filePath">Path to the GGUF file.</param>
+    /// <param name="filePath">Path to the GGUF file (the first shard for a split set).</param>
     /// <returns>A <see cref="GgufFile"/> instance. Caller owns disposal.</returns>
-    /// <exception cref="FileNotFoundException">File does not exist.</exception>
-    /// <exception cref="InvalidDataException">File is not a valid GGUF file.</exception>
+    /// <exception cref="FileNotFoundException">File does not exist, or a sibling shard of a split set is missing
+    /// (the exception's <see cref="FileNotFoundException.FileName"/> is the missing shard's path).</exception>
+    /// <exception cref="InvalidDataException">File is not a valid GGUF file, or a split set is inconsistent.</exception>
     public static GgufFile Open(string filePath)
     {
         if (!File.Exists(filePath))
             throw new FileNotFoundException($"GGUF file not found: {filePath}", filePath);
 
+        ParsedShard first = ParseShard(filePath);
+        var parsed = new List<ParsedShard> { first };
+
+        int splitCount = ReadSplitInt(first.Metadata, "split.count", filePath) ?? 1;
+        if (splitCount > 1)
+        {
+            ValidateFirstShard(first, filePath, splitCount, out string dir, out string prefix);
+            for (int i = 2; i <= splitCount; i++)
+            {
+                string sibling = Path.Combine(dir, $"{prefix}-{i:D5}-of-{splitCount:D5}.gguf");
+                if (!File.Exists(sibling))
+                    throw new FileNotFoundException(
+                        $"GGUF split set '{filePath}' declares {splitCount} shards but shard {i} is missing: {sibling}", sibling);
+
+                ParsedShard shard = ParseShard(sibling);
+                ValidateSiblingShard(shard, sibling, expectedNo: i - 1, splitCount);
+                parsed.Add(shard);
+            }
+
+            ValidateSplitTensorTable(parsed, filePath);
+        }
+
+        // Unified tensor table, in shard order.
+        var tensors = new List<GgufTensorDescriptor>();
+        Dictionary<string, int>? shardByTensor = splitCount > 1 ? new Dictionary<string, int>() : null;
+        for (int si = 0; si < parsed.Count; si++)
+        {
+            foreach (var t in parsed[si].Tensors)
+            {
+                tensors.Add(t);
+                shardByTensor?.Add(t.Name, si);
+            }
+        }
+
+        var tensorsByName = new Dictionary<string, GgufTensorDescriptor>(tensors.Count);
+        foreach (var tensor in tensors)
+            tensorsByName[tensor.Name] = tensor;
+
+        // Memory-map every shard that carries tensor data (a metadata-only first shard maps nothing).
+        var shards = new Shard[parsed.Count];
+        try
+        {
+            for (int si = 0; si < parsed.Count; si++)
+                shards[si] = Shard.Map(parsed[si]);
+        }
+        catch
+        {
+            foreach (var s in shards) s?.Dispose();
+            throw;
+        }
+
+        return new GgufFile(first.Header, first.Metadata, tensors.AsReadOnly(), tensorsByName, shardByTensor, shards);
+    }
+
+    /// <inheritdoc/>
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+        _disposed = true;
+
+        foreach (var shard in _shards)
+            shard.Dispose();
+    }
+
+    // ───────────────────────────── shard parsing ─────────────────────────────
+
+    private sealed record ParsedShard(
+        string Path,
+        GgufHeader Header,
+        GgufMetadata Metadata,
+        List<GgufTensorDescriptor> Tensors,
+        long DataSectionOffset,
+        long DataSectionLength);
+
+    /// <summary>Parses one GGUF file's header, metadata and tensor table and bounds-checks every tensor against ITS data section.</summary>
+    private static ParsedShard ParseShard(string filePath)
+    {
         GgufHeader header;
         Dictionary<string, GgufMetadataValue> rawMetadata;
         List<GgufTensorDescriptor> tensors;
@@ -174,72 +330,167 @@ public sealed unsafe class GgufFile : IDisposable
                 throw new InvalidDataException(
                     $"Tensor '{tensor.Name}' data extends beyond file boundary " +
                     $"(offset {tensor.DataOffset}, size {tensorBytes}, " +
-                    $"data section size {dataSectionLength}).");
+                    $"data section size {dataSectionLength}) in '{filePath}'.");
         }
 
         GgufReader.ValidatePq2_0Layout(tensors, alignment, dataSectionLength);
 
-        var tensorsByName = new Dictionary<string, GgufTensorDescriptor>(tensors.Count);
-        foreach (var tensor in tensors)
-            tensorsByName[tensor.Name] = tensor;
+        return new ParsedShard(filePath, header, metadata, tensors, dataSectionOffset, dataSectionLength);
+    }
 
-        // Memory-map the file for tensor data access.
-        MemoryMappedFile? mmf = null;
-        MemoryMappedViewAccessor? accessor = null;
-        byte* basePointer = null;
-        nint dataBasePointer = nint.Zero;
+    private static readonly Regex s_shardName = new(
+        @"^(?<prefix>.+)-(?<no>\d{5})-of-(?<count>\d{5})\.gguf$",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
-        if (header.TensorCount > 0)
+    /// <summary>Checks the file handed to <see cref="Open"/> really is shard 1 of a well-named set; yields the sibling name stem.</summary>
+    private static void ValidateFirstShard(ParsedShard first, string filePath, int splitCount, out string dir, out string prefix)
+    {
+        string fileName = Path.GetFileName(filePath);
+        Match m = s_shardName.Match(fileName);
+        if (!m.Success)
+            throw new InvalidDataException(
+                $"GGUF '{filePath}' declares split.count={splitCount} but its name does not follow the " +
+                "'<name>-0000N-of-0000M.gguf' convention, so the other shards cannot be located.");
+
+        int fileNo = int.Parse(m.Groups["no"].Value);
+        int fileCount = int.Parse(m.Groups["count"].Value);
+        prefix = m.Groups["prefix"].Value;
+        dir = Path.GetDirectoryName(Path.GetFullPath(filePath)) ?? ".";
+
+        if (fileCount != splitCount)
+            throw new InvalidDataException(
+                $"GGUF '{filePath}' is named as one of {fileCount} shards but its split.count metadata says {splitCount}.");
+
+        int? splitNo = ReadSplitInt(first.Metadata, "split.no", filePath);
+        if (splitNo is null || splitNo.Value + 1 != fileNo)
+            throw new InvalidDataException(
+                $"GGUF '{filePath}' is named shard {fileNo} of {fileCount} but its split.no metadata is " +
+                $"{(splitNo is null ? "absent" : splitNo.Value.ToString())} (zero-based; expected {fileNo - 1}).");
+
+        if (fileNo != 1)
+            throw new InvalidDataException(
+                $"GGUF '{filePath}' is shard {fileNo} of {fileCount}; open the first shard " +
+                $"'{prefix}-{1:D5}-of-{fileCount:D5}.gguf' instead (only it carries the model metadata).");
+    }
+
+    private static void ValidateSiblingShard(ParsedShard shard, string path, int expectedNo, int splitCount)
+    {
+        int? no = ReadSplitInt(shard.Metadata, "split.no", path);
+        int? count = ReadSplitInt(shard.Metadata, "split.count", path);
+        if (count is null || count.Value != splitCount)
+            throw new InvalidDataException(
+                $"GGUF shard '{path}' has split.count {(count is null ? "absent" : count.Value.ToString())}, expected {splitCount}.");
+        if (no is null || no.Value != expectedNo)
+            throw new InvalidDataException(
+                $"GGUF shard '{path}' has split.no {(no is null ? "absent" : no.Value.ToString())}, expected {expectedNo} " +
+                "(shards were renamed or mixed from different sets).");
+    }
+
+    private static void ValidateSplitTensorTable(List<ParsedShard> shards, string filePath)
+    {
+        var seen = new Dictionary<string, string>();
+        long total = 0;
+        foreach (var shard in shards)
         {
+            foreach (var t in shard.Tensors)
+            {
+                if (!seen.TryAdd(t.Name, shard.Path))
+                    throw new InvalidDataException(
+                        $"Tensor '{t.Name}' appears in both '{seen[t.Name]}' and '{shard.Path}' of split set '{filePath}'.");
+                total++;
+            }
+        }
+
+        int? declared = ReadSplitInt(shards[0].Metadata, "split.tensors.count", filePath);
+        if (declared is not null && declared.Value != total)
+            throw new InvalidDataException(
+                $"GGUF split set '{filePath}' declares split.tensors.count={declared.Value} but its {shards.Count} shards " +
+                $"contain {total} tensors (a shard is truncated, replaced, or from a different quantization).");
+    }
+
+    /// <summary>Reads an integer-typed <c>split.*</c> key (u16 in files written by llama.cpp, i32 for the tensor count).</summary>
+    private static int? ReadSplitInt(GgufMetadata metadata, string key, string filePath)
+    {
+        if (!metadata.TryGetValue(key, out var v))
+            return null;
+
+        long value = v.Value switch
+        {
+            byte b => b,
+            sbyte sb => sb,
+            ushort us => us,
+            short s => s,
+            uint ui => ui,
+            int i => i,
+            ulong ul when ul <= int.MaxValue => (long)ul,
+            long l => l,
+            _ => throw new InvalidDataException(
+                $"GGUF '{filePath}' metadata '{key}' has non-integer type {v.Type}."),
+        };
+        if (value < 0 || value > int.MaxValue)
+            throw new InvalidDataException($"GGUF '{filePath}' metadata '{key}' value {value} is out of range.");
+        return (int)value;
+    }
+
+    // ───────────────────────────── shard mapping ─────────────────────────────
+
+    /// <summary>Owns one shard file's memory mapping.</summary>
+    private sealed unsafe class Shard : IDisposable
+    {
+        private MemoryMappedFile? _mmf;
+        private MemoryMappedViewAccessor? _accessor;
+        private byte* _basePointer;
+
+        public string Path { get; }
+        public long DataSectionOffset { get; }
+        public long DataSectionLength { get; }
+        public nint DataBase { get; private set; }
+
+        private Shard(string path, long dataSectionOffset, long dataSectionLength)
+        {
+            Path = path;
+            DataSectionOffset = dataSectionOffset;
+            DataSectionLength = dataSectionLength;
+        }
+
+        public static Shard Map(ParsedShard parsed)
+        {
+            var shard = new Shard(parsed.Path, parsed.DataSectionOffset, parsed.DataSectionLength);
+            if (parsed.Header.TensorCount == 0)
+                return shard;
+
             try
             {
                 MemoryMappedFileAccess access = MappingAccess;
-                mmf = MemoryMappedFile.CreateFromFile(filePath, FileMode.Open, null, 0, access);
-                accessor = mmf.CreateViewAccessor(0, 0, access);
-                accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref basePointer);
-                dataBasePointer = (nint)(basePointer + accessor.PointerOffset + dataSectionOffset);
+                shard._mmf = MemoryMappedFile.CreateFromFile(parsed.Path, FileMode.Open, null, 0, access);
+                shard._accessor = shard._mmf.CreateViewAccessor(0, 0, access);
+                byte* basePointer = null;
+                shard._accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref basePointer);
+                shard._basePointer = basePointer;
+                shard.DataBase = (nint)(basePointer + shard._accessor.PointerOffset + parsed.DataSectionOffset);
+                return shard;
             }
             catch
             {
-                if (basePointer != null)
-                    accessor?.SafeMemoryMappedViewHandle.ReleasePointer();
-                accessor?.Dispose();
-                mmf?.Dispose();
+                shard.Dispose();
                 throw;
             }
         }
 
-        return new GgufFile(
-            header,
-            metadata,
-            tensors.AsReadOnly(),
-            tensorsByName,
-            dataSectionOffset,
-            dataSectionLength,
-            dataBasePointer,
-            mmf,
-            accessor,
-            basePointer);
-    }
-
-    /// <inheritdoc/>
-    public void Dispose()
-    {
-        if (_disposed)
-            return;
-        _disposed = true;
-
-        if (_basePointer != null)
+        public void Dispose()
         {
-            _accessor?.SafeMemoryMappedViewHandle.ReleasePointer();
-            _basePointer = null;
+            if (_basePointer != null)
+            {
+                _accessor?.SafeMemoryMappedViewHandle.ReleasePointer();
+                _basePointer = null;
+            }
+
+            _accessor?.Dispose();
+            _accessor = null;
+
+            _mmf?.Dispose();
+            _mmf = null;
         }
-
-        _accessor?.Dispose();
-        _accessor = null;
-
-        _mmf?.Dispose();
-        _mmf = null;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
