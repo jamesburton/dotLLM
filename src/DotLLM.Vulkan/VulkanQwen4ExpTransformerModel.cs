@@ -112,6 +112,13 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     /// <summary>Test/diagnostic hook: receives <c>(name, data, rows, cols)</c> after each block (residual) (null = off, zero cost).</summary>
     internal Action<string, float[], int, int>? Trace { get; set; }
 
+    /// <summary>Device storage type of every layer's routed gate / down / up bank (F32 = widened because no resident kernel exists for the source quant).</summary>
+    internal IReadOnlyList<(Core.Configuration.QuantizationType Gate, Core.Configuration.QuantizationType Down, Core.Configuration.QuantizationType Up)> ExpertBankDeviceTypes
+        => _moe.Select(m => (m.W1QuantType, m.W2QuantType, m.W3QuantType)).ToArray();
+
+    /// <summary>Address of the n-gram table inside the GGUF mapping (0 when absent) - tests assert nothing was uploaded from this range.</summary>
+    internal (nint Pointer, long Bytes) HostOnlyTableRange => _hostOnlyTable ?? (0, 0);
+
     /// <summary>Bytes of the n-gram table the model deliberately keeps off the device (0 when the checkpoint has none).</summary>
     public long HostOnlyTableBytes => _hostOnlyTable?.Bytes ?? 0;
 

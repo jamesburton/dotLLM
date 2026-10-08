@@ -24,6 +24,11 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
     /// <param name="spvDir">Directory containing compiled SPIR-V blobs.</param>
     /// <exception cref="NotSupportedException">The weights do not fit the device's resident capacity (and no overcommit override is set).</exception>
     public static VulkanQwen4ExpTransformerModel BuildFromGguf(VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir)
+        => BuildFromGguf(device, gguf, config, spvDir, residentCapacityOverrideBytes: null);
+
+    /// <summary>Test seam: <paramref name="residentCapacityOverrideBytes"/> replaces the device's resident capacity in the pre-load gate.</summary>
+    internal static VulkanQwen4ExpTransformerModel BuildFromGguf(VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir,
+        long? residentCapacityOverrideBytes)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(gguf);
@@ -45,7 +50,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         int kvCapacity = Math.Min(config.MaxSequenceLength, denseLimit);
 
         // Residency gate BEFORE touching the device (the 122B WDDM-thrash class: refuse with numbers, do not page).
-        var plan = Qwen4ExpResidencyPlan.Create(tensors, config, device.ResidentCapacityBytes(), kvCapacity,
+        var plan = Qwen4ExpResidencyPlan.Create(tensors, config, residentCapacityOverrideBytes ?? device.ResidentCapacityBytes(), kvCapacity,
             GC.GetGCMemoryInfo().TotalAvailableMemoryBytes);
         if (!plan.Fits)
         {
