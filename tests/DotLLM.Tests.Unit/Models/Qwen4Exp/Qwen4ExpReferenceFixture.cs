@@ -35,6 +35,9 @@ internal sealed class Qwen4ExpReferenceFixture
     /// <summary>Integer meta entry.</summary>
     public int Int(string key) => Meta.GetProperty(key).GetInt32();
 
+    /// <summary>Names of every stored tensor.</summary>
+    public IEnumerable<string> Names => _tensors.Keys;
+
     /// <summary>Whether a tensor of this name exists.</summary>
     public bool Has(string name) => _tensors.ContainsKey(name);
 
