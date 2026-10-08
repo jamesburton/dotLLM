@@ -569,8 +569,24 @@ public sealed class Qwen4ExpQsaLayer
 
             // ── cache update (this chunk is visible to its own queries) ──
             nint kvKeysPtr = 0, kvValuesPtr = 0;
+            var qkv = kvCache as DotLLM.Core.Attention.IQuantizedKvCache;   // int8 / int4 rows: gathered + dequantised per query (#841)
             if (kvCache is null)
                 state.AppendKv(k, v, tokens);
+            else if (qkv is not null)
+            {
+                Qwen4ExpKvRows.RequireSupported(qkv);
+                if (kvCache.CurrentLength < first)
+                    throw new InvalidOperationException(
+                        $"QSA KV cache holds {kvCache.CurrentLength} rows but the sequence state is at position {first}.");
+                int[] positions = ArrayPool<int>.Shared.Rent(tokens);
+                try
+                {
+                    for (int t = 0; t < tokens; t++) positions[t] = first + t;
+                    fixed (float* kp = k) fixed (float* vp = v)
+                        Qwen4ExpKvRows.Update(kvCache, kp, vp, tokens, kvElems, positions.AsSpan(0, tokens), kvSlot);
+                }
+                finally { ArrayPool<int>.Shared.Return(positions); }
+            }
             else
             {
                 if (kvCache.CurrentLength < first)
@@ -603,10 +619,13 @@ public sealed class Qwen4ExpQsaLayer
             int[] sel = ArrayPool<int>.Shared.Rent(_budgetBlocks);
             float[] scores = ArrayPool<float>.Shared.Rent(maxKeys + 1);
             float[] blockScores = ArrayPool<float>.Shared.Rent(maxKeys / _blockSize + 1);
+            float[]? gK = null, gV = null;      // quantised path: gathered + dequantised selected rows
+            int[]? ramp = null;
             try
             {
                 ReadOnlySpan<float> keys, values;
                 if (kvCache is null) { keys = state.Keys; values = state.Values; }
+                else if (qkv is not null) { keys = default; values = default; }
                 else
                 {
                     keys = new ReadOnlySpan<float>((void*)kvKeysPtr, (first + tokens) * kvElems);
@@ -629,8 +648,24 @@ public sealed class Qwen4ExpQsaLayer
                                                              pooled, nb, _budgetBlocks, sel, blockScores);
                         count = Qwen4ExpQsa.BuildKeyList(pos, _blockSize, false, sel.AsSpan(0, taken), keyIdx);
                     }
-                    Qwen4ExpQsa.AttendKeys(q.AsSpan(t * qElems, qElems), keys, values, keyIdx.AsSpan(0, count),
-                                           nH, nKv, d, scale, attn.AsSpan(t * qElems, qElems), scores);
+                    if (qkv is null)
+                        Qwen4ExpQsa.AttendKeys(q.AsSpan(t * qElems, qElems), keys, values, keyIdx.AsSpan(0, count),
+                                               nH, nKv, d, scale, attn.AsSpan(t * qElems, qElems), scores);
+                    else
+                    {
+                        // Selected rows are dequantised into a dense scratch (row i = keyIdx[i]) and attended through a 0..n-1 ramp.
+                        if (gK is null || gK.Length < (long)count * kvElems)
+                        {
+                            if (gK is not null) { ArrayPool<float>.Shared.Return(gK); ArrayPool<float>.Shared.Return(gV!); ArrayPool<int>.Shared.Return(ramp!); }
+                            gK = ArrayPool<float>.Shared.Rent(count * kvElems); gV = ArrayPool<float>.Shared.Rent(count * kvElems);
+                            ramp = ArrayPool<int>.Shared.Rent(count);
+                            for (int i = 0; i < ramp.Length; i++) ramp[i] = i;
+                        }
+                        Qwen4ExpKvRows.Gather(qkv, kvSlot, keyIdx.AsSpan(0, count), first, kvElems, k.AsSpan(0, tokens * kvElems),
+                                              v.AsSpan(0, tokens * kvElems), gK, gV!);
+                        Qwen4ExpQsa.AttendKeys(q.AsSpan(t * qElems, qElems), gK, gV!, ramp.AsSpan(0, count),
+                                               nH, nKv, d, scale, attn.AsSpan(t * qElems, qElems), scores);
+                    }
                 }
                 // keys / values / pooled are raw spans over the state's native buffers, whose finalizers free them: the state
                 // must stay reachable until the last read (otherwise a GC mid-loop frees memory under the span; observed as
@@ -639,6 +674,7 @@ public sealed class Qwen4ExpQsaLayer
             }
             finally
             {
+                if (gK is not null) { ArrayPool<float>.Shared.Return(gK); ArrayPool<float>.Shared.Return(gV!); ArrayPool<int>.Shared.Return(ramp!); }
                 ArrayPool<int>.Shared.Return(keyIdx); ArrayPool<int>.Shared.Return(sel);
                 ArrayPool<float>.Shared.Return(scores); ArrayPool<float>.Shared.Return(blockScores);
             }

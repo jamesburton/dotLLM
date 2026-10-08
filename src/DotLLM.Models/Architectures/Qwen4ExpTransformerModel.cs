@@ -934,11 +934,20 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
             {
                 if (b.Qsa is null) continue;
                 int slot = b.QsaOrdinal, stride = b.Qsa.KvStride;
-                var kr = kvCache.GetKeysRef(slot); var vr = kvCache.GetValuesRef(slot);
-                if (kr.Dim0 < prefixLen) throw new ArgumentException($"The KV cache holds {kr.Dim0} rows; the prefix is {prefixLen}.", nameof(kvCache));
                 keys[slot] = new Qwen4ExpNativeBuffer(); values[slot] = new Qwen4ExpNativeBuffer();
                 keys[slot].EnsureExact(Math.Max(1L, (long)prefixLen * stride));
                 values[slot].EnsureExact(Math.Max(1L, (long)prefixLen * stride));
+                if (kvCache is IQuantizedKvCache qkv)
+                {
+                    // Quantised cache: the snapshot holds the DEQUANTISED rows (fp32), so restoring re-quantises them into the target.
+                    Qwen4ExpKvRows.RequireSupported(qkv);
+                    if (qkv.CurrentLength < prefixLen) throw new ArgumentException($"The KV cache holds {qkv.CurrentLength} rows; the prefix is {prefixLen}.", nameof(kvCache));
+                    for (int p = 0; p < prefixLen; p++)
+                        Qwen4ExpKvRows.ReadRow(qkv, slot, p, stride, keys[slot].Pointer + (long)p * stride, values[slot].Pointer + (long)p * stride);
+                    continue;
+                }
+                var kr = kvCache.GetKeysRef(slot); var vr = kvCache.GetValuesRef(slot);
+                if (kr.Dim0 < prefixLen) throw new ArgumentException($"The KV cache holds {kr.Dim0} rows; the prefix is {prefixLen}.", nameof(kvCache));
                 new ReadOnlySpan<float>((void*)kr.DataPointer, prefixLen * stride).CopyTo(keys[slot].Slice(0, prefixLen * stride));
                 new ReadOnlySpan<float>((void*)vr.DataPointer, prefixLen * stride).CopyTo(values[slot].Slice(0, prefixLen * stride));
             }
@@ -968,9 +977,8 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         {
             if (b.Qsa is null) continue;
             int slot = b.QsaOrdinal, stride = b.Qsa.KvStride;
-            var kRef = new TensorRef(snap.Length, stride, DType.Float32, -1, (nint)snap.Keys[slot].Pointer);
-            var vRef = new TensorRef(snap.Length, stride, DType.Float32, -1, (nint)snap.Values[slot].Pointer);
-            kvCache.Update(kRef, vRef, pos, slot);
+            // Sub-chunked for a windowed quantised cache (an update longer than its window would quantise unwritten ring slots).
+            Qwen4ExpKvRows.Update(kvCache, snap.Keys[slot].Pointer, snap.Values[slot].Pointer, snap.Length, stride, pos, slot);
         }
         s.CopyFrom(snap.State);
     }
@@ -983,6 +991,13 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
     /// </summary>
     /// <param name="contextLength">Tokens consumed by the sequence.</param>
     public Qwen4ExpStateBytes EstimateSequenceStateBytes(int contextLength) => Qwen4ExpStateBytes.Estimate(Config, contextLength);
+
+    /// <summary>
+    /// Like <see cref="EstimateSequenceStateBytes(int)"/> with the QSA K/V rows in a quantised engine KV cache (#841): <paramref name="keyDType"/> /
+    /// <paramref name="valueDType"/> (Q8_0 or Q4_0) older than the fp32 <paramref name="windowSize"/> rows.
+    /// </summary>
+    public Qwen4ExpStateBytes EstimateSequenceStateBytes(int contextLength, KvCacheDType keyDType, KvCacheDType valueDType, int windowSize)
+        => Qwen4ExpStateBytes.Estimate(Config, contextLength, keyDType, valueDType, windowSize);
 
     /// <summary>
     /// Size of a checkpoint taken at <paramref name="contextLength"/> tokens (what <see cref="CheckpointRecurrentState"/> copies,
