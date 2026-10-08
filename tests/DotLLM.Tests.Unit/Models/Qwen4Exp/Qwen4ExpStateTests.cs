@@ -75,13 +75,16 @@ public sealed class Qwen4ExpStateTests : IDisposable
 
     private IKvCache NewKv(int len = 64) => new SimpleKvCache(KvGeometry.FromConfig(_config), len);
 
+    /// <summary>Worst absolute difference scaled by the largest reference magnitude (the tiny model's logits are small, so a
+    /// per-element 1+|x| denominator would hide real state differences).</summary>
     private static float MaxRel(float[] expected, float[] actual)
     {
         Assert.Equal(expected.Length, actual.Length);
-        float worst = 0;
+        float worst = 0, scale = 1e-12f;
+        foreach (float v in expected) scale = MathF.Max(scale, MathF.Abs(v));
         for (int i = 0; i < expected.Length; i++)
-            worst = MathF.Max(worst, MathF.Abs(expected[i] - actual[i]) / (1f + MathF.Abs(expected[i])));
-        return worst;
+            worst = MathF.Max(worst, MathF.Abs(expected[i] - actual[i]));
+        return worst / scale;
     }
 
     private float[] Fwd(int[] ids, int start, IKvCache? kv)
