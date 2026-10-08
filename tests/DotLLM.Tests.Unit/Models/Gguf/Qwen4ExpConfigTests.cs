@@ -349,24 +349,27 @@ public sealed class Qwen4ExpConfigTests : IDisposable
     // ───────────────────────────── explicit refusals ─────────────────────────────
 
     [Fact]
-    public void CpuLoader_RefusesQwen4Exp_Explicitly()
+    public void CpuLoader_LoadsQwen4Exp_WithTheOracleModel()
     {
+        // #816: the explicit CPU refusal of #815 is replaced by the CPU reference forward.
         var (file, c) = Open();
         using (file)
         {
-            var ex = Assert.Throws<NotSupportedException>(() => ModelLoader.CreateCpuModelFromGguf(file, c));
-            Assert.Contains("Qwen4Exp", ex.Message);
-            Assert.Contains("CPU", ex.Message);
-            Assert.Contains("#814", ex.Message);
+            using var model = ModelLoader.CreateCpuModelFromGguf(file, c);
+            Assert.IsType<Qwen4ExpTransformerModel>(model);
         }
     }
 
     [Fact]
-    public void CpuLoader_LoadFromGguf_RefusesQwen4Exp_BeforeAnyTensorIsRead()
+    public void CpuLoader_LoadFromGguf_RunsAForwardOnTheSyntheticFixture()
     {
         string path = SyntheticQwen4ExpGguf.Write(Path.Combine(_dir, "whole.gguf"));
-        var ex = Assert.Throws<NotSupportedException>(() => ModelLoader.LoadFromGguf(path));
-        Assert.Contains("Qwen4Exp", ex.Message);
+        var (model, gguf, _) = ModelLoader.LoadFromGguf(path);
+        using (gguf) using (model)
+        {
+            using var logits = model.Forward([4, 7, 2, 9], [0, 1, 2, 3], -1);
+            Assert.Equal(SyntheticQwen4ExpGguf.VocabSize, logits.Shape[1]);
+        }
     }
 
     [Fact]

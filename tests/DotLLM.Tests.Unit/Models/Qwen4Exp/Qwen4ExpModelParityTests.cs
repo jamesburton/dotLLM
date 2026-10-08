@@ -146,6 +146,20 @@ public sealed unsafe class Qwen4ExpModelParityTests : IDisposable
     }
 
     [Fact]
+    public void ParallelThreadPool_MatchesHf()
+    {
+        string path = Path.Combine(_dir, "tiny.gguf");
+        File.WriteAllBytes(path, Qwen4ExpTinyGguf.Build(Fx));
+        var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var model = ModelLoader.CreateCpuModelFromGguf(gguf, config, DotLLM.Core.Configuration.ThreadingConfig.Auto);
+        _disposables.Add(gguf); _disposables.Add(model);
+        int T = Fx.Int("seq_len");
+        var logits = ToArray(model.Forward(Ids, Positions(T), -1));
+        Assert.True(MaxRel(Fx.F32("logits"), logits, out _) < 5e-4f);
+    }
+
+    [Fact]
     public void LastTokenLogitsOnly_ReturnsTheLastRow()
     {
         var (model, _) = Load();
