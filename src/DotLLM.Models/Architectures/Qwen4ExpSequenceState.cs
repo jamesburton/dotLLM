@@ -149,10 +149,15 @@ public sealed class Qwen4ExpSequenceState : IGdnState
         Length = shell.Length;
     }
 
-    /// <summary>Completes any lazy GDN copy that still reads from <paramref name="shell"/> (call before the shell is reused or freed).</summary>
+    /// <summary>
+    /// Completes any lazy GDN copy that still reads from <paramref name="shell"/> (call before the shell is reused or freed). When
+    /// nothing has consumed it yet (the usual restore-then-dispose) the buffers are exchanged instead of copied: the released shell's
+    /// content is dead anyway.
+    /// </summary>
     internal void ReleaseSource(Qwen4ExpSequenceState shell)
     {
-        if (Gdn.IsPendingOn(shell.Gdn)) Gdn.MaterializePending();
+        if (!Gdn.IsPendingOn(shell.Gdn)) return;
+        if (!Gdn.TryTakeSourceBuffers(shell.Gdn)) Gdn.MaterializePending();
     }
 
     /// <summary>

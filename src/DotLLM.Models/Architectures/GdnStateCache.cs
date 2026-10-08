@@ -282,6 +282,25 @@ public sealed unsafe class GdnStateCache : IGdnState
         }
     }
 
+    /// <summary>Layers physically copied by lazy-copy materialisation so far (a lazy copy consumed by <see cref="BeginUpdate"/> or
+    /// resolved by <see cref="TryTakeSourceBuffers"/> costs none).</summary>
+    public long MaterializedLayerCopies { get; private set; }
+
+    /// <summary>
+    /// <paramref name="source"/> is about to be released and this cache still lazily reads ALL of its layers from it: instead of
+    /// copying, exchange buffers (this cache takes the source's, which hold exactly its logical content; the source takes the stale
+    /// ones, whose content its owner no longer needs). Returns false (and does nothing) unless every layer is still pending on
+    /// <paramref name="source"/>.
+    /// </summary>
+    public bool TryTakeSourceBuffers(GdnStateCache source)
+    {
+        if (_pendingCount != _numGdnLayers || _numGdnLayers == 0 || !ReferenceEquals(_pendingSource, source)) return false;
+        (_convState, source._convState) = (source._convState, _convState);
+        (_gdnState, source._gdnState) = (source._gdnState, _gdnState);
+        ClearPending();
+        return true;
+    }
+
     /// <summary>Performs every outstanding lazy copy (after this the cache no longer depends on its former source).</summary>
     public void MaterializePending()
     {
@@ -298,6 +317,7 @@ public sealed unsafe class GdnStateCache : IGdnState
         Buffer.MemoryCopy((float*)src._convState + (long)i * _convStateElements, (float*)_convState + (long)i * _convStateElements, cb, cb);
         Buffer.MemoryCopy((float*)src._gdnState + (long)i * _gdnStateElements, (float*)_gdnState + (long)i * _gdnStateElements, sb, sb);
         _pending[i] = false;
+        MaterializedLayerCopies++;
         if (--_pendingCount == 0) _pendingSource = null;
     }
 

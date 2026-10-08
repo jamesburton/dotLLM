@@ -286,6 +286,41 @@ public sealed unsafe class Qwen4ExpDeltaCheckpointTests : IDisposable
     }
 
     [Fact]
+    public void RestoreThenReleaseBeforeForward_ExchangesBuffersInsteadOfCopying()
+    {
+        var m = Model();
+        var prefix = Toks(15, 11); var detour = Toks(6, 12); var next = Toks(4, 13);
+
+        float[] Run(bool viaCheckpoint, out long copies)
+        {
+            using var live = m.CreateState();
+            using var shell = m.CreateState();
+            Row(m, live, prefix, 0);
+            copies = 0;
+            if (viaCheckpoint)
+            {
+                live.CaptureInto(shell);                        // no GDN copy: buffers exchanged, live defers from the shell
+                Row(m, live, detour, prefix.Length);            // consumes the deferred copy (fused)
+                live.RestoreFrom(shell);                        // deferred again
+                live.ReleaseSource(shell);                      // restore-then-dispose: exchange, not copy
+                copies = live.Gdn.MaterializedLayerCopies;
+            }
+            return Row(m, live, next, prefix.Length);
+        }
+
+        var want = Run(false, out _);
+        var got = Run(true, out long copies);
+        Assert.Equal(want, got);
+        Assert.Equal(0, copies);
+    }
+
+    private static float[] Row(Qwen4ExpTransformerModel m, Qwen4ExpSequenceState st, int[] ids, int start)
+    {
+        using var t = m.Forward(ids, Enumerable.Range(start, ids.Length).ToArray(), -1, st, null, lastTokenLogitsOnly: false);
+        return new ReadOnlySpan<float>((void*)t.DataPointer, t.Shape[0] * t.Shape[1]).ToArray();
+    }
+
+    [Fact]
     public void Checkpoint_DisposedBeforeAnyForward_StillLeavesTheLiveStateIntact()
     {
         // The live state defers its GDN content from the shell: freeing / reusing the shell first must materialise it.
