@@ -1232,7 +1232,8 @@ internal sealed class TransformerWeights : IDisposable
             DotLLM.Core.Configuration.Architecture.Qwen4Exp =>
                 "it is a Gated-DeltaNet / QSA hybrid with a 4-stream gated residual (hc_* tensors instead of "
                 + "attn_norm/ffn_norm/output_norm), an n-gram embedding and no dense attention projections on "
-                + "its linear-attention layers; its forward pass is not implemented yet (issues #814 / #815)",
+                + "its linear-attention layers; it has dedicated models (CPU Qwen4ExpTransformerModel, Vulkan VulkanQwen4ExpTransformerModel; CUDA is not "
+                + "implemented yet), issues #814 / #816 / #818",
             DotLLM.Core.Configuration.Architecture.Mamba3 =>
                 "Mamba-3 has no GGUF representation at all (no upstream 'mamba3' value for "
                 + "general.architecture and no GGUF tensor-naming convention) — it is "

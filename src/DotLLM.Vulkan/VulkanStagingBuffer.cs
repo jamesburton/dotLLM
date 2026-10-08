@@ -241,6 +241,7 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
     /// </remarks>
     public void UploadBytes(nint src, long bytes, VulkanDevice.Buffer dst, long dstOffset = 0, long zeroTailBytes = 0)
     {
+        VulkanWeightImportPolicy.ThrowIfHostOnly(src, bytes);
         var plan = new VulkanStagingChunkPlan(bytes, zeroTailBytes, Capacity);
         while (plan.MoveNext())
         {

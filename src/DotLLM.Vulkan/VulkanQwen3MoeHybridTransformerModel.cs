@@ -55,7 +55,7 @@ namespace DotLLM.Vulkan;
 /// transcendental kernels (decay / sigmoid) target ≤4 ULP drift.
 /// </para>
 /// </remarks>
-public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
+public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
 {
     private readonly VulkanDevice _device;
     private readonly bool _ownsDevice;
@@ -377,7 +377,8 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(outputNormWeight);
         ArgumentNullException.ThrowIfNull(spvDir);
 
-        if (config.Architecture != Architecture.Qwen3MoeHybrid)
+        // Qwen4Exp (#818) reuses this class as its GDN / full-attention / MoE building-block set (VulkanQwen4ExpTransformerModel).
+        if (config.Architecture is not (Architecture.Qwen3MoeHybrid or Architecture.Qwen4Exp))
             throw new ArgumentException(
                 $"VulkanQwen3MoeHybridTransformerModel requires Architecture.Qwen3MoeHybrid, got {config.Architecture}.",
                 nameof(config));
@@ -821,7 +822,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     /// </summary>
     private unsafe void RecordGdnLayer(
         nint cmdBuf, int absoluteLayerIdx, VulkanQwen3MoeHybridWeights.GdnLayerBuffers gdnW,
-        int seqLen, float eps, VulkanGdnStateCache gdnCache)
+        int seqLen, float eps, VulkanGdnStateCache gdnCache, GdnPostScanGateF32Kernel? postScanGateOverride = null)
     {
         int nVHead = _gdn.NVHead;
         int nKHead = _gdn.NKHead;
@@ -967,7 +968,8 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         TmStage("gdn_scan", seqLen);
 
         // ── 6. Per-head RMSNorm × silu(z) gate (fused) ───────────────────────
-        _kernels.GdnPostScanGate.Record(cmdBuf,
+        // postScanGateOverride: Qwen4-Exp gates with sigmoid(z) where Qwen3.5/3.6 gate with silu(z) (the shipped kernel).
+        (postScanGateOverride ?? _kernels.GdnPostScanGate).Record(cmdBuf,
             gdnOut: _state.GdnOut, z: _state.GdnZBuf, ssmNormWeight: gdnW.SsmNormWeight,
             seqLen: seqLen, nVHead: nVHead, dState: dState, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -1687,7 +1689,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     /// </summary>
     private unsafe void RecordMoeLayer(
         nint cmdBuf, VulkanQwen3MoeMoeUpload.LayerBundle moeW,
-        VulkanDevice.Buffer postAttnNormWeight, int seqLen, int hidden, float eps)
+        VulkanDevice.Buffer? postAttnNormWeight, int seqLen, int hidden, float eps)
     {
         int interm = moeW.IntermediateSize;
         int numE = moeW.NumExperts;
@@ -1923,16 +1925,21 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     /// </summary>
     private void RecordSharedExpert(
         nint cmdBuf, VulkanQwen3MoeMoeUpload.LayerBundle moeW,
-        VulkanDevice.Buffer postAttnNormWeight, int seqLen, int hidden, float eps)
+        VulkanDevice.Buffer? postAttnNormWeight, int seqLen, int hidden, float eps)
     {
         int sharedI = moeW.SharedIntermediateSize;
         int sharedInterElems = seqLen * sharedI;
 
         // Shared input = the same RMSNormed hidden state we used for the routed
         // path. The routed scatter overwrote NormOutput so we re-derive it.
-        _kernels.RmsNorm.Record(cmdBuf, _state.HiddenState, postAttnNormWeight, _state.MoeSharedInput,
-            rowCount: seqLen, n: hidden, eps: eps);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        // A null norm weight means the caller (Qwen4-Exp: the gated-residual read already produced the block input, there is no
+        // post-attention norm) pre-staged the shared input in MoeSharedInput before the router ran.
+        if (postAttnNormWeight is not null)
+        {
+            _kernels.RmsNorm.Record(cmdBuf, _state.HiddenState, postAttnNormWeight, _state.MoeSharedInput,
+                rowCount: seqLen, n: hidden, eps: eps);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
         MoeStage("shx_norm");
 
         // Shared expert gate/up matmuls share the input.
