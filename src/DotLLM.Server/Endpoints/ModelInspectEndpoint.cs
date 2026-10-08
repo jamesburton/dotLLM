@@ -36,7 +36,7 @@ public static class ModelInspectEndpoint
             {
                 using var gguf = GgufFile.Open(fullPath);
                 var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
-                var fileSize = new FileInfo(fullPath).Length;
+                var fileSize = ModelResolver.FileLength(fullPath);
 
                 return Results.Ok(BuildResponse(config, fileSize, HasEmbeddedMtpHead(config, gguf.TensorsByName)));
             }

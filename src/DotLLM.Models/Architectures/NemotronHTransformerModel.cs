@@ -158,13 +158,13 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         if (config.SsmConfig is null)
             throw new ArgumentException("NemotronH config must have SsmConfig populated.", nameof(config));
 
-        nint dataBase = gguf.DataBasePointer;
+        var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
         var layout = config.HybridLayout;
         var ssm = config.SsmConfig.Value;
 
         var embDesc = tensors["token_embd.weight"];
-        nint embPtr = dataBase + (nint)embDesc.DataOffset;
+        nint embPtr = dataBase.Of(embDesc);
 
         var outNormDesc = tensors["output_norm.weight"];
         float[] outputNormWeight = DequantizeF32(dataBase, outNormDesc, config.HiddenSize);
@@ -174,7 +174,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         int outputM, outputK;
         if (tensors.TryGetValue("output.weight", out var outDesc))
         {
-            outputPtr = dataBase + (nint)outDesc.DataOffset;
+            outputPtr = dataBase.Of(outDesc);
             outputQt = outDesc.QuantizationType;
             outputK = outDesc.Shape[0];
             outputM = outDesc.Shape[1];
@@ -284,7 +284,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
 
     private static NemotronHLayerWeights LoadLayer(
         int layerIdx,
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config,
         HybridLayerLayout layout,
@@ -327,7 +327,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     }
 
     private static NemotronHSsmWeights LoadSsmLayer(
-        string prefix, nint dataBase,
+        string prefix, GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         MambaSsmConfig ssm)
     {
@@ -361,7 +361,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
 
         return new NemotronHSsmWeights
         {
-            InWeight = dataBase + (nint)inDesc.DataOffset,
+            InWeight = dataBase.Of(inDesc),
             InQuantType = inDesc.QuantizationType,
             InInputDim = inDesc.Shape[0],
             InOutputDim = inDesc.Shape[1],
@@ -371,7 +371,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             D = DequantizeF32(dataBase, dDesc, ssm.NHead),
             DtBias = DequantizeF32(dataBase, dtBDesc, ssm.NHead),
             NormWeight = DequantizeF32(dataBase, normDesc, ssm.DInner),
-            OutWeight = dataBase + (nint)outDesc.DataOffset,
+            OutWeight = dataBase.Of(outDesc),
             OutQuantType = outDesc.QuantizationType,
             OutInputDim = outDesc.Shape[0],
             OutOutputDim = outDesc.Shape[1],
@@ -379,7 +379,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     }
 
     private static NemotronHAttentionWeights LoadAttentionLayer(
-        string prefix, nint dataBase,
+        string prefix, GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config, int numKvHeads)
     {
@@ -390,22 +390,22 @@ public sealed unsafe class NemotronHTransformerModel : IModel
 
         return new NemotronHAttentionWeights
         {
-            QWeight = dataBase + (nint)q.DataOffset,
+            QWeight = dataBase.Of(q),
             QQuantType = q.QuantizationType,
             QInputDim = q.Shape[0],
             QOutputDim = q.Shape[1],
 
-            KWeight = dataBase + (nint)k.DataOffset,
+            KWeight = dataBase.Of(k),
             KQuantType = k.QuantizationType,
             KInputDim = k.Shape[0],
             KOutputDim = k.Shape[1],
 
-            VWeight = dataBase + (nint)v.DataOffset,
+            VWeight = dataBase.Of(v),
             VQuantType = v.QuantizationType,
             VInputDim = v.Shape[0],
             VOutputDim = v.Shape[1],
 
-            OWeight = dataBase + (nint)o.DataOffset,
+            OWeight = dataBase.Of(o),
             OQuantType = o.QuantizationType,
             OInputDim = o.Shape[0],
             OOutputDim = o.Shape[1],
@@ -415,7 +415,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     }
 
     private static NemotronHFfnWeights LoadFfnLayer(
-        string prefix, nint dataBase,
+        string prefix, GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         int intermediateSize)
     {
@@ -429,12 +429,12 @@ public sealed unsafe class NemotronHTransformerModel : IModel
 
         return new NemotronHFfnWeights
         {
-            UpWeight = dataBase + (nint)up.DataOffset,
+            UpWeight = dataBase.Of(up),
             UpQuantType = up.QuantizationType,
             UpInputDim = up.Shape[0],
             UpOutputDim = up.Shape[1],
 
-            DownWeight = dataBase + (nint)down.DataOffset,
+            DownWeight = dataBase.Of(down),
             DownQuantType = down.QuantizationType,
             DownInputDim = down.Shape[0],
             DownOutputDim = down.Shape[1],
@@ -450,7 +450,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     /// up/down expert banks, and the shared expert's up/down.
     /// </summary>
     private static NemotronHMoeWeights LoadMoeLayer(
-        string prefix, nint dataBase,
+        string prefix, GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config)
     {
@@ -483,18 +483,18 @@ public sealed unsafe class NemotronHTransformerModel : IModel
 
         return new NemotronHMoeWeights
         {
-            GateInpWeight = dataBase + (nint)gateInp.DataOffset,
+            GateInpWeight = dataBase.Of(gateInp),
             GateInpQuantType = gateInp.QuantizationType,
             SelectionBias = DequantizeF32(dataBase, probsB, nExpert),
-            UpExpsWeight = dataBase + (nint)upExps.DataOffset,
+            UpExpsWeight = dataBase.Of(upExps),
             UpExpsQuantType = upExps.QuantizationType,
             UpPerExpertBytes = Dequantize.RowByteSize(hidden, upExps.QuantizationType) * moeInter,
-            DownExpsWeight = dataBase + (nint)downExps.DataOffset,
+            DownExpsWeight = dataBase.Of(downExps),
             DownExpsQuantType = downExps.QuantizationType,
             DownPerExpertBytes = Dequantize.RowByteSize(moeInter, downExps.QuantizationType) * hidden,
-            UpShexpWeight = dataBase + (nint)upShexp.DataOffset,
+            UpShexpWeight = dataBase.Of(upShexp),
             UpShexpQuantType = upShexp.QuantizationType,
-            DownShexpWeight = dataBase + (nint)downShexp.DataOffset,
+            DownShexpWeight = dataBase.Of(downShexp),
             DownShexpQuantType = downShexp.QuantizationType,
             NumExperts = nExpert,
             NumExpertsPerTok = moeCfg.NumExpertsPerTok,
@@ -1220,9 +1220,9 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         GC.SuppressFinalize(this);
     }
 
-    private static float[] DequantizeF32(nint dataBase, GgufTensorDescriptor desc, int expectedSize)
+    private static float[] DequantizeF32(GgufDataBase dataBase, GgufTensorDescriptor desc, int expectedSize)
     {
-        nint ptr = dataBase + (nint)desc.DataOffset;
+        nint ptr = dataBase.Of(desc);
         float[] result = new float[expectedSize];
         Dequantize.ToFloat32(ptr, expectedSize, desc.QuantizationType, result);
         return result;

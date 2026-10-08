@@ -1,3 +1,4 @@
+using DotLLM.HuggingFace;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Models;
@@ -54,7 +55,7 @@ internal static class DeviceCli
         var warnings = new List<string>();
         var res = DeviceModelLoader.Load(
             gguf, config, device, gpuLayers, threading,
-            new FileInfo(modelPath).Length, Path.GetFileName(modelPath),
+            ModelResolver.FileLength(modelPath), Path.GetFileName(modelPath),
             notes.Add, warnings.Add);
         string? warning = res.Warning;
         if (warnings.Count > 0)
@@ -108,7 +109,7 @@ internal static class DeviceCli
     {
         backend = "cpu"; ordinal = 0;
         if (!DeviceSpec.TryParse(device, out var spec, out string? error)) { PrintError(error!, json); return false; }
-        long bytes = new FileInfo(modelPath).Length;
+        long bytes = ModelResolver.FileLength(modelPath);
         var plan = DeviceSelector.Plan(spec, bytes, DotLLM.Server.Endpoints.DeviceEndpoint.Describe());
         if (plan.Error is not null)
         {

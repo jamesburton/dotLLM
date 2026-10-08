@@ -202,7 +202,7 @@ public sealed class PullJob
                 var progress = new Progress<(long bytesDownloaded, long? totalBytes)>(
                     p => ApplyProgress(p.bytesDownloaded, p.totalBytes));
 
-                var result = await downloader.DownloadToHubCacheAsync(
+                var result = await downloader.DownloadModelToHubCacheAsync(
                     RepoId, Filename, Revision, cacheRoot, modelsDir, progress, _cts.Token)
                     .ConfigureAwait(false);
 

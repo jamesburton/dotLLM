@@ -303,7 +303,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
 
         kernels = new CudaKernels(ptxDir);
 
-        nint dataBase = gguf.DataBasePointer;
+        var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
         var layout = config.HybridLayout!;
         int hiddenSize = config.HiddenSize;
@@ -313,7 +313,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         long embRowBytes = Dequantize.RowByteSize(hiddenSize, embDesc.QuantizationType);
         long embTotalBytes = embRowBytes * config.VocabSize;
         nint tokenEmbedDevice = AllocDevice(embTotalBytes, allocs);
-        CopyHtoD(tokenEmbedDevice, dataBase + (nint)embDesc.DataOffset, embTotalBytes);
+        CopyHtoD(tokenEmbedDevice, dataBase.Of(embDesc), embTotalBytes);
 
         // If the embed quant type is not directly supported by LaunchEmbeddingLookupF32
         // (F32 / F16 / Q8_0 only), pre-dequant the whole table to a model-owned F32 buffer.
@@ -341,7 +341,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             ownsEmbedF32 = true;
             // Host-side full-table dequant then H2D — once per load.
             float[] embedF32Host = new float[totalElems];
-            Dequantize.ToFloat32(dataBase + (nint)embDesc.DataOffset, totalElems,
+            Dequantize.ToFloat32(dataBase.Of(embDesc), totalElems,
                 embDesc.QuantizationType, embedF32Host);
             fixed (float* pHost = embedF32Host)
             {
@@ -352,7 +352,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         // ── Output norm (always F32 [hiddenSize], dequant on host then H2D) ──
         var outNormDesc = tensors["output_norm.weight"];
         float[] outputNormHost = new float[hiddenSize];
-        Dequantize.ToFloat32(dataBase + (nint)outNormDesc.DataOffset, hiddenSize,
+        Dequantize.ToFloat32(dataBase.Of(outNormDesc), hiddenSize,
             outNormDesc.QuantizationType, outputNormHost);
         nint outputNormDevice = AllocDevice((long)hiddenSize * sizeof(float), allocs);
         fixed (float* p = outputNormHost)
@@ -375,7 +375,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             long outRowBytes = Dequantize.RowByteSize(outDesc.Shape[0], outDesc.QuantizationType);
             long outTotalBytes = outRowBytes * outDesc.Shape[1];
             outputDevice = AllocDevice(outTotalBytes, allocs);
-            CopyHtoD(outputDevice, dataBase + (nint)outDesc.DataOffset, outTotalBytes);
+            CopyHtoD(outputDevice, dataBase.Of(outDesc), outTotalBytes);
             outputQt = outDesc.QuantizationType;
             outputInputDim = outDesc.Shape[0];
             outputOutputDim = outDesc.Shape[1];
@@ -558,7 +558,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
 
         kernels = new CudaKernels(ptxDir);
 
-        nint dataBase = gguf.DataBasePointer;
+        var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
         var layout = config.HybridLayout!;
         int hiddenSize = config.HiddenSize;
@@ -568,7 +568,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         long embRowBytes = Dequantize.RowByteSize(hiddenSize, embDesc.QuantizationType);
         long embTotalBytes = embRowBytes * config.VocabSize;
         nint tokenEmbedDevice = AllocDevice(embTotalBytes, allocs);
-        CopyHtoD(tokenEmbedDevice, dataBase + (nint)embDesc.DataOffset, embTotalBytes);
+        CopyHtoD(tokenEmbedDevice, dataBase.Of(embDesc), embTotalBytes);
 
         nint embedF32Device = 0;
         bool ownsEmbedF32 = false;
@@ -588,7 +588,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             embedF32Device = AllocDevice(embedF32Bytes, allocs);
             ownsEmbedF32 = true;
             float[] embedF32Host = new float[totalElems];
-            Dequantize.ToFloat32(dataBase + (nint)embDesc.DataOffset, totalElems,
+            Dequantize.ToFloat32(dataBase.Of(embDesc), totalElems,
                 embDesc.QuantizationType, embedF32Host);
             fixed (float* pHost = embedF32Host)
             {
@@ -599,7 +599,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         // ── Output norm ──
         var outNormDesc = tensors["output_norm.weight"];
         float[] outputNormHost = new float[hiddenSize];
-        Dequantize.ToFloat32(dataBase + (nint)outNormDesc.DataOffset, hiddenSize,
+        Dequantize.ToFloat32(dataBase.Of(outNormDesc), hiddenSize,
             outNormDesc.QuantizationType, outputNormHost);
         nint outputNormDevice = AllocDevice((long)hiddenSize * sizeof(float), allocs);
         fixed (float* p = outputNormHost)
@@ -618,7 +618,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             long outRowBytes = Dequantize.RowByteSize(outDesc.Shape[0], outDesc.QuantizationType);
             long outTotalBytes = outRowBytes * outDesc.Shape[1];
             outputDevice = AllocDevice(outTotalBytes, allocs);
-            CopyHtoD(outputDevice, dataBase + (nint)outDesc.DataOffset, outTotalBytes);
+            CopyHtoD(outputDevice, dataBase.Of(outDesc), outTotalBytes);
             outputQt = outDesc.QuantizationType;
             outputInputDim = outDesc.Shape[0];
             outputOutputDim = outDesc.Shape[1];
@@ -736,7 +736,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
                 $"Layer {layerIdx} is already loaded. Call FreeSingleLayerWeights({layerIdx}) first.");
 
         _context.MakeCurrent();
-        nint dataBase = _gguf.DataBasePointer;
+        var dataBase = new GgufDataBase(_gguf);
         var tensors = _gguf.TensorsByName;
         // #383: this is a post-construction, per-layer streaming load on an already-valid model
         // (not model construction itself), but LoadLayerDevice still makes several device
@@ -1455,7 +1455,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     // ──────────────────────────────────────────────────────────────────────
 
     private static DeviceLayer LoadLayerDevice(
-        int layerIdx, nint dataBase,
+        int layerIdx, GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config, List<nint> owned, List<nint> allocs)
     {
@@ -1502,7 +1502,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     }
 
     private static DeviceGdn LoadGdnLayerDevice(
-        string prefix, nint dataBase,
+        string prefix, GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config, List<nint> allocs)
     {
@@ -1565,7 +1565,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     }
 
     private static DeviceFullAttn LoadFullAttnLayerDevice(
-        string prefix, nint dataBase,
+        string prefix, GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config, int numKvHeads, List<nint> allocs)
     {
@@ -3132,10 +3132,10 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// Used for norms, A, dt_bias, ssm_norm, conv1d_weight (host-dequant is cheap for
     /// these shapes).
     /// </summary>
-    private static nint UploadF32Tensor(nint dataBase, GgufTensorDescriptor desc, int expectedElems, List<nint>? allocs = null)
+    private static nint UploadF32Tensor(GgufDataBase dataBase, GgufTensorDescriptor desc, int expectedElems, List<nint>? allocs = null)
     {
         float[] host = new float[expectedElems];
-        Dequantize.ToFloat32(dataBase + (nint)desc.DataOffset, expectedElems,
+        Dequantize.ToFloat32(dataBase.Of(desc), expectedElems,
             desc.QuantizationType, host);
         nint device = AllocDevice((long)expectedElems * sizeof(float), allocs);
         fixed (float* p = host)
@@ -3150,13 +3150,13 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// pointer holds the same byte representation as the source mmap region; dequant
     /// happens at GEMM time via <see cref="Gemm"/>.
     /// </summary>
-    private static nint UploadRawTensor(nint dataBase, GgufTensorDescriptor desc, List<nint>? allocs = null)
+    private static nint UploadRawTensor(GgufDataBase dataBase, GgufTensorDescriptor desc, List<nint>? allocs = null)
     {
         int innerDim = desc.Shape[0];
         long outerDim = desc.Shape.ElementCount / innerDim;
         long bytes = Dequantize.RowByteSize(innerDim, desc.QuantizationType) * outerDim;
         nint device = AllocDevice(bytes, allocs);
-        CopyHtoD(device, dataBase + (nint)desc.DataOffset, bytes);
+        CopyHtoD(device, dataBase.Of(desc), bytes);
         return device;
     }
 

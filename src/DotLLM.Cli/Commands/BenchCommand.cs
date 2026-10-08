@@ -202,12 +202,13 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
 
         // Issue #438 — opt-in residency probe. The mapped tensor-data region is
         // [DataBasePointer, EOF); its pages are the ones every device upload reads from.
-        nint mapBase = gguf.DataBasePointer;
+        // A split GGUF has one mapping per shard and no single base: the probe is skipped there (#756).
+        nint mapBase = gguf.IsSplit ? 0 : gguf.DataBasePointer;
         // The mapped length comes from the already-open GgufFile, never from a second handle:
         // FileInfo.Length on a symlink reports the reparse point (every HF-cache model is reached
         // through one), and File.OpenRead throws a sharing violation once DOTLLM_GGUF_MAP_COW=1,
         // because a copy-on-write mapping needs write access and so holds the file FileShare.None.
-        long mapLength = HostResidencyProbe.Enabled ? gguf.DataSectionLength : 0;
+        long mapLength = HostResidencyProbe.Enabled && !gguf.IsSplit ? gguf.DataSectionLength : 0;
         if (HostResidencyProbe.Enabled)
             HostResidencyProbe.Report("before-load", mapBase, mapLength, deviceSnapshot: null);
 
