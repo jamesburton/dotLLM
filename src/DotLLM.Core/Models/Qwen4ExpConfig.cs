@@ -63,14 +63,14 @@ public sealed record Qwen4ExpConfig
     public Qwen4ExpPleConfig? Ple { get; init; }
 
     /// <summary>
-    /// The one refusal text every backend uses while the forward pass is unimplemented, so a user never reaches the
-    /// misleading "blk.0.attn_output.weight not present" of a generic loader.
+    /// The refusal text the GPU backends use while their forward pass is unimplemented (the CPU backend has the reference
+    /// forward), so a user never reaches the misleading "blk.0.attn_output.weight not present" of a generic loader.
     /// </summary>
     /// <param name="backend">Backend name for the message ("CPU", "Vulkan", "CUDA").</param>
     public static string UnsupportedMessage(string backend) =>
         $"Architecture Qwen4Exp (GGUF 'qwen4exp', Qwen3.8-Flash-Next) is recognised — its config and metadata parse — but its forward pass " +
         $"is not implemented on the {backend} backend yet (4-stream gated residual, QSA indexer attention and the n-gram embedding have no " +
-        "kernels). Tracked in the Qwen4Exp epic, issue #814 (CPU oracle first, then Vulkan).";
+        "kernels there; the CPU backend has the reference forward). Tracked in the Qwen4Exp epic, issue #814.";
 }
 
 /// <summary>

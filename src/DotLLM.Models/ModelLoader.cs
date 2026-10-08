@@ -73,8 +73,8 @@ public static class ModelLoader
             Architecture.NemotronHMoe => NemotronHTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             Architecture.Qwen3MoeHybrid => Qwen3MoeHybridTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             Architecture.Qwen3HybridDense => Qwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
-            // Explicit refusal: the generic TransformerModel would die on a misleading missing-tensor error (#815).
-            Architecture.Qwen4Exp => throw new NotSupportedException(Qwen4ExpConfig.UnsupportedMessage("CPU")),
+            // CPU reference forward (#816): GR + GDN/QSA + 512-expert MoE + n-gram PLE.
+            Architecture.Qwen4Exp => Qwen4ExpTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             _ => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
         };
     }
