@@ -246,6 +246,44 @@ public sealed unsafe class Qwen4ExpQuantizedKvTests(ITestOutputHelper output) : 
         Assert.Equal(f32.Total - f32.Kv, q8.Total - q8.Kv);   // nothing else changes
     }
 
+
+    /// <summary>
+    /// Decision record for the pooled indexer keys: they stay fp32. Measured here: the top-k block set the indexer picks when the pooled
+    /// keys are round-tripped through Q8_0 vs fp32, at the real geometry (128-wide keys, 512-block budget, 3000 blocks = 12K tokens).
+    /// Random keys are the harshest case (many near-ties at the cut), so this under-states real-data agreement.
+    /// </summary>
+    [Fact]
+    public void PooledIndexerKeys_Q8_0_RoundTrip_SelectionOverlap_IsReported()
+    {
+        const int idxD = 128, idxH = 4, nb = 3000, budget = 512, queries = 40;
+        var rng = new Random(21);
+        var pooled = new float[nb * idxD];
+        for (int i = 0; i < pooled.Length; i++) pooled[i] = (float)(rng.NextDouble() * 2 - 1);
+        var rt = new float[pooled.Length];
+        var qbuf = new byte[KvQuantize.QuantizedRowBytes(idxD, KvCacheDType.Q8_0)];
+        fixed (byte* qb = qbuf)
+            for (int b = 0; b < nb; b++)
+                fixed (float* src = &pooled[b * idxD]) fixed (float* dst = &rt[b * idxD])
+                {
+                    KvQuantize.F32ToQ8_0(src, qb, idxD);
+                    KvQuantize.Q8_0ToF32(qb, dst, idxD);
+                }
+        double overlap = 0;
+        var selA = new int[budget]; var selB = new int[budget]; var scores = new float[nb + 1];
+        for (int qn = 0; qn < queries; qn++)
+        {
+            var iq = new float[idxH * idxD];
+            for (int i = 0; i < iq.Length; i++) iq[i] = (float)(rng.NextDouble() * 2 - 1);
+            int ta = Qwen4ExpQsa.SelectBlocks(iq, idxH, idxD, pooled, nb, budget, selA, scores);
+            int tb = Qwen4ExpQsa.SelectBlocks(iq, idxH, idxD, rt, nb, budget, selB, scores);
+            overlap += selA.Take(ta).Intersect(selB.Take(tb)).Count() / (double)ta;
+        }
+        overlap /= queries;
+        output.WriteLine($"pooled indexer keys Q8_0 round trip: mean top-{budget} block-set overlap {overlap:P2} over {queries} random queries " +
+                         $"(pooled bytes/token/layer: fp32 {idxD * 4 / 4}, Q8_0 {qbuf.Length / 4}; int8 K+V row/token/layer at the real 512-wide row: {2 * KvQuantize.QuantizedRowBytes(512, KvCacheDType.Q8_0)})");
+        Assert.True(overlap > 0.9, $"overlap {overlap}");   // sanity only: the decision (keep fp32) rests on bytes (see PR), not this bound
+    }
+
     // ── beyond the real 2048-token budget, standalone QSA layer ──
 
     private static Qwen4ExpProjection RandProj(int outDim, int inDim, int seed, float scale)

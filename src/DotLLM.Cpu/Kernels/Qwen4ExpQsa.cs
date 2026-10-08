@@ -654,6 +654,10 @@ public sealed class Qwen4ExpQsaLayer
                                                nH, nKv, d, scale, attn.AsSpan(t * qElems, qElems), scores);
                     }
                 }
+                // keys / values / pooled are raw spans over the state's native buffers, whose finalizers free them: the state
+                // must stay reachable until the last read (otherwise a GC mid-loop frees memory under the span; observed as
+                // an AccessViolation in Dot under whole-suite GC timing).
+                GC.KeepAlive(state);
             }
             finally
             {

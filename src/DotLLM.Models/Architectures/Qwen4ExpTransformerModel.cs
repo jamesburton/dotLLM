@@ -986,6 +986,13 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
     public Qwen4ExpStateBytes EstimateSequenceStateBytes(int contextLength) => Qwen4ExpStateBytes.Estimate(Config, contextLength);
 
     /// <summary>
+    /// Like <see cref="EstimateSequenceStateBytes(int)"/> with the QSA K/V rows in a quantised engine KV cache (#841): <paramref name="keyDType"/> /
+    /// <paramref name="valueDType"/> (Q8_0 or Q4_0) older than the fp32 <paramref name="windowSize"/> rows.
+    /// </summary>
+    public Qwen4ExpStateBytes EstimateSequenceStateBytes(int contextLength, KvCacheDType keyDType, KvCacheDType valueDType, int windowSize)
+        => Qwen4ExpStateBytes.Estimate(Config, contextLength, keyDType, valueDType, windowSize);
+
+    /// <summary>
     /// Size of a checkpoint taken at <paramref name="contextLength"/> tokens (what <see cref="CheckpointRecurrentState"/> copies,
     /// assuming the QSA K/V rows live in an engine KV cache): everything except <see cref="Qwen4ExpStateBytes.Kv"/>.
     /// </summary>
