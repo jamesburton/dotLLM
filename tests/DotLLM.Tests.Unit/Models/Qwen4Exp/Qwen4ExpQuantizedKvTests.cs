@@ -239,9 +239,9 @@ public sealed unsafe class Qwen4ExpQuantizedKvTests(ITestOutputHelper output) : 
         var f32 = Qwen4ExpStateBytes.Estimate(cfg, ctx);
         var q8 = Qwen4ExpStateBytes.Estimate(cfg, ctx, KvCacheDType.Q8_0, KvCacheDType.Q8_0, 0);
         var q8w = Qwen4ExpStateBytes.Estimate(cfg, ctx, KvCacheDType.Q8_0, KvCacheDType.Q8_0, 8);
-        // Only the QSA slots (1 of 4 layers) hold rows: the cache allocates all 4 slots today, the estimate counts the real ones.
-        Assert.Equal(kvQ.AllocatedBytes / cfg.NumLayers, q8.Kv);
-        Assert.Equal(kvQw.AllocatedBytes / cfg.NumLayers, q8w.Kv);
+        // Since #839 the hybrid-aware geometry gives the cache one slot per QSA layer only, so the allocation equals the estimate.
+        Assert.Equal(kvQ.AllocatedBytes, q8.Kv);
+        Assert.Equal(kvQw.AllocatedBytes, q8w.Kv);
         Assert.True(q8.Kv * 3 < f32.Kv, $"int8 should be ~3.8x smaller: {q8.Kv} vs {f32.Kv}");
         Assert.Equal(f32.Total - f32.Kv, q8.Total - q8.Kv);   // nothing else changes
     }
