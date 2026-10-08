@@ -11,15 +11,22 @@ namespace DotLLM.Cpu.Kernels;
 /// gated value (the dilated-conv history, HF <c>conv_states[1]</c>). A fresh sequence has an EOS-filled window and a
 /// zero conv history. Chunked prefill threads one instance through the chunks, so chunked == single-shot.
 /// </summary>
-public sealed class Qwen4ExpPleState
+public sealed class Qwen4ExpPleState : IDisposable
 {
+    private readonly Qwen4ExpNativeBuffer _conv = new();
+    private readonly Qwen4ExpNativeBuffer _snapConv = new();
+    private readonly int _eos, _histRows, _channels;
+    private int[] _snapTokens = [];
+    private int _snapRows;
+
     /// <summary>Last <c>ngram-1</c> raw token ids, oldest first.</summary>
     public int[] TokenHistory { get; }
 
-    /// <summary>Conv history <c>[(K-1)*dilation, channels]</c>, oldest row first.</summary>
-    public float[] ConvHistory { get; }
+    /// <summary>Conv history <c>[(K-1)*dilation, channels]</c>, oldest row first (native memory).</summary>
+    public Span<float> ConvHistory => _conv.Slice(0, _histRows * _channels);
 
-    private readonly int _eos;
+    /// <summary>Rows <see cref="Qwen4ExpPleBranch.Apply"/> should record per-row snapshots for on its next call (0 = off).</summary>
+    internal int RecordRowCount { get; set; }
 
     /// <summary>Creates a fresh (start-of-sequence) state.</summary>
     /// <param name="ngramSize">N-gram order (window is <c>ngramSize - 1</c> tokens).</param>
@@ -28,9 +35,9 @@ public sealed class Qwen4ExpPleState
     /// <param name="channels"><c>hcCount * hiddenSize</c>.</param>
     public Qwen4ExpPleState(int ngramSize, int eosTokenId, int convHistoryRows, int channels)
     {
-        _eos = eosTokenId;
+        _eos = eosTokenId; _histRows = convHistoryRows; _channels = channels;
         TokenHistory = new int[ngramSize - 1];
-        ConvHistory = new float[(long)convHistoryRows * channels];
+        _conv.EnsureExact(Math.Max(1L, (long)convHistoryRows * channels));
         Reset();
     }
 
@@ -38,18 +45,65 @@ public sealed class Qwen4ExpPleState
     public void Reset()
     {
         Array.Fill(TokenHistory, _eos);
-        Array.Clear(ConvHistory);
+        ConvHistory.Clear();
+        _snapRows = 0;
     }
 
     /// <summary>Copies another state (checkpoint / rollback).</summary>
     public void CopyFrom(Qwen4ExpPleState other)
     {
         other.TokenHistory.CopyTo(TokenHistory, 0);
-        other.ConvHistory.CopyTo(ConvHistory, 0);
+        other.ConvHistory.CopyTo(ConvHistory);
+        _snapRows = 0;
     }
 
-    /// <summary>Resident bytes of this state.</summary>
-    public long Bytes => TokenHistory.Length * 4L + ConvHistory.Length * 4L;
+    /// <summary>Resident bytes of this state (history plus any row-snapshot scratch).</summary>
+    public long Bytes => TokenHistory.Length * 4L + _conv.Bytes + _snapConv.Bytes + _snapTokens.Length * 4L;
+
+    /// <summary>Resident bytes of the sequence state proper (history only, no scratch).</summary>
+    public long StateBytes => TokenHistory.Length * 4L + (long)_histRows * _channels * 4L;
+
+    /// <summary>
+    /// Records, for rows <c>0 .. rows-1</c> of a chunk, the hash window and conv history as they stand AFTER that row.
+    /// Must be called before the chunk advances the state. The conv history after row <c>t</c> is rows
+    /// <c>t+1 .. t+hist</c> of <c>[history ; normed]</c>.
+    /// </summary>
+    internal void RecordRows(ReadOnlySpan<int> tokens, ReadOnlySpan<float> normed, int rows)
+    {
+        int n1 = TokenHistory.Length, hist = _histRows, ch = _channels;
+        _snapConv.EnsureExact(Math.Max(1L, (long)rows * hist * ch));
+        if (_snapTokens.Length < rows * n1) _snapTokens = new int[rows * n1];
+        var cur = ConvHistory;
+        for (int t = 0; t < rows; t++)
+        {
+            var tokDst = _snapTokens.AsSpan(t * n1, n1);
+            TokenHistory.CopyTo(tokDst);
+            Qwen4ExpPle.AdvanceHistory(tokDst, tokens.Slice(0, t + 1));
+            var dst = _snapConv.Slice((long)t * hist * ch, hist * ch);
+            for (int r = 0; r < hist; r++)
+            {
+                int src = t + 1 + r;   // row index in [history ; normed]
+                var from = src < hist ? cur.Slice(src * ch, ch) : normed.Slice((src - hist) * ch, ch);
+                from.CopyTo(dst.Slice(r * ch, ch));
+            }
+        }
+        _snapRows = rows;
+    }
+
+    /// <summary>Sets the state to what it was right after row <paramref name="row"/> of the last recorded chunk.</summary>
+    internal void RestoreRow(int row)
+    {
+        if ((uint)row >= (uint)_snapRows) throw new InvalidOperationException($"No PLE row snapshot for row {row} ({_snapRows} recorded).");
+        int n1 = TokenHistory.Length;
+        _snapTokens.AsSpan(row * n1, n1).CopyTo(TokenHistory);
+        _snapConv.Slice((long)row * _histRows * _channels, _histRows * _channels).CopyTo(ConvHistory);
+    }
+
+    /// <summary>Drops recorded row snapshots (a later forward invalidates them).</summary>
+    internal void InvalidateRows() => _snapRows = 0;
+
+    /// <inheritdoc/>
+    public void Dispose() { _conv.Dispose(); _snapConv.Dispose(); }
 }
 
 /// <summary>
@@ -428,6 +482,8 @@ public sealed class Qwen4ExpPleBranch
             Qwen4ExpPle.ComputeGate(key, query, _hc, _hidden, gate, T);
             Qwen4ExpPle.ApplyGate(gate, value, _hc, _hidden, gated, T);
             Qwen4ExpGatedResidual.GroupRmsNorm(gated, _normConv, _hc, _hidden, _eps, normed, T);
+            if (state.RecordRowCount > 0)
+                state.RecordRows(tokens, normed.AsSpan(0, T * row), Math.Min(state.RecordRowCount, T - 1));
             Qwen4ExpPle.DilatedConvSilu(normed.AsSpan(0, T * row), state.ConvHistory, _convTap, _convKernel, _ngram,
                                         row, conv.AsSpan(0, T * row), T);
 

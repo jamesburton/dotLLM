@@ -218,16 +218,17 @@ public sealed unsafe class Qwen4ExpModelParityTests : IDisposable
     }
 
     [Fact]
-    public void EngineKvCacheAndBatchedDispatch_AreRefused_NotSilentlyMisused()
+    public void MisuseOfTheEngineContracts_IsRefusedLoudly_NotSilentlyMisused()
     {
+        // #817 turned the blanket refusal into a real integration; what stays refused is the MISUSE of it:
+        // a KV cache whose geometry cannot carry the QSA layers, and a multi-sequence batch with no per-sequence state.
         var (model, _) = Load();
         var ids = Ids.AsSpan(0, 4).ToArray();
-        using var cache = new DotLLM.Engine.KvCache.SimpleKvCache(1, 1, 8, 16);
-        var ex = Assert.Throws<NotSupportedException>(() => model.Forward(ids, Positions(4), -1, cache));
-        Assert.Contains("#817", ex.Message);
-        Assert.Throws<NotSupportedException>(() => model.Forward(ids, Positions(4), -1, cache, true));
-        var req = new SequenceForwardRequest { TokenIds = ids, Positions = Positions(4), KvCache = cache };
-        Assert.Throws<NotSupportedException>(() => ((IModel)model).ForwardBatch([req, req], -1));
+        using var wrongGeometry = new DotLLM.Engine.KvCache.SimpleKvCache(1, 1, 8, 16);
+        Assert.Throws<ArgumentException>(() => model.Forward(ids, Positions(4), -1, wrongGeometry));
+        Assert.Throws<ArgumentException>(() => model.Forward(ids, Positions(4), -1, wrongGeometry, true));
+        var req = new SequenceForwardRequest { TokenIds = ids, Positions = Positions(4), KvCache = wrongGeometry };
+        Assert.Throws<ArgumentException>(() => ((IModel)model).ForwardBatch([req, req], -1));
         // The refusal happened before any state was touched.
         Assert.Equal(4, ToArray(model.Forward(ids, Positions(4), -1)).Length / Fx.Int("vocab"));
     }
