@@ -53,6 +53,8 @@
     <None Include="Tokenizers\ChatTemplates\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
     <!-- #815: header-only dump (metadata + tensor tables) of the real Qwen3.8-Flash-Next GGUFs; the contract test reads it at runtime. -->
     <None Include="Models\Gguf\TestData\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- #832: LittleBit spike fixture (generated offline from the paper equations). -->
+    <None Include="Cpu\Kernels\LittleBitData\littlebit_fixture.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
