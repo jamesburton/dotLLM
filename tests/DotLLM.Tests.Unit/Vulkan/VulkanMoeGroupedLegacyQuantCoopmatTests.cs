@@ -44,6 +44,8 @@ public sealed class VulkanMoeGroupedLegacyQuantCoopmatTests
     [InlineData(MoeGroupedLegacyQuant.Q8_0, 128, 704, "0,3,0,17,40,16,15,1,33,64,2,0", false)]
     [InlineData(MoeGroupedLegacyQuant.Q8_0, 100, 192, "5,0,1,40", false)]
     [InlineData(MoeGroupedLegacyQuant.Q8_0, 64, 64, "16,15,17,1", false)]       // single staging round
+    [InlineData(MoeGroupedLegacyQuant.Q5_1, 100, 640, "5,0,1,40,17,0,3", false)] // #849: K = 640 (not a multiple of 256), scale off as the resident MoE path runs it
+    [InlineData(MoeGroupedLegacyQuant.Q8_0, 100, 640, "5,0,1,40,17,0,3", false)]
     public void Grouped_MatchesScalarIndexed(MoeGroupedLegacyQuant quant, int m, int k, string countsCsv, bool useScale)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

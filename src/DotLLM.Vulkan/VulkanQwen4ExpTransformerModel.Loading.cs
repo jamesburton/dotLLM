@@ -55,7 +55,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         if (!plan.Fits)
         {
             string msg = "qwen4exp weights do not fit the Vulkan device's resident capacity: " + plan.Describe() + ". " +
-                         "Quant types without a resident indexed-MoE kernel (everything but Q4_K/Q5_K/Q6_K experts) are widened to F32 on upload.";
+                         "Quant types without a resident indexed-MoE kernel (everything but Q4_K/Q5_K/Q6_K/Q5_1/Q8_0 experts) are widened to F32 on upload.";
             if (!AllowOvercommit)
                 throw new NotSupportedException(msg + " Set DOTLLM_VK_ALLOW_OVERCOMMIT=1 to load anyway (expect paging).");
             Console.Error.WriteLine("[dotLLM] WARNING: " + msg + " DOTLLM_VK_ALLOW_OVERCOMMIT=1: loading anyway.");

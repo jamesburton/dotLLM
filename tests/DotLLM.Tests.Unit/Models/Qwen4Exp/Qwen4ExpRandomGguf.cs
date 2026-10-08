@@ -57,6 +57,14 @@ internal sealed record Q4eQuant
         HcDown = QuantizationType.Q4_K, Embed = QuantizationType.Q8_0, Table = QuantizationType.F16, Indexer = QuantizationType.BF16,
     };
     /// <summary>The K-quant resident path: Q4_K gate/up and down (the test quantizer only writes Q4_K; needs hidden and moe_inter multiples of 256).</summary>
+    /// <summary>The real UD-Q4_K_XL mix (#849): Q4_K gate/up experts, Q5_1 down experts (Q8_0 projections).</summary>
+    public static Q4eQuant RealMixQ51 => new()
+    {
+        ExpertGateUp = QuantizationType.Q4_K, ExpertDown = QuantizationType.Q5_1, Proj = QuantizationType.Q8_0,
+        HcDown = QuantizationType.Q4_K, Embed = QuantizationType.Q8_0, Table = QuantizationType.F16, Indexer = QuantizationType.BF16,
+    };
+    /// <summary>The real UD-Q4_K_XL mix's Q8_0-down layers (#849): Q4_K gate/up, Q8_0 down.</summary>
+    public static Q4eQuant RealMixQ80 => RealMixQ51 with { ExpertDown = QuantizationType.Q8_0 };
     public static Q4eQuant KQuant => new()
     {
         ExpertGateUp = QuantizationType.Q4_K, ExpertDown = QuantizationType.Q4_K, Proj = QuantizationType.Q8_0,
@@ -263,6 +271,14 @@ internal static class Qwen4ExpRandomGguf
     /// top-4, 2 key vs 4 value GDN heads, 4 query heads over 2 KV heads. Q4_K down means the grouped coopmat prefill and the fused
     /// single-token MoE decode (both need a Q5_K / Q6_K down bank) are NOT exercised here.
     /// </summary>
+    public static Q4eGeometry Inter640 => KQuant256 with { MoeInter = 640 };
+
+    /// <summary>Expert width 96 (a multiple of 32 but NOT of 64 or 256): the legacy-quant MMVQ decode applies, the grouped prefill must fall back (#849).</summary>
+    public static Q4eGeometry Inter96 => KQuant256 with { MoeInter = 96 };
+
+    /// <summary>The real file's expert count with 640-wide experts (#849): 512 experts, top-10, K-quant-legal hidden.</summary>
+    public static Q4eGeometry Real512x640 => KQuant256 with { MoeInter = 640, Experts = 512, TopK = 10 };
+
     public static Q4eGeometry KQuant256 => new()
     {
         Hidden = 256, Heads = 4, KvHeads = 2, HeadDim = 64, RopeDim = 16, Experts = 16, TopK = 4, MoeInter = 256, SharedInter = 256,

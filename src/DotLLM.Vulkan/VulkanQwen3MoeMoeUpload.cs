@@ -59,7 +59,19 @@ internal static class VulkanQwen3MoeMoeUpload
         QuantizationType.Q6_K,
         QuantizationType.Q4_K,
         QuantizationType.Q5_K,
+        // #849: legacy 32-element-block banks (UD-Q4_K_XL down projections are Q5_1, Q8_0 in a few layers). Indexed F32 kernels,
+        // MMVQ decode kernels and grouped coopmat prefill kernels exist for both; they need K % 32 == 0 (always true for real models).
+        QuantizationType.Q5_1,
+        QuantizationType.Q8_0,
     };
+
+    /// <summary>
+    /// True when a routed bank of source quant <paramref name="qt"/> and input width <paramref name="kDim"/> stays packed on the device
+    /// (the single source of truth shared with the pre-load residency estimate, so the two cannot drift).
+    /// </summary>
+    internal static bool BankStaysPacked(QuantizationType qt, int kDim)
+        => s_ResidentQuantTypes.Contains(qt)
+            && (qt is not (QuantizationType.Q5_1 or QuantizationType.Q8_0) || kDim % 32 == 0);
 
     /// <summary>
     /// Resolves the on-device storage type for ONE routed bank, independent
@@ -68,8 +80,8 @@ internal static class VulkanQwen3MoeMoeUpload
     /// <see cref="s_ResidentQuantTypes"/>; F32 dequant otherwise.
     /// </summary>
     private static QuantizationType ResolveBankQuantType(
-        QuantizationType sourceQt, bool residentQuant, bool hasRawQuantView)
-        => residentQuant && hasRawQuantView && s_ResidentQuantTypes.Contains(sourceQt)
+        QuantizationType sourceQt, bool residentQuant, bool hasRawQuantView, int kDim)
+        => residentQuant && hasRawQuantView && BankStaysPacked(sourceQt, kDim)
             ? sourceQt
             : QuantizationType.F32;
 
@@ -174,7 +186,7 @@ internal static class VulkanQwen3MoeMoeUpload
     /// <param name="residentQuant">
     /// When <c>true</c>, opt into resident-quant upload for each routed bank
     /// whose own source quant is one of <see cref="s_ResidentQuantTypes"/>
-    /// (currently Q6_K, Q4_K, Q5_K — see
+    /// (currently Q6_K, Q4_K, Q5_K, Q5_1, Q8_0 — see
     /// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ6_KF32Kernel"/>,
     /// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ4_KF32Kernel"/>, and
     /// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ5_KF32Kernel"/>).
@@ -203,9 +215,9 @@ internal static class VulkanQwen3MoeMoeUpload
         // no longer need to share one quant type. Only quant types with a
         // resident indexed-matmul kernel wired up (see s_ResidentQuantTypes)
         // are eligible; anything else falls back to F32 for that bank alone.
-        QuantizationType w1Qt = ResolveBankQuantType(moe.GateExpsRawQt, residentQuant, moe.HasRawQuantView);
-        QuantizationType w2Qt = ResolveBankQuantType(moe.DownExpsRawQt, residentQuant, moe.HasRawQuantView);
-        QuantizationType w3Qt = ResolveBankQuantType(moe.UpExpsRawQt, residentQuant, moe.HasRawQuantView);
+        QuantizationType w1Qt = ResolveBankQuantType(moe.GateExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize);
+        QuantizationType w2Qt = ResolveBankQuantType(moe.DownExpsRawQt, residentQuant, moe.HasRawQuantView, interm);
+        QuantizationType w3Qt = ResolveBankQuantType(moe.UpExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize);
 
         // Bounded persistently-mapped staging (issue #147): banks stream through
         // it one expert slab (or chunk) at a time — the previous whole-bank

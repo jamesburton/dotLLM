@@ -116,6 +116,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     internal IReadOnlyList<(Core.Configuration.QuantizationType Gate, Core.Configuration.QuantizationType Down, Core.Configuration.QuantizationType Up)> ExpertBankDeviceTypes
         => _moe.Select(m => (m.W1QuantType, m.W2QuantType, m.W3QuantType)).ToArray();
 
+    /// <summary>Test hook (#849): how many times each routed-MoE fast path was recorded (see <c>MoePath</c>).</summary>
+    internal long MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath p) => _core.MoePathCounts[(int)p];
+
     /// <summary>Address of the n-gram table inside the GGUF mapping (0 when absent) - tests assert nothing was uploaded from this range.</summary>
     internal (nint Pointer, long Bytes) HostOnlyTableRange => _hostOnlyTable ?? (0, 0);
 
