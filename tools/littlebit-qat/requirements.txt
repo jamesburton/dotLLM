@@ -1,0 +1,6 @@
+torch>=2.5
+transformers>=4.51
+safetensors
+numpy
+datasets
+huggingface_hub
