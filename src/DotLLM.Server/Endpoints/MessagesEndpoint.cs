@@ -87,7 +87,7 @@ public static class MessagesEndpoint
             return;
         }
 
-        var validationError = ValidateRequest(request);
+        var validationError = ValidateRequest(request, maxMessages: state.Options.EffectiveMaxMessages);
         if (validationError is not null)
         {
             await WriteErrorAsync(httpContext, 400, "invalid_request_error", validationError);
@@ -567,13 +567,15 @@ public static class MessagesEndpoint
     /// <c>/v1/messages/count_tokens</c>, whose request body has no <c>max_tokens</c> at all
     /// (see <c>MessageCountTokensParams</c> in the official SDK).
     /// </param>
-    internal static string? ValidateRequest(AnthropicMessagesRequest request, bool requireMaxTokens = true)
+    /// <param name="maxMessages">Message-count cap; 0 = unlimited (<see cref="ServerOptions.EffectiveMaxMessages"/>).</param>
+    internal static string? ValidateRequest(AnthropicMessagesRequest request, bool requireMaxTokens = true,
+        int maxMessages = RequestValidator.DefaultMaxMessages)
     {
         if (request.Messages is null || request.Messages.Length == 0)
             return "messages: at least one message is required";
 
-        if (request.Messages.Length > RequestValidator.MaxMessages)
-            return $"messages: array exceeds maximum of {RequestValidator.MaxMessages}";
+        if (RequestValidator.CheckMessageCount(request.Messages.Length, maxMessages) is { } tooMany)
+            return "messages: array " + tooMany;
 
         // max_tokens is a required field of the Anthropic Messages API (unlike OpenAI's),
         // but it is absent from the count_tokens body — hence the flag.
@@ -717,7 +719,7 @@ public static class MessagesEndpoint
             return;
         }
 
-        var validationError = ValidateRequest(request, requireMaxTokens: false);
+        var validationError = ValidateRequest(request, requireMaxTokens: false, maxMessages: state.Options.EffectiveMaxMessages);
         if (validationError is not null)
         {
             await WriteErrorAsync(httpContext, 400, "invalid_request_error", validationError);
