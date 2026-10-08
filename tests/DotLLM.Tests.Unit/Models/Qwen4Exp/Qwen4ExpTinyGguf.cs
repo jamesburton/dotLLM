@@ -16,7 +16,7 @@ internal static class Qwen4ExpTinyGguf
           || name.StartsWith("ple.", StringComparison.Ordinal));
 
     /// <summary>Builds the GGUF bytes. <paramref name="shards"/> &gt; 1 is not supported here (see the split test).</summary>
-    public static byte[] Build(Qwen4ExpReferenceFixture fx, int contextLength = 256)
+    public static byte[] Build(Qwen4ExpReferenceFixture fx, int contextLength = 256, bool quantize = false, int? budgetTokens = null)
     {
         const string arch = "qwen4exp";
         int layers = fx.Int("num_layers"), blockSize = fx.Int("block");
@@ -49,7 +49,7 @@ internal static class Qwen4ExpTinyGguf
         w.AddUInt32($"{arch}.hyper_connection.low_rank", (uint)fx.Int("hc_lowrank"));
         w.AddUInt32($"{arch}.attention.indexer.head_count", (uint)fx.Int("idx_heads"));
         w.AddUInt32($"{arch}.attention.indexer.key_length", (uint)fx.Int("idx_dim"));
-        w.AddUInt32($"{arch}.attention.indexer.top_k", (uint)fx.Int("budget"));
+        w.AddUInt32($"{arch}.attention.indexer.top_k", (uint)(budgetTokens ?? fx.Int("budget")));
         var ratios = new int[layers];
         for (int i = 0; i < layers; i++) ratios[i] = (i + 1) % 4 == 0 ? blockSize : 0;
         w.AddInt32Array($"{arch}.attention.compress_ratios", ratios);
@@ -78,9 +78,28 @@ internal static class Qwen4ExpTinyGguf
             int[] shape = fx.Shape(name);
             int[] dims = shape.Reverse().ToArray();          // numpy [out, in] row-major == GGUF ne [in, out]
             float[] data = fx.F32(name);
-            var bytes = new byte[data.Length * 4];
-            Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
-            w.AddTensor(name, dims, (uint)QuantizationType.F32, bytes);
+            var qt = QuantizationType.F32;
+            if (quantize)
+            {
+                // Mirror the real file's mix where the tiny geometry allows: Q8_0 for matrices whose input dim is a multiple of 32
+                // (projections, hc down, router, embedding), F16 for the n-gram table, F32 for norms/convs/inject/scalars.
+                if (name == "per_layer_token_embd.weight") qt = QuantizationType.F16;
+                else if (shape.Length >= 2 && name.EndsWith(".weight", StringComparison.Ordinal) && shape[^1] % 32 == 0
+                         && !name.Contains("conv1d", StringComparison.Ordinal) && !name.Contains("inject", StringComparison.Ordinal)
+                         && !name.Contains("_shexp", StringComparison.Ordinal))
+                    qt = QuantizationType.Q8_0;
+            }
+            byte[] bytes;
+            if (qt == QuantizationType.F32)
+            {
+                bytes = new byte[data.Length * 4];
+                Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
+            }
+            else
+            {
+                bytes = DotLLM.Cpu.Kernels.Quantize.FromFloat32(data, data.Length, qt);
+            }
+            w.AddTensor(name, dims, (uint)qt, bytes);
         }
         return w.Build();
     }

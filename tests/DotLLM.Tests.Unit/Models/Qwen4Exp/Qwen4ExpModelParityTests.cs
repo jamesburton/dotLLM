@@ -160,6 +160,65 @@ public sealed unsafe class Qwen4ExpModelParityTests : IDisposable
     }
 
     [Fact]
+    public void Q8_0_F16_QuantizedCheckpoint_StaysCloseToHf()
+    {
+        // The real file stores hc down/up, projections and the router as Q8_0 and the table quantised: exercise those dispatch
+        // paths (quant GEMMs, quant embedding rows, quant PLE table rows, 3D expert banks) on the tiny geometry.
+        string path = Path.Combine(_dir, "tiny-q.gguf");
+        File.WriteAllBytes(path, Qwen4ExpTinyGguf.Build(Fx, quantize: true));
+        var (model, gguf, _) = ModelLoader.LoadFromGguf(path);
+        _disposables.Add(gguf); _disposables.Add(model);
+        int T = Fx.Int("seq_len"), V = Fx.Int("vocab");
+        var logits = ToArray(model.Forward(Ids, Positions(T), -1));
+        var hf = Fx.F32("logits");
+        Assert.All(logits, v => Assert.True(float.IsFinite(v)));
+
+        double num = 0, den = 0;
+        for (int i = 0; i < hf.Length; i++) { num += Math.Pow(hf[i] - logits[i], 2); den += Math.Pow(hf[i], 2); }
+        double relRms = Math.Sqrt(num / den);
+        Assert.True(relRms < 0.08, $"Q8_0 logits drifted from HF: relative RMS {relRms:F4}");
+        int agree = 0;
+        for (int t = 0; t < T; t++) if (Argmax(hf.AsSpan(t * V, V)) == Argmax(logits.AsSpan(t * V, V))) agree++;
+        Assert.True(agree >= T * 3 / 4, $"top-1 agreement {agree}/{T}");
+        Assert.True(relRms > 1e-5, "quantised path is bit-identical to F32: quantisation did not apply");
+    }
+
+    [Fact]
+    public void RealBudget_ContextBeyond2051_SparseDiffersFromDense_AndChunkingHolds()
+    {
+        // Same tiny weights, but the REAL indexer budget (2048 tokens = 512 blocks) and a 2300-token context.
+        string path = Path.Combine(_dir, "tiny-long.gguf");
+        File.WriteAllBytes(path, Qwen4ExpTinyGguf.Build(Fx, contextLength: 4096, budgetTokens: 2048));
+        var (m, gguf, _) = ModelLoader.LoadFromGguf(path);
+        _disposables.Add(gguf); _disposables.Add(m);
+        var model = (Qwen4ExpTransformerModel)m;
+        const int T = 2300;
+        int V = Fx.Int("vocab");
+        var rng = new Random(5);
+        var ids = Enumerable.Range(0, T).Select(_ => rng.Next(6, V)).ToArray();
+
+        var sparse = ToArray(model.Forward(ids, Positions(T), -1, kvCache: null, lastTokenLogitsOnly: false));
+        model.SetForceDenseAttention(true);
+        var dense = ToArray(model.Forward(ids, Positions(T), -1, kvCache: null, lastTokenLogitsOnly: false));
+        model.SetForceDenseAttention(false);
+
+        int exact = 2048 + Fx.Int("block") - 1;   // 2051 tokens: positions 0..2050
+        Assert.True(MaxRel(dense.AsSpan(0, exact * V).ToArray(), sparse.AsSpan(0, exact * V).ToArray(), out _) < 1e-6f,
+            "rows within the budget must be exactly dense");
+        Assert.True(MaxRel(dense.AsSpan(exact * V).ToArray(), sparse.AsSpan(exact * V).ToArray(), out _) > 1e-5f,
+            "QSA never diverged from dense beyond 2051 tokens");
+
+        var state = model.CreateState();
+        var chunked = new float[T * V];
+        for (int i = 0; i < T; i += 512)
+        {
+            int n = Math.Min(512, T - i);
+            ToArray(model.Forward(ids.AsSpan(i, n), Positions(n, i), -1, state)).CopyTo(chunked, i * V);
+        }
+        Assert.True(MaxRel(sparse, chunked, out int at) < 1e-4f, $"chunked(512) vs single-shot at {at}");
+    }
+
+    [Fact]
     public void LastTokenLogitsOnly_ReturnsTheLastRow()
     {
         var (model, _) = Load();
