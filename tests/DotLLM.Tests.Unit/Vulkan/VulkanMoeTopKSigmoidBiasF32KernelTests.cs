@@ -20,7 +20,9 @@ public class VulkanMoeTopKSigmoidBiasF32KernelTests
     [InlineData(3, 64, 4, true, 1.8f)]       // scale applied after renorm
     [InlineData(2, 64, 6, false, 2.5f)]      // scale without renorm
     [InlineData(1, 16, 1, true, 1.0f)]
-    [InlineData(2, 256, 8, true, 1.8f)]      // MAX_EXPERTS
+    [InlineData(2, 256, 8, true, 1.8f)]      // 256-expert regression arm
+    [InlineData(2, 512, 10, true, 1.8f)]     // MAX_EXPERTS (#818)
+    [InlineData(1, 300, 10, false, 1.0f)]    // non-power-of-two count > 256
     public void Launch_MatchesCpuReference_AndBiasChangesSelection(
         int seqLen, int numExperts, int k, bool norm, float scale)
     {
