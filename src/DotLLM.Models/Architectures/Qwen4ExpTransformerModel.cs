@@ -496,7 +496,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
                 // ── token mixer ──
                 GrRead(blk.AttnGr, res, xn, low, mix, h, gains, T, wantInject: true);
                 if (blk.Gdn is { } g)
-                    ForwardGdn(g, blk.GdnOrdinal, h, y, T, state.Gdn, snapRows);
+                    ForwardGdn(g, blk.GdnOrdinal, il, h, y, T, state.Gdn, snapRows);
                 else
                     blk.Qsa!.Forward(h.AsSpan(0, T * H), T, state.Qsa[il]!, y.AsSpan(0, T * H), kvCache, blk.QsaOrdinal);
                 Qwen4ExpGatedResidual.Write(res.AsSpan(0, T * row), y, gains, S, H, T);
@@ -565,11 +565,11 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
     }
 
     /// <summary>
-    /// Gated DeltaNet token mixer: the Qwen3.5 GDN with a SIGMOID output gate (<c>norm(core) * sigmoid(z)</c>) — llama.cpp
+    /// Gated DeltaNet token mixer: the Qwen3.5 GDN with a SIGMOID output gate (<c>norm(core) * sigmoid(z)</c>) - llama.cpp
     /// <c>qwen4exp.cpp build_norm_gated</c> ("the one numerical difference from Qwen3.5's GDN") and HF
-    /// <c>output_gate_type="sigmoid"</c>.
+    /// <c>output_gate_type="sigmoid"</c>. The body is the shared <see cref="GdnTokenMixer"/>; this wrapper only rents the scratch.
     /// </summary>
-    private void ForwardGdn(GdnTokenMixingWeights w, int ordinal, float[] x, float[] y, int T, GdnStateCache cache, int snapRows)
+    private void ForwardGdn(GdnTokenMixingWeights w, int ordinal, int absoluteLayer, float[] x, float[] y, int T, GdnStateCache cache, int snapRows)
     {
         int nV = _gdn.NVHead, nK = _gdn.NKHead, dS = _gdn.DState, dC = _gdn.DConv;
         int convDim = (2 * nK + nV) * dS, vDim = nV * dS, kDim = nK * dS;
@@ -584,76 +584,13 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         float[] core = ArrayPool<float>.Shared.Rent(T * vDim);
         try
         {
-            var xs = x.AsSpan(0, T * _hidden);
-            fixed (float* xp = xs)
-            {
-                fixed (float* o = qkv) Gemm(w.QkvWeight, w.QkvQuantType, xp, o, w.QkvOutputDim, w.QkvInputDim, T, _threadPool);
-                fixed (float* o = z) Gemm(w.GateWeight, w.GateQuantType, xp, o, w.GateOutputDim, w.GateInputDim, T, _threadPool);
-                fixed (float* o = alpha) Gemm(w.AlphaWeight, w.AlphaQuantType, xp, o, w.AlphaOutputDim, w.AlphaInputDim, T, _threadPool);
-                fixed (float* o = beta) Gemm(w.BetaWeight, w.BetaQuantType, xp, o, w.BetaOutputDim, w.BetaInputDim, T, _threadPool);
-            }
-
-            // g = exp(softplus(alpha + dt_bias) * A); beta = sigmoid(beta)
-            for (int t = 0; t < T; t++)
-                for (int vh = 0; vh < nV; vh++)
-                {
-                    float a = alpha[t * nV + vh] + w.DtBias[vh];
-                    float sp = MathF.Log(1f + MathF.Exp(a));
-                    alpha[t * nV + vh] = MathF.Exp(sp * w.A[vh]);
-                }
-            TensorPrimitives.Sigmoid(beta.AsSpan(0, T * nV), beta.AsSpan(0, T * nV));
-
-            // causal conv over [conv_state | qkv] then SiLU
-            // A pending (lazily checkpointed / restored) layer reads its input from the source cache here and in the scan's
-            // first token, and writes the result into its own buffers: the state copy is fused into work done anyway (#840).
-            cache.BeginUpdate(ordinal, out var srcConv, out var srcGdn);
-            var convState = cache.GetConvStateForUpdate(ordinal);
-            (srcConv.IsEmpty ? convState : srcConv).Slice(0, (dC - 1) * convDim).CopyTo(convIn.AsSpan(0, (dC - 1) * convDim));
-            qkv.AsSpan(0, T * convDim).CopyTo(convIn.AsSpan((dC - 1) * convDim));
-            Conv1dCausal.Execute(convIn.AsSpan(0, (dC - 1 + T) * convDim), w.Conv1dWeight, w.Conv1dBias,
-                                 qkv.AsSpan(0, T * convDim), dC, convDim, T);
-            SiLu.Execute(qkv.AsSpan(0, T * convDim), qkv.AsSpan(0, T * convDim));
-            for (int r = 0; r < dC - 1; r++)
-                convIn.AsSpan((T + r) * convDim, convDim).CopyTo(convState.Slice(r * convDim, convDim));
-            // Row snapshots: after row t the rolling window is convIn rows t+1 .. t+dC-1.
-            int rowsToSnap = snapRows > 0 ? Math.Min(snapRows, T - 1) : 0;
-            for (int t = 0; t < rowsToSnap; t++)
-                convIn.AsSpan((t + 1) * convDim, (dC - 1) * convDim).CopyTo(RowSnapshotConv(ordinal, t));
-
-            for (int t = 0; t < T; t++)
-            {
-                qkv.AsSpan(t * convDim, kDim).CopyTo(q.AsSpan(t * kDim, kDim));
-                qkv.AsSpan(t * convDim + kDim, kDim).CopyTo(k.AsSpan(t * kDim, kDim));
-                qkv.AsSpan(t * convDim + 2 * kDim, vDim).CopyTo(v.AsSpan(t * vDim, vDim));
-            }
-            GatedDeltaNetScan.L2NormalizeHeads(q.AsSpan(0, T * kDim), dS);
-            GatedDeltaNetScan.L2NormalizeHeads(k.AsSpan(0, T * kDim), dS);
-            if (rowsToSnap > 0)
-            {
-                // what Replay needs to rebuild the state after any of the first rowsToSnap tokens (the scan records the deltas)
-                k.AsSpan(0, rowsToSnap * kDim).CopyTo(RowRecKLayer(ordinal));
-                alpha.AsSpan(0, rowsToSnap * nV).CopyTo(RowRecGLayer(ordinal));
-            }
-
-            GatedDeltaNetScan.Execute(cache.GetGdnStateForUpdate(ordinal), q.AsSpan(0, T * kDim), k.AsSpan(0, T * kDim),
-                                      v.AsSpan(0, T * vDim), alpha.AsSpan(0, T * nV), beta.AsSpan(0, T * nV),
-                                      core.AsSpan(0, T * vDim), nV, nK, dS, T,
-                                      snapshotRows: rowsToSnap, stateSource: srcGdn,
-                                      deltaRecord: rowsToSnap > 0 ? RowRecDLayer(ordinal) : default);
-
-            // per-head RMSNorm(core, ssm_norm) * sigmoid(z)
-            for (int t = 0; t < T; t++)
-                for (int vh = 0; vh < nV; vh++)
-                {
-                    int off = t * vDim + vh * dS;
-                    RmsNorm.Execute(core.AsSpan(off, dS), w.SsmNormWeight, _eps, core.AsSpan(off, dS));
-                }
-            Span<float> zs = z.AsSpan(0, T * vDim);
-            TensorPrimitives.Sigmoid(zs, zs);
-            TensorPrimitives.Multiply(core.AsSpan(0, T * vDim), zs, core.AsSpan(0, T * vDim));
-
-            fixed (float* cp = core) fixed (float* yp = y)
-                Gemm(w.OutWeight, w.OutQuantType, cp, yp, w.OutOutputDim, w.OutInputDim, T, _threadPool);
+            int rows = snapRows > 0 ? Math.Min(snapRows, T - 1) : 0;
+            var rec = rows > 0
+                ? new GdnRowRecording(rows, RowSnapshotConvLayer(ordinal), RowRecKLayer(ordinal), RowRecGLayer(ordinal), RowRecDLayer(ordinal))
+                : default;
+            GdnTokenMixer.Forward(w, _gdn, absoluteLayer, ordinal, T, _hidden, _eps, GdnOutputGate.Sigmoid,
+                                  x.AsSpan(0, T * _hidden), y.AsSpan(0, T * _hidden), _gdnGemm ??= GdnGemmAdapter,
+                                  new GdnMixerScratch(qkv, z, alpha, beta, convIn, q, k, v, core), cache, rec);
         }
         finally
         {
@@ -661,6 +598,17 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
             ArrayPool<float>.Shared.Return(beta); ArrayPool<float>.Shared.Return(convIn); ArrayPool<float>.Shared.Return(q);
             ArrayPool<float>.Shared.Return(k); ArrayPool<float>.Shared.Return(v); ArrayPool<float>.Shared.Return(core);
         }
+    }
+
+    private GdnGemm? _gdnGemm;
+
+    private void GdnGemmAdapter(nint weight, QuantizationType qt, ReadOnlySpan<float> input, Span<float> output, int outDim, int inDim, int seqLen)
+    {
+        if (input.Length < (long)seqLen * inDim) throw new ArgumentException("input too small.", nameof(input));
+        if (output.Length < (long)seqLen * outDim) throw new ArgumentException("output too small.", nameof(output));
+        fixed (float* xp = input)
+        fixed (float* yp = output)
+            Gemm(weight, qt, xp, yp, outDim, inDim, seqLen, _threadPool);
     }
 
     /// <summary>512-expert softmax MoE: router softmax over ALL experts → top-k → renormalise; routed experts + shared expert × sigmoid(gate).</summary>
@@ -926,6 +874,12 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
     {
         int e = _gdn.NVHead * _gdn.DState;
         return _rowRecD.Slice((long)ordinal * _snapStrideRows * e, _snapStrideRows * e);
+    }
+
+    private Span<float> RowSnapshotConvLayer(int ordinal)
+    {
+        int e = _defaultState.Gdn.ConvStateElements;
+        return _rowSnapConv.Slice((long)ordinal * _snapStrideRows * e, _snapStrideRows * e);
     }
 
     private Span<float> RowSnapshotConv(int ordinal, int row)
