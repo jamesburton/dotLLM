@@ -157,6 +157,12 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [DefaultValue(0)]
         public int ExpectedConcurrency { get; set; }
 
+        /// <summary>Per-request message-count cap (#835).</summary>
+        [CommandOption("--max-messages")]
+        [Description("Maximum messages accepted per chat request on /v1/chat/completions and /v1/messages. Default 8192; 0 = unlimited. " +
+                     "Falls back to the DOTLLM_MAX_MESSAGES environment variable; the flag wins. The prompt-length-vs-context check still applies.")]
+        public int? MaxMessages { get; set; }
+
         /// <summary>Download a missing Hugging Face model when a request or load names one.</summary>
         [CommandOption("--auto-pull")]
         [Description("Download a missing Hugging Face model when a request names one (e.g. model \"owner/repo:Q4_K_M\"), like 'ollama run' does. " +
@@ -299,8 +305,21 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             return 1;
         }
 
+        int? maxMessages;
+        try
+        {
+            maxMessages = ServerOptions.ResolveMaxMessages(
+                settings.MaxMessages, Environment.GetEnvironmentVariable(ServerOptions.MaxMessagesEnvVar));
+        }
+        catch (ArgumentException ex)
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(ex.Message)}[/]");
+            return 1;
+        }
+
         var serverOptions = new ServerOptions
         {
+            MaxMessages = maxMessages,
             Model = settings.Model ?? "",
             ExpectedConcurrency = settings.ExpectedConcurrency,
             AutoPull = settings.AutoPull,
