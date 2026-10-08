@@ -186,7 +186,7 @@ public sealed unsafe class Qwen4ExpMultiPleAndImageTests : IDisposable
         using var a = model.CreateState(); using var b = model.CreateState();
         var ids = Ids("ids");
         Assert.Equal(ToArray(model.Forward(ids, Positions(T), -1, a, null, false)),
-                     ToArray(model.Forward(ids, Positions(T), -1, b, null, false, default)));
+                     ToArray(model.Forward(ids, Positions(T), -1, b, null, false, default(ReadOnlySpan<float>))));
     }
 
     [Fact]

@@ -1237,7 +1237,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
 
     private GdnGemm? _gdnGemm;
 
-    private void GdnGemmAdapter(nint weight, QuantizationType qt, ReadOnlySpan<float> input, Span<float> output, int outDim, int inDim, int seqLen)
+    private void GdnGemmAdapter(GdnProjection projection, nint weight, QuantizationType qt, ReadOnlySpan<float> input, Span<float> output, int outDim, int inDim, int seqLen)
     {
         fixed (float* b = input)
         fixed (float* c = output)

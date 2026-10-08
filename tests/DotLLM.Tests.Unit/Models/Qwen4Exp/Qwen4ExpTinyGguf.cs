@@ -34,7 +34,8 @@ internal static class Qwen4ExpTinyGguf
     }
 
     /// <summary>Builds the GGUF bytes. <paramref name="shards"/> &gt; 1 is not supported here (see the split test).</summary>
-    public static byte[] Build(Qwen4ExpReferenceFixture fx, int contextLength = 256, bool quantize = false, int? budgetTokens = null, bool omitImageTokenId = false)
+    public static byte[] Build(Qwen4ExpReferenceFixture fx, int contextLength = 256, bool quantize = false, int? budgetTokens = null,
+                               bool omitImageTokenId = false, Func<string, float[], float[]>? editTensor = null)
     {
         const string arch = "qwen4exp";
         int layers = fx.Int("num_layers"), blockSize = fx.Int("block");
@@ -100,6 +101,7 @@ internal static class Qwen4ExpTinyGguf
             int[] shape = fx.Shape(name);
             int[] dims = shape.Reverse().ToArray();          // numpy [out, in] row-major == GGUF ne [in, out]
             float[] data = fx.F32(name);
+            if (editTensor is not null) data = editTensor(name, data);
             var qt = QuantizationType.F32;
             if (quantize) qt = ChooseQuant(name, shape);
             byte[] bytes;

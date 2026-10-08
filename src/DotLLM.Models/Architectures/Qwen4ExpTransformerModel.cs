@@ -3,6 +3,7 @@ using System.Numerics.Tensors;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
@@ -77,8 +78,9 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
 
     private Qwen4ExpTransformerModel(ModelConfig config, GgufFile? gguf, Block[] blocks, GrWeights head, nint tokenEmbed,
                                      QuantizationType tokenEmbedQt, MatRef output, ComputeThreadPool? pool, bool ownsPool,
-                                     List<nint> owned)
+                                     List<nint> owned, Qwen4ExpLoraContext lora)
     {
+        _lora = lora;
         Config = config; _gguf = gguf; _blocks = blocks; _head = head; _tokenEmbed = tokenEmbed; _tokenEmbedQt = tokenEmbedQt;
         _output = output; _threadPool = pool; _ownsPool = ownsPool; _owned = owned;
         _gdn = config.GdnConfig!.Value;
@@ -153,6 +155,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         var layout = config.HybridLayout!;
         var gdnCfg = config.GdnConfig!.Value;
         var pool = CreatePool(threading);
+        var lora = new Qwen4ExpLoraContext(pool);
 
         MatRef Mat(string name)
         {
@@ -213,8 +216,8 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
                     F32(b + "attn_q_norm.weight", config.HeadDim), F32(b + "attn_k_norm.weight", config.HeadDim),
                     F32(b + "indexer.q_norm.weight", q4.IndexerKeyLength), F32(b + "indexer.k_norm.weight", q4.IndexerKeyLength),
                     ropeCos, ropeSin,
-                    Projection(Mat(b + "attn_q.weight"), pool), Projection(Mat(b + "attn_k.weight"), pool),
-                    Projection(Mat(b + "attn_v.weight"), pool), Projection(Mat(b + "attn_output.weight"), pool),
+                    Projection(Mat(b + "attn_q.weight"), pool, lora, il, "q_proj"), Projection(Mat(b + "attn_k.weight"), pool, lora, il, "k_proj"),
+                    Projection(Mat(b + "attn_v.weight"), pool, lora, il, "v_proj"), Projection(Mat(b + "attn_output.weight"), pool, lora, il, "o_proj"),
                     Projection(Mat(b + "indexer.q_proj.weight"), pool), Projection(Mat(b + "indexer.k_proj.weight"), pool));
                 block.QsaOrdinal = qsaOrd++;
             }
@@ -242,7 +245,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         }
 
         return new Qwen4ExpTransformerModel(config, gguf, blocks, head, embPtr, embDesc.QuantizationType, output,
-                                            pool, ownsPool: pool is not null, owned);
+                                            pool, ownsPool: pool is not null, owned, lora);
     }
 
     private static ComputeThreadPool? CreatePool(ThreadingConfig threading)
@@ -330,8 +333,17 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
 
     // ───────────────────────────── projections ─────────────────────────────
 
-    private static Qwen4ExpProjection Projection(MatRef w, ComputeThreadPool? pool) =>
-        (input, output, tokens) => GemmSpan(w, input, output, tokens, pool);
+    private static Qwen4ExpProjection Projection(MatRef w, ComputeThreadPool? pool, Qwen4ExpLoraContext? lora = null, int layer = -1, string? loraName = null)
+    {
+        if (lora is null || loraName is null)
+            return (input, output, tokens) => GemmSpan(w, input, output, tokens, pool);
+        // LoRA site (#845): the base GEMM, then y += scale * (x B) A when the current forward carries an adapter that targets this site.
+        return (input, output, tokens) =>
+        {
+            GemmSpan(w, input, output, tokens, pool);
+            lora.Apply(layer, loraName, input, output, tokens, w.In, w.Out);
+        };
+    }
 
     private static void GemmSpan(MatRef w, ReadOnlySpan<float> x, Span<float> y, int n, ComputeThreadPool? pool)
     {
@@ -388,6 +400,31 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache,
                            bool lastTokenLogitsOnly)
         => ForwardCore(tokenIds, positions, deviceId, _defaultState, kvCache, lastTokenLogitsOnly, snapRows: 0);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// LoRA (#845): the adapter's delta <c>y += (alpha / rank) (x B) A</c> is added after the base GEMM of every adapted projection - QSA
+    /// q/k/v/o, Gated-DeltaNet in_proj_qkv/z/a/b + out_proj, routed-expert gate/up/down - and never merged into the weights, so adapters switch
+    /// per call. An adapter targeting anything else, a name on the wrong layer kind or a mis-shaped factor is rejected before any compute
+    /// (<see cref="NotSupportedException"/> / <see cref="ArgumentException"/>), see <c>Qwen4ExpLoraContext.Validate</c>. Model-owned state.
+    /// </remarks>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache, ILoraAdapter? adapter)
+        => ForwardCore(tokenIds, positions, deviceId, _defaultState, kvCache, lastTokenLogitsOnly: false, snapRows: 0, adapter: adapter);
+
+    /// <summary>The caller-owned-state forward with a LoRA adapter (see the remarks of the adapter overload above).</summary>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                           Qwen4ExpSequenceState state, IKvCache? kvCache, bool lastTokenLogitsOnly, ILoraAdapter? adapter)
+        => ForwardCore(tokenIds, positions, deviceId, state, kvCache, lastTokenLogitsOnly, snapRows: 0, adapter: adapter);
+
+    private ILoraAdapter? _validatedAdapter;
+    private readonly Qwen4ExpLoraContext _lora;
+
+    private void ValidateAdapter(ILoraAdapter adapter)
+    {
+        if (ReferenceEquals(adapter, _validatedAdapter)) return;
+        Qwen4ExpLoraContext.Validate(adapter, Config);
+        _validatedAdapter = adapter;
+    }
 
     /// <summary>
     /// Forward over a caller-owned sequence state with its QSA K/V rows in <paramref name="kvCache"/> (the engine path). Positions
@@ -448,7 +485,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
 
     private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
                                 Qwen4ExpSequenceState state, IKvCache? kvCache, bool lastTokenLogitsOnly, int snapRows,
-                                ReadOnlySpan<float> externalEmbeddings = default)
+                                ReadOnlySpan<float> externalEmbeddings = default, ILoraAdapter? adapter = null)
     {
         ArgumentNullException.ThrowIfNull(state);
         int T = tokenIds.Length;
@@ -469,13 +506,16 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         _snapValid = false;   // any forward moves the live state on: earlier row snapshots no longer describe it
         foreach (var p in state.Ple) p?.InvalidateRows();
         foreach (var q in state.Qsa) q?.Indexer.InvalidateRows();
+        if (adapter is not null) ValidateAdapter(adapter);
         if (snapRows > 0) BeginRowRecording(state, snapRows, T);
+        _lora.Adapter = adapter;   // consulted by the projections for the duration of this call only (not reentrant, like TransformerModel)
         try
         {
             return ForwardBody(tokenIds, deviceId, state, kvCache, lastTokenLogitsOnly, snapRows, externalEmbeddings);
         }
         finally
         {
+            _lora.Adapter = null;
             if (snapRows > 0) EndRowRecording(state);
         }
     }
@@ -636,6 +676,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
             var rec = rows > 0
                 ? new GdnRowRecording(rows, RowSnapshotConvLayer(ordinal), RowRecKLayer(ordinal), RowRecGLayer(ordinal), RowRecDLayer(ordinal))
                 : default;
+            _gdnLoraLayer = absoluteLayer;
             GdnTokenMixer.Forward(w, _gdn, absoluteLayer, ordinal, T, _hidden, _eps, GdnOutputGate.Sigmoid,
                                   x.AsSpan(0, T * _hidden), y.AsSpan(0, T * _hidden), _gdnGemm ??= GdnGemmAdapter,
                                   new GdnMixerScratch(qkv, z, alpha, beta, convIn, q, k, v, core), cache, rec);
@@ -650,14 +691,24 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
 
     private GdnGemm? _gdnGemm;
 
-    private void GdnGemmAdapter(nint weight, QuantizationType qt, ReadOnlySpan<float> input, Span<float> output, int outDim, int inDim, int seqLen)
+    private void GdnGemmAdapter(GdnProjection projection, nint weight, QuantizationType qt, ReadOnlySpan<float> input, Span<float> output, int outDim, int inDim, int seqLen)
     {
         if (input.Length < (long)seqLen * inDim) throw new ArgumentException("input too small.", nameof(input));
         if (output.Length < (long)seqLen * outDim) throw new ArgumentException("output too small.", nameof(output));
         fixed (float* xp = input)
         fixed (float* yp = output)
             Gemm(weight, qt, xp, yp, outDim, inDim, seqLen, _threadPool);
+        if (_lora.Adapter is not null)
+            _lora.Apply(_gdnLoraLayer, GdnLoraName(projection), input, output, seqLen, inDim, outDim);
     }
+
+    private int _gdnLoraLayer;
+
+    private static string GdnLoraName(GdnProjection p) => p switch
+    {
+        GdnProjection.Qkv => "in_proj_qkv", GdnProjection.Gate => "in_proj_z", GdnProjection.Alpha => "in_proj_a",
+        GdnProjection.Beta => "in_proj_b", _ => "out_proj",
+    };
 
     /// <summary>512-expert softmax MoE: router softmax over ALL experts → top-k → renormalise; routed experts + shared expert × sigmoid(gate).</summary>
     private void ForwardMoe(MoeLayerWeights moe, int layer, float[] x, float[] y, int T)
@@ -688,7 +739,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
                 ne, k, H, inter, T,
                 moe.SharedGateProj, moe.SharedUpProj, moe.SharedDownProj, moe.SharedIntermediateSize,
                 moe.SharedExpertGate is null ? ReadOnlySpan<float>.Empty : moe.SharedExpertGate,
-                loraAdapter: null, loraLayer: layer, threadPool: _threadPool);
+                loraAdapter: _lora.Adapter, loraLayer: layer, threadPool: _threadPool);
         }
         finally
         {
@@ -721,8 +772,6 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         if (requests.Count == 0) return Array.Empty<ITensor>();
         for (int i = 0; i < requests.Count; i++)
         {
-            if (requests[i].Adapter is not null)
-                throw new NotSupportedException("Qwen4ExpTransformerModel.ForwardBatch does not support LoRA adapters.");
             if (requests[i].GdnState is null && requests.Count >= 2)
                 throw new ArgumentException(
                     $"Multi-seq ForwardBatch requires each SequenceForwardRequest to carry its own GdnState (request {i} has none): " +
@@ -739,7 +788,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
             foreach (var r in requests)
             {
                 var st = (Qwen4ExpSequenceState?)r.GdnState ?? _defaultState;
-                results.Add(ForwardCore(r.TokenIds.Span, r.Positions.Span, deviceId, st, r.KvCache, lastTokenLogitsOnly: true, snapRows: 0));
+                results.Add(ForwardCore(r.TokenIds.Span, r.Positions.Span, deviceId, st, r.KvCache, lastTokenLogitsOnly: true, snapRows: 0, adapter: r.Adapter));
             }
         }
         catch
