@@ -124,10 +124,11 @@ public sealed class VulkanQwen4ExpLoaderTests
             // Table (+ PLE projections / indexer) are host-only in both and dominate neither number.
             Assert.True(host32 >= 40_000L * geo.PleRowDim * 4, "table bytes missing from the host-only side");
             Assert.True(hostQ >= 40_000L * geo.PleRowDim * 2);
-            // Q8_0 / Q5_1 expert banks have no resident kernel: they are WIDENED, so the experts cost the same F32 bytes in both variants.
+            // Q8_0 / Q5_1 expert banks stay packed since #849: the estimate must NOT charge them as F32 (it did before, which is what made
+            // the real UD-Q4_K_XL file refuse to load). Packed Q8_0/Q5_1 is ~1/4 of F32, so the saving is at least half the expert F32 bytes.
             long expertF32 = 4L * geo.Experts * 3 * geo.MoeInter * geo.Hidden * 4;
-            Assert.True(q8 >= expertF32, $"widened expert banks not counted: {q8:N0} < {expertF32:N0}");
             Assert.True(f32 >= expertF32);
+            Assert.True(q8 < f32 - expertF32 / 2, $"packed expert banks charged as F32: {q8:N0} vs F32 file {f32:N0} (expert F32 {expertF32:N0})");
         }
         finally { try { Directory.Delete(dir, true); } catch (IOException) { } }
     }
@@ -178,11 +179,12 @@ public sealed class VulkanQwen4ExpLoaderTests
                 Assert.Equal(QuantizationType.Q4_K, t.Down);
                 Assert.Equal(QuantizationType.Q4_K, t.Up);
             });
-        using (var rig = new Q4eRig(VulkanQwen4ExpParityTests.Build(1), spvDir))   // tiny-q8q51: no resident Q8_0 / Q5_1 kernel yet
+        using (var rig = new Q4eRig(VulkanQwen4ExpParityTests.Build(1), spvDir))   // tiny-q8q51: Q8_0 gate/up + Q5_1 down are resident since #849
             Assert.All(rig.Vk.ExpertBankDeviceTypes, t =>
             {
-                Assert.Equal(QuantizationType.F32, t.Gate);
-                Assert.Equal(QuantizationType.F32, t.Down);
+                Assert.Equal(QuantizationType.Q8_0, t.Gate);
+                Assert.Equal(QuantizationType.Q5_1, t.Down);
+                Assert.Equal(QuantizationType.Q8_0, t.Up);
             });
     }
 

@@ -1,3 +1,4 @@
+using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Models;
@@ -70,6 +71,12 @@ public sealed class VulkanQwen4ExpParityTests
         ["kq256-f32", 5],
         ["hd256-f32", 6],       // the released attention geometry: head_dim 256, 64 rotary dims, 4 query heads over 2 KV heads
         ["hd256-q8q51", 7],
+        // #849: the real file's mix (Q4_K gate/up + Q5_1 / Q8_0 down experts), now resident. Inter 640 is not a multiple of 256; 96 is not a
+        // multiple of 64 (grouped prefill must fall back); 512 experts / top-10 with 640-wide experts is the released router shape.
+        ["inter640-q4k-q51", 8],
+        ["inter640-q4k-q80", 9],
+        ["inter96-q4k-q51", 10],
+        ["e512x640-q4k-q51", 11],
     ];
 
     internal static byte[] Build(int variant) => variant switch
@@ -82,10 +89,14 @@ public sealed class VulkanQwen4ExpParityTests
         5 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.KQuant256, Q4eQuant.F32),
         6 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Hd256, Q4eQuant.F32),
         7 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Hd256, Q4eQuant.Q8Q51),
+        8 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.RealMixQ51),
+        9 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.RealMixQ80),
+        10 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter96, Q4eQuant.RealMixQ51),
+        11 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Real512x640, Q4eQuant.RealMixQ51),
         _ => throw new ArgumentOutOfRangeException(nameof(variant)),
     };
 
-    internal static bool IsQuantised(int variant) => variant is 1 or 3 or 4 or 7;
+    internal static bool IsQuantised(int variant) => variant is 1 or 3 or 4 or 7 or 8 or 9 or 10 or 11;
 
     internal static int[] Ids(int count, int vocab, int seed = 7)
     {
@@ -204,6 +215,74 @@ public sealed class VulkanQwen4ExpParityTests
         var (rl2, kl, _) = Compare(whole, last);
         _out.WriteLine($"chunk {chunk}: relL2 = {rl2:E3}, KL = {kl:E3}");
         Assert.True(rl2 < 2e-3, $"chunked({chunk}) diverges from single shot: relL2 {rl2:E3}");
+    }
+
+    private static float[] Decode(Q4eRig rig, int[] ids, int steps, out float[] prefill)
+    {
+        int T = ids.Length;
+        prefill = Q4eRig.Row(rig.Vk.Forward(ids, Enumerable.Range(0, T).ToArray(), -1), 0);
+        float[] last = prefill;
+        for (int s = 0; s < steps; s++)
+        {
+            int next = Array.IndexOf(last, last.Max());
+            last = Q4eRig.Row(rig.Vk.Forward([next], [T + s], -1), 0);
+        }
+        return last;
+    }
+
+    /// <summary>
+    /// #849: the legacy-quant (Q5_1 / Q8_0) down banks stay PACKED on the device (no F32 expansion) and the layer takes the legacy MMVQ decode and
+    /// grouped coopmat prefill arms. Proven two ways, per the "prove a fast path ran" rule: the record-time branch counters, and a perturbation -
+    /// disabling the MMVQ / grouped kernels (same resident banks, scalar F32-in path) must change the logits (int8-activation / f16-tile rounding
+    /// differ) while both stay oracle-close.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(8, QuantizationType.Q5_1, true)]
+    [InlineData(9, QuantizationType.Q8_0, true)]
+    [InlineData(10, QuantizationType.Q5_1, false)]    // inter 96: MMVQ yes (K % 32), grouped no (K % 64)
+    public void LegacyDownBanks_AreResident_AndTakeTheFastArms(int variant, QuantizationType down, bool groupedExpected)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        int T = 40;
+        var ids = Ids(T, 128, seed: 21);
+        float[] cpuPrefill, fastPrefill, fastDecode, slowPrefill, slowDecode;
+        using (var rig = new Q4eRig(Build(variant), spvDir))
+        {
+            Assert.All(rig.Vk.ExpertBankDeviceTypes, t =>
+            {
+                Assert.Equal(QuantizationType.Q4_K, t.Gate);
+                Assert.Equal(down, t.Down);          // NOT F32: no expansion
+                Assert.Equal(QuantizationType.Q4_K, t.Up);
+            });
+            cpuPrefill = Q4eRig.Row(rig.Cpu.Forward(ids, Enumerable.Range(0, T).ToArray(), -1), T - 1);
+            fastDecode = Decode(rig, ids, 3, out fastPrefill);
+            Assert.True(rig.Vk.MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath.MmvqLegacyDown) > 0, "legacy MMVQ down arm never recorded");
+            long grouped = rig.Vk.MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath.GroupedLegacyDown);
+            if (groupedExpected) Assert.True(grouped > 0, "grouped legacy down arm never recorded");
+            else Assert.Equal(0, grouped);
+        }
+        string[] vars = ["DOTLLM_VK_MOE_MMVQ", "DOTLLM_VK_MOE_GROUPED", "DOTLLM_VK_MOE_INDEXED_MMQ"];
+        string?[] prior = vars.Select(Environment.GetEnvironmentVariable).ToArray();
+        try
+        {
+            foreach (var v in vars) Environment.SetEnvironmentVariable(v, "0");
+            using var rig = new Q4eRig(Build(variant), spvDir);
+            Assert.All(rig.Vk.ExpertBankDeviceTypes, t => Assert.Equal(down, t.Down));   // same residency, scalar kernels
+            slowDecode = Decode(rig, ids, 3, out slowPrefill);
+            Assert.Equal(0, rig.Vk.MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath.MmvqLegacyDown));
+        }
+        finally
+        {
+            for (int i = 0; i < vars.Length; i++) Environment.SetEnvironmentVariable(vars[i], prior[i]);
+        }
+        var (fastRel, fastKl, _) = Compare(cpuPrefill, fastPrefill);
+        var (slowRel, slowKl, _) = Compare(cpuPrefill, slowPrefill);
+        var (armRel, _, _) = Compare(slowDecode, fastDecode);
+        var (armPre, _, _) = Compare(slowPrefill, fastPrefill);
+        _out.WriteLine($"variant {variant} ({down}): fast vs CPU relL2 {fastRel:E3} KL {fastKl:E3}; scalar vs CPU relL2 {slowRel:E3} KL {slowKl:E3}; fast vs scalar prefill {armPre:E3}, decode {armRel:E3}");
+        Assert.True(fastRel < 0.08 && fastKl < 0.02, $"fast arms off the oracle: relL2 {fastRel:E3}, KL {fastKl:E3}");
+        Assert.True(slowRel < 0.08 && slowKl < 0.02, $"scalar arms off the oracle: relL2 {slowRel:E3}, KL {slowKl:E3}");
+        Assert.True(armPre > 0 || armRel > 0, "perturbation inert: the fast arms produced bit-identical logits to the scalar kernels, so they did not run");
     }
 
     [SkippableFact]

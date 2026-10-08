@@ -19,8 +19,8 @@ namespace DotLLM.Vulkan;
 /// </para>
 /// <para>
 /// The estimate mirrors the upload policy rather than the file size: expert banks whose quant has no resident indexed kernel
-/// (anything but Q4_K/Q5_K/Q6_K today - Q5_1 / Q8_0 / IQ*) are WIDENED to F32 on upload, which is exactly what makes the real
-/// UD-Q4_K_XL file (Q5_1 down experts) not fit until those banks get resident kernels; the estimate must say so up front.
+/// (anything but Q4_K/Q5_K/Q6_K/Q5_1/Q8_0 today - e.g. IQ*) are WIDENED to F32 on upload, which is what made the real
+/// UD-Q4_K_XL file (Q5_1 down experts) not fit before #849; the estimate must say so up front.
 /// </para>
 /// </remarks>
 internal readonly record struct Qwen4ExpResidencyPlan(
@@ -52,8 +52,8 @@ internal readonly record struct Qwen4ExpResidencyPlan(
     }
 
     /// <summary>Quant types whose routed expert banks stay packed on the device (mirrors <c>VulkanQwen3MoeMoeUpload</c>).</summary>
-    private static bool BankStaysPacked(QuantizationType qt)
-        => qt is QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K;
+    private static bool BankStaysPacked(QuantizationType qt, int kDim)
+        => VulkanQwen3MoeMoeUpload.BankStaysPacked(qt, kDim);
 
     /// <summary>Estimates device bytes for the tensors Qwen4Exp uploads, from the GGUF tensor table. Host-only tensors are excluded.</summary>
     public static (long DeviceBytes, long HostOnlyBytes) EstimateWeights(
@@ -74,7 +74,7 @@ internal readonly record struct Qwen4ExpResidencyPlan(
             if (name.Contains(".nextn.", StringComparison.Ordinal)) continue;   // MTP block: not loaded by V1
 
             if (name.Contains("_exps.weight", StringComparison.Ordinal))
-                device += BankStaysPacked(d.QuantizationType) ? packed : elems * 4;
+                device += BankStaysPacked(d.QuantizationType, d.Shape[0]) ? packed : elems * 4;
             else if (name == Qwen4ExpTensors.TokenEmbd)
                 device += elems * 4;                                        // the embedding gather table is always widened to F32
             else if (name.Contains("_shexp.weight", StringComparison.Ordinal))

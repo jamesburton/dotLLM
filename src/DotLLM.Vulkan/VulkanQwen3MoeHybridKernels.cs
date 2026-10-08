@@ -50,6 +50,23 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public RmsNormQuantizeQ8_1FusedKernel? RmsNormQuantizeFused { get; private set; }
     public SwiGluQuantizeQ8_1FusedKernel? SwiGluQuantizeFused { get; private set; }
     public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ5K { get; private set; }
+    // #849: legacy 32-element-block expert banks (Q5_1 / Q8_0 down projections of UD-Q4_K_XL files). Scalar F32-in indexed kernels are the
+    // always-available correctness path; MMVQ (dp4a) serves decode, the legacy coopmat grouped kernels serve prefill (always 16-row tiles).
+    /// <summary>Scalar F32-in indexed Q5_1 matmul (applies a per-expert output scale; the MoE path passes a unit-scale buffer).</summary>
+    public MoeIndexedMatmulQ5_1F32Kernel? MoeIndexedMatmulQ5_1 { get; private set; }
+    /// <summary>Scalar F32-in indexed Q8_0 matmul.</summary>
+    public MoeIndexedMatmulQ8_0F32Kernel? MoeIndexedMatmulQ8_0 { get; private set; }
+    /// <summary>Indexed Q5_1 MMVQ (dp4a) decode GEMV.</summary>
+    public MoeIndexedMatmulQ5_1MmvqKernel? MoeMmvqQ5_1 { get; private set; }
+    /// <summary>Indexed Q8_0 MMVQ (dp4a) decode GEMV.</summary>
+    public MoeIndexedMatmulQ8_0MmvqKernel? MoeMmvqQ8_0 { get; private set; }
+    /// <summary>Grouped coopmat Q5_1 prefill kernel (16-row tiles).</summary>
+    public MoeGroupedMatmulLegacyQuantCoopmatKernel? MoeGroupedQ5_1 { get; private set; }
+    /// <summary>Grouped coopmat Q8_0 prefill kernel (16-row tiles).</summary>
+    public MoeGroupedMatmulLegacyQuantCoopmatKernel? MoeGroupedQ8_0 { get; private set; }
+    /// <summary>16-row Q4_K grouped kernel, present only when <see cref="MoeGroupedQ4K"/> is the 32-row row-pair form: a layer whose down
+    /// bank is legacy-quant (16-row tiles only) needs gate/up on the same 16-row tile list.</summary>
+    public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ4K16 { get; private set; }
     public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ6K { get; private set; }
     public MatMulQ2KGemvF32Kernel MatMulQ2K { get; }
     public MatMulQ2KGemmF32Kernel MatMulQ2KGemm { get; }
@@ -495,7 +512,19 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             kernels.MoeGroupedQ4K = q4;
             kernels.MoeGroupedQ5K = q5;
             kernels.MoeGroupedQ6K = q6;
+            // #849: legacy-quant grouped down kernels (16-row tiles). They need the indirect tile list (the legacy grid is Q4_K-agnostic too,
+            // but keeping one gate keeps the all-or-nothing invariant simple).
+            if (MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q5_1))
+                kernels.MoeGroupedQ5_1 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Q5_1);
+            if (MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q8_0))
+                kernels.MoeGroupedQ8_0 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Q8_0);
+            if ((kernels.MoeGroupedQ5_1 is not null || kernels.MoeGroupedQ8_0 is not null) && q4.RowTile != 16)
+                kernels.MoeGroupedQ4K16 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K);
         }
+        if (File.Exists(Path.Combine(spvDir, "moe_indexed_matmul_q5_1_f32.spv")))
+            kernels.MoeIndexedMatmulQ5_1 = MoeIndexedMatmulQ5_1F32Kernel.Create(device, spvDir);
+        if (File.Exists(Path.Combine(spvDir, "moe_indexed_matmul_q8_0_f32.spv")))
+            kernels.MoeIndexedMatmulQ8_0 = MoeIndexedMatmulQ8_0F32Kernel.Create(device, spvDir);
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_DEINTERLEAVE") != "0")
         {
             kernels.GdnQkvSplit = DeinterleaveF32Kernel.TryCreate(device, spvDir, DeinterleaveF32Kernel.Kind.GdnQkvSplit);
@@ -512,6 +541,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
                 kernels.SwiGluQuantizeFused = SwiGluQuantizeQ8_1FusedKernel.TryCreate(device, spvDir);
             }
             kernels.MoeMmvqQ5K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q5_K);
+            kernels.MoeMmvqQ5_1 = MoeIndexedMatmulQ5_1MmvqKernel.TryCreate(device, spvDir);
+            kernels.MoeMmvqQ8_0 = MoeIndexedMatmulQ8_0MmvqKernel.TryCreate(device, spvDir);
             kernels.MoeMmvqQ6K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q6_K);
         }
         return kernels;
@@ -611,10 +642,19 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         SwiGluQuantizeFused?.InvalidateDescriptorCache();
         MoeMmvqQ5K?.InvalidateDescriptorCache();
         MoeMmvqQ6K?.InvalidateDescriptorCache();
+        MoeIndexedMatmulQ5_1?.InvalidateDescriptorCache();
+        MoeIndexedMatmulQ8_0?.InvalidateDescriptorCache();
+        MoeMmvqQ5_1?.InvalidateDescriptorCache();
+        MoeMmvqQ8_0?.InvalidateDescriptorCache();
+        MoeGroupedQ5_1?.InvalidateDescriptorCache();
+        MoeGroupedQ8_0?.InvalidateDescriptorCache();
+        MoeGroupedQ4K16?.InvalidateDescriptorCache();
     }
 
     public void Dispose()
     {
+        MoeIndexedMatmulQ5_1?.Dispose(); MoeIndexedMatmulQ8_0?.Dispose(); MoeMmvqQ5_1?.Dispose(); MoeMmvqQ8_0?.Dispose();
+        MoeGroupedQ5_1?.Dispose(); MoeGroupedQ8_0?.Dispose(); MoeGroupedQ4K16?.Dispose();
         QGateDeinterleave?.Dispose(); GdnQkvSplit?.Dispose(); SwiGluQuantizeFused?.Dispose(); RmsNormQuantizeFused?.Dispose(); MatMulQ8Mmvq?.Dispose(); MoeMmvqQ6K?.Dispose(); MoeMmvqQ5K?.Dispose(); MoeMmvqQ4K?.Dispose();
         MoeGroupedQ6K?.Dispose(); MoeGroupedQ5K?.Dispose(); MoeGroupedQ4K?.Dispose(); MoeUngroupScatter?.Dispose();
         MoeExpandGroupByExpert?.Dispose(); MoeExpertOffsets?.Dispose(); MoeBuildTileList?.Dispose(); MoeExpandGatherGroup?.Dispose(); MoeWeightedScatterGrouped?.Dispose();
