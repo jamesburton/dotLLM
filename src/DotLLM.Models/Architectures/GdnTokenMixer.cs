@@ -16,8 +16,27 @@ internal enum GdnOutputGate
     Sigmoid,
 }
 
+/// <summary>Which of the mixer's five dense projections a <see cref="GdnGemm"/> call computes (LoRA sites, #845).</summary>
+internal enum GdnProjection
+{
+    /// <summary><c>attn_qkv</c> (HF <c>in_proj_qkv</c>).</summary>
+    Qkv,
+
+    /// <summary><c>attn_gate</c> (HF <c>in_proj_z</c>).</summary>
+    Gate,
+
+    /// <summary><c>ssm_alpha</c> (HF <c>in_proj_a</c>).</summary>
+    Alpha,
+
+    /// <summary><c>ssm_beta</c> (HF <c>in_proj_b</c>).</summary>
+    Beta,
+
+    /// <summary><c>ssm_out</c> (HF <c>out_proj</c>).</summary>
+    Out,
+}
+
 /// <summary>A model's own GEMM dispatch (<c>output[T, outDim] = input[T, inDim] x weight^T</c>) for one projection.</summary>
-internal delegate void GdnGemm(nint weight, QuantizationType quantType, ReadOnlySpan<float> input, Span<float> output,
+internal delegate void GdnGemm(GdnProjection projection, nint weight, QuantizationType quantType, ReadOnlySpan<float> input, Span<float> output,
                                int outDim, int inDim, int seqLen);
 
 /// <summary>Caller-owned scratch of one mixer call (all fully overwritten before being read).</summary>
@@ -76,10 +95,10 @@ internal static unsafe class GdnTokenMixer
         var q = s.Q; var k = s.K; var v = s.V; var core = s.Core;
 
         // ── 1. projections from the normed input ──
-        gemm(w.QkvWeight, w.QkvQuantType, x, qkv, w.QkvOutputDim, w.QkvInputDim, T);
-        gemm(w.GateWeight, w.GateQuantType, x, z, w.GateOutputDim, w.GateInputDim, T);
-        gemm(w.AlphaWeight, w.AlphaQuantType, x, alpha, w.AlphaOutputDim, w.AlphaInputDim, T);
-        gemm(w.BetaWeight, w.BetaQuantType, x, beta, w.BetaOutputDim, w.BetaInputDim, T);
+        gemm(GdnProjection.Qkv, w.QkvWeight, w.QkvQuantType, x, qkv, w.QkvOutputDim, w.QkvInputDim, T);
+        gemm(GdnProjection.Gate, w.GateWeight, w.GateQuantType, x, z, w.GateOutputDim, w.GateInputDim, T);
+        gemm(GdnProjection.Alpha, w.AlphaWeight, w.AlphaQuantType, x, alpha, w.AlphaOutputDim, w.AlphaInputDim, T);
+        gemm(GdnProjection.Beta, w.BetaWeight, w.BetaQuantType, x, beta, w.BetaOutputDim, w.BetaInputDim, T);
         if (TensorDump.Enabled)
         {
             Dump2D($"blk.{absoluteLayer}.linear_attn_qkv_mixed", qkv, T, convDim);
@@ -188,7 +207,7 @@ internal static unsafe class GdnTokenMixer
         if (TensorDump.Enabled) Dump3D($"blk.{absoluteLayer}.final_output", core, T, nV, dS);
 
         // ── 7. ssm_out ──
-        gemm(w.OutWeight, w.OutQuantType, core.Slice(0, T * vDim), y, w.OutOutputDim, w.OutInputDim, T);
+        gemm(GdnProjection.Out, w.OutWeight, w.OutQuantType, core.Slice(0, T * vDim), y, w.OutOutputDim, w.OutInputDim, T);
         if (TensorDump.Enabled) Dump2D($"blk.{absoluteLayer}.linear_attn_out", y, T, hiddenSize);
     }
 

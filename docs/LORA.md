@@ -92,6 +92,10 @@ Because the delta is linear, `LoraComposer.Compose` realises this by **rank-conc
 
 Constraints (current): stacked adapters must have **uniform site coverage** (every `(layer, projection)` targeted by one is targeted by all) and **F32 weights**. A single `--lora` bypasses composition entirely (so non-F32 single adapters are unaffected). GPU stacked-parity is validated by a separate env-gated test.
 
+## Qwen4-Exp CPU path (#845)
+
+`Qwen4ExpTransformerModel` applies a runtime adapter (never merged) after the base GEMM of: QSA `q_proj` (the FUSED `[q | gate]` projection, `2*heads*headDim` wide), `k_proj`, `v_proj`, `o_proj`; Gated-DeltaNet `in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`, `out_proj`; and routed-expert `mlp.experts.{j}.{gate,up,down}_proj` (through the shared MoE kernel). The GDN factors must be expressed in the GGUF layout the model consumes (value heads tiled, like the converted base weights); the PEFT loader still only maps `self_attn`/`mlp` names, so GDN adapters are built programmatically until a converter exists. The shared expert, router, hyper-connection mixers, QSA indexer, n-gram (PLE) branch, embeddings and LM head are not adaptable: an adapter entry for any of them, for a name on the wrong layer kind, or with a wrong shape is rejected before any compute (`NotSupportedException` / `ArgumentException` naming the site). `ForwardBatch` honours each request's own adapter (requests run sequentially). Verified by comparing against the same checkpoint with the adapter merged into the weights (`Qwen4ExpLoraTests`).
+
 ## Design Decisions
 
 - **No weight merging**: Adapters are never merged into base weights (`W' = W + αBA`). This enables instant switching and concurrent adapters. Trade-off: small per-layer overhead vs. large flexibility gain.

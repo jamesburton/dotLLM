@@ -50,7 +50,7 @@ public sealed unsafe class GdnTokenMixerTests : IDisposable
     }
 
     /// <summary>Naive F32 GEMM that also records the gate projection output (z) and the input of ssm_out (the gated, normed core).</summary>
-    private static GdnGemm Gemm(GdnTokenMixingWeights w, Capture cap) => (weight, qt, input, output, outDim, inDim, n) =>
+    private static GdnGemm Gemm(GdnTokenMixingWeights w, Capture cap) => (proj, weight, qt, input, output, outDim, inDim, n) =>
     {
         Assert.Equal(QuantizationType.F32, qt);
         var wp = (float*)weight;
