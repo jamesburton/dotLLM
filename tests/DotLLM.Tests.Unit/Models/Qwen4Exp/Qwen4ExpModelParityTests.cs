@@ -90,7 +90,6 @@ public sealed unsafe class Qwen4ExpModelParityTests : IDisposable
         var hf = Fx.F32("logits");
         for (int t = 0; t < T; t++)
             Assert.Equal(Argmax(hf.AsSpan(t * V, V)), Argmax(logits.AsSpan(t * V, V)));
-        Assert.NotEqual(Argmax(hf.AsSpan(0, V)), Argmax(hf.AsSpan(7 * V, V)) + 1000);   // keep the check honest
     }
 
     private static int Argmax(ReadOnlySpan<float> v)
@@ -216,6 +215,21 @@ public sealed unsafe class Qwen4ExpModelParityTests : IDisposable
             ToArray(model.Forward(ids.AsSpan(i, n), Positions(n, i), -1, state)).CopyTo(chunked, i * V);
         }
         Assert.True(MaxRel(sparse, chunked, out int at) < 1e-4f, $"chunked(512) vs single-shot at {at}");
+    }
+
+    [Fact]
+    public void EngineKvCacheAndBatchedDispatch_AreRefused_NotSilentlyMisused()
+    {
+        var (model, _) = Load();
+        var ids = Ids.AsSpan(0, 4).ToArray();
+        using var cache = new DotLLM.Engine.KvCache.SimpleKvCache(1, 1, 8, 16);
+        var ex = Assert.Throws<NotSupportedException>(() => model.Forward(ids, Positions(4), -1, cache));
+        Assert.Contains("#817", ex.Message);
+        Assert.Throws<NotSupportedException>(() => model.Forward(ids, Positions(4), -1, cache, true));
+        var req = new SequenceForwardRequest { TokenIds = ids, Positions = Positions(4), KvCache = cache };
+        Assert.Throws<NotSupportedException>(() => ((IModel)model).ForwardBatch([req, req], -1));
+        // The refusal happened before any state was touched.
+        Assert.Equal(4, ToArray(model.Forward(ids, Positions(4), -1)).Length / Fx.Int("vocab"));
     }
 
     [Fact]

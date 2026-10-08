@@ -27,7 +27,8 @@ def reorder_v(t, dim, nk, r, hd):
 
 def main(out):
     seed = 33
-    model = build_model(seed=seed)
+    # moe/shared intermediate 32 (not the default 24) so the expert banks can be block-quantised (K multiple of 32) in the quantised-checkpoint test
+    model = build_model(seed=seed, moe_intermediate_size=32, shared_expert_intermediate_size=32)
     cfg = model.config
     H, S = cfg.hidden_size, cfg.hc_count
     nk, nv, dk, dv = cfg.linear_num_key_heads, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim

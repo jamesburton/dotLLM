@@ -119,6 +119,11 @@ public sealed class Qwen4ExpIndexerCache
 /// <summary>
 /// Per-sequence, per-layer state of a Qwen4-Exp QSA attention layer: the K/V cache and the indexer key cache.
 /// </summary>
+/// <remarks>
+/// CPU-oracle layout: the K/V rows live in geometrically grown managed arrays (at the released geometry and 262 K context that is
+/// ~0.5 GiB per layer of LOH-sized buffers). A native, paged and checkpointable layout belongs to the state-management work of
+/// issue #817; this class is the numerical reference, not the serving cache.
+/// </remarks>
 public sealed class Qwen4ExpQsaState
 {
     private float[] _k, _v;

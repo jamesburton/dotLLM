@@ -15,6 +15,23 @@ internal static class Qwen4ExpTinyGguf
         !(name.StartsWith("l_out.", StringComparison.Ordinal) || name is "ids" or "hidden_final" or "logits"
           || name.StartsWith("ple.", StringComparison.Ordinal));
 
+    /// <summary>
+    /// The real UD-Q4_K_XL mix where the tiny geometry allows: BF16 indexer projections, Q4_K hc-down (K = 4*H = 256), Q8_0
+    /// projections / router / embedding / shared expert, Q8_0 gate+up and Q5_1 down expert banks (the Q5_1 bank exercises the
+    /// no-direct-kernel fallback), F16 n-gram table; norms, convs, inject, hc-up (K = 20) and scalars stay F32.
+    /// </summary>
+    private static QuantizationType ChooseQuant(string name, int[] shape)
+    {
+        if (name == "per_layer_token_embd.weight") return QuantizationType.F16;
+        if (name.Contains("indexer.", StringComparison.Ordinal) && name.EndsWith("_proj.weight", StringComparison.Ordinal)) return QuantizationType.BF16;
+        if (name.Contains("ffn_down_exps", StringComparison.Ordinal)) return QuantizationType.Q5_1;
+        if (name.Contains("_down.weight", StringComparison.Ordinal) && name.Contains("hc_", StringComparison.Ordinal)) return QuantizationType.Q4_K;
+        if (shape.Length >= 2 && name.EndsWith(".weight", StringComparison.Ordinal) && shape[^1] % 32 == 0
+            && !name.Contains("conv1d", StringComparison.Ordinal) && !name.Contains("inject", StringComparison.Ordinal))
+            return QuantizationType.Q8_0;
+        return QuantizationType.F32;
+    }
+
     /// <summary>Builds the GGUF bytes. <paramref name="shards"/> &gt; 1 is not supported here (see the split test).</summary>
     public static byte[] Build(Qwen4ExpReferenceFixture fx, int contextLength = 256, bool quantize = false, int? budgetTokens = null)
     {
@@ -79,21 +96,22 @@ internal static class Qwen4ExpTinyGguf
             int[] dims = shape.Reverse().ToArray();          // numpy [out, in] row-major == GGUF ne [in, out]
             float[] data = fx.F32(name);
             var qt = QuantizationType.F32;
-            if (quantize)
-            {
-                // Mirror the real file's mix where the tiny geometry allows: Q8_0 for matrices whose input dim is a multiple of 32
-                // (projections, hc down, router, embedding), F16 for the n-gram table, F32 for norms/convs/inject/scalars.
-                if (name == "per_layer_token_embd.weight") qt = QuantizationType.F16;
-                else if (shape.Length >= 2 && name.EndsWith(".weight", StringComparison.Ordinal) && shape[^1] % 32 == 0
-                         && !name.Contains("conv1d", StringComparison.Ordinal) && !name.Contains("inject", StringComparison.Ordinal)
-                         && !name.Contains("_shexp", StringComparison.Ordinal))
-                    qt = QuantizationType.Q8_0;
-            }
+            if (quantize) qt = ChooseQuant(name, shape);
             byte[] bytes;
             if (qt == QuantizationType.F32)
             {
                 bytes = new byte[data.Length * 4];
                 Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
+            }
+            else if (qt == QuantizationType.BF16)
+            {
+                bytes = new byte[data.Length * 2];
+                for (int i = 0; i < data.Length; i++)
+                {
+                    uint bits = BitConverter.SingleToUInt32Bits(data[i]);
+                    ushort bf = (ushort)((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);   // round-to-nearest-even
+                    bytes[2 * i] = (byte)bf; bytes[2 * i + 1] = (byte)(bf >> 8);
+                }
             }
             else
             {

@@ -415,13 +415,42 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         => Forward(tokenIds, positions, deviceId, _defaultState, lastTokenLogitsOnly: false);
 
     /// <inheritdoc/>
+    /// <exception cref="NotSupportedException"><paramref name="kvCache"/> is non-null: the model keeps its own state (see remarks).</exception>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
-        => Forward(tokenIds, positions, deviceId, _defaultState, lastTokenLogitsOnly: false);
+    {
+        RejectEngineKvCache(kvCache);
+        return Forward(tokenIds, positions, deviceId, _defaultState, lastTokenLogitsOnly: false);
+    }
 
     /// <inheritdoc/>
+    /// <exception cref="NotSupportedException"><paramref name="kvCache"/> is non-null: the model keeps its own state (see remarks).</exception>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache,
                            bool lastTokenLogitsOnly)
-        => Forward(tokenIds, positions, deviceId, _defaultState, lastTokenLogitsOnly);
+    {
+        RejectEngineKvCache(kvCache);
+        return Forward(tokenIds, positions, deviceId, _defaultState, lastTokenLogitsOnly);
+    }
+
+    /// <summary>
+    /// The oracle owns its sequence state (QSA K/V + indexer keys, GDN, PLE). An engine-owned <see cref="IKvCache"/> would silently
+    /// not advance while that state does, and the default <c>ForwardBatch</c> loop would make concurrent sequences share the
+    /// model-owned default state (the #261 failure class) — so both are refused until the engine integration of issue #817.
+    /// </summary>
+    private static void RejectEngineKvCache(IKvCache? kvCache)
+    {
+        if (kvCache is not null)
+            throw new NotSupportedException(
+                "Qwen4ExpTransformerModel keeps its own sequence state (QSA K/V, pooled indexer keys, GDN, PLE) and cannot run against an " +
+                "engine KV cache yet; call Forward(tokens, positions, deviceId[, lastTokenLogitsOnly]) or the Qwen4ExpSequenceState overload. " +
+                "Engine/scheduler integration is tracked in issue #817.");
+    }
+
+    /// <inheritdoc/>
+    /// <exception cref="NotSupportedException">Always: batched/scheduler dispatch needs the engine state integration of issue #817.</exception>
+    public IReadOnlyList<ITensor> ForwardBatch(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+        => throw new NotSupportedException(
+            "Qwen4ExpTransformerModel does not support ForwardBatch: requests carry an engine KV cache and the model-owned default state " +
+            "would be shared by concurrent sequences. Engine/scheduler integration is tracked in issue #817.");
 
     /// <summary>
     /// Forward over a caller-owned sequence state (chunked prefill / decode). Positions must continue
