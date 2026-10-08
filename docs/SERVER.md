@@ -841,11 +841,19 @@ Both `/v1/chat/completions` and `/v1/completions` validate inputs before inferen
 | Check | Limit | Response |
 |-------|-------|----------|
 | Empty messages array | 0 | 400 `"messages array must not be empty"` |
-| Messages count | > 1024 | 400 `"messages array exceeds maximum of 1024"` |
+| Messages count | > `--max-messages` (default 8192; 0 = unlimited) | 400 `"messages array exceeds maximum of N messages (got M); raise it with --max-messages or DOTLLM_MAX_MESSAGES (0 = unlimited)"` (Anthropic route: `"messages: array exceeds ..."`) |
 | Empty prompt (completions) | empty/null | 400 `"prompt must not be empty"` |
 | `max_tokens` | &le; 0 | 400 `"max_tokens must be a positive integer"` |
 | Prompt token count | &ge; `MaxSequenceLength` | 400 `"prompt (N tokens) exceeds model context length (M)"` |
 | `prompt_tokens + max_tokens` | > `MaxSequenceLength` | `max_tokens` silently clamped to remaining context |
+
+### Configuring limits
+
+The message-count cap applies to both `/v1/chat/completions` and `/v1/messages` (#835). It defaults to 8192 (it was a
+hard-coded 1024). Set it with `dotllm serve --max-messages <n>` or the `DOTLLM_MAX_MESSAGES` environment variable; the flag
+wins over the variable. `0` removes the cap; a negative or non-integer value fails at startup. It is only a cheap structural
+bound - the prompt-length-vs-context check remains the real protection, so long agent conversations are limited by the
+model's context window, not by this count.
 
 ### Vulkan continuous-batch scheduler (hybrid GDN models)
 

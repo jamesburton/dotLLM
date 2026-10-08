@@ -52,7 +52,7 @@ public static class ChatCompletionEndpoint
         }
 
         // Validate request structure
-        var validationError = RequestValidator.ValidateChatRequest(request);
+        var validationError = RequestValidator.ValidateChatRequest(request, state.Options.EffectiveMaxMessages);
         if (validationError is not null)
         {
             httpContext.Response.StatusCode = 400;

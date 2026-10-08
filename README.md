@@ -470,6 +470,7 @@ To embed the same endpoints inside your own ASP.NET Core app, see [Host the Open
 | `--allow-model-admin` | | false | Enable the management API (`/v1/models/*`, `/v1/settings`, `/v1/admin/shutdown`, ollama `/api/pull` + `/api/delete`) |
 | `--allow-lora-admin` | | false | Enable `POST /v1/lora/load` and `DELETE /v1/lora/{name}` |
 | `--mtp` | | *(default on)* | Accepted for back-compat. `serve` auto-enables MTP self-speculation for models with an embedded MTP head when expected concurrency is < 5 and no `--speculative-model` is set; `--no-mtp` opts out |
+| `--max-messages` | | `8192` | Max messages per chat request on `/v1/chat/completions` and `/v1/messages`; `0` = unlimited; env `DOTLLM_MAX_MESSAGES` (flag wins) |
 | `--expected-concurrency` | | `0` | At 5+ concurrent requests Vulkan hybrid models serve through the continuous-batch scheduler |
 | `--decision-temperature`, `--decision-orderings` | | `0`, `1` | Calibration of `POST /v1/systemone` probabilities |
 | `--rate-limit-rpm`, `--rate-limit-tpm`, `--rate-limit-concurrency` | | `0` (off) | Per-API-key rate limits; setting any enables limiting |

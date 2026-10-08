@@ -99,6 +99,45 @@ public sealed record ServerOptions
     /// </summary>
     public int PrefillChunkSize { get; init; }
 
+    /// <summary>Default for <see cref="EffectiveMaxMessages"/> when <see cref="MaxMessages"/> is unset.</summary>
+    public const int DefaultMaxMessages = 8192;
+
+    /// <summary>Environment variable that supplies <see cref="MaxMessages"/> when <c>--max-messages</c> is not given.</summary>
+    public const string MaxMessagesEnvVar = "DOTLLM_MAX_MESSAGES";
+
+    /// <summary>
+    /// Maximum number of messages accepted in one chat request on <c>/v1/chat/completions</c> and
+    /// <c>/v1/messages</c> (#835). Null = <see cref="DefaultMaxMessages"/>; 0 = unlimited; negative is
+    /// invalid (rejected by <see cref="ResolveMaxMessages"/>). Set with <c>--max-messages</c> or
+    /// <c>DOTLLM_MAX_MESSAGES</c>. A cheap structural bound only - the prompt-length-vs-context check
+    /// is the real protection for the engine.
+    /// </summary>
+    public int? MaxMessages { get; init; }
+
+    /// <summary>The message-count cap in force: <see cref="MaxMessages"/> or the default. 0 means unlimited.</summary>
+    public int EffectiveMaxMessages => MaxMessages ?? DefaultMaxMessages;
+
+    /// <summary>
+    /// Resolves the message cap from the CLI value and the <see cref="MaxMessagesEnvVar"/> value; the CLI wins.
+    /// Returns null when neither is set (so the default applies). Throws <see cref="ArgumentException"/> for a
+    /// negative or non-integer value, so a typo fails at startup instead of silently disabling the cap.
+    /// </summary>
+    public static int? ResolveMaxMessages(int? cliValue, string? envValue)
+    {
+        if (cliValue is int cli)
+            return cli >= 0 ? cli : throw new ArgumentException(
+                $"--max-messages must be >= 0 (0 = unlimited), got {cli}.");
+
+        if (string.IsNullOrWhiteSpace(envValue))
+            return null;
+
+        if (!int.TryParse(envValue.Trim(), System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out int env) || env < 0)
+            throw new ArgumentException(
+                $"{MaxMessagesEnvVar} must be an integer >= 0 (0 = unlimited), got '{envValue}'.");
+        return env;
+    }
+
     /// <summary>Model display name (derived from file path).</summary>
     public string ModelId { get; init; } = "default";
 
@@ -244,6 +283,7 @@ public sealed record ServerOptions
         long residentMemoryBudgetBytes = 0;
         bool allowModelAdmin = false;
         bool allowLoraAdmin = false;
+        int? maxMessagesCli = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -322,6 +362,8 @@ public sealed record ServerOptions
                     allowModelAdmin = true; break;
                 case "--allow-lora-admin":
                     allowLoraAdmin = true; break;
+                case "--max-messages":
+                    maxMessagesCli = int.Parse(next!, System.Globalization.CultureInfo.InvariantCulture); i++; break;
                 default:
                     // Positional: treat as model if not set
                     if (model is null && !arg.StartsWith('-'))
@@ -374,6 +416,7 @@ public sealed record ServerOptions
             ResidentMemoryBudgetBytes = residentMemoryBudgetBytes,
             AllowModelAdminApi = allowModelAdmin,
             AllowLoraAdminApi = allowLoraAdmin,
+            MaxMessages = ResolveMaxMessages(maxMessagesCli, Environment.GetEnvironmentVariable(MaxMessagesEnvVar)),
             ModelId = modelId,
             RopeOverride = BuildRopeOverride(ropeScaling, ropeFreqBase, ropeScale,
                 yarnOrigCtx, yarnAttnFactor, yarnBetaFast, yarnBetaSlow),
