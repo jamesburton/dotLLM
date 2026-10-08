@@ -19,6 +19,7 @@ namespace DotLLM.Cpu.Kernels;
 public sealed class Qwen4ExpIndexerCache : IDisposable
 {
     private readonly Qwen4ExpNativeBuffer _pooled = new();
+    private readonly Qwen4ExpRowStamps _poolStamps = new();   // content identity of the pooled rows (delta checkpoint, #840)
     private readonly Qwen4ExpNativeBuffer _tailRaw = new();
     private int _tailCount;
 
@@ -81,16 +82,25 @@ public sealed class Qwen4ExpIndexerCache : IDisposable
         _recRows = 0;
     }
 
-    /// <summary>Copies another cache of identical geometry (full copy: pooled blocks and tail).</summary>
-    public void CopyFrom(Qwen4ExpIndexerCache other)
+    /// <summary>Pooled rows physically copied by the last <see cref="CopyFrom"/> (the rest were already identical).</summary>
+    public long LastCopiedPooledRows => _poolStamps.LastCopiedRows;
+
+    /// <summary>
+    /// Makes this cache equal to <paramref name="other"/> (identical geometry): token count, tail, and the pooled blocks. Only the
+    /// pooled blocks whose content stamps differ are copied (<see cref="Qwen4ExpRowStamps"/>), so syncing a checkpoint shell that
+    /// last synced from (a descendant of) the same history costs a stamp compare, not a copy of the whole context. Correct for any
+    /// pair of caches, including ones that diverged (the stamps identify content, not lineage).
+    /// </summary>
+    public unsafe void CopyFrom(Qwen4ExpIndexerCache other)
     {
         if (other.HeadDim != HeadDim || other.BlockSize != BlockSize) throw new ArgumentException("geometry mismatch.");
         int blocks = other.CompleteBlocks;
         if (blocks > 0)
         {
             _pooled.EnsureCapacity((long)blocks * HeadDim);
-            other.Pooled.CopyTo(_pooled.Slice(0, blocks * HeadDim));
+            Qwen4ExpRowStamps.DeltaCopy(other._poolStamps, _poolStamps, blocks, other._pooled.Pointer, _pooled.Pointer, HeadDim);
         }
+        else _poolStamps.ResetCopied();
         CopyTailFrom(other);
     }
 
@@ -145,6 +155,7 @@ public sealed class Qwen4ExpIndexerCache : IDisposable
             if (ropeDim > 0)
                 RoPE.ApplyRotationNeoX(dst.Slice(0, ropeDim), ropeCos.Slice(startPos * half, half),
                                        ropeSin.Slice(startPos * half, half), ropeDim);
+            _poolStamps.Touch(block, 1);
             _tailCount = 0;
         }
     }
@@ -207,6 +218,7 @@ public sealed class Qwen4ExpIndexerCache : IDisposable
 public sealed unsafe class Qwen4ExpQsaState : IDisposable
 {
     private readonly Qwen4ExpNativeBuffer _k = new(), _v = new();
+    private readonly Qwen4ExpRowStamps _kStamps = new(), _vStamps = new();   // content identity of the own K/V rows (#840)
 
     /// <summary>Cached tokens (the indexer's token count).</summary>
     public int Length => Indexer.TokenCount;
@@ -239,14 +251,14 @@ public sealed unsafe class Qwen4ExpQsaState : IDisposable
     public void Reset() => Indexer.Reset();
 
     /// <summary>Copies another state of identical geometry (own K/V rows below <c>other.Length</c> and the indexer).</summary>
-    public void CopyFrom(Qwen4ExpQsaState other)
+    public unsafe void CopyFrom(Qwen4ExpQsaState other)
     {
         long floats = (long)other.Length * KvStride;
         if (floats > 0 && other._k.Pointer != null)
         {
             _k.EnsureCapacity(floats); _v.EnsureCapacity(floats);
-            other.Keys.CopyTo(_k.Slice(0, (int)floats));
-            other.Values.CopyTo(_v.Slice(0, (int)floats));
+            Qwen4ExpRowStamps.DeltaCopy(other._kStamps, _kStamps, other.Length, other._k.Pointer, _k.Pointer, KvStride);
+            Qwen4ExpRowStamps.DeltaCopy(other._vStamps, _vStamps, other.Length, other._v.Pointer, _v.Pointer, KvStride);
         }
         Indexer.CopyFrom(other.Indexer);
     }
@@ -261,6 +273,7 @@ public sealed unsafe class Qwen4ExpQsaState : IDisposable
         _k.EnsureCapacity(end); _v.EnsureCapacity(end);
         k.Slice(0, count * KvStride).CopyTo(_k.Slice((long)Length * KvStride, count * KvStride));
         v.Slice(0, count * KvStride).CopyTo(_v.Slice((long)Length * KvStride, count * KvStride));
+        _kStamps.Touch(Length, count); _vStamps.Touch(Length, count);
     }
 
     /// <inheritdoc/>

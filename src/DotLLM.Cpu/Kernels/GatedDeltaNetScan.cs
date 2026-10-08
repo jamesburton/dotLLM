@@ -67,6 +67,12 @@ public static class GatedDeltaNetScan
     /// without recomputing it.
     /// </param>
     /// <param name="snapshotRows">Rows to snapshot; 0 (default) records nothing.</param>
+    /// <param name="stateSource">
+    /// Optional (#840 fused checkpoint copy): when non-empty, the INITIAL state is read from this span instead of
+    /// <paramref name="state"/> (whose prior content is ignored): token 0's decay pass computes
+    /// <c>state = stateSource * g</c> instead of <c>state *= g</c>, which is bit-identical to copying the source into
+    /// <paramref name="state"/> first and then decaying in place, minus the separate copy pass.
+    /// </param>
     [SkipLocalsInit]
     public static void Execute(
         Span<float> state,
@@ -81,7 +87,8 @@ public static class GatedDeltaNetScan
         int dState,
         int seqLen,
         Span<float> rowSnapshots = default,
-        int snapshotRows = 0)
+        int snapshotRows = 0,
+        ReadOnlySpan<float> stateSource = default)
     {
         if (nVHead <= 0) throw new ArgumentOutOfRangeException(nameof(nVHead));
         if (nKHead <= 0) throw new ArgumentOutOfRangeException(nameof(nKHead));
@@ -122,7 +129,14 @@ public static class GatedDeltaNetScan
         if (rowSnapshots.Length < (long)snapshotRows * stateLen)
             throw new ArgumentException("rowSnapshots buffer too small.", nameof(rowSnapshots));
 
-        if (seqLen == 0) return;
+        bool fromSource = !stateSource.IsEmpty;
+        if (fromSource && stateSource.Length < (long)nVHead * statePerHead)
+            throw new ArgumentException("stateSource too small.", nameof(stateSource));
+        if (seqLen == 0)
+        {
+            if (fromSource) stateSource.Slice(0, stateLen).CopyTo(state);
+            return;
+        }
 
         // Temporary [DState] buffer reused across all (t, vh) iterations.
         // First used for "retrieved" (S.T @ k), then overwritten with delta (β*(v-r)).
@@ -149,8 +163,17 @@ public static class GatedDeltaNetScan
                     // stateHead[row * dState + col]: row = key dim, col = value dim.
 
                     // 1. Decay: S_vh *= g_vh  (element-wise scalar on [DState, DState])
-                    for (int i = 0; i < statePerHead; i++)
-                        stateHead[i] *= gHead;
+                    if (fromSource && t == 0)
+                    {
+                        ReadOnlySpan<float> srcHead = stateSource.Slice(vh * statePerHead, statePerHead);
+                        for (int i = 0; i < statePerHead; i++)
+                            stateHead[i] = srcHead[i] * gHead;
+                    }
+                    else
+                    {
+                        for (int i = 0; i < statePerHead; i++)
+                            stateHead[i] *= gHead;
+                    }
 
                     // 2. Retrieve: tmp[col] = Σ_row S[row,col] × k[row]  (= S.T @ k)
                     //    Row-outer traversal keeps state accesses sequential (cache-friendly).
