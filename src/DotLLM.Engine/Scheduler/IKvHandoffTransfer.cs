@@ -80,7 +80,7 @@ public sealed class CopyKvHandoffTransfer : IKvHandoffTransfer
         IKvCache destination = destinationFactory(config, source.MaxLength);
         try
         {
-            KvCacheCopy.CopyContents(source, destination, config.NumLayers);
+            KvCacheCopy.CopyContents(source, destination, DotLLM.Core.Attention.KvGeometry.SlotCount(config));
         }
         catch
         {
@@ -130,7 +130,7 @@ public sealed class StagedKvHandoffTransfer : IKvHandoffTransfer
 
             int length = source.CurrentLength;
             if (length > 0)
-                StageLayers(stagedSource, stagedDestination, config.NumLayers, length);
+                StageLayers(stagedSource, stagedDestination, DotLLM.Core.Attention.KvGeometry.SlotCount(config), length);
         }
         catch
         {

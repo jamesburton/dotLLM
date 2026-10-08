@@ -428,7 +428,7 @@ public static class ServerStartup
             Console.WriteLine($"[dotllm] Using TurboQuant KV-cache ({kvConfig.TurboQuantBits}-bit, data-oblivious" +
                 (kvConfig.TurboQuantUseQjl ? ", QJL unbiased scores)." : ")."));
             kvFactory = (cfg, size) => new TurboQuantKvCache(
-                cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, size,
+                DotLLM.Core.Attention.KvGeometry.SlotCount(cfg), cfg.NumKvHeads, cfg.HeadDim, size,
                 kvConfig.TurboQuantBits, kvConfig.TurboQuantSeed, kvConfig.TurboQuantUseQjl);
         }
 
