@@ -41,7 +41,8 @@ public static class ModelResolver
     }
 
     /// <summary>File length that sees through symlinks (a link's own <see cref="FileInfo.Length"/> is not the target's).</summary>
-    public static long FileLength(string path) => new FileInfo(ResolveLinks(path)).Length;
+    public static long FileLength(string path) =>
+        SplitGguf.IsFirstShard(Path.GetFileName(path)) ? SplitGguf.TotalLength(path) : new FileInfo(ResolveLinks(path)).Length;
 
     /// <summary>Parses a reference. Never touches the file system or the network.</summary>
     public static ModelReference Parse(string arg)
@@ -75,6 +76,8 @@ public static class ModelResolver
         void Add(LocalModel m)
         {
             if (Path.GetFileName(m.Filename).StartsWith("mmproj", StringComparison.OrdinalIgnoreCase)) return;   // multimodal projector, not a model
+            if (SplitGguf.IsLaterShard(m.Filename)) return;   // shard 2..N is part of the set listed under shard 1 (#756)
+            if (SplitGguf.IsFirstShard(m.Filename)) m = m with { SizeBytes = SplitGguf.TotalLength(m.FullPath) };
             string key = m.RepoId + "|" + m.Filename;
             if (!byKey.TryGetValue(key, out var have) || m.DownloadedAt > have.DownloadedAt) byKey[key] = m;
         }
@@ -230,12 +233,7 @@ public static class ModelResolver
         return QuantPreference.Length;
     }
 
-    private static bool IsLaterShard(string filename)
-    {
-        // "model-00002-of-00005.gguf": only shard 1 is a valid entry point.
-        var m = System.Text.RegularExpressions.Regex.Match(filename, @"-(\d{5})-of-(\d{5})\.gguf$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-        return m.Success && int.Parse(m.Groups[1].Value) > 1;
-    }
+    private static bool IsLaterShard(string filename) => SplitGguf.IsLaterShard(filename);
 
     /// <summary>
     /// Downloads the reference's file into the hub cache (resumable) and returns the mirror path. The file is chosen by tag / default quant
@@ -260,7 +258,8 @@ public static class ModelResolver
                     $"No matching .gguf in '{repo}'" + ((quant ?? reference.Tag) is { } t ? $" for tag '{t}'" : "") + ".");
         }
 
-        var result = await downloader.DownloadToHubCacheAsync(repo, file, cacheRoot: cacheRoot, modelsDir: modelsDir, progress: progress, cancellationToken: ct).ConfigureAwait(false);
+        // A split GGUF (name-00001-of-0000M.gguf) is useless without its siblings: fetch every shard, open from shard 1 (#756).
+        var result = await downloader.DownloadModelToHubCacheAsync(repo, file, cacheRoot: cacheRoot, modelsDir: modelsDir, progress: progress, cancellationToken: ct).ConfigureAwait(false);
         return result.ModelPath;
     }
 
@@ -269,9 +268,23 @@ public static class ModelResolver
     /// when exactly one blob in the repo matches the file (same length and first MiB), so another tool's data is never guessed at.
     /// Returns the bytes released, 0 when nothing was removed.
     /// </summary>
-    public static long DeleteLocal(LocalModel model, string? modelsDir = null, string? cacheRoot = null)
+    public static long DeleteLocal(LocalModel model, string? modelsDir = null, string? cacheRoot = null, bool firstShardOwnSize = false)
     {
         cacheRoot ??= HubCache.CacheRoot;
+        if (!firstShardOwnSize && SplitGguf.IsFirstShard(model.Filename))
+        {
+            // Release shards 2..N first (each is its own blob), then shard 1 with its own size.
+            long released = 0;
+            string dir = Path.GetDirectoryName(model.FullPath) ?? ".";
+            foreach (string shard in SplitGguf.ShardNames(model.Filename).Skip(1))
+            {
+                string shardPath = Path.Combine(dir, Path.GetFileName(shard));
+                long len = File.Exists(shardPath) ? new FileInfo(ResolveLinks(shardPath)).Length : 0;
+                released += DeleteLocal(new LocalModel(model.RepoId, shard, shardPath, len, model.DownloadedAt), modelsDir, cacheRoot);
+            }
+            long own = File.Exists(model.FullPath) ? new FileInfo(ResolveLinks(model.FullPath)).Length : 0;
+            return released + DeleteLocal(model with { SizeBytes = own }, modelsDir, cacheRoot, firstShardOwnSize: true);
+        }
         string repoDir = HubCache.RepoDirectory(model.RepoId, cacheRoot);
         string blobsDir = Path.Combine(repoDir, "blobs");
 

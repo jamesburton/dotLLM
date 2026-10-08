@@ -145,7 +145,7 @@ public sealed class GgufDeepSeekMoeLoaderTests
                 try
                 {
                     var bundle = TransformerWeights.LoadDeepSeekMoeLayer(
-                        layerIdx: 0, dataBase: dataBase,
+                        layerIdx: 0, dataBase: GgufDataBase.FromContiguousBase(dataBase),
                         tensors: tensors, config: config, owned: owned);
 
                     Assert.Equal(numExperts, bundle.NumExperts);
@@ -239,7 +239,7 @@ public sealed class GgufDeepSeekMoeLoaderTests
         {
             Assert.Throws<InvalidDataException>(() =>
                 TransformerWeights.LoadDeepSeekMoeLayer(
-                    layerIdx: 0, dataBase: dataBase,
+                    layerIdx: 0, dataBase: GgufDataBase.FromContiguousBase(dataBase),
                     tensors: tensors, config: config, owned: owned));
         }
         finally

@@ -726,8 +726,9 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             long modelWeightsBytes;
             if (gguf is not null)
             {
-                long fileSize = new FileInfo(resolvedPath).Length;
-                modelWeightsBytes = fileSize - gguf.DataSectionOffset;
+                modelWeightsBytes = gguf.IsSplit
+                    ? gguf.DataSectionLength
+                    : new FileInfo(resolvedPath).Length - gguf.DataSectionOffset;
             }
             else
             {

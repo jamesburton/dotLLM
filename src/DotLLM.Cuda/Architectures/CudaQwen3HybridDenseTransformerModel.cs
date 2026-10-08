@@ -614,7 +614,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         if (config.HadamardFold is { } fold)
             hadamard = CudaHadamardRotation.Create(kernels, fold, config.GdnConfig!.Value, config.NumLayers);
 
-        nint dataBase = gguf.DataBasePointer;
+        var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
         var layout = config.HybridLayout!;
         int hiddenSize = config.HiddenSize;
@@ -648,7 +648,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         // ── Output norm (always F32 [hiddenSize], dequant on host then H2D) ──
         var outNormDesc = tensors["output_norm.weight"];
         float[] outputNormHost = new float[hiddenSize];
-        Dequantize.ToFloat32(dataBase + (nint)outNormDesc.DataOffset, hiddenSize,
+        Dequantize.ToFloat32(dataBase.Of(outNormDesc), hiddenSize,
             outNormDesc.QuantizationType, outputNormHost);
         nint outputNormDevice = AllocDevice((long)hiddenSize * sizeof(float), allocs);
         fixed (float* p = outputNormHost)
@@ -739,7 +739,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         return new CudaQwen3HybridDenseTransformerModel(
             config, gguf, layers,
             tokenEmbedDevice, embDesc.QuantizationType,
-            dataBase, embDesc.DataOffset, embRowBytes,
+            dataBase.Of(embDesc), 0UL, embRowBytes,
             outputNormDevice,
             outputDevice, outputQt, outputOutputDim, outputInputDim, ownsOutputDevice,
             kvSlotForLayer, attentionLayerCount,
@@ -864,7 +864,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             hadamard = CudaHadamardRotation.Create(kernels, fold, fullConfig.GdnConfig!.Value, fullConfig.NumLayers,
                 ownedFirstLayer: 0, ownedLayerCount: numGpuLayers, ownsLmHead: false);
 
-        nint dataBase = gguf.DataBasePointer;
+        var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
         var fullLayout = fullConfig.HybridLayout!;
         int hiddenSize = fullConfig.HiddenSize;
@@ -933,7 +933,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         return new CudaQwen3HybridDenseTransformerModel(
             headConfig, gguf, layers,
             tokenEmbedDevice: 0, embDesc.QuantizationType,
-            dataBase, embDesc.DataOffset, embRowBytes,
+            dataBase.Of(embDesc), 0UL, embRowBytes,
             outputNormDevice: 0,
             outputDevice: 0, outputQt: default, outputOutputDim: 0, outputInputDim: 0,
             ownsOutputDevice: false,
@@ -1083,7 +1083,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     // ──────────────────────────────────────────────────────────────────────
 
     private static DeviceLayer LoadLayerDevice(
-        int layerIdx, nint dataBase,
+        int layerIdx, GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config, List<nint> allocs)
     {
@@ -1141,7 +1141,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     }
 
     private static DeviceGdn LoadGdnLayerDevice(
-        string prefix, nint dataBase,
+        string prefix, GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config, List<nint> allocs)
     {
@@ -1200,7 +1200,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     }
 
     private static DeviceFullAttn LoadFullAttnLayerDevice(
-        string prefix, nint dataBase,
+        string prefix, GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config, int numKvHeads, List<nint> allocs)
     {
@@ -1260,7 +1260,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     /// <c>nextn_predict_layers</c> back out of the raw <c>block_count</c>).
     /// </summary>
     private static CudaMtpHeadWeights? LoadMtpHeadIfPresent(
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config,
         List<nint> allocs)
@@ -1336,8 +1336,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         QuantizationType embedTokensQt = default;
         if (tensors.TryGetValue($"{prefix}.nextn.embed_tokens.weight", out var embedDesc))
         {
-            embedTokensHostBase = dataBase;
-            embedTokensDataOffset = embedDesc.DataOffset;
+            embedTokensHostBase = dataBase.Of(embedDesc);
+            embedTokensDataOffset = 0; // host base is already tensor-resolved (split-GGUF safe, #756)
             embedTokensRowBytes = Dequantize.RowByteSize(hiddenSize, embedDesc.QuantizationType);
             embedTokensQt = embedDesc.QuantizationType;
         }
@@ -4281,10 +4281,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         }
     }
 
-    private static nint UploadF32Tensor(nint dataBase, GgufTensorDescriptor desc, int expectedElems, List<nint>? allocs = null)
+    private static nint UploadF32Tensor(GgufDataBase dataBase, GgufTensorDescriptor desc, int expectedElems, List<nint>? allocs = null)
     {
         float[] host = new float[expectedElems];
-        Dequantize.ToFloat32(dataBase + (nint)desc.DataOffset, expectedElems,
+        Dequantize.ToFloat32(dataBase.Of(desc), expectedElems,
             desc.QuantizationType, host);
         nint device = AllocDevice((long)expectedElems * sizeof(float), allocs);
         fixed (float* p = host)
@@ -4329,13 +4329,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         return s_pq2_0RepackFunc;
     }
 
-    private static nint UploadRawTensor(nint dataBase, GgufTensorDescriptor desc, List<nint>? allocs = null)
+    private static nint UploadRawTensor(GgufDataBase dataBase, GgufTensorDescriptor desc, List<nint>? allocs = null)
     {
         int innerDim = desc.Shape[0];
         long outerDim = desc.Shape.ElementCount / innerDim;
         long bytes = Dequantize.RowByteSize(innerDim, desc.QuantizationType) * outerDim;
         nint device = AllocDevice(bytes, allocs);
-        CopyHtoD(device, dataBase + (nint)desc.DataOffset, bytes);
+        CopyHtoD(device, dataBase.Of(desc), bytes);
 
         if (desc.QuantizationType != QuantizationType.PQ2_0)
             return device;

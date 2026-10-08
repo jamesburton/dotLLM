@@ -136,7 +136,7 @@ public static class ServerStartup
             // cannot be honoured is an error (what/why/opt-in), never a CPU run. ResolvedDevice is always recorded so
             // /props and `model ps` report the same thing as an auto load does.
             string canonical = spec.Canonical;
-            long bytes = new FileInfo(resolvedPath).Length;
+            long bytes = ModelResolver.FileLength(resolvedPath);
             string name = ModelIdFor(options.Model, resolvedPath);
             if (spec.IsGpu)
             {
@@ -163,7 +163,7 @@ public static class ServerStartup
         // WARNING (console + ServerState.DeviceFallbackWarning -> /props) rather than a quiet log line (#733).
         Exception? last = null;
         var gpuFailures = new List<string>();
-        var autoPlan = DeviceSelector.Plan(spec, new FileInfo(resolvedPath).Length, Endpoints.DeviceEndpoint.Describe());
+        var autoPlan = DeviceSelector.Plan(spec, ModelResolver.FileLength(resolvedPath), Endpoints.DeviceEndpoint.Describe());
         foreach (string device in autoPlan.Candidates)
         {
             try
@@ -621,9 +621,7 @@ public static class ServerStartup
     {
         try
         {
-            if (File.ResolveLinkTarget(path, returnFinalTarget: true) is FileInfo target)
-                return target.Length;
-            return new FileInfo(path).Length;
+            return ModelResolver.FileLength(path);   // follows symlinks; sums every shard of a split GGUF (#756)
         }
         catch { return 0; }
     }

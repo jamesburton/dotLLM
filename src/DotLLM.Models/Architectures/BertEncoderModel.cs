@@ -109,7 +109,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         if (config.Architecture is not (Architecture.Bert or Architecture.NomicBert))
             throw new ArgumentException($"BertEncoderModel requires Architecture.Bert/NomicBert, got {config.Architecture}.", nameof(config));
 
-        nint dataBase = gguf.DataBasePointer;
+        var dataBase = new GgufDataBase(gguf);
         var t = gguf.TensorsByName;
         int h = config.HiddenSize;
         bool nomic = config.Architecture == Architecture.NomicBert;
@@ -122,7 +122,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         {
             var d = Req(name);
             var r = new float[n];
-            Dequantize.ToFloat32(dataBase + (nint)d.DataOffset, n, d.QuantizationType, r);
+            Dequantize.ToFloat32(dataBase.Of(d), n, d.QuantizationType, r);
             return r;
         }
 
@@ -134,7 +134,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
             int k = d.Shape[0], m = d.Shape[1];
             return new Proj
             {
-                Weight = dataBase + (nint)d.DataOffset,
+                Weight = dataBase.Of(d),
                 Qt = d.QuantizationType,
                 K = k,
                 M = m,
@@ -152,7 +152,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         nint typePtr = 0; var typeQt = QuantizationType.F32;
         if (t.TryGetValue("token_types.weight", out var typeDesc))
         {
-            typePtr = dataBase + (nint)typeDesc.DataOffset;
+            typePtr = dataBase.Of(typeDesc);
             typeQt = typeDesc.QuantizationType;
         }
 
@@ -160,7 +160,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
         if (!nomic)
         {
             var posDesc = Req("position_embd.weight");
-            posPtr = dataBase + (nint)posDesc.DataOffset;
+            posPtr = dataBase.Of(posDesc);
             posQt = posDesc.QuantizationType;
             posRows = posDesc.Shape[1];
         }
@@ -209,7 +209,7 @@ public sealed unsafe class BertEncoderModel : IModel, IEmbeddingModel
 
         return new BertEncoderModel(
             gguf, config, layers,
-            dataBase + (nint)tokDesc.DataOffset, tokDesc.QuantizationType,
+            dataBase.Of(tokDesc), tokDesc.QuantizationType,
             typePtr, typeQt, posPtr, posQt, posRows,
             Vec("token_embd_norm.weight", h), Vec("token_embd_norm.bias", h), pool,
             cos, sin, ropeRows);

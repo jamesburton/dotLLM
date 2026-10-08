@@ -2507,7 +2507,7 @@ internal sealed class VulkanWeights : IDisposable
 
         var moe = config.Moe;
         var tensors = gguf.TensorsByName;
-        nint dataBase = gguf.DataBasePointer;
+        var dataBase = new GgufDataBase(gguf);
         int hiddenSize = config.HiddenSize;
         int moeIntermediate = moe.MoeIntermediateSize;
         int numExperts = moe.NumExperts;
@@ -2541,9 +2541,9 @@ internal sealed class VulkanWeights : IDisposable
 
             totalBanks += 3;
 
-            nint gateRaw = dataBase + (nint)gateDesc.DataOffset;
-            nint upRaw = dataBase + (nint)upDesc.DataOffset;
-            nint downRaw = dataBase + (nint)downDesc.DataOffset;
+            nint gateRaw = dataBase.Of(gateDesc);
+            nint upRaw = dataBase.Of(upDesc);
+            nint downRaw = dataBase.Of(downDesc);
 
             var w1Qt = MoeRoutedRawDeviceQuantType(
                 device, gateRaw, gateDesc.QuantizationType, moeIntermediate, hiddenSize, moeIntermediate, hiddenSize);
@@ -2621,7 +2621,7 @@ internal sealed class VulkanWeights : IDisposable
 
         var moe = config.Moe;
         var tensors = gguf.TensorsByName;
-        nint dataBase = gguf.DataBasePointer;
+        var dataBase = new GgufDataBase(gguf);
         int hiddenSize = config.HiddenSize;
         int moeIntermediate = moe.MoeIntermediateSize;
 
@@ -2639,9 +2639,9 @@ internal sealed class VulkanWeights : IDisposable
                 continue; // Unexpected/missing tensor — caller must fall back to F32 for this layer.
             }
 
-            nint gateRaw = dataBase + (nint)gateDesc.DataOffset;
-            nint upRaw = dataBase + (nint)upDesc.DataOffset;
-            nint downRaw = dataBase + (nint)downDesc.DataOffset;
+            nint gateRaw = dataBase.Of(gateDesc);
+            nint upRaw = dataBase.Of(upDesc);
+            nint downRaw = dataBase.Of(downDesc);
 
             var w1Qt = MoeRoutedRawDeviceQuantType(
                 device, gateRaw, gateDesc.QuantizationType, moeIntermediate, hiddenSize, moeIntermediate, hiddenSize);

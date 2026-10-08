@@ -1278,12 +1278,12 @@ internal sealed class TransformerWeights : IDisposable
     {
         ThrowIfArchitectureNeedsDedicatedLoader(config);
 
-        nint dataBase = gguf.DataBasePointer;
+        var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
 
         // Token embeddings
         var embDesc = tensors["token_embd.weight"];
-        nint embPtr = dataBase + (nint)embDesc.DataOffset;
+        nint embPtr = dataBase.Of(embDesc);
 
         // MLA (DeepSeek-V2/V3) loads its projection tensors as F32 dequant
         // buffers since the CPU MlaAttention.Execute oracle is F32-only. Track
@@ -1356,14 +1356,14 @@ internal sealed class TransformerWeights : IDisposable
                     $"per_layer_token_embd.weight row width {pleTokDesc.Shape[0]} != numLayers*pleDim ({lp}).");
             var pleProjDesc = tensors["per_layer_model_proj.weight"];
             nint pleProjPtr = pleProjDesc.QuantizationType == QuantizationType.F32
-                ? dataBase + (nint)pleProjDesc.DataOffset      // zero-copy mmap view
+                ? dataBase.Of(pleProjDesc)      // zero-copy mmap view
                 : DequantToF32(dataBase, pleProjDesc, (long)lp * config.HiddenSize, owned!);
             float[] pleProjNorm = DequantizeNorm(
                 dataBase, tensors["per_layer_proj_norm.weight"], pleCfg.PerLayerDim);
 
             perLayerEmbedding = new PerLayerEmbeddingWeights
             {
-                EmbedTokensPerLayer = dataBase + (nint)pleTokDesc.DataOffset,
+                EmbedTokensPerLayer = dataBase.Of(pleTokDesc),
                 EmbedTokensPerLayerQt = pleTokDesc.QuantizationType,
                 ModelProjection = pleProjPtr,
                 ProjectionNorm = pleProjNorm,
@@ -1380,7 +1380,7 @@ internal sealed class TransformerWeights : IDisposable
         if (tensors.TryGetValue("rope_freqs.weight", out var ropeFreqsDesc))
         {
             ropeFreqFactors = new float[ropeFreqsDesc.Shape[0]];
-            Dequantize.ToFloat32(dataBase + (nint)ropeFreqsDesc.DataOffset,
+            Dequantize.ToFloat32(dataBase.Of(ropeFreqsDesc),
                 ropeFreqsDesc.Shape[0], ropeFreqsDesc.QuantizationType, ropeFreqFactors);
         }
 
@@ -1391,7 +1391,7 @@ internal sealed class TransformerWeights : IDisposable
 
         if (tensors.TryGetValue("output.weight", out var outDesc))
         {
-            outputPtr = dataBase + (nint)outDesc.DataOffset;
+            outputPtr = dataBase.Of(outDesc);
             outputQt = outDesc.QuantizationType;
             // GGUF: Dimensions[0] = input dim (K), Dimensions[1] = output dim (M)
             outputK = outDesc.Shape[0];
@@ -1561,7 +1561,7 @@ internal sealed class TransformerWeights : IDisposable
 
     private static TransformerLayerWeights LoadLayer(
         int layerIdx,
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config)
     {
@@ -1600,7 +1600,7 @@ internal sealed class TransformerWeights : IDisposable
         if (tensors.TryGetValue($"{prefix}.attn_qkv.weight", out var qkvDesc))
         {
             // Fused QKV — split by row offset
-            nint qkvPtr = dataBase + (nint)qkvDesc.DataOffset;
+            nint qkvPtr = dataBase.Of(qkvDesc);
             int inputDim = qkvDesc.Shape[0]; // hidden_size
             long rowBytes = Dequantize.RowByteSize(inputDim, qkvDesc.QuantizationType);
 
@@ -1626,7 +1626,7 @@ internal sealed class TransformerWeights : IDisposable
         if (tensors.TryGetValue($"{prefix}.attn_qkv.bias", out var qkvBiasDesc))
         {
             // Fused QKV bias — split by element offset
-            nint biasPtr = dataBase + (nint)qkvBiasDesc.DataOffset;
+            nint biasPtr = dataBase.Of(qkvBiasDesc);
             int qDim = config.NumAttentionHeads * layerHeadDim;
             int kvDim = layerKvHeads * layerHeadDim;
 
@@ -1744,7 +1744,7 @@ internal sealed class TransformerWeights : IDisposable
             // Fused gate+up in ffn_up.weight (Phi-3 style): output dim = 2 * intermediate_size
             // Split: first intermediate_size rows = gate, next intermediate_size rows = up
             var fusedDesc = tensors[$"{prefix}.ffn_up.weight"];
-            nint fusedPtr = dataBase + (nint)fusedDesc.DataOffset;
+            nint fusedPtr = dataBase.Of(fusedDesc);
             int inputDim = fusedDesc.Shape[0]; // hidden_size
             int fusedOutputDim = fusedDesc.Shape[1]; // 2 * intermediate_size
             int halfDim = fusedOutputDim / 2;
@@ -1756,7 +1756,7 @@ internal sealed class TransformerWeights : IDisposable
             // Fused bias split (if present)
             if (tensors.TryGetValue($"{prefix}.ffn_up.bias", out var fusedBiasDesc))
             {
-                nint biasPtr = dataBase + (nint)fusedBiasDesc.DataOffset;
+                nint biasPtr = dataBase.Of(fusedBiasDesc);
                 gateBias = new float[halfDim];
                 upBias = new float[halfDim];
                 Dequantize.ToFloat32(biasPtr, halfDim, fusedBiasDesc.QuantizationType, gateBias);
@@ -1812,7 +1812,7 @@ internal sealed class TransformerWeights : IDisposable
     /// </summary>
     private static TransformerLayerWeights LoadGemma4Layer(
         int layerIdx,
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config,
         List<nint>? owned)
@@ -1886,7 +1886,7 @@ internal sealed class TransformerWeights : IDisposable
         // layout. Small → dequant inline to F32.
         var routerDesc = tensors[$"{prefix}.ffn_gate_inp.weight"];
         float[] router = new float[(long)numExperts * hiddenSize];
-        Dequantize.ToFloat32(dataBase + (nint)routerDesc.DataOffset,
+        Dequantize.ToFloat32(dataBase.Of(routerDesc),
             (long)numExperts * hiddenSize, routerDesc.QuantizationType, router);
 
         // Fused gate_up experts ffn_gate_up_exps [K=hidden, 2*Ie, E]: per expert a
@@ -1903,7 +1903,7 @@ internal sealed class TransformerWeights : IDisposable
                 + $"does not match expected hidden={hiddenSize} × 2*Ie={2 * moeIntermediate} × E={numExperts}.");
         long gateUpRowBytes = Dequantize.RowByteSize(hiddenSize, gateUpDesc.QuantizationType);
         gateUpStride = (long)(2 * moeIntermediate) * gateUpRowBytes; // per-expert slab
-        nint gateUpBase = dataBase + (nint)gateUpDesc.DataOffset;
+        nint gateUpBase = dataBase.Of(gateUpDesc);
         nint gateExpsRaw = gateUpBase;                                       // gate rows [0, Ie)
         nint upExpsRaw = gateUpBase + (nint)((long)moeIntermediate * gateUpRowBytes); // up rows [Ie, 2*Ie)
 
@@ -1918,7 +1918,7 @@ internal sealed class TransformerWeights : IDisposable
                 + $"does not match expected Ie={moeIntermediate} × hidden={hiddenSize} × E={numExperts}.");
         long downRowBytes = Dequantize.RowByteSize(moeIntermediate, downExpsDesc.QuantizationType);
         downStride = (long)hiddenSize * downRowBytes;
-        nint downExpsRaw = dataBase + (nint)downExpsDesc.DataOffset;
+        nint downExpsRaw = dataBase.Of(downExpsDesc);
 
         // Empty F32 per-expert pointer arrays — the kernel uses the raw strided
         // views (Q4_K gate/up, Q5_1 down) and never the F32 fallback array.
@@ -1995,10 +1995,10 @@ internal sealed class TransformerWeights : IDisposable
             var pleGateDesc = tensors[$"{prefix}.inp_gate.weight"];
             var pleProjDesc = tensors[$"{prefix}.proj.weight"];
             pleGatePtr = pleGateDesc.QuantizationType == QuantizationType.F32
-                ? dataBase + (nint)pleGateDesc.DataOffset
+                ? dataBase.Of(pleGateDesc)
                 : DequantToF32(dataBase, pleGateDesc, (long)layerPle.PerLayerDim * hiddenSize, owned!);
             pleProjPtr = pleProjDesc.QuantizationType == QuantizationType.F32
-                ? dataBase + (nint)pleProjDesc.DataOffset
+                ? dataBase.Of(pleProjDesc)
                 : DequantToF32(dataBase, pleProjDesc, (long)hiddenSize * layerPle.PerLayerDim, owned!);
             plePostNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.post_norm.weight"], hiddenSize);
         }
@@ -2042,7 +2042,7 @@ internal sealed class TransformerWeights : IDisposable
     /// </remarks>
     internal static MoeLayerWeights LoadQuantExpertMoeLayer(
         int layerIdx,
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config)
     {
@@ -2058,7 +2058,7 @@ internal sealed class TransformerWeights : IDisposable
         var routerDesc = tensors[$"{prefix}.ffn_gate_inp.weight"];
         float[] router = new float[numExperts * hiddenSize];
         Dequantize.ToFloat32(
-            dataBase + (nint)routerDesc.DataOffset,
+            dataBase.Of(routerDesc),
             (long)numExperts * hiddenSize,
             routerDesc.QuantizationType,
             router);
@@ -2097,11 +2097,11 @@ internal sealed class TransformerWeights : IDisposable
             sharedDownProj: Array.Empty<nint>(),
             sharedIntermediateSize: 0,
             sharedExpertGate: null,
-            gateExpsRaw: dataBase + (nint)gateDesc.DataOffset, gateExpsRawQt: gateDesc.QuantizationType,
+            gateExpsRaw: dataBase.Of(gateDesc), gateExpsRawQt: gateDesc.QuantizationType,
             gateExpsMDim: moeIntermediate, gateExpsKDim: hiddenSize,
-            upExpsRaw: dataBase + (nint)upDesc.DataOffset, upExpsRawQt: upDesc.QuantizationType,
+            upExpsRaw: dataBase.Of(upDesc), upExpsRawQt: upDesc.QuantizationType,
             upExpsMDim: moeIntermediate, upExpsKDim: hiddenSize,
-            downExpsRaw: dataBase + (nint)downDesc.DataOffset, downExpsRawQt: downDesc.QuantizationType,
+            downExpsRaw: dataBase.Of(downDesc), downExpsRawQt: downDesc.QuantizationType,
             downExpsMDim: hiddenSize, downExpsKDim: moeIntermediate,
             sharedGateRaw: Array.Empty<nint>(), sharedGateRawQt: QuantizationType.F32,
             sharedUpRaw: Array.Empty<nint>(), sharedUpRawQt: QuantizationType.F32,
@@ -2128,9 +2128,9 @@ internal sealed class TransformerWeights : IDisposable
     }
 
     private static (nint ptr, QuantizationType qt, int outputDim, int inputDim) LoadLinear(
-        nint dataBase, GgufTensorDescriptor desc)
+        GgufDataBase dataBase, GgufTensorDescriptor desc)
     {
-        nint ptr = dataBase + (nint)desc.DataOffset;
+        nint ptr = dataBase.Of(desc);
         // GGUF: Dimensions[0] = input dim (K), Dimensions[1] = output dim (M)
         int k = desc.Shape[0];
         int m = desc.Shape[1];
@@ -2167,7 +2167,7 @@ internal sealed class TransformerWeights : IDisposable
     /// </remarks>
     private static unsafe TransformerLayerWeights LoadMlaLayer(
         int layerIdx,
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config,
         List<nint> owned,
@@ -2208,27 +2208,27 @@ internal sealed class TransformerWeights : IDisposable
         if (qLora > 0)
         {
             var qaDesc = tensors[$"{prefix}.attn_q_a.weight"];
-            qAProjRaw = dataBase + (nint)qaDesc.DataOffset;
+            qAProjRaw = dataBase.Of(qaDesc);
             qAProjRawQt = qaDesc.QuantizationType;
             qAProj = DequantToF32(dataBase, qaDesc, (long)qLora * hiddenSize, owned);
             qANorm = DequantizeNorm(dataBase, tensors[$"{prefix}.attn_q_a_norm.weight"], qLora);
 
             var qbDesc = tensors[$"{prefix}.attn_q_b.weight"];
-            qBProjRaw = dataBase + (nint)qbDesc.DataOffset;
+            qBProjRaw = dataBase.Of(qbDesc);
             qBProjRawQt = qbDesc.QuantizationType;
             qBProj = DequantToF32(dataBase, qbDesc, (long)qTotal * qLora, owned);
         }
         else
         {
             var qDesc = tensors[$"{prefix}.attn_q.weight"];
-            qProjRaw = dataBase + (nint)qDesc.DataOffset;
+            qProjRaw = dataBase.Of(qDesc);
             qProjRawQt = qDesc.QuantizationType;
             qProj = DequantToF32(dataBase, qDesc, (long)qTotal * hiddenSize, owned);
         }
 
         // ── KV path (always factored) ────────────────────────────────
         var kvaDesc = tensors[$"{prefix}.attn_kv_a_mqa.weight"];
-        nint kvAProjRaw = dataBase + (nint)kvaDesc.DataOffset;
+        nint kvAProjRaw = dataBase.Of(kvaDesc);
         QuantizationType kvAProjRawQt = kvaDesc.QuantizationType;
         nint kvAProj = DequantToF32(dataBase, kvaDesc, (long)kvAOut * hiddenSize, owned);
         float[] kvANorm = DequantizeNorm(dataBase, tensors[$"{prefix}.attn_kv_a_norm.weight"], kvLora);
@@ -2238,7 +2238,7 @@ internal sealed class TransformerWeights : IDisposable
         nint kvBProj;
         if (tensors.TryGetValue($"{prefix}.attn_kv_b.weight", out var kvbDesc))
         {
-            kvBProjRaw = dataBase + (nint)kvbDesc.DataOffset;
+            kvBProjRaw = dataBase.Of(kvbDesc);
             kvBProjRawQt = kvbDesc.QuantizationType;
             kvBProj = DequantToF32(dataBase, kvbDesc, (long)kvBOut * kvLora, owned);
         }
@@ -2413,7 +2413,7 @@ internal sealed class TransformerWeights : IDisposable
     /// for <c>ffn_down_exps</c>.</param>
     internal static unsafe MoeLayerWeights LoadDeepSeekMoeLayer(
         int layerIdx,
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config,
         List<nint> owned,
@@ -2435,7 +2435,7 @@ internal sealed class TransformerWeights : IDisposable
         var routerDesc = tensors[$"{prefix}.ffn_gate_inp.weight"];
         float[] router = new float[numExperts * hiddenSize];
         Dequantize.ToFloat32(
-            dataBase + (nint)routerDesc.DataOffset,
+            dataBase.Of(routerDesc),
             (long)numExperts * hiddenSize,
             routerDesc.QuantizationType,
             router);
@@ -2488,9 +2488,9 @@ internal sealed class TransformerWeights : IDisposable
             ? new nint[numExperts]
             : SliceExpertsToF32(dataBase, downDesc, numExperts, M: hiddenSize, K: moeIntermediate, owned);
 
-        nint gateRaw = dataBase + (nint)gateDesc.DataOffset;
-        nint upRaw = dataBase + (nint)upDesc.DataOffset;
-        nint downRaw = dataBase + (nint)downDesc.DataOffset;
+        nint gateRaw = dataBase.Of(gateDesc);
+        nint upRaw = dataBase.Of(upDesc);
+        nint downRaw = dataBase.Of(downDesc);
 
         // Shared expert (DeepSeek-V2/V3 fuses N shared into a single wider MLP).
         nint[] sharedGate = Array.Empty<nint>();
@@ -2528,11 +2528,11 @@ internal sealed class TransformerWeights : IDisposable
                 sharedDown = [DequantToF32(dataBase, sharedDownDesc, (long)hiddenSize * sharedI, owned)];
             }
 
-            sharedGateRaw = [dataBase + (nint)sharedGateDesc.DataOffset];
+            sharedGateRaw = [dataBase.Of(sharedGateDesc)];
             sharedGateRawQt = sharedGateDesc.QuantizationType;
-            sharedUpRaw = [dataBase + (nint)sharedUpDesc.DataOffset];
+            sharedUpRaw = [dataBase.Of(sharedUpDesc)];
             sharedUpRawQt = sharedUpDesc.QuantizationType;
-            sharedDownRaw = [dataBase + (nint)sharedDownDesc.DataOffset];
+            sharedDownRaw = [dataBase.Of(sharedDownDesc)];
             sharedDownRawQt = sharedDownDesc.QuantizationType;
         }
 
@@ -2546,7 +2546,7 @@ internal sealed class TransformerWeights : IDisposable
         {
             sharedExpertGate = new float[hiddenSize];
             Dequantize.ToFloat32(
-                dataBase + (nint)shGateDesc.DataOffset,
+                dataBase.Of(shGateDesc),
                 hiddenSize,
                 shGateDesc.QuantizationType,
                 sharedExpertGate);
@@ -2559,7 +2559,7 @@ internal sealed class TransformerWeights : IDisposable
             && tensors.TryGetValue($"{prefix}.exp_probs_b.bias", out var probsBDesc))
         {
             selectionBias = new float[numExperts];
-            Dequantize.ToFloat32(dataBase + (nint)probsBDesc.DataOffset, numExperts,
+            Dequantize.ToFloat32(dataBase.Of(probsBDesc), numExperts,
                 probsBDesc.QuantizationType, selectionBias);
         }
 
@@ -2607,7 +2607,7 @@ internal sealed class TransformerWeights : IDisposable
     /// which holds for every shipping DeepSeek-V2/V3 size).
     /// </remarks>
     private static unsafe nint[] SliceExpertsToF32(
-        nint dataBase, GgufTensorDescriptor desc,
+        GgufDataBase dataBase, GgufTensorDescriptor desc,
         int numExperts, int M, int K, List<nint> owned)
     {
         if (desc.Shape.Rank != 3)
@@ -2624,7 +2624,7 @@ internal sealed class TransformerWeights : IDisposable
 
         long perExpertBytes = M * Dequantize.RowByteSize(K, desc.QuantizationType);
         long perExpertElements = (long)M * K;
-        nint base_ = dataBase + (nint)desc.DataOffset;
+        nint base_ = dataBase.Of(desc);
 
         var ptrs = new nint[numExperts];
         for (int e = 0; e < numExperts; e++)
@@ -2648,21 +2648,21 @@ internal sealed class TransformerWeights : IDisposable
     /// Tracks the allocation in <paramref name="owned"/> so the loader's Dispose
     /// can free it. Returns the pointer.
     /// </summary>
-    private static unsafe nint DequantToF32(nint dataBase, GgufTensorDescriptor desc,
+    private static unsafe nint DequantToF32(GgufDataBase dataBase, GgufTensorDescriptor desc,
                                             long elementCount, List<nint> owned)
     {
         nuint bytes = (nuint)(elementCount * sizeof(float));
         nint dst = (nint)NativeMemory.AlignedAlloc(bytes, 64);
         owned.Add(dst);
-        nint src = dataBase + (nint)desc.DataOffset;
+        nint src = dataBase.Of(desc);
         Dequantize.ToFloat32(src, elementCount, desc.QuantizationType,
                               new Span<float>((void*)dst, (int)elementCount));
         return dst;
     }
 
-    private static float[] DequantizeNorm(nint dataBase, GgufTensorDescriptor desc, int expectedSize)
+    private static float[] DequantizeNorm(GgufDataBase dataBase, GgufTensorDescriptor desc, int expectedSize)
     {
-        nint ptr = dataBase + (nint)desc.DataOffset;
+        nint ptr = dataBase.Of(desc);
         float[] result = new float[expectedSize];
         Dequantize.ToFloat32(ptr, expectedSize, desc.QuantizationType, result);
         return result;
@@ -2673,7 +2673,7 @@ internal sealed class TransformerWeights : IDisposable
     /// projection (<paramref name="fullDim"/>). The on-disk length decides; any other length is an error (the plain
     /// <see cref="LoadOptionalNorm"/> would silently read just the first <c>perHeadDim</c> elements of a wider tensor).
     /// </summary>
-    private static float[]? LoadOptionalQkNorm(nint dataBase,
+    private static float[]? LoadOptionalQkNorm(GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, string name, int perHeadDim, int fullDim)
     {
         if (!tensors.TryGetValue(name, out var desc)) return null;
@@ -2687,7 +2687,7 @@ internal sealed class TransformerWeights : IDisposable
     /// <summary>
     /// Loads an optional norm weight tensor. Returns null when the tensor is absent.
     /// </summary>
-    private static float[]? LoadOptionalNorm(nint dataBase,
+    private static float[]? LoadOptionalNorm(GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, string name, int expectedSize)
     {
         if (!tensors.TryGetValue(name, out var desc)) return null;
@@ -2697,13 +2697,13 @@ internal sealed class TransformerWeights : IDisposable
     /// <summary>
     /// Loads an optional bias tensor (F32 in GGUF). Returns null when the tensor is absent.
     /// </summary>
-    private static float[]? LoadOptionalBias(nint dataBase,
+    private static float[]? LoadOptionalBias(GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, string name)
     {
         if (!tensors.TryGetValue(name, out var desc)) return null;
         int size = (int)desc.Shape.ElementCount;
         float[] result = new float[size];
-        Dequantize.ToFloat32(dataBase + (nint)desc.DataOffset, size, desc.QuantizationType, result);
+        Dequantize.ToFloat32(dataBase.Of(desc), size, desc.QuantizationType, result);
         return result;
     }
 }

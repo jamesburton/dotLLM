@@ -192,12 +192,12 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         if (config.GdnConfig is null)
             throw new ArgumentException("Qwen3HybridDense config must have GdnConfig populated.", nameof(config));
 
-        nint dataBase = gguf.DataBasePointer;
+        var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
         var layout = config.HybridLayout;
 
         var embDesc = tensors["token_embd.weight"];
-        nint embPtr = dataBase + (nint)embDesc.DataOffset;
+        nint embPtr = dataBase.Of(embDesc);
 
         var outNormDesc = tensors["output_norm.weight"];
         float[] outputNormWeight = DequantizeF32(dataBase, outNormDesc, config.HiddenSize);
@@ -207,7 +207,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         int outputM, outputK;
         if (tensors.TryGetValue("output.weight", out var outDesc))
         {
-            outputPtr = dataBase + (nint)outDesc.DataOffset;
+            outputPtr = dataBase.Of(outDesc);
             outputQt = outDesc.QuantizationType;
             outputK = outDesc.Shape[0];
             outputM = outDesc.Shape[1];
@@ -328,7 +328,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             throw new ArgumentOutOfRangeException(nameof(startLayer),
                 $"startLayer must be between 1 and {fullConfig.NumLayers - 1} for a GPU/CPU split.");
 
-        nint dataBase = gguf.DataBasePointer;
+        var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
         int tailCount = fullConfig.NumLayers - startLayer;
 
@@ -349,7 +349,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         var tailConfig = fullConfig with { NumLayers = tailCount, HybridLayout = tailLayout, NextnPredictLayers = 0 };
 
         var embDesc = tensors["token_embd.weight"];
-        nint embPtr = dataBase + (nint)embDesc.DataOffset;
+        nint embPtr = dataBase.Of(embDesc);
 
         var outNormDesc = tensors["output_norm.weight"];
         float[] outputNormWeight = DequantizeF32(dataBase, outNormDesc, fullConfig.HiddenSize);
@@ -359,7 +359,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         int outputM, outputK;
         if (tensors.TryGetValue("output.weight", out var outDesc))
         {
-            outputPtr = dataBase + (nint)outDesc.DataOffset;
+            outputPtr = dataBase.Of(outDesc);
             outputQt = outDesc.QuantizationType;
             outputK = outDesc.Shape[0];
             outputM = outDesc.Shape[1];
@@ -660,7 +660,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
     private static Qwen3HybridDenseLayerWeights LoadLayer(
         int layerIdx,
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config)
     {
@@ -700,17 +700,17 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             Gdn = tokenMixing.gdn,
             FullAttn = tokenMixing.attn,
 
-            GateWeight = dataBase + (nint)gateDesc.DataOffset,
+            GateWeight = dataBase.Of(gateDesc),
             GateQuantType = gateDesc.QuantizationType,
             GateInputDim = gateDesc.Shape[0],
             GateOutputDim = gateDesc.Shape[1],
 
-            UpWeight = dataBase + (nint)upDesc.DataOffset,
+            UpWeight = dataBase.Of(upDesc),
             UpQuantType = upDesc.QuantizationType,
             UpInputDim = upDesc.Shape[0],
             UpOutputDim = upDesc.Shape[1],
 
-            DownWeight = dataBase + (nint)downDesc.DataOffset,
+            DownWeight = dataBase.Of(downDesc),
             DownQuantType = downDesc.QuantizationType,
             DownInputDim = downDesc.Shape[0],
             DownOutputDim = downDesc.Shape[1],
@@ -719,7 +719,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
     private static GdnTokenMixingWeights LoadGdnLayer(
         string prefix,
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config)
     {
@@ -744,24 +744,24 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
         return new GdnTokenMixingWeights
         {
-            QkvWeight = dataBase + (nint)qkvDesc.DataOffset,
+            QkvWeight = dataBase.Of(qkvDesc),
             QkvQuantType = qkvDesc.QuantizationType,
             QkvInputDim = qkvDesc.Shape[0],
             QkvOutputDim = qkvDesc.Shape[1],
 
-            GateWeight = dataBase + (nint)gateDesc.DataOffset,
+            GateWeight = dataBase.Of(gateDesc),
             GateQuantType = gateDesc.QuantizationType,
             GateInputDim = gateDesc.Shape[0],
             GateOutputDim = gateDesc.Shape[1],
 
             A = a,
 
-            AlphaWeight = dataBase + (nint)alphaDesc.DataOffset,
+            AlphaWeight = dataBase.Of(alphaDesc),
             AlphaQuantType = alphaDesc.QuantizationType,
             AlphaInputDim = alphaDesc.Shape[0],
             AlphaOutputDim = alphaDesc.Shape[1],
 
-            BetaWeight = dataBase + (nint)betaDesc.DataOffset,
+            BetaWeight = dataBase.Of(betaDesc),
             BetaQuantType = betaDesc.QuantizationType,
             BetaInputDim = betaDesc.Shape[0],
             BetaOutputDim = betaDesc.Shape[1],
@@ -771,7 +771,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             DtBias = dtBias,
             SsmNormWeight = ssmNormWeight,
 
-            OutWeight = dataBase + (nint)outDesc.DataOffset,
+            OutWeight = dataBase.Of(outDesc),
             OutQuantType = outDesc.QuantizationType,
             OutInputDim = outDesc.Shape[0],
             OutOutputDim = outDesc.Shape[1],
@@ -780,7 +780,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
     private static Qwen3FullAttnWeights LoadFullAttnLayer(
         string prefix,
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config,
         int numKvHeads)
@@ -807,22 +807,22 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
 
         return new Qwen3FullAttnWeights
         {
-            QWeight = dataBase + (nint)q.DataOffset,
+            QWeight = dataBase.Of(q),
             QQuantType = q.QuantizationType,
             QInputDim = q.Shape[0],
             QOutputDim = q.Shape[1],
 
-            KWeight = dataBase + (nint)k.DataOffset,
+            KWeight = dataBase.Of(k),
             KQuantType = k.QuantizationType,
             KInputDim = k.Shape[0],
             KOutputDim = k.Shape[1],
 
-            VWeight = dataBase + (nint)v.DataOffset,
+            VWeight = dataBase.Of(v),
             VQuantType = v.QuantizationType,
             VInputDim = v.Shape[0],
             VOutputDim = v.Shape[1],
 
-            OWeight = dataBase + (nint)o.DataOffset,
+            OWeight = dataBase.Of(o),
             OQuantType = o.QuantizationType,
             OInputDim = o.Shape[0],
             OOutputDim = o.Shape[1],
@@ -850,7 +850,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
     /// <c>GGML_ASSERT(hparams.nextn_predict_layers == 1)</c> for the QWEN35 family today.
     /// </remarks>
     private static MtpHeadWeights? LoadMtpHeadIfPresent(
-        nint dataBase,
+        GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config)
     {
@@ -891,17 +891,17 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
             FullAttn = attn,
             Gdn = null,
 
-            GateWeight = dataBase + (nint)gateDesc.DataOffset,
+            GateWeight = dataBase.Of(gateDesc),
             GateQuantType = gateDesc.QuantizationType,
             GateInputDim = gateDesc.Shape[0],
             GateOutputDim = gateDesc.Shape[1],
 
-            UpWeight = dataBase + (nint)upDesc.DataOffset,
+            UpWeight = dataBase.Of(upDesc),
             UpQuantType = upDesc.QuantizationType,
             UpInputDim = upDesc.Shape[0],
             UpOutputDim = upDesc.Shape[1],
 
-            DownWeight = dataBase + (nint)downDesc.DataOffset,
+            DownWeight = dataBase.Of(downDesc),
             DownQuantType = downDesc.QuantizationType,
             DownInputDim = downDesc.Shape[0],
             DownOutputDim = downDesc.Shape[1],
@@ -915,7 +915,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         QuantizationType embedTokensQt = default;
         if (tensors.TryGetValue($"{prefix}.nextn.embed_tokens.weight", out var embedDesc))
         {
-            embedTokensPtr = dataBase + (nint)embedDesc.DataOffset;
+            embedTokensPtr = dataBase.Of(embedDesc);
             embedTokensQt = embedDesc.QuantizationType;
         }
 
@@ -923,7 +923,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         QuantizationType sharedHeadQt = default;
         if (tensors.TryGetValue($"{prefix}.nextn.shared_head_head.weight", out var sharedHeadDesc))
         {
-            sharedHeadPtr = dataBase + (nint)sharedHeadDesc.DataOffset;
+            sharedHeadPtr = dataBase.Of(sharedHeadDesc);
             sharedHeadQt = sharedHeadDesc.QuantizationType;
         }
 
@@ -935,7 +935,7 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         {
             Layer = layer,
 
-            EhProjWeight = dataBase + (nint)ehProjDesc.DataOffset,
+            EhProjWeight = dataBase.Of(ehProjDesc),
             EhProjQuantType = ehProjDesc.QuantizationType,
             EhProjInputDim = ehProjDesc.Shape[0],
             EhProjOutputDim = ehProjDesc.Shape[1],
@@ -2422,9 +2422,9 @@ public sealed unsafe class Qwen3HybridDenseTransformerModel : IModel
         GC.SuppressFinalize(this);
     }
 
-    private static float[] DequantizeF32(nint dataBase, GgufTensorDescriptor desc, int expectedSize)
+    private static float[] DequantizeF32(GgufDataBase dataBase, GgufTensorDescriptor desc, int expectedSize)
     {
-        nint ptr = dataBase + (nint)desc.DataOffset;
+        nint ptr = dataBase.Of(desc);
         float[] result = new float[expectedSize];
         Dequantize.ToFloat32(ptr, expectedSize, desc.QuantizationType, result);
         return result;

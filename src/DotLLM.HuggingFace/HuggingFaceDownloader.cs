@@ -263,6 +263,50 @@ public sealed class HuggingFaceDownloader : IDisposable
             blobPath, snapshotPath, mirrorPath, new FileInfo(blobPath).Length, hardlinked);
     }
 
+    /// <summary>
+    /// Like <see cref="DownloadToHubCacheAsync"/>, but split-GGUF aware (issue #756): when <paramref name="filename"/> is shard 1 of a
+    /// <c>name-00001-of-0000M.gguf</c> set, ALL M shards are fetched into the hub cache (each its own blob, hardlinked into the snapshot
+    /// and the mirror directory side by side - never copied) and the result describes shard 1, the entry point the engine opens. For an
+    /// ordinary file it is exactly <see cref="DownloadToHubCacheAsync"/>. Progress is cumulative over the whole set.
+    /// </summary>
+    /// <param name="repoId">Repository ID.</param>
+    /// <param name="filename">Filename within the repo (shard 1 for a split set).</param>
+    /// <param name="revision">Git revision; defaults to <c>main</c>.</param>
+    /// <param name="cacheRoot">Hub cache root.</param>
+    /// <param name="modelsDir">Mirror root.</param>
+    /// <param name="progress">Cumulative progress callback.</param>
+    /// <param name="cancellationToken">Cancels the transfer.</param>
+    /// <param name="totalBytesHint">Sum of all shard sizes when known (from the repo listing); lets progress report a total across shards.</param>
+    public async Task<HubCacheDownloadResult> DownloadModelToHubCacheAsync(
+        string repoId, string filename, string? revision = null, string? cacheRoot = null, string? modelsDir = null,
+        IProgress<(long bytesDownloaded, long? totalBytes)>? progress = null, CancellationToken cancellationToken = default,
+        long? totalBytesHint = null)
+    {
+        var names = SplitGguf.ShardNames(filename);
+        if (names.Count == 1 || !SplitGguf.IsFirstShard(filename))
+            return await DownloadToHubCacheAsync(repoId, filename, revision, cacheRoot, modelsDir, progress, cancellationToken).ConfigureAwait(false);
+
+        HubCacheDownloadResult first = default;
+        long done = 0;
+        for (int i = 0; i < names.Count; i++)
+        {
+            long before = done;
+            bool last = i == names.Count - 1;
+            var shardProgress = progress is null ? null : new SyncProgress((b, t) =>
+                progress.Report((before + b, totalBytesHint ?? (last && t is not null ? before + t : null))));
+            var r = await DownloadToHubCacheAsync(repoId, names[i], revision, cacheRoot, modelsDir, shardProgress, cancellationToken).ConfigureAwait(false);
+            done += r.SizeBytes;
+            if (i == 0) first = r;
+        }
+        progress?.Report((done, done));
+        return first with { SizeBytes = done };
+    }
+
+    private sealed class SyncProgress(Action<long, long?> report) : IProgress<(long bytesDownloaded, long? totalBytes)>
+    {
+        public void Report((long bytesDownloaded, long? totalBytes) v) => report(v.bytesDownloaded, v.totalBytes);
+    }
+
     private HttpClient? _metadataClient;
 
     /// <summary>
