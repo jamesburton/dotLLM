@@ -1,5 +1,7 @@
 using System.Buffers;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -73,6 +75,13 @@ public static class GatedDeltaNetScan
     /// <c>state = stateSource * g</c> instead of <c>state *= g</c>, which is bit-identical to copying the source into
     /// <paramref name="state"/> first and then decaying in place, minus the separate copy pass.
     /// </param>
+    /// <param name="deltaRecord">
+    /// Optional (#842): receives each value head's delta <c>d = beta * (v - S.T k)</c> (the vector of the rank-1 write
+    /// <c>S += outer(k, d)</c>) for the first <paramref name="snapshotRows"/> tokens, token <c>t</c>, head <c>vh</c> at
+    /// <c>(t * NVHead + vh) * DState</c>. With the decay <c>g</c> and the key <c>k</c> (already in the caller's hands) it is all
+    /// <see cref="Replay"/> needs to rebuild the state after any of those tokens from the state BEFORE the chunk, instead of storing
+    /// a full state per row. Independent of <paramref name="rowSnapshots"/>.
+    /// </param>
     [SkipLocalsInit]
     public static void Execute(
         Span<float> state,
@@ -88,7 +97,8 @@ public static class GatedDeltaNetScan
         int seqLen,
         Span<float> rowSnapshots = default,
         int snapshotRows = 0,
-        ReadOnlySpan<float> stateSource = default)
+        ReadOnlySpan<float> stateSource = default,
+        Span<float> deltaRecord = default)
     {
         if (nVHead <= 0) throw new ArgumentOutOfRangeException(nameof(nVHead));
         if (nKHead <= 0) throw new ArgumentOutOfRangeException(nameof(nKHead));
@@ -126,8 +136,12 @@ public static class GatedDeltaNetScan
         if ((uint)snapshotRows > (uint)seqLen)
             throw new ArgumentOutOfRangeException(nameof(snapshotRows));
         int stateLen = nVHead * statePerHead;
-        if (rowSnapshots.Length < (long)snapshotRows * stateLen)
+        bool recordStates = !rowSnapshots.IsEmpty;
+        if (recordStates && rowSnapshots.Length < (long)snapshotRows * stateLen)
             throw new ArgumentException("rowSnapshots buffer too small.", nameof(rowSnapshots));
+        bool recordDeltas = !deltaRecord.IsEmpty;
+        if (recordDeltas && deltaRecord.Length < (long)snapshotRows * nVHead * dState)
+            throw new ArgumentException("deltaRecord buffer too small.", nameof(deltaRecord));
 
         bool fromSource = !stateSource.IsEmpty;
         if (fromSource && stateSource.Length < (long)nVHead * statePerHead)
@@ -192,6 +206,8 @@ public static class GatedDeltaNetScan
                     //    S[row,col] += k[row] × tmp[col]       // rank-1 update
                     for (int col = 0; col < dState; col++)
                         tmp[col] = betaHead * (vHead[col] - tmp[col]);
+                    if (recordDeltas && t < snapshotRows)
+                        tmp.CopyTo(deltaRecord.Slice((t * nVHead + vh) * dState, dState));
 
                     for (int row = 0; row < dState; row++)
                     {
@@ -216,13 +232,87 @@ public static class GatedDeltaNetScan
                         outHead[col] *= scale;
                 }
 
-                if (t < snapshotRows)
+                if (recordStates && t < snapshotRows)
                     state.Slice(0, stateLen).CopyTo(rowSnapshots.Slice(t * stateLen, stateLen));
             }
         }
         finally
         {
             ArrayPool<float>.Shared.Return(tmpBuf);
+        }
+    }
+
+    /// <summary>
+    /// Rebuilds the state after the first <paramref name="rows"/> tokens of a chunk from the state BEFORE the chunk, using only the
+    /// per-token decay, key and delta that <see cref="Execute"/> produced (#842): per token and head
+    /// <c>S = S * g + outer(k, d)</c>. Performs exactly the floating-point operations of the scan's decay pass and rank-1 write
+    /// (separate multiply and add, no FMA contraction), so the result is BIT-IDENTICAL to the state the scan leaves after that token,
+    /// while the per-row cost of keeping it is <c>NVHead * (1 + 2 * DState)</c> floats instead of a whole <c>NVHead * DState^2</c> state.
+    /// </summary>
+    /// <param name="state">Receives the rebuilt state <c>[NVHead, DState, DState]</c> (prior content ignored when <paramref name="source"/> is given).</param>
+    /// <param name="source">The state before the chunk; empty means <paramref name="state"/> already holds it.</param>
+    /// <param name="k">The scan's L2-normalised keys <c>[tokens, NKHead * DState]</c>.</param>
+    /// <param name="g">The scan's decays <c>[tokens, NVHead]</c>.</param>
+    /// <param name="delta">The scan's recorded deltas <c>[tokens, NVHead, DState]</c> (<c>deltaRecord</c>).</param>
+    /// <param name="nVHead">Value heads.</param>
+    /// <param name="nKHead">Key heads (value head <c>vh</c> uses key head <c>vh % NKHead</c>).</param>
+    /// <param name="dState">Per-head state dimension.</param>
+    /// <param name="rows">Tokens to replay (&gt;= 1).</param>
+    public static void Replay(Span<float> state, ReadOnlySpan<float> source, ReadOnlySpan<float> k, ReadOnlySpan<float> g,
+                              ReadOnlySpan<float> delta, int nVHead, int nKHead, int dState, int rows)
+    {
+        if (rows < 0) throw new ArgumentOutOfRangeException(nameof(rows));
+        int per = dState * dState, stateLen = nVHead * per, qk = nKHead * dState;
+        if (state.Length < stateLen) throw new ArgumentException("state too small.", nameof(state));
+        if (!source.IsEmpty && source.Length < stateLen) throw new ArgumentException("source too small.", nameof(source));
+        if (rows == 0)
+        {
+            if (!source.IsEmpty) source.Slice(0, stateLen).CopyTo(state);
+            return;
+        }
+        if (k.Length < (long)rows * qk || g.Length < (long)rows * nVHead || delta.Length < (long)rows * nVHead * dState)
+            throw new ArgumentException("replay inputs too small.");
+
+        for (int t = 0; t < rows; t++)
+        {
+            for (int vh = 0; vh < nVHead; vh++)
+            {
+                int kh = vh % nKHead;
+                float gHead = g[t * nVHead + vh];
+                ReadOnlySpan<float> kHead = k.Slice(t * qk + kh * dState, dState);
+                ReadOnlySpan<float> dHead = delta.Slice((t * nVHead + vh) * dState, dState);
+                Span<float> sHead = state.Slice(vh * per, per);
+                ReadOnlySpan<float> from = t == 0 && !source.IsEmpty ? source.Slice(vh * per, per) : sHead;
+                for (int row = 0; row < dState; row++)
+                    ReplayRow(from.Slice(row * dState, dState), sHead.Slice(row * dState, dState), dHead, kHead[row], gHead);
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ReplayRow(ReadOnlySpan<float> src, Span<float> dst, ReadOnlySpan<float> d, float ki, float g)
+    {
+        int col = 0, n = dst.Length;
+        if (Vector256.IsHardwareAccelerated)
+        {
+            var gv = Vector256.Create(g);
+            var kv = Vector256.Create(ki);
+            ref float sr = ref MemoryMarshal.GetReference(src);
+            ref float dr = ref MemoryMarshal.GetReference(dst);
+            ref float er = ref MemoryMarshal.GetReference(d);
+            for (; col + Vector256<float>.Count <= n; col += Vector256<float>.Count)
+            {
+                // separate multiply / multiply / add: the scan's `S *= g` then `S += k * d`, rounded identically (no FMA)
+                var scaled = Vector256.Multiply(Vector256.LoadUnsafe(ref sr, (nuint)col), gv);
+                var write = Vector256.Multiply(kv, Vector256.LoadUnsafe(ref er, (nuint)col));
+                Vector256.Add(scaled, write).StoreUnsafe(ref dr, (nuint)col);
+            }
+        }
+        for (; col < n; col++)
+        {
+            float scaled = src[col] * g;
+            float write = ki * d[col];
+            dst[col] = scaled + write;
         }
     }
 
