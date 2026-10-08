@@ -134,9 +134,6 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         if (problems.Count > 0)
             throw new InvalidDataException("qwen4exp tensor table does not match the model contract: " +
                                            string.Join("; ", problems.Take(8)) + (problems.Count > 8 ? $"; (+{problems.Count - 8} more)" : ""));
-        if (q4.Ple is { } ple0 && ple0.Layers.Count > 1)
-            throw new NotSupportedException("qwen4exp files carry one set of PLE hash constants; several PLE layers cannot be represented.");
-
         var owned = new List<nint>();
         try
         {
@@ -224,15 +221,17 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
 
             if (q4.Ple is { } ple && ple.Layers.Contains(il))
             {
+                // module index = position in the (ascending) layer list: selects this module's own hash constants (HF ple_layer_index)
+                int module = ple.Layers.ToList().IndexOf(il);
                 var tdesc = tensors[Qwen4ExpTensors.PerLayerTokenEmbd];
                 int rowDim = ple.RowDim;
                 var convRaw = F32(b + "ple_conv1d.weight", (long)ple.ConvKernel * hcDim);   // [C][K] (K fastest)
                 block.Ple = new Qwen4ExpPleBranch(
                     gguf.TensorDataPointer(tdesc), tdesc.QuantizationType, tdesc.Shape[1], rowDim,
                     ple.NgramSize, ple.HeadsPerNgram, ple.EosTokenId, ple.ConvKernel,
-                    ple.LayerMultipliers.Select(v => unchecked((long)v)).ToArray(),
-                    ple.HeadOffsets.Select(v => checked((long)v)).ToArray(),
-                    ple.HeadVocabSizes.Select(v => checked((long)v)).ToArray(),
+                    ple.MultipliersOf(module).Select(v => unchecked((long)v)).ToArray(),
+                    ple.HeadOffsetsOf(module).Select(v => checked((long)v)).ToArray(),
+                    ple.HeadVocabSizesOf(module).Select(v => checked((long)v)).ToArray(),
                     hc, hidden, config.NormEpsilon,
                     F32(b + "ple_norm_key.weight", hcDim), F32(b + "ple_norm_query.weight", hcDim), F32(b + "ple_norm_conv.weight", hcDim),
                     Qwen4ExpPle.TransposeConvWeight(convRaw, hcDim, ple.ConvKernel),
@@ -419,8 +418,37 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
                            Qwen4ExpSequenceState state, bool lastTokenLogitsOnly = false)
         => ForwardCore(tokenIds, positions, deviceId, state, null, lastTokenLogitsOnly, snapRows: 0);
 
+    /// <summary>
+    /// Token id that marks a position whose input embedding the caller supplies instead of the token-embedding row (an image patch from a
+    /// vision tower). The supplied rows go in <c>externalEmbeddings</c>, in position order, <c>hidden</c> floats each.
+    /// </summary>
+    /// <remarks>
+    /// The PLE branch hashes TOKEN IDS, which an embedding row does not have: HF passes the original <c>input_ids</c> (the image
+    /// placeholder, <c>image_token_id</c>) as <c>ple_input_ids</c>, and llama.cpp substitutes the GGUF <c>ple.image_token_id</c>
+    /// stand-in (falling back to the EOS id for files written before the key existed). This model does the latter for sentinel positions,
+    /// so a file whose <c>ple.image_token_id</c> equals the placeholder id reproduces HF exactly.
+    /// </remarks>
+    public const int ExternalEmbeddingToken = -1;
+
+    /// <summary>
+    /// Forward over a caller-owned sequence state where some positions carry externally supplied embeddings (image tokens): every
+    /// <paramref name="tokenIds"/> entry equal to <see cref="ExternalEmbeddingToken"/> takes its input embedding from the next
+    /// <c>hidden</c> floats of <paramref name="externalEmbeddings"/>, and is seen by the PLE hash as the image stand-in id.
+    /// </summary>
+    /// <param name="tokenIds">Token ids; <see cref="ExternalEmbeddingToken"/> marks an external-embedding position.</param>
+    /// <param name="positions">Absolute positions (continuing <paramref name="state"/>).</param>
+    /// <param name="deviceId">Device id for the returned tensor.</param>
+    /// <param name="state">Sequence state; advanced by <c>tokenIds.Length</c>.</param>
+    /// <param name="kvCache">Engine KV cache for the QSA rows, or null.</param>
+    /// <param name="lastTokenLogitsOnly">Return only the last row's logits.</param>
+    /// <param name="externalEmbeddings">One <c>hidden</c>-wide row per sentinel position, in order.</param>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                           Qwen4ExpSequenceState state, IKvCache? kvCache, bool lastTokenLogitsOnly, ReadOnlySpan<float> externalEmbeddings)
+        => ForwardCore(tokenIds, positions, deviceId, state, kvCache, lastTokenLogitsOnly, snapRows: 0, externalEmbeddings);
+
     private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
-                                Qwen4ExpSequenceState state, IKvCache? kvCache, bool lastTokenLogitsOnly, int snapRows)
+                                Qwen4ExpSequenceState state, IKvCache? kvCache, bool lastTokenLogitsOnly, int snapRows,
+                                ReadOnlySpan<float> externalEmbeddings = default)
     {
         ArgumentNullException.ThrowIfNull(state);
         int T = tokenIds.Length;
@@ -434,13 +462,17 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         if (kvCache is not null) ValidateKvCache(kvCache, state.Length);
         if (snapRows > 0 && !ReferenceEquals(state, _defaultState))
             throw new InvalidOperationException("Row snapshots are only recorded on the model-owned state.");
+        int external = 0;
+        for (int i = 0; i < T; i++) if (tokenIds[i] == ExternalEmbeddingToken) external++;
+        if ((long)external * _hidden != externalEmbeddings.Length)
+            throw new ArgumentException($"{external} external-embedding position(s) need {(long)external * _hidden} floats, got {externalEmbeddings.Length}.", nameof(externalEmbeddings));
         _snapValid = false;   // any forward moves the live state on: earlier row snapshots no longer describe it
         foreach (var p in state.Ple) p?.InvalidateRows();
         foreach (var q in state.Qsa) q?.Indexer.InvalidateRows();
         if (snapRows > 0) BeginRowRecording(state, snapRows, T);
         try
         {
-            return ForwardBody(tokenIds, deviceId, state, kvCache, lastTokenLogitsOnly, snapRows);
+            return ForwardBody(tokenIds, deviceId, state, kvCache, lastTokenLogitsOnly, snapRows, externalEmbeddings);
         }
         finally
         {
@@ -467,7 +499,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
     }
 
     private ITensor ForwardBody(ReadOnlySpan<int> tokenIds, int deviceId, Qwen4ExpSequenceState state, IKvCache? kvCache,
-                                bool lastTokenLogitsOnly, int snapRows)
+                                bool lastTokenLogitsOnly, int snapRows, ReadOnlySpan<float> externalEmbeddings)
     {
         int T = tokenIds.Length;
         _threadPool?.SetDispatchMode(T == 1 ? DispatchMode.SpinWait : DispatchMode.EventBased);
@@ -481,9 +513,19 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         float[] h = ArrayPool<float>.Shared.Rent(T * H);
         float[] y = ArrayPool<float>.Shared.Rent(T * H);
         float[] gains = ArrayPool<float>.Shared.Rent(T * S);
+        // The ids the PLE hash sees: image positions (no token id) take the GGUF stand-in, everything else is the token itself.
+        int[]? pleIdBuf = null;
         try
         {
-            EmbedTokens(tokenIds, emb);
+            ReadOnlySpan<int> pleIds = tokenIds;
+            if (!externalEmbeddings.IsEmpty && Config.Qwen4Exp!.Ple is { } pleCfg)
+            {
+                pleIdBuf = ArrayPool<int>.Shared.Rent(T);
+                int stand = pleCfg.ImageTokenId ?? pleCfg.EosTokenId;
+                for (int t = 0; t < T; t++) pleIdBuf[t] = tokenIds[t] == ExternalEmbeddingToken ? stand : tokenIds[t];
+                pleIds = pleIdBuf.AsSpan(0, T);
+            }
+            EmbedTokens(tokenIds, emb, externalEmbeddings);
             Qwen4ExpGatedResidual.Broadcast(emb, S, H, res, T);
             if (Trace is { } tr0) tr0("embed", emb.AsSpan(0, T * H), T, H);
 
@@ -491,7 +533,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
             {
                 var blk = _blocks[il];
                 if (blk.Ple is { } ple)
-                    ple.Apply(tokenIds, state.Ple[il]!, res.AsSpan(0, T * row));
+                    ple.Apply(pleIds, state.Ple[il]!, res.AsSpan(0, T * row));
 
                 // ── token mixer ──
                 GrRead(blk.AttnGr, res, xn, low, mix, h, gains, T, wantInject: true);
@@ -527,6 +569,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
             ArrayPool<float>.Shared.Return(emb); ArrayPool<float>.Shared.Return(res); ArrayPool<float>.Shared.Return(xn);
             ArrayPool<float>.Shared.Return(low); ArrayPool<float>.Shared.Return(mix); ArrayPool<float>.Shared.Return(h);
             ArrayPool<float>.Shared.Return(y); ArrayPool<float>.Shared.Return(gains);
+            if (pleIdBuf is not null) ArrayPool<int>.Shared.Return(pleIdBuf);
         }
     }
 
@@ -551,12 +594,17 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         }
     }
 
-    private void EmbedTokens(ReadOnlySpan<int> tokenIds, float[] dest)
+    private void EmbedTokens(ReadOnlySpan<int> tokenIds, float[] dest, ReadOnlySpan<float> externalEmbeddings = default)
     {
-        int H = _hidden;
+        int H = _hidden, nextExternal = 0;
         for (int t = 0; t < tokenIds.Length; t++)
         {
             int id = tokenIds[t];
+            if (id == ExternalEmbeddingToken)
+            {
+                externalEmbeddings.Slice(nextExternal++ * H, H).CopyTo(dest.AsSpan(t * H, H));
+                continue;
+            }
             if ((uint)id >= (uint)Config.VocabSize)
                 throw new ArgumentOutOfRangeException(nameof(tokenIds), $"Token ID {id} at position {t} is out of range [0, {Config.VocabSize}).");
             long rowBytes = Dequantize.RowByteSize(H, _tokenEmbedQt);

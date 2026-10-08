@@ -299,9 +299,19 @@ public sealed class Qwen4ExpConfigTests : IDisposable
     }
 
     [Fact]
-    public void Extract_MultiplePleLayers_AreRefusedAsUnsupported()
+    public void Extract_MultiplePleLayers_WithASingleSetOfConstants_AreRefusedWithAnExplanation()
     {
-        Assert.Throws<NotSupportedException>(() => ExtractMutated(d => d["qwen4exp.ple.layers"] = I32Array(0, 1)));
+        // Two modules need one set of hash constants each (HF derives them per ple_layer_index); a llama.cpp-style single set cannot describe them.
+        var ex = Assert.Throws<NotSupportedException>(() => ExtractMutated(d => d["qwen4exp.ple.layers"] = I32Array(0, 1)));
+        Assert.Contains("one set per layer", ex.Message);
+    }
+
+    [Fact]
+    public void Extract_PleLayers_MustBeStrictlyAscending()
+    {
+        // HF numbers a module by its position in the sorted, de-duplicated list; an unsorted / repeated list would silently re-number them.
+        Assert.Throws<InvalidDataException>(() => ExtractMutated(d => d["qwen4exp.ple.layers"] = I32Array(1, 1)));
+        Assert.Throws<InvalidDataException>(() => ExtractMutated(d => d["qwen4exp.ple.layers"] = I32Array(2, 1)));
     }
 
     [Fact]
