@@ -604,8 +604,11 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
             TensorPrimitives.Sigmoid(beta.AsSpan(0, T * nV), beta.AsSpan(0, T * nV));
 
             // causal conv over [conv_state | qkv] then SiLU
-            var convState = cache.GetConvState(ordinal);
-            convState.CopyTo(convIn.AsSpan(0, (dC - 1) * convDim));
+            // A pending (lazily checkpointed / restored) layer reads its input from the source cache here and in the scan's
+            // first token, and writes the result into its own buffers: the state copy is fused into work done anyway (#840).
+            cache.BeginUpdate(ordinal, out var srcConv, out var srcGdn);
+            var convState = cache.GetConvStateForUpdate(ordinal);
+            (srcConv.IsEmpty ? convState : srcConv).Slice(0, (dC - 1) * convDim).CopyTo(convIn.AsSpan(0, (dC - 1) * convDim));
             qkv.AsSpan(0, T * convDim).CopyTo(convIn.AsSpan((dC - 1) * convDim));
             Conv1dCausal.Execute(convIn.AsSpan(0, (dC - 1 + T) * convDim), w.Conv1dWeight, w.Conv1dBias,
                                  qkv.AsSpan(0, T * convDim), dC, convDim, T);
@@ -626,10 +629,11 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
             GatedDeltaNetScan.L2NormalizeHeads(q.AsSpan(0, T * kDim), dS);
             GatedDeltaNetScan.L2NormalizeHeads(k.AsSpan(0, T * kDim), dS);
 
-            GatedDeltaNetScan.Execute(cache.GetGdnState(ordinal), q.AsSpan(0, T * kDim), k.AsSpan(0, T * kDim),
+            GatedDeltaNetScan.Execute(cache.GetGdnStateForUpdate(ordinal), q.AsSpan(0, T * kDim), k.AsSpan(0, T * kDim),
                                       v.AsSpan(0, T * vDim), alpha.AsSpan(0, T * nV), beta.AsSpan(0, T * nV),
                                       core.AsSpan(0, T * vDim), nV, nK, dS, T,
-                                      rowSnapshots: rowsToSnap > 0 ? RowSnapshotGdnLayer(ordinal) : default, snapshotRows: rowsToSnap);
+                                      rowSnapshots: rowsToSnap > 0 ? RowSnapshotGdnLayer(ordinal) : default, snapshotRows: rowsToSnap,
+                                      stateSource: srcGdn);
 
             // per-head RMSNorm(core, ssm_norm) * sigmoid(z)
             for (int t = 0; t < T; t++)
@@ -759,6 +763,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         {
             var s = Interlocked.Exchange(ref _shell, null);
             if (s is null) return;
+            owner._defaultState.ReleaseSource(s);   // the live state may still lazily read its GDN from this shell
             if (Interlocked.CompareExchange(ref owner._spareCheckpoint, s, null) is not null) s.Dispose();
         }
     }
@@ -768,16 +773,17 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
 
     /// <inheritdoc/>
     /// <remarks>
-    /// A full, independent copy: the GDN state (~113 MiB at the released size), the PLE window + conv history, the QSA indexers'
-    /// pooled keys + tails (128 B per token per QSA layer) and, when the state keeps its K/V rows itself, those too. K/V rows
-    /// in an engine KV cache are position-addressed: the caller rolls that cache back. Because the copy is complete it is also
-    /// a valid prefix snapshot after the live state has moved to a different history. One shell is pooled across rounds.
-    /// Incremental (delta) capture for the speculative path is a possible later optimisation.
+    /// Logically a full, independent copy (GDN ~113 MiB at the released size, the PLE window + conv history, the QSA indexers'
+    /// pooled keys + tails and, when the state keeps its K/V rows itself, those too), so it stays a valid prefix snapshot after
+    /// the live state has moved to a different history (#840: physically incremental). The GDN buffers are exchanged with the
+    /// pooled shell instead of copied and the live state defers its content from the checkpoint until the next forward, whose
+    /// first step reads it (fused copy); pooled keys / own K/V rows are copied only where their content stamps differ from what
+    /// the shell last synced. K/V rows in an engine KV cache are position-addressed: the caller rolls that cache back.
     /// </remarks>
     public object? CheckpointRecurrentState()
     {
         var shell = Interlocked.Exchange(ref _spareCheckpoint, null) ?? CreateState();
-        shell.CopyFrom(_defaultState);
+        _defaultState.CaptureInto(shell);
         return new StateCheckpoint(this, shell);
     }
 
@@ -789,7 +795,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
             throw new ArgumentException(
                 $"{GetType().Name}.RestoreRecurrentState expects a checkpoint from this model's CheckpointRecurrentState; got {checkpoint.GetType().Name}.",
                 nameof(checkpoint));
-        _defaultState.CopyFrom(cp.Shell);
+        _defaultState.RestoreFrom(cp.Shell);
         _snapValid = false;
         foreach (var p in _defaultState.Ple) p?.InvalidateRows();
         foreach (var q in _defaultState.Qsa) q?.Indexer.InvalidateRows();
@@ -848,8 +854,9 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         var st = _defaultState;
         for (int l = 0; l < _numGdn; l++)
         {
-            RowSnapshotGdn(l, row).CopyTo(st.Gdn.GetGdnState(l));
-            RowSnapshotConv(l, row).CopyTo(st.Gdn.GetConvState(l));
+            st.Gdn.DiscardPending(l);   // fully overwritten below: no point materialising a lazy copy first
+            RowSnapshotGdn(l, row).CopyTo(st.Gdn.GetGdnStateForUpdate(l));
+            RowSnapshotConv(l, row).CopyTo(st.Gdn.GetConvStateForUpdate(l));
         }
         foreach (var p in st.Ple) p?.RestoreRow(row);
         foreach (var q in st.Qsa) q?.Indexer.RestoreToRow(row);

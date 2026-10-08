@@ -136,8 +136,10 @@ Differences between architectures are captured entirely in ModelConfig.
     layer's pooled indexer keys + raw tail are native memory; the QSA K/V rows live in the engine `IKvCache` (slot = QSA ordinal, stride
     `nKv*headDim`; `KvGeometry.FromConfig` over-allocates the 36 unused GDN slots, as for the other hybrids) or, with no cache, in a lazily allocated
     native store inside the state. Implements `CreateSequenceState`/`SupportsThreadedSequenceState`, `ForwardBatch` (per-sequence loop, last-row
-    logits), `CheckpointRecurrentState`/`RestoreRecurrentState` (a FULL copy incl. pooled keys, so it is valid after the live state moved to another
-    history), per-row snapshots (`ForwardWithRecurrentSnapshots`/`RestoreRecurrentStateToRow`: GDN via the scan snapshots, PLE history and the indexer
+    logits), `CheckpointRecurrentState`/`RestoreRecurrentState` (logically a full copy, so valid after the live state moved to another history, but
+    physically incremental, #840: the GDN buffers are exchanged with the pooled shell and the live state lazily reads them in the next forward's first
+    scan step - `GatedDeltaNetScan.Execute(stateSource:)`, bit-identical, no separate copy pass - and pooled keys / own K/V rows are copied only
+    where their `Qwen4ExpRowStamps` content stamps differ; at the released size 4-12 ms -> ~0.1 ms per checkpoint and per restore, see PR #840), per-row snapshots (`ForwardWithRecurrentSnapshots`/`RestoreRecurrentStateToRow`: GDN via the scan snapshots, PLE history and the indexer
     tail rebuilt from the recorded chunk) and `SnapshotSequencePrefix`/`RestoreSequencePrefix`. Accounting: `Qwen4ExpStateBytes.Estimate(config, ctx)` /
     `model.EstimateSequenceStateBytes(ctx)` split into Gdn (~113 MiB at the released size, constant), Ple, IndexerTail (constant), IndexerPooled
     (128 B per token per QSA layer) and Kv; `state.ResidentBytes` is the allocated counterpart. Exact (bit-identical) rollback holds between runs that

@@ -112,6 +112,55 @@ public sealed class Qwen4ExpSequenceState : IGdnState
     }
 
     /// <summary>
+    /// Captures this state into <paramref name="shell"/> (same model geometry) as a checkpoint, cheaply (#840): the GDN part
+    /// (~113 MiB) is NOT copied: the shell takes this state's buffers and this state takes the shell's stale ones, lazily pointing
+    /// at the shell (<see cref="GdnStateCache.DeferCopyFrom"/>), so the copy is fused into the next forward's first step. The QSA
+    /// indexers / own K/V rows are delta-copied by content stamps, the small PLE window and the tails are copied. The shell must
+    /// stay unmodified and undisposed while this state still defers from it (see <see cref="ReleaseSource"/>).
+    /// </summary>
+    internal void CaptureInto(Qwen4ExpSequenceState shell)
+    {
+        if (shell.Ple.Length != Ple.Length) throw new ArgumentException("state geometry mismatch.", nameof(shell));
+        Gdn.MaterializePending();
+        shell.Gdn.MaterializePending();
+        shell.Gdn.SwapBuffersWith(Gdn);
+        Gdn.DeferCopyFrom(shell.Gdn);
+        for (int i = 0; i < Ple.Length; i++)
+        {
+            if (Ple[i] is { } p) shell.Ple[i]!.CopyFrom(p);
+            if (Qsa[i] is { } q) shell.Qsa[i]!.CopyFrom(q);
+        }
+        shell.Length = Length;
+    }
+
+    /// <summary>
+    /// Rolls this state back to <paramref name="shell"/> (a <see cref="CaptureInto"/> checkpoint, which stays valid and can be
+    /// restored again): GDN is deferred (no copy; fused into the next forward), the rest delta-copied.
+    /// </summary>
+    internal void RestoreFrom(Qwen4ExpSequenceState shell)
+    {
+        if (shell.Ple.Length != Ple.Length) throw new ArgumentException("state geometry mismatch.", nameof(shell));
+        Gdn.DeferCopyFrom(shell.Gdn);
+        for (int i = 0; i < Ple.Length; i++)
+        {
+            if (Ple[i] is { } p) p.CopyFrom(shell.Ple[i]!);
+            if (Qsa[i] is { } q) q.CopyFrom(shell.Qsa[i]!);
+        }
+        Length = shell.Length;
+    }
+
+    /// <summary>
+    /// Completes any lazy GDN copy that still reads from <paramref name="shell"/> (call before the shell is reused or freed). When
+    /// nothing has consumed it yet (the usual restore-then-dispose) the buffers are exchanged instead of copied: the released shell's
+    /// content is dead anyway.
+    /// </summary>
+    internal void ReleaseSource(Qwen4ExpSequenceState shell)
+    {
+        if (!Gdn.IsPendingOn(shell.Gdn)) return;
+        if (!Gdn.TryTakeSourceBuffers(shell.Gdn)) Gdn.MaterializePending();
+    }
+
+    /// <summary>
     /// Resident bytes split by owner (allocation sizes, including growth headroom and any row-snapshot scratch).
     /// <see cref="Qwen4ExpStateBytes.Kv"/> is the state's OWN K/V store (zero when an engine KV cache carries the rows).
     /// </summary>
