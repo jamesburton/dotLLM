@@ -68,6 +68,8 @@ public sealed class VulkanQwen4ExpParityTests
         ["e512-q8q51", 3],
         ["kq256-kquant", 4],
         ["kq256-f32", 5],
+        ["hd256-f32", 6],       // the released attention geometry: head_dim 256, 64 rotary dims, 4 query heads over 2 KV heads
+        ["hd256-q8q51", 7],
     ];
 
     internal static byte[] Build(int variant) => variant switch
@@ -78,10 +80,12 @@ public sealed class VulkanQwen4ExpParityTests
         3 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Experts512, Q4eQuant.Q8Q51),
         4 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.KQuant256, Q4eQuant.KQuant),
         5 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.KQuant256, Q4eQuant.F32),
+        6 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Hd256, Q4eQuant.F32),
+        7 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Hd256, Q4eQuant.Q8Q51),
         _ => throw new ArgumentOutOfRangeException(nameof(variant)),
     };
 
-    internal static bool IsQuantised(int variant) => variant is 1 or 3 or 4;
+    internal static bool IsQuantised(int variant) => variant is 1 or 3 or 4 or 7;
 
     internal static int[] Ids(int count, int vocab, int seed = 7)
     {
@@ -200,5 +204,30 @@ public sealed class VulkanQwen4ExpParityTests
         var (rl2, kl, _) = Compare(whole, last);
         _out.WriteLine($"chunk {chunk}: relL2 = {rl2:E3}, KL = {kl:E3}");
         Assert.True(rl2 < 2e-3, $"chunked({chunk}) diverges from single shot: relL2 {rl2:E3}");
+    }
+
+    [SkippableFact]
+    public void SyntheticFixture_MatchesOracle()
+    {
+        // The in-tree SyntheticQwen4ExpGguf (named by the issue): a different GQA ratio (2 query heads over 1 KV head) and a single GDN key
+        // head, so it is the degenerate-shape arm next to the NK != NV rigs above - it must still agree.
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var rig = new Q4eRig(SyntheticQwen4ExpGguf.Build(), spvDir);
+        int V = rig.Config.VocabSize;
+        Assert.Equal(11, rig.Vk.DenseContextLimit);   // indexer budget 8 + block 4 - 1
+        var ids = Ids(7, V, seed: 5);
+        var cpu = Q4eRig.Row(rig.Cpu.Forward(ids, Enumerable.Range(0, 7).ToArray(), -1), 6);
+        var vk = Q4eRig.Row(rig.Vk.Forward(ids, Enumerable.Range(0, 7).ToArray(), -1), 0);
+        var (rl2, kl, _) = Compare(cpu, vk);
+        _out.WriteLine($"synthetic prefill: relL2 {rl2:E3}, KL {kl:E3}");
+        Assert.True(rl2 < 3e-3);
+        for (int s = 0; s < 4; s++)
+        {
+            int next = Array.IndexOf(cpu, cpu.Max());
+            cpu = Q4eRig.Row(rig.Cpu.Forward([next], [7 + s], -1), 0);
+            vk = Q4eRig.Row(rig.Vk.Forward([next], [7 + s], -1), 0);
+            (rl2, kl, _) = Compare(cpu, vk);
+            Assert.True(rl2 < 3e-3, $"synthetic decode step {s}: relL2 {rl2:E3}");
+        }
     }
 }

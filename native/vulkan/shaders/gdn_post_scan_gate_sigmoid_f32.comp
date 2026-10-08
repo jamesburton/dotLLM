@@ -1,9 +1,8 @@
 #version 450
 // SIGMOID-gated variant of gdn_post_scan_gate_f32.comp for Qwen4-Exp (llama.cpp qwen4exp build_norm_gated):
 // per-head RMSNorm × sigmoid(z) (the Qwen3.5/3.6 shader gates with silu(z)). Otherwise identical.
-// Per-head RMSNorm × silu(z) gating fused into one dispatch — step 6 of
-// Qwen3MoeHybrid GDN token mixing (ForwardGdnBody, lines 727-748 in
-// Qwen3MoeHybridTransformerModel.cs).
+// Per-head RMSNorm × sigmoid(z) gating fused into one dispatch — step 6 of
+// GDN token mixing (the CPU oracle is Qwen4ExpTransformerModel.ForwardGdn).
 //
 // Mirrors the CPU code bit-for-bit:
 //
@@ -14,7 +13,7 @@
 //     rms    = sqrt(sumSq / d_state + eps)
 //     scale  = 1 / rms
 //     gdnOut[base+i] = gdnOut[base+i] * scale * ssm_norm_weight[i]
-//     // 2. Multiply by silu(z):
+//     // 2. Multiply by sigmoid(z):
 //     for i in [0, d_state):
 //       z_i = z[base+i]
 //       gdnOut[base+i] *= z_i * (1 / (1 + exp(-z_i)))
@@ -29,9 +28,8 @@
 // reference where RmsNorm.Execute is called with `gdnW.SsmNormWeight` for
 // every (t, vh)).
 //
-// silu(z) = z * sigmoid(z) = z * (1 / (1 + exp(-z))). Computed inline
-// rather than via a separate silu pass so we avoid an extra global-memory
-// round-trip on the dState elements.
+// sigmoid(z) = 1 / (1 + exp(-z)). Computed inline rather than via a separate
+// pass so we avoid an extra global-memory round-trip on the dState elements.
 //
 // Dispatch:
 //   groupCount    = (n_v_head, seq_len, 1)    — one workgroup per (vh, t)
@@ -96,9 +94,9 @@ void main() {
     barrier();
     float invRms = partials[0];
 
-    // ── 4. RMSNorm scale × silu(z) fold, write back in place ───────────────
+    // ── 4. RMSNorm scale × sigmoid(z) fold, write back in place ───────────────
     //    Matches the two-step CPU sequence (RmsNorm in place, then *=
-    //    silu(z)) collapsed into one read/write per element. Multiplication
+    //    sigmoid(z)) collapsed into one read/write per element. Multiplication
     //    is associative under fp32 only modulo ulp rounding — the per-thread
     //    accumulation order here is unchanged from the CPU because each
     //    element is independent (no reduction across i).
@@ -109,7 +107,7 @@ void main() {
         float gateV = 1.0 / (1.0 + exp(-zi));   // SIGMOID output gate (qwen4exp), not silu
         // Order chosen to match the C# pair-of-statements exactly:
         //   RmsNorm: gdnOut[i] = x * invRms * w
-        //   gate   : gdnOut[i] *= zi * sigmoid(zi)
+        //   gate   : gdnOut[i] *= sigmoid(zi)
         gdnOut[base + i] = (x * invRms * w) * gateV;
     }
 }

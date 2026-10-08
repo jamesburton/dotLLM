@@ -253,8 +253,15 @@ internal static class Qwen4ExpRandomGguf
     public static Q4eGeometry Experts512 => new() { Experts = 512, TopK = 10 };
 
     /// <summary>
-    /// Hidden size and expert width 256 so Q4_K / Q5_K banks are legal and the MMVQ (T==1) and grouped coopmat (T&gt;=16) kernels engage; 16
-    /// experts top-4, 2 key vs 4 value GDN heads, 4 query heads over 2 KV heads.
+    /// The released attention geometry: head_dim 256 with 64 rotary dims (so the hd256 flash-coopmat prefill and the split-KV decode kernels are
+    /// selected, as on the real file), 4 query heads over 2 KV heads, an indexer wide enough to hold the 64 rotary dims.
+    /// </summary>
+    public static Q4eGeometry Hd256 => new() { HeadDim = 256, RopeDim = 64, IdxDim = 64 };
+
+    /// <summary>
+    /// Hidden size and expert width 256 so Q4_K banks are legal and stay resident (Q4_K indexed MMVQ at T==1, dp4a MMQ at T&gt;1); 16 experts
+    /// top-4, 2 key vs 4 value GDN heads, 4 query heads over 2 KV heads. Q4_K down means the grouped coopmat prefill and the fused
+    /// single-token MoE decode (both need a Q5_K / Q6_K down bank) are NOT exercised here.
     /// </summary>
     public static Q4eGeometry KQuant256 => new()
     {
