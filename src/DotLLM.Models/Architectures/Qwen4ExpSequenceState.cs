@@ -29,6 +29,21 @@ public readonly record struct Qwen4ExpStateBytes(long Gdn, long Ple, long Indexe
     /// <param name="config">A fully populated <see cref="DotLLM.Core.Configuration.Architecture.Qwen4Exp"/> configuration.</param>
     /// <param name="contextLength">Tokens consumed.</param>
     public static Qwen4ExpStateBytes Estimate(ModelConfig config, int contextLength)
+        => Estimate(config, contextLength, DotLLM.Core.Configuration.KvCacheDType.F32, DotLLM.Core.Configuration.KvCacheDType.F32, 0);
+
+    /// <summary>
+    /// Like <see cref="Estimate(ModelConfig, int)"/> with the QSA K/V rows stored in a quantised engine KV cache (#841): rows older than
+    /// the fp32 <paramref name="windowSize"/> take <c>QuantizedRowBytes</c> per K and per V row, the newest <paramref name="windowSize"/>
+    /// rows (and, for the cache, nothing else) stay fp32. A dtype of <c>F32</c> keeps that side in fp32.
+    /// </summary>
+    /// <param name="config">A fully populated <see cref="DotLLM.Core.Configuration.Architecture.Qwen4Exp"/> configuration.</param>
+    /// <param name="contextLength">Tokens consumed.</param>
+    /// <param name="keyDType">K storage type.</param>
+    /// <param name="valueDType">V storage type.</param>
+    /// <param name="windowSize">fp32 window rows of the quantised cache (0 = every row quantised).</param>
+    public static Qwen4ExpStateBytes Estimate(ModelConfig config, int contextLength,
+                                              DotLLM.Core.Configuration.KvCacheDType keyDType,
+                                              DotLLM.Core.Configuration.KvCacheDType valueDType, int windowSize)
     {
         ArgumentNullException.ThrowIfNull(config);
         if (config.Qwen4Exp is not { } q4 || config.GdnConfig is not { } gdn || config.HybridLayout is not { } layout)
@@ -36,11 +51,21 @@ public readonly record struct Qwen4ExpStateBytes(long Gdn, long Ple, long Indexe
         if (contextLength < 0) throw new ArgumentOutOfRangeException(nameof(contextLength));
 
         int numGdn = 0, numQsa = 0;
-        long kvStrideSum = 0;
+        long kvBytes = 0;
+        int window = Math.Min(Math.Max(windowSize, 0), contextLength);
         for (int il = 0; il < config.NumLayers; il++)
         {
             if (layout.LayerKind[il] == HybridLayerKind.GatedDeltaNet) numGdn++;
-            else { numQsa++; kvStrideSum += (long)layout.HeadCountKv[il] * config.HeadDim; }
+            else
+            {
+                numQsa++;
+                int stride = layout.HeadCountKv[il] * config.HeadDim;
+                long kRow = keyDType == DotLLM.Core.Configuration.KvCacheDType.F32 ? (long)stride * sizeof(float) : DotLLM.Cpu.Kernels.KvQuantize.QuantizedRowBytes(stride, keyDType);
+                long vRow = valueDType == DotLLM.Core.Configuration.KvCacheDType.F32 ? (long)stride * sizeof(float) : DotLLM.Cpu.Kernels.KvQuantize.QuantizedRowBytes(stride, valueDType);
+                bool quantized = kRow != (long)stride * sizeof(float) || vRow != (long)stride * sizeof(float);
+                // quantised store sized for every row (as QuantizedKvCache allocates it) + the fp32 ring window
+                kvBytes += (kRow + vRow) * contextLength + (quantized ? (long)window * stride * 2 * sizeof(float) : 0);
+            }
         }
 
         long gdnBytes = (long)numGdn * (gdn.ConvStateElements + gdn.StateElements) * sizeof(float);
@@ -50,8 +75,7 @@ public readonly record struct Qwen4ExpStateBytes(long Gdn, long Ple, long Indexe
                   + (long)(p.ConvKernel - 1) * p.NgramSize * q4.HyperConnectionCount * config.HiddenSize * sizeof(float));
         long pooled = (long)numQsa * (contextLength / q4.IndexerBlockSize) * q4.IndexerKeyLength * sizeof(float);
         long tail = (long)numQsa * q4.IndexerBlockSize * q4.IndexerKeyLength * sizeof(float);
-        long kv = kvStrideSum * contextLength * 2 * sizeof(float);
-        return new Qwen4ExpStateBytes(gdnBytes, ple, pooled, tail, kv);
+        return new Qwen4ExpStateBytes(gdnBytes, ple, pooled, tail, kvBytes);
     }
 }
 
