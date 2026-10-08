@@ -1,3 +1,4 @@
+using System.Runtime.Intrinsics.X86;
 using System.Text.Json;
 using DotLLM.Cpu.Kernels.Experimental;
 using DotLLM.Cpu.Threading;
@@ -64,6 +65,7 @@ public sealed unsafe class LittleBitTests(ITestOutputHelper output)
     [InlineData(0)] [InlineData(1)] [InlineData(2)]
     public void Fixture_ReferenceAndKernels_MatchNumpyFloat64(int caseIdx)
     {
+        if (!Avx2.IsSupported) return;   // kernels are AVX2-only (spike); reference is covered by the other cases
         string path = Path.Combine(AppContext.BaseDirectory, "Cpu", "Kernels", "LittleBitData", "littlebit_fixture.json");
         using var doc = JsonDocument.Parse(File.ReadAllText(path));
         var c = doc.RootElement.GetProperty("cases")[caseIdx];
@@ -93,6 +95,7 @@ public sealed unsafe class LittleBitTests(ITestOutputHelper output)
     [InlineData(1, 5, 1, 2)]
     public void RandomShapes_Kernels_MatchScalarAndDenseF32Control(int dOut, int dIn, int r, int npaths)
     {
+        if (!Avx2.IsSupported) return;
         var rng = new Random(dOut * 31 + dIn);
         using var layer = new LittleBitLayer(Enumerable.Range(0, npaths).Select(_ => LittleBitPath.Random(dOut, dIn, r, rng)).ToArray());
         var dense = LittleBitReference.DecodeDense(layer);
