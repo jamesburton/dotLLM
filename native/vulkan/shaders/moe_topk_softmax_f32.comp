@@ -13,7 +13,7 @@
 //   if normTopKProb: weights /= sum(weights)
 //
 // Dispatch:
-//   local_size_x = 64                  (numExperts up to 256 fits in 4 strides)
+//   local_size_x = 64                  (numExperts up to 512 fits in 8 strides)
 //   groupCount.x = seqLen
 //
 // Buffer layout:
@@ -21,7 +21,7 @@
 //   indices : [seqLen, k]           int32 row-major
 //   weights : [seqLen, k]           F32 row-major
 
-#define MAX_EXPERTS    256u
+#define MAX_EXPERTS    512u
 #define WG_SIZE        64u
 #define MAX_K          16u
 #define NEG_INF        (-3.4e38)

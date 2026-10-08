@@ -27,7 +27,7 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class MoeTopKSoftmaxF32Kernel : IDisposable
 {
     /// <summary>Compile-time upper bound on numExperts (mirrors <c>MAX_EXPERTS</c> in the shader).</summary>
-    public const int MaxExperts = 256;
+    public const int MaxExperts = 512;
 
     /// <summary>Compile-time upper bound on top-k (mirrors <c>MAX_K</c> in the shader).</summary>
     public const int MaxK = 16;
