@@ -162,6 +162,8 @@ public sealed class VulkanGptOssKernelTests
     [InlineData(5, 32, 4)]
     [InlineData(3, 128, 8)]
     [InlineData(1, 32, 4)]
+    [InlineData(2, 256, 8)]   // 256-expert regression arm
+    [InlineData(2, 512, 10)]  // MAX_EXPERTS (#818)
     public void RawTopKSoftmax_SelectsOnRawLogitsThenSoftmaxesSelected(int seqLen, int numExperts, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

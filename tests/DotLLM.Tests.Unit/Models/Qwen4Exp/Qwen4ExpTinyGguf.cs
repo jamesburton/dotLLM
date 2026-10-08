@@ -13,6 +13,7 @@ internal static class Qwen4ExpTinyGguf
     /// <summary>Non-tensor entries of the fixture (reference values / hash constants).</summary>
     private static bool IsTensor(string name) =>
         !(name.StartsWith("l_out.", StringComparison.Ordinal) || name is "ids" or "hidden_final" or "logits"
+          or "ids_img" or "img_positions" or "img_embeds" or "hidden_final_img" or "logits_img"
           || name.StartsWith("ple.", StringComparison.Ordinal));
 
     /// <summary>
@@ -34,7 +35,7 @@ internal static class Qwen4ExpTinyGguf
 
     /// <summary>Builds the GGUF bytes. <paramref name="shards"/> &gt; 1 is not supported here (see the split test).</summary>
     public static byte[] Build(Qwen4ExpReferenceFixture fx, int contextLength = 256, bool quantize = false, int? budgetTokens = null,
-                               Func<string, float[], float[]>? editTensor = null)
+                               bool omitImageTokenId = false, Func<string, float[], float[]>? editTensor = null)
     {
         const string arch = "qwen4exp";
         int layers = fx.Int("num_layers"), blockSize = fx.Int("block");
@@ -72,7 +73,11 @@ internal static class Qwen4ExpTinyGguf
         for (int i = 0; i < layers; i++) ratios[i] = (i + 1) % 4 == 0 ? blockSize : 0;
         w.AddInt32Array($"{arch}.attention.compress_ratios", ratios);
 
-        w.AddInt32Array($"{arch}.ple.layers", [1]);   // zero-based block index (HF ple_layer_ids=[2] is 1-based)
+        // zero-based block indices (HF ple_layer_ids=[2] is 1-based); fixtures with several modules list them in "ple_layers"
+        int[] pleLayers = fx.Meta.TryGetProperty("ple_layers", out var pl) ? pl.EnumerateArray().Select(e => e.GetInt32()).ToArray() : [1];
+        w.AddInt32Array($"{arch}.ple.layers", pleLayers);
+        if (!omitImageTokenId && fx.Meta.TryGetProperty("image_token_id", out var imageId))
+            w.AddUInt32($"{arch}.ple.image_token_id", (uint)imageId.GetInt32());
         w.AddUInt32($"{arch}.ple.ngram_size", (uint)fx.Int("ngram"));
         w.AddUInt32($"{arch}.ple.heads_per_ngram", (uint)fx.Int("heads_per_ngram"));
         w.AddUInt32($"{arch}.ple.conv_kernel", (uint)fx.Int("ple_conv_k"));

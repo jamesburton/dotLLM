@@ -217,7 +217,7 @@ internal sealed class VulkanGptOssKernels : IDisposable
     public void RecordTopKRawSoftmax(nint cmdBuf, VulkanDevice.Buffer logits, VulkanDevice.Buffer indices,
         VulkanDevice.Buffer weights, int seqLen, int numExperts, int k)
     {
-        if (numExperts > 256) throw new ArgumentException("numExperts must be <= 256.", nameof(numExperts));
+        if (numExperts > 512) throw new ArgumentException("numExperts must be <= 512.", nameof(numExperts));
         if (k <= 0 || k > 16) throw new ArgumentException("k must be in [1, 16].", nameof(k));
         ReadOnlySpan<nint> bufs = [logits.Handle, indices.Handle, weights.Handle];
         ReadOnlySpan<uint> pc = [(uint)seqLen, (uint)numExperts, (uint)k];

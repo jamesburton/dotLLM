@@ -25,17 +25,10 @@ def reorder_v(t, dim, nk, r, hd):
     return t.permute(*perm).contiguous().reshape(*shape)
 
 
-def main(out):
-    seed = 33
-    # moe/shared intermediate 32 (not the default 24) so the expert banks can be block-quantised (K multiple of 32) in the quantised-checkpoint test
-    model = build_model(seed=seed, moe_intermediate_size=32, shared_expert_intermediate_size=32)
-    cfg = model.config
+def new_writer(cfg, seed, T, **extra_meta):
     H, S = cfg.hidden_size, cfg.hc_count
     nk, nv, dk, dv = cfg.linear_num_key_heads, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
-    r = nv // nk
-    T = 48
-
-    w = FixtureWriter(hidden_size=H, hc_count=S, num_layers=cfg.num_hidden_layers, vocab=cfg.vocab_size,
+    return FixtureWriter(hidden_size=H, hc_count=S, num_layers=cfg.num_hidden_layers, vocab=cfg.vocab_size,
                       seq_len=T, eos=5, eps=float(cfg.rms_norm_eps), nk=nk, nv=nv, dk=dk, dv=dv,
                       heads=cfg.num_attention_heads, kv_heads=cfg.num_key_value_heads, head_dim=cfg.head_dim,
                       rope_dim=int(cfg.head_dim * 0.25), rope_theta=1.0e7, idx_heads=cfg.indexer_n_heads,
@@ -43,7 +36,18 @@ def main(out):
                       experts=cfg.num_experts, top_k=cfg.num_experts_per_tok, moe_inter=cfg.moe_intermediate_size,
                       shared_inter=cfg.shared_expert_intermediate_size, hc_lowrank=cfg.hc_lowrank,
                       ngram=cfg.ngram_size, heads_per_ngram=cfg.heads_per_ngram, ple_layer=0, conv_k=cfg.linear_conv_kernel_dim,
-                      ple_conv_k=cfg.ple_conv_kernel_size, seed=seed)
+                      ple_conv_k=cfg.ple_conv_kernel_size, seed=seed, **extra_meta)
+
+
+def export_weights(model, w, seed):
+    """Writes every weight in the GGUF convention. With several PLE modules their tables are concatenated into the one
+    `per_layer_token_embd.weight` (module j's head offsets shifted by the padded row count of the tables before it) and the hash
+    constants are concatenated module-major, which is how the dotLLM GGUF reader slices them (module = position in ple_layer_ids)."""
+    cfg = model.config
+    H, S = cfg.hidden_size, cfg.hc_count
+    nk, nv, dk, dv = cfg.linear_num_key_heads, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
+    r = nv // nk
+    ple_tables, ple_mult, ple_off, ple_vocab, rows_so_far = [], [], [], [], 0
 
     def gr(prefix, mod, inject=True):
         w.add(f"{prefix}norm.weight", 1.0 + mod.hc_norm.weight)
@@ -99,10 +103,12 @@ def main(out):
             w.add(b + "ple_norm_query.weight", 1.0 + p.norm_query.weight)
             w.add(b + "ple_norm_conv.weight", 1.0 + p.norm_conv.weight)
             w.add(b + "ple_conv1d.weight", p.conv1d.weight[:, 0, :])
-            w.add("per_layer_token_embd.weight", p.ple_embedding.ngram_embedding.weight)
-            w.add("ple.layer_multipliers", p.ple_embedding.layer_multipliers)
-            w.add("ple.head_offsets", p.ple_embedding.ngram_heads_offsets)
-            w.add("ple.head_vocab_sizes", p.ple_embedding.ngram_heads_vocab_sizes)
+            table = p.ple_embedding.ngram_embedding.weight
+            ple_tables.append(table)
+            ple_mult.append(p.ple_embedding.layer_multipliers)
+            ple_off.append(p.ple_embedding.ngram_heads_offsets + rows_so_far)
+            ple_vocab.append(p.ple_embedding.ngram_heads_vocab_sizes)
+            rows_so_far += table.shape[0]
         mlp = layer.mlp
         inter = cfg.moe_intermediate_size
         gate_up = mlp.experts.gate_up_proj
@@ -114,6 +120,23 @@ def main(out):
         w.add(b + "ffn_up_shexp.weight", mlp.shared_expert.up_proj.weight)
         w.add(b + "ffn_down_shexp.weight", mlp.shared_expert.down_proj.weight)
         w.add(b + "ffn_gate_inp_shexp.weight", mlp.shared_expert_gate.weight[0])
+
+    if ple_tables:
+        w.add("per_layer_token_embd.weight", torch.cat(ple_tables, 0))
+        w.add("ple.layer_multipliers", torch.cat(ple_mult, 0))
+        w.add("ple.head_offsets", torch.cat(ple_off, 0))
+        w.add("ple.head_vocab_sizes", torch.cat(ple_vocab, 0))
+    return lm_head
+
+
+def main(out):
+    seed = 33
+    # moe/shared intermediate 32 (not the default 24) so the expert banks can be block-quantised (K multiple of 32) in the quantised-checkpoint test
+    model = build_model(seed=seed, moe_intermediate_size=32, shared_expert_intermediate_size=32)
+    cfg = model.config
+    T = 48
+    w = new_writer(cfg, seed, T)
+    lm_head = export_weights(model, w, seed)
 
     torch.manual_seed(seed + 2)
     ids = torch.randint(6, cfg.vocab_size, (1, T))

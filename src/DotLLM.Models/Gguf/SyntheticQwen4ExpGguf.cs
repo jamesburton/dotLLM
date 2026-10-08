@@ -102,19 +102,21 @@ public static class SyntheticQwen4ExpGguf
     /// <summary>Builds the synthetic fixture to a single-file byte array.</summary>
     /// <param name="seed">PRNG seed.</param>
     /// <param name="includeMtp">Append a QSA + nextn MTP block (<c>block_count</c> 5, <c>nextn_predict_layers</c> 1).</param>
-    public static byte[] Build(uint seed = 0xC0FFEEu, bool includeMtp = false)
+    /// <param name="numKvHeads">KV heads of the QSA layers (default <see cref="NumKvHeads"/> = 1, a 16-wide KV row; 2 gives the 32-wide row
+    /// a quantised KV cache needs, #841). Must divide <see cref="NumHeads"/>.</param>
+    public static byte[] Build(uint seed = 0xC0FFEEu, bool includeMtp = false, int numKvHeads = NumKvHeads)
     {
         var w = new GgufWriter();
-        WriteMetadata(w, includeMtp);
-        foreach (var t in BuildTensors(seed, includeMtp))
+        WriteMetadata(w, includeMtp, numKvHeads);
+        foreach (var t in BuildTensors(seed, includeMtp, numKvHeads))
             w.AddTensor(t.Name, t.Dims, (uint)QuantizationType.F32, t.Data);
         return w.Build();
     }
 
     /// <summary>Writes the single-file fixture to <paramref name="path"/>.</summary>
-    public static string Write(string path, uint seed = 0xC0FFEEu, bool includeMtp = false)
+    public static string Write(string path, uint seed = 0xC0FFEEu, bool includeMtp = false, int numKvHeads = NumKvHeads)
     {
-        File.WriteAllBytes(path, Build(seed, includeMtp));
+        File.WriteAllBytes(path, Build(seed, includeMtp, numKvHeads));
         return path;
     }
 
@@ -131,14 +133,14 @@ public static class SyntheticQwen4ExpGguf
     public static string WriteSplit(string directory, string stem, int shardCount, uint seed = 0xC0FFEEu, bool includeMtp = false)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(shardCount, 2);
-        var tensors = BuildTensors(seed, includeMtp);
+        var tensors = BuildTensors(seed, includeMtp, NumKvHeads);
         int dataShards = shardCount - 1;
 
         for (int s = 1; s <= shardCount; s++)
         {
             var w = new GgufWriter();
             if (s == 1)
-                WriteMetadata(w, includeMtp);
+                WriteMetadata(w, includeMtp, NumKvHeads);
             w.AddUInt16("split.no", (ushort)(s - 1)).AddUInt16("split.count", (ushort)shardCount).AddInt32("split.tensors.count", tensors.Count);
             if (s > 1)
             {
@@ -155,7 +157,7 @@ public static class SyntheticQwen4ExpGguf
 
     // ───────────────────────────── metadata ─────────────────────────────
 
-    private static void WriteMetadata(GgufWriter w, bool includeMtp)
+    private static void WriteMetadata(GgufWriter w, bool includeMtp, int numKvHeads)
     {
         const string arch = "qwen4exp";
         int blocks = TrunkLayers + (includeMtp ? 1 : 0);
@@ -168,7 +170,7 @@ public static class SyntheticQwen4ExpGguf
         w.AddUInt32($"{arch}.context_length", ContextLength);
         w.AddUInt32($"{arch}.embedding_length", HiddenSize);
         w.AddUInt32($"{arch}.attention.head_count", NumHeads);
-        w.AddUInt32($"{arch}.attention.head_count_kv", NumKvHeads);
+        w.AddUInt32($"{arch}.attention.head_count_kv", (uint)numKvHeads);
         w.AddInt32Array($"{arch}.rope.dimension_sections", [3, 3, 2, 0]);
         w.AddFloat32($"{arch}.rope.freq_base", 10000000.0f);
         w.AddFloat32($"{arch}.attention.layer_norm_rms_epsilon", 1e-6f);
@@ -234,7 +236,7 @@ public static class SyntheticQwen4ExpGguf
 
     // ───────────────────────────── tensors ─────────────────────────────
 
-    private static List<Tensor> BuildTensors(uint seed, bool includeMtp)
+    private static List<Tensor> BuildTensors(uint seed, bool includeMtp, int numKvHeads)
     {
         var rng = new SyntheticGemma4Gguf.Xorshift(seed);
         var list = new List<Tensor>();
@@ -250,13 +252,13 @@ public static class SyntheticQwen4ExpGguf
         for (int il = 0; il < TrunkLayers; il++)
         {
             bool attention = (il + 1) % FullAttnInterval == 0;
-            AddBlock(list, rng, il, attention, hasPle: il == PleLayer);
+            AddBlock(list, rng, il, attention, hasPle: il == PleLayer, numKvHeads);
         }
 
         if (includeMtp)
         {
             int il = TrunkLayers;
-            AddBlock(list, rng, il, attention: true, hasPle: false);
+            AddBlock(list, rng, il, attention: true, hasPle: false, numKvHeads);
             Matrix(list, rng, Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.NextnEhProj), 2 * HiddenSize, HiddenSize);
             Norm(list, rng, Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.NextnEnorm), HiddenSize);
             Norm(list, rng, Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.NextnHnorm), hcDim);
@@ -268,7 +270,7 @@ public static class SyntheticQwen4ExpGguf
         return list;
     }
 
-    private static void AddBlock(List<Tensor> t, SyntheticGemma4Gguf.Xorshift rng, int il, bool attention, bool hasPle)
+    private static void AddBlock(List<Tensor> t, SyntheticGemma4Gguf.Xorshift rng, int il, bool attention, bool hasPle, int numKvHeads)
     {
         const int hcDim = HcCount * HiddenSize;
         string B(string suffix) => Qwen4ExpTensors.Block(il, suffix);
@@ -288,8 +290,8 @@ public static class SyntheticQwen4ExpGguf
         if (attention)
         {
             Matrix(t, rng, B(Qwen4ExpTensors.Suffix.AttnQ), HiddenSize, NumHeads * HeadDim * 2);
-            Matrix(t, rng, B(Qwen4ExpTensors.Suffix.AttnK), HiddenSize, NumKvHeads * HeadDim);
-            Matrix(t, rng, B(Qwen4ExpTensors.Suffix.AttnV), HiddenSize, NumKvHeads * HeadDim);
+            Matrix(t, rng, B(Qwen4ExpTensors.Suffix.AttnK), HiddenSize, numKvHeads * HeadDim);
+            Matrix(t, rng, B(Qwen4ExpTensors.Suffix.AttnV), HiddenSize, numKvHeads * HeadDim);
             Matrix(t, rng, B(Qwen4ExpTensors.Suffix.AttnOutput), NumHeads * HeadDim, HiddenSize);
             Norm(t, rng, B(Qwen4ExpTensors.Suffix.AttnQNorm), HeadDim);
             Norm(t, rng, B(Qwen4ExpTensors.Suffix.AttnKNorm), HeadDim);

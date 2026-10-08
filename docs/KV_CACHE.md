@@ -22,6 +22,18 @@ V_cache[layer][kv_head][max_seq_len][head_dim]  — FP16
 ```
 Simple indexing: `K_cache[layer][head][pos] = new_K`. Wastes memory for short sequences.
 
+### Hybrid-aware geometry (issue #839)
+
+For hybrid models (`ModelConfig.HybridLayout` set: Qwen3.5/3.6/3.8 GDN, Nemotron-H, Qwen4-Exp) only the attention layers hold K/V.
+`KvGeometry.FromConfig` therefore allocates **slots for attention layers only**, in layer order (slot k = k-th attention layer — the
+`kvSlotForLayer` convention every hybrid forward pass, CPU/Vulkan/CUDA, already uses). The geometry exposes the map:
+`HasLayerSlotMap`, `SlotOfLayer(modelLayer)` (-1 for a recurrent layer), `ModelLayerCount`; `LayerCount` is the **slot** count and
+`KvStrideOf(slot)` takes a slot. `KvGeometry.SlotCount(config)` is the allocation-free slot count (use it instead of
+`config.NumLayers` anywhere a cache or handoff is sized). A 1-in-4 hybrid (Qwen4-Exp: 12 of 48) allocates 4x less KV; dense models
+are unchanged (`HasLayerSlotMap == false`, identity map). Vulkan (`VulkanNemotronHKvCache`) and CUDA (`CudaNemotronHKvCache`) hybrid
+caches were already sparse; the CPU `SimpleKvCache` / `QuantizedKvCache` / `TurboQuantKvCache`, the hybrid CPU-tail cache of the
+split Qwen3-hybrid model, the KV handoff paths and the CLI memory estimate now agree with them.
+
 ## Paged KV-Cache
 
 Inspired by OS virtual memory paging. This is the **memory management** half of PagedAttention (vLLM): block-based allocation, ref counting, CoW. The **kernel** half (attention reading non-contiguous blocks directly) is opt-in on CUDA as of issue #200 (`DOTLLM_ATTN_PAGED_NATIVE=1`, decode only — see the CUDA section below); it remains a future step for CPU and any future Vulkan paged cache, where current kernels still see contiguous buffers via staging-buffer gather.

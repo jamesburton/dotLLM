@@ -96,8 +96,8 @@ Differences between architectures are captured entirely in ModelConfig.
 
 ### Qwen4-Exp / Qwen3.8-Flash-Next (`qwen4exp`) — config (#815) + CPU reference forward (#816), epic #814
 - GGUF arch string: `qwen4exp` (llama.cpp `LLM_ARCH_QWEN4EXP`) -> `Architecture.Qwen4Exp`. The **CPU** loader builds `Qwen4ExpTransformerModel` (the
-  numerical oracle, validated against HF `qwen4_exp` on a tiny random-weight model); Vulkan and CUDA still refuse it with
-  `Qwen4ExpConfig.UnsupportedMessage(...)` (issues V1/C1 of the epic).
+  numerical oracle, validated against HF `qwen4_exp` on a tiny random-weight model); **Vulkan** builds `VulkanQwen4ExpTransformerModel` (#818, below);
+  CUDA still refuses it with `Qwen4ExpConfig.UnsupportedMessage(...)` (issue C1 of the epic).
 - 48 layers = `(GDN, GDN, GDN, QSA) x 12` (`full_attention_interval` 4, reuses `GdnConfig` + `HybridLayout`), every block a
   512-expert top-10 **softmax** MoE (`NormTopKProb`) with one sigmoid-gated shared expert (reuses `MoeConfig`). Optional trailing MTP
   block: `block_count` 49 + `nextn_predict_layers` 1 (the Unsloth trunk files have neither; MTP ships as a separate GGUF).
@@ -110,10 +110,10 @@ Differences between architectures are captured entirely in ModelConfig.
 | `attention.indexer.head_count` / `.key_length` / `.top_k` | `IndexerHeadCount` / `IndexerKeyLength` / `IndexerTopK` | 4 / 128 / 2048 (a TOKEN budget) |
 | `attention.compress_ratios` | `CompressRatios`, `IndexerBlockSize` | per-block i32 (0 = GDN, 4 = QSA); one shared ratio > 1 dividing `top_k` |
 | `rope.dimension_sections` | `RopeSections` | `[11, 11, 10, 0]`, required |
-| `ple.layers` | `Ple.Layers` | **zero-based** (`[1]`); must be a GDN layer; one layer supported |
+| `ple.layers` | `Ple.Layers` | **zero-based** (`[1]`), strictly ascending; every entry must be a GDN layer; several supported (#844) |
 | `ple.ngram_size`, `.heads_per_ngram`, `.conv_kernel`, `.eos_token_id`, `.image_token_id` | `Ple.*` | image id optional (null -> EOS) |
 | `embedding_length_per_layer_input` | `Ple.RowDim` | 160 (not under `ple.*`) |
-| `ple.layer_multipliers`, `.head_offsets`, `.head_vocab_sizes` | `Ple.*` as `ulong` | exact uint64 (never via float/double/signed); lengths >= ngram_size / heads |
+| `ple.layer_multipliers`, `.head_offsets`, `.head_vocab_sizes` | `Ple.*` as `ulong` | exact uint64 (never via float/double/signed); ONE SET PER PLE LAYER, layer-major (module j = position in `ple.layers` uses `[j*ngram_size, ..)` / `[j*heads, ..)`); a single set with several layers is refused |
 
 - Tensor contract: `Qwen4ExpTensors` (names + shapes, `FindProblems` diff) — asserted equal to the real 1224-tensor trunk table and the 34-tensor
   MTP table. Differences from the early design notes: indexer tensors are **dotted** (`blk.N.indexer.q_proj`), the head mixer is
@@ -130,8 +130,30 @@ Differences between architectures are captured entirely in ModelConfig.
     top `top_k/4` blocks (ties -> lower index) + the incomplete tail; exactly dense for <= `top_k + 3` (2051) tokens. `ForceDense` is a diagnostic.
   - PLE (`Qwen4ExpPleBranch`): exact int64 hash (`(t0*m0) ^ (t1*m1) [^ (t2*m2)]`, signed floor-mod, EOS cuts the window), row gather straight
     from the lazy table (IQ4_NL/BF16/...; never copied), signed-sqrt sigmoid gate, dilated (3) depthwise conv with a 9-row history.
+  - **Several PLE modules and image tokens (#844).** HF gives every PLE module (`ple_layer_ids`, 1-based, sorted) its own n-gram table, key/value
+    projections, norms and dilated conv, and derives its hash multipliers (`_build_layer_multipliers(..., ple_layer_index, seed)`) and its slice of the head
+    primes (`global_head_idx = ple_layer_index * ngram_heads + h`) from the module's position `ple_layer_index`. llama.cpp's hparams hold ONE set of constants
+    and one `per_layer_token_embd.weight`, so it cannot describe a second module; the dotLLM convention (verified only against HF, no llama.cpp-written
+    multi-module file exists) concatenates the tables into that one tensor and stores the constants module-major, offsets already shifted by the rows of the
+    tables before (`Reference/gen_model_ple2.py`, `Fixtures/tiny_model_ple2.json`: modules on layers 1 and 2). Each module keeps its own `Qwen4ExpPleState`
+    (hash window + conv history), checkpointed, row-snapshotted and accounted like the single module. Image tokens: HF passes the original `input_ids`
+    (the image placeholder) as `ple_input_ids` while `inputs_embeds` carries the vision-tower rows; llama.cpp substitutes `ple.image_token_id` (EOS if the key is
+    absent). `Qwen4ExpTransformerModel.Forward(..., externalEmbeddings)` marks such positions with `ExternalEmbeddingToken` (-1), takes their embeddings from the
+    supplied rows and hashes them as the stand-in id, reproducing HF when `ple.image_token_id` equals the placeholder id.
   - The model keeps its own sequence state (`Qwen4ExpSequenceState`: GDN + PLE window/conv + QSA K/V and pooled indexer keys); positions must
     continue it.
+  - **Quantised KV (#841).** The QSA K/V rows can live in a `QuantizedKvCache` (`--cache-type-k/-v q8_0|q4_0`, both sides quantised; the KV row
+    `nKv*headDim` must be a multiple of 32). The sparse attention gathers the selected rows, so `Qwen4ExpKvRows` dequantises exactly those rows (quantised
+    region) or copies them (fp32 window) into a scratch, and the rows of the chunk being processed are read from the fresh fp32 projections: a chunk is
+    attended at full precision, only rows from earlier chunks carry rounding (single-shot prefill is bit-identical to fp32). An update longer than the
+    fp32 window is split into window-sized pieces (a longer update would quantise unwritten ring slots). Pooled indexer keys stay **fp32**: they decide
+    which blocks are attended, and quantising them saves 94 of the 1,216 bytes/token/layer (measured Q8_0 round-trip keeps 99.7% of the top-512 block set
+    on random keys, the worst case). Measured, standalone QSA layer at the real 2048-token budget, T=2400 (rows past 2051 are sparse): Q8_0 relative L2
+    error 2.2e-3 (proxy-logit KL 9e-7, top-1 99.7%), Q4_0 4.1e-2 (KL 3e-4, top-1 94.3%); KV bytes 3.76x smaller at Q8_0 (the real 512-wide row:
+    2,048 B in bf16 -> 1,088 B at Q8_0 per K+V per token per layer; 12 QSA layers x 262K ctx: ~6 GiB -> ~3.2 GiB).
+    `Qwen4ExpStateBytes.Estimate(config, ctx, keyDType, valueDType, window)` accounts for it. Snapshots taken from a quantised cache hold the dequantised
+    rows. **Vulkan (V2, #819):** the QSA gather kernel would dequantise Q8_0 blocks (34 B / 32 elements) on load, read the newest `window` rows from the fp32
+    ring and the in-flight chunk from the fresh projections, and keep the pooled keys + top-k in fp32.
   - **Engine state (#817).** `Qwen4ExpSequenceState` is an `IGdnState` (so the scheduler threads it with no changes): GDN, PLE window/conv and each QSA
     layer's pooled indexer keys + raw tail are native memory; the QSA K/V rows live in the engine `IKvCache` (slot = QSA ordinal, stride
     `nKv*headDim`; `KvGeometry.FromConfig` over-allocates the 36 unused GDN slots, as for the other hybrids) or, with no cache, in a lazily allocated
@@ -145,6 +167,15 @@ Differences between architectures are captured entirely in ModelConfig.
     (128 B per token per QSA layer) and Kv; `state.ResidentBytes` is the allocated counterpart. Exact (bit-identical) rollback holds between runs that
     use the same forward shapes; snapshot-vs-differently-shaped-fresh comparisons agree to ULP-level drift. Reference fixtures: `tests/DotLLM.Tests.Unit/Models/Qwen4Exp/Reference/gen_*.py` (HF transformers >= 5.19; recipe in
     `qwen4exp_ref_common.py`).
+- **Vulkan forward** (`VulkanQwen4ExpTransformerModel`, #818 V1). Composes the Qwen3MoeHybrid Vulkan blocks (GDN layer, full-GQA layer,
+  routed+shared MoE, quant-aware matmul) behind its internal `Q4*` surface and adds the GR shader (`qwen4exp_gated_residual.comp`: broadcast,
+  `silu(v/S)`, mix-and-mean, `2*sigmoid(g/S)`, write), the sigmoid GDN gate (`gdn_post_scan_gate_sigmoid_f32.comp`) and the three routers at
+  `MAX_EXPERTS` 512. Validated against the CPU oracle on random-weight checkpoints (tiny, 512-expert top-10, 256-wide K-quant, Q8_0/Q5_1/BF16
+  mixes): per-layer residual and last-row logits, 24-step greedy decode, chunked prefill. V1 limits: **dense** attention (exact up to
+  `top_k + block - 1` = 2051 tokens, throws beyond: sparse QSA is #819); the n-gram branch runs on the **host** at its layer (one residual
+  round-trip; table registered host-only so no upload/import/staging path can take it); model-owned single sequence state (#817); no MTP;
+  Q5_1 / Q8_0 / IQ expert banks are widened to F32 (no resident kernel yet), which the pre-load gate (`Qwen4ExpResidencyPlan`, refuses over
+  `ResidentCapacityBytes - headroom`, `DOTLLM_VK_ALLOW_OVERCOMMIT=1` overrides) accounts for.
 
 ## GGUF → ModelConfig Mapping
 

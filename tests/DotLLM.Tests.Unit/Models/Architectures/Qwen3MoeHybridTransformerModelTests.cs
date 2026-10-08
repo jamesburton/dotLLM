@@ -335,6 +335,38 @@ public sealed unsafe class Qwen3MoeHybridTransformerModelTests
     /// Layer 0 is GDN, layer 1 is full GQA attention. Both layers share a sparse MoE FFN
     /// with a Qwen1.5-style shared expert and per-token sigmoid gate.
     /// </summary>
+    /// <summary>
+    /// #839: the hybrid-aware default cache (<c>KvGeometry.FromConfig</c>) allocates slots for the attention layers only. Here the
+    /// attention layer is layer 1 (slot 0), so slot != layer index; logits must be bit-identical to the legacy one-slot-per-layer
+    /// cache while the cache is half the size.
+    /// </summary>
+    [Fact]
+    public void HybridAwareKvGeometry_BitIdenticalToLegacyPerLayerCache()
+    {
+        int[] tokenIds = [3, 1, 4, 1, 5];
+        int[] positions = [0, 1, 2, 3, 4];
+
+        float[] Run(bool compact, out long bytes)
+        {
+            using var fixture = Qwen3MoeHybridFixtureBuilder.Build(seed: 7);
+            using var model = Qwen3MoeHybridTransformerModel.BuildFromPrebuiltWeights(
+                fixture.Config, fixture.Layers, fixture.OutputNormWeight,
+                fixture.TokenEmbedPtr, QuantizationType.F32,
+                fixture.OutputWeightPtr, QuantizationType.F32, VocabSize, HiddenSize);
+            using var kv = compact
+                ? new SimpleKvCache(DotLLM.Core.Attention.KvGeometry.FromConfig(fixture.Config), MaxSeqLen)
+                : new SimpleKvCache(fixture.Config.NumLayers, NumKvHeads, HeadDim, MaxSeqLen);
+            bytes = kv.AllocatedBytes;
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1, kv);
+            return CopyLogits(logits);
+        }
+
+        var legacy = Run(false, out long legacyBytes);
+        var hybrid = Run(true, out long hybridBytes);
+        Assert.Equal(legacy, hybrid);
+        Assert.Equal(legacyBytes / 2, hybridBytes);
+    }
+
     private sealed unsafe class Qwen3MoeHybridFixtureBuilder : IDisposable
     {
         private readonly List<nint> _allocs = new();

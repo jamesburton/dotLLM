@@ -162,8 +162,7 @@ public sealed class HybridQwen3HybridDenseTransformerModel : IModel
         // slots go unused for the tail's own GDN layers (kvSlotForLayer[i] == -1, never touched) —
         // harmless, matches how the plain CPU-only Qwen3HybridDenseTransformerModel path already
         // sizes its default KV-cache (TextGenerator.AllocateKvCache) the same way.
-        var cpuCache = new SimpleKvCache(_tailModel.Config.NumLayers, _tailModel.Config.NumKvHeads,
-            _tailModel.Config.HeadDim, maxSeqLen);
+        var cpuCache = new SimpleKvCache(DotLLM.Core.Attention.KvGeometry.FromConfig(_tailModel.Config), maxSeqLen);
         return new Qwen3HybridDenseSplitKvCache(gpuHandle, cpuCache);
     }
 

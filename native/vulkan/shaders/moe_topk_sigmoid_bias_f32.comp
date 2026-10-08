@@ -9,7 +9,7 @@
 //   w *= weightsScale
 // Mirrors DotLLM.Cpu.Kernels.MoeSwiGluMlp.Route(sigmoidGating: true, ...).
 //
-// Dispatch: local_size_x = 64, groupCount.x = seqLen. numExperts <= 256, k <= 16.
+// Dispatch: local_size_x = 64, groupCount.x = seqLen. numExperts <= 512, k <= 16.
 //
 // Buffers:
 //   logits  : [seqLen, numExperts] F32
@@ -17,7 +17,7 @@
 //   indices : [seqLen, k]          int32
 //   weights : [seqLen, k]          F32
 
-#define MAX_EXPERTS    256u
+#define MAX_EXPERTS    512u
 #define WG_SIZE        64u
 #define MAX_K          16u
 #define NEG_INF        (-3.4e38)
