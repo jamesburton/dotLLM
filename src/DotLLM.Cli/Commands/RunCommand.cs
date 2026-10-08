@@ -626,13 +626,13 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             {
                 Console.Error.WriteLine("WARNING: Paged KV-cache does not support quantization yet, using quantized simple cache.");
                 kvFactory = (cfg, size) => new DotLLM.Engine.KvCache.QuantizedKvCache(
-                    cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, size,
+                    DotLLM.Core.Attention.KvGeometry.FromConfig(cfg), size,
                     kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
             }
             else if (kvConfig.IsQuantized)
             {
                 kvFactory = (cfg, size) => new DotLLM.Engine.KvCache.QuantizedKvCache(
-                    cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, size,
+                    DotLLM.Core.Attention.KvGeometry.FromConfig(cfg), size,
                     kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
             }
 
@@ -747,7 +747,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             else if (kvConfig.IsQuantized)
                 kvCacheBytes = ComputeQuantizedKvBytes(config, cacheSize, kvConfig);
             else
-                kvCacheBytes = (long)config.NumLayers * 2 * cacheSize
+                kvCacheBytes = (long)DotLLM.Core.Attention.KvGeometry.SlotCount(config) * 2 * cacheSize
                     * config.NumKvHeads * config.HeadDim
                     * (model is DotLLM.Cuda.CudaTransformerModel ? sizeof(ushort) : sizeof(float));
             // R4-interleaved buffers are a second, committed copy of the weights held alongside
@@ -1106,8 +1106,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         };
 
         // Quantized region + full-precision window
-        long quantBytes = (long)config.NumLayers * quantSlots * (kQuantRowBytes + vQuantRowBytes);
-        long windowBytes = (long)config.NumLayers * window * fpBytesPerRow * 2; // K + V
+        long quantBytes = (long)DotLLM.Core.Attention.KvGeometry.SlotCount(config) * quantSlots * (kQuantRowBytes + vQuantRowBytes);
+        long windowBytes = (long)DotLLM.Core.Attention.KvGeometry.SlotCount(config) * window * fpBytesPerRow * 2; // K + V
         return quantBytes + windowBytes;
     }
 
