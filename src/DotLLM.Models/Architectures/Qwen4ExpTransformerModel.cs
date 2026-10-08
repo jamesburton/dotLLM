@@ -11,41 +11,6 @@ using DotLLM.Models.Gguf;
 
 namespace DotLLM.Models.Architectures;
 
-/// <summary>
-/// Per-sequence state of a <see cref="Qwen4ExpTransformerModel"/>: the Gated-DeltaNet recurrent state of every GDN layer, the
-/// PLE hash window + dilated-conv history, and each QSA layer's K/V + pooled-indexer-key cache. Fully self-contained (the
-/// model does not use the engine <see cref="IKvCache"/>): chunked prefill and token-by-token decode thread one instance.
-/// </summary>
-public sealed class Qwen4ExpSequenceState : IRecurrentSequenceState
-{
-    internal GdnStateCache Gdn { get; }
-    internal Qwen4ExpPleState?[] Ple { get; }
-    internal Qwen4ExpQsaState?[] Qsa { get; }
-
-    /// <summary>Tokens consumed so far (the next position).</summary>
-    public int Length { get; internal set; }
-
-    internal Qwen4ExpSequenceState(GdnStateCache gdn, Qwen4ExpPleState?[] ple, Qwen4ExpQsaState?[] qsa)
-    {
-        Gdn = gdn; Ple = ple; Qsa = qsa;
-    }
-
-    /// <inheritdoc/>
-    public void Reset()
-    {
-        Gdn.Reset();
-        foreach (var p in Ple) p?.Reset();
-        foreach (var q in Qsa) q?.Reset();
-        Length = 0;
-    }
-
-    /// <summary>Resident bytes of the QSA K/V + indexer caches and PLE state (the part that grows with context).</summary>
-    public long Bytes => Gdn.AllocatedBytes + Ple.Sum(p => p?.Bytes ?? 0) + Qsa.Sum(q => q?.Bytes ?? 0);
-
-    /// <inheritdoc/>
-    public void Dispose() => Gdn.Dispose();
-}
-
 /// <summary>Receives <c>(name, data, rows, cols)</c> tensors from <see cref="Qwen4ExpTransformerModel"/>'s trace hook.</summary>
 internal delegate void Qwen4ExpTraceSink(string name, ReadOnlySpan<float> data, int rows, int cols);
 
@@ -94,7 +59,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
     private readonly MatRef _output;
     private readonly GatedDeltaNetConfig _gdn;
     private readonly Qwen4ExpConfig _q4;
-    private readonly int _hidden, _hc, _lowRank, _numGdn;
+    private readonly int _hidden, _hc, _lowRank, _numGdn, _numQsa;
     private readonly float _eps;
     private readonly ComputeThreadPool? _threadPool;
     private readonly bool _ownsPool;
@@ -123,12 +88,13 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         _lowRank = _q4.HyperConnectionLowRank;
         _eps = config.NormEpsilon;
         _numGdn = blocks.Count(b => b.Gdn is not null);
+        _numQsa = blocks.Count(b => b.Qsa is not null);
         _defaultState = CreateState();
     }
 
     // ───────────────────────────── state ─────────────────────────────
 
-    /// <summary>Allocates a fresh sequence state.</summary>
+    /// <summary>Allocates a fresh sequence state (native memory; dispose it when the sequence ends).</summary>
     public Qwen4ExpSequenceState CreateState()
     {
         var ple = new Qwen4ExpPleState?[_blocks.Length];
@@ -412,50 +378,37 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
 
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
-        => Forward(tokenIds, positions, deviceId, _defaultState, lastTokenLogitsOnly: false);
+        => ForwardCore(tokenIds, positions, deviceId, _defaultState, null, lastTokenLogitsOnly: false, snapRows: 0);
 
     /// <inheritdoc/>
-    /// <exception cref="NotSupportedException"><paramref name="kvCache"/> is non-null: the model keeps its own state (see remarks).</exception>
+    /// <remarks>Runs on the model-owned default state; a non-null <paramref name="kvCache"/> carries the QSA K/V rows.</remarks>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
-    {
-        RejectEngineKvCache(kvCache);
-        return Forward(tokenIds, positions, deviceId, _defaultState, lastTokenLogitsOnly: false);
-    }
+        => ForwardCore(tokenIds, positions, deviceId, _defaultState, kvCache, lastTokenLogitsOnly: false, snapRows: 0);
 
     /// <inheritdoc/>
-    /// <exception cref="NotSupportedException"><paramref name="kvCache"/> is non-null: the model keeps its own state (see remarks).</exception>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache,
                            bool lastTokenLogitsOnly)
-    {
-        RejectEngineKvCache(kvCache);
-        return Forward(tokenIds, positions, deviceId, _defaultState, lastTokenLogitsOnly);
-    }
+        => ForwardCore(tokenIds, positions, deviceId, _defaultState, kvCache, lastTokenLogitsOnly, snapRows: 0);
 
     /// <summary>
-    /// The oracle owns its sequence state (QSA K/V + indexer keys, GDN, PLE). An engine-owned <see cref="IKvCache"/> would silently
-    /// not advance while that state does, and the default <c>ForwardBatch</c> loop would make concurrent sequences share the
-    /// model-owned default state (the #261 failure class) — so both are refused until the engine integration of issue #817.
+    /// Forward over a caller-owned sequence state with its QSA K/V rows in <paramref name="kvCache"/> (the engine path). Positions
+    /// must continue <paramref name="state"/> (<c>positions[i] == state.Length + i</c>) and the cache must already hold at least
+    /// <c>state.Length</c> rows (it may hold more after a speculative rollback: stale rows are overwritten).
     /// </summary>
-    private static void RejectEngineKvCache(IKvCache? kvCache)
-    {
-        if (kvCache is not null)
-            throw new NotSupportedException(
-                "Qwen4ExpTransformerModel keeps its own sequence state (QSA K/V, pooled indexer keys, GDN, PLE) and cannot run against an " +
-                "engine KV cache yet; call Forward(tokens, positions, deviceId[, lastTokenLogitsOnly]) or the Qwen4ExpSequenceState overload. " +
-                "Engine/scheduler integration is tracked in issue #817.");
-    }
-
-    /// <inheritdoc/>
-    /// <exception cref="NotSupportedException">Always: batched/scheduler dispatch needs the engine state integration of issue #817.</exception>
-    public IReadOnlyList<ITensor> ForwardBatch(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
-        => throw new NotSupportedException(
-            "Qwen4ExpTransformerModel does not support ForwardBatch: requests carry an engine KV cache and the model-owned default state " +
-            "would be shared by concurrent sequences. Engine/scheduler integration is tracked in issue #817.");
+    /// <param name="tokenIds">Input tokens.</param>
+    /// <param name="positions">Absolute positions.</param>
+    /// <param name="deviceId">Device id for the returned tensor.</param>
+    /// <param name="state">Sequence state; advanced by <c>tokenIds.Length</c>.</param>
+    /// <param name="kvCache">Engine KV cache carrying the QSA K/V rows (slot = QSA ordinal); null keeps them in <paramref name="state"/>.</param>
+    /// <param name="lastTokenLogitsOnly">Return only the last row's logits (<c>[1, vocab]</c>); otherwise every row.</param>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                           Qwen4ExpSequenceState state, IKvCache? kvCache, bool lastTokenLogitsOnly)
+        => ForwardCore(tokenIds, positions, deviceId, state, kvCache, lastTokenLogitsOnly, snapRows: 0);
 
     /// <summary>
-    /// Forward over a caller-owned sequence state (chunked prefill / decode). Positions must continue
-    /// <paramref name="state"/> (<c>positions[i] == state.Length + i</c>); the model-owned default state restarts when the
-    /// call begins at position 0.
+    /// Forward over a caller-owned sequence state (chunked prefill / decode) with the QSA K/V rows kept in the state itself.
+    /// Positions must continue <paramref name="state"/> (<c>positions[i] == state.Length + i</c>); the model-owned default state
+    /// restarts when the call begins at position 0.
     /// </summary>
     /// <param name="tokenIds">Input tokens.</param>
     /// <param name="positions">Absolute positions.</param>
@@ -464,7 +417,12 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
     /// <param name="lastTokenLogitsOnly">Return only the last row's logits (<c>[1, vocab]</c>); otherwise every row.</param>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
                            Qwen4ExpSequenceState state, bool lastTokenLogitsOnly = false)
+        => ForwardCore(tokenIds, positions, deviceId, state, null, lastTokenLogitsOnly, snapRows: 0);
+
+    private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                                Qwen4ExpSequenceState state, IKvCache? kvCache, bool lastTokenLogitsOnly, int snapRows)
     {
+        ArgumentNullException.ThrowIfNull(state);
         int T = tokenIds.Length;
         if (T == 0 || T != positions.Length) throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
         if (ReferenceEquals(state, _defaultState) && positions[0] == 0 && state.Length != 0) state.Reset();
@@ -473,7 +431,45 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
                 throw new ArgumentException($"qwen4exp keeps its own sequence state: positions[{i}] = {positions[i]} but the state is at {state.Length + i}.");
         if (state.Length + T > Config.MaxSequenceLength)
             throw new ArgumentOutOfRangeException(nameof(positions), $"Sequence would exceed the context length {Config.MaxSequenceLength}.");
+        if (kvCache is not null) ValidateKvCache(kvCache, state.Length);
+        if (snapRows > 0 && !ReferenceEquals(state, _defaultState))
+            throw new InvalidOperationException("Row snapshots are only recorded on the model-owned state.");
+        _snapValid = false;   // any forward moves the live state on: earlier row snapshots no longer describe it
+        foreach (var p in state.Ple) p?.InvalidateRows();
+        foreach (var q in state.Qsa) q?.Indexer.InvalidateRows();
+        if (snapRows > 0) BeginRowRecording(state, snapRows, T);
+        try
+        {
+            return ForwardBody(tokenIds, deviceId, state, kvCache, lastTokenLogitsOnly, snapRows);
+        }
+        finally
+        {
+            if (snapRows > 0) EndRowRecording(state);
+        }
+    }
 
+    /// <summary>Rejects an engine KV cache whose geometry cannot carry the QSA layers (clear message instead of a silent misread).</summary>
+    private void ValidateKvCache(IKvCache kvCache, int stateLength)
+    {
+        if (kvCache.CurrentLength < stateLength)
+            throw new InvalidOperationException(
+                $"The KV cache holds {kvCache.CurrentLength} rows but the sequence state is at position {stateLength}: " +
+                "they must advance together (Rollback the cache and restore the state to the same length).");
+        if (kvCache is IPerLayerKvCache per)
+        {
+            if (per.LayerCount < _numQsa)
+                throw new ArgumentException($"qwen4exp needs {_numQsa} KV layers (one per QSA layer); the cache has {per.LayerCount}.", nameof(kvCache));
+            foreach (var b in _blocks)
+                if (b.Qsa is { } qsa && per.KvStrideOf(b.QsaOrdinal) != qsa.KvStride)
+                    throw new ArgumentException(
+                        $"qwen4exp QSA layer {b.QsaOrdinal} needs KV stride {qsa.KvStride}; the cache slot has {per.KvStrideOf(b.QsaOrdinal)}.", nameof(kvCache));
+        }
+    }
+
+    private ITensor ForwardBody(ReadOnlySpan<int> tokenIds, int deviceId, Qwen4ExpSequenceState state, IKvCache? kvCache,
+                                bool lastTokenLogitsOnly, int snapRows)
+    {
+        int T = tokenIds.Length;
         _threadPool?.SetDispatchMode(T == 1 ? DispatchMode.SpinWait : DispatchMode.EventBased);
         int H = _hidden, S = _hc, row = S * H, vocab = Config.VocabSize;
 
@@ -500,9 +496,9 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
                 // ── token mixer ──
                 GrRead(blk.AttnGr, res, xn, low, mix, h, gains, T, wantInject: true);
                 if (blk.Gdn is { } g)
-                    ForwardGdn(g, blk.GdnOrdinal, h, y, T, state.Gdn);
+                    ForwardGdn(g, blk.GdnOrdinal, h, y, T, state.Gdn, snapRows);
                 else
-                    blk.Qsa!.Forward(h.AsSpan(0, T * H), T, state.Qsa[il]!, y.AsSpan(0, T * H));
+                    blk.Qsa!.Forward(h.AsSpan(0, T * H), T, state.Qsa[il]!, y.AsSpan(0, T * H), kvCache, blk.QsaOrdinal);
                 Qwen4ExpGatedResidual.Write(res.AsSpan(0, T * row), y, gains, S, H, T);
 
                 // ── MoE ──
@@ -573,7 +569,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
     /// <c>qwen4exp.cpp build_norm_gated</c> ("the one numerical difference from Qwen3.5's GDN") and HF
     /// <c>output_gate_type="sigmoid"</c>.
     /// </summary>
-    private void ForwardGdn(GdnTokenMixingWeights w, int ordinal, float[] x, float[] y, int T, GdnStateCache cache)
+    private void ForwardGdn(GdnTokenMixingWeights w, int ordinal, float[] x, float[] y, int T, GdnStateCache cache, int snapRows)
     {
         int nV = _gdn.NVHead, nK = _gdn.NKHead, dS = _gdn.DState, dC = _gdn.DConv;
         int convDim = (2 * nK + nV) * dS, vDim = nV * dS, kDim = nK * dS;
@@ -616,6 +612,10 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
             SiLu.Execute(qkv.AsSpan(0, T * convDim), qkv.AsSpan(0, T * convDim));
             for (int r = 0; r < dC - 1; r++)
                 convIn.AsSpan((T + r) * convDim, convDim).CopyTo(convState.Slice(r * convDim, convDim));
+            // Row snapshots: after row t the rolling window is convIn rows t+1 .. t+dC-1.
+            int rowsToSnap = snapRows > 0 ? Math.Min(snapRows, T - 1) : 0;
+            for (int t = 0; t < rowsToSnap; t++)
+                convIn.AsSpan((t + 1) * convDim, (dC - 1) * convDim).CopyTo(RowSnapshotConv(ordinal, t));
 
             for (int t = 0; t < T; t++)
             {
@@ -628,7 +628,8 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
 
             GatedDeltaNetScan.Execute(cache.GetGdnState(ordinal), q.AsSpan(0, T * kDim), k.AsSpan(0, T * kDim),
                                       v.AsSpan(0, T * vDim), alpha.AsSpan(0, T * nV), beta.AsSpan(0, T * nV),
-                                      core.AsSpan(0, T * vDim), nV, nK, dS, T);
+                                      core.AsSpan(0, T * vDim), nV, nK, dS, T,
+                                      rowSnapshots: rowsToSnap > 0 ? RowSnapshotGdnLayer(ordinal) : default, snapshotRows: rowsToSnap);
 
             // per-head RMSNorm(core, ssm_norm) * sigmoid(z)
             for (int t = 0; t < T; t++)
@@ -691,6 +692,301 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         }
     }
 
+    // ───────────────────────────── engine contracts ─────────────────────────────
+
+    /// <inheritdoc/>
+    public bool SupportsThreadedSequenceState => true;
+
+    /// <inheritdoc/>
+    public IRecurrentSequenceState? CreateSequenceState() => CreateState();
+
+    /// <summary>
+    /// Per-sequence loop over the forward: each request's <see cref="SequenceForwardRequest.GdnState"/> (a
+    /// <see cref="Qwen4ExpSequenceState"/>) is threaded through, with the QSA K/V rows in the request's KV cache. Returns the LAST
+    /// row's logits (<c>[1, vocab]</c>) per request — the scheduler samples row <c>Shape[0] - 1</c> only. GDN, PLE and the
+    /// indexer are per-token recurrent and per-sequence, so fusing across sequences buys nothing on the CPU oracle; interleaved
+    /// sequences therefore equal separate runs exactly.
+    /// </summary>
+    /// <exception cref="ArgumentException">A multi-sequence batch with a request lacking its own state (it would share the
+    /// model-owned default state), or a state of another model type.</exception>
+    public IReadOnlyList<ITensor> ForwardBatch(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+        for (int i = 0; i < requests.Count; i++)
+        {
+            if (requests[i].Adapter is not null)
+                throw new NotSupportedException("Qwen4ExpTransformerModel.ForwardBatch does not support LoRA adapters.");
+            if (requests[i].GdnState is null && requests.Count >= 2)
+                throw new ArgumentException(
+                    $"Multi-seq ForwardBatch requires each SequenceForwardRequest to carry its own GdnState (request {i} has none): " +
+                    "the model-owned default state would be shared across sequences. Allocate one with CreateSequenceState().",
+                    nameof(requests));
+            if (requests[i].GdnState is not null and not Qwen4ExpSequenceState)
+                throw new ArgumentException(
+                    $"Request {i} carries a {requests[i].GdnState!.GetType().Name}; qwen4exp needs a Qwen4ExpSequenceState.", nameof(requests));
+        }
+
+        var results = new List<ITensor>(requests.Count);
+        try
+        {
+            foreach (var r in requests)
+            {
+                var st = (Qwen4ExpSequenceState?)r.GdnState ?? _defaultState;
+                results.Add(ForwardCore(r.TokenIds.Span, r.Positions.Span, deviceId, st, r.KvCache, lastTokenLogitsOnly: true, snapRows: 0));
+            }
+        }
+        catch
+        {
+            foreach (var t in results) t.Dispose();
+            throw;
+        }
+        return results;
+    }
+
+    // ── checkpoint / rollback of the model-owned state ──
+
+    private Qwen4ExpSequenceState? _spareCheckpoint;
+
+    /// <summary>A pooled checkpoint shell; disposing returns its buffers to the owning model.</summary>
+    private sealed class StateCheckpoint(Qwen4ExpTransformerModel owner, Qwen4ExpSequenceState shell) : IDisposable
+    {
+        private Qwen4ExpSequenceState? _shell = shell;
+        public Qwen4ExpSequenceState Shell => _shell ?? throw new ObjectDisposedException(nameof(StateCheckpoint));
+        public Qwen4ExpTransformerModel Owner => owner;
+
+        public void Dispose()
+        {
+            var s = Interlocked.Exchange(ref _shell, null);
+            if (s is null) return;
+            if (Interlocked.CompareExchange(ref owner._spareCheckpoint, s, null) is not null) s.Dispose();
+        }
+    }
+
+    /// <inheritdoc/>
+    public bool SupportsRecurrentStateCheckpoint => true;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// A full, independent copy: the GDN state (~113 MiB at the released size), the PLE window + conv history, the QSA indexers'
+    /// pooled keys + tails (128 B per token per QSA layer) and, when the state keeps its K/V rows itself, those too. K/V rows
+    /// in an engine KV cache are position-addressed: the caller rolls that cache back. Because the copy is complete it is also
+    /// a valid prefix snapshot after the live state has moved to a different history. One shell is pooled across rounds.
+    /// Incremental (delta) capture for the speculative path is a possible later optimisation.
+    /// </remarks>
+    public object? CheckpointRecurrentState()
+    {
+        var shell = Interlocked.Exchange(ref _spareCheckpoint, null) ?? CreateState();
+        shell.CopyFrom(_defaultState);
+        return new StateCheckpoint(this, shell);
+    }
+
+    /// <inheritdoc/>
+    public void RestoreRecurrentState(object? checkpoint)
+    {
+        if (checkpoint is null) return;
+        if (checkpoint is not StateCheckpoint cp || !ReferenceEquals(cp.Owner, this))
+            throw new ArgumentException(
+                $"{GetType().Name}.RestoreRecurrentState expects a checkpoint from this model's CheckpointRecurrentState; got {checkpoint.GetType().Name}.",
+                nameof(checkpoint));
+        _defaultState.CopyFrom(cp.Shell);
+        _snapValid = false;
+        foreach (var p in _defaultState.Ple) p?.InvalidateRows();
+        foreach (var q in _defaultState.Qsa) q?.Indexer.InvalidateRows();
+    }
+
+    // ── per-row recurrent snapshots (speculative verify without replay) ──
+
+    private readonly Qwen4ExpNativeBuffer _rowSnapGdn = new(), _rowSnapConv = new();
+    private int _snapStrideRows;      // rows per layer region in the scratch (this recording)
+    private int _snapRowsRecorded;    // rows 0 .. _snapRowsRecorded-1 recorded (state after the last row is the live state)
+    private int _snapBase;            // state.Length before the recorded chunk
+    private bool _snapValid;
+
+    /// <summary>Bytes currently held by the per-row recurrent snapshot scratch (all components).</summary>
+    public long RecurrentRowSnapshotBytes
+    {
+        get
+        {
+            long b = _rowSnapGdn.Bytes + _rowSnapConv.Bytes;
+            foreach (var p in _defaultState.Ple) b += p is null ? 0 : p.Bytes - p.StateBytes;
+            foreach (var q in _defaultState.Qsa) b += q?.Indexer.SnapshotScratchBytes ?? 0;
+            return b;
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Costs <c>rows x (36 GDN layers x (NVHead x DState^2 + conv))</c> floats of scratch (~113 MiB per row at the released
+    /// size), kept for the model's lifetime; every snapshot is bit-identical to the state a forward of only that prefix leaves.
+    /// </remarks>
+    public bool SupportsRecurrentRowSnapshots => true;
+
+    /// <inheritdoc/>
+    public ITensor ForwardWithRecurrentSnapshots(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                                                 IKvCache? kvCache, IMtpState? mtpState)
+    {
+        if (mtpState is not null)
+            throw new NotSupportedException("qwen4exp has no MTP head on the CPU oracle yet (mtpState must be null).");
+        int rows = Math.Max(tokenIds.Length - 1, 0);
+        var logits = ForwardCore(tokenIds, positions, deviceId, _defaultState, kvCache, lastTokenLogitsOnly: false, snapRows: rows);
+        _snapBase = positions[0];
+        _snapRowsRecorded = rows;
+        _snapValid = true;
+        return logits;
+    }
+
+    /// <inheritdoc/>
+    public void RestoreRecurrentStateToRow(int row)
+    {
+        if (!_snapValid || (uint)row > (uint)_snapRowsRecorded)
+            throw new InvalidOperationException(
+                $"No recurrent snapshot for row {row}: the last ForwardWithRecurrentSnapshots recorded {(_snapValid ? _snapRowsRecorded : 0)} " +
+                "row(s), or a later forward invalidated them.");
+        if (row == _snapRowsRecorded) return;   // the live state IS the state after the last row
+
+        var st = _defaultState;
+        for (int l = 0; l < _numGdn; l++)
+        {
+            RowSnapshotGdn(l, row).CopyTo(st.Gdn.GetGdnState(l));
+            RowSnapshotConv(l, row).CopyTo(st.Gdn.GetConvState(l));
+        }
+        foreach (var p in st.Ple) p?.RestoreRow(row);
+        foreach (var q in st.Qsa) q?.Indexer.RestoreToRow(row);
+        st.Length = _snapBase + row + 1;
+        _snapValid = false;
+    }
+
+    private void BeginRowRecording(Qwen4ExpSequenceState state, int rows, int chunkLength)
+    {
+        int recorded = Math.Min(rows, chunkLength - 1);
+        _snapStrideRows = Math.Max(recorded, 1);
+        if (_numGdn > 0)
+        {
+            _rowSnapGdn.EnsureExact((long)_numGdn * _snapStrideRows * state.Gdn.GdnStateElements);
+            _rowSnapConv.EnsureExact((long)_numGdn * _snapStrideRows * state.Gdn.ConvStateElements);
+        }
+        foreach (var p in state.Ple) if (p is not null) p.RecordRowCount = recorded;
+        foreach (var q in state.Qsa) if (q is not null) q.Indexer.RecordRowCount = recorded;
+    }
+
+    private static void EndRowRecording(Qwen4ExpSequenceState state)
+    {
+        foreach (var p in state.Ple) if (p is not null) p.RecordRowCount = 0;
+        foreach (var q in state.Qsa) if (q is not null) q.Indexer.RecordRowCount = 0;
+    }
+
+    private Span<float> RowSnapshotGdnLayer(int ordinal)
+    {
+        int e = _defaultState.Gdn.GdnStateElements;
+        return _rowSnapGdn.Slice((long)ordinal * _snapStrideRows * e, _snapStrideRows * e);
+    }
+
+    private Span<float> RowSnapshotGdn(int ordinal, int row)
+        => RowSnapshotGdnLayer(ordinal).Slice(row * _defaultState.Gdn.GdnStateElements, _defaultState.Gdn.GdnStateElements);
+
+    private Span<float> RowSnapshotConv(int ordinal, int row)
+    {
+        int e = _defaultState.Gdn.ConvStateElements;
+        return _rowSnapConv.Slice(((long)ordinal * _snapStrideRows + row) * e, e);
+    }
+
+    // ── per-sequence prefix snapshots (scheduler recurrent prefix cache) ──
+
+    /// <inheritdoc/>
+    public bool SupportsSequencePrefixSnapshot => true;
+
+    /// <summary>State clone + the QSA K/V rows of the prefix, independent of both inputs.</summary>
+    private sealed class PrefixSnapshot : IDisposable
+    {
+        public required Qwen4ExpSequenceState State;
+        public required Qwen4ExpNativeBuffer[] Keys, Values;
+        public required int Length;
+
+        public void Dispose()
+        {
+            State.Dispose();
+            foreach (var b in Keys) b.Dispose();
+            foreach (var b in Values) b.Dispose();
+        }
+    }
+
+    /// <inheritdoc/>
+    public IDisposable? SnapshotSequencePrefix(IKvCache kvCache, IRecurrentSequenceState? state, int prefixLen)
+    {
+        if (state is not Qwen4ExpSequenceState s) return null;
+        ArgumentNullException.ThrowIfNull(kvCache);
+        if (s.Length != prefixLen)
+            throw new ArgumentException($"The state has consumed {s.Length} tokens, not the {prefixLen}-token prefix.", nameof(prefixLen));
+        var keys = new Qwen4ExpNativeBuffer[_numQsa];
+        var values = new Qwen4ExpNativeBuffer[_numQsa];
+        var clone = CreateState();
+        try
+        {
+            foreach (var b in _blocks)
+            {
+                if (b.Qsa is null) continue;
+                int slot = b.QsaOrdinal, stride = b.Qsa.KvStride;
+                var kr = kvCache.GetKeysRef(slot); var vr = kvCache.GetValuesRef(slot);
+                if (kr.Dim0 < prefixLen) throw new ArgumentException($"The KV cache holds {kr.Dim0} rows; the prefix is {prefixLen}.", nameof(kvCache));
+                keys[slot] = new Qwen4ExpNativeBuffer(); values[slot] = new Qwen4ExpNativeBuffer();
+                keys[slot].EnsureExact(Math.Max(1L, (long)prefixLen * stride));
+                values[slot].EnsureExact(Math.Max(1L, (long)prefixLen * stride));
+                new ReadOnlySpan<float>((void*)kr.DataPointer, prefixLen * stride).CopyTo(keys[slot].Slice(0, prefixLen * stride));
+                new ReadOnlySpan<float>((void*)vr.DataPointer, prefixLen * stride).CopyTo(values[slot].Slice(0, prefixLen * stride));
+            }
+            clone.CopyFrom(s);
+        }
+        catch
+        {
+            clone.Dispose();
+            foreach (var b in keys) b?.Dispose();
+            foreach (var b in values) b?.Dispose();
+            throw;
+        }
+        return new PrefixSnapshot { State = clone, Keys = keys, Values = values, Length = prefixLen };
+    }
+
+    /// <inheritdoc/>
+    public void RestoreSequencePrefix(IDisposable snapshot, IKvCache kvCache, IRecurrentSequenceState? state)
+    {
+        if (snapshot is not PrefixSnapshot snap || state is not Qwen4ExpSequenceState s)
+            throw new ArgumentException("Snapshot / state are not this model's types.");
+        ArgumentNullException.ThrowIfNull(kvCache);
+        if (kvCache.MaxLength < snap.Length) throw new ArgumentException("The KV cache is smaller than the snapshot prefix.", nameof(kvCache));
+        if (kvCache.CurrentLength != 0) kvCache.Rollback(0);
+        int[] pos = new int[snap.Length];
+        for (int i = 0; i < pos.Length; i++) pos[i] = i;
+        foreach (var b in _blocks)
+        {
+            if (b.Qsa is null) continue;
+            int slot = b.QsaOrdinal, stride = b.Qsa.KvStride;
+            var kRef = new TensorRef(snap.Length, stride, DType.Float32, -1, (nint)snap.Keys[slot].Pointer);
+            var vRef = new TensorRef(snap.Length, stride, DType.Float32, -1, (nint)snap.Values[slot].Pointer);
+            kvCache.Update(kRef, vRef, pos, slot);
+        }
+        s.CopyFrom(snap.State);
+    }
+
+    // ── state accounting for memory planning ──
+
+    /// <summary>
+    /// Logical per-sequence state size after <paramref name="contextLength"/> tokens: the constant part (GDN ~113 MiB at the
+    /// released size, PLE history, indexer tails) plus the context-proportional pooled keys and QSA K/V rows.
+    /// </summary>
+    /// <param name="contextLength">Tokens consumed by the sequence.</param>
+    public Qwen4ExpStateBytes EstimateSequenceStateBytes(int contextLength) => Qwen4ExpStateBytes.Estimate(Config, contextLength);
+
+    /// <summary>
+    /// Size of a checkpoint taken at <paramref name="contextLength"/> tokens (what <see cref="CheckpointRecurrentState"/> copies,
+    /// assuming the QSA K/V rows live in an engine KV cache): everything except <see cref="Qwen4ExpStateBytes.Kv"/>.
+    /// </summary>
+    /// <param name="contextLength">Tokens consumed.</param>
+    public long CheckpointBytes(int contextLength) { var e = EstimateSequenceStateBytes(contextLength); return e.Total - e.Kv; }
+
+    /// <summary>Resident bytes of the model-owned default state, by owner.</summary>
+    public Qwen4ExpStateBytes DefaultStateBytes => _defaultState.ResidentBytes;
+
     // ───────────────────────────── lifetime ─────────────────────────────
 
     /// <inheritdoc/>
@@ -698,6 +994,8 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
     {
         if (_ownsPool) _threadPool?.Dispose();
         _defaultState.Dispose();
+        _spareCheckpoint?.Dispose();
+        _rowSnapGdn.Dispose(); _rowSnapConv.Dispose();
         foreach (nint p in _owned) NativeMemory.AlignedFree((void*)p);
         _owned.Clear();
         GC.SuppressFinalize(this);

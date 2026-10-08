@@ -11,13 +11,21 @@ namespace DotLLM.Cpu.Kernels;
 /// arrives, chunked prefill and token-by-token decode produce identical pooled keys to a single shot.
 /// </summary>
 /// <remarks>
-/// Backing arrays grow geometrically (CPU oracle; a native/paged layout belongs to the state-management work of #817).
+/// <para>Native memory (<see cref="Qwen4ExpNativeBuffer"/>), grown geometrically. Pooled block <c>b</c> is a pure function
+/// of raw keys <c>R*b .. R*b+R-1</c> and is never modified once written, so rolling back to token count <c>C</c> only needs
+/// the <b>tail</b> (the raw keys of the incomplete block at <c>C</c>) restored: pooled rows past <c>C / R</c> are simply
+/// unreachable and are re-derived bit-identically by a replay.</para>
 /// </remarks>
-public sealed class Qwen4ExpIndexerCache
+public sealed class Qwen4ExpIndexerCache : IDisposable
 {
-    private float[] _pooled;
-    private readonly float[] _tailRaw;
+    private readonly Qwen4ExpNativeBuffer _pooled = new();
+    private readonly Qwen4ExpNativeBuffer _tailRaw = new();
     private int _tailCount;
+
+    // Row-snapshot recording (speculative verify): the pre-chunk tail and the chunk's raw keys.
+    private readonly Qwen4ExpNativeBuffer _recPreTail = new();
+    private readonly Qwen4ExpNativeBuffer _recChunk = new();
+    private int _recPreTokens, _recPreTailCount, _recRows;
 
     /// <summary>Indexer key width (128 on the released model).</summary>
     public int HeadDim { get; }
@@ -32,19 +40,37 @@ public sealed class Qwen4ExpIndexerCache
     public int CompleteBlocks => TokenCount / BlockSize;
 
     /// <summary>Pooled keys of the complete blocks, <c>[CompleteBlocks, HeadDim]</c>.</summary>
-    public ReadOnlySpan<float> Pooled => _pooled.AsSpan(0, CompleteBlocks * HeadDim);
+    public unsafe ReadOnlySpan<float> Pooled
+        => CompleteBlocks == 0 ? default : new ReadOnlySpan<float>(_pooled.Pointer, CompleteBlocks * HeadDim);
 
-    /// <summary>Resident bytes (pooled keys + tail).</summary>
-    public long Bytes => (long)(_pooled.Length + _tailRaw.Length) * 4;
+    /// <summary>Resident bytes (pooled keys + tail + any row-snapshot scratch).</summary>
+    public long Bytes => _pooled.Bytes + _tailRaw.Bytes + _recPreTail.Bytes + _recChunk.Bytes;
+
+    /// <summary>Bytes of the pooled-key store (grows with context).</summary>
+    public long PooledBytes => _pooled.Bytes;
+
+    /// <summary>Bytes of the row-snapshot recording scratch.</summary>
+    public long SnapshotScratchBytes => _recPreTail.Bytes + _recChunk.Bytes;
+
+    /// <summary>Bytes of the tail block buffer (the part a checkpoint copies).</summary>
+    public long TailBytes => (long)BlockSize * HeadDim * sizeof(float);
+
+    /// <summary>Rows of the last recorded chunk that <see cref="RestoreToRow"/> can restore.</summary>
+    public int RecordedRows => _recRows;
+
+    /// <summary>When &gt; 0, the next <see cref="Append"/> records per-row snapshots for that many rows (set by the model).</summary>
+    internal int RecordRowCount { get; set; }
 
     /// <summary>Creates an empty cache.</summary>
+    /// <param name="headDim">Indexer key width.</param>
+    /// <param name="blockSize">Tokens per pooled block.</param>
     public Qwen4ExpIndexerCache(int headDim, int blockSize)
     {
         if (headDim <= 0 || blockSize <= 0) throw new ArgumentOutOfRangeException();
         HeadDim = headDim;
         BlockSize = blockSize;
-        _pooled = new float[16 * headDim];
-        _tailRaw = new float[blockSize * headDim];
+        _tailRaw.EnsureExact((long)blockSize * headDim);
+        _pooled.EnsureCapacity(16L * headDim);
     }
 
     /// <summary>Back to an empty sequence.</summary>
@@ -52,17 +78,33 @@ public sealed class Qwen4ExpIndexerCache
     {
         TokenCount = 0;
         _tailCount = 0;
+        _recRows = 0;
     }
 
-    /// <summary>Copies another cache of identical geometry (checkpoint / rollback).</summary>
+    /// <summary>Copies another cache of identical geometry (full copy: pooled blocks and tail).</summary>
     public void CopyFrom(Qwen4ExpIndexerCache other)
     {
         if (other.HeadDim != HeadDim || other.BlockSize != BlockSize) throw new ArgumentException("geometry mismatch.");
-        if (_pooled.Length < other._pooled.Length) _pooled = new float[other._pooled.Length];
-        other._pooled.AsSpan(0, other.CompleteBlocks * HeadDim).CopyTo(_pooled);
-        other._tailRaw.CopyTo(_tailRaw, 0);
+        int blocks = other.CompleteBlocks;
+        if (blocks > 0)
+        {
+            _pooled.EnsureCapacity((long)blocks * HeadDim);
+            other.Pooled.CopyTo(_pooled.Slice(0, blocks * HeadDim));
+        }
+        CopyTailFrom(other);
+    }
+
+    /// <summary>
+    /// Copies only the token count and the tail block of <paramref name="other"/> (checkpoint / rollback within one
+    /// sequence: the pooled blocks below the restored count are already in place and immutable).
+    /// </summary>
+    public void CopyTailFrom(Qwen4ExpIndexerCache other)
+    {
+        if (other.HeadDim != HeadDim || other.BlockSize != BlockSize) throw new ArgumentException("geometry mismatch.");
+        other._tailRaw.Slice(0, BlockSize * HeadDim).CopyTo(_tailRaw.Slice(0, BlockSize * HeadDim));
         _tailCount = other._tailCount;
         TokenCount = other.TokenCount;
+        _recRows = 0;
     }
 
     /// <summary>
@@ -82,10 +124,11 @@ public sealed class Qwen4ExpIndexerCache
         int d = HeadDim;
         if (rawKeys.Length < (long)count * d) throw new ArgumentException("rawKeys too small.", nameof(rawKeys));
         int half = ropeDim / 2;
+        if (RecordRowCount > 0) RecordChunk(rawKeys, count);
         Span<float> mean = stackalloc float[d];
         for (int i = 0; i < count; i++)
         {
-            rawKeys.Slice(i * d, d).CopyTo(_tailRaw.AsSpan(_tailCount * d, d));
+            rawKeys.Slice(i * d, d).CopyTo(_tailRaw.Slice((long)_tailCount * d, d));
             _tailCount++;
             TokenCount++;
             if (_tailCount < BlockSize) continue;
@@ -93,10 +136,10 @@ public sealed class Qwen4ExpIndexerCache
             // Complete block: mean (float accumulation, as HF's .float().mean), norm, rotate at the block's first position.
             int block = TokenCount / BlockSize - 1;
             mean.Clear();
-            for (int j = 0; j < BlockSize; j++) TensorPrimitives.Add(mean, _tailRaw.AsSpan(j * d, d), mean);
+            for (int j = 0; j < BlockSize; j++) TensorPrimitives.Add(mean, _tailRaw.Slice((long)j * d, d), mean);
             TensorPrimitives.Multiply(mean, 1.0f / BlockSize, mean);
-            EnsurePooled(block + 1);
-            Span<float> dst = _pooled.AsSpan(block * d, d);
+            _pooled.EnsureCapacity((long)(block + 1) * d);
+            Span<float> dst = _pooled.Slice((long)block * d, d);
             RmsNorm.Execute(mean, kNormGamma, eps, dst);
             int startPos = block * BlockSize;
             if (ropeDim > 0)
@@ -106,30 +149,67 @@ public sealed class Qwen4ExpIndexerCache
         }
     }
 
-    private void EnsurePooled(int blocks)
+    private void RecordChunk(ReadOnlySpan<float> rawKeys, int count)
     {
-        long need = (long)blocks * HeadDim;
-        if (need <= _pooled.Length) return;
-        long cap = _pooled.Length;
-        while (cap < need) cap *= 2;
-        Array.Resize(ref _pooled, checked((int)cap));
+        int d = HeadDim;
+        _recPreTokens = TokenCount;
+        _recPreTailCount = _tailCount;
+        _recPreTail.EnsureExact((long)BlockSize * d);
+        _tailRaw.Slice(0, BlockSize * d).CopyTo(_recPreTail.Slice(0, BlockSize * d));
+        _recChunk.EnsureExact(Math.Max(1L, (long)count * d));
+        rawKeys.Slice(0, count * d).CopyTo(_recChunk.Slice(0, count * d));
+        _recRows = Math.Min(RecordRowCount, Math.Max(count - 1, 0));
+    }
+
+    /// <summary>
+    /// Sets the cache to exactly what it was right after row <paramref name="row"/> of the last recorded chunk: token count
+    /// <c>pre + row + 1</c> and the tail rebuilt from the pre-chunk tail and the recorded raw keys. Pooled blocks are
+    /// untouched (append-only), so the result is bit-identical to a forward of only rows <c>0..row</c>.
+    /// </summary>
+    /// <param name="row">Row index in <c>[0, RecordedRows)</c>.</param>
+    public void RestoreToRow(int row)
+    {
+        if ((uint)row >= (uint)_recRows) throw new InvalidOperationException($"No indexer row snapshot for row {row} ({_recRows} recorded).");
+        int d = HeadDim, newCount = _recPreTokens + row + 1, tail = newCount % BlockSize;
+        int preTailStart = _recPreTokens - _recPreTailCount;
+        // The new tail is assembled in the (separate) live tail buffer from the recorded copies, never from itself.
+        for (int j = 0; j < tail; j++)
+        {
+            int q = newCount - tail + j;
+            var src = q < _recPreTokens
+                ? _recPreTail.Slice((long)(q - preTailStart) * d, d)
+                : _recChunk.Slice((long)(q - _recPreTokens) * d, d);
+            src.CopyTo(_tailRaw.Slice((long)j * d, d));
+        }
+        _tailCount = tail;
+        TokenCount = newCount;
+    }
+
+    /// <summary>Drops recorded row snapshots (a later forward invalidates them).</summary>
+    internal void InvalidateRows() => _recRows = 0;
+
+    /// <inheritdoc/>
+    public void Dispose()
+    {
+        _pooled.Dispose(); _tailRaw.Dispose(); _recPreTail.Dispose(); _recChunk.Dispose();
     }
 }
 
 /// <summary>
-/// Per-sequence, per-layer state of a Qwen4-Exp QSA attention layer: the K/V cache and the indexer key cache.
+/// Per-sequence, per-layer state of a Qwen4-Exp QSA attention layer: the indexer key cache and, when no engine
+/// <see cref="DotLLM.Core.Attention.IKvCache"/> carries the K/V rows, a native position-indexed K/V store.
 /// </summary>
 /// <remarks>
-/// CPU-oracle layout: the K/V rows live in geometrically grown managed arrays (at the released geometry and 262 K context that is
-/// ~0.5 GiB per layer of LOH-sized buffers). A native, paged and checkpointable layout belongs to the state-management work of
-/// issue #817; this class is the numerical reference, not the serving cache.
+/// <para><see cref="Length"/> is the indexer's token count: the single source of truth for the layer's position, valid in both
+/// modes. The own K/V store (<see cref="Keys"/>/<see cref="Values"/>) is allocated lazily on the first <see cref="AppendKv"/>,
+/// so a state driven through an engine KV cache never pays for it. Position-indexed: rolling back is a length change.</para>
 /// </remarks>
-public sealed class Qwen4ExpQsaState
+public sealed unsafe class Qwen4ExpQsaState : IDisposable
 {
-    private float[] _k, _v;
+    private readonly Qwen4ExpNativeBuffer _k = new(), _v = new();
 
-    /// <summary>Cached tokens.</summary>
-    public int Length { get; private set; }
+    /// <summary>Cached tokens (the indexer's token count).</summary>
+    public int Length => Indexer.TokenCount;
 
     /// <summary>Indexer key cache of this layer.</summary>
     public Qwen4ExpIndexerCache Indexer { get; }
@@ -142,51 +222,49 @@ public sealed class Qwen4ExpQsaState
     {
         KvStride = kvStride;
         Indexer = new Qwen4ExpIndexerCache(indexerHeadDim, blockSize);
-        _k = new float[64 * kvStride];
-        _v = new float[64 * kvStride];
     }
 
-    /// <summary>Cached keys <c>[Length, KvStride]</c>.</summary>
-    public ReadOnlySpan<float> Keys => _k.AsSpan(0, Length * KvStride);
+    /// <summary>Own-store keys <c>[Length, KvStride]</c> (empty when the K/V rows live in an engine KV cache).</summary>
+    public unsafe ReadOnlySpan<float> Keys
+        => _k.Pointer == null ? default : new ReadOnlySpan<float>(_k.Pointer, Length * KvStride);
 
-    /// <summary>Cached values <c>[Length, KvStride]</c>.</summary>
-    public ReadOnlySpan<float> Values => _v.AsSpan(0, Length * KvStride);
+    /// <summary>Own-store values <c>[Length, KvStride]</c>.</summary>
+    public unsafe ReadOnlySpan<float> Values
+        => _v.Pointer == null ? default : new ReadOnlySpan<float>(_v.Pointer, Length * KvStride);
 
-    /// <summary>Resident bytes (KV + indexer).</summary>
-    public long Bytes => (long)(_k.Length + _v.Length) * 4 + Indexer.Bytes;
+    /// <summary>Resident bytes (own K/V store + indexer).</summary>
+    public long Bytes => _k.Bytes + _v.Bytes + Indexer.Bytes;
 
     /// <summary>Back to an empty sequence.</summary>
-    public void Reset()
-    {
-        Length = 0;
-        Indexer.Reset();
-    }
+    public void Reset() => Indexer.Reset();
 
-    /// <summary>Copies another state of identical geometry.</summary>
+    /// <summary>Copies another state of identical geometry (own K/V rows below <c>other.Length</c> and the indexer).</summary>
     public void CopyFrom(Qwen4ExpQsaState other)
     {
-        if (_k.Length < other.Length * KvStride) { _k = new float[other._k.Length]; _v = new float[other._v.Length]; }
-        other.Keys.CopyTo(_k);
-        other.Values.CopyTo(_v);
-        Length = other.Length;
+        long floats = (long)other.Length * KvStride;
+        if (floats > 0 && other._k.Pointer != null)
+        {
+            _k.EnsureCapacity(floats); _v.EnsureCapacity(floats);
+            other.Keys.CopyTo(_k.Slice(0, (int)floats));
+            other.Values.CopyTo(_v.Slice(0, (int)floats));
+        }
         Indexer.CopyFrom(other.Indexer);
     }
 
-    /// <summary>Appends <paramref name="count"/> K/V rows.</summary>
+    /// <summary>
+    /// Appends <paramref name="count"/> K/V rows to the own store at row <see cref="Length"/>. Call BEFORE
+    /// <see cref="Qwen4ExpIndexerCache.Append"/> (which advances <see cref="Length"/>).
+    /// </summary>
     public void AppendKv(ReadOnlySpan<float> k, ReadOnlySpan<float> v, int count)
     {
-        long need = (long)(Length + count) * KvStride;
-        if (need > _k.Length)
-        {
-            long cap = _k.Length;
-            while (cap < need) cap *= 2;
-            Array.Resize(ref _k, checked((int)cap));
-            Array.Resize(ref _v, checked((int)cap));
-        }
-        k.Slice(0, count * KvStride).CopyTo(_k.AsSpan(Length * KvStride));
-        v.Slice(0, count * KvStride).CopyTo(_v.AsSpan(Length * KvStride));
-        Length += count;
+        long end = (long)(Length + count) * KvStride;
+        _k.EnsureCapacity(end); _v.EnsureCapacity(end);
+        k.Slice(0, count * KvStride).CopyTo(_k.Slice((long)Length * KvStride, count * KvStride));
+        v.Slice(0, count * KvStride).CopyTo(_v.Slice((long)Length * KvStride, count * KvStride));
     }
+
+    /// <inheritdoc/>
+    public void Dispose() { _k.Dispose(); _v.Dispose(); Indexer.Dispose(); }
 }
 
 /// <summary>
@@ -413,6 +491,9 @@ public sealed class Qwen4ExpQsaLayer
     /// <summary>Allocates an empty per-sequence state for this layer.</summary>
     public Qwen4ExpQsaState CreateState() => new(_numKvHeads * _headDim, _idxDim, _blockSize);
 
+    /// <summary>KV row width <c>numKvHeads * headDim</c> of this layer.</summary>
+    public int KvStride => _numKvHeads * _headDim;
+
     /// <summary>
     /// Runs the layer on a chunk of <paramref name="tokens"/> block-input rows (positions continue from <c>state.Length</c>)
     /// and appends their K/V and indexer keys to <paramref name="state"/>.
@@ -421,8 +502,12 @@ public sealed class Qwen4ExpQsaLayer
     /// <param name="tokens">Chunk length.</param>
     /// <param name="state">Per-sequence state.</param>
     /// <param name="output">Destination <c>[tokens, hidden]</c>.</param>
+    /// <param name="kvCache">Engine KV cache carrying this layer's K/V rows at <paramref name="kvSlot"/> (null: the state's own native store).
+    /// Rows <c>state.Length .. state.Length + tokens - 1</c> are written; the cache must already hold at least <c>state.Length</c> rows.</param>
+    /// <param name="kvSlot">Layer slot inside <paramref name="kvCache"/> (the QSA ordinal).</param>
     [SkipLocalsInit]
-    public void Forward(ReadOnlySpan<float> x, int tokens, Qwen4ExpQsaState state, Span<float> output)
+    public unsafe void Forward(ReadOnlySpan<float> x, int tokens, Qwen4ExpQsaState state, Span<float> output,
+                               DotLLM.Core.Attention.IKvCache? kvCache = null, int kvSlot = 0)
     {
         int nH = _numHeads, nKv = _numKvHeads, d = _headDim;
         int qElems = nH * d, kvElems = nKv * d, idxQElems = _idxHeads * _idxDim;
@@ -470,7 +555,32 @@ public sealed class Qwen4ExpQsaLayer
             }
 
             // ── cache update (this chunk is visible to its own queries) ──
-            state.AppendKv(k, v, tokens);
+            nint kvKeysPtr = 0, kvValuesPtr = 0;
+            if (kvCache is null)
+                state.AppendKv(k, v, tokens);
+            else
+            {
+                if (kvCache.CurrentLength < first)
+                    throw new InvalidOperationException(
+                        $"QSA KV cache holds {kvCache.CurrentLength} rows but the sequence state is at position {first}.");
+                int[] positions = ArrayPool<int>.Shared.Rent(tokens);
+                try
+                {
+                    for (int t = 0; t < tokens; t++) positions[t] = first + t;
+                    fixed (float* kp = k) fixed (float* vp = v)
+                    {
+                        var kRef = new DotLLM.Core.Tensors.TensorRef(tokens, kvElems, DotLLM.Core.Tensors.DType.Float32, -1, (nint)kp);
+                        var vRef = new DotLLM.Core.Tensors.TensorRef(tokens, kvElems, DotLLM.Core.Tensors.DType.Float32, -1, (nint)vp);
+                        kvCache.Update(kRef, vRef, positions.AsSpan(0, tokens), kvSlot);
+                    }
+                }
+                finally { ArrayPool<int>.Shared.Return(positions); }
+                var kr = kvCache.GetKeysRef(kvSlot); var vr = kvCache.GetValuesRef(kvSlot);
+                if (kr.DType != DotLLM.Core.Tensors.DType.Float32 || kr.Dim1 != kvElems || kr.Dim0 < first + tokens)
+                    throw new NotSupportedException(
+                        $"QSA needs a float32 KV cache slot of stride {kvElems} holding {first + tokens} rows; got {kr.DType} stride {kr.Dim1} rows {kr.Dim0}.");
+                kvKeysPtr = kr.DataPointer; kvValuesPtr = vr.DataPointer;
+            }
             state.Indexer.Append(ik, tokens, _idxKNorm, _eps, _ropeCos, _ropeSin, _ropeDim);
 
             // ── attention ──
@@ -482,7 +592,13 @@ public sealed class Qwen4ExpQsaLayer
             float[] blockScores = ArrayPool<float>.Shared.Rent(maxKeys / _blockSize + 1);
             try
             {
-                var keys = state.Keys; var values = state.Values;
+                ReadOnlySpan<float> keys, values;
+                if (kvCache is null) { keys = state.Keys; values = state.Values; }
+                else
+                {
+                    keys = new ReadOnlySpan<float>((void*)kvKeysPtr, (first + tokens) * kvElems);
+                    values = new ReadOnlySpan<float>((void*)kvValuesPtr, (first + tokens) * kvElems);
+                }
                 var pooled = state.Indexer.Pooled;
                 for (int t = 0; t < tokens; t++)
                 {
