@@ -170,7 +170,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         Func<int, (bool, bool, bool)>? skipRoutedF32 = config.MlaConfig is not null && config.Moe is not null
             ? static _ => (true, true, true)
             : null;
-        var weights = TransformerWeights.LoadFromGguf(gguf, config, moeBankSkipSelector: skipRoutedF32);
+        var weights = TransformerWeights.LoadFromGguf(gguf, config, moeBankSkipSelector: skipRoutedF32, allowNanoQuant: true);
         // Route through the shared state builder so the GGUF path gets the same
         // per-attention-type RoPE tables, partial-rotary handling, and distinct
         // per-layer head-dim scratch sizing as the safetensors path (Gemma 4 needs
@@ -3876,6 +3876,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             _littleBitScratch = set;
         }
         layer.GemmTokens(b, c, n, set, _threadPool);
+        FactorizedWeights.GetSalient(token)?.AddTo(b, c, n, k);   // NanoQuant salient columns (#869)
     }
 
     /// <summary>

@@ -56,7 +56,14 @@ public static class NanoQuantLoader
     /// <summary>Loads one composite as a <see cref="NanoQuantLayer"/>.</summary>
     /// <exception cref="InvalidDataException">Missing or inconsistent tensors.</exception>
     /// <exception cref="NotSupportedException">A tensor has a dtype this reader does not accept.</exception>
-    public static unsafe NanoQuantLayer Load(GgufFile file, string baseName)
+    public static NanoQuantLayer Load(GgufFile file, string baseName) => LoadSplit(file, baseName, [])[0];
+
+    /// <summary>
+    /// Loads a composite and splits its output rows into consecutive layers of <paramref name="rowCounts"/> rows each
+    /// (the community stacked <c>attn_qkv</c> = q, k, v rows with ONE shared right factor V, which is replicated per
+    /// slice). An empty <paramref name="rowCounts"/> yields the whole layer. Row counts must sum to d_out.
+    /// </summary>
+    public static NanoQuantLayer[] LoadSplit(GgufFile file, string baseName, ReadOnlySpan<int> rowCounts)
     {
         ValidateMetadata(file.Metadata);
         var u = Get(file, baseName, "nq_u", 2, QuantizationType.I32);
@@ -70,6 +77,8 @@ public static class NanoQuantLoader
         if (v.Shape[0] != (dIn + 31) / 32) throw new InvalidDataException($"{baseName}.nq_v has {v.Shape[0]} words/row, d_in {dIn} needs {(dIn + 31) / 32}.");
         if (mid.Shape[0] != r) throw new InvalidDataException($"{baseName}.nq_scale_mid length {mid.Shape[0]} != rank {r}.");
         if (post.Shape[0] != dOut) throw new InvalidDataException($"{baseName}.nq_scale_post length {post.Shape[0]} != d_out {dOut}.");
+        if (rowCounts.Length > 0 && rowCounts.ToArray().Sum() != dOut)
+            throw new InvalidDataException($"{baseName}: split rows {string.Join('+', rowCounts.ToArray())} != d_out {dOut}.");
 
         int[] uw = ReadI32(file, u), vw = ReadI32(file, v);
         int[] idx = [];
@@ -91,7 +100,19 @@ public static class NanoQuantLoader
             sw = ReadFloats(file, swt);
         }
 
-        return NanoQuantLayer.FromPacked(dOut, dIn, r, uw, vw, ReadFloats(file, pre), ReadFloats(file, mid), ReadFloats(file, post), idx, sw);
+        float[] preF = ReadFloats(file, pre), midF = ReadFloats(file, mid), postF = ReadFloats(file, post);
+        int uwPer = (r + 31) / 32, k = idx.Length;
+        int[] counts = rowCounts.Length == 0 ? [dOut] : rowCounts.ToArray();
+        var result = new NanoQuantLayer[counts.Length];
+        int row0 = 0;
+        for (int i = 0; i < counts.Length; i++)
+        {
+            int n = counts[i];
+            result[i] = NanoQuantLayer.FromPacked(n, dIn, r,
+                uw.AsSpan(row0 * uwPer, n * uwPer), vw, preF, midF, postF.AsSpan(row0, n), idx, sw.AsSpan(row0 * k, n * k));
+            row0 += n;
+        }
+        return result;
     }
 
     private static GgufTensorDescriptor Get(GgufFile f, string b, string role, int rank, QuantizationType? type)

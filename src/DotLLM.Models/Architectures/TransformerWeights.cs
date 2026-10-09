@@ -1273,14 +1273,34 @@ internal sealed class TransformerWeights : IDisposable
     /// unsupported bank no longer forces the F32 host dequant for its resident-capable
     /// siblings. <see langword="null"/> (the default) preserves the prior model-wide
     /// behavior driven solely by <paramref name="skipF32MoeDequant"/>.</param>
+    /// <param name="allowNanoQuant">True only for the CPU backend: accepts a community NanoQuant GGUF (#869). Every other
+    /// caller leaves it false and gets a clear <see cref="NotSupportedException"/> for such a file.</param>
     public static TransformerWeights LoadFromGguf(GgufFile gguf, ModelConfig config,
                                                     bool skipF32MoeDequant = false,
-                                                    Func<int, (bool SkipGate, bool SkipUp, bool SkipDown)>? moeBankSkipSelector = null)
+                                                    Func<int, (bool SkipGate, bool SkipUp, bool SkipDown)>? moeBankSkipSelector = null,
+                                                    bool allowNanoQuant = false)
     {
         ThrowIfArchitectureNeedsDedicatedLoader(config);
 
         var dataBase = new GgufDataBase(gguf);
         var tensors = gguf.TensorsByName;
+
+        // Community NanoQuant GGUF (issue #869): factorised linears, CPU + dense Qwen3 only. Every other consumer of this
+        // shared loader (Vulkan, CUDA, HIP, other architectures) must fail loudly rather than die on a missing tensor.
+        bool nanoQuant = DotLLM.Models.Quantization.NanoQuantLoader.IsNanoQuant(gguf);
+        if (nanoQuant)
+        {
+            if (!allowNanoQuant)
+                throw new NotSupportedException(
+                    "This GGUF stores NanoQuant factorised linears (nq_u/nq_v/nq_scale_*). They are supported on the CPU backend "
+                    + "only (use --device cpu); Vulkan, CUDA and HIP cannot run them.");
+            if (config.Architecture != DotLLM.Core.Configuration.Architecture.Qwen || config.Moe is not null || config.MlaConfig is not null)
+                throw new NotSupportedException(
+                    $"NanoQuant factorised linears are only supported for dense Qwen3, got Architecture.{config.Architecture}.");
+            if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+                throw new PlatformNotSupportedException("NanoQuant factorised linears require AVX2.");
+            DotLLM.Models.Quantization.NanoQuantLoader.ValidateMetadata(gguf.Metadata);
+        }
 
         // Token embeddings
         var embDesc = tensors["token_embd.weight"];
@@ -1294,7 +1314,7 @@ internal sealed class TransformerWeights : IDisposable
         // keeps the big expert banks as raw mmap views; its dense-PLE variant
         // (E2B/E4B) additionally owns F32 upcasts of the PLE projections when
         // they are not stored as F32 (per_layer_model_proj ships BF16).
-        var owned = config.MlaConfig is not null || config.PerLayerEmbedding is not null
+        var owned = config.MlaConfig is not null || config.PerLayerEmbedding is not null || nanoQuant
             ? new List<nint>()
             : null;
 
@@ -1306,7 +1326,7 @@ internal sealed class TransformerWeights : IDisposable
                 ? LoadMlaLayer(i, dataBase, tensors, config, owned!, skipF32MoeDequant, moeBankSkipSelector)
                 : config.Gemma4DualFfn
                     ? LoadGemma4Layer(i, dataBase, tensors, config, owned)
-                    : LoadLayer(i, dataBase, tensors, config);
+                    : LoadLayer(i, dataBase, tensors, config, nanoQuant ? gguf : null, owned);
         }
 
         // Output norm
@@ -1567,7 +1587,9 @@ internal sealed class TransformerWeights : IDisposable
         int layerIdx,
         GgufDataBase dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
-        ModelConfig config)
+        ModelConfig config,
+        GgufFile? nqFile = null,
+        List<nint>? nqOwned = null)
     {
         string prefix = $"blk.{layerIdx}";
         int hiddenSize = config.HiddenSize;
@@ -1601,7 +1623,20 @@ internal sealed class TransformerWeights : IDisposable
         QuantizationType qQt, kQt, vQt;
         int qM, qK, kM, kK, vM, vK;
 
-        if (tensors.TryGetValue($"{prefix}.attn_qkv.weight", out var qkvDesc))
+        if (nqFile is not null && tensors.ContainsKey($"{prefix}.attn_qkv.nq_u"))
+        {
+            // NanoQuant stacked QKV (q, k, v rows concatenated, one shared right factor): split into three layers (#869).
+            int qDim = config.NumAttentionHeads * layerHeadDim, kvDim = layerKvHeads * layerHeadDim;
+            var r = FactorizedWeights.ResolveNanoQuant(nqFile, $"{prefix}.attn_qkv", [qDim, kvDim, kvDim], nqOwned!);
+            (qPtr, qQt, qM, qK) = r[0]; (kPtr, kQt, kM, kK) = r[1]; (vPtr, vQt, vM, vK) = r[2];
+        }
+        else if (nqFile is not null && tensors.ContainsKey($"{prefix}.attn_q.nq_u"))
+        {
+            (qPtr, qQt, qM, qK) = FactorizedWeights.ResolveNanoQuant(nqFile, $"{prefix}.attn_q", [], nqOwned!)[0];
+            (kPtr, kQt, kM, kK) = FactorizedWeights.ResolveNanoQuant(nqFile, $"{prefix}.attn_k", [], nqOwned!)[0];
+            (vPtr, vQt, vM, vK) = FactorizedWeights.ResolveNanoQuant(nqFile, $"{prefix}.attn_v", [], nqOwned!)[0];
+        }
+        else if (tensors.TryGetValue($"{prefix}.attn_qkv.weight", out var qkvDesc))
         {
             // Fused QKV — split by row offset
             nint qkvPtr = dataBase.Of(qkvDesc);
@@ -1623,7 +1658,9 @@ internal sealed class TransformerWeights : IDisposable
             (vPtr, vQt, vM, vK) = LoadLinear(dataBase, tensors[$"{prefix}.attn_v.weight"]);
         }
 
-        var (oPtr, oQt, oM, oK) = LoadLinear(dataBase, tensors[$"{prefix}.attn_output.weight"]);
+        var (oPtr, oQt, oM, oK) = nqFile is not null && tensors.ContainsKey($"{prefix}.attn_output.nq_u")
+            ? FactorizedWeights.ResolveNanoQuant(nqFile, $"{prefix}.attn_output", [], nqOwned!)[0]
+            : LoadLinear(dataBase, tensors[$"{prefix}.attn_output.weight"]);
 
         // Optional biases — check for fused attn_qkv.bias (Phi-3 style)
         float[]? qBias, kBias, vBias;
@@ -1732,10 +1769,19 @@ internal sealed class TransformerWeights : IDisposable
         int gateM, gateK, upM, upK, downM, downK;
         float[]? gateBias, upBias, downBias;
 
-        (downPtr, downQt, downM, downK) = LoadLinear(dataBase, tensors[$"{prefix}.ffn_down.weight"]);
+        bool nqFfn = nqFile is not null && tensors.ContainsKey($"{prefix}.ffn_down.nq_u");
+        (downPtr, downQt, downM, downK) = nqFfn
+            ? FactorizedWeights.ResolveNanoQuant(nqFile!, $"{prefix}.ffn_down", [], nqOwned!)[0]
+            : LoadLinear(dataBase, tensors[$"{prefix}.ffn_down.weight"]);
         downBias = LoadOptionalBias(dataBase, tensors, $"{prefix}.ffn_down.bias");
 
-        if (tensors.TryGetValue($"{prefix}.ffn_gate.weight", out var gateDesc))
+        if (nqFfn)
+        {
+            (gatePtr, gateQt, gateM, gateK) = FactorizedWeights.ResolveNanoQuant(nqFile!, $"{prefix}.ffn_gate", [], nqOwned!)[0];
+            (upPtr, upQt, upM, upK) = FactorizedWeights.ResolveNanoQuant(nqFile!, $"{prefix}.ffn_up", [], nqOwned!)[0];
+            gateBias = null; upBias = null;
+        }
+        else if (tensors.TryGetValue($"{prefix}.ffn_gate.weight", out var gateDesc))
         {
             // Standard separate gate/up (Llama, Mistral, Qwen)
             (gatePtr, gateQt, gateM, gateK) = LoadLinear(dataBase, gateDesc);
