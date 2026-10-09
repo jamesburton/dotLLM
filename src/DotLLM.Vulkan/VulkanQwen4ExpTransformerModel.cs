@@ -366,7 +366,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
 
         Begin();
         _core.Q4StageBegin();
-        _ple?.BeginPrefetch(tokenIds, state.Ple!);   // #822: the n-gram rows depend only on token ids - start paging the table in before layer 0
+        if (NgramPrefetch) _ple?.BeginPrefetch(tokenIds, state.Ple!);   // #822: the n-gram rows depend only on token ids - start paging the table in before layer 0
         _core.Q4RecordEmbedding(cmd, tokenIds);
         Barrier();
         _core.Q4Stage("embed");
@@ -476,8 +476,10 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         if (recorded > 0) { _snapBase = positions[0]; _snapRowsRecorded = recorded; _snapValid = true; }
         if (mtp is not null)
         {
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             try { AbsorbBatch(mtp, tokenIds, positions[0]); }
             catch { logits.Dispose(); throw; }
+            _absorbTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
         }
         return logits;
     }
@@ -515,6 +517,12 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
             _core.Q4Stage("gr.inject_gains");
         }
     }
+
+    /// <summary>
+    /// Start paging the n-gram table rows of a chunk in at the top of the forward (#822) and, for MTP, while the draft steps run. On by default;
+    /// <c>DOTLLM_VK_Q4E_PREFETCH=0</c> turns it off at startup (A/B diagnostic - it never changes a result, only when the table pages become resident).
+    /// </summary>
+    public static bool NgramPrefetch { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_PREFETCH") != "0";
 
     private static int SplitHalvesAbove =
         int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_SPLIT_ABOVE"), out int sa) && sa >= 1 ? sa : 16;

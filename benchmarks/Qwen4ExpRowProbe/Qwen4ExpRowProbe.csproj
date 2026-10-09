@@ -16,6 +16,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\DotLLM.Core\DotLLM.Core.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Models\DotLLM.Models.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Engine\DotLLM.Engine.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Vulkan\DotLLM.Vulkan.csproj" />
   </ItemGroup>
 

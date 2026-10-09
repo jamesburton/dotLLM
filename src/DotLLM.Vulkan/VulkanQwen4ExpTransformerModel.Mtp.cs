@@ -53,6 +53,16 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
     /// <summary>Path-proof counters (tests): draft steps, absorbed cells, verify forwards that recorded snapshots, restores.</summary>
     internal long DraftSteps, AbsorbedCells, SnapshotForwards, SnapshotRestores;
 
+    /// <summary>Diagnostic: cumulative wall ms spent in the post-forward absorb, in snapshot restores and in draft steps (reset with <see cref="ResetMtpTimings"/>).</summary>
+    public (double AbsorbMs, double RestoreMs, double DraftMs, long DraftSteps) MtpTimings
+        => (_absorbTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency, _restoreTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency,
+            _draftTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency, DraftSteps);
+
+    /// <summary>Zeroes <see cref="MtpTimings"/>.</summary>
+    public void ResetMtpTimings() { _absorbTicks = _restoreTicks = _draftTicks = 0; DraftSteps = 0; }
+
+    private long _absorbTicks, _restoreTicks, _draftTicks;
+
     private sealed class MtpHead : IDisposable
     {
         public required VulkanQwen3MoeHybridTransformerModel Core;
@@ -63,9 +73,21 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         public required VulkanDevice.Buffer E, A, HN, B, Pair, RFront, RWork;
         public required List<nint> Owned;
         public GgufFile? OwnedFile;
+        /// <summary>Layer index of the head's attention block inside <see cref="Core"/> (0 for the real head's one-layer core).</summary>
+        public int AttnLayer;
+        /// <summary>Stand-in head (benchmarking): core, MoE bundle and GR weights belong to the trunk and are not disposed here.</summary>
+        public bool SharedWithTrunk;
 
         public void Dispose()
         {
+            if (SharedWithTrunk)
+            {
+                EhEmb.Dispose(); EhHid.Dispose(); Enorm.Dispose(); Hnorm.Dispose();
+                E.Dispose(); A.Dispose(); HN.Dispose(); B.Dispose(); Pair.Dispose(); RFront.Dispose(); RWork.Dispose();
+                foreach (nint p in Owned) NativeMemory.AlignedFree((void*)p);
+                Owned.Clear();
+                return;
+            }
             Moe.Dispose(); AttnGr.Dispose(); FfnGr.Dispose(); HeadGr.Dispose();
             EhEmb.Dispose(); EhHid.Dispose(); Enorm.Dispose(); Hnorm.Dispose();
             E.Dispose(); A.Dispose(); HN.Dispose(); B.Dispose(); Pair.Dispose(); RFront.Dispose(); RWork.Dispose();
@@ -109,10 +131,20 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
 
         int il = Config.NumLayers, H = _hidden, S = _streams, hcDim = S * H;
         string b = $"blk.{il}.", n = b + "nextn.";
+        long headBytes = 0;
+        foreach (var kv in tensors)
+        {
+            if (kv.Key is Qwen4ExpTensors.TokenEmbd or Qwen4ExpTensors.Output) continue;   // the trunk's embedding / LM head are used
+            long rows = 1;
+            for (int d = 1; d < kv.Value.Shape.Rank; d++) rows *= kv.Value.Shape[d];
+            headBytes += Dequantize.RowByteSize(kv.Value.Shape[0], kv.Value.QuantizationType) * rows;
+        }
+        EnsureDeviceHeadroom(headBytes);
         var owned = new List<nint>();
         VulkanQwen3MoeHybridTransformerModel? core = null;
         VulkanQwen4ExpGrWeights? attnGr = null, ffnGr = null, headGr = null;
         VulkanQwen3MoeMoeUpload.LayerBundle? moe = null;
+        VulkanDevice.Buffer? enorm = null, hnorm = null, ehEmb = null, ehHid = null;
         var bufs = new List<VulkanDevice.Buffer>();
         try
         {
@@ -145,7 +177,6 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
             if (core.Q4EnsureCapacity(AbsorbChunk)) core.Q4InvalidateCaches();
 
             long weightBytes = 0;
-            VulkanDevice.Buffer enorm, hnorm, ehEmb, ehHid;
             QuantizationType embQt, hidQt;
             using (var staging = VulkanStagingBuffer.Create(_device, 64L << 20))
             {
@@ -186,7 +217,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
             var head = new MtpHead
             {
                 Core = core, AttnGr = attnGr, FfnGr = ffnGr, HeadGr = headGr, Moe = moe,
-                EhEmb = ehEmb, EhHid = ehHid, Enorm = enorm, Hnorm = hnorm, EhEmbQt = embQt, EhHidQt = hidQt,
+                EhEmb = ehEmb!, EhHid = ehHid!, Enorm = enorm!, Hnorm = hnorm!, EhEmbQt = embQt, EhHidQt = hidQt,
                 E = Scratch((long)AbsorbChunk * H * 4), A = Scratch((long)AbsorbChunk * H * 4),
                 HN = Scratch(AbsorbChunk * rowBytes), B = Scratch(AbsorbChunk * rowBytes),
                 Pair = Scratch(AbsorbChunk * rowBytes), RFront = Scratch(AbsorbChunk * rowBytes), RWork = Scratch(AbsorbChunk * rowBytes),
@@ -202,10 +233,95 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         catch
         {
             moe?.Dispose(); attnGr?.Dispose(); ffnGr?.Dispose(); headGr?.Dispose(); core?.Dispose();
+            enorm?.Dispose(); hnorm?.Dispose(); ehEmb?.Dispose(); ehHid?.Dispose();
             foreach (var x in bufs) x.Dispose();
             foreach (nint p in owned) NativeMemory.AlignedFree((void*)p);
             throw;
         }
+    }
+
+
+    /// <summary>
+    /// BENCHMARKING AID, not a quality feature: attaches a stand-in head built from the trunk's own QSA layer <paramref name="trunkLayer"/>
+    /// (its attention, MoE bank and gated-residual modules, shared with the trunk) with a random <c>eh_proj</c>. It costs the same per draft
+    /// step as the real head (a QSA + 512-expert MoE block, the trunk's LM head) but needs only ~60 MB of extra device memory, so the round
+    /// time of the whole speculative path can be measured on a checkpoint that leaves no room for the real head (UD-Q4_K_XL fills this
+    /// box's device budget). Its drafts are noise: use the real head for acceptance.
+    /// </summary>
+    /// <param name="trunkLayer">Index of a QSA layer of the trunk.</param>
+    public void AttachStandInMtpHead(int trunkLayer)
+    {
+        if (_mtp is not null) throw new InvalidOperationException("An MTP head is already attached.");
+        if ((uint)trunkLayer >= (uint)Config.NumLayers || Config.HybridLayout!.LayerKind[trunkLayer] == HybridLayerKind.GatedDeltaNet)
+            throw new ArgumentOutOfRangeException(nameof(trunkLayer), "The stand-in head needs a QSA layer.");
+        int H = _hidden, S = _streams, hcDim = S * H;
+        var owned = new List<nint>();
+        var bufs = new List<VulkanDevice.Buffer>();
+        VulkanDevice.Buffer Scratch(long bytes) { var x = _device.AllocateDeviceLocal(bytes); bufs.Add(x); return x; }
+        try
+        {
+            long rowBytes = (long)hcDim * 4;
+            long q8Bytes = (long)H * (H / 32) * 34;
+            nint raw = (nint)NativeMemory.AlignedAlloc((nuint)q8Bytes, 64);
+            owned.Add(raw);
+            var rnd = new Random(1234);
+            var blk = new byte[34];
+            for (long i = 0; i < (long)H * (H / 32); i++)
+            {
+                rnd.NextBytes(blk);
+                BitConverter.TryWriteBytes(blk.AsSpan(0, 2), (Half)0.004f);
+                Marshal.Copy(blk, 0, raw + (nint)(i * 34), 34);
+            }
+            VulkanDevice.Buffer ehEmb, ehHid, enorm, hnorm;
+            QuantizationType q1, q2;
+            using (var staging = VulkanStagingBuffer.Create(_device, 64L << 20))
+            {
+                ehEmb = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(_device, staging, raw, QuantizationType.Q8_0, H, H, false, out q1, out _);
+                ehHid = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(_device, staging, raw, QuantizationType.Q8_0, H, H, false, out q2, out _);
+                enorm = VulkanQwen3MoeHybridWeights.UploadFloatArray(_device, staging, Enumerable.Repeat(1f, H).ToArray());
+                hnorm = VulkanQwen3MoeHybridWeights.UploadFloatArray(_device, staging, Enumerable.Repeat(1f, hcDim).ToArray());
+            }
+            _mtp = new MtpHead
+            {
+                Core = _core, AttnGr = _attnGr[trunkLayer], FfnGr = _ffnGr[trunkLayer], HeadGr = _headGr, Moe = _moe[trunkLayer],
+                EhEmb = ehEmb, EhHid = ehHid, Enorm = enorm, Hnorm = hnorm, EhEmbQt = q1, EhHidQt = q2,
+                E = Scratch((long)AbsorbChunk * H * 4), A = Scratch((long)AbsorbChunk * H * 4),
+                HN = Scratch(AbsorbChunk * rowBytes), B = Scratch(AbsorbChunk * rowBytes),
+                Pair = Scratch(AbsorbChunk * rowBytes), RFront = Scratch(AbsorbChunk * rowBytes), RWork = Scratch(AbsorbChunk * rowBytes),
+                Owned = owned, AttnLayer = trunkLayer, SharedWithTrunk = true,
+            };
+            EnsureScratch(AbsorbChunk);
+            if (_core.Q4EnsureCapacity(AbsorbChunk)) { _gr.InvalidateDescriptorCache(); _groupRms.InvalidateDescriptorCache(); _sigmoidGate.InvalidateDescriptorCache(); }
+        }
+        catch
+        {
+            foreach (var x in bufs) x.Dispose();
+            foreach (nint p in owned) NativeMemory.AlignedFree((void*)p);
+            throw;
+        }
+    }
+
+
+    /// <summary>
+    /// Refuses, with numbers, an attach that would not fit the device-local heap next to the resident trunk. This is a pure estimate and never
+    /// touches the device on purpose: on this box the released trunk (UD-Q4_K_XL, ~69 GiB) fills the 69.8 GiB device-local heap, a further
+    /// upload spills into the shared heap and then fails at the next submit with out-of-memory, and after one such failure EVERY later
+    /// allocation fails (measured: even a 113 MiB sequence state) - so the only safe check is the one that runs before anything is allocated.
+    /// <c>DOTLLM_VK_ALLOW_OVERCOMMIT=1</c> skips it (same switch as the load-time residency gate).
+    /// </summary>
+    private void EnsureDeviceHeadroom(long headBytes)
+    {
+        if (AllowOvercommit) return;
+        long local = _device.DeviceLocalHeapBytes();
+        var (trunk, _) = Qwen4ExpResidencyPlan.EstimateWeights(_gguf.TensorsByName, Config);
+        long scratch = Qwen4ExpResidencyPlan.KvBytes(Config, _kvCapacity) + (1L << 30) + (long)AbsorbChunk * _streams * _hidden * 4 * 8;
+        long need = trunk + headBytes + scratch;
+        if (need <= local) return;
+        static string G(long b) => $"{b / (double)(1L << 30):F1} GiB";
+        throw new NotSupportedException(
+            $"The MTP head does not fit the device-local heap next to the resident trunk: trunk {G(trunk)} + head {G(headBytes)} + KV/scratch {G(scratch)} = " +
+            $"{G(need)} against a {G(local)} heap (a failed upload would leave the device unable to allocate at all). Use a smaller trunk quantisation, " +
+            "or set DOTLLM_VK_ALLOW_OVERCOMMIT=1 to try anyway; decoding continues without speculation.");
     }
 
     // ───────────────────────────── IModel MTP surface ─────────────────────────────
@@ -290,6 +406,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
                 "row(s), or a later forward invalidated them.");
         if (row == _snapRowsRecorded) return;   // the live state IS the state after the last row
 
+        long tr0 = System.Diagnostics.Stopwatch.GetTimestamp();
         var st = _defaultState;
         var snap = _snapGdn!;
         long stateBytes = (long)st.Gdn.GdnStateElements * sizeof(float), convBytes = (long)st.Gdn.ConvStateElements * sizeof(float);
@@ -312,6 +429,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         st.Length = _snapBase + row + 1;
         _snapValid = false;
         SnapshotRestores++;
+        _restoreTicks += System.Diagnostics.Stopwatch.GetTimestamp() - tr0;
     }
 
     private Q4GdnRowSnapshots EnsureRowSnapshots(int rows)
@@ -372,6 +490,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
     /// <summary>One head draft step at <paramref name="position"/>; returns the argmax token, and the logits when <paramref name="logits"/> is given.</summary>
     private int RunDraftStep(VulkanQwen4ExpMtpState st, int tokenId, int position, Span<float> logits)
     {
+        long td0 = System.Diagnostics.Stopwatch.GetTimestamp();
         var h = _mtp ?? throw new NotSupportedException("No MTP head is attached (SupportsMtp=false).");
         if (position < 1)
             throw new ArgumentOutOfRangeException(nameof(position), "An MTP cell pairs a token with the residual of the position before it: position must be >= 1.");
@@ -398,7 +517,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         RecordMtpFront(cmd, h, tok, st.Pending, h.RWork, 1);
 
         RecordGrRead(cmd, h.AttnGr, h.RWork, hst.NormOutput, 1, inject: true);
-        h.Core.Q4RecordAttention(cmd, 0, 1, cpos, st.Kv);
+        h.Core.Q4RecordAttention(cmd, h.AttnLayer, 1, cpos, st.Kv);
         Barrier();
         _gr.RecordWrite(cmd, h.RWork, hst.NormOutput, _gains, 1, S, H);
         Barrier();
@@ -426,10 +545,11 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         _device.Download(tst.Logits, _mtpLogits);
         if (!logits.IsEmpty) _mtpLogits.AsSpan().CopyTo(logits);
         int top = TensorPrimitives.IndexOfMax((ReadOnlySpan<float>)_mtpLogits);
+        _draftTicks += System.Diagnostics.Stopwatch.GetTimestamp() - td0;
 
         // #822: the verify forward will be [last token, d1 .. dK]; its n-gram table rows depend only on those ids, and the prefix known so far
         // is enough to start paging them in while the remaining draft steps run (a later call wins; an abandoned request is harmless).
-        if (_ple is not null)
+        if (_ple is not null && NgramPrefetch)
         {
             if (st.Run.Count == 0 || position != st.RunNextPosition) { st.Run.Clear(); st.RunStart = position; }
             st.Run.Add(tokenId);
@@ -515,7 +635,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
             KernelSupport.ComputeTransferFullBarrier(cmd);
             RecordMtpFront(cmd, h, tokenIds.Slice(c0, m), h.Pair, h.RFront, m);
             RecordGrRead(cmd, h.AttnGr, h.RFront, hst.NormOutput, m, inject: false);
-            h.Core.Q4RecordAttention(cmd, 0, m, cpos, mtp.Kv);
+            h.Core.Q4RecordAttention(cmd, h.AttnLayer, m, cpos, mtp.Kv);
             KernelSupport.ComputeToHostBarrier(cmd);
             submit.SubmitAndWait();
             AbsorbedCells += m;

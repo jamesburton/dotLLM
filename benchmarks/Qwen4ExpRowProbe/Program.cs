@@ -2,6 +2,9 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using DotLLM.Core.Configuration;
+using DotLLM.Engine;
+using DotLLM.Engine.Samplers;
 using DotLLM.Models.Gguf;
 using DotLLM.Vulkan;
 
@@ -91,6 +94,82 @@ double TimeFwd(int rows, int ctx, int seed)
     return Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
 }
 
+
+static int ArgMaxOf(ReadOnlySpan<float> r) { int b = 0; for (int i = 1; i < r.Length; i++) if (r[i] > r[b]) b = i; return b; }
+
+unsafe float[] LastRow(DotLLM.Core.Tensors.ITensor t)
+{
+    using (t) return new ReadOnlySpan<float>((void*)(t.DataPointer + (nint)((long)(t.Shape[0] - 1) * vocab * 4)), vocab).ToArray();
+}
+
+// Plain 1-row greedy decode (the engine's non-speculative path) and MTP speculative decode over the SAME prompt in this process.
+// Both prefill in 512-row chunks; decode timing excludes the prefill. Returns a report block.
+void SpecRun(int[] ids, int n, int k, StringBuilder o, string label)
+{
+    int cap = Math.Min(ids.Length + n + 16, model.DenseContextLimit);
+    var plainTok = new List<int>(); var plainLogits = new List<float[]>();
+    double plainMs;
+    {
+        model.ResetSequenceState();
+        using var kv = model.CreateKvCache(cap);
+        float[] last = Array.Empty<float>();
+        for (int p = 0; p < ids.Length; p += 512)
+        {
+            int m = Math.Min(512, ids.Length - p);
+            last = LastRow(model.Forward(ids.AsSpan(p, m), Enumerable.Range(p, m).ToArray(), -1, kv, true));
+        }
+        plainTok.Add(ArgMaxOf(last)); plainLogits.Add(last);
+        var t0 = Stopwatch.GetTimestamp();
+        while (plainTok.Count < n)
+        {
+            last = LastRow(model.Forward([plainTok[^1]], [ids.Length + plainTok.Count - 1], -1, kv, true));
+            plainTok.Add(ArgMaxOf(last)); plainLogits.Add(last);
+        }
+        plainMs = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+    }
+    var gen = new List<int>(); var rounds = new List<int>(); double draftMs = 0, verifyMs = 0; double specMs;
+    {
+        model.ResetSequenceState();
+        using var kv = model.CreateKvCache(cap);
+        using var st = model.CreateMtpState(kv.MaxLength)!;
+        model.ResetMtpTimings();
+        var dec = new MtpSpeculativeDecoder(greedy: true);
+        var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
+        float[] last = Array.Empty<float>();
+        for (int p = 0; p < ids.Length; p += 512)
+        {
+            int m = Math.Min(512, ids.Length - p);
+            last = LastRow(model.Forward(ids.AsSpan(p, m), Enumerable.Range(p, m).ToArray(), -1, kv, null, st, true));
+        }
+        gen.Add(ArgMaxOf(last));
+        var buf = new int[k + 1];
+        var t0 = Stopwatch.GetTimestamp();
+        while (gen.Count < n)
+        {
+            int pos = ids.Length + gen.Count - 1;
+            var r = dec.DraftAndVerify(model, kv, st, pipeline, gen, null, pos, vocab, Math.Min(k, n - gen.Count), buf);
+            rounds.Add(r.AcceptedCount);
+            draftMs += r.DraftTicks * 1000.0 / Stopwatch.Frequency; verifyMs += r.VerifyTicks * 1000.0 / Stopwatch.Frequency;
+            for (int i = 0; i < r.AcceptedCount && gen.Count < n; i++) gen.Add(buf[i]);
+        }
+        specMs = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+    }
+    var mt = model.MtpTimings;
+    int div = -1;
+    for (int i = 0; i < n; i++) if (plainTok[i] != gen[i]) { div = i; break; }
+    string divTxt = "identical to plain 1-row greedy";
+    if (div >= 0)
+    {
+        var l = plainLogits[div]; float mx = l.Max(), mn = l.Min();
+        divTxt = $"DIVERGES at token {div}: 1-row logit gap(plain pick - verify pick) {l[plainTok[div]] - l[gen[div]]:F4} of range {mx - mn:F2}";
+    }
+    double plainTps = (n - 1) * 1000.0 / plainMs, specTps = (n - 1) * 1000.0 / specMs;
+    o.AppendLine($"{label}: ctx={ids.Length} n={n} K={k}: plain {plainTps:F2} tok/s ({plainMs / (n - 1):F1} ms/tok) | MTP {specTps:F2} tok/s | ratio {specTps / plainTps:F2}x | " +
+                 $"rounds {rounds.Count}, tokens/round {(double)(n - 1) / rounds.Count:F2}, draft {draftMs / rounds.Count:F1} ms/round, verify {verifyMs / rounds.Count:F1} ms/round, round {specMs / rounds.Count:F1} ms | {divTxt}");
+    o.AppendLine($"   in-process: absorb {mt.AbsorbMs / rounds.Count:F1} ms/round (incl. prefill absorbs), restore {mt.RestoreMs / rounds.Count:F1} ms/round, draft steps {mt.DraftMs / Math.Max(mt.DraftSteps, 1):F1} ms each");
+    o.AppendLine($"   accepted-per-round histogram: {string.Join(" ", rounds.GroupBy(x => x).OrderBy(g => g.Key).Select(g => $"{g.Key}:{g.Count()}"))}");
+}
+
 void Exec(string line, StringBuilder o)
 {
     var a = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -159,6 +238,123 @@ void Exec(string line, StringBuilder o)
             for (int i = 0; i < reps; i++) t.Add(TimeFwd(rows, ctx, 2 + i));
             t.Sort();
             o.AppendLine($"fwd rows={rows} ctx={ctx} reps={reps}: min {t[0]:F1} med {t[t.Count / 2]:F1} mean {t.Average():F1} max {t[^1]:F1} ms");
+            break;
+        }
+        case "attach":
+        {
+            var t0 = Stopwatch.GetTimestamp();
+            model.AttachMtpHead(a[1]);
+            o.AppendLine($"attach: {Stopwatch.GetElapsedTime(t0).TotalSeconds:F1} s, SupportsMtp={model.SupportsMtp}");
+            break;
+        }
+        case "standin":   // standin <trunkQsaLayer> : benchmark-only head from a trunk layer (no extra device memory)
+            model.AttachStandInMtpHead(int.Parse(a[1]));
+            o.AppendLine($"standin head from layer {a[1]}: SupportsMtp={model.SupportsMtp}");
+            break;
+        case "spec":   // spec <ctx> <n> <k> : the shared long text, ctx tokens
+            SpecRun(Ids(int.Parse(a[1]), 11), int.Parse(a[2]), int.Parse(a[3]), o, "spec");
+            break;
+        case "specp":  // specp <promptIdx|all> <n> <k> : the short chat/code prompts
+        {
+            for (int pi = 0; pi < prompts.Length; pi++)
+                if (a[1] == "all" || a[1] == pi.ToString())
+                    SpecRun(tok.Encode(prompts[pi]).ToArray(), int.Parse(a[2]), int.Parse(a[3]), o, $"prompt{pi}");
+            break;
+        }
+        case "pfill":   // pfill <rows> <reps> <prefetch 0|1> : prefill of FRESH random ids (cold table pages) from position 0, wall ms
+        {
+            int rows = int.Parse(a[1]), reps = int.Parse(a[2]);
+            VulkanQwen4ExpTransformerModel.NgramPrefetch = a[3] == "1";
+            var t = new List<double>();
+            var rnd = new Random(Environment.TickCount);
+            for (int i = 0; i < reps; i++)
+            {
+                var ids = Enumerable.Range(0, rows).Select(_ => rnd.Next(1000, Math.Max(2000, vocab - 10))).ToArray();
+                using var st = model.CreateState();
+                var t0 = Stopwatch.GetTimestamp();
+                using var lg = model.Forward(ids, Enumerable.Range(0, rows).ToArray(), -1, st);
+                t.Add(Stopwatch.GetElapsedTime(t0).TotalMilliseconds);
+            }
+            VulkanQwen4ExpTransformerModel.NgramPrefetch = true;
+            var ps = model.PleTableStats;
+            o.AppendLine($"pfill rows={rows} prefetch={a[3]}: ms [{string.Join(", ", t.Select(x => x.ToString("F0")))}] median {t.OrderBy(x => x).ElementAt(t.Count / 2):F0}" +
+                         (ps is { } s ? $" | table requests {s.Requests} rows {s.Rows} pages {s.UniquePages} waitMs {s.WaitMicros / 1000}" : ""));
+            break;
+        }
+        case "memtest":   // memtest <mib> <count> : how many extra <mib> buffers can be allocated AND used (copy) after the model is resident
+        {
+            long bytes = long.Parse(a[1]) << 20; int count = int.Parse(a[2]);
+            var bufs = new List<VulkanDevice.Buffer>();
+            int ok = 0;
+            try
+            {
+                var first = device.AllocateDeviceLocal(bytes); bufs.Add(first);
+                for (int i = 0; i < count; i++)
+                {
+                    var b = device.AllocateDeviceLocal(bytes); bufs.Add(b);
+                    device.CopyBufferSynchronous(first, b, (ulong)bytes);
+                    ok++;
+                }
+            }
+            catch (Exception e) { o.AppendLine($"memtest stopped: {e.GetType().Name}: {e.Message.Substring(0, Math.Min(120, e.Message.Length))}"); }
+            o.AppendLine($"memtest: {ok} x {a[1]} MiB extra buffers allocated+used; heap0 fallback bytes {device.FallbackBytesOnHeap(0)}, heap1 {device.FallbackBytesOnHeap(1)}");
+            foreach (var b in bufs) b.Dispose();
+            break;
+        }
+        case "vtime":   // vtime <ctx> <rows> <reps> : the verify forward by ingredient (needs an attached head)
+        {
+            int ctx = int.Parse(a[1]), rows = int.Parse(a[2]), reps = int.Parse(a[3]);
+            var ctxIds = Ids(ctx, 11); var ids = Ids(rows, 5);
+            var res = new Dictionary<string, List<double>> { ["plain"] = new(), ["snap"] = new(), ["mtp"] = new(), ["snap+mtp"] = new() };
+            for (int rep = 0; rep <= reps; rep++)
+                foreach (var mode in res.Keys.ToArray())
+                {
+                    model.ResetSequenceState();
+                    using var kv = model.CreateKvCache(Math.Min(ctx + rows + 16, model.DenseContextLimit));
+                    using var st = model.CreateMtpState(kv.MaxLength)!;
+                    bool useMtp = mode.Contains("mtp"), useSnap = mode.Contains("snap");
+                    for (int p = 0; p < ctx; p += 512)
+                    {
+                        int m = Math.Min(512, ctx - p);
+                        using var w = model.Forward(ctxIds.AsSpan(p, m), Enumerable.Range(p, m).ToArray(), -1, kv, null, st, true);
+                    }
+                    var pos = Enumerable.Range(ctx, rows).ToArray();
+                    var t0 = Stopwatch.GetTimestamp();
+                    using var lg = useSnap ? model.ForwardWithRecurrentSnapshots(ids, pos, -1, kv, useMtp ? st : null)
+                                           : model.Forward(ids, pos, -1, kv, null, useMtp ? st : null);
+                    double ms = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+                    if (rep > 0) res[mode].Add(ms);
+                }
+            o.AppendLine($"vtime ctx={ctx} rows={rows}: " + string.Join(" | ", res.Select(kv => $"{kv.Key} med {kv.Value.OrderBy(x => x).ElementAt(kv.Value.Count / 2):F1} min {kv.Value.Min():F1}")));
+            break;
+        }
+        case "vstage":   // vstage <ctx> <rows> <reps> : split-submit stages of the real verify forward (snapshots + MTP absorb)
+        {
+            int ctx = int.Parse(a[1]), rows = int.Parse(a[2]), reps = int.Parse(a[3]);
+            var ctxIds = Ids(ctx, 11); var ids = Ids(rows, 5);
+            var sums = new Dictionary<string, double>(); double tot = 0, absorb = 0;
+            for (int rep = 0; rep <= reps; rep++)
+            {
+                model.ResetSequenceState();
+                using var kv = model.CreateKvCache(Math.Min(ctx + rows + 16, model.DenseContextLimit));
+                using var st = model.CreateMtpState(kv.MaxLength)!;
+                for (int p = 0; p < ctx; p += 512)
+                {
+                    int m = Math.Min(512, ctx - p);
+                    using var w = model.Forward(ctxIds.AsSpan(p, m), Enumerable.Range(p, m).ToArray(), -1, kv, null, st, true);
+                }
+                VulkanQwen4ExpTransformerModel.StageProfile = true;
+                model.TakeStageTimes(); model.ResetMtpTimings();
+                var t0 = Stopwatch.GetTimestamp();
+                using (var lg = model.ForwardWithRecurrentSnapshots(ids, Enumerable.Range(ctx, rows).ToArray(), -1, kv, st)) { }
+                double ms = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+                VulkanQwen4ExpTransformerModel.StageProfile = false;
+                if (rep == 0) continue;
+                tot += ms; absorb += model.MtpTimings.AbsorbMs;
+                foreach (var kv2 in model.TakeStageTimes()) sums[kv2.Key] = sums.GetValueOrDefault(kv2.Key) + kv2.Value;
+            }
+            o.AppendLine($"vstage ctx={ctx} rows={rows}: forward {tot / reps:F1} ms (absorb {absorb / reps:F1} ms inside), stages sum {sums.Values.Sum() / reps:F1} ms");
+            foreach (var kv3 in sums.OrderByDescending(k => k.Value).Take(14)) o.AppendLine($"   {kv3.Key,-22} {kv3.Value / reps,8:F2} ms");
             break;
         }
         case "draft":
