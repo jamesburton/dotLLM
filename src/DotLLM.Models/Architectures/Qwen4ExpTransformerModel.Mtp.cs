@@ -26,7 +26,7 @@ namespace DotLLM.Models.Architectures;
 /// </code>
 /// All norm gammas are stored folded (<c>1 + w</c>), measured against the HF checkpoint tensors.</para>
 /// </remarks>
-public sealed unsafe partial class Qwen4ExpTransformerModel
+public sealed unsafe partial class Qwen4ExpTransformerModel : IMtpHeadAttachable
 {
     private sealed class MtpHead
     {
@@ -58,6 +58,9 @@ public sealed unsafe partial class Qwen4ExpTransformerModel
 
     /// <summary>True once an MTP head is attached.</summary>
     public bool SupportsMtp => _mtp is not null;
+
+    /// <inheritdoc/>
+    public bool HasMtpHead => _mtp is not null;
 
     /// <summary>Opens <paramref name="path"/> as the MTP head GGUF, attaches it and takes ownership of the file (disposed with the model).</summary>
     /// <param name="path">Path of the <c>mtp-*.gguf</c> file.</param>

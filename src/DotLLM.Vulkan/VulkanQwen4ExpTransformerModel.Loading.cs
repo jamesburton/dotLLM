@@ -130,8 +130,10 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             groupRms = GroupRmsNormF32Kernel.Create(device, spvDir);
             sigmoidGate = GdnPostScanGateF32Kernel.Create(device, spvDir, sigmoidGate: true);
 
-            return new VulkanQwen4ExpTransformerModel(device, gguf, config, core, attnGr.ToArray(), ffnGr.ToArray(), head, moeBundles.ToArray(),
+            var built = new VulkanQwen4ExpTransformerModel(device, gguf, config, core, attnGr.ToArray(), ffnGr.ToArray(), head, moeBundles.ToArray(),
                 ple, pleLayer, owned, hostOnly, gr, groupRms, sigmoidGate, kvCapacity, weightBytes);
+            built._spvDir = spvDir;
+            return built;
         }
         catch
         {

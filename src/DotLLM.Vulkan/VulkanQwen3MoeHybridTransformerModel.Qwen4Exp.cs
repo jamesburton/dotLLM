@@ -26,6 +26,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
         return resized;
     }
 
+    /// <summary>Drops every cached descriptor set (call after re-creating buffers the caller feeds into this model's kernels).</summary>
+    internal void Q4InvalidateCaches() { _kernels.InvalidateAll(); _iqF16Prefill?.InvalidateDescriptorCache(); }
+
     internal void Q4UploadPositions(ReadOnlySpan<int> positions) => UploadPositions(positions);
 
     internal void Q4RecordEmbedding(nint cmdBuf, ReadOnlySpan<int> tokenIds) => RecordEmbeddingGather(cmdBuf, tokenIds);
@@ -61,13 +64,19 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
 
 /// <summary>
 /// Per-row recurrent-state snapshots a speculative verify forward asks the Gated-DeltaNet layers to record (#820): the state after each
-/// of the first <see cref="Rows"/> rows (scan twin kernel, bit-identical to the shipping scan) and the conv window after each of them.
+/// of the first <see cref="Rows"/> rows (scan twin kernel, owned by the model, bit-identical to the shipping scan) and the conv window after each of them.
 /// Buffers are indexed by GDN ordinal: <c>Gdn[l]</c> holds <c>Rows x stateElements</c> floats, <c>Conv[l]</c> <c>Rows x convStateElements</c>.
 /// </summary>
-internal sealed class Q4GdnRowSnapshots
+internal sealed class Q4GdnRowSnapshots : IDisposable
 {
     public required GdnScanMultiTokenSnapshotF32Kernel Kernel { get; init; }
     public required VulkanDevice.Buffer[] Gdn { get; init; }
     public required VulkanDevice.Buffer[] Conv { get; init; }
     public int Rows { get; set; }
+
+    public void Dispose()
+    {
+        foreach (var b in Gdn) b?.Dispose();
+        foreach (var b in Conv) b?.Dispose();
+    }
 }

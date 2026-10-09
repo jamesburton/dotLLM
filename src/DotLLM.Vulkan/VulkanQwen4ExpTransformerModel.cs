@@ -153,6 +153,12 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
 
     // ───────────────────────────── state ─────────────────────────────
 
+    /// <summary>
+    /// Counters of the n-gram table prefetch / row-cache service (#822); <c>null</c> when the model has no n-gram branch or the service is off
+    /// (<c>DOTLLM_PLE_PREFETCH=off</c> without a cache).
+    /// </summary>
+    public PleTableStats? PleTableStats => _ple?.Prefetcher is { } pf ? pf.Stats : null;
+
     /// <summary>Allocates a fresh sequence state (KV capacity <see cref="DenseContextLimit"/>).</summary>
     public VulkanQwen4ExpSequenceState CreateState()
         => new(_core.Q4CreateGdnState(), () => _core.Q4CreateKvCache(_kvCapacity), _ple?.CreateState());
@@ -185,6 +191,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     {
         if (seqLen <= _scratchCapacity) return;
         _res?.Dispose(); _xn?.Dispose(); _low?.Dispose(); _mix?.Dispose(); _gains?.Dispose(); _headRes?.Dispose();
+        _core.Q4InvalidateCaches();   // freed handles can be recycled into the new buffers: no cached descriptor may name an old one
         long row = (long)_streams * _hidden;
         _res = _device.AllocateDeviceLocal(seqLen * row * 4);
         _xn = _device.AllocateDeviceLocal(seqLen * row * 4);
@@ -277,9 +284,11 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         => ForwardCore(tokenIds, positions, deviceId, state, null, lastTokenLogitsOnly: false);
 
     private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, VulkanQwen4ExpSequenceState state,
-                                IKvCache? kvCache, bool lastTokenLogitsOnly)
+                                IKvCache? kvCache, bool lastTokenLogitsOnly, VulkanQwen4ExpMtpState? mtp = null, int snapRows = 0, bool allRows = false)
     {
         ArgumentNullException.ThrowIfNull(state);
+        if (snapRows > 0 && !ReferenceEquals(state, _defaultState))
+            throw new InvalidOperationException("Row snapshots are only recorded on the model-owned state.");
         VulkanNemotronHKvCache kv;
         if (kvCache is null) kv = state.OwnKv;
         else if (kvCache is VulkanNemotronHKvCache vk) kv = vk;
@@ -296,6 +305,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
             throw new NotSupportedException(
                 $"qwen4exp on Vulkan attends densely, which is exact only up to {_kvCapacity} tokens (indexer budget {_q4.IndexerTopK} + block " +
                 $"{_q4.IndexerBlockSize} - 1); this call would reach {state.Length + T}. Sparse QSA block selection is issue #819.");
+        if (kvCache is null && kv.CurrentLength > state.Length) kv.Rollback(state.Length);   // rows of rejected speculative tokens
         if (kvCache is not null)
         {
             if (kv.CurrentLength < state.Length)
@@ -314,6 +324,18 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         EnsureScratch(T);
         if (resized) { _gr.InvalidateDescriptorCache(); _groupRms.InvalidateDescriptorCache(); _sigmoidGate.InvalidateDescriptorCache(); }
         _core.Q4UploadPositions(positions);
+
+        // Speculative verify (#820): record the recurrent state after each of the first T-1 rows (GDN scan twin + conv windows + n-gram state).
+        _snapValid = false;
+        state.Ple?.InvalidateRows();
+        int recorded = snapRows > 0 ? Math.Min(snapRows, T - 1) : 0;
+        Q4GdnRowSnapshots? snap = null;
+        if (recorded > 0)
+        {
+            snap = EnsureRowSnapshots(recorded);
+            snap.Rows = recorded;
+            if (state.Ple is { } ps) ps.RecordRowCount = recorded;
+        }
 
         var submit = _core.Q4Submit;
         var st = _core.Q4State;
@@ -344,6 +366,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
 
         Begin();
         _core.Q4StageBegin();
+        _ple?.BeginPrefetch(tokenIds, state.Ple!);   // #822: the n-gram rows depend only on token ids - start paging the table in before layer 0
         _core.Q4RecordEmbedding(cmd, tokenIds);
         Barrier();
         _core.Q4Stage("embed");
@@ -371,7 +394,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
             // ── token mixer ──
             GrRead(_attnGr[il], _res, T, inject: true);
             if (Config.HybridLayout!.LayerKind[il] == HybridLayerKind.GatedDeltaNet)
-                _core.Q4RecordGdn(cmd, il, T, _eps, state.Gdn, _sigmoidGate);
+                _core.Q4RecordGdn(cmd, il, T, _eps, state.Gdn, _sigmoidGate, snap);
             else
                 _core.Q4RecordAttention(cmd, il, T, positions, kv);
             Barrier();
@@ -404,7 +427,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         }
 
         // ── head mixer (replaces the final norm) + LM head: the LAST row, or every row when the caller opted in (perplexity) ──
-        int rows = !lastTokenLogitsOnly && T <= _allRowLogitsLimit ? T : 1;
+        int rows = allRows || (!lastTokenLogitsOnly && T <= _allRowLogitsLimit) ? T : 1;
         var w0 = _core.Q4Weights;
         if (rows == 1)
         {
@@ -417,7 +440,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
             state.Length += T;
             var one = UnmanagedTensor.Allocate(new TensorShape(1, _vocab), DType.Float32, deviceId: -1);
             _device.Download(st.Logits, new Span<float>((void*)one.DataPointer, _vocab));
-            return one;
+            return FinishForward(one, tokenIds, positions, state, mtp, recorded);
         }
 
         // All rows: head mixer over all T rows, then the LM head in chunks so the device logits scratch stays small
@@ -442,10 +465,23 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         }
         catch { result.Dispose(); throw; }
         state.Length += T;
-        return result;
+        return FinishForward(result, tokenIds, positions, state, mtp, recorded);
     }
 
-    /// <summary>GR read: group-RMS(src) -> low-rank mix -> block input written to <paramref name="dst"/>; inject gains when requested.</summary>
+    /// <summary>Common tail of a forward: closes the row recording and, when an MTP state rides along, feeds the batch to the head.</summary>
+    private ITensor FinishForward(ITensor logits, ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, VulkanQwen4ExpSequenceState state,
+                                  VulkanQwen4ExpMtpState? mtp, int recorded)
+    {
+        if (state.Ple is { } ps) ps.RecordRowCount = 0;
+        if (recorded > 0) { _snapBase = positions[0]; _snapRowsRecorded = recorded; _snapValid = true; }
+        if (mtp is not null)
+        {
+            try { AbsorbBatch(mtp, tokenIds, positions[0]); }
+            catch { logits.Dispose(); throw; }
+        }
+        return logits;
+    }
+
     /// <summary>GR read: group-RMS(src) -> low-rank mix -> block input written to <paramref name="dst"/>; inject gains when requested.</summary>
     private void RecordGrRead(nint cmd, VulkanQwen4ExpGrWeights w, VulkanDevice.Buffer src, VulkanDevice.Buffer dst, int tokens, bool inject)
     {
@@ -516,6 +552,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     {
         if (_disposed) return;
         _disposed = true;
+        _mtp?.Dispose();
+        _ple?.Prefetcher?.Dispose();
         _defaultState.Dispose();
         foreach (var m in _moe) m.Dispose();
         foreach (var g in _attnGr) g.Dispose();
@@ -523,6 +561,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         _headGr.Dispose();
         _res?.Dispose(); _xn?.Dispose(); _low?.Dispose(); _mix?.Dispose(); _gains?.Dispose(); _headRes?.Dispose();
         _headIn?.Dispose(); _headLogits?.Dispose();
+        _snapGdn?.Dispose(); _snapKernel?.Dispose();
         _gr.Dispose(); _groupRms.Dispose(); _sigmoidGate.Dispose();
         _core.Dispose();
         foreach (nint p in _owned) NativeMemory.AlignedFree((void*)p);
