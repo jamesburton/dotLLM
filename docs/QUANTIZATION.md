@@ -496,3 +496,7 @@ trainer (`tools/littlebit-qat`); no third-party code.
   trainer 401.02, `dotllm perplexity <dir> --tokens-file wikitext2_first40.tokens --context 2048 --stride 2048 --unscored-prefix 1` gives **400.89**
   (ratio 0.9997). The teacher (bf16 Qwen3-0.6B) is 19.6; this checkpoint is a 1500-step spike run, so the model is poor even though the engine matches.
 - Fixtures (`~/.dotllm/test-cache/littlebit-qwen3-0.6b-055`, or `DOTLLM_LITTLEBIT_CKPT`); tests skip cleanly when absent.
+- **Decode speed** (`dotllm run`, 64 tokens, CPU, same session, runs interleaved dense/LittleBit): LittleBit 19-30 tok/s vs 10-14 tok/s for the dense
+  Qwen3-0.6B baseline of the same model, per-pair ratios 1.4x-2.9x (median 2.3x). The "dense bf16" baseline is the safetensors loader's bf16->F32
+  upcast (there is no resident-bf16 GEMV), so it streams 4 B/weight; the box was at 100% CPU from other processes, so judge the ratio, not the absolutes.
+  Both runs include the F32-upcast tied lm_head (594 MiB/token), which is now a large share of the LittleBit decode traffic. Prefill (perplexity run): ~213 tok/s.
