@@ -144,7 +144,7 @@ public sealed class TextGenerator
         _prefillChunkSize = prefillChunkSize;
         _recurrentPrefixEnabled = recurrentPrefixCache && draftModel is null
             && model.RequiresPerSequenceState && model.SupportsRecurrentStateCheckpoint;
-        _mtpGate = mtpAdaptive && MtpAdaptiveGate.EnabledByEnvironment ? new MtpAdaptiveGate(model.ComputeMemoryBytes) : null;
+        _mtpGate = mtpAdaptive && MtpAdaptiveGate.EnabledByEnvironment ? new MtpAdaptiveGate(model.MtpGatePriorBytes) : null;
 
         if (hybridStrategy is not null
             && !ReferenceEquals(hybridStrategy.DecodeModel, model))

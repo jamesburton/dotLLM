@@ -29,7 +29,7 @@ internal delegate void Qwen4ExpTraceSink(string name, ReadOnlySpan<float> data, 
 /// <para>Positions must continue the sequence state (<c>positions[i] == state.Length + i</c>); the model-owned default state
 /// restarts when a call begins at position 0. The MTP block, vision tower and image-token PLE stand-in are not implemented.</para>
 /// </remarks>
-public sealed unsafe class Qwen4ExpTransformerModel : IModel
+public sealed unsafe partial class Qwen4ExpTransformerModel : IModel
 {
     private readonly record struct MatRef(nint Ptr, QuantizationType Qt, int In, int Out);
 
@@ -232,15 +232,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
             }
             else
             {
-                int nKv = layout.HeadCountKv[il];
-                block.Qsa = new Qwen4ExpQsaLayer(hidden, config.NumAttentionHeads, nKv, config.HeadDim, ropeDim,
-                    q4.IndexerHeadCount, q4.IndexerKeyLength, q4.IndexerBlockSize, q4.IndexerTopK, config.NormEpsilon,
-                    F32(b + "attn_q_norm.weight", config.HeadDim), F32(b + "attn_k_norm.weight", config.HeadDim),
-                    F32(b + "indexer.q_norm.weight", q4.IndexerKeyLength), F32(b + "indexer.k_norm.weight", q4.IndexerKeyLength),
-                    ropeCos, ropeSin,
-                    Projection(Mat(b + "attn_q.weight"), pool, lora, il, "q_proj"), Projection(Mat(b + "attn_k.weight"), pool, lora, il, "k_proj"),
-                    Projection(Mat(b + "attn_v.weight"), pool, lora, il, "v_proj"), Projection(Mat(b + "attn_output.weight"), pool, lora, il, "o_proj"),
-                    Projection(Mat(b + "indexer.q_proj.weight"), pool), Projection(Mat(b + "indexer.k_proj.weight"), pool));
+                block.Qsa = LoadQsa(b, il, config, q4, gguf, tensors, pool, lora, ropeCos, ropeSin);
                 block.QsaOrdinal = qsaOrd++;
             }
 
@@ -266,8 +258,10 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
             blocks[il] = block;
         }
 
-        return new Qwen4ExpTransformerModel(config, gguf, blocks, head, embPtr, embDesc.QuantizationType, output,
-                                            pool, ownsPool: pool is not null, owned, lora);
+        var model = new Qwen4ExpTransformerModel(config, gguf, blocks, head, embPtr, embDesc.QuantizationType, output,
+                                                 pool, ownsPool: pool is not null, owned, lora);
+        model._ropeCos = ropeCos; model._ropeSin = ropeSin;   // shared with the MTP head's QSA layer (AttachMtpHead)
+        return model;
     }
 
     private static ComputeThreadPool? CreatePool(ThreadingConfig threading)
@@ -281,6 +275,49 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
             return new ComputeThreadPool(n, topology, threading);
         }
         return new ComputeThreadPool(n, topology: null, threading);
+    }
+
+    private static GrWeights LoadGr(GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, int hcDim,
+                                    string prefix, string norm, string down, string up, string? inject)
+    {
+        MatRef Mat(string name)
+        {
+            var d = tensors[name];
+            return new MatRef(gguf.TensorDataPointer(d), d.QuantizationType, d.Shape[0], d.Shape.Rank > 1 ? d.Shape[1] : 1);
+        }
+        var nd = tensors[prefix + norm];
+        var gamma = new float[hcDim];
+        Dequantize.ToFloat32(gguf.TensorDataPointer(nd), hcDim, nd.QuantizationType, gamma);
+        return new GrWeights { Norm = gamma, Down = Mat(prefix + down), Up = Mat(prefix + up), Inject = inject is null ? null : Mat(prefix + inject) };
+    }
+
+    /// <summary>One QSA attention layer from <paramref name="b"/> + tensor names, shared by the trunk loader and the MTP head loader.</summary>
+    private static Qwen4ExpQsaLayer LoadQsa(string b, int il, ModelConfig config, Qwen4ExpConfig q4, GgufFile gguf,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, ComputeThreadPool? pool, Qwen4ExpLoraContext? lora,
+        float[] ropeCos, float[] ropeSin)
+    {
+        MatRef Mat(string name)
+        {
+            var d = tensors[name];
+            return new MatRef(gguf.TensorDataPointer(d), d.QuantizationType, d.Shape[0], d.Shape.Rank > 1 ? d.Shape[1] : 1);
+        }
+        float[] F32(string name, long count)
+        {
+            var d = tensors[name];
+            var r = new float[count];
+            Dequantize.ToFloat32(gguf.TensorDataPointer(d), count, d.QuantizationType, r);
+            return r;
+        }
+        int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
+        int nKv = tensors[b + "attn_k.weight"].Shape[1] / config.HeadDim;   // from the K projection: the MTP block has no layout entry
+        return new Qwen4ExpQsaLayer(config.HiddenSize, config.NumAttentionHeads, nKv, config.HeadDim, ropeDim,
+            q4.IndexerHeadCount, q4.IndexerKeyLength, q4.IndexerBlockSize, q4.IndexerTopK, config.NormEpsilon,
+            F32(b + "attn_q_norm.weight", config.HeadDim), F32(b + "attn_k_norm.weight", config.HeadDim),
+            F32(b + "indexer.q_norm.weight", q4.IndexerKeyLength), F32(b + "indexer.k_norm.weight", q4.IndexerKeyLength),
+            ropeCos, ropeSin,
+            Projection(Mat(b + "attn_q.weight"), pool, lora, il, "q_proj"), Projection(Mat(b + "attn_k.weight"), pool, lora, il, "k_proj"),
+            Projection(Mat(b + "attn_v.weight"), pool, lora, il, "v_proj"), Projection(Mat(b + "attn_output.weight"), pool, lora, il, "o_proj"),
+            Projection(Mat(b + "indexer.q_proj.weight"), pool), Projection(Mat(b + "indexer.k_proj.weight"), pool));
     }
 
     private static GdnTokenMixingWeights LoadGdn(string b, GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> t, GatedDeltaNetConfig g)
@@ -507,7 +544,8 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
 
     private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
                                 Qwen4ExpSequenceState state, IKvCache? kvCache, bool lastTokenLogitsOnly, int snapRows,
-                                ReadOnlySpan<float> externalEmbeddings = default, ILoraAdapter? adapter = null)
+                                ReadOnlySpan<float> externalEmbeddings = default, ILoraAdapter? adapter = null,
+                                Qwen4ExpMtpState? mtp = null)
     {
         ArgumentNullException.ThrowIfNull(state);
         int T = tokenIds.Length;
@@ -533,7 +571,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         _lora.Adapter = adapter;   // consulted by the projections for the duration of this call only (not reentrant, like TransformerModel)
         try
         {
-            return ForwardBody(tokenIds, deviceId, state, kvCache, lastTokenLogitsOnly, snapRows, externalEmbeddings);
+            return ForwardBody(tokenIds, deviceId, state, kvCache, lastTokenLogitsOnly, snapRows, externalEmbeddings, mtp);
         }
         finally
         {
@@ -561,7 +599,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
     }
 
     private ITensor ForwardBody(ReadOnlySpan<int> tokenIds, int deviceId, Qwen4ExpSequenceState state, IKvCache? kvCache,
-                                bool lastTokenLogitsOnly, int snapRows, ReadOnlySpan<float> externalEmbeddings)
+                                bool lastTokenLogitsOnly, int snapRows, ReadOnlySpan<float> externalEmbeddings, Qwen4ExpMtpState? mtp)
     {
         int T = tokenIds.Length;
         _threadPool?.SetDispatchMode(T == 1 ? DispatchMode.SpinWait : DispatchMode.EventBased);
@@ -616,6 +654,9 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
                 if (TensorDump.Enabled) DumpResidual(il, res, T, row);
             }
 
+            // MTP (#820): the head reads the 4-stream residual BEFORE the head mixer (not the mixed hidden), one row per position.
+            if (mtp is not null) mtp.SetCapturedRows(res.AsSpan(0, T * row), T);
+
             // ── head mixer (replaces the final norm) + LM head ──
             GrRead(_head, res, xn, low, mix, h, gains, T, wantInject: false);
             if (Trace is { } trh) trh("hidden_final", h.AsSpan(0, T * H), T, H);
@@ -625,7 +666,9 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
             var result = UnmanagedTensor.Allocate(new TensorShape(rows, vocab), DType.Float32, deviceId);
             var logits = new Span<float>((void*)result.DataPointer, rows * vocab);
             GemmSpan(_output, h.AsSpan(firstRow * H, rows * H), logits, rows, _threadPool);
+            int firstPosition = state.Length;
             state.Length += T;
+            if (mtp is not null) AbsorbMtp(mtp, tokenIds, firstPosition);
             return result;
         }
         finally
@@ -917,10 +960,9 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
     public ITensor ForwardWithRecurrentSnapshots(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
                                                  IKvCache? kvCache, IMtpState? mtpState)
     {
-        if (mtpState is not null)
-            throw new NotSupportedException("qwen4exp has no MTP head on the CPU oracle yet (mtpState must be null).");
+        var mtp = RequireMtpState(mtpState);
         int rows = Math.Max(tokenIds.Length - 1, 0);
-        var logits = ForwardCore(tokenIds, positions, deviceId, _defaultState, kvCache, lastTokenLogitsOnly: false, snapRows: rows);
+        var logits = ForwardCore(tokenIds, positions, deviceId, _defaultState, kvCache, lastTokenLogitsOnly: false, snapRows: rows, mtp: mtp);
         _snapBase = positions[0];
         _snapRowsRecorded = rows;
         _snapValid = true;
@@ -1128,6 +1170,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
         if (_ownsPool) _threadPool?.Dispose();
         _defaultState.Dispose();
         foreach (var b in _blocks) b.Ple?.Prefetcher?.Dispose();
+        _mtp?.OwnedFile?.Dispose();
         _spareCheckpoint?.Dispose();
         _rowBase?.Dispose(); _rowRecK.Dispose(); _rowRecG.Dispose(); _rowRecD.Dispose(); _rowSnapConv.Dispose();
         foreach (nint p in _owned) NativeMemory.AlignedFree((void*)p);
