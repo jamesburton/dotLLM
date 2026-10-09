@@ -1,4 +1,4 @@
-﻿using DotLLM.Vulkan.Kernels;
+﻿﻿using DotLLM.Vulkan.Kernels;
 
 namespace DotLLM.Vulkan;
 
@@ -41,8 +41,18 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ6K { get; private set; }
     // Decode-path (small expanded-row count) indexed dp4a MMVQ GEMVs: coalesced subgroup-per-cell, replacing the one-thread-per-cell MMQ/scalar kernels.
     public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ4K { get; private set; }
+    /// <summary>Multi-row (NR output rows per workgroup) Q4_K indexed MMVQ for the 2..15-token MoE steps (#876); null = off.</summary>
+    public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ4KMr { get; private set; }
+    /// <summary>Multi-row Q5_1 indexed MMVQ (down bank) for the 2..15-token MoE steps (#876); null = off.</summary>
+    public MoeIndexedMatmulQ5_1MmvqKernel? MoeMmvqQ5_1Mr { get; private set; }
     /// <summary>Dense Q8_0 decode MMVQ GEMV (dp4a, coalesced) for the GDN / attention / shared-expert projections (all Q8_0 in the UD-Q4_K_M GGUF).</summary>
     public MatMulQ8_0MmvqKernel? MatMulQ8Mmvq { get; private set; }
+    /// <summary>Q8_0 multi-column MMVQ GEMV for 2..8 rows (#876); null when disabled (<c>DOTLLM_VK_SMALLROW_GEMV=0</c>) or unsupported.</summary>
+    public MatMulQ8_0MmvqMultiKernel? MatMulQ8MmvqMulti { get; private set; }
+    /// <summary>F32 multi-column GEMV for 2..8 rows (#876); null when disabled or unsupported.</summary>
+    public MatMulF32GemvMultiKernel? MatMulF32Multi { get; private set; }
+    /// <summary>F16 multi-column GEMV for 2..8 rows (#876); null when unsupported.</summary>
+    public MatMulF16GemvMultiKernel? MatMulF16Multi { get; private set; }
     // One-dispatch replacements for the per-token vkCmdCopyBuffer fan-out loops (GDN [Q|K|V] split, attention Q+gate de-interleave).
     public DeinterleaveF32Kernel? GdnQkvSplit { get; private set; }
     public DeinterleaveF32Kernel? QGateDeinterleave { get; private set; }
@@ -457,6 +467,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             moeIndexedQ4KMmq, quantizeQ8_1Rows, moeIndexedQ5KMmq, moeScatter, moeSigmoidGatedAdd);
         kernels.MoeSharedGateAdd = moeSharedGateAdd;
         kernels.MatMulBf16Multi = matmulBf16Multi;
+        kernels.MatMulF32Multi = MatMulF32GemvMultiKernel.TryCreate(device, spvDir);
+        kernels.MatMulF16Multi = MatMulF16GemvMultiKernel.TryCreate(device, spvDir);
+        kernels.MatMulQ8MmvqMulti = MatMulQ8_0MmvqMultiKernel.TryCreate(device, spvDir);
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_GDN_CONV_FUSED") != "0" && GdnConvSiluF32Kernel.IsSupportedOn(spvDir))
             kernels.GdnConvSilu = GdnConvSiluF32Kernel.Create(device, spvDir);
 
@@ -533,6 +546,14 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MMVQ") != "0")
         {
             kernels.MoeMmvqQ4K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q4_K);
+            // Multi-row variants (#876): measured best at NR = 2 for the ALU-heavy Q4_K gate/up and NR = 4 for the Q5_1 down;
+            // DOTLLM_VK_MOE_MR=<n> forces n for both, DOTLLM_VK_MOE_MR=0 disables them.
+            int moeMrEnv = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MR"), out int mrv) ? mrv : -1;
+            if (moeMrEnv != 0 && moeMrEnv != 1)
+            {
+                kernels.MoeMmvqQ4KMr = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q4_K, moeMrEnv > 1 ? moeMrEnv : 2);
+                kernels.MoeMmvqQ5_1Mr = MoeIndexedMatmulQ5_1MmvqKernel.TryCreate(device, spvDir, moeMrEnv > 1 ? moeMrEnv : 4);
+            }
             if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_Q8_MMVQ") != "0")
                 kernels.MatMulQ8Mmvq = MatMulQ8_0MmvqKernel.TryCreate(device, spvDir);
             if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_DECODE_FUSED") != "0")
@@ -635,7 +656,12 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeGroupedQ5K?.InvalidateDescriptorCache();
         MoeGroupedQ6K?.InvalidateDescriptorCache();
         MoeMmvqQ4K?.InvalidateDescriptorCache();
+        MoeMmvqQ4KMr?.InvalidateDescriptorCache();
+        MoeMmvqQ5_1Mr?.InvalidateDescriptorCache();
         MatMulQ8Mmvq?.InvalidateDescriptorCache();
+        MatMulQ8MmvqMulti?.InvalidateDescriptorCache();
+        MatMulF32Multi?.InvalidateDescriptorCache();
+        MatMulF16Multi?.InvalidateDescriptorCache();
         GdnQkvSplit?.InvalidateDescriptorCache();
         QGateDeinterleave?.InvalidateDescriptorCache();
         RmsNormQuantizeFused?.InvalidateDescriptorCache();
@@ -653,7 +679,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
 
     public void Dispose()
     {
-        MoeIndexedMatmulQ5_1?.Dispose(); MoeIndexedMatmulQ8_0?.Dispose(); MoeMmvqQ5_1?.Dispose(); MoeMmvqQ8_0?.Dispose();
+        MoeIndexedMatmulQ5_1?.Dispose(); MoeIndexedMatmulQ8_0?.Dispose(); MoeMmvqQ5_1?.Dispose(); MoeMmvqQ8_0?.Dispose(); MoeMmvqQ4KMr?.Dispose(); MoeMmvqQ5_1Mr?.Dispose();
         MoeGroupedQ5_1?.Dispose(); MoeGroupedQ8_0?.Dispose(); MoeGroupedQ4K16?.Dispose();
         QGateDeinterleave?.Dispose(); GdnQkvSplit?.Dispose(); SwiGluQuantizeFused?.Dispose(); RmsNormQuantizeFused?.Dispose(); MatMulQ8Mmvq?.Dispose(); MoeMmvqQ6K?.Dispose(); MoeMmvqQ5K?.Dispose(); MoeMmvqQ4K?.Dispose();
         MoeGroupedQ6K?.Dispose(); MoeGroupedQ5K?.Dispose(); MoeGroupedQ4K?.Dispose(); MoeUngroupScatter?.Dispose();
@@ -690,6 +716,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         RmsNorm.Dispose();
         MatMulBf16Gemm.Dispose();
         MatMulBf16Multi?.Dispose();
+        MatMulQ8MmvqMulti?.Dispose();
+        MatMulF32Multi?.Dispose();
+        MatMulF16Multi?.Dispose();
         MatMulBf16.Dispose();
         MatMulF16GemmCoopmat?.Dispose();
         MatMulF16Gemm.Dispose();

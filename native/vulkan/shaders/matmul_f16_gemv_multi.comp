@@ -1,0 +1,53 @@
+#version 450
+// F16 multi-column matrix-vector product (2..8 activation rows, #876): Y[col, m] = sum_k W_f16[m, k] * X[col, k].
+//
+// matmul_f16_gemv_f32.comp for N columns at once: each weight uint (two F16) is read once and FMA'd against all NC activation rows,
+// so a 2..8-token verify batch costs about one GEMV instead of the 128x128 coopmat GEMM (used for the qwen4exp shared-expert down
+// projection, 640 -> 2560). NC is a specialization constant. K must be even. Output layout [NC, M].
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint NC = 2u;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };       // [NC, K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };       // [NC, M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint pairsPerRow;  // K / 2
+    uint rowUints;     // == pairsPerRow
+} pc;
+
+shared float partials[NC][128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint rowUintBase = m * pc.rowUints;
+
+    float acc[NC];
+    for (uint cc = 0u; cc < NC; ++cc) acc[cc] = 0.0;
+
+    for (uint p = tid; p < pc.pairsPerRow; p += 128u) {
+        vec2 w = unpackHalf2x16(weight[rowUintBase + p]);
+        uint kBase = p * 2u;
+        for (uint cc = 0u; cc < NC; ++cc) {
+            uint xb = cc * pc.K + kBase;
+            acc[cc] += w.x * x[xb];
+            acc[cc] += w.y * x[xb + 1u];
+        }
+    }
+
+    for (uint cc = 0u; cc < NC; ++cc) partials[cc][tid] = acc[cc];
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (tid < stride)
+            for (uint cc = 0u; cc < NC; ++cc) partials[cc][tid] += partials[cc][tid + stride];
+        barrier();
+    }
+    if (tid < NC) y[tid * pc.M + m] = partials[tid][0];
+}

@@ -30,9 +30,14 @@ public sealed class MoeIndexedMatmulKQuantMmvqKernel : IDisposable
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
+    private readonly int _rowsPerGroup;
 
-    private MoeIndexedMatmulKQuantMmvqKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, int blockBytes)
+    /// <summary>Output rows each workgroup produces (1 = one cell per workgroup; &gt; 1 = the multi-row variant, #876; Q4_K only).</summary>
+    public int RowsPerGroup => _rowsPerGroup;
+
+    private MoeIndexedMatmulKQuantMmvqKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, int blockBytes, int rowsPerGroup)
     {
+        _rowsPerGroup = rowsPerGroup;
         _blockBytes = blockBytes;
         _device = device;
         _module = module;
@@ -45,14 +50,14 @@ public sealed class MoeIndexedMatmulKQuantMmvqKernel : IDisposable
     /// Loads <c>moe_indexed_matmul_{q4_k_xdiv,q5_k,q6_k}_mmvq.spv</c> from <paramref name="spvDir"/> and builds the pipeline. Returns
     /// <c>null</c> when the SPV is missing or the device lacks integer-dot-product support (callers keep their scalar/MMQ fallback).
     /// </summary>
-    public static MoeIndexedMatmulKQuantMmvqKernel? TryCreate(VulkanDevice device, string spvDir, MoeGroupedKQuant quant)
+    public static MoeIndexedMatmulKQuantMmvqKernel? TryCreate(VulkanDevice device, string spvDir, MoeGroupedKQuant quant, int rowsPerGroup = 1)
     {
         if (!device.HasIntegerDotProduct)
             return null;
 
         (string name, int blockBytes) = quant switch
         {
-            MoeGroupedKQuant.Q4_K => ("moe_indexed_matmul_q4_k_mmvq_xdiv.spv", QuantFormat.Q4_KBlockBytes),
+            MoeGroupedKQuant.Q4_K => (rowsPerGroup > 1 ? "moe_indexed_matmul_q4_k_mmvq_xdiv_mr.spv" : "moe_indexed_matmul_q4_k_mmvq_xdiv.spv", QuantFormat.Q4_KBlockBytes),
             MoeGroupedKQuant.Q5_K => ("moe_indexed_matmul_q5_k_mmvq.spv", 176),
             _ => ("moe_indexed_matmul_q6_k_mmvq.spv", 210),
         };
@@ -73,7 +78,8 @@ public sealed class MoeIndexedMatmulKQuantMmvqKernel : IDisposable
                 entryPoint: "main",
                 bindings: bindings,
                 pushConstantBytes: PushConstantBytes,
-                requiredSubgroupSize: requiredSubgroupSize);
+                requiredSubgroupSize: requiredSubgroupSize,
+                specConstants: rowsPerGroup > 1 ? new[] { (uint)rowsPerGroup } : default);
         }
         catch
         {
@@ -82,7 +88,7 @@ public sealed class MoeIndexedMatmulKQuantMmvqKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)BuffersPerSet);
-        return new MoeIndexedMatmulKQuantMmvqKernel(device, module, pipeline, pool, blockBytes);
+        return new MoeIndexedMatmulKQuantMmvqKernel(device, module, pipeline, pool, blockBytes, rowsPerGroup);
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
@@ -149,8 +155,10 @@ public sealed class MoeIndexedMatmulKQuantMmvqKernel : IDisposable
                 0, PushConstantBytes, (nint)pcPtr);
         }
 
-        // One wave32 workgroup per (m, n) output cell.
-        VulkanApi.vkCmdDispatch(cmdBuf, (uint)m, (uint)n, 1);
+        // One wave32 workgroup per (m, n) output cell (or per NR consecutive rows of one n in the multi-row variant).
+        if (_rowsPerGroup > 1 && (m % _rowsPerGroup) != 0)
+            throw new ArgumentException($"m ({m}) must be a multiple of the rows-per-group ({_rowsPerGroup}).", nameof(m));
+        VulkanApi.vkCmdDispatch(cmdBuf, (uint)(m / _rowsPerGroup), (uint)n, 1);
     }
 
     /// <inheritdoc/>

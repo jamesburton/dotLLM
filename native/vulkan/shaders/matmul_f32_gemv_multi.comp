@@ -1,0 +1,53 @@
+#version 450
+// F32 multi-column matrix-vector product for the small-row case (2..8 rows, #876): C[col, m] = dot(A[m, :], X[col, :]).
+//
+// matmul_f32_gemv.comp serves N == 1; every N >= 2 used to fall to the 64x32 tiled GEMM, whose workgroup count is ceil(M/64)*ceil(N/32):
+// a thin projection (the qwen4exp hyper-connection inject, M = 4, K = 10240) ran on ONE workgroup walking K serially (0.45 ms vs 0.056 ms
+// at N = 1, x96 calls per forward). Here one workgroup still owns one output row m, but its 128 threads read each weight vec4 ONCE and
+// FMA it against all NC activation rows, so the weights are streamed once for the whole batch.
+//
+// NC (2..8) is a specialization constant: the per-column accumulators live in registers and the loops are unrolled by the driver.
+// Requires K % 4 == 0. Same push-constant layout as matmul_f32.comp; output layout [N, M] (row-major, token-major).
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint NC = 2u;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufA { vec4  a4[]; }; // [M*K/4]
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { vec4  x4[]; }; // [NC*K/4]
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[];  }; // [NC*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N; // == NC
+} pc;
+
+shared float partials[NC][128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint k4 = pc.K >> 2u;
+    uint rowBase = m * k4;
+
+    float acc[NC];
+    for (uint cc = 0u; cc < NC; ++cc) acc[cc] = 0.0;
+
+    for (uint i = tid; i < k4; i += 128u) {
+        vec4 w = a4[rowBase + i];
+        for (uint cc = 0u; cc < NC; ++cc)
+            acc[cc] += dot(w, x4[cc * k4 + i]);
+    }
+
+    for (uint cc = 0u; cc < NC; ++cc) partials[cc][tid] = acc[cc];
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (tid < stride)
+            for (uint cc = 0u; cc < NC; ++cc) partials[cc][tid] += partials[cc][tid + stride];
+        barrier();
+    }
+    if (tid < NC) c[tid * pc.M + m] = partials[tid][0];
+}

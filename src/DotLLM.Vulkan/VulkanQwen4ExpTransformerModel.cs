@@ -126,6 +126,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     /// <summary>Test hook (#849): how many times each routed-MoE fast path was recorded (see <c>MoePath</c>).</summary>
     internal long MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath p) => _core.MoePathCounts[(int)p];
 
+    /// <summary>Test hook (#876): how many times each 2..8-row fast path was recorded.</summary>
+    internal long SmallRowPathCount(VulkanQwen3MoeHybridTransformerModel.SmallRowPath p) => _core.SmallRowPathCounts[(int)p];
+
     /// <summary>Address of the n-gram table inside the GGUF mapping (0 when absent) - tests assert nothing was uploaded from this range.</summary>
     internal (nint Pointer, long Bytes) HostOnlyTableRange => _hostOnlyTable ?? (0, 0);
 
@@ -192,6 +195,27 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         _scratchCapacity = seqLen;
         _gr?.InvalidateDescriptorCache(); _groupRms?.InvalidateDescriptorCache(); _sigmoidGate?.InvalidateDescriptorCache();
     }
+
+    /// <summary>
+    /// Diagnostic (#876): split-submit per-stage wall timing. When on, every stage of the forward (and the core's GDN / attention / MoE
+    /// sub-stages, at any row count) is followed by a submit + wait and its host-observed ms accumulated; read with <see cref="TakeStageTimes"/>.
+    /// Off by default; <c>DOTLLM_VULKAN_MOE_STAGE_PROFILE=1</c> turns it on at startup. Each stage carries ~50 us of sync cost.
+    /// </summary>
+    public static bool StageProfile
+    {
+        get => VulkanQwen3MoeHybridTransformerModel.StageProfileEnabled;
+        set => VulkanQwen3MoeHybridTransformerModel.StageProfileEnabled = value;
+    }
+
+    /// <summary>Diagnostic (#876): the 2..8-row multi-column GEMVs (Q8_0 MMVQ, F32). On by default; <c>DOTLLM_VK_SMALLROW_GEMV=0</c> disables them at startup.</summary>
+    public static bool SmallRowGemv
+    {
+        get => VulkanQwen3MoeHybridTransformerModel.SmallRowGemvEnabled;
+        set => VulkanQwen3MoeHybridTransformerModel.SmallRowGemvEnabled = value;
+    }
+
+    /// <summary>Returns and clears the accumulated per-stage times (ms) recorded while <see cref="StageProfile"/> was on.</summary>
+    public IReadOnlyDictionary<string, double> TakeStageTimes() => _core.TakeStageTimes();
 
     // ───────────────────────────── forward ─────────────────────────────
 
@@ -312,35 +336,46 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
 
         // Splitting a long prefill into per-half-layer submissions keeps each under the driver watchdog (the hybrid model does the same);
         // single-token decode runs as one command buffer except at the host PLE step.
-        bool splitHalves = T > 1;
+        // Short forwards (decode, 2..8-row MTP verify) stay in ONE command buffer: each split costs a submit + fence wait (~0.1 ms x 96 per forward, #876).
+        bool splitHalves = T > SplitHalvesAbove;
 
         // GR read: group-RMS(src) -> low-rank mix -> block input h (core NormOutput); inject gains when requested.
         void GrRead(VulkanQwen4ExpGrWeights w, VulkanDevice.Buffer src, int tokens, bool inject)
         {
             VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, src, _xn, 0, 0, (ulong)(tokens * rowBytes));
             Barrier();
+            _core.Q4Stage("gr.copy");
             _groupRms.Record(cmd, _xn, w.Norm, tokens, S, H, _eps);
             Barrier();
+            _core.Q4Stage("gr.grouprms");
             _core.Q4RecordMatmul(cmd, w.Down, w.DownQt, _xn, _low, outputDim: _lowRank, inputDim: row, seqLen: tokens);
             Barrier();
+            _core.Q4Stage("gr.down");
             _gr.RecordActivateLowRank(cmd, _low, tokens * _lowRank, S);
             Barrier();
+            _core.Q4Stage("gr.act");
             _core.Q4RecordMatmul(cmd, w.Up, w.UpQt, _low, _mix, outputDim: row, inputDim: _lowRank, seqLen: tokens);
             Barrier();
+            _core.Q4Stage("gr.up");
             _gr.RecordMixMean(cmd, st.NormOutput, _mix, _xn, tokens, S, H);
             Barrier();
+            _core.Q4Stage("gr.mixmean");
             if (inject)
             {
                 _core.Q4RecordMatmul(cmd, w.Inject!, w.InjectQt, _xn, _gains, outputDim: S, inputDim: row, seqLen: tokens);
                 Barrier();
+                _core.Q4Stage("gr.inject_mm");
                 _gr.RecordInjectGains(cmd, _gains, tokens, S);
                 Barrier();
+                _core.Q4Stage("gr.inject_gains");
             }
         }
 
         Begin();
+        _core.Q4StageBegin();
         _core.Q4RecordEmbedding(cmd, tokenIds);
         Barrier();
+        _core.Q4Stage("embed");
         _gr.RecordBroadcast(cmd, _res, st.HiddenState, T, S, H);
         Barrier();
 
@@ -371,16 +406,20 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
             Barrier();
             _gr.RecordWrite(cmd, _res, st.NormOutput, _gains, T, S, H);
             Barrier();
+            _core.Q4Stage("gr_write_x");
             if (splitHalves) { End(); Begin(); }
 
             // ── MoE ──
             GrRead(_ffnGr[il], _res, T, inject: true);
             VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, st.NormOutput, st.MoeSharedInput, 0, 0, (ulong)((long)T * H * 4));
             Barrier();
+            _core.Q4Stage("moe_copy");
             _core.Q4RecordMoe(cmd, _moe[il], T);
             Barrier();
+            _core.Q4Stage("moe_total");
             _gr.RecordWrite(cmd, _res, st.NormOutput, _gains, T, S, H);
             Barrier();
+            _core.Q4Stage("gr_write_x");
             if (splitHalves) { End(); Begin(); }
 
             if (Trace is { } tr)
@@ -433,6 +472,26 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         catch { result.Dispose(); throw; }
         state.Length += T;
         return result;
+    }
+
+    private static int SplitHalvesAbove =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_SPLIT_ABOVE"), out int sa) && sa >= 1 ? sa : 16;
+
+    /// <summary>Diagnostic (#876): forwards longer than this many rows split each half-layer into its own submission (default 16).</summary>
+    public static int SplitAbove { get => SplitHalvesAbove; set => SplitHalvesAbove = value; }
+
+    /// <summary>Diagnostic (#876): smallest token count that takes the expert-grouped coopmat MoE path (default 16).</summary>
+    public int MoeGroupedMinTokens
+    {
+        get => _core.GroupedMinTokens;
+        set => _core.GroupedMinTokens = value;
+    }
+
+    /// <summary>Diagnostic (#876): smallest token count that uses the multi-row routed-MoE MMVQ variants (0 = never; default 2).</summary>
+    public static int MoeMultiRowMinRows
+    {
+        get => VulkanQwen3MoeHybridTransformerModel.MoeMrMinRows;
+        set => VulkanQwen3MoeHybridTransformerModel.MoeMrMinRows = value;
     }
 
     private VulkanDevice.Buffer? _headIn, _headLogits;
