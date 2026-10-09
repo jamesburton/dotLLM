@@ -177,6 +177,13 @@ public static class PerplexityEvaluator
         string? nllDumpPath = Environment.GetEnvironmentVariable("DOTLLM_PPL_NLL_DUMP");
         using StreamWriter? nllDump = string.IsNullOrEmpty(nllDumpPath) ? null : new StreamWriter(nllDumpPath);
 
+        // Debug aid (#862): DOTLLM_PPL_LOGITS_DUMP=<path> appends every window's raw float32 logits (all rows,
+        // [context][vocab], row i predicts token i+1) so a cross-engine KL can be computed offline over the
+        // FULL vocabulary (not a top-k truncation). Multi-GB for long windows: point it at scratch.
+        string? logitsDumpPath = Environment.GetEnvironmentVariable("DOTLLM_PPL_LOGITS_DUMP");
+        using FileStream? logitsDump = string.IsNullOrEmpty(logitsDumpPath)
+            ? null : new FileStream(logitsDumpPath, FileMode.Create, FileAccess.Write, FileShare.Read, 1 << 20);
+
         for (int start = 0; start + context <= tokens.Length; start += stride)
         {
             ReadOnlySpan<int> window;
@@ -221,6 +228,12 @@ public static class PerplexityEvaluator
             model.ResetState();
             using ITensor logits = model.Forward(window, positions);
             windows++;
+            if (logitsDump is not null)
+            {
+                long bytes = (long)context * vocab * sizeof(float);
+                for (long off = 0; off < bytes; off += 1 << 30)
+                    logitsDump.Write(new ReadOnlySpan<byte>((void*)(logits.DataPointer + (nint)off), (int)Math.Min(1 << 30, bytes - off)));
+            }
 
             double windowNll = 0;
             int windowScored = 0;
