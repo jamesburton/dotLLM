@@ -12,7 +12,7 @@ namespace DotLLM.Cpu.Kernels.Experimental;
 //
 //   W ~= diag(h) . Us . diag(l) . Vs^T . diag(g)         (per path; primary + optional residual path)
 //   y  = sum_paths  h .* ( Us ( l .* ( Vs^T ( g .* x ) ) ) )
-//   Us in {+-1}^{d_out x r}, Vs in {+-1}^{d_in x r}; h (d_out), g (d_in), l (r) are FP16.
+//   Us in {+-1}^{d_out x r}, Vs in {+-1}^{d_in x r}; h (d_out), g (d_in), l (r) are stored F32 (exact widening of fp16/bf16 sources; #864).
 //   bits per path = 2r(d_out + d_in + 1) + 16(d_out + d_in + r).
 //
 // Bit packing (all sign factors): one bit per weight, LSB-first within each byte (element i of a row
@@ -50,12 +50,12 @@ public sealed unsafe class LittleBitPath : IDisposable
 
     internal byte* UBits;   // [DOut][RPad/8]
     internal byte* VBits;   // [R][DInPad/8]
-    internal Half* H;       // [DOut]
-    internal Half* G;       // [DIn]
-    internal Half* L;       // [R]
+    internal float* H;      // [DOut]  (F32: holds fp16 or bf16 source scales exactly)
+    internal float* G;      // [DIn]
+    internal float* L;      // [R]
 
-    /// <summary>Bytes the kernel reads per GEMV for this path (packed bits + FP16 scales).</summary>
-    public long WeightBytes => (long)DOut * (RPad / 8) + (long)R * (DInPad / 8) + 2L * (DOut + DIn + R);
+    /// <summary>Bytes the kernel reads per GEMV for this path (packed bits + F32 scales).</summary>
+    public long WeightBytes => (long)DOut * (RPad / 8) + (long)R * (DInPad / 8) + 4L * (DOut + DIn + R);
 
     /// <summary>Paper's bit count for this path: 2r(d_out+d_in+1) + 16(d_out+d_in+r).</summary>
     public long PaperBits => 2L * R * (DOut + DIn + 1) + 16L * (DOut + DIn + R);
@@ -70,9 +70,9 @@ public sealed unsafe class LittleBitPath : IDisposable
         RPad = (r + 31) / 32 * 32;
         UBits = Alloc((long)dOut * (RPad / 8));
         VBits = Alloc((long)r * (DInPad / 8));
-        H = (Half*)Alloc(2L * dOut);
-        G = (Half*)Alloc(2L * dIn);
-        L = (Half*)Alloc(2L * r);
+        H = (float*)Alloc(4L * dOut);
+        G = (float*)Alloc(4L * dIn);
+        L = (float*)Alloc(4L * r);
     }
 
     private static byte* Alloc(long bytes)
@@ -91,6 +91,18 @@ public sealed unsafe class LittleBitPath : IDisposable
         ReadOnlySpan<sbyte> us, ReadOnlySpan<sbyte> vs,
         ReadOnlySpan<Half> h, ReadOnlySpan<Half> g, ReadOnlySpan<Half> l)
     {
+        var p = FromSigns(dOut, dIn, r, us, vs, new float[dOut], new float[dIn], new float[r]);
+        TensorPrimitives.ConvertToSingle(h, new Span<float>(p.H, dOut));
+        TensorPrimitives.ConvertToSingle(g, new Span<float>(p.G, dIn));
+        TensorPrimitives.ConvertToSingle(l, new Span<float>(p.L, r));
+        return p;
+    }
+
+    /// <summary>As the <see cref="Half"/> overload with F32 scales (exact for fp16 and bf16 sources).</summary>
+    public static LittleBitPath FromSigns(int dOut, int dIn, int r,
+        ReadOnlySpan<sbyte> us, ReadOnlySpan<sbyte> vs,
+        ReadOnlySpan<float> h, ReadOnlySpan<float> g, ReadOnlySpan<float> l)
+    {
         if (us.Length != dOut * r || vs.Length != dIn * r || h.Length != dOut || g.Length != dIn || l.Length != r)
             throw new ArgumentException("factor shape mismatch");
         var p = new LittleBitPath(dOut, dIn, r);
@@ -101,9 +113,33 @@ public sealed unsafe class LittleBitPath : IDisposable
         for (int i = 0; i < dIn; i++)
             for (int j = 0; j < r; j++)
                 if (vs[i * r + j] <= 0) p.VBits[(long)j * vStride + (i >> 3)] |= (byte)(1 << (i & 7));
-        h.CopyTo(new Span<Half>(p.H, dOut));
-        g.CopyTo(new Span<Half>(p.G, dIn));
-        l.CopyTo(new Span<Half>(p.L, r));
+        h.CopyTo(new Span<float>(p.H, dOut));
+        g.CopyTo(new Span<float>(p.G, dIn));
+        l.CopyTo(new Span<float>(p.L, r));
+        return p;
+    }
+
+    /// <summary>
+    /// Builds a path directly from the checkpoint's packed sign words (int32, LSB-first, bit 1 = -1, padded with +1):
+    /// <paramref name="uWords"/> is [dOut x ceil(r/32)] and <paramref name="vWords"/> is [r x ceil(dIn/32)], exactly the
+    /// layout of this class (little-endian words == LSB-first bytes), so this is a row-wise copy. Padding bits are
+    /// cleared (they are +1 by the format). Scales are F32; the caller decodes bf16 and pre-multiplies l = v1*u2.
+    /// </summary>
+    public static LittleBitPath FromPackedWords(int dOut, int dIn, int r,
+        ReadOnlySpan<int> uWords, ReadOnlySpan<int> vWords,
+        ReadOnlySpan<float> h, ReadOnlySpan<float> g, ReadOnlySpan<float> l)
+    {
+        var p = new LittleBitPath(dOut, dIn, r);
+        int uw = p.RPad / 32, vw = p.DInPad / 32;
+        if (uWords.Length != dOut * uw || vWords.Length != r * vw || h.Length != dOut || g.Length != dIn || l.Length != r)
+            throw new ArgumentException("packed factor shape mismatch");
+        MemoryMarshal.AsBytes(uWords).CopyTo(new Span<byte>(p.UBits, uWords.Length * 4));
+        MemoryMarshal.AsBytes(vWords).CopyTo(new Span<byte>(p.VBits, vWords.Length * 4));
+        for (int o = 0; o < dOut; o++) ClearBitsFrom(p.UBits + (long)o * (p.RPad / 8), r, p.RPad);
+        for (int j = 0; j < r; j++) ClearBitsFrom(p.VBits + (long)j * (p.DInPad / 8), dIn, p.DInPad);
+        h.CopyTo(new Span<float>(p.H, dOut));
+        g.CopyTo(new Span<float>(p.G, dIn));
+        l.CopyTo(new Span<float>(p.L, r));
         return p;
     }
 
@@ -118,9 +154,9 @@ public sealed unsafe class LittleBitPath : IDisposable
             ClearBitsFrom(p.UBits + (long)o * (p.RPad / 8), r, p.RPad);
         for (int j = 0; j < r; j++)
             ClearBitsFrom(p.VBits + (long)j * (p.DInPad / 8), dIn, p.DInPad);
-        for (int o = 0; o < dOut; o++) p.H[o] = (Half)(0.5f + rng.NextSingle());
-        for (int i = 0; i < dIn; i++) p.G[i] = (Half)(0.5f + rng.NextSingle());
-        for (int j = 0; j < r; j++) p.L[j] = (Half)(0.5f + rng.NextSingle());
+        for (int o = 0; o < dOut; o++) p.H[o] = 0.5f + rng.NextSingle();
+        for (int i = 0; i < dIn; i++) p.G[i] = 0.5f + rng.NextSingle();
+        for (int j = 0; j < r; j++) p.L[j] = 0.5f + rng.NextSingle();
         return p;
     }
 
@@ -143,9 +179,9 @@ public sealed unsafe class LittleBitPath : IDisposable
         var c = new LittleBitPath(DOut, DIn, R);
         Buffer.MemoryCopy(UBits, c.UBits, (long)DOut * (RPad / 8), (long)DOut * (RPad / 8));
         Buffer.MemoryCopy(VBits, c.VBits, (long)R * (DInPad / 8), (long)R * (DInPad / 8));
-        Buffer.MemoryCopy(H, c.H, 2L * DOut, 2L * DOut);
-        Buffer.MemoryCopy(G, c.G, 2L * DIn, 2L * DIn);
-        Buffer.MemoryCopy(L, c.L, 2L * R, 2L * R);
+        Buffer.MemoryCopy(H, c.H, 4L * DOut, 4L * DOut);
+        Buffer.MemoryCopy(G, c.G, 4L * DIn, 4L * DIn);
+        Buffer.MemoryCopy(L, c.L, 4L * R, 4L * R);
         return c;
     }
 
@@ -245,7 +281,7 @@ public sealed unsafe class LittleBitLayer : IDisposable
     private struct PathCtx
     {
         public byte* U, V;
-        public Half* H, L;
+        public float* H, L;
         public float* Xs, T;
         public sbyte* Xq, Tq;
         public int DOut, DInPad, RPad, R;
@@ -350,14 +386,14 @@ public sealed unsafe class LittleBitLayer : IDisposable
             if (ctx->Kernel == LittleBitKernel.Avx2Float)
             {
                 SignedDot8F(rows, p->DInPad / 8, valid, p->Xs, p->DInPad, fout);
-                for (int k = 0; k < valid; k++) p->T[j0 + k] = fout[k] * (float)p->L[j0 + k];
+                for (int k = 0; k < valid; k++) p->T[j0 + k] = fout[k] * p->L[j0 + k];
             }
             else
             {
                 SignedDot8I(rows, p->DInPad / 8, valid, p->Xq, p->DInPad, iout);
                 float sc = p->XScale;
                 for (int k = 0; k < valid; k++)
-                    p->T[j0 + k] = (float)(p->XSum - 2 * (iout[k] / 255)) * sc * (float)p->L[j0 + k];
+                    p->T[j0 + k] = (float)(p->XSum - 2 * (iout[k] / 255)) * sc * p->L[j0 + k];
             }
         }
     }
@@ -381,14 +417,14 @@ public sealed unsafe class LittleBitLayer : IDisposable
                 if (ctx->Kernel == LittleBitKernel.Avx2Float)
                 {
                     SignedDot8F(rows, p->RPad / 8, valid, p->T, p->RPad, fout);
-                    for (int k = 0; k < valid; k++) acc[k] += fout[k] * (float)p->H[o0 + k];
+                    for (int k = 0; k < valid; k++) acc[k] += fout[k] * p->H[o0 + k];
                 }
                 else
                 {
                     SignedDot8I(rows, p->RPad / 8, valid, p->Tq, p->RPad, iout);
                     float sc = p->TScale;
                     for (int k = 0; k < valid; k++)
-                        acc[k] += (float)(p->TSum - 2 * (iout[k] / 255)) * sc * (float)p->H[o0 + k];
+                        acc[k] += (float)(p->TSum - 2 * (iout[k] / 255)) * sc * p->H[o0 + k];
                 }
             }
             for (int k = 0; k < valid; k++) ctx->Y[o0 + k] = acc[k];
@@ -406,10 +442,9 @@ public sealed unsafe class LittleBitLayer : IDisposable
 
     // ───────────────────────────── helpers ─────────────────────────────
 
-    private static void ScaleByHalf(float* x, Half* g, float* dst, int n)
+    private static void ScaleByHalf(float* x, float* g, float* dst, int n)
     {
-        TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(g, n), new Span<float>(dst, n));
-        TensorPrimitives.Multiply(new ReadOnlySpan<float>(dst, n), new ReadOnlySpan<float>(x, n), new Span<float>(dst, n));
+        TensorPrimitives.Multiply(new ReadOnlySpan<float>(g, n), new ReadOnlySpan<float>(x, n), new Span<float>(dst, n));
     }
 
     private static void Quantize(float* src, sbyte* dst, int n, out float scale, out int sum)
@@ -541,14 +576,14 @@ public static class LittleBitReference
                 {
                     double s = 0;
                     for (int i = 0; i < p.DIn; i++)
-                        s += p.VSign(i, j) * ((double)(float)p.G[i] * x[i]);
-                    t[j] = (double)(float)p.L[j] * s;
+                        s += p.VSign(i, j) * ((double)p.G[i] * x[i]);
+                    t[j] = (double)p.L[j] * s;
                 }
                 for (int o = 0; o < p.DOut; o++)
                 {
                     double s = 0;
                     for (int j = 0; j < p.R; j++) s += p.USign(o, j) * t[j];
-                    y[o] += (double)(float)p.H[o] * s;
+                    y[o] += (double)p.H[o] * s;
                 }
             }
         }
@@ -571,8 +606,8 @@ public static class LittleBitReference
                     for (int i = 0; i < dIn; i++)
                     {
                         float s = 0;
-                        for (int j = 0; j < p.R; j++) s += p.USign(o, j) * (float)p.L[j] * p.VSign(i, j);
-                        w[(long)o * dIn + i] += (float)p.H[o] * s * (float)p.G[i];
+                        for (int j = 0; j < p.R; j++) s += p.USign(o, j) * p.L[j] * p.VSign(i, j);
+                        w[(long)o * dIn + i] += p.H[o] * s * p.G[i];
                     }
             }
         }
