@@ -124,7 +124,7 @@ public sealed unsafe class NanoQuantTests(ITestOutputHelper output)
         // Tail bits are +1 (clear) by the format; the reference reads only valid bits, the kernel must ignore the rest.
         if (r % 32 != 0) for (int o = 0; o < dOut; o++) u[o * uw + uw - 1] &= (1 << (r % 32)) - 1;
         if (dIn % 32 != 0) for (int j = 0; j < r; j++) v[j * vw + vw - 1] &= (1 << (dIn % 32)) - 1;
-        // Scales on a bf16 grid inside fp16 range (as in real files).
+        // Scales on a bf16 grid (as in real files).
         float Sc() => BitConverter.UInt32BitsToSingle(BitConverter.SingleToUInt32Bits(0.1f + 0.9f * rng.NextSingle()) & 0xFFFF0000u);
         var pre = Enumerable.Range(0, dIn).Select(_ => Sc()).ToArray();
         var mid = Enumerable.Range(0, r).Select(_ => Sc()).ToArray();
@@ -158,8 +158,9 @@ public sealed unsafe class NanoQuantTests(ITestOutputHelper output)
         Assert.Throws<InvalidDataException>(() => NanoQuantLayer.FromPacked(f.DOut, f.DIn, f.R, f.U, f.V, f.Pre, f.Mid, f.Post, [f.Idx[1], f.Idx[0]], f.Sal));
         var pre = (float[])f.Pre.Clone(); pre[f.Idx[0]] = 0.5f;   // llama.cpp contract: scale_pre is exactly 0 at salient indices
         Assert.Throws<InvalidDataException>(() => NanoQuantLayer.FromPacked(f.DOut, f.DIn, f.R, f.U, f.V, pre, f.Mid, f.Post, f.Idx, f.Sal));
-        var mid = (float[])f.Mid.Clone(); mid[0] = 1e-6f;          // not exact in fp16 (subnormal): refuse to round silently
-        Assert.Throws<InvalidDataException>(() => NanoQuantLayer.FromPacked(f.DOut, f.DIn, f.R, f.U, f.V, f.Pre, mid, f.Post, f.Idx, f.Sal));
+        // F32 scales (#864): values outside fp16's exact range are fine now.
+        var mid = (float[])f.Mid.Clone(); mid[0] = 1e-6f;
+        using var ok = NanoQuantLayer.FromPacked(f.DOut, f.DIn, f.R, f.U, f.V, f.Pre, mid, f.Post, f.Idx, f.Sal);
     }
 
     // ------------------------------------------------------------------ real GGUF (skips when absent)
