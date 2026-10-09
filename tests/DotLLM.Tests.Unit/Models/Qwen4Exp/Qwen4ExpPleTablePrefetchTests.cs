@@ -280,31 +280,69 @@ public sealed unsafe class Qwen4ExpPleTablePrefetchTests(ITestOutputHelper outpu
 
     // ── soak (llama.cpp #28933 class of RSS growth) ────────────────────────
 
+    /// <summary>
+    /// The #28933 bug class is mapped-file pages piling up in the working set beyond what was touched. <c>PrivateMemorySize64</c>
+    /// cannot see mapped pages, so this counts the table's own resident pages (<c>QueryWorkingSetEx</c>) against the pages the
+    /// requests actually named: residency must track the touched footprint (bounded read-around amplification), and replaying
+    /// already-seen chunks must not add any.
+    /// </summary>
     [Fact]
-    public void Soak_TwentyPrefillChunks_OnAScaledTable_DoesNotGrow()
+    public void Soak_TwentyPrefillChunks_OnAScaledTable_ResidencyTracksTheTouchedFootprint()
     {
-        // 1M-row F16 table (32 MiB) so the hash spreads over many pages; ram mode exercises the cache + worker + pool paths.
-        var geo = new Q4eGeometry() with { TableRows = 1 << 20, Vocab = 100 };
-        var (m, cfg) = LoadSynthetic(new PleTableOptions { Mode = PleTableMode.Ram, Hint = PleHintMode.OsThenTouch, CacheMegabytes = 4 }, "soak", geo);
-        int eos = cfg.Qwen4Exp!.Ple!.EosTokenId;
-        const int chunk = 48;
-        long Priv() { GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect(); return Process.GetCurrentProcess().PrivateMemorySize64; }
-        long baseline = 0;
-        var samples = new List<long>();
-        for (int i = 0; i < 20; i++)
+        // 4M-row table: wide enough that the hash does not saturate it in 20 chunks.
+        var geo = new Q4eGeometry { TableRows = 1 << 22, Vocab = 100 };   // 4M rows x 32 B = 128 MiB = 32768 pages
+        Directory.CreateDirectory(_dir);
+        string path = Path.Combine(_dir, "soak.gguf");
+        File.WriteAllBytes(path, Qwen4ExpRandomGguf.Build(geo, Q4eQuant.Q8Q51));
+        var prev = PleTableOptions.Ambient;
+        PleTableOptions.Ambient = new PleTableOptions { Mode = PleTableMode.Mmap, Hint = PleHintMode.OsThenTouch };
+        var (mdl, gguf, cfg) = ModelLoader.LoadFromGguf(path);
+        PleTableOptions.Ambient = prev;
+        _cleanup.Add(mdl); _cleanup.Add(gguf);
+        var m = (Qwen4ExpTransformerModel)mdl;
+        var ple = cfg.Qwen4Exp!.Ple!;
+        var tdesc = gguf.Tensors.Single(t => t.Name == "per_layer_token_embd.weight");
+        nint tbl = gguf.TensorDataPointer(tdesc);
+        long tableBytes = Dequantize.RowByteSize(ple.RowDim, tdesc.QuantizationType) * tdesc.Shape[1];
+        int ps = Environment.SystemPageSize;
+        long firstPage = (long)tbl / ps, lastPage = ((long)tbl + tableBytes - 1) / ps;
+        var pageAddrs = new nint[lastPage - firstPage + 1];
+        for (int i = 0; i < pageAddrs.Length; i++) pageAddrs[i] = (nint)((firstPage + i) * ps);
+        long Resident() => ProcessFaults.CountWorkingSetResident(pageAddrs);
+
+        int eos = ple.EosTokenId;
+        const int chunk = 48, chunks = 20;
+        long r0 = Resident();
+        var seen = new List<int[]>();
+        var trace = new List<string>();
+        for (int i = 0; i < chunks; i++)
         {
             var ids = Tokens(chunk, 100 + i, eos);
-            // a fresh sequence per chunk: the synthetic QSA layer prunes beyond its tiny budget, and each chunk is an independent prefill anyway
-            using var st = m.CreateState();
+            seen.Add(ids);
+            using var st = m.CreateState();   // fresh sequence per chunk: the synthetic QSA layer prunes beyond its tiny budget
             using (var t = m.Forward(ids, Enumerable.Range(0, chunk).ToArray(), -1, st, null, lastTokenLogitsOnly: true)) { }
-            if (i == 4) baseline = Priv();   // warm: pools, JIT, cache slab touched
-            if (i >= 5 && i % 5 == 4) samples.Add(Priv());
+            long touched = m.PleTableStats!.Value.UniquePages;
+            trace.Add($"chunk {i + 1}: touched(cum) {touched} resident {Resident() - r0}");
         }
-        long growth = samples.Max() - baseline;
-        output.WriteLine($"soak: baseline {baseline / 1048576.0:F1} MiB, samples [{string.Join(", ", samples.Select(s => (s / 1048576.0).ToString("F1")))}] MiB, max growth {growth / 1048576.0:F2} MiB");
         var stats = m.PleTableStats!.Value;
-        output.WriteLine($"soak stats: {stats}");
-        Assert.True(growth < 32L * 1048576, $"private bytes grew {growth / 1048576.0:F1} MiB over 15 chunks after warmup");
-        Assert.True(stats.CacheHits > 0);
+        long resident = Resident() - r0;
+        output.WriteLine(string.Join(Environment.NewLine, trace));
+        output.WriteLine($"stats: {stats}");
+        output.WriteLine($"table pages {pageAddrs.Length}, touched {stats.UniquePages}, resident growth {resident} (amplification {(double)resident / stats.UniquePages:F2}x)");
+
+        // replay: the same chunks again must not make more of the table resident
+        for (int i = 0; i < chunks; i++)
+        {
+            using var st = m.CreateState();
+            using var t = m.Forward(seen[i], Enumerable.Range(0, chunk).ToArray(), -1, st, null, lastTokenLogitsOnly: true);
+        }
+        long replayGrowth = Resident() - r0 - resident;
+        output.WriteLine($"replay growth {replayGrowth} pages");
+        if (Resident() >= 0)   // Windows only
+        {
+            Assert.True(resident <= 2 * stats.UniquePages + 512, $"resident {resident} pages vs {stats.UniquePages} touched");
+            Assert.True(replayGrowth <= 64, $"replaying seen chunks made {replayGrowth} more table pages resident");
+        }
+        Assert.True(stats.Requests == chunks && stats.Gathers == chunks);
     }
 }
