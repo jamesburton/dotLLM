@@ -144,8 +144,7 @@ Qwen3"); the CPU-only switch is `TransformerWeights.LoadFromGguf(..., allowNanoQ
 
 - **Oracle** (modified llama.cpp fork `arelath/llama.cpp@nanoquants`, mingw CPU build, no repack, 3 prompts / 22 positions): top-1 agreement
   22/22, per-position KL(oracle||dotLLM) 1.2e-7..7.9e-5 nats, max |dlogit| 0.002..0.065 over the 151,936-entry vocab; greedy 16-token
-  continuation identical for 2 of 3 prompts and 13/16 for the third (a near-tie at token 14; the oracle itself differs by CPU repack
-  settings). Test: `NanoQuantEndToEndTests` (committed top-1/top-5/greedy in `NanoQuantData/oracle_p*.json`; full logits from
+  continuation identical for 2 of 3 prompts and 13/16 for the third (first divergence at generated token 14, cause not investigated; per-position logits agree to KL<1e-4). Test: `NanoQuantEndToEndTests` (committed top-1/top-5/greedy in `NanoQuantData/oracle_p*.json`; full logits from
   `DOTLLM_NANOQUANT_ORACLE_DIR` / `~/.dotllm/test-cache/nanoquant-oracle`, skipped when absent).
 - **F32-decoded control** (`DOTLLM_LITTLEBIT_DENSE_CONTROL=1`: every projection incl. salient columns decoded to dense F32): layer-level
   kernel-vs-dense gap 3.4e-6 of RMS (blk.0.ffn_gate); the model logits are (near-)bit-identical because the Q8_0 head quantises its
