@@ -1,4 +1,4 @@
-﻿using DotLLM.Vulkan.Kernels;
+﻿﻿using DotLLM.Vulkan.Kernels;
 
 namespace DotLLM.Vulkan;
 
@@ -43,6 +43,12 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ4K { get; private set; }
     /// <summary>Dense Q8_0 decode MMVQ GEMV (dp4a, coalesced) for the GDN / attention / shared-expert projections (all Q8_0 in the UD-Q4_K_M GGUF).</summary>
     public MatMulQ8_0MmvqKernel? MatMulQ8Mmvq { get; private set; }
+    /// <summary>Q8_0 multi-column MMVQ GEMV for 2..8 rows (#876); null when disabled (<c>DOTLLM_VK_SMALLROW_GEMV=0</c>) or unsupported.</summary>
+    public MatMulQ8_0MmvqMultiKernel? MatMulQ8MmvqMulti { get; private set; }
+    /// <summary>F32 multi-column GEMV for 2..8 rows (#876); null when disabled or unsupported.</summary>
+    public MatMulF32GemvMultiKernel? MatMulF32Multi { get; private set; }
+    /// <summary>F16 multi-column GEMV for 2..8 rows (#876); null when unsupported.</summary>
+    public MatMulF16GemvMultiKernel? MatMulF16Multi { get; private set; }
     // One-dispatch replacements for the per-token vkCmdCopyBuffer fan-out loops (GDN [Q|K|V] split, attention Q+gate de-interleave).
     public DeinterleaveF32Kernel? GdnQkvSplit { get; private set; }
     public DeinterleaveF32Kernel? QGateDeinterleave { get; private set; }
@@ -457,6 +463,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             moeIndexedQ4KMmq, quantizeQ8_1Rows, moeIndexedQ5KMmq, moeScatter, moeSigmoidGatedAdd);
         kernels.MoeSharedGateAdd = moeSharedGateAdd;
         kernels.MatMulBf16Multi = matmulBf16Multi;
+        kernels.MatMulF32Multi = MatMulF32GemvMultiKernel.TryCreate(device, spvDir);
+        kernels.MatMulF16Multi = MatMulF16GemvMultiKernel.TryCreate(device, spvDir);
+        kernels.MatMulQ8MmvqMulti = MatMulQ8_0MmvqMultiKernel.TryCreate(device, spvDir);
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_GDN_CONV_FUSED") != "0" && GdnConvSiluF32Kernel.IsSupportedOn(spvDir))
             kernels.GdnConvSilu = GdnConvSiluF32Kernel.Create(device, spvDir);
 
@@ -636,6 +645,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeGroupedQ6K?.InvalidateDescriptorCache();
         MoeMmvqQ4K?.InvalidateDescriptorCache();
         MatMulQ8Mmvq?.InvalidateDescriptorCache();
+        MatMulQ8MmvqMulti?.InvalidateDescriptorCache();
+        MatMulF32Multi?.InvalidateDescriptorCache();
+        MatMulF16Multi?.InvalidateDescriptorCache();
         GdnQkvSplit?.InvalidateDescriptorCache();
         QGateDeinterleave?.InvalidateDescriptorCache();
         RmsNormQuantizeFused?.InvalidateDescriptorCache();
@@ -690,6 +702,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         RmsNorm.Dispose();
         MatMulBf16Gemm.Dispose();
         MatMulBf16Multi?.Dispose();
+        MatMulQ8MmvqMulti?.Dispose();
+        MatMulF32Multi?.Dispose();
+        MatMulF16Multi?.Dispose();
         MatMulBf16.Dispose();
         MatMulF16GemmCoopmat?.Dispose();
         MatMulF16Gemm.Dispose();

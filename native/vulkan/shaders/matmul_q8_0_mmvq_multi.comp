@@ -1,0 +1,84 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Q8_0 MMVQ multi-column GEMV (2..8 activation rows, #876): Y[col, m] = sum_k W_q8[m, k] * X[col, k].
+//
+// Same coalesced lane = K-position layout and dp4a arithmetic as matmul_q8_0_mmvq.comp (one wave32 subgroup per output row, 8-block
+// window, lane owns 8 int8), but each lane reads its weight words ONCE and dots them against all NC pre-quantized (Q8_1) activation rows.
+// The per-column accumulation order is identical to the single-column kernel, so column c of this kernel is bit-equal to running the
+// single-column kernel on row c alone. Before this the 2..8-row (MTP verify / short prefill) case went to the 128x128 coopmat GEMM,
+// which is ~2-3x the cost of a 1-row GEMV at N = 2 for these thin decode-sized projections.
+//
+// Activations: xq [NC][K/4] packed int8, xds [NC][K/32] (d_x, s_x) from quantize_q8_1_rows.comp. Output y [NC][M].
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint NC = 2u;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer BufY   { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow; // = K / 32
+    uint rowUints;     // unused
+} pc;
+
+const uint UINT16_PER_BLOCK = 17u;
+const uint WINDOW_BLOCKS    = 8u;
+
+uint readU16(uint idx16) {
+    uint w = weight[idx16 >> 1u];
+    return ((idx16 & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint blockInWindow = lane >> 2u;
+    uint subInBlock    = lane & 3u;
+    uint qOff16        = 1u + 4u * subInBlock;
+
+    uint rowBase16 = m * pc.blocksPerRow * UINT16_PER_BLOCK;
+    uint xqRow  = pc.K >> 2u;        // uints per activation row
+    uint xdsRow = pc.blocksPerRow;   // vec2 per activation row
+
+    float acc[NC];
+    for (uint cc = 0u; cc < NC; ++cc) acc[cc] = 0.0;
+
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + blockInWindow;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        uint blkBase16 = rowBase16 + blk * UINT16_PER_BLOCK;
+        float dW = unpackHalf2x16(readU16(blkBase16)).x;
+
+        uint qb = blkBase16 + qOff16;
+        uint w32a = readU16(qb)      | (readU16(qb + 1u) << 16u);
+        uint w32b = readU16(qb + 2u) | (readU16(qb + 3u) << 16u);
+
+        uint xbase = blk * 8u + 2u * subInBlock;
+        for (uint cc = 0u; cc < NC; ++cc) {
+            float dX = xds[cc * xdsRow + blk].x;
+            uint xa = xq[cc * xqRow + xbase];
+            uint xb = xq[cc * xqRow + xbase + 1u];
+            int dotI = 0;
+            dotI = dotPacked4x8AccSatEXT(int(w32a), int(xa), dotI);
+            dotI = dotPacked4x8AccSatEXT(int(w32b), int(xb), dotI);
+            acc[cc] += (dW * dX) * float(dotI);
+        }
+    }
+
+    for (uint cc = 0u; cc < NC; ++cc) {
+        float total = subgroupAdd(acc[cc]);
+        if (subgroupElect())
+            y[cc * pc.M + m] = total;
+    }
+}

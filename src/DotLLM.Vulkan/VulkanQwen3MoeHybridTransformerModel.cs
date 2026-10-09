@@ -509,8 +509,14 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     // Per-STAGE split-submit timing inside the routed-MoE prefill layer (DOTLLM_VULKAN_MOE_STAGE_PROFILE=1): after each stage the
     // command buffer is submitted and waited, so the stage's wall time is attributed to it (sync cost ~50 us per stage is included).
     // Diagnostic only; the totals are printed next to the coarse profile.
-    private static readonly bool MoeStageProfileEnabled =
+    private static bool MoeStageProfileEnabled =
         Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MOE_STAGE_PROFILE") == "1";
+    /// <summary>Runtime switch for the split-submit stage timing (#876 probe; also on at startup via the env var). When on, token-mixing stages are timed at 1 row too.</summary>
+    internal static bool StageProfileEnabled { get => MoeStageProfileEnabled; set => MoeStageProfileEnabled = value; }
+    /// <summary>Accumulated per-stage wall ms since the last <see cref="TakeStageTimes"/>.</summary>
+    internal Dictionary<string, double> TakeStageTimes() { var d = new Dictionary<string, double>(_moeStageMs); _moeStageMs.Clear(); return d; }
+    internal void Q4Stage(string name) => MoeStage(name);
+    internal void Q4StageBegin() => MoeStageBegin();
     private readonly Dictionary<string, double> _moeStageMs = new();
     private long _moeStageLast;
 
@@ -523,7 +529,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// <summary>Token-mixing stage marker: only meaningful on the per-layer-submit prefill path (never inside the fused decode buffer).</summary>
     private void TmStage(string name, int seqLen)
     {
-        if (MoeStageProfileEnabled && seqLen > 1) MoeStage(name);
+        if (MoeStageProfileEnabled) MoeStage(name);
     }
 
     private void MoeStage(string name)
@@ -853,8 +859,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         var gdnStateBuf = gdnCache.GetGdnStateBuffer(gdnOrdinal);
 
         // ── 1. Projections ───────────────────────────────────────────────────
-        bool gdnXq = seqLen == 1 && gdnW.QkvDeviceQuantType == QuantizationType.Q8_0 && gdnW.GateDeviceQuantType == QuantizationType.Q8_0
-            && gdnW.QkvInputDim == gdnW.GateInputDim && TryPrepareQ8Activations(cmdBuf, _state.NormOutput, gdnW.QkvInputDim);
+        bool gdnXq = (seqLen == 1 || SmallRowQ8(seqLen)) && gdnW.QkvDeviceQuantType == QuantizationType.Q8_0 && gdnW.GateDeviceQuantType == QuantizationType.Q8_0
+            && gdnW.QkvInputDim == gdnW.GateInputDim && TryPrepareQ8Activations(cmdBuf, _state.NormOutput, gdnW.QkvInputDim, seqLen);
         RecordMatmul(cmdBuf, gdnW.QkvWeight, gdnW.QkvDeviceQuantType,
             _state.NormOutput, _state.GdnQkvBuf,
             outputDim: gdnW.QkvOutputDim, inputDim: gdnW.QkvInputDim, seqLen: seqLen, xqReady: gdnXq);
@@ -1016,9 +1022,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         int kvStride = numKvHeads * headDim;
 
         // 1. Fused Q+Gate projection.
-        bool attnXq = seqLen == 1 && attnW.QDeviceQuantType == QuantizationType.Q8_0 && attnW.KDeviceQuantType == QuantizationType.Q8_0
+        bool attnXq = (seqLen == 1 || SmallRowQ8(seqLen)) && attnW.QDeviceQuantType == QuantizationType.Q8_0 && attnW.KDeviceQuantType == QuantizationType.Q8_0
             && attnW.VDeviceQuantType == QuantizationType.Q8_0 && attnW.QInputDim == attnW.KInputDim && attnW.QInputDim == attnW.VInputDim
-            && TryPrepareQ8Activations(cmdBuf, _state.NormOutput, attnW.QInputDim);
+            && TryPrepareQ8Activations(cmdBuf, _state.NormOutput, attnW.QInputDim, seqLen);
         RecordMatmul(cmdBuf, attnW.QWeight, attnW.QDeviceQuantType,
             _state.NormOutput, _state.QGateScratch,
             outputDim: attnW.QOutputDim, inputDim: attnW.QInputDim, seqLen: seqLen, xqReady: attnXq);
@@ -1887,11 +1893,13 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 m: interm, k: hidden, n: expandedRows, numExperts: numE);
         }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("gate_up");
 
         // 5. SwiGLU: silu(gate) * up
         _kernels.SwiGlu.Record(cmdBuf, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter,
             n: expandedRows * interm);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("swiglu");
 
         // 6. Indexed down matmul. #383 follow-up: same dp4a swap as gate/up, for the
         // Q5_K-resident down bank (K=intermediate, MoeSiluInter as input — a
@@ -1929,6 +1937,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 m: hidden, k: interm, n: expandedRows, numExperts: numE);
         }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("down");
 
         }
 
@@ -2108,15 +2117,23 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// gate/up section) so the dp4a Q8_0 MMVQ GEMV can read it; one quantize serves every Q8_0 projection that shares the input
     /// (pass <c>xqReady</c> to <see cref="RecordMatmul"/>). False when the kernels are unavailable or the row does not fit the scratch.
     /// </summary>
-    private bool TryPrepareQ8Activations(nint cmdBuf, VulkanDevice.Buffer input, int k)
+    private bool TryPrepareQ8Activations(nint cmdBuf, VulkanDevice.Buffer input, int k, int n = 1)
     {
         if (_kernels.MatMulQ8Mmvq is null || _kernels.QuantizeQ8_1RowsActivations is null || (k & 31) != 0) return false;
-        if (QuantizeQ8_1RowsKernel.PackedBytes(1, k) > _state.MoeExpandedInputXq.Size
-            || QuantizeQ8_1RowsKernel.ScaleBytes(1, k) > _state.MoeExpandedInputXds.Size) return false;
-        _kernels.QuantizeQ8_1RowsActivations.Record(cmdBuf, input, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, n: 1, k: k);
+        if (QuantizeQ8_1RowsKernel.PackedBytes(n, k) > _state.MoeExpandedInputXq.Size
+            || QuantizeQ8_1RowsKernel.ScaleBytes(n, k) > _state.MoeExpandedInputXds.Size) return false;
+        _kernels.QuantizeQ8_1RowsActivations.Record(cmdBuf, input, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, n: n, k: k);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         return true;
     }
+
+    /// <summary>Runtime switch for the 2..8-row multi-column GEMVs (#876); <c>DOTLLM_VK_SMALLROW_GEMV=0</c> at startup disables (A/B and diagnostics).</summary>
+    internal static bool SmallRowGemvEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_SMALLROW_GEMV") != "0";
+
+    /// <summary>True for 2..8-row forwards that have the Q8_0 multi-column MMVQ GEMV (#876).</summary>
+    private bool SmallRowQ8(int seqLen)
+        => SmallRowGemvEnabled && seqLen >= 2 && MatMulQ8_0MmvqMultiKernel.Accepts(seqLen, 32) && _kernels.MatMulQ8MmvqMulti is not null
+           && _kernels.QuantizeQ8_1RowsActivations is not null;
 
     private void RecordMatmul(
         nint cmdBuf,
@@ -2136,6 +2153,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                     _kernels.MatMulQ8Mmvq.Record(cmdBuf, weights, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, output, m: outputDim, k: inputDim);
                 else if (seqLen == 1)
                     _kernels.MatMulQ8.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (SmallRowQ8(seqLen) && (inputDim & 31) == 0 && SmallRowQ8Prepare(cmdBuf, input, inputDim, seqLen, xqReady))
+                    _kernels.MatMulQ8MmvqMulti!.Record(cmdBuf, weights, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, output,
+                        m: outputDim, k: inputDim, n: seqLen);   // #876: 2..8 rows read the weights once instead of the 128x128 coopmat GEMM
                 else if (_kernels.MatMulQ8GemmCoopmat is not null)
                     _kernels.MatMulQ8GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
@@ -2245,6 +2265,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.F16:
                 if (seqLen == 1)
                     _kernels.MatMulF16.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (SmallRowGemvEnabled && _kernels.MatMulF16Multi is { } f16Multi && MatMulF16GemvMultiKernel.Accepts(seqLen, inputDim))
+                    f16Multi.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);   // #876
                 else if (_kernels.MatMulF16GemmCoopmat is not null)
                     _kernels.MatMulF16GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
@@ -2259,9 +2281,25 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                     _kernels.MatMulBf16Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             default:
-                _kernels.MatMul.Record(cmdBuf, weights, input, output, outputDim, inputDim, seqLen);
+                if (SmallRowGemvEnabled && weightQt == QuantizationType.F32 && _kernels.MatMulF32Multi is { } f32Multi && MatMulF32GemvMultiKernel.Accepts(seqLen, inputDim))
+                    f32Multi.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);   // #876
+                else
+                    _kernels.MatMul.Record(cmdBuf, weights, input, output, outputDim, inputDim, seqLen);
                 break;
         }
+    }
+
+    /// <summary>
+    /// Quantizes the <paramref name="n"/> activation rows for the multi-column Q8_0 GEMV. The shared scratch may still be read by the
+    /// previous matmul, so a barrier precedes the quantize unless the caller already quantized this input (<paramref name="xqReady"/>).
+    /// </summary>
+    private bool SmallRowQ8Prepare(nint cmdBuf, VulkanDevice.Buffer input, int k, int n, bool xqReady)
+    {
+        if (xqReady) return true;
+        if (QuantizeQ8_1RowsKernel.PackedBytes(n, k) > _state.MoeExpandedInputXq.Size
+            || QuantizeQ8_1RowsKernel.ScaleBytes(n, k) > _state.MoeExpandedInputXds.Size) return false;
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        return TryPrepareQ8Activations(cmdBuf, input, k, n);
     }
 
     // ── Plumbing ─────────────────────────────────────────────────────────────
