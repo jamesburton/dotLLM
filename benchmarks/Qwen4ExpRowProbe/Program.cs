@@ -161,6 +161,18 @@ void Exec(string line, StringBuilder o)
             o.AppendLine($"fwd rows={rows} ctx={ctx} reps={reps}: min {t[0]:F1} med {t[t.Count / 2]:F1} mean {t.Average():F1} max {t[^1]:F1} ms");
             break;
         }
+        case "draft":
+        {
+            // MTP draft-step proxy (#820): GR-read, QSA, GR-write, GR-read, MoE, GR-write, head mixer, LM head, host argmax - 1 row, one submit
+            int reps = int.Parse(a[1]), ctx = a.Length > 2 ? int.Parse(a[2]) : 16;
+            using var st = model.CreateState();
+            var ctxIds = Ids(ctx, 11);
+            using (var w = model.Forward(ctxIds, Enumerable.Range(0, ctx).ToArray(), -1, st)) { }
+            model.ProbeDraftStepMs(st, 3);
+            var t = model.ProbeDraftStepMs(st, reps).OrderBy(x => x).ToArray();
+            o.AppendLine($"draft proxy ctx={ctx} reps={reps}: min {t[0]:F2} med {t[t.Length / 2]:F2} mean {t.Average():F2} max {t[^1]:F2} ms");
+            break;
+        }
         case "stage":
         {
             int rows = int.Parse(a[1]), reps = int.Parse(a[2]), ctx = a.Length > 3 ? int.Parse(a[3]) : 16;

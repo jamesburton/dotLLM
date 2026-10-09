@@ -339,37 +339,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         // Short forwards (decode, 2..8-row MTP verify) stay in ONE command buffer: each split costs a submit + fence wait (~0.1 ms x 96 per forward, #876).
         bool splitHalves = T > SplitHalvesAbove;
 
-        // GR read: group-RMS(src) -> low-rank mix -> block input h (core NormOutput); inject gains when requested.
         void GrRead(VulkanQwen4ExpGrWeights w, VulkanDevice.Buffer src, int tokens, bool inject)
-        {
-            VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, src, _xn, 0, 0, (ulong)(tokens * rowBytes));
-            Barrier();
-            _core.Q4Stage("gr.copy");
-            _groupRms.Record(cmd, _xn, w.Norm, tokens, S, H, _eps);
-            Barrier();
-            _core.Q4Stage("gr.grouprms");
-            _core.Q4RecordMatmul(cmd, w.Down, w.DownQt, _xn, _low, outputDim: _lowRank, inputDim: row, seqLen: tokens);
-            Barrier();
-            _core.Q4Stage("gr.down");
-            _gr.RecordActivateLowRank(cmd, _low, tokens * _lowRank, S);
-            Barrier();
-            _core.Q4Stage("gr.act");
-            _core.Q4RecordMatmul(cmd, w.Up, w.UpQt, _low, _mix, outputDim: row, inputDim: _lowRank, seqLen: tokens);
-            Barrier();
-            _core.Q4Stage("gr.up");
-            _gr.RecordMixMean(cmd, st.NormOutput, _mix, _xn, tokens, S, H);
-            Barrier();
-            _core.Q4Stage("gr.mixmean");
-            if (inject)
-            {
-                _core.Q4RecordMatmul(cmd, w.Inject!, w.InjectQt, _xn, _gains, outputDim: S, inputDim: row, seqLen: tokens);
-                Barrier();
-                _core.Q4Stage("gr.inject_mm");
-                _gr.RecordInjectGains(cmd, _gains, tokens, S);
-                Barrier();
-                _core.Q4Stage("gr.inject_gains");
-            }
-        }
+            => RecordGrRead(cmd, w, src, st.NormOutput, tokens, inject);
 
         Begin();
         _core.Q4StageBegin();
@@ -472,6 +443,41 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         catch { result.Dispose(); throw; }
         state.Length += T;
         return result;
+    }
+
+    /// <summary>GR read: group-RMS(src) -> low-rank mix -> block input written to <paramref name="dst"/>; inject gains when requested.</summary>
+    /// <summary>GR read: group-RMS(src) -> low-rank mix -> block input written to <paramref name="dst"/>; inject gains when requested.</summary>
+    private void RecordGrRead(nint cmd, VulkanQwen4ExpGrWeights w, VulkanDevice.Buffer src, VulkanDevice.Buffer dst, int tokens, bool inject)
+    {
+        int S = _streams, H = _hidden, row = S * H;
+        long rowBytes = (long)row * 4;
+        VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, src, _xn, 0, 0, (ulong)(tokens * rowBytes));
+        KernelSupport.ComputeTransferFullBarrier(cmd);
+        _core.Q4Stage("gr.copy");
+        _groupRms.Record(cmd, _xn, w.Norm, tokens, S, H, _eps);
+        KernelSupport.ComputeTransferFullBarrier(cmd);
+        _core.Q4Stage("gr.grouprms");
+        _core.Q4RecordMatmul(cmd, w.Down, w.DownQt, _xn, _low, outputDim: _lowRank, inputDim: row, seqLen: tokens);
+        KernelSupport.ComputeTransferFullBarrier(cmd);
+        _core.Q4Stage("gr.down");
+        _gr.RecordActivateLowRank(cmd, _low, tokens * _lowRank, S);
+        KernelSupport.ComputeTransferFullBarrier(cmd);
+        _core.Q4Stage("gr.act");
+        _core.Q4RecordMatmul(cmd, w.Up, w.UpQt, _low, _mix, outputDim: row, inputDim: _lowRank, seqLen: tokens);
+        KernelSupport.ComputeTransferFullBarrier(cmd);
+        _core.Q4Stage("gr.up");
+        _gr.RecordMixMean(cmd, dst, _mix, _xn, tokens, S, H);
+        KernelSupport.ComputeTransferFullBarrier(cmd);
+        _core.Q4Stage("gr.mixmean");
+        if (inject)
+        {
+            _core.Q4RecordMatmul(cmd, w.Inject!, w.InjectQt, _xn, _gains, outputDim: S, inputDim: row, seqLen: tokens);
+            KernelSupport.ComputeTransferFullBarrier(cmd);
+            _core.Q4Stage("gr.inject_mm");
+            _gr.RecordInjectGains(cmd, _gains, tokens, S);
+            KernelSupport.ComputeTransferFullBarrier(cmd);
+            _core.Q4Stage("gr.inject_gains");
+        }
     }
 
     private static int SplitHalvesAbove =
