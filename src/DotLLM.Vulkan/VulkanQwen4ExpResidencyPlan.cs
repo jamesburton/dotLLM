@@ -33,8 +33,36 @@ internal readonly record struct Qwen4ExpResidencyPlan(
     /// <summary>Usable resident budget: capacity minus headroom.</summary>
     public long BudgetBytes => Math.Max(0, CapacityBytes - HeadroomBytes);
 
-    /// <summary>True when <see cref="RequiredBytes"/> fits the budget.</summary>
-    public bool Fits => RequiredBytes <= BudgetBytes;
+    /// <summary>GPU memory other processes hold on this adapter right now (#880); 0 when unknown.</summary>
+    public long OtherProcessBytes { get; init; }
+
+    /// <summary>"pid 1234 (llama-server) 31.2 GiB, ..." naming the top holders; null when unknown.</summary>
+    public string? OtherProcessDetail { get; init; }
+
+    /// <summary>True when <see cref="RequiredBytes"/> plus what other processes hold fits the budget.</summary>
+    public bool Fits => RequiredBytes + OtherProcessBytes <= BudgetBytes;
+
+    /// <summary>Bytes by which <see cref="RequiredBytes"/> + other processes exceed the budget (0 when it fits).</summary>
+    public long ShortfallBytes => Math.Max(0, RequiredBytes + OtherProcessBytes - BudgetBytes);
+
+    /// <summary>
+    /// Post-upload check (#880): given what this process actually holds after the weights are resident, does it still fit
+    /// beside the other processes? Returns the shortfall in bytes (0 = fine).
+    /// </summary>
+    public static long PostUploadShortfall(long ourBytes, long otherBytes, long capacityBytes, long headroomBytes)
+        => Math.Max(0, ourBytes + otherBytes - Math.Max(0, capacityBytes - headroomBytes));
+
+    /// <summary>The refusal / warning text naming the shortfall and the likely culprits.</summary>
+    public string DescribeShortfall()
+    {
+        static string G(long b) => $"{b / (double)(1L << 30):F1} GiB";
+        string others = OtherProcessBytes > 0
+            ? $"Other processes already hold {G(OtherProcessBytes)} of GPU memory ({OtherProcessDetail ?? "unnamed"}). "
+            : "";
+        return $"short by {G(ShortfallBytes)} once other GPU users are counted. {others}" +
+               "Close the other GPU consumers (a second dotllm, llama.cpp, Lemonade, Docker, ollama, a browser) or lower the context; " +
+               "oversubscribing GPU memory can end in VK_ERROR_DEVICE_LOST.";
+    }
 
     /// <summary>True when device weights plus the (possibly fully page-cache-warm) host-only table exceed physical RAM less headroom (UMA only matters).</summary>
     public bool HostPressure => PhysicalRamBytes > 0 && RequiredBytes + HostOnlyBytes > Math.Max(0, PhysicalRamBytes - HeadroomBytes);
@@ -48,7 +76,8 @@ internal readonly record struct Qwen4ExpResidencyPlan(
         static string G(long b) => $"{b / (double)(1L << 30):F1} GiB";
         return $"device needs {G(RequiredBytes)} (weights {G(DeviceWeightBytes)} + KV/scratch {G(KvAndScratchBytes)}) against a resident " +
                $"budget of {G(BudgetBytes)} (capacity {G(CapacityBytes)} - headroom {G(HeadroomBytes)}); host-only n-gram table {G(HostOnlyBytes)} " +
-               $"(never uploaded); physical RAM {G(PhysicalRamBytes)}";
+               $"(never uploaded); physical RAM {G(PhysicalRamBytes)}" +
+               (OtherProcessBytes > 0 ? $"; other processes' GPU memory {G(OtherProcessBytes)}" : "");
     }
 
     /// <summary>Quant types whose routed expert banks stay packed on the device (mirrors <c>VulkanQwen3MoeMoeUpload</c>).</summary>

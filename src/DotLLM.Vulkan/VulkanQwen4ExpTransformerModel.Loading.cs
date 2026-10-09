@@ -26,9 +26,12 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
     public static VulkanQwen4ExpTransformerModel BuildFromGguf(VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir)
         => BuildFromGguf(device, gguf, config, spvDir, residentCapacityOverrideBytes: null);
 
-    /// <summary>Test seam: <paramref name="residentCapacityOverrideBytes"/> replaces the device's resident capacity in the pre-load gate.</summary>
+    /// <summary>
+    /// Test seam: <paramref name="residentCapacityOverrideBytes"/> replaces the device's resident capacity in the pre-load gate;
+    /// <paramref name="otherPressureProbe"/> replaces the OS read of other processes' GPU memory (called once before and once after the upload).
+    /// </summary>
     internal static VulkanQwen4ExpTransformerModel BuildFromGguf(VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir,
-        long? residentCapacityOverrideBytes)
+        long? residentCapacityOverrideBytes, Func<VulkanGpuMemoryPressure?>? otherPressureProbe = null)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(gguf);
@@ -52,9 +55,13 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         // Residency gate BEFORE touching the device (the 122B WDDM-thrash class: refuse with numbers, do not page).
         var plan = Qwen4ExpResidencyPlan.Create(tensors, config, residentCapacityOverrideBytes ?? device.ResidentCapacityBytes(), kvCapacity,
             GC.GetGCMemoryInfo().TotalAvailableMemoryBytes);
+        // #880: other processes' GPU memory (second dotllm, llama.cpp, ...) is invisible to VK_EXT_memory_budget, so read the OS counters.
+        var pressure = otherPressureProbe is not null ? otherPressureProbe() : device.ReadOtherProcessPressure();
+        if (pressure is not null)
+            plan = plan with { OtherProcessBytes = pressure.OtherBytes, OtherProcessDetail = pressure.DescribeCulprits() };
         if (!plan.Fits)
         {
-            string msg = "qwen4exp weights do not fit the Vulkan device's resident capacity: " + plan.Describe() + ". " +
+            string msg = "qwen4exp weights do not fit the Vulkan device's resident capacity: " + plan.Describe() + ". " + plan.DescribeShortfall() + " " +
                          "Quant types without a resident indexed-MoE kernel (everything but Q4_K/Q5_K/Q6_K/Q5_1/Q8_0 experts) are widened to F32 on upload.";
             if (!AllowOvercommit)
                 throw new NotSupportedException(msg + " Set DOTLLM_VK_ALLOW_OVERCOMMIT=1 to load anyway (expect paging).");
@@ -129,6 +136,26 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             gr = Qwen4ExpGatedResidualKernel.Create(device, spvDir);
             groupRms = GroupRmsNormF32Kernel.Create(device, spvDir);
             sigmoidGate = GdnPostScanGateF32Kernel.Create(device, spvDir, sigmoidGate: true);
+
+            // #880: re-check after the upload. Another process may have grown while we were loading; surface it here with numbers
+            // instead of letting the first forward end in VK_ERROR_DEVICE_LOST.
+            var after = otherPressureProbe is not null ? otherPressureProbe() : device.ReadOtherProcessPressure();
+            if (after is not null)
+            {
+                long ours = device.LiveBytesTotal();
+                long short_ = Qwen4ExpResidencyPlan.PostUploadShortfall(ours, after.OtherBytes, plan.CapacityBytes, plan.HeadroomBytes);
+                if (short_ > 0)
+                {
+                    string msg = $"after the qwen4exp upload this process holds {ours / (double)(1L << 30):F1} GiB and other processes hold " +
+                                 $"{after.OtherBytes / (double)(1L << 30):F1} GiB ({after.DescribeCulprits()}), " +
+                                 $"{short_ / (double)(1L << 30):F1} GiB over the {plan.BudgetBytes / (double)(1L << 30):F1} GiB budget. " +
+                                 "Close the other GPU consumers (a second dotllm, llama.cpp, Lemonade, Docker, ollama, a browser); " +
+                                 "oversubscribing GPU memory can end in VK_ERROR_DEVICE_LOST.";
+                    if (!AllowOvercommit)
+                        throw new NotSupportedException(msg + " Set DOTLLM_VK_ALLOW_OVERCOMMIT=1 to continue anyway.");
+                    Console.Error.WriteLine("[dotLLM] WARNING: " + msg + " DOTLLM_VK_ALLOW_OVERCOMMIT=1: continuing.");
+                }
+            }
 
             return new VulkanQwen4ExpTransformerModel(device, gguf, config, core, attnGr.ToArray(), ffnGr.ToArray(), head, moeBundles.ToArray(),
                 ple, pleLayer, owned, hostOnly, gr, groupRms, sigmoidGate, kvCapacity, weightBytes);
