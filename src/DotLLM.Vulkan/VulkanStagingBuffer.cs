@@ -94,7 +94,7 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
 
     /// <summary>Persistent host pointer to the CURRENT slot's mapped memory. Re-read it after every
     /// <see cref="Flush"/> — the slot rotates.</summary>
-    public nint Mapped => _slots[_current]!.Mapped;
+    public nint Mapped => (_slots[_current] ??= CreateSlot(_device, Capacity)).Mapped;
 
     /// <summary>Usable staging bytes per call — <c>min(neededBytes, MaxChunkBytes / SlotCount)</c>.</summary>
     public long Capacity { get; }
@@ -110,11 +110,34 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
 
     private long _fenceWaitTicks;
 
+    private static long s_memcpyTicks, s_memcpyBytes, s_copyWaitTicks;
+
+    /// <summary>Process-wide time the submitting thread spent waiting for a parallel memcpy job to finish (#874 diagnostic).</summary>
+    public static double CopyWaitMilliseconds => Interlocked.Read(ref s_copyWaitTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+    /// <summary>Process-wide time spent in the mmap-to-staging <c>memcpy</c> of <see cref="UploadBytes"/> (page-fault bound when the source is cold) (#874).</summary>
+    public static double MemcpyMilliseconds => Interlocked.Read(ref s_memcpyTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+    /// <summary>Process-wide bytes copied by <see cref="UploadBytes"/> (#874 diagnostic).</summary>
+    public static long MemcpyBytes => Interlocked.Read(ref s_memcpyBytes);
+
     /// <summary>Diagnostic (issue #510): total host time spent blocked in
     /// <c>vkWaitForFences</c>. This is the number #510 moves: the wait COUNT barely
     /// changes, but each wait now finds a copy that has been running since the previous
     /// chunk's memcpy started, instead of one that was submitted moments ago.</summary>
     public double FenceWaitMilliseconds => _fenceWaitTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+    /// <summary>Number of staging slots when built by <see cref="CreateParallel"/> (<c>DOTLLM_VULKAN_UPLOAD_SLOTS</c>, default 12, 3..32).</summary>
+    public static int ParallelSlotCount { get; } = ParseInt("DOTLLM_VULKAN_UPLOAD_SLOTS", 12, 3, 32);
+
+    /// <summary>Slot size when built by <see cref="CreateParallel"/> (<c>DOTLLM_VULKAN_UPLOAD_SLOT_MB</c>, default 32).</summary>
+    public static long ParallelSlotBytes { get; } = ParseInt("DOTLLM_VULKAN_UPLOAD_SLOT_MB", 32, 1, 256) * 1024L * 1024;
+
+    private static int ParseInt(string name, int dflt, int lo, int hi)
+        => int.TryParse(Environment.GetEnvironmentVariable(name), out int v) && v >= lo && v <= hi ? v : dflt;
+
+    /// <summary>True when this buffer was built for parallel streaming (more than the default two slots).</summary>
+    public bool IsParallel => _slots.Length > SlotCount;
 
     private VulkanStagingBuffer(VulkanDevice device, Slot?[] slots, long capacity)
     {
@@ -142,6 +165,20 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
         var slots = new Slot?[SlotCount];
         slots[0] = CreateSlot(device, capacity);
         return new VulkanStagingBuffer(device, slots, capacity);
+    }
+
+    /// <summary>
+    /// Builds a staging buffer for multi-threaded streaming (#874): <paramref name="slotCount"/> slots of <paramref name="slotBytes"/>
+    /// each. <see cref="UploadBytes"/> on a large tensor then <c>memcpy</c>s up to two thirds of the slots concurrently on the thread
+    /// pool - parallel page-ins from the mmap and parallel writes to the staging memory - while Vulkan calls stay on the caller's
+    /// thread, in chunk order. Build one per load and share it across tensors; the slots are allocated lazily.
+    /// </summary>
+    public static VulkanStagingBuffer CreateParallel(VulkanDevice device, long slotBytes, int slotCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(slotCount, SlotCount + 1);
+        var slots = new Slot?[slotCount];
+        slots[0] = CreateSlot(device, slotBytes);
+        return new VulkanStagingBuffer(device, slots, slotBytes);
     }
 
     private static Slot CreateSlot(VulkanDevice device, long capacity)
@@ -190,14 +227,14 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
     public void Flush(VulkanDevice.Buffer dst, long dstOffset, long bytes)
     {
         if (bytes <= 0) return;
-        var slot = _slots[_current]!;
+        var slot = _slots[_current] ??= CreateSlot(_device, Capacity);
         _device.SubmitCopyDeferred(
             slot.CommandBuffer, slot.Fence, slot.Buffer, dst,
             srcOffset: 0, dstOffset: (ulong)dstOffset, size: (ulong)bytes);
         slot.InFlight = true;
         Submits++;
 
-        _current = (_current + 1) % SlotCount;
+        _current = (_current + 1) % _slots.Length;
         var next = _slots[_current] ??= CreateSlot(_device, Capacity);
         if (next.InFlight)
         {
@@ -242,15 +279,103 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
     public void UploadBytes(nint src, long bytes, VulkanDevice.Buffer dst, long dstOffset = 0, long zeroTailBytes = 0)
     {
         VulkanWeightImportPolicy.ThrowIfHostOnly(src, bytes);
+        if (IsParallel && bytes >= 2 * Capacity)
+        {
+            UploadBytesParallel(src, bytes, dst, dstOffset, zeroTailBytes);
+            return;
+        }
         var plan = new VulkanStagingChunkPlan(bytes, zeroTailBytes, Capacity);
+        bool readAhead = VulkanWeightReadAhead.Applies(bytes);
+        var cursor = readAhead ? VulkanWeightReadAhead.Begin(bytes) : default;
         while (plan.MoveNext())
         {
+            if (readAhead) VulkanWeightReadAhead.Pump(ref cursor, src, plan.SrcOffset);   // #874: page in the next window in parallel
             nint mapped = Mapped;
+            long tc = System.Diagnostics.Stopwatch.GetTimestamp();
             if (plan.Length > 0)
                 System.Buffer.MemoryCopy((void*)(src + (nint)plan.SrcOffset), (void*)mapped, Capacity, plan.Length);
+            Interlocked.Add(ref s_memcpyTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tc);
+            Interlocked.Add(ref s_memcpyBytes, plan.Length);
             if (plan.ZeroTail > 0)
                 new Span<byte>((void*)(mapped + (nint)plan.Length), (int)plan.ZeroTail).Clear();
             Flush(dst, dstOffset + plan.SrcOffset, plan.Length + plan.ZeroTail);
+        }
+    }
+
+    /// <summary>
+    /// Multi-threaded variant of <see cref="UploadBytes"/> (#874). Chunk <c>i</c> goes to the next ring slot; its <c>memcpy</c> runs on
+    /// the thread pool while the caller dispatches the following chunks, and the caller (only) submits finished chunks in order. At most
+    /// <c>2/3</c> of the slots are being filled at once, so the rest hold copies the GPU is draining and a slot is rarely waited on.
+    /// </summary>
+    private void UploadBytesParallel(nint src, long bytes, VulkanDevice.Buffer dst, long dstOffset, long zeroTailBytes)
+    {
+        var plan = new VulkanStagingChunkPlan(bytes, zeroTailBytes, Capacity);
+        int maxFilling = Math.Max(2, _slots.Length * 2 / 3);
+        var pending = new Queue<(Task Job, Slot Slot, long DstOffset, long Length)>(maxFilling);
+        bool readAhead = VulkanWeightReadAhead.Applies(bytes);
+        var cursor = readAhead ? VulkanWeightReadAhead.Begin(bytes) : default;
+        long capacity = Capacity;
+
+        void SubmitOldest()
+        {
+            var (job, slot, off, len) = pending.Dequeue();
+            long tw = System.Diagnostics.Stopwatch.GetTimestamp();
+            job.GetAwaiter().GetResult();
+            Interlocked.Add(ref s_copyWaitTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tw);
+            _device.SubmitCopyDeferred(slot.CommandBuffer, slot.Fence, slot.Buffer, dst,
+                srcOffset: 0, dstOffset: (ulong)off, size: (ulong)len);
+            slot.InFlight = true;
+            Submits++;
+        }
+
+        try
+        {
+            while (plan.MoveNext())
+            {
+                var slot = _slots[_current] ??= CreateSlot(_device, capacity);
+                if (slot.InFlight)
+                {
+                    long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    _device.WaitAndResetFence(slot.Fence);
+                    _fenceWaitTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+                    slot.InFlight = false;
+                    FenceWaits++;
+                }
+                if (readAhead) VulkanWeightReadAhead.Pump(ref cursor, src, plan.SrcOffset);
+                long srcOff = plan.SrcOffset, len = plan.Length, tail = plan.ZeroTail;
+                nint mapped = slot.Mapped;
+                var job = Task.Run(() =>
+                {
+                    long tc = System.Diagnostics.Stopwatch.GetTimestamp();
+                    if (len > 0)
+                        System.Buffer.MemoryCopy((void*)(src + (nint)srcOff), (void*)mapped, capacity, len);
+                    if (tail > 0)
+                        new Span<byte>((void*)(mapped + (nint)len), (int)tail).Clear();
+                    Interlocked.Add(ref s_memcpyTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tc);
+                    Interlocked.Add(ref s_memcpyBytes, len);
+                });
+                pending.Enqueue((job, slot, dstOffset + srcOff, len + tail));
+                _current = (_current + 1) % _slots.Length;
+                if (pending.Count >= maxFilling) SubmitOldest();
+            }
+            while (pending.Count > 0) SubmitOldest();
+        }
+        catch
+        {
+            // Never leave a memcpy running into a slot we are about to hand back or destroy.
+            foreach (var p in pending) { try { p.Job.GetAwaiter().GetResult(); } catch { } }
+            throw;
+        }
+
+        // Serial-path invariant (Flush writes into the CURRENT slot without checking it): make sure it is free.
+        var cur = _slots[_current];
+        if (cur is { InFlight: true })
+        {
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            _device.WaitAndResetFence(cur.Fence);
+            _fenceWaitTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+            cur.InFlight = false;
+            FenceWaits++;
         }
     }
 
@@ -316,8 +441,9 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
         if (s_trace)
         {
             Console.Error.WriteLine(
-                $"[vulkan-mem] staging({Capacity / (1024 * 1024)} MiB x{SlotCount}) " +
+                $"[vulkan-mem] staging({Capacity / (1024 * 1024)} MiB x{_slots.Length}) " +
                 $"submits={Submits} fenceWaits={FenceWaits} stall={FenceWaitMilliseconds:F1} ms; " +
+                $"cum memcpy={MemcpyMilliseconds:F0} ms/{MemcpyBytes / (1024 * 1024)} MiB, readahead={VulkanWeightReadAhead.RequestedBytes / (1024 * 1024)} MiB; " +
                 VulkanWeightImportPolicy.Summary());
         }
         for (int i = 0; i < _slots.Length; i++)
