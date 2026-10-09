@@ -134,6 +134,35 @@ bf16 values that are not exact in fp16 (the whole Qwen3-0.6B file is exact). `I3
 takes it. Quality of the available community files is low (Qwen3-0.6B WikiText PPL 55 -> 292); they are format/kernel
 vehicles. Test: `DOTLLM_NANOQUANT_GGUF` (or the HF-cache copy of `arelath/Qwen3-0.6B-nanoquant-GGUF`).
 
+**End-to-end CPU load (issue #869).** `NanoQuantLoader` composites are registered as `QuantizationType.LittleBit` weights
+(`FactorizedWeights`, see LittleBit above): `TransformerModel.LoadFromGguf` loads the community Qwen3-0.6B file as an ordinary
+dense Qwen3. Stacked `attn_qkv` is split by row into q (n_heads*head_dim), k, v (n_kv*head_dim) layers with the shared right
+factor replicated (3x stage-1 work for qkv; ~0.3 MiB each, negligible memory); the salient columns are applied by
+`GemmLittleBit` after the base GEMM on the raw input. Scales are F32 (bf16 widened exactly), so the former fp16-exactness guard is
+gone. Vulkan/CUDA/HIP/hybrid loaders and any non-Qwen3 architecture throw `NotSupportedException` ("CPU backend only" / "dense
+Qwen3"); the CPU-only switch is `TransformerWeights.LoadFromGguf(..., allowNanoQuant: true)`.
+
+- **Oracle** (modified llama.cpp fork `arelath/llama.cpp@nanoquants`, mingw CPU build, no repack, 3 prompts / 22 positions): top-1 agreement
+  22/22, per-position KL(oracle||dotLLM) 1.2e-7..7.9e-5 nats, max |dlogit| 0.002..0.065 over the 151,936-entry vocab; greedy 16-token
+  continuation identical for 2 of 3 prompts and 13/16 for the third (a near-tie at token 14; the oracle itself differs by CPU repack
+  settings). Test: `NanoQuantEndToEndTests` (committed top-1/top-5/greedy in `NanoQuantData/oracle_p*.json`; full logits from
+  `DOTLLM_NANOQUANT_ORACLE_DIR` / `~/.dotllm/test-cache/nanoquant-oracle`, skipped when absent).
+- **F32-decoded control** (`DOTLLM_LITTLEBIT_DENSE_CONTROL=1`: every projection incl. salient columns decoded to dense F32): layer-level
+  kernel-vs-dense gap 3.4e-6 of RMS (blk.0.ffn_gate); the model logits are (near-)bit-identical because the Q8_0 head quantises its
+  input to int8, which absorbs that gap.
+- **Perplexity** (`dotllm perplexity`, WikiText-2 test LF fixture, token ids dumped from the GGUF run so teacher and student score the
+  identical stream): 64 windows x 128 tokens (closest to the card protocol; card: BF16 55.17, NanoQuant 292.26, ratio 5.30x) -> dense bf16
+  Qwen3-0.6B (rev c1899de) **53.88**, NanoQuant **302.49**, ratio **5.61x**. 32 windows x 512 (second half scored): teacher 19.30, NanoQuant
+  99.96 (5.18x). Absolute numbers differ from the card because the card's own window sampling / batching is not reproducible from the card;
+  the ratio is the comparable figure and agrees to ~6%.
+- **Memory**: the 196 factorised projections hold 63.4 MiB resident (packed signs + F32 scales + F32 salient columns) vs 840 MiB as dense
+  bf16 (1680 MiB as the F32 the dense CPU path upcasts to): 13x/26x smaller. File 375 MiB total, dominated by the Q8_0 embedding and head
+  (2 x 157.6 MiB, mmap'd).
+- **Decode** (`dotllm run`, 64 tokens, greedy, CPU, 3 interleaved same-session pairs on a loaded box): NanoQuant 43.9 / 29.0 / 23.9 tok/s vs dense
+  bf16 (upcast to F32) 10.1 / 10.8 / 15.2: per-pair ratios 4.3x / 2.7x / 1.6x, median 2.7x. The NanoQuant file also benefits from its Q8_0 head
+  (the dense baseline streams an F32-upcast tied head), so read it as an upper bound of the projection-only gain.
+
+
 ## Kernel Types
 
 Each quantization format needs two kernels:

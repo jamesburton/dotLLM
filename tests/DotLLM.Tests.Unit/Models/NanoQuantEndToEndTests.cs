@@ -74,7 +74,12 @@ public sealed unsafe class NanoQuantEndToEndTests(ITestOutputHelper output)
         var (model, file, vocab) = Open(path)!.Value;
         using (file) using (model)
         {
-            Assert.True(FactorizedWeights.LiveBytes > 0);
+            long live = FactorizedWeights.LiveBytes;
+            Assert.True(live > 0);
+            // Memory accounting: factorised projections resident (packed bits + F32 scales + F32 salient) vs the same
+            // 196 projections dense (F32 / bf16); the Q8_0 embedding + head and norms are unchanged.
+            long denseProj = 28L * ((2048L + 1024 + 1024) * 1024 + 1024L * 2048 + 3L * 3072 * 1024);
+            output.WriteLine($"factorised projections resident: {live / 1048576.0:F1} MiB; same projections dense bf16 {denseProj * 2 / 1048576.0:F1} MiB / F32 {denseProj * 4 / 1048576.0:F1} MiB");
             int agree = 0, total = 0;
             for (int p = 1; p <= 3; p++)
             {
