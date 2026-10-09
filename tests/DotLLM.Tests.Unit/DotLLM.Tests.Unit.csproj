@@ -56,6 +56,9 @@
     <!-- #832: LittleBit spike fixture (generated offline from the paper equations). -->
     <None Include="Cpu\Kernels\LittleBitData\littlebit_fixture.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="Cpu\Kernels\LittleBitData\littlebit_packed_fixture.json" CopyToOutputDirectory="PreserveNewest" />
+    <!-- #866: NanoQuant crop fixture (real community bits + float64 numpy reference) and full-layer expectations. -->
+    <None Include="Cpu\Kernels\NanoQuantData\nanoquant_crop_fixture.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Cpu\Kernels\NanoQuantData\nanoquant_full_expect.json" CopyToOutputDirectory="PreserveNewest" />
     <!-- #816: HF-generated Qwen4-Exp reference fixtures (generators in Models\Qwen4Exp\Reference; CI has no torch). -->
     <None Include="Models\Qwen4Exp\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>

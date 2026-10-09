@@ -71,6 +71,7 @@ public static unsafe partial class Dequantize
         QuantizationType.F32 => elementCount * 4,
         QuantizationType.F16 => elementCount * 2,
         QuantizationType.BF16 => elementCount * 2,
+        QuantizationType.I32 => elementCount * 4,
         QuantizationType.Q4_0 => elementCount / Q8_0GroupSize * Q4_0BlockBytes,
         QuantizationType.Q4_1 => elementCount / Q8_0GroupSize * Q4_1BlockBytes,
         QuantizationType.Q8_0 => elementCount / Q8_0GroupSize * Q8_0BlockBytes,
@@ -123,6 +124,10 @@ public static unsafe partial class Dequantize
                 break;
             case QuantizationType.BF16:
                 DequantizeBf16(src, elementCount, dest);
+                break;
+            case QuantizationType.I32:
+                // Not a float tensor: exact int -> float widening (|v| < 2^24 is exact). Raw access via the pointer is the norm.
+                for (long i = 0; i < elementCount; i++) dest[(int)i] = ((int*)src)[i];
                 break;
             case QuantizationType.Q8_0:
                 DequantizeQ8_0(src, elementCount, dest);
