@@ -147,6 +147,54 @@ class BlockData:
         return torch.from_numpy(np.stack(rows)).to(device)
 
 
+def eval_ids(tok, seq):
+    from datasets import load_dataset
+    return tok("\n\n".join(load_dataset("wikitext", "wikitext-2-raw-v1", split="test")["text"]), return_tensors="pt").input_ids
+
+
+@torch.no_grad()
+def eval_ppl_live(model, ids, seq, windows, dev):
+    was = model.training
+    model.eval()
+    n = min(ids.shape[1] // seq, windows)
+    nll = 0.0
+    for i in range(n):
+        x = ids[:, i * seq:(i + 1) * seq].to(dev)
+        lg = model(input_ids=x, use_cache=False).logits.float()
+        nll += F.cross_entropy(lg[0, :-1], x[0, 1:], reduction="sum").item()
+        del lg
+    model.train(was)
+    return math.exp(nll / (n * (seq - 1)))
+
+
+def save_ckpt(out, step, cur, opt, keep=2):
+    d = os.path.join(out, "ckpt")
+    os.makedirs(d, exist_ok=True)
+    tmp = os.path.join(d, f"tmp_{step}.pt")
+    torch.save(dict(step=step, cur=cur, params=[p.detach().cpu() for p in opt.params],
+                    masters=[m.detach().cpu() for m in opt.masters], opt=opt.opt.state_dict()), tmp)
+    os.replace(tmp, os.path.join(d, f"step_{step:06d}.pt"))
+    old = sorted(f for f in os.listdir(d) if f.startswith("step_"))
+    for f in old[:-keep]:
+        os.remove(os.path.join(d, f))
+
+
+def load_latest_ckpt(out, opt):
+    d = os.path.join(out, "ckpt")
+    fs = sorted(f for f in os.listdir(d) if f.startswith("step_")) if os.path.isdir(d) else []
+    if not fs:
+        return 0, 0
+    s = torch.load(os.path.join(d, fs[-1]), map_location="cpu")
+    with torch.no_grad():
+        for p, v in zip(opt.params, s["params"]):
+            p.copy_(v)
+        for m, v in zip(opt.masters, s["masters"]):
+            m.copy_(v)
+    opt.opt.load_state_dict(s["opt"])
+    print(f"resumed from {fs[-1]}", flush=True)
+    return s["step"], s["cur"]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
@@ -163,7 +211,12 @@ def main():
     ap.add_argument("--warmup", type=float, default=0.02)
     ap.add_argument("--l2l", type=float, default=10.0)
     ap.add_argument("--kd-reduction", default="spec", choices=["spec", "token"])
-    ap.add_argument("--save-every", type=int, default=250)
+    ap.add_argument("--ckpt-every", type=int, default=100, help="resumable checkpoint (keeps last 2)")
+    ap.add_argument("--eval-every", type=int, default=100)
+    ap.add_argument("--eval-windows", type=int, default=40)
+    ap.add_argument("--export-every", type=int, default=500)
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--max-hours", type=float, default=0.0, help="stop (after a checkpoint+export) past this wall time")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
@@ -177,6 +230,7 @@ def main():
     for p in teacher.parameters():
         p.requires_grad = False
     tok = AutoTokenizer.from_pretrained(a.model)
+    ev_ids = eval_ids(tok, a.seq)
     t0 = time.time()
     student, ranks = build_student(teacher, cfg, dev)
     print(f"init done in {time.time() - t0:.0f}s", flush=True)
@@ -185,19 +239,33 @@ def main():
     student.train()
     cap_s, cap_t = HiddenCapture(student), HiddenCapture(teacher)
     opt = MasterAdamW([p for p in student.parameters()], a.lr)
-    ntrain = sum(p.numel() for p in opt.params)
-    print(f"trainable params {ntrain / 1e6:.1f}M", flush=True)
+    print(f"trainable params {sum(p.numel() for p in opt.params) / 1e6:.1f}M", flush=True)
 
     data = BlockData(a.data, a.seq)
-    rng = np.random.default_rng(a.seed)
-    order = rng.permutation(data.n)
+    order = np.random.default_rng(a.seed).permutation(data.n)
     per_step = a.batch * a.accum
-    print(f"blocks {data.n}  steps {a.steps}  seq/step {per_step}  tokens {a.steps * per_step * a.seq / 1e6:.1f}M", flush=True)
+    tok_per_step = per_step * a.seq
+    print(f"blocks {data.n}  steps {a.steps}  tokens {a.steps * tok_per_step / 1e6:.1f}M", flush=True)
     os.makedirs(a.out, exist_ok=True)
     log = open(os.path.join(a.out, "train_log.jsonl"), "a")
+    start, cur = (load_latest_ckpt(a.out, opt) if a.resume else (0, 0))
+
+    def jlog(rec, echo=True):
+        log.write(json.dumps(rec) + "\n"); log.flush()
+        if echo:
+            print(" ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in rec.items()), flush=True)
+
+    def do_eval(step):
+        t = time.time()
+        jlog(dict(type="eval", step=step, tokens=step * tok_per_step,
+                  wikitext2_ppl=eval_ppl_live(student, ev_ids, a.seq, a.eval_windows, dev), eval_s=time.time() - t))
+
+    def do_export(step):
+        rep = export_checkpoint(student, os.path.join(a.out, "export"), cfg, tok)
+        print("exported", step, rep, flush=True)
+
     tstart = time.time()
-    cur = 0
-    for step in range(a.steps):
+    for step in range(start, a.steps):
         opt.set_lr(lr_at(step, a.steps, a.lr, a.warmup))
         opt.zero_grad()
         tl = tk = tm = 0.0
@@ -211,18 +279,24 @@ def main():
             tl += loss.item() / a.accum; tk += kl.item() / a.accum; tm += mse.item() / a.accum
         gn = opt.step()
         el = time.time() - tstart
-        rec = dict(step=step + 1, loss=tl, kl=tk, mse=tm, gnorm=float(gn), lr=opt.opt.param_groups[0]["lr"],
-                   tok_s=(step + 1) * per_step * a.seq / el, elapsed=el,
-                   peak_gb=torch.cuda.max_memory_allocated() / 2 ** 30 if dev.startswith("cuda") else 0)
-        log.write(json.dumps(rec) + "\n"); log.flush()
-        print(" ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in rec.items()), flush=True)
-        if (step + 1) % a.save_every == 0 or step + 1 == a.steps:
-            rep = export_checkpoint(student, os.path.join(a.out, "export"), cfg, tok)
-            torch.save(dict(step=step + 1, cur=cur,
-                            params=[p.detach().cpu() for p in opt.params],
-                            masters=[m.detach().cpu() for m in opt.masters],
-                            opt=opt.opt.state_dict()), os.path.join(a.out, "train_state.pt"))
-            print("saved", rep, flush=True)
+        done = step + 1
+        jlog(dict(type="train", step=done, tokens=done * tok_per_step, loss=tl, kl=tk, mse=tm, gnorm=float(gn),
+                  lr=opt.opt.param_groups[0]["lr"], tok_s=(done - start) * tok_per_step / el, elapsed=el,
+                  peak_gb=torch.cuda.max_memory_allocated() / 2 ** 30 if dev.startswith("cuda") else 0),
+             echo=(done <= 5 or done % 10 == 0))
+        timeout = a.max_hours > 0 and el > a.max_hours * 3600
+        last = done == a.steps or timeout
+        if done % a.eval_every == 0 or last:
+            do_eval(done)
+        if done % a.ckpt_every == 0 or last:
+            save_ckpt(a.out, done, cur, opt)
+            print("checkpoint", done, flush=True)
+        if done % a.export_every == 0 or last:
+            do_export(done)
+        if timeout:
+            print("max-hours reached, stopping", flush=True)
+            break
+    print("DONE", flush=True)
 
 
 if __name__ == "__main__":

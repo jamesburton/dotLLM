@@ -30,3 +30,9 @@ Bit 1 = -1, LSB-first, padded with +1. Everything except `lm_head*` linears is q
 3. Scales: checkpoint bf16 `u1,u2,v1,v2` vs spike fp16 `h,g,l` with `l = bf16(v1*u2)`. bf16->fp16 is exact only for |x| in [6.1e-5, 65504]; export reports the count outside.
 4. Spike `LittleBitPath.PaperBits` = `2r(a+b+1)+16(a+b+r)` per path double-counts sign bits (spec/authors: `r(a+b)+16(a+b)+16r`). 1024x3072, r=192, 2 paths: spec 1,710,080 bits (0.544 bpw), spike 3,283,712. Not changed here.
 5. The checkpoint stores v1 and u2 separately (+16r bits/path over the authors' accounting); trainer reports both `bits_spec` and `bits_stored`.
+
+## Resumable run on the T5500
+`t5500/launch.ps1 -Out C:/littlebit/out -Log C:/littlebit/main.log -ArgFile args.txt` starts `run_train.sh` (takes the gpu-lock, runs `train.py --resume`) and
+`watcher.sh` (refreshes the lock every 4 min while the trainer's Windows pid lives, releases it when it exits) as detached processes.
+`train.py` checkpoints every 100 steps (keeps 2), evals WikiText-2 PPL (first 40 windows) every 100, exports every 500 and at the end.
+First 0.55 bpw run (1500 steps x 8192 tokens = 12.3M tokens, ~4.7 h, ~720 tok/s): 40-window PPL 3496 (step 100) -> 401 (step 1500); teacher 19.6.
