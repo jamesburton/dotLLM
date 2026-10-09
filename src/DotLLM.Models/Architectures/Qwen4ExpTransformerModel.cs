@@ -96,6 +96,28 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
 
     // ───────────────────────────── state ─────────────────────────────
 
+    /// <summary>
+    /// Counters of the n-gram table prefetch / row-cache service summed over the PLE modules (#822); <c>null</c> when no module
+    /// runs the service (e.g. <c>DOTLLM_PLE_PREFETCH=off</c> without a cache).
+    /// </summary>
+    public PleTableStats? PleTableStats
+    {
+        get
+        {
+            PleTableStats? sum = null;
+            foreach (var b in _blocks)
+                if (b.Ple?.Prefetcher is { } pf)
+                {
+                    var s = pf.Stats;
+                    sum = sum is not { } a ? s : new PleTableStats(a.Requests + s.Requests, a.Gathers + s.Gathers, a.Rows + s.Rows,
+                        a.UniqueRows + s.UniqueRows, a.UniquePages + s.UniquePages, a.Ranges + s.Ranges, a.CacheHits + s.CacheHits,
+                        a.CacheMisses + s.CacheMisses, a.WaitMicros + s.WaitMicros, a.WorkMicros + s.WorkMicros,
+                        a.GatherMicros + s.GatherMicros, a.GatherFaults + s.GatherFaults, a.HintFailures + s.HintFailures);
+                }
+            return sum;
+        }
+    }
+
     /// <summary>Allocates a fresh sequence state (native memory; dispose it when the sequence ends).</summary>
     public Qwen4ExpSequenceState CreateState()
     {
@@ -565,6 +587,8 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
                 for (int t = 0; t < T; t++) pleIdBuf[t] = tokenIds[t] == ExternalEmbeddingToken ? stand : tokenIds[t];
                 pleIds = pleIdBuf.AsSpan(0, T);
             }
+            // #822: the n-gram rows depend only on token ids -> start paging the table in before layer 0 runs.
+            for (int pl = 0; pl < _blocks.Length; pl++) _blocks[pl].Ple?.BeginPrefetch(pleIds, state.Ple[pl]!);
             EmbedTokens(tokenIds, emb, externalEmbeddings);
             Qwen4ExpGatedResidual.Broadcast(emb, S, H, res, T);
             if (Trace is { } tr0) tr0("embed", emb.AsSpan(0, T * H), T, H);
@@ -1103,6 +1127,7 @@ public sealed unsafe class Qwen4ExpTransformerModel : IModel
     {
         if (_ownsPool) _threadPool?.Dispose();
         _defaultState.Dispose();
+        foreach (var b in _blocks) b.Ple?.Prefetcher?.Dispose();
         _spareCheckpoint?.Dispose();
         _rowBase?.Dispose(); _rowRecK.Dispose(); _rowRecG.Dispose(); _rowRecD.Dispose(); _rowSnapConv.Dispose();
         foreach (nint p in _owned) NativeMemory.AlignedFree((void*)p);
