@@ -55,6 +55,7 @@
     <None Include="Models\Gguf\TestData\**\*" CopyToOutputDirectory="PreserveNewest" />
     <!-- #832: LittleBit spike fixture (generated offline from the paper equations). -->
     <None Include="Cpu\Kernels\LittleBitData\littlebit_fixture.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Cpu\Kernels\LittleBitData\littlebit_packed_fixture.json" CopyToOutputDirectory="PreserveNewest" />
     <!-- #816: HF-generated Qwen4-Exp reference fixtures (generators in Models\Qwen4Exp\Reference; CI has no torch). -->
     <None Include="Models\Qwen4Exp\Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
