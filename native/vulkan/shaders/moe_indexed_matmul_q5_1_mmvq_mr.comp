@@ -39,7 +39,7 @@
 // Dispatch: 2D grid — gl_WorkGroupID.x = m, gl_WorkGroupID.y = n.
 
 // MULTI-ROW variant (#876): NR consecutive output rows per workgroup (see moe_indexed_matmul_q4_k_mmvq_xdiv_mr.comp). Per-row arithmetic
-// and accumulation order are identical to the one-row kernel (bit-equal output). Requires M % NR == 0.
+// and accumulation order are identical to the one-row kernel (same accumulation order; FMA contraction may differ by a few ULP - NOT guaranteed bit-equal). Requires M % NR == 0.
 // Dispatch: gl_WorkGroupID.x = m0 / NR, gl_WorkGroupID.y = n.
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 

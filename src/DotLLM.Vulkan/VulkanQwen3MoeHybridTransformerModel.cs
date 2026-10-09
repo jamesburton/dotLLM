@@ -1875,7 +1875,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             // Decode-sized batches: the coalesced subgroup-per-cell MMVQ GEMV instead of the one-thread-per-cell MMQ.
             var gateUpMmvq = decodeMmvq ? _kernels.MoeMmvqQ4K : null;
-            // #876: 2..15-token steps use the multi-row variant (bit-equal, NR output rows per workgroup).
+            // #876: 2..15-token steps use the multi-row variant (same per-row accumulation order, NR output rows per workgroup; a few ULP from the one-row kernel).
             if (gateUpMmvq is not null && MoeMrMinRows > 0 && seqLen >= MoeMrMinRows && SmallRowGemvEnabled && _kernels.MoeMmvqQ4KMr is { } q4Mr && (interm % q4Mr.RowsPerGroup) == 0)
             { gateUpMmvq = q4Mr; CountSmallRow(SmallRowPath.MoeQ4KMr); }
             if (gateUpMmvq is not null)

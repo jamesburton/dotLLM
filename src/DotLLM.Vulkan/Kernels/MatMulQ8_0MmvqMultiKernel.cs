@@ -5,7 +5,7 @@ namespace DotLLM.Vulkan.Kernels;
 
 /// <summary>
 /// Q8_0 MMVQ multi-column GEMV (#876): <c>Y[N, M] = X_q8_1[N, K] @ W_q8[M, K]^T</c> for N in 2..<see cref="MaxColumns"/>. Activations come
-/// from <see cref="QuantizeQ8_1RowsKernel"/> (row-major <c>[N][K/4]</c> / <c>[N][K/32]</c>). Column c is bit-equal to
+/// from <see cref="QuantizeQ8_1RowsKernel"/> (row-major <c>[N][K/4]</c> / <c>[N][K/32]</c>). Column c matches, to a few ULP,
 /// <see cref="MatMulQ8_0MmvqKernel"/> run on row c alone: each weight word is read once and dotted against every column in the same order.
 /// </summary>
 public sealed class MatMulQ8_0MmvqMultiKernel : IDisposable

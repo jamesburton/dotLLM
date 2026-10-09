@@ -6,7 +6,7 @@
 //
 // Same coalesced lane = K-position layout and dp4a arithmetic as matmul_q8_0_mmvq.comp (one wave32 subgroup per output row, 8-block
 // window, lane owns 8 int8), but each lane reads its weight words ONCE and dots them against all NC pre-quantized (Q8_1) activation rows.
-// The per-column accumulation order is identical to the single-column kernel, so column c of this kernel is bit-equal to running the
+// The per-column accumulation order is identical to the single-column kernel, so column c of this kernel matches (to a few ULP; FMA contraction may differ) running the
 // single-column kernel on row c alone. Before this the 2..8-row (MTP verify / short prefill) case went to the 128x128 coopmat GEMM,
 // which is ~2-3x the cost of a 1-row GEMV at N = 2 for these thin decode-sized projections.
 //

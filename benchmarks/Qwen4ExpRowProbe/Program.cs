@@ -1,3 +1,4 @@
+// Diagnostics tool (not shipped). The GPU-lock refresh path below is the author's checkout: /c/Development/dotLLM/scripts/gpu-lock.sh.
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;

@@ -17,7 +17,7 @@
 // MULTI-ROW variant (#876): each workgroup produces NR consecutive output rows (m0 .. m0+NR-1) of one expanded row n, so the activation
 // loads are shared and NR independent weight-load chains are in flight per lane (the one-row-per-workgroup kernel has ~10 dependent
 // iterations and one wave per workgroup, which is launch/latency bound at the 20..160 cells of a 2..8-row MoE step). The per-row
-// arithmetic and accumulation order are IDENTICAL to the one-row kernel, so the output is bit-equal. Requires M % NR == 0.
+// arithmetic and accumulation order are IDENTICAL to the one-row kernel, so the output matches it to a few ULP (same accumulation order; FMA contraction may differ - NOT guaranteed bit-equal). Requires M % NR == 0.
 // Dispatch: gl_WorkGroupID.x = m0 / NR, gl_WorkGroupID.y = n.
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
