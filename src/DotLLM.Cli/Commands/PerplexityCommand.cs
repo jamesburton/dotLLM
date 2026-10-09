@@ -156,19 +156,56 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             return 1;
         }
 
-        string? resolvedPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
+        // HuggingFace safetensors directory (e.g. a LittleBit factorized checkpoint, #864): CPU only, token ids
+        // supplied via --tokens-file (no GGUF tokenizer to read).
+        string? hfDir = Directory.Exists(settings.Model) && File.Exists(Path.Combine(settings.Model, "config.json"))
+            ? settings.Model : null;
+        if (hfDir is not null)
+        {
+            if (settings.TokensFile is null)
+            {
+                AnsiConsole.MarkupLine("[red]A safetensors model directory requires --tokens-file (pre-tokenized ids).[/]");
+                return 1;
+            }
+            if (!string.Equals(settings.Device, "cpu", StringComparison.OrdinalIgnoreCase))
+            {
+                AnsiConsole.MarkupLine("[red]Safetensors model directories are scored on --device cpu only.[/]");
+                return 1;
+            }
+        }
+
+        string? resolvedPath = hfDir ?? GgufFileResolver.Resolve(settings.Model, settings.Quant);
         if (resolvedPath is null)
             return 1;
 
-        using GgufFile gguf = GgufFile.Open(resolvedPath);
-        ModelConfig config = GgufModelConfigExtractor.Extract(gguf.Metadata);
-        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        using GgufFile? gguf = hfDir is null ? GgufFile.Open(resolvedPath) : null;
+        ModelConfig config;
+        var tokenizer = hfDir is null ? GgufBpeTokenizerFactory.Load(gguf!.Metadata) : null;
+        IDisposable? safetensorsSource = null;
+        IModel model;
+        IDisposable? ownedDevice = null;
+        int forwardDeviceId;
+        string deviceLabel;
+        bool addBos;
+
+        if (hfDir is not null)
+        {
+            var (m, src, cfg) = ModelLoader.LoadFromSafetensors(hfDir, new ThreadingConfig(settings.Threads));
+            model = m; config = cfg; safetensorsSource = src as IDisposable;
+            ownedDevice = safetensorsSource;
+            addBos = settings.Bos ?? false;
+            forwardDeviceId = -1;
+            deviceLabel = $"cpu-{new ThreadingConfig(settings.Threads).EffectiveThreadCount}t (safetensors)";
+        }
+        else
+        {
+        config = GgufModelConfigExtractor.Extract(gguf!.Metadata);
 
         // Issue #515/#516: llama.cpp prepends BOS to the whole stream when the vocab asks for it,
         // and dotLLM did not -- so every chunk boundary sat one token off llama.cpp's and the two
         // engines scored different text. The setting is a property of the vocab, not a user
         // preference, so it is derived here and --bos only overrides it.
-        bool addBos = settings.Bos ?? GgufAddBosResolver.Resolve(gguf.Metadata);
+        addBos = settings.Bos ?? GgufAddBosResolver.Resolve(gguf.Metadata);
 
         // One shared parser/resolution (#790): unknown value -> error, explicit GPU that cannot be honoured -> error (never CPU), auto -> best device.
         if (!Helpers.DeviceCli.TryResolveForTool(settings.Device, resolvedPath, json: false, out string backend, out int gpuId))
@@ -177,10 +214,6 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         // Both are owned here and released in the finally below. The previous CPU-only code got
         // this from `using TransformerModel`; with a backend switch the model's static type is
         // IModel (itself IDisposable) and Vulkan additionally owns a device handle.
-        IModel model;
-        IDisposable? ownedDevice = null;
-        int forwardDeviceId;
-        string deviceLabel;
         switch (backend)
         {
             case "cuda":
@@ -220,6 +253,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
                 break;
             }
         }
+        }
 
         int effectiveContext = Math.Min(settings.Context, config.MaxSequenceLength);
         // Defaults reproduce llama.cpp: non-overlapping chunks, scoring the second half of each.
@@ -253,8 +287,8 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
                 ? new CrlfNormalizingTextReader(fileReader)
                 : fileReader;
             foreach (int id in CorpusReader.StreamTokens(
-                         reader, tokenizer, settings.MaxTokens,
-                         bosTokenId: addBos ? tokenizer.BosTokenId : -1))
+                         reader, tokenizer!, settings.MaxTokens,
+                         bosTokenId: addBos ? tokenizer!.BosTokenId : -1))
                 tokens.Add(id);
         }
 
@@ -280,7 +314,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         AnsiConsole.MarkupLine(
             $"[grey]device: {Markup.Escape(deviceLabel)}  all-rows logits: {returnsAllRows} "
             + $"({(returnsAllRows ? "single-pass O(n)" : "growing-prefix O(n^2)")})[/]");
-        int bosTokenId = addBos ? tokenizer.BosTokenId : -1;
+        int bosTokenId = addBos ? tokenizer!.BosTokenId : -1;
         var options = new PerplexityOptions(
             mode, effectiveContext, effectiveStride, settings.MaxTokens, effectivePrefix, bosTokenId);
 

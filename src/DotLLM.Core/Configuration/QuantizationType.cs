@@ -155,5 +155,12 @@ public enum QuantizationType
     /// hypothesis (codes-then-scale, or separate contiguous code/scale regions) produces
     /// invalid codes and/or wildly inconsistent scale magnitudes.
     /// </summary>
-    PQ2_0 = 42
+    PQ2_0 = 42,
+
+    /// <summary>
+    /// LittleBit factorized linear (issue #864): not a GGUF type. The weight "pointer" is a handle into
+    /// <c>FactorizedWeights</c> naming a sign-factor composite (<c>diag(u1) U diag(l) V diag(v2)</c>, primary plus
+    /// residual path), CPU only. Id 100 is outside the GGUF range.
+    /// </summary>
+    LittleBit = 100
 }

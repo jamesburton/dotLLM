@@ -36,8 +36,33 @@ internal static class SafetensorsTensorResolver
         ISafetensorsTensorSource file, string name, List<nint> owned)
     {
         if (!file.TensorsByName.TryGetValue(name, out var desc))
+        {
+            // LittleBit factorized composite stored under <module>.U_packed etc. (issue #864).
+            if (name.EndsWith(".weight", StringComparison.Ordinal))
+            {
+                string fprefix = name[..^"weight".Length];
+                if (DotLLM.Models.Quantization.LittleBitLoader.HasLayer(file, fprefix))
+                {
+                    if (file.TensorsByName.ContainsKey(fprefix + "bias"))
+                        throw new NotSupportedException($"LittleBit layer '{fprefix}' has a bias; not supported yet.");
+                    var layer = DotLLM.Models.Quantization.LittleBitLoader.LoadLayer(file, fprefix);
+                    if (Environment.GetEnvironmentVariable("DOTLLM_LITTLEBIT_DENSE_CONTROL") == "1")
+                    {
+                        // Diagnostic F32-decoded control: same factors, decoded to a dense F32 matrix; runs the stock F32 GEMM.
+                        nint dense = (nint)DotLLM.Cpu.Kernels.Experimental.LittleBitReference.DecodeDenseFast(layer);
+                        int dOut = layer.DOut, dIn = layer.DIn;
+                        layer.Dispose();
+                        owned.Add(dense);
+                        return (dense, QuantizationType.F32, dOut, dIn);
+                    }
+                    nint token = FactorizedWeights.Register(layer);
+                    owned.Add(token);
+                    return (token, QuantizationType.LittleBit, layer.DOut, layer.DIn);
+                }
+            }
             throw new InvalidDataException(
                 $"Safetensors file is missing required tensor '{name}'.");
+        }
 
         if (desc.Shape.Length != 2)
             throw new InvalidDataException(

@@ -211,7 +211,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
 
-        var weights = TransformerWeightsSafetensorsLoader.Load(file, config, i2sCache);
+        var weights = TransformerWeightsSafetensorsLoader.Load(file, config, i2sCache, allowFactorized: true);
         return BuildFromPrebuiltWeightsInternal(weights, config, threading, anchorSource: file);
     }
 
@@ -3811,7 +3811,9 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
     private void Gemm(nint weights, QuantizationType qt, float* b, float* c,
                       int m, int k, int n, byte* preQuantizedInput = null)
     {
-        if (qt == QuantizationType.Q8_0)
+        if (qt == QuantizationType.LittleBit)
+            GemmLittleBit(weights, b, c, m, k, n);
+        else if (qt == QuantizationType.Q8_0)
             MatMul.GemmQ8_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
         else if (qt == QuantizationType.Q5_0)
             MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
@@ -3848,6 +3850,32 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
             // all n columns, row-parallel over the pool — bit-identical to the serial per-token
             // fallback it replaces, just not single-threaded any more (#263).
             MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, _threadPool);
+    }
+
+    private DotLLM.Cpu.Kernels.Experimental.LittleBitScratch[]? _littleBitScratch;
+
+    /// <summary>
+    /// LittleBit factorized projection (#864): c[t*m..] = layer(b[t*k..]) for each of the n tokens. Decode (n == 1) runs the
+    /// row-parallel GEMV; prefill (n &gt; 1) parallelises over tokens with per-thread scratch. The model is driven by one
+    /// caller at a time, so the scratch set is shared across layers.
+    /// </summary>
+    private void GemmLittleBit(nint token, float* b, float* c, int m, int k, int n)
+    {
+        var layer = FactorizedWeights.Get(token);
+        if (layer.DOut != m || layer.DIn != k)
+            throw new InvalidOperationException($"LittleBit layer is {layer.DOut}x{layer.DIn}, call expects {m}x{k}.");
+        var (dIn, r) = layer.ScratchDims;
+        int threads = Math.Max(1, _threadPool?.ThreadCount ?? 1);
+        var set = _littleBitScratch;
+        if (set is null || set.Length != threads || set[0].MaxDInPad < dIn || set[0].MaxRPad < r)
+        {
+            int nd = Math.Max(dIn, set?[0].MaxDInPad ?? 0), nr = Math.Max(r, set?[0].MaxRPad ?? 0);
+            if (set is not null) foreach (var s0 in set) s0.Dispose();
+            set = new DotLLM.Cpu.Kernels.Experimental.LittleBitScratch[threads];
+            for (int i = 0; i < threads; i++) set[i] = new DotLLM.Cpu.Kernels.Experimental.LittleBitScratch(nd, nr);
+            _littleBitScratch = set;
+        }
+        layer.GemmTokens(b, c, n, set, _threadPool);
     }
 
     /// <summary>
@@ -4343,6 +4371,7 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         _state.Dispose();
         _mlaKvState?.Dispose();
         _mlaLatentKvState?.Dispose();
+        if (_littleBitScratch is not null) foreach (var s0 in _littleBitScratch) s0.Dispose();
         _weights.Dispose(); // free R4-interleaved weight buffers and any owned bf16→F32 scratch
         // _mmapAnchor is not owned by us — caller disposes the GgufFile / SafetensorsFile.
     }

@@ -13,17 +13,17 @@ namespace DotLLM.Models.Quantization;
 public static class LittleBitLoader
 {
     /// <summary>True when <paramref name="prefix"/> (ending in '.') names a LittleBit linear in the file.</summary>
-    public static bool HasLayer(SafetensorsFile f, string prefix) => f.TensorsByName.ContainsKey(prefix + "U_packed");
+    public static bool HasLayer(ISafetensorsTensorSource f, string prefix) => f.TensorsByName.ContainsKey(prefix + "U_packed");
 
     /// <summary>Loads the linear at <paramref name="prefix"/> (e.g. <c>model.layers.3.mlp.gate_proj.</c>).</summary>
-    public static LittleBitLayer LoadLayer(SafetensorsFile f, string prefix)
+    public static LittleBitLayer LoadLayer(ISafetensorsTensorSource f, string prefix)
     {
         var paths = new List<LittleBitPath> { LoadPath(f, prefix, "") };
         if (f.TensorsByName.ContainsKey(prefix + "U_R_packed")) paths.Add(LoadPath(f, prefix, "_R"));
         return new LittleBitLayer(paths.ToArray());
     }
 
-    private static LittleBitPath LoadPath(SafetensorsFile f, string prefix, string sfx)
+    private static LittleBitPath LoadPath(ISafetensorsTensorSource f, string prefix, string sfx)
     {
         var us = I64(f, $"{prefix}U{sfx}_shape");
         var vs = I64(f, $"{prefix}V{sfx}_shape");
@@ -42,24 +42,30 @@ public static class LittleBitLoader
         return LittleBitPath.FromPackedWords(dOut, dIn, r, uw, vw, u1, v2, l);
     }
 
-    private static long[] I64(SafetensorsFile f, string name)
-        => MemoryMarshal.Cast<byte, long>(f.GetTensorSpan(name)).ToArray();
+    private static unsafe ReadOnlySpan<byte> Span(ISafetensorsTensorSource f, string name)
+    {
+        var d = f.TensorsByName[name];
+        return new ReadOnlySpan<byte>((void*)f.GetTensorPointer(name), checked((int)d.ByteCount));
+    }
 
-    private static ReadOnlySpan<int> Words(SafetensorsFile f, string name, int rows, int words)
+    private static long[] I64(ISafetensorsTensorSource f, string name)
+        => MemoryMarshal.Cast<byte, long>(Span(f, name)).ToArray();
+
+    private static ReadOnlySpan<int> Words(ISafetensorsTensorSource f, string name, int rows, int words)
     {
         var d = f.TensorsByName[name];
         if (d.DType != SafetensorsDType.I32 || d.Shape.Length != 2 || d.Shape[0] != rows || d.Shape[1] != words)
             throw new InvalidDataException($"{name}: expected I32 [{rows},{words}], got {d.DType} [{string.Join(',', d.Shape)}]");
-        return MemoryMarshal.Cast<byte, int>(f.GetTensorSpan(name));
+        return MemoryMarshal.Cast<byte, int>(Span(f, name));
     }
 
     /// <summary>Reads a bf16 vector tensor (any leading 1 dims) as exact F32.</summary>
-    public static float[] Bf16(SafetensorsFile f, string name, int expectedLength)
+    public static float[] Bf16(ISafetensorsTensorSource f, string name, int expectedLength)
     {
         var d = f.TensorsByName[name];
         if (d.DType != SafetensorsDType.BF16 || d.ElementCount != expectedLength)
             throw new InvalidDataException($"{name}: expected BF16 x{expectedLength}, got {d.DType} x{d.ElementCount}");
-        var src = MemoryMarshal.Cast<byte, ushort>(f.GetTensorSpan(name));
+        var src = MemoryMarshal.Cast<byte, ushort>(Span(f, name));
         var dst = new float[src.Length];
         for (int i = 0; i < src.Length; i++) dst[i] = BitConverter.UInt32BitsToSingle((uint)src[i] << 16);
         return dst;
