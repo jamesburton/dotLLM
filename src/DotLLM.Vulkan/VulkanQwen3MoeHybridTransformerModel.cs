@@ -110,6 +110,11 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// <summary>Which routed-MoE fast paths were RECORDED (test hook: proves a branch was taken, not merely that a kernel exists).</summary>
     internal enum MoePath { GroupedPrefill, GroupedLegacyDown, MmvqDown, MmvqLegacyDown, FusedDecode }
     internal readonly long[] MoePathCounts = new long[Enum.GetValues<MoePath>().Length];
+
+    /// <summary>Record-time counters for the 2..8-row fast paths (#876): prove a fast path ran by counting, not by IsSupported.</summary>
+    internal enum SmallRowPath { F32Multi, F16Multi, Q8Multi, MoeQ4KMr, MoeQ5_1Mr }
+    internal readonly long[] SmallRowPathCounts = new long[Enum.GetValues<SmallRowPath>().Length];
+    private void CountSmallRow(SmallRowPath p) => SmallRowPathCounts[(int)p]++;
     private void CountMoePath(MoePath p) => MoePathCounts[(int)p]++;
     private static bool IsLegacyQuant(QuantizationType qt) => qt is QuantizationType.Q5_1 or QuantizationType.Q8_0;
 
@@ -1389,7 +1394,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     };
 
     /// <summary>Records the down-projection MMVQ for <paramref name="qt"/> (Q5_1 passes the identity expert scale).</summary>
-    private void RecordDownMmvq(nint cmdBuf, QuantizationType qt, VulkanQwen3MoeMoeUpload.LayerBundle moeW, int hidden, int interm, int n, int numE)
+    private void RecordDownMmvq(nint cmdBuf, QuantizationType qt, VulkanQwen3MoeMoeUpload.LayerBundle moeW, int hidden, int interm, int n, int numE, bool multiRow = false)
     {
         switch (qt)
         {
@@ -1402,6 +1407,13 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                     _state.MoeTopkIndices, _state.MoeDownRows, m: hidden, k: interm, n: n, numExperts: numE);
                 break;
             case QuantizationType.Q5_1:
+                if (multiRow && _kernels.MoeMmvqQ5_1Mr is { } q51Mr && (hidden % q51Mr.RowsPerGroup) == 0)
+                {
+                    CountSmallRow(SmallRowPath.MoeQ5_1Mr);
+                    q51Mr.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
+                        _state.MoeTopkIndices, _state.MoeDownRows, _moeUnitScale!, m: hidden, k: interm, n: n, numExperts: numE);
+                    break;
+                }
                 _kernels.MoeMmvqQ5_1!.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
                     _state.MoeTopkIndices, _state.MoeDownRows, _moeUnitScale!, m: hidden, k: interm, n: n, numExperts: numE);
                 break;
@@ -1679,8 +1691,11 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         => GroupedDownKernel(qt) is not null ? (interm % 256) == 0
             : GroupedLegacyDownKernel(qt) is not null && _moeUnitScale is not null && (interm % MoeGroupedMatmulLegacyQuantCoopmatKernel.KGroup) == 0;
 
-    private static readonly int GroupedMinTokens =
+    private static readonly int GroupedMinTokensDefault =
         int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_GROUPED_MIN_TOKENS"), out int g) && g > 0 ? g : 16;
+
+    /// <summary>Smallest token count that takes the expert-grouped coopmat MoE path; per instance so the qwen4exp wrapper can lower it (#876).</summary>
+    internal int GroupedMinTokens { get; set; } = GroupedMinTokensDefault;
 
     /// <summary>
     /// Grouped-by-expert routed FFN (issue #637). Buffer reuse: MoeExpandedInput (broadcast rows) -> packed rows in MoeDownRows ->
@@ -1860,6 +1875,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             // Decode-sized batches: the coalesced subgroup-per-cell MMVQ GEMV instead of the one-thread-per-cell MMQ.
             var gateUpMmvq = decodeMmvq ? _kernels.MoeMmvqQ4K : null;
+            // #876: 2..15-token steps use the multi-row variant (bit-equal, NR output rows per workgroup).
+            if (gateUpMmvq is not null && MoeMrMinRows > 0 && seqLen >= MoeMrMinRows && SmallRowGemvEnabled && _kernels.MoeMmvqQ4KMr is { } q4Mr && (interm % q4Mr.RowsPerGroup) == 0)
+            { gateUpMmvq = q4Mr; CountSmallRow(SmallRowPath.MoeQ4KMr); }
             if (gateUpMmvq is not null)
             {
                 gateUpMmvq.Record(cmdBuf,
@@ -1917,7 +1935,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             CountMoePath(MoePath.MmvqDown);
             if (IsLegacyQuant(moeW.W2QuantType)) CountMoePath(MoePath.MmvqLegacyDown);
-            RecordDownMmvq(cmdBuf, moeW.W2QuantType, moeW, hidden, interm, expandedRows, numE);
+            RecordDownMmvq(cmdBuf, moeW.W2QuantType, moeW, hidden, interm, expandedRows, numE, multiRow: MoeMrMinRows > 0 && seqLen >= MoeMrMinRows && SmallRowGemvEnabled);
         }
         else if (useDownMmq)
         {
@@ -2130,6 +2148,10 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// <summary>Runtime switch for the 2..8-row multi-column GEMVs (#876); <c>DOTLLM_VK_SMALLROW_GEMV=0</c> at startup disables (A/B and diagnostics).</summary>
     internal static bool SmallRowGemvEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_SMALLROW_GEMV") != "0";
 
+    /// <summary>Smallest token count that takes the multi-row routed-MoE MMVQ variants (#876); 0 = never (A/B). Default 2 leaves single-token decode on the proven kernels (DOTLLM_VK_MOE_MR_MIN_ROWS=1 opts decode in: -9% 1-row forward on the real qwen4exp file).</summary>
+    internal static int MoeMrMinRows { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MR_MIN_ROWS"), out int mrMin) && mrMin >= 0 ? mrMin : 2;
+
     /// <summary>True for 2..8-row forwards that have the Q8_0 multi-column MMVQ GEMV (#876).</summary>
     private bool SmallRowQ8(int seqLen)
         => SmallRowGemvEnabled && seqLen >= 2 && MatMulQ8_0MmvqMultiKernel.Accepts(seqLen, 32) && _kernels.MatMulQ8MmvqMulti is not null
@@ -2154,8 +2176,11 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 else if (seqLen == 1)
                     _kernels.MatMulQ8.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 else if (SmallRowQ8(seqLen) && (inputDim & 31) == 0 && SmallRowQ8Prepare(cmdBuf, input, inputDim, seqLen, xqReady))
+                {
+                    CountSmallRow(SmallRowPath.Q8Multi);
                     _kernels.MatMulQ8MmvqMulti!.Record(cmdBuf, weights, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, output,
-                        m: outputDim, k: inputDim, n: seqLen);   // #876: 2..8 rows read the weights once instead of the 128x128 coopmat GEMM
+                        m: outputDim, k: inputDim, n: seqLen);
+                }   // #876: 2..8 rows read the weights once instead of the 128x128 coopmat GEMM
                 else if (_kernels.MatMulQ8GemmCoopmat is not null)
                     _kernels.MatMulQ8GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
@@ -2266,7 +2291,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 if (seqLen == 1)
                     _kernels.MatMulF16.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 else if (SmallRowGemvEnabled && _kernels.MatMulF16Multi is { } f16Multi && MatMulF16GemvMultiKernel.Accepts(seqLen, inputDim))
-                    f16Multi.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);   // #876
+                { CountSmallRow(SmallRowPath.F16Multi); f16Multi.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #876
                 else if (_kernels.MatMulF16GemmCoopmat is not null)
                     _kernels.MatMulF16GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
@@ -2282,7 +2307,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 break;
             default:
                 if (SmallRowGemvEnabled && weightQt == QuantizationType.F32 && _kernels.MatMulF32Multi is { } f32Multi && MatMulF32GemvMultiKernel.Accepts(seqLen, inputDim))
-                    f32Multi.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);   // #876
+                { CountSmallRow(SmallRowPath.F32Multi); f32Multi.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #876
                 else
                     _kernels.MatMul.Record(cmdBuf, weights, input, output, outputDim, inputDim, seqLen);
                 break;

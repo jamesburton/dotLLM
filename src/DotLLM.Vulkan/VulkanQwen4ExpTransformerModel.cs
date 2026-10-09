@@ -126,6 +126,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     /// <summary>Test hook (#849): how many times each routed-MoE fast path was recorded (see <c>MoePath</c>).</summary>
     internal long MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath p) => _core.MoePathCounts[(int)p];
 
+    /// <summary>Test hook (#876): how many times each 2..8-row fast path was recorded.</summary>
+    internal long SmallRowPathCount(VulkanQwen3MoeHybridTransformerModel.SmallRowPath p) => _core.SmallRowPathCounts[(int)p];
+
     /// <summary>Address of the n-gram table inside the GGUF mapping (0 when absent) - tests assert nothing was uploaded from this range.</summary>
     internal (nint Pointer, long Bytes) HostOnlyTableRange => _hostOnlyTable ?? (0, 0);
 
@@ -471,8 +474,25 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         return result;
     }
 
-    private static readonly int SplitHalvesAbove =
+    private static int SplitHalvesAbove =
         int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_SPLIT_ABOVE"), out int sa) && sa >= 1 ? sa : 16;
+
+    /// <summary>Diagnostic (#876): forwards longer than this many rows split each half-layer into its own submission (default 16).</summary>
+    public static int SplitAbove { get => SplitHalvesAbove; set => SplitHalvesAbove = value; }
+
+    /// <summary>Diagnostic (#876): smallest token count that takes the expert-grouped coopmat MoE path (default 16).</summary>
+    public int MoeGroupedMinTokens
+    {
+        get => _core.GroupedMinTokens;
+        set => _core.GroupedMinTokens = value;
+    }
+
+    /// <summary>Diagnostic (#876): smallest token count that uses the multi-row routed-MoE MMVQ variants (0 = never; default 2).</summary>
+    public static int MoeMultiRowMinRows
+    {
+        get => VulkanQwen3MoeHybridTransformerModel.MoeMrMinRows;
+        set => VulkanQwen3MoeHybridTransformerModel.MoeMrMinRows = value;
+    }
 
     private VulkanDevice.Buffer? _headIn, _headLogits;
 

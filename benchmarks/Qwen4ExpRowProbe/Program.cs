@@ -15,6 +15,7 @@ using DotLLM.Vulkan;
 //   env NAME=VALUE                 set a process env var (for switches read per call)
 //   quit
 const string Marker = "[probe]";
+if (args[0] == "kbench") { KBench.Run(args); return; }
 string gguf = args[0];
 string work = args[1];
 Directory.CreateDirectory(Path.Combine(work, "jobs"));
@@ -39,8 +40,17 @@ string[] prompts =
     "The French Revolution began in 1789 and transformed the political landscape of Europe. Key events included the storming of the Bastille, the Declaration of the Rights of Man, the Reign of Terror, and the rise of Napoleon Bonaparte, who eventually crowned himself emperor in 1804. Summarize the main causes.",
 };
 
+bool realText = true;
+int[] longText = null!;
 int[] Ids(int n, int seed)
 {
+    if (realText)
+    {
+        longText ??= Enumerable.Range(0, 8).SelectMany(_ => prompts.SelectMany(p => tok.Encode(p))).ToArray();
+        // seed 11 = the shared context; other seeds pick distinct windows after it
+        int start = seed == 11 ? 0 : 16 + ((seed * 37) % 200);
+        return Enumerable.Range(0, n).Select(i => longText[(start + i) % longText.Length]).ToArray();
+    }
     var r = new Random(seed);
     var a = new int[n];
     for (int i = 0; i < n; i++) a[i] = r.Next(1000, 60000);
@@ -89,6 +99,49 @@ void Exec(string line, StringBuilder o)
         case "smallrow":
             VulkanQwen4ExpTransformerModel.SmallRowGemv = a[1] == "1";
             o.AppendLine("smallrow " + a[1]);
+            break;
+        case "ratio":
+        {
+            int rows = int.Parse(a[1]), reps = int.Parse(a[2]);
+            TimeFwd(1, 16, 1); TimeFwd(rows, 16, 1);
+            var t1 = new List<double>(); var tn = new List<double>();
+            for (int i = 0; i < reps; i++) { t1.Add(TimeFwd(1, 16, 2 + i)); tn.Add(TimeFwd(rows, 16, 2 + i)); }
+            t1.Sort(); tn.Sort();
+            o.AppendLine($"ratio rows={rows}: 1-row med {t1[t1.Count / 2]:F1} min {t1[0]:F1} | {rows}-row med {tn[tn.Count / 2]:F1} min {tn[0]:F1} | med ratio {tn[tn.Count / 2] / t1[t1.Count / 2]:F2} min ratio {tn[0] / t1[0]:F2}");
+            break;
+        }
+        case "grouped":
+            model.MoeGroupedMinTokens = int.Parse(a[1]);
+            o.AppendLine("grouped " + a[1]);
+            break;
+        case "text":
+            realText = a[1] == "real";
+            o.AppendLine("text " + a[1]);
+            break;
+        case "alt1":
+        {
+            // 1-row decode A/B, interleaved: multi-row MoE MMVQ off (min rows 2 = default) vs on at 1 row
+            int reps = int.Parse(a[1]);
+            var d = new List<double>(); var e = new List<double>();
+            int saved = VulkanQwen4ExpTransformerModel.MoeMultiRowMinRows;
+            TimeFwd(1, 16, 1);
+            for (int i = 0; i < reps; i++)
+            {
+                VulkanQwen4ExpTransformerModel.MoeMultiRowMinRows = 2; d.Add(TimeFwd(1, 16, 2 + i));
+                VulkanQwen4ExpTransformerModel.MoeMultiRowMinRows = 1; e.Add(TimeFwd(1, 16, 2 + i));
+            }
+            VulkanQwen4ExpTransformerModel.MoeMultiRowMinRows = saved;
+            d.Sort(); e.Sort();
+            o.AppendLine($"alt1: default 1-row med {d[d.Count / 2]:F1} min {d[0]:F1} | MR-at-1-row med {e[e.Count / 2]:F1} min {e[0]:F1}");
+            break;
+        }
+        case "moemr":
+            VulkanQwen4ExpTransformerModel.MoeMultiRowMinRows = int.Parse(a[1]);
+            o.AppendLine("moemr " + a[1]);
+            break;
+        case "split":
+            VulkanQwen4ExpTransformerModel.SplitAbove = int.Parse(a[1]);
+            o.AppendLine("split " + a[1]);
             break;
         case "env":
         {
