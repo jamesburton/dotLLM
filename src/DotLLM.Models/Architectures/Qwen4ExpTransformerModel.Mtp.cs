@@ -19,7 +19,7 @@ namespace DotLLM.Models.Architectures;
 /// <para>Forward of one cell, exactly Strata's <c>MtpDrafter::record_front/record_rest</c> (the vLLM <c>qwen4_exp</c> MTP):
 /// <code>
 /// e   = enorm(embed(token))                          // [H]
-/// h_s = hnorm(R[s])                                  // joint RMS over hc*H, or one RMS per stream (DOTLLM_MTP_HNORM=stream)
+/// h_s = hnorm(R[s])                                  // one RMS per stream (default), or joint over hc*H (DOTLLM_MTP_HNORM=joint)
 /// R'  = eh_proj([e ; h_s]) per stream s              // eh_proj = cat(fc_embedding, fc_hidden), so this is fc_embedding(e) + fc_hidden(h_s)
 /// R'  -> GR-read -> QSA (own dense K/V) -> GR-write -> GR-read -> MoE -> GR-write
 /// logits = lm_head(head_mixer(R'))                   // the next draft step's input residual is R' (before the mixer)
@@ -41,14 +41,20 @@ public sealed unsafe partial class Qwen4ExpTransformerModel
     private MtpHead? _mtp;
     private float[]? _ropeCos, _ropeSin;
 
-    /// <summary>Env var selecting the MTP <c>hnorm</c> convention: <c>joint</c> (default, Strata and vLLM) or <c>stream</c> (one RMS per residual stream).</summary>
+    /// <summary>Env var selecting the MTP <c>hnorm</c> convention: <c>stream</c> (default) or <c>joint</c>.</summary>
     public const string HnormEnvVar = "DOTLLM_MTP_HNORM";
 
     /// <summary>
-    /// True: <c>pre_fc_norm_hidden</c> normalises each residual stream on its own (llama.cpp's reading); false (default): one RMS over all
-    /// <c>hc * hidden</c> channels (Strata's default). Only draft QUALITY depends on it, never the emitted text.
+    /// True (default): <c>pre_fc_norm_hidden</c> normalises each residual stream on its own (llama.cpp's reading); false: one RMS over all
+    /// <c>hc * hidden</c> channels (Strata's default, <c>DOTLLM_MTP_HNORM=joint</c>). Chosen by MEASURED acceptance on the real file, not
+    /// by argument: per-stream drafted 3.05 tokens/round against 2.91 for joint over 6 prompts x 128 tokens (K=4), ahead on 6 of 6.
+    /// Only draft QUALITY depends on it, never the emitted text.
     /// </summary>
-    public bool MtpHnormPerStream { get; set; } = Environment.GetEnvironmentVariable(HnormEnvVar) == "stream";
+    public bool MtpHnormPerStream { get; set; } = Environment.GetEnvironmentVariable(HnormEnvVar) != "joint";
+
+    /// <inheritdoc/>
+    /// <remarks>A 100 GiB-class 6B-active MoE is weight-bandwidth bound on any CPU, so MTP is tried first (the gate still re-measures); <see cref="ComputeMemoryBytes"/> is only the ~113 MiB state.</remarks>
+    public long MtpGatePriorBytes => long.MaxValue;
 
     /// <summary>True once an MTP head is attached.</summary>
     public bool SupportsMtp => _mtp is not null;
