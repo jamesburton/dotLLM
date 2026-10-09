@@ -112,6 +112,28 @@ fast paths never noticed the distinction). dotLLM's ragged-K support (CPU: `MatM
 in `native/kernels/`) is a scalar, correctness-first fallback reached only when `k % 128 != 0` — the
 aligned SIMD/uint4 fast paths are untouched.
 
+### NanoQuant (community GGUF, sub-1-bit factorised; issue #866)
+
+Not a block quant: a linear is a **composite** of tensors, `W ~ diag(post) U diag(mid) V diag(pre)` with U, V in {+-1}.
+Community layout (`quantization.nanoquant.version = 2`, `bit_order = lsb_first`, `positive_bit = 0`,
+`outlier_format = column_side_path`), per linear `<base>`:
+
+| tensor | ggml dtype | GGUF dims (fastest first) |
+|---|---|---|
+| `.nq_u` | **I32** (type 26) | `[ceil(r/32), d_out]`  sign words, bit set = -1, LSB-first, tail clear |
+| `.nq_v` | **I32** | `[ceil(d_in/32), r]` |
+| `.nq_scale_pre / _mid / _post` | BF16 (30) / F16 / F32 | `[d_in] / [r] / [d_out]` |
+| `.nq_salient_idx` | I32 | `[k]` strictly increasing input columns (scale_pre is exactly 0 there) |
+| `.nq_salient_weight` | F16/BF16/F32 | `[k, d_out]`; `y += W_sal . x[idx]` using the RAW x |
+
+`y = post * (U (mid * (V (pre * x)))) + salient`. The sign layout is byte-identical to the LittleBit spike (#832), so
+`NanoQuantLayer` (`DotLLM.Cpu.Kernels.Experimental`) is one `LittleBitPath` plus the salient side path, with a float64
+scalar reference (`NanoQuantReference`). `NanoQuantLoader` (`DotLLM.Models.Quantization`) reads the composites. Stacked
+`attn_qkv` is just `d_out = dq+dk+dv`; ranks differ per tensor. Scales are held fp16 by the spike, so loading refuses
+bf16 values that are not exact in fp16 (the whole Qwen3-0.6B file is exact). `I32` is a raw-word type: no matmul kernel
+takes it. Quality of the available community files is low (Qwen3-0.6B WikiText PPL 55 -> 292); they are format/kernel
+vehicles. Test: `DOTLLM_NANOQUANT_GGUF` (or the HF-cache copy of `arelath/Qwen3-0.6B-nanoquant-GGUF`).
+
 ## Kernel Types
 
 Each quantization format needs two kernels:

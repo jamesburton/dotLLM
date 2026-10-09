@@ -49,6 +49,14 @@ public enum QuantizationType
     /// <summary>6-bit K-quant, super-block of 256.</summary>
     Q6_K = 14,
 
+    /// <summary>
+    /// 32-bit signed integer tensor (ggml <c>GGML_TYPE_I32</c> = 26). Not a weight-quantization
+    /// format: it carries index lists and bit-packed payloads (e.g. the community NanoQuant GGUF stores
+    /// its <c>nq_u</c>/<c>nq_v</c> sign words and <c>nq_salient_idx</c> as I32). 4 bytes per element,
+    /// little-endian. The matmul kernels do not accept it; consumers read the raw words.
+    /// </summary>
+    I32 = 26,
+
     /// <summary>4-bit non-linear importance quantization, block size 32.</summary>
     IQ4_NL = 20,
 
