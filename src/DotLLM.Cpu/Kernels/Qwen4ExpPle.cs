@@ -28,6 +28,9 @@ public sealed class Qwen4ExpPleState : IDisposable
     /// <summary>Rows <see cref="Qwen4ExpPleBranch.Apply"/> should record per-row snapshots for on its next call (0 = off).</summary>
     internal int RecordRowCount { get; set; }
 
+    /// <summary>In-flight n-gram table prefetch for the next <see cref="Qwen4ExpPleBranch.Apply"/> (#822); consumed by it.</summary>
+    internal PleRowPrefetcher.Request? PendingPrefetch { get; set; }
+
     /// <summary>Creates a fresh (start-of-sequence) state.</summary>
     /// <param name="ngramSize">N-gram order (window is <c>ngramSize - 1</c> tokens).</param>
     /// <param name="eosTokenId">EOS id the window is filled with.</param>
@@ -396,6 +399,10 @@ public sealed class Qwen4ExpPleBranch
     private readonly Qwen4ExpProjection _keyProj, _valueProj;
     private readonly int _hc, _hidden;
     private readonly float _eps;
+    private readonly PleRowPrefetcher? _prefetcher;
+
+    /// <summary>The n-gram table service (null = plain demand-faulting gather).</summary>
+    public PleRowPrefetcher? Prefetcher => _prefetcher;
 
     /// <summary>Hash window / conv history geometry for allocating a <see cref="Qwen4ExpPleState"/>.</summary>
     public int ConvHistoryRows => (_convKernel - 1) * _ngram;
@@ -424,12 +431,14 @@ public sealed class Qwen4ExpPleBranch
     /// <param name="convWeightTapMajor">Conv weight <c>[kernel, hc*hidden]</c> (see <see cref="Qwen4ExpPle.TransposeConvWeight"/>).</param>
     /// <param name="keyProj">Key projection (<c>numHeads*rowDim -&gt; hc*hidden</c>).</param>
     /// <param name="valueProj">Value projection (<c>numHeads*rowDim -&gt; hidden</c>).</param>
+    /// <param name="tableOptions">Table prefetch / cache options (<c>null</c> = <see cref="PleTableOptions.FromEnvironment"/>).</param>
     public Qwen4ExpPleBranch(nint table, QuantizationType tableQt, long tableRows, int rowDim,
                              int ngramSize, int headsPerNgram, int eosTokenId, int convKernel,
                              long[] multipliers, long[] headOffsets, long[] headVocabSizes,
                              int hcCount, int hiddenSize, float eps,
                              float[] normKey, float[] normQuery, float[] normConv, float[] convWeightTapMajor,
-                             Qwen4ExpProjection keyProj, Qwen4ExpProjection valueProj)
+                             Qwen4ExpProjection keyProj, Qwen4ExpProjection valueProj,
+                             PleTableOptions? tableOptions = null)
     {
         _table = table; _tableQt = tableQt; _tableRows = tableRows; _rowDim = rowDim;
         _ngram = ngramSize; _headsPerNgram = headsPerNgram; _eos = eosTokenId; _convKernel = convKernel;
@@ -441,6 +450,29 @@ public sealed class Qwen4ExpPleBranch
         for (int h = 0; h < NumHeads; h++) minRows = Math.Max(minRows, headOffsets[h] + headVocabSizes[h]);
         if (tableRows < minRows)
             throw new ArgumentException($"PLE table has {tableRows} rows, head ranges need {minRows}.");
+        var opts = tableOptions ?? PleTableOptions.FromEnvironment();
+        if (opts.NeedsService && table != 0)
+            _prefetcher = new PleRowPrefetcher(table, tableQt, tableRows, rowDim, opts);
+    }
+
+    /// <summary>
+    /// Starts pulling this chunk's n-gram table rows into memory on a background task (#822). Call as soon as the token ids are
+    /// known, before the layers preceding this module run; <see cref="Apply"/> collects it. Safe to skip, to call twice (the later
+    /// call wins) or to abandon: it never changes the result, only when the table pages become resident.
+    /// </summary>
+    /// <param name="tokens">Raw token ids of the chunk <see cref="Apply"/> will see.</param>
+    /// <param name="state">This module's state; its hash window must still be the one at the start of the chunk.</param>
+    public void BeginPrefetch(ReadOnlySpan<int> tokens, Qwen4ExpPleState state)
+    {
+        if (_prefetcher is not { PrefetchEnabled: true } pf || tokens.IsEmpty) return;
+        int n = tokens.Length * NumHeads;
+        long[] rows = ArrayPool<long>.Shared.Rent(n);
+        try
+        {
+            Qwen4ExpPle.BuildRowIndices(tokens, state.TokenHistory, _ngram, _headsPerNgram, _eos, _multipliers, _offsets, _vocab, rows);
+            state.PendingPrefetch = pf.Begin(rows.AsSpan(0, n));
+        }
+        finally { ArrayPool<long>.Shared.Return(rows); }
     }
 
     /// <summary>Allocates a fresh start-of-sequence state for this module.</summary>
@@ -471,7 +503,12 @@ public sealed class Qwen4ExpPleBranch
         {
             Qwen4ExpPle.BuildRowIndices(tokens, state.TokenHistory, _ngram, _headsPerNgram, _eos,
                                         _multipliers, _offsets, _vocab, rows);
-            Qwen4ExpPle.GatherRows(_table, _tableQt, _tableRows, _rowDim, rows.AsSpan(0, T * numHeads), emb);
+            var pending = state.PendingPrefetch;
+            state.PendingPrefetch = null;
+            if (_prefetcher is { } pf)
+                pf.Gather(pending, rows.AsSpan(0, T * numHeads), emb);
+            else
+                Qwen4ExpPle.GatherRows(_table, _tableQt, _tableRows, _rowDim, rows.AsSpan(0, T * numHeads), emb);
 
             var embSpan = emb.AsSpan(0, T * numHeads * _rowDim);
             _keyProj(embSpan, key.AsSpan(0, T * row), T);
