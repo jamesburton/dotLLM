@@ -198,7 +198,8 @@ public sealed unsafe class LittleBitPath : IDisposable
 /// <summary>Caller-owned scratch for <see cref="LittleBitLayer.Gemv"/> (so layers do not each own hot scratch).</summary>
 public sealed unsafe class LittleBitScratch : IDisposable
 {
-    internal readonly int MaxDInPad, MaxRPad;
+    /// <summary>Padded capacity (d_in / rank) this scratch supports.</summary>
+    public readonly int MaxDInPad, MaxRPad;
     internal float* Xs;     // [2][MaxDInPad]
     internal float* T;      // [2][MaxRPad]
     internal sbyte* Xq;     // [2][MaxDInPad]
@@ -353,6 +354,51 @@ public sealed unsafe class LittleBitLayer : IDisposable
             if (kernel == LittleBitKernel.VnniInt8) QuantizeT(&ctx);
             pool.Dispatch((nint)(&ctx), &Stage2Worker);
         }
+    }
+
+    private struct TokCtx
+    {
+        public nint Layer, Scratches;
+        public float* X, Y;
+        public int N, DIn, DOut;
+    }
+
+    /// <summary>
+    /// y[t*DOut..] = layer(x[t*DIn..]) for n tokens (prefill). Parallel over TOKENS: each pool thread runs the single-threaded
+    /// GEMV for its token range with its own scratch (<paramref name="perThread"/> needs one entry per pool thread), which
+    /// avoids two pool dispatches per token. Bit-identical to calling <see cref="Gemv"/> per token (same per-row arithmetic).
+    /// </summary>
+    public void GemmTokens(float* x, float* y, int n, LittleBitScratch[] perThread, ComputeThreadPool? pool,
+                           LittleBitKernel kernel = LittleBitKernel.Avx2Float)
+    {
+        if (pool is null || n < 2)
+        {
+            for (int t = 0; t < n; t++) Gemv(x + (long)t * DIn, y + (long)t * DOut, perThread[0], pool, kernel);
+            return;
+        }
+        if (kernel != LittleBitKernel.Avx2Float) throw new NotSupportedException("GemmTokens: float kernel only");
+        if (perThread.Length < pool.ThreadCount) throw new ArgumentException("one scratch per pool thread required");
+        var gl = System.Runtime.InteropServices.GCHandle.Alloc(this);
+        var gs = System.Runtime.InteropServices.GCHandle.Alloc(perThread);
+        try
+        {
+            TokCtx ctx = default;
+            ctx.Layer = System.Runtime.InteropServices.GCHandle.ToIntPtr(gl);
+            ctx.Scratches = System.Runtime.InteropServices.GCHandle.ToIntPtr(gs);
+            ctx.X = x; ctx.Y = y; ctx.N = n; ctx.DIn = DIn; ctx.DOut = DOut;
+            pool.Dispatch((nint)(&ctx), &TokWorker);
+        }
+        finally { gl.Free(); gs.Free(); }
+    }
+
+    private static void TokWorker(nint c, int tid, int tc)
+    {
+        TokCtx* ctx = (TokCtx*)c;
+        var layer = (LittleBitLayer)System.Runtime.InteropServices.GCHandle.FromIntPtr(ctx->Layer).Target!;
+        var sc = ((LittleBitScratch[])System.Runtime.InteropServices.GCHandle.FromIntPtr(ctx->Scratches).Target!)[tid];
+        ComputeThreadPool.PartitionRange(ctx->N, tid, tc, out int s, out int e);
+        for (int t = s; t < e; t++)
+            layer.Gemv(ctx->X + (long)t * ctx->DIn, ctx->Y + (long)t * ctx->DOut, sc, null);
     }
 
     private static void Stage1Worker(nint c, int tid, int tc)
@@ -610,6 +656,39 @@ public static class LittleBitReference
                         w[(long)o * dIn + i] += p.H[o] * s * p.G[i];
                     }
             }
+        }
+        return w;
+    }
+
+    /// <summary>
+    /// Fast dense-F32 decode (the "F32-decoded control" for whole-model comparison): W[o,:] = sum_paths h[o] * sum_j
+    /// Us[o,j] l[j] * (Vs[:,j] .* g), row-parallel with axpy. Same maths as <see cref="DecodeDense"/>, usable at model scale.
+    /// Returns a 64-byte aligned native buffer [dOut x dIn] the caller frees with <c>NativeMemory.AlignedFree</c>.
+    /// </summary>
+    public static unsafe float* DecodeDenseFast(LittleBitLayer layer)
+    {
+        int dOut = layer.DOut, dIn = layer.DIn;
+        long bytes = (long)dOut * dIn * sizeof(float);
+        float* w = (float*)NativeMemory.AlignedAlloc((nuint)bytes, 64);
+        NativeMemory.Clear(w, (nuint)bytes);
+        foreach (var p in layer.Paths)
+        {
+            // Vg[j][i] = Vs[i,j] * g[i]
+            var vg = new float[(long)p.R * dIn];
+            for (int j = 0; j < p.R; j++)
+                for (int i = 0; i < dIn; i++)
+                    vg[(long)j * dIn + i] = p.VSign(i, j) * p.G[i];
+            var pp = p;
+            float* wp = w;
+            Parallel.For(0, dOut, o =>
+            {
+                var row = new Span<float>(wp + (long)o * dIn, dIn);
+                for (int j = 0; j < pp.R; j++)
+                {
+                    float coef = pp.H[o] * pp.USign(o, j) * pp.L[j];
+                    TensorPrimitives.MultiplyAdd(new ReadOnlySpan<float>(vg, j * dIn, dIn), coef, row, row);
+                }
+            });
         }
         return w;
     }

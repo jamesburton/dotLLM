@@ -1553,7 +1553,10 @@ internal sealed class TransformerWeights : IDisposable
             foreach (var ptr in _liveOwnedAllocations)
             {
                 if (ptr != nint.Zero)
+                {
+                    FactorizedWeights.Release(ptr);   // LittleBit token blocks also own a managed layer (#864)
                     NativeMemory.AlignedFree((void*)ptr);
+                }
             }
             _liveOwnedAllocations.Clear();
         }

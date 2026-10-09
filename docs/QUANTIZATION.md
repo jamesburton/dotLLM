@@ -480,3 +480,45 @@ All errors are consistent with ordinary fp32 reassociation noise (the two paths 
 - **Wiring into the actual MoE forward pass** (`Qwen3MoeHybridTransformerModel`'s FFN dispatch) — this pass validates the kernel in isolation against real weights, not end-to-end token generation through the fused path. The forward pass currently uses `LoadFromMach1Packed`'s dense-decode-then-cache route only.
 - **The other three tiers' stepping-stone completion** (NE spine 0.70 GB, LM head 0.33 GB, embeddings 0.29 GB) — issue #266's permitted stepping-stone decodes these to dense/Q8_0 at load while only the routed-expert GEMV fuses; that decode-at-load path already exists from Phase B, it just hasn't been threaded into a real "packed-resident" load mode (currently everything, including these three tiers, decodes to dense fp32 the same way, so the ~7.5 GB headline number is not yet achievable end-to-end).
 - **Model-scale (not per-expert) resident-memory and perplexity/top-1 measurement**, gated on the ~70-128 GB RAM issue #266 already documents as needed for a full dense-decode baseline run, or on the forward-pass wiring above making a dense baseline unnecessary.
+
+## LittleBit factorized linears (issue #864, CPU only)
+
+`QuantizationType.LittleBit` (id 100, not a GGUF type) is a *factorized-linear* weight kind: a projection stored as sign
+factors plus FP scales, `W ~= sum_paths diag(u1) . Us . diag(l) . Vs . diag(v2)` with `l = bf16(v1*u2)`, `Us in {+-1}^(out x r)`,
+`Vs in {+-1}^(r x in)`, primary path plus an optional residual path (`*_R`). Implemented clean-room from the paper equations and our own
+trainer (`tools/littlebit-qat`); no third-party code.
+
+- **Checkpoint**: a safetensors directory with `config.json` (Qwen3) and `littlebit_config.json`. Per projection the keys are
+  `{prefix}U_packed, V_packed, U_shape, V_shape, u1, u2, v1, v2` and `U_R_packed ... v2_R`. Packed words are int32, LSB-first,
+  bit 1 = -1, padded with +1; `U` is `[out, ceil(r/32)]` and `V` is `[r, ceil(in/32)]`, which is byte-identical to the kernel layout, so
+  loading is a row copy (`LittleBitLoader`). Embeddings, norms and the (tied) head stay bf16 and are upcast to F32 by the normal loader.
+- **Where it plugs in**: `SafetensorsTensorResolver.ResolveLinear` returns `(token, QuantizationType.LittleBit, out, in)` when `{prefix}weight`
+  is absent but `{prefix}U_packed` exists; `TransformerModel.Gemm` dispatches on the type. Everything else (QK-norm, RoPE, GQA attention,
+  SwiGLU, KV cache, `generate`, perplexity) is the stock dense-Qwen3 path. Fused decode kernels are skipped (`SupportsFusedDecode` is false).
+- **Kernels** (`DotLLM.Cpu.Kernels.Experimental.LittleBit`): two-stage signed-sum GEMV (stage 1 `t = l .* (Vs (v2 .* x))`, stage 2
+  `y += u1 .* (Us t)`), AVX2 float path. Decode is row-parallel over the pool (two dispatches per projection); prefill parallelises over
+  tokens, each thread running the single-thread GEMV with its own scratch (bit-identical per token). Scalar double reference in
+  `LittleBitReference`. The VNNI int8 variant exists but is not used by the model (it adds activation-quantisation error).
+- **Rejections** (explicit `NotSupportedException`, never a fall-through): the shared weight loader used by Vulkan, CUDA and HIP refuses a
+  factorized checkpoint ("supported on the CPU backend only"); the CPU path refuses any architecture other than dense Qwen (`Architecture.Qwen`,
+  no MoE) and layers with a bias; AVX2 is required. `dotllm perplexity` accepts a safetensors directory on `--device cpu` only
+  (with `--tokens-file`).
+- **Memory** (Qwen3-0.6B, eff_bit 0.55, 196 projections, residual on): sign bits 26.5 MiB + F32 scales 5.1 MiB = **31.6 MiB** against 840 MiB for the same
+  projections in bf16 (26.6x smaller; 0.60 stored bits per weight, 0.55 with bf16 scales). Scales are held as F32 (exact widening of the bf16 source,
+  and not clamped to fp16 range): that costs 2.5 MiB more than bf16 scales would. Padding to x32 is included. The paper's bit formula counts 2 bits
+  per sign; this layout stores 1.
+- **Precision**: scales are bf16 in the checkpoint, widened exactly; `l` is rounded once to bf16 like the reference forward. The kernel
+  accumulates in F32. Layer level (step 1): max relative error 1.7e-7 vs a float64 reference, 5.8e-3 vs the trainer's all-bf16 forward.
+- **Whole-model validation** (Qwen3-0.6B-055, `LittleBitModelTests`, fixtures from `tools/littlebit-qat/gen_dotllm_reference.py`): against torch fp32,
+  120/120 teacher-forced top-1 and byte-identical 40-token greedy continuations on 3 prompts, max |logit diff| 0.044 over torch's top-8. Against the
+  torch **bf16** forward only 115/120 top-1 (the bf16 forward itself agrees with torch fp32 on 115/120: it flips near-tied argmaxes on this
+  PPL~400 model, so bf16 is the wrong oracle for an fp32 engine). F32-decoded control (`DOTLLM_LITTLEBIT_DENSE_CONTROL=1` decodes every
+  projection to dense F32 and runs the stock GEMM): identical metrics, last-position logits differ from the factorized kernel by 1e-5.
+- **Perplexity**: WikiText-2 test, first 40 non-overlapping 2048-token windows, scored as the trainer's `eval_ppl.py` does (targets 1..2047 of each window):
+  trainer 401.02, `dotllm perplexity <dir> --tokens-file wikitext2_first40.tokens --context 2048 --stride 2048 --unscored-prefix 1` gives **400.89**
+  (ratio 0.9997). The teacher (bf16 Qwen3-0.6B) is 19.6; this checkpoint is a 1500-step spike run, so the model is poor even though the engine matches.
+- Fixtures (`~/.dotllm/test-cache/littlebit-qwen3-0.6b-055`, or `DOTLLM_LITTLEBIT_CKPT`); tests skip cleanly when absent.
+- **Decode speed** (`dotllm run`, 64 tokens, CPU, same session, runs interleaved dense/LittleBit): LittleBit 19-30 tok/s vs 10-14 tok/s for the dense
+  Qwen3-0.6B baseline of the same model, per-pair ratios 1.4x-2.9x (median 2.3x). The "dense bf16" baseline is the safetensors loader's bf16->F32
+  upcast (there is no resident-bf16 GEMV), so it streams 4 B/weight; the box was at 100% CPU from other processes, so judge the ratio, not the absolutes.
+  Both runs include the F32-upcast tied lm_head (594 MiB/token), which is now a large share of the LittleBit decode traffic. Prefill (perplexity run): ~213 tok/s.

@@ -56,6 +56,7 @@
     <!-- #832: LittleBit spike fixture (generated offline from the paper equations). -->
     <None Include="Cpu\Kernels\LittleBitData\littlebit_fixture.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="Cpu\Kernels\LittleBitData\littlebit_real_fixture.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Cpu\Kernels\LittleBitData\littlebit_generation_reference.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="Cpu\Kernels\LittleBitData\littlebit_packed_fixture.json" CopyToOutputDirectory="PreserveNewest" />
     <!-- #866: NanoQuant crop fixture (real community bits + float64 numpy reference) and full-layer expectations. -->
     <None Include="Cpu\Kernels\NanoQuantData\nanoquant_crop_fixture.json" CopyToOutputDirectory="PreserveNewest" />
