@@ -541,7 +541,7 @@ internal static unsafe partial class OsPrefetch
                 return ok;
             }
         }
-        catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException) { }
+        catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException) { }
         return false;
     }
 }
