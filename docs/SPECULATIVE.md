@@ -476,3 +476,31 @@ trunk's are, `mtp_use_dedicated_embeddings = false`). The trunk GGUF has no `nex
   so the verify shape cannot flip an argmax.
 - The pinned llama.cpp (`3cf0325`) has no qwen4exp MTP graph (no `nextn` tensors in `qwen4exp.cpp`, no `--spec-type draft-mtp` for this
   architecture), so there is no llama.cpp acceptance number; Strata (`MtpDrafter`) is the algorithmic reference.
+
+#### Vulkan go/no-go: verify cost vs rows (issue #820 stage 2 guard)
+
+MTP only pays if verifying `k + 1` rows costs far less than `k + 1` single-row forwards (the Tev1 refutation was exactly that: linear row
+cost). Measured on the real `UD-Q4_K_XL` file, Strix Halo (Radeon 8060S), Vulkan, natural-text tokens, median of 8, full logits for every
+row, `VulkanQwen4ExpTransformerModel.Forward` (same session as a Llama-3.1-8B Q4_K_M bench at 32.5 / 36.8 tok/s before / after):
+
+| rows | ms | x 1 row |
+|---|---|---|
+| 1 | 57 | 1.00 |
+| 2 | 166 | 2.9 |
+| 3 | 187 | 3.3 |
+| 4 | 207 | 3.6 |
+| 5 | 225 | 3.9 |
+| 6 | 247 | 4.3 |
+
+A 4-draft round verifies 5 rows (225 ms) and, at the CPU-measured 3.05 tokens per round, delivers about 12 tok/s against ~17 tok/s plain
+decode: **0.6-0.7x, a slowdown, with the current kernels.** The shape of the curve says why and what would change it:
+
+- Per-half-layer GPU waits (36 GDN / 12 QSA / 48 MoE halves, split mode), ms per forward at 1 row -> 2 rows -> 6 rows: GDN 19.9 -> 48.5 -> 51,
+  QSA 5.9 -> 18.7 -> 19, MoE 30.2 -> 79.4 -> 138, head 3.3 -> 6.1 -> 6.2. Every multi-row path is ~2.5x the T=1 fast path at 2 rows
+  (a fixed ~100 ms step), after which only the MoE half grows (~15 ms per row). The dense paths are flat in rows.
+- It is not the per-half-layer submit splitting (`T > 1` splits: 98 submit-waits instead of 2 costs about 6 ms at 2 rows) and not the host
+  n-gram branch (4-10 ms).
+- So the lever is a small-T (2..8 rows) fast path for the dense projections (multi-column GEMV), the GDN / QSA token mixers and the MoE
+  (expert-grouped, reading each routed expert once per window). With the dense halves held near their T=1 cost and the MoE growing at the
+  measured ~15 ms/row, 5 rows would land near 100 ms (1.7x) and K=4 MTP near 1.4x; that is a kernel project of its own and a prerequisite
+  to building the Vulkan head, recurrent-state checkpoint/restore and the draft block on that backend.
