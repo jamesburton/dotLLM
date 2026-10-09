@@ -77,6 +77,7 @@ public sealed unsafe class NanoQuantTests(ITestOutputHelper output)
     [Fact]
     public void SalientPath_IsActive_AndAddsRawX()
     {
+        if (!Avx2.IsSupported) return;
         var f = LoadCrop();
         // Same layer without the salient path must differ by exactly sum_s w[o,s] * x[idx[s]].
         using var with = Build(f);
