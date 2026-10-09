@@ -227,10 +227,13 @@ public sealed class VulkanQwen4ExpLoaderTests
             {
                 Assert.IsType<VulkanQwen4ExpTransformerModel>(model);
                 Assert.True(model.RequiresPerSequenceState);
-                var ex = Assert.Throws<NotSupportedException>(() => kvFactory(16));
-                Assert.Contains("#817", ex.Message, StringComparison.Ordinal);
-                // State is model-owned: an engine KV cache and ForwardBatch are refused with the #817 explanation, like the CPU oracle.
-                Assert.Throws<NotSupportedException>(() => model.ForwardBatch([], 0).ToString());
+                Assert.True(model.SupportsThreadedSequenceState);
+                // #871: the factory hands out an engine KV cache (clamped to the dense-attention limit) and state is per sequence.
+                using var kv = kvFactory(1_000_000);
+                Assert.IsType<VulkanNemotronHKvCache>(kv);
+                using var seqState = model.CreateSequenceState();
+                Assert.IsType<VulkanQwen4ExpSequenceState>(seqState);
+                Assert.Empty(model.ForwardBatch([], 0));
             }
 
             // The dense Vulkan model must never be handed this architecture: its tensors are not Llama-style.

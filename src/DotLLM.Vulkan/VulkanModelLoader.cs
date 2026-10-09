@@ -131,11 +131,10 @@ public static class VulkanModelLoader
 
             case Architecture.Qwen4Exp:
             {
-                // Qwen3.8-Flash-Next (#818 V1): dense-attention QSA fallback, host n-gram branch. The model owns its sequence
-                // state until the engine integration of #817, so there is no engine KV cache to hand out.
+                // Qwen3.8-Flash-Next (#818 V1, #871): dense-attention QSA fallback, host n-gram branch. Per-sequence state
+                // (CreateSequenceState) with the QSA K/V rows in an engine KV cache clamped to the dense-attention limit.
                 var q4 = VulkanQwen4ExpTransformerModel.BuildFromGguf(device, gguf, config, spvDir);
-                return (q4, _ => throw new NotSupportedException(
-                    "qwen4exp keeps its own sequence state and has no engine KV cache yet; engine/scheduler integration is issue #817."));
+                return (q4, size => q4.CreateKvCache(size));
             }
 
             case Architecture.Mamba3:

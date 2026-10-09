@@ -13,28 +13,35 @@ namespace DotLLM.Vulkan;
 
 /// <summary>
 /// Per-sequence state of a <see cref="VulkanQwen4ExpTransformerModel"/>: the device-resident Gated-DeltaNet state of every GDN layer,
-/// the dense K/V cache of every QSA layer, and the host-side PLE hash window + dilated-conv history. Self-contained (the model does
-/// not use the engine <see cref="IKvCache"/> until #817).
+/// the host-side PLE hash window + dilated-conv history, and (when no engine <see cref="IKvCache"/> is supplied) the dense K/V cache of every QSA layer.
 /// </summary>
-public sealed class VulkanQwen4ExpSequenceState : IRecurrentSequenceState
+public sealed class VulkanQwen4ExpSequenceState : IGdnState
 {
+    private readonly Func<VulkanNemotronHKvCache>? _kvFactory;
+    private VulkanNemotronHKvCache? _kv;
+
     internal VulkanGdnStateCache Gdn { get; }
-    internal VulkanNemotronHKvCache Kv { get; }
     internal Qwen4ExpPleState? Ple { get; }
+
+    /// <inheritdoc/>
+    public int NumGdnLayers => Gdn.NumGdnLayers;
+
+    /// <summary>The state's own dense QSA K/V rows, allocated on first use (an engine-supplied KV cache bypasses them entirely).</summary>
+    internal VulkanNemotronHKvCache OwnKv => _kv ??= _kvFactory!();
 
     /// <summary>Tokens consumed so far (the next position).</summary>
     public int Length { get; internal set; }
 
-    internal VulkanQwen4ExpSequenceState(VulkanGdnStateCache gdn, VulkanNemotronHKvCache kv, Qwen4ExpPleState? ple)
+    internal VulkanQwen4ExpSequenceState(VulkanGdnStateCache gdn, Func<VulkanNemotronHKvCache> kvFactory, Qwen4ExpPleState? ple)
     {
-        Gdn = gdn; Kv = kv; Ple = ple;
+        Gdn = gdn; _kvFactory = kvFactory; Ple = ple;
     }
 
     /// <inheritdoc/>
     public void Reset()
     {
         Gdn.Reset();
-        Kv.Rollback(0);
+        _kv?.Rollback(0);
         Ple?.Reset();
         Length = 0;
     }
@@ -43,7 +50,7 @@ public sealed class VulkanQwen4ExpSequenceState : IRecurrentSequenceState
     public void Dispose()
     {
         Gdn.Dispose();
-        Kv.Dispose();
+        _kv?.Dispose();
     }
 }
 
@@ -63,8 +70,8 @@ public sealed class VulkanQwen4ExpSequenceState : IRecurrentSequenceState
 /// 2051 on the released model); beyond that the call fails loudly instead of silently diverging from sparse QSA (V2, #819).
 /// (b) The n-gram branch runs on the host at its layer: the residual is downloaded once, the CPU branch (<see cref="Qwen4ExpPleBranch"/>,
 /// the oracle's own code) gathers the 16 table rows from the mmap'd table and runs key/value projections, gate and the dilated conv, and
-/// the residual is uploaded back. The 28.8 GB table is registered host-only and can never be imported or staged. (c) One sequence
-/// state, model-owned (engine integration is #817). (d) No MTP block.
+/// the residual is uploaded back. The 28.8 GB table is registered host-only and can never be imported or staged. (c) Sequence state is per-sequence
+/// (<see cref="CreateSequenceState"/>, threaded through <see cref="ForwardBatch"/>) with the QSA K/V rows in the engine KV cache (#871); no recurrent checkpoint/rollback yet. (d) No MTP block.
 /// </para>
 /// </remarks>
 public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
@@ -145,7 +152,28 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
 
     /// <summary>Allocates a fresh sequence state (KV capacity <see cref="DenseContextLimit"/>).</summary>
     public VulkanQwen4ExpSequenceState CreateState()
-        => new(_core.Q4CreateGdnState(), _core.Q4CreateKvCache(_kvCapacity), _ple?.CreateState());
+        => new(_core.Q4CreateGdnState(), () => _core.Q4CreateKvCache(_kvCapacity), _ple?.CreateState());
+
+    /// <summary>Allocates an engine KV cache for the QSA layers (capacity clamped to <see cref="DenseContextLimit"/>).</summary>
+    public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen) => _core.Q4CreateKvCache(Math.Min(maxSeqLen, _kvCapacity));
+
+    /// <inheritdoc/>
+    public bool SupportsThreadedSequenceState => true;
+
+    /// <inheritdoc/>
+    public IRecurrentSequenceState? CreateSequenceState() => CreateState();
+
+    private int _allRowLogitsLimit = 1;
+
+    /// <inheritdoc/>
+    public int MaxAllRowLogitsLength => _allRowLogitsLimit;
+
+    /// <inheritdoc/>
+    public bool TrySetAllRowLogitsLimit(int maxSeqLen)
+    {
+        if (maxSeqLen > _allRowLogitsLimit) _allRowLogitsLimit = Math.Min(maxSeqLen, _kvCapacity + 1);
+        return _allRowLogitsLimit >= maxSeqLen;
+    }
 
     /// <inheritdoc/>
     public void ResetSequenceState() => _defaultState.Reset();
@@ -169,40 +197,69 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
 
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
-        => Forward(tokenIds, positions, deviceId, _defaultState);
+        => ForwardCore(tokenIds, positions, deviceId, _defaultState, null, lastTokenLogitsOnly: false);
 
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
-    {
-        RejectEngineKvCache(kvCache);
-        return Forward(tokenIds, positions, deviceId, _defaultState);
-    }
+        => ForwardCore(tokenIds, positions, deviceId, _defaultState, kvCache, lastTokenLogitsOnly: false);
 
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly)
-        => Forward(tokenIds, positions, deviceId, kvCache);
+        => ForwardCore(tokenIds, positions, deviceId, _defaultState, kvCache, lastTokenLogitsOnly);
 
-    private static void RejectEngineKvCache(IKvCache? kvCache)
-    {
-        if (kvCache is not null)
-            throw new NotSupportedException(
-                "VulkanQwen4ExpTransformerModel keeps its own sequence state (QSA K/V, GDN, PLE) and cannot run against an engine KV cache yet; " +
-                "call Forward(tokens, positions, deviceId[, state]). Engine/scheduler integration is tracked in issue #817.");
-    }
-
-    /// <inheritdoc/>
+    /// <summary>
+    /// Per-sequence loop over the forward: each request's <see cref="SequenceForwardRequest.GdnState"/> (a
+    /// <see cref="VulkanQwen4ExpSequenceState"/>) is threaded through, with the QSA K/V rows in the request's KV cache. Returns the LAST
+    /// row's logits (<c>[1, vocab]</c>) per request. Interleaved sequences equal separate runs (state is per sequence).
+    /// </summary>
     public IReadOnlyList<ITensor> ForwardBatch(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
-        => throw new NotSupportedException(
-            "VulkanQwen4ExpTransformerModel does not support ForwardBatch: requests carry an engine KV cache and the model-owned default state " +
-            "would be shared by concurrent sequences. Engine/scheduler integration is tracked in issue #817.");
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+        for (int i = 0; i < requests.Count; i++)
+        {
+            if (requests[i].GdnState is null && requests.Count >= 2)
+                throw new ArgumentException(
+                    $"Multi-seq ForwardBatch requires each SequenceForwardRequest to carry its own GdnState (request {i} has none): " +
+                    "the model-owned default state would be shared across sequences. Allocate one with CreateSequenceState().", nameof(requests));
+            if (requests[i].GdnState is not null and not VulkanQwen4ExpSequenceState)
+                throw new ArgumentException(
+                    $"Request {i} carries a {requests[i].GdnState!.GetType().Name}; qwen4exp on Vulkan needs a VulkanQwen4ExpSequenceState.", nameof(requests));
+            if (requests[i].Adapter is not null)
+                throw new NotSupportedException("LoRA adapters are not supported by the Vulkan qwen4exp model (CPU only, #845).");
+        }
+        var results = new List<ITensor>(requests.Count);
+        try
+        {
+            foreach (var r in requests)
+            {
+                var st = (VulkanQwen4ExpSequenceState?)r.GdnState ?? _defaultState;
+                results.Add(ForwardCore(r.TokenIds.Span, r.Positions.Span, deviceId, st, r.KvCache, lastTokenLogitsOnly: true));
+            }
+        }
+        catch
+        {
+            foreach (var t in results) t.Dispose();
+            throw;
+        }
+        return results;
+    }
 
     /// <summary>
     /// Forward over a caller-owned sequence state (chunked prefill / decode). <c>positions[i]</c> must equal <c>state.Length + i</c>;
     /// the model-owned default state restarts when a call begins at position 0. Returns the LAST token's logits <c>[1, vocab]</c>.
     /// </summary>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, VulkanQwen4ExpSequenceState state)
+        => ForwardCore(tokenIds, positions, deviceId, state, null, lastTokenLogitsOnly: false);
+
+    private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, VulkanQwen4ExpSequenceState state,
+                                IKvCache? kvCache, bool lastTokenLogitsOnly)
     {
         ArgumentNullException.ThrowIfNull(state);
+        VulkanNemotronHKvCache kv;
+        if (kvCache is null) kv = state.OwnKv;
+        else if (kvCache is VulkanNemotronHKvCache vk) kv = vk;
+        else throw new ArgumentException($"qwen4exp on Vulkan needs a VulkanNemotronHKvCache (from CreateKvCache); got {kvCache.GetType().Name}.", nameof(kvCache));
         int T = tokenIds.Length;
         if (T == 0 || T != positions.Length) throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
         if (ReferenceEquals(state, _defaultState) && positions[0] == 0 && state.Length != 0) state.Reset();
@@ -215,6 +272,16 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
             throw new NotSupportedException(
                 $"qwen4exp on Vulkan attends densely, which is exact only up to {_kvCapacity} tokens (indexer budget {_q4.IndexerTopK} + block " +
                 $"{_q4.IndexerBlockSize} - 1); this call would reach {state.Length + T}. Sparse QSA block selection is issue #819.");
+        if (kvCache is not null)
+        {
+            if (kv.CurrentLength < state.Length)
+                throw new InvalidOperationException(
+                    $"The KV cache holds {kv.CurrentLength} rows but the sequence state is at position {state.Length}: they must advance together.");
+            if (kv.CurrentLength > state.Length) kv.Rollback(state.Length);   // stale rows after a rollback are overwritten
+            if (kv.MaxLength < state.Length + T)
+                throw new NotSupportedException(
+                    $"The KV cache holds {kv.MaxLength} positions but this call would reach {state.Length + T}; qwen4exp on Vulkan attends densely up to {_kvCapacity} tokens.");
+        }
         for (int i = 0; i < T; i++)
             if ((uint)tokenIds[i] >= (uint)_vocab)
                 throw new ArgumentOutOfRangeException(nameof(tokenIds), $"Token ID {tokenIds[i]} at position {i} is out of range [0, {_vocab}).");
@@ -300,7 +367,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
             if (Config.HybridLayout!.LayerKind[il] == HybridLayerKind.GatedDeltaNet)
                 _core.Q4RecordGdn(cmd, il, T, _eps, state.Gdn, _sigmoidGate);
             else
-                _core.Q4RecordAttention(cmd, il, T, positions, state.Kv);
+                _core.Q4RecordAttention(cmd, il, T, positions, kv);
             Barrier();
             _gr.RecordWrite(cmd, _res, st.NormOutput, _gains, T, S, H);
             Barrier();
@@ -326,19 +393,55 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
             }
         }
 
-        // ── head mixer (replaces the final norm) on the LAST row, then the LM head ──
-        VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, _res, _headRes, (ulong)((T - 1) * rowBytes), 0, (ulong)rowBytes);
-        Barrier();
-        GrRead(_headGr, _headRes, 1, inject: false);
+        // ── head mixer (replaces the final norm) + LM head: the LAST row, or every row when the caller opted in (perplexity) ──
+        int rows = !lastTokenLogitsOnly && T <= _allRowLogitsLimit ? T : 1;
         var w0 = _core.Q4Weights;
-        _core.Q4RecordMatmul(cmd, w0.OutputWeight, w0.OutputDeviceQuantType, st.NormOutput, st.Logits,
-            outputDim: w0.OutputOutputDim, inputDim: w0.OutputInputDim, seqLen: 1);
-        End();
+        if (rows == 1)
+        {
+            VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, _res, _headRes, (ulong)((T - 1) * rowBytes), 0, (ulong)rowBytes);
+            Barrier();
+            GrRead(_headGr, _headRes, 1, inject: false);
+            _core.Q4RecordMatmul(cmd, w0.OutputWeight, w0.OutputDeviceQuantType, st.NormOutput, st.Logits,
+                outputDim: w0.OutputOutputDim, inputDim: w0.OutputInputDim, seqLen: 1);
+            End();
+            state.Length += T;
+            var one = UnmanagedTensor.Allocate(new TensorShape(1, _vocab), DType.Float32, deviceId: -1);
+            _device.Download(st.Logits, new Span<float>((void*)one.DataPointer, _vocab));
+            return one;
+        }
 
+        // All rows: head mixer over all T rows, then the LM head in chunks so the device logits scratch stays small
+        // (a 2K window x 248K vocab is 2 GB; the host result tensor is the only full-size allocation).
+        GrRead(_headGr, _res, T, inject: false);
+        const int Chunk = 32;
+        EnsureHeadChunk(Chunk);
+        var result = UnmanagedTensor.Allocate(new TensorShape(T, _vocab), DType.Float32, deviceId: -1);
+        try
+        {
+            for (int c0 = 0; c0 < T; c0 += Chunk)
+            {
+                int n = Math.Min(Chunk, T - c0);
+                if (c0 > 0) Begin();
+                VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, st.NormOutput, _headIn!, (ulong)((long)c0 * H * 4), 0, (ulong)((long)n * H * 4));
+                Barrier();
+                _core.Q4RecordMatmul(cmd, w0.OutputWeight, w0.OutputDeviceQuantType, _headIn!, _headLogits!,
+                    outputDim: w0.OutputOutputDim, inputDim: w0.OutputInputDim, seqLen: n);
+                End();
+                _device.Download(_headLogits!, new Span<float>((void*)(result.DataPointer + (nint)((long)c0 * _vocab * 4)), n * _vocab));
+            }
+        }
+        catch { result.Dispose(); throw; }
         state.Length += T;
-        var result = UnmanagedTensor.Allocate(new TensorShape(1, _vocab), DType.Float32, deviceId: -1);
-        _device.Download(st.Logits, new Span<float>((void*)result.DataPointer, _vocab));
         return result;
+    }
+
+    private VulkanDevice.Buffer? _headIn, _headLogits;
+
+    private void EnsureHeadChunk(int rows)
+    {
+        if (_headIn is not null) return;
+        _headIn = _device.AllocateDeviceLocal((long)rows * _hidden * 4);
+        _headLogits = _device.AllocateDeviceLocal((long)rows * _vocab * 4);
     }
 
     // ───────────────────────────── lifetime ─────────────────────────────
@@ -354,6 +457,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         foreach (var g in _ffnGr) g.Dispose();
         _headGr.Dispose();
         _res?.Dispose(); _xn?.Dispose(); _low?.Dispose(); _mix?.Dispose(); _gains?.Dispose(); _headRes?.Dispose();
+        _headIn?.Dispose(); _headLogits?.Dispose();
         _gr.Dispose(); _groupRms.Dispose(); _sigmoidGate.Dispose();
         _core.Dispose();
         foreach (nint p in _owned) NativeMemory.AlignedFree((void*)p);
