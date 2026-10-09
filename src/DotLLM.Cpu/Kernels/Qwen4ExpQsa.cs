@@ -281,6 +281,58 @@ public sealed unsafe class Qwen4ExpQsaState : IDisposable
 }
 
 /// <summary>
+/// Position-indexed K/V store of a QSA layer that attends DENSELY (no indexer): the MTP draft head's cache. Rolling back is a length
+/// change, so speculative draft rows are simply overwritten when their cells are processed again.
+/// </summary>
+public sealed unsafe class Qwen4ExpDenseKv : IDisposable
+{
+    private readonly Qwen4ExpNativeBuffer _k = new(), _v = new();
+
+    /// <summary>KV row width <c>numKvHeads * headDim</c>.</summary>
+    public int KvStride { get; }
+
+    /// <summary>Cells held (the next write slot).</summary>
+    public int Length { get; private set; }
+
+    /// <summary>Creates an empty store.</summary>
+    /// <param name="kvStride">KV row width.</param>
+    public Qwen4ExpDenseKv(int kvStride)
+    {
+        if (kvStride <= 0) throw new ArgumentOutOfRangeException(nameof(kvStride));
+        KvStride = kvStride;
+    }
+
+    /// <summary>Keys <c>[Length, KvStride]</c>.</summary>
+    public ReadOnlySpan<float> Keys => _k.Pointer == null ? default : new ReadOnlySpan<float>(_k.Pointer, Length * KvStride);
+
+    /// <summary>Values <c>[Length, KvStride]</c>.</summary>
+    public ReadOnlySpan<float> Values => _v.Pointer == null ? default : new ReadOnlySpan<float>(_v.Pointer, Length * KvStride);
+
+    /// <summary>Resident bytes.</summary>
+    public long Bytes => _k.Bytes + _v.Bytes;
+
+    /// <summary>Drops every cell at or beyond <paramref name="length"/> (a length change; the rows stay until overwritten).</summary>
+    public void Truncate(int length)
+    {
+        if ((uint)length > (uint)Length) throw new ArgumentOutOfRangeException(nameof(length), $"{length} is beyond the {Length} held cells.");
+        Length = length;
+    }
+
+    /// <summary>Appends <paramref name="count"/> K/V rows at <see cref="Length"/>.</summary>
+    public void Append(ReadOnlySpan<float> k, ReadOnlySpan<float> v, int count)
+    {
+        long end = (long)(Length + count) * KvStride;
+        _k.EnsureCapacity(end); _v.EnsureCapacity(end);
+        k.Slice(0, count * KvStride).CopyTo(_k.Slice((long)Length * KvStride, count * KvStride));
+        v.Slice(0, count * KvStride).CopyTo(_v.Slice((long)Length * KvStride, count * KvStride));
+        Length += count;
+    }
+
+    /// <inheritdoc/>
+    public void Dispose() { _k.Dispose(); _v.Dispose(); }
+}
+
+/// <summary>
 /// Qwen4-Exp QSA (query-sparse attention) kernels: the block-pooled relu-sum indexer with top-k + incomplete tail, and
 /// GQA over the selected keys. Verified against HF <c>Qwen4ExpTextQSAIndexer</c> (eager) and llama.cpp
 /// <c>build_qsa_sel</c> / <c>build_attn_qsa</c>.
@@ -691,6 +743,98 @@ public sealed class Qwen4ExpQsaLayer
             ArrayPool<float>.Shared.Return(qg); ArrayPool<float>.Shared.Return(q); ArrayPool<float>.Shared.Return(gate);
             ArrayPool<float>.Shared.Return(k); ArrayPool<float>.Shared.Return(v); ArrayPool<float>.Shared.Return(iq);
             ArrayPool<float>.Shared.Return(ik); ArrayPool<float>.Shared.Return(attn);
+        }
+    }
+
+    /// <summary>
+    /// Dense, indexer-less pass for a draft layer (the MTP head): appends the chunk's K/V to <paramref name="kv"/> at cell
+    /// <c>kv.Length</c> (the RoPE position of row 0) and, when <paramref name="attend"/>, attends every row densely over cells
+    /// <c>0 .. its own</c>. No indexer keys are kept: QSA equals dense attention below <c>budget + blockSize - 1</c> tokens
+    /// (2051), and a draft only has to be a good guess - the verify forward decides every emitted token.
+    /// </summary>
+    /// <param name="x">Block input <c>[tokens, hidden]</c>.</param>
+    /// <param name="tokens">Chunk length.</param>
+    /// <param name="kv">Dense K/V store; advanced by <paramref name="tokens"/>.</param>
+    /// <param name="output">Destination <c>[tokens, hidden]</c> (ignored, may be empty, when <paramref name="attend"/> is false).</param>
+    /// <param name="attend">False: only compute and append K/V (an MTP cell absorbed for its cache alone).</param>
+    [SkipLocalsInit]
+    public void ForwardDense(ReadOnlySpan<float> x, int tokens, Qwen4ExpDenseKv kv, Span<float> output, bool attend)
+    {
+        int nH = _numHeads, nKv = _numKvHeads, d = _headDim;
+        int qElems = nH * d, kvElems = nKv * d;
+        int first = kv.Length;
+        int half = _ropeDim / 2;
+        if (kv.KvStride != kvElems) throw new ArgumentException("K/V store geometry mismatch.", nameof(kv));
+        if ((long)(first + tokens) * half > _ropeCos.Length)
+            throw new ArgumentOutOfRangeException(nameof(tokens), "position exceeds the RoPE table.");
+
+        float[] k = ArrayPool<float>.Shared.Rent(tokens * kvElems);
+        float[] v = ArrayPool<float>.Shared.Rent(tokens * kvElems);
+        float[]? qg = null, q = null, gate = null, attn = null;
+        try
+        {
+            _kProj(x, k.AsSpan(0, tokens * kvElems), tokens);
+            _vProj(x, v.AsSpan(0, tokens * kvElems), tokens);
+            NormHeads(k, tokens, nKv, d, _kNorm);
+            for (int t = 0; t < tokens; t++)
+            {
+                var cos = _ropeCos.AsSpan((first + t) * half, half);
+                var sin = _ropeSin.AsSpan((first + t) * half, half);
+                for (int h = 0; h < nKv; h++) RoPE.ApplyRotationNeoX(k.AsSpan(t * kvElems + h * d, _ropeDim), cos, sin, _ropeDim);
+            }
+
+            if (attend)
+            {
+                qg = ArrayPool<float>.Shared.Rent(tokens * 2 * qElems);
+                q = ArrayPool<float>.Shared.Rent(tokens * qElems);
+                gate = ArrayPool<float>.Shared.Rent(tokens * qElems);
+                attn = ArrayPool<float>.Shared.Rent(tokens * qElems);
+                _qProj(x, qg.AsSpan(0, tokens * 2 * qElems), tokens);
+                for (int t = 0; t < tokens; t++)
+                for (int h = 0; h < nH; h++)
+                {
+                    qg.AsSpan(t * 2 * qElems + h * 2 * d, d).CopyTo(q.AsSpan(t * qElems + h * d, d));
+                    qg.AsSpan(t * 2 * qElems + h * 2 * d + d, d).CopyTo(gate.AsSpan(t * qElems + h * d, d));
+                }
+                NormHeads(q, tokens, nH, d, _qNorm);
+                for (int t = 0; t < tokens; t++)
+                {
+                    var cos = _ropeCos.AsSpan((first + t) * half, half);
+                    var sin = _ropeSin.AsSpan((first + t) * half, half);
+                    for (int h = 0; h < nH; h++) RoPE.ApplyRotationNeoX(q.AsSpan(t * qElems + h * d, _ropeDim), cos, sin, _ropeDim);
+                }
+            }
+
+            kv.Append(k, v, tokens);   // this chunk is visible to its own queries
+
+            if (!attend) return;
+            float scale = 1.0f / MathF.Sqrt(d);
+            int maxKeys = first + tokens;
+            int[] keyIdx = ArrayPool<int>.Shared.Rent(maxKeys);
+            float[] scores = ArrayPool<float>.Shared.Rent(maxKeys + 1);
+            try
+            {
+                for (int i = 0; i < maxKeys; i++) keyIdx[i] = i;
+                for (int t = 0; t < tokens; t++)
+                    Qwen4ExpQsa.AttendKeys(q!.AsSpan(t * qElems, qElems), kv.Keys, kv.Values, keyIdx.AsSpan(0, first + t + 1),
+                                           nH, nKv, d, scale, attn!.AsSpan(t * qElems, qElems), scores);
+                GC.KeepAlive(kv);
+            }
+            finally { ArrayPool<int>.Shared.Return(keyIdx); ArrayPool<float>.Shared.Return(scores); }
+
+            Span<float> a = attn!.AsSpan(0, tokens * qElems);
+            Span<float> g = gate!.AsSpan(0, tokens * qElems);
+            TensorPrimitives.Sigmoid(g, g);
+            TensorPrimitives.Multiply(a, g, a);
+            _oProj(a, output, tokens);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(k); ArrayPool<float>.Shared.Return(v);
+            if (qg is not null) ArrayPool<float>.Shared.Return(qg);
+            if (q is not null) ArrayPool<float>.Shared.Return(q);
+            if (gate is not null) ArrayPool<float>.Shared.Return(gate);
+            if (attn is not null) ArrayPool<float>.Shared.Return(attn);
         }
     }
 

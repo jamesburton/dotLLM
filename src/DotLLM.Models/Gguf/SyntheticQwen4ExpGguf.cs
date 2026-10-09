@@ -256,18 +256,50 @@ public static class SyntheticQwen4ExpGguf
         }
 
         if (includeMtp)
-        {
-            int il = TrunkLayers;
-            AddBlock(list, rng, il, attention: true, hasPle: false, numKvHeads);
-            Matrix(list, rng, Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.NextnEhProj), 2 * HiddenSize, HiddenSize);
-            Norm(list, rng, Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.NextnEnorm), HiddenSize);
-            Norm(list, rng, Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.NextnHnorm), hcDim);
-            Norm(list, rng, Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.NextnHcHeadNorm), hcDim);
-            Matrix(list, rng, Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.NextnHcHeadDown), hcDim, HcLowRank);
-            Matrix(list, rng, Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.NextnHcHeadUp), HcLowRank, hcDim);
-        }
+            AddMtpBlock(list, rng, numKvHeads);
 
         return list;
+    }
+
+    private static void AddMtpBlock(List<Tensor> list, SyntheticGemma4Gguf.Xorshift rng, int numKvHeads)
+    {
+        const int hcDim = HcCount * HiddenSize;
+        int il = TrunkLayers;
+        AddBlock(list, rng, il, attention: true, hasPle: false, numKvHeads);
+        Matrix(list, rng, Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.NextnEhProj), 2 * HiddenSize, HiddenSize);
+        Norm(list, rng, Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.NextnEnorm), HiddenSize);
+        Norm(list, rng, Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.NextnHnorm), hcDim);
+        Norm(list, rng, Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.NextnHcHeadNorm), hcDim);
+        Matrix(list, rng, Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.NextnHcHeadDown), hcDim, HcLowRank);
+        Matrix(list, rng, Qwen4ExpTensors.Block(il, Qwen4ExpTensors.Suffix.NextnHcHeadUp), HcLowRank, hcDim);
+    }
+
+    /// <summary>
+    /// Builds a STANDALONE MTP-head file shaped like the released <c>mtp-*.gguf</c> (issue #820): <c>block_count</c> 5, <c>nextn_predict_layers</c> 1,
+    /// its own <c>token_embd</c> / <c>output</c> and ONLY the <c>blk.4.*</c> QSA + MoE block with its <c>nextn.*</c> tensors (no trunk blocks, no head
+    /// mixer, no n-gram table). Pair it with <see cref="Build"/> (<c>includeMtp: false</c>) as the trunk.
+    /// </summary>
+    /// <param name="seed">PRNG seed (use a different one from the trunk's so the head is not accidentally the trunk).</param>
+    /// <param name="numKvHeads">KV heads of the head's attention layer.</param>
+    public static byte[] BuildMtpOnly(uint seed = 0xBEEF01u, int numKvHeads = NumKvHeads)
+    {
+        var w = new GgufWriter();
+        WriteMetadata(w, includeMtp: true, numKvHeads);
+        var rng = new SyntheticGemma4Gguf.Xorshift(seed);
+        var list = new List<Tensor>();
+        Matrix(list, rng, Qwen4ExpTensors.TokenEmbd, HiddenSize, VocabSize);
+        Matrix(list, rng, Qwen4ExpTensors.Output, HiddenSize, VocabSize);
+        AddMtpBlock(list, rng, numKvHeads);
+        foreach (var t in list)
+            w.AddTensor(t.Name, t.Dims, (uint)QuantizationType.F32, t.Data);
+        return w.Build();
+    }
+
+    /// <summary>Writes <see cref="BuildMtpOnly"/> to <paramref name="path"/>.</summary>
+    public static string WriteMtpOnly(string path, uint seed = 0xBEEF01u, int numKvHeads = NumKvHeads)
+    {
+        File.WriteAllBytes(path, BuildMtpOnly(seed, numKvHeads));
+        return path;
     }
 
     private static void AddBlock(List<Tensor> t, SyntheticGemma4Gguf.Xorshift rng, int il, bool attention, bool hasPle, int numKvHeads)

@@ -16,6 +16,14 @@ public interface IModel : IDisposable
     long ComputeMemoryBytes { get; }
 
     /// <summary>
+    /// The size the adaptive MTP gate (<c>MtpAdaptiveGate</c>) uses as its prior for which arm to try first: from
+    /// <c>MtpAdaptiveGate.MtpPriorMinModelBytes</c> up, MTP is tried before plain decode. Defaults to <see cref="ComputeMemoryBytes"/>,
+    /// which is right for backends that hold their weights in that figure and wrong for a CPU model whose weights are memory-mapped
+    /// and so absent from it (a 100 GiB-class model must not look tiny). A prior only: measured speed replaces it after one sample per arm.
+    /// </summary>
+    long MtpGatePriorBytes => ComputeMemoryBytes;
+
+    /// <summary>
     /// Total bytes of committed memory holding repacked (layout-transformed) copies of the model
     /// weights, or 0 when the backend does not repack. This is memory in addition to the
     /// memory-mapped weight file, not a subset of it.

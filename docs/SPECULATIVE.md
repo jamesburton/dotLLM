@@ -448,3 +448,59 @@ wire-format fields needed.
   `MtpBenchProfile`-only.
 - **Only `nextn_predict_layers == 1`** is supported, matching llama.cpp's own current QWEN35
   assertion — multi-block MTP is out of scope until a real checkpoint needs it.
+### qwen4exp MTP head (issue #820, CPU oracle)
+
+Qwen3.8-Flash-Next (`qwen4exp`) ships its MTP head as a **separate 49-block GGUF** (`mtp-Qwen3.8-Flash-Next-Q8_0.gguf`, 4.1 GB: `blk.48.*`
+QSA + 512-expert MoE block, `blk.48.nextn.{eh_proj,enorm,hnorm,hc_head_*}`; the file's own `token_embd`/`output` are not used — the
+trunk's are, `mtp_use_dedicated_embeddings = false`). The trunk GGUF has no `nextn_predict_layers`, so:
+
+- `Qwen4ExpTransformerModel.AttachMtpHead(GgufFile | path)` loads the head; `Qwen4ExpMtpHeadResolver` auto-detects an `mtp-*.gguf` in
+  the model's directory and the one above it (the HF snapshot layout), `dotllm run --mtp-head <path>` overrides, `--no-mtp` skips it.
+- **The head reads the 4-stream residual**, captured BEFORE the head mixer (`hc * hidden` = 10240 floats per position), not the mixed hidden
+  state the dense hybrids use. `Qwen4ExpMtpState.HiddenSize` is therefore 10240.
+- Cell for token `p` = `(R_{p-1}, token_p)` (the #469 pairing; Strata's "cell i = (R_i, token_{i+1})" shifted by one), at RoPE position `p - 1`.
+  Token 0 owns no cell (no preceding residual), so `n` absorbed tokens hold `n - 1` cells.
+- Per cell: `R' = eh_proj([enorm(embed(token)) ; hnorm(R[s])])` per stream (`eh_proj = cat(fc_embedding, fc_hidden)`, one GEMM over `4 x 5120`),
+  then GR-read -> QSA -> GR-write -> GR-read -> MoE -> GR-write, then the head's own mixer + the trunk's LM head. The next draft step's
+  input residual is `R'` (before the mixer). All norm gammas are folded (`1 + w`): measured against the HF tensors, enorm/hnorm included.
+- Absorbing a trunk batch computes **K/V only** (the cell's attention, MoE and mixer output would be discarded), which is why prefill
+  absorb is cheap. The head's attention is **dense** over all cells with no indexer: exact below 2051 positions, a draft-only
+  approximation beyond (Strata does the same), and never a correctness matter since the verify forward decides every token. Top-k reuse
+  across MTP steps / an indexer cache for the head belongs to sparse QSA (#819).
+- `DOTLLM_MTP_HNORM=stream|joint` selects the `pre_fc_norm_hidden` convention (one RMS per residual stream — llama.cpp's reading, the
+  default — vs one RMS over all four streams, Strata's default). Chosen by measurement on the real file (UD-Q4_K_XL trunk + Q8_0 head,
+  CPU, K=4, 6 chat/code prompts x 128 greedy tokens): tokens per verify round **3.05 per-stream vs 2.91 joint** (per-stream ahead on 6 of 6).
+  Strata's reported band at 4 drafts is 2.4-3.6.
+- **Exactness.** Greedy output was IDENTICAL to plain decode in all 12 real-file runs (128/128 tokens each). That is not luck: on the CPU
+  the real file's logits for a 5-row forward equal five 1-row forwards bit for bit (max |diff| 0 over all 248320 logits of every row),
+  so the verify shape cannot flip an argmax.
+- The pinned llama.cpp (`3cf0325`) has no qwen4exp MTP graph (no `nextn` tensors in `qwen4exp.cpp`, no `--spec-type draft-mtp` for this
+  architecture), so there is no llama.cpp acceptance number; Strata (`MtpDrafter`) is the algorithmic reference.
+
+#### Vulkan go/no-go: verify cost vs rows (issue #820 stage 2 guard)
+
+MTP only pays if verifying `k + 1` rows costs far less than `k + 1` single-row forwards (the Tev1 refutation was exactly that: linear row
+cost). Measured on the real `UD-Q4_K_XL` file, Strix Halo (Radeon 8060S), Vulkan, natural-text tokens, median of 8, full logits for every
+row, `VulkanQwen4ExpTransformerModel.Forward` (same session as a Llama-3.1-8B Q4_K_M bench at 32.5 / 36.8 tok/s before / after):
+
+| rows | ms | x 1 row |
+|---|---|---|
+| 1 | 57 | 1.00 |
+| 2 | 166 | 2.9 |
+| 3 | 187 | 3.3 |
+| 4 | 207 | 3.6 |
+| 5 | 225 | 3.9 |
+| 6 | 247 | 4.3 |
+
+A 4-draft round verifies 5 rows (225 ms) and, at the CPU-measured 3.05 tokens per round, delivers about 12 tok/s against ~17 tok/s plain
+decode: **0.6-0.7x, a slowdown, with the current kernels.** The shape of the curve says why and what would change it:
+
+- Per-half-layer GPU waits (36 GDN / 12 QSA / 48 MoE halves, split mode), ms per forward at 1 row -> 2 rows -> 6 rows: GDN 19.9 -> 48.5 -> 51,
+  QSA 5.9 -> 18.7 -> 19, MoE 30.2 -> 79.4 -> 138, head 3.3 -> 6.1 -> 6.2. Every multi-row path is ~2.5x the T=1 fast path at 2 rows
+  (a fixed ~100 ms step), after which only the MoE half grows (~15 ms per row). The dense paths are flat in rows.
+- It is not the per-half-layer submit splitting (`T > 1` splits: 98 submit-waits instead of 2 costs about 6 ms at 2 rows) and not the host
+  n-gram branch (4-10 ms).
+- So the lever is a small-T (2..8 rows) fast path for the dense projections (multi-column GEMV), the GDN / QSA token mixers and the MoE
+  (expert-grouped, reading each routed expert once per window). With the dense halves held near their T=1 cost and the MoE growing at the
+  measured ~15 ms/row, 5 rows would land near 100 ms (1.7x) and K=4 MTP near 1.4x; that is a kernel project of its own and a prerequisite
+  to building the Vulkan head, recurrent-state checkpoint/restore and the draft block on that backend.
