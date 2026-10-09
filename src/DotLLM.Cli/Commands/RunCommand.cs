@@ -262,6 +262,12 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         [DefaultValue(false)]
         public bool NoMtp { get; set; }
 
+        /// <summary>Explicit MTP head GGUF for architectures that ship it as a separate file (qwen4exp).</summary>
+        [CommandOption("--mtp-head")]
+        [Description("Path of a separate MTP head GGUF (qwen4exp ships it as mtp-*.gguf beside the quantisation folders). " +
+                     "Default: auto-detected in the model's directory and the one above it. Ignored for models whose GGUF embeds the head.")]
+        public string? MtpHead { get; set; }
+
         /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
         [CommandOption("--prefill-chunk-size|--ubatch-size")]
         [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default).")]
@@ -318,6 +324,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             resolvedPath = ggufPath;
         }
 
+        string? mtpHeadPath = null;
         GgufFile? gguf = null;
         IDisposable? safetensorsSource = null;
         ModelConfig config = null!;
@@ -361,6 +368,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 resolvedPath);
             model = loaded.Model;
             vulkanKv = loaded.IsVulkan ? loaded.KvCacheFactory : null;   // CUDA/hybrid models build their caches from the model type below
+            if (!settings.NoMtp)
+            {
+                // qwen4exp ships its MTP draft head as a separate GGUF (#820): attach the explicit or auto-detected sibling.
+                mtpHeadPath = DotLLM.Models.Architectures.Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, settings.MtpHead);
+            }
         }
 
         var loadSw = Stopwatch.StartNew();
@@ -678,7 +690,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             }
 
             if (!settings.Json && draftModel is null && !settings.NoMtp && model.SupportsMtp)
-                AnsiConsole.MarkupLine($"[dim]MTP self-speculative decoding: K={settings.SpeculativeK} (model carries an MTP head; disable with --no-mtp)[/]");
+                AnsiConsole.MarkupLine($"[dim]MTP self-speculative decoding: K={settings.SpeculativeK} ({(mtpHeadPath is null ? "model carries an MTP head" : "head: " + Markup.Escape(System.IO.Path.GetFileName(mtpHeadPath)))}; disable with --no-mtp)[/]");
 
             var generator = new TextGenerator(model, tokenizer, kvFactory,
                 draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
