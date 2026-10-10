@@ -52,6 +52,20 @@ internal readonly record struct Qwen4ExpResidencyPlan(
     public static long PostUploadShortfall(long ourBytes, long otherBytes, long capacityBytes, long headroomBytes)
         => Math.Max(0, ourBytes + otherBytes - Math.Max(0, capacityBytes - headroomBytes));
 
+    /// <summary>
+    /// Rows the per-forward scratch is pre-sized to at load (<c>DOTLLM_VK_PLANNED_ROWS</c>, default 2048), clamped to
+    /// <paramref name="kvCapacity"/>. Scratch otherwise grows lazily on the first larger forward - AFTER the weights already fill the
+    /// device-local heap - and a 512-row then 1024-row call sequence was seen to end in VK_ERROR_DEVICE_LOST (#880).
+    /// </summary>
+    public static int PlannedRows(int kvCapacity)
+        => Math.Clamp(int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_PLANNED_ROWS"), out int v) && v > 0 ? v : 2048, 1, Math.Max(1, kvCapacity));
+
+    /// <summary>Error text for a scratch (re)allocation that failed after the weights were resident.</summary>
+    public static string ScratchGrowthMessage(int rows, string inner)
+        => $"growing the per-forward scratch to {rows} rows failed after the weights were loaded ({inner}). The device-local heap is nearly full of " +
+           $"weights, so lazily growing scratch can run out of memory (or end in VK_ERROR_DEVICE_LOST). Lower the prompt/chunk size, close other GPU " +
+           $"consumers, or set DOTLLM_VK_PLANNED_ROWS>={rows} so the scratch is allocated (and counted by the residency check) at load time.";
+
     /// <summary>The refusal / warning text naming the shortfall and the likely culprits.</summary>
     public string DescribeShortfall()
     {

@@ -137,6 +137,15 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             groupRms = GroupRmsNormF32Kernel.Create(device, spvDir);
             sigmoidGate = GdnPostScanGateF32Kernel.Create(device, spvDir, sigmoidGate: true);
 
+            // #880: allocate the per-forward scratch for the planned row count NOW, so (a) the post-upload check below counts it and (b) no
+            // forward up to that size has to grow it after the weights fill the heap (a small-then-larger call order lost the device).
+            int plannedRows = Qwen4ExpResidencyPlan.PlannedRows(kvCapacity);
+            try { core.Q4EnsureCapacity(plannedRows); }
+            catch (InvalidOperationException e) when (e.InnerException is Interop.VulkanException)
+            {
+                throw new NotSupportedException(e.Message + (AllowOvercommit ? "" : " Set DOTLLM_VK_PLANNED_ROWS to a smaller value to load with less scratch."), e);
+            }
+
             // #880: re-check after the upload. Another process may have grown while we were loading; surface it here with numbers
             // instead of letting the first forward end in VK_ERROR_DEVICE_LOST.
             var after = otherPressureProbe is not null ? otherPressureProbe() : device.ReadOtherProcessPressure();

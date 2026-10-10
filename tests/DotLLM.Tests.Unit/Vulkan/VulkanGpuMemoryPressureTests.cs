@@ -212,4 +212,66 @@ public sealed class VulkanGpuMemoryPressureGpuTests
             try { Directory.Delete(dir, true); } catch (IOException) { }
         }
     }
+
+    private static long LiveAfterSmallThenLargeForward(string plannedRows, int small, int large, string spvDir, out long afterSmall)
+    {
+        string? prior = Environment.GetEnvironmentVariable("DOTLLM_VK_PLANNED_ROWS");
+        Environment.SetEnvironmentVariable("DOTLLM_VK_PLANNED_ROWS", plannedRows);
+        try
+        {
+            var geo = Qwen4ExpRandomGguf.Tiny with { Budget = 64 };
+            using var rig = new Q4eRig(Qwen4ExpRandomGguf.Build(geo, Q4eQuant.F32), spvDir);
+            var ids = VulkanQwen4ExpParityTests.Ids(large, rig.Config.VocabSize);
+            rig.Vk.Forward(ids.AsSpan(0, small).ToArray(), Enumerable.Range(0, small).ToArray(), -1);
+            afterSmall = rig.Device.LiveBytesTotal();
+            rig.Vk.ResetSequenceState();
+            rig.Vk.Forward(ids, Enumerable.Range(0, large).ToArray(), -1);
+            return rig.Device.LiveBytesTotal();
+        }
+        finally { Environment.SetEnvironmentVariable("DOTLLM_VK_PLANNED_ROWS", prior); }
+    }
+
+    /// <summary>
+    /// The prefill agent's repro class (#880): a small forward followed by a larger one grew the scratch AFTER the weights filled the
+    /// heap. With the scratch pre-sized at load to the planned rows, the larger forward allocates nothing; without that it must grow.
+    /// </summary>
+    [SkippableFact]
+    public void ScratchIsPreSizedAtLoad_SoSmallThenLargeForwardDoesNotGrowIt()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        long presizedFinal = LiveAfterSmallThenLargeForward("48", small: 4, large: 40, spvDir, out long presizedSmall);
+        Assert.Equal(presizedSmall, presizedFinal);   // order-independent: nothing was allocated by the larger call
+
+        long lazyFinal = LiveAfterSmallThenLargeForward("4", small: 4, large: 40, spvDir, out long lazySmall);
+        Assert.True(lazyFinal > lazySmall, "control arm: with a small plan the larger forward must grow the scratch (else this test cannot discriminate)");
+        Assert.True(presizedSmall > lazySmall, "pre-sizing must be visible in the post-load footprint (it is counted by the residency check)");
+    }
+}
+
+public sealed class Qwen4ExpScratchMessageTests
+{
+    [Fact]
+    public void ScratchGrowthMessage_NamesRowCountAndTheRemedy()
+    {
+        string m = Qwen4ExpResidencyPlan.ScratchGrowthMessage(1024, "Vulkan error -2 (VK_ERROR_OUT_OF_DEVICE_MEMORY)");
+        Assert.Contains("1024 rows", m, StringComparison.Ordinal);
+        Assert.Contains("scratch", m, StringComparison.Ordinal);
+        Assert.Contains("DOTLLM_VK_PLANNED_ROWS>=1024", m, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(null, 5000, 2048)]
+    [InlineData(null, 100, 100)]      // clamped to the KV capacity
+    [InlineData("512", 5000, 512)]
+    [InlineData("junk", 5000, 2048)]
+    public void PlannedRows_DefaultsAndClamps(string? env, int kv, int expected)
+    {
+        string? prior = Environment.GetEnvironmentVariable("DOTLLM_VK_PLANNED_ROWS");
+        try
+        {
+            Environment.SetEnvironmentVariable("DOTLLM_VK_PLANNED_ROWS", env);
+            Assert.Equal(expected, Qwen4ExpResidencyPlan.PlannedRows(kv));
+        }
+        finally { Environment.SetEnvironmentVariable("DOTLLM_VK_PLANNED_ROWS", prior); }
+    }
 }
