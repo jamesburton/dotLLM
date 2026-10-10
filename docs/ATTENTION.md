@@ -321,7 +321,8 @@ Validation (`VulkanQwen4ExpQsaTests`): exact set equality of the select kernel a
 scores against `Qwen4ExpIndexerCache` / `ScoreBlocksScalar`; whole-model prefill, token-by-token decode through the dense limit, chunked == single-shot and the
 released head_dim-256 geometry against the CPU oracle with a 16-token budget (sparse from the 20th token), with a sensitive control (the oracle's own dense vs
 sparse outputs differ ~1000x more than Vulkan vs oracle). The GPU and the oracle sum scores in a different float order, so a near-tie at the 512th block can flip
-one block (1 row in 648 in the synthetic sweep); the kernel-level tests prove the selection logic itself is exact.
+one block (1 row in 648 in the synthetic sweep; `AMaterialRowMismatch_IsATopKBoundaryNearTie` shows its GPU rank-4 / rank-5 scores differ by 4.5e-5 relative, and
+fails if a mismatching row is ever not such a near-tie); the kernel-level tests prove the selection logic itself is exact.
 
 Measured on the real UD-Q4_K_XL file (Strix Halo, 512 MB BIOS split, 2026-10-10; harness `VulkanQwen4ExpRealQsaTests`, env-gated by `DOTLLM_QWEN4EXP_REAL_GGUF`):
 
