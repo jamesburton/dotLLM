@@ -849,7 +849,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// </summary>
     private unsafe void RecordGdnLayer(
         nint cmdBuf, int absoluteLayerIdx, VulkanQwen3MoeHybridWeights.GdnLayerBuffers gdnW,
-        int seqLen, float eps, VulkanGdnStateCache gdnCache, GdnPostScanGateF32Kernel? postScanGateOverride = null)
+        int seqLen, float eps, VulkanGdnStateCache gdnCache, GdnPostScanGateF32Kernel? postScanGateOverride = null,
+        Q4GdnRowSnapshots? snap = null)
     {
         int nVHead = _gdn.NVHead;
         int nKHead = _gdn.NKHead;
@@ -901,7 +902,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         // concatenation copy), applies SiLU, and writes GdnConvInput; the new conv state is the last (dConv-1) qkv rows. Bit-identical to the
         // copy + conv + SiLU chain below, which short forwards (decode, verify) and DOTLLM_VK_GDN_CONV_FUSED=0 keep.
         var convOut = _state.GdnQkvBuf;
-        if (_kernels.GdnConvSilu is { } fusedConv && seqLen >= 8 && dConv >= 2 && dConv <= GdnConvSiluF32Kernel.MaxConvWidth)
+        if (_kernels.GdnConvSilu is { } fusedConv && seqLen >= 8 && snap is null && dConv >= 2 && dConv <= GdnConvSiluF32Kernel.MaxConvWidth)
         {
             fusedConv.Record(cmdBuf, convStateBuf, _state.GdnQkvBuf, gdnW.Conv1dWeight, gdnW.Conv1dBias, _state.GdnConvInput,
                 dConv: dConv, channels: convDim, seqLen: seqLen);
@@ -945,6 +946,11 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 ulong saveSrc = (ulong)((long)seqLen * convDimBytes);
                 RecordCopyBufferRange(cmdBuf, _state.GdnConvInput, convStateBuf,
                     srcOffset: saveSrc, dstOffset: 0, size: (ulong)convStateBytes);
+                // Speculative verify (#820): the conv window after row r is ConvInput rows [r+1, r+dConv-1] (ConvInput = [state | qkv rows]).
+                if (snap is not null)
+                    for (int r = 0; r < snap.Rows; r++)
+                        RecordCopyBufferRange(cmdBuf, _state.GdnConvInput, snap.Conv[gdnOrdinal],
+                            srcOffset: (ulong)((long)(r + 1) * convDimBytes), dstOffset: (ulong)(r * convStateBytes), size: (ulong)convStateBytes);
                 KernelSupport.TransferToComputeBarrier(cmdBuf);
             }
 
@@ -985,6 +991,15 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         // the per-sequence state matrix between tokens. Replaces the previous
         // host-driven O(seqLen) per-token dispatch + 6 D2D copies per token.
         // Same bit-parity guarantees as the per-token shader, by construction.
+        if (snap is not null && snap.Rows > 0)
+            snap.Kernel.Record(cmdBuf,
+                state: gdnStateBuf,
+                q: _state.GdnQBuf, k: _state.GdnKBuf, v: _state.GdnVBuf,
+                g: _state.GdnAlphaBuf, beta: _state.GdnBetaBuf,
+                output: _state.GdnOut,
+                snapshots: snap.Gdn[gdnOrdinal], snapRows: snap.Rows,
+                seqLen: seqLen, nVHead: nVHead, nKHead: nKHead, dState: dState);
+        else
         _kernels.GdnScanMultiToken.Record(cmdBuf,
             state: gdnStateBuf,
             q: _state.GdnQBuf, k: _state.GdnKBuf, v: _state.GdnVBuf,

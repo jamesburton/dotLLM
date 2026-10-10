@@ -1725,6 +1725,14 @@ public sealed class VulkanDevice : IDisposable
     /// <summary>Bytes that landed on each heap via the device-local fallback (not the preferred type).</summary>
     public long FallbackBytesOnHeap(int heap) => Interlocked.Read(ref _fallbackBytesByHeap[heap]);
 
+    /// <summary>Bytes of live buffers this process currently holds, summed over every memory heap (what the <c>[vulkan-mem]</c> diagnostic prints as <c>ours</c>).</summary>
+    public long TotalLiveBytes()
+    {
+        long sum = 0;
+        for (int h = 0; h < _liveBytesByHeap.Length; h++) sum += Interlocked.Read(ref _liveBytesByHeap[h]);
+        return sum;
+    }
+
     /// <summary>
     /// Live allocated bytes and allocation count per memory heap, maintained by
     /// <see cref="AllocateInternal"/> and <see cref="Buffer.Dispose"/>.

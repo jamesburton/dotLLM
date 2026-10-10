@@ -36,7 +36,7 @@ public static class Qwen4ExpMtpHeadResolver
     }
 
     /// <summary>
-    /// Attaches the MTP head to <paramref name="model"/> when it is a CPU <see cref="Qwen4ExpTransformerModel"/> without a head yet.
+    /// Attaches the MTP head to <paramref name="model"/> when it is a qwen4exp model (CPU oracle or Vulkan) without a head yet.
     /// </summary>
     /// <param name="model">The loaded model; any other type is left alone.</param>
     /// <param name="modelPath">Trunk path used for auto-detection.</param>
@@ -45,7 +45,7 @@ public static class Qwen4ExpMtpHeadResolver
     /// <exception cref="FileNotFoundException"><paramref name="explicitPath"/> does not exist.</exception>
     public static string? TryAttach(IModel model, string modelPath, string? explicitPath = null)
     {
-        if (model is not Qwen4ExpTransformerModel q4 || q4.SupportsMtp) return null;
+        if (model is not IMtpHeadAttachable q4 || q4.HasMtpHead) return null;
         string? path = explicitPath;
         if (path is not null)
         {
