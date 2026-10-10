@@ -14,6 +14,12 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
     /// <summary>Default context capacity (tokens) of the K/V + indexer caches; <c>DOTLLM_VK_QWEN4EXP_CONTEXT</c> overrides.</summary>
     internal const int DefaultContextCapacity = 8192;
 
+    /// <summary>
+    /// Gather token-embedding rows on the host from the mmap'd (quantised) table instead of keeping an F32 copy of the whole table on the device
+    /// (2.4 GiB at the released vocabulary). On by default; <c>DOTLLM_VK_QWEN4EXP_HOST_EMBED=0</c> restores the device table (A/B diagnostic).
+    /// </summary>
+    public static bool HostEmbedding { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_HOST_EMBED") != "0";
+
     /// <summary>Resident-capacity refusal override: <c>DOTLLM_VK_ALLOW_OVERCOMMIT=1</c> turns the pre-load refusal into a warning.</summary>
     private static bool AllowOvercommit
         => string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_ALLOW_OVERCOMMIT"), "1", StringComparison.Ordinal);
@@ -101,6 +107,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             hostOnly = (tptr, tbytes);
         }
 
+        bool hostEmbedding = HostEmbedding;
         var owned = new List<nint>();
         VulkanQwen3MoeHybridTransformerModel? core = null;
         var attnGr = new List<VulkanQwen4ExpGrWeights>();
@@ -134,7 +141,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             // The hybrid's pre/post norms and output norm do not exist in qwen4exp (the gated residual replaces them): 1-element dummies.
             core = VulkanQwen3MoeHybridTransformerModel.BuildFromPrebuiltWeights(
                 device, config, layers, outputNormWeight: [1f], outPtr, outQt, outM, outK, embPtr, embDesc.QuantizationType,
-                spvDir, nCpuMoeLayers: 0);
+                spvDir, nCpuMoeLayers: 0, hostTokenEmbedding: hostEmbedding);
 
             Mark("coreWeights");
             long weightBytes = 0;
@@ -231,7 +238,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                                         $"staging memcpy={VulkanStagingBuffer.MemcpyMilliseconds / 1000:F1}s/{VulkanStagingBuffer.MemcpyBytes / (1024 * 1024)} MiB (thread-sum), " +
                                         $"bank uploads={VulkanQwen3MoeMoeUpload.BanksMilliseconds / 1000:F1}s, submitter waited {VulkanStagingBuffer.CopyWaitMilliseconds / 1000:F1}s on memcpy and {VulkanBankPrealloc.WaitMilliseconds / 1000:F1}s on bank allocation; {device.MemorySnapshot()}");
             model = new VulkanQwen4ExpTransformerModel(device, gguf, config, core, attnGr.ToArray(), ffnGr.ToArray(), head, moeBundles.ToArray(),
-                ple, pleLayer, owned, hostOnly, gr, groupRms, sigmoidGate, kvCapacity, weightBytes, qsa);
+                ple, pleLayer, owned, hostOnly, gr, groupRms, sigmoidGate, kvCapacity, weightBytes, qsa, hostEmbedding);
             model._spvDir = spvDir;
             try
             {
@@ -293,6 +300,14 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
     private static VulkanQwen4ExpQsa.LayerWeights UploadQsaIndexer(VulkanDevice device, VulkanStagingBuffer staging, GgufFile gguf,
         IReadOnlyDictionary<string, GgufTensorDescriptor> t, string b, Qwen4ExpConfig q4)
     {
+        if (!VulkanQwen4ExpQsa.Enabled)   // diagnostic baseline footprint (DOTLLM_VK_QWEN4EXP_QSA=0): the indexer is never run, so upload nothing
+        {
+            return new VulkanQwen4ExpQsa.LayerWeights
+            {
+                QProj = device.AllocateDeviceLocal(16), KProj = device.AllocateDeviceLocal(16), QGamma = device.AllocateDeviceLocal(16),
+                KGamma = device.AllocateDeviceLocal(16), QQt = QuantizationType.F32, KQt = QuantizationType.F32, Bytes = 64,
+            };
+        }
         var qd = t[b + "indexer.q_proj.weight"]; var kd = t[b + "indexer.k_proj.weight"];
         var qBuf = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging, gguf.TensorDataPointer(qd), qd.QuantizationType,
             outputDim: qd.Shape[1], inputDim: qd.Shape[0], forceF32: false, out var qQt, out long qBytes);

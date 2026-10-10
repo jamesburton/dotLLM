@@ -102,18 +102,30 @@ public sealed class VulkanQwen4ExpEngineTests
     }
 
     [SkippableFact]
-    public void PastTheDenseLimit_FailsWithAClearMessage()
+    public void PastTheContextCapacity_FailsWithAClearMessage_AndTheDenseLimitIsNoLongerAWall()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
-        using var rig = new Q4eRig(SyntheticQwen4ExpGguf.Build(), spvDir);
-        int limit = rig.Vk.DenseContextLimit;
-        var ids = VulkanQwen4ExpParityTests.Ids(limit + 1, rig.Config.VocabSize);
-        var ex = Assert.Throws<NotSupportedException>(() => rig.Vk.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), -1));
-        Assert.Contains("dense", ex.Message);
-        Assert.Contains("#819", ex.Message);
-        Assert.Contains(limit.ToString(), ex.Message);
-        // The engine KV cache is clamped to the same limit.
-        using var kv = rig.Vk.CreateKvCache(1_000_000);
-        Assert.Equal(limit, kv.MaxLength);
+        const string Env = "DOTLLM_VK_QWEN4EXP_CONTEXT";
+        string? old = Environment.GetEnvironmentVariable(Env);
+        Environment.SetEnvironmentVariable(Env, "40");
+        try
+        {
+            using var rig = new Q4eRig(SyntheticQwen4ExpGguf.Build(), spvDir);
+            int dense = rig.Vk.DenseContextLimit;
+            Assert.Equal(40, rig.Vk.ContextCapacity);
+            Assert.True(dense < 40);
+            // Past the dense limit but inside the capacity: sparse QSA runs (#819) instead of refusing.
+            var ok = VulkanQwen4ExpParityTests.Ids(dense + 5, rig.Config.VocabSize);
+            using (rig.Vk.Forward(ok, Enumerable.Range(0, ok.Length).ToArray(), -1)) { }
+            // Past the capacity: a clear message naming the knob.
+            var ids = VulkanQwen4ExpParityTests.Ids(41, rig.Config.VocabSize);
+            var ex = Assert.Throws<NotSupportedException>(() => rig.Vk.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), -1));
+            Assert.Contains(Env, ex.Message);
+            Assert.Contains("40", ex.Message);
+            // The engine KV cache is clamped to the capacity.
+            using var kv = rig.Vk.CreateKvCache(1_000_000);
+            Assert.Equal(40, kv.MaxLength);
+        }
+        finally { Environment.SetEnvironmentVariable(Env, old); }
     }
 }

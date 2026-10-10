@@ -390,7 +390,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         nint outputWeight, QuantizationType outputQt, int outputM, int outputK,
         nint tokenEmbedWeight, QuantizationType tokenEmbedQt,
         string spvDir,
-        int nCpuMoeLayers = -1)
+        int nCpuMoeLayers = -1,
+        bool hostTokenEmbedding = false)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(config);
@@ -451,7 +452,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         // inside cpuLayers[*].Moe and stream per layer in the forward pass — same
         // policy as BuildFromGguf.
         var weights = VulkanQwen3MoeHybridWeights.Upload(device, config, cpuLayers, outputNormWeight,
-            tokenEmbedWeight, tokenEmbedQt, outputWeight, outputQt, outputM, outputK);
+            tokenEmbedWeight, tokenEmbedQt, outputWeight, outputQt, outputM, outputK, hostTokenEmbedding);
 
         var state = new VulkanQwen3MoeHybridForwardState(device, config, gdn, initialSeqLen: 1);
         var gdnCache = new VulkanGdnStateCache(device, gdn, gdnOrdinal);

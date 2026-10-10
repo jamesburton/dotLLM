@@ -119,7 +119,10 @@ internal readonly record struct Qwen4ExpResidencyPlan(
             if (name.Contains("_exps.weight", StringComparison.Ordinal))
                 device += BankStaysPacked(d.QuantizationType, d.Shape[0]) ? packed : elems * 4;
             else if (name == Qwen4ExpTensors.TokenEmbd)
-                device += elems * 4;                                        // the embedding gather table is always widened to F32
+            {
+                if (VulkanQwen4ExpTransformerModel.HostEmbedding) hostOnly += packed;   // rows are gathered on the host from the mmap'd table (#819)
+                else device += elems * 4;                                                // the device gather table is widened to F32
+            }
             else if (name.Contains("_shexp.weight", StringComparison.Ordinal))
                 device += elems * 2 + (d.QuantizationType == QuantizationType.Q8_0 && !name.Contains("_down_", StringComparison.Ordinal) ? packed : 0);   // F16 copy + decode-only Q8_0 gate/up alias
             else if (d.Shape.Rank >= 2 && name.EndsWith(".weight", StringComparison.Ordinal))

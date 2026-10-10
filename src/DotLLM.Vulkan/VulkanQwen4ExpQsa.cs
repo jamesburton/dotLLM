@@ -75,6 +75,12 @@ internal sealed class VulkanQwen4ExpQsa : IQ4AttentionHook, IDisposable
     private long _partFloats;
     private VulkanQwen4ExpIndexerState? _cur;
 
+    /// <summary>
+    /// Diagnostic A/B switch (<c>DOTLLM_VK_QWEN4EXP_QSA=0</c> at startup): off = the QSA layers run the plain dense attention and the indexer is not
+    /// maintained, which is only correct up to <see cref="DenseLimit"/> tokens (a longer forward then throws). Measures what the indexer costs at short context.
+    /// </summary>
+    public static bool Enabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_QSA") != "0";
+
     /// <summary>Largest query sub-chunk (bounds the score / partial scratch regardless of the prefill chunk size).</summary>
     internal const int MaxQueryChunk = 1024;
     private const long ScoreScratchFloats = 12L << 20;   // 48 MiB
@@ -156,7 +162,7 @@ internal sealed class VulkanQwen4ExpQsa : IQ4AttentionHook, IDisposable
         VulkanDevice.Buffer kSrc, VulkanDevice.Buffer vSrc)
     {
         var ist = _cur;
-        if (ist is null || _ordinal[layer] < 0) return false;
+        if (!Enabled || ist is null || _ordinal[layer] < 0) return false;
         int ord = _ordinal[layer];
         var w = _w[ord];
         var st = _core.Q4State;

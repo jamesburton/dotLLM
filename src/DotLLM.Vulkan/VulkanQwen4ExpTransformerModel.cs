@@ -103,6 +103,41 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     private readonly VulkanQwen4ExpSequenceState _defaultState;
     private readonly long _weightBytes;
     private readonly VulkanQwen4ExpQsa _qsa;
+    private readonly bool _hostEmbedding;
+    private readonly nint _embPtr;
+    private readonly QuantizationType _embQt;
+    private readonly long _embRowBytes;
+    private VulkanDevice.Buffer? _embStage;
+    private readonly List<VulkanDevice.Buffer> _retiredStages = [];
+
+    /// <summary>
+    /// Token embedding for a batch: rows dequantised from the mmap'd table on the host (no device-resident F32 table, #819), written to a host-visible
+    /// stage and copied into <c>HiddenState</c> inside the command buffer. One call per submission: the stage is rewritten by the next call.
+    /// </summary>
+    private void RecordEmbedding(nint cmd, ReadOnlySpan<int> tokenIds)
+    {
+        if (!_hostEmbedding) { _core.Q4RecordEmbedding(cmd, tokenIds); return; }
+        int T = tokenIds.Length, H = _hidden;
+        long bytes = (long)T * H * 4;
+        if (_embStage is null || _embStage.Size < bytes)
+        {
+            if (_embStage is not null) _retiredStages.Add(_embStage);   // a recorded-but-unsubmitted copy may still name it
+            _embStage = _device.Allocate(Math.Max(bytes, 1L << 20));
+        }
+        float[] host = System.Buffers.ArrayPool<float>.Shared.Rent(T * H);
+        try
+        {
+            for (int t = 0; t < T; t++)
+            {
+                int id = tokenIds[t];
+                if ((uint)id >= (uint)_vocab) throw new ArgumentOutOfRangeException(nameof(tokenIds), $"Token id {id} is out of range");
+                Dequantize.ToFloat32(_embPtr + (nint)(id * _embRowBytes), H, _embQt, host.AsSpan(t * H, H));
+            }
+            _device.Upload(host.AsSpan(0, T * H), _embStage);
+        }
+        finally { System.Buffers.ArrayPool<float>.Shared.Return(host); }
+        VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, _embStage, _core.Q4State.HiddenState, 0, 0, (ulong)bytes);
+    }
 
     // Own scratch (the block input / output and every MoE / GDN / attention scratch buffer is the core's).
     private VulkanDevice.Buffer _res = null!, _xn = null!, _low = null!, _mix = null!, _gains = null!;
@@ -158,9 +193,14 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         VulkanQwen4ExpGrWeights[] attnGr, VulkanQwen4ExpGrWeights[] ffnGr, VulkanQwen4ExpGrWeights headGr,
         VulkanQwen3MoeMoeUpload.LayerBundle[] moe, Qwen4ExpPleBranch? ple, int pleLayer, List<nint> owned,
         (nint, long)? hostOnlyTable, Qwen4ExpGatedResidualKernel gr, GroupRmsNormF32Kernel groupRms,
-        GdnPostScanGateF32Kernel sigmoidGate, int kvCapacity, long weightBytes, VulkanQwen4ExpQsa qsa)
+        GdnPostScanGateF32Kernel sigmoidGate, int kvCapacity, long weightBytes, VulkanQwen4ExpQsa qsa, bool hostEmbedding)
     {
         _qsa = qsa;
+        _hostEmbedding = hostEmbedding;
+        var ed = gguf.TensorsByName[Qwen4ExpTensors.TokenEmbd];
+        _embPtr = gguf.TensorDataPointer(ed);
+        _embQt = ed.QuantizationType;
+        _embRowBytes = Dequantize.RowByteSize(ed.Shape[0], ed.QuantizationType);
         _device = device; _gguf = gguf; Config = config; _core = core; _q4 = config.Qwen4Exp!;
         _attnGr = attnGr; _ffnGr = ffnGr; _headGr = headGr; _moe = moe; _ple = ple; _pleLayer = pleLayer;
         _owned = owned; _hostOnlyTable = hostOnlyTable; _gr = gr; _groupRms = groupRms; _sigmoidGate = sigmoidGate;
@@ -345,6 +385,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         EnsureScratch(T);
         if (resized) { _gr.InvalidateDescriptorCache(); _groupRms.InvalidateDescriptorCache(); _sigmoidGate.InvalidateDescriptorCache(); }
         _core.Q4UploadPositions(positions);
+        if (!VulkanQwen4ExpQsa.Enabled && state.Length + T > _qsa.DenseLimit)
+            throw new NotSupportedException("The QSA indexer is disabled (DOTLLM_VK_QWEN4EXP_QSA=0): attention is dense and only exact up to " +
+                                            $"{_qsa.DenseLimit} tokens, this call would reach {state.Length + T}.");
         _qsa.EnsureRows(T);                    // QSA scratch + the sequence's indexer cache (#819); allocated before any recording starts
         _qsa.Begin(state.Indexer);
 
@@ -390,7 +433,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         Begin();
         _core.Q4StageBegin();
         if (NgramPrefetch) _ple?.BeginPrefetch(tokenIds, state.Ple!);   // #822: the n-gram rows depend only on token ids - start paging the table in before layer 0
-        _core.Q4RecordEmbedding(cmd, tokenIds);
+        RecordEmbedding(cmd, tokenIds);
         Barrier();
         _core.Q4Stage("embed");
         _gr.RecordBroadcast(cmd, _res, st.HiddenState, T, S, H);
@@ -603,6 +646,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         _gr.Dispose(); _groupRms.Dispose(); _sigmoidGate.Dispose();
         _core.Q4AttentionHook = null;
         _qsa.Dispose();
+        _embStage?.Dispose();
+        foreach (var b in _retiredStages) b.Dispose();
         _core.Dispose();
         foreach (nint p in _owned) NativeMemory.AlignedFree((void*)p);
         _owned.Clear();

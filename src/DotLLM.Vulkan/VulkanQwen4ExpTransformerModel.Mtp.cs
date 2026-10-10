@@ -493,7 +493,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         var k = _core.Q4Kernels;
         void Barrier() => KernelSupport.ComputeTransferFullBarrier(cmd);
 
-        _core.Q4RecordEmbedding(cmd, tokens);
+        RecordEmbedding(cmd, tokens);
         Barrier();
         k.RmsNorm.Record(cmd, st.HiddenState, h.Enorm, h.E, rowCount: n, n: H, eps: _eps);
         VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, rIn, h.HN, 0, 0, (ulong)((long)n * row * 4));
