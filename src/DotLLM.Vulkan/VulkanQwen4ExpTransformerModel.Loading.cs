@@ -127,7 +127,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             bool parallelUpload = !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PARALLEL_UPLOAD"), "0", StringComparison.Ordinal);
             using (var upStaging = parallelUpload
                        ? VulkanStagingBuffer.CreateParallel(device, VulkanStagingBuffer.ParallelSlotBytes, VulkanStagingBuffer.ParallelSlotCount) : null)
-            using (var prealloc = parallelUpload ? new VulkanBankPrealloc(device) : null)
+            using (var prealloc = parallelUpload && !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_BANK_PREALLOC"), "0", StringComparison.Ordinal) ? new VulkanBankPrealloc(device) : null)
             {
                 const int AllocAhead = 2;
                 long heapBytes = device.DeviceLocalHeapBytes();
