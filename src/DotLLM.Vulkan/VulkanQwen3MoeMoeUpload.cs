@@ -177,6 +177,11 @@ internal static class VulkanQwen3MoeMoeUpload
         }
     }
 
+    private static long s_banksTicks;
+
+    /// <summary>Process-wide time in the three routed-bank uploads of <see cref="UploadLayer"/> (allocation take + streamed copy) (#874 diagnostic).</summary>
+    public static double BanksMilliseconds => Interlocked.Read(ref s_banksTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
     /// <summary>
     /// Byte sizes of the three routed-expert banks (gate, down, up) <see cref="UploadLayer"/> will allocate for <paramref name="moe"/>,
     /// in allocation order. Mirrors <c>UploadRoutedBankAnyQuant</c> so a <see cref="VulkanBankPrealloc"/> can allocate them ahead (#874).
@@ -264,6 +269,7 @@ internal static class VulkanQwen3MoeMoeUpload
         //   (2) Resident-quant: copy each per-expert raw block slab into
         //       staging at the expert's contiguous slot, then copy. Device
         //       buffer is at a fraction of the F32 size (quant-dependent).
+        long tBanks = System.Diagnostics.Stopwatch.GetTimestamp();
         VulkanDevice.Buffer w1Bank = UploadRoutedBankAnyQuant(
             device, staging, moe, w1Qt, kind: 'G', numE: numE, mDim: interm, kDim: hiddenSize, elemsF32: w1Elems, prealloc);
         VulkanDevice.Buffer w2Bank = UploadRoutedBankAnyQuant(
@@ -271,6 +277,7 @@ internal static class VulkanQwen3MoeMoeUpload
         VulkanDevice.Buffer w3Bank = UploadRoutedBankAnyQuant(
             device, staging, moe, w3Qt, kind: 'U', numE: numE, mDim: interm, kDim: hiddenSize, elemsF32: w1Elems, prealloc);
 
+        Interlocked.Add(ref s_banksTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tBanks);
         // ── Shared expert (optional) ─────────────────────────────────────────
         VulkanDevice.Buffer? sharedGate = null, sharedUp = null, sharedDown = null;
         VulkanDevice.Buffer? sharedExpertGate = null;
