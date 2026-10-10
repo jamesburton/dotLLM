@@ -170,12 +170,44 @@ void SpecRun(int[] ids, int n, int k, StringBuilder o, string label)
     o.AppendLine($"   accepted-per-round histogram: {string.Join(" ", rounds.GroupBy(x => x).OrderBy(g => g.Key).Select(g => $"{g.Key}:{g.Count()}"))}");
 }
 
+void Setp(string name, string val)
+{
+    var parts = name.Split('.');
+    var t = typeof(VulkanQwen4ExpTransformerModel).Assembly.GetType("DotLLM.Vulkan." + parts[0]) ?? throw new Exception("no type " + parts[0]);
+    var pi = t.GetProperty(parts[1], System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic) ?? throw new Exception("no prop");
+    object v = pi.PropertyType == typeof(bool) ? (val == "1" || val == "true") : Convert.ChangeType(val, pi.PropertyType);
+    pi.SetValue(null, v);
+}
+
 void Exec(string line, StringBuilder o)
 {
     var a = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
     if (a.Length == 0) return;
     switch (a[0])
     {
+        case "set":
+        {
+            // set <Type.Prop> <value>: static property on the Vulkan model classes (internal ones included), int/bool.
+            Setp(a[1], a[2]);
+            o.AppendLine($"set {a[1]}={a[2]}");
+            break;
+        }
+        case "abfwd":
+        {
+            // abfwd <rows> <reps> <ctx> <Prop> <valA> <valB>: interleaved A/B of a 1..N-row forward in one process.
+            int rows = int.Parse(a[1]), reps = int.Parse(a[2]), ctx = int.Parse(a[3]);
+            Setp(a[4], a[5]); TimeFwd(rows, ctx, 1); Setp(a[4], a[6]); TimeFwd(rows, ctx, 1);
+            var ta = new List<double>(); var tb = new List<double>();
+            for (int i = 0; i < reps; i++)
+            {
+                Setp(a[4], a[5]); TimeFwd(rows, ctx, 2 + i); ta.Add(TimeFwd(rows, ctx, 2 + i));   // first call warms the PLE table pages for this seed
+                Setp(a[4], a[6]); tb.Add(TimeFwd(rows, ctx, 2 + i));
+            }
+            Setp(a[4], a[5]);
+            ta.Sort(); tb.Sort();
+            o.AppendLine($"abfwd rows={rows} ctx={ctx} {a[4]}: A={a[5]} min {ta[0]:F1} med {ta[ta.Count / 2]:F1} | B={a[6]} min {tb[0]:F1} med {tb[tb.Count / 2]:F1} ms");
+            break;
+        }
         case "smallrow":
             VulkanQwen4ExpTransformerModel.SmallRowGemv = a[1] == "1";
             o.AppendLine("smallrow " + a[1]);
@@ -377,6 +409,7 @@ void Exec(string line, StringBuilder o)
             int rows = int.Parse(a[1]), reps = int.Parse(a[2]), ctx = a.Length > 3 ? int.Parse(a[3]) : 16;
             TimeFwd(rows, ctx, 1);
             VulkanQwen4ExpTransformerModel.StageProfile = true;
+            VulkanQwen4ExpTransformerModel.StageTimestamps = Environment.GetEnvironmentVariable("PROBE_TS") == "1";
             model.TakeStageTimes();
             double tot = 0;
             var sums = new Dictionary<string, double>();
@@ -393,6 +426,7 @@ void Exec(string line, StringBuilder o)
                 foreach (var kv in model.TakeStageTimes()) sums[kv.Key] = sums.GetValueOrDefault(kv.Key) + kv.Value;
             }
             VulkanQwen4ExpTransformerModel.StageProfile = false;
+            VulkanQwen4ExpTransformerModel.StageTimestamps = false;
             o.AppendLine($"stage rows={rows} ctx={ctx} reps={reps}: forward {tot / reps:F1} ms, stages sum {sums.Values.Sum() / reps:F1} ms");
             foreach (var kv in sums.OrderByDescending(k => k.Value))
                 o.AppendLine($"   {kv.Key,-22} {kv.Value / reps,8:F2} ms");

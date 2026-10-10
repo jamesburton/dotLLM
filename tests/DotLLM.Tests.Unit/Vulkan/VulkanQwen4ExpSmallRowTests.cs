@@ -57,8 +57,9 @@ public sealed class VulkanQwen4ExpSmallRowTests
             _out.WriteLine($"rows {rows}: F32Multi {f32} F16Multi {f16} Q8Multi {q8} MoeQ4KMr {q4} MoeQ5_1Mr {q51}");
             if (rows == 1)
             {
-                // single-token decode must be untouched: not one small-row dispatch was recorded
-                Assert.Equal(0, f32 + f16 + q8 + q4 + q51);
+                // single-token decode (#885): the dense multi-column GEMVs stay off (one row), the multi-row routed-MoE MMVQs are on
+                Assert.Equal(0, f32 + f16 + q8);
+                Assert.True(q4 > 0 && q51 > 0, "decode never took the multi-row MoE MMVQs");
             }
             else if (rows <= 8)
             {
@@ -72,6 +73,17 @@ public sealed class VulkanQwen4ExpSmallRowTests
             }
 
             VulkanQwen4ExpTransformerModel.SmallRowGemv = false;
+            if (rows == 1)
+            {
+                // the decode opt-out switch itself must also turn the path off
+                VulkanQwen4ExpTransformerModel.SmallRowGemv = true;
+                VulkanQwen4ExpTransformerModel.DecodeMoeMr = false;
+                long b1 = Q4() + Q51();
+                Chunked(rig, ids, 1);
+                Assert.Equal(b1, Q4() + Q51());
+                VulkanQwen4ExpTransformerModel.DecodeMoeMr = true;
+                VulkanQwen4ExpTransformerModel.SmallRowGemv = false;
+            }
             long before = Q8() + F32() + F16() + Q4() + Q51();
             slow = Chunked(rig, ids, rows);
             Assert.Equal(before, Q8() + F32() + F16() + Q4() + Q51());   // disabled: nothing recorded
@@ -84,7 +96,7 @@ public sealed class VulkanQwen4ExpSmallRowTests
         _out.WriteLine($"rows {rows}: fast vs CPU relL2 {fastRel:E3} KL {fastKl:E3}; old path vs CPU relL2 {slowRel:E3} KL {slowKl:E3}; fast vs old relL2 {armRel:E3} KL {armKl:E3}");
         Assert.True(fastRel < 0.08 && fastKl < 0.02, $"fast path off the oracle: relL2 {fastRel:E3}, KL {fastKl:E3}");
         Assert.True(armRel < 0.05 && armKl < 0.01, $"fast path diverges from the previous multi-row path: relL2 {armRel:E3}, KL {armKl:E3}");
-        if (rows is >= 2 and <= 8)
+        if (rows <= 8)
             Assert.True(armRel > 0, "perturbation inert: the fast path produced bit-identical logits to the old kernels");
     }
 }

@@ -167,11 +167,15 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
 
             Mark("moeBanks");
             Qwen4ExpPleBranch? ple = null;
+            VulkanQwen4ExpPleGpu? pleGpu = null;
             int pleLayer = -1;
             if (q4.Ple is { } pc)
             {
                 pleLayer = pc.Layers[0];
                 ple = BuildPleBranch(gguf, tensors, config, q4, pc, pleLayer, owned);
+                using var pleStaging = VulkanStagingBuffer.Create(device, 64L << 20);
+                pleGpu = VulkanQwen4ExpPleGpu.Upload(device, pleStaging, gguf, $"blk.{pleLayer}.ple_key.weight", $"blk.{pleLayer}.ple_value.weight",
+                    q4.HyperConnectionCount * config.HiddenSize);
             }
 
             gr = Qwen4ExpGatedResidualKernel.Create(device, spvDir);
@@ -193,7 +197,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                                         $"staging memcpy={VulkanStagingBuffer.MemcpyMilliseconds / 1000:F1}s/{VulkanStagingBuffer.MemcpyBytes / (1024 * 1024)} MiB (thread-sum), " +
                                         $"bank uploads={VulkanQwen3MoeMoeUpload.BanksMilliseconds / 1000:F1}s, submitter waited {VulkanStagingBuffer.CopyWaitMilliseconds / 1000:F1}s on memcpy and {VulkanBankPrealloc.WaitMilliseconds / 1000:F1}s on bank allocation; {device.MemorySnapshot()}");
             model = new VulkanQwen4ExpTransformerModel(device, gguf, config, core, attnGr.ToArray(), ffnGr.ToArray(), head, moeBundles.ToArray(),
-                ple, pleLayer, owned, hostOnly, gr, groupRms, sigmoidGate, kvCapacity, weightBytes);
+                ple, pleLayer, owned, hostOnly, gr, groupRms, sigmoidGate, kvCapacity, weightBytes, pleGpu);
             model._spvDir = spvDir;
             try
             {

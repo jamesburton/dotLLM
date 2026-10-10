@@ -85,6 +85,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     private readonly VulkanQwen4ExpGrWeights _headGr;
     private readonly VulkanQwen3MoeMoeUpload.LayerBundle[] _moe;
     private readonly Qwen4ExpPleBranch? _ple;
+    private readonly VulkanQwen4ExpPleGpu? _pleGpu;
     private readonly int _pleLayer;
     private readonly List<nint> _owned;
     private readonly (nint Ptr, long Bytes)? _hostOnlyTable;
@@ -141,8 +142,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         VulkanQwen4ExpGrWeights[] attnGr, VulkanQwen4ExpGrWeights[] ffnGr, VulkanQwen4ExpGrWeights headGr,
         VulkanQwen3MoeMoeUpload.LayerBundle[] moe, Qwen4ExpPleBranch? ple, int pleLayer, List<nint> owned,
         (nint, long)? hostOnlyTable, Qwen4ExpGatedResidualKernel gr, GroupRmsNormF32Kernel groupRms,
-        GdnPostScanGateF32Kernel sigmoidGate, int kvCapacity, long weightBytes)
+        GdnPostScanGateF32Kernel sigmoidGate, int kvCapacity, long weightBytes, VulkanQwen4ExpPleGpu? pleGpu = null)
     {
+        _pleGpu = pleGpu;
         _device = device; _gguf = gguf; Config = config; _core = core; _q4 = config.Qwen4Exp!;
         _attnGr = attnGr; _ffnGr = ffnGr; _headGr = headGr; _moe = moe; _ple = ple; _pleLayer = pleLayer;
         _owned = owned; _hostOnlyTable = hostOnlyTable; _gr = gr; _groupRms = groupRms; _sigmoidGate = sigmoidGate;
@@ -220,6 +222,13 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     {
         get => VulkanQwen3MoeHybridTransformerModel.SmallRowGemvEnabled;
         set => VulkanQwen3MoeHybridTransformerModel.SmallRowGemvEnabled = value;
+    }
+
+    /// <summary>Diagnostic (#885): with <see cref="StageProfile"/> on, charge stage deltas from GPU timestamps inside the one command buffer instead of submit+wait per stage.</summary>
+    public static bool StageTimestamps
+    {
+        get => VulkanQwen3MoeHybridTransformerModel.StageTimestamps;
+        set => VulkanQwen3MoeHybridTransformerModel.StageTimestamps = value;
     }
 
     /// <summary>Returns and clears the accumulated per-stage times (ms) recorded while <see cref="StageProfile"/> was on.</summary>
@@ -365,9 +374,14 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         void GrRead(VulkanQwen4ExpGrWeights w, VulkanDevice.Buffer src, int tokens, bool inject)
             => RecordGrRead(cmd, w, src, st.NormOutput, tokens, inject);
 
+        _core.Q4DecodeMr = DecodeMoeMr;
         Begin();
         _core.Q4StageBegin();
         if (NgramPrefetch) _ple?.BeginPrefetch(tokenIds, state.Ple!);   // #822: the n-gram rows depend only on token ids - start paging the table in before layer 0
+        // #885: the PLE key/value projections need only the token ids: run them on the GPU ahead of layer 0 (short forwards), so the host step
+        // between layer 0 and layer 1 is just the residual-dependent remainder (no 131 MB F32 CPU GEMM).
+        bool pleOnGpu = _ple is not null && _pleGpu is not null && PleOnGpu && T <= VulkanQwen4ExpPleGpu.MaxRows;
+        if (pleOnGpu) { RecordPleProjections(cmd, tokenIds, state.Ple!, T); PleGpuForwards++; }
         _core.Q4RecordEmbedding(cmd, tokenIds);
         Barrier();
         _core.Q4Stage("embed");
@@ -377,19 +391,64 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         for (int il = 0; il < Config.NumLayers; il++)
         {
             // ── n-gram branch (host): R += PLE(R, token history) ──
-            if (_ple is not null && il == _pleLayer)
+            if (pleOnGpu && il == _pleLayer)
+            {
+                var pg = _pleGpu!;
+                int n = T * row, emb = T * pg.KeyDim, vlen = T * pg.ValueDim;
+                VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, _res, pg.ResidualOut, 0, 0, (ulong)((long)n * 4));
+                KernelSupport.TransferToHostBarrier(cmd);
+                End();
+                float[] hostR = System.Buffers.ArrayPool<float>.Shared.Rent(n);
+                float[] hostK = System.Buffers.ArrayPool<float>.Shared.Rent(emb);
+                float[] hostV = System.Buffers.ArrayPool<float>.Shared.Rent(vlen);
+                try
+                {
+                    long pt0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    _device.Download(pg.ResidualOut, hostR.AsSpan(0, n));
+                    _device.Download(pg.KeyOut, hostK.AsSpan(0, emb));
+                    _device.Download(pg.ValueOut, hostV.AsSpan(0, vlen));
+                    long pt1 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    _ple!.ApplyProjected(tokenIds, state.Ple!, hostR.AsSpan(0, n), hostK.AsSpan(0, emb), hostV.AsSpan(0, vlen));
+                    long pt2 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    _device.Upload(hostR.AsSpan(0, n), pg.ResidualIn);
+                    long pt3 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    double f = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                    _core.Q4AddStageMs("host.ple_download", (pt1 - pt0) * f);
+                    _core.Q4AddStageMs("host.ple_apply", (pt2 - pt1) * f);
+                    _core.Q4AddStageMs("host.ple_upload", (pt3 - pt2) * f);
+                }
+                finally
+                {
+                    System.Buffers.ArrayPool<float>.Shared.Return(hostR); System.Buffers.ArrayPool<float>.Shared.Return(hostK);
+                    System.Buffers.ArrayPool<float>.Shared.Return(hostV);
+                }
+                Begin();
+                VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, pg.ResidualIn, _res, 0, 0, (ulong)((long)n * 4));
+                Barrier();
+                _core.Q4Stage("~ple");
+            }
+            else if (_ple is not null && il == _pleLayer)
             {
                 End();
                 int n = T * row;
                 float[] host = System.Buffers.ArrayPool<float>.Shared.Rent(n);
                 try
                 {
+                    long pt0 = System.Diagnostics.Stopwatch.GetTimestamp();
                     _device.Download(_res, host.AsSpan(0, n));
+                    long pt1 = System.Diagnostics.Stopwatch.GetTimestamp();
                     _ple.Apply(tokenIds, state.Ple!, host.AsSpan(0, n));
+                    long pt2 = System.Diagnostics.Stopwatch.GetTimestamp();
                     _device.Upload(host.AsSpan(0, n), _res);
+                    long pt3 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    double f = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                    _core.Q4AddStageMs("host.ple_download", (pt1 - pt0) * f);
+                    _core.Q4AddStageMs("host.ple_apply", (pt2 - pt1) * f);
+                    _core.Q4AddStageMs("host.ple_upload", (pt3 - pt2) * f);
                 }
                 finally { System.Buffers.ArrayPool<float>.Shared.Return(host); }
                 Begin();
+                _core.Q4Stage("~ple");
             }
 
             // ── token mixer ──
@@ -489,6 +548,32 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         return logits;
     }
 
+    /// <summary>
+    /// Short forwards run the n-gram key/value projections on the GPU (#885, ~4 ms of a ~57 ms decode step). On by default;
+    /// <c>DOTLLM_VK_Q4E_PLE_GPU=0</c> at startup (or setting this) restores the all-host branch. Read at the top of every forward.
+    /// </summary>
+    public static bool PleOnGpu { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_PLE_GPU") != "0";
+
+    /// <summary>Test hook (#885): forwards whose PLE key/value projections ran on the GPU.</summary>
+    internal long PleGpuForwards { get; private set; }
+
+    /// <summary>Gathers the table rows on the host, writes them to the device scratch and records both projections (key, value).</summary>
+    private void RecordPleProjections(nint cmd, ReadOnlySpan<int> tokenIds, Qwen4ExpPleState pleState, int T)
+    {
+        var pg = _pleGpu!;
+        int embLen = _ple!.EmbeddingLength(T);
+        float[] emb = System.Buffers.ArrayPool<float>.Shared.Rent(embLen);
+        try
+        {
+            _ple.GatherEmbeddings(tokenIds, pleState, emb.AsSpan(0, embLen));
+            _device.Upload(emb.AsSpan(0, embLen), pg.Emb);
+        }
+        finally { System.Buffers.ArrayPool<float>.Shared.Return(emb); }
+        pg.Record(_core, cmd, T);
+        KernelSupport.ComputeTransferFullBarrier(cmd);
+        _core.Q4Stage("ple_proj");
+    }
+
     /// <summary>GR read: group-RMS(src) -> low-rank mix -> block input written to <paramref name="dst"/>; inject gains when requested.</summary>
     private void RecordGrRead(nint cmd, VulkanQwen4ExpGrWeights w, VulkanDevice.Buffer src, VulkanDevice.Buffer dst, int tokens, bool inject)
     {
@@ -542,6 +627,12 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         set => _core.GroupedMinTokens = value;
     }
 
+    /// <summary>
+    /// Single-token decode uses the multi-row routed-MoE MMVQs (#885; 56.7 -> 52.5 ms per 1-row forward on UD-Q4_K_XL). On by default;
+    /// <c>DOTLLM_VK_Q4E_DECODE_MR=0</c> at startup (or setting this) restores the one-row kernels. Read at the top of every forward.
+    /// </summary>
+    public static bool DecodeMoeMr { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_DECODE_MR") != "0";
+
     /// <summary>Diagnostic (#876): smallest token count that uses the multi-row routed-MoE MMVQ variants (0 = never; default 2).</summary>
     public static int MoeMultiRowMinRows
     {
@@ -569,6 +660,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         _disposed = true;
         _mtp?.Dispose();
         _ple?.Prefetcher?.Dispose();
+        _pleGpu?.Dispose();
         _defaultState.Dispose();
         foreach (var m in _moe) m.Dispose();
         foreach (var g in _attnGr) g.Dispose();

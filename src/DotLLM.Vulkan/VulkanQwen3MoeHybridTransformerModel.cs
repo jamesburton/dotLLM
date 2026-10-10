@@ -519,16 +519,66 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// <summary>Runtime switch for the split-submit stage timing (#876 probe; also on at startup via the env var). When on, token-mixing stages are timed at 1 row too.</summary>
     internal static bool StageProfileEnabled { get => MoeStageProfileEnabled; set => MoeStageProfileEnabled = value; }
     /// <summary>Accumulated per-stage wall ms since the last <see cref="TakeStageTimes"/>.</summary>
-    internal Dictionary<string, double> TakeStageTimes() { var d = new Dictionary<string, double>(_moeStageMs); _moeStageMs.Clear(); return d; }
+    internal Dictionary<string, double> TakeStageTimes()
+    {
+        if (_tsCount > 1) CollectStageTimestamps();
+        var d = new Dictionary<string, double>(_moeStageMs); _moeStageMs.Clear(); return d;
+    }
     internal void Q4Stage(string name) => MoeStage(name);
-    internal void Q4StageBegin() => MoeStageBegin();
+    /// <summary>Charges host-measured ms to a stage label (#885 diagnostic; only while stage profiling is on).</summary>
+    internal void Q4AddStageMs(string name, double ms) { if (MoeStageProfileEnabled) _moeStageMs[name] = _moeStageMs.GetValueOrDefault(name) + ms; }
+    internal void Q4StageBegin() { if (StageTimestamps && MoeStageProfileEnabled) TsBegin(); else MoeStageBegin(); }
     private readonly Dictionary<string, double> _moeStageMs = new();
     private long _moeStageLast;
 
+    // GPU-timestamp stage mode (#885): DOTLLM_VK_STAGE_TS=1 or StageTimestamps=true. Instead of submit+wait per stage (which pays ~50 us of
+    // fence round trip each and distorts a 2000-dispatch decode), each stage writes a BOTTOM_OF_PIPE timestamp into the one command buffer
+    // and the delta to the previous stamp is charged to the stage label. The run keeps its real submission structure.
+    internal static bool StageTimestamps { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_STAGE_TS") == "1";
+    private const int TsMax = 8192;
+    private nint _tsPool;
+    private int _tsCount;
+    private readonly string[] _tsLabels = new string[TsMax];
+    private readonly ulong[] _tsScratch = new ulong[TsMax];
+
+    private void TsStamp(string label)
+    {
+        if (_tsPool == 0 || _tsCount >= TsMax) return;
+        _tsLabels[_tsCount] = label;
+        VulkanApi.vkCmdWriteTimestamp(_submit.CommandBuffer, VkPipelineStageFlags.BottomOfPipe, _tsPool, (uint)_tsCount++);
+    }
+
+    private unsafe void CollectStageTimestamps()
+    {
+        int n = _tsCount; _tsCount = 0;
+        fixed (ulong* p = _tsScratch)
+        {
+            if (VulkanApi.vkGetQueryPoolResults(_device.Handle, _tsPool, 0, (uint)n, (nuint)(n * sizeof(ulong)), (nint)p, sizeof(ulong), flags: 0x1 | 0x2) < 0) return;
+        }
+        double toMs = _device.TimestampPeriodNs / 1_000_000.0;
+        for (int i = 1; i < n; i++)
+            _moeStageMs[_tsLabels[i]] = _moeStageMs.GetValueOrDefault(_tsLabels[i]) + (_tsScratch[i] - _tsScratch[i - 1]) * toMs;
+    }
+
     private void MoeStageBegin()
     {
-        if (!MoeStageProfileEnabled) return;
+        if (!MoeStageProfileEnabled || StageTimestamps) return;
         _moeStageLast = System.Diagnostics.Stopwatch.GetTimestamp();
+    }
+
+    private void TsBegin()
+    {
+        {
+            if (_tsPool == 0)
+            {
+                var qci = new VkQueryPoolCreateInfo { sType = 11, queryType = 2, queryCount = TsMax };
+                if (VulkanApi.vkCreateQueryPool(_device.Handle, qci, 0, out _tsPool) < 0) { _tsPool = 0; return; }
+            }
+            if (_tsCount > 1) CollectStageTimestamps();
+            _tsCount = 0;
+            VulkanApi.vkCmdResetQueryPool(_submit.CommandBuffer, _tsPool, 0, TsMax);
+            TsStamp("~begin");
+        }
     }
 
     /// <summary>Token-mixing stage marker: only meaningful on the per-layer-submit prefill path (never inside the fused decode buffer).</summary>
@@ -540,6 +590,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private void MoeStage(string name)
     {
         if (!MoeStageProfileEnabled) return;
+        if (StageTimestamps) { TsStamp(name); return; }
         KernelSupport.ComputeToHostBarrier(_submit.CommandBuffer);
         _submit.SubmitAndWait();
         long now = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -1910,7 +1961,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             // Decode-sized batches: the coalesced subgroup-per-cell MMVQ GEMV instead of the one-thread-per-cell MMQ.
             var gateUpMmvq = decodeMmvq ? _kernels.MoeMmvqQ4K : null;
             // #876: 2..15-token steps use the multi-row variant (same per-row accumulation order, NR output rows per workgroup; a few ULP from the one-row kernel).
-            if (gateUpMmvq is not null && MoeMrMinRows > 0 && seqLen >= MoeMrMinRows && SmallRowGemvEnabled && _kernels.MoeMmvqQ4KMr is { } q4Mr && (interm % q4Mr.RowsPerGroup) == 0)
+            if (gateUpMmvq is not null && EffMoeMrMinRows > 0 && seqLen >= EffMoeMrMinRows && SmallRowGemvEnabled && _kernels.MoeMmvqQ4KMr is { } q4Mr && (interm % q4Mr.RowsPerGroup) == 0)
             { gateUpMmvq = q4Mr; CountSmallRow(SmallRowPath.MoeQ4KMr); }
             if (gateUpMmvq is not null)
             {
@@ -1969,7 +2020,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             CountMoePath(MoePath.MmvqDown);
             if (IsLegacyQuant(moeW.W2QuantType)) CountMoePath(MoePath.MmvqLegacyDown);
-            RecordDownMmvq(cmdBuf, moeW.W2QuantType, moeW, hidden, interm, expandedRows, numE, multiRow: MoeMrMinRows > 0 && seqLen >= MoeMrMinRows && SmallRowGemvEnabled);
+            RecordDownMmvq(cmdBuf, moeW.W2QuantType, moeW, hidden, interm, expandedRows, numE, multiRow: EffMoeMrMinRows > 0 && seqLen >= EffMoeMrMinRows && SmallRowGemvEnabled);
         }
         else if (useDownMmq)
         {
@@ -2181,6 +2232,13 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
 
     /// <summary>Runtime switch for the 2..8-row multi-column GEMVs (#876); <c>DOTLLM_VK_SMALLROW_GEMV=0</c> at startup disables (A/B and diagnostics).</summary>
     internal static bool SmallRowGemvEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_SMALLROW_GEMV") != "0";
+
+    /// <summary>
+    /// qwen4exp opt-in (#885): single-token decode takes the multi-row routed-MoE MMVQs (Q4_K gate/up NR=2, Q5_1 down NR=4) - 56.7 -> 52.5 ms per 1-row
+    /// forward on the real UD-Q4_K_XL file (interleaved same-process A/B). Other MoE models keep the static default (not measured there).
+    /// </summary>
+    internal bool Q4DecodeMr { get; set; }
+    private int EffMoeMrMinRows => MoeMrMinRows > 0 && Q4DecodeMr ? 1 : MoeMrMinRows;
 
     /// <summary>Smallest token count that takes the multi-row routed-MoE MMVQ variants (#876); 0 = never (A/B). Default 2 leaves single-token decode on the proven kernels (DOTLLM_VK_MOE_MR_MIN_ROWS=1 opts decode in: -9% 1-row forward on the real qwen4exp file).</summary>
     internal static int MoeMrMinRows { get; set; } =
