@@ -26,12 +26,19 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
         return resized;
     }
 
+    /// <summary>Drops every cached descriptor set (call after re-creating buffers the caller feeds into this model's kernels).</summary>
+    internal void Q4InvalidateCaches() { _kernels.InvalidateAll(); _iqF16Prefill?.InvalidateDescriptorCache(); }
+
     internal void Q4UploadPositions(ReadOnlySpan<int> positions) => UploadPositions(positions);
 
     internal void Q4RecordEmbedding(nint cmdBuf, ReadOnlySpan<int> tokenIds) => RecordEmbeddingGather(cmdBuf, tokenIds);
 
-    internal void Q4RecordGdn(nint cmdBuf, int layer, int seqLen, float eps, VulkanGdnStateCache gdnCache, GdnPostScanGateF32Kernel sigmoidGate)
-        => RecordGdnLayer(cmdBuf, layer, _weights.Layers[layer].Gdn!.Value, seqLen, eps, gdnCache, sigmoidGate);
+    internal void Q4RecordGdn(nint cmdBuf, int layer, int seqLen, float eps, VulkanGdnStateCache gdnCache, GdnPostScanGateF32Kernel sigmoidGate,
+                              Q4GdnRowSnapshots? snap = null)
+        => RecordGdnLayer(cmdBuf, layer, _weights.Layers[layer].Gdn!.Value, seqLen, eps, gdnCache, sigmoidGate, snap);
+
+    /// <summary>GDN ordinal of absolute layer <paramref name="layer"/> (-1 for attention layers).</summary>
+    internal int Q4GdnOrdinal(int layer) => _gdnLayerOrdinal[layer];
 
     internal void Q4RecordAttention(nint cmdBuf, int layer, int seqLen, ReadOnlySpan<int> positions, VulkanNemotronHKvCache kvCache)
         => RecordFullAttnLayer(cmdBuf, layer, _weights.Layers[layer].Attention!.Value, seqLen, positions,
@@ -53,4 +60,23 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
 
     /// <summary>Sparse per-attention-layer KV cache sized for <paramref name="maxSeqLen"/> positions.</summary>
     internal VulkanNemotronHKvCache Q4CreateKvCache(int maxSeqLen) => CreateKvCache(maxSeqLen);
+}
+
+/// <summary>
+/// Per-row recurrent-state snapshots a speculative verify forward asks the Gated-DeltaNet layers to record (#820): the state after each
+/// of the first <see cref="Rows"/> rows (scan twin kernel, owned by the model, bit-identical to the shipping scan) and the conv window after each of them.
+/// Buffers are indexed by GDN ordinal: <c>Gdn[l]</c> holds <c>Rows x stateElements</c> floats, <c>Conv[l]</c> <c>Rows x convStateElements</c>.
+/// </summary>
+internal sealed class Q4GdnRowSnapshots : IDisposable
+{
+    public required GdnScanMultiTokenSnapshotF32Kernel Kernel { get; init; }
+    public required VulkanDevice.Buffer[] Gdn { get; init; }
+    public required VulkanDevice.Buffer[] Conv { get; init; }
+    public int Rows { get; set; }
+
+    public void Dispose()
+    {
+        foreach (var b in Gdn) b?.Dispose();
+        foreach (var b in Conv) b?.Dispose();
+    }
 }

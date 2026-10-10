@@ -371,7 +371,15 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             if (!settings.NoMtp)
             {
                 // qwen4exp ships its MTP draft head as a separate GGUF (#820): attach the explicit or auto-detected sibling.
-                mtpHeadPath = DotLLM.Models.Architectures.Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, settings.MtpHead);
+                try
+                {
+                    mtpHeadPath = DotLLM.Models.Architectures.Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, settings.MtpHead);
+                }
+                catch (Exception ex) when (settings.MtpHead is null && ex is not FileNotFoundException)
+                {
+                    // An auto-detected head that cannot be attached (device memory, a mismatched file) must not take the run down: plain decode works.
+                    Console.Error.WriteLine($"WARNING: MTP head not attached ({ex.GetType().Name}: {ex.Message}); decoding without speculation.");
+                }
             }
         }
 

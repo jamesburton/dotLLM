@@ -167,8 +167,10 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                 Console.Error.WriteLine($"[vulkan-load] phases: {string.Join(", ", phases)}; vkAllocateMemory={VulkanDevice.AllocateMemoryMilliseconds / 1000:F1}s, " +
                                         $"staging memcpy={VulkanStagingBuffer.MemcpyMilliseconds / 1000:F1}s/{VulkanStagingBuffer.MemcpyBytes / (1024 * 1024)} MiB (thread-sum), " +
                                         $"bank uploads={VulkanQwen3MoeMoeUpload.BanksMilliseconds / 1000:F1}s, submitter waited {VulkanStagingBuffer.CopyWaitMilliseconds / 1000:F1}s on memcpy and {VulkanBankPrealloc.WaitMilliseconds / 1000:F1}s on bank allocation; {device.MemorySnapshot()}");
-            return new VulkanQwen4ExpTransformerModel(device, gguf, config, core, attnGr.ToArray(), ffnGr.ToArray(), head, moeBundles.ToArray(),
+            var built = new VulkanQwen4ExpTransformerModel(device, gguf, config, core, attnGr.ToArray(), ffnGr.ToArray(), head, moeBundles.ToArray(),
                 ple, pleLayer, owned, hostOnly, gr, groupRms, sigmoidGate, kvCapacity, weightBytes);
+            built._spvDir = spvDir;
+            return built;
         }
         catch
         {

@@ -88,7 +88,13 @@ exact ids (so `on` read warm pages), the box was shared, and the PLE gather is ~
 measurement. A repeat of the `off` arm as a determinism control was not run (on == off already shows the two agree).
 
 
-## Wiring the Vulkan model (follow-up after the MTP work lands)
+## Wiring the Vulkan model (DONE in #820 stage 2; the notes below are what was wired)
+
+**Status (2026-10-10).** Items 1, 2 and 4 are in: `VulkanQwen4ExpTransformerModel.ForwardCore` calls `BeginPrefetch` right after `Begin()` and before
+`Q4RecordEmbedding`, the model disposes the prefetcher, `PleTableStats` is exposed, and the MTP draft loop re-issues the request with the verify
+chunk's known prefix `[last token, d1 .. di]` after every draft step. Measured on the real file, cold 1K-token prefill of fresh random ids, A/B/B/A in
+one process: **7.7-7.9 s with the prefetch, 14.4-14.6 s without** (-6.7 s per 1K chunk, 1.85x; the CPU measurement above predicted 6.8 s of demand
+faults). `DOTLLM_VK_Q4E_PREFETCH=0` disables it for A/B. Item 3 (prefetching chunk k+1 during chunk k) is not done.
 
 `VulkanQwen4ExpTransformerModel` builds the same `Qwen4ExpPleBranch` and runs it on the host at the PLE layer. Today it is inert
 (mmap default, no `BeginPrefetch` call, `Gather(null, ...)` = the plain path plus counters). To get the win:

@@ -79,7 +79,13 @@ internal sealed record Q4eQuant
 /// </summary>
 internal static class Qwen4ExpRandomGguf
 {
-    public static byte[] Build(Q4eGeometry g, Q4eQuant q, uint seed = 0xA11CEu)
+    /// <summary>
+    /// A STANDALONE MTP-head file (#820) for the same geometry: only <c>blk.{Layers}.*</c> (a QSA + MoE block with its gated-residual modules)
+    /// and the <c>nextn.*</c> tensors, like the released <c>mtp-*.gguf</c>. Pair it with <see cref="Build"/> of the same geometry as the trunk.
+    /// </summary>
+    public static byte[] BuildMtpOnly(Q4eGeometry g, Q4eQuant q, uint seed = 0xBEEF01u) => Build(g, q, seed, mtpHeadOnly: true);
+
+    public static byte[] Build(Q4eGeometry g, Q4eQuant q, uint seed = 0xA11CEu, bool mtpHeadOnly = false)
     {
         const string arch = "qwen4exp";
         var rng = new Random(unchecked((int)seed));
@@ -184,17 +190,27 @@ internal static class Qwen4ExpRandomGguf
             => Add(name, [ne0, ne1], Randn((long)ne0 * ne1, gain / MathF.Sqrt(ne0)), qt);
         void Norm(string name, int n) => Add(name, [n], Randn(n, 0.05f, 1f), QuantizationType.F32);
 
-        Mat("token_embd.weight", H, g.Vocab, q.Embed, gain: 1.5f * MathF.Sqrt(H));
-        Mat("output.weight", H, g.Vocab, q.Embed, gain: 3f);
-        Norm("output_hc_norm.weight", hcDim);
-        Mat("output_hc_down.weight", hcDim, g.HcLowRank, q.HcDown);
-        Mat("output_hc_up.weight", g.HcLowRank, hcDim, QuantizationType.F32, gain: 2f);
-        Add("per_layer_token_embd.weight", [g.PleRowDim, g.TableRows], Randn((long)g.PleRowDim * g.TableRows, 0.5f), q.Table);
+        if (!mtpHeadOnly)
+        {
+            Mat("token_embd.weight", H, g.Vocab, q.Embed, gain: 1.5f * MathF.Sqrt(H));
+            Mat("output.weight", H, g.Vocab, q.Embed, gain: 3f);
+            Norm("output_hc_norm.weight", hcDim);
+            Mat("output_hc_down.weight", hcDim, g.HcLowRank, q.HcDown);
+            Mat("output_hc_up.weight", g.HcLowRank, hcDim, QuantizationType.F32, gain: 2f);
+            Add("per_layer_token_embd.weight", [g.PleRowDim, g.TableRows], Randn((long)g.PleRowDim * g.TableRows, 0.5f), q.Table);
+        }
 
-        for (int il = 0; il < g.Layers; il++)
+        if (mtpHeadOnly)
+        {
+            // the released head file carries its own embedding / LM head (unused: mtp_use_dedicated_embeddings = false) and nothing else of the trunk
+            Mat("token_embd.weight", H, g.Vocab, q.Embed, gain: 1.5f * MathF.Sqrt(H));
+            Mat("output.weight", H, g.Vocab, q.Embed, gain: 3f);
+        }
+
+        for (int il = mtpHeadOnly ? g.Layers : 0; il < (mtpHeadOnly ? g.Layers + 1 : g.Layers); il++)
         {
             string b = $"blk.{il}.";
-            bool attention = (il + 1) % 4 == 0;
+            bool attention = mtpHeadOnly || (il + 1) % 4 == 0;
             foreach (string m in new[] { "hc_attn_", "hc_ffn_" })
             {
                 Norm(b + m + "norm.weight", hcDim);
@@ -250,6 +266,16 @@ internal static class Qwen4ExpRandomGguf
             Mat(b + "ffn_gate_shexp.weight", H, g.SharedInter, q.Proj);
             Mat(b + "ffn_up_shexp.weight", H, g.SharedInter, q.Proj);
             Mat(b + "ffn_down_shexp.weight", g.SharedInter, H, q.Proj);
+
+            if (mtpHeadOnly)
+            {
+                Mat(b + "nextn.eh_proj.weight", 2 * H, H, q.Proj, gain: 2f);
+                Norm(b + "nextn.enorm.weight", H);
+                Norm(b + "nextn.hnorm.weight", hcDim);
+                Norm(b + "nextn.hc_head_norm.weight", hcDim);
+                Mat(b + "nextn.hc_head_down.weight", hcDim, g.HcLowRank, q.HcDown);
+                Mat(b + "nextn.hc_head_up.weight", g.HcLowRank, hcDim, QuantizationType.F32, gain: 2f);
+            }
         }
         return w.Build();
     }
