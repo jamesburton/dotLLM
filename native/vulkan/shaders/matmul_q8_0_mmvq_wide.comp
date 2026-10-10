@@ -1,0 +1,105 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered  : require
+// Q8_0 MMVQ decode GEMV, WIDE variant (#885): the matmul_q8_0_mmvq.comp inner loop (coalesced lane = K-position, 8-block windows, dp4a)
+// with two orthogonal knobs for the shapes the one-wave-per-row kernel serves badly:
+//
+//   ROWS   output rows per workgroup. A K = 320 row is ten Q8_0 blocks: one wave32 per row means 10240 tiny workgroups for the
+//          qwen4exp gated-residual "up" projection, i.e. launch-rate bound (27 us for 3.5 MB = 130 GB/s). ROWS = 4 quarters the grid.
+//   KSPLIT subgroups cooperating on ONE row (the K windows are dealt round-robin, partial sums reduced in a fixed order). A K = 10240
+//          row with M = 320 rows is only 320 waves, 40 dependent window iterations each: latency bound (29 us for 3.5 MB = 120 GB/s).
+//          KSPLIT = 4 gives 4x the bytes in flight.
+//
+// workgroup = 128 threads = ROWS * KSPLIT (= 4) subgroups of 32 lanes (pinned wave32 by the host). Row r of the workgroup is served by subgroups
+// r*KSPLIT .. r*KSPLIT+KSPLIT-1. With KSPLIT = 1 the per-row arithmetic and accumulation order are IDENTICAL to matmul_q8_0_mmvq.comp
+// (bit-exact); with KSPLIT > 1 the accumulation order changes (a few ULP). Rows past M do no loads but still reach the barrier.
+
+layout(constant_id = 0) const uint ROWS   = 4u;
+layout(constant_id = 1) const uint KSPLIT = 1u;
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;   // 4 subgroups: ROWS * KSPLIT must be 4 (host-checked)
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; }; // Q8_0 blob, 4-byte indexable
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };      // [K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };     // [K/32] (d_x, s_x)
+layout(set = 0, binding = 3, std430) writeonly buffer BufY   { float y[]; };       // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;            // number of output rows
+    uint K;            // columns (multiple of 32)
+    uint blocksPerRow; // = K / 32
+    uint rowUints;     // unused
+} pc;
+
+const uint UINT16_PER_BLOCK = 17u;  // 34 bytes = 1 scale + 16 qs (uint16)
+const uint WINDOW_BLOCKS    = 8u;   // 32 lanes * 8 int8/lane = 256 weights = 8 blocks
+
+shared float partials[32];
+
+uint readU16(uint idx16) {
+    uint w = weight[idx16 >> 1u];
+    return ((idx16 & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+}
+
+void main() {
+    uint tid  = gl_LocalInvocationID.x;
+    uint lane = tid & 31u;
+    uint sg   = tid >> 5u;
+    uint rowInWg = sg / KSPLIT;
+    uint part    = sg % KSPLIT;
+    uint m = gl_WorkGroupID.x * ROWS + rowInWg;
+    bool valid = m < pc.M;
+
+    uint blockInWindow = lane >> 2u;
+    uint subInBlock    = lane & 3u;
+    uint qOff16        = 1u + 4u * subInBlock;
+    uint rowBase16 = m * pc.blocksPerRow * UINT16_PER_BLOCK;
+
+    float acc = 0.0;
+    if (valid) {
+        for (uint w0 = part * WINDOW_BLOCKS; w0 < pc.blocksPerRow; w0 += KSPLIT * WINDOW_BLOCKS) {
+            uint blk = w0 + blockInWindow;
+            if (blk >= pc.blocksPerRow)
+                continue;
+
+            uint blkBase16 = rowBase16 + blk * UINT16_PER_BLOCK;
+            float dW = unpackHalf2x16(readU16(blkBase16)).x;
+            float dX = xds[blk].x;
+
+            uint qb = blkBase16 + qOff16;
+            uint w32a = readU16(qb)      | (readU16(qb + 1u) << 16u);
+            uint w32b = readU16(qb + 2u) | (readU16(qb + 3u) << 16u);
+
+            uint xbase = blk * 8u + 2u * subInBlock;
+            uint xa = xq[xbase];
+            uint xb = xq[xbase + 1u];
+
+            int dotI = 0;
+            dotI = dotPacked4x8AccSatEXT(int(w32a), int(xa), dotI);
+            dotI = dotPacked4x8AccSatEXT(int(w32b), int(xb), dotI);
+
+            acc += (dW * dX) * float(dotI);
+        }
+    }
+
+    // cluster of 32 = this row-part's lanes whether the hardware subgroup is 32 or 64 wide (a 128-thread group may be scheduled as wave64)
+    float total = subgroupClusteredAdd(acc, 32u);
+    if (KSPLIT == 1u) {
+        if (valid && lane == 0u)
+            y[m] = total;
+    } else {
+        if (lane == 0u)
+            partials[sg] = total;
+        barrier();
+        if (tid < ROWS) {
+            uint mr = gl_WorkGroupID.x * ROWS + tid;
+            if (mr < pc.M) {
+                float s = 0.0;
+                for (uint p = 0u; p < KSPLIT; p++)
+                    s += partials[tid * KSPLIT + p];
+                y[mr] = s;
+            }
+        }
+    }
+}

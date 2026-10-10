@@ -19,8 +19,34 @@ using DotLLM.Vulkan;
 //   env NAME=VALUE                 set a process env var (for switches read per call)
 //   quit
 const string Marker = "[probe]";
+string[] prompts =
+{
+    "The capital of France is Paris, and the capital of Germany is",
+    "Mixture-of-experts models route each token to a small subset of expert networks, which lets the total parameter count grow much faster than the compute per token. Explain in detail how the router is trained and why load balancing matters for throughput.",
+    "def is_palindrome(s: str) -> bool:" + (char)10 + "    cleaned = " + "''" + ".join(c.lower() for c in s if c.isalnum())" + (char)10 + "    return cleaned == cleaned[::-1]" + (char)10 + (char)10 + "# Write unit tests for the function above",
+    "The French Revolution began in 1789 and transformed the political landscape of Europe. Key events included the storming of the Bastille, the Declaration of the Rights of Man, the Reign of Terror, and the rise of Napoleon Bonaparte, who eventually crowned himself emperor in 1804. Summarize the main causes.",
+};
 if (args[0] == "kbench") { KBench.Run(args); return; }
 if (args[0] == "iqbench") { IqKBench.Run(args); return; }
+if (args[0] == "oracle")
+{
+    // CPU oracle of the real file: final-position logits of the four probe prompts, single-shot prefill, stored in the rdump format (<work>/oracle.f32).
+    var (cpuModel, cpuGguf, cpuCfg) = DotLLM.Models.ModelLoader.LoadFromGguf(args[1], new DotLLM.Core.Configuration.ThreadingConfig(0));
+    var cpuTok = GgufTokenizerFactory.Load(cpuGguf.Metadata);
+    Directory.CreateDirectory(args[2]);
+    var all = new List<float>();
+    foreach (var pr in prompts)
+    {
+        var ids = cpuTok.Encode(pr);
+        var sw = Stopwatch.StartNew();
+        using var lg = cpuModel.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), -1);
+        unsafe { all.AddRange(new ReadOnlySpan<float>((void*)(lg.DataPointer + (nint)((long)(ids.Length - 1) * cpuCfg.VocabSize * 4)), cpuCfg.VocabSize).ToArray()); }
+        Console.WriteLine($"oracle prompt {ids.Length} tok: {sw.Elapsed.TotalSeconds:F1} s");
+    }
+    File.WriteAllBytes(Path.Combine(args[2], "oracle.f32"), MemoryMarshal.AsBytes(all.ToArray().AsSpan()).ToArray());
+    Console.WriteLine("oracle written");
+    return;
+}
 string gguf = args[0];
 string work = args[1];
 Directory.CreateDirectory(Path.Combine(work, "jobs"));
@@ -37,13 +63,6 @@ using var model = VulkanQwen4ExpTransformerModel.BuildFromGguf(device, file, cfg
 Log($"loaded in {sw0.Elapsed.TotalSeconds:F0} s");
 int vocab = cfg.VocabSize;
 var tok = GgufTokenizerFactory.Load(file.Metadata);
-string[] prompts =
-{
-    "The capital of France is Paris, and the capital of Germany is",
-    "Mixture-of-experts models route each token to a small subset of expert networks, which lets the total parameter count grow much faster than the compute per token. Explain in detail how the router is trained and why load balancing matters for throughput.",
-    "def is_palindrome(s: str) -> bool:" + (char)10 + "    cleaned = " + "''" + ".join(c.lower() for c in s if c.isalnum())" + (char)10 + "    return cleaned == cleaned[::-1]" + (char)10 + (char)10 + "# Write unit tests for the function above",
-    "The French Revolution began in 1789 and transformed the political landscape of Europe. Key events included the storming of the Bastille, the Declaration of the Rights of Man, the Reign of Terror, and the rise of Napoleon Bonaparte, who eventually crowned himself emperor in 1804. Summarize the main causes.",
-};
 
 bool realText = true;
 int[] longText = null!;
@@ -171,12 +190,44 @@ void SpecRun(int[] ids, int n, int k, StringBuilder o, string label)
     o.AppendLine($"   accepted-per-round histogram: {string.Join(" ", rounds.GroupBy(x => x).OrderBy(g => g.Key).Select(g => $"{g.Key}:{g.Count()}"))}");
 }
 
+void Setp(string name, string val)
+{
+    var parts = name.Split('.');
+    var t = typeof(VulkanQwen4ExpTransformerModel).Assembly.GetType("DotLLM.Vulkan." + parts[0]) ?? throw new Exception("no type " + parts[0]);
+    var pi = t.GetProperty(parts[1], System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic) ?? throw new Exception("no prop");
+    object v = pi.PropertyType == typeof(bool) ? (val == "1" || val == "true") : Convert.ChangeType(val, pi.PropertyType);
+    pi.SetValue(null, v);
+}
+
 void Exec(string line, StringBuilder o)
 {
     var a = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
     if (a.Length == 0) return;
     switch (a[0])
     {
+        case "set":
+        {
+            // set <Type.Prop> <value>: static property on the Vulkan model classes (internal ones included), int/bool.
+            Setp(a[1], a[2]);
+            o.AppendLine($"set {a[1]}={a[2]}");
+            break;
+        }
+        case "abfwd":
+        {
+            // abfwd <rows> <reps> <ctx> <Prop> <valA> <valB>: interleaved A/B of a 1..N-row forward in one process.
+            int rows = int.Parse(a[1]), reps = int.Parse(a[2]), ctx = int.Parse(a[3]);
+            Setp(a[4], a[5]); TimeFwd(rows, ctx, 1); Setp(a[4], a[6]); TimeFwd(rows, ctx, 1);
+            var ta = new List<double>(); var tb = new List<double>();
+            for (int i = 0; i < reps; i++)
+            {
+                Setp(a[4], a[5]); TimeFwd(rows, ctx, 2 + i); ta.Add(TimeFwd(rows, ctx, 2 + i));   // first call warms the PLE table pages for this seed
+                Setp(a[4], a[6]); tb.Add(TimeFwd(rows, ctx, 2 + i));
+            }
+            Setp(a[4], a[5]);
+            ta.Sort(); tb.Sort();
+            o.AppendLine($"abfwd rows={rows} ctx={ctx} {a[4]}: A={a[5]} min {ta[0]:F1} med {ta[ta.Count / 2]:F1} | B={a[6]} min {tb[0]:F1} med {tb[tb.Count / 2]:F1} ms");
+            break;
+        }
         case "smallrow":
             VulkanQwen4ExpTransformerModel.SmallRowGemv = a[1] == "1";
             o.AppendLine("smallrow " + a[1]);
@@ -378,6 +429,7 @@ void Exec(string line, StringBuilder o)
             int rows = int.Parse(a[1]), reps = int.Parse(a[2]), ctx = a.Length > 3 ? int.Parse(a[3]) : 16;
             TimeFwd(rows, ctx, 1);
             VulkanQwen4ExpTransformerModel.StageProfile = true;
+            VulkanQwen4ExpTransformerModel.StageTimestamps = Environment.GetEnvironmentVariable("PROBE_TS") == "1";
             model.TakeStageTimes();
             double tot = 0;
             var sums = new Dictionary<string, double>();
@@ -394,6 +446,7 @@ void Exec(string line, StringBuilder o)
                 foreach (var kv in model.TakeStageTimes()) sums[kv.Key] = sums.GetValueOrDefault(kv.Key) + kv.Value;
             }
             VulkanQwen4ExpTransformerModel.StageProfile = false;
+            VulkanQwen4ExpTransformerModel.StageTimestamps = false;
             o.AppendLine($"stage rows={rows} ctx={ctx} reps={reps}: forward {tot / reps:F1} ms, stages sum {sums.Values.Sum() / reps:F1} ms");
             foreach (var kv in sums.OrderByDescending(k => k.Value))
                 o.AppendLine($"   {kv.Key,-22} {kv.Value / reps,8:F2} ms");

@@ -490,15 +490,36 @@ public sealed class Qwen4ExpPleBranch
         int T = tokens.Length, row = _hc * _hidden, numHeads = NumHeads;
         if (residual.Length < (long)T * row) throw new ArgumentException("residual too small.", nameof(residual));
 
-        long[] rows = ArrayPool<long>.Shared.Rent(T * numHeads);
         float[] emb = ArrayPool<float>.Shared.Rent(T * numHeads * _rowDim);
         float[] key = ArrayPool<float>.Shared.Rent(T * row);
-        float[] query = ArrayPool<float>.Shared.Rent(T * row);
         float[] value = ArrayPool<float>.Shared.Rent(T * _hidden);
-        float[] gate = ArrayPool<float>.Shared.Rent(T * _hc);
-        float[] gated = ArrayPool<float>.Shared.Rent(T * row);
-        float[] normed = ArrayPool<float>.Shared.Rent(T * row);
-        float[] conv = ArrayPool<float>.Shared.Rent(T * row);
+        try
+        {
+            GatherEmbeddings(tokens, state, emb);
+            var embSpan = emb.AsSpan(0, T * numHeads * _rowDim);
+            _keyProj(embSpan, key.AsSpan(0, T * row), T);
+            _valueProj(embSpan, value.AsSpan(0, T * _hidden), T);
+            ApplyProjected(tokens, state, residual, key, value);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(emb); ArrayPool<float>.Shared.Return(key); ArrayPool<float>.Shared.Return(value);
+        }
+    }
+
+    /// <summary>Elements of the gathered embedding of <paramref name="tokens"/> tokens (<c>tokens * NumHeads * rowDim</c>).</summary>
+    public int EmbeddingLength(int tokens) => tokens * NumHeads * _rowDim;
+
+    /// <summary>
+    /// The token-id-only half of <see cref="Apply"/>: hashes the n-gram rows and gathers (dequantised, F32) the table rows into
+    /// <paramref name="emb"/> (<c>tokens * NumHeads * rowDim</c>, head-major per token). Collects an in-flight prefetch. Does NOT advance
+    /// <paramref name="state"/>; <see cref="ApplyProjected"/> does. A caller that projects <paramref name="emb"/> elsewhere (the Vulkan
+    /// decode path runs the two projections on the GPU before layer 0) feeds the results to <see cref="ApplyProjected"/>.
+    /// </summary>
+    public void GatherEmbeddings(ReadOnlySpan<int> tokens, Qwen4ExpPleState state, Span<float> emb)
+    {
+        int T = tokens.Length, numHeads = NumHeads;
+        long[] rows = ArrayPool<long>.Shared.Rent(T * numHeads);
         try
         {
             Qwen4ExpPle.BuildRowIndices(tokens, state.TokenHistory, _ngram, _headsPerNgram, _eos,
@@ -509,10 +530,26 @@ public sealed class Qwen4ExpPleBranch
                 pf.Gather(pending, rows.AsSpan(0, T * numHeads), emb);
             else
                 Qwen4ExpPle.GatherRows(_table, _tableQt, _tableRows, _rowDim, rows.AsSpan(0, T * numHeads), emb);
+        }
+        finally { ArrayPool<long>.Shared.Return(rows); }
+    }
 
-            var embSpan = emb.AsSpan(0, T * numHeads * _rowDim);
-            _keyProj(embSpan, key.AsSpan(0, T * row), T);
-            _valueProj(embSpan, value.AsSpan(0, T * _hidden), T);
+    /// <summary>
+    /// The residual-dependent half of <see cref="Apply"/>, given the key / value projections of the gathered embeddings:
+    /// <paramref name="key"/> <c>[tokens, hc*hidden]</c> (RAW, un-normalised; normed in place here) and <paramref name="value"/>
+    /// <c>[tokens, hidden]</c>. Adds the branch output to <paramref name="residual"/> and advances <paramref name="state"/>.
+    /// </summary>
+    public void ApplyProjected(ReadOnlySpan<int> tokens, Qwen4ExpPleState state, Span<float> residual, Span<float> key, ReadOnlySpan<float> value)
+    {
+        int T = tokens.Length, row = _hc * _hidden;
+        if (residual.Length < (long)T * row) throw new ArgumentException("residual too small.", nameof(residual));
+        float[] query = ArrayPool<float>.Shared.Rent(T * row);
+        float[] gate = ArrayPool<float>.Shared.Rent(T * _hc);
+        float[] gated = ArrayPool<float>.Shared.Rent(T * row);
+        float[] normed = ArrayPool<float>.Shared.Rent(T * row);
+        float[] conv = ArrayPool<float>.Shared.Rent(T * row);
+        try
+        {
             Qwen4ExpGatedResidual.GroupRmsNorm(key, _normKey, _hc, _hidden, _eps, key, T);
             Qwen4ExpGatedResidual.GroupRmsNorm(residual, _normQuery, _hc, _hidden, _eps, query, T);
 
@@ -532,9 +569,7 @@ public sealed class Qwen4ExpPleBranch
         }
         finally
         {
-            ArrayPool<long>.Shared.Return(rows);
-            ArrayPool<float>.Shared.Return(emb); ArrayPool<float>.Shared.Return(key); ArrayPool<float>.Shared.Return(query);
-            ArrayPool<float>.Shared.Return(value); ArrayPool<float>.Shared.Return(gate); ArrayPool<float>.Shared.Return(gated);
+            ArrayPool<float>.Shared.Return(query); ArrayPool<float>.Shared.Return(gate); ArrayPool<float>.Shared.Return(gated);
             ArrayPool<float>.Shared.Return(normed); ArrayPool<float>.Shared.Return(conv);
         }
     }
