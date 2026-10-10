@@ -111,8 +111,8 @@ internal readonly record struct Qwen4ExpResidencyPlan(
                 : Dequantize.RowByteSize(d.Shape[0], d.QuantizationType) * (elems / d.Shape[0]);
 
             if (name == Qwen4ExpTensors.PerLayerTokenEmbd) { hostOnly += packed; continue; }
-            // PLE projections / norms / conv run on the host branch; the dense indexer is not used by the V1 dense QSA fallback.
-            if (name.Contains(".ple_", StringComparison.Ordinal) || name.Contains(".indexer.", StringComparison.Ordinal))
+            // PLE projections / norms / conv run on the host branch. The QSA indexer projections are device weights (#819).
+            if (name.Contains(".ple_", StringComparison.Ordinal))
             { hostOnly += packed; continue; }
             if (name.Contains(".nextn.", StringComparison.Ordinal)) continue;   // MTP block: not loaded by V1
 
@@ -139,6 +139,19 @@ internal readonly record struct Qwen4ExpResidencyPlan(
     }
 
     /// <summary>
+    /// Device bytes of everything that grows with context for a sequence: the F32 K/V rows of the QSA layers plus the indexer's raw and
+    /// pooled keys (#819). Raw keys are one row per position, pooled keys one per block.
+    /// </summary>
+    public static long ContextBytes(ModelConfig config, int positions)
+    {
+        var layout = config.HybridLayout!;
+        long layers = layout.LayerKind.Count(k => k == HybridLayerKind.Attention);
+        long idx = config.Qwen4Exp is { } q4 && q4.IndexerBlockSize > 0
+            ? VulkanQwen4ExpIndexerState.BytesFor((int)layers, positions, q4.IndexerKeyLength, q4.IndexerBlockSize) : 0;
+        return KvBytes(config, positions) + idx;
+    }
+
+    /// <summary>
     /// Builds the plan for <paramref name="tensors"/> on a device with <paramref name="capacityBytes"/> resident capacity.
     /// </summary>
     public static Qwen4ExpResidencyPlan Create(
@@ -148,7 +161,7 @@ internal readonly record struct Qwen4ExpResidencyPlan(
         var (device, hostOnly) = EstimateWeights(tensors, config);
         // Scratch: the prefill chunk working set (routed-expert intermediates dominate) - a flat allowance plus per-position KV.
         long scratch = 1L << 30;
-        return new Qwen4ExpResidencyPlan(device, KvBytes(config, kvPositions) + scratch, hostOnly,
+        return new Qwen4ExpResidencyPlan(device, ContextBytes(config, kvPositions) + scratch, hostOnly,
             capacityBytes, headroomBytes ?? DefaultHeadroom(capacityBytes), physicalRamBytes);
     }
 }

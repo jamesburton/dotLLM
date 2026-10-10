@@ -1,0 +1,68 @@
+#version 450
+// Qwen4-Exp QSA indexer key pooling (issue #819).
+//
+// Block b of the pooled key cache is  rope(rmsnorm(mean(raw[b*R .. b*R+R-1])), position = b*R)
+// (pool BEFORE norm and rotation; mirrors Qwen4ExpIndexerCache.Append). One workgroup per block;
+// the raw keys are the un-normed, un-rotated indexer keys of every cached position, so a block is
+// a pure function of its R raw rows: rollback needs no state, a re-completed block is recomputed.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufRaw    { float raw[]; };     // [positions, dim]
+layout(set = 0, binding = 1, std430) readonly  buffer BufGamma  { float gamma[]; };   // [dim] folded (1+w)
+layout(set = 0, binding = 2, std430)           buffer BufPooled { float pooled[]; };  // [blocks, dim]
+
+layout(push_constant) uniform PushConstants {
+    uint  firstBlock;
+    uint  numBlocks;
+    uint  dim;
+    uint  ropeDim;
+    uint  blockSize;
+    float eps;
+    float theta;
+} pc;
+
+shared float vec[512];
+shared float red[128];
+
+void main() {
+    if (gl_WorkGroupID.x >= pc.numBlocks) return;
+    uint blk = pc.firstBlock + gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint dim = pc.dim;
+
+    float inv = 1.0 / float(pc.blockSize);
+    float ss = 0.0;
+    for (uint d = tid; d < dim; d += 128u) {
+        float m = raw[(blk * pc.blockSize) * dim + d];
+        for (uint j = 1u; j < pc.blockSize; j++) m += raw[(blk * pc.blockSize + j) * dim + d];
+        m *= inv;
+        vec[d] = m;
+        ss += m * m;
+    }
+    red[tid] = ss;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    float rinv = 1.0 / sqrt(red[0] / float(dim) + pc.eps);
+    barrier();
+    for (uint d = tid; d < dim; d += 128u) vec[d] = vec[d] * rinv * gamma[d];
+    barrier();
+
+    uint halfRope = pc.ropeDim >> 1u;
+    float pos = float(blk * pc.blockSize);
+    for (uint d = tid; d < dim; d += 128u) {
+        float outv = vec[d];
+        if (d < pc.ropeDim) {
+            uint pair = (d < halfRope) ? d : d - halfRope;
+            float freq = 1.0 / pow(pc.theta, float(2u * pair) / float(pc.ropeDim));
+            float angle = pos * freq;
+            float c = cos(angle), s = sin(angle);
+            if (d < halfRope) outv = vec[d] * c - vec[d + halfRope] * s;
+            else              outv = vec[d - halfRope] * s + vec[d] * c;
+        }
+        pooled[blk * dim + d] = outv;
+    }
+}

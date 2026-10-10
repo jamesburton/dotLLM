@@ -1130,7 +1130,16 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             positionOffset = 0;
         }
 
-        if (_kernels.SplitKvAttention is not null && seqLen == 1
+        // qwen4exp QSA hook (#819): maintains the indexer key cache and, past the dense limit, replaces the dense dispatch below.
+        // Null for every other architecture and for the MTP draft head, so their path is untouched.
+        bool hookHandled = Q4AttentionHook is { } hook && kvCache is VulkanNemotronHKvCache
+            && hook.RecordAttention(cmdBuf, absoluteLayerIdx, seqLen, positions, kSrc, vSrc);
+
+        if (hookHandled)
+        {
+            // AttnOutput written by the hook.
+        }
+        else if (_kernels.SplitKvAttention is not null && seqLen == 1
             && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
             && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads))
         {

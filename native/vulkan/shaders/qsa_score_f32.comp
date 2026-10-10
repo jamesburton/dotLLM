@@ -1,0 +1,56 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Qwen4-Exp QSA block scoring (issue #819): score(b) = sum_h relu(q_h . pooled_b) / sqrt(dim) for every complete block
+// visible to a query whose block count exceeds the budget (smaller queries attend every block and need no scores).
+// One workgroup per (128-block tile, query); a subgroup computes one block with lanes across the key dim (coalesced).
+
+#define TILE_BLOCKS 128
+#define MAX_Q 1024
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufIq     { float iq[]; };      // [T, heads*dim] normed + rotated
+layout(set = 0, binding = 1, std430) readonly  buffer BufPooled { float pooled[]; };  // [blocks, dim]
+layout(set = 0, binding = 2, std430) writeonly buffer BufScores { float scores[]; };  // [qCount, nbCap]
+
+layout(push_constant) uniform PushConstants {
+    uint  qBase;         // first query row (within the forward) of this sub-chunk
+    uint  qCount;
+    uint  firstPos;      // absolute position of forward row 0
+    uint  heads;
+    uint  dim;
+    uint  blockSize;
+    uint  budgetBlocks;
+    uint  nbCap;         // scores row stride
+    float invScale;      // 1/sqrt(dim)
+} pc;
+
+shared float qs[MAX_Q];
+
+void main() {
+    uint lq = gl_WorkGroupID.y;
+    uint tq = pc.qBase + lq;
+    uint p  = pc.firstPos + tq;
+    uint nb = (p + 1u) / pc.blockSize;
+    if (nb <= pc.budgetBlocks) return;
+    uint tileStart = gl_WorkGroupID.x * uint(TILE_BLOCKS);
+    if (tileStart >= nb) return;
+    uint tileEnd = min(tileStart + uint(TILE_BLOCKS), nb);
+
+    uint hd = pc.heads * pc.dim;
+    for (uint i = gl_LocalInvocationID.x; i < hd; i += 256u) qs[i] = iq[tq * hd + i];
+    barrier();
+
+    uint lane = gl_SubgroupInvocationID, sgSize = gl_SubgroupSize;
+    for (uint b = tileStart + gl_SubgroupID; b < tileEnd; b += gl_NumSubgroups) {
+        float s = 0.0;
+        for (uint h = 0u; h < pc.heads; h++) {
+            float part = 0.0;
+            for (uint d = lane; d < pc.dim; d += sgSize) part += qs[h * pc.dim + d] * pooled[b * pc.dim + d];
+            float dot = subgroupAdd(part);
+            if (dot > 0.0) s += dot;
+        }
+        if (subgroupElect()) scores[lq * pc.nbCap + b] = s * pc.invScale;
+    }
+}
