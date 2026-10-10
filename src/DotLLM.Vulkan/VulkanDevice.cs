@@ -1725,6 +1725,26 @@ public sealed class VulkanDevice : IDisposable
     /// <summary>Bytes that landed on each heap via the device-local fallback (not the preferred type).</summary>
     public long FallbackBytesOnHeap(int heap) => Interlocked.Read(ref _fallbackBytesByHeap[heap]);
 
+    /// <summary>Live bytes in the heaps that count toward <see cref="ResidentCapacityBytes"/>: every heap on an integrated GPU, device-local heaps only on a discrete one (#880).</summary>
+    internal unsafe long ResidentLiveBytes()
+    {
+        if (PhysicalDeviceTypeValue == VkPhysicalDeviceType.IntegratedGpu) return TotalLiveBytes();
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        byte* heaps = (byte*)mem.memoryHeaps;
+        long sum = 0;
+        for (uint i = 0; i < mem.memoryHeapCount && i < _liveBytesByHeap.Length; i++)
+            if ((*(uint*)(heaps + i * 16 + 8) & (uint)VkMemoryHeapFlags.DeviceLocal) != 0) sum += Interlocked.Read(ref _liveBytesByHeap[i]);
+        return sum;
+    }
+
+    /// <summary>Bytes of live buffers this process currently holds, summed over every memory heap (what the <c>[vulkan-mem]</c> diagnostic prints as <c>ours</c>).</summary>
+    public long TotalLiveBytes()
+    {
+        long sum = 0;
+        for (int h = 0; h < _liveBytesByHeap.Length; h++) sum += Interlocked.Read(ref _liveBytesByHeap[h]);
+        return sum;
+    }
+
     /// <summary>
     /// Live allocated bytes and allocation count per memory heap, maintained by
     /// <see cref="AllocateInternal"/> and <see cref="Buffer.Dispose"/>.

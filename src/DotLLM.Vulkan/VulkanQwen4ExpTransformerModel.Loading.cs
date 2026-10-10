@@ -150,6 +150,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
 
             model = new VulkanQwen4ExpTransformerModel(device, gguf, config, core, attnGr.ToArray(), ffnGr.ToArray(), head, moeBundles.ToArray(),
                 ple, pleLayer, owned, hostOnly, gr, groupRms, sigmoidGate, kvCapacity, weightBytes);
+            model._spvDir = spvDir;
             try
             {
                 model.EnsureScratch(plannedRows);   // the model's own (small) scratch too, so no forward up to plannedRows allocates anything

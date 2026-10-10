@@ -217,6 +217,10 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
             gdnCheckpoint = !rowSnapshots && targetModel.SupportsRecurrentStateCheckpoint
                 ? targetModel.CheckpointRecurrentState()
                 : null;
+            if (!rowSnapshots && gdnCheckpoint is null && targetModel.RequiresPerSequenceState && targetModel.SupportsRecurrentStateCheckpoint == false)
+                throw new NotSupportedException(
+                    $"{targetModel.GetType().Name} has a recurrent trunk but offers neither per-row snapshots nor a state checkpoint " +
+                    $"(DOTLLM_MTP_GDN_SNAPSHOTS=0?): a rejected draft would leave the recurrent state advanced past the committed text.");
 
             // ── Verify: ONE trunk forward over [lastToken, d1..dk] at position..position+k.
             //    Row i predicts the token after position+i, so it checks draft i+1; row k is the

@@ -504,3 +504,65 @@ decode: **0.6-0.7x, a slowdown, with the current kernels.** The shape of the cur
   (expert-grouped, reading each routed expert once per window). With the dense halves held near their T=1 cost and the MoE growing at the
   measured ~15 ms/row, 5 rows would land near 100 ms (1.7x) and K=4 MTP near 1.4x; that is a kernel project of its own and a prerequisite
   to building the Vulkan head, recurrent-state checkpoint/restore and the draft block on that backend.
+
+#### Vulkan qwen4exp MTP (issue #820, stage 2)
+
+`VulkanQwen4ExpTransformerModel` now carries the head (`AttachMtpHead`, auto-attached by `Qwen4ExpMtpHeadResolver` / `dotllm run` through
+`IMtpHeadAttachable`), per-row recurrent snapshots and the verify path; the engine's `MtpSpeculativeDecoder` drives it unchanged.
+
+**Design.** The head block runs on a one-layer `VulkanQwen3MoeHybridTransformerModel` (same QSA / 512-expert MoE kernels, own scratch, own dense
+K/V cells), the gated-residual plumbing on the trunk model's. `eh_proj` is split once at load into its embedding and hidden halves (row-wise block
+copies of the Q8_0 matrix) so the front is two plain matmuls + a broadcast + an add instead of a concatenation. The trunk residual rows never visit
+the host: the head state holds `Pending` (the head's next input, before its mixer), `Carry` (`R_{p-1}` for the next absorb, the #469 pairing) and the
+last 32 trunk rows; `SeedFromCapturedRow` is a queued device copy resolved by the next command buffer. Absorb (after every trunk forward that carries
+the state) writes K/V cells only (attention is computed and discarded; the head's MoE/mixer never run for absorbed cells).
+
+**Verify rows and exactness.** Verify runs `ForwardWithRecurrentSnapshots`: the GDN scan is swapped for its snapshot twin (bit-identical state
+evolution), each row's conv window is copied out of `ConvInput`, the n-gram branch records its hash window / conv history per row, and a rejection
+restores row `accepted` (a device copy, ~1.5 ms) instead of replaying a forward. **Accept rule (chosen):** the decoder emits the verify row's argmax
+for every position (a draft is accepted only when it equals it), so the output is the *verify path's* greedy. The multi-row kernels are not
+bit-identical to the 1-row decode (KL 2e-3..1.4e-2, #876), so a near-tie can resolve differently. Measured on the real file (stand-in head, so every
+round rejects and restores: the harshest case): identical to plain 1-row greedy in 6 of 10 runs (64 tokens each, 4 short prompts + 1K / 1.9K
+text, K = 2-4); the 4 divergences are near-ties of the 1-row logits (gaps 0.14, 0.14, 0.36 and 0.75 logits of a 31-38 logit range, 0.4-2.3 %;
+the two 0.14 ones are the same position reached at K = 4 and K = 3). Re-checking with a 1-row forward would cost a full decode per round, so it is
+not done.
+
+**Cost on the real file (UD-Q4_K_XL, Strix Halo, same process, plain and speculative interleaved, ratios not absolutes).** Draft step 4.5-5.5 ms
+(proxy measured before building: 4.2 ms + ~0.6 ms for `eh_proj` / Q8_0 experts; the 5.5 ms includes host argmax and the submit). Verify
+(`snap+mtp`, 5 rows, all logits): 107 ms at ctx < 100, 128 ms at 1K, 137 ms at 1.9K, against a 62 ms 1-row step (1.7x / 2.1x / 2.2x). Absorb 1-3 ms,
+restore 1.5 ms, snapshots + MTP bookkeeping +7 ms on the 5-row forward. Round times (K=4 / K=3 / K=2): 128 / - / - ms at short context, 152 / 128 / 110
+ms at 1K, 162 / - / 126 ms at 1.9K.
+
+**Projected throughput** (round times above; tokens per round from the CPU oracle's acceptance, 3.05 at K=4, and its geometric fit 2.73 / 2.31 at
+K=3 / 2, p = 0.75; the Vulkan head reproduces the oracle's drafts, argmax 16/16 on the synthetic tests, so acceptance transfers):
+
+| context | K=4 | K=3 | K=2 |
+|---|---|---|---|
+| short | 1.44x | - | - |
+| 1K | 1.27x (20.1 vs 15.9 tok/s) | 1.32x | 1.30x |
+| 1.9K | 1.19x | - | 1.15x |
+
+The 1.5x target is **not met on this box**. Where it goes (K=4, 1K): 21 ms drafting, 128 ms verifying 5 rows, 3 ms absorb, 2 ms restore, of a 152
+ms round that must beat 3.05 x 62 = 189 ms. The verify rows are the shortfall: MoE rows activate mostly different experts (10 of 512), so the expert
+read traffic is roughly linear in rows (`gate_up` + `down` +38 ms per 5-row forward in the split-submit profile), and the 12 QSA layers fall off the
+split-KV decode kernel onto the prefill flash kernel at `seqQ > 1` (up to +20 ms at 1K, more at 1.9K). Levers not taken: a split-KV attention variant
+with per-row query offsets, an expert-grouped verify GEMM, a multi-column Q6_K LM-head GEMV. The adaptive gate (`MtpGatePriorBytes`, re-measured per
+request) keeps MTP off whenever it is slower than plain decode.
+
+**An avoidable cost found on the way.** Reading back five logit rows from a device-local scratch went through a freshly allocated staging buffer on
+every call: +26 ms per verify (141 -> 115 ms for 5 rows). The all-rows logits scratch is now a host-readback buffer.
+
+**The real head does not fit next to this trunk on this box.** `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` needs ~2.6 GiB of device memory (without its own
+embedding / LM head) plus ~0.45 GiB of verify snapshots, and UD-Q4_K_XL (69.3 GiB) fills the 69.8 GiB device-local heap; measured headroom after
+the load is under 1 GiB and varies from run to run. A failed upload does not just fail: afterwards *every* allocation fails, including a 113 MiB
+sequence state. `AttachMtpHead` therefore refuses before touching the device, with numbers, when trunk + head + snapshots + KV/scratch exceed the
+device-local heap (`DOTLLM_VK_ALLOW_OVERCOMMIT=1` overrides); the CLI prints a warning and decodes plain. The residency work (#874, #880) is what
+would make the real head fit; until then the round times above come from a **stand-in head** (`AttachStandInMtpHead`, benchmarking only): the
+trunk's own QSA layer 3 with a random `eh_proj`, same per-step work as the real head, noise drafts (acceptance 1.0 token per round). Draft quality
+and the acceptance rate on Vulkan numerics are therefore *not* measured on the real file; the synthetic 512-expert tests pin Vulkan against the CPU
+oracle (draft logits relL2 5e-5 F32 / 1.4e-2 Q8, argmax 16/16, identical accepted counts per round).
+
+**n-gram table prefetch (#822) on Vulkan.** `PleRowPrefetcher` is called at the top of every forward (before the first embedding record) and, for
+MTP, after each draft step with the verify chunk's known prefix `[last token, d1 .. di]`. Cold 1K-token prefill of fresh ids, A/B/B/A in one process:
+**7.7-7.9 s with the prefetch vs 14.4-14.6 s without** (-6.7 s, 1.85x), matching the CPU measurement of 6.8 s of demand faults per 1K chunk.
+`DOTLLM_VK_Q4E_PREFETCH=0` turns it off (diagnostic).
