@@ -2138,7 +2138,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
 
         // Phase 3: routed gate/up + shared down. The multi-row variant (2 output rows per workgroup) is the measured decode win (#885).
         var gateUp = _kernels.MoeMmvqQ4K!;
-        if (EffMoeMrMinRows > 0 && SmallRowGemvEnabled && _kernels.MoeMmvqQ4KMr is { } q4Mr && (interm % q4Mr.RowsPerGroup) == 0)
+        bool mr = EffMoeMrMinRows > 0 && 1 >= EffMoeMrMinRows && SmallRowGemvEnabled;   // one decode row
+        if (mr && _kernels.MoeMmvqQ4KMr is { } q4Mr && (interm % q4Mr.RowsPerGroup) == 0)
         { gateUp = q4Mr; CountSmallRow(SmallRowPath.MoeQ4KMr); }
         gateUp.Record(cmdBuf, moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
             _state.MoeTopkIndices, _state.MoeGateInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
@@ -2157,7 +2158,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         // Phase 5: routed down.
         CountMoePath(MoePath.MmvqDown);
         if (IsLegacyQuant(moeW.W2QuantType)) CountMoePath(MoePath.MmvqLegacyDown);
-        RecordDownMmvq(cmdBuf, moeW.W2QuantType, moeW, hidden, interm, topK, numE, multiRow: EffMoeMrMinRows > 0 && SmallRowGemvEnabled);
+        RecordDownMmvq(cmdBuf, moeW.W2QuantType, moeW, hidden, interm, topK, numE, multiRow: mr);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("down");
 
