@@ -519,16 +519,67 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// <summary>Runtime switch for the split-submit stage timing (#876 probe; also on at startup via the env var). When on, token-mixing stages are timed at 1 row too.</summary>
     internal static bool StageProfileEnabled { get => MoeStageProfileEnabled; set => MoeStageProfileEnabled = value; }
     /// <summary>Accumulated per-stage wall ms since the last <see cref="TakeStageTimes"/>.</summary>
-    internal Dictionary<string, double> TakeStageTimes() { var d = new Dictionary<string, double>(_moeStageMs); _moeStageMs.Clear(); return d; }
+    internal Dictionary<string, double> TakeStageTimes()
+    {
+        if (_tsCount > 1) CollectStageTimestamps();
+        var d = new Dictionary<string, double>(_moeStageMs); _moeStageMs.Clear(); return d;
+    }
     internal void Q4Stage(string name) => MoeStage(name);
-    internal void Q4StageBegin() => MoeStageBegin();
+    /// <summary>Charges host-measured ms to a stage label (#885 diagnostic; only while stage profiling is on).</summary>
+    internal void Q4AddStageMs(string name, double ms) { if (MoeStageProfileEnabled) _moeStageMs[name] = _moeStageMs.GetValueOrDefault(name) + ms; }
+    internal bool Q4StageProfiling => MoeStageProfileEnabled;
+    internal void Q4StageBegin() { if (StageTimestamps && MoeStageProfileEnabled) TsBegin(); else MoeStageBegin(); }
     private readonly Dictionary<string, double> _moeStageMs = new();
     private long _moeStageLast;
 
+    // GPU-timestamp stage mode (#885): DOTLLM_VK_STAGE_TS=1 or StageTimestamps=true. Instead of submit+wait per stage (which pays ~50 us of
+    // fence round trip each and distorts a 2000-dispatch decode), each stage writes a BOTTOM_OF_PIPE timestamp into the one command buffer
+    // and the delta to the previous stamp is charged to the stage label. The run keeps its real submission structure.
+    internal static bool StageTimestamps { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_STAGE_TS") == "1";
+    private const int TsMax = 8192;
+    private nint _tsPool;
+    private int _tsCount;
+    private readonly string[] _tsLabels = new string[TsMax];
+    private readonly ulong[] _tsScratch = new ulong[TsMax];
+
+    private void TsStamp(string label)
+    {
+        if (_tsPool == 0 || _tsCount >= TsMax) return;
+        _tsLabels[_tsCount] = label;
+        VulkanApi.vkCmdWriteTimestamp(_submit.CommandBuffer, VkPipelineStageFlags.BottomOfPipe, _tsPool, (uint)_tsCount++);
+    }
+
+    private unsafe void CollectStageTimestamps()
+    {
+        int n = _tsCount; _tsCount = 0;
+        fixed (ulong* p = _tsScratch)
+        {
+            if (VulkanApi.vkGetQueryPoolResults(_device.Handle, _tsPool, 0, (uint)n, (nuint)(n * sizeof(ulong)), (nint)p, sizeof(ulong), flags: 0x1 | 0x2) < 0) return;
+        }
+        double toMs = _device.TimestampPeriodNs / 1_000_000.0;
+        for (int i = 1; i < n; i++)
+            _moeStageMs[_tsLabels[i]] = _moeStageMs.GetValueOrDefault(_tsLabels[i]) + (_tsScratch[i] - _tsScratch[i - 1]) * toMs;
+    }
+
     private void MoeStageBegin()
     {
-        if (!MoeStageProfileEnabled) return;
+        if (!MoeStageProfileEnabled || StageTimestamps) return;
         _moeStageLast = System.Diagnostics.Stopwatch.GetTimestamp();
+    }
+
+    private void TsBegin()
+    {
+        {
+            if (_tsPool == 0)
+            {
+                var qci = new VkQueryPoolCreateInfo { sType = 11, queryType = 2, queryCount = TsMax };
+                if (VulkanApi.vkCreateQueryPool(_device.Handle, qci, 0, out _tsPool) < 0) { _tsPool = 0; return; }
+            }
+            if (_tsCount > 1) CollectStageTimestamps();
+            _tsCount = 0;
+            VulkanApi.vkCmdResetQueryPool(_submit.CommandBuffer, _tsPool, 0, TsMax);
+            TsStamp("~begin");
+        }
     }
 
     /// <summary>Token-mixing stage marker: only meaningful on the per-layer-submit prefill path (never inside the fused decode buffer).</summary>
@@ -540,6 +591,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private void MoeStage(string name)
     {
         if (!MoeStageProfileEnabled) return;
+        if (StageTimestamps) { TsStamp(name); return; }
         KernelSupport.ComputeToHostBarrier(_submit.CommandBuffer);
         _submit.SubmitAndWait();
         long now = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -1839,6 +1891,15 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         int expandedRows = seqLen * topK;
         MoeStageBegin();
 
+        // qwen4exp (no post-attention norm): the block input is already in NormOutput. Single-token decode on the fused indexed-MMVQ chain (#885);
+        // everything else stages a copy for the serial shared expert (the routed scatter overwrites NormOutput).
+        if (postAttnNormWeight is null)
+        {
+            if (CanRecordMoeDecodeQ4E(moeW, seqLen, hidden)) { RecordMoeDecodeQ4E(cmdBuf, moeW, hidden); return; }
+            RecordCopyBufferRange(cmdBuf, _state.NormOutput, _state.MoeSharedInput, 0, 0, (ulong)((long)seqLen * hidden * sizeof(float)));
+            KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+        }
+
         // 1. Router gate logits.
         RecordMatmul(cmdBuf, moeW.Gate, QuantizationType.F32,
             _state.NormOutput, _state.MoeRouterLogits,
@@ -1910,7 +1971,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             // Decode-sized batches: the coalesced subgroup-per-cell MMVQ GEMV instead of the one-thread-per-cell MMQ.
             var gateUpMmvq = decodeMmvq ? _kernels.MoeMmvqQ4K : null;
             // #876: 2..15-token steps use the multi-row variant (same per-row accumulation order, NR output rows per workgroup; a few ULP from the one-row kernel).
-            if (gateUpMmvq is not null && MoeMrMinRows > 0 && seqLen >= MoeMrMinRows && SmallRowGemvEnabled && _kernels.MoeMmvqQ4KMr is { } q4Mr && (interm % q4Mr.RowsPerGroup) == 0)
+            if (gateUpMmvq is not null && EffMoeMrMinRows > 0 && seqLen >= EffMoeMrMinRows && SmallRowGemvEnabled && _kernels.MoeMmvqQ4KMr is { } q4Mr && (interm % q4Mr.RowsPerGroup) == 0)
             { gateUpMmvq = q4Mr; CountSmallRow(SmallRowPath.MoeQ4KMr); }
             if (gateUpMmvq is not null)
             {
@@ -1969,7 +2030,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             CountMoePath(MoePath.MmvqDown);
             if (IsLegacyQuant(moeW.W2QuantType)) CountMoePath(MoePath.MmvqLegacyDown);
-            RecordDownMmvq(cmdBuf, moeW.W2QuantType, moeW, hidden, interm, expandedRows, numE, multiRow: MoeMrMinRows > 0 && seqLen >= MoeMrMinRows && SmallRowGemvEnabled);
+            RecordDownMmvq(cmdBuf, moeW.W2QuantType, moeW, hidden, interm, expandedRows, numE, multiRow: EffMoeMrMinRows > 0 && seqLen >= EffMoeMrMinRows && SmallRowGemvEnabled);
         }
         else if (useDownMmq)
         {
@@ -2011,6 +2072,104 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             RecordSharedExpert(cmdBuf, moeW, postAttnNormWeight, seqLen, hidden, eps);
             MoeStage("shared_expert");
         }
+    }
+
+    /// <summary>
+    /// qwen4exp single-token MoE decode on the fused chain (#885), the no-post-attention-norm twin of <see cref="RecordMoeDecodeFast"/>.
+    /// On by default; <c>DOTLLM_VK_Q4E_MOE_FUSED=0</c> (or setting this) restores the general serial path.
+    /// </summary>
+    internal static bool Q4MoeDecodeFused { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_MOE_FUSED") != "0";
+
+    /// <summary>Test hook (#885): MoE layers recorded on the fused qwen4exp decode chain.</summary>
+    internal long Q4MoeFusedLayers { get; private set; }
+
+    /// <summary>
+    /// One decode row, resident Q4_K gate/up (indexed MMVQ with the broadcast folded in as xDiv), any MMVQ-capable down bank (K-quants and the
+    /// legacy Q5_1 / Q8_0 of the real file), and a sigmoid-gated shared expert. Layers outside that (UD-Q4_K_XL layer 2 has Q5_K gate/up) keep the general path.
+    /// </summary>
+    private bool CanRecordMoeDecodeQ4E(VulkanQwen3MoeMoeUpload.LayerBundle moeW, int seqLen, int hidden)
+        => Q4MoeDecodeFused && seqLen == 1 && seqLen < GroupedMinTokens
+            && _kernels.QuantizeQ8_1RowsActivations is not null && _kernels.SwiGluQuantizeFused is not null && _kernels.MoeMmvqQ4K is not null
+            && moeW.W1QuantType == QuantizationType.Q4_K && moeW.W3QuantType == QuantizationType.Q4_K
+            && DownMmvqFits(moeW.W2QuantType, moeW.IntermediateSize)
+            && moeW.HasSharedExpert && moeW.SharedExpertGate is not null && moeW.SharedGate is not null && moeW.SharedUp is not null && moeW.SharedDown is not null
+            && (hidden % 256) == 0 && (moeW.IntermediateSize % 32) == 0
+            && QuantizeQ8_1RowsKernel.PackedBytes(moeW.NumExpertsPerTok, moeW.IntermediateSize) <= _state.MoeSiluInterXq.Size;
+
+    private void RecordMoeDecodeQ4E(nint cmdBuf, VulkanQwen3MoeMoeUpload.LayerBundle moeW, int hidden)
+    {
+        int interm = moeW.IntermediateSize;
+        int numE = moeW.NumExperts;
+        int topK = moeW.NumExpertsPerTok;
+        int sharedI = moeW.SharedIntermediateSize;
+        Q4MoeFusedLayers++;
+        CountMoePath(MoePath.FusedDecode);
+        MoeStageBegin();
+
+        // Phase 0: quantize the single block-input row once (the indexed MMVQ reads it for every topK slot via xDiv).
+        _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf, _state.NormOutput, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, n: 1, k: hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("quantize_x");
+
+        // Phase 1: router + the shared-expert gate/up (Q8_0 raw copies read the quantized row; otherwise the F32/F16 matmul reads NormOutput) + gate logit.
+        RecordMatmul(cmdBuf, moeW.Gate, QuantizationType.F32, _state.NormOutput, _state.MoeRouterLogits, outputDim: numE, inputDim: hidden, seqLen: 1);
+        if (moeW.SharedGateQ8 is not null && moeW.SharedUpQ8 is not null && _kernels.MatMulQ8Mmvq is not null)
+        {
+            RecordMatmul(cmdBuf, moeW.SharedGateQ8, QuantizationType.Q8_0, _state.NormOutput, _state.MoeSharedGate,
+                outputDim: sharedI, inputDim: hidden, seqLen: 1, xqReady: true);
+            RecordMatmul(cmdBuf, moeW.SharedUpQ8, QuantizationType.Q8_0, _state.NormOutput, _state.MoeSharedUp,
+                outputDim: sharedI, inputDim: hidden, seqLen: 1, xqReady: true);
+        }
+        else
+        {
+            RecordMatmul(cmdBuf, moeW.SharedGate!, moeW.SharedQuantType, _state.NormOutput, _state.MoeSharedGate, outputDim: sharedI, inputDim: hidden, seqLen: 1);
+            RecordMatmul(cmdBuf, moeW.SharedUp!, moeW.SharedQuantType, _state.NormOutput, _state.MoeSharedUp, outputDim: sharedI, inputDim: hidden, seqLen: 1);
+        }
+        RecordMatmul(cmdBuf, moeW.SharedExpertGate!, QuantizationType.F32, _state.NormOutput, _state.MoeSharedGateLogits, outputDim: 1, inputDim: hidden, seqLen: 1);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("router");
+
+        // Phase 2: top-k routing + shared SwiGLU.
+        _kernels.MoeTopkSoftmax.Record(cmdBuf, _state.MoeRouterLogits, _state.MoeTopkIndices, _state.MoeTopkWeights,
+            seqLen: 1, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
+        _kernels.SwiGlu.Record(cmdBuf, _state.MoeSharedGate, _state.MoeSharedUp, _state.MoeSharedSilu, n: sharedI);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("topk");
+
+        // Phase 3: routed gate/up + shared down. The multi-row variant (2 output rows per workgroup) is the measured decode win (#885).
+        var gateUp = _kernels.MoeMmvqQ4K!;
+        bool mr = EffMoeMrMinRows > 0 && 1 >= EffMoeMrMinRows && SmallRowGemvEnabled;   // one decode row
+        if (mr && _kernels.MoeMmvqQ4KMr is { } q4Mr && (interm % q4Mr.RowsPerGroup) == 0)
+        { gateUp = q4Mr; CountSmallRow(SmallRowPath.MoeQ4KMr); }
+        gateUp.Record(cmdBuf, moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+            _state.MoeTopkIndices, _state.MoeGateInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
+        gateUp.Record(cmdBuf, moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+            _state.MoeTopkIndices, _state.MoeUpInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
+        RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType, _state.MoeSharedSilu, _state.MoeSharedSumA, outputDim: hidden, inputDim: sharedI, seqLen: 1);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("gate_up");
+
+        // Phase 4: routed SwiGLU fused with the Q8_1 quantize feeding the down projection.
+        _kernels.SwiGluQuantizeFused!.Record(cmdBuf, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter,
+            _state.MoeSiluInterXq, _state.MoeSiluInterXds, n: topK * interm);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("swiglu");
+
+        // Phase 5: routed down.
+        CountMoePath(MoePath.MmvqDown);
+        if (IsLegacyQuant(moeW.W2QuantType)) CountMoePath(MoePath.MmvqLegacyDown);
+        RecordDownMmvq(cmdBuf, moeW.W2QuantType, moeW, hidden, interm, topK, numE, multiRow: mr);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("down");
+
+        // Phase 6: weighted scatter into NormOutput (every NormOutput reader finished in phase 1), then the shared sigmoid-gated add.
+        _kernels.MoeWeightedScatter.Record(cmdBuf, _state.MoeDownRows, _state.MoeTopkWeights, _state.NormOutput, seqLen: 1, topK: topK, hiddenSize: hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("weighted_scatter");
+        _kernels.MoeSigmoidGatedAdd.Record(cmdBuf, output: _state.NormOutput, b: _state.MoeSharedSumA, gateLogits: _state.MoeSharedGateLogits,
+            seqLen: 1, hiddenSize: hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("shared_expert");
     }
 
     /// <summary>
@@ -2181,6 +2340,13 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
 
     /// <summary>Runtime switch for the 2..8-row multi-column GEMVs (#876); <c>DOTLLM_VK_SMALLROW_GEMV=0</c> at startup disables (A/B and diagnostics).</summary>
     internal static bool SmallRowGemvEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_SMALLROW_GEMV") != "0";
+
+    /// <summary>
+    /// qwen4exp opt-in (#885): single-token decode takes the multi-row routed-MoE MMVQs (Q4_K gate/up NR=2, Q5_1 down NR=4) - 56.7 -> 52.5 ms per 1-row
+    /// forward on the real UD-Q4_K_XL file (interleaved same-process A/B). Other MoE models keep the static default (not measured there).
+    /// </summary>
+    internal bool Q4DecodeMr { get; set; }
+    private int EffMoeMrMinRows => MoeMrMinRows > 0 && Q4DecodeMr ? 1 : MoeMrMinRows;
 
     /// <summary>Smallest token count that takes the multi-row routed-MoE MMVQ variants (#876); 0 = never (A/B). Default 2 leaves single-token decode on the proven kernels (DOTLLM_VK_MOE_MR_MIN_ROWS=1 opts decode in: -9% 1-row forward on the real qwen4exp file).</summary>
     internal static int MoeMrMinRows { get; set; } =
