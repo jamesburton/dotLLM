@@ -51,6 +51,19 @@ public sealed class TopPSampler : ISamplerStep
             return;
 
         int vocabSize = logits.Length;
+
+        // Fast path: an earlier step (top-k, min-p, logit bias) usually leaves a few dozen finite logits. Masked entries
+        // have probability exactly 0 and sit below every finite entry, so only the finite ones can be inside the nucleus and
+        // sorting/softmaxing just those is equivalent to the full-vocabulary pass.
+        int finite = 0;
+        for (int i = 0; i < vocabSize; i++)
+            if (logits[i] != float.NegativeInfinity) finite++;
+        if (finite > 0 && finite <= vocabSize / 8)
+        {
+            ApplyCompact(logits, topP, finite);
+            return;
+        }
+
         float[] rentedProbs = ArrayPool<float>.Shared.Rent(vocabSize);
         ulong[] rentedKeys = ArrayPool<ulong>.Shared.Rent(vocabSize);
         bool[] rentedKeep = ArrayPool<bool>.Shared.Rent(vocabSize);
@@ -105,6 +118,49 @@ public sealed class TopPSampler : ISamplerStep
             ArrayPool<float>.Shared.Return(rentedProbs);
             ArrayPool<ulong>.Shared.Return(rentedKeys);
             ArrayPool<bool>.Shared.Return(rentedKeep);
+        }
+    }
+
+    /// <summary>Top-P over the <paramref name="finite"/> unmasked logits only; same ordering and tie-breaking as the dense path.</summary>
+    private static void ApplyCompact(Span<float> logits, float topP, int finite)
+    {
+        float[] rentedVals = ArrayPool<float>.Shared.Rent(finite);
+        float[] rentedProbs = ArrayPool<float>.Shared.Rent(finite);
+        ulong[] rentedKeys = ArrayPool<ulong>.Shared.Rent(finite);
+        try
+        {
+            var vals = rentedVals.AsSpan(0, finite);
+            var probs = rentedProbs.AsSpan(0, finite);
+            int n = 0;
+            for (int i = 0; i < logits.Length; i++)
+            {
+                if (logits[i] == float.NegativeInfinity) continue;
+                vals[n] = logits[i];
+                rentedKeys[n++] = (uint)i; // token id parked in the low bits until probabilities are known
+            }
+            TensorPrimitives.SoftMax(vals, probs);
+            for (int j = 0; j < finite; j++)
+            {
+                Debug.Assert(!float.IsNaN(probs[j]), "TopPSampler: probabilities must not contain NaN");
+                rentedKeys[j] = ((ulong)BitConverter.SingleToUInt32Bits(probs[j]) << 32) | ~(uint)rentedKeys[j];
+            }
+            Array.Sort(rentedKeys, 0, finite);
+
+            float cumulative = 0f;
+            int keepStart = 0;
+            for (int i = finite - 1; i >= 0; i--)
+            {
+                cumulative += BitConverter.UInt32BitsToSingle((uint)(rentedKeys[i] >> 32));
+                if (cumulative >= topP) { keepStart = i; break; }
+            }
+            for (int i = 0; i < keepStart; i++)
+                logits[TokenIdOf(rentedKeys[i])] = float.NegativeInfinity;
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(rentedVals);
+            ArrayPool<float>.Shared.Return(rentedProbs);
+            ArrayPool<ulong>.Shared.Return(rentedKeys);
         }
     }
 

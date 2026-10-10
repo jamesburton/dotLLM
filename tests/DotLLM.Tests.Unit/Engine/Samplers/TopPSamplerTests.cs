@@ -137,4 +137,38 @@ public class TopPSamplerTests
 
         Assert.Equal(Run(), Run());
     }
+
+    /// <summary>
+    /// The sparse fast path (few finite logits after top-k) must keep exactly the tokens the dense full-vocabulary path keeps,
+    /// ties included. The dense arm is the same finite values packed into a vocabulary small enough to force the dense path.
+    /// </summary>
+    [Theory]
+    [InlineData(0.5f)]
+    [InlineData(0.9f)]
+    [InlineData(0.95f)]
+    [InlineData(0.999f)]
+    public void Apply_SparseFastPath_KeepsSameTokensAsDensePath(float topP)
+    {
+        var rng = new Random(11);
+        var ctx = new SamplerContext(Temperature: 1.0f, TopK: 0, TopP: topP, MinP: 0f, Seed: null);
+        for (int trial = 0; trial < 300; trial++)
+        {
+            int finite = 8 + rng.Next(60);
+            var values = new float[finite];
+            for (int j = 0; j < finite; j++)
+                values[j] = rng.Next(4) == 0 && j > 0 ? values[j - 1] : (float)(rng.NextDouble() * 6 - 3); // plant exact ties
+
+            var sparse = new float[8192];
+            Array.Fill(sparse, float.NegativeInfinity);
+            var positions = Enumerable.Range(0, sparse.Length).OrderBy(_ => rng.Next()).Take(finite).OrderBy(x => x).ToArray();
+            for (int j = 0; j < finite; j++) sparse[positions[j]] = values[j];
+            var dense = (float[])values.Clone();
+
+            _sampler.Apply(sparse, ctx);
+            _sampler.Apply(dense, ctx);
+
+            for (int j = 0; j < finite; j++)
+                Assert.Equal(float.IsNegativeInfinity(dense[j]), float.IsNegativeInfinity(sparse[positions[j]]));
+        }
+    }
 }
