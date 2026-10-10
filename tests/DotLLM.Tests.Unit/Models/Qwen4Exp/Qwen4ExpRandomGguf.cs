@@ -63,6 +63,8 @@ internal sealed record Q4eQuant
         ExpertGateUp = QuantizationType.Q4_K, ExpertDown = QuantizationType.Q5_1, Proj = QuantizationType.Q8_0,
         HcDown = QuantizationType.Q4_K, Embed = QuantizationType.Q8_0, Table = QuantizationType.F16, Indexer = QuantizationType.BF16,
     };
+    /// <summary>The real UD-Q4_K_XL layer 2 (#821): Q5_K gate/up experts with a Q8_0 down (it fell off the grouped prefill path).</summary>
+    public static Q4eQuant RealMixQ5KQ80 => RealMixQ51 with { ExpertGateUp = QuantizationType.Q5_K, ExpertDown = QuantizationType.Q8_0 };
     /// <summary>The real UD-Q4_K_XL mix's Q8_0-down layers (#849): Q4_K gate/up, Q8_0 down.</summary>
     public static Q4eQuant RealMixQ80 => RealMixQ51 with { ExpertDown = QuantizationType.Q8_0 };
     public static Q4eQuant KQuant => new()
@@ -79,6 +81,63 @@ internal sealed record Q4eQuant
 /// </summary>
 internal static class Qwen4ExpRandomGguf
 {
+    /// <summary>
+    /// Test-only Q5_K encoder (the shipped quantizer writes Q4_K): 8 sub-blocks of 32 with a 6-bit scale and a 6-bit min each, 5-bit values,
+    /// ggml layout (d, dmin, 12 packed scale bytes, qh[32], qs[128]); x ~ d*sc*q - dmin*m.
+    /// </summary>
+    internal static byte[] EncodeQ5K(float[] x)
+    {
+        const int BlockBytes = 176;
+        int nb = x.Length / 256;
+        var outp = new byte[nb * BlockBytes];
+        var scale = new float[8]; var min = new float[8]; var sc = new byte[8]; var mn = new byte[8];
+        for (int b = 0; b < nb; b++)
+        {
+            var blk = x.AsSpan(b * 256, 256);
+            for (int j = 0; j < 8; j++)
+            {
+                float lo = 0f, hi = float.MinValue;   // min is clamped to <= 0 so a zero maps to q*scale - min >= 0
+                for (int i = 0; i < 32; i++) { float v = blk[32 * j + i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+                if (hi < 0) hi = 0;
+                scale[j] = (hi - lo) / 31f; min[j] = -lo;
+            }
+            float maxScale = 0, maxMin = 0;
+            for (int j = 0; j < 8; j++) { maxScale = MathF.Max(maxScale, scale[j]); maxMin = MathF.Max(maxMin, min[j]); }
+            float d = maxScale > 0 ? maxScale / 63f : 0f, dmin = maxMin > 0 ? maxMin / 63f : 0f;
+            Half dh = (Half)d, dminh = (Half)dmin;
+            d = (float)dh; dmin = (float)dminh;
+            for (int j = 0; j < 8; j++)
+            {
+                sc[j] = (byte)(d > 0 ? Math.Clamp((int)MathF.Round(scale[j] / d), 0, 63) : 0);
+                mn[j] = (byte)(dmin > 0 ? Math.Clamp((int)MathF.Round(min[j] / dmin), 0, 63) : 0);
+            }
+            var o = outp.AsSpan(b * BlockBytes, BlockBytes);
+            BitConverter.TryWriteBytes(o[0..2], dh); BitConverter.TryWriteBytes(o[2..4], dminh);
+            var q = o.Slice(4, 12);
+            for (int j = 0; j < 4; j++) { q[j] = (byte)(sc[j] & 63); q[j + 4] = (byte)(mn[j] & 63); }
+            for (int j = 4; j < 8; j++)
+            {
+                q[j + 4] = (byte)((sc[j] & 0xF) | ((mn[j] & 0xF) << 4));
+                q[j - 4] |= (byte)((sc[j] >> 4) << 6);
+                q[j] |= (byte)((mn[j] >> 4) << 6);
+            }
+            var qh = o.Slice(16, 32); var qs = o.Slice(48, 128);
+            for (int j = 0; j < 8; j++)
+            {
+                float step = d * sc[j], off = dmin * mn[j];
+                for (int i = 0; i < 32; i++)
+                {
+                    int v = step > 0 ? Math.Clamp((int)MathF.Round((blk[32 * j + i] + off) / step), 0, 31) : 0;
+                    int grp = j >> 1, hiHalf = j & 1;          // 64-element group; low or high 32 of it
+                    int qsIdx = 32 * grp + i;
+                    if (hiHalf == 0) qs[qsIdx] = (byte)((qs[qsIdx] & 0xF0) | (v & 0xF)); else qs[qsIdx] = (byte)((qs[qsIdx] & 0x0F) | ((v & 0xF) << 4));
+                    if ((v & 16) != 0) qh[i] |= (byte)(1 << (2 * grp + hiHalf));
+                }
+            }
+        }
+        return outp;
+    }
+
     /// <summary>
     /// A STANDALONE MTP-head file (#820) for the same geometry: only <c>blk.{Layers}.*</c> (a QSA + MoE block with its gated-residual modules)
     /// and the <c>nextn.*</c> tensors, like the released <c>mtp-*.gguf</c>. Pair it with <see cref="Build"/> of the same geometry as the trunk.
@@ -183,6 +242,7 @@ internal static class Qwen4ExpRandomGguf
                 for (int i = 0; i < data.Length; i++)
                     BitConverter.TryWriteBytes(bytes.AsSpan(2 * i), (Half)data[i]);
             }
+            else if (qt == QuantizationType.Q5_K) bytes = EncodeQ5K(data);
             else bytes = Quantize.FromFloat32(data, data.Length, qt);
             w.AddTensor(name, dims, (uint)qt, bytes);
         }

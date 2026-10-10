@@ -108,7 +108,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private readonly VulkanDevice.Buffer? _moeUnitScale;
 
     /// <summary>Which routed-MoE fast paths were RECORDED (test hook: proves a branch was taken, not merely that a kernel exists).</summary>
-    internal enum MoePath { GroupedPrefill, GroupedLegacyDown, MmvqDown, MmvqLegacyDown, FusedDecode }
+    internal enum MoePath { GroupedPrefill, GroupedGateUpNotQ4K, GroupedLegacyDown, MmvqDown, MmvqLegacyDown, FusedDecode }
     internal readonly long[] MoePathCounts = new long[Enum.GetValues<MoePath>().Length];
 
     /// <summary>Record-time counters for the 2..8-row fast paths (#876): prove a fast path ran by counting, not by IsSupported.</summary>
@@ -1691,6 +1691,23 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         _ => null,
     };
 
+    /// <summary>
+    /// Grouped coopmat kernel for a gate/up bank of type <paramref name="qt"/> (#821): Q4_K plus the Q5_K/Q6_K kernels the down projection already
+    /// uses (UD-Q4_K_XL layer 2 has Q5_K gate/up and used to fall off the grouped path onto the scalar indexed kernels - half the prefill time).
+    /// <paramref name="sixteenRow"/> selects the 16-row twin a legacy-quant down (16-row tiles only) shares its tile list with; null when none exists.
+    /// </summary>
+    private MoeGroupedMatmulKQuantCoopmatKernel? GroupedGateUpKernel(QuantizationType qt, bool sixteenRow)
+    {
+        var k = qt switch
+        {
+            QuantizationType.Q4_K => sixteenRow && _kernels.MoeGroupedQ4K16 is not null ? _kernels.MoeGroupedQ4K16 : _kernels.MoeGroupedQ4K,
+            QuantizationType.Q5_K => sixteenRow && _kernels.MoeGroupedQ5K16 is not null ? _kernels.MoeGroupedQ5K16 : _kernels.MoeGroupedQ5K,
+            QuantizationType.Q6_K => _kernels.MoeGroupedQ6K,
+            _ => null,
+        };
+        return k;
+    }
+
     private MoeGroupedMatmulLegacyQuantCoopmatKernel? GroupedLegacyDownKernel(QuantizationType qt) => qt switch
     {
         QuantizationType.Q5_1 => _kernels.MoeGroupedQ5_1,
@@ -1742,7 +1759,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         var legacyDown = GroupedLegacyDownKernel(moeW.W2QuantType);
         CountMoePath(MoePath.GroupedPrefill);
         if (legacyDown is not null) CountMoePath(MoePath.GroupedLegacyDown);
-        var gateUpKernel = legacyDown is not null && _kernels.MoeGroupedQ4K16 is not null ? _kernels.MoeGroupedQ4K16 : _kernels.MoeGroupedQ4K!;
+        if (moeW.W1QuantType != QuantizationType.Q4_K) CountMoePath(MoePath.GroupedGateUpNotQ4K);
+        var gateUpKernel = GroupedGateUpKernel(moeW.W1QuantType, sixteenRow: legacyDown is not null)!;
         var downKernel = GroupedDownKernel(moeW.W2QuantType);
         int downMTiles = downKernel?.MTiles(hidden) ?? legacyDown!.MTiles(hidden);
         var tileBuild = _kernels.MoeBuildTileList;
@@ -1838,9 +1856,10 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         // Issue #637: prefill batches group the routed rows by expert and run each expert's weights through a coopmat GEMM once per
         // 16-row tile (the indexed kernels below re-read an expert's weights for every routed row). Resident Q4_K gate/up + Q5_K/Q6_K down only (UD-Q4_K_M mixes both down types).
         bool grouped = seqLen >= GroupedMinTokens
-            && _kernels.MoeGroupedQ4K is not null && GroupedDownFits(moeW.W2QuantType, interm)
+            && GroupedGateUpKernel(moeW.W1QuantType, sixteenRow: GroupedLegacyDownKernel(moeW.W2QuantType) is not null) is { } guKernel
+            && (GroupedLegacyDownKernel(moeW.W2QuantType) is null || guKernel.RowTile == 16) && moeW.W1QuantType == moeW.W3QuantType
+            && GroupedDownFits(moeW.W2QuantType, interm)
             && _kernels.MoeExpertOffsets is not null && _kernels.MoeExpandGroupByExpert is not null && _kernels.MoeUngroupScatter is not null
-            && moeW.W1QuantType == QuantizationType.Q4_K && moeW.W3QuantType == QuantizationType.Q4_K
             && (hidden % 256) == 0;
         // Fused glue: gather the token rows straight into expert order (no broadcast pass) and combine straight from the grouped down
         // output (no ungroup pass). DOTLLM_VK_MOE_FUSED_GLUE=0 restores broadcast + expand + ungroup + scatter.
