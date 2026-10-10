@@ -105,6 +105,37 @@ public static class GgufReader
     }
 
     /// <summary>
+    /// Resolves the GGUF type-id 42 collision in favour of upstream ggml <c>Q2_0</c> where the bytes say so (#823). A tensor read as
+    /// <see cref="QuantizationType.PQ2_0"/> (id 42) whose on-disk extent does NOT fit the PQ2_0 byte count (the distance to the next tensor
+    /// offset is at least one alignment larger) but DOES fit the upstream Q2_0 count (64-element blocks, 18 B each, 2.25 bpw vs 2.125) is
+    /// re-labelled <see cref="QuantizationType.Q2_0"/>. Tensors that fit PQ2_0 (every pristine PrismML tensor, and any ambiguous tiny
+    /// one) are left alone, and whatever still fits neither is rejected afterwards by <see cref="ValidatePq2_0Layout"/> with the existing
+    /// message. Real example: the ISTA Qwen3.8-Flash-Next GSQ-RCO IQ2_XS / IQ3_XXS files store their expert down banks as id 42 at exactly
+    /// 2.25 bits per weight.
+    /// </summary>
+    public static void ReclassifyUpstreamQ2_0(List<GgufTensorDescriptor> tensors, uint alignment, long dataSectionLength)
+    {
+        List<ulong>? offsets = null;
+        for (int i = 0; i < tensors.Count; i++)
+        {
+            var t = tensors[i];
+            if (t.QuantizationType != QuantizationType.PQ2_0) continue;
+            long n = t.Shape.ElementCount;
+            if (n % 64 != 0) continue;
+            offsets ??= tensors.Select(x => x.DataOffset).Distinct().Order().ToList();
+            int idx = offsets.BinarySearch(t.DataOffset);
+            long end = idx + 1 < offsets.Count ? (long)offsets[idx + 1] : dataSectionLength;
+            long span = end - (long)t.DataOffset;
+            long pq = QuantizationType.PQ2_0.ComputeByteCount(n);
+            long q2 = QuantizationType.Q2_0.ComputeByteCount(n);
+            bool fitsPq = n % 128 == 0 && span >= pq && span < pq + alignment;
+            bool fitsQ2 = span >= q2 && span < q2 + alignment;
+            if (!fitsPq && fitsQ2)
+                tensors[i] = t with { QuantizationType = QuantizationType.Q2_0 };
+        }
+    }
+
+    /// <summary>
     /// Guards the GGUF type-id 42 collision. Upstream ggml's <c>Q2_0</c> is also type 42 but uses
     /// 64-element groups, whereas <see cref="QuantizationType.PQ2_0"/> uses 128-element groups
     /// (34 B/group); an upstream Q2_0 file would otherwise load and silently mis-decode. The tensor

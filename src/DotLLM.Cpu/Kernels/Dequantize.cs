@@ -88,11 +88,13 @@ public static unsafe partial class Dequantize
         QuantizationType.IQ2_XS => elementCount / KQuantGroupSize * IQ2_XS_BlockBytes,
         QuantizationType.IQ2_S => elementCount / KQuantGroupSize * IQ2_S_BlockBytes,
         QuantizationType.IQ1_S => elementCount / KQuantGroupSize * IQ1_S_BlockBytes,
+        QuantizationType.IQ1_M => elementCount / KQuantGroupSize * QuantFormat.IQ1_MBlockBytes,
         QuantizationType.IQ3_XXS => elementCount / KQuantGroupSize * IQ3_XXS_BlockBytes,
         QuantizationType.IQ3_S => elementCount / KQuantGroupSize * IQ3_S_BlockBytes,
         // I2_S: packed 2-bit row stride only (k/4). The per-tensor scale lives at the tensor tail.
         QuantizationType.I2_S => elementCount / 4,
         QuantizationType.MXFP4 => elementCount / Mxfp4GroupSize * Mxfp4BlockBytes,
+        QuantizationType.Q2_0 => elementCount / QuantFormat.Q2_0GroupSize * QuantFormat.Q2_0BlockBytes,
         // PQ2_0: scale is per-group (interleaved), so row stride includes it — contrast I2_S.
         QuantizationType.PQ2_0 => elementCount / PQ2_0GroupSize * PQ2_0GroupBytes,
         _ => throw new ArgumentOutOfRangeException(nameof(quantType), quantType,
@@ -177,6 +179,9 @@ public static unsafe partial class Dequantize
             case QuantizationType.IQ1_S:
                 DequantizeIQ1_S(src, elementCount, dest);
                 break;
+            case QuantizationType.IQ1_M:
+                DequantizeIQ1_M(src, elementCount, dest);
+                break;
             case QuantizationType.IQ3_XXS:
                 DequantizeIQ3_XXS(src, elementCount, dest);
                 break;
@@ -191,6 +196,9 @@ public static unsafe partial class Dequantize
                 break;
             case QuantizationType.PQ2_0:
                 DequantizePQ2_0(src, elementCount, dest);
+                break;
+            case QuantizationType.Q2_0:
+                DequantizeQ2_0(src, elementCount, dest);
                 break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(quantType), quantType,
@@ -523,6 +531,28 @@ public static unsafe partial class Dequantize
                 dest[outBase + gp + 64] = (((packed >> 2) & 0x3) - 1) * scale;
                 dest[outBase + gp + 96] = ((packed & 0x3) - 1) * scale;
             }
+        }
+    }
+
+    // ──────────────────── Q2_0 (upstream ggml, #823) ────────────────────
+
+    /// <summary>
+    /// Scalar upstream-ggml Q2_0 dequantization (#823): 64-element blocks, fp16 d then 16 bytes of 2-bit codes (element j in bits
+    /// 2*(j%4) of byte j/4); value = (code - 1) * d, so codes 0..3 are -d, 0, +d, +2d. Port of llama.cpp <c>dequantize_row_q2_0</c>.
+    /// </summary>
+    internal static void DequantizeQ2_0(nint src, long elementCount, Span<float> dest)
+    {
+        if (elementCount % QuantFormat.Q2_0GroupSize != 0)
+            throw new ArgumentException($"Q2_0 element count must be a multiple of {QuantFormat.Q2_0GroupSize}, got {elementCount}", nameof(elementCount));
+        byte* p = (byte*)src;
+        long blocks = elementCount / QuantFormat.Q2_0GroupSize;
+        for (long b = 0; b < blocks; b++)
+        {
+            float d = (float)BitConverter.UInt16BitsToHalf((ushort)(p[0] | (p[1] << 8)));
+            long o = b * QuantFormat.Q2_0GroupSize;
+            for (int j = 0; j < QuantFormat.Q2_0GroupSize; j++)
+                dest[(int)(o + j)] = (((p[2 + (j >> 2)] >> ((j & 3) * 2)) & 3) - 1) * d;
+            p += QuantFormat.Q2_0BlockBytes;
         }
     }
 

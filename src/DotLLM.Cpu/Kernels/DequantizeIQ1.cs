@@ -535,6 +535,60 @@ public static unsafe partial class Dequantize
     ];
 
     /// <summary>
+    /// Dequantizes IQ1_M (ggml <c>dequantize_row_iq1_m</c>, #823). Block layout <c>qs[32]@0, qh[16]@32, scales[4 x uint16]@48</c>; the fp16
+    /// super-scale is the top nibbles of the four scale words (<c>sc0&gt;&gt;12 | (sc1&gt;&gt;8)&amp;0xf0 | (sc2&gt;&gt;4)&amp;0xf00 | sc3&amp;0xf000</c>).
+    /// Sub-block ib: two 3-bit sub-scales <c>dl1/dl2 = d * (2*s + 1)</c> from <c>sc[ib/2] &gt;&gt; (6*(ib%2) [+3])</c> (groups 0-1 use dl1, 2-3 dl2);
+    /// group l's grid index is <c>qs[4ib+l] | ((qh[2ib+l/2] &lt;&lt; (8 or 4)) &amp; 0x700)</c> and its delta sign is qh bit 3 (even l) / 7 (odd l).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void DequantizeIQ1_M(nint src, long elementCount, Span<float> dest)
+    {
+        if (elementCount % KQuantGroupSize != 0)
+            throw new ArgumentException(
+                $"IQ1_M element count must be a multiple of {KQuantGroupSize}, got {elementCount}", nameof(elementCount));
+
+        long blockCount = elementCount / KQuantGroupSize;
+        byte* blockBase = (byte*)src;
+        int outIdx = 0;
+        ReadOnlySpan<ulong> grid = Iq1SGrid;
+
+        for (long b = 0; b < blockCount; b++)
+        {
+            byte* qs = blockBase;
+            byte* qh = blockBase + 32;
+            ushort* sc = (ushort*)(blockBase + 48);
+            ushort scaleBits = (ushort)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+            float d = (float)BitConverter.UInt16BitsToHalf(scaleBits);
+
+            for (int ib = 0; ib < KQuantGroupSize / 32; ib++)
+            {
+                int word = sc[ib / 2];
+                int shift = 6 * (ib % 2);
+                float dl1 = d * (2 * ((word >> shift) & 7) + 1);
+                float dl2 = d * (2 * ((word >> (shift + 3)) & 7) + 1);
+                byte qh0 = qh[ib * 2], qh1 = qh[ib * 2 + 1];
+                for (int l = 0; l < 4; l++)
+                {
+                    int hb = (l < 2) ? qh0 : qh1;
+                    int idx = qs[ib * 4 + l] | (((l & 1) == 0 ? hb << 8 : hb << 4) & 0x700);
+                    float delta = ((l & 1) == 0 ? (hb & 0x08) : (hb & 0x80)) != 0 ? -Iq1SDelta : Iq1SDelta;
+                    float dl = l < 2 ? dl1 : dl2;
+                    ulong gridEntry = grid[idx];
+                    int outOff = outIdx + ib * 32 + l * 8;
+                    for (int j = 0; j < 8; j++)
+                    {
+                        sbyte g = (sbyte)((gridEntry >> (8 * j)) & 0xff);
+                        dest[outOff + j] = dl * (g + delta);
+                    }
+                }
+            }
+
+            outIdx += KQuantGroupSize;
+            blockBase += QuantFormat.IQ1_MBlockBytes;
+        }
+    }
+
+    /// <summary>
     /// Dequantizes IQ1_S. Block layout:
     /// <c>d(Half@0), qs[32]@2, qh[8](uint16)@34</c>.
     /// Per 256-element super-block: 8 sub-blocks of 32 elements. Per sub-block ib in [0,8):

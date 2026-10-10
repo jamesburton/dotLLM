@@ -27,6 +27,7 @@ string[] prompts =
     "The French Revolution began in 1789 and transformed the political landscape of Europe. Key events included the storming of the Bastille, the Declaration of the Rights of Man, the Reign of Terror, and the rise of Napoleon Bonaparte, who eventually crowned himself emperor in 1804. Summarize the main causes.",
 };
 if (args[0] == "kbench") { KBench.Run(args); return; }
+if (args[0] == "iqbench") { IqKBench.Run(args); return; }
 if (args[0] == "oracle")
 {
     // CPU oracle of the real file: final-position logits of the four probe prompts, single-shot prefill, stored in the rdump format (<work>/oracle.f32).
