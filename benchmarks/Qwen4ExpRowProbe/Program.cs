@@ -19,7 +19,33 @@ using DotLLM.Vulkan;
 //   env NAME=VALUE                 set a process env var (for switches read per call)
 //   quit
 const string Marker = "[probe]";
+string[] prompts =
+{
+    "The capital of France is Paris, and the capital of Germany is",
+    "Mixture-of-experts models route each token to a small subset of expert networks, which lets the total parameter count grow much faster than the compute per token. Explain in detail how the router is trained and why load balancing matters for throughput.",
+    "def is_palindrome(s: str) -> bool:" + (char)10 + "    cleaned = " + "''" + ".join(c.lower() for c in s if c.isalnum())" + (char)10 + "    return cleaned == cleaned[::-1]" + (char)10 + (char)10 + "# Write unit tests for the function above",
+    "The French Revolution began in 1789 and transformed the political landscape of Europe. Key events included the storming of the Bastille, the Declaration of the Rights of Man, the Reign of Terror, and the rise of Napoleon Bonaparte, who eventually crowned himself emperor in 1804. Summarize the main causes.",
+};
 if (args[0] == "kbench") { KBench.Run(args); return; }
+if (args[0] == "oracle")
+{
+    // CPU oracle of the real file: final-position logits of the four probe prompts, single-shot prefill, stored in the rdump format (<work>/oracle.f32).
+    var (cpuModel, cpuGguf, cpuCfg) = DotLLM.Models.ModelLoader.LoadFromGguf(args[1], new DotLLM.Core.Configuration.ThreadingConfig(0));
+    var cpuTok = GgufTokenizerFactory.Load(cpuGguf.Metadata);
+    Directory.CreateDirectory(args[2]);
+    var all = new List<float>();
+    foreach (var pr in prompts)
+    {
+        var ids = cpuTok.Encode(pr);
+        var sw = Stopwatch.StartNew();
+        using var lg = cpuModel.Forward(ids, Enumerable.Range(0, ids.Length).ToArray(), -1);
+        unsafe { all.AddRange(new ReadOnlySpan<float>((void*)(lg.DataPointer + (nint)((long)(ids.Length - 1) * cpuCfg.VocabSize * 4)), cpuCfg.VocabSize).ToArray()); }
+        Console.WriteLine($"oracle prompt {ids.Length} tok: {sw.Elapsed.TotalSeconds:F1} s");
+    }
+    File.WriteAllBytes(Path.Combine(args[2], "oracle.f32"), MemoryMarshal.AsBytes(all.ToArray().AsSpan()).ToArray());
+    Console.WriteLine("oracle written");
+    return;
+}
 string gguf = args[0];
 string work = args[1];
 Directory.CreateDirectory(Path.Combine(work, "jobs"));
@@ -36,13 +62,6 @@ using var model = VulkanQwen4ExpTransformerModel.BuildFromGguf(device, file, cfg
 Log($"loaded in {sw0.Elapsed.TotalSeconds:F0} s");
 int vocab = cfg.VocabSize;
 var tok = GgufTokenizerFactory.Load(file.Metadata);
-string[] prompts =
-{
-    "The capital of France is Paris, and the capital of Germany is",
-    "Mixture-of-experts models route each token to a small subset of expert networks, which lets the total parameter count grow much faster than the compute per token. Explain in detail how the router is trained and why load balancing matters for throughput.",
-    "def is_palindrome(s: str) -> bool:" + (char)10 + "    cleaned = " + "''" + ".join(c.lower() for c in s if c.isalnum())" + (char)10 + "    return cleaned == cleaned[::-1]" + (char)10 + (char)10 + "# Write unit tests for the function above",
-    "The French Revolution began in 1789 and transformed the political landscape of Europe. Key events included the storming of the Bastille, the Declaration of the Rights of Man, the Reign of Terror, and the rise of Napoleon Bonaparte, who eventually crowned himself emperor in 1804. Summarize the main causes.",
-};
 
 bool realText = true;
 int[] longText = null!;
