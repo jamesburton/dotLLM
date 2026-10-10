@@ -63,15 +63,27 @@ internal static class VulkanQwen3MoeMoeUpload
         // MMVQ decode kernels and grouped coopmat prefill kernels exist for both; they need K % 32 == 0 (always true for real models).
         QuantizationType.Q5_1,
         QuantizationType.Q8_0,
+        // #823: IQ-family banks (UD-IQ4_XS: IQ3_S gate/up, IQ4_XS gate/up in a layer, IQ4_NL down). Served by the indexed IQ MMVQ decode
+        // kernels (MoeIndexedMatmulIqMmvqKernel, which needs integer-dot-product) and nothing else: there is no scalar F32-in indexed
+        // kernel for them, so BankStaysPacked refuses them on a device without dp4a and they widen to F32 as before.
+        QuantizationType.IQ3_S,
+        QuantizationType.IQ4_XS,
+        QuantizationType.IQ4_NL,
     };
 
     /// <summary>
     /// True when a routed bank of source quant <paramref name="qt"/> and input width <paramref name="kDim"/> stays packed on the device
     /// (the single source of truth shared with the pre-load residency estimate, so the two cannot drift).
     /// </summary>
-    internal static bool BankStaysPacked(QuantizationType qt, int kDim)
+    internal static bool BankStaysPacked(QuantizationType qt, int kDim, bool integerDot = true)
         => s_ResidentQuantTypes.Contains(qt)
-            && (qt is not (QuantizationType.Q5_1 or QuantizationType.Q8_0) || kDim % 32 == 0);
+            && (qt is not (QuantizationType.Q5_1 or QuantizationType.Q8_0 or QuantizationType.IQ4_NL) || kDim % 32 == 0)
+            && (qt is not (QuantizationType.IQ3_S or QuantizationType.IQ4_XS) || kDim % 256 == 0)
+            && (qt is not (QuantizationType.IQ3_S or QuantizationType.IQ4_XS or QuantizationType.IQ4_NL) || (integerDot && IqBanksResidentEnabled));
+
+    /// <summary>#823 A/B switch: <c>DOTLLM_VK_IQ_RESIDENT=0</c> widens IQ expert banks to F32 as before (pairs with the residency estimate).</summary>
+    internal static bool IqBanksResidentEnabled => Environment.GetEnvironmentVariable("DOTLLM_VK_IQ_RESIDENT") != "0"
+        && Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MMVQ") != "0";   // the MMVQ kernels are what read these banks
 
     /// <summary>
     /// Resolves the on-device storage type for ONE routed bank, independent
@@ -80,8 +92,8 @@ internal static class VulkanQwen3MoeMoeUpload
     /// <see cref="s_ResidentQuantTypes"/>; F32 dequant otherwise.
     /// </summary>
     private static QuantizationType ResolveBankQuantType(
-        QuantizationType sourceQt, bool residentQuant, bool hasRawQuantView, int kDim)
-        => residentQuant && hasRawQuantView && BankStaysPacked(sourceQt, kDim)
+        QuantizationType sourceQt, bool residentQuant, bool hasRawQuantView, int kDim, bool integerDot = true)
+        => residentQuant && hasRawQuantView && BankStaysPacked(sourceQt, kDim, integerDot)
             ? sourceQt
             : QuantizationType.F32;
 
@@ -186,7 +198,7 @@ internal static class VulkanQwen3MoeMoeUpload
     /// Byte sizes of the three routed-expert banks (gate, down, up) <see cref="UploadLayer"/> will allocate for <paramref name="moe"/>,
     /// in allocation order. Mirrors <c>UploadRoutedBankAnyQuant</c> so a <see cref="VulkanBankPrealloc"/> can allocate them ahead (#874).
     /// </summary>
-    public static long[] BankAllocationSizes(MoeLayerWeights moe, int hiddenSize, bool residentQuant)
+    public static long[] BankAllocationSizes(MoeLayerWeights moe, int hiddenSize, bool residentQuant, bool integerDot = true)
     {
         int numE = moe.NumExperts;
         int interm = moe.IntermediateSize;
@@ -196,9 +208,9 @@ internal static class VulkanQwen3MoeMoeUpload
             => qt == QuantizationType.F32 ? (long)numE * elemsF32 * sizeof(float) : (long)numE * Dequantize.RowByteSize(kDim, qt) * mDim;
         return
         [
-            Size(ResolveBankQuantType(moe.GateExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize), interm, hiddenSize, w1Elems),
-            Size(ResolveBankQuantType(moe.DownExpsRawQt, residentQuant, moe.HasRawQuantView, interm), hiddenSize, interm, w2Elems),
-            Size(ResolveBankQuantType(moe.UpExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize), interm, hiddenSize, w1Elems),
+            Size(ResolveBankQuantType(moe.GateExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize, integerDot), interm, hiddenSize, w1Elems),
+            Size(ResolveBankQuantType(moe.DownExpsRawQt, residentQuant, moe.HasRawQuantView, interm, integerDot), hiddenSize, interm, w2Elems),
+            Size(ResolveBankQuantType(moe.UpExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize, integerDot), interm, hiddenSize, w1Elems),
         ];
     }
 
@@ -242,9 +254,10 @@ internal static class VulkanQwen3MoeMoeUpload
         // no longer need to share one quant type. Only quant types with a
         // resident indexed-matmul kernel wired up (see s_ResidentQuantTypes)
         // are eligible; anything else falls back to F32 for that bank alone.
-        QuantizationType w1Qt = ResolveBankQuantType(moe.GateExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize);
-        QuantizationType w2Qt = ResolveBankQuantType(moe.DownExpsRawQt, residentQuant, moe.HasRawQuantView, interm);
-        QuantizationType w3Qt = ResolveBankQuantType(moe.UpExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize);
+        bool integerDot = device.HasIntegerDotProduct;
+        QuantizationType w1Qt = ResolveBankQuantType(moe.GateExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize, integerDot);
+        QuantizationType w2Qt = ResolveBankQuantType(moe.DownExpsRawQt, residentQuant, moe.HasRawQuantView, interm, integerDot);
+        QuantizationType w3Qt = ResolveBankQuantType(moe.UpExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize, integerDot);
 
         // Bounded persistently-mapped staging (issue #147): banks stream through
         // it one expert slab (or chunk) at a time — the previous whole-bank
