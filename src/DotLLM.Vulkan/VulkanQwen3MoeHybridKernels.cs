@@ -77,6 +77,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     /// <summary>16-row Q4_K grouped kernel, present only when <see cref="MoeGroupedQ4K"/> is the 32-row row-pair form: a layer whose down
     /// bank is legacy-quant (16-row tiles only) needs gate/up on the same 16-row tile list.</summary>
     public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ4K16 { get; private set; }
+    /// <summary>16-row Q5_K twin (#821): a layer with Q5_K gate/up and a legacy-quant (Q5_1/Q8_0) down - UD-Q4_K_XL layer 2 - shares one 16-row tile list. Present under the same condition as <see cref="MoeGroupedQ4K16"/>.</summary>
+    public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ5K16 { get; private set; }
     public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ6K { get; private set; }
     public MatMulQ2KGemvF32Kernel MatMulQ2K { get; }
     public MatMulQ2KGemmF32Kernel MatMulQ2KGemm { get; }
@@ -532,7 +534,10 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             if (MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q8_0))
                 kernels.MoeGroupedQ8_0 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Q8_0);
             if ((kernels.MoeGroupedQ5_1 is not null || kernels.MoeGroupedQ8_0 is not null) && q4.RowTile != 16)
+            {
                 kernels.MoeGroupedQ4K16 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K);
+                if (q5.RowTile != 16) kernels.MoeGroupedQ5K16 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q5_K);
+            }
         }
         if (File.Exists(Path.Combine(spvDir, "moe_indexed_matmul_q5_1_f32.spv")))
             kernels.MoeIndexedMatmulQ5_1 = MoeIndexedMatmulQ5_1F32Kernel.Create(device, spvDir);
@@ -675,12 +680,13 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeGroupedQ5_1?.InvalidateDescriptorCache();
         MoeGroupedQ8_0?.InvalidateDescriptorCache();
         MoeGroupedQ4K16?.InvalidateDescriptorCache();
+        MoeGroupedQ5K16?.InvalidateDescriptorCache();
     }
 
     public void Dispose()
     {
         MoeIndexedMatmulQ5_1?.Dispose(); MoeIndexedMatmulQ8_0?.Dispose(); MoeMmvqQ5_1?.Dispose(); MoeMmvqQ8_0?.Dispose(); MoeMmvqQ4KMr?.Dispose(); MoeMmvqQ5_1Mr?.Dispose();
-        MoeGroupedQ5_1?.Dispose(); MoeGroupedQ8_0?.Dispose(); MoeGroupedQ4K16?.Dispose();
+        MoeGroupedQ5_1?.Dispose(); MoeGroupedQ8_0?.Dispose(); MoeGroupedQ4K16?.Dispose(); MoeGroupedQ5K16?.Dispose();
         QGateDeinterleave?.Dispose(); GdnQkvSplit?.Dispose(); SwiGluQuantizeFused?.Dispose(); RmsNormQuantizeFused?.Dispose(); MatMulQ8Mmvq?.Dispose(); MoeMmvqQ6K?.Dispose(); MoeMmvqQ5K?.Dispose(); MoeMmvqQ4K?.Dispose();
         MoeGroupedQ6K?.Dispose(); MoeGroupedQ5K?.Dispose(); MoeGroupedQ4K?.Dispose(); MoeUngroupScatter?.Dispose();
         MoeExpandGroupByExpert?.Dispose(); MoeExpertOffsets?.Dispose(); MoeBuildTileList?.Dispose(); MoeExpandGatherGroup?.Dispose(); MoeWeightedScatterGrouped?.Dispose();

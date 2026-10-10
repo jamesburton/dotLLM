@@ -491,6 +491,7 @@ void Exec(string line, StringBuilder o)
 }
 
 var lastRefresh = Stopwatch.StartNew();
+var idle = Stopwatch.StartNew();   // exit after 5 minutes without a job so a model-resident process never lingers (70 GiB)
 string jobs = Path.Combine(work, "jobs");
 Log("ready");
 File.WriteAllText(Path.Combine(work, "ready"), "1");
@@ -499,6 +500,7 @@ while (true)
     var job = Directory.GetFiles(jobs, "*.job").OrderBy(f => f).FirstOrDefault();
     if (job is null)
     {
+        if (idle.Elapsed.TotalMinutes > 5) { Log("idle timeout, exiting"); break; }
         if (lockName.Length > 0 && lastRefresh.Elapsed.TotalMinutes > 10)
         {
             try
@@ -514,6 +516,7 @@ while (true)
         Thread.Sleep(500);
         continue;
     }
+    idle.Restart();
     string id = Path.GetFileNameWithoutExtension(job);
     var sb = new StringBuilder();
     bool quit = false;
@@ -526,6 +529,7 @@ while (true)
     File.Delete(job);
     File.WriteAllText(Path.Combine(jobs, id + ".out"), sb.ToString());
     File.WriteAllText(Path.Combine(jobs, id + ".done"), "");
+    idle.Restart();
     Log($"job {id} done");
     if (quit) break;
 }
