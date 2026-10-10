@@ -2080,6 +2080,12 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// </summary>
     internal static bool Q4MoeDecodeFused { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_MOE_FUSED") != "0";
 
+    /// <summary>Single-token fused scatter + shared-gate add in the qwen4exp decode chain (#885). <c>DOTLLM_VK_Q4E_COMBINE_FUSED=0</c> (or setting this) restores the two dispatches.</summary>
+    internal static bool Q4CombineFused { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_COMBINE_FUSED") != "0";
+
+    /// <summary>Test hook (#885): decode MoE layers that used the fused combine kernel.</summary>
+    internal long Q4CombineFusedLayers { get; private set; }
+
     /// <summary>Test hook (#885): MoE layers recorded on the fused qwen4exp decode chain.</summary>
     internal long Q4MoeFusedLayers { get; private set; }
 
@@ -2162,14 +2168,25 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("down");
 
-        // Phase 6: weighted scatter into NormOutput (every NormOutput reader finished in phase 1), then the shared sigmoid-gated add.
-        _kernels.MoeWeightedScatter.Record(cmdBuf, _state.MoeDownRows, _state.MoeTopkWeights, _state.NormOutput, seqLen: 1, topK: topK, hiddenSize: hidden);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
-        MoeStage("weighted_scatter");
-        _kernels.MoeSigmoidGatedAdd.Record(cmdBuf, output: _state.NormOutput, b: _state.MoeSharedSumA, gateLogits: _state.MoeSharedGateLogits,
-            seqLen: 1, hiddenSize: hidden);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
-        MoeStage("shared_expert");
+        // Phase 6: combine into NormOutput (every NormOutput reader finished in phase 1): weighted scatter of the topK rows + the shared sigmoid-gated add.
+        if (_kernels.MoeScatterGatedAddDecode is { } fusedCombine && Q4CombineFused)
+        {
+            fusedCombine.Record(cmdBuf, _state.MoeDownRows, _state.MoeTopkWeights, _state.MoeSharedSumA, _state.MoeSharedGateLogits, _state.NormOutput,
+                topK: topK, hiddenSize: hidden);
+            Q4CombineFusedLayers++;
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MoeStage("weighted_scatter");
+        }
+        else
+        {
+            _kernels.MoeWeightedScatter.Record(cmdBuf, _state.MoeDownRows, _state.MoeTopkWeights, _state.NormOutput, seqLen: 1, topK: topK, hiddenSize: hidden);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MoeStage("weighted_scatter");
+            _kernels.MoeSigmoidGatedAdd.Record(cmdBuf, output: _state.NormOutput, b: _state.MoeSharedSumA, gateLogits: _state.MoeSharedGateLogits,
+                seqLen: 1, hiddenSize: hidden);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MoeStage("shared_expert");
+        }
     }
 
     /// <summary>

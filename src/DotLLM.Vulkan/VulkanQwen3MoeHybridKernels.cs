@@ -30,6 +30,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MoeBuildTileListKernel? MoeBuildTileList { get; private set; }
     public MoeExpandGatherGroupF32Kernel? MoeExpandGatherGroup { get; private set; }
     public MoeWeightedScatterGroupedF32Kernel? MoeWeightedScatterGrouped { get; private set; }
+    /// <summary>Single-token fused weighted scatter + shared-expert sigmoid-gated add (#885); null when the SPIR-V is missing.</summary>
+    public MoeScatterGatedAddDecodeF32Kernel? MoeScatterGatedAddDecode { get; private set; }
     /// <summary>Fused shared-expert gate + sigmoid-gated add for prefill (issue #693); null when disabled or the SPIR-V is missing.</summary>
     public MoeSharedGateAddF32Kernel? MoeSharedGateAdd { get; private set; }
     /// <summary>Fused conv + SiLU for the GDN prefill (issue #695); null when disabled or the SPIR-V is missing.</summary>
@@ -554,6 +556,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MMVQ") != "0")
         {
             kernels.MoeMmvqQ4K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q4_K);
+            if (File.Exists(Path.Combine(spvDir, "moe_scatter_gated_add_decode_f32.spv")))
+                kernels.MoeScatterGatedAddDecode = MoeScatterGatedAddDecodeF32Kernel.Create(device, spvDir);
             // Multi-row variants (#876): measured best at NR = 2 for the ALU-heavy Q4_K gate/up and NR = 4 for the Q5_1 down;
             // DOTLLM_VK_MOE_MR=<n> forces n for both, DOTLLM_VK_MOE_MR=0 disables them.
             int moeMrEnv = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MR"), out int mrv) ? mrv : -1;
@@ -660,6 +664,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeBuildTileList?.InvalidateDescriptorCache();
         MoeExpandGatherGroup?.InvalidateDescriptorCache();
         MoeWeightedScatterGrouped?.InvalidateDescriptorCache();
+        MoeScatterGatedAddDecode?.InvalidateDescriptorCache();
         MoeExpandGroupByExpert?.InvalidateDescriptorCache();
         MoeUngroupScatter?.InvalidateDescriptorCache();
         MoeGroupedQ4K?.InvalidateDescriptorCache();
@@ -696,7 +701,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeGroupedQ5_1?.Dispose(); MoeGroupedQ8_0?.Dispose(); MoeGroupedQ4K16?.Dispose(); MoeGroupedQ5K16?.Dispose();
         QGateDeinterleave?.Dispose(); GdnQkvSplit?.Dispose(); SwiGluQuantizeFused?.Dispose(); RmsNormQuantizeFused?.Dispose(); MatMulQ8Mmvq?.Dispose(); MatMulQ8MmvqWideRows?.Dispose(); MatMulQ8MmvqWideKSplit?.Dispose(); MoeMmvqQ6K?.Dispose(); MoeMmvqQ5K?.Dispose(); MoeMmvqQ4K?.Dispose();
         MoeGroupedQ6K?.Dispose(); MoeGroupedQ5K?.Dispose(); MoeGroupedQ4K?.Dispose(); MoeUngroupScatter?.Dispose();
-        MoeExpandGroupByExpert?.Dispose(); MoeExpertOffsets?.Dispose(); MoeBuildTileList?.Dispose(); MoeExpandGatherGroup?.Dispose(); MoeWeightedScatterGrouped?.Dispose();
+        MoeExpandGroupByExpert?.Dispose(); MoeExpertOffsets?.Dispose(); MoeBuildTileList?.Dispose(); MoeExpandGatherGroup?.Dispose(); MoeWeightedScatterGrouped?.Dispose(); MoeScatterGatedAddDecode?.Dispose();
         MoeSigmoidGatedAdd.Dispose();
         MoeSharedGateAdd?.Dispose();
         GdnConvSilu?.Dispose();

@@ -97,4 +97,33 @@ public sealed class VulkanQwen4ExpDecodeOverlapTests
         Assert.True(fRel < 0.08 && fKl < 0.02, $"fused MoE chain off the oracle: relL2 {fRel:E3}, KL {fKl:E3}");
         Assert.True(aRel < 0.05 && aKl < 0.01, $"fused MoE chain diverges from the general path: relL2 {aRel:E3}, KL {aKl:E3}");
     }
+
+    [SkippableFact]
+    public void FusedCombine_IsBitIdenticalToScatterThenGatedAdd()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        const int T = 24;
+        var ids = VulkanQwen4ExpParityTests.Ids(T, 128, seed: 71);
+        using var rig = new Q4eRig(VulkanQwen4ExpParityTests.Build(11), spvDir);
+        bool prior = VulkanQwen4ExpTransformerModel.CombineFused;
+        try
+        {
+            VulkanQwen4ExpTransformerModel.CombineFused = true;
+            long c0 = rig.Vk.CombineFusedLayers;
+            var fast = Chunked(rig, ids, 1);
+            long used = rig.Vk.CombineFusedLayers - c0;
+            _out.WriteLine($"decode: {used} layers used the fused combine kernel");
+            Assert.True(used > 0, "the fused scatter + gated-add kernel never ran on decode");
+
+            VulkanQwen4ExpTransformerModel.CombineFused = false;
+            long c1 = rig.Vk.CombineFusedLayers;
+            var slow = Chunked(rig, ids, 1);
+            Assert.Equal(c1, rig.Vk.CombineFusedLayers);   // switched off: nothing recorded
+
+            int differing = 0;
+            for (int i = 0; i < slow.Length; i++) if (BitConverter.SingleToInt32Bits(slow[i]) != BitConverter.SingleToInt32Bits(fast[i])) differing++;
+            Assert.True(differing == 0, $"{differing} of {slow.Length} logits differ between the fused and the two-pass combine (must be bit-identical)");
+        }
+        finally { VulkanQwen4ExpTransformerModel.CombineFused = prior; }
+    }
 }
