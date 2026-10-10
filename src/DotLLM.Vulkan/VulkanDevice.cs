@@ -1725,6 +1725,18 @@ public sealed class VulkanDevice : IDisposable
     /// <summary>Bytes that landed on each heap via the device-local fallback (not the preferred type).</summary>
     public long FallbackBytesOnHeap(int heap) => Interlocked.Read(ref _fallbackBytesByHeap[heap]);
 
+    /// <summary>Live bytes in the heaps that count toward <see cref="ResidentCapacityBytes"/>: every heap on an integrated GPU, device-local heaps only on a discrete one (#880).</summary>
+    internal unsafe long ResidentLiveBytes()
+    {
+        if (PhysicalDeviceTypeValue == VkPhysicalDeviceType.IntegratedGpu) return TotalLiveBytes();
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        byte* heaps = (byte*)mem.memoryHeaps;
+        long sum = 0;
+        for (uint i = 0; i < mem.memoryHeapCount && i < _liveBytesByHeap.Length; i++)
+            if ((*(uint*)(heaps + i * 16 + 8) & (uint)VkMemoryHeapFlags.DeviceLocal) != 0) sum += Interlocked.Read(ref _liveBytesByHeap[i]);
+        return sum;
+    }
+
     /// <summary>Bytes of live buffers this process currently holds, summed over every memory heap (what the <c>[vulkan-mem]</c> diagnostic prints as <c>ours</c>).</summary>
     public long TotalLiveBytes()
     {
@@ -1894,6 +1906,49 @@ public sealed class VulkanDevice : IDisposable
         return sb.ToString();
     }
 
+    /// <summary>Extra text for an out-of-device-memory failure: who else is holding GPU memory (#880). Empty for other results or when unknown.</summary>
+    private string OtherProcessOomHint(int result)
+    {
+        if (result != VkErrorOutOfDeviceMemory) return string.Empty;
+        try
+        {
+            var p = ReadOtherProcessPressure();
+            if (p is null) return string.Empty;
+            return $" Other processes currently hold {p.OtherBytes / (double)(1L << 30):F1} GiB of GPU memory on this adapter ({p.DescribeCulprits()}).";
+        }
+        catch (Exception) { return string.Empty; }   // diagnostics must never mask the real failure
+    }
+
+    /// <summary>The adapter LUID (<c>high &lt;&lt; 32 | low</c>) from <c>VkPhysicalDeviceIDProperties</c>, or null when the driver does not report a valid one.</summary>
+    internal unsafe ulong? DeviceLuid()
+    {
+        byte* id = stackalloc byte[88];
+        new Span<byte>(id, 88).Clear();
+        *(int*)id = 1000071004;   // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES
+        var p2 = default(VkPhysicalDeviceProperties2);
+        p2.sType = VkStructureType.PhysicalDeviceProperties2;
+        p2.pNext = (nint)id;
+        VulkanApi.vkGetPhysicalDeviceProperties2(_physicalDevice, ref p2);
+        // sType(4)+pad(4), pNext(8), deviceUUID[16]@16, driverUUID[16]@32, deviceLUID[8]@48, deviceNodeMask@56, deviceLUIDValid@60
+        if (*(uint*)(id + 60) == 0) return null;
+        return *(ulong*)(id + 48);   // LUID = {u32 LowPart, i32 HighPart}, little-endian
+    }
+
+    /// <summary>
+    /// GPU memory held by OTHER processes on this adapter (Windows PDH counters; <c>VK_EXT_memory_budget</c> cannot see other
+    /// processes - see <see cref="VulkanGpuMemoryPressure"/>). Null when unavailable.
+    /// </summary>
+    internal VulkanGpuMemoryPressure? ReadOtherProcessPressure()
+        => VulkanGpuMemoryPressure.TryRead(DeviceLuid(), PhysicalDeviceTypeValue == VkPhysicalDeviceType.IntegratedGpu);
+
+    /// <summary>Bytes this device object currently has allocated, across every heap.</summary>
+    internal long LiveBytesTotal()
+    {
+        long sum = 0;
+        for (int h = 0; h < _liveBytesByHeap.Length; h++) sum += Interlocked.Read(ref _liveBytesByHeap[h]);
+        return sum;
+    }
+
     /// <summary>
     /// Number of device-local allocations that fell back to a host-visible memory
     /// type because the strict DEVICE_LOCAL heap was exhausted. Non-zero means part
@@ -1901,6 +1956,11 @@ public sealed class VulkanDevice : IDisposable
     /// heap — perf harnesses should report it alongside any measurement.
     /// </summary>
     public long DeviceLocalFallbackCount => Interlocked.Read(ref _deviceLocalFallbacks);
+
+    private static long s_allocateMemoryTicks;
+
+    /// <summary>Process-wide wall time inside <c>vkAllocateMemory</c> on the primary path (#874 load-time diagnostic).</summary>
+    internal static double AllocateMemoryMilliseconds => Interlocked.Read(ref s_allocateMemoryTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
 
     private Buffer AllocateInternal(long bytes, bool deviceLocal, bool preferHostCached = false)
     {
@@ -1984,7 +2044,11 @@ public sealed class VulkanDevice : IDisposable
                 allocResult = VkErrorOutOfDeviceMemory; memory = 0; // synthetic exhaustion (#810 knob)
             }
             else
+            {
+                long tAlloc = System.Diagnostics.Stopwatch.GetTimestamp();
                 allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out memory);
+                Interlocked.Add(ref s_allocateMemoryTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tAlloc);
+            }
 
             // The strict device-local heap (discrete VRAM, or the UMA carve-out — e.g. a
             // 16 GB heap[0] on Strix Halo while heap[1] exposes 96 GB of DEVICE_LOCAL +
@@ -2057,7 +2121,7 @@ public sealed class VulkanDevice : IDisposable
                 $"vkAllocateMemory ({bytes} bytes{(IsTransientMemoryResult(allocResult) ? $", {s_memRetries} retries exhausted" : "")}" +
                 $"; memoryTypeIndex={preferredTypeIndex} flags=0x{chosenFlags:X} heapIndex={chosenHeap} " +
                 $"heapSize={heapSize / (1024 * 1024)} MiB; typeBits=0x{req.memoryTypeBits:X}" +
-                $"; live: {MemorySnapshot()})");
+                $"; live: {MemorySnapshot()}){OtherProcessOomHint(allocResult)}");
         }
 
         int bindResult = VulkanApi.vkBindBufferMemory(_device, buffer, memory, 0);

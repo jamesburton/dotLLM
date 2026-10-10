@@ -26,9 +26,12 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
     public static VulkanQwen4ExpTransformerModel BuildFromGguf(VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir)
         => BuildFromGguf(device, gguf, config, spvDir, residentCapacityOverrideBytes: null);
 
-    /// <summary>Test seam: <paramref name="residentCapacityOverrideBytes"/> replaces the device's resident capacity in the pre-load gate.</summary>
+    /// <summary>
+    /// Test seam: <paramref name="residentCapacityOverrideBytes"/> replaces the device's resident capacity in the pre-load gate;
+    /// <paramref name="otherPressureProbe"/> replaces the OS read of other processes' GPU memory (called once before and once after the upload).
+    /// </summary>
     internal static VulkanQwen4ExpTransformerModel BuildFromGguf(VulkanDevice device, GgufFile gguf, ModelConfig config, string spvDir,
-        long? residentCapacityOverrideBytes)
+        long? residentCapacityOverrideBytes, Func<VulkanGpuMemoryPressure?>? otherPressureProbe = null)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(gguf);
@@ -52,9 +55,13 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         // Residency gate BEFORE touching the device (the 122B WDDM-thrash class: refuse with numbers, do not page).
         var plan = Qwen4ExpResidencyPlan.Create(tensors, config, residentCapacityOverrideBytes ?? device.ResidentCapacityBytes(), kvCapacity,
             GC.GetGCMemoryInfo().TotalAvailableMemoryBytes);
+        // #880: other processes' GPU memory (second dotllm, llama.cpp, ...) is invisible to VK_EXT_memory_budget, so read the OS counters.
+        var pressure = otherPressureProbe is not null ? otherPressureProbe() : device.ReadOtherProcessPressure();
+        if (pressure is not null)
+            plan = plan with { OtherProcessBytes = pressure.OtherBytes, OtherProcessDetail = pressure.DescribeCulprits() };
         if (!plan.Fits)
         {
-            string msg = "qwen4exp weights do not fit the Vulkan device's resident capacity: " + plan.Describe() + ". " +
+            string msg = "qwen4exp weights do not fit the Vulkan device's resident capacity: " + plan.Describe() + ". " + plan.DescribeShortfall() + " " +
                          "Quant types without a resident indexed-MoE kernel (everything but Q4_K/Q5_K/Q6_K/Q5_1/Q8_0 experts) are widened to F32 on upload.";
             if (!AllowOvercommit)
                 throw new NotSupportedException(msg + " Set DOTLLM_VK_ALLOW_OVERCOMMIT=1 to load anyway (expect paging).");
@@ -82,9 +89,15 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         Qwen4ExpGatedResidualKernel? gr = null;
         GroupRmsNormF32Kernel? groupRms = null;
         GdnPostScanGateF32Kernel? sigmoidGate = null;
+        VulkanQwen4ExpTransformerModel? model = null;
+        bool disposed = false;
         try
         {
+            var phase = System.Diagnostics.Stopwatch.StartNew();
+            var phases = new List<string>();
+            void Mark(string what) { phases.Add($"{what}={phase.Elapsed.TotalSeconds:F1}s"); phase.Restart(); }
             var layers = BuildHybridLayers(gguf, tensors, config, owned);
+            Mark("hybridLayers");
             var embDesc = tensors[Qwen4ExpTensors.TokenEmbd];
             nint embPtr = gguf.TensorDataPointer(embDesc);
             nint outPtr = embPtr; var outQt = embDesc.QuantizationType; int outM = embDesc.Shape[1], outK = embDesc.Shape[0];
@@ -96,6 +109,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                 device, config, layers, outputNormWeight: [1f], outPtr, outQt, outM, outK, embPtr, embDesc.QuantizationType,
                 spvDir, nCpuMoeLayers: 0);
 
+            Mark("coreWeights");
             long weightBytes = 0;
             using (var staging = VulkanStagingBuffer.Create(device, 64L << 20))
             {
@@ -113,11 +127,45 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                 weightBytes += head.Bytes;
             }
 
+            Mark("grWeights");
             // Routed experts are uploaded eagerly (resident): a model that cannot be resident was refused above, and the transient
             // per-forward upload path would be the 0.01 tok/s thrash class.
-            for (int il = 0; il < config.NumLayers; il++)
-                moeBundles.Add(VulkanQwen3MoeMoeUpload.UploadLayer(device, layers[il].Moe, config.HiddenSize, residentQuant: true));
+            // #874: one multi-threaded staging buffer for the whole load (parallel page-in + memcpy), and the next layers' banks
+            // allocated on background threads while the current layer copies (vkAllocateMemory is ~0.45 s/GiB here). A/B switch:
+            // DOTLLM_VULKAN_PARALLEL_UPLOAD=0 restores the serial per-layer staging and inline allocation.
+            bool parallelUpload = !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PARALLEL_UPLOAD"), "0", StringComparison.Ordinal);
+            using (var upStaging = parallelUpload
+                       ? VulkanStagingBuffer.CreateParallel(device, VulkanStagingBuffer.ParallelSlotBytes, VulkanStagingBuffer.ParallelSlotCount) : null)
+            using (var prealloc = parallelUpload && !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_BANK_PREALLOC"), "0", StringComparison.Ordinal) ? new VulkanBankPrealloc(device) : null)
+            {
+                const int AllocAhead = 2;
+                long heapBytes = device.DeviceLocalHeapBytes();
+                const long AheadMargin = 3L << 30;
+                void ScheduleLayer(int il)
+                {
+                    if (prealloc is null || il >= config.NumLayers) return;
+                    long[] sizes = VulkanQwen3MoeMoeUpload.BankAllocationSizes(layers[il].Moe, config.HiddenSize, residentQuant: true);
+                    // Near the device-local heap boundary allocation ORDER decides what falls back to the slower heap: allocate those inline.
+                    if (VulkanBankPrealloc.MayAllocateAhead(heapBytes, LiveDeviceBytes(device), prealloc.PendingBytes, sizes.Sum(), AheadMargin))
+                        prealloc.Schedule(sizes);
+                }
+                for (int il = 0; il < AllocAhead; il++) ScheduleLayer(il);
+                bool layerTrace = string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE"), "1", StringComparison.Ordinal);
+                for (int il = 0; il < config.NumLayers; il++)
+                {
+                    long tl = System.Diagnostics.Stopwatch.GetTimestamp();
+                    double cw0 = VulkanStagingBuffer.CopyWaitMilliseconds, aw0 = VulkanBankPrealloc.WaitMilliseconds, am0 = VulkanDevice.AllocateMemoryMilliseconds;
+                    moeBundles.Add(VulkanQwen3MoeMoeUpload.UploadLayer(device, layers[il].Moe, config.HiddenSize, residentQuant: true, upStaging, prealloc));
+                    ScheduleLayer(il + AllocAhead);
+                    if (layerTrace)
+                        Console.Error.WriteLine($"[vulkan-load] layer {il}: {System.Diagnostics.Stopwatch.GetElapsedTime(tl).TotalMilliseconds:F0} ms " +
+                            $"(memcpy wait {VulkanStagingBuffer.CopyWaitMilliseconds - cw0:F0}, alloc wait {VulkanBankPrealloc.WaitMilliseconds - aw0:F0}, " +
+                            $"vkAllocateMemory thread-ms {VulkanDevice.AllocateMemoryMilliseconds - am0:F0}, live {LiveDeviceBytes(device) >> 20} MiB)");
+                }
+                upStaging?.WaitAll();   // the banks are consumed by compute right after the load: drain every queued copy first
+            }
 
+            Mark("moeBanks");
             Qwen4ExpPleBranch? ple = null;
             int pleLayer = -1;
             if (q4.Ple is { } pc)
@@ -130,13 +178,57 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             groupRms = GroupRmsNormF32Kernel.Create(device, spvDir);
             sigmoidGate = GdnPostScanGateF32Kernel.Create(device, spvDir, sigmoidGate: true);
 
-            var built = new VulkanQwen4ExpTransformerModel(device, gguf, config, core, attnGr.ToArray(), ffnGr.ToArray(), head, moeBundles.ToArray(),
+            // #880: allocate the per-forward scratch for the planned row count NOW, so (a) the post-upload check below counts it and (b) no
+            // forward up to that size has to grow it after the weights fill the heap (a small-then-larger call order lost the device).
+            int plannedRows = Qwen4ExpResidencyPlan.PlannedRows(kvCapacity);
+            try { core.Q4EnsureCapacity(plannedRows); }
+            catch (InvalidOperationException e) when (e.InnerException is Interop.VulkanException)
+            {
+                throw new NotSupportedException(e.Message + (AllowOvercommit ? "" : " Set DOTLLM_VK_PLANNED_ROWS to a smaller value to load with less scratch."), e);
+            }
+
+            Mark("ple+kernels");
+            if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE"), "1", StringComparison.Ordinal))
+                Console.Error.WriteLine($"[vulkan-load] phases: {string.Join(", ", phases)}; vkAllocateMemory={VulkanDevice.AllocateMemoryMilliseconds / 1000:F1}s, " +
+                                        $"staging memcpy={VulkanStagingBuffer.MemcpyMilliseconds / 1000:F1}s/{VulkanStagingBuffer.MemcpyBytes / (1024 * 1024)} MiB (thread-sum), " +
+                                        $"bank uploads={VulkanQwen3MoeMoeUpload.BanksMilliseconds / 1000:F1}s, submitter waited {VulkanStagingBuffer.CopyWaitMilliseconds / 1000:F1}s on memcpy and {VulkanBankPrealloc.WaitMilliseconds / 1000:F1}s on bank allocation; {device.MemorySnapshot()}");
+            model = new VulkanQwen4ExpTransformerModel(device, gguf, config, core, attnGr.ToArray(), ffnGr.ToArray(), head, moeBundles.ToArray(),
                 ple, pleLayer, owned, hostOnly, gr, groupRms, sigmoidGate, kvCapacity, weightBytes);
-            built._spvDir = spvDir;
-            return built;
+            model._spvDir = spvDir;
+            try
+            {
+                model.EnsureScratch(plannedRows);   // the model's own (small) scratch too, so no forward up to plannedRows allocates anything
+            // #880: re-check after the upload. Another process may have grown while we were loading; surface it here with numbers
+                // instead of letting the first forward end in VK_ERROR_DEVICE_LOST.
+                var after = otherPressureProbe is not null ? otherPressureProbe() : device.ReadOtherProcessPressure();
+                if (after is not null)
+                {
+                    long ours = device.LiveBytesTotal();
+                    long short_ = Qwen4ExpResidencyPlan.PostUploadShortfall(ours, after.OtherBytes, plan.CapacityBytes, plan.HeadroomBytes);
+                    if (short_ > 0)
+                    {
+                        string msg = $"after the qwen4exp upload this process holds {ours / (double)(1L << 30):F1} GiB and other processes hold " +
+                                     $"{after.OtherBytes / (double)(1L << 30):F1} GiB ({after.DescribeCulprits()}), " +
+                                     $"{short_ / (double)(1L << 30):F1} GiB over the {plan.BudgetBytes / (double)(1L << 30):F1} GiB budget. " +
+                                     "Close the other GPU consumers (a second dotllm, llama.cpp, Lemonade, Docker, ollama, a browser); " +
+                                     "oversubscribing GPU memory can end in VK_ERROR_DEVICE_LOST.";
+                        if (!AllowOvercommit)
+                            throw new NotSupportedException(msg + " Set DOTLLM_VK_ALLOW_OVERCOMMIT=1 to continue anyway.");
+                        Console.Error.WriteLine("[dotLLM] WARNING: " + msg + " DOTLLM_VK_ALLOW_OVERCOMMIT=1: continuing.");
+                    }
+                }
+            }
+            catch
+            {
+                model.Dispose();   // owns every resource built above now
+                disposed = true;
+                throw;
+            }
+            return model;
         }
         catch
         {
+            if (disposed) throw;
             foreach (var m in moeBundles) m.Dispose();
             foreach (var g in attnGr) g.Dispose();
             foreach (var g in ffnGr) g.Dispose();
@@ -147,6 +239,14 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             if (hostOnly is { } h) VulkanWeightImportPolicy.UnregisterHostOnly(h.Item1);
             throw;
         }
+    }
+
+    /// <summary>Bytes this device object has allocated across all heaps (the sum is conservative once allocations fall back to the host heap).</summary>
+    private static long LiveDeviceBytes(VulkanDevice device)
+    {
+        long sum = 0;
+        for (int h = 0; h < 16; h++) sum += device.LiveBytesOnHeap(h);
+        return sum;
     }
 
     private static Qwen3MoeLayerWeights[] BuildHybridLayers(GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> t,

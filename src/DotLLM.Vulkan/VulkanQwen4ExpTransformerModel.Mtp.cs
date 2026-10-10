@@ -315,15 +315,24 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
     private void EnsureDeviceHeadroom(long headBytes)
     {
         if (AllowOvercommit) return;
-        long local = _device.DeviceLocalHeapBytes();
-        long trunk = _device.TotalLiveBytes();   // what the process really holds now (the load-time plan over-estimates by ~10 GiB)
+        // #880: compare like with like. The capacity is what the device can really hold resident (UMA: device-local heap PLUS the shared
+        // heap the trunk already spills into - ~11 GiB of the real file lives there; discrete: VRAM only), the trunk is what this process
+        // holds in those same heaps, and other processes' GPU memory is subtracted. The old check compared ALL live bytes with the
+        // device-local heap alone, so it refused with ~30 GiB of the shared heap unused.
+        // The usable capacity is the OS limit (UMA: ~0.64 x RAM, measured), not the sum of the advertised heaps, and the allocation that
+        // crosses it does not fail - the NEXT submit does, and the device is then unusable. No extra headroom is subtracted: the cap
+        // already is the point of failure and everything counted below is real.
+        long local = VulkanMemoryCapacity.UsableCapacityBytes(_device.ResidentCapacityBytes(),
+            GC.GetGCMemoryInfo().TotalAvailableMemoryBytes, _device.PhysicalDeviceTypeValue);
+        long trunk = _device.ResidentLiveBytes();
+        long others = _device.ReadOtherProcessPressure()?.OtherBytes ?? 0;
         long scratch = Qwen4ExpResidencyPlan.KvBytes(Config, _kvCapacity) + (1L << 30) + (long)AbsorbChunk * _streams * _hidden * 4 * 8;
-        long need = trunk + headBytes + scratch;
+        long need = trunk + headBytes + scratch + others;
         if (need <= local) return;
         static string G(long b) => $"{b / (double)(1L << 30):F1} GiB";
         throw new NotSupportedException(
             $"The MTP head does not fit the device-local heap next to the resident trunk: resident {G(trunk)} + head {G(headBytes)} + KV/scratch {G(scratch)} = " +
-            $"{G(need)} against a {G(local)} heap (a failed upload would leave the device unable to allocate at all). Use a smaller trunk quantisation, " +
+            $"{G(need)} (incl. {G(others)} held by other processes) against a {G(local)} resident budget (a failed upload would leave the device unable to allocate at all). Use a smaller trunk quantisation, " +
             "or set DOTLLM_VK_ALLOW_OVERCOMMIT=1 to try anyway; decoding continues without speculation.");
     }
 

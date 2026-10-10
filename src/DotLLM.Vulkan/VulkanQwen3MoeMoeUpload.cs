@@ -177,6 +177,31 @@ internal static class VulkanQwen3MoeMoeUpload
         }
     }
 
+    private static long s_banksTicks;
+
+    /// <summary>Process-wide time in the three routed-bank uploads of <see cref="UploadLayer"/> (allocation take + streamed copy) (#874 diagnostic).</summary>
+    public static double BanksMilliseconds => Interlocked.Read(ref s_banksTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+    /// <summary>
+    /// Byte sizes of the three routed-expert banks (gate, down, up) <see cref="UploadLayer"/> will allocate for <paramref name="moe"/>,
+    /// in allocation order. Mirrors <c>UploadRoutedBankAnyQuant</c> so a <see cref="VulkanBankPrealloc"/> can allocate them ahead (#874).
+    /// </summary>
+    public static long[] BankAllocationSizes(MoeLayerWeights moe, int hiddenSize, bool residentQuant)
+    {
+        int numE = moe.NumExperts;
+        int interm = moe.IntermediateSize;
+        long w1Elems = (long)interm * hiddenSize;
+        long w2Elems = (long)hiddenSize * interm;
+        long Size(QuantizationType qt, int mDim, int kDim, long elemsF32)
+            => qt == QuantizationType.F32 ? (long)numE * elemsF32 * sizeof(float) : (long)numE * Dequantize.RowByteSize(kDim, qt) * mDim;
+        return
+        [
+            Size(ResolveBankQuantType(moe.GateExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize), interm, hiddenSize, w1Elems),
+            Size(ResolveBankQuantType(moe.DownExpsRawQt, residentQuant, moe.HasRawQuantView, interm), hiddenSize, interm, w2Elems),
+            Size(ResolveBankQuantType(moe.UpExpsRawQt, residentQuant, moe.HasRawQuantView, hiddenSize), interm, hiddenSize, w1Elems),
+        ];
+    }
+
     /// <summary>
     /// Uploads one MoE layer's routed banks plus shared-expert weights.
     /// </summary>
@@ -202,9 +227,11 @@ internal static class VulkanQwen3MoeMoeUpload
     /// forwards), <c>false</c> in streaming mode (per-forward F32 upload is
     /// the existing default).
     /// </param>
+    /// <param name="sharedStaging">Optional caller-owned (typically multi-threaded) staging buffer reused across layers; null = a per-layer one (#874).</param>
+    /// <param name="prealloc">Optional pool of bank buffers allocated ahead on background threads; null = allocate inline (#874).</param>
     public static unsafe LayerBundle UploadLayer(
         VulkanDevice device, MoeLayerWeights moe, int hiddenSize,
-        bool residentQuant = false)
+        bool residentQuant = false, VulkanStagingBuffer? sharedStaging = null, VulkanBankPrealloc? prealloc = null)
     {
         int numE = moe.NumExperts;
         int interm = moe.IntermediateSize;
@@ -225,7 +252,10 @@ internal static class VulkanQwen3MoeMoeUpload
         long maxSlabBytesF32 = Math.Max(w1Elems, w2Elems) * sizeof(float);
         long gateBytes = (long)numE * hiddenSize * sizeof(float);
         long stageBytes = Math.Max(maxSlabBytesF32, gateBytes);
-        using var staging = VulkanStagingBuffer.Create(device, stageBytes);
+        // #874: a caller-owned staging buffer (one per load, multi-threaded) replaces the per-layer one when its slots are big enough.
+        bool useShared = sharedStaging is not null && sharedStaging.Capacity >= Math.Min(stageBytes, VulkanStagingBuffer.MaxChunkBytes / VulkanStagingBuffer.SlotCount);
+        using var ownStaging = useShared ? null : VulkanStagingBuffer.Create(device, stageBytes);
+        var staging = useShared ? sharedStaging! : ownStaging!;
 
         // ── Router gate ──────────────────────────────────────────────────────
         var gate = device.AllocateDeviceLocal(gateBytes);
@@ -239,13 +269,15 @@ internal static class VulkanQwen3MoeMoeUpload
         //   (2) Resident-quant: copy each per-expert raw block slab into
         //       staging at the expert's contiguous slot, then copy. Device
         //       buffer is at a fraction of the F32 size (quant-dependent).
+        long tBanks = System.Diagnostics.Stopwatch.GetTimestamp();
         VulkanDevice.Buffer w1Bank = UploadRoutedBankAnyQuant(
-            device, staging, moe, w1Qt, kind: 'G', numE: numE, mDim: interm, kDim: hiddenSize, elemsF32: w1Elems);
+            device, staging, moe, w1Qt, kind: 'G', numE: numE, mDim: interm, kDim: hiddenSize, elemsF32: w1Elems, prealloc);
         VulkanDevice.Buffer w2Bank = UploadRoutedBankAnyQuant(
-            device, staging, moe, w2Qt, kind: 'D', numE: numE, mDim: hiddenSize, kDim: interm, elemsF32: w2Elems);
+            device, staging, moe, w2Qt, kind: 'D', numE: numE, mDim: hiddenSize, kDim: interm, elemsF32: w2Elems, prealloc);
         VulkanDevice.Buffer w3Bank = UploadRoutedBankAnyQuant(
-            device, staging, moe, w3Qt, kind: 'U', numE: numE, mDim: interm, kDim: hiddenSize, elemsF32: w1Elems);
+            device, staging, moe, w3Qt, kind: 'U', numE: numE, mDim: interm, kDim: hiddenSize, elemsF32: w1Elems, prealloc);
 
+        Interlocked.Add(ref s_banksTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tBanks);
         // ── Shared expert (optional) ─────────────────────────────────────────
         VulkanDevice.Buffer? sharedGate = null, sharedUp = null, sharedDown = null;
         VulkanDevice.Buffer? sharedExpertGate = null;
@@ -320,12 +352,12 @@ internal static class VulkanQwen3MoeMoeUpload
     /// </summary>
     private static VulkanDevice.Buffer UploadRoutedBankAnyQuant(
         VulkanDevice device, VulkanStagingBuffer staging, MoeLayerWeights moe,
-        QuantizationType quantType, char kind, int numE, int mDim, int kDim, long elemsF32)
+        QuantizationType quantType, char kind, int numE, int mDim, int kDim, long elemsF32, VulkanBankPrealloc? prealloc = null)
     {
         if (quantType == QuantizationType.F32)
         {
             long bankBytes = (long)numE * elemsF32 * sizeof(float);
-            var bank = device.AllocateDeviceLocal(bankBytes);
+            var bank = prealloc?.Take(bankBytes) ?? device.AllocateDeviceLocal(bankBytes);
             UploadRoutedBank(device, staging, moe, kind, bank, numE, elemsF32);
             return bank;
         }
@@ -334,7 +366,7 @@ internal static class VulkanQwen3MoeMoeUpload
             long rowBytes = Dequantize.RowByteSize(kDim, quantType);
             long perExpertBytes = rowBytes * mDim;
             long bankBytes = (long)numE * perExpertBytes;
-            var bank = device.AllocateDeviceLocal(bankBytes);
+            var bank = prealloc?.Take(bankBytes) ?? device.AllocateDeviceLocal(bankBytes);
             UploadRoutedBankResidentQuant(device, staging, moe, quantType, kind, bank, numE, perExpertBytes);
             return bank;
         }
