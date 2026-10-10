@@ -150,10 +150,17 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                         prealloc.Schedule(sizes);
                 }
                 for (int il = 0; il < AllocAhead; il++) ScheduleLayer(il);
+                bool layerTrace = string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE"), "1", StringComparison.Ordinal);
                 for (int il = 0; il < config.NumLayers; il++)
                 {
+                    long tl = System.Diagnostics.Stopwatch.GetTimestamp();
+                    double cw0 = VulkanStagingBuffer.CopyWaitMilliseconds, aw0 = VulkanBankPrealloc.WaitMilliseconds, am0 = VulkanDevice.AllocateMemoryMilliseconds;
                     moeBundles.Add(VulkanQwen3MoeMoeUpload.UploadLayer(device, layers[il].Moe, config.HiddenSize, residentQuant: true, upStaging, prealloc));
                     ScheduleLayer(il + AllocAhead);
+                    if (layerTrace)
+                        Console.Error.WriteLine($"[vulkan-load] layer {il}: {System.Diagnostics.Stopwatch.GetElapsedTime(tl).TotalMilliseconds:F0} ms " +
+                            $"(memcpy wait {VulkanStagingBuffer.CopyWaitMilliseconds - cw0:F0}, alloc wait {VulkanBankPrealloc.WaitMilliseconds - aw0:F0}, " +
+                            $"vkAllocateMemory thread-ms {VulkanDevice.AllocateMemoryMilliseconds - am0:F0}, live {LiveDeviceBytes(device) >> 20} MiB)");
                 }
                 upStaging?.WaitAll();   // the banks are consumed by compute right after the load: drain every queued copy first
             }
