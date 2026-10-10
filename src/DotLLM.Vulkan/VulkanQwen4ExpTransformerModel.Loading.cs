@@ -165,6 +165,19 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                 upStaging?.WaitAll();   // the banks are consumed by compute right after the load: drain every queued copy first
             }
 
+            // #890: the shared-expert gate/up/down F32 host copies (LoadMoe.SharedF32) existed only to be uploaded as F16; every copy is drained
+            // above. They are ~3.3 GiB of private memory on the real UD-Q4_K_XL file, and the OS caps a process's total residency (~82 GiB on
+            // a 127 GiB box) - with a 79.7 GiB trunk that is the whole margin. This model never routes an MoE layer through the host
+            // (nCpuMoeLayers: 0), so nothing reads them again. A/B: DOTLLM_VK_KEEP_HOST_SHARED=1 keeps them.
+            if (!string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_KEEP_HOST_SHARED"), "1", StringComparison.Ordinal))
+            {
+                long freed = 0;
+                for (int il = 0; il < layers.Length; il++)
+                    freed += ReleaseHostSharedExperts(layers[il].Moe, owned, config.HiddenSize);
+                if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE"), "1", StringComparison.Ordinal))
+                    Console.Error.WriteLine($"[vulkan-load] released {freed >> 20} MiB of host F32 shared-expert copies");
+            }
+
             Mark("moeBanks");
             Qwen4ExpPleBranch? ple = null;
             VulkanQwen4ExpPleGpu? pleGpu = null;
@@ -244,6 +257,28 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             if (hostOnly is { } h) VulkanWeightImportPolicy.UnregisterHostOnly(h.Item1);
             throw;
         }
+    }
+
+    /// <summary>
+    /// Frees the host F32 shared-expert projections of one layer (allocated by <c>LoadMoe</c>, tracked in <paramref name="owned"/>) once they
+    /// have been uploaded, and zeroes the pointers. Returns the bytes released.
+    /// </summary>
+    internal static long ReleaseHostSharedExperts(MoeLayerWeights moe, List<nint> owned, int hiddenSize)
+    {
+        long bytes = 0;
+        long elems = (long)moe.SharedIntermediateSize * hiddenSize;
+        foreach (nint[] arr in new[] { moe.SharedGateProj, moe.SharedUpProj, moe.SharedDownProj })
+        {
+            for (int s = 0; s < arr.Length; s++)
+            {
+                nint p = arr[s];
+                if (p == 0 || !owned.Remove(p)) continue;   // only pointers this loader allocated
+                NativeMemory.AlignedFree((void*)p);
+                arr[s] = 0;
+                bytes += elems * sizeof(float);
+            }
+        }
+        return bytes;
     }
 
     /// <summary>Bytes this device object has allocated across all heaps (the sum is conservative once allocations fall back to the host heap).</summary>
