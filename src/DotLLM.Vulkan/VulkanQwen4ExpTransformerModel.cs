@@ -91,6 +91,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     private readonly (nint Ptr, long Bytes)? _hostOnlyTable;
     private readonly Qwen4ExpGatedResidualKernel _gr;
     private readonly GroupRmsNormF32Kernel _groupRms;
+    internal GroupRmsNormOopF32Kernel? _groupRmsOop;
     private readonly GdnPostScanGateF32Kernel _sigmoidGate;
     private readonly int _hidden, _streams, _lowRank, _vocab, _kvCapacity;
     private readonly float _eps;
@@ -332,7 +333,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
 
         bool resized = _core.Q4EnsureCapacity(T);
         EnsureScratch(T);
-        if (resized) { _gr.InvalidateDescriptorCache(); _groupRms.InvalidateDescriptorCache(); _sigmoidGate.InvalidateDescriptorCache(); }
+        if (resized) { _gr.InvalidateDescriptorCache(); _groupRms.InvalidateDescriptorCache(); _groupRmsOop?.InvalidateDescriptorCache(); _sigmoidGate.InvalidateDescriptorCache(); }
         _core.Q4UploadPositions(positions);
 
         // Speculative verify (#820): record the recurrent state after each of the first T-1 rows (GDN scan twin + conv windows + n-gram state).
@@ -370,6 +371,10 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         // single-token decode runs as one command buffer except at the host PLE step.
         // Short forwards (decode, 2..8-row MTP verify) stay in ONE command buffer: each split costs a submit + fence wait (~0.1 ms x 96 per forward, #876).
         bool splitHalves = T > SplitHalvesAbove;
+        // #885: ONE fence-free mid-forward submit a few layers after the host PLE step (or from the start without one): the GPU runs those layers
+        // while the host records the remaining ~45 (~1.3 ms of recording that would otherwise be idle GPU time). Same queue order, so bit-identical.
+        int splitAt = !splitHalves && DecodeSplitLayers > 0 && Trace is null && (!_core.Q4StageProfiling || StageTimestamps)
+            ? (_ple is not null ? _pleLayer : 0) + DecodeSplitLayers : -1;
 
         void GrRead(VulkanQwen4ExpGrWeights w, VulkanDevice.Buffer src, int tokens, bool inject)
             => RecordGrRead(cmd, w, src, st.NormOutput, tokens, inject);
@@ -465,9 +470,6 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
 
             // ── MoE ──
             GrRead(_ffnGr[il], _res, T, inject: true);
-            VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, st.NormOutput, st.MoeSharedInput, 0, 0, (ulong)((long)T * H * 4));
-            Barrier();
-            _core.Q4Stage("moe_copy");
             _core.Q4RecordMoe(cmd, _moe[il], T);
             Barrier();
             _core.Q4Stage("moe_total");
@@ -475,6 +477,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
             Barrier();
             _core.Q4Stage("gr_write_x");
             if (splitHalves) { End(); Begin(); }
+            if (il == splitAt) { submit.SplitSubmit(); cmd = submit.CommandBuffer; DecodeSplits++; }
 
             if (Trace is { } tr)
             {
@@ -554,6 +557,39 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     /// </summary>
     public static bool PleOnGpu { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_PLE_GPU") != "0";
 
+    /// <summary>Test hook (#885): Q8_0 GEMVs recorded through the wide MMVQ twins.</summary>
+    internal long WideQ8Dispatches => _core.Q4WideDispatches;
+
+    /// <summary>Diagnostic (#885): wide Q8_0 MMVQ twins for the gated-residual projections.</summary>
+    public static bool Q8Wide
+    {
+        get => VulkanQwen3MoeHybridTransformerModel.Q4WideEnabled;
+        set => VulkanQwen3MoeHybridTransformerModel.Q4WideEnabled = value;
+    }
+
+    /// <summary>Test hook (#885): gated-residual reads recorded on the fused path.</summary>
+    internal long GrFusedReads { get; private set; }
+
+    /// <summary>Test hook (#885): MoE layers that ran on the fused single-token decode chain.</summary>
+    internal long MoeFusedLayers => _core.Q4MoeFusedLayers;
+
+    /// <summary>Diagnostic (#885): fused single-token MoE decode chain (see <see cref="VulkanQwen3MoeHybridTransformerModel.Q4MoeDecodeFused"/>).</summary>
+    public static bool MoeDecodeFused
+    {
+        get => VulkanQwen3MoeHybridTransformerModel.Q4MoeDecodeFused;
+        set => VulkanQwen3MoeHybridTransformerModel.Q4MoeDecodeFused = value;
+    }
+
+    /// <summary>
+    /// Layers of work submitted ahead (fence-free) after the PLE step so the GPU runs while the host records the rest of a short forward (#885); 0 disables.
+    /// <c>DOTLLM_VK_Q4E_SPLIT_LAYERS</c> at startup, default 3. Read at the top of every forward.
+    /// </summary>
+    public static int DecodeSplitLayers { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_SPLIT_LAYERS"), out int dsl) && dsl >= 0 ? dsl : 3;
+
+    /// <summary>Test hook (#885): forwards that took the mid-forward submit.</summary>
+    internal long DecodeSplits { get; private set; }
+
     /// <summary>Test hook (#885): forwards whose PLE key/value projections ran on the GPU.</summary>
     internal long PleGpuForwards { get; private set; }
 
@@ -579,25 +615,45 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     {
         int S = _streams, H = _hidden, row = S * H;
         long rowBytes = (long)row * 4;
-        VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, src, _xn, 0, 0, (ulong)(tokens * rowBytes));
-        KernelSupport.ComputeTransferFullBarrier(cmd);
-        _core.Q4Stage("gr.copy");
-        _groupRms.Record(cmd, _xn, w.Norm, tokens, S, H, _eps);
-        KernelSupport.ComputeTransferFullBarrier(cmd);
-        _core.Q4Stage("gr.grouprms");
-        _core.Q4RecordMatmul(cmd, w.Down, w.DownQt, _xn, _low, outputDim: _lowRank, inputDim: row, seqLen: tokens);
+        // #885: the residual -> scratch copy is folded into an out-of-place norm, and the inject projection (independent of the
+        // low-rank chain, M = 4 rows so latency-bound) runs concurrently with the down projection instead of after the mix-mean.
+        bool fast = _groupRmsOop is not null && GrFused;
+        if (fast) GrFusedReads++;
+        if (fast)
+        {
+            _groupRmsOop!.Record(cmd, src, w.Norm, _xn, tokens, S, H, _eps);
+            KernelSupport.ComputeTransferFullBarrier(cmd);
+            _core.Q4Stage("gr.grouprms");
+        }
+        else
+        {
+            VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, src, _xn, 0, 0, (ulong)(tokens * rowBytes));
+            KernelSupport.ComputeTransferFullBarrier(cmd);
+            _core.Q4Stage("gr.copy");
+            _groupRms.Record(cmd, _xn, w.Norm, tokens, S, H, _eps);
+            KernelSupport.ComputeTransferFullBarrier(cmd);
+            _core.Q4Stage("gr.grouprms");
+        }
+        // fast path + inject: quantize xn once, then record the down GEMV and the (latency-bound, 4-row) inject GEMV with no barrier between them
+        bool q8 = fast && tokens == 1 && w.DownQt == QuantizationType.Q8_0 && w.UpQt == QuantizationType.Q8_0;
+        bool xqReady = q8 && _core.Q4PrepareQ8Row(cmd, _xn, row);
+        if (!(xqReady && _core.Q4RecordQ8Wide(cmd, kSplit: true, w.Down, _low, _lowRank, row)))
+            _core.Q4RecordMatmul(cmd, w.Down, w.DownQt, _xn, _low, outputDim: _lowRank, inputDim: row, seqLen: tokens, xqReady: xqReady);
+        if (fast && inject) _core.Q4RecordMatmul(cmd, w.Inject!, w.InjectQt, _xn, _gains, outputDim: S, inputDim: row, seqLen: tokens);
         KernelSupport.ComputeTransferFullBarrier(cmd);
         _core.Q4Stage("gr.down");
         _gr.RecordActivateLowRank(cmd, _low, tokens * _lowRank, S);
         KernelSupport.ComputeTransferFullBarrier(cmd);
         _core.Q4Stage("gr.act");
-        _core.Q4RecordMatmul(cmd, w.Up, w.UpQt, _low, _mix, outputDim: row, inputDim: _lowRank, seqLen: tokens);
+        if (!(q8 && _lowRank % 32 == 0 && _core.Q4PrepareQ8Row(cmd, _low, _lowRank) && _core.Q4RecordQ8Wide(cmd, kSplit: false, w.Up, _mix, row, _lowRank)))
+            _core.Q4RecordMatmul(cmd, w.Up, w.UpQt, _low, _mix, outputDim: row, inputDim: _lowRank, seqLen: tokens);
         KernelSupport.ComputeTransferFullBarrier(cmd);
         _core.Q4Stage("gr.up");
         _gr.RecordMixMean(cmd, dst, _mix, _xn, tokens, S, H);
+        if (inject && fast) _gr.RecordInjectGains(cmd, _gains, tokens, S);   // independent of the mix-mean: same barrier slot
         KernelSupport.ComputeTransferFullBarrier(cmd);
         _core.Q4Stage("gr.mixmean");
-        if (inject)
+        if (inject && !fast)
         {
             _core.Q4RecordMatmul(cmd, w.Inject!, w.InjectQt, _xn, _gains, outputDim: S, inputDim: row, seqLen: tokens);
             KernelSupport.ComputeTransferFullBarrier(cmd);
@@ -607,6 +663,12 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
             _core.Q4Stage("gr.inject_gains");
         }
     }
+
+    /// <summary>
+    /// Gated-residual reads fold the residual copy into an out-of-place group norm and overlap the inject projection with the low-rank
+    /// chain (#885). Bit-identical to the unfused sequence. On by default; <c>DOTLLM_VK_Q4E_GR_FUSED=0</c> (or setting this) restores it.
+    /// </summary>
+    public static bool GrFused { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_GR_FUSED") != "0";
 
     /// <summary>
     /// Start paging the n-gram table rows of a chunk in at the top of the forward (#822) and, for MTP, while the draft steps run. On by default;
@@ -669,7 +731,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         _res?.Dispose(); _xn?.Dispose(); _low?.Dispose(); _mix?.Dispose(); _gains?.Dispose(); _headRes?.Dispose();
         _headIn?.Dispose(); _headLogits?.Dispose();
         _snapGdn?.Dispose(); _snapKernel?.Dispose();
-        _gr.Dispose(); _groupRms.Dispose(); _sigmoidGate.Dispose();
+        _gr.Dispose(); _groupRms.Dispose(); _groupRmsOop?.Dispose(); _sigmoidGate.Dispose();
         _core.Dispose();
         foreach (nint p in _owned) NativeMemory.AlignedFree((void*)p);
         _owned.Clear();

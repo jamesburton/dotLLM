@@ -527,6 +527,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     internal void Q4Stage(string name) => MoeStage(name);
     /// <summary>Charges host-measured ms to a stage label (#885 diagnostic; only while stage profiling is on).</summary>
     internal void Q4AddStageMs(string name, double ms) { if (MoeStageProfileEnabled) _moeStageMs[name] = _moeStageMs.GetValueOrDefault(name) + ms; }
+    internal bool Q4StageProfiling => MoeStageProfileEnabled;
     internal void Q4StageBegin() { if (StageTimestamps && MoeStageProfileEnabled) TsBegin(); else MoeStageBegin(); }
     private readonly Dictionary<string, double> _moeStageMs = new();
     private long _moeStageLast;
@@ -1890,6 +1891,15 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         int expandedRows = seqLen * topK;
         MoeStageBegin();
 
+        // qwen4exp (no post-attention norm): the block input is already in NormOutput. Single-token decode on the fused indexed-MMVQ chain (#885);
+        // everything else stages a copy for the serial shared expert (the routed scatter overwrites NormOutput).
+        if (postAttnNormWeight is null)
+        {
+            if (CanRecordMoeDecodeQ4E(moeW, seqLen, hidden)) { RecordMoeDecodeQ4E(cmdBuf, moeW, hidden); return; }
+            RecordCopyBufferRange(cmdBuf, _state.NormOutput, _state.MoeSharedInput, 0, 0, (ulong)((long)seqLen * hidden * sizeof(float)));
+            KernelSupport.ComputeTransferFullBarrier(cmdBuf);
+        }
+
         // 1. Router gate logits.
         RecordMatmul(cmdBuf, moeW.Gate, QuantizationType.F32,
             _state.NormOutput, _state.MoeRouterLogits,
@@ -2062,6 +2072,103 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             RecordSharedExpert(cmdBuf, moeW, postAttnNormWeight, seqLen, hidden, eps);
             MoeStage("shared_expert");
         }
+    }
+
+    /// <summary>
+    /// qwen4exp single-token MoE decode on the fused chain (#885), the no-post-attention-norm twin of <see cref="RecordMoeDecodeFast"/>.
+    /// On by default; <c>DOTLLM_VK_Q4E_MOE_FUSED=0</c> (or setting this) restores the general serial path.
+    /// </summary>
+    internal static bool Q4MoeDecodeFused { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_MOE_FUSED") != "0";
+
+    /// <summary>Test hook (#885): MoE layers recorded on the fused qwen4exp decode chain.</summary>
+    internal long Q4MoeFusedLayers { get; private set; }
+
+    /// <summary>
+    /// One decode row, resident Q4_K gate/up (indexed MMVQ with the broadcast folded in as xDiv), any MMVQ-capable down bank (K-quants and the
+    /// legacy Q5_1 / Q8_0 of the real file), and a sigmoid-gated shared expert. Layers outside that (UD-Q4_K_XL layer 2 has Q5_K gate/up) keep the general path.
+    /// </summary>
+    private bool CanRecordMoeDecodeQ4E(VulkanQwen3MoeMoeUpload.LayerBundle moeW, int seqLen, int hidden)
+        => Q4MoeDecodeFused && seqLen == 1 && seqLen < GroupedMinTokens
+            && _kernels.QuantizeQ8_1RowsActivations is not null && _kernels.SwiGluQuantizeFused is not null && _kernels.MoeMmvqQ4K is not null
+            && moeW.W1QuantType == QuantizationType.Q4_K && moeW.W3QuantType == QuantizationType.Q4_K
+            && DownMmvqFits(moeW.W2QuantType, moeW.IntermediateSize)
+            && moeW.HasSharedExpert && moeW.SharedExpertGate is not null && moeW.SharedGate is not null && moeW.SharedUp is not null && moeW.SharedDown is not null
+            && (hidden % 256) == 0 && (moeW.IntermediateSize % 32) == 0
+            && QuantizeQ8_1RowsKernel.PackedBytes(moeW.NumExpertsPerTok, moeW.IntermediateSize) <= _state.MoeSiluInterXq.Size;
+
+    private void RecordMoeDecodeQ4E(nint cmdBuf, VulkanQwen3MoeMoeUpload.LayerBundle moeW, int hidden)
+    {
+        int interm = moeW.IntermediateSize;
+        int numE = moeW.NumExperts;
+        int topK = moeW.NumExpertsPerTok;
+        int sharedI = moeW.SharedIntermediateSize;
+        Q4MoeFusedLayers++;
+        CountMoePath(MoePath.FusedDecode);
+        MoeStageBegin();
+
+        // Phase 0: quantize the single block-input row once (the indexed MMVQ reads it for every topK slot via xDiv).
+        _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf, _state.NormOutput, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, n: 1, k: hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("quantize_x");
+
+        // Phase 1: router + the shared-expert gate/up (Q8_0 raw copies read the quantized row; otherwise the F32/F16 matmul reads NormOutput) + gate logit.
+        RecordMatmul(cmdBuf, moeW.Gate, QuantizationType.F32, _state.NormOutput, _state.MoeRouterLogits, outputDim: numE, inputDim: hidden, seqLen: 1);
+        if (moeW.SharedGateQ8 is not null && moeW.SharedUpQ8 is not null && _kernels.MatMulQ8Mmvq is not null)
+        {
+            RecordMatmul(cmdBuf, moeW.SharedGateQ8, QuantizationType.Q8_0, _state.NormOutput, _state.MoeSharedGate,
+                outputDim: sharedI, inputDim: hidden, seqLen: 1, xqReady: true);
+            RecordMatmul(cmdBuf, moeW.SharedUpQ8, QuantizationType.Q8_0, _state.NormOutput, _state.MoeSharedUp,
+                outputDim: sharedI, inputDim: hidden, seqLen: 1, xqReady: true);
+        }
+        else
+        {
+            RecordMatmul(cmdBuf, moeW.SharedGate!, moeW.SharedQuantType, _state.NormOutput, _state.MoeSharedGate, outputDim: sharedI, inputDim: hidden, seqLen: 1);
+            RecordMatmul(cmdBuf, moeW.SharedUp!, moeW.SharedQuantType, _state.NormOutput, _state.MoeSharedUp, outputDim: sharedI, inputDim: hidden, seqLen: 1);
+        }
+        RecordMatmul(cmdBuf, moeW.SharedExpertGate!, QuantizationType.F32, _state.NormOutput, _state.MoeSharedGateLogits, outputDim: 1, inputDim: hidden, seqLen: 1);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("router");
+
+        // Phase 2: top-k routing + shared SwiGLU.
+        _kernels.MoeTopkSoftmax.Record(cmdBuf, _state.MoeRouterLogits, _state.MoeTopkIndices, _state.MoeTopkWeights,
+            seqLen: 1, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
+        _kernels.SwiGlu.Record(cmdBuf, _state.MoeSharedGate, _state.MoeSharedUp, _state.MoeSharedSilu, n: sharedI);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("topk");
+
+        // Phase 3: routed gate/up + shared down. The multi-row variant (2 output rows per workgroup) is the measured decode win (#885).
+        var gateUp = _kernels.MoeMmvqQ4K!;
+        if (EffMoeMrMinRows > 0 && SmallRowGemvEnabled && _kernels.MoeMmvqQ4KMr is { } q4Mr && (interm % q4Mr.RowsPerGroup) == 0)
+        { gateUp = q4Mr; CountSmallRow(SmallRowPath.MoeQ4KMr); }
+        gateUp.Record(cmdBuf, moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+            _state.MoeTopkIndices, _state.MoeGateInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
+        gateUp.Record(cmdBuf, moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+            _state.MoeTopkIndices, _state.MoeUpInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
+        RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType, _state.MoeSharedSilu, _state.MoeSharedSumA, outputDim: hidden, inputDim: sharedI, seqLen: 1);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("gate_up");
+
+        // Phase 4: routed SwiGLU fused with the Q8_1 quantize feeding the down projection.
+        _kernels.SwiGluQuantizeFused!.Record(cmdBuf, _state.MoeGateInter, _state.MoeUpInter, _state.MoeSiluInter,
+            _state.MoeSiluInterXq, _state.MoeSiluInterXds, n: topK * interm);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("swiglu");
+
+        // Phase 5: routed down.
+        CountMoePath(MoePath.MmvqDown);
+        if (IsLegacyQuant(moeW.W2QuantType)) CountMoePath(MoePath.MmvqLegacyDown);
+        RecordDownMmvq(cmdBuf, moeW.W2QuantType, moeW, hidden, interm, topK, numE, multiRow: EffMoeMrMinRows > 0 && SmallRowGemvEnabled);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("down");
+
+        // Phase 6: weighted scatter into NormOutput (every NormOutput reader finished in phase 1), then the shared sigmoid-gated add.
+        _kernels.MoeWeightedScatter.Record(cmdBuf, _state.MoeDownRows, _state.MoeTopkWeights, _state.NormOutput, seqLen: 1, topK: topK, hiddenSize: hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("weighted_scatter");
+        _kernels.MoeSigmoidGatedAdd.Record(cmdBuf, output: _state.NormOutput, b: _state.MoeSharedSumA, gateLogits: _state.MoeSharedGateLogits,
+            seqLen: 1, hiddenSize: hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MoeStage("shared_expert");
     }
 
     /// <summary>

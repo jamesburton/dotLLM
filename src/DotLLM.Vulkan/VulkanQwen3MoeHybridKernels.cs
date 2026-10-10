@@ -47,6 +47,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MoeIndexedMatmulQ5_1MmvqKernel? MoeMmvqQ5_1Mr { get; private set; }
     /// <summary>Dense Q8_0 decode MMVQ GEMV (dp4a, coalesced) for the GDN / attention / shared-expert projections (all Q8_0 in the UD-Q4_K_M GGUF).</summary>
     public MatMulQ8_0MmvqKernel? MatMulQ8Mmvq { get; private set; }
+    /// <summary>Wide Q8_0 MMVQ twins (#885): 4 rows per workgroup (small-K tall matrices) and 4 subgroups per row (large-K short matrices).</summary>
+    public MatMulQ8_0MmvqWideKernel? MatMulQ8MmvqWideRows { get; private set; }
+    public MatMulQ8_0MmvqWideKernel? MatMulQ8MmvqWideKSplit { get; private set; }
     /// <summary>Q8_0 multi-column MMVQ GEMV for 2..8 rows (#876); null when disabled (<c>DOTLLM_VK_SMALLROW_GEMV=0</c>) or unsupported.</summary>
     public MatMulQ8_0MmvqMultiKernel? MatMulQ8MmvqMulti { get; private set; }
     /// <summary>F32 multi-column GEMV for 2..8 rows (#876); null when disabled or unsupported.</summary>
@@ -561,6 +564,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             }
             if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_Q8_MMVQ") != "0")
                 kernels.MatMulQ8Mmvq = MatMulQ8_0MmvqKernel.TryCreate(device, spvDir);
+                kernels.MatMulQ8MmvqWideRows = MatMulQ8_0MmvqWideKernel.TryCreate(device, spvDir, rows: 4, ksplit: 1);
+                kernels.MatMulQ8MmvqWideKSplit = MatMulQ8_0MmvqWideKernel.TryCreate(device, spvDir, rows: 1, ksplit: 4);
             if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_DECODE_FUSED") != "0")
             {
                 kernels.RmsNormQuantizeFused = RmsNormQuantizeQ8_1FusedKernel.TryCreate(device, spvDir);
@@ -664,6 +669,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeMmvqQ4KMr?.InvalidateDescriptorCache();
         MoeMmvqQ5_1Mr?.InvalidateDescriptorCache();
         MatMulQ8Mmvq?.InvalidateDescriptorCache();
+        MatMulQ8MmvqWideRows?.InvalidateDescriptorCache();
+        MatMulQ8MmvqWideKSplit?.InvalidateDescriptorCache();
         MatMulQ8MmvqMulti?.InvalidateDescriptorCache();
         MatMulF32Multi?.InvalidateDescriptorCache();
         MatMulF16Multi?.InvalidateDescriptorCache();
@@ -687,7 +694,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     {
         MoeIndexedMatmulQ5_1?.Dispose(); MoeIndexedMatmulQ8_0?.Dispose(); MoeMmvqQ5_1?.Dispose(); MoeMmvqQ8_0?.Dispose(); MoeMmvqQ4KMr?.Dispose(); MoeMmvqQ5_1Mr?.Dispose();
         MoeGroupedQ5_1?.Dispose(); MoeGroupedQ8_0?.Dispose(); MoeGroupedQ4K16?.Dispose(); MoeGroupedQ5K16?.Dispose();
-        QGateDeinterleave?.Dispose(); GdnQkvSplit?.Dispose(); SwiGluQuantizeFused?.Dispose(); RmsNormQuantizeFused?.Dispose(); MatMulQ8Mmvq?.Dispose(); MoeMmvqQ6K?.Dispose(); MoeMmvqQ5K?.Dispose(); MoeMmvqQ4K?.Dispose();
+        QGateDeinterleave?.Dispose(); GdnQkvSplit?.Dispose(); SwiGluQuantizeFused?.Dispose(); RmsNormQuantizeFused?.Dispose(); MatMulQ8Mmvq?.Dispose(); MatMulQ8MmvqWideRows?.Dispose(); MatMulQ8MmvqWideKSplit?.Dispose(); MoeMmvqQ6K?.Dispose(); MoeMmvqQ5K?.Dispose(); MoeMmvqQ4K?.Dispose();
         MoeGroupedQ6K?.Dispose(); MoeGroupedQ5K?.Dispose(); MoeGroupedQ4K?.Dispose(); MoeUngroupScatter?.Dispose();
         MoeExpandGroupByExpert?.Dispose(); MoeExpertOffsets?.Dispose(); MoeBuildTileList?.Dispose(); MoeExpandGatherGroup?.Dispose(); MoeWeightedScatterGrouped?.Dispose();
         MoeSigmoidGatedAdd.Dispose();
