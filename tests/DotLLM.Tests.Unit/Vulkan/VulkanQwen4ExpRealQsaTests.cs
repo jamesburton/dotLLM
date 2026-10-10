@@ -95,6 +95,7 @@ public sealed class VulkanQwen4ExpRealQsaTests
             Prefill(warm, Enumerable.Range(1000, 256).ToArray(), out _);
 
         // Same-session A/B of what the indexer costs at short context (decode at depth 1024, indexer off vs on, alternating).
+        if (Environment.GetEnvironmentVariable("DOTLLM_REAL_SKIP_AB") != "1")   // two live states: skip at big capacities (each state holds the full K/V + indexer allocation)
         {
             var rngAb = new Random(7);
             int[] fill = Enumerable.Range(0, 1100).Select(_ => rngAb.Next(1000, 20000)).ToArray();

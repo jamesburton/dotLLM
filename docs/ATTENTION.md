@@ -332,6 +332,7 @@ Measured on the real UD-Q4_K_XL file (Strix Halo, 512 MB BIOS split, 2026-10-10;
 | indexer cost at 1K (same-session A/B, 3 rounds, indexer on vs off) | 43.2-43.8 vs 44.4-45.7 ms/token: within noise |
 | prefill, chunks of 1024 | 3.7 s per first 1K, 3.8 s for 1K-2K, then ~240-260 tok/s at 2K-8K depth (the sparse region costs ~15 % vs the dense one) |
 | KL vs the CPU oracle, 4096-token held-out window, scored half | mean 0.054, median 0.026, top-1 88 %, PPL 9.358 (Vulkan) vs 9.374 (oracle); no step at the dense limit: rows [1800,2051) 0.051, [2051,2300) 0.040 |
+| 16384-token capacity (`DOTLLM_VK_QWEN4EXP_CONTEXT=16384`, one live sequence): needles at 12,769 tokens | **3/3**; decode 21.3 / 21.2 tok/s at depth 12K / 16K (47 ms/token), prefill 230-240 tok/s at 12K. Each live state holds the full K/V + indexer allocation (0.9 GiB at 16K), two concurrent 16K states exceed the resident wall |
 | device memory | heap1 69,780 MiB + heap0 9.8 GiB (was 12.1 GiB before the host embedding gather) at an 8192-token capacity |
 
 The KL level is the pre-existing Vulkan-vs-oracle gap that grows with context (#873, ~0.03-0.05 at 512-2K positions on the same file), not a QSA effect: it has no
