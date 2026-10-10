@@ -294,6 +294,56 @@ Things worth probing on Strix Halo before tile sizes lock in:
 - **Q-tile transpose for memory coalescing.** Currently `qTile[r * head_dim + d]` is row-major; threads access `qTile[r][d]` strided by `d` across rows during the score loop, which is irregular. A `[d][r]` layout might give better LDS bank-conflict behaviour. Trace it before changing.
 - **Soft-cap fold into `scale`.** When `softCap > 0` and the raw score is far from saturation, the `tanh` is wasted work; could skip when score magnitude < softCap × 0.5. Marginal.
 
+## Qwen4-Exp QSA (query-sparse attention) on Vulkan — issue #819
+
+The 12 full-attention layers of `qwen4exp` attend a SELECTED subset of the context: an indexer pools the keys of every block of 4 tokens, scores
+the blocks against the query, keeps the top 512 (= `indexer.top_k` 2048 tokens) plus the tail of the incomplete block, and runs ordinary GQA over those
+~2051 keys. Up to `top_k + block - 1` = 2051 tokens every complete block is selected, so QSA equals dense causal attention; beyond it the cost per decoded
+token is bounded by 2051 keys regardless of context. The CPU oracle is `Qwen4ExpQsa`; `VulkanQwen4ExpQsa` (`src/DotLLM.Vulkan/VulkanQwen4ExpQsa.cs`,
+`Kernels/Qwen4ExpQsaKernels.cs`) is the device implementation, hooked into the shared `RecordFullAttnLayer` through `IQ4AttentionHook`.
+
+Per QSA layer, per forward (all in the forward's command buffer, nothing returns to the host):
+
+1. `indexer.k_proj(x)` -> RAW (un-normed, un-rotated) keys, copied into a per-sequence, position-indexed store `[capacity, 128]`. Runs on EVERY forward,
+   including dense-regime ones, so a sequence can cross the dense limit mid-stream; rollback is just a smaller sequence length (nothing to restore).
+2. `qsa_pool_f32.comp`: block `b` = `rope(rmsnorm(mean(raw[4b..4b+3])), pos 4b)` (pool, then norm, then rotate), for every block this forward completes.
+   A block is a pure function of its four raw rows, so a rewritten position simply re-derives it.
+3. Only when the forward reaches positions whose complete-block count exceeds the budget: `indexer.q_proj(x)`, per-head RMSNorm, NeoX RoPE at the query
+   position, then `qsa_score_f32.comp` (`sum_h relu(q_h . k_b) / sqrt(128)`, subgroup-per-block, lanes across the key dim) and `qsa_select_f32.comp`
+   (exact top-512: 4-pass radix select on the float bit patterns, then an index-ordered compaction; ties go to the LOWER block index like the oracle and the
+   ids come out ascending). Queries are processed in sub-chunks (<= 1024) so score / partial scratch is bounded independent of the prefill chunk.
+4. `qsa_attention_f32.comp` + `qsa_merge_f32.comp`: split-KV online-softmax attention over the virtual key list (selected blocks' tokens, then the tail),
+   so dense-regime and sparse queries share one kernel (identity selection when the query still has <= 512 blocks).
+
+The dense attention of the shared layer is untouched and still serves forwards that end below the dense limit.
+
+Validation (`VulkanQwen4ExpQsaTests`): exact set equality of the select kernel against the oracle incl. heavy ties / all-equal / 65536 blocks; pooled keys and
+scores against `Qwen4ExpIndexerCache` / `ScoreBlocksScalar`; whole-model prefill, token-by-token decode through the dense limit, chunked == single-shot and the
+released head_dim-256 geometry against the CPU oracle with a 16-token budget (sparse from the 20th token), with a sensitive control (the oracle's own dense vs
+sparse outputs differ ~1000x more than Vulkan vs oracle). The GPU and the oracle sum scores in a different float order, so a near-tie at the 512th block can flip
+one block (1 row in 648 in the synthetic sweep; `AMaterialRowMismatch_IsATopKBoundaryNearTie` shows its GPU rank-4 / rank-5 scores differ by 4.5e-5 relative, and
+fails if a mismatching row is ever not such a near-tie); the kernel-level tests prove the selection logic itself is exact.
+
+Measured on the real UD-Q4_K_XL file (Strix Halo, 512 MB BIOS split, 2026-10-10; harness `VulkanQwen4ExpRealQsaTests`, env-gated by `DOTLLM_QWEN4EXP_REAL_GGUF`):
+
+| | result |
+|---|---|
+| needle-in-a-haystack (3 depths x 3 codes), 4046 and 7890 tokens | **6/6** (answer = the planted code, no distractor) |
+| decode tok/s at depth 1K / 2K / 4K / 8K (same state, growing) | 22.5 / 21.2 / 21.6 / 21.3 (44-47 ms/token): flat, the cost is bounded by ~2051 keys |
+| indexer cost at 1K (same-session A/B, 3 rounds, indexer on vs off) | 43.2-43.8 vs 44.4-45.7 ms/token: within noise |
+| prefill, chunks of 1024 | 3.7 s per first 1K, 3.8 s for 1K-2K, then ~240-260 tok/s at 2K-8K depth (the sparse region costs ~15 % vs the dense one) |
+| KL vs the CPU oracle, 4096-token held-out window, scored half | mean 0.054, median 0.026, top-1 88 %, PPL 9.358 (Vulkan) vs 9.374 (oracle); no step at the dense limit: rows [1800,2051) 0.051, [2051,2300) 0.040 |
+| 16384-token capacity (`DOTLLM_VK_QWEN4EXP_CONTEXT=16384`, one live sequence): needles at 12,769 tokens | **3/3**; decode 21.3 / 21.2 tok/s at depth 12K / 16K (47 ms/token), prefill 230-240 tok/s at 12K. Each live state holds the full K/V + indexer allocation (0.9 GiB at 16K), two concurrent 16K states exceed the resident wall |
+| device memory | heap1 69,780 MiB + heap0 9.8 GiB (was 12.1 GiB before the host embedding gather) at an 8192-token capacity |
+
+The KL level is the pre-existing Vulkan-vs-oracle gap that grows with context (#873, ~0.03-0.05 at 512-2K positions on the same file), not a QSA effect: it has no
+discontinuity where the sparse path starts.
+
+Capacity: the K/V cache is F32 (48 KiB per token over the 12 layers) plus 5 KiB per token of indexer keys. The model is sized for
+`min(context_length, 8192)` tokens by default (`DOTLLM_VK_QWEN4EXP_CONTEXT` overrides; halved automatically until the residency plan fits). On the 128 GiB Strix Halo
+box the OS keeps ~82 GiB resident per process and the UD-Q4_K_XL trunk is ~79 GiB, which is why the token-embedding table is gathered on the HOST for qwen4exp
+(`DOTLLM_VK_QWEN4EXP_HOST_EMBED`, default on): the device-resident F32 copy was 2.4 GiB.
+
 ## IAttentionStrategy — Kernel Selection
 
 ```

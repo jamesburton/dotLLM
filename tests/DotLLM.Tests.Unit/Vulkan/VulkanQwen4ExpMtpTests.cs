@@ -42,12 +42,13 @@ public sealed class VulkanQwen4ExpMtpTests : IDisposable
     private static readonly Q4eGeometry Geo = Qwen4ExpRandomGguf.Experts512;
 
     /// <summary>Trunk + head, loaded on both backends. <paramref name="quant"/> picks the weights' quantisation (the head's Q8_0 projections are the release's).</summary>
-    private Q4eRig Rig(string spvDir, Q4eQuant quant, uint headSeed = 0xBEEF01u)
+    private Q4eRig Rig(string spvDir, Q4eQuant quant, uint headSeed = 0xBEEF01u, Q4eGeometry? geo = null)
     {
-        var rig = new Q4eRig(Qwen4ExpRandomGguf.Build(Geo, quant), spvDir);
+        geo ??= Geo;
+        var rig = new Q4eRig(Qwen4ExpRandomGguf.Build(geo, quant), spvDir);
         _disposables.Add(rig);
         string head = Path.Combine(_dir, $"mtp-{Guid.NewGuid():N}.gguf");
-        File.WriteAllBytes(head, Qwen4ExpRandomGguf.BuildMtpOnly(Geo, quant, headSeed));
+        File.WriteAllBytes(head, Qwen4ExpRandomGguf.BuildMtpOnly(geo, quant, headSeed));
         rig.Cpu.AttachMtpHead(head);
         rig.Vk.AttachMtpHead(head);
         return rig;
@@ -351,6 +352,38 @@ public sealed class VulkanQwen4ExpMtpTests : IDisposable
             var l = plainLogits[firstDiff];
             float range = l.Max() - l.Min(), gap = l[plain[firstDiff]] - l[spec[firstDiff]];
             _out.WriteLine($"first divergence from 1-row greedy at token {firstDiff}: 1-row logit gap between its pick and the verify path's pick {gap:E3} (logit range {range:F2}, ratio {gap / range:E2})");
+            Assert.True(gap >= 0 && gap < 0.02f * range, $"divergence at token {firstDiff} is not a near-tie: gap {gap:E3} of range {range:F2}");
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(1, 11, 3)]
+    [InlineData(2, 9, 4)]
+    public void SpeculativeDecode_BeyondTheDenseLimit_EmitsThePlainGreedySequence(int seed, int promptLen, int k)
+    {
+        // #819: a 16-token indexer budget makes everything past 19 tokens sparse QSA, so the verify forwards, the recurrent-snapshot
+        // restores and the position rewrites after a rejection all run against the sparse indexer cache.
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        var rig = Rig(spvDir, Q4eQuant.F32, geo: Geo with { Budget = 16, Context = 512 });
+        Skip.IfNot(rig.Vk.SupportsRecurrentRowSnapshots, "snapshot scan kernel not built");
+        int V = rig.Config.VocabSize;
+        int[] prompt = Prompt(promptLen, seed, V);
+        const int N = 36;
+        using var kvP = rig.Vk.CreateKvCache(128);
+        var plainLogits = new List<float[]>();
+        var plain = PlainGreedy(rig.Vk, kvP, prompt, N, V, plainLogits);
+        long restore0 = rig.Vk.SnapshotRestores, sparse0 = rig.Vk.Qsa.SparseLayerRecordings;
+        using var kvS = rig.Vk.CreateKvCache(128);
+        var (spec, perRound) = Speculate(rig.Vk, kvS, prompt, N, k, V);
+        _out.WriteLine($"seed {seed} k {k}: rounds={perRound.Count} perRound=[{string.Join(",", perRound)}] restores={rig.Vk.SnapshotRestores - restore0} sparseLayers={rig.Vk.Qsa.SparseLayerRecordings - sparse0}");
+        Assert.True(rig.Vk.Qsa.SparseLayerRecordings > sparse0, "the sparse path never ran");
+        Assert.True(rig.Vk.SnapshotRestores - restore0 > 0 || perRound.All(x => x == k + 1), "a rejection must roll back");
+        int firstDiff = Enumerable.Range(0, N).FirstOrDefault(i => plain[i] != spec[i], -1);
+        if (firstDiff >= 0)
+        {
+            var l = plainLogits[firstDiff];
+            float range = l.Max() - l.Min(), gap = l[plain[firstDiff]] - l[spec[firstDiff]];
+            _out.WriteLine($"first divergence at token {firstDiff}: gap {gap:E3} of range {range:F2}");
             Assert.True(gap >= 0 && gap < 0.02f * range, $"divergence at token {firstDiff} is not a near-tie: gap {gap:E3} of range {range:F2}");
         }
     }

@@ -189,7 +189,7 @@ public sealed class VulkanQwen4ExpLoaderTests
     }
 
     [SkippableFact]
-    public void DenseAttention_IsExactWithinBudget_AndRefusesBeyondIt()
+    public void DenseAttention_IsExactWithinBudget_AndGoesSparseBeyondIt()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         // budget 16 tokens, block 4 -> exactly dense up to 19 tokens (HF/oracle semantics); the 20th would need sparse selection.
@@ -205,8 +205,12 @@ public sealed class VulkanQwen4ExpLoaderTests
         _out.WriteLine($"19 tokens at the budget edge: relL2 {rl2:E3}, KL {kl:E3}");
         Assert.True(rl2 < 3e-3);
 
-        var ex = Assert.Throws<NotSupportedException>(() => rig.Vk.Forward([3], [19], -1));
-        Assert.Contains("#819", ex.Message, StringComparison.Ordinal);
+        // The 20th token has 5 complete blocks > the 4-block budget: sparse QSA selection runs (#819) and still follows the oracle.
+        var cpu20 = Q4eRig.Row(rig.Cpu.Forward([3], [19], -1), 0);
+        var vk20 = Q4eRig.Row(rig.Vk.Forward([3], [19], -1), 0);
+        var (rl20, _, _) = VulkanQwen4ExpParityTests.Compare(cpu20, vk20);
+        _out.WriteLine($"token 20 (first sparse): relL2 {rl20:E3}");
+        Assert.True(rl20 < 3e-3);
     }
 
     [SkippableFact]

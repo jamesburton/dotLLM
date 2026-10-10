@@ -45,6 +45,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
     /// <summary>GDN ordinal of absolute layer <paramref name="layer"/> (-1 for attention layers).</summary>
     internal int Q4GdnOrdinal(int layer) => _gdnLayerOrdinal[layer];
 
+    /// <summary>Optional QSA hook (#819): consulted by the full-attention layer after the K/V cache update; true = it produced <c>AttnOutput</c>.</summary>
+    internal IQ4AttentionHook? Q4AttentionHook { get; set; }
+
     internal void Q4RecordAttention(nint cmdBuf, int layer, int seqLen, ReadOnlySpan<int> positions, VulkanNemotronHKvCache kvCache)
         => RecordFullAttnLayer(cmdBuf, layer, _weights.Layers[layer].Attention!.Value, seqLen, positions,
             Config.NumAttentionHeads, _weights.Layers[layer].Attention!.Value.NumKvHeads, Config.HeadDim, kvCache);
@@ -91,6 +94,15 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
 
     /// <summary>Sparse per-attention-layer KV cache sized for <paramref name="maxSeqLen"/> positions.</summary>
     internal VulkanNemotronHKvCache Q4CreateKvCache(int maxSeqLen) => CreateKvCache(maxSeqLen);
+}
+
+/// <summary>
+/// Replaces the dense attention dispatch of a full-attention layer (issue #819). Called after Q/K were normed + rotated and the chunk's K/V were
+/// written to the cache; the block input is still in <c>NormOutput</c>. Return true after writing <c>AttnOutput</c>; false = run the dense kernels.
+/// </summary>
+internal interface IQ4AttentionHook
+{
+    bool RecordAttention(nint cmd, int layer, int seqLen, ReadOnlySpan<int> positions, VulkanDevice.Buffer kSrc, VulkanDevice.Buffer vSrc);
 }
 
 /// <summary>

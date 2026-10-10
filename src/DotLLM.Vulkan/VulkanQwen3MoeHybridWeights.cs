@@ -202,7 +202,8 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         Qwen3MoeLayerWeights[] cpuLayers,
         float[] outputNormWeight,
         nint tokenEmbedWeight, QuantizationType tokenEmbedQt,
-        nint outputWeight, QuantizationType outputQt, int outputOutputDim, int outputInputDim)
+        nint outputWeight, QuantizationType outputQt, int outputOutputDim, int outputInputDim,
+        bool hostTokenEmbedding = false)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(config);
@@ -222,8 +223,10 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
 
         // Token embedding always dequantises to F32 — the embedding gather uses
         // vkCmdCopyBuffer byte offsets and needs a contiguous F32 layout.
+        // hostTokenEmbedding (qwen4exp, #819): the caller gathers rows from the mmap'd table on the host, so only a one-row stub is uploaded -
+        // the F32 table is 2.4 GiB at the released vocab, which on a box whose resident GPU memory is capped near the weights is the KV budget.
         var tokenEmbed = VulkanChunkedRowTable.Create(device, staging,
-            tokenEmbedWeight, tokenEmbedQt, config.VocabSize, config.HiddenSize);
+            tokenEmbedWeight, tokenEmbedQt, hostTokenEmbedding ? 1 : config.VocabSize, config.HiddenSize);
         totalBytes += tokenEmbed.TotalBytes;
 
         var layers = new LayerBuffers[config.NumLayers];

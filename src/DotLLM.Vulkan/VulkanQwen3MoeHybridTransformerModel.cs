@@ -393,7 +393,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         nint outputWeight, QuantizationType outputQt, int outputM, int outputK,
         nint tokenEmbedWeight, QuantizationType tokenEmbedQt,
         string spvDir,
-        int nCpuMoeLayers = -1)
+        int nCpuMoeLayers = -1,
+        bool hostTokenEmbedding = false)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(config);
@@ -454,7 +455,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         // inside cpuLayers[*].Moe and stream per layer in the forward pass — same
         // policy as BuildFromGguf.
         var weights = VulkanQwen3MoeHybridWeights.Upload(device, config, cpuLayers, outputNormWeight,
-            tokenEmbedWeight, tokenEmbedQt, outputWeight, outputQt, outputM, outputK);
+            tokenEmbedWeight, tokenEmbedQt, outputWeight, outputQt, outputM, outputK, hostTokenEmbedding);
 
         var state = new VulkanQwen3MoeHybridForwardState(device, config, gdn, initialSeqLen: 1);
         var gdnCache = new VulkanGdnStateCache(device, gdn, gdnOrdinal);
@@ -1185,7 +1186,16 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             positionOffset = 0;
         }
 
-        if (_kernels.SplitKvAttention is not null && seqLen == 1
+        // qwen4exp QSA hook (#819): maintains the indexer key cache and, past the dense limit, replaces the dense dispatch below.
+        // Null for every other architecture and for the MTP draft head, so their path is untouched.
+        bool hookHandled = Q4AttentionHook is { } hook && kvCache is VulkanNemotronHKvCache
+            && hook.RecordAttention(cmdBuf, absoluteLayerIdx, seqLen, positions, kSrc, vSrc);
+
+        if (hookHandled)
+        {
+            // AttnOutput written by the hook.
+        }
+        else if (_kernels.SplitKvAttention is not null && seqLen == 1
             && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
             && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads))
         {

@@ -11,6 +11,15 @@ namespace DotLLM.Vulkan;
 
 public sealed unsafe partial class VulkanQwen4ExpTransformerModel
 {
+    /// <summary>Default context capacity (tokens) of the K/V + indexer caches; <c>DOTLLM_VK_QWEN4EXP_CONTEXT</c> overrides.</summary>
+    internal const int DefaultContextCapacity = 8192;
+
+    /// <summary>
+    /// Gather token-embedding rows on the host from the mmap'd (quantised) table instead of keeping an F32 copy of the whole table on the device
+    /// (2.4 GiB at the released vocabulary). On by default; <c>DOTLLM_VK_QWEN4EXP_HOST_EMBED=0</c> restores the device table (A/B diagnostic).
+    /// </summary>
+    public static bool HostEmbedding { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_HOST_EMBED") != "0";
+
     /// <summary>Resident-capacity refusal override: <c>DOTLLM_VK_ALLOW_OVERCOMMIT=1</c> turns the pre-load refusal into a warning.</summary>
     private static bool AllowOvercommit
         => string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_ALLOW_OVERCOMMIT"), "1", StringComparison.Ordinal);
@@ -48,17 +57,36 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         if (q4.Ple is { } ple0 && ple0.Layers.Count > 1)
             throw new NotSupportedException("qwen4exp files carry one set of PLE hash constants; several PLE layers cannot be represented.");
 
-        // Dense-attention capacity: exact while nb <= budget/blockSize, i.e. up to budget + block - 1 tokens.
+        // Context capacity (#819): QSA attention is exact dense attention up to budget + block - 1 tokens (2051); beyond it the indexer
+        // selects blocks, so the K/V + indexer caches can be sized for far more than the dense limit. Default 8192 (env override), clamped
+        // to the model's context and then halved until the plan fits the device - never below the dense limit.
         int denseLimit = q4.IndexerBlockSize > 0 ? q4.IndexerTopK + q4.IndexerBlockSize - 1 : config.MaxSequenceLength;
-        int kvCapacity = Math.Min(config.MaxSequenceLength, denseLimit);
+        int floorCapacity = Math.Min(config.MaxSequenceLength, denseLimit);
+        int requested = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_CONTEXT"), out int envCtx) && envCtx > 0 ? envCtx : DefaultContextCapacity;
+        int kvCapacity = Math.Max(floorCapacity, Math.Min(config.MaxSequenceLength, requested));
 
         // Residency gate BEFORE touching the device (the 122B WDDM-thrash class: refuse with numbers, do not page).
-        var plan = Qwen4ExpResidencyPlan.Create(tensors, config, residentCapacityOverrideBytes ?? device.ResidentCapacityBytes(), kvCapacity,
-            GC.GetGCMemoryInfo().TotalAvailableMemoryBytes, integerDot: device.HasIntegerDotProduct);
         // #880: other processes' GPU memory (second dotllm, llama.cpp, ...) is invisible to VK_EXT_memory_budget, so read the OS counters.
         var pressure = otherPressureProbe is not null ? otherPressureProbe() : device.ReadOtherProcessPressure();
-        if (pressure is not null)
-            plan = plan with { OtherProcessBytes = pressure.OtherBytes, OtherProcessDetail = pressure.DescribeCulprits() };
+        long residentCapacity = residentCapacityOverrideBytes ?? device.ResidentCapacityBytes();
+        Qwen4ExpResidencyPlan MakePlan(int capacity)
+        {
+            var p = Qwen4ExpResidencyPlan.Create(tensors, config, residentCapacity, capacity, GC.GetGCMemoryInfo().TotalAvailableMemoryBytes,
+                integerDot: device.HasIntegerDotProduct);
+            return pressure is not null ? p with { OtherProcessBytes = pressure.OtherBytes, OtherProcessDetail = pressure.DescribeCulprits() } : p;
+        }
+        var plan = MakePlan(kvCapacity);
+        if (!plan.Fits && kvCapacity > floorCapacity)
+        {
+            int requestedCapacity = kvCapacity;
+            while (!plan.Fits && kvCapacity > floorCapacity)
+            {
+                kvCapacity = Math.Max(floorCapacity, kvCapacity / 2);
+                plan = MakePlan(kvCapacity);
+            }
+            Console.Error.WriteLine($"[dotLLM] qwen4exp context capacity reduced from {requestedCapacity} to {kvCapacity} tokens to fit the device " +
+                                    $"(K/V + indexer caches cost {Qwen4ExpResidencyPlan.ContextBytes(config, 1) / 1024.0:F0} KiB per token).");
+        }
         if (!plan.Fits)
         {
             string msg = "qwen4exp weights do not fit the Vulkan device's resident capacity: " + plan.Describe() + ". " + plan.DescribeShortfall() + " " +
@@ -80,6 +108,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             hostOnly = (tptr, tbytes);
         }
 
+        bool hostEmbedding = HostEmbedding;
         var owned = new List<nint>();
         VulkanQwen3MoeHybridTransformerModel? core = null;
         var attnGr = new List<VulkanQwen4ExpGrWeights>();
@@ -90,6 +119,12 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         GroupRmsNormF32Kernel? groupRms = null;
         GdnPostScanGateF32Kernel? sigmoidGate = null;
         VulkanQwen4ExpTransformerModel? model = null;
+        var qsaWeights = new List<VulkanQwen4ExpQsa.LayerWeights>();
+        var qsaOrdinal = new int[config.NumLayers];
+        for (int il = 0, qo = 0; il < qsaOrdinal.Length; il++)
+            qsaOrdinal[il] = config.HybridLayout.LayerKind[il] == HybridLayerKind.GatedDeltaNet ? -1 : qo++;
+        Qwen4ExpQsaKernels? qsaKernels = null;
+        VulkanQwen4ExpQsa? qsa = null;
         bool disposed = false;
         try
         {
@@ -107,7 +142,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             // The hybrid's pre/post norms and output norm do not exist in qwen4exp (the gated residual replaces them): 1-element dummies.
             core = VulkanQwen3MoeHybridTransformerModel.BuildFromPrebuiltWeights(
                 device, config, layers, outputNormWeight: [1f], outPtr, outQt, outM, outK, embPtr, embDesc.QuantizationType,
-                spvDir, nCpuMoeLayers: 0);
+                spvDir, nCpuMoeLayers: 0, hostTokenEmbedding: hostEmbedding);
 
             Mark("coreWeights");
             long weightBytes = 0;
@@ -125,6 +160,15 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                 head = VulkanQwen4ExpGrWeights.Upload(device, staging, gguf, Qwen4ExpTensors.OutputHcNorm, Qwen4ExpTensors.OutputHcDown,
                     Qwen4ExpTensors.OutputHcUp, inject: null);
                 weightBytes += head.Bytes;
+
+                // QSA indexer projections + folded norm gammas, one set per QSA layer (#819).
+                for (int il = 0; il < config.NumLayers; il++)
+                {
+                    if (qsaOrdinal[il] < 0) continue;
+                    var lw = UploadQsaIndexer(device, staging, gguf, tensors, $"blk.{il}.", q4);
+                    qsaWeights.Add(lw);
+                    weightBytes += lw.Bytes;
+                }
             }
 
             Mark("grWeights");
@@ -181,6 +225,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             gr = Qwen4ExpGatedResidualKernel.Create(device, spvDir);
             groupRms = GroupRmsNormF32Kernel.Create(device, spvDir);
             sigmoidGate = GdnPostScanGateF32Kernel.Create(device, spvDir, sigmoidGate: true);
+            qsaKernels = Qwen4ExpQsaKernels.Create(device, spvDir);
+            qsa = new VulkanQwen4ExpQsa(device, core, qsaKernels, qsaWeights.ToArray(), qsaOrdinal, config, q4, kvCapacity);
 
             // #880: allocate the per-forward scratch for the planned row count NOW, so (a) the post-upload check below counts it and (b) no
             // forward up to that size has to grow it after the weights fill the heap (a small-then-larger call order lost the device).
@@ -197,7 +243,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                                         $"staging memcpy={VulkanStagingBuffer.MemcpyMilliseconds / 1000:F1}s/{VulkanStagingBuffer.MemcpyBytes / (1024 * 1024)} MiB (thread-sum), " +
                                         $"bank uploads={VulkanQwen3MoeMoeUpload.BanksMilliseconds / 1000:F1}s, submitter waited {VulkanStagingBuffer.CopyWaitMilliseconds / 1000:F1}s on memcpy and {VulkanBankPrealloc.WaitMilliseconds / 1000:F1}s on bank allocation; {device.MemorySnapshot()}");
             model = new VulkanQwen4ExpTransformerModel(device, gguf, config, core, attnGr.ToArray(), ffnGr.ToArray(), head, moeBundles.ToArray(),
-                ple, pleLayer, owned, hostOnly, gr, groupRms, sigmoidGate, kvCapacity, weightBytes, pleGpu);
+                ple, pleLayer, owned, hostOnly, gr, groupRms, sigmoidGate, kvCapacity, weightBytes, qsa, hostEmbedding, pleGpu);
             model._spvDir = spvDir;
             model._groupRmsOop = GroupRmsNormOopF32Kernel.Create(device, spvDir);
             try
@@ -239,6 +285,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             foreach (var g in ffnGr) g.Dispose();
             head?.Dispose();
             gr?.Dispose(); groupRms?.Dispose(); sigmoidGate?.Dispose();
+            if (qsa is not null) qsa.Dispose();
+            else { foreach (var w in qsaWeights) w.Dispose(); qsaKernels?.Dispose(); }
             core?.Dispose();
             foreach (nint p in owned) NativeMemory.AlignedFree((void*)p);
             if (hostOnly is { } h) VulkanWeightImportPolicy.UnregisterHostOnly(h.Item1);
@@ -252,6 +300,32 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         long sum = 0;
         for (int h = 0; h < 16; h++) sum += device.LiveBytesOnHeap(h);
         return sum;
+    }
+
+    /// <summary>Uploads one QSA layer's indexer projections (<c>indexer.q_proj</c>, <c>indexer.k_proj</c>) and folded norm gammas.</summary>
+    private static VulkanQwen4ExpQsa.LayerWeights UploadQsaIndexer(VulkanDevice device, VulkanStagingBuffer staging, GgufFile gguf,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> t, string b, Qwen4ExpConfig q4)
+    {
+        if (!VulkanQwen4ExpQsa.Enabled)   // diagnostic baseline footprint (DOTLLM_VK_QWEN4EXP_QSA=0): the indexer is never run, so upload nothing
+        {
+            return new VulkanQwen4ExpQsa.LayerWeights
+            {
+                QProj = device.AllocateDeviceLocal(16), KProj = device.AllocateDeviceLocal(16), QGamma = device.AllocateDeviceLocal(16),
+                KGamma = device.AllocateDeviceLocal(16), QQt = QuantizationType.F32, KQt = QuantizationType.F32, Bytes = 64,
+            };
+        }
+        var qd = t[b + "indexer.q_proj.weight"]; var kd = t[b + "indexer.k_proj.weight"];
+        var qBuf = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging, gguf.TensorDataPointer(qd), qd.QuantizationType,
+            outputDim: qd.Shape[1], inputDim: qd.Shape[0], forceF32: false, out var qQt, out long qBytes);
+        var kBuf = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging, gguf.TensorDataPointer(kd), kd.QuantizationType,
+            outputDim: kd.Shape[1], inputDim: kd.Shape[0], forceF32: false, out var kQt, out long kBytes);
+        var qg = VulkanQwen3MoeHybridWeights.UploadFloatArray(device, staging, F32(gguf, t, b + "indexer.q_norm.weight", q4.IndexerKeyLength));
+        var kg = VulkanQwen3MoeHybridWeights.UploadFloatArray(device, staging, F32(gguf, t, b + "indexer.k_norm.weight", q4.IndexerKeyLength));
+        return new VulkanQwen4ExpQsa.LayerWeights
+        {
+            QProj = qBuf, KProj = kBuf, QGamma = qg, KGamma = kg, QQt = qQt, KQt = kQt,
+            Bytes = qBytes + kBytes + 2L * q4.IndexerKeyLength * 4,
+        };
     }
 
     private static Qwen3MoeLayerWeights[] BuildHybridLayers(GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> t,
