@@ -29,8 +29,12 @@ public sealed class VulkanException : Exception
         -4 => " — the GPU device was lost (a kernel faulted, the driver watchdog (TDR) fired, "
             + "or the driver miscompiled a shader). The VkDevice is now invalid. Check the offending "
             + "compute dispatch; on the gfx1151 iGPU some heavy quantized prefill kernels are known to "
-            + "trip this (see DOTLLM_VULKAN_DISABLE_MMQ to fall back to the F32-dequant GEMM path).",
-        -2 => " — out of device (GPU) memory; reduce the model/batch/context size or free GPU buffers.",
+            + "trip this (see DOTLLM_VULKAN_DISABLE_MMQ to fall back to the F32-dequant GEMM path). "
+            + "It is also what an oversubscribed GPU memory pool looks like: another process holding GPU memory "
+            + "(second dotllm, llama.cpp, Lemonade, Docker, ollama, a browser) can end in a device loss instead of an allocation error.",
+        -2 => " — out of device (GPU) memory; reduce the model/batch/context size or free GPU buffers. "
+            + "GPU memory is shared with every other process on the machine: check for a second dotllm, llama.cpp, "
+            + "Lemonade, Docker, ollama or a browser holding it.",
         _ => string.Empty
     };
 

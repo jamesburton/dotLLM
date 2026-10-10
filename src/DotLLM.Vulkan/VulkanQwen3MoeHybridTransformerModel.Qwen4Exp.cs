@@ -21,7 +21,12 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
     /// <summary>Grows the per-forward scratch to <paramref name="seqLen"/> rows; true when buffers were re-created (descriptor caches were dropped).</summary>
     internal bool Q4EnsureCapacity(int seqLen)
     {
-        bool resized = _state.EnsureCapacity(seqLen);
+        bool resized;
+        try { resized = _state.EnsureCapacity(seqLen); }
+        catch (Interop.VulkanException e) when (e.ErrorCode is -2 or -1)   // out of device / host memory (#880)
+        {
+            throw new InvalidOperationException(Qwen4ExpResidencyPlan.ScratchGrowthMessage(seqLen, e.Message), e);
+        }
         if (resized) { _kernels.InvalidateAll(); _iqF16Prefill?.InvalidateDescriptorCache(); }
         return resized;
     }

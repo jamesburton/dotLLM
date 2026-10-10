@@ -40,6 +40,7 @@ int typeIndexArg = -1;
 long chunkMiB = 8;
 int maxCount = 1200;
 double hostPressureGiB = 0;
+int holdSec = 60;
 bool noBuffer = false;
 
 for (int i = 0; i < args.Length; i++)
@@ -50,6 +51,7 @@ for (int i = 0; i < args.Length; i++)
         case "--type": typeIndexArg = int.Parse(args[++i]); break;
         case "--chunk": chunkMiB = long.Parse(args[++i]); break;
         case "--count": maxCount = int.Parse(args[++i]); break;
+        case "--hold-sec": holdSec = int.Parse(args[++i]); break;
         case "--host-pressure": hostPressureGiB = double.Parse(args[++i]); break;
         case "--no-buffer": noBuffer = true; break;
         default: Console.Error.WriteLine($"unknown arg {args[i]}"); return 2;
@@ -190,9 +192,10 @@ try
 {
     if (mode is "ramp" or "all") Ramp();
     if (mode is "cumul" or "all") Cumulative();
+    if (mode == "hold") Hold();
     if (mode is "bigblocks" or "all") BigBlocks();
     if (mode is "mapwrite" or "all") MapWrite();
-    if (mode is not ("info" or "ramp" or "cumul" or "bigblocks" or "mapwrite" or "all"))
+    if (mode is not ("info" or "ramp" or "cumul" or "bigblocks" or "mapwrite" or "all" or "hold"))
     {
         Console.Error.WriteLine($"unknown mode {mode}");
         return 2;
@@ -238,6 +241,25 @@ void Ramp()
 //     this model); ggml-vulkan suballocates a few ~2 GiB blocks instead. A wall at
 //     a COUNT means the arena is the fix; a wall at a cumulative BYTE total means a
 //     commit cap and the arena will not help.
+// hold (#801): allocate --count x --chunk MiB device-local chunks and keep them for --hold-sec seconds, so
+// another process can be measured while this one oversubscribes the carve-out.
+void Hold()
+{
+    long bytes = chunkMiB * 1024 * 1024;
+    long total = 0;
+    for (int i = 0; i < maxCount; i++)
+    {
+        var (res, a) = TryAlloc(bytes, probeType);
+        if (res != VK_SUCCESS) { Console.WriteLine($"  hold: FAILED at #{i + 1} ({ResName(res)})"); break; }
+        allocs.Add(a); total += bytes;
+    }
+    PrintBudget("after hold allocs (this process)");
+    Console.WriteLine($"  hold: {total / (1024 * 1024)} MiB held for {holdSec}s");
+    Console.Out.Flush();
+    Thread.Sleep(holdSec * 1000);
+    FreeAll();
+}
+
 void Cumulative()
 {
     Console.WriteLine($"=== cumul: up to {maxCount} x {chunkMiB} MiB, none freed ===");
