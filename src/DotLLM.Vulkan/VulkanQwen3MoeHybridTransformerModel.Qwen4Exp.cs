@@ -57,8 +57,34 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
         => RecordMoeLayer(cmdBuf, bundle, postAttnNormWeight: null, seqLen, Config.HiddenSize, Config.NormEpsilon);
 
     internal void Q4RecordMatmul(nint cmdBuf, VulkanDevice.Buffer weights, QuantizationType qt, VulkanDevice.Buffer input,
-        VulkanDevice.Buffer output, int outputDim, int inputDim, int seqLen)
-        => RecordMatmul(cmdBuf, weights, qt, input, output, outputDim, inputDim, seqLen);
+        VulkanDevice.Buffer output, int outputDim, int inputDim, int seqLen, bool xqReady = false)
+        => RecordMatmul(cmdBuf, weights, qt, input, output, outputDim, inputDim, seqLen, xqReady);
+
+    /// <summary>
+    /// Records a Q8_0 GEMV through the wide MMVQ twin (#885) against the row the last <see cref="Q4PrepareQ8Row"/> quantized: <paramref name="kSplit"/> picks the
+    /// 4-subgroups-per-row kernel (large K, few rows), otherwise the 4-rows-per-workgroup kernel (small K, many rows). False when the twin is unavailable or switched off.
+    /// </summary>
+    internal bool Q4RecordQ8Wide(nint cmdBuf, bool kSplit, VulkanDevice.Buffer weights, VulkanDevice.Buffer output, int m, int k)
+    {
+        var kern = kSplit ? _kernels.MatMulQ8MmvqWideKSplit : _kernels.MatMulQ8MmvqWideRows;
+        if (kern is null || !Q4WideEnabled) return false;
+        kern.Record(cmdBuf, weights, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, output, m: m, k: k);
+        Q4WideDispatches++;
+        return true;
+    }
+
+    /// <summary>Test hook (#885): GEMVs recorded through the wide Q8_0 MMVQ twins.</summary>
+    internal long Q4WideDispatches { get; private set; }
+
+    /// <summary>Wide Q8_0 MMVQ twins for the gated-residual down / up projections. On by default; <c>DOTLLM_VK_Q4E_Q8_WIDE=0</c> (or setting this) restores the one-wave-per-row kernel.</summary>
+    internal static bool Q4WideEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_Q8_WIDE") != "0";
+
+    /// <summary>
+    /// Quantizes the single decode row <paramref name="input"/> to Q8_1 into the shared activation scratch (and records the barrier that makes it
+    /// readable) so several Q8_0 / independent GEMVs can then be recorded back to back without a barrier between them (pass <c>xqReady: true</c>).
+    /// False when the Q8 MMVQ kernels are unavailable or the row does not fit.
+    /// </summary>
+    internal bool Q4PrepareQ8Row(nint cmdBuf, VulkanDevice.Buffer input, int k) => TryPrepareQ8Activations(cmdBuf, input, k);
 
     internal static void Q4Copy(nint cmdBuf, VulkanDevice.Buffer src, VulkanDevice.Buffer dst, ulong srcOffset, ulong dstOffset, ulong size)
         => RecordCopyBufferRange(cmdBuf, src, dst, srcOffset, dstOffset, size);

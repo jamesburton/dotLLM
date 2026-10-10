@@ -1,0 +1,35 @@
+#version 450
+// MoE decode combine, fused (#885): the weighted scatter of the topK expert rows and the shared-expert sigmoid-gated add in ONE pass.
+//
+//   out[h] = ( sum_{slot} weights[slot] * x[slot, h] ) + sigmoid(gateLogit) * b[h]
+//
+// For a single decode row this replaces two dispatches that were both badly shaped: moe_weighted_scatter_f32.comp launches 16x16 groups of which only
+// 16 threads of each are live for one token, and moe_sigmoid_gated_add_f32.comp runs ONE 64-thread workgroup over the whole 2560-wide row (~8 us/layer).
+// Same per-slot accumulation order as the scatter, same `acc + scale * b` add as the gated add, so the result is the two-pass result.
+//
+// Dispatch: one thread per hidden element, 256 per workgroup, groupCount.x = ceil(hiddenSize / 256). seqLen == 1 only.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX     { float x[]; };           // [topK * hiddenSize]
+layout(set = 0, binding = 1, std430) readonly  buffer BufW     { float weights[]; };     // [topK]
+layout(set = 0, binding = 2, std430) readonly  buffer BufB     { float b[]; };           // [hiddenSize] shared-expert sum
+layout(set = 0, binding = 3, std430) readonly  buffer BufLogit { float gateLogits[]; };  // [1] raw, pre-sigmoid
+layout(set = 0, binding = 4, std430) writeonly buffer BufOut   { float outBuf[]; };      // [hiddenSize]
+
+layout(push_constant) uniform PushConstants {
+    uint topK;
+    uint hiddenSize;
+} pc;
+
+void main() {
+    uint h = gl_GlobalInvocationID.x;
+    if (h >= pc.hiddenSize) return;
+
+    float acc = 0.0;
+    for (uint slot = 0u; slot < pc.topK; slot++)
+        acc += weights[slot] * x[slot * pc.hiddenSize + h];
+
+    float scale = 1.0 / (1.0 + exp(-gateLogits[0]));
+    outBuf[h] = acc + scale * b[h];
+}

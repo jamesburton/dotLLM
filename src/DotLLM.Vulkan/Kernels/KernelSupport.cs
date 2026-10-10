@@ -345,6 +345,26 @@ internal static class KernelSupport
             imageMemoryBarrierCount: 0, pImageMemoryBarriers: 0);
     }
 
+    /// <summary>Transfer-write (vkCmdCopyBuffer into a host-readback buffer) -&gt; host-read visibility before the submit's fence wait (#885).</summary>
+    internal static unsafe void TransferToHostBarrier(nint cmdBuf)
+    {
+        var barrier = new VkMemoryBarrier
+        {
+            sType = VkStructureType.MemoryBarrier,
+            srcAccessMask = VkAccessFlags.TransferWrite,
+            dstAccessMask = VkAccessFlags.HostRead,
+        };
+        Interop.ProfileCounters.Barriers++;
+        VulkanApi.vkCmdPipelineBarrier(
+            cmdBuf,
+            srcStageMask: VkPipelineStageFlags.Transfer,
+            dstStageMask: VkPipelineStageFlags.Host,
+            dependencyFlags: 0,
+            memoryBarrierCount: 1, pMemoryBarriers: barrier,
+            bufferMemoryBarrierCount: 0, pBufferMemoryBarriers: 0,
+            imageMemoryBarrierCount: 0, pImageMemoryBarriers: 0);
+    }
+
     /// <summary>
     /// Inserts a <c>COMPUTE_SHADER → HOST</c> barrier so the host can read
     /// back a compute kernel's output (specifically the final LM-head
