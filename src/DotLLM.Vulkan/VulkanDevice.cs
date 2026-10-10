@@ -1957,6 +1957,11 @@ public sealed class VulkanDevice : IDisposable
     /// </summary>
     public long DeviceLocalFallbackCount => Interlocked.Read(ref _deviceLocalFallbacks);
 
+    private static long s_allocateMemoryTicks;
+
+    /// <summary>Process-wide wall time inside <c>vkAllocateMemory</c> on the primary path (#874 load-time diagnostic).</summary>
+    internal static double AllocateMemoryMilliseconds => Interlocked.Read(ref s_allocateMemoryTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
     private Buffer AllocateInternal(long bytes, bool deviceLocal, bool preferHostCached = false)
     {
         if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
@@ -2039,7 +2044,11 @@ public sealed class VulkanDevice : IDisposable
                 allocResult = VkErrorOutOfDeviceMemory; memory = 0; // synthetic exhaustion (#810 knob)
             }
             else
+            {
+                long tAlloc = System.Diagnostics.Stopwatch.GetTimestamp();
                 allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out memory);
+                Interlocked.Add(ref s_allocateMemoryTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tAlloc);
+            }
 
             // The strict device-local heap (discrete VRAM, or the UMA carve-out — e.g. a
             // 16 GB heap[0] on Strix Halo while heap[1] exposes 96 GB of DEVICE_LOCAL +
