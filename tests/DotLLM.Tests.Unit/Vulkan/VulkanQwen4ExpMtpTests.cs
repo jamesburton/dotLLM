@@ -2,6 +2,7 @@ using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
+using DotLLM.Tokenizers;
 using DotLLM.Engine;
 using DotLLM.Engine.Samplers;
 using DotLLM.Models.Architectures;
@@ -392,5 +393,37 @@ public sealed class VulkanQwen4ExpMtpTests : IDisposable
         rig.Vk.ForwardMtp(st, 6, 11).Dispose();
         long r2 = rig.Vk.PleTableStats!.Value.Requests;
         Assert.True(r2 > r1, "draft steps never pre-requested the coming verify rows");
+    }
+
+    [SkippableFact]
+    public void TextGenerator_UsesTheVulkanHead_WhenAttachedThroughTheResolver_AndMatchesNoMtp()
+    {
+        // The wiring `dotllm run` uses: the resolver attaches the sibling mtp-*.gguf to the loaded Vulkan model, the generator then speculates.
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        var rig = new Q4eRig(Qwen4ExpRandomGguf.Build(Geo, Q4eQuant.Q8Q51), spvDir);
+        _disposables.Add(rig);
+        File.WriteAllBytes(Path.Combine(Path.GetDirectoryName(rig.FilePath)!, "mtp-syn-Q8_0.gguf"), Qwen4ExpRandomGguf.BuildMtpOnly(Geo, Q4eQuant.Q8Q51));
+        Assert.False(rig.Vk.SupportsMtp);
+        string? attached = Qwen4ExpMtpHeadResolver.TryAttach(rig.Vk, rig.FilePath);
+        Assert.NotNull(attached);
+        Assert.True(rig.Vk.SupportsMtp);
+        Assert.Null(Qwen4ExpMtpHeadResolver.TryAttach(rig.Vk, rig.FilePath));   // already attached
+
+        using var gguf = GgufFile.Open(rig.FilePath);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        Func<ModelConfig, int, IKvCache> kv = (_, len) => rig.Vk.CreateKvCache(len);
+        var opts = new InferenceOptions { Temperature = 0f, MaxTokens = 26 };
+        const string prompt = "tok12 tok13 tok14 tok15 tok16 tok17 tok18";
+
+        var plain = new TextGenerator(rig.Vk, tokenizer, kv, mtpEnabled: false).Generate(prompt, opts);
+        long d0 = rig.Vk.DraftSteps, s0 = rig.Vk.SnapshotForwards;
+        var gen = new TextGenerator(rig.Vk, tokenizer, kv, speculativeCandidates: 3, mtpEnabled: true, mtpAdaptive: false);
+        var spec = gen.Generate(prompt, opts);
+        _out.WriteLine($"plain: [{string.Join(",", plain.GeneratedTokenIds)}]  spec: [{string.Join(",", spec.GeneratedTokenIds)}]  draftSteps {rig.Vk.DraftSteps - d0}, snapshot verifies {rig.Vk.SnapshotForwards - s0}");
+        Assert.True(rig.Vk.DraftSteps - d0 > 0 && rig.Vk.SnapshotForwards - s0 > 0, "the generator never took the MTP path");
+        Assert.Equal(plain.GeneratedTokenIds.Length, spec.GeneratedTokenIds.Length);
+        // multi-row verify numerics may flip a near-tie (see the decode test); require agreement over a long prefix
+        int agree = plain.GeneratedTokenIds.Zip(spec.GeneratedTokenIds).TakeWhile(t => t.First == t.Second).Count();
+        Assert.True(agree >= Math.Min(plain.GeneratedTokenIds.Length, 8), $"speculative output diverges from plain after {agree} tokens");
     }
 }

@@ -71,7 +71,8 @@ public sealed class VulkanQwen4ExpSequenceState : IGdnState
 /// (b) The n-gram branch runs on the host at its layer: the residual is downloaded once, the CPU branch (<see cref="Qwen4ExpPleBranch"/>,
 /// the oracle's own code) gathers the 16 table rows from the mmap'd table and runs key/value projections, gate and the dilated conv, and
 /// the residual is uploaded back. The 28.8 GB table is registered host-only and can never be imported or staged. (c) Sequence state is per-sequence
-/// (<see cref="CreateSequenceState"/>, threaded through <see cref="ForwardBatch"/>) with the QSA K/V rows in the engine KV cache (#871); no recurrent checkpoint/rollback yet. (d) No MTP block.
+/// (<see cref="CreateSequenceState"/>, threaded through <see cref="ForwardBatch"/>) with the QSA K/V rows in the engine KV cache (#871). (d) MTP (#820): the draft head
+/// (<see cref="AttachMtpHead(string)"/>) and per-row recurrent snapshots live on the model-owned state only (see <c>VulkanQwen4ExpTransformerModel.Mtp.cs</c>); the batch scheduler does not speculate.
 /// </para>
 /// </remarks>
 public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
@@ -434,8 +435,10 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
             VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, _res, _headRes, (ulong)((T - 1) * rowBytes), 0, (ulong)rowBytes);
             Barrier();
             GrRead(_headGr, _headRes, 1, inject: false);
+            _core.Q4Stage("head_gr");
             _core.Q4RecordMatmul(cmd, w0.OutputWeight, w0.OutputDeviceQuantType, st.NormOutput, st.Logits,
                 outputDim: w0.OutputOutputDim, inputDim: w0.OutputInputDim, seqLen: 1);
+            _core.Q4Stage("lm_head");
             End();
             state.Length += T;
             var one = UnmanagedTensor.Allocate(new TensorShape(1, _vocab), DType.Float32, deviceId: -1);
@@ -446,6 +449,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         // All rows: head mixer over all T rows, then the LM head in chunks so the device logits scratch stays small
         // (a 2K window x 248K vocab is 2 GB; the host result tensor is the only full-size allocation).
         GrRead(_headGr, _res, T, inject: false);
+        _core.Q4Stage("head_gr");
         const int Chunk = 32;
         EnsureHeadChunk(Chunk);
         var result = UnmanagedTensor.Allocate(new TensorShape(T, _vocab), DType.Float32, deviceId: -1);
@@ -459,6 +463,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
                 Barrier();
                 _core.Q4RecordMatmul(cmd, w0.OutputWeight, w0.OutputDeviceQuantType, _headIn!, _headLogits!,
                     outputDim: w0.OutputOutputDim, inputDim: w0.OutputInputDim, seqLen: n);
+                _core.Q4Stage("lm_head");
                 End();
                 _device.Download(_headLogits!, new Span<float>((void*)(result.DataPointer + (nint)((long)c0 * _vocab * 4)), n * _vocab));
             }
@@ -550,7 +555,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     {
         if (_headIn is not null) return;
         _headIn = _device.AllocateDeviceLocal((long)rows * _hidden * 4);
-        _headLogits = _device.AllocateDeviceLocal((long)rows * _vocab * 4);
+        // Host-readback on purpose: a device-local-only buffer is read back through a freshly allocated staging buffer on every call, which cost
+        // ~25 ms per 5-row verify (measured, #820); a host-visible one is mapped directly, like the core's 1-row logits buffer.
+        _headLogits = _device.AllocateHostReadback((long)rows * _vocab * 4);
     }
 
     // ───────────────────────────── lifetime ─────────────────────────────

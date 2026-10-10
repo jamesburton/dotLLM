@@ -357,6 +357,9 @@ void Exec(string line, StringBuilder o)
             foreach (var kv3 in sums.OrderByDescending(k => k.Value).Take(14)) o.AppendLine($"   {kv3.Key,-22} {kv3.Value / reps,8:F2} ms");
             break;
         }
+        case "allrows":   // allrows <n> : ask for a logit row per input position up to n rows (raises the limit; it never lowers)
+            o.AppendLine($"allrows {a[1]}: {model.TrySetAllRowLogitsLimit(int.Parse(a[1]))}, limit now {model.MaxAllRowLogitsLength}");
+            break;
         case "draft":
         {
             // MTP draft-step proxy (#820): GR-read, QSA, GR-write, GR-read, MoE, GR-write, head mixer, LM head, host argmax - 1 row, one submit

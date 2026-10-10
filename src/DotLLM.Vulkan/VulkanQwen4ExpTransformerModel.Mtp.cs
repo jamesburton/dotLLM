@@ -139,7 +139,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
             for (int d = 1; d < kv.Value.Shape.Rank; d++) rows *= kv.Value.Shape[d];
             headBytes += Dequantize.RowByteSize(kv.Value.Shape[0], kv.Value.QuantizationType) * rows;
         }
-        EnsureDeviceHeadroom(headBytes);
+        EnsureDeviceHeadroom(headBytes + DefaultSnapshotBytes());
         var owned = new List<nint>();
         VulkanQwen3MoeHybridTransformerModel? core = null;
         VulkanQwen4ExpGrWeights? attnGr = null, ffnGr = null, headGr = null;
@@ -227,6 +227,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
             EnsureScratch(AbsorbChunk);
             if (_core.Q4EnsureCapacity(AbsorbChunk)) { _gr.InvalidateDescriptorCache(); _groupRms.InvalidateDescriptorCache(); _sigmoidGate.InvalidateDescriptorCache(); }
             _mtp = head;
+            // Allocate the verify snapshots NOW: an out-of-memory belongs at attach time (where the caller declines speculation), not mid-decode.
+            if (SupportsRecurrentRowSnapshots) EnsureRowSnapshots(DefaultSnapshotRows);
             if (Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_VERBOSE") == "1")
                 Console.Error.WriteLine($"[dotLLM] qwen4exp MTP head attached: {weightBytes / (1024.0 * 1024.0):F0} MiB of dense head weights");
         }
@@ -292,6 +294,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
             };
             EnsureScratch(AbsorbChunk);
             if (_core.Q4EnsureCapacity(AbsorbChunk)) { _gr.InvalidateDescriptorCache(); _groupRms.InvalidateDescriptorCache(); _sigmoidGate.InvalidateDescriptorCache(); }
+            if (SupportsRecurrentRowSnapshots) EnsureRowSnapshots(DefaultSnapshotRows);
         }
         catch
         {
@@ -313,15 +316,26 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
     {
         if (AllowOvercommit) return;
         long local = _device.DeviceLocalHeapBytes();
-        var (trunk, _) = Qwen4ExpResidencyPlan.EstimateWeights(_gguf.TensorsByName, Config);
+        long trunk = _device.TotalLiveBytes();   // what the process really holds now (the load-time plan over-estimates by ~10 GiB)
         long scratch = Qwen4ExpResidencyPlan.KvBytes(Config, _kvCapacity) + (1L << 30) + (long)AbsorbChunk * _streams * _hidden * 4 * 8;
         long need = trunk + headBytes + scratch;
         if (need <= local) return;
         static string G(long b) => $"{b / (double)(1L << 30):F1} GiB";
         throw new NotSupportedException(
-            $"The MTP head does not fit the device-local heap next to the resident trunk: trunk {G(trunk)} + head {G(headBytes)} + KV/scratch {G(scratch)} = " +
+            $"The MTP head does not fit the device-local heap next to the resident trunk: resident {G(trunk)} + head {G(headBytes)} + KV/scratch {G(scratch)} = " +
             $"{G(need)} against a {G(local)} heap (a failed upload would leave the device unable to allocate at all). Use a smaller trunk quantisation, " +
             "or set DOTLLM_VK_ALLOW_OVERCOMMIT=1 to try anyway; decoding continues without speculation.");
+    }
+
+
+    /// <summary>Verify rows with snapshot scratch allocated at attach (a K = 4 round verifies 5 rows and snapshots 4); larger rounds grow it.</summary>
+    internal const int DefaultSnapshotRows = 4;
+
+    private long DefaultSnapshotBytes()
+    {
+        if (!SupportsRecurrentRowSnapshots) return 0;
+        var g = _defaultState.Gdn;
+        return (long)DefaultSnapshotRows * g.NumGdnLayers * ((long)g.GdnStateElements + g.ConvStateElements) * sizeof(float);
     }
 
     // ───────────────────────────── IModel MTP surface ─────────────────────────────
