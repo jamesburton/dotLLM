@@ -1,3 +1,4 @@
+using DotLLM.Vulkan.Kernels;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
@@ -77,6 +78,17 @@ public sealed class VulkanQwen4ExpParityTests
         ["inter640-q4k-q80", 9],
         ["inter96-q4k-q51", 10],
         ["e512x640-q4k-q51", 11],
+        // #823: the UD-IQ4_XS mix (IQ3_S / IQ4_XS gate+up, IQ4_NL down) with random IQ blocks; hidden 256 = one super-block per gate/up row.
+        ["inter640-iq3s-iq4nl", 12],
+        ["inter640-iq4xs-iq4nl", 13],
+        ["e512x640-iq3s-iq4nl", 14],
+        // ISTA GSQ-RCO mixes: IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS gate+up with upstream Q2_0 down banks (hidden 256, expert 640 = 10 Q2_0 blocks).
+        ["inter640-iq2xxs-q20", 15],
+        ["inter640-iq2xs-q20", 16],
+        ["inter640-iq2s-q20", 17],
+        ["inter640-iq3xxs-q20", 18],
+        ["inter640-iq1m-q20", 19],
+        ["inter640-hc-bf16", 20],
     ];
 
     internal static byte[] Build(int variant) => variant switch
@@ -93,10 +105,19 @@ public sealed class VulkanQwen4ExpParityTests
         9 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.RealMixQ80),
         10 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter96, Q4eQuant.RealMixQ51),
         11 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Real512x640, Q4eQuant.RealMixQ51),
+        12 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.RealMixIq4Xs),
+        13 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.RealMixIq4XsGate),
+        14 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Real512x640, Q4eQuant.RealMixIq4Xs),
+        15 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.IstaMix(QuantizationType.IQ2_XXS, QuantizationType.Q2_0)),
+        16 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.IstaMix(QuantizationType.IQ2_XS, QuantizationType.Q2_0)),
+        17 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.IstaMix(QuantizationType.IQ2_S, QuantizationType.Q2_0)),
+        18 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.IstaMix(QuantizationType.IQ3_XXS, QuantizationType.Q2_0)),
+        19 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.IstaMix(QuantizationType.IQ1_M, QuantizationType.Q2_0)),
+        20 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.HcBf16),
         _ => throw new ArgumentOutOfRangeException(nameof(variant)),
     };
 
-    internal static bool IsQuantised(int variant) => variant is 1 or 3 or 4 or 7 or 8 or 9 or 10 or 11;
+    internal static bool IsQuantised(int variant) => variant is 1 or 3 or 4 or 7 or 8 or 9 or 10 or 11 or 12 or 13 or 14 or 15 or 16 or 17 or 18 or 19 or 20;
 
     internal static int[] Ids(int count, int vocab, int seed = 7)
     {
@@ -283,6 +304,71 @@ public sealed class VulkanQwen4ExpParityTests
         Assert.True(fastRel < 0.08 && fastKl < 0.02, $"fast arms off the oracle: relL2 {fastRel:E3}, KL {fastKl:E3}");
         Assert.True(slowRel < 0.08 && slowKl < 0.02, $"scalar arms off the oracle: relL2 {slowRel:E3}, KL {slowKl:E3}");
         Assert.True(armPre > 0 || armRel > 0, "perturbation inert: the fast arms produced bit-identical logits to the scalar kernels, so they did not run");
+    }
+
+    /// <summary>
+    /// #823: IQ3_S / IQ4_XS gate+up and IQ4_NL down banks stay PACKED on the device and take the indexed IQ MMVQ arms. Same proof style as the
+    /// legacy-quant test: record-time branch counters plus a perturbation (DOTLLM_VK_IQ_RESIDENT=0 widens the banks to F32 and routes the scalar
+    /// kernels; the logits must move, and both must stay oracle-close). Both gate/up and down are checked on 640-wide experts with 256 hidden.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(12, QuantizationType.IQ3_S, QuantizationType.IQ4_NL)]
+    [InlineData(13, QuantizationType.IQ4_XS, QuantizationType.IQ4_NL)]
+    [InlineData(14, QuantizationType.IQ3_S, QuantizationType.IQ4_NL)]    // 512 experts, top-10
+    [InlineData(15, QuantizationType.IQ2_XXS, QuantizationType.Q2_0)]
+    [InlineData(16, QuantizationType.IQ2_XS, QuantizationType.Q2_0)]
+    [InlineData(17, QuantizationType.IQ2_S, QuantizationType.Q2_0)]
+    [InlineData(18, QuantizationType.IQ3_XXS, QuantizationType.Q2_0)]
+    [InlineData(19, QuantizationType.IQ1_M, QuantizationType.Q2_0)]
+    public void IqBanks_AreResident_AndTakeTheMmvqArms(int variant, QuantizationType gateUp, QuantizationType down)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        int T = 40;
+        var ids = Ids(T, 128, seed: 21);
+        float[] cpuPrefill, fastPrefill, fastDecode, slowPrefill, slowDecode;
+        using (var rig = new Q4eRig(Build(variant), spvDir))
+        {
+            Skip.IfNot(rig.Device.HasIntegerDotProduct, "needs VK_KHR_shader_integer_dot_product");
+            Assert.All(rig.Vk.ExpertBankDeviceTypes, t =>
+            {
+                Assert.Equal(gateUp, t.Gate);        // NOT F32: no expansion
+                Assert.Equal(down, t.Down);
+                Assert.Equal(gateUp, t.Up);
+            });
+            cpuPrefill = Q4eRig.Row(rig.Cpu.Forward(ids, Enumerable.Range(0, T).ToArray(), -1), T - 1);
+            fastDecode = Decode(rig, ids, 3, out fastPrefill);
+            Assert.True(rig.Vk.MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath.IqMmvqGateUp) > 0, "IQ MMVQ gate/up arm never recorded");
+            Assert.True(rig.Vk.MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath.IqMmvqDown) > 0, "IQ MMVQ down arm never recorded");
+            Assert.True(rig.Vk.MoeFusedLayers > 0, "the 1-token decode steps never took the fused qwen4exp MoE chain (#885) with IQ gate/up banks");
+            // The 40-token prefill is above the grouped threshold: where coopmat + native wave64 exist, both banks must take the grouped arms.
+            var gateIq = MoeIndexedMatmulIqMmvqKernel.FromQuantizationType(gateUp)!.Value;
+            if (MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(rig.Device, spvDir, gateIq) && MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(rig.Device, spvDir, MoeIndexedMatmulIqMmvqKernel.FromQuantizationType(down)!.Value))
+            {
+                Assert.True(rig.Vk.MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath.GroupedIqGateUp) > 0, "grouped IQ gate/up arm never recorded");
+                Assert.True(rig.Vk.MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath.GroupedIqDown) > 0, "grouped IQ down arm never recorded");
+            }
+        }
+        string? prior = Environment.GetEnvironmentVariable("DOTLLM_VK_IQ_RESIDENT");
+        try
+        {
+            Environment.SetEnvironmentVariable("DOTLLM_VK_IQ_RESIDENT", "0");
+            using var rig = new Q4eRig(Build(variant), spvDir);
+            Assert.All(rig.Vk.ExpertBankDeviceTypes, t => Assert.Equal(QuantizationType.F32, t.Down));   // widened: the scalar F32 path
+            slowDecode = Decode(rig, ids, 3, out slowPrefill);
+            Assert.Equal(0, rig.Vk.MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath.IqMmvqGateUp));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DOTLLM_VK_IQ_RESIDENT", prior);
+        }
+        var (fastRel, fastKl, _) = Compare(cpuPrefill, fastPrefill);
+        var (slowRel, slowKl, _) = Compare(cpuPrefill, slowPrefill);
+        var (armRel, _, _) = Compare(slowDecode, fastDecode);
+        var (armPre, _, _) = Compare(slowPrefill, fastPrefill);
+        _out.WriteLine($"variant {variant} ({gateUp}/{down}): fast vs CPU relL2 {fastRel:E3} KL {fastKl:E3}; widened vs CPU relL2 {slowRel:E3} KL {slowKl:E3}; fast vs widened prefill {armPre:E3}, decode {armRel:E3}");
+        Assert.True(fastRel < 0.08 && fastKl < 0.02, $"IQ MMVQ arms off the oracle: relL2 {fastRel:E3}, KL {fastKl:E3}");
+        Assert.True(slowRel < 0.08 && slowKl < 0.02, $"widened arms off the oracle: relL2 {slowRel:E3}, KL {slowKl:E3}");
+        Assert.True(armPre > 0 || armRel > 0, "perturbation inert: the resident IQ arms produced bit-identical logits to the widened path, so they did not run");
     }
 
     [SkippableFact]

@@ -322,6 +322,7 @@ public sealed class GgufFile : IDisposable
 
         // Validate tensor data fits within the file.
         long dataSectionLength = fileLength - dataSectionOffset;
+        GgufReader.ReclassifyUpstreamQ2_0(tensors, alignment, dataSectionLength);   // #823: type id 42 = PQ2_0 or upstream Q2_0, told apart by extent
         foreach (var tensor in tensors)
         {
             long tensorBytes = tensor.QuantizationType.ComputeByteCount(tensor.Shape.ElementCount);

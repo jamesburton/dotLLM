@@ -1,0 +1,85 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// MoE INDEXED upstream-ggml Q2_0 MMVQ decode GEMV (issue #823): integer-dot (dp4a) matrix-vector multiply over a packed Q2_0 expert bank.
+//
+//   y[n, m] = sum_k dequant_q2_0(bank[indices[n], m, k]) * x[n, k]
+//
+// Q2_0 block (18 bytes / 64 elements): fp16 d, qs[16]; element j = ((qs[j/4] >> (2*(j%4))) & 3) - 1) * d  (codes 0..3 = -d, 0, +d, +2d).
+// With the code c in 0..3 (fits int8) the activation is a Q8_1 block (int8 xq, scale d_x):
+//   sum_j w_j * x_j = d * d_x * ( dp4a(c, xq) - dp4a(1, xq) )
+// One wave32 subgroup per output cell (n, m); 8 lanes per 64-element block (4 blocks per window): lane L -> block L/8, slice sl = L%8 owns
+// elements [8*sl, 8*sl+8) = the 2 code bytes at block byte 2 + 2*sl (an even offset, so a 16-bit read never straddles a word).
+// Reduction: one subgroupAdd. NOT bit-exact vs a float-in reference (x is int8-quantized). Dispatch: 2D grid - x = m, y = n.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  bank[]; };      // Q2_0 blob [numExperts, M, K/64 x 18 B]
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq   { uint  xq[]; };        // [N * K/4]
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds  { vec2  xds[]; };       // [N * K/32]
+layout(set = 0, binding = 3, std430) readonly  buffer BufIdx  { int   indices[]; };   // [N]
+layout(set = 0, binding = 4, std430) writeonly buffer BufY    { float y[]; };         // [N * M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint numExperts;
+    uint blocksPerRow;  // K / 64
+    uint xDiv;          // activation row = n / xDiv (1 = per-row input; topK = one row broadcast to its topK expert slots)
+} pc;
+
+const uint Q2_0_BLOCK_BYTES = 18u;
+const uint WINDOW_BLOCKS = 4u;   // 32 lanes / 8 lanes-per-block
+
+uint readHalf16(uint absByteOff) {            // absByteOff is even
+    return (bank[absByteOff >> 2u] >> ((absByteOff & 2u) * 8u)) & 0xFFFFu;
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    uint n = gl_WorkGroupID.y;
+    if (m >= pc.M || n >= pc.N) return;
+
+    uint expert = uint(indices[n]);
+    if (expert >= pc.numExperts) return;
+
+    uint lane = gl_LocalInvocationID.x;   // 0..31
+    uint bi = lane >> 3u;                 // block within the 4-block window
+    uint sl = lane & 7u;                  // 8-element slice of the 64-element block
+
+    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * Q2_0_BLOCK_BYTES;
+    uint xRow        = n / pc.xDiv;
+    uint xqRowBase   = xRow * (pc.K >> 2u);
+    uint xdsRowBase  = xRow * (pc.K >> 5u);
+    float acc = 0.0;
+
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + bi;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        uint blockByteBase = rowByteBase + blk * Q2_0_BLOCK_BYTES;
+        float d = unpackHalf2x16(readHalf16(blockByteBase)).x;
+        uint h = readHalf16(blockByteBase + 2u + 2u * sl);   // 8 two-bit codes
+
+        uint cLo = (h & 3u) | (((h >> 2u) & 3u) << 8u) | (((h >> 4u) & 3u) << 16u) | (((h >> 6u) & 3u) << 24u);
+        uint cHi = ((h >> 8u) & 3u) | (((h >> 10u) & 3u) << 8u) | (((h >> 12u) & 3u) << 16u) | (((h >> 14u) & 3u) << 24u);
+
+        uint xi = xqRowBase + blk * 16u + 2u * sl;           // 64 elements = 16 xq uints; slice = 2 uints
+        int x0 = int(xq[xi]);
+        int x1 = int(xq[xi + 1u]);
+        int dotC = dotPacked4x8AccSatEXT(int(cLo), x0, 0);
+        dotC = dotPacked4x8AccSatEXT(int(cHi), x1, dotC);
+        int dotOnes = dotPacked4x8AccSatEXT(0x01010101, x0, 0);
+        dotOnes = dotPacked4x8AccSatEXT(0x01010101, x1, dotOnes);
+
+        float dX = xds[xdsRowBase + blk * 2u + (sl >> 2u)].x;   // slices 0..3 -> first Q8_1 block of the pair, 4..7 -> second
+        acc += d * (dX * float(dotC - dotOnes));
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[n * pc.M + m] = total;
+}

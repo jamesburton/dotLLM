@@ -45,6 +45,8 @@ internal sealed record Q4eQuant
     public QuantizationType ExpertDown { get; init; } = QuantizationType.F32;
     public QuantizationType Proj { get; init; } = QuantizationType.F32;
     public QuantizationType HcDown { get; init; } = QuantizationType.F32;
+    /// <summary>Gated-residual up projections (F32 unless a fixture mirrors the ISTA files' BF16 ones, #823).</summary>
+    public QuantizationType HcUp { get; init; } = QuantizationType.F32;
     public QuantizationType Embed { get; init; } = QuantizationType.F32;
     public QuantizationType Table { get; init; } = QuantizationType.F32;
     public QuantizationType Indexer { get; init; } = QuantizationType.F32;
@@ -67,6 +69,14 @@ internal sealed record Q4eQuant
     public static Q4eQuant RealMixQ5KQ80 => RealMixQ51 with { ExpertGateUp = QuantizationType.Q5_K, ExpertDown = QuantizationType.Q8_0 };
     /// <summary>The real UD-Q4_K_XL mix's Q8_0-down layers (#849): Q4_K gate/up, Q8_0 down.</summary>
     public static Q4eQuant RealMixQ80 => RealMixQ51 with { ExpertDown = QuantizationType.Q8_0 };
+    /// <summary>The real UD-IQ4_XS mix (#823): IQ3_S gate/up experts, IQ4_NL down experts (Q8_0 projections). Expert bytes are random IQ blocks.</summary>
+    public static Q4eQuant RealMixIq4Xs => RealMixQ51 with { ExpertGateUp = QuantizationType.IQ3_S, ExpertDown = QuantizationType.IQ4_NL };
+    /// <summary>The UD-IQ4_XS layer whose gate/up is IQ4_XS (#823), IQ4_NL down.</summary>
+    /// <summary>ISTA-style BF16 gated-residual projections with the UD-Q4_K_XL mix otherwise (#823).</summary>
+    public static Q4eQuant HcBf16 => RealMixQ51 with { HcDown = QuantizationType.BF16, HcUp = QuantizationType.BF16 };
+    public static Q4eQuant RealMixIq4XsGate => RealMixIq4Xs with { ExpertGateUp = QuantizationType.IQ4_XS };
+    /// <summary>The ISTA GSQ-RCO mixes (#823): small-IQ gate/up experts with upstream-Q2_0 (or IQ4_NL) down experts.</summary>
+    public static Q4eQuant IstaMix(QuantizationType gateUp, QuantizationType down) => RealMixIq4Xs with { ExpertGateUp = gateUp, ExpertDown = down };
     public static Q4eQuant KQuant => new()
     {
         ExpertGateUp = QuantizationType.Q4_K, ExpertDown = QuantizationType.Q4_K, Proj = QuantizationType.Q8_0,
@@ -218,7 +228,8 @@ internal static class Qwen4ExpRandomGguf
         void Add(string name, int[] dims, float[] data, QuantizationType qt)
         {
             // Quantised rows need ne0 to be a block multiple; otherwise the family silently stays F32 (the contract allows any type per tensor).
-            int block = qt switch { QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K => 256, QuantizationType.F32 or QuantizationType.F16 or QuantizationType.BF16 => 1, _ => 32 };
+            int block = qt switch { QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K or QuantizationType.IQ3_S or QuantizationType.IQ4_XS
+                or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S or QuantizationType.IQ3_XXS or QuantizationType.IQ1_M => 256, QuantizationType.Q2_0 => 64, QuantizationType.F32 or QuantizationType.F16 or QuantizationType.BF16 => 1, _ => 32 };
             if (dims[0] % block != 0) qt = QuantizationType.F32;
             byte[] bytes;
             if (qt == QuantizationType.F32)
@@ -243,6 +254,8 @@ internal static class Qwen4ExpRandomGguf
                     BitConverter.TryWriteBytes(bytes.AsSpan(2 * i), (Half)data[i]);
             }
             else if (qt == QuantizationType.Q5_K) bytes = EncodeQ5K(data);
+            else if (IsRandomIq(qt))
+                bytes = EncodeRandomIq(data, dims[0], qt);
             else bytes = Quantize.FromFloat32(data, data.Length, qt);
             w.AddTensor(name, dims, (uint)qt, bytes);
         }
@@ -256,7 +269,7 @@ internal static class Qwen4ExpRandomGguf
             Mat("output.weight", H, g.Vocab, q.Embed, gain: 3f);
             Norm("output_hc_norm.weight", hcDim);
             Mat("output_hc_down.weight", hcDim, g.HcLowRank, q.HcDown);
-            Mat("output_hc_up.weight", g.HcLowRank, hcDim, QuantizationType.F32, gain: 2f);
+            Mat("output_hc_up.weight", g.HcLowRank, hcDim, q.HcUp, gain: 2f);
             Add("per_layer_token_embd.weight", [g.PleRowDim, g.TableRows], Randn((long)g.PleRowDim * g.TableRows, 0.5f), q.Table);
         }
 
@@ -275,7 +288,7 @@ internal static class Qwen4ExpRandomGguf
             {
                 Norm(b + m + "norm.weight", hcDim);
                 Mat(b + m + "down.weight", hcDim, g.HcLowRank, q.HcDown);
-                Mat(b + m + "up.weight", g.HcLowRank, hcDim, QuantizationType.F32, gain: 2f);
+                Mat(b + m + "up.weight", g.HcLowRank, hcDim, q.HcUp, gain: 2f);
                 Add(b + m + "inject.weight", [hcDim, S], Randn((long)hcDim * S, 1f / MathF.Sqrt(hcDim)), QuantizationType.F32);
             }
 
@@ -334,7 +347,7 @@ internal static class Qwen4ExpRandomGguf
                 Norm(b + "nextn.hnorm.weight", hcDim);
                 Norm(b + "nextn.hc_head_norm.weight", hcDim);
                 Mat(b + "nextn.hc_head_down.weight", hcDim, g.HcLowRank, q.HcDown);
-                Mat(b + "nextn.hc_head_up.weight", g.HcLowRank, hcDim, QuantizationType.F32, gain: 2f);
+                Mat(b + "nextn.hc_head_up.weight", g.HcLowRank, hcDim, q.HcUp, gain: 2f);
             }
         }
         return w.Build();
@@ -358,6 +371,49 @@ internal static class Qwen4ExpRandomGguf
     /// single-token MoE decode (both need a Q5_K / Q6_K down bank) are NOT exercised here.
     /// </summary>
     public static Q4eGeometry Inter640 => KQuant256 with { MoeInter = 640 };
+
+    /// <summary>
+    /// Random IQ blocks (the test tree has no IQ quantizer): any code / sign / scale byte decodes, so the bytes are random with the leading
+    /// fp16 super-scale of every block rescaled so the dequantized rms matches the Gaussian the float data was drawn with (the model stays
+    /// well conditioned). CPU oracle and Vulkan read the same bytes, which is all a parity test needs.
+    /// </summary>
+    private static bool IsRandomIq(QuantizationType qt) => qt is QuantizationType.IQ3_S or QuantizationType.IQ4_XS or QuantizationType.IQ4_NL
+        or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S or QuantizationType.IQ3_XXS or QuantizationType.Q2_0 or QuantizationType.IQ1_M;
+
+    private static unsafe byte[] EncodeRandomIq(float[] data, int rowElems, QuantizationType qt)
+    {
+        long n = data.Length;
+        long rowBytes = Dequantize.RowByteSize(rowElems, qt);
+        long rows = n / rowElems;
+        int blockBytes = QuantFormat.TryGetInfo(qt)!.Value.BlockBytes;
+        var rng = new Random(unchecked((int)(n * 31 + (int)qt * 7919 + rowElems)));
+        var bytes = new byte[rows * rowBytes];
+        rng.NextBytes(bytes);
+        double target = 0;
+        for (long i = 0; i < n; i++) target += (double)data[i] * data[i];
+        target = Math.Sqrt(target / n);
+        for (long b = 0; b + blockBytes <= bytes.Length; b += blockBytes)
+        {
+            DotLLM.Tests.Unit.Vulkan.IqBlockScale.Set(bytes, b, blockBytes, (Half)0.01f);
+        }
+        // Measure the rms of the first rows at d = 0.01 and rescale every d (fp16) to hit the target.
+        long probeRows = Math.Min(rows, 8);
+        var probe = new float[rowElems];
+        double ss = 0;
+        fixed (byte* p = bytes)
+            for (long r = 0; r < probeRows; r++)
+            {
+                Dequantize.ToFloat32((nint)(p + r * rowBytes), rowElems, qt, probe);
+                foreach (float v in probe) ss += (double)v * v;
+            }
+        double rms = Math.Sqrt(ss / (probeRows * rowElems));
+        float scale = rms > 0 ? (float)(0.01 * target / rms) : 0.01f;
+        for (long b = 0; b + blockBytes <= bytes.Length; b += blockBytes)
+        {
+            DotLLM.Tests.Unit.Vulkan.IqBlockScale.Set(bytes, b, blockBytes, (Half)scale);
+        }
+        return bytes;
+    }
 
     /// <summary>Expert width 96 (a multiple of 32 but NOT of 64 or 256): the legacy-quant MMVQ decode applies, the grouped prefill must fall back (#849).</summary>
     public static Q4eGeometry Inter96 => KQuant256 with { MoeInter = 96 };

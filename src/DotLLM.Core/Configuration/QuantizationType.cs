@@ -105,6 +105,14 @@ public enum QuantizationType
     IQ1_S = 19,
 
     /// <summary>
+    /// 1.75 bpw importance quantization (ggml <c>IQ1_M</c>, id 29; issue #823). Super-block of 256 elements stored in 56 bytes:
+    /// <c>qs[32]@0 + qh[16]@32 + scales[4 x uint16]@48</c>. There is no separate fp16 super-scale: it is spread over the top nibbles of
+    /// the four <c>scales</c> words. Each 32-element sub-block has two 3-bit sub-scales (<c>dl = d * (2*s + 1)</c>) and four 8-element
+    /// groups indexing the shared iq1s grid with an 11-bit index (<c>qs | 3 bits of qh &lt;&lt; 8</c>) plus a per-group delta sign.
+    /// </summary>
+    IQ1_M = 29,
+
+    /// <summary>
     /// 3-bit importance quantization, "extra extra small" (3.0625 bpw).
     /// Super-block of 256 elements stored in 98 bytes:
     /// <c>d(Half@0) + qs[64]@2 + scales_and_signs[32]@66</c>. The first 64
@@ -164,6 +172,15 @@ public enum QuantizationType
     /// invalid codes and/or wildly inconsistent scale magnitudes.
     /// </summary>
     PQ2_0 = 42,
+
+    /// <summary>
+    /// Upstream ggml <c>Q2_0</c> (issue #823): 64-element blocks of <c>fp16 d</c> + 16 bytes of 2-bit codes (2.25 bpw, 18 bytes/block);
+    /// element j of a block is <c>((qs[j/4] &gt;&gt; (2*(j%4))) &amp; 3) - 1) * d</c> (codes 0..3 = -1, 0, +1, +2). On disk it shares GGUF
+    /// type id 42 with <see cref="PQ2_0"/>, so the id is not enough: <c>GgufReader.ReclassifyUpstreamQ2_0</c> decides from the tensor's
+    /// on-disk extent and re-labels the tensor with this internal value (242, outside the GGUF id range). Used for the ISTA
+    /// Qwen3.8-Flash-Next expert down banks.
+    /// </summary>
+    Q2_0 = 242,
 
     /// <summary>
     /// LittleBit factorized linear (issue #864): not a GGUF type. The weight "pointer" is a handle into

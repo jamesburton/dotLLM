@@ -95,12 +95,12 @@ internal readonly record struct Qwen4ExpResidencyPlan(
     }
 
     /// <summary>Quant types whose routed expert banks stay packed on the device (mirrors <c>VulkanQwen3MoeMoeUpload</c>).</summary>
-    private static bool BankStaysPacked(QuantizationType qt, int kDim)
-        => VulkanQwen3MoeMoeUpload.BankStaysPacked(qt, kDim);
+    private static bool BankStaysPacked(QuantizationType qt, int kDim, bool integerDot)
+        => VulkanQwen3MoeMoeUpload.BankStaysPacked(qt, kDim, integerDot);
 
     /// <summary>Estimates device bytes for the tensors Qwen4Exp uploads, from the GGUF tensor table. Host-only tensors are excluded.</summary>
     public static (long DeviceBytes, long HostOnlyBytes) EstimateWeights(
-        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, ModelConfig config)
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, ModelConfig config, bool integerDot = true)
     {
         long device = 0, hostOnly = 0;
         foreach (var (name, d) in tensors)
@@ -117,7 +117,7 @@ internal readonly record struct Qwen4ExpResidencyPlan(
             if (name.Contains(".nextn.", StringComparison.Ordinal)) continue;   // MTP block: not loaded by V1
 
             if (name.Contains("_exps.weight", StringComparison.Ordinal))
-                device += BankStaysPacked(d.QuantizationType, d.Shape[0]) ? packed : elems * 4;
+                device += BankStaysPacked(d.QuantizationType, d.Shape[0], integerDot) ? packed : elems * 4;
             else if (name == Qwen4ExpTensors.TokenEmbd)
             {
                 if (VulkanQwen4ExpTransformerModel.HostEmbedding) hostOnly += packed;   // rows are gathered on the host from the mmap'd table (#819)
@@ -159,9 +159,9 @@ internal readonly record struct Qwen4ExpResidencyPlan(
     /// </summary>
     public static Qwen4ExpResidencyPlan Create(
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, ModelConfig config,
-        long capacityBytes, int kvPositions, long physicalRamBytes, long? headroomBytes = null)
+        long capacityBytes, int kvPositions, long physicalRamBytes, long? headroomBytes = null, bool integerDot = true)
     {
-        var (device, hostOnly) = EstimateWeights(tensors, config);
+        var (device, hostOnly) = EstimateWeights(tensors, config, integerDot);
         // Scratch: the prefill chunk working set (routed-expert intermediates dominate) - a flat allowance plus per-position KV.
         long scratch = 1L << 30;
         return new Qwen4ExpResidencyPlan(device, ContextBytes(config, kvPositions) + scratch, hostOnly,

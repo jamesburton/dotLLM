@@ -48,17 +48,41 @@ public sealed class GgufType42CollisionTests : IDisposable
     [Theory]
     [InlineData(true)]  // extent measured to next tensor
     [InlineData(false)] // extent measured to end of data section
-    public void Id42_WithUpstreamQ2_0Extent_IsRejected(bool trailing)
+    public void Id42_WithUpstreamQ2_0Extent_LoadsAsQ2_0(bool trailing)
     {
-        var ex = Assert.Throws<NotSupportedException>(
-            () => GgufFile.Open(Build(42, UpstreamQ2Bytes, N, trailing)));
+        // #823: the extent says upstream ggml Q2_0 (64-element groups), so the tensor is re-labelled instead of mis-decoded as PQ2_0.
+        using var f = GgufFile.Open(Build(42, UpstreamQ2Bytes, N, trailing));
+        Assert.Equal(QuantizationType.Q2_0, f.Tensors[0].QuantizationType);
+    }
+
+    [Fact]
+    public void Id42_FittingNeitherLayout_IsStillRejected()
+    {
+        var ex = Assert.Throws<NotSupportedException>(() => GgufFile.Open(Build(42, UpstreamQ2Bytes + 200, N, trailingTensor: true)));
         Assert.Contains("Q2_0", ex.Message);
     }
 
     [Fact]
-    public void Id42_NotMultipleOf128_IsRejected()
+    public void Id42_SingleUpstreamQ2_0Group_LoadsAsQ2_0()
     {
         // 64 elements = one upstream Q2_0 group (18 B); impossible as PQ2_0.
-        Assert.Throws<NotSupportedException>(() => GgufFile.Open(Build(42, 18, 64, trailingTensor: true)));
+        using var f = GgufFile.Open(Build(42, 18, 64, trailingTensor: true));
+        Assert.Equal(QuantizationType.Q2_0, f.Tensors[0].QuantizationType);
+    }
+
+    /// <summary>
+    /// #823 real-file check (opt-in, <c>DOTLLM_ISTA_GGUF</c> = shard 1 of an ISTA Qwen3.8-Flash-Next GSQ-RCO IQ2_XS / IQ3_XXS set): every id-42
+    /// expert down bank is upstream Q2_0 (2.25 bpw), nothing is left labelled PQ2_0, and the open succeeds.
+    /// </summary>
+    [SkippableFact]
+    public void RealIstaFile_Id42ExpertBanks_AreQ2_0()
+    {
+        string? path = Environment.GetEnvironmentVariable("DOTLLM_ISTA_GGUF");
+        Skip.If(string.IsNullOrEmpty(path) || !File.Exists(path), "DOTLLM_ISTA_GGUF not set");
+        using var f = GgufFile.Open(path!);
+        var q2 = f.Tensors.Where(t => t.QuantizationType == QuantizationType.Q2_0).ToList();
+        Assert.NotEmpty(q2);
+        Assert.Contains(q2, t => t.Name.Contains("ffn_down_exps", StringComparison.Ordinal));
+        Assert.DoesNotContain(f.Tensors, t => t.QuantizationType == QuantizationType.PQ2_0);
     }
 }

@@ -125,7 +125,7 @@ public class QuantFormatTests
             ["IQ3_XXS"] = QuantFormat.IQ3_XXSBlockBytes, ["IQ3_S"] = QuantFormat.IQ3_SBlockBytes,
             ["IQ4_NL"] = QuantFormat.IQ4_NLBlockBytes, ["IQ4_XS"] = QuantFormat.IQ4_XSBlockBytes,
             ["I2S"] = QuantFormat.I2_SBlockBytes, ["PQ2_0"] = QuantFormat.PQ2_0BlockBytes,
-            ["MXFP4"] = QuantFormat.Mxfp4BlockBytes,
+            ["MXFP4"] = QuantFormat.Mxfp4BlockBytes, ["Q2_0"] = QuantFormat.Q2_0BlockBytes, ["IQ1_M"] = QuantFormat.IQ1_MBlockBytes,
         };
         // filename fragment -> expected bytes, for bare `BLOCK_BYTES`
         var byFile = new (string Fragment, int Bytes)[]

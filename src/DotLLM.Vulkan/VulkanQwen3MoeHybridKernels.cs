@@ -85,6 +85,18 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     /// <summary>16-row Q5_K twin (#821): a layer with Q5_K gate/up and a legacy-quant (Q5_1/Q8_0) down - UD-Q4_K_XL layer 2 - shares one 16-row tile list. Present under the same condition as <see cref="MoeGroupedQ4K16"/>.</summary>
     public MoeGroupedMatmulKQuantCoopmatKernel? MoeGroupedQ5K16 { get; private set; }
     public MoeIndexedMatmulKQuantMmvqKernel? MoeMmvqQ6K { get; private set; }
+    /// <summary>The iq1s grid for the IQ1_M expert kernels (#823), uploaded once per kernel set.</summary>
+    internal Iq1Codebooks Iq1CodebooksOwned { get; private set; } = null!;
+    private readonly Dictionary<MoeIqQuant, MoeIndexedMatmulIqMmvqKernel> _iqMmvq = new();
+    private readonly Dictionary<MoeIqQuant, MoeGroupedMatmulIqCoopmatKernel> _iqGrouped = new();
+
+    /// <summary>#823: the indexed IQ-family MMVQ (dp4a) decode kernel serving a resident expert bank of <paramref name="qt"/>, or <c>null</c> (not an IQ bank type / no kernel / no integer-dot).</summary>
+    public MoeIndexedMatmulIqMmvqKernel? MoeMmvqIq(DotLLM.Core.Configuration.QuantizationType qt)
+        => MoeIqFormats.FromQuantizationType(qt) is { } f && _iqMmvq.TryGetValue(f, out var kern) ? kern : null;
+
+    /// <summary>#823: the grouped coopmat IQ-family prefill kernel (16-row tiles; wave64 + cooperative matrix only), or <c>null</c>.</summary>
+    public MoeGroupedMatmulIqCoopmatKernel? MoeGroupedIq(DotLLM.Core.Configuration.QuantizationType qt)
+        => MoeIqFormats.FromQuantizationType(qt) is { } f && _iqGrouped.TryGetValue(f, out var kern) ? kern : null;
     public MatMulQ2KGemvF32Kernel MatMulQ2K { get; }
     public MatMulQ2KGemmF32Kernel MatMulQ2KGemm { get; }
     public MatMulQ3KGemvF32Kernel MatMulQ3K { get; }
@@ -472,6 +484,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             sigGateMul,
             moeTopk, moeBroadcast, moeIndexed, moeIndexedQ6K, moeIndexedQ4K, moeIndexedQ5K,
             moeIndexedQ4KMmq, quantizeQ8_1Rows, moeIndexedQ5KMmq, moeScatter, moeSigmoidGatedAdd);
+        kernels.Iq1CodebooksOwned = Iq1Codebooks.Create(device);   // #823: grid for the IQ1_M expert kernels
         kernels.MoeSharedGateAdd = moeSharedGateAdd;
         kernels.MatMulBf16Multi = matmulBf16Multi;
         kernels.MatMulF32Multi = MatMulF32GemvMultiKernel.TryCreate(device, spvDir);
@@ -538,7 +551,14 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
                 kernels.MoeGroupedQ5_1 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Q5_1);
             if (MoeGroupedMatmulLegacyQuantCoopmatKernel.IsSupportedOn(device, spvDir, MoeGroupedLegacyQuant.Q8_0))
                 kernels.MoeGroupedQ8_0 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Q8_0);
-            if ((kernels.MoeGroupedQ5_1 is not null || kernels.MoeGroupedQ8_0 is not null) && q4.RowTile != 16)
+            // #823: grouped IQ kernels (16-row tiles). DOTLLM_VK_MOE_IQ_GROUPED=0 leaves IQ banks on the MMVQ path for every row count.
+            if (Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_IQ_GROUPED") != "0")
+            {
+                foreach (var f in Enum.GetValues<MoeIqQuant>())
+                    if (MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(device, spvDir, f))
+                        kernels._iqGrouped[f] = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, f, iq3Codebooks, iq2Codebooks, kernels.Iq1CodebooksOwned);
+            }
+            if ((kernels.MoeGroupedQ5_1 is not null || kernels.MoeGroupedQ8_0 is not null || kernels._iqGrouped.Count > 0) && q4.RowTile != 16)
             {
                 kernels.MoeGroupedQ4K16 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q4_K);
                 if (q5.RowTile != 16) kernels.MoeGroupedQ5K16 = MoeGroupedMatmulKQuantCoopmatKernel.Create(device, spvDir, MoeGroupedKQuant.Q5_K);
@@ -579,6 +599,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             kernels.MoeMmvqQ5_1 = MoeIndexedMatmulQ5_1MmvqKernel.TryCreate(device, spvDir);
             kernels.MoeMmvqQ8_0 = MoeIndexedMatmulQ8_0MmvqKernel.TryCreate(device, spvDir);
             kernels.MoeMmvqQ6K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q6_K);
+            foreach (var f in Enum.GetValues<MoeIqQuant>())
+                if (MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spvDir, f, iq3Codebooks, iq2Codebooks, kernels.Iq1CodebooksOwned) is { } mk)
+                    kernels._iqMmvq[f] = mk;
         }
         return kernels;
     }
@@ -687,6 +710,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeMmvqQ6K?.InvalidateDescriptorCache();
         MoeIndexedMatmulQ5_1?.InvalidateDescriptorCache();
         MoeIndexedMatmulQ8_0?.InvalidateDescriptorCache();
+        foreach (var gk in _iqGrouped.Values) gk.InvalidateDescriptorCache();
+        foreach (var mk in _iqMmvq.Values) mk.InvalidateDescriptorCache();
         MoeMmvqQ5_1?.InvalidateDescriptorCache();
         MoeMmvqQ8_0?.InvalidateDescriptorCache();
         MoeGroupedQ5_1?.InvalidateDescriptorCache();
@@ -697,6 +722,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
 
     public void Dispose()
     {
+        foreach (var gk in _iqGrouped.Values) gk.Dispose();
+        foreach (var mk in _iqMmvq.Values) mk.Dispose();
         MoeIndexedMatmulQ5_1?.Dispose(); MoeIndexedMatmulQ8_0?.Dispose(); MoeMmvqQ5_1?.Dispose(); MoeMmvqQ8_0?.Dispose(); MoeMmvqQ4KMr?.Dispose(); MoeMmvqQ5_1Mr?.Dispose();
         MoeGroupedQ5_1?.Dispose(); MoeGroupedQ8_0?.Dispose(); MoeGroupedQ4K16?.Dispose(); MoeGroupedQ5K16?.Dispose();
         QGateDeinterleave?.Dispose(); GdnQkvSplit?.Dispose(); SwiGluQuantizeFused?.Dispose(); RmsNormQuantizeFused?.Dispose(); MatMulQ8Mmvq?.Dispose(); MatMulQ8MmvqWideRows?.Dispose(); MatMulQ8MmvqWideKSplit?.Dispose(); MoeMmvqQ6K?.Dispose(); MoeMmvqQ5K?.Dispose(); MoeMmvqQ4K?.Dispose();
@@ -754,6 +781,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulIq3XxsGemm.Dispose();
         MatMulIq3Xxs.Dispose();
         Iq3Codebooks.Dispose();
+        Iq1CodebooksOwned?.Dispose();
         MatMulIq2SGemm.Dispose();
         MatMulIq2S.Dispose();
         MatMulIq2XsGemm.Dispose();

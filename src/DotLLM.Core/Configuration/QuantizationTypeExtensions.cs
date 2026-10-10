@@ -38,6 +38,8 @@ public static class QuantizationTypeExtensions
         QuantizationType.IQ2_S => elementCount / 256 * 82,
         // IQ1_S:    d(2) + qs[QK_K/8] + qh[QK_K/32](uint16) = 2 + 32 + 16 = 50 bytes / 256 (~1.5625 bpw).
         QuantizationType.IQ1_S => elementCount / 256 * 50,
+        // IQ1_M:    qs[QK_K/8] + qh[QK_K/16] + scales[QK_K/32] = 32 + 16 + 8 = 56 bytes / 256 (1.75 bpw); the fp16 super-scale hides in the scales nibbles.
+        QuantizationType.IQ1_M => elementCount / 256 * 56,
         // IQ3_XXS:  d(2) + qs[QK_K/4] + scales_and_signs[QK_K/8] = 2 + 64 + 32 = 98 bytes / 256 (3.0625 bpw).
         QuantizationType.IQ3_XXS => elementCount / 256 * 98,
         // IQ3_S:    d(2) + qs[QK_K/4] + qh[QK_K/32] + signs[QK_K/8] + scales[QK_K/64]
@@ -47,6 +49,8 @@ public static class QuantizationTypeExtensions
         QuantizationType.I2_S => elementCount / 4 + 4,
         // MXFP4: e(1, E8M0 scale) + qs[16] = 17 bytes / 32 elements (4.25 bpw).
         QuantizationType.MXFP4 => elementCount / 32 * 17,
+        // Upstream ggml Q2_0: fp16 d + qs[16] = 18 bytes / 64 elements (2.25 bpw).
+        QuantizationType.Q2_0 => elementCount / 64 * 18,
         // PQ2_0: scale(Half, 2 bytes) + codes[32](uint8, 4 codes/byte) = 34 bytes / 128
         // elements (2.125 bpw) — one scale PER GROUP, not per tensor (contrast I2_S above).
         QuantizationType.PQ2_0 => elementCount / 128 * 34,

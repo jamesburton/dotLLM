@@ -71,7 +71,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         long residentCapacity = residentCapacityOverrideBytes ?? device.ResidentCapacityBytes();
         Qwen4ExpResidencyPlan MakePlan(int capacity)
         {
-            var p = Qwen4ExpResidencyPlan.Create(tensors, config, residentCapacity, capacity, GC.GetGCMemoryInfo().TotalAvailableMemoryBytes);
+            var p = Qwen4ExpResidencyPlan.Create(tensors, config, residentCapacity, capacity, GC.GetGCMemoryInfo().TotalAvailableMemoryBytes,
+                integerDot: device.HasIntegerDotProduct);
             return pressure is not null ? p with { OtherProcessBytes = pressure.OtherBytes, OtherProcessDetail = pressure.DescribeCulprits() } : p;
         }
         var plan = MakePlan(kvCapacity);
@@ -89,7 +90,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         if (!plan.Fits)
         {
             string msg = "qwen4exp weights do not fit the Vulkan device's resident capacity: " + plan.Describe() + ". " + plan.DescribeShortfall() + " " +
-                         "Quant types without a resident indexed-MoE kernel (everything but Q4_K/Q5_K/Q6_K/Q5_1/Q8_0 experts) are widened to F32 on upload.";
+                         "Quant types without a resident indexed-MoE kernel (everything but Q4_K/Q5_K/Q6_K/Q5_1/Q8_0/IQ3_S/IQ4_XS/IQ4_NL experts) are widened to F32 on upload.";
             if (!AllowOvercommit)
                 throw new NotSupportedException(msg + " Set DOTLLM_VK_ALLOW_OVERCOMMIT=1 to load anyway (expect paging).");
             Console.Error.WriteLine("[dotLLM] WARNING: " + msg + " DOTLLM_VK_ALLOW_OVERCOMMIT=1: loading anyway.");
@@ -187,7 +188,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                 void ScheduleLayer(int il)
                 {
                     if (prealloc is null || il >= config.NumLayers) return;
-                    long[] sizes = VulkanQwen3MoeMoeUpload.BankAllocationSizes(layers[il].Moe, config.HiddenSize, residentQuant: true);
+                    long[] sizes = VulkanQwen3MoeMoeUpload.BankAllocationSizes(layers[il].Moe, config.HiddenSize, residentQuant: true, integerDot: device.HasIntegerDotProduct);
                     // Near the device-local heap boundary allocation ORDER decides what falls back to the slower heap: allocate those inline.
                     if (VulkanBankPrealloc.MayAllocateAhead(heapBytes, LiveDeviceBytes(device), prealloc.PendingBytes, sizes.Sum(), AheadMargin))
                         prealloc.Schedule(sizes);
