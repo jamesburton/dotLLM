@@ -74,6 +74,7 @@ internal static class VulkanQwen3MoeMoeUpload
         QuantizationType.IQ2_S,
         QuantizationType.IQ3_XXS,
         QuantizationType.Q2_0,
+        QuantizationType.IQ1_M,
     };
 
     /// <summary>

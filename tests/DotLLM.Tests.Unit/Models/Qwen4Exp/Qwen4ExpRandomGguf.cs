@@ -225,7 +225,7 @@ internal static class Qwen4ExpRandomGguf
         {
             // Quantised rows need ne0 to be a block multiple; otherwise the family silently stays F32 (the contract allows any type per tensor).
             int block = qt switch { QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K or QuantizationType.IQ3_S or QuantizationType.IQ4_XS
-                or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S or QuantizationType.IQ3_XXS => 256, QuantizationType.Q2_0 => 64, QuantizationType.F32 or QuantizationType.F16 or QuantizationType.BF16 => 1, _ => 32 };
+                or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S or QuantizationType.IQ3_XXS or QuantizationType.IQ1_M => 256, QuantizationType.Q2_0 => 64, QuantizationType.F32 or QuantizationType.F16 or QuantizationType.BF16 => 1, _ => 32 };
             if (dims[0] % block != 0) qt = QuantizationType.F32;
             byte[] bytes;
             if (qt == QuantizationType.F32)
@@ -374,7 +374,7 @@ internal static class Qwen4ExpRandomGguf
     /// well conditioned). CPU oracle and Vulkan read the same bytes, which is all a parity test needs.
     /// </summary>
     private static bool IsRandomIq(QuantizationType qt) => qt is QuantizationType.IQ3_S or QuantizationType.IQ4_XS or QuantizationType.IQ4_NL
-        or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S or QuantizationType.IQ3_XXS or QuantizationType.Q2_0;
+        or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S or QuantizationType.IQ3_XXS or QuantizationType.Q2_0 or QuantizationType.IQ1_M;
 
     private static unsafe byte[] EncodeRandomIq(float[] data, int rowElems, QuantizationType qt)
     {
@@ -390,8 +390,7 @@ internal static class Qwen4ExpRandomGguf
         target = Math.Sqrt(target / n);
         for (long b = 0; b + blockBytes <= bytes.Length; b += blockBytes)
         {
-            ushort d = BitConverter.HalfToUInt16Bits((Half)0.01f);
-            bytes[b] = (byte)(d & 0xFF); bytes[b + 1] = (byte)(d >> 8);
+            DotLLM.Tests.Unit.Vulkan.IqBlockScale.Set(bytes, b, blockBytes, (Half)0.01f);
         }
         // Measure the rms of the first rows at d = 0.01 and rescale every d (fp16) to hit the target.
         long probeRows = Math.Min(rows, 8);
@@ -407,8 +406,7 @@ internal static class Qwen4ExpRandomGguf
         float scale = rms > 0 ? (float)(0.01 * target / rms) : 0.01f;
         for (long b = 0; b + blockBytes <= bytes.Length; b += blockBytes)
         {
-            ushort d = BitConverter.HalfToUInt16Bits((Half)scale);
-            bytes[b] = (byte)(d & 0xFF); bytes[b + 1] = (byte)(d >> 8);
+            DotLLM.Tests.Unit.Vulkan.IqBlockScale.Set(bytes, b, blockBytes, (Half)scale);
         }
         return bytes;
     }

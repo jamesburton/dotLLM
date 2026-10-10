@@ -41,6 +41,9 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
     [InlineData(QuantizationType.IQ2_S, 10, 512, 48, 2560, 10)]
     [InlineData(QuantizationType.IQ3_XXS, 6, 8, 12, 768, 5)]
     [InlineData(QuantizationType.IQ3_XXS, 10, 512, 48, 2560, 10)]
+    [InlineData(QuantizationType.IQ1_M, 5, 7, 12, 256, 4)]
+    [InlineData(QuantizationType.IQ1_M, 6, 8, 12, 768, 5)]
+    [InlineData(QuantizationType.IQ1_M, 10, 512, 48, 2560, 10)]
     [InlineData(QuantizationType.Q2_0, 5, 7, 12, 64, 4)]       // 1 block/row
     [InlineData(QuantizationType.Q2_0, 6, 8, 12, 192, 5)]      // 3 blocks/row - window tail
     [InlineData(QuantizationType.Q2_0, 3, 4, 9, 256, 3)]       // exactly one 4-block window
@@ -55,8 +58,9 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
             ?? throw new Xunit.Sdk.XunitException("quantize_q8_1_rows.spv missing.");
         using var codebooks = Iq3Codebooks.Create(device);
         using var codebooks2 = Iq2Codebooks.Create(device);
+        using var codebooks1 = Iq1Codebooks.Create(device);
         var iq = MoeIndexedMatmulIqMmvqKernel.FromQuantizationType(qt)!.Value;
-        using var kernel = MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spvDir, iq, codebooks, codebooks2)
+        using var kernel = MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spvDir, iq, codebooks, codebooks2, codebooks1)
             ?? throw new Xunit.Sdk.XunitException(MoeIndexedMatmulIqMmvqKernel.ShaderName(iq) + ".spv missing or unsupported.");
 
         var rng = new Random(0x1B5A + (int)qt * 1009 + n * 31 + numExperts * 17 + m * 11 + k * 7);
@@ -81,6 +85,7 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
     [InlineData(QuantizationType.IQ2_S, 6, 8, 12, 768)]
     [InlineData(QuantizationType.IQ3_XXS, 6, 8, 12, 768)]
     [InlineData(QuantizationType.Q2_0, 6, 8, 12, 192)]
+    [InlineData(QuantizationType.IQ1_M, 6, 8, 12, 768)]
     public void PerRowExpertIndex_MatchesSingleRowLaunches(QuantizationType qt, int n, int numExperts, int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -91,8 +96,9 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
             ?? throw new Xunit.Sdk.XunitException("quantize_q8_1_rows.spv missing.");
         using var codebooks = Iq3Codebooks.Create(device);
         using var codebooks2 = Iq2Codebooks.Create(device);
+        using var codebooks1 = Iq1Codebooks.Create(device);
         var iq = MoeIndexedMatmulIqMmvqKernel.FromQuantizationType(qt)!.Value;
-        using var kernel = MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spvDir, iq, codebooks, codebooks2)
+        using var kernel = MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spvDir, iq, codebooks, codebooks2, codebooks1)
             ?? throw new Xunit.Sdk.XunitException("spv missing.");
 
         var rng = new Random(0xC15C1 + (int)qt + n * 31 + numExperts * 17 + m * 11 + k * 7);
@@ -122,9 +128,7 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
         rng.NextBytes(bytes);
         for (long b = 0; b + blockBytes <= total; b += blockBytes)
         {
-            ushort d = BitConverter.HalfToUInt16Bits((Half)(0.002f + (float)rng.NextDouble() * 0.02f));
-            bytes[b] = (byte)(d & 0xFF);
-            bytes[b + 1] = (byte)(d >> 8);
+            IqBlockScale.Set(bytes, b, blockBytes, (Half)(0.002f + (float)rng.NextDouble() * 0.02f));
         }
         return bytes;
     }

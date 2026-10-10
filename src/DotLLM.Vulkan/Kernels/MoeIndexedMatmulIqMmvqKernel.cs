@@ -22,6 +22,8 @@ public enum MoeIqQuant
     IQ3_XXS,
     /// <summary>Upstream ggml Q2_0: 18 B / 64 elements (no codebook).</summary>
     Q2_0,
+    /// <summary>IQ1_M: 56 B / 256 elements, iq1s ternary grid.</summary>
+    IQ1_M,
 }
 
 /// <summary>Per-format facts shared by the indexed MMVQ and grouped coopmat IQ kernels (#823).</summary>
@@ -38,6 +40,7 @@ internal static class MoeIqFormats
         MoeIqQuant.IQ2_S => (QuantFormat.IQ2_SBlockBytes, QuantFormat.KQuantGroupSize),
         MoeIqQuant.IQ3_XXS => (QuantFormat.IQ3_XXSBlockBytes, QuantFormat.KQuantGroupSize),
         MoeIqQuant.Q2_0 => (QuantFormat.Q2_0BlockBytes, QuantFormat.Q2_0GroupSize),
+        MoeIqQuant.IQ1_M => (QuantFormat.IQ1_MBlockBytes, QuantFormat.KQuantGroupSize),
         _ => throw new ArgumentOutOfRangeException(nameof(quant)),
     };
 
@@ -52,11 +55,12 @@ internal static class MoeIqFormats
         QuantizationType.IQ2_S => MoeIqQuant.IQ2_S,
         QuantizationType.IQ3_XXS => MoeIqQuant.IQ3_XXS,
         QuantizationType.Q2_0 => MoeIqQuant.Q2_0,
+        QuantizationType.IQ1_M => MoeIqQuant.IQ1_M,
         _ => null,
     };
 
     /// <summary>The codebook buffers the shader binds after its fixed bindings (grid, then ksigns where the format has one).</summary>
-    public static VulkanDevice.Buffer[] Codebooks(MoeIqQuant quant, Iq3Codebooks? iq3, Iq2Codebooks? iq2)
+    public static VulkanDevice.Buffer[] Codebooks(MoeIqQuant quant, Iq3Codebooks? iq3, Iq2Codebooks? iq2, Iq1Codebooks? iq1 = null)
     {
         return quant switch
         {
@@ -65,6 +69,7 @@ internal static class MoeIqFormats
             MoeIqQuant.IQ2_XXS => [(iq2 ?? throw new ArgumentNullException(nameof(iq2), "IQ2_XXS needs the shared IQ2 codebooks.")).Iq2XxsGrid, iq2.Ksigns],
             MoeIqQuant.IQ2_XS => [(iq2 ?? throw new ArgumentNullException(nameof(iq2), "IQ2_XS needs the shared IQ2 codebooks.")).Iq2XsGrid, iq2.Ksigns],
             MoeIqQuant.IQ2_S => [(iq2 ?? throw new ArgumentNullException(nameof(iq2), "IQ2_S needs the shared IQ2 codebooks.")).Iq2SGrid],
+            MoeIqQuant.IQ1_M => [(iq1 ?? throw new ArgumentNullException(nameof(iq1), "IQ1_M needs the shared iq1s grid.")).Iq1SGrid],
             _ => [],
         };
     }
@@ -131,6 +136,7 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
         MoeIqQuant.IQ2_S => "moe_indexed_matmul_iq2_s_mmvq",
         MoeIqQuant.IQ3_XXS => "moe_indexed_matmul_iq3_xxs_mmvq",
         MoeIqQuant.Q2_0 => "moe_indexed_matmul_q2_0_mmvq",
+        MoeIqQuant.IQ1_M => "moe_indexed_matmul_iq1_m_mmvq",
         _ => throw new ArgumentOutOfRangeException(nameof(quant)),
     };
 
@@ -142,14 +148,14 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
     /// SPV is missing or the device lacks integer-dot-product support. <paramref name="iq3Codebooks"/> supplies the iq3s grid (required
     /// for <see cref="MoeIqQuant.IQ3_S"/>, ignored otherwise; the caller keeps ownership).
     /// </summary>
-    internal static MoeIndexedMatmulIqMmvqKernel? TryCreate(VulkanDevice device, string spvDir, MoeIqQuant quant, Iq3Codebooks? iq3Codebooks = null, Iq2Codebooks? iq2Codebooks = null)
+    internal static MoeIndexedMatmulIqMmvqKernel? TryCreate(VulkanDevice device, string spvDir, MoeIqQuant quant, Iq3Codebooks? iq3Codebooks = null, Iq2Codebooks? iq2Codebooks = null, Iq1Codebooks? iq1Codebooks = null)
     {
         if (!device.HasIntegerDotProduct)
             return null;
         string path = Path.Combine(spvDir, ShaderName(quant) + ".spv");
         if (!File.Exists(path))
             return null;
-        var codebooks = MoeIqFormats.Codebooks(quant, iq3Codebooks, iq2Codebooks);
+        var codebooks = MoeIqFormats.Codebooks(quant, iq3Codebooks, iq2Codebooks, iq1Codebooks);
         int buffersPerSet = 5 + codebooks.Length;
 
         uint requiredSubgroupSize = Wave32SubgroupControl.RequiredSubgroupSizeFor(device);

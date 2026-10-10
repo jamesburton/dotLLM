@@ -63,6 +63,7 @@ public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable
         MoeIqQuant.IQ2_S => "moe_grouped_matmul_iq2_s_coopmat_m64.spv",
         MoeIqQuant.IQ3_XXS => "moe_grouped_matmul_iq3_xxs_coopmat_m64.spv",
         MoeIqQuant.Q2_0 => "moe_grouped_matmul_q2_0_coopmat_m64.spv",
+        MoeIqQuant.IQ1_M => "moe_grouped_matmul_iq1_m_coopmat_m64.spv",
         _ => throw new ArgumentOutOfRangeException(nameof(quant)),
     };
 
@@ -75,11 +76,11 @@ public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable
         => device.HasCooperativeMatrix && device.SubgroupSize == 64 && File.Exists(Path.Combine(spvDir, SpvName(quant)));
 
     /// <summary>Creates the kernel for <paramref name="quant"/>; <paramref name="iq3Codebooks"/> supplies the iq3s grid (IQ3_S only; caller keeps ownership).</summary>
-    internal static MoeGroupedMatmulIqCoopmatKernel Create(VulkanDevice device, string spvDir, MoeIqQuant quant, Iq3Codebooks? iq3Codebooks = null, Iq2Codebooks? iq2Codebooks = null)
+    internal static MoeGroupedMatmulIqCoopmatKernel Create(VulkanDevice device, string spvDir, MoeIqQuant quant, Iq3Codebooks? iq3Codebooks = null, Iq2Codebooks? iq2Codebooks = null, Iq1Codebooks? iq1Codebooks = null)
     {
         if (!IsSupportedOn(device, spvDir, quant))
             throw new InvalidOperationException("MoeGroupedMatmulIqCoopmatKernel requires VK_KHR_cooperative_matrix, wave64 and the SPIR-V.");
-        var codebooks = MoeIqFormats.Codebooks(quant, iq3Codebooks, iq2Codebooks);
+        var codebooks = MoeIqFormats.Codebooks(quant, iq3Codebooks, iq2Codebooks, iq1Codebooks);
         int buffersPerSet = 4 + codebooks.Length;
         var module = VulkanModule.LoadFromFile(device, Path.Combine(spvDir, SpvName(quant)));
         ComputePipeline pipeline;

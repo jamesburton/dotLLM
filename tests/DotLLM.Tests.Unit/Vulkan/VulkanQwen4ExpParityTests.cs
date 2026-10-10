@@ -87,6 +87,7 @@ public sealed class VulkanQwen4ExpParityTests
         ["inter640-iq2xs-q20", 16],
         ["inter640-iq2s-q20", 17],
         ["inter640-iq3xxs-q20", 18],
+        ["inter640-iq1m-q20", 19],
     ];
 
     internal static byte[] Build(int variant) => variant switch
@@ -110,10 +111,11 @@ public sealed class VulkanQwen4ExpParityTests
         16 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.IstaMix(QuantizationType.IQ2_XS, QuantizationType.Q2_0)),
         17 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.IstaMix(QuantizationType.IQ2_S, QuantizationType.Q2_0)),
         18 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.IstaMix(QuantizationType.IQ3_XXS, QuantizationType.Q2_0)),
+        19 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.IstaMix(QuantizationType.IQ1_M, QuantizationType.Q2_0)),
         _ => throw new ArgumentOutOfRangeException(nameof(variant)),
     };
 
-    internal static bool IsQuantised(int variant) => variant is 1 or 3 or 4 or 7 or 8 or 9 or 10 or 11 or 12 or 13 or 14 or 15 or 16 or 17 or 18;
+    internal static bool IsQuantised(int variant) => variant is 1 or 3 or 4 or 7 or 8 or 9 or 10 or 11 or 12 or 13 or 14 or 15 or 16 or 17 or 18 or 19;
 
     internal static int[] Ids(int count, int vocab, int seed = 7)
     {
@@ -315,6 +317,7 @@ public sealed class VulkanQwen4ExpParityTests
     [InlineData(16, QuantizationType.IQ2_XS, QuantizationType.Q2_0)]
     [InlineData(17, QuantizationType.IQ2_S, QuantizationType.Q2_0)]
     [InlineData(18, QuantizationType.IQ3_XXS, QuantizationType.Q2_0)]
+    [InlineData(19, QuantizationType.IQ1_M, QuantizationType.Q2_0)]
     public void IqBanks_AreResident_AndTakeTheMmvqArms(int variant, QuantizationType gateUp, QuantizationType down)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

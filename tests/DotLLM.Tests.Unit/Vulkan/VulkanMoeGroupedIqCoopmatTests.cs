@@ -25,9 +25,7 @@ public sealed class VulkanMoeGroupedIqCoopmatTests
         rng.NextBytes(bytes);
         for (long off = 0; off + blockBytes <= bytes.Length; off += blockBytes)
         {
-            ushort bits = BitConverter.HalfToUInt16Bits((Half)(0.002f + (float)rng.NextDouble() * 0.02f));
-            bytes[off] = (byte)bits;
-            bytes[off + 1] = (byte)(bits >> 8);
+            IqBlockScale.Set(bytes, off, blockBytes, (Half)(0.002f + (float)rng.NextDouble() * 0.02f));
         }
         return bytes;
     }
@@ -48,6 +46,8 @@ public sealed class VulkanMoeGroupedIqCoopmatTests
     [InlineData(QuantizationType.IQ2_S, 130, 2560, "0,3,0,17,40,16,15,1,33,64,2,0")]
     [InlineData(QuantizationType.IQ3_XXS, 100, 512, "5,0,1,40,17,0,3")]
     [InlineData(QuantizationType.IQ3_XXS, 130, 2560, "0,3,0,17,40,16,15,1,33,64,2,0")]
+    [InlineData(QuantizationType.IQ1_M, 100, 512, "5,0,1,40,17,0,3")]
+    [InlineData(QuantizationType.IQ1_M, 130, 2560, "0,3,0,17,40,16,15,1,33,64,2,0")]
     [InlineData(QuantizationType.Q2_0, 64, 64, "16,15,17,1")]                           // single block / staging round
     [InlineData(QuantizationType.Q2_0, 100, 640, "5,0,1,40,17,0,3")]                    // ISTA down K = 640
     [InlineData(QuantizationType.Q2_0, 130, 704, "0,3,0,17,40,16,15,1,33,64,2,0")]
@@ -78,6 +78,7 @@ public sealed class VulkanMoeGroupedIqCoopmatTests
 
         using var codebooks = Iq3Codebooks.Create(device);
         using var codebooks2 = Iq2Codebooks.Create(device);
+        using var codebooks1 = Iq1Codebooks.Create(device);
         using var bufW = device.Allocate((bank.Length + 3L) & ~3L);
         using var bufX = device.Allocate((long)rows * k * sizeof(float));
         using var bufOff = device.Allocate(MoeBuildTileListKernel.OffsetsBufferUints(E, rows) * sizeof(uint));
@@ -88,7 +89,7 @@ public sealed class VulkanMoeGroupedIqCoopmatTests
         device.Upload(x, bufX);
         device.Upload(MemoryMarshal.AsBytes<uint>(offsets), bufOff);
 
-        using var kernel = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, iq, codebooks, codebooks2);
+        using var kernel = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, iq, codebooks, codebooks2, codebooks1);
         using var build = MoeBuildTileListKernel.Create(device, spvDir);
         kernel.Launch(bufW, bufX, bufOff, yLegacy, m, k, rows, E, maxRowsPerExpert: counts.Max());
         using (var ctx = device.CreateSubmitContext())

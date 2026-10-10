@@ -488,7 +488,49 @@ struct Stage { uint d; uint codes; vec4 bv; };   // d: fp16 bits; codes: this th
     }
 ''' + B_COMMIT)
 
-SHADERS = [IQ4_NL, IQ4_XS, IQ3_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, Q2_0]
+# IQ1_M: 56-byte super-blocks (word aligned): qs[32], qh[16], scales[4 x uint16] with the fp16 super-scale in the scale words' top nibbles.
+IQ1_M = dict(
+    name='iq1_m', fmt='IQ1_M', kreq='256',
+    extra='layout(set = 0, binding = 4, std430) readonly  buffer BufGrid { uint iq1sGrid[]; };   // 2048 entries x 8 int8 ternary lanes (2 uints each)\n',
+    layout='Bank layout: [E, M, K/256 super-blocks of 56 bytes]: qs[32], qh[16], scales[4 x uint16] (fp16 super-scale = top nibbles of the four words). Sub-block ib = 4 groups of 8: group l\n// grid index = qs[4ib+l] | ((l even ? qh<<8 : qh<<4) & 0x700) with qh = qh[2ib + l/2], delta sign = qh bit 3 (l even) / 7 (l odd), dl = d * (2s+1), s = (sc[ib/2] >> (6(ib%2) + 3(l/2))) & 7;\n// value = dl * (grid int8 + delta). This thread owns groups 2*half_ and 2*half_+1 (16 elements), which share one qh byte and one dl.',
+    body='''const uint IQ1_M_BLOCK_BYTES = 56u;
+const float IQ1S_DELTA = 0.125;
+
+struct Stage { uint sw0; uint sw1; uint qs2; uint qhb; uint ib; vec4 bv; };   // sw0/sw1: the 4 scale words; qs2: this half's 2 qs bytes; qhb: its qh byte; ib: sub-block
+
+''' + LOAD_SIG + '''    st.sw0 = 0u; st.sw1 = 0u; st.qs2 = 0u; st.qhb = 0u; st.ib = 0u;
+    if (rowValid) {
+        uint s = sb * 2u + blk;
+        uint base = rowBase + (s >> 3u) * IQ1_M_BLOCK_BYTES;
+        uint ib = s & 7u;
+        st.ib = ib;
+        st.sw0 = weight[(base + 48u) >> 2u];
+        st.sw1 = weight[((base + 48u) >> 2u) + 1u];
+        uint q = base + ib * 4u + half_ * 2u;
+        st.qs2 = readByte(q) | (readByte(q + 1u) << 8u);
+        st.qhb = readByte(base + 32u + ib * 2u + half_);
+    }
+''' + B_LOAD + '\n' + COMMIT_SIG + ZERO_A + '''        uint sc0 = st.sw0 & 0xFFFFu, sc1 = st.sw0 >> 16u, sc2 = st.sw1 & 0xFFFFu, sc3 = st.sw1 >> 16u;
+        uint dBits = (sc0 >> 12u) | ((sc1 >> 8u) & 0x00F0u) | ((sc2 >> 4u) & 0x0F00u) | (sc3 & 0xF000u);
+        float d = unpackHalf2x16(dBits).x;
+        uint ib = st.ib;
+        uint scWord = ((ib >> 1u) == 0u) ? sc0 : ((ib >> 1u) == 1u) ? sc1 : ((ib >> 1u) == 2u) ? sc2 : sc3;
+        uint sub = (scWord >> (6u * (ib & 1u) + 3u * half_)) & 7u;
+        float dl = d * float(2u * sub + 1u);
+        for (uint pl = 0u; pl < 2u; pl++) {
+            uint idx = ((st.qs2 >> (8u * pl)) & 0xFFu) | (((pl == 0u) ? (st.qhb << 8u) : (st.qhb << 4u)) & 0x700u);
+            float delta = (((pl == 0u) ? (st.qhb & 0x08u) : (st.qhb & 0x80u)) != 0u) ? -IQ1S_DELTA : IQ1S_DELTA;
+            uint ga = iq1sGrid[2u * idx];
+            uint gb = iq1sGrid[2u * idx + 1u];
+            for (uint e = 0u; e < 4u; e++) {
+                sharedA[aBase + pl * 8u + e]      = float16_t(dl * (float(bitfieldExtract(int(ga), int(8u * e), 8)) + delta));
+                sharedA[aBase + pl * 8u + 4u + e] = float16_t(dl * (float(bitfieldExtract(int(gb), int(8u * e), 8)) + delta));
+            }
+        }
+    }
+''' + B_COMMIT)
+
+SHADERS = [IQ4_NL, IQ4_XS, IQ3_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, Q2_0, IQ1_M]
 
 
 def render(spec):
