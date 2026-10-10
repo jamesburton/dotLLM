@@ -45,6 +45,8 @@ internal sealed record Q4eQuant
     public QuantizationType ExpertDown { get; init; } = QuantizationType.F32;
     public QuantizationType Proj { get; init; } = QuantizationType.F32;
     public QuantizationType HcDown { get; init; } = QuantizationType.F32;
+    /// <summary>Gated-residual up projections (F32 unless a fixture mirrors the ISTA files' BF16 ones, #823).</summary>
+    public QuantizationType HcUp { get; init; } = QuantizationType.F32;
     public QuantizationType Embed { get; init; } = QuantizationType.F32;
     public QuantizationType Table { get; init; } = QuantizationType.F32;
     public QuantizationType Indexer { get; init; } = QuantizationType.F32;
@@ -70,6 +72,8 @@ internal sealed record Q4eQuant
     /// <summary>The real UD-IQ4_XS mix (#823): IQ3_S gate/up experts, IQ4_NL down experts (Q8_0 projections). Expert bytes are random IQ blocks.</summary>
     public static Q4eQuant RealMixIq4Xs => RealMixQ51 with { ExpertGateUp = QuantizationType.IQ3_S, ExpertDown = QuantizationType.IQ4_NL };
     /// <summary>The UD-IQ4_XS layer whose gate/up is IQ4_XS (#823), IQ4_NL down.</summary>
+    /// <summary>ISTA-style BF16 gated-residual projections with the UD-Q4_K_XL mix otherwise (#823).</summary>
+    public static Q4eQuant HcBf16 => RealMixQ51 with { HcDown = QuantizationType.BF16, HcUp = QuantizationType.BF16 };
     public static Q4eQuant RealMixIq4XsGate => RealMixIq4Xs with { ExpertGateUp = QuantizationType.IQ4_XS };
     /// <summary>The ISTA GSQ-RCO mixes (#823): small-IQ gate/up experts with upstream-Q2_0 (or IQ4_NL) down experts.</summary>
     public static Q4eQuant IstaMix(QuantizationType gateUp, QuantizationType down) => RealMixIq4Xs with { ExpertGateUp = gateUp, ExpertDown = down };
@@ -265,7 +269,7 @@ internal static class Qwen4ExpRandomGguf
             Mat("output.weight", H, g.Vocab, q.Embed, gain: 3f);
             Norm("output_hc_norm.weight", hcDim);
             Mat("output_hc_down.weight", hcDim, g.HcLowRank, q.HcDown);
-            Mat("output_hc_up.weight", g.HcLowRank, hcDim, QuantizationType.F32, gain: 2f);
+            Mat("output_hc_up.weight", g.HcLowRank, hcDim, q.HcUp, gain: 2f);
             Add("per_layer_token_embd.weight", [g.PleRowDim, g.TableRows], Randn((long)g.PleRowDim * g.TableRows, 0.5f), q.Table);
         }
 
@@ -284,7 +288,7 @@ internal static class Qwen4ExpRandomGguf
             {
                 Norm(b + m + "norm.weight", hcDim);
                 Mat(b + m + "down.weight", hcDim, g.HcLowRank, q.HcDown);
-                Mat(b + m + "up.weight", g.HcLowRank, hcDim, QuantizationType.F32, gain: 2f);
+                Mat(b + m + "up.weight", g.HcLowRank, hcDim, q.HcUp, gain: 2f);
                 Add(b + m + "inject.weight", [hcDim, S], Randn((long)hcDim * S, 1f / MathF.Sqrt(hcDim)), QuantizationType.F32);
             }
 
@@ -343,7 +347,7 @@ internal static class Qwen4ExpRandomGguf
                 Norm(b + "nextn.hnorm.weight", hcDim);
                 Norm(b + "nextn.hc_head_norm.weight", hcDim);
                 Mat(b + "nextn.hc_head_down.weight", hcDim, g.HcLowRank, q.HcDown);
-                Mat(b + "nextn.hc_head_up.weight", g.HcLowRank, hcDim, QuantizationType.F32, gain: 2f);
+                Mat(b + "nextn.hc_head_up.weight", g.HcLowRank, hcDim, q.HcUp, gain: 2f);
             }
         }
         return w.Build();

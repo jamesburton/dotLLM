@@ -61,6 +61,13 @@ internal sealed class VulkanQwen4ExpGrWeights : IDisposable
         VulkanDevice.Buffer Proj(string name, out QuantizationType qt)
         {
             var d = t[name];
+            if (Bf16AsF16Enabled && d.QuantizationType == QuantizationType.BF16 && d.Shape.Rank == 2
+                && TryUploadBf16AsF16(device, staging, gguf.TensorDataPointer(d), d.Shape[0], d.Shape[1], out var f16Buf, out long f16Bytes))
+            {
+                qt = QuantizationType.F16;
+                total += f16Bytes;
+                return f16Buf!;
+            }
             var buf = VulkanQwen3MoeHybridWeights.UploadProjectionMatrix(device, staging, gguf.TensorDataPointer(d), d.QuantizationType,
                 outputDim: d.Shape[1], inputDim: d.Shape[0], forceF32: false, out qt, out long bytes);
             total += bytes;
@@ -72,6 +79,40 @@ internal sealed class VulkanQwen4ExpGrWeights : IDisposable
         QuantizationType injQt = QuantizationType.F32;
         if (inject is not null) injBuf = Proj(inject, out injQt);
         return new VulkanQwen4ExpGrWeights(normBuf, downBuf, downQt, upBuf, upQt, injBuf, injQt, total);
+    }
+
+    /// <summary>
+    /// #823: the ISTA GSQ-RCO files store the gated-residual low-rank projections as BF16, whose prefill GEMM is the plain tiled F32 kernel
+    /// (about 3.4 s of a 7 s 1K-token prefill: 4 projections x 48 layers). F16 has the cooperative-matrix GEMM, and a BF16 weight is exactly
+    /// representable in F16 unless it is tiny (below 2^-14 it loses mantissa bits, below 2^-24 it flushes), which for these weights moves no
+    /// output measurably; the conversion is skipped (BF16 kept) when it would overflow F16 or be lossy for more than 0.1% of the elements.
+    /// <c>DOTLLM_VK_Q4E_BF16_AS_F16=0</c> keeps BF16.
+    /// </summary>
+    internal static bool Bf16AsF16Enabled => Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_BF16_AS_F16") != "0";
+
+    private static unsafe bool TryUploadBf16AsF16(VulkanDevice device, VulkanStagingBuffer staging, nint src, int inputDim, int outputDim,
+        out VulkanDevice.Buffer? buffer, out long bytes)
+    {
+        buffer = null;
+        bytes = 0;
+        if (inputDim % 32 != 0 || outputDim < 16) return false;   // the F16 coopmat GEMM wants K % 32; tiny outputs are not worth a second format
+        long elems = (long)inputDim * outputDim;
+        var half = new Half[elems];
+        ushort* p = (ushort*)src;
+        long lossy = 0;
+        for (long i = 0; i < elems; i++)
+        {
+            float f = BitConverter.UInt32BitsToSingle((uint)p[i] << 16);
+            if (!float.IsFinite(f) || MathF.Abs(f) > 65000f) return false;
+            Half h = (Half)f;
+            if (f != 0f && (float)h != f && ++lossy > elems / 1000) return false;
+            half[i] = h;
+        }
+        bytes = elems * 2;
+        var buf = device.AllocateDeviceLocal(bytes);
+        fixed (Half* hp = half) staging.UploadBytes((nint)hp, bytes, buf);
+        buffer = buf;
+        return true;
     }
 
     /// <inheritdoc/>
