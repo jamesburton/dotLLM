@@ -227,6 +227,45 @@ public sealed class VulkanQwen4ExpQsaTests
     }
 
     [SkippableFact]
+    public void AMaterialRowMismatch_IsATopKBoundaryNearTie()
+    {
+        // The only way the GPU and the oracle can disagree materially is a different block at the top-k boundary. For every row that does disagree,
+        // the GPU's own scores must show rank-`budget` and rank-`budget+1` within float noise of each other (a genuine near-tie), otherwise the
+        // mismatch is a real bug in selection or in the gather attention. (Tiny geometry: layer 3 is the only QSA layer, 4-block budget.)
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var rig = new Q4eRig(SmallBudgetModel(), spvDir);
+        const int T = 100, Budget = 4;
+        var cpuTrace = new Dictionary<string, float[]>();
+        rig.Cpu.Trace = (n, d, r, c) => cpuTrace[n] = d.ToArray();
+        var vkTrace = new Dictionary<string, float[]>();
+        rig.Vk.Trace = (n, d, r, c) => vkTrace[n] = d;
+        var pos = Enumerable.Range(0, T).ToArray();
+        int examined = 0;
+        foreach (int seed in new[] { 7, 3, 5 })
+        {
+            var ids = VulkanQwen4ExpParityTests.Ids(T, rig.Config.VocabSize, seed);
+            rig.Cpu.Forward(ids, pos, -1);
+            rig.Vk.Forward(ids, pos, -1);
+            var rows = RowErrors(cpuTrace["blk.3.l_out"], vkTrace["blk.3.l_out"], T);
+            var scoresBuf = rig.Vk.Qsa.ScoresBuffer!;
+            int nbCap = rig.Vk.Qsa.NbCap;
+            var scores = new float[scoresBuf.Size / 4];
+            rig.Device.Download(scoresBuf, scores);
+            for (int r = 0; r < T; r++)
+            {
+                if (rows[r] <= 1e-3) continue;
+                int nb = (r + 1) / 4;
+                var s = scores.AsSpan(r * nbCap, nb).ToArray().OrderByDescending(x => x).ToArray();
+                double gap = (s[Budget - 1] - s[Budget]) / Math.Max(Math.Abs(s[Budget - 1]), 1e-30);
+                _out.WriteLine($"seed {seed} row {r}: relL2 {rows[r]:E2}; GPU rank-{Budget} {s[Budget - 1]:G9} vs rank-{Budget + 1} {s[Budget]:G9}, relative gap {gap:E2}");
+                Assert.True(gap < 5e-4, $"row {r} disagrees with the oracle but its top-k boundary is not a near-tie (gap {gap:E2}): selection or gather is wrong");
+                examined++;
+            }
+        }
+        _out.WriteLine($"{examined} mismatching rows examined");
+    }
+
+    [SkippableFact]
     public void Prefill_BeyondDenseLimit_MatchesOracle_AndOracleSparseDiffersFromDense()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

@@ -100,6 +100,12 @@ internal sealed class VulkanQwen4ExpQsa : IQ4AttentionHook, IDisposable
     /// <summary>Test hook: the block selection scratch <c>[queries, budget]</c> ints of the most recent sparse sub-chunk.</summary>
     internal VulkanDevice.Buffer? SelectionBuffer => _sel;
 
+    /// <summary>Test hook: the block score scratch <c>[queries, NbCap]</c> floats of the most recent sparse sub-chunk.</summary>
+    internal VulkanDevice.Buffer? ScoresBuffer => _scores;
+
+    /// <summary>Test hook: row stride of <see cref="ScoresBuffer"/>.</summary>
+    internal int NbCap => _nbCap;
+
     public VulkanQwen4ExpQsa(VulkanDevice device, VulkanQwen3MoeHybridTransformerModel core, Qwen4ExpQsaKernels kernels, LayerWeights[] weights,
         int[] ordinal, ModelConfig config, Qwen4ExpConfig q4, int capacity)
     {
