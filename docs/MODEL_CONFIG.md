@@ -173,7 +173,8 @@ Differences between architectures are captured entirely in ModelConfig.
   `MAX_EXPERTS` 512. Validated against the CPU oracle on random-weight checkpoints (tiny, 512-expert top-10, 256-wide K-quant, Q8_0/Q5_1/BF16
   mixes): per-layer residual and last-row logits, 24-step greedy decode, chunked prefill. Attention is dense up to `top_k + block - 1` = 2051 tokens (QSA == dense there) and **sparse QSA beyond it** (#819: device indexer
   pooling / scoring / exact top-k / gather attention, see `docs/ATTENTION.md`; context capacity default 8192 tokens, `DOTLLM_VK_QWEN4EXP_CONTEXT`); token embeddings
-  are gathered on the host (no 2.4 GiB device table). V1 limits: the n-gram branch runs on the **host** at its layer (one residual
+  are gathered on the host (no 2.4 GiB device table); a call longer than `MaxRowsPerForward` (`DOTLLM_VK_PLANNED_ROWS`, default 1024 rows: the scratch planned at load)
+  is split into chunks internally instead of growing the scratch past the resident-memory wall. V1 limits: the n-gram branch runs on the **host** at its layer (one residual
   round-trip; table registered host-only so no upload/import/staging path can take it); model-owned single sequence state (#817); no MTP;
   Q5_1 / Q8_0 / IQ expert banks are widened to F32 (no resident kernel yet), which the pre-load gate (`Qwen4ExpResidencyPlan`, refuses over
   `ResidentCapacityBytes - headroom`, `DOTLLM_VK_ALLOW_OVERCOMMIT=1` overrides) accounts for.

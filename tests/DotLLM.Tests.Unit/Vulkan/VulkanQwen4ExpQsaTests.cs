@@ -316,6 +316,37 @@ public sealed class VulkanQwen4ExpQsaTests
     }
 
     [SkippableFact]
+    public void ForwardLongerThanThePlannedRows_IsChunked_AndKeepsAllRowLogits()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        const string Env = "DOTLLM_VK_PLANNED_ROWS";
+        string? old = Environment.GetEnvironmentVariable(Env);
+        Environment.SetEnvironmentVariable(Env, "16");
+        try
+        {
+            using var rig = new Q4eRig(SmallBudgetModel(), spvDir);
+            Assert.Equal(16, rig.Vk.MaxRowsPerForward);
+            int T = 60;
+            var ids = VulkanQwen4ExpParityTests.Ids(T, rig.Config.VocabSize, seed: 8);
+            var pos = Enumerable.Range(0, T).ToArray();
+            Assert.True(rig.Vk.TrySetAllRowLogitsLimit(T));
+            using var cpu = rig.Cpu.Forward(ids, pos, -1);
+            using var vk = rig.Vk.Forward(ids, pos, -1);
+            Assert.Equal(T, vk.Shape[0]);
+            double worst = 0;
+            for (int r = 0; r < T; r++) worst = Math.Max(worst, VulkanQwen4ExpParityTests.Compare(Q4eRig.Row(cpu, r), Q4eRig.Row(vk, r)).RelL2);
+            _out.WriteLine($"60 rows in 16-row chunks (sparse from row 19): worst row relL2 {worst:E3}");
+            Assert.True(worst < 3e-3);
+            // Without the all-rows opt-in only the last row comes back, still through chunks.
+            using var rig2 = new Q4eRig(SmallBudgetModel(), spvDir);
+            using var last = rig2.Vk.Forward(ids, pos, -1, null, lastTokenLogitsOnly: true);
+            Assert.Equal(1, last.Shape[0]);
+            Assert.True(VulkanQwen4ExpParityTests.Compare(Q4eRig.Row(cpu, T - 1), Q4eRig.Row(last, 0)).RelL2 < 3e-3);
+        }
+        finally { Environment.SetEnvironmentVariable(Env, old); }
+    }
+
+    [SkippableFact]
     public void FullHeadDim256Geometry_BeyondDenseLimit_MatchesOracle()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

@@ -355,10 +355,45 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, VulkanQwen4ExpSequenceState state)
         => ForwardCore(tokenIds, positions, deviceId, state, null, lastTokenLogitsOnly: false);
 
+    /// <summary>
+    /// Largest number of rows one device forward processes (<c>DOTLLM_VK_PLANNED_ROWS</c>, default 1024): the per-forward scratch is planned and allocated for this
+    /// many rows at load. A longer call (a whole perplexity window, an unchunked prompt) is split into chunks of this size, which equals a chunked prefill
+    /// (verified bit-for-bit class: relL2 3e-7) instead of growing the scratch past the resident-memory wall after the weights filled it.
+    /// </summary>
+    public int MaxRowsPerForward => Qwen4ExpResidencyPlan.PlannedRows(_kvCapacity);
+
+    private ITensor ForwardChunked(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, VulkanQwen4ExpSequenceState state,
+                                   IKvCache? kvCache, bool lastTokenLogitsOnly, bool allRows, int cap)
+    {
+        int total = tokenIds.Length;
+        bool wantAll = allRows || (!lastTokenLogitsOnly && total <= _allRowLogitsLimit);
+        ITensor? result = wantAll ? UnmanagedTensor.Allocate(new TensorShape(total, _vocab), DType.Float32, deviceId: -1) : null;
+        ITensor? last = null;
+        try
+        {
+            for (int a = 0; a < total; a += cap)
+            {
+                int n = Math.Min(cap, total - a);
+                var part = ForwardCore(tokenIds.Slice(a, n), positions.Slice(a, n), deviceId, state, kvCache, lastTokenLogitsOnly: !wantAll,
+                    mtp: null, snapRows: 0, allRows: wantAll);
+                if (wantAll)
+                {
+                    using (part)
+                        new ReadOnlySpan<float>((void*)part.DataPointer, n * _vocab).CopyTo(new Span<float>((void*)(result!.DataPointer + (nint)((long)a * _vocab * 4)), n * _vocab));
+                }
+                else { last?.Dispose(); last = part; }
+            }
+        }
+        catch { result?.Dispose(); last?.Dispose(); throw; }
+        return wantAll ? result! : last!;
+    }
+
     private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, VulkanQwen4ExpSequenceState state,
                                 IKvCache? kvCache, bool lastTokenLogitsOnly, VulkanQwen4ExpMtpState? mtp = null, int snapRows = 0, bool allRows = false)
     {
         ArgumentNullException.ThrowIfNull(state);
+        if (mtp is null && snapRows == 0 && tokenIds.Length > MaxRowsPerForward && tokenIds.Length == positions.Length)
+            return ForwardChunked(tokenIds, positions, deviceId, state, kvCache, lastTokenLogitsOnly, allRows, MaxRowsPerForward);
         if (snapRows > 0 && !ReferenceEquals(state, _defaultState))
             throw new InvalidOperationException("Row snapshots are only recorded on the model-owned state.");
         VulkanNemotronHKvCache kv;

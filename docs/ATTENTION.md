@@ -323,6 +323,20 @@ released head_dim-256 geometry against the CPU oracle with a 16-token budget (sp
 sparse outputs differ ~1000x more than Vulkan vs oracle). The GPU and the oracle sum scores in a different float order, so a near-tie at the 512th block can flip
 one block (1 row in 648 in the synthetic sweep); the kernel-level tests prove the selection logic itself is exact.
 
+Measured on the real UD-Q4_K_XL file (Strix Halo, 512 MB BIOS split, 2026-10-10; harness `VulkanQwen4ExpRealQsaTests`, env-gated by `DOTLLM_QWEN4EXP_REAL_GGUF`):
+
+| | result |
+|---|---|
+| needle-in-a-haystack (3 depths x 3 codes), 4046 and 7890 tokens | **6/6** (answer = the planted code, no distractor) |
+| decode tok/s at depth 1K / 2K / 4K / 8K (same state, growing) | 22.5 / 21.2 / 21.6 / 21.3 (44-47 ms/token): flat, the cost is bounded by ~2051 keys |
+| indexer cost at 1K (same-session A/B, 3 rounds, indexer on vs off) | 43.2-43.8 vs 44.4-45.7 ms/token: within noise |
+| prefill, chunks of 1024 | 3.7 s per first 1K, 3.8 s for 1K-2K, then ~240-260 tok/s at 2K-8K depth (the sparse region costs ~15 % vs the dense one) |
+| KL vs the CPU oracle, 4096-token held-out window, scored half | mean 0.054, median 0.026, top-1 88 %, PPL 9.358 (Vulkan) vs 9.374 (oracle); no step at the dense limit: rows [1800,2051) 0.051, [2051,2300) 0.040 |
+| device memory | heap1 69,780 MiB + heap0 9.8 GiB (was 12.1 GiB before the host embedding gather) at an 8192-token capacity |
+
+The KL level is the pre-existing Vulkan-vs-oracle gap that grows with context (#873, ~0.03-0.05 at 512-2K positions on the same file), not a QSA effect: it has no
+discontinuity where the sparse path starts.
+
 Capacity: the K/V cache is F32 (48 KiB per token over the 12 layers) plus 5 KiB per token of indexer keys. The model is sized for
 `min(context_length, 8192)` tokens by default (`DOTLLM_VK_QWEN4EXP_CONTEXT` overrides; halved automatically until the residency plan fits). On the 128 GiB Strix Halo
 box the OS keeps ~82 GiB resident per process and the UD-Q4_K_XL trunk is ~79 GiB, which is why the token-embedding table is gathered on the HOST for qwen4exp
