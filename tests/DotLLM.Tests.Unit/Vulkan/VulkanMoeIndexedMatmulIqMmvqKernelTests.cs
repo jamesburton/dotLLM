@@ -33,6 +33,18 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
     [InlineData(QuantizationType.IQ4_NL, 3, 4, 9, 256, 3)]      // exactly one 8-block lane window
     [InlineData(QuantizationType.IQ4_NL, 9, 16, 20, 288, 11)]   // 9 blocks/row - window + 1-block tail
     [InlineData(QuantizationType.IQ4_NL, 10, 512, 48, 640, 10)] // qwen4exp down: K=intermediate 640 (not a multiple of 256), 20 blocks/row
+    [InlineData(QuantizationType.IQ2_XXS, 5, 7, 12, 256, 4)]
+    [InlineData(QuantizationType.IQ2_XXS, 10, 512, 48, 2560, 10)]
+    [InlineData(QuantizationType.IQ2_XS, 6, 8, 12, 768, 5)]
+    [InlineData(QuantizationType.IQ2_XS, 10, 512, 48, 2560, 10)]
+    [InlineData(QuantizationType.IQ2_S, 6, 8, 12, 768, 5)]
+    [InlineData(QuantizationType.IQ2_S, 10, 512, 48, 2560, 10)]
+    [InlineData(QuantizationType.IQ3_XXS, 6, 8, 12, 768, 5)]
+    [InlineData(QuantizationType.IQ3_XXS, 10, 512, 48, 2560, 10)]
+    [InlineData(QuantizationType.Q2_0, 5, 7, 12, 64, 4)]       // 1 block/row
+    [InlineData(QuantizationType.Q2_0, 6, 8, 12, 192, 5)]      // 3 blocks/row - window tail
+    [InlineData(QuantizationType.Q2_0, 3, 4, 9, 256, 3)]       // exactly one 4-block window
+    [InlineData(QuantizationType.Q2_0, 10, 512, 48, 640, 10)]  // ISTA down: 10 blocks/row
     public void Launch_MatchesSameTierCpuOracle(QuantizationType qt, int n, int numExperts, int m, int k, int activeExperts)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -42,8 +54,9 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
         using var quant = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir)
             ?? throw new Xunit.Sdk.XunitException("quantize_q8_1_rows.spv missing.");
         using var codebooks = Iq3Codebooks.Create(device);
+        using var codebooks2 = Iq2Codebooks.Create(device);
         var iq = MoeIndexedMatmulIqMmvqKernel.FromQuantizationType(qt)!.Value;
-        using var kernel = MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spvDir, iq, codebooks)
+        using var kernel = MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spvDir, iq, codebooks, codebooks2)
             ?? throw new Xunit.Sdk.XunitException(MoeIndexedMatmulIqMmvqKernel.ShaderName(iq) + ".spv missing or unsupported.");
 
         var rng = new Random(0x1B5A + (int)qt * 1009 + n * 31 + numExperts * 17 + m * 11 + k * 7);
@@ -63,6 +76,11 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
     [InlineData(QuantizationType.IQ3_S, 6, 8, 12, 768)]
     [InlineData(QuantizationType.IQ4_XS, 6, 8, 12, 768)]
     [InlineData(QuantizationType.IQ4_NL, 9, 16, 20, 288)]
+    [InlineData(QuantizationType.IQ2_XXS, 6, 8, 12, 768)]
+    [InlineData(QuantizationType.IQ2_XS, 6, 8, 12, 768)]
+    [InlineData(QuantizationType.IQ2_S, 6, 8, 12, 768)]
+    [InlineData(QuantizationType.IQ3_XXS, 6, 8, 12, 768)]
+    [InlineData(QuantizationType.Q2_0, 6, 8, 12, 192)]
     public void PerRowExpertIndex_MatchesSingleRowLaunches(QuantizationType qt, int n, int numExperts, int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -72,8 +90,9 @@ public sealed class VulkanMoeIndexedMatmulIqMmvqKernelTests
         using var quant = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir)
             ?? throw new Xunit.Sdk.XunitException("quantize_q8_1_rows.spv missing.");
         using var codebooks = Iq3Codebooks.Create(device);
+        using var codebooks2 = Iq2Codebooks.Create(device);
         var iq = MoeIndexedMatmulIqMmvqKernel.FromQuantizationType(qt)!.Value;
-        using var kernel = MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spvDir, iq, codebooks)
+        using var kernel = MoeIndexedMatmulIqMmvqKernel.TryCreate(device, spvDir, iq, codebooks, codebooks2)
             ?? throw new Xunit.Sdk.XunitException("spv missing.");
 
         var rng = new Random(0xC15C1 + (int)qt + n * 31 + numExperts * 17 + m * 11 + k * 7);

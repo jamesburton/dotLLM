@@ -40,6 +40,17 @@ public sealed class VulkanMoeGroupedIqCoopmatTests
     [InlineData(QuantizationType.IQ4_NL, 64, 64, "16,15,17,1")]                          // single staging round
     [InlineData(QuantizationType.IQ4_NL, 100, 640, "5,0,1,40,17,0,3")]                   // real down K = 640 (not a multiple of 256)
     [InlineData(QuantizationType.IQ4_NL, 130, 704, "0,3,0,17,40,16,15,1,33,64,2,0")]
+    [InlineData(QuantizationType.IQ2_XXS, 100, 512, "5,0,1,40,17,0,3")]
+    [InlineData(QuantizationType.IQ2_XXS, 130, 2560, "0,3,0,17,40,16,15,1,33,64,2,0")]
+    [InlineData(QuantizationType.IQ2_XS, 100, 512, "5,0,1,40,17,0,3")]
+    [InlineData(QuantizationType.IQ2_XS, 130, 2560, "0,3,0,17,40,16,15,1,33,64,2,0")]
+    [InlineData(QuantizationType.IQ2_S, 100, 512, "5,0,1,40,17,0,3")]
+    [InlineData(QuantizationType.IQ2_S, 130, 2560, "0,3,0,17,40,16,15,1,33,64,2,0")]
+    [InlineData(QuantizationType.IQ3_XXS, 100, 512, "5,0,1,40,17,0,3")]
+    [InlineData(QuantizationType.IQ3_XXS, 130, 2560, "0,3,0,17,40,16,15,1,33,64,2,0")]
+    [InlineData(QuantizationType.Q2_0, 64, 64, "16,15,17,1")]                           // single block / staging round
+    [InlineData(QuantizationType.Q2_0, 100, 640, "5,0,1,40,17,0,3")]                    // ISTA down K = 640
+    [InlineData(QuantizationType.Q2_0, 130, 704, "0,3,0,17,40,16,15,1,33,64,2,0")]
     public void Grouped_MatchesCpuDequantOracle(QuantizationType qt, int m, int k, string countsCsv)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -66,6 +77,7 @@ public sealed class VulkanMoeGroupedIqCoopmatTests
         for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
 
         using var codebooks = Iq3Codebooks.Create(device);
+        using var codebooks2 = Iq2Codebooks.Create(device);
         using var bufW = device.Allocate((bank.Length + 3L) & ~3L);
         using var bufX = device.Allocate((long)rows * k * sizeof(float));
         using var bufOff = device.Allocate(MoeBuildTileListKernel.OffsetsBufferUints(E, rows) * sizeof(uint));
@@ -76,7 +88,7 @@ public sealed class VulkanMoeGroupedIqCoopmatTests
         device.Upload(x, bufX);
         device.Upload(MemoryMarshal.AsBytes<uint>(offsets), bufOff);
 
-        using var kernel = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, iq, codebooks);
+        using var kernel = MoeGroupedMatmulIqCoopmatKernel.Create(device, spvDir, iq, codebooks, codebooks2);
         using var build = MoeBuildTileListKernel.Create(device, spvDir);
         kernel.Launch(bufW, bufX, bufOff, yLegacy, m, k, rows, E, maxRowsPerExpert: counts.Max());
         using (var ctx = device.CreateSubmitContext())

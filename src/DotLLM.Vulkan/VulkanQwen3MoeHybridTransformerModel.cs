@@ -119,7 +119,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private static bool IsLegacyQuant(QuantizationType qt) => qt is QuantizationType.Q5_1 or QuantizationType.Q8_0;
 
     /// <summary>#823: true for the IQ-family expert-bank types served by <see cref="MoeIndexedMatmulIqMmvqKernel"/>.</summary>
-    private static bool IsIqBankQuant(QuantizationType qt) => qt is QuantizationType.IQ3_S or QuantizationType.IQ4_XS or QuantizationType.IQ4_NL;
+    private static bool IsIqBankQuant(QuantizationType qt) => MoeIqFormats.FromQuantizationType(qt) is not null;
 
     // #383: opt-in dp4a indexed-matmul MMQ for Q4_K-resident gate/up banks —
     // see the constructor assignment for rollout rationale.
@@ -1408,8 +1408,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         QuantizationType.Q6_K => _kernels.MoeMmvqQ6K is not null && (interm % 256) == 0,
         QuantizationType.Q5_1 => _kernels.MoeMmvqQ5_1 is not null && _moeUnitScale is not null && (interm % 32) == 0,
         QuantizationType.Q8_0 => _kernels.MoeMmvqQ8_0 is not null && (interm % 32) == 0,
-        QuantizationType.IQ3_S or QuantizationType.IQ4_XS or QuantizationType.IQ4_NL
-            => _kernels.MoeMmvqIq(qt) is { } iq && (interm % iq.GroupSize) == 0,
+        _ when IsIqBankQuant(qt) => _kernels.MoeMmvqIq(qt) is { } iq && (interm % iq.GroupSize) == 0,
         _ => false,
     };
 
@@ -1441,9 +1440,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 _kernels.MoeMmvqQ8_0!.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
                     _state.MoeTopkIndices, _state.MoeDownRows, m: hidden, k: interm, n: n, numExperts: numE);
                 break;
-            case QuantizationType.IQ3_S:
-            case QuantizationType.IQ4_XS:
-            case QuantizationType.IQ4_NL:
+            case var _ when IsIqBankQuant(qt):
                 _kernels.MoeMmvqIq(qt)!.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
                     _state.MoeTopkIndices, _state.MoeDownRows, m: hidden, k: interm, n: n, numExperts: numE);
                 break;
@@ -1735,13 +1732,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             : GroupedLegacyDownKernel(qt) is not null && _moeUnitScale is not null && (interm % MoeGroupedMatmulLegacyQuantCoopmatKernel.KGroup) == 0;
 
     /// <summary>#823: the grouped coopmat kernel for an IQ-family bank of type <paramref name="qt"/> (16-row tiles only), or null.</summary>
-    private MoeGroupedMatmulIqCoopmatKernel? GroupedIqKernel(QuantizationType qt) => qt switch
-    {
-        QuantizationType.IQ3_S => _kernels.MoeGroupedIq3S,
-        QuantizationType.IQ4_XS => _kernels.MoeGroupedIq4Xs,
-        QuantizationType.IQ4_NL => _kernels.MoeGroupedIq4Nl,
-        _ => null,
-    };
+    private MoeGroupedMatmulIqCoopmatKernel? GroupedIqKernel(QuantizationType qt) => _kernels.MoeGroupedIq(qt);
 
     /// <summary>
     /// True when the layer's three banks all have a grouped coopmat kernel that agree on one tile list (#823 extends #849/#821 to IQ banks).

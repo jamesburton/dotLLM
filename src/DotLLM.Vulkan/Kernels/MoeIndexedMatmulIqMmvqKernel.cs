@@ -12,6 +12,62 @@ public enum MoeIqQuant
     IQ4_XS,
     /// <summary>IQ4_NL: 18 B / 32 elements.</summary>
     IQ4_NL,
+    /// <summary>IQ2_XXS: 66 B / 256 elements, iq2xxs grid + ksigns.</summary>
+    IQ2_XXS,
+    /// <summary>IQ2_XS: 74 B / 256 elements, iq2xs grid + ksigns.</summary>
+    IQ2_XS,
+    /// <summary>IQ2_S: 82 B / 256 elements, iq2s grid.</summary>
+    IQ2_S,
+    /// <summary>IQ3_XXS: 98 B / 256 elements, iq3xxs grid + ksigns.</summary>
+    IQ3_XXS,
+    /// <summary>Upstream ggml Q2_0: 18 B / 64 elements (no codebook).</summary>
+    Q2_0,
+}
+
+/// <summary>Per-format facts shared by the indexed MMVQ and grouped coopmat IQ kernels (#823).</summary>
+internal static class MoeIqFormats
+{
+    /// <summary>Block bytes and elements per block (the K granule) of <paramref name="quant"/>.</summary>
+    public static (int BlockBytes, int GroupSize) Describe(MoeIqQuant quant) => quant switch
+    {
+        MoeIqQuant.IQ3_S => (QuantFormat.IQ3_SBlockBytes, QuantFormat.KQuantGroupSize),
+        MoeIqQuant.IQ4_XS => (QuantFormat.IQ4_XSBlockBytes, QuantFormat.KQuantGroupSize),
+        MoeIqQuant.IQ4_NL => (QuantFormat.IQ4_NLBlockBytes, QuantFormat.LegacyGroupSize),
+        MoeIqQuant.IQ2_XXS => (QuantFormat.IQ2_XXSBlockBytes, QuantFormat.KQuantGroupSize),
+        MoeIqQuant.IQ2_XS => (QuantFormat.IQ2_XSBlockBytes, QuantFormat.KQuantGroupSize),
+        MoeIqQuant.IQ2_S => (QuantFormat.IQ2_SBlockBytes, QuantFormat.KQuantGroupSize),
+        MoeIqQuant.IQ3_XXS => (QuantFormat.IQ3_XXSBlockBytes, QuantFormat.KQuantGroupSize),
+        MoeIqQuant.Q2_0 => (QuantFormat.Q2_0BlockBytes, QuantFormat.Q2_0GroupSize),
+        _ => throw new ArgumentOutOfRangeException(nameof(quant)),
+    };
+
+    /// <summary>Maps the model-level quant type to the kernel format; <c>null</c> when this kernel family does not serve it.</summary>
+    public static MoeIqQuant? FromQuantizationType(QuantizationType qt) => qt switch
+    {
+        QuantizationType.IQ3_S => MoeIqQuant.IQ3_S,
+        QuantizationType.IQ4_XS => MoeIqQuant.IQ4_XS,
+        QuantizationType.IQ4_NL => MoeIqQuant.IQ4_NL,
+        QuantizationType.IQ2_XXS => MoeIqQuant.IQ2_XXS,
+        QuantizationType.IQ2_XS => MoeIqQuant.IQ2_XS,
+        QuantizationType.IQ2_S => MoeIqQuant.IQ2_S,
+        QuantizationType.IQ3_XXS => MoeIqQuant.IQ3_XXS,
+        QuantizationType.Q2_0 => MoeIqQuant.Q2_0,
+        _ => null,
+    };
+
+    /// <summary>The codebook buffers the shader binds after its fixed bindings (grid, then ksigns where the format has one).</summary>
+    public static VulkanDevice.Buffer[] Codebooks(MoeIqQuant quant, Iq3Codebooks? iq3, Iq2Codebooks? iq2)
+    {
+        return quant switch
+        {
+            MoeIqQuant.IQ3_S => [(iq3 ?? throw new ArgumentNullException(nameof(iq3), "IQ3_S needs the shared iq3s grid.")).Iq3SGrid],
+            MoeIqQuant.IQ3_XXS => [(iq3 ?? throw new ArgumentNullException(nameof(iq3), "IQ3_XXS needs the shared IQ3 codebooks.")).Iq3XxsGrid, iq3.Ksigns],
+            MoeIqQuant.IQ2_XXS => [(iq2 ?? throw new ArgumentNullException(nameof(iq2), "IQ2_XXS needs the shared IQ2 codebooks.")).Iq2XxsGrid, iq2.Ksigns],
+            MoeIqQuant.IQ2_XS => [(iq2 ?? throw new ArgumentNullException(nameof(iq2), "IQ2_XS needs the shared IQ2 codebooks.")).Iq2XsGrid, iq2.Ksigns],
+            MoeIqQuant.IQ2_S => [(iq2 ?? throw new ArgumentNullException(nameof(iq2), "IQ2_S needs the shared IQ2 codebooks.")).Iq2SGrid],
+            _ => [],
+        };
+    }
 }
 
 /// <summary>
@@ -34,7 +90,7 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
-    private readonly VulkanDevice.Buffer? _grid;
+    private readonly VulkanDevice.Buffer[] _codebooks;
     private readonly int _buffersPerSet;
     private bool _disposed;
 
@@ -48,7 +104,7 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
     public int GroupSize { get; }
 
     private MoeIndexedMatmulIqMmvqKernel(MoeIqQuant quant, VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
-        int buffersPerSet, VulkanDevice.Buffer? grid)
+        int buffersPerSet, VulkanDevice.Buffer[] codebooks)
     {
         Quant = quant;
         (BlockBytes, GroupSize) = Describe(quant);
@@ -57,18 +113,12 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
         _pipeline = pipeline;
         _descriptorPool = pool;
         _buffersPerSet = buffersPerSet;
-        _grid = grid;
+        _codebooks = codebooks;
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: buffersPerSet);
     }
 
     /// <summary>Block bytes and group size for <paramref name="quant"/>.</summary>
-    public static (int BlockBytes, int GroupSize) Describe(MoeIqQuant quant) => quant switch
-    {
-        MoeIqQuant.IQ3_S => (QuantFormat.IQ3_SBlockBytes, QuantFormat.KQuantGroupSize),
-        MoeIqQuant.IQ4_XS => (QuantFormat.IQ4_XSBlockBytes, QuantFormat.KQuantGroupSize),
-        MoeIqQuant.IQ4_NL => (QuantFormat.IQ4_NLBlockBytes, QuantFormat.LegacyGroupSize),
-        _ => throw new ArgumentOutOfRangeException(nameof(quant)),
-    };
+    public static (int BlockBytes, int GroupSize) Describe(MoeIqQuant quant) => MoeIqFormats.Describe(quant);
 
     /// <summary>The MMVQ shader file (without extension) for <paramref name="quant"/>.</summary>
     public static string ShaderName(MoeIqQuant quant) => quant switch
@@ -76,36 +126,31 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
         MoeIqQuant.IQ3_S => "moe_indexed_matmul_iq3_s_mmvq",
         MoeIqQuant.IQ4_XS => "moe_indexed_matmul_iq4_xs_mmvq",
         MoeIqQuant.IQ4_NL => "moe_indexed_matmul_iq4_nl_mmvq",
+        MoeIqQuant.IQ2_XXS => "moe_indexed_matmul_iq2_xxs_mmvq",
+        MoeIqQuant.IQ2_XS => "moe_indexed_matmul_iq2_xs_mmvq",
+        MoeIqQuant.IQ2_S => "moe_indexed_matmul_iq2_s_mmvq",
+        MoeIqQuant.IQ3_XXS => "moe_indexed_matmul_iq3_xxs_mmvq",
+        MoeIqQuant.Q2_0 => "moe_indexed_matmul_q2_0_mmvq",
         _ => throw new ArgumentOutOfRangeException(nameof(quant)),
     };
 
     /// <summary>Maps the model-level quant type to the kernel format; <c>null</c> when this kernel family does not serve it.</summary>
-    public static MoeIqQuant? FromQuantizationType(QuantizationType qt) => qt switch
-    {
-        QuantizationType.IQ3_S => MoeIqQuant.IQ3_S,
-        QuantizationType.IQ4_XS => MoeIqQuant.IQ4_XS,
-        QuantizationType.IQ4_NL => MoeIqQuant.IQ4_NL,
-        _ => null,
-    };
+    public static MoeIqQuant? FromQuantizationType(QuantizationType qt) => MoeIqFormats.FromQuantizationType(qt);
 
     /// <summary>
     /// Loads the shader for <paramref name="quant"/> from <paramref name="spvDir"/> and builds the pipeline. Returns <c>null</c> when the
     /// SPV is missing or the device lacks integer-dot-product support. <paramref name="iq3Codebooks"/> supplies the iq3s grid (required
     /// for <see cref="MoeIqQuant.IQ3_S"/>, ignored otherwise; the caller keeps ownership).
     /// </summary>
-    internal static MoeIndexedMatmulIqMmvqKernel? TryCreate(VulkanDevice device, string spvDir, MoeIqQuant quant, Iq3Codebooks? iq3Codebooks = null)
+    internal static MoeIndexedMatmulIqMmvqKernel? TryCreate(VulkanDevice device, string spvDir, MoeIqQuant quant, Iq3Codebooks? iq3Codebooks = null, Iq2Codebooks? iq2Codebooks = null)
     {
         if (!device.HasIntegerDotProduct)
             return null;
         string path = Path.Combine(spvDir, ShaderName(quant) + ".spv");
         if (!File.Exists(path))
             return null;
-        VulkanDevice.Buffer? grid = null;
-        if (quant == MoeIqQuant.IQ3_S)
-        {
-            grid = (iq3Codebooks ?? throw new ArgumentNullException(nameof(iq3Codebooks), "IQ3_S needs the shared iq3s grid.")).Iq3SGrid;
-        }
-        int buffersPerSet = quant == MoeIqQuant.IQ3_S ? 6 : 5;
+        var codebooks = MoeIqFormats.Codebooks(quant, iq3Codebooks, iq2Codebooks);
+        int buffersPerSet = 5 + codebooks.Length;
 
         uint requiredSubgroupSize = Wave32SubgroupControl.RequiredSubgroupSizeFor(device);
         var module = VulkanModule.LoadFromFile(device, path);
@@ -128,7 +173,7 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)buffersPerSet);
-        return new MoeIndexedMatmulIqMmvqKernel(quant, device, module, pipeline, pool, buffersPerSet, grid);
+        return new MoeIndexedMatmulIqMmvqKernel(quant, device, module, pipeline, pool, buffersPerSet, codebooks);
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
@@ -172,7 +217,7 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
 
         Span<nint> buffers = stackalloc nint[_buffersPerSet];
         buffers[0] = bank.Handle; buffers[1] = xq.Handle; buffers[2] = xds.Handle; buffers[3] = indices.Handle; buffers[4] = y.Handle;
-        if (_grid is not null) buffers[5] = _grid.Handle;
+        for (int i = 0; i < _codebooks.Length; i++) buffers[5 + i] = _codebooks[i].Handle;
         nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
 
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);

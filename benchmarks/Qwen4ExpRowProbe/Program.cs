@@ -20,6 +20,7 @@ using DotLLM.Vulkan;
 //   quit
 const string Marker = "[probe]";
 if (args[0] == "kbench") { KBench.Run(args); return; }
+if (args[0] == "iqbench") { IqKBench.Run(args); return; }
 string gguf = args[0];
 string work = args[1];
 Directory.CreateDirectory(Path.Combine(work, "jobs"));

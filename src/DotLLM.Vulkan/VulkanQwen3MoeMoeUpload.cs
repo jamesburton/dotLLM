@@ -69,6 +69,11 @@ internal static class VulkanQwen3MoeMoeUpload
         QuantizationType.IQ3_S,
         QuantizationType.IQ4_XS,
         QuantizationType.IQ4_NL,
+        QuantizationType.IQ2_XXS,
+        QuantizationType.IQ2_XS,
+        QuantizationType.IQ2_S,
+        QuantizationType.IQ3_XXS,
+        QuantizationType.Q2_0,
     };
 
     /// <summary>
@@ -77,9 +82,8 @@ internal static class VulkanQwen3MoeMoeUpload
     /// </summary>
     internal static bool BankStaysPacked(QuantizationType qt, int kDim, bool integerDot = true)
         => s_ResidentQuantTypes.Contains(qt)
-            && (qt is not (QuantizationType.Q5_1 or QuantizationType.Q8_0 or QuantizationType.IQ4_NL) || kDim % 32 == 0)
-            && (qt is not (QuantizationType.IQ3_S or QuantizationType.IQ4_XS) || kDim % 256 == 0)
-            && (qt is not (QuantizationType.IQ3_S or QuantizationType.IQ4_XS or QuantizationType.IQ4_NL) || (integerDot && IqBanksResidentEnabled));
+            && (qt is not (QuantizationType.Q5_1 or QuantizationType.Q8_0) || kDim % 32 == 0)
+            && (DotLLM.Vulkan.Kernels.MoeIqFormats.FromQuantizationType(qt) is not { } iq || (kDim % DotLLM.Vulkan.Kernels.MoeIqFormats.Describe(iq).GroupSize == 0 && integerDot && IqBanksResidentEnabled));
 
     /// <summary>#823 A/B switch: <c>DOTLLM_VK_IQ_RESIDENT=0</c> widens IQ expert banks to F32 as before (pairs with the residency estimate).</summary>
     internal static bool IqBanksResidentEnabled => Environment.GetEnvironmentVariable("DOTLLM_VK_IQ_RESIDENT") != "0"

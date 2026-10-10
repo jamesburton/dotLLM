@@ -20,7 +20,7 @@ public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
-    private readonly VulkanDevice.Buffer? _grid;
+    private readonly VulkanDevice.Buffer[] _codebooks;
     private readonly int _buffersPerSet;
     private bool _disposed;
 
@@ -34,10 +34,10 @@ public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable
     public int KGroup { get; }
 
     private MoeGroupedMatmulIqCoopmatKernel(MoeIqQuant quant, VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
-        int buffersPerSet, VulkanDevice.Buffer? grid)
+        int buffersPerSet, VulkanDevice.Buffer[] codebooks)
     {
         Quant = quant;
-        var (blockBytes, group) = MoeIndexedMatmulIqMmvqKernel.Describe(quant);
+        var (blockBytes, group) = MoeIqFormats.Describe(quant);
         BlockBytes = blockBytes;
         KGroup = Math.Max(group, 64);
         _device = device;
@@ -45,12 +45,12 @@ public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable
         _pipeline = pipeline;
         _descriptorPool = pool;
         _buffersPerSet = buffersPerSet;
-        _grid = grid;
+        _codebooks = codebooks;
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: buffersPerSet);
     }
 
     /// <summary>Elements covered by one block of the bank format (the unit the row stride is a multiple of).</summary>
-    private int ElementsPerBlock => MoeIndexedMatmulIqMmvqKernel.Describe(Quant).GroupSize;
+    private int ElementsPerBlock => MoeIqFormats.Describe(Quant).GroupSize;
 
     /// <summary>The SPIR-V file for <paramref name="quant"/>.</summary>
     public static string SpvName(MoeIqQuant quant) => quant switch
@@ -58,6 +58,11 @@ public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable
         MoeIqQuant.IQ3_S => "moe_grouped_matmul_iq3_s_coopmat_m64.spv",
         MoeIqQuant.IQ4_XS => "moe_grouped_matmul_iq4_xs_coopmat_m64.spv",
         MoeIqQuant.IQ4_NL => "moe_grouped_matmul_iq4_nl_coopmat_m64.spv",
+        MoeIqQuant.IQ2_XXS => "moe_grouped_matmul_iq2_xxs_coopmat_m64.spv",
+        MoeIqQuant.IQ2_XS => "moe_grouped_matmul_iq2_xs_coopmat_m64.spv",
+        MoeIqQuant.IQ2_S => "moe_grouped_matmul_iq2_s_coopmat_m64.spv",
+        MoeIqQuant.IQ3_XXS => "moe_grouped_matmul_iq3_xxs_coopmat_m64.spv",
+        MoeIqQuant.Q2_0 => "moe_grouped_matmul_q2_0_coopmat_m64.spv",
         _ => throw new ArgumentOutOfRangeException(nameof(quant)),
     };
 
@@ -70,14 +75,12 @@ public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable
         => device.HasCooperativeMatrix && device.SubgroupSize == 64 && File.Exists(Path.Combine(spvDir, SpvName(quant)));
 
     /// <summary>Creates the kernel for <paramref name="quant"/>; <paramref name="iq3Codebooks"/> supplies the iq3s grid (IQ3_S only; caller keeps ownership).</summary>
-    internal static MoeGroupedMatmulIqCoopmatKernel Create(VulkanDevice device, string spvDir, MoeIqQuant quant, Iq3Codebooks? iq3Codebooks = null)
+    internal static MoeGroupedMatmulIqCoopmatKernel Create(VulkanDevice device, string spvDir, MoeIqQuant quant, Iq3Codebooks? iq3Codebooks = null, Iq2Codebooks? iq2Codebooks = null)
     {
         if (!IsSupportedOn(device, spvDir, quant))
             throw new InvalidOperationException("MoeGroupedMatmulIqCoopmatKernel requires VK_KHR_cooperative_matrix, wave64 and the SPIR-V.");
-        VulkanDevice.Buffer? grid = null;
-        if (quant == MoeIqQuant.IQ3_S)
-            grid = (iq3Codebooks ?? throw new ArgumentNullException(nameof(iq3Codebooks), "IQ3_S needs the shared iq3s grid.")).Iq3SGrid;
-        int buffersPerSet = quant == MoeIqQuant.IQ3_S ? 5 : 4;
+        var codebooks = MoeIqFormats.Codebooks(quant, iq3Codebooks, iq2Codebooks);
+        int buffersPerSet = 4 + codebooks.Length;
         var module = VulkanModule.LoadFromFile(device, Path.Combine(spvDir, SpvName(quant)));
         ComputePipeline pipeline;
         try
@@ -92,7 +95,7 @@ public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable
             throw;
         }
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: (uint)buffersPerSet);
-        return new MoeGroupedMatmulIqCoopmatKernel(quant, device, module, pipeline, pool, buffersPerSet, grid);
+        return new MoeGroupedMatmulIqCoopmatKernel(quant, device, module, pipeline, pool, buffersPerSet, codebooks);
     }
 
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
@@ -158,7 +161,7 @@ public sealed class MoeGroupedMatmulIqCoopmatKernel : IDisposable
     {
         Span<nint> buffers = stackalloc nint[_buffersPerSet];
         buffers[0] = bank.Handle; buffers[1] = packedInput.Handle; buffers[2] = offsets.Handle; buffers[3] = output.Handle;
-        if (_grid is not null) buffers[4] = _grid.Handle;
+        for (int i = 0; i < _codebooks.Length; i++) buffers[4 + i] = _codebooks[i].Handle;
         nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout, 0, 1, descriptorSet, 0, 0);

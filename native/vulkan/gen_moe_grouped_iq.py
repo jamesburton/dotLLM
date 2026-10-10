@@ -311,7 +311,184 @@ struct Stage { uint dq; uint qs4; uint sg2; uint misc; vec4 bv; };   // dq: d bi
     }
 ''' + B_COMMIT)
 
-SHADERS = [IQ4_NL, IQ4_XS, IQ3_S]
+
+READ4 = r'''uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
+'''
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# Shared by the IQ2 / IQ3_XXS formats: one 8-element pair = two grid words (IQ2: bytes 0..3 / 4..7 of one 8-byte entry; IQ3: two 4-byte
+# entries) + an 8-bit sign mask + a scale.
+PAIR8 = r'''void emitPair8(uint dst, uint wa, uint wb, uint signs, float sc) {
+    for (uint e = 0u; e < 4u; e++) {
+        float va = sc * float((wa >> (8u * e)) & 0xFFu);
+        float vb = sc * float((wb >> (8u * e)) & 0xFFu);
+        sharedA[dst + e]      = float16_t(((signs >> e) & 1u) != 0u ? -va : va);
+        sharedA[dst + 4u + e] = float16_t(((signs >> (4u + e)) & 1u) != 0u ? -vb : vb);
+    }
+}
+
+'''
+
+# IQ2_XXS: 66-byte super-blocks: d, then per sub-block 8 bytes a0 (4 grid-index bytes) + a1 (4 x 7-bit sign indices in the low 28 bits, scale in the top nibble).
+IQ2_XXS = dict(
+    name='iq2_xxs', fmt='IQ2_XXS', kreq='256',
+    extra=('layout(set = 0, binding = 4, std430) readonly  buffer BufGrid   { uint iq2xxsGrid[]; };   // 256 entries x 8 magnitude bytes\n'
+           'layout(set = 0, binding = 5, std430) readonly  buffer BufKsigns { uint ksigns[]; };       // 128 sign bytes\n'),
+    layout='Bank layout: [E, M, K/256 super-blocks of 66 bytes]: fp16 d, then per 32-element sub-block 8 bytes a0 (4 grid indices) + a1 (4 x 7-bit ksigns indices | 4-bit scale << 28);\n// pair l (8 elements) = iq2xxs grid entry (a0 >> 8l) & 255 with sign byte ksigns[(a1 >> 7l) & 127]; value = d * (0.5 + (a1 >> 28)) * 0.25 * sign * grid byte.',
+    body='''const uint IQ2_XXS_BLOCK_BYTES = 66u;
+
+struct Stage { uint dq; uint a0; uint a1; vec4 bv; };   // dq: d bits
+
+''' + READ4 + PAIR8 + LOAD_SIG + '''    st.dq = 0u; st.a0 = 0u; st.a1 = 0u;
+    if (rowValid) {
+        uint s = sb * 2u + blk;
+        uint base = rowBase + (s >> 3u) * IQ2_XXS_BLOCK_BYTES;
+        uint ib32 = s & 7u;
+        st.dq = readHalfBits(base);
+        uint p = base + 2u + 8u * ib32;
+        st.a0 = read4Bytes(p);
+        st.a1 = read4Bytes(p + 4u);
+    }
+''' + B_LOAD + '\n' + COMMIT_SIG + ZERO_A + '''        float d = unpackHalf2x16(st.dq & 0xFFFFu).x;
+        float db = d * (0.5 + float(st.a1 >> 28)) * 0.25;
+        for (uint pl = 0u; pl < 2u; pl++) {
+            uint l = half_ * 2u + pl;
+            uint gridIdx = (st.a0 >> (8u * l)) & 0xFFu;
+            uint signs = (ksigns[((st.a1 >> (7u * l)) & 0x7Fu) >> 2u] >> ((((st.a1 >> (7u * l)) & 0x7Fu) & 3u) * 8u)) & 0xFFu;
+            emitPair8(aBase + pl * 8u, iq2xxsGrid[gridIdx * 2u], iq2xxsGrid[gridIdx * 2u + 1u], signs, db);
+        }
+    }
+''' + B_COMMIT)
+
+# IQ2_XS: 74-byte super-blocks: d, qs[32] uint16 (9-bit grid | 7-bit ksigns index << 9), scales[8] (two nibbles per byte).
+IQ2_XS = dict(
+    name='iq2_xs', fmt='IQ2_XS', kreq='256',
+    extra=('layout(set = 0, binding = 4, std430) readonly  buffer BufGrid   { uint iq2xsGrid[]; };    // 512 entries x 8 magnitude bytes\n'
+           'layout(set = 0, binding = 5, std430) readonly  buffer BufKsigns { uint ksigns[]; };       // 128 sign bytes\n'),
+    layout='Bank layout: [E, M, K/256 super-blocks of 74 bytes]: fp16 d, qs[32] uint16 (low 9 bits = iq2xs grid index, high 7 bits = ksigns index), scales[8];\n// pair l of sub-block ib32 = qs[ib32*4 + l]; scale nibble = scales[ib32] low (l < 2) / high (l >= 2); value = d * (0.5 + sub) * 0.25 * sign * grid byte.',
+    body='''const uint IQ2_XS_BLOCK_BYTES = 74u;
+
+struct Stage { uint dq; uint q2; uint sc; vec4 bv; };   // dq: d bits; q2: the two uint16 of this half; sc: scale byte
+
+''' + READ4 + PAIR8 + LOAD_SIG + '''    st.dq = 0u; st.q2 = 0u; st.sc = 0u;
+    if (rowValid) {
+        uint s = sb * 2u + blk;
+        uint base = rowBase + (s >> 3u) * IQ2_XS_BLOCK_BYTES;
+        uint ib32 = s & 7u;
+        st.dq = readHalfBits(base);
+        st.q2 = read4Bytes(base + 2u + ib32 * 8u + half_ * 4u);
+        st.sc = readByte(base + 66u + ib32);
+    }
+''' + B_LOAD + '\n' + COMMIT_SIG + ZERO_A + '''        float d = unpackHalf2x16(st.dq & 0xFFFFu).x;
+        uint sub = half_ == 0u ? (st.sc & 0xFu) : (st.sc >> 4u);
+        float dl = d * (0.5 + float(sub)) * 0.25;
+        for (uint pl = 0u; pl < 2u; pl++) {
+            uint q = (st.q2 >> (16u * pl)) & 0xFFFFu;
+            uint gridIdx = q & 0x1FFu;
+            uint si = q >> 9u;
+            uint signs = (ksigns[si >> 2u] >> ((si & 3u) * 8u)) & 0xFFu;
+            emitPair8(aBase + pl * 8u, iq2xsGrid[gridIdx * 2u], iq2xsGrid[gridIdx * 2u + 1u], signs, dl);
+        }
+    }
+''' + B_COMMIT)
+
+# IQ2_S: 82-byte super-blocks: d, qs[32] (grid low 8 bits), qs_signs[32] (explicit sign byte), qh[8] (2 high grid bits per pair), scales[8].
+IQ2_S = dict(
+    name='iq2_s', fmt='IQ2_S', kreq='256',
+    extra='layout(set = 0, binding = 4, std430) readonly  buffer BufGrid { uint iq2sGrid[]; };   // 1024 entries x 8 magnitude bytes\n',
+    layout='Bank layout: [E, M, K/256 super-blocks of 82 bytes]: fp16 d, qs[32] (grid index low 8 bits), qs_signs[32] (explicit 8-bit sign mask), qh[8], scales[8];\n// pair l of sub-block ib32: grid = qs[ib32*4+l] | ((qh[ib32] >> 2l) & 3) << 8, sign byte qs_signs[ib32*4+l]; scale nibble = scales[ib32] low (l < 2) / high; value = d * (0.5 + sub) * 0.25 * sign * grid byte.',
+    body='''const uint IQ2_S_BLOCK_BYTES = 82u;
+
+struct Stage { uint dq; uint lo2; uint sg2; uint qhs; vec4 bv; };   // dq: d bits; lo2: 2 grid-low bytes; sg2: 2 sign bytes; qhs: qh | scaleByte << 8
+
+''' + PAIR8 + LOAD_SIG + '''    st.dq = 0u; st.lo2 = 0u; st.sg2 = 0u; st.qhs = 0u;
+    if (rowValid) {
+        uint s = sb * 2u + blk;
+        uint base = rowBase + (s >> 3u) * IQ2_S_BLOCK_BYTES;
+        uint ib32 = s & 7u;
+        st.dq = readHalfBits(base);
+        uint lo = base + 2u + ib32 * 4u + half_ * 2u;
+        st.lo2 = readByte(lo) | (readByte(lo + 1u) << 8u);
+        uint sg = base + 34u + ib32 * 4u + half_ * 2u;
+        st.sg2 = readByte(sg) | (readByte(sg + 1u) << 8u);
+        st.qhs = readByte(base + 66u + ib32) | (readByte(base + 74u + ib32) << 8u);
+    }
+''' + B_LOAD + '\n' + COMMIT_SIG + ZERO_A + '''        float d = unpackHalf2x16(st.dq & 0xFFFFu).x;
+        uint qh = st.qhs & 0xFFu;
+        uint sb8 = (st.qhs >> 8u) & 0xFFu;
+        uint sub = half_ == 0u ? (sb8 & 0xFu) : (sb8 >> 4u);
+        float dl = d * (0.5 + float(sub)) * 0.25;
+        for (uint pl = 0u; pl < 2u; pl++) {
+            uint l = half_ * 2u + pl;
+            uint gridIdx = ((st.lo2 >> (8u * pl)) & 0xFFu) | (((qh >> (2u * l)) & 3u) << 8u);
+            uint signs = (st.sg2 >> (8u * pl)) & 0xFFu;
+            emitPair8(aBase + pl * 8u, iq2sGrid[gridIdx * 2u], iq2sGrid[gridIdx * 2u + 1u], signs, dl);
+        }
+    }
+''' + B_COMMIT)
+
+# IQ3_XXS: 98-byte super-blocks: d, qs[64] grid bytes (g1,g2 per pair), scales_and_signs[8] uint32 (4 x 7-bit ksigns | scale << 28).
+IQ3_XXS = dict(
+    name='iq3_xxs', fmt='IQ3_XXS', kreq='256',
+    extra=('layout(set = 0, binding = 4, std430) readonly  buffer BufGrid   { uint iq3xxsGrid[]; };   // 256 entries x 4 magnitude bytes\n'
+           'layout(set = 0, binding = 5, std430) readonly  buffer BufKsigns { uint ksigns[]; };       // 128 sign bytes\n'),
+    layout='Bank layout: [E, M, K/256 super-blocks of 98 bytes]: fp16 d, qs[64] (8-bit grid indices: g1, g2 per pair), scales_and_signs[8] uint32 (4 x 7-bit ksigns | scale << 28);\n// pair l of sub-block ib32: g1 = qs[ib32*8 + 2l], g2 = qs[ib32*8 + 2l + 1] (4 magnitude bytes each), sign byte ksigns[(aux >> 7l) & 127]; value = d * (0.5 + (aux >> 28)) * 0.5 * sign * grid byte.',
+    body='''const uint IQ3_XXS_BLOCK_BYTES = 98u;
+
+struct Stage { uint dq; uint qs4; uint aux; vec4 bv; };   // dq: d bits; qs4: this half's 4 grid-index bytes; aux: scales_and_signs of the sub-block
+
+''' + READ4 + PAIR8 + LOAD_SIG + '''    st.dq = 0u; st.qs4 = 0u; st.aux = 0u;
+    if (rowValid) {
+        uint s = sb * 2u + blk;
+        uint base = rowBase + (s >> 3u) * IQ3_XXS_BLOCK_BYTES;
+        uint ib32 = s & 7u;
+        st.dq = readHalfBits(base);
+        st.qs4 = read4Bytes(base + 2u + ib32 * 8u + half_ * 4u);
+        st.aux = read4Bytes(base + 66u + 4u * ib32);
+    }
+''' + B_LOAD + '\n' + COMMIT_SIG + ZERO_A + '''        float d = unpackHalf2x16(st.dq & 0xFFFFu).x;
+        float db = d * (0.5 + float(st.aux >> 28)) * 0.5;
+        for (uint pl = 0u; pl < 2u; pl++) {
+            uint l = half_ * 2u + pl;
+            uint g1 = (st.qs4 >> (16u * pl)) & 0xFFu;
+            uint g2 = (st.qs4 >> (16u * pl + 8u)) & 0xFFu;
+            uint si = (st.aux >> (7u * l)) & 0x7Fu;
+            uint signs = (ksigns[si >> 2u] >> ((si & 3u) * 8u)) & 0xFFu;
+            emitPair8(aBase + pl * 8u, iq3xxsGrid[g1], iq3xxsGrid[g2], signs, db);
+        }
+    }
+''' + B_COMMIT)
+
+# Q2_0 (upstream ggml): 18-byte blocks of 64 elements = exactly one 64-K staging round. Thread (blk, half_) owns elements [32*blk + 16*half_, +16).
+Q2_0 = dict(
+    name='q2_0', fmt='Q2_0', kreq='64', extra='',
+    layout='Bank layout: [E, M, K/64 blocks of 18 bytes]: fp16 d, qs[16] 2-bit codes (element j = qs[j/4] >> 2(j%4) & 3); value = (code - 1) * d. One block = one staging round;\n// this thread owns the 4 code bytes of its 16 elements (block byte 2 + 8*blk + 4*half_, an even offset).',
+    body='''const uint Q2_0_BLOCK_BYTES = 18u;
+
+struct Stage { uint d; uint codes; vec4 bv; };   // d: fp16 bits; codes: this thread's 4 code bytes (16 two-bit codes)
+
+''' + LOAD_SIG + '''    st.d = 0u; st.codes = 0u;
+    if (rowValid) {
+        uint base = rowBase + sb * Q2_0_BLOCK_BYTES;
+        st.d = readHalfBits(base);
+        uint cb = base + 2u + 8u * blk + 4u * half_;
+        st.codes = readHalfBits(cb) | (readHalfBits(cb + 2u) << 16u);
+    }
+''' + B_LOAD + '\n' + COMMIT_SIG + ZERO_A + '''        float d = unpackHalf2x16(st.d & 0xFFFFu).x;
+        for (uint j = 0u; j < 16u; j++)
+            sharedA[aBase + j] = float16_t(float(int((st.codes >> (2u * j)) & 3u) - 1) * d);
+    }
+''' + B_COMMIT)
+
+SHADERS = [IQ4_NL, IQ4_XS, IQ3_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, Q2_0]
 
 
 def render(spec):

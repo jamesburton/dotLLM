@@ -71,6 +71,8 @@ internal sealed record Q4eQuant
     public static Q4eQuant RealMixIq4Xs => RealMixQ51 with { ExpertGateUp = QuantizationType.IQ3_S, ExpertDown = QuantizationType.IQ4_NL };
     /// <summary>The UD-IQ4_XS layer whose gate/up is IQ4_XS (#823), IQ4_NL down.</summary>
     public static Q4eQuant RealMixIq4XsGate => RealMixIq4Xs with { ExpertGateUp = QuantizationType.IQ4_XS };
+    /// <summary>The ISTA GSQ-RCO mixes (#823): small-IQ gate/up experts with upstream-Q2_0 (or IQ4_NL) down experts.</summary>
+    public static Q4eQuant IstaMix(QuantizationType gateUp, QuantizationType down) => RealMixIq4Xs with { ExpertGateUp = gateUp, ExpertDown = down };
     public static Q4eQuant KQuant => new()
     {
         ExpertGateUp = QuantizationType.Q4_K, ExpertDown = QuantizationType.Q4_K, Proj = QuantizationType.Q8_0,
@@ -222,7 +224,8 @@ internal static class Qwen4ExpRandomGguf
         void Add(string name, int[] dims, float[] data, QuantizationType qt)
         {
             // Quantised rows need ne0 to be a block multiple; otherwise the family silently stays F32 (the contract allows any type per tensor).
-            int block = qt switch { QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K or QuantizationType.IQ3_S or QuantizationType.IQ4_XS => 256, QuantizationType.F32 or QuantizationType.F16 or QuantizationType.BF16 => 1, _ => 32 };
+            int block = qt switch { QuantizationType.Q4_K or QuantizationType.Q5_K or QuantizationType.Q6_K or QuantizationType.IQ3_S or QuantizationType.IQ4_XS
+                or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S or QuantizationType.IQ3_XXS => 256, QuantizationType.Q2_0 => 64, QuantizationType.F32 or QuantizationType.F16 or QuantizationType.BF16 => 1, _ => 32 };
             if (dims[0] % block != 0) qt = QuantizationType.F32;
             byte[] bytes;
             if (qt == QuantizationType.F32)
@@ -247,7 +250,8 @@ internal static class Qwen4ExpRandomGguf
                     BitConverter.TryWriteBytes(bytes.AsSpan(2 * i), (Half)data[i]);
             }
             else if (qt == QuantizationType.Q5_K) bytes = EncodeQ5K(data);
-            else if (qt is QuantizationType.IQ3_S or QuantizationType.IQ4_XS or QuantizationType.IQ4_NL) bytes = EncodeRandomIq(data, dims[0], qt);
+            else if (IsRandomIq(qt))
+                bytes = EncodeRandomIq(data, dims[0], qt);
             else bytes = Quantize.FromFloat32(data, data.Length, qt);
             w.AddTensor(name, dims, (uint)qt, bytes);
         }
@@ -369,12 +373,15 @@ internal static class Qwen4ExpRandomGguf
     /// fp16 super-scale of every block rescaled so the dequantized rms matches the Gaussian the float data was drawn with (the model stays
     /// well conditioned). CPU oracle and Vulkan read the same bytes, which is all a parity test needs.
     /// </summary>
+    private static bool IsRandomIq(QuantizationType qt) => qt is QuantizationType.IQ3_S or QuantizationType.IQ4_XS or QuantizationType.IQ4_NL
+        or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S or QuantizationType.IQ3_XXS or QuantizationType.Q2_0;
+
     private static unsafe byte[] EncodeRandomIq(float[] data, int rowElems, QuantizationType qt)
     {
         long n = data.Length;
         long rowBytes = Dequantize.RowByteSize(rowElems, qt);
         long rows = n / rowElems;
-        int blockBytes = qt switch { QuantizationType.IQ3_S => 110, QuantizationType.IQ4_XS => 136, _ => 18 };
+        int blockBytes = QuantFormat.TryGetInfo(qt)!.Value.BlockBytes;
         var rng = new Random(unchecked((int)(n * 31 + (int)qt * 7919 + rowElems)));
         var bytes = new byte[rows * rowBytes];
         rng.NextBytes(bytes);

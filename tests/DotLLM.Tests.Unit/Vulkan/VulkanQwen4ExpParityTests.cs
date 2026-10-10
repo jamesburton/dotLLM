@@ -82,6 +82,11 @@ public sealed class VulkanQwen4ExpParityTests
         ["inter640-iq3s-iq4nl", 12],
         ["inter640-iq4xs-iq4nl", 13],
         ["e512x640-iq3s-iq4nl", 14],
+        // ISTA GSQ-RCO mixes: IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS gate+up with upstream Q2_0 down banks (hidden 256, expert 640 = 10 Q2_0 blocks).
+        ["inter640-iq2xxs-q20", 15],
+        ["inter640-iq2xs-q20", 16],
+        ["inter640-iq2s-q20", 17],
+        ["inter640-iq3xxs-q20", 18],
     ];
 
     internal static byte[] Build(int variant) => variant switch
@@ -101,10 +106,14 @@ public sealed class VulkanQwen4ExpParityTests
         12 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.RealMixIq4Xs),
         13 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.RealMixIq4XsGate),
         14 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Real512x640, Q4eQuant.RealMixIq4Xs),
+        15 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.IstaMix(QuantizationType.IQ2_XXS, QuantizationType.Q2_0)),
+        16 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.IstaMix(QuantizationType.IQ2_XS, QuantizationType.Q2_0)),
+        17 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.IstaMix(QuantizationType.IQ2_S, QuantizationType.Q2_0)),
+        18 => Qwen4ExpRandomGguf.Build(Qwen4ExpRandomGguf.Inter640, Q4eQuant.IstaMix(QuantizationType.IQ3_XXS, QuantizationType.Q2_0)),
         _ => throw new ArgumentOutOfRangeException(nameof(variant)),
     };
 
-    internal static bool IsQuantised(int variant) => variant is 1 or 3 or 4 or 7 or 8 or 9 or 10 or 11 or 12 or 13 or 14;
+    internal static bool IsQuantised(int variant) => variant is 1 or 3 or 4 or 7 or 8 or 9 or 10 or 11 or 12 or 13 or 14 or 15 or 16 or 17 or 18;
 
     internal static int[] Ids(int count, int vocab, int seed = 7)
     {
@@ -299,10 +308,14 @@ public sealed class VulkanQwen4ExpParityTests
     /// kernels; the logits must move, and both must stay oracle-close). Both gate/up and down are checked on 640-wide experts with 256 hidden.
     /// </summary>
     [SkippableTheory]
-    [InlineData(12, QuantizationType.IQ3_S)]
-    [InlineData(13, QuantizationType.IQ4_XS)]
-    [InlineData(14, QuantizationType.IQ3_S)]    // 512 experts, top-10
-    public void IqBanks_AreResident_AndTakeTheMmvqArms(int variant, QuantizationType gateUp)
+    [InlineData(12, QuantizationType.IQ3_S, QuantizationType.IQ4_NL)]
+    [InlineData(13, QuantizationType.IQ4_XS, QuantizationType.IQ4_NL)]
+    [InlineData(14, QuantizationType.IQ3_S, QuantizationType.IQ4_NL)]    // 512 experts, top-10
+    [InlineData(15, QuantizationType.IQ2_XXS, QuantizationType.Q2_0)]
+    [InlineData(16, QuantizationType.IQ2_XS, QuantizationType.Q2_0)]
+    [InlineData(17, QuantizationType.IQ2_S, QuantizationType.Q2_0)]
+    [InlineData(18, QuantizationType.IQ3_XXS, QuantizationType.Q2_0)]
+    public void IqBanks_AreResident_AndTakeTheMmvqArms(int variant, QuantizationType gateUp, QuantizationType down)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         int T = 40;
@@ -314,7 +327,7 @@ public sealed class VulkanQwen4ExpParityTests
             Assert.All(rig.Vk.ExpertBankDeviceTypes, t =>
             {
                 Assert.Equal(gateUp, t.Gate);        // NOT F32: no expansion
-                Assert.Equal(QuantizationType.IQ4_NL, t.Down);
+                Assert.Equal(down, t.Down);
                 Assert.Equal(gateUp, t.Up);
             });
             cpuPrefill = Q4eRig.Row(rig.Cpu.Forward(ids, Enumerable.Range(0, T).ToArray(), -1), T - 1);
@@ -323,7 +336,7 @@ public sealed class VulkanQwen4ExpParityTests
             Assert.True(rig.Vk.MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath.IqMmvqDown) > 0, "IQ MMVQ down arm never recorded");
             // The 40-token prefill is above the grouped threshold: where coopmat + native wave64 exist, both banks must take the grouped arms.
             var gateIq = MoeIndexedMatmulIqMmvqKernel.FromQuantizationType(gateUp)!.Value;
-            if (MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(rig.Device, spvDir, gateIq) && MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(rig.Device, spvDir, MoeIqQuant.IQ4_NL))
+            if (MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(rig.Device, spvDir, gateIq) && MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(rig.Device, spvDir, MoeIndexedMatmulIqMmvqKernel.FromQuantizationType(down)!.Value))
             {
                 Assert.True(rig.Vk.MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath.GroupedIqGateUp) > 0, "grouped IQ gate/up arm never recorded");
                 Assert.True(rig.Vk.MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath.GroupedIqDown) > 0, "grouped IQ down arm never recorded");
@@ -346,7 +359,7 @@ public sealed class VulkanQwen4ExpParityTests
         var (slowRel, slowKl, _) = Compare(cpuPrefill, slowPrefill);
         var (armRel, _, _) = Compare(slowDecode, fastDecode);
         var (armPre, _, _) = Compare(slowPrefill, fastPrefill);
-        _out.WriteLine($"variant {variant} ({gateUp}/IQ4_NL): fast vs CPU relL2 {fastRel:E3} KL {fastKl:E3}; widened vs CPU relL2 {slowRel:E3} KL {slowKl:E3}; fast vs widened prefill {armPre:E3}, decode {armRel:E3}");
+        _out.WriteLine($"variant {variant} ({gateUp}/{down}): fast vs CPU relL2 {fastRel:E3} KL {fastKl:E3}; widened vs CPU relL2 {slowRel:E3} KL {slowKl:E3}; fast vs widened prefill {armPre:E3}, decode {armRel:E3}");
         Assert.True(fastRel < 0.08 && fastKl < 0.02, $"IQ MMVQ arms off the oracle: relL2 {fastRel:E3}, KL {fastKl:E3}");
         Assert.True(slowRel < 0.08 && slowKl < 0.02, $"widened arms off the oracle: relL2 {slowRel:E3}, KL {slowKl:E3}");
         Assert.True(armPre > 0 || armRel > 0, "perturbation inert: the resident IQ arms produced bit-identical logits to the widened path, so they did not run");
