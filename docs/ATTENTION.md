@@ -294,6 +294,40 @@ Things worth probing on Strix Halo before tile sizes lock in:
 - **Q-tile transpose for memory coalescing.** Currently `qTile[r * head_dim + d]` is row-major; threads access `qTile[r][d]` strided by `d` across rows during the score loop, which is irregular. A `[d][r]` layout might give better LDS bank-conflict behaviour. Trace it before changing.
 - **Soft-cap fold into `scale`.** When `softCap > 0` and the raw score is far from saturation, the `tanh` is wasted work; could skip when score magnitude < softCap × 0.5. Marginal.
 
+## Qwen4-Exp QSA (query-sparse attention) on Vulkan — issue #819
+
+The 12 full-attention layers of `qwen4exp` attend a SELECTED subset of the context: an indexer pools the keys of every block of 4 tokens, scores
+the blocks against the query, keeps the top 512 (= `indexer.top_k` 2048 tokens) plus the tail of the incomplete block, and runs ordinary GQA over those
+~2051 keys. Up to `top_k + block - 1` = 2051 tokens every complete block is selected, so QSA equals dense causal attention; beyond it the cost per decoded
+token is bounded by 2051 keys regardless of context. The CPU oracle is `Qwen4ExpQsa`; `VulkanQwen4ExpQsa` (`src/DotLLM.Vulkan/VulkanQwen4ExpQsa.cs`,
+`Kernels/Qwen4ExpQsaKernels.cs`) is the device implementation, hooked into the shared `RecordFullAttnLayer` through `IQ4AttentionHook`.
+
+Per QSA layer, per forward (all in the forward's command buffer, nothing returns to the host):
+
+1. `indexer.k_proj(x)` -> RAW (un-normed, un-rotated) keys, copied into a per-sequence, position-indexed store `[capacity, 128]`. Runs on EVERY forward,
+   including dense-regime ones, so a sequence can cross the dense limit mid-stream; rollback is just a smaller sequence length (nothing to restore).
+2. `qsa_pool_f32.comp`: block `b` = `rope(rmsnorm(mean(raw[4b..4b+3])), pos 4b)` (pool, then norm, then rotate), for every block this forward completes.
+   A block is a pure function of its four raw rows, so a rewritten position simply re-derives it.
+3. Only when the forward reaches positions whose complete-block count exceeds the budget: `indexer.q_proj(x)`, per-head RMSNorm, NeoX RoPE at the query
+   position, then `qsa_score_f32.comp` (`sum_h relu(q_h . k_b) / sqrt(128)`, subgroup-per-block, lanes across the key dim) and `qsa_select_f32.comp`
+   (exact top-512: 4-pass radix select on the float bit patterns, then an index-ordered compaction; ties go to the LOWER block index like the oracle and the
+   ids come out ascending). Queries are processed in sub-chunks (<= 1024) so score / partial scratch is bounded independent of the prefill chunk.
+4. `qsa_attention_f32.comp` + `qsa_merge_f32.comp`: split-KV online-softmax attention over the virtual key list (selected blocks' tokens, then the tail),
+   so dense-regime and sparse queries share one kernel (identity selection when the query still has <= 512 blocks).
+
+The dense attention of the shared layer is untouched and still serves forwards that end below the dense limit.
+
+Validation (`VulkanQwen4ExpQsaTests`): exact set equality of the select kernel against the oracle incl. heavy ties / all-equal / 65536 blocks; pooled keys and
+scores against `Qwen4ExpIndexerCache` / `ScoreBlocksScalar`; whole-model prefill, token-by-token decode through the dense limit, chunked == single-shot and the
+released head_dim-256 geometry against the CPU oracle with a 16-token budget (sparse from the 20th token), with a sensitive control (the oracle's own dense vs
+sparse outputs differ ~1000x more than Vulkan vs oracle). The GPU and the oracle sum scores in a different float order, so a near-tie at the 512th block can flip
+one block (1 row in 648 in the synthetic sweep); the kernel-level tests prove the selection logic itself is exact.
+
+Capacity: the K/V cache is F32 (48 KiB per token over the 12 layers) plus 5 KiB per token of indexer keys. The model is sized for
+`min(context_length, 8192)` tokens by default (`DOTLLM_VK_QWEN4EXP_CONTEXT` overrides; halved automatically until the residency plan fits). On the 128 GiB Strix Halo
+box the OS keeps ~82 GiB resident per process and the UD-Q4_K_XL trunk is ~79 GiB, which is why the token-embedding table is gathered on the HOST for qwen4exp
+(`DOTLLM_VK_QWEN4EXP_HOST_EMBED`, default on): the device-resident F32 copy was 2.4 GiB.
+
 ## IAttentionStrategy — Kernel Selection
 
 ```
