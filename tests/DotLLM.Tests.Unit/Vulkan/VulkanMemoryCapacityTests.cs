@@ -44,3 +44,24 @@ public class VulkanMemoryCapacityTests
     public void NoHeaps_IsZero() =>
         Assert.Equal(0, VulkanMemoryCapacity.ResidentCapacityBytes([], [], VkPhysicalDeviceType.IntegratedGpu));
 }
+
+/// <summary>#880: the OS cap on integrated GPUs that the advertised heaps do not show.</summary>
+public class VulkanUsableCapacityTests
+{
+    private const long GiB = 1L << 30;
+
+    [Fact]
+    public void Integrated_IsCappedAtTheUsableFractionOfRam()
+    {
+        // Strix Halo: 104.7 GiB of heaps, 127.1 GiB RAM -> ~80 GiB really usable (measured OOM at submit beyond ~80.5 GiB).
+        long usable = VulkanMemoryCapacity.UsableCapacityBytes(105 * GiB, 127 * GiB, DotLLM.Vulkan.Interop.VkPhysicalDeviceType.IntegratedGpu);
+        Assert.InRange(usable, 79 * GiB, 82 * GiB);
+    }
+
+    [Fact]
+    public void Discrete_IsNotCapped_AndSmallHeapsWin()
+    {
+        Assert.Equal(12 * GiB, VulkanMemoryCapacity.UsableCapacityBytes(12 * GiB, 64 * GiB, DotLLM.Vulkan.Interop.VkPhysicalDeviceType.DiscreteGpu));
+        Assert.Equal(8 * GiB, VulkanMemoryCapacity.UsableCapacityBytes(8 * GiB, 127 * GiB, DotLLM.Vulkan.Interop.VkPhysicalDeviceType.IntegratedGpu));
+    }
+}

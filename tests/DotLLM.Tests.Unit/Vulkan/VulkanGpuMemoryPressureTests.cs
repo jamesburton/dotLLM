@@ -260,10 +260,10 @@ public sealed class Qwen4ExpScratchMessageTests
     }
 
     [Theory]
-    [InlineData(null, 5000, 2048)]
+    [InlineData(null, 5000, 1024)]
     [InlineData(null, 100, 100)]      // clamped to the KV capacity
     [InlineData("512", 5000, 512)]
-    [InlineData("junk", 5000, 2048)]
+    [InlineData("junk", 5000, 1024)]
     public void PlannedRows_DefaultsAndClamps(string? env, int kv, int expected)
     {
         string? prior = Environment.GetEnvironmentVariable("DOTLLM_VK_PLANNED_ROWS");

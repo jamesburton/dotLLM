@@ -53,12 +53,12 @@ internal readonly record struct Qwen4ExpResidencyPlan(
         => Math.Max(0, ourBytes + otherBytes - Math.Max(0, capacityBytes - headroomBytes));
 
     /// <summary>
-    /// Rows the per-forward scratch is pre-sized to at load (<c>DOTLLM_VK_PLANNED_ROWS</c>, default 2048), clamped to
+    /// Rows the per-forward scratch is pre-sized to at load (<c>DOTLLM_VK_PLANNED_ROWS</c>, default 1024: ~0.55 GiB, because on a 127 GiB box the real file leaves only ~1.3 GiB under the OS limit), clamped to
     /// <paramref name="kvCapacity"/>. Scratch otherwise grows lazily on the first larger forward - AFTER the weights already fill the
     /// device-local heap - and a 512-row then 1024-row call sequence was seen to end in VK_ERROR_DEVICE_LOST (#880).
     /// </summary>
     public static int PlannedRows(int kvCapacity)
-        => Math.Clamp(int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_PLANNED_ROWS"), out int v) && v > 0 ? v : 2048, 1, Math.Max(1, kvCapacity));
+        => Math.Clamp(int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_PLANNED_ROWS"), out int v) && v > 0 ? v : 1024, 1, Math.Max(1, kvCapacity));
 
     /// <summary>Error text for a scratch (re)allocation that failed after the weights were resident.</summary>
     public static string ScratchGrowthMessage(int rows, string inner)
