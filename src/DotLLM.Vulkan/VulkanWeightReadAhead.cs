@@ -122,6 +122,28 @@ internal static class VulkanWeightReadAhead
         }
     }
 
+    /// <summary>
+    /// Drops the pages of an already-uploaded source range from this process's working set (#874). Mapped GGUF pages that were just
+    /// copied to the device would otherwise sit in the working set - unavailable to the OS - while the GPU heap fills the same physical
+    /// RAM: on this 128 GB UMA box 80 GiB of weights plus the touched file pages hit zero available memory and the next submit fails
+    /// with VK_ERROR_OUT_OF_DEVICE_MEMORY. <c>VirtualUnlock</c> on pages that are not locked removes them from the working set (they stay
+    /// in the standby cache); its "not locked" error is the expected result and is ignored. Advisory and Windows-only.
+    /// </summary>
+    public static void ReleaseSource(nint ptr, long bytes)
+    {
+        if (!OperatingSystem.IsWindows() || bytes < MinTensorBytes || !Enabled) return;
+        const long Page = 4096;
+        nint start = (ptr + (nint)(Page - 1)) & ~(nint)(Page - 1);
+        long len = (ptr + (nint)bytes - start) & ~(Page - 1);
+        for (long off = 0; off < len; off += 256L << 20)
+            VirtualUnlock(start + (nint)off, (nuint)Math.Min(256L << 20, len - off));
+    }
+
+    /// <summary>Source-page release (<c>DOTLLM_VULKAN_RELEASE_SOURCE=0</c> disables).</summary>
+    public static bool Enabled { get; } = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_RELEASE_SOURCE") != "0";
+
+    [DllImport("kernel32.dll")] private static extern bool VirtualUnlock(nint address, nuint size);
+
     [StructLayout(LayoutKind.Sequential)]
     private unsafe struct MemoryRangeEntry { public void* VirtualAddress; public nuint NumberOfBytes; }
 

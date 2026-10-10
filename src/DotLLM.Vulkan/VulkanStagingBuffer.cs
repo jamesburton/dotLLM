@@ -300,6 +300,7 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
                 new Span<byte>((void*)(mapped + (nint)plan.Length), (int)plan.ZeroTail).Clear();
             Flush(dst, dstOffset + plan.SrcOffset, plan.Length + plan.ZeroTail);
         }
+        VulkanWeightReadAhead.ReleaseSource(src, bytes);   // #874: the copied pages leave the working set
     }
 
     /// <summary>
@@ -359,6 +360,7 @@ internal sealed unsafe class VulkanStagingBuffer : IDisposable
                 if (pending.Count >= maxFilling) SubmitOldest();
             }
             while (pending.Count > 0) SubmitOldest();
+            VulkanWeightReadAhead.ReleaseSource(src, bytes);
         }
         catch
         {
