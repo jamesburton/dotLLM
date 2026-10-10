@@ -2184,10 +2184,21 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     /// One decode row, resident Q4_K gate/up (indexed MMVQ with the broadcast folded in as xDiv), any MMVQ-capable down bank (K-quants and the
     /// legacy Q5_1 / Q8_0 of the real file), and a sigmoid-gated shared expert. Layers outside that (UD-Q4_K_XL layer 2 has Q5_K gate/up) keep the general path.
     /// </summary>
+    /// <summary>
+    /// Gate/up banks the fused qwen4exp decode chain can read with <c>xDiv</c>: Q4_K (as before), or one IQ-family type on both banks (#823; the
+    /// indexed IQ MMVQ kernels take the same <c>xDiv</c> broadcast). A mixed pair stays on the general path.
+    /// </summary>
+    private bool FusedDecodeGateUpOk(VulkanQwen3MoeMoeUpload.LayerBundle moeW, int hidden)
+    {
+        if (moeW.W1QuantType == QuantizationType.Q4_K && moeW.W3QuantType == QuantizationType.Q4_K) return _kernels.MoeMmvqQ4K is not null;
+        return IsIqBankQuant(moeW.W1QuantType) && moeW.W1QuantType == moeW.W3QuantType
+            && _kernels.MoeMmvqIq(moeW.W1QuantType) is { } iq && (hidden % iq.GroupSize) == 0;
+    }
+
     private bool CanRecordMoeDecodeQ4E(VulkanQwen3MoeMoeUpload.LayerBundle moeW, int seqLen, int hidden)
         => Q4MoeDecodeFused && seqLen == 1 && seqLen < GroupedMinTokens
-            && _kernels.QuantizeQ8_1RowsActivations is not null && _kernels.SwiGluQuantizeFused is not null && _kernels.MoeMmvqQ4K is not null
-            && moeW.W1QuantType == QuantizationType.Q4_K && moeW.W3QuantType == QuantizationType.Q4_K
+            && _kernels.QuantizeQ8_1RowsActivations is not null && _kernels.SwiGluQuantizeFused is not null
+            && FusedDecodeGateUpOk(moeW, hidden)
             && DownMmvqFits(moeW.W2QuantType, moeW.IntermediateSize)
             && moeW.HasSharedExpert && moeW.SharedExpertGate is not null && moeW.SharedGate is not null && moeW.SharedUp is not null && moeW.SharedDown is not null
             && (hidden % 256) == 0 && (moeW.IntermediateSize % 32) == 0
@@ -2234,14 +2245,27 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         MoeStage("topk");
 
         // Phase 3: routed gate/up + shared down. The multi-row variant (2 output rows per workgroup) is the measured decode win (#885).
-        var gateUp = _kernels.MoeMmvqQ4K!;
         bool mr = EffMoeMrMinRows > 0 && 1 >= EffMoeMrMinRows && SmallRowGemvEnabled;   // one decode row
-        if (mr && _kernels.MoeMmvqQ4KMr is { } q4Mr && (interm % q4Mr.RowsPerGroup) == 0)
-        { gateUp = q4Mr; CountSmallRow(SmallRowPath.MoeQ4KMr); }
-        gateUp.Record(cmdBuf, moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
-            _state.MoeTopkIndices, _state.MoeGateInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
-        gateUp.Record(cmdBuf, moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
-            _state.MoeTopkIndices, _state.MoeUpInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
+        if (IsIqBankQuant(moeW.W1QuantType))
+        {
+            // #823: IQ gate/up (UD-IQ4_XS, ISTA GSQ-RCO files) on the same fused chain; the IQ MMVQ kernels take the xDiv broadcast.
+            var iqGu = _kernels.MoeMmvqIq(moeW.W1QuantType)!;
+            CountMoePath(MoePath.IqMmvqGateUp);
+            iqGu.Record(cmdBuf, moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                _state.MoeTopkIndices, _state.MoeGateInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
+            iqGu.Record(cmdBuf, moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                _state.MoeTopkIndices, _state.MoeUpInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
+        }
+        else
+        {
+            var gateUp = _kernels.MoeMmvqQ4K!;
+            if (mr && _kernels.MoeMmvqQ4KMr is { } q4Mr && (interm % q4Mr.RowsPerGroup) == 0)
+            { gateUp = q4Mr; CountSmallRow(SmallRowPath.MoeQ4KMr); }
+            gateUp.Record(cmdBuf, moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                _state.MoeTopkIndices, _state.MoeGateInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
+            gateUp.Record(cmdBuf, moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                _state.MoeTopkIndices, _state.MoeUpInter, m: interm, k: hidden, n: topK, numExperts: numE, xDiv: topK);
+        }
         RecordMatmul(cmdBuf, moeW.SharedDown!, moeW.SharedQuantType, _state.MoeSharedSilu, _state.MoeSharedSumA, outputDim: hidden, inputDim: sharedI, seqLen: 1);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("gate_up");
@@ -2255,6 +2279,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         // Phase 5: routed down.
         CountMoePath(MoePath.MmvqDown);
         if (IsLegacyQuant(moeW.W2QuantType)) CountMoePath(MoePath.MmvqLegacyDown);
+        if (IsIqBankQuant(moeW.W2QuantType)) CountMoePath(MoePath.IqMmvqDown);
         RecordDownMmvq(cmdBuf, moeW.W2QuantType, moeW, hidden, interm, topK, numE, multiRow: mr);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         MoeStage("down");

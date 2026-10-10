@@ -334,6 +334,7 @@ public sealed class VulkanQwen4ExpParityTests
             fastDecode = Decode(rig, ids, 3, out fastPrefill);
             Assert.True(rig.Vk.MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath.IqMmvqGateUp) > 0, "IQ MMVQ gate/up arm never recorded");
             Assert.True(rig.Vk.MoePathCount(VulkanQwen3MoeHybridTransformerModel.MoePath.IqMmvqDown) > 0, "IQ MMVQ down arm never recorded");
+            Assert.True(rig.Vk.MoeFusedLayers > 0, "the 1-token decode steps never took the fused qwen4exp MoE chain (#885) with IQ gate/up banks");
             // The 40-token prefill is above the grouped threshold: where coopmat + native wave64 exist, both banks must take the grouped arms.
             var gateIq = MoeIndexedMatmulIqMmvqKernel.FromQuantizationType(gateUp)!.Value;
             if (MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(rig.Device, spvDir, gateIq) && MoeGroupedMatmulIqCoopmatKernel.IsSupportedOn(rig.Device, spvDir, MoeIndexedMatmulIqMmvqKernel.FromQuantizationType(down)!.Value))

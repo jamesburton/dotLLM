@@ -53,7 +53,7 @@ def convert(dense_name, out_name, fmt):
 
     # push constants
     s = sub1(s, r'layout\(push_constant\) uniform PushConstants \{.*?\} pc;',
-             'layout(push_constant) uniform PushConstants {\n    uint M;\n    uint K;\n    uint N;\n    uint numExperts;\n    uint blocksPerRow; // K / 256\n} pc;',
+             'layout(push_constant) uniform PushConstants {\n    uint M;\n    uint K;\n    uint N;\n    uint numExperts;\n    uint blocksPerRow; // K / 256\n    uint xDiv;          // activation row = n / xDiv (1 = per-row input; topK = one row broadcast to its topK expert slots)\n} pc;',
              re.S)
 
     # entry: m / n / expert
@@ -61,7 +61,7 @@ def convert(dense_name, out_name, fmt):
              '    uint m = gl_WorkGroupID.x;\n    uint n = gl_WorkGroupID.y;\n    if (m >= pc.M || n >= pc.N) return;\n\n'
              '    uint expert = uint(indices[n]);\n    if (expert >= pc.numExperts) return; // defensive: bad index leaves y untouched\n')
     s = sub1(s, r'    uint rowByteBase = m \* pc.blocksPerRow \* (\w+_BLOCK_BYTES);',
-             r'    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * \1;\n    uint xqRowBase   = n * (pc.K >> 2u);\n    uint xdsRowBase  = n * (pc.K >> 5u);')
+             r'    uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * \1;\n    uint xRow        = n / pc.xDiv;\n    uint xqRowBase   = xRow * (pc.K >> 2u);\n    uint xdsRowBase  = xRow * (pc.K >> 5u);')
     s = sub1(s, r'uint xqi = blk \* 64u', 'uint xqi = xqRowBase + blk * 64u')
     s = sub1(s, r'xds\[blk \* 8u \+ ib32\]', 'xds[xdsRowBase + blk * 8u + ib32]')
     s = sub1(s, r'y\[m\] = total;', 'y[n * pc.M + m] = total;')

@@ -28,6 +28,7 @@ layout(push_constant) uniform PushConstants {
     uint N;
     uint numExperts;
     uint blocksPerRow;  // K / 32
+    uint xDiv;          // activation row = n / xDiv (1 = per-row input; topK = one row broadcast to its topK expert slots)
 } pc;
 
 const uint IQ4_NL_BLOCK_BYTES = 18u;
@@ -81,8 +82,9 @@ void main() {
     uint w  = lane & 3u;                  // qs word 0..3
 
     uint rowByteBase = (expert * pc.M + m) * pc.blocksPerRow * IQ4_NL_BLOCK_BYTES;
-    uint xqRowBase   = n * (pc.K >> 2u);
-    uint xdsRowBase  = n * (pc.K >> 5u);
+    uint xRow        = n / pc.xDiv;
+    uint xqRowBase   = xRow * (pc.K >> 2u);
+    uint xdsRowBase  = xRow * (pc.K >> 5u);
     float acc = 0.0;
 
     for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {

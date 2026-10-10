@@ -83,7 +83,7 @@ internal static class MoeIqFormats
 /// </remarks>
 public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
 {
-    private const int PushConstantBytes = 5 * sizeof(uint); // M, K, N, numExperts, blocksPerRow
+    private const int PushConstantBytes = 6 * sizeof(uint); // M, K, N, numExperts, blocksPerRow, xDiv
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
@@ -190,12 +190,15 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
     /// <param name="k">Per-expert weight column count (multiple of <see cref="GroupSize"/>).</param>
     /// <param name="n">Number of output rows (typically <c>seqLen * topK</c>).</param>
     /// <param name="numExperts">Bank's first axis size.</param>
+    /// <param name="xDiv">Activation row for output row <c>r</c> is <c>r / xDiv</c> (1 = one quantized row per output row; <c>topK</c> = a decode row broadcast to its topK expert slots).</param>
     public unsafe void Record(
         nint cmdBuf,
         VulkanDevice.Buffer bank, VulkanDevice.Buffer xq, VulkanDevice.Buffer xds,
         VulkanDevice.Buffer indices, VulkanDevice.Buffer y,
-        int m, int k, int n, int numExperts)
+        int m, int k, int n, int numExperts, int xDiv = 1)
     {
+        if (xDiv <= 0) throw new ArgumentOutOfRangeException(nameof(xDiv));
+        int xRows = (n + xDiv - 1) / xDiv;
         if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n));
@@ -208,9 +211,9 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
         if (bankBytes > uint.MaxValue)
             throw new ArgumentException($"bank is {bankBytes} bytes; the shader addresses it with 32-bit byte offsets.", nameof(bank));
         if (bank.Size < bankBytes) throw new ArgumentException("bank buffer too small.", nameof(bank));
-        if (xq.Size < QuantizeQ8_1RowsKernel.PackedBytes(n, k))
+        if (xq.Size < QuantizeQ8_1RowsKernel.PackedBytes(xRows, k))
             throw new ArgumentException("Packed activation buffer too small.", nameof(xq));
-        if (xds.Size < QuantizeQ8_1RowsKernel.ScaleBytes(n, k))
+        if (xds.Size < QuantizeQ8_1RowsKernel.ScaleBytes(xRows, k))
             throw new ArgumentException("Activation scale buffer too small.", nameof(xds));
         if (indices.Size < (long)n * sizeof(int)) throw new ArgumentException("indices buffer too small.", nameof(indices));
         if (y.Size < (long)n * m * sizeof(float)) throw new ArgumentException("y buffer too small.", nameof(y));
@@ -223,7 +226,7 @@ public sealed class MoeIndexedMatmulIqMmvqKernel : IDisposable
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout, 0, 1, descriptorSet, 0, 0);
 
-        Span<uint> pc = stackalloc uint[5] { (uint)m, (uint)k, (uint)n, (uint)numExperts, (uint)blocksPerRow };
+        Span<uint> pc = stackalloc uint[6] { (uint)m, (uint)k, (uint)n, (uint)numExperts, (uint)blocksPerRow, (uint)xDiv };
         fixed (uint* pcPtr = pc)
         {
             VulkanApi.vkCmdPushConstants(cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute, 0, PushConstantBytes, (nint)pcPtr);
