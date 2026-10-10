@@ -570,6 +570,16 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     /// <summary>Test hook (#885): gated-residual reads recorded on the fused path.</summary>
     internal long GrFusedReads { get; private set; }
 
+    /// <summary>Test hook (#885): decode MoE layers that used the fused scatter + shared-gate add kernel.</summary>
+    internal long CombineFusedLayers => _core.Q4CombineFusedLayers;
+
+    /// <summary>Diagnostic (#885): fused weighted scatter + shared-expert gated add on decode.</summary>
+    public static bool CombineFused
+    {
+        get => VulkanQwen3MoeHybridTransformerModel.Q4CombineFused;
+        set => VulkanQwen3MoeHybridTransformerModel.Q4CombineFused = value;
+    }
+
     /// <summary>Test hook (#885): MoE layers that ran on the fused single-token decode chain.</summary>
     internal long MoeFusedLayers => _core.Q4MoeFusedLayers;
 
