@@ -319,7 +319,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         // heap the trunk already spills into - ~11 GiB of the real file lives there; discrete: VRAM only), the trunk is what this process
         // holds in those same heaps, and other processes' GPU memory is subtracted. The old check compared ALL live bytes with the
         // device-local heap alone, so it refused with ~30 GiB of the shared heap unused.
-        // The usable capacity is the OS limit (UMA: ~0.63 x RAM, measured), not the sum of the advertised heaps, and the allocation that
+        // The usable capacity is the OS limit (UMA: ~0.64 x RAM, measured), not the sum of the advertised heaps, and the allocation that
         // crosses it does not fail - the NEXT submit does, and the device is then unusable. No extra headroom is subtracted: the cap
         // already is the point of failure and everything counted below is real.
         long local = VulkanMemoryCapacity.UsableCapacityBytes(_device.ResidentCapacityBytes(),
