@@ -161,7 +161,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         }
         long snapBytes = DefaultSnapshotBytes();
         // #900: the Q8_0 head (~3 GiB) is what keeps MTP off the 79 GiB UD-Q4_K_XL; its routed banks re-quantised to Q4_K / Q5_1 save ~0.9 GiB and run the
-        // fused single-token MoE chain. Mode 0 = never, 1 = always, 2 (default) = only when the native head does not fit.
+        // fused single-token MoE chain. Mode 0 = never, 1 (default) = whenever the banks are Q8_0, 2 = only when the native head does not fit.
         bool requant = MtpHeadRequantMode == 1 && requantSaving > 0;
         if (MtpHeadRequantMode == 2 && requantSaving > 0 && !HeadroomFits(headBytes + snapBytes, out _))
             requant = true;
@@ -346,8 +346,13 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
             throw new NotSupportedException(message);
     }
 
-    /// <summary>Env <c>DOTLLM_MTP_HEAD_REQUANT</c>: 0 = keep the head's native routed-bank quantisation, 1 = always re-quantise (Q4_K gate/up, Q5_1 down), 2 (default) = only when the native head does not fit the device.</summary>
-    internal static int MtpHeadRequantMode { get; set; } = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_MTP_HEAD_REQUANT"), out int rq) ? rq : 2;
+    /// <summary>
+    /// Env <c>DOTLLM_MTP_HEAD_REQUANT</c>: 0 = keep the head's native routed-bank quantisation, 1 (default) = re-quantise a Q8_0 head's routed banks (Q4_K
+    /// gate/up, Q5_1 down), 2 = only when the native head does not fit the device. Measured on UD-IQ4_XS (Vulkan, Strix Halo): the Q8_0 head's MoE ran the
+    /// general serial path, 10.5 ms of a 13.9 ms draft step; re-quantised it takes the fused single-token chain, draft step 4.1 ms, with the same drafts
+    /// (tokens per round 3.26 / 3.10 / 4.23 / 4.10 vs 3.26 / 3.02 / 4.23 / 4.10) and MTP K=4 from 1.17x to 1.56x of plain decode.
+    /// </summary>
+    internal static int MtpHeadRequantMode { get; set; } = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_MTP_HEAD_REQUANT"), out int rq) ? rq : 1;
 
     /// <summary>True when the attached head's routed banks were re-quantised at attach (see <see cref="MtpHeadRequantMode"/>).</summary>
     public bool MtpHeadRequantized { get; private set; }
@@ -396,6 +401,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
     /// <inheritdoc/>
     /// <remarks>A weight-bandwidth-bound 6B-active MoE: MTP is tried first and the gate still re-measures (same prior as the CPU oracle).</remarks>
     public long MtpGatePriorBytes => long.MaxValue;
+
+    /// <inheritdoc/>
+    public int MtpPreferredDraftTokens => 4;
 
     /// <inheritdoc/>
     public IMtpState? CreateMtpState() => CreateMtpState(Config.MaxSequenceLength);

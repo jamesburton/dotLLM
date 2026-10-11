@@ -24,6 +24,13 @@ public interface IModel : IDisposable
     long MtpGatePriorBytes => ComputeMemoryBytes;
 
     /// <summary>
+    /// The MTP draft depth K this model runs best at, or 0 for "no preference". <c>TextGenerator</c> uses it instead of its library default
+    /// (<c>DefaultSpeculativeCandidates</c> = 3) when the caller did not pick a different K. qwen4exp returns 4: its verify rows cost ~11 ms each
+    /// against a ~4 ms draft step, so a 5-row verify still beats three shorter rounds at the measured 3-4 tokens committed per round (#900).
+    /// </summary>
+    int MtpPreferredDraftTokens => 0;
+
+    /// <summary>
     /// Total bytes of committed memory holding repacked (layout-transformed) copies of the model
     /// weights, or 0 when the backend does not repack. This is memory in addition to the
     /// memory-mapped weight file, not a subset of it.

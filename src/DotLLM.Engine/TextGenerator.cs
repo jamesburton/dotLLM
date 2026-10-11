@@ -33,6 +33,7 @@ public sealed class TextGenerator
     private readonly IModel? _draftModel;
     private readonly Func<ModelConfig, int, Core.Attention.IKvCache>? _draftKvCacheFactory;
     private readonly int _speculativeCandidates;
+    private readonly int _mtpCandidates;   // MTP depth: the model's preferred K when the caller kept the library default
     private readonly bool _mtpEnabled;
     private readonly HybridPrefillDecodeStrategy? _hybridStrategy;
     private readonly int _prefillChunkSize;
@@ -140,6 +141,8 @@ public sealed class TextGenerator
         _draftModel = draftModel;
         _draftKvCacheFactory = draftKvCacheFactory;
         _speculativeCandidates = speculativeCandidates;
+        _mtpCandidates = speculativeCandidates == DefaultSpeculativeCandidates && model.MtpPreferredDraftTokens > 0
+            ? Math.Min(model.MtpPreferredDraftTokens, MtpCostModel.MaxK) : speculativeCandidates;
         _mtpEnabled = mtpEnabled;
         _hybridStrategy = hybridStrategy;
         _prefillChunkSize = prefillChunkSize;
@@ -611,8 +614,8 @@ public sealed class TextGenerator
                 //    lightweight head drafts candidates from its own hidden state — no second
                 //    model, no second full-model KV-cache, just the model's own IMtpState. ──
                 var mtpDecoder = new MtpSpeculativeDecoder();
-                int[] specBuffer = ArrayPool<int>.Shared.Rent(_speculativeCandidates + 1);
-                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _speculativeCandidates) : null;
+                int[] specBuffer = ArrayPool<int>.Shared.Rent(_mtpCandidates + 1);
+                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _mtpCandidates) : null;
                 try
                 {
                     int step = 1;
@@ -625,7 +628,7 @@ public sealed class TextGenerator
                         if (mtpCtl is not null && mtpCtl.ShouldFallBack(mtpGate!.PlainMsPerToken)) { mtpFallbackStep = step; break; }
 
                         int remaining = maxTokens - step;
-                        int k = mtpCtl?.NextK(remaining) ?? Math.Min(_speculativeCandidates, remaining);
+                        int k = mtpCtl?.NextK(remaining) ?? Math.Min(_mtpCandidates, remaining);
 
                         var result = mtpDecoder.DraftAndVerify(
                             _model, kvCache, mtpState!,
@@ -1147,8 +1150,8 @@ public sealed class TextGenerator
             {
                 // ── MTP self-speculative decode loop (issue #253) — streaming variant. ──
                 var mtpDecoder = new MtpSpeculativeDecoder();
-                int[] specBuffer = ArrayPool<int>.Shared.Rent(_speculativeCandidates + 1);
-                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _speculativeCandidates) : null;
+                int[] specBuffer = ArrayPool<int>.Shared.Rent(_mtpCandidates + 1);
+                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _mtpCandidates) : null;
                 try
                 {
                     int step = 1;
@@ -1163,7 +1166,7 @@ public sealed class TextGenerator
                         if (mtpCtl is not null && mtpCtl.ShouldFallBack(mtpGate!.PlainMsPerToken)) { mtpFallbackStep = step; break; }
 
                         int remaining = maxTokens - step;
-                        int kk = mtpCtl?.NextK(remaining) ?? Math.Min(_speculativeCandidates, remaining);
+                        int kk = mtpCtl?.NextK(remaining) ?? Math.Min(_mtpCandidates, remaining);
 
                         var result = mtpDecoder.DraftAndVerify(
                             _model, kvCache, mtpState!,
