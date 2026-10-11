@@ -59,6 +59,207 @@ public sealed class VulkanQwen4ExpRealQsaTests
         Log($"[smoke] forward ok, argmax {Argmax(row)}, {device.MemorySnapshot()}");
     }
 
+    private static double Kl(float[] p, float[] q)
+    {
+        double mp = p.Max(), mq = q.Max(), zp = 0, zq = 0;
+        for (int i = 0; i < p.Length; i++) { zp += Math.Exp(p[i] - mp); zq += Math.Exp(q[i] - mq); }
+        double lzp = Math.Log(zp), lzq = Math.Log(zq), kl = 0;
+        for (int i = 0; i < p.Length; i++)
+        {
+            double lp = p[i] - mp - lzp;
+            kl += Math.Exp(lp) * (lp - (q[i] - mq - lzq));
+        }
+        return kl;
+    }
+
+    /// <summary>
+    /// Issue #437: same-process A/B of the K/V + indexer storage arms on identical token sequences. Every arm prefills the same text in 1024-row chunks;
+    /// at each depth in <c>DOTLLM_REAL_KV_AB_DEPTHS</c> (default 4096,8192,16000) it records the chunk's last-row logits, then runs eight teacher-forced
+    /// decode steps (timed, logits kept). The baseline arm (the first) is compared with every other arm by KL / top-1; eager vs lazy F32 must be bit-identical.
+    /// Memory is the device snapshot at each depth. Text: <c>DOTLLM_REAL_KV_AB_TEXT</c>. Arms: <c>DOTLLM_REAL_KV_AB_ARMS</c> (default all).
+    /// </summary>
+    [SkippableFact]
+    public void KvStorageAb_KlThroughputAndMemoryAtDepth()
+    {
+        string? path = Environment.GetEnvironmentVariable("DOTLLM_QWEN4EXP_REAL_GGUF");
+        Skip.If(string.IsNullOrEmpty(path) || !File.Exists(path), "DOTLLM_QWEN4EXP_REAL_GGUF not set");
+        string? textPath = Environment.GetEnvironmentVariable("DOTLLM_REAL_KV_AB_TEXT");
+        Skip.If(string.IsNullOrEmpty(textPath) || !File.Exists(textPath), "DOTLLM_REAL_KV_AB_TEXT not set");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        int[] depths = (Environment.GetEnvironmentVariable("DOTLLM_REAL_KV_AB_DEPTHS") ?? "4096,8192,16000").Split(',').Select(int.Parse).ToArray();
+        string[] armNames = (Environment.GetEnvironmentVariable("DOTLLM_REAL_KV_AB_ARMS") ?? "f32-eager,f32-lazy,f16-lazy,f16-lazy-idx16").Split(',');
+        const int Chunk = 1024, Steps = 16;
+
+        using var gguf = GgufFile.Open(path!);
+        var cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        using var model = VulkanQwen4ExpTransformerModel.BuildFromGguf(device, gguf, cfg, spvDir);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        int[] ids = tokenizer.Encode(File.ReadAllText(textPath!));
+        int need = depths.Max() + Steps + 2;
+        Skip.If(ids.Length < need, $"text has {ids.Length} tokens, needs {need}");
+        Skip.If(depths.Max() + Steps + 1 > model.ContextCapacity, $"capacity {model.ContextCapacity} < depth {depths.Max() + Steps + 1}");
+        Log($"[kvab] capacity {model.ContextCapacity}, text {ids.Length} tokens, depths {string.Join(",", depths)}, arms {string.Join(",", armNames)}");
+
+        var oldKv = VulkanQwen4ExpTransformerModel.KvStorage; bool oldLazy = VulkanQwen4ExpTransformerModel.LazyKv, oldIdx = VulkanQwen4ExpTransformerModel.IndexerRawF16;
+        var rows = new Dictionary<string, List<float[]>>();
+        try
+        {
+            using (var warm = model.CreateState())
+                LastRow(model.Forward(ids.AsSpan(0, 256), Enumerable.Range(0, 256).ToArray(), -1, warm));
+            foreach (string arm in armNames)
+            {
+                VulkanQwen4ExpTransformerModel.KvStorage = arm.StartsWith("f16") ? VulkanKvStorage.F16 : VulkanKvStorage.F32;
+                VulkanQwen4ExpTransformerModel.LazyKv = !arm.Contains("eager");
+                VulkanQwen4ExpTransformerModel.IndexerRawF16 = arm.Contains("idx16");
+                VulkanQwen4ExpQsa.SplitsOverride = arm.Contains("split1") ? 1 : 0;   // control: a pure summation-order change of the F32 path
+                var kept = new List<float[]>(); rows[arm] = kept;
+                using var st = model.CreateState();
+                int at = 0;
+                double preSec = 0;
+                foreach (int depth in depths)
+                {
+                    var tp = Stopwatch.GetTimestamp();
+                    int from = at;
+                    float[]? last = null;
+                    while (at < depth)
+                    {
+                        int n = Math.Min(Chunk, depth - at);
+                        last = LastRow(model.Forward(ids.AsSpan(at, n), Enumerable.Range(at, n).ToArray(), -1, st));
+                        at += n;
+                    }
+                    double sec = Stopwatch.GetElapsedTime(tp).TotalSeconds;
+                    if (last is not null) kept.Add(last);
+                    // One untimed decode step first: a lazy cache that was exactly full grows (and re-records) on it, which is a one-off stall, not a rate.
+                    kept.Add(LastRow(model.Forward([ids[at]], [at], -1, st)));
+                    at++;
+                    var td = Stopwatch.GetTimestamp();
+                    for (int i = 0; i < Steps; i++)
+                    {
+                        kept.Add(LastRow(model.Forward([ids[at]], [at], -1, st)));
+                        at++;
+                    }
+                    double dms = Stopwatch.GetElapsedTime(td).TotalMilliseconds / Steps;
+                    Log($"[kvab] {arm,-16} depth {depth,6}: prefill {(depth - from) / sec,6:F0} tok/s over {depth - from} rows, decode {1000 / dms:F1} tok/s ({dms:F1} ms/tok), {device.MemorySnapshot()}");
+                    preSec += sec;
+                }
+                Log($"[kvab] {arm}: prefill total {preSec:F1}s");
+            }
+        }
+        finally
+        {
+            VulkanQwen4ExpTransformerModel.KvStorage = oldKv; VulkanQwen4ExpTransformerModel.LazyKv = oldLazy; VulkanQwen4ExpTransformerModel.IndexerRawF16 = oldIdx;
+            VulkanQwen4ExpQsa.SplitsOverride = 0;
+        }
+        string baseArm = armNames[0];
+        foreach (string arm in armNames.Skip(1))
+        {
+            var a = rows[baseArm]; var b = rows[arm];
+            double sum = 0, max = 0; int agree = 0; var perDepth = new List<string>();
+            for (int i = 0; i < a.Count; i++)
+            {
+                double kl = Kl(a[i], b[i]); sum += kl; max = Math.Max(max, kl);
+                if (Argmax(a[i]) == Argmax(b[i])) agree++;
+                perDepth.Add(kl.ToString("E1"));
+            }
+            bool identical = a.Zip(b).All(p => p.First.AsSpan().SequenceEqual(p.Second));
+            Log($"[kvab] KL({baseArm} || {arm}): mean {sum / a.Count:E2} max {max:E2} top1 {agree}/{a.Count} bit-identical {identical}; per row [{string.Join(" ", perDepth)}]");
+            if (arm == "f32-lazy") Assert.True(identical, "lazy F32 KV must be bit-identical to eager F32 KV");
+        }
+    }
+
+    /// <summary>
+    /// Issue #437: throughput of the storage arms measured fairly. UMA bandwidth contention swings sequential A/B runs by 30-40 %, so all arms (live
+    /// states) advance through the SAME text together: every 1024-row prefill chunk is timed per arm in rotating order, and at each depth the decode
+    /// rate is timed in alternating rounds (<c>Rounds</c> x <c>Steps</c> teacher-forced steps per arm, medians reported). Env: <c>DOTLLM_REAL_KV_AB_TEXT</c>,
+    /// <c>DOTLLM_REAL_KV_DEC_DEPTHS</c> (default 1024,4096,8192,16000), <c>DOTLLM_REAL_KV_DEC_ARMS</c> (default f32-lazy,f16-lazy).
+    /// </summary>
+    [SkippableFact]
+    public void KvStorageDecodeAb_InterleavedArms()
+    {
+        string? path = Environment.GetEnvironmentVariable("DOTLLM_QWEN4EXP_REAL_GGUF");
+        Skip.If(string.IsNullOrEmpty(path) || !File.Exists(path), "DOTLLM_QWEN4EXP_REAL_GGUF not set");
+        string? textPath = Environment.GetEnvironmentVariable("DOTLLM_REAL_KV_AB_TEXT");
+        Skip.If(string.IsNullOrEmpty(textPath) || !File.Exists(textPath), "DOTLLM_REAL_KV_AB_TEXT not set");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        int[] depths = (Environment.GetEnvironmentVariable("DOTLLM_REAL_KV_DEC_DEPTHS") ?? "1024,4096,8192,16000").Split(',').Select(int.Parse).ToArray();
+        string[] armNames = (Environment.GetEnvironmentVariable("DOTLLM_REAL_KV_DEC_ARMS") ?? "f32-lazy,f16-lazy").Split(',');
+        const int Chunk = 1024, Steps = 16, Rounds = 5;
+
+        using var gguf = GgufFile.Open(path!);
+        var cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var device = VulkanDevice.Create();
+        using var model = VulkanQwen4ExpTransformerModel.BuildFromGguf(device, gguf, cfg, spvDir);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        int[] ids = tokenizer.Encode(File.ReadAllText(textPath!));
+        int need = depths.Max() + 1 + Steps * Rounds + 2;
+        Skip.If(ids.Length < need, $"text has {ids.Length} tokens, needs {need}");
+        Skip.If(need > model.ContextCapacity, $"capacity {model.ContextCapacity} < {need}");
+
+        var oldKv = VulkanQwen4ExpTransformerModel.KvStorage; bool oldLazy = VulkanQwen4ExpTransformerModel.LazyKv, oldIdx = VulkanQwen4ExpTransformerModel.IndexerRawF16;
+        var states = new List<VulkanQwen4ExpSequenceState>();
+        try
+        {
+            foreach (string arm in armNames)
+            {
+                VulkanQwen4ExpTransformerModel.KvStorage = arm.StartsWith("f16") ? VulkanKvStorage.F16 : VulkanKvStorage.F32;
+                VulkanQwen4ExpTransformerModel.LazyKv = !arm.Contains("eager");
+                VulkanQwen4ExpTransformerModel.IndexerRawF16 = arm.Contains("idx16");
+                states.Add(model.CreateState());
+            }
+            using (var warm = model.CreateState())
+                LastRow(model.Forward(ids.AsSpan(0, 256), Enumerable.Range(0, 256).ToArray(), -1, warm));
+            var pos = new int[armNames.Length];
+            var prefillSec = new double[armNames.Length][];
+            for (int a = 0; a < armNames.Length; a++) prefillSec[a] = new double[3];   // [dense chunks, sparse chunks, rows counted as sparse]
+            int chunkNo = 0;
+            foreach (int depth in depths)
+            {
+                while (pos[0] < depth)
+                {
+                    int n = Math.Min(Chunk, depth - pos[0]);
+                    for (int k = 0; k < armNames.Length; k++)
+                    {
+                        int a = (k + chunkNo) % armNames.Length;
+                        var t0 = Stopwatch.GetTimestamp();
+                        LastRow(model.Forward(ids.AsSpan(pos[a], n), Enumerable.Range(pos[a], n).ToArray(), -1, states[a]));
+                        double sec = Stopwatch.GetElapsedTime(t0).TotalSeconds;
+                        bool sparse = pos[a] + n > model.DenseContextLimit;
+                        prefillSec[a][sparse ? 1 : 0] += sec;
+                        if (sparse) prefillSec[a][2] += n;
+                        pos[a] += n;
+                    }
+                    chunkNo++;
+                }
+                var ms = armNames.Select(_ => new List<double>()).ToArray();
+                for (int a = 0; a < armNames.Length; a++)   // one untimed step per state (growth stall, descriptor rebuild)
+                { LastRow(model.Forward([ids[pos[a]]], [pos[a]], -1, states[a])); pos[a]++; }
+                for (int r = 0; r < Rounds; r++)
+                    for (int k = 0; k < armNames.Length; k++)
+                    {
+                        int a = (k + r) % armNames.Length;
+                        var t0 = Stopwatch.GetTimestamp();
+                        for (int i = 0; i < Steps; i++) { LastRow(model.Forward([ids[pos[a]]], [pos[a]], -1, states[a])); pos[a]++; }
+                        ms[a].Add(Stopwatch.GetElapsedTime(t0).TotalMilliseconds / Steps);
+                    }
+                for (int a = 0; a < armNames.Length; a++)
+                {
+                    var s = ms[a].OrderBy(x => x).ToArray();
+                    Log($"[kvdec] depth {depth,6} {armNames[a],-12}: decode median {s[s.Length / 2]:F1} ms/token ({1000 / s[s.Length / 2]:F1} tok/s) rounds [{string.Join(", ", ms[a].Select(x => x.ToString("F1")))}]");
+                }
+                // rotate so that every arm reaches the next depth together (the decode steps advanced all arms equally)
+            }
+            for (int a = 0; a < armNames.Length; a++)
+                Log($"[kvdec] prefill {armNames[a],-12}: dense chunks {prefillSec[a][0]:F1}s, sparse chunks {prefillSec[a][1]:F1}s ({prefillSec[a][2] / Math.Max(prefillSec[a][1], 1e-9):F0} tok/s over {prefillSec[a][2]:F0} rows), live states {states[a].Length} tokens");
+            Log($"[kvdec] growths {model.CacheGrowths}, {model.CacheGrowthSeconds:F2}s total; {device.MemorySnapshot()}");
+        }
+        finally
+        {
+            foreach (var s in states) s.Dispose();
+            VulkanQwen4ExpTransformerModel.KvStorage = oldKv; VulkanQwen4ExpTransformerModel.LazyKv = oldLazy; VulkanQwen4ExpTransformerModel.IndexerRawF16 = oldIdx;
+        }
+    }
+
     [SkippableFact]
     public void NeedlesThroughputAndMemory()
     {
@@ -165,7 +366,7 @@ public sealed class VulkanQwen4ExpRealQsaTests
             int[] filler = Enumerable.Range(0, model.ContextCapacity).Select(_ => rng.Next(1000, 20000)).ToArray();
             float[]? logits = null;
             int at = 0;
-            foreach (int depth in new[] { 1024, 2048, 4096, 8000, 12000, 16000 })
+            foreach (int depth in new[] { 1024, 2048, 4096, 8000, 12000, 16000, 24000, 32000 })
             {
                 if (depth + 40 > model.ContextCapacity) break;
                 if (depth > at)

@@ -695,6 +695,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
             if (Config.HybridLayout!.LayerKind[il] != HybridLayerKind.GatedDeltaNet) { fq = il; break; }
         if (fq < 0) throw new InvalidOperationException("No QSA layer.");
         var kv = state.OwnKv;
+        if (kv.Storage != VulkanKvStorage.F32) throw new NotSupportedException("The draft-step probe attends densely and needs an F32 KV cache.");
         var st = _core.Q4State;
         int S = _streams, H = _hidden;
         int pos = state.Length;

@@ -20,6 +20,26 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
     /// </summary>
     public static bool HostEmbedding { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_HOST_EMBED") != "0";
 
+    /// <summary>
+    /// Element format of the QSA layers' K/V rows (issue #437), read when a cache is created. <c>DOTLLM_VK_QWEN4EXP_KV=f16</c> halves the K/V footprint
+    /// (24 instead of 48 KiB per token at the released geometry); F32 is the default until the accuracy delta is accepted. F16 caches are read only by the
+    /// QSA gather kernel (exact dense attention below the budget runs through it too), so they need the QSA indexer on.
+    /// </summary>
+    public static VulkanKvStorage KvStorage { get; set; } =
+        string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_KV"), "f16", StringComparison.OrdinalIgnoreCase) ? VulkanKvStorage.F16 : VulkanKvStorage.F32;
+
+    /// <summary>
+    /// Store the indexer's raw (pre-pooling) keys as F16 (<c>DOTLLM_VK_QWEN4EXP_IDX_F16=1</c>): 2 of the ~6 KiB per token the indexer holds. The pooled
+    /// block keys, which the scorer reads, stay F32. Off by default.
+    /// </summary>
+    public static bool IndexerRawF16 { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_IDX_F16") == "1";
+
+    /// <summary>
+    /// Grow the K/V and indexer caches on demand instead of allocating the whole capacity per sequence (issue #437). On by default;
+    /// <c>DOTLLM_VK_QWEN4EXP_KV_LAZY=0</c> restores eager allocation (A/B diagnostic). Output is bit-identical either way.
+    /// </summary>
+    public static bool LazyKv { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_QWEN4EXP_KV_LAZY") != "0";
+
     /// <summary>Resident-capacity refusal override: <c>DOTLLM_VK_ALLOW_OVERCOMMIT=1</c> turns the pre-load refusal into a warning.</summary>
     private static bool AllowOvercommit
         => string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_ALLOW_OVERCOMMIT"), "1", StringComparison.Ordinal);
@@ -72,7 +92,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         Qwen4ExpResidencyPlan MakePlan(int capacity)
         {
             var p = Qwen4ExpResidencyPlan.Create(tensors, config, residentCapacity, capacity, GC.GetGCMemoryInfo().TotalAvailableMemoryBytes,
-                integerDot: device.HasIntegerDotProduct);
+                integerDot: device.HasIntegerDotProduct, kvElementBytes: KvStorage == VulkanKvStorage.F16 ? 2 : 4, rawKeysF16: IndexerRawF16);
             return pressure is not null ? p with { OtherProcessBytes = pressure.OtherBytes, OtherProcessDetail = pressure.DescribeCulprits() } : p;
         }
         var plan = MakePlan(kvCapacity);
@@ -85,7 +105,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                 plan = MakePlan(kvCapacity);
             }
             Console.Error.WriteLine($"[dotLLM] qwen4exp context capacity reduced from {requestedCapacity} to {kvCapacity} tokens to fit the device " +
-                                    $"(K/V + indexer caches cost {Qwen4ExpResidencyPlan.ContextBytes(config, 1) / 1024.0:F0} KiB per token).");
+                                    $"(K/V + indexer caches cost {Qwen4ExpResidencyPlan.ContextBytes(config, 1, KvStorage == VulkanKvStorage.F16 ? 2 : 4, IndexerRawF16) / 1024.0:F0} KiB per token)." +
+                                    (KvStorage == VulkanKvStorage.F32 ? " DOTLLM_VK_QWEN4EXP_KV=f16 halves the K/V part." : ""));
         }
         if (!plan.Fits)
         {
