@@ -368,7 +368,7 @@ public sealed class MtpSpeculativeDecoderTests
         // must apply the penalty with the drafts accepted so far in the history too, or they would accept a repeated draft.
         const int V = VocabSize;
         Func<int, int> target = t => (t + 1) % V;
-        void Row(int t, Span<float> row) { row.Fill(0f); row[(t + 1) % V] = 3f; row[(t + 2) % V] = 2.5f; }
+        void Row(int t, Span<float> row) { row.Fill(0f); row[t % V] = 3.5f; row[(t + 1) % V] = 3f; row[(t + 2) % V] = 1f; }   // un-penalised, a token repeats itself
         var opts = new InferenceOptions { Temperature = 0f, RepetitionPenalty = 4.0f };
 
         // plain reference: argmax of penalised logits step by step
