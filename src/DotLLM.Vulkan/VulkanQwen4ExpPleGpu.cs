@@ -4,7 +4,7 @@ using DotLLM.Models.Gguf;
 namespace DotLLM.Vulkan;
 
 /// <summary>
-/// Device side of the qwen4exp n-gram (PLE) branch for short forwards (#885): the two projections of the gathered table rows
+/// Device side of the qwen4exp n-gram (PLE) branch (#885 decode, #896 prefill chunks): the two projections of the gathered table rows
 /// (<c>key = Wk emb</c>, <c>value = Wv emb</c>) depend only on the token ids, so they run on the GPU at the START of the forward
 /// (ahead of layer 0, no host sync) instead of as a 131 MB F32 CPU GEMM between layer 0 and layer 1 (~4 ms of the ~57 ms decode step).
 /// The residual-dependent remainder (query norm, gate, dilated conv with its carried history) stays on the host
@@ -16,8 +16,11 @@ namespace DotLLM.Vulkan;
 /// </remarks>
 internal sealed class VulkanQwen4ExpPleGpu : IDisposable
 {
-    /// <summary>Largest row count handled (decode 1, MTP verify up to 8); longer chunks use the all-host branch.</summary>
-    public const int MaxRows = 8;
+    /// <summary>
+    /// Largest row count handled: the model's planned rows per forward (decode 1, MTP verify up to 8, prefill chunks up to 1024 by default).
+    /// A longer forward is chunked by the caller, so every chunk fits. The scratch is sized once at load (the heap is full of weights afterwards).
+    /// </summary>
+    public int MaxRows { get; }
 
     public VulkanDevice.Buffer KeyW { get; }
     public VulkanDevice.Buffer ValueW { get; }
@@ -37,8 +40,9 @@ internal sealed class VulkanQwen4ExpPleGpu : IDisposable
     public long Bytes { get; }
 
     private VulkanQwen4ExpPleGpu(VulkanDevice.Buffer keyW, VulkanDevice.Buffer valueW, int embDim, int keyDim, int valueDim, int residualRowFloats, long bytes,
-        VulkanDevice device)
+        VulkanDevice device, int maxRows)
     {
+        MaxRows = maxRows;
         KeyW = keyW; ValueW = valueW; EmbDim = embDim; KeyDim = keyDim; ValueDim = valueDim; Bytes = bytes;
         Emb = device.Allocate((long)MaxRows * embDim * 4);
         KeyOut = device.AllocateHostReadback((long)MaxRows * keyDim * 4);
@@ -48,7 +52,7 @@ internal sealed class VulkanQwen4ExpPleGpu : IDisposable
     }
 
     /// <summary>Uploads the two projections (exact F32) and allocates the scratch.</summary>
-    public static VulkanQwen4ExpPleGpu Upload(VulkanDevice device, VulkanStagingBuffer staging, GgufFile gguf, string keyName, string valueName, int residualRowFloats)
+    public static VulkanQwen4ExpPleGpu Upload(VulkanDevice device, VulkanStagingBuffer staging, GgufFile gguf, string keyName, string valueName, int residualRowFloats, int maxRows)
     {
         var t = gguf.TensorsByName;
         long total = 0;
@@ -64,7 +68,7 @@ internal sealed class VulkanQwen4ExpPleGpu : IDisposable
         var k = Proj(keyName, out int kIn, out int kOut);
         var v = Proj(valueName, out int vIn, out int vOut);
         if (kIn != vIn) throw new InvalidDataException("PLE key/value projections disagree on their input width.");
-        return new VulkanQwen4ExpPleGpu(k, v, kIn, kOut, vOut, residualRowFloats, total, device);
+        return new VulkanQwen4ExpPleGpu(k, v, kIn, kOut, vOut, residualRowFloats, total, device, maxRows);
     }
 
     /// <summary>Records <c>key = Wk emb</c> and <c>value = Wv emb</c> for <paramref name="rows"/> rows (the host already wrote <see cref="Emb"/>).</summary>
