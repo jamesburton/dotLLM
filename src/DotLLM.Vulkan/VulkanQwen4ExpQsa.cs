@@ -12,36 +12,87 @@ namespace DotLLM.Vulkan;
 /// </summary>
 public sealed class VulkanQwen4ExpIndexerState : IDisposable
 {
+    private readonly VulkanDevice _device;
+    private readonly int _qsaLayers, _dim, _blockSize;
+    private bool _disposed;
+
     internal VulkanDevice.Buffer[] Raw { get; }
     internal VulkanDevice.Buffer[] Pooled { get; }
 
-    /// <summary>Positions the buffers can hold.</summary>
+    /// <summary>Positions the state may be asked to hold (the logical limit).</summary>
     public int Capacity { get; }
 
-    /// <summary>Device bytes held.</summary>
-    public long Bytes { get; }
+    /// <summary>Positions the device buffers hold right now (equals <see cref="Capacity"/> unless the state is lazy).</summary>
+    public int AllocatedPositions { get; private set; }
 
-    internal VulkanQwen4ExpIndexerState(VulkanDevice device, int qsaLayers, int capacity, int dim, int blockSize)
+    /// <summary>True when the raw keys are stored as F16 (issue #437); the pooled keys always stay F32.</summary>
+    public bool RawF16 { get; }
+
+    /// <summary>Device bytes held right now.</summary>
+    public long Bytes => BytesFor(_qsaLayers, AllocatedPositions, _dim, _blockSize, RawF16);
+
+    internal VulkanQwen4ExpIndexerState(VulkanDevice device, int qsaLayers, int capacity, int dim, int blockSize,
+        bool lazy = false, bool rawF16 = false)
     {
-        Capacity = capacity;
+        if (rawF16 && (dim & 1) != 0) throw new ArgumentException("F16 raw keys need an even indexer width.", nameof(dim));
+        _device = device; _qsaLayers = qsaLayers; _dim = dim; _blockSize = blockSize;
+        Capacity = capacity; RawF16 = rawF16;
         Raw = new VulkanDevice.Buffer[qsaLayers];
         Pooled = new VulkanDevice.Buffer[qsaLayers];
-        long raw = (long)capacity * dim * 4, pooled = (long)(capacity / blockSize + 1) * dim * 4;
-        for (int i = 0; i < qsaLayers; i++)
+        if (lazy) return;
+        for (int i = 0; i < qsaLayers; i++) Allocate(i, capacity);
+        AllocatedPositions = capacity;
+    }
+
+    private void Allocate(int layer, int positions)
+    {
+        Raw[layer] = _device.AllocateDeviceLocal((long)positions * _dim * (RawF16 ? 2 : 4));
+        Pooled[layer] = _device.AllocateDeviceLocal((long)(positions / _blockSize + 1) * _dim * 4);
+    }
+
+    /// <summary>
+    /// Lazy states only: makes the buffers hold at least <paramref name="positions"/> positions, preserving the raw rows and pooled blocks of the first
+    /// <paramref name="validLength"/> positions (layer by layer, so the transient is one layer). True when buffers were re-created: the caller MUST then drop
+    /// every descriptor cache that may name the old handles. Call BEFORE recording.
+    /// </summary>
+    internal bool EnsureCapacity(int positions, int validLength)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (positions > Capacity) throw new ArgumentOutOfRangeException(nameof(positions), $"{positions} exceeds the indexer capacity {Capacity}.");
+        if (positions <= AllocatedPositions) return false;
+        int q = VulkanNemotronHKvCache.LazyGrowthQuantum;
+        int target = Math.Max(positions, AllocatedPositions + Math.Max(q, AllocatedPositions / 4));
+        target = (int)Math.Min(Capacity, ((long)target + q - 1) / q * q);
+        int rawBytesPerPos = _dim * (RawF16 ? 2 : 4);
+        ulong rawKeep = (ulong)validLength * (ulong)rawBytesPerPos, poolKeep = (ulong)(validLength / _blockSize) * (ulong)_dim * 4;
+        for (int i = 0; i < _qsaLayers; i++)
         {
-            Raw[i] = device.AllocateDeviceLocal(raw);
-            Pooled[i] = device.AllocateDeviceLocal(pooled);
+            var oldRaw = Raw[i]; var oldPooled = Pooled[i];
+            Allocate(i, target);
+            if (oldRaw is not null && (rawKeep > 0 || poolKeep > 0))
+            {
+                using var ctx = _device.CreateSubmitContext();
+                ctx.Begin();
+                KernelSupport.ComputeToTransferBarrier(ctx.CommandBuffer);
+                if (rawKeep > 0) VulkanQwen3MoeHybridTransformerModel.Q4Copy(ctx.CommandBuffer, oldRaw, Raw[i], 0, 0, rawKeep);
+                if (poolKeep > 0) VulkanQwen3MoeHybridTransformerModel.Q4Copy(ctx.CommandBuffer, oldPooled, Pooled[i], 0, 0, poolKeep);
+                KernelSupport.TransferToComputeBarrier(ctx.CommandBuffer);
+                ctx.SubmitAndWait();
+            }
+            oldRaw?.Dispose(); oldPooled?.Dispose();
         }
-        Bytes = qsaLayers * (raw + pooled);
+        AllocatedPositions = target;
+        return true;
     }
 
     /// <summary>Device bytes the indexer state of <paramref name="qsaLayers"/> layers needs for <paramref name="capacity"/> positions.</summary>
-    public static long BytesFor(int qsaLayers, int capacity, int dim, int blockSize)
-        => qsaLayers * ((long)capacity * dim * 4 + (long)(capacity / blockSize + 1) * dim * 4);
+    public static long BytesFor(int qsaLayers, int capacity, int dim, int blockSize, bool rawF16 = false)
+        => qsaLayers * ((long)capacity * dim * (rawF16 ? 2 : 4) + (long)(capacity / blockSize + 1) * dim * 4);
 
     /// <inheritdoc/>
     public void Dispose()
     {
+        _disposed = true;
         foreach (var b in Raw) b?.Dispose();
         foreach (var b in Pooled) b?.Dispose();
     }
@@ -163,17 +214,30 @@ internal sealed class VulkanQwen4ExpQsa : IQ4AttentionHook, IDisposable
 
     private int MaxSplitsFor(int queries) => Math.Clamp((256 + queries * _attnHeads - 1) / (queries * _attnHeads), 1, 16);
 
+    /// <summary>
+    /// Test hook (0 = off): caps the KV splits of the gather attention. Fewer splits change only the float summation order of the softmax merge, which makes
+    /// it the control perturbation for noise-floor measurements (a harmless ~1e-7 change that the quantised network may still amplify).
+    /// </summary>
+    internal static int SplitsOverride { get; set; }
+
+    private int SplitsFor(int queries) => SplitsOverride > 0 ? Math.Min(SplitsOverride, MaxSplitsFor(queries)) : MaxSplitsFor(queries);
+
     /// <inheritdoc/>
     public bool RecordAttention(nint cmd, int layer, int seqLen, ReadOnlySpan<int> positions,
-        VulkanDevice.Buffer kSrc, VulkanDevice.Buffer vSrc)
+        VulkanDevice.Buffer kSrc, VulkanDevice.Buffer vSrc, VulkanKvStorage kvStorage = VulkanKvStorage.F32)
     {
         var ist = _cur;
+        bool kvF16 = kvStorage == VulkanKvStorage.F16;
+        if (kvF16 && (!Enabled || ist is null))
+            throw new InvalidOperationException("An F16 KV cache needs the QSA indexer state of the sequence (QSA disabled or no sequence begun).");
         if (!Enabled || ist is null || _ordinal[layer] < 0) return false;
         int ord = _ordinal[layer];
         var w = _w[ord];
         var st = _core.Q4State;
         int first = positions[0];
         if (first + seqLen > ist.Capacity) throw new InvalidOperationException("QSA indexer capacity exceeded.");
+        if (first + seqLen > ist.AllocatedPositions)
+            throw new InvalidOperationException($"QSA indexer holds {ist.AllocatedPositions} positions but this forward reaches {first + seqLen}: EnsureCapacity was not called.");
         bool sparse = first + seqLen > DenseLimit;
 
         // Raw key of every row -> the position-indexed store; the (cheap) key projection runs on every forward so history exists
@@ -182,24 +246,33 @@ internal sealed class VulkanQwen4ExpQsa : IQ4AttentionHook, IDisposable
         if (sparse)
             _core.Q4RecordMatmul(cmd, w.QProj, w.QQt, st.NormOutput, _iq!, outputDim: _heads * _dim, inputDim: _hidden, seqLen: seqLen);
         KernelSupport.ComputeTransferFullBarrier(cmd);
-        VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, _ik!, ist.Raw[ord], 0, (ulong)((long)first * _dim * 4), (ulong)((long)seqLen * _dim * 4));
+        if (ist.RawF16)
+            _k.RecordF32ToF16(cmd, _ik!, ist.Raw[ord], (long)first * _dim, (long)seqLen * _dim);
+        else
+            VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, _ik!, ist.Raw[ord], 0, (ulong)((long)first * _dim * 4), (ulong)((long)seqLen * _dim * 4));
         KernelSupport.ComputeTransferFullBarrier(cmd);
 
         int firstBlock = first / _blockSize, endBlock = (first + seqLen) / _blockSize;
-        _k.RecordPool(cmd, ist.Raw[ord], w.KGamma, ist.Pooled[ord], firstBlock, endBlock - firstBlock, _dim, _ropeDim, _blockSize, _eps, _theta);
-        if (!sparse)
+        _k.RecordPool(cmd, ist.Raw[ord], w.KGamma, ist.Pooled[ord], firstBlock, endBlock - firstBlock, _dim, _ropeDim, _blockSize, _eps, _theta,
+            rawF16: ist.RawF16);
+        // An F32 cache keeps the exact dense kernels below the budget; an F16 cache can only be read by the gather kernel, which attends every
+        // block while a query's block count fits the budget (the scoring below is skipped for those queries).
+        if (!sparse && !kvF16)
         {
             KernelSupport.ComputeToComputeBarrier(cmd);
             return false;
         }
 
-        // Indexer queries: per-head RMSNorm, then NeoX RoPE at the query position (the Rope kernel also rotates its K operand: the
-        // already-copied scratch key, which is dead after this point).
-        var kern = _core.Q4Kernels;
-        kern.RmsNorm.Record(cmd, _iq!, w.QGamma, _iq!, rowCount: seqLen * _heads, n: _dim, eps: _eps);
-        KernelSupport.ComputeToComputeBarrier(cmd);
-        kern.Rope.Record(cmd, _iq!, _ik!, st.PositionsBuffer, seqLen: seqLen, numHeads: _heads, numKvHeads: 1, headDim: _dim,
-            ropeDim: _ropeDim, theta: _theta, variant: RopeF32Kernel.Variant.NeoX);
+        if (sparse)
+        {
+            // Indexer queries: per-head RMSNorm, then NeoX RoPE at the query position (the Rope kernel also rotates its K operand: the
+            // already-copied scratch key, which is dead after this point).
+            var kern = _core.Q4Kernels;
+            kern.RmsNorm.Record(cmd, _iq!, w.QGamma, _iq!, rowCount: seqLen * _heads, n: _dim, eps: _eps);
+            KernelSupport.ComputeToComputeBarrier(cmd);
+            kern.Rope.Record(cmd, _iq!, _ik!, st.PositionsBuffer, seqLen: seqLen, numHeads: _heads, numKvHeads: 1, headDim: _dim,
+                ropeDim: _ropeDim, theta: _theta, variant: RopeF32Kernel.Variant.NeoX);
+        }
         KernelSupport.ComputeToComputeBarrier(cmd);
 
         for (int q0 = 0; q0 < seqLen; q0 += _qc)
@@ -213,14 +286,26 @@ internal sealed class VulkanQwen4ExpQsa : IQ4AttentionHook, IDisposable
                 _k.RecordSelect(cmd, _scores!, _sel!, q0, n, first, _blockSize, _budgetBlocks, _nbCap);
                 KernelSupport.ComputeToComputeBarrier(cmd);
             }
-            int splits = MaxSplitsFor(n);
+            int splits = SplitsFor(n);
             _k.RecordAttention(cmd, st.Q, kSrc, vSrc, _sel!, _partOut!, _partMs!, st.AttnOutput, q0, n, first, _attnHeads, _kvHeads,
-                _headDim, _blockSize, _budgetBlocks, splits);
+                _headDim, _blockSize, _budgetBlocks, splits, kvF16);
             KernelSupport.ComputeToComputeBarrier(cmd);
         }
-        SparseLayerRecordings++;
+        if (sparse) SparseLayerRecordings++;
         return true;
     }
+
+    /// <inheritdoc/>
+    public Qwen4ExpQsaKernels? F16Writer => _k.F16Supported ? _k : null;
+
+    /// <summary>True when the F16 KV / F16 raw-key kernels are available.</summary>
+    internal bool F16Supported => _k.F16Supported;
+
+    /// <summary>Test hook: the kernel set (dispatch counters).</summary>
+    internal Qwen4ExpQsaKernels QsaKernels => _k;
+
+    /// <summary>Drops every cached descriptor set of the QSA stages (call after a K/V or indexer buffer was re-created).</summary>
+    internal void InvalidateDescriptorCaches() => _k.InvalidateDescriptorCache();
 
     /// <summary>Device bytes of the projection weights.</summary>
     public long WeightBytes => _w.Sum(x => x.Bytes);

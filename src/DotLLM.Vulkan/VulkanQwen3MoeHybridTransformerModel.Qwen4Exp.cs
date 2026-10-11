@@ -93,7 +93,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
     internal VulkanGdnStateCache Q4CreateGdnState() => CreateGdnStateCache();
 
     /// <summary>Sparse per-attention-layer KV cache sized for <paramref name="maxSeqLen"/> positions.</summary>
-    internal VulkanNemotronHKvCache Q4CreateKvCache(int maxSeqLen) => CreateKvCache(maxSeqLen);
+    internal VulkanNemotronHKvCache Q4CreateKvCache(int maxSeqLen, VulkanKvStorage storage = VulkanKvStorage.F32, bool lazy = false)
+        => CreateKvCache(maxSeqLen, storage, lazy);
 }
 
 /// <summary>
@@ -102,7 +103,12 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
 /// </summary>
 internal interface IQ4AttentionHook
 {
-    bool RecordAttention(nint cmd, int layer, int seqLen, ReadOnlySpan<int> positions, VulkanDevice.Buffer kSrc, VulkanDevice.Buffer vSrc);
+    /// <remarks><paramref name="kvStorage"/> is the element format of <paramref name="kSrc"/> / <paramref name="vSrc"/>; an F16 cache MUST be handled (true), the dense kernels cannot read it.</remarks>
+    bool RecordAttention(nint cmd, int layer, int seqLen, ReadOnlySpan<int> positions, VulkanDevice.Buffer kSrc, VulkanDevice.Buffer vSrc,
+        VulkanKvStorage kvStorage = VulkanKvStorage.F32);
+
+    /// <summary>Kernels that convert the F32 K/V rows into an F16 cache (null when F16 caches are unsupported).</summary>
+    Kernels.Qwen4ExpQsaKernels? F16Writer { get; }
 }
 
 /// <summary>
