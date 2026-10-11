@@ -28,6 +28,27 @@ string[] prompts =
 };
 if (args[0] == "kbench") { KBench.Run(args); return; }
 if (args[0] == "iqbench") { IqKBench.Run(args); return; }
+if (args[0] == "mkids")
+{
+    // mkids <gguf> <text file> <out.i32> <maxTokens>: tokenize a text file with the model's tokenizer (raw int32 ids, no BOS added by us).
+    using var g = GgufFile.Open(args[1]);
+    var tk = GgufTokenizerFactory.Load(g.Metadata);
+    var all = tk.Encode(File.ReadAllText(args[2])).Take(int.Parse(args[4])).ToArray();
+    File.WriteAllBytes(args[3], MemoryMarshal.AsBytes(all.AsSpan()).ToArray());
+    Console.WriteLine($"mkids: {all.Length} tokens -> {args[3]}");
+    return;
+}
+if (args[0] == "curvecpu")
+{
+    // curvecpu <gguf> <ids.i32> <prefix> <n> <rows> <stride> [dense]: CPU oracle position curve (see KlCurve).
+    var (cm, cg, cc) = DotLLM.Models.ModelLoader.LoadFromGguf(args[1], new DotLLM.Core.Configuration.ThreadingConfig(0));
+    var q4 = (DotLLM.Models.Architectures.Qwen4ExpTransformerModel)cm;
+    if (args.Length > 7 && args[7] == "dense") q4.SetForceDenseAttention(true);
+    var cids = MemoryMarshal.Cast<byte, int>(File.ReadAllBytes(args[2]).AsSpan()).ToArray();
+    using var cst = q4.CreateState();
+    KlCurve.Run((c, p) => q4.Forward(c, p, -1, cst, false), cids, args[3], int.Parse(args[4]), int.Parse(args[5]), int.Parse(args[6]), cc.VocabSize, Console.WriteLine);
+    return;
+}
 if (args[0] == "oracle")
 {
     // CPU oracle of the real file: final-position logits of the four probe prompts, single-shot prefill, stored in the rdump format (<work>/oracle.f32).
@@ -407,6 +428,16 @@ void Exec(string line, StringBuilder o)
             }
             o.AppendLine($"vstage ctx={ctx} rows={rows}: forward {tot / reps:F1} ms (absorb {absorb / reps:F1} ms inside), stages sum {sums.Values.Sum() / reps:F1} ms");
             foreach (var kv3 in sums.OrderByDescending(k => k.Value).Take(14)) o.AppendLine($"   {kv3.Key,-22} {kv3.Value / reps,8:F2} ms");
+            break;
+        }
+        case "curve":   // curve <ids.i32> <prefix> <n> <rows> <stride> : Vulkan position curve (raises the all-row logits limit to <rows>)
+        {
+            int rows = int.Parse(a[4]);
+            model.TrySetAllRowLogitsLimit(rows);
+            var cids = MemoryMarshal.Cast<byte, int>(File.ReadAllBytes(a[1]).AsSpan()).ToArray();
+            using var cst = model.CreateState();
+            KlCurve.Run((c, p) => model.Forward(c, p, -1, cst), cids, a[2], int.Parse(a[3]), rows, int.Parse(a[5]), vocab, s => Log(s));
+            o.AppendLine($"curve {a[2]} done");
             break;
         }
         case "allrows":   // allrows <n> : ask for a logit row per input position up to n rows (raises the limit; it never lowers)
