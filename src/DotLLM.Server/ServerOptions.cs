@@ -80,6 +80,13 @@ public sealed record ServerOptions
     public bool MtpExplicit { get; init; }
 
     /// <summary>
+    /// Path of a separate MTP head GGUF for architectures that ship it beside the trunk (qwen4exp: <c>mtp-*.gguf</c>). Null = auto-detect a sibling
+    /// file (see <c>Qwen4ExpMtpHeadResolver</c>). An explicit path always attaches; an auto-detected one attaches only when the trunk is large
+    /// enough for MTP to pay (see <c>Qwen4ExpMtpHeadResolver.AutoAttachMinTrunkBytes</c>).
+    /// </summary>
+    public string? MtpHeadPath { get; init; }
+
+    /// <summary>
     /// How reasoning ("thinking") output is separated from the answer (#767): <c>--reasoning-format
     /// none|auto|deepseek</c>. <see cref="DotLLM.Tokenizers.Reasoning.ReasoningFormat.Auto"/> (default) splits
     /// into <c>reasoning_content</c> + <c>content</c> when the chat template opened a think block or the model
@@ -269,6 +276,7 @@ public sealed record ServerOptions
         int speculativeCandidates = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
         bool mtpEnabled = true;
         bool mtpExplicit = false;
+        string? mtpHeadPath = null;
         var reasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormat.Auto;
         int prefillChunkSize = 0;
         string? ropeScaling = null;
@@ -334,6 +342,8 @@ public sealed record ServerOptions
                     mtpEnabled = true; mtpExplicit = true; break;
                 case "--no-mtp":
                     mtpEnabled = false; mtpExplicit = false; break;
+                case "--mtp-head":
+                    mtpHeadPath = next; i++; break;
                 case "--reasoning-format":
                     reasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormats.Parse(next ?? ""); i++; break;
                 case "--prefill-chunk-size" or "--ubatch-size":
@@ -409,6 +419,7 @@ public sealed record ServerOptions
             SpeculativeCandidates = speculativeCandidates,
             MtpEnabled = mtpEnabled,
             MtpExplicit = mtpExplicit,
+            MtpHeadPath = mtpHeadPath,
             ReasoningFormat = reasoningFormat,
             PrefillChunkSize = prefillChunkSize,
             KeepAliveSeconds = keepAliveSeconds,

@@ -39,13 +39,6 @@ public sealed class MtpSpeculativeDecoderTests
     private const int MtpHeadDim = 4;
 
     [Fact]
-    public void Constructor_Throws_WhenNonGreedy()
-    {
-        var ex = Assert.Throws<NotSupportedException>(() => new MtpSpeculativeDecoder(greedy: false));
-        Assert.Contains("greedy", ex.Message, StringComparison.OrdinalIgnoreCase);
-    }
-
-    [Fact]
     public void DraftAndVerify_ModelWithoutMtp_Throws()
     {
         // targetFn == mtpFn is irrelevant here — SupportsMtp is what's being asserted.
@@ -306,6 +299,94 @@ public sealed class MtpSpeculativeDecoderTests
         public void Reset() { }
     }
 
+    // ── Sampled speculation (#900): exact speculative sampling against the prepared distribution ──
+
+    /// <summary>Soft target: after token t the next token is t+1 (p=0.55), t+2 (0.30) or t+3 (0.15) modulo the vocabulary.</summary>
+    private static void SoftRow(int t, Span<float> row)
+    {
+        row.Fill(float.NegativeInfinity);
+        row[(t + 1) % VocabSize] = MathF.Log(0.55f);
+        row[(t + 2) % VocabSize] = MathF.Log(0.30f);
+        row[(t + 3) % VocabSize] = MathF.Log(0.15f);
+    }
+
+    private static readonly double[] SoftP = [0.55, 0.30, 0.15];
+
+    [Fact]
+    public void SampledDraftAndVerify_EmitsTheTargetDistribution_AndActuallySpeculates()
+    {
+        // The draft is always t+1 (the modal token), so ~55% of the positions accept it and the rest are resampled from the residual. The three-token
+        // continuations of token 0 must follow the chain's exact probabilities no matter how many drafts the rounds accepted.
+        const int Trials = 30000, Len = 3;
+        var counts = new Dictionary<(int, int, int), int>();
+        int totalRounds = 0, totalTokens = 0;
+        for (int trial = 0; trial < Trials; trial++)
+        {
+            using var model = new MockMtpModel(t => 0, t => (t + 1) % VocabSize, supportsMtp: true, targetRow: SoftRow);
+            var decoder = new MtpSpeculativeDecoder();
+            var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 1.0f, Seed = 1000 + trial });
+            var seq = RunSpeculative(model, decoder, pipeline, startToken: 0, totalNewTokens: Len, k: 3, out int rounds);
+            totalRounds += rounds; totalTokens += Len;
+            var key = (seq[1], seq[2], seq[3]);
+            counts[key] = counts.GetValueOrDefault(key) + 1;
+        }
+
+        // Expected probability of a sequence: product of the per-step offsets (1..3 -> 0.55/0.30/0.15).
+        double maxErr = 0;
+        for (int a = 1; a <= 3; a++)
+        for (int b = 1; b <= 3; b++)
+        for (int c = 1; c <= 3; c++)
+        {
+            int t1 = a % VocabSize, t2 = (t1 + b) % VocabSize, t3 = (t2 + c) % VocabSize;
+            double expected = SoftP[a - 1] * SoftP[b - 1] * SoftP[c - 1];
+            double observed = counts.GetValueOrDefault((t1, t2, t3)) / (double)Trials;
+            maxErr = Math.Max(maxErr, Math.Abs(observed - expected));
+        }
+        Assert.True(maxErr < 0.012, $"max |observed - expected| over the 27 continuations = {maxErr:F4}");
+        // Path proof: with k=3 drafts and ~55% acceptance, rounds must carry well over one token each; a decoder that fell back to one
+        // token per round (the draft never consulted) would have rounds == tokens.
+        Assert.True(totalTokens / (double)totalRounds > 1.3, $"{totalTokens} tokens in {totalRounds} rounds");
+    }
+
+    [Fact]
+    public void SampledDraftAndVerify_WithZeroTemperaturePipeline_IsPlainGreedy()
+    {
+        // A greedy pipeline through the sampled-capable decoder must still reproduce plain greedy decode token for token.
+        Func<int, int> target = t => (t * 5 + 3) % VocabSize;
+        using var model = new MockMtpModel(target, t => (t * 5 + 3) % VocabSize, supportsMtp: true);
+        var decoder = new MtpSpeculativeDecoder();
+        var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
+        var plain = RunPlainGreedy(1, 24, target);
+        var spec = RunSpeculative(model, decoder, pipeline, 1, 24, 4);
+        Assert.Equal(plain, spec);
+    }
+
+    [Fact]
+    public void SampledDraftAndVerify_RepetitionPenalty_SeesTheAcceptedHistory()
+    {
+        // With a harsh repetition penalty on a greedy pipeline the plain decode never repeats a token inside the window; the speculative rounds
+        // must apply the penalty with the drafts accepted so far in the history too, or they would accept a repeated draft.
+        const int V = VocabSize;
+        Func<int, int> target = t => (t + 1) % V;
+        void Row(int t, Span<float> row) { row.Fill(0f); row[(t + 1) % V] = 3f; row[(t + 2) % V] = 2.5f; }
+        var opts = new InferenceOptions { Temperature = 0f, RepetitionPenalty = 4.0f };
+
+        // plain reference: argmax of penalised logits step by step
+        var plainSeq = new List<int> { 0 };
+        var refPipe = new SamplerPipeline(opts);
+        for (int i = 0; i < 12; i++)
+        {
+            var row = new float[V];
+            Row(plainSeq[^1], row);
+            plainSeq.Add(refPipe.Sample(row, plainSeq));
+        }
+
+        using var model = new MockMtpModel(target, t => (t + 1) % V, supportsMtp: true, targetRow: Row);
+        var decoder = new MtpSpeculativeDecoder();
+        var spec = RunSpeculative(model, decoder, new SamplerPipeline(opts), 0, 12, 3);
+        Assert.Equal(plainSeq, spec);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static List<int> RunPlainGreedy(int startToken, int totalNewTokens, Func<int, int> targetFn)
@@ -371,6 +452,7 @@ public sealed class MtpSpeculativeDecoderTests
         private readonly Func<int, int> _mtpFn;
         private readonly bool _supportsMtp;
         private readonly Action<int, Span<float>>? _draftRow;
+        private readonly Action<int, Span<float>>? _targetRow;
         private readonly bool _supportsArgMax;
 
         /// <param name="targetFn">Trunk argmax for an input token.</param>
@@ -382,8 +464,10 @@ public sealed class MtpSpeculativeDecoderTests
         /// independent first-maximum scan — the device kernel's contract — instead of TensorPrimitives.
         /// </param>
         public MockMtpModel(Func<int, int> targetFn, Func<int, int> mtpFn, bool supportsMtp,
-                            Action<int, Span<float>>? draftRow = null, bool supportsArgMax = false)
+                            Action<int, Span<float>>? draftRow = null, bool supportsArgMax = false,
+                            Action<int, Span<float>>? targetRow = null)
         {
+            _targetRow = targetRow;
             _targetFn = targetFn;
             _mtpFn = mtpFn;
             _supportsMtp = supportsMtp;
@@ -487,6 +571,7 @@ public sealed class MtpSpeculativeDecoderTests
             for (int t = 0; t < batchSize; t++)
             {
                 var row = new Span<float>(dst + (long)t * VocabSize, VocabSize);
+                if (_targetRow is not null) { _targetRow(tokenIds[t], row); continue; }
                 row.Fill(-10f);
                 row[_targetFn(tokenIds[t])] = 10f;
             }

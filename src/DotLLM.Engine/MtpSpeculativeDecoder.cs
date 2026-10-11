@@ -18,24 +18,13 @@ namespace DotLLM.Engine;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Greedy-only, matching both this project's existing gate and llama.cpp's own current MTP
-/// maturity.</b> <see cref="SpeculativeDecoder"/> already restricts probabilistic (modified
-/// rejection sampling) acceptance to a future change (issue #121) because <c>q</c>/<c>p</c> must
-/// come from the same post-transform distribution the sampler pipeline actually draws from. MTP
-/// inherits that same constraint AND, independently, llama.cpp's own merged MTP draft
-/// implementation (<c>common_speculative_state_draft_mtp::draft()</c>, PR
-/// ggml-org/llama.cpp#22673) currently hardcodes <c>sparams.top_k = 1</c> for the MTP head's own
-/// sampler with an explicit <c>// TODO: re-enable top_k == 10 and utilize p_min spec param</c> —
-/// i.e. upstream's own MTP draft is greedy-argmax today too. This decoder matches that: it throws
-/// for <c>greedy: false</c> for the same reason <see cref="SpeculativeDecoder"/> does.
-/// </para>
-/// <para>
-/// <b>Distributional correctness.</b> In greedy mode the accepted sequence is identical to what
-/// argmax-decoding the target model (without MTP) would produce: every accepted or corrected
-/// token in <c>outputBuffer</c> is always the target model's OWN argmax at that position (MTP
-/// never gets to inject a token the target didn't independently agree with) — see
-/// <c>MtpSpeculativeDecoderTests</c> for the test that demonstrates token-for-token equivalence
-/// against plain greedy decode of the same (synthetic) model.
+/// <b>Greedy and sampled.</b> The draft is always the head's argmax (a point mass), so exact speculative sampling is cheap: a draft <c>d</c> at a
+/// verify row with prepared distribution <c>p</c> (processors, temperature, top-k/p/min-p applied by the <see cref="SamplerPipeline"/>) is accepted with
+/// probability <c>p(d)</c>, and a rejected position is resampled from <c>p</c> with <c>d</c> removed and renormalised; the all-accepted bonus row is
+/// sampled from its <c>p</c>. Every emitted token is then distributed exactly as the target alone would sample it (for <c>x != d</c>:
+/// <c>(1 - p(d)) * p(x) / (1 - p(d)) = p(x)</c>). With a greedy pipeline this degenerates to accept-iff-argmax and the accepted sequence is identical
+/// to argmax-decoding the target without MTP; <c>MtpSpeculativeDecoderTests</c> checks both token-for-token and distributionally.
+/// A sampled run is NOT bit-reproducible against the same seed with MTP off (different random draws), only equal in distribution.
 /// </para>
 /// <para>
 /// <b>One trunk forward per round, matching llama.cpp's <c>draft-mtp</c> (issue #469).</b> The
@@ -72,8 +61,6 @@ namespace DotLLM.Engine;
 /// </remarks>
 public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
 {
-    private readonly bool _greedy;
-
     /// <summary>Env switch that forces checkpoint + replay even on snapshot-capable models.</summary>
     internal const string DisableRowSnapshotsEnvVar = "DOTLLM_MTP_GDN_SNAPSHOTS";
 
@@ -109,18 +96,12 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
     /// <summary>
     /// Creates a new MTP self-speculative decoder.
     /// </summary>
-    /// <param name="greedy">Must be <c>true</c> — see the greedy-only remarks on this type.</param>
-    /// <exception cref="NotSupportedException">Thrown when <paramref name="greedy"/> is <c>false</c>.</exception>
-    public MtpSpeculativeDecoder(bool greedy)
+    /// <param name="greedy">Kept for source compatibility. The decoder follows the <see cref="SamplerPipeline"/> it is given: a greedy pipeline
+    /// accepts a draft iff it is the target's argmax (output identical to plain greedy decode); a stochastic one accepts with probability
+    /// <c>p(draft)</c> and resamples a rejected position from the residual, so the output is distributed exactly as plain sampling (#900).</param>
+    public MtpSpeculativeDecoder(bool greedy = true)
     {
-        if (!greedy)
-        {
-            throw new NotSupportedException(
-                "Probabilistic MTP self-speculative decoding is not yet distributionally correct " +
-                "under the sampler pipeline, and llama.cpp's own merged MTP draft implementation is " +
-                "greedy-only today too (top_k=1, see the type remarks). Use greedy mode.");
-        }
-        _greedy = greedy;
+        _ = greedy;
     }
 
     /// <inheritdoc/>
@@ -151,6 +132,7 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
 
         int lastToken = generatedIds[^1];
 
+        long roundStart = Stopwatch.GetTimestamp();
         long draftTicks = 0;
         long verifyTicks = 0;
 
@@ -247,23 +229,57 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
 
             int accepted = 0;       // drafts accepted
             int acceptedCount = 0;  // tokens written to outputBuffer (accepted drafts + correction/bonus)
+            // Penalty processors read the generated history: every emitted token joins it for the next row (a row is only reached when the
+            // drafts before it were accepted, so the history is exactly the sequence plain decoding would have had). Removed again below.
+            int historyBase = generatedIds.Count;
+            bool stochastic = pipeline.IsStochastic;
             unsafe
             {
                 nint basePtr = targetLogits.DataPointer;
-                for (int row = 0; row <= k; row++)
+                try
                 {
-                    var rowLogits = new Span<float>(
-                        (void*)(basePtr + (long)row * vocabSize * sizeof(float)), vocabSize);
-                    if (constraint != null)
-                        TokenMaskApplier.Apply(rowLogits, constraint.GetAllowedTokens());
-                    int targetArgmax = TensorPrimitives.IndexOfMax((ReadOnlySpan<float>)rowLogits);
+                    for (int row = 0; row <= k; row++)
+                    {
+                        var rowLogits = new Span<float>(
+                            (void*)(basePtr + (long)row * vocabSize * sizeof(float)), vocabSize);
+                        if (constraint != null)
+                            TokenMaskApplier.Apply(rowLogits, constraint.GetAllowedTokens());
 
-                    outputBuffer[acceptedCount++] = targetArgmax;
-                    constraint?.Advance(targetArgmax);
+                        int emitted;
+                        bool draftHeld;
+                        if (!stochastic && !pipeline.HasProcessors)
+                        {
+                            // Plain greedy: the target's own argmax (the path every earlier version took, bit for bit).
+                            emitted = TensorPrimitives.IndexOfMax((ReadOnlySpan<float>)rowLogits);
+                            draftHeld = row < k && draftTokens[row] == emitted;
+                        }
+                        else
+                        {
+                            pipeline.PrepareDistribution(rowLogits, generatedIds);
+                            if (row == k)
+                            {
+                                emitted = pipeline.SamplePrepared(rowLogits);   // every draft held: the bonus token
+                                draftHeld = false;
+                            }
+                            else
+                            {
+                                draftHeld = pipeline.TryAcceptDraft(rowLogits, draftTokens[row], out emitted);
+                            }
+                        }
 
-                    if (row == k || draftTokens[row] != targetArgmax)
-                        break;      // correction (or bonus): the target's own token ends the round
-                    accepted++;
+                        outputBuffer[acceptedCount++] = emitted;
+                        constraint?.Advance(emitted);
+                        generatedIds.Add(emitted);
+
+                        if (!draftHeld)
+                            break;      // correction (or bonus): the target's own token ends the round
+                        accepted++;
+                    }
+                }
+                finally
+                {
+                    if (generatedIds.Count > historyBase)
+                        generatedIds.RemoveRange(historyBase, generatedIds.Count - historyBase);
                 }
             }
 
@@ -296,7 +312,7 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
                     deviceId: -1, kvCacheTarget, adapter: null, mtpState: null);
             }
 
-            return new SpeculativeResult(acceptedCount, draftTicks, verifyTicks, k);
+            return new SpeculativeResult(acceptedCount, draftTicks, verifyTicks, k, Stopwatch.GetTimestamp() - roundStart);
         }
         finally
         {

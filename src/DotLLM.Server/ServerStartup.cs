@@ -473,6 +473,10 @@ public static class ServerStartup
         bool schedulerAvailable = (vulkanKvFactory is not null && !string.Equals(vkSchedEnvForMtp, "0", StringComparison.Ordinal))
             || pagedFactory is not null;
         bool concurrencyOverMtp = options.MtpEnabled && options.ExpectedConcurrency >= 5 && schedulerAvailable;
+        // qwen4exp ships its draft head as a separate mtp-*.gguf (#820): attach it when MTP can engage (same rules as DecideMtp) so the default-on
+        // serve path actually speculates; a head that does not fit the device is declined with a message, never fatal.
+        if (options.MtpEnabled && !concurrencyOverMtp && draftModel is null && !model.SupportsMtp)
+            TryAttachSeparateMtpHead(model, resolvedPath, options);
         var mtpDecision = DecideMtp(options, model.SupportsMtp, draftModel is not null, concurrencyOverMtp, schedulerAvailable);
         bool mtpActive = mtpDecision.Active;
         if (mtpDecision.Message is { } mtpMsg)
@@ -576,6 +580,38 @@ public static class ServerStartup
             EstimatedBytes = estimatedBytes,
             LastUsedUtc = DateTimeOffset.UtcNow,
         };
+    }
+
+    /// <summary>
+    /// Attaches a separate MTP head GGUF (qwen4exp) to <paramref name="model"/>: an explicit <c>--mtp-head</c> always, an auto-detected sibling only when
+    /// the trunk is big enough for self-speculation to beat plain decode (measured per quantisation, see <see cref="Qwen4ExpMtpHeadResolver"/>).
+    /// Failure to attach (no room on the device, bad tensor table) is reported and serving continues without speculation.
+    /// </summary>
+    internal static void TryAttachSeparateMtpHead(IModel model, string resolvedPath, ServerOptions options)
+    {
+        if (model is not IMtpHeadAttachable) return;
+        try
+        {
+            string? headPath = options.MtpHeadPath;
+            if (headPath is null)
+            {
+                headPath = Qwen4ExpMtpHeadResolver.Find(resolvedPath);
+                if (headPath is null) return;
+                long trunk = ModelResolver.FileLength(resolvedPath);
+                if (!Qwen4ExpMtpHeadResolver.ShouldAutoAttach(trunk))
+                {
+                    Console.WriteLine($"[dotllm] MTP: head {Path.GetFileName(headPath)} found but not attached - a {trunk / (double)(1L << 30):F0} GiB trunk measures slower with " +
+                                      "speculation than without (--mtp-head <path> forces it).");
+                    return;
+                }
+            }
+            Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, headPath);
+            Console.WriteLine($"[dotllm] MTP: attached head {Path.GetFileName(headPath)}.");
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            Console.WriteLine($"[dotllm] MTP: head not attached ({ex.GetType().Name}: {ex.Message}); decoding without speculation.");
+        }
     }
 
     /// <summary>Outcome of the serve-time MTP policy: whether it engages, the startup log line (null = stay quiet), and a short /props status.</summary>
