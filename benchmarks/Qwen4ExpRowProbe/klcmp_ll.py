@@ -5,10 +5,12 @@ usage: klcmp_ll.py <prefix> <llama.bin> <vocab> [refIsLlama=0]
 llama-perplexity saves log-probs (uint16-quantised per row) for the SECOND HALF of each window only (positions n_ctx/2 .. n_ctx-2).
 Prints per-bucket mean KL(ours||llama) (or KL(llama||ours) with refIsLlama=1) over our sampled positions inside that range.
 
-CAVEATS (measured on the 8192-token held-out window, #873): (1) llama.cpp tokenizes the text file ITSELF; it matched dotLLM's ids only for the
-first 2005 tokens, so comparisons are valid ONLY for positions below the first token mismatch (use -c 2048 and positions < 2004; the 8192-token
-file's second half is a different token stream). (2) The record offset is empirical: argmax agreement fixes SHIFT (record r holds position
-first - SHIFT + r), it is not derived from the format. Re-fit it with a fresh agreement scan for every new file.
+CAVEATS (#873): (1) llama.cpp tokenizes the text file ITSELF. On the 8192-token held-out window it matched dotLLM's ids only for the first 2005
+tokens (it then splits some text differently), so a comparison is valid ONLY at positions below the first token mismatch: use a window whose
+scored half lies below it (-c 2048, positions 1024..2003, which is what the #873 numbers use, n=61) and check `toks != ids` first.
+(2) The record offset is empirical, not derived from the format: SHIFT is the number of records by which the file is offset from
+`first = n_ctx/2`. For the matched 2048 window it is 0 (argmax agreement 27/30); on the mismatched 8192 file a "fit" of 4 and later 8 is only
+the token-stream offset, and is meaningless. Re-fit with an argmax-agreement scan for every new file and pass LL_SHIFT / LL_PMAX explicitly.
 """
 import os
 import sys
@@ -22,8 +24,8 @@ n_ctx, n_vocab, n_chunk = np.frombuffer(raw.read(12), dtype=np.int32)
 assert n_vocab == vocab, (n_vocab, vocab)
 toks = np.frombuffer(raw.read(4 * n_ctx * n_chunk), dtype=np.int32)
 first = n_ctx // 2
-SHIFT = int(os.environ.get('LL_SHIFT', '4'))   # empirical record offset (see caveats); 8192-window fit: 4
-PMAX = int(os.environ.get('LL_PMAX', '7600'))    # last position known to share the token stream with dotLLM's ids
+SHIFT = int(os.environ['LL_SHIFT'])   # empirical record offset (see caveats); required, no default
+PMAX = int(os.environ['LL_PMAX'])     # last position known to share the token stream with dotLLM's ids; required, no default
 nrec = n_ctx - 1 - first
 nv = 2 * ((vocab + 1) // 2) + 4  # uint16 units per record
 rec = np.memmap(llf, dtype=np.uint16, mode="r", offset=raw.tell()).reshape(-1, nv)[:nrec]

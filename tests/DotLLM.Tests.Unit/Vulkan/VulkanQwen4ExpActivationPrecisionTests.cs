@@ -75,6 +75,7 @@ public sealed class VulkanQwen4ExpActivationPrecisionTests(ITestOutputHelper out
 
         output.WriteLine($"mean KL over {prompts} prompts: prefill vs quantized-act oracle {prefillVsQ / prompts:E3}, vs F32-act oracle {prefillVsF / prompts:E3}; " +
                          $"decode vs quantized-act {decodeVsQ / prompts:E3}, vs F32-act {decodeVsF / prompts:E3}");
+        Assert.True(prefillVsQ / prompts > 1e-5, "the quantized-activation oracle must be measurably away from the prefill (otherwise the comparison is two noise values)");
         Assert.True(prefillVsF < 0.5 * prefillVsQ,
             $"a >= 9-row Vulkan prefill must be markedly closer to the unquantized-activation oracle ({prefillVsF:E3}) than to the quantized one ({prefillVsQ:E3})");
     }

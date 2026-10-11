@@ -705,8 +705,8 @@ not a position effect. Three confounds made it look like drift:
    | Vulkan decode | .019\|.016 | .028\|.046 | .030\|.047 | .015\|.024 | - | .016\|.015 | .025\|.032 | .025\|.029 |
    | Vulkan 512 rows | .022\|.033 | .006\|.009 | .009\|.016 | .022\|.035 | .026\|.031 | .024\|.030 | .008\|.010 | - |
 
-   Only the F32 activations of the **dense** projections (Q8_0 gated-residual/attention/GDN) move the oracle into the prefill cluster;
-   the MoE experts' activation quantization does not. Within a cluster KL is 0.005-0.019; across clusters 0.02 (dense regime) to 0.04-0.05
+   The F32 activations of the **dense** projections (Q8_0 gated-residual/attention/GDN) are the lever that moves the oracle into the prefill
+   cluster; the MoE experts' activation quantization contributes far less (dense-only is 0.009|0.016 from Vulkan prefill, both 0.006|0.009). Within a cluster KL is 0.005-0.019; across clusters 0.02 (dense regime) to 0.04-0.05
    (sparse regime, where the top-512 block selection of the QSA indexer flips on near-ties).    The causal swap on the Vulkan side is one switch: 8-row chunks with `DOTLLM_VK_SMALLROW_GEMV=0` (the dense projections take the
    unquantized-activation GEMM instead of the Q8_1 multi-column MMVQ) move from cluster 1 to cluster 2: KL vs the oracle 0.016 -> 0.028,
    vs the F32-act oracle 0.033 -> 0.010 (cumulative over 8192 positions). The coopmat/MMQ/grouped-MoE/f16 switches, the GDN scan
