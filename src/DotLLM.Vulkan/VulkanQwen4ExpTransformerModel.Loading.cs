@@ -232,7 +232,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
                 ple = BuildPleBranch(gguf, tensors, config, q4, pc, pleLayer, owned);
                 using var pleStaging = VulkanStagingBuffer.Create(device, 64L << 20);
                 pleGpu = VulkanQwen4ExpPleGpu.Upload(device, pleStaging, gguf, $"blk.{pleLayer}.ple_key.weight", $"blk.{pleLayer}.ple_value.weight",
-                    q4.HyperConnectionCount * config.HiddenSize);
+                    q4.HyperConnectionCount * config.HiddenSize, Qwen4ExpResidencyPlan.PlannedRows(kvCapacity));
             }
 
             gr = Qwen4ExpGatedResidualKernel.Create(device, spvDir);

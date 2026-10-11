@@ -486,7 +486,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         if (NgramPrefetch) _ple?.BeginPrefetch(tokenIds, state.Ple!);   // #822: the n-gram rows depend only on token ids - start paging the table in before layer 0
         // #885: the PLE key/value projections need only the token ids: run them on the GPU ahead of layer 0 (short forwards), so the host step
         // between layer 0 and layer 1 is just the residual-dependent remainder (no 131 MB F32 CPU GEMM).
-        bool pleOnGpu = _ple is not null && _pleGpu is not null && PleOnGpu && T <= VulkanQwen4ExpPleGpu.MaxRows;
+        bool pleOnGpu = _ple is not null && _pleGpu is not null && PleOnGpu && T <= _pleGpu.MaxRows;
         if (pleOnGpu) { RecordPleProjections(cmd, tokenIds, state.Ple!, T); PleGpuForwards++; }
         RecordEmbedding(cmd, tokenIds);
         Barrier();
@@ -654,8 +654,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     }
 
     /// <summary>
-    /// Short forwards run the n-gram key/value projections on the GPU (#885, ~4 ms of a ~57 ms decode step). On by default;
-    /// <c>DOTLLM_VK_Q4E_PLE_GPU=0</c> at startup (or setting this) restores the all-host branch. Read at the top of every forward.
+    /// Forwards run the n-gram key/value projections on the GPU (#885: ~4 ms of a ~57 ms decode step; #896: prefill chunks too - the CPU F32 GEMM
+    /// was ~0.75 s of every 1024-row chunk). On by default; <c>DOTLLM_VK_Q4E_PLE_GPU=0</c> at startup (or setting this) restores the all-host
+    /// branch. Read at the top of every forward.
     /// </summary>
     public static bool PleOnGpu { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_PLE_GPU") != "0";
 

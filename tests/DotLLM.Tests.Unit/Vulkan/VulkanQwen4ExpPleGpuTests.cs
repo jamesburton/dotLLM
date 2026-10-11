@@ -5,7 +5,7 @@ using Xunit.Abstractions;
 namespace DotLLM.Tests.Unit.Vulkan;
 
 /// <summary>
-/// The GPU-side PLE key/value projections of short qwen4exp forwards (#885): the token-only half of the n-gram branch runs ahead of layer 0
+/// The GPU-side PLE key/value projections of qwen4exp forwards (#885 decode, prefill chunks too): the token-only half of the n-gram branch runs ahead of layer 0
 /// on the GPU instead of as a CPU GEMM between layer 0 and layer 1. Must stay oracle-close, must measurably take the path, and the
 /// opt-out switch must restore the all-host branch.
 /// </summary>
@@ -34,6 +34,7 @@ public sealed class VulkanQwen4ExpPleGpuTests
     [InlineData(1)]
     [InlineData(5)]
     [InlineData(9)]
+    [InlineData(27)]   // one forward over the whole prompt: > 16 rows also takes the per-half-layer submit path
     public void ShortForwards_ProjectPleOnGpu_AndStayOracleClose(int rows)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -50,8 +51,7 @@ public sealed class VulkanQwen4ExpPleGpuTests
             gpu = Chunked(rig, ids, rows, out int fwds);
             long taken = rig.Vk.PleGpuForwards - b0;
             _out.WriteLine($"rows {rows}: {taken}/{fwds} forwards projected PLE on the GPU");
-            if (rows <= 8) Assert.Equal(fwds, taken);   // every short forward takes it
-            else Assert.Equal(0, taken);                // 9-row chunks are the all-host branch
+            Assert.Equal(fwds, taken);   // every forward takes it, prefill chunks (> 8 rows) included: no CPU F32 GEMM left
 
             VulkanQwen4ExpTransformerModel.PleOnGpu = false;
             long b1 = rig.Vk.PleGpuForwards;
@@ -66,7 +66,6 @@ public sealed class VulkanQwen4ExpPleGpuTests
         _out.WriteLine($"rows {rows}: gpu-PLE vs CPU relL2 {gRel:E3} KL {gKl:E3}; host-PLE vs CPU relL2 {hRel:E3} KL {hKl:E3}; gpu vs host relL2 {aRel:E3} KL {aKl:E3}");
         Assert.True(gRel < 0.08 && gKl < 0.02, $"GPU-PLE path off the oracle: relL2 {gRel:E3}, KL {gKl:E3}");
         Assert.True(aRel < 0.02 && aKl < 0.005, $"GPU-PLE path diverges from the host branch: relL2 {aRel:E3}, KL {aKl:E3}");
-        if (rows <= 8)
-            Assert.True(aRel > 0, "perturbation inert: the GPU projections produced bit-identical logits to the host GEMM");
+        Assert.True(aRel > 0, "perturbation inert: the GPU projections produced bit-identical logits to the host GEMM");
     }
 }
