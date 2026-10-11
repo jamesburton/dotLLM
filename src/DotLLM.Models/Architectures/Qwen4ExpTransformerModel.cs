@@ -415,6 +415,11 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IModel
 
     private static void Gemm(nint weights, QuantizationType qt, float* b, float* c, int m, int k, int n, ComputeThreadPool? pool)
     {
+        if (MoeSwiGluMlp.DiagF32ActivationsDense && qt is not (QuantizationType.F32 or QuantizationType.F16))
+        {
+            MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, pool);   // diagnostic F32-activation control (#873)
+            return;
+        }
         switch (qt)
         {
             case QuantizationType.Q8_0: MatMul.GemmQ8_0((byte*)weights, b, c, m, k, n, pool, null); return;
@@ -778,8 +783,27 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IModel
     };
 
     /// <summary>512-expert softmax MoE: router softmax over ALL experts → top-k → renormalise; routed experts + shared expert × sigmoid(gate).</summary>
+    /// <summary>
+    /// Diagnostic (#873): relative noise amplitude injected into every MoE-layer input before routing (default 0 = off).
+    /// A deterministic per-element factor <c>1 + eps * u</c>, <c>u</c> in [-1, 1], so two runs with different eps/seed measure how far
+    /// a perturbation of that size moves the logits (the implementation-independent noise floor of the model). Not a production switch.
+    /// </summary>
+    public static float DiagMoeInputNoise { get; set; } = float.TryParse(Environment.GetEnvironmentVariable("DOTLLM_Q4E_DIAG_NOISE"), System.Globalization.NumberStyles.Float,
+        System.Globalization.CultureInfo.InvariantCulture, out float dn) ? dn : 0f;
+
     private void ForwardMoe(MoeLayerWeights moe, int layer, float[] x, float[] y, int T)
     {
+        if (DiagMoeInputNoise != 0f)
+        {
+            var xn = new float[x.Length];
+            uint seed = 2463534242u ^ (uint)layer * 2654435761u;
+            for (int i = 0; i < T * _hidden; i++)
+            {
+                uint h = seed + (uint)i * 2246822519u; h ^= h >> 15; h *= 2246822519u; h ^= h >> 13; h *= 3266489917u; h ^= h >> 16;
+                xn[i] = x[i] * (1f + DiagMoeInputNoise * ((h >> 8) * (2f / 16777216f) - 1f));
+            }
+            x = xn;
+        }
         int ne = moe.NumExperts, k = moe.NumExpertsPerTok, H = _hidden, inter = moe.IntermediateSize, total = T * k;
         int[] assignExpert = ArrayPool<int>.Shared.Rent(total);
         float[] assignWeight = ArrayPool<float>.Shared.Rent(total);

@@ -983,6 +983,16 @@ public static unsafe partial class MoeSwiGluMlp
     }
 
     /// <summary>
+    /// Diagnostic (#873): when true every quantized expert GEMM dequantizes the weights to F32 and dots them with the UNQUANTIZED F32
+    /// activations (no Q8_K/Q8_0 activation quantization) - the "F32-decoded control" that separates activation-quantization noise from
+    /// everything else. Slow; default off (env <c>DOTLLM_Q4E_DIAG_F32ACT=1</c>).
+    /// </summary>
+    public static bool DiagF32Activations { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_Q4E_DIAG_F32ACT") is "1" or "moe";
+
+    /// <summary>Diagnostic (#873): same control for the NON-expert projections (<c>DOTLLM_Q4E_DIAG_F32ACT=1</c> or <c>dense</c>); consulted by the qwen4exp model's dense GEMM.</summary>
+    public static bool DiagF32ActivationsDense { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_Q4E_DIAG_F32ACT") is "1" or "dense";
+
+    /// <summary>
     /// Dispatch one weight-quant-typed GEMM <c>C[N,M] = B[N,K] × A[M,K]^T</c>. Routes to
     /// the matching <c>MatMul.GemmQX</c> kernel for supported quant types, falls back to
     /// per-row dequant + <see cref="TensorPrimitives.Dot"/> for everything else.
@@ -992,6 +1002,11 @@ public static unsafe partial class MoeSwiGluMlp
         QuantizationType qt, nint weights, float* b, float* c,
         int m, int k, int n, byte* preQuantizedInput, ComputeThreadPool? pool)
     {
+        if (DiagF32Activations && qt is not (QuantizationType.F32 or QuantizationType.F16))
+        {
+            MatMul.GemmDequantRows((byte*)weights, qt, b, c, m, k, n, pool);
+            return;
+        }
         switch (qt)
         {
             case QuantizationType.F32:
