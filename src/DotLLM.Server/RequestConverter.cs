@@ -292,6 +292,25 @@ public static class RequestConverter
     }
 
     /// <summary>
+    /// Converts engine tool calls to streaming deltas with distinct, zero-based indexes.
+    /// </summary>
+    public static StreamingToolCallDto[] ToStreamingToolCallDtos(ToolCall[] toolCalls)
+    {
+        var calls = ToToolCallDtos(toolCalls);
+        var result = new StreamingToolCallDto[calls.Length];
+        for (int i = 0; i < calls.Length; i++)
+        {
+            result[i] = new StreamingToolCallDto
+            {
+                Index = i,
+                Id = calls[i].Id,
+                Function = calls[i].Function,
+            };
+        }
+        return result;
+    }
+
+    /// <summary>
     /// Generates a unique request ID in the OpenAI format.
     /// </summary>
     public static string GenerateRequestId() => $"chatcmpl-{Guid.NewGuid():N}";

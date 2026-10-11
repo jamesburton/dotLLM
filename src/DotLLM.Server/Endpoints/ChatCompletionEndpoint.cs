@@ -588,7 +588,7 @@ public static class ChatCompletionEndpoint
 
         // Final chunk with finish_reason
         var finalDelta = toolCalls is { Length: > 0 }
-            ? new ChatDeltaDto { ToolCalls = RequestConverter.ToToolCallDtos(toolCalls) }
+            ? new ChatDeltaDto { ToolCalls = RequestConverter.ToStreamingToolCallDtos(toolCalls) }
             : new ChatDeltaDto();
 
         int promptTokens = timings?.PrefillTokenCount ?? 0;
