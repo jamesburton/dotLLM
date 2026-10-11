@@ -71,6 +71,45 @@ public sealed class OpenAiStreamingToolCallTests
     }
 
     [Fact]
+    public async Task ParallelCalls_HaveDistinctStreamIndexes_AndPreserveArguments()
+    {
+        var r = await RunAsync(
+            ["<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n</function>\n</tool_call>\n",
+             "<tool_call>\n<function=get_weather>\n<parameter=city>London</parameter>\n</function>\n</tool_call>"],
+            new QwenXmlToolCallParser());
+
+        Assert.Equal("tool_calls", r.FinishReason);
+        var calls = r.FinalToolCalls!.Value;
+        Assert.Equal(2, calls.GetArrayLength());
+        for (int i = 0; i < calls.GetArrayLength(); i++)
+        {
+            Assert.Equal(i, calls[i].GetProperty("index").GetInt32());
+            Assert.Equal("function", calls[i].GetProperty("type").GetString());
+            Assert.Equal("get_weather", calls[i].GetProperty("function").GetProperty("name").GetString());
+            var arguments = JsonDocument.Parse(calls[i].GetProperty("function").GetProperty("arguments").GetString()!).RootElement;
+            Assert.Equal(i == 0 ? "Paris" : "London", arguments.GetProperty("city").GetString());
+        }
+        Assert.NotEqual(calls[0].GetProperty("id").GetString(), calls[1].GetProperty("id").GetString());
+        if (Environment.GetEnvironmentVariable("DOTLLM_STREAM_INDEX_CAPTURE") is { } capture)
+            await File.WriteAllTextAsync(capture, r.Raw);
+    }
+
+    [Fact]
+    public void NonstreamToolCalls_DoNotContainStreamIndexes()
+    {
+        var calls = RequestConverter.ToToolCallDtos([new ToolCall("call_0", "get_weather", "{\"city\":\"Paris\"}")]);
+        var response = new ChatCompletionResponse
+        {
+            Id = "req_1", Model = "m", Usage = new UsageDto(),
+            Choices = [new ChatChoiceDto { Message = new ChatMessageDto { Role = "assistant", ToolCalls = calls }, FinishReason = "tool_calls" }],
+        };
+        var json = JsonSerializer.SerializeToElement(response, ServerJsonContext.Default.ChatCompletionResponse);
+        var call = json.GetProperty("choices")[0].GetProperty("message").GetProperty("tool_calls")[0];
+        Assert.False(call.TryGetProperty("index", out _));
+        Assert.Equal("{\"city\":\"Paris\"}", call.GetProperty("function").GetProperty("arguments").GetString());
+    }
+
+    [Fact]
     public async Task QwenXml_CallIsNotLeakedAsContent_AndFinalChunkCarriesToolCalls()
     {
         var r = await RunAsync(
@@ -81,6 +120,7 @@ public sealed class OpenAiStreamingToolCallTests
         Assert.DoesNotContain("<function", r.Content);
         Assert.Equal("tool_calls", r.FinishReason);
         var call = Assert.Single(r.FinalToolCalls!.Value.EnumerateArray().ToArray());
+        Assert.Equal(0, call.GetProperty("index").GetInt32());
         Assert.Equal("get_weather", call.GetProperty("function").GetProperty("name").GetString());
         // arguments is a JSON string; days is coerced to an integer by the schema.
         var args = JsonDocument.Parse(call.GetProperty("function").GetProperty("arguments").GetString()!).RootElement;
