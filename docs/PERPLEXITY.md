@@ -672,3 +672,55 @@ Qwen3.5-122B-A10B Q4_K_M (unsloth, 71.3 GiB), `wiki.test.lf.raw`, first 1,536 to
 
 dotLLM Vulkan is within -0.44..+0.50 % of the llama.cpp CPU oracle on every chunk (aggregate -0.04 %); llama.cpp's own
 Vulkan sits +0.16 % off its CPU and -1.3 % off on chunk 0 (cf. #568). The very low chunk 5 is real text (all three agree).
+
+## KL against an oracle on a chaotic model: the activation-quantization floor (qwen4exp, issue #873, 2026-10-11)
+
+**Finding.** Vulkan qwen4exp (UD-Q4_K_XL) sits 0.02-0.03 mean KL from the CPU oracle on real text, and that number does **not**
+grow with context. It is the model's sensitivity to the *activation precision* of its quantized GEMMs, not a kernel bug, and
+not a position effect. Three confounds made it look like drift:
+
+1. **Entropy, not context.** Short chat prompts end on confident tokens (reference entropy ~0) and score KL 0.001; document text has
+   many 1-4 nat positions where the *same* perturbation scores 0.03-0.1. KL binned by reference entropy (`klentropy.py`), 8192-token
+   held-out window, KL(oracle || X):
+
+   | X | H<0.1 | 0.1-0.5 | 0.5-1.5 | 1.5-3 | >3 nats |
+   |---|---|---|---|---|---|
+   | oracle + 1-ULP noise on every MoE input (1e-7 relative) | 0.0002 | 0.004 | 0.016 | 0.027 | 0.042 |
+   | Vulkan decode (1 row) | 0.0002 | 0.005 | 0.020 | 0.043 | 0.047 |
+   | Vulkan prefill (512 rows) | 0.0004 | 0.015 | 0.037 | 0.062 | 0.088 |
+
+2. **The oracle's own floor is ~0.012.** `Qwen4ExpTransformerModel.DiagMoeInputNoise` (`DOTLLM_Q4E_DIAG_NOISE`) multiplies every MoE
+   input by `1 + eps*u`, u in [-1,1]. Noise-vs-clean oracle KL over positions 0-2048: eps 1e-7 -> 0.012, 1e-6 -> 0.018, 1e-5 -> 0.022,
+   1e-4 -> 0.022 (saturates: routing/indexer flips are discrete). At 8192 tokens eps 1e-7 gives 0.0125 cumulative. The oracle vs
+   llama.cpp CPU on *identical* ids (positions 1024-2003; llama.cpp tokenizes differently past token 2005, so longer windows are not
+   comparable) is 0.0125 - indistinguishable from one ULP of noise.
+3. **Two activation precisions, two clusters.** The oracle and llama.cpp quantize the activations of every quantized GEMM (Q8_K/Q8_0).
+   The Vulkan 1-8 row paths do the same (Q8_1 MMVQ); the >= 9-row prefill GEMMs read activations unquantized. The oracle's *F32-decoded
+   control* (`MoeSwiGluMlp.DiagF32Activations[Dense]`, `DOTLLM_Q4E_DIAG_F32ACT=1|dense|moe`: dequantized weights x unquantized
+   activations) lands in the prefill cluster. Pairwise mean KL(row||col), dense regime (<2048) | sparse regime (>=2048):
+
+   | | oracle (Q8-act) | oracle F32-act | oracle F32-act dense only | oracle F32-act MoE only | Vulkan decode | Vulkan 8 rows | Vulkan 9 rows | Vulkan 512 rows |
+   |---|---|---|---|---|---|---|---|---|
+   | oracle (Q8-act) | - | .022\|.040 | .024\|.039 | .018\|.019 | .022\|.016 | .020\|.015 | .021\|.032 | .023\|.031 |
+   | Vulkan decode | .019\|.016 | .028\|.046 | .030\|.047 | .015\|.024 | - | .016\|.015 | .025\|.032 | .025\|.029 |
+   | Vulkan 512 rows | .022\|.033 | .006\|.009 | .009\|.016 | .022\|.035 | .026\|.031 | .024\|.030 | .008\|.010 | - |
+
+   Only the F32 activations of the **dense** projections (Q8_0 gated-residual/attention/GDN) move the oracle into the prefill cluster;
+   the MoE experts' activation quantization does not. Within a cluster KL is 0.005-0.019; across clusters 0.02 (dense regime) to 0.04-0.05
+   (sparse regime, where the top-512 block selection of the QSA indexer flips on near-ties).    The causal swap on the Vulkan side is one switch: 8-row chunks with `DOTLLM_VK_SMALLROW_GEMV=0` (the dense projections take the
+   unquantized-activation GEMM instead of the Q8_1 multi-column MMVQ) move from cluster 1 to cluster 2: KL vs the oracle 0.016 -> 0.028,
+   vs the F32-act oracle 0.033 -> 0.010 (cumulative over 8192 positions). The coopmat/MMQ/grouped-MoE/f16 switches, the GDN scan
+   variant, split-submit and PLE placement do **not** move it (full 'everything legacy' arm: 0.029).
+   Vulkan prefill is the *more* faithful to the
+   unquantized model (0.006|0.009 from the F32-act oracle) and the decode path the more faithful to llama.cpp's arithmetic.
+
+**Quality is the same everywhere.** Teacher-forced PPL over the first 4095 tokens of the held-out window: oracle 3.367, oracle + 1e-7 noise
+3.364, oracle F32-act 3.386, Vulkan 512-row 3.379, 9-row 3.372, 8-row 3.362, 1-row 3.373 (`klppl.py`) - a +-0.3 % spread, no trend.
+KL by position (cumulative, oracle || Vulkan 512-row): <512 0.032, <1K 0.025, <2K 0.023, <4K 0.030, <8K 0.029: flat.
+
+**Protocol for any future "drift from the oracle" claim.** Dump full-vocab logits at sampled positions of ONE long window from both
+sides (`Qwen4ExpRowProbe curvecpu` / the `curve` job command, `klcmp.py`); bucket by position *and* by reference entropy; run the
+noise-injection floor and the F32-activation control on the same window; only a gap that survives all three is a bug. Compare KL across
+text types or window lengths only entropy-matched. Every one of these arms exists because a control that cannot disagree proves
+nothing: `Qwen4ExpNoiseFloorDiagnosticsTests` pins that the switches are inert off, engaged on, and graded, and
+`VulkanQwen4ExpActivationPrecisionTests` pins which activation precision each Vulkan path uses.

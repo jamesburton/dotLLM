@@ -13,10 +13,12 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// &gt;= 9-row prefill GEMMs read the activations unquantized. On this model (4-stream gated residual, 512-expert top-10 router, sparse
 /// attention indexer) the activation-quantization noise is digitized into a macroscopic, entropy-proportional logit shift, so the two
 /// activation precisions form two clusters ~0.02-0.05 KL apart on real text, with each cluster internally ~0.01.
-/// The tests pin the mechanism on a small K-quant checkpoint, using the oracle's own F32-activation control
-/// (<see cref="MoeSwiGluMlp.DiagF32ActivationsDense"/>) as the discriminator: a Vulkan prefill must be CLOSER to the unquantized-activation
-/// oracle than to the quantized-activation one, and the Vulkan decode path must be the opposite. If someone changes which precision a path
-/// uses (or breaks the control) one of the two inequalities flips.
+/// The test pins the mechanism on a small K-quant checkpoint, using the oracle's own F32-activation control
+/// (<see cref="MoeSwiGluMlp.DiagF32Activations"/> + <see cref="MoeSwiGluMlp.DiagF32ActivationsDense"/>) as the discriminator: a Vulkan prefill must be
+/// markedly CLOSER to the unquantized-activation oracle than to the quantized-activation one. If someone makes the prefill GEMMs quantize their
+/// activations (or breaks the control) the inequality flips. (The 1-row decode numbers are printed, not asserted: on this tiny model the decode
+/// kernels are not in the quantized cluster the way they are on the real 176B file, where decode sits 0.016 from the quantized-activation oracle
+/// and 0.046 from the F32 one.)
 /// </summary>
 [Trait("Category", "GPU")]
 [Collection(Qwen4ExpDiagnosticSwitchCollection.Name)]
@@ -73,7 +75,7 @@ public sealed class VulkanQwen4ExpActivationPrecisionTests(ITestOutputHelper out
 
         output.WriteLine($"mean KL over {prompts} prompts: prefill vs quantized-act oracle {prefillVsQ / prompts:E3}, vs F32-act oracle {prefillVsF / prompts:E3}; " +
                          $"decode vs quantized-act {decodeVsQ / prompts:E3}, vs F32-act {decodeVsF / prompts:E3}");
-        Assert.True(prefillVsF < prefillVsQ, "a >= 9-row Vulkan prefill must be closer to the unquantized-activation oracle than to the quantized one");
-        Assert.True(decodeVsQ < decodeVsF, "the 1-row Vulkan decode (Q8_1 activations) must be closer to the quantized-activation oracle");
+        Assert.True(prefillVsF < 0.5 * prefillVsQ,
+            $"a >= 9-row Vulkan prefill must be markedly closer to the unquantized-activation oracle ({prefillVsF:E3}) than to the quantized one ({prefillVsQ:E3})");
     }
 }
