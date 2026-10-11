@@ -446,7 +446,7 @@ public sealed class MtpSpeculativeDecoderTests
     /// pattern, extended to be per-row input-dependent (needed to prove a genuine multi-round
     /// equivalence property, not just single-round accept/reject).
     /// </summary>
-    private sealed class MockMtpModel : IModel
+    internal sealed class MockMtpModel : IModel
     {
         private readonly Func<int, int> _targetFn;
         private readonly Func<int, int> _mtpFn;
@@ -454,6 +454,12 @@ public sealed class MtpSpeculativeDecoderTests
         private readonly Action<int, Span<float>>? _draftRow;
         private readonly Action<int, Span<float>>? _targetRow;
         private readonly bool _supportsArgMax;
+
+        /// <summary>Called at the start of every trunk forward with its row count (latency simulation for gate tests).</summary>
+        public Action<int>? OnTrunkForward { get; init; }
+
+        /// <summary>Called at the start of every draft step.</summary>
+        public Action? OnDraftStep { get; init; }
 
         /// <param name="targetFn">Trunk argmax for an input token.</param>
         /// <param name="mtpFn">Draft argmax for an input token (ignored when <paramref name="draftRow"/> is set).</param>
@@ -509,7 +515,7 @@ public sealed class MtpSpeculativeDecoderTests
             Architecture = Architecture.Llama,
         };
 
-        public long ComputeMemoryBytes => 0;
+        public long ComputeMemoryBytes { get; init; }
 
         public void Dispose() { }
 
@@ -563,6 +569,7 @@ public sealed class MtpSpeculativeDecoderTests
             int deviceId, IKvCache? kvCache, DotLLM.Core.Lora.ILoraAdapter? adapter, IMtpState? mtpState)
         {
             TrunkForwardCount++;
+            OnTrunkForward?.Invoke(tokenIds.Length);
             int batchSize = tokenIds.Length;
             long totalFloats = (long)batchSize * VocabSize;
             nint ptr = (nint)NativeMemory.AlignedAlloc((nuint)(totalFloats * sizeof(float)), 64);
@@ -625,6 +632,7 @@ public sealed class MtpSpeculativeDecoderTests
         {
             if (!_supportsMtp)
                 throw new NotSupportedException();
+            OnDraftStep?.Invoke();
 
             long totalFloats = VocabSize;
             nint ptr = (nint)NativeMemory.AlignedAlloc((nuint)(totalFloats * sizeof(float)), 64);
