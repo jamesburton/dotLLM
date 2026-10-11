@@ -60,13 +60,14 @@ public sealed class TextGeneratorMtpGateTests
     [Fact]
     public void WinningRounds_KeepSpeculating_WithIdenticalOutput()
     {
-        // Perfect drafts: a K=3 round commits 4 tokens for 6 + 2*4 + 3 = 17 ms against 4 * 8 = 32 ms plain.
-        using var plainModel = NewModel(draftRight: true, plainMs: 8, rowMs: 2, fixedMs: 6);
+        // Perfect drafts: a K=3 round commits 4 tokens for 6 + 2*4 + 3 = 17 ms against 4 * 20 = 80 ms plain (a wide margin: the suite runs this
+        // beside hundreds of CPU-bound tests and the spin clocks are wall time).
+        using var plainModel = NewModel(draftRight: true, plainMs: 20, rowMs: 2, fixedMs: 6);
         var reference = new TextGenerator(plainModel, new Tok(), mtpEnabled: false).Generate("p", Greedy(48));
 
-        using var model = NewModel(draftRight: true, plainMs: 8, rowMs: 2, fixedMs: 6);
+        using var model = NewModel(draftRight: true, plainMs: 20, rowMs: 2, fixedMs: 6);
         var gen = new TextGenerator(model, new Tok(), mtpEnabled: true, mtpAdaptive: true, speculativeCandidates: 3);
-        gen.MtpGate!.RecordSegment(false, 40, 40 * 8.0);
+        gen.MtpGate!.RecordSegment(false, 40, 40 * 20.0);
         var resp = gen.Generate("p", Greedy(48));
 
         Assert.Equal(reference.Text, resp.Text);

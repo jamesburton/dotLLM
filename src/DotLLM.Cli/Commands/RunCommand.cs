@@ -700,7 +700,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             }
 
             if (!settings.Json && draftModel is null && !settings.NoMtp && model.SupportsMtp)
-                AnsiConsole.MarkupLine($"[dim]MTP self-speculative decoding: K={settings.SpeculativeK} ({(mtpHeadPath is null ? "model carries an MTP head" : "head: " + Markup.Escape(System.IO.Path.GetFileName(mtpHeadPath)))}; disable with --no-mtp)[/]");
+                AnsiConsole.MarkupLine($"[dim]MTP self-speculative decoding: K={(settings.SpeculativeK == DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates && model.MtpPreferredDraftTokens > 0 ? model.MtpPreferredDraftTokens : settings.SpeculativeK)} ({(mtpHeadPath is null ? "model carries an MTP head" : "head: " + Markup.Escape(System.IO.Path.GetFileName(mtpHeadPath)))}; disable with --no-mtp)[/]");
 
             var generator = new TextGenerator(model, tokenizer, kvFactory,
                 draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
