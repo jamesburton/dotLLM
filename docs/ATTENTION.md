@@ -381,7 +381,9 @@ sums (0.017) and is much smaller than the existing Vulkan-vs-oracle gap (0.054, 
 (KL 0.042 on the decode rows), so they are a separate opt-in.
 
 Long context with F16 K/V (capacity 34,000; needles from `scratchpad/needle2`): needles **6/6** at 23,783 and 31,011 tokens; prefill 229-238 tok/s; decode 20.5 tok/s at depth 32K
-(19.5-20.7 from 4K to 32K: flat, as the gather is bounded by ~2K keys). Same-session interleaved A/B, F32 lazy vs F16 lazy: decode 45.9 / 44.4 ms at 1K, 49.6 / 46.5 at 4K, 48.0 / 46.9 at 8K,
+(19.5-20.7 from 4K to 32K: flat, as the gather is bounded by ~2K keys). Ceiling probe (`DOTLLM_VK_QWEN4EXP_CONTEXT=66000`, F16 K/V, one sequence of filler tokens, no needles):
+the residency plan keeps the full 66,000 capacity, the sequence reaches 64,024 tokens without an allocation failure, prefill 210-220 tok/s over the last 16K, decode 20.1 tok/s at 48K and 19.4 at 64K
+(quality beyond 32K is NOT validated: no needle files exist above 31K). Same-session interleaved A/B, F32 lazy vs F16 lazy: decode 45.9 / 44.4 ms at 1K, 49.6 / 46.5 at 4K, 48.0 / 46.9 at 8K,
 52.4 / 47.9 at 16K; sparse prefill 202 / 221 tok/s: F16 is never slower (half the bytes per gathered key).
 
 RoPE fp32 angle: the shaders computed `sin(pos * freq)` with the GPU's own sin/cos, whose internal fp32 argument reduction costs ~6e-8 x angle of extra phase error (1.3-2.7x the CPU
