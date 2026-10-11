@@ -59,9 +59,21 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
             _draftTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency, DraftSteps);
 
     /// <summary>Zeroes <see cref="MtpTimings"/>.</summary>
-    public void ResetMtpTimings() { _absorbTicks = _restoreTicks = _draftTicks = 0; DraftSteps = 0; }
+    public void ResetMtpTimings() { _absorbTicks = _restoreTicks = _draftTicks = _dRecTicks = _dSubTicks = _dDlTicks = _dPfTicks = 0; DraftSteps = 0; }
 
     private long _absorbTicks, _restoreTicks, _draftTicks;
+    private long _dRecTicks, _dSubTicks, _dDlTicks, _dPfTicks;
+
+    /// <summary>Diagnostic split of the cumulative draft-step wall time: command recording, submit + wait, logits download + host argmax, n-gram prefetch (ms; reset with <see cref="ResetMtpTimings"/>).</summary>
+    public (double RecordMs, double SubmitMs, double DownloadMs, double PrefetchMs) DraftSplitMs
+        => (_dRecTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency, _dSubTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency,
+            _dDlTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency, _dPfTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+
+    /// <summary>
+    /// Perturbation switch for the draft step (timing attribution only; the drafted token is garbage when non-zero): 1 skips the head MoE, 2 the LM head
+    /// matmul, 4 the head attention, 8 the front (embedding, eh_proj), 16 the GR plumbing around the blocks.
+    /// </summary>
+    internal static int MtpDraftSkipMask { get; set; } = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MTP_DRAFT_SKIP"), out int skipMask) ? skipMask : 0;
 
     private sealed class MtpHead : IDisposable
     {
@@ -131,15 +143,31 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
 
         int il = Config.NumLayers, H = _hidden, S = _streams, hcDim = S * H;
         string b = $"blk.{il}.", n = b + "nextn.";
-        long headBytes = 0;
+        long headBytes = 0, requantSaving = 0;
         foreach (var kv in tensors)
         {
             if (kv.Key is Qwen4ExpTensors.TokenEmbd or Qwen4ExpTensors.Output) continue;   // the trunk's embedding / LM head are used
             long rows = 1;
             for (int d = 1; d < kv.Value.Shape.Rank; d++) rows *= kv.Value.Shape[d];
-            headBytes += Dequantize.RowByteSize(kv.Value.Shape[0], kv.Value.QuantizationType) * rows;
+            long bytes = Dequantize.RowByteSize(kv.Value.Shape[0], kv.Value.QuantizationType) * rows;
+            headBytes += bytes;
+            // What the routed banks would save as Q4_K (gate/up) / Q5_1 (down): see RequantBank.
+            QuantizationType target = kv.Key.EndsWith("ffn_down_exps.weight", StringComparison.Ordinal) ? QuantizationType.Q5_1
+                : kv.Key.EndsWith("ffn_gate_exps.weight", StringComparison.Ordinal) || kv.Key.EndsWith("ffn_up_exps.weight", StringComparison.Ordinal) ? QuantizationType.Q4_K
+                : kv.Value.QuantizationType;
+            if (target != kv.Value.QuantizationType && kv.Value.QuantizationType == QuantizationType.Q8_0
+                && kv.Value.Shape[0] % (target == QuantizationType.Q4_K ? 256 : 32) == 0)
+                requantSaving += bytes - Dequantize.RowByteSize(kv.Value.Shape[0], target) * rows;
         }
-        EnsureDeviceHeadroom(headBytes + DefaultSnapshotBytes());
+        long snapBytes = DefaultSnapshotBytes();
+        // #900: the Q8_0 head (~3 GiB) is what keeps MTP off the 79 GiB UD-Q4_K_XL; its routed banks re-quantised to Q4_K / Q5_1 save ~0.9 GiB and run the
+        // fused single-token MoE chain. Mode 0 = never, 1 = always, 2 (default) = only when the native head does not fit.
+        bool requant = MtpHeadRequantMode == 1 && requantSaving > 0;
+        if (MtpHeadRequantMode == 2 && requantSaving > 0 && !HeadroomFits(headBytes + snapBytes, out _))
+            requant = true;
+        if (requant) headBytes -= requantSaving;
+        MtpHeadRequantized = requant;
+        EnsureDeviceHeadroom(headBytes + snapBytes);
         var owned = new List<nint>();
         VulkanQwen3MoeHybridTransformerModel? core = null;
         VulkanQwen4ExpGrWeights? attnGr = null, ffnGr = null, headGr = null;
@@ -155,7 +183,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
                 {
                     AttnNormWeight = [1f], PostAttnNormWeight = [1f], Gdn = null,
                     FullAttn = LoadAttention(b, headFile, tensors, nKv, Config.HeadDim),
-                    Moe = LoadMoe(il, headFile, tensors, Config, owned),
+                    Moe = LoadMoe(il, headFile, tensors, Config, owned, requantRoutedBanks: requant),
                 },
             };
             // A one-layer attention core: the head's block reuses the validated QSA / MoE kernels. Its embedding table and LM head are never
@@ -314,7 +342,20 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
     /// </summary>
     private void EnsureDeviceHeadroom(long headBytes)
     {
-        if (AllowOvercommit) return;
+        if (!HeadroomFits(headBytes, out string? message))
+            throw new NotSupportedException(message);
+    }
+
+    /// <summary>Env <c>DOTLLM_MTP_HEAD_REQUANT</c>: 0 = keep the head's native routed-bank quantisation, 1 = always re-quantise (Q4_K gate/up, Q5_1 down), 2 (default) = only when the native head does not fit the device.</summary>
+    internal static int MtpHeadRequantMode { get; set; } = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_MTP_HEAD_REQUANT"), out int rq) ? rq : 2;
+
+    /// <summary>True when the attached head's routed banks were re-quantised at attach (see <see cref="MtpHeadRequantMode"/>).</summary>
+    public bool MtpHeadRequantized { get; private set; }
+
+    private bool HeadroomFits(long headBytes, out string? message)
+    {
+        message = null;
+        if (AllowOvercommit) return true;
         // #880: compare like with like. The capacity is what the device can really hold resident (UMA: device-local heap PLUS the shared
         // heap the trunk already spills into - ~11 GiB of the real file lives there; discrete: VRAM only), the trunk is what this process
         // holds in those same heaps, and other processes' GPU memory is subtracted. The old check compared ALL live bytes with the
@@ -328,14 +369,14 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         long others = _device.ReadOtherProcessPressure()?.OtherBytes ?? 0;
         long scratch = Qwen4ExpResidencyPlan.KvBytes(Config, _kvCapacity) + (1L << 30) + (long)AbsorbChunk * _streams * _hidden * 4 * 8;
         long need = trunk + headBytes + scratch + others;
-        if (need <= local) return;
+        if (need <= local) return true;
         static string G(long b) => $"{b / (double)(1L << 30):F1} GiB";
-        throw new NotSupportedException(
+        message =
             $"The MTP head does not fit the device-local heap next to the resident trunk: resident {G(trunk)} + head {G(headBytes)} + KV/scratch {G(scratch)} = " +
             $"{G(need)} (incl. {G(others)} held by other processes) against a {G(local)} resident budget (a failed upload would leave the device unable to allocate at all). Use a smaller trunk quantisation, " +
-            "or set DOTLLM_VK_ALLOW_OVERCOMMIT=1 to try anyway; decoding continues without speculation.");
+            "or set DOTLLM_VK_ALLOW_OVERCOMMIT=1 to try anyway; decoding continues without speculation.";
+        return false;
     }
-
 
     /// <summary>Verify rows with snapshot scratch allocated at attach (a K = 4 round verifies 5 rows and snapshots 4); larger rounds grow it.</summary>
     internal const int DefaultSnapshotRows = 4;
@@ -536,31 +577,35 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         KernelSupport.HostToComputeBarrier(cmd);
         void Barrier() => KernelSupport.ComputeTransferFullBarrier(cmd);
 
+        int skip = MtpDraftSkipMask;
         st.RecordSeed(cmd);
-        RecordMtpFront(cmd, h, tok, st.Pending, h.RWork, 1);
+        if ((skip & 8) == 0) RecordMtpFront(cmd, h, tok, st.Pending, h.RWork, 1);
 
-        RecordGrRead(cmd, h.AttnGr, h.RWork, hst.NormOutput, 1, inject: true);
-        h.Core.Q4RecordAttention(cmd, h.AttnLayer, 1, cpos, st.Kv);
+        if ((skip & 16) == 0) RecordGrRead(cmd, h.AttnGr, h.RWork, hst.NormOutput, 1, inject: true);
+        if ((skip & 4) == 0) h.Core.Q4RecordAttention(cmd, h.AttnLayer, 1, cpos, st.Kv);
         Barrier();
-        _gr.RecordWrite(cmd, h.RWork, hst.NormOutput, _gains, 1, S, H);
+        if ((skip & 16) == 0) _gr.RecordWrite(cmd, h.RWork, hst.NormOutput, _gains, 1, S, H);
         Barrier();
 
-        RecordGrRead(cmd, h.FfnGr, h.RWork, hst.NormOutput, 1, inject: true);
+        if ((skip & 16) == 0) RecordGrRead(cmd, h.FfnGr, h.RWork, hst.NormOutput, 1, inject: true);
         VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, hst.NormOutput, hst.MoeSharedInput, 0, 0, (ulong)H * 4);
         Barrier();
-        h.Core.Q4RecordMoe(cmd, h.Moe, 1);
+        if ((skip & 1) == 0) h.Core.Q4RecordMoe(cmd, h.Moe, 1);
         Barrier();
-        _gr.RecordWrite(cmd, h.RWork, hst.NormOutput, _gains, 1, S, H);
+        if ((skip & 16) == 0) _gr.RecordWrite(cmd, h.RWork, hst.NormOutput, _gains, 1, S, H);
         Barrier();
 
         VulkanQwen3MoeHybridTransformerModel.Q4Copy(cmd, h.RWork, st.Pending, 0, 0, rowBytes);   // the next draft step's input (before the head mixer)
         Barrier();
-        RecordGrRead(cmd, h.HeadGr, h.RWork, tst.NormOutput, 1, inject: false);
+        if ((skip & 16) == 0) RecordGrRead(cmd, h.HeadGr, h.RWork, tst.NormOutput, 1, inject: false);
         var w0 = _core.Q4Weights;
-        _core.Q4RecordMatmul(cmd, w0.OutputWeight, w0.OutputDeviceQuantType, tst.NormOutput, tst.Logits,
-            outputDim: w0.OutputOutputDim, inputDim: w0.OutputInputDim, seqLen: 1);
+        if ((skip & 2) == 0)
+            _core.Q4RecordMatmul(cmd, w0.OutputWeight, w0.OutputDeviceQuantType, tst.NormOutput, tst.Logits,
+                outputDim: w0.OutputOutputDim, inputDim: w0.OutputInputDim, seqLen: 1);
         KernelSupport.ComputeToHostBarrier(cmd);
+        long tSub = System.Diagnostics.Stopwatch.GetTimestamp();
         submit.SubmitAndWait();
+        long tDl = System.Diagnostics.Stopwatch.GetTimestamp();
         st.MarkCovered(position);
         DraftSteps++;
 
@@ -568,7 +613,11 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         _device.Download(tst.Logits, _mtpLogits);
         if (!logits.IsEmpty) _mtpLogits.AsSpan().CopyTo(logits);
         int top = TensorPrimitives.IndexOfMax((ReadOnlySpan<float>)_mtpLogits);
-        _draftTicks += System.Diagnostics.Stopwatch.GetTimestamp() - td0;
+        long tPf = System.Diagnostics.Stopwatch.GetTimestamp();
+        _dRecTicks += tSub - td0;
+        _dSubTicks += tDl - tSub;
+        _dDlTicks += tPf - tDl;
+        _draftTicks += tPf - td0;
 
         // #822: the verify forward will be [last token, d1 .. dK]; its n-gram table rows depend only on those ids, and the prefix known so far
         // is enough to start paging them in while the remaining draft steps run (a later call wins; an abandoned request is harmless).
@@ -584,6 +633,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
                 st.Run.RemoveAt(st.Run.Count - 1);
             }
         }
+        long tEnd = System.Diagnostics.Stopwatch.GetTimestamp();
+        _dPfTicks += tEnd - tPf;
         return top;
     }
 
