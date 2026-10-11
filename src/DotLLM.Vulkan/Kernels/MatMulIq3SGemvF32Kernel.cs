@@ -76,6 +76,9 @@ public sealed class MatMulIq3SGemvF32Kernel : IDisposable
 
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
+    /// <summary>The IQ3_S grid codebook buffer (shared with the multi-column GEMV, #902).</summary>
+    internal VulkanDevice.Buffer GridBuffer => _codebooks.Iq3SGrid;
+
     /// <summary>Dispatches the GEMV synchronously.</summary>
     public void Launch(VulkanDevice.Buffer weights, VulkanDevice.Buffer x, VulkanDevice.Buffer y, int m, int k)
     {

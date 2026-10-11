@@ -112,7 +112,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     internal readonly long[] MoePathCounts = new long[Enum.GetValues<MoePath>().Length];
 
     /// <summary>Record-time counters for the 2..8-row fast paths (#876): prove a fast path ran by counting, not by IsSupported.</summary>
-    internal enum SmallRowPath { F32Multi, F16Multi, Q8Multi, MoeQ4KMr, MoeQ5_1Mr }
+    internal enum SmallRowPath { F32Multi, F16Multi, Q8Multi, MoeQ4KMr, MoeQ5_1Mr, QuantMulti }
     internal readonly long[] SmallRowPathCounts = new long[Enum.GetValues<SmallRowPath>().Length];
     private void CountSmallRow(SmallRowPath p) => SmallRowPathCounts[(int)p]++;
     private void CountMoePath(MoePath p) => MoePathCounts[(int)p]++;
@@ -2548,6 +2548,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.Q4_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ4K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (SmallRowGemvEnabled && _kernels.MatMulQ4KMulti is { } multiQ4K && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
+                { CountSmallRow(SmallRowPath.QuantMulti); multiQ4K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #902
                 else if (_kernels.MatMulQ4KGemmCoopmat is not null && (inputDim % 256) == 0)
                     _kernels.MatMulQ4KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
@@ -2556,6 +2558,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.Q5_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ5K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (SmallRowGemvEnabled && _kernels.MatMulQ5KMulti is { } multiQ5K && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
+                { CountSmallRow(SmallRowPath.QuantMulti); multiQ5K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #902
                 else if (_kernels.MatMulQ5KGemmCoopmat is not null && (inputDim % 256) == 0)
                     _kernels.MatMulQ5KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
@@ -2564,6 +2568,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.Q6_K:
                 if (seqLen == 1)
                     _kernels.MatMulQ6K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (SmallRowGemvEnabled && _kernels.MatMulQ6KMulti is { } multiQ6K && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
+                { CountSmallRow(SmallRowPath.QuantMulti); multiQ6K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #902
                 else if (_kernels.MatMulQ6KGemmCoopmat is not null && (inputDim % 256) == 0)
                     _kernels.MatMulQ6KGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
@@ -2578,6 +2584,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.IQ4_XS:
                 if (seqLen == 1)
                     _kernels.MatMulIq4Xs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (SmallRowGemvEnabled && _kernels.MatMulIq4XsMulti is { } multiIq4Xs && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
+                { CountSmallRow(SmallRowPath.QuantMulti); multiIq4Xs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen); }   // #902
                 else if (_kernels.MatMulIq4XsGemmCoopmat is not null && (inputDim % 256) == 0)
                     _kernels.MatMulIq4XsGemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
@@ -2610,6 +2618,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             case QuantizationType.IQ3_S:
                 if (seqLen == 1)
                     _kernels.MatMulIq3S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else if (SmallRowGemvEnabled && _kernels.MatMulIq3SMulti is { } multiIq3S && MatMulQuantGemvMultiKernel.Accepts(seqLen, inputDim))
+                { CountSmallRow(SmallRowPath.QuantMulti); multiIq3S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen, codebook: _kernels.MatMulIq3S.GridBuffer); }   // #902
                 else
                     _kernels.MatMulIq3SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
