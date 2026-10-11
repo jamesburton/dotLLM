@@ -34,6 +34,15 @@ are unchanged (`HasLayerSlotMap == false`, identity map). Vulkan (`VulkanNemotro
 caches were already sparse; the CPU `SimpleKvCache` / `QuantizedKvCache` / `TurboQuantKvCache`, the hybrid CPU-tail cache of the
 split Qwen3-hybrid model, the KV handoff paths and the CLI memory estimate now agree with them.
 
+### Vulkan hybrid KV: element format and lazy growth (issue #898)
+
+`VulkanNemotronHKvCache` (shared by the Vulkan Nemotron-H, Qwen3.5/3.6/3.8 hybrids and Qwen4-Exp) takes two opt-in constructor arguments, both OFF by default so existing models are
+untouched: `storage: VulkanKvStorage.F16` (K/V rows written by a convert kernel, 2 bytes per element; only the Qwen4-Exp QSA gather kernel reads them, so it is created only through the
+Qwen4-Exp model) and `lazy: true` (buffers start empty and `EnsureCapacity(positions)` reallocates layer by layer, 25 % / >= 1024 positions at a time, copying the live prefix).
+`MaxLength` is the logical limit, `AllocatedLength` the physical one. After `EnsureCapacity` returns true the CALLER must drop every descriptor cache that may name the freed buffers
+(handles are recycled; a stale cached set reads zeros without any error). Qwen4-Exp does this in `ForwardCore` before recording (`EnsureContext`), for the sequence's K/V and its indexer
+state. Switches and measurements: [ATTENTION.md](ATTENTION.md), "Lazy growth and F16 K/V".
+
 ## Paged KV-Cache
 
 Inspired by OS virtual memory paging. This is the **memory management** half of PagedAttention (vLLM): block-based allocation, ref counting, CoW. The **kernel** half (attention reading non-contiguous blocks directly) is opt-in on CUDA as of issue #200 (`DOTLLM_ATTN_PAGED_NATIVE=1`, decode only — see the CUDA section below); it remains a future step for CPU and any future Vulkan paged cache, where current kernels still see contiguous buffers via staging-buffer gather.

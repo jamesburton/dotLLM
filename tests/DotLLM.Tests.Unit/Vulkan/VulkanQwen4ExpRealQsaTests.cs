@@ -366,7 +366,7 @@ public sealed class VulkanQwen4ExpRealQsaTests
             int[] filler = Enumerable.Range(0, model.ContextCapacity).Select(_ => rng.Next(1000, 20000)).ToArray();
             float[]? logits = null;
             int at = 0;
-            foreach (int depth in new[] { 1024, 2048, 4096, 8000, 12000, 16000, 24000, 32000 })
+            foreach (int depth in new[] { 1024, 2048, 4096, 8000, 12000, 16000, 24000, 32000, 48000, 64000 })
             {
                 if (depth + 40 > model.ContextCapacity) break;
                 if (depth > at)
