@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_control_flow_attributes : require
 // IQ4_XS multi-column GEMV (2..8 activation rows, #902): Y[col, m] = sum_k W_iq4xs[m, k] * X[col, k].
 //
 // matmul_iq4_xs_f32_gemv.comp for NC columns at once: each (super-block, sub-block) work item decodes its scale and codebook values ONCE and
@@ -91,7 +92,7 @@ void main() {
     uint rowByteBase = m * rowByteStride;
 
     float acc[NC];
-    for (uint cc = 0u; cc < NC; ++cc) acc[cc] = 0.0;
+    [[unroll]] for (uint cc = 0u; cc < NC; ++cc) acc[cc] = 0.0;
 
     // One work item = one (super-block, sub-block) pair (the old mapping gave a thread a whole super-block and
     // kept 10 of 128 threads busy on a K = 2560 row).
@@ -127,7 +128,7 @@ void main() {
 
             float loSum[NC];
             float hiSum[NC];
-            for (uint cc = 0u; cc < NC; ++cc) { loSum[cc] = 0.0; hiSum[cc] = 0.0; }
+            [[unroll]] for (uint cc = 0u; cc < NC; ++cc) { loSum[cc] = 0.0; hiSum[cc] = 0.0; }
             for (uint w = 0u; w < 4u; w++) {
                 uint cur = weight[subQsUint + w];
                 uint e = w * 4u;
@@ -139,21 +140,21 @@ void main() {
                 float h1 = KVALUES_IQ4NL[(cur >> 12u) & 0xFu];
                 float h2 = KVALUES_IQ4NL[(cur >> 20u) & 0xFu];
                 float h3 = KVALUES_IQ4NL[(cur >> 28u) & 0xFu];
-                for (uint cc = 0u; cc < NC; ++cc) {
+                [[unroll]] for (uint cc = 0u; cc < NC; ++cc) {
                     uint xo = cc * pc.K + subXBase + e;
                     loSum[cc] += x[xo + 0u] * k0 + x[xo + 1u] * k1 + x[xo + 2u] * k2 + x[xo + 3u] * k3;
                     hiSum[cc] += x[xo + 16u] * h0 + x[xo + 17u] * h1 + x[xo + 18u] * h2 + x[xo + 19u] * h3;
                 }
             }
-            for (uint cc = 0u; cc < NC; ++cc) acc[cc] += dl * (loSum[cc] + hiSum[cc]);
+            [[unroll]] for (uint cc = 0u; cc < NC; ++cc) acc[cc] += dl * (loSum[cc] + hiSum[cc]);
         }
     }
 
-    for (uint cc = 0u; cc < NC; ++cc) partials[cc][tid] = acc[cc];
+    [[unroll]] for (uint cc = 0u; cc < NC; ++cc) partials[cc][tid] = acc[cc];
     barrier();
     for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
         if (tid < stride)
-            for (uint cc = 0u; cc < NC; ++cc) partials[cc][tid] += partials[cc][tid + stride];
+            [[unroll]] for (uint cc = 0u; cc < NC; ++cc) partials[cc][tid] += partials[cc][tid + stride];
         barrier();
     }
 

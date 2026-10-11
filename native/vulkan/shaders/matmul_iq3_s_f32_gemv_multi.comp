@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_control_flow_attributes : require
 // IQ3_S multi-column GEMV (2..8 activation rows, #902): Y[col, m] = sum_k W_iq3s[m, k] * X[col, k].
 //
 // matmul_iq3_s_f32_gemv.comp for NC columns at once: the grid-codebook gathers and sign decode (the expensive part) run ONCE per weight and the
@@ -93,7 +94,7 @@ void main() {
     uint rowByteBase   = m * rowByteStride;
 
     float acc[NC];
-    for (uint cc = 0u; cc < NC; ++cc) acc[cc] = 0.0;
+    [[unroll]] for (uint cc = 0u; cc < NC; ++cc) acc[cc] = 0.0;
 
     // One work item = one (super-block, sub-block) pair. The old mapping gave a thread a whole super-block,
     // so a K = 2560 row (10 super-blocks) kept 10 of 128 threads busy (decode at ~60 GB/s on hybrid-dense).
@@ -148,7 +149,7 @@ void main() {
                 uint gOff2 = g2 * 4u;
 
                 float pairSum[NC];
-                for (uint cc = 0u; cc < NC; ++cc) pairSum[cc] = 0.0;
+                [[unroll]] for (uint cc = 0u; cc < NC; ++cc) pairSum[cc] = 0.0;
                 for (uint j = 0u; j < 4u; j++) {
                     float g0 = float(gridByte(gOff1 + j));
                     float gH = float(gridByte(gOff2 + j));
@@ -156,22 +157,22 @@ void main() {
                     float sH = ((signs & (1u << (j + 4u))) != 0u) ? -1.0 : 1.0;
                     float w0 = g0 * s0;
                     float wH = gH * sH;
-                    for (uint cc = 0u; cc < NC; ++cc) {
+                    [[unroll]] for (uint cc = 0u; cc < NC; ++cc) {
                         uint xo = cc * pc.K + xOff + j;
                         pairSum[cc] += w0 * x[xo];
                         pairSum[cc] += wH * x[xo + 4u];
                     }
                 }
-                for (uint cc = 0u; cc < NC; ++cc) acc[cc] += db * pairSum[cc];
+                [[unroll]] for (uint cc = 0u; cc < NC; ++cc) acc[cc] += db * pairSum[cc];
             }
         }
     }
 
-    for (uint cc = 0u; cc < NC; ++cc) partials[cc][tid] = acc[cc];
+    [[unroll]] for (uint cc = 0u; cc < NC; ++cc) partials[cc][tid] = acc[cc];
     barrier();
     for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
         if (tid < stride)
-            for (uint cc = 0u; cc < NC; ++cc) partials[cc][tid] += partials[cc][tid + stride];
+            [[unroll]] for (uint cc = 0u; cc < NC; ++cc) partials[cc][tid] += partials[cc][tid + stride];
         barrier();
     }
 

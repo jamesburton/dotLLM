@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_shader_subgroup_basic      : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
@@ -91,7 +92,7 @@ void main() {
 
     uint xRow4 = pc.K >> 2u;   // vec4 per activation row
     float acc[NC];
-    for (uint cc = 0u; cc < NC; ++cc) acc[cc] = 0.0;
+    [[unroll]] for (uint cc = 0u; cc < NC; ++cc) acc[cc] = 0.0;
     for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
         uint blk = w0 + blockInWindow;
         if (blk >= pc.blocksPerRow)
@@ -109,7 +110,7 @@ void main() {
         vec4 cB = codes5(weight[qw + 1u], shift, weight[qhw + 1u], sb);
 
         uint xi = blk * 64u + sb * 8u + 2u * q;
-        for (uint cc = 0u; cc < NC; ++cc) {
+        [[unroll]] for (uint cc = 0u; cc < NC; ++cc) {
             vec4 xa = x4[cc * xRow4 + xi];
             vec4 xb = x4[cc * xRow4 + xi + 1u];
             acc[cc] += sc * (dot(cA, xa) + dot(cB, xb))
@@ -118,17 +119,17 @@ void main() {
     }
 
     float sums[NC];
-    for (uint cc = 0u; cc < NC; ++cc) sums[cc] = subgroupAdd(acc[cc]);
+    [[unroll]] for (uint cc = 0u; cc < NC; ++cc) sums[cc] = subgroupAdd(acc[cc]);
     if (gl_NumSubgroups == 1u) {
         if (subgroupElect())
-            for (uint cc = 0u; cc < NC; ++cc) y[cc * pc.M + m] = sums[cc];
+            [[unroll]] for (uint cc = 0u; cc < NC; ++cc) y[cc * pc.M + m] = sums[cc];
         return;
     }
     if (subgroupElect())
-        for (uint cc = 0u; cc < NC; ++cc) partials[cc][gl_SubgroupID] = sums[cc];
+        [[unroll]] for (uint cc = 0u; cc < NC; ++cc) partials[cc][gl_SubgroupID] = sums[cc];
     barrier();
     if (lane == 0u) {
-        for (uint cc = 0u; cc < NC; ++cc) {
+        [[unroll]] for (uint cc = 0u; cc < NC; ++cc) {
             float total = 0.0;
             for (uint i = 0u; i < gl_NumSubgroups; i++)
                 total += partials[cc][i];
