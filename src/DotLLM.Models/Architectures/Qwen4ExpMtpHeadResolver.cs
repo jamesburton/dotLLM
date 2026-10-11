@@ -52,9 +52,11 @@ public static class Qwen4ExpMtpHeadResolver
     /// <param name="model">The loaded model; any other type is left alone.</param>
     /// <param name="modelPath">Trunk path used for auto-detection.</param>
     /// <param name="explicitPath">An explicit head path (<c>--mtp-head</c>), which skips detection; null for auto-detection.</param>
+    /// <param name="trunkBytes">Summed GGUF bytes of the trunk; when given (&gt;= 0) an auto-detected head is attached only if
+    /// <see cref="ShouldAutoAttach"/> (an explicit path always attaches). -1 = no size rule.</param>
     /// <returns>The attached head's path, or null when nothing was attached.</returns>
     /// <exception cref="FileNotFoundException"><paramref name="explicitPath"/> does not exist.</exception>
-    public static string? TryAttach(IModel model, string modelPath, string? explicitPath = null)
+    public static string? TryAttach(IModel model, string modelPath, string? explicitPath = null, long trunkBytes = -1)
     {
         if (model is not IMtpHeadAttachable q4 || q4.HasMtpHead) return null;
         string? path = explicitPath;
@@ -64,6 +66,7 @@ public static class Qwen4ExpMtpHeadResolver
         }
         else
         {
+            if (trunkBytes >= 0 && !ShouldAutoAttach(trunkBytes)) return null;
             path = Find(modelPath);
             if (path is null) return null;
         }
