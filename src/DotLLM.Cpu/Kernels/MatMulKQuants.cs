@@ -630,6 +630,22 @@ public static unsafe partial class MatMul
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, int wStride, float* results)
     {
+        if (Avx2.IsSupported && Sse41.IsSupported)
+        {
+            // Bit-identical rewrite with hoisted/vectorised scale + min handling (#933).
+            Q4KRows4Tokens1(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
+            return;
+        }
+
+        VecDotQ4_K_Q8_K_4RowsReference(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
+    }
+
+    /// <summary>Original (pre-#933) 4-row Q4_K x Q8_K kernel; the bit-exactness oracle for the fast kernels.</summary>
+    [SkipLocalsInit]
+    internal static void VecDotQ4_K_Q8_K_4RowsReference(
+        byte* w0, byte* w1, byte* w2, byte* w3,
+        byte* q8k, int superBlockCount, int wStride, float* results)
+    {
         if (!Avx2.IsSupported)
         {
             results[0] = VecDotQ4_K_Q8_KPortable(w0, q8k, superBlockCount, wStride);
@@ -951,6 +967,22 @@ public static unsafe partial class MatMul
     /// </summary>
     [SkipLocalsInit]
     internal static void VecDotQ6_K_Q8_K_4Rows(
+        byte* w0, byte* w1, byte* w2, byte* w3,
+        byte* q8k, int superBlockCount, int wStride, float* results)
+    {
+        if (Avx2.IsSupported)
+        {
+            // Bit-identical rewrite (#933).
+            Q6KRows4Tokens1(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
+            return;
+        }
+
+        VecDotQ6_K_Q8_K_4RowsReference(w0, w1, w2, w3, q8k, superBlockCount, wStride, results);
+    }
+
+    /// <summary>Original (pre-#933) 4-row Q6_K x Q8_K kernel; the bit-exactness oracle for the fast kernels.</summary>
+    [SkipLocalsInit]
+    internal static void VecDotQ6_K_Q8_K_4RowsReference(
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, int wStride, float* results)
     {
