@@ -593,6 +593,13 @@ the head 1.0 GiB smaller. UD-IQ4_XS, K = 4: 1.17x -> 1.56x of plain decode (K = 
   one-row absorb is ~1 ms); the loss on a losing configuration is bounded by those 8 plain-speed tokens plus the 5 rounds before the fall-back. The reference
   errs towards keeping MTP (the absorb, and any cold rounds that slip into the median, make it slower than true plain decode); the re-probes replace it with a true
   plain sample. `DOTLLM_MTP_CALIBRATE=0` turns it off; `DOTLLM_MTP_TRACE=1` prints every calibration round.
+  Measured in fresh processes (UD-IQ4_XS, greedy, 192 tokens, box otherwise idle): calibration rounds 43-62 ms (reference 44-48 ms/token; plain decode measures 47);
+  the first request took 5.7 s with calibration against 5.2 s without (+0.5 s once, because 8 tokens run at plain speed instead of MTP speed), and the second
+  request then runs the faster arm straight away. The fall-back itself is covered by the latency-simulating mock (`TextGeneratorMtpGateTests`: a losing config
+  drops MTP after the calibration plus 5 rounds, a winning one keeps its win, both with output identical to plain); on the real files the one mild loser tried
+  (ISTA IQ2_XS with the native Q8_0 head at K = 8, 0.9x) is handled by the controller picking a shorter K, not by the fall-back, so it neither gained nor lost
+  from the calibration beyond noise. A stall in the first MTP rounds (measured once, while the box was building code: 700 ms per round) can trigger a spurious
+  fall-back in the first request; the re-probes recover it.
 - *Re-probing.* A losing arm is re-measured every 40 decisions; a clear loss (> 10 %) doubles the interval up to 640.
 - *serve attaches the head.* `serve` never attached the separate qwen4exp head (only `run` did), so the default-on serve path never speculated on this
   model. It now attaches an auto-detected `mtp-*.gguf` and logs the outcome; a head that does not fit the device is declined with the numbers and serving
