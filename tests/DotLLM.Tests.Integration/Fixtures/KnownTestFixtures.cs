@@ -66,6 +66,20 @@ internal static class KnownTestFixtures
     public const string TernaryBonsai27BDescription = "Ternary-Bonsai-2-27B PQ2_0 GGUF (tokenizer.ggml.pre = qwen35)";
 
     /// <summary>
+    /// NVIDIA Nemotron 3.5 Lightning 30B-A3B, Q4_K_M (~25 GB, <c>nemotron_h_moe</c>; Q5_0 / Q8_0 expert banks) — the ollama
+    /// <c>nemotron-3.5-lightning</c> blob / <c>ggml-org</c> file, hard-linked at
+    /// <c>~/.dotllm/test-cache/nvidia/nemotron-3.5-lightning/</c> (never copied into the tree).
+    /// </summary>
+    public static FixtureLocation NemotronLightningQ4KM => TestFixtureResolver.ResolveFile(
+        "DOTLLM_NEMOTRON_MOE_GGUF",
+        "nvidia",
+        "nemotron-3.5-lightning",
+        "nemotron-3.5-lightning-Q4_K_M.gguf");
+
+    /// <summary>Human-readable name for <see cref="NemotronLightningQ4KM"/> skip messages.</summary>
+    public const string NemotronLightningDescription = "NVIDIA Nemotron 3.5 Lightning 30B-A3B Q4_K_M GGUF (~25 GB, nemotron_h_moe)";
+
+    /// <summary>
     /// DeepSeek-V2-Lite HF safetensors snapshot directory —
     /// <c>deepseek-ai/DeepSeek-V2-Lite</c>.
     /// </summary>

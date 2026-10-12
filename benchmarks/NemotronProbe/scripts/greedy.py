@@ -78,7 +78,7 @@ for name, prompt in cases.items():
     tl = time.time() - t0
     # dotLLM
     t0 = time.time()
-    rd = run([CLI, "run", GGUF_DOT, "-d", "cpu", "-p", prompt, "-n", str(N), "--json"])
+    rd = run([CLI, "run", GGUF_DOT, "-d", os.environ.get("NEM_DOT_DEVICE", "cpu"), "-p", prompt, "-n", str(N), "--json"])
     td = time.time() - t0
     line = [l for l in rd.stdout.decode("utf-8", "replace").splitlines() if l.startswith("{")][-1]
     j = json.loads(line)
