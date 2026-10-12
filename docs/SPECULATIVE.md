@@ -604,6 +604,38 @@ row 0) reproduced the plain text in 5 of 6 runs, so the divergence enters throug
 not through the draft, the rollback or the head. Re-checking every committed token with a 1-row forward would cost a decode step per round, which is the
 whole saving, so it is not done; sampled output is unaffected in distribution.
 
+**The ISTA GSQ-RCO files lost for another reason: 2..8-row dense projections (issue #902).** On ISTA IQ3_XXS / IQ2_XS the 2-row forward cost 100-109 ms
+against 41-45 ms for one row (UD-IQ4_XS: 57 ms), so a K = 4 round was 200+ ms and MTP ran at 0.65-0.82x. The split-submit profile put the jump in the dense
+projections (gdn_proj +24 ms, gdn_outproj +9, attn_qproj +7): those files keep them in IQ4_XS, IQ3_S, Q4_K, Q5_K and Q6_K, and the #878 multi-column GEMVs
+cover only F32 / F16 / Q8_0, so everything else fell to the coopmat / tiled GEMM at any row count from 2. New multi-column F32-in GEMVs
+(`matmul_{q4_k,q5_k,q6_k}_gemv_f32_multi`, `matmul_iq4_xs_f32_gemv_multi`, `matmul_iq3_s_f32_gemv_multi`, `MatMulQuantGemvMultiKernel`) decode every weight once
+and FMA it against up to 8 activation rows. Two layout lessons from `mcbench`: array accumulators indexed by a specialization-constant loop spilled from 5
+columns (IQ3_S 130 -> 430 us), and a thread-per-sub-block layout whose activation loads are 128 bytes apart per lane left the L1 from 5 columns (IQ4_XS
+10240x2560: 133 us at n = 4, 582 us at n = 5, 2 ms at n = 8); the IQ shaders are generated (`native/vulkan/gen_iq_gemv_multi.py`) with one scalar accumulator
+per column and the IQ4_XS one uses the coalesced lane = K layout (n = 2..8: 46-160 us). Forward cost by rows on the ISTA IQ3_XXS file, 1/2/3/5 rows:
+43 / 100 / 108 / 128 ms before, **43 / 56 / 69 / 92 ms after**; IQ2_XS 41 / 109 / 118 / 138 before, 40 / 53 / 64 / 87 after. Parity tests
+(`VulkanQuantGemvMultiKernelTests`) hold every column to the single-row GEMV of the same format.
+
+**Per-quantisation result (final build, same-process interleaved plain / MTP, 4 short prompts at 128 tokens, greedy; K = 3 is the library default depth,
+K = 4 the qwen4exp preferred depth).** The last column is the 1K-token context run at K = 4.
+
+| file | plain tok/s | MTP K=3 | MTP K=4 | tokens/round K=4 | 1K ctx K=4 | greedy text identical to 1-row |
+|---|---|---|---|---|---|---|
+| UD-Q4_K_XL (79 GiB; needs `DOTLLM_VK_ALLOW_OVERCOMMIT=1`, below) | 22.3 | 30.9 (1.38x) | 28.8 (1.33x) | 3.57 | 30.6 vs 21.5 (1.42x) | 1 / 8 |
+| UD-IQ4_XS (60 GiB) | 22.7 | 32.3 (1.42x) | 31.1 (1.37x vs the 22.7 baseline; 19.9 in that run's cold first prompt) | 3.67 | 30.2 vs 21.8 (1.39x) | 2 / 8 |
+| ISTA IQ3_XXS (44 GiB) | 23.2 | 31.6 (1.36x) | 30.3 (1.35x) | 3.60 | 31.7 vs 22.3 (1.42x) | 3 / 8 |
+| ISTA IQ2_XS (37 GiB) | 24.5 | 32.9 (1.34x) | 30.8 (1.30x) | 3.39 | 26.8 vs 23.4 (1.14x) | 4 / 8 |
+
+(Before #900 / #902 the same files measured 1.17x (IQ4_XS, native Q8_0 head), 0.65-0.82x (ISTA IQ3_XXS / IQ2_XS) and "head does not fit" (Q4_K_XL).)
+The depth plateau is broad (K = 2 is 1.30-1.41x on the same files), so the controller's choice matters by a few percent; it picks K per round from the
+measured acceptance and round cost.
+
+**UD-Q4_K_XL fit.** The re-quantised head adds 2.08 GiB of resident memory (77.86 -> 79.95 GiB, measured), 1.0 GiB less than the Q8_0 head. The attach guard
+still declines it by 1.0 GiB (82.5 GiB estimated against the 81.4 GiB per-process budget: trunk 77.9 + head with snapshots 2.0 + 1.4 KV/scratch estimate + 1.2
+held by other processes); with the guard overridden the attach works and decoding is stable (two probe sessions). The 1.4 GiB estimate is the slack: the measured
+post-attach growth beyond the head is 0.08 GiB. `DOTLLM_VK_ALLOW_OVERCOMMIT=1` therefore gives Q4_K_XL its 1.33-1.38x today; tightening the estimate is left alone
+because it shares lines with the KV-allocation work (#437/#898).
+
 **n-gram table prefetch (#822) on Vulkan.** `PleRowPrefetcher` is called at the top of every forward (before the first embedding record) and, for
 MTP, after each draft step with the verify chunk's known prefix `[last token, d1 .. di]`. Cold 1K-token prefill of fresh ids, A/B/B/A in one process:
 **7.7-7.9 s with the prefetch vs 14.4-14.6 s without** (-6.7 s, 1.85x), matching the CPU measurement of 6.8 s of demand faults per 1K chunk.
