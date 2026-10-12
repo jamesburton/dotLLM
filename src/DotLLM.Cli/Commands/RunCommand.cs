@@ -265,7 +265,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         /// <summary>Explicit MTP head GGUF for architectures that ship it as a separate file (qwen4exp).</summary>
         [CommandOption("--mtp-head")]
         [Description("Path of a separate MTP head GGUF (qwen4exp ships it as mtp-*.gguf beside the quantisation folders). " +
-                     "Default: auto-detected in the model's directory and the one above it, and attached only for trunks of 50 GiB and up (smaller quantisations measure faster without it; an explicit path always attaches). " +
+                     "Default: auto-detected in the model's directory and the one above it (a head that does not fit the device is declined with a warning). " +
                      "Ignored for models whose GGUF embeds the head.")]
         public string? MtpHead { get; set; }
 

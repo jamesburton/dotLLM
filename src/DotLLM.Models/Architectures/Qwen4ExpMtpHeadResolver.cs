@@ -36,12 +36,14 @@ public static class Qwen4ExpMtpHeadResolver
     }
 
     /// <summary>
-    /// Smallest trunk (summed GGUF bytes) for which an auto-detected head is attached. A round costs a fixed part plus about 16-22 ms per draft row
-    /// (every verify row reads its own experts) while a plain step shrinks with the file, so speculation pays only on the bigger quantisations:
-    /// measured on Vulkan / Strix Halo (see <c>.docs</c> / issue #900), UD-IQ4_XS (~60 GiB) wins, ISTA IQ3_XXS (44 GiB) and IQ2_XS (37 GiB) lose.
-    /// Below this the head would cost 3 GiB of device memory for nothing; an explicit path still attaches.
+    /// Smallest trunk (summed GGUF bytes) for which an auto-detected head is attached; 0 = every trunk. Before the 2..8-row GEMVs for the K-quant / IQ dense
+    /// projections (#902) the ISTA GSQ-RCO files (37-44 GiB) lost to plain decode with the head (verify rows cost 100+ ms at 2 rows), so this was 50 GiB; with them
+    /// every measured file wins at K = 3-4 (see <c>docs/SPECULATIVE.md</c>), and the adaptive gate still falls back per request. The head costs ~2 GiB of device
+    /// memory, so a trunk that leaves no room declines it at attach (<c>EnsureDeviceHeadroom</c>). Override with <c>DOTLLM_MTP_AUTO_ATTACH_MIN_GIB</c>.
     /// </summary>
-    public const long AutoAttachMinTrunkBytes = 50L << 30;
+    public static long AutoAttachMinTrunkBytes { get; } =
+        double.TryParse(Environment.GetEnvironmentVariable("DOTLLM_MTP_AUTO_ATTACH_MIN_GIB"), System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out double gib) && gib >= 0 ? (long)(gib * (1L << 30)) : 0;
 
     /// <summary>True when an auto-detected head is worth attaching to a trunk of <paramref name="trunkBytes"/> (see <see cref="AutoAttachMinTrunkBytes"/>).</summary>
     public static bool ShouldAutoAttach(long trunkBytes) => trunkBytes >= AutoAttachMinTrunkBytes;

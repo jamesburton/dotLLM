@@ -413,7 +413,7 @@ To embed the same endpoints inside your own ASP.NET Core app, see [Host the Open
 | `--cache-type-v` | | `f32` | KV-cache value quant: `f32`, `q8_0`, `q4_0` |
 | `--speculative-model` | | *(none)* | Draft model for speculative decoding (must share vocab) |
 | `--speculative-k` | | 3 | Draft tokens per speculative step |
-| `--mtp-head` | | *(auto)* | `serve`: path of a separate MTP head GGUF (qwen4exp `mtp-*.gguf`); an auto-detected sibling attaches only for trunks of 50 GiB and up. See [docs/SERVER.md](docs/SERVER.md) |
+| `--mtp-head` | | *(auto)* | `serve`: path of a separate MTP head GGUF (qwen4exp `mtp-*.gguf`); an auto-detected sibling is attached when it fits the device. See [docs/SERVER.md](docs/SERVER.md) |
 | `--no-mtp` | | off | `serve`: opt out of default-on MTP self-speculation (models with an embedded MTP head, expected concurrency < 5, no `--speculative-model`). `--mtp` is accepted for back-compat. See [docs/SERVER.md](docs/SERVER.md) |
 
 **Sampling & constraints** (shared by `run` and `chat`):
