@@ -11,7 +11,7 @@ namespace DotLLM.Tests.Unit.Cpu.Kernels;
 /// 4 codes/byte, 2 bits each). Codes map 0→-1, 1→0, 2→+1, 3→+2. Unlike I2_S (a single
 /// per-tensor scale trailing the whole packed payload), PQ2_0's scale is per-GROUP and comes
 /// BEFORE the group's codes — both facts verified empirically against real
-/// <c>Ternary-Bonsai-27B-Q2_0.gguf</c> tensor bytes (2026-07-20): decoding with
+/// <c>Ternary-Bonsai-2-27B-PQ2_0.gguf</c> tensor bytes (2026-07-20): decoding with
 /// scale-then-codes gives 0% invalid ternary codes and a tight, plausible per-group scale
 /// distribution across 200 sampled groups of a real attention-output weight matrix; every
 /// other byte-ordering hypothesis (codes-then-scale, or separate contiguous code/scale
