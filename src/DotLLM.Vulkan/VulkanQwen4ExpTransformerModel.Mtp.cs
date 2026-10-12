@@ -357,29 +357,53 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
     /// <summary>True when the attached head's routed banks were re-quantised at attach (see <see cref="MtpHeadRequantMode"/>).</summary>
     public bool MtpHeadRequantized { get; private set; }
 
+    /// <summary>
+    /// Test hook / switch for the second-device canary (see <see cref="VulkanHeadroomCanary"/>). Env <c>DOTLLM_MTP_HEADROOM_CANARY=0</c> turns it off, leaving only
+    /// the arithmetic estimate.
+    /// </summary>
+    internal static Func<VulkanDevice, long, HeadroomProbeResult>? HeadroomProbe { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_MTP_HEADROOM_CANARY") == "0" ? null : VulkanHeadroomCanary.Probe;
+
     private bool HeadroomFits(long headBytes, out string? message)
     {
         message = null;
-        if (AllowOvercommit) return true;
         // #880: compare like with like. The capacity is what the device can really hold resident (UMA: device-local heap PLUS the shared
-        // heap the trunk already spills into - ~11 GiB of the real file lives there; discrete: VRAM only), the trunk is what this process
-        // holds in those same heaps, and other processes' GPU memory is subtracted. The old check compared ALL live bytes with the
-        // device-local heap alone, so it refused with ~30 GiB of the shared heap unused.
-        // The usable capacity is the OS limit (UMA: ~0.64 x RAM, measured), not the sum of the advertised heaps, and the allocation that
-        // crosses it does not fail - the NEXT submit does, and the device is then unusable. No extra headroom is subtracted: the cap
-        // already is the point of failure and everything counted below is real.
+        // heap the trunk already spills into; discrete: VRAM only), the trunk is what this process holds in those same heaps, and other
+        // processes' GPU memory is subtracted. The usable capacity is the OS limit (UMA: ~0.64 x RAM), not the sum of the advertised
+        // heaps, and the allocation that crosses it does not fail - the NEXT submit does, and the device is then unusable.
         long local = VulkanMemoryCapacity.UsableCapacityBytes(_device.ResidentCapacityBytes(),
             GC.GetGCMemoryInfo().TotalAvailableMemoryBytes, _device.PhysicalDeviceTypeValue);
-        long trunk = _device.ResidentLiveBytes();
+        long live = _device.ResidentLiveBytes();
         long others = _device.ReadOtherProcessPressure()?.OtherBytes ?? 0;
-        long scratch = Qwen4ExpResidencyPlan.KvBytes(Config, _kvCapacity) + (1L << 30) + (long)AbsorbChunk * _streams * _hidden * 4 * 8;
-        long need = trunk + headBytes + scratch + others;
-        if (need <= local) return true;
-        static string G(long b) => $"{b / (double)(1L << 30):F1} GiB";
-        message =
-            $"The MTP head does not fit the device-local heap next to the resident trunk: resident {G(trunk)} + head {G(headBytes)} + KV/scratch {G(scratch)} = " +
-            $"{G(need)} (incl. {G(others)} held by other processes) against a {G(local)} resident budget (a failed upload would leave the device unable to allocate at all). Use a smaller trunk quantisation, " +
-            "or set DOTLLM_VK_ALLOW_OVERCOMMIT=1 to try anyway; decoding continues without speculation.";
+        // #820: only what is NOT resident yet counts. The per-forward scratch (DOTLLM_VK_PLANNED_ROWS) is allocated at load and is already in
+        // `live`; the old estimate added a flat 1 GiB for it again (and KV at full capacity without the indexer), which alone made the 79 GiB
+        // UD-Q4_K_XL decline a head that measured +2.08 GiB in total.
+        int kvBytesPerElement = KvStorage == VulkanKvStorage.F16 ? 2 : 4;
+        long context = Qwen4ExpResidencyPlan.ContextBytes(Config, _kvCapacity, kvBytesPerElement, IndexerRawF16);
+        long headKv = 2L * _kvCapacity * Config.NumKvHeads * Config.HeadDim * sizeof(float);   // the head's own one-layer F32 K/V (CreateMtpState)
+        long absorb = (long)AbsorbChunk * _streams * _hidden * 4 * 8;
+        var est = new Qwen4ExpMtpAttachEstimate(live, headBytes, context + headKv, absorb, others, local);
+        bool trace = Environment.GetEnvironmentVariable("DOTLLM_MTP_TRACE") == "1" || Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_TRACE") == "1";
+        if (trace) Console.Error.WriteLine("[mtp-attach] " + est.Describe());
+        if (AllowOvercommit)
+        {
+            if (trace) Console.Error.WriteLine("[mtp-attach] DOTLLM_VK_ALLOW_OVERCOMMIT=1: not enforced.");
+            return true;
+        }
+        // The arithmetic cannot see the OS limit drifting (81.4 GiB then 73.9 GiB on the same idle box), so ask the driver: allocate and touch
+        // what the attach would add on a second device. Only that device is poisoned if it fails.
+        HeadroomProbeResult? probe = null;
+        if (HeadroomProbe is { } run)
+        {
+            probe = run(_device, est.ProbeBytes);
+            if (trace) Console.Error.WriteLine("[mtp-attach] " + probe.Value.Describe());
+        }
+        var verdict = est.Decide(probe);
+        if (trace) Console.Error.WriteLine("[mtp-attach] verdict: " + (verdict.Fits ? "fits" : "refused") + " (" + verdict.Reason + ")");
+        if (verdict.Fits) return true;
+        message = "The MTP head does not fit the device next to the resident trunk: " + verdict.Reason +
+                  ". A failed upload would leave the device unable to allocate at all, so the head is not attached and decoding continues WITHOUT speculation. " +
+                  "Use a smaller trunk quantisation, close other GPU consumers, lower DOTLLM_VK_QWEN4EXP_CONTEXT, or set DOTLLM_VK_ALLOW_OVERCOMMIT=1 to try anyway.";
         return false;
     }
 

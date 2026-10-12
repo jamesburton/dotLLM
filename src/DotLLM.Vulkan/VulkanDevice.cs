@@ -594,6 +594,7 @@ public sealed class VulkanDevice : IDisposable
                     hasSubgroupSizeControl, minSubgroupSize, maxSubgroupSize,
                     requiredSubgroupSizeStages, hasExternalSemaphoreWin32, hasShaderInfoAmd,
                     hasPipelineExecutableProperties);
+                result.PhysicalDeviceIndex = IndexOfPhysicalDevice(instance, physical);
                 instance = 0;
                 return result;
             }
@@ -607,6 +608,21 @@ public sealed class VulkanDevice : IDisposable
         {
             s_lifecycleLock.ExitWriteLock();
         }
+    }
+
+    /// <summary>
+    /// <c>vkEnumeratePhysicalDevices</c> index this device was created on (what <see cref="Create(int)"/> takes), or -1 when unknown. A second device
+    /// bound to the same GPU - e.g. the MTP-head headroom canary (#820) - must use the same index, or it would probe a different adapter.
+    /// </summary>
+    internal int PhysicalDeviceIndex { get; private set; } = -1;
+
+    private static int IndexOfPhysicalDevice(nint instance, nint physical)
+    {
+        uint count = 0;
+        if (VulkanApi.vkEnumeratePhysicalDevices(instance, ref count, null) < 0 || count == 0) return -1;
+        var devices = new nint[count];
+        if (VulkanApi.vkEnumeratePhysicalDevices(instance, ref count, devices) < 0) return -1;
+        return Array.IndexOf(devices, physical);
     }
 
     private static nint CreateInstance()

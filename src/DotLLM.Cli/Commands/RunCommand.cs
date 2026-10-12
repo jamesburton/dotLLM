@@ -377,7 +377,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                     mtpHeadPath = DotLLM.Models.Architectures.Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, settings.MtpHead,
                         trunkBytes: model is DotLLM.Core.Models.IMtpHeadAttachable ? DotLLM.HuggingFace.ModelResolver.FileLength(resolvedPath) : -1);
                 }
-                catch (Exception ex) when (settings.MtpHead is null && ex is not FileNotFoundException)
+                catch (Exception ex) when (ex is not FileNotFoundException && (settings.MtpHead is null || ex is NotSupportedException))
                 {
                     // An auto-detected head that cannot be attached (device memory, a mismatched file) must not take the run down: plain decode works.
                     Console.Error.WriteLine($"WARNING: MTP head not attached ({ex.GetType().Name}: {ex.Message}); decoding without speculation.");
