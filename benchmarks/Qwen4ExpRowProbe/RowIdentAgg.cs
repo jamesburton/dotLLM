@@ -7,6 +7,7 @@ internal sealed class RowIdentAgg(int rows)
     {
         public int N, Bit, Arg;
         public double SumMax;
+        public double SumKl;   // KL(reference || candidate) over the full vocabulary
         public double MaxMax;
         public int TieFlips;   // rows where the candidate's argmax differs AND the reference gap between the two picks is < 1.0
     }
@@ -29,6 +30,13 @@ internal sealed class RowIdentAgg(int rows)
             if (reference[i] > reference[ra]) ra = i;
             if (candidate[i] > candidate[ca]) ca = i;
         }
+        {
+            double mr = reference[ra], mc = candidate[ca], zr = 0, zc = 0;
+            for (int i = 0; i < reference.Length; i++) { zr += Math.Exp(reference[i] - mr); zc += Math.Exp(candidate[i] - mc); }
+            double lr = Math.Log(zr) + mr, lc = Math.Log(zc) + mc, kl = 0;
+            for (int i = 0; i < reference.Length; i++) kl += Math.Exp(reference[i] - lr) * ((reference[i] - lr) - (candidate[i] - lc));
+            c.SumKl += kl;
+        }
         if (bit) c.Bit++;
         if (ra == ca) c.Arg++;
         else c.TieFlips++;
@@ -47,7 +55,7 @@ internal sealed class RowIdentAgg(int rows)
             {
                 var c = _c[arm][j];
                 if (c.N == 0) continue;
-                sb.AppendLine($"  row {j}: n={c.N} bit-identical {c.Bit}/{c.N} ({100.0 * c.Bit / c.N:F0}%), argmax equal {c.Arg}/{c.N} ({100.0 * c.Arg / c.N:F1}%), mean max|dlogit| {c.SumMax / c.N:F4}, worst {c.MaxMax:F3}");
+                sb.AppendLine($"  row {j}: n={c.N} bit-identical {c.Bit}/{c.N} ({100.0 * c.Bit / c.N:F0}%), argmax equal {c.Arg}/{c.N} ({100.0 * c.Arg / c.N:F1}%), mean max|dlogit| {c.SumMax / c.N:F4}, worst {c.MaxMax:F3}, mean KL {c.SumKl / c.N:E2}");
             }
         }
         return sb.ToString();

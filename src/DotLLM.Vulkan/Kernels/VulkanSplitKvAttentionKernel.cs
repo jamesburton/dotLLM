@@ -80,8 +80,8 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     // non-positive value falls back to the default.
     internal const string TargetWorkgroupsEnvVar = "DOTLLM_VULKAN_SPLIT_TARGET_WG";
     internal const string MinKvPerSplitEnvVar = "DOTLLM_VULKAN_SPLIT_MIN_KV";
-    private static readonly int TargetWorkgroups = EnvIntOrDefault(TargetWorkgroupsEnvVar, 256);
-    private static readonly int MinKvPerSplit = EnvIntOrDefault(MinKvPerSplitEnvVar, 16);
+    internal static readonly int TargetWorkgroups = EnvIntOrDefault(TargetWorkgroupsEnvVar, 256);
+    internal static readonly int MinKvPerSplit = EnvIntOrDefault(MinKvPerSplitEnvVar, 16);
 
     private static int EnvIntOrDefault(string envVar, int fallback)
     {

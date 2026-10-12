@@ -631,7 +631,7 @@ forward with the same token run 1-row on an identical state and prints the first
 3. *First-order sources found by `layerdiv`.* Layer 0 (a GDN layer) already differs by 1.8e-3 relative; with the fused single-token MoE chain and its fused combine
    off (`DOTLLM_VK_Q4E_MOE_FUSED=0 DOTLLM_VK_Q4E_COMBINE_FUSED=0`, i.e. the 1-row path takes the same general MoE path as the rows) it is 1.9e-7: the fused decode
    chain is the big difference. The first QSA layer (3) then jumps to 7.8e-4: the f16 hi/lo coopmat flash attention that every `seqQ > 1` forward takes against the
-   f32 split-KV kernel of the 1-row path (also the +20 ms per 1K tokens of verify cost noted above). Switching the 1-row path to the verify path's attention and MoE
+   f32 split-KV kernel of the 1-row path (also the +20 ms per 1K tokens of verify cost noted above; replaced by a per-row split-KV kernel in #910, below). Switching the 1-row path to the verify path's attention and MoE
    (or the other way round: `DOTLLM_VULKAN_DISABLE_COOPMAT_ATTENTION=1 DOTLLM_VULKAN_DISABLE_FLASH_ATTENTION=1 DOTLLM_VULKAN_DISABLE_SPLIT_DECODE=1`) leaves layers 0-3 (one
    window: 0-7) at ULP level (`u`), and from layer 4-8 on every residual is > 1e-4 away again: the Q8 activation quantisation (#873) turns the first 1-ULP
    difference into a quantisation-step difference. In one window row 1 of the batch differs by > 1e-4 already at layer 0 (the GDN conv state and recurrence run
@@ -648,6 +648,32 @@ Decision (rule from #820: default only if the tok/s loss is < 3 % AND identity >
 quality is not what differs (both paths are equally valid draws from the same near-ties, #873; sampled MTP is exact in distribution). What a real fix would take:
 bit-identical single-row and batched variants of an estimated ~15 kernels (fused vs general MoE, split-KV with per-row offsets for attention, GDN conv/scan, the multi- and
 single-column GEMV codegens, router top-k, LM head), each with a bit-exactness test, with `layerdiv` as the harness (the target is a string of `=`).
+
+**Verify-row attention: per-row split-KV (issue #910), dense regime.** The attention of a 2..8-row verify forward (it was the f16 hi/lo coopmat flash attention, 13 ms
+of a 5-row forward at 1K context and 25 ms at 2K, 1-2 ms of a 1-row forward) is now `attention_f32_splitkv_rows.comp` + `_rows_merge.comp`
+(`VulkanSplitKvRowsAttentionKernel`): one workgroup per (row, head, split), row r at `positionOffset + r` attending to its own `positionOffset + r + 1` keys, split
+with the split count and chunk boundaries the 1-row decode kernel uses at that length (the shader is the 1-row one with the row dimension added). It serves F32 KV
+caches, 2..8 rows (K <= 7), consecutive positions, contexts where the first row has > 16 keys; anything else falls back to flash. `DOTLLM_VK_Q4E_SPLITKV_ROWS=0`
+restores the flash path. An F16 KV cache (`DOTLLM_VK_QWEN4EXP_KV=f16`, opt-in) and the sparse QSA regime past 2051 tokens never reach this branch (both go through the QSA
+gather kernel for every row count), so they are unchanged.
+- *Bit-identity of the kernel itself* is pinned by `VulkanSplitKvRowsAttentionKernelTests`: every row equals the shipping 1-row kernel at that row's length bit for bit
+  (6 shapes, including batches whose rows have different split counts and the 256-wide head dim). The wiring (one dispatch per dense QSA layer of a 2..8-row forward,
+  none for 1 or 9+ rows or with the switch off, logits on the CPU oracle) is `VulkanQwen4ExpVerifyRowsAttentionTests`.
+- *Attention stage* (`stage` with GPU timestamps, 12 attention layers summed, UD-IQ4_XS; flash -> per-row split-KV): 5 rows 7.0 -> 2.6 ms at 512, 13.3 -> 2.9 ms at 1K,
+  25.3 -> 5.0 ms at 2K; 2 rows 6.7 -> 1.0, 13.0 -> 1.9, 24.8 -> 2.9 ms. The 1-row decode kernel is 0.8 / 1.1 / 1.9 ms. UD-Q4_K_XL, 5 rows: 16.6 -> 3.1 ms at 1K, 27.8 -> 5.2 ms at 1.9K
+  (forward stage sum 102.0 -> 90.0 and 116.0 -> 91.8 ms, trunk only).
+- *End to end* (`spec <ctx> 96 4`, real head, plain and MTP interleaved, switch alternated in one process, 2 repeats): verify ms/round 108.4 -> 106.4 at 512 (neutral),
+  117.4 / 116.3 -> 107.0 / 109.5 at 1K, 137.8 / 128.1 -> 112.1 / 111.9 at 1.9K on UD-IQ4_XS; UD-Q4_K_XL (attach forced with `DOTLLM_VK_ALLOW_OVERCOMMIT=1`, the canary
+  declined by 0.23 GiB with 0.9 GiB held by other processes) 114.9 / 112.3 -> 105.5 / 107.5 at 1K and 131.3 / 129.0 -> 103.6 / 104.1 at 1.9K. Where the tokens per round were
+  equal in both arms (Q4_K_XL: 3.65 and 3.80) the MTP rate moved 26.8 / 27.6 -> 28.3 / 28.2 tok/s at 1K (+3-5 %) and 24.7 / 25.0 -> 30.5 / 30.4 tok/s at 1.9K (+22 %), i.e. 1.30 / 1.20 -> 1.46x of
+  plain at 1.9K. On UD-IQ4_XS the acceptance sequences differed between the arms (3.65 vs 4.13 tokens/round at 1K, same prompt), so its tok/s ratios (1.35 -> 1.66x at 1K) overstate the
+  time effect; use the verify ms/round. The 4-prompt short-context run (ctx <= 70) moves nothing but the trajectories, as predicted (attention is ~1 ms there).
+- *Identity and KL: unchanged.* `rowident` (5-row verify vs plain 1-row, 4 prompts x 13 windows x 5 rows, UD-IQ4_XS) with a 1000-token prefix: argmax equal 260/260 in both arms, mean max |dlogit|
+  0.68 -> 0.71, mean KL(1-row || verify row) 6.2e-4 -> 7.1e-4; 1700-token prefix: 258/260 both, 0.61 -> 0.64, 6.4e-4 -> 7.6e-4; short prompts: 256/260 both, 0.65 -> 0.63, 5.6e-3 -> 2.3e-3.
+  Row KLs are heavy-tailed (2e-4 .. 1.8e-2 between rows), so these differences are noise; there is no improvement in identity either. `layerdiv` (5 rows) shows why: with the fused MoE chain on (the
+  default) layer 0, a GDN layer, is already `X` in both arms; with it off the first QSA layer (3) goes `X` -> `u` for rows 0-2 and the first `X` moves from layer 3 to layers 8 / 5 / 4, but
+  rows 3-4 stay `uuX` / `uX` (the GDN recurrence across rows is out of this kernel's reach). One of the ~15 kernels now matches its 1-row twin exactly; the logit floor is
+  set by the others, as written above. Not extended to the sparse regime: the same per-row offsets would go into `qsa_attention_f32.comp`'s split dispatch.
 
 **The ISTA GSQ-RCO files lost for another reason: 2..8-row dense projections (issue #902).** On ISTA IQ3_XXS / IQ2_XS the 2-row forward cost 100-109 ms
 against 41-45 ms for one row (UD-IQ4_XS: 57 ms), so a K = 4 round was 200+ ms and MTP ran at 0.65-0.82x. The split-submit profile put the jump in the dense
