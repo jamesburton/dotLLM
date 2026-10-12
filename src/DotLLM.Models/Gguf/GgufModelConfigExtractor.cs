@@ -1070,7 +1070,17 @@ public static partial class GgufModelConfigExtractor
         // Dense FFN width (the non-expert ffn_up/gate/down on every layer — Gemma 4
         // keeps a dense MLP alongside the routed experts). Stored under
         // feed_forward_length; expert width is separate (expert_feed_forward_length).
+        // E2B stores feed_forward_length as a PER-LAYER array (6144 for the first
+        // 15 layers, 12288 for the 20 shared-KV layers: HF use_double_wide_mlp);
+        // E4B and the 26B store a scalar. IntermediateSize is the WIDEST layer so
+        // every shared scratch buffer sized from it fits; each layer's actual
+        // width is the dimension of its own gate/up/down weights.
         int intermediateSize = (int)metadata.GetUInt32OrDefault($"{arch}.feed_forward_length", 0);
+        if (intermediateSize == 0)
+        {
+            foreach (int w in GetIntArrayOrEmpty(metadata, $"{arch}.feed_forward_length"))
+                intermediateSize = Math.Max(intermediateSize, w);
+        }
 
         // Sliding-window pattern: per-layer 1 (sliding/local) / 0 (full/global).
         int slidingWindow = (int)metadata.GetUInt32OrDefault($"{arch}.attention.sliding_window", 1024);

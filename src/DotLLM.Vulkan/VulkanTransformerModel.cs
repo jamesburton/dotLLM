@@ -4149,8 +4149,13 @@ public sealed class VulkanTransformerModel : IModel
             // residual add collapse from 3 dispatches / 2 barriers into 2
             // dispatches / 1 barrier (activation+quantize fused; the GEMV
             // still needs its own barrier to see the just-quantized scratch).
+            // Per-layer FFN width: Gemma-4 E2B has a double-wide MLP on its shared-KV
+            // layers (6144 vs 12288). Size the activation by THIS layer's gate output,
+            // not the model-wide maximum in Config.IntermediateSize, so the narrow
+            // layers do not do (and read stale) work for rows that were never written (#917).
+            int layerInterm = Config.IsGemma4DensePle && lw.GateOutputDim > 0 ? lw.GateOutputDim : intermediateSize;
             downProjFused = _residualScale == 1.0f
-                && TryRecordFusedSwiGluQuantizeDownResidual(cmdBuf, lw, seqLen, intermediateSize);
+                && TryRecordFusedSwiGluQuantizeDownResidual(cmdBuf, lw, seqLen, layerInterm);
 
             if (!downProjFused)
             {
@@ -4159,11 +4164,11 @@ public sealed class VulkanTransformerModel : IModel
                 // the standard SwiGLU. All fuse gate*act + up into SiluOutput; only
                 // the gate non-linearity differs.
                 if (_geglu is not null)
-                    _geglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
+                    _geglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * layerInterm);
                 else if (_relu2glu is not null)
-                    _relu2glu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
+                    _relu2glu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * layerInterm);
                 else
-                    _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
+                    _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * layerInterm);
                 BarrierComputeToCompute(cmdBuf);
                 ProfSample("ffn_act");
                 DpStamp(cmdBuf, DpCatAct);

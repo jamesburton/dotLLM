@@ -401,6 +401,13 @@ public static class ServerStartup
             // carry recurrent state the paged scheduler does not manage, so use the simple cache.
             Console.WriteLine("[dotllm] Paged KV-cache not supported for hybrid/recurrent CPU models; using the simple KV-cache.");
         }
+        else if (options.UsePaged && !kvConfig.IsQuantized && config.GlobalHeadDim is int dualHeadDim && dualHeadDim != config.HeadDim)
+        {
+            // Gemma-4 (dual head dim 256/512): per-layer KV strides exist only on the contiguous F32
+            // SimpleKvCache; the CPU forward's GuardKvCacheHeadDim rejects PagedKvCache with a 500 on the
+            // first request (#917). Fall back to the simple cache instead of failing every request.
+            Console.WriteLine("[dotllm] Paged KV-cache does not support dual head-dim models (Gemma-4); using the simple KV-cache.");
+        }
         else if (options.UsePaged && !kvConfig.IsQuantized)
         {
             pagedFactory = new PagedKvCacheFactory(
