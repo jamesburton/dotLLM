@@ -642,7 +642,7 @@ explores plain decode once after the first MTP request and then follows the fast
 | file | greedy plain | greedy MTP | sampled (T 0.7, top-k 40) plain | sampled MTP |
 |---|---|---|---|---|
 | UD-IQ4_XS | 23.1 | 29.1-31.6 (1.26-1.37x) | 22.4 | 26.8-32.4 |
-| ISTA IQ3_XXS | 23.3 | 30.0-31.7 (1.29-1.36x) | 23.2 | 27.3-28.5 |
+| ISTA IQ3_XXS | 23.3 | 28.9-31.7 (1.24-1.36x) | 23.2 | 24.2-27.1 |
 | ISTA IQ2_XS | 24.5 | 33.0-35.7 (1.35-1.45x) | 23.6 | 27.3-28.5 |
 
 **Never a loss: the stress case.** The native Q8_0 head (draft step 12-14 ms, `DOTLLM_MTP_HEAD_REQUANT=0`) on ISTA IQ2_XS makes MTP break even (+5 % greedy,
