@@ -142,9 +142,17 @@ internal sealed class JinjaParser
         }
 
         Expect(JinjaTokenType.In);
-        var iterable = ParseExpression();
-        // Handle optional filter on the iterable (e.g., "for x in items | reverse")
-        // Filters are already handled in ParseExpression -> ParsePostfix
+        // The iterable stops BEFORE a trailing "if": in a for header it is the per-item filter
+        // ("for k in d if k not in skip"), not a ternary on the sequence. ParseOr leaves "if" unconsumed;
+        // a parenthesised ternary still works as the iterable.
+        var iterable = ParseOr();
+        IExpression? filter = null;
+        if (CurrentIs(JinjaTokenType.If))
+        {
+            Advance();
+            filter = ParseOr();
+        }
+        // Filters ("for x in items | reverse") are already handled in ParseOr -> ... -> ParsePostfix
         Expect(JinjaTokenType.StmtEnd);
 
         // Check for optional recursive keyword - we don't support it but skip gracefully
@@ -164,7 +172,7 @@ internal sealed class JinjaParser
         Expect(JinjaTokenType.Endfor);
         Expect(JinjaTokenType.StmtEnd);
 
-        return new ForNode(varName, secondVar, iterable, body, elseBody);
+        return new ForNode(varName, secondVar, iterable, body, elseBody, filter);
     }
 
     private ITemplateNode ParseSet()
