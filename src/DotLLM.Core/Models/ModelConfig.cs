@@ -394,6 +394,29 @@ public record ModelConfig
     public int? GlobalHeadDim { get; init; }
 
     /// <summary>
+    /// Per-head dimension of V (and of the attention output feeding <c>o_proj</c>) when it differs from the Q/K head
+    /// dim <see cref="HeadDim"/> (MiMo-V2: K 192, V 128). Null = V uses <see cref="HeadDim"/> (every other
+    /// non-MLA architecture). Resolve through <see cref="GetValueHeadDim"/>.
+    /// </summary>
+    public int? ValueHeadDim { get; init; }
+
+    /// <summary>The V head dimension: <see cref="ValueHeadDim"/> when set, else <see cref="HeadDim"/>.</summary>
+    public int GetValueHeadDim() => ValueHeadDim ?? HeadDim;
+
+    /// <summary>
+    /// True when V's head dim differs from Q/K's (<see cref="ValueHeadDim"/> set and unequal to <see cref="HeadDim"/>).
+    /// Backends whose attention kernels assume one head dim for Q, K and V must reject such a model explicitly.
+    /// </summary>
+    public bool HasDistinctValueHeadDim => ValueHeadDim is int v && v != HeadDim;
+
+    /// <summary>
+    /// Constant multiplier applied to the attention-layer value contribution (MiMo-V2 <c>attention_value_scale</c> 0.707,
+    /// GGUF <c>{arch}.attention.value_scale</c>). V is linear in the attention output, so it is equivalent to scaling V or
+    /// the pre-<c>o_proj</c> attention output. Null = 1.
+    /// </summary>
+    public float? AttentionValueScale { get; init; }
+
+    /// <summary>
     /// Returns the per-head dimension for <paramref name="layerIdx"/>. Full-attention
     /// layers use <see cref="GlobalHeadDim"/> when set (Gemma 4 <c>global_head_dim</c>);
     /// sliding-window layers and every other architecture use <see cref="HeadDim"/>.
