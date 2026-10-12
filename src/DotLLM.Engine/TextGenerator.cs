@@ -285,6 +285,7 @@ public sealed class TextGenerator
         var mtpGate = GateFor(pipeline.IsStochastic);
         bool useMtp = ShouldUseMtp(captureLogprobs) && cachedTokenCount == 0
             && (mtpGate?.ShouldUseMtp(maxTokens) ?? true);
+        TraceGate(mtpGate, pipeline.IsStochastic, useMtp, captureLogprobs, cachedTokenCount);
         bool useHybrid = _hybridStrategy is not null
             && _hybridStrategy.ShouldRunHybrid(promptLen)
             && cachedTokenCount == 0
@@ -870,6 +871,7 @@ public sealed class TextGenerator
         var mtpGate = GateFor(pipeline.IsStochastic);
         bool useMtp = ShouldUseMtp(captureLogprobs) && cachedTokenCount == 0
             && (mtpGate?.ShouldUseMtp(maxTokens) ?? true);
+        TraceGate(mtpGate, pipeline.IsStochastic, useMtp, captureLogprobs, cachedTokenCount);
         bool useHybrid = _hybridStrategy is not null
             && _hybridStrategy.ShouldRunHybrid(promptLen)
             && cachedTokenCount == 0
@@ -1640,6 +1642,12 @@ public sealed class TextGenerator
         _mtpGateSampled?.Reset();
     }
 
+    private void TraceGate(MtpAdaptiveGate? gate, bool sampled, bool useMtp, bool captureLogprobs, int cachedTokenCount)
+    {
+        if (!MtpAdaptiveGate.TraceEnabled || !_model.SupportsMtp) return;
+        Console.Error.WriteLine($"[mtp] {(sampled ? "sampled" : "greedy")} request: {(useMtp ? "MTP" : "plain")} (enabled={_mtpEnabled}, logprobs={captureLogprobs}, cachedTokens={cachedTokenCount}, K={_mtpCandidates}); {gate?.Describe() ?? "no gate"}");
+    }
+
     private MtpAdaptiveGate? GateFor(bool sampled) => sampled ? _mtpGateSampled : _mtpGate;
 
     /// <summary>
@@ -1650,6 +1658,8 @@ public sealed class TextGenerator
     private static void RecordMtpGate(MtpAdaptiveGate? gate, bool usedMtp, int generated, long mtpTicks, int mtpTokens, long decodeTicks, long samplerTicks)
     {
         if (gate is null) return;
+        if (MtpAdaptiveGate.TraceEnabled)
+            Console.Error.WriteLine($"[mtp] record: used={(usedMtp ? "MTP" : "plain")} generated={generated} mtpTokens={mtpTokens} mtpMs={mtpTicks * 1000.0 / Stopwatch.Frequency:F0} decodeMs={decodeTicks * 1000.0 / Stopwatch.Frequency:F0} samplerMs={samplerTicks * 1000.0 / Stopwatch.Frequency:F0}");
         if (!usedMtp)
         {
             gate.Record(false, generated, (decodeTicks + samplerTicks) * 1000.0 / Stopwatch.Frequency);

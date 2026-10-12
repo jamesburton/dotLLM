@@ -28,6 +28,7 @@ string[] prompts =
 };
 if (args[0] == "kbench") { KBench.Run(args); return; }
 if (args[0] == "iqbench") { IqKBench.Run(args); return; }
+if (args[0] == "mcbench") { McBench.Run(args); return; }
 if (args[0] == "mkids")
 {
     // mkids <gguf> <text file> <out.i32> <maxTokens>: tokenize a text file with the model's tokenizer (raw int32 ids, no BOS added by us).

@@ -265,7 +265,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         /// <summary>Explicit MTP head GGUF for architectures that ship it as a separate file (qwen4exp).</summary>
         [CommandOption("--mtp-head")]
         [Description("Path of a separate MTP head GGUF (qwen4exp ships it as mtp-*.gguf beside the quantisation folders). " +
-                     "Default: auto-detected in the model's directory and the one above it, and attached only for trunks of 50 GiB and up (smaller quantisations measure faster without it; an explicit path always attaches). " +
+                     "Default: auto-detected in the model's directory and the one above it (a head that does not fit the device is declined with a warning). " +
                      "Ignored for models whose GGUF embeds the head.")]
         public string? MtpHead { get; set; }
 
@@ -375,7 +375,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 try
                 {
                     mtpHeadPath = DotLLM.Models.Architectures.Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, settings.MtpHead,
-                        trunkBytes: DotLLM.HuggingFace.ModelResolver.FileLength(resolvedPath));
+                        trunkBytes: model is DotLLM.Core.Models.IMtpHeadAttachable ? DotLLM.HuggingFace.ModelResolver.FileLength(resolvedPath) : -1);
                 }
                 catch (Exception ex) when (settings.MtpHead is null && ex is not FileNotFoundException)
                 {

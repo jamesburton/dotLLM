@@ -98,6 +98,22 @@ public sealed class TextGeneratorMtpGateTests
         Assert.True(gen.MtpGate!.MtpMsPerToken > 0);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void WinningMtp_IsChosenAgain_AfterTheOtherArmWasExplored(bool sampled)
+    {
+        // Serve log, UD-IQ4_XS: sampled request 1 ran MTP (24.1 tok/s), request 2 explored plain (22.5), then requests 3 and 4 ran plain even though MTP
+        // had measured faster. After both arms are sampled the faster one must be picked every time (until a re-probe).
+        using var model = NewModel(draftRight: true, plainMs: 20, rowMs: 2, fixedMs: 6);
+        var gen = new TextGenerator(model, new Tok(), mtpEnabled: true, mtpAdaptive: true, speculativeCandidates: 3);
+        var opts = sampled ? new InferenceOptions { MaxTokens = 40, Temperature = 0.8f, TopK = 1, Seed = 7 } : Greedy(40);
+        var used = new List<bool>();
+        for (int i = 0; i < 5; i++)
+            used.Add(gen.Generate("p", opts).Timings.SpeculativeDraftTokens > 0);
+        Assert.Equal(new[] { true, false, true, true, true }, used);
+    }
+
     [Fact]
     public void Warmup_DoesNotLeaveAVerdictInTheGate()
     {
