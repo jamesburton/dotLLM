@@ -1886,7 +1886,7 @@ public sealed class VulkanTransformerModel : IModel
         // without anything saying so.
         VulkanFlashAttentionF32Kernel? flashAttention =
             VulkanAttentionFallbackDiagnostics.CreatePrefillFlashAttention(
-                device, spvDir, config.HeadDim, "VulkanTransformerModel");
+                device, spvDir, Math.Max(config.HeadDim, config.GlobalHeadDim ?? 0), "VulkanTransformerModel");
         // Cooperative-matrix FA prefill kernel (issue #149) — preferred over the
         // scalar FA shader when the device has the 16x16x16 f16->f32 subgroup
         // tile (llama.cpp's FA_COOPMAT1 path). Kill-switch:
@@ -1895,9 +1895,16 @@ public sealed class VulkanTransformerModel : IModel
         // shaders before — see the IQ2_XXS MMQ history).
         VulkanFlashAttentionCoopmatKernel? flashAttentionCoopmat =
             IsFlashAttentionDisabled() || IsCoopmatAttentionDisabled()
-                || config.HeadDim > VulkanFlashAttentionCoopmatKernel.MaxHeadDim
+                || config.HeadDim > VulkanFlashAttentionCoopmatKernel.WideMaxHeadDim
                 ? null
                 : VulkanFlashAttentionCoopmatKernel.TryCreate(device, spvDir);
+        // #914: head_dim 129..256 models (Gemma-2/3/4 sliding layers) use the hi/lo-split hd256 pipeline (#685). Keep the kernel only
+        // when this instance can dispatch the model's head_dim (an older SPV cache without the hd256 shader stays on scalar FA).
+        if (flashAttentionCoopmat is not null && config.HeadDim > flashAttentionCoopmat.SupportedMaxHeadDim)
+        {
+            flashAttentionCoopmat.Dispose();
+            flashAttentionCoopmat = null;
+        }
         // Optional split-KV (Flash-Decoding) kernel for the decode path
         // (seqQ == 1). Disabled by env-var opt-out or missing SPV (older
         // builds); only seqKv <= 16 decode still routes to the per-token kernel
@@ -2487,7 +2494,7 @@ public sealed class VulkanTransformerModel : IModel
         // #149, llama.cpp FA_COOPMAT1 analogue) over the scalar FA shader.
         // Same tiling, same mask semantics; f16-matmul numerics (see kernel).
         if (_flashAttentionCoopmat is not null && seqQ > 1
-            && headDim <= VulkanFlashAttentionCoopmatKernel.MaxHeadDim)
+            && headDim <= _flashAttentionCoopmat.SupportedMaxHeadDim)
         {
             ProfNote("attn_flash_cm", seqQ, seqKv, numHeads);
             _flashAttentionCoopmat.Record(cmdBuf, q, k, v, output,

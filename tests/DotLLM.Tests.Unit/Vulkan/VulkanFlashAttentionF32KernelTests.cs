@@ -226,6 +226,55 @@ public class VulkanFlashAttentionF32KernelTests
                wideVariant: FlashAttentionWideVariant.Hd256Br8);
     }
 
+    // ── #914: head_dim 512 (Gemma-4 global layers) ──────────────────────────────────────────────────────────────────────────
+
+    [SkippableFact]
+    public void Launch_Hd512_Gqa8_MultiKvTile_PositionOffset()
+    {
+        // Gemma-4 26B global layer shape: 16 q heads over 2 kv heads (GQA ratio 8, NOT NKHead = 1), hd 512, a KV range spanning
+        // several 64-wide tiles, a continuation offset and a partial query tile (37 is not a multiple of BR = 4).
+        RunOne(seqQ: 37, seqKv: 200, numHeads: 16, numKvHeads: 2, headDim: 512, positionOffset: 163,
+               wideVariant: FlashAttentionWideVariant.Hd256Br4);
+    }
+
+    [SkippableFact]
+    public void Launch_Hd512_SlidingWindow_PartialQTile()
+    {
+        RunOne(seqQ: 13, seqKv: 150, numHeads: 8, numKvHeads: 2, headDim: 512, positionOffset: 137,
+               slidingWindow: 64, wideVariant: FlashAttentionWideVariant.Hd256Br4);
+    }
+
+    [SkippableFact]
+    public void Hd512_LargeAmplitudeScores_StayAccurate()
+    {
+        // QK-normed models produce large scores; the kernel is all-F32 (no f16 inputs) so this must hold to F32 tolerance.
+        RunOne(seqQ: 16, seqKv: 96, numHeads: 4, numKvHeads: 1, headDim: 512, positionOffset: 80,
+               wideVariant: FlashAttentionWideVariant.Hd256Br4, qkAmplitude: 4f);
+    }
+
+    [SkippableFact]
+    public void Hd512Variant_ReportsSupportedMaxHeadDim_AndIsOptIn()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using var device = VulkanDevice.Create();
+
+        using var without = VulkanFlashAttentionF32Kernel.Create(device, spvDir, FlashAttentionWideVariant.Hd256Br4);
+        Assert.Equal(VulkanFlashAttentionF32Kernel.WideMaxHeadDim, without.SupportedMaxHeadDim);
+
+        using var with512 = VulkanFlashAttentionF32Kernel.Create(device, spvDir, FlashAttentionWideVariant.Hd256Br4, includeHd512: true);
+        Assert.Equal(VulkanFlashAttentionF32Kernel.Hd512MaxHeadDim, with512.SupportedMaxHeadDim);
+        Assert.Equal(4, with512.QueryTileRowsFor(512));
+        Assert.Equal(4, with512.QueryTileRowsFor(256));
+
+        // The factory asks for it exactly when the model has a 512-wide head.
+        VulkanAttentionFallbackDiagnostics.Reset();
+        using var viaFactory = VulkanAttentionFallbackDiagnostics.CreatePrefillFlashAttention(
+            device, spvDir, headDim: 512, modelKind: "TestModel", wideVariantOverride: FlashAttentionWideVariant.Hd256Br4);
+        Assert.NotNull(viaFactory);
+        Assert.Equal(512, viaFactory!.SupportedMaxHeadDim);
+        Assert.Empty(VulkanAttentionFallbackDiagnostics.Reported);
+    }
+
     [SkippableFact]
     public void Hd256Variant_ReportsSupportedMaxHeadDim()
     {
@@ -315,7 +364,7 @@ public class VulkanFlashAttentionF32KernelTests
     private static void RunOne(int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset, int slidingWindow = 0, float softCap = 0.0f, bool useAlibi = false,
         AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0,
-        FlashAttentionWideVariant wideVariant = FlashAttentionWideVariant.Hd256Br16)
+        FlashAttentionWideVariant wideVariant = FlashAttentionWideVariant.Hd256Br16, float qkAmplitude = 1f)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -323,6 +372,11 @@ public class VulkanFlashAttentionF32KernelTests
         float[] qh = RandomFloats(rng, seqQ * numHeads * headDim);
         float[] kh = RandomFloats(rng, seqKv * numKvHeads * headDim);
         float[] vh = RandomFloats(rng, seqKv * numKvHeads * headDim);
+        if (qkAmplitude != 1f)
+        {
+            for (int i = 0; i < qh.Length; i++) qh[i] *= qkAmplitude;
+            for (int i = 0; i < kh.Length; i++) kh[i] *= qkAmplitude;
+        }
         float[] expected = new float[seqQ * numHeads * headDim];
 
         ComputeExpected(qh, kh, vh, expected,
@@ -330,7 +384,7 @@ public class VulkanFlashAttentionF32KernelTests
             slidingWindow, softCap, useAlibi, maskMode, prefixLen);
 
         using var device = VulkanDevice.Create();
-        using var kernel = VulkanFlashAttentionF32Kernel.Create(device, spvDir, wideVariant);
+        using var kernel = VulkanFlashAttentionF32Kernel.Create(device, spvDir, wideVariant, includeHd512: headDim > VulkanFlashAttentionF32Kernel.WideMaxHeadDim);
         // A headDim the loaded variants cannot take would otherwise throw from Record() with a
         // message the reader has to decode; skip explicitly instead.
         Skip.If(headDim > kernel.SupportedMaxHeadDim,

@@ -110,9 +110,11 @@ public static class VulkanAttentionFallbackDiagnostics
             ? FlashAttentionWideVariant.None
             : wideVariantOverride ?? VulkanFlashAttentionF32Kernel.WideVariantFromEnvironment();
 
+        // #914: heads wider than 256 (Gemma-4 global layers, 512) need the optional hd512 pipeline on top of a wide variant.
+        bool wantHd512 = headDim > VulkanFlashAttentionF32Kernel.WideMaxHeadDim;
         int reachableMaxHeadDim = wideVariant == FlashAttentionWideVariant.None
             ? VulkanFlashAttentionF32Kernel.MaxHeadDim
-            : VulkanFlashAttentionF32Kernel.WideMaxHeadDim;
+            : wantHd512 ? VulkanFlashAttentionF32Kernel.Hd512MaxHeadDim : VulkanFlashAttentionF32Kernel.WideMaxHeadDim;
 
         if (headDim > reachableMaxHeadDim)
         {
@@ -121,7 +123,7 @@ public static class VulkanAttentionFallbackDiagnostics
         }
 
         VulkanFlashAttentionF32Kernel? kernel =
-            VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir, wideVariant);
+            VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir, wideVariant, includeHd512: wantHd512);
         if (kernel is null)
         {
             ReportUnavailable(modelKind, "attention_flash_f32.spv is missing or its pipeline failed to build");
