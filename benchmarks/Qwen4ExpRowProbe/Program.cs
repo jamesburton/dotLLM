@@ -503,6 +503,48 @@ void Exec(string line, StringBuilder o)
             o.Append(agg.Report());
             break;
         }
+        case "calib":   // calib <promptIdx> <n> : n zero-draft MTP rounds (#906 calibration) vs n plain 1-row steps, per-step ms (needs an attached head)
+        {
+            var pids = tok.Encode(prompts[int.Parse(a[1])]).ToArray();
+            int n = int.Parse(a[2]);
+            int cap = Math.Min(pids.Length + 2 * n + 16, model.DenseContextLimit);
+            var plainMs = new List<double>(); var zeroMs = new List<double>();
+            model.ResetSequenceState();
+            using (var kv = model.CreateKvCache(cap))
+            {
+                var last = LastRow(model.Forward(pids, Enumerable.Range(0, pids.Length).ToArray(), -1, kv, true));
+                int t = ArgMaxOf(last);
+                for (int i = 0; i < n; i++)
+                {
+                    var t0 = Stopwatch.GetTimestamp();
+                    last = LastRow(model.Forward([t], [pids.Length + i], -1, kv, true));
+                    plainMs.Add(Stopwatch.GetElapsedTime(t0).TotalMilliseconds);
+                    t = ArgMaxOf(last);
+                }
+            }
+            model.ResetSequenceState();
+            using (var kv = model.CreateKvCache(cap))
+            {
+                using var st = model.CreateMtpState(kv.MaxLength)!;
+                var last = LastRow(model.Forward(pids, Enumerable.Range(0, pids.Length).ToArray(), -1, kv, null, st, true));
+                var gen = new List<int> { ArgMaxOf(last) };
+                var dec = new MtpSpeculativeDecoder(greedy: true);
+                var pipeline = new SamplerPipeline(new InferenceOptions { Temperature = 0f });
+                var buf = new int[2];
+                for (int i = 0; i < n; i++)
+                {
+                    var t0 = Stopwatch.GetTimestamp();
+                    var r = dec.DraftAndVerify(model, kv, st, pipeline, gen, null, pids.Length + i, vocab, 0, buf, allowZeroDraft: true);
+                    zeroMs.Add(Stopwatch.GetElapsedTime(t0).TotalMilliseconds);
+                    gen.Add(buf[0]);
+                }
+            }
+            string F(List<double> l) => string.Join(" ", l.Select(x => x.ToString("F0")));
+            var ps = plainMs.OrderBy(x => x).ToList(); var zs = zeroMs.OrderBy(x => x).ToList();
+            o.AppendLine($"calib prompt{a[1]} n={n}: plain per step ms [{F(plainMs)}] median {ps[ps.Count / 2]:F1}");
+            o.AppendLine($"calib prompt{a[1]} n={n}: zero-draft round ms [{F(zeroMs)}] median {zs[zs.Count / 2]:F1}");
+            break;
+        }
         case "pfill":   // pfill <rows> <reps> <prefetch 0|1> : prefill of FRESH random ids (cold table pages) from position 0, wall ms
         {
             int rows = int.Parse(a[1]), reps = int.Parse(a[2]);
