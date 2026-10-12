@@ -98,6 +98,20 @@ public sealed class TextGeneratorMtpGateTests
         Assert.True(gen.MtpGate!.MtpMsPerToken > 0);
     }
 
+    [Fact]
+    public void Warmup_DoesNotLeaveAVerdictInTheGate()
+    {
+        // Warm-up requests are tiny and cold; a bad MTP warm-up sample once made `serve` run plain decode for its first real requests (measured on
+        // UD-IQ4_XS: four greedy requests at plain speed while sampled requests, on a gate warm-up never touched, ran at 1.5x).
+        using var model = NewModel(draftRight: true, plainMs: 8, rowMs: 2, fixedMs: 6);
+        var gen = new TextGenerator(model, new Tok(), mtpEnabled: true, mtpAdaptive: true, speculativeCandidates: 3);
+        WarmupRunner.Run(gen, new Tok(), new WarmupOptions { Iterations = 3, MaxTokens = 16 });
+        Assert.Equal(0, gen.MtpGate!.PlainMsPerToken);
+        Assert.Equal(0, gen.MtpGate.MtpMsPerToken);
+        Assert.Equal(0, gen.MtpGate.CostModel.TotalRounds);
+        Assert.True(gen.MtpGate.ShouldUseMtp(64), "after warm-up the first real request must follow the size prior (MTP first)");
+    }
+
     private sealed class Tok : ITokenizer
     {
         public int VocabSize => Vocab;
