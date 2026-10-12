@@ -179,6 +179,11 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         => new(_device, _kvSlotForLayer, _attentionLayerCount,
                Config.NumKvHeads, Config.HeadDim, maxSeqLen);
 
+    /// <summary>Creates a sparse KV cache with an explicit element format and (optionally) lazy growth (Qwen4-Exp, issue #437).</summary>
+    internal VulkanNemotronHKvCache CreateKvCache(int maxSeqLen, VulkanKvStorage storage, bool lazy)
+        => new(_device, _kvSlotForLayer, _attentionLayerCount,
+               Config.NumKvHeads, Config.HeadDim, maxSeqLen, storage, lazy);
+
     /// <summary>
     /// Creates a fresh per-sequence <see cref="VulkanGdnStateCache"/> sized for this
     /// model's GDN-layer count. The scheduler / multi-seq dispatcher should
@@ -1170,8 +1175,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         if (kvCache is VulkanNemotronHKvCache vkCache)
         {
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, absoluteLayerIdx);
-            KernelSupport.TransferToComputeBarrier(cmdBuf);
+            vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, absoluteLayerIdx, Q4AttentionHook?.F16Writer);
+            if (vkCache.Storage == VulkanKvStorage.F16) KernelSupport.ComputeToComputeBarrier(cmdBuf);   // the convert kernel is a compute writer
+            else KernelSupport.TransferToComputeBarrier(cmdBuf);
             kSrc = vkCache.GetKeysBuffer(absoluteLayerIdx);
             vSrc = vkCache.GetValuesBuffer(absoluteLayerIdx);
             seqKv = vkCache.CurrentLength;
@@ -1189,7 +1195,11 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         // qwen4exp QSA hook (#819): maintains the indexer key cache and, past the dense limit, replaces the dense dispatch below.
         // Null for every other architecture and for the MTP draft head, so their path is untouched.
         bool hookHandled = Q4AttentionHook is { } hook && kvCache is VulkanNemotronHKvCache
-            && hook.RecordAttention(cmdBuf, absoluteLayerIdx, seqLen, positions, kSrc, vSrc);
+            && hook.RecordAttention(cmdBuf, absoluteLayerIdx, seqLen, positions, kSrc, vSrc, ((VulkanNemotronHKvCache)kvCache).Storage);
+
+        if (!hookHandled && kvCache is VulkanNemotronHKvCache { Storage: not VulkanKvStorage.F32 })
+            throw new InvalidOperationException("An F16 KV cache can only be attended by the QSA gather kernel (the dense kernels read F32); " +
+                                                "the QSA hook is missing or disabled for this forward.");
 
         if (hookHandled)
         {

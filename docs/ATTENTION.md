@@ -333,16 +333,64 @@ Measured on the real UD-Q4_K_XL file (Strix Halo, 512 MB BIOS split, 2026-10-10;
 | indexer cost at 1K (same-session A/B, 3 rounds, indexer on vs off) | 43.2-43.8 vs 44.4-45.7 ms/token: within noise |
 | prefill, chunks of 1024 | 3.7 s per first 1K, 3.8 s for 1K-2K, then ~240-260 tok/s at 2K-8K depth (the sparse region costs ~15 % vs the dense one) |
 | KL vs the CPU oracle, 4096-token held-out window, scored half | mean 0.054, median 0.026, top-1 88 %, PPL 9.358 (Vulkan) vs 9.374 (oracle); no step at the dense limit: rows [1800,2051) 0.051, [2051,2300) 0.040 |
-| 16384-token capacity (`DOTLLM_VK_QWEN4EXP_CONTEXT=16384`, one live sequence): needles at 12,769 tokens | **3/3**; decode 21.3 / 21.2 tok/s at depth 12K / 16K (47 ms/token), prefill 230-240 tok/s at 12K. Each live state holds the full K/V + indexer allocation (0.9 GiB at 16K), two concurrent 16K states exceed the resident wall |
+| 16384-token capacity (`DOTLLM_VK_QWEN4EXP_CONTEXT=16384`, one live sequence): needles at 12,769 tokens | **3/3**; decode 21.3 / 21.2 tok/s at depth 12K / 16K (47 ms/token), prefill 230-240 tok/s at 12K. Before #898 each live state held the full K/V + indexer allocation (0.9 GiB at 16K), so two concurrent 16K states exceeded the resident wall (lazy growth, below, removed that) |
 | device memory | heap1 69,780 MiB + heap0 9.8 GiB (was 12.1 GiB before the host embedding gather) at an 8192-token capacity |
 
 The KL level is the pre-existing Vulkan-vs-oracle gap that grows with context (#873, ~0.03-0.05 at 512-2K positions on the same file), not a QSA effect: it has no
 discontinuity where the sparse path starts.
 
-Capacity: the K/V cache is F32 (48 KiB per token over the 12 layers) plus 5 KiB per token of indexer keys. The model is sized for
-`min(context_length, 8192)` tokens by default (`DOTLLM_VK_QWEN4EXP_CONTEXT` overrides; halved automatically until the residency plan fits). On the 128 GiB Strix Halo
-box the OS keeps ~82 GiB resident per process and the UD-Q4_K_XL trunk is ~79 GiB, which is why the token-embedding table is gathered on the HOST for qwen4exp
-(`DOTLLM_VK_QWEN4EXP_HOST_EMBED`, default on): the device-resident F32 copy was 2.4 GiB.
+Capacity: the K/V cache is F32 by default (48 KiB per token over the 12 layers) plus 7.5 KiB per token of indexer keys (6 KiB raw + 1.5 KiB pooled). The model is
+sized for `min(context_length, 8192)` tokens by default (`DOTLLM_VK_QWEN4EXP_CONTEXT` overrides; halved automatically until the residency plan fits). On the
+128 GiB Strix Halo box the OS keeps ~82 GiB resident per process and the UD-Q4_K_XL trunk is ~79 GiB, which is why the token-embedding table is gathered on the
+HOST for qwen4exp (`DOTLLM_VK_QWEN4EXP_HOST_EMBED`, default on): the device-resident F32 copy was 2.4 GiB.
+
+### Lazy growth and F16 K/V (issue #898, lifts the ~16K ceiling)
+
+* **Lazy growth (default on, `DOTLLM_VK_QWEN4EXP_KV_LAZY=0` restores eager).** A sequence's K/V cache (`VulkanNemotronHKvCache`, `lazy: true`) and indexer state
+  (`VulkanQwen4ExpIndexerState`) start empty and grow 25 % (>= 1024 positions) at a time: `ForwardCore` calls `EnsureContext` BEFORE recording, which reallocates layer by
+  layer (one layer's K+V transient), copies the live prefix, and drops every descriptor cache that could name the freed handles (the aliasing trap of #437: a stale
+  cached set silently reads zeros). `MaxLength` stays the logical limit. Output is **bit-identical** to eager (KL 0, 72 of 72 logit rows on the real file; synthetic
+  test across 5 growths); a growth step stalls ~0.3 s (21 growths = 6.2 s over two 16K prefills, ~4 % each).
+* **F16 K/V (opt-in: `DOTLLM_VK_QWEN4EXP_KV=f16`).** K/V rows are converted by `convert_f32_to_f16_range.comp` (round-to-nearest-even in the shader: AMD's `packHalf2x16`
+  truncates) and read DIRECTLY by `qsa_attention_f16kv.comp`, a byte-for-byte twin of `qsa_attention_f32.comp` with only the K/V loads changed (no dequant pass; the
+  gather touches ~2K keys per query, a full-history dequant would move ~190 MiB per layer per step at 32K). The gather kernel attends every block while a query's block count
+  fits the budget, so below the dense limit an F16 cache is served by it too instead of the dense kernels (which cannot read F16). The hook therefore MUST handle every layer:
+  `RecordFullAttnLayer` throws if an F16 cache reaches the dense path, and F16 with `DOTLLM_VK_QWEN4EXP_QSA=0` is refused. The MTP draft head keeps an F32 cache.
+  `DOTLLM_VK_QWEN4EXP_IDX_F16=1` additionally stores the indexer's RAW keys as F16 (`qsa_pool_f16raw.comp`; pooled keys stay F32): -3 KiB/token, slightly noisier selection.
+
+| per token, 12 layers | F32 (default) | F16 K/V | F16 K/V + F16 raw keys |
+|---|---:|---:|---:|
+| K/V | 48 KiB | 24 KiB | 24 KiB |
+| indexer (raw + pooled) | 7.5 KiB | 7.5 KiB | 4.5 KiB |
+| total; 32K tokens | 55.5 KiB; 1.73 GiB | 31.5 KiB; 0.98 GiB | 28.5 KiB; 0.89 GiB |
+
+Measured on the real UD-Q4_K_XL file (same-session, `VulkanQwen4ExpRealQsaTests`; quiet machine unless noted):
+
+| | F32 K/V (eager) | F32 lazy | F16 lazy | F16 + F16 raw keys |
+|---|---|---|---|---|
+| device heap0 after a 4096-token prefill (MiB; weights + scratch 9,813) | 10,870 | 10,260 | 10,140 | 10,125 |
+| same at 16,000 tokens | 10,870 | 10,870 | 10,486 | 10,438 |
+| KL vs CPU oracle, 4096-token held-out window, scored half (rope fix in) | 0.0549 | | 0.0558 | |
+| held-out PPL, same window (CPU oracle 9.374) | 9.337 | | 9.356 | |
+| KL(F32 K/V \|\| arm), same window | | 0 (bit-identical) | 0.0063 (top-1 95.8 %) | 0.0069 |
+| KL(F32 \|\| arm), 72 decode/prefill-tail rows at 2K-16K | | 0 | 0.027 | 0.042 |
+| control: KL(F32 \|\| F32 with the softmax merge in 1 split instead of <=16, a pure summation-order change), same 72 rows | | 0.017 | | |
+
+The model is chaotic to any rounding change (quantised weights and activations digitise ULP drift), so an F16-vs-F32 KL of 0.006-0.03 is the same order as merely reordering float
+sums (0.017) and is much smaller than the existing Vulkan-vs-oracle gap (0.054, #873); the distance to the CPU oracle and the PPL do not move. F16 raw keys flip a few more top-k blocks
+(KL 0.042 on the decode rows), so they are a separate opt-in.
+
+Long context with F16 K/V (capacity 34,000; needles from `scratchpad/needle2`): needles **6/6** at 23,783 and 31,011 tokens; prefill 229-238 tok/s; decode 20.5 tok/s at depth 32K
+(19.5-20.7 from 4K to 32K: flat, as the gather is bounded by ~2K keys). Ceiling probe (`DOTLLM_VK_QWEN4EXP_CONTEXT=66000`, F16 K/V, one sequence of filler tokens, no needles):
+the residency plan keeps the full 66,000 capacity, the sequence reaches 64,024 tokens without an allocation failure, prefill 210-220 tok/s over the last 16K, decode 20.1 tok/s at 48K and 19.4 at 64K
+(quality beyond 32K is NOT validated: no needle files exist above 31K). Same-session interleaved A/B, F32 lazy vs F16 lazy: decode 45.9 / 44.4 ms at 1K, 49.6 / 46.5 at 4K, 48.0 / 46.9 at 8K,
+52.4 / 47.9 at 16K; sparse prefill 202 / 221 tok/s: F16 is never slower (half the bytes per gathered key).
+
+RoPE fp32 angle: the shaders computed `sin(pos * freq)` with the GPU's own sin/cos, whose internal fp32 argument reduction costs ~6e-8 x angle of extra phase error (1.3-2.7x the CPU
+table's error from 8K positions: max |error| of (cos, sin) vs double truth at 32K/131K positions was 2.8e-3/1.1e-2 vs the CPU table's 1.0e-3/3.8e-3). `rope_f32`, `rope_kv_write_f32`,
+`rope_invfreq_f32`, `rope_yarn_f32`, `rope_mla_f32` and `qsa_pool_*` now range-reduce the angle to [-pi, pi] with a Cody-Waite split of 2 pi before `sin`/`cos`, bringing the GPU to the CPU
+table's error (1.07x at worst; identical for |angle| < pi, so short contexts are unchanged). The remaining loss is the fp32 product `pos * freq` itself, shared by the CPU table, HF and
+llama.cpp (CUDA and the CPU use libm sin/cos, which reduce exactly). It did not move the Vulkan-vs-oracle KL at 4096 (0.0542 -> 0.0549): not a cause of #873.
 
 ## IAttentionStrategy — Kernel Selection
 

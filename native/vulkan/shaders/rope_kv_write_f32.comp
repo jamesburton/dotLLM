@@ -58,6 +58,18 @@ layout(push_constant) uniform PushConstants {
     uint  kvStride;       // elements per cache row (== numKvHeads * headDim for this layer)
 } pc;
 
+// sin/cos of a RoPE angle with the argument range-reduced to [-pi, pi] first (issue #898). The GPU's sin/cos reduce the argument in fp32 internally,
+// which costs ~6e-8 * angle of phase error (0.2 % of a radian at 32K positions on the highest-frequency pair); the CPU table and CUDA use libm sin/cos
+// that reduce exactly. 2*pi is split into float(2*pi) + a correction so r = angle - k*2*pi carries only the error of the angle itself (identical to the
+// reference implementations) while |angle| < 2^23. For |angle| < pi this is the identity: short contexts are unchanged.
+void sincosRed(float a, out float c, out float s) {
+    float k = floor(a * 0.15915494309189535 + 0.5);
+    float r = fma(-k, 6.28318548202514648, a);   // float(2*pi) = 2*pi + 1.7484556e-7
+    r = fma(k, 1.7484556e-7, r);
+    c = cos(r);
+    s = sin(r);
+}
+
 void main() {
     uint idx = gl_GlobalInvocationID.x;
 
@@ -82,8 +94,8 @@ void main() {
         float expn  = float(2u * pair) / float(pc.freqDim);
         float freq  = 1.0 / pow(pc.theta, expn);
         float angle = float(positions[t]) * freq;
-        float c     = cos(angle);
-        float s     = sin(angle);
+        float c, s;
+        sincosRed(angle, c, s);
 
         uint baseIdx = t * pc.numHeads * pc.headDim + head * pc.headDim;
         uint i0, i1;
@@ -113,8 +125,8 @@ void main() {
         float expn  = float(2u * pair) / float(pc.freqDim);
         float freq  = 1.0 / pow(pc.theta, expn);
         float angle = float(positions[t]) * freq;
-        float c     = cos(angle);
-        float s     = sin(angle);
+        float c, s;
+        sincosRed(angle, c, s);
 
         uint srcBase = t * pc.numKvHeads * pc.headDim + head * pc.headDim;
         uint i0, i1;

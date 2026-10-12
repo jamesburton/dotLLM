@@ -31,6 +31,9 @@ public sealed class VulkanQwen4ExpSequenceState : IGdnState
     /// <summary>The state's own dense QSA K/V rows, allocated on first use (an engine-supplied KV cache bypasses them entirely).</summary>
     internal VulkanNemotronHKvCache OwnKv => _kv ??= _kvFactory!();
 
+    /// <summary>Test hook: positions the state's own K/V cache holds on the device right now (0 before first use).</summary>
+    internal int OwnKvAllocatedForTests => _kv?.AllocatedLength ?? 0;
+
     /// <summary>The state's QSA indexer key cache (raw + pooled keys per QSA layer), allocated on first use (#819).</summary>
     internal VulkanQwen4ExpIndexerState Indexer => _indexer ??= _indexerFactory!();
 
@@ -225,11 +228,56 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
 
     /// <summary>Allocates a fresh sequence state (KV capacity <see cref="DenseContextLimit"/>).</summary>
     public VulkanQwen4ExpSequenceState CreateState()
-        => new(_core.Q4CreateGdnState(), () => _core.Q4CreateKvCache(_kvCapacity), _ple?.CreateState(),
-            () => new VulkanQwen4ExpIndexerState(_device, _qsa.Ordinal.Count(o => o >= 0), _kvCapacity, _q4.IndexerKeyLength, _q4.IndexerBlockSize));
+    {
+        // The formats are read now, so one state is internally consistent even if the switches change later.
+        var storage = ResolveKvStorage();
+        bool lazy = LazyKv, rawF16 = IndexerRawF16;
+        if (rawF16 && !_qsa.F16Supported) throw new NotSupportedException("F16 indexer keys need qsa_pool_f16raw.spv / convert_f32_to_f16_range.spv next to the other SPIR-V blobs.");
+        return new(_core.Q4CreateGdnState(), () => _core.Q4CreateKvCache(_kvCapacity, storage, lazy), _ple?.CreateState(),
+            () => new VulkanQwen4ExpIndexerState(_device, _qsa.Ordinal.Count(o => o >= 0), _kvCapacity, _q4.IndexerKeyLength, _q4.IndexerBlockSize, lazy, rawF16));
+    }
 
-    /// <summary>Allocates an engine KV cache for the QSA layers (capacity clamped to <see cref="DenseContextLimit"/>).</summary>
-    public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen) => _core.Q4CreateKvCache(Math.Min(maxSeqLen, _kvCapacity));
+    private VulkanKvStorage ResolveKvStorage()
+    {
+        var s = KvStorage;
+        if (s == VulkanKvStorage.F16 && !_qsa.F16Supported)
+            throw new NotSupportedException("DOTLLM_VK_QWEN4EXP_KV=f16 needs qsa_attention_f16kv.spv / convert_f32_to_f16_range.spv next to the other SPIR-V blobs.");
+        return s;
+    }
+
+    /// <summary>
+    /// Allocates an engine KV cache for the QSA layers (capacity clamped to <see cref="ContextCapacity"/>), in the format of <see cref="KvStorage"/>;
+    /// grows on demand unless <see cref="LazyKv"/> is off.
+    /// </summary>
+    public VulkanNemotronHKvCache CreateKvCache(int maxSeqLen) => _core.Q4CreateKvCache(Math.Min(maxSeqLen, _kvCapacity), ResolveKvStorage(), LazyKv);
+
+    /// <summary>
+    /// Grows the lazily allocated K/V cache and indexer state of a sequence to hold <paramref name="positions"/> positions (before any recording), and
+    /// drops every descriptor cache that could name the freed buffers. True when anything was re-created.
+    /// </summary>
+    private bool EnsureContext(VulkanNemotronHKvCache kv, VulkanQwen4ExpSequenceState state, int positions)
+    {
+        bool grew;
+        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        try { grew = kv.EnsureCapacity(positions) | state.Indexer.EnsureCapacity(positions, state.Length); }
+        catch (Interop.VulkanException e) when (e.ErrorCode is -2 or -1)   // out of device / host memory
+        {
+            throw new InvalidOperationException(
+                $"Out of device memory growing the K/V + indexer caches to {positions} positions ({e.Message}). Use DOTLLM_VK_QWEN4EXP_KV=f16 or a shorter context.", e);
+        }
+        if (grew)
+        {
+            _core.Q4InvalidateCaches(); _qsa.InvalidateDescriptorCaches(); CacheGrowths++;
+            CacheGrowthSeconds += System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalSeconds;
+        }
+        return grew;
+    }
+
+    /// <summary>Test hook: how many forwards re-created a K/V or indexer buffer.</summary>
+    internal long CacheGrowths { get; private set; }
+
+    /// <summary>Test hook: wall seconds spent re-creating and copying K/V + indexer buffers (the stall of a growth step).</summary>
+    internal double CacheGrowthSeconds { get; private set; }
 
     /// <inheritdoc/>
     public bool SupportsThreadedSequenceState => true;
@@ -411,7 +459,7 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         if (state.Length + T > _kvCapacity)
             throw new NotSupportedException(
                 $"qwen4exp on Vulkan is sized for {_kvCapacity} tokens (K/V and indexer caches); this call would reach {state.Length + T}. " +
-                "Raise the capacity with DOTLLM_VK_QWEN4EXP_CONTEXT (K/V costs 48 KiB per token in F32) if the device has the memory.");
+                "Raise the capacity with DOTLLM_VK_QWEN4EXP_CONTEXT (K/V costs 48 KiB per token in F32, 24 with DOTLLM_VK_QWEN4EXP_KV=f16) if the device has the memory.");
         if (kvCache is null && kv.CurrentLength > state.Length) kv.Rollback(state.Length);   // rows of rejected speculative tokens
         if (kvCache is not null)
         {
@@ -426,6 +474,10 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         for (int i = 0; i < T; i++)
             if ((uint)tokenIds[i] >= (uint)_vocab)
                 throw new ArgumentOutOfRangeException(nameof(tokenIds), $"Token ID {tokenIds[i]} at position {i} is out of range [0, {_vocab}).");
+
+        if (kv.Storage == VulkanKvStorage.F16 && !VulkanQwen4ExpQsa.Enabled)
+            throw new NotSupportedException("An F16 KV cache is read only by the QSA gather kernel; DOTLLM_VK_QWEN4EXP_QSA=0 cannot be combined with DOTLLM_VK_QWEN4EXP_KV=f16.");
+        EnsureContext(kv, state, state.Length + T);   // lazy K/V + indexer growth (#437)
 
         bool resized = _core.Q4EnsureCapacity(T);
         EnsureScratch(T);

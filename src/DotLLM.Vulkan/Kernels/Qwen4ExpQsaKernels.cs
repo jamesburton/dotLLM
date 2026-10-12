@@ -66,11 +66,23 @@ public sealed class Qwen4ExpQsaKernels : IDisposable
         }
     }
 
+    private const int ConvertPcBytes = 2 * 4;
+
     private readonly Stage _pool, _score, _select, _attn, _merge;
+    private readonly Stage? _attn16, _pool16, _convert;
     private bool _disposed;
 
-    private Qwen4ExpQsaKernels(Stage pool, Stage score, Stage select, Stage attn, Stage merge)
-    { _pool = pool; _score = score; _select = select; _attn = attn; _merge = merge; }
+    private Qwen4ExpQsaKernels(Stage pool, Stage score, Stage select, Stage attn, Stage merge, Stage? attn16, Stage? pool16, Stage? convert)
+    { _pool = pool; _score = score; _select = select; _attn = attn; _merge = merge; _attn16 = attn16; _pool16 = pool16; _convert = convert; }
+
+    /// <summary>True when the F16 K/V gather kernel, the F16-raw pooling kernel and the F32-to-F16 convert kernel were all found (issue #437).</summary>
+    public bool F16Supported => _attn16 is not null && _pool16 is not null && _convert is not null;
+
+    /// <summary>Test hook: dispatches of the F16-KV gather attention kernel.</summary>
+    public long F16AttentionDispatches { get; private set; }
+
+    /// <summary>Test hook: dispatches of the F32-to-F16 convert kernel.</summary>
+    public long ConvertDispatches { get; private set; }
 
     /// <summary>Loads the five <c>qsa_*_f32.spv</c> blobs from <paramref name="spvDir"/>.</summary>
     public static Qwen4ExpQsaKernels Create(VulkanDevice device, string spvDir)
@@ -79,8 +91,19 @@ public sealed class Qwen4ExpQsaKernels : IDisposable
         try
         {
             Stage Make(string n, int b, int pc) { var s = new Stage(device, spvDir, n, b, pc); made.Add(s); return s; }
-            return new Qwen4ExpQsaKernels(Make("qsa_pool_f32", 3, PoolPcBytes), Make("qsa_score_f32", 3, ScorePcBytes),
-                Make("qsa_select_f32", 2, SelectPcBytes), Make("qsa_attention_f32", 6, AttnPcBytes), Make("qsa_merge_f32", 3, MergePcBytes));
+            var pool = Make("qsa_pool_f32", 3, PoolPcBytes); var score = Make("qsa_score_f32", 3, ScorePcBytes);
+            var select = Make("qsa_select_f32", 2, SelectPcBytes); var attn = Make("qsa_attention_f32", 6, AttnPcBytes);
+            var merge = Make("qsa_merge_f32", 3, MergePcBytes);
+            // The F16 twins are optional: a missing blob only disables the F16 KV option.
+            Stage? attn16 = null, pool16 = null, convert = null;
+            if (File.Exists(Path.Combine(spvDir, "qsa_attention_f16kv.spv")) && File.Exists(Path.Combine(spvDir, "qsa_pool_f16raw.spv"))
+                && File.Exists(Path.Combine(spvDir, "convert_f32_to_f16_range.spv")))
+            {
+                attn16 = Make("qsa_attention_f16kv", 6, AttnPcBytes);
+                pool16 = Make("qsa_pool_f16raw", 3, PoolPcBytes);
+                convert = Make("convert_f32_to_f16_range", 2, ConvertPcBytes);
+            }
+            return new Qwen4ExpQsaKernels(pool, score, select, attn, merge, attn16, pool16, convert);
         }
         catch { foreach (var s in made) s.Dispose(); throw; }
     }
@@ -89,6 +112,7 @@ public sealed class Qwen4ExpQsaKernels : IDisposable
     public void InvalidateDescriptorCache()
     {
         _pool.Cache.Reset(); _score.Cache.Reset(); _select.Cache.Reset(); _attn.Cache.Reset(); _merge.Cache.Reset();
+        _attn16?.Cache.Reset(); _pool16?.Cache.Reset(); _convert?.Cache.Reset();
     }
 
     private static void U(Span<byte> pc, int i, uint v) => BinaryPrimitives.WriteUInt32LittleEndian(pc[(i * 4)..], v);
@@ -99,14 +123,15 @@ public sealed class Qwen4ExpQsaKernels : IDisposable
     /// <c>[blocks, dim]</c>: mean of the block's raw keys, RMSNorm with <paramref name="gamma"/>, NeoX RoPE (leading <paramref name="ropeDim"/> dims) at the block's first position.
     /// </summary>
     public void RecordPool(nint cmd, VulkanDevice.Buffer raw, VulkanDevice.Buffer gamma, VulkanDevice.Buffer pooled,
-        int firstBlock, int numBlocks, int dim, int ropeDim, int blockSize, float eps, float theta)
+        int firstBlock, int numBlocks, int dim, int ropeDim, int blockSize, float eps, float theta, bool rawF16 = false)
     {
         if (numBlocks <= 0) return;
+        if (rawF16 && _pool16 is null) throw new InvalidOperationException("The F16 pooling kernel is not available.");
         if (dim > 512) throw new ArgumentOutOfRangeException(nameof(dim), "indexer key width above 512 is not supported.");
         Span<byte> pc = stackalloc byte[PoolPcBytes];
         U(pc, 0, (uint)firstBlock); U(pc, 1, (uint)numBlocks); U(pc, 2, (uint)dim); U(pc, 3, (uint)ropeDim);
         U(pc, 4, (uint)blockSize); F(pc, 5, eps); F(pc, 6, theta);
-        _pool.Dispatch(cmd, [raw.Handle, gamma.Handle, pooled.Handle], pc, (uint)numBlocks, 1);
+        (rawF16 ? _pool16! : _pool).Dispatch(cmd, [raw.Handle, gamma.Handle, pooled.Handle], pc, (uint)numBlocks, 1);
     }
 
     /// <summary>Scores the complete blocks of queries <c>qBase .. qBase+qCount-1</c> whose block count exceeds the budget (others untouched).</summary>
@@ -138,18 +163,39 @@ public sealed class Qwen4ExpQsaKernels : IDisposable
     /// </summary>
     public void RecordAttention(nint cmd, VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer sel,
         VulkanDevice.Buffer partOut, VulkanDevice.Buffer partMs, VulkanDevice.Buffer output,
-        int qBase, int qCount, int firstPos, int numHeads, int numKvHeads, int headDim, int blockSize, int budgetBlocks, int numSplits)
+        int qBase, int qCount, int firstPos, int numHeads, int numKvHeads, int headDim, int blockSize, int budgetBlocks, int numSplits,
+        bool kvF16 = false)
     {
         if (headDim > 512) throw new ArgumentOutOfRangeException(nameof(headDim));
+        if (kvF16 && _attn16 is null) throw new InvalidOperationException("The F16 KV attention kernel is not available.");
+        if (kvF16 && (headDim & 1) != 0) throw new ArgumentOutOfRangeException(nameof(headDim), "F16 KV needs an even head width.");
         Span<byte> pc = stackalloc byte[AttnPcBytes];
         U(pc, 0, (uint)qBase); U(pc, 1, (uint)qCount); U(pc, 2, (uint)firstPos); U(pc, 3, (uint)numHeads); U(pc, 4, (uint)numKvHeads);
         U(pc, 5, (uint)headDim); U(pc, 6, (uint)blockSize); U(pc, 7, (uint)budgetBlocks); U(pc, 8, (uint)numSplits);
         U(pc, 9, (uint)budgetBlocks); F(pc, 10, 1.0f / MathF.Sqrt(headDim));
-        _attn.Dispatch(cmd, [q.Handle, k.Handle, v.Handle, sel.Handle, partOut.Handle, partMs.Handle], pc, (uint)(numHeads * numSplits), (uint)qCount);
+        if (kvF16) F16AttentionDispatches++;
+        (kvF16 ? _attn16! : _attn).Dispatch(cmd, [q.Handle, k.Handle, v.Handle, sel.Handle, partOut.Handle, partMs.Handle], pc, (uint)(numHeads * numSplits), (uint)qCount);
         KernelSupport.ComputeToComputeBarrier(cmd);
         Span<byte> mc = stackalloc byte[MergePcBytes];
         U(mc, 0, (uint)qBase); U(mc, 1, (uint)numHeads); U(mc, 2, (uint)headDim); U(mc, 3, (uint)numSplits);
         _merge.Dispatch(cmd, [partOut.Handle, partMs.Handle, output.Handle], mc, (uint)numHeads, (uint)qCount);
+    }
+
+    /// <summary>
+    /// Converts <paramref name="count"/> F32 elements from the start of <paramref name="src"/> into F16 at element offset <paramref name="dstElemOffset"/>
+    /// of <paramref name="dst"/> (uint-backed halves). Both must be even. Values saturate at the F16 range.
+    /// </summary>
+    public void RecordF32ToF16(nint cmd, VulkanDevice.Buffer src, VulkanDevice.Buffer dst, long dstElemOffset, long count)
+    {
+        if (_convert is null) throw new InvalidOperationException("The F32-to-F16 convert kernel is not available.");
+        if (count <= 0) return;
+        if ((dstElemOffset & 1) != 0 || (count & 1) != 0) throw new ArgumentException("F16 convert offsets and counts must be even.");
+        long words = count / 2;
+        if (dstElemOffset / 2 + words > uint.MaxValue || words > 0x7FFFFFFFL * 1) throw new ArgumentOutOfRangeException(nameof(count));
+        Span<byte> pc = stackalloc byte[ConvertPcBytes];
+        U(pc, 0, (uint)(dstElemOffset / 2)); U(pc, 1, (uint)words);
+        ConvertDispatches++;
+        _convert.Dispatch(cmd, [src.Handle, dst.Handle], pc, (uint)((words + 255) / 256), 1);
     }
 
     /// <inheritdoc/>
@@ -158,5 +204,6 @@ public sealed class Qwen4ExpQsaKernels : IDisposable
         if (_disposed) return;
         _disposed = true;
         _pool.Dispose(); _score.Dispose(); _select.Dispose(); _attn.Dispose(); _merge.Dispose();
+        _attn16?.Dispose(); _pool16?.Dispose(); _convert?.Dispose();
     }
 }

@@ -134,24 +134,24 @@ internal readonly record struct Qwen4ExpResidencyPlan(
     }
 
     /// <summary>Dense-attention KV cache bytes for <paramref name="positions"/> positions across the QSA layers (F32 K and V).</summary>
-    public static long KvBytes(ModelConfig config, int positions)
+    public static long KvBytes(ModelConfig config, int positions, int elementBytes = 4)
     {
         var layout = config.HybridLayout!;
         long layers = layout.LayerKind.Count(k => k == HybridLayerKind.Attention);
-        return layers * 2L * positions * config.NumKvHeads * config.HeadDim * 4;
+        return layers * 2L * positions * config.NumKvHeads * config.HeadDim * elementBytes;
     }
 
     /// <summary>
     /// Device bytes of everything that grows with context for a sequence: the F32 K/V rows of the QSA layers plus the indexer's raw and
     /// pooled keys (#819). Raw keys are one row per position, pooled keys one per block.
     /// </summary>
-    public static long ContextBytes(ModelConfig config, int positions)
+    public static long ContextBytes(ModelConfig config, int positions, int kvElementBytes = 4, bool rawKeysF16 = false)
     {
         var layout = config.HybridLayout!;
         long layers = layout.LayerKind.Count(k => k == HybridLayerKind.Attention);
         long idx = config.Qwen4Exp is { } q4 && q4.IndexerBlockSize > 0
-            ? VulkanQwen4ExpIndexerState.BytesFor((int)layers, positions, q4.IndexerKeyLength, q4.IndexerBlockSize) : 0;
-        return KvBytes(config, positions) + idx;
+            ? VulkanQwen4ExpIndexerState.BytesFor((int)layers, positions, q4.IndexerKeyLength, q4.IndexerBlockSize, rawKeysF16) : 0;
+        return KvBytes(config, positions, kvElementBytes) + idx;
     }
 
     /// <summary>
@@ -159,12 +159,13 @@ internal readonly record struct Qwen4ExpResidencyPlan(
     /// </summary>
     public static Qwen4ExpResidencyPlan Create(
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, ModelConfig config,
-        long capacityBytes, int kvPositions, long physicalRamBytes, long? headroomBytes = null, bool integerDot = true)
+        long capacityBytes, int kvPositions, long physicalRamBytes, long? headroomBytes = null, bool integerDot = true,
+        int kvElementBytes = 4, bool rawKeysF16 = false)
     {
         var (device, hostOnly) = EstimateWeights(tensors, config, integerDot);
         // Scratch: the prefill chunk working set (routed-expert intermediates dominate) - a flat allowance plus per-position KV.
         long scratch = 1L << 30;
-        return new Qwen4ExpResidencyPlan(device, ContextBytes(config, kvPositions) + scratch, hostOnly,
+        return new Qwen4ExpResidencyPlan(device, ContextBytes(config, kvPositions, kvElementBytes, rawKeysF16) + scratch, hostOnly,
             capacityBytes, headroomBytes ?? DefaultHeadroom(capacityBytes), physicalRamBytes);
     }
 }
