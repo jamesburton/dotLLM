@@ -493,11 +493,11 @@ public sealed class VulkanTransformerModel : IModel
     {
         "start", "embed", "qkv_proj", "rope", "kv_update", "attention",
         "o_proj", "norm_resid", "ffn_gate_up", "ffn_act", "ffn_down", "lm_head",
-        "attn_split",
+        "attn_split", "moe_route", "moe_experts",
     };
     private const byte DpCatStart = 0, DpCatEmbed = 1, DpCatQkv = 2, DpCatRope = 3,
         DpCatKv = 4, DpCatAttn = 5, DpCatO = 6, DpCatResid = 7, DpCatGateUp = 8,
-        DpCatAct = 9, DpCatDown = 10, DpCatLmHead = 11, DpCatAttnSplit = 12;
+        DpCatAct = 9, DpCatDown = 10, DpCatLmHead = 11, DpCatAttnSplit = 12, DpCatMoeRoute = 13, DpCatMoeExperts = 14;
 
     // Cached delegate for the split-KV kernel's inter-pass profiler hook — when
     // the GPU decode profiler is active this splits the "attention" category
@@ -843,6 +843,37 @@ public sealed class VulkanTransformerModel : IModel
     public int GroupedMoeDispatchCount { get; private set; }
     /// <summary>Of <see cref="GroupedMoeDispatchCount"/>, layers whose gate/up banks were MXFP4 (gpt-oss).</summary>
     public int GroupedMoeMxfp4DispatchCount { get; private set; }
+
+    // Generic-MoE decode MMVQ (#912): indexed dp4a expert GEMVs for RecordMoeLayer rows below the grouped threshold. All null when the model has no
+    // (non-Gemma-4) MoE, the device lacks integer dot product, or DOTLLM_VULKAN_DISABLE_MOE_MMVQ=1 / DOTLLM_VK_MOE_MMVQ=0.
+    private MoeIndexedMatmulKQuantMmvqKernel? _gmMmvqQ4K, _gmMmvqQ5K, _gmMmvqQ6K;
+    private MoeIndexedMatmulQ8_0MmvqKernel? _gmMmvqQ8_0;
+    private MoeIndexedMatmulMxfp4MmvqKernel? _gmMmvqMxfp4;
+    private MoeIndexedMatmulKQuantMmvqKernel? _gmMmvqQ4KMr;
+    private SwiGluQuantizeRowsKernel? _gmSwiGluQuant;
+    /// <summary>Runtime A/B switch: fuse the routed-expert activation with the Q8_1 quantize of the down input (default on).</summary>
+    public bool GenericMoeFuseEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_GMOE_FUSE") != "0";
+    /// <summary>
+    /// Multi-row (NR output rows per workgroup) Q4_K indexed MMVQ for the generic MoE arm. OPT-IN (<c>DOTLLM_VK_MOE_MR=&lt;NR&gt;</c>, NR &gt;= 2): measured neutral
+    /// within run-to-run noise on GLM-4.7-Flash (#912), so the one-row kernel stays the default.
+    /// </summary>
+    public bool GenericMoeMrEnabled { get; set; } = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MR"), out int mrOptIn) && mrOptIn >= 2;
+    /// <summary>Count of generic MoE layers whose routed experts ran on the indexed dp4a MMVQ decode kernels (test/diagnostic, #912).</summary>
+    public long GenericMoeMmvqLayerCount { get; private set; }
+    /// <summary>Count of generic MoE layers that ran the scalar one-thread-per-cell indexed kernels at a decode-sized row count (test/diagnostic, #912).</summary>
+    public long GenericMoeScalarDecodeLayerCount { get; private set; }
+    /// <summary>True when at least one generic-MoE MMVQ kernel was built for this model (integer-dot device, SPIR-V present, not disabled by env).</summary>
+    public bool GenericMoeMmvqAvailable =>
+        _quantizeQ8_1Rows is not null && (_gmMmvqQ4K is not null || _gmMmvqQ5K is not null || _gmMmvqQ6K is not null || _gmMmvqQ8_0 is not null || _gmMmvqMxfp4 is not null);
+    /// <summary>Runtime A/B switch for the generic MoE MMVQ decode arm (default on). Off = the scalar indexed kernels, so one loaded model can compare both.</summary>
+    public bool GenericMoeMmvqEnabled { get; set; } = true;
+    /// <summary>
+    /// Largest row count the MMVQ arm is PREFERRED over the expert-grouped coopmat GEMM (default 4, measured crossover; <c>DOTLLM_VK_MOE_MMVQ_MAX_ROWS</c>
+    /// overrides). Above it, layers whose banks the grouped path supports go grouped (<see cref="EffGroupedMoeMinTokens"/>); layers it cannot serve keep the
+    /// arm up to 15 rows (still far faster than the scalar kernels).
+    /// </summary>
+    public int GenericMoeMmvqMaxRows { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MMVQ_MAX_ROWS"), out int mmr) && mmr >= 0 ? mmr : 4;
     /// <summary>
     /// Runtime A/B switch for the generic grouped-by-expert prefill path (default on; load-time opt-out <c>DOTLLM_VK_MOE_GROUPED=0</c>).
     /// Off = the scalar indexed kernels, so one loaded model can compare both paths in-process.
@@ -2160,6 +2191,20 @@ public sealed class VulkanTransformerModel : IModel
                 model._grpMxfp4 = MoeGroupedMatmulLegacyQuantCoopmatKernel.Create(device, spvDir, MoeGroupedLegacyQuant.Mxfp4);
             model._grpTileList = MoeBuildTileListKernel.Create(device, spvDir);
         }
+        if (hasMoe && !config.Gemma4DualFfn && quantizeQ8_1Rows is not null && !IsMmvqDisabled() && !IsMoeMmvqDisabled()
+            && Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MMVQ") != "0")
+        {
+            // #912: indexed dp4a MMVQ twins of the scalar decode kernels. K-quant ones take the xDiv broadcast (no expanded-input copy);
+            // they bypass UseKQuantMmvq on purpose - that gate is the DENSE-GEMV finding (#801); Qwen3.6-35B-A3B / Gemma-4 run these indexed kernels on AMD.
+            model._gmMmvqQ4K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q4_K);
+            model._gmMmvqQ5K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q5_K);
+            model._gmMmvqQ6K = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q6_K);
+            model._gmMmvqQ8_0 = MoeIndexedMatmulQ8_0MmvqKernel.TryCreate(device, spvDir);
+            model._gmMmvqMxfp4 = MoeIndexedMatmulMxfp4MmvqKernel.TryCreate(device, spvDir);
+            if (int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MR"), out int gmMrEnv) && gmMrEnv >= 2)
+                model._gmMmvqQ4KMr = MoeIndexedMatmulKQuantMmvqKernel.TryCreate(device, spvDir, MoeGroupedKQuant.Q4_K, gmMrEnv);
+            model._gmSwiGluQuant = SwiGluQuantizeRowsKernel.TryCreate(device, spvDir);
+        }
         model._firstLayer = firstLayer;
         model._proportionalRopePairs = proportionalRopePairs;
         model.ConfigureDenseRopeFactorsAndAttnTemperature(device, spvDir, config, cpuWeights.RopeFreqFactors, ropeDim, ropeTheta);
@@ -2439,6 +2484,11 @@ public sealed class VulkanTransformerModel : IModel
     internal static bool IsIq2XxsMmqEnabled() =>
         Environment.GetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_IQ2XXS_MMQ") == "1";
 
+    /// <summary>Count of gpt-oss decode attention layers that ran on the split-KV kernel with the sink merge (#915; test/diagnostic).</summary>
+    public long GptOssSinkSplitDispatchCount { get; private set; }
+    /// <summary>Runtime A/B switch for split-KV gpt-oss decode attention (default on; <c>DOTLLM_VK_SINK_SPLIT=0</c> disables).</summary>
+    public bool SinkSplitKvEnabled { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_SINK_SPLIT") != "0";
+
     /// <summary>
     /// Records the attention dispatch using Flash-Attention when the kernel
     /// is available, head_dim fits the shader bound, and the sequence is in
@@ -2467,6 +2517,22 @@ public sealed class VulkanTransformerModel : IModel
         {
             if (softCap != 0.0f || maskMode != AttentionMaskMode.Causal)
                 throw new NotSupportedException("gpt-oss sink attention supports only plain causal attention (no soft-cap / non-causal mask).");
+            // Decode (#915): split-KV flash-decoding with the sink folded into the merge, over only the sliding window's KV range for windowed layers.
+            // The per-token sink kernel below scans every KV tile with one workgroup per head (64 workgroups, strided K reads) and clips nothing.
+            if (seqQ == 1 && SinkSplitKvEnabled && _splitKvAttention is not null && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim)
+            {
+                int kvStart = slidingWindow > 0 ? Math.Max(0, positionOffset - slidingWindow + 1) : 0;
+                if (VulkanSplitKvAttentionKernel.WouldSplit(seqKv - kvStart, numHeads))
+                {
+                    GptOssSinkSplitDispatchCount++;
+                    _splitKvAttention.Record(cmdBuf, q, k, v, output,
+                        seqQ: seqQ, seqKv: seqKv, numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                        positionOffset: positionOffset, slidingWindow: slidingWindow,
+                        softCap: 0.0f, scaleOverride: scaleOverride,
+                        interPassStamp: DpAttnSplitStamp, sinks: sinks, kvStart: kvStart);
+                    return;
+                }
+            }
             _gptOss.RecordAttentionSinks(cmdBuf, q, k, v, output, sinks,
                 seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow, scaleOverride);
             return;
@@ -4691,6 +4757,13 @@ public sealed class VulkanTransformerModel : IModel
         _grpQ6K?.InvalidateDescriptorCache();
         _grpQ8_0?.InvalidateDescriptorCache();
         _grpMxfp4?.InvalidateDescriptorCache();
+        _gmMmvqQ4K?.InvalidateDescriptorCache();
+        _gmMmvqQ5K?.InvalidateDescriptorCache();
+        _gmMmvqQ6K?.InvalidateDescriptorCache();
+        _gmMmvqQ8_0?.InvalidateDescriptorCache();
+        _gmMmvqMxfp4?.InvalidateDescriptorCache();
+        _gmMmvqQ4KMr?.InvalidateDescriptorCache();
+        _gmSwiGluQuant?.InvalidateDescriptorCache();
         _gemma4GroupedQ4K?.InvalidateDescriptorCache();
         _gemma4GroupedQ5_1?.InvalidateDescriptorCache();
         _gemma4GroupedQ8_0?.InvalidateDescriptorCache();
@@ -5929,6 +6002,15 @@ public sealed class VulkanTransformerModel : IModel
             rowCount: seqLen, n: hidden, eps: eps);
         BarrierComputeToCompute(cmdBuf);
 
+        // Decode-sized rows on packed K-quant / Q8_0 / MXFP4 banks take the indexed dp4a MMVQ arm (#912). When the gate/up kernels read the
+        // activation through xDiv (everything but Q8_0) the single quantize of the normed rows runs here, beside the router matmul, and the
+        // topK broadcast copy below is skipped.
+        bool mmvqXDiv = false;
+        bool mmvqArm = !CanUseGroupedF16Moe(moeW, hidden, interm) && !CanUseGroupedQuantMoe(moeW, seqLen, hidden, interm)
+            && CanUseGenericMoeMmvq(moeW, seqLen, hidden, interm, out mmvqXDiv);
+        if (mmvqArm && mmvqXDiv)
+            _quantizeQ8_1Rows!.Record(cmdBuf, _state.NormOutput, _state.MoeQ8_1Xq!, _state.MoeQ8_1Xds!, n: seqLen, k: hidden);
+
         // 2. Router gate matmul: Gate @ NormOutput → MoeRouterLogits.
         //    Q8_0 dispatch via RecordMatmul (matmul_q8_0 GEMV at seqLen==1 / GEMM at >1)
         //    when the upload kept the gate as Q8_0; otherwise the standard F32 kernel.
@@ -5972,6 +6054,7 @@ public sealed class VulkanTransformerModel : IModel
         // matmul-read on the indices/weights.
         BarrierComputeToCompute(cmdBuf);
         ProfSample("moe_router_topk");
+        DpStamp(cmdBuf, DpCatMoeRoute);
 
         // 4. Broadcast NormOutput[seqLen, hidden] → MoeExpandedInput[seqLen*topK, hidden].
         //    Each token's row gets replicated topK times so each (t, slot)
@@ -5980,15 +6063,23 @@ public sealed class VulkanTransformerModel : IModel
         //    vkCmdCopyBuffer regions the previous implementation issued —
         //    same math, no transfer↔compute stage transition, dispatch
         //    count drops from O(seqLen·topK) to 1 per MoE layer.
-        _moeBroadcast!.Record(cmdBuf,
-            _state.NormOutput, _state.MoeExpandedInput!,
-            seqLen: seqLen, topK: topK, hidden: hidden);
-        BarrierComputeToCompute(cmdBuf);
-        ProfSample("moe_broadcast");
+        if (!(mmvqArm && mmvqXDiv))
+        {
+            _moeBroadcast!.Record(cmdBuf,
+                _state.NormOutput, _state.MoeExpandedInput!,
+                seqLen: seqLen, topK: topK, hidden: hidden);
+            BarrierComputeToCompute(cmdBuf);
+            ProfSample("moe_broadcast");
+        }
 
         if (CanUseGroupedF16Moe(moeW, hidden, interm))
         {
             RecordMoeGroupedF16Layer(cmdBuf, moeW, expandedRows, hidden, interm, numE);
+        }
+        else if (mmvqArm)
+        {
+            GenericMoeMmvqLayerCount++;
+            RecordGenericMoeMmvqExperts(cmdBuf, moeW, hidden, interm, numE, topK, expandedRows, mmvqXDiv);
         }
         else if (CanUseGroupedQuantMoe(moeW, seqLen, hidden, interm))
         {
@@ -5998,6 +6089,7 @@ public sealed class VulkanTransformerModel : IModel
         }
         else
         {
+            if (seqLen < 16) GenericMoeScalarDecodeLayerCount++;
             // 5. Indexed expert matmuls: gate (W1) and up (W3) project the
             //    expanded input through the experts selected by topk indices.
             RecordMoeIndexedMatmul(cmdBuf,
@@ -6064,6 +6156,7 @@ public sealed class VulkanTransformerModel : IModel
             seqLen: seqLen, topK: topK, hiddenSize: hidden);
         BarrierComputeToCompute(cmdBuf);
         ProfSample("moe_scatter");
+        DpStamp(cmdBuf, DpCatMoeExperts);
 
         // 9. Shared-expert branch (DeepSeek-V2/V3 ungated). Each shared expert
         //    runs a dense SwiGLU MLP on the per-token hidden state and the
@@ -6075,8 +6168,16 @@ public sealed class VulkanTransformerModel : IModel
         }
     }
 
-    private static readonly int GroupedMoeMinTokens =
-        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_GROUPED_MIN_TOKENS"), out int gmt) && gmt > 0 ? gmt : 16;
+    private static readonly int? GroupedMoeMinTokensEnv =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_GROUPED_MIN_TOKENS"), out int gmt) && gmt > 0 ? gmt : null;
+
+    /// <summary>
+    /// Smallest row count that takes the expert-grouped coopmat path. Explicit <c>DOTLLM_VK_MOE_GROUPED_MIN_TOKENS</c> wins; otherwise 16 when the decode
+    /// MMVQ arm is unavailable (grouped GEMM tiles are 16 rows wide) and <see cref="GenericMoeMmvqMaxRows"/> + 1 when it is: measured on this box (#912), the
+    /// arm wins up to ~4 rows and the grouped GEMM wins from ~5 (gpt-oss-20b p8 54.9 vs 58.6 ms, GLM-4.7-Flash p4 112 vs 120 ms).
+    /// </summary>
+    internal int EffGroupedMoeMinTokens =>
+        GroupedMoeMinTokensEnv ?? (GenericMoeMmvqAvailable && GenericMoeMmvqEnabled ? Math.Min(16, GenericMoeMmvqMaxRows + 1) : 16);
 
     private bool GroupedQuantBankSupported(QuantType qt, int k)
         => qt switch
@@ -6096,7 +6197,7 @@ public sealed class VulkanTransformerModel : IModel
     /// </summary>
     private bool CanUseGroupedQuantMoe(in VulkanWeights.MoeLayerBuffers moeW, int seqLen, int hidden, int interm)
     {
-        if (!GroupedMoeEnabled || seqLen < GroupedMoeMinTokens || _currentLora is not null) return false;
+        if (!GroupedMoeEnabled || seqLen < EffGroupedMoeMinTokens || _currentLora is not null) return false;
         if (_grpTileList is null || _moeExpertOffsets is null || _moeExpandGroupByExpert is null || _moeUngroupScatter is null) return false;
         if (_state.MoeGroupDispatchArgs is null || _state.MoeGroupedHidden is null || _state.MoePermutation is null
             || _state.MoeGroupedGateInter is null || _state.MoeGroupedUpInter is null) return false;
@@ -6110,6 +6211,125 @@ public sealed class VulkanTransformerModel : IModel
             if (g.DownBias is not null && moeW.W2DeviceQuantType != QuantType.MXFP4) return false;
         }
         return true;
+    }
+
+    /// <summary>Whether a routed bank of type <paramref name="qt"/> with contraction dim <paramref name="k"/> has a generic decode MMVQ kernel; <paramref name="xDiv"/> = it reads a broadcast activation row.</summary>
+    private bool GenericMoeMmvqBankSupported(QuantType qt, int k, out bool xDiv)
+    {
+        xDiv = qt != QuantType.Q8_0;
+        return qt switch
+        {
+            QuantType.Q4_K => _gmMmvqQ4K is not null && (k % 256) == 0,
+            QuantType.Q5_K => _gmMmvqQ5K is not null && (k % 256) == 0,
+            QuantType.Q6_K => _gmMmvqQ6K is not null && (k % 256) == 0,
+            QuantType.Q8_0 => _gmMmvqQ8_0 is not null && (k % 32) == 0,
+            QuantType.MXFP4 => _gmMmvqMxfp4 is not null && (k % 32) == 0,
+            _ => false,
+        };
+    }
+
+    /// <summary>
+    /// Whether this MoE layer's routed experts can run on the indexed dp4a MMVQ decode kernels (#912): row count within
+    /// <see cref="GenericMoeMmvqMaxRows"/>, no LoRA (the indexed LoRA deltas read the F32 expanded input), the Q8_1 row quantizer + scratch exist, and
+    /// every bank (gate, up, down) is a packed type with a kernel. <paramref name="xDiv"/> = the gate/up kernels read one quantized row per token
+    /// (broadcast to its topK slots) instead of an expanded copy; false when a Q8_0 gate/up bank (no xDiv shader) forces the expanded input.
+    /// </summary>
+    private bool CanUseGenericMoeMmvq(in VulkanWeights.MoeLayerBuffers moeW, int seqLen, int hidden, int interm, out bool xDiv)
+    {
+        xDiv = false;
+        if (!GenericMoeMmvqEnabled || seqLen > 15 || _currentLora is not null) return false;
+        if (_quantizeQ8_1Rows is null || _state.MoeQ8_1Xq is null || _state.MoeQ8_1Xds is null) return false;
+        if (!GenericMoeMmvqBankSupported(moeW.W1DeviceQuantType, hidden, out bool d1)
+            || !GenericMoeMmvqBankSupported(moeW.W3DeviceQuantType, hidden, out bool d3)
+            || !GenericMoeMmvqBankSupported(moeW.W2DeviceQuantType, interm, out _)) return false;
+        xDiv = d1 && d3;
+        return true;
+    }
+
+    private void RecordGenericMoeMmvqProjection(nint cmdBuf, QuantType qt, VulkanDevice.Buffer bank, VulkanDevice.Buffer y, VulkanDevice.Buffer? bias,
+        int m, int k, int n, int numE, int xDiv)
+    {
+        var xq = _state.MoeQ8_1Xq!;
+        var xds = _state.MoeQ8_1Xds!;
+        var idx = _state.MoeTopkIndices!;
+        switch (qt)
+        {
+            case QuantType.Q4_K:
+                if (GenericMoeMrEnabled && _gmMmvqQ4KMr is { } mr && (m % mr.RowsPerGroup) == 0) mr.Record(cmdBuf, bank, xq, xds, idx, y, m, k, n, numE, xDiv);
+                else _gmMmvqQ4K!.Record(cmdBuf, bank, xq, xds, idx, y, m, k, n, numE, xDiv);
+                break;
+            case QuantType.Q5_K: _gmMmvqQ5K!.Record(cmdBuf, bank, xq, xds, idx, y, m, k, n, numE, xDiv); break;
+            case QuantType.Q6_K: _gmMmvqQ6K!.Record(cmdBuf, bank, xq, xds, idx, y, m, k, n, numE, xDiv); break;
+            case QuantType.Q8_0: _gmMmvqQ8_0!.Record(cmdBuf, bank, xq, xds, idx, y, m, k, n, numE); break;
+            case QuantType.MXFP4: _gmMmvqMxfp4!.Record(cmdBuf, bank, xq, xds, idx, y, bias, m, k, n, numE, xDiv); break;
+            default: throw new InvalidOperationException($"No generic MoE MMVQ kernel for {qt}.");
+        }
+    }
+
+    /// <summary>
+    /// Routed experts of a generic MoE layer at decode-sized row counts on the indexed dp4a kernels (#912). On entry the Q8_1-quantized
+    /// activation is in <c>MoeQ8_1Xq/Xds</c> (one row per token when <paramref name="xDiv"/>, else one per routed row, quantized here from
+    /// <c>MoeExpandedInput</c>); on exit <c>MoeDownRows</c> holds the per-routed-row down outputs (gpt-oss down bias included), exactly as the
+    /// scalar path leaves them. gpt-oss per-expert biases ride in the MXFP4 kernels' epilogue; other bank types add them with the separate dispatch.
+    /// </summary>
+    private void RecordGenericMoeMmvqExperts(nint cmdBuf, in VulkanWeights.MoeLayerBuffers moeW, int hidden, int interm, int numE, int topK, int expandedRows, bool xDiv)
+    {
+        var g = moeW.GptOss;
+        bool bias = g is not null && !_gptOssDbg.NoExpertBias;
+        if (!xDiv)
+        {
+            _quantizeQ8_1Rows!.Record(cmdBuf, _state.MoeExpandedInput!, _state.MoeQ8_1Xq!, _state.MoeQ8_1Xds!, n: expandedRows, k: hidden);
+            BarrierComputeToCompute(cmdBuf);
+        }
+        int gdDiv = xDiv ? topK : 1;
+        var gateBias = bias && moeW.W1DeviceQuantType == QuantType.MXFP4 ? g!.GateBias : null;
+        var upBias = bias && moeW.W3DeviceQuantType == QuantType.MXFP4 ? g!.UpBias : null;
+        var downBias = bias && moeW.W2DeviceQuantType == QuantType.MXFP4 ? g!.DownBias : null;
+        RecordGenericMoeMmvqProjection(cmdBuf, moeW.W1DeviceQuantType, moeW.W1Bank, _state.MoeGateInter!, gateBias, interm, hidden, expandedRows, numE, gdDiv);
+        RecordGenericMoeMmvqProjection(cmdBuf, moeW.W3DeviceQuantType, moeW.W3Bank, _state.MoeUpInter!, upBias, interm, hidden, expandedRows, numE, gdDiv);
+        BarrierComputeToCompute(cmdBuf);
+        ProfSample("moe_gateup_mmvq");
+        if (bias)
+        {
+            // Banks without the in-kernel bias epilogue (non-MXFP4 types never ship with biases today; kept for exactness).
+            if (g!.GateBias is { } gb && gateBias is null)
+                _gptOss!.RecordExpertBiasAdd(cmdBuf, _state.MoeGateInter!, gb, _state.MoeTopkIndices!, expandedRows, interm, numE);
+            if (g.UpBias is { } ub && upBias is null)
+                _gptOss!.RecordExpertBiasAdd(cmdBuf, _state.MoeUpInter!, ub, _state.MoeTopkIndices!, expandedRows, interm, numE);
+            if ((g.GateBias is not null && gateBias is null) || (g.UpBias is not null && upBias is null))
+                BarrierComputeToCompute(cmdBuf);
+        }
+
+        bool oai = g is { UseSwiGluOai: true } && !_gptOssDbg.PlainSwiGlu;
+        if (GenericMoeFuseEnabled && _gmSwiGluQuant is { } fused && (interm % 32) == 0)
+        {
+            // Down input = Q8_1(act(gate, up)) in one dispatch (the F32 activation is not needed: no LoRA on this arm). The gate/up reads of the
+            // scratch finished before the barrier above, so overwriting it is safe.
+            fused.Record(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeQ8_1Xq!, _state.MoeQ8_1Xds!, expandedRows * interm, oai);
+            BarrierComputeToCompute(cmdBuf);
+            ProfSample("moe_act");
+        }
+        else
+        {
+            if (oai)
+                _gptOss!.RecordSwiGluOai(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeSiluInter!, expandedRows * interm);
+            else
+                _swiglu.Record(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeSiluInter!, n: expandedRows * interm);
+            BarrierComputeToCompute(cmdBuf);
+            ProfSample("moe_act");
+
+            // Down input: re-quantize the activation rows (K = interm) into the same scratch (the gate/up reads completed before the swiglu barrier).
+            _quantizeQ8_1Rows!.Record(cmdBuf, _state.MoeSiluInter!, _state.MoeQ8_1Xq!, _state.MoeQ8_1Xds!, n: expandedRows, k: interm);
+            BarrierComputeToCompute(cmdBuf);
+        }
+        RecordGenericMoeMmvqProjection(cmdBuf, moeW.W2DeviceQuantType, moeW.W2Bank, _state.MoeDownRows!, downBias, hidden, interm, expandedRows, numE, 1);
+        BarrierComputeToCompute(cmdBuf);
+        ProfSample("moe_down_mmvq");
+        if (bias && g!.DownBias is { } db && downBias is null)
+        {
+            _gptOss!.RecordExpertBiasAdd(cmdBuf, _state.MoeDownRows!, db, _state.MoeTopkIndices!, expandedRows, hidden, numE);
+            BarrierComputeToCompute(cmdBuf);
+        }
     }
 
     private void RecordGroupedQuantProjection(nint cmdBuf, QuantType qt, VulkanDevice.Buffer bank, VulkanDevice.Buffer packedIn,
@@ -7947,6 +8167,13 @@ public sealed class VulkanTransformerModel : IModel
         _grpQ6K?.Dispose();
         _grpQ8_0?.Dispose();
         _grpMxfp4?.Dispose();
+        _gmMmvqQ4K?.Dispose();
+        _gmMmvqQ5K?.Dispose();
+        _gmMmvqQ6K?.Dispose();
+        _gmMmvqQ8_0?.Dispose();
+        _gmMmvqMxfp4?.Dispose();
+        _gmMmvqQ4KMr?.Dispose();
+        _gmSwiGluQuant?.Dispose();
         _grpTileList?.Dispose();
         _gemma4GroupedQ4K?.Dispose();
         _gemma4GroupedQ5_1?.Dispose();

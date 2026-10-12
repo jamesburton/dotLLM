@@ -89,10 +89,10 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         return int.TryParse(v, out int n) && n > 0 ? n : fallback;
     }
 
-    // 13 uints (the shared 12-uint attention block + numSplits) = 52 bytes.
-    private const int SplitPushConstantBytes = 13 * sizeof(uint);
-    // numHeads, headDim, numSplits = 12 bytes.
-    private const int MergePushConstantBytes = 3 * sizeof(uint);
+    // 14 uints (the shared 12-uint attention block + numSplits + kvStart) = 56 bytes.
+    private const int SplitPushConstantBytes = 14 * sizeof(uint);
+    // numHeads, headDim, numSplits, hasSinks = 16 bytes.
+    private const int MergePushConstantBytes = 4 * sizeof(uint);
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _splitModule;
@@ -127,7 +127,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         _mergePipeline = mergePipeline;
         _mergePool = mergePool;
         _splitCache = new DescriptorSetCache(device, splitPool, splitPipeline, buffersPerSet: 5);
-        _mergeCache = new DescriptorSetCache(device, mergePool, mergePipeline, buffersPerSet: 3);
+        _mergeCache = new DescriptorSetCache(device, mergePool, mergePipeline, buffersPerSet: 4);
     }
 
     /// <summary>
@@ -154,7 +154,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         {
             splitPipeline = CreatePipeline(splitModule, bindingCount: 5, SplitPushConstantBytes);
             mergeModule = VulkanModule.LoadFromFile(device, mergePath);
-            mergePipeline = CreatePipeline(mergeModule, bindingCount: 3, MergePushConstantBytes);
+            mergePipeline = CreatePipeline(mergeModule, bindingCount: 4, MergePushConstantBytes);
         }
         catch
         {
@@ -166,7 +166,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         }
 
         nint splitPool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 5);
-        nint mergePool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
+        nint mergePool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
         return new VulkanSplitKvAttentionKernel(
             device, splitModule, splitPipeline, splitPool, mergeModule!, mergePipeline, mergePool);
     }
@@ -278,7 +278,8 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         int positionOffset = 0, int slidingWindow = 0, bool useAlibi = false,
         float softCap = 0.0f, float scaleOverride = 0.0f,
         AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0,
-        Action<nint>? interPassStamp = null)
+        Action<nint>? interPassStamp = null,
+        VulkanDevice.Buffer? sinks = null, int kvStart = 0)
     {
         if (seqQ != 1)
             throw new ArgumentException("VulkanSplitKvAttentionKernel is decode-only (seqQ must be 1).", nameof(seqQ));
@@ -307,7 +308,9 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         if (v.Size      < kvBytes)  throw new ArgumentException("V buffer too small.",      nameof(v));
         if (output.Size < qBytes)   throw new ArgumentException("Output buffer too small.", nameof(output));
 
-        int numSplits = ComputeSplits(seqKv, numHeads);
+        if (kvStart < 0 || kvStart >= seqKv) throw new ArgumentOutOfRangeException(nameof(kvStart));
+        if (sinks is not null && sinks.Size < (long)numHeads * sizeof(float)) throw new ArgumentException("Sinks buffer too small.", nameof(sinks));
+        int numSplits = ComputeSplits(seqKv - kvStart, numHeads);
 
         EnsureScratch(numHeads);
 
@@ -330,7 +333,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         VulkanApi.vkCmdBindDescriptorSets(
             cmdBuf, VkPipelineBindPoint.Compute, _splitPipeline.Layout, 0, 1, splitSet, 0, 0);
 
-        Span<uint> spc = stackalloc uint[13];
+        Span<uint> spc = stackalloc uint[14];
         spc[0]  = 1u;                  // seqQ
         spc[1]  = (uint)seqKv;
         spc[2]  = (uint)numHeads;
@@ -344,6 +347,7 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         spc[10] = (uint)maskMode;
         spc[11] = (uint)prefixLen;
         spc[12] = (uint)numSplits;
+        spc[13] = (uint)kvStart;
         fixed (uint* pcPtr = spc)
         {
             VulkanApi.vkCmdPushConstants(
@@ -363,17 +367,18 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         interPassStamp?.Invoke(cmdBuf);
 
         // ── Pass 2: merge ────────────────────────────────────────────────
-        Span<nint> mergeBuffers = stackalloc nint[3] { _partOut!.Handle, _partMS!.Handle, output.Handle };
+        Span<nint> mergeBuffers = stackalloc nint[4] { _partOut!.Handle, _partMS!.Handle, output.Handle, (sinks ?? output).Handle };
         nint mergeSet = _mergeCache.GetOrCreate(mergeBuffers);
 
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _mergePipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(
             cmdBuf, VkPipelineBindPoint.Compute, _mergePipeline.Layout, 0, 1, mergeSet, 0, 0);
 
-        Span<uint> mpc = stackalloc uint[3];
+        Span<uint> mpc = stackalloc uint[4];
         mpc[0] = (uint)numHeads;
         mpc[1] = (uint)headDim;
         mpc[2] = (uint)numSplits;
+        mpc[3] = sinks is null ? 0u : 1u;
         fixed (uint* pcPtr = mpc)
         {
             VulkanApi.vkCmdPushConstants(

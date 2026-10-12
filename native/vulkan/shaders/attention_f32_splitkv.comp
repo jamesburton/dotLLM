@@ -52,6 +52,7 @@ layout(push_constant) uniform PushConstants {
     uint maskMode;        // 0 = Causal, 1 = Bidirectional, 2 = Hybrid
     uint prefixLen;       // Hybrid only
     uint numSplits;       // number of KV splits (>= 2 when this kernel is dispatched)
+    uint kvStart;         // first KV position the splits cover (0 = all; sliding-window sink attention (#915) passes posQ - window + 1)
 } pc;
 
 // Identical to attention_f32_sg.comp::isMasked.
@@ -142,8 +143,9 @@ void main() {
     uint qBase = hq * pc.headDim;    // tq == 0
 
     // This split's KV chunk.
-    uint splitLen   = (pc.seqKv + pc.numSplits - 1u) / pc.numSplits;
-    uint chunkStart = splitId * splitLen;
+    uint spanLen    = pc.seqKv - pc.kvStart;
+    uint splitLen   = (spanLen + pc.numSplits - 1u) / pc.numSplits;
+    uint chunkStart = pc.kvStart + splitId * splitLen;
     uint chunkEnd   = min(chunkStart + splitLen, pc.seqKv);
 
     // 1. Load Q and zero the accumulator.
