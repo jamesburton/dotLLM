@@ -619,11 +619,11 @@ per column and the IQ4_XS one uses the coalesced lane = K layout (n = 2..8: 46-1
 **Per-quantisation result (final build, same-process interleaved plain / MTP, 4 short prompts at 128 tokens, greedy; K = 3 is the library default depth,
 K = 4 the qwen4exp preferred depth).** The last column is the 1K-token context run at K = 4.
 
-| file | plain tok/s | MTP K=3 | MTP K=4 | tokens/round K=4 | 1K ctx K=4 | greedy text identical to 1-row |
+| file | plain tok/s | MTP K=3 | MTP K=4 | tokens/round K=4 | 1K ctx K=4 | greedy text identical to 1-row (K=3 and K=4 runs) |
 |---|---|---|---|---|---|---|
 | UD-Q4_K_XL (79 GiB; needs `DOTLLM_VK_ALLOW_OVERCOMMIT=1`, below) | 22.3 | 30.9 (1.38x) | 28.8 (1.33x) | 3.57 | 30.6 vs 21.5 (1.42x) | 1 / 8 |
 | UD-IQ4_XS (60 GiB) | 22.7 | 32.3 (1.42x) | 31.1 (1.37x vs the 22.7 baseline; 19.9 in that run's cold first prompt) | 3.67 | 30.2 vs 21.8 (1.39x) | 2 / 8 |
-| ISTA IQ3_XXS (44 GiB) | 23.2 | 31.6 (1.36x) | 30.3 (1.35x) | 3.60 | 31.7 vs 22.3 (1.42x) | 3 / 8 |
+| ISTA IQ3_XXS (44 GiB) | 23.2 | 31.6 (1.36x) | 30.3 (1.35x) | 3.60 | 31.7 vs 22.3 (1.42x) | 2 / 8 |
 | ISTA IQ2_XS (37 GiB) | 24.5 | 32.9 (1.34x) | 30.8 (1.30x) | 3.39 | 26.8 vs 23.4 (1.14x) | 4 / 8 |
 
 (Before #900 / #902 the same files measured 1.17x (IQ4_XS, native Q8_0 head), 0.65-0.82x (ISTA IQ3_XXS / IQ2_XS) and "head does not fit" (Q4_K_XL).)
