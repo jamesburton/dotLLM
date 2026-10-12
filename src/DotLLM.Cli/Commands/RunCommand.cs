@@ -375,7 +375,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 try
                 {
                     mtpHeadPath = DotLLM.Models.Architectures.Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, settings.MtpHead,
-                        trunkBytes: DotLLM.HuggingFace.ModelResolver.FileLength(resolvedPath));
+                        trunkBytes: model is DotLLM.Core.Models.IMtpHeadAttachable ? DotLLM.HuggingFace.ModelResolver.FileLength(resolvedPath) : -1);
                 }
                 catch (Exception ex) when (settings.MtpHead is null && ex is not FileNotFoundException)
                 {

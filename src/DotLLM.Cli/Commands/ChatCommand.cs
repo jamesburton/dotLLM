@@ -212,6 +212,17 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         [DefaultValue(DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates)]
         public int SpeculativeK { get; set; } = DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates;
 
+        /// <summary>Opt-out of MTP self-speculative decoding when the model carries (or is given) an MTP head.</summary>
+        [CommandOption("--no-mtp")]
+        [Description("Disable Multi-Token Prediction (MTP) self-speculative decoding (on by default when the model carries an MTP head; an adaptive gate falls back to plain decode when it loses).")]
+        [DefaultValue(false)]
+        public bool NoMtp { get; set; }
+
+        /// <summary>Explicit MTP head GGUF for architectures that ship it as a separate file (qwen4exp).</summary>
+        [CommandOption("--mtp-head")]
+        [Description("Path of a separate MTP head GGUF (qwen4exp ships it as mtp-*.gguf beside the quantisation folders). Default: auto-detected next to the model; a head that does not fit the device is declined with a warning.")]
+        public string? MtpHead { get; set; }
+
         /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
         [CommandOption("--prefill-chunk-size|--ubatch-size")]
         [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default).")]
@@ -313,6 +324,19 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                     resolvedPath);
                 model = loaded.Model;
                 vulkanKv = loaded.IsVulkan ? loaded.KvCacheFactory : null;   // CUDA/hybrid models build their caches from the model type below
+                if (!settings.NoMtp)
+                {
+                    // qwen4exp ships its MTP draft head as a separate GGUF (#820): attach the explicit or auto-detected sibling; plain decode if it cannot be attached.
+                    try
+                    {
+                        DotLLM.Models.Architectures.Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, settings.MtpHead,
+                            trunkBytes: model is DotLLM.Core.Models.IMtpHeadAttachable ? DotLLM.HuggingFace.ModelResolver.FileLength(resolvedPath) : -1);
+                    }
+                    catch (Exception ex) when (settings.MtpHead is null && ex is not FileNotFoundException)
+                    {
+                        Console.Error.WriteLine($"WARNING: MTP head not attached ({ex.GetType().Name}: {ex.Message}); decoding without speculation.");
+                    }
+                }
             });
         }
         catch (DotLLM.Server.DeviceUnavailableException ex)
@@ -559,7 +583,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
 
         var generator = new TextGenerator(model!, tokenizer!, kvFactory, prefixCache,
             draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
-            mtpAdaptive: true, recurrentPrefixCache: true,
+            mtpEnabled: !settings.NoMtp, mtpAdaptive: true, recurrentPrefixCache: true,
             prefillChunkSize: settings.PrefillChunkSize);
 
         try
