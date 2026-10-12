@@ -451,6 +451,9 @@ void Exec(string line, StringBuilder o)
             {
                 if (a[1] != "all" && a[1] != pi.ToString()) continue;
                 var pids = tok.Encode(prompts[pi]).ToArray();
+                // ROWIDENT_PREFIX=N: put N tokens of the shared long text in front of the prompt (the attention kernels differ most at long context).
+                if (int.TryParse(Environment.GetEnvironmentVariable("ROWIDENT_PREFIX"), out int pre) && pre > 0)
+                    pids = Ids(pre, 11).Concat(pids).ToArray();
                 // Plain greedy run, 1-row decode: the reference tokens and the reference logits (state built by 1-row steps).
                 int cap = Math.Min(pids.Length + gen + R + 8, model.DenseContextLimit);
                 var seq = new List<int>(pids);

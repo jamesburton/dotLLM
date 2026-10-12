@@ -48,6 +48,21 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel
     /// <summary>Optional QSA hook (#819): consulted by the full-attention layer after the K/V cache update; true = it produced <c>AttnOutput</c>.</summary>
     internal IQ4AttentionHook? Q4AttentionHook { get; set; }
 
+    /// <summary>
+    /// qwen4exp 2..8-row verify forwards attend with the per-row split-KV kernel (the 1-row decode kernel's arithmetic at each row's own length) instead of the
+    /// f16 coopmat flash attention. <c>DOTLLM_VK_Q4E_SPLITKV_ROWS=0</c> (or setting this) restores the flash path.
+    /// </summary>
+    internal static bool Q4SplitKvRows { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_SPLITKV_ROWS") != "0";
+
+    /// <summary>Test hook: dispatches recorded through the per-row split-KV kernel.</summary>
+    internal long Q4SplitKvRowsDispatches => _kernels.SplitKvRowsAttention?.RecordCount ?? 0;
+
+    private static bool IsConsecutive(ReadOnlySpan<int> positions)
+    {
+        for (int i = 1; i < positions.Length; i++) if (positions[i] != positions[0] + i) return false;
+        return true;
+    }
+
     internal void Q4RecordAttention(nint cmdBuf, int layer, int seqLen, ReadOnlySpan<int> positions, VulkanNemotronHKvCache kvCache)
         => RecordFullAttnLayer(cmdBuf, layer, _weights.Layers[layer].Attention!.Value, seqLen, positions,
             Config.NumAttentionHeads, _weights.Layers[layer].Attention!.Value.NumKvHeads, Config.HeadDim, kvCache);

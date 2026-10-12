@@ -187,6 +187,9 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
     /// <summary>Test hook (#876): how many times each 2..8-row fast path was recorded.</summary>
     internal long SmallRowPathCount(VulkanQwen3MoeHybridTransformerModel.SmallRowPath p) => _core.SmallRowPathCounts[(int)p];
 
+    /// <summary>Test hook: per-row split-KV attention dispatches (the 2..8-row verify forwards' dense full-attention layers).</summary>
+    internal long SplitKvRowsDispatches => _core.Q4SplitKvRowsDispatches;
+
     /// <summary>Address of the n-gram table inside the GGUF mapping (0 when absent) - tests assert nothing was uploaded from this range.</summary>
     internal (nint Pointer, long Bytes) HostOnlyTableRange => _hostOnlyTable ?? (0, 0);
 

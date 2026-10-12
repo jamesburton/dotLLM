@@ -187,6 +187,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     /// threshold derivation and the ON-by-default evidence.
     /// </summary>
     public VulkanSplitKvAttentionKernel? SplitKvAttention { get; }
+
+    /// <summary>Split-KV attention with per-row query offsets for 2..8-row verify forwards (null when its SPIR-V is missing or split decode is disabled).</summary>
+    public VulkanSplitKvRowsAttentionKernel? SplitKvRowsAttention { get; private set; }
     public SwiGluF32Kernel SwiGlu { get; }
     public AddKernel Add { get; }
     public SiluInplaceF32Kernel SiluInplace { get; }
@@ -495,6 +498,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             sigGateMul,
             moeTopk, moeBroadcast, moeIndexed, moeIndexedQ6K, moeIndexedQ4K, moeIndexedQ5K,
             moeIndexedQ4KMmq, quantizeQ8_1Rows, moeIndexedQ5KMmq, moeScatter, moeSigmoidGatedAdd);
+        kernels.SplitKvRowsAttention = splitKvAttention is null ? null : VulkanSplitKvRowsAttentionKernel.TryCreate(device, spvDir);
         kernels.Iq1CodebooksOwned = Iq1Codebooks.Create(device);   // #823: grid for the IQ1_M expert kernels
         kernels.MoeSharedGateAdd = moeSharedGateAdd;
         kernels.MatMulBf16Multi = matmulBf16Multi;
@@ -675,6 +679,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         FlashAttention?.InvalidateDescriptorCache();
         FlashAttentionCoopmat?.InvalidateDescriptorCache();
         SplitKvAttention?.InvalidateDescriptorCache();
+        SplitKvRowsAttention?.InvalidateDescriptorCache();
         SwiGlu.InvalidateDescriptorCache();
         Add.InvalidateDescriptorCache();
         SiluInplace.InvalidateDescriptorCache();
@@ -775,6 +780,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         Add.Dispose();
         SwiGlu.Dispose();
         SplitKvAttention?.Dispose();
+        SplitKvRowsAttention?.Dispose();
         FlashAttention?.Dispose();
         FlashAttentionCoopmat?.Dispose();
         Attention.Dispose();

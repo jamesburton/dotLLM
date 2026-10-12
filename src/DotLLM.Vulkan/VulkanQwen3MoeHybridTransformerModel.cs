@@ -1223,6 +1223,13 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: 0);
         }
+        else if (Q4SplitKvRows && Q4AttentionHook is not null && _kernels.SplitKvRowsAttention is { } rowsKernel && positions.Length == seqLen
+            && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim && VulkanSplitKvRowsAttentionKernel.CanServe(seqLen, positionOffset, numHeads)
+            && IsConsecutive(positions))
+        {
+            // Speculative verify rows (#909 follow-up): per-row split-KV, each row the 1-row decode kernel's computation at its own length.
+            rowsKernel.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput, seqLen, numHeads, numKvHeads, headDim, positionOffset);
+        }
         else if (_kernels.FlashAttentionCoopmat is not null && seqLen > 1 && headDim <= _kernels.FlashAttentionCoopmat.SupportedMaxHeadDim)
         {
             _kernels.FlashAttentionCoopmat.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
