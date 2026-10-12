@@ -39,7 +39,7 @@ internal sealed class RowIdentAgg(int rows)
     public string Report()
     {
         var sb = new StringBuilder();
-        string[] names = ["A: 1-row replay on prefill-built state", "B: R-row verify forward on prefill-built state"];
+        string[] names = ["A: 1-row replay on the same state", "B: R-row verify forward on the same state"];
         for (int arm = 0; arm < 2; arm++)
         {
             sb.AppendLine(names[arm] + " vs plain 1-row decode reference");

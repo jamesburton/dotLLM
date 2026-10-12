@@ -621,7 +621,7 @@ K = 4 the qwen4exp preferred depth).** The last column is the 1K-token context r
 
 | file | plain tok/s | MTP K=3 | MTP K=4 | tokens/round K=4 | 1K ctx K=4 | greedy text identical to 1-row (K=3 and K=4 runs) |
 |---|---|---|---|---|---|---|
-| UD-Q4_K_XL (79 GiB; needs `DOTLLM_VK_ALLOW_OVERCOMMIT=1`, below) | 22.3 | 30.9 (1.38x) | 28.8 (1.33x) | 3.57 | 30.6 vs 21.5 (1.42x) | 1 / 8 |
+| UD-Q4_K_XL (79 GiB; measured with `DOTLLM_VK_ALLOW_OVERCOMMIT=1`; since #905 the headroom probe decides, see below) | 22.3 | 30.9 (1.38x) | 28.8 (1.33x) | 3.57 | 30.6 vs 21.5 (1.42x) | 1 / 8 |
 | UD-IQ4_XS (60 GiB) | 22.7 | 32.3 (1.42x) | 31.1 (1.37x vs the 22.7 baseline; 19.9 in that run's cold first prompt) | 3.67 | 30.2 vs 21.8 (1.39x) | 2 / 8 |
 | ISTA IQ3_XXS (44 GiB) | 23.2 | 31.6 (1.36x) | 30.3 (1.35x) | 3.60 | 31.7 vs 22.3 (1.42x) | 2 / 8 |
 | ISTA IQ2_XS (37 GiB) | 24.5 | 32.9 (1.34x) | 30.8 (1.30x) | 3.39 | 26.8 vs 23.4 (1.14x) | 4 / 8 |
@@ -630,11 +630,47 @@ K = 4 the qwen4exp preferred depth).** The last column is the 1K-token context r
 The depth plateau is broad (K = 2 is 1.30-1.41x on the same files), so the controller's choice matters by a few percent; it picks K per round from the
 measured acceptance and round cost.
 
-**UD-Q4_K_XL fit.** The re-quantised head adds 2.08 GiB of resident memory (77.86 -> 79.95 GiB, measured), 1.0 GiB less than the Q8_0 head. The attach guard
-still declines it by 1.0 GiB (82.5 GiB estimated against the 81.4 GiB per-process budget: trunk 77.9 + head with snapshots 2.0 + 1.4 KV/scratch estimate + 1.2
-held by other processes); with the guard overridden the attach works and decoding is stable (two probe sessions). The 1.4 GiB estimate is the slack: the measured
-post-attach growth beyond the head is 0.08 GiB. `DOTLLM_VK_ALLOW_OVERCOMMIT=1` therefore gives Q4_K_XL its 1.33-1.38x today; tightening the estimate is left alone
-because it shares lines with the KV-allocation work (#437/#898).
+**UD-Q4_K_XL fit and the attach guard (#905).** The re-quantised head adds 2.08 GiB of resident memory (77.86 -> 79.95 GiB, measured), 1.0 GiB less than the
+Q8_0 head. The guard used to decline it by 1.0 GiB (82.5 GiB estimated against an 81.4 GiB limit) although the attach is stable with the guard overridden. What
+was wrong, and what replaced it:
+
+- *The arithmetic double-counted.* The per-forward scratch (`DOTLLM_VK_PLANNED_ROWS`, ~1 GiB) is allocated at load and already in the live bytes, yet the
+  estimate added a flat 1 GiB for it again (and K/V at full capacity without the indexer cache). `Qwen4ExpMtpAttachEstimate` is now the itemised sum of what the
+  attach newly allocates: live bytes (trunk + scratch + any KV already grown) + head weights after the re-quantisation + the 4 verify snapshots + K/V and indexer
+  growth to the context capacity + the head's own K/V + absorb scratch + 0.25 GiB margin + other processes' GPU memory. For UD-Q4_K_XL: 77.86 + 2.00 + 0.46 +
+  0.02 + 0.25 + 1.22 = 81.8 GiB. That still exceeds the assumed limit (0.64 x RAM = 81.37 GiB) by 0.4 GiB, and it should: the limit is not a constant.
+- *The limit drifts, and a formula cannot see it.* Allocate-and-touch on a fresh device (`capscan`, `memtest` in `Qwen4ExpRowProbe`) reached 81.43 GiB in one
+  session (0.650 x RAM, 3.5 GiB above the Q4_K_XL trunk) and 73.4-74.8 GiB an hour later on the same idle box with nothing of ours running. The only change found
+  is that the WSL2 VM's working set had grown from 5.1 to 10.1 GiB (`.wslconfig`: `autoMemoryReclaim=disabled`, so it never gives it back); the drop matches it
+  in size, but that is a correlation, not a measured cause (a 10 GiB host-RAM hog in another process did NOT move the limit). After the drop UD-Q4_K_XL no
+  longer loads at all (`VK_ERROR_OUT_OF_DEVICE_MEMORY` at ~70 GiB) and UD-IQ4_XS has 12.4 GiB of headroom instead of ~20. The allocation
+  that crosses the limit succeeds; the NEXT submit fails, and from then on **every allocation on that `VkDevice` fails, even after the memory is freed**
+  (measured: a 16-row forward after the OOM and after releasing everything). A failed submit on a SECOND `VkDevice` of the same process leaves the first one
+  working (measured), which is what makes a safe probe possible.
+- *The canary (`VulkanHeadroomCanary`).* Before the head is uploaded, a second device bound to the same GPU allocates what the attach would add (3.0 GiB for the
+  real file: itemised bytes + margin + 0.25 GiB slack, in 128 MiB chunks, each followed by a GPU copy over the whole chunk so the driver must make it
+  resident) and frees it again (~1 s). The probe sees what no formula can: the current OS limit, this process's other devices and other processes. Success
+  attaches (even where the arithmetic would decline); an out-of-memory refuses (even where the arithmetic would fit); only an unavailable probe falls back to
+  the arithmetic. `DOTLLM_MTP_HEADROOM_CANARY=0` leaves the arithmetic alone; `DOTLLM_MTP_TRACE=1` prints the itemised sum, the probe and the verdict;
+  `DOTLLM_MTP_HEADROOM_EXTRA_MIB` asks the probe for more (a diagnostic that makes the refusal reproducible).
+- *Validated against real out-of-memory (UD-IQ4_XS, 61.4 GiB resident, head needs 2.98 GiB, a competing process allocates AFTER the load).* A process that
+  allocates before the load does not take memory from a loaded process (its idle allocations are evicted), so the competitor has to arrive late:
+
+  | competitor | headroom the probe found | guard | what the same attach does when forced (`DOTLLM_VK_ALLOW_OVERCOMMIT=1`) |
+  |---|---|---|---|
+  | none | all 2.98 GiB | attaches | attach +2.08 GiB, 1K prefill and decode fine, 8 fresh-process CLI cycles with and without `DOTLLM_VULKAN_MEM_TRACE` all attached and ran MTP (21.6-24.4 tok/s) |
+  | 9 GiB | all 2.98 GiB | attaches | attach and a 1K-token forward fine |
+  | 10 GiB | 2.38 GiB | **refuses** | attach succeeds (+2.08), the 1K-token forward then runs out of memory and the device is dead |
+  | 11 GiB | 1.25 GiB | **refuses** | the upload itself runs out of memory, device dead |
+  | 11.9 GiB | 1.38 GiB | **refuses** | device dead |
+
+  The 10 GiB row is the point of the 3.0 GiB (not 2.1 GiB) request: the head fits, the first real forward after it does not.
+  A refusal is a `NotSupportedException` with the numbers; `run`, `chat` (also for an explicit `--mtp-head`) and `serve` log a warning and decode without
+  speculation, and the model's device stays usable (a 16-row forward after the refusal ran).
+- *UD-Q4_K_XL itself* could not be re-run for this change: in the drifted state the box cannot load it at all, so the attach is never reached.
+  On the box state of the original measurements (3.5 GiB above the trunk) the probe asks for 3.0 and leaves 0.5 GiB beyond the itemised worst case
+  (K/V at the full 8K context); at the 1K contexts measured the real slack is ~1 GiB. Restoring that state needs the WSL VM's memory back (`wsl --shutdown`, or
+  `autoMemoryReclaim=gradual`), which only the box's owner should decide.
 
 **End to end through `dotllm serve` (default settings, streamed chat, 200 tokens, `--mtp-head` for the ISTA files; tok/s from the final chunk's timings).** The gate
 explores plain decode once after the first MTP request and then follows the faster arm:

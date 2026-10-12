@@ -406,16 +406,25 @@ void Exec(string line, StringBuilder o)
                     var refs = Enumerable.Range(0, R).Select(j => refRows[s - pids.Length + j + 1]).ToArray();
                     // (A) 1-row replay on a prefill-built state; (B) one R-row verify forward on an identical state.
                     float[][] rowsA = new float[R][], rowsB = new float[R][];
+                    // State at s: "plain" = the prompt prefill, then 1-row steps (exactly the reference run's state, so only the verify kernels differ);
+                    // "prefill" = one prefill over seq[0..s) (the >= 9-row path builds the generated tokens' state).
+                    bool plainState = a.Length <= 5 || a[5] == "plain";
+                    void BuildState(VulkanNemotronHKvCache kvc)
+                    {
+                        if (!plainState) { model.Forward(seq.GetRange(0, s).ToArray(), Enumerable.Range(0, s).ToArray(), -1, kvc, true).Dispose(); return; }
+                        model.Forward(pids, Enumerable.Range(0, pids.Length).ToArray(), -1, kvc, true).Dispose();
+                        for (int q = pids.Length; q < s; q++) model.Forward([seq[q]], [q], -1, kvc, true).Dispose();
+                    }
                     model.ResetSequenceState();
                     using (var kv = model.CreateKvCache(cap))
                     {
-                        model.Forward(seq.GetRange(0, s).ToArray(), Enumerable.Range(0, s).ToArray(), -1, kv, true).Dispose();
+                        BuildState(kv);
                         for (int j = 0; j < R; j++) rowsA[j] = LastRow(model.Forward([toks[j]], [pos[j]], -1, kv, true));
                     }
                     model.ResetSequenceState();
                     using (var kv = model.CreateKvCache(cap))
                     {
-                        model.Forward(seq.GetRange(0, s).ToArray(), Enumerable.Range(0, s).ToArray(), -1, kv, true).Dispose();
+                        BuildState(kv);
                         using var lg = model.ForwardWithRecurrentSnapshots(toks, pos, -1, kv, null);
                         unsafe { for (int j = 0; j < R; j++) rowsB[j] = new ReadOnlySpan<float>((void*)(lg.DataPointer + (nint)((long)j * vocab * 4)), vocab).ToArray(); }
                     }

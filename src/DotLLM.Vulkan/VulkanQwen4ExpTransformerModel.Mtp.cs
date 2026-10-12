@@ -395,7 +395,10 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IMtpHeadAtta
         HeadroomProbeResult? probe = null;
         if (HeadroomProbe is { } run)
         {
-            probe = run(_device, est.ProbeBytes);
+            // DOTLLM_MTP_HEADROOM_EXTRA_MIB is a diagnostic: it asks the probe for that much more, which makes "the head does not fit" reproducible on demand
+            // (a competing process only takes memory from this one when it arrives AFTER the load; an earlier allocation that sits idle is evicted).
+            long extra = long.TryParse(Environment.GetEnvironmentVariable("DOTLLM_MTP_HEADROOM_EXTRA_MIB"), out long xm) && xm > 0 ? xm << 20 : 0;
+            probe = run(_device, est.ProbeBytes + extra);
             if (trace) Console.Error.WriteLine("[mtp-attach] " + probe.Value.Describe());
         }
         var verdict = est.Decide(probe);
