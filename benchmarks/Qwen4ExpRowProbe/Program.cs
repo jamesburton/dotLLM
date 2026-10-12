@@ -29,6 +29,28 @@ string[] prompts =
 if (args[0] == "kbench") { KBench.Run(args); return; }
 if (args[0] == "iqbench") { IqKBench.Run(args); return; }
 if (args[0] == "mcbench") { McBench.Run(args); return; }
+if (args[0] == "capscan")
+{
+    // capscan [chunkMiB=128]: how much device memory ONE process can allocate and touch on a fresh device before the driver reports out-of-memory (no model).
+    long chunk = (args.Length > 1 ? long.Parse(args[1]) : 128) << 20;
+    using var dev = VulkanDevice.Create();
+    var bufs = new List<VulkanDevice.Buffer>();
+    long avail0 = HostMem.AvailableBytes();
+    try
+    {
+        var first = dev.AllocateDeviceLocal(chunk); bufs.Add(first);
+        for (int i = 0; i < 4000; i++)
+        {
+            var b = dev.AllocateDeviceLocal(chunk); bufs.Add(b);
+            dev.CopyBufferSynchronous(first, b, (ulong)chunk);
+            if (bufs.Count % 64 == 0) Console.WriteLine($"[capscan] {bufs.Count * chunk / 1073741824.0:F1} GiB ok, available RAM {HostMem.AvailableBytes() / 1073741824.0:F1} GiB");
+        }
+    }
+    catch (Exception e) { Console.WriteLine($"[capscan] stopped: {e.GetType().Name}"); }
+    Console.WriteLine($"[capscan] RESULT: {(bufs.Count - 1) * chunk / 1073741824.0:F2} GiB held OK (total allocated {bufs.Count * chunk / 1073741824.0:F2}), others {(dev.ReadOtherProcessPressure()?.OtherBytes ?? 0) / 1073741824.0:F2} GiB, available RAM {avail0 / 1073741824.0:F1} -> {HostMem.AvailableBytes() / 1073741824.0:F1} GiB");
+    foreach (var b in bufs) b.Dispose();
+    return;
+}
 if (args[0] == "mkids")
 {
     // mkids <gguf> <text file> <out.i32> <maxTokens>: tokenize a text file with the model's tokenizer (raw int32 ids, no BOS added by us).
@@ -80,6 +102,19 @@ var sw0 = Stopwatch.StartNew();
 using var file = GgufFile.Open(gguf);
 var cfg = GgufModelConfigExtractor.Extract(file.Metadata);
 using var device = VulkanDevice.Create();
+if (Environment.GetEnvironmentVariable("PROBE_MONITOR") == "1")
+{
+    // Resident-live / available-RAM sampler (#820 cap measurement): the last line before a failed load says where the process died.
+    var monDevice = device;
+    new Thread(() =>
+    {
+        while (true)
+        {
+            try { Console.WriteLine($"[mon] live {monDevice.ResidentLiveBytes() / 1073741824.0:F2} GiB, available RAM {HostMem.AvailableBytes() / 1073741824.0:F1} GiB"); Console.Out.Flush(); } catch { }
+            Thread.Sleep(2000);
+        }
+    }) { IsBackground = true }.Start();
+}
 string spv = Path.Combine(AppContext.BaseDirectory, "spv");
 using var model = VulkanQwen4ExpTransformerModel.BuildFromGguf(device, file, cfg, spv);
 Log($"loaded in {sw0.Elapsed.TotalSeconds:F0} s");
@@ -339,6 +374,135 @@ void Exec(string line, StringBuilder o)
                     SpecRun(tok.Encode(prompts[pi]).ToArray(), int.Parse(a[2]), int.Parse(a[3]), o, $"prompt{pi}");
             break;
         }
+        case "layerdiv":   // layerdiv <promptIdx> <R> <skip> : per-layer residual of row j of an R-row verify forward vs the same token run 1-row (identical state), first divergent layer
+        {
+            int pi = int.Parse(a[1]), R = int.Parse(a[2]), skip = a.Length > 3 ? int.Parse(a[3]) : 0;
+            var pids = tok.Encode(prompts[pi]).ToArray();
+            int cap = pids.Length + skip + R + 8;
+            // Greedy continuation from the plain 1-row run: the tokens to verify.
+            var seq = new List<int>(pids);
+            model.ResetSequenceState();
+            using (var kv = model.CreateKvCache(cap))
+            {
+                var last = LastRow(model.Forward(pids, Enumerable.Range(0, pids.Length).ToArray(), -1, kv, true));
+                for (int i = 0; i < skip + R; i++) { int t = ArgMaxOf(last); seq.Add(t); last = LastRow(model.Forward([t], [seq.Count - 1], -1, kv, true)); }
+            }
+            int s = pids.Length + skip;
+            var toks = seq.GetRange(s, R).ToArray();
+            var posn = Enumerable.Range(s, R).ToArray();
+            void BuildPlain(VulkanNemotronHKvCache kvc)
+            {
+                model.Forward(pids, Enumerable.Range(0, pids.Length).ToArray(), -1, kvc, true).Dispose();
+                for (int q = pids.Length; q < s; q++) model.Forward([seq[q]], [q], -1, kvc, true).Dispose();
+            }
+            var oneRow = new List<Dictionary<int, float[]>>();   // per verified token: layer -> residual (1 x row)
+            model.ResetSequenceState();
+            using (var kv = model.CreateKvCache(cap))
+            {
+                BuildPlain(kv);
+                for (int j = 0; j < R; j++)
+                {
+                    var d = new Dictionary<int, float[]>();
+                    model.Trace = (name, data, t, row) => { int il = int.Parse(name.Split('.')[1]); d[il] = (float[])data.Clone(); };
+                    model.Forward([toks[j]], [posn[j]], -1, kv, true).Dispose();
+                    model.Trace = null;
+                    oneRow.Add(d);
+                }
+            }
+            var batch = new Dictionary<int, float[]>();
+            int rowLen = 0;
+            model.ResetSequenceState();
+            using (var kv = model.CreateKvCache(cap))
+            {
+                BuildPlain(kv);
+                model.Trace = (name, data, t, row) => { int il = int.Parse(name.Split('.')[1]); batch[il] = (float[])data.Clone(); rowLen = row; };
+                model.ForwardWithRecurrentSnapshots(toks, posn, -1, kv, null).Dispose();
+                model.Trace = null;
+            }
+            for (int j = 0; j < R; j++)
+            {
+                int first = -1; var lineSb = new StringBuilder();
+                for (int il = 0; il < cfg.NumLayers; il++)
+                {
+                    var one = oneRow[j][il]; var b = batch[il];
+                    double mx = 0, mag = 0; bool eq = true;
+                    for (int i = 0; i < rowLen; i++)
+                    {
+                        float x1 = one[i], x2 = b[j * rowLen + i];
+                        if (x1 != x2) eq = false;
+                        mx = Math.Max(mx, Math.Abs((double)x1 - x2)); mag = Math.Max(mag, Math.Abs(x1));
+                    }
+                    if (!eq && first < 0) first = il;
+                    lineSb.Append(eq ? "=" : (mx / Math.Max(mag, 1e-9) < 1e-6 ? "u" : mx / Math.Max(mag, 1e-9) < 1e-4 ? "m" : "X"));
+                    if (il < 8 && j == 0) o.AppendLine($"   L{il} maxdiff {mx:G3} maxabs {mag:G3} rel {mx / Math.Max(mag, 1e-9):G3}");
+                }
+                string kinds = string.Concat(Enumerable.Range(0, cfg.NumLayers).Select(il => cfg.HybridLayout!.LayerKind[il] == DotLLM.Core.Models.HybridLayerKind.GatedDeltaNet ? 'g' : 'a'));
+                o.AppendLine($"layerdiv prompt{pi} skip={skip} row {j}: first divergent layer {first} ({(first >= 0 ? kinds[first].ToString() : "-")})");
+                o.AppendLine($"   kinds {kinds}");
+                o.AppendLine($"   rel   {lineSb}   (= identical, u <1e-6, m <1e-4, X larger)");
+            }
+            break;
+        }
+        case "rowident":   // rowident <promptIdx|all> <gen> <rows> <stride> : verify-row logits vs the plain 1-row run, per row index (#820 greedy identity)
+        {
+            int gen = int.Parse(a[2]), R = int.Parse(a[3]), stride = int.Parse(a[4]);
+            var agg = new RowIdentAgg(R);
+            for (int pi = 0; pi < prompts.Length; pi++)
+            {
+                if (a[1] != "all" && a[1] != pi.ToString()) continue;
+                var pids = tok.Encode(prompts[pi]).ToArray();
+                // Plain greedy run, 1-row decode: the reference tokens and the reference logits (state built by 1-row steps).
+                int cap = Math.Min(pids.Length + gen + R + 8, model.DenseContextLimit);
+                var seq = new List<int>(pids);
+                var refRows = new List<float[]>();   // refRows[i] = logits after consuming seq[0..pids.Length+i-1+1)... see below
+                model.ResetSequenceState();
+                using (var kv = model.CreateKvCache(cap))
+                {
+                    var last = LastRow(model.Forward(pids, Enumerable.Range(0, pids.Length).ToArray(), -1, kv, true));
+                    refRows.Add(last);   // refRows[0] = logits for the token after the prompt
+                    for (int i = 0; i < gen + R; i++)
+                    {
+                        int t = ArgMaxOf(last); seq.Add(t);
+                        last = LastRow(model.Forward([t], [seq.Count - 1], -1, kv, true));
+                        refRows.Add(last);
+                    }
+                }
+                // Windows: state = prefill of seq[0..s) (kernels of the verify/prefill family), then verify seq[s..s+R) and compare row j with refRows[s - pids.Length + j + 1]...
+                for (int s = pids.Length; s <= pids.Length + gen; s += stride)
+                {
+                    var toks = seq.GetRange(s, R).ToArray();
+                    var pos = Enumerable.Range(s, R).ToArray();
+                    var refs = Enumerable.Range(0, R).Select(j => refRows[s - pids.Length + j + 1]).ToArray();
+                    // (A) 1-row replay on a prefill-built state; (B) one R-row verify forward on an identical state.
+                    float[][] rowsA = new float[R][], rowsB = new float[R][];
+                    // State at s: "plain" = the prompt prefill, then 1-row steps (exactly the reference run's state, so only the verify kernels differ);
+                    // "prefill" = one prefill over seq[0..s) (the >= 9-row path builds the generated tokens' state).
+                    bool plainState = a.Length <= 5 || a[5] == "plain";
+                    void BuildState(VulkanNemotronHKvCache kvc)
+                    {
+                        if (!plainState) { model.Forward(seq.GetRange(0, s).ToArray(), Enumerable.Range(0, s).ToArray(), -1, kvc, true).Dispose(); return; }
+                        model.Forward(pids, Enumerable.Range(0, pids.Length).ToArray(), -1, kvc, true).Dispose();
+                        for (int q = pids.Length; q < s; q++) model.Forward([seq[q]], [q], -1, kvc, true).Dispose();
+                    }
+                    model.ResetSequenceState();
+                    using (var kv = model.CreateKvCache(cap))
+                    {
+                        BuildState(kv);
+                        for (int j = 0; j < R; j++) rowsA[j] = LastRow(model.Forward([toks[j]], [pos[j]], -1, kv, true));
+                    }
+                    model.ResetSequenceState();
+                    using (var kv = model.CreateKvCache(cap))
+                    {
+                        BuildState(kv);
+                        using var lg = model.ForwardWithRecurrentSnapshots(toks, pos, -1, kv, null);
+                        unsafe { for (int j = 0; j < R; j++) rowsB[j] = new ReadOnlySpan<float>((void*)(lg.DataPointer + (nint)((long)j * vocab * 4)), vocab).ToArray(); }
+                    }
+                    for (int j = 0; j < R; j++) { agg.Add(0, j, refs[j], rowsA[j]); agg.Add(1, j, refs[j], rowsB[j]); }
+                }
+            }
+            o.Append(agg.Report());
+            break;
+        }
         case "pfill":   // pfill <rows> <reps> <prefetch 0|1> : prefill of FRESH random ids (cold table pages) from position 0, wall ms
         {
             int rows = int.Parse(a[1]), reps = int.Parse(a[2]);
@@ -359,6 +523,27 @@ void Exec(string line, StringBuilder o)
                          (ps is { } s ? $" | table requests {s.Requests} rows {s.Rows} pages {s.UniquePages} waitMs {s.WaitMicros / 1000}" : ""));
             break;
         }
+        case "canary":   // canary <mib> <count> : memtest on a SECOND VulkanDevice in this process (does a failed submit there leave the model's device usable?)
+        {
+            long bytes = long.Parse(a[1]) << 20; int count = int.Parse(a[2]);
+            using var dev2 = VulkanDevice.Create();
+            var bufs = new List<VulkanDevice.Buffer>();
+            int ok = 0;
+            try
+            {
+                var first = dev2.AllocateDeviceLocal(bytes); bufs.Add(first);
+                for (int i = 0; i < count; i++)
+                {
+                    var b = dev2.AllocateDeviceLocal(bytes); bufs.Add(b);
+                    dev2.CopyBufferSynchronous(first, b, (ulong)bytes);
+                    ok++;
+                }
+            }
+            catch (Exception e) { o.AppendLine($"canary stopped: {e.GetType().Name}: {e.Message.Substring(0, Math.Min(100, e.Message.Length))}"); }
+            o.AppendLine($"canary: {ok} x {a[1]} MiB on device 2 (model device live {device.ResidentLiveBytes() / 1073741824.0:F2} GiB, device 2 live {dev2.ResidentLiveBytes() / 1073741824.0:F2} GiB)");
+            foreach (var b in bufs) b.Dispose();
+            break;
+        }
         case "memtest":   // memtest <mib> <count> : how many extra <mib> buffers can be allocated AND used (copy) after the model is resident
         {
             long bytes = long.Parse(a[1]) << 20; int count = int.Parse(a[2]);
@@ -375,7 +560,7 @@ void Exec(string line, StringBuilder o)
                 }
             }
             catch (Exception e) { o.AppendLine($"memtest stopped: {e.GetType().Name}: {e.Message.Substring(0, Math.Min(120, e.Message.Length))}"); }
-            o.AppendLine($"memtest: {ok} x {a[1]} MiB extra buffers allocated+used; heap0 fallback bytes {device.FallbackBytesOnHeap(0)}, heap1 {device.FallbackBytesOnHeap(1)}");
+            o.AppendLine($"memtest: {ok} x {a[1]} MiB extra buffers allocated+used (resident live now {device.ResidentLiveBytes() / 1073741824.0:F2} GiB, other processes {(device.ReadOtherProcessPressure()?.OtherBytes ?? 0) / 1073741824.0:F2} GiB); heap0 fallback bytes {device.FallbackBytesOnHeap(0)}, heap1 {device.FallbackBytesOnHeap(1)}");
             foreach (var b in bufs) b.Dispose();
             break;
         }
