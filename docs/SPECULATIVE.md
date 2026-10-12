@@ -636,6 +636,20 @@ held by other processes); with the guard overridden the attach works and decodin
 post-attach growth beyond the head is 0.08 GiB. `DOTLLM_VK_ALLOW_OVERCOMMIT=1` therefore gives Q4_K_XL its 1.33-1.38x today; tightening the estimate is left alone
 because it shares lines with the KV-allocation work (#437/#898).
 
+**End to end through `dotllm serve` (default settings, streamed chat, 200 tokens, `--mtp-head` for the ISTA files; tok/s from the final chunk's timings).** The gate
+explores plain decode once after the first MTP request and then follows the faster arm:
+
+| file | greedy plain | greedy MTP | sampled (T 0.7, top-k 40) plain | sampled MTP |
+|---|---|---|---|---|
+| UD-IQ4_XS | 23.1 | 29.1-31.6 (1.26-1.37x) | 22.4 | 26.8-32.4 |
+| ISTA IQ3_XXS | 23.3 | 30.0-31.7 (1.29-1.36x) | 23.2 | 27.3-28.5 |
+| ISTA IQ2_XS | 24.5 | 33.0-35.7 (1.35-1.45x) | 23.6 | 27.3-28.5 |
+
+**Never a loss: the stress case.** The native Q8_0 head (draft step 12-14 ms, `DOTLLM_MTP_HEAD_REQUANT=0`) on ISTA IQ2_XS makes MTP break even (+5 % greedy,
+-8 % sampled). With `DOTLLM_MTP_TRACE=1` the gate shows what it does: greedy request 1 on MTP (37.6 ms/token), request 2 plain (39.7), request 3 back on MTP,
+which then fell back to plain mid-request (103 of 199 tokens on MTP: the round model said MTP had slipped 4 % behind plain); the sampled gate measured MTP
+43.2 vs plain 40.0 ms/token and stayed on plain. Every request landed within 3 % of plain decode except the single exploratory sampled request (-8 %).
+
 **n-gram table prefetch (#822) on Vulkan.** `PleRowPrefetcher` is called at the top of every forward (before the first embedding record) and, for
 MTP, after each draft step with the verify chunk's known prefix `[last token, d1 .. di]`. Cold 1K-token prefill of fresh ids, A/B/B/A in one process:
 **7.7-7.9 s with the prefetch vs 14.4-14.6 s without** (-6.7 s, 1.85x), matching the CPU measurement of 6.8 s of demand faults per 1K chunk.
