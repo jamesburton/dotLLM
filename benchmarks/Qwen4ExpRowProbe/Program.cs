@@ -318,8 +318,10 @@ void Exec(string line, StringBuilder o)
         case "attach":
         {
             var t0 = Stopwatch.GetTimestamp();
+            long live0 = device.ResidentLiveBytes();
             model.AttachMtpHead(a[1]);
-            o.AppendLine($"attach: {Stopwatch.GetElapsedTime(t0).TotalSeconds:F1} s, SupportsMtp={model.SupportsMtp}");
+            long live1 = device.ResidentLiveBytes();
+            o.AppendLine($"attach: {Stopwatch.GetElapsedTime(t0).TotalSeconds:F1} s, SupportsMtp={model.SupportsMtp}, requantised={model.MtpHeadRequantized}, resident live {live0 / 1073741824.0:F2} -> {live1 / 1073741824.0:F2} GiB (+{(live1 - live0) / 1073741824.0:F2})");
             break;
         }
         case "standin":   // standin <trunkQsaLayer> : benchmark-only head from a trunk layer (no extra device memory)
