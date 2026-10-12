@@ -78,12 +78,21 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
     public const int WideMaxHeadDim = 256;
 
     /// <summary>
+    /// Compile-time head_dim bound of the optional 512-dim variant (issue #914: Gemma-4 global layers). Loaded only when
+    /// requested (<c>includeHd512</c>) on top of a wide variant; ask the INSTANCE (<see cref="SupportedMaxHeadDim"/>).
+    /// </summary>
+    public const int Hd512MaxHeadDim = 512;
+
+    /// <summary>Query rows per workgroup of the 512-dim variant (LDS: 17 KB).</summary>
+    private const int Hd512QueryTileRows = 4;
+
+    /// <summary>
     /// Largest head_dim any variant of this kernel can dispatch. Load-time gates that run
     /// before a kernel instance exists should compare against this, then consult the created
     /// instance's <see cref="SupportedMaxHeadDim"/> (the wide SPV may be absent from an
     /// older build).
     /// </summary>
-    public static int MaxSupportedHeadDim => WideMaxHeadDim;
+    public static int MaxSupportedHeadDim => Hd512MaxHeadDim;
 
     /// <summary>Environment override for the wide-head variant: <c>br16</c> (default), <c>br8</c>, or <c>off</c>.</summary>
     public const string WideVariantEnvVar = "DOTLLM_VK_FLASH_HD256";
@@ -113,12 +122,17 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
     private readonly nint _widePool;
     private readonly DescriptorSetCache? _wideDescriptorCache;
     private readonly int _wideQueryTileRows;
+    private readonly VulkanModule? _hd512Module;
+    private readonly ComputePipeline? _hd512Pipeline;
+    private readonly nint _hd512Pool;
+    private readonly DescriptorSetCache? _hd512DescriptorCache;
     private bool _disposed;
 
     private VulkanFlashAttentionF32Kernel(
         VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
         VulkanModule? wideModule, ComputePipeline? widePipeline, nint widePool,
-        FlashAttentionWideVariant wideVariant)
+        FlashAttentionWideVariant wideVariant,
+        VulkanModule? hd512Module = null, ComputePipeline? hd512Pipeline = null, nint hd512Pool = 0)
     {
         _device = device;
         _module = module;
@@ -137,6 +151,11 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         };
         if (widePipeline is not null)
             _wideDescriptorCache = new DescriptorSetCache(device, widePool, widePipeline, buffersPerSet: 4);
+        _hd512Module = hd512Module;
+        _hd512Pipeline = hd512Pipeline;
+        _hd512Pool = hd512Pool;
+        if (hd512Pipeline is not null)
+            _hd512DescriptorCache = new DescriptorSetCache(device, hd512Pool, hd512Pipeline, buffersPerSet: 4);
     }
 
     /// <summary>The wide-head variant this instance actually loaded, or <see cref="FlashAttentionWideVariant.None"/>.</summary>
@@ -148,12 +167,14 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
     /// the <see cref="MaxHeadDim"/> constant.
     /// </summary>
     public int SupportedMaxHeadDim =>
-        WideVariant == FlashAttentionWideVariant.None ? MaxHeadDim : WideMaxHeadDim;
+        WideVariant == FlashAttentionWideVariant.None ? MaxHeadDim
+        : _hd512Pipeline is not null ? Hd512MaxHeadDim : WideMaxHeadDim;
 
     /// <summary>Query rows per workgroup for a given head_dim (the wide br8 variant uses a smaller tile).</summary>
     /// <param name="headDim">Per-head dimension of the dispatch.</param>
     /// <returns>The <c>BR</c> the selected shader was compiled with.</returns>
-    public int QueryTileRowsFor(int headDim) => headDim > MaxHeadDim ? _wideQueryTileRows : QueryTileRows;
+    public int QueryTileRowsFor(int headDim)
+        => headDim > WideMaxHeadDim ? Hd512QueryTileRows : headDim > MaxHeadDim ? _wideQueryTileRows : QueryTileRows;
 
     /// <summary>Resolves the wide variant requested by <see cref="WideVariantEnvVar"/>.</summary>
     /// <returns>The requested variant; <see cref="FlashAttentionWideVariant.Hd256Br16"/> when unset.</returns>
@@ -212,9 +233,10 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
     /// <param name="device">Device to create the pipelines on.</param>
     /// <param name="spvDir">Directory holding the compiled SPIR-V blobs.</param>
     /// <param name="wideVariant">Wide-head variant to attempt to load.</param>
+    /// <param name="includeHd512">Also load the optional 512-dim variant (Gemma-4 global layers, #914).</param>
     /// <returns>The created kernel.</returns>
     public static VulkanFlashAttentionF32Kernel Create(
-        VulkanDevice device, string spvDir, FlashAttentionWideVariant wideVariant)
+        VulkanDevice device, string spvDir, FlashAttentionWideVariant wideVariant, bool includeHd512 = false)
     {
         string path = Path.Combine(spvDir, "attention_flash_f32.spv");
         if (!File.Exists(path))
@@ -282,8 +304,36 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
             }
         }
 
+        // #914: optional 512-dim variant (Gemma-4 global layers). Same degrade-don't-throw contract as the wide SPV; only
+        // meaningful on top of a loaded wide variant so SupportedMaxHeadDim stays monotone.
+        VulkanModule? hd512Module = null;
+        ComputePipeline? hd512Pipeline = null;
+        nint hd512Pool = 0;
+        if (includeHd512 && widePipeline is not null
+            && File.Exists(Path.Combine(spvDir, "attention_flash_f32_hd512_br4.spv"))
+            && Environment.GetEnvironmentVariable("DOTLLM_VK_FLASH_HD512") != "0")
+        {
+            try
+            {
+                hd512Module = VulkanModule.LoadFromFile(device, Path.Combine(spvDir, "attention_flash_f32_hd512_br4.spv"));
+                Span<VkDescriptorBinding> b512 = stackalloc VkDescriptorBinding[4];
+                for (uint i = 0; i < 4; i++) b512[(int)i] = new VkDescriptorBinding(i);
+                hd512Pipeline = hd512Module.CreateComputePipeline("main", b512, PushConstantBytes);
+                hd512Pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
+            }
+            catch
+            {
+                hd512Pipeline?.Dispose();
+                hd512Module?.Dispose();
+                hd512Module = null;
+                hd512Pipeline = null;
+                hd512Pool = 0;
+            }
+        }
+
         return new VulkanFlashAttentionF32Kernel(
-            device, module, pipeline, pool, wideModule, widePipeline, widePool, wideVariant);
+            device, module, pipeline, pool, wideModule, widePipeline, widePool, wideVariant,
+            hd512Module, hd512Pipeline, hd512Pool);
     }
 
     /// <summary>
@@ -296,19 +346,20 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         => TryCreate(device, spvDir, WideVariantFromEnvironment());
 
     /// <summary>
-    /// <see cref="Create(VulkanDevice, string, FlashAttentionWideVariant)"/> companion that
+    /// <see cref="Create(VulkanDevice, string, FlashAttentionWideVariant, bool)"/> companion that
     /// returns <c>null</c> instead of throwing when the base SPV is missing.
     /// </summary>
     /// <param name="device">Device to create the pipelines on.</param>
     /// <param name="spvDir">Directory holding the compiled SPIR-V blobs.</param>
     /// <param name="wideVariant">Wide-head variant to attempt to load.</param>
+    /// <param name="includeHd512">Also load the optional 512-dim variant (Gemma-4 global layers, #914).</param>
     /// <returns>The created kernel, or <c>null</c>.</returns>
     public static VulkanFlashAttentionF32Kernel? TryCreate(
-        VulkanDevice device, string spvDir, FlashAttentionWideVariant wideVariant)
+        VulkanDevice device, string spvDir, FlashAttentionWideVariant wideVariant, bool includeHd512 = false)
     {
         try
         {
-            return Create(device, spvDir, wideVariant);
+            return Create(device, spvDir, wideVariant, includeHd512);
         }
         catch (FileNotFoundException)
         {
@@ -325,6 +376,7 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
     {
         _descriptorCache.Reset();
         _wideDescriptorCache?.Reset();
+        _hd512DescriptorCache?.Reset();
     }
 
     /// <summary>
@@ -394,9 +446,10 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         // Issue #441: heads wider than the base shader's MAX_HEAD_DIM dispatch the wide SPV,
         // which has its own pipeline, descriptor pool/cache and (for br8) its own BR.
         bool wide = headDim > MaxHeadDim;
-        ComputePipeline pipeline = wide ? _widePipeline! : _pipeline;
-        DescriptorSetCache cache = wide ? _wideDescriptorCache! : _descriptorCache;
-        int queryTileRows = wide ? _wideQueryTileRows : QueryTileRows;
+        bool hd512 = headDim > WideMaxHeadDim;   // SupportedMaxHeadDim above guarantees the pipeline exists
+        ComputePipeline pipeline = hd512 ? _hd512Pipeline! : wide ? _widePipeline! : _pipeline;
+        DescriptorSetCache cache = hd512 ? _hd512DescriptorCache! : wide ? _wideDescriptorCache! : _descriptorCache;
+        int queryTileRows = hd512 ? Hd512QueryTileRows : wide ? _wideQueryTileRows : QueryTileRows;
 
         Span<nint> buffers = stackalloc nint[4] { q.Handle, k.Handle, v.Handle, output.Handle };
         nint descriptorSet = cache.GetOrCreate(buffers);
@@ -441,6 +494,11 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+
+        if (_hd512Pool != 0)
+            VulkanApi.vkDestroyDescriptorPool(_device.Handle, _hd512Pool, 0);
+        _hd512Pipeline?.Dispose();
+        _hd512Module?.Dispose();
 
         if (_widePool != 0)
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _widePool, 0);
