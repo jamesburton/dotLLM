@@ -599,7 +599,7 @@ the head 1.0 GiB smaller. UD-IQ4_XS, K = 4: 1.17x -> 1.56x of plain decode (K = 
   drops MTP after the calibration plus 5 rounds, a winning one keeps its win, both with output identical to plain); on the real files the one mild loser tried
   (ISTA IQ2_XS with the native Q8_0 head at K = 8, 0.9x) is handled by the controller picking a shorter K, not by the fall-back, so it neither gained nor lost
   from the calibration beyond noise. A stall in the first MTP rounds (measured once, while the box was building code: 700 ms per round) can trigger a spurious
-  fall-back in the first request; the re-probes recover it.
+  fall-back in the first request; the next re-probe (up to 16 requests later) recovers it.
 - *Re-probing.* A losing arm is re-measured every 40 decisions; a clear loss (> 10 %) doubles the interval up to 640.
 - *serve attaches the head.* `serve` never attached the separate qwen4exp head (only `run` did), so the default-on serve path never speculated on this
   model. It now attaches an auto-detected `mtp-*.gguf` and logs the outcome; a head that does not fit the device is declined with the numbers and serving
