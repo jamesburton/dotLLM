@@ -116,6 +116,26 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
         int vocabSize,
         int numCandidates,
         Span<int> outputBuffer)
+        => DraftAndVerify(targetModel, kvCacheTarget, mtpState, pipeline, generatedIds, constraint, position, vocabSize, numCandidates, outputBuffer,
+                          allowZeroDraft: false);
+
+    /// <summary>
+    /// The same round with an explicit switch for the calibration round (#820): with <paramref name="allowZeroDraft"/> a <paramref name="numCandidates"/>
+    /// of 0 drafts nothing, verifies the last token alone and commits one token - a plain decode step that keeps the MTP state in sync, whose wall time is
+    /// the request's plain-decode reference. Without it 0 candidates return an empty result, as before.
+    /// </summary>
+    public SpeculativeResult DraftAndVerify(
+        IModel targetModel,
+        IKvCache kvCacheTarget,
+        IMtpState mtpState,
+        SamplerPipeline pipeline,
+        List<int> generatedIds,
+        IDecodingConstraint? constraint,
+        int position,
+        int vocabSize,
+        int numCandidates,
+        Span<int> outputBuffer,
+        bool allowZeroDraft)
     {
         if (!targetModel.SupportsMtp)
             throw new ArgumentException(
@@ -127,7 +147,7 @@ public sealed class MtpSpeculativeDecoder : IMtpSpeculativeDecoder
         // KV-cache (the MTP state is sized for the whole sequence by the caller).
         int maxPos = kvCacheTarget.MaxLength;
         int k = Math.Min(numCandidates, maxPos - position - 1);
-        if (k <= 0)
+        if (k < 0 || (k == 0 && !(allowZeroDraft && numCandidates == 0)))
             return default;
 
         int lastToken = generatedIds[^1];

@@ -58,6 +58,55 @@ public sealed class TextGeneratorMtpGateTests
     }
 
     [Fact]
+    public void ColdStart_LosingConfig_IsCaughtByTheRequestsOwnCalibration_NotAfterAFullRequest()
+    {
+        // No plain sample exists (first request of a process): before #820 nothing could say "MTP is slower", so a losing configuration ran the whole
+        // request on MTP. The request now opens with zero-draft rounds, which are plain steps, and judges its own rounds against them.
+        using var plainModel = NewModel(draftRight: false, plainMs: 2, rowMs: 6, fixedMs: 6);
+        var reference = new TextGenerator(plainModel, new Tok(), mtpEnabled: false).Generate("p", Greedy(160));
+
+        using var model = NewModel(draftRight: false, plainMs: 2, rowMs: 6, fixedMs: 6);
+        var gen = new TextGenerator(model, new Tok(), mtpEnabled: true, mtpAdaptive: true, speculativeCandidates: 3);
+        Assert.Equal(0, gen.MtpGate!.PlainMsPerToken);
+        var resp = gen.Generate("p", Greedy(160));
+
+        Assert.Equal(reference.Text, resp.Text);   // calibration rounds and the switch commit exactly the plain tokens
+        Assert.True(resp.Timings.SpeculativeDraftTokens > 0, "the request must have tried MTP after calibrating");
+        Assert.True(resp.Timings.SpeculativeDraftTokens <= (MtpRoundController.MinRoundsForFallback + 2) * 3,
+            $"a losing config must drop MTP after a handful of rounds, drafted {resp.Timings.SpeculativeDraftTokens}");
+        Assert.True(gen.MtpGate.PlainMsPerToken > 0, "the calibration rounds must hand the gate its first plain sample");
+    }
+
+    [Fact]
+    public void ColdStart_WinningConfig_KeepsSpeculating_AndBothArmsAreMeasuredAfterOneRequest()
+    {
+        using var plainModel = NewModel(draftRight: true, plainMs: 20, rowMs: 2, fixedMs: 6);
+        var reference = new TextGenerator(plainModel, new Tok(), mtpEnabled: false).Generate("p", Greedy(100));
+
+        using var model = NewModel(draftRight: true, plainMs: 20, rowMs: 2, fixedMs: 6);
+        var gen = new TextGenerator(model, new Tok(), mtpEnabled: true, mtpAdaptive: true, speculativeCandidates: 3);
+        var resp = gen.Generate("p", Greedy(100));
+
+        Assert.Equal(reference.Text, resp.Text);
+        Assert.True(resp.Timings.SpeculativeAcceptedTokens >= 60, $"accepted {resp.Timings.SpeculativeAcceptedTokens}: the win must survive the calibration prefix");
+        Assert.True(gen.MtpGate!.PlainMsPerToken > 0 && gen.MtpGate.MtpMsPerToken > 0, "one request must leave a sample for each arm");
+        Assert.True(gen.MtpGate.MtpMsPerToken < gen.MtpGate.PlainMsPerToken);
+        // With both arms measured the second request goes straight to the winner instead of spending a request exploring plain decode.
+        Assert.True(gen.Generate("p", Greedy(100)).Timings.SpeculativeDraftTokens > 0);
+    }
+
+    [Fact]
+    public void Calibration_IsSkipped_ForShortRequests_AndWhenAPlainSampleExists()
+    {
+        using var model = NewModel(draftRight: true, plainMs: 20, rowMs: 2, fixedMs: 6);
+        var gen = new TextGenerator(model, new Tok(), mtpEnabled: true, mtpAdaptive: true, speculativeCandidates: 3);
+        Assert.False(gen.MtpGate!.NeedsPlainReference(MtpRoundController.MinTokensToCalibrate - 1));
+        Assert.True(gen.MtpGate.NeedsPlainReference(MtpRoundController.MinTokensToCalibrate));
+        gen.MtpGate.RecordSegment(false, 40, 40 * 20.0);
+        Assert.False(gen.MtpGate.NeedsPlainReference(1000));
+    }
+
+    [Fact]
     public void WinningRounds_KeepSpeculating_WithIdenticalOutput()
     {
         // Perfect drafts: a K=3 round commits 4 tokens for 6 + 2*4 + 3 = 17 ms against 4 * 20 = 80 ms plain (a wide margin: the suite runs this

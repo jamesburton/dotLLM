@@ -616,7 +616,7 @@ public sealed class TextGenerator
                 //    model, no second full-model KV-cache, just the model's own IMtpState. ──
                 var mtpDecoder = new MtpSpeculativeDecoder();
                 int[] specBuffer = ArrayPool<int>.Shared.Rent(_mtpCandidates + 1);
-                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _mtpCandidates) : null;
+                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _mtpCandidates, calibratePlain: mtpG.NeedsPlainReference(maxTokens - 1)) : null;
                 try
                 {
                     int step = 1;
@@ -634,14 +634,19 @@ public sealed class TextGenerator
                         var result = mtpDecoder.DraftAndVerify(
                             _model, kvCache, mtpState!,
                             pipeline, generatedIds, constraint,
-                            pos, vocabSize, k, specBuffer);
+                            pos, vocabSize, k, specBuffer, allowZeroDraft: true);
 
                         if (result.AcceptedCount == 0) break;
 
                         // Whole-round wall time (draft + verify + restore/absorb): the draft + verify sum omits the post-verify state restore.
                         decodeTicks += result.RoundTicks;
-                        mtpTicks += result.RoundTicks;
-                        mtpTokens += result.AcceptedCount;
+                        // Zero-draft calibration rounds are plain decode steps: they stay out of the MTP segment, so the end-of-request record
+                        // hands them to the gate as the plain sample.
+                        if (result.DraftedCount > 0)
+                        {
+                            mtpTicks += result.RoundTicks;
+                            mtpTokens += result.AcceptedCount;
+                        }
                         mtpCtl?.Record(result.DraftedCount, result.AcceptedCount, result.RoundTicks * 1000.0 / Stopwatch.Frequency);
                         specDrafted += result.DraftedCount;
 
@@ -1153,7 +1158,7 @@ public sealed class TextGenerator
                 // ── MTP self-speculative decode loop (issue #253) — streaming variant. ──
                 var mtpDecoder = new MtpSpeculativeDecoder();
                 int[] specBuffer = ArrayPool<int>.Shared.Rent(_mtpCandidates + 1);
-                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _mtpCandidates) : null;
+                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _mtpCandidates, calibratePlain: mtpG.NeedsPlainReference(maxTokens - 1)) : null;
                 try
                 {
                     int step = 1;
@@ -1173,13 +1178,18 @@ public sealed class TextGenerator
                         var result = mtpDecoder.DraftAndVerify(
                             _model, kvCache, mtpState!,
                             pipeline, generatedIds, constraint,
-                            pos, vocabSize, kk, specBuffer);
+                            pos, vocabSize, kk, specBuffer, allowZeroDraft: true);
 
                         if (result.AcceptedCount == 0) break;
 
                         decodeTicks += result.RoundTicks;
-                        mtpTicks += result.RoundTicks;
-                        mtpTokens += result.AcceptedCount;
+                        // Zero-draft calibration rounds are plain decode steps: they stay out of the MTP segment, so the end-of-request record
+                        // hands them to the gate as the plain sample.
+                        if (result.DraftedCount > 0)
+                        {
+                            mtpTicks += result.RoundTicks;
+                            mtpTokens += result.AcceptedCount;
+                        }
                         mtpCtl?.Record(result.DraftedCount, result.AcceptedCount, result.RoundTicks * 1000.0 / Stopwatch.Frequency);
                         specDrafted += result.DraftedCount;
 

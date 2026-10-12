@@ -196,22 +196,52 @@ public sealed class MtpRoundController
     /// <summary>MTP must be this much slower per token than plain before the request drops it (hysteresis against noise).</summary>
     public const double FallbackMargin = 0.04;
 
+    /// <summary>
+    /// Zero-draft calibration rounds a request runs when its gate has no plain-decode sample yet (#820). The first is cold (clock ramp, cold pages) and is
+    /// dropped from the average, so <see cref="MtpAdaptiveGate.MinSampleTokens"/> rounds count; they also hand the gate its first plain sample.
+    /// </summary>
+    public const int CalibrationRounds = MtpAdaptiveGate.MinSampleTokens + 1;
+
+    /// <summary>
+    /// A request calibrates only when it is long enough for the calibration to matter: the rounds cost at most a fraction of the output, and a
+    /// request this short could not amortise a speculative start anyway.
+    /// </summary>
+    public const int MinTokensToCalibrate = 4 * CalibrationRounds;
+
     private readonly MtpCostModel _model;
     private readonly int _configuredK;
     private int _round;
     private int _roundsThisRequest;
+    private int _calibrationLeft;
+    private bool _calibrationColdDropped;
+    private double _calibrationMs;
+    private int _calibrationSamples;
 
     /// <param name="model">Shared cost model.</param>
     /// <param name="configuredK">The K the caller asked for; also the upper bound.</param>
-    public MtpRoundController(MtpCostModel model, int configuredK)
+    /// <param name="calibratePlain">Start with <see cref="CalibrationRounds"/> zero-draft rounds that measure plain decode inside this request. Set when the gate has
+    /// no plain sample: without a reference a losing configuration cannot be detected, and the first request would run entirely on MTP.</param>
+    public MtpRoundController(MtpCostModel model, int configuredK, bool calibratePlain = false)
     {
         _model = model;
         _configuredK = Math.Clamp(configuredK, 1, MtpCostModel.MaxK);
+        _calibrationLeft = calibratePlain ? CalibrationRounds : 0;
     }
 
-    /// <summary>Draft length for the next round, never above <paramref name="remainingTokens"/> or the configured K.</summary>
+    /// <summary>True while zero-draft calibration rounds remain.</summary>
+    public bool Calibrating => _calibrationLeft > 0;
+
+    /// <summary>Plain-decode milliseconds per token measured by this request's calibration rounds; 0 until at least one counted round ran.</summary>
+    public double CalibratedPlainMsPerToken => _calibrationSamples > 0 ? _calibrationMs / _calibrationSamples : 0;
+
+    /// <summary>
+    /// Draft length for the next round, never above <paramref name="remainingTokens"/> or the configured K. Returns 0 for a calibration round (no draft,
+    /// one committed token; see <see cref="MtpSpeculativeDecoder"/>).
+    /// </summary>
     public int NextK(int remainingTokens)
     {
+        if (_calibrationLeft > 0)
+            return 0;
         int cap = Math.Min(_configuredK, Math.Max(remainingTokens, 1));
         int k;
         if (_roundsThisRequest < WarmupRounds && _model.RoundsAt(_configuredK) < WarmupRounds)
@@ -230,19 +260,27 @@ public sealed class MtpRoundController
         return Math.Clamp(k, 1, cap);
     }
 
-    /// <summary>Feeds back a finished round (<paramref name="emitted"/> = tokens committed, i.e. accepted drafts + 1).</summary>
+    /// <summary>Feeds back a finished round (<paramref name="emitted"/> = tokens committed, i.e. accepted drafts + 1). <paramref name="k"/> 0 is a calibration round.</summary>
     public void Record(int k, int emitted, double roundMs)
     {
+        if (k == 0)
+        {
+            if (_calibrationLeft > 0) _calibrationLeft--;
+            if (!_calibrationColdDropped) { _calibrationColdDropped = true; return; }
+            if (roundMs > 0 && emitted > 0) { _calibrationMs += roundMs / emitted; _calibrationSamples++; }
+            return;
+        }
         _roundsThisRequest++;
         _model.RecordRound(k, emitted - 1, roundMs);
     }
 
     /// <summary>
-    /// True when the model's best K is slower per generated token than plain decode (<paramref name="plainMsPerToken"/> &gt; 0) by more than
-    /// <see cref="FallbackMargin"/>, after enough rounds in this request to trust it.
+    /// True when the model's best K is slower per generated token than plain decode (<paramref name="plainMsPerToken"/> &gt; 0, else this request's own
+    /// calibration) by more than <see cref="FallbackMargin"/>, after enough rounds in this request to trust it.
     /// </summary>
     public bool ShouldFallBack(double plainMsPerToken)
     {
+        if (plainMsPerToken <= 0) plainMsPerToken = CalibratedPlainMsPerToken;
         if (plainMsPerToken <= 0 || _roundsThisRequest < MinRoundsForFallback) return false;
         var (_, perTok) = _model.BestK(_configuredK);
         return perTok > 0 && perTok > plainMsPerToken * (1.0 + FallbackMargin);
