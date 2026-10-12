@@ -616,7 +616,7 @@ public sealed class TextGenerator
                 //    model, no second full-model KV-cache, just the model's own IMtpState. ──
                 var mtpDecoder = new MtpSpeculativeDecoder();
                 int[] specBuffer = ArrayPool<int>.Shared.Rent(_mtpCandidates + 1);
-                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _mtpCandidates, calibratePlain: mtpG.NeedsPlainReference(maxTokens - 1)) : null;
+                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _mtpCandidates, calibratePlain: mtpG.NeedsPlainReference(maxTokens - 1), gate: mtpG) : null;
                 try
                 {
                     int step = 1;
@@ -1158,7 +1158,7 @@ public sealed class TextGenerator
                 // ── MTP self-speculative decode loop (issue #253) — streaming variant. ──
                 var mtpDecoder = new MtpSpeculativeDecoder();
                 int[] specBuffer = ArrayPool<int>.Shared.Rent(_mtpCandidates + 1);
-                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _mtpCandidates, calibratePlain: mtpG.NeedsPlainReference(maxTokens - 1)) : null;
+                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _mtpCandidates, calibratePlain: mtpG.NeedsPlainReference(maxTokens - 1), gate: mtpG) : null;
                 try
                 {
                     int step = 1;

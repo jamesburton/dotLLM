@@ -133,6 +133,21 @@ public sealed class MtpAdaptiveGate
         lock (_lock) return _plainSamples == 0;
     }
 
+    /// <summary>
+    /// Takes a request's own calibrated plain-decode figure as the first plain sample when the gate has none (the calibration rounds are too few for
+    /// <see cref="RecordSegment"/>'s minimum). Later real plain samples replace it through the usual EMA.
+    /// </summary>
+    internal void AdoptPlainReference(double msPerToken)
+    {
+        if (msPerToken <= 0) return;
+        lock (_lock)
+        {
+            if (_plainSamples != 0) return;
+            _plainMsPerToken = msPerToken;
+            _plainSamples = 1;
+        }
+    }
+
     /// <summary>True unless <c>DOTLLM_MTP_CALIBRATE</c> is <c>0</c>.</summary>
     public static bool CalibrationEnabled { get; } = Environment.GetEnvironmentVariable("DOTLLM_MTP_CALIBRATE") != "0";
 

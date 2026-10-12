@@ -585,13 +585,14 @@ the head 1.0 GiB smaller. UD-IQ4_XS, K = 4: 1.17x -> 1.56x of plain decode (K = 
 - *Mid-request fall-back.* After 5 rounds, if the best K is more than 4 % slower per token than plain decode, the request finishes on the plain loop
   (output unchanged: the state after a round is exactly the committed state). The decision needs a plain reference.
 - *Cold start (#906).* The first request of a process has no plain sample, so before #906 it was not cut short and a losing configuration paid a whole
-  request. A request of at least `MtpRoundController.MinTokensToCalibrate` (52) tokens on a gate with no plain sample now opens with 13 **zero-draft
+  request. A request of at least `MtpRoundController.MinTokensToCalibrate` (48) tokens on a gate with no plain sample now opens with 8 **zero-draft
   rounds** (`MtpSpeculativeDecoder.DraftAndVerify(..., allowZeroDraft: true)` with 0 candidates: no draft, a one-row verify of the last token, one committed
-  token, MTP state kept in sync, so the output is exactly plain greedy/sampled decode). The first is cold and dropped; the other 12 are the request's own
-  plain reference for the fall-back and are recorded as the gate's first plain sample, so after ONE request both arms are measured (before: a second request
-  was spent exploring plain). Cost: about a dozen plain-speed tokens once per gate (greedy and sampled each); the loss on a losing configuration is bounded by
-  those plus the 5 rounds before the fall-back. Bias: a zero-draft round also pays the head's one-row absorb, so the reference is a few percent slower than
-  true plain decode, which errs towards keeping MTP (the re-probes then replace it with a true plain sample). `DOTLLM_MTP_CALIBRATE=0` turns it off.
+  token, MTP state kept in sync, so the output is exactly plain greedy/sampled decode). The first 2 are cold and not counted; the median of the other 6 is the
+  request's own plain reference for the fall-back and is adopted as the gate's first plain sample, so after ONE request both arms are measured (before: a second
+  request was spent exploring plain). Warm, a zero-draft round costs what a plain step costs (44.5-45.2 vs 43.9-50.9 ms median, UD-IQ4_XS, 16 rounds each: the head's
+  one-row absorb is ~1 ms); the loss on a losing configuration is bounded by those 8 plain-speed tokens plus the 5 rounds before the fall-back. The reference
+  errs towards keeping MTP (the absorb, and any cold rounds that slip into the median, make it slower than true plain decode); the re-probes replace it with a true
+  plain sample. `DOTLLM_MTP_CALIBRATE=0` turns it off; `DOTLLM_MTP_TRACE=1` prints every calibration round.
 - *Re-probing.* A losing arm is re-measured every 40 decisions; a clear loss (> 10 %) doubles the interval up to 640.
 - *serve attaches the head.* `serve` never attached the separate qwen4exp head (only `run` did), so the default-on serve path never speculated on this
   model. It now attaches an auto-detected `mtp-*.gguf` and logs the outcome; a head that does not fit the device is declined with the numbers and serving

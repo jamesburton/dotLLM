@@ -197,32 +197,38 @@ public sealed class MtpRoundController
     public const double FallbackMargin = 0.04;
 
     /// <summary>
-    /// Zero-draft calibration rounds a request runs when its gate has no plain-decode sample yet (#820). The first is cold (clock ramp, cold pages) and is
-    /// dropped from the average, so <see cref="MtpAdaptiveGate.MinSampleTokens"/> rounds count; they also hand the gate its first plain sample.
+    /// Zero-draft calibration rounds a request runs when its gate has no plain-decode sample yet (#906). The first <see cref="CalibrationColdRounds"/> are cold
+    /// (clock ramp, first-use pipelines, cold n-gram pages: 140-260 ms against 45 ms warm on UD-IQ4_XS in a fresh process) and are not counted; the median of
+    /// the rest is the request's plain reference and the gate's first plain sample.
     /// </summary>
-    public const int CalibrationRounds = MtpAdaptiveGate.MinSampleTokens + 1;
+    public const int CalibrationRounds = 8;
+
+    /// <summary>Leading calibration rounds that are discarded as cold.</summary>
+    public const int CalibrationColdRounds = 2;
 
     /// <summary>
-    /// A request calibrates only when it is long enough for the calibration to matter: the rounds cost at most a fraction of the output, and a
-    /// request this short could not amortise a speculative start anyway.
+    /// A request calibrates only when it is long enough for the calibration to matter: the rounds run at plain speed, so a request must have enough tokens
+    /// left for a win to repay them, and a short one could not amortise a speculative start anyway.
     /// </summary>
-    public const int MinTokensToCalibrate = 4 * CalibrationRounds;
+    public const int MinTokensToCalibrate = 48;
 
     private readonly MtpCostModel _model;
     private readonly int _configuredK;
     private int _round;
     private int _roundsThisRequest;
     private int _calibrationLeft;
-    private bool _calibrationColdDropped;
-    private double _calibrationMs;
-    private int _calibrationSamples;
+    private int _calibrationSeen;
+    private readonly List<double> _calibrationSamples = new();
+    private readonly MtpAdaptiveGate? _gate;
 
     /// <param name="model">Shared cost model.</param>
     /// <param name="configuredK">The K the caller asked for; also the upper bound.</param>
     /// <param name="calibratePlain">Start with <see cref="CalibrationRounds"/> zero-draft rounds that measure plain decode inside this request. Set when the gate has
     /// no plain sample: without a reference a losing configuration cannot be detected, and the first request would run entirely on MTP.</param>
-    public MtpRoundController(MtpCostModel model, int configuredK, bool calibratePlain = false)
+    /// <param name="gate">The gate that receives the calibrated plain reference as its first plain sample (null in unit tests of the controller alone).</param>
+    public MtpRoundController(MtpCostModel model, int configuredK, bool calibratePlain = false, MtpAdaptiveGate? gate = null)
     {
+        _gate = gate;
         _model = model;
         _configuredK = Math.Clamp(configuredK, 1, MtpCostModel.MaxK);
         _calibrationLeft = calibratePlain ? CalibrationRounds : 0;
@@ -231,8 +237,16 @@ public sealed class MtpRoundController
     /// <summary>True while zero-draft calibration rounds remain.</summary>
     public bool Calibrating => _calibrationLeft > 0;
 
-    /// <summary>Plain-decode milliseconds per token measured by this request's calibration rounds; 0 until at least one counted round ran.</summary>
-    public double CalibratedPlainMsPerToken => _calibrationSamples > 0 ? _calibrationMs / _calibrationSamples : 0;
+    /// <summary>Plain-decode milliseconds per token measured by this request's calibration rounds (median of the counted ones); 0 until one counted round ran.</summary>
+    public double CalibratedPlainMsPerToken
+    {
+        get
+        {
+            if (_calibrationSamples.Count == 0) return 0;
+            var sorted = _calibrationSamples.OrderBy(x => x).ToList();
+            return sorted[sorted.Count / 2];
+        }
+    }
 
     /// <summary>
     /// Draft length for the next round, never above <paramref name="remainingTokens"/> or the configured K. Returns 0 for a calibration round (no draft,
@@ -266,8 +280,16 @@ public sealed class MtpRoundController
         if (k == 0)
         {
             if (_calibrationLeft > 0) _calibrationLeft--;
-            if (!_calibrationColdDropped) { _calibrationColdDropped = true; return; }
-            if (roundMs > 0 && emitted > 0) { _calibrationMs += roundMs / emitted; _calibrationSamples++; }
+            bool cold = _calibrationSeen++ < CalibrationColdRounds;
+            if (MtpAdaptiveGate.TraceEnabled)
+                Console.Error.WriteLine($"[mtp] calibration round {_calibrationSeen}/{CalibrationRounds}: {roundMs:F1} ms{(cold ? " (cold, not counted)" : "")}");
+            if (!cold && roundMs > 0 && emitted > 0) _calibrationSamples.Add(roundMs / emitted);
+            if (_calibrationLeft == 0 && _calibrationSamples.Count > 0)
+            {
+                _gate?.AdoptPlainReference(CalibratedPlainMsPerToken);
+                if (MtpAdaptiveGate.TraceEnabled)
+                    Console.Error.WriteLine($"[mtp] calibrated plain reference: {CalibratedPlainMsPerToken:F1} ms/token ({_calibrationSamples.Count} counted rounds)");
+            }
             return;
         }
         _roundsThisRequest++;

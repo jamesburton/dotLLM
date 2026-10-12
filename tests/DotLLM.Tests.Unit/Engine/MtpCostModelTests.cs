@@ -34,10 +34,10 @@ public sealed class MtpCostModelTests
         {
             Assert.True(ctl.Calibrating);
             Assert.Equal(0, ctl.NextK(1000));
-            ctl.Record(0, 1, i == 0 ? 90.0 : 40.0);   // the first (cold) round is slower and must not enter the average
+            ctl.Record(0, 1, i < MtpRoundController.CalibrationColdRounds ? 90.0 : 40.0 + (i % 2));   // the cold rounds are slower and must not enter the median
         }
         Assert.False(ctl.Calibrating);
-        Assert.Equal(40.0, ctl.CalibratedPlainMsPerToken, 6);
+        Assert.InRange(ctl.CalibratedPlainMsPerToken, 40.0, 41.0);
         Assert.Equal(0, model.TotalRounds);           // calibration never pollutes the MTP cost model
         Assert.InRange(ctl.NextK(1000), 1, 4);
     }
