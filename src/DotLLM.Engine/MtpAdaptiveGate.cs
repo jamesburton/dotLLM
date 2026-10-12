@@ -87,6 +87,16 @@ public sealed class MtpAdaptiveGate
     /// <summary>EMA of decode ms per token for MTP rounds; 0 until sampled.</summary>
     public double MtpMsPerToken { get { lock (_lock) return _mtpMsPerToken; } }
 
+    /// <summary>Trace switch: <c>DOTLLM_MTP_TRACE=1</c> prints every gate decision and sample to stderr (diagnosis of "why did request N run plain?").</summary>
+    public static bool TraceEnabled { get; } = Environment.GetEnvironmentVariable("DOTLLM_MTP_TRACE") == "1";
+
+    /// <summary>One-line state of both arms, for the trace.</summary>
+    public string Describe()
+    {
+        lock (_lock)
+            return $"plain {_plainMsPerToken:F1} ms/tok (n={_plainSamples}), mtp {_mtpMsPerToken:F1} ms/tok (n={_mtpSamples}), since-reprobe {_sinceReprobe}/{_reprobeEvery}";
+    }
+
     /// <summary>Decides whether the next request (with the given <c>max_tokens</c>) should use MTP.</summary>
     public bool ShouldUseMtp(int maxTokens)
     {
