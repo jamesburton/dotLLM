@@ -81,8 +81,7 @@ public static class VulkanModelLoader
     /// cache type and there is no common <c>CreateKvCache</c> interface.
     /// </returns>
     /// <exception cref="NotSupportedException">
-    /// The architecture has no GGUF representation at all (Mamba-3), is recognized but not
-    /// runnable on Vulkan yet (nemotron_h_moe), or is only wired on the single-device model
+    /// The architecture has no GGUF representation at all (Mamba-3), or is only wired on the single-device model
     /// (gpt-oss on the pipeline/hybrid models; #737).
     /// </exception>
     public static (IModel Model, Func<int, IKvCache> KvCacheFactory) CreateFromGguf(
@@ -104,6 +103,7 @@ public static class VulkanModelLoader
             }
 
             case Architecture.NemotronH:
+            case Architecture.NemotronHMoe:   // #402: routed layers are detected per layer by the router tensor
             {
                 var nemotron = VulkanNemotronHTransformerModel.BuildFromGguf(
                     device, gguf, config, spvDir);
@@ -122,13 +122,6 @@ public static class VulkanModelLoader
             // caller then sees "blk.0.attn_output.weight not present" (or a bare
             // "Hybrid SSM / Mamba architectures are not supported") instead of the actual
             // reason.
-            case Architecture.NemotronHMoe:
-                throw new NotSupportedException(
-                    "nemotron_h_moe (Nemotron 3.5 Lightning) is recognized but not yet runnable on " +
-                    "Vulkan: the DeepSeek-V3-style MoE forward is not implemented, and its expert " +
-                    "tensors ship in quantizations (Q5_0/IQ4_NL/Q4_0) the expert-indexed MoE kernel " +
-                    "family does not cover yet. Tracked in issue #375.");
-
             case Architecture.Qwen4Exp:
             {
                 // Qwen3.8-Flash-Next (#818 V1, #871): dense-attention QSA fallback, host n-gram branch. Per-sequence state
