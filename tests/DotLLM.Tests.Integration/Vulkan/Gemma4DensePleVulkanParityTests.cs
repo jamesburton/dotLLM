@@ -85,6 +85,63 @@ public sealed class Gemma4DensePleVulkanParityTests
         finally { try { File.Delete(path); } catch { } }
     }
 
+    [SkippableTheory]
+    [InlineData(1)]
+    [InlineData(7)]
+    public void GpuPleInputs_MatchHostPath_AndAreActuallyUsed(int rows)
+    {
+        // #916: the GPU PLE pipeline (projection GEMM + combine kernel) must reproduce the host
+        // ComputeLayerMajor result (here: through the logits of a real forward) for 1 row and a prefill chunk,
+        // and the default path must really be the GPU one (A/B arm: DOTLLM_VK_GEMMA4_PLE_GPU=0).
+        RequireVulkan();
+        string spv = SpvDir();
+        string path = Path.Combine(Path.GetTempPath(), $"syn_g4ple_{Guid.NewGuid():N}.gguf");
+        SyntheticGemma4Gguf.WriteGemma4(path, Cfg());
+        string? prev = Environment.GetEnvironmentVariable("DOTLLM_VK_GEMMA4_PLE_GPU");
+        try
+        {
+            using var gguf = GgufFile.Open(path);
+            var cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            var ids = Ids.AsSpan(0, rows).ToArray();
+            var pos = Pos.AsSpan(0, rows).ToArray();
+
+            Environment.SetEnvironmentVariable("DOTLLM_VK_GEMMA4_PLE_GPU", "0");
+            float[] host, hostPle;
+            int pleElems = cfg.NumLayers * rows * cfg.PerLayerEmbedding!.PerLayerDim;
+            using (var vkHost = VulkanTransformerModel.LoadFromGguf(gguf, cfg, spv))
+            {
+                Assert.False(vkHost.Gemma4PleOnGpu);
+                host = LastRow(vkHost.Forward(ids, pos, -1, kvCache: null), cfg.VocabSize);
+                hostPle = vkHost.DownloadPleInputsForTest(pleElems);
+            }
+            Environment.SetEnvironmentVariable("DOTLLM_VK_GEMMA4_PLE_GPU", null);
+            float[] gpu, gpuPle;
+            using (var vkGpu = VulkanTransformerModel.LoadFromGguf(gguf, cfg, spv))
+            {
+                Assert.True(vkGpu.Gemma4PleOnGpu);
+                gpu = LastRow(vkGpu.Forward(ids, pos, -1, kvCache: null), cfg.VocabSize);
+                gpuPle = vkGpu.DownloadPleInputsForTest(pleElems);
+            }
+
+            float pleWorst = 0, pleMax = 0;
+            for (int i = 0; i < pleElems; i++) { pleWorst = MathF.Max(pleWorst, MathF.Abs(hostPle[i] - gpuPle[i])); pleMax = MathF.Max(pleMax, MathF.Abs(hostPle[i])); }
+            _output.WriteLine($"rows={rows}: PLE inputs worst|diff|={pleWorst:E3} (max |value| {pleMax:E3})");
+            Assert.True(pleMax > 0.05f, "PLE inputs degenerate");
+            Assert.True(pleWorst <= 1e-5f * pleMax + 1e-6f, $"PLE inputs differ: {pleWorst:E3} vs max {pleMax:E3}");
+
+            float worst = 0;
+            for (int i = 0; i < host.Length; i++) worst = MathF.Max(worst, MathF.Abs(host[i] - gpu[i]));
+            _output.WriteLine($"rows={rows}: host-PLE vs gpu-PLE worst|logit diff|={worst:E3} (logit range {host.Min():F2}..{host.Max():F2})");
+            Assert.True(worst < 2e-3f, $"GPU PLE logits diverge from the host path: {worst:E3}");
+            Assert.Equal(ArgMax(host), ArgMax(gpu));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DOTLLM_VK_GEMMA4_PLE_GPU", prev);
+            try { File.Delete(path); } catch { }
+        }
+    }
+
     [SkippableFact]
     public void CachedPrefillThenDecode_DoubleWideFfn_MatchesCpu()
     {
