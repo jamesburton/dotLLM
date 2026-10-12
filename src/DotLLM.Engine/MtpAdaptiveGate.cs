@@ -122,6 +122,35 @@ public sealed class MtpAdaptiveGate
         }
     }
 
+    /// <summary>
+    /// True when a request of up to <paramref name="remainingTokens"/> decode tokens should open with zero-draft calibration rounds (see
+    /// <see cref="MtpRoundController.CalibrationRounds"/>): there is no plain-decode sample yet, so neither this request nor the gate could notice a
+    /// speculative configuration that loses. Costs about a dozen plain steps once; <c>DOTLLM_MTP_CALIBRATE=0</c> turns it off.
+    /// </summary>
+    public bool NeedsPlainReference(int remainingTokens)
+    {
+        if (remainingTokens < MtpRoundController.MinTokensToCalibrate || !CalibrationEnabled) return false;
+        lock (_lock) return _plainSamples == 0;
+    }
+
+    /// <summary>
+    /// Takes a request's own calibrated plain-decode figure as the first plain sample when the gate has none (the calibration rounds are too few for
+    /// <see cref="RecordSegment"/>'s minimum). Later real plain samples replace it through the usual EMA.
+    /// </summary>
+    internal void AdoptPlainReference(double msPerToken)
+    {
+        if (msPerToken <= 0) return;
+        lock (_lock)
+        {
+            if (_plainSamples != 0) return;
+            _plainMsPerToken = msPerToken;
+            _plainSamples = 1;
+        }
+    }
+
+    /// <summary>True unless <c>DOTLLM_MTP_CALIBRATE</c> is <c>0</c>.</summary>
+    public static bool CalibrationEnabled { get; } = Environment.GetEnvironmentVariable("DOTLLM_MTP_CALIBRATE") != "0";
+
     /// <summary>Feeds back a finished request: whether MTP was used, tokens generated, and decode-phase time.</summary>
     public void Record(bool usedMtp, int generatedTokens, double decodeMs)
         => RecordSegment(usedMtp, generatedTokens - 1, decodeMs); // the first token comes from prefill

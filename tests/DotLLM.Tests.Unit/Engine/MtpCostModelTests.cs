@@ -26,6 +26,40 @@ public sealed class MtpCostModelTests
     }
 
     [Fact]
+    public void Calibration_RunsZeroDraftRoundsFirst_DropsTheColdOne_AndDoesNotCountAsMtpRounds()
+    {
+        var model = new MtpCostModel();
+        var ctl = new MtpRoundController(model, 4, calibratePlain: true);
+        for (int i = 0; i < MtpRoundController.CalibrationRounds; i++)
+        {
+            Assert.True(ctl.Calibrating);
+            Assert.Equal(0, ctl.NextK(1000));
+            ctl.Record(0, 1, i < MtpRoundController.CalibrationColdRounds ? 90.0 : 40.0 + (i % 2));   // the cold rounds are slower and must not enter the median
+        }
+        Assert.False(ctl.Calibrating);
+        Assert.InRange(ctl.CalibratedPlainMsPerToken, 40.0, 41.0);
+        Assert.Equal(0, model.TotalRounds);           // calibration never pollutes the MTP cost model
+        Assert.InRange(ctl.NextK(1000), 1, 4);
+    }
+
+    [Fact]
+    public void Calibration_GivesAFreshRequestItsFallBackReference()
+    {
+        var model = new MtpCostModel();
+        var ctl = new MtpRoundController(model, 3, calibratePlain: true);
+        for (int i = 0; i < MtpRoundController.CalibrationRounds; i++) { ctl.NextK(1000); ctl.Record(0, 1, 10.0); }   // plain: 10 ms / token
+        // MTP rounds at 60 ms for 1 token (all drafts rejected): 6x slower than plain.
+        for (int i = 0; i < MtpRoundController.MinRoundsForFallback; i++)
+        {
+            Assert.False(ctl.ShouldFallBack(plainMsPerToken: 0), "must not judge before enough MTP rounds");
+            int k = ctl.NextK(1000);
+            ctl.Record(k, 1, 60.0);
+        }
+        Assert.True(ctl.ShouldFallBack(plainMsPerToken: 0), "the request's own calibration is the reference when the gate has none");
+        Assert.False(new MtpRoundController(model, 3).ShouldFallBack(0), "without calibration or a gate sample there is no reference");
+    }
+
+    [Fact]
     public void Controller_WarmsUpAtTheConfiguredK_ThenFollowsTheModel()
     {
         var model = new MtpCostModel();
