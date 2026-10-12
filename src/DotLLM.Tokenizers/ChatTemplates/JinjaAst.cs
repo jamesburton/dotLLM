@@ -13,7 +13,8 @@ internal sealed record ForNode(
     string? SecondVariableName, // for "key, value in dict" unpacking
     IExpression Iterable,
     IReadOnlyList<ITemplateNode> Body,
-    IReadOnlyList<ITemplateNode>? ElseBody) : ITemplateNode;
+    IReadOnlyList<ITemplateNode>? ElseBody,
+    IExpression? Filter = null) : ITemplateNode; // "for x in seq if cond": cond is evaluated per item BEFORE iteration (loop.* counts the survivors)
 
 internal sealed record IfNode(
     IReadOnlyList<(IExpression Condition, IReadOnlyList<ITemplateNode> Body)> Branches,
