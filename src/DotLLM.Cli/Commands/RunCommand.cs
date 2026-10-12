@@ -256,8 +256,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         /// <summary>Opt-out of MTP self-speculative decoding when the loaded GGUF carries an MTP head.</summary>
         [CommandOption("--no-mtp")]
         [Description("Disable Multi-Token Prediction (MTP) self-speculative decoding. When enabled (default), " +
-                     "MTP auto-engages whenever the loaded GGUF carries an MTP head (nextn.* tensors) and decoding " +
-                     "is effectively greedy — same output as plain decode, just faster. No effect on GGUFs without an MTP head. " +
+                     "MTP auto-engages whenever the loaded GGUF carries an MTP head (nextn.* tensors); an adaptive gate measures it against plain decode and " +
+                     "falls back when it loses. Greedy output is identical to plain decode; sampled output is distributed identically (exact speculative sampling). No effect on GGUFs without an MTP head. " +
                      "Mutually exclusive with --speculative-model (an explicit draft model takes priority).")]
         [DefaultValue(false)]
         public bool NoMtp { get; set; }
@@ -265,7 +265,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         /// <summary>Explicit MTP head GGUF for architectures that ship it as a separate file (qwen4exp).</summary>
         [CommandOption("--mtp-head")]
         [Description("Path of a separate MTP head GGUF (qwen4exp ships it as mtp-*.gguf beside the quantisation folders). " +
-                     "Default: auto-detected in the model's directory and the one above it. Ignored for models whose GGUF embeds the head.")]
+                     "Default: auto-detected in the model's directory and the one above it, and attached only for trunks of 50 GiB and up (smaller quantisations measure faster without it; an explicit path always attaches). " +
+                     "Ignored for models whose GGUF embeds the head.")]
         public string? MtpHead { get; set; }
 
         /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
@@ -373,7 +374,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 // qwen4exp ships its MTP draft head as a separate GGUF (#820): attach the explicit or auto-detected sibling.
                 try
                 {
-                    mtpHeadPath = DotLLM.Models.Architectures.Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, settings.MtpHead);
+                    mtpHeadPath = DotLLM.Models.Architectures.Qwen4ExpMtpHeadResolver.TryAttach(model, resolvedPath, settings.MtpHead,
+                        trunkBytes: DotLLM.HuggingFace.ModelResolver.FileLength(resolvedPath));
                 }
                 catch (Exception ex) when (settings.MtpHead is null && ex is not FileNotFoundException)
                 {
@@ -698,7 +700,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             }
 
             if (!settings.Json && draftModel is null && !settings.NoMtp && model.SupportsMtp)
-                AnsiConsole.MarkupLine($"[dim]MTP self-speculative decoding: K={settings.SpeculativeK} ({(mtpHeadPath is null ? "model carries an MTP head" : "head: " + Markup.Escape(System.IO.Path.GetFileName(mtpHeadPath)))}; disable with --no-mtp)[/]");
+                AnsiConsole.MarkupLine($"[dim]MTP self-speculative decoding: K={(settings.SpeculativeK == DotLLM.Engine.TextGenerator.DefaultSpeculativeCandidates && model.MtpPreferredDraftTokens > 0 ? model.MtpPreferredDraftTokens : settings.SpeculativeK)} ({(mtpHeadPath is null ? "model carries an MTP head" : "head: " + Markup.Escape(System.IO.Path.GetFileName(mtpHeadPath)))}; disable with --no-mtp)[/]");
 
             var generator = new TextGenerator(model, tokenizer, kvFactory,
                 draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,

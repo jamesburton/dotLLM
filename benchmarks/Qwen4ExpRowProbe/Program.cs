@@ -208,6 +208,8 @@ void SpecRun(int[] ids, int n, int k, StringBuilder o, string label)
     o.AppendLine($"{label}: ctx={ids.Length} n={n} K={k}: plain {plainTps:F2} tok/s ({plainMs / (n - 1):F1} ms/tok) | MTP {specTps:F2} tok/s | ratio {specTps / plainTps:F2}x | " +
                  $"rounds {rounds.Count}, tokens/round {(double)(n - 1) / rounds.Count:F2}, draft {draftMs / rounds.Count:F1} ms/round, verify {verifyMs / rounds.Count:F1} ms/round, round {specMs / rounds.Count:F1} ms | {divTxt}");
     o.AppendLine($"   in-process: absorb {mt.AbsorbMs / rounds.Count:F1} ms/round (incl. prefill absorbs), restore {mt.RestoreMs / rounds.Count:F1} ms/round, draft steps {mt.DraftMs / Math.Max(mt.DraftSteps, 1):F1} ms each");
+    var ds = model.DraftSplitMs; long dn = Math.Max(mt.DraftSteps, 1);
+    o.AppendLine($"   draft step split (ms each): record {ds.RecordMs / dn:F2}, submit+wait {ds.SubmitMs / dn:F2}, download+argmax {ds.DownloadMs / dn:F2}, prefetch {ds.PrefetchMs / dn:F2}");
     o.AppendLine($"   accepted-per-round histogram: {string.Join(" ", rounds.GroupBy(x => x).OrderBy(g => g.Key).Select(g => $"{g.Key}:{g.Count()}"))}");
 }
 
@@ -316,8 +318,10 @@ void Exec(string line, StringBuilder o)
         case "attach":
         {
             var t0 = Stopwatch.GetTimestamp();
+            long live0 = device.ResidentLiveBytes();
             model.AttachMtpHead(a[1]);
-            o.AppendLine($"attach: {Stopwatch.GetElapsedTime(t0).TotalSeconds:F1} s, SupportsMtp={model.SupportsMtp}");
+            long live1 = device.ResidentLiveBytes();
+            o.AppendLine($"attach: {Stopwatch.GetElapsedTime(t0).TotalSeconds:F1} s, SupportsMtp={model.SupportsMtp}, requantised={model.MtpHeadRequantized}, resident live {live0 / 1073741824.0:F2} -> {live1 / 1073741824.0:F2} GiB (+{(live1 - live0) / 1073741824.0:F2})");
             break;
         }
         case "standin":   // standin <trunkQsaLayer> : benchmark-only head from a trunk layer (no extra device memory)

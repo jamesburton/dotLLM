@@ -59,10 +59,11 @@ public sealed class MtpAdaptiveGateTests
         g.Record(false, 65, 27 * 64);
         g.Record(true, 65, 55 * 64);
 
+        // 55 vs 27 ms/token is a clear loss, so the interval doubles after every probe (40, 80, 160 ...; see MtpCostModelTests for the near-tie case).
         int mtpPicks = 0;
-        for (int i = 0; i < MtpAdaptiveGate.ReprobeEvery * 3; i++)
+        for (int i = 0; i < MtpAdaptiveGate.ReprobeEvery * 7; i++)
             if (g.ShouldUseMtp(64)) mtpPicks++;
-        Assert.Equal(3, mtpPicks);   // exactly one re-probe per ReprobeEvery decisions
+        Assert.Equal(3, mtpPicks);
     }
 
     [Fact]

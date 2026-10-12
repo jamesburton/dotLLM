@@ -457,6 +457,14 @@ or `--expected-concurrency 5` (or more). `--mtp` is still accepted for back-comp
 rules above. `GET /props` reports `mtp_active` and `mtp_status` (`active`, `off (--no-mtp)`, `unavailable (no MTP head)`, `skipped (...)`); the
 web UI shows the same on the model badge. `POST /v1/models/load` accepts `"mtp": false` to opt out for one load.
 
+**qwen4exp (Qwen3.8-Flash-Next) ships its head as a separate `mtp-*.gguf`** beside the quantisation folders (#820). `serve` attaches an
+auto-detected sibling head only for trunks of 50 GiB and up (`Qwen4ExpMtpHeadResolver.AutoAttachMinTrunkBytes`): measured on Vulkan / Strix Halo, the
+bigger quantisations win with speculation and the smaller ones lose, and the head costs ~3 GiB of device memory. `--mtp-head <path>` forces a head
+for any trunk; a head that does not fit the device is declined with a startup message and serving continues without speculation. Sampled requests
+(`temperature > 0`) speculate too, with exact speculative sampling (the output is distributed as plain sampling; greedy output is identical to plain
+decode). The adaptive gate keeps separate greedy and sampled arms, measures whole-round wall time, adapts the draft length K per model, drops to plain
+decode inside a request whose measured rounds lose, and re-probes a losing arm with exponential back-off. See [SPECULATIVE.md](SPECULATIVE.md) (#900).
+
 `GET /v1/models/inspect` returns `has_mtp` (true for a qwen35 checkpoint whose trailing block really carries the `nextn.*` tensors). The web UI's
 Load Model modal uses it: for such models the draft-model picker is hidden and replaced with "MTP: built into this model - enabled automatically"
 plus an opt-out checkbox; for models without a head the picker is offered as an optional **external draft (speculative) model** (unselected by default).

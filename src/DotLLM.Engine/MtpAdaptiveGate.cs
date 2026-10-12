@@ -23,10 +23,10 @@ public sealed class MtpAdaptiveGate
     public const int MinMaxTokens = 12;
 
     /// <summary>Minimum decode-phase tokens for a request to contribute a speed sample.</summary>
-    public const int MinSampleTokens = 6;
+    public const int MinSampleTokens = 12;
 
     /// <summary>Re-measure the currently losing arm after this many decisions.</summary>
-    public const int ReprobeEvery = 40;
+    public const int ReprobeEvery = 16;
 
     private const double Alpha = 0.3;
 
@@ -39,14 +39,44 @@ public sealed class MtpAdaptiveGate
     /// </summary>
     public const long MtpPriorMinModelBytes = 6L << 30;
 
+    /// <summary>Longest wait between re-probes of a clearly losing arm (decisions).</summary>
+    public const int MaxReprobeEvery = 640;
+
+    /// <summary>An arm slower than the winner by more than this ratio is "clearly losing": its re-probe interval doubles (a probe of a 0.8x arm costs a fifth of one request).</summary>
+    public const double ClearLossRatio = 1.10;
+
     private readonly bool _tryMtpFirst;
     private readonly object _lock = new();
+    private int _reprobeEvery = ReprobeEvery;
+
+    /// <summary>
+    /// Online model of this model's MTP rounds (acceptance per draft position, round cost per K). Shared by every request of the generator, so
+    /// the draft length and the mid-request fall-back (<see cref="MtpRoundController"/>) learn once and keep learning.
+    /// </summary>
+    public MtpCostModel CostModel { get; } = new();
 
     /// <param name="modelBytes">Resident model size in bytes; selects which arm is explored first.</param>
     public MtpAdaptiveGate(long modelBytes = long.MaxValue) => _tryMtpFirst = modelBytes >= MtpPriorMinModelBytes;
     private double _plainMsPerToken, _mtpMsPerToken;
     private int _plainSamples, _mtpSamples;
     private int _sinceReprobe;
+
+    /// <summary>
+    /// Forgets every measurement (arms, re-probe schedule, cost model) and starts again from the size prior. The server calls this after its warm-up:
+    /// warm-up requests are tiny and run cold (the first MTP request of a process measured 2x slower than steady state), and one such sample made
+    /// the gate settle on plain decode for the first dozens of real requests.
+    /// </summary>
+    public void Reset()
+    {
+        lock (_lock)
+        {
+            _plainMsPerToken = _mtpMsPerToken = 0;
+            _plainSamples = _mtpSamples = 0;
+            _sinceReprobe = 0;
+            _reprobeEvery = ReprobeEvery;
+        }
+        CostModel.Reset();
+    }
 
     /// <summary>True unless <see cref="DisableEnvVar"/> is <c>0</c>.</summary>
     public static bool EnabledByEnvironment => Environment.GetEnvironmentVariable(DisableEnvVar) != "0";
@@ -70,9 +100,12 @@ public sealed class MtpAdaptiveGate
             if (_plainSamples == 0) return false;
 
             bool mtpWins = _mtpMsPerToken < _plainMsPerToken;
-            if (++_sinceReprobe >= ReprobeEvery)
+            if (++_sinceReprobe >= _reprobeEvery)
             {
                 _sinceReprobe = 0;
+                // Re-measure the losing arm; back off when it loses by a clear margin so a hopeless arm costs ~nothing in the long run.
+                double ratio = mtpWins ? _plainMsPerToken / _mtpMsPerToken : _mtpMsPerToken / _plainMsPerToken;
+                _reprobeEvery = ratio > ClearLossRatio ? Math.Min(_reprobeEvery * 2, MaxReprobeEvery) : ReprobeEvery;
                 return !mtpWins;
             }
             return mtpWins;
@@ -81,8 +114,14 @@ public sealed class MtpAdaptiveGate
 
     /// <summary>Feeds back a finished request: whether MTP was used, tokens generated, and decode-phase time.</summary>
     public void Record(bool usedMtp, int generatedTokens, double decodeMs)
+        => RecordSegment(usedMtp, generatedTokens - 1, decodeMs); // the first token comes from prefill
+
+    /// <summary>
+    /// Feeds back a stretch of decode (<paramref name="decodeTokens"/> tokens in <paramref name="decodeMs"/>) done with one arm. A request that
+    /// fell back from MTP to plain decode mid-way records its two stretches separately.
+    /// </summary>
+    public void RecordSegment(bool usedMtp, int decodeTokens, double decodeMs)
     {
-        int decodeTokens = generatedTokens - 1; // the first token comes from prefill
         if (decodeTokens < MinSampleTokens || decodeMs <= 0)
             return;
 

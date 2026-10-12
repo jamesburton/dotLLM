@@ -33,10 +33,12 @@ public sealed class TextGenerator
     private readonly IModel? _draftModel;
     private readonly Func<ModelConfig, int, Core.Attention.IKvCache>? _draftKvCacheFactory;
     private readonly int _speculativeCandidates;
+    private readonly int _mtpCandidates;   // MTP depth: the model's preferred K when the caller kept the library default
     private readonly bool _mtpEnabled;
     private readonly HybridPrefillDecodeStrategy? _hybridStrategy;
     private readonly int _prefillChunkSize;
     private readonly MtpAdaptiveGate? _mtpGate;
+    private readonly MtpAdaptiveGate? _mtpGateSampled;   // sampled requests accept fewer drafts and pay the sampler per verify row: own arms and cost model
 
     // Single-slot prefix cache for recurrent (GDN/SSM) models: tokens + the KV cache holding them + the recurrent state
     // checkpointed right after them. See ResolveRecurrentPrefix.
@@ -139,12 +141,15 @@ public sealed class TextGenerator
         _draftModel = draftModel;
         _draftKvCacheFactory = draftKvCacheFactory;
         _speculativeCandidates = speculativeCandidates;
+        _mtpCandidates = speculativeCandidates == DefaultSpeculativeCandidates && model.MtpPreferredDraftTokens > 0
+            ? Math.Min(model.MtpPreferredDraftTokens, MtpCostModel.MaxK) : speculativeCandidates;
         _mtpEnabled = mtpEnabled;
         _hybridStrategy = hybridStrategy;
         _prefillChunkSize = prefillChunkSize;
         _recurrentPrefixEnabled = recurrentPrefixCache && draftModel is null
             && model.RequiresPerSequenceState && model.SupportsRecurrentStateCheckpoint;
         _mtpGate = mtpAdaptive && MtpAdaptiveGate.EnabledByEnvironment ? new MtpAdaptiveGate(model.MtpGatePriorBytes) : null;
+        _mtpGateSampled = _mtpGate is null ? null : new MtpAdaptiveGate(model.MtpGatePriorBytes);
 
         if (hybridStrategy is not null
             && !ReferenceEquals(hybridStrategy.DecodeModel, model))
@@ -277,8 +282,9 @@ public sealed class TextGenerator
         // and we have a clean cache (no prefix-cache reuse, no speculative draft model, no MTP).
         // MTP needs the whole sequence absorbed into its head from position 0 (issue #469), so a
         // prefix-cache hit — which skips the cached prefix's forward — runs without it.
-        bool useMtp = ShouldUseMtp(captureLogprobs, options) && cachedTokenCount == 0
-            && (_mtpGate?.ShouldUseMtp(maxTokens) ?? true);
+        var mtpGate = GateFor(pipeline.IsStochastic);
+        bool useMtp = ShouldUseMtp(captureLogprobs) && cachedTokenCount == 0
+            && (mtpGate?.ShouldUseMtp(maxTokens) ?? true);
         bool useHybrid = _hybridStrategy is not null
             && _hybridStrategy.ShouldRunHybrid(promptLen)
             && cachedTokenCount == 0
@@ -516,11 +522,14 @@ public sealed class TextGenerator
             }
 
             int specDrafted = 0, specAccepted = 0;
+            bool useDraftSpec = _draftModel != null && !captureLogprobs && IsEffectivelyGreedy(options);
+            int mtpFallbackStep = 0;                // > 0: the MTP rounds measured slower than plain decode; plain decode resumes at this step (#900)
+            long mtpTicks = 0; int mtpTokens = 0;   // MTP-segment wall ticks / committed tokens, for the adaptive gate
 
             // Decode loop (speculative decode disabled when logprobs requested — no per-position logit access;
             // also disabled when sampling isn't effectively greedy, since non-greedy acceptance is not yet
             // distributionally correct under the sampler pipeline — see Wave 8 / issue #121).
-            if (_draftModel != null && !captureLogprobs && IsEffectivelyGreedy(options))
+            if (useDraftSpec)
             {
                 // ── Speculative decode loop ──
                 var specDecoder = new SpeculativeDecoder(
@@ -542,9 +551,9 @@ public sealed class TextGenerator
                         int k = Math.Min(_speculativeCandidates, remaining);
 
                         var result = specDecoder.DraftAndVerify(
-                            _model, _draftModel, kvCache, draftKvCache,
+                            _model, _draftModel!, kvCache, draftKvCache,
                             pipeline, generatedIds, constraint,
-                            pos, vocabSize, _draftModel.Config.VocabSize, k, specBuffer);
+                            pos, vocabSize, _draftModel!.Config.VocabSize, k, specBuffer);
 
                         if (result.AcceptedCount == 0) break;
 
@@ -604,8 +613,9 @@ public sealed class TextGenerator
                 // ── MTP self-speculative decode loop (issue #253): the target model's own
                 //    lightweight head drafts candidates from its own hidden state — no second
                 //    model, no second full-model KV-cache, just the model's own IMtpState. ──
-                var mtpDecoder = new MtpSpeculativeDecoder(greedy: true);
-                int[] specBuffer = ArrayPool<int>.Shared.Rent(_speculativeCandidates + 1);
+                var mtpDecoder = new MtpSpeculativeDecoder();
+                int[] specBuffer = ArrayPool<int>.Shared.Rent(_mtpCandidates + 1);
+                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _mtpCandidates) : null;
                 try
                 {
                     int step = 1;
@@ -614,8 +624,11 @@ public sealed class TextGenerator
                         int pos = promptLen + step - 1;
                         if (pos >= cacheSize) break;
 
+                        // The measured MTP round cost per token is above plain decode's: finish this request on the plain loop below.
+                        if (mtpCtl is not null && mtpCtl.ShouldFallBack(mtpGate!.PlainMsPerToken)) { mtpFallbackStep = step; break; }
+
                         int remaining = maxTokens - step;
-                        int k = Math.Min(_speculativeCandidates, remaining);
+                        int k = mtpCtl?.NextK(remaining) ?? Math.Min(_mtpCandidates, remaining);
 
                         var result = mtpDecoder.DraftAndVerify(
                             _model, kvCache, mtpState!,
@@ -624,7 +637,11 @@ public sealed class TextGenerator
 
                         if (result.AcceptedCount == 0) break;
 
-                        decodeTicks += result.DraftTicks + result.VerifyTicks;
+                        // Whole-round wall time (draft + verify + restore/absorb): the draft + verify sum omits the post-verify state restore.
+                        decodeTicks += result.RoundTicks;
+                        mtpTicks += result.RoundTicks;
+                        mtpTokens += result.AcceptedCount;
+                        mtpCtl?.Record(result.DraftedCount, result.AcceptedCount, result.RoundTicks * 1000.0 / Stopwatch.Frequency);
                         specDrafted += result.DraftedCount;
 
                         // Constraint is already advanced inside DraftAndVerify — do NOT advance again here.
@@ -676,10 +693,12 @@ public sealed class TextGenerator
                     ArrayPool<int>.Shared.Return(specBuffer);
                 }
             }
-            else
+
+            // Plain decode: the default, and the tail of a request whose MTP rounds fell back (mtpFallbackStep).
+            if (!useDraftSpec && (!useMtp || mtpFallbackStep > 0))
             {
                 // ── Standard decode loop: one token at a time ──
-                for (int step = 1; step < maxTokens; step++)
+                for (int step = mtpFallbackStep > 0 ? mtpFallbackStep : 1; step < maxTokens; step++)
                 {
                     int pos = promptLen + step - 1;
                     if (pos >= cacheSize)
@@ -755,7 +774,7 @@ public sealed class TextGenerator
                 prefillTicks * 1000.0 / Stopwatch.Frequency,
                 decodeTicks * 1000.0 / Stopwatch.Frequency,
                 finishReason);
-            _mtpGate?.Record(useMtp, generatedIds.Count, decodeTicks * 1000.0 / Stopwatch.Frequency);
+            RecordMtpGate(mtpGate, useMtp, generatedIds.Count, mtpTicks, mtpTokens, decodeTicks, samplerTicks);
             return BuildResponse(promptLen, generatedIds, finishReason,
                 prefillTicks, decodeTicks, samplerTicks, GetKvCacheBytes(kvCache), cachedTokenCount,
                 specDrafted, specAccepted, logprobsList?.ToArray(),
@@ -848,8 +867,9 @@ public sealed class TextGenerator
         // Hybrid mode: same gating as the non-streaming path.
         // MTP needs the whole sequence absorbed into its head from position 0 (issue #469), so a
         // prefix-cache hit — which skips the cached prefix's forward — runs without it.
-        bool useMtp = ShouldUseMtp(captureLogprobs, options) && cachedTokenCount == 0
-            && (_mtpGate?.ShouldUseMtp(maxTokens) ?? true);
+        var mtpGate = GateFor(pipeline.IsStochastic);
+        bool useMtp = ShouldUseMtp(captureLogprobs) && cachedTokenCount == 0
+            && (mtpGate?.ShouldUseMtp(maxTokens) ?? true);
         bool useHybrid = _hybridStrategy is not null
             && _hybridStrategy.ShouldRunHybrid(promptLen)
             && cachedTokenCount == 0
@@ -865,10 +885,11 @@ public sealed class TextGenerator
         var generatedIds = new List<int>(maxTokens);
         long prefillTicks = 0;
         long decodeTicks = 0;
+        long mtpTicks = 0; int mtpTokens = 0;   // MTP-segment wall ticks / committed tokens, for the adaptive gate (read in the finally)
+        long samplerTicks = 0;
 
         try
         {
-            long samplerTicks = 0;
             int cacheSize = kvCache.MaxLength;
 
             // Incremental detokenizer: O(1) amortized per token for stop-check + streaming delta,
@@ -1026,10 +1047,12 @@ public sealed class TextGenerator
             }
 
             int specDrafted = 0, specAccepted = 0;
+            bool useDraftSpec = _draftModel != null && !captureLogprobs && IsEffectivelyGreedy(options);
+            int mtpFallbackStep = 0;                // > 0: the MTP rounds measured slower than plain decode; plain decode resumes at this step (#900)
 
             // Speculative decode disabled when logprobs requested — no per-position logit access.
             // Also disabled when sampling isn't effectively greedy (see Wave 8 / issue #121).
-            if (_draftModel != null && !captureLogprobs && IsEffectivelyGreedy(options))
+            if (useDraftSpec)
             {
                 // ── Speculative decode loop ──
                 var specDecoder = new SpeculativeDecoder(
@@ -1052,9 +1075,9 @@ public sealed class TextGenerator
                         int kk = Math.Min(_speculativeCandidates, remaining);
 
                         var result = specDecoder.DraftAndVerify(
-                            _model, _draftModel, kvCache, draftKvCache,
+                            _model, _draftModel!, kvCache, draftKvCache,
                             pipeline, generatedIds, constraint,
-                            pos, vocabSize, _draftModel.Config.VocabSize, kk, specBuffer);
+                            pos, vocabSize, _draftModel!.Config.VocabSize, kk, specBuffer);
 
                         if (result.AcceptedCount == 0) break;
 
@@ -1126,8 +1149,9 @@ public sealed class TextGenerator
             else if (useMtp)
             {
                 // ── MTP self-speculative decode loop (issue #253) — streaming variant. ──
-                var mtpDecoder = new MtpSpeculativeDecoder(greedy: true);
-                int[] specBuffer = ArrayPool<int>.Shared.Rent(_speculativeCandidates + 1);
+                var mtpDecoder = new MtpSpeculativeDecoder();
+                int[] specBuffer = ArrayPool<int>.Shared.Rent(_mtpCandidates + 1);
+                var mtpCtl = mtpGate is { } mtpG ? new MtpRoundController(mtpG.CostModel, _mtpCandidates) : null;
                 try
                 {
                     int step = 1;
@@ -1138,8 +1162,11 @@ public sealed class TextGenerator
                         int pos = promptLen + step - 1;
                         if (pos >= cacheSize) break;
 
+                        // See the non-streaming loop: fall back to plain decode when MTP measures slower.
+                        if (mtpCtl is not null && mtpCtl.ShouldFallBack(mtpGate!.PlainMsPerToken)) { mtpFallbackStep = step; break; }
+
                         int remaining = maxTokens - step;
-                        int kk = Math.Min(_speculativeCandidates, remaining);
+                        int kk = mtpCtl?.NextK(remaining) ?? Math.Min(_mtpCandidates, remaining);
 
                         var result = mtpDecoder.DraftAndVerify(
                             _model, kvCache, mtpState!,
@@ -1148,7 +1175,10 @@ public sealed class TextGenerator
 
                         if (result.AcceptedCount == 0) break;
 
-                        decodeTicks += result.DraftTicks + result.VerifyTicks;
+                        decodeTicks += result.RoundTicks;
+                        mtpTicks += result.RoundTicks;
+                        mtpTokens += result.AcceptedCount;
+                        mtpCtl?.Record(result.DraftedCount, result.AcceptedCount, result.RoundTicks * 1000.0 / Stopwatch.Frequency);
                         specDrafted += result.DraftedCount;
 
                         // Constraint is already advanced inside DraftAndVerify — do NOT advance again here.
@@ -1211,10 +1241,12 @@ public sealed class TextGenerator
                     ArrayPool<int>.Shared.Return(specBuffer);
                 }
             }
-            else
+
+            // Plain decode: the default, and the tail of a request whose MTP rounds fell back (mtpFallbackStep).
+            if (!useDraftSpec && (!useMtp || mtpFallbackStep > 0))
             {
                 // ── Standard decode loop: one token at a time ──
-                for (int step = 1; step < maxTokens; step++)
+                for (int step = mtpFallbackStep > 0 ? mtpFallbackStep : 1; step < maxTokens; step++)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
@@ -1296,7 +1328,7 @@ public sealed class TextGenerator
                 prefillTicks * 1000.0 / Stopwatch.Frequency,
                 decodeTicks * 1000.0 / Stopwatch.Frequency,
                 FinishReason.Length);
-            _mtpGate?.Record(useMtp, generatedIds.Count, decodeTicks * 1000.0 / Stopwatch.Frequency);
+            RecordMtpGate(mtpGate, useMtp, generatedIds.Count, mtpTicks, mtpTokens, decodeTicks, samplerTicks);
             ArrayPool<char>.Shared.Return(stopScratch);
             mtpState?.Dispose();
             if (ownsKvCache)
@@ -1601,9 +1633,38 @@ public sealed class TextGenerator
         return allowed <= 0;
     }
 
-    private bool ShouldUseMtp(bool captureLogprobs, DotLLM.Core.Configuration.InferenceOptions options)
-        => _mtpEnabled && _draftModel is null && _model.SupportsMtp
-           && !captureLogprobs && IsEffectivelyGreedy(options);
+    /// <summary>Clears the adaptive MTP gates' measurements (greedy and sampled); the warm-up calls this so its tiny cold requests do not set the first verdict.</summary>
+    public void ResetMtpGate()
+    {
+        _mtpGate?.Reset();
+        _mtpGateSampled?.Reset();
+    }
+
+    private MtpAdaptiveGate? GateFor(bool sampled) => sampled ? _mtpGateSampled : _mtpGate;
+
+    /// <summary>
+    /// Feeds one finished request to the adaptive gate. A plain request contributes one plain sample (forward + sampler); an MTP request contributes
+    /// an MTP sample from its round wall time (the rounds already contain their sampling) and, when it fell back to plain decode mid-request, a plain
+    /// sample from the tail.
+    /// </summary>
+    private static void RecordMtpGate(MtpAdaptiveGate? gate, bool usedMtp, int generated, long mtpTicks, int mtpTokens, long decodeTicks, long samplerTicks)
+    {
+        if (gate is null) return;
+        if (!usedMtp)
+        {
+            gate.Record(false, generated, (decodeTicks + samplerTicks) * 1000.0 / Stopwatch.Frequency);
+            return;
+        }
+        gate.RecordSegment(true, mtpTokens, mtpTicks * 1000.0 / Stopwatch.Frequency);
+        int plainTokens = generated - 1 - mtpTokens;
+        if (plainTokens > 0)
+            gate.RecordSegment(false, plainTokens, (decodeTicks - mtpTicks + samplerTicks) * 1000.0 / Stopwatch.Frequency);
+    }
+
+    // Sampled requests speculate too (#900): the decoder does exact speculative sampling against the prepared distribution. Logprob capture still
+    // opts out (no per-position logits to read back).
+    private bool ShouldUseMtp(bool captureLogprobs)
+        => _mtpEnabled && _draftModel is null && _model.SupportsMtp && !captureLogprobs;
 
     /// <summary>
     /// Runs the prompt-suffix prefill forward pass(es) against <paramref name="kvCache"/>.

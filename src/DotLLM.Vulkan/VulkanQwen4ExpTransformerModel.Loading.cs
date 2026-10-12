@@ -450,7 +450,8 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
         };
     }
 
-    private static MoeLayerWeights LoadMoe(int il, GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> t, ModelConfig config, List<nint> owned)
+    private static MoeLayerWeights LoadMoe(int il, GgufFile gguf, IReadOnlyDictionary<string, GgufTensorDescriptor> t, ModelConfig config, List<nint> owned,
+        bool requantRoutedBanks = false)
     {
         var moe = config.Moe!;
         string p = $"blk.{il}.";
@@ -468,6 +469,17 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
 
         var gateD = t[p + "ffn_gate_exps.weight"]; var upD = t[p + "ffn_up_exps.weight"]; var downD = t[p + "ffn_down_exps.weight"];
         var sg = t[p + "ffn_gate_shexp.weight"]; var su = t[p + "ffn_up_shexp.weight"]; var sd = t[p + "ffn_down_shexp.weight"];
+        // #900: a smaller routed bank for the MTP head. Gate/up -> Q4_K (the fused decode chain and the multi-row MMVQ twin read it), down -> Q5_1
+        // (K = the 640-wide intermediate is not a multiple of 256, so no K-quant fits; Q5_1 has a decode MMVQ). Draft quality only: the verify
+        // forward decides every emitted token.
+        nint gateP = gguf.TensorDataPointer(gateD), upP = gguf.TensorDataPointer(upD), downP = gguf.TensorDataPointer(downD);
+        QuantizationType gateQt = gateD.QuantizationType, upQt = upD.QuantizationType, downQt = downD.QuantizationType;
+        if (requantRoutedBanks)
+        {
+            (gateP, gateQt) = RequantBank(gateP, gateQt, ne, inter, hidden, QuantizationType.Q4_K, owned);
+            (upP, upQt) = RequantBank(upP, upQt, ne, inter, hidden, QuantizationType.Q4_K, owned);
+            (downP, downQt) = RequantBank(downP, downQt, ne, hidden, inter, QuantizationType.Q5_1, owned);
+        }
         return new MoeLayerWeights(
             gate: F32(gguf, t, p + "ffn_gate_inp.weight", (long)ne * hidden),
             w1: new nint[ne], w2: new nint[ne], w3: new nint[ne],
@@ -478,12 +490,40 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel
             sharedDownProj: [SharedF32(p + "ffn_down_shexp.weight", (long)hidden * shared)],
             sharedIntermediateSize: shared,
             sharedExpertGate: F32(gguf, t, p + "ffn_gate_inp_shexp.weight", hidden),
-            gateExpsRaw: gguf.TensorDataPointer(gateD), gateExpsRawQt: gateD.QuantizationType, gateExpsMDim: inter, gateExpsKDim: hidden,
-            upExpsRaw: gguf.TensorDataPointer(upD), upExpsRawQt: upD.QuantizationType, upExpsMDim: inter, upExpsKDim: hidden,
-            downExpsRaw: gguf.TensorDataPointer(downD), downExpsRawQt: downD.QuantizationType, downExpsMDim: hidden, downExpsKDim: inter,
+            gateExpsRaw: gateP, gateExpsRawQt: gateQt, gateExpsMDim: inter, gateExpsKDim: hidden,
+            upExpsRaw: upP, upExpsRawQt: upQt, upExpsMDim: inter, upExpsKDim: hidden,
+            downExpsRaw: downP, downExpsRawQt: downQt, downExpsMDim: hidden, downExpsKDim: inter,
             sharedGateRaw: [gguf.TensorDataPointer(sg)], sharedGateRawQt: sg.QuantizationType,
             sharedUpRaw: [gguf.TensorDataPointer(su)], sharedUpRawQt: su.QuantizationType,
             sharedDownRaw: [gguf.TensorDataPointer(sd)], sharedDownRawQt: sd.QuantizationType);
+    }
+
+    /// <summary>
+    /// Re-quantises a packed routed-expert bank <c>[experts, m, k]</c> row by row (dequantise to F32, quantise to <paramref name="dst"/>) into a new
+    /// host allocation owned by <paramref name="owned"/>. A bank already in <paramref name="dst"/>, or one whose <paramref name="k"/> does not fit the target
+    /// block size, is returned unchanged. Parallel over experts (the 512-expert MTP head takes about a second).
+    /// </summary>
+    internal static (nint Ptr, QuantizationType Qt) RequantBank(nint src, QuantizationType srcQt, int experts, int m, int k, QuantizationType dst, List<nint> owned)
+    {
+        if (srcQt == dst) return (src, srcQt);
+        int block = dst == QuantizationType.Q4_K ? 256 : 32;
+        if (k % block != 0 || (srcQt != QuantizationType.Q8_0 && srcQt != QuantizationType.Q5_1 && srcQt != QuantizationType.Q4_K && srcQt != QuantizationType.Q5_K && srcQt != QuantizationType.Q6_K))
+            return (src, srcQt);
+        long srcRow = Dequantize.RowByteSize(k, srcQt), dstRow = Dequantize.RowByteSize(k, dst);
+        long total = dstRow * m * experts;
+        nint mem = (nint)NativeMemory.AlignedAlloc((nuint)total, 64);
+        owned.Add(mem);
+        Parallel.For(0, experts, () => new float[k], (e, _, buf) =>
+        {
+            for (int r = 0; r < m; r++)
+            {
+                long row = (long)e * m + r;
+                Dequantize.ToFloat32(src + (nint)(row * srcRow), k, srcQt, buf);
+                Quantize.FromFloat32(buf, k, dst, new Span<byte>((void*)(mem + (nint)(row * dstRow)), (int)dstRow));
+            }
+            return buf;
+        }, _ => { });
+        return (mem, dst);
     }
 
     /// <summary>

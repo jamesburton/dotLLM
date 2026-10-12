@@ -183,6 +183,103 @@ public sealed class SamplerPipeline
         return tokenIds.Count > 0 ? tokenIds : null;
     }
 
+    /// <summary>True when the pipeline draws from a distribution; false when it is a (processor-adjusted) argmax.</summary>
+    public bool IsStochastic => !_greedy;
+
+    /// <summary>True when at least one logit processor (repetition / frequency / presence penalty, logit bias, DRY) runs before the argmax or the steps.</summary>
+    public bool HasProcessors => _processors.Length > 0;
+
+    private ISamplerStep[]? _fastPrepSteps;
+
+    /// <summary>
+    /// Turns <paramref name="logits"/> in place into the exact logits <see cref="Sample"/> would draw from (processors, then temperature /
+    /// top-k / top-p / min-p / ...), without drawing. Speculative sampling (<see cref="TryAcceptDraft"/>) needs the distribution, not just a draw.
+    /// A greedy pipeline only applies its processors: the distribution is the argmax of the result.
+    /// </summary>
+    /// <param name="logits">Logits of one position (modified in place).</param>
+    /// <param name="previousTokens">Tokens generated so far, for the penalty processors.</param>
+    public void PrepareDistribution(Span<float> logits, IReadOnlyList<int> previousTokens)
+    {
+        for (int i = 0; i < _processors.Length; i++)
+            _processors[i].Process(logits, previousTokens, _processorContext);
+        if (_greedy) return;
+
+        if (_fastTopKSampling)
+        {
+            // Sample() skips the steps on this shape and draws straight from the top-k candidates; the equivalent distribution is
+            // temperature then top-k, which is what SampleTopK computes.
+            _fastPrepSteps ??= _samplerContext.Temperature != 1.0f
+                ? [new TemperatureSampler(), new TopKSampler()]
+                : [new TopKSampler()];
+            for (int i = 0; i < _fastPrepSteps.Length; i++)
+                _fastPrepSteps[i].Apply(logits, _samplerContext);
+            return;
+        }
+        for (int i = 0; i < _steps.Length; i++)
+            _steps[i].Apply(logits, _samplerContext);
+    }
+
+    /// <summary>Draws from logits already prepared by <see cref="PrepareDistribution"/> (argmax for a greedy pipeline).</summary>
+    public int SamplePrepared(ReadOnlySpan<float> preparedLogits)
+        => _greedy ? CategoricalSampler.ArgMax(preparedLogits) : CategoricalSampler.Sample(preparedLogits, _rng);
+
+    /// <summary>
+    /// Speculative-sampling accept/reject of ONE deterministic draft token against the prepared distribution <c>p</c> (the draft distribution is a
+    /// point mass, so the accept probability <c>min(1, p(d)/1)</c> is <c>p(d)</c>). Accepted: the token is <paramref name="draftToken"/>. Rejected:
+    /// <paramref name="token"/> is drawn from <c>p</c> with the draft removed and renormalised. Either way the emitted token is distributed exactly
+    /// as <c>p</c>, which is why the result is the same as sampling the target alone. A greedy pipeline accepts iff the draft is the argmax.
+    /// </summary>
+    /// <param name="preparedLogits">Output of <see cref="PrepareDistribution"/> for this position.</param>
+    /// <param name="draftToken">The head's draft for this position.</param>
+    /// <param name="token">The token to emit (the draft when accepted).</param>
+    /// <returns>True when the draft was accepted.</returns>
+    public bool TryAcceptDraft(ReadOnlySpan<float> preparedLogits, int draftToken, out int token)
+    {
+        if (_greedy)
+        {
+            token = CategoricalSampler.ArgMax(preparedLogits);
+            return token == draftToken;
+        }
+
+        int vocab = preparedLogits.Length;
+        float[] rented = System.Buffers.ArrayPool<float>.Shared.Rent(vocab);
+        try
+        {
+            Span<float> probs = rented.AsSpan(0, vocab);
+            System.Numerics.Tensors.TensorPrimitives.SoftMax(preparedLogits, probs);
+            double pd = probs[draftToken];
+            if (_rng.NextDouble() < pd)
+            {
+                token = draftToken;
+                return true;
+            }
+            probs[draftToken] = 0f;
+            double rest = 0;
+            for (int i = 0; i < vocab; i++) rest += probs[i];
+            if (rest <= 1e-12)
+            {
+                token = draftToken;     // all the mass sits on the draft: rejecting it is numerically meaningless
+                return true;
+            }
+            double r = _rng.NextDouble() * rest, cumulative = 0;
+            int last = draftToken;
+            for (int i = 0; i < vocab; i++)
+            {
+                float p = probs[i];
+                if (p <= 0f) continue;
+                last = i;
+                cumulative += p;
+                if (r < cumulative) { token = i; return false; }
+            }
+            token = last;               // rounding: the last token with mass
+            return false;
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(rented);
+        }
+    }
+
     /// <summary>
     /// Samples a token from the given logits, applying all enabled processors and steps.
     /// </summary>

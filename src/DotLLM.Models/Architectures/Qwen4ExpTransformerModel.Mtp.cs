@@ -56,6 +56,9 @@ public sealed unsafe partial class Qwen4ExpTransformerModel : IMtpHeadAttachable
     /// <remarks>A 100 GiB-class 6B-active MoE is weight-bandwidth bound on any CPU, so MTP is tried first (the gate still re-measures); <see cref="ComputeMemoryBytes"/> is only the ~113 MiB state.</remarks>
     public long MtpGatePriorBytes => long.MaxValue;
 
+    /// <inheritdoc/>
+    public int MtpPreferredDraftTokens => 4;
+
     /// <summary>True once an MTP head is attached.</summary>
     public bool SupportsMtp => _mtp is not null;
 

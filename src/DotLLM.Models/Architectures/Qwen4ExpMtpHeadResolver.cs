@@ -36,14 +36,27 @@ public static class Qwen4ExpMtpHeadResolver
     }
 
     /// <summary>
+    /// Smallest trunk (summed GGUF bytes) for which an auto-detected head is attached. A round costs a fixed part plus about 16-22 ms per draft row
+    /// (every verify row reads its own experts) while a plain step shrinks with the file, so speculation pays only on the bigger quantisations:
+    /// measured on Vulkan / Strix Halo (see <c>.docs</c> / issue #900), UD-IQ4_XS (~60 GiB) wins, ISTA IQ3_XXS (44 GiB) and IQ2_XS (37 GiB) lose.
+    /// Below this the head would cost 3 GiB of device memory for nothing; an explicit path still attaches.
+    /// </summary>
+    public const long AutoAttachMinTrunkBytes = 50L << 30;
+
+    /// <summary>True when an auto-detected head is worth attaching to a trunk of <paramref name="trunkBytes"/> (see <see cref="AutoAttachMinTrunkBytes"/>).</summary>
+    public static bool ShouldAutoAttach(long trunkBytes) => trunkBytes >= AutoAttachMinTrunkBytes;
+
+    /// <summary>
     /// Attaches the MTP head to <paramref name="model"/> when it is a qwen4exp model (CPU oracle or Vulkan) without a head yet.
     /// </summary>
     /// <param name="model">The loaded model; any other type is left alone.</param>
     /// <param name="modelPath">Trunk path used for auto-detection.</param>
     /// <param name="explicitPath">An explicit head path (<c>--mtp-head</c>), which skips detection; null for auto-detection.</param>
+    /// <param name="trunkBytes">Summed GGUF bytes of the trunk; when given (&gt;= 0) an auto-detected head is attached only if
+    /// <see cref="ShouldAutoAttach"/> (an explicit path always attaches). -1 = no size rule.</param>
     /// <returns>The attached head's path, or null when nothing was attached.</returns>
     /// <exception cref="FileNotFoundException"><paramref name="explicitPath"/> does not exist.</exception>
-    public static string? TryAttach(IModel model, string modelPath, string? explicitPath = null)
+    public static string? TryAttach(IModel model, string modelPath, string? explicitPath = null, long trunkBytes = -1)
     {
         if (model is not IMtpHeadAttachable q4 || q4.HasMtpHead) return null;
         string? path = explicitPath;
@@ -53,6 +66,7 @@ public static class Qwen4ExpMtpHeadResolver
         }
         else
         {
+            if (trunkBytes >= 0 && !ShouldAutoAttach(trunkBytes)) return null;
             path = Find(modelPath);
             if (path is null) return null;
         }

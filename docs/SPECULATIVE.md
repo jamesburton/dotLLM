@@ -562,6 +562,48 @@ trunk's own QSA layer 3 with a random `eh_proj`, same per-step work as the real 
 and the acceptance rate on Vulkan numerics are therefore *not* measured on the real file; the synthetic 512-expert tests pin Vulkan against the CPU
 oracle (draft logits relL2 5e-5 F32 / 1.4e-2 Q8, argmax 16/16, identical accepted counts per round).
 
+#### Making MTP a default win on qwen4exp (issue #900)
+
+Measured on Vulkan / Strix Halo with the real `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` head, plain and speculative runs interleaved in one process
+(`benchmarks/Qwen4ExpRowProbe`: `specp`, `spec`, `mcbench`), four short chat/code prompts at 128 tokens, greedy. Ratios are within-process; the box drifts
+10-15 % between runs, so absolute tok/s move more than the ratios.
+
+**Where the round time was.** The first re-measure (Q8_0 head as shipped) put a K = 4 round at ~150 ms for 3.65 tokens: verify 100 ms (5 rows), but
+**draft steps of 12-14 ms each, not the 4.5-5.5 ms of the stand-in head**. Perturbation (`DOTLLM_VK_MTP_DRAFT_SKIP`, probe `set`) attributed 10.5 ms of
+the 13.9 ms step to the head's MoE: the head's routed experts are Q8_0, which the fused single-token chain does not take (it needs Q4_K or IQ gate/up),
+so the head ran the general serial MoE path. Re-quantising the head's routed banks at attach (gate/up Q4_K, down Q5_1; `RequantBank`) puts it on the
+fused chain: **draft step 13.9 -> 4.1 ms, with the same drafts** (tokens per round 3.26 / 3.10 / 4.23 / 4.10 against 3.26 / 3.02 / 4.23 / 4.10) and
+the head 1.0 GiB smaller. UD-IQ4_XS, K = 4: 1.17x -> 1.56x of plain decode (K = 3: 1.38x). `DOTLLM_MTP_HEAD_REQUANT=0` keeps the file's quantisation.
+
+**Adaptive gate (`MtpAdaptiveGate`, `MtpCostModel`, `MtpRoundController`).**
+- *Honest accounting.* The gate used draft + verify ticks, which omit the post-verify state restore; it now uses the round's wall time
+  (`SpeculativeResult.RoundTicks`). Plain decode is measured forward + sampler. Greedy and sampled requests have separate gates (their acceptance and
+  sampler cost differ).
+- *Per-round K.* `MtpCostModel` keeps the acceptance of every draft position (running mean, then slow EMA) and the wall time of a round per K; the
+  controller warms up at the configured K and then runs the K with the lowest predicted ms per generated token, re-measuring a neighbouring K every
+  16 rounds. `IModel.MtpPreferredDraftTokens` (qwen4exp: 4) raises the default depth of 3 when the caller did not choose one.
+- *Mid-request fall-back.* After 5 rounds, if the best K is more than 4 % slower per token than plain decode, the request finishes on the plain loop
+  (output unchanged: the state after a round is exactly the committed state). The decision needs a plain reference, so the first request of a process
+  on a model with no plain sample is not cut short.
+- *Re-probing.* A losing arm is re-measured every 40 decisions; a clear loss (> 10 %) doubles the interval up to 640.
+- *serve attaches the head.* `serve` never attached the separate qwen4exp head (only `run` did), so the default-on serve path never speculated on this
+  model. It now attaches an auto-detected `mtp-*.gguf` and logs the outcome; a head that does not fit the device is declined with the numbers and serving
+  continues. `--mtp-head <path>` forces it.
+
+**Sampled requests speculate too.** The draft is the head's argmax (a point mass), so exact speculative sampling is cheap: accept a draft with
+probability `p(d)` under the prepared distribution (processors, temperature, top-k/p/min-p), resample a rejection from `p` with `d` removed and
+renormalised, sample the bonus row from its `p`. Every emitted token is distributed exactly as plain sampling; greedy pipelines reduce to accept-iff-argmax.
+`MtpSpeculativeDecoderTests` checks the 27 three-token continuations of a soft Markov target against their analytic probabilities (30 000 runs), and three
+mutants (always accept; keep the draft in the residual; drop the history from the penalty processors) each fail a test.
+
+**Greedy identity.** The emitted token is always the verify row's argmax, but the multi-row kernels are not bit-identical to the 1-row decode, so a
+near-tie can resolve differently. Across the runs above (4 prompts x K = 2/3/4 per file, 128 tokens each) the MTP text equalled plain 1-row greedy in
+23-46 % of the runs and diverged in the rest, always at a position where the two paths' logits for the top two tokens differ by 0.01-0.6 of a 25-35 logit
+range (once 1.6, on the 2-bit ISTA IQ2_XS file). Perturbation runs with garbage drafts (one token committed per round, so every emitted token comes from verify
+row 0) reproduced the plain text in 5 of 6 runs, so the divergence enters through the rows after the first (small-row kernels, Q8 activations; the #873 effect),
+not through the draft, the rollback or the head. Re-checking every committed token with a 1-row forward would cost a decode step per round, which is the
+whole saving, so it is not done; sampled output is unaffected in distribution.
+
 **n-gram table prefetch (#822) on Vulkan.** `PleRowPrefetcher` is called at the top of every forward (before the first embedding record) and, for
 MTP, after each draft step with the verify chunk's known prefix `[last token, d1 .. di]`. Cold 1K-token prefill of fresh ids, A/B/B/A in one process:
 **7.7-7.9 s with the prefetch vs 14.4-14.6 s without** (-6.7 s, 1.85x), matching the CPU measurement of 6.8 s of demand faults per 1K chunk.
