@@ -599,10 +599,40 @@ mutants (always accept; keep the draft in the residual; drop the history from th
 **Greedy identity.** The emitted token is always the verify row's argmax, but the multi-row kernels are not bit-identical to the 1-row decode, so a
 near-tie can resolve differently. Across the runs above (4 prompts x K = 2/3/4 per file, 128 tokens each) the MTP text equalled plain 1-row greedy in
 23-46 % of the runs and diverged in the rest, always at a position where the two paths' logits for the top two tokens differ by 0.01-0.6 of a 25-35 logit
-range (once 1.6, on the 2-bit ISTA IQ2_XS file). Perturbation runs with garbage drafts (one token committed per round, so every emitted token comes from verify
-row 0) reproduced the plain text in 5 of 6 runs, so the divergence enters through the rows after the first (small-row kernels, Q8 activations; the #873 effect),
-not through the draft, the rollback or the head. Re-checking every committed token with a 1-row forward would cost a decode step per round, which is the
-whole saving, so it is not done; sampled output is unaffected in distribution.
+range (once 1.6, on the 2-bit ISTA IQ2_XS file). Re-checking every committed token with a 1-row forward would cost a decode step per round, which is the
+whole saving, so it is not done; sampled output is unaffected in distribution. Why a cheaper fix does not exist is measured under #909 below.
+
+**Greedy identity, investigated (#909): the noise floor is set by the first non-bit-identical op, so partial unification buys nothing.** Tools
+(`benchmarks/Qwen4ExpRowProbe`, UD-IQ4_XS, 4 prompts x 17 windows): `rowident <prompt|all> <gen> <rows> <stride> [plain|prefill]` compares the logits of a 5-row
+verify forward with the plain 1-row run's logits at the same positions; `layerdiv <prompt> <rows> <skip>` compares every layer's residual of row j of a verify
+forward with the same token run 1-row on an identical state and prints the first divergent layer (`=` bit-identical, `u` < 1e-6 relative, `m` < 1e-4, `X` larger).
+
+1. *The state matters as much as the kernel.* Rebuilding the state with one prefill over the generated tokens (the >= 9-row path, unquantised activations) and then
+   replaying the tokens 1-row already differs from the plain run by a mean max |dlogit| of 0.74-1.0 (argmax equal 92.6-100 % per row): committed state built by a
+   different kernel family is a source of its own. On the plain run's OWN state a 1-row replay is bit-identical (340/340 rows, so the measurement is deterministic).
+2. *The 5-row verify forward is not bit-identical to the 1-row forward even on that state*: 0/340 rows bit-identical, mean max |dlogit| 0.54-0.63, argmax equal
+   97.1-100 % per row (row 0 included; ~0.9 % of rows flip, and 0.991^128 = 31 % is the observed 25-50 % identity). The garbage-draft runs that "reproduced plain 5
+   of 6 times" were too few to see a 1 % flip rate.
+3. *First-order sources found by `layerdiv`.* Layer 0 (a GDN layer) already differs by 1.8e-3 relative; with the fused single-token MoE chain and its fused combine
+   off (`DOTLLM_VK_Q4E_MOE_FUSED=0 DOTLLM_VK_Q4E_COMBINE_FUSED=0`, i.e. the 1-row path takes the same general MoE path as the rows) it is 1.9e-7: the fused decode
+   chain is the big difference. The first QSA layer (3) then jumps to 7.8e-4: the f16 hi/lo coopmat flash attention that every `seqQ > 1` forward takes against the
+   f32 split-KV kernel of the 1-row path (also the +20 ms per 1K tokens of verify cost noted above). Switching the 1-row path to the verify path's attention and MoE
+   (or the other way round: `DOTLLM_VULKAN_DISABLE_COOPMAT_ATTENTION=1 DOTLLM_VULKAN_DISABLE_FLASH_ATTENTION=1 DOTLLM_VULKAN_DISABLE_SPLIT_DECODE=1`) leaves layers 0-3 (one
+   window: 0-7) at ULP level (`u`), and from layer 4-8 on every residual is > 1e-4 away again: the Q8 activation quantisation (#873) turns the first 1-ULP
+   difference into a quantisation-step difference. In one window row 1 of the batch differs by > 1e-4 already at layer 0 (the GDN conv state and recurrence run
+   across rows; not isolated).
+4. *Unifying ops one by one does not move the logits.* Mean max |dlogit| of the verify rows with attention unified 0.51-0.67, plus the fused MoE chain off 0.51-0.68,
+   plus fused gated-residual reads, decode multi-row MoE MMVQ and wide Q8 twins off 0.54-0.72: the same ~0.6 as the default (0.54-0.63). Only a configuration in which
+   EVERY row-count-dependent op is bit-identical would change the answer, and the ULP-level (`u`) differences that remain in layers 0-7 of the fully switched
+   configuration show that this is not one switch away (the multi-column GEMV shaders share the single-row accumulation order but not necessarily its FMA contraction).
+5. *Re-scoring borderline rows cannot reach identity either.* A 1-row recompute of a row with a small top-2 gap runs on the KV and GDN state that the verify
+   kernels built for the accepted rows before it, so it is the "different state" case of (1), not the plain run. Only re-running the committed tokens 1-row restores
+   identity, and that is plain decode.
+
+Decision (rule from #820: default only if the tok/s loss is < 3 % AND identity > 90 % at 128 tokens): neither is reachable cheaply, nothing was changed. Output
+quality is not what differs (both paths are equally valid draws from the same near-ties, #873; sampled MTP is exact in distribution). What a real fix would take:
+bit-identical single-row and batched variants of an estimated ~15 kernels (fused vs general MoE, split-KV with per-row offsets for attention, GDN conv/scan, the multi- and
+single-column GEMV codegens, router top-k, LM head), each with a bit-exactness test, with `layerdiv` as the harness (the target is a string of `=`).
 
 **The ISTA GSQ-RCO files lost for another reason: 2..8-row dense projections (issue #902).** On ISTA IQ3_XXS / IQ2_XS the 2-row forward cost 100-109 ms
 against 41-45 ms for one row (UD-IQ4_XS: 57 ms), so a K = 4 round was 200+ ms and MTP ran at 0.65-0.82x. The split-submit profile put the jump in the dense
@@ -642,7 +672,7 @@ was wrong, and what replaced it:
 - *The limit drifts, and a formula cannot see it.* Allocate-and-touch on a fresh device (`capscan`, `memtest` in `Qwen4ExpRowProbe`) reached 81.43 GiB in one
   session (0.650 x RAM, 3.5 GiB above the Q4_K_XL trunk) and 73.4-74.8 GiB an hour later on the same idle box with nothing of ours running. The only change found
   is that the WSL2 VM's working set had grown from 5.1 to 10.1 GiB (`.wslconfig`: `autoMemoryReclaim=disabled`, so it never gives it back); the drop matches it
-  in size, but that is a correlation, not a measured cause (a 10 GiB host-RAM hog in another process did NOT move the limit). After the drop UD-Q4_K_XL no
+  in size, and the limit came back when the VM's working set fell to 3.4 GiB, but that is a correlation, not a measured cause (a 10 GiB host-RAM hog in another process did NOT move the limit). After the drop UD-Q4_K_XL no
   longer loads at all (`VK_ERROR_OUT_OF_DEVICE_MEMORY` at ~70 GiB) and UD-IQ4_XS has 12.4 GiB of headroom instead of ~20. The allocation
   that crosses the limit succeeds; the NEXT submit fails, and from then on **every allocation on that `VkDevice` fails, even after the memory is freed**
   (measured: a 16-row forward after the OOM and after releasing everything). A failed submit on a SECOND `VkDevice` of the same process leaves the first one
@@ -667,10 +697,14 @@ was wrong, and what replaced it:
   The 10 GiB row is the point of the 3.0 GiB (not 2.1 GiB) request: the head fits, the first real forward after it does not.
   A refusal is a `NotSupportedException` with the numbers; `run`, `chat` (also for an explicit `--mtp-head`) and `serve` log a warning and decode without
   speculation, and the model's device stays usable (a 16-row forward after the refusal ran).
-- *UD-Q4_K_XL itself* could not be re-run for this change: in the drifted state the box cannot load it at all, so the attach is never reached.
-  On the box state of the original measurements (3.5 GiB above the trunk) the probe asks for 3.0 and leaves 0.5 GiB beyond the itemised worst case
-  (K/V at the full 8K context); at the 1K contexts measured the real slack is ~1 GiB. Restoring that state needs the WSL VM's memory back (`wsl --shutdown`, or
-  `autoMemoryReclaim=gradual`), which only the box's owner should decide.
+- *UD-Q4_K_XL itself, default settings (no `DOTLLM_VK_ALLOW_OVERCOMMIT`), once the box had its memory back* (the WSL VM's working set fell to 3.4 GiB and the
+  limit recovered; an hour earlier the same file could not even load): three fresh-process load + attach + 1K-token prefill + 64-token decode cycles, two without and
+  one with `DOTLLM_VULKAN_MEM_TRACE=1`, all attached (probe: 2.98 GiB allocated and touched; an oversized probe measured 3.88 GiB actually available, so 0.9 GiB beyond
+  the itemised worst case with K/V at the full 8K context, ~1.7 GiB at a 1K context) and ran MTP at 24.8-25.3 tok/s (19.4 for the very first request of a process, which
+  is cold) against 17.8 tok/s plain decode in a fresh `--no-mtp` process on the same prompt. The same file with the diagnostic oversize
+  (`DOTLLM_MTP_HEADROOM_EXTRA_MIB=30000`): the probe reached 3.88 GiB of 32.28 GiB, the CLI logged `WARNING: MTP head not attached (NotSupportedException: ...)` with the
+  numbers and decoded the same prompt plain at 20.0 tok/s: a clean fallback, not a crash. The itemised arithmetic alone (81.8 GiB against the assumed 81.37 GiB) would
+  still have refused in that state, which is why the probe is the authority.
 
 **End to end through `dotllm serve` (default settings, streamed chat, 200 tokens, `--mtp-head` for the ISTA files; tok/s from the final chunk's timings).** The gate
 explores plain decode once after the first MTP request and then follows the faster arm:

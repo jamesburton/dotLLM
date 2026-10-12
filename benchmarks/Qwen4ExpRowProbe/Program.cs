@@ -374,6 +374,75 @@ void Exec(string line, StringBuilder o)
                     SpecRun(tok.Encode(prompts[pi]).ToArray(), int.Parse(a[2]), int.Parse(a[3]), o, $"prompt{pi}");
             break;
         }
+        case "layerdiv":   // layerdiv <promptIdx> <R> <skip> : per-layer residual of row j of an R-row verify forward vs the same token run 1-row (identical state), first divergent layer
+        {
+            int pi = int.Parse(a[1]), R = int.Parse(a[2]), skip = a.Length > 3 ? int.Parse(a[3]) : 0;
+            var pids = tok.Encode(prompts[pi]).ToArray();
+            int cap = pids.Length + skip + R + 8;
+            // Greedy continuation from the plain 1-row run: the tokens to verify.
+            var seq = new List<int>(pids);
+            model.ResetSequenceState();
+            using (var kv = model.CreateKvCache(cap))
+            {
+                var last = LastRow(model.Forward(pids, Enumerable.Range(0, pids.Length).ToArray(), -1, kv, true));
+                for (int i = 0; i < skip + R; i++) { int t = ArgMaxOf(last); seq.Add(t); last = LastRow(model.Forward([t], [seq.Count - 1], -1, kv, true)); }
+            }
+            int s = pids.Length + skip;
+            var toks = seq.GetRange(s, R).ToArray();
+            var posn = Enumerable.Range(s, R).ToArray();
+            void BuildPlain(VulkanNemotronHKvCache kvc)
+            {
+                model.Forward(pids, Enumerable.Range(0, pids.Length).ToArray(), -1, kvc, true).Dispose();
+                for (int q = pids.Length; q < s; q++) model.Forward([seq[q]], [q], -1, kvc, true).Dispose();
+            }
+            var oneRow = new List<Dictionary<int, float[]>>();   // per verified token: layer -> residual (1 x row)
+            model.ResetSequenceState();
+            using (var kv = model.CreateKvCache(cap))
+            {
+                BuildPlain(kv);
+                for (int j = 0; j < R; j++)
+                {
+                    var d = new Dictionary<int, float[]>();
+                    model.Trace = (name, data, t, row) => { int il = int.Parse(name.Split('.')[1]); d[il] = (float[])data.Clone(); };
+                    model.Forward([toks[j]], [posn[j]], -1, kv, true).Dispose();
+                    model.Trace = null;
+                    oneRow.Add(d);
+                }
+            }
+            var batch = new Dictionary<int, float[]>();
+            int rowLen = 0;
+            model.ResetSequenceState();
+            using (var kv = model.CreateKvCache(cap))
+            {
+                BuildPlain(kv);
+                model.Trace = (name, data, t, row) => { int il = int.Parse(name.Split('.')[1]); batch[il] = (float[])data.Clone(); rowLen = row; };
+                model.ForwardWithRecurrentSnapshots(toks, posn, -1, kv, null).Dispose();
+                model.Trace = null;
+            }
+            for (int j = 0; j < R; j++)
+            {
+                int first = -1; var lineSb = new StringBuilder();
+                for (int il = 0; il < cfg.NumLayers; il++)
+                {
+                    var one = oneRow[j][il]; var b = batch[il];
+                    double mx = 0, mag = 0; bool eq = true;
+                    for (int i = 0; i < rowLen; i++)
+                    {
+                        float x1 = one[i], x2 = b[j * rowLen + i];
+                        if (x1 != x2) eq = false;
+                        mx = Math.Max(mx, Math.Abs((double)x1 - x2)); mag = Math.Max(mag, Math.Abs(x1));
+                    }
+                    if (!eq && first < 0) first = il;
+                    lineSb.Append(eq ? "=" : (mx / Math.Max(mag, 1e-9) < 1e-6 ? "u" : mx / Math.Max(mag, 1e-9) < 1e-4 ? "m" : "X"));
+                    if (il < 8 && j == 0) o.AppendLine($"   L{il} maxdiff {mx:G3} maxabs {mag:G3} rel {mx / Math.Max(mag, 1e-9):G3}");
+                }
+                string kinds = string.Concat(Enumerable.Range(0, cfg.NumLayers).Select(il => cfg.HybridLayout!.LayerKind[il] == DotLLM.Core.Models.HybridLayerKind.GatedDeltaNet ? 'g' : 'a'));
+                o.AppendLine($"layerdiv prompt{pi} skip={skip} row {j}: first divergent layer {first} ({(first >= 0 ? kinds[first].ToString() : "-")})");
+                o.AppendLine($"   kinds {kinds}");
+                o.AppendLine($"   rel   {lineSb}   (= identical, u <1e-6, m <1e-4, X larger)");
+            }
+            break;
+        }
         case "rowident":   // rowident <promptIdx|all> <gen> <rows> <stride> : verify-row logits vs the plain 1-row run, per row index (#820 greedy identity)
         {
             int gen = int.Parse(a[2]), R = int.Parse(a[3]), stride = int.Parse(a[4]);
