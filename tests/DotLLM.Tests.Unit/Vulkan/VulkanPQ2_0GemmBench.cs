@@ -67,7 +67,7 @@ public sealed class VulkanPQ2_0GemmBench
     public VulkanPQ2_0GemmBench(ITestOutputHelper output) => _output = output;
 
     /// <summary>
-    /// Projection shapes, read off the real <c>Ternary-Bonsai-27B-Q2_0.gguf</c> tensor headers
+    /// Projection shapes, read off the real <c>Ternary-Bonsai-2-27B-PQ2_0.gguf</c> tensor headers
     /// (<c>embedding_length</c> 5120, <c>feed_forward_length</c> 17408; GGUF dims are
     /// <c>[K, M]</c>). Override with <c>DOTLLM_PQ2_0_GEMM_BENCH_SHAPES</c> as a
     /// semicolon-separated <c>tag,M,K</c> list to re-run against another checkpoint without a

@@ -49,7 +49,7 @@ public class VulkanMatMulPQ2_0GemmF32KernelTests
     private const int GroupBytes = 34;
 
     private const string ModelPathEnvVar = "DOTLLM_BONSAI_PQ2_0_GGUF";
-    private const string FileName = "Ternary-Bonsai-27B-Q2_0.gguf";
+    private const string FileName = "Ternary-Bonsai-2-27B-PQ2_0.gguf";
 
     /// <summary>
     /// Synthetic parity against a double-precision ground truth
@@ -330,8 +330,8 @@ public class VulkanMatMulPQ2_0GemmF32KernelTests
 
     private const string FixtureSkipMessage =
         "Bonsai PQ2_0 GGUF fixture not found. Set " + ModelPathEnvVar + ", or place " + FileName
-        + " under ~/.dotllm/models/PrismML/Ternary-Bonsai-27B-GGUF/ or "
-        + "~/.dotllm/test-cache/PrismML/Ternary-Bonsai-27B-GGUF/.";
+        + " under ~/.dotllm/models/prism-ml/Ternary-Bonsai-2-27B-gguf/ or "
+        + "~/.dotllm/test-cache/prism-ml/Ternary-Bonsai-2-27B-gguf/.";
 
     /// <summary>Mirrors <c>PQ2_0RealGgufSmokeTests.ResolveFixturePath</c>.</summary>
     private static string? ResolveFixturePath()
@@ -343,8 +343,8 @@ public class VulkanMatMulPQ2_0GemmF32KernelTests
         string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         string[] candidates =
         [
-            Path.Combine(home, ".dotllm", "models", "PrismML", "Ternary-Bonsai-27B-GGUF", FileName),
-            Path.Combine(home, ".dotllm", "test-cache", "PrismML", "Ternary-Bonsai-27B-GGUF", FileName),
+            Path.Combine(home, ".dotllm", "models", "prism-ml", "Ternary-Bonsai-2-27B-gguf", FileName),
+            Path.Combine(home, ".dotllm", "test-cache", "prism-ml", "Ternary-Bonsai-2-27B-gguf", FileName),
         ];
         foreach (string candidate in candidates)
             if (File.Exists(candidate))
