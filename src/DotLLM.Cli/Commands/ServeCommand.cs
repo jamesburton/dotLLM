@@ -141,6 +141,12 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [DefaultValue(false)]
         public bool NoMtp { get; set; }
 
+        /// <summary>Explicit MTP head GGUF for architectures that ship it as a separate file (qwen4exp).</summary>
+        [CommandOption("--mtp-head")]
+        [Description("Path of a separate MTP head GGUF (qwen4exp ships it as mtp-*.gguf beside the quantisation folders). Default: auto-detected in the model's " +
+                     "directory and the one above it (a head that does not fit the device is declined with a startup message and serving continues without it).")]
+        public string? MtpHead { get; set; }
+
         /// <summary>How reasoning output is split from the answer (#767).</summary>
         [CommandOption("--reasoning-format")]
         [Description("How thinking output is separated from the answer: auto (default; split into reasoning_content + content when the chat " +
@@ -346,6 +352,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             SpeculativeCandidates = settings.SpeculativeK,
             MtpEnabled = !settings.NoMtp,
             MtpExplicit = settings.Mtp && !settings.NoMtp,
+            MtpHeadPath = settings.MtpHead,
             ReasoningFormat = DotLLM.Tokenizers.Reasoning.ReasoningFormats.Parse(settings.ReasoningFormat),
             PrefillChunkSize = settings.PrefillChunkSize,
             KeepAliveSeconds = settings.KeepAlive,
