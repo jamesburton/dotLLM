@@ -733,6 +733,21 @@ public sealed class VulkanTransformerModel : IModel
     // ── Gemma-4 dense-PLE (E2B/E4B) state, issue #734 ──
     // Host-built per-layer inputs, layer-major [numLayers, seqLen, pleDim], re-uploaded every forward.
     private VulkanDevice.Buffer? _pleInputs;
+    // #916 GPU PLE input pipeline (Gemma-4 E2B/E4B): F32 per_layer_model_proj + norm weight (model lifetime) and the
+    // per-forward identity/projection scratch (grown on demand, before recording starts).
+    private DotLLM.Vulkan.Kernels.Gemma4PleCombineF32Kernel? _g4PleCombine;
+    private VulkanDevice.Buffer? _g4PleProjW, _g4PleNormW, _g4PleIdent, _g4PleProj;
+
+    /// <summary>True when the Gemma-4 PLE per-layer inputs are built on the GPU (#916); false = legacy host path (<c>DOTLLM_VK_GEMMA4_PLE_GPU=0</c>) or no PLE.</summary>
+    public bool Gemma4PleOnGpu => _g4PleCombine is not null;
+
+    /// <summary>Test hook: the device-resident PLE per-layer inputs (layer-major) of the last forward, first elems floats.</summary>
+    internal float[] DownloadPleInputsForTest(int elems)
+    {
+        var r = new float[elems];
+        _device.Download(_pleInputs ?? throw new InvalidOperationException("No PLE inputs resident."), r);
+        return r;
+    }
     // Cacheless shared-KV donor stash: slot 0 = sliding donor, slot 1 = full-attention donor.
     private readonly VulkanDevice.Buffer?[] _g4StashK = new VulkanDevice.Buffer?[2];
     private readonly VulkanDevice.Buffer?[] _g4StashV = new VulkanDevice.Buffer?[2];
@@ -2151,6 +2166,8 @@ public sealed class VulkanTransformerModel : IModel
         model._noTokenEmbed = skipTokenEmbed;
         if (config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss)
             model.InitGptOss(spvDir);
+        if (config.PerLayerEmbedding is not null && config.IsGemma4DensePle)
+            model.InitGemma4Ple(spvDir);
         return model;
     }
 
@@ -3719,6 +3736,9 @@ public sealed class VulkanTransformerModel : IModel
                 RecordDiffusionCanvasEmbed(cmdBuf, regionP, canvasLen, hiddenSize, eps);
         }
 
+        if (Config.PerLayerEmbedding is not null)
+            RecordGemma4PleInputs(cmdBuf, seqLen, eps);
+
         ProfSample("embed");
         DpStamp(cmdBuf, DpCatEmbed);
 
@@ -4149,8 +4169,13 @@ public sealed class VulkanTransformerModel : IModel
             // residual add collapse from 3 dispatches / 2 barriers into 2
             // dispatches / 1 barrier (activation+quantize fused; the GEMV
             // still needs its own barrier to see the just-quantized scratch).
+            // Per-layer FFN width: Gemma-4 E2B has a double-wide MLP on its shared-KV
+            // layers (6144 vs 12288). Size the activation by THIS layer's gate output,
+            // not the model-wide maximum in Config.IntermediateSize, so the narrow
+            // layers do not do (and read stale) work for rows that were never written (#917).
+            int layerInterm = Config.IsGemma4DensePle && lw.GateOutputDim > 0 ? lw.GateOutputDim : intermediateSize;
             downProjFused = _residualScale == 1.0f
-                && TryRecordFusedSwiGluQuantizeDownResidual(cmdBuf, lw, seqLen, intermediateSize);
+                && TryRecordFusedSwiGluQuantizeDownResidual(cmdBuf, lw, seqLen, layerInterm);
 
             if (!downProjFused)
             {
@@ -4159,11 +4184,11 @@ public sealed class VulkanTransformerModel : IModel
                 // the standard SwiGLU. All fuse gate*act + up into SiluOutput; only
                 // the gate non-linearity differs.
                 if (_geglu is not null)
-                    _geglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
+                    _geglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * layerInterm);
                 else if (_relu2glu is not null)
-                    _relu2glu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
+                    _relu2glu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * layerInterm);
                 else
-                    _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
+                    _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * layerInterm);
                 BarrierComputeToCompute(cmdBuf);
                 ProfSample("ffn_act");
                 DpStamp(cmdBuf, DpCatAct);
@@ -4629,6 +4654,7 @@ public sealed class VulkanTransformerModel : IModel
         _splitKvAttention?.InvalidateDescriptorCache();
         _swiglu.InvalidateDescriptorCache();
         _geglu?.InvalidateDescriptorCache();
+        _g4PleCombine?.InvalidateDescriptorCache();
         _relu2glu?.InvalidateDescriptorCache();
         _embedScale?.InvalidateDescriptorCache();
         _embedGatherQ8?.InvalidateDescriptorCache();
@@ -5059,16 +5085,83 @@ public sealed class VulkanTransformerModel : IModel
     }
 
     /// <summary>Builds and uploads the Gemma-4 PLE per-layer inputs (layer-major) for <paramref name="tokenIds"/>.</summary>
-    private void UploadGemma4PleInputs(ReadOnlySpan<int> tokenIds)
+    private unsafe void UploadGemma4PleInputs(ReadOnlySpan<int> tokenIds)
     {
-        float[] data = DotLLM.Models.Architectures.Gemma4PerLayerInputs.ComputeLayerMajor(_cpuWeights, Config, tokenIds);
-        long bytes = (long)data.Length * sizeof(float);
-        if (_pleInputs is null || _pleInputs.Size < bytes)
+        if (_g4PleCombine is null)
         {
-            _pleInputs?.Dispose();
-            _pleInputs = _device.Allocate(bytes);
+            // Legacy host path (kept as the oracle/fallback): build everything on the host.
+            float[] data = DotLLM.Models.Architectures.Gemma4PerLayerInputs.ComputeLayerMajor(_cpuWeights, Config, tokenIds);
+            long hostBytes = (long)data.Length * sizeof(float);
+            if (_pleInputs is null || _pleInputs.Size < hostBytes)
+            {
+                _pleInputs?.Dispose();
+                _pleInputs = _device.Allocate(hostBytes);
+            }
+            _device.Upload(data.AsSpan(), _pleInputs);
+            return;
         }
-        _device.Upload(data.AsSpan(), _pleInputs);
+
+        // #916: only the token-identity gather (a row lookup into the huge per_layer_token_embd table) stays on the
+        // host; the context projection GEMM, per-block RMSNorm, combine and layer-major transpose run on the GPU
+        // at the start of the forward (RecordGemma4PleInputs).
+        var ple = _cpuWeights.PerLayerEmbedding!;
+        int seq = tokenIds.Length;
+        int pleDim = ple.PerLayerDim;
+        int lp = Config.NumLayers * pleDim;
+        long bytes = (long)seq * lp * sizeof(float);
+        if (_g4PleIdent is null || _g4PleIdent.Size < bytes)
+        {
+            _g4PleIdent?.Dispose(); _g4PleProj?.Dispose(); _pleInputs?.Dispose();
+            _g4PleIdent = _device.Allocate(bytes);              // host-written every forward
+            _g4PleProj = _device.AllocateDeviceLocal(bytes);    // GEMM output, GPU-only
+            _pleInputs = _device.AllocateDeviceLocal(bytes);    // layer-major combine output, GPU-only
+        }
+
+        float[] identity = System.Buffers.ArrayPool<float>.Shared.Rent(checked(seq * lp));
+        try
+        {
+            fixed (float* idp = identity)
+                DotLLM.Models.Architectures.Gemma4PerLayerInputs.GatherIdentity(ple, tokenIds, idp, lp, MathF.Sqrt(pleDim));
+            _device.Upload(identity.AsSpan(0, seq * lp), _g4PleIdent);
+        }
+        finally { System.Buffers.ArrayPool<float>.Shared.Return(identity); }
+    }
+
+    /// <summary>
+    /// Creates the Gemma-4 dense-PLE GPU input pipeline (#916): the F32 <c>per_layer_model_proj</c> device copy
+    /// (mirrors the qwen4exp <see cref="VulkanQwen4ExpPleGpu"/> approach), its norm weight and the combine kernel.
+    /// <c>DOTLLM_VK_GEMMA4_PLE_GPU=0</c> keeps the host path (A/B arm).
+    /// </summary>
+    private unsafe void InitGemma4Ple(string spvDir)
+    {
+        if (Environment.GetEnvironmentVariable("DOTLLM_VK_GEMMA4_PLE_GPU") == "0") return;
+        var ple = _cpuWeights.PerLayerEmbedding ?? throw new InvalidOperationException("Model has no Per-Layer Embedding weights.");
+        int hidden = Config.HiddenSize;
+        long lp = (long)Config.NumLayers * ple.PerLayerDim;
+        long bytes = lp * hidden * sizeof(float);
+        _g4PleCombine = DotLLM.Vulkan.Kernels.Gemma4PleCombineF32Kernel.Create(_device, spvDir);
+        _g4PleProjW = _device.AllocateDeviceLocal(bytes);
+        _device.Upload(new ReadOnlySpan<byte>((void*)ple.ModelProjection, checked((int)bytes)), _g4PleProjW);
+        _g4PleNormW = _device.Allocate((long)ple.PerLayerDim * sizeof(float));
+        _device.Upload(ple.ProjectionNorm.AsSpan(), _g4PleNormW);
+    }
+
+    /// <summary>
+    /// Records the PLE per-layer-input pipeline right after the scaled embedding is in <c>HiddenState</c>:
+    /// <c>proj = per_layer_model_proj . hidden</c> (F32 GEMM) then the combine kernel (scale, per-block RMSNorm,
+    /// + token identity, * 1/sqrt2, layer-major write). Mirrors <c>PerLayerEmbeddings.ComputeInputs</c>.
+    /// </summary>
+    private void RecordGemma4PleInputs(nint cmdBuf, int seqLen, float eps)
+    {
+        if (_g4PleCombine is null) return;
+        int hidden = Config.HiddenSize;
+        int pleDim = Config.PerLayerEmbedding!.PerLayerDim;
+        int layers = Config.NumLayers;
+        RecordMatmul(cmdBuf, _g4PleProjW!, QuantType.F32, _state.HiddenState, _g4PleProj!, layers * pleDim, hidden, seqLen);
+        BarrierComputeToCompute(cmdBuf);   // legacy blanket barriers are the default (hazard tracker is opt-in)
+        _g4PleCombine.Record(cmdBuf, _g4PleProj!, _g4PleIdent!, _g4PleNormW!, _pleInputs!,
+            seqLen, layers, pleDim, 1.0f / MathF.Sqrt(hidden), eps, 1.0f / MathF.Sqrt(2.0f));
+        BarrierComputeToCompute(cmdBuf);
     }
 
     /// <summary>Lazily (re)allocates the cacheless shared-KV donor stash for <paramref name="seqLen"/> rows.</summary>
@@ -7880,6 +7973,8 @@ public sealed class VulkanTransformerModel : IModel
         _embedGatherQ8?.Dispose();
         _gemma4OnesVec?.Dispose();
         _pleInputs?.Dispose();
+        _g4PleProjW?.Dispose(); _g4PleNormW?.Dispose(); _g4PleIdent?.Dispose(); _g4PleProj?.Dispose();
+        _g4PleCombine?.Dispose();
         for (int i = 0; i < 2; i++) { _g4StashK[i]?.Dispose(); _g4StashV[i]?.Dispose(); }
         _splitKvAttention?.Dispose();
         _flashAttention?.Dispose();
