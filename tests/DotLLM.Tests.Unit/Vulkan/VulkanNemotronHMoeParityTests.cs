@@ -38,7 +38,7 @@ public sealed class VulkanNemotronHMoeParityTests(Xunit.Abstractions.ITestOutput
             byte[] q50 = Quantize.FromFloat32(row, k, QuantizationType.Q5_0);
             byte[] q51 = new byte[Dequantize.RowByteSize(k, QuantizationType.Q5_1)];
             fixed (byte* s = q50) fixed (byte* d = q51)
-                VulkanNemotronHWeights.RepackQ5_0ToQ5_1((nint)s, (nint)d, k / 32);
+                VulkanWeights.ConvertQ5_0BlocksToQ5_1((nint)s, (nint)d, k / 32);
 
             float[] a = new float[k], b = new float[k];
             fixed (byte* s = q50) Dequantize.ToFloat32((nint)s, k, QuantizationType.Q5_0, a);
@@ -58,7 +58,7 @@ public sealed class VulkanNemotronHMoeParityTests(Xunit.Abstractions.ITestOutput
         byte[] q50 = Quantize.FromFloat32(row, 32, QuantizationType.Q5_0);
         byte[] q51 = new byte[24];
         fixed (byte* s = q50) fixed (byte* d = q51)
-            VulkanNemotronHWeights.RepackQ5_0ToQ5_1((nint)s, (nint)d, 1);
+            VulkanWeights.ConvertQ5_0BlocksToQ5_1((nint)s, (nint)d, 1);
         q51[2] = 0; q51[3] = 0;                          // sabotage: m = 0
         float[] a = new float[32], b = new float[32];
         fixed (byte* s = q50) Dequantize.ToFloat32((nint)s, 32, QuantizationType.Q5_0, a);

@@ -273,7 +273,8 @@ architecture's loader will route to it:
 | loader | additionally falls back to F32 |
 |---|---|
 | `VulkanWeights` (dense) | — (the table above) |
-| `VulkanNemotronHWeights`, `VulkanMamba3Weights` | Q5_0, I2_S, PQ2_0 |
+| `VulkanNemotronHWeights` | I2_S, PQ2_0 (Q5_0 stays packed since #568). nemotron_h_moe routed expert banks: Q8_0 and Q5_1 as stored, Q5_0 repacked to Q5_1; any other expert quant is refused with a `NotSupportedException` (#402, #407) |
+| `VulkanMamba3Weights` | Q5_0, I2_S, PQ2_0 |
 | `VulkanQwen3MoeHybridWeights` | Q5_0, Q2_K, Q3_K, IQ4_NL, IQ4_XS, IQ1_S, I2_S |
 | `VulkanQwen3HybridDenseWeights` | everything but PQ2_0 (it handles only the packed token embed) |
 

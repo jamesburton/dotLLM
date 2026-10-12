@@ -149,7 +149,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     /// <summary>
     /// nemotron_h_moe routed-MoE FFN layer (#375/#402): sigmoid router + selection bias, ungated relu-squared routed expert banks
     /// (up, down), and one ungated relu-squared shared expert. Expert banks are resident in a quantized form that has an
-    /// indexed matmul kernel: Q8_0 and Q5_1 as stored, Q5_0 repacked to Q5_1 at upload (exact, see <see cref="RepackQ5_0ToQ5_1"/>).
+    /// indexed matmul kernel: Q8_0 and Q5_1 as stored, Q5_0 repacked to Q5_1 at upload (bit-exact, <see cref="VulkanWeights.ConvertQ5_0BlocksToQ5_1"/>).
     /// </summary>
     internal readonly struct MoeLayerBuffers
     {
@@ -696,7 +696,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
                 {
                     nint srcFirst = srcPtr + (nint)(firstRow * srcRowBytes);
                     System.Threading.Tasks.Parallel.For(0, rowCount, r =>
-                        RepackQ5_0ToQ5_1(srcFirst + (nint)(r * srcRowBytes), chunkPtr + (nint)(r * dstRowBytes), blocksPerRow));
+                        VulkanWeights.ConvertQ5_0BlocksToQ5_1(srcFirst + (nint)(r * srcRowBytes), chunkPtr + (nint)(r * dstRowBytes), blocksPerRow));
                 });
                 VulkanWeightImportPolicy.NoteStaged(srcPtr, rows * srcRowBytes, "repacked_q5_0_to_q5_1");
                 return buf;
@@ -705,28 +705,6 @@ internal sealed class VulkanNemotronHWeights : IDisposable
                 throw new NotSupportedException(
                     $"nemotron_h_moe {what} is {srcQt}: the Vulkan expert-indexed kernels cover Q8_0, Q5_1 and Q5_0 (repacked to Q5_1) banks only. " +
                     "Widening the banks to F32 would need ~100 GB. IQ4_NL / Q4_0 / K-quant / MXFP4 expert banks are tracked in #407 and #402; use --device cpu.");
-        }
-    }
-
-    /// <summary>
-    /// Repacks <paramref name="blocks"/> Q5_0 blocks (<c>half d; u8 qh[4]; u8 qs[16]</c>, 22 bytes, value <c>d*(q-16)</c>) into Q5_1 blocks
-    /// (<c>half d; half m; u8 qh[4]; u8 qs[16]</c>, 24 bytes, value <c>d*q+m</c>) with <c>m = -16*d</c>. Multiplying a half by 16 only shifts its
-    /// exponent, so <c>m</c> is exact (a weight scale never approaches the half overflow at 4096), and <c>d*q + m = d*(q-16)</c> holds exactly
-    /// in F32 (<c>|q-16|*d</c> needs at most 16 significand bits): the repack changes no weight.
-    /// </summary>
-    internal static unsafe void RepackQ5_0ToQ5_1(nint src, nint dst, int blocks)
-    {
-        byte* s = (byte*)src;
-        byte* d = (byte*)dst;
-        for (int b = 0; b < blocks; b++)
-        {
-            Half scale = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<Half>(s);
-            Half min = (Half)(-16f * (float)scale);
-            System.Runtime.CompilerServices.Unsafe.WriteUnaligned(d, scale);
-            System.Runtime.CompilerServices.Unsafe.WriteUnaligned(d + 2, min);
-            System.Runtime.CompilerServices.Unsafe.CopyBlockUnaligned(d + 4, s + 2, 20);   // qh[4] + qs[16]
-            s += 22;
-            d += 24;
         }
     }
 
