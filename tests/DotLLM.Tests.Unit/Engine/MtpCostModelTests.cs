@@ -143,8 +143,9 @@ public sealed class MtpCostModelTests
         clear.Record(false, 65, 27 * 64);
         clear.Record(true, 65, 55 * 64);
         int picks = 0;
-        for (int i = 0; i < 40 + 80 + 160; i++) if (clear.ShouldUseMtp(64)) picks++;
-        Assert.Equal(3, picks);   // after 40, then 80 more, then 160 more decisions
+        int e = MtpAdaptiveGate.ReprobeEvery;
+        for (int i = 0; i < e + 2 * e + 4 * e; i++) if (clear.ShouldUseMtp(64)) picks++;
+        Assert.Equal(3, picks);   // after e, then 2e more, then 4e more decisions
 
         var tie = new MtpAdaptiveGate(3L << 30);
         tie.Record(false, 65, 27 * 64);
@@ -155,11 +156,28 @@ public sealed class MtpCostModelTests
     }
 
     [Fact]
+    public void Gate_Reset_ForgetsTheColdWarmupVerdict()
+    {
+        // A cold warm-up pair (MTP slow, plain fast) settles the gate on plain; the server resets it so the first real request tries MTP again.
+        var g = new MtpAdaptiveGate(long.MaxValue);
+        Assert.True(g.ShouldUseMtp(64));
+        g.Record(true, 17, 15 * 120.0);
+        g.Record(false, 17, 15 * 45.0);
+        Assert.False(g.ShouldUseMtp(64));
+        g.CostModel.RecordRound(4, 3, 150);
+        g.Reset();
+        Assert.Equal(0, g.PlainMsPerToken);
+        Assert.Equal(0, g.MtpMsPerToken);
+        Assert.Equal(0, g.CostModel.TotalRounds);
+        Assert.True(g.ShouldUseMtp(64));
+    }
+
+    [Fact]
     public void Gate_RecordsSegmentsSeparately()
     {
         var g = new MtpAdaptiveGate(7L << 30);
-        g.RecordSegment(true, 10, 500);
-        g.RecordSegment(false, 20, 800);
+        g.RecordSegment(true, 20, 1000);
+        g.RecordSegment(false, 30, 1200);
         Assert.Equal(50, g.MtpMsPerToken, 1);
         Assert.Equal(40, g.PlainMsPerToken, 1);
         g.RecordSegment(false, MtpAdaptiveGate.MinSampleTokens - 1, 100);   // too short: ignored

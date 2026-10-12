@@ -1633,6 +1633,13 @@ public sealed class TextGenerator
         return allowed <= 0;
     }
 
+    /// <summary>Clears the adaptive MTP gates' measurements (greedy and sampled); the warm-up calls this so its tiny cold requests do not set the first verdict.</summary>
+    public void ResetMtpGate()
+    {
+        _mtpGate?.Reset();
+        _mtpGateSampled?.Reset();
+    }
+
     private MtpAdaptiveGate? GateFor(bool sampled) => sampled ? _mtpGateSampled : _mtpGate;
 
     /// <summary>

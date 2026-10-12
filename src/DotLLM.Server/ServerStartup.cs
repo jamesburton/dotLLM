@@ -477,7 +477,9 @@ public static class ServerStartup
         // serve path actually speculates; a head that does not fit the device is declined with a message, never fatal.
         if (options.MtpEnabled && !concurrencyOverMtp && draftModel is null && !model.SupportsMtp)
             TryAttachSeparateMtpHead(model, resolvedPath, options);
-        var mtpDecision = DecideMtp(options, model.SupportsMtp, draftModel is not null, concurrencyOverMtp, schedulerAvailable);
+        int mtpK = options.SpeculativeCandidates == TextGenerator.DefaultSpeculativeCandidates && model.MtpPreferredDraftTokens > 0
+            ? model.MtpPreferredDraftTokens : options.SpeculativeCandidates;
+        var mtpDecision = DecideMtp(options, model.SupportsMtp, draftModel is not null, concurrencyOverMtp, schedulerAvailable, mtpK);
         bool mtpActive = mtpDecision.Active;
         if (mtpDecision.Message is { } mtpMsg)
             Console.WriteLine(mtpMsg);
@@ -622,7 +624,7 @@ public static class ServerStartup
     /// expected concurrency does not route to the continuous-batch scheduler. Always explains why when MTP is not engaged for a model
     /// that has a head (or when the user explicitly asked with <c>--mtp</c>).
     /// </summary>
-    internal static MtpDecision DecideMtp(ServerOptions options, bool supportsMtp, bool hasDraftModel, bool concurrencyOverMtp, bool schedulerAvailable = true)
+    internal static MtpDecision DecideMtp(ServerOptions options, bool supportsMtp, bool hasDraftModel, bool concurrencyOverMtp, bool schedulerAvailable = true, int? draftDepth = null)
     {
         if (!options.MtpEnabled)
             return new(false, supportsMtp ? "[dotllm] MTP: skipped - disabled by --no-mtp (this model carries an MTP head)." : null,
@@ -642,7 +644,7 @@ public static class ServerStartup
         string tradeoff = schedulerAvailable
             ? " Tradeoff: continuous batching is off for this model; for many concurrent clients pass --no-mtp or --expected-concurrency 5."
             : "";
-        return new(true, $"[dotllm] MTP: {how}, K={options.SpeculativeCandidates}, adaptive gate on.{tradeoff}", "active");
+        return new(true, $"[dotllm] MTP: {how}, K={draftDepth ?? options.SpeculativeCandidates}, adaptive gate on.{tradeoff}", "active");
     }
 
     /// <summary>

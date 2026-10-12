@@ -23,10 +23,10 @@ public sealed class MtpAdaptiveGate
     public const int MinMaxTokens = 12;
 
     /// <summary>Minimum decode-phase tokens for a request to contribute a speed sample.</summary>
-    public const int MinSampleTokens = 6;
+    public const int MinSampleTokens = 12;
 
     /// <summary>Re-measure the currently losing arm after this many decisions.</summary>
-    public const int ReprobeEvery = 40;
+    public const int ReprobeEvery = 16;
 
     private const double Alpha = 0.3;
 
@@ -60,6 +60,23 @@ public sealed class MtpAdaptiveGate
     private double _plainMsPerToken, _mtpMsPerToken;
     private int _plainSamples, _mtpSamples;
     private int _sinceReprobe;
+
+    /// <summary>
+    /// Forgets every measurement (arms, re-probe schedule, cost model) and starts again from the size prior. The server calls this after its warm-up:
+    /// warm-up requests are tiny and run cold (the first MTP request of a process measured 2x slower than steady state), and one such sample made
+    /// the gate settle on plain decode for the first dozens of real requests.
+    /// </summary>
+    public void Reset()
+    {
+        lock (_lock)
+        {
+            _plainMsPerToken = _mtpMsPerToken = 0;
+            _plainSamples = _mtpSamples = 0;
+            _sinceReprobe = 0;
+            _reprobeEvery = ReprobeEvery;
+        }
+        CostModel.Reset();
+    }
 
     /// <summary>True unless <see cref="DisableEnvVar"/> is <c>0</c>.</summary>
     public static bool EnabledByEnvironment => Environment.GetEnvironmentVariable(DisableEnvVar) != "0";

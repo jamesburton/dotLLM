@@ -41,6 +41,16 @@ public sealed class MtpCostModel
     private readonly int[] _costN = new int[MaxK + 1];
     private bool _firstRoundSeen;
 
+    /// <summary>Forgets every observation (see <see cref="MtpAdaptiveGate.Reset"/>).</summary>
+    public void Reset()
+    {
+        lock (_lock)
+        {
+            Array.Clear(_acc); Array.Clear(_accN); Array.Clear(_cost); Array.Clear(_costN);
+            _firstRoundSeen = false;
+        }
+    }
+
     /// <summary>Records one finished round: draft length <paramref name="k"/>, <paramref name="accepted"/> drafts accepted (0..k), wall milliseconds.</summary>
     public void RecordRound(int k, int accepted, double roundMs)
     {
