@@ -1,3 +1,4 @@
+using DotLLM.Core.Configuration;
 using Xunit;
 
 namespace DotLLM.Tests.Unit.Models.MiMoV2;
@@ -62,5 +63,28 @@ public sealed class MiMoV2QuantMixParityTests
         Assert.True(quant.MaxKl > 100 * c.MaxKl, "control arm: Q2_K must visibly damage this random model, else the check is vacuous");
         // dotLLM's packed-weight noise must be of the same order as llama.cpp's own (not 10x worse): both are activation-quantisation noise
         Assert.True(a.MaxKl < 10 * Math.Max(b.MaxKl, 1e-3), $"dotLLM packed-vs-exact maxKL {a.MaxKl} vs llama.cpp's own {b.MaxKl}");
+    }
+
+    /// <summary>
+    /// The path a real <c>dotllm run --device cpu</c> takes on the Q8_0-attention GGUF: seqLen == 1, parallel pool, fused
+    /// RMSNorm+quantise and fused Q/K/V decode GEMV (<c>FusedQkvDecode</c>) with V rows (nkv*32) != K rows (nkv*48), through the
+    /// per-layer-strided KV cache. Must equal the batched forward of the same engine and track llama.cpp on the same bytes.
+    /// </summary>
+    [SkippableFact]
+    public void Parallel_Q80_Fused_Decode_With_Distinct_V_Rows_Matches_Batched_And_LlamaCpp()
+    {
+        string? dir = Dir();
+        Skip.If(dir is null, "mimo2-tiny-k256 fixture not present (see class remarks)");
+        var par = new ThreadingConfig(ThreadCount: 4);
+        var (decoded, vocab, _) = MiMoV2TinyOracleParityTests.RunDotLlm(dir!, file: "tiny_k256_mix.gguf", decode: true, threading: par);
+        var (batched, _, _) = MiMoV2TinyOracleParityTests.RunDotLlm(dir!, file: "tiny_k256_mix.gguf", threading: par);
+        float[] ll = MiMoV2TinyOracleParityTests.ReadF32(Path.Combine(dir!, "ll_mix.f32"));
+        var selfCheck = MiMoV2TinyOracleParityTests.Compare(decoded, batched, vocab);
+        var vsLl = MiMoV2TinyOracleParityTests.Compare(decoded, ll, vocab);
+        Console.WriteLine($"[mimo2 k256 parallel decode] decode-vs-batched maxKL={selfCheck.MaxKl:E2} top1={selfCheck.Top1:P0}; decode-vs-llama(mix) maxKL={vsLl.MaxKl:E2} top1={vsLl.Top1:P0}");
+        // Decode and batched quantise activations at different granularities on a chaotic random Q2_K model, so only coarse agreement is meaningful;
+        // a V-row/K-row mix-up in the fused kernel would instead give an unrelated distribution (KL ~ 3-7 as the quantisation-damage control shows).
+        Assert.True(selfCheck.MaxKl < 2.0, $"parallel fused decode vs batched maxKL {selfCheck.MaxKl}");
+        Assert.True(vsLl.Top1 >= 0.8, $"parallel fused decode vs llama.cpp top1 {vsLl.Top1}");
     }
 }

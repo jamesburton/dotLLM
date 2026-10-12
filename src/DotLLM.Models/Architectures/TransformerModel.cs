@@ -497,8 +497,8 @@ public sealed unsafe class TransformerModel : IModel, IEmbeddingModel
         }
 
         throw new NotSupportedException(
-            $"Gemma 4 with distinct global_head_dim ({Config.GlobalHeadDim}) and head_dim "
-            + $"({Config.HeadDim}) requires a per-layer-strided KV-cache. Only the contiguous F32 "
+            $"A model with per-layer KV row widths (Gemma 4 global_head_dim {Config.GlobalHeadDim?.ToString() ?? "n/a"} vs head_dim "
+            + $"{Config.HeadDim}; per-layer KV-head counts {Config.NumKvHeads} vs {Config.NumGlobalKvHeads?.ToString() ?? "n/a"}, e.g. MiMo-V2) requires a per-layer-strided KV-cache. Only the contiguous F32 "
             + $"SimpleKvCache carries per-layer strides today; the supplied "
             + $"{kvCache.GetType().Name} does not. Build a SimpleKvCache with "
             + "KvGeometry.FromConfig(Config) (F32) or run cacheless. Per-layer quantized / paged "

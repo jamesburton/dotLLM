@@ -39,14 +39,14 @@ public sealed class MiMoV2TinyOracleParityTests
         return f;
     }
 
-    internal static (float[] Logits, int Vocab, int N) RunDotLlm(string dir, Func<ModelConfig, ModelConfig>? mutate = null, bool decode = false, string file = "tiny_mimo_f32.gguf")
+    internal static (float[] Logits, int Vocab, int N) RunDotLlm(string dir, Func<ModelConfig, ModelConfig>? mutate = null, bool decode = false, string file = "tiny_mimo_f32.gguf", ThreadingConfig? threading = null)
     {
         int[] ids = File.ReadAllText(Path.Combine(dir, "ids.txt")).Split(' ', StringSplitOptions.RemoveEmptyEntries).Select(int.Parse).ToArray();
         int[] pos = Enumerable.Range(0, ids.Length).ToArray();
         using var gguf = GgufFile.Open(Path.Combine(dir, file));
         ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
         if (mutate is not null) cfg = mutate(cfg);
-        using var model = TransformerModel.LoadFromGguf(gguf, cfg, ThreadingConfig.SingleThreaded);
+        using var model = TransformerModel.LoadFromGguf(gguf, cfg, threading ?? ThreadingConfig.SingleThreaded);
         if (!decode)
         {
             using ITensor logits = model.Forward(ids, pos, deviceId: -1);
