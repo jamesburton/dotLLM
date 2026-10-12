@@ -838,6 +838,9 @@ public sealed class VulkanTransformerModel : IModel
     public long GenericMoeMmvqLayerCount { get; private set; }
     /// <summary>Count of generic MoE layers that ran the scalar one-thread-per-cell indexed kernels at a decode-sized row count (test/diagnostic, #912).</summary>
     public long GenericMoeScalarDecodeLayerCount { get; private set; }
+    /// <summary>True when at least one generic-MoE MMVQ kernel was built for this model (integer-dot device, SPIR-V present, not disabled by env).</summary>
+    public bool GenericMoeMmvqAvailable =>
+        _quantizeQ8_1Rows is not null && (_gmMmvqQ4K is not null || _gmMmvqQ5K is not null || _gmMmvqQ6K is not null || _gmMmvqQ8_0 is not null || _gmMmvqMxfp4 is not null);
     /// <summary>Runtime A/B switch for the generic MoE MMVQ decode arm (default on). Off = the scalar indexed kernels, so one loaded model can compare both.</summary>
     public bool GenericMoeMmvqEnabled { get; set; } = true;
     /// <summary>Largest row count (seqLen) that takes the generic MoE MMVQ arm; default 15 (one below the grouped-prefill gate). <c>DOTLLM_VK_MOE_MMVQ_MAX_ROWS</c> overrides.</summary>
