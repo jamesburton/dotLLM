@@ -58,6 +58,7 @@ public sealed class VulkanTransformerModelGenericMoeMmvqDecodeTests : IDisposabl
         using var device = VulkanDevice.Create();
         Skip.IfNot(device.HasIntegerDotProduct, "integer-dot-product unavailable.");
         using var vk = VulkanTransformerModel.LoadFromGguf(device, g2, cfg, spvDir);
+        vk.GenericMoeMmvqMaxRows = 15;   // pin the arm for every row count here; the default crossover to the grouped GEMM is covered below
 
         for (int i = 0; i < sequences.Length; i++)
         {
@@ -94,7 +95,7 @@ public sealed class VulkanTransformerModelGenericMoeMmvqDecodeTests : IDisposabl
         }
     }
 
-    /// <summary>The arm has a row ceiling: above <c>GenericMoeMmvqMaxRows</c> the layer must NOT take it (it would re-read the bank per routed row).</summary>
+    /// <summary>The arm has a preferred row ceiling: above <c>GenericMoeMmvqMaxRows</c> a layer the grouped GEMM can serve must go grouped instead (the arm re-reads the bank per routed row).</summary>
     [SkippableFact]
     public void RowsAboveTheCeiling_DoNotTakeTheArm()
     {
@@ -105,6 +106,7 @@ public sealed class VulkanTransformerModelGenericMoeMmvqDecodeTests : IDisposabl
         using var device = VulkanDevice.Create();
         Skip.IfNot(device.HasIntegerDotProduct, "integer-dot-product unavailable.");
         using var vk = VulkanTransformerModel.LoadFromGguf(device, gguf, cfg, spvDir);
+        Skip.IfNot(vk.GroupedMoeKernelsBuilt, "needs the grouped path to take over above the arm's preferred ceiling.");
         vk.GenericMoeMmvqMaxRows = 2;
         long mm0 = vk.GenericMoeMmvqLayerCount;
         using (ITensor l = vk.Forward([1, 2, 3], [0, 1, 2], deviceId: -1)) { }
