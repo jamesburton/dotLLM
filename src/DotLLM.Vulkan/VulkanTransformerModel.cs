@@ -6076,7 +6076,7 @@ public sealed class VulkanTransformerModel : IModel
     /// MMVQ arm is unavailable (grouped GEMM tiles are 16 rows wide) and <see cref="GenericMoeMmvqMaxRows"/> + 1 when it is: measured on this box (#912), the
     /// arm wins up to ~4 rows and the grouped GEMM wins from ~5 (gpt-oss-20b p8 54.9 vs 58.6 ms, GLM-4.7-Flash p4 112 vs 120 ms).
     /// </summary>
-    private int EffGroupedMoeMinTokens =>
+    internal int EffGroupedMoeMinTokens =>
         GroupedMoeMinTokensEnv ?? (GenericMoeMmvqAvailable && GenericMoeMmvqEnabled ? Math.Min(16, GenericMoeMmvqMaxRows + 1) : 16);
 
     private bool GroupedQuantBankSupported(QuantType qt, int k)

@@ -31,6 +31,8 @@ public sealed class GenericMoeMmvqRealModelTests
         "The capital of France is Paris, and the capital of Germany is",
         "def fibonacci(n):\n    if n < 2:\n        return n\n    return fibonacci(n - 1) +",
         "In 1969, the Apollo 11 mission landed the first humans on the Moon. The commander of the mission was",
+        // > 128 tokens: past gpt-oss's sliding window, so windowed layers clip their KV range and dense layers split it (#915).
+        string.Concat(Enumerable.Repeat("The history of the Roman Empire spans many centuries, during which the city grew from a small settlement on the banks of the Tiber into the capital of a vast realm. Its legions marched across Europe, and its roads linked provinces from Britain to Syria. ", 4)) + "In summary, the Roman Empire was",
     ];
 
     private static string? Find(string envVar, string repoDir, string file)
