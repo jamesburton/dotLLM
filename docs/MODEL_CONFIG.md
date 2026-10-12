@@ -94,6 +94,42 @@ Differences between architectures are captured entirely in ModelConfig.
   `MoeQuantSwiGluMlp`); attention/embeddings/LM head: Q8_0
 - Tokenizer: gpt2-model BPE with `gpt-4o` (o200k) pre-tokenizer
 
+### MiMo-V2 / V2.5 / V2.6-Flash (`mimo2`) - CPU reference (#936), tracker #935
+- GGUF arch string: `mimo2` (llama.cpp `LLM_ARCH_MIMO2`, `src/models/mimo2.cpp`); HF `MiMoV2ForCausalLM`
+  (`modeling_mimo_v2.py`, remote code). 310.8B total / 15B active, 48 trunk layers (+ 3 NextN/MTP blocks that the GGUF appends:
+  `block_count` = 51, `nextn_predict_layers` = 3; `ModelConfig.NumLayers` is the trunk, `NextnPredictLayers` the rest).
+- **Attention** (plain GQA, no QK-norm, no bias, fused `attn_qkv`): 64 Q heads, **K head_dim 192 but V head_dim 128**
+  (`attention.key_length` / `attention.value_length`; `ModelConfig.HeadDim` = K, `ValueHeadDim` = V; `o_proj` input is
+  `64 * 128`). Score scale `1/sqrt(192)` (K dim). Fused rows = `[Q 64*192 | K nkv*192 | V nkv*128]`.
+- **Per-layer global / sliding-window mix** (`sliding_window_pattern`, 1 = sliding): 9 global layers (indices 0,5,11,...,47, 4 KV
+  heads) and 39 sliding-window layers (window 128, 8 KV heads). The GGUF stores `head_count_kv` as a per-layer array; sliding values map
+  to `NumKvHeads` / `RoPEConfig` and global ones to `NumGlobalKvHeads` / `GlobalRoPEConfig` (the Gemma-4 mechanism).
+- **Attention sinks on sliding layers only** (`blk.N.attn_sinks.weight` [64] F32; absent on global layers): a learned per-head
+  logit joins the softmax denominator and is excluded from the V sum (same math as gpt-oss).
+- **RoPE**: NEOX pairing on the first `rope.dimension_count` = 64 of 192 dims of EVERY layer (rotated span baked into the key, so
+  `PartialRotaryFactor` stays null); theta `rope.freq_base` 1e7 (global) / `rope.freq_base_swa` 1e4 (sliding); frequency
+  denominator is the rotated dim 64 (HF `compute_default_rope_parameters`, ggml `n_rot`), NOT the 192 head dim. No scaling.
+- **V scale**: `attention.value_scale` = 0.707 (`AttentionValueScale`); HF scales V, llama.cpp scales the layer output after
+  `o_proj`; V is linear in the output so the CPU applies it to the pre-`o_proj` attention output. Not folded into quantised weights.
+- **FFN**: layer 0 dense SwiGLU (16384); layers 1..47 MoE: 256 routed experts, top-8, expert ff 2048, **no shared expert**,
+  **sigmoid** scores, `blk.N.exp_probs_b.bias` added for top-k *selection only* (weights are the unbiased sigmoids), selected weights
+  renormalised, `routed_scaling_factor` null (= 1). The GGUF does not record which layers are dense (`moe_layer_freq`); the loader
+  keys off the presence of `ffn_gate_exps` and the extractor defaults `MlpOnlyLayers` to `[0]`
+  (`leading_dense_block_count` overrides). `expert_weights_norm` is not written by the converter and defaults to true.
+- **MTP head** (3 layers, `blk.48..50`): SWA attention (own sinks) + dense FFN 16384 + `nextn.eh_proj [2H,H]`, `nextn.enorm`,
+  `nextn.hnorm`, `layer_output_norm`. Present in the file but NOT used: the trunk ignores them (llama.cpp marks them "preserved but disabled").
+- Tokenizer: Qwen2 BPE (`pre = qwen2`), vocab 152576, no BOS. Chat template: MiMo family (same as the Distill-Qwen-9B).
+- **CPU realisation of V != K head dim (reference, exact)**: each V head is zero-padded from 128 to 192 columns right after the
+  projection so the shared attention kernels and every KV cache (single K/V row stride) are used unchanged; the pad columns of the
+  attention output are exact zeros and are compacted away before `o_proj` (`TransformerModel.ExpandValueHeads` /
+  `CompactAttentionHeads`). Cost: 1.5x V memory and PV work on the CPU. A native V-dim kernel is a GPU-backend task.
+- **GPU backends refuse** `mimo2` explicitly (`ModelConfig.MiMoV2UnsupportedMessage`): V!=K attention kernels, sliding-window KV ring,
+  packed Q2_K/IQ expert banks in the generic MoE path and MTP are missing - see #935.
+- Verification: `tools/mimo2-tiny-oracle` builds a tiny random MiMoV2 (K 48 / V 32, rotary 16/48, GQA 4 global / 2 sliding,
+  window 4, sinks, 8 experts top-2, dense layer 0) in HF torch, converts it with llama.cpp's own `convert_hf_to_gguf.py`, and
+  compares HF torch / llama.cpp CPU / dotLLM CPU (max |dlogit| 1.9e-5, KL 8.6e-12, top-1 100%; decode through the per-layer-strided KV cache
+  matches too). `MiMoV2SyntheticGoldenTests` is the hermetic variant (C#-written GGUF vs llama.cpp golden logits, plus mutants).
+
 ### Qwen4-Exp / Qwen3.8-Flash-Next (`qwen4exp`) — config (#815) + CPU reference forward (#816), epic #814
 - GGUF arch string: `qwen4exp` (llama.cpp `LLM_ARCH_QWEN4EXP`) -> `Architecture.Qwen4Exp`. The **CPU** loader builds `Qwen4ExpTransformerModel` (the
   numerical oracle, validated against HF `qwen4_exp` on a tiny random-weight model); **Vulkan** builds `VulkanQwen4ExpTransformerModel` (#818, below);
