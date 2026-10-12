@@ -137,6 +137,9 @@ public static class VulkanModelLoader
                 return (q4, size => q4.CreateKvCache(size));
             }
 
+            case Architecture.MiMoV2:
+                throw new NotSupportedException(ModelConfig.MiMoV2UnsupportedMessage("Vulkan"));
+
             case Architecture.Mamba3:
                 throw new NotSupportedException(
                     "Mamba-3 has no GGUF representation: no upstream 'mamba3' value for " +

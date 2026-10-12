@@ -31,7 +31,7 @@ public sealed class MiMoV2TinyOracleParityTests
         return File.Exists(Path.Combine(d, "tiny_mimo_f32.gguf")) ? d : null;
     }
 
-    private static float[] ReadF32(string path)
+    internal static float[] ReadF32(string path)
     {
         byte[] b = File.ReadAllBytes(path);
         var f = new float[b.Length / 4];
@@ -39,11 +39,11 @@ public sealed class MiMoV2TinyOracleParityTests
         return f;
     }
 
-    private static (float[] Logits, int Vocab, int N) RunDotLlm(string dir, Func<ModelConfig, ModelConfig>? mutate = null, bool decode = false)
+    internal static (float[] Logits, int Vocab, int N) RunDotLlm(string dir, Func<ModelConfig, ModelConfig>? mutate = null, bool decode = false, string file = "tiny_mimo_f32.gguf")
     {
         int[] ids = File.ReadAllText(Path.Combine(dir, "ids.txt")).Split(' ', StringSplitOptions.RemoveEmptyEntries).Select(int.Parse).ToArray();
         int[] pos = Enumerable.Range(0, ids.Length).ToArray();
-        using var gguf = GgufFile.Open(Path.Combine(dir, "tiny_mimo_f32.gguf"));
+        using var gguf = GgufFile.Open(Path.Combine(dir, file));
         ModelConfig cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
         if (mutate is not null) cfg = mutate(cfg);
         using var model = TransformerModel.LoadFromGguf(gguf, cfg, ThreadingConfig.SingleThreaded);
@@ -71,7 +71,7 @@ public sealed class MiMoV2TinyOracleParityTests
         return f;
     }
 
-    private static (float MaxAbs, double MaxKl, double Top1) Compare(float[] a, float[] reference, int vocab)
+    internal static (float MaxAbs, double MaxKl, double Top1) Compare(float[] a, float[] reference, int vocab)
     {
         float maxAbs = 0f; double maxKl = 0; int agree = 0, rows = a.Length / vocab;
         for (int r = 0; r < rows; r++)

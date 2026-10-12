@@ -491,6 +491,19 @@ public record ModelConfig
     public bool IsGemma4DensePle
         => Gemma4DualFfn && (Moe is null || PerLayerEmbedding is not null || NumSharedKvLayers > 0);
 
+    /// <summary>
+    /// Actionable refusal for GPU backends asked to run a MiMo-V2 (<c>mimo2</c>) model. Their attention kernels, KV caches and
+    /// generic MoE paths assume one head dim for Q, K and V; MiMo-V2 has K 192 / V 128, a sliding-window ring with sinks on 39
+    /// of 48 layers and Q2_K/IQ expert banks that the generic MoE loaders would widen to F32. Running it anyway would load and
+    /// produce wrong logits silently, so refuse. CPU is the reference backend (issue #936).
+    /// </summary>
+    public static string MiMoV2UnsupportedMessage(string backend)
+        => $"The MiMo-V2 architecture (GGUF 'mimo2', Xiaomi MiMo-V2 / V2.5 / V2.6-Flash) is not supported on the {backend} backend yet: "
+         + "its attention uses V head_dim 128 with Q/K head_dim 192 (every GPU attention kernel and KV cache here assumes one head dim), "
+         + "it needs a sliding-window KV ring with learned attention sinks on the sliding layers, and its low-bit routed-expert banks "
+         + "(Q2_K / IQ1_M / IQ2_*) are not kept packed by the generic MoE path. Use --device cpu. "
+         + "Tracked in https://github.com/jamesburton/dotLLM/issues/935 (CPU reference: #936).";
+
     /// <summary>Actionable message for backends that cannot run <see cref="IsGemma4DensePle"/> models.</summary>
     public static string Gemma4DensePleUnsupportedMessage(string backend)
         => $"The Gemma-4 dense variant (E2B/E4B: per-layer embeddings, shared-KV layers, no MoE block) "
