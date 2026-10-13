@@ -174,6 +174,15 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private KvCacheDType _kvValueDType = ParseKvStorageEnv().value;
     private nint[]? _kQuant;
     private nint[]? _vQuant;
+
+    // Fused dequant-in-load decode attention for quantized KV (issue #956). Default ON when both
+    // sides are quantized and the kvq kernels are loaded; DOTLLM_HYBRID_KV_FUSED=0 forces the
+    // dequant-into-scratch path (kept for A/B and as the fallback).
+    internal bool FuseQuantKvDecodeForTest { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_HYBRID_KV_FUSED") != "0";
+
+    /// <summary>Test-only: decode attention calls served by the fused quantized-KV kernel.</summary>
+    internal int DebugFusedKvqAttentionCallsForTest { get; private set; }
     private nint _kvF16ScratchK;
     private nint _kvF16ScratchV;
     private long _kvF16ScratchElems;
@@ -3253,9 +3262,17 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 && numKvHeads < numHeads
                 && seqKv >= CudaKernels.AttentionGqaSplitMinSeqKv
                 && _mmaDecodeGqaSplit.CanUse(seqLen, seqKv, slidingWindow: 0, numHeads, numKvHeads, headDim);
-            int mmaKvSplit = mmaEligible
-                ? _mmaDecodeGqaSplit.ComputeSafeKvSplit(numKvHeads, numHeads / numKvHeads, seqKv)
-                : 0;
+            // Fused quantized-KV tier (issue #956): both sides quantized, kernel loaded, mma-eligible.
+            bool fusedKvqDecode = mmaEligible
+                && FuseQuantKvDecodeForTest
+                && IsQuantKv(_kvKeyDType) && IsQuantKv(_kvValueDType)
+                && _mmaDecodeGqaSplit.CanUseKvq(_kvKeyDType, _kvValueDType, seqLen, seqKv, 0,
+                                                numHeads, numKvHeads, headDim)
+                && _mmaDecodeGqaSplit.ComputeSafeKvSplitKvq(_kvKeyDType, _kvValueDType, numKvHeads, seqKv) >= 1;
+            int mmaKvSplit = !mmaEligible ? 0
+                : fusedKvqDecode
+                    ? _mmaDecodeGqaSplit.ComputeSafeKvSplitKvq(_kvKeyDType, _kvValueDType, numKvHeads, seqKv)
+                    : _mmaDecodeGqaSplit.ComputeSafeKvSplit(numKvHeads, numHeads / numKvHeads, seqKv);
             bool useMmaDecodeGqaSplitAttn = mmaEligible && mmaKvSplit >= 1;
 
             // Issue #226 spike: fp64-combine variant, mutually exclusive with (checked before, so
@@ -3266,6 +3283,9 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 && CudaKernels.EnableAttentionSplitKvHp
                 && seqKv >= CudaKernels.AttentionSplitKvMinSeqKv
                 && _kernels.IsAttentionSplitKvHpSafe(numHeads, headDim);
+            // The fp64-combine research toggle wins over mma and consumes F32 staging built from
+            // kF16/vF16, so the fused quantized-KV path (which never resolves them) must stand down.
+            if (useSplitKvHpAttn) fusedKvqDecode = false;
 
             // F32 K/V read-staging (issue #956): needed only by the F32-consuming tiers. The mma
             // decode kernel below reads the F16 cache directly, so on the default decode path no
@@ -3275,8 +3295,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             nint kStage = 0, vStage = 0;
             // F16 view of K/V history: the persistent cache, or a fresh dequant into the shared
             // scratch when KV storage is quantized (Phase 2).
-            nint kF16 = ResolveKvF16(slot, isKey: true, seqKv, kvElems, streamH);
-            nint vF16 = ResolveKvF16(slot, isKey: false, seqKv, kvElems, streamH);
+            nint kF16 = 0, vF16 = 0;
+            if (!fusedKvqDecode)
+            {
+                kF16 = ResolveKvF16(slot, isKey: true, seqKv, kvElems, streamH);
+                vF16 = ResolveKvF16(slot, isKey: false, seqKv, kvElems, streamH);
+            }
             if (needF32Stage)
             {
                 EnsureF32KvStaging(seqKv, kvElems);
@@ -3316,9 +3340,20 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 EnsureAttentionMmaDecodeQF16Scratch(numHeads, headDim);
                 EnsureAttentionGqaSplitScratch(numHeads, headDim, mmaKvSplit);
                 _kernels.LaunchConvertF32ToF16(q, _attnMmaDecodeQF16, numHeads * headDim, streamH);
-                _mmaDecodeGqaSplit.Run(_attnMmaDecodeQF16, kF16, vF16, attnOut,
-                    seqKv, numHeads, numKvHeads, mmaKvSplit,
-                    _attnGqaSplitPartialMax, _attnGqaSplitPartialSum, _attnGqaSplitPartialOut, streamH);
+                if (fusedKvqDecode)
+                {
+                    _mmaDecodeGqaSplit.RunKvq(_attnMmaDecodeQF16, _kQuant![slot], _vQuant![slot],
+                        _kvKeyDType, _kvValueDType, attnOut,
+                        seqKv, numHeads, numKvHeads, mmaKvSplit,
+                        _attnGqaSplitPartialMax, _attnGqaSplitPartialSum, _attnGqaSplitPartialOut, streamH);
+                    DebugFusedKvqAttentionCallsForTest++;
+                }
+                else
+                {
+                    _mmaDecodeGqaSplit.Run(_attnMmaDecodeQF16, kF16, vF16, attnOut,
+                        seqKv, numHeads, numKvHeads, mmaKvSplit,
+                        _attnGqaSplitPartialMax, _attnGqaSplitPartialSum, _attnGqaSplitPartialOut, streamH);
+                }
             }
             else if (useGqaSplitAttn)
             {

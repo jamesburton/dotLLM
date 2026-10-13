@@ -70,14 +70,53 @@ public class CudaQwen3HybridDenseQuantKvTest
         }
     }
 
-    private sealed record RunResult(int DecodeStaged, float[][] DecodeLogits);
+    /// <summary>
+    /// The fused dequant-in-load kernel must produce BIT-IDENTICAL logits to dequantize-into-F16 +
+    /// the F16 kernel (same element expression, same accumulation), and must actually be the
+    /// kernel that ran (counter), for every K/V format pair.
+    /// </summary>
+    [SkippableFact]
+    public void FusedQuantKvDecode_IsBitIdenticalToDequantScratchPath()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT") == "0",
+            "mma decode opted out via env");
+        string? path = ResolveFixturePath();
+        Skip.If(path is null, $"Bonsai PQ2_0 GGUF fixture not found. Set {ModelPathEnvVar}.");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir is null, "PTX files not found");
 
-    private static RunResult Execute(string path, string ptxDir, KvCacheDType key, KvCacheDType value)
+        var pairs = new (string name, KvCacheDType k, KvCacheDType v)[]
+        {
+            ("q8q8", KvCacheDType.Q8_0, KvCacheDType.Q8_0),
+            ("q4q4", KvCacheDType.Q4_0, KvCacheDType.Q4_0),
+            ("q8q4", KvCacheDType.Q8_0, KvCacheDType.Q4_0),
+            ("q4q8", KvCacheDType.Q4_0, KvCacheDType.Q8_0),
+        };
+        foreach (var p in pairs)
+        {
+            var scratch = Execute(path!, ptxDir!, p.k, p.v, fused: false);
+            var fusedRun = Execute(path!, ptxDir!, p.k, p.v, fused: true);
+            Assert.Equal(0, scratch.FusedCalls);
+            Assert.Equal(DecodeSteps * 16, fusedRun.FusedCalls);   // one per attention layer per decode step
+            for (int s = 0; s < DecodeSteps; s++)
+                for (int i = 0; i < scratch.DecodeLogits[s].Length; i++)
+                    Assert.True(BitConverter.SingleToInt32Bits(scratch.DecodeLogits[s][i]) ==
+                                BitConverter.SingleToInt32Bits(fusedRun.DecodeLogits[s][i]),
+                        $"{p.name} step {s} logit {i}: fused {fusedRun.DecodeLogits[s][i]} != scratch {scratch.DecodeLogits[s][i]}");
+            _out.WriteLine($"{p.name}: fused == scratch bit-identical over {DecodeSteps} steps");
+        }
+    }
+
+    private sealed record RunResult(int DecodeStaged, int FusedCalls, float[][] DecodeLogits);
+
+    private static RunResult Execute(string path, string ptxDir, KvCacheDType key, KvCacheDType value, bool fused = true)
     {
         using var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         using var model = CudaQwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
         model.SetKvStorageForTest(key, value);
+        model.FuseQuantKvDecodeForTest = fused;
         using var kv = model.CreateKvCache(maxSeqLen: 512);
 
         int[] tokens = new int[PrefillLen];
@@ -92,7 +131,8 @@ public class CudaQwen3HybridDenseQuantKvTest
             using ITensor t = model.Forward([(7 + s * 13) % 30000], [PrefillLen + s], deviceId: -1, kv);
             logits[s] = Copy(t, config.VocabSize);
         }
-        return new RunResult(model.DebugF32StagedAttentionCallsForTest - c1, logits);
+        return new RunResult(model.DebugF32StagedAttentionCallsForTest - c1,
+                             model.DebugFusedKvqAttentionCallsForTest, logits);
     }
 
     private static unsafe float[] Copy(ITensor t, int count)

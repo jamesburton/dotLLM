@@ -43,6 +43,33 @@ Qwen4-Exp model) and `lazy: true` (buffers start empty and `EnsureCapacity(posit
 (handles are recycled; a stale cached set reads zeros without any error). Qwen4-Exp does this in `ForwardCore` before recording (`EnsureContext`), for the sequence's K/V and its indexer
 state. Switches and measurements: [ATTENTION.md](ATTENTION.md), "Lazy growth and F16 K/V".
 
+### CUDA hybrid-dense KV: staging, quantized storage, fused decode (issue #956)
+
+`CudaQwen3HybridDenseTransformerModel` (Bonsai-2 27B and other qwen35 dense hybrids) owns its KV buffers behind the
+length-only `CudaHybridKvCacheHandle`. Per full-attention slot (16 of 64 layers for Bonsai-2: 4 KV heads x 256 dim,
+32,768 elements/token across slots):
+
+| storage | per token | at 64k |
+|---|---|---|
+| F16 (default) | 64 KiB | 4.0 GiB |
+| Q8_0 (`DOTLLM_HYBRID_KV=q8_0`) | ~34 KiB | ~2.2 GiB |
+| K8/V4 (`k8v4`) | ~26 KiB | ~1.7 GiB |
+| Q4_0 (`q4_0`) | ~18 KiB | ~1.15 GiB |
+
+- **F32 staging is shared and on demand.** Only the F32-consuming tiers (prefill `attention_f32`, opt-in/fallback decode
+  tiers) read F32 K/V. They get ONE staging pair shared by all layers, fully reconverted per use (512 MiB at 64k). The
+  default mma decode kernel reads the F16 cache directly and stages nothing. Before #956 every slot kept a persistent F32
+  mirror (128 KiB/token, power-of-two growth): 8 GiB at 64k, 16 GiB past 65,536.
+- **Quantized storage** (`DOTLLM_HYBRID_KV=f16|q8_0|q4_0|k8v4|k4v8`): rows are quantized on write
+  (`quant_f16_to_q{8,4}_0`, standard 32-element blocks) and read either by the **fused** decode kernel
+  (`attention_flash_mma_decode_gqa_split_kvq_*`, dequant inside the K/V tile load, bit-identical to the scratch path;
+  `DOTLLM_HYBRID_KV_FUSED=0` disables) or by a dequant into one shared F16 scratch pair (prefill and fallback tiers).
+- **KV Q4_0 is not the GGUF Q4_0 layout.** KV blocks pack ADJACENT PAIRS (low nibble = even element), matching CPU
+  `KvQuantize` and `quant_kv.cu`; the weight dequant (`dequant_q4_0_f16`) unpacks low/high HALVES. Always use
+  `CudaKernels.LaunchKvDequantToF16` for KV data. (The eager `CudaQuantizedKvCache` path used the weight dequant until
+  #956, permuting elements inside every 32-block.)
+- `DOTLLM_HYBRID_VRAM_LEDGER=1` logs the model-owned KV/staging/scratch bytes once after the first attention call.
+
 ## Paged KV-Cache
 
 Inspired by OS virtual memory paging. This is the **memory management** half of PagedAttention (vLLM): block-based allocation, ref counting, CoW. The **kernel** half (attention reading non-contiguous blocks directly) is opt-in on CUDA as of issue #200 (`DOTLLM_ATTN_PAGED_NATIVE=1`, decode only — see the CUDA section below); it remains a future step for CPU and any future Vulkan paged cache, where current kernels still see contiguous buffers via staging-buffer gather.
