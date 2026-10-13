@@ -33,6 +33,11 @@ public static partial class GgufModelConfigExtractor
         if (architecture is Architecture.Gemma4 or Architecture.DiffusionGemma)
             return BuildGemma4Config(metadata, arch, architecture);
 
+        // MiMo-V2 likewise stores head_count_kv / sliding_window_pattern as per-layer arrays (global vs SWA layers differ),
+        // and has K head_dim != V head_dim; dedicated builder.
+        if (architecture == Architecture.MiMoV2)
+            return BuildMiMoV2Config(metadata, arch);
+
         int hiddenSize = (int)metadata.GetUInt32($"{arch}.embedding_length");
         int numLayers = (int)metadata.GetUInt32($"{arch}.block_count");
         int numAttentionHeads = (int)metadata.GetUInt32($"{arch}.attention.head_count");
@@ -997,6 +1002,8 @@ public static partial class GgufModelConfigExtractor
             "bitnet" or "bitnet-b1.58" or "bitnet-25" => Architecture.BitNet,
             // OpenAI gpt-oss (llama.cpp LLM_ARCH_OPENAI_MOE).
             "gpt-oss" => Architecture.GptOss,
+            // Xiaomi MiMo-V2 (llama.cpp LLM_ARCH_MIMO2): GQA + sinks/SWA mix + K!=V head dim + sigmoid-bias MoE.
+            "mimo2" => Architecture.MiMoV2,
             // Gemma 1 / CodeGemma (llama.cpp LLM_ARCH_GEMMA) and Gemma 2 (LLM_ARCH_GEMMA2).
             "gemma" => Architecture.Gemma,
             "gemma2" => Architecture.Gemma2,
@@ -1016,6 +1023,148 @@ public static partial class GgufModelConfigExtractor
             "bert" => Architecture.Bert,
             "nomic-bert" => Architecture.NomicBert,
             _ => throw new InvalidDataException($"Unsupported GGUF architecture: '{archString}'.")
+        };
+    }
+
+    /// <summary>
+    /// Builds a <see cref="ModelConfig"/> from a llama.cpp <c>mimo2</c> GGUF (conversion/mimo.py, src/models/mimo2.cpp).
+    /// </summary>
+    /// <remarks>
+    /// <list type="bullet">
+    /// <item><c>block_count</c> includes the trailing <c>nextn_predict_layers</c> (3) MTP blocks (the converter writes
+    ///   <c>num_hidden_layers + 3</c>, and every per-layer array has that many entries); the trunk is the first
+    ///   <c>block_count - nextn_predict_layers</c> blocks.</item>
+    /// <item><c>head_count_kv</c> is a per-layer array (global 4, SWA 8) and <c>sliding_window_pattern</c> a per-layer 0/1 array
+    ///   (1 = sliding-window layer). Sliding values map onto <see cref="ModelConfig.NumKvHeads"/> /
+    ///   <see cref="ModelConfig.RoPEConfig"/>, global onto <see cref="ModelConfig.NumGlobalKvHeads"/> /
+    ///   <see cref="ModelConfig.GlobalRoPEConfig"/> (the Gemma-4 mechanism).</item>
+    /// <item><c>attention.key_length</c> is the Q/K head dim (192), <c>attention.value_length</c> the V head dim (128);
+    ///   <c>rope.dimension_count</c> (64) is the rotated span of EVERY layer (NEOX); theta is <c>rope.freq_base</c> (global)
+    ///   and <c>rope.freq_base_swa</c> (sliding).</item>
+    /// <item>MoE: sigmoid scoring + <c>exp_probs_b</c> selection bias, renormalised top-k weights, no shared expert; layer 0
+    ///   is dense (HF <c>moe_layer_freq[0] = 0</c>; the GGUF does not record it, the loader keys off the presence of the
+    ///   <c>ffn_gate_exps</c> tensor and <see cref="MoeConfig.MlpOnlyLayers"/> carries the same default for consumers that
+    ///   only see the config).</item>
+    /// </list>
+    /// </remarks>
+    private static ModelConfig BuildMiMoV2Config(GgufMetadata metadata, string arch)
+    {
+        int hiddenSize = (int)metadata.GetUInt32($"{arch}.embedding_length");
+        int blockCount = (int)metadata.GetUInt32($"{arch}.block_count");
+        int nextn = (int)metadata.GetUInt32OrDefault($"{arch}.nextn_predict_layers", 0);
+        if (nextn < 0 || nextn >= blockCount)
+            throw new InvalidDataException($"{arch}.nextn_predict_layers = {nextn} must be in [0, block_count {blockCount}).");
+        int numLayers = blockCount - nextn;
+        int numAttentionHeads = (int)metadata.GetUInt32($"{arch}.attention.head_count");
+        int maxSeqLen = (int)metadata.GetUInt32OrDefault($"{arch}.context_length", 2048);
+        float normEps = metadata.GetFloat32OrDefault($"{arch}.attention.layer_norm_rms_epsilon", 1e-6f);
+        int vocabSize = ResolveVocabSize(metadata, arch);
+        int denseIntermediate = (int)metadata.GetUInt32OrDefault($"{arch}.feed_forward_length", 0);
+
+        int headDim = (int)metadata.GetUInt32($"{arch}.attention.key_length");
+        int valueDim = (int)metadata.GetUInt32OrDefault($"{arch}.attention.value_length", (uint)headDim);
+        int ropeDim = (int)metadata.GetUInt32OrDefault($"{arch}.rope.dimension_count", (uint)headDim);
+        if (ropeDim <= 0 || (ropeDim & 1) != 0 || ropeDim > headDim)
+            throw new InvalidDataException($"{arch}.rope.dimension_count = {ropeDim} must be a positive even number <= key_length {headDim}.");
+
+        int window = (int)metadata.GetUInt32($"{arch}.attention.sliding_window");
+        int[] pattern = GetIntArrayOrEmpty(metadata, $"{arch}.attention.sliding_window_pattern");
+        if (pattern.Length < numLayers)
+            throw new InvalidDataException(
+                $"{arch}.attention.sliding_window_pattern has {pattern.Length} entries; need at least {numLayers} (one per trunk layer).");
+        var perLayerSliding = new int?[numLayers];
+        for (int i = 0; i < numLayers; i++)
+            perLayerSliding[i] = pattern[i] != 0 ? window : (int?)null;
+
+        int[] kvArray = GetIntArrayOrEmpty(metadata, $"{arch}.attention.head_count_kv");
+        int slidingKv = 0, globalKv = 0;
+        if (kvArray.Length == 0)
+        {
+            slidingKv = globalKv = (int)metadata.GetUInt32($"{arch}.attention.head_count_kv");
+        }
+        else
+        {
+            if (kvArray.Length < numLayers)
+                throw new InvalidDataException(
+                    $"{arch}.attention.head_count_kv has {kvArray.Length} entries; need at least {numLayers}.");
+            for (int i = 0; i < numLayers; i++)
+            {
+                bool sliding = perLayerSliding[i] is not null;
+                int seen = sliding ? slidingKv : globalKv;
+                if (seen == 0)
+                {
+                    if (sliding) slidingKv = kvArray[i]; else globalKv = kvArray[i];
+                }
+                else if (seen != kvArray[i])
+                {
+                    throw new InvalidDataException(
+                        $"{arch}.attention.head_count_kv is not uniform within the {(sliding ? "sliding" : "global")} layers (layer {i}: {kvArray[i]} vs {seen}).");
+                }
+            }
+            if (slidingKv == 0) slidingKv = globalKv;   // no sliding layer at all
+            if (globalKv == 0) globalKv = slidingKv;    // no global layer at all
+        }
+
+        float globalTheta = metadata.GetFloat32OrDefault($"{arch}.rope.freq_base", 10000.0f);
+        float slidingTheta = metadata.GetFloat32OrDefault($"{arch}.rope.freq_base_swa", globalTheta);
+        var slidingRope = new RoPEConfig(Theta: slidingTheta, DimensionCount: ropeDim, Type: RoPEType.NeoX);
+        var globalRope = new RoPEConfig(Theta: globalTheta, DimensionCount: ropeDim, Type: RoPEType.NeoX);
+
+        // Sigmoid + selection bias + renormalised top-k, no shared expert.
+        int expertCount = (int)metadata.GetUInt32($"{arch}.expert_count");
+        int expertUsed = (int)metadata.GetUInt32($"{arch}.expert_used_count");
+        int moeIntermediate = (int)metadata.GetUInt32($"{arch}.expert_feed_forward_length");
+        uint gating = metadata.GetUInt32OrDefault($"{arch}.expert_gating_func", 2);
+        if (gating != 2)
+            throw new InvalidDataException($"{arch}.expert_gating_func = {gating} is not supported (mimo2 routes with sigmoid = 2).");
+        float weightsScale = metadata.GetFloat32OrDefault($"{arch}.expert_weights_scale", 1.0f);
+        if (weightsScale == 0.0f) weightsScale = 1.0f;
+        int leadingDense = (int)metadata.GetUInt32OrDefault($"{arch}.leading_dense_block_count", 1);
+        var mlpOnly = new int[Math.Max(0, Math.Min(leadingDense, numLayers))];
+        for (int i = 0; i < mlpOnly.Length; i++) mlpOnly[i] = i;
+        var moe = new MoeConfig
+        {
+            NumExperts = expertCount,
+            NumExpertsPerTok = expertUsed,
+            MoeIntermediateSize = moeIntermediate,
+            NormTopKProb = false,
+            SigmoidGating = true,
+            HasSelectionBias = true,
+            NormalizeExpertWeights = metadata.GetBoolOrDefault($"{arch}.expert_weights_norm", true),
+            ExpertWeightsScale = weightsScale,
+            DecoderSparseStep = 1,
+            MlpOnlyLayers = mlpOnly.Length > 0 ? mlpOnly : null,
+        };
+
+        string? chatTemplate = metadata.GetStringOrDefault("tokenizer.chat_template", null!);
+        if (string.IsNullOrEmpty(chatTemplate)) chatTemplate = null;
+
+        float valueScale = metadata.GetFloat32OrDefault($"{arch}.attention.value_scale", 1.0f);
+
+        return new ModelConfig
+        {
+            Architecture = Architecture.MiMoV2,
+            VocabSize = vocabSize,
+            HiddenSize = hiddenSize,
+            IntermediateSize = denseIntermediate,
+            NumLayers = numLayers,
+            NextnPredictLayers = nextn,
+            NumAttentionHeads = numAttentionHeads,
+            NumKvHeads = slidingKv,
+            NumGlobalKvHeads = globalKv != slidingKv ? globalKv : null,
+            HeadDim = headDim,
+            ValueHeadDim = valueDim != headDim ? valueDim : null,
+            AttentionValueScale = valueScale != 1.0f && valueScale > 0f ? valueScale : null,
+            MaxSequenceLength = maxSeqLen,
+            AttentionType = AttentionType.GQA,
+            PositionEncodingType = PositionEncodingType.RoPE,
+            RoPEConfig = slidingRope,
+            GlobalRoPEConfig = globalRope,
+            NormEpsilon = normEps,
+            SlidingWindowSize = window,
+            PerLayerSlidingWindow = perLayerSliding,
+            Moe = moe,
+            ChatTemplate = chatTemplate,
         };
     }
 

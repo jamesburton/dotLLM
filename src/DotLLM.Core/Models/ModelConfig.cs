@@ -394,6 +394,29 @@ public record ModelConfig
     public int? GlobalHeadDim { get; init; }
 
     /// <summary>
+    /// Per-head dimension of V (and of the attention output feeding <c>o_proj</c>) when it differs from the Q/K head
+    /// dim <see cref="HeadDim"/> (MiMo-V2: K 192, V 128). Null = V uses <see cref="HeadDim"/> (every other
+    /// non-MLA architecture). Resolve through <see cref="GetValueHeadDim"/>.
+    /// </summary>
+    public int? ValueHeadDim { get; init; }
+
+    /// <summary>The V head dimension: <see cref="ValueHeadDim"/> when set, else <see cref="HeadDim"/>.</summary>
+    public int GetValueHeadDim() => ValueHeadDim ?? HeadDim;
+
+    /// <summary>
+    /// True when V's head dim differs from Q/K's (<see cref="ValueHeadDim"/> set and unequal to <see cref="HeadDim"/>).
+    /// Backends whose attention kernels assume one head dim for Q, K and V must reject such a model explicitly.
+    /// </summary>
+    public bool HasDistinctValueHeadDim => ValueHeadDim is int v && v != HeadDim;
+
+    /// <summary>
+    /// Constant multiplier applied to the attention-layer value contribution (MiMo-V2 <c>attention_value_scale</c> 0.707,
+    /// GGUF <c>{arch}.attention.value_scale</c>). V is linear in the attention output, so it is equivalent to scaling V or
+    /// the pre-<c>o_proj</c> attention output. Null = 1.
+    /// </summary>
+    public float? AttentionValueScale { get; init; }
+
+    /// <summary>
     /// Returns the per-head dimension for <paramref name="layerIdx"/>. Full-attention
     /// layers use <see cref="GlobalHeadDim"/> when set (Gemma 4 <c>global_head_dim</c>);
     /// sliding-window layers and every other architecture use <see cref="HeadDim"/>.
@@ -467,6 +490,19 @@ public record ModelConfig
     /// </summary>
     public bool IsGemma4DensePle
         => Gemma4DualFfn && (Moe is null || PerLayerEmbedding is not null || NumSharedKvLayers > 0);
+
+    /// <summary>
+    /// Actionable refusal for GPU backends asked to run a MiMo-V2 (<c>mimo2</c>) model. Their attention kernels, KV caches and
+    /// generic MoE paths assume one head dim for Q, K and V; MiMo-V2 has K 192 / V 128, a sliding-window ring with sinks on 39
+    /// of 48 layers and Q2_K/IQ expert banks that the generic MoE loaders would widen to F32. Running it anyway would load and
+    /// produce wrong logits silently, so refuse. CPU is the reference backend (issue #936).
+    /// </summary>
+    public static string MiMoV2UnsupportedMessage(string backend)
+        => $"The MiMo-V2 architecture (GGUF 'mimo2', Xiaomi MiMo-V2 / V2.5 / V2.6-Flash) is not supported on the {backend} backend yet: "
+         + "its attention uses V head_dim 128 with Q/K head_dim 192 (every GPU attention kernel and KV cache here assumes one head dim), "
+         + "it needs a sliding-window KV ring with learned attention sinks on the sliding layers, and its low-bit routed-expert banks "
+         + "(Q2_K / IQ1_M / IQ2_*) are not kept packed by the generic MoE path. Use --device cpu. "
+         + "Tracked in https://github.com/jamesburton/dotLLM/issues/935 (CPU reference: #936).";
 
     /// <summary>Actionable message for backends that cannot run <see cref="IsGemma4DensePle"/> models.</summary>
     public static string Gemma4DensePleUnsupportedMessage(string backend)

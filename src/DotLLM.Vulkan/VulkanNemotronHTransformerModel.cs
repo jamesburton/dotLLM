@@ -337,9 +337,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(spvDir);
 
-        if (config.Architecture != Architecture.NemotronH)
+        if (config.Architecture is not (Architecture.NemotronH or Architecture.NemotronHMoe))
             throw new ArgumentException(
-                $"VulkanNemotronHTransformerModel requires Architecture.NemotronH, got {config.Architecture}.",
+                $"VulkanNemotronHTransformerModel requires Architecture.NemotronH/NemotronHMoe, got {config.Architecture}.",
                 nameof(config));
 
         var cpuModel = NemotronHTransformerModel.LoadFromGguf(gguf, config);
@@ -411,9 +411,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(cpuLayers);
         ArgumentNullException.ThrowIfNull(spvDir);
 
-        if (config.Architecture != Architecture.NemotronH)
+        if (config.Architecture is not (Architecture.NemotronH or Architecture.NemotronHMoe))
             throw new ArgumentException(
-                $"VulkanNemotronHTransformerModel requires Architecture.NemotronH, got {config.Architecture}.",
+                $"VulkanNemotronHTransformerModel requires Architecture.NemotronH/NemotronHMoe, got {config.Architecture}.",
                 nameof(config));
         if (config.HybridLayout is null)
             throw new ArgumentException("NemotronH config must have HybridLayout populated.", nameof(config));
@@ -429,6 +429,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         int ssmOrdinal = 0;
         int attentionLayerCount = 0;
         int maxIntermediate = 0;
+        (int NumExperts, int TopK, int MoeIntermediate)? moeSpec = null;
         for (int i = 0; i < config.NumLayers; i++)
         {
             ssmLayerOrdinal[i] = layout.LayerKind[i] == HybridLayerKind.Ssm ? ssmOrdinal++ : -1;
@@ -438,8 +439,17 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
             if (layout.LayerKind[i] == HybridLayerKind.Ffn)
             {
-                var ffn = cpuLayers[i].Ffn!;
-                if (ffn.UpOutputDim > maxIntermediate) maxIntermediate = ffn.UpOutputDim;
+                if (cpuLayers[i].Moe is { } moeLayer)
+                {
+                    // The shared expert's intermediate rides FfnIntermediate; routed rows have their own scratch.
+                    if (moeLayer.SharedIntermediateSize > maxIntermediate) maxIntermediate = moeLayer.SharedIntermediateSize;
+                    moeSpec = (moeLayer.NumExperts, moeLayer.NumExpertsPerTok, moeLayer.MoeIntermediateSize);
+                }
+                else
+                {
+                    var ffn = cpuLayers[i].Ffn!;
+                    if (ffn.UpOutputDim > maxIntermediate) maxIntermediate = ffn.UpOutputDim;
+                }
             }
         }
         if (maxIntermediate == 0) maxIntermediate = config.HiddenSize;
@@ -458,7 +468,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             qElems: config.NumAttentionHeads * config.HeadDim,
             kvElems: config.NumKvHeads * config.HeadDim,
             ssm: ssm,
-            initialSeqLen: 1);
+            initialSeqLen: 1,
+            moe: moeSpec);
 
         var ssmCache = new VulkanSsmStateCache(device, ssm, ssmOrdinal);
 
@@ -557,7 +568,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         var submit = device.CreateSubmitContext();
 
-        return new VulkanNemotronHTransformerModel(
+        MoeKernelSet? moeKernels = moeSpec is { } spec ? CreateMoeKernels(device, spvDir, spec.NumExperts) : null;
+
+        var created = new VulkanNemotronHTransformerModel(
             device, ownsDevice: false,
             config, weights, state, ssmCache,
             ssmLayerOrdinal, kvSlotForLayer, attentionLayerCount,
@@ -584,6 +597,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             conv1dCausal, siluInplace, mamba2Scan, mamba2ScanRegs, ssmDSkip, groupRmsNorm, reluSquared,
             ssmSplitXbc,
             submit);
+        created._moe = moeKernels;
+        return created;
     }
 
     /// <inheritdoc/>
@@ -775,6 +790,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 case HybridLayerKind.Attention:
                     RecordAttentionLayer(cmdBuf, layer, lw.Attention!.Value, seqLen, positions,
                         numHeads, numKvHeads, headDim, kvCache);
+                    break;
+                case HybridLayerKind.Ffn when lw.Moe is { } moeLayer:
+                    RecordMoeFfnLayer(cmdBuf, moeLayer, seqLen);
                     break;
                 case HybridLayerKind.Ffn:
                     RecordFfnLayer(cmdBuf, lw.Ffn!.Value, seqLen);
@@ -1261,6 +1279,155 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             outputDim: ffnW.DownOutputDim, inputDim: ffnW.DownInputDim, seqLen: seqLen);
     }
 
+    /// <summary>
+    /// Kernels of the nemotron_h_moe routed layer (#402). Created only when the model has a router tensor; the dense Nemotron-H path never
+    /// touches them. Expert banks are Q8_0 / Q5_1 (Q5_0 repacked at upload), so only those indexed matmuls exist here.
+    /// </summary>
+    private sealed class MoeKernelSet : IDisposable
+    {
+        public required MoeTopKSigmoidBiasF32Kernel Router { get; init; }
+        public required MoeBroadcastF32Kernel Broadcast { get; init; }
+        public required MoeWeightedScatterF32Kernel Scatter { get; init; }
+        public required MoeIndexedMatmulQ5_1F32Kernel IndexedQ5_1 { get; init; }
+        public required MoeIndexedMatmulQ8_0F32Kernel IndexedQ8_0 { get; init; }
+        public QuantizeQ8_1RowsKernel? Quantize { get; init; }
+        public MoeIndexedMatmulQ5_1MmvqKernel? MmvqQ5_1 { get; init; }
+        public MoeIndexedMatmulQ8_0MmvqKernel? MmvqQ8_0 { get; init; }
+        public required VulkanDevice.Buffer UnitScale { get; init; }   // per-expert output scale, all ones
+
+        public bool CanMmvq => Quantize is not null && MmvqQ5_1 is not null && MmvqQ8_0 is not null;
+
+        public void Invalidate()
+        {
+            Router.InvalidateDescriptorCache(); Broadcast.InvalidateDescriptorCache(); Scatter.InvalidateDescriptorCache();
+            IndexedQ5_1.InvalidateDescriptorCache(); IndexedQ8_0.InvalidateDescriptorCache();
+            Quantize?.InvalidateDescriptorCache(); MmvqQ5_1?.InvalidateDescriptorCache(); MmvqQ8_0?.InvalidateDescriptorCache();
+        }
+
+        public void Dispose()
+        {
+            Router.Dispose(); Broadcast.Dispose(); Scatter.Dispose(); IndexedQ5_1.Dispose(); IndexedQ8_0.Dispose();
+            Quantize?.Dispose(); MmvqQ5_1?.Dispose(); MmvqQ8_0?.Dispose(); UnitScale.Dispose();
+        }
+    }
+
+    private MoeKernelSet? _moe;
+
+    /// <summary><c>DOTLLM_VK_NEMOTRON_MOE_MMVQ=0</c> routes the routed experts through the F32-activation indexed kernels (exact reference arm) instead of dp4a MMVQ.</summary>
+    internal static bool MoeMmvqEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_VK_NEMOTRON_MOE_MMVQ") != "0";
+
+    private static MoeKernelSet CreateMoeKernels(VulkanDevice device, string spvDir, int numExperts)
+    {
+        var ones = device.AllocateDeviceLocal((long)numExperts * sizeof(float));
+        var host = new float[numExperts];
+        Array.Fill(host, 1.0f);
+        device.Upload(host, ones);
+        bool mmvq = MoeMmvqEnabled && device.HasIntegerDotProduct;
+        return new MoeKernelSet
+        {
+            Router = MoeTopKSigmoidBiasF32Kernel.Create(device, spvDir),
+            Broadcast = MoeBroadcastF32Kernel.Create(device, spvDir),
+            Scatter = MoeWeightedScatterF32Kernel.Create(device, spvDir),
+            IndexedQ5_1 = MoeIndexedMatmulQ5_1F32Kernel.Create(device, spvDir),
+            IndexedQ8_0 = MoeIndexedMatmulQ8_0F32Kernel.Create(device, spvDir),
+            Quantize = mmvq ? QuantizeQ8_1RowsKernel.TryCreate(device, spvDir) : null,
+            MmvqQ5_1 = mmvq ? MoeIndexedMatmulQ5_1MmvqKernel.TryCreate(device, spvDir) : null,
+            MmvqQ8_0 = mmvq ? MoeIndexedMatmulQ8_0MmvqKernel.TryCreate(device, spvDir) : null,
+            UnitScale = ones,
+        };
+    }
+
+    /// <summary>Which expert-matmul arm the last routed layer used; read by tests to prove the intended path ran.</summary>
+    internal static class MoePathCounters
+    {
+        public static long Mmvq;
+        public static long F32Indexed;
+        public static void Reset() { Interlocked.Exchange(ref Mmvq, 0); Interlocked.Exchange(ref F32Indexed, 0); }
+    }
+
+    /// <summary>
+    /// nemotron_h_moe routed-MoE FFN (#402), the Vulkan twin of <c>NemotronHTransformerModel.ForwardMoeFfnBody</c> (llama.cpp
+    /// <c>build_moe_ffn</c>): router on the full normed input, sigmoid + selection-only bias, top-k, weights from the unbiased
+    /// probabilities (renorm, x scale), ungated relu-squared routed experts, plus the unweighted ungated relu-squared shared expert.
+    /// Reads the pre-normed activations from <c>NormOutput</c>, leaves the result there. The shared expert runs first: it reads
+    /// <c>NormOutput</c>, which the routed scatter overwrites.
+    /// </summary>
+    private void RecordMoeFfnLayer(nint cmdBuf, VulkanNemotronHWeights.MoeLayerBuffers m, int seqLen)
+    {
+        var k = _moe ?? throw new InvalidOperationException("MoE kernels were not created for a model with a routed layer.");
+        int hidden = Config.HiddenSize;
+        int numE = m.NumExperts, topK = m.NumExpertsPerTok, inter = m.MoeIntermediateSize, sharedInter = m.SharedIntermediateSize;
+        int rows = seqLen * topK;
+
+        // Independent readers of NormOutput: shared-expert up and the router.
+        RecordMatmul(cmdBuf, m.SharedUp, m.SharedUpDeviceQuantType, _state.NormOutput, _state.FfnIntermediate,
+            outputDim: sharedInter, inputDim: hidden, seqLen: seqLen);
+        RecordMatmul(cmdBuf, m.Router, m.RouterDeviceQuantType, _state.NormOutput, _state.MoeRouterLogits!,
+            outputDim: numE, inputDim: hidden, seqLen: seqLen);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        _reluSquared.Record(cmdBuf, _state.FfnIntermediate, n: seqLen * sharedInter);
+        k.Router.Record(cmdBuf, _state.MoeRouterLogits!, m.SelectionBias, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
+            seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: m.NormalizeWeights, weightsScale: m.WeightsScale);
+        k.Broadcast.Record(cmdBuf, _state.NormOutput, _state.MoeExpandedInput!, seqLen: seqLen, topK: topK, hidden: hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        RecordMatmul(cmdBuf, m.SharedDown, m.SharedDownDeviceQuantType, _state.FfnIntermediate, _state.MoeSharedOut!,
+            outputDim: hidden, inputDim: sharedInter, seqLen: seqLen);
+        RecordExpertMatmul(cmdBuf, k, m.UpBankQuantType, m.UpBank, _state.MoeExpandedInput!, _state.MoeExpandedInputXq!, _state.MoeExpandedInputXds!,
+            _state.MoeUpInter!, mDim: inter, kDim: hidden, rows: rows, numExperts: numE);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        _reluSquared.Record(cmdBuf, _state.MoeUpInter!, n: rows * inter);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        RecordExpertMatmul(cmdBuf, k, m.DownBankQuantType, m.DownBank, _state.MoeUpInter!, _state.MoeUpInterXq!, _state.MoeUpInterXds!,
+            _state.MoeDownRows!, mDim: hidden, kDim: inter, rows: rows, numExperts: numE);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        k.Scatter.Record(cmdBuf, _state.MoeDownRows!, _state.MoeTopkWeights!, _state.NormOutput, seqLen: seqLen, topK: topK, hiddenSize: hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // Shared expert added unweighted (elementwise, so the in-place a = a + b alias is safe).
+        _add.Record(cmdBuf, _state.NormOutput, _state.MoeSharedOut!, _state.NormOutput, seqLen * hidden);
+    }
+
+    /// <summary>
+    /// One routed-expert projection over <paramref name="rows"/> (token, slot) rows: dp4a MMVQ on a Q8_1-quantized copy of the input when
+    /// available (the decode / default arm), else the F32-activation indexed kernel. <see cref="MoePathCounters"/> records which ran.
+    /// </summary>
+    private void RecordExpertMatmul(
+        nint cmdBuf, MoeKernelSet k, QuantizationType bankQt, VulkanDevice.Buffer bank,
+        VulkanDevice.Buffer x, VulkanDevice.Buffer xq, VulkanDevice.Buffer xds, VulkanDevice.Buffer y,
+        int mDim, int kDim, int rows, int numExperts)
+    {
+        var indices = _state.MoeTopkIndices!;
+        if (k.CanMmvq && bankQt is QuantizationType.Q5_1 or QuantizationType.Q8_0)
+        {
+            Interlocked.Increment(ref MoePathCounters.Mmvq);
+            k.Quantize!.Record(cmdBuf, x, xq, xds, n: rows, k: kDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            if (bankQt == QuantizationType.Q5_1)
+                k.MmvqQ5_1!.Record(cmdBuf, bank, xq, xds, indices, y, k.UnitScale, m: mDim, k: kDim, n: rows, numExperts: numExperts);
+            else
+                k.MmvqQ8_0!.Record(cmdBuf, bank, xq, xds, indices, y, m: mDim, k: kDim, n: rows, numExperts: numExperts);
+            return;
+        }
+        Interlocked.Increment(ref MoePathCounters.F32Indexed);
+        switch (bankQt)
+        {
+            case QuantizationType.Q5_1:
+                k.IndexedQ5_1.Record(cmdBuf, bank, x, indices, y, k.UnitScale, m: mDim, k: kDim, n: rows, numExperts: numExperts);
+                break;
+            case QuantizationType.Q8_0:
+                k.IndexedQ8_0.Record(cmdBuf, bank, x, indices, y, m: mDim, k: kDim, n: rows, numExperts: numExperts);
+                break;
+            default:
+                throw new InvalidOperationException($"No indexed expert kernel for a resident {bankQt} bank (upload should have refused it).");
+        }
+    }
+
     private void InvalidateKernelCaches()
     {
         _matmul.InvalidateDescriptorCache();
@@ -1318,6 +1485,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _groupRmsNorm.InvalidateDescriptorCache();
         _reluSquared.InvalidateDescriptorCache();
         _ssmSplitXbc.InvalidateDescriptorCache();
+        _moe?.Invalidate();
     }
 
     /// <summary>
@@ -1634,6 +1802,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         // The GgufFile is owned by the BuildFromGguf caller, so it is not disposed here.
         _cpuModel?.Dispose();
 
+        _moe?.Dispose();
         _ssmSplitXbc.Dispose();
         _reluSquared.Dispose();
         _groupRmsNorm.Dispose();

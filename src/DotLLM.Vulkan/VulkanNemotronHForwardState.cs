@@ -57,6 +57,20 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
     // ── FFN scratch ───────────────────────────────────────────────────────
     public VulkanDevice.Buffer FfnIntermediate { get; private set; } = null!;
 
+    // ── MoE scratch (nemotron_h_moe, #402); null when the model has no routed layers ─────────────────────────
+    private readonly (int NumExperts, int TopK, int MoeIntermediate)? _moe;
+    public VulkanDevice.Buffer? MoeRouterLogits { get; private set; }      // [seqLen, numExperts]
+    public VulkanDevice.Buffer? MoeTopkIndices { get; private set; }       // [seqLen, topK] int32
+    public VulkanDevice.Buffer? MoeTopkWeights { get; private set; }       // [seqLen, topK]
+    public VulkanDevice.Buffer? MoeExpandedInput { get; private set; }     // [seqLen*topK, hidden]  (token row repeated per slot)
+    public VulkanDevice.Buffer? MoeExpandedInputXq { get; private set; }   // Q8_1 packed int8 of MoeExpandedInput (MMVQ decode path)
+    public VulkanDevice.Buffer? MoeExpandedInputXds { get; private set; }
+    public VulkanDevice.Buffer? MoeUpInter { get; private set; }           // [seqLen*topK, moeIntermediate]
+    public VulkanDevice.Buffer? MoeUpInterXq { get; private set; }         // Q8_1 packed int8 of the relu^2 output (MMVQ down)
+    public VulkanDevice.Buffer? MoeUpInterXds { get; private set; }
+    public VulkanDevice.Buffer? MoeDownRows { get; private set; }          // [seqLen*topK, hidden]
+    public VulkanDevice.Buffer? MoeSharedOut { get; private set; }         // [seqLen, hidden] shared-expert output
+
     // ── Logits + positions ────────────────────────────────────────────────
     public VulkanDevice.Buffer Logits { get; private set; }
     public VulkanDevice.Buffer PositionsBuffer { get; private set; }
@@ -70,9 +84,11 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
         int hiddenSize, int maxIntermediateSize, int vocabSize,
         int qElems, int kvElems,
         MambaSsmConfig ssm,
-        int initialSeqLen)
+        int initialSeqLen,
+        (int NumExperts, int TopK, int MoeIntermediate)? moe = null)
     {
         _device = device;
+        _moe = moe;
         _hiddenSize = hiddenSize;
         _maxIntermediateSize = maxIntermediateSize;
         _vocabSize = vocabSize;
@@ -137,6 +153,26 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
 
         FfnIntermediate = _device.AllocateDeviceLocal(ffnBytes);
 
+        long moeBytes = 0;
+        if (_moe is { } moe)
+        {
+            long rows = (long)seqLen * moe.TopK;
+            MoeRouterLogits = _device.AllocateDeviceLocal((long)seqLen * moe.NumExperts * sizeof(float));
+            MoeTopkIndices = _device.AllocateDeviceLocal(rows * sizeof(int));
+            MoeTopkWeights = _device.AllocateDeviceLocal(rows * sizeof(float));
+            MoeExpandedInput = _device.AllocateDeviceLocal(rows * _hiddenSize * sizeof(float));
+            MoeExpandedInputXq = _device.AllocateDeviceLocal(Kernels.QuantizeQ8_1RowsKernel.PackedBytes((int)rows, _hiddenSize));
+            MoeExpandedInputXds = _device.AllocateDeviceLocal(Kernels.QuantizeQ8_1RowsKernel.ScaleBytes((int)rows, _hiddenSize));
+            MoeUpInter = _device.AllocateDeviceLocal(rows * moe.MoeIntermediate * sizeof(float));
+            MoeUpInterXq = _device.AllocateDeviceLocal(Kernels.QuantizeQ8_1RowsKernel.PackedBytes((int)rows, moe.MoeIntermediate));
+            MoeUpInterXds = _device.AllocateDeviceLocal(Kernels.QuantizeQ8_1RowsKernel.ScaleBytes((int)rows, moe.MoeIntermediate));
+            MoeDownRows = _device.AllocateDeviceLocal(rows * _hiddenSize * sizeof(float));
+            MoeSharedOut = _device.AllocateDeviceLocal(hiddenBytes);
+            moeBytes = MoeRouterLogits.Size + MoeTopkIndices.Size + MoeTopkWeights.Size + MoeExpandedInput.Size
+                     + MoeExpandedInputXq.Size + MoeExpandedInputXds.Size + MoeUpInter.Size + MoeUpInterXq.Size
+                     + MoeUpInterXds.Size + MoeDownRows.Size + MoeSharedOut.Size;
+        }
+
         // Resize positions buffer (host writes positions per forward).
         PositionsBuffer.Dispose();
         PositionsBuffer = _device.Allocate((long)seqLen * sizeof(int));
@@ -145,7 +181,7 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
         AllocatedBytes = hiddenBytes * 3 + qBytes * 2 + kvBytes * 2 + ffnBytes
                        + zxbcdtBytes + convInputBytes + xbcBytes + dtBytes
                        + ssmXBytes + ssmBcBytes * 2 + ssmYBytes + ssmZBytes
-                       + (long)_vocabSize * sizeof(float) + (long)seqLen * sizeof(int);
+                       + (long)_vocabSize * sizeof(float) + (long)seqLen * sizeof(int) + moeBytes;
     }
 
     private void ReleaseLayerScratch()
@@ -169,6 +205,10 @@ internal sealed class VulkanNemotronHForwardState : IDisposable
         SsmY?.Dispose();
         SsmZ?.Dispose();
         FfnIntermediate?.Dispose();
+        MoeRouterLogits?.Dispose(); MoeTopkIndices?.Dispose(); MoeTopkWeights?.Dispose();
+        MoeExpandedInput?.Dispose(); MoeExpandedInputXq?.Dispose(); MoeExpandedInputXds?.Dispose();
+        MoeUpInter?.Dispose(); MoeUpInterXq?.Dispose(); MoeUpInterXds?.Dispose();
+        MoeDownRows?.Dispose(); MoeSharedOut?.Dispose();
     }
 
     public void Dispose()
