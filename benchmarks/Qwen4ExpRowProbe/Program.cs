@@ -121,6 +121,19 @@ Log($"loaded in {sw0.Elapsed.TotalSeconds:F0} s");
 int vocab = cfg.VocabSize;
 var tok = GgufTokenizerFactory.Load(file.Metadata);
 
+// Diverse greedy-identity prompts (#909 follow-up: Q8-activation prefill experiment). Ids 0..7 natural prompts, 8..9 long windows (> 512 tokens: multi-chunk prefill).
+string[] idPrompts =
+{
+    "You are a careful assistant. A train leaves city A at 9:00 travelling at 80 km/h and another leaves city B, 420 km away, at 10:00 travelling toward A at 100 km/h. At what time do they meet? Work through the problem step by step and then state the answer clearly.",
+    "Once upon a time, in a village at the edge of a vast and silent forest, there lived an old clockmaker who had never once been late for anything. One winter morning, however, every clock in his shop stopped at exactly the same moment. Continue the story.",
+    "Translate the following paragraph into French and then into German, keeping the tone formal: The committee will review all submitted proposals during the first week of March and notify applicants of its decision no later than the end of the month.",
+    "Write a SQL query for a PostgreSQL database with tables customers(id, name, country), orders(id, customer_id, created_at, total) and order_items(order_id, sku, qty, price) that returns, for each country, the three customers with the highest total spend in 2024, together with their share of that country's revenue.",
+    "Explain the difference between a mutex, a semaphore and a condition variable. Give a short C++ example of a bounded producer-consumer queue using std::condition_variable and discuss how spurious wakeups are handled.",
+    "Compose a sonnet about a lighthouse keeper who has begun to suspect that the light is guiding something other than ships. Use iambic pentameter and a volta at line nine.",
+    "{\"task\": \"extract\", \"text\": \"Dr. Amara Okafor joined Helios Biotech in Lagos on 14 June 2021 as Chief Scientist, after nine years at the University of Edinburgh.\", \"fields\": [\"person\", \"organisation\", \"city\", \"date\", \"role\"]} Respond with a single JSON object containing the extracted fields.",
+    "List the planets of the solar system in order from the Sun and for each give its approximate diameter in kilometres, its number of known moons, and one distinctive feature. Present the result as a markdown table and add two sentences about why Pluto was reclassified.",
+};
+
 bool realText = true;
 int[] longText = null!;
 int[] Ids(int n, int seed)
@@ -372,6 +385,19 @@ void Exec(string line, StringBuilder o)
             for (int pi = 0; pi < prompts.Length; pi++)
                 if (a[1] == "all" || a[1] == pi.ToString())
                     SpecRun(tok.Encode(prompts[pi]).ToArray(), int.Parse(a[2]), int.Parse(a[3]), o, $"prompt{pi}");
+            break;
+        }
+        case "paths":
+            o.AppendLine("paths " + model.PathCounterReport());
+            break;
+        case "specid":   // specid <idx|all> <n> <k> : greedy plain-vs-MTP identity over idPrompts (+ long windows 8,9 = Ids(700..1400))
+        {
+            for (int pi = 0; pi < idPrompts.Length + 2; pi++)
+                if (a[1] == "all" || a[1] == pi.ToString())
+                {
+                    int[] ids = pi < idPrompts.Length ? tok.Encode(idPrompts[pi]).ToArray() : Ids(pi == 8 ? 700 : 1400, 11);
+                    SpecRun(ids, int.Parse(a[2]), int.Parse(a[3]), o, $"id{pi}");
+                }
             break;
         }
         case "layerdiv":   // layerdiv <promptIdx> <R> <skip> : per-layer residual of row j of an R-row verify forward vs the same token run 1-row (identical state), first divergent layer

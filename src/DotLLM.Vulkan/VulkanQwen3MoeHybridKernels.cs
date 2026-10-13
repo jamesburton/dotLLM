@@ -54,6 +54,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulQ8_0MmvqWideKernel? MatMulQ8MmvqWideKSplit { get; private set; }
     /// <summary>Q8_0 multi-column MMVQ GEMV for 2..8 rows (#876); null when disabled (<c>DOTLLM_VK_SMALLROW_GEMV=0</c>) or unsupported.</summary>
     public MatMulQ8_0MmvqMultiKernel? MatMulQ8MmvqMulti { get; private set; }
+    /// <summary>Q8_0 dp4a MMQ GEMM over pre-quantised Q8_1 activations; only used by the opt-in Q8-activation prefill (<c>DOTLLM_VK_Q4E_PREFILL_Q8ACT</c>).</summary>
+    public MatMulQ8_0MmqKernel? MatMulQ8Mmq { get; private set; }
     /// <summary>F32 multi-column GEMV for 2..8 rows (#876); null when disabled or unsupported.</summary>
     public MatMulF32GemvMultiKernel? MatMulF32Multi { get; private set; }
     /// <summary>F16 multi-column GEMV for 2..8 rows (#876); null when unsupported.</summary>
@@ -510,6 +512,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         kernels.MatMulIq4XsMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.IQ4_XS);
         kernels.MatMulIq3SMulti = MatMulQuantGemvMultiKernel.TryCreate(device, spvDir, QuantGemvMultiFormat.IQ3_S);
         kernels.MatMulQ8MmvqMulti = MatMulQ8_0MmvqMultiKernel.TryCreate(device, spvDir);
+        if (device.HasIntegerDotProduct) kernels.MatMulQ8Mmq = MatMulQ8_0MmqKernel.TryCreate(device, spvDir);
         if (Environment.GetEnvironmentVariable("DOTLLM_VK_GDN_CONV_FUSED") != "0" && GdnConvSiluF32Kernel.IsSupportedOn(spvDir))
             kernels.GdnConvSilu = GdnConvSiluF32Kernel.Create(device, spvDir);
 
@@ -721,6 +724,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ8MmvqWideRows?.InvalidateDescriptorCache();
         MatMulQ8MmvqWideKSplit?.InvalidateDescriptorCache();
         MatMulQ8MmvqMulti?.InvalidateDescriptorCache();
+        MatMulQ8Mmq?.InvalidateDescriptorCache();
         MatMulF32Multi?.InvalidateDescriptorCache();
         MatMulF16Multi?.InvalidateDescriptorCache();
         MatMulQ4KMulti?.InvalidateDescriptorCache();
@@ -789,6 +793,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulBf16Gemm.Dispose();
         MatMulBf16Multi?.Dispose();
         MatMulQ8MmvqMulti?.Dispose();
+        MatMulQ8Mmq?.Dispose();
         MatMulF32Multi?.Dispose();
         MatMulF16Multi?.Dispose();
         MatMulQ4KMulti?.Dispose();

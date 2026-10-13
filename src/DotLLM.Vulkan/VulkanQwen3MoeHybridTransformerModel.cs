@@ -108,11 +108,11 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     private readonly VulkanDevice.Buffer? _moeUnitScale;
 
     /// <summary>Which routed-MoE fast paths were RECORDED (test hook: proves a branch was taken, not merely that a kernel exists).</summary>
-    internal enum MoePath { GroupedPrefill, GroupedGateUpNotQ4K, GroupedLegacyDown, MmvqDown, MmvqLegacyDown, FusedDecode, IqMmvqGateUp, IqMmvqDown, GroupedIqGateUp, GroupedIqDown }
+    internal enum MoePath { GroupedPrefill, GroupedGateUpNotQ4K, GroupedLegacyDown, MmvqDown, MmvqLegacyDown, FusedDecode, IqMmvqGateUp, IqMmvqDown, GroupedIqGateUp, GroupedIqDown, PrefillQ8ActGateUp, PrefillQ8ActDown }
     internal readonly long[] MoePathCounts = new long[Enum.GetValues<MoePath>().Length];
 
     /// <summary>Record-time counters for the 2..8-row fast paths (#876): prove a fast path ran by counting, not by IsSupported.</summary>
-    internal enum SmallRowPath { F32Multi, F16Multi, Q8Multi, MoeQ4KMr, MoeQ5_1Mr, QuantMulti }
+    internal enum SmallRowPath { F32Multi, F16Multi, Q8Multi, MoeQ4KMr, MoeQ5_1Mr, QuantMulti, PrefillQ8Mmq }
     internal readonly long[] SmallRowPathCounts = new long[Enum.GetValues<SmallRowPath>().Length];
     private void CountSmallRow(SmallRowPath p) => SmallRowPathCounts[(int)p]++;
     private void CountMoePath(MoePath p) => MoePathCounts[(int)p]++;
@@ -926,7 +926,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         var gdnStateBuf = gdnCache.GetGdnStateBuffer(gdnOrdinal);
 
         // ── 1. Projections ───────────────────────────────────────────────────
-        bool gdnXq = (seqLen == 1 || SmallRowQ8(seqLen)) && gdnW.QkvDeviceQuantType == QuantizationType.Q8_0 && gdnW.GateDeviceQuantType == QuantizationType.Q8_0
+        bool gdnXq = (seqLen == 1 || SmallRowQ8(seqLen) || PrefillQ8Gemm(seqLen)) && gdnW.QkvDeviceQuantType == QuantizationType.Q8_0 && gdnW.GateDeviceQuantType == QuantizationType.Q8_0
             && gdnW.QkvInputDim == gdnW.GateInputDim && TryPrepareQ8Activations(cmdBuf, _state.NormOutput, gdnW.QkvInputDim, seqLen);
         RecordMatmul(cmdBuf, gdnW.QkvWeight, gdnW.QkvDeviceQuantType,
             _state.NormOutput, _state.GdnQkvBuf,
@@ -1103,7 +1103,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         int kvStride = numKvHeads * headDim;
 
         // 1. Fused Q+Gate projection.
-        bool attnXq = (seqLen == 1 || SmallRowQ8(seqLen)) && attnW.QDeviceQuantType == QuantizationType.Q8_0 && attnW.KDeviceQuantType == QuantizationType.Q8_0
+        bool attnXq = (seqLen == 1 || SmallRowQ8(seqLen) || PrefillQ8Gemm(seqLen)) && attnW.QDeviceQuantType == QuantizationType.Q8_0 && attnW.KDeviceQuantType == QuantizationType.Q8_0
             && attnW.VDeviceQuantType == QuantizationType.Q8_0 && attnW.QInputDim == attnW.KInputDim && attnW.QInputDim == attnW.VInputDim
             && TryPrepareQ8Activations(cmdBuf, _state.NormOutput, attnW.QInputDim, seqLen);
         RecordMatmul(cmdBuf, attnW.QWeight, attnW.QDeviceQuantType,
@@ -2009,7 +2009,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
 
         // Issue #637: prefill batches group the routed rows by expert and run each expert's weights through a coopmat GEMM once per
         // 16-row tile (the indexed kernels below re-read an expert's weights for every routed row). Resident Q4_K gate/up + Q5_K/Q6_K down only (UD-Q4_K_M mixes both down types).
-        bool grouped = seqLen >= GroupedMinTokens
+        bool q8ActMoe = (PrefillQ8ActMode & 2) != 0 && seqLen >= GroupedMinTokens;   // opt-in: Q8-activation MMVQ for prefill rows too (no grouped coopmat)
+        bool grouped = seqLen >= GroupedMinTokens && !q8ActMoe
             && GroupedKernelsFit(moeW, hidden, interm)
             && _kernels.MoeExpertOffsets is not null && _kernels.MoeExpandGroupByExpert is not null && _kernels.MoeUngroupScatter is not null
             && (hidden % 256) == 0;
@@ -2055,6 +2056,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
             && (hidden % MoeIndexedMatmulQ4KMmqKernel.Q4_KGroupSize) == 0;
         if (useGateUpMmq)
         {
+            if (q8ActMoe) CountMoePath(MoePath.PrefillQ8ActGateUp);
             _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf,
                 _state.MoeExpandedInput, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
                 n: expandedRows, k: hidden);
@@ -2120,7 +2122,8 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
         // 6. Indexed down matmul. #383 follow-up: same dp4a swap as gate/up, for the
         // Q5_K-resident down bank (K=intermediate, MoeSiluInter as input — a
         // different activation buffer than gate/up's, so its own quantize pass).
-        bool downMmvq = (decodeMmvq || IsIqBankQuant(moeW.W2QuantType)) && _kernels.QuantizeQ8_1RowsActivations is not null && DownMmvqFits(moeW.W2QuantType, interm);
+        bool q8ActDown = (PrefillQ8ActMode & 4) != 0 && seqLen >= GroupedMinTokens;
+        bool downMmvq = (decodeMmvq || q8ActDown || IsIqBankQuant(moeW.W2QuantType)) && _kernels.QuantizeQ8_1RowsActivations is not null && DownMmvqFits(moeW.W2QuantType, interm);
         bool useDownMmq = _moeIndexedMmqEnabled
             && _kernels.MoeIndexedMatmulQ5KMmq is not null
             && moeW.W2QuantType == QuantizationType.Q5_K
@@ -2132,6 +2135,7 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                 n: expandedRows, k: interm);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             CountMoePath(MoePath.MmvqDown);
+            if (q8ActDown && !decodeMmvq) CountMoePath(MoePath.PrefillQ8ActDown);
             if (IsLegacyQuant(moeW.W2QuantType)) CountMoePath(MoePath.MmvqLegacyDown);
             if (IsIqBankQuant(moeW.W2QuantType)) CountMoePath(MoePath.IqMmvqDown);
             RecordDownMmvq(cmdBuf, moeW.W2QuantType, moeW, hidden, interm, expandedRows, numE, multiRow: EffMoeMrMinRows > 0 && seqLen >= EffMoeMrMinRows && SmallRowGemvEnabled);
@@ -2512,6 +2516,13 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
     internal static int MoeMrMinRows { get; set; } =
         int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_MR_MIN_ROWS"), out int mrMin) && mrMin >= 0 ? mrMin : 2;
 
+    /// <summary>Opt-in (<c>DOTLLM_VK_Q4E_PREFILL_Q8ACT=1</c>): &gt;= 9-row forwards quantise activations to Q8_1 like the 1..8-row cluster instead of reading them unquantised (greedy-identity experiment).</summary>
+    /// <summary>Mode bits: 1 = dense Q8_0 projections through the dp4a MMQ GEMM, 2 = routed MoE without the grouped coopmat path (existing Q8_1 MMQ gate/up), 4 = routed down bank via the Q8_1 MMVQ; env <c>=1</c> means 7 (all).</summary>
+    internal static int PrefillQ8ActMode { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_VK_Q4E_PREFILL_Q8ACT") is { Length: > 0 } pq && int.TryParse(pq, out int pm) ? (pm == 1 ? 7 : pm) : 0;
+    private bool PrefillQ8Gemm(int seqLen)
+        => (PrefillQ8ActMode & 1) != 0 && seqLen > MatMulQ8_0MmvqMultiKernel.MaxColumns && _kernels.MatMulQ8Mmq is not null && _kernels.MatMulQ8Mmvq is not null
+           && _kernels.QuantizeQ8_1RowsActivations is not null;
+
     /// <summary>True for 2..8-row forwards that have the Q8_0 multi-column MMVQ GEMV (#876).</summary>
     private bool SmallRowQ8(int seqLen)
         => SmallRowGemvEnabled && seqLen >= 2 && MatMulQ8_0MmvqMultiKernel.Accepts(seqLen, 32) && _kernels.MatMulQ8MmvqMulti is not null
@@ -2541,6 +2552,9 @@ public sealed partial class VulkanQwen3MoeHybridTransformerModel : IModel
                     _kernels.MatMulQ8MmvqMulti!.Record(cmdBuf, weights, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, output,
                         m: outputDim, k: inputDim, n: seqLen);
                 }   // #876: 2..8 rows read the weights once instead of the 128x128 coopmat GEMM
+                else if (PrefillQ8Gemm(seqLen) && (inputDim & 31) == 0 && SmallRowQ8Prepare(cmdBuf, input, inputDim, seqLen, xqReady))
+                { CountSmallRow(SmallRowPath.PrefillQ8Mmq); _kernels.MatMulQ8Mmq!.Record(cmdBuf, weights, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds, output,
+                        m: outputDim, k: inputDim, n: seqLen); }   // opt-in Q8-activation prefill: same activation quantisation as the 1..8-row cluster
                 else if (_kernels.MatMulQ8GemmCoopmat is not null)
                     _kernels.MatMulQ8GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else

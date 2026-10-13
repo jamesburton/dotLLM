@@ -337,6 +337,18 @@ public sealed unsafe partial class VulkanQwen4ExpTransformerModel : IModel
         set => VulkanQwen3MoeHybridTransformerModel.SmallRowGemvEnabled = value;
     }
 
+    /// <summary>Opt-in greedy-identity experiment: &gt;= 9-row forwards quantise activations to Q8_1 (dense Q8_0 via dp4a MMQ, routed MoE via MMVQ) like the 1..8-row cluster. Env <c>DOTLLM_VK_Q4E_PREFILL_Q8ACT=1</c>.</summary>
+    public static int PrefillQ8Act
+    {
+        get => VulkanQwen3MoeHybridTransformerModel.PrefillQ8ActMode;
+        set => VulkanQwen3MoeHybridTransformerModel.PrefillQ8ActMode = value;
+    }
+
+    /// <summary>Diagnostic: record-time path counters (proves which kernels a forward actually used).</summary>
+    public string PathCounterReport()
+        => string.Join(' ', Enum.GetValues<VulkanQwen3MoeHybridTransformerModel.SmallRowPath>().Select(p => $"{p}={SmallRowPathCount(p)}"))
+           + " | " + string.Join(' ', Enum.GetValues<VulkanQwen3MoeHybridTransformerModel.MoePath>().Select(p => $"{p}={MoePathCount(p)}"));
+
     /// <summary>Diagnostic (#885): with <see cref="StageProfile"/> on, charge stage deltas from GPU timestamps inside the one command buffer instead of submit+wait per stage.</summary>
     public static bool StageTimestamps
     {
