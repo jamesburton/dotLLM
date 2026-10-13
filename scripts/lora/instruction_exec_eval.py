@@ -19,6 +19,7 @@ new (deterministic constraint checks instead of a judge). The full open-ended ju
 """
 from __future__ import annotations
 
+import gc
 import os
 import re
 import sys
@@ -132,6 +133,12 @@ def eval_instruction_inproc(
             text = e["instruction"]
         prompt_ids.append(tokenizer(text, add_special_tokens=not has_template)["input_ids"])
 
+    # See csharp_exec_eval.eval_csharp_exec / bitdistill.eval_gsm8k for why: DynamicCache's
+    # torch.cat-per-step growth means the caching allocator's reservation from this call can
+    # carry over to whatever runs next in this process (Windows WDDM silent-paging class of bug).
+    if device.type == "cuda":
+        gc.collect(); torch.cuda.empty_cache()
+
     satisfied = 0
     with torch.no_grad():
         for i in range(0, len(examples), chunk):
@@ -154,10 +161,15 @@ def eval_instruction_inproc(
                     ok = False
                 if ok:
                     satisfied += 1
+            del out
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     model.config.use_cache = prev_cache
     if was_training:
         model.train()
+    if device.type == "cuda":
+        gc.collect(); torch.cuda.empty_cache()
     return satisfied / len(examples)
 
 

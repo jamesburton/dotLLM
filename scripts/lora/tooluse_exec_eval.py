@@ -22,6 +22,7 @@ is disjoint — same held-out convention as ``capability_data.py``).
 """
 from __future__ import annotations
 
+import gc
 import json
 import os
 import re
@@ -177,6 +178,12 @@ def eval_tooluse_inproc(
     # Prompts are already chat-templated (add_generation_prompt) at load time → no special tokens.
     prompt_ids = [tokenizer(e["prompt"], add_special_tokens=False)["input_ids"] for e in examples]
 
+    # See csharp_exec_eval.eval_csharp_exec / bitdistill.eval_gsm8k for why: DynamicCache's
+    # torch.cat-per-step growth means the caching allocator's reservation from this call can
+    # carry over to whatever runs next in this process (Windows WDDM silent-paging class of bug).
+    if device.type == "cuda":
+        gc.collect(); torch.cuda.empty_cache()
+
     correct = 0
     with torch.no_grad():
         for i in range(0, len(examples), chunk):
@@ -198,10 +205,15 @@ def eval_tooluse_inproc(
                     name_ok = call[0] == examples[j]["gold_name"]
                     if name_ok and call[1] == examples[j]["gold_args"]:
                         correct += 1
+            del out
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     model.config.use_cache = prev_cache
     if was_training:
         model.train()
+    if device.type == "cuda":
+        gc.collect(); torch.cuda.empty_cache()
     return correct / len(examples)
 
 

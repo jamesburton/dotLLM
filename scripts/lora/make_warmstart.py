@@ -53,7 +53,8 @@ def main():
 
     calib = bdata.cpt_token_stream(tok, args.seq_len, dataset_name=args.cpt_dataset,
                                    dataset_config=args.cpt_config,
-                                   local_parquet=args.cpt_local_parquet, seed=4242)
+                                   local_parquet=args.cpt_local_parquet, seed=4242,
+                                   shuffle_buffer=512)  # warm-start needs few seqs; small prefetch
     t0 = time.time()
     stats = gptq_init.gptq_warmstart_init(
         student, calib, device,
@@ -61,7 +62,7 @@ def main():
         hessian_device=("cpu" if args.hessian_cpu else None))
     print(f"[warmstart] DONE in {time.time() - t0:.0f}s; aggregate MSE "
           f"{stats['mse_absmean']:.3e} -> {stats['mse_warmstart']:.3e} "
-          f"({100 * stats['mse_reduction']:.1f}%)", flush=True)
+          f"({stats['mse_reduction']:.1f}%)", flush=True)  # mse_reduction is already a percent
 
     ck = os.path.join(args.out, "ckpt_warmstart")
     bd.save_checkpoint(student, ck, 0, 0,

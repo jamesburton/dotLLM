@@ -71,6 +71,7 @@ except Exception:
     pass
 
 import argparse
+import gc
 import itertools
 import json
 import math
@@ -450,6 +451,13 @@ def _extract_number(text: str) -> str:
     return nums[-1].rstrip(".") if nums else ""
 
 
+def _cuda_mem_snapshot(device) -> str:
+    if device.type != "cuda":
+        return ""
+    a, r = torch.cuda.memory_allocated() / 2**30, torch.cuda.memory_reserved() / 2**30
+    return f" [cuda_alloc={a:.2f}G cuda_resv={r:.2f}G]"
+
+
 def eval_gsm8k(model, tokenizer, examples: list, device,
                max_new_tokens: int = 256, chunk: int = 16) -> float:
     """Greedy-decode GSM8K prompts (batched, left-padded); exact-match accuracy of the
@@ -464,6 +472,16 @@ def eval_gsm8k(model, tokenizer, examples: list, device,
     model.config.use_cache = True
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (tokenizer.eos_token_id or 0)
     correct = 0
+    # DynamicCache grows via torch.cat every decode step (never in-place) -- the caching
+    # allocator's reserved pool this call's generate() ends up needing can persist as "reserved
+    # but idle" long after the call returns (PyTorch never returns segments to the OS except via
+    # explicit empty_cache()), so a LATER eval_gsm8k call in the same process inherits whatever
+    # the FIRST call's reservation high-water-mark left behind, on top of its own -- flushing only
+    # between chunks (below) doesn't touch this entry-time carryover. Flush before starting too.
+    if device.type == "cuda":
+        gc.collect()
+        torch.cuda.empty_cache()
+    print(f"[eval_gsm8k] entry{_cuda_mem_snapshot(device)}", flush=True)
     with torch.no_grad():
         for i in range(0, len(examples), chunk):
             batch = examples[i:i + chunk]
@@ -480,9 +498,17 @@ def eval_gsm8k(model, tokenizer, examples: list, device,
                 gen = tokenizer.decode(out[j, maxlen:], skip_special_tokens=True).split("Question:")[0]
                 if _extract_number(gen) == e["answer"] and e["answer"] != "":
                     correct += 1
+            del out                       # each chunk's KV-cache has a different shape/size than
+            if device.type == "cuda":     # the next; without a flush the caching allocator's reserved
+                torch.cuda.empty_cache()  # pool grows chunk-over-chunk (same class of bug as the
+                                          # training-loop leak fixed earlier -- WDDM host-RAM paging).
     model.config.use_cache = prev_cache
     if was_training:
         model.train()
+    if device.type == "cuda":     # symmetric with the entry-flush above -- don't leave this
+        gc.collect()               # call's own reservation high-water-mark for whatever runs
+        torch.cuda.empty_cache()   # next (more training steps, or the NEXT eval_gsm8k call).
+    print(f"[eval_gsm8k] exit{_cuda_mem_snapshot(device)}", flush=True)
     return correct / len(examples)
 
 
@@ -734,7 +760,8 @@ def train(args) -> int:
         else:
             calib_stream = bdata.cpt_token_stream(
                 tokenizer, args.max_seq_len, dataset_name=args.cpt_dataset,
-                dataset_config=args.cpt_config, local_parquet=args.cpt_local_parquet, seed=4242)
+                dataset_config=args.cpt_config, local_parquet=args.cpt_local_parquet, seed=4242,
+                shuffle_buffer=512)  # small: warm-start pulls few seqs; avoids slow/ballooning prefetch
         gptq_init.gptq_warmstart_init(
             student, calib_stream, device,
             n_calib_batches=args.warmstart_batches,
@@ -1125,11 +1152,164 @@ def generate_teacher_cache(args) -> int:
     return 0
 
 
+def run_cache_training_loop(student, tokenizer, opt, trainable, cache_files, device, args, *,
+                            max_tokens, resume_step, resume_tokens, out_dir, seq_len, tau,
+                            milestones, ppl_slice, gsm8k, csharp_tasks, tooluse_ex,
+                            instruction_ex, nll_ex, base, meta, post_step_hook=None) -> dict:
+    """The cached-teacher grad-accum training loop + milestone-eval/checkpoint block, extracted
+    from train_from_cache so bitdistill_staged.py can drive it per-window against whichever
+    params are currently trainable (a "hot window"), reusing every KD-loss/eval/checkpoint/
+    WDDM-safety detail unchanged. Returns the final eval dict (also the curve's last entry).
+
+    post_step_hook: optional callable invoked once after every opt.step(). Lets a caller with
+    knowledge this function deliberately doesn't have (e.g. bitdistill_staged.py's
+    PackedTernaryLinear step-scoped unpack cache) hook the step boundary without this file
+    taking on a hard dependency on that caller's module."""
+    import time
+    curve, next_ms = [], 0
+    V = student.config.vocab_size
+    warmup = args.precision_warmup_steps
+    tokens_seen, step, ci = resume_tokens, resume_step, resume_step
+    while next_ms < len(milestones) and milestones[next_ms] <= tokens_seen:
+        next_ms += 1  # skip milestones already completed before the resume point
+    t0 = time.perf_counter()
+    print(f"[from-cache] training to {max_tokens:.2e} tokens over {len(cache_files)} cached batches "
+          f"(from {tokens_seen:.2e})", flush=True)
+
+    while tokens_seen < max_tokens and (args.max_steps == 0 or step < args.max_steps):
+        alpha = 1.0 if warmup <= 0 else min(1.0, step / warmup)
+        set_quant_alpha(student, alpha)
+        lam = args.lambda_kd
+        c = torch.load(cache_files[ci % len(cache_files)]); ci += 1
+        batch = c["input_ids"].to(device).long()                          # [B, T]
+        topv = c["topk_logits"].to(device)                                # [B, T, K]
+        topi = c["topk_idx"].to(device).long()
+        lse = c["lse"].to(device)                                         # [B, T]
+        lmask = c["loss_mask"].to(device) if (args.completion_mask and "loss_mask" in c) else None
+
+        B = batch.size(0)
+        mb = args.micro_batch if args.micro_batch and args.micro_batch > 0 else B
+        opt.zero_grad()
+        ce_val = ld_val = 0.0
+        for j in range(0, B, mb):                                             # grad-accum micro-batches
+            sl = slice(j, min(j + mb, B))
+            frac = (sl.stop - sl.start) / B                                   # weight so accum == full-batch mean
+            s_logits = student(input_ids=batch[sl], use_cache=False).logits
+            tgt = batch[sl, 1:].contiguous()
+            mflat = None
+            if lmask is not None:                                             # completion-masked: drop prompt tokens
+                mslc = lmask[sl, 1:].contiguous()
+                tgt = tgt.masked_fill(mslc == 0, -100)                        # CE ignores -100
+                mflat = mslc.reshape(-1)
+                if int((tgt != -100).sum()) == 0:                            # pure-prompt micro-batch: no signal
+                    del s_logits, tgt, mflat                                 # graph never hits backward() to free
+                    continue                                                 # itself -- checkpoint autograd nodes
+                                                                              # form ref cycles the GC won't sweep
+                                                                              # promptly, so drop the ref explicitly
+            ce = F.cross_entropy(s_logits[:, :-1, :].contiguous().view(-1, V), tgt.view(-1))
+            Kd = topv.size(-1)
+            ld = sparse_logit_kd_loss(s_logits[:, :-1, :].contiguous().view(-1, V),
+                                      topv[sl, :-1, :].contiguous().view(-1, Kd),
+                                      topi[sl, :-1, :].contiguous().view(-1, Kd),
+                                      lse[sl, :-1].contiguous().view(-1), tau, loss_mask=mflat)
+            ((ce + lam * ld) * frac).backward()
+            ce_val += ce.item() * frac; ld_val += ld.item() * frac
+        torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+        opt.step()
+        if post_step_hook is not None:
+            post_step_hook()
+        loss_val = ce_val + lam * ld_val
+        tokens_seen += batch.numel(); step += 1
+
+        if step % 100 == 0:                     # periodic insurance: trim the caching
+            torch.cuda.empty_cache()             # allocator's reserved pool so a slow
+                                                  # per-step creep can't compound toward
+                                                  # the VRAM ceiling between milestones
+
+        if step <= 5 or step % args.log_every == 0:
+            sps = step / max(time.perf_counter() - t0, 1e-9)
+            print(f"  step {step:6d}  tok {tokens_seen:.3e}  a={alpha:.2f}  "
+                  f"CE {ce_val:.4f}  LD {ld_val:.4f}  loss {loss_val:.4f}  {sps:.2f} it/s"
+                  f"{_cuda_mem_snapshot(device)}", flush=True)
+
+        while next_ms < len(milestones) and tokens_seen >= milestones[next_ms]:
+            mtok = milestones[next_ms]
+            set_quant_alpha(student, 1.0)
+            ppl = compute_ppl(student, ppl_slice, device)
+            acc = eval_gsm8k(student, tokenizer, gsm8k, device) if gsm8k else float("nan")
+            csharp_p1 = cse.eval_csharp_exec(student, tokenizer, csharp_tasks, device,
+                                             bench_dir=args.csharp_bench_dir) if csharp_tasks else float("nan")
+            tooluse_a = tue.eval_tooluse_inproc(student, tokenizer, tooluse_ex, device) if tooluse_ex else float("nan")
+            instruction_a = iue.eval_instruction_inproc(student, tokenizer, instruction_ex, device) if instruction_ex else float("nan")
+            gnll = cve.eval_gsm8k_nll(student, tokenizer, nll_ex, device) if nll_ex else float("nan")
+            ck = os.path.join(out_dir, f"ckpt_{mtok}")
+            if args.save_ckpt:
+                save_checkpoint(student, ck, step, tokens_seen,
+                                extra={"ppl": ppl, "gsm8k_acc": acc, "csharp_pass1": csharp_p1,
+                                       "tooluse_acc": tooluse_a, "instruction_acc": instruction_a,
+                                       "gsm8k_nll": gnll, "milestone": mtok})
+            curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc,
+                          "csharp_pass1": csharp_p1,
+                          "tooluse_acc": tooluse_a, "instruction_acc": instruction_a, "gsm8k_nll": gnll})
+            print(f"[milestone {mtok:.2e}] ppl={ppl:.3f}  gsm8k_acc={acc}  csharp_pass1={csharp_p1}  "
+                  f"tooluse_acc={tooluse_a}  instruction_acc={instruction_a}  gsm8k_nll={gnll}  -> {ck}", flush=True)
+            next_ms += 1
+            # A staged-trainer PackedTernaryLinear caches its unpacked weight per forward
+            # call (see ternary_pack.py's _step_cache) and only clears it via post_step_hook
+            # after opt.step() -- eval's forward passes (compute_ppl, eval_gsm8k's generate())
+            # populate that cache too but never trigger an opt.step(), so it stays populated
+            # indefinitely. Measured: ~6GB (32 frozen layers x ~200MB unpacked bf16) that a
+            # plain gc.collect()+empty_cache() CANNOT reclaim, because the cache is a live,
+            # reachable reference (deliberately retained, not garbage) until cleared.
+            if post_step_hook is not None:
+                post_step_hook()
+            # eval (esp. generate()'s KV-cache) allocates a very different shape/size
+            # profile than training; the caching allocator won't hand that back on its
+            # own, and on Windows staying pinned near the VRAM ceiling triggers silent
+            # WDDM host-RAM paging (10-100x slowdown, no crash) for the rest of the run.
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    if device.type == "cuda":
+        gc.collect(); torch.cuda.empty_cache()
+        print(f"[from-cache] training loop exit{_cuda_mem_snapshot(device)}", flush=True)
+    set_quant_alpha(student, 1.0)
+    ppl = compute_ppl(student, ppl_slice, device)
+    # See the identical comment at the milestone block above: compute_ppl's forward passes
+    # populate every frozen PackedTernaryLinear's _step_cache (a deliberately-retained live
+    # reference, not garbage), and nothing else in this function's tail clears it. Directly
+    # measured: cuda_alloc jumps 3.17G -> 9.22G across just this one compute_ppl call.
+    if post_step_hook is not None:
+        post_step_hook()
+    if device.type == "cuda":
+        gc.collect(); torch.cuda.empty_cache()
+        print(f"[from-cache] post-compute_ppl{_cuda_mem_snapshot(device)}", flush=True)
+    acc = eval_gsm8k(student, tokenizer, gsm8k, device) if gsm8k else float("nan")
+    csharp_p1 = cse.eval_csharp_exec(student, tokenizer, csharp_tasks, device,
+                                     bench_dir=args.csharp_bench_dir) if csharp_tasks else float("nan")
+    tooluse_a = tue.eval_tooluse_inproc(student, tokenizer, tooluse_ex, device) if tooluse_ex else float("nan")
+    instruction_a = iue.eval_instruction_inproc(student, tokenizer, instruction_ex, device) if instruction_ex else float("nan")
+    gnll = cve.eval_gsm8k_nll(student, tokenizer, nll_ex, device) if nll_ex else float("nan")
+    if post_step_hook is not None:
+        post_step_hook()
+    final = {"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc,
+            "csharp_pass1": csharp_p1,
+            "tooluse_acc": tooluse_a, "instruction_acc": instruction_a, "gsm8k_nll": gnll, "final": True}
+    curve.append(final)
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "curve.json"), "w") as f:
+        json.dump({"base": base, "from_cache": args.from_teacher_cache, "curve": curve, "meta": meta}, f, indent=2)
+    print(f"[from-cache] done: {step} steps / {tokens_seen} tokens. final ppl={ppl:.3f} "
+          f"gsm8k_acc={acc} csharp_pass1={csharp_p1} tooluse_acc={tooluse_a} "
+          f"instruction_acc={instruction_a} gsm8k_nll={gnll}. curve -> {out_dir}/curve.json", flush=True)
+    return final
+
+
 def train_from_cache(args) -> int:
     """Phase 2 of offline KD: train the ternary student alone against a cached teacher (Phase 1).
     Student is the only resident model. Loss = CE + lambda * sparse_top-K KD (no attention-relation
     term — it needs teacher hidden states and was shown not to help)."""
-    import json, glob, time
+    import json, glob
     from transformers import AutoModelForCausalLM, AutoTokenizer
     device = torch.device(args.device)
     cache_dir = args.from_teacher_cache
@@ -1162,7 +1342,8 @@ def train_from_cache(args) -> int:
         else:
             calib_stream = bdata.cpt_token_stream(
                 tokenizer, args.max_seq_len, dataset_name=args.cpt_dataset,
-                dataset_config=args.cpt_config, local_parquet=args.cpt_local_parquet, seed=4242)
+                dataset_config=args.cpt_config, local_parquet=args.cpt_local_parquet, seed=4242,
+                shuffle_buffer=512)  # small: warm-start pulls few seqs; avoids slow/ballooning prefetch
         gptq_init.gptq_warmstart_init(
             student, calib_stream, device,
             n_calib_batches=args.warmstart_batches,
@@ -1197,105 +1378,18 @@ def train_from_cache(args) -> int:
     instruction_ex = iue.load_instruction_eval(tokenizer, n=args.eval_n_instruction) if args.eval_instruction else []
     nll_ex = cve.load_gsm8k_nll(tokenizer, n=args.eval_n_nll) if args.eval_nll else []
     milestones = sorted(int(float(x)) for x in args.milestones.split(",")) if args.milestones else []
-    curve, next_ms = [], 0
 
     cache_files = sorted(glob.glob(os.path.join(cache_dir, "batch_*.pt")))
     if not cache_files:
         raise SystemExit(f"no cache batches in {cache_dir}")
-    V = student.config.vocab_size
-    max_tokens, warmup = int(args.tokens), args.precision_warmup_steps
-    tokens_seen, step, ci = resume_tokens, resume_step, resume_step
-    while next_ms < len(milestones) and milestones[next_ms] <= tokens_seen:
-        next_ms += 1  # skip milestones already completed before the resume point
-    t0 = time.perf_counter()
-    print(f"[from-cache] training to {max_tokens:.2e} tokens over {len(cache_files)} cached batches "
-          f"(from {tokens_seen:.2e})", flush=True)
+    max_tokens = int(args.tokens)
 
-    while tokens_seen < max_tokens and (args.max_steps == 0 or step < args.max_steps):
-        alpha = 1.0 if warmup <= 0 else min(1.0, step / warmup)
-        set_quant_alpha(student, alpha)
-        lam = args.lambda_kd
-        c = torch.load(cache_files[ci % len(cache_files)]); ci += 1
-        batch = c["input_ids"].to(device).long()                          # [B, T]
-        topv = c["topk_logits"].to(device)                                # [B, T, K]
-        topi = c["topk_idx"].to(device).long()
-        lse = c["lse"].to(device)                                         # [B, T]
-        lmask = c["loss_mask"].to(device) if (args.completion_mask and "loss_mask" in c) else None
-
-        B = batch.size(0)
-        mb = args.micro_batch if args.micro_batch and args.micro_batch > 0 else B
-        opt.zero_grad()
-        ce_val = ld_val = 0.0
-        for j in range(0, B, mb):                                             # grad-accum micro-batches
-            sl = slice(j, min(j + mb, B))
-            frac = (sl.stop - sl.start) / B                                   # weight so accum == full-batch mean
-            s_logits = student(input_ids=batch[sl], use_cache=False).logits
-            tgt = batch[sl, 1:].contiguous()
-            mflat = None
-            if lmask is not None:                                             # completion-masked: drop prompt tokens
-                mslc = lmask[sl, 1:].contiguous()
-                tgt = tgt.masked_fill(mslc == 0, -100)                        # CE ignores -100
-                mflat = mslc.reshape(-1)
-                if int((tgt != -100).sum()) == 0:                            # pure-prompt micro-batch: no signal
-                    continue
-            ce = F.cross_entropy(s_logits[:, :-1, :].contiguous().view(-1, V), tgt.view(-1))
-            Kd = topv.size(-1)
-            ld = sparse_logit_kd_loss(s_logits[:, :-1, :].contiguous().view(-1, V),
-                                      topv[sl, :-1, :].contiguous().view(-1, Kd),
-                                      topi[sl, :-1, :].contiguous().view(-1, Kd),
-                                      lse[sl, :-1].contiguous().view(-1), tau, loss_mask=mflat)
-            ((ce + lam * ld) * frac).backward()
-            ce_val += ce.item() * frac; ld_val += ld.item() * frac
-        torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-        opt.step()
-        loss_val = ce_val + lam * ld_val
-        tokens_seen += batch.numel(); step += 1
-
-        if step <= 5 or step % args.log_every == 0:
-            sps = step / max(time.perf_counter() - t0, 1e-9)
-            print(f"  step {step:6d}  tok {tokens_seen:.3e}  a={alpha:.2f}  "
-                  f"CE {ce_val:.4f}  LD {ld_val:.4f}  loss {loss_val:.4f}  {sps:.2f} it/s", flush=True)
-
-        while next_ms < len(milestones) and tokens_seen >= milestones[next_ms]:
-            mtok = milestones[next_ms]
-            set_quant_alpha(student, 1.0)
-            ppl = compute_ppl(student, ppl_slice, device)
-            acc = eval_gsm8k(student, tokenizer, gsm8k, device) if gsm8k else float("nan")
-            csharp_p1 = cse.eval_csharp_exec(student, tokenizer, csharp_tasks, device,
-                                             bench_dir=args.csharp_bench_dir) if csharp_tasks else float("nan")
-            tooluse_a = tue.eval_tooluse_inproc(student, tokenizer, tooluse_ex, device) if tooluse_ex else float("nan")
-            instruction_a = iue.eval_instruction_inproc(student, tokenizer, instruction_ex, device) if instruction_ex else float("nan")
-            gnll = cve.eval_gsm8k_nll(student, tokenizer, nll_ex, device) if nll_ex else float("nan")
-            ck = os.path.join(args.out, f"ckpt_{mtok}")
-            if args.save_ckpt:
-                save_checkpoint(student, ck, step, tokens_seen,
-                                extra={"ppl": ppl, "gsm8k_acc": acc, "csharp_pass1": csharp_p1,
-                                       "tooluse_acc": tooluse_a, "instruction_acc": instruction_a,
-                                       "gsm8k_nll": gnll, "milestone": mtok})
-            curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc,
-                          "csharp_pass1": csharp_p1,
-                          "tooluse_acc": tooluse_a, "instruction_acc": instruction_a, "gsm8k_nll": gnll})
-            print(f"[milestone {mtok:.2e}] ppl={ppl:.3f}  gsm8k_acc={acc}  csharp_pass1={csharp_p1}  "
-                  f"tooluse_acc={tooluse_a}  instruction_acc={instruction_a}  gsm8k_nll={gnll}  -> {ck}", flush=True)
-            next_ms += 1
-
-    set_quant_alpha(student, 1.0)
-    ppl = compute_ppl(student, ppl_slice, device)
-    acc = eval_gsm8k(student, tokenizer, gsm8k, device) if gsm8k else float("nan")
-    csharp_p1 = cse.eval_csharp_exec(student, tokenizer, csharp_tasks, device,
-                                     bench_dir=args.csharp_bench_dir) if csharp_tasks else float("nan")
-    tooluse_a = tue.eval_tooluse_inproc(student, tokenizer, tooluse_ex, device) if tooluse_ex else float("nan")
-    instruction_a = iue.eval_instruction_inproc(student, tokenizer, instruction_ex, device) if instruction_ex else float("nan")
-    gnll = cve.eval_gsm8k_nll(student, tokenizer, nll_ex, device) if nll_ex else float("nan")
-    curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc,
-                  "csharp_pass1": csharp_p1,
-                  "tooluse_acc": tooluse_a, "instruction_acc": instruction_a, "gsm8k_nll": gnll, "final": True})
-    os.makedirs(args.out, exist_ok=True)
-    with open(os.path.join(args.out, "curve.json"), "w") as f:
-        json.dump({"base": base, "from_cache": cache_dir, "curve": curve, "meta": meta}, f, indent=2)
-    print(f"[from-cache] done: {step} steps / {tokens_seen} tokens. final ppl={ppl:.3f} "
-          f"gsm8k_acc={acc} csharp_pass1={csharp_p1} tooluse_acc={tooluse_a} "
-          f"instruction_acc={instruction_a} gsm8k_nll={gnll}. curve -> {args.out}/curve.json", flush=True)
+    run_cache_training_loop(student, tokenizer, opt, trainable, cache_files, device, args,
+                            max_tokens=max_tokens, resume_step=resume_step, resume_tokens=resume_tokens,
+                            out_dir=args.out, seq_len=seq_len, tau=tau, milestones=milestones,
+                            ppl_slice=ppl_slice, gsm8k=gsm8k, csharp_tasks=csharp_tasks,
+                            tooluse_ex=tooluse_ex, instruction_ex=instruction_ex, nll_ex=nll_ex,
+                            base=base, meta=meta)
     return 0
 
 

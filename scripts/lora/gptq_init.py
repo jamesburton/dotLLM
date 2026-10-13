@@ -60,12 +60,45 @@ Real smoke on the actual Qwen3-0.6B (a few BitLinear layers, absmean vs warm-sta
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import os
 import sys
+import time
 from typing import Callable, Iterator, Optional
 
 import torch
+
+
+# ===========================================================================
+# Diagnostics: flushed memory/heartbeat log (stdout redirects buffer; this doesn't).
+# Set GPTQ_INIT_LOG=<path> to also append every line to a file, fsync'd.
+# ===========================================================================
+_DIAG_PATH = os.environ.get("GPTQ_INIT_LOG")
+_DIAG_T0 = time.time()
+
+
+def _mem_snapshot() -> str:
+    try:
+        import psutil
+        rss = psutil.Process().memory_info().rss / 2**30
+    except Exception:
+        rss = float("nan")
+    if torch.cuda.is_available():
+        a = torch.cuda.memory_allocated() / 2**30
+        r = torch.cuda.memory_reserved() / 2**30
+        return f"rss={rss:.2f}G cuda_alloc={a:.2f}G cuda_resv={r:.2f}G"
+    return f"rss={rss:.2f}G"
+
+
+def _diag(msg: str) -> None:
+    line = f"[gptq-diag +{time.time() - _DIAG_T0:8.1f}s] {msg} | {_mem_snapshot()}"
+    print(line, flush=True)
+    if _DIAG_PATH:
+        with open(_DIAG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
 
 # ===========================================================================
@@ -131,9 +164,22 @@ def _gptq_ternary(W0: torch.Tensor, H: torch.Tensor, alpha: float,
     Fixed per-tensor scale ``alpha`` (levels {-alpha,0,+alpha}); column-by-column rounding
     with Hessian error feedback (the classic GPTQ recipe: Frantar et al. 2210.17323). Plain
     RTN is exactly this with the error-feedback term removed.
+
+    **Runs on CPU regardless of the caller's device.** Reproduced on the RTX 3060 / Windows
+    CUDA build: driving the Cholesky-family calls + the long sequential per-column update loop
+    on the GPU crashes the process (silent native abort, EXIT 127) after a *cumulative* number
+    of projections — independent of memory (it dies at flat, low VRAM). A pure-Cholesky loop
+    survives; adding the column loop crashes it, so it is the sustained tiny-kernel-launch
+    stream from the OBS updates that trips the driver. This is the sequential, memory-light
+    part of GPTQ ("the solve is cheap"); the expensive scale-search matmuls stay on the GPU in
+    the caller. Returns ``T`` on ``W0``'s original device.
     """
-    W = W0.clone().to(torch.float32)
-    H = H.clone().to(torch.float32)
+    out_device = W0.device
+    # copy=True is mandatory: the column loop mutates W (and H is patched) in place, and
+    # .to() is a no-op alias when the source is already CPU-float32 — without the copy that
+    # would corrupt the caller's weight/Hessian (self-test MSE regressed until this was added).
+    W = W0.detach().to("cpu", torch.float32, copy=True)
+    H = H.detach().to("cpu", torch.float32, copy=True)
     cols = W.shape[1]
 
     # Dead (never-activated) input dims: pin diag so Cholesky is well posed; force weight 0.
@@ -148,12 +194,17 @@ def _gptq_ternary(W0: torch.Tensor, H: torch.Tensor, alpha: float,
     H[idx, idx] += damp
 
     # Hinv (upper-tri Cholesky of the inverse) — GPTQ's numerically stable factorization.
+    _diag(f"    gptq: cholesky start (cols={cols}, dev={H.device})")
     L = torch.linalg.cholesky(H)
     Hinv = torch.cholesky_inverse(L)
+    del L, H                                    # the biggest scratch buffers — free now
     Hinv = torch.linalg.cholesky(Hinv, upper=True)
+    _diag("    gptq: cholesky done; column loop start")
 
     T = torch.zeros_like(W)
     for j in range(cols):
+        if j and j % 1024 == 0:
+            _diag(f"    gptq: column {j}/{cols}")
         w = W[:, j]
         d = Hinv[j, j]
         t = torch.clamp(torch.round(w / alpha), -1, 1)         # ternary level for this column
@@ -161,7 +212,8 @@ def _gptq_ternary(W0: torch.Tensor, H: torch.Tensor, alpha: float,
         if j + 1 < cols and float(d) != 0.0:
             err = (w - t * alpha) / d                          # OBS error to redistribute
             W[:, j + 1:] -= err.unsqueeze(1) * Hinv[j, j + 1:].unsqueeze(0)
-    return T
+    _diag("    gptq: column loop done")
+    return T.to(out_device)
 
 
 def _rtn_ternary(W0: torch.Tensor, alpha: float) -> torch.Tensor:
@@ -189,9 +241,13 @@ def _collect_hessians(student, layers: dict, calib_iter: Iterator, device, *,
             x = inp[0]
             if getattr(module, "sub_norm", None) is not None:
                 x = module.sub_norm(x)               # the tensor that actually multiplies W
-            x = x.reshape(-1, x.shape[-1]).to(hessian_device, torch.float32)
-            h = x.t() @ x
-            H[name] = h if H[name] is None else H[name] + h
+            # Compute XtX on the forward device (GPU = fast) and move only the small
+            # (in x in) accumulator to hessian_device. Materialising the full activation
+            # as CPU float32 per hook per batch ratchets the host heap (RSS climbed
+            # ~0.4 GB/batch pre-fix); the reduced XtX keeps host churn bounded.
+            x = x.reshape(-1, x.shape[-1]).float()
+            h = (x.t() @ x).to(hessian_device)
+            H[name] = h if H[name] is None else H[name].add_(h)
         return hook
 
     for name, module in layers.items():
@@ -218,6 +274,7 @@ def _collect_hessians(student, layers: dict, calib_iter: Iterator, device, *,
                 batch = torch.cat(seqs, dim=0).to(device)     # [B, T]
                 student(input_ids=batch, use_cache=False)
                 pulled += 1
+                _diag(f"  calib batch {pulled}/{n_calib_batches} done")
     finally:
         for h in handles:
             h.remove()
@@ -264,8 +321,11 @@ def gptq_warmstart_init(
     scale_search : search the per-tensor scale (ratio·absmean) minimizing MSE. Guarantees the
         result is ≤ absmean even with ``use_gptq=False``.
     use_gptq : apply GPTQ error-feedback rounding on top of the chosen scale.
-    hessian_device : where to hold the (in×in) Hessians (default: ``device``; pass ``"cpu"``
-        to spare VRAM on big models — Cholesky then runs on CPU).
+    hessian_device : where the *full set* of (in×in) Hessians is parked between collection
+        and solving. Default: ``"cpu"`` when ``device`` is CUDA (all 196 Hessians ≈ 6.5 GB for
+        Qwen3-1.7B cannot co-reside with the model on a 12 GB card), else ``device``. The solve
+        streams each Hessian back to ``device`` one at a time, so the O(n³) Cholesky and
+        scale-search matmuls still run at GPU speed while only one Hessian is device-resident.
     layer_filter : optional ``name -> bool`` to restrict which BitLinears are initialized
         (used by the self-test / partial-model validation).
 
@@ -275,7 +335,14 @@ def gptq_warmstart_init(
     density}) and aggregate ``mse_absmean`` / ``mse_warmstart`` / ``mse_reduction`` /
     ``n_layers``. The aggregate warm-start MSE is asserted ≤ the absmean MSE.
     """
-    hdev = torch.device(hessian_device) if hessian_device is not None else torch.device(device)
+    compute_dev = torch.device(device)
+    # Where the full set of (in x in) Hessians is parked between collection and solving.
+    # On CUDA the default is CPU: all 196 Hessians (~6.5 GB for Qwen3-1.7B) cannot co-reside
+    # with the model on a 12 GB card. The solve streams them back to the GPU one at a time.
+    if hessian_device is not None:
+        hdev = torch.device(hessian_device)
+    else:
+        hdev = torch.device("cpu") if compute_dev.type == "cuda" else compute_dev
 
     layers = {}
     for name, m in student.named_modules():
@@ -298,15 +365,19 @@ def gptq_warmstart_init(
 
     per_layer = {}
     tot_abs, tot_ws = 0.0, 0.0
-    for name, module in layers.items():
+    for li, (name, module) in enumerate(layers.items()):
+        _diag(f"[{li + 1}/{len(layers)}] {name}: start")
         Hn = H[name]
         if Hn is None:
             if verbose:
                 print(f"[gptq-init]   {name}: no calibration activations captured; skipped.")
             continue
         orig_dtype = module.weight.dtype
-        W0 = module.weight.detach().to(hdev, torch.float32)
-        Hn = Hn.to(hdev)
+        # Stream this one layer's weight + Hessian to the compute device (GPU). Only a
+        # single Hessian is ever device-resident, so the O(n^3) scale-search matmuls and
+        # Cholesky run at GPU speed while device memory stays flat at ~model + one Hessian.
+        W0 = module.weight.detach().to(compute_dev, torch.float32)
+        Hn = Hn.to(compute_dev, torch.float32)
 
         base_alpha = float(W0.abs().mean().clamp(min=1e-5))
 
@@ -326,6 +397,7 @@ def gptq_warmstart_init(
                 if mse < best_mse:
                     best_alpha, best_T, best_mse = a, T, mse
         method = "rtn+scale"
+        _diag(f"    scale search done (best ratio {best_alpha / base_alpha:.2f})")
 
         # --- (3) GPTQ error-feedback at the chosen scale; keep only if it helps ---
         if use_gptq:
@@ -351,6 +423,7 @@ def gptq_warmstart_init(
             f"{name}: reproduction lemma failed (max err {float((repro - target).abs().max()):.3e})"
 
         module.weight.data.copy_(W_store.to(orig_dtype).to(module.weight.device))
+        _diag(f"    weight written ({method})")
 
         density = float((best_T != 0).to(torch.float32).mean())
         per_layer[name] = {
@@ -363,8 +436,21 @@ def gptq_warmstart_init(
         if verbose:
             red = 100.0 * (1.0 - best_mse / mse_abs) if mse_abs > 0 else 0.0
             print(f"[gptq-init]   {name:<40s} absmean={mse_abs:.4e} -> "
-                  f"warmstart={best_mse:.4e} ({red:+.1f}%, {method}, α×{best_alpha/base_alpha:.2f})",
+                  f"warmstart={best_mse:.4e} ({red:+.1f}%, {method}, scale x{best_alpha/base_alpha:.2f})",
                   flush=True)
+
+        # --- per-layer teardown: keep host + device memory flat across all 196 layers ---
+        # This layer's Hessian is never needed again — drop it so the parked-Hessian
+        # footprint SHRINKS as we go (host RSS fell monotonically after this fix). Free the
+        # device scratch and hand cached blocks back to the driver so the CUDA allocator
+        # cannot fragment its way to an OOM around layer 4 (the original failure).
+        H[name] = None
+        del W0, Hn, T_abs, best_T, W_store, repro, target
+        if use_gptq and "T_g" in locals():
+            del T_g
+        gc.collect()
+        if compute_dev.type == "cuda":
+            torch.cuda.empty_cache()
 
     reduction = 100.0 * (1.0 - tot_ws / tot_abs) if tot_abs > 0 else 0.0
     assert tot_ws <= tot_abs + 1e-6 * (abs(tot_abs) + 1.0), \
@@ -433,13 +519,15 @@ def bd_tiny_stream(vocab_size: int, seq_len: int, seed: int = 0):
 # ===========================================================================
 # Real smoke — a few BitLinear layers of the actual Qwen3-0.6B.
 # ===========================================================================
-def _run_real(n_layers: int, device: str) -> bool:
+def _run_real(n_layers: int, device: str, base: str = "Qwen/Qwen3-0.6B", *,
+              hessian_cpu: bool = False, calib_batches: int = 8, calib_bs: int = 2,
+              seq_len: int = 256, ffn_relu2: bool = False, skip_ppl: bool = False,
+              local_parquet: Optional[str] = None) -> bool:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import bitdistill as bd
     import bitdistill_data as bdata
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    base = "Qwen/Qwen3-0.6B"
     dev = torch.device(device)
     dtype = torch.float32 if dev.type == "cpu" else torch.bfloat16
     print(f"[real] loading {base} ({dtype})...")
@@ -447,30 +535,40 @@ def _run_real(n_layers: int, device: str) -> bool:
     student = AutoModelForCausalLM.from_pretrained(base, dtype=dtype).to(dev)
     student.config.use_cache = False
     bd.convert_to_bitnet_student(student)
+    if ffn_relu2:
+        bd.set_student_ffn_activation(student, "relu2", 0)
     student.to(dev)
 
     # Restrict to the first n_layers decoder blocks (fast; enough to show the win).
+    n_layers = min(n_layers, student.config.num_hidden_layers)
     prefixes = tuple(f"model.layers.{i}." for i in range(n_layers))
     lf = lambda name: name.startswith(prefixes)  # noqa: E731
 
-    calib = bdata.cpt_token_stream(tok, seq_len=256, local_parquet=None)
+    # Small shuffle buffer: warm-start pulls only a few dozen sequences, so a 10k-example
+    # prefetch just wastes time (and balloons RAM on a network source). 512 is ample.
+    calib = bdata.cpt_token_stream(tok, seq_len=seq_len, local_parquet=local_parquet,
+                                   shuffle_buffer=512)
     # PPL slice BEFORE (absmean init) vs AFTER (warm-start) on the affected layers.
-    ppl_seqs = bdata.load_ppl_slice(tok, n=8, seq_len=256)
-    bd.set_quant_alpha(student, 1.0)
-    ppl_before = bd.compute_ppl(student, ppl_seqs, dev)
+    ppl_before = float("nan")
+    if not skip_ppl:
+        ppl_seqs = bdata.load_ppl_slice(tok, n=8, seq_len=seq_len)
+        bd.set_quant_alpha(student, 1.0)
+        ppl_before = bd.compute_ppl(student, ppl_seqs, dev)
 
-    stats = gptq_warmstart_init(student, calib, dev, n_calib_batches=8, calib_batch_size=2,
-                                hessian_device="cpu" if dev.type == "cpu" else None,
+    stats = gptq_warmstart_init(student, calib, dev, n_calib_batches=calib_batches,
+                                calib_batch_size=calib_bs,
+                                hessian_device="cpu" if (hessian_cpu or dev.type == "cpu") else None,
                                 layer_filter=lf, verbose=True)
 
-    bd.set_quant_alpha(student, 1.0)
-    ppl_after = bd.compute_ppl(student, ppl_seqs, dev)
     print(f"[real] layers initialized: {stats['n_layers']} "
           f"(first {n_layers} blocks)")
     print(f"[real] recon MSE  absmean={stats['mse_absmean']:.4e} -> "
           f"warmstart={stats['mse_warmstart']:.4e} ({stats['mse_reduction']:+.1f}%)")
-    print(f"[real] tiny-slice PPL (ternary)  before={ppl_before:.3f}  after={ppl_after:.3f}  "
-          f"(delta {ppl_after - ppl_before:+.3f})")
+    if not skip_ppl:
+        bd.set_quant_alpha(student, 1.0)
+        ppl_after = bd.compute_ppl(student, ppl_seqs, dev)
+        print(f"[real] tiny-slice PPL (ternary)  before={ppl_before:.3f}  after={ppl_after:.3f}  "
+              f"(delta {ppl_after - ppl_before:+.3f})")
     return True
 
 
@@ -478,12 +576,27 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="gptq_init.py",
                                 description="GPTQ-style warm-start init for the BitLinear ternary student.")
     p.add_argument("--self-test", action="store_true", help="Tiny synthetic Qwen3 numeric check (no download).")
-    p.add_argument("--real", action="store_true", help="Smoke on the actual Qwen3-0.6B (a few layers).")
+    p.add_argument("--real", action="store_true", help="Smoke on a real Qwen3 checkpoint (a few layers).")
     p.add_argument("--n-layers", type=int, default=2, dest="n_layers", help="Decoder blocks to init in --real.")
     p.add_argument("--device", default="cpu", help="cpu | cuda ...")
+    p.add_argument("--base", default="Qwen/Qwen3-0.6B", help="HF checkpoint for --real.")
+    p.add_argument("--hessian-cpu", action="store_true", dest="hessian_cpu",
+                   help="Park Hessians on CPU (mirrors bitdistill --warmstart-hessian-cpu).")
+    p.add_argument("--calib-batches", type=int, default=8, dest="calib_batches")
+    p.add_argument("--calib-bs", type=int, default=2, dest="calib_bs")
+    p.add_argument("--seq-len", type=int, default=256, dest="seq_len")
+    p.add_argument("--ffn-relu2", action="store_true", dest="ffn_relu2",
+                   help="Swap student FFN act to relu2 before calibration (mirrors bitdistill).")
+    p.add_argument("--skip-ppl", action="store_true", dest="skip_ppl")
+    p.add_argument("--cpt-local-parquet", default=None, dest="local_parquet",
+                   help="Calibrate from a LOCAL fineweb parquet shard (no network streaming).")
     args = p.parse_args(argv)
     if args.real:
-        return 0 if _run_real(args.n_layers, args.device) else 1
+        return 0 if _run_real(args.n_layers, args.device, args.base,
+                              hessian_cpu=args.hessian_cpu, calib_batches=args.calib_batches,
+                              calib_bs=args.calib_bs, seq_len=args.seq_len,
+                              ffn_relu2=args.ffn_relu2, skip_ppl=args.skip_ppl,
+                              local_parquet=args.local_parquet) else 1
     return 0 if _run_self_test() else 1
 
 

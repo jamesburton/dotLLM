@@ -19,10 +19,12 @@ compiles-but-wrong → partial pass).
 """
 from __future__ import annotations
 
+import gc
 import os
 import shutil
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import torch
@@ -125,12 +127,19 @@ def eval_csharp_exec(
     max_new_tokens: int = 512,
     chunk: int = 4,
     bench_dir: str = DEFAULT_BENCH_DIR,
+    dotnet_workers: Optional[int] = None,
 ) -> float:
     """Chat-templated in-process generation → C# compile+xUnit → pass@1 over ``tasks``.
 
     Batched + left-padded (all sequences end aligned); ``use_cache`` is forced on for
     decode (the student trains with it off). Returns exact pass@1 fraction, or ``nan``
-    for an empty task list — same shape as ``eval_gsm8k``."""
+    for an empty task list — same shape as ``eval_gsm8k``.
+
+    ``dotnet_workers``: how many ``dotnet build``+``dotnet test`` pipelines to run
+    concurrently. The compile/test step is subprocess/IO-bound (each generated task has
+    its own isolated working dir), so it parallelises across cores while GPU generation
+    stays serial on the main thread. Default: ``$DOTLLM_CSHARP_WORKERS`` or 8, capped by
+    the task count — a sane fit for a many-core host without oversubscribing MSBuild."""
     if not tasks:
         return float("nan")
     try:
@@ -158,7 +167,18 @@ def eval_csharp_exec(
         prompt_ids.append(tokenizer(text, add_special_tokens=not has_template)["input_ids"])
 
     work_root = os.path.join(tempfile.gettempdir(), "dotllm_csharp_eval", "work")
-    passed = 0
+
+    # generate()'s DynamicCache grows via torch.cat every decode step (never in-place); the
+    # caching allocator's reservation from this never returns to the OS except via explicit
+    # empty_cache(), so it carries over chunk-to-chunk AND call-to-call in a long process
+    # (same class of Windows WDDM silent-paging bug fixed in eval_gsm8k -- see bitdistill.py).
+    # max_new_tokens=512 here is the largest of the milestone-eval generators, so this call is
+    # a bigger contributor to that carryover than eval_gsm8k was.
+    if device.type == "cuda":
+        gc.collect(); torch.cuda.empty_cache()
+
+    # --- Phase 1: GPU generation (serial, main thread — model.generate isn't thread-safe) ---
+    gens = []  # (task_index, generated_text, working_dir)
     with torch.no_grad():
         for i in range(0, len(tasks), chunk):
             batch = list(range(i, min(i + chunk, len(tasks))))
@@ -174,12 +194,32 @@ def eval_csharp_exec(
                 max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=pad_id)
             for k, j in enumerate(batch):
                 gen = tokenizer.decode(out[k, maxlen:], skip_special_tokens=True)
-                wd = os.path.join(work_root, tasks[j]["name"])
-                if _score(gen, tasks[j], run_dotnet_task, extract_csharp, wd):
-                    passed += 1
-                shutil.rmtree(wd, ignore_errors=True)
+                gens.append((j, gen, os.path.join(work_root, tasks[j]["name"])))
+            del out
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     model.config.use_cache = prev_cache
     if was_training:
         model.train()
+    if device.type == "cuda":
+        gc.collect(); torch.cuda.empty_cache()
+
+    # --- Phase 2: dotnet build+test (parallel — subprocess/IO-bound, isolated dirs) ---
+    def _score_one(item):
+        j, gen, wd = item
+        try:
+            ok = bool(_score(gen, tasks[j], run_dotnet_task, extract_csharp, wd))
+        finally:
+            shutil.rmtree(wd, ignore_errors=True)
+        return ok
+
+    if dotnet_workers is None:
+        dotnet_workers = int(os.environ.get("DOTLLM_CSHARP_WORKERS", "8"))
+    n_workers = max(1, min(dotnet_workers, len(gens)))
+    if n_workers == 1:
+        passed = sum(_score_one(it) for it in gens)
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            passed = sum(ex.map(_score_one, gens))
     return passed / len(tasks)

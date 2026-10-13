@@ -12,6 +12,7 @@ and runnable on CPU alongside a GPU training job.
 """
 from __future__ import annotations
 
+import gc
 import itertools
 import math
 import os
@@ -52,6 +53,18 @@ def eval_completion_nll(model, tokenizer, examples: list, device) -> float:
     model.eval()
     prev = getattr(model.config, "use_cache", True)
     model.config.use_cache = False
+    # This eval runs LAST in the milestone/final-eval sequence (bitdistill.py's
+    # run_cache_training_loop calls it after gsm8k/csharp/tooluse/instruction), so it
+    # inherits whatever reserved-memory high-water-mark those generate()-heavy calls left
+    # behind. Each individual forward here is cheap in isolation (this module's own
+    # docstring: "teacher-forced, ONE forward per example"), but starting 20 of them
+    # already pinned near the VRAM ceiling from the prior evals' KV-cache reservations
+    # triggers WDDM host-RAM paging on nearly every call -- measured turning a ~10-20s
+    # eval into multiple HOURS on a real run. Flush before AND after, matching the same
+    # pattern already applied to eval_gsm8k/eval_csharp_exec/eval_tooluse_inproc/
+    # eval_instruction_inproc.
+    if device.type == "cuda":
+        gc.collect(); torch.cuda.empty_cache()
     tot, cnt = 0.0, 0
     for ex in examples:
         nll, n = completion_nll(model, tokenizer, ex["prompt_text"], ex["gold_text"], device)
@@ -61,6 +74,8 @@ def eval_completion_nll(model, tokenizer, examples: list, device) -> float:
     model.config.use_cache = prev
     if was:
         model.train()
+    if device.type == "cuda":
+        gc.collect(); torch.cuda.empty_cache()
     return tot / cnt if cnt else float("nan")
 
 

@@ -117,9 +117,11 @@ Default is **off** (`--warmstart-init` opt-in) so existing runs are unchanged; e
 
 - **Calibration corpus for the real run**: general web vs the capability mix (recommend the mix
   once B4 lands — see above).
-- **Scale-search grid** default `[0.5, 1.5]×absmean`, 21 points. The guarantee (≤ absmean) holds
-  for any grid because ratio 1.0 is always included; widen `scale_hi` if per-layer logs show the
-  chosen ratio pinned at the ceiling.
+- **Scale-search grid** default `[0.5, 2.0]×absmean`, 31 points. On the real Qwen3-0.6B weights the
+  output-MSE-optimal ternary scale is >1.5×absmean (heavy-tailed weights → absmean underestimates
+  it), so the ceiling was raised from 1.5 to 2.0. The guarantee (≤ absmean) holds for any grid
+  because ratio 1.0 is always included; widen `scale_hi` further if per-layer logs still pin the
+  chosen ratio at the ceiling.
 - **GPTQ ordering**: this implementation uses natural column order with OBS error feedback (no
   act-order/`percdamp` sweep). Sufficient for a warm-start; act-order is a possible future upgrade
   if init quality ever bottlenecks.

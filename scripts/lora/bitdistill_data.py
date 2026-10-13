@@ -23,10 +23,47 @@ loader returns a materialised list (small, for eval).
 
 from __future__ import annotations
 
+import glob
 import itertools
+import os
 from typing import Iterator, Optional
 
 import torch
+
+
+# ---------------------------------------------------------------------------
+# Local-shard resolver — the robust calibration/CPT path.
+# ---------------------------------------------------------------------------
+# Streaming FineWeb-Edu over the network with a large shuffle-prefetch buffer
+# balloons host RAM catastrophically on a flaky link: partial-download/retry
+# buffers plus multi-hundred-MB parquet row-groups accumulate until the box
+# swap-thrashes (this is what made warm-start appear to "hang at layer 4" —
+# it was never the GPTQ solve). If a FineWeb-Edu shard is already in the HF
+# cache we prefer it: memory stays bounded and no network can kill the run.
+def resolve_local_fineweb(dataset_hint: str = "fineweb") -> Optional[str]:
+    """Return a path to a locally-cached FineWeb(-Edu) parquet shard, or ``None``.
+
+    Scans the HF datasets hub cache (``$HF_HOME/hub`` or ``~/.cache/huggingface/hub``)
+    for a ``datasets--*<hint>*`` snapshot and returns the largest ``.parquet`` blob
+    found (largest ⇒ a complete shard, not a truncated partial download).
+    """
+    roots = []
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        roots.append(os.path.join(hf_home, "hub"))
+    roots.append(os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub"))
+
+    best, best_sz = None, 0
+    for root in roots:
+        pat = os.path.join(root, f"datasets--*{dataset_hint}*", "snapshots", "*", "**", "*.parquet")
+        for p in glob.glob(pat, recursive=True):
+            try:
+                sz = os.path.getsize(os.path.realpath(p))  # follow symlink to blob
+            except OSError:
+                continue
+            if sz > best_sz:
+                best, best_sz = p, sz
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +93,8 @@ def cpt_token_stream(
     text_field: str = "text",
     seed: int = 0,
     local_parquet: Optional[str] = None,
+    prefer_local_cache: bool = True,
+    shuffle_buffer: int = 10_000,
 ) -> Iterator[torch.Tensor]:
     """Yield fixed-length token sequences from a streaming HF dataset.
 
@@ -71,15 +110,26 @@ def cpt_token_stream(
     """
     import datasets as hf_datasets
 
+    # Prefer a locally-cached shard when none was named explicitly: streaming over a
+    # flaky network balloons host RAM (see resolve_local_fineweb). Callers wanting the
+    # full network stream can pass prefer_local_cache=False.
+    if not local_parquet and prefer_local_cache and "fineweb" in dataset_name.lower():
+        cached = resolve_local_fineweb()
+        if cached:
+            local_parquet = cached
+            print(f"[cpt] calibration/CPT from LOCAL shard (network-safe): {cached}", flush=True)
+
     if local_parquet:
         ds = hf_datasets.load_dataset(
             "parquet", data_files=local_parquet, split=dataset_split, streaming=True
         )
     else:
+        print(f"[cpt] STREAMING {dataset_name} over network — a flaky link can balloon host "
+              f"RAM; pre-cache a shard to avoid this.", flush=True)
         ds = hf_datasets.load_dataset(
             dataset_name, dataset_config, split=dataset_split, streaming=True
         )
-    ds = ds.shuffle(seed=seed, buffer_size=10_000)
+    ds = ds.shuffle(seed=seed, buffer_size=shuffle_buffer)
 
     buf: list[int] = []
     for row in ds:
